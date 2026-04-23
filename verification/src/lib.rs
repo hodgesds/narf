@@ -17,6 +17,8 @@
 #![feature(generic_const_exprs)]
 #![allow(incomplete_features)]
 
+extern crate alloc;
+
 use core::fmt::Write;
 
 use narf_console::Writer;
@@ -208,3 +210,58 @@ fn smoke_arch_backend() -> TestResult {
     else { TestResult::Fail("BACKEND constant mismatch") }
 }
 kernel_test!(smoke_arch_backend);
+
+fn smoke_monotonic_advances() -> TestResult {
+    let a = narf_time::now_cycles();
+    for _ in 0..100_000 { core::hint::spin_loop(); }
+    let b = narf_time::now_cycles();
+    if b > a { TestResult::Pass } else { TestResult::Fail("monotonic counter didn't advance") }
+}
+kernel_test!(smoke_monotonic_advances);
+
+fn smoke_box_roundtrip() -> TestResult {
+    use alloc::boxed::Box;
+    let b: Box<[u32; 4]> = Box::new([1, 2, 3, 4]);
+    let sum: u32 = b.iter().sum();
+    if sum == 10 { TestResult::Pass } else { TestResult::Fail("Box<[u32;4]> sum wrong") }
+}
+kernel_test!(smoke_box_roundtrip);
+
+fn smoke_scheduler_drives_future() -> TestResult {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    narf_scheduler::init();
+    for _ in 0..3 {
+        narf_scheduler::spawn(async {
+            COUNT.fetch_add(1, Ordering::Relaxed);
+            narf_scheduler::yield_now().await;
+            COUNT.fetch_add(10, Ordering::Relaxed);
+        });
+    }
+    narf_scheduler::run_until_empty();
+    // Three tasks × (1 + 10) = 33.
+    if COUNT.load(Ordering::Relaxed) == 33 { TestResult::Pass }
+    else { TestResult::Fail("scheduler didn't drive 3 tasks to completion") }
+}
+kernel_test!(smoke_scheduler_drives_future);
+
+fn smoke_sleep_future_waits() -> TestResult {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    narf_scheduler::init();
+    let start = narf_time::Instant::now();
+    narf_scheduler::spawn(async {
+        narf_time::sleep_cycles(10_000_000).await;
+        DONE.store(true, Ordering::Relaxed);
+    });
+    narf_scheduler::run_until_empty();
+    let elapsed = narf_time::Instant::now().cycles_since(start);
+    if !DONE.load(Ordering::Relaxed) {
+        return TestResult::Fail("sleep future never completed");
+    }
+    if elapsed < 10_000_000 {
+        return TestResult::Fail("completed before deadline — sleep isn't blocking");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_sleep_future_waits);

@@ -12,9 +12,11 @@ name = "narf_verification"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib     = { path = "../lib" }
-narf-arch    = { path = "../arch" }
-narf-console = { path = "../console" }
+narf-lib       = { path = "../lib" }
+narf-arch      = { path = "../arch" }
+narf-console   = { path = "../console" }
+narf-time      = { path = "../time" }
+narf-scheduler = { path = "../scheduler" }
 
 [lints]
 workspace = true
