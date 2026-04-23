@@ -148,11 +148,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
     { narf_verification::run_all_and_exit(); }
 
     // ─── Stage 1 exit-gate demo: async executor + timer-driven yield ──
-    #[cfg(not(feature = "kernel-test"))]
+    #[cfg(not(any(feature = "kernel-test", feature = "idt-selftest")))]
     run_async_demo()
 }
 
-#[cfg(not(feature = "kernel-test"))]
+#[cfg(not(any(feature = "kernel-test", feature = "idt-selftest")))]
 fn run_async_demo() -> ! {
     narf_scheduler::init();
     let _ = writeln!(console::Writer, "  scheduler: ready queue initialised");

@@ -68,9 +68,7 @@ const IDT_ENTRIES: usize = 256;
 /// Interrupt-gate, present, DPL=0: 0x8E.
 const GATE_INT_KERNEL: u8 = 0x8E;
 
-/// Kernel code selector = GDT[1] byte offset = 0x08. This matches the GDT
-/// set up in boot.S.
-const KCODE_SEL: u16 = 0x08;
+use super::gdt::{KCODE_SEL, IST_NMI, IST_DF, IST_MC, IST_VC};
 
 /// The IDT itself — 4 KiB.
 static mut IDT: [IdtEntry; IDT_ENTRIES] = [IdtEntry::NULL; IDT_ENTRIES];
@@ -88,7 +86,11 @@ extern "C" {
 }
 
 fn install(vec: usize, handler: unsafe extern "C" fn()) {
-    let entry = IdtEntry::new(handler as u64, KCODE_SEL, 0, GATE_INT_KERNEL);
+    install_with_ist(vec, handler, 0);
+}
+
+fn install_with_ist(vec: usize, handler: unsafe extern "C" fn(), ist: u8) {
+    let entry = IdtEntry::new(handler as u64, KCODE_SEL, ist, GATE_INT_KERNEL);
     // SAFETY: IDT is accessed only on the BSP during Stage-1 bring-up, before
     // any other CPU or interrupt handler can observe it. The write happens
     // before `lidt`, and the entry layout matches the hardware spec.
@@ -104,14 +106,20 @@ pub unsafe fn init() {
     // Fill the 32 CPU-exception slots. The rest stay zero/NULL;
     // unhandled external IRQs would cause a triple-fault, but Stage 1
     // leaves interrupts masked until `interrupts/` lands.
-    install(0,  int_0);  install(1,  int_1);  install(2,  int_2);  install(3,  int_3);
+    install(0,  int_0);  install(1,  int_1);
+    install_with_ist(2, int_2, IST_NMI);         // NMI runs on its own stack
+    install(3,  int_3);
     install(4,  int_4);  install(5,  int_5);  install(6,  int_6);  install(7,  int_7);
-    install(8,  int_8);  install(9,  int_9);  install(10, int_10); install(11, int_11);
+    install_with_ist(8, int_8, IST_DF);          // #DF must not re-double-fault
+    install(9,  int_9);  install(10, int_10); install(11, int_11);
     install(12, int_12); install(13, int_13); install(14, int_14); install(15, int_15);
-    install(16, int_16); install(17, int_17); install(18, int_18); install(19, int_19);
-    install(20, int_20); install(21, int_21); install(22, int_22); install(23, int_23);
-    install(24, int_24); install(25, int_25); install(26, int_26); install(27, int_27);
-    install(28, int_28); install(29, int_29); install(30, int_30); install(31, int_31);
+    install(16, int_16); install(17, int_17);
+    install_with_ist(18, int_18, IST_MC);        // #MC is asynchronous, own stack
+    install(19, int_19); install(20, int_20); install(21, int_21);
+    install(22, int_22); install(23, int_23); install(24, int_24); install(25, int_25);
+    install(26, int_26); install(27, int_27); install(28, int_28);
+    install_with_ist(29, int_29, IST_VC);        // #VC (SEV-ES) own stack
+    install(30, int_30); install(31, int_31);
 
     // Build the LIDT descriptor and load it.
     let ptr = IdtPointer {
