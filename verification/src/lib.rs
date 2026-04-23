@@ -246,6 +246,37 @@ fn smoke_scheduler_drives_future() -> TestResult {
 kernel_test!(smoke_scheduler_drives_future);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_pkrs_roundtrip() -> TestResult {
+    // PKS availability is a hardware property; only run the roundtrip
+    // if CR4.PKS was enabled during boot. Otherwise IA32_PKRS would
+    // #GP and we'd re-enter the trap handler.
+    // SAFETY: CPUID is always legal.
+    let feats = unsafe { narf_arch::x86_64::Features::probe() };
+    if !feats.pks {
+        return TestResult::Skip("PKS not exposed by this CPU");
+    }
+    use narf_arch::x86_64::msr::{rdmsr, wrmsr, IA32_PKRS};
+    // SAFETY: feats.pks==true means CR4.PKS is set (frame/ enabled it
+    // at boot), so PKRS is accessible.
+    let saved = unsafe { rdmsr(IA32_PKRS) };
+    // Write 0xFFFF_FFFF — "all domains disallowed" — then read back.
+    // Every 2-bit field set to 11 (AD|WD). u64 is fine even though
+    // only the low 32 bits are defined; upper bits are reserved-zero.
+    let test_value = 0xFFFF_FFFF_u64;
+    unsafe { wrmsr(IA32_PKRS, test_value); }
+    let got = unsafe { rdmsr(IA32_PKRS) };
+    // Restore to avoid surprising subsequent code.
+    unsafe { wrmsr(IA32_PKRS, saved); }
+    if got == test_value {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("PKRS roundtrip mismatch")
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_pkrs_roundtrip);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_paging_map_translate_unmap() -> TestResult {
     use narf_memory::paging::{map_4kb, unmap_4kb, translate, PageTable, PtFlags};
     use narf_memory::{alloc_frame, FrameAllocError, PhysAddr, VirtAddr};

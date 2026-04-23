@@ -74,6 +74,40 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         let _ = writeln!(console::Writer, "  idt: loaded — 32 CPU-exception vectors routed");
     }
 
+    // Stage 2 feature probe. Print what the CPU supports; gate
+    // per-feature enables on explicit CPUID presence so the kernel
+    // boots on pre-PKS / pre-UIPI hardware (with degraded behaviour
+    // in later stages rather than a boot panic).
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: CPUID is always legal at CPL=0.
+        let feats = unsafe { narf_arch::x86_64::Features::probe() };
+        let _ = writeln!(console::Writer,
+            "  features: nx={} tsc_inv={} pku={} pks={} uipi={} rdseed={} rdrand={}",
+            feats.nx, feats.invariant_tsc, feats.pku, feats.pks,
+            feats.uipi, feats.rdseed, feats.rdrand);
+
+        // Attempt to enable CR4.PKS if available. Success means the
+        // IA32_PKRS MSR is now accessible and per-page PK bits are
+        // active — Stage 2 domain-switch machinery can now use them.
+        if feats.pks {
+            // SAFETY: CPUID confirmed PKS support.
+            unsafe {
+                let cr4 = narf_arch::x86_64::cr::read_cr4();
+                narf_arch::x86_64::cr::write_cr4(cr4 | narf_arch::x86_64::cr::CR4_PKS);
+                // Initialise PKRS to "all domains have all rights"
+                // (every 2-bit field = 00). Stage-3 cap-gated rights
+                // flips land later.
+                narf_arch::x86_64::msr::wrmsr(narf_arch::x86_64::msr::IA32_PKRS, 0);
+            }
+            let _ = writeln!(console::Writer,
+                "  pks: enabled (CR4.PKS=1, IA32_PKRS=0 / all-allow)");
+        } else {
+            let _ = writeln!(console::Writer,
+                "  pks: unavailable — Stage-2 Barrier domain switch will degrade");
+        }
+    }
+
     // Boot-time domain enumeration — STAGE1.md exit-gate #5. Confirm the
     // authoritative DomainId table from security-model/ §4.1 is the one
     // `narf_lib::id` declares at compile time.

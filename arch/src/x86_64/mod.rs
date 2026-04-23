@@ -1,9 +1,13 @@
 //! x86_64 arch backend.
 
 pub mod asm;
+pub mod cpuid;
+pub mod cr;
 pub mod io_port;
+pub mod msr;
 
 pub use asm::{halt_forever, disable_interrupts, enable_interrupts};
+pub use cpuid::Features;
 
 /// Exit QEMU cleanly via the `isa-debug-exit` device (I/O port 0xF4).
 /// QEMU computes its exit status as `(code << 1) | 1`, so `exit_qemu(0)`
