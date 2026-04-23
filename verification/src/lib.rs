@@ -245,6 +245,55 @@ fn smoke_scheduler_drives_future() -> TestResult {
 }
 kernel_test!(smoke_scheduler_drives_future);
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_paging_map_translate_unmap() -> TestResult {
+    use narf_memory::paging::{map_4kb, unmap_4kb, translate, PageTable, PtFlags};
+    use narf_memory::{alloc_frame, FrameAllocError, PhysAddr, VirtAddr};
+
+    // Fresh PML4 just for this test — doesn't touch the live address space.
+    let pml4 = match alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(FrameAllocError::Uninitialised) =>
+            return TestResult::Skip("frame allocator not initialised"),
+        Err(_) => return TestResult::Fail("alloc_frame failed"),
+    };
+    PageTable::zero_at(pml4.as_mut_ptr::<PageTable>());
+
+    // Map virtual 0x5678_0000 → physical 0x1234_0000 with RW.
+    let virt = VirtAddr::new(0x5678_0000);
+    let phys = PhysAddr::new(0x1234_0000);
+    // SAFETY: PML4 owned by this test, no other CPU touches it, low-4-GiB
+    // identity map guarantees table-level reachability.
+    if let Err(e) = unsafe { map_4kb(pml4, virt, phys, PtFlags::WRITABLE) } {
+        let _ = e;
+        return TestResult::Fail("map_4kb failed");
+    }
+
+    // Translate back.
+    let got = unsafe { translate(pml4, virt) };
+    if got != Some(phys) {
+        return TestResult::Fail("translate returned wrong physical address");
+    }
+
+    // Unmap.
+    let removed = match unsafe { unmap_4kb(pml4, virt) } {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("unmap_4kb failed"),
+    };
+    if removed != phys {
+        return TestResult::Fail("unmap returned wrong phys");
+    }
+
+    // Translate must now return None.
+    if unsafe { translate(pml4, virt) }.is_some() {
+        return TestResult::Fail("translate still resolves after unmap");
+    }
+
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_paging_map_translate_unmap);
+
 fn smoke_frame_alloc_roundtrip() -> TestResult {
     // Allocator has to be initialised by the bin crate's _start_rust,
     // so we just assert alloc-then-free works and returns a valid frame.

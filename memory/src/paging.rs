@@ -151,3 +151,245 @@ pub unsafe fn write_cr3(pml4_phys: PhysAddr) {
     }
     compiler_fence(Ordering::SeqCst);
 }
+
+/// Invalidate the TLB for a single virtual address via `INVLPG`.
+///
+/// # Safety
+/// Single-page TLB invalidation is always safe at CPL=0; the
+/// `compiler_fence` pair keeps the post-invalidation load ordering
+/// correct under fat LTO.
+pub unsafe fn invlpg(virt: VirtAddr) {
+    use core::arch::asm;
+    use core::sync::atomic::{compiler_fence, Ordering};
+
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: INVLPG [mem] at CPL=0 is always legal.
+    unsafe {
+        asm!(
+            "invlpg [{addr}]",
+            addr = in(reg) virt.raw(),
+            options(nostack, preserves_flags),
+        );
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// Errors from `map_4kb` / `unmap_4kb`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MapError {
+    /// The target virtual address isn't 4 KiB-aligned.
+    UnalignedVirt,
+    /// The target physical address isn't 4 KiB-aligned.
+    UnalignedPhys,
+    /// Frame allocator couldn't provide a new intermediate page table.
+    FrameExhausted,
+    /// A higher-level entry on the walk is marked HUGE_PAGE — the caller
+    /// asked to overlay a 4 KiB mapping on top of a 1 GiB or 2 MiB
+    /// page. Callers must explicitly demote before remapping; Stage-2
+    /// work.
+    EncounteredHugePage,
+    /// The target virtual address already has a 4 KiB mapping. Caller
+    /// should `unmap_4kb` first if replacement is intended.
+    AlreadyMapped,
+    /// The address isn't in canonical 48-bit form (bits 47–63 must be
+    /// uniformly 0 or all-1).
+    NonCanonical,
+}
+
+/// Indices into each level of the 4-level page-table walk.
+///
+/// Bits [47:39]=PML4, [38:30]=PDPT, [29:21]=PD, [20:12]=PT.
+#[derive(Copy, Clone, Debug)]
+pub struct WalkIndices {
+    pub pml4: usize,
+    pub pdpt: usize,
+    pub pd:   usize,
+    pub pt:   usize,
+}
+
+impl WalkIndices {
+    pub const fn from_virt(v: VirtAddr) -> Self {
+        let raw = v.raw();
+        Self {
+            pml4: ((raw >> 39) & 0x1FF) as usize,
+            pdpt: ((raw >> 30) & 0x1FF) as usize,
+            pd:   ((raw >> 21) & 0x1FF) as usize,
+            pt:   ((raw >> 12) & 0x1FF) as usize,
+        }
+    }
+}
+
+/// Check canonical-form constraint: bits 47–63 must all equal bit 47.
+#[inline]
+const fn is_canonical(v: VirtAddr) -> bool {
+    let hi = v.raw() >> 47;
+    hi == 0 || hi == 0x1FFFF
+}
+
+use crate::VirtAddr;
+
+/// Map a 4 KiB virtual page to a 4 KiB physical frame.
+///
+/// Walks the PML4 starting at `pml4_phys`, allocating fresh PDPT / PD /
+/// PT frames along the way if they don't exist. Sets the final PT entry
+/// to point at `phys` with `flags | PRESENT`. `INVLPG`s the target
+/// address so subsequent accesses see the new mapping immediately.
+///
+/// # Safety
+/// - The current address space must identity-map the physical addresses
+///   of every page-table level touched. Stage 1's low-4-GiB identity
+///   mapping covers this because page tables are in low RAM.
+/// - `pml4_phys` must point at a valid PML4 owned by the caller —
+///   concurrently modifying it from another CPU is UB.
+pub unsafe fn map_4kb(
+    pml4_phys: PhysAddr,
+    virt: VirtAddr,
+    phys: PhysAddr,
+    flags: PtFlags,
+) -> Result<(), MapError> {
+    if !is_canonical(virt) { return Err(MapError::NonCanonical); }
+    if virt.raw() & 0xFFF != 0 { return Err(MapError::UnalignedVirt); }
+    if phys.raw() & 0xFFF != 0 { return Err(MapError::UnalignedPhys); }
+
+    let idx = WalkIndices::from_virt(virt);
+    let base_flags = PtFlags::PRESENT | PtFlags::WRITABLE;
+
+    // SAFETY: caller guarantees pml4_phys is identity-reachable.
+    let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
+    let pdpt_phys = unsafe {
+        ensure_next_table(&mut pml4.entries[idx.pml4], base_flags)?
+    };
+
+    // SAFETY: pdpt_phys came either from an existing mapping we
+    // validated, or from a freshly-allocated frame (identity-mapped).
+    let pdpt = unsafe { &mut *pdpt_phys.as_mut_ptr::<PageTable>() };
+    if pdpt.entries[idx.pdpt].flags().contains(PtFlags::HUGE_PAGE) {
+        return Err(MapError::EncounteredHugePage);
+    }
+    let pd_phys = unsafe {
+        ensure_next_table(&mut pdpt.entries[idx.pdpt], base_flags)?
+    };
+
+    let pd = unsafe { &mut *pd_phys.as_mut_ptr::<PageTable>() };
+    if pd.entries[idx.pd].flags().contains(PtFlags::HUGE_PAGE) {
+        return Err(MapError::EncounteredHugePage);
+    }
+    let pt_phys = unsafe {
+        ensure_next_table(&mut pd.entries[idx.pd], base_flags)?
+    };
+
+    let pt = unsafe { &mut *pt_phys.as_mut_ptr::<PageTable>() };
+    if pt.entries[idx.pt].is_present() {
+        return Err(MapError::AlreadyMapped);
+    }
+    pt.entries[idx.pt] = PageTableEntry::new(phys, flags | PtFlags::PRESENT);
+
+    // SAFETY: INVLPG is always safe; syncs the TLB for the page we
+    // just mapped so subsequent accesses don't miss on stale entries.
+    unsafe { invlpg(virt); }
+
+    Ok(())
+}
+
+/// Tear down a 4 KiB mapping. Intermediate tables are left intact —
+/// Wave 2+'s refcounted-table work adds the "delete if empty" sweep.
+///
+/// # Safety
+/// Same identity-mapping precondition as `map_4kb`.
+pub unsafe fn unmap_4kb(
+    pml4_phys: PhysAddr,
+    virt: VirtAddr,
+) -> Result<PhysAddr, MapError> {
+    if !is_canonical(virt) { return Err(MapError::NonCanonical); }
+    if virt.raw() & 0xFFF != 0 { return Err(MapError::UnalignedVirt); }
+
+    let idx = WalkIndices::from_virt(virt);
+    // SAFETY: caller promises identity reachability.
+    let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
+    let e = pml4.entries[idx.pml4];
+    if !e.is_present() { return Err(MapError::AlreadyMapped); }
+    let pdpt = unsafe { &mut *e.addr().as_mut_ptr::<PageTable>() };
+
+    let e = pdpt.entries[idx.pdpt];
+    if !e.is_present() { return Err(MapError::AlreadyMapped); }
+    if e.flags().contains(PtFlags::HUGE_PAGE) {
+        return Err(MapError::EncounteredHugePage);
+    }
+    let pd = unsafe { &mut *e.addr().as_mut_ptr::<PageTable>() };
+
+    let e = pd.entries[idx.pd];
+    if !e.is_present() { return Err(MapError::AlreadyMapped); }
+    if e.flags().contains(PtFlags::HUGE_PAGE) {
+        return Err(MapError::EncounteredHugePage);
+    }
+    let pt = unsafe { &mut *e.addr().as_mut_ptr::<PageTable>() };
+
+    let removed = pt.entries[idx.pt];
+    if !removed.is_present() { return Err(MapError::AlreadyMapped); }
+    pt.entries[idx.pt] = PageTableEntry::EMPTY;
+
+    // SAFETY: INVLPG always safe.
+    unsafe { invlpg(virt); }
+
+    Ok(removed.addr())
+}
+
+/// Resolve the physical address currently mapped at `virt`, if any.
+/// Returns `None` when the walk hits a not-present entry. Treats huge
+/// pages (1 GiB at PDPT level, 2 MiB at PD level) as first-class —
+/// the returned address is the *base* of the huge page, with no
+/// offset rollup; callers that need the byte-level phys can add
+/// `virt.raw() & (page_size - 1)`.
+///
+/// # Safety
+/// `pml4_phys` must be identity-reachable (same as `map_4kb`).
+pub unsafe fn translate(
+    pml4_phys: PhysAddr,
+    virt: VirtAddr,
+) -> Option<PhysAddr> {
+    if !is_canonical(virt) { return None; }
+    let idx = WalkIndices::from_virt(virt);
+    let pml4 = unsafe { &*pml4_phys.as_ptr::<PageTable>() };
+    let e = pml4.entries[idx.pml4];
+    if !e.is_present() { return None; }
+    let pdpt = unsafe { &*e.addr().as_ptr::<PageTable>() };
+    let e = pdpt.entries[idx.pdpt];
+    if !e.is_present() { return None; }
+    if e.flags().contains(PtFlags::HUGE_PAGE) { return Some(e.addr()); }  // 1 GiB
+    let pd = unsafe { &*e.addr().as_ptr::<PageTable>() };
+    let e = pd.entries[idx.pd];
+    if !e.is_present() { return None; }
+    if e.flags().contains(PtFlags::HUGE_PAGE) { return Some(e.addr()); }  // 2 MiB
+    let pt = unsafe { &*e.addr().as_ptr::<PageTable>() };
+    let e = pt.entries[idx.pt];
+    if !e.is_present() { return None; }
+    Some(e.addr())                                                         // 4 KiB
+}
+
+/// Ensure the entry at `slot` references a present, non-huge
+/// intermediate table. Allocates a zeroed frame if the slot is empty.
+/// Returns the physical address of the next-level table.
+///
+/// # Safety
+/// - `slot` must be a mutable reference to a real PTE slot reachable
+///   under the current identity map.
+/// - The caller owns the logical mutation window (no other CPU /
+///   interrupt path can be walking this subtree).
+unsafe fn ensure_next_table(
+    slot: &mut PageTableEntry,
+    flags: PtFlags,
+) -> Result<PhysAddr, MapError> {
+    if slot.is_present() {
+        if slot.flags().contains(PtFlags::HUGE_PAGE) {
+            return Err(MapError::EncounteredHugePage);
+        }
+        return Ok(slot.addr());
+    }
+    let frame = crate::alloc_frame().map_err(|_| MapError::FrameExhausted)?;
+    let phys = frame.start_address();
+    // Caller promises identity-mapped reachability; the unsafe lives
+    // inside PageTable::zero_at.
+    PageTable::zero_at(phys.as_mut_ptr::<PageTable>());
+    *slot = PageTableEntry::new(phys, flags);
+    Ok(phys)
+}
