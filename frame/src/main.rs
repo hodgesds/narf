@@ -74,6 +74,34 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         let _ = writeln!(console::Writer, "  idt: loaded — 32 CPU-exception vectors routed");
     }
 
+    // Boot-time domain enumeration — STAGE1.md exit-gate #5. Confirm the
+    // authoritative DomainId table from security-model/ §4.1 is the one
+    // `narf_lib::id` declares at compile time.
+    {
+        use narf_lib::id::DomainId;
+        const DOMAINS: &[(DomainId, &str)] = &[
+            (DomainId::FRAME,       "FRAME"),
+            (DomainId::CAPS,        "CAPS"),
+            (DomainId::MEMORY_MGR,  "MEMORY_MGR"),
+            (DomainId::SCHED,       "SCHED"),
+            (DomainId::IPC,         "IPC"),
+            (DomainId::TRACER,      "TRACER"),
+            (DomainId::KEYS,        "KEYS"),
+            (DomainId::OBSERVE,     "OBSERVE"),
+            (DomainId::USERSPACE_K, "USERSPACE_K"),
+            (DomainId::DRIVER_0,    "DRIVER_0"),
+            (DomainId::DRIVER_1,    "DRIVER_1"),
+            (DomainId::DRIVER_2,    "DRIVER_2"),
+            (DomainId::DRIVER_3,    "DRIVER_3"),
+            (DomainId::DRIVER_4,    "DRIVER_4"),
+            (DomainId::DRIVER_5,    "DRIVER_5"),
+            (DomainId::SCRATCH,     "SCRATCH"),
+        ];
+        let _ = writeln!(console::Writer,
+            "  domains: {} declared (Stage 1 all PKS/MTE-off, rights = all-allow)",
+            DOMAINS.len());
+    }
+
     // Step 2: parse the bootloader handoff into a validated BootInfo.
     // SAFETY: the raw struct came from the arch stub; bootloader contract.
     let boot_result = unsafe {
@@ -114,7 +142,18 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         unsafe { core::arch::asm!("ud2", options(noreturn)); }
     }
 
+    // Run the kernel-test harness instead of the async demo when the
+    // `kernel-test` feature is on. `run_all_and_exit` never returns.
+    #[cfg(feature = "kernel-test")]
+    { narf_verification::run_all_and_exit(); }
+
     // ─── Stage 1 exit-gate demo: async executor + timer-driven yield ──
+    #[cfg(not(feature = "kernel-test"))]
+    run_async_demo()
+}
+
+#[cfg(not(feature = "kernel-test"))]
+fn run_async_demo() -> ! {
     narf_scheduler::init();
     let _ = writeln!(console::Writer, "  scheduler: ready queue initialised");
 

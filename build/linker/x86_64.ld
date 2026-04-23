@@ -64,6 +64,17 @@ SECTIONS
         __rodata_start = .;
         *(.rodata .rodata.*)
         *(.note.narf.probes)        /* USDT probe markers; tracing/ §3.3 */
+
+        /* Kernel-test collector. `kernel_test!` writes KernelTest
+         * entries into this section; the harness reads the slice
+         * bounded by the two symbols below. Wrap in KEEP so gc-sections
+         * doesn't discard unused tests.
+         */
+        . = ALIGN(8);
+        __narf_tests_start = .;
+        KEEP(*(narf.tests))
+        __narf_tests_end   = .;
+
         __rodata_end = .;
     } :rodata
 

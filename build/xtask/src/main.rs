@@ -184,11 +184,16 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Build(args) => { cargo_build(&args, &workspace_root()?)?; Ok(()) }
         Cmd::Run(args)   => run_cmd(&args),
-        Cmd::Test(args)  => {
-            // TODO(stage-1-wave-3): integrate `verification/` kernel_test harness.
-            eprintln!("xtask test: stub (arch={:?}); wires in with verification/ Wave 3.",
-                args.arch.triple());
-            Ok(())
+        Cmd::Test(mut args)  => {
+            // Run the verification/ harness: build with `kernel-test`
+            // feature on, boot under QEMU, map isa-debug-exit status
+            // to cargo test's "passed" / "failed" convention.
+            if args.features.is_empty() {
+                args.features = "kernel-test".into();
+            } else if !args.features.contains("kernel-test") {
+                args.features.push_str(",kernel-test");
+            }
+            run_cmd(&args)
         }
         Cmd::Image(args) => {
             eprintln!("xtask image: stub (arch={:?}); wires in with boot/ at Stage 1 Wave 1.",

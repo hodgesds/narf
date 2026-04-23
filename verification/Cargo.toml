@@ -1,0 +1,20 @@
+[package]
+name         = "narf-verification"
+description  = "Kernel-test harness: #[kernel_test] collector, runtime dispatch, pass/fail exit."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_verification"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib     = { path = "../lib" }
+narf-arch    = { path = "../arch" }
+narf-console = { path = "../console" }
+
+[lints]
+workspace = true

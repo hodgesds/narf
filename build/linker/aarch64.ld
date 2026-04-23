@@ -51,6 +51,12 @@ SECTIONS
         __rodata_start = .;
         *(.rodata .rodata.*)
         *(.note.narf.probes)   /* USDT probe markers; tracing/ §3.3 */
+
+        . = ALIGN(8);
+        __narf_tests_start = .;
+        KEEP(*(narf.tests))
+        __narf_tests_end   = .;
+
         __rodata_end = .;
     } :rodata
 

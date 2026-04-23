@@ -151,6 +151,7 @@ dependencies = [
  "narf-memory",
  "narf-scheduler",
  "narf-time",
+ "narf-verification",
 ]
 
 [[package]]
@@ -177,6 +178,15 @@ name = "narf-time"
 version = "0.0.0"
 dependencies = [
  "narf-arch",
+ "narf-lib",
+]
+
+[[package]]
+name = "narf-verification"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-console",
  "narf-lib",
 ]
 

@@ -12,18 +12,22 @@ name = "narf-frame"
 path = "src/main.rs"
 
 [dependencies]
-narf-lib       = { path = "../lib" }
-narf-arch      = { path = "../arch" }
-narf-memory    = { path = "../memory" }
-narf-boot      = { path = "../boot" }
-narf-console   = { path = "../console" }
-narf-time      = { path = "../time" }
-narf-scheduler = { path = "../scheduler" }
+narf-lib           = { path = "../lib" }
+narf-arch          = { path = "../arch" }
+narf-memory        = { path = "../memory" }
+narf-boot          = { path = "../boot" }
+narf-console       = { path = "../console" }
+narf-time          = { path = "../time" }
+narf-scheduler     = { path = "../scheduler" }
+narf-verification  = { path = "../verification", optional = true }
 
 [features]
 # Self-test: trigger a #UD at end-of-boot to prove the IDT dispatches.
 # Off by default; enable with `cargo xtask run --arch=x86_64 --features idt-selftest`.
 idt-selftest = []
+# Run the narf-verification kernel-test harness instead of the async demo.
+# Used by `cargo xtask test` — exits 0 if all tests pass, non-zero otherwise.
+kernel-test  = ["dep:narf-verification"]
 
 [lints]
 workspace = true
