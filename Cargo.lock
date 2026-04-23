@@ -188,6 +188,7 @@ dependencies = [
  "narf-arch",
  "narf-console",
  "narf-lib",
+ "narf-memory",
  "narf-scheduler",
  "narf-time",
 ]

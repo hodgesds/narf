@@ -245,6 +245,24 @@ fn smoke_scheduler_drives_future() -> TestResult {
 }
 kernel_test!(smoke_scheduler_drives_future);
 
+fn smoke_frame_alloc_roundtrip() -> TestResult {
+    // Allocator has to be initialised by the bin crate's _start_rust,
+    // so we just assert alloc-then-free works and returns a valid frame.
+    let f = match narf_memory::alloc_frame() {
+        Ok(f) => f,
+        Err(narf_memory::FrameAllocError::Uninitialised) => {
+            return TestResult::Skip("frame allocator not initialised in this flavour");
+        }
+        Err(_) => return TestResult::Fail("alloc_frame unexpectedly failed"),
+    };
+    if f.start_address().raw() & (narf_memory::PAGE_SIZE - 1) != 0 {
+        return TestResult::Fail("frame not page-aligned");
+    }
+    narf_memory::free_frame(f);
+    TestResult::Pass
+}
+kernel_test!(smoke_frame_alloc_roundtrip);
+
 fn smoke_sleep_future_waits() -> TestResult {
     use core::sync::atomic::{AtomicBool, Ordering};
     static DONE: AtomicBool = AtomicBool::new(false);

@@ -124,6 +124,37 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             }
             let _ = writeln!(console::Writer,
                 "  usable RAM: {} MiB", usable_bytes / (1024 * 1024));
+
+            // Bring the frame allocator online. Exclude the kernel image
+            // itself so we don't hand out our own code/data as free frames.
+            // SAFETY: __kernel_start / __kernel_end are linker-provided
+            // symbols bounding the loaded image in physical memory.
+            extern "C" {
+                static __kernel_start: u8;
+                static __kernel_end:   u8;
+            }
+            let kstart = core::ptr::addr_of!(__kernel_start) as u64;
+            let kend   = core::ptr::addr_of!(__kernel_end)   as u64;
+
+            let regions: alloc::vec::Vec<narf_memory::UsableRegion> =
+                info.memory_map.iter()
+                    .filter(|r| r.kind == narf_boot::MemRegionKind::Usable)
+                    .map(|r| narf_memory::UsableRegion {
+                        start: r.start,
+                        len:   r.len,
+                    })
+                    .collect();
+            let exclude: &[(u64, u64)] = &[(kstart, kend)];
+
+            // SAFETY: first call, BSP, memory map came from parse_raw
+            // which validated magic + min-RAM.
+            unsafe { narf_memory::init_from_map(&regions, exclude); }
+
+            let s = narf_memory::frame_stats();
+            let _ = writeln!(console::Writer,
+                "  frames: total {} / free {} / reserved {} ({} MiB usable)",
+                s.total, s.free, s.reserved,
+                (s.free as u64) * narf_memory::PAGE_SIZE / (1024 * 1024));
         }
         Err(e) => {
             let _ = writeln!(console::Writer, "  boot parse failed: {e:?}");
