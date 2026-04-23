@@ -5,6 +5,11 @@
 resolver = "2"
 members = [
     "lib",
+    "arch",
+    "boot",
+    "console",
+    "memory",
+    "frame",
     "build/xtask",
 ]
 

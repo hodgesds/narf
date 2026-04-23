@@ -117,8 +117,50 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
+name = "narf-arch"
+version = "0.0.0"
+dependencies = [
+ "narf-lib",
+]
+
+[[package]]
+name = "narf-boot"
+version = "0.0.0"
+dependencies = [
+ "narf-lib",
+ "narf-memory",
+]
+
+[[package]]
+name = "narf-console"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-lib",
+ "narf-memory",
+]
+
+[[package]]
+name = "narf-frame"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-boot",
+ "narf-console",
+ "narf-lib",
+ "narf-memory",
+]
+
+[[package]]
 name = "narf-lib"
 version = "0.0.0"
+
+[[package]]
+name = "narf-memory"
+version = "0.0.0"
+dependencies = [
+ "narf-lib",
+]
 
 [[package]]
 name = "once_cell_polyfill"

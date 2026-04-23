@@ -1,0 +1,20 @@
+[package]
+name         = "narf-console"
+description  = "Early serial console: 16550A (x86_64) / PL011 (aarch64), panic sink, MMU-enable handoff."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_console"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib    = { path = "../lib" }
+narf-arch   = { path = "../arch" }
+narf-memory = { path = "../memory" }
+
+[lints]
+workspace = true

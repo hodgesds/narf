@@ -1,0 +1,19 @@
+[package]
+name         = "narf-boot"
+description  = "Bootloader handoff (multiboot2 / U-Boot FDT), BootInfo validation."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_boot"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib    = { path = "../lib" }
+narf-memory = { path = "../memory" }
+
+[lints]
+workspace = true

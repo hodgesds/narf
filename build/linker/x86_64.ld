@@ -1,23 +1,22 @@
 /*
  * NARF kernel linker script — x86_64.
  *
- * Spec: build/specification/spec.md §5 (kernel at -2GiB high half),
- *       boot/specification/spec.md §3–§5 (Limine handoff).
+ * Spec: build/specification/spec.md §5, boot/specification/spec.md §3–§5.
  *
- * Invariant (STAGE1.md Wave 0 #2): the `.boot` section comes before `.text`.
- * `boot/` code must be reachable at the early physical-map address the
- * bootloader hands us, then control transfers into `.text` once the virtual
- * mapping is up. ASSERT() below catches any accidental reorder.
+ * Stage 1 layout: link + load both at physical 0x100000 (the Multiboot
+ * standard load address). Higher-half relocation is deferred until `memory/`
+ * brings the MMU up with the final kernel-virtual mapping and
+ * `console::remap_to_virtual` executes — that's the earliest we can jump
+ * from low-half into -2 GiB without unmapped-address faults. See
+ * STAGE1.md Wave 1 for the critical-path reasoning.
+ *
+ * Invariant (STAGE1.md Wave 0 #2): `.boot` precedes `.text`. The ASSERT
+ * at the end of this file is the static guard.
  */
 
 ENTRY(_start)
 
-/* Kernel linked to run at -2GiB (standard kernel high half on x86_64).
- * The bootloader identity-maps the first few MiB of the kernel image so the
- * `.boot` stub can execute at its physical address before paging is on.
- */
-KERNEL_VIRT_BASE = 0xFFFFFFFF80000000;
-KERNEL_PHYS_BASE = 0x0000000000100000;  /* 1 MiB — Limine default load addr */
+KERNEL_LOAD_BASE = 0x100000;    /* Multiboot low-1-MiB load address */
 
 PHDRS
 {
@@ -25,24 +24,35 @@ PHDRS
     text   PT_LOAD FLAGS(5); /* R-X */
     rodata PT_LOAD FLAGS(4); /* R-- */
     data   PT_LOAD FLAGS(6); /* RW- */
+    note   PT_NOTE FLAGS(4); /* R-- : PVH / Xen entry note (see boot.S) */
 }
 
 SECTIONS
 {
-    . = KERNEL_VIRT_BASE + KERNEL_PHYS_BASE;
+    . = KERNEL_LOAD_BASE;
 
     __kernel_start = .;
 
-    /* `.boot` lives before `.text`. The bootloader enters through a symbol
-     * in `.boot` before the MMU is fully programmed to the kernel's view.
-     * See STAGE1.md Wave 1 / console+memory MMU handoff protocol.
+    /*
+     * `.boot` is where `_start` lives. It runs in 32-bit protected mode
+     * directly after multiboot2 hands control over, transitions to long
+     * mode, and then calls into `.text` (`_start_rust`). The multiboot2
+     * header must be within the first 32 KiB of the ELF and 8-byte
+     * aligned — we place it as the first section of `.boot`.
      */
     .boot : ALIGN(4K) {
         __boot_start = .;
-        KEEP(*(.boot.header))
         KEEP(*(.boot .boot.*))
         __boot_end = .;
     } :boot
+
+    /* PT_NOTE only — the note is read by the loader at boot time, not
+     * mapped into guest memory at runtime. Assigning it to :rodata too
+     * makes the rodata PT_LOAD span everything through .text, which
+     * trips QEMU's "overlapping ROM regions" check. */
+    .note.Xen : ALIGN(4) {
+        KEEP(*(.note.Xen))
+    } :note
 
     .text : ALIGN(4K) {
         __text_start = .;
@@ -53,7 +63,7 @@ SECTIONS
     .rodata : ALIGN(4K) {
         __rodata_start = .;
         *(.rodata .rodata.*)
-        *(.note.narf.probes)   /* USDT probe markers; tracing/ §3.3 */
+        *(.note.narf.probes)        /* USDT probe markers; tracing/ §3.3 */
         __rodata_end = .;
     } :rodata
 
@@ -78,13 +88,9 @@ SECTIONS
         *(.comment)
         *(.dynamic)
         *(.interp)
+        *(.gcc_except_table*)
     }
 }
 
-/* The load-bearing assertion from STAGE1.md Wave 0 #2:
- * `.boot` MUST be before `.text` in the file layout; otherwise the bootloader
- * hands control to code that assumes paging is already on, and we silently
- * triple-fault at MMU enable.
- */
 ASSERT(__boot_end <= __text_start,
        "linker: .boot section must come before .text — see build/ §4")

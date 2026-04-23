@@ -44,8 +44,9 @@ struct BuildArgs {
     #[arg(long)]
     release: bool,
 
-    /// Crate to build (defaults to the first kernel crate — Stage 1 only has `narf-lib`).
-    #[arg(long, default_value = "narf-lib")]
+    /// Crate to build. `narf-frame` is the kernel bin; `narf-lib` is a rlib
+    /// used for cross-target sanity checks.
+    #[arg(long, default_value = "narf-frame")]
     package: String,
 }
 
@@ -145,24 +146,25 @@ fn run_cmd(args: &BuildArgs) -> Result<()> {
     let root = workspace_root()?;
     let out_dir = cargo_build(args, &root)?;
 
-    // Stage 1: `narf-lib` is the only crate and it's a library — nothing to
-    // run yet. `frame/`'s `_start` binary lands in Wave 2; this branch is
-    // the harness shape so that wiring is a one-line change then.
-    let kernel = out_dir.join(format!("{}.elf", args.package));
+    // Cargo names kernel binaries the same as the [[bin]] `name` field in
+    // the crate's Cargo.toml. For narf-frame that's `narf-frame`, no .elf
+    // extension.
+    let kernel = out_dir.join(&args.package);
     if !kernel.exists() {
-        println!("Stage 1: no bootable kernel yet (only `narf-lib` exists).");
-        println!("         `frame/` will produce `{}` at Wave 2.", kernel.display());
-        return Ok(());
+        bail!("expected kernel binary at {} — did `cargo build` succeed?",
+              kernel.display());
     }
 
     let qemu = args.arch.qemu_bin();
     let mut cmd = Command::new(qemu);
     cmd.args(args.arch.qemu_args(&kernel));
+    println!("xtask: launching {} {}", qemu, kernel.display());
     let status = cmd.status()
         .with_context(|| format!("failed to invoke {qemu} — is it installed?"))?;
-    if !status.success() {
-        bail!("{qemu} exited with status {status}");
-    }
+    // QEMU exits non-zero for many legitimate reasons (reset/shutdown via
+    // the debug-exit device, Ctrl-A x). Treat any exit as "ran"; caller
+    // inspects serial output for pass/fail.
+    println!("xtask: {qemu} exited with {status}");
     Ok(())
 }
 

@@ -1,0 +1,18 @@
+[package]
+name         = "narf-arch"
+description  = "NARF hardware abstraction layer: CPU, MMU, interrupts, timer. Per-arch backends under #[cfg]."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_arch"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib = { path = "../lib" }
+
+[lints]
+workspace = true

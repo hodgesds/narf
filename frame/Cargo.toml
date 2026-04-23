@@ -1,0 +1,22 @@
+[package]
+name         = "narf-frame"
+description  = "TCB: boot CPU bring-up, trap-prologue PKRS save (Stage 2+), panic path."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[[bin]]
+name = "narf-frame"
+path = "src/main.rs"
+
+[dependencies]
+narf-lib     = { path = "../lib" }
+narf-arch    = { path = "../arch" }
+narf-memory  = { path = "../memory" }
+narf-boot    = { path = "../boot" }
+narf-console = { path = "../console" }
+
+[lints]
+workspace = true
