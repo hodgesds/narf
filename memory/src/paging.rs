@@ -44,11 +44,29 @@ impl PtFlags {
     /// interpreted; without NXE the bit is reserved-zero).
     pub const NO_EXEC:   Self = Self(1 << 63);
 
+    /// Protection-key mask. Bits 59..=62 in a PTE hold the PK field
+    /// (4 bits, 16 possible domains). See SDM Vol 3 §4.6.2.
+    pub const PK_MASK: Self = Self(0xF << 59);
+
     pub const EMPTY: Self = Self(0);
 
     #[inline] pub const fn bits(self) -> u64 { self.0 }
     #[inline] pub const fn contains(self, other: Self) -> bool {
         (self.0 & other.0) == other.0
+    }
+
+    /// Flag mask that tags a PTE with protection-key `domain`. Only the
+    /// low 4 bits of `domain` are used; higher bits are silently masked.
+    #[inline]
+    pub const fn pk(domain: u8) -> Self {
+        Self(((domain as u64) & 0xF) << 59)
+    }
+
+    /// Extract the protection-key domain from a flag value. Returns a
+    /// value in 0..=15.
+    #[inline]
+    pub const fn pk_of(self) -> u8 {
+        ((self.0 >> 59) & 0xF) as u8
     }
 }
 
@@ -332,6 +350,33 @@ pub unsafe fn unmap_4kb(
     unsafe { invlpg(virt); }
 
     Ok(removed.addr())
+}
+
+/// Return the PT-level flags currently set for `virt`, or `None` if
+/// unmapped / resolved at a huge-page level. Useful for verifying that
+/// a `map_4kb` call preserved the flags the caller requested (especially
+/// the PK field, which won't show in a plain `translate` call).
+///
+/// # Safety
+/// `pml4_phys` must be identity-reachable (same as `map_4kb`).
+pub unsafe fn flags_at(pml4_phys: PhysAddr, virt: VirtAddr) -> Option<PtFlags> {
+    if !is_canonical(virt) { return None; }
+    let idx = WalkIndices::from_virt(virt);
+    let pml4 = unsafe { &*pml4_phys.as_ptr::<PageTable>() };
+    let e = pml4.entries[idx.pml4];
+    if !e.is_present() { return None; }
+    let pdpt = unsafe { &*e.addr().as_ptr::<PageTable>() };
+    let e = pdpt.entries[idx.pdpt];
+    if !e.is_present() { return None; }
+    if e.flags().contains(PtFlags::HUGE_PAGE) { return None; }
+    let pd = unsafe { &*e.addr().as_ptr::<PageTable>() };
+    let e = pd.entries[idx.pd];
+    if !e.is_present() { return None; }
+    if e.flags().contains(PtFlags::HUGE_PAGE) { return None; }
+    let pt = unsafe { &*e.addr().as_ptr::<PageTable>() };
+    let e = pt.entries[idx.pt];
+    if !e.is_present() { return None; }
+    Some(e.flags())
 }
 
 /// Resolve the physical address currently mapped at `virt`, if any.

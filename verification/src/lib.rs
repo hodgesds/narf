@@ -246,6 +246,59 @@ fn smoke_scheduler_drives_future() -> TestResult {
 kernel_test!(smoke_scheduler_drives_future);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_pks_set_get_rights() -> TestResult {
+    // SAFETY: CPUID always legal.
+    let feats = unsafe { narf_arch::x86_64::Features::probe() };
+    if !feats.pks {
+        return TestResult::Skip("PKS not exposed by this CPU");
+    }
+    use narf_arch::x86_64::pks::{save, restore, get_rights, set_rights, DomainRights};
+    // SAFETY: feats.pks==true.
+    let saved = unsafe { save() };
+    // Set domain 3 to read-only, domain 7 to deny-all; leave others.
+    unsafe {
+        set_rights(3, DomainRights::READ_ONLY);
+        set_rights(7, DomainRights::DENY_ALL);
+    }
+    let r3 = unsafe { get_rights(3) };
+    let r7 = unsafe { get_rights(7) };
+    // Restore *before* returning so subsequent tests / code aren't
+    // affected by our mutation.
+    unsafe { restore(saved); }
+    if r3 != DomainRights::READ_ONLY {
+        return TestResult::Fail("set_rights(3, READ_ONLY) didn't round-trip");
+    }
+    if r7 != DomainRights::DENY_ALL {
+        return TestResult::Fail("set_rights(7, DENY_ALL) didn't round-trip");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_pks_set_get_rights);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_pte_pk_field() -> TestResult {
+    use narf_memory::paging::PtFlags;
+    // Build a flag value with PK=7; check the round-trip + isolation
+    // from other flag bits.
+    let f = PtFlags::WRITABLE | PtFlags::pk(7);
+    if f.pk_of() != 7 {
+        return TestResult::Fail("pk_of didn't recover the PK field");
+    }
+    if !f.contains(PtFlags::WRITABLE) {
+        return TestResult::Fail("pk bits stomped on unrelated flag bit");
+    }
+    // PK=0 is the default / "unrestricted" case.
+    let g = PtFlags::PRESENT | PtFlags::pk(0);
+    if g.pk_of() != 0 {
+        return TestResult::Fail("pk(0) encoding wrong");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_pte_pk_field);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_pkrs_roundtrip() -> TestResult {
     // PKS availability is a hardware property; only run the roundtrip
     // if CR4.PKS was enabled during boot. Otherwise IA32_PKRS would
@@ -275,6 +328,48 @@ fn smoke_pkrs_roundtrip() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_pkrs_roundtrip);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_map_preserves_pk_field() -> TestResult {
+    // Verify map_4kb preserves the PK field at the PTE level: tag a
+    // virtual page with PK=5, then read back the PTE flags and check
+    // that pk_of returns 5.
+    use narf_memory::paging::{flags_at, map_4kb, unmap_4kb, PageTable, PtFlags};
+    use narf_memory::{alloc_frame, FrameAllocError, PhysAddr, VirtAddr};
+
+    let pml4 = match alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(FrameAllocError::Uninitialised) =>
+            return TestResult::Skip("frame allocator not initialised"),
+        Err(_) => return TestResult::Fail("alloc_frame failed"),
+    };
+    PageTable::zero_at(pml4.as_mut_ptr::<PageTable>());
+
+    let virt = VirtAddr::new(0x9abc_0000);
+    let phys = PhysAddr::new(0x8765_0000);
+    let requested = PtFlags::WRITABLE | PtFlags::pk(5);
+    // SAFETY: isolated PML4, identity-reachable via the low-4-GiB map.
+    if unsafe { map_4kb(pml4, virt, phys, requested) }.is_err() {
+        return TestResult::Fail("map_4kb with PK=5 failed");
+    }
+    let got = match unsafe { flags_at(pml4, virt) } {
+        Some(f) => f,
+        None    => return TestResult::Fail("flags_at returned None"),
+    };
+    if got.pk_of() != 5 {
+        return TestResult::Fail("PK field lost through map_4kb");
+    }
+    if !got.contains(PtFlags::WRITABLE) {
+        return TestResult::Fail("WRITABLE lost");
+    }
+    if !got.contains(PtFlags::PRESENT) {
+        return TestResult::Fail("PRESENT missing");
+    }
+    let _ = unsafe { unmap_4kb(pml4, virt) };
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_map_preserves_pk_field);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_paging_map_translate_unmap() -> TestResult {
