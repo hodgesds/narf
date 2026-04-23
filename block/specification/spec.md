@@ -1,0 +1,196 @@
+# block — Specification
+
+> Status: **Outline v0.1** (Stage 3 → 4).
+
+## 1. Purpose & scope
+
+**Owns:** The generic interface every block device (real or virtual)
+implements, the I/O scheduler that orders requests across consumers,
+multi-queue dispatch, and operations that aren't just read/write:
+discard/TRIM, flush, write-zeroes, zone management (deferred).
+
+**Does NOT own:**
+
+- Concrete block drivers — live in `drivers/{nvme,virtio,…}`.
+- Filesystems or file semantics — `filesystem/`.
+- DMA buffer mechanics — `io/`.
+- Caching decisions (page cache equivalent) — `filesystem/` owns the
+  cache; `block/` is a pass-through unless explicitly configured.
+
+## 2. Assumptions
+
+- `drivers/` produce devices that implement the `BlockDevice` trait.
+- `io/` supplies `DmaBuffer<T>` for backing I/O.
+- `ipc/` Narf-Rings carry requests between `block/` and drivers.
+- `capabilities/` gates access: `Cap<BlockDevice, R>` where R ∈ {Read,
+  Write, Admin, Discard}.
+
+## 3. Public interface
+
+### 3.1 Device trait
+
+```rust
+pub trait BlockDevice: Send + Sync {
+    fn logical_block_size(&self) -> u32;          // e.g. 512 or 4096
+    fn physical_block_size(&self) -> u32;
+    fn capacity_blocks(&self) -> u64;
+    fn supports(&self, feat: BlockFeature) -> bool;
+
+    fn submit(&self, req: BlockRequest) -> impl Future<Output = BlockCompletion>;
+    fn flush(&self)                     -> impl Future<Output = ()>;
+    fn discard(&self, range: LbaRange)  -> impl Future<Output = ()>;
+
+    /// Cancel an in-flight request by kernel-assigned tag.
+    /// Returns `Cancelled` (op was aborted before hardware completed),
+    /// `Completed` (op finished naturally; caller should drain the
+    /// completion to inspect the result), or `NotFound` (tag refers
+    /// to no in-flight op — already completed and drained, or never
+    /// submitted). Required by `abi/` §3.1 cancellation protocol.
+    fn cancel(&self, tag: u64) -> impl Future<Output = CancelResult>;
+}
+
+pub enum CancelResult { Cancelled, Completed, NotFound }
+pub enum BlockFeature { Flush, Discard, WriteZeroes, Fua, Zoned, AtomicWrites }
+```
+
+### 3.2 Request / completion
+
+```rust
+pub struct BlockRequest {
+    pub op:       BlockOp,           // Read | Write { fua: bool } | WriteZeroes | Trim
+    pub lba:      u64,
+    pub blocks:   u32,
+    pub buffer:   Cap<DmaBuffer, _>, // cap-gated; payload never copied through block/
+    pub qos:      QosHint,           // Latency | Throughput | Background
+    pub user_tag: u64,               // opaque to the kernel; echoed in completion
+}
+
+pub struct BlockCompletion {
+    pub tag:      u64,               // kernel-assigned; primary key for cancel
+    pub user_tag: u64,               // echoed from the submission
+    pub result:   Result<(), BlockError>,
+    pub timing:   Option<IoTiming>,  // opt-in, via tracing/ FnTime equivalent
+}
+```
+
+**Two tags, not one.** The submission carries a caller-set
+`user_tag` (opaque correlation cookie) and receives a
+kernel-assigned `tag` in the completion. The kernel's `tag` is
+unique across all in-flight requests system-wide and is the
+primary key for `cancel`. Without this split, two callers could
+collide on the same `tag` and target each other's cancellations.
+
+Zero-copy: `buffer` is a DMA buffer cap owned by the caller; the
+driver DMAs directly into/out of it. `block/` is routing + scheduling,
+not a copy stage.
+
+### 3.3 I/O scheduler
+
+Baseline algorithm: **deadline + fair-share**.
+
+- Each request carries a `QosHint`. Latency-class requests get a
+  short deadline (default 1 ms); throughput-class requests get a
+  longer deadline (default 100 ms); background-class requests yield
+  to the others.
+- **Per-`Cap<BlockDevice>` rate limiting**, not per-task. Each cap
+  carries a configurable token bucket (tokens-per-second, default
+  unlimited). Revocation of the cap atomically removes its bucket
+  from the scheduler's accounting table. Per-cap is correct because
+  one task may hold multiple caps with different rates (e.g. a fast
+  log device + a throttled scratch device).
+- Priority inversion avoided by treating the highest-class pending
+  request as the scheduler's head-of-line.
+
+Deliberately simpler than Linux's mq-deadline/BFQ. Replaceable per
+device via `BlockSchedulerPolicy` if a specific workload demands it.
+
+### 3.4 Multi-queue dispatch
+
+- A `BlockDevice` may expose N submission queues (typical: one per
+  CPU for NVMe).
+- `block/` places the scheduler upstream of the driver queues —
+  request ordering happens per-device, dispatch happens per-queue.
+- Consumers don't see queue multiplicity; they submit against the
+  device, `block/` picks the queue (CPU-local preferred).
+
+## 4. Invariants & safety properties
+
+- No byte of I/O data ever lives in `block/` address space; all
+  payload movement is DMA between driver and consumer-owned buffer.
+- Capability discipline: a consumer with `Cap<BlockDevice, Read>`
+  cannot issue `Write` or `Discard` — the trait method is gated at
+  the invocation surface.
+- **Every `submit` / `flush` / `discard` resolves its
+  `Cap<BlockDevice, _>` via `Cap::invoke` at dispatch time.** A
+  device detach / hot-remove / admin revoke bumps the device's
+  object epoch; outstanding caps return `Err(Revoked)` on their next
+  operation. In-flight requests are fenced: the driver drops on-the-
+  wire completions for submissions whose cap went stale during the
+  trip. See `capabilities/` §3 for epoch mechanics.
+- Flush ordering: a submitted flush completes only after every
+  previously-submitted write on the same device has completed.
+- Discard is advisory (blocks may or may not be zeroed on next read
+  unless `WriteZeroes` is used); document this to callers.
+- QoS hints are hints. The scheduler never misses a hard deadline
+  because of a QoS reordering; it only reorders within the slack.
+- **Submission and completion rings inherit `ipc/` §4 in full:**
+  explicit release/acquire barrier pair on indices (matters on
+  aarch64), cache-line partitioning, 2-bit wrap counter +
+  AVAIL/USED flag, no silent completion drops.
+- **Submission back-pressure: standard `ipc/` blocking-via-waker.**
+  A consumer that submits faster than the device can absorb is
+  blocked until queue space frees. Latency-class submissions are
+  scheduled ahead of background-class ones within the slack but
+  receive no exemption from back-pressure.
+- **Cancellation:** dropping the Future returned by `submit` requests
+  cancellation, not blind discard. The driver returns a definitive
+  `Cancelled` completion; the DMA buffer is reclaimed only after
+  that completion arrives. Dropping without waiting for the
+  `Cancelled` is a leak (and a debug-build assertion).
+  **The `block/` scheduler is responsible for injecting
+  `BlockDevice::cancel(tag)` on behalf of a dropped Future** — the
+  user side does not need to issue cancel explicitly; the scheduler
+  notices the dropped wake-target and propagates. This closes the
+  DMA-buffer UAF hazard at the layer where it can be enforced.
+
+## 5. Architecture notes
+
+Largely arch-neutral. Two points of contact:
+
+- **Memory ordering of submission/completion indices** — release on
+  submit, acquire on complete; drivers implement per arch.
+- **Atomic 64-bit CAS** on request tag allocation — present on both
+  primary archs.
+
+## 6. Dependencies
+
+- **Consumes:** `drivers/` (provides devices), `io/` (DMA buffers),
+  `ipc/` (request Narf-Ring), `capabilities/`, `time/` (deadlines),
+  `tracing/` (per-request timing via USDT), `scheduler/` (dispatch
+  worker task), `rcu/` (device registry — many readers across
+  filesystem and direct-block tools, rare writers on hot-plug).
+- **Provides to:** `filesystem/` (primary consumer), any direct-block
+  userspace tooling with an appropriate cap.
+
+## 7. Stage assignment
+
+| Stage | Lands                                                          |
+| ----- | -------------------------------------------------------------- |
+| 3     | Core `BlockDevice` trait + `cancel`, single-queue deadline scheduler, flush, virtio-blk backing, **composable device stacking via `stack(inner: Cap<BlockDevice, _>, transform: BlockTransform) -> Cap<BlockDevice, _>`** so `crypto/` can register encrypted-at-rest as the first transform without forcing a Stage 4 retrofit of `filesystem/`. |
+| 4     | Multi-queue dispatch, discard/TRIM, write-zeroes, per-consumer fair-share, NVMe backing. |
+| post-1.0 | Zoned block devices, atomic writes, write hints (stream IDs). |
+
+## 8. Open questions
+
+- **Cache home.** Is there a page-cache equivalent, and if so does it
+  live in `block/` or `filesystem/`? Current lean: in `filesystem/`,
+  with `block/` pure pass-through, because caching is a per-FS policy
+  decision.
+- **Request fairness at scale.** Per-task or per-cap-chain fair share?
+  Per-cap-chain is more defensible but harder to account.
+- **Barrier semantics.** Do we need explicit barrier requests, or is
+  `flush` sufficient? Modern NVMe suggests flush is enough.
+- **Encrypted-at-rest path.** Between `block/` and driver, or between
+  `filesystem/` and `block/`? Affects where `crypto/` plugs in.
+- **Live-migration of in-flight I/O** (e.g. device hot-remove).
+  Complexity vs. value pre-1.0.

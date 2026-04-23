@@ -1,0 +1,66 @@
+# lib — Design Notes
+
+> 2026-04-22. Author: Claude Sonnet 4.6 (design-phase analysis).
+> Note: lib/research/summaries/ has 0 entries; analysis draws on project docs + training knowledge.
+
+---
+
+## Load-bearing decisions
+
+**The `SpinLock<T>` "panics if locked from irq-unsafe context" model needs a compile-time mechanism, not a runtime panic.** §3.1 says "`SpinLock` used from an IRQ-possible context is a compile error via a marker trait on the guard (`Send`/`!Send` discipline)." This is the right intent, but the `Send`/`!Send` approach is not sufficient: `Send` means a value can be sent across thread boundaries; it does not encode "this guard was acquired while IRQs were disabled." The correct mechanism is a typestate approach — `SpinLockGuard<T, IrqState>` where `IrqState` is either `IrqsEnabled` or `IrqsDisabled`, and the guard can only be `Send` (usable across an interrupt handler) when `IrqsDisabled`. Linux's `lockdep` makes this check dynamic; parking_lot makes it a convention; the right Rust approach is a typestate that makes the unsafe combination a type error at the call site.
+
+**`IrqSafeSpinLock<T>` disabling interrupts "for the duration" has a scope issue.** Disabling IRQs on one CPU for a spinlock protects the lock against the IRQ handler on *that* CPU, but on SMP the lock itself (a `fetch_and_swap` or LOCK CMPXCHG) protects against other CPUs. The current spec implies a single type handles both cases, but the semantics diverge: `IrqSafeSpinLock` on a uniprocessor is just a critical section; on SMP it is a critical section *plus* a cross-CPU spin. The performance characteristic is different — on uniprocessor, you never spin; on SMP, you may spin for hundreds of cycles while IRQs are off on your CPU. The spec should acknowledge that `IrqSafeSpinLock` is acceptable only for *short* critical sections (< ~10 µs or the preemption latency will degrade).
+
+**The async `Mutex<T>` tied to `scheduler/` wakers is a circular dependency risk.** `lib/` is supposed to be the bottom of the dependency tree ("provides to: everything"). But `Mutex<T>` uses `scheduler/` wakers, meaning `lib/` depends on `scheduler/`. If `scheduler/` imports anything from `lib/` (e.g., a `SpinLock` or `BinaryHeap`), there is a circular crate dependency that Cargo cannot resolve. This must be broken either by: (a) splitting `lib/` into `lib-core` (no async, no scheduler dependency) and `lib-async` (depends on `scheduler/`), or (b) using a callback/trait-based waker interface that `scheduler/` implements and `lib/` takes as a type parameter. Option (b) is the standard Rust async pattern (`core::task::Waker`) and should be adopted.
+
+**`SeqLock<T>` is listed but is dangerous for complex types.** SeqLock works correctly only for `Copy` types (plain integer-like values) because the reader may observe torn state mid-read and must retry. For a `SeqLock<T>` where `T` is a struct, the reader copies the bytes without calling any constructor, then checks the sequence — if torn, retries. But if `T` contains pointers or references, the torn-state copy may contain a partially-written pointer. Dereferencing it before the retry check is undefined behavior. The `SeqLock<T: Copy>` bound must be in the type signature, not just implied by documentation.
+
+**`BinaryHeap<T: Ord>` pinned — "pin-stable" is not enough without a proof.** §3.2 says the `BinaryHeap` is "pin-stable." A `BinaryHeap` moves elements during sift-up/sift-down operations; if elements contain self-referential pointers (unlikely for kernel data, but possible with intrusive timers), this is UB. For the timer wheel in `time/` and the run-queue in `scheduler/`, the heap elements are `Ord`-by-priority task handles (not self-referential), so this is fine. But the `BinaryHeap` used as a priority queue in a domain-aware context must ensure that heap entries are always from the same domain (no mixing of domains inside one heap instance), or the comparison operator must be domain-safe. This is not a type constraint today.
+
+---
+
+## Divergences from precedent
+
+**`spin` crate vs. in-tree spinlock implementation:** The research README notes `spin` as the starting point. The `spin` crate's `SpinLock` is simple and correct for uniprocessor, but it has no IRQ-state awareness, no lockdep equivalent, and no ticket-spinlock variant (which is important for fairness under high contention). Linux's ticket spinlock (later MCS lock, now qspinlock) was evolved specifically because simple spinlocks starve CPUs under contention. For NARF's expected workload (relatively few CPUs, mostly uncontended locks), simple spinlocks are probably fine through Stage 2, but the spec should note that lock contention benchmarks are a required perf gate before any spinlock implementation is considered correct.
+
+**`parking_lot` patterns vs. a proper async `Mutex`:** `parking_lot` is based on the idea of a user-space parking lot — threads park on a futex when contended. In a kernel, there are no futexes; there is the scheduler. The async `Mutex` in `lib/` must use `core::task::Waker` to register interest and have the lock-release path wake the first waiter. The `parking_lot` pattern is inspiration for the data layout (tagged pointer to a wait queue), but the mechanism must be the scheduler's waker infrastructure. This is a non-trivial design that deserves a dedicated design note, not just "port `parking_lot` patterns to `no_std`."
+
+**Linux kernel's `list_head` vs. NARF's `IntrusiveList<T: Linked>`:** Linux's `list_head` is embedded in every struct that participates in a doubly-linked list. NARF's `Linked` trait is the Rust equivalent. The critical difference is `!Unpin` enforcement: Linux has no compile-time enforcement that a `list_head` node is not moved while linked; NARF promises it ("intrusive collection nodes are pinned; moving a linked node is UB, enforced at type level where possible"). The "where possible" qualifier is significant: `Pin<P>` only prevents moving via the `Pin<P>` reference; if you also hold a raw pointer (which the intrusive list internally must), the compiler does not prevent a move. The `!Unpin` bound prevents `mem::swap` on the struct but not a `ptr::write` via a raw pointer. This is a known unsafe-Rust limitation that the spec should acknowledge rather than overstate with "enforced at type level."
+
+**`heapless` and `ArrayVec` as external alternatives:** The spec mentions `arrayvec` and `smallvec` as planned dependencies for `no_std` contexts. `heapless` (by Jorge Aparicio) provides a particularly clean `heapless::Vec<T, N>` with const-generic capacity. For NARF's use cases (bounded strings, small fixed-size queues in drivers), `heapless` is likely the right choice over a custom implementation. The spec should commit to one rather than listing three options; implementing multiple bounded-vec types creates the "47 list types" problem the research README warns against.
+
+---
+
+## Proposed spec changes
+
+- **§3.1 Sync primitives — replace `Send`/`!Send` with typestate for IRQ safety:** Change the `SpinLockGuard` type to `SpinLockGuard<'a, T, I: IrqState>`. Define `IrqsEnabled` and `IrqsDisabled` marker types. `SpinLock::lock()` returns `SpinLockGuard<'_, T, IrqsEnabled>` and requires `IrqsEnabled` at the call site (enforced via a context type or thread-local typestate). `IrqSafeSpinLock::lock()` disables IRQs and returns `SpinLockGuard<'_, T, IrqsDisabled>`. This makes mixed use a compile error, not a runtime panic.
+
+- **§3.1 Sync primitives — add `T: Copy` bound to `SeqLock<T>`:** "T must implement `Copy`. This constraint is load-bearing: the reader samples T's bytes without synchronization and retries on sequence mismatch. A `T` containing pointers or references is undefined behavior under torn-state sampling. The bound enforces this at the type level." If `T: Copy` is too restrictive for some use case, provide `unsafe SeqLockUnchecked<T>` with documented preconditions.
+
+- **§3.2 Intrusive collections — add `Pin`-based node API:** "Intrusive list nodes must be accessed through `Pin<&Node<T>>` in the public API. The `push` and `pop` methods take `Pin<&Node<T>>` and `Pin<&mut Node<T>>` respectively. Raw pointer access within the implementation is `unsafe` and documented." This makes the `!Unpin` enforcement concrete rather than aspirational.
+
+- **§2 Assumptions — add split crate design decision:** "Async primitives that depend on `scheduler/` wakers (`Mutex<T>`, `RwLock<T>`) live in `lib-async/` (separate crate). Sync primitives with no scheduler dependency live in `lib/` (this crate). This breaks the circular dependency where `lib/` needs `scheduler/` and `scheduler/` needs `lib/`. The `lib/` crate has no dependency on `scheduler/` or any other subsystem crate."
+
+- **§7 Stage assignment — add concurrency model tests to Stage 2:** "Stage 2 adds `loom`-based concurrency model tests for `SpinLock`, `SeqLock`, and `IntrusiveList`. `loom` runs the test under a systematic concurrency scheduler to find races that normal testing misses. These are host-side unit tests gated by a `loom` feature flag."
+
+- **§8 Open questions — decide on `heapless` vs. `arrayvec` for bounded collections:** Replace the open question with a decision: adopt `heapless` for all fixed-capacity collections (`BoundedString`, queue types, small vecs). Document the policy: if `heapless` provides the type, do not add an in-tree equivalent. In-tree types are added only when `heapless` lacks a required feature (e.g., domain-tagged allocation metadata).
+
+---
+
+## Open invariants / cross-subsystem hazards
+
+**`scheduler/` wakers ↔ `lib/` async `Mutex`:** As noted, the async `Mutex` must use `core::task::Waker`. The `Waker` vtable's `wake()` function calls into `scheduler/` to put the waiting task back on the run queue. This means `lib/`'s `Mutex<T>` drop implementation (which wakes waiters) transitively calls `scheduler/`. If `scheduler/` is not yet initialized (Stage 1, single-CPU cooperative scheduler), `Mutex<T>` must degrade to a spin or panic. There needs to be an initialization gate: a global `AtomicBool` that `scheduler/` sets at init time, and `Mutex<T>::drop` checks before attempting a wakeup. This interaction must be documented in both `lib/` §2 and `scheduler/` §?.
+
+**`tracing/` §3.4 (domain-aware assertion macros) ↔ `lib/` §3.4:** The Stage 3 domain-aware assertion macros (`debug_assert_in_domain!`, `assert_tcb!`) emit a USDT-style event before calling `frame::panic`. But `lib/` is loaded at Stage 1 when `tracing/` is not initialized. The assertion macros must check whether `tracing/` is initialized before attempting to emit a USDT event, or the unarmed USDT must be safe to "emit" even when the tracer domain is not running (which the tracing spec guarantees for unarmed markers — they are just a nop).
+
+**`capabilities/` cap-slot allocation ↔ `lib/` `Bitmap<N>`:** §3.3 notes that `capabilities/` uses `Bitmap<N>` for cap-slot allocation. The const-generic `N` in `Bitmap<N>` must be large enough for the maximum cap table size. If `capabilities/` uses a different slot count per table, or if the slot count is dynamic, a fixed `Bitmap<N>` is the wrong data structure. `DynBitmap` (backed by the allocator) is needed, which means `capabilities/` cannot use `Bitmap` without the allocator being initialized. This is a Stage sequencing dependency: cap-slot allocation requires `memory/`'s allocator, which Stage 1 provides only in its basic form.
+
+**`rcu/` `Atomic<T>` ↔ `lib/` atomics:** The `rcu/` spec references `Atomic<T>` as part of its API surface. If `lib/` is meant to be the home of atomic types, the `Atomic<T>` wrapper for RCU-protected pointers should be defined here with the appropriate `#[repr(transparent)]` and `Send`/`Sync` bounds, not redefined in `rcu/`. The dependency direction `rcu/` → `lib/` should carry the type definition.
+
+---
+
+## Additional opinionated commentary
+
+`lib/` has a scope problem: it is simultaneously the bottom of the dependency tree (everything uses it) and a growth target (more types are added as consumers demand). The Linux kernel's `lib/` contains 300+ source files and has the "47 list types" problem the research README references. The way to avoid this fate is to have a strict acceptance criterion for new types: a type is added to `lib/` only when two distinct subsystems need it and no external crate provides it without pulling in `std`. This should be a written policy, not just a note in the research README.
+
+The async `Mutex`/`RwLock` design deserves more attention than the spec gives it. In a kernel with domain isolation, a mutex contention path that calls into the scheduler to sleep is a domain-switch: the waiting task is in domain N, the scheduler runs in domain TCB, and the woken task is domain N again. That is three PKRS writes per contention event. At high lock contention, this becomes visible. The seqlock + direct-context-transfer pattern (where the loser donates its time slice to the holder directly) is an alternative that avoids the domain-switch overhead. The spec should at least note that "async `Mutex` with scheduler waker" is not free in a domain-switching kernel and that FnTime benchmarks should measure contended-mutex cost with domain switching enabled.

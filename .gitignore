@@ -1,0 +1,26 @@
+# Rust build output
+/target/
+target/
+**/*.rs.bk
+
+# Workspace lockfile policy: commit for the kernel workspace
+# Cargo.lock stays tracked
+
+# Cargo xtask artefacts
+/build/out/
+*.img
+*.bin
+
+# Editor / OS
+*.swp
+*.swo
+.DS_Store
+.idea/
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# QEMU runtime
+*.qcow2
+serial.log
+qemu.log
