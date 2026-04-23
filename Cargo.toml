@@ -1,0 +1,50 @@
+# NARF kernel workspace.
+# Single workspace so fat LTO can span every crate. See build/specification/spec.md §4.
+
+[workspace]
+resolver = "2"
+members = [
+    "lib",
+    "build/xtask",
+]
+
+[workspace.package]
+version      = "0.0.0"
+edition      = "2021"
+rust-version = "1.85"          # align with 2025-09-14 nightly
+license      = "MPL-2.0"
+repository   = "https://github.com/hodgesds/narf"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+# A kernel crate needing panic = abort must never allocate in panic path.
+# Explicit lints land as subsystems come online.
+
+# ─── Release profile ────────────────────────────────────────────────
+# Fat LTO, per build/specification/spec.md §4.
+# compiler_fence(SeqCst) pairs in arch/ wrappers are what keep this correct —
+# LTO is aggressive and will happily reorder across inline asm without them.
+[profile.release]
+opt-level       = 3
+lto             = "fat"
+codegen-units   = 1
+panic           = "abort"
+strip           = "none"        # keep symbols — observability/ needs them
+debug           = 2
+overflow-checks = false         # release trusts bounds; debug always checks
+incremental     = false
+
+[profile.dev]
+opt-level       = 1             # -O1 — unoptimised kernel code won't boot under QEMU in reasonable time
+lto             = false
+panic           = "abort"
+debug           = 2
+overflow-checks = true
+incremental     = true
+
+# Reproducible builds: build/specification/spec.md §4.
+# SOURCE_DATE_EPOCH is honoured by rustc 1.85+; path remapping is in .cargo/config.toml.

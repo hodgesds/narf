@@ -1,0 +1,11 @@
+[toolchain]
+channel = "nightly-2025-09-14"
+components = [
+    "rust-src",
+    "llvm-tools",
+    "clippy",
+    "rustfmt",
+]
+# No precompiled cross targets: build-std compiles core/alloc from rust-src
+# per-invocation for each target triple. Host toolchain is enough here.
+profile = "minimal"

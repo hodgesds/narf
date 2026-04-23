@@ -1,0 +1,15 @@
+[package]
+name         = "narf-lib"
+description  = "NARF shared no_std primitives: typed IDs, spinlocks, bitmaps, intrusive lists."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_lib"
+path = "src/lib.rs"
+
+[lints]
+workspace = true

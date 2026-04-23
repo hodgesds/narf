@@ -1,0 +1,56 @@
+# NARF cargo configuration.
+# Authoritative source: build/specification/spec.md §3–§5.
+#
+# Target triples (per build/ §5):
+#   x86_64-unknown-none                 — kernel-high-half, Limine boot
+#   aarch64-unknown-none-softfloat      — no SIMD in kernel
+#
+# build-std rebuilds core/compiler_builtins from the pinned rust-src
+# for every target. We never rely on pre-built cross std.
+
+# build-std is scoped to the kernel targets only. We do NOT enable it
+# globally, because `cargo test` on the host would then rebuild core and
+# hit a duplicate-lang-item error. xtask passes
+#   -Z build-std=core,compiler_builtins
+#   -Z build-std-features=compiler-builtins-mem
+# when it invokes cargo for x86_64-unknown-none / aarch64-unknown-none-softfloat.
+
+# Path remapping for reproducible builds (build/ §4).
+# SOURCE_DATE_EPOCH covers timestamps; this covers absolute paths in debug info.
+[build]
+# xtask/ always runs on the host; narf/ crates run on the kernel target.
+# No default target here — `cargo xtask run --arch=x86_64` sets it per command.
+rustflags = [
+    "--remap-path-prefix", ".=.",
+]
+
+# ─── x86_64 kernel target ──────────────────────────────────────────
+# CPU feature flags (per build/ §4) that *must* be added to unlock the
+# domain-switch intrinsics are gated: +pks and +userintrins are still
+# LLVM-nightly features. They'll be added once upstream stabilises in a
+# nightly we can pin; until then Stage 1 runs on the plain x86-64 baseline.
+[target.x86_64-unknown-none]
+rustflags = [
+    "-C", "relocation-model=static",
+    "-C", "code-model=kernel",
+    "-C", "link-arg=-Tbuild/linker/x86_64.ld",
+    "-C", "link-arg=--gc-sections",
+    "-Z", "plt=no",
+]
+
+# ─── aarch64 kernel target ─────────────────────────────────────────
+# MTE and pointer-auth flags are Stage 2+ and gated similarly.
+[target.aarch64-unknown-none-softfloat]
+rustflags = [
+    "-C", "relocation-model=static",
+    "-C", "link-arg=-Tbuild/linker/aarch64.ld",
+    "-C", "link-arg=--gc-sections",
+]
+
+# ─── Alias shortcuts ───────────────────────────────────────────────
+# Mirrors build/ §3 xtask interface, usable as raw cargo for debugging:
+#   cargo narf-x86   build -p narf-lib
+[alias]
+xtask    = "run --package xtask --quiet --"
+narf-x86 = "build --target x86_64-unknown-none"
+narf-a64 = "build --target aarch64-unknown-none-softfloat"
