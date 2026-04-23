@@ -1,0 +1,19 @@
+[package]
+name         = "narf-scheduler"
+description  = "Cooperative async executor. Stage 1: single-CPU, spawn + block_on + yield_now."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_scheduler"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib    = { path = "../lib" }
+narf-arch   = { path = "../arch" }
+
+[lints]
+workspace = true

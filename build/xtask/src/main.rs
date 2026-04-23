@@ -128,7 +128,9 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
         // build-std scoped to the cross targets only. See .cargo/config.toml.
         // `no-f16-f128` keeps compiler_builtins from pulling soft-float f128
         // lowering paths that LLVM can't soften under `code-model=kernel`.
-        .arg("-Z").arg("build-std=core,compiler_builtins")
+        // `alloc` comes along because narf-frame registers a
+        // #[global_allocator] and uses `alloc::boxed::Box` for tasks.
+        .arg("-Z").arg("build-std=core,compiler_builtins,alloc")
         .arg("-Z").arg("build-std-features=compiler-builtins-mem,compiler-builtins-no-f16-f128");
     if args.release { cmd.arg("--release"); }
     if !args.features.is_empty() {

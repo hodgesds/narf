@@ -9,6 +9,8 @@ members = [
     "boot",
     "console",
     "memory",
+    "time",
+    "scheduler",
     "frame",
     "build/xtask",
 ]

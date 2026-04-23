@@ -9,5 +9,7 @@
 #![deny(missing_debug_implementations)]
 
 pub mod addr;
+pub mod heap;
 
 pub use addr::{PhysAddr, VirtAddr};
+pub use heap::BumpAllocator;

@@ -12,12 +12,17 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(missing_debug_implementations)]
 
+extern crate alloc;
+
 use core::fmt::Write;
 use core::panic::PanicInfo;
 
 use narf_boot::{RawBootInfo};
 use narf_console::{self as console, UartKind};
-use narf_memory::PhysAddr;
+use narf_memory::{PhysAddr, BumpAllocator};
+
+#[global_allocator]
+static GLOBAL_ALLOC: BumpAllocator = BumpAllocator;
 
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
@@ -97,8 +102,6 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         }
     }
 
-    let _ = writeln!(console::Writer, "  halting — Wave 2 lands the MMU + async executor.");
-
     // Quick self-test: trigger a #UD (invalid-opcode) to prove the IDT
     // actually dispatches. The handler prints the trap frame and calls
     // exit_kernel(42). If the IDT weren't installed this would
@@ -111,10 +114,37 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         unsafe { core::arch::asm!("ud2", options(noreturn)); }
     }
 
+    // ─── Stage 1 exit-gate demo: async executor + timer-driven yield ──
+    narf_scheduler::init();
+    let _ = writeln!(console::Writer, "  scheduler: ready queue initialised");
+
+    narf_scheduler::spawn(async {
+        use core::fmt::Write as _;
+        let start = narf_time::Instant::now();
+        // Assume a ~1 GHz clock for the tick spacing. Calibration is a
+        // Wave 3 task (consult HPET / ACPI / FDT). 1e8 cycles ≈ 100 ms
+        // at 1 GHz; at 2-3 GHz it's correspondingly faster.
+        const TICK_CYCLES: u64 = 100_000_000;
+        for n in 0..5 {
+            narf_time::sleep_cycles(TICK_CYCLES).await;
+            let elapsed = narf_time::Instant::now().cycles_since(start);
+            let _ = writeln!(console::Writer,
+                "  tick {}: elapsed {} Mcycles", n, elapsed / 1_000_000);
+            narf_scheduler::yield_now().await;
+        }
+        let _ = writeln!(console::Writer, "  async demo: done");
+    });
+
+    let _ = writeln!(console::Writer, "  scheduler: spawning 1 task, running to completion");
+    narf_scheduler::run_until_empty();
+
+    let _ = writeln!(console::Writer, "  heap used: {} / {} bytes",
+        narf_memory::heap::used_bytes(), narf_memory::heap::capacity_bytes());
+    let _ = writeln!(console::Writer, "  halting — Stage 1 exit-gate demo complete.");
+
     // SAFETY: exit_kernel is infallible; on QEMU it exits cleanly via
     // the isa-debug-exit device (x86_64) or semihosting (aarch64); on
     // real hardware it falls back to a quiet halt.
-    #[cfg(not(all(target_arch = "x86_64", feature = "idt-selftest")))]
     unsafe { narf_arch::exit_kernel(0) }
 }
 

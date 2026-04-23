@@ -1,0 +1,19 @@
+[package]
+name         = "narf-time"
+description  = "Monotonic clock, Instant, Duration, sleep_until — Stage 1 subset."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_time"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib  = { path = "../lib" }
+narf-arch = { path = "../arch" }
+
+[lints]
+workspace = true
