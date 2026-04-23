@@ -14,6 +14,11 @@ pub mod addr;
 pub mod frame;
 pub mod heap;
 
+#[cfg(target_arch = "x86_64")]
+pub mod mmu;
+#[cfg(target_arch = "x86_64")]
+pub mod paging;
+
 pub use addr::{PhysAddr, VirtAddr};
 pub use frame::{
     alloc_frame, free_frame, init_from_map, stats as frame_stats,

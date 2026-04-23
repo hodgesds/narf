@@ -155,6 +155,32 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 "  frames: total {} / free {} / reserved {} ({} MiB usable)",
                 s.total, s.free, s.reserved,
                 (s.free as u64) * narf_memory::PAGE_SIZE / (1024 * 1024));
+
+            // MMU handoff per console/ §3.1. The three-step sequence
+            // (print, swap, remap) is orchestrated here because
+            // memory/ can't depend on console/ without creating a
+            // crate cycle. Closes Stage 1 exit-gate #2.
+            #[cfg(target_arch = "x86_64")]
+            {
+                let _ = writeln!(console::Writer, "  mmu: handoff...");
+                // SAFETY: BSP, interrupts disabled (boot.S CLI + IDT
+                // doesn't unmask), allocator populated above.
+                match unsafe { narf_memory::mmu::init_mmu() } {
+                    Ok(pml4) => {
+                        // The new PML4 identity-maps 0..=4 GiB, so the
+                        // UART (I/O port on x86_64) is reachable and
+                        // console::remap_to_virtual with an identity
+                        // address is correct.
+                        narf_console::remap_to_virtual(info.uart_virt);
+                        let _ = writeln!(console::Writer,
+                            "  mmu: installed, PML4 @ {:?}, console remapped", pml4);
+                    }
+                    Err(e) => {
+                        let _ = writeln!(console::Writer,
+                            "  mmu: init failed: {e:?}");
+                    }
+                }
+            }
         }
         Err(e) => {
             let _ = writeln!(console::Writer, "  boot parse failed: {e:?}");

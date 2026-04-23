@@ -14,6 +14,8 @@ NARF Stage 1 Wave 1 — hello from a bare kernel.
   boot info: 9 memory region(s), uart_phys=PhysAddr(0x00000000000003f8)
   usable RAM: 255 MiB
   frames: total 65406 / free 65095 / reserved 311 (254 MiB usable)
+  mmu: handoff...
+  mmu: installed, PML4 @ PhysAddr(0x000000000ffde000), console remapped
   scheduler: ready queue initialised
   scheduler: spawning 1 task, running to completion
   tick 0: elapsed 100 Mcycles
@@ -62,31 +64,39 @@ $ cargo xtask test --arch=x86_64
 | # | requirement                                                    | state |
 |---|----------------------------------------------------------------|-------|
 | 1 | boot through `boot::_start` → `frame::init_bsp`                | ✓     |
-| 2 | print `mmu: handoff...` via `remap_to_virtual`                 | ✗ deferred (Wave 2: memory/ owns this) |
+| 2 | print `mmu: handoff...` via `remap_to_virtual`                 | ✓ (Wave 2: own PML4 + CR3 swap + console remap) |
 | 3 | Future-on-executor prints per tick, exits cleanly              | ✓     |
 | 4 | `verification/` smoke test produces Pass exit                  | ✓     |
 | 5 | boot-time domain enumeration                                   | ✓     |
 | 6 | no unsafe block outside `arch/` touches privileged MSRs        | ~ design-enforced; Clippy / post-link scan TBD |
 
-## Deferred to Wave 2 (next big push)
+## Deferred (Stage 1 closure work + Stage 2 prep)
 
-- **`memory/` page tables + MMU handoff**: frame allocator landed
-  (Wave 2b below); what's still open is page-table manipulation
-  (4 KiB / 2 MiB / 1 GiB), final kernel page tables,
-  `console::remap_to_virtual` handoff, and replacing the bump heap
-  with a proper slab over the frame allocator. *This remains the
-  largest Stage-1 critical-path item.*
+Every Stage 1 exit-gate criterion is now met or explicitly deferred-
+with-scaffolding. What's left is the set-up required before the
+Stage 2 "Barrier" theme (PKS/MTE domain switching + UIPI) can land:
+
+- **4 KiB / 2 MiB page-table manipulation**: `memory/paging.rs`
+  currently has the PML4 / PDPT types and 1-GiB-huge-page wiring used
+  by the Wave 2c handoff. `map_4kb` / `unmap_4kb` / `map_2mb` are
+  needed before domain-tagged mappings (PKS PK bits, MTE tag storage)
+  can exist.
+- **Higher-half kernel**: today phys==virt. Stage 2's domain assign
+  doesn't strictly require -2 GiB, but it's the conventional layout
+  every other Stage 2 subsystem expects.
 - **Full buddy allocator**: today's `memory::frame` is a free-stack
-  allocator (4 KiB granularity only). The buddy + Folio { order, head }
-  structures from `memory/` §3 land with the page-table work.
-- **`frame/` trap-prologue PKRS save**: scaffolding only. The domain-
-  switch work from STAGE1.md Wave 2 #7 needs a defined place to save
-  the MSR; wiring happens when Wave 2 lands PKS enable.
-- **`boot/` full `validate_boot_info`**: today only magic-presence +
-  min-RAM. The 6-check validation from `boot/` §3 lands when its
-  callers need the stricter guarantees.
-- **`interrupts/`**: no external IRQ routing yet. APIC / GICv3
-  bring-up is Wave 2 after MMU.
+  allocator (4 KiB granularity). Buddy + `Folio { order, head }`
+  land once 2 MiB / 1 GiB mapping has consumers.
+- **Slab (SLAB/SLUB-lite) over the frame allocator**: retires the
+  Stage-1 bump heap. Currently the bump arena is 1 MiB and uses
+  ~500 KiB just for the frame-allocator's free-stack Vec, leaving
+  limited headroom for `alloc::` in long-running kernel code.
+- **`frame/` trap-prologue PKRS save**: scaffolding only until
+  Stage 2 wires PKS enable.
+- **`boot/` full `validate_boot_info`**: magic + min-RAM only today;
+  all 6 checks land with Stage 2's memory-map consumers.
+- **`interrupts/`**: no external IRQ routing yet. APIC / GICv3 bring-
+  up gates Stage 2 UIPI.
 
 ## Deviations from the v0.2 design
 
@@ -150,33 +160,35 @@ cargo test -p narf-lib
 | more tests   | 4 additional smoke tests covering scheduler/time/alloc        |
 | Wave 2 gdt   | GDT + TSS + 4 IST stacks (NMI/#DF/#MC/#VC)                    |
 | Wave 2b      | PhysFrame + free-stack frame allocator (Vec<PhysFrame>)       |
+| Wave 2c      | MMU handoff — own PML4, CR3 swap, console::remap_to_virtual   |
 
 ## Pickup hint for the next session
 
-`memory/` Wave 2 is still the biggest open chunk. PhysFrame + the
-frame allocator landed; what remains:
+**Stage 1 is effectively closed** — exit-gate items 1–5 all pass,
+with item 6 (MSR lint) being the remaining infrastructure task.
+The next big chunk is the bridge from Stage 1 to Stage 2 "Barrier":
 
-1. Page-table manipulation helpers (`map_page`, `unmap_page`) in
-   `memory/src/paging.rs`; start with 4 KiB pages, add 2 MiB / 1 GiB
-   as `Folio::order` consumers arrive. On x86_64 this is PML4 / PDPT /
-   PD / PT walkers with entry flags; on aarch64 it's TTBR0/1 with
-   three levels of table descriptors.
-2. Build the final kernel page tables: identity-map the low 4 GiB
-   (devices, early boot) + higher-half-map the kernel text/data at
-   -2 GiB. Flip `code-model` back to `kernel` when the higher-half
-   mapping is ready.
-3. Execute the `console/` §3.1 MMU-enable handoff and print
-   `mmu: handoff...` — closes Stage 1 exit-gate #2.
-4. Retire the bump heap; wire a real slab (SLAB/SLUB-lite) over the
-   `frame::alloc_frame` source.
-5. Upgrade the free-stack frame allocator to the buddy + Folio
-   structures described in `memory/` §3.
+1. **`memory/paging.rs` 4 KiB mapping**: `map_4kb(virt, phys, flags)`
+   walks or builds PML4 / PDPT / PD / PT, allocating new tables via
+   `alloc_frame`. Needed before PKS PK bits can live on individual
+   PTEs.
+2. **`interrupts/` APIC skeleton**: x2APIC init, local-APIC timer
+   (replace TSC-based busy-wait with real timer IRQs driving the
+   scheduler's waker).
+3. **`rcu/` stub API** (Wave 4 in STAGE1.md, but low-cost to land
+   now): `Atomic<T>`, `ReadGuard`, `defer_drop` stubs so downstream
+   consumers don't retrofit the types later. The executor's
+   `report_quiescent` hook already exists in spirit — a real call
+   site is one line.
+4. **`tracing/` USDT markers**: `.note.narf.probes` section is
+   already carved out in both linker scripts; add the `usdt!` macro
+   + the `Recorder<E>` flight-recorder ring.
+5. **Stage 2 Barrier proper**: PKS enable on x86_64, MTE enable on
+   aarch64, the `DomainPrimitive::set_rights` implementations,
+   UIPI bring-up. This is the next major theme and is gated on (1).
 
-Parallel tasks with no dependency on Wave 2 memory:
-- `interrupts/` APIC/GICv3 skeleton so `enable_interrupts()` doesn't
-  get us a spurious IRQ triple-fault.
-- `rcu/` stub API (Wave 4 item) — the types land so that consumers
-  don't have to retrofit them later.
-- `tracing/` USDT compile-time markers (Wave 4 item) — the
-  `.note.narf.probes` section is already carved out in both linker
-  scripts; only the `usdt!` macro + recorder ring is missing.
+Parallel-safe micro-tasks:
+- Replace the free-stack frame allocator with a buddy (retains the
+  Vec-based free-list API so callers don't change).
+- Add `kernel_test!`-level coverage for MMU bring-up (build a PML4
+  in isolation, verify entries decode correctly).
