@@ -18,5 +18,10 @@ narf-memory  = { path = "../memory" }
 narf-boot    = { path = "../boot" }
 narf-console = { path = "../console" }
 
+[features]
+# Self-test: trigger a #UD at end-of-boot to prove the IDT dispatches.
+# Off by default; enable with `cargo xtask run --arch=x86_64 --features idt-selftest`.
+idt-selftest = []
+
 [lints]
 workspace = true

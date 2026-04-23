@@ -48,6 +48,11 @@ struct BuildArgs {
     /// used for cross-target sanity checks.
     #[arg(long, default_value = "narf-frame")]
     package: String,
+
+    /// Forward-list of cargo features to enable. Comma-separated.
+    /// Example: `--features idt-selftest`.
+    #[arg(long, default_value = "")]
+    features: String,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -76,16 +81,17 @@ impl Arch {
     fn qemu_args(self, kernel: &Path) -> Vec<String> {
         let kernel = kernel.display().to_string();
         match self {
-            // Minimal x86_64 QEMU harness — no multiboot yet; -kernel will not
-            // actually boot a bare ELF without a bootloader, but this shape is
-            // where boot/ integration plugs in at Wave 1.
+            // x86_64 via PVH direct-kernel load. `isa-debug-exit` lets the
+            // guest exit QEMU by writing to I/O port 0xF4 (status = value<<1 | 1).
+            // `-no-reboot` stops QEMU on triple-fault instead of infinite resets.
             Arch::X86_64 => vec![
                 "-machine".into(), "q35".into(),
                 "-cpu".into(),     "max".into(),
                 "-m".into(),       "256M".into(),
                 "-serial".into(),  "stdio".into(),
                 "-display".into(), "none".into(),
-                "-no-reboot".into(), "-no-shutdown".into(),
+                "-no-reboot".into(),
+                "-device".into(),  "isa-debug-exit,iobase=0xf4,iosize=0x04".into(),
                 "-kernel".into(),  kernel,
             ],
             // aarch64 virt machine — Limine / U-Boot / EFI handoff wires in at boot/.
@@ -125,6 +131,9 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
         .arg("-Z").arg("build-std=core,compiler_builtins")
         .arg("-Z").arg("build-std-features=compiler-builtins-mem,compiler-builtins-no-f16-f128");
     if args.release { cmd.arg("--release"); }
+    if !args.features.is_empty() {
+        cmd.arg("--features").arg(&args.features);
+    }
 
     let status = cmd.status().context("failed to invoke cargo build")?;
     if !status.success() {

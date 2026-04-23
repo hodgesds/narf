@@ -32,6 +32,20 @@ pub const BACKEND: DomainBackend = DomainBackend::Mte;
 #[inline(always)]
 pub fn halt_forever() -> ! { current::halt_forever() }
 
+/// End the kernel run with an exit code. Under QEMU this triggers a clean
+/// VM exit; on real hardware / other VMMs it falls back to `halt_forever`.
+/// `code == 0` is "normal success"; non-zero is "failure" — verification
+/// harnesses map these to `cargo xtask test` pass/fail.
+///
+/// # Safety
+/// Per-arch backend may touch a platform-specific exit device; see
+/// `arch::current::exit_qemu` for the x86_64 implementation and the
+/// aarch64 semihosting path.
+pub unsafe fn exit_kernel(code: u32) -> ! {
+    // SAFETY: backend owns the platform contract.
+    unsafe { current::exit_qemu(code) }
+}
+
 /// Disable interrupts on the current CPU. Stage 1 only — proper save/restore
 /// typestate comes with `frame/`'s IRQ context token.
 #[inline(always)]
