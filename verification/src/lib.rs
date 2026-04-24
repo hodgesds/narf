@@ -5059,6 +5059,56 @@ fn smoke_drivers_net_nic_model_ids() -> TestResult {
 }
 kernel_test!(smoke_drivers_net_nic_model_ids);
 
+fn smoke_scheduler_spawn_user_carries_address_space() -> TestResult {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use narf_memory::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+    use narf_scheduler::{address_space_of, spawn_user, TaskSpec};
+
+    narf_scheduler::init();
+    static RAN: AtomicU32 = AtomicU32::new(0);
+    RAN.store(0, Ordering::Relaxed);
+
+    // Build an address space with one region so the scheduler has
+    // something to activate (even though activate returns
+    // NotImplemented — we're proving the handshake).
+    let mut a = AddressSpace::empty();
+    a.root = PhysAddr::new(0x1000_0000);  // non-zero sentinel for activate()
+    a.map_region(Region {
+        base: VirtAddr::new(0x4000),
+        len:  0x1000,
+        perms: RegionPerms::READ | RegionPerms::EXEC,
+        phys:  PhysAddr::new(0x2_0000),
+    }).expect("map");
+    let arc_a = Arc::new(a);
+
+    let tid = spawn_user(async {
+        RAN.fetch_add(1, Ordering::Relaxed);
+    }, TaskSpec::unthrottled(), Arc::clone(&arc_a));
+
+    // Before running, `address_space_of` finds our AS.
+    match address_space_of(tid) {
+        Some(found) => {
+            if found.region_count() != 1 {
+                return TestResult::Fail("address_space_of returned wrong AS");
+            }
+        }
+        None => return TestResult::Fail("spawn_user did not attach AS"),
+    }
+
+    narf_scheduler::run_until_empty();
+
+    if RAN.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("user task did not run");
+    }
+    // After task completes, lookup should return None.
+    if address_space_of(tid).is_some() {
+        return TestResult::Fail("AS handle persisted past task completion");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_scheduler_spawn_user_carries_address_space);
+
 fn smoke_ipc_mpsc_multi_producer_roundtrip() -> TestResult {
     use core::sync::atomic::{AtomicU32, Ordering};
     use narf_ipc::{mpsc_channel, MpscRecvError};

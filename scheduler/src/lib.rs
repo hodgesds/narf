@@ -60,6 +60,7 @@ use core::sync::atomic::AtomicU64;
 
 use narf_capabilities::{Cap, CapKind, CapType, Spend};
 use narf_lib::sync::IrqSafeSpinLock;
+use narf_memory::AddressSpace;
 use narf_time::Instant;
 
 /// A pinned boxed future representing one kernel task.
@@ -112,6 +113,11 @@ struct TaskSlot {
     /// `BudgetAccount`.
     spec:    TaskSpec,
     account: BudgetAccount,
+    /// Optional per-process address space (Stage 4). `None` for
+    /// kernel-only tasks; `Some` for a user-mode task that shares
+    /// the AS with its process peers. Held as `Arc` so tasks within
+    /// one process share one AS without copying.
+    addr_space: Option<Arc<AddressSpace>>,
 }
 
 impl core::fmt::Debug for TaskSlot {
@@ -221,6 +227,7 @@ where
         awake:   Arc::new(AtomicBool::new(true)),
         id,
         spec,
+        addr_space: None,
         account: BudgetAccount::new(),
     };
     let mut q = READY.lock();
@@ -235,6 +242,38 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     spawn_with_spec(f, TaskSpec::budgeted(budget, cap))
+}
+
+/// Spawn a user-mode task carrying its own address space. Every
+/// poll of the task's future is preceded by
+/// `addr_space.activate()` — the Stage-4 arch backend will make
+/// this a real `MOV CR3` / `TTBR0_EL1` store. Until that lands
+/// `activate()` returns `NotImplemented` and the executor logs +
+/// proceeds (user code would trap, but the shape is exercised).
+pub fn spawn_user<F>(f: F, spec: TaskSpec, addr_space: Arc<AddressSpace>) -> TaskId
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let id = TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed));
+    let slot = TaskSlot {
+        task:    Box::pin(f),
+        awake:   Arc::new(AtomicBool::new(true)),
+        id,
+        spec,
+        addr_space: Some(addr_space),
+        account: BudgetAccount::new(),
+    };
+    let mut q = READY.lock();
+    q.as_mut().expect("scheduler::spawn_user before init").push_back(slot);
+    id
+}
+
+/// Look up the address space attached to `id`, if any. The returned
+/// `Arc` keeps the AS alive even if the task drops immediately —
+/// callers holding it observe a consistent snapshot.
+pub fn address_space_of(id: TaskId) -> Option<Arc<AddressSpace>> {
+    let q = READY.lock();
+    q.as_ref()?.iter().find(|s| s.id == id).and_then(|s| s.addr_space.clone())
 }
 
 /// Errors `donate_to` can return.
@@ -380,6 +419,16 @@ pub fn run_until_empty() {
                 let mut q = READY.lock();
                 q.as_mut().unwrap().push_back(slot);
                 continue;
+            }
+
+            // Stage-4: if the task owns an address space, activate it
+            // before polling so user-mode accesses land in the right
+            // low-half mappings. Today the arch backend isn't wired;
+            // `activate()` returns `NotImplemented` and we ignore the
+            // error — user tasks would trap, but kernel-only tasks
+            // are unaffected.
+            if let Some(ref a) = slot.addr_space {
+                let _ = a.activate();
             }
 
             let waker = make_waker(slot.awake.clone());
