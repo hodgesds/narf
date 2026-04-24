@@ -1,0 +1,141 @@
+//! Per-process address space.
+//!
+//! Spec: `memory/specification/spec.md` (Stage-4 — user-mode address
+//! spaces). A kernel thread always runs in the shared high-half
+//! address space; a user process needs its own page table so
+//! user-mode mappings in the low half don't collide across
+//! processes.
+//!
+//! This module pins the `AddressSpace` shape + a region table + the
+//! entry points the Stage-4 ELF loader calls (`map_region`,
+//! `activate`, `unmap_region`). The per-arch primitives
+//! (`arch::x86_64::paging::new_pml4_from_kernel`,
+//! `arch::aarch64::paging::new_ttbr0`) don't yet exist — the stubs
+//! return `Err(AddressSpaceError::NotImplemented)` until they do,
+//! but the shape is stable enough that Stage-4 loader code can
+//! compile and test against it.
+
+use alloc::vec::Vec;
+
+use crate::addr::{PhysAddr, VirtAddr};
+
+/// Region permission flags. Mirrors ELF `PF_*` so the loader doesn't
+/// need a translation step.
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RegionPerms(pub u32);
+
+impl RegionPerms {
+    pub const EXEC:  RegionPerms = RegionPerms(1 << 0);
+    pub const WRITE: RegionPerms = RegionPerms(1 << 1);
+    pub const READ:  RegionPerms = RegionPerms(1 << 2);
+
+    #[inline] pub const fn contains(self, o: RegionPerms) -> bool { self.0 & o.0 == o.0 }
+}
+
+impl core::ops::BitOr for RegionPerms {
+    type Output = RegionPerms;
+    fn bitor(self, rhs: RegionPerms) -> Self { RegionPerms(self.0 | rhs.0) }
+}
+
+/// A contiguous user-mode mapping.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Region {
+    pub base:     VirtAddr,
+    pub len:      u64,
+    pub perms:    RegionPerms,
+    /// Physical frame the first page of `base` maps to. Multi-frame
+    /// mappings walk contiguous physical frames for Stage-4
+    /// structural — the Stage-4+ refinement uses a scatter list.
+    pub phys:     PhysAddr,
+}
+
+/// Errors from the address-space surface.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AddressSpaceError {
+    NotImplemented,
+    Overlap,
+    OutOfRange,
+    AlignmentMismatch,
+    Unmapped,
+}
+
+/// Per-process address space. Stage-4 body: holds the region table +
+/// a placeholder for the root paging structure; `activate()` is the
+/// per-arch `MOV CR3, …` / `TTBR0_EL1 = …` operation that makes
+/// this the live address space.
+#[derive(Debug)]
+pub struct AddressSpace {
+    /// Root page-table physical frame. Filled in by the per-arch
+    /// `new_table` primitive once it lands; `PhysAddr::new(0)`
+    /// acts as "not-yet-initialised" sentinel.
+    pub root: PhysAddr,
+    regions:  Vec<Region>,
+}
+
+impl AddressSpace {
+    /// Fresh address space with no regions. Stage-4 arch backend
+    /// must assign `root` to a freshly-allocated page-table frame.
+    pub const fn empty() -> Self {
+        Self {
+            root:    PhysAddr::new(0),
+            regions: Vec::new(),
+        }
+    }
+
+    /// Attach a region description to the address-space table. Does
+    /// NOT program the page table — that lives in `arch/`. Checks
+    /// for overlap with existing regions and 4 KiB alignment.
+    pub fn map_region(&mut self, region: Region) -> Result<(), AddressSpaceError> {
+        if region.base.as_u64() & 0xFFF != 0 || region.len & 0xFFF != 0 {
+            return Err(AddressSpaceError::AlignmentMismatch);
+        }
+        let end = region.base.as_u64().checked_add(region.len)
+            .ok_or(AddressSpaceError::OutOfRange)?;
+        for r in &self.regions {
+            let r_end = r.base.as_u64() + r.len;
+            if region.base.as_u64() < r_end && r.base.as_u64() < end {
+                return Err(AddressSpaceError::Overlap);
+            }
+        }
+        self.regions.push(region);
+        Ok(())
+    }
+
+    /// Remove a region whose base address matches `base`.
+    pub fn unmap_region(&mut self, base: VirtAddr) -> Result<Region, AddressSpaceError> {
+        let idx = self.regions.iter().position(|r| r.base == base)
+            .ok_or(AddressSpaceError::Unmapped)?;
+        Ok(self.regions.swap_remove(idx))
+    }
+
+    /// Number of mapped regions.
+    #[inline]
+    pub fn region_count(&self) -> usize { self.regions.len() }
+
+    /// Snapshot of the region list.
+    pub fn regions(&self) -> &[Region] { &self.regions }
+
+    /// Find the region covering `vaddr`, if any.
+    pub fn lookup(&self, vaddr: VirtAddr) -> Option<&Region> {
+        let a = vaddr.as_u64();
+        self.regions.iter().find(|r| {
+            a >= r.base.as_u64() && a < r.base.as_u64() + r.len
+        })
+    }
+
+    /// Make this address-space the active one. Returns
+    /// `NotImplemented` until the arch backend lands (which does
+    /// the `MOV CR3` / `TTBR0_EL1` store with the right shootdown
+    /// discipline).
+    pub fn activate(&self) -> Result<(), AddressSpaceError> {
+        if self.root.as_u64() == 0 {
+            return Err(AddressSpaceError::OutOfRange);
+        }
+        Err(AddressSpaceError::NotImplemented)
+    }
+}
+
+impl Default for AddressSpace {
+    fn default() -> Self { Self::empty() }
+}

@@ -11,8 +11,11 @@
 extern crate alloc;
 
 pub mod addr;
+pub mod address_space;
 pub mod frame;
 pub mod heap;
+
+pub use address_space::{AddressSpace, AddressSpaceError, Region, RegionPerms};
 
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;

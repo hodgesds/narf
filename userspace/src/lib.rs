@@ -36,7 +36,10 @@
 
 extern crate alloc;
 
+pub mod loader;
 pub mod syscall;
+
+pub use loader::{load_into, EntryPoint, LoadError};
 pub use syscall::{Syscall, SyscallArgs, SyscallEntry, SyscallReturn, SyscallTable};
 
 use alloc::string::String;

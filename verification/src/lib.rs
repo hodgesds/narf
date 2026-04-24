@@ -5059,6 +5059,136 @@ fn smoke_drivers_net_nic_model_ids() -> TestResult {
 }
 kernel_test!(smoke_drivers_net_nic_model_ids);
 
+fn smoke_memory_address_space_region_table() -> TestResult {
+    use narf_memory::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    let mut a = AddressSpace::empty();
+    if a.region_count() != 0 { return TestResult::Fail("fresh AS has regions"); }
+
+    let rx = RegionPerms::READ | RegionPerms::EXEC;
+    let r1 = Region { base: VirtAddr::new(0x4000), len: 0x1000, perms: rx, phys: PhysAddr::new(0x10_0000) };
+    if a.map_region(r1).is_err() { return TestResult::Fail("first map failed"); }
+
+    // Non-overlapping second region is fine.
+    let r2 = Region { base: VirtAddr::new(0x5000), len: 0x2000, perms: rx, phys: PhysAddr::new(0x11_0000) };
+    if a.map_region(r2).is_err() { return TestResult::Fail("second non-overlap map failed"); }
+
+    // Overlap is rejected.
+    let r_over = Region { base: VirtAddr::new(0x6000), len: 0x2000, perms: rx, phys: PhysAddr::new(0x12_0000) };
+    match a.map_region(r_over) {
+        Err(AddressSpaceError::Overlap) => {}
+        _ => return TestResult::Fail("overlap should be rejected"),
+    }
+
+    // Unaligned base is rejected.
+    let r_unaligned = Region { base: VirtAddr::new(0x4123), len: 0x1000, perms: rx, phys: PhysAddr::new(0x13_0000) };
+    match a.map_region(r_unaligned) {
+        Err(AddressSpaceError::AlignmentMismatch) => {}
+        _ => return TestResult::Fail("unaligned base should be rejected"),
+    }
+
+    // lookup finds the covering region (inside r2's 0x5000..0x7000).
+    let hit = a.lookup(VirtAddr::new(0x6123));
+    if hit.map(|r| r.base) != Some(VirtAddr::new(0x5000)) {
+        return TestResult::Fail("lookup did not find covering region");
+    }
+
+    // activate returns NotImplemented / OutOfRange until arch backend.
+    match a.activate() {
+        Err(AddressSpaceError::OutOfRange) => {} // root is still 0
+        _ => return TestResult::Fail("activate on unset root should surface OutOfRange"),
+    }
+    a.root = PhysAddr::new(0xFFDE_0000);
+    match a.activate() {
+        Err(AddressSpaceError::NotImplemented) => {}
+        _ => return TestResult::Fail("activate with root set should surface NotImplemented"),
+    }
+
+    // Unmap removes by base.
+    let removed = a.unmap_region(VirtAddr::new(0x5000));
+    if removed.map(|r| r.len) != Ok(0x2000) {
+        return TestResult::Fail("unmap did not return correct region");
+    }
+    if a.region_count() != 1 {
+        return TestResult::Fail("unmap did not shrink region count");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_memory_address_space_region_table);
+
+fn smoke_userspace_loader_into_address_space() -> TestResult {
+    use narf_memory::{AddressSpace, PhysAddr, RegionPerms, VirtAddr};
+    use narf_userspace::{
+        load_into, ExecImage, ExecKind, LoadError, Segment, SegmentFlags,
+    };
+
+    // Empty image must refuse.
+    let empty = ExecImage::empty(ExecKind::Elf64Exec);
+    let pool: alloc::vec::Vec<PhysAddr> = alloc::vec::Vec::new();
+    let mut a = AddressSpace::empty();
+    match load_into(&empty, pool.into_iter(), &mut a) {
+        Err(LoadError::NoSegments) => {}
+        _ => return TestResult::Fail("empty image should refuse"),
+    }
+
+    // Build an image with two segments.
+    let rx = SegmentFlags::READ | SegmentFlags::EXEC;
+    let rw = SegmentFlags::READ | SegmentFlags::WRITE;
+    let mut img = ExecImage::empty(ExecKind::Elf64Exec);
+    img.entry = 0x4000;
+    img.segments.push(Segment {
+        vaddr: 0x4000, file_off: 0, file_size: 0x1000, mem_size: 0x2000, flags: rx,
+    });
+    img.segments.push(Segment {
+        vaddr: 0x7000, file_off: 0x1000, file_size: 0x800, mem_size: 0x1000, flags: rw,
+    });
+
+    // Pool: 2 pages for segment 1 + 1 page for segment 2 = 3 frames.
+    let pool = alloc::vec![
+        PhysAddr::new(0x10_0000),
+        PhysAddr::new(0x10_1000),
+        PhysAddr::new(0x20_0000),
+    ];
+    let mut a2 = AddressSpace::empty();
+    let ep = match load_into(&img, pool.into_iter(), &mut a2) {
+        Ok(ep) => ep,
+        Err(_) => return TestResult::Fail("loader failed on valid image"),
+    };
+    if ep.0 != VirtAddr::new(0x4000) {
+        return TestResult::Fail("loader returned wrong entry point");
+    }
+    if a2.region_count() != 2 {
+        return TestResult::Fail("loader did not install both segments");
+    }
+    // First region: RX, first pool frame.
+    let r1 = a2.lookup(VirtAddr::new(0x4000)).expect("mapped");
+    if r1.perms != (RegionPerms::READ | RegionPerms::EXEC) {
+        return TestResult::Fail("first segment perms wrong");
+    }
+    if r1.phys != PhysAddr::new(0x10_0000) {
+        return TestResult::Fail("first segment did not pick first pool frame");
+    }
+    if r1.len != 0x2000 {
+        return TestResult::Fail("first segment len did not round up mem_size");
+    }
+    // Second region: RW, third pool frame (first two went to seg 1).
+    let r2 = a2.lookup(VirtAddr::new(0x7000)).expect("mapped");
+    if r2.phys != PhysAddr::new(0x20_0000) {
+        return TestResult::Fail("second segment picked wrong frame from pool");
+    }
+
+    // Insufficient pool → NoPhysFrames.
+    let tiny = alloc::vec![PhysAddr::new(0x30_0000)];
+    let mut a3 = AddressSpace::empty();
+    match load_into(&img, tiny.into_iter(), &mut a3) {
+        Err(LoadError::NoPhysFrames) => {}
+        _ => return TestResult::Fail("insufficient pool should surface NoPhysFrames"),
+    }
+
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_loader_into_address_space);
+
 fn smoke_userspace_syscall_table_roundtrip() -> TestResult {
     use narf_userspace::{Syscall, SyscallTable};
 
