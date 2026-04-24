@@ -228,25 +228,36 @@ pub unsafe fn read_tcr_el1() -> u64 {
     v
 }
 
-/// Write `GCR_EL1` — Tag Control Register.
+/// Write `GCR_EL1` — Tag Control Register. Uses the raw
+/// `S<op0>_<op1>_C<crn>_C<crm>_<op2>` encoding (Op0=3, Op1=0, CRn=1,
+/// CRm=0, Op2=6) because the `gcr_el1` mnemonic requires the `+mte`
+/// target feature which the bare `aarch64-unknown-none` target
+/// doesn't enable by default.
+///
+/// # Safety
+/// On CPUs without MTE (ID_AA64PFR1_EL1.MTE == 0), this raises #UD.
+/// Callers must gate on `Features::probe().mte > 0`.
 #[inline]
 pub unsafe fn write_gcr_el1(value: u64) {
     compiler_fence(Ordering::SeqCst);
-    // SAFETY: Always legal at EL1.
+    // SAFETY: caller confirmed MTE is present.
     unsafe {
-        asm!("msr gcr_el1, {v}", v = in(reg) value,
+        asm!("msr s3_0_c1_c0_6, {v}", v = in(reg) value,
              options(nostack, preserves_flags));
     }
     compiler_fence(Ordering::SeqCst);
 }
 
 /// Read `GCR_EL1`.
+///
+/// # Safety
+/// Same as `write_gcr_el1`: requires MTE support.
 #[inline]
 pub unsafe fn read_gcr_el1() -> u64 {
     let v: u64;
-    // SAFETY: Always legal at EL1.
+    // SAFETY: caller confirmed MTE is present.
     unsafe {
-        asm!("mrs {v}, gcr_el1", v = out(reg) v,
+        asm!("mrs {v}, s3_0_c1_c0_6", v = out(reg) v,
              options(nomem, nostack, preserves_flags));
     }
     v

@@ -7,11 +7,13 @@
 use core::fmt;
 use crate::aarch64::sysreg;
 
-/// Saved MTE state. Wraps `SCTLR_EL1` and `GCR_EL1`.
+/// Saved MTE state. Stage-2 scope: just `SCTLR_EL1` (the TCF mode +
+/// ATA bit live here and are universally accessible at EL1). Adding
+/// `GCR_EL1` requires `-machine virt,mte=on` on QEMU + MTE level ≥ 2,
+/// which isn't wired in our CI flow today — that's a Stage-3 follow-on.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub struct SavedMteState {
     pub sctlr: u64,
-    pub gcr:   u64,
 }
 
 /// Per-domain access rights. On aarch64 MTE, "rights" are enforced via
@@ -53,22 +55,14 @@ impl crate::DomainPrimitive for Mte {
 
     #[inline]
     unsafe fn save() -> Self::SavedState {
-        // SAFETY: MRS legal at EL1.
-        unsafe {
-            SavedMteState {
-                sctlr: sysreg::read_sctlr_el1(),
-                gcr:   sysreg::read_gcr_el1(),
-            }
-        }
+        // SAFETY: MRS SCTLR_EL1 always legal at EL1.
+        unsafe { SavedMteState { sctlr: sysreg::read_sctlr_el1() } }
     }
 
     #[inline]
     unsafe fn restore(s: Self::SavedState) {
-        // SAFETY: MSR legal at EL1.
-        unsafe {
-            sysreg::write_sctlr_el1(s.sctlr);
-            sysreg::write_gcr_el1(s.gcr);
-        }
+        // SAFETY: MSR SCTLR_EL1 always legal at EL1.
+        unsafe { sysreg::write_sctlr_el1(s.sctlr); }
     }
 
     #[inline]
@@ -86,21 +80,23 @@ impl crate::DomainPrimitive for Mte {
     #[inline]
     unsafe fn enter_domain(_kernel_domain: u8, _driver_domain: u8)
         -> Self::SavedState {
-        // SAFETY: transition to synchronous TCF mode.
-        unsafe {
-            let saved = Self::save();
-            let mut sctlr = saved.sctlr;
-            // TCF0 = 0b01 (Sync), TCF = 0b01 (Sync). bits 39:38 and 26:25.
-            sctlr &= !((0b11 << 38) | (0b11 << 25));
-            sctlr |= (0b01 << 38) | (0b01 << 25);
-            sysreg::write_sctlr_el1(sctlr);
-            saved
-        }
+        // Stage-2 scope: structural save only.
+        //
+        // A real MTE "enter scope" would flip SCTLR_EL1.TCF from
+        // Ignore to Sync so tag mismatches fault, but that requires
+        // the kernel's live tag storage and tagged pointers to already
+        // be consistent — otherwise every memory access after the
+        // flip tag-faults, recurses into the fault handler (which
+        // also tag-faults), and we loop. Tag storage bring-up is a
+        // Stage-3 task that pairs with the MTE-tag-aware allocator.
+        //
+        // SAFETY: pure MRS of SCTLR_EL1 — always legal at EL1.
+        unsafe { Self::save() }
     }
 
     #[inline]
     unsafe fn exit_domain(saved: Self::SavedState) {
-        // SAFETY: restore previous state.
+        // SAFETY: restore previous SCTLR_EL1.
         unsafe { Self::restore(saved); }
     }
 }

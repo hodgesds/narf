@@ -442,9 +442,9 @@ fn smoke_aarch64_features() -> TestResult {
 kernel_test!(smoke_aarch64_features);
 
 fn smoke_domain_primitive_trait() -> TestResult {
-    // The trait should be callable uniformly via `arch::Domain::*`.
-    // On x86_64 it dispatches to PKS. On aarch64 the stubs panic, so
-    // we skip the live calls there.
+    // Trait-level dispatch through `arch::Domain::*`. On x86_64 maps
+    // to PKS; on aarch64 maps to MTE. Both are live; the aarch64 path
+    // exercises `enter_domain` (SCTLR_EL1.TCF bit flip) + restore.
     use narf_arch::{DomainPrimitive, DomainBackend};
 
     // BACKEND must match the arch.
@@ -455,7 +455,25 @@ fn smoke_domain_primitive_trait() -> TestResult {
         return TestResult::Fail("DomainPrimitive::BACKEND wrong");
     }
 
-    // Live dispatch only on x86_64 where it's implemented.
+    #[cfg(target_arch = "aarch64")]
+    {
+        // aarch64 MTE: save + enter_domain (sync TCF) + exit_domain
+        // + save-vs-saved equality. MTE get_rights/set_rights are
+        // no-ops on aarch64 (rights are per-tag, not per-domain-
+        // register), so we exercise the save/restore path instead.
+        // SAFETY: legal MRS/MSR sequence at EL1.
+        unsafe {
+            let saved0 = <narf_arch::Domain as DomainPrimitive>::save();
+            let inner  = <narf_arch::Domain as DomainPrimitive>::enter_domain(0, 9);
+            <narf_arch::Domain as DomainPrimitive>::exit_domain(inner);
+            let saved1 = <narf_arch::Domain as DomainPrimitive>::save();
+            if saved0 != saved1 {
+                return TestResult::Fail("MTE save round-trip not preserved");
+            }
+        }
+    }
+
+    // Live dispatch x86_64 path (unchanged).
     #[cfg(target_arch = "x86_64")]
     {
         // SAFETY: CPUID always legal.

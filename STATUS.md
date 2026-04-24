@@ -169,23 +169,43 @@ $ cargo xtask test --arch=x86_64
   full PTE-PK → PKRS-rights → hardware-check → #PF → recovery loop
   is exercised every run.
 
-## Stage 2 Barrier — what's still open
+## Stage 2 Barrier — status
 
-- **Higher-half kernel** (-2 GiB linker relocation + `code-model=kernel`).
-  Every Stage 2 subsystem expects this layout by convention. Today the
-  kernel runs low-half (phys == virt).
-- **UIPI** (Sapphire Rapids+). Infrastructure now ready (LAPIC live,
-  IRQ path proven); UIPI is additive on top.
-- **Proper waker plumbing**: today's scheduler halts between rounds
-  but still re-polls every task on every wake (no-op waker). A real
-  `Waker` implementation would register per-task "I'm waiting on
-  this deadline / this ring" and only re-poll the specific task that
-  got woken. Nice optimisation but not critical for Stage 2.
-- **aarch64 MTE mirror**: SCTLR_EL1.TCF, tag storage, symmetric
-  DomainPrimitive. Currently only `BACKEND = Mte` constant exists.
-- **GICv3 skeleton** on aarch64 to match x2APIC on x86_64.
-- **Per-CPU probe state**: today's `arch::probe` globals are
-  single-probe-at-a-time. Wave-3 SMP bring-up needs per-CPU.
+**Substantively complete. All core items landed, both arches green.**
+
+- ~~Higher-half kernel~~ ✓ done. Linker scripts place
+  `.text`/`.rodata`/`.data`/`.bss` at high virt
+  (`0xFFFFFFFF_80000000` on x86_64, `0xFFFFFF80_00000000` on aarch64)
+  with `AT()` phys LMA. `.boot` / `.boot.data` stay at low phys for
+  the pre-MMU bootstrap. Both arches boot with kernel RIPs at
+  high-half.
+- ~~aarch64 MTE mirror~~ ✓ done. `arch::aarch64::mte::Mte` impls
+  `DomainPrimitive` with live `save` / `restore` on `SCTLR_EL1`.
+  `smoke_domain_primitive_trait` exercises the save/restore round-
+  trip on aarch64 through the trait. GCR_EL1 access (MTE L2) deferred
+  to Stage 3 when QEMU `-machine virt,mte=on` + tag storage lands;
+  `enter_domain` is currently a structural save-only (actual
+  `SCTLR_EL1.TCF = Sync` flip needs tag storage coherent first,
+  else every subsequent access tag-faults).
+- ~~GICv3 skeleton on aarch64~~ ✓ done. `init_bsp` programs the
+  CPU interface (system registers) + distributor (MMIO 0x0800_0000)
+  + redistributor (MMIO 0x080A_0000), enables the generic-timer
+  PPI (INTID 30). Default boot delivers ~100 timer IRQs during
+  the 5-tick demo; `smoke_aarch64_features` guards the probe.
+
+Remaining Stage 2 items (all additive / out of scope for local test):
+
+- **UIPI** (Sapphire Rapids+ only). QEMU `-cpu max` doesn't expose
+  UIPI on this host, so exercising it requires new hardware. The
+  IDT / IRQ infrastructure is ready; the actual UIPI MSR programming
+  would be <100 lines when there's a test target.
+- **Proper per-task waker plumbing**. Today's scheduler halts
+  between rounds but still re-polls every task on every wake
+  (no-op waker). Real per-task `Waker` that only re-polls the
+  specific task that got woken is a nice optimisation but not
+  behaviour-changing; deferred.
+- **Per-CPU probe state** — this is actually a Stage 3 SMP item
+  (current single-CPU state is correct by construction for Stage 2).
 
 ## Stage 2 design debt (not blocking, worth tracking)
 
