@@ -131,6 +131,20 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         }
     }
 
+    // aarch64 feature probe — mirrors the x86_64 block above. Gates
+    // the MTE/GICv3/PAC enable on actual silicon support so the same
+    // kernel image boots across CPU variants.
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: MRS of ID_AA64* is always legal at EL1.
+        let feats = unsafe { narf_arch::aarch64::Features::probe() };
+        // SAFETY: CNTFRQ_EL0 is always readable.
+        let hz = unsafe { narf_arch::aarch64::cpuid::generic_timer_hz() };
+        let _ = writeln!(console::Writer,
+            "  features: mte={} pauth={} bti={} gicv3_sr={} cntfrq={}Hz",
+            feats.mte, feats.pauth, feats.bti, feats.gicv3_sysreg, hz);
+    }
+
     // Boot-time domain enumeration — STAGE1.md exit-gate #5. Confirm the
     // authoritative DomainId table from security-model/ §4.1 is the one
     // `narf_lib::id` declares at compile time.

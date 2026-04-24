@@ -1,10 +1,12 @@
 //! aarch64 arch backend.
 
 pub mod asm;
+pub mod cpuid;
 pub mod mmio;
 pub mod mte;
 
 pub use asm::{halt_forever, disable_interrupts, enable_interrupts};
+pub use cpuid::Features;
 pub use mte::Mte;
 
 /// Exit QEMU via ARM semihosting `SYS_EXIT`. Falls back to `halt_forever`
