@@ -5506,6 +5506,102 @@ fn smoke_userspace_syscall_table_roundtrip() -> TestResult {
 kernel_test!(smoke_userspace_syscall_table_roundtrip);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_frame_x86_64_gdt_user_descriptors() -> TestResult {
+    // Read the GDT directly via SGDT and inspect the access byte
+    // (byte 5) of the user-code (index 6) and user-data (index 5)
+    // descriptors. Each descriptor is 8 bytes; byte 5 holds
+    // [P(7) | DPL(5:6) | S(4) | Type(0:3)]. DPL=3 → 0x60.
+    use core::arch::asm;
+
+    #[repr(C, packed)]
+    struct GdtPtr { limit: u16, base: u64 }
+    let mut ptr = GdtPtr { limit: 0, base: 0 };
+    unsafe {
+        asm!("sgdt [{p}]", p = in(reg) &mut ptr,
+             options(nostack, preserves_flags));
+    }
+    let base = ptr.base;
+
+    // Index 5 = byte offset 0x28 → user data.
+    // Index 6 = byte offset 0x30 → user code.
+    let read_access = |idx: u64| -> u8 {
+        unsafe { core::ptr::read_volatile((base + idx * 8 + 5) as *const u8) }
+    };
+
+    let udata_access = read_access(5);
+    if udata_access & 0xE0 != 0xE0 {
+        // 0xE0 = P(0x80) | DPL=3(0x60); S + Type checked below.
+        return TestResult::Fail("user-data descriptor lacks P+DPL=3");
+    }
+    if udata_access & 0x10 == 0 {
+        return TestResult::Fail("user-data descriptor S bit not set");
+    }
+    // Writable-data type: low nibble 0x2 (data + writable).
+    if udata_access & 0x0F != 0x02 {
+        return TestResult::Fail("user-data descriptor type != writable data");
+    }
+
+    let ucode_access = read_access(6);
+    if ucode_access & 0xE0 != 0xE0 {
+        return TestResult::Fail("user-code descriptor lacks P+DPL=3");
+    }
+    if ucode_access & 0x10 == 0 {
+        return TestResult::Fail("user-code descriptor S bit not set");
+    }
+    // Exec/read code type: low nibble 0xA (code + readable).
+    if ucode_access & 0x0F != 0x0A {
+        return TestResult::Fail("user-code descriptor type != exec/readable code");
+    }
+
+    // Kernel code descriptor (index 1) must still be DPL=0.
+    let kcode_access = read_access(1);
+    if kcode_access & 0x60 != 0x00 {
+        return TestResult::Fail("kernel code DPL drifted from 0");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_frame_x86_64_gdt_user_descriptors);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_frame_x86_64_idt_vector_128_dpl3() -> TestResult {
+    // The IDT itself is loaded via LIDT; we verify vector 128's
+    // DPL=3 by reading the IDT descriptor table pointer with
+    // SIDT and dereferencing the 16-byte entry at offset 128*16.
+    use core::arch::asm;
+
+    #[repr(C, packed)]
+    struct IdtPtr { limit: u16, base: u64 }
+    let mut ptr = IdtPtr { limit: 0, base: 0 };
+    unsafe {
+        asm!(
+            "sidt [{p}]",
+            p = in(reg) &mut ptr,
+            options(nostack, preserves_flags),
+        );
+    }
+    // Each IDT entry is 16 bytes. Vector 128 → offset 128*16 = 0x800.
+    let entry_ptr = {
+        let base = ptr.base;
+        (base + 128 * 16) as *const u8
+    };
+    // Access byte is at offset 5 within the 16-byte entry.
+    let access = unsafe { core::ptr::read_volatile(entry_ptr.add(5)) };
+    // DPL is bits 5..=6 of the access byte; should be 3 for a
+    // user-triggerable gate (0b01100000 = 0x60).
+    if access & 0x60 != 0x60 {
+        return TestResult::Fail("IDT vector 128 DPL != 3 — user mode cannot trigger int 0x80");
+    }
+    // Present bit should still be set.
+    if access & 0x80 == 0 {
+        return TestResult::Fail("IDT vector 128 not present");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_frame_x86_64_idt_vector_128_dpl3);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_frame_x86_64_tss_rsp0_and_gs_base() -> TestResult {
     // After `frame::x86_64::init_traps()` runs (part of boot) the
     // TSS has rsp0 pointing at the static kernel stack, and

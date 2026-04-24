@@ -24,8 +24,14 @@ use core::sync::atomic::{compiler_fence, Ordering};
 
 /// Kernel-code selector — byte offset into the GDT.
 pub const KCODE_SEL: u16 = 0x08;
+/// Kernel-data selector.
+pub const KDATA_SEL: u16 = 0x10;
 /// TSS selector.
 const TSS_SEL:  u16 = 0x18;
+/// User-data selector (RPL = 3).
+pub const UDATA_SEL: u16 = 0x28 | 3;  // index 5, RPL=3 → 0x2B
+/// User-code selector (RPL = 3) — long-mode code at DPL=3.
+pub const UCODE_SEL: u16 = 0x30 | 3;  // index 6, RPL=3 → 0x33
 
 /// IST slot assignments, STAGE1.md Wave 2 #7.
 pub const IST_NMI: u8 = 1;
@@ -94,8 +100,11 @@ static mut TSS: Tss = Tss {
     io_map_base: 0,
 };
 
-/// 5 entries × 8 bytes = 40 bytes. Null + code + data + TSS-lo + TSS-hi.
-static mut GDT: [u64; 5] = [0; 5];
+/// 7 entries × 8 bytes = 56 bytes. Null + kernel-code + kernel-data +
+/// TSS-lo + TSS-hi + user-data + user-code. User descriptors sit
+/// after the TSS so the existing kernel selectors keep their byte
+/// offsets.
+static mut GDT: [u64; 7] = [0; 7];
 
 #[repr(C, packed)]
 #[derive(Copy, Clone)]
@@ -160,19 +169,26 @@ pub unsafe fn init() {
         | (((tss_base >> 24) & 0xFF) << 56);
     let tss_hi: u64 = tss_base >> 32;
 
+    // User-code (long mode, DPL=3): L=1, P=1, DPL=3, S=1, Type=exec/read.
+    //   0x00af_fa00_0000_ffff     (same as kernel code but DPL=3 → byte 5: 0xFA)
+    // User-data (present, writable, DPL=3): cosmetic in long mode.
+    //   0x00cf_f200_0000_ffff
+    //
     // SAFETY: single-threaded boot path, no prior readers.
     unsafe {
         let gdt = core::ptr::addr_of_mut!(GDT).cast::<u64>();
         gdt.add(0).write(0);                          // null
-        gdt.add(1).write(0x00af_9a00_0000_ffff);      // kernel code
-        gdt.add(2).write(0x00cf_9200_0000_ffff);      // kernel data
-        gdt.add(3).write(tss_lo);
-        gdt.add(4).write(tss_hi);
+        gdt.add(1).write(0x00af_9a00_0000_ffff);      // kernel code  (0x08)
+        gdt.add(2).write(0x00cf_9200_0000_ffff);      // kernel data  (0x10)
+        gdt.add(3).write(tss_lo);                     // TSS lo       (0x18)
+        gdt.add(4).write(tss_hi);                     // TSS hi       (0x20)
+        gdt.add(5).write(0x00cf_f200_0000_ffff);      // user data    (0x28 | 3)
+        gdt.add(6).write(0x00af_fa00_0000_ffff);      // user code    (0x30 | 3)
     }
 
     // ── LGDT ──
     let ptr = Pseudo {
-        limit: (5 * 8 - 1) as u16,
+        limit: (7 * 8 - 1) as u16,
         base:  core::ptr::addr_of!(GDT) as u64,
     };
     compiler_fence(Ordering::SeqCst);

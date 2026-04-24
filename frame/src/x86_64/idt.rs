@@ -67,6 +67,9 @@ const IDT_ENTRIES: usize = 256;
 
 /// Interrupt-gate, present, DPL=0: 0x8E.
 const GATE_INT_KERNEL: u8 = 0x8E;
+/// Interrupt-gate, present, DPL=3: 0xEE. User-mode software
+/// interrupts (`int 0x80` from CPL=3) require DPL=3 or they #GP.
+const GATE_INT_USER:   u8 = 0xEE;
 
 use super::gdt::{KCODE_SEL, IST_NMI, IST_DF, IST_MC, IST_VC};
 
@@ -98,7 +101,11 @@ fn install(vec: usize, handler: unsafe extern "C" fn()) {
 }
 
 fn install_with_ist(vec: usize, handler: unsafe extern "C" fn(), ist: u8) {
-    let entry = IdtEntry::new(handler as u64, KCODE_SEL, ist, GATE_INT_KERNEL);
+    install_full(vec, handler, ist, GATE_INT_KERNEL);
+}
+
+fn install_full(vec: usize, handler: unsafe extern "C" fn(), ist: u8, gate: u8) {
+    let entry = IdtEntry::new(handler as u64, KCODE_SEL, ist, gate);
     // SAFETY: IDT is accessed only on the BSP during Stage-1 bring-up, before
     // any other CPU or interrupt handler can observe it. The write happens
     // before `lidt`, and the entry layout matches the hardware spec.
@@ -136,7 +143,9 @@ pub unsafe fn init() {
     install(40, int_40); install(41, int_41); install(42, int_42); install(43, int_43);
     install(44, int_44); install(45, int_45); install(46, int_46); install(47, int_47);
     // Software-interrupt syscall gate — `int 0x80` routes here.
-    install(128, int_128);
+    // DPL=3 so user mode (CPL=3) can trigger it; kernel mode also
+    // works at any CPL.
+    install_full(128, int_128, 0, GATE_INT_USER);
     install(255, int_255);
 
     // Build the LIDT descriptor and load it.

@@ -7,6 +7,7 @@ pub mod gdt;
 pub mod idt;
 pub mod percpu;
 pub mod trap;
+pub mod user;
 
 /// Install GDT (with TSS) and the IDT. After this returns, CPU exceptions
 /// route through `rust_trap_handler`; NMI / #DF / #MC / #VC land on

@@ -341,7 +341,15 @@ pub unsafe fn map_4kb(
     if phys.raw() & 0xFFF != 0 { return Err(MapError::UnalignedPhys); }
 
     let idx = WalkIndices::from_virt(virt);
-    let base_flags = PtFlags::PRESENT | PtFlags::WRITABLE;
+    // Intermediate tables need `USER` whenever the leaf does — the
+    // CPU AND's the USER bits across every level of the walk, so a
+    // `USER` leaf under a supervisor-only PML4 entry is unreachable
+    // from CPL=3. Kernel pages are still protected by their own
+    // leaf-PTE USER=0.
+    let mut base_flags = PtFlags::PRESENT | PtFlags::WRITABLE;
+    if flags.contains(PtFlags::USER) {
+        base_flags = base_flags | PtFlags::USER;
+    }
 
     // SAFETY: caller guarantees pml4_phys is identity-reachable.
     let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
