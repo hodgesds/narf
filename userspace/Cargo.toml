@@ -1,0 +1,20 @@
+[package]
+name         = "narf-userspace"
+description  = "User-mode process model, ELF loader, relibc integration shapes."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_userspace"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../lib" }
+narf-capabilities = { path = "../capabilities" }
+narf-scheduler    = { path = "../scheduler" }
+
+[lints]
+workspace = true

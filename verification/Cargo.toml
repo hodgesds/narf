@@ -35,6 +35,7 @@ narf-net        = { path = "../net" }
 narf-filesystem = { path = "../filesystem" }
 narf-power      = { path = "../power" }
 narf-observability = { path = "../observability" }
+narf-userspace  = { path = "../userspace" }
 
 [lints]
 workspace = true

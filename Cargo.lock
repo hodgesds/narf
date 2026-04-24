@@ -591,6 +591,7 @@ name = "narf-time"
 version = "0.0.0"
 dependencies = [
  "narf-arch",
+ "narf-capabilities",
  "narf-lib",
 ]
 
@@ -602,6 +603,15 @@ dependencies = [
  "narf-capabilities",
  "narf-lib",
  "narf-time",
+]
+
+[[package]]
+name = "narf-userspace"
+version = "0.0.0"
+dependencies = [
+ "narf-capabilities",
+ "narf-lib",
+ "narf-scheduler",
 ]
 
 [[package]]
@@ -631,6 +641,7 @@ dependencies = [
  "narf-scheduler",
  "narf-time",
  "narf-tracing",
+ "narf-userspace",
 ]
 
 [[package]]

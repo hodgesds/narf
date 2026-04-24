@@ -4713,6 +4713,46 @@ fn smoke_block_deadline_promotes_expired() -> TestResult {
 }
 kernel_test!(smoke_block_deadline_promotes_expired);
 
+fn smoke_userspace_process_id_and_aux() -> TestResult {
+    use narf_userspace::{
+        alloc_pid, AuxEntry, ExecImage, ExecKind, ProcessId, Segment, SegmentFlags,
+    };
+
+    if ProcessId::KERNEL.raw() != 0 {
+        return TestResult::Fail("KERNEL pid reservation wrong");
+    }
+    let a = alloc_pid();
+    let b = alloc_pid();
+    if a == b || a.raw() == 0 || b.raw() == 0 {
+        return TestResult::Fail("alloc_pid did not mint distinct non-zero ids");
+    }
+
+    // Aux tag values match <elf.h>.
+    assert!(AuxEntry::Null.tag() == 0);
+    assert!(AuxEntry::Entry(0).tag() == 9);
+    assert!(AuxEntry::Pagesz(4096).tag() == 6);
+
+    // Segment flags compose.
+    let rx = SegmentFlags::READ | SegmentFlags::EXEC;
+    if !rx.contains(SegmentFlags::READ) || !rx.contains(SegmentFlags::EXEC) {
+        return TestResult::Fail("SegmentFlags::contains broken");
+    }
+    if rx.contains(SegmentFlags::WRITE) {
+        return TestResult::Fail("RX flags should not contain WRITE");
+    }
+
+    let mut img = ExecImage::empty(ExecKind::Elf64Dyn);
+    img.entry = 0x4000;
+    img.segments.push(Segment {
+        vaddr: 0x4000, file_off: 0, file_size: 0x1000, mem_size: 0x1000, flags: rx,
+    });
+    if img.entry != 0x4000 || img.segments.len() != 1 {
+        return TestResult::Fail("ExecImage assembly broke");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_process_id_and_aux);
+
 fn smoke_obs_gdb_packet_checksum() -> TestResult {
     use narf_observability::gdb::GdbPacket;
 

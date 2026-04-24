@@ -29,6 +29,7 @@ members = [
     "filesystem",
     "power",
     "observability",
+    "userspace",
 ]
 
 [workspace.package]
