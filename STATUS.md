@@ -87,7 +87,18 @@ $ cargo xtask test --arch=x86_64
 ## Stage 2 Barrier — what exists
 
 - **CPUID feature probe** (`arch/x86_64/cpuid.rs`): NX, PKU, PKS, UIPI,
-  invariant-TSC, RDSEED, RDRAND detected at boot and reported.
+  invariant-TSC, RDSEED, RDRAND, x2APIC, APIC detected at boot and
+  reported.
+- **x2APIC enable** (`narf-interrupts` crate, `apic::init_bsp`):
+  IA32_APIC_BASE set with EN + EXTD; SIVR programmed; LVT timer
+  masked by default; `start_timer` / `stop_timer` primitives for
+  periodic-mode configuration.
+- **IRQ-vector IDT entries** (`frame/x86_64`): stubs + IDT installs
+  for vectors 32..=47 and 255 (spurious). `rust_trap_handler`
+  dispatches IRQ vectors (>= 32) separately from exceptions,
+  calling the appropriate subsystem handler and EOI-ing the LAPIC.
+  **Software `int 32` dispatch verified end-to-end** (pushes frame
+  → stub → common_trap → Rust handler → EOI → iretq returns cleanly).
 - **MSR / CR helpers** (`arch/x86_64/msr.rs`, `.../cr.rs`): `rdmsr`,
   `wrmsr`, `read_cr4`, `write_cr4`, with the compiler_fence(SeqCst)
   pair per `arch/` §4.
@@ -115,17 +126,23 @@ $ cargo xtask test --arch=x86_64
 
 ## Stage 2 Barrier — what's still open
 
+- **Hardware LAPIC-IRQ dispatch**: software `int 32` works cleanly,
+  but enabling CPU IRQs (`sti`) with the LAPIC timer programmed
+  causes a `#DF` on the first async IRQ delivery. Trap frame shows
+  RIP=0x8 / CS=valid-rflags, suggesting a push/layout mismatch
+  specific to async IRQ entry on this QEMU/CPU combo. Captured as
+  an open investigation; the scheduler stays on Stage-1 busy-poll
+  until resolved.
 - **Higher-half kernel** (-2 GiB linker relocation + `code-model=kernel`).
   Every Stage 2 subsystem expects this layout by convention. Today the
   kernel runs low-half (phys == virt).
 - **NX enable**: `IA32_EFER.NXE = 1` so `PtFlags::NO_EXEC` is honoured.
   CPUID says NX is present; just not wired yet.
-- **Interrupt controller** (`interrupts/`): x2APIC / LAPIC-timer bring-up
-  on x86_64, GICv3 on aarch64. Prerequisite for replacing the Stage 1
-  busy-poll scheduler with an IRQ-driven one.
-- **UIPI** (Sapphire Rapids+). Gates on APIC.
+- **UIPI** (Sapphire Rapids+). Gates on resolving the hardware-IRQ
+  #DF above.
 - **aarch64 MTE mirror**: SCTLR_EL1.TCF, tag storage, symmetric
   DomainPrimitive. Currently only `BACKEND = Mte` constant exists.
+- **GICv3 skeleton** on aarch64 to match x2APIC on x86_64.
 - **`DomainPrimitive` trait declared in `arch/`**: once MTE lands the
   second implementation, extract the common trait surface from the
   x86_64 `pks` module and point aarch64 at it.
@@ -200,6 +217,7 @@ cargo test -p narf-lib
 | Stage 2 PK    | PTE PK field, `DomainPrimitive`-shaped save/restore/get/set  |
 | probe         | Recoverable trap handler + arm/disarm exception-table probe  |
 | PKS live      | `smoke_pks_enforces_deny_all` — end-to-end #PF/PK demo      |
+| APIC partial  | `narf-interrupts` + IRQ IDT entries; soft INT 32 works      |
 
 ## Pickup hint for the next session
 

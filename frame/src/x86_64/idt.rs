@@ -83,6 +83,13 @@ extern "C" {
     fn int_20();  fn int_21();  fn int_22();  fn int_23();
     fn int_24();  fn int_25();  fn int_26();  fn int_27();
     fn int_28();  fn int_29();  fn int_30();  fn int_31();
+
+    // External IRQ stubs (32..=47) + spurious (255).
+    fn int_32();  fn int_33();  fn int_34();  fn int_35();
+    fn int_36();  fn int_37();  fn int_38();  fn int_39();
+    fn int_40();  fn int_41();  fn int_42();  fn int_43();
+    fn int_44();  fn int_45();  fn int_46();  fn int_47();
+    fn int_255();
 }
 
 fn install(vec: usize, handler: unsafe extern "C" fn()) {
@@ -120,6 +127,13 @@ pub unsafe fn init() {
     install(26, int_26); install(27, int_27); install(28, int_28);
     install_with_ist(29, int_29, IST_VC);        // #VC (SEV-ES) own stack
     install(30, int_30); install(31, int_31);
+
+    // External IRQs 32..=47 + spurious 255.
+    install(32, int_32); install(33, int_33); install(34, int_34); install(35, int_35);
+    install(36, int_36); install(37, int_37); install(38, int_38); install(39, int_39);
+    install(40, int_40); install(41, int_41); install(42, int_42); install(43, int_43);
+    install(44, int_44); install(45, int_45); install(46, int_46); install(47, int_47);
+    install(255, int_255);
 
     // Build the LIDT descriptor and load it.
     let ptr = IdtPointer {

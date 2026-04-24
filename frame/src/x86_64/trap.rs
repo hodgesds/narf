@@ -87,6 +87,20 @@ fn vector_name(v: u64) -> &'static str {
 ///     does not return.
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
+    // External IRQ path (vectors 32..=255). Dispatch to the
+    // subsystem-registered handler (or ignore if no handler), then
+    // EOI. Bypasses the probe-catch path — probes are for catching
+    // CPU *exceptions* (vectors 0..=31), not asynchronous IRQs.
+    if frame.vector >= 32 {
+        match frame.vector {
+            32 => narf_interrupts::x86_64::apic::on_timer_tick(),
+            _  => {}
+        }
+        // SAFETY: APIC is initialised before interrupts are enabled.
+        unsafe { narf_interrupts::eoi(); }
+        return;
+    }
+
     // Recoverable-probe path. `consume` is atomic: a second fault
     // inside the handler can't double-claim the recovery.
     let recovery = narf_arch::x86_64::probe::consume(

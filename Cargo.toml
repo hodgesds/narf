@@ -11,6 +11,7 @@ members = [
     "memory",
     "time",
     "scheduler",
+    "interrupts",
     "verification",
     "frame",
     "build/xtask",

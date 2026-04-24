@@ -19,6 +19,7 @@ narf-boot          = { path = "../boot" }
 narf-console       = { path = "../console" }
 narf-time          = { path = "../time" }
 narf-scheduler     = { path = "../scheduler" }
+narf-interrupts    = { path = "../interrupts" }
 narf-verification  = { path = "../verification", optional = true }
 
 [features]

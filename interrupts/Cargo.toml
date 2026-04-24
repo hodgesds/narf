@@ -1,0 +1,19 @@
+[package]
+name         = "narf-interrupts"
+description  = "x2APIC / LAPIC timer / IRQ routing. Stage 2: BSP-local timer."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_interrupts"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib  = { path = "../lib" }
+narf-arch = { path = "../arch" }
+
+[lints]
+workspace = true

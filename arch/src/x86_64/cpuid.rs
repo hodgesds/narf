@@ -52,6 +52,8 @@ pub struct Features {
     pub invariant_tsc: bool, // leaf 80000007h EDX:8
     pub rdseed:   bool,   // leaf 7, sub 0 EBX:18
     pub rdrand:   bool,   // leaf 1 ECX:30
+    pub x2apic:   bool,   // leaf 1 ECX:21
+    pub apic:     bool,   // leaf 1 EDX:9
 }
 
 impl Features {
@@ -63,10 +65,12 @@ impl Features {
     pub unsafe fn probe() -> Self {
         let mut f = Features::default();
 
-        // Leaf 1: ECX:30 = RDRAND.
+        // Leaf 1: ECX:21 = x2APIC, ECX:30 = RDRAND, EDX:9 = APIC.
         // SAFETY: CPUID at CPL=0 is always defined.
-        let (_, _, ecx1, _) = unsafe { cpuid(0x0000_0001, 0) };
+        let (_, _, ecx1, edx1) = unsafe { cpuid(0x0000_0001, 0) };
         f.rdrand = ecx1 & (1 << 30) != 0;
+        f.x2apic = ecx1 & (1 << 21) != 0;
+        f.apic   = edx1 & (1 <<  9) != 0;
 
         // Leaf 7, sub 0 — extended features.
         let (_, ebx7, ecx7, edx7) = unsafe { cpuid(0x0000_0007, 0) };

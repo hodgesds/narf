@@ -147,11 +147,20 @@ dependencies = [
  "narf-arch",
  "narf-boot",
  "narf-console",
+ "narf-interrupts",
  "narf-lib",
  "narf-memory",
  "narf-scheduler",
  "narf-time",
  "narf-verification",
+]
+
+[[package]]
+name = "narf-interrupts"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-lib",
 ]
 
 [[package]]

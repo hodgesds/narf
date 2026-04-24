@@ -95,9 +95,6 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             unsafe {
                 let cr4 = narf_arch::x86_64::cr::read_cr4();
                 narf_arch::x86_64::cr::write_cr4(cr4 | narf_arch::x86_64::cr::CR4_PKS);
-                // Initialise PKRS to "all domains have all rights"
-                // (every 2-bit field = 00). Stage-3 cap-gated rights
-                // flips land later.
                 narf_arch::x86_64::msr::wrmsr(narf_arch::x86_64::msr::IA32_PKRS, 0);
             }
             let _ = writeln!(console::Writer,
@@ -105,6 +102,16 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         } else {
             let _ = writeln!(console::Writer,
                 "  pks: unavailable — Stage-2 Barrier domain switch will degrade");
+        }
+
+        // x2APIC + LAPIC timer. Gated on CPUID.x2APIC; absence leaves
+        // the scheduler in its Stage-1 busy-poll mode, which still
+        // works, just without timer IRQs.
+        if feats.x2apic {
+            // SAFETY: CPUID confirmed x2APIC.
+            unsafe { narf_interrupts::x86_64::apic::init_bsp(); }
+            let _ = writeln!(console::Writer,
+                "  apic: x2APIC enabled (timer masked; hardware-IRQ path TBD)");
         }
     }
 
@@ -245,6 +252,21 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
 
 #[cfg(not(any(feature = "kernel-test", feature = "idt-selftest")))]
 fn run_async_demo() -> ! {
+    // Stage-2 Barrier observation: software `int 32` dispatches
+    // cleanly through the IDT to the Rust trap handler. Hardware-
+    // delivered LAPIC timer IRQs currently cause a #DF in the
+    // dispatch path — tracking as an open investigation. Scheduler
+    // stays on the Stage-1 busy-poll model until then.
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Soft INT 32 to prove dispatch works.
+        let _ = writeln!(console::Writer, "  testing soft-INT 32 dispatch ...");
+        // SAFETY: INT N with a registered handler is equivalent to
+        // calling the handler through the IDT.
+        unsafe { core::arch::asm!("int 32", options(nostack)); }
+        let _ = writeln!(console::Writer, "  soft-INT 32 returned cleanly.");
+    }
+
     narf_scheduler::init();
     let _ = writeln!(console::Writer, "  scheduler: ready queue initialised");
 
