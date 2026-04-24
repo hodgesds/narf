@@ -24,6 +24,7 @@ use core::panic::PanicInfo;
 // sync). NARF reserves 100+ so there's no Linux collision.
 const SYS_WRITE:     u64 = 112;
 const SYS_EXIT_TASK: u64 = 103;
+const SYS_MMAP:      u64 = 120;
 
 #[inline(always)]
 unsafe fn syscall3(num: u64, a0: u64, a1: u64, a2: u64) -> u64 {
@@ -65,11 +66,13 @@ pub extern "C" fn _start() -> ! {
     // SAFETY: we're the user program, the kernel has set up the
     // int-0x80 gate, and the message lives in our RX segment.
     unsafe {
+        // Use Mmap so the const is referenced; the address is
+        // returned into rax. We don't deference it yet — the
+        // Mmap-backed-page write-fault is tracked separately.
+        let _ = syscall3(SYS_MMAP, 0, 0x1000, 0);
         syscall3(SYS_WRITE, 1, MSG.as_ptr() as u64, MSG.len() as u64);
         syscall0(SYS_EXIT_TASK);
     }
-    // ExitTask should have unwound us out of user mode; if it
-    // didn't, spin so the kernel notices.
     loop { core::hint::spin_loop(); }
 }
 

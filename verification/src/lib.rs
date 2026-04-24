@@ -6319,17 +6319,20 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
         );
     }
 
-    // Scheduler-aware AS lookup for Mmap/Munmap handlers. Not
-    // used by the testbin today (it only calls Write + ExitTask),
-    // but present for completeness.
-    fn scheduler_as_lookup() -> Option<alloc::sync::Arc<narf_memory::AddressSpace>> {
-        let id = narf_scheduler::current_task_id();
-        if id == narf_scheduler::TaskId::NONE { return None; }
-        narf_scheduler::address_space_of(id)
+    // Test-only AS lookup: the testbin is run outside the
+    // scheduler (we're called from the kernel-test harness, not as
+    // a spawned task), so `scheduler::current_task_id()` returns
+    // NONE. Instead, stash the process's Arc<AddressSpace> in a
+    // static that the lookup returns directly.
+    static USER_AS: narf_lib::sync::IrqSafeSpinLock<
+        Option<alloc::sync::Arc<narf_memory::AddressSpace>>,
+    > = narf_lib::sync::IrqSafeSpinLock::new(None);
+    fn test_as_lookup() -> Option<alloc::sync::Arc<narf_memory::AddressSpace>> {
+        USER_AS.lock().clone()
     }
 
     __test_clear_global();
-    install_address_space_lookup(scheduler_as_lookup);
+    install_address_space_lookup(test_as_lookup);
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
     install_global(t);
@@ -6381,6 +6384,10 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("load_user_process failed on narf-testbin"),
     };
+
+    // Stash the user AS so Mmap/Munmap handlers can find it via
+    // the installed lookup.
+    *USER_AS.lock() = Some(proc.address_space.clone());
 
     if proc.address_space.activate().is_err() {
         return TestResult::Fail("activate failed");
