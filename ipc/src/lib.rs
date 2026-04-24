@@ -36,6 +36,9 @@
 
 extern crate alloc;
 
+pub mod mpsc;
+pub use mpsc::{mpsc_channel, MpscConsumer, MpscProducer, MpscRecvError, MpscSendError};
+
 use alloc::sync::Arc;
 use core::cell::UnsafeCell;
 use core::future::Future;
