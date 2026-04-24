@@ -4713,6 +4713,91 @@ fn smoke_block_deadline_promotes_expired() -> TestResult {
 }
 kernel_test!(smoke_block_deadline_promotes_expired);
 
+fn smoke_power_thermal_zone_transitions() -> TestResult {
+    use core::sync::atomic::{AtomicU8, Ordering};
+    use narf_capabilities::{Cap, Grant};
+    use narf_power::{thermal, Thermal, ThermalEvent, ThermalState};
+
+    thermal::__test_reset();
+    thermal::init();
+
+    static LAST: AtomicU8 = AtomicU8::new(0);
+    LAST.store(0, Ordering::Relaxed);
+
+    let cap: Cap<Thermal, Grant> = Cap::bootstrap();
+    let id = match thermal::register_zone(&cap, "cpu0", 70_000, 95_000) {
+        Ok(id) => id,
+        Err(_) => return TestResult::Fail("register_zone failed"),
+    };
+    if thermal::subscribe(&cap, |ev| {
+        let code = match ev {
+            ThermalEvent::Normal   { .. } => 1,
+            ThermalEvent::Warm     { .. } => 2,
+            ThermalEvent::Critical { .. } => 3,
+        };
+        LAST.store(code, Ordering::Relaxed);
+    }).is_err() {
+        return TestResult::Fail("subscribe failed");
+    }
+
+    // 50_000 milli_C → still Normal, no event (Normal → Normal).
+    if thermal::record_temp(id, 50_000).unwrap() != ThermalState::Normal {
+        return TestResult::Fail("50C classified wrong");
+    }
+    if LAST.load(Ordering::Relaxed) != 0 {
+        return TestResult::Fail("no event should fire Normal→Normal");
+    }
+    // 75_000 → Warm; event fires.
+    if thermal::record_temp(id, 75_000).unwrap() != ThermalState::Warm {
+        return TestResult::Fail("75C classified wrong");
+    }
+    if LAST.load(Ordering::Relaxed) != 2 {
+        return TestResult::Fail("Warm event did not fire");
+    }
+    // 96_000 → Critical; event fires.
+    if thermal::record_temp(id, 96_000).unwrap() != ThermalState::Critical {
+        return TestResult::Fail("96C classified wrong");
+    }
+    if LAST.load(Ordering::Relaxed) != 3 {
+        return TestResult::Fail("Critical event did not fire");
+    }
+    // Back to 40_000 → Normal again; event fires.
+    if thermal::record_temp(id, 40_000).unwrap() != ThermalState::Normal {
+        return TestResult::Fail("40C classified wrong");
+    }
+    if LAST.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("Normal return event did not fire");
+    }
+
+    thermal::__test_reset();
+    TestResult::Pass
+}
+kernel_test!(smoke_power_thermal_zone_transitions);
+
+fn smoke_power_energy_aware_governor() -> TestResult {
+    use narf_power::{EnergyAware, FreqHint, GovernorPolicy};
+
+    let g = EnergyAware;
+    if g.name() != "energy-aware" {
+        return TestResult::Fail("EnergyAware governor name wrong");
+    }
+    // Idle band: 50/1000 load → MIN.
+    if g.select_freq(50) != FreqHint::MIN {
+        return TestResult::Fail("idle-band not MIN");
+    }
+    // Moderate band: 400/1000 load → midpoint (between MIN and MAX).
+    let mid = g.select_freq(400);
+    if mid == FreqHint::MIN || mid == FreqHint::MAX {
+        return TestResult::Fail("moderate-band should pick a midpoint");
+    }
+    // Heavy band: 800/1000 load → MAX.
+    if g.select_freq(800) != FreqHint::MAX {
+        return TestResult::Fail("heavy-band not MAX");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_power_energy_aware_governor);
+
 fn smoke_block_mq_round_robins_across_lanes() -> TestResult {
     // Populate three lanes with one request each. dequeue_next walks
     // round-robin so each lane's entry comes out exactly once before

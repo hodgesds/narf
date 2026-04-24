@@ -33,6 +33,12 @@
 
 extern crate alloc;
 
+pub mod thermal;
+
+pub use thermal::{
+    ThermalEvent, ThermalError, ThermalState, ThermalZone, Thermal,
+};
+
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::future::Future;
@@ -262,6 +268,36 @@ impl GovernorPolicy for OnDemand {
     fn name(&self) -> &'static str { "ondemand" }
     fn select_freq(&self, load_permille: u16) -> FreqHint {
         if load_permille > 500 { FreqHint::MAX } else { FreqHint::MIN }
+    }
+}
+
+/// Stage-4 EnergyAware governor. Three-band mapping keyed off a
+/// `scheduler/`-supplied load hint: idle (0..=100) clocks down to
+/// minimum, moderate (100..=700) picks the midpoint, heavy
+/// (700..=1000) maxes out. The real EAS model in Linux consumes a
+/// per-OPP energy table; that table lives behind `arch/` DVFS
+/// primitives that are not yet exposed, so this structural form
+/// picks a reasonable frequency *for the stub* without pretending to
+/// minimise energy-per-work. Once `arch/` exposes the table, swap
+/// the midpoint selector for a per-OPP energy walk.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct EnergyAware;
+impl GovernorPolicy for EnergyAware {
+    fn name(&self) -> &'static str { "energy-aware" }
+    fn select_freq(&self, load_permille: u16) -> FreqHint {
+        // Three-band pick in [MIN, MAX]. Midpoint for moderate load
+        // so p99 latency doesn't suffer; MAX reserved for genuine
+        // throughput workloads.
+        let min = FreqHint::MIN.0;
+        let max = FreqHint::MAX.0;
+        if load_permille >= 700 {
+            FreqHint::MAX
+        } else if load_permille >= 100 {
+            let mid = min + (max - min) / 2;
+            FreqHint(mid)
+        } else {
+            FreqHint::MIN
+        }
     }
 }
 
