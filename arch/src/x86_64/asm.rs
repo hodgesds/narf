@@ -124,3 +124,44 @@ pub unsafe fn cas128(ptr: *mut u128, old: u128, new: u128) -> Result<u128, u128>
         Err(res)
     }
 }
+
+/// Atomically replace a 4-byte instruction word at `addr` with `new`.
+/// Used by `tracing/` for runtime probe arming.
+///
+/// # Safety
+/// - `addr` must be 4-byte aligned and point to memory that is both
+///   writable (typically via a kernel-writable alias; W^X violation
+///   otherwise) and executable.
+/// - The old and new bytes must each encode a complete 4-byte boundary:
+///   no cross-instruction splits. For NOP-sled arming, the classic NARF
+///   sled is 4 bytes of `0x90` + a 4-byte slot that `patch_word` flips.
+/// - On single-CPU NARF (Stage 3), the local-serialising `cpuid` at the
+///   end is sufficient for the patching CPU to see the new code on its
+///   next fetch. SMP requires broadcasting via IPI + targeted
+///   `wbinvd`/serializing sequence on every CPU — deferred to Stage 4.
+#[inline(always)]
+pub unsafe fn patch_word(addr: *mut u32, new: u32) {
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: aligned 4-byte store is atomic on every x86_64 CPU NARF
+    // targets. The caller asserts writable + executable + aligned.
+    unsafe { core::ptr::write_volatile(addr, new); }
+    // Serialising instruction: CPUID with EAX=0 is the canonical
+    // x86 post-self-modifying-code flush. Spec is clear that an
+    // instruction-fetch of modified code without a serialising
+    // event is architecturally undefined.
+    unsafe {
+        // RBX is LLVM-reserved; stash it manually. `nostack` is not set
+        // because push/pop touches the stack.
+        asm!(
+            "push rbx",
+            "mov eax, 0",
+            "cpuid",
+            "pop rbx",
+            lateout("eax") _,
+            lateout("ecx") _,
+            lateout("edx") _,
+            options(preserves_flags),
+        );
+    }
+    compiler_fence(Ordering::SeqCst);
+}

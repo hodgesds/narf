@@ -8,7 +8,7 @@ pub mod msr;
 pub mod pks;
 pub mod probe;
 
-pub use asm::{halt_forever, disable_interrupts, enable_interrupts, cas128};
+pub use asm::{halt_forever, disable_interrupts, enable_interrupts, cas128, patch_word};
 pub use cpuid::Features;
 
 /// x86_64's concrete `DomainPrimitive` type. All methods forward to

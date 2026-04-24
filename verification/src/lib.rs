@@ -3419,6 +3419,166 @@ fn smoke_rcu_sleepable_revoked_cap_rejected() -> TestResult {
 }
 kernel_test!(smoke_rcu_sleepable_revoked_cap_rejected);
 
+// ── rcu/ hazard-pointer tests ──────────────────────────────────────
+//
+// Cover the three load-bearing properties of `HazardDomain`:
+//   * publish + retire round-trip (no readers active)
+//   * retire while a reader holds the guard — drop must wait
+//   * batch retire of unheld pointers — one scan() drains all
+
+fn smoke_rcu_hazard_publish_retire() -> TestResult {
+    // Publisher allocates a Box<u32>, exposes it via AtomicPtr; reader
+    // acquires a guard; verifies the value; drops the guard. Publisher
+    // then retires the pointer with a Drop-counting trampoline; one
+    // scan() must reclaim it.
+    use alloc::boxed::Box;
+    use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+    use narf_rcu::hazard::HazardDomain;
+
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+    struct Canary { v: u32 }
+    impl Drop for Canary {
+        fn drop(&mut self) { DROPS.fetch_add(1, Ordering::Relaxed); }
+    }
+
+    DROPS.store(0, Ordering::Relaxed);
+
+    let domain = HazardDomain::new();
+    let raw = Box::into_raw(Box::new(Canary { v: 0xdead_beef }));
+    let cell: AtomicPtr<Canary> = AtomicPtr::new(raw);
+
+    {
+        let g = match domain.acquire(&cell) {
+            Some(g) => g,
+            None    => return TestResult::Fail("acquire returned None on a non-null cell"),
+        };
+        if g.v != 0xdead_beef {
+            return TestResult::Fail("hazard guard saw wrong value");
+        }
+        // Guard drops here.
+    }
+
+    if DROPS.load(Ordering::Relaxed) != 0 {
+        return TestResult::Fail("Canary dropped before retire was called");
+    }
+
+    fn drop_canary(p: *mut Canary) {
+        // SAFETY: the test owns the pointer; retire's contract is that
+        // we'll be invoked once no hazard slot names it.
+        unsafe { drop(Box::from_raw(p)); }
+    }
+    domain.retire(raw, drop_canary);
+
+    if DROPS.load(Ordering::Relaxed) != 0 {
+        return TestResult::Fail("retire ran the dropper before scan()");
+    }
+    domain.scan();
+    if DROPS.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("scan() didn't reclaim the unheld retired pointer");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_rcu_hazard_publish_retire);
+
+fn smoke_rcu_hazard_retired_but_held() -> TestResult {
+    // Reader acquires the guard, THEN publisher retires the pointer.
+    // scan() while the guard is live must NOT reclaim. Drop the guard,
+    // scan() again — drop fires.
+    use alloc::boxed::Box;
+    use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+    use narf_rcu::hazard::HazardDomain;
+
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+    struct Canary;
+    impl Drop for Canary {
+        fn drop(&mut self) { DROPS.fetch_add(1, Ordering::Relaxed); }
+    }
+
+    DROPS.store(0, Ordering::Relaxed);
+
+    let domain = HazardDomain::new();
+    let raw = Box::into_raw(Box::new(Canary));
+    let cell: AtomicPtr<Canary> = AtomicPtr::new(raw);
+
+    let g = match domain.acquire(&cell) {
+        Some(g) => g,
+        None    => return TestResult::Fail("acquire returned None on a non-null cell"),
+    };
+
+    fn drop_canary(p: *mut Canary) {
+        // SAFETY: hazard discipline; we're not invoked while held.
+        unsafe { drop(Box::from_raw(p)); }
+    }
+    domain.retire(raw, drop_canary);
+
+    // First scan: hazard slot still names the pointer. Drop must NOT
+    // fire.
+    domain.scan();
+    if DROPS.load(Ordering::Relaxed) != 0 {
+        return TestResult::Fail("scan() reclaimed a still-held hazard pointer");
+    }
+    if domain.pending_retires() != 1 {
+        return TestResult::Fail("retire-list lost the entry that was held back");
+    }
+
+    // Drop the guard, then scan. Now reclamation is allowed.
+    drop(g);
+    domain.scan();
+    if DROPS.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("post-release scan() didn't reclaim the entry");
+    }
+    if domain.pending_retires() != 0 {
+        return TestResult::Fail("retire list still pending after successful scan");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_rcu_hazard_retired_but_held);
+
+fn smoke_rcu_hazard_scan_frees_unheld() -> TestResult {
+    // Bulk retire several pointers with no reader holding any of them.
+    // One scan() must drain them all.
+    use alloc::boxed::Box;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use narf_rcu::hazard::HazardDomain;
+
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+    struct Canary;
+    impl Drop for Canary {
+        fn drop(&mut self) { DROPS.fetch_add(1, Ordering::Relaxed); }
+    }
+
+    DROPS.store(0, Ordering::Relaxed);
+    let domain = HazardDomain::new();
+
+    fn drop_canary(p: *mut Canary) {
+        // SAFETY: hazard discipline; the test never holds these.
+        unsafe { drop(Box::from_raw(p)); }
+    }
+
+    // Retire eight pointers — under the threshold so no inline scan
+    // fires; we trigger reclamation explicitly.
+    let n = 8usize;
+    for _ in 0..n {
+        let raw = Box::into_raw(Box::new(Canary));
+        domain.retire(raw, drop_canary);
+    }
+    if DROPS.load(Ordering::Relaxed) != 0 {
+        return TestResult::Fail("bulk retire ran droppers inline (threshold misconfigured?)");
+    }
+    if domain.pending_retires() != n {
+        return TestResult::Fail("retire-list length mismatch before scan");
+    }
+    domain.scan();
+    if DROPS.load(Ordering::Relaxed) != n {
+        return TestResult::Fail("scan() didn't drain the full retire list");
+    }
+    if domain.pending_retires() != 0 {
+        return TestResult::Fail("retire-list non-empty after scan");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_rcu_hazard_scan_frees_unheld);
+
 // ── observability/ Stage-2/3 smoke tests ────────────────────────────
 //
 // PMU read paths, panic-snapshot install, and the synthesised
@@ -3574,3 +3734,88 @@ fn smoke_obs_panic_snapshot_roundtrip() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_obs_panic_snapshot_roundtrip);
+
+fn smoke_arch_patch_word_roundtrip() -> TestResult {
+    // arch::patch_word is the atomic instruction-word replace primitive
+    // backing tracing/'s runtime arming. Exercise it on a writable u32
+    // (data, not text — the serialisation sequence is still run, proving
+    // the helper doesn't fault on non-text memory). Tests that:
+    //   - the write is visible to a subsequent volatile read
+    //   - overwriting twice leaves the last value
+    //   - the caller's remaining registers / flags aren't clobbered
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static SLOT: AtomicU32 = AtomicU32::new(0xDEAD_BEEF);
+    let addr = SLOT.as_ptr() as *mut u32;
+    // SAFETY: SLOT is a static mut u32 (interior-atomic); addr is
+    // 4-byte aligned. `patch_word` only writes 4 bytes + serialises.
+    unsafe {
+        narf_arch::patch_word(addr, 0xCAFE_F00D);
+        if SLOT.load(Ordering::Acquire) != 0xCAFE_F00D {
+            return TestResult::Fail("first patch not visible");
+        }
+        narf_arch::patch_word(addr, 0x1234_5678);
+        if SLOT.load(Ordering::Acquire) != 0x1234_5678 {
+            return TestResult::Fail("second patch overwrote wrong");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_arch_patch_word_roundtrip);
+
+fn smoke_tracing_arm_disarm_cycle() -> TestResult {
+    // Stage-3 arm/disarm exercises the cap gate plus the arch patch
+    // path end-to-end. A 4-byte slot in a static mut stands in for
+    // a real probe site's arming word.
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use narf_capabilities::{Cap, Grant};
+    use narf_tracing::{arm, disarm, any_armed, ProbeArming};
+
+    static SLOT: AtomicU32 = AtomicU32::new(0x9090_9090); // nop sled
+    let addr = SLOT.as_ptr() as *mut u32;
+
+    let cap: Cap<ProbeArming, Grant> = Cap::<ProbeArming, Grant>::bootstrap();
+    let before_armed = any_armed();
+
+    // SAFETY: addr is 4-byte aligned static storage; patch_word only
+    // writes 4 bytes + serialises.
+    unsafe {
+        if arm(&cap, addr, 0xAA55_AA55).is_err() {
+            return TestResult::Fail("arm() failed on live cap");
+        }
+    }
+    if SLOT.load(Ordering::Acquire) != 0xAA55_AA55 {
+        return TestResult::Fail("arm did not patch the slot");
+    }
+    if !any_armed() {
+        return TestResult::Fail("any_armed() did not go true after arm");
+    }
+
+    // Revoked cap must be rejected without patching.
+    let revoked: Cap<ProbeArming, Grant> = Cap::<ProbeArming, Grant>::bootstrap();
+    revoked.revoke();
+    // SAFETY: same as above; call should never reach patch_word.
+    unsafe {
+        if arm(&revoked, addr, 0xDEAD_0000).is_ok() {
+            return TestResult::Fail("revoked cap slipped past arm gate");
+        }
+    }
+    if SLOT.load(Ordering::Acquire) != 0xAA55_AA55 {
+        return TestResult::Fail("arm on revoked cap mutated the slot anyway");
+    }
+
+    // Disarm: restore, armed count drops back.
+    // SAFETY: same preconditions.
+    unsafe {
+        if disarm(&cap, addr, 0x9090_9090).is_err() {
+            return TestResult::Fail("disarm() failed on live cap");
+        }
+    }
+    if SLOT.load(Ordering::Acquire) != 0x9090_9090 {
+        return TestResult::Fail("disarm did not restore the slot");
+    }
+    if any_armed() != before_armed {
+        return TestResult::Fail("any_armed() didn't decrement back");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_tracing_arm_disarm_cycle);

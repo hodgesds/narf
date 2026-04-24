@@ -117,6 +117,22 @@ pub unsafe fn cas128(ptr: *mut u128, old: u128, new: u128) -> Result<u128, u128>
     unsafe { current::cas128(ptr, old, new) }
 }
 
+/// Atomically replace a 4-byte instruction word. Used by `tracing/` for
+/// runtime probe arming. Per-arch `asm.rs` implements the required
+/// self-modifying-code synchronisation.
+///
+/// # Safety
+/// `addr` must be 4-byte aligned and refer to memory that is both
+/// writable and executable (typically a kernel-writable alias of the
+/// probe site). On SMP NARF the caller must also arrange for every
+/// other CPU to serialise before it next fetches the patched word —
+/// Stage 3 is single-CPU, so the local flush is enough.
+#[inline(always)]
+pub unsafe fn patch_word(addr: *mut u32, new: u32) {
+    // SAFETY: delegated to the per-arch helper; contract above.
+    unsafe { current::patch_word(addr, new); }
+}
+
 /// ID of the CPU currently executing this code. Stage-2 single-CPU
 /// returns `0`; Stage-3 AP bring-up replaces the body with a real
 /// read (TPIDR_EL1 on aarch64, MSR GS-based on x86_64).

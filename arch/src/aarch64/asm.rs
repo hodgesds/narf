@@ -124,3 +124,34 @@ pub unsafe fn cas128(ptr: *mut u128, old: u128, new: u128) -> Result<u128, u128>
         Err(res)
     }
 }
+
+/// Atomically replace a 4-byte instruction word at `addr` with `new`.
+///
+/// # Safety
+/// Same contract as the x86_64 sibling. aarch64 instructions are
+/// always 4 bytes + 4-byte aligned, so a single `str w, [x]` is the
+/// whole instruction; the synchronisation dance below is what guarantees
+/// the I-cache sees it before the next fetch (ARMv8 §B2.3).
+#[inline(always)]
+pub unsafe fn patch_word(addr: *mut u32, new: u32) {
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: aligned 4-byte store is atomic. Serialisation below.
+    unsafe { core::ptr::write_volatile(addr, new); }
+    // Self-modifying-code flush per ARMv8 B2.3:
+    //   DSB ISH        — drain the pending data write to the PoU
+    //   IC IVAU, <addr> — invalidate the I-cache line holding the patch
+    //   DSB ISH        — ensure the invalidate completes before ISB
+    //   ISB            — flush the pipeline so the next fetch sees the
+    //                     new word
+    unsafe {
+        asm!(
+            "dsb ish",
+            "ic ivau, {a}",
+            "dsb ish",
+            "isb",
+            a = in(reg) addr,
+            options(nostack, preserves_flags),
+        );
+    }
+    compiler_fence(Ordering::SeqCst);
+}

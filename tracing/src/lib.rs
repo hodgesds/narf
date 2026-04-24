@@ -372,22 +372,65 @@ impl<T: Event, const N: usize> FlightRing<T, N> {
     }
 }
 
-// ── Armed / disarmed helpers (scaffolding) ──────────────────────────
+// ── Armed / disarmed (Stage 3) ──────────────────────────────────────
 //
-// Stage-2 scope is unarmed probe-site emission. Arming plumbing lives
-// in Stage-3 main-track work (needs `arch/` patch + `capabilities/`).
-// We still expose a single global armed flag so a Stage-3 consumer
-// can cheaply gate handler execution while the crate is otherwise
-// quiescent — today, always false.
+// Arming flips a 4-byte patch slot adjacent to a probe's NOP sled
+// using `arch::patch_word`, which takes care of the self-modifying-
+// code synchronisation. The Stage-3 slot is a 32-bit marker that
+// consumers load to decide whether the probe is enabled; a real
+// Stage-4 handler-dispatch path would replace the slot with a branch
+// to a trampoline. Cap-gated on `Cap<Probe, Grant>`.
+
+use narf_capabilities::{Cap, CapError, CapKind, CapType, Grant};
 
 static GLOBAL_ARMED: AtomicUsize = AtomicUsize::new(0);
 
-/// Are any probes currently armed? Stage-2: always returns `false`
-/// because no arming surface exists yet. Stage-3 arming bumps this.
+/// Are any probes currently armed?
+#[inline]
 pub fn any_armed() -> bool { GLOBAL_ARMED.load(Ordering::Relaxed) != 0 }
 
-/// Arm / disarm scaffolding — exposed for tests only. Stage-3 replaces
-/// this with a capability-gated patch path against `arch/`.
+/// Cap-type marker for probe arming authority.
+#[derive(Debug)]
+pub struct ProbeArming;
+impl CapType for ProbeArming { const KIND: CapKind = CapKind::Probe; }
+
+/// Arm the 4-byte patch slot at `target` with `word`, bumping the
+/// global armed count. The slot must be 4-byte aligned and live in
+/// writable+executable memory — see `arch::patch_word` for the full
+/// safety contract.
+///
+/// # Safety
+/// Caller must uphold `arch::patch_word`'s preconditions on `target`.
+pub unsafe fn arm(
+    cap: &Cap<ProbeArming, Grant>,
+    target: *mut u32,
+    word: u32,
+) -> Result<(), CapError> {
+    cap.check_live()?;
+    // SAFETY: delegated to arch::patch_word per the caller's contract.
+    unsafe { narf_arch::patch_word(target, word); }
+    GLOBAL_ARMED.fetch_add(1, Ordering::Release);
+    Ok(())
+}
+
+/// Disarm: patch `target` back to the caller-supplied `original` word
+/// and decrement the global armed count.
+///
+/// # Safety
+/// Same as `arm`.
+pub unsafe fn disarm(
+    cap: &Cap<ProbeArming, Grant>,
+    target: *mut u32,
+    original: u32,
+) -> Result<(), CapError> {
+    cap.check_live()?;
+    // SAFETY: delegated to arch::patch_word.
+    unsafe { narf_arch::patch_word(target, original); }
+    GLOBAL_ARMED.fetch_sub(1, Ordering::Release);
+    Ok(())
+}
+
+/// Test-only bump / clear kept for back-compat with Stage-2 users.
 #[doc(hidden)]
 pub fn __test_bump_armed()   { GLOBAL_ARMED.fetch_add(1, Ordering::Relaxed); }
 #[doc(hidden)]
