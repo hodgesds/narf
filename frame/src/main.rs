@@ -143,6 +143,27 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         let _ = writeln!(console::Writer,
             "  features: mte={} pauth={} bti={} gicv3_sr={} cntfrq={}Hz",
             feats.mte, feats.pauth, feats.bti, feats.gicv3_sysreg, hz);
+
+        // Install EL1 vector table so exceptions route through Rust
+        // handlers instead of whatever default state the bootloader
+        // left.
+        // SAFETY: first call, BSP, IRQs masked (DAIF left as boot
+        // defaults; we'll explicitly unmask later).
+        unsafe { aarch64::init_traps(); }
+        let _ = writeln!(console::Writer,
+            "  vbar_el1: loaded — 16 EL1 vectors routed");
+
+        // GICv3 bring-up (only if the sysreg interface is there).
+        if feats.gicv3_sysreg {
+            // SAFETY: CPUID confirmed GICv3; still at EL1 with IRQs
+            // masked.
+            unsafe { narf_interrupts::aarch64::init_bsp(); }
+            let _ = writeln!(console::Writer,
+                "  gic: v3 enabled, timer PPI {} unmasked", narf_interrupts::aarch64::TIMER_PPI);
+        } else {
+            let _ = writeln!(console::Writer,
+                "  gic: v3 sysreg interface unavailable — IRQs stay masked");
+        }
     }
 
     // Boot-time domain enumeration — STAGE1.md exit-gate #5. Confirm the
@@ -252,6 +273,22 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     }
                 }
             }
+            #[cfg(target_arch = "aarch64")]
+            {
+                let _ = writeln!(console::Writer, "  mmu: handoff...");
+                // SAFETY: BSP, interrupts disabled, allocator populated.
+                match unsafe { narf_memory::mmu::init_mmu() } {
+                    Ok(ttbr0) => {
+                        narf_console::remap_to_virtual(info.uart_virt);
+                        let _ = writeln!(console::Writer,
+                            "  mmu: installed, TTBR0 @ {:?}, console remapped", ttbr0);
+                    }
+                    Err(e) => {
+                        let _ = writeln!(console::Writer,
+                            "  mmu: init failed: {e:?}");
+                    }
+                }
+            }
         }
         Err(e) => {
             let _ = writeln!(console::Writer, "  boot parse failed: {e:?}");
@@ -282,6 +319,23 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
 
 #[cfg(not(any(feature = "kernel-test", feature = "idt-selftest")))]
 fn run_async_demo() -> ! {
+    // aarch64 timer start. GICv3 + vector table already installed
+    // earlier; this starts the generic-timer PPI and unmasks IRQs
+    // in DAIF.
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: GIC is up (or the feature check in _start_rust
+        // skipped init_bsp, in which case timer IRQs fire but are
+        // never delivered — still safe, just silent).
+        unsafe {
+            narf_interrupts::aarch64::start_timer(
+                aarch64::trap::TIMER_TVAL_DEFAULT);
+            narf_arch::enable_interrupts();
+        }
+        let _ = writeln!(console::Writer,
+            "  gic: generic timer started, IRQs unmasked");
+    }
+
     // Stage 2 Barrier: LAPIC timer IRQs are now live. `init_bsp`
     // masks both legacy 8259 PICs so their BIOS-default vectors
     // can't land on ours. Start a periodic timer and enable CPU
@@ -335,6 +389,12 @@ fn run_async_demo() -> ! {
     #[cfg(target_arch = "x86_64")]
     {
         let ticks = narf_interrupts::x86_64::apic::timer_ticks();
+        let _ = writeln!(console::Writer,
+            "  timer IRQs delivered: {} ticks", ticks);
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let ticks = narf_interrupts::aarch64::timer_ticks();
         let _ = writeln!(console::Writer,
             "  timer IRQs delivered: {} ticks", ticks);
     }

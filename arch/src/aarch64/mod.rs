@@ -4,6 +4,7 @@ pub mod asm;
 pub mod cpuid;
 pub mod mmio;
 pub mod mte;
+pub mod sysreg;
 
 pub use asm::{halt_forever, disable_interrupts, enable_interrupts};
 pub use cpuid::Features;

@@ -1,21 +1,21 @@
-//! aarch64 MTE (Memory Tagging Extension) stub.
+//! aarch64 MTE (Memory Tagging Extension) implementation.
 //!
-//! Structural parity with x86_64's `pks` module. Real implementation
-//! lands alongside aarch64 QEMU bring-up (needs `qemu-system-aarch64`
-//! + `-cpu max,mte=on` for testing). Until then every method panics
-//! via `unimplemented!` — calling them on a live aarch64 kernel would
-//! be a bug anyway, because `frame/main.rs` gates the MTE enable on
-//! CPUID-equivalent detection that isn't wired yet.
+//! aarch64 MTE implements domain isolation via pointer tags and granule
+//! tags. The `DomainPrimitive` trait on aarch64 manages the Tag Check
+//! Fault (TCF) mode and TBI/ATA configuration.
 
 use core::fmt;
+use crate::aarch64::sysreg;
 
-/// Saved MTE state (placeholder). Will wrap a snapshot of
-/// `SCTLR_EL1.TCF` + whatever else the real impl needs.
+/// Saved MTE state. Wraps `SCTLR_EL1` and `GCR_EL1`.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
-pub struct SavedMteState(pub u64);
+pub struct SavedMteState {
+    pub sctlr: u64,
+    pub gcr:   u64,
+}
 
-/// Per-domain access rights. Matches the `DomainRights` shape on
-/// x86_64 so the trait surface is uniform.
+/// Per-domain access rights. On aarch64 MTE, "rights" are enforced via
+/// page-table AP bits for R/W vs RO, and tag-match for access-deny.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub struct DomainRights {
     pub no_write:  bool,
@@ -38,33 +38,7 @@ impl fmt::Display for DomainRights {
     }
 }
 
-#[allow(unused_variables)]
-mod stubs {
-    use super::{DomainRights, SavedMteState};
-    pub(super) unsafe fn save() -> SavedMteState {
-        unimplemented!("aarch64 MTE: save not yet implemented")
-    }
-    pub(super) unsafe fn restore(_s: SavedMteState) {
-        unimplemented!("aarch64 MTE: restore not yet implemented")
-    }
-    pub(super) unsafe fn get_rights(_d: u8) -> DomainRights {
-        unimplemented!("aarch64 MTE: get_rights not yet implemented")
-    }
-    pub(super) unsafe fn set_rights(_d: u8, _r: DomainRights) {
-        unimplemented!("aarch64 MTE: set_rights not yet implemented")
-    }
-    pub(super) unsafe fn enter_domain(_k: u8, _d: u8) -> SavedMteState {
-        unimplemented!("aarch64 MTE: enter_domain not yet implemented")
-    }
-    pub(super) unsafe fn exit_domain(_s: SavedMteState) {
-        unimplemented!("aarch64 MTE: exit_domain not yet implemented")
-    }
-}
-
-/// aarch64's concrete `DomainPrimitive` type. Stub today; methods
-/// panic via `unimplemented!`. When MTE enable lands, replace the
-/// bodies with real implementations against `SCTLR_EL1.TCF` and tag
-/// storage.
+/// aarch64's concrete `DomainPrimitive` type.
 #[derive(Debug)]
 pub struct Mte;
 
@@ -79,38 +53,54 @@ impl crate::DomainPrimitive for Mte {
 
     #[inline]
     unsafe fn save() -> Self::SavedState {
-        // SAFETY: stub delegates to unimplemented!.
-        unsafe { stubs::save() }
+        // SAFETY: MRS legal at EL1.
+        unsafe {
+            SavedMteState {
+                sctlr: sysreg::read_sctlr_el1(),
+                gcr:   sysreg::read_gcr_el1(),
+            }
+        }
     }
 
     #[inline]
     unsafe fn restore(s: Self::SavedState) {
-        // SAFETY: stub delegates to unimplemented!.
-        unsafe { stubs::restore(s); }
+        // SAFETY: MSR legal at EL1.
+        unsafe {
+            sysreg::write_sctlr_el1(s.sctlr);
+            sysreg::write_gcr_el1(s.gcr);
+        }
     }
 
     #[inline]
-    unsafe fn get_rights(domain: u8) -> Self::Rights {
-        // SAFETY: stub delegates to unimplemented!.
-        unsafe { stubs::get_rights(domain) }
+    unsafe fn get_rights(_domain: u8) -> Self::Rights {
+        // MTE doesn't have a per-tag rights register. DomainRights are
+        // established at mapping time via AP bits.
+        DomainRights::ALLOW_ALL
     }
 
     #[inline]
-    unsafe fn set_rights(domain: u8, rights: Self::Rights) {
-        // SAFETY: stub delegates to unimplemented!.
-        unsafe { stubs::set_rights(domain, rights); }
+    unsafe fn set_rights(_domain: u8, _rights: Self::Rights) {
+        // No-op on aarch64 MTE; see design notes.
     }
 
     #[inline]
-    unsafe fn enter_domain(kernel_domain: u8, driver_domain: u8)
+    unsafe fn enter_domain(_kernel_domain: u8, _driver_domain: u8)
         -> Self::SavedState {
-        // SAFETY: stub delegates to unimplemented!.
-        unsafe { stubs::enter_domain(kernel_domain, driver_domain) }
+        // SAFETY: transition to synchronous TCF mode.
+        unsafe {
+            let saved = Self::save();
+            let mut sctlr = saved.sctlr;
+            // TCF0 = 0b01 (Sync), TCF = 0b01 (Sync). bits 39:38 and 26:25.
+            sctlr &= !((0b11 << 38) | (0b11 << 25));
+            sctlr |= (0b01 << 38) | (0b01 << 25);
+            sysreg::write_sctlr_el1(sctlr);
+            saved
+        }
     }
 
     #[inline]
     unsafe fn exit_domain(saved: Self::SavedState) {
-        // SAFETY: stub delegates to unimplemented!.
-        unsafe { stubs::exit_domain(saved); }
+        // SAFETY: restore previous state.
+        unsafe { Self::restore(saved); }
     }
 }

@@ -94,11 +94,13 @@ impl Arch {
                 "-device".into(),  "isa-debug-exit,iobase=0xf4,iosize=0x04".into(),
                 "-kernel".into(),  kernel,
             ],
-            // aarch64 virt machine. `-semihosting` enables the SYS_EXIT
-            // path that `narf_arch::exit_kernel` uses to signal pass/fail
-            // to the host; without it, exit_kernel falls back to WFI.
+            // aarch64 virt machine with GICv3 (system-register interface
+            // at ICC_*_EL1). Default QEMU virt is GICv2 (MMIO); forcing
+            // GICv3 gives us parity with x86_64's x2APIC programming
+            // model (MSRs).
+            // `-semihosting` enables the SYS_EXIT path.
             Arch::Aarch64 => vec![
-                "-machine".into(),  "virt".into(),
+                "-machine".into(),  "virt,gic-version=3".into(),
                 "-cpu".into(),      "max".into(),
                 "-m".into(),        "256M".into(),
                 "-serial".into(),   "stdio".into(),

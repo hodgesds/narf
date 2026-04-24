@@ -43,14 +43,12 @@ pub fn halt_forever() -> ! {
 
 /// Wait for an interrupt.
 ///
-/// Falls back to `spin_loop` on aarch64 today because the GICv3 +
-/// generic-timer IRQ sources aren't wired yet — WFI without an IRQ
-/// source wedges indefinitely. Once the aarch64 IRQ stack lands
-/// (Stage 2 aarch64 polish), this becomes a real WFI.
+/// WFI wakes on any IRQ (including masked ones if `WFIT` semantics
+/// apply), and the generic-timer PPI via GICv3 is now a live source
+/// after `narf_interrupts::aarch64::init_bsp` + `start_timer` at boot.
 #[inline(always)]
 pub fn halt_until_irq() {
-    // TODO(aarch64): replace with `wfi_once()` once generic-timer
-    // IRQs via GICv3 are live. Today no IRQ source fires, so WFI
-    // would hang.
-    core::hint::spin_loop();
+    // SAFETY: WFI at EL1 is always safe; it stalls the CPU until a
+    // wake condition (IRQ / FIQ / SError / WFI-wake event).
+    unsafe { wfi_once(); }
 }

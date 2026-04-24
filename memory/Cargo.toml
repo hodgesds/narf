@@ -12,7 +12,8 @@ name = "narf_memory"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib  = { path = "../lib" }
+narf-lib   = { path = "../lib" }
+narf-arch  = { path = "../arch" }
 
 [lints]
 workspace = true

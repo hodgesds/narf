@@ -15,9 +15,14 @@ pub mod frame;
 pub mod heap;
 
 #[cfg(target_arch = "x86_64")]
-pub mod mmu;
+pub mod x86_64;
 #[cfg(target_arch = "x86_64")]
-pub mod paging;
+pub use x86_64::{mmu, paging};
+
+#[cfg(target_arch = "aarch64")]
+pub mod aarch64;
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::{mmu, paging};
 
 pub use addr::{PhysAddr, VirtAddr};
 pub use frame::{
