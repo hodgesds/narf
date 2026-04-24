@@ -14,6 +14,12 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(missing_debug_implementations)]
 
+pub mod wall;
+pub use wall::{
+    begin_leap_smear, monotonic_ns, now_wall, set_cycles_per_ns,
+    set_wall_offset, WallClock, WallError, WallInstant,
+};
+
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};

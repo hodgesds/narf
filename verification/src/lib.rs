@@ -4713,6 +4713,48 @@ fn smoke_block_deadline_promotes_expired() -> TestResult {
 }
 kernel_test!(smoke_block_deadline_promotes_expired);
 
+fn smoke_time_wall_offset_and_leap_smear() -> TestResult {
+    use narf_capabilities::{Cap, Write};
+    use narf_time::{
+        begin_leap_smear, now_wall, set_wall_offset, wall, WallClock, WallError,
+    };
+
+    wall::__test_reset();
+
+    let cap: Cap<WallClock, Write> = Cap::bootstrap();
+
+    // Setting an offset of 1_000_000_000 ns (1s) must show up in now_wall().
+    if set_wall_offset(&cap, 1_000_000_000).is_err() {
+        return TestResult::Fail("set_wall_offset failed on a live cap");
+    }
+    let t0 = now_wall();
+    if t0.secs < 1 {
+        return TestResult::Fail("wall offset did not take effect");
+    }
+
+    // Zero-window leap smear must be rejected structurally.
+    match begin_leap_smear(&cap, 1_000, 0) {
+        Err(WallError::InvalidSmearWindow) => {}
+        _ => return TestResult::Fail("zero-window leap smear accepted"),
+    }
+
+    // A normal smear (500 ns window, 10 ns delta) must succeed.
+    if begin_leap_smear(&cap, 10, 500).is_err() {
+        return TestResult::Fail("legitimate leap smear rejected");
+    }
+
+    // Revocation blocks further writes.
+    cap.revoke();
+    match set_wall_offset(&cap, 0) {
+        Err(WallError::AuthorityRevoked) => {}
+        _ => return TestResult::Fail("revoked wall-clock cap accepted"),
+    }
+
+    wall::__test_reset();
+    TestResult::Pass
+}
+kernel_test!(smoke_time_wall_offset_and_leap_smear);
+
 fn smoke_power_thermal_zone_transitions() -> TestResult {
     use core::sync::atomic::{AtomicU8, Ordering};
     use narf_capabilities::{Cap, Grant};
