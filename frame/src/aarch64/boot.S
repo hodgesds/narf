@@ -9,6 +9,23 @@ _start:
     /* Save the incoming DTB pointer. */
     mov x19, x0
 
+    /* Enable FP/SIMD access at EL1 (CPACR_EL1.FPEN = 0b11, bits 21:20).
+     *
+     * Without this, any SIMD or floating-point instruction the Rust
+     * compiler emits (memcpy-style register moves, struct copies at
+     * hardfloat targets) raises a synchronous exception with
+     * ESR_EL1.EC = 0x07 (Trapped FP/SIMD access). Target is
+     * `aarch64-unknown-none` (hardfloat), which emits SIMD freely.
+     *
+     * Kernel-mode SIMD use still requires lazy FPU-state save/restore
+     * at the trap prologue once Stage 3 adds context switches; Stage 2
+     * single-task just needs the access to not trap.
+     */
+    mrs  x0, cpacr_el1
+    orr  x0, x0, #(3 << 20)
+    msr  cpacr_el1, x0
+    isb
+
     /* Stack in .boot.data. Physical base. */
     adrp x0, stack_top
     add  x0, x0, #:lo12:stack_top

@@ -67,7 +67,14 @@ impl Arch {
     fn triple(self) -> &'static str {
         match self {
             Arch::X86_64  => "x86_64-unknown-none",
-            Arch::Aarch64 => "aarch64-unknown-none-softfloat",
+            // `aarch64-unknown-none-softfloat` trips a future-incompat
+            // warning in stdlib's NEON intrinsics (issue #134375 —
+            // `target_feature(enable = "neon")` on softfloat is
+            // unsound). `aarch64-unknown-none` is the plain variant
+            // that kernel ports conventionally target; we keep
+            // floating-point disabled by runtime convention
+            // (CPACR_EL1.FPEN left at its reset state).
+            Arch::Aarch64 => "aarch64-unknown-none",
         }
     }
 

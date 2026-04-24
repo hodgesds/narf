@@ -3,7 +3,10 @@
 #
 # Target triples (per build/ §5):
 #   x86_64-unknown-none                 — kernel-high-half, Limine boot
-#   aarch64-unknown-none-softfloat      — no SIMD in kernel
+#   aarch64-unknown-none                 — plain bare-metal aarch64;
+#     (avoids the NEON-on-softfloat future-incompat warning from
+#     stdlib's arm_shared intrinsics; CPACR_EL1.FPEN controls actual
+#     FP/SIMD at runtime).
 #
 # build-std rebuilds core/compiler_builtins from the pinned rust-src
 # for every target. We never rely on pre-built cross std.
@@ -13,7 +16,7 @@
 # hit a duplicate-lang-item error. xtask passes
 #   -Z build-std=core,compiler_builtins
 #   -Z build-std-features=compiler-builtins-mem
-# when it invokes cargo for x86_64-unknown-none / aarch64-unknown-none-softfloat.
+# when it invokes cargo for x86_64-unknown-none / aarch64-unknown-none.
 
 # Path remapping for reproducible builds (build/ §4).
 # SOURCE_DATE_EPOCH covers timestamps; this covers absolute paths in debug info.
@@ -40,7 +43,7 @@ rustflags = [
 
 # ─── aarch64 kernel target ─────────────────────────────────────────
 # MTE and pointer-auth flags are Stage 2+ and gated similarly.
-[target.aarch64-unknown-none-softfloat]
+[target.aarch64-unknown-none]
 rustflags = [
     "-C", "relocation-model=static",
     "-C", "code-model=large",
@@ -54,4 +57,4 @@ rustflags = [
 [alias]
 xtask    = "run --package xtask --quiet --"
 narf-x86 = "build --target x86_64-unknown-none"
-narf-a64 = "build --target aarch64-unknown-none-softfloat"
+narf-a64 = "build --target aarch64-unknown-none"
