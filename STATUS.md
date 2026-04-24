@@ -103,8 +103,15 @@ $ cargo xtask test --arch=x86_64
   configured cadence; `on_timer_tick` increments a counter visible
   via `narf_interrupts::x86_64::apic::timer_ticks()`. Default
   boot runs with IRQs unmasked for the duration of the async demo;
-  typical observed tick counts: 9 after ~500 Mcycles of demo.
+  typical observed tick counts: 15 during a 5-tick demo.
   Regression-guarded by `smoke_timer_irq_fires` kernel test.
+- **IRQ-driven scheduler**: `scheduler::run_until_empty` polls every
+  ready task once per round; if no task became `Ready` in the round,
+  it calls `arch::halt_until_irq` (HLT on x86_64 when IF=1, WFI on
+  aarch64, `spin_loop` fallback when IRQs are masked). The LAPIC
+  timer IRQ wakes the CPU, a new round runs, progress repeats. On
+  the 5-tick demo: 15 timer IRQs delivered vs. the previous busy-
+  poll's ~0 IRQs while spinning `Instant::now`.
 - **MSR / CR helpers** (`arch/x86_64/msr.rs`, `.../cr.rs`): `rdmsr`,
   `wrmsr`, `read_cr4`, `write_cr4`, with the compiler_fence(SeqCst)
   pair per `arch/` §4.
@@ -139,9 +146,11 @@ $ cargo xtask test --arch=x86_64
   CPUID says NX is present; just not wired yet.
 - **UIPI** (Sapphire Rapids+). Infrastructure now ready (LAPIC live,
   IRQ path proven); UIPI is additive on top.
-- **Scheduler on timer IRQ**: the Stage-1 busy-poll executor still
-  runs as before. Wiring `sleep_until` to wake from a timer-IRQ
-  waker (instead of repolling the clock) is a cleaner model.
+- **Proper waker plumbing**: today's scheduler halts between rounds
+  but still re-polls every task on every wake (no-op waker). A real
+  `Waker` implementation would register per-task "I'm waiting on
+  this deadline / this ring" and only re-poll the specific task that
+  got woken. Nice optimisation but not critical for Stage 2.
 - **aarch64 MTE mirror**: SCTLR_EL1.TCF, tag storage, symmetric
   DomainPrimitive. Currently only `BACKEND = Mte` constant exists.
 - **GICv3 skeleton** on aarch64 to match x2APIC on x86_64.
@@ -221,6 +230,7 @@ cargo test -p narf-lib
 | PKS live      | `smoke_pks_enforces_deny_all` — end-to-end #PF/PK demo      |
 | APIC partial  | `narf-interrupts` + IRQ IDT entries; soft INT 32 works      |
 | APIC full     | 8259 PICs masked; hardware LAPIC timer IRQs live + tested   |
+| IRQ sched     | run_until_empty halts between no-progress rounds            |
 
 ## Pickup hint for the next session
 

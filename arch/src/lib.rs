@@ -32,6 +32,12 @@ pub const BACKEND: DomainBackend = DomainBackend::Mte;
 #[inline(always)]
 pub fn halt_forever() -> ! { current::halt_forever() }
 
+/// Halt until the next interrupt. On x86_64 falls back to `spin_loop`
+/// when IRQs are masked (HLT would otherwise deadlock). On aarch64 uses
+/// WFI, which wakes on IRQ regardless of mask state.
+#[inline(always)]
+pub fn halt_until_irq() { current::asm::halt_until_irq() }
+
 /// End the kernel run with an exit code. Under QEMU this triggers a clean
 /// VM exit; on real hardware / other VMMs it falls back to `halt_forever`.
 /// `code == 0` is "normal success"; non-zero is "failure" — verification

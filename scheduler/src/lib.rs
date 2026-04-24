@@ -85,45 +85,61 @@ fn noop_waker() -> Waker {
     unsafe { Waker::from_raw(RawWaker::new(ptr::null(), &NOOP_VTABLE)) }
 }
 
-/// Run the ready queue until it's empty. Useful for "end of boot, spawn
-/// a task tree, drive it to completion."
+/// Run the ready queue until it's empty.
 ///
-/// Scheduling is pop-front, poll, push-back-if-Pending: O(1) allocations
-/// per iteration once the VecDeque has grown to its working size. Under
-/// the Stage-1 busy-poll model (time::SleepUntil repolls every round
-/// until its deadline passes), this matters — we can poll a task
-/// hundreds of thousands of times per tick, and any per-iteration
-/// allocation would exhaust the bump heap in milliseconds.
+/// Strategy: round through every task in the queue, polling each once.
+/// After a full round where **no** task went `Ready`, halt the CPU via
+/// `arch::halt_until_irq` — an external interrupt (timer or otherwise)
+/// will wake us, and the next round of polling either makes progress
+/// (some task's deadline met, waker fired) or we halt again.
+///
+/// This replaces the Stage-1 busy-poll that spin-checked `Instant::now`
+/// every iteration. Saves massive CPU when all tasks are sleeping.
+/// Correctness-preserving because our Futures are self-propelling
+/// (they check the clock on poll, so spurious wake-ups are harmless).
 pub fn run_until_empty() {
     let waker = noop_waker();
     let mut ctx = Context::from_waker(&waker);
     loop {
-        // Pop one task; release the lock before polling so spawn() from
-        // inside a Future can land without deadlocking.
-        let mut slot = {
-            let mut q = READY.lock();
-            let qref = q.as_mut().expect("scheduler::run_until_empty before init");
-            match qref.pop_front() {
-                Some(t) => t,
-                None    => return,
-            }
+        // Snapshot queue length. We'll poll each task at most once per
+        // round; spawns during the round land at the back and get
+        // polled on the NEXT round.
+        let round_len = {
+            let q = READY.lock();
+            q.as_ref().expect("scheduler::run_until_empty before init").len()
         };
+        if round_len == 0 { return; }
 
-        slot.awake.store(false, Ordering::Relaxed);
-        let poll_result = slot.task.as_mut().poll(&mut ctx);
+        let mut ready_this_round: usize = 0;
 
-        match poll_result {
-            Poll::Ready(()) => {
-                // drop slot, its box gets reclaimed — well, "leaked" under
-                // the bump allocator; Stage 2's slab reclaims.
-            }
-            Poll::Pending => {
-                // Requeue at the back. The VecDeque's buffer typically
-                // doesn't realloc because pop_front+push_back on the
-                // same underlying ring stays within capacity.
+        for _ in 0..round_len {
+            // Pop; if empty, break (can happen if a task was cancelled).
+            let mut slot = {
                 let mut q = READY.lock();
-                q.as_mut().unwrap().push_back(slot);
+                match q.as_mut().unwrap().pop_front() {
+                    Some(t) => t,
+                    None    => break,
+                }
+            };
+
+            slot.awake.store(false, Ordering::Relaxed);
+            let poll_result = slot.task.as_mut().poll(&mut ctx);
+
+            match poll_result {
+                Poll::Ready(()) => { ready_this_round += 1; /* drop slot */ }
+                Poll::Pending   => {
+                    let mut q = READY.lock();
+                    q.as_mut().unwrap().push_back(slot);
+                }
             }
+        }
+
+        // If we made no progress this round, halt until an IRQ wakes
+        // us. With the LAPIC timer live (narf-interrupts), this saves
+        // the CPU from spin-polling `Instant::now` tens of thousands
+        // of times between tick deadlines.
+        if ready_this_round == 0 {
+            narf_arch::halt_until_irq();
         }
     }
 }

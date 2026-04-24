@@ -34,6 +34,41 @@ pub unsafe fn halt_once() {
     compiler_fence(Ordering::SeqCst);
 }
 
+/// Read RFLAGS.
+#[inline(always)]
+pub fn read_rflags() -> u64 {
+    let v: u64;
+    // SAFETY: PUSHFQ/POP is always legal; reads current flags register.
+    unsafe {
+        asm!(
+            "pushfq",
+            "pop {v}",
+            v = out(reg) v,
+            options(preserves_flags),
+        );
+    }
+    v
+}
+
+/// True iff IRQs are currently enabled (RFLAGS.IF == 1).
+#[inline(always)]
+pub fn interrupts_enabled() -> bool {
+    read_rflags() & (1 << 9) != 0
+}
+
+/// Halt the CPU until the next interrupt, but only if IRQs are enabled
+/// (otherwise HLT would deadlock because nothing can wake us). When
+/// IRQs are masked, falls back to a `spin_loop` hint.
+#[inline(always)]
+pub fn halt_until_irq() {
+    if interrupts_enabled() {
+        // SAFETY: HLT at CPL=0 with IF=1 wakes on the next IRQ.
+        unsafe { halt_once(); }
+    } else {
+        core::hint::spin_loop();
+    }
+}
+
 /// Disable interrupts, then spin on `HLT` forever. Used for panic and Stage-1
 /// end-of-boot before the async executor exists.
 #[inline(always)]

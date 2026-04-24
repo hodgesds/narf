@@ -40,3 +40,12 @@ pub fn halt_forever() -> ! {
         loop { wfi_once(); }
     }
 }
+
+/// Wait for an interrupt (WFI). On aarch64 WFI wakes on an IRQ even
+/// if DAIF.I is masked (though the IRQ won't actually be taken until
+/// unmasked). Matches x86_64's `halt_until_irq` surface.
+#[inline(always)]
+pub fn halt_until_irq() {
+    // SAFETY: WFI is always safe.
+    unsafe { wfi_once(); }
+}
