@@ -39,7 +39,10 @@ extern crate alloc;
 
 pub mod dispatch;
 pub mod fntime;
+pub mod hwtrace;
 pub mod sketch;
+
+pub use hwtrace::{HwTraceConfig, HwTraceError, HwTraceMarker, HwTraceStatus};
 
 pub use dispatch::{
     fire, reserve_probe_id, table as handler_table,

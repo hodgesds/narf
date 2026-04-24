@@ -4713,6 +4713,39 @@ fn smoke_block_deadline_promotes_expired() -> TestResult {
 }
 kernel_test!(smoke_block_deadline_promotes_expired);
 
+fn smoke_tracing_hwtrace_surface() -> TestResult {
+    use narf_capabilities::{Cap, Invoke};
+    use narf_tracing::{hwtrace, HwTraceConfig, HwTraceError, HwTraceMarker, HwTraceStatus};
+
+    let cap: Cap<HwTraceMarker, Invoke> = Cap::bootstrap();
+    let cfg = HwTraceConfig::default();
+
+    // Default config passes validation but arch backend is absent.
+    match hwtrace::start(&cap, &cfg) {
+        Err(HwTraceError::NotImplemented) => {}
+        _ => return TestResult::Fail("start should surface NotImplemented"),
+    }
+    // Invalid buffer — size non-zero but phys is 0 — must fail before
+    // the arch-backend stub fires.
+    let bad = HwTraceConfig { buffer_phys: 0, buffer_size: 4096, ..Default::default() };
+    if hwtrace::start(&cap, &bad) != Err(HwTraceError::InvalidBuffer) {
+        return TestResult::Fail("invalid buffer pair not rejected");
+    }
+    // Status on an idle surface returns Idle (arch backend stubs in
+    // a read-only probe).
+    if hwtrace::status(&cap) != Ok(HwTraceStatus::Idle) {
+        return TestResult::Fail("status did not return Idle on idle stub");
+    }
+
+    cap.revoke();
+    match hwtrace::start(&cap, &cfg) {
+        Err(HwTraceError::AuthorityRevoked) => {}
+        _ => return TestResult::Fail("revoked HwTrace cap accepted"),
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_tracing_hwtrace_surface);
+
 fn smoke_bus_acpi_notify_dispatch() -> TestResult {
     use core::sync::atomic::{AtomicU32, Ordering};
     use narf_bus::acpi_notify::{
