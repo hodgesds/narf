@@ -6,6 +6,7 @@ pub mod cr;
 pub mod io_port;
 pub mod msr;
 pub mod pks;
+pub mod probe;
 
 pub use asm::{halt_forever, disable_interrupts, enable_interrupts};
 pub use cpuid::Features;

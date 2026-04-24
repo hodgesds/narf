@@ -246,6 +246,66 @@ fn smoke_scheduler_drives_future() -> TestResult {
 kernel_test!(smoke_scheduler_drives_future);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_probe_catches_page_fault() -> TestResult {
+    // Arm the recoverable-fault probe, write to an unmapped virtual
+    // address (above our 4 GiB identity map), and verify the handler
+    // caught the #PF (vector 14) instead of panic-exiting.
+    use core::arch::asm;
+    use narf_arch::x86_64::probe;
+
+    // Address above our 4-GiB identity map. The MMU handoff installed a
+    // PML4 with PDPT[0..=3] = 1-GiB huge pages covering phys 0..=4 GiB.
+    // Anything at 4 GiB and above has no PML4 entry and will #PF.
+    let unmapped: u64 = 0x0000_0001_0000_0000;
+
+    let recovery: u64;
+    // Step 1: compute the recovery RIP and arm the probe. The
+    // recovery label must match the one in the probing asm block
+    // below. rustc rejects numeric asm labels (LLVM issue #99547);
+    // use an alphabetic local.
+    // SAFETY: LEA of a local label is always safe.
+    unsafe {
+        asm!(
+            "lea {rec}, [99f + rip]",
+            rec = out(reg) recovery,
+            options(nostack, preserves_flags),
+        );
+    }
+    // The `99:` target below is reachable via the LEA above because
+    // rustc emits each asm block into the same translation unit and
+    // local labels resolve at link time. We compute the recovery RIP
+    // in the first block and use the label in the second.
+    probe::arm(recovery);
+
+    // Step 2: the probe. Writing to `unmapped` raises #PF; the trap
+    // handler sees the armed probe, records vector, rewrites RIP to
+    // the `99:` label, and iretqs there.
+    // SAFETY: if PKS / paging are broken and this write *succeeds*,
+    // it just stores a byte at a virtual address that doesn't exist
+    // in our PML4; the test reports failure rather than crashing.
+    unsafe {
+        asm!(
+            "mov byte ptr [{ptr}], 0",
+            "99:",
+            ptr = in(reg) unmapped,
+            options(nostack),
+        );
+    }
+
+    // Step 3: disarm and inspect.
+    let caught = probe::disarm();
+    if caught == 0 {
+        return TestResult::Fail("probe didn't catch the expected #PF");
+    }
+    if caught - 1 != 14 {
+        return TestResult::Fail("wrong vector caught (not #PF)");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_probe_catches_page_fault);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_pks_set_get_rights() -> TestResult {
     // SAFETY: CPUID always legal.
     let feats = unsafe { narf_arch::x86_64::Features::probe() };

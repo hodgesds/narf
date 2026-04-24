@@ -76,12 +76,25 @@ fn vector_name(v: u64) -> &'static str {
 }
 
 /// Rust-side trap dispatch. Called from `common_trap` in `trap_entry.S`
-/// with a pointer to the fully-populated `TrapFrame` on the trap stack.
+/// with a mutable pointer to the `TrapFrame` on the trap stack.
 ///
-/// Stage 1 policy: print the frame and halt. Stage 2 will demux to
-/// per-vector handlers (e.g. `#PF` talks to `memory/`).
+/// Contract:
+///   - If a probe is armed (`narf_arch::x86_64::probe` globals), consume
+///     it: record the vector, rewrite `frame.rip` to the probe's
+///     recovery RIP, and return. The asm tail restores GPRs and
+///     `iretq`s to the rewritten RIP.
+///   - Otherwise print the frame and call `exit_kernel(42)`, which
+///     does not return.
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_trap_handler(frame: &TrapFrame) -> ! {
+pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
+    // Recoverable-probe path. `consume` is atomic: a second fault
+    // inside the handler can't double-claim the recovery.
+    let recovery = narf_arch::x86_64::probe::consume(frame.vector as u32);
+    if recovery != 0 {
+        frame.rip = recovery;
+        return;
+    }
+
     let _ = writeln!(Writer, "\n*** CPU EXCEPTION ***");
     let _ = writeln!(Writer, "  vector: {:3} — {}", frame.vector, vector_name(frame.vector));
     let _ = writeln!(Writer, "  error:  {:#018x}", frame.error_code);

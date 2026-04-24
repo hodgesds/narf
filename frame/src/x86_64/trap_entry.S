@@ -103,12 +103,39 @@ common_trap:
     /* RDI = pointer to the trap frame (the current RSP). */
     mov rdi, rsp
 
-    /* Call the Rust dispatcher — it is marked `-> !`, so we never
-     * unwind this far. The hlt/jmp tail is a belt-and-braces fallback
-     * in case the Rust signature changes.
+    /* Call the Rust dispatcher. It may either:
+     *   - return normally → we pop regs and iretq, resuming at the
+     *     (possibly rewritten) RIP in the trap frame. This is how the
+     *     recoverable-probe path works: the handler modifies frame.rip
+     *     to a recovery address and returns.
+     *   - call exit_kernel internally → never returns here.
      */
     call rust_trap_handler
 
-1:  hlt
-    jmp 1b
+    /* Restore general-purpose registers in reverse push order. */
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+
+    /* Discard the vector + error_code we pushed. */
+    add rsp, 16
+
+    /* Return from interrupt. Reads the CPU-pushed [rip, cs, rflags,
+     * rsp, ss] from the top of the stack — the same 40 bytes the
+     * processor pushed on entry, possibly with RIP rewritten by the
+     * Rust handler.
+     */
+    iretq
 .size common_trap, . - common_trap
