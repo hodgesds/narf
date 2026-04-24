@@ -1173,6 +1173,178 @@ fn smoke_bus_claim_device_not_found() -> TestResult {
 }
 kernel_test!(smoke_bus_claim_device_not_found);
 
+fn smoke_bus_msix_alloc_vector() -> TestResult {
+    // Exercises the MsixTable::alloc_vector arithmetic against a
+    // synthetic table so the test doesn't depend on any particular
+    // device having an MSI-X capability. The synthetic helper mirrors
+    // the shape of a real `enable_msix` return value — same fields,
+    // same one-writer `&mut self` gate — so the arithmetic path is
+    // the real one. Real capability-list walking against a PCIe
+    // device lands with the Stage-4 BAR-map work; until then `bus/`
+    // only exposes the walker itself and relies on this synthetic
+    // path for coverage.
+    use narf_bus::msix::__synth_msix_table;
+    let mut t = __synth_msix_table(4);
+    if t.size() != 4 { return TestResult::Fail("synthetic size mismatch"); }
+    if t.free() != 4 { return TestResult::Fail("initial free mismatch"); }
+
+    let v0 = t.alloc_vector().expect("slot 0");
+    let v1 = t.alloc_vector().expect("slot 1");
+    if v0.vector != 0 || v1.vector != 1 {
+        return TestResult::Fail("monotonic vector allocation broken");
+    }
+    if t.free() != 2 { return TestResult::Fail("free count not decremented"); }
+
+    // Bulk reservation path: take the remaining two.
+    if t.alloc_block(2).is_err() {
+        return TestResult::Fail("alloc_block(2) rejected a fitting reservation");
+    }
+    if t.alloc_vector().is_some() {
+        return TestResult::Fail("alloc_vector returned Some on a full table");
+    }
+    match t.alloc_block(1) {
+        Err(narf_bus::MsixError::TableOverflow) => {}
+        Ok(_)  => return TestResult::Fail("alloc_block past capacity succeeded"),
+        Err(_) => return TestResult::Fail("wrong error on overflow"),
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_bus_msix_alloc_vector);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_bus_msix_enable_on_virtio() -> TestResult {
+    // virtio-mmio transports have no PCIe capability list. `enable_msix`
+    // must reject them cleanly with `NotPcie`, never `CapabilityNotFound`
+    // (which implies "PCIe with no MSI-X cap") and never UB-read the
+    // non-existent config window.
+    use narf_bus::{
+        bootstrap_registry_authority, claim_device_cap, devices, enable_msix,
+        BusKind, MsixError,
+    };
+    // SAFETY: the aarch64 enumerator falls back to probing the QEMU
+    // virt virtio-mmio slot layout when no DTB is supplied. The reads
+    // are volatile and validate magic before trusting the slot.
+    let _ = unsafe { narf_bus::init(None) };
+    let devs = devices();
+    let virtio = devs.iter().find(|d| matches!(d.kind, BusKind::VirtioMmio { .. }));
+    let Some(dev) = virtio else {
+        return TestResult::Skip("no virtio-mmio device in this flavour");
+    };
+
+    let authority = bootstrap_registry_authority();
+    let (_handle, dev_cap) = match claim_device_cap(&authority, dev.addr) {
+        Ok(ok)  => ok,
+        Err(_)  => return TestResult::Fail("claim_device_cap on a live address failed"),
+    };
+    match enable_msix(&dev_cap, dev) {
+        Err(MsixError::NotPcie) => TestResult::Pass,
+        Err(_) => TestResult::Fail("wrong error on virtio-mmio"),
+        Ok(_)  => TestResult::Fail("enable_msix accepted a virtio-mmio device"),
+    }
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test!(smoke_bus_msix_enable_on_virtio);
+
+fn smoke_bus_hotplug_listener_roundtrip() -> TestResult {
+    // Register a listener, dispatch an Attach + Detach, confirm the
+    // listener's atomic advanced to 2.
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use narf_bus::hotplug::__clear_listeners;
+    use narf_bus::{
+        bootstrap_registry_authority, dispatch_event, register_listener, BusAddr, DeviceId,
+        HotplugEvent, HotplugListener, PcieAddr,
+    };
+
+    // Isolate from any prior test run — the harness shares global state.
+    __clear_listeners();
+
+    struct Counter { hits: AtomicUsize }
+    impl HotplugListener for Counter {
+        fn on_event(&self, _ev: HotplugEvent) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let authority = bootstrap_registry_authority();
+    let counter = Arc::new(Counter { hits: AtomicUsize::new(0) });
+    if register_listener(&authority, counter.clone()).is_err() {
+        return TestResult::Fail("register_listener rejected a live authority");
+    }
+
+    let addr = BusAddr::Pcie(PcieAddr::new(0, 0, 1, 0));
+    dispatch_event(HotplugEvent::Attach {
+        addr,
+        device_id: DeviceId { vendor: 0x1af4, device: 0x1001, class: 0 },
+    });
+    dispatch_event(HotplugEvent::Detach { addr });
+
+    if counter.hits.load(Ordering::Relaxed) != 2 {
+        return TestResult::Fail("listener did not see both events");
+    }
+    // Restore a clean list so later tests don't see lingering state.
+    __clear_listeners();
+    TestResult::Pass
+}
+kernel_test!(smoke_bus_hotplug_listener_roundtrip);
+
+fn smoke_bus_hotplug_revoked_authority() -> TestResult {
+    // Revoking the authority before `register_listener` must fail with
+    // AuthorityRevoked; same epoch-gate path the other cap-gated
+    // subsystems rely on.
+    use alloc::sync::Arc;
+    use narf_bus::hotplug::__clear_listeners;
+    use narf_bus::{
+        bootstrap_registry_authority, register_listener, HotplugError, HotplugEvent,
+        HotplugListener,
+    };
+
+    __clear_listeners();
+
+    struct Sink;
+    impl HotplugListener for Sink {
+        fn on_event(&self, _: HotplugEvent) {}
+    }
+
+    let authority = bootstrap_registry_authority();
+    authority.revoke();
+    match register_listener(&authority, Arc::new(Sink) as Arc<dyn HotplugListener>) {
+        Err(HotplugError::AuthorityRevoked) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("register_listener accepted a revoked authority"),
+    }
+}
+kernel_test!(smoke_bus_hotplug_revoked_authority);
+
+fn smoke_bus_iommu_group_default() -> TestResult {
+    // Stage-3 stub: every enumerated device lives in group 0 on the
+    // default QEMU line (no vIOMMU). Once ACS-walked grouping lands in
+    // Stage 4 this test is where we'll assert the real mapping.
+    use narf_bus::{devices, iommu_group_for};
+    #[cfg(target_arch = "x86_64")]
+    {
+        use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+        // SAFETY: walking QEMU q35's identity-mapped ECAM.
+        let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: fallback probes the identity-mapped virtio-mmio layout.
+        let _ = unsafe { narf_bus::init(None) };
+    }
+
+    let devs = devices();
+    if devs.is_empty() {
+        return TestResult::Skip("empty registry on this flavour");
+    }
+    for d in devs.iter() {
+        if iommu_group_for(d) != 0 {
+            return TestResult::Fail("Stage-3 stub reported non-zero group");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_bus_iommu_group_default);
+
 fn smoke_sleep_future_waits() -> TestResult {
     use core::sync::atomic::{AtomicBool, Ordering};
     static DONE: AtomicBool = AtomicBool::new(false);
