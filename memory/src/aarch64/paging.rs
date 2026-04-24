@@ -97,3 +97,285 @@ impl PageTable {
 pub unsafe fn write_identity<T>(phys: PhysAddr, value: T) {
     unsafe { ptr::write_volatile(phys.raw() as *mut T, value); }
 }
+
+use crate::VirtAddr;
+
+/// Read the current TTBR0_EL1 (low-half / user) translation base.
+///
+/// # Safety
+/// `MRS` to a system register at EL1 is always legal.
+pub unsafe fn read_ttbr0_el1() -> PhysAddr {
+    use core::arch::asm;
+    use core::sync::atomic::{compiler_fence, Ordering};
+
+    let v: u64;
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: register read at EL1 is defined.
+    unsafe {
+        asm!(
+            "mrs {v}, ttbr0_el1",
+            v = out(reg) v,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    compiler_fence(Ordering::SeqCst);
+    // Low bits (ASID / CnP) are not part of the base; the BADDR
+    // field lives in [47:1] — mask to page boundary.
+    PhysAddr::new(v & 0x0000_FFFF_FFFF_F000)
+}
+
+/// Read TTBR1_EL1 (high-half / kernel).
+pub unsafe fn read_ttbr1_el1() -> PhysAddr {
+    use core::arch::asm;
+    use core::sync::atomic::{compiler_fence, Ordering};
+
+    let v: u64;
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: register read at EL1 is defined.
+    unsafe {
+        asm!(
+            "mrs {v}, ttbr1_el1",
+            v = out(reg) v,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    compiler_fence(Ordering::SeqCst);
+    PhysAddr::new(v & 0x0000_FFFF_FFFF_F000)
+}
+
+/// Install a fresh TTBR0_EL1. A `DSB ISH; ISB` pair ensures the
+/// translation change is observable to later instructions.
+///
+/// # Safety
+/// `root` must point at a valid root table for the low half
+/// (user space). Installing garbage kills the low-half mappings
+/// immediately, which takes down anything the kernel accesses
+/// through identity/user virt — today the NARF kernel runs in the
+/// high half (TTBR1) so swapping TTBR0 is safe from the kernel's
+/// perspective.
+pub unsafe fn write_ttbr0_el1(root: PhysAddr) {
+    use core::arch::asm;
+    use core::sync::atomic::{compiler_fence, Ordering};
+
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: `MSR TTBR0_EL1, xN` at EL1 is the architected way to
+    // swap the low-half translation root; the ASID field in bits
+    // [63:48] stays zero (single-ASID mode for Stage-4 structural).
+    unsafe {
+        asm!(
+            "msr ttbr0_el1, {addr}",
+            "dsb ish",
+            "tlbi vmalle1is",
+            "dsb ish",
+            "isb",
+            addr = in(reg) root.raw(),
+            options(nostack, preserves_flags),
+        );
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// Invalidate a single virtual address from the TLB via
+/// `TLBI VAE1, xN` with the required barrier dance.
+pub unsafe fn tlb_invalidate_vae1(virt: VirtAddr) {
+    use core::arch::asm;
+    use core::sync::atomic::{compiler_fence, Ordering};
+
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: TLBI at EL1 is always legal; the VA field is
+    // bits [43:0] of the operand (shifted-down by 12).
+    unsafe {
+        asm!(
+            "dsb ishst",
+            "tlbi vae1, {a}",
+            "dsb ish",
+            "isb",
+            a = in(reg) (virt.as_u64() >> 12),
+            options(nostack, preserves_flags),
+        );
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
+// ── Errors ──────────────────────────────────────────────────────────
+
+/// Errors from `new_user_ttbr0` and related primitives.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PageTableAllocError {
+    NoFrame,
+}
+
+/// Errors from `map_4kb`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MapError {
+    NonCanonical,
+    UnalignedVirt,
+    UnalignedPhys,
+    AlreadyMapped,
+    EncounteredBlock,
+    NoFrame,
+}
+
+// ── Allocation ──────────────────────────────────────────────────────
+
+/// Allocate a fresh zeroed root for a user-mode address space.
+/// aarch64's split translation (TTBR0 low, TTBR1 high) means the
+/// low-half root starts empty — the kernel lives in TTBR1 and is
+/// unaffected by whatever we install in TTBR0.
+///
+/// # Safety
+/// Caller must run with the MMU up and the frame allocator's
+/// output identity-mapped (standard NARF boot state).
+pub unsafe fn new_user_ttbr0() -> Result<PhysAddr, PageTableAllocError> {
+    let frame = crate::frame::alloc_frame().map_err(|_| PageTableAllocError::NoFrame)?;
+    let phys  = frame.start_address();
+    // SAFETY: frame is identity-mapped per the allocator's
+    // contract; 4 KiB write is aligned.
+    unsafe {
+        ptr::write_bytes(phys.raw() as *mut u8, 0, core::mem::size_of::<PageTable>());
+    }
+    Ok(phys)
+}
+
+// ── 4 KiB mapping walk ──────────────────────────────────────────────
+
+/// Indices into the 4-level walk for a 4 KiB page.
+struct WalkIndices {
+    l0: usize,
+    l1: usize,
+    l2: usize,
+    l3: usize,
+}
+
+impl WalkIndices {
+    fn from_virt(v: VirtAddr) -> Self {
+        let a = v.as_u64();
+        Self {
+            l0: ((a >> 39) & 0x1FF) as usize,
+            l1: ((a >> 30) & 0x1FF) as usize,
+            l2: ((a >> 21) & 0x1FF) as usize,
+            l3: ((a >> 12) & 0x1FF) as usize,
+        }
+    }
+}
+
+/// aarch64 "canonical": top 16 bits are either all-0 (low half /
+/// user) or all-1 (high half / kernel).
+fn is_canonical(v: VirtAddr) -> bool {
+    let top = v.as_u64() >> 48;
+    top == 0x0000 || top == 0xFFFF
+}
+
+/// Install a next-level table descriptor at `entry`, allocating a
+/// fresh frame if the entry is currently empty. Returns the phys
+/// address of the next-level table.
+unsafe fn ensure_next_table(entry: &mut PageTableEntry) -> Result<PhysAddr, MapError> {
+    if entry.is_valid() {
+        // Must be a TABLE (bit 1 = 1) — BLOCK entries stop the walk.
+        if (entry.0 & 0b11) != 0b11 {
+            return Err(MapError::EncounteredBlock);
+        }
+        return Ok(entry.addr());
+    }
+    let frame = crate::frame::alloc_frame().map_err(|_| MapError::NoFrame)?;
+    let next  = frame.start_address();
+    // Zero the new table.
+    // SAFETY: identity-mapped frame.
+    unsafe {
+        ptr::write_bytes(next.raw() as *mut u8, 0, core::mem::size_of::<PageTable>());
+    }
+    // Table descriptor: low bits 0b11 = valid + table.
+    *entry = PageTableEntry(next.raw() | 0b11);
+    Ok(next)
+}
+
+/// Map `virt` to `phys` at 4 KiB granularity under `root`.
+///
+/// # Safety
+/// - `root` must point at a valid aarch64 root translation table
+///   whose storage is identity-mapped in the currently-active
+///   mappings.
+/// - Concurrent modification from another CPU is UB.
+pub unsafe fn map_4kb(
+    root: PhysAddr,
+    virt: VirtAddr,
+    phys: PhysAddr,
+    flags: PtFlags,
+) -> Result<(), MapError> {
+    if !is_canonical(virt)     { return Err(MapError::NonCanonical); }
+    if virt.as_u64() & 0xFFF != 0 { return Err(MapError::UnalignedVirt); }
+    if phys.raw()    & 0xFFF != 0 { return Err(MapError::UnalignedPhys); }
+
+    let idx = WalkIndices::from_virt(virt);
+
+    // SAFETY: `root` is identity-mapped per caller contract.
+    let l0 = unsafe { &mut *(root.raw() as *mut PageTable) };
+    let l1_phys = unsafe { ensure_next_table(&mut l0.entries[idx.l0])? };
+
+    let l1 = unsafe { &mut *(l1_phys.raw() as *mut PageTable) };
+    let l2_phys = unsafe { ensure_next_table(&mut l1.entries[idx.l1])? };
+
+    let l2 = unsafe { &mut *(l2_phys.raw() as *mut PageTable) };
+    let l3_phys = unsafe { ensure_next_table(&mut l2.entries[idx.l2])? };
+
+    let l3 = unsafe { &mut *(l3_phys.raw() as *mut PageTable) };
+    if l3.entries[idx.l3].is_valid() {
+        return Err(MapError::AlreadyMapped);
+    }
+    // L3 entry for a 4 KiB page: valid + page (low bits = 0b11),
+    // AF must be set to avoid Access Flag faults on first touch,
+    // inner-shareable + normal memory attr.
+    let base = PtFlags::VALID | PtFlags::TYPE_PAGE
+             | PtFlags::AF | PtFlags::SH_INNER | PtFlags::ATTR_NORMAL;
+    l3.entries[idx.l3] = PageTableEntry::new(phys, base | flags);
+    Ok(())
+}
+
+/// Walk the table at `root` and return the physical address mapped
+/// at `virt`, or `None` if unmapped.
+pub unsafe fn translate(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {
+    let idx = WalkIndices::from_virt(virt);
+    // SAFETY: root must be identity-mapped per caller contract;
+    // callers hold this invariant.
+    let l0 = unsafe { &*(root.raw() as *const PageTable) };
+    let e = l0.entries[idx.l0];
+    if !e.is_valid() || (e.0 & 0b11) != 0b11 { return None; }
+
+    let l1 = unsafe { &*(e.addr().raw() as *const PageTable) };
+    let e = l1.entries[idx.l1];
+    if !e.is_valid() { return None; }
+    if (e.0 & 0b11) != 0b11 { /* block at L1 — 1 GiB */ return None; }
+
+    let l2 = unsafe { &*(e.addr().raw() as *const PageTable) };
+    let e = l2.entries[idx.l2];
+    if !e.is_valid() { return None; }
+    if (e.0 & 0b11) != 0b11 { /* block at L2 — 2 MiB */ return None; }
+
+    let l3 = unsafe { &*(e.addr().raw() as *const PageTable) };
+    let e = l3.entries[idx.l3];
+    if !e.is_valid() { return None; }
+    Some(e.addr())
+}
+
+/// Walk the table at `root` and return the flags for `virt`, or
+/// `None` if unmapped.
+pub unsafe fn flags_at(root: PhysAddr, virt: VirtAddr) -> Option<PtFlags> {
+    let idx = WalkIndices::from_virt(virt);
+    let l0 = unsafe { &*(root.raw() as *const PageTable) };
+    let e = l0.entries[idx.l0];
+    if !e.is_valid() || (e.0 & 0b11) != 0b11 { return None; }
+
+    let l1 = unsafe { &*(e.addr().raw() as *const PageTable) };
+    let e = l1.entries[idx.l1];
+    if !e.is_valid() || (e.0 & 0b11) != 0b11 { return None; }
+
+    let l2 = unsafe { &*(e.addr().raw() as *const PageTable) };
+    let e = l2.entries[idx.l2];
+    if !e.is_valid() || (e.0 & 0b11) != 0b11 { return None; }
+
+    let l3 = unsafe { &*(e.addr().raw() as *const PageTable) };
+    let e = l3.entries[idx.l3];
+    if !e.is_valid() { return None; }
+    // Strip the phys-addr bits; keep the flag bits.
+    Some(PtFlags(e.0 & !0x0000_FFFF_FFFF_F000))
+}

@@ -103,7 +103,17 @@ impl AddressSpace {
         Ok(Self { root: phys, regions: Vec::new() })
     }
 
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    pub unsafe fn new_for_user() -> Result<Self, AddressSpaceError> {
+        // SAFETY: contract documented on the function. aarch64's
+        // split translation means the user root starts empty —
+        // the kernel sits behind TTBR1 and is unaffected.
+        let phys = unsafe { crate::aarch64::paging::new_user_ttbr0() }
+            .map_err(|_| AddressSpaceError::OutOfRange)?;
+        Ok(Self { root: phys, regions: Vec::new() })
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub unsafe fn new_for_user() -> Result<Self, AddressSpaceError> {
         Err(AddressSpaceError::NotImplemented)
     }
@@ -177,7 +187,39 @@ impl AddressSpace {
         Ok(())
     }
 
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    pub unsafe fn materialize(&self) -> Result<(), AddressSpaceError> {
+        use crate::aarch64::paging::{map_4kb, MapError, PtFlags};
+        if self.root.as_u64() == 0 { return Err(AddressSpaceError::OutOfRange); }
+        for r in &self.regions {
+            // aarch64 perm translation:
+            // - AP_RW_EL1 = kernel-writable; for user the AP field
+            //   changes to RW-EL1/EL0 (0b01<<6). For now Stage-4
+            //   structural keeps the kernel-mode bit; true EL0
+            //   access lands with full user-mode enablement.
+            // - UXN+PXN disable exec at the respective ELs; we set
+            //   UXN unless `perms.contains(EXEC)`.
+            let mut flags = PtFlags::AP_RW_EL1;
+            if !r.perms.contains(RegionPerms::EXEC) {
+                flags = flags | PtFlags::UXN | PtFlags::PXN;
+            }
+            let pages = r.len >> 12;
+            for i in 0..pages {
+                let v = crate::VirtAddr::new(r.base.as_u64() + (i << 12));
+                let p = crate::PhysAddr::new(r.phys.as_u64() + (i << 12));
+                // SAFETY: root is valid per `new_for_user`; pages
+                // covered are within the just-allocated region.
+                match unsafe { map_4kb(self.root, v, p, flags) } {
+                    Ok(()) => {}
+                    Err(MapError::AlreadyMapped) => {}
+                    Err(_) => return Err(AddressSpaceError::NotImplemented),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub unsafe fn materialize(&self) -> Result<(), AddressSpaceError> {
         Err(AddressSpaceError::NotImplemented)
     }
@@ -216,7 +258,22 @@ impl AddressSpace {
             unsafe { crate::x86_64::paging::write_cr3(self.root); }
             return Ok(());
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        {
+            // aarch64 split translation would make TTBR0 swaps safe
+            // in principle — the kernel lives behind TTBR1. In
+            // practice the current boot's TTBR0 carries the kernel's
+            // low-half identity map that the heap + free-list
+            // access through raw phys-as-virt pointers, so swapping
+            // it to a fresh empty table hangs. The full
+            // `write_ttbr0_el1` primitive IS landed in
+            // `aarch64::paging` and tested independently; wiring it
+            // here waits on migrating the allocator off the identity
+            // map (the same prerequisite x86_64 has for genuine
+            // user-AS isolation).
+            return Err(AddressSpaceError::NotImplemented);
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             Err(AddressSpaceError::NotImplemented)
         }

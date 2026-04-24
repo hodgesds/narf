@@ -5059,22 +5059,20 @@ fn smoke_drivers_net_nic_model_ids() -> TestResult {
 }
 kernel_test!(smoke_drivers_net_nic_model_ids);
 
-#[cfg(target_arch = "x86_64")]
 fn smoke_memory_address_space_materialize() -> TestResult {
-    // Full flow: new_for_user allocates a fresh PML4, map_region
+    // Full flow: new_for_user allocates a fresh root, map_region
     // records a region, materialize walks the region and installs
-    // real PTEs via map_4kb, then translate() under the new PML4
-    // finds the mapping.
-    use narf_memory::{
-        x86_64::paging::{self, PtFlags},
-        AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr,
-    };
+    // real PTEs via the arch's 4-KiB mapper, then translate()
+    // against the new root finds the mapping with expected flags.
+    use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
 
     let mut a = unsafe { AddressSpace::new_for_user() }.expect("alloc AS");
-    // Pick a user virtual address in PML4 entry 1 — outside the
-    // identity-mapped low 4 GiB (PML4[0] → PDPT[0..4] with HUGE_PAGE)
-    // so the walk doesn't trip `EncounteredHugePage`.
-    let vbase = 0x0000_0080_0000_0000u64; // 512 GiB, PML4[1]
+    // Pick a user virtual address outside every pre-existing
+    // mapping. On x86_64, low 4 GiB is identity-mapped via 1-GiB
+    // HUGE_PAGE entries in PML4[0]; pick PML4[1] (= 512 GiB). On
+    // aarch64 TTBR0 starts empty, so any low-half canonical VA is
+    // safe — use the same one for portability.
+    let vbase = 0x0000_0080_0000_0000u64; // 512 GiB
     // Allocate a real phys frame to back it.
     let target = match narf_memory::alloc_frame() {
         Ok(f) => f.start_address(),
@@ -5089,32 +5087,50 @@ fn smoke_memory_address_space_materialize() -> TestResult {
     }).expect("map region");
 
     if unsafe { a.materialize() }.is_err() {
-        return TestResult::Fail("materialize failed on fresh user PML4");
+        return TestResult::Fail("materialize failed on fresh user root");
     }
 
-    // Walk the PML4 to confirm the PTE is installed with the
-    // expected physical address + flags.
-    let got = unsafe { paging::translate(a.root, VirtAddr::new(vbase)) };
-    match got {
-        Some(phys) => {
-            if phys != target {
+    // Per-arch structural validation of the installed PTE.
+    #[cfg(target_arch = "x86_64")]
+    {
+        use narf_memory::x86_64::paging::{self, PtFlags};
+        let got = unsafe { paging::translate(a.root, VirtAddr::new(vbase)) };
+        match got {
+            Some(phys) => if phys != target {
                 return TestResult::Fail("translate returned wrong phys");
-            }
+            },
+            None => return TestResult::Fail("translate found no mapping post-materialize"),
         }
-        None => return TestResult::Fail("translate found no mapping post-materialize"),
+        let flags = unsafe { paging::flags_at(a.root, VirtAddr::new(vbase)) };
+        match flags {
+            Some(f) if f.contains(PtFlags::PRESENT)
+                   && f.contains(PtFlags::WRITABLE)
+                   && f.contains(PtFlags::USER)
+                   && f.contains(PtFlags::NO_EXEC) => {}
+            _ => return TestResult::Fail("x86_64 PTE missing expected flags"),
+        }
     }
-
-    // Flags should include PRESENT + WRITABLE + USER.
-    let flags = unsafe { paging::flags_at(a.root, VirtAddr::new(vbase)) };
-    let want = PtFlags::PRESENT | PtFlags::WRITABLE | PtFlags::USER | PtFlags::NO_EXEC;
-    match flags {
-        Some(f) if f.contains(PtFlags::PRESENT)
-              && f.contains(PtFlags::WRITABLE)
-              && f.contains(PtFlags::USER)
-              && f.contains(PtFlags::NO_EXEC) => {
-            let _ = want;
+    #[cfg(target_arch = "aarch64")]
+    {
+        use narf_memory::aarch64::paging::{self, PtFlags};
+        let got = unsafe { paging::translate(a.root, VirtAddr::new(vbase)) };
+        match got {
+            Some(phys) => if phys != target {
+                return TestResult::Fail("translate returned wrong phys");
+            },
+            None => return TestResult::Fail("translate found no mapping post-materialize"),
         }
-        _ => return TestResult::Fail("mapped PTE missing expected flags"),
+        // Expect VALID + AF + UXN (non-exec default) + TYPE_PAGE.
+        let flags = unsafe { paging::flags_at(a.root, VirtAddr::new(vbase)) };
+        match flags {
+            Some(f) => {
+                let v = f.bits();
+                if v & 1 != 1 { return TestResult::Fail("aarch64 PTE not VALID"); }
+                if v & (1 << 10) == 0 { return TestResult::Fail("aarch64 PTE missing AF"); }
+                if v & (1 << 54) == 0 { return TestResult::Fail("aarch64 PTE missing UXN for non-exec region"); }
+            }
+            None => return TestResult::Fail("aarch64 flags_at returned None"),
+        }
     }
 
     // Idempotent second call.
@@ -5123,7 +5139,6 @@ fn smoke_memory_address_space_materialize() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_memory_address_space_materialize);
 
 fn smoke_scheduler_spawn_user_carries_address_space() -> TestResult {
@@ -5136,18 +5151,11 @@ fn smoke_scheduler_spawn_user_carries_address_space() -> TestResult {
     static RAN: AtomicU32 = AtomicU32::new(0);
     RAN.store(0, Ordering::Relaxed);
 
-    // Build an address space — on x86_64 allocate a real PML4 so
-    // the executor's `activate()` does a safe CR3 swap (the
-    // constructor full-copies the current PML4 so kernel mappings
-    // stay intact). On aarch64 fall back to the empty AS, whose
-    // activate() surfaces NotImplemented until the TTBR0 primitive
-    // lands.
-    let mut a = {
-        #[cfg(target_arch = "x86_64")]
-        { unsafe { AddressSpace::new_for_user() }.expect("alloc user AS") }
-        #[cfg(not(target_arch = "x86_64"))]
-        { AddressSpace::empty() }
-    };
+    // Allocate a real user-root for the active arch — the
+    // constructor takes care of the kernel/high-half bits that
+    // have to survive activation (full-copy PML4 on x86_64, empty
+    // TTBR0 on aarch64 since the kernel lives behind TTBR1).
+    let mut a = unsafe { AddressSpace::new_for_user() }.expect("alloc user AS");
     a.map_region(Region {
         base: VirtAddr::new(0x4000),
         len:  0x1000,
