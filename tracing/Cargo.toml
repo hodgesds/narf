@@ -15,6 +15,7 @@ path = "src/lib.rs"
 narf-lib          = { path = "../lib" }
 narf-arch         = { path = "../arch" }
 narf-capabilities = { path = "../capabilities" }
+narf-time         = { path = "../time" }
 
 [lints]
 workspace = true

@@ -3819,3 +3819,133 @@ fn smoke_tracing_arm_disarm_cycle() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_tracing_arm_disarm_cycle);
+
+fn smoke_tracing_dispatch_fire_routes_handler() -> TestResult {
+    // Register a handler for a fresh probe id, fire() → handler runs;
+    // unregister → fire() is a no-op; revoked cap cannot register.
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_capabilities::{Cap, Grant};
+    use narf_tracing::{
+        fire, handler_table, reserve_probe_id,
+        ProbeArgs, ProbeHandler, ProbeHandlerInstall, RegisterError,
+    };
+
+    static HITS: AtomicU64 = AtomicU64::new(0);
+    static SUM:  AtomicU64 = AtomicU64::new(0);
+    HITS.store(0, Ordering::Relaxed);
+    SUM.store(0, Ordering::Relaxed);
+
+    struct Counter;
+    impl ProbeHandler for Counter {
+        fn fire(&self, args: ProbeArgs) {
+            HITS.fetch_add(1, Ordering::Relaxed);
+            SUM.fetch_add(args.0[0], Ordering::Relaxed);
+        }
+    }
+
+    let pid = reserve_probe_id();
+    let cap: Cap<ProbeHandlerInstall, Grant> =
+        Cap::<ProbeHandlerInstall, Grant>::bootstrap();
+
+    // No handler yet — fire is a no-op.
+    fire(pid, ProbeArgs::one(7));
+    if HITS.load(Ordering::Relaxed) != 0 {
+        return TestResult::Fail("fire() ran without a registered handler");
+    }
+
+    handler_table().register(&cap, pid, Counter).expect("register");
+    fire(pid, ProbeArgs::one(7));
+    fire(pid, ProbeArgs::one(35));
+    if HITS.load(Ordering::Relaxed) != 2 || SUM.load(Ordering::Relaxed) != 42 {
+        return TestResult::Fail("handler missed a fire or arg was lost");
+    }
+
+    // Duplicate register: rejected.
+    match handler_table().register(&cap, pid, Counter) {
+        Err(RegisterError::DuplicateProbeId) => {}
+        _ => return TestResult::Fail("duplicate-id register accepted"),
+    }
+
+    // Revoked cap cannot register OR unregister.
+    let revoked: Cap<ProbeHandlerInstall, Grant> =
+        Cap::<ProbeHandlerInstall, Grant>::bootstrap();
+    revoked.revoke();
+    let pid2 = reserve_probe_id();
+    match handler_table().register(&revoked, pid2, Counter) {
+        Err(RegisterError::AuthorityRevoked) => {}
+        _ => return TestResult::Fail("revoked cap slipped past register"),
+    }
+
+    // Unregister and confirm fire is silent again.
+    handler_table().unregister(&cap, pid).expect("unregister");
+    let before = HITS.load(Ordering::Relaxed);
+    fire(pid, ProbeArgs::one(100));
+    if HITS.load(Ordering::Relaxed) != before {
+        return TestResult::Fail("fire() called a torn-down handler");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_tracing_dispatch_fire_routes_handler);
+
+fn smoke_tracing_fntime_welford_accumulates() -> TestResult {
+    // Direct record_cycles() path: deterministic (no clock noise).
+    // Feed {1, 2, 3, 4, 5}, confirm count/min/max/mean.
+    use narf_tracing::{FnTime, Welford};
+    static LAT: FnTime = FnTime::new("test::welford");
+    for x in [1u64, 2, 3, 4, 5] { LAT.record_cycles(x); }
+    let w: Welford = LAT.welford();
+    if w.count != 5 { return TestResult::Fail("count != 5"); }
+    if w.min != 1 || w.max != 5 { return TestResult::Fail("min/max wrong"); }
+    // Mean of 1..=5 is exactly 3.0.
+    if (w.mean - 3.0).abs() > 1e-9 { return TestResult::Fail("mean drifted"); }
+    // Sample variance of 1..=5 is 2.5.
+    let var = w.sample_variance();
+    if (var - 2.5).abs() > 1e-9 { return TestResult::Fail("sample variance off"); }
+    TestResult::Pass
+}
+kernel_test!(smoke_tracing_fntime_welford_accumulates);
+
+fn smoke_tracing_fntime_scope_records_cycles() -> TestResult {
+    // ScopeGuard path: drop records elapsed cycles into the FnTime.
+    // Busy-wait a non-trivial number of cycles so a stuck timer
+    // surfaces as a 0-sample.
+    use narf_tracing::{scope, FnTime};
+    static LAT: FnTime = FnTime::new("test::scope");
+    let before = LAT.welford().count;
+    {
+        let _g = scope(&LAT);
+        narf_time::busy_wait_cycles(10_000);
+    }
+    if LAT.live_scopes() != 0 {
+        return TestResult::Fail("ScopeGuard drop didn't balance live_scopes");
+    }
+    let w = LAT.welford();
+    if w.count != before + 1 { return TestResult::Fail("scope did not add sample"); }
+    if w.max < 10_000 { return TestResult::Fail("scope sample shorter than busy-wait"); }
+    TestResult::Pass
+}
+kernel_test!(smoke_tracing_fntime_scope_records_cycles);
+
+fn smoke_tracing_histogram_quantile_bucket() -> TestResult {
+    // 10 bulk samples of 1000 (bucket 10, lower = 512) plus one outlier
+    // of 1<<20 (bucket 21, lower = 1<<20). With 11 samples the outlier
+    // falls inside the p99 band — ceil(11 * 990 / 1000) = 11 — so p99
+    // must land in the outlier bucket while p50 stays in the bulk one.
+    use narf_tracing::Histogram;
+    let h = Histogram::new();
+    for _ in 0..10 { h.add(1000); }
+    if h.p50() != 512 {
+        return TestResult::Fail("bucket lower bound for 1000 drifted from 512");
+    }
+    h.add(1u64 << 20);
+    if h.p50() != 512 {
+        return TestResult::Fail("outlier moved p50 off the bulk bucket");
+    }
+    // 1<<20 is 1_048_576; bucket index = 64 - 43 = 21, lower = 1<<20.
+    if h.p99() != 1u64 << 20 {
+        return TestResult::Fail("outlier did not move p99 into its bucket");
+    }
+    if h.count() != 11 { return TestResult::Fail("count mismatch"); }
+    TestResult::Pass
+}
+kernel_test!(smoke_tracing_histogram_quantile_bucket);

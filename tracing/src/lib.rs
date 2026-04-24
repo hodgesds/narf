@@ -7,18 +7,46 @@
 //! cost when unarmed (a single `nop`), and a basic fixed-size power-
 //! of-two drop-oldest ring for Stage-2 flight-recorder use.
 //!
-//! Non-goals in this crate (later stages / other tracks):
-//! - Runtime arming of probe sites (needs `arch/` patch primitive
-//!   + `capabilities/` install cap — Stage-3 main-track work).
-//! - Dynamic probes, `FnTime`, aggregate sketches (spec §3.2+).
-//! - Tracer task / streaming rings (spec §3.4 — Stage-2 tracer
-//!   domain, side track not in scope here).
+//! Round-4 added runtime probe arming (`arm` / `disarm` against
+//! `arch::patch_word`, cap-gated on `Cap<ProbeArming, Grant>`).
+//! Round-5 (this iteration) lands the dynamic-probe dispatch surface
+//! plus `FnTime` function-level timing aggregates — the §3.2 scope.
+//!
+//! Submodules:
+//! - `dispatch`: cap-gated handler registry + `fire(probe_id, args)`
+//!   that armed probe sites call. Up to 256 handlers, linear-scan
+//!   lookup under an IRQ-safe lock (Stage 4 swaps to a hazard-
+//!   pointer-backed per-slot table).
+//! - `fntime`: `FnTime` scope accumulator with Welford online mean +
+//!   variance + a log2-bucket histogram for approximate percentiles.
+//! - `sketch`: the log2-bucket `Histogram` primitive `FnTime` uses.
+//!   The spec §3.2 asks for tDigest-grade quantile accuracy — that
+//!   is deferred to Stage 4 once a NARF-wide quantile-accuracy
+//!   contract is settled.
+//!
+//! Non-goals in this crate (later stages):
+//! - Tracer task / streaming rings (spec §3.4 — tracer domain).
 //! - `frame/` panic-path snapshot hook (the ring is callable; the
 //!   panic path wiring is deferred to the frame/ owner).
+//! - Real tDigest centroid-merge quantile sketch.
+//! - Per-CPU-sharded handler dispatch (Stage 4 hazard-pointer path).
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(missing_debug_implementations)]
+
+extern crate alloc;
+
+pub mod dispatch;
+pub mod fntime;
+pub mod sketch;
+
+pub use dispatch::{
+    fire, reserve_probe_id, table as handler_table,
+    HandlerTable, ProbeArgs, ProbeHandler, ProbeHandlerInstall, RegisterError,
+};
+pub use fntime::{scope, FnTime, ScopeGuard, Welford};
+pub use sketch::{Histogram, HISTOGRAM_BUCKETS};
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
