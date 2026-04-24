@@ -39,6 +39,8 @@ NARF Stage 1 Wave 1 — hello from a bare kernel.
 $ cargo xtask test --arch=x86_64
 ...
 ── kernel_test harness ──────────────────────────
+  [ OK ] smoke_pks_enforces_deny_all    ← live PKS #PF/PK demo
+  [ OK ] smoke_probe_catches_page_fault ← recoverable trap
   [ OK ] smoke_pks_set_get_rights
   [ OK ] smoke_pkrs_roundtrip
   [ OK ] smoke_map_preserves_pk_field
@@ -53,7 +55,7 @@ $ cargo xtask test --arch=x86_64
   [ OK ] smoke_bitmap_first_set
   [ OK ] smoke_arch_backend
   [ OK ] smoke_typed_id_sanity
-── summary: 14 pass, 0 fail, 0 skip ──
+── summary: 16 pass, 0 fail, 0 skip ──
 ```
 
 ## Crates that exist
@@ -98,8 +100,18 @@ $ cargo xtask test --arch=x86_64
 - **PTE PK field** (`memory/paging.rs`): `PtFlags::pk(domain)` /
   `pk_of()`; `map_4kb` tags a page with any of 16 PK domains.
 - **4 KiB page-table walk API**: `map_4kb` / `unmap_4kb` / `translate` /
-  `flags_at` operating on a caller-supplied PML4. Does not yet mutate
-  the *live* PML4 — consumers pass a specific PML4 physical address.
+  `flags_at` / `read_cr3` operating on an arbitrary PML4 — including
+  the live one.
+- **Recoverable trap handler** (`frame/x86_64/trap.rs` +
+  `arch/x86_64/probe.rs`): Linux-style exception-table pattern. Arm
+  a probe with a recovery RIP; CPU exceptions redirect there via
+  `iretq` instead of panic-exiting. Captures vector + error code.
+- **Live PKS enforcement, verified**: `smoke_pks_enforces_deny_all`
+  kernel test maps a page with PK=9, sets IA32_PKRS domain 9 to
+  DENY_ALL, writes → `#PF` with error-code bit 5 (PK violation) set,
+  handler catches, test checks both vector and error-code bit. The
+  full PTE-PK → PKRS-rights → hardware-check → #PF → recovery loop
+  is exercised every run.
 
 ## Stage 2 Barrier — what's still open
 
@@ -108,16 +120,17 @@ $ cargo xtask test --arch=x86_64
   kernel runs low-half (phys == virt).
 - **NX enable**: `IA32_EFER.NXE = 1` so `PtFlags::NO_EXEC` is honoured.
   CPUID says NX is present; just not wired yet.
-- **Live enforcement demo**: recoverable `#PF` handler + a kernel test
-  that tags a page `DENY_ALL` and proves the fault fires with
-  PK-violation error-code bit set. Requires exception-table plumbing
-  (Linux `__get_user`-style) that doesn't exist yet.
 - **Interrupt controller** (`interrupts/`): x2APIC / LAPIC-timer bring-up
   on x86_64, GICv3 on aarch64. Prerequisite for replacing the Stage 1
   busy-poll scheduler with an IRQ-driven one.
 - **UIPI** (Sapphire Rapids+). Gates on APIC.
 - **aarch64 MTE mirror**: SCTLR_EL1.TCF, tag storage, symmetric
   DomainPrimitive. Currently only `BACKEND = Mte` constant exists.
+- **`DomainPrimitive` trait declared in `arch/`**: once MTE lands the
+  second implementation, extract the common trait surface from the
+  x86_64 `pks` module and point aarch64 at it.
+- **Per-CPU probe state**: today's `arch::probe` globals are
+  single-probe-at-a-time. Wave-3 SMP bring-up needs per-CPU.
 
 ## Stage 2 design debt (not blocking, worth tracking)
 
@@ -185,35 +198,43 @@ cargo test -p narf-lib
 | Stage 2 paging| `map_4kb` / `unmap_4kb` / `translate` + kernel test          |
 | Stage 2 PKS   | CR4.PKS enable, CPUID probe, `arch::x86_64::pks` module      |
 | Stage 2 PK    | PTE PK field, `DomainPrimitive`-shaped save/restore/get/set  |
+| probe         | Recoverable trap handler + arm/disarm exception-table probe  |
+| PKS live      | `smoke_pks_enforces_deny_all` — end-to-end #PF/PK demo      |
 
 ## Pickup hint for the next session
 
-Three equally-valuable next pieces. Pick based on appetite:
+The critical-path Stage-2 items remaining:
 
-1. **Higher-half kernel relocation**. Lands the conventional Stage-2
-   layout. Touches: linker script (`build/linker/x86_64.ld`), boot.S
-   (the far-jump after long-mode enable needs a 64-bit displacement),
-   `.cargo/config.toml` (code-model back to `kernel`). The MMU
-   handoff already exists — this is mostly a PML4 construction tweak
-   (add high-half entries pointing to the same physical pages) + a
-   far-jump-to-virtual-kernel at the end of `init_mmu`.
+1. **Interrupt controller bring-up** (`interrupts/`). x2APIC init,
+   LAPIC timer → real IRQ handler driving the scheduler's waker.
+   ~300 LoC. Unblocks UIPI (remaining Stage 2) and preemption
+   (Stage 3). Today's scheduler busy-polls `Instant::now()`; with
+   a timer IRQ we'd use real wakers instead.
 
-2. **Interrupt controller bring-up**. x2APIC init + LAPIC timer +
-   first real IRQ handler driving the scheduler's waker. ~300 LoC.
-   Unblocks UIPI (Stage 2) and real preemption (Stage 3).
+2. **Higher-half kernel relocation**. Conventional -2 GiB layout.
+   Touches the linker script, boot.S (far-jump-to-virtual after
+   long-mode enable), and `.cargo/config.toml` (code-model back
+   to `kernel`). The MMU handoff already owns its own PML4, so
+   this is mostly adding high-half PML4/PDPT entries and a
+   far-jump.
 
-3. **Live PKS enforcement demo**. Linux-style exception table in
-   the trap handler: before a probing access, set a (fault_rip,
-   recovery_rip) pair; handler consults on fault and jumps to
-   recovery instead of panic. Lets a kernel test map a page with
-   pk=9, set domain 9 DENY_ALL, attempt access, catch the fault,
-   check error-code bit 5 (PK). This is the smallest piece but
-   arguably the highest-value signal that Stage 2 Barrier actually
-   enforces.
+3. **NX enable**. `IA32_EFER.NXE = 1` so `PtFlags::NO_EXEC` is
+   actually honoured. Small (~20 lines + a kernel test that maps
+   a page NX and probes a jump-to-that-page).
+
+4. **aarch64 MTE mirror**. SCTLR_EL1.TCF / tag storage /
+   symmetric DomainPrimitive impl. Can't run-test without
+   qemu-system-aarch64 installed, but code-compiles and
+   matches the x86_64 structure.
+
+5. **`DomainPrimitive` trait extraction**. Once 4 lands, pull the
+   shared shape out of `arch::x86_64::pks` and `arch::aarch64::mte`
+   into `arch::DomainPrimitive`.
+
+6. **Per-CPU probe state** (`arch::probe`). Needed for Wave-3 SMP.
+   Low-value until APs come up.
 
 Parallel-safe micro-tasks:
-- aarch64 MTE helpers (can't run-test, but mirrors x86_64 structure).
-- NX enable in IA32_EFER (~20 lines).
 - Replace free-stack frame allocator with a buddy.
 - `rcu/` stub API so downstream crates don't retrofit.
 - `tracing/` USDT marker macro — `.note.narf.probes` section exists.
