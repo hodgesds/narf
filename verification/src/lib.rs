@@ -4713,6 +4713,84 @@ fn smoke_block_deadline_promotes_expired() -> TestResult {
 }
 kernel_test!(smoke_block_deadline_promotes_expired);
 
+fn smoke_obs_gdb_packet_checksum() -> TestResult {
+    use narf_observability::gdb::GdbPacket;
+
+    let p = GdbPacket::new("OK");
+    if !p.checksum_valid() {
+        return TestResult::Fail("freshly-built packet has wrong checksum");
+    }
+    let wire = p.to_wire();
+    if !wire.starts_with("$OK#") {
+        return TestResult::Fail("wire format incorrect prefix");
+    }
+    // $OK#9a on a correctly-summed packet.
+    let mut tampered = p.clone();
+    tampered.checksum = tampered.checksum.wrapping_add(1);
+    if tampered.checksum_valid() {
+        return TestResult::Fail("tampered checksum accepted");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_obs_gdb_packet_checksum);
+
+fn smoke_obs_gdb_attach_not_implemented() -> TestResult {
+    use narf_capabilities::{Cap, Invoke};
+    use narf_observability::{gdb, Debugger, GdbError};
+
+    let cap: Cap<Debugger, Invoke> = Cap::bootstrap();
+    match gdb::attach(&cap) {
+        Err(GdbError::NotImplemented) => {}
+        _ => return TestResult::Fail("attach should return NotImplemented pending arch backend"),
+    }
+    cap.revoke();
+    match gdb::attach(&cap) {
+        Err(GdbError::AuthorityRevoked) => {}
+        _ => return TestResult::Fail("revoked debugger cap not rejected"),
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_obs_gdb_attach_not_implemented);
+
+fn smoke_obs_peek_provider_registration() -> TestResult {
+    use alloc::vec::Vec;
+    use narf_capabilities::{Cap, Read};
+    use narf_observability::{peek, Diagnostics, MetricSample, MetricValue, Provider};
+
+    peek::__test_reset();
+
+    struct TestProvider;
+    impl Provider for TestProvider {
+        fn name(&self) -> &'static str { "test" }
+        fn sample(&self, out: &mut Vec<MetricSample>) {
+            out.push(MetricSample {
+                provider: alloc::string::String::from("test"),
+                name:     alloc::string::String::from("counter"),
+                value:    MetricValue::U64(42),
+            });
+        }
+    }
+
+    peek::register(TestProvider);
+    if peek::provider_count() != 1 {
+        peek::__test_reset();
+        return TestResult::Fail("provider did not register");
+    }
+    let cap: Cap<Diagnostics, Read> = Cap::bootstrap();
+    let mut out = Vec::new();
+    if peek::sample_all(&cap, &mut out).is_err() {
+        peek::__test_reset();
+        return TestResult::Fail("sample_all failed on a live cap");
+    }
+    if out.len() != 1 || out[0].value != MetricValue::U64(42) {
+        peek::__test_reset();
+        return TestResult::Fail("sample_all did not return test provider data");
+    }
+    peek::__test_reset();
+    TestResult::Pass
+}
+kernel_test!(smoke_obs_peek_provider_registration);
+
 fn smoke_time_wall_offset_and_leap_smear() -> TestResult {
     use narf_capabilities::{Cap, Write};
     use narf_time::{

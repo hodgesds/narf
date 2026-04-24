@@ -35,6 +35,14 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(missing_debug_implementations)]
 
+extern crate alloc;
+
+pub mod gdb;
+pub mod peek;
+
+pub use gdb::{GdbCommand, GdbError, GdbPacket};
+pub use peek::{MetricSample, MetricValue, PeekError, Provider};
+
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use narf_capabilities::{
