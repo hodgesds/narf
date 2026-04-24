@@ -1,0 +1,22 @@
+[package]
+name         = "narf-observability"
+description  = "PMU counters, crash dump, panic flight-recorder snapshot — state-inspection observability."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_observability"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../lib" }
+narf-arch         = { path = "../arch" }
+narf-capabilities = { path = "../capabilities" }
+narf-tracing      = { path = "../tracing" }
+narf-time         = { path = "../time" }
+
+[lints]
+workspace = true
