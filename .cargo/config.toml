@@ -32,10 +32,7 @@ rustflags = [
 [target.x86_64-unknown-none]
 rustflags = [
     "-C", "relocation-model=static",
-    # Stage 1 loads the kernel at phys 0x100000 (low 4 GiB), so code-model=small
-    # is correct. Higher-half migration is a Stage 2 task — see STAGE1.md
-    # Wave 1 and memory/specification/spec.md §6 for the handoff protocol.
-    "-C", "code-model=small",
+    "-C", "code-model=kernel",
     "-C", "link-arg=-Tbuild/linker/x86_64.ld",
     "-C", "link-arg=--gc-sections",
     "-Z", "plt=no",
@@ -46,6 +43,7 @@ rustflags = [
 [target.aarch64-unknown-none-softfloat]
 rustflags = [
     "-C", "relocation-model=static",
+    "-C", "code-model=large",
     "-C", "link-arg=-Tbuild/linker/aarch64.ld",
     "-C", "link-arg=--gc-sections",
 ]
