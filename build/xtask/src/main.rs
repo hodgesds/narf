@@ -94,14 +94,17 @@ impl Arch {
                 "-device".into(),  "isa-debug-exit,iobase=0xf4,iosize=0x04".into(),
                 "-kernel".into(),  kernel,
             ],
-            // aarch64 virt machine — Limine / U-Boot / EFI handoff wires in at boot/.
+            // aarch64 virt machine. `-semihosting` enables the SYS_EXIT
+            // path that `narf_arch::exit_kernel` uses to signal pass/fail
+            // to the host; without it, exit_kernel falls back to WFI.
             Arch::Aarch64 => vec![
                 "-machine".into(),  "virt".into(),
                 "-cpu".into(),      "max".into(),
                 "-m".into(),        "256M".into(),
                 "-serial".into(),   "stdio".into(),
                 "-display".into(),  "none".into(),
-                "-no-reboot".into(), "-no-shutdown".into(),
+                "-no-reboot".into(),
+                "-semihosting".into(),
                 "-kernel".into(),   kernel,
             ],
         }

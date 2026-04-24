@@ -27,17 +27,29 @@ static mut MEMORY_MAP_LEN: usize = 0;
 static CMDLINE: &str = "";
 
 /// Parse a U-Boot-style handoff. Wave 1 trusts QEMU `virt` defaults — the
-/// full FDT walker lands with `memory/` at Wave 2.
+/// full FDT walker lands with `memory/` at a later wave.
+///
+/// Tolerates a null or bogus DTB pointer: when QEMU's `-kernel` path
+/// doesn't populate X0 with an FDT address (observed on ELF inputs
+/// without an explicit `-dtb`), we synthesise a plausible memory
+/// map from the standard QEMU `virt` layout instead of faulting.
+/// Real FDT parsing becomes load-bearing only when Stage 3 needs the
+/// device tree for peripherals.
 ///
 /// # Safety
-/// `raw.payload` must point at a valid DTB; we only read the magic from it.
+/// `raw.payload` may be null; we check before dereferencing.
 pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
-    // SAFETY: caller supplied a DTB pointer; reading the first 4 bytes is
-    // the minimum validation we can do without a full FDT parser.
-    let magic_ptr = raw.payload.raw() as *const u32;
-    let magic = unsafe { magic_ptr.read_unaligned() }.to_be();
-    if magic != DTB_MAGIC_BE {
-        return Err(BootError::BadDtbMagic);
+    // Validate DTB magic only if the bootloader gave us a non-null
+    // pointer. Null → treat as "no DTB, use defaults."
+    if raw.payload.raw() != 0 {
+        // SAFETY: non-null pointer into identity-mapped RAM; read of
+        // 4 unaligned bytes is defined on aarch64.
+        let magic_ptr = raw.payload.raw() as *const u32;
+        let magic = unsafe { magic_ptr.read_unaligned() }.to_be();
+        if magic != DTB_MAGIC_BE {
+            // Non-null but bad magic — really wrong, bail.
+            return Err(BootError::BadDtbMagic);
+        }
     }
 
     // Wave-1 placeholder: a single 128-MiB usable region starting at the

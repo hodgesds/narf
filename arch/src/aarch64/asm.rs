@@ -41,11 +41,16 @@ pub fn halt_forever() -> ! {
     }
 }
 
-/// Wait for an interrupt (WFI). On aarch64 WFI wakes on an IRQ even
-/// if DAIF.I is masked (though the IRQ won't actually be taken until
-/// unmasked). Matches x86_64's `halt_until_irq` surface.
+/// Wait for an interrupt.
+///
+/// Falls back to `spin_loop` on aarch64 today because the GICv3 +
+/// generic-timer IRQ sources aren't wired yet — WFI without an IRQ
+/// source wedges indefinitely. Once the aarch64 IRQ stack lands
+/// (Stage 2 aarch64 polish), this becomes a real WFI.
 #[inline(always)]
 pub fn halt_until_irq() {
-    // SAFETY: WFI is always safe.
-    unsafe { wfi_once(); }
+    // TODO(aarch64): replace with `wfi_once()` once generic-timer
+    // IRQs via GICv3 are live. Today no IRQ source fires, so WFI
+    // would hang.
+    core::hint::spin_loop();
 }

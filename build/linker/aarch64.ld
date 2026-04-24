@@ -9,13 +9,13 @@
 
 ENTRY(_start)
 
-/* QEMU's aarch64 `virt` machine puts RAM at 0x4000_0000. Kernel convention
- * on NARF: kernel at 0x4008_0000 (512 KiB above base, matching the Linux
- * Image convention on virt). High-half mapping is established by the early
- * MMU bring-up in `memory/` once `console::remap_to_virtual` hands off.
+/* QEMU's aarch64 `virt` machine puts RAM at 0x4000_0000. Kernel loads at
+ * 0x4008_0000 (matching the Linux Image convention on virt). Stage 2
+ * runs low-half identity: VMA == LMA == 0x4008_0000. Higher-half
+ * relocation at 0xFFFF_8000_4008_0000 (conventional aarch64 kernel
+ * space) lands with the aarch64 MMU bring-up in `memory::mmu`.
  */
-KERNEL_PHYS_BASE = 0x40080000;
-KERNEL_VIRT_BASE = 0xFFFF800000000000;   /* kernel half on 48-bit VA */
+KERNEL_LOAD_BASE = 0x40080000;
 
 PHDRS
 {
@@ -27,10 +27,7 @@ PHDRS
 
 SECTIONS
 {
-    /* Initial PC is physical (EL1 entry from U-Boot / EFI stub);
-     * the `.boot` stub runs at KERNEL_PHYS_BASE before MMU enable.
-     */
-    . = KERNEL_VIRT_BASE + KERNEL_PHYS_BASE;
+    . = KERNEL_LOAD_BASE;
 
     __kernel_start = .;
 

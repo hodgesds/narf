@@ -12,7 +12,17 @@ asks for. Updated when observable kernel behaviour changes.
 | 3. Flow          | Narf-Ring + capabilities + first VirtIO | not started |
 | 4. Compatibility | relibc integration; run standard Rust bins | not started |
 
-## Working today (on x86_64 / QEMU)
+## Working today (both arches on QEMU)
+
+- `cargo xtask run --arch=x86_64` boots, runs the full async demo,
+  delivers hardware LAPIC-timer IRQs, exits cleanly.
+- `cargo xtask run --arch=aarch64` boots, runs the full async demo
+  using CNTPCT_EL0 as the clock, exits via ARM semihosting.
+- `cargo xtask test --arch=x86_64` passes **20/20** kernel tests.
+- `cargo xtask test --arch=aarch64` passes **10/10** arch-neutral
+  kernel tests (the 10 x86_64-specific ones correctly cfg-out).
+
+Representative x86_64 boot transcript:
 
 ```
 $ cargo xtask run --arch=x86_64
@@ -250,6 +260,7 @@ cargo test -p narf-lib
 | NX enable     | IA32_EFER.NXE + NO_EXEC enforcement test                    |
 | Domain switch | enter_domain/exit_domain API + cross-domain denial test     |
 | Domain trait  | DomainPrimitive trait; Pks impl live, Mte stub for aarch64  |
+| aarch64 boot  | `virt` machine boots; full async demo runs on aarch64 too   |
 
 ## Pickup hint for the next session
 
@@ -273,9 +284,10 @@ The critical-path Stage-2 items remaining:
    a page NX and probes a jump-to-that-page).
 
 4. **aarch64 MTE mirror**. SCTLR_EL1.TCF / tag storage /
-   symmetric DomainPrimitive impl. Can't run-test without
-   qemu-system-aarch64 installed, but code-compiles and
-   matches the x86_64 structure.
+   replace the `Mte` stub in `arch::aarch64::mte` with a live
+   impl. Running end-to-end works now (qemu-system-aarch64 is
+   available on the dev host), and `smoke_domain_primitive_trait`
+   will exercise the new path once the stub becomes real.
 
 5. **`DomainPrimitive` trait extraction**. Once 4 lands, pull the
    shared shape out of `arch::x86_64::pks` and `arch::aarch64::mte`

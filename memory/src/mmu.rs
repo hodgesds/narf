@@ -42,58 +42,81 @@ impl From<FrameAllocError> for MmuError {
     }
 }
 
-/// Build a fresh identity-mapped PML4 covering the first 4 GiB with
-/// 1-GiB huge pages and swap CR3 to it. Returns the physical address
-/// of the new PML4.
+/// PML4 index of the higher-half kernel base (-2 GiB). Virtual address
+/// `0xFFFF_FFFF_8000_0000` decomposes as PML4=511, PDPT=510.
+pub const HIGHER_HALF_PML4_INDEX: usize = 511;
+/// PDPT index of the higher-half kernel base (-2 GiB).
+pub const HIGHER_HALF_PDPT_INDEX: usize = 510;
+
+/// Build a fresh PML4 with:
+///   * PML4[0] → PDPT covering the first 4 GiB identity-mapped via
+///     four 1-GiB huge pages. Keeps low-half addresses live for
+///     Stage-2-era kernel code that's still linked at low physical.
+///   * PML4[511] → a second PDPT with a 1-GiB huge page at PDPT[510]
+///     mapping `0xFFFF_FFFF_8000_0000..0xFFFF_FFFF_C000_0000` to
+///     physical `0x0..0x4000_0000`. This is the higher-half window a
+///     future linker script will place `.text/.rodata/.data/.bss`
+///     into — the same physical pages become reachable at both low
+///     and high virtual addresses.
+///
+/// Returns the physical address of the new PML4.
 ///
 /// This function is the *memory/* half of the `console/` §3.1
 /// handoff protocol; the caller (`frame/main.rs`) is responsible for
 /// the `mmu: handoff...` print immediately before and the
-/// `console::remap_to_virtual(...)` call immediately after — memory/
-/// can't depend on narf-console without introducing a crate cycle
-/// (narf-console → narf-memory already).
+/// `console::remap_to_virtual(...)` call immediately after.
 ///
 /// # Safety
 /// - Must be called once, on the BSP, with interrupts disabled and no
 ///   concurrent MMU activity.
 /// - `memory::init_from_map` must have populated the frame allocator.
 /// - Every address range the kernel will access after this call must
-///   be covered by the identity map being built (low 4 GiB is fine for
-///   Stage 1; Wave 2 higher-half map adds kernel-virtual coverage).
+///   be covered by the identity map being built (currently the low
+///   4 GiB + the high-half -2 GiB window).
 pub unsafe fn init_mmu() -> Result<PhysAddr, MmuError> {
-    // Step 1: allocate and zero a PML4 + PDPT.
-    let pml4_frame = alloc_frame()?;
-    let pdpt_frame = alloc_frame()?;
-    let pml4_addr  = pml4_frame.start_address();
-    let pdpt_addr  = pdpt_frame.start_address();
+    // Step 1: allocate and zero a PML4 + PDPT (for low identity) +
+    // another PDPT for the high-half window.
+    let pml4_frame    = alloc_frame()?;
+    let pdpt_lo_frame = alloc_frame()?;
+    let pdpt_hi_frame = alloc_frame()?;
+    let pml4_addr     = pml4_frame.start_address();
+    let pdpt_lo_addr  = pdpt_lo_frame.start_address();
+    let pdpt_hi_addr  = pdpt_hi_frame.start_address();
 
     // These frames came from the allocator and are identity-mapped in
     // the boot.S page tables (the low 1 GiB huge page covers them),
     // so the raw pointer is valid for a 4 KiB write.
     PageTable::zero_at(pml4_addr.as_mut_ptr::<PageTable>());
-    PageTable::zero_at(pdpt_addr.as_mut_ptr::<PageTable>());
+    PageTable::zero_at(pdpt_lo_addr.as_mut_ptr::<PageTable>());
+    PageTable::zero_at(pdpt_hi_addr.as_mut_ptr::<PageTable>());
 
     // Step 2: populate.
-    //
-    // PML4[0] → PDPT (P | RW)
-    // PDPT[0..=3] = identity 1-GiB huge pages at phys 0, 1 GiB, 2 GiB, 3 GiB.
-    //   Covers the first 4 GiB of physical address space — plenty for
-    //   Stage 1's kernel-in-low-4-GiB layout. 4 × 1-GiB huge pages is
-    //   4 entries, each setting HUGE_PAGE | WRITABLE | PRESENT.
     let flags_ptr = PtFlags::PRESENT | PtFlags::WRITABLE;
     let flags_1gb = PtFlags::PRESENT | PtFlags::WRITABLE | PtFlags::HUGE_PAGE;
     // SAFETY: the PML4/PDPT storage is identity-mapped (low 1 GiB of
     // boot.S's table), so writes go to the intended physical memory.
     unsafe {
-        let pml4_entry = PageTableEntry::new(pdpt_addr, flags_ptr);
-        write_identity::<PageTableEntry>(pml4_addr, pml4_entry);
-
+        // Low-identity PML4 + PDPT (first 4 GiB).
+        let pml4_lo_entry = PageTableEntry::new(pdpt_lo_addr, flags_ptr);
+        write_identity::<PageTableEntry>(pml4_addr, pml4_lo_entry);
         for gib in 0u64..=3 {
             let phys  = PhysAddr::new(gib << 30);
             let entry = PageTableEntry::new(phys, flags_1gb);
-            let slot  = PhysAddr::new(pdpt_addr.raw() + gib * 8);
+            let slot  = PhysAddr::new(pdpt_lo_addr.raw() + gib * 8);
             write_identity::<PageTableEntry>(slot, entry);
         }
+
+        // High-half PML4[511] + PDPT[510] → phys 0 (1 GiB huge page).
+        // Virtual 0xFFFF_FFFF_8000_0000 + x maps to physical 0 + x.
+        let pml4_hi_entry = PageTableEntry::new(pdpt_hi_addr, flags_ptr);
+        let pml4_hi_slot  = PhysAddr::new(
+            pml4_addr.raw() + (HIGHER_HALF_PML4_INDEX as u64) * 8);
+        write_identity::<PageTableEntry>(pml4_hi_slot, pml4_hi_entry);
+
+        let hh_entry = PageTableEntry::new(PhysAddr::new(0), flags_1gb);
+        let hh_slot  = PhysAddr::new(
+            pdpt_hi_addr.raw() + (HIGHER_HALF_PDPT_INDEX as u64) * 8);
+        write_identity::<PageTableEntry>(hh_slot, hh_entry);
     }
 
     // Step 3 from console/ §3.1: *caller* prints the handoff line
