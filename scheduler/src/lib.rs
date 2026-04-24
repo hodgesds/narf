@@ -12,17 +12,33 @@
 //! (today's `SleepUntil`, `yield_now`) still idle the CPU between
 //! rounds until a hardware tick resumes us.
 //!
-//! Non-goals still:
-//! - Direct context transfer (Stage 3).
-//! - Work stealing / multi-CPU (Stage 3).
-//! - PKRS save/restore at yield points (Stage 3).
-//! - CPU budgets / affinities (Stage 3).
+//! Stage 3 adds CPU budgets, affinity types, and the scaffolding for
+//! direct context transfer. Single-CPU reality keeps the work-stealing
+//! and SMP pieces structural; what the executor *does* act on:
+//! - `TaskSpec { affinity, budget, budget_cap }` on every spawn.
+//! - A live `Cap<CpuBudget, Spend>`, when attached, is
+//!   `check_live`-gated on every poll — revoke → task dropped next
+//!   round.
+//! - Per-task `BudgetAccount` accumulates measured poll cycles and
+//!   ticks `overruns` when a poll blows the burst allowance.
+//!
+//! Non-goals still (Stage 4):
+//! - Direct context transfer / time-slice donation fast path.
+//! - Work stealing / multi-CPU run queues.
+//! - PKRS save/restore at yield points.
+//! - Fair-share enforcement (today's budget accounting is diagnostic).
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(missing_debug_implementations)]
 
 extern crate alloc;
+
+pub mod affinity;
+pub mod budget;
+
+pub use affinity::{Affinity, CpuId, CpuSet};
+pub use budget::{BudgetAccount, CpuBudget, OverrunPolicy, ResourceBudget};
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -32,7 +48,9 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
+use narf_capabilities::{Cap, Spend};
 use narf_lib::sync::IrqSafeSpinLock;
+use narf_time::Instant;
 
 /// A pinned boxed future representing one kernel task.
 type Task = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -52,13 +70,56 @@ struct TaskSlot {
     // returns `Pending` and nothing has re-set it, the slot is skipped
     // on subsequent rounds until a waker flips it back to `true`.
     awake: Arc<AtomicBool>,
+    /// Stage-3 §3.3/§3.4 per-task metadata: affinity, CPU budget, the
+    /// `Cap<CpuBudget, Spend>` that gates scheduling, and the running
+    /// `BudgetAccount`.
+    spec:    TaskSpec,
+    account: BudgetAccount,
 }
 
 impl core::fmt::Debug for TaskSlot {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("TaskSlot")
-            .field("awake", &self.awake.load(Ordering::Relaxed))
+            .field("awake",   &self.awake.load(Ordering::Relaxed))
+            .field("spec",    &self.spec)
+            .field("account", &self.account)
             .finish_non_exhaustive()
+    }
+}
+
+/// Per-task scheduling metadata — spec §3.3 + §3.4.
+///
+/// A `TaskSpec` with `budget_cap = None` behaves like a Stage-2 task:
+/// always runnable, no accounting. Attaching a live
+/// `Cap<CpuBudget, Spend>` makes the executor `check_live`-gate every
+/// poll; revoking the cap takes the task off the scheduler in O(1) on
+/// the next round.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct TaskSpec {
+    pub affinity:   Affinity,
+    pub budget:     ResourceBudget,
+    pub budget_cap: Option<Cap<CpuBudget, Spend>>,
+}
+
+impl TaskSpec {
+    /// Default: any CPU, unthrottled, no cap gate. Matches the
+    /// Stage-2 `spawn` behaviour byte-for-byte in the executor.
+    pub const fn unthrottled() -> Self {
+        Self {
+            affinity:   Affinity::any(),
+            budget:     ResourceBudget::unthrottled(),
+            budget_cap: None,
+        }
+    }
+
+    /// Budgeted spec: charge every poll against `budget`, and
+    /// `check_live` the cap each round.
+    pub const fn budgeted(budget: ResourceBudget, cap: Cap<CpuBudget, Spend>) -> Self {
+        Self {
+            affinity:   Affinity::any(),
+            budget,
+            budget_cap: Some(cap),
+        }
     }
 }
 
@@ -72,12 +133,34 @@ pub fn init() {
 
 /// Queue a new task on the ready queue. Requires `init()` to have run.
 pub fn spawn<F: Future<Output = ()> + Send + 'static>(f: F) {
+    spawn_with_spec(f, TaskSpec::unthrottled());
+}
+
+/// Queue a new task with a Stage-3 `TaskSpec` attached. A `None`
+/// `budget_cap` makes the task always-runnable; a live cap is
+/// epoch-checked on every round and the task drops when the cap is
+/// revoked.
+pub fn spawn_with_spec<F>(f: F, spec: TaskSpec)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     let slot = TaskSlot {
-        task:  Box::pin(f),
-        awake: Arc::new(AtomicBool::new(true)),
+        task:    Box::pin(f),
+        awake:   Arc::new(AtomicBool::new(true)),
+        spec,
+        account: BudgetAccount::new(),
     };
     let mut q = READY.lock();
     q.as_mut().expect("scheduler::spawn before init").push_back(slot);
+}
+
+/// Shorthand: spawn a task with a budget cap + the default everywhere-
+/// affinity.
+pub fn spawn_budgeted<F>(f: F, budget: ResourceBudget, cap: Cap<CpuBudget, Spend>)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    spawn_with_spec(f, TaskSpec::budgeted(budget, cap));
 }
 
 // ── Waker plumbing ──────────────────────────────────────────────────
@@ -170,6 +253,15 @@ pub fn run_until_empty() {
                 }
             };
 
+            // Budget cap check — a revoked Cap<CpuBudget, Spend>
+            // drops the task O(1). No cap attached → skip the check.
+            if let Some(ref cap) = slot.spec.budget_cap {
+                if cap.check_live().is_err() {
+                    // Task is off the scheduler: drop the slot.
+                    continue;
+                }
+            }
+
             // Skip if no waker has fired since the last poll. The slot
             // stays in the queue, waiting for an external signal.
             if !slot.awake.swap(false, Ordering::Acquire) {
@@ -180,7 +272,10 @@ pub fn run_until_empty() {
 
             let waker = make_waker(slot.awake.clone());
             let mut ctx = Context::from_waker(&waker);
+            let start = Instant::now();
             let poll_result = slot.task.as_mut().poll(&mut ctx);
+            let elapsed = Instant::now().cycles_since(start);
+            slot.account.charge(elapsed, &slot.spec.budget);
 
             // Announce a QSBR quiescent state: the task has yielded
             // back to the executor and holds no RCU read-guards across

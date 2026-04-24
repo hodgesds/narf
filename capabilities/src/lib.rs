@@ -42,13 +42,22 @@ pub struct Write;
 #[derive(Copy, Clone, Debug)]
 pub struct Grant;
 
+/// Spend: authority to charge against a consumable quota (e.g. CPU
+/// budget, DMA-buffer allowance). Distinct from Write so the scheduler
+/// can tell "may debit" apart from "may mutate the budget policy
+/// itself". `scheduler/` spec §3.4 names `Cap<CpuBudget, Spend>`.
+#[derive(Copy, Clone, Debug)]
+pub struct Spend;
+
 impl Sealed for Read  {}
 impl Sealed for Write {}
 impl Sealed for Grant {}
+impl Sealed for Spend {}
 
-impl Rights for Read  { const BITS: u32 = 0b001; }
-impl Rights for Write { const BITS: u32 = 0b010; }
-impl Rights for Grant { const BITS: u32 = 0b100; }
+impl Rights for Read  { const BITS: u32 = 0b0001; }
+impl Rights for Write { const BITS: u32 = 0b0010; }
+impl Rights for Grant { const BITS: u32 = 0b0100; }
+impl Rights for Spend { const BITS: u32 = 0b1000; }
 
 /// Authority to derive R2 from R.
 pub trait SubsetOf<R: Rights>: Rights {}
@@ -56,6 +65,7 @@ pub trait SubsetOf<R: Rights>: Rights {}
 impl<R: Rights> SubsetOf<R> for R {}
 impl SubsetOf<Grant> for Read  {}
 impl SubsetOf<Grant> for Write {}
+impl SubsetOf<Grant> for Spend {}
 
 // ── CapSlot ─────────────────────────────────────────────────────────
 

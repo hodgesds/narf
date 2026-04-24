@@ -4066,3 +4066,120 @@ fn smoke_obs_core_dump_bundles_snapshot() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_obs_core_dump_bundles_snapshot);
+
+fn smoke_scheduler_budget_cap_revokes_task() -> TestResult {
+    // A Cap<CpuBudget, Spend>-attached task runs while the cap is live,
+    // and is dropped by the scheduler once the cap is revoked.
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::task::{Context, Poll};
+    use narf_capabilities::Cap;
+    use narf_scheduler::{CpuBudget, ResourceBudget, TaskSpec};
+
+    static RUNS: AtomicUsize = AtomicUsize::new(0);
+
+    struct Alive;
+    impl Future for Alive {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            RUNS.fetch_add(1, Ordering::Relaxed);
+            // Always ask to be re-polled — would run forever if the
+            // scheduler never dropped the task.
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+
+    RUNS.store(0, Ordering::Relaxed);
+    narf_scheduler::init();
+
+    let cap: Cap<CpuBudget, narf_capabilities::Spend> = Cap::bootstrap();
+    // Spawn a second task that revokes the budget cap after a few
+    // yields so the scheduler has a clear "alive, then dead" window.
+    let revoke_cap = cap;
+    narf_scheduler::spawn_with_spec(
+        Alive,
+        TaskSpec::budgeted(ResourceBudget::unthrottled(), cap),
+    );
+    narf_scheduler::spawn(async move {
+        for _ in 0..4 { narf_scheduler::yield_now().await; }
+        revoke_cap.revoke();
+    });
+
+    narf_scheduler::run_until_empty();
+
+    let n = RUNS.load(Ordering::Relaxed);
+    if n == 0 {
+        return TestResult::Fail("budgeted task never polled while cap was live");
+    }
+    // After revoke the task must drop, not spin forever — if we got
+    // here at all the scheduler terminated, which is the assertion.
+    TestResult::Pass
+}
+kernel_test!(smoke_scheduler_budget_cap_revokes_task);
+
+fn smoke_scheduler_budget_accounts_cycles() -> TestResult {
+    // The executor charges measured cycles into the task's
+    // `BudgetAccount` via `ResourceBudget` — single-shot task, so we
+    // can't observe the account post-drop, but we can verify the
+    // types compose and TaskSpec construction doesn't require a cap.
+    use narf_scheduler::{BudgetAccount, OverrunPolicy, ResourceBudget, TaskSpec};
+
+    let unthrottled = TaskSpec::unthrottled();
+    if unthrottled.budget_cap.is_some() {
+        return TestResult::Fail("unthrottled TaskSpec should not carry a budget cap");
+    }
+    if unthrottled.budget.policy != OverrunPolicy::Ignore {
+        return TestResult::Fail("unthrottled budget must default to Ignore policy");
+    }
+
+    let mut acct = BudgetAccount::new();
+    let budget   = ResourceBudget::fair_share(100_000, 1_000);
+    let over     = acct.charge(2_000, &budget);
+    if !over {
+        return TestResult::Fail("charge exceeding burst_cycles should report over-budget");
+    }
+    if acct.overruns != 1 || acct.polls != 1 || acct.cycles_spent != 2_000 {
+        return TestResult::Fail("BudgetAccount did not accumulate correctly");
+    }
+    let under = acct.charge(500, &budget);
+    if under {
+        return TestResult::Fail("500 cycles inside burst should not report over-budget");
+    }
+    if acct.overruns != 1 || acct.polls != 2 || acct.cycles_spent != 2_500 {
+        return TestResult::Fail("BudgetAccount running totals drifted");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_scheduler_budget_accounts_cycles);
+
+fn smoke_scheduler_cpu_set_membership() -> TestResult {
+    use narf_scheduler::{Affinity, CpuId, CpuSet};
+
+    let all = CpuSet::ALL;
+    if !all.contains(CpuId::BOOT) {
+        return TestResult::Fail("CpuSet::ALL should contain the boot CPU");
+    }
+    let empty = CpuSet::EMPTY;
+    if empty.contains(CpuId::BOOT) {
+        return TestResult::Fail("CpuSet::EMPTY should not contain any CPU");
+    }
+    let single = CpuSet::single(CpuId(3));
+    if !single.contains(CpuId(3)) || single.contains(CpuId(0)) {
+        return TestResult::Fail("CpuSet::single membership incorrect");
+    }
+    if single.len() != 1 {
+        return TestResult::Fail("single-CPU set should have len 1");
+    }
+
+    let pinned = Affinity::pinned(CpuId(0));
+    if pinned.preferred != Some(CpuId(0)) {
+        return TestResult::Fail("pinned affinity should prefer the pinned CPU");
+    }
+    if !pinned.allowed.contains(CpuId(0)) {
+        return TestResult::Fail("pinned affinity should allow the pinned CPU");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_scheduler_cpu_set_membership);

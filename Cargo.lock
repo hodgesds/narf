@@ -578,8 +578,10 @@ name = "narf-scheduler"
 version = "0.0.0"
 dependencies = [
  "narf-arch",
+ "narf-capabilities",
  "narf-lib",
  "narf-rcu",
+ "narf-time",
 ]
 
 [[package]]
