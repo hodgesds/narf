@@ -7,9 +7,11 @@
 //! every CPU to pass a quiescent point.
 //!
 //! Non-goals for this wave:
-//! - Hazard-pointer variant — API surface only, `unimplemented!()`.
 //! - Per-domain reclamation-worker Future — depends on scheduler domain
 //!   changes; stubbed, flagged to the main agent.
+//! - Scheduled (timer-driven) hazard-pointer reclamation pass — Stage-4.
+//!   Today the only triggers are the inline-on-threshold scan and
+//!   explicit `HazardDomain::scan()`; see `hazard.rs` module docs.
 //! - Direct integration with `scheduler::run_until_empty` — the hook
 //!   `rcu::report_quiescent()` is exported so the scheduler can call it
 //!   at each poll boundary (spec §3.7); Stage 3 wires it inside
@@ -21,6 +23,13 @@
 //! scope reader budget. The QSBR types here are unchanged; the
 //! sleepable variant is a parallel surface that lives in its own
 //! module.
+//!
+//! Stage-3 round-4 added the **hazard-pointer** variant (`hazard`
+//! module, spec §3.6): per-CPU `HazardSlot` array, retire-list with a
+//! threshold-driven inline scan + explicit `HazardDomain::scan()`,
+//! `HazardGuard<'_, T>` RAII for the load-publish-verify discipline.
+//! The retire-list scan threshold is the Stage-3 budget knob; a
+//! periodic scheduled pass is Stage-4.
 //!
 //! # Reader discipline
 //!
@@ -37,10 +46,12 @@
 extern crate alloc;
 
 pub mod epoch;
+pub mod hazard;
 pub mod policy;
 pub mod qsbr;
 pub mod sleepable;
 
+pub use hazard::{HazardDomain, HazardGuard, HazardSlot, retire};
 pub use policy::ReclamationPolicy;
 pub use sleepable::{
     SleepableGuard, SleepableReader, SleepableScope, SleepableSync, SyncOutcome,
@@ -284,8 +295,4 @@ pub fn sync_async() -> impl core::future::Future<Output = ()> {
     qsbr::SyncFuture::new()
 }
 
-// ── Hazard stub ─────────────────────────────────────────────────────
-
-/// Hazard-pointer reader slot. Stub for Stage-3; see spec §3.6.
-#[derive(Debug)]
-pub struct HazardSlot { _private: () }
+// Hazard-pointer types live in `hazard.rs` and are re-exported above.

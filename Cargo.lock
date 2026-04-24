@@ -594,6 +594,8 @@ dependencies = [
 name = "narf-tracing"
 version = "0.0.0"
 dependencies = [
+ "narf-arch",
+ "narf-capabilities",
  "narf-lib",
 ]
 
