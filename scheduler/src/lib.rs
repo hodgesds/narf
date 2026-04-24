@@ -96,6 +96,20 @@ impl CapType for Task {
 
 static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Id of the task currently being polled by the executor, or
+/// `TaskId::NONE` when the executor is between polls. Syscall
+/// handlers read this to identify the caller; SMP bring-up will
+/// migrate to a per-CPU slot read via `gs:[offset]`.
+static CURRENT_TASK: AtomicU64 = AtomicU64::new(0);
+
+/// Read the currently-polling task's id. Returns `TaskId::NONE`
+/// when called outside any `poll` context (e.g. from boot or
+/// between rounds).
+#[inline]
+pub fn current_task_id() -> TaskId {
+    TaskId(CURRENT_TASK.load(Ordering::Acquire))
+}
+
 struct TaskSlot {
     task: BoxedTask,
     // Per-task "needs-repoll" flag set by the waker. The slot owns one
@@ -434,7 +448,14 @@ pub fn run_until_empty() {
             let waker = make_waker(slot.awake.clone());
             let mut ctx = Context::from_waker(&waker);
             let start = Instant::now();
+            // Publish this slot's id as the currently-polling task
+            // so syscall handlers + introspection can identify the
+            // caller. Cleared after the poll so async code that
+            // defers via `.await` doesn't leak the id across yield
+            // points (the next round's task will re-publish).
+            CURRENT_TASK.store(slot.id.raw(), Ordering::Release);
             let poll_result = slot.task.as_mut().poll(&mut ctx);
+            CURRENT_TASK.store(0, Ordering::Release);
             let elapsed = Instant::now().cycles_since(start);
             slot.account.charge(elapsed, &slot.spec.budget);
 

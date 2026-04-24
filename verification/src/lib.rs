@@ -4563,6 +4563,36 @@ fn smoke_scheduler_donate_to_reorders_head() -> TestResult {
 }
 kernel_test!(smoke_scheduler_donate_to_reorders_head);
 
+fn smoke_scheduler_current_task_id_during_poll() -> TestResult {
+    // Before any spawn, current_task_id() is TaskId::NONE. Inside
+    // a poll it matches the polling slot's id. Between rounds it
+    // reverts to NONE.
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_scheduler::{current_task_id, TaskId};
+
+    if current_task_id() != TaskId::NONE {
+        return TestResult::Fail("current_task_id leaked across tests");
+    }
+
+    narf_scheduler::init();
+    static OBSERVED: AtomicU64 = AtomicU64::new(u64::MAX);
+    OBSERVED.store(u64::MAX, Ordering::Relaxed);
+
+    let tid = narf_scheduler::spawn(async {
+        OBSERVED.store(current_task_id().raw(), Ordering::Relaxed);
+    });
+    narf_scheduler::run_until_empty();
+
+    if OBSERVED.load(Ordering::Relaxed) != tid.raw() {
+        return TestResult::Fail("task did not see its own id via current_task_id");
+    }
+    if current_task_id() != TaskId::NONE {
+        return TestResult::Fail("current_task_id not cleared after run_until_empty");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_scheduler_current_task_id_during_poll);
+
 fn smoke_scheduler_donate_to_rejects_revoked_cap() -> TestResult {
     use narf_capabilities::{Cap, Invoke};
     use narf_scheduler::{donate_to, DonateError, Task, TaskId};
