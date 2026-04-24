@@ -43,10 +43,15 @@ rustflags = [
 
 # ─── aarch64 kernel target ─────────────────────────────────────────
 # MTE and pointer-auth flags are Stage 2+ and gated similarly.
+# +lse enables ARMv8.1 Large System Extensions (CASP, LDADD, …) —
+# required for the 128-bit cap-slot compare-and-swap in arch/asm.rs.
+# QEMU `-cpu max` exposes v8.6+, and every server-class arm64 CPU
+# since Cortex-A75 / Neoverse has LSE. Stage-1/2 don't need it.
 [target.aarch64-unknown-none]
 rustflags = [
     "-C", "relocation-model=static",
     "-C", "code-model=large",
+    "-C", "target-feature=+lse",
     "-C", "link-arg=-Tbuild/linker/aarch64.ld",
     "-C", "link-arg=--gc-sections",
 ]

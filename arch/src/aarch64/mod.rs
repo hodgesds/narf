@@ -6,7 +6,7 @@ pub mod mmio;
 pub mod mte;
 pub mod sysreg;
 
-pub use asm::{halt_forever, disable_interrupts, enable_interrupts};
+pub use asm::{halt_forever, disable_interrupts, enable_interrupts, cas128};
 pub use cpuid::Features;
 pub use mte::Mte;
 

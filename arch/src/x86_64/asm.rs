@@ -81,3 +81,46 @@ pub fn halt_forever() -> ! {
         loop { halt_once(); }
     }
 }
+
+/// 128-bit atomic compare-and-swap via `CMPXCHG16B`.
+///
+/// # Safety
+/// `ptr` must be 16-byte aligned and point to valid, writable memory.
+#[inline(always)]
+pub unsafe fn cas128(ptr: *mut u128, old: u128, new: u128) -> Result<u128, u128> {
+    let old_low  = old as u64;
+    let old_high = (old >> 64) as u64;
+    let new_low  = new as u64;
+    let new_high = (new >> 64) as u64;
+
+    let res_low: u64;
+    let res_high: u64;
+
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: CMPXCHG16B is valid on all NARF-supported x86_64 CPUs
+    // (it's a baseline requirement for Stage 3). ptr alignment is the
+    // caller's responsibility. RBX is LLVM-reserved, so we stash it
+    // manually — and that's why `options(nostack)` is *not* set
+    // (the stash touches the stack).
+    unsafe {
+        asm!(
+            "push rbx",
+            "mov rbx, {new_low}",
+            "lock cmpxchg16b [{ptr}]",
+            "pop rbx",
+            ptr = in(reg) ptr,
+            new_low = in(reg) new_low,
+            inout("rax") old_low => res_low,
+            inout("rdx") old_high => res_high,
+            in("rcx") new_high,
+        );
+    }
+    compiler_fence(Ordering::SeqCst);
+
+    let res = (res_low as u128) | ((res_high as u128) << 64);
+    if res == old {
+        Ok(res)
+    } else {
+        Err(res)
+    }
+}

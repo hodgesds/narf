@@ -108,13 +108,21 @@ pub type Domain = current::Mte;
 #[inline(always)]
 pub fn halt_forever() -> ! { current::halt_forever() }
 
+/// 128-bit atomic compare-and-swap.
+///
+/// # Safety
+/// `ptr` must be 16-byte aligned.
+#[inline(always)]
+pub unsafe fn cas128(ptr: *mut u128, old: u128, new: u128) -> Result<u128, u128> {
+    unsafe { current::cas128(ptr, old, new) }
+}
+
 /// ID of the CPU currently executing this code. Stage-2 single-CPU
 /// returns `0`; Stage-3 AP bring-up replaces the body with a real
 /// read (TPIDR_EL1 on aarch64, MSR GS-based on x86_64).
 #[inline]
 pub fn current_cpu_id() -> narf_lib::id::CpuId {
-    // SAFETY: pure read with no side effects; Stage-2 body is `0`.
-    narf_lib::id::CpuId::new(unsafe { narf_arch_cpu_id() } as u16)
+    narf_lib::id::CpuId::new(narf_arch_cpu_id() as u16)
 }
 
 /// Hook that `narf_lib::percpu` calls to avoid a dep cycle. Stage 2:

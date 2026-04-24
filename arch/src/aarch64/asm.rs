@@ -77,3 +77,50 @@ pub fn halt_until_irq() {
         core::hint::spin_loop();
     }
 }
+
+/// 128-bit atomic compare-and-swap via `CASP`.
+///
+/// # Safety
+/// `ptr` must be 16-byte aligned and point to valid, writable memory.
+/// This implementation requires ARMv8.1-LSE support.
+#[inline(always)]
+pub unsafe fn cas128(ptr: *mut u128, old: u128, new: u128) -> Result<u128, u128> {
+    let old_low  = old as u64;
+    let old_high = (old >> 64) as u64;
+    let new_low  = new as u64;
+    let new_high = (new >> 64) as u64;
+
+    let res_low: u64;
+    let res_high: u64;
+
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: CASP (with acquire-release semantics: CASPAL) is valid
+    // on ARMv8.1+ CPUs. NARF's aarch64 baseline includes LSE.
+    // ptr alignment is the caller's responsibility.
+    // Rust's `asm!` disallows `name = inout("xN")` syntax — when a
+    // register is explicit you reference it by register name directly
+    // in the template. CASP needs specific pairs (x0+x1 for the old
+    // value, x2+x3 for the new) so we bind those by position.
+    // SAFETY: CASP (with acquire-release semantics: CASPAL) is valid
+    // on ARMv8.1+ CPUs. NARF's aarch64 baseline includes LSE.
+    // ptr alignment is the caller's responsibility.
+    unsafe {
+        asm!(
+            "caspal x0, x1, x2, x3, [{ptr}]",
+            inout("x0") old_low  => res_low,
+            inout("x1") old_high => res_high,
+            in("x2")    new_low,
+            in("x3")    new_high,
+            ptr = in(reg) ptr,
+            options(nostack),
+        );
+    }
+    compiler_fence(Ordering::SeqCst);
+
+    let res = (res_low as u128) | ((res_high as u128) << 64);
+    if res == old {
+        Ok(res)
+    } else {
+        Err(res)
+    }
+}
