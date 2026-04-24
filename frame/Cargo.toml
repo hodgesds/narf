@@ -30,6 +30,8 @@ idt-selftest = []
 # Run the narf-verification kernel-test harness instead of the async demo.
 # Used by `cargo xtask test` — exits 0 if all tests pass, non-zero otherwise.
 kernel-test  = ["dep:narf-verification"]
+# Chain into verification's opt-in end-to-end user-mode test.
+user-mode-e2e = ["kernel-test", "narf-verification/user-mode-e2e"]
 
 [lints]
 workspace = true

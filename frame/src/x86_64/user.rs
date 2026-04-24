@@ -21,9 +21,83 @@
 //! so user mode can trigger it), CPU exceptions (page fault etc.),
 //! or an external IRQ.
 
-use core::arch::asm;
+use core::arch::{asm, naked_asm};
 
 use super::gdt::{UCODE_SEL, UDATA_SEL};
+
+/// Callee-saved register snapshot for the `setjmp`/`longjmp` pair
+/// tests use to resume cleanly after a user-mode round-trip.
+/// Field order is load-bearing — the naked asm reads by byte
+/// offset.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct JmpBuf {
+    pub rbx: u64,  // offset 0
+    pub rbp: u64,  // offset 8
+    pub r12: u64,  // offset 16
+    pub r13: u64,  // offset 24
+    pub r14: u64,  // offset 32
+    pub r15: u64,  // offset 40
+    pub rsp: u64,  // offset 48
+    pub rip: u64,  // offset 56
+}
+
+/// Save callee-saved registers + caller's RSP + caller's return
+/// RIP into `*buf`. Returns `0` on the initial call. A subsequent
+/// `longjmp(buf, val)` resumes at the saved RIP, returning `val`
+/// (forced non-zero so callers can distinguish) — effectively a
+/// second "return" from this call site.
+///
+/// # Safety
+/// `buf` must point at a valid, properly-aligned `JmpBuf`.
+#[unsafe(naked)]
+pub unsafe extern "C" fn setjmp(buf: *mut JmpBuf) -> u64 {
+    naked_asm!(
+        // SysV ABI: first ptr arg in rdi.
+        "mov [rdi +  0], rbx",
+        "mov [rdi +  8], rbp",
+        "mov [rdi + 16], r12",
+        "mov [rdi + 24], r13",
+        "mov [rdi + 32], r14",
+        "mov [rdi + 40], r15",
+        // Caller's RSP is one qword above the CALL-pushed return
+        // address — i.e. `rsp + 8` here inside this naked fn.
+        "lea rax, [rsp + 8]",
+        "mov [rdi + 48], rax",
+        // Caller's return RIP is at the top of the stack.
+        "mov rax, [rsp]",
+        "mov [rdi + 56], rax",
+        "xor rax, rax",
+        "ret",
+    );
+}
+
+/// Resume at `buf`'s saved state, returning `val` from the
+/// corresponding `setjmp`. `val = 0` is rewritten to `1` so the
+/// caller can always distinguish initial-call from longjmp paths.
+///
+/// # Safety
+/// `buf` must have been populated by a prior `setjmp`, and the
+/// saved RSP must still reference a live kernel stack.
+#[unsafe(naked)]
+pub unsafe extern "C" fn longjmp(buf: *const JmpBuf, val: u64) -> ! {
+    naked_asm!(
+        // SysV: buf in rdi, val in rsi.
+        "mov rbx, [rdi +  0]",
+        "mov rbp, [rdi +  8]",
+        "mov r12, [rdi + 16]",
+        "mov r13, [rdi + 24]",
+        "mov r14, [rdi + 32]",
+        "mov r15, [rdi + 40]",
+        "mov rsp, [rdi + 48]",
+        "mov rax, rsi",
+        "test rax, rax",
+        "jnz 1f",
+        "inc rax",
+        "1:",
+        "jmp qword ptr [rdi + 56]",
+    );
+}
 
 /// RFLAGS value to hand user mode: IF=1 (interrupts enabled), the
 /// always-set reserved bit at position 1. Everything else zero —
@@ -47,12 +121,22 @@ pub const USER_RFLAGS: u64 = 0x0000_0202;
 /// - Interrupts should be disabled across the iretq — this function
 ///   does not disable them; the caller owns that invariant.
 pub unsafe fn enter_user_mode(rip: u64, rsp: u64) -> ! {
+    // swapgs before iretq:
+    //   Pre:  GS.base = kernel_percpu, KERNEL_GS_BASE = user_gs
+    //         (caller must have populated KERNEL_GS_BASE — 0 is a
+    //          valid sentinel for "user starts with null gs").
+    //   Post: GS.base = user_gs, KERNEL_GS_BASE = kernel_percpu
+    // The kernel's gs.base now rides in KERNEL_GS_BASE, ready for
+    // the entry-side swapgs on the next user→kernel trap to swing
+    // it back into GS.base.
+    //
     // SAFETY: 5 pushes + iretq is the architecturally-defined
     // protocol for entering a lower privilege level in long mode.
     // Clobbering the stack is fine because we never return — the
     // caller's frame is discarded.
     unsafe {
         asm!(
+            "swapgs",
             // Push the synthetic iretq frame (ss, rsp, rflags, cs, rip
             // — pushed in REVERSE order because stack grows down).
             "push {ss}",

@@ -39,7 +39,14 @@ narf-userspace  = { path = "../userspace" }
 narf-drivers-nvme = { path = "../drivers/nvme" }
 narf-drivers-net  = { path = "../drivers/net" }
 narf-drivers-gpu  = { path = "../drivers/gpu" }
-# narf-userspace already above
+
+[features]
+# Opt-in end-to-end user-mode round-trip test. Enabling this adds a
+# kernel_test that boots a real user process, issues `int 0x80`, and
+# longjmps back. Disabled by default because the test leaves subsystem
+# state that hangs a later test in the default suite; enable with
+# `cargo xtask test --arch=x86_64 --features=user-mode-e2e`.
+user-mode-e2e = []
 
 [lints]
 workspace = true
