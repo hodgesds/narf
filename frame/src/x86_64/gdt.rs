@@ -67,6 +67,23 @@ static mut IST_STACKS: [IstStack; 4] = [
     IstStack([0; IST_STACK_BYTES]),
 ];
 
+/// Kernel stack used by `TSS.rsp0`. On a user→kernel trap (CPL=3 →
+/// CPL=0) the CPU reads `TSS.rsp0` and atomically switches to it
+/// before pushing the trap frame. Without this, user-mode traps
+/// would push onto a user-controlled RSP — classic CPL-confusion.
+///
+/// 16 KiB matches the IST slot size; big enough for the trap frame
+/// + one level of Rust call without overflow. Per-task kernel
+/// stacks (once we have multi-process support) will relocate via
+/// `set_kernel_rsp0` when the scheduler switches tasks.
+const KERNEL_RSP0_BYTES: usize = 16 * 1024;
+
+#[repr(C, align(16))]
+struct KernelRsp0Stack([u8; KERNEL_RSP0_BYTES]);
+
+static mut KERNEL_RSP0_STACK: KernelRsp0Stack =
+    KernelRsp0Stack([0; KERNEL_RSP0_BYTES]);
+
 static mut TSS: Tss = Tss {
     _reserved0: 0,
     rsp0: 0, rsp1: 0, rsp2: 0,
@@ -110,6 +127,15 @@ pub unsafe fn init() {
                 .cast::<u64>()
                 .write_unaligned(top);
         }
+    }
+
+    // ── TSS.rsp0 — kernel stack for user→kernel trap entry ──
+    // SAFETY: single-threaded boot, no observer for the static yet.
+    unsafe {
+        let top = core::ptr::addr_of!(KERNEL_RSP0_STACK)
+            .cast::<u8>()
+            .add(KERNEL_RSP0_BYTES) as u64;
+        set_kernel_rsp0(top);
     }
 
     // ── build GDT descriptors ──
@@ -184,4 +210,46 @@ pub unsafe fn init() {
              options(nomem, nostack, preserves_flags));
     }
     compiler_fence(Ordering::SeqCst);
+}
+
+/// Write `top` into `TSS.rsp0`. The scheduler calls this when it
+/// picks a user task so a subsequent user→kernel trap lands on that
+/// task's kernel stack instead of the previous task's.
+///
+/// `top` is the *top* of the stack (highest address + 1); the CPU
+/// uses it directly as the new RSP on trap-from-user-mode.
+///
+/// # Safety
+/// `top` must point at the high end of a writable, 16-byte-aligned
+/// kernel stack with at least enough slack for a trap frame +
+/// Rust-side dispatch frames before the trap returns. 16 KiB is
+/// plenty; per-task stacks smaller than 4 KiB risk overflow.
+pub unsafe fn set_kernel_rsp0(top: u64) {
+    use core::sync::atomic::{compiler_fence, Ordering};
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: single writer (scheduler) + unaligned write is
+    // architecturally fine; the CPU reads rsp0 atomically on trap
+    // entry. Using `write_unaligned` to match the `#[repr(packed)]`
+    // Tss layout.
+    unsafe {
+        core::ptr::addr_of_mut!(TSS).cast::<u8>()
+            .add(4 /* offset of rsp0 */)
+            .cast::<u64>()
+            .write_unaligned(top);
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// Read the currently-installed `TSS.rsp0`. Diagnostic helper —
+/// scheduler tests use it to confirm the setter took effect.
+pub fn kernel_rsp0() -> u64 {
+    // SAFETY: aligned (well, packed) read of a u64; single reader
+    // convention + the atomic-write contract on the setter keep
+    // tearing at bay.
+    unsafe {
+        core::ptr::addr_of!(TSS).cast::<u8>()
+            .add(4)
+            .cast::<u64>()
+            .read_unaligned()
+    }
 }

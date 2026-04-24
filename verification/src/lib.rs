@@ -5506,6 +5506,81 @@ fn smoke_userspace_syscall_table_roundtrip() -> TestResult {
 kernel_test!(smoke_userspace_syscall_table_roundtrip);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_frame_x86_64_tss_rsp0_and_gs_base() -> TestResult {
+    // After `frame::x86_64::init_traps()` runs (part of boot) the
+    // TSS has rsp0 pointing at the static kernel stack, and
+    // IA32_GS_BASE points at the BSP's PerCpu struct so kernel
+    // code can read per-CPU state via `gs:offset`.
+    //
+    // The frame binary doesn't expose these as library symbols, so
+    // we check the system-register state directly: `str` + `ltr`
+    // operate on the task-register selector (TSS_SEL = 0x18), and
+    // MSR reads for IA32_GS_BASE are always legal at CPL=0.
+    use core::arch::asm;
+    use narf_arch::x86_64::msr;
+
+    const IA32_GS_BASE:        u32 = 0xC0000101;
+    const IA32_KERNEL_GS_BASE: u32 = 0xC0000102;
+
+    // Confirm the task register still points at the TSS selector
+    // GDT installed (0x18). A failure here means boot changed
+    // something we shouldn't have.
+    let tr: u16;
+    unsafe {
+        asm!("str {t:x}", t = out(reg) tr, options(nomem, nostack, preserves_flags));
+    }
+    if tr != 0x18 {
+        return TestResult::Fail("task register is not the post-init TSS selector");
+    }
+
+    // IA32_GS_BASE should be non-zero (init_bsp programmed it to
+    // point at BSP_PERCPU).
+    // SAFETY: reading IA32_GS_BASE at CPL=0 is always legal.
+    let gs_base = unsafe { msr::rdmsr(IA32_GS_BASE) };
+    if gs_base == 0 {
+        return TestResult::Fail("IA32_GS_BASE is zero — percpu::init_bsp didn't run");
+    }
+
+    // IA32_KERNEL_GS_BASE starts at zero (no user task running yet);
+    // writing + reading round-trips.
+    // SAFETY: reading this MSR is always legal at CPL=0.
+    let kgs_before = unsafe { msr::rdmsr(IA32_KERNEL_GS_BASE) };
+    if kgs_before != 0 {
+        return TestResult::Fail("IA32_KERNEL_GS_BASE should be zero pre-user-task");
+    }
+    // SAFETY: writing KERNEL_GS_BASE at CPL=0 is documented. We
+    // restore it immediately so other tests see the same initial
+    // state.
+    unsafe {
+        msr::wrmsr(IA32_KERNEL_GS_BASE, 0xDEAD_BEEF_CAFE_F00D);
+    }
+    let kgs_mid = unsafe { msr::rdmsr(IA32_KERNEL_GS_BASE) };
+    if kgs_mid != 0xDEAD_BEEF_CAFE_F00D {
+        unsafe { msr::wrmsr(IA32_KERNEL_GS_BASE, 0); }
+        return TestResult::Fail("IA32_KERNEL_GS_BASE did not round-trip");
+    }
+    unsafe { msr::wrmsr(IA32_KERNEL_GS_BASE, 0); }
+
+    // Read `gs:[8]` — the `kernel_stack_top` slot in PerCpu. It
+    // mirrors TSS.rsp0, so it should be non-zero.
+    let mirrored: u64;
+    unsafe {
+        asm!(
+            "mov {v}, gs:[8]",
+            v = out(reg) mirrored,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    if mirrored == 0 {
+        return TestResult::Fail("percpu.kernel_stack_top mirror is zero");
+    }
+
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_frame_x86_64_tss_rsp0_and_gs_base);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_frame_x86_64_int80_dispatches_through_global() -> TestResult {
     // End-to-end: install a global SyscallTable with a handler for
     // Syscall::Yield, fire `int 0x80` from kernel mode with

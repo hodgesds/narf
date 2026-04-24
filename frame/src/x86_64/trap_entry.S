@@ -100,7 +100,18 @@ common_trap:
     /* At entry: RSP points at [error_code, vector] followed upward by
      * [rip, cs, rflags, rsp, ss] that the CPU pushed.
      *
-     * Push general-purpose registers in the order the Rust TrapFrame
+     * If the trap came from user mode (CS.RPL != 0) we need to
+     * swapgs into the kernel's per-CPU area so any kernel code
+     * that reads `gs:offset` finds kernel data, not user-controlled
+     * state. The CPU-pushed CS is at rsp + 24 (after error + vec +
+     * rip). RPL lives in the low 2 bits of the selector.
+     */
+    test qword ptr [rsp + 24], 0x3
+    jz 1f
+    swapgs
+1:
+
+    /* Push general-purpose registers in the order the Rust TrapFrame
      * struct expects them — last-pushed first in the struct, because
      * `push` grows the stack downward.
      */
@@ -151,6 +162,17 @@ common_trap:
 
     /* Discard the vector + error_code we pushed. */
     add rsp, 16
+
+    /* If we're about to iretq to user mode, swapgs to restore the
+     * user's GS.base — the inverse of the entry-side swapgs.
+     * Rust handlers can rewrite frame.cs, so we re-check against
+     * the CPU-pushed CS at rsp + 8 (after rip, since rip is at
+     * rsp + 0 post add-rsp-16).
+     */
+    test qword ptr [rsp + 8], 0x3
+    jz 2f
+    swapgs
+2:
 
     /* Return from interrupt. Reads the CPU-pushed [rip, cs, rflags,
      * rsp, ss] from the top of the stack — the same 40 bytes the
