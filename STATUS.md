@@ -244,8 +244,14 @@ Remaining Stage 2 items (all additive / out of scope for local test):
   (`repr(transparent)` u32 bit-set), `NarfStatus` (`repr(u32)`,
   8 pinned variants), `Tag(u64)` correlation newtype,
   `SubmissionQueue` / `CompletionQueue` type aliases over
-  `narf-ipc` Producer/Consumer. Cancellation protocol of §3.1
-  deferred to Stage 4 dispatcher work.
+  `narf-ipc` Producer/Consumer. Stage-3 round lands the §3.1
+  cooperative cancellation protocol: `Dispatcher::pending` tracks
+  cancel-pending tags; `OpCode::Cancel` reads `target_tag` from
+  inline[0], records it, and always completes Ok; the target's
+  completion is routed to `Cancelled` (when
+  `SubmissionFlags::CANCELLABLE` is set) or `CancelRequested`
+  (non-cancellable path) on drain. Mid-op cancellation via
+  per-inflight flags remains Stage 4 (needs concurrent dispatch).
 - **`drivers/`**: framework. `Driver` trait (async `start`/`quiesce`
   via `Pin<Box<dyn Future>>` so the registry holds heterogeneous
   drivers), `DriverHandle` cap marker → `CapKind::Driver`,
