@@ -39,6 +39,7 @@ NARF Stage 1 Wave 1 — hello from a bare kernel.
 $ cargo xtask test --arch=x86_64
 ...
 ── kernel_test harness ──────────────────────────
+  [ OK ] smoke_nx_enforces_no_exec      ← NX enforces NO_EXEC
   [ OK ] smoke_timer_irq_fires          ← hardware LAPIC-timer IRQ
   [ OK ] smoke_pks_enforces_deny_all    ← live PKS #PF/PK demo
   [ OK ] smoke_probe_catches_page_fault ← recoverable trap
@@ -112,6 +113,11 @@ $ cargo xtask test --arch=x86_64
   timer IRQ wakes the CPU, a new round runs, progress repeats. On
   the 5-tick demo: 15 timer IRQs delivered vs. the previous busy-
   poll's ~0 IRQs while spinning `Instant::now`.
+- **NX enable**: `IA32_EFER.NXE = 1` at boot (gated on CPUID.NX) so
+  PTE bit 63 (`PtFlags::NO_EXEC`) actually prevents instruction
+  fetch. Regression-guarded by `smoke_nx_enforces_no_exec`: maps a
+  page `WRITABLE | NO_EXEC`, jumps to it, catches the `#PF` with
+  error-code bit 4 (instruction-fetch) set.
 - **MSR / CR helpers** (`arch/x86_64/msr.rs`, `.../cr.rs`): `rdmsr`,
   `wrmsr`, `read_cr4`, `write_cr4`, with the compiler_fence(SeqCst)
   pair per `arch/` §4.
@@ -142,8 +148,6 @@ $ cargo xtask test --arch=x86_64
 - **Higher-half kernel** (-2 GiB linker relocation + `code-model=kernel`).
   Every Stage 2 subsystem expects this layout by convention. Today the
   kernel runs low-half (phys == virt).
-- **NX enable**: `IA32_EFER.NXE = 1` so `PtFlags::NO_EXEC` is honoured.
-  CPUID says NX is present; just not wired yet.
 - **UIPI** (Sapphire Rapids+). Infrastructure now ready (LAPIC live,
   IRQ path proven); UIPI is additive on top.
 - **Proper waker plumbing**: today's scheduler halts between rounds
@@ -231,6 +235,7 @@ cargo test -p narf-lib
 | APIC partial  | `narf-interrupts` + IRQ IDT entries; soft INT 32 works      |
 | APIC full     | 8259 PICs masked; hardware LAPIC timer IRQs live + tested   |
 | IRQ sched     | run_until_empty halts between no-progress rounds            |
+| NX enable     | IA32_EFER.NXE + NO_EXEC enforcement test                    |
 
 ## Pickup hint for the next session
 

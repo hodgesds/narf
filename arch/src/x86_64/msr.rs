@@ -6,6 +6,9 @@ use core::sync::atomic::{compiler_fence, Ordering};
 
 /// MSR index: `IA32_EFER`.
 pub const IA32_EFER: u32 = 0xC000_0080;
+/// `IA32_EFER.NXE` — NX-bit enable. When set, PTE bit 63 becomes the
+/// "no-execute" bit; otherwise it's reserved-zero.
+pub const IA32_EFER_NXE: u64 = 1 << 11;
 /// MSR index: `IA32_PKRS` — protection-key rights for supervisor.
 /// Accessible only when `CR4.PKS = 1`.
 pub const IA32_PKRS: u32 = 0x0000_06E1;

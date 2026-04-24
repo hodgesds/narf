@@ -104,6 +104,22 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 "  pks: unavailable — Stage-2 Barrier domain switch will degrade");
         }
 
+        // NX enable. PTE bit 63 (NO_EXEC) is reserved-zero unless
+        // IA32_EFER.NXE=1. Flipping the bit at boot makes subsequent
+        // `PtFlags::NO_EXEC` mappings actually block execution.
+        if feats.nx {
+            // SAFETY: CPUID confirmed NX support.
+            unsafe {
+                use narf_arch::x86_64::msr::{rdmsr, wrmsr, IA32_EFER, IA32_EFER_NXE};
+                let efer = rdmsr(IA32_EFER);
+                wrmsr(IA32_EFER, efer | IA32_EFER_NXE);
+            }
+            let _ = writeln!(console::Writer,
+                "  nx: enabled (IA32_EFER.NXE=1, PTE NO_EXEC active)");
+        } else {
+            let _ = writeln!(console::Writer, "  nx: unavailable");
+        }
+
         // x2APIC + LAPIC timer. Gated on CPUID.x2APIC; absence leaves
         // the scheduler in its Stage-1 busy-poll mode, which still
         // works, just without timer IRQs.

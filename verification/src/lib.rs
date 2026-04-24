@@ -340,6 +340,83 @@ fn smoke_probe_catches_page_fault() -> TestResult {
 kernel_test!(smoke_probe_catches_page_fault);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_nx_enforces_no_exec() -> TestResult {
+    // Map a page NO_EXEC, attempt to execute from it, verify the
+    // resulting #PF has the instruction-fetch bit (bit 4) set in the
+    // error code. x86_64 #PF error-code bit 4 is defined as "this
+    // fault was caused by an instruction fetch" (SDM Vol 3 §4.7).
+    use core::arch::asm;
+    use narf_arch::x86_64::{probe, Features};
+    use narf_memory::{alloc_frame, FrameAllocError, free_frame, VirtAddr};
+    use narf_memory::paging::{map_4kb, unmap_4kb, read_cr3, PtFlags};
+
+    // SAFETY: CPUID always legal.
+    let feats = unsafe { Features::probe() };
+    if !feats.nx {
+        return TestResult::Skip("NX not exposed");
+    }
+
+    let pml4 = unsafe { read_cr3() };
+    let frame = match alloc_frame() {
+        Ok(f) => f,
+        Err(FrameAllocError::Uninitialised) =>
+            return TestResult::Skip("frame allocator not initialised"),
+        Err(_) => return TestResult::Fail("alloc_frame failed"),
+    };
+    // Same high-but-unmapped virt range as the PKS test (8 GiB+).
+    let virt = VirtAddr::new(0x3_0000_1000);
+    let phys = frame.start_address();
+    let flags = PtFlags::WRITABLE | PtFlags::NO_EXEC;
+
+    // SAFETY: live PML4 modification on the BSP with the test's
+    // chosen virt not overlapping anything else.
+    if unsafe { map_4kb(pml4, virt, phys, flags) }.is_err() {
+        free_frame(frame);
+        return TestResult::Fail("map_4kb NO_EXEC failed");
+    }
+
+    // Arm the probe, jump to the NO_EXEC page, catch the #PF.
+    let recovery: u64;
+    // SAFETY: LEA of a local label.
+    unsafe {
+        asm!(
+            "lea {r}, [77f + rip]",
+            r = out(reg) recovery,
+            options(nostack, preserves_flags),
+        );
+    }
+    probe::arm(recovery);
+
+    // SAFETY: `jmp {ptr}` transfers to the tagged-NX page. The CPU
+    // raises #PF on instruction fetch; our probe redirects to `77:`.
+    unsafe {
+        asm!(
+            "jmp {p}",
+            "77:",
+            p = in(reg) virt.raw(),
+            options(nostack),
+        );
+    }
+
+    let caught = probe::disarm();
+    let _ = unsafe { unmap_4kb(pml4, virt) };
+    free_frame(frame);
+
+    match caught.vector {
+        None     => return TestResult::Fail("NX didn't fault on NO_EXEC jump"),
+        Some(14) => {}
+        Some(_)  => return TestResult::Fail("wrong vector caught (not #PF)"),
+    }
+    // Bit 4 of the #PF error code = instruction-fetch fault.
+    if caught.error_code & (1 << 4) == 0 {
+        return TestResult::Fail("fault caught but IF bit (4) not set — not NX");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_nx_enforces_no_exec);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_pks_enforces_deny_all() -> TestResult {
     // End-to-end PKS enforcement demo:
     //  1. Allocate a fresh 4 KiB frame.
