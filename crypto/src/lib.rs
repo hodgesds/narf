@@ -25,6 +25,9 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(missing_debug_implementations)]
 
+pub mod tpm;
+pub mod pq;
+
 extern crate alloc;
 
 use core::marker::PhantomData;

@@ -4713,6 +4713,48 @@ fn smoke_block_deadline_promotes_expired() -> TestResult {
 }
 kernel_test!(smoke_block_deadline_promotes_expired);
 
+fn smoke_crypto_tpm_command_shapes() -> TestResult {
+    use narf_crypto::tpm::{submit, Tpm2Command, Tpm2Status, TpmAlgHash, TpmCc};
+
+    // Command codes match TCG spec values.
+    if TpmCc::PcrExtend as u32 != 0x0000_0182 {
+        return TestResult::Fail("PcrExtend CC drifted from TCG value");
+    }
+    if TpmCc::GetRandom as u32 != 0x0000_017B {
+        return TestResult::Fail("GetRandom CC drifted from TCG value");
+    }
+    if TpmAlgHash::Sha256 as u16 != 0x000B {
+        return TestResult::Fail("Sha256 alg id drifted from TCG value");
+    }
+
+    // Submit is NotImplemented until the transport lands.
+    let cmd = Tpm2Command::GetRandom { bytes: 16 };
+    if submit(&cmd) != Tpm2Status::NotImplemented {
+        return TestResult::Fail("TPM submit should return NotImplemented");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_crypto_tpm_command_shapes);
+
+fn smoke_crypto_pq_fips_gate() -> TestResult {
+    use narf_crypto::pq::{fips_allowed, fips_mode, HybridMode, PqAlg};
+
+    // FIPS mode off in Stage-4 structural build.
+    if fips_mode() {
+        return TestResult::Fail("FIPS mode should be false until primitives are validated");
+    }
+    // Every algorithm allowed when FIPS is off.
+    if !fips_allowed(PqAlg::MlKem768) || !fips_allowed(PqAlg::MlDsa65) {
+        return TestResult::Fail("non-FIPS posture should permit every PQ algorithm");
+    }
+    // Sanity: HybridMode variants are distinct.
+    if HybridMode::Hybrid == HybridMode::PqOnly {
+        return TestResult::Fail("HybridMode variant comparison broken");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_crypto_pq_fips_gate);
+
 fn smoke_nvme_cap_register_decode() -> TestResult {
     use narf_drivers_nvme::NvmeCaps;
 
