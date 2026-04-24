@@ -103,13 +103,24 @@ __narf_vector_table:
     stp     x4,  x5,  [sp, #-16]!
     stp     x2,  x3,  [sp, #-16]!
     stp     x0,  x1,  [sp, #-16]!
-    /* And x30 (LR) separately, plus ELR/SPSR so the return path has
-     * them. Put x30 on first, then ELR/SPSR pair. */
+    /* x30 (LR) and ELR/SPSR so the return path has them. Layout:
+     *   [sp +  0] = x30
+     *   [sp +  8] = ELR_EL1 (return RIP)
+     *   [sp + 16] = SPSR_EL1 (return PSTATE incl. target EL)
+     *   [sp + 24] = unused
+     * ELR/SPSR are at fixed offsets so Rust handlers can rewrite
+     * them via `TrapContext::redirect_to_kernel`. */
+    mrs     x0,  elr_el1
+    mrs     x1,  spsr_el1
+    stp     x0,  x1,  [sp, #-16]!
     str     x30,      [sp, #-16]!
 .endm
 
 .macro RESTORE_ALL_GPRS
     ldr     x30,      [sp], #16
+    ldp     x0,  x1,  [sp], #16
+    msr     elr_el1,  x0
+    msr     spsr_el1, x1
     ldp     x0,  x1,  [sp], #16
     ldp     x2,  x3,  [sp], #16
     ldp     x4,  x5,  [sp], #16

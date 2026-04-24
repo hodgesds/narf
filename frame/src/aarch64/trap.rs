@@ -13,13 +13,15 @@ use narf_arch::aarch64::sysreg;
 /// On-stack layout saved by `vec.S`'s `SAVE_ALL_GPRS` macro.
 /// The last push is `str x30, [sp, #-16]!`, which grows the stack
 /// by 16 bytes but only stores 8 — so there's an 8-byte pad between
-/// `x30` and the start of the `stp`-saved GPR pairs. The field
-/// order below matches that layout exactly.
+/// `x30` and the start of the saved GPR pairs. ELR_EL1 + SPSR_EL1
+/// ride on the stack above x30 so handlers can rewrite them.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct TrapFrame {
-    pub x30:  u64,
-    pub _pad: u64,                   // forced by `str x30, [sp, #-16]!`
+    pub x30:   u64,
+    pub _pad:  u64,                  // forced by `str x30, [sp, #-16]!`
+    pub elr:   u64,                  // ELR_EL1 — return RIP
+    pub spsr:  u64,                  // SPSR_EL1 — return PSTATE + target EL
     pub x0:   u64, pub x1:  u64,
     pub x2:   u64, pub x3:  u64,
     pub x4:   u64, pub x5:  u64,
@@ -176,16 +178,17 @@ impl<'a> TrapContext for Aarch64TrapContext<'a> {
         self.frame.x1 = ret.status as u64;
     }
 
-    fn redirect_to_kernel(&mut self, _rip: u64, _rsp: u64) -> bool {
-        // aarch64's eret uses ELR_EL1 (not a frame slot) for the
-        // return address and SPSR_EL1 for the target EL, neither
-        // of which vec.S currently saves to the TrapFrame. Landing
-        // this cleanly requires the vector macro to stash ELR/SPSR
-        // alongside the GPR pairs so Rust can rewrite them.
-        // Returning `false` tells callers to fall back to
-        // `set_return` — the syscall completes, control returns to
-        // the user-space `svc #0` site.
-        false
+    fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
+        // Rewrite ELR_EL1 to the kernel landing; SPSR_EL1's mode
+        // field picks EL1h (SP_ELx selected). Push the requested
+        // kernel stack into x30 so the landing can `mov sp, x30`
+        // if it wants a custom stack (a naked trampoline can also
+        // load a full jmpbuf rsp separately).
+        self.frame.elr = rip;
+        // SPSR_EL1: M[4:0] = 0b00101 (EL1h), DAIF cleared.
+        self.frame.spsr = 0x0000_0000_0000_0005;
+        self.frame.x30 = rsp;
+        true
     }
 }
 
