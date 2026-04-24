@@ -21,6 +21,8 @@
 //! doesn't call the frame allocator directly so tests can hand it a
 //! deterministic sequence.
 
+use alloc::sync::Arc;
+
 use narf_memory::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
 
 use crate::{ExecImage, SegmentFlags};
@@ -60,7 +62,7 @@ fn perms_of(f: SegmentFlags) -> RegionPerms {
 pub fn load_into<I>(
     image:      &ExecImage,
     mut phys_pool: I,
-    addr_space: &mut AddressSpace,
+    addr_space: &AddressSpace,
 ) -> Result<EntryPoint, LoadError>
 where
     I: Iterator<Item = PhysAddr>,
@@ -88,4 +90,107 @@ where
     }
 
     Ok(EntryPoint(VirtAddr::new(image.entry)))
+}
+
+// ── Convenience: `bytes → Arc<AddressSpace>` ───────────────────────
+
+/// Errors that the `load_elf_bytes` end-to-end path can surface.
+/// Composes `ElfError` + `LoadError` + frame-allocator failure.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LoadBytesError {
+    Elf(crate::ElfError),
+    Load(LoadError),
+    NoFrame,
+    ByteCopyOutOfBounds,
+}
+
+impl From<crate::ElfError> for LoadBytesError {
+    fn from(e: crate::ElfError) -> Self { LoadBytesError::Elf(e) }
+}
+impl From<LoadError> for LoadBytesError {
+    fn from(e: LoadError) -> Self { LoadBytesError::Load(e) }
+}
+
+/// One-shot: parse ELF bytes, allocate a fresh user `AddressSpace`,
+/// map + materialize every `PT_LOAD` segment, and copy the segment
+/// data from `bytes` into the backing physical frames. Returns the
+/// `Arc<AddressSpace>` ready to attach to a `spawn_user` task, plus
+/// the entry point.
+///
+/// BSS (the `mem_size > file_size` tail) is zero — frames come from
+/// the allocator freshly-zeroed.
+///
+/// # Safety
+/// - `bytes` must be a live slice for the duration of this call.
+/// - The kernel must be running with the low 4 GiB identity-mapped
+///   so `phys.raw() as *mut u8` writes reach the backing storage.
+/// - Frame allocator must be initialised.
+pub unsafe fn load_elf_bytes(
+    bytes: &[u8],
+) -> Result<(Arc<AddressSpace>, EntryPoint), LoadBytesError> {
+    let image = crate::parse_elf(bytes)?;
+
+    // SAFETY: `new_for_user` contract — caller is in kernel mode
+    // with paging up.
+    let addr_space = unsafe { AddressSpace::new_for_user() }
+        .map_err(|e| LoadBytesError::Load(LoadError::AddressSpace(e)))?;
+
+    // Allocate all needed frames up front, chunk by chunk.
+    let mut allocated: alloc::vec::Vec<PhysAddr> = alloc::vec::Vec::new();
+    for seg in &image.segments {
+        let pages = (seg.mem_size + 0xFFF) >> 12;
+        for _ in 0..pages {
+            let f = narf_memory::alloc_frame().map_err(|_| LoadBytesError::NoFrame)?;
+            allocated.push(f.start_address());
+        }
+    }
+
+    // Zero every allocated frame before we copy into it (so the
+    // `mem_size > file_size` BSS tail is naturally zero).
+    for &p in &allocated {
+        // SAFETY: identity-mapped in low 4 GiB.
+        unsafe {
+            core::ptr::write_bytes(p.raw() as *mut u8, 0, 4096);
+        }
+    }
+
+    // Map each segment. `load_into` consumes frames from the pool.
+    let entry = load_into(&image, allocated.iter().copied(), &addr_space)?;
+
+    // Copy segment data. We re-walk `allocated` mirroring
+    // `load_into`'s consumption order: one frame per page of
+    // `mem_size`, contiguous.
+    let mut pool = allocated.iter().copied();
+    for seg in &image.segments {
+        let first = pool.next().ok_or(LoadBytesError::NoFrame)?;
+        let pages = (seg.mem_size + 0xFFF) >> 12;
+        for _ in 1..pages { let _ = pool.next(); }
+
+        // Copy `file_size` bytes from `bytes[file_off..]` into the
+        // contiguous physical range starting at `first`.
+        let start = seg.file_off as usize;
+        let end   = start.checked_add(seg.file_size as usize)
+            .ok_or(LoadBytesError::ByteCopyOutOfBounds)?;
+        if end > bytes.len() {
+            return Err(LoadBytesError::ByteCopyOutOfBounds);
+        }
+        let src = &bytes[start..end];
+        // SAFETY: allocated frames are identity-mapped; we write
+        // within the total size we allocated.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                src.as_ptr(),
+                first.raw() as *mut u8,
+                src.len(),
+            );
+        }
+    }
+
+    // Install PTEs.
+    // SAFETY: AS constructed by `new_for_user`; regions just pushed
+    // via `load_into`.
+    unsafe { addr_space.materialize() }
+        .map_err(|e| LoadBytesError::Load(LoadError::AddressSpace(e)))?;
+
+    Ok((Arc::new(addr_space), entry))
 }

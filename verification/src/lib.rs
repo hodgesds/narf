@@ -5355,6 +5355,80 @@ fn smoke_memory_address_space_region_table() -> TestResult {
 }
 kernel_test!(smoke_memory_address_space_region_table);
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_load_elf_bytes_end_to_end() -> TestResult {
+    // End-to-end: hand-build a minimal ELF64 with a 1-page PT_LOAD
+    // carrying 7 bytes of "payload", call load_elf_bytes, then walk
+    // the returned AddressSpace via translate() to confirm the
+    // backing phys frame is mapped AND the payload bytes are in
+    // the frame.
+    use narf_memory::x86_64::paging;
+    use narf_memory::VirtAddr;
+    use narf_userspace::load_elf_bytes;
+
+    // Build ELF bytes: header (64) + 1 PHDR (56) + 0x1000 payload
+    // area. Payload-area size is chosen so file_size == mem_size ==
+    // 0x1000, which means `load_elf_bytes` copies the full page.
+    let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(64 + 56 + 0x1000);
+    // e_ident
+    bytes.extend_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    bytes.extend_from_slice(&2u16.to_le_bytes());   // e_type = ET_EXEC
+    bytes.extend_from_slice(&0x3Eu16.to_le_bytes()); // e_machine
+    bytes.extend_from_slice(&1u32.to_le_bytes());   // e_version
+    // Entry = 0x0000_0080_0000_1111 (some user vaddr inside PML4[1]).
+    bytes.extend_from_slice(&0x0000_0080_0000_1111u64.to_le_bytes());
+    bytes.extend_from_slice(&64u64.to_le_bytes());  // e_phoff
+    bytes.extend_from_slice(&0u64.to_le_bytes());   // e_shoff
+    bytes.extend_from_slice(&0u32.to_le_bytes());   // e_flags
+    bytes.extend_from_slice(&64u16.to_le_bytes());  // e_ehsize
+    bytes.extend_from_slice(&56u16.to_le_bytes());  // e_phentsize
+    bytes.extend_from_slice(&1u16.to_le_bytes());   // e_phnum
+    bytes.extend_from_slice(&0u16.to_le_bytes());   // e_shentsize
+    bytes.extend_from_slice(&0u16.to_le_bytes());   // e_shnum
+    bytes.extend_from_slice(&0u16.to_le_bytes());   // e_shstrndx
+    // Program header — R|X 1-page segment.
+    bytes.extend_from_slice(&1u32.to_le_bytes());            // p_type = PT_LOAD
+    bytes.extend_from_slice(&5u32.to_le_bytes());            // p_flags = R|X
+    bytes.extend_from_slice(&(64u64 + 56).to_le_bytes());    // p_offset = past PHDR
+    bytes.extend_from_slice(&0x0000_0080_0000_1000u64.to_le_bytes()); // p_vaddr
+    bytes.extend_from_slice(&0x0000_0080_0000_1000u64.to_le_bytes()); // p_paddr
+    bytes.extend_from_slice(&0x1000u64.to_le_bytes());       // p_filesz
+    bytes.extend_from_slice(&0x1000u64.to_le_bytes());       // p_memsz
+    bytes.extend_from_slice(&0x1000u64.to_le_bytes());       // p_align
+    // 4 KiB of payload. First 7 bytes distinct so we can verify.
+    bytes.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x42, 0x69, 0x01]);
+    bytes.resize(64 + 56 + 0x1000, 0);
+
+    let (as_arc, entry) = match unsafe { load_elf_bytes(&bytes) } {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("load_elf_bytes failed on minimal ELF"),
+    };
+
+    if entry.0 != VirtAddr::new(0x0000_0080_0000_1111) {
+        return TestResult::Fail("entry point mis-decoded");
+    }
+    if as_arc.region_count() != 1 {
+        return TestResult::Fail("load_elf_bytes did not install one region");
+    }
+
+    // Walk the AS PML4 to find the PTE for the segment base, then
+    // read back the first 7 bytes via the phys address.
+    let phys = match unsafe { paging::translate(as_arc.root, VirtAddr::new(0x0000_0080_0000_1000)) } {
+        Some(p) => p,
+        None    => return TestResult::Fail("translate found no mapping for segment base"),
+    };
+    // Read back via identity map.
+    let payload: [u8; 7] = unsafe {
+        core::ptr::read_volatile(phys.raw() as *const [u8; 7])
+    };
+    if payload != [0xDE, 0xAD, 0xBE, 0xEF, 0x42, 0x69, 0x01] {
+        return TestResult::Fail("segment payload bytes did not land in the mapped frame");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_userspace_load_elf_bytes_end_to_end);
+
 fn smoke_userspace_loader_into_address_space() -> TestResult {
     use narf_memory::{AddressSpace, PhysAddr, RegionPerms, VirtAddr};
     use narf_userspace::{

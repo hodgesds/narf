@@ -41,7 +41,7 @@ pub mod loader;
 pub mod syscall;
 
 pub use elf::{parse as parse_elf, ElfError};
-pub use loader::{load_into, EntryPoint, LoadError};
+pub use loader::{load_elf_bytes, load_into, EntryPoint, LoadBytesError, LoadError};
 pub use syscall::{
     install_global, kernel_syscall_entry, kernel_syscall_entry_plain,
     FnHandler, RawFnHandler, RawSyscallHandler, Syscall, SyscallArgs,
