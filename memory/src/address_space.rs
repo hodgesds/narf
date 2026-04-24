@@ -17,6 +17,8 @@
 
 use alloc::vec::Vec;
 
+use narf_lib::sync::IrqSafeSpinLock;
+
 use crate::addr::{PhysAddr, VirtAddr};
 
 /// Region permission flags. Mirrors ELF `PF_*` so the loader doesn't
@@ -64,13 +66,18 @@ pub enum AddressSpaceError {
 /// a placeholder for the root paging structure; `activate()` is the
 /// per-arch `MOV CR3, …` / `TTBR0_EL1 = …` operation that makes
 /// this the live address space.
+///
+/// The region table lives behind an `IrqSafeSpinLock` so syscall
+/// handlers holding `Arc<AddressSpace>` can mutate it without
+/// exclusive ownership — the typical shape for per-task ASes
+/// shared across a trap handler + the executor's poll path.
 #[derive(Debug)]
 pub struct AddressSpace {
     /// Root page-table physical frame. Filled in by the per-arch
     /// `new_table` primitive once it lands; `PhysAddr::new(0)`
     /// acts as "not-yet-initialised" sentinel.
     pub root: PhysAddr,
-    regions:  Vec<Region>,
+    regions:  IrqSafeSpinLock<Vec<Region>>,
 }
 
 impl AddressSpace {
@@ -79,7 +86,7 @@ impl AddressSpace {
     pub const fn empty() -> Self {
         Self {
             root:    PhysAddr::new(0),
-            regions: Vec::new(),
+            regions: IrqSafeSpinLock::new(Vec::new()),
         }
     }
 
@@ -100,7 +107,7 @@ impl AddressSpace {
         // SAFETY: contract documented on the function.
         let phys = unsafe { crate::x86_64::paging::new_user_pml4() }
             .map_err(|_| AddressSpaceError::OutOfRange)?;
-        Ok(Self { root: phys, regions: Vec::new() })
+        Ok(Self { root: phys, regions: IrqSafeSpinLock::new(Vec::new()) })
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -110,7 +117,7 @@ impl AddressSpace {
         // the kernel sits behind TTBR1 and is unaffected.
         let phys = unsafe { crate::aarch64::paging::new_user_ttbr0() }
             .map_err(|_| AddressSpaceError::OutOfRange)?;
-        Ok(Self { root: phys, regions: Vec::new() })
+        Ok(Self { root: phys, regions: IrqSafeSpinLock::new(Vec::new()) })
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -121,35 +128,38 @@ impl AddressSpace {
     /// Attach a region description to the address-space table. Does
     /// NOT program the page table — that lives in `arch/`. Checks
     /// for overlap with existing regions and 4 KiB alignment.
-    pub fn map_region(&mut self, region: Region) -> Result<(), AddressSpaceError> {
+    pub fn map_region(&self, region: Region) -> Result<(), AddressSpaceError> {
         if region.base.as_u64() & 0xFFF != 0 || region.len & 0xFFF != 0 {
             return Err(AddressSpaceError::AlignmentMismatch);
         }
         let end = region.base.as_u64().checked_add(region.len)
             .ok_or(AddressSpaceError::OutOfRange)?;
-        for r in &self.regions {
+        let mut regions = self.regions.lock();
+        for r in regions.iter() {
             let r_end = r.base.as_u64() + r.len;
             if region.base.as_u64() < r_end && r.base.as_u64() < end {
                 return Err(AddressSpaceError::Overlap);
             }
         }
-        self.regions.push(region);
+        regions.push(region);
         Ok(())
     }
 
     /// Remove a region whose base address matches `base`.
-    pub fn unmap_region(&mut self, base: VirtAddr) -> Result<Region, AddressSpaceError> {
-        let idx = self.regions.iter().position(|r| r.base == base)
+    pub fn unmap_region(&self, base: VirtAddr) -> Result<Region, AddressSpaceError> {
+        let mut regions = self.regions.lock();
+        let idx = regions.iter().position(|r| r.base == base)
             .ok_or(AddressSpaceError::Unmapped)?;
-        Ok(self.regions.swap_remove(idx))
+        Ok(regions.swap_remove(idx))
     }
 
     /// Number of mapped regions.
     #[inline]
-    pub fn region_count(&self) -> usize { self.regions.len() }
+    pub fn region_count(&self) -> usize { self.regions.lock().len() }
 
-    /// Snapshot of the region list.
-    pub fn regions(&self) -> &[Region] { &self.regions }
+    /// Snapshot of the region list — returns an owned `Vec<Region>`
+    /// so callers can iterate without holding the lock.
+    pub fn regions_snapshot(&self) -> Vec<Region> { self.regions.lock().clone() }
 
     /// Materialise all pending regions into actual page-table entries.
     /// On x86_64 walks each region's pages and calls `map_4kb` on the
@@ -165,7 +175,8 @@ impl AddressSpace {
     pub unsafe fn materialize(&self) -> Result<(), AddressSpaceError> {
         use crate::x86_64::paging::{map_4kb, MapError, PtFlags};
         if self.root.as_u64() == 0 { return Err(AddressSpaceError::OutOfRange); }
-        for r in &self.regions {
+        let regions = self.regions.lock();
+        for r in regions.iter() {
             let mut flags = PtFlags::USER;
             if r.perms.contains(RegionPerms::WRITE) { flags = flags | PtFlags::WRITABLE; }
             if !r.perms.contains(RegionPerms::EXEC) { flags = flags | PtFlags::NO_EXEC; }
@@ -191,7 +202,8 @@ impl AddressSpace {
     pub unsafe fn materialize(&self) -> Result<(), AddressSpaceError> {
         use crate::aarch64::paging::{map_4kb, MapError, PtFlags};
         if self.root.as_u64() == 0 { return Err(AddressSpaceError::OutOfRange); }
-        for r in &self.regions {
+        let regions = self.regions.lock();
+        for r in regions.iter() {
             // aarch64 perm translation:
             // - AP_RW_EL1 = kernel-writable; for user the AP field
             //   changes to RW-EL1/EL0 (0b01<<6). For now Stage-4
@@ -224,12 +236,13 @@ impl AddressSpace {
         Err(AddressSpaceError::NotImplemented)
     }
 
-    /// Find the region covering `vaddr`, if any.
-    pub fn lookup(&self, vaddr: VirtAddr) -> Option<&Region> {
+    /// Find the region covering `vaddr`, if any. Returns a copy
+    /// since the region table lives behind an interior lock.
+    pub fn lookup(&self, vaddr: VirtAddr) -> Option<Region> {
         let a = vaddr.as_u64();
-        self.regions.iter().find(|r| {
+        self.regions.lock().iter().find(|r| {
             a >= r.base.as_u64() && a < r.base.as_u64() + r.len
-        })
+        }).copied()
     }
 
     /// Make this address-space the active one. On x86_64 issues a
