@@ -9,7 +9,7 @@ asks for. Updated when observable kernel behaviour changes.
 |-------|-------------------------------------------|--------|
 | 1. Skeleton      | Bootloader + async executor + console | **closed** — all 6 exit-gate items met |
 | 2. Barrier       | PKS/MTE domain switching + UIPI        | **closed** — both arches boot; higher-half, MTE, GICv3 all landed |
-| 3. Flow          | Narf-Ring + capabilities + first VirtIO | not started |
+| 3. Flow          | Narf-Ring + capabilities + first VirtIO | **composition complete; enforcement deferred to Stage 4** — caps/epoch, ipc SPSC, drivers framework, io DMA, rcu, tracing, abi, virtio-mmio skeleton all landed; `smoke_exit_gate_*` pass both arches, proving DmaBuffer → Narf-Ring → cap-gated consumer composes end-to-end. Real PKS/MTE enforcement on buffer pages, real virtio device I/O, real IOMMU, real user-mode consumer: Stage 4 items. |
 | 4. Compatibility | relibc integration; run standard Rust bins | not started |
 
 ## Working today (both arches on QEMU)

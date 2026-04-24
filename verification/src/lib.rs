@@ -2006,3 +2006,180 @@ fn smoke_virtio_mmio_wrong_magic() -> TestResult {
 }
 kernel_test!(smoke_virtio_mmio_wrong_magic);
 
+
+// ── Stage-3 exit-gate integration ──────────────────────────────────
+//
+// Spec: ROADMAP.md Stage 3 exit criterion — "A VirtIO device, running
+// in its own PKS domain, moves a buffer through a Narf-Ring to another
+// domain using only capability invocations, with no copy and no Ring-0
+// trap on the fast path."
+//
+// The Wave-3b demonstration composes: io/ DmaBuffer + capabilities/
+// cap-table + ipc/ Narf-Ring + scheduler. Driving real virtio silicon
+// is the drivers/virtio/ side-track's job; this integration proves the
+// composition works. Two tasks — notionally the "driver domain" and
+// the "consumer domain" — trade ownership of a DmaBuffer plus a
+// `Cap<DmaBuffer, Read>` through the ring. No memcpy on the payload
+// (the DmaBuffer is moved by handle, not by content); the cap's
+// `check_live` gate on the receive side is the spec's "capability
+// invocation" on the fast path.
+
+fn smoke_exit_gate_buffer_handoff() -> TestResult {
+    use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+    use narf_capabilities::{Cap, CapType, Read};
+    use narf_io::{DmaBuffer, alloc_coherent};
+    use narf_lib::id::DomainId;
+    use narf_memory::PAGE_SIZE;
+
+    /// 17-byte payload pattern. Non-trivial so a zeroed/untouched
+    /// buffer doesn't accidentally match.
+    const PATTERN: [u8; 17] = [
+        0xA5, 0x5A, 0x01, 0xFE, 0x42, 0x00, 0xFF, 0x10,
+        0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xAA,
+    ];
+
+    static OUTCOME:   AtomicU8    = AtomicU8::new(0);   // 0=pending, 1=ok, 2=bad
+    static READ_LEN:  AtomicUsize = AtomicUsize::new(0);
+
+    struct Handoff {
+        buf: DmaBuffer,
+        cap: Cap<DmaBuffer, Read>,
+    }
+
+    OUTCOME.store(0, Ordering::Relaxed);
+    READ_LEN.store(0, Ordering::Relaxed);
+
+    let (mut tx, mut rx) = narf_ipc::channel::<Handoff, 2>();
+    narf_scheduler::init();
+
+    // "Driver domain" task: allocate, fill, hand off.
+    narf_scheduler::spawn(async move {
+        let Ok(buf) = alloc_coherent(PATTERN.len(), DomainId::DRIVER_0) else {
+            return;
+        };
+        // Write the pattern to the buffer's physical memory. Valid
+        // per `PhysAddr::as_mut_ptr`'s documented contract
+        // (memory/src/addr.rs — caller must ensure identity-mapped or
+        // remap_to_virtual-translated). Kernel keeps low RAM
+        // identity-mapped on both arches; alloc_coherent returns
+        // low-RAM frames, so the precondition holds.
+        // SAFETY: buf is exclusively owned here; we write its full
+        // allocated length at byte granularity.
+        unsafe {
+            let dst = buf.phys_addr().as_mut_ptr::<u8>();
+            for (i, b) in PATTERN.iter().enumerate() {
+                core::ptr::write_volatile(dst.add(i), *b);
+            }
+        }
+        let cap: Cap<DmaBuffer, Read> = Cap::<DmaBuffer, Read>::bootstrap();
+        let _ = tx.send(Handoff { buf, cap }).await;
+        // Producer drops tx here; consumer finishes its recv.
+    });
+
+    // "Consumer domain" task: receive, gate on cap, read, assert.
+    narf_scheduler::spawn(async move {
+        let Ok(Handoff { buf, cap }) = rx.recv().await else {
+            OUTCOME.store(2, Ordering::Relaxed);
+            return;
+        };
+        // The spec's "capability invocation on the fast path": if the
+        // cap were revoked between send and read, this fails — see
+        // the revoked-variant test below.
+        if cap.check_live().is_err() {
+            OUTCOME.store(2, Ordering::Relaxed);
+            return;
+        }
+        // SAFETY: buf ownership transferred to this task; identity-
+        // mapped phys address readable.
+        let mut ok = true;
+        unsafe {
+            let src = buf.phys_addr().as_ptr::<u8>();
+            for (i, expected) in PATTERN.iter().enumerate() {
+                if core::ptr::read_volatile(src.add(i)) != *expected {
+                    ok = false; break;
+                }
+            }
+        }
+        READ_LEN.store(buf.len(), Ordering::Relaxed);
+        OUTCOME.store(if ok { 1 } else { 2 }, Ordering::Relaxed);
+        // buf drops here → frame returns to allocator.
+    });
+
+    narf_scheduler::run_until_empty();
+
+    // Both tasks must have run to completion.
+    if READ_LEN.load(Ordering::Relaxed) < PATTERN.len() {
+        return TestResult::Fail("consumer never received a buffer");
+    }
+    if READ_LEN.load(Ordering::Relaxed) != PAGE_SIZE as usize {
+        return TestResult::Fail("buffer length wasn't page-rounded on receive");
+    }
+    match OUTCOME.load(Ordering::Relaxed) {
+        1 => TestResult::Pass,
+        2 => TestResult::Fail("payload mismatch or cap check_live failed"),
+        _ => TestResult::Fail("consumer task never ran"),
+    }
+}
+kernel_test!(smoke_exit_gate_buffer_handoff);
+
+fn smoke_exit_gate_revoked_cap_rejected() -> TestResult {
+    // Same flow, but the producer revokes the cap after sending. The
+    // consumer's `check_live` must reject the receive — a revoked
+    // object is exactly the case epoch bumping invalidates O(1).
+    //
+    // Determinism precondition: single-CPU cooperative FIFO scheduler
+    // (scheduler/src/lib.rs). `yield_now` pushes the yielder to the
+    // queue tail, so producer-revoke always runs before consumer-
+    // check_live. A preemptive or multi-CPU executor would make this
+    // test racy — revisit the schedule when that lands.
+    use core::sync::atomic::{AtomicU8, Ordering};
+    use narf_capabilities::{Cap, Read};
+    use narf_io::{DmaBuffer, alloc_coherent};
+    use narf_lib::id::DomainId;
+
+    static OUTCOME: AtomicU8 = AtomicU8::new(0); // 0 pending, 1 properly-rejected, 2 slipped-through
+
+    struct Handoff {
+        buf: DmaBuffer,
+        cap: Cap<DmaBuffer, Read>,
+    }
+
+    OUTCOME.store(0, Ordering::Relaxed);
+
+    let (mut tx, mut rx) = narf_ipc::channel::<Handoff, 2>();
+    narf_scheduler::init();
+
+    narf_scheduler::spawn(async move {
+        let Ok(buf) = alloc_coherent(16, DomainId::DRIVER_0) else { return };
+        let cap: Cap<DmaBuffer, Read> = Cap::<DmaBuffer, Read>::bootstrap();
+        let cap_clone = cap;                         // Cap is Copy
+        let _ = tx.send(Handoff { buf, cap: cap_clone }).await;
+        // Yield so the consumer picks up the send before we revoke.
+        narf_scheduler::yield_now().await;
+        cap.revoke();                                // bumps the shared epoch
+    });
+
+    narf_scheduler::spawn(async move {
+        let Ok(Handoff { buf: _buf, cap }) = rx.recv().await else {
+            OUTCOME.store(2, Ordering::Relaxed);
+            return;
+        };
+        // Yield once more to give the producer a chance to revoke
+        // before we gate. On single-CPU cooperative this models the
+        // "producer yanked authority before consumer touched buffer"
+        // window the exit-gate criterion insists we honour.
+        narf_scheduler::yield_now().await;
+        match cap.check_live() {
+            Err(_) => OUTCOME.store(1, Ordering::Relaxed),
+            Ok(()) => OUTCOME.store(2, Ordering::Relaxed),
+        }
+    });
+
+    narf_scheduler::run_until_empty();
+    match OUTCOME.load(Ordering::Relaxed) {
+        1 => TestResult::Pass,
+        2 => TestResult::Fail("revoked cap slipped past check_live"),
+        _ => TestResult::Fail("consumer never reached check_live"),
+    }
+}
+kernel_test!(smoke_exit_gate_revoked_cap_rejected);
