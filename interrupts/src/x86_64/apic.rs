@@ -53,6 +53,12 @@ static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 
 /// Initialise the BSP's LAPIC in x2APIC mode (no timer yet).
 ///
+/// Also masks both legacy 8259 PICs so their IRQs can't land on our
+/// IDT vectors. The default BIOS-programmed PIC vectors on x86 PCs
+/// typically *overlap* the LAPIC-timer vector we chose (32 = PIC
+/// master IRQ 0 after the BIOS's standard remap), so leaving the PIC
+/// unmasked plus enabling IRQs = spurious deliveries racing ours.
+///
 /// # Safety
 /// - Must run on the BSP, exactly once.
 /// - CPUID must confirm x2APIC; caller gates on `Features::probe`.
@@ -61,6 +67,18 @@ pub unsafe fn init_bsp() {
     // SAFETY: caller confirmed x2APIC support via CPUID.
     let base = unsafe { rdmsr(IA32_APIC_BASE) };
     unsafe { wrmsr(IA32_APIC_BASE, base | APIC_BASE_EN | APIC_BASE_EXTD); }
+
+    // Mask every IRQ on both 8259 PICs. This is the legacy-PIC
+    // compatible way of saying "I don't want any interrupts from
+    // you" — writes 0xFF to the master data port (0x21) and the
+    // slave data port (0xA1). Stage-3 can revisit if we need PIC
+    // support for some legacy device.
+    // SAFETY: I/O-port writes to 0x21 / 0xA1 are standard PIC data.
+    unsafe {
+        use narf_arch::x86_64::io_port::outb;
+        outb(0x21, 0xFF);
+        outb(0xA1, 0xFF);
+    }
 
     // Spurious-interrupt vector register: enable + vector 0xFF for
     // stray interrupts. Bit 8 = software enable.
@@ -112,6 +130,18 @@ pub unsafe fn eoi() {
     // SAFETY: APIC is initialised; EOI write has no side effect beyond
     // unblocking the same-or-lower-priority interrupts.
     unsafe { wrmsr(APIC_EOI_MSR, 0); }
+}
+
+/// Self-IPI: send an interrupt to this CPU's own LAPIC at the given
+/// vector. Uses the x2APIC Self-IPI MSR (0x83F) which takes just the
+/// vector in the low 8 bits.
+///
+/// # Safety
+/// APIC must be in x2APIC mode.
+#[inline]
+pub unsafe fn self_ipi(vector: u8) {
+    // SAFETY: MSR 0x83F is the x2APIC Self-IPI register.
+    unsafe { wrmsr(0x83F, vector as u64); }
 }
 
 /// Called from the Rust trap handler on the timer IRQ.

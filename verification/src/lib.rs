@@ -246,6 +246,42 @@ fn smoke_scheduler_drives_future() -> TestResult {
 kernel_test!(smoke_scheduler_drives_future);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_timer_irq_fires() -> TestResult {
+    // Hardware-IRQ end-to-end: program the LAPIC timer + STI, busy-wait
+    // a while, confirm the tick counter advances. Requires PIC masking
+    // (done by apic::init_bsp) — otherwise legacy PIC IRQs land on our
+    // CPU-exception slots and cause #DF.
+    use narf_arch::x86_64::Features;
+    // SAFETY: CPUID always legal.
+    let feats = unsafe { Features::probe() };
+    if !feats.x2apic {
+        return TestResult::Skip("x2APIC not exposed");
+    }
+    let before = narf_interrupts::x86_64::apic::timer_ticks();
+    // SAFETY: APIC init has run at boot; this programs the timer + STI.
+    unsafe {
+        narf_interrupts::x86_64::apic::start_timer(
+            narf_interrupts::VECTOR_TIMER, 500_000);
+        narf_arch::enable_interrupts();
+    }
+    // Busy-wait ~50M cycles.
+    let start = narf_time::Instant::now();
+    while narf_time::Instant::now().cycles_since(start) < 50_000_000 {
+        core::hint::spin_loop();
+    }
+    // SAFETY: disable IRQs + stop timer before checking.
+    unsafe {
+        narf_arch::disable_interrupts();
+        narf_interrupts::x86_64::apic::stop_timer();
+    }
+    let after = narf_interrupts::x86_64::apic::timer_ticks();
+    if after > before { TestResult::Pass }
+    else { TestResult::Fail("LAPIC timer IRQ never fired") }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_timer_irq_fires);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_probe_catches_page_fault() -> TestResult {
     // Arm the recoverable-fault probe, write to an unmapped virtual
     // address (above our 4 GiB identity map), and verify the handler

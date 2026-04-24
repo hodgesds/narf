@@ -129,7 +129,8 @@ pub unsafe fn init() {
     install(30, int_30); install(31, int_31);
 
     // External IRQs 32..=47 + spurious 255.
-    install(32, int_32); install(33, int_33); install(34, int_34); install(35, int_35);
+    install(32, int_32);
+    install(33, int_33); install(34, int_34); install(35, int_35);
     install(36, int_36); install(37, int_37); install(38, int_38); install(39, int_39);
     install(40, int_40); install(41, int_41); install(42, int_42); install(43, int_43);
     install(44, int_44); install(45, int_45); install(46, int_46); install(47, int_47);

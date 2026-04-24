@@ -111,7 +111,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // SAFETY: CPUID confirmed x2APIC.
             unsafe { narf_interrupts::x86_64::apic::init_bsp(); }
             let _ = writeln!(console::Writer,
-                "  apic: x2APIC enabled (timer masked; hardware-IRQ path TBD)");
+                "  apic: x2APIC enabled, 8259 PICs masked");
         }
     }
 
@@ -252,19 +252,29 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
 
 #[cfg(not(any(feature = "kernel-test", feature = "idt-selftest")))]
 fn run_async_demo() -> ! {
-    // Stage-2 Barrier observation: software `int 32` dispatches
-    // cleanly through the IDT to the Rust trap handler. Hardware-
-    // delivered LAPIC timer IRQs currently cause a #DF in the
-    // dispatch path — tracking as an open investigation. Scheduler
-    // stays on the Stage-1 busy-poll model until then.
+    // Stage 2 Barrier: LAPIC timer IRQs are now live. `init_bsp`
+    // masks both legacy 8259 PICs so their BIOS-default vectors
+    // can't land on ours. Start a periodic timer and enable CPU
+    // IRQs — the async demo below runs with real timer-driven
+    // interrupts visible through `timer_ticks()`.
     #[cfg(target_arch = "x86_64")]
     {
-        // Soft INT 32 to prove dispatch works.
-        let _ = writeln!(console::Writer, "  testing soft-INT 32 dispatch ...");
-        // SAFETY: INT N with a registered handler is equivalent to
-        // calling the handler through the IDT.
-        unsafe { core::arch::asm!("int 32", options(nostack)); }
-        let _ = writeln!(console::Writer, "  soft-INT 32 returned cleanly.");
+        // SAFETY: APIC is up (init_bsp ran), IDT is loaded, PIC
+        // is masked. This starts the periodic timer + unmasks CPU
+        // IRQs; from here the LAPIC timer fires vector 32 every
+        // `initial_count` LAPIC ticks, the IDT dispatches to
+        // `rust_trap_handler` which increments `timer_ticks` and
+        // EOIs.
+        unsafe {
+            narf_interrupts::x86_64::apic::start_timer(
+                narf_interrupts::VECTOR_TIMER,
+                1_000_000,
+            );
+            narf_arch::enable_interrupts();
+        }
+        let _ = writeln!(console::Writer,
+            "  apic: LAPIC timer live on vector {}, IRQs unmasked",
+            narf_interrupts::VECTOR_TIMER);
     }
 
     narf_scheduler::init();
@@ -292,6 +302,12 @@ fn run_async_demo() -> ! {
 
     let _ = writeln!(console::Writer, "  heap used: {} / {} bytes",
         narf_memory::heap::used_bytes(), narf_memory::heap::capacity_bytes());
+    #[cfg(target_arch = "x86_64")]
+    {
+        let ticks = narf_interrupts::x86_64::apic::timer_ticks();
+        let _ = writeln!(console::Writer,
+            "  timer IRQs delivered: {} ticks", ticks);
+    }
     let _ = writeln!(console::Writer, "  halting — Stage 1 exit-gate demo complete.");
 
     // SAFETY: exit_kernel is infallible; on QEMU it exits cleanly via

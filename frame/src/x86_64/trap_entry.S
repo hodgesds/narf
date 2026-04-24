@@ -74,12 +74,7 @@ TRAP_STUB_ERR   29
 TRAP_STUB_ERR   30
 TRAP_STUB_NOERR 31
 
-/* External IRQ vectors — no CPU-pushed error code. Stage 2 registers
- * a range wide enough for the LAPIC timer + spurious + a handful of
- * future vectors. Hardware-IRQ dispatch is known-broken (#DF on
- * first async timer); software INT 32 works, so the IDT path itself
- * is correct. Tracking as open investigation.
- */
+/* External IRQ vectors — no CPU-pushed error code. */
 TRAP_STUB_NOERR 32
 TRAP_STUB_NOERR 33
 TRAP_STUB_NOERR 34

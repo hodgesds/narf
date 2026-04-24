@@ -196,6 +196,7 @@ version = "0.0.0"
 dependencies = [
  "narf-arch",
  "narf-console",
+ "narf-interrupts",
  "narf-lib",
  "narf-memory",
  "narf-scheduler",

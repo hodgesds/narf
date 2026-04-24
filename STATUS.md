@@ -39,6 +39,7 @@ NARF Stage 1 Wave 1 — hello from a bare kernel.
 $ cargo xtask test --arch=x86_64
 ...
 ── kernel_test harness ──────────────────────────
+  [ OK ] smoke_timer_irq_fires          ← hardware LAPIC-timer IRQ
   [ OK ] smoke_pks_enforces_deny_all    ← live PKS #PF/PK demo
   [ OK ] smoke_probe_catches_page_fault ← recoverable trap
   [ OK ] smoke_pks_set_get_rights
@@ -55,7 +56,7 @@ $ cargo xtask test --arch=x86_64
   [ OK ] smoke_bitmap_first_set
   [ OK ] smoke_arch_backend
   [ OK ] smoke_typed_id_sanity
-── summary: 16 pass, 0 fail, 0 skip ──
+── summary: 17 pass, 0 fail, 0 skip ──
 ```
 
 ## Crates that exist
@@ -90,15 +91,20 @@ $ cargo xtask test --arch=x86_64
   invariant-TSC, RDSEED, RDRAND, x2APIC, APIC detected at boot and
   reported.
 - **x2APIC enable** (`narf-interrupts` crate, `apic::init_bsp`):
-  IA32_APIC_BASE set with EN + EXTD; SIVR programmed; LVT timer
-  masked by default; `start_timer` / `stop_timer` primitives for
-  periodic-mode configuration.
+  IA32_APIC_BASE set with EN + EXTD; SIVR programmed; both legacy
+  8259 PICs masked (via I/O ports 0x21 + 0xA1 writing 0xFF);
+  LVT timer masked by default; `start_timer` / `stop_timer` for
+  periodic-mode configuration; `self_ipi` helper.
 - **IRQ-vector IDT entries** (`frame/x86_64`): stubs + IDT installs
   for vectors 32..=47 and 255 (spurious). `rust_trap_handler`
   dispatches IRQ vectors (>= 32) separately from exceptions,
   calling the appropriate subsystem handler and EOI-ing the LAPIC.
-  **Software `int 32` dispatch verified end-to-end** (pushes frame
-  → stub → common_trap → Rust handler → EOI → iretq returns cleanly).
+- **Hardware timer IRQs live**: LAPIC timer fires vector 32 at the
+  configured cadence; `on_timer_tick` increments a counter visible
+  via `narf_interrupts::x86_64::apic::timer_ticks()`. Default
+  boot runs with IRQs unmasked for the duration of the async demo;
+  typical observed tick counts: 9 after ~500 Mcycles of demo.
+  Regression-guarded by `smoke_timer_irq_fires` kernel test.
 - **MSR / CR helpers** (`arch/x86_64/msr.rs`, `.../cr.rs`): `rdmsr`,
   `wrmsr`, `read_cr4`, `write_cr4`, with the compiler_fence(SeqCst)
   pair per `arch/` §4.
@@ -126,20 +132,16 @@ $ cargo xtask test --arch=x86_64
 
 ## Stage 2 Barrier — what's still open
 
-- **Hardware LAPIC-IRQ dispatch**: software `int 32` works cleanly,
-  but enabling CPU IRQs (`sti`) with the LAPIC timer programmed
-  causes a `#DF` on the first async IRQ delivery. Trap frame shows
-  RIP=0x8 / CS=valid-rflags, suggesting a push/layout mismatch
-  specific to async IRQ entry on this QEMU/CPU combo. Captured as
-  an open investigation; the scheduler stays on Stage-1 busy-poll
-  until resolved.
 - **Higher-half kernel** (-2 GiB linker relocation + `code-model=kernel`).
   Every Stage 2 subsystem expects this layout by convention. Today the
   kernel runs low-half (phys == virt).
 - **NX enable**: `IA32_EFER.NXE = 1` so `PtFlags::NO_EXEC` is honoured.
   CPUID says NX is present; just not wired yet.
-- **UIPI** (Sapphire Rapids+). Gates on resolving the hardware-IRQ
-  #DF above.
+- **UIPI** (Sapphire Rapids+). Infrastructure now ready (LAPIC live,
+  IRQ path proven); UIPI is additive on top.
+- **Scheduler on timer IRQ**: the Stage-1 busy-poll executor still
+  runs as before. Wiring `sleep_until` to wake from a timer-IRQ
+  waker (instead of repolling the clock) is a cleaner model.
 - **aarch64 MTE mirror**: SCTLR_EL1.TCF, tag storage, symmetric
   DomainPrimitive. Currently only `BACKEND = Mte` constant exists.
 - **GICv3 skeleton** on aarch64 to match x2APIC on x86_64.
@@ -218,6 +220,7 @@ cargo test -p narf-lib
 | probe         | Recoverable trap handler + arm/disarm exception-table probe  |
 | PKS live      | `smoke_pks_enforces_deny_all` — end-to-end #PF/PK demo      |
 | APIC partial  | `narf-interrupts` + IRQ IDT entries; soft INT 32 works      |
+| APIC full     | 8259 PICs masked; hardware LAPIC timer IRQs live + tested   |
 
 ## Pickup hint for the next session
 
