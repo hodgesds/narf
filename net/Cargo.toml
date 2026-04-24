@@ -1,0 +1,22 @@
+[package]
+name         = "narf-net"
+description  = "Frame-ring contract, interface registry, loopback. Stage 3 net."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_net"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../lib" }
+narf-capabilities = { path = "../capabilities" }
+narf-ipc          = { path = "../ipc" }
+narf-io           = { path = "../io" }
+narf-scheduler    = { path = "../scheduler" }
+
+[lints]
+workspace = true

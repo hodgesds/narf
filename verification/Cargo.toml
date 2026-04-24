@@ -30,6 +30,8 @@ narf-block      = { path = "../block" }
 narf-console    = { path = "../console" }
 narf-interrupts = { path = "../interrupts" }
 narf-time       = { path = "../time" }
+narf-crypto     = { path = "../crypto" }
+narf-net        = { path = "../net" }
 
 [lints]
 workspace = true

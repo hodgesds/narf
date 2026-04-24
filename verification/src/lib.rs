@@ -2413,3 +2413,309 @@ fn smoke_lib_bug_on_false_is_silent() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_lib_bug_on_false_is_silent);
+
+// ── net ───────────────────────────────────────────────────────────
+
+fn smoke_net_loopback_register() -> TestResult {
+    // Register a uniquely-named loopback (the global registry persists
+    // across tests in a single boot, so don't use the default name) and
+    // verify the registry exposes its name/MAC/MTU + link state.
+    use narf_net::{Loopback, bootstrap_authority, register_loopback_named, registry};
+
+    // Scheduler must be live: register_loopback_named spawns a
+    // forwarder task at registration time (per the Stage-3 spec).
+    narf_scheduler::init();
+
+    let authority = bootstrap_authority();
+    let before = registry().len();
+    let _handle = match register_loopback_named(&authority, "lo.smoke-register") {
+        Ok(h)  => h,
+        Err(_) => return TestResult::Fail("register_loopback_named failed on fresh authority"),
+    };
+    if registry().len() != before + 1 {
+        return TestResult::Fail("registry length didn't grow after register");
+    }
+
+    let info = registry().with_interface("lo.smoke-register", |i| {
+        (i.mac(), i.mtu(), i.link_up())
+    });
+    match info {
+        Some((mac, mtu, link)) => {
+            if mac != Loopback::DEFAULT_MAC { return TestResult::Fail("MAC mismatch"); }
+            if mtu != Loopback::DEFAULT_MTU { return TestResult::Fail("MTU mismatch"); }
+            if !link { return TestResult::Fail("loopback link not up"); }
+            TestResult::Pass
+        }
+        None => TestResult::Fail("registered interface not found by name"),
+    }
+}
+kernel_test!(smoke_net_loopback_register);
+
+fn smoke_net_loopback_roundtrip() -> TestResult {
+    // End-to-end zero-copy: write a known payload into a DmaBuffer,
+    // wrap as a Frame, send via loopback's tx_ring, recv via rx_ring,
+    // verify byte-exact match. Producer + consumer + forwarder all
+    // share one cooperative executor; the forwarder spawned at
+    // register time pumps tx → rx.
+    use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+    use narf_io::alloc_coherent;
+    use narf_lib::id::DomainId;
+    use narf_net::{Frame, bootstrap_authority, register_loopback_named, registry};
+
+    const PAYLOAD: [u8; 24] = [
+        0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+    ];
+
+    static OUTCOME:  AtomicU8  = AtomicU8::new(0); // 0 pending, 1 ok, 2 mismatch, 3 lost
+    static GOT_LEN:  AtomicU32 = AtomicU32::new(0);
+
+    OUTCOME.store(0, Ordering::Relaxed);
+    GOT_LEN.store(0, Ordering::Relaxed);
+
+    narf_scheduler::init();
+
+    let authority = bootstrap_authority();
+    if register_loopback_named(&authority, "lo.smoke-roundtrip").is_err() {
+        return TestResult::Fail("register_loopback_named failed");
+    }
+
+    // Take the producer + consumer out of the interface — sole-owner
+    // SPSC discipline. Both ring halves are still owned by the
+    // registry-held Loopback; we hold them only for the duration of
+    // this test.
+    let tx = registry().with_interface("lo.smoke-roundtrip", |i| {
+        i.tx_ring().lock().take()
+    }).flatten();
+    let rx = registry().with_interface("lo.smoke-roundtrip", |i| {
+        i.rx_ring().lock().take()
+    }).flatten();
+    let (Some(mut tx), Some(mut rx)) = (tx, rx) else {
+        return TestResult::Fail("loopback ring halves missing");
+    };
+
+    // Sender: alloc, fill, frame, send. Drops tx at the end of the
+    // task — the forwarder observes Closed and exits, but our send
+    // has already landed by then.
+    narf_scheduler::spawn(async move {
+        let Ok(buf) = alloc_coherent(PAYLOAD.len(), DomainId::DRIVER_0) else {
+            return;
+        };
+        // SAFETY: buf is exclusively owned here; alloc_coherent returns
+        // identity-mapped low-RAM frames so phys_addr is a valid raw
+        // pointer (same precondition as smoke_exit_gate_buffer_handoff).
+        unsafe {
+            let dst = buf.phys_addr().as_mut_ptr::<u8>();
+            for (i, b) in PAYLOAD.iter().enumerate() {
+                core::ptr::write_volatile(dst.add(i), *b);
+            }
+        }
+        let frame = Frame::new(buf, PAYLOAD.len() as u32);
+        let _ = tx.send(frame).await;
+    });
+
+    // Receiver: recv one frame, verify payload survived the loopback
+    // round-trip without copy.
+    narf_scheduler::spawn(async move {
+        let Ok(frame) = rx.recv().await else {
+            OUTCOME.store(3, Ordering::Relaxed);
+            return;
+        };
+        let len = frame.len();
+        GOT_LEN.store(len, Ordering::Relaxed);
+        let (buf, used) = frame.into_parts();
+        let mut ok = used as usize == PAYLOAD.len();
+        // SAFETY: buf ownership transferred here; identity-mapped read.
+        unsafe {
+            let src = buf.phys_addr().as_ptr::<u8>();
+            for (i, expected) in PAYLOAD.iter().enumerate() {
+                if core::ptr::read_volatile(src.add(i)) != *expected {
+                    ok = false; break;
+                }
+            }
+        }
+        OUTCOME.store(if ok { 1 } else { 2 }, Ordering::Relaxed);
+        // buf drops → frame returns to allocator. rx drops here too,
+        // closing the rx ring; the forwarder will hit Err on its next
+        // send and exit cleanly.
+    });
+
+    narf_scheduler::run_until_empty();
+
+    if GOT_LEN.load(Ordering::Relaxed) == 0 {
+        return TestResult::Fail("receiver never observed a frame");
+    }
+    if GOT_LEN.load(Ordering::Relaxed) as usize != PAYLOAD.len() {
+        return TestResult::Fail("frame length didn't match payload length");
+    }
+    match OUTCOME.load(Ordering::Relaxed) {
+        1 => TestResult::Pass,
+        2 => TestResult::Fail("payload mismatch after loopback round-trip"),
+        3 => TestResult::Fail("rx recv resolved Closed before delivering a frame"),
+        _ => TestResult::Fail("receiver task never ran"),
+    }
+}
+kernel_test!(smoke_net_loopback_roundtrip);
+
+fn smoke_net_loopback_revoked_authority() -> TestResult {
+    // A revoked authority cap must not be able to register further
+    // interfaces — same epoch-gate path the drivers/ framework relies
+    // on (smoke_drivers_register_revoked_authority is the parallel).
+    use narf_net::{RegisterError, bootstrap_authority, register_loopback_named};
+
+    // Scheduler must be live: register short-circuits on
+    // AuthorityRevoked before spawning, but staying consistent with the
+    // other two net tests keeps the harness state predictable across
+    // boots.
+    narf_scheduler::init();
+
+    let authority = bootstrap_authority();
+    authority.revoke();
+    match register_loopback_named(&authority, "lo.smoke-revoked") {
+        Err(RegisterError::AuthorityRevoked) => TestResult::Pass,
+        Err(_) => TestResult::Fail("wrong error variant from revoked-authority register"),
+        Ok(_)  => TestResult::Fail("register_loopback_named accepted a revoked authority"),
+    }
+}
+kernel_test!(smoke_net_loopback_revoked_authority);
+
+// ── crypto/ smokes ──────────────────────────────────────────────────
+//
+// Stage-3 round 2: cap-gated primitive surface in narf-crypto. Vectors
+// come from canonical sources so a regression in the underlying
+// RustCrypto crates surfaces immediately rather than as a downstream
+// protocol failure.
+
+fn smoke_crypto_ed25519_verify() -> TestResult {
+    // RFC 8032 §7.1 Test 1: empty message, well-known key + signature.
+    use narf_capabilities::{Cap, Read};
+    use narf_crypto::{ed25519_verify, Ed25519Verify, Key};
+
+    let public: [u8; 32] = [
+        0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7,
+        0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
+        0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25,
+        0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a,
+    ];
+    let sig: [u8; 64] = [
+        0xe5, 0x56, 0x43, 0x00, 0xc3, 0x60, 0xac, 0x72,
+        0x90, 0x86, 0xe2, 0xcc, 0x80, 0x6e, 0x82, 0x8a,
+        0x84, 0x87, 0x7f, 0x1e, 0xb8, 0xe5, 0xd9, 0x74,
+        0xd8, 0x73, 0xe0, 0x65, 0x22, 0x49, 0x01, 0x55,
+        0x5f, 0xb8, 0x82, 0x15, 0x90, 0xa3, 0x3b, 0xac,
+        0xc6, 0x1e, 0x39, 0x70, 0x1c, 0xf9, 0xb4, 0x6b,
+        0xd2, 0x5b, 0xf5, 0xf0, 0x59, 0x5b, 0xbe, 0x24,
+        0x65, 0x51, 0x41, 0x43, 0x8e, 0x7a, 0x10, 0x0b,
+    ];
+
+    let cap: Cap<Key<Ed25519Verify>, Read> =
+        Cap::<Key<Ed25519Verify>, Read>::bootstrap();
+    if ed25519_verify(&cap, &public, b"", &sig).is_err() {
+        return TestResult::Fail("ed25519 verify rejected RFC 8032 vector");
+    }
+
+    // Negative: flip a byte in the signature, must reject.
+    let mut bad_sig = sig;
+    bad_sig[0] ^= 0x01;
+    if ed25519_verify(&cap, &public, b"", &bad_sig).is_ok() {
+        return TestResult::Fail("ed25519 verify accepted tampered signature");
+    }
+
+    TestResult::Pass
+}
+kernel_test!(smoke_crypto_ed25519_verify);
+
+fn smoke_crypto_chacha20_roundtrip() -> TestResult {
+    // Seal then open: tag must match and plaintext must round-trip.
+    // Cap is a fresh bootstrap; key bytes are a 32-byte zero-key
+    // (vector quality doesn't matter here, only seal/open closure).
+    use alloc::vec::Vec;
+    use narf_capabilities::{Cap, Grant};
+    use narf_crypto::{chacha20_open, chacha20_seal, ChaCha20Poly1305Alg, Key};
+
+    let key = [0u8; 32];
+    let nonce = [0u8; 12];
+    let aad: &[u8] = b"narf-crypto-aad";
+    let original: Vec<u8> = b"the quick brown fox jumps over the lazy dog".to_vec();
+
+    let cap: Cap<Key<ChaCha20Poly1305Alg>, Grant> =
+        Cap::<Key<ChaCha20Poly1305Alg>, Grant>::bootstrap();
+
+    let mut buf = original.clone();
+    if chacha20_seal(&cap, &key, &nonce, &mut buf, aad).is_err() {
+        return TestResult::Fail("chacha20 seal returned AeadFailure");
+    }
+    if buf.len() != original.len() + 16 {
+        return TestResult::Fail("chacha20 seal didn't append 16-byte tag");
+    }
+    if buf[..original.len()] == original[..] {
+        return TestResult::Fail("chacha20 seal left plaintext unencrypted");
+    }
+    if chacha20_open(&cap, &key, &nonce, &mut buf, aad).is_err() {
+        return TestResult::Fail("chacha20 open rejected our own ciphertext");
+    }
+    if buf != original {
+        return TestResult::Fail("chacha20 open didn't recover plaintext");
+    }
+
+    // Tamper the AAD on open — must reject.
+    let mut buf2 = original.clone();
+    let _ = chacha20_seal(&cap, &key, &nonce, &mut buf2, aad);
+    if chacha20_open(&cap, &key, &nonce, &mut buf2, b"different-aad").is_ok() {
+        return TestResult::Fail("chacha20 open accepted mismatched AAD");
+    }
+
+    TestResult::Pass
+}
+kernel_test!(smoke_crypto_chacha20_roundtrip);
+
+fn smoke_crypto_hkdf_test_vector() -> TestResult {
+    // RFC 5869 Test Case 1 — HKDF-SHA-256.
+    use narf_capabilities::{Cap, Read};
+    use narf_crypto::{hkdf_expand, Hkdf, Key};
+
+    let ikm: [u8; 22] = [0x0b; 22];
+    let salt: [u8; 13] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0a, 0x0b, 0x0c,
+    ];
+    let info: [u8; 10] = [0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9];
+    let expected: [u8; 42] = [
+        0x3c, 0xb2, 0x5f, 0x25, 0xfa, 0xac, 0xd5, 0x7a,
+        0x90, 0x43, 0x4f, 0x64, 0xd0, 0x36, 0x2f, 0x2a,
+        0x2d, 0x2d, 0x0a, 0x90, 0xcf, 0x1a, 0x5a, 0x4c,
+        0x5d, 0xb0, 0x2d, 0x56, 0xec, 0xc4, 0xc5, 0xbf,
+        0x34, 0x00, 0x72, 0x08, 0xd5, 0xb8, 0x87, 0x18,
+        0x58, 0x65,
+    ];
+
+    let cap: Cap<Key<Hkdf>, Read> = Cap::<Key<Hkdf>, Read>::bootstrap();
+    let okm = match hkdf_expand(&cap, &salt, &ikm, &info, 42) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("hkdf_expand returned an error"),
+    };
+    if okm.len() != 42 || okm[..] != expected[..] {
+        return TestResult::Fail("hkdf_expand output mismatched RFC 5869 vector");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_crypto_hkdf_test_vector);
+
+fn smoke_crypto_blake3_known_answer() -> TestResult {
+    // BLAKE3 empty-input digest, official KAT.
+    use narf_crypto::blake3_hash;
+
+    let expected: [u8; 32] = [
+        0xaf, 0x13, 0x49, 0xb9, 0xf5, 0xf9, 0xa1, 0xa6,
+        0xa0, 0xf2, 0x61, 0x0a, 0x12, 0xed, 0xdf, 0x2b,
+        0xd1, 0x7c, 0xe4, 0x0d, 0x4f, 0x4a, 0xf1, 0xeb,
+        0x7c, 0x9c, 0x3e, 0xdc, 0x4c, 0xc6, 0xc5, 0xc5,
+    ];
+    let got = blake3_hash(b"");
+    if got != expected {
+        return TestResult::Fail("blake3 empty-input hash drifted from KAT");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_crypto_blake3_known_answer);

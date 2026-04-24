@@ -1,0 +1,38 @@
+[package]
+name         = "narf-crypto"
+description  = "Crypto primitives, cap-gated keys, RNG, SecureRing skeleton."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_crypto"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../lib" }
+narf-capabilities = { path = "../capabilities" }
+narf-ipc          = { path = "../ipc" }
+narf-time         = { path = "../time" }
+
+# RustCrypto primitives. Default features disabled to keep no_std clean —
+# every feature pull is explicit. See spec/specification/spec.md §3 for
+# the algorithm matrix; Stage 3 wires Ed25519 verify, ChaCha20-Poly1305
+# AEAD, HKDF-SHA-256 and BLAKE3.
+ed25519-dalek      = { version = "2",    default-features = false, features = ["zeroize"] }
+# chacha20poly1305: poly1305's auto-detected AVX2 backend SIGILLs LLVM
+# under `code-model=kernel`; we pin the soft backend via the
+# `--cfg poly1305_force_soft` rustflag in `.cargo/config.toml`. With
+# that, the dep compiles clean on both arches.
+chacha20poly1305   = { version = "0.10", default-features = false, features = ["alloc"] }
+hkdf               = { version = "0.12", default-features = false }
+sha2               = { version = "0.10", default-features = false }
+blake3             = { version = "1",    default-features = false, features = ["pure"] }
+rand_core          = { version = "0.6",  default-features = false }
+rand_chacha        = { version = "0.3",  default-features = false }
+zeroize            = { version = "1",    default-features = false }
+
+[lints]
+workspace = true

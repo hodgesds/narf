@@ -24,6 +24,8 @@ members = [
     "drivers",
     "drivers/virtio",
     "block",
+    "crypto",
+    "net",
 ]
 
 [workspace.package]
