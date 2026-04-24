@@ -6348,9 +6348,24 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
     let saved = unsafe { user_mode_setjmp(core::ptr::addr_of_mut!(JMP2)) };
     if saved != 0 {
         unsafe {
+            // Restore kernel CR3.
             let cr3 = SAVED_CR3_2.load(Ordering::Acquire);
             core::arch::asm!("mov cr3, {v}", v = in(reg) cr3,
                 options(nostack, preserves_flags));
+            // Reset KERNEL_GS_BASE to zero (post-init state). The
+            // entry-swapgs on the trap put kernel_percpu in
+            // GS.base and 0 into KERNEL_GS_BASE; longjmp kept that
+            // state. This stamp is defensive — re-asserts the
+            // post-init invariant subsequent tests expect.
+            const IA32_KERNEL_GS_BASE: u32 = 0xC0000102;
+            core::arch::asm!(
+                "wrmsr",
+                in("ecx") IA32_KERNEL_GS_BASE,
+                in("eax") 0u32,
+                in("edx") 0u32,
+                options(nostack, preserves_flags),
+            );
+            // Re-enable interrupts.
             core::arch::asm!("sti", options(nomem, nostack, preserves_flags));
         }
         clear_exit_landing();
