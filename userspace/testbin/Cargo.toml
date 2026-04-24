@@ -1,0 +1,23 @@
+[package]
+name         = "narf-testbin"
+description  = "Minimal Rust no_std user binary run by narf-verification user-mode tests."
+version      = "0.0.0"
+edition      = "2021"
+rust-version = "1.85"
+license      = "MPL-2.0"
+
+[[bin]]
+name = "narf-testbin"
+path = "src/main.rs"
+
+# Explicitly disclaim the outer workspace so this crate's own
+# release profile + linker script apply (the kernel workspace's
+# fat-LTO settings and `code-model=kernel` are wrong for user code).
+[workspace]
+
+[profile.release]
+opt-level = "s"
+lto       = true
+panic     = "abort"
+debug     = false
+strip     = "none"

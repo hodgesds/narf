@@ -34,6 +34,13 @@ members = [
     "drivers/net",
     "drivers/gpu",
 ]
+# narf-testbin is built out-of-line by verification's build.rs
+# because it needs a distinct linker script and release profile.
+# Leaving it outside the `members` array keeps the kernel workspace's
+# fat-LTO release settings from contaminating the user binary.
+exclude = [
+    "userspace/testbin",
+]
 
 [workspace.package]
 version      = "0.0.0"

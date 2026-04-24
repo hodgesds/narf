@@ -6281,6 +6281,102 @@ fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
 kernel_test!(smoke_frame_x86_64_user_mode_roundtrip);
 
+// ── Real Rust user binary run through the full pipeline ──────────────
+
+#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
+const NARF_TESTBIN_ELF: &[u8] = include_bytes!(env!("NARF_TESTBIN_ELF"));
+
+#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
+fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
+    // Load the real Rust no_std binary `narf-testbin` into a fresh
+    // UserProcess, install the core syscall handlers (Write goes
+    // to the kernel console; ExitTask redirects the trap frame),
+    // register an exit-landing that longjmps back to the kernel,
+    // and enter user mode. On successful unwind, the testbin's
+    // "user: ok\n" message has hit the console and ExitTask did
+    // its redirect.
+    use core::arch::naked_asm;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_userspace::{
+        clear_exit_landing, install_address_space_lookup, install_core_syscalls,
+        install_global, load_user_process, set_exit_landing,
+        syscall::__test_clear_global, SyscallTable,
+    };
+
+    static mut JMP2: UserModeJmpBuf = UserModeJmpBuf {
+        rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, rsp: 0, rip: 0,
+    };
+    static SAVED_CR3_2: AtomicU64 = AtomicU64::new(0);
+
+    #[unsafe(naked)]
+    unsafe extern "C" fn testbin_resume_trampoline() -> ! {
+        naked_asm!(
+            "lea rdi, [rip + {jmp}]",
+            "mov rsi, 1",
+            "jmp {lj}",
+            jmp = sym JMP2,
+            lj  = sym user_mode_longjmp,
+        );
+    }
+
+    // Scheduler-aware AS lookup for Mmap/Munmap handlers. Not
+    // used by the testbin today (it only calls Write + ExitTask),
+    // but present for completeness.
+    fn scheduler_as_lookup() -> Option<alloc::sync::Arc<narf_memory::AddressSpace>> {
+        let id = narf_scheduler::current_task_id();
+        if id == narf_scheduler::TaskId::NONE { return None; }
+        narf_scheduler::address_space_of(id)
+    }
+
+    __test_clear_global();
+    install_address_space_lookup(scheduler_as_lookup);
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Snapshot CR3 for restore post-unwind.
+    let original_cr3: u64;
+    unsafe {
+        core::arch::asm!("mov {v}, cr3", v = out(reg) original_cr3,
+            options(nostack, preserves_flags));
+    }
+    SAVED_CR3_2.store(original_cr3, Ordering::Release);
+
+    // ExitTask lands at the naked trampoline.
+    set_exit_landing(testbin_resume_trampoline as usize as u64, 0);
+
+    let saved = unsafe { user_mode_setjmp(core::ptr::addr_of_mut!(JMP2)) };
+    if saved != 0 {
+        unsafe {
+            let cr3 = SAVED_CR3_2.load(Ordering::Acquire);
+            core::arch::asm!("mov cr3, {v}", v = in(reg) cr3,
+                options(nostack, preserves_flags));
+            core::arch::asm!("sti", options(nomem, nostack, preserves_flags));
+        }
+        clear_exit_landing();
+        __test_clear_global();
+        return TestResult::Pass;
+    }
+
+    // First pass — load + enter.
+    if NARF_TESTBIN_ELF.is_empty() {
+        return TestResult::Skip("narf-testbin not built (feature disabled?)");
+    }
+    let proc = match unsafe { load_user_process(NARF_TESTBIN_ELF) } {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("load_user_process failed on narf-testbin"),
+    };
+
+    if proc.address_space.activate().is_err() {
+        return TestResult::Fail("activate failed");
+    }
+
+    unsafe { core::arch::asm!("cli"); }
+    unsafe { user_mode_enter(proc.entry.0.as_u64(), proc.stack_top.as_u64()) }
+}
+#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
+kernel_test!(smoke_frame_x86_64_run_narf_testbin);
+
 fn smoke_userspace_raw_handler_dispatch() -> TestResult {
     // Install a RawSyscallHandler and confirm it observes the
     // TrapContext, can set the return, and (on x86_64) can ask to
