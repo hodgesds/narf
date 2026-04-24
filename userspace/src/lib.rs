@@ -42,7 +42,10 @@ pub mod syscall;
 
 pub use elf::{parse as parse_elf, ElfError};
 pub use loader::{load_into, EntryPoint, LoadError};
-pub use syscall::{Syscall, SyscallArgs, SyscallEntry, SyscallReturn, SyscallTable};
+pub use syscall::{
+    install_global, kernel_syscall_entry, FnHandler, Syscall, SyscallArgs,
+    SyscallEntry, SyscallHandler, SyscallReturn, SyscallTable,
+};
 
 use alloc::string::String;
 use alloc::vec::Vec;

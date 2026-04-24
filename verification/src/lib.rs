@@ -5505,6 +5505,65 @@ fn smoke_userspace_syscall_table_roundtrip() -> TestResult {
 }
 kernel_test!(smoke_userspace_syscall_table_roundtrip);
 
+fn smoke_userspace_syscall_dispatch_via_global() -> TestResult {
+    // Install a global table with a live handler for Syscall::Yield;
+    // kernel_syscall_entry(104, …) routes to it. Unregistered
+    // numbers return invalid_op.
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_userspace::{
+        install_global, kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+    };
+
+    __test_clear_global();
+
+    static SEEN_ARG: AtomicU64 = AtomicU64::new(0);
+    SEEN_ARG.store(0, Ordering::Relaxed);
+
+    let mut table = SyscallTable::new();
+    table.install_fn(Syscall::Yield, "yield", |args: &SyscallArgs| {
+        SEEN_ARG.store(args.arg0, Ordering::Relaxed);
+        SyscallReturn::ok(args.arg0.wrapping_add(1))
+    });
+    install_global(table);
+
+    // Happy path.
+    let args = SyscallArgs { arg0: 0x41, ..SyscallArgs::default() };
+    let r = kernel_syscall_entry(Syscall::Yield.raw(), &args);
+    if r != SyscallReturn::ok(0x42) {
+        __test_clear_global();
+        return TestResult::Fail("registered handler return mismatch");
+    }
+    if SEEN_ARG.load(Ordering::Relaxed) != 0x41 {
+        __test_clear_global();
+        return TestResult::Fail("handler did not observe args.arg0");
+    }
+
+    // Unknown number → invalid_op.
+    let r2 = kernel_syscall_entry(999, &args);
+    if r2 != SyscallReturn::invalid_op() {
+        __test_clear_global();
+        return TestResult::Fail("unknown number did not surface invalid_op");
+    }
+
+    // Known number without a handler → invalid_op.
+    let r3 = kernel_syscall_entry(Syscall::Write.raw(), &args);
+    if r3 != SyscallReturn::invalid_op() {
+        __test_clear_global();
+        return TestResult::Fail("handler-less number did not surface invalid_op");
+    }
+
+    // After __test_clear_global, every entry returns invalid_op —
+    // pre-boot / post-shutdown safety.
+    __test_clear_global();
+    let r4 = kernel_syscall_entry(Syscall::Yield.raw(), &args);
+    if r4 != SyscallReturn::invalid_op() {
+        return TestResult::Fail("no global should surface invalid_op");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_syscall_dispatch_via_global);
+
 fn smoke_userspace_process_id_and_aux() -> TestResult {
     use narf_userspace::{
         alloc_pid, AuxEntry, ExecImage, ExecKind, ProcessId, Segment, SegmentFlags,
