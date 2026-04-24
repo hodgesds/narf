@@ -30,6 +30,8 @@ members = [
     "power",
     "observability",
     "userspace",
+    "drivers/nvme",
+    "drivers/net",
 ]
 
 [workspace.package]

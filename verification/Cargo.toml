@@ -36,6 +36,8 @@ narf-filesystem = { path = "../filesystem" }
 narf-power      = { path = "../power" }
 narf-observability = { path = "../observability" }
 narf-userspace  = { path = "../userspace" }
+narf-drivers-nvme = { path = "../drivers/nvme" }
+narf-drivers-net  = { path = "../drivers/net" }
 
 [lints]
 workspace = true

@@ -455,6 +455,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-drivers-net"
+version = "0.0.0"
+dependencies = [
+ "narf-bus",
+ "narf-capabilities",
+ "narf-io",
+ "narf-lib",
+ "narf-net",
+]
+
+[[package]]
+name = "narf-drivers-nvme"
+version = "0.0.0"
+dependencies = [
+ "narf-block",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-io",
+ "narf-lib",
+]
+
+[[package]]
 name = "narf-drivers-virtio"
 version = "0.0.0"
 dependencies = [
@@ -627,6 +649,8 @@ dependencies = [
  "narf-console",
  "narf-crypto",
  "narf-drivers",
+ "narf-drivers-net",
+ "narf-drivers-nvme",
  "narf-drivers-virtio",
  "narf-filesystem",
  "narf-interrupts",

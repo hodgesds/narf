@@ -1,0 +1,22 @@
+[package]
+name         = "narf-drivers-net"
+description  = "Hardware NIC drivers (e1000/igb/ixgbe/mlx5) skeleton — Stage-4 primary."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_net"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../../lib" }
+narf-capabilities = { path = "../../capabilities" }
+narf-io           = { path = "../../io" }
+narf-net          = { path = "../../net" }
+narf-bus          = { path = "../../bus" }
+
+[lints]
+workspace = true

@@ -1,0 +1,22 @@
+[package]
+name         = "narf-drivers-nvme"
+description  = "NVMe host driver skeleton — Stage-4 primary."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_nvme"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../../lib" }
+narf-capabilities = { path = "../../capabilities" }
+narf-io           = { path = "../../io" }
+narf-block        = { path = "../../block" }
+narf-bus          = { path = "../../bus" }
+
+[lints]
+workspace = true

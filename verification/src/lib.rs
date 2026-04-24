@@ -4713,6 +4713,67 @@ fn smoke_block_deadline_promotes_expired() -> TestResult {
 }
 kernel_test!(smoke_block_deadline_promotes_expired);
 
+fn smoke_nvme_cap_register_decode() -> TestResult {
+    use narf_drivers_nvme::NvmeCaps;
+
+    // CAP layout: MQES[0..=15], DSTRD[32..=35], MPSMIN[48..=51],
+    // MPSMAX[52..=55]. Craft a value with MQES=0x3FF, DSTRD=2,
+    // MPSMIN=0, MPSMAX=4 and check the decoder.
+    let raw: u64 = 0x3FF
+        | (2u64 << 32)
+        | (0u64 << 48)
+        | (4u64 << 52);
+    let c = NvmeCaps::from_raw(raw);
+    if c.mqes != 0x3FF || c.dstrd != 2 || c.mpsmin != 0 || c.mpsmax != 4 {
+        return TestResult::Fail("NvmeCaps::from_raw decoded wrong");
+    }
+    if c.doorbell_stride() != 16 {
+        return TestResult::Fail("doorbell stride mis-computed (4 << 2 = 16)");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_nvme_cap_register_decode);
+
+fn smoke_nvme_probe_stub_surfaces_not_implemented() -> TestResult {
+    use narf_capabilities::{Cap, Write};
+    use narf_drivers_nvme::{Controller, NvmeError};
+
+    let mut ctrl = Controller::new(0x8000_0000);
+    let cap: Cap<narf_bus::BusDeviceCap, Write> = Cap::bootstrap();
+    match ctrl.probe(&cap) {
+        Err(NvmeError::NotImplemented) => {}
+        _ => return TestResult::Fail("probe should surface NotImplemented"),
+    }
+    let mut bad = Controller::new(0);
+    if bad.probe(&cap) != Err(NvmeError::BadBar) {
+        return TestResult::Fail("zero BAR should surface BadBar");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_nvme_probe_stub_surfaces_not_implemented);
+
+fn smoke_drivers_net_nic_model_ids() -> TestResult {
+    use narf_drivers_net::{NicCaps, NicModel};
+
+    // PCI vendor-id sanity.
+    let e1000 = NicModel::IntelE1000.primary_pci_id();
+    if e1000 != (0x8086, 0x100E) {
+        return TestResult::Fail("e1000 vendor/device id mismatch");
+    }
+    let mlx5 = NicModel::MellanoxMlx5.primary_pci_id();
+    if mlx5.0 != 0x15B3 {
+        return TestResult::Fail("Mellanox vendor id should be 0x15B3");
+    }
+
+    // Caps compose + contain.
+    let full = NicCaps::TX_CSUM | NicCaps::RX_CSUM | NicCaps::TSO;
+    if !full.contains(NicCaps::TSO) || full.contains(NicCaps::RSS) {
+        return TestResult::Fail("NicCaps::contains logic broken");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_drivers_net_nic_model_ids);
+
 fn smoke_userspace_process_id_and_aux() -> TestResult {
     use narf_userspace::{
         alloc_pid, AuxEntry, ExecImage, ExecKind, ProcessId, Segment, SegmentFlags,
