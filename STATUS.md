@@ -8,7 +8,7 @@ asks for. Updated when observable kernel behaviour changes.
 | stage | theme                                     | status |
 |-------|-------------------------------------------|--------|
 | 1. Skeleton      | Bootloader + async executor + console | **closed** — all 6 exit-gate items met |
-| 2. Barrier       | PKS/MTE domain switching + UIPI        | **in progress** — PKS enabled, domain API live |
+| 2. Barrier       | PKS/MTE domain switching + UIPI        | **closed** — both arches boot; higher-half, MTE, GICv3 all landed |
 | 3. Flow          | Narf-Ring + capabilities + first VirtIO | not started |
 | 4. Compatibility | relibc integration; run standard Rust bins | not started |
 
