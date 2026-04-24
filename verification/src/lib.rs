@@ -4713,6 +4713,90 @@ fn smoke_block_deadline_promotes_expired() -> TestResult {
 }
 kernel_test!(smoke_block_deadline_promotes_expired);
 
+fn smoke_bus_acpi_notify_dispatch() -> TestResult {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use narf_bus::acpi_notify::{
+        self, AcpiNotify, NotifyEvent, NotifyKind,
+    };
+    use narf_capabilities::{Cap, Grant};
+
+    acpi_notify::__test_reset();
+    acpi_notify::init();
+
+    static HITS: AtomicU32 = AtomicU32::new(0);
+    HITS.store(0, Ordering::Relaxed);
+
+    let cap: Cap<AcpiNotify, Grant> = Cap::bootstrap();
+    if acpi_notify::subscribe(&cap, |ev| {
+        if matches!(ev.kind, NotifyKind::Thermal) {
+            HITS.fetch_add(1, Ordering::Relaxed);
+        }
+    }).is_err() {
+        return TestResult::Fail("subscribe failed on live cap");
+    }
+
+    let _ = acpi_notify::dispatch_notify(NotifyEvent {
+        acpi_handle: 0x4242,
+        kind: NotifyKind::Thermal,
+    });
+    if HITS.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("Thermal notify did not reach subscriber");
+    }
+
+    // Unrelated notify doesn't increment our thermal counter.
+    let _ = acpi_notify::dispatch_notify(NotifyEvent {
+        acpi_handle: 0x4242,
+        kind: NotifyKind::PowerSource,
+    });
+    if HITS.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("non-thermal notify incremented thermal counter");
+    }
+
+    // NotifyKind::from_raw / raw round-trips.
+    if NotifyKind::from_raw(0x82) != NotifyKind::Thermal {
+        return TestResult::Fail("NotifyKind::from_raw broke on 0x82");
+    }
+    if NotifyKind::Device(0x77).raw() != 0x77 {
+        return TestResult::Fail("NotifyKind::Device round-trip broken");
+    }
+
+    acpi_notify::__test_reset();
+    TestResult::Pass
+}
+kernel_test!(smoke_bus_acpi_notify_dispatch);
+
+fn smoke_rcu_batched_reclaim_drains() -> TestResult {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use narf_rcu::BatchedReclaimer;
+
+    static COUNT: AtomicU32 = AtomicU32::new(0);
+    COUNT.store(0, Ordering::Relaxed);
+
+    let r = BatchedReclaimer::new(0);
+    if r.pending() != 0 { return TestResult::Fail("fresh reclaimer has pending"); }
+
+    for _ in 0..10 {
+        let _full = r.submit(|| { COUNT.fetch_add(1, Ordering::Relaxed); });
+    }
+    if r.pending() != 10 { return TestResult::Fail("submitted != pending"); }
+    if COUNT.load(Ordering::Relaxed) != 0 {
+        return TestResult::Fail("callback ran before flush");
+    }
+    r.flush();
+    if COUNT.load(Ordering::Relaxed) != 10 {
+        return TestResult::Fail("flush did not run all callbacks");
+    }
+    if r.pending() != 0 {
+        return TestResult::Fail("pending did not settle after flush");
+    }
+    if r.total_submitted() != 10 || r.total_drained() != 10 {
+        return TestResult::Fail("submit/drain totals off");
+    }
+    r.pace(2, 500);   // hint-only, no observable side effect
+    TestResult::Pass
+}
+kernel_test!(smoke_rcu_batched_reclaim_drains);
+
 fn smoke_net_stack_attach_not_implemented() -> TestResult {
     use narf_capabilities::{Cap, Invoke, Write};
     use narf_net::{AttachError, NetIface, StackAttach, StackDaemon};

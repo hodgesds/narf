@@ -45,12 +45,14 @@
 
 extern crate alloc;
 
+pub mod batched;
 pub mod epoch;
 pub mod hazard;
 pub mod policy;
 pub mod qsbr;
 pub mod sleepable;
 
+pub use batched::{BatchedReclaimer, ReclaimBatch, BATCH_CAP};
 pub use hazard::{HazardDomain, HazardGuard, HazardSlot, retire};
 pub use policy::ReclamationPolicy;
 pub use sleepable::{

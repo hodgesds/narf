@@ -31,11 +31,14 @@
 
 extern crate alloc;
 
+pub mod acpi_notify;
 pub mod addr;
 pub mod device;
 pub mod hotplug;
 pub mod msix;
 pub mod registry;
+
+pub use acpi_notify::{AcpiNotify, NotifyEvent, NotifyKind};
 
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;
