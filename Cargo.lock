@@ -367,6 +367,7 @@ version = "0.0.0"
 dependencies = [
  "narf-capabilities",
  "narf-ipc",
+ "narf-lib",
  "narf-rcu",
  "narf-scheduler",
 ]

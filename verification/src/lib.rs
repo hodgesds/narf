@@ -4154,6 +4154,170 @@ fn smoke_scheduler_budget_accounts_cycles() -> TestResult {
 }
 kernel_test!(smoke_scheduler_budget_accounts_cycles);
 
+fn smoke_abi_cancel_before_target_marks_cancelled() -> TestResult {
+    // §3.1 protocol: a Cancel submitted *before* its target is drained
+    // must complete the target with `Cancelled` (when CANCELLABLE is
+    // set on the target). The cancel op itself always completes `Ok`.
+    use core::sync::atomic::{AtomicU8, Ordering};
+    use narf_abi::{
+        completion_channel, submission_channel, Dispatcher, NarfStatus,
+        Submission, SubmissionFlags, Tag,
+    };
+
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+
+    narf_scheduler::init();
+    let (mut sq_tx, sq_rx) = submission_channel::<4>();
+    let (cq_tx, mut cq_rx) = completion_channel::<4>();
+
+    narf_scheduler::spawn(async move {
+        let mut d = Dispatcher::new(sq_rx, cq_tx);
+        d.run().await;
+    });
+
+    narf_scheduler::spawn(async move {
+        let target = Tag::new(0x7777);
+        let canceller = Tag::new(0xC001);
+
+        // 1. Submit the cancel first — dispatcher records the target.
+        sq_tx.send(Submission::cancel(canceller, target)).await.unwrap();
+        let c1 = cq_rx.recv().await.unwrap();
+        if c1.tag() != canceller || c1.status != NarfStatus::Ok {
+            OUTCOME.store(2, Ordering::Relaxed);
+            return;
+        }
+
+        // 2. Submit the target with CANCELLABLE — must come back Cancelled.
+        let mut sub = Submission::noop(target);
+        sub.flags = SubmissionFlags::CANCELLABLE;
+        sq_tx.send(sub).await.unwrap();
+        let c2 = cq_rx.recv().await.unwrap();
+        if c2.tag() != target || c2.status != NarfStatus::Cancelled {
+            OUTCOME.store(3, Ordering::Relaxed);
+            return;
+        }
+
+        OUTCOME.store(1, Ordering::Relaxed);
+        core::mem::drop(sq_tx);
+        core::mem::drop(cq_rx);
+    });
+
+    narf_scheduler::run_until_empty();
+    match OUTCOME.load(Ordering::Relaxed) {
+        1 => TestResult::Pass,
+        2 => TestResult::Fail("cancel submission did not complete Ok"),
+        3 => TestResult::Fail("cancellable target did not complete Cancelled"),
+        _ => TestResult::Fail("cancel protocol round-trip did not run"),
+    }
+}
+kernel_test!(smoke_abi_cancel_before_target_marks_cancelled);
+
+fn smoke_abi_cancel_non_cancellable_marks_request() -> TestResult {
+    // §3.1: a target without CANCELLABLE completes with
+    // `CancelRequested` so the caller knows the op ran to completion.
+    use core::sync::atomic::{AtomicU8, Ordering};
+    use narf_abi::{
+        completion_channel, submission_channel, Dispatcher, NarfStatus,
+        Submission, Tag,
+    };
+
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+
+    narf_scheduler::init();
+    let (mut sq_tx, sq_rx) = submission_channel::<4>();
+    let (cq_tx, mut cq_rx) = completion_channel::<4>();
+
+    narf_scheduler::spawn(async move {
+        let mut d = Dispatcher::new(sq_rx, cq_tx);
+        d.run().await;
+    });
+
+    narf_scheduler::spawn(async move {
+        let target = Tag::new(0x8888);
+        let canceller = Tag::new(0xC002);
+
+        sq_tx.send(Submission::cancel(canceller, target)).await.unwrap();
+        let _ = cq_rx.recv().await.unwrap();
+
+        // No CANCELLABLE flag on the target.
+        sq_tx.send(Submission::noop(target)).await.unwrap();
+        let c = cq_rx.recv().await.unwrap();
+        if c.tag() != target || c.status != NarfStatus::CancelRequested {
+            OUTCOME.store(2, Ordering::Relaxed);
+            return;
+        }
+
+        OUTCOME.store(1, Ordering::Relaxed);
+        core::mem::drop(sq_tx);
+        core::mem::drop(cq_rx);
+    });
+
+    narf_scheduler::run_until_empty();
+    match OUTCOME.load(Ordering::Relaxed) {
+        1 => TestResult::Pass,
+        2 => TestResult::Fail("non-cancellable target did not surface CancelRequested"),
+        _ => TestResult::Fail("dispatcher did not run the protocol"),
+    }
+}
+kernel_test!(smoke_abi_cancel_non_cancellable_marks_request);
+
+fn smoke_abi_cancel_stale_tag_is_noop() -> TestResult {
+    // §3.1: the cancel op is non-blocking and always succeeds even
+    // when the target tag never shows up. A subsequent unrelated
+    // submission must not inherit the cancel.
+    use core::sync::atomic::{AtomicU8, Ordering};
+    use narf_abi::{
+        completion_channel, submission_channel, Dispatcher, NarfStatus,
+        Submission, Tag,
+    };
+
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+
+    narf_scheduler::init();
+    let (mut sq_tx, sq_rx) = submission_channel::<4>();
+    let (cq_tx, mut cq_rx) = completion_channel::<4>();
+
+    narf_scheduler::spawn(async move {
+        let mut d = Dispatcher::new(sq_rx, cq_tx);
+        d.run().await;
+    });
+
+    narf_scheduler::spawn(async move {
+        let stale  = Tag::new(0xDEAD);
+        let other  = Tag::new(0xAAAA);
+        let canceller = Tag::new(0xC003);
+
+        // Cancel a tag the producer will never submit.
+        sq_tx.send(Submission::cancel(canceller, stale)).await.unwrap();
+        let c1 = cq_rx.recv().await.unwrap();
+        if c1.status != NarfStatus::Ok {
+            OUTCOME.store(2, Ordering::Relaxed);
+            return;
+        }
+
+        // Now submit an unrelated tag — must complete Ok.
+        sq_tx.send(Submission::noop(other)).await.unwrap();
+        let c2 = cq_rx.recv().await.unwrap();
+        if c2.tag() != other || c2.status != NarfStatus::Ok {
+            OUTCOME.store(3, Ordering::Relaxed);
+            return;
+        }
+
+        OUTCOME.store(1, Ordering::Relaxed);
+        core::mem::drop(sq_tx);
+        core::mem::drop(cq_rx);
+    });
+
+    narf_scheduler::run_until_empty();
+    match OUTCOME.load(Ordering::Relaxed) {
+        1 => TestResult::Pass,
+        2 => TestResult::Fail("cancel for a never-submitted tag did not return Ok"),
+        3 => TestResult::Fail("unrelated tag inherited a stale cancel"),
+        _ => TestResult::Fail("dispatcher never drained"),
+    }
+}
+kernel_test!(smoke_abi_cancel_stale_tag_is_noop);
+
 fn smoke_scheduler_cpu_set_membership() -> TestResult {
     use narf_scheduler::{Affinity, CpuId, CpuSet};
 

@@ -48,8 +48,13 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(missing_debug_implementations)]
 
+extern crate alloc;
+
+use alloc::vec::Vec;
+
 use narf_capabilities::CapSlot;
 use narf_ipc::{Consumer, Producer};
+use narf_lib::sync::IrqSafeSpinLock;
 
 // ── OpCode ──────────────────────────────────────────────────────────
 //
@@ -312,6 +317,30 @@ impl Submission {
         }
     }
 
+    /// Construct a cancel submission: `tag` is this submission's own
+    /// correlation tag, `target` is the tag of the outstanding
+    /// submission to cancel. Per spec §3.1 the cancel op itself
+    /// always succeeds with `Ok`; the target's terminal completion
+    /// reports `Cancelled` / `CancelRequested` / `Ok` separately.
+    #[inline]
+    pub const fn cancel(tag: Tag, target: Tag) -> Self {
+        let mut inline = [0u64; 6];
+        inline[0] = target.raw();
+        Self {
+            op: OpCode::Cancel,
+            flags: SubmissionFlags::NONE,
+            caps: [CapSlot::EMPTY; 4],
+            tag: tag.raw(),
+            inline,
+        }
+    }
+
+    /// Target tag for an `OpCode::Cancel` submission (inline[0]). Calling
+    /// on a non-cancel submission returns the inline[0] value as-is —
+    /// this is a structural accessor, not a type check.
+    #[inline]
+    pub const fn cancel_target(&self) -> Tag { Tag(self.inline[0]) }
+
     /// Return the correlation tag as a `Tag`.
     #[inline]
     pub const fn tag(&self) -> Tag { Tag(self.tag) }
@@ -410,18 +439,64 @@ pub fn completion_channel<const N: usize>() -> (CompletionQueue<N>, CompletionDr
 
 // ── Dispatcher ──────────────────────────────────────────────────────
 
+/// Pending-cancel registry — tags whose producers have issued an
+/// `OpCode::Cancel`. The dispatcher consults this before running each
+/// submission's op body: a hit short-circuits the op with `Cancelled`
+/// (for ops that carry `SubmissionFlags::CANCEL_AWARE`) or
+/// `CancelRequested` (for ops that don't).
+///
+/// Stage-3 single-task dispatch: the cancel is observed only when its
+/// target has not yet been dequeued. Stage-4's concurrent dispatcher
+/// will widen this into per-inflight-tag cancel flags so mid-op
+/// cancellation can interrupt a long-running await.
+#[derive(Debug)]
+struct PendingCancels {
+    tags: IrqSafeSpinLock<Vec<u64>>,
+}
+
+impl PendingCancels {
+    const fn new() -> Self {
+        Self { tags: IrqSafeSpinLock::new(Vec::new()) }
+    }
+
+    /// Record `target` as cancel-pending. Duplicates are silently
+    /// collapsed (set semantics) to keep the list bounded.
+    fn request(&self, target: Tag) {
+        let mut t = self.tags.lock();
+        if !t.iter().any(|&x| x == target.raw()) {
+            t.push(target.raw());
+        }
+    }
+
+    /// Consume a pending cancel for `tag` if present; returns `true`
+    /// iff this tag was cancel-pending. Removing on consume means a
+    /// late-arriving retry submission with the same tag is not
+    /// auto-cancelled.
+    fn consume(&self, tag: Tag) -> bool {
+        let mut t = self.tags.lock();
+        if let Some(pos) = t.iter().position(|&x| x == tag.raw()) {
+            t.swap_remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+
+}
+
 /// In-kernel ABI dispatcher. Drains a submission ring and dispatches
 /// to the appropriate subsystems.
 #[derive(Debug)]
 pub struct Dispatcher<const N: usize> {
-    sq: SubmissionDrain<N>,
-    cq: CompletionQueue<N>,
+    sq:      SubmissionDrain<N>,
+    cq:      CompletionQueue<N>,
+    pending: PendingCancels,
 }
 
 impl<const N: usize> Dispatcher<N> {
     /// Create a new dispatcher from a ring pair.
-    pub fn new(sq: SubmissionDrain<N>, cq: CompletionQueue<N>) -> Self {
-        Self { sq, cq }
+    pub const fn new(sq: SubmissionDrain<N>, cq: CompletionQueue<N>) -> Self {
+        Self { sq, cq, pending: PendingCancels::new() }
     }
 
     /// Run the dispatch loop. Never returns unless the submission ring
@@ -454,8 +529,30 @@ impl<const N: usize> Dispatcher<N> {
     async fn dispatch_one(&mut self, sub: Submission) -> Completion {
         let tag = sub.tag();
 
+        // Cancel-protocol pre-check (spec §3.1): if this submission's
+        // tag was already requested-to-cancel, short-circuit. Ops that
+        // carry `CANCEL_AWARE` complete `Cancelled`; all others complete
+        // `CancelRequested` — the spec's non-cancellable path.
+        // `OpCode::Cancel` itself bypasses the check (cancelling a
+        // cancel is a no-op whose completion still always succeeds).
+        if sub.op != OpCode::Cancel && self.pending.consume(tag) {
+            let status = if sub.flags.contains(SubmissionFlags::CANCELLABLE) {
+                NarfStatus::Cancelled
+            } else {
+                NarfStatus::CancelRequested
+            };
+            return Completion::with(tag, status, [0; 6]);
+        }
+
         match sub.op {
             OpCode::Noop => {
+                Completion::ok(tag)
+            }
+
+            OpCode::Cancel => {
+                // §3.1: cancel always succeeds; the target's terminal
+                // completion reports the outcome separately.
+                self.pending.request(sub.cancel_target());
                 Completion::ok(tag)
             }
 
@@ -469,5 +566,13 @@ impl<const N: usize> Dispatcher<N> {
                 Completion::with(tag, NarfStatus::InvalidOp, [0; 6])
             }
         }
+    }
+
+    /// Count of cancel requests that have been recorded but not yet
+    /// consumed by a matching submission. Diagnostic surface for tests
+    /// and tracing; not load-bearing for dispatch semantics.
+    pub fn pending_cancels(&self) -> usize {
+        let t = self.pending.tags.lock();
+        t.len()
     }
 }
