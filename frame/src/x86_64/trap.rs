@@ -87,6 +87,28 @@ fn vector_name(v: u64) -> &'static str {
 ///     does not return.
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
+    // Software-interrupt syscall gate. `int 0x80` arrives here; the
+    // caller's registers have been saved into `frame` already.
+    // Convention: rax = syscall number, rdi/rsi/rdx/r10/r8/r9 =
+    // args 0..5 (the standard x86_64 syscall ABI, except rcx is
+    // clobbered by the trap so we use r10 like `syscall` does).
+    // Return value in rax, status in rdx.
+    if frame.vector == 128 {
+        let args = narf_userspace::SyscallArgs {
+            arg0: frame.rdi,
+            arg1: frame.rsi,
+            arg2: frame.rdx,
+            arg3: frame.r10,
+            arg4: frame.r8,
+            arg5: frame.r9,
+        };
+        let num = frame.rax as u32;
+        let ret = narf_userspace::kernel_syscall_entry(num, &args);
+        frame.rax = ret.value;
+        frame.rdx = ret.status as u64;
+        return;
+    }
+
     // External IRQ path (vectors 32..=255). Dispatch to the
     // subsystem-registered handler (or ignore if no handler), then
     // EOI. Bypasses the probe-catch path — probes are for catching
