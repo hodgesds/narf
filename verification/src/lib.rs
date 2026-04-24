@@ -4459,6 +4459,69 @@ fn smoke_abi_cancel_stale_tag_is_noop() -> TestResult {
 }
 kernel_test!(smoke_abi_cancel_stale_tag_is_noop);
 
+fn smoke_scheduler_cpu_lifecycle_take_offline() -> TestResult {
+    use narf_capabilities::{Cap, Invoke};
+    use narf_scheduler::{
+        cpu_bring_up, cpu_online, cpu_take_offline,
+        CpuId, CpuLifecycle, HotPlugError,
+    };
+
+    narf_scheduler::cpu_lifecycle::__test_reset_online_mask();
+
+    let cap: Cap<CpuLifecycle, Invoke> = Cap::bootstrap();
+
+    if !cpu_online(CpuId::BOOT) {
+        return TestResult::Fail("boot CPU should be online after reset");
+    }
+    if cpu_online(CpuId(3)) {
+        return TestResult::Fail("CPU 3 should not be online before bring-up");
+    }
+    if cpu_bring_up(CpuId(3), &cap).is_err() {
+        return TestResult::Fail("cpu_bring_up with live cap returned Err");
+    }
+    if !cpu_online(CpuId(3)) {
+        return TestResult::Fail("cpu_bring_up did not mark CPU 3 online");
+    }
+    if cpu_take_offline(CpuId(3), &cap).is_err() {
+        return TestResult::Fail("cpu_take_offline with live cap returned Err");
+    }
+    if cpu_online(CpuId(3)) {
+        return TestResult::Fail("cpu_take_offline did not clear CPU 3");
+    }
+    match cpu_take_offline(CpuId::BOOT, &cap) {
+        Err(HotPlugError::OutOfRange) => {}
+        _ => return TestResult::Fail("boot CPU take-offline should be rejected"),
+    }
+
+    cap.revoke();
+    match cpu_bring_up(CpuId(3), &cap) {
+        Err(HotPlugError::AuthorityRevoked) => {}
+        _ => return TestResult::Fail("revoked lifecycle cap not rejected"),
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_scheduler_cpu_lifecycle_take_offline);
+
+fn smoke_scheduler_realtime_spec() -> TestResult {
+    use narf_scheduler::{Priority, SchedClass, SmtSharePolicy, TaskSpec};
+
+    let rt = TaskSpec::realtime(1_000_000);
+    if rt.class != SchedClass::RealTime {
+        return TestResult::Fail("realtime TaskSpec class wrong");
+    }
+    if rt.priority != Priority::HIGH {
+        return TestResult::Fail("realtime TaskSpec priority not HIGH");
+    }
+    if rt.smt != SmtSharePolicy::Avoid {
+        return TestResult::Fail("realtime TaskSpec SMT default wrong");
+    }
+    if rt.budget.deadline_cycles != Some(1_000_000) {
+        return TestResult::Fail("realtime deadline_cycles not stored");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_scheduler_realtime_spec);
+
 fn smoke_scheduler_donate_to_reorders_head() -> TestResult {
     // donate_to moves the named task to the head of the ready queue.
     // Called *before* run_until_empty, it swaps spawn-order so the

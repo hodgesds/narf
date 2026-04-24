@@ -36,9 +36,13 @@ extern crate alloc;
 
 pub mod affinity;
 pub mod budget;
+pub mod cpu_lifecycle;
+pub mod priority;
 
 pub use affinity::{Affinity, CpuId, CpuSet};
 pub use budget::{BudgetAccount, CpuBudget, OverrunPolicy, ResourceBudget};
+pub use cpu_lifecycle::{cpu_bring_up, cpu_online, cpu_take_offline, online_count, CpuLifecycle, HotPlugError};
+pub use priority::{Priority, SchedClass, SmtSharePolicy};
 
 // re-export the Invoke rights marker for callers who need to type a
 // donation cap — saves one import line at every call site.
@@ -133,6 +137,13 @@ pub struct TaskSpec {
     pub affinity:   Affinity,
     pub budget:     ResourceBudget,
     pub budget_cap: Option<Cap<CpuBudget, Spend>>,
+    /// Scheduling class (Stage-4). Stage-3 executor ignores this;
+    /// SMP dispatch consumes it once the deadline class lands.
+    pub class:      SchedClass,
+    /// Nice-style priority within `class`.
+    pub priority:   Priority,
+    /// SMT-sibling co-scheduling preference.
+    pub smt:        SmtSharePolicy,
 }
 
 impl TaskSpec {
@@ -143,6 +154,9 @@ impl TaskSpec {
             affinity:   Affinity::any(),
             budget:     ResourceBudget::unthrottled(),
             budget_cap: None,
+            class:      SchedClass::Normal,
+            priority:   Priority::NORMAL,
+            smt:        SmtSharePolicy::Avoid,
         }
     }
 
@@ -153,6 +167,26 @@ impl TaskSpec {
             affinity:   Affinity::any(),
             budget,
             budget_cap: Some(cap),
+            class:      SchedClass::Normal,
+            priority:   Priority::NORMAL,
+            smt:        SmtSharePolicy::Avoid,
+        }
+    }
+
+    /// Shorthand: realtime task with an absolute cycle deadline.
+    pub const fn realtime(deadline_cycles: u64) -> Self {
+        Self {
+            affinity:   Affinity::any(),
+            budget:     ResourceBudget {
+                share_ppm:       1_000_000,
+                burst_cycles:    u64::MAX,
+                deadline_cycles: Some(deadline_cycles),
+                policy:          OverrunPolicy::Ignore,
+            },
+            budget_cap: None,
+            class:      SchedClass::RealTime,
+            priority:   Priority::HIGH,
+            smt:        SmtSharePolicy::Avoid,
         }
     }
 }
