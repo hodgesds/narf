@@ -11,4 +11,13 @@ Linux RCU — see spec §1 and [`research/summaries/linux-rcu-variants.md`](./re
 
 - Spec: [`specification/spec.md`](./specification/spec.md)
 - Research: [`research/README.md`](./research/README.md)
-- Stage: 1 (API + QSBR stub) → 2 (real QSBR + epoch + hazard) → 3 (sleepable, consumers adopt) → 4 (full tuning).
+- Stage: **Stage 3 landed.** Real QSBR with per-CPU reader counters +
+  global epoch + per-CPU deferred-drop buckets; Epoch variant with
+  pin/unpin/advance/min_pinned; Hazard + Sleepable shape-only stubs.
+  `scheduler/` calls `narf_rcu::report_quiescent()` after every poll
+  so every cooperative yield advances the grace period (rcu/ §3.7).
+  Deferred to Stage 4: sleepable runtime with cap-gated scopes + time/
+  deadline, hazard-pointer full implementation, per-domain `defer_drop`
+  queues, reclamation-worker Future, batched drop queue under SMP,
+  RCU-backed consumers in `capabilities/` / `filesystem/` dentry
+  cache.

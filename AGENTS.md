@@ -9,8 +9,11 @@ Everything here is terse by design. Follow links for depth.
   domains (PKS on x86_64, MTE on aarch64).
 - **Async-first** executor, zero-copy Narf-Ring IPC, capability-typed
   access control, no root user.
-- **Status:** design phase; no code yet. Targets x86_64 + aarch64 from
-  day one.
+- **Status:** Stages 1 + 2 closed; Stage 3 composition landed (caps/
+  epoch, Narf-Ring SPSC, abi, drivers framework, io DMA, rcu, tracing,
+  bus, virtio-mmio skeleton) — `smoke_exit_gate_*` green on both
+  arches. Stage 4 "Compatibility" (real PKS/MTE enforcement on buffer
+  pages, real virtio device I/O, IOMMU, user-mode consumer) is next.
 
 ## Canonical docs (read when relevant, not always)
 

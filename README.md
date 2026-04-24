@@ -6,8 +6,14 @@ intra-address-space isolation.
 
 > "NARF: Because security shouldn't feel like a speed limit."
 
-Status: **Design Phase (v1.0)**. No code yet — this tree holds the design
-artefacts that will drive implementation.
+Status: **Stage 3 composition landed**. Stages 1 ("Skeleton") and 2
+("Barrier") are closed; Stage 3 ("Flow") has every subsystem the
+ROADMAP lists for it wired end-to-end, with `smoke_exit_gate_*`
+proving the `DmaBuffer → Narf-Ring → cap-gated consumer` composition
+on both x86_64 and aarch64. Stage 4 ("Compatibility") — real PKS/MTE
+enforcement on buffer pages, driving real virtio hardware, IOMMU
+programming, user-mode consumer via `abi/` — is next. See `STATUS.md`
+for current test tallies and `ROADMAP.md` / `STAGE3.md` for the plan.
 
 ## Core ideas
 

@@ -212,6 +212,112 @@ Remaining Stage 2 items (all additive / out of scope for local test):
 - **Per-CPU probe state** — this is actually a Stage 3 SMP item
   (current single-CPU state is correct by construction for Stage 2).
 
+## Stage 3 Flow — what exists
+
+- **`capabilities/`**: 128-bit `CapSlot` (`repr(C, align(16))`,
+  CMPXCHG16B / LDXP-STXP / CASPAL-sized), `Cap<T, R: Rights>` with
+  hand-rolled `Copy`/`Clone`/`Send`/`Sync`, `Read`/`Write`/`Grant`
+  + reflexive `SubsetOf<R>` compile-time narrowing, full `CapKind`
+  wire registry (§3.1), `CapType` marker, `parse_kind`/`kind_name`.
+  Live cap-table runtime: per-object `AtomicU32` epoch in an
+  append-only `Vec<Entry>` under `IrqSafeSpinLock`; `check_live`
+  compares stored generation to current epoch; `revoke(self)`
+  `fetch_add(AcqRel)`s the epoch → O(1) mass invalidation across
+  every clone / badged copy / derived narrowing; `invoke<O: CapOp>`
+  gates on `check_live` then dispatches `op.execute(cap)`; safe
+  `Cap::<T: CapType, R>::bootstrap()` allocates a fresh object
+  entry and mints a cap with the right `CapKind` tag.
+- **`ipc/`**: Narf-Ring SPSC. `Ring<T, N>` with cache-line-partitioned
+  head/tail via `Align64<AtomicU64>`, `MaybeUninit<T>` slot ownership
+  transfer (T moves through the ring; no byte-level copy), explicit
+  release/acquire pair on every index transition (correct under
+  aarch64's weaker ordering model), both-side waker slots
+  (`SpinLock` producer-side + `IrqSafeSpinLock` consumer-side for
+  driver-IRQ publish contexts), `closed` latch on drop, `Drop for
+  Ring` drains undelivered slots. `CapType` → `CapKind::Ring`.
+- **`abi/`**: wire shapes. `Submission { op, flags, caps: [CapSlot; 4],
+  tag, inline: [u64; 6] }` sized 144 B / 16-aligned (`CapSlot`'s
+  16-align forces an 8-byte mid pad + 8-byte tail pad — the naive
+  128-byte arithmetic undercounts both), `Completion { tag, status,
+  result: [u64; 6] }` at 64 B / 8-aligned, `OpCode` (`repr(u32)`,
+  7 variants with pinned discriminants), `SubmissionFlags`
+  (`repr(transparent)` u32 bit-set), `NarfStatus` (`repr(u32)`,
+  8 pinned variants), `Tag(u64)` correlation newtype,
+  `SubmissionQueue` / `CompletionQueue` type aliases over
+  `narf-ipc` Producer/Consumer. Cancellation protocol of §3.1
+  deferred to Stage 4 dispatcher work.
+- **`drivers/`**: framework. `Driver` trait (async `start`/`quiesce`
+  via `Pin<Box<dyn Future>>` so the registry holds heterogeneous
+  drivers), `DriverHandle` cap marker → `CapKind::Driver`,
+  `DriverManifest` (typed `&[CapKind]`, compile-checked — a manifest
+  naming an unknown cap is a build error), `DomainPolicy::{Shared,
+  Dedicated}` with §4.1 6-driver-dedicated-domain cap, `DriverEnv`
+  handed to `start`, `DriverRegistry` + global `registry()` with
+  cap-gated `register()` (Wave-3a fix landed: count+push in one
+  critical section), `DriverPhase` state machine providing shared
+  exclusivity for both `start_named` and `quiesce_named` (Wave-3a
+  aliasing-UB fix), `with_entry` observer accessor, `NoopDriver`
+  reference impl, `bootstrap_authority()`.
+- **`drivers/virtio/`**: virtio-mmio skeleton. Register constants
+  per spec §4.2.2, `VirtioMmioDevice::probe` / `probe_raw`
+  validating magic / version / device-id / vendor-id with
+  `compiler_fence(SeqCst)` pair per `arch/` §4, `ProbeError`,
+  `VirtioSkeletonDriver` implementing the `Driver` trait. Feature
+  negotiation, virtqueue ring, doorbells, IRQ binding, subdrivers:
+  Stage 4.
+- **`io/`**: DMA buffer + IOMMU stub. `DmaBuffer` (backed by a
+  single `PhysFrame`, `CapType` → `CapKind::DmaBuffer`, `phys_addr`
+  / `len` / `domain` / `coherency` getters), `alloc_coherent` /
+  `free_coherent` (page-aligned), `IommuContext` with `map` /
+  `unmap` as QEMU-compatible no-ops, `IoError` enum, `p2p_map`
+  signature-only placeholder. Multi-frame contig, real VT-d/AMD-Vi/
+  SMMUv3, P2P, aarch64 `DC CIVAC`: Stage 4.
+- **`rcu/`**: real QSBR (per-CPU reader counters + global epoch +
+  per-CPU deferred-drop buckets with `u64::MAX` offline-CPU
+  sentinel), Epoch variant (`pin`/`unpin`/`advance`/`min_pinned`),
+  Hazard + Sleepable shape-only stubs, `Owned<T>` /
+  `Shared<'g, T>` / `Atomic<T>` public surface. `scheduler/`
+  calls `narf_rcu::report_quiescent()` after every `Future::poll`
+  return per rcu/ §3.7 — every cooperative yield advances the
+  grace period.
+- **`tracing/`**: static markers + flight recorder. `probe!` macro
+  emits a nop-sled + `.note.narf.probes` ELF-note record (KEEP'd on
+  both arches, bounded by `__narf_probes_start`/`_end`),
+  `FlightRing<T, N>` with per-slot seqlock publish protocol
+  (odd=in-flight, even=published), const-asserted non-zero
+  power-of-two `N`. Dynamic probes, `FnTime`, HW trace: Stage 4.
+- **`bus/`**: enumeration. PCIe ECAM walker on x86_64 (q35 default
+  `0xb000_0000`, MCFG deferred), FDT bus walker on aarch64 with a
+  QEMU-virt fallback layout, `BusDevice` / `BusKind::{Pcie, VirtioMmio}`
+  / `DeviceId`, read-only registry, `claim_device` stub. Hot-plug,
+  MSI-X, IOMMU-group coordination: Stage 4.
+- **`scheduler/`**: per-task waker plumbing (Wave-0 + Stage-2 close).
+  Each `TaskSlot` owns an `Arc<AtomicBool>` awake flag; `Waker`
+  vtable flips it via `wake`/`wake_by_ref`. `run_until_empty`
+  `swap(false)`s before polling and skips slots whose flag is
+  still false, so IRQ/IPC-driven futures no longer cost a poll per
+  loop iteration. `narf_rcu::report_quiescent()` invoked after each
+  poll.
+
+### Stage 3 exit-gate integration
+
+`smoke_exit_gate_buffer_handoff` + `smoke_exit_gate_revoked_cap_rejected`
+(both arches) compose the spec's Stage-3 criterion: task-1 `alloc_coherent`
+→ writes a 17-byte pattern to the buffer's phys address → mints
+`Cap::<DmaBuffer, Read>::bootstrap()` → sends `(DmaBuffer, Cap)` through
+an `ipc/` channel; task-2 `recv().await` → `cap.check_live()` gate →
+volatile-reads the pattern → asserts match. Ownership moves by handle
+(no memcpy of the payload). The revoked-cap variant confirms O(1) mass
+invalidation on the fast path.
+
+What Stage 4 adds that Stage 3 elides (tracked as follow-ups in each
+subsystem's README): real PKS/MTE enforcement on buffer pages, driving
+real virtio silicon (feature negotiation, virtqueue rings, doorbells,
+IRQ binding, subdrivers), real IOMMU programming, user-mode consumer
+via `abi/` submission surface (makes "no Ring-0 trap on the fast path"
+literal instead of trivial-in-kernel-AS), `BootstrapRequest` / Reply
+slow path in `frame/`, cooperative-cancel state machine in `abi/`.
+
 ## Stage 2 design debt (not blocking, worth tracking)
 
 - **Higher-half migration**. Linker script lives at phys 0x100000,

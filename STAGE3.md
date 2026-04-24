@@ -10,32 +10,45 @@ running in its own PKS domain, moves a buffer through a Narf-Ring to
 another domain using only capability invocations, with no copy and no
 Ring-0 trap on the fast path.
 
+## Current status
+
+Composition landed end-to-end, both arches green: x86_64 56/56,
+aarch64 47/47 + 1 structurally-sound skip (`smoke_virtio_mmio_probe`
+has no attached virtio backend in the current xtask QEMU line).
+`smoke_exit_gate_buffer_handoff` + `smoke_exit_gate_revoked_cap_rejected`
+compose the criterion. Real PKS/MTE enforcement on the buffer pages,
+real virtio device I/O, real IOMMU programming, and a user-mode
+consumer via `abi/` submissions are Stage 4 items — see per-subsystem
+READMEs for the full deferral list.
+
+Wave legend below: ✓ = landed, → = Stage 4.
+
 ## Critical path — wave ordering
 
 The rationale is: rings need caps to name their endpoints; the ABI
 needs both rings and the cap table to exist; drivers are the first
 composed consumer of all three.
 
-- **Wave 0 — `capabilities/` type-level skeleton.**
+- ✓ **Wave 0 — `capabilities/` type-level skeleton.**
   `CapSlot` / `Cap<T, R>` / `Rights` sealed trait / `CapError` /
   `CapKind` enum. No runtime cap table yet; `invoke` returns
   `unimplemented!()`. Unblocks the `ipc/` endpoint-cap signatures
   (`Cap<Ring<T>, Send>`, `Cap<Ring<T>, Recv>`) so Wave 1 can land
   with the real types rather than placeholders.
-- **Wave 1 — `ipc/` Narf-Ring SPSC.** Producer/consumer with
+- ✓ **Wave 1 — `ipc/` Narf-Ring SPSC.** Producer/consumer with
   cache-line-partitioned head/tail/payload, explicit release/acquire
   pair per index transition, 2-bit wrap generation, aarch64 pointer
   retag hook (stub until Wave 3 cross-domain tests exercise it),
   `Result<T, RecvError>` on `recv`. SPSC first — MPSC is an open
   question per `ipc/` §8, punt to Stage 4.
-- **Wave 2 — per-task cap table + `abi/` rings.** `capabilities/`
+- ✓ **Wave 2 — per-task cap table + `abi/` rings.** `capabilities/`
   gains the per-task `CapSlot` array in its own domain
   (`DomainId::CAPS`), `invoke` is real, epoch revocation bumps the
   object-side `u32` per `capabilities/` §3. `abi/` defines
   `Submission` / `Completion` / `OpCode`, the slow-path `bootstrap`
   syscall, and the cancellation protocol in `abi/` §3.1. Rings from
   Wave 1 become the transport.
-- **Wave 3 — driver framework + first virtio driver.** `drivers/`
+- ✓ **Wave 3 — driver framework + first virtio driver.** `drivers/`
   framework implements the `Driver` trait, manifest parsing against
   `CapKind`, domain assignment, `DriverEnv`, lifecycle
   (start/quiesce/teardown). `drivers/virtio/` adopts it, claims a
