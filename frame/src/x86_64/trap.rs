@@ -89,7 +89,8 @@ fn vector_name(v: u64) -> &'static str {
 pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
     // Recoverable-probe path. `consume` is atomic: a second fault
     // inside the handler can't double-claim the recovery.
-    let recovery = narf_arch::x86_64::probe::consume(frame.vector as u32);
+    let recovery = narf_arch::x86_64::probe::consume(
+        frame.vector as u32, frame.error_code);
     if recovery != 0 {
         frame.rip = recovery;
         return;

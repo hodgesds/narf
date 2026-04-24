@@ -144,6 +144,30 @@ pub unsafe fn write_identity<T>(phys: PhysAddr, value: T) {
     unsafe { ptr::write_volatile(phys.raw() as *mut T, value); }
 }
 
+/// Read the currently-active PML4 physical address from CR3.
+///
+/// # Safety
+/// `MOV from CR3` is always legal at CPL=0; the `unsafe` marker is for
+/// the inline-asm boundary only.
+pub unsafe fn read_cr3() -> PhysAddr {
+    use core::arch::asm;
+    use core::sync::atomic::{compiler_fence, Ordering};
+
+    let v: u64;
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: CR3 read at CPL=0 is always defined.
+    unsafe {
+        asm!(
+            "mov {v}, cr3",
+            v = out(reg) v,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    compiler_fence(Ordering::SeqCst);
+    // Low 12 bits are PCID (when CR4.PCIDE=1); mask them off.
+    PhysAddr::new(v & 0x000f_ffff_ffff_f000)
+}
+
 /// Load a fresh PML4 physical address into CR3. The full pre/post
 /// `compiler_fence(SeqCst)` pair follows `arch/` §4 discipline.
 ///

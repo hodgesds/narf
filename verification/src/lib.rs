@@ -294,16 +294,107 @@ fn smoke_probe_catches_page_fault() -> TestResult {
 
     // Step 3: disarm and inspect.
     let caught = probe::disarm();
-    if caught == 0 {
-        return TestResult::Fail("probe didn't catch the expected #PF");
+    match caught.vector {
+        Some(14) => TestResult::Pass,
+        Some(_)  => TestResult::Fail("wrong vector caught (not #PF)"),
+        None     => TestResult::Fail("probe didn't catch the expected #PF"),
     }
-    if caught - 1 != 14 {
-        return TestResult::Fail("wrong vector caught (not #PF)");
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_probe_catches_page_fault);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_pks_enforces_deny_all() -> TestResult {
+    // End-to-end PKS enforcement demo:
+    //  1. Allocate a fresh 4 KiB frame.
+    //  2. Map it at virt 0x2_0000_1000 (8 GiB + 4 KiB) with PK=9, in
+    //     the *live* PML4 (the one CR3 currently points at).
+    //  3. Set IA32_PKRS domain 9 to DENY_ALL.
+    //  4. Arm the probe and attempt a write at the tagged virt.
+    //  5. Verify the handler caught #PF (vector 14) with the PK bit
+    //     (error-code bit 5) set.
+    //  6. Restore PKRS, unmap the page, free the frame.
+    use core::arch::asm;
+    use narf_arch::x86_64::{probe, pks::{self, DomainRights}, Features};
+    use narf_memory::{alloc_frame, FrameAllocError, free_frame, VirtAddr};
+    use narf_memory::paging::{map_4kb, unmap_4kb, read_cr3, PtFlags};
+
+    // SAFETY: CPUID always legal.
+    let feats = unsafe { Features::probe() };
+    if !feats.pks {
+        return TestResult::Skip("PKS not exposed");
+    }
+
+    // SAFETY: allocator is up, read_cr3 is always safe.
+    let pml4 = unsafe { read_cr3() };
+    let frame = match alloc_frame() {
+        Ok(f) => f,
+        Err(FrameAllocError::Uninitialised) =>
+            return TestResult::Skip("frame allocator not initialised"),
+        Err(_) => return TestResult::Fail("alloc_frame failed"),
+    };
+    let virt = VirtAddr::new(0x2_0000_1000);
+    let phys = frame.start_address();
+    let flags = PtFlags::WRITABLE | PtFlags::pk(9);
+
+    // SAFETY: live PML4 modification. We're the only CPU, interrupts
+    // aren't in a weird state (kernel tests run synchronously on the
+    // BSP), and virt is in unmapped territory (PDPT[8] is empty).
+    if unsafe { map_4kb(pml4, virt, phys, flags) }.is_err() {
+        free_frame(frame);
+        return TestResult::Fail("map_4kb of test page failed");
+    }
+
+    // SAFETY: CR4.PKS is 1 (frame/ set it during boot based on CPUID).
+    let saved_pkrs = unsafe { pks::save() };
+    unsafe { pks::set_rights(9, DomainRights::DENY_ALL); }
+
+    // Probe: a store to `virt` should #PF with PK bit in error code.
+    let recovery: u64;
+    // SAFETY: LEA of a local label.
+    unsafe {
+        asm!(
+            "lea {r}, [88f + rip]",
+            r = out(reg) recovery,
+            options(nostack, preserves_flags),
+        );
+    }
+    probe::arm(recovery);
+
+    // SAFETY: store that's expected to fault. The probe catches it.
+    unsafe {
+        asm!(
+            "mov byte ptr [{p}], 1",
+            "88:",
+            p = in(reg) virt.raw(),
+            options(nostack),
+        );
+    }
+
+    let caught = probe::disarm();
+
+    // Restore PKRS before anything else so subsequent tests aren't
+    // affected.
+    // SAFETY: see pks::save.
+    unsafe { pks::restore(saved_pkrs); }
+
+    // Unmap the test page and release the frame.
+    let _ = unsafe { unmap_4kb(pml4, virt) };
+    free_frame(frame);
+
+    match caught.vector {
+        None => return TestResult::Fail("PKS didn't fault on DENY_ALL-tagged write"),
+        Some(14) => {}
+        Some(_) => return TestResult::Fail("wrong vector caught (not #PF)"),
+    }
+    // x86_64 #PF error-code bit 5 = protection-key violation.
+    if caught.error_code & (1 << 5) == 0 {
+        return TestResult::Fail("fault caught, but PK bit (5) not set — regular #PF, not PKS");
     }
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test!(smoke_probe_catches_page_fault);
+kernel_test!(smoke_pks_enforces_deny_all);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_pks_set_get_rights() -> TestResult {
