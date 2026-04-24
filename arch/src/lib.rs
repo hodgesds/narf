@@ -132,6 +132,17 @@ pub extern "Rust" fn narf_arch_cpu_id() -> usize {
     0
 }
 
+/// Hook that `narf_lib::assert::current_domain` calls to avoid a dep
+/// cycle. Stage 3 returns 0 (`DomainId::FRAME`) — the Stage-2 bring-up
+/// runs every task in-Frame. Stage 4 replaces the body with a live
+/// PKRU / PKRS / TCF-derived read once per-task domain tracking lands.
+/// Returning an out-of-range value here would cause `DomainId::new`
+/// to panic at construction, so the body is intentionally conservative.
+#[unsafe(no_mangle)]
+pub extern "Rust" fn narf_arch_current_domain() -> u8 {
+    0
+}
+
 /// Halt until the next interrupt. On x86_64 falls back to `spin_loop`
 /// when IRQs are masked (HLT would otherwise deadlock). On aarch64 uses
 /// WFI, which wakes on IRQ regardless of mask state.

@@ -2380,3 +2380,36 @@ fn smoke_abi_dispatcher_roundtrip() -> TestResult {
     }
 }
 kernel_test!(smoke_abi_dispatcher_roundtrip);
+
+fn smoke_lib_current_domain_hook() -> TestResult {
+    // narf-arch provides `narf_arch_current_domain` as the weak hook
+    // `narf-lib` calls. Stage-3 default: 0 == DomainId::FRAME. Any
+    // drift here breaks every assert_in_domain / assert_tcb caller.
+    use narf_lib::assert::current_domain;
+    use narf_lib::id::DomainId;
+
+    if current_domain() != DomainId::FRAME {
+        return TestResult::Fail("arch hook returned non-FRAME domain at boot");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_lib_current_domain_hook);
+
+fn smoke_lib_assert_in_domain_passes_on_frame() -> TestResult {
+    // The always-on assert variant must not panic when the expected
+    // domain matches. Stage-3 default has every task running in FRAME.
+    use narf_lib::id::DomainId;
+    narf_lib::assert_in_domain!(DomainId::FRAME);
+    narf_lib::assert_tcb!();
+    TestResult::Pass
+}
+kernel_test!(smoke_lib_assert_in_domain_passes_on_frame);
+
+fn smoke_lib_bug_on_false_is_silent() -> TestResult {
+    // bug_on! is a panic-path macro; a false condition must NOT panic.
+    // Also implicitly tests the format-args path compiles.
+    narf_lib::bug_on!(false, "should not fire");
+    narf_lib::bug_on!(1 + 1 != 2, "arithmetic drift: {}", 42);
+    TestResult::Pass
+}
+kernel_test!(smoke_lib_bug_on_false_is_silent);
