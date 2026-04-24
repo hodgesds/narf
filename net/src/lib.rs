@@ -44,6 +44,9 @@
 
 extern crate alloc;
 
+pub mod stack;
+pub use stack::{AdminCap, AttachError, StackAttach, StackAttachReply, StackDaemon};
+
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt;

@@ -60,6 +60,9 @@
 
 extern crate alloc;
 
+pub mod page_cache;
+pub use page_cache::{Page, PageCache, PageKey, PAGE_SIZE};
+
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;

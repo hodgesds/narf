@@ -4713,6 +4713,57 @@ fn smoke_block_deadline_promotes_expired() -> TestResult {
 }
 kernel_test!(smoke_block_deadline_promotes_expired);
 
+fn smoke_net_stack_attach_not_implemented() -> TestResult {
+    use narf_capabilities::{Cap, Invoke, Write};
+    use narf_net::{AttachError, NetIface, StackAttach, StackDaemon};
+
+    let iface: Cap<NetIface, Write> = Cap::bootstrap();
+    let daemon: Cap<StackDaemon, Invoke> = Cap::bootstrap();
+    let req = StackAttach { iface, daemon };
+
+    // Use a VirtioNet placeholder as the attach target — it
+    // implements `Interface` and doesn't need a running forwarder.
+    let stub = narf_net::virtio_net::VirtioNet::new("vnet0", [0; 6], 1500);
+    match narf_net::stack::attach(&req, &stub) {
+        Err(AttachError::NotImplemented) => {}
+        _ => return TestResult::Fail("attach should surface NotImplemented"),
+    }
+    iface.revoke();
+    match narf_net::stack::attach(&req, &stub) {
+        Err(AttachError::IfaceCapRevoked) => {}
+        _ => return TestResult::Fail("revoked iface cap should be rejected first"),
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_net_stack_attach_not_implemented);
+
+fn smoke_fs_page_cache_dirty_drain() -> TestResult {
+    use narf_filesystem::{Page, PageCache, PageKey};
+
+    let pc = PageCache::new();
+    let k = PageKey { fs_id: 1, inode: 2, page_off: 0 };
+
+    if pc.lookup(k).is_some() {
+        return TestResult::Fail("empty cache should lookup None");
+    }
+    let p = Page::zeroed();
+    pc.insert(k, p);
+    if pc.len() != 1 { return TestResult::Fail("insert did not grow cache"); }
+
+    if !pc.mark_dirty(k) { return TestResult::Fail("mark_dirty missed a live key"); }
+    let drained = pc.drain_dirty();
+    if drained.len() != 1 || drained[0].0 != k {
+        return TestResult::Fail("drain_dirty did not return the marked page");
+    }
+    // After drain the dirty flag is cleared.
+    let again = pc.drain_dirty();
+    if !again.is_empty() {
+        return TestResult::Fail("second drain without new mark should be empty");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_fs_page_cache_dirty_drain);
+
 fn smoke_crypto_tpm_command_shapes() -> TestResult {
     use narf_crypto::tpm::{submit, Tpm2Command, Tpm2Status, TpmAlgHash, TpmCc};
 
