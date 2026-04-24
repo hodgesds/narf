@@ -5059,6 +5059,73 @@ fn smoke_drivers_net_nic_model_ids() -> TestResult {
 }
 kernel_test!(smoke_drivers_net_nic_model_ids);
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_address_space_materialize() -> TestResult {
+    // Full flow: new_for_user allocates a fresh PML4, map_region
+    // records a region, materialize walks the region and installs
+    // real PTEs via map_4kb, then translate() under the new PML4
+    // finds the mapping.
+    use narf_memory::{
+        x86_64::paging::{self, PtFlags},
+        AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr,
+    };
+
+    let mut a = unsafe { AddressSpace::new_for_user() }.expect("alloc AS");
+    // Pick a user virtual address in PML4 entry 1 — outside the
+    // identity-mapped low 4 GiB (PML4[0] → PDPT[0..4] with HUGE_PAGE)
+    // so the walk doesn't trip `EncounteredHugePage`.
+    let vbase = 0x0000_0080_0000_0000u64; // 512 GiB, PML4[1]
+    // Allocate a real phys frame to back it.
+    let target = match narf_memory::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => return TestResult::Skip("frame allocator drained"),
+    };
+
+    a.map_region(Region {
+        base:  VirtAddr::new(vbase),
+        len:   0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys:  target,
+    }).expect("map region");
+
+    if unsafe { a.materialize() }.is_err() {
+        return TestResult::Fail("materialize failed on fresh user PML4");
+    }
+
+    // Walk the PML4 to confirm the PTE is installed with the
+    // expected physical address + flags.
+    let got = unsafe { paging::translate(a.root, VirtAddr::new(vbase)) };
+    match got {
+        Some(phys) => {
+            if phys != target {
+                return TestResult::Fail("translate returned wrong phys");
+            }
+        }
+        None => return TestResult::Fail("translate found no mapping post-materialize"),
+    }
+
+    // Flags should include PRESENT + WRITABLE + USER.
+    let flags = unsafe { paging::flags_at(a.root, VirtAddr::new(vbase)) };
+    let want = PtFlags::PRESENT | PtFlags::WRITABLE | PtFlags::USER | PtFlags::NO_EXEC;
+    match flags {
+        Some(f) if f.contains(PtFlags::PRESENT)
+              && f.contains(PtFlags::WRITABLE)
+              && f.contains(PtFlags::USER)
+              && f.contains(PtFlags::NO_EXEC) => {
+            let _ = want;
+        }
+        _ => return TestResult::Fail("mapped PTE missing expected flags"),
+    }
+
+    // Idempotent second call.
+    if unsafe { a.materialize() }.is_err() {
+        return TestResult::Fail("second materialize should be idempotent");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_memory_address_space_materialize);
+
 fn smoke_scheduler_spawn_user_carries_address_space() -> TestResult {
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicU32, Ordering};

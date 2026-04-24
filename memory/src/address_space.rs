@@ -141,6 +141,47 @@ impl AddressSpace {
     /// Snapshot of the region list.
     pub fn regions(&self) -> &[Region] { &self.regions }
 
+    /// Materialise all pending regions into actual page-table entries.
+    /// On x86_64 walks each region's pages and calls `map_4kb` on the
+    /// AS's PML4 root; on aarch64 returns `NotImplemented` until the
+    /// 4 KiB map primitive lands.
+    ///
+    /// # Safety
+    /// The AS must have been constructed via `new_for_user` (so
+    /// `root` points at a valid full-copy PML4). Repeated calls are
+    /// idempotent — `map_4kb` returns `AlreadyMapped` on the second
+    /// pass and this surface treats it as success.
+    #[cfg(target_arch = "x86_64")]
+    pub unsafe fn materialize(&self) -> Result<(), AddressSpaceError> {
+        use crate::x86_64::paging::{map_4kb, MapError, PtFlags};
+        if self.root.as_u64() == 0 { return Err(AddressSpaceError::OutOfRange); }
+        for r in &self.regions {
+            let mut flags = PtFlags::USER;
+            if r.perms.contains(RegionPerms::WRITE) { flags = flags | PtFlags::WRITABLE; }
+            if !r.perms.contains(RegionPerms::EXEC) { flags = flags | PtFlags::NO_EXEC; }
+
+            let pages = r.len >> 12;
+            for i in 0..pages {
+                let v = crate::VirtAddr::new(r.base.as_u64() + (i << 12));
+                let p = crate::PhysAddr::new(r.phys.as_u64() + (i << 12));
+                // SAFETY: `self.root` is a valid PML4 per the
+                // `new_for_user` contract; pages walked are within
+                // the region we're materialising.
+                match unsafe { map_4kb(self.root, v, p, flags) } {
+                    Ok(()) => {}
+                    Err(MapError::AlreadyMapped) => {}   // idempotent
+                    Err(_)                        => return Err(AddressSpaceError::NotImplemented),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    pub unsafe fn materialize(&self) -> Result<(), AddressSpaceError> {
+        Err(AddressSpaceError::NotImplemented)
+    }
+
     /// Find the region covering `vaddr`, if any.
     pub fn lookup(&self, vaddr: VirtAddr) -> Option<&Region> {
         let a = vaddr.as_u64();
