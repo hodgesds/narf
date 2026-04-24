@@ -3949,3 +3949,120 @@ fn smoke_tracing_histogram_quantile_bucket() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_tracing_histogram_quantile_bucket);
+
+fn smoke_obs_pmu_sample_into_ring() -> TestResult {
+    // sample_pmu pushes one ObservabilityEvent::Pmu per call, cap-gated
+    // on Cap<Pmu, Read>. Revoking the cap must surface as Err(Revoked).
+    use narf_capabilities::{Cap, Read};
+    use narf_observability::{
+        sample_pmu, take_snapshot, install_panic_snapshot, ObsError,
+        ObservabilityEvent, Pmu, Recorder, SNAPSHOT_CAPACITY,
+        __test_clear_panic_ring,
+    };
+    use narf_tracing::FlightRing;
+
+    __test_clear_panic_ring();
+
+    static RING: FlightRing<ObservabilityEvent, SNAPSHOT_CAPACITY>
+        = FlightRing::new();
+    let rec: Cap<Recorder, narf_capabilities::Grant> = Cap::bootstrap();
+    if install_panic_snapshot(&rec, &RING).is_err() {
+        return TestResult::Fail("install_panic_snapshot failed");
+    }
+
+    let cap: Cap<Pmu, Read> = Cap::bootstrap();
+    if sample_pmu(&cap, &RING).is_err() {
+        __test_clear_panic_ring();
+        return TestResult::Fail("sample_pmu returned Err with a live cap");
+    }
+    if sample_pmu(&cap, &RING).is_err() {
+        __test_clear_panic_ring();
+        return TestResult::Fail("sample_pmu second call returned Err");
+    }
+    let snap = match take_snapshot() {
+        Some(s) => s,
+        None    => {
+            __test_clear_panic_ring();
+            return TestResult::Fail("take_snapshot returned None after sampling");
+        }
+    };
+    if snap.len() < 2 {
+        __test_clear_panic_ring();
+        return TestResult::Fail("ring received fewer than 2 samples");
+    }
+    for ev in snap.entries().iter().take(2) {
+        match ev {
+            ObservabilityEvent::Pmu { .. } => {}
+            _ => {
+                __test_clear_panic_ring();
+                return TestResult::Fail("sampled entry was not Pmu variant");
+            }
+        }
+    }
+
+    cap.revoke();
+    match sample_pmu(&cap, &RING) {
+        Err(ObsError::Revoked) => {}
+        _ => {
+            __test_clear_panic_ring();
+            return TestResult::Fail("sample_pmu did not fail-closed on revoked cap");
+        }
+    }
+
+    __test_clear_panic_ring();
+    TestResult::Pass
+}
+kernel_test!(smoke_obs_pmu_sample_into_ring);
+
+fn smoke_obs_core_dump_bundles_snapshot() -> TestResult {
+    // capture_core_dump returns the CrashFrame + take_snapshot in one
+    // call. Without an installed ring the snapshot field is None; after
+    // install + record it carries the last-N events.
+    use narf_capabilities::{Cap, Grant};
+    use narf_observability::{
+        capture_core_dump, install_panic_snapshot, ArchRegs,
+        ObservabilityEvent, Recorder, SNAPSHOT_CAPACITY,
+        __test_clear_panic_ring,
+    };
+    use narf_tracing::FlightRing;
+
+    __test_clear_panic_ring();
+
+    let regs = ArchRegs::default();
+    let dump_before = capture_core_dump(regs);
+    if dump_before.snapshot.is_some() {
+        return TestResult::Fail("snapshot is Some before any install");
+    }
+
+    static RING: FlightRing<ObservabilityEvent, SNAPSHOT_CAPACITY>
+        = FlightRing::new();
+    let rec: Cap<Recorder, Grant> = Cap::bootstrap();
+    if install_panic_snapshot(&rec, &RING).is_err() {
+        return TestResult::Fail("install_panic_snapshot failed");
+    }
+    RING.record(ObservabilityEvent::Panic { ip: 0x1234, domain: 2 });
+
+    let dump_after = capture_core_dump(regs);
+    let snap = match dump_after.snapshot {
+        Some(s) => s,
+        None    => {
+            __test_clear_panic_ring();
+            return TestResult::Fail("snapshot missing after install + record");
+        }
+    };
+    if snap.len() < 1 {
+        __test_clear_panic_ring();
+        return TestResult::Fail("snapshot is empty after recording an event");
+    }
+    match snap.entries()[0] {
+        ObservabilityEvent::Panic { ip: 0x1234, domain: 2 } => {}
+        _ => {
+            __test_clear_panic_ring();
+            return TestResult::Fail("snapshot head did not match recorded Panic event");
+        }
+    }
+
+    __test_clear_panic_ring();
+    TestResult::Pass
+}
+kernel_test!(smoke_obs_core_dump_bundles_snapshot);

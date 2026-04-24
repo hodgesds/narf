@@ -525,3 +525,76 @@ pub fn __test_clear_panic_ring() {
     PANIC_RING.store(core::ptr::null_mut(), Ordering::Release);
 }
 
+// ── Stage-3 §3.1: PMU sampling via tracing/ transport ───────────────
+//
+// `sample_pmu` reads the cap-gated PMU counters and records an
+// `ObservabilityEvent::Pmu` into a caller-supplied `FlightRing`. The
+// probe-handler wrapper bridges into `tracing::dispatch`: registering
+// a `PmuProbeHandler` for a `probe_id` means every `tracing::fire` at
+// that id drives a PMU sample. Instructions-retired falls back to `0`
+// when `arch/` doesn't yet expose the primitive — cycles alone are
+// still useful and `Err` from the cap path still surfaces as `Revoked`.
+
+/// Record one PMU sample into `ring`, cap-gated on `Cap<Pmu, Read>`.
+pub fn sample_pmu(
+    cap: &Cap<Pmu, Read>,
+    ring: &FlightRing<ObservabilityEvent, SNAPSHOT_CAPACITY>,
+) -> Result<(), ObsError> {
+    let cycles       = read_cycles(cap)?;
+    let instructions = read_instructions(cap).unwrap_or(0);
+    ring.record(ObservabilityEvent::Pmu { cycles, instructions });
+    Ok(())
+}
+
+/// `tracing::ProbeHandler` that samples the PMU into a flight ring.
+///
+/// Install with `narf_tracing::dispatch::table().register(cap, id, h)`.
+/// Each `fire(id, …)` drives one `sample_pmu` invocation; the handler
+/// is `Send + Sync + 'static` as `ProbeHandler` requires (`Cap` is
+/// `Send + Sync`, and the `&'static FlightRing` is trivially both).
+#[derive(Debug)]
+pub struct PmuProbeHandler {
+    cap:  Cap<Pmu, Read>,
+    ring: &'static FlightRing<ObservabilityEvent, SNAPSHOT_CAPACITY>,
+}
+
+impl PmuProbeHandler {
+    pub const fn new(
+        cap:  Cap<Pmu, Read>,
+        ring: &'static FlightRing<ObservabilityEvent, SNAPSHOT_CAPACITY>,
+    ) -> Self {
+        Self { cap, ring }
+    }
+}
+
+impl narf_tracing::ProbeHandler for PmuProbeHandler {
+    fn fire(&self, _args: narf_tracing::ProbeArgs) {
+        // Sampling failures are diagnostic — a revoked cap or an
+        // unavailable counter shouldn't poison the fire path.
+        let _ = sample_pmu(&self.cap, self.ring);
+    }
+}
+
+// ── Stage-3 §3.3: core-dump enrichment with flight-recorder snapshot ─
+//
+// `capture_core_dump` wraps `capture_crash_frame` + `take_snapshot` so
+// a Stage-3 panic path gets a single struct carrying both the register
+// state and the last-N-events ring view. No copy of the ring's backing
+// storage — `CoreSnapshot` already owns its own inline array.
+
+/// Bundled core-dump payload: register/stack capture plus the
+/// flight-recorder snapshot, when a recorder has been installed.
+#[derive(Copy, Clone, Debug)]
+pub struct CoreDump {
+    pub frame:    CrashFrame,
+    pub snapshot: Option<CoreSnapshot>,
+}
+
+/// Capture a Stage-3 core dump: CPU state + panic-ring snapshot.
+pub fn capture_core_dump(regs: ArchRegs) -> CoreDump {
+    CoreDump {
+        frame:    capture_crash_frame(regs),
+        snapshot: take_snapshot(),
+    }
+}
+
