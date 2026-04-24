@@ -280,24 +280,50 @@ Remaining Stage 2 items (all additive / out of scope for local test):
   calls `narf_rcu::report_quiescent()` after every `Future::poll`
   return per rcu/ §3.7 — every cooperative yield advances the
   grace period.
-- **`tracing/`**: static markers + flight recorder. `probe!` macro
-  emits a nop-sled + `.note.narf.probes` ELF-note record (KEEP'd on
-  both arches, bounded by `__narf_probes_start`/`_end`),
-  `FlightRing<T, N>` with per-slot seqlock publish protocol
-  (odd=in-flight, even=published), const-asserted non-zero
-  power-of-two `N`. Dynamic probes, `FnTime`, HW trace: Stage 4.
+- **`tracing/`**: static markers + flight recorder + dynamic probes +
+  live aggregates. `probe!` macro emits a nop-sled + `.note.narf.probes`
+  ELF-note record (KEEP'd on both arches, bounded by
+  `__narf_probes_start`/`_end`), `FlightRing<T, N>` with per-slot
+  seqlock publish protocol (odd=in-flight, even=published),
+  const-asserted non-zero power-of-two `N`. Stage-3 round 5 lands:
+  `dispatch::fire(probe_id, args)` with a cap-gated
+  `ProbeHandlerInstall` registry (linear-scan, up to 256 handlers),
+  `FnTime` scope accumulator with Welford online mean/variance, and a
+  log2-bucket `Histogram` stub standing in for the Stage-4 tDigest.
+  Real tDigest accuracy contract + per-CPU hazard-pointer handler
+  table: Stage 4.
 - **`bus/`**: enumeration. PCIe ECAM walker on x86_64 (q35 default
   `0xb000_0000`, MCFG deferred), FDT bus walker on aarch64 with a
   QEMU-virt fallback layout, `BusDevice` / `BusKind::{Pcie, VirtioMmio}`
   / `DeviceId`, read-only registry, `claim_device` stub. Hot-plug,
   MSI-X, IOMMU-group coordination: Stage 4.
-- **`scheduler/`**: per-task waker plumbing (Wave-0 + Stage-2 close).
-  Each `TaskSlot` owns an `Arc<AtomicBool>` awake flag; `Waker`
-  vtable flips it via `wake`/`wake_by_ref`. `run_until_empty`
-  `swap(false)`s before polling and skips slots whose flag is
-  still false, so IRQ/IPC-driven futures no longer cost a poll per
-  loop iteration. `narf_rcu::report_quiescent()` invoked after each
-  poll.
+- **`scheduler/`**: per-task waker plumbing (Wave-0 + Stage-2 close)
+  plus Stage-3 §3.3/§3.4 task-spec surface. Each `TaskSlot` owns an
+  `Arc<AtomicBool>` awake flag; `Waker` vtable flips it via
+  `wake`/`wake_by_ref`. `run_until_empty` `swap(false)`s before polling
+  and skips slots whose flag is still false, so IRQ/IPC-driven futures
+  no longer cost a poll per loop iteration. `narf_rcu::report_quiescent()`
+  invoked after each poll. Stage-3 round adds `TaskSpec` (affinity +
+  budget + optional `Cap<CpuBudget, Spend>`), `spawn_with_spec` /
+  `spawn_budgeted` entry points, `BudgetAccount` running totals
+  (cycles_spent / polls / overruns), `ResourceBudget` + `OverrunPolicy`
+  + `Affinity` + `CpuSet` types. Every poll `check_live`-gates the
+  attached budget cap — revoking stops the task O(1) on the next round
+  — and charges measured `narf_time::Instant` cycles into the account.
+  Direct context transfer, work stealing, multi-CPU: Stage 4.
+- **`observability/`**: Stage-3 round wires PMU sampling through the
+  tracing transport. `sample_pmu(cap, ring)` reads cycles (+
+  instructions when available) and records an
+  `ObservabilityEvent::Pmu` into a `FlightRing`; `PmuProbeHandler`
+  bridges `tracing::ProbeHandler::fire` to a sample, so registering
+  one handler on a probe id samples the PMU on every fire.
+  `capture_core_dump(regs)` bundles `CrashFrame` + `take_snapshot()`
+  into the single struct a panic path emits. Stage-4 items unchanged
+  (real arch PMU primitives, multiplexed counter groups).
+- **`capabilities/`**: Stage-3 round adds the `Spend` rights marker
+  (reflexive under `Grant`, orthogonal to Read/Write) so cap types
+  that represent consumable quotas (`CpuBudget`, future `DmaAllowance`)
+  can be distinguished from policy-mutation rights at the type level.
 
 ### Stage 3 exit-gate integration
 
