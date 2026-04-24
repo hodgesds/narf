@@ -90,22 +90,18 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
     // Software-interrupt syscall gate. `int 0x80` arrives here; the
     // caller's registers have been saved into `frame` already.
     // Convention: rax = syscall number, rdi/rsi/rdx/r10/r8/r9 =
-    // args 0..5 (the standard x86_64 syscall ABI, except rcx is
-    // clobbered by the trap so we use r10 like `syscall` does).
-    // Return value in rax, status in rdx.
+    // args 0..5. Return value in rax, status in rdx.
+    //
+    // Raw handlers can `redirect_to_kernel` to rewrite the frame
+    // instead of returning to the caller's context — the iretq at
+    // the tail of common_trap then lands at the kernel RIP we set
+    // here, with kernel CS/SS and the supplied RSP. swapgs on exit
+    // is gated on the (possibly rewritten) frame.cs, so a redirect
+    // to KCODE correctly skips the user-side swapgs.
     if frame.vector == 128 {
-        let args = narf_userspace::SyscallArgs {
-            arg0: frame.rdi,
-            arg1: frame.rsi,
-            arg2: frame.rdx,
-            arg3: frame.r10,
-            arg4: frame.r8,
-            arg5: frame.r9,
-        };
         let num = frame.rax as u32;
-        let ret = narf_userspace::kernel_syscall_entry(num, &args);
-        frame.rax = ret.value;
-        frame.rdx = ret.status as u64;
+        let mut ctx = X86TrapContext::from_int80(frame);
+        narf_userspace::kernel_syscall_entry(num, &mut ctx);
         return;
     }
 
@@ -150,4 +146,52 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
     // SAFETY: after a fatal exception we have no policy to resume; exit with
     // a non-zero code so xtask / verification can see the failure.
     unsafe { narf_arch::exit_kernel(42) }
+}
+
+// ── TrapContext impl for the int-0x80 path ─────────────────────────
+
+use narf_userspace::{SyscallArgs, SyscallReturn, TrapContext};
+
+/// Arch-specific `TrapContext` wrapper around a live trap frame.
+/// Constructed at int-0x80 dispatch time so raw handlers get
+/// `set_return` + `redirect_to_kernel` bound to the real frame.
+struct X86TrapContext<'a> {
+    frame: &'a mut TrapFrame,
+    args:  SyscallArgs,
+}
+
+impl<'a> X86TrapContext<'a> {
+    fn from_int80(frame: &'a mut TrapFrame) -> Self {
+        let args = SyscallArgs {
+            arg0: frame.rdi,
+            arg1: frame.rsi,
+            arg2: frame.rdx,
+            arg3: frame.r10,
+            arg4: frame.r8,
+            arg5: frame.r9,
+        };
+        Self { frame, args }
+    }
+}
+
+impl<'a> TrapContext for X86TrapContext<'a> {
+    fn args(&self) -> &SyscallArgs { &self.args }
+
+    fn set_return(&mut self, ret: SyscallReturn) {
+        self.frame.rax = ret.value;
+        self.frame.rdx = ret.status as u64;
+    }
+
+    fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
+        // Rewrite the CPU-pushed fields so common_trap's iretq
+        // lands in kernel mode at the supplied RIP/RSP. CS=KCODE,
+        // SS=KDATA match the kernel's data-segment convention.
+        // RFLAGS retains the caller's flags — kernel code is
+        // prepared for any flag state.
+        self.frame.rip = rip;
+        self.frame.cs  = super::gdt::KCODE_SEL as u64;
+        self.frame.rsp = rsp;
+        self.frame.ss  = super::gdt::KDATA_SEL as u64;
+        true
+    }
 }

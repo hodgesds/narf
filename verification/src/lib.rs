@@ -5795,12 +5795,12 @@ fn smoke_frame_aarch64_svc_dispatches_through_global() -> TestResult {
 kernel_test!(smoke_frame_aarch64_svc_dispatches_through_global);
 
 fn smoke_userspace_syscall_dispatch_via_global() -> TestResult {
-    // Install a global table with a live handler for Syscall::Yield;
-    // kernel_syscall_entry(104, …) routes to it. Unregistered
-    // numbers return invalid_op.
+    // Install a global table with a live plain handler for
+    // Syscall::Yield; kernel_syscall_entry_plain(104, …) routes
+    // to it. Unregistered numbers return invalid_op.
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_userspace::{
-        install_global, kernel_syscall_entry, syscall::__test_clear_global,
+        install_global, kernel_syscall_entry_plain, syscall::__test_clear_global,
         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
     };
 
@@ -5818,7 +5818,7 @@ fn smoke_userspace_syscall_dispatch_via_global() -> TestResult {
 
     // Happy path.
     let args = SyscallArgs { arg0: 0x41, ..SyscallArgs::default() };
-    let r = kernel_syscall_entry(Syscall::Yield.raw(), &args);
+    let r = kernel_syscall_entry_plain(Syscall::Yield.raw(), &args);
     if r != SyscallReturn::ok(0x42) {
         __test_clear_global();
         return TestResult::Fail("registered handler return mismatch");
@@ -5829,14 +5829,14 @@ fn smoke_userspace_syscall_dispatch_via_global() -> TestResult {
     }
 
     // Unknown number → invalid_op.
-    let r2 = kernel_syscall_entry(999, &args);
+    let r2 = kernel_syscall_entry_plain(999, &args);
     if r2 != SyscallReturn::invalid_op() {
         __test_clear_global();
         return TestResult::Fail("unknown number did not surface invalid_op");
     }
 
     // Known number without a handler → invalid_op.
-    let r3 = kernel_syscall_entry(Syscall::Write.raw(), &args);
+    let r3 = kernel_syscall_entry_plain(Syscall::Write.raw(), &args);
     if r3 != SyscallReturn::invalid_op() {
         __test_clear_global();
         return TestResult::Fail("handler-less number did not surface invalid_op");
@@ -5845,13 +5845,88 @@ fn smoke_userspace_syscall_dispatch_via_global() -> TestResult {
     // After __test_clear_global, every entry returns invalid_op —
     // pre-boot / post-shutdown safety.
     __test_clear_global();
-    let r4 = kernel_syscall_entry(Syscall::Yield.raw(), &args);
+    let r4 = kernel_syscall_entry_plain(Syscall::Yield.raw(), &args);
     if r4 != SyscallReturn::invalid_op() {
         return TestResult::Fail("no global should surface invalid_op");
     }
     TestResult::Pass
 }
 kernel_test!(smoke_userspace_syscall_dispatch_via_global);
+
+fn smoke_userspace_raw_handler_dispatch() -> TestResult {
+    // Install a RawSyscallHandler and confirm it observes the
+    // TrapContext, can set the return, and (on x86_64) can ask to
+    // redirect to kernel — though we only exercise the non-redirect
+    // path synchronously here since actual redirection requires a
+    // live trap frame.
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_userspace::{
+        install_global, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+
+    __test_clear_global();
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    SEEN.store(0, Ordering::Relaxed);
+
+    let mut t = SyscallTable::new();
+    t.install_raw_fn(Syscall::Yield, "yield_raw", |ctx: &mut dyn TrapContext| {
+        SEEN.store(ctx.args().arg0, Ordering::Relaxed);
+        ctx.set_return(SyscallReturn::ok(ctx.args().arg0.wrapping_add(10)));
+    });
+    install_global(t);
+
+    // Synthetic TrapContext — not a live trap, just exercising the
+    // dispatch path.
+    struct FakeCtx {
+        args:    SyscallArgs,
+        ret:     Option<SyscallReturn>,
+        redirect_attempts: u32,
+    }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _rip: u64, _rsp: u64) -> bool {
+            self.redirect_attempts += 1;
+            true
+        }
+    }
+
+    let mut ctx = FakeCtx {
+        args: SyscallArgs { arg0: 5, ..Default::default() },
+        ret: None,
+        redirect_attempts: 0,
+    };
+    narf_userspace::kernel_syscall_entry(Syscall::Yield.raw(), &mut ctx);
+
+    if SEEN.load(Ordering::Relaxed) != 5 {
+        __test_clear_global();
+        return TestResult::Fail("raw handler did not see args.arg0");
+    }
+    if ctx.ret != Some(SyscallReturn::ok(15)) {
+        __test_clear_global();
+        return TestResult::Fail("raw handler return not delivered via set_return");
+    }
+
+    // Raw handler wins over a plain handler on the same slot.
+    __test_clear_global();
+    let mut t2 = SyscallTable::new();
+    t2.install_fn(Syscall::Sleep, "sleep_plain", |_| SyscallReturn::ok(111));
+    t2.install_raw_fn(Syscall::Sleep, "sleep_raw", |ctx: &mut dyn TrapContext| {
+        ctx.set_return(SyscallReturn::ok(222));
+    });
+    install_global(t2);
+    let mut ctx2 = FakeCtx { args: SyscallArgs::default(), ret: None, redirect_attempts: 0 };
+    narf_userspace::kernel_syscall_entry(Syscall::Sleep.raw(), &mut ctx2);
+    if ctx2.ret != Some(SyscallReturn::ok(222)) {
+        __test_clear_global();
+        return TestResult::Fail("raw handler did not win over plain handler");
+    }
+
+    __test_clear_global();
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_raw_handler_dispatch);
 
 fn smoke_userspace_process_id_and_aux() -> TestResult {
     use narf_userspace::{

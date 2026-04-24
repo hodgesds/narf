@@ -110,14 +110,9 @@ pub extern "C" fn rust_aarch64_sync_dispatch(frame: &mut TrapFrame) {
         // Convention: x8 = syscall number, x0..x5 = args. Return
         // value placed in x0 (value) + x1 (status) so callers can
         // read both without a follow-up instruction.
-        let args = narf_userspace::SyscallArgs {
-            arg0: frame.x0, arg1: frame.x1, arg2: frame.x2,
-            arg3: frame.x3, arg4: frame.x4, arg5: frame.x5,
-        };
         let num = frame.x8 as u32;
-        let ret = narf_userspace::kernel_syscall_entry(num, &args);
-        frame.x0 = ret.value;
-        frame.x1 = ret.status as u64;
+        let mut ctx = Aarch64TrapContext::from_svc(frame);
+        narf_userspace::kernel_syscall_entry(num, &mut ctx);
         return;
     }
 
@@ -151,6 +146,47 @@ pub extern "C" fn rust_aarch64_unimpl(frame: &TrapFrame) -> ! {
     dump_frame(frame);
     // SAFETY: exit.
     unsafe { narf_arch::exit_kernel(42) }
+}
+
+// ── TrapContext impl for the SVC path ──────────────────────────────
+
+use narf_userspace::{SyscallArgs, SyscallReturn, TrapContext};
+
+/// aarch64 `TrapContext` wrapper around a live SVC-trap frame.
+struct Aarch64TrapContext<'a> {
+    frame: &'a mut TrapFrame,
+    args:  SyscallArgs,
+}
+
+impl<'a> Aarch64TrapContext<'a> {
+    fn from_svc(frame: &'a mut TrapFrame) -> Self {
+        let args = SyscallArgs {
+            arg0: frame.x0, arg1: frame.x1, arg2: frame.x2,
+            arg3: frame.x3, arg4: frame.x4, arg5: frame.x5,
+        };
+        Self { frame, args }
+    }
+}
+
+impl<'a> TrapContext for Aarch64TrapContext<'a> {
+    fn args(&self) -> &SyscallArgs { &self.args }
+
+    fn set_return(&mut self, ret: SyscallReturn) {
+        self.frame.x0 = ret.value;
+        self.frame.x1 = ret.status as u64;
+    }
+
+    fn redirect_to_kernel(&mut self, _rip: u64, _rsp: u64) -> bool {
+        // aarch64's eret uses ELR_EL1 (not a frame slot) for the
+        // return address and SPSR_EL1 for the target EL, neither
+        // of which vec.S currently saves to the TrapFrame. Landing
+        // this cleanly requires the vector macro to stash ELR/SPSR
+        // alongside the GPR pairs so Rust can rewrite them.
+        // Returning `false` tells callers to fall back to
+        // `set_return` — the syscall completes, control returns to
+        // the user-space `svc #0` site.
+        false
+    }
 }
 
 fn dump_frame(f: &TrapFrame) {
