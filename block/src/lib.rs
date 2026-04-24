@@ -28,8 +28,10 @@
 extern crate alloc;
 
 pub mod deadline;
+pub mod mq;
 
 pub use deadline::{DeadlineScheduler, Lane, STARVE_BOUND};
+pub use mq::{MqDeadlineScheduler, MAX_LANES};
 
 use core::future::Future;
 use narf_capabilities::{Cap, Read};

@@ -4650,6 +4650,33 @@ fn smoke_block_deadline_promotes_expired() -> TestResult {
 }
 kernel_test!(smoke_block_deadline_promotes_expired);
 
+fn smoke_block_mq_round_robins_across_lanes() -> TestResult {
+    // Populate three lanes with one request each. dequeue_next walks
+    // round-robin so each lane's entry comes out exactly once before
+    // any lane is revisited.
+    use narf_block::{BlockOp, MqDeadlineScheduler};
+
+    let s = MqDeadlineScheduler::with_lanes(3);
+    s.enqueue_on(0, make_block_request(BlockOp::Read, 0x0A), u64::MAX);
+    s.enqueue_on(1, make_block_request(BlockOp::Read, 0x1B), u64::MAX);
+    s.enqueue_on(2, make_block_request(BlockOp::Read, 0x2C), u64::MAX);
+    if s.len() != 3 { return TestResult::Fail("multi-queue len mismatch"); }
+
+    let first = s.dequeue_next(0).expect("pending").user_tag;
+    let second = s.dequeue_next(0).expect("pending").user_tag;
+    let third = s.dequeue_next(0).expect("pending").user_tag;
+    if s.dequeue_next(0).is_some() {
+        return TestResult::Fail("multi-queue over-drained");
+    }
+
+    // Round-robin must visit all three distinct lanes.
+    if first == second || second == third || first == third {
+        return TestResult::Fail("round-robin served the same lane twice");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_block_mq_round_robins_across_lanes);
+
 fn smoke_block_deadline_tags_are_monotonic() -> TestResult {
     use narf_block::{BlockOp, DeadlineScheduler};
 
