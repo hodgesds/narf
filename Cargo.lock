@@ -642,6 +642,7 @@ name = "narf-userspace"
 version = "0.0.0"
 dependencies = [
  "narf-capabilities",
+ "narf-console",
  "narf-lib",
  "narf-memory",
  "narf-scheduler",

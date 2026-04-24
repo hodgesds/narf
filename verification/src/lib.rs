@@ -5355,6 +5355,109 @@ fn smoke_memory_address_space_region_table() -> TestResult {
 }
 kernel_test!(smoke_memory_address_space_region_table);
 
+fn smoke_userspace_install_core_syscalls_fills_table() -> TestResult {
+    // `install_core_syscalls` drops Write/Read/Close/Mmap/Munmap/
+    // ExitTask/Yield/Sleep handlers into a fresh table. Confirm
+    // every slot has both a name and a handler after install.
+    use narf_userspace::{install_core_syscalls, Syscall, SyscallTable};
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+
+    let slots = [
+        Syscall::Write, Syscall::Read, Syscall::Close,
+        Syscall::Mmap,  Syscall::Munmap,
+        Syscall::ExitTask, Syscall::Yield, Syscall::Sleep,
+    ];
+    for s in slots {
+        if t.name_of(s).is_none() {
+            return TestResult::Fail("core syscall missing after install_core_syscalls");
+        }
+    }
+    if t.len() < slots.len() {
+        return TestResult::Fail("install_core_syscalls did not grow table to cover every slot");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_install_core_syscalls_fills_table);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_load_user_process_builds_runnable_image() -> TestResult {
+    // Build a minimal ELF64 with a 1-page R|X PT_LOAD, hand it to
+    // `load_user_process`, confirm the returned UserProcess has a
+    // fresh pid, a materialised AS with both the code segment and
+    // a mapped user stack at DEFAULT_USER_STACK_BASE.
+    use narf_memory::x86_64::paging;
+    use narf_memory::VirtAddr;
+    use narf_userspace::{
+        load_user_process, DEFAULT_USER_STACK_BASE, DEFAULT_USER_STACK_BYTES,
+    };
+
+    let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(64 + 56 + 0x1000);
+    bytes.extend_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    bytes.extend_from_slice(&2u16.to_le_bytes());
+    bytes.extend_from_slice(&0x3Eu16.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&0x0000_0080_0000_1111u64.to_le_bytes());
+    bytes.extend_from_slice(&64u64.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&64u16.to_le_bytes());
+    bytes.extend_from_slice(&56u16.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&5u32.to_le_bytes());
+    bytes.extend_from_slice(&(64u64 + 56).to_le_bytes());
+    bytes.extend_from_slice(&0x0000_0080_0000_1000u64.to_le_bytes());
+    bytes.extend_from_slice(&0x0000_0080_0000_1000u64.to_le_bytes());
+    bytes.extend_from_slice(&0x1000u64.to_le_bytes());
+    bytes.extend_from_slice(&0x1000u64.to_le_bytes());
+    bytes.extend_from_slice(&0x1000u64.to_le_bytes());
+    bytes.resize(64 + 56 + 0x1000, 0);
+
+    let proc = match unsafe { load_user_process(&bytes) } {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("load_user_process failed"),
+    };
+
+    if proc.pid.raw() == 0 {
+        return TestResult::Fail("pid should be non-zero");
+    }
+    if proc.entry.0 != VirtAddr::new(0x0000_0080_0000_1111) {
+        return TestResult::Fail("entry mis-decoded");
+    }
+    if proc.stack_top.as_u64() != DEFAULT_USER_STACK_BASE + DEFAULT_USER_STACK_BYTES {
+        return TestResult::Fail("stack_top mis-computed");
+    }
+
+    // AS should have the code segment + stack region.
+    if proc.address_space.region_count() != 2 {
+        return TestResult::Fail("address space should carry 2 regions");
+    }
+
+    // Code segment PTE installed.
+    let code_phys = unsafe {
+        paging::translate(proc.address_space.root, VirtAddr::new(0x0000_0080_0000_1000))
+    };
+    if code_phys.is_none() {
+        return TestResult::Fail("code segment not materialized");
+    }
+
+    // Stack PTE installed — check the first page.
+    let stack_phys = unsafe {
+        paging::translate(proc.address_space.root, VirtAddr::new(DEFAULT_USER_STACK_BASE))
+    };
+    if stack_phys.is_none() {
+        return TestResult::Fail("stack region not materialized");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_userspace_load_user_process_builds_runnable_image);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_load_elf_bytes_end_to_end() -> TestResult {
     // End-to-end: hand-build a minimal ELF64 with a 1-page PT_LOAD

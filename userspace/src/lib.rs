@@ -37,11 +37,21 @@
 extern crate alloc;
 
 pub mod elf;
+pub mod handlers;
 pub mod loader;
+pub mod process;
 pub mod syscall;
 
 pub use elf::{parse as parse_elf, ElfError};
+pub use handlers::{
+    clear_exit_landing, install_address_space_lookup, install_core_syscalls,
+    set_exit_landing,
+};
 pub use loader::{load_elf_bytes, load_into, EntryPoint, LoadBytesError, LoadError};
+pub use process::{
+    load_user_process, ProcessLoadError, UserProcess,
+    DEFAULT_USER_STACK_BASE, DEFAULT_USER_STACK_BYTES,
+};
 pub use syscall::{
     install_global, kernel_syscall_entry, kernel_syscall_entry_plain,
     FnHandler, RawFnHandler, RawSyscallHandler, Syscall, SyscallArgs,
