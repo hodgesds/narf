@@ -4713,6 +4713,33 @@ fn smoke_block_deadline_promotes_expired() -> TestResult {
 }
 kernel_test!(smoke_block_deadline_promotes_expired);
 
+fn smoke_power_suspend_phase_progression() -> TestResult {
+    use narf_capabilities::{Cap, Invoke};
+    use narf_power::{suspend, SuspendError, SuspendPhase};
+
+    suspend::__test_reset();
+    let cap: Cap<narf_power::Power, Invoke> = Cap::bootstrap();
+
+    // Stage-4 stub: suspend walks through the phase sequence and
+    // returns NotImplemented — the platform primitive is absent.
+    match suspend::suspend(&cap) {
+        Err(SuspendError::NotImplemented) => {}
+        _ => return TestResult::Fail("suspend should surface NotImplemented"),
+    }
+    // And the phase returns to Idle afterwards.
+    if suspend::current_phase() != SuspendPhase::Idle {
+        return TestResult::Fail("phase did not return to Idle");
+    }
+
+    cap.revoke();
+    match suspend::suspend(&cap) {
+        Err(SuspendError::AuthorityRevoked) => {}
+        _ => return TestResult::Fail("revoked Power cap accepted"),
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_power_suspend_phase_progression);
+
 fn smoke_tracing_hwtrace_surface() -> TestResult {
     use narf_capabilities::{Cap, Invoke};
     use narf_tracing::{hwtrace, HwTraceConfig, HwTraceError, HwTraceMarker, HwTraceStatus};
