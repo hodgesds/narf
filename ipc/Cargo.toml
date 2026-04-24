@@ -1,0 +1,19 @@
+[package]
+name         = "narf-ipc"
+description  = "Narf-Ring: zero-copy SPSC shared-memory rings with ownership-transfer semantics. Stage 3 Wave 1 = SPSC + waker-driven back-pressure."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_ipc"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../lib" }
+narf-capabilities = { path = "../capabilities" }
+
+[lints]
+workspace = true

@@ -19,6 +19,16 @@ narf-memory     = { path = "../memory" }
 narf-time       = { path = "../time" }
 narf-scheduler  = { path = "../scheduler" }
 narf-interrupts = { path = "../interrupts" }
+narf-capabilities = { path = "../capabilities" }
+narf-tracing    = { path = "../tracing" }
+narf-bus        = { path = "../bus" }
+narf-boot       = { path = "../boot" }
+narf-rcu        = { path = "../rcu" }
+narf-ipc        = { path = "../ipc" }
+narf-abi        = { path = "../abi" }
+narf-io         = { path = "../io" }
+narf-drivers    = { path = "../drivers" }
+narf-drivers-virtio = { path = "../drivers/virtio" }
 
 [lints]
 workspace = true

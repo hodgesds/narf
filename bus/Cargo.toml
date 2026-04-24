@@ -1,6 +1,6 @@
 [package]
-name         = "narf-scheduler"
-description  = "Cooperative async executor. Stage 1: single-CPU, spawn + block_on + yield_now."
+name         = "narf-bus"
+description  = "Boot-time device enumeration: PCIe ECAM (x86_64) + devicetree virtio-mmio (aarch64). Stage 2 → 3."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
@@ -8,13 +8,13 @@ license.workspace      = true
 repository.workspace   = true
 
 [lib]
-name = "narf_scheduler"
+name = "narf_bus"
 path = "src/lib.rs"
 
 [dependencies]
 narf-lib    = { path = "../lib" }
-narf-arch   = { path = "../arch" }
-narf-rcu    = { path = "../rcu" }
+narf-memory = { path = "../memory" }
+narf-boot   = { path = "../boot" }
 
 [lints]
 workspace = true

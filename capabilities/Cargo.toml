@@ -1,0 +1,23 @@
+[package]
+name         = "narf-capabilities"
+description  = "Typed capability tokens: Cap<T, R>, CapKind registry, Rights subsetting. Stage 3 Wave 0 = types only (no runtime cap table yet)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_capabilities"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib = { path = "../lib" }
+
+# Workspace-internal: once Wave 3 RCU-backs the object table, narf-rcu
+# moves here. Wave 2 uses an IrqSafeSpinLock over a Vec, which is
+# allocator-free once the table is warm.
+# narf-rcu = { path = "../rcu" }
+
+[lints]
+workspace = true

@@ -1,0 +1,19 @@
+[package]
+name         = "narf-abi"
+description  = "Kernel↔user ABI: Submission / Completion / OpCode / NarfStatus + ring wrappers."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_abi"
+path = "src/lib.rs"
+
+[dependencies]
+narf-capabilities = { path = "../capabilities" }
+narf-ipc          = { path = "../ipc" }
+
+[lints]
+workspace = true

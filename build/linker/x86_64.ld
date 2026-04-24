@@ -49,7 +49,10 @@ SECTIONS
     .rodata : AT(ADDR(.rodata) - KERNEL_VIRT_BASE) ALIGN(4K) {
         __rodata_start = .;
         *(.rodata .rodata.*)
-        *(.note.narf.probes)
+        . = ALIGN(8);
+        __narf_probes_start = .;
+        KEEP(*(.note.narf.probes))
+        __narf_probes_end   = .;
         . = ALIGN(8);
         __narf_tests_start = .;
         KEEP(*(narf.tests))

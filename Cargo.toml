@@ -11,10 +11,18 @@ members = [
     "memory",
     "time",
     "scheduler",
+    "capabilities",
+    "ipc",
     "interrupts",
     "verification",
     "frame",
+    "rcu",
+    "bus",
     "build/xtask",
+    "abi",
+    "io",
+    "drivers",
+    "drivers/virtio",
 ]
 
 [workspace.package]

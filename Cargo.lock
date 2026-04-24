@@ -123,6 +123,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
+name = "narf-abi"
+version = "0.0.0"
+dependencies = [
+ "narf-capabilities",
+ "narf-ipc",
+]
+
+[[package]]
 name = "narf-arch"
 version = "0.0.0"
 dependencies = [
@@ -138,10 +146,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-bus"
+version = "0.0.0"
+dependencies = [
+ "narf-boot",
+ "narf-lib",
+ "narf-memory",
+]
+
+[[package]]
+name = "narf-capabilities"
+version = "0.0.0"
+dependencies = [
+ "narf-lib",
+]
+
+[[package]]
 name = "narf-console"
 version = "0.0.0"
 dependencies = [
  "narf-arch",
+ "narf-lib",
+ "narf-memory",
+]
+
+[[package]]
+name = "narf-drivers"
+version = "0.0.0"
+dependencies = [
+ "narf-capabilities",
+ "narf-lib",
+]
+
+[[package]]
+name = "narf-drivers-virtio"
+version = "0.0.0"
+dependencies = [
+ "narf-bus",
+ "narf-capabilities",
+ "narf-drivers",
  "narf-lib",
  "narf-memory",
 ]
@@ -170,6 +213,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-io"
+version = "0.0.0"
+dependencies = [
+ "narf-capabilities",
+ "narf-lib",
+ "narf-memory",
+]
+
+[[package]]
+name = "narf-ipc"
+version = "0.0.0"
+dependencies = [
+ "narf-capabilities",
+ "narf-lib",
+]
+
+[[package]]
 name = "narf-lib"
 version = "0.0.0"
 
@@ -182,11 +242,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-rcu"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-lib",
+]
+
+[[package]]
 name = "narf-scheduler"
 version = "0.0.0"
 dependencies = [
  "narf-arch",
  "narf-lib",
+ "narf-rcu",
 ]
 
 [[package]]
@@ -198,16 +267,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-tracing"
+version = "0.0.0"
+dependencies = [
+ "narf-lib",
+]
+
+[[package]]
 name = "narf-verification"
 version = "0.0.0"
 dependencies = [
+ "narf-abi",
  "narf-arch",
+ "narf-boot",
+ "narf-bus",
+ "narf-capabilities",
  "narf-console",
+ "narf-drivers",
+ "narf-drivers-virtio",
  "narf-interrupts",
+ "narf-io",
+ "narf-ipc",
  "narf-lib",
  "narf-memory",
+ "narf-rcu",
  "narf-scheduler",
  "narf-time",
+ "narf-tracing",
 ]
 
 [[package]]

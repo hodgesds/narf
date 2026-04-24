@@ -1,0 +1,22 @@
+[package]
+name         = "narf-drivers-virtio"
+description  = "virtio-mmio transport probe + skeleton driver. Stage 3 Wave 3b side-track: probes the registers, validates magic, registers a no-op Driver with the framework."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_virtio"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../../lib" }
+narf-bus          = { path = "../../bus" }
+narf-drivers      = { path = "../" }
+narf-capabilities = { path = "../../capabilities" }
+narf-memory       = { path = "../../memory" }
+
+[lints]
+workspace = true

@@ -1,0 +1,20 @@
+[package]
+name         = "narf-io"
+description  = "DMA buffers, IOMMU context, P2P DMA. Stage 3 Wave 3a: alloc_coherent / free_coherent + Cap<DmaBuffer, _> hand-off."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_io"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../lib" }
+narf-memory       = { path = "../memory" }
+narf-capabilities = { path = "../capabilities" }
+
+[lints]
+workspace = true

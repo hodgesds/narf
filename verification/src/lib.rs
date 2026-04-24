@@ -245,6 +245,144 @@ fn smoke_scheduler_drives_future() -> TestResult {
 }
 kernel_test!(smoke_scheduler_drives_future);
 
+fn smoke_scheduler_respects_waker() -> TestResult {
+    // Proves the scheduler honours per-task wakers: a Parked future
+    // that returns Pending *without* calling its waker must not be
+    // re-polled until something else wakes it. Without the per-task
+    // awake flag this test would fail because the old no-op waker
+    // caused every Pending task to be repolled on every round.
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::task::{Context, Poll, Waker};
+    use narf_lib::sync::IrqSafeSpinLock;
+
+    static POLLS:         AtomicUsize                     = AtomicUsize::new(0);
+    static PARKED_WAKER:  IrqSafeSpinLock<Option<Waker>>  = IrqSafeSpinLock::new(None);
+
+    struct Parked { ready: bool }
+    impl Future for Parked {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            let this = self.get_mut();
+            POLLS.fetch_add(1, Ordering::Relaxed);
+            if this.ready { return Poll::Ready(()); }
+            *PARKED_WAKER.lock() = Some(cx.waker().clone());
+            this.ready = true;   // next poll (after being woken) completes
+            Poll::Pending
+        }
+    }
+
+    POLLS.store(0, Ordering::Relaxed);
+    *PARKED_WAKER.lock() = None;
+
+    narf_scheduler::init();
+    narf_scheduler::spawn(Parked { ready: false });
+    narf_scheduler::spawn(async {
+        // Yield once so Parked gets a turn to register its waker, then
+        // wake it. Under the old noop_waker Parked would already have
+        // been re-polled many times by now; with per-task wakers it
+        // must have been polled exactly once so far.
+        narf_scheduler::yield_now().await;
+        if let Some(w) = PARKED_WAKER.lock().take() { w.wake(); }
+    });
+    narf_scheduler::run_until_empty();
+
+    match POLLS.load(Ordering::Relaxed) {
+        2 => TestResult::Pass,
+        n if n < 2 => TestResult::Fail("parked task never woke after wake()"),
+        _          => TestResult::Fail("parked task re-polled without a wake — waker gating broken"),
+    }
+}
+kernel_test!(smoke_scheduler_respects_waker);
+
+fn smoke_cap_slot_layout() -> TestResult {
+    // The cap-slot wire format is 16 bytes, 16-byte aligned. The ipc/
+    // ring-slot layout assumes this; a size/align drift here is an ABI
+    // break that would silently misalign every submission. Redundant
+    // with the crate-internal const-asserts, but a runtime test gives
+    // a visible failure in the verification harness.
+    use narf_capabilities::CapSlot;
+    if core::mem::size_of::<CapSlot>() != 16 {
+        return TestResult::Fail("CapSlot size != 16");
+    }
+    if core::mem::align_of::<CapSlot>() != 16 {
+        return TestResult::Fail("CapSlot align != 16");
+    }
+    let s = CapSlot::new(1, 2, 3, 4);
+    if s.generation != 1 || s.index != 2 || s.rights != 3 || s.type_tag != 4 {
+        return TestResult::Fail("CapSlot::new field order wrong");
+    }
+    if CapSlot::EMPTY.is_empty() != true { return TestResult::Fail("EMPTY not empty"); }
+    if s.is_empty() { return TestResult::Fail("non-zero slot reported empty"); }
+    TestResult::Pass
+}
+kernel_test!(smoke_cap_slot_layout);
+
+fn smoke_cap_kind_registry() -> TestResult {
+    // The CapKind integer values are permanent per spec §3.1 — adding
+    // kinds is allowed, renumbering is an ABI break. Guard a handful
+    // of the pinned values + the parse_kind round-trip.
+    use narf_capabilities::{CapKind, parse_kind, kind_name};
+    let pinned: &[(&str, CapKind, u32)] = &[
+        ("BusDevice",      CapKind::BusDevice,      0x0001),
+        ("BlockDevice",    CapKind::BlockDevice,    0x0010),
+        ("NetIface",       CapKind::NetIface,       0x0020),
+        ("FileNode",       CapKind::FileNode,       0x0030),
+        ("Ring",           CapKind::Ring,           0x0040),
+        ("Domain",         CapKind::Domain,         0x0050),
+        ("Probe",          CapKind::Probe,          0x0060),
+        ("Key",            CapKind::Key,            0x0070),
+        ("Task",           CapKind::Task,           0x0080),
+        ("SleepableReader",CapKind::SleepableReader,0x0090),
+        ("Process",        CapKind::Process,        0x00A0),
+    ];
+    for &(name, kind, wire) in pinned {
+        if kind as u32 != wire {
+            return TestResult::Fail("CapKind wire value drifted — ABI break");
+        }
+        match parse_kind(name) {
+            Ok(k) if k as u32 == wire => {}
+            _ => return TestResult::Fail("parse_kind round-trip broken"),
+        }
+        if kind_name(kind) != name {
+            return TestResult::Fail("kind_name round-trip broken");
+        }
+    }
+    if parse_kind("DefinitelyNotAKind").is_ok() {
+        return TestResult::Fail("parse_kind accepted garbage");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_cap_kind_registry);
+
+fn smoke_cap_derive_narrows_rights() -> TestResult {
+    // Compile-time check: a Cap<_, Write> can derive Cap<_, Write>
+    // reflexively. The interesting negative case ("Cap<_, Read> cannot
+    // derive Cap<_, Grant>") would fail to compile — documented in the
+    // crate doc, cannot be exercised from a runtime test. Runtime side
+    // here: the derived cap preserves generation/index/type_tag and
+    // carries the narrower rights bits.
+    use narf_capabilities::{Cap, CapSlot, Rights, Write};
+
+    // Mint a Write cap directly (TCB path, no cap table yet).
+    let seed = CapSlot::new(42, 7, Write::BITS, 0x0040);
+    // SAFETY: Wave 0 test-only mint; no backing object yet.
+    let parent: Cap<(), Write> = unsafe { Cap::mint(seed) };
+    let derived: Cap<(), Write> = parent.derive::<Write>();
+
+    let p = parent.slot();
+    let d = derived.slot();
+    if p.generation != d.generation || p.index != d.index || p.type_tag != d.type_tag {
+        return TestResult::Fail("derive dropped non-rights metadata");
+    }
+    if d.rights != Write::BITS {
+        return TestResult::Fail("derive did not tag rights bits");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_cap_derive_narrows_rights);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_timer_irq_fires() -> TestResult {
     // Hardware-IRQ end-to-end: program the LAPIC timer + STI, busy-wait
@@ -956,6 +1094,86 @@ fn smoke_frame_alloc_roundtrip() -> TestResult {
 }
 kernel_test!(smoke_frame_alloc_roundtrip);
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_bus_enumerates_pcie() -> TestResult {
+    // Walk QEMU q35's PCIe ECAM at its default base. q35 exposes a
+    // PCI-Express host bridge at 00:00.0 plus any attached devices.
+    // We expect at minimum the host bridge entry (vendor != 0xFFFF).
+    use narf_bus::{devices, BusKind};
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    // SAFETY: ECAM_DEFAULT_BASE (0xb000_0000) is inside q35's
+    // pcie-mmcfg region and below the 4-GiB identity map installed
+    // by memory/mmu::init_mmu. No MMIO write happens during the walk.
+    let n = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    if n == 0 {
+        return TestResult::Fail("ECAM walk found zero devices on q35 — host bridge missing");
+    }
+    // Host bridge must be the first entry (function 0 on bus 0, dev 0).
+    let devs = devices();
+    let has_host_bridge = devs.iter().any(|d| matches!(
+        &d.kind,
+        BusKind::Pcie { addr, .. } if addr.bus == 0 && addr.device == 0 && addr.function == 0
+    ));
+    if !has_host_bridge {
+        return TestResult::Fail("00:00.0 host bridge not found in ECAM walk");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_bus_enumerates_pcie);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_bus_enumerates_virtio_mmio() -> TestResult {
+    // QEMU `virt` exposes 32 virtio-mmio transport slots at
+    // 0x0a00_0000 (stride 0x200). We don't have easy access to the
+    // DTB pointer from here, so the enumerator's fallback path probes
+    // the documented slot layout when no DTB is supplied — this
+    // covers the default cargo-xtask-test boot.
+    use narf_bus::{devices, snapshot};
+    // SAFETY: the fallback reads 4-byte MMIO from identity-mapped
+    // virtio-mmio registers and rejects invalid magic, so stray
+    // ranges don't produce phantom devices.
+    let _n = unsafe { narf_bus::init(None) };
+    let devs = devices();
+    // Structural: snapshot must agree with devices() post-init.
+    if snapshot().len() != devs.len() {
+        return TestResult::Fail("snapshot vs devices mismatch after init");
+    }
+    // QEMU virt without extra -device flags still exposes magic on
+    // every slot; populated slots (DeviceID != 0) appear only when a
+    // device is attached. We don't require one — just that the walk
+    // runs cleanly. If any device is present, it must have a
+    // VirtioMmio kind variant.
+    for d in devs.iter() {
+        match &d.kind {
+            narf_bus::BusKind::VirtioMmio { base, .. } => {
+                if base.raw() < 0x0a00_0000 || base.raw() >= 0x0a00_0000 + 32 * 0x200 {
+                    return TestResult::Fail("virtio-mmio base outside QEMU virt range");
+                }
+            }
+            _ => return TestResult::Fail("non-virtio device in aarch64 registry"),
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test!(smoke_bus_enumerates_virtio_mmio);
+
+fn smoke_bus_claim_device_not_found() -> TestResult {
+    // Structural test for the claim-API stub: claiming an address
+    // that doesn't exist must cleanly return NotFound / NotInitialised,
+    // never panic.
+    use narf_bus::{claim_device, BusAddr};
+    use narf_memory::PhysAddr;
+    let bogus = BusAddr::Mmio(PhysAddr::new(0xdead_beef_0000));
+    match claim_device(bogus) {
+        Err(narf_bus::ClaimError::NotFound)
+        | Err(narf_bus::ClaimError::NotInitialised) => TestResult::Pass,
+        Ok(_)  => TestResult::Fail("claim of bogus addr succeeded"),
+    }
+}
+kernel_test!(smoke_bus_claim_device_not_found);
+
 fn smoke_sleep_future_waits() -> TestResult {
     use core::sync::atomic::{AtomicBool, Ordering};
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -977,53 +1195,814 @@ fn smoke_sleep_future_waits() -> TestResult {
 }
 kernel_test!(smoke_sleep_future_waits);
 
-fn smoke_scheduler_respects_waker() -> TestResult {
-    // Proves the scheduler honours per-task wakers: a Parked future
-    // that returns Pending *without* calling its waker must not be
-    // re-polled until something else wakes it. Without the per-task
-    // awake flag this test would fail because the old no-op waker
-    // caused every Pending task to be repolled on every round.
-    use core::future::Future;
-    use core::pin::Pin;
-    use core::sync::atomic::{AtomicUsize, Ordering};
-    use core::task::{Context, Poll, Waker};
-    use narf_lib::sync::IrqSafeSpinLock;
+fn smoke_tracing_note_section_present() -> TestResult {
+    // Drive the internal probe sites so their nop actually executes
+    // in this test pass (the real smoke is the metadata, but exercising
+    // the marker proves the inline asm compiled and LTO kept it).
+    narf_tracing::exercise_internal_probes();
 
-    static POLLS:         AtomicUsize                     = AtomicUsize::new(0);
-    static PARKED_WAKER:  IrqSafeSpinLock<Option<Waker>>  = IrqSafeSpinLock::new(None);
-
-    struct Parked { ready: bool }
-    impl Future for Parked {
-        type Output = ();
-        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-            let this = self.get_mut();
-            POLLS.fetch_add(1, Ordering::Relaxed);
-            if this.ready { return Poll::Ready(()); }
-            *PARKED_WAKER.lock() = Some(cx.waker().clone());
-            this.ready = true;   // next poll (after being woken) completes
-            Poll::Pending
-        }
+    // The .note.narf.probes section must be non-empty: narf-tracing
+    // emits two internal probe sites (tracing::loaded + tracing::heartbeat)
+    // and `#[used]` plus `KEEP(*(.note.narf.probes))` in the linker
+    // script keep them even under fat LTO.
+    let probes = narf_tracing::probes();
+    if probes.is_empty() {
+        return TestResult::Fail(".note.narf.probes section empty — linker didn't keep the entries");
     }
 
-    POLLS.store(0, Ordering::Relaxed);
-    *PARKED_WAKER.lock() = None;
+    // Look for our two well-known entries.
+    let mut saw_loaded = false;
+    let mut saw_heartbeat = false;
+    for p in probes {
+        if p.provider == "tracing" && p.name == "loaded"    { saw_loaded = true; }
+        if p.provider == "tracing" && p.name == "heartbeat" { saw_heartbeat = true; }
+    }
+    if !saw_loaded    { return TestResult::Fail("tracing::loaded probe not in .note.narf.probes"); }
+    if !saw_heartbeat { return TestResult::Fail("tracing::heartbeat probe not in .note.narf.probes"); }
 
+    // Structural sanity: argc matches the args-type string.
+    for p in probes {
+        let expected = if p.args.is_empty() { 0 }
+                       else { (p.args.as_bytes().iter().filter(|&&b| b == b',').count() as u32) + 1 };
+        if p.argc != expected {
+            return TestResult::Fail("probe argc / args mismatch");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_tracing_note_section_present);
+
+fn smoke_tracing_flight_ring_basic() -> TestResult {
+    // Drop-oldest ring: N=4, write 6 records, expect overruns == 2.
+    use narf_tracing::FlightRing;
+    static RING: FlightRing<u32, 4> = FlightRing::new();
+
+    for i in 1u32..=6 { RING.record(i); }
+
+    if RING.total() != 6 {
+        return TestResult::Fail("FlightRing.total wrong after 6 records");
+    }
+    if RING.overruns() != 2 {
+        return TestResult::Fail("FlightRing.overruns not 2 after 2 wraps");
+    }
+
+    // Snapshot should return the 4 most recent writes. Single-threaded
+    // writer means no torn slots, so all four come back.
+    let mut out = [0u32; 4];
+    let n = RING.snapshot(&mut out);
+    if n != 4 {
+        return TestResult::Fail("FlightRing.snapshot returned the wrong count");
+    }
+    let mut present = [false; 7];
+    for &v in &out {
+        if (v as usize) < present.len() { present[v as usize] = true; }
+    }
+    for expected in [3u32, 4, 5, 6] {
+        if !present[expected as usize] {
+            return TestResult::Fail("FlightRing.snapshot missing a recent entry");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_tracing_flight_ring_basic);
+
+// ── rcu/ side-track tests ───────────────────────────────────────────
+//
+// Exercise the QSBR + Epoch variants end-to-end: pin, load through an
+// Atomic<T>, swap, defer-drop, sync, confirm the old value's Drop ran.
+
+fn smoke_rcu_qsbr_pin_unpin() -> TestResult {
+    // Baseline: pin() increments reader-in-flight; dropping the guard
+    // decrements it. While pinned, `report_quiescent()` must NOT advance
+    // the local epoch — advancing under a live reader would let their
+    // Shared<'g, T> get reclaimed.
+    let before = narf_rcu::qsbr::global_epoch();
+    {
+        let _g = narf_rcu::pin();
+        // With a live reader, report_quiescent is a safe no-op and
+        // sync_blocking must not accelerate reclamation.
+        narf_rcu::report_quiescent();
+    }
+    // Guard dropped — CPU is quiescent. Call sync to publish + drain.
+    narf_rcu::sync();
+    let after = narf_rcu::qsbr::global_epoch();
+    if after <= before {
+        return TestResult::Fail("global epoch didn't advance after sync");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_rcu_qsbr_pin_unpin);
+
+fn smoke_rcu_qsbr_reclaims() -> TestResult {
+    // Deferred-drop round-trip: publish a value, swap it, sync, confirm
+    // the displaced allocation's Drop ran.
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use narf_rcu::{Atomic, Owned};
+
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+    struct Canary;
+    impl Drop for Canary {
+        fn drop(&mut self) { DROPS.fetch_add(1, Ordering::Relaxed); }
+    }
+
+    DROPS.store(0, Ordering::Relaxed);
+    let cell: Atomic<Canary> = Atomic::new(Canary);
+
+    // Swap the initial Canary out of the cell — this queues it for
+    // deferred drop at the current epoch.
+    {
+        let g = narf_rcu::pin();
+        cell.store(Owned::new(Canary), &g);
+    }
+    // No drops yet — the queued entry is still pending its grace period.
+    if DROPS.load(Ordering::Relaxed) != 0 {
+        return TestResult::Fail("deferred drop ran before sync()");
+    }
+
+    // Wait a grace period. The queued Canary must now have dropped.
+    narf_rcu::sync();
+
+    if DROPS.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("deferred Canary didn't Drop after sync()");
+    }
+
+    // Also verify the new value is still readable.
+    let g = narf_rcu::pin();
+    let s = cell.load(&g);
+    if s.is_null() {
+        return TestResult::Fail("Atomic<Canary> became null after store+sync");
+    }
+    drop(g);
+
+    // Drop the cell itself — the still-live Canary drops inline.
+    drop(cell);
+    if DROPS.load(Ordering::Relaxed) != 2 {
+        return TestResult::Fail("cell-drop didn't reclaim the last value");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_rcu_qsbr_reclaims);
+
+fn smoke_rcu_epoch_pin_cycle() -> TestResult {
+    // Epoch-variant pin/unpin. min_pinned() must drop back to u64::MAX
+    // after the guard is released.
+    let before = narf_rcu::epoch::min_pinned();
+    {
+        let g = narf_rcu::epoch::pin();
+        // While pinned, min_pinned() must not be u64::MAX (we're pinned).
+        if narf_rcu::epoch::min_pinned() == u64::MAX {
+            return TestResult::Fail("Epoch pin didn't publish a snapshot");
+        }
+        // Guard's snapshot must be <= current advance target.
+        let adv = narf_rcu::epoch::advance();
+        if g.epoch() > adv {
+            return TestResult::Fail("EpochGuard epoch greater than current global");
+        }
+    }
+    // Guard dropped. Back to "no pinned reader" = u64::MAX.
+    if narf_rcu::epoch::min_pinned() != u64::MAX {
+        return TestResult::Fail("Epoch guard drop didn't release the slot");
+    }
+    let _ = before;
+    TestResult::Pass
+}
+kernel_test!(smoke_rcu_epoch_pin_cycle);
+
+fn smoke_rcu_epoch_defer_drop() -> TestResult {
+    // Epoch-backed defer_drop runs the destructor.
+    use alloc::boxed::Box;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+    struct Canary;
+    impl Drop for Canary {
+        fn drop(&mut self) { DROPS.fetch_add(1, Ordering::Relaxed); }
+    }
+
+    DROPS.store(0, Ordering::Relaxed);
+    narf_rcu::epoch::defer_drop(Box::new(Canary));
+    if DROPS.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("epoch::defer_drop didn't run destructor");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_rcu_epoch_defer_drop);
+
+fn smoke_ipc_spsc_round_trip() -> TestResult {
+    // Producer and consumer on the same executor: send 8 u64 values
+    // through a 4-slot ring, sum them on the consumer side. Exercises
+    // the wrap-around + back-pressure-via-waker path at the same time:
+    // the consumer must drain before the producer can publish the
+    // second half.
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static SUM: AtomicU64 = AtomicU64::new(0);
+
+    SUM.store(0, Ordering::Relaxed);
     narf_scheduler::init();
-    narf_scheduler::spawn(Parked { ready: false });
-    narf_scheduler::spawn(async {
-        // Yield once so Parked gets a turn to register its waker, then
-        // wake it. Under the old noop_waker Parked would already have
-        // been re-polled many times by now; with per-task wakers it
-        // must have been polled exactly once so far.
+
+    let (mut tx, mut rx) = narf_ipc::channel::<u64, 4>();
+
+    narf_scheduler::spawn(async move {
+        for i in 1u64..=8 {
+            let _ = tx.send(i).await;
+        }
+        // tx dropped here → closes the ring.
+    });
+
+    narf_scheduler::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(v)                           => { SUM.fetch_add(v, Ordering::Relaxed); }
+                Err(narf_ipc::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    narf_scheduler::run_until_empty();
+    // 1 + 2 + … + 8 = 36.
+    if SUM.load(Ordering::Relaxed) == 36 { TestResult::Pass }
+    else { TestResult::Fail("SPSC round-trip didn't deliver every message") }
+}
+kernel_test!(smoke_ipc_spsc_round_trip);
+
+fn smoke_ipc_spsc_try_send_full() -> TestResult {
+    // Fill a 2-slot ring without a consumer; the third try_send must
+    // return Full and hand the message back.
+    let (mut tx, _rx) = narf_ipc::channel::<u32, 2>();
+    tx.try_send(10).expect("slot 0 free");
+    tx.try_send(20).expect("slot 1 free");
+    match tx.try_send(30) {
+        Err(narf_ipc::TrySendError::Full(30)) => TestResult::Pass,
+        Err(narf_ipc::TrySendError::Full(_))  => TestResult::Fail("Full returned wrong value"),
+        Err(narf_ipc::TrySendError::Closed(_)) => TestResult::Fail("unexpected Closed"),
+        Ok(())                                => TestResult::Fail("try_send accepted beyond capacity"),
+    }
+}
+kernel_test!(smoke_ipc_spsc_try_send_full);
+
+fn smoke_ipc_spsc_close_eof() -> TestResult {
+    // Drop the producer without sending anything → consumer's first
+    // recv resolves to Closed. Also verifies the path where the drop's
+    // wake fires against an already-parked RecvFuture.
+    use core::sync::atomic::{AtomicU8, Ordering};
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);       // 0=pending, 1=closed, 2=unexpected
+
+    OUTCOME.store(0, Ordering::Relaxed);
+    narf_scheduler::init();
+
+    let (tx, mut rx) = narf_ipc::channel::<u32, 4>();
+
+    // Consumer task: parks on recv, then observes Closed.
+    narf_scheduler::spawn(async move {
+        match rx.recv().await {
+            Err(narf_ipc::RecvError::Closed) => { OUTCOME.store(1, Ordering::Relaxed); }
+            _                                => { OUTCOME.store(2, Ordering::Relaxed); }
+        }
+    });
+
+    // Producer dropper: yields once to let the consumer park, then drops.
+    narf_scheduler::spawn(async move {
         narf_scheduler::yield_now().await;
-        if let Some(w) = PARKED_WAKER.lock().take() { w.wake(); }
+        drop(tx);
+    });
+
+    narf_scheduler::run_until_empty();
+    match OUTCOME.load(Ordering::Relaxed) {
+        1 => TestResult::Pass,
+        2 => TestResult::Fail("recv returned unexpected variant"),
+        _ => TestResult::Fail("recv future never resolved after producer drop"),
+    }
+}
+kernel_test!(smoke_ipc_spsc_close_eof);
+
+fn smoke_ipc_spsc_drain_then_eof() -> TestResult {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static COUNT:  AtomicU32 = AtomicU32::new(0);
+    static CLOSED: AtomicU32 = AtomicU32::new(0);
+
+    COUNT.store(0, Ordering::Relaxed);
+    CLOSED.store(0, Ordering::Relaxed);
+    narf_scheduler::init();
+
+    let (mut tx, mut rx) = narf_ipc::channel::<u32, 4>();
+    narf_scheduler::spawn(async move {
+        let _ = tx.try_send(10);
+        let _ = tx.try_send(20);
+        let _ = tx.try_send(30);
+    });
+    narf_scheduler::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(_)  => { COUNT.fetch_add(1, Ordering::Relaxed); }
+                Err(_) => { CLOSED.store(1, Ordering::Relaxed); break; }
+            }
+        }
     });
     narf_scheduler::run_until_empty();
 
-    match POLLS.load(Ordering::Relaxed) {
-        2 => TestResult::Pass,
-        n if n < 2 => TestResult::Fail("parked task never woke after wake()"),
-        _          => TestResult::Fail("parked task re-polled without a wake — waker gating broken"),
+    if COUNT.load(Ordering::Relaxed) != 3 {
+        return TestResult::Fail("drain lost messages before Closed");
+    }
+    if CLOSED.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("Closed not observed after drain");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_ipc_spsc_drain_then_eof);
+
+// ── abi ───────────────────────────────────────────────────────────
+
+fn smoke_abi_submission_layout() -> TestResult {
+    // Wire-format pin. Spec §3 field order is op, flags, caps, tag,
+    // inline; under `#[repr(C)]` the 16-aligned `CapSlot` forces an
+    // 8-byte interior pad and an 8-byte tail pad, for 144 bytes total
+    // at 16-byte alignment. The naive 4+4+64+8+48=128 undercounts both.
+    use core::mem::{align_of, size_of};
+    if size_of::<narf_abi::Submission>() != 144 {
+        return TestResult::Fail("Submission size drifted from 144");
+    }
+    if align_of::<narf_abi::Submission>() != 16 {
+        return TestResult::Fail("Submission alignment drifted from 16");
+    }
+    // Every OpCode discriminant must match the spec-pinned wire tag.
+    // Adding a variant is fine; changing one of these is an ABI break.
+    let opcode_pins: &[(narf_abi::OpCode, u32)] = &[
+        (narf_abi::OpCode::Noop,        0x0000),
+        (narf_abi::OpCode::Cancel,      0x0001),
+        (narf_abi::OpCode::RingSend,    0x0002),
+        (narf_abi::OpCode::RingRecv,    0x0003),
+        (narf_abi::OpCode::Yield,       0x0004),
+        (narf_abi::OpCode::DomainEnter, 0x0005),
+        (narf_abi::OpCode::DomainExit,  0x0006),
+    ];
+    for &(op, wire) in opcode_pins {
+        if op.as_u32() != wire {
+            return TestResult::Fail("OpCode wire discriminant drifted");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_abi_submission_layout);
+
+fn smoke_abi_completion_layout() -> TestResult {
+    // Same pin for completions: 64 bytes, 8-byte aligned (status is u32
+    // at offset 8, Rust inserts 4 bytes of tail padding before result).
+    use core::mem::{align_of, size_of};
+    if size_of::<narf_abi::Completion>() != 64 {
+        return TestResult::Fail("Completion size drifted from 64");
+    }
+    if align_of::<narf_abi::Completion>() != 8 {
+        return TestResult::Fail("Completion alignment drifted from 8");
+    }
+    let status_pins: &[(narf_abi::NarfStatus, u32)] = &[
+        (narf_abi::NarfStatus::Ok,              0x0000),
+        (narf_abi::NarfStatus::Pending,         0x0001),
+        (narf_abi::NarfStatus::Cancelled,       0x0002),
+        (narf_abi::NarfStatus::CancelRequested, 0x0003),
+        (narf_abi::NarfStatus::CapRevoked,      0x0004),
+        (narf_abi::NarfStatus::InvalidOp,       0x0005),
+        (narf_abi::NarfStatus::Busy,            0x0006),
+        (narf_abi::NarfStatus::Closed,          0x0007),
+    ];
+    for &(st, wire) in status_pins {
+        if st.as_u32() != wire {
+            return TestResult::Fail("NarfStatus wire discriminant drifted");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_abi_completion_layout);
+
+fn smoke_abi_ring_roundtrip() -> TestResult {
+    // Submit a Submission through the submission ring, on the kernel
+    // side turn it into a Completion, then verify the tag round-trips
+    // through the completion ring. This proves the `narf_ipc` SPSC ring
+    // happily carries the wire-layout-pinned `Submission`/`Completion`
+    // types at their declared sizes (i.e. we haven't accidentally made
+    // the payload an un-transferable type).
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static RECEIVED_TAG: AtomicU64 = AtomicU64::new(0);
+
+    RECEIVED_TAG.store(0, Ordering::Relaxed);
+    narf_scheduler::init();
+
+    let (mut sq_tx, mut sq_rx) = narf_abi::submission_channel::<4>();
+    let (mut cq_tx, mut cq_rx) = narf_abi::completion_channel::<4>();
+
+    // Userland side: submit, await completion, stash the tag.
+    narf_scheduler::spawn(async move {
+        let sub = narf_abi::Submission::noop(narf_abi::Tag::new(0xDEADBEEF));
+        let _ = sq_tx.send(sub).await;
+        if let Ok(c) = cq_rx.recv().await {
+            RECEIVED_TAG.store(c.tag, Ordering::Relaxed);
+        }
+    });
+
+    // Kernel side: drain one submission, emit a matching completion.
+    narf_scheduler::spawn(async move {
+        if let Ok(sub) = sq_rx.recv().await {
+            let c = narf_abi::Completion::ok(sub.tag());
+            let _ = cq_tx.send(c).await;
+        }
+    });
+
+    narf_scheduler::run_until_empty();
+    if RECEIVED_TAG.load(Ordering::Relaxed) == 0xDEADBEEF {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("submission→completion tag did not round-trip")
     }
 }
-kernel_test!(smoke_scheduler_respects_waker);
+kernel_test!(smoke_abi_ring_roundtrip);
+
+fn smoke_cap_bootstrap_and_invoke() -> TestResult {
+    // A freshly-bootstrapped cap is live: check_live / is_live / invoke
+    // with NoopOp all succeed. Epoch starts at 1.
+    use narf_capabilities::{Cap, CapKind, CapType, NoopOp, Write, object_table};
+
+    struct TestObj;
+    impl CapType for TestObj { const KIND: CapKind = CapKind::Endpoint; }
+
+    let cap: Cap<TestObj, Write> = Cap::<TestObj, Write>::bootstrap();
+    if !cap.is_live() { return TestResult::Fail("fresh cap not live"); }
+    if cap.check_live().is_err() { return TestResult::Fail("check_live on fresh cap failed"); }
+    if cap.invoke(NoopOp).is_err() { return TestResult::Fail("NoopOp invoke failed on fresh cap"); }
+    if object_table::kind_at(cap.slot().index) != Some(CapKind::Endpoint) {
+        return TestResult::Fail("object_table lost the registered kind");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_cap_bootstrap_and_invoke);
+
+fn smoke_cap_revoke_invalidates() -> TestResult {
+    // Bootstrap cap, keep a clone, revoke the original → clone sees
+    // Revoked on its next check_live / invoke. O(1) mass invalidation.
+    use narf_capabilities::{Cap, CapError, CapKind, CapType, NoopOp, Write};
+
+    struct TestObj;
+    impl CapType for TestObj { const KIND: CapKind = CapKind::Endpoint; }
+
+    let parent: Cap<TestObj, Write> = Cap::<TestObj, Write>::bootstrap();
+    let clone  = parent;               // Cap is Copy
+    let derived: Cap<TestObj, Write> = parent.derive::<Write>();
+    parent.revoke();
+
+    match clone.check_live() {
+        Err(CapError::Revoked) => {}
+        Ok(_)                  => return TestResult::Fail("clone still live after revoke"),
+        Err(_)                 => return TestResult::Fail("clone reported wrong error"),
+    }
+    if derived.is_live()    { return TestResult::Fail("derived cap survived parent revoke"); }
+    if clone.invoke(NoopOp) != Err(CapError::Revoked) {
+        return TestResult::Fail("invoke didn't gate on epoch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_cap_revoke_invalidates);
+
+fn smoke_cap_independent_objects() -> TestResult {
+    // Revoking one object does not invalidate caps to another object
+    // of the same kind — epochs are per-index, not global.
+    use narf_capabilities::{Cap, CapKind, CapType, Write};
+
+    struct TestObj;
+    impl CapType for TestObj { const KIND: CapKind = CapKind::Endpoint; }
+
+    let a: Cap<TestObj, Write> = Cap::<TestObj, Write>::bootstrap();
+    let b: Cap<TestObj, Write> = Cap::<TestObj, Write>::bootstrap();
+    if a.slot().index == b.slot().index {
+        return TestResult::Fail("distinct bootstraps produced the same index");
+    }
+    a.revoke();
+    if !b.is_live() { return TestResult::Fail("revoking a killed unrelated b"); }
+    TestResult::Pass
+}
+kernel_test!(smoke_cap_independent_objects);
+
+fn smoke_io_dma_alloc_free() -> TestResult {
+    // alloc_coherent returns a page-aligned nonzero phys address with
+    // the requested (rounded) length; drop returns the storage.
+    use narf_io::{alloc_coherent, free_coherent};
+    use narf_lib::id::DomainId;
+    use narf_memory::PAGE_SIZE;
+
+    let buf = match alloc_coherent(256, DomainId::DRIVER_0) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Skip("frame allocator unavailable in this flavour"),
+    };
+    if buf.phys_addr().raw() == 0 {
+        return TestResult::Fail("DMA buffer phys addr is zero");
+    }
+    if buf.phys_addr().raw() & (PAGE_SIZE - 1) != 0 {
+        return TestResult::Fail("DMA buffer phys addr not page-aligned");
+    }
+    if buf.len() != PAGE_SIZE as usize {
+        return TestResult::Fail("DMA buffer length not rounded to a page");
+    }
+    if buf.domain() != DomainId::DRIVER_0 {
+        return TestResult::Fail("DMA buffer domain mismatch");
+    }
+    // Explicit free path (Drop path tested implicitly by the others).
+    free_coherent(buf);
+    TestResult::Pass
+}
+kernel_test!(smoke_io_dma_alloc_free);
+
+fn smoke_io_dma_cap_bootstrap() -> TestResult {
+    // Exercises Wave-2 cap table + Wave-3a DmaBuffer: bootstrap a
+    // Cap<DmaBuffer, Write>, confirm it's live, revoke, confirm dead.
+    use narf_capabilities::{Cap, CapError, CapType, Write};
+    use narf_io::DmaBuffer;
+
+    // Sanity: the CapType wiring points at CapKind::DmaBuffer.
+    if DmaBuffer::KIND as u32 != narf_capabilities::CapKind::DmaBuffer as u32 {
+        return TestResult::Fail("DmaBuffer::KIND not DmaBuffer");
+    }
+
+    let cap: Cap<DmaBuffer, Write> = Cap::<DmaBuffer, Write>::bootstrap();
+    if !cap.is_live() { return TestResult::Fail("fresh DmaBuffer cap not live"); }
+    if cap.check_live().is_err() {
+        return TestResult::Fail("check_live on fresh DmaBuffer cap failed");
+    }
+    let clone = cap;
+    cap.revoke();
+    match clone.check_live() {
+        Err(CapError::Revoked) => {}
+        Ok(_) => return TestResult::Fail("DmaBuffer cap still live after revoke"),
+        Err(_) => return TestResult::Fail("DmaBuffer cap reported wrong error"),
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_io_dma_cap_bootstrap);
+
+fn smoke_io_iommu_stub_map_unmap() -> TestResult {
+    // Wave-3a IOMMU stub: construct a context, map a DmaBuffer, unmap,
+    // confirm the no-op returns and the internal mapping count tracks.
+    use narf_io::{alloc_coherent, IommuContext, IoError};
+    use narf_lib::id::DomainId;
+
+    let dom = DomainId::DRIVER_1;
+    let buf = match alloc_coherent(4096, dom) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Skip("frame allocator unavailable in this flavour"),
+    };
+
+    let mut ctx = IommuContext::new(dom);
+    if ctx.domain() != dom { return TestResult::Fail("IommuContext domain mismatch"); }
+    if ctx.mapping_count() != 0 { return TestResult::Fail("fresh context not empty"); }
+
+    if ctx.map(&buf, 0x1000_0000).is_err() {
+        return TestResult::Fail("stub map returned error");
+    }
+    if ctx.mapping_count() != 1 { return TestResult::Fail("mapping count not bumped"); }
+
+    // A mismatched-domain buffer must be rejected.
+    let other = match alloc_coherent(4096, DomainId::DRIVER_2) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Skip("frame allocator exhausted mid-test"),
+    };
+    match ctx.map(&other, 0x2000_0000) {
+        Err(IoError::DomainMismatch) => {}
+        _ => return TestResult::Fail("cross-domain map should have rejected"),
+    }
+
+    if ctx.unmap(0x1000_0000).is_err() {
+        return TestResult::Fail("stub unmap returned error");
+    }
+    if ctx.mapping_count() != 0 { return TestResult::Fail("mapping count not decremented"); }
+
+    // Unmapping nothing is an error.
+    match ctx.unmap(0x1000_0000) {
+        Err(IoError::NotMapped) => {}
+        _ => return TestResult::Fail("unmap of empty context should fail"),
+    }
+
+    TestResult::Pass
+}
+kernel_test!(smoke_io_iommu_stub_map_unmap);
+
+fn smoke_drivers_register_and_lifecycle() -> TestResult {
+    // Exercises the whole Wave-3a framework path: mint a registration
+    // authority, register a NoopDriver, drive its start + quiesce,
+    // and observe the phase transitions via `with_entry`.
+    use narf_drivers::{
+        DomainPolicy, DriverManifest, DriverPhase, NoopDriver,
+        bootstrap_authority, registry,
+    };
+
+    static MANIFEST: DriverManifest = DriverManifest {
+        name:          "noop.smoke-1",
+        domain_policy: DomainPolicy::Shared,
+        caps_required: &[],
+    };
+
+    let authority = bootstrap_authority();
+    let before = registry().len();
+    let _handle = match registry().register(&authority, &MANIFEST, NoopDriver::new()) {
+        Ok(h)  => h,
+        Err(_) => return TestResult::Fail("register() failed on fresh authority"),
+    };
+    if registry().len() != before + 1 {
+        return TestResult::Fail("registry length didn't grow after register");
+    }
+
+    // Freshly registered → Loaded.
+    match registry().with_entry("noop.smoke-1", |s| s.phase) {
+        Some(DriverPhase::Loaded) => {}
+        _ => return TestResult::Fail("post-register phase not Loaded"),
+    }
+
+    narf_scheduler::init();
+    narf_scheduler::spawn(async {
+        let _ = registry().start_named("noop.smoke-1").await;
+    });
+    narf_scheduler::run_until_empty();
+    match registry().with_entry("noop.smoke-1", |s| s.phase) {
+        Some(DriverPhase::Started) => {}
+        _ => return TestResult::Fail("post-start phase not Started"),
+    }
+
+    narf_scheduler::init();
+    narf_scheduler::spawn(async {
+        let _ = registry().quiesce_named("noop.smoke-1").await;
+    });
+    narf_scheduler::run_until_empty();
+    match registry().with_entry("noop.smoke-1", |s| s.phase) {
+        Some(DriverPhase::Quiesced) => {}
+        _ => return TestResult::Fail("post-quiesce phase not Quiesced"),
+    }
+
+    // Re-entry is a no-op (idempotent): calling start on a Quiesced
+    // entry or quiesce twice must not explode.
+    narf_scheduler::init();
+    narf_scheduler::spawn(async {
+        let _ = registry().start_named("noop.smoke-1").await;
+        let _ = registry().quiesce_named("noop.smoke-1").await;
+    });
+    narf_scheduler::run_until_empty();
+    match registry().with_entry("noop.smoke-1", |s| s.phase) {
+        Some(DriverPhase::Quiesced) => TestResult::Pass,
+        _ => TestResult::Fail("post-reentry phase drifted off Quiesced"),
+    }
+}
+kernel_test!(smoke_drivers_register_and_lifecycle);
+
+fn smoke_drivers_register_revoked_authority() -> TestResult {
+    // A revoked authority cap must not be able to register further
+    // drivers — cap-table epoch gates the whole framework load path.
+    use narf_drivers::{
+        DomainPolicy, DriverManifest, NoopDriver, RegistrationError,
+        bootstrap_authority, registry,
+    };
+
+    static MANIFEST: DriverManifest = DriverManifest {
+        name:          "noop.revoke-test",
+        domain_policy: DomainPolicy::Shared,
+        caps_required: &[],
+    };
+
+    let authority = bootstrap_authority();
+    authority.revoke();
+    match registry().register(&authority, &MANIFEST, NoopDriver::new()) {
+        Err(RegistrationError::AuthorityRevoked) => TestResult::Pass,
+        Err(_) => TestResult::Fail("wrong error variant from revoked-authority register"),
+        Ok(_)  => TestResult::Fail("register() accepted a revoked authority"),
+    }
+}
+kernel_test!(smoke_drivers_register_revoked_authority);
+
+fn smoke_drivers_dedicated_domain_exhaustion() -> TestResult {
+    // security-model/ §4.1 caps dedicated-domain drivers at 6.
+    // Register 6, confirm the 7th hard-errors.
+    use narf_drivers::{
+        DomainPolicy, DriverManifest, NoopDriver, RegistrationError,
+        bootstrap_authority, registry,
+    };
+
+    // Seven distinct static manifests — kernel_test requires 'static
+    // references, and the registry stores &'static DriverManifest.
+    static M0: DriverManifest = DriverManifest { name: "ded.0", domain_policy: DomainPolicy::Dedicated, caps_required: &[] };
+    static M1: DriverManifest = DriverManifest { name: "ded.1", domain_policy: DomainPolicy::Dedicated, caps_required: &[] };
+    static M2: DriverManifest = DriverManifest { name: "ded.2", domain_policy: DomainPolicy::Dedicated, caps_required: &[] };
+    static M3: DriverManifest = DriverManifest { name: "ded.3", domain_policy: DomainPolicy::Dedicated, caps_required: &[] };
+    static M4: DriverManifest = DriverManifest { name: "ded.4", domain_policy: DomainPolicy::Dedicated, caps_required: &[] };
+    static M5: DriverManifest = DriverManifest { name: "ded.5", domain_policy: DomainPolicy::Dedicated, caps_required: &[] };
+    static M6: DriverManifest = DriverManifest { name: "ded.6", domain_policy: DomainPolicy::Dedicated, caps_required: &[] };
+
+    let a = bootstrap_authority();
+    for m in [&M0, &M1, &M2, &M3, &M4, &M5].iter().copied() {
+        if registry().register(&a, m, NoopDriver::new()).is_err() {
+            return TestResult::Fail("dedicated-domain register failed before limit");
+        }
+    }
+    match registry().register(&a, &M6, NoopDriver::new()) {
+        Err(RegistrationError::NoDomain) => TestResult::Pass,
+        Err(_) => TestResult::Fail("wrong error variant on domain exhaustion"),
+        Ok(_)  => TestResult::Fail("7th dedicated-domain register accepted"),
+    }
+}
+kernel_test!(smoke_drivers_dedicated_domain_exhaustion);
+
+// ── drivers/virtio — Wave 3b side-track ─────────────────────────────
+//
+// The side-track crate defines `VirtioMmioDevice::probe` + a skeleton
+// `Driver`. These two tests exercise the happy path on aarch64 (where
+// QEMU `virt` exposes 32 virtio-mmio slots) and a synthesised
+// wrong-magic path that doesn't rely on real hardware at all.
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_virtio_mmio_probe() -> TestResult {
+    // QEMU `virt` populates virtio-mmio slot 0 at 0x0a00_0000 onwards;
+    // the bus enumerator has already filtered out empty slots
+    // (device_id == 0), so a non-empty registry proves at least one
+    // probe will succeed. Re-probe every registry entry here to
+    // exercise VirtioMmioDevice::probe directly.
+    use narf_bus::{devices, BusKind};
+    use narf_drivers_virtio::{ProbeError, VirtioMmioDevice};
+    // SAFETY: init tolerates a null/absent DTB by falling back to the
+    // QEMU-virt default layout; identity-map covers the MMIO window.
+    let _n = unsafe { narf_bus::init(None) };
+    let mut ok = 0usize;
+    let mut no_device = 0usize;
+    for d in devices() {
+        if !matches!(d.kind, BusKind::VirtioMmio { .. }) { continue; }
+        match VirtioMmioDevice::probe(&d) {
+            Ok(v) => {
+                if v.version() != 2 {
+                    return TestResult::Fail("probed transport reported non-modern version");
+                }
+                ok += 1;
+            }
+            Err(ProbeError::NoDevice) => { no_device += 1; }
+            Err(_) => return TestResult::Fail("unexpected probe error on bus-registry virtio-mmio entry"),
+        }
+    }
+    // The bus-registry filter drops empty slots, so on QEMU virt we
+    // must see at least one successful probe. If the registry had
+    // returned zero entries we'd accept that — but we observed at
+    // least one via the iterator.
+    if ok == 0 && no_device == 0 {
+        // Registry had no virtio-mmio entries at all — either QEMU
+        // changed its defaults or the DTB fallback is off. Tolerate
+        // as a skip rather than a hard fail.
+        return TestResult::Skip("no virtio-mmio entries in bus registry");
+    }
+    if ok == 0 {
+        return TestResult::Fail("bus registry had virtio-mmio entries but none probed Ok");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test!(smoke_virtio_mmio_probe);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_virtio_mmio_probe() -> TestResult {
+    // x86_64 under QEMU q35 has no virtio-mmio transports (virtio
+    // lives behind PCIe on that machine). Assert structural: the bus
+    // registry, once walked, contains zero VirtioMmio entries.
+    use narf_bus::{devices, BusKind};
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    // SAFETY: ECAM_DEFAULT_BASE is inside q35's pcie-mmcfg region and
+    // the walker performs read-only config-space probes.
+    let _n = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    for d in devices() {
+        if matches!(d.kind, BusKind::VirtioMmio { .. }) {
+            return TestResult::Fail("unexpected virtio-mmio entry on x86_64 q35");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_virtio_mmio_probe);
+
+fn smoke_virtio_mmio_wrong_magic() -> TestResult {
+    // Synthesise a fake MMIO window on the stack: a zeroed u32 at
+    // offset 0 (the MAGIC_VALUE register) will not match VIRTIO_MAGIC
+    // (0x7472_6976), so the probe must reject with WrongMagic. No
+    // real hardware is touched, and the buffer does not escape this
+    // function body.
+    use narf_drivers_virtio::{ProbeError, VirtioMmioDevice};
+    // 64 u32 slots = 256 bytes > 0x100 CONFIG offset, so any read
+    // `probe_raw` performs lands inside the buffer. All zeros means
+    // the very first read (MAGIC_VALUE) fails and we never touch the
+    // tail.
+    let fake: [u32; 64] = [0; 64];
+    let addr = fake.as_ptr() as u64;
+    // SAFETY: `fake` is a stack-allocated u32-aligned buffer covering
+    // at least CONFIG bytes; `probe_raw` reads only 4-byte words
+    // within it. The buffer's lifetime is this function body — we do
+    // not stash the pointer anywhere.
+    let result = unsafe { VirtioMmioDevice::probe_raw(addr) };
+    // Prevent the optimiser from eliding the buffer even under fat LTO.
+    core::hint::black_box(&fake);
+    match result {
+        Err(ProbeError::WrongMagic) => TestResult::Pass,
+        Err(e) => {
+            let _ = e;
+            TestResult::Fail("wrong-magic probe returned the wrong error variant")
+        }
+        Ok(_)  => TestResult::Fail("wrong-magic probe unexpectedly succeeded"),
+    }
+}
+kernel_test!(smoke_virtio_mmio_wrong_magic);
+

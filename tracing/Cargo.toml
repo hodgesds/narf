@@ -1,0 +1,18 @@
+[package]
+name         = "narf-tracing"
+description  = "Static USDT-style probe markers, .note.narf.probes, and flight-recorder rings."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_tracing"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib  = { path = "../lib" }
+
+[lints]
+workspace = true

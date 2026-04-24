@@ -1,0 +1,19 @@
+[package]
+name         = "narf-rcu"
+description  = "Deferred reclamation: QSBR (default), epoch, hazard (stub), sleepable (stub)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_rcu"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib  = { path = "../lib" }
+narf-arch = { path = "../arch" }
+
+[lints]
+workspace = true

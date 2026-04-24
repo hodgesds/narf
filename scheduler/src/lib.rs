@@ -182,6 +182,13 @@ pub fn run_until_empty() {
             let mut ctx = Context::from_waker(&waker);
             let poll_result = slot.task.as_mut().poll(&mut ctx);
 
+            // Announce a QSBR quiescent state: the task has yielded
+            // back to the executor and holds no RCU read-guards across
+            // the poll boundary (per rcu/ §3.7, read-guards may not
+            // span awaits). Every poll return is therefore a grace-
+            // period tick for this CPU.
+            narf_rcu::report_quiescent();
+
             match poll_result {
                 Poll::Ready(()) => { ready_this_round += 1; /* drop slot */ }
                 Poll::Pending   => {

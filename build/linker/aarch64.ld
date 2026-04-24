@@ -45,6 +45,10 @@ SECTIONS
         __rodata_start = .;
         *(.rodata .rodata.*)
         . = ALIGN(8);
+        __narf_probes_start = .;
+        KEEP(*(.note.narf.probes))
+        __narf_probes_end   = .;
+        . = ALIGN(8);
         __narf_tests_start = .;
         KEEP(*(narf.tests))
         __narf_tests_end   = .;
