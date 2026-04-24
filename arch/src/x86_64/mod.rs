@@ -11,6 +11,59 @@ pub mod probe;
 pub use asm::{halt_forever, disable_interrupts, enable_interrupts};
 pub use cpuid::Features;
 
+/// x86_64's concrete `DomainPrimitive` type. All methods forward to
+/// the free functions in `pks` — the trait is just a way to let
+/// arch-agnostic code name a single type.
+#[derive(Debug)]
+pub struct Pks;
+
+impl crate::DomainPrimitive for Pks {
+    const BACKEND: crate::DomainBackend = crate::DomainBackend::Pks;
+    type SavedState = pks::SavedPkrs;
+    type Rights     = pks::DomainRights;
+
+    const ALLOW_ALL: pks::DomainRights = pks::DomainRights::ALLOW_ALL;
+    const READ_ONLY: pks::DomainRights = pks::DomainRights::READ_ONLY;
+    const DENY_ALL:  pks::DomainRights = pks::DomainRights::DENY_ALL;
+
+    #[inline]
+    unsafe fn save() -> Self::SavedState {
+        // SAFETY: trait contract delegated.
+        unsafe { pks::save() }
+    }
+
+    #[inline]
+    unsafe fn restore(s: Self::SavedState) {
+        // SAFETY: trait contract delegated.
+        unsafe { pks::restore(s); }
+    }
+
+    #[inline]
+    unsafe fn get_rights(domain: u8) -> Self::Rights {
+        // SAFETY: trait contract delegated.
+        unsafe { pks::get_rights(domain) }
+    }
+
+    #[inline]
+    unsafe fn set_rights(domain: u8, rights: Self::Rights) {
+        // SAFETY: trait contract delegated.
+        unsafe { pks::set_rights(domain, rights); }
+    }
+
+    #[inline]
+    unsafe fn enter_domain(kernel_domain: u8, driver_domain: u8)
+        -> Self::SavedState {
+        // SAFETY: trait contract delegated.
+        unsafe { pks::enter_domain(kernel_domain, driver_domain) }
+    }
+
+    #[inline]
+    unsafe fn exit_domain(saved: Self::SavedState) {
+        // SAFETY: trait contract delegated.
+        unsafe { pks::exit_domain(saved); }
+    }
+}
+
 /// Exit QEMU cleanly via the `isa-debug-exit` device (I/O port 0xF4).
 /// QEMU computes its exit status as `(code << 1) | 1`, so `exit_qemu(0)`
 /// gives exit status 1 and `exit_qemu(16)` gives status 33 — xtask /

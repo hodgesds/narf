@@ -28,6 +28,82 @@ pub const BACKEND: DomainBackend = DomainBackend::Pks;
 #[cfg(target_arch = "aarch64")]
 pub const BACKEND: DomainBackend = DomainBackend::Mte;
 
+/// Per-arch domain-rights primitive.
+///
+/// x86_64 backs this with PKS (`IA32_PKRS` + PTE PK field). aarch64
+/// backs it with MTE (`SCTLR_EL1.TCF` + pointer tag bits). The two
+/// differ structurally — PKS does rights with a single MSR write;
+/// MTE encodes rights in pointer tags per 16-byte granule — but both
+/// expose the same coarse save / restore / rights-mutation surface.
+///
+/// Stage-2 status:
+///   * x86_64 impl: fully live (`arch::x86_64::Pks`).
+///   * aarch64 impl: stub (`arch::aarch64::Mte`) — methods
+///     `unimplemented!`; the trait shape is carved out so consumers
+///     can depend on it today and the real impl lands without API
+///     churn when MTE work begins.
+pub trait DomainPrimitive {
+    const BACKEND: DomainBackend;
+    type SavedState: Copy;
+    type Rights: Copy + Eq;
+
+    /// All-allow rights. Default initial PKRS / "TCF off" for aarch64.
+    const ALLOW_ALL: Self::Rights;
+    /// Read-only: writes fault, reads allowed.
+    const READ_ONLY: Self::Rights;
+    /// All-deny: any access faults.
+    const DENY_ALL:  Self::Rights;
+
+    /// Snapshot the current domain-rights state.
+    ///
+    /// # Safety
+    /// Backend preconditions (e.g. CR4.PKS=1 for the PKS impl) must hold.
+    unsafe fn save() -> Self::SavedState;
+
+    /// Restore a previously-saved domain-rights state.
+    ///
+    /// # Safety
+    /// Same as `save`.
+    unsafe fn restore(s: Self::SavedState);
+
+    /// Read the rights for a single domain.
+    ///
+    /// # Safety
+    /// Same as `save`. `domain` must be in 0..=15.
+    unsafe fn get_rights(domain: u8) -> Self::Rights;
+
+    /// Write rights for one domain without disturbing the other 15.
+    ///
+    /// # Safety
+    /// Same as `save`. `domain` must be in 0..=15.
+    unsafe fn set_rights(domain: u8, rights: Self::Rights);
+
+    /// Enter a domain scope — rights allow only the two named
+    /// domains. Returns the previous saved state for `exit_domain`.
+    /// Backends typically implement this as a single atomic mutation
+    /// (PKS: one `WRMSR IA32_PKRS`).
+    ///
+    /// # Safety
+    /// Same as `save`. Both domain numbers must be in 0..=15.
+    unsafe fn enter_domain(
+        kernel_domain: u8,
+        driver_domain: u8,
+    ) -> Self::SavedState;
+
+    /// Symmetric exit from a scope started by `enter_domain`.
+    ///
+    /// # Safety
+    /// Same as `restore`.
+    unsafe fn exit_domain(saved: Self::SavedState);
+}
+
+/// The active architecture's `DomainPrimitive` implementation. Type
+/// alias so consumers write `arch::Domain::save()` regardless of arch.
+#[cfg(target_arch = "x86_64")]
+pub type Domain = current::Pks;
+#[cfg(target_arch = "aarch64")]
+pub type Domain = current::Mte;
+
 /// Spin-halt the current CPU forever. Used on panic and end-of-boot.
 #[inline(always)]
 pub fn halt_forever() -> ! { current::halt_forever() }

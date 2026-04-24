@@ -127,6 +127,12 @@ $ cargo xtask test --arch=x86_64
   `enter_domain(FRAME, DRIVER_1)` denies it (PK-violation #PF).
   This is the Stage-2 canonical "entering driver scope" primitive
   that Stage-3 driver dispatch will call.
+- **`DomainPrimitive` trait**: the shape spec'd in `arch/` §3 now
+  exists as an actual trait. `narf_arch::x86_64::Pks` impls it
+  (forwards to `pks::*`); `narf_arch::aarch64::Mte` is a stub with
+  the same signatures (bodies `unimplemented!`). `narf_arch::Domain`
+  type alias resolves to the current-arch concrete type so
+  arch-agnostic consumers write `Domain::save()` / `Domain::enter_domain(...)`.
 - **MSR / CR helpers** (`arch/x86_64/msr.rs`, `.../cr.rs`): `rdmsr`,
   `wrmsr`, `read_cr4`, `write_cr4`, with the compiler_fence(SeqCst)
   pair per `arch/` §4.
@@ -167,9 +173,6 @@ $ cargo xtask test --arch=x86_64
 - **aarch64 MTE mirror**: SCTLR_EL1.TCF, tag storage, symmetric
   DomainPrimitive. Currently only `BACKEND = Mte` constant exists.
 - **GICv3 skeleton** on aarch64 to match x2APIC on x86_64.
-- **`DomainPrimitive` trait declared in `arch/`**: once MTE lands the
-  second implementation, extract the common trait surface from the
-  x86_64 `pks` module and point aarch64 at it.
 - **Per-CPU probe state**: today's `arch::probe` globals are
   single-probe-at-a-time. Wave-3 SMP bring-up needs per-CPU.
 
@@ -246,6 +249,7 @@ cargo test -p narf-lib
 | IRQ sched     | run_until_empty halts between no-progress rounds            |
 | NX enable     | IA32_EFER.NXE + NO_EXEC enforcement test                    |
 | Domain switch | enter_domain/exit_domain API + cross-domain denial test     |
+| Domain trait  | DomainPrimitive trait; Pks impl live, Mte stub for aarch64  |
 
 ## Pickup hint for the next session
 

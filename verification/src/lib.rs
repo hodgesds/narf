@@ -416,6 +416,47 @@ fn smoke_nx_enforces_no_exec() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_nx_enforces_no_exec);
 
+fn smoke_domain_primitive_trait() -> TestResult {
+    // The trait should be callable uniformly via `arch::Domain::*`.
+    // On x86_64 it dispatches to PKS. On aarch64 the stubs panic, so
+    // we skip the live calls there.
+    use narf_arch::{DomainPrimitive, DomainBackend};
+
+    // BACKEND must match the arch.
+    let expected = if cfg!(target_arch = "x86_64") { DomainBackend::Pks }
+                   else if cfg!(target_arch = "aarch64") { DomainBackend::Mte }
+                   else { return TestResult::Skip("unknown arch") };
+    if <narf_arch::Domain as DomainPrimitive>::BACKEND != expected {
+        return TestResult::Fail("DomainPrimitive::BACKEND wrong");
+    }
+
+    // Live dispatch only on x86_64 where it's implemented.
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: CPUID always legal.
+        let feats = unsafe { narf_arch::x86_64::Features::probe() };
+        if !feats.pks {
+            return TestResult::Skip("PKS not exposed on this host");
+        }
+        // SAFETY: CR4.PKS is enabled by frame/ at boot.
+        unsafe {
+            let saved = <narf_arch::Domain as DomainPrimitive>::save();
+            <narf_arch::Domain as DomainPrimitive>::set_rights(
+                5,
+                <narf_arch::Domain as DomainPrimitive>::READ_ONLY,
+            );
+            let r = <narf_arch::Domain as DomainPrimitive>::get_rights(5);
+            <narf_arch::Domain as DomainPrimitive>::restore(saved);
+
+            if r != <narf_arch::Domain as DomainPrimitive>::READ_ONLY {
+                return TestResult::Fail("trait-level get_rights didn't match set_rights");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_domain_primitive_trait);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_domain_switch() -> TestResult {
     // End-to-end domain transition:
