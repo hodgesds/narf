@@ -9,6 +9,12 @@
 //! virtual) implements, the I/O scheduler that orders requests across
 //! consumers, and the types used for dispatch and completion.
 //!
+//! Stage-3 also lands a single-queue deadline I/O scheduler in
+//! `deadline::DeadlineScheduler` — two FIFO lanes (read / write)
+//! with write-starvation prevention and per-request deadline
+//! promotion. Request merging, multi-queue dispatch, and
+//! device-queue-depth back-pressure remain Stage-4 work.
+//!
 //! Non-goals for Stage 3:
 //! - Multi-queue dispatch (Stage 4).
 //! - Discard/TRIM (Stage 4).
@@ -20,6 +26,10 @@
 #![deny(missing_debug_implementations)]
 
 extern crate alloc;
+
+pub mod deadline;
+
+pub use deadline::{DeadlineScheduler, Lane, STARVE_BOUND};
 
 use core::future::Future;
 use narf_capabilities::{Cap, Read};

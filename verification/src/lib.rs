@@ -4347,3 +4347,108 @@ fn smoke_scheduler_cpu_set_membership() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_scheduler_cpu_set_membership);
+
+fn make_block_request(op: narf_block::BlockOp, user_tag: u64) -> narf_block::BlockRequest {
+    use narf_block::{BlockRequest, QosHint};
+    use narf_capabilities::{Cap, CapSlot, Read, Rights};
+    let cap = unsafe { Cap::<narf_io::DmaBuffer, Read>::mint(
+        CapSlot::new(1, 0, Read::BITS, narf_capabilities::CapKind::DmaBuffer as u32)
+    )};
+    BlockRequest {
+        op,
+        lba: 0,
+        blocks: 1,
+        buffer: cap,
+        qos: QosHint::Latency,
+        user_tag,
+    }
+}
+
+fn smoke_block_deadline_prefers_reads() -> TestResult {
+    // With fresh deadlines, a mixed read/write workload drains reads
+    // first until the starvation bound triggers, then services one
+    // write, then resumes reads. Matches the Linux deadline default.
+    use narf_block::{BlockOp, DeadlineScheduler, STARVE_BOUND};
+
+    let s = DeadlineScheduler::new();
+    let far_future = u64::MAX / 2;
+
+    // Enqueue one write followed by STARVE_BOUND + 2 reads.
+    s.enqueue(make_block_request(BlockOp::Write { fua: false }, 0x100), far_future);
+    for i in 0..(STARVE_BOUND + 2) {
+        s.enqueue(make_block_request(BlockOp::Read, 0x200 + i as u64), far_future);
+    }
+
+    // First STARVE_BOUND picks should all be reads.
+    for i in 0..STARVE_BOUND {
+        let req = match s.dequeue_next(0) {
+            Some(r) => r,
+            None    => return TestResult::Fail("scheduler underflowed"),
+        };
+        if req.op != BlockOp::Read {
+            return TestResult::Fail("read lane starved before STARVE_BOUND");
+        }
+        if req.user_tag != 0x200 + i as u64 {
+            return TestResult::Fail("read lane drained out of order");
+        }
+    }
+    // The STARVE_BOUND+1-th pick must be the pending write.
+    let req = s.dequeue_next(0).expect("pending");
+    if !matches!(req.op, BlockOp::Write { .. }) {
+        return TestResult::Fail("write was not promoted after STARVE_BOUND reads");
+    }
+    if req.user_tag != 0x100 {
+        return TestResult::Fail("wrong write promoted");
+    }
+    // And the remaining picks are reads again.
+    let req = s.dequeue_next(0).expect("pending");
+    if req.op != BlockOp::Read {
+        return TestResult::Fail("read lane did not resume after write flush");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_block_deadline_prefers_reads);
+
+fn smoke_block_deadline_promotes_expired() -> TestResult {
+    // A write with an already-past deadline must beat reads that are
+    // still within their deadline, regardless of the starvation count.
+    use narf_block::{BlockOp, DeadlineScheduler};
+
+    let s = DeadlineScheduler::new();
+    s.enqueue(make_block_request(BlockOp::Read, 0x10),                   1_000);
+    s.enqueue(make_block_request(BlockOp::Write { fua: false }, 0x20),   500);
+
+    // now_cycles = 750 → the write at deadline 500 is expired,
+    // the read at deadline 1_000 is not.
+    let req = s.dequeue_next(750).expect("pending");
+    if !matches!(req.op, BlockOp::Write { .. }) || req.user_tag != 0x20 {
+        return TestResult::Fail("expired write was not promoted ahead of the read");
+    }
+    // Next: the read is still pending.
+    let req = s.dequeue_next(750).expect("pending");
+    if req.op != BlockOp::Read || req.user_tag != 0x10 {
+        return TestResult::Fail("pending read was not drained next");
+    }
+    if !s.is_empty() {
+        return TestResult::Fail("scheduler should be empty after draining both");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_block_deadline_promotes_expired);
+
+fn smoke_block_deadline_tags_are_monotonic() -> TestResult {
+    use narf_block::{BlockOp, DeadlineScheduler};
+
+    let s = DeadlineScheduler::new();
+    let t1 = s.enqueue(make_block_request(BlockOp::Read, 0), u64::MAX);
+    let t2 = s.enqueue(make_block_request(BlockOp::Write { fua: false }, 1), u64::MAX);
+    let t3 = s.enqueue(make_block_request(BlockOp::Read, 2), u64::MAX);
+    if !(t1 < t2 && t2 < t3) {
+        return TestResult::Fail("enqueue tags not monotonically assigned");
+    }
+    if s.reads_pending() != 2 || s.writes_pending() != 1 {
+        return TestResult::Fail("per-lane pending counts off");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_block_deadline_tags_are_monotonic);
