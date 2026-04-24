@@ -455,6 +455,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-drivers-gpu"
+version = "0.0.0"
+dependencies = [
+ "narf-capabilities",
+ "narf-lib",
+]
+
+[[package]]
 name = "narf-drivers-net"
 version = "0.0.0"
 dependencies = [
@@ -649,6 +657,7 @@ dependencies = [
  "narf-console",
  "narf-crypto",
  "narf-drivers",
+ "narf-drivers-gpu",
  "narf-drivers-net",
  "narf-drivers-nvme",
  "narf-drivers-virtio",

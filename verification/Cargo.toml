@@ -38,6 +38,7 @@ narf-observability = { path = "../observability" }
 narf-userspace  = { path = "../userspace" }
 narf-drivers-nvme = { path = "../drivers/nvme" }
 narf-drivers-net  = { path = "../drivers/net" }
+narf-drivers-gpu  = { path = "../drivers/gpu" }
 
 [lints]
 workspace = true

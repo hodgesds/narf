@@ -32,6 +32,7 @@ members = [
     "userspace",
     "drivers/nvme",
     "drivers/net",
+    "drivers/gpu",
 ]
 
 [workspace.package]

@@ -4773,6 +4773,54 @@ fn smoke_tracing_hwtrace_surface() -> TestResult {
 }
 kernel_test!(smoke_tracing_hwtrace_surface);
 
+fn smoke_fs_fuse_opcode_constants() -> TestResult {
+    use narf_filesystem::{
+        FuseOpcode, FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION,
+    };
+    // Opcode values match Linux FUSE UAPI.
+    if FuseOpcode::Lookup as u32 != 1 {
+        return TestResult::Fail("FuseOpcode::Lookup drifted from UAPI");
+    }
+    if FuseOpcode::Init as u32 != 26 {
+        return TestResult::Fail("FuseOpcode::Init drifted from UAPI");
+    }
+    if FuseOpcode::ReadDir as u32 != 28 {
+        return TestResult::Fail("FuseOpcode::ReadDir drifted from UAPI");
+    }
+    if FUSE_KERNEL_VERSION != 7 || FUSE_KERNEL_MINOR_VERSION != 36 {
+        return TestResult::Fail("FUSE protocol version mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_fs_fuse_opcode_constants);
+
+fn smoke_drivers_gpu_mode_and_family() -> TestResult {
+    use narf_drivers_gpu::{GpuFamily, Mode, ModeList, SubmitKind};
+
+    // Known modes carry sensible sizes.
+    if Mode::FHD_60.width != 1920 || Mode::FHD_60.height != 1080 {
+        return TestResult::Fail("FHD_60 mode fields wrong");
+    }
+    if Mode::XGA_60.refresh_hz != 60 {
+        return TestResult::Fail("XGA_60 refresh_hz wrong");
+    }
+
+    let mut list = ModeList::default();
+    list.modes.push(Mode::FHD_60);
+    list.modes.push(Mode::XGA_60);
+    if list.modes.len() != 2 { return TestResult::Fail("mode list len"); }
+
+    // Family + submit kind discriminants distinct.
+    if GpuFamily::VirtioGpu == GpuFamily::IntelI915 {
+        return TestResult::Fail("GpuFamily variants collapsed");
+    }
+    if SubmitKind::Gfx == SubmitKind::Compute {
+        return TestResult::Fail("SubmitKind variants collapsed");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_drivers_gpu_mode_and_family);
+
 fn smoke_bus_acpi_notify_dispatch() -> TestResult {
     use core::sync::atomic::{AtomicU32, Ordering};
     use narf_bus::acpi_notify::{

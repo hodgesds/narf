@@ -1,0 +1,19 @@
+[package]
+name         = "narf-drivers-gpu"
+description  = "GPU driver skeleton — Stage-4 partial."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_gpu"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../../lib" }
+narf-capabilities = { path = "../../capabilities" }
+
+[lints]
+workspace = true
