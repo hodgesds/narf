@@ -417,6 +417,107 @@ fn smoke_nx_enforces_no_exec() -> TestResult {
 kernel_test!(smoke_nx_enforces_no_exec);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_domain_switch() -> TestResult {
+    // End-to-end domain transition:
+    //  1. Map a page with PK = DRIVER_0 (9).
+    //  2. enter_domain(FRAME=0, DRIVER_0=9): PKRS allows 0 + 9, denies
+    //     the other 14. Write to the page — succeeds.
+    //  3. enter_domain(FRAME=0, DRIVER_1=10): now domain 9 is denied.
+    //     Write to the page — faults with PK bit set.
+    //  4. exit_domain restores original PKRS.
+    //
+    // This proves `enter_domain` + per-page PK tag actually scopes
+    // access the way driver-framework Stage-3 code will rely on.
+    use core::arch::asm;
+    use narf_arch::x86_64::{probe, pks::{self, SavedPkrs}, Features};
+    use narf_lib::id::DomainId;
+    use narf_memory::{alloc_frame, FrameAllocError, free_frame, VirtAddr};
+    use narf_memory::paging::{map_4kb, unmap_4kb, read_cr3, PtFlags};
+
+    // SAFETY: CPUID always legal.
+    let feats = unsafe { Features::probe() };
+    if !feats.pks { return TestResult::Skip("PKS not exposed"); }
+
+    let pml4 = unsafe { read_cr3() };
+    let frame = match alloc_frame() {
+        Ok(f) => f,
+        Err(FrameAllocError::Uninitialised) =>
+            return TestResult::Skip("frame allocator not initialised"),
+        Err(_) => return TestResult::Fail("alloc_frame failed"),
+    };
+    let virt = VirtAddr::new(0x4_0000_1000);
+    let phys = frame.start_address();
+    let driver_pk = DomainId::DRIVER_0.raw(); // 9
+
+    // SAFETY: live PML4; this virt is in an unused PDPT slot.
+    if unsafe {
+        map_4kb(pml4, virt, phys,
+                PtFlags::WRITABLE | PtFlags::pk(driver_pk))
+    }.is_err() {
+        free_frame(frame);
+        return TestResult::Fail("map_4kb with PK=DRIVER_0 failed");
+    }
+
+    // SAFETY: initial PKRS save so we can restore at the end.
+    let outermost_saved: SavedPkrs = unsafe { pks::save() };
+
+    // ---- Step 2: inside DRIVER_0 domain, write should succeed.
+    // SAFETY: enter_domain is live with CR4.PKS=1.
+    let scope1 = unsafe { pks::enter_domain(DomainId::FRAME.raw(), driver_pk) };
+    // SAFETY: write to a page PKRS currently allows.
+    unsafe {
+        asm!("mov byte ptr [{p}], 1", p = in(reg) virt.raw(),
+             options(nostack));
+    }
+    // SAFETY: restore after the write.
+    unsafe { pks::exit_domain(scope1); }
+
+    // ---- Step 3: now enter DRIVER_1 — domain 9 denied. Write #PFs.
+    let scope2 = unsafe { pks::enter_domain(DomainId::FRAME.raw(),
+                                             DomainId::DRIVER_1.raw()) };
+    let recovery: u64;
+    // SAFETY: LEA of local label.
+    unsafe {
+        asm!(
+            "lea {r}, [66f + rip]",
+            r = out(reg) recovery,
+            options(nostack, preserves_flags),
+        );
+    }
+    probe::arm(recovery);
+    // SAFETY: expected-to-fault write.
+    unsafe {
+        asm!(
+            "mov byte ptr [{p}], 2",
+            "66:",
+            p = in(reg) virt.raw(),
+            options(nostack),
+        );
+    }
+    let caught = probe::disarm();
+    // SAFETY: restore PKRS for rest of the test.
+    unsafe { pks::exit_domain(scope2); }
+
+    // Restore outermost PKRS before exiting.
+    // SAFETY: restore of the previously-saved state.
+    unsafe { pks::restore(outermost_saved); }
+    let _ = unsafe { unmap_4kb(pml4, virt) };
+    free_frame(frame);
+
+    match caught.vector {
+        None => return TestResult::Fail("Step 3 write succeeded — domain enforcement failed"),
+        Some(14) => {}
+        Some(_)  => return TestResult::Fail("wrong vector (not #PF)"),
+    }
+    if caught.error_code & (1 << 5) == 0 {
+        return TestResult::Fail("#PF caught but PK bit (5) not set — not domain fault");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_domain_switch);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_pks_enforces_deny_all() -> TestResult {
     // End-to-end PKS enforcement demo:
     //  1. Allocate a fresh 4 KiB frame.

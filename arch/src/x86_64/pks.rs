@@ -115,3 +115,43 @@ pub unsafe fn set_rights(domain: u8, rights: DomainRights) {
     let next = (current & mask) | (rights.encode() << shift);
     unsafe { wrmsr(IA32_PKRS, next); }
 }
+
+/// Enter a domain scope: save the current PKRS, then write a new
+/// PKRS that DENIES access to every domain except the two passed in.
+/// Returns the saved state for restoration by `exit_domain`.
+///
+/// This is the canonical "I'm about to run driver code / touch driver
+/// memory" call: the kernel's FRAME domain (0) stays reachable so
+/// the caller can still access its own stack, globals, and the IDT;
+/// the target driver's domain is allowed so its heap / buffers work;
+/// every other domain faults.
+///
+/// Order matches `save() + set_rights(...)` but does it in a single
+/// MSR write (atomic vs. IRQs arriving mid-sequence).
+///
+/// # Safety
+/// CR4.PKS must be enabled. `kernel_domain` and `driver_domain` must
+/// each be in 0..=15.
+#[inline]
+pub unsafe fn enter_domain(kernel_domain: u8, driver_domain: u8) -> SavedPkrs {
+    debug_assert!(kernel_domain < 16 && driver_domain < 16);
+    // SAFETY: CR4.PKS is on.
+    let saved = unsafe { rdmsr(IA32_PKRS) };
+    // Deny every domain (all 16 × AD|WD = 11) then clear the two we
+    // want to allow. 0x5555_5555 would be "WD set for all"; we want
+    // AD+WD (all bits) for every domain except the two.
+    let mut new_pkrs: u64 = 0xFFFF_FFFF;
+    new_pkrs &= !(0b11u64 << (2 * kernel_domain as u32));
+    new_pkrs &= !(0b11u64 << (2 * driver_domain as u32));
+    // SAFETY: see save.
+    unsafe { wrmsr(IA32_PKRS, new_pkrs); }
+    SavedPkrs(saved)
+}
+
+/// Exit a domain scope; restore the PKRS value captured by
+/// `enter_domain`. Alias for `restore`, named for call-site symmetry.
+#[inline]
+pub unsafe fn exit_domain(saved: SavedPkrs) {
+    // SAFETY: same as restore.
+    unsafe { restore(saved); }
+}

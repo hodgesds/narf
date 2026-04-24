@@ -39,6 +39,7 @@ NARF Stage 1 Wave 1 — hello from a bare kernel.
 $ cargo xtask test --arch=x86_64
 ...
 ── kernel_test harness ──────────────────────────
+  [ OK ] smoke_domain_switch            ← enter_domain scope enforcement
   [ OK ] smoke_nx_enforces_no_exec      ← NX enforces NO_EXEC
   [ OK ] smoke_timer_irq_fires          ← hardware LAPIC-timer IRQ
   [ OK ] smoke_pks_enforces_deny_all    ← live PKS #PF/PK demo
@@ -118,6 +119,14 @@ $ cargo xtask test --arch=x86_64
   fetch. Regression-guarded by `smoke_nx_enforces_no_exec`: maps a
   page `WRITABLE | NO_EXEC`, jumps to it, catches the `#PF` with
   error-code bit 4 (instruction-fetch) set.
+- **Domain switch API**: `arch::x86_64::pks::enter_domain(kernel,
+  driver)` + matching `exit_domain` — single-PKRS-write that denies
+  every PK domain except the two named. Regression-guarded by
+  `smoke_domain_switch`: maps a PK=DRIVER_0 page, verifies
+  `enter_domain(FRAME, DRIVER_0)` allows access, then
+  `enter_domain(FRAME, DRIVER_1)` denies it (PK-violation #PF).
+  This is the Stage-2 canonical "entering driver scope" primitive
+  that Stage-3 driver dispatch will call.
 - **MSR / CR helpers** (`arch/x86_64/msr.rs`, `.../cr.rs`): `rdmsr`,
   `wrmsr`, `read_cr4`, `write_cr4`, with the compiler_fence(SeqCst)
   pair per `arch/` §4.
@@ -236,6 +245,7 @@ cargo test -p narf-lib
 | APIC full     | 8259 PICs masked; hardware LAPIC timer IRQs live + tested   |
 | IRQ sched     | run_until_empty halts between no-progress rounds            |
 | NX enable     | IA32_EFER.NXE + NO_EXEC enforcement test                    |
+| Domain switch | enter_domain/exit_domain API + cross-domain denial test     |
 
 ## Pickup hint for the next session
 
