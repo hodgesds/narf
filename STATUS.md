@@ -199,11 +199,16 @@ Remaining Stage 2 items (all additive / out of scope for local test):
   UIPI on this host, so exercising it requires new hardware. The
   IDT / IRQ infrastructure is ready; the actual UIPI MSR programming
   would be <100 lines when there's a test target.
-- **Proper per-task waker plumbing**. Today's scheduler halts
-  between rounds but still re-polls every task on every wake
-  (no-op waker). Real per-task `Waker` that only re-polls the
-  specific task that got woken is a nice optimisation but not
-  behaviour-changing; deferred.
+- ~~Proper per-task waker plumbing~~ ✓ done. Each `TaskSlot`
+  owns an `Arc<AtomicBool>` awake flag; the `Waker` vtable
+  flips it via `wake` / `wake_by_ref`. `run_until_empty`
+  `swap(false)`s the flag before polling and skips slots whose
+  flag is still `false` on the next round, so a future stashed
+  behind an IRQ/IPC signal no longer costs a poll per loop.
+  The halt-on-no-progress backstop is kept as the energy-save
+  path for self-waking futures (today's `SleepUntil` /
+  `yield_now`). Regression-guarded by
+  `smoke_scheduler_respects_waker` (both arches).
 - **Per-CPU probe state** — this is actually a Stage 3 SMP item
   (current single-CPU state is correct by construction for Stage 2).
 
@@ -282,6 +287,7 @@ cargo test -p narf-lib
 | Domain switch | enter_domain/exit_domain API + cross-domain denial test     |
 | Domain trait  | DomainPrimitive trait; Pks impl live, Mte stub for aarch64  |
 | aarch64 boot  | `virt` machine boots; full async demo runs on aarch64 too   |
+| per-task waker| `Arc<AtomicBool>` waker vtable — Pending tasks skip repoll |
 
 ## Pickup hint for the next session
 

@@ -976,3 +976,54 @@ fn smoke_sleep_future_waits() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_sleep_future_waits);
+
+fn smoke_scheduler_respects_waker() -> TestResult {
+    // Proves the scheduler honours per-task wakers: a Parked future
+    // that returns Pending *without* calling its waker must not be
+    // re-polled until something else wakes it. Without the per-task
+    // awake flag this test would fail because the old no-op waker
+    // caused every Pending task to be repolled on every round.
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::task::{Context, Poll, Waker};
+    use narf_lib::sync::IrqSafeSpinLock;
+
+    static POLLS:         AtomicUsize                     = AtomicUsize::new(0);
+    static PARKED_WAKER:  IrqSafeSpinLock<Option<Waker>>  = IrqSafeSpinLock::new(None);
+
+    struct Parked { ready: bool }
+    impl Future for Parked {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            let this = self.get_mut();
+            POLLS.fetch_add(1, Ordering::Relaxed);
+            if this.ready { return Poll::Ready(()); }
+            *PARKED_WAKER.lock() = Some(cx.waker().clone());
+            this.ready = true;   // next poll (after being woken) completes
+            Poll::Pending
+        }
+    }
+
+    POLLS.store(0, Ordering::Relaxed);
+    *PARKED_WAKER.lock() = None;
+
+    narf_scheduler::init();
+    narf_scheduler::spawn(Parked { ready: false });
+    narf_scheduler::spawn(async {
+        // Yield once so Parked gets a turn to register its waker, then
+        // wake it. Under the old noop_waker Parked would already have
+        // been re-polled many times by now; with per-task wakers it
+        // must have been polled exactly once so far.
+        narf_scheduler::yield_now().await;
+        if let Some(w) = PARKED_WAKER.lock().take() { w.wake(); }
+    });
+    narf_scheduler::run_until_empty();
+
+    match POLLS.load(Ordering::Relaxed) {
+        2 => TestResult::Pass,
+        n if n < 2 => TestResult::Fail("parked task never woke after wake()"),
+        _          => TestResult::Fail("parked task re-polled without a wake — waker gating broken"),
+    }
+}
+kernel_test!(smoke_scheduler_respects_waker);
