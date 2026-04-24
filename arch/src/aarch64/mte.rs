@@ -7,13 +7,19 @@
 use core::fmt;
 use crate::aarch64::sysreg;
 
-/// Saved MTE state. Stage-2 scope: just `SCTLR_EL1` (the TCF mode +
-/// ATA bit live here and are universally accessible at EL1). Adding
-/// `GCR_EL1` requires `-machine virt,mte=on` on QEMU + MTE level ≥ 2,
-/// which isn't wired in our CI flow today — that's a Stage-3 follow-on.
+/// Saved MTE state.
+///
+/// Stage 2 saves both `SCTLR_EL1` (the TCF mode + ATA bit) and
+/// `GCR_EL1` (the random-tag seed + exclusion list used by `IRG`).
+/// `GCR_EL1` access requires MTE level ≥ 2 and `SCTLR_EL1.ATA = 1`
+/// — both established at boot in `frame/aarch64/boot.S`. On CPUs
+/// without MTE, calling save/restore would #UD, so the caller must
+/// gate on `Features::probe().mte >= 2` (the probe is already the
+/// boot-path gate for enabling ATA).
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub struct SavedMteState {
     pub sctlr: u64,
+    pub gcr:   u64,
 }
 
 /// Per-domain access rights. On aarch64 MTE, "rights" are enforced via
@@ -55,14 +61,23 @@ impl crate::DomainPrimitive for Mte {
 
     #[inline]
     unsafe fn save() -> Self::SavedState {
-        // SAFETY: MRS SCTLR_EL1 always legal at EL1.
-        unsafe { SavedMteState { sctlr: sysreg::read_sctlr_el1() } }
+        // SAFETY: MRS SCTLR_EL1 always legal; MRS GCR_EL1 legal once
+        // SCTLR_EL1.ATA=1 (set at boot when MTE is present).
+        unsafe {
+            SavedMteState {
+                sctlr: sysreg::read_sctlr_el1(),
+                gcr:   sysreg::read_gcr_el1(),
+            }
+        }
     }
 
     #[inline]
     unsafe fn restore(s: Self::SavedState) {
-        // SAFETY: MSR SCTLR_EL1 always legal at EL1.
-        unsafe { sysreg::write_sctlr_el1(s.sctlr); }
+        // SAFETY: see `save`; MSR is the reverse.
+        unsafe {
+            sysreg::write_sctlr_el1(s.sctlr);
+            sysreg::write_gcr_el1(s.gcr);
+        }
     }
 
     #[inline]

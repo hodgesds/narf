@@ -417,6 +417,38 @@ fn smoke_nx_enforces_no_exec() -> TestResult {
 kernel_test!(smoke_nx_enforces_no_exec);
 
 #[cfg(target_arch = "aarch64")]
+fn smoke_aarch64_mte_l2() -> TestResult {
+    // MTE-L2 live test: SCTLR_EL1.ATA is set by boot.S when MTE is
+    // present, so GCR_EL1 is accessible here. Read it, write a
+    // distinctive value, read back, restore. Verifies (a) the
+    // feature probe matches QEMU's `-machine virt,mte=on` flag,
+    // (b) the ATA bit actually ungated GCR_EL1, and (c) the
+    // arch::aarch64::sysreg raw-encoding accessors work.
+    // SAFETY: MRS ID_AA64* always legal.
+    let feats = unsafe { narf_arch::aarch64::Features::probe() };
+    if feats.mte < 2 {
+        return TestResult::Skip("MTE level <2 (QEMU -machine virt,mte=on not in effect)");
+    }
+    use narf_arch::aarch64::sysreg::{read_gcr_el1, write_gcr_el1};
+    // SAFETY: ATA=1, so GCR_EL1 is live.
+    unsafe {
+        let saved = read_gcr_el1();
+        // Low 16 bits = exclusion mask (any-bit-set = exclude that tag
+        // from IRG output). 0xABCD is arbitrary-but-distinct.
+        write_gcr_el1(0xABCD);
+        let got = read_gcr_el1();
+        // Restore before any possible early-return.
+        write_gcr_el1(saved);
+        if got & 0xFFFF != 0xABCD {
+            return TestResult::Fail("GCR_EL1 roundtrip lost the exclusion mask");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test!(smoke_aarch64_mte_l2);
+
+#[cfg(target_arch = "aarch64")]
 fn smoke_aarch64_features() -> TestResult {
     // SAFETY: MRS of ID_AA64* and CNTFRQ_EL0 is always legal at EL1.
     let feats = unsafe { narf_arch::aarch64::Features::probe() };

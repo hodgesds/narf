@@ -107,7 +107,11 @@ impl Arch {
             // model (MSRs).
             // `-semihosting` enables the SYS_EXIT path.
             Arch::Aarch64 => vec![
-                "-machine".into(),  "virt,gic-version=3".into(),
+                // `mte=on` enables full MTE (level 2+): tag storage,
+                // accessible GCR_EL1/TFSR_EL1, SCTLR_EL1.ATA/TCF gates.
+                // Without this QEMU exposes only MTE level 1 (instruction
+                // support but no in-memory tag check).
+                "-machine".into(),  "virt,gic-version=3,mte=on".into(),
                 "-cpu".into(),      "max".into(),
                 "-m".into(),        "256M".into(),
                 "-serial".into(),   "stdio".into(),

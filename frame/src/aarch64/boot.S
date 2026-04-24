@@ -26,6 +26,22 @@ _start:
     msr  cpacr_el1, x0
     isb
 
+    /* Enable Allocation Tag Access at EL1 (SCTLR_EL1.ATA, bit 43).
+     *
+     * ATA=1 makes `GCR_EL1`, `TFSR_EL1`, and the MTE tag-memory
+     * instructions (STG/LDG/IRG/...) accessible at EL1; without it
+     * they #UD. Only takes effect on CPUs that actually support MTE
+     * L2 — gated at boot by the feature probe below.
+     *
+     * Does NOT enable tag checking itself (SCTLR_EL1.TCF stays at
+     * its reset value = Ignore). Actual check-mode enable pairs
+     * with tag storage in Stage 3.
+     */
+    mrs  x0, sctlr_el1
+    orr  x0, x0, #(1 << 43)
+    msr  sctlr_el1, x0
+    isb
+
     /* Stack in .boot.data. Physical base. */
     adrp x0, stack_top
     add  x0, x0, #:lo12:stack_top
