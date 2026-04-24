@@ -5011,6 +5011,34 @@ fn smoke_drivers_net_nic_model_ids() -> TestResult {
 }
 kernel_test!(smoke_drivers_net_nic_model_ids);
 
+fn smoke_userspace_syscall_table_roundtrip() -> TestResult {
+    use narf_userspace::{Syscall, SyscallTable};
+
+    // Pinned numbers.
+    if Syscall::Submit.raw() != 100 || Syscall::Bootstrap.raw() != 101 {
+        return TestResult::Fail("syscall numbers drifted");
+    }
+    if Syscall::from_raw(110) != Some(Syscall::OpenFile) {
+        return TestResult::Fail("from_raw(110) did not match OpenFile");
+    }
+    if Syscall::from_raw(999).is_some() {
+        return TestResult::Fail("from_raw(999) should be None");
+    }
+
+    let mut t = SyscallTable::new();
+    t.register(Syscall::Submit,    "submit");
+    t.register(Syscall::Bootstrap, "bootstrap");
+    if t.len() != 2 { return TestResult::Fail("register did not grow table"); }
+    if t.name_of(Syscall::Submit) != Some("submit") {
+        return TestResult::Fail("name_of mismatch");
+    }
+    if t.name_of(Syscall::Yield).is_some() {
+        return TestResult::Fail("unregistered syscall should return None");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_syscall_table_roundtrip);
+
 fn smoke_userspace_process_id_and_aux() -> TestResult {
     use narf_userspace::{
         alloc_pid, AuxEntry, ExecImage, ExecKind, ProcessId, Segment, SegmentFlags,
