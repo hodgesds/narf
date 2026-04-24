@@ -49,23 +49,35 @@ pub struct Grant;
 #[derive(Copy, Clone, Debug)]
 pub struct Spend;
 
-impl Sealed for Read  {}
-impl Sealed for Write {}
-impl Sealed for Grant {}
-impl Sealed for Spend {}
+/// Invoke: authority to call an object's operational surface — the
+/// classic EROS "invoke a service" right. Used by
+/// `scheduler/` spec §3.3's `Cap<Task, Invoke>` (donate time-slice) and
+/// by the driver framework for cap-gated entry points. Distinct from
+/// Write so an audit can tell "call this object" apart from "mutate
+/// this object's state".
+#[derive(Copy, Clone, Debug)]
+pub struct Invoke;
 
-impl Rights for Read  { const BITS: u32 = 0b0001; }
-impl Rights for Write { const BITS: u32 = 0b0010; }
-impl Rights for Grant { const BITS: u32 = 0b0100; }
-impl Rights for Spend { const BITS: u32 = 0b1000; }
+impl Sealed for Read   {}
+impl Sealed for Write  {}
+impl Sealed for Grant  {}
+impl Sealed for Spend  {}
+impl Sealed for Invoke {}
+
+impl Rights for Read   { const BITS: u32 = 0b0_0001; }
+impl Rights for Write  { const BITS: u32 = 0b0_0010; }
+impl Rights for Grant  { const BITS: u32 = 0b0_0100; }
+impl Rights for Spend  { const BITS: u32 = 0b0_1000; }
+impl Rights for Invoke { const BITS: u32 = 0b1_0000; }
 
 /// Authority to derive R2 from R.
 pub trait SubsetOf<R: Rights>: Rights {}
 
 impl<R: Rights> SubsetOf<R> for R {}
-impl SubsetOf<Grant> for Read  {}
-impl SubsetOf<Grant> for Write {}
-impl SubsetOf<Grant> for Spend {}
+impl SubsetOf<Grant> for Read   {}
+impl SubsetOf<Grant> for Write  {}
+impl SubsetOf<Grant> for Spend  {}
+impl SubsetOf<Grant> for Invoke {}
 
 // ── CapSlot ─────────────────────────────────────────────────────────
 

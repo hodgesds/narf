@@ -40,6 +40,10 @@ pub mod budget;
 pub use affinity::{Affinity, CpuId, CpuSet};
 pub use budget::{BudgetAccount, CpuBudget, OverrunPolicy, ResourceBudget};
 
+// re-export the Invoke rights marker for callers who need to type a
+// donation cap — saves one import line at every call site.
+pub use narf_capabilities::Invoke;
+
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -48,12 +52,14 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-use narf_capabilities::{Cap, Spend};
+use core::sync::atomic::AtomicU64;
+
+use narf_capabilities::{Cap, CapKind, CapType, Spend};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_time::Instant;
 
 /// A pinned boxed future representing one kernel task.
-type Task = Pin<Box<dyn Future<Output = ()> + Send>>;
+type BoxedTask = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 /// Ready queue of runnable tasks. Stage 1 uses `VecDeque` for FIFO
 /// fairness; Stage 3 upgrades to the intrusive doubly-linked structure
@@ -61,8 +67,32 @@ type Task = Pin<Box<dyn Future<Output = ()> + Send>>;
 /// queue itself (tasks are still boxed).
 static READY: IrqSafeSpinLock<Option<VecDeque<TaskSlot>>> = IrqSafeSpinLock::new(None);
 
+/// Monotonic task identifier. Minted at `spawn` time. `0` is reserved
+/// as "no task"; the first spawn gets `TaskId(1)`.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TaskId(pub u64);
+
+impl TaskId {
+    pub const NONE: TaskId = TaskId(0);
+
+    #[inline]
+    pub const fn raw(self) -> u64 { self.0 }
+}
+
+/// Cap-type marker for `Cap<Task, R>`. `Cap<Task, Invoke>` is the
+/// `scheduler/` spec §3.3 donation-authority type: the caller proves
+/// prior permission to donate its time slice to the target.
+#[derive(Copy, Clone, Debug)]
+pub struct Task;
+
+impl CapType for Task {
+    const KIND: CapKind = CapKind::Task;
+}
+
+static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
+
 struct TaskSlot {
-    task: Task,
+    task: BoxedTask,
     // Per-task "needs-repoll" flag set by the waker. The slot owns one
     // `Arc<AtomicBool>`; each handed-out `Waker` owns another clone, so
     // the flag outlives the slot if the future has stashed its waker.
@@ -70,6 +100,9 @@ struct TaskSlot {
     // returns `Pending` and nothing has re-set it, the slot is skipped
     // on subsequent rounds until a waker flips it back to `true`.
     awake: Arc<AtomicBool>,
+    /// Monotonic identifier stamped at spawn time so `donate_to` has
+    /// a stable handle into the ready queue.
+    id:      TaskId,
     /// Stage-3 §3.3/§3.4 per-task metadata: affinity, CPU budget, the
     /// `Cap<CpuBudget, Spend>` that gates scheduling, and the running
     /// `BudgetAccount`.
@@ -80,6 +113,7 @@ struct TaskSlot {
 impl core::fmt::Debug for TaskSlot {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("TaskSlot")
+            .field("id",      &self.id)
             .field("awake",   &self.awake.load(Ordering::Relaxed))
             .field("spec",    &self.spec)
             .field("account", &self.account)
@@ -132,35 +166,79 @@ pub fn init() {
 }
 
 /// Queue a new task on the ready queue. Requires `init()` to have run.
-pub fn spawn<F: Future<Output = ()> + Send + 'static>(f: F) {
-    spawn_with_spec(f, TaskSpec::unthrottled());
+///
+/// Returns the `TaskId` stamped on the newly-created task — `donate_to`
+/// and future `cancel`/`join` primitives name the task by this id.
+pub fn spawn<F: Future<Output = ()> + Send + 'static>(f: F) -> TaskId {
+    spawn_with_spec(f, TaskSpec::unthrottled())
 }
 
 /// Queue a new task with a Stage-3 `TaskSpec` attached. A `None`
 /// `budget_cap` makes the task always-runnable; a live cap is
 /// epoch-checked on every round and the task drops when the cap is
 /// revoked.
-pub fn spawn_with_spec<F>(f: F, spec: TaskSpec)
+pub fn spawn_with_spec<F>(f: F, spec: TaskSpec) -> TaskId
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    let id = TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed));
     let slot = TaskSlot {
         task:    Box::pin(f),
         awake:   Arc::new(AtomicBool::new(true)),
+        id,
         spec,
         account: BudgetAccount::new(),
     };
     let mut q = READY.lock();
     q.as_mut().expect("scheduler::spawn before init").push_back(slot);
+    id
 }
 
 /// Shorthand: spawn a task with a budget cap + the default everywhere-
 /// affinity.
-pub fn spawn_budgeted<F>(f: F, budget: ResourceBudget, cap: Cap<CpuBudget, Spend>)
+pub fn spawn_budgeted<F>(f: F, budget: ResourceBudget, cap: Cap<CpuBudget, Spend>) -> TaskId
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    spawn_with_spec(f, TaskSpec::budgeted(budget, cap));
+    spawn_with_spec(f, TaskSpec::budgeted(budget, cap))
+}
+
+/// Errors `donate_to` can return.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DonateError {
+    /// Caller's donation authority was revoked.
+    AuthorityRevoked,
+    /// No task with the named id is currently on the ready queue.
+    /// Target may have completed or never existed.
+    TargetNotFound,
+    /// Scheduler is not initialised.
+    NotReady,
+}
+
+/// Direct time-slice donation: cap-gated reorder that moves `target`
+/// to the head of the ready queue so the next dispatch round services
+/// it ahead of its queue position. Matches the spec's §3.3 donation
+/// surface for the single-CPU executor. The SMP fast-path (save caller
+/// state, restore callee's domain, branch directly into the callee)
+/// is Stage-4 work — this Stage-3 form is correct but not performant.
+pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateError> {
+    cap.check_live().map_err(|_| DonateError::AuthorityRevoked)?;
+    let mut q = READY.lock();
+    let ready = q.as_mut().ok_or(DonateError::NotReady)?;
+    let pos = match ready.iter().position(|s| s.id == target) {
+        Some(p) => p,
+        None    => return Err(DonateError::TargetNotFound),
+    };
+    if pos != 0 {
+        let slot = ready.remove(pos).unwrap();
+        // Force-wake the donee so the executor doesn't skip it on the
+        // next round if its waker hasn't fired — donation is by
+        // definition "let me pick this task even though you wouldn't
+        // normally have chosen it".
+        slot.awake.store(true, Ordering::Release);
+        ready.push_front(slot);
+    }
+    Ok(())
 }
 
 // ── Waker plumbing ──────────────────────────────────────────────────

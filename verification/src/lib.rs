@@ -4318,6 +4318,79 @@ fn smoke_abi_cancel_stale_tag_is_noop() -> TestResult {
 }
 kernel_test!(smoke_abi_cancel_stale_tag_is_noop);
 
+fn smoke_scheduler_donate_to_reorders_head() -> TestResult {
+    // donate_to moves the named task to the head of the ready queue.
+    // Called *before* run_until_empty, it swaps spawn-order so the
+    // donee's first poll lands ahead of the task that was spawned
+    // before it.
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use narf_capabilities::{Cap, Invoke};
+    use narf_scheduler::{donate_to, Task};
+
+    static FIRST_TAG: AtomicU32 = AtomicU32::new(0);
+    FIRST_TAG.store(0, Ordering::Relaxed);
+
+    narf_scheduler::init();
+
+    let donation: Cap<Task, Invoke> = Cap::bootstrap();
+
+    // Spawn A first, B second. Both record their own tag into
+    // FIRST_TAG on first poll if the slot is still 0.
+    let _a = narf_scheduler::spawn(async {
+        let _ = FIRST_TAG.compare_exchange(0, 0xAAAA, Ordering::Relaxed, Ordering::Relaxed);
+    });
+    let b = narf_scheduler::spawn(async {
+        let _ = FIRST_TAG.compare_exchange(0, 0xBBBB, Ordering::Relaxed, Ordering::Relaxed);
+    });
+
+    // Donate to B *before* run_until_empty so the reorder is
+    // observable. Without donation A would write first.
+    if donate_to(b, &donation).is_err() {
+        return TestResult::Fail("donate_to returned Err on a live cap");
+    }
+
+    narf_scheduler::run_until_empty();
+
+    match FIRST_TAG.load(Ordering::Relaxed) {
+        0xBBBB => TestResult::Pass,
+        0xAAAA => TestResult::Fail("donee did not run ahead of the pre-spawned task"),
+        _      => TestResult::Fail("neither task ran"),
+    }
+}
+kernel_test!(smoke_scheduler_donate_to_reorders_head);
+
+fn smoke_scheduler_donate_to_rejects_revoked_cap() -> TestResult {
+    use narf_capabilities::{Cap, Invoke};
+    use narf_scheduler::{donate_to, DonateError, Task, TaskId};
+
+    narf_scheduler::init();
+    let cap: Cap<Task, Invoke> = Cap::bootstrap();
+    cap.revoke();
+    match donate_to(TaskId(1), &cap) {
+        Err(DonateError::AuthorityRevoked) => TestResult::Pass,
+        Err(other) => {
+            let _ = other;
+            TestResult::Fail("donate_to with revoked cap returned wrong error")
+        }
+        Ok(()) => TestResult::Fail("donate_to with revoked cap succeeded"),
+    }
+}
+kernel_test!(smoke_scheduler_donate_to_rejects_revoked_cap);
+
+fn smoke_scheduler_donate_to_missing_target() -> TestResult {
+    use narf_capabilities::{Cap, Invoke};
+    use narf_scheduler::{donate_to, DonateError, Task, TaskId};
+
+    narf_scheduler::init();
+    let cap: Cap<Task, Invoke> = Cap::bootstrap();
+    // An id far past any live task's id — guaranteed not to match.
+    match donate_to(TaskId(u64::MAX), &cap) {
+        Err(DonateError::TargetNotFound) => TestResult::Pass,
+        _ => TestResult::Fail("donate_to to unknown id did not return TargetNotFound"),
+    }
+}
+kernel_test!(smoke_scheduler_donate_to_missing_target);
+
 fn smoke_scheduler_cpu_set_membership() -> TestResult {
     use narf_scheduler::{Affinity, CpuId, CpuSet};
 
