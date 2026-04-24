@@ -4261,6 +4261,62 @@ fn smoke_abi_cancel_non_cancellable_marks_request() -> TestResult {
 }
 kernel_test!(smoke_abi_cancel_non_cancellable_marks_request);
 
+fn smoke_abi_dispatch_latency_accumulates() -> TestResult {
+    // The Dispatcher wraps each dispatch_one in a FnTime::scope guard,
+    // so after N successful submissions the public ABI_DISPATCH_LATENCY
+    // accumulator reports at least N samples. Welford's mean must be
+    // non-zero (the measured elapsed cycle-count per dispatch is
+    // non-zero on any real timer source).
+    use core::sync::atomic::{AtomicU8, Ordering};
+    use narf_abi::{
+        completion_channel, submission_channel, Dispatcher, Submission, Tag,
+        ABI_DISPATCH_LATENCY,
+    };
+
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+
+    let before = ABI_DISPATCH_LATENCY.welford().count;
+
+    narf_scheduler::init();
+    let (mut sq_tx, sq_rx) = submission_channel::<4>();
+    let (cq_tx, mut cq_rx) = completion_channel::<4>();
+
+    narf_scheduler::spawn(async move {
+        let mut d = Dispatcher::new(sq_rx, cq_tx);
+        d.run().await;
+    });
+
+    narf_scheduler::spawn(async move {
+        for i in 0..3 {
+            sq_tx.send(Submission::noop(Tag::new(0xF00 + i))).await.unwrap();
+            let _ = cq_rx.recv().await.unwrap();
+        }
+        OUTCOME.store(1, Ordering::Relaxed);
+        core::mem::drop(sq_tx);
+        core::mem::drop(cq_rx);
+    });
+
+    narf_scheduler::run_until_empty();
+    if OUTCOME.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("producer did not round-trip all three ops");
+    }
+
+    let w = ABI_DISPATCH_LATENCY.welford();
+    if w.count < before + 3 {
+        return TestResult::Fail("FnTime sample count did not grow by the number of dispatches");
+    }
+    if w.mean <= 0.0 {
+        return TestResult::Fail("FnTime mean dispatch latency was non-positive");
+    }
+    // Histogram must have registered non-zero samples too.
+    let hist = ABI_DISPATCH_LATENCY.histogram();
+    if hist.count() < before + 3 {
+        return TestResult::Fail("FnTime histogram missed samples");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_abi_dispatch_latency_accumulates);
+
 fn smoke_abi_linked_chain_cancels_forward() -> TestResult {
     // §3.1 "Linked submissions": cancelling any member of a LINKED
     // chain auto-cancels the rest of the chain. Here the producer

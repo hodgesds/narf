@@ -17,6 +17,7 @@ narf-ipc          = { path = "../ipc" }
 narf-lib          = { path = "../lib" }
 narf-scheduler    = { path = "../scheduler" }
 narf-rcu          = { path = "../rcu" }
+narf-tracing      = { path = "../tracing" }
 
 [lints]
 workspace = true

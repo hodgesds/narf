@@ -370,6 +370,7 @@ dependencies = [
  "narf-lib",
  "narf-rcu",
  "narf-scheduler",
+ "narf-tracing",
 ]
 
 [[package]]

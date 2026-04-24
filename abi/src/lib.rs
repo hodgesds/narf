@@ -55,6 +55,21 @@ use alloc::vec::Vec;
 use narf_capabilities::CapSlot;
 use narf_ipc::{Consumer, Producer};
 use narf_lib::sync::IrqSafeSpinLock;
+use narf_tracing::FnTime;
+
+/// Per-call latency accumulator for `Dispatcher::dispatch_one`.
+/// Exposed for read-back by tests / observability: a `FnTime` gives
+/// a running Welford mean + variance plus a log2-bucket histogram so
+/// callers can observe ABI dispatch cost without rebuilding the
+/// kernel. The accumulator is global because the dispatcher is a
+/// singleton in spec §3 — once SMP-sharded dispatch lands, a per-CPU
+/// array will replace this.
+pub static ABI_DISPATCH_LATENCY: FnTime = FnTime::new("abi::dispatch_one");
+
+/// Latency accumulator for the slow-path pre-check — deliberately
+/// separate from `ABI_DISPATCH_LATENCY` so the arithmetic cost of the
+/// cancel-chain consume/enter is observable in isolation.
+pub static ABI_CANCEL_CHECK_LATENCY: FnTime = FnTime::new("abi::cancel_check");
 
 // ── OpCode ──────────────────────────────────────────────────────────
 //
@@ -593,11 +608,15 @@ impl<const N: usize> Dispatcher<N> {
 
     /// Dispatch a single submission.
     async fn dispatch_one(&mut self, sub: Submission) -> Completion {
+        let _g = narf_tracing::fntime::scope(&ABI_DISPATCH_LATENCY);
         let tag   = sub.tag();
         // Enter the sub into the chain registry; assigns a chain id
         // (fresh or inherited from LINKED) and records tag→chain so a
         // later `OpCode::Cancel` can propagate across the chain.
-        let chain = self.pending.enter(&sub);
+        let chain = {
+            let _g = narf_tracing::fntime::scope(&ABI_CANCEL_CHECK_LATENCY);
+            self.pending.enter(&sub)
+        };
 
         // Cancel-protocol pre-check (spec §3.1): if this submission's
         // tag was already cancel-pending, or any linked peer already
