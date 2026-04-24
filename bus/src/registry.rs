@@ -18,18 +18,42 @@
 use alloc::vec::Vec;
 use core::fmt;
 
+use narf_capabilities::{Cap, CapError, CapKind, CapType, Grant, Write};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::addr::BusAddr;
 use crate::device::BusDevice;
 
-/// Registry error surface. Today only "no such device" is reachable;
-/// cap-related errors arrive with the cap-table rewire in Wave 2
-/// (`Revoked`, `RightsTooWeak`, etc. per `capabilities/` §3).
+/// Cap-type marker for a specific claimed bus device. `Cap<BusDeviceCap,
+/// Write>` is the Stage-3 counterpart of the spec §3.3 `Cap<BusDevice, _>`
+/// bundle — the bus crate hands it out on successful `claim_device_cap`
+/// and both `msix::enable_msix` and the Stage-4 BAR / IRQ / DMA flow
+/// gate on it. The `Cap` kind is `CapKind::BusDevice` so it dovetails
+/// with the workspace registry.
+#[derive(Debug)]
+pub struct BusDeviceCap;
+impl CapType for BusDeviceCap { const KIND: CapKind = CapKind::BusDevice; }
+
+/// Cap-type marker for the bus-level registry authority. Held by the
+/// subsystem that's allowed to subscribe to hot-plug events, walk the
+/// whole registry, or mint `Cap<BusDeviceCap, _>` on behalf of another
+/// domain. TCB-only mint path via `bootstrap_registry_authority`.
+#[derive(Debug)]
+pub struct BusRegistryCap;
+impl CapType for BusRegistryCap { const KIND: CapKind = CapKind::BusRegistry; }
+
+/// Registry error surface. Today `NotFound` / `NotInitialised` are the
+/// boot-time-enumeration cases; `AuthorityRevoked` surfaces when the
+/// caller's authority cap fails its epoch check.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ClaimError {
     NotFound,
     NotInitialised,
+    AuthorityRevoked,
+}
+
+impl From<CapError> for ClaimError {
+    fn from(_: CapError) -> Self { ClaimError::AuthorityRevoked }
 }
 
 /// Handle returned by `claim_device`. Wave-2 placeholder — once
@@ -138,4 +162,28 @@ pub fn claim_device(addr: BusAddr) -> Result<BusDeviceHandle, ClaimError> {
         }
     }
     Err(ClaimError::NotFound)
+}
+
+/// Cap-gated variant of `claim_device`. Requires a live
+/// `Cap<BusRegistryCap, Grant>` authority and hands back the same
+/// `BusDeviceHandle` plus a freshly-minted `Cap<BusDeviceCap, Write>`
+/// over the specific device. Stage-4 will grow the `Cap<BusDeviceCap,_>`
+/// into a bundle of BAR-map / IRQ-request / DMA-context permissions per
+/// `bus/` §3.3; Stage-3 keeps the single write-authority cap and uses
+/// it to gate `msix::enable_msix`.
+pub fn claim_device_cap(
+    authority: &Cap<BusRegistryCap, Grant>,
+    addr:      BusAddr,
+) -> Result<(BusDeviceHandle, Cap<BusDeviceCap, Write>), ClaimError> {
+    authority.check_live()?;
+    let handle = claim_device(addr)?;
+    let cap = Cap::<BusDeviceCap, Write>::bootstrap();
+    Ok((handle, cap))
+}
+
+/// Bootstrap the registry authority. TCB-only path; the kernel calls
+/// this at boot and hands the result to whichever subsystem is meant
+/// to broker `claim_device_cap` + hot-plug listener registration.
+pub fn bootstrap_registry_authority() -> Cap<BusRegistryCap, Grant> {
+    Cap::<BusRegistryCap, Grant>::bootstrap()
 }

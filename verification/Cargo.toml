@@ -32,6 +32,9 @@ narf-interrupts = { path = "../interrupts" }
 narf-time       = { path = "../time" }
 narf-crypto     = { path = "../crypto" }
 narf-net        = { path = "../net" }
+narf-filesystem = { path = "../filesystem" }
+narf-power      = { path = "../power" }
+narf-observability = { path = "../observability" }
 
 [lints]
 workspace = true

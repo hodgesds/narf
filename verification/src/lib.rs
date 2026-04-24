@@ -1165,7 +1165,10 @@ fn smoke_bus_claim_device_not_found() -> TestResult {
     match claim_device(bogus) {
         Err(narf_bus::ClaimError::NotFound)
         | Err(narf_bus::ClaimError::NotInitialised) => TestResult::Pass,
-        Ok(_)  => TestResult::Fail("claim of bogus addr succeeded"),
+        Err(narf_bus::ClaimError::AuthorityRevoked) => {
+            TestResult::Fail("AuthorityRevoked on un-authorised path")
+        }
+        Ok(_) => TestResult::Fail("claim of bogus addr succeeded"),
     }
 }
 kernel_test!(smoke_bus_claim_device_not_found);
@@ -2720,3 +2723,682 @@ fn smoke_net_loopback_revoked_authority() -> TestResult {
     }
 }
 kernel_test!(smoke_net_loopback_revoked_authority);
+
+// ── filesystem (Stage 3) ────────────────────────────────────────────
+//
+// Tiny CPIO newc archive with a single file "hello" containing "world".
+// Hand-built so the harness has zero dependency on a host cpio tool;
+// see filesystem/src/lib.rs for the on-the-wire format. Byte counts:
+//   header "hello"        : 110
+//   name   "hello\0"      :   6   (110+6 = 116, 4-byte aligned)
+//   data   "world"        :   5   (116+5 = 121)
+//   pad                   :   3   (-> 124)
+//   header TRAILER!!!     : 110   (-> 234)
+//   name   "TRAILER!!!\0" :  11   (-> 245)
+//   pad                   :   3   (-> 248)
+static SMOKE_INITRAMFS: &[u8] = b"\
+070701\
+00000001\
+000081A4\
+00000000\
+00000000\
+00000001\
+00000064\
+00000005\
+00000000\
+00000000\
+00000000\
+00000000\
+00000006\
+00000000\
+hello\0\
+world\0\0\0\
+070701\
+00000000\
+00000000\
+00000000\
+00000000\
+00000001\
+00000000\
+00000000\
+00000000\
+00000000\
+00000000\
+00000000\
+0000000B\
+00000000\
+TRAILER!!!\0\0\0\0";
+
+fn smoke_fs_initramfs_mount_and_stat() -> TestResult {
+    use narf_filesystem::{
+        Initramfs, bootstrap_mount_authority, registry, resolve, FileType,
+    };
+
+    let fs = match Initramfs::from_cpio("smoke-fs-stat", SMOKE_INITRAMFS) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("CPIO parse failed at fixture build"),
+    };
+
+    let authority = bootstrap_mount_authority();
+    let _handle = match registry().mount(&authority, "/smoke-stat", fs) {
+        Ok(h)  => h,
+        Err(_) => return TestResult::Fail("mount() refused a live authority"),
+    };
+
+    // Look up the FsInstance by mount path and stat "hello".
+    let stat_opt = registry().with_mount("/smoke-stat", |fs| {
+        let root = fs.root();
+        let file = resolve(root, "hello").ok()?;
+        Some(file.stat())
+    }).flatten();
+
+    let stat = match stat_opt {
+        Some(s) => s,
+        None    => return TestResult::Fail("resolve(hello) failed inside mounted FS"),
+    };
+    if stat.size != 5            { return TestResult::Fail("stat.size != 5"); }
+    if stat.mode.file_type != FileType::File {
+        return TestResult::Fail("stat reported non-File type");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_fs_initramfs_mount_and_stat);
+
+fn smoke_fs_initramfs_read() -> TestResult {
+    use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+    use narf_filesystem::{
+        Initramfs, bootstrap_mount_authority, registry, resolve,
+    };
+
+    static OUTCOME: AtomicU8    = AtomicU8::new(0);   // 0 pending, 1 ok, 2 mismatch, 3 short
+    static GOT_LEN: AtomicUsize = AtomicUsize::new(0);
+    OUTCOME.store(0, Ordering::Relaxed);
+    GOT_LEN.store(0, Ordering::Relaxed);
+
+    let fs = match Initramfs::from_cpio("smoke-fs-read", SMOKE_INITRAMFS) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("CPIO parse failed at fixture build"),
+    };
+    let authority = bootstrap_mount_authority();
+    let _handle = match registry().mount(&authority, "/smoke-read", fs) {
+        Ok(h)  => h,
+        Err(_) => return TestResult::Fail("mount() refused a live authority"),
+    };
+
+    let file = match registry().with_mount("/smoke-read", |fs| {
+        resolve(fs.root(), "hello").ok()
+    }).flatten() {
+        Some(f) => f,
+        None    => return TestResult::Fail("resolve(hello) returned None"),
+    };
+
+    narf_scheduler::init();
+    narf_scheduler::spawn(async move {
+        let mut buf = [0u8; 16];
+        let n = match file.read(0, &mut buf).await {
+            Ok(n)  => n,
+            Err(_) => { OUTCOME.store(3, Ordering::Relaxed); return; }
+        };
+        GOT_LEN.store(n, Ordering::Relaxed);
+        if n != 5 { OUTCOME.store(3, Ordering::Relaxed); return; }
+        if &buf[..5] == b"world" {
+            OUTCOME.store(1, Ordering::Relaxed);
+        } else {
+            OUTCOME.store(2, Ordering::Relaxed);
+        }
+    });
+    narf_scheduler::run_until_empty();
+
+    match OUTCOME.load(Ordering::Relaxed) {
+        1 => TestResult::Pass,
+        2 => TestResult::Fail("read returned wrong bytes"),
+        3 => TestResult::Fail("read short or errored"),
+        _ => TestResult::Fail("read task never ran"),
+    }
+}
+kernel_test!(smoke_fs_initramfs_read);
+
+fn smoke_fs_lookup_missing() -> TestResult {
+    use narf_filesystem::{
+        FsError, Initramfs, bootstrap_mount_authority, registry, resolve,
+    };
+
+    let fs = match Initramfs::from_cpio("smoke-fs-miss", SMOKE_INITRAMFS) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("CPIO parse failed at fixture build"),
+    };
+    let authority = bootstrap_mount_authority();
+    let _handle = match registry().mount(&authority, "/smoke-miss", fs) {
+        Ok(h)  => h,
+        Err(_) => return TestResult::Fail("mount() refused a live authority"),
+    };
+
+    let res = registry().with_mount("/smoke-miss", |fs| {
+        resolve(fs.root(), "does-not-exist")
+    });
+    match res {
+        Some(Err(FsError::NotFound)) => TestResult::Pass,
+        Some(Err(_)) => TestResult::Fail("wrong error for missing file"),
+        Some(Ok(_))  => TestResult::Fail("missing file resolved to a node"),
+        None         => TestResult::Fail("with_mount couldn't find the mount we just made"),
+    }
+}
+kernel_test!(smoke_fs_lookup_missing);
+
+fn smoke_fs_mount_revoked_authority() -> TestResult {
+    use narf_filesystem::{
+        FsError, Initramfs, bootstrap_mount_authority, registry,
+    };
+
+    let fs = match Initramfs::from_cpio("smoke-fs-rev", SMOKE_INITRAMFS) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("CPIO parse failed at fixture build"),
+    };
+    let authority = bootstrap_mount_authority();
+    authority.revoke();
+    match registry().mount(&authority, "/smoke-rev", fs) {
+        Err(FsError::PermissionDenied) => TestResult::Pass,
+        Err(_) => TestResult::Fail("revoked authority returned wrong FsError"),
+        Ok(_)  => TestResult::Fail("mount() accepted a revoked authority"),
+    }
+}
+kernel_test!(smoke_fs_mount_revoked_authority);
+
+// ── power/ smokes ───────────────────────────────────────────────────
+//
+// Stage-3 round 3: cap-gated C-state registry, DVFS governor framework,
+// per-driver runtime PM. Tests run after net/ / fs/ smokes in this
+// file, so the global power tables may already hold defaults from a
+// previous `init()` call — the registry deliberately tolerates this
+// (duplicate-id rejection on cstates, governor slot is overwritten).
+
+fn smoke_power_cstate_register() -> TestResult {
+    use narf_power::{
+        bootstrap_power_authority, cstate_count, init, register_cstate,
+        select_idle_state, CState, PowerError,
+    };
+
+    init();
+    let baseline = cstate_count();
+    if baseline < 2 {
+        return TestResult::Fail("init() did not register C0 + C1");
+    }
+
+    // Pick an `id` that won't collide with C0/C1 or with anything a
+    // previous test may have inserted. 200 is well above the realistic
+    // ACPI _CST depth so it stays unique across the harness boot.
+    let cap = bootstrap_power_authority();
+    let synth = CState {
+        id: 200,
+        exit_latency_us: 50,
+        power_draw_mw: 100,
+        entry: || { /* test stub */ },
+    };
+    if let Err(e) = register_cstate(&cap, synth) {
+        // `DuplicateCState` here means a previous run of this test
+        // already inserted id=200 — re-running the harness from a
+        // single boot is fine; treat as Pass.
+        if e != PowerError::DuplicateCState {
+            return TestResult::Fail("register_cstate rejected a fresh id");
+        }
+    }
+
+    // select_idle_state should return *some* state whose latency fits
+    // within the Stage-3 deadline budget. C1 (latency 1us) is the
+    // expected answer in a fresh harness; the synthetic state at 50us
+    // also fits. Either is acceptable for "sensible".
+    let chosen = match select_idle_state() {
+        Ok(s)  => s,
+        Err(_) => return TestResult::Fail("select_idle_state returned NoMatchingState"),
+    };
+    if chosen.exit_latency_us > 1_000 {
+        return TestResult::Fail("selected state exceeded the deadline budget");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_power_cstate_register);
+
+fn smoke_power_governor_swap() -> TestResult {
+    use narf_power::{
+        bootstrap_governor_authority, current_governor_name, init,
+        install_governor, OnDemand, Powersave, PowerError,
+    };
+
+    init();
+
+    // Default after init() is `Performance`. Tests earlier in the same
+    // boot may have swapped it; install_governor is idempotent so we
+    // re-establish the baseline before swapping again.
+    let cap = bootstrap_governor_authority();
+    if install_governor(&cap, narf_power::Performance).is_err() {
+        return TestResult::Fail("install_governor(Performance) failed on a live cap");
+    }
+    if current_governor_name() != Some("performance") {
+        return TestResult::Fail("baseline governor name was not 'performance'");
+    }
+
+    // Live cap — install OnDemand, confirm name flips.
+    if install_governor(&cap, OnDemand).is_err() {
+        return TestResult::Fail("install_governor(OnDemand) rejected a live cap");
+    }
+    if current_governor_name() != Some("ondemand") {
+        return TestResult::Fail("governor name didn't update after install");
+    }
+
+    // Revoke the cap, then attempt to install Powersave — must fail.
+    cap.revoke();
+    match install_governor(&cap, Powersave) {
+        Err(PowerError::AuthorityRevoked) => {}
+        Err(_) => return TestResult::Fail("revoked install returned wrong error variant"),
+        Ok(_)  => return TestResult::Fail("install_governor accepted a revoked cap"),
+    }
+
+    // The active governor must still be OnDemand — a failed install
+    // doesn't displace the previous policy.
+    if current_governor_name() != Some("ondemand") {
+        return TestResult::Fail("failed install displaced the active governor");
+    }
+
+    // Reset the active governor to Performance for downstream tests
+    // (none today, but the harness convention is to leave global state
+    // approximating the post-init baseline).
+    let cap2 = bootstrap_governor_authority();
+    let _ = install_governor(&cap2, narf_power::Performance);
+    TestResult::Pass
+}
+kernel_test!(smoke_power_governor_swap);
+
+fn smoke_power_device_pm_lifecycle() -> TestResult {
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+    use narf_power::{
+        bootstrap_device_pm_authority, register_device_pm, resume_device,
+        suspend_device, DeviceRuntimePm,
+    };
+
+    // Counters shared with the trivial DeviceRuntimePm impl. `Arc<...>`
+    // so the registry-stashed Box<dyn DeviceRuntimePm> can keep its own
+    // handle while the test body still observes the post-resume values.
+    let suspends = Arc::new(AtomicU32::new(0));
+    let resumes  = Arc::new(AtomicU32::new(0));
+
+    struct Counter {
+        suspends: Arc<AtomicU32>,
+        resumes:  Arc<AtomicU32>,
+    }
+    impl DeviceRuntimePm for Counter {
+        fn suspend<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+            let c = self.suspends.clone();
+            Box::pin(async move {
+                c.fetch_add(1, Ordering::Release);
+            })
+        }
+        fn resume<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+            let c = self.resumes.clone();
+            Box::pin(async move {
+                c.fetch_add(1, Ordering::Release);
+            })
+        }
+    }
+
+    let cap = bootstrap_device_pm_authority();
+    let dev = Counter { suspends: suspends.clone(), resumes: resumes.clone() };
+    let handle = match register_device_pm(&cap, dev) {
+        Ok(h)  => h,
+        Err(_) => return TestResult::Fail("register_device_pm rejected a live cap"),
+    };
+
+    // Drive suspend + resume through the scheduler — confirms the
+    // futures returned by the trait actually compose with the Stage-1
+    // executor and that the registry's "take then put back" dance
+    // doesn't deadlock the global lock.
+    narf_scheduler::init();
+    narf_scheduler::spawn(async move {
+        let _ = suspend_device(handle).await;
+        let _ = resume_device(handle).await;
+    });
+    narf_scheduler::run_until_empty();
+
+    if suspends.load(Ordering::Acquire) != 1 {
+        return TestResult::Fail("DeviceRuntimePm::suspend was not called exactly once");
+    }
+    if resumes.load(Ordering::Acquire) != 1 {
+        return TestResult::Fail("DeviceRuntimePm::resume was not called exactly once");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_power_device_pm_lifecycle);
+
+fn smoke_rcu_sleepable_enter_exit() -> TestResult {
+    use narf_rcu::sleepable::{SleepableReader, SleepableScope};
+
+    let scope = SleepableScope::new();
+    let cap = SleepableReader::bootstrap_cap();
+
+    if scope.active() != 0 {
+        return TestResult::Fail("scope.active() must start at 0");
+    }
+    {
+        let _g = match scope.enter(&cap) {
+            Ok(g)  => g,
+            Err(_) => return TestResult::Fail("enter rejected a fresh cap"),
+        };
+        if scope.active() != 1 {
+            return TestResult::Fail("active didn't reach 1 after enter");
+        }
+    }
+    if scope.active() != 0 {
+        return TestResult::Fail("active didn't return to 0 after guard drop");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_rcu_sleepable_enter_exit);
+
+fn smoke_rcu_sleepable_sync_drains() -> TestResult {
+    // Two-task choreography on the cooperative executor:
+    //   A. holder task: enters scope, yields a few times, drops guard.
+    //   B. waiter task: awaits sync_async(deadline = +1B cycles); must
+    //      observe Drained, NOT Timeout.
+    //
+    // The 1-billion-cycle deadline is well past the holder's natural
+    // exit on the cooperative single-CPU executor. The static
+    // SCOPE/CAP avoid lifetime-juggling between the two spawned
+    // futures (they need 'static or move-by-Arc; static is simpler).
+    use core::sync::atomic::{AtomicU8, Ordering};
+    use narf_rcu::sleepable::{SleepableReader, SleepableScope, SyncOutcome, sync_async};
+    use narf_capabilities::{Cap, Read};
+
+    static SCOPE:    SleepableScope             = SleepableScope::new();
+    static CAP_SET:  core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    static mut CAP:  Option<Cap<SleepableReader, Read>> = None;
+    static OUTCOME:  AtomicU8 = AtomicU8::new(0);   // 0=pending, 1=drained, 2=timeout, 3=error
+
+    OUTCOME.store(0, Ordering::Relaxed);
+    SCOPE.clear_over_budget();
+    // Force a fresh cap each invocation. Last-test residue (especially
+    // when the harness repeats) would otherwise see active != 0 leak.
+    // SAFETY: harness is single-threaded; no concurrent CAP access.
+    unsafe {
+        CAP = Some(SleepableReader::bootstrap_cap());
+        CAP_SET.store(true, Ordering::Release);
+    }
+
+    narf_scheduler::init();
+
+    // Holder task — yields three times, then drops the guard.
+    narf_scheduler::spawn(async move {
+        // SAFETY: CAP is set above on the same thread before spawn.
+        let cap = unsafe { CAP.as_ref().unwrap() };
+        let g = SCOPE.enter(cap).expect("enter must succeed");
+        for _ in 0..3 { narf_scheduler::yield_now().await; }
+        drop(g);
+    });
+
+    // Waiter task — sync_async with a generous deadline.
+    narf_scheduler::spawn(async move {
+        let deadline = narf_time::Instant::now().plus_cycles(1_000_000_000);
+        match sync_async(&SCOPE, deadline).await {
+            SyncOutcome::Drained   => OUTCOME.store(1, Ordering::Relaxed),
+            SyncOutcome::Timeout   => OUTCOME.store(2, Ordering::Relaxed),
+            SyncOutcome::Cancelled => OUTCOME.store(3, Ordering::Relaxed),
+        }
+    });
+
+    narf_scheduler::run_until_empty();
+
+    let _ = CAP_SET.load(Ordering::Acquire); // suppress warning if cfg trims
+
+    match OUTCOME.load(Ordering::Relaxed) {
+        1 => TestResult::Pass,
+        2 => TestResult::Fail("sync_async returned Timeout when readers should have drained"),
+        3 => TestResult::Fail("sync_async returned Cancelled (Stage-4 path)"),
+        _ => TestResult::Fail("sync_async never resolved"),
+    }
+}
+kernel_test!(smoke_rcu_sleepable_sync_drains);
+
+fn smoke_rcu_sleepable_timeout() -> TestResult {
+    // Holder never drops within the deadline. Waiter must observe
+    // Timeout. The deadline is 10_000 cycles from the moment
+    // sync_async is created — vanishingly short on any real CPU,
+    // guaranteed to fire before a typical yield round completes
+    // even on the cooperative executor.
+    use core::sync::atomic::{AtomicU8, Ordering};
+    use narf_rcu::sleepable::{SleepableReader, SleepableScope, SyncOutcome, sync_async};
+    use narf_capabilities::{Cap, Read};
+
+    static SCOPE:    SleepableScope             = SleepableScope::new();
+    static mut CAP:  Option<Cap<SleepableReader, Read>> = None;
+    static OUTCOME:  AtomicU8 = AtomicU8::new(0);
+    static DONE:     core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+    OUTCOME.store(0, Ordering::Relaxed);
+    DONE.store(false, Ordering::Relaxed);
+    SCOPE.clear_over_budget();
+    // SAFETY: harness is single-threaded.
+    unsafe { CAP = Some(SleepableReader::bootstrap_cap()); }
+
+    narf_scheduler::init();
+
+    // Holder task — holds the guard until DONE flips. Yields each
+    // round so the executor doesn't deadlock.
+    narf_scheduler::spawn(async move {
+        // SAFETY: CAP is set above before spawn.
+        let cap = unsafe { CAP.as_ref().unwrap() };
+        let _g = SCOPE.enter(cap).expect("enter must succeed");
+        while !DONE.load(Ordering::Acquire) {
+            narf_scheduler::yield_now().await;
+        }
+        // _g drops here.
+    });
+
+    // Waiter task — short deadline, expect Timeout.
+    narf_scheduler::spawn(async move {
+        let deadline = narf_time::Instant::now().plus_cycles(10_000);
+        let outcome = sync_async(&SCOPE, deadline).await;
+        match outcome {
+            SyncOutcome::Timeout   => OUTCOME.store(2, Ordering::Relaxed),
+            SyncOutcome::Drained   => OUTCOME.store(1, Ordering::Relaxed),
+            SyncOutcome::Cancelled => OUTCOME.store(3, Ordering::Relaxed),
+        }
+        // Release the holder so run_until_empty terminates.
+        DONE.store(true, Ordering::Release);
+    });
+
+    narf_scheduler::run_until_empty();
+
+    match OUTCOME.load(Ordering::Relaxed) {
+        2 => TestResult::Pass,
+        1 => TestResult::Fail("sync_async drained when it should have timed out"),
+        3 => TestResult::Fail("sync_async returned Cancelled (Stage-4 path)"),
+        _ => TestResult::Fail("sync_async never resolved"),
+    }
+}
+kernel_test!(smoke_rcu_sleepable_timeout);
+
+fn smoke_rcu_sleepable_revoked_cap_rejected() -> TestResult {
+    use narf_capabilities::CapError;
+    use narf_rcu::sleepable::{SleepableReader, SleepableScope};
+
+    let scope = SleepableScope::new();
+    let cap = SleepableReader::bootstrap_cap();
+    // Clone-by-Copy keeps the slot bits while transferring ownership of
+    // the original to revoke(). After revoke, the duplicate cap with
+    // the same generation snapshot must fail check_live and bounce out
+    // of enter() with CapError::Revoked.
+    let cap_copy = cap;
+    cap.revoke();
+
+    if scope.active() != 0 {
+        return TestResult::Fail("scope.active() must start at 0");
+    }
+    match scope.enter(&cap_copy) {
+        Err(CapError::Revoked) => {}
+        Err(_) => return TestResult::Fail("wrong error variant from revoked cap"),
+        Ok(_)  => return TestResult::Fail("enter accepted a revoked cap"),
+    }
+    if scope.active() != 0 {
+        return TestResult::Fail("rejected enter must not bump active");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_rcu_sleepable_revoked_cap_rejected);
+
+// ── observability/ Stage-2/3 smoke tests ────────────────────────────
+//
+// PMU read paths, panic-snapshot install, and the synthesised
+// CrashFrame round-trip. Each test is independent — the panic-ring
+// install test uses `__test_clear_panic_ring` to reset shared state.
+
+fn smoke_obs_pmu_cycles_monotonic() -> TestResult {
+    use narf_capabilities::{Cap, Read};
+    use narf_observability::{read_cycles, ObsError, Pmu};
+
+    let cap: Cap<Pmu, Read> = Cap::bootstrap();
+    let a = match read_cycles(&cap) {
+        Ok(v) => v,
+        Err(ObsError::NotAvailable) => {
+            return TestResult::Skip("PMU not exposed at this ring (CR4.PCE / PMUSERENR_EL0)");
+        }
+        Err(_) => {
+            return TestResult::Fail("read_cycles failed unexpectedly");
+        }
+    };
+    // Short busy wait — long enough for at least one cycle even on a
+    // serialising counter.
+    for _ in 0..10_000 { core::hint::spin_loop(); }
+    let b = match read_cycles(&cap) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("second read_cycles failed"),
+    };
+    if b > a { TestResult::Pass }
+    else { TestResult::Fail("cycle counter did not advance across busy-wait") }
+}
+kernel_test!(smoke_obs_pmu_cycles_monotonic);
+
+fn smoke_obs_pmu_cap_gated() -> TestResult {
+    // Revoking the Pmu Read cap must surface as Err(Revoked) — the
+    // hot-path epoch gate is the load-bearing invariant from
+    // capabilities/ §3.
+    use narf_capabilities::{Cap, Read};
+    use narf_observability::{read_cycles, ObsError, Pmu};
+
+    let cap: Cap<Pmu, Read> = Cap::bootstrap();
+    cap.revoke();
+    // After revoke, the cap copy still exists (Cap is Copy) but its
+    // generation no longer matches the object epoch.
+    match read_cycles(&cap) {
+        Err(ObsError::Revoked) => TestResult::Pass,
+        Err(_)                 => TestResult::Fail("wrong error variant from revoked PMU cap"),
+        Ok(_)                  => TestResult::Fail("read_cycles accepted a revoked cap"),
+    }
+}
+kernel_test!(smoke_obs_pmu_cap_gated);
+
+fn smoke_obs_crash_frame_captures_regs() -> TestResult {
+    use narf_observability::{capture_crash_frame, ArchRegs, CRASH_STACK_WORDS};
+
+    // Synthesise a register set with a recognisable IP value; the
+    // capture must preserve every field and surface that IP via the
+    // arch-agnostic `instruction_ptr`.
+    #[cfg(target_arch = "x86_64")]
+    let regs = ArchRegs {
+        rax: 0x11, rbx: 0x22, rcx: 0x33, rdx: 0x44,
+        rsi: 0x55, rdi: 0x66, rbp: 0x77, rsp: 0x88,
+        r8: 0x99, r9: 0xAA, r10: 0xBB, r11: 0xCC,
+        r12: 0xDD, r13: 0xEE, r14: 0xFF, r15: 0x10,
+        rip: 0xDEAD_BEEF, rflags: 0x202, cs: 0x08, ss: 0x10,
+    };
+    #[cfg(target_arch = "aarch64")]
+    let regs = {
+        let mut r = ArchRegs::default();
+        r.x[0]   = 0x11;
+        r.x[30]  = 0x1E;        // LR
+        r.sp     = 0x88;
+        r.pc     = 0xDEAD_BEEF;
+        r.pstate = 0x3C5;
+        r
+    };
+
+    let frame = capture_crash_frame(regs);
+
+    if frame.registers != regs {
+        return TestResult::Fail("crash_frame did not preserve ArchRegs verbatim");
+    }
+    if frame.instruction_ptr != 0xDEAD_BEEF {
+        return TestResult::Fail("instruction_ptr not synthesised from arch regs");
+    }
+    if frame.stack.len() != CRASH_STACK_WORDS {
+        return TestResult::Fail("stack snapshot has wrong length");
+    }
+    // At least one stack word should be non-zero — we walked our own
+    // active stack so a return address or frame pointer must appear.
+    if !frame.stack.iter().any(|w| *w != 0) {
+        return TestResult::Fail("stack snapshot was entirely zero");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_obs_crash_frame_captures_regs);
+
+fn smoke_obs_panic_snapshot_roundtrip() -> TestResult {
+    // Install a flight-recorder ring under a Recorder Grant cap, push
+    // a few ObservabilityEvents, take_snapshot, and verify they appear
+    // newest-first in the snapshot.
+    use narf_capabilities::{Cap, Grant};
+    use narf_observability::{
+        install_panic_snapshot, take_snapshot, ObservabilityEvent, Recorder,
+        SNAPSHOT_CAPACITY, __test_clear_panic_ring,
+    };
+    use narf_tracing::FlightRing;
+
+    __test_clear_panic_ring();
+
+    static RING: FlightRing<ObservabilityEvent, SNAPSHOT_CAPACITY>
+        = FlightRing::new();
+
+    let cap: Cap<Recorder, Grant> = Cap::bootstrap();
+    if install_panic_snapshot(&cap, &RING).is_err() {
+        return TestResult::Fail("install_panic_snapshot returned Err with a live cap");
+    }
+
+    let events = [
+        ObservabilityEvent::CapInvoke { kind: 1, generation: 100 },
+        ObservabilityEvent::Pmu       { cycles: 200, instructions: 0 },
+        ObservabilityEvent::Panic     { ip: 0xDEAD_BEEF, domain: 7 },
+    ];
+    for ev in &events {
+        RING.record(*ev);
+    }
+
+    let snap = match take_snapshot() {
+        Some(s) => s,
+        None    => {
+            __test_clear_panic_ring();
+            return TestResult::Fail("take_snapshot returned None after install");
+        }
+    };
+    if snap.len() < events.len() {
+        __test_clear_panic_ring();
+        return TestResult::Fail("snapshot length below pushed event count");
+    }
+    // FlightRing::snapshot is newest-first, so events appear reversed.
+    let entries = snap.entries();
+    let expected_newest = events[events.len() - 1];
+    if entries[0] != expected_newest {
+        __test_clear_panic_ring();
+        return TestResult::Fail("snapshot ordering is not newest-first");
+    }
+    // Walk back through the pushed history.
+    for (i, ev) in events.iter().rev().enumerate() {
+        if entries[i] != *ev {
+            __test_clear_panic_ring();
+            return TestResult::Fail("snapshot entry did not match pushed event");
+        }
+    }
+    __test_clear_panic_ring();
+    TestResult::Pass
+}
+kernel_test!(smoke_obs_panic_snapshot_roundtrip);

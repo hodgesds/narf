@@ -12,8 +12,10 @@ name = "narf_rcu"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib  = { path = "../lib" }
-narf-arch = { path = "../arch" }
+narf-lib          = { path = "../lib" }
+narf-arch         = { path = "../arch" }
+narf-time         = { path = "../time" }
+narf-capabilities = { path = "../capabilities" }
 
 [lints]
 workspace = true

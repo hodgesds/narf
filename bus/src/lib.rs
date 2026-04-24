@@ -33,6 +33,8 @@ extern crate alloc;
 
 pub mod addr;
 pub mod device;
+pub mod hotplug;
+pub mod msix;
 pub mod registry;
 
 #[cfg(target_arch = "x86_64")]
@@ -43,4 +45,26 @@ pub mod aarch64;
 
 pub use addr::{BusAddr, PcieAddr};
 pub use device::{BusDevice, BusKind, DeviceId};
-pub use registry::{claim_device, devices, init, snapshot, BusDeviceHandle, ClaimError};
+pub use hotplug::{
+    dispatch_event, register_listener, HotplugError, HotplugEvent, HotplugListener,
+};
+pub use msix::{enable_msix, MsixError, MsixTable, MsixVector};
+pub use registry::{
+    bootstrap_registry_authority, claim_device, claim_device_cap, devices, init, snapshot,
+    BusDeviceCap, BusDeviceHandle, BusRegistryCap, ClaimError,
+};
+
+/// IOMMU group id for a given device. Stage-3 stub: QEMU's default
+/// virtio transport (MMIO on aarch64, PCIe without vIOMMU on x86_64)
+/// puts every device in group 0. Real ACS-walked grouping — where the
+/// bus crate walks every bridge in a PCIe path looking for Access
+/// Control Services, and assigns one group per isolation domain — is
+/// Stage-4 per `bus/` §5 x86_64 ACS check. The signature stays stable
+/// across the rewire: callers that already treat the return value as
+/// opaque don't need to change.
+pub fn iommu_group_for(_dev: &BusDevice) -> u32 {
+    // Stage-3 invariant: no vIOMMU on the default xtask QEMU line, so
+    // every device lives in a single shared group. This mirrors the
+    // `acs_clean: bool = false` placeholder documented in `bus/` §5.
+    0
+}

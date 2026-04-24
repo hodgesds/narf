@@ -26,6 +26,9 @@ members = [
     "block",
     "crypto",
     "net",
+    "filesystem",
+    "power",
+    "observability",
 ]
 
 [workspace.package]

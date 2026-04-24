@@ -1,6 +1,6 @@
 [package]
-name         = "narf-bus"
-description  = "Boot-time device enumeration: PCIe ECAM (x86_64) + devicetree virtio-mmio (aarch64). Stage 2 → 3."
+name         = "narf-power"
+description  = "Power management: C-state registry, idle governor, DVFS governors, runtime PM."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
@@ -8,13 +8,14 @@ license.workspace      = true
 repository.workspace   = true
 
 [lib]
-name = "narf_bus"
+name = "narf_power"
 path = "src/lib.rs"
 
 [dependencies]
 narf-lib          = { path = "../lib" }
-narf-memory       = { path = "../memory" }
-narf-boot         = { path = "../boot" }
+narf-arch         = { path = "../arch" }
+narf-time         = { path = "../time" }
+narf-scheduler    = { path = "../scheduler" }
 narf-capabilities = { path = "../capabilities" }
 
 [lints]

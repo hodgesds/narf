@@ -404,6 +404,7 @@ name = "narf-bus"
 version = "0.0.0"
 dependencies = [
  "narf-boot",
+ "narf-capabilities",
  "narf-lib",
  "narf-memory",
 ]
@@ -463,6 +464,18 @@ dependencies = [
  "narf-ipc",
  "narf-lib",
  "narf-memory",
+]
+
+[[package]]
+name = "narf-filesystem"
+version = "0.0.0"
+dependencies = [
+ "narf-block",
+ "narf-capabilities",
+ "narf-io",
+ "narf-lib",
+ "narf-scheduler",
+ "narf-time",
 ]
 
 [[package]]
@@ -529,11 +542,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-observability"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-capabilities",
+ "narf-lib",
+ "narf-time",
+ "narf-tracing",
+]
+
+[[package]]
+name = "narf-power"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-capabilities",
+ "narf-lib",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
 name = "narf-rcu"
 version = "0.0.0"
 dependencies = [
  "narf-arch",
+ "narf-capabilities",
  "narf-lib",
+ "narf-time",
 ]
 
 [[package]]
@@ -574,12 +611,15 @@ dependencies = [
  "narf-crypto",
  "narf-drivers",
  "narf-drivers-virtio",
+ "narf-filesystem",
  "narf-interrupts",
  "narf-io",
  "narf-ipc",
  "narf-lib",
  "narf-memory",
  "narf-net",
+ "narf-observability",
+ "narf-power",
  "narf-rcu",
  "narf-scheduler",
  "narf-time",

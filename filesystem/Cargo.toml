@@ -1,0 +1,23 @@
+[package]
+name         = "narf-filesystem"
+description  = "VFS core, path resolution, mount tree, initramfs, virtiofs skeleton. Stage-3 subset."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_filesystem"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../lib" }
+narf-capabilities = { path = "../capabilities" }
+narf-block        = { path = "../block" }
+narf-io           = { path = "../io" }
+narf-scheduler    = { path = "../scheduler" }
+narf-time         = { path = "../time" }
+
+[lints]
+workspace = true

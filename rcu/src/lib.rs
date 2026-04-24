@@ -8,15 +8,19 @@
 //!
 //! Non-goals for this wave:
 //! - Hazard-pointer variant — API surface only, `unimplemented!()`.
-//! - Sleepable variant (SRCU-analogue) — API surface only; real impl
-//!   needs Wave-2 capabilities and lands in the main track.
 //! - Per-domain reclamation-worker Future — depends on scheduler domain
 //!   changes; stubbed, flagged to the main agent.
 //! - Direct integration with `scheduler::run_until_empty` — the hook
 //!   `rcu::report_quiescent()` is exported so the scheduler can call it
-//!   at each poll boundary (spec §3.7); the Stage-2 scheduler does not
-//!   call it yet, so tests drive it manually. This is a stub to be wired
-//!   by the main agent.
+//!   at each poll boundary (spec §3.7); Stage 3 wires it inside
+//!   `scheduler::run_until_empty` already, so QSBR sees grace ticks
+//!   without test-harness help.
+//!
+//! Stage-3 round-2 added the **sleepable** variant (`sleepable` module,
+//! spec §3.5): cap-gated scopes, deadline-bounded `sync_async`, per-
+//! scope reader budget. The QSBR types here are unchanged; the
+//! sleepable variant is a parallel surface that lives in its own
+//! module.
 //!
 //! # Reader discipline
 //!
@@ -35,8 +39,12 @@ extern crate alloc;
 pub mod epoch;
 pub mod policy;
 pub mod qsbr;
+pub mod sleepable;
 
 pub use policy::ReclamationPolicy;
+pub use sleepable::{
+    SleepableGuard, SleepableReader, SleepableScope, SleepableSync, SyncOutcome,
+};
 
 use alloc::boxed::Box;
 use core::marker::PhantomData;
@@ -276,28 +284,7 @@ pub fn sync_async() -> impl core::future::Future<Output = ()> {
     qsbr::SyncFuture::new()
 }
 
-// ── Sleepable + Hazard stubs ────────────────────────────────────────
-
-/// Sleepable RCU reader handle (SRCU-analogue). Cap-gated; Stage-3
-/// follow-up.
-#[derive(Debug)]
-pub struct SleepableReader { _private: () }
-
-/// Sleepable RCU guard. Unlike the QSBR `ReadGuard`, this one *is*
-/// Future-safe — the whole point of the sleepable variant.
-#[derive(Debug)]
-pub struct SleepableGuard<'a> { _p: PhantomData<&'a ()> }
-
-/// Sleepable-scope handle. Stub — real impl needs Wave-2 capabilities.
-#[derive(Debug)]
-pub struct SleepableScope { _private: () }
-
-/// Outcome of `sleepable_sync`.
-#[derive(Debug)]
-pub enum SyncOutcome {
-    Drained,
-    Timeout,
-}
+// ── Hazard stub ─────────────────────────────────────────────────────
 
 /// Hazard-pointer reader slot. Stub for Stage-3; see spec §3.6.
 #[derive(Debug)]
