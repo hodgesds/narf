@@ -11,27 +11,30 @@ use narf_console::Writer;
 use narf_arch::aarch64::sysreg;
 
 /// On-stack layout saved by `vec.S`'s `SAVE_ALL_GPRS` macro.
-/// The last push is `x30`, so `x30` is at offset 0 when Rust reads
-/// the frame pointer (= current SP after the macro).
+/// The last push is `str x30, [sp, #-16]!`, which grows the stack
+/// by 16 bytes but only stores 8 — so there's an 8-byte pad between
+/// `x30` and the start of the `stp`-saved GPR pairs. The field
+/// order below matches that layout exactly.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct TrapFrame {
-    pub x30: u64,
-    pub x0:  u64, pub x1:  u64,
-    pub x2:  u64, pub x3:  u64,
-    pub x4:  u64, pub x5:  u64,
-    pub x6:  u64, pub x7:  u64,
-    pub x8:  u64, pub x9:  u64,
-    pub x10: u64, pub x11: u64,
-    pub x12: u64, pub x13: u64,
-    pub x14: u64, pub x15: u64,
-    pub x16: u64, pub x17: u64,
-    pub x18: u64, pub x19: u64,
-    pub x20: u64, pub x21: u64,
-    pub x22: u64, pub x23: u64,
-    pub x24: u64, pub x25: u64,
-    pub x26: u64, pub x27: u64,
-    pub x28: u64, pub x29: u64,
+    pub x30:  u64,
+    pub _pad: u64,                   // forced by `str x30, [sp, #-16]!`
+    pub x0:   u64, pub x1:  u64,
+    pub x2:   u64, pub x3:  u64,
+    pub x4:   u64, pub x5:  u64,
+    pub x6:   u64, pub x7:  u64,
+    pub x8:   u64, pub x9:  u64,
+    pub x10:  u64, pub x11: u64,
+    pub x12:  u64, pub x13: u64,
+    pub x14:  u64, pub x15: u64,
+    pub x16:  u64, pub x17: u64,
+    pub x18:  u64, pub x19: u64,
+    pub x20:  u64, pub x21: u64,
+    pub x22:  u64, pub x23: u64,
+    pub x24:  u64, pub x25: u64,
+    pub x26:  u64, pub x27: u64,
+    pub x28:  u64, pub x29: u64,
 }
 
 /// Called from `__narf_vec_irq` in `vec.S`. Reads the GIC's ICC_IAR1_EL1
@@ -84,6 +87,42 @@ pub extern "C" fn rust_aarch64_sync(frame: &TrapFrame) -> ! {
     dump_frame(frame);
     // SAFETY: exit is our fail path.
     unsafe { narf_arch::exit_kernel(42) }
+}
+
+/// Synchronous-exception dispatcher entered via `__narf_vec_sync_spx`.
+///
+/// Reads `ESR_EL1.EC` and routes:
+/// - `EC = 0b010101` (SVC from AArch64): marshal x0..x5 + x8 into a
+///   `SyscallArgs`, call `kernel_syscall_entry`, store the return
+///   value + status in `frame.x0` / `frame.x1` so RESTORE_ALL_GPRS
+///   + `eret` delivers them back to user space. Returns normally.
+/// - Anything else: fatal — delegates to `rust_aarch64_sync` which
+///   prints diagnostics and calls `exit_kernel`.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_aarch64_sync_dispatch(frame: &mut TrapFrame) {
+    // SAFETY: ESR_EL1 read at EL1 is always defined.
+    let esr = unsafe { sysreg::read_esr_el1() };
+    let ec  = (esr >> 26) & 0x3F;
+
+    const EC_SVC_AARCH64: u64 = 0b01_0101;
+
+    if ec == EC_SVC_AARCH64 {
+        // Convention: x8 = syscall number, x0..x5 = args. Return
+        // value placed in x0 (value) + x1 (status) so callers can
+        // read both without a follow-up instruction.
+        let args = narf_userspace::SyscallArgs {
+            arg0: frame.x0, arg1: frame.x1, arg2: frame.x2,
+            arg3: frame.x3, arg4: frame.x4, arg5: frame.x5,
+        };
+        let num = frame.x8 as u32;
+        let ret = narf_userspace::kernel_syscall_entry(num, &args);
+        frame.x0 = ret.value;
+        frame.x1 = ret.status as u64;
+        return;
+    }
+
+    // Non-SVC synchronous exception — fatal.
+    rust_aarch64_sync(frame);
 }
 
 #[unsafe(no_mangle)]

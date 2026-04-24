@@ -142,10 +142,14 @@ __narf_vec_irq:
 __narf_vec_sync_spx:
     SAVE_ALL_GPRS
     mov     x0, sp
-    bl      rust_aarch64_sync
-    /* rust_aarch64_sync is `-> !`; control never reaches here. */
-1:  wfe
-    b       1b
+    bl      rust_aarch64_sync_dispatch
+    /* For SVC-class sync exceptions the dispatcher writes the
+     * return value into the saved x0 slot and returns here;
+     * RESTORE_ALL_GPRS + eret resumes user state. Fatal sync
+     * exceptions (page-fault etc) call exit_kernel from Rust and
+     * never return. */
+    RESTORE_ALL_GPRS
+    eret
 .size __narf_vec_sync_spx, . - __narf_vec_sync_spx
 
 .align 4

@@ -5505,6 +5505,68 @@ fn smoke_userspace_syscall_table_roundtrip() -> TestResult {
 }
 kernel_test!(smoke_userspace_syscall_table_roundtrip);
 
+#[cfg(target_arch = "aarch64")]
+fn smoke_frame_aarch64_svc_dispatches_through_global() -> TestResult {
+    // End-to-end: install a global SyscallTable with a handler for
+    // Syscall::Yield, fire `svc #0` from kernel mode with x8 =
+    // Yield.raw() and x0 = 0xC0FFEE, read back x0 (value) + x1
+    // (status) and confirm the trap dispatcher round-tripped
+    // through our handler.
+    use core::arch::asm;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_userspace::{
+        install_global, syscall::__test_clear_global, Syscall, SyscallArgs,
+        SyscallReturn, SyscallTable,
+    };
+
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    SEEN.store(0, Ordering::Relaxed);
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    t.install_fn(Syscall::Yield, "yield", |args: &SyscallArgs| {
+        SEEN.store(args.arg0, Ordering::Relaxed);
+        SyscallReturn::ok(args.arg0.wrapping_mul(2))
+    });
+    install_global(t);
+
+    // Fire SVC from EL1. The vec.S sync-SPx slot dispatches into
+    // `rust_aarch64_sync_dispatch`, which routes the SVC into
+    // `kernel_syscall_entry`.
+    //
+    // x8 = syscall number (Yield = 104), x0 = arg0 = 0xC0FFEE.
+    // After the call x0 = value, x1 = status.
+    let mut value: u64 = 0xC0FFEE;
+    let mut status: u64;
+    unsafe {
+        asm!(
+            "mov x8, #{num}",
+            "svc #0",
+            "mov {s}, x1",
+            num = const (Syscall::Yield.raw() as u64),
+            s = out(reg) status,
+            inout("x0") value,
+            out("x1") _,
+            out("x8") _,
+        );
+    }
+
+    __test_clear_global();
+
+    if SEEN.load(Ordering::Relaxed) != 0xC0FFEE {
+        return TestResult::Fail("handler did not observe args.arg0 via SVC path");
+    }
+    if status != SyscallReturn::OK as u64 {
+        return TestResult::Fail("status returned through SVC wasn't Ok");
+    }
+    if value != 0xC0FFEE * 2 {
+        return TestResult::Fail("value returned through SVC didn't round-trip");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test!(smoke_frame_aarch64_svc_dispatches_through_global);
+
 fn smoke_userspace_syscall_dispatch_via_global() -> TestResult {
     // Install a global table with a live handler for Syscall::Yield;
     // kernel_syscall_entry(104, …) routes to it. Unregistered

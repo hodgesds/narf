@@ -522,6 +522,7 @@ dependencies = [
  "narf-memory",
  "narf-scheduler",
  "narf-time",
+ "narf-userspace",
  "narf-verification",
 ]
 

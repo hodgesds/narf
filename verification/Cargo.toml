@@ -39,6 +39,7 @@ narf-userspace  = { path = "../userspace" }
 narf-drivers-nvme = { path = "../drivers/nvme" }
 narf-drivers-net  = { path = "../drivers/net" }
 narf-drivers-gpu  = { path = "../drivers/gpu" }
+# narf-userspace already above
 
 [lints]
 workspace = true
