@@ -10,7 +10,7 @@ asks for. Updated when observable kernel behaviour changes.
 | 1. Skeleton      | Bootloader + async executor + console | **closed** — all 6 exit-gate items met |
 | 2. Barrier       | PKS/MTE domain switching + UIPI        | **closed** — both arches boot; higher-half, MTE, GICv3 all landed |
 | 3. Flow          | Narf-Ring + capabilities + first VirtIO | **composition complete; enforcement deferred to Stage 4** — caps/epoch, ipc SPSC, drivers framework, io DMA, rcu, tracing, abi, virtio-mmio skeleton all landed; `smoke_exit_gate_*` pass both arches, proving DmaBuffer → Narf-Ring → cap-gated consumer composes end-to-end. Real PKS/MTE enforcement on buffer pages, real virtio device I/O, real IOMMU, real user-mode consumer: Stage 4 items. |
-| 4. Compatibility | relibc integration; run standard Rust bins | not started |
+| 4. Compatibility | relibc integration; run standard Rust bins | **structural surfaces landed; exit-gate blocked on host toolchain work** — see §"Stage 4 structural landing" below |
 
 ## Working today (both arches on QEMU)
 
@@ -465,3 +465,64 @@ Parallel-safe micro-tasks:
 - Replace free-stack frame allocator with a buddy.
 - `rcu/` stub API so downstream crates don't retrofit.
 - `tracing/` USDT marker macro — `.note.narf.probes` section exists.
+
+## Stage 4 structural landing
+
+This session landed a broad Stage-4 **structural** pass — every
+subsystem listed in `ROADMAP.md` Stage 4 has its type surface,
+cap-type markers, and enough stub bodies to compile, test, and
+interop with the rest of the tree. The bodies that actually do
+something on real hardware are not yet wired because they depend on
+three host-toolchain / deep-arch pieces that were out of scope:
+
+1. **`frame/` syscall entry** — a real `syscall` (x86_64) / `svc
+   #0` (aarch64) trap handler that reads `SyscallArgs` off the
+   register file, dispatches through a `SyscallTable`, and returns
+   a `SyscallReturn`. Needs register save/restore in the trap
+   prologue, not just the existing CPU-exception path.
+2. **`memory/` per-process address spaces** — every user process
+   needs its own PML4/TTBR0 so user-mode mappings don't collide
+   with the kernel half. The loader (`userspace::ExecImage`) places
+   `PT_LOAD` segments into that address space.
+3. **External relibc build** — the Stage-4 exit gate requires a
+   relibc compiled against NARF's syscall ABI
+   (`narf_userspace::Syscall`). That is a separate repo / build
+   artefact outside this tree.
+
+Without those three, the spec's Stage-4 exit criterion ("relibc-
+linked standard Rust binary doing block + network I/O through
+capability-gated paths") is unreachable from this tree alone.
+
+### Stage 4 structural surfaces landed (both arches green)
+
+| subsystem             | what shipped                                              |
+| --------------------- | --------------------------------------------------------- |
+| `block::mq`           | `MqDeadlineScheduler` with N-lane round-robin + deadline promotion (`MAX_LANES = 64`). |
+| `scheduler::priority` | `SchedClass { Normal, RealTime, Idle }`, `Priority(i8)`, `SmtSharePolicy`; `TaskSpec::realtime(deadline_cycles)`. |
+| `scheduler::cpu_lifecycle` | Cap-gated `cpu_bring_up` / `cpu_take_offline` against `Cap<CpuLifecycle, Invoke>` with a 64-wide online bitmap; boot CPU protected. |
+| `power::thermal`      | `ThermalZone` registry + `ThermalEvent` subscribers; Normal/Warm/Critical transitions fire exactly once. |
+| `power::suspend`      | Nine-phase `SuspendPhase` pipeline + `suspend(cap)` that walks the phases and returns `NotImplemented` until `arch/` exposes S3 / PSCI. |
+| `EnergyAware` governor | Three-band DVFS pick keyed off `load_permille`. |
+| `time::wall`          | `WallInstant`, `set_wall_offset(cap, ns)`, `begin_leap_smear(cap, delta, window)`, `now_wall()` reader. |
+| `observability::gdb`  | `GdbPacket` framing + checksum helper, `GdbCommand` enum covering the RSP subset, `attach(cap)` stub. |
+| `observability::peek` | `Provider` trait + cap-gated `sample_all(cap, out)` registry for live-peek metrics. |
+| `userspace`           | `ProcessId`, `ExecImage` with `Segment` + `SegmentFlags` matching ELF `PF_*`, `AuxEntry` with `AT_*` tags, `SyscallTable` pinning the canonical numbers (Submit=100, …, Munmap=121). |
+| `drivers/nvme`        | BAR0 register offsets, `NvmeCaps::from_raw` bitfield decoder, `AdminOpcode` + `IoOpcode` tables, `Controller::probe(cap)` stub, `NvmeBlockDevice` impl of `BlockDevice`. |
+| `drivers/net`         | `NicModel` enum (e1000/igb/ixgbe/mlx5/rtl8139) with `primary_pci_id()` lookup, `NicCaps` feature bitmap, `NicDescriptor`, `HwNic` trait. |
+| `drivers/gpu`         | `GpuFamily` backend list, `Mode { width, height, refresh_hz, bpp }` with `FHD_60` / `XGA_60` presets, `SubmitKind` + `CommandBuffer` + `GpuFence`. |
+| `crypto::tpm`         | TCG-spec `TpmCc` command codes (PcrExtend/Read/GetRandom/Startup/SelfTest/…), `TpmAlgHash` enum, `Tpm2Command` wrapper, `submit()` stub. |
+| `crypto::pq`          | `MlKem768` / `MlDsa65` / `SphincsPlus` CapType markers, `HybridMode`, runtime `fips_mode()` + `fips_allowed(alg)` gate. |
+| `net::stack`          | `StackAttach` / `StackAttachReply` protocol, `AdminCap` marker, `StackDaemon` identity cap, `attach()` stub. |
+| `filesystem::page_cache` | `PageKey` + `Page { data: Arc<[u8; 4096]>, dirty, gen }` + `PageCache` with `lookup` / `insert` / `mark_dirty` / `drain_dirty`. |
+| `filesystem::fuse`    | `FuseOpcode` values matching Linux UAPI verbatim, `FuseInHeader` / `FuseOutHeader` / `FuseInitIn` / `FuseInitOut` wire structs, `FUSE_KERNEL_VERSION = 7.36`. |
+| `bus::acpi_notify`    | `NotifyKind` event table (BusCheck/DeviceCheck/Thermal/…), cap-gated subscriber registry, `dispatch_notify` fan-out. |
+| `rcu::batched`        | `BatchedReclaimer` grouping callbacks into capped `ReclaimBatch` (BATCH_CAP = 128), `submit` / `flush`, `pace(node, quantum)` NUMA hint. |
+| `tracing::hwtrace`    | `HwTraceConfig` shared between Intel PT + CoreSight ETM, `HwTraceStatus`, `HwTraceMarker` CapType, `start` / `stop` / `status` stubs. |
+
+Test coverage for each of the above: a dedicated `smoke_*`
+kernel_test in `verification/src/lib.rs` exercising either the
+happy path, the cap-revoke fail-closed, or the structural
+invariants. Totals after the Stage-4 round: **x86_64 134 pass,
+aarch64 124 pass + 3 skip** (same three skips as Stage 3 —
+arch-gated bus test, sleepable-RCU detail, virtio probe without
+hardware).
