@@ -108,6 +108,22 @@ pub type Domain = current::Mte;
 #[inline(always)]
 pub fn halt_forever() -> ! { current::halt_forever() }
 
+/// ID of the CPU currently executing this code. Stage-2 single-CPU
+/// returns `0`; Stage-3 AP bring-up replaces the body with a real
+/// read (TPIDR_EL1 on aarch64, MSR GS-based on x86_64).
+#[inline]
+pub fn current_cpu_id() -> narf_lib::id::CpuId {
+    // SAFETY: pure read with no side effects; Stage-2 body is `0`.
+    narf_lib::id::CpuId::new(unsafe { narf_arch_cpu_id() } as u16)
+}
+
+/// Hook that `narf_lib::percpu` calls to avoid a dep cycle. Stage 2:
+/// returns 0 (BSP-only). Stage 3: reads CPU-ID register.
+#[unsafe(no_mangle)]
+pub extern "Rust" fn narf_arch_cpu_id() -> usize {
+    0
+}
+
 /// Halt until the next interrupt. On x86_64 falls back to `spin_loop`
 /// when IRQs are masked (HLT would otherwise deadlock). On aarch64 uses
 /// WFI, which wakes on IRQ regardless of mask state.

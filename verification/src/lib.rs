@@ -441,6 +441,43 @@ fn smoke_aarch64_features() -> TestResult {
 #[cfg(target_arch = "aarch64")]
 kernel_test!(smoke_aarch64_features);
 
+fn smoke_percpu_this_cpu() -> TestResult {
+    // Stage-2 single-CPU: current_cpu_id() returns 0, so this_cpu()
+    // always reads cell 0. Verify structural correctness.
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_lib::percpu::{PerCpu, MAX_CPUS};
+
+    // PerCpu<u64> can hold a plain value; mutate via a pointer cast
+    // to AtomicU64 for the test.
+    static CELL: PerCpu<u64> = PerCpu::new(0);
+
+    let ptr = CELL.this_cpu() as *const u64 as *mut u64;
+    // SAFETY: `ptr` points at a live `u64` cell inside `CELL`. We
+    // treat it as an `AtomicU64` for the test roundtrip.
+    let atomic = unsafe { AtomicU64::from_ptr(ptr) };
+
+    atomic.store(0xDEAD_BEEF, Ordering::Relaxed);
+    if atomic.load(Ordering::Relaxed) != 0xDEAD_BEEF {
+        return TestResult::Fail("PerCpu cell roundtrip failed");
+    }
+
+    if narf_arch::current_cpu_id().raw() != 0 {
+        return TestResult::Fail("Stage-2 current_cpu_id != 0");
+    }
+
+    // Iter should produce MAX_CPUS entries (most 0, the one we
+    // wrote = 0xDEAD_BEEF).
+    let count = CELL.iter().count();
+    if count != MAX_CPUS {
+        return TestResult::Fail("PerCpu::iter didn't yield MAX_CPUS cells");
+    }
+
+    // Cleanup so the value doesn't leak across tests.
+    atomic.store(0, Ordering::Relaxed);
+    TestResult::Pass
+}
+kernel_test!(smoke_percpu_this_cpu);
+
 fn smoke_domain_primitive_trait() -> TestResult {
     // Trait-level dispatch through `arch::Domain::*`. On x86_64 maps
     // to PKS; on aarch64 maps to MTE. Both are live; the aarch64 path

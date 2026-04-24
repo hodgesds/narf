@@ -13,9 +13,37 @@
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-static PROBE_RECOVERY_RIP: AtomicU64 = AtomicU64::new(0);
-static PROBE_CAUGHT:       AtomicU32 = AtomicU32::new(0);
-static PROBE_ERROR:        AtomicU64 = AtomicU64::new(0);
+use narf_lib::percpu::MAX_CPUS;
+
+/// Per-CPU probe state. A single CPU probes + catches on its own
+/// cell; there's no cross-CPU visibility needed (a CPU's probe is
+/// consumed by that CPU's trap handler). Using `[const { … }; N]`
+/// because `AtomicU*` isn't `Copy`, so `PerCpu<AtomicU*>` can't
+/// repeat-initialise.
+#[derive(Debug)]
+struct ProbeCell {
+    recovery: AtomicU64,
+    caught:   AtomicU32,
+    error:    AtomicU64,
+}
+
+impl ProbeCell {
+    const NEW: Self = Self {
+        recovery: AtomicU64::new(0),
+        caught:   AtomicU32::new(0),
+        error:    AtomicU64::new(0),
+    };
+}
+
+static PROBE: [ProbeCell; MAX_CPUS] = [const { ProbeCell::NEW }; MAX_CPUS];
+
+#[inline]
+fn this_probe() -> &'static ProbeCell {
+    let cpu = crate::current_cpu_id().raw() as usize;
+    // Stage 2: single-CPU always returns 0; the clamp guards Stage-3
+    // where MAX_CPUS could be exceeded by a mis-configured AP.
+    &PROBE[if cpu < MAX_CPUS { cpu } else { 0 }]
+}
 
 /// What the probe caught.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
@@ -33,16 +61,18 @@ pub struct Caught {
 ///
 /// Clears any stale caught state from a prior arming.
 pub fn arm(recovery_rip: u64) {
-    PROBE_CAUGHT.store(0, Ordering::Release);
-    PROBE_ERROR .store(0, Ordering::Release);
-    PROBE_RECOVERY_RIP.store(recovery_rip, Ordering::Release);
+    let cell = this_probe();
+    cell.caught  .store(0, Ordering::Release);
+    cell.error   .store(0, Ordering::Release);
+    cell.recovery.store(recovery_rip, Ordering::Release);
 }
 
 /// Disarm the probe and return what was caught.
 pub fn disarm() -> Caught {
-    PROBE_RECOVERY_RIP.store(0, Ordering::Release);
-    let raw = PROBE_CAUGHT.swap(0, Ordering::AcqRel);
-    let err = PROBE_ERROR.swap(0, Ordering::AcqRel);
+    let cell = this_probe();
+    cell.recovery.store(0, Ordering::Release);
+    let raw = cell.caught.swap(0, Ordering::AcqRel);
+    let err = cell.error .swap(0, Ordering::AcqRel);
     Caught {
         vector: if raw == 0 { None } else { Some(raw - 1) },
         error_code: err,
@@ -58,10 +88,11 @@ pub fn disarm() -> Caught {
 /// Only the trap handler should call this.
 #[doc(hidden)]
 pub fn consume(vector: u32, error_code: u64) -> u64 {
-    let recovery = PROBE_RECOVERY_RIP.swap(0, Ordering::AcqRel);
+    let cell = this_probe();
+    let recovery = cell.recovery.swap(0, Ordering::AcqRel);
     if recovery != 0 {
-        PROBE_CAUGHT.store(vector + 1, Ordering::Release);
-        PROBE_ERROR.store(error_code, Ordering::Release);
+        cell.caught.store(vector + 1, Ordering::Release);
+        cell.error .store(error_code, Ordering::Release);
     }
     recovery
 }
