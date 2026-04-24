@@ -5069,11 +5069,18 @@ fn smoke_scheduler_spawn_user_carries_address_space() -> TestResult {
     static RAN: AtomicU32 = AtomicU32::new(0);
     RAN.store(0, Ordering::Relaxed);
 
-    // Build an address space with one region so the scheduler has
-    // something to activate (even though activate returns
-    // NotImplemented — we're proving the handshake).
-    let mut a = AddressSpace::empty();
-    a.root = PhysAddr::new(0x1000_0000);  // non-zero sentinel for activate()
+    // Build an address space — on x86_64 allocate a real PML4 so
+    // the executor's `activate()` does a safe CR3 swap (the
+    // constructor full-copies the current PML4 so kernel mappings
+    // stay intact). On aarch64 fall back to the empty AS, whose
+    // activate() surfaces NotImplemented until the TTBR0 primitive
+    // lands.
+    let mut a = {
+        #[cfg(target_arch = "x86_64")]
+        { unsafe { AddressSpace::new_for_user() }.expect("alloc user AS") }
+        #[cfg(not(target_arch = "x86_64"))]
+        { AddressSpace::empty() }
+    };
     a.map_region(Region {
         base: VirtAddr::new(0x4000),
         len:  0x1000,
@@ -5224,15 +5231,11 @@ fn smoke_memory_address_space_region_table() -> TestResult {
         return TestResult::Fail("lookup did not find covering region");
     }
 
-    // activate returns NotImplemented / OutOfRange until arch backend.
+    // activate on a fresh AS (root still 0) surfaces OutOfRange —
+    // this path doesn't touch CR3.
     match a.activate() {
-        Err(AddressSpaceError::OutOfRange) => {} // root is still 0
+        Err(AddressSpaceError::OutOfRange) => {}
         _ => return TestResult::Fail("activate on unset root should surface OutOfRange"),
-    }
-    a.root = PhysAddr::new(0xFFDE_0000);
-    match a.activate() {
-        Err(AddressSpaceError::NotImplemented) => {}
-        _ => return TestResult::Fail("activate with root set should surface NotImplemented"),
     }
 
     // Unmap removes by base.

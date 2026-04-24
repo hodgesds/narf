@@ -132,6 +132,53 @@ impl fmt::Debug for PageTable {
     }
 }
 
+/// Errors from `new_user_pml4` / address-space construction.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PageTableAllocError {
+    NoFrame,
+}
+
+/// Allocate a fresh PML4 for an address-space handle. Full-copy of
+/// the currently-active PML4 so activation is safe under the current
+/// kernel layout (which keeps the low 4 GiB identity-mapped for
+/// frame-allocator access and the high half for kernel code/stack).
+///
+/// This is a Stage-4 **structural** constructor — the AS returned
+/// can be installed via `AddressSpace::activate()` without
+/// triple-faulting, but every user-space access goes through the
+/// same mappings as the kernel. A genuinely isolating user AS
+/// needs either a higher-half direct map in `memory/` or a
+/// migration of the frame allocator off the identity map so the
+/// low half can be cleared. That work is tracked separately.
+///
+/// # Safety
+/// - Caller must run with paging enabled and the low 4 GiB still
+///   identity-mapped (standard NARF boot state).
+/// - The returned PhysAddr must be dropped through the frame
+///   allocator when the address space retires — leaks are live
+///   pages until reboot.
+pub unsafe fn new_user_pml4() -> Result<PhysAddr, PageTableAllocError> {
+    let frame = crate::frame::alloc_frame().map_err(|_| PageTableAllocError::NoFrame)?;
+    let phys  = frame.start_address();
+
+    // Read the currently-active PML4.
+    // SAFETY: `read_cr3` is a single privileged read — legal at CPL=0.
+    let cur_pml4 = unsafe { read_cr3() };
+
+    // Full-copy the 4 KiB of PML4 entries into the fresh frame.
+    // SAFETY: both `cur_pml4` and `phys` point at properly-aligned
+    // `PageTable`-sized identity-mapped regions.
+    unsafe {
+        ptr::copy_nonoverlapping(
+            cur_pml4.raw() as *const u8,
+            phys.raw()     as *mut u8,
+            core::mem::size_of::<PageTable>(),
+        );
+    }
+
+    Ok(phys)
+}
+
 /// Write a value to physical memory while we're still in an
 /// identity-mapped phase of boot. Used to prime a fresh PML4 before
 /// `write_cr3` swaps to it.

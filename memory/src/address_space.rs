@@ -83,6 +83,31 @@ impl AddressSpace {
         }
     }
 
+    /// Allocate a fresh user-mode PML4 (x86_64) or TTBR0 page-table
+    /// root (aarch64) inheriting every kernel-half entry from the
+    /// currently-active root. The returned `AddressSpace` can be
+    /// populated with user regions via `map_region` and activated
+    /// via `activate()` — which on x86_64 is now a real `MOV CR3`.
+    ///
+    /// aarch64 returns `NotImplemented` until the TTBR0 primitive
+    /// lands in `memory/src/aarch64/paging.rs`.
+    ///
+    /// # Safety
+    /// Caller must run with paging enabled. Post-construction the
+    /// AS is safe to build up and activate per the normal flow.
+    #[cfg(target_arch = "x86_64")]
+    pub unsafe fn new_for_user() -> Result<Self, AddressSpaceError> {
+        // SAFETY: contract documented on the function.
+        let phys = unsafe { crate::x86_64::paging::new_user_pml4() }
+            .map_err(|_| AddressSpaceError::OutOfRange)?;
+        Ok(Self { root: phys, regions: Vec::new() })
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    pub unsafe fn new_for_user() -> Result<Self, AddressSpaceError> {
+        Err(AddressSpaceError::NotImplemented)
+    }
+
     /// Attach a region description to the address-space table. Does
     /// NOT program the page table — that lives in `arch/`. Checks
     /// for overlap with existing regions and 4 KiB alignment.
@@ -124,15 +149,36 @@ impl AddressSpace {
         })
     }
 
-    /// Make this address-space the active one. Returns
-    /// `NotImplemented` until the arch backend lands (which does
-    /// the `MOV CR3` / `TTBR0_EL1` store with the right shootdown
-    /// discipline).
+    /// Make this address-space the active one. On x86_64 issues a
+    /// `MOV CR3` with the right `compiler_fence` discipline; on
+    /// aarch64 returns `NotImplemented` until the TTBR0_EL1
+    /// primitive lands.
+    ///
+    /// # Safety invariants (x86_64)
+    /// - `self.root` must have been constructed via `new_for_user`,
+    ///   which copies the currently-active kernel-half entries.
+    ///   Activating a PML4 without kernel mappings triple-faults
+    ///   on the next instruction fetch.
     pub fn activate(&self) -> Result<(), AddressSpaceError> {
         if self.root.as_u64() == 0 {
             return Err(AddressSpaceError::OutOfRange);
         }
-        Err(AddressSpaceError::NotImplemented)
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: `new_for_user` (the only safe path to a
+            // non-zero `root`) populated the kernel-half entries
+            // from the current PML4, so the next instruction fetch
+            // after the CR3 swap still resolves against a valid
+            // kernel mapping. Interrupt state is the caller's
+            // contract — the executor disables IRQs through the
+            // existing `IrqSafeSpinLock` on the ready queue.
+            unsafe { crate::x86_64::paging::write_cr3(self.root); }
+            return Ok(());
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            Err(AddressSpaceError::NotImplemented)
+        }
     }
 }
 
