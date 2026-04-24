@@ -4261,6 +4261,91 @@ fn smoke_abi_cancel_non_cancellable_marks_request() -> TestResult {
 }
 kernel_test!(smoke_abi_cancel_non_cancellable_marks_request);
 
+fn smoke_abi_linked_chain_cancels_forward() -> TestResult {
+    // §3.1 "Linked submissions": cancelling any member of a LINKED
+    // chain auto-cancels the rest of the chain. Here the producer
+    // submits A (starts a chain), then B (LINKED, inherits A's chain),
+    // then Cancel(A), then C (LINKED, still same chain). The chain
+    // registry flagged chain_id when Cancel(A) ran; C must short-
+    // circuit with Cancelled even though it was never named directly.
+    use core::sync::atomic::{AtomicU8, Ordering};
+    use narf_abi::{
+        completion_channel, submission_channel, Dispatcher, NarfStatus,
+        Submission, SubmissionFlags, Tag,
+    };
+
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+
+    narf_scheduler::init();
+    let (mut sq_tx, sq_rx) = submission_channel::<8>();
+    let (cq_tx, mut cq_rx) = completion_channel::<8>();
+
+    narf_scheduler::spawn(async move {
+        let mut d = Dispatcher::new(sq_rx, cq_tx);
+        d.run().await;
+    });
+
+    narf_scheduler::spawn(async move {
+        let ta = Tag::new(0xA0);
+        let tb = Tag::new(0xB0);
+        let tc = Tag::new(0xC0);
+        let tcan = Tag::new(0xCA);
+
+        // A — fresh chain, CANCELLABLE. Runs to completion before the
+        // cancel arrives (serial dispatch) → Ok.
+        let mut a = Submission::noop(ta);
+        a.flags = SubmissionFlags::CANCELLABLE;
+        sq_tx.send(a).await.unwrap();
+
+        // B — LINKED, CANCELLABLE. Part of A's chain.
+        let mut b = Submission::noop(tb);
+        b.flags = SubmissionFlags::CANCELLABLE | SubmissionFlags::LINKED;
+        sq_tx.send(b).await.unwrap();
+
+        // Cancel A. The Dispatcher marks A's chain_id pending.
+        sq_tx.send(Submission::cancel(tcan, ta)).await.unwrap();
+
+        // C — LINKED, CANCELLABLE. Must short-circuit with Cancelled.
+        let mut c = Submission::noop(tc);
+        c.flags = SubmissionFlags::CANCELLABLE | SubmissionFlags::LINKED;
+        sq_tx.send(c).await.unwrap();
+
+        // Drain: A (Ok), B (Ok — entered chain before cancel marked it),
+        // cancel (Ok), C (Cancelled).
+        let ca = cq_rx.recv().await.unwrap();
+        if ca.tag() != ta || ca.status != NarfStatus::Ok {
+            OUTCOME.store(2, Ordering::Relaxed); return;
+        }
+        let cb = cq_rx.recv().await.unwrap();
+        if cb.tag() != tb || cb.status != NarfStatus::Ok {
+            OUTCOME.store(3, Ordering::Relaxed); return;
+        }
+        let ccan = cq_rx.recv().await.unwrap();
+        if ccan.tag() != tcan || ccan.status != NarfStatus::Ok {
+            OUTCOME.store(4, Ordering::Relaxed); return;
+        }
+        let cc = cq_rx.recv().await.unwrap();
+        if cc.tag() != tc || cc.status != NarfStatus::Cancelled {
+            OUTCOME.store(5, Ordering::Relaxed); return;
+        }
+
+        OUTCOME.store(1, Ordering::Relaxed);
+        core::mem::drop(sq_tx);
+        core::mem::drop(cq_rx);
+    });
+
+    narf_scheduler::run_until_empty();
+    match OUTCOME.load(Ordering::Relaxed) {
+        1 => TestResult::Pass,
+        2 => TestResult::Fail("A did not complete Ok"),
+        3 => TestResult::Fail("B did not complete Ok (chain not yet cancelled when B dispatched)"),
+        4 => TestResult::Fail("Cancel op did not complete Ok"),
+        5 => TestResult::Fail("C was not auto-cancelled via its chain"),
+        _ => TestResult::Fail("linked chain roundtrip did not run"),
+    }
+}
+kernel_test!(smoke_abi_linked_chain_cancels_forward);
+
 fn smoke_abi_cancel_stale_tag_is_noop() -> TestResult {
     // §3.1: the cancel op is non-blocking and always succeeds even
     // when the target tag never shows up. A subsequent unrelated

@@ -451,37 +451,103 @@ pub fn completion_channel<const N: usize>() -> (CompletionQueue<N>, CompletionDr
 /// cancellation can interrupt a long-running await.
 #[derive(Debug)]
 struct PendingCancels {
-    tags: IrqSafeSpinLock<Vec<u64>>,
+    inner: IrqSafeSpinLock<CancelInner>,
+}
+
+#[derive(Debug)]
+struct CancelInner {
+    /// Tags directly targeted by an `OpCode::Cancel`.
+    tags:           Vec<u64>,
+    /// Chain ids whose members should propagate to `Cancelled` —
+    /// spec §3.1 "Linked submissions" rule.
+    chains:         Vec<u32>,
+    /// tag → chain_id map for the submissions that have been
+    /// dispatched (or are being dispatched). Cancel propagation looks
+    /// a target's tag up here to find its chain and then marks the
+    /// whole chain.
+    chain_of:       Vec<(u64, u32)>,
+    /// Id assigned to the most recently seen chain. A new submission
+    /// with `SubmissionFlags::LINKED` inherits this id; a submission
+    /// without `LINKED` starts a fresh chain.
+    last_chain:     u32,
+    /// Monotonic chain-id allocator; starts at 1 so `last_chain == 0`
+    /// unambiguously means "no chain seen yet".
+    next_chain:     u32,
 }
 
 impl PendingCancels {
     const fn new() -> Self {
-        Self { tags: IrqSafeSpinLock::new(Vec::new()) }
-    }
-
-    /// Record `target` as cancel-pending. Duplicates are silently
-    /// collapsed (set semantics) to keep the list bounded.
-    fn request(&self, target: Tag) {
-        let mut t = self.tags.lock();
-        if !t.iter().any(|&x| x == target.raw()) {
-            t.push(target.raw());
+        Self {
+            inner: IrqSafeSpinLock::new(CancelInner {
+                tags:       Vec::new(),
+                chains:     Vec::new(),
+                chain_of:   Vec::new(),
+                last_chain: 0,
+                next_chain: 1,
+            }),
         }
     }
 
-    /// Consume a pending cancel for `tag` if present; returns `true`
-    /// iff this tag was cancel-pending. Removing on consume means a
-    /// late-arriving retry submission with the same tag is not
-    /// auto-cancelled.
-    fn consume(&self, tag: Tag) -> bool {
-        let mut t = self.tags.lock();
-        if let Some(pos) = t.iter().position(|&x| x == tag.raw()) {
-            t.swap_remove(pos);
-            true
+    /// Determine the chain id for a newly-arrived submission. Called
+    /// at dispatch time. `LINKED` extends the previous chain;
+    /// otherwise a fresh chain id is minted. Records the tag→chain
+    /// mapping so a later `OpCode::Cancel(tag)` can find it.
+    ///
+    /// `OpCode::Cancel` submissions are transparent to the chain
+    /// tracker — they neither consume a chain id nor update
+    /// `last_chain`. A cancel issued mid-chain must not displace the
+    /// `LINKED`-inheritance of the next real op, because the cancel
+    /// is a control message that lives outside the chain's I/O
+    /// semantics (spec §3.1 "Linked submissions" talks about chained
+    /// *operations*, not cancel requests).
+    fn enter(&self, sub: &Submission) -> u32 {
+        if sub.op == OpCode::Cancel {
+            return 0; // sentinel — cancel doesn't belong to a chain
+        }
+        let mut g = self.inner.lock();
+        let chain = if sub.flags.contains(SubmissionFlags::LINKED) && g.last_chain != 0 {
+            g.last_chain
         } else {
-            false
+            let id = g.next_chain;
+            g.next_chain = g.next_chain.saturating_add(1);
+            id
+        };
+        g.last_chain = chain;
+        g.chain_of.push((sub.tag, chain));
+        chain
+    }
+
+    /// Record a cancel request for `target`. Looks up the target's
+    /// chain (if any) and marks the whole chain cancel-pending so
+    /// linked peers are auto-cancelled on dispatch.
+    fn request(&self, target: Tag) {
+        let mut g = self.inner.lock();
+        if !g.tags.iter().any(|&x| x == target.raw()) {
+            g.tags.push(target.raw());
+        }
+        if let Some(&(_, chain)) = g.chain_of.iter().find(|&&(t, _)| t == target.raw()) {
+            if !g.chains.iter().any(|&c| c == chain) {
+                g.chains.push(chain);
+            }
         }
     }
 
+    /// Consume any cancel-pending state for `tag` / `chain`; returns
+    /// `true` iff this submission should short-circuit. Consuming the
+    /// tag side avoids re-cancelling a late retry with the same tag;
+    /// chain side stays marked so every member of the chain propagates.
+    fn consume(&self, tag: Tag, chain: u32) -> bool {
+        let mut g = self.inner.lock();
+        let mut hit = false;
+        if let Some(pos) = g.tags.iter().position(|&x| x == tag.raw()) {
+            g.tags.swap_remove(pos);
+            hit = true;
+        }
+        if g.chains.iter().any(|&c| c == chain) {
+            hit = true;
+        }
+        hit
+    }
 }
 
 /// In-kernel ABI dispatcher. Drains a submission ring and dispatches
@@ -527,15 +593,20 @@ impl<const N: usize> Dispatcher<N> {
 
     /// Dispatch a single submission.
     async fn dispatch_one(&mut self, sub: Submission) -> Completion {
-        let tag = sub.tag();
+        let tag   = sub.tag();
+        // Enter the sub into the chain registry; assigns a chain id
+        // (fresh or inherited from LINKED) and records tag→chain so a
+        // later `OpCode::Cancel` can propagate across the chain.
+        let chain = self.pending.enter(&sub);
 
         // Cancel-protocol pre-check (spec §3.1): if this submission's
-        // tag was already requested-to-cancel, short-circuit. Ops that
-        // carry `CANCEL_AWARE` complete `Cancelled`; all others complete
+        // tag was already cancel-pending, or any linked peer already
+        // triggered a chain cancel, short-circuit. Ops that carry
+        // `CANCELLABLE` complete `Cancelled`; all others complete
         // `CancelRequested` — the spec's non-cancellable path.
         // `OpCode::Cancel` itself bypasses the check (cancelling a
         // cancel is a no-op whose completion still always succeeds).
-        if sub.op != OpCode::Cancel && self.pending.consume(tag) {
+        if sub.op != OpCode::Cancel && self.pending.consume(tag, chain) {
             let status = if sub.flags.contains(SubmissionFlags::CANCELLABLE) {
                 NarfStatus::Cancelled
             } else {
@@ -552,6 +623,8 @@ impl<const N: usize> Dispatcher<N> {
             OpCode::Cancel => {
                 // §3.1: cancel always succeeds; the target's terminal
                 // completion reports the outcome separately.
+                // `request` also marks the target's whole chain so
+                // linked peers auto-cancel.
                 self.pending.request(sub.cancel_target());
                 Completion::ok(tag)
             }
@@ -572,7 +645,7 @@ impl<const N: usize> Dispatcher<N> {
     /// consumed by a matching submission. Diagnostic surface for tests
     /// and tracing; not load-bearing for dispatch semantics.
     pub fn pending_cancels(&self) -> usize {
-        let t = self.pending.tags.lock();
-        t.len()
+        let g = self.pending.inner.lock();
+        g.tags.len()
     }
 }
