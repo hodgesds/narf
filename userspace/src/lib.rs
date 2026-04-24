@@ -36,9 +36,11 @@
 
 extern crate alloc;
 
+pub mod elf;
 pub mod loader;
 pub mod syscall;
 
+pub use elf::{parse as parse_elf, ElfError};
 pub use loader::{load_into, EntryPoint, LoadError};
 pub use syscall::{Syscall, SyscallArgs, SyscallEntry, SyscallReturn, SyscallTable};
 

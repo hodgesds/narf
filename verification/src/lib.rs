@@ -5398,6 +5398,85 @@ fn smoke_userspace_loader_into_address_space() -> TestResult {
 }
 kernel_test!(smoke_userspace_loader_into_address_space);
 
+fn smoke_userspace_parse_minimal_elf64() -> TestResult {
+    use narf_userspace::{parse_elf, ElfError, ExecKind, SegmentFlags};
+
+    // Hand-crafted minimal ELF64 LE header + 1 PT_LOAD program
+    // header. 64-byte ELF header, 56-byte program header, no
+    // section table. PT_LOAD covers virt 0x400000 of 0x1000 bytes,
+    // flags RX.
+    let mut bytes = alloc::vec::Vec::with_capacity(64 + 56);
+    // e_ident: 7F 'E' 'L' 'F', class 2 (64-bit), data 1 (LSB),
+    // version 1, OS/ABI 0, abi-version 0, 7 bytes pad.
+    bytes.extend_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    bytes.extend_from_slice(&2u16.to_le_bytes());          // e_type = ET_EXEC
+    bytes.extend_from_slice(&0x3Eu16.to_le_bytes());       // e_machine = EM_X86_64 (ignored here)
+    bytes.extend_from_slice(&1u32.to_le_bytes());          // e_version
+    bytes.extend_from_slice(&0x401000u64.to_le_bytes());   // e_entry
+    bytes.extend_from_slice(&64u64.to_le_bytes());         // e_phoff
+    bytes.extend_from_slice(&0u64.to_le_bytes());          // e_shoff
+    bytes.extend_from_slice(&0u32.to_le_bytes());          // e_flags
+    bytes.extend_from_slice(&64u16.to_le_bytes());         // e_ehsize
+    bytes.extend_from_slice(&56u16.to_le_bytes());         // e_phentsize
+    bytes.extend_from_slice(&1u16.to_le_bytes());          // e_phnum
+    bytes.extend_from_slice(&0u16.to_le_bytes());          // e_shentsize
+    bytes.extend_from_slice(&0u16.to_le_bytes());          // e_shnum
+    bytes.extend_from_slice(&0u16.to_le_bytes());          // e_shstrndx
+    // Program header: PT_LOAD, flags=PF_R|PF_X (5).
+    bytes.extend_from_slice(&1u32.to_le_bytes());          // p_type = PT_LOAD
+    bytes.extend_from_slice(&5u32.to_le_bytes());          // p_flags = R|X
+    bytes.extend_from_slice(&0u64.to_le_bytes());          // p_offset
+    bytes.extend_from_slice(&0x400000u64.to_le_bytes());   // p_vaddr
+    bytes.extend_from_slice(&0x400000u64.to_le_bytes());   // p_paddr
+    bytes.extend_from_slice(&0x1000u64.to_le_bytes());     // p_filesz
+    bytes.extend_from_slice(&0x1000u64.to_le_bytes());     // p_memsz
+    bytes.extend_from_slice(&0x1000u64.to_le_bytes());     // p_align
+
+    let image = match parse_elf(&bytes) {
+        Ok(i) => i,
+        Err(_) => return TestResult::Fail("minimal ELF64 failed to parse"),
+    };
+    if image.kind != ExecKind::Elf64Exec {
+        return TestResult::Fail("ET_EXEC not mapped to Elf64Exec");
+    }
+    if image.entry != 0x401000 {
+        return TestResult::Fail("entry point mis-parsed");
+    }
+    if image.segments.len() != 1 {
+        return TestResult::Fail("segment count off");
+    }
+    let s = &image.segments[0];
+    if s.vaddr != 0x400000 || s.file_size != 0x1000 || s.mem_size != 0x1000 {
+        return TestResult::Fail("segment fields mis-parsed");
+    }
+    if !s.flags.contains(SegmentFlags::READ) || !s.flags.contains(SegmentFlags::EXEC) {
+        return TestResult::Fail("segment flags lost R|X");
+    }
+    if s.flags.contains(SegmentFlags::WRITE) {
+        return TestResult::Fail("W bit appeared spuriously");
+    }
+
+    // Refusal paths.
+    match parse_elf(&bytes[..32]) {
+        Err(ElfError::TooShort) => {}
+        _ => return TestResult::Fail("short slice should surface TooShort"),
+    }
+    let mut bad = bytes.clone();
+    bad[0] = 0;  // wreck ELF magic
+    match parse_elf(&bad) {
+        Err(ElfError::BadMagic) => {}
+        _ => return TestResult::Fail("bad magic should surface BadMagic"),
+    }
+    let mut bad32 = bytes.clone();
+    bad32[4] = 1;  // ELFCLASS32
+    match parse_elf(&bad32) {
+        Err(ElfError::Not64Bit) => {}
+        _ => return TestResult::Fail("32-bit ELF should be rejected"),
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_parse_minimal_elf64);
+
 fn smoke_userspace_syscall_table_roundtrip() -> TestResult {
     use narf_userspace::{Syscall, SyscallTable};
 
