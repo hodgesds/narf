@@ -19,8 +19,9 @@ asks for. Updated when observable kernel behaviour changes.
 - `cargo xtask run --arch=aarch64` boots, runs the full async demo
   using CNTPCT_EL0 as the clock, exits via ARM semihosting.
 - `cargo xtask test --arch=x86_64` passes **20/20** kernel tests.
-- `cargo xtask test --arch=aarch64` passes **10/10** arch-neutral
-  kernel tests (the 10 x86_64-specific ones correctly cfg-out).
+- `cargo xtask test --arch=aarch64` passes **11/11** kernel tests
+  (10 arch-neutral + `smoke_aarch64_features` for the ID-register
+  probe; x86_64-specific tests correctly cfg-out).
 
 Representative x86_64 boot transcript:
 

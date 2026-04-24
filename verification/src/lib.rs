@@ -416,6 +416,31 @@ fn smoke_nx_enforces_no_exec() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_nx_enforces_no_exec);
 
+#[cfg(target_arch = "aarch64")]
+fn smoke_aarch64_features() -> TestResult {
+    // SAFETY: MRS of ID_AA64* and CNTFRQ_EL0 is always legal at EL1.
+    let feats = unsafe { narf_arch::aarch64::Features::probe() };
+    let hz = unsafe { narf_arch::aarch64::cpuid::generic_timer_hz() };
+
+    // generic_timer = true on ARMv8+; if our probe reports false we've
+    // regressed the structural invariant.
+    if !feats.generic_timer {
+        return TestResult::Fail("generic_timer reported false");
+    }
+    // CNTFRQ must be non-zero — otherwise Instant::now would always
+    // return 0 and the scheduler's sleep path would never advance.
+    if hz == 0 {
+        return TestResult::Fail("CNTFRQ_EL0 is zero");
+    }
+    // MTE level 0..=3 is the only valid range.
+    if feats.mte > 3 {
+        return TestResult::Fail("MTE level > 3 — bogus");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test!(smoke_aarch64_features);
+
 fn smoke_domain_primitive_trait() -> TestResult {
     // The trait should be callable uniformly via `arch::Domain::*`.
     // On x86_64 it dispatches to PKS. On aarch64 the stubs panic, so
