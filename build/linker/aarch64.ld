@@ -5,7 +5,7 @@
 ENTRY(_start)
 
 KERNEL_LOAD_BASE = 0x40080000;
-KERNEL_VIRT_BASE = 0xFFFFFF8000000000;
+KERNEL_VIRT_BASE = 0xFFFFFFFF80000000;
 
 PHDRS
 {
@@ -27,7 +27,6 @@ SECTIONS
         __boot_end = .;
     } :boot
 
-    /* Boot-time page tables linked at physical address. */
     .boot.data : ALIGN(4K) {
         __boot_data_start = .;
         *(.boot.data)
