@@ -407,3 +407,67 @@ pub fn submission_channel<const N: usize>() -> (SubmissionQueue<N>, SubmissionDr
 pub fn completion_channel<const N: usize>() -> (CompletionQueue<N>, CompletionDrain<N>) {
     narf_ipc::channel::<Completion, N>()
 }
+
+// ── Dispatcher ──────────────────────────────────────────────────────
+
+/// In-kernel ABI dispatcher. Drains a submission ring and dispatches
+/// to the appropriate subsystems.
+#[derive(Debug)]
+pub struct Dispatcher<const N: usize> {
+    sq: SubmissionDrain<N>,
+    cq: CompletionQueue<N>,
+}
+
+impl<const N: usize> Dispatcher<N> {
+    /// Create a new dispatcher from a ring pair.
+    pub fn new(sq: SubmissionDrain<N>, cq: CompletionQueue<N>) -> Self {
+        Self { sq, cq }
+    }
+
+    /// Run the dispatch loop. Never returns unless the submission ring
+    /// is closed.
+    pub async fn run(&mut self) {
+        loop {
+            // 1. Receive next submission.
+            let Ok(sub) = self.sq.recv().await else {
+                // User-side dropped their SQ producer; EOF.
+                break;
+            };
+
+            // 2. Dispatch.
+            let completion = self.dispatch_one(sub).await;
+
+            // 3. Post completion.
+            // If the user-side dropped their CQ consumer, we can't
+            // deliver anymore; terminate.
+            if self.cq.send(completion).await.is_err() {
+                break;
+            }
+
+            // 4. Quiescent state: we've finished one "ABI syscall"
+            // and hold no cross-await RCU guards.
+            narf_rcu::report_quiescent();
+        }
+    }
+
+    /// Dispatch a single submission.
+    async fn dispatch_one(&mut self, sub: Submission) -> Completion {
+        let tag = sub.tag();
+
+        match sub.op {
+            OpCode::Noop => {
+                Completion::ok(tag)
+            }
+
+            OpCode::Yield => {
+                narf_scheduler::yield_now().await;
+                Completion::ok(tag)
+            }
+
+            _ => {
+                // unrecognized opcode.
+                Completion::with(tag, NarfStatus::InvalidOp, [0; 6])
+            }
+        }
+    }
+}

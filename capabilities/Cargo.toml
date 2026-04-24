@@ -13,6 +13,7 @@ path = "src/lib.rs"
 
 [dependencies]
 narf-lib = { path = "../lib" }
+narf-arch = { path = "../arch" }
 
 # Workspace-internal: once Wave 3 RCU-backs the object table, narf-rcu
 # moves here. Wave 2 uses an IrqSafeSpinLock over a Vec, which is

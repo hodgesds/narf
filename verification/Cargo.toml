@@ -12,13 +12,10 @@ name = "narf_verification"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib        = { path = "../lib" }
-narf-arch       = { path = "../arch" }
-narf-console    = { path = "../console" }
-narf-memory     = { path = "../memory" }
-narf-time       = { path = "../time" }
-narf-scheduler  = { path = "../scheduler" }
-narf-interrupts = { path = "../interrupts" }
+narf-lib         = { path = "../lib" }
+narf-arch        = { path = "../arch" }
+narf-memory      = { path = "../memory" }
+narf-scheduler   = { path = "../scheduler" }
 narf-capabilities = { path = "../capabilities" }
 narf-tracing    = { path = "../tracing" }
 narf-bus        = { path = "../bus" }
@@ -29,6 +26,10 @@ narf-abi        = { path = "../abi" }
 narf-io         = { path = "../io" }
 narf-drivers    = { path = "../drivers" }
 narf-drivers-virtio = { path = "../drivers/virtio" }
+narf-block      = { path = "../block" }
+narf-console    = { path = "../console" }
+narf-interrupts = { path = "../interrupts" }
+narf-time       = { path = "../time" }
 
 [lints]
 workspace = true

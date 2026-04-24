@@ -128,6 +128,8 @@ version = "0.0.0"
 dependencies = [
  "narf-capabilities",
  "narf-ipc",
+ "narf-rcu",
+ "narf-scheduler",
 ]
 
 [[package]]
@@ -135,6 +137,19 @@ name = "narf-arch"
 version = "0.0.0"
 dependencies = [
  "narf-lib",
+]
+
+[[package]]
+name = "narf-block"
+version = "0.0.0"
+dependencies = [
+ "narf-capabilities",
+ "narf-io",
+ "narf-ipc",
+ "narf-lib",
+ "narf-scheduler",
+ "narf-time",
+ "narf-tracing",
 ]
 
 [[package]]
@@ -158,6 +173,7 @@ dependencies = [
 name = "narf-capabilities"
 version = "0.0.0"
 dependencies = [
+ "narf-arch",
  "narf-lib",
 ]
 
@@ -182,9 +198,12 @@ dependencies = [
 name = "narf-drivers-virtio"
 version = "0.0.0"
 dependencies = [
+ "narf-block",
  "narf-bus",
  "narf-capabilities",
  "narf-drivers",
+ "narf-io",
+ "narf-ipc",
  "narf-lib",
  "narf-memory",
 ]
@@ -279,6 +298,7 @@ version = "0.0.0"
 dependencies = [
  "narf-abi",
  "narf-arch",
+ "narf-block",
  "narf-boot",
  "narf-bus",
  "narf-capabilities",

@@ -1,0 +1,19 @@
+[package]
+name = "narf-block"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "NARF block device abstraction"
+
+[dependencies]
+narf-lib = { path = "../lib" }
+narf-capabilities = { path = "../capabilities" }
+narf-io = { path = "../io" }
+narf-ipc = { path = "../ipc" }
+narf-time = { path = "../time" }
+narf-tracing = { path = "../tracing" }
+narf-scheduler = { path = "../scheduler" }
+
+[lints]
+workspace = true

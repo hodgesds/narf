@@ -23,6 +23,7 @@ members = [
     "io",
     "drivers",
     "drivers/virtio",
+    "block",
 ]
 
 [workspace.package]
