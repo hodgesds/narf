@@ -158,13 +158,13 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
     Ok(out)
 }
 
+use std::time::Duration;
+use wait_timeout::ChildExt;
+
 fn run_cmd(args: &BuildArgs) -> Result<()> {
     let root = workspace_root()?;
     let out_dir = cargo_build(args, &root)?;
 
-    // Cargo names kernel binaries the same as the [[bin]] `name` field in
-    // the crate's Cargo.toml. For narf-frame that's `narf-frame`, no .elf
-    // extension.
     let kernel = out_dir.join(&args.package);
     if !kernel.exists() {
         bail!("expected kernel binary at {} — did `cargo build` succeed?",
@@ -174,13 +174,24 @@ fn run_cmd(args: &BuildArgs) -> Result<()> {
     let qemu = args.arch.qemu_bin();
     let mut cmd = Command::new(qemu);
     cmd.args(args.arch.qemu_args(&kernel));
+    
     println!("xtask: launching {} {}", qemu, kernel.display());
-    let status = cmd.status()
-        .with_context(|| format!("failed to invoke {qemu} — is it installed?"))?;
-    // QEMU exits non-zero for many legitimate reasons (reset/shutdown via
-    // the debug-exit device, Ctrl-A x). Treat any exit as "ran"; caller
-    // inspects serial output for pass/fail.
-    println!("xtask: {qemu} exited with {status}");
+    
+    let mut child = cmd.spawn()
+        .with_context(|| format!("failed to spawn {qemu}"))?;
+
+    // Wait for up to 15 seconds. If the kernel hasn't finished the
+    // exit-gate demo by then, it's likely hung.
+    match child.wait_timeout(Duration::from_secs(15))? {
+        Some(status) => {
+            println!("xtask: {qemu} exited with {status}");
+        }
+        None => {
+            child.kill()?;
+            child.wait()?;
+            bail!("xtask: {qemu} timed out after 15s (possible kernel hang)");
+        }
+    }
     Ok(())
 }
 

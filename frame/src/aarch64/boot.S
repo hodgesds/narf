@@ -14,78 +14,121 @@ _start:
     add  x0, x0, #:lo12:stack_top
     mov  sp, x0
 
-    /* ─── Build temporary 3-level page tables ─── */
-    adrp x0, l1_lo
-    add  x0, x0, #:lo12:l1_lo
+    /* --- Build temporary 4-level page tables ---
+     * lo_L0 -> lo_L1 -> Blocks
+     * hi_L0 -> hi_L1 -> Blocks
+     */
+    adrp x0, l0_lo
+    add  x0, x0, #:lo12:l0_lo
     mov  x1, #0
 1:  str  xzr, [x0, x1]
     add  x1, x1, #8
-    cmp  x1, #8192      /* Two 4KB tables */
+    cmp  x1, #(4096 * 4)    /* lo_L0, lo_L1, hi_L0, hi_L1 */
     b.ne 1b
 
-    /* L1_lo (Identity) */
-    mov  x1, #0x401     /* Valid | AF | SH_Inner | Attr0(Device) | 0x0 */
-    str  x1, [x0, #0]   
-    mov  x1, #0x404     /* Valid | AF | SH_Inner | Attr1(Normal) | 0x4000_0000 */
+    /* lo_L0[0] -> lo_L1 */
+    adrp x0, l0_lo
+    add  x0, x0, #:lo12:l0_lo
+    add  x1, x0, #4096      /* x1 = &lo_L1 */
+    mov  x2, #0x3           /* Table descriptor */
+    orr  x1, x1, x2
+    str  x1, [x0, #0]
+    
+    /* lo_L1[0] = 0x0 (Device: AttrIndx=0), lo_L1[1] = 0x4000_0000 (Normal: AttrIndx=1)
+     *
+     * Block descriptor bits:
+     *   [1:0] = 01  (valid block)
+     *   [4:2] = AttrIndx (0=Device, 1=Normal, per MAIR_EL1 below)
+     *   [10]  = AF  (access flag — else fault on first access)
+     *
+     * 0x401 = bit 0 + bit 10              → valid, AttrIndx=0 (Device)
+     * 0x405 = bit 0 + bit 2 + bit 10      → valid, AttrIndx=1 (Normal)
+     * (earlier 0x404 had bit 0 CLEAR = INVALID, causing translation
+     * fault on first post-MMU instruction fetch at PA 0x40080000.)
+     */
+    add  x0, x0, #4096      /* x0 = &lo_L1 */
+    mov  x1, #0x401         /* valid block, AttrIndx=0 (Device), PA 0x0 */
+    str  x1, [x0, #0]
+    mov  x1, #0x405         /* valid block, AttrIndx=1 (Normal), PA 0x4000_0000 */
     movk x1, #0x4000, lsl #16
     str  x1, [x0, #8]
 
-    /* L1_hi (Higher-half @ -2 GiB / 0xFFFFFFFF80000000)
-     * Index 510 in 39-bit VA space.
-     * Maps to physical RAM base 0x4000_0000.
-     */
-    adrp x0, l1_hi
-    add  x0, x0, #:lo12:l1_hi
-    mov  x1, #0x404
+    /* hi_L0[511] -> hi_L1 */
+    adrp x0, l0_hi
+    add  x0, x0, #:lo12:l0_hi
+    add  x1, x0, #4096      /* x1 = &hi_L1 */
+    mov  x2, #0x3
+    orr  x1, x1, x2
+    str  x1, [x0, #(511 * 8)]
+    
+    /* hi_L1[1] = 0x4000_0000 (Normal RAM, virt 0xFFFFFF80_40000000)
+     *
+     * VA 0xFFFFFF80_40080000 decomposes (T1SZ=16, 4 KiB granule) as
+     *   bits 47-39 = 511 (L0 index, == hi_L0[511] above)
+     *   bits 38-30 = 1   (L1 index, THIS slot)
+     *   ...
+     * The earlier #(510 * 8) was a copy-paste of x86_64's PDPT[510]
+     * convention; aarch64 with this KERNEL_VIRT_BASE wants L1[1],
+     * and 510 GiB past the L0 base overflows T1SZ entirely. */
+    add  x0, x0, #4096      /* x0 = &hi_L1 */
+    mov  x1, #0x405
     movk x1, #0x4000, lsl #16
-    str  x1, [x0, #(510 * 8)]
+    str  x1, [x0, #(1 * 8)]
 
-    /* MAIR_EL1 */
-    mov  x0, #0x04FF
+    dsb sy
+
+    /* MAIR_EL1: Attr0 = Device nGnRE (0x04), Attr1 = Normal WB (0xFF).
+     *
+     * The bytes are low-to-high: bits[7:0]=Attr0, bits[15:8]=Attr1.
+     * Encoding 0xFF04 gives Attr0=0x04=Device, Attr1=0xFF=Normal —
+     * matching the AttrIndx values in the block descriptors above.
+     * (Earlier 0x04FF had them swapped, causing the RAM region to be
+     * mapped as Device memory, which breaks instruction-fetch ordering
+     * on modern cores.)
+     */
+    mov  x0, #0xFF04
     msr  mair_el1, x0
 
-    /* TCR_EL1: T0SZ=25, T1SZ=25, TG1=4KB, SH=Inner, ORGN/IRGN=WB */
-    mov  x0, #25
-    mov  x1, #25
-    orr  x0, x0, x1, lsl #16
-    mov  x1, #3
-    orr  x0, x0, x1, lsl #12
-    orr  x0, x0, x1, lsl #28
-    mov  x1, #1
-    orr  x0, x0, x1, lsl #10
-    orr  x0, x0, x1, lsl #26
-    orr  x0, x0, x1, lsl #8
-    orr  x0, x0, x1, lsl #24
+    /* TCR_EL1: 48-bit VA, TG=4KB */
+    mov  x0, #16
+    orr  x0, x0, #(16 << 16)    /* T0SZ | T1SZ */
+    orr  x0, x0, #(3 << 12)     /* SH0 */
+    orr  x0, x0, #(3 << 28)     /* SH1 */
+    orr  x0, x0, #(1 << 10)     /* ORGN0 */
+    orr  x0, x0, #(1 << 26)     /* ORGN1 */
+    orr  x0, x0, #(1 << 8)      /* IRGN0 */
+    orr  x0, x0, #(1 << 24)     /* IRGN1 */
+    orr  x0, x0, #(2 << 30)     /* TG1=4KB */
     mov  x1, #2
-    orr  x0, x0, x1, lsl #30
-    mov  x1, #2
-    orr  x0, x0, x1, lsl #32
+    orr  x0, x0, x1, lsl #32    /* IPS=40-bit */
     msr  tcr_el1, x0
     isb
 
-    adrp x0, l1_lo
-    add  x0, x0, #:lo12:l1_lo
+    /* TTBR0/1 */
+    adrp x0, l0_lo
+    add  x0, x0, #:lo12:l0_lo
     msr  ttbr0_el1, x0
-    adrp x0, l1_hi
-    add  x0, x0, #:lo12:l1_hi
+    adrp x0, l0_hi
+    add  x0, x0, #:lo12:l0_hi
     msr  ttbr1_el1, x0
+    
+    ic   ialluis
+    dsb  sy
     isb
 
+    /* Enable MMU */
     mrs  x0, sctlr_el1
-    orr  x0, x0, #0x1
-    orr  x0, x0, #0x4
-    orr  x0, x0, #0x1000
+    orr  x0, x0, #0x1           /* M=1 */
+    orr  x0, x0, #0x1000        /* I=1 */
     msr  sctlr_el1, x0
+    dsb  sy
     isb
 
-    /* Jump to Virtual. */
-    ldr  x0, =_start_rust_virtual
+    /* Jump to Virtual */
+    ldr  x0, =_start_rust_entry
     br   x0
 
-_start_rust_virtual:
-    /* Stack update: physical to virtual. Add 0xFFFFFFFF80000000 - 0x40000000 offset.
-     * Actually, just reload it via high virtual address.
-     */
+_start_rust_entry:
     ldr  x0, =stack_top
     mov  sp, x0
 
@@ -100,10 +143,15 @@ _start_rust_virtual:
 
 .section .boot.data, "aw"
 .align 12
+l0_lo:
+    .skip 4096
 l1_lo:
+    .skip 4096
+l0_hi:
     .skip 4096
 l1_hi:
     .skip 4096
+
 .align 4
 stack_bottom:
     .skip 4096 * 16

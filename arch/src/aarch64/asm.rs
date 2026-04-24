@@ -41,14 +41,39 @@ pub fn halt_forever() -> ! {
     }
 }
 
+/// Read DAIF — the A/I/F/D interrupt-mask flags (bits 6-9).
+#[inline(always)]
+pub fn read_daif() -> u64 {
+    let v: u64;
+    // SAFETY: MRS DAIF is always legal at EL1.
+    unsafe {
+        core::arch::asm!("mrs {v}, daif", v = out(reg) v,
+                         options(nomem, nostack, preserves_flags));
+    }
+    v
+}
+
+/// True iff IRQs are currently enabled (DAIF.I == 0, bit 7 clear).
+#[inline(always)]
+pub fn interrupts_enabled() -> bool {
+    read_daif() & (1 << 7) == 0
+}
+
 /// Wait for an interrupt.
 ///
-/// WFI wakes on any IRQ (including masked ones if `WFIT` semantics
-/// apply), and the generic-timer PPI via GICv3 is now a live source
-/// after `narf_interrupts::aarch64::init_bsp` + `start_timer` at boot.
+/// Uses WFI only when IRQs are unmasked AND a wake source is live
+/// (the generic-timer PPI, enabled by `interrupts/aarch64/timer.rs`).
+/// If IRQs are masked (e.g. during the kernel-test harness which
+/// runs synchronously without starting the timer), falls back to
+/// `spin_loop` — WFI with no IRQ source would hang forever.
 #[inline(always)]
 pub fn halt_until_irq() {
-    // SAFETY: WFI at EL1 is always safe; it stalls the CPU until a
-    // wake condition (IRQ / FIQ / SError / WFI-wake event).
-    unsafe { wfi_once(); }
+    if interrupts_enabled() {
+        // SAFETY: WFI at EL1 is always safe; it stalls the CPU until
+        // a wake condition. With DAIF.I=0 and the GIC delivering the
+        // generic-timer PPI, the wake fires on each IRQ.
+        unsafe { wfi_once(); }
+    } else {
+        core::hint::spin_loop();
+    }
 }
