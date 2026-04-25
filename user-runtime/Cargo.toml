@@ -1,0 +1,22 @@
+[package]
+name         = "narf-user-runtime"
+description  = "User-side typed SDK for NARF syscalls: int-0x80 / svc-0 wrappers, BootstrapHeader, console writers."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_user_runtime"
+path = "src/lib.rs"
+
+# No dependencies on kernel-side crates — this is a user-side SDK
+# that must build cleanly for `*-unknown-none` targets without
+# pulling in narf-userspace, narf-frame, narf-arch, narf-abi, etc.
+# Wire-stable types (BootstrapHeader, Submission/Completion shape)
+# are mirrored by hand and noted to keep in sync.
+[dependencies]
+
+[lints]
+workspace = true

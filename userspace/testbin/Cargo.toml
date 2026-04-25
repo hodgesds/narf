@@ -10,6 +10,9 @@ license      = "MPL-2.0"
 name = "narf-testbin"
 path = "src/main.rs"
 
+[dependencies]
+narf-user-runtime = { path = "../../user-runtime" }
+
 # Explicitly disclaim the outer workspace so this crate's own
 # release profile + linker script apply (the kernel workspace's
 # fat-LTO settings and `code-model=kernel` are wrong for user code).

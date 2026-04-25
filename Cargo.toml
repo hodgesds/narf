@@ -30,6 +30,7 @@ members = [
     "power",
     "observability",
     "userspace",
+    "user-runtime",
     "drivers/nvme",
     "drivers/net",
     "drivers/gpu",

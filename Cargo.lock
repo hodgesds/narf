@@ -638,6 +638,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-user-runtime"
+version = "0.0.0"
+
+[[package]]
 name = "narf-userspace"
 version = "0.0.0"
 dependencies = [

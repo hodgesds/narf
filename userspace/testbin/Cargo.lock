@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "narf-testbin"
 version = "0.0.0"
+dependencies = [
+ "narf-user-runtime",
+]
+
+[[package]]
+name = "narf-user-runtime"
+version = "0.0.0"
