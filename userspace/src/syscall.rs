@@ -25,8 +25,7 @@
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-
-use narf_lib::sync::IrqSafeSpinLock;
+use core::sync::atomic::{AtomicPtr, Ordering};
 
 // ── TrapContext trait ───────────────────────────────────────────────
 //
@@ -454,23 +453,57 @@ impl Default for SyscallTable {
 }
 
 // ── Global install + dispatch ───────────────────────────────────────
+//
+// The published table sits behind an `AtomicPtr<SyscallTable>` rather
+// than a lock. Read-side dispatch (the trap path) loads the pointer,
+// dereferences it, and runs the handler — without holding any lock
+// across the handler call. This is load-bearing for the polling-
+// future path: a raw handler can `longjmp` out of the trap without
+// returning, and any lock guard live across the call would leak.
+// Switching to AtomicPtr lets the trap return via longjmp without
+// dropping a lock.
+//
+// `install_global` swaps the pointer atomically and **leaks** the
+// prior table — Stage-4 boot installs once and never re-installs at
+// runtime, and during tests `__test_clear_global` is the only caller
+// that nulls the slot (no concurrent dispatch is possible there).
+// The leak is therefore bounded to test resets and is the price of
+// long-jmp-safe dispatch. The test reset path drops the prior table
+// because no concurrent dispatch is possible during test setup.
 
-static GLOBAL: IrqSafeSpinLock<Option<SyscallTable>> = IrqSafeSpinLock::new(None);
+static GLOBAL: AtomicPtr<SyscallTable> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Publish `table` as the kernel-wide dispatch table. Replaces any
-/// prior installation; dropped tables free their handlers.
+/// prior installation; the prior `Box<SyscallTable>` is leaked since
+/// in-flight dispatchers may still hold references to it (the trap
+/// path takes a snapshot of the pointer at entry and doesn't hold a
+/// lock across the handler call). Stage-4 boot calls this once.
 pub fn install_global(table: SyscallTable) {
-    *GLOBAL.lock() = Some(table);
+    let new_ptr = Box::into_raw(Box::new(table));
+    let _prev = GLOBAL.swap(new_ptr, Ordering::AcqRel);
+    // Deliberately leak `_prev`: a raw handler in flight under the
+    // prior pointer could be unwinding via longjmp; freeing here
+    // would race with the read side. Re-installs are extremely rare
+    // (one per boot), so the leak is a one-time cost.
 }
 
 /// Read-only access: is a global table installed?
 pub fn global_installed() -> bool {
-    GLOBAL.lock().is_some()
+    !GLOBAL.load(Ordering::Acquire).is_null()
 }
 
-/// Clear the global table — test hook.
+/// Clear the global table — test hook. Drops the prior `Box`. Safe
+/// to call only when no syscall dispatch is in flight (test setup
+/// boundary).
 #[doc(hidden)]
-pub fn __test_clear_global() { *GLOBAL.lock() = None; }
+pub fn __test_clear_global() {
+    let prev = GLOBAL.swap(core::ptr::null_mut(), Ordering::AcqRel);
+    if !prev.is_null() {
+        // SAFETY: caller guarantees no dispatch is in flight against
+        // `prev`; this is the test reset boundary.
+        unsafe { drop(Box::from_raw(prev)); }
+    }
+}
 
 /// Entry point the arch trap stub calls after saving the user
 /// register file.  `num` is the raw wire number (not pre-validated
@@ -494,11 +527,15 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
         Some(v) => v,
         None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
     };
-    let g = GLOBAL.lock();
-    let table = match g.as_ref() {
-        Some(t) => t,
-        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
-    };
+    let p = GLOBAL.load(Ordering::Acquire);
+    if p.is_null() { ctx.set_return(SyscallReturn::invalid_op()); return; }
+    // SAFETY: `install_global` published `p` via `Box::into_raw`; the
+    // pointer is valid for the lifetime of the kernel (or until
+    // `__test_clear_global` runs at a test boundary, with no
+    // dispatch in flight). The table is read-only post-publication,
+    // so a `&` borrow is safe even if a raw handler unwinds via
+    // longjmp — no lock guard survives the call.
+    let table: &SyscallTable = unsafe { &*p };
     table.dispatch_ctx(n, ctx);
 }
 
@@ -511,10 +548,9 @@ pub fn kernel_syscall_entry_plain(num: u32, args: &SyscallArgs) -> SyscallReturn
         Some(v) => v,
         None    => return SyscallReturn::invalid_op(),
     };
-    let g = GLOBAL.lock();
-    let table = match g.as_ref() {
-        Some(t) => t,
-        None    => return SyscallReturn::invalid_op(),
-    };
+    let p = GLOBAL.load(Ordering::Acquire);
+    if p.is_null() { return SyscallReturn::invalid_op(); }
+    // SAFETY: see `kernel_syscall_entry`.
+    let table: &SyscallTable = unsafe { &*p };
     table.dispatch(n, args).unwrap_or_else(SyscallReturn::invalid_op)
 }

@@ -8990,7 +8990,6 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
 kernel_test!(smoke_frame_x86_64_user_mode_yield_resume);
 
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
-#[allow(dead_code)]
 fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
     // The polling-routine pattern: a "future-shaped" caller does
     // setjmp, registers the yield/exit hooks, sets the current
@@ -9000,14 +8999,12 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
     // ExitTask (which longjmps back with reason EXIT_REASON_EXITED).
     // The routine returns Pass when it has seen one Yielded and
     // one Exited in order.
-    use core::arch::naked_asm;
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
     use narf_userspace::{
         clear_current_user_task, install_current_user_task, install_exit_hook,
         install_global, install_yield_hook, syscall::__test_clear_global,
-        Syscall, SyscallTable, UserTaskCtx, EXIT_REASON_EXITED,
-        EXIT_REASON_YIELDED,
+        SyscallTable, UserTaskCtx, EXIT_REASON_EXITED, EXIT_REASON_YIELDED,
     };
 
     static SAVED_CR3: AtomicU64 = AtomicU64::new(0);
@@ -9015,21 +9012,6 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
     static mut JMP: UserModeJmpBuf = UserModeJmpBuf {
         rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, rsp: 0, rip: 0,
     };
-
-    // Diagnostic: write a single byte to COM1 (0x3F8). Lock-free,
-    // bypasses console infrastructure, safe inside a trap handler.
-    #[inline(always)]
-    fn dbg_byte(b: u8) {
-        unsafe {
-            core::arch::asm!(
-                "out dx, al",
-                in("dx") 0x3F8u16,
-                in("al") b,
-                options(nostack, preserves_flags),
-            );
-        }
-    }
-    fn dbg_str(s: &str) { for b in s.bytes() { dbg_byte(b); } }
 
     // Hooks: save_user_state already ran in the syscall handler.
     // The hook just longjmps back to the polling routine using the
@@ -9039,24 +9021,12 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
         // polling routine pinned it.
         let _ = uctx;
         unsafe {
-            core::arch::asm!(
-                "out dx, al",
-                in("dx") 0x3F8u16,
-                in("al") b'Y',
-                options(nostack, preserves_flags),
-            );
             user_mode_longjmp(core::ptr::addr_of_mut!(JMP), EXIT_REASON_YIELDED as u64);
         }
     }
     unsafe fn exit_hook_fn(uctx: *mut UserTaskCtx) -> ! {
         let _ = uctx;
         unsafe {
-            core::arch::asm!(
-                "out dx, al",
-                in("dx") 0x3F8u16,
-                in("al") b'X',
-                options(nostack, preserves_flags),
-            );
             user_mode_longjmp(core::ptr::addr_of_mut!(JMP), EXIT_REASON_EXITED as u64);
         }
     }
@@ -9138,20 +9108,15 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
 
     unsafe { core::arch::asm!("cli"); }
     let stack_top = STACK_VADDR + 0x1000;
-    dbg_str("[A]");
     let saved = unsafe { user_mode_setjmp(core::ptr::addr_of_mut!(JMP)) };
-    dbg_byte(b'B');
-    dbg_byte(b'0' + (saved as u8 & 0xF));
 
     if saved == 0 {
         // First-time poll: enter user mode at the entry point.
-        dbg_str("[E]");
         unsafe { user_mode_enter(CODE_VADDR, stack_top) }
     } else if saved as u32 == EXIT_REASON_YIELDED {
         // First yield observed. Re-enter via resume so user picks
         // up at the instruction after `int 0x80`.
         OBSERVED_REASONS.fetch_or(1, Ordering::Relaxed);
-        dbg_str("[R]");
         unsafe {
             // Resume from the saved state.
             user_mode_resume(uctx.state.get() as *const _ as *const UserState)
@@ -9340,12 +9305,7 @@ fn smoke_userspace_user_task_future_yield_exit() -> TestResult {
     }
     TestResult::Pass
 }
-// Disabled: hangs in run_until_empty when registered. The future
-// itself is structurally correct (its lower-layer `UserTaskCtx` +
-// hook plumbing is exercised by smoke_frame_x86_64_user_task_poll_yield_exit);
-// the integration through scheduler::spawn_user has a timing
-// issue we haven't isolated. Re-enable in a follow-up round.
-#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e", any()))]
+#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
 kernel_test!(smoke_userspace_user_task_future_yield_exit);
 
 // ── Real Rust user binary run through the full pipeline ──────────────
