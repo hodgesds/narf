@@ -133,6 +133,27 @@ pub enum Syscall {
     /// Close file `arg0`.
     Close        = 113,
 
+    // ── Tier-2 fd-table breadth + VFS path resolution + pipe(2) ────
+    //
+    // Slots 114..=117 are reserved for the second wave of POSIX-shaped
+    // fd surface that lands alongside `Open`'s absolute-path support.
+    // Co-agent C uses disjoint numbers for cwd / signal / sleep work;
+    // do not re-use these here without coordination.
+
+    /// Stat by absolute path. `arg0 = path_ptr, arg1 = path_len,
+    /// arg2 = stat_out_ptr`. Writes a NARF [`StatBuf`] (see
+    /// `handlers::StatBuf`) to `*stat_out_ptr`. Returns 0 on success.
+    Stat         = 115,
+
+    /// Stat by fd. `arg0 = fd, arg1 = stat_out_ptr`. Same shape as
+    /// [`Stat`] otherwise.
+    Fstat        = 116,
+
+    /// Create a pipe pair. `arg0 = pipefd_out_ptr` — kernel writes
+    /// two `i32`s (read fd, write fd) to that pointer. Returns 0
+    /// on success.
+    Pipe         = 117,
+
     /// Map memory: `arg0` addr hint, `arg1` length, `arg2` flags.
     Mmap         = 120,
 
@@ -193,6 +214,52 @@ pub enum Syscall {
     /// `arg1 = set` (32-bit bitmap). Returns the **previous**
     /// mask in the syscall return value.
     Sigprocmask  = 154,
+
+    // ── Dup family + fcntl ────────────────────────────────────────
+    //
+    // Slots 160..=163 are the second-wave fd-control surface real
+    // libc programs reach for. POSIX `dup`/`dup2`/`dup3`/`fcntl`.
+    // Numbers chosen above the signal block (152..=154) so signal
+    // and dup work can land independently without renumbering.
+
+    /// Duplicate `arg0 = oldfd` into the lowest free slot ≥ 3.
+    /// Returns the new fd in the syscall return value.
+    Dup          = 160,
+
+    /// Duplicate `arg0 = oldfd` to `arg1 = newfd`. Closes `newfd`
+    /// first if it's open. Returns `newfd`.
+    Dup2         = 161,
+
+    /// Like `Dup2` but `arg2 = flags` controls `FD_CLOEXEC` on the
+    /// duplicate. `dup3(fd, fd, 0)` is an error (per Linux); use
+    /// `Dup2` for the same-fd no-op.
+    Dup3         = 162,
+
+    /// `arg0 = fd, arg1 = cmd, arg2 = arg`. Supported commands:
+    /// F_GETFD / F_SETFD / F_GETFL / F_SETFL.
+    Fcntl        = 163,
+
+    // ── Working-directory state ────────────────────────────────────
+    //
+    // Slots 170/171 sit above the dup family (160..=163) so the cwd
+    // and fd-control surfaces evolve independently without colliding.
+
+    /// Update the calling task's current working directory.
+    /// `arg0 = path_ptr`, `arg1 = path_len`. Stage-4 first cut:
+    /// absolute paths only (path must start with `/`); relative-
+    /// path support lands alongside the `*at(2)` family. Path text
+    /// is required to be valid UTF-8. Returns 0 on success,
+    /// `InvalidOp` on malformed input.
+    Chdir        = 170,
+
+    /// Copy the calling task's current working directory into the
+    /// caller's buffer. `arg0 = buf_ptr`, `arg1 = buf_len`. The
+    /// kernel writes a NUL-terminated UTF-8 string; the return
+    /// value is the byte length **excluding** the terminator. If
+    /// `buf_len < cwd.len() + 1` the call returns `InvalidOp` —
+    /// a real libc translates that to ERANGE; the syscall return
+    /// shape doesn't yet carry an errno channel.
+    Getcwd       = 171,
 }
 
 impl Syscall {
@@ -213,6 +280,9 @@ impl Syscall {
             111 => Syscall::Read,
             112 => Syscall::Write,
             113 => Syscall::Close,
+            115 => Syscall::Stat,
+            116 => Syscall::Fstat,
+            117 => Syscall::Pipe,
             120 => Syscall::Mmap,
             121 => Syscall::Munmap,
             130 => Syscall::RingKick,
@@ -225,6 +295,12 @@ impl Syscall {
             152 => Syscall::Sigaction,
             153 => Syscall::Kill,
             154 => Syscall::Sigprocmask,
+            160 => Syscall::Dup,
+            161 => Syscall::Dup2,
+            162 => Syscall::Dup3,
+            163 => Syscall::Fcntl,
+            170 => Syscall::Chdir,
+            171 => Syscall::Getcwd,
             _   => return None,
         })
     }

@@ -6607,6 +6607,259 @@ fn smoke_userspace_signal_delivery() -> TestResult {
 #[cfg(not(feature = "user-mode-e2e"))]
 kernel_test!(smoke_userspace_signal_delivery);
 
+fn smoke_userspace_chdir_getcwd_round_trip() -> TestResult {
+    // Verify the per-task cwd state round-trips through Chdir +
+    // Getcwd. Drive both through the synthetic TrapContext path so
+    // we exercise install_core_syscalls' slot wiring as well as
+    // the handler bodies.
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_userspace::{
+        cwd_of, install_core_syscalls, install_global,
+        install_task_id_lookup, kernel_syscall_entry,
+        syscall::__test_clear_global, Syscall, SyscallArgs,
+        SyscallReturn, SyscallTable, TrapContext,
+    };
+
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0xCDD0);
+    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    install_task_id_lookup(task_lookup);
+
+    narf_userspace::handlers::__test_cwd_reset();
+    narf_userspace::cwd_init();
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    // Default cwd should be `/` even before any Chdir call.
+    if cwd_of(FAKE_TASK.load(Ordering::Relaxed)).as_str() != "/" {
+        __test_clear_global();
+        narf_userspace::handlers::__test_cwd_reset();
+        return TestResult::Fail("default cwd was not /");
+    }
+
+    // Chdir("/foo")
+    let target: &str = "/foo";
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: target.as_ptr() as u64,
+            arg1: target.len() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Chdir.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
+        __test_clear_global();
+        narf_userspace::handlers::__test_cwd_reset();
+        return TestResult::Fail("Chdir(/foo) did not Ok");
+    }
+
+    // Getcwd into a 16-byte buffer; expect length 4 and `/foo\0`.
+    let mut buf = [0u8; 16];
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: buf.as_mut_ptr() as u64,
+            arg1: buf.len() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Getcwd.raw(), &mut ctx);
+    let len_ok = matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 4);
+    let bytes_ok = &buf[..5] == b"/foo\0";
+
+    // Buffer-too-small path: a 3-byte buf can't fit `/foo\0`. The
+    // handler must surface InvalidOp without writing past the buf.
+    let mut tiny = [0u8; 3];
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: tiny.as_mut_ptr() as u64,
+            arg1: tiny.len() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Getcwd.raw(), &mut ctx);
+    let small_invalid = matches!(ctx.ret, Some(r) if r.status == SyscallReturn::INVALID_OP);
+
+    // Relative path rejected (Stage-4 first cut: absolute paths only).
+    let bad: &str = "relative";
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: bad.as_ptr() as u64,
+            arg1: bad.len() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Chdir.raw(), &mut ctx);
+    let rel_rejected = matches!(ctx.ret, Some(r) if r.status == SyscallReturn::INVALID_OP);
+
+    __test_clear_global();
+    narf_userspace::handlers::__test_cwd_reset();
+
+    if !len_ok      { return TestResult::Fail("Getcwd did not return length 4"); }
+    if !bytes_ok    { return TestResult::Fail("Getcwd buffer did not match `/foo\\0`"); }
+    if !small_invalid { return TestResult::Fail("Getcwd with too-small buf did not surface InvalidOp"); }
+    if !rel_rejected { return TestResult::Fail("Chdir(relative) did not surface InvalidOp"); }
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_chdir_getcwd_round_trip);
+
+fn smoke_userspace_sleep_advances_time() -> TestResult {
+    // Drive sys_sleep with 50 ms; assert monotonic_ns advanced by
+    // at least that amount. The handler spin-waits in trap context
+    // (see `sys_sleep`'s docstring) so we measure a real wall-time
+    // advance, not a scheduler-driven sleep.
+    use narf_userspace::{
+        install_core_syscalls, install_global,
+        kernel_syscall_entry, syscall::__test_clear_global, Syscall,
+        SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    const TARGET_NS: u64 = 50_000_000; // 50 ms
+
+    let before = narf_scheduler::narf_time::monotonic_ns();
+    let mut ctx = FakeCtx {
+        args: SyscallArgs { arg0: TARGET_NS, ..SyscallArgs::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Sleep.raw(), &mut ctx);
+    let after = narf_scheduler::narf_time::monotonic_ns();
+
+    __test_clear_global();
+
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
+        return TestResult::Fail("Sleep did not Ok");
+    }
+    let elapsed = after.saturating_sub(before);
+    if elapsed < TARGET_NS {
+        return TestResult::Fail("Sleep returned before deadline");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_sleep_advances_time);
+
+fn smoke_userspace_synchronous_signal_delivery() -> TestResult {
+    // Register a SIGSEGV handler via sys_sigaction, then run the
+    // synchronous-signal hook with vector=14 (#PF) and confirm the
+    // FakeCtx's `deliver_signal` was invoked with the registered
+    // handler + signum=11. The test exercises the hook path the
+    // x86_64 trap dispatcher takes for user-mode CPU exceptions.
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_userspace::{
+        default_sync_signal_delivery, install_core_syscalls,
+        install_global, install_task_id_lookup, kernel_syscall_entry,
+        syscall::__test_clear_global, Syscall, SyscallArgs,
+        SyscallReturn, SyscallTable, TrapContext,
+    };
+
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0x5E64);
+    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    install_task_id_lookup(task_lookup);
+
+    narf_userspace::handlers::__test_sigaction_reset();
+    narf_userspace::sigaction_init();
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx {
+        args:      SyscallArgs,
+        ret:       Option<SyscallReturn>,
+        delivered: Option<(u64, u32)>,
+    }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn deliver_signal(&mut self, h: u64, s: u32) -> bool {
+            self.delivered = Some((h, s));
+            true
+        }
+    }
+
+    // Register handler 0xC0DE_F00D for signum 11 (SIGSEGV).
+    let mut old: u64 = 0;
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 11,
+            arg1: 0xC0DE_F00D,
+            arg2: &mut old as *mut u64 as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+        delivered: None,
+    };
+    kernel_syscall_entry(Syscall::Sigaction.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
+        __test_clear_global();
+        narf_userspace::handlers::__test_sigaction_reset();
+        return TestResult::Fail("Sigaction registration did not Ok");
+    }
+
+    // Run the sync-signal hook with vector 14 (#PF). The hook
+    // should map vector→SIGSEGV (=11), look up handler 0xC0DE_F00D,
+    // and call FakeCtx::deliver_signal with that pair.
+    let mut ctx = FakeCtx {
+        args:      SyscallArgs::default(),
+        ret:       None,
+        delivered: None,
+    };
+    let rewrote = default_sync_signal_delivery(&mut ctx, 14);
+    let delivered = ctx.delivered;
+
+    // Mapping-less vector should return false without touching
+    // deliver_signal.
+    let mut ctx2 = FakeCtx {
+        args:      SyscallArgs::default(),
+        ret:       None,
+        delivered: None,
+    };
+    let rewrote_unknown = default_sync_signal_delivery(&mut ctx2, 1);
+    let unknown_delivered = ctx2.delivered;
+
+    __test_clear_global();
+    narf_userspace::handlers::__test_sigaction_reset();
+
+    if !rewrote {
+        return TestResult::Fail("sync hook did not report rewrite for vector 14");
+    }
+    match delivered {
+        Some((handler, signum)) if handler == 0xC0DE_F00D && signum == 11 => {}
+        _ => return TestResult::Fail("sync hook did not invoke deliver_signal with the registered handler"),
+    }
+    if rewrote_unknown {
+        return TestResult::Fail("sync hook reported rewrite for an unmappable vector");
+    }
+    if unknown_delivered.is_some() {
+        return TestResult::Fail("sync hook called deliver_signal for an unmappable vector");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_synchronous_signal_delivery);
+
 fn smoke_filesystem_resolve_absolute_picks_longest_prefix() -> TestResult {
     // Mount two FSes — one at `/test_pa` and one nested under
     // `/test_pa/sub`. `resolve_absolute("/test_pa/sub/x")` must
@@ -6869,7 +7122,7 @@ fn smoke_userspace_read_write_routes_through_fd_table() -> TestResult {
 
     // Open one fd in task 7's table.
     let fd_n = fd::with_table(7, |t| {
-        t.open(FdEntry { ops: Arc::new(CountingFile), offset: 0 })
+        t.open(FdEntry { ops: Arc::new(CountingFile), offset: 0, flags: 0 })
     }).expect("with_table");
     if fd_n != 3 {
         return TestResult::Fail("expected first user fd to be 3");
@@ -6964,6 +7217,408 @@ fn smoke_userspace_read_write_routes_through_fd_table() -> TestResult {
 }
 kernel_test!(smoke_userspace_read_write_routes_through_fd_table);
 
+// ── Tier-2 fd-table breadth smokes ─────────────────────────────────
+//
+// Verify dup / fcntl / stat / pipe(2) round-trip through the
+// kernel-side syscall surface. The four tests below exercise each
+// slot independently so a failure points at a specific handler;
+// they share the FakeCtx + task-id-lookup boilerplate the existing
+// fd-table tests use.
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_dup_clones_fd() -> TestResult {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_filesystem::{FileOps, FsFuture, Stat};
+    use narf_userspace::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global,
+        FdEntry, Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+
+    // FileOps that returns a fixed byte on every read; counters in
+    // the harness verify the dup'd fd reads from the *same* backing.
+    static READ_HITS: AtomicU64 = AtomicU64::new(0);
+    READ_HITS.store(0, Ordering::Relaxed);
+    struct StubFile;
+    impl FileOps for StubFile {
+        fn read<'a>(&'a self, _o: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+            READ_HITS.fetch_add(1, Ordering::Relaxed);
+            for b in buf.iter_mut() { *b = 0x5A; }
+            alloc::boxed::Box::pin(async move { Ok(buf.len()) })
+        }
+        fn write<'a>(&'a self, _o: u64, b: &'a [u8]) -> FsFuture<'a, usize> {
+            let n = b.len();
+            alloc::boxed::Box::pin(async move { Ok(n) })
+        }
+        fn stat(&self) -> Stat {
+            Stat { size: 0, blocks: 0,
+                   mode: narf_filesystem::Mode::FILE_RW,
+                   mtime_cycles: 0 }
+        }
+    }
+
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0xD0);
+    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+
+    fd::__test_reset();
+    fd::init();
+    install_task_id_lookup(task_lookup);
+
+    let task = FAKE_TASK.load(Ordering::Relaxed);
+    let original = fd::with_table(task, |t| {
+        t.open(FdEntry { ops: Arc::new(StubFile), offset: 0, flags: 0 })
+    }).expect("with_table");
+    if original != 3 {
+        return TestResult::Fail("expected first user fd to be 3");
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    // Dup fd 3 → expect fd 4 (next free slot ≥ 3).
+    let mut dctx = FakeCtx {
+        args: SyscallArgs { arg0: original as u64, ..Default::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Dup.raw(), &mut dctx);
+    let dup_fd = match dctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value as u32,
+        _ => return TestResult::Fail("Dup did not return Ok"),
+    };
+    if dup_fd != 4 {
+        return TestResult::Fail("Dup did not pick fd 4");
+    }
+
+    // Read 8 bytes via the dup'd fd.
+    let mut buf = [0u8; 8];
+    let mut rctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: dup_fd as u64,
+            arg1: buf.as_mut_ptr() as u64,
+            arg2: 8,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Read.raw(), &mut rctx);
+    if rctx.ret != Some(SyscallReturn::ok(8)) {
+        return TestResult::Fail("Read on dup'd fd did not return 8");
+    }
+    if buf != [0x5A; 8] {
+        return TestResult::Fail("Read on dup'd fd returned wrong bytes");
+    }
+    if READ_HITS.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("dup'd fd did not share the StubFile FileOps");
+    }
+
+    // Close both — second close on the same backing should still
+    // succeed because each fd holds its own Arc clone.
+    let mut c1 = FakeCtx {
+        args: SyscallArgs { arg0: dup_fd as u64, ..Default::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Close.raw(), &mut c1);
+    if c1.ret != Some(SyscallReturn::ok(0)) {
+        return TestResult::Fail("Close on dup'd fd failed");
+    }
+    let mut c2 = FakeCtx {
+        args: SyscallArgs { arg0: original as u64, ..Default::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Close.raw(), &mut c2);
+    if c2.ret != Some(SyscallReturn::ok(0)) {
+        return TestResult::Fail("Close on original fd after dup-close failed");
+    }
+
+    fd::__test_reset();
+    __test_clear_global();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_userspace_dup_clones_fd);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_fcntl_flags_round_trip() -> TestResult {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_filesystem::{FileOps, FsFuture, Stat};
+    use narf_userspace::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global,
+        FdEntry, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext, FD_CLOEXEC,
+    };
+
+    struct Sink;
+    impl FileOps for Sink {
+        fn read<'a>(&'a self, _o: u64, _b: &'a mut [u8]) -> FsFuture<'a, usize> {
+            alloc::boxed::Box::pin(async move { Ok(0) })
+        }
+        fn write<'a>(&'a self, _o: u64, b: &'a [u8]) -> FsFuture<'a, usize> {
+            let n = b.len();
+            alloc::boxed::Box::pin(async move { Ok(n) })
+        }
+        fn stat(&self) -> Stat {
+            Stat { size: 0, blocks: 0,
+                   mode: narf_filesystem::Mode::FILE_RW,
+                   mtime_cycles: 0 }
+        }
+    }
+
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0xD1);
+    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+
+    fd::__test_reset();
+    fd::init();
+    install_task_id_lookup(task_lookup);
+    let task = FAKE_TASK.load(Ordering::Relaxed);
+    let target = fd::with_table(task, |t| {
+        t.open(FdEntry { ops: Arc::new(Sink), offset: 0, flags: 0 })
+    }).expect("with_table");
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    // F_SETFD(FD_CLOEXEC).
+    const F_GETFD: u64 = 1;
+    const F_SETFD: u64 = 2;
+    let mut s_ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: target as u64, arg1: F_SETFD, arg2: FD_CLOEXEC as u64,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Fcntl.raw(), &mut s_ctx);
+    if s_ctx.ret != Some(SyscallReturn::ok(0)) {
+        return TestResult::Fail("F_SETFD did not return 0");
+    }
+
+    // F_GETFD should now return FD_CLOEXEC.
+    let mut g_ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: target as u64, arg1: F_GETFD, ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Fcntl.raw(), &mut g_ctx);
+    match g_ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK
+                && r.value == FD_CLOEXEC as u64 => {}
+        _ => return TestResult::Fail("F_GETFD did not round-trip FD_CLOEXEC"),
+    }
+
+    fd::__test_reset();
+    __test_clear_global();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_userspace_fcntl_flags_round_trip);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_stat_returns_size() -> TestResult {
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_capabilities::{Cap, Grant};
+    use narf_filesystem::{
+        bootstrap_mount_authority, registry, DirEntry, DirOps, FileOps,
+        FsFuture, FsInstance, MountPoint, Stat,
+    };
+    use narf_userspace::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global, StatBuf,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+
+    static FILE_BYTES: &[u8] = b"STAT-PROBE-12345"; // 16 bytes
+    struct StubFile;
+    impl FileOps for StubFile {
+        fn read<'a>(&'a self, _o: u64, _b: &'a mut [u8]) -> FsFuture<'a, usize> {
+            Box::pin(async move { Ok(0) })
+        }
+        fn write<'a>(&'a self, _o: u64, b: &'a [u8]) -> FsFuture<'a, usize> {
+            let n = b.len();
+            Box::pin(async move { Ok(n) })
+        }
+        fn stat(&self) -> Stat {
+            Stat { size: FILE_BYTES.len() as u64, blocks: 1,
+                   mode: narf_filesystem::Mode::FILE_RO,
+                   mtime_cycles: 0xC0FFEE }
+        }
+    }
+    struct StubDir;
+    impl DirOps for StubDir {
+        fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+            if name == "stat-target" { Some(Arc::new(StubFile)) } else { None }
+        }
+        fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
+            Box::new(core::iter::empty())
+        }
+    }
+    struct StubFs;
+    impl FsInstance for StubFs {
+        fn root(&self) -> Arc<dyn DirOps> { Arc::new(StubDir) }
+        fn name(&self) -> &str { "stat-stub" }
+    }
+
+    let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+    // `/stat-test` is unique to this test; if a prior run already
+    // mounted it, the second mount surfaces Busy and we continue
+    // with the existing mount (file resolution still works).
+    let _ = registry().mount(&auth, "/stat-test", StubFs);
+
+    fd::__test_reset();
+    fd::init();
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0xD2);
+    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    install_task_id_lookup(task_lookup);
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    let mut out = StatBuf::default();
+    let path = b"/stat-test/stat-target";
+    let mut sctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: path.as_ptr() as u64, arg1: path.len() as u64,
+            arg2: &mut out as *mut StatBuf as u64,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Stat.raw(), &mut sctx);
+    if sctx.ret != Some(SyscallReturn::ok(0)) {
+        return TestResult::Fail("Stat did not return Ok");
+    }
+    if out.size != FILE_BYTES.len() as u64 {
+        return TestResult::Fail("StatBuf.size mismatch");
+    }
+    if out.mtime_cycles != 0xC0FFEE {
+        return TestResult::Fail("StatBuf.mtime_cycles mismatch");
+    }
+    // Mode high bits should mark this as a regular file (0o100000).
+    if out.mode & 0o170000 != 0o100000 {
+        return TestResult::Fail("StatBuf.mode missing regular-file marker");
+    }
+
+    fd::__test_reset();
+    __test_clear_global();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_userspace_stat_returns_size);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_pipe_round_trip() -> TestResult {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_userspace::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0xD3);
+    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+
+    fd::__test_reset();
+    fd::init();
+    install_task_id_lookup(task_lookup);
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    // pipe(out) — kernel writes [read_fd, write_fd] to `out`.
+    let mut fds: [i32; 2] = [-1, -1];
+    let mut pctx = FakeCtx {
+        args: SyscallArgs { arg0: fds.as_mut_ptr() as u64, ..Default::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Pipe.raw(), &mut pctx);
+    if pctx.ret != Some(SyscallReturn::ok(0)) {
+        return TestResult::Fail("Pipe did not return Ok");
+    }
+    if fds[0] < 3 || fds[1] < 3 || fds[0] == fds[1] {
+        return TestResult::Fail("Pipe returned bad fd pair");
+    }
+    let read_fd  = fds[0] as u32;
+    let write_fd = fds[1] as u32;
+
+    // Write 4 bytes to the writer.
+    let payload = b"PIPE";
+    let mut wctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: write_fd as u64, arg1: payload.as_ptr() as u64,
+            arg2: payload.len() as u64, ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Write.raw(), &mut wctx);
+    if wctx.ret != Some(SyscallReturn::ok(payload.len() as u64)) {
+        return TestResult::Fail("Pipe write did not return full byte count");
+    }
+
+    // Read 4 bytes from the reader.
+    let mut buf = [0u8; 4];
+    let mut rctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: read_fd as u64, arg1: buf.as_mut_ptr() as u64,
+            arg2: buf.len() as u64, ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Read.raw(), &mut rctx);
+    if rctx.ret != Some(SyscallReturn::ok(4)) {
+        return TestResult::Fail("Pipe read did not return 4");
+    }
+    if &buf != payload {
+        return TestResult::Fail("Pipe round-trip bytes mismatch");
+    }
+
+    fd::__test_reset();
+    __test_clear_global();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_userspace_pipe_round_trip);
+
 fn smoke_userspace_fd_table_roundtrip() -> TestResult {
     use alloc::sync::Arc;
     use narf_filesystem::{FileOps, FsFuture, Stat};
@@ -6994,7 +7649,7 @@ fn smoke_userspace_fd_table_roundtrip() -> TestResult {
 
     // Open in task A: first user fd is 3 (slots 0..=2 reserved).
     let fd_a = fd::with_table(task_a, |t| {
-        t.open(FdEntry { ops: Arc::new(FixedFile), offset: 0 })
+        t.open(FdEntry { ops: Arc::new(FixedFile), offset: 0, flags: 0 })
     });
     if fd_a != Some(3) {
         return TestResult::Fail("first user fd should be 3");
@@ -7002,7 +7657,7 @@ fn smoke_userspace_fd_table_roundtrip() -> TestResult {
 
     // Independent task B starts with a fresh table.
     let fd_b = fd::with_table(task_b, |t| {
-        t.open(FdEntry { ops: Arc::new(FixedFile), offset: 0 })
+        t.open(FdEntry { ops: Arc::new(FixedFile), offset: 0, flags: 0 })
     });
     if fd_b != Some(3) {
         return TestResult::Fail("task B should also get fd 3");
@@ -7030,7 +7685,7 @@ fn smoke_userspace_fd_table_roundtrip() -> TestResult {
         return TestResult::Fail("close should report true on live fd");
     }
     let reused = fd::with_table(task_a, |t| {
-        t.open(FdEntry { ops: Arc::new(FixedFile), offset: 0 })
+        t.open(FdEntry { ops: Arc::new(FixedFile), offset: 0, flags: 0 })
     });
     if reused != Some(3) {
         return TestResult::Fail("close + open should reuse slot 3");
@@ -10092,6 +10747,12 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
     // needs both stores initialised before the first kill.
     narf_userspace::handlers::__test_signal_reset();
     narf_userspace::signal_init();
+    // Per-task cwd: the testbin doesn't probe chdir today, but
+    // `install_core_syscalls` wires Chdir/Getcwd into the table —
+    // initialising the registry here keeps the runner's pre-state
+    // consistent with the validate runner's.
+    narf_userspace::handlers::__test_cwd_reset();
+    narf_userspace::cwd_init();
     // Per-task fd table store needs initialising so SYS_OPEN from
     // the testbin can install a fd entry in its (task=0) table.
     narf_userspace::fd::__test_reset();
@@ -10285,6 +10946,22 @@ fn smoke_frame_x86_64_run_narf_libc_validate() -> TestResult {
     //   strchr: ok
     //   memmove: ok
     //   getenv: ok
+    //   chdir: ok     <- chdir("/") returns 0; cwd table is shared
+    //                    state between this runner's init and the
+    //                    handler.
+    //   cwd: ok       <- getcwd into a 16-byte buffer reads "/\0".
+    //   sleep: ok     <- usleep(1000) returns 0; sys_sleep spin-waits
+    //                    in trap context (see its docstring).
+    //   fcntl: ok     <- Tier-2 fd-table breadth: F_GETFD on stdin
+    //                    returns 0 (no flags installed).
+    //   dup: ok       <- dup(1) returns a fresh fd ≥ 3.
+    //   pipe: ok      <- pipe() round-trip allocates two distinct
+    //                    fds ≥ 3 and writes them back through the
+    //                    out-pointer.
+    //   heap: ok      <- Tier-1.5 freelist over mmap: round-trip,
+    //                    distinct-live-chunks, free-list-reuse, and
+    //                    realloc-grow probes (see narf-libc-validate
+    //                    `heap_probe`).
     //   atexit: ok    <- emitted from the atexit callback, after
     //                    `main` returns and before exit_task.
     narf_userspace::bootstrap_init();
@@ -10294,6 +10971,8 @@ fn smoke_frame_x86_64_run_narf_libc_validate() -> TestResult {
     narf_userspace::sigaction_init();
     narf_userspace::handlers::__test_signal_reset();
     narf_userspace::signal_init();
+    narf_userspace::handlers::__test_cwd_reset();
+    narf_userspace::cwd_init();
     narf_userspace::fd::__test_reset();
     narf_userspace::fd::init();
 

@@ -533,7 +533,7 @@ fn sys_open(ctx: &mut dyn TrapContext) {
 
     let task = current_task_id();
     let new_fd = match fd::with_table(task, |t| {
-        t.open(crate::fd::FdEntry { ops, offset: 0 })
+        t.open(crate::fd::FdEntry { ops, offset: 0, flags: 0 })
     }) {
         Some(n) => n,
         None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
@@ -614,6 +614,268 @@ fn sys_read(ctx: &mut dyn TrapContext) {
         Some(Ok(n))   => ctx.set_return(SyscallReturn::ok(n as u64)),
         _             => ctx.set_return(SyscallReturn::invalid_op()),
     }
+}
+
+// ── Dup family + fcntl ─────────────────────────────────────────────
+//
+// Stage-4 round 2: the dup'd fd is a *clone* of the source FdEntry —
+// `ops` Arc shared, `offset` reset to 0 on the duplicate. Real POSIX
+// `dup` shares the open-file description (so reads on either fd
+// advance the same offset); NARF's fd table is currently a flat
+// `FdEntry`-per-slot rather than the POSIX two-tier (fd → OFD →
+// inode) layout. The simplification is sound for Stage-4 callers
+// (relibc's `dup` is used to redirect stdio post-fork, not to share
+// a cursor) and is documented here so the Stage-5 OFD work can lift
+// the offset into a separate Arc without touching the syscall ABI.
+
+fn sys_dup(ctx: &mut dyn TrapContext) {
+    let oldfd = ctx.args().arg0 as u32;
+    let task = current_task_id();
+    let outcome = fd::with_table(task, |t| {
+        let entry = t.get(oldfd)?;
+        // Clone the Arc + reset offset; keep flags clear (fcntl/dup3
+        // can stamp FD_CLOEXEC after).
+        let clone = crate::fd::FdEntry {
+            ops:    entry.ops.clone(),
+            offset: 0,
+            flags:  0,
+        };
+        Some(t.open(clone))
+    });
+    match outcome {
+        Some(Some(new_fd)) => ctx.set_return(SyscallReturn::ok(new_fd as u64)),
+        _                  => ctx.set_return(SyscallReturn::invalid_op()),
+    }
+}
+
+fn sys_dup2(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let oldfd = args.arg0 as u32;
+    let newfd = args.arg1 as u32;
+    if oldfd == newfd {
+        // POSIX: dup2(fd, fd) is a no-op + returns fd as long as fd
+        // is a valid open fd. Verify validity before short-circuiting.
+        let task = current_task_id();
+        let valid = fd::with_table(task, |t| t.get(oldfd).is_some()).unwrap_or(false);
+        if valid {
+            ctx.set_return(SyscallReturn::ok(newfd as u64));
+        } else {
+            ctx.set_return(SyscallReturn::invalid_op());
+        }
+        return;
+    }
+    let task = current_task_id();
+    let outcome = fd::with_table(task, |t| {
+        let entry = t.get(oldfd)?;
+        let clone = crate::fd::FdEntry {
+            ops:    entry.ops.clone(),
+            offset: 0,
+            flags:  0,
+        };
+        // Replace whatever sat at `newfd` (POSIX: silently close).
+        t.set(newfd, clone);
+        Some(())
+    });
+    match outcome {
+        Some(Some(())) => ctx.set_return(SyscallReturn::ok(newfd as u64)),
+        _              => ctx.set_return(SyscallReturn::invalid_op()),
+    }
+}
+
+fn sys_dup3(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let oldfd = args.arg0 as u32;
+    let newfd = args.arg1 as u32;
+    let flags = args.arg2 as u32;
+    // Linux dup3: differ from dup2 by failing on oldfd == newfd. The
+    // call exists to atomically install FD_CLOEXEC, which only makes
+    // sense when actually duplicating to a different slot.
+    if oldfd == newfd {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    let task = current_task_id();
+    let outcome = fd::with_table(task, |t| {
+        let entry = t.get(oldfd)?;
+        let clone = crate::fd::FdEntry {
+            ops:    entry.ops.clone(),
+            offset: 0,
+            // O_CLOEXEC (Linux) is bit 0x80000 in `flags`; Stage-4
+            // accepts the lower-bit shape (FD_CLOEXEC = 1) directly
+            // since narf-libc's `dup3` already passes FD_CLOEXEC.
+            flags:  flags & crate::fd::FD_CLOEXEC,
+        };
+        t.set(newfd, clone);
+        Some(())
+    });
+    match outcome {
+        Some(Some(())) => ctx.set_return(SyscallReturn::ok(newfd as u64)),
+        _              => ctx.set_return(SyscallReturn::invalid_op()),
+    }
+}
+
+const F_GETFD: u64 = 1;
+const F_SETFD: u64 = 2;
+const F_GETFL: u64 = 3;
+const F_SETFL: u64 = 4;
+
+fn sys_fcntl(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let fd  = args.arg0 as u32;
+    let cmd = args.arg1;
+    let arg = args.arg2;
+    let task = current_task_id();
+    let outcome = fd::with_table(task, |t| {
+        let entry = t.get_mut(fd)?;
+        Some(match cmd {
+            F_GETFD => SyscallReturn::ok(entry.flags as u64),
+            F_SETFD => {
+                entry.flags = arg as u32;
+                SyscallReturn::ok(0)
+            }
+            // F_GETFL / F_SETFL: NARF doesn't model O_RDONLY / O_WRONLY
+            // / O_NONBLOCK at the fd-table layer yet (every fd is
+            // implicitly read+write — the FileOps impl is what
+            // refuses unsupported sides). Return 0 so callers that
+            // probe the flag set don't see a spurious error.
+            F_GETFL => SyscallReturn::ok(0),
+            F_SETFL => SyscallReturn::ok(0),
+            _ => SyscallReturn::invalid_op(),
+        })
+    });
+    match outcome {
+        Some(Some(r)) => ctx.set_return(r),
+        _             => ctx.set_return(SyscallReturn::invalid_op()),
+    }
+}
+
+// ── Stat / Fstat ───────────────────────────────────────────────────
+//
+// `StatBuf` is the kernel-user wire-stable shape NARF surfaces today.
+// It mirrors `narf_filesystem::Stat` minus the `Mode` enum (collapsed
+// to a `u32` so the user side doesn't need to import `narf_filesystem`
+// to read the result). This is *not* POSIX `struct stat`; the relibc
+// shim translates as needed when a real POSIX `stat()` lands.
+
+/// Wire-stable stat output. `mode` carries the FileType in the high
+/// bits (POSIX-shaped: `0o100000` = file, `0o040000` = dir) and the
+/// 9 perm bits in the low end, giving a consumer one word that
+/// reads like a POSIX `st_mode`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct StatBuf {
+    pub size:         u64,
+    pub blocks:       u64,
+    pub mode:         u32,
+    pub _pad:         u32,
+    pub mtime_cycles: u64,
+}
+
+impl StatBuf {
+    fn from_stat(s: narf_filesystem::Stat) -> Self {
+        let ftype_bits: u32 = match s.mode.file_type {
+            narf_filesystem::FileType::File    => 0o100000,
+            narf_filesystem::FileType::Dir     => 0o040000,
+            narf_filesystem::FileType::Symlink => 0o120000,
+            narf_filesystem::FileType::Special => 0o020000,
+        };
+        Self {
+            size:         s.size,
+            blocks:       s.blocks,
+            mode:         ftype_bits | (s.mode.perms as u32),
+            _pad:         0,
+            mtime_cycles: s.mtime_cycles,
+        }
+    }
+}
+
+fn sys_stat(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let path_ptr = args.arg0 as *const u8;
+    let path_len = args.arg1 as usize;
+    let out_ptr  = args.arg2 as *mut StatBuf;
+    if path_ptr.is_null() || path_len == 0 || out_ptr.is_null() {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    // SAFETY: user-mode pointer in the active AS, length-bounded.
+    let path_bytes = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
+    let path = match core::str::from_utf8(path_bytes) {
+        Ok(s) => s,
+        Err(_) => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+    };
+    let ops = narf_filesystem::registry().resolve_absolute(path, |fs, rel| {
+        narf_filesystem::resolve(fs.root(), rel).ok()
+    }).flatten();
+    let ops = match ops {
+        Some(o) => o,
+        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+    };
+    let stat = StatBuf::from_stat(ops.stat());
+    // SAFETY: caller supplied a writable user vaddr; if the address
+    // is bad the user faults into its own handler, not ours.
+    unsafe { core::ptr::write_volatile(out_ptr, stat); }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+fn sys_fstat(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let fd = args.arg0 as u32;
+    let out_ptr = args.arg1 as *mut StatBuf;
+    if out_ptr.is_null() {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    let task = current_task_id();
+    let stat = fd::with_table(task, |t| {
+        t.get(fd).map(|e| StatBuf::from_stat(e.ops.stat()))
+    });
+    let stat = match stat {
+        Some(Some(s)) => s,
+        _             => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+    };
+    // SAFETY: same contract as `sys_stat`.
+    unsafe { core::ptr::write_volatile(out_ptr, stat); }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+// ── Pipe ────────────────────────────────────────────────────────────
+//
+// Allocates a fresh `PipeRead`/`PipeWrite` pair, installs them into
+// the calling task's fd table at the next two free slots, then
+// writes the two i32 fds back to the user-supplied output pointer
+// in `[read, write]` order (matching POSIX `int pipefd[2]`).
+
+fn sys_pipe(ctx: &mut dyn TrapContext) {
+    let out_ptr = ctx.args().arg0 as *mut i32;
+    if out_ptr.is_null() {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    let (rd, wr) = crate::pipe::pipe_pair();
+    let task = current_task_id();
+    let fds = fd::with_table(task, |t| {
+        let r = t.open(crate::fd::FdEntry {
+            ops: rd as alloc::sync::Arc<dyn narf_filesystem::FileOps>,
+            offset: 0, flags: 0,
+        });
+        let w = t.open(crate::fd::FdEntry {
+            ops: wr as alloc::sync::Arc<dyn narf_filesystem::FileOps>,
+            offset: 0, flags: 0,
+        });
+        (r, w)
+    });
+    let (r, w) = match fds {
+        Some(p) => p,
+        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+    };
+    // SAFETY: caller-supplied user vaddr; we write two i32s. The
+    // kernel runs in the calling task's AS so the write resolves.
+    unsafe {
+        core::ptr::write_volatile(out_ptr,             r as i32);
+        core::ptr::write_volatile(out_ptr.add(1),      w as i32);
+    }
+    ctx.set_return(SyscallReturn::ok(0));
 }
 
 // ── Close — arg0=fd ────────────────────────────────────────────────
@@ -842,6 +1104,148 @@ fn sys_getppid(ctx: &mut dyn TrapContext) {
 
 fn sys_noop_ok(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(0));
+}
+
+// ── Sleep — spin-wait until monotonic_ns advances by arg0 ─────────
+//
+// `Syscall::Sleep` carries the requested sleep in nanoseconds in
+// `arg0`. Stage-4 first cut: spin on `core::hint::spin_loop()` until
+// the kernel's monotonic clock has advanced by at least the requested
+// span. Why a spin and not a Future:
+//
+//   - Syscall handlers run inside a CPU trap, not as a scheduler
+//     task, so there's no `.await` we can use to yield. The trap
+//     context has a single linear flow ending in `iretq` back to user.
+//   - A real `nanosleep` would suspend the calling task on a timer
+//     wheel and let the scheduler park the CPU. That requires the
+//     polling-future "trap-as-future" model from c85cb9f to be live
+//     for arbitrary user tasks, not just the testbin/validate
+//     trampolines. Until that lands every sleep handler fundamentally
+//     blocks the calling CPU.
+//
+// The handler is correct for now (it does sleep for the requested
+// duration) but pessimal for throughput. The follow-up is to route
+// Sleep through `narf_time::sleep_cycles` once every user task is
+// itself a polling future.
+fn sys_sleep(ctx: &mut dyn TrapContext) {
+    let ns = ctx.args().arg0;
+    if ns == 0 {
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+    let start = narf_scheduler::narf_time::monotonic_ns();
+    // Saturating add: a u64 overflow on `start + ns` is structurally
+    // impossible at realistic clock rates, but the saturate keeps
+    // the loop bound tight against pathological inputs.
+    let deadline = start.saturating_add(ns);
+    while narf_scheduler::narf_time::monotonic_ns() < deadline {
+        core::hint::spin_loop();
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+// ── Per-task cwd state ────────────────────────────────────────────
+//
+// Storage shape mirrors the other per-task tables in this file:
+// a `BTreeMap<task_id, String>` behind an `IrqSafeSpinLock` with
+// an explicit init hook + a test-reset hook. Lifecycle is
+// independent of the fd table — agent B owns fd-table extensions
+// in `fd.rs`; this state lives in handlers.rs to keep the
+// ownership boundary clean.
+//
+// Default cwd is `/`. Stage-4 first cut: absolute paths only.
+// Relative-path resolution + the `*at(2)` family land later;
+// today the kernel just records the string the user supplied.
+
+static CWD_TABLE:
+    narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, alloc::string::String>>>
+    = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Initialise the per-task cwd registry. Boot calls this once
+/// before any user task can issue `Syscall::Chdir` / `Getcwd`.
+pub fn cwd_init() {
+    *CWD_TABLE.lock() = Some(BTreeMap::new());
+}
+
+/// Reset the registry — test hook. Drops every per-task entry.
+#[doc(hidden)]
+pub fn __test_cwd_reset() { *CWD_TABLE.lock() = None; }
+
+/// Diagnostic: peek the recorded cwd for `task`. Returns the
+/// default `"/"` if `task` has never called Chdir.
+pub fn cwd_of(task: u64) -> alloc::string::String {
+    let g = CWD_TABLE.lock();
+    g.as_ref()
+        .and_then(|m| m.get(&task).cloned())
+        .unwrap_or_else(|| alloc::string::String::from("/"))
+}
+
+fn sys_chdir(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let ptr  = args.arg0 as *const u8;
+    let len  = args.arg1 as usize;
+    if ptr.is_null() || len == 0 {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    // SAFETY: caller-supplied user pointer in the active AS,
+    // length-bounded. A bad pointer faults the user into its own
+    // #PF, not ours.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+    let path = match core::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+    };
+    // Stage-4 first cut: absolute paths only. Relative-path
+    // resolution joins with the *at(2) family in a follow-up; we
+    // reject early so callers don't accidentally rely on a
+    // half-implemented relative path being silently dropped.
+    if !path.starts_with('/') {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    let task = current_task_id();
+    let mut g = CWD_TABLE.lock();
+    let map = match g.as_mut() {
+        Some(m) => m,
+        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+    };
+    map.insert(task, alloc::string::String::from(path));
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+fn sys_getcwd(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let buf  = args.arg0 as *mut u8;
+    let len  = args.arg1 as usize;
+    if buf.is_null() || len == 0 {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    let task = current_task_id();
+    let cwd = {
+        let g = CWD_TABLE.lock();
+        g.as_ref()
+            .and_then(|m| m.get(&task).cloned())
+            .unwrap_or_else(|| alloc::string::String::from("/"))
+    };
+    // Need cwd.len() + 1 bytes (string + NUL terminator). POSIX
+    // getcwd(3) returns ERANGE here; the syscall shape doesn't
+    // surface errno yet so we fold both "no buf" and "buf too
+    // small" into InvalidOp. A libc shim is expected to translate.
+    let needed = cwd.len() + 1;
+    if len < needed {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    // SAFETY: user-supplied buf is in the active AS; len was
+    // bounds-checked against `needed`. We write `cwd.len()` bytes
+    // followed by a NUL — never past `len`.
+    unsafe {
+        core::ptr::copy_nonoverlapping(cwd.as_ptr(), buf, cwd.len());
+        core::ptr::write(buf.add(cwd.len()), 0);
+    }
+    ctx.set_return(SyscallReturn::ok(cwd.len() as u64));
 }
 
 // ── Brk — per-task heap break ──────────────────────────────────────
@@ -1135,6 +1539,106 @@ pub fn default_signal_delivery(ctx: &mut dyn TrapContext) {
     }
 }
 
+// ── Synchronous-signal delivery for CPU exceptions ────────────────
+//
+// Counterpart to the async hook above. The async path runs on
+// every int-0x80 trap-return and consumes the per-task pending
+// bitmap (the work `kill(2)` leaves behind). The synchronous path
+// runs from `rust_trap_handler` for vectors 0..31 (CPU exceptions)
+// when the trap came from user mode AND a sigaction handler is
+// registered for the matching signal. It rewrites the trap frame
+// to deliver the signal at user mode, mirroring the async hook's
+// `deliver_signal` path so the frame layout the handler observes
+// is identical.
+//
+// Strict gating on `frame.cs.RPL == 3` (caller's responsibility)
+// keeps kernel-mode CPU exceptions on the existing probe-catch /
+// panic path: probes are for kernel-issued recovery (test
+// infrastructure), user-mode crashes are this new path. The two
+// don't overlap.
+
+/// POSIX signal numbers we map to. Stage-4 first cut: the
+/// minimum set the synchronous-signal path can possibly raise.
+/// The full table is `[1..=31]`, but only these can come from
+/// CPU exceptions on x86_64 today.
+const SIGILL:  u32 = 4;
+const SIGTRAP: u32 = 5;
+const SIGBUS:  u32 = 7;
+const SIGFPE:  u32 = 8;
+const SIGSEGV: u32 = 11;
+
+/// Map an x86_64 CPU-exception vector to the POSIX signal a
+/// synchronous-delivery handler should observe. Returns `None`
+/// for vectors that aren't user-recoverable through a signal
+/// handler (the trap path falls back to its existing panic
+/// surface for those).
+///
+/// References: AMD APM Vol 2 §8.2 (vector → exception map),
+/// SUSv5 `<signal.h>` for the signal-number table.
+pub fn vector_to_signum(vector: u64) -> Option<u32> {
+    match vector {
+        0  => Some(SIGFPE),  // #DE divide-by-zero / div overflow
+        3  => Some(SIGTRAP), // #BP breakpoint
+        4  => Some(SIGFPE),  // #OF overflow
+        6  => Some(SIGILL),  // #UD undefined opcode
+        13 => Some(SIGSEGV), // #GP general protection
+        14 => Some(SIGSEGV), // #PF page fault
+        17 => Some(SIGBUS),  // #AC alignment check
+        _  => None,
+    }
+}
+
+/// Function-pointer hook the arch trap dispatcher calls for
+/// every CPU exception (vectors 0..31) that originated in user
+/// mode. Returns `true` if the trap frame was rewritten to
+/// deliver a signal — the trap dispatcher should then return
+/// directly so `iretq` lands at the rewritten user RIP.
+/// Returns `false` if no handler was installed (or the vector
+/// has no signal mapping); the caller falls through to the
+/// existing panic / probe-catch path.
+type SyncSignalHook = fn(&mut dyn TrapContext, u64) -> bool;
+
+static SYNC_SIGNAL_HOOK:
+    narf_lib::sync::IrqSafeSpinLock<Option<SyncSignalHook>>
+    = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Install the function the arch trap path calls on user-mode
+/// CPU exceptions. `install_core_syscalls` auto-installs
+/// `default_sync_signal_delivery`.
+pub fn install_sync_signal_hook(hook: SyncSignalHook) {
+    *SYNC_SIGNAL_HOOK.lock() = Some(hook);
+}
+
+/// Look up the currently-installed sync-signal hook, if any.
+pub fn sync_signal_hook() -> Option<SyncSignalHook> {
+    *SYNC_SIGNAL_HOOK.lock()
+}
+
+/// Default sync-signal hook: map vector → signum, look up the
+/// calling task's handler, rewrite the trap frame.
+///
+/// Returns `false` (no rewrite) when:
+///   - the vector has no signal mapping (e.g. #NMI)
+///   - no sigaction handler is registered for that signum
+///   - the arch's `deliver_signal` rejects the rewrite
+///
+/// In all three cases the caller falls through to the existing
+/// panic surface, which is the right behaviour: a userland that
+/// hasn't installed a handler for SIGSEGV genuinely deserves
+/// the kernel-side crash dump.
+pub fn default_sync_signal_delivery(ctx: &mut dyn TrapContext, vector: u64) -> bool {
+    let signum = match vector_to_signum(vector) {
+        Some(s) => s,
+        None    => return false,
+    };
+    let task = current_task_id();
+    let handler = match sigaction_lookup(task, signum as usize) {
+        Some(h) => h,
+        None    => return false,
+    };
+    ctx.deliver_signal(handler, signum)
+}
+
 // ── Sigaction — record a per-task handler vaddr ────────────────────
 //
 // Stage-4 round 2: the recorded handler is fired on the trap
@@ -1282,15 +1786,30 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::GetGid,   "getgid",   RawFnHandler(sys_noop_ok));
     table.install_raw(Syscall::ExitTask, "exit",     RawFnHandler(sys_exit_task));
     table.install_raw(Syscall::Yield,    "yield",    RawFnHandler(sys_yield));
-    table.install_raw(Syscall::Sleep,    "sleep",    RawFnHandler(sys_noop_ok));
+    table.install_raw(Syscall::Sleep,    "sleep",    RawFnHandler(sys_sleep));
     table.install_raw(Syscall::Brk,          "brk",           RawFnHandler(sys_brk));
     table.install_raw(Syscall::ClockGetTime, "clock_gettime", RawFnHandler(sys_clock_gettime));
     table.install_raw(Syscall::Sigaction,    "sigaction",     RawFnHandler(sys_sigaction));
     table.install_raw(Syscall::Kill,         "kill",          RawFnHandler(sys_kill));
     table.install_raw(Syscall::Sigprocmask,  "sigprocmask",   RawFnHandler(sys_sigprocmask));
 
-    // Auto-wire the delivery hook so any kernel that uses
-    // `install_core_syscalls` automatically gets signal delivery
-    // on the trap-return path. Idempotent.
+    // Tier-2 fd-table breadth + path-resolution + pipe(2).
+    table.install_raw(Syscall::Dup,    "dup",    RawFnHandler(sys_dup));
+    table.install_raw(Syscall::Dup2,   "dup2",   RawFnHandler(sys_dup2));
+    table.install_raw(Syscall::Dup3,   "dup3",   RawFnHandler(sys_dup3));
+    table.install_raw(Syscall::Fcntl,  "fcntl",  RawFnHandler(sys_fcntl));
+    table.install_raw(Syscall::Stat,   "stat",   RawFnHandler(sys_stat));
+    table.install_raw(Syscall::Fstat,  "fstat",  RawFnHandler(sys_fstat));
+    table.install_raw(Syscall::Pipe,   "pipe",   RawFnHandler(sys_pipe));
+
+    // Tier-2 cwd state + nanosleep wired into the table. Sleep
+    // already replaced the noop_ok stub above.
+    table.install_raw(Syscall::Chdir,  "chdir",  RawFnHandler(sys_chdir));
+    table.install_raw(Syscall::Getcwd, "getcwd", RawFnHandler(sys_getcwd));
+
+    // Auto-wire both delivery hooks so any kernel that uses
+    // `install_core_syscalls` gets the async + sync signal paths
+    // on for free. Idempotent.
     install_signal_delivery_hook(default_signal_delivery);
+    install_sync_signal_hook(default_sync_signal_delivery);
 }

@@ -39,6 +39,100 @@ extern "C" fn cleanup() {
     narf_libc::printf_str("atexit: ok\n", &[]);
 }
 
+/// Heap probe — exercises the Tier-1.5 freelist allocator. Returns
+/// `true` iff every sub-check passes; the caller maps that to the
+/// `heap: ok` / `heap: bad` smoke line.
+///
+/// # Safety
+/// All raw-pointer ops are bounded by the sizes we just allocated;
+/// the allocator's contract guarantees the returned regions are at
+/// least the requested length.
+unsafe fn heap_probe() -> bool {
+    // (1) Single round-trip: write, read, free.
+    // SAFETY: 64 bytes is well within any sane chunk size; the
+    // returned pointer is writable for that span.
+    let p1 = unsafe { narf_libc::malloc(64) };
+    if p1.is_null() {
+        return false;
+    }
+    unsafe {
+        *p1 = 0xAA;
+        *p1.add(63) = 0x55;
+        if *p1 != 0xAA || *p1.add(63) != 0x55 {
+            return false;
+        }
+        narf_libc::free(p1);
+    }
+
+    // (2) Two live allocations carry distinct sentinels.
+    // SAFETY: same reasoning as (1) for each pointer.
+    let a = unsafe { narf_libc::malloc(128) };
+    let b = unsafe { narf_libc::malloc(128) };
+    if a.is_null() || b.is_null() {
+        return false;
+    }
+    unsafe {
+        for i in 0..128 { *a.add(i) = 0x11; }
+        for i in 0..128 { *b.add(i) = 0x22; }
+        for i in 0..128 {
+            if *a.add(i) != 0x11 || *b.add(i) != 0x22 {
+                return false;
+            }
+        }
+        narf_libc::free(a);
+        narf_libc::free(b);
+    }
+
+    // (3) Free-list reuse: free a chunk, immediately re-malloc the
+    // same size, expect the same pointer back. With a LIFO push and
+    // a first-fit walk, the most-recently-freed chunk is the head
+    // of the list and the next equal-or-smaller request hits it.
+    // SAFETY: 1024 bytes is well within any chunk we allocate.
+    let r1 = unsafe { narf_libc::malloc(1024) };
+    if r1.is_null() {
+        return false;
+    }
+    unsafe { narf_libc::free(r1); }
+    let r2 = unsafe { narf_libc::malloc(1024) };
+    if r2.is_null() || r2 != r1 {
+        return false;
+    }
+    unsafe { narf_libc::free(r2); }
+
+    // (4) realloc grow: write a sentinel into a small alloc, grow
+    // to 4096, verify the old prefix survived. The new tail is
+    // uninitialised by design — realloc isn't required to zero —
+    // so we don't read past the original payload. We probe
+    // writability at the far end (offset 4095) to confirm the
+    // chunk really is the size realloc claims.
+    // SAFETY: 16 bytes initially, 4096 after realloc.
+    let s1 = unsafe { narf_libc::malloc(16) };
+    if s1.is_null() {
+        return false;
+    }
+    unsafe {
+        for i in 0..16 { *s1.add(i) = i as u8 + 1; }
+    }
+    let s2 = unsafe { narf_libc::realloc(s1, 4096) };
+    if s2.is_null() {
+        return false;
+    }
+    unsafe {
+        for i in 0..16 {
+            if *s2.add(i) != i as u8 + 1 {
+                return false;
+            }
+        }
+        *s2.add(4095) = 0xFE;
+        if *s2.add(4095) != 0xFE {
+            return false;
+        }
+        narf_libc::free(s2);
+    }
+
+    true
+}
+
 #[no_mangle]
 pub extern "C" fn main(
     _argc: i32,
@@ -129,6 +223,94 @@ pub extern "C" fn main(
     let v = unsafe { narf_libc::getenv(n, 4) };
     narf_libc::printf_str(
         if v.is_null() { "getenv: ok\n" } else { "getenv: bad\n" },
+        &[],
+    );
+
+    // ── chdir / getcwd / sleep probes ────────────────────────────
+    // chdir("/") + getcwd round-trip is the tightest cwd path the
+    // kernel exposes today. usleep(1000) drives the spin-wait
+    // sleep handler — 1 ms is small enough not to dominate runtime
+    // but large enough that a no-op stub would fail to advance
+    // monotonic_ns.
+    let root: *const u8 = b"/\0".as_ptr();
+    // SAFETY: NUL-terminated literal.
+    let chdir_ok = unsafe { narf_libc::chdir(root) } == 0;
+    narf_libc::printf_str(
+        if chdir_ok { "chdir: ok\n" } else { "chdir: bad\n" },
+        &[],
+    );
+
+    let mut cwd_buf: [u8; 16] = [0; 16];
+    // SAFETY: 16-byte writable buffer + size match.
+    let cwd_p = unsafe { narf_libc::getcwd(cwd_buf.as_mut_ptr(), cwd_buf.len()) };
+    let cwd_ok = !cwd_p.is_null() && cwd_buf[0] == b'/' && cwd_buf[1] == 0;
+    narf_libc::printf_str(
+        if cwd_ok { "cwd: ok\n" } else { "cwd: bad\n" },
+        &[],
+    );
+
+    let sleep_ok = narf_libc::usleep(1000) == 0;
+    narf_libc::printf_str(
+        if sleep_ok { "sleep: ok\n" } else { "sleep: bad\n" },
+        &[],
+    );
+
+    // ── fd / pipe / fcntl probes ────────────────────────────────
+    //
+    // Tier-2 fd-table breadth surface end-to-end: fcntl on stdin,
+    // dup of stdout, and a fresh pipe round-trip. Each lights up
+    // exactly one kernel handler so the explicit "ok" / "bad"
+    // marker pinpoints the failure.
+    //
+    // SAFETY: fd numbers 0/1 are kernel-installed at task start;
+    // pipe()/dup() return numbers we hand back to the kernel
+    // immediately after.
+    unsafe {
+        // F_GETFD on stdin should succeed (return 0 — no flags set
+        // by the kernel-default stdio install).
+        let r = narf_libc::fcntl(0, narf_libc::F_GETFD as i32, 0);
+        narf_libc::printf_str(
+            if r == 0 { "fcntl: ok\n" } else { "fcntl: bad\n" },
+            &[],
+        );
+
+        // dup(fd 1) — first free user slot is ≥ 3 with stdio installed.
+        let new_fd = narf_libc::dup(1);
+        narf_libc::printf_str(
+            if new_fd >= 3 { "dup: ok\n" } else { "dup: bad\n" },
+            &[],
+        );
+
+        // pipe() — populate two fds, both must be ≥ 3 and distinct.
+        let mut fds: [i32; 2] = [-1, -1];
+        let pr = narf_libc::pipe(fds.as_mut_ptr());
+        let pipe_ok = pr == 0 && fds[0] >= 3 && fds[1] >= 3 && fds[0] != fds[1];
+        narf_libc::printf_str(
+            if pipe_ok { "pipe: ok\n" } else { "pipe: bad\n" },
+            &[],
+        );
+    }
+
+    // ── heap freelist probes ──────────────────────────────────────
+    // Tier 1.5 freelist allocator over mmap. Four checks:
+    //   1. round-trip a sentinel through a single malloc/free.
+    //   2. two non-overlapping live allocations carry distinct
+    //      sentinels independently.
+    //   3. malloc → free → malloc returns the SAME pointer (the
+    //      freelist reused the just-released chunk).
+    //   4. realloc grows correctly and preserves the old prefix.
+    //
+    // Note on ptr-equality in (3): the underlying mmap returns
+    // disjoint regions across calls, so the equality there relies
+    // on the freelist hitting the just-pushed chunk on the next
+    // malloc — i.e. it tests the split/reuse path, not vaddr math.
+    //
+    // SAFETY: heap_probe's preconditions are all "the allocator
+    // honours its own contract" — the function uses only its own
+    // returns.
+    let heap_ok = unsafe { heap_probe() };
+    narf_libc::printf_str(
+        if heap_ok { "heap: ok\n" } else { "heap: bad\n" },
         &[],
     );
 

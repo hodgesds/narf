@@ -41,6 +41,7 @@ pub mod fd;
 pub mod handlers;
 pub mod interp;
 pub mod loader;
+pub mod pipe;
 pub mod process;
 pub mod syscall;
 #[cfg(target_arch = "x86_64")]
@@ -49,17 +50,22 @@ pub mod user_task;
 
 pub use interp::{lookup_interpreter, register_interpreter};
 
-pub use fd::{FdEntry, FdTable};
+pub use fd::{FdEntry, FdTable, FD_CLOEXEC};
+
+pub use handlers::StatBuf;
+pub use pipe::{pipe_pair, PipeRead, PipeWrite};
 
 pub use elf::{parse as parse_elf, ElfError};
 pub use handlers::{
     abi_file_op_bridge, bootstrap_init, bootstrap_live_count, brk_init,
-    clear_exit_landing, default_signal_delivery, install_address_space_lookup,
+    clear_exit_landing, cwd_init, cwd_of, default_signal_delivery,
+    default_sync_signal_delivery, install_address_space_lookup,
     install_core_syscalls, install_signal_delivery_hook,
-    install_task_id_lookup, set_exit_landing, shared_rings_for,
-    sigaction_init, sigaction_lookup, signal_delivery_hook, signal_init,
-    signal_mask_of, signal_pending_of, spawn_dispatcher_for,
-    take_kernel_ends, take_user_ends, SharedRingPair, TaskRings,
+    install_sync_signal_hook, install_task_id_lookup, set_exit_landing,
+    shared_rings_for, sigaction_init, sigaction_lookup,
+    signal_delivery_hook, signal_init, signal_mask_of, signal_pending_of,
+    spawn_dispatcher_for, sync_signal_hook, take_kernel_ends,
+    take_user_ends, vector_to_signum, SharedRingPair, TaskRings,
     UserRingEnds, BOOTSTRAP_SHARED_RING_DEPTH,
 };
 pub use user_task::{

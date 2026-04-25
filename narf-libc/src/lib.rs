@@ -34,6 +34,8 @@ extern "C" {
 pub mod arch;
 pub mod env;
 pub mod errno;
+pub mod fd;
+pub mod fs;
 pub mod heap;
 pub mod io;
 pub mod process;
@@ -44,13 +46,18 @@ pub mod string;
 pub use arch::_start;
 pub use env::{getenv, getenv_cstr, setenv, unsetenv, ENVIRON};
 pub use errno::{errno, set_errno};
-pub use heap::{free, malloc};
+pub use fd::{
+    dup, dup2, fcntl, fstat, pipe, stat, FD_CLOEXEC, F_GETFD, F_GETFL, F_SETFD,
+    F_SETFL, StatBuf,
+};
+pub use fs::{chdir, getcwd};
+pub use heap::{calloc, free, malloc, realloc};
 // `io::fputs(&str, fd)` deliberately omitted — the `stdio::fputs`
 // FILE*-shaped one (re-exported below) is the canonical public
 // surface. The internal helper is still reachable as
 // `crate::io::fputs` for non-public call sites that haven't migrated.
 pub use io::{fprintf_str, printf_str, vprintf_str, write, Arg, Stdout};
-pub use process::{abort, atexit, exit, getpid, getppid, getuid};
+pub use process::{abort, atexit, exit, getpid, getppid, getuid, sleep, usleep};
 pub use startup::__libc_start_main;
 // Note: `stdio::fputs` shadows the older `io::fputs(&str, fd)` helper
 // — the FILE*-shaped one is the POSIX-correct surface and is the one

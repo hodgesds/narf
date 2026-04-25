@@ -171,13 +171,14 @@ pub fn stderr() -> *mut File {
 /// failure. The caller must `fclose` to release the kernel fd and
 /// the heap allocation.
 ///
-/// **Path-B simplification**: our underlying `narf_user_runtime::open`
-/// takes `(path, mount)`. We approximate that by splitting the
-/// absolute path on the second `/`: e.g. `/testbin/f` becomes mount
-/// `/testbin` + relative `f`. A real mount-table walk lives inside
-/// the kernel; this shim is just enough to round-trip the testbin
-/// stub-FS. TODO: once the kernel exposes a "resolve absolute path
-/// to mount" syscall, drop this split and call that instead.
+/// Path resolution: relies on the kernel's
+/// `Open(path, len, 0, 0)` shape (the `(arg2, arg3) = (0, 0)`
+/// variant) which routes through `VfsRegistry::resolve_absolute`
+/// to find the longest matching mount and walk the relative
+/// suffix. The user-runtime helper [`narf_user_runtime::open_abs`]
+/// passes the empty mount string, hitting that path. The earlier
+/// "split on the second `/`" Path-B simplification has been
+/// retired now that the kernel handles the walk.
 ///
 /// # Safety
 /// `path` must be a valid pointer to `path_len` UTF-8 bytes. `mode`
@@ -198,23 +199,14 @@ pub unsafe fn fopen(path: *const u8, path_len: usize, mode: &str) -> *mut File {
         }
     };
 
-    // Split on the second '/' to derive (mount, relative) — see the
-    // function doc-comment for why this is a Stage-4 approximation.
+    // Absolute path required — POSIX semantics + we don't yet
+    // surface a per-task cwd to resolve relative paths against.
     if !path_str.starts_with('/') {
         set_errno(EBADF);
         return null_mut();
     }
-    let after_root = &path_str[1..];
-    let (mount, rel) = match after_root.find('/') {
-        Some(i) => (&path_str[..1 + i], &path_str[1 + i + 1..]),
-        // Single-segment path like "/foo" — treat the whole thing as
-        // mount and pass an empty relative. Kernel behaviour on
-        // empty rel is "open the mount root", which is what POSIX
-        // expects for opening a directory file by its mount point.
-        None => (path_str, ""),
-    };
 
-    let fd = match narf_user_runtime::open(rel, mount) {
+    let fd = match narf_user_runtime::open_abs(path_str) {
         Some(fd) => fd,
         None => {
             set_errno(EIO);
@@ -231,7 +223,9 @@ pub unsafe fn fopen(path: *const u8, path_len: usize, mode: &str) -> *mut File {
 
     // Allocate the FILE struct on the bump heap. `malloc` returns
     // null on failure; we propagate that to the caller.
-    let f = malloc(core::mem::size_of::<File>()) as *mut File;
+    // SAFETY: malloc is `unsafe extern "C"`; a non-zero size is
+    // the only contract.
+    let f = unsafe { malloc(core::mem::size_of::<File>()) } as *mut File;
     if f.is_null() {
         let _ = narf_user_runtime::close(fd);
         set_errno(ENOMEM);
@@ -279,13 +273,13 @@ pub unsafe fn fclose(f: *mut File) -> i32 {
     }
 
     if let Some(p) = file.rbuf.take() {
-        // SAFETY: pointer came from `malloc`; `free` is no-op today
-        // (bump allocator) but we still call it for forward
-        // compatibility with a real freelist implementation.
-        free(p);
+        // SAFETY: pointer came from `malloc` via `ensure_rbuf` —
+        // matched alloc/free pair through the freelist allocator.
+        unsafe { free(p); }
     }
     if let Some(p) = file.wbuf.take() {
-        free(p);
+        // SAFETY: as above for the write buffer (`ensure_wbuf`).
+        unsafe { free(p); }
     }
 
     if file.owns_fd {
@@ -298,7 +292,9 @@ pub unsafe fn fclose(f: *mut File) -> i32 {
         // Owned `File` came from `malloc`; release the struct
         // itself. (Static stdin/stdout/stderr have `owns_fd = false`
         // and live in `.bss`, so we leave them alone.)
-        free(f as *mut u8);
+        // SAFETY: matched alloc/free pair through the freelist
+        // allocator's C-ABI.
+        unsafe { free(f as *mut u8); }
     }
     rc
 }
@@ -309,7 +305,9 @@ pub unsafe fn fclose(f: *mut File) -> i32 {
 /// allocation failed (in which case `f.err` is stamped with ENOMEM).
 fn ensure_rbuf(f: &mut File) -> Option<*mut u8> {
     if let Some(p) = f.rbuf { return Some(p); }
-    let p = malloc(BUF_CAP);
+    // SAFETY: malloc is `unsafe extern "C"`; a non-zero size is
+    // the only contract.
+    let p = unsafe { malloc(BUF_CAP) };
     if p.is_null() {
         f.err = ENOMEM;
         set_errno(ENOMEM);
@@ -322,7 +320,9 @@ fn ensure_rbuf(f: &mut File) -> Option<*mut u8> {
 /// Lazily allocate the write buffer; mirrors [`ensure_rbuf`].
 fn ensure_wbuf(f: &mut File) -> Option<*mut u8> {
     if let Some(p) = f.wbuf { return Some(p); }
-    let p = malloc(BUF_CAP);
+    // SAFETY: malloc is `unsafe extern "C"`; a non-zero size is
+    // the only contract.
+    let p = unsafe { malloc(BUF_CAP) };
     if p.is_null() {
         f.err = ENOMEM;
         set_errno(ENOMEM);

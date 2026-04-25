@@ -44,6 +44,10 @@ pub const SYS_OPEN:           u64 = 110;
 pub const SYS_READ:           u64 = 111;
 pub const SYS_WRITE:          u64 = 112;
 pub const SYS_CLOSE:          u64 = 113;
+// Tier-2 fd-table breadth + path resolution + pipe (115..=117 reserved).
+pub const SYS_STAT:           u64 = 115;
+pub const SYS_FSTAT:          u64 = 116;
+pub const SYS_PIPE:           u64 = 117;
 pub const SYS_MMAP:           u64 = 120;
 pub const SYS_MUNMAP:         u64 = 121;
 pub const SYS_RING_KICK:      u64 = 130;
@@ -56,6 +60,24 @@ pub const SYS_CLOCK_GETTIME:  u64 = 151;
 pub const SYS_SIGACTION:      u64 = 152;
 pub const SYS_KILL:           u64 = 153;
 pub const SYS_SIGPROCMASK:    u64 = 154;
+// Dup family + fcntl (160..=163 reserved).
+pub const SYS_DUP:            u64 = 160;
+pub const SYS_DUP2:           u64 = 161;
+pub const SYS_DUP3:           u64 = 162;
+pub const SYS_FCNTL:          u64 = 163;
+// Cwd state (170/171).
+pub const SYS_CHDIR:          u64 = 170;
+pub const SYS_GETCWD:         u64 = 171;
+
+/// `fcntl` command constants — match Linux numbering for the subset
+/// NARF supports today (FD_CLOEXEC + the file-flag query/set pair).
+pub const F_GETFD:    u32 = 1;
+pub const F_SETFD:    u32 = 2;
+pub const F_GETFL:    u32 = 3;
+pub const F_SETFL:    u32 = 4;
+/// `FD_CLOEXEC` flag bit — the only `flags` bit NARF currently
+/// stamps onto an fd entry.
+pub const FD_CLOEXEC: u32 = 1;
 
 /// `sigprocmask` how-flags — match POSIX.
 pub const SIG_BLOCK:   u32 = 0;
@@ -351,6 +373,58 @@ pub fn brk(new_break: usize) -> usize {
     unsafe { syscall1(SYS_BRK, new_break as u64) as usize }
 }
 
+// ── Working directory ─────────────────────────────────────────────
+
+/// Update the calling task's current working directory. Stage-4
+/// first cut: absolute paths only (must start with `/`); the
+/// kernel rejects relative paths until `*at(2)` lands. Returns 0
+/// on success, -1 on error (matching POSIX `chdir(3)` shape).
+#[inline]
+pub fn chdir(path: &str) -> i32 {
+    // SAFETY: SYS_CHDIR signature: (path_ptr, path_len). Pointer
+    // stays valid across the call because `&str` borrows outlive
+    // the syscall.
+    let r = unsafe {
+        syscall2(SYS_CHDIR, path.as_ptr() as u64, path.len() as u64)
+    };
+    if r == 0 { 0 } else { -1 }
+}
+
+/// Read the calling task's current working directory into `buf`.
+/// On success returns the byte length of the path (excluding the
+/// NUL terminator), matching the kernel's return-on-success shape.
+/// On any error (buffer too small, no cwd table) returns -1; the
+/// libc wrapper then translates to ERANGE.
+#[inline]
+pub fn getcwd(buf: &mut [u8]) -> i32 {
+    // SAFETY: SYS_GETCWD signature: (buf_ptr, buf_len). The kernel
+    // writes ≤ buf.len() bytes (NUL-terminated) when buf is large
+    // enough; otherwise returns InvalidOp and we don't trust the
+    // buffer state.
+    let r = unsafe {
+        syscall2(SYS_GETCWD, buf.as_mut_ptr() as u64, buf.len() as u64)
+    };
+    // The kernel returns the byte length on success; treat the
+    // sentinel `!0u64` (InvalidOp's payload) as failure as well so
+    // callers don't observe a 64-bit length when truncated.
+    if r == !0u64 { -1 } else { r as i32 }
+}
+
+// ── Sleep ──────────────────────────────────────────────────────────
+
+/// Sleep for at least `ns` nanoseconds. The kernel-side handler
+/// today spin-waits in trap context (see `sys_sleep` in
+/// `userspace/src/handlers.rs`); long sleeps therefore burn the
+/// calling CPU. This wrapper just plumbs the request through —
+/// the user-visible contract is "blocks for ≥ ns wall time".
+/// Returns 0 on success.
+#[inline]
+pub fn nanosleep(ns: u64) -> i32 {
+    // SAFETY: SYS_SLEEP signature: arg0 ns.
+    let r = unsafe { syscall1(SYS_SLEEP, ns) };
+    if r == 0 { 0 } else { -1 }
+}
+
 // ── VFS ────────────────────────────────────────────────────────────
 
 /// Open `path` under `mount`. Returns the fd on success, `None`
@@ -395,6 +469,119 @@ pub fn close(fd: u32) -> Result<(), ()> {
     // SAFETY: SYS_CLOSE signature: (fd).
     let r = unsafe { syscall1(SYS_CLOSE, fd as u64) };
     if r == 0 { Ok(()) } else { Err(()) }
+}
+
+/// Open `path` as an absolute path, with the kernel walking its
+/// mount table to find the longest matching prefix. Returns the
+/// fd on success, `None` on failure. Equivalent to calling
+/// [`open`] with an empty `mount` argument; provided as a named
+/// helper so the absolute-path-only call site reads naturally.
+#[inline]
+pub fn open_abs(path: &str) -> Option<u32> {
+    open(path, "")
+}
+
+// ── Dup family + fcntl ─────────────────────────────────────────────
+
+/// `dup(oldfd)` — install a clone of `oldfd` at the lowest free
+/// slot ≥ 3. Returns the new fd, or `None` when the kernel rejects
+/// the call (e.g. `oldfd` not open).
+#[inline]
+pub fn dup(oldfd: u32) -> Option<u32> {
+    // SAFETY: SYS_DUP signature: (oldfd).
+    let r = unsafe { syscall1(SYS_DUP, oldfd as u64) };
+    if r == !0u64 { None } else { Some(r as u32) }
+}
+
+/// `dup2(oldfd, newfd)` — install a clone at exactly `newfd`,
+/// closing whatever was there. Returns `newfd` on success.
+#[inline]
+pub fn dup2(oldfd: u32, newfd: u32) -> Option<u32> {
+    // SAFETY: SYS_DUP2 signature: (oldfd, newfd).
+    let r = unsafe { syscall2(SYS_DUP2, oldfd as u64, newfd as u64) };
+    if r == !0u64 { None } else { Some(r as u32) }
+}
+
+/// `dup3(oldfd, newfd, flags)` — like [`dup2`] but `flags` controls
+/// `FD_CLOEXEC` on the new fd. `dup3(fd, fd, 0)` is an error per
+/// Linux — pass `dup2` for the same-fd no-op.
+#[inline]
+pub fn dup3(oldfd: u32, newfd: u32, flags: u32) -> Option<u32> {
+    // SAFETY: SYS_DUP3 signature: (oldfd, newfd, flags). RDX must be
+    // declared inout per the ≥3-arg convention (commit b3c6517).
+    let r = unsafe { syscall3(SYS_DUP3, oldfd as u64, newfd as u64, flags as u64) };
+    if r == !0u64 { None } else { Some(r as u32) }
+}
+
+/// `fcntl(fd, cmd, arg)` — supports `F_GETFD` / `F_SETFD` /
+/// `F_GETFL` / `F_SETFL`. Other commands surface as `-1` (the
+/// invalid-op return).
+#[inline]
+pub fn fcntl(fd: u32, cmd: u32, arg: u64) -> i64 {
+    // SAFETY: SYS_FCNTL signature: (fd, cmd, arg). 3 args → RDX inout.
+    let r = unsafe { syscall3(SYS_FCNTL, fd as u64, cmd as u64, arg) };
+    if r == !0u64 { -1 } else { r as i64 }
+}
+
+// ── Stat / Fstat / Pipe ────────────────────────────────────────────
+
+/// Wire-stable stat output. Mirrors the kernel-side struct in
+/// `userspace/src/handlers.rs::StatBuf` exactly. **Wire-stable** —
+/// updates must land on both sides simultaneously. `mode` carries
+/// the FileType in the high bits (`0o100000` file, `0o040000` dir)
+/// and the perm triplet in the low 9 bits.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct StatBuf {
+    pub size:         u64,
+    pub blocks:       u64,
+    pub mode:         u32,
+    pub _pad:         u32,
+    pub mtime_cycles: u64,
+}
+
+/// `stat(path, &mut out)` — write the stat result for the file at
+/// the given absolute path. Returns 0 on success, -1 on failure.
+#[inline]
+pub fn stat(path: &str, out: &mut StatBuf) -> i32 {
+    // SAFETY: SYS_STAT signature: (path_ptr, path_len, out_ptr).
+    let r = unsafe {
+        syscall3(
+            SYS_STAT,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            out as *mut StatBuf as u64,
+        )
+    };
+    if r == 0 { 0 } else { -1 }
+}
+
+/// `fstat(fd, &mut out)` — write the stat result for the open fd.
+/// Returns 0 on success, -1 on failure.
+#[inline]
+pub fn fstat(fd: u32, out: &mut StatBuf) -> i32 {
+    // SAFETY: SYS_FSTAT signature: (fd, out_ptr).
+    let r = unsafe {
+        syscall2(SYS_FSTAT, fd as u64, out as *mut StatBuf as u64)
+    };
+    if r == 0 { 0 } else { -1 }
+}
+
+/// `pipe()` — allocate a fresh pipe and install both halves in the
+/// calling task's fd table. Returns `(read_fd, write_fd)` on success.
+/// On failure (kernel returns non-zero), returns `None`.
+#[inline]
+pub fn pipe() -> Option<(u32, u32)> {
+    let mut fds: [i32; 2] = [-1, -1];
+    // SAFETY: SYS_PIPE signature: (out_ptr). The kernel writes two
+    // i32s through the pointer; `fds` lives on this function's stack
+    // for the duration of the syscall.
+    let r = unsafe { syscall1(SYS_PIPE, fds.as_mut_ptr() as u64) };
+    if r != 0 || fds[0] < 0 || fds[1] < 0 {
+        None
+    } else {
+        Some((fds[0] as u32, fds[1] as u32))
+    }
 }
 
 // ── Time / signal ──────────────────────────────────────────────────

@@ -28,12 +28,26 @@ pub struct FdEntry {
     /// every `Read` / `Write` so they're position-tracking by
     /// default (POSIX semantics).
     pub offset: u64,
+    /// Per-fd flags bitfield. Stage-4 round 2 (Tier-2 fd-table
+    /// breadth) only models `FD_CLOEXEC = bit 0` so dup3/fcntl can
+    /// round-trip the flag; other bits are reserved for future
+    /// O_NONBLOCK / O_DIRECT / etc. Defaults to 0 on every newly
+    /// installed fd — including the dup'd half — so the historical
+    /// "everything inherits across exec" Stage-4 behaviour holds
+    /// until exec actually consults the bit.
+    pub flags:  u32,
 }
+
+/// `FD_CLOEXEC` — bit 0 of `FdEntry::flags`. Mirrors POSIX. Kept
+/// here so callers don't have to import a libc-style header to
+/// poke the bit.
+pub const FD_CLOEXEC: u32 = 1;
 
 impl core::fmt::Debug for FdEntry {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("FdEntry")
             .field("offset", &self.offset)
+            .field("flags",  &self.flags)
             .finish_non_exhaustive()
     }
 }
@@ -117,9 +131,9 @@ pub fn with_table<R>(task_id: u64, op: impl FnOnce(&mut FdTable) -> R) -> Option
         // kernel console. stdin reads return 0 (EOF) until a
         // real keyboard/serial backing lands.
         let console: Arc<dyn FileOps> = Arc::new(ConsoleFile);
-        t.set(0, FdEntry { ops: console.clone(), offset: 0 });
-        t.set(1, FdEntry { ops: console.clone(), offset: 0 });
-        t.set(2, FdEntry { ops: console,         offset: 0 });
+        t.set(0, FdEntry { ops: console.clone(), offset: 0, flags: 0 });
+        t.set(1, FdEntry { ops: console.clone(), offset: 0, flags: 0 });
+        t.set(2, FdEntry { ops: console,         offset: 0, flags: 0 });
         t
     });
     Some(op(table))
