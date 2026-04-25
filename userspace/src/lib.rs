@@ -54,8 +54,9 @@ pub use handlers::{
 };
 pub use loader::{load_elf_bytes, load_into, EntryPoint, LoadBytesError, LoadError};
 pub use process::{
-    init_sysv_stack, load_user_process, ProcessLoadError, SysVStackError,
-    UserProcess, DEFAULT_USER_STACK_BASE, DEFAULT_USER_STACK_BYTES,
+    init_sysv_stack, load_user_process, load_user_process_with,
+    ProcessLoadError, SysVStackError, UserProcess,
+    DEFAULT_USER_STACK_BASE, DEFAULT_USER_STACK_BYTES,
 };
 pub use syscall::{
     install_global, kernel_syscall_entry, kernel_syscall_entry_plain,

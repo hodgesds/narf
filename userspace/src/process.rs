@@ -50,6 +50,8 @@ pub enum ProcessLoadError {
     StackAllocFailed,
     StackMapFailed,
     StackMaterializeFailed,
+    /// argv / envp / aux total exceeded the user stack region.
+    StackOverflow,
 }
 
 impl From<LoadBytesError> for ProcessLoadError {
@@ -58,12 +60,37 @@ impl From<LoadBytesError> for ProcessLoadError {
 
 /// Parse + load `bytes` into a fresh `UserProcess` with a mapped
 /// stack at `DEFAULT_USER_STACK_BASE ..+ DEFAULT_USER_STACK_BYTES`.
+/// `stack_top` points at the highest mapped byte; nothing is laid
+/// out on the stack — `_start` reads zeroes if it tries to fetch
+/// argc.
+///
+/// For a process that needs argv / envp / auxv on the stack at
+/// entry, use `load_user_process_with` instead.
 ///
 /// # Safety
 /// - Identity mapping of the low 4 GiB must still be live (the
 ///   Stage-4 structural contract all of `load_elf_bytes` rides on).
 /// - Frame allocator must be initialised.
 pub unsafe fn load_user_process(bytes: &[u8]) -> Result<UserProcess, ProcessLoadError> {
+    unsafe { load_user_process_with(bytes, &[], &[], &[]) }
+}
+
+/// Parse + load `bytes` into a fresh `UserProcess`, initialising
+/// the user stack with the System V x86_64 startup contract:
+/// argc + argv pointers + envp pointers + aux vector + the strings
+/// they name. `stack_top` in the returned process is updated to
+/// the new RSP value (the address `_start` should be invoked with),
+/// not the highest stack byte.
+///
+/// # Safety
+/// Same contract as [`load_user_process`]: identity-mapped low
+/// 4 GiB + initialised frame allocator.
+pub unsafe fn load_user_process_with(
+    bytes: &[u8],
+    argv:  &[&str],
+    envp:  &[&str],
+    aux:   &[AuxEntry],
+) -> Result<UserProcess, ProcessLoadError> {
     let (address_space, entry) = unsafe { load_elf_bytes(bytes) }?;
 
     // Allocate + map a user stack. Pages come from the global
@@ -95,11 +122,22 @@ pub unsafe fn load_user_process(bytes: &[u8]) -> Result<UserProcess, ProcessLoad
     unsafe { address_space.materialize() }
         .map_err(|_| ProcessLoadError::StackMaterializeFailed)?;
 
+    let stack_bytes  = pages * 4096;
+    let stack_top_v  = DEFAULT_USER_STACK_BASE + stack_bytes;
+    // Lay out argc/argv/envp/auxv if anything was supplied; an
+    // entirely empty (no-args) process keeps the all-zero stack.
+    let rsp = if argv.is_empty() && envp.is_empty() && aux.is_empty() {
+        stack_top_v
+    } else {
+        unsafe { init_sysv_stack(stack_phys, stack_top_v, stack_bytes, argv, envp, aux) }
+            .map_err(|_| ProcessLoadError::StackOverflow)?
+    };
+
     Ok(UserProcess {
         pid:           alloc_pid(),
         address_space,
         entry,
-        stack_top:     VirtAddr::new(DEFAULT_USER_STACK_BASE + pages * 4096),
+        stack_top:     VirtAddr::new(rsp),
     })
 }
 
