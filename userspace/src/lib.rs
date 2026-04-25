@@ -39,20 +39,24 @@ extern crate alloc;
 pub mod elf;
 pub mod fd;
 pub mod handlers;
+pub mod interp;
 pub mod loader;
 pub mod process;
 pub mod syscall;
 pub mod user_task;
 
+pub use interp::{lookup_interpreter, register_interpreter};
+
 pub use fd::{FdEntry, FdTable};
 
 pub use elf::{parse as parse_elf, ElfError};
 pub use handlers::{
-    abi_file_op_bridge, bootstrap_init, bootstrap_live_count,
+    abi_file_op_bridge, bootstrap_init, bootstrap_live_count, brk_init,
     clear_exit_landing, install_address_space_lookup, install_core_syscalls,
     install_task_id_lookup, set_exit_landing, shared_rings_for,
-    spawn_dispatcher_for, take_kernel_ends, take_user_ends, SharedRingPair,
-    TaskRings, UserRingEnds, BOOTSTRAP_SHARED_RING_DEPTH,
+    sigaction_init, sigaction_lookup, spawn_dispatcher_for, take_kernel_ends,
+    take_user_ends, SharedRingPair, TaskRings, UserRingEnds,
+    BOOTSTRAP_SHARED_RING_DEPTH,
 };
 pub use user_task::{
     clear_current as clear_current_user_task, current_user_task,
@@ -60,7 +64,9 @@ pub use user_task::{
     install_yield_hook, UserExit, UserTaskCtx, EXIT_REASON_EXITED,
     EXIT_REASON_YIELDED,
 };
-pub use loader::{load_elf_bytes, load_into, EntryPoint, LoadBytesError, LoadError};
+pub use loader::{
+    load_elf_bytes, load_elf_into_at, load_into, EntryPoint, LoadBytesError, LoadError,
+};
 pub use process::{
     init_sysv_stack, load_user_process, load_user_process_with,
     ProcessLoadError, SysVStackError, UserProcess,

@@ -111,29 +111,28 @@ impl From<LoadError> for LoadBytesError {
     fn from(e: LoadError) -> Self { LoadBytesError::Load(e) }
 }
 
-/// One-shot: parse ELF bytes, allocate a fresh user `AddressSpace`,
-/// map + materialize every `PT_LOAD` segment, and copy the segment
-/// data from `bytes` into the backing physical frames. Returns the
-/// `Arc<AddressSpace>` ready to attach to a `spawn_user` task, plus
-/// the entry point.
+/// Parse ELF `bytes`, allocate fresh frames for every `PT_LOAD`
+/// segment, copy bytes in, and push regions onto the existing
+/// `addr_space` with each segment's vaddr biased by `vaddr_bias`.
+/// Returns the (biased) entry point. Does NOT call `materialize` —
+/// the caller batches a single materialize call after every image
+/// has been staged so PT_INTERP can share an AS with the program.
 ///
-/// BSS (the `mem_size > file_size` tail) is zero — frames come from
-/// the allocator freshly-zeroed.
+/// `vaddr_bias = 0` reproduces the historical behaviour for an
+/// `ET_EXEC` program; non-zero biases place a `PT_DYN` interpreter
+/// (or PIE program) at a chosen base.
 ///
 /// # Safety
-/// - `bytes` must be a live slice for the duration of this call.
-/// - The kernel must be running with the low 4 GiB identity-mapped
-///   so `phys.raw() as *mut u8` writes reach the backing storage.
-/// - Frame allocator must be initialised.
-pub unsafe fn load_elf_bytes(
-    bytes: &[u8],
-) -> Result<(Arc<AddressSpace>, EntryPoint), LoadBytesError> {
+/// Same identity-mapping + frame-allocator contract as
+/// [`load_elf_bytes`].
+pub unsafe fn load_elf_into_at(
+    bytes:      &[u8],
+    addr_space: &AddressSpace,
+    vaddr_bias: u64,
+) -> Result<u64, LoadBytesError> {
     let image = crate::parse_elf(bytes)?;
-
-    // SAFETY: `new_for_user` contract — caller is in kernel mode
-    // with paging up.
-    let addr_space = unsafe { AddressSpace::new_for_user() }
-        .map_err(|e| LoadBytesError::Load(LoadError::AddressSpace(e)))?;
+    if image.segments.is_empty() { return Err(LoadBytesError::Load(LoadError::NoSegments)); }
+    if image.entry == 0          { return Err(LoadBytesError::Load(LoadError::BadEntry)); }
 
     // Allocate all needed frames up front, chunk by chunk.
     let mut allocated: alloc::vec::Vec<PhysAddr> = alloc::vec::Vec::new();
@@ -154,20 +153,30 @@ pub unsafe fn load_elf_bytes(
         }
     }
 
-    // Map each segment. `load_into` consumes frames from the pool.
-    let entry = load_into(&image, allocated.iter().copied(), &addr_space)?;
+    // Push regions, mirroring `load_into` but with the bias applied
+    // to each segment's base vaddr.
+    let mut pool = allocated.iter().copied();
+    for seg in &image.segments {
+        let first = pool.next().ok_or(LoadBytesError::NoFrame)?;
+        let pages = (seg.mem_size + 0xFFF) >> 12;
+        for _ in 1..pages { let _ = pool.next().ok_or(LoadBytesError::NoFrame)?; }
 
-    // Copy segment data. We re-walk `allocated` mirroring
-    // `load_into`'s consumption order: one frame per page of
-    // `mem_size`, contiguous.
+        addr_space.map_region(Region {
+            base:  VirtAddr::new(seg.vaddr.wrapping_add(vaddr_bias)),
+            len:   (pages as u64) << 12,
+            perms: perms_of(seg.flags),
+            phys:  first,
+        }).map_err(|e| LoadBytesError::Load(LoadError::AddressSpace(e)))?;
+    }
+
+    // Copy segment data. Re-walk the pool in identical consumption
+    // order so each segment finds the frames it just got mapped to.
     let mut pool = allocated.iter().copied();
     for seg in &image.segments {
         let first = pool.next().ok_or(LoadBytesError::NoFrame)?;
         let pages = (seg.mem_size + 0xFFF) >> 12;
         for _ in 1..pages { let _ = pool.next(); }
 
-        // Copy `file_size` bytes from `bytes[file_off..]` into the
-        // contiguous physical range starting at `first`.
         let start = seg.file_off as usize;
         let end   = start.checked_add(seg.file_size as usize)
             .ok_or(LoadBytesError::ByteCopyOutOfBounds)?;
@@ -186,11 +195,40 @@ pub unsafe fn load_elf_bytes(
         }
     }
 
+    Ok(image.entry.wrapping_add(vaddr_bias))
+}
+
+/// One-shot: parse ELF bytes, allocate a fresh user `AddressSpace`,
+/// map + materialize every `PT_LOAD` segment, and copy the segment
+/// data from `bytes` into the backing physical frames. Returns the
+/// `Arc<AddressSpace>` ready to attach to a `spawn_user` task, plus
+/// the entry point.
+///
+/// BSS (the `mem_size > file_size` tail) is zero — frames come from
+/// the allocator freshly-zeroed.
+///
+/// # Safety
+/// - `bytes` must be a live slice for the duration of this call.
+/// - The kernel must be running with the low 4 GiB identity-mapped
+///   so `phys.raw() as *mut u8` writes reach the backing storage.
+/// - Frame allocator must be initialised.
+pub unsafe fn load_elf_bytes(
+    bytes: &[u8],
+) -> Result<(Arc<AddressSpace>, EntryPoint), LoadBytesError> {
+    // SAFETY: `new_for_user` contract — caller is in kernel mode
+    // with paging up.
+    let addr_space = unsafe { AddressSpace::new_for_user() }
+        .map_err(|e| LoadBytesError::Load(LoadError::AddressSpace(e)))?;
+
+    // SAFETY: forwarding the caller's identity-map + allocator
+    // contract; bias 0 keeps historical behaviour for ET_EXEC.
+    let entry = unsafe { load_elf_into_at(bytes, &addr_space, 0) }?;
+
     // Install PTEs.
     // SAFETY: AS constructed by `new_for_user`; regions just pushed
-    // via `load_into`.
+    // via `load_elf_into_at`.
     unsafe { addr_space.materialize() }
         .map_err(|e| LoadBytesError::Load(LoadError::AddressSpace(e)))?;
 
-    Ok((Arc::new(addr_space), entry))
+    Ok((Arc::new(addr_space), EntryPoint(VirtAddr::new(entry))))
 }

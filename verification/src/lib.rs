@@ -6847,6 +6847,213 @@ fn smoke_userspace_load_user_process_with_argv() -> TestResult {
 kernel_test!(smoke_userspace_load_user_process_with_argv);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_userspace_load_user_process_with_interp() -> TestResult {
+    // PT_INTERP follow-through. Build two minimal ELFs:
+    //
+    //   - program: 2 PT_LOAD segments (RX code + RW data) + 1
+    //     PT_INTERP pointing at the literal "ld-narf\0".
+    //   - interp:  1 PT_LOAD segment (RX code).
+    //
+    // Register the interpreter under "ld-narf", call
+    // load_user_process_with, and verify:
+    //   - proc.entry resolves to the *interpreter's* entry +
+    //     INTERP_BIAS (the program's entry is forwarded via
+    //     AT_ENTRY).
+    //   - Both bias=0 (program) and bias=INTERP_BIAS (interp)
+    //     vaddr ranges materialise.
+    //   - region_count() == 4 (program code + program data +
+    //     interp code + stack).
+    //   - The aux vector on the stack carries AT_PAGESZ, AT_ENTRY,
+    //     AT_BASE with the expected values.
+    use narf_memory::x86_64::paging;
+    use narf_memory::VirtAddr;
+    use narf_userspace::{
+        interp::__test_clear_interpreters,
+        load_user_process_with, register_interpreter,
+    };
+
+    const INTERP_BIAS:    u64 = 0x0000_4000_0000_0000;
+    const PROG_CODE_VA:   u64 = 0x0000_0080_0000_1000;
+    const PROG_DATA_VA:   u64 = 0x0000_0080_0000_2000;
+    const PROG_ENTRY:     u64 = 0x0000_0080_0000_1111;
+    const INTERP_CODE_VA: u64 = 0x0000_0000_0000_1000;
+    const INTERP_ENTRY:   u64 = 0x0000_0000_0000_1234;
+
+    // Build a 3-phdr program ELF. Phdr 0 = PT_INTERP naming the
+    // string at offset 64+3*56=232; phdrs 1 & 2 = PT_LOAD code/data
+    // backed by file pages at offset 0x1000 / 0x2000.
+    fn write_program() -> alloc::vec::Vec<u8> {
+        const FSIZE: usize = 0x3000;
+        let mut b = alloc::vec![0u8; FSIZE];
+        // ELF ident + e_type/e_machine/e_version.
+        b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        b[0x10..0x12].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        b[0x12..0x14].copy_from_slice(&0x3Eu16.to_le_bytes());
+        b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+        b[0x18..0x20].copy_from_slice(&PROG_ENTRY.to_le_bytes());
+        b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        b[0x28..0x30].copy_from_slice(&0u64.to_le_bytes());  // e_shoff
+        b[0x30..0x34].copy_from_slice(&0u32.to_le_bytes());  // e_flags
+        b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        b[0x38..0x3A].copy_from_slice(&3u16.to_le_bytes());  // e_phnum
+        // Phdr 0 — PT_INTERP pointing at the "ld-narf\0" string.
+        let interp_str = b"ld-narf\0";
+        let interp_off = 64 + 3 * 56;
+        b[interp_off..interp_off + interp_str.len()].copy_from_slice(interp_str);
+        let mut ph = 64usize;
+        b[ph + 0x00..ph + 0x04].copy_from_slice(&3u32.to_le_bytes()); // PT_INTERP
+        b[ph + 0x04..ph + 0x08].copy_from_slice(&4u32.to_le_bytes()); // PF_R
+        b[ph + 0x08..ph + 0x10].copy_from_slice(&(interp_off as u64).to_le_bytes());
+        b[ph + 0x10..ph + 0x18].copy_from_slice(&0u64.to_le_bytes());
+        b[ph + 0x18..ph + 0x20].copy_from_slice(&0u64.to_le_bytes());
+        b[ph + 0x20..ph + 0x28].copy_from_slice(&(interp_str.len() as u64).to_le_bytes());
+        b[ph + 0x28..ph + 0x30].copy_from_slice(&(interp_str.len() as u64).to_le_bytes());
+        b[ph + 0x30..ph + 0x38].copy_from_slice(&1u64.to_le_bytes());
+        // Phdr 1 — PT_LOAD code (RX) at PROG_CODE_VA, file off 0x1000.
+        ph = 64 + 56;
+        b[ph + 0x00..ph + 0x04].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        b[ph + 0x04..ph + 0x08].copy_from_slice(&5u32.to_le_bytes()); // PF_R|PF_X
+        b[ph + 0x08..ph + 0x10].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x10..ph + 0x18].copy_from_slice(&PROG_CODE_VA.to_le_bytes());
+        b[ph + 0x18..ph + 0x20].copy_from_slice(&PROG_CODE_VA.to_le_bytes());
+        b[ph + 0x20..ph + 0x28].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x28..ph + 0x30].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x30..ph + 0x38].copy_from_slice(&0x1000u64.to_le_bytes());
+        // Phdr 2 — PT_LOAD data (RW) at PROG_DATA_VA, file off 0x2000.
+        ph = 64 + 2 * 56;
+        b[ph + 0x00..ph + 0x04].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        b[ph + 0x04..ph + 0x08].copy_from_slice(&6u32.to_le_bytes()); // PF_R|PF_W
+        b[ph + 0x08..ph + 0x10].copy_from_slice(&0x2000u64.to_le_bytes());
+        b[ph + 0x10..ph + 0x18].copy_from_slice(&PROG_DATA_VA.to_le_bytes());
+        b[ph + 0x18..ph + 0x20].copy_from_slice(&PROG_DATA_VA.to_le_bytes());
+        b[ph + 0x20..ph + 0x28].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x28..ph + 0x30].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x30..ph + 0x38].copy_from_slice(&0x1000u64.to_le_bytes());
+        b
+    }
+
+    // Single PT_LOAD interpreter ELF. ET_EXEC keeps the parser
+    // happy; entry sits inside the loaded page.
+    fn write_interp() -> alloc::vec::Vec<u8> {
+        const FSIZE: usize = 0x2000;
+        let mut b = alloc::vec![0u8; FSIZE];
+        b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        b[0x10..0x12].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        b[0x12..0x14].copy_from_slice(&0x3Eu16.to_le_bytes());
+        b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+        b[0x18..0x20].copy_from_slice(&INTERP_ENTRY.to_le_bytes());
+        b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes());
+        b[0x28..0x30].copy_from_slice(&0u64.to_le_bytes());
+        b[0x30..0x34].copy_from_slice(&0u32.to_le_bytes());
+        b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());
+        b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+        b[0x38..0x3A].copy_from_slice(&1u16.to_le_bytes());
+        let ph = 64usize;
+        b[ph + 0x00..ph + 0x04].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        b[ph + 0x04..ph + 0x08].copy_from_slice(&5u32.to_le_bytes()); // PF_R|PF_X
+        b[ph + 0x08..ph + 0x10].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x10..ph + 0x18].copy_from_slice(&INTERP_CODE_VA.to_le_bytes());
+        b[ph + 0x18..ph + 0x20].copy_from_slice(&INTERP_CODE_VA.to_le_bytes());
+        b[ph + 0x20..ph + 0x28].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x28..ph + 0x30].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x30..ph + 0x38].copy_from_slice(&0x1000u64.to_le_bytes());
+        b
+    }
+
+    __test_clear_interpreters();
+
+    let prog_bytes = write_program();
+    // Leak the interp bytes — the registry stores `&'static [u8]`
+    // for the lifetime of the kernel. Tests run once per boot so a
+    // small leak is fine; production code's interpreter bytes come
+    // from `.rodata` of an init image.
+    let interp_bytes = alloc::boxed::Box::leak(write_interp().into_boxed_slice());
+    register_interpreter("ld-narf", interp_bytes);
+
+    let proc = match unsafe { load_user_process_with(&prog_bytes, &[], &[], &[]) } {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("load_user_process_with failed"),
+    };
+
+    // Entry must point at the interpreter (program entry + INTERP_BIAS
+    // for the interp's vaddr — its INTERP_ENTRY plus the bias).
+    if proc.entry.0 != VirtAddr::new(INTERP_ENTRY + INTERP_BIAS) {
+        return TestResult::Fail("entry should be interpreter entry + bias");
+    }
+
+    if proc.address_space.region_count() != 4 {
+        return TestResult::Fail("expected 4 regions (program code/data + interp + stack)");
+    }
+
+    // Both program and interpreter pages must be materialised.
+    if unsafe { paging::translate(proc.address_space.root, VirtAddr::new(PROG_CODE_VA)) }
+        .is_none()
+    {
+        return TestResult::Fail("program code not materialised");
+    }
+    if unsafe { paging::translate(proc.address_space.root, VirtAddr::new(PROG_DATA_VA)) }
+        .is_none()
+    {
+        return TestResult::Fail("program data not materialised");
+    }
+    if unsafe {
+        paging::translate(proc.address_space.root, VirtAddr::new(INTERP_CODE_VA + INTERP_BIAS))
+    }
+    .is_none()
+    {
+        return TestResult::Fail("interpreter code not materialised at bias");
+    }
+
+    // Walk the aux vector on the stack: argc=0, argv NULL, envp
+    // NULL, then aux pairs. Match by AT_* tag.
+    let read_u64 = |vaddr: u64| -> Option<u64> {
+        let p = unsafe { paging::translate(proc.address_space.root, VirtAddr::new(vaddr & !0xFFF)) }?;
+        Some(unsafe { *((p.as_u64() | (vaddr & 0xFFF)) as *const u64) })
+    };
+    let rsp = proc.stack_top.as_u64();
+    let argc = read_u64(rsp).unwrap_or(0xDEAD);
+    if argc != 0 { return TestResult::Fail("argc should be 0 in this test"); }
+    let argv_null = read_u64(rsp + 8).unwrap_or(0xDEAD);
+    if argv_null != 0 { return TestResult::Fail("argv NULL terminator missing"); }
+    let envp_null = read_u64(rsp + 16).unwrap_or(0xDEAD);
+    if envp_null != 0 { return TestResult::Fail("envp NULL terminator missing"); }
+
+    // Aux pairs start at rsp+24. Walk until AT_NULL (key=0); we
+    // expect to find AT_PAGESZ(6), AT_ENTRY(9), AT_BASE(7).
+    let mut at_pagesz: Option<u64> = None;
+    let mut at_entry:  Option<u64> = None;
+    let mut at_base:   Option<u64> = None;
+    let mut p = rsp + 24;
+    for _ in 0..16 {
+        let key = read_u64(p).unwrap_or(0xDEAD);
+        let val = read_u64(p + 8).unwrap_or(0xDEAD);
+        match key {
+            0  => break,
+            6  => at_pagesz = Some(val),
+            9  => at_entry  = Some(val),
+            7  => at_base   = Some(val),
+            _  => {}
+        }
+        p += 16;
+    }
+    if at_pagesz != Some(4096) {
+        return TestResult::Fail("AT_PAGESZ missing or wrong");
+    }
+    if at_entry != Some(PROG_ENTRY) {
+        return TestResult::Fail("AT_ENTRY should be the program entry");
+    }
+    if at_base != Some(INTERP_BIAS) {
+        return TestResult::Fail("AT_BASE should be the interp bias");
+    }
+
+    __test_clear_interpreters();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_userspace_load_user_process_with_interp);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_userspace_init_sysv_stack_layout() -> TestResult {
     // Verify `init_sysv_stack` lays out the System V x86_64 startup
     // contract: argc at [rsp], then argv pointers + NULL, then envp
@@ -8198,11 +8405,9 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
 // of the polling routine for `UserTaskFuture::poll`. The
 // `UserTaskCtx` + hook infrastructure under it is exercised by
 // `smoke_frame_x86_64_user_mode_yield_resume`'s state-save round-
-// trip; this version (which uses `install_core_syscalls` + hooks
-// instead of a manual landing) wedges in an as-yet-unidentified
-// interaction with the trap-stack restore. Registration disabled
-// until that's diagnosed; the function itself stays so the next
-// round can pick it up.
+// trip; this version wedges on a yet-undiagnosed interaction
+// when registered. Disabled here; the function body stays so the
+// next round can pick it up.
 #[allow(dead_code)]
 fn _smoke_frame_x86_64_user_task_poll_yield_exit_unused() {}
 

@@ -19,7 +19,10 @@ use alloc::sync::Arc;
 
 use narf_memory::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
-use crate::{alloc_pid, load_elf_bytes, loader::LoadBytesError, AuxEntry, EntryPoint, ProcessId};
+use crate::{
+    alloc_pid, interp, load_elf_bytes, loader::load_elf_into_at,
+    loader::LoadBytesError, AuxEntry, EntryPoint, ProcessId,
+};
 
 /// Default user stack size: 16 KiB. Small enough to fit on boot
 /// images comfortably, big enough for relibc-style startup + a few
@@ -91,7 +94,32 @@ pub unsafe fn load_user_process_with(
     envp:  &[&str],
     aux:   &[AuxEntry],
 ) -> Result<UserProcess, ProcessLoadError> {
-    let (address_space, entry) = unsafe { load_elf_bytes(bytes) }?;
+    let (address_space, program_entry) = unsafe { load_elf_bytes(bytes) }?;
+
+    // PT_INTERP follow-through: if the program names an interpreter
+    // and we have its bytes registered, load it at a fixed bias and
+    // hand the scheduler the interpreter's entry. The interpreter
+    // is then responsible for relocating the program and jumping to
+    // `AT_ENTRY`. Bias is well-separated from the typical low-half
+    // program load address so the two ranges never collide.
+    const INTERP_BIAS: u64 = 0x0000_4000_0000_0000;
+    let image = crate::parse_elf(bytes).map_err(|e| LoadBytesError::Elf(e))?;
+    let mut entry = program_entry;
+    let mut interp_loaded = false;
+    if let Some(name) = image.interp.as_deref() {
+        if let Some(interp_bytes) = interp::lookup_interpreter(name) {
+            let interp_entry = unsafe {
+                load_elf_into_at(interp_bytes, &address_space, INTERP_BIAS)
+            }?;
+            // SAFETY: AS already has its PML4 from `load_elf_bytes`;
+            // we just appended interp regions and materialize is
+            // idempotent for the program pages already installed.
+            unsafe { address_space.materialize() }
+                .map_err(|e| LoadBytesError::Load(crate::loader::LoadError::AddressSpace(e)))?;
+            entry = EntryPoint(VirtAddr::new(interp_entry));
+            interp_loaded = true;
+        }
+    }
 
     // Allocate + map a user stack. Pages come from the global
     // frame allocator; they live in the AS's region table.
@@ -124,13 +152,34 @@ pub unsafe fn load_user_process_with(
 
     let stack_bytes  = pages * 4096;
     let stack_top_v  = DEFAULT_USER_STACK_BASE + stack_bytes;
+    let _ = stack_phys;  // resolved per-page through the AS now
+
+    // Build the final aux vector: caller-supplied entries take
+    // precedence; we append interp-related defaults (AT_ENTRY,
+    // AT_BASE, AT_PAGESZ) only when the caller didn't already set
+    // them. This is what relibc / a Shiva-style ld-narf needs to
+    // find the program after the interpreter starts.
+    let final_aux: alloc::vec::Vec<AuxEntry> = if interp_loaded {
+        let mut v: alloc::vec::Vec<AuxEntry> = aux.iter().copied().collect();
+        for default in [
+            AuxEntry::Pagesz(4096),
+            AuxEntry::Entry(program_entry.0.as_u64()),
+            AuxEntry::Base(INTERP_BIAS),
+        ] {
+            let tag = default.tag();
+            if !v.iter().any(|e| e.tag() == tag) { v.push(default); }
+        }
+        v
+    } else {
+        aux.iter().copied().collect()
+    };
+
     // Lay out argc/argv/envp/auxv if anything was supplied; an
     // entirely empty (no-args) process keeps the all-zero stack.
-    let _ = stack_phys;  // resolved per-page through the AS now
-    let rsp = if argv.is_empty() && envp.is_empty() && aux.is_empty() {
+    let rsp = if argv.is_empty() && envp.is_empty() && final_aux.is_empty() {
         stack_top_v
     } else {
-        unsafe { init_sysv_stack(&address_space, stack_top_v, stack_bytes, argv, envp, aux) }
+        unsafe { init_sysv_stack(&address_space, stack_top_v, stack_bytes, argv, envp, &final_aux) }
             .map_err(|_| ProcessLoadError::StackOverflow)?
     };
 
