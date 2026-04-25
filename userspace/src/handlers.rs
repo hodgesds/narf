@@ -790,6 +790,17 @@ fn sys_ring_kick(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(processed));
 }
 
+// ── GetPid / GetPpid — POSIX-shaped task-id surface ────────────────
+
+fn sys_getpid(ctx: &mut dyn TrapContext) {
+    ctx.set_return(SyscallReturn::ok(current_task_id()));
+}
+
+fn sys_getppid(ctx: &mut dyn TrapContext) {
+    // Stage-4 stub: scheduler doesn't track parentage yet.
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
 // ── Yield / Sleep — Ok ─────────────────────────────────────────────
 
 fn sys_noop_ok(ctx: &mut dyn TrapContext) {
@@ -866,6 +877,8 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Mmap,     "mmap",     RawFnHandler(sys_mmap));
     table.install_raw(Syscall::Munmap,   "munmap",   RawFnHandler(sys_munmap));
     table.install_raw(Syscall::RingKick, "ringkick", RawFnHandler(sys_ring_kick));
+    table.install_raw(Syscall::GetPid,   "getpid",   RawFnHandler(sys_getpid));
+    table.install_raw(Syscall::GetPpid,  "getppid",  RawFnHandler(sys_getppid));
     table.install_raw(Syscall::ExitTask, "exit",     RawFnHandler(sys_exit_task));
     table.install_raw(Syscall::Yield,    "yield",    RawFnHandler(sys_noop_ok));
     table.install_raw(Syscall::Sleep,    "sleep",    RawFnHandler(sys_noop_ok));

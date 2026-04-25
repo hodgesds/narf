@@ -33,6 +33,10 @@ const SYS_BOOTSTRAP: u64 = 101;
 #[cfg(target_arch = "x86_64")]
 const SYS_RING_KICK: u64 = 130;
 #[cfg(target_arch = "x86_64")]
+const SYS_GETPID:    u64 = 140;
+#[cfg(target_arch = "x86_64")]
+const SYS_GETPPID:   u64 = 141;
+#[cfg(target_arch = "x86_64")]
 const SYS_OPEN:      u64 = 110;
 #[cfg(target_arch = "x86_64")]
 const SYS_READ:      u64 = 111;
@@ -344,6 +348,20 @@ fn start_rust(rsp_at_entry: u64) -> ! {
             let (wp, wl) = if wr_ok { (WROK.as_ptr(), WROK.len()) }
                             else     { (WRBAD.as_ptr(), WRBAD.len()) };
             syscall3(SYS_WRITE, 1, wp as u64, wl as u64);
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            const POK:  &[u8] = b"pid: ok\n";
+            const PBAD: &[u8] = b"pid: bad\n";
+            // Stage-4: getpid returns the kernel's task lookup
+            // value (no parent tracking yet so getppid is 0). Just
+            // confirm the calls return without faulting.
+            let _pid = syscall0(SYS_GETPID);
+            let ppid = syscall0(SYS_GETPPID);
+            let pid_ok = ppid == 0;
+            let (pp, pl) = if pid_ok { (POK.as_ptr(), POK.len()) }
+                            else      { (PBAD.as_ptr(), PBAD.len()) };
+            syscall3(SYS_WRITE, 1, pp as u64, pl as u64);
         }
         syscall3(SYS_WRITE, 1, MSG.as_ptr() as u64, MSG.len() as u64);
         syscall0(SYS_EXIT_TASK);

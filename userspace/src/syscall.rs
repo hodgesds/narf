@@ -111,6 +111,16 @@ pub enum Syscall {
     /// shared SubmissionRing and post Completions to the shared
     /// CompletionRing. Returns the number of submissions processed.
     RingKick     = 130,
+
+    /// Return the calling task's monotonic id. POSIX-shaped surface
+    /// for relibc's `getpid()` / `gettid()` (we don't yet
+    /// distinguish PID from TID — single-thread-per-process at
+    /// Stage 4).
+    GetPid       = 140,
+    /// Return the calling task's parent id, or 0 if none. Stage 4
+    /// stub: returns 0 unconditionally; real ppid lands once the
+    /// scheduler tracks parentage.
+    GetPpid      = 141,
 }
 
 impl Syscall {
@@ -134,6 +144,8 @@ impl Syscall {
             120 => Syscall::Mmap,
             121 => Syscall::Munmap,
             130 => Syscall::RingKick,
+            140 => Syscall::GetPid,
+            141 => Syscall::GetPpid,
             _   => return None,
         })
     }
