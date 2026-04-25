@@ -56,6 +56,18 @@ pub trait TrapContext {
     /// path can't yet rewrite the EL/CPL target. Callers should
     /// check the return and fall back to `set_return` if `false`.
     fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool;
+
+    /// Save the trapping user-mode CPU state (GPRs, RIP, RSP,
+    /// RFLAGS) to `out` so a later resume path can re-enter user
+    /// mode at exactly the next instruction. Returns `true` on
+    /// arches that have a `UserState` shape (x86_64 today);
+    /// `false` elsewhere. The pointer is `*mut u8` because the
+    /// concrete `UserState` type is arch-specific — callers cast.
+    ///
+    /// # Safety
+    /// `out` must point at a writable region of at least
+    /// `UserState`-sized bytes for the calling arch.
+    unsafe fn save_user_state(&self, _out: *mut u8) -> bool { false }
 }
 
 // ── Numbers ─────────────────────────────────────────────────────────

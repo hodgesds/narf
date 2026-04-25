@@ -194,4 +194,19 @@ impl<'a> TrapContext for X86TrapContext<'a> {
         self.frame.ss  = super::gdt::KDATA_SEL as u64;
         true
     }
+
+    unsafe fn save_user_state(&self, out: *mut u8) -> bool {
+        use super::user::UserState;
+        // SAFETY: caller declared `out` is writable for at least
+        // `size_of::<UserState>()` bytes — the trait's contract.
+        let s = unsafe { &mut *(out as *mut UserState) };
+        let f = &self.frame;
+        s.r15 = f.r15; s.r14 = f.r14; s.r13 = f.r13; s.r12 = f.r12;
+        s.r11 = f.r11; s.r10 = f.r10; s.r9  = f.r9;  s.r8  = f.r8;
+        s.rbp = f.rbp; s.rdi = f.rdi; s.rsi = f.rsi; s.rdx = f.rdx;
+        s.rcx = f.rcx; s.rbx = f.rbx; s.rax = f.rax;
+        s.rip = f.rip; s.rflags = f.rflags; s.rsp = f.rsp;
+        s.valid = 1;
+        true
+    }
 }

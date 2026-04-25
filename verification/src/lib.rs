@@ -7622,6 +7622,50 @@ unsafe extern "C" fn user_mode_enter(rip: u64, rsp: u64) -> ! {
     );
 }
 
+// Mirrors `narf_frame::x86_64::user::UserState`. Inlined here so
+// verification (which doesn't link against narf-frame) can read it.
+// Field order load-bearing — the resume trampoline reads by offset.
+#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+struct UserState {
+    r15: u64, r14: u64, r13: u64, r12: u64,
+    r11: u64, r10: u64, r9:  u64, r8:  u64,
+    rbp: u64, rdi: u64, rsi: u64, rdx: u64,
+    rcx: u64, rbx: u64, rax: u64,
+    rip: u64, rflags: u64, rsp: u64,
+    valid: u64,
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
+#[unsafe(naked)]
+unsafe extern "C" fn user_mode_resume(_state: *const UserState) -> ! {
+    core::arch::naked_asm!(
+        "push 0x2B",                       // SS
+        "push qword ptr [rdi + 8*17]",     // user RSP
+        "push qword ptr [rdi + 8*16]",     // RFLAGS
+        "push 0x33",                       // CS
+        "push qword ptr [rdi + 8*15]",     // RIP
+        "mov r15, [rdi + 8*0]",
+        "mov r14, [rdi + 8*1]",
+        "mov r13, [rdi + 8*2]",
+        "mov r12, [rdi + 8*3]",
+        "mov r11, [rdi + 8*4]",
+        "mov r10, [rdi + 8*5]",
+        "mov r9,  [rdi + 8*6]",
+        "mov r8,  [rdi + 8*7]",
+        "mov rbp, [rdi + 8*8]",
+        "mov rsi, [rdi + 8*10]",
+        "mov rdx, [rdi + 8*11]",
+        "mov rcx, [rdi + 8*12]",
+        "mov rbx, [rdi + 8*13]",
+        "mov rax, [rdi + 8*14]",
+        "mov rdi, [rdi + 8*9]",
+        "swapgs",
+        "iretq",
+    );
+}
+
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
 fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
     // Full end-to-end: build a user AS with a code + stack page,
@@ -7780,6 +7824,208 @@ fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
 }
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
 kernel_test!(smoke_frame_x86_64_user_mode_roundtrip);
+
+#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
+fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
+    // Foundation for scheduler-native user tasks: a trap from user
+    // saves CPU state into a UserState slot, the kernel jumps to a
+    // landing trampoline which calls `enter_user_mode_resume` to
+    // re-enter at the saved RIP. End-to-end: user issues SYS_YIELD,
+    // kernel saves state + redirects to landing, landing resumes
+    // user mode at the next instruction, user issues SYS_SLEEP with
+    // a magic — the magic must match what the user wrote between
+    // yield and sleep, proving state was preserved across the
+    // user→kernel→user transition.
+    use core::arch::naked_asm;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
+    use narf_userspace::{
+        install_global, syscall::__test_clear_global,
+        RawSyscallHandler, Syscall, SyscallTable, TrapContext,
+    };
+
+    static SEEN_MAGIC: AtomicU64 = AtomicU64::new(0);
+    static SAVED_CR3: AtomicU64 = AtomicU64::new(0);
+    static mut SAVED_USER: UserState = UserState {
+        r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
+        rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0,
+        rip: 0, rflags: 0, rsp: 0, valid: 0,
+    };
+    static mut JMP: UserModeJmpBuf = UserModeJmpBuf {
+        rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, rsp: 0, rip: 0,
+    };
+    // Tiny kernel stack for the resume trampoline — `user_mode_resume`
+    // pushes a 5-qword iretq frame, which a 256-byte stack absorbs
+    // comfortably.
+    #[repr(C, align(16))]
+    struct ResumeStack([u64; 32]);
+    static mut RESUME_STACK: ResumeStack = ResumeStack([0; 32]);
+
+    // Yield handler: save user state, redirect_to_kernel into the
+    // resume trampoline. The trampoline calls enter_user_mode_resume
+    // with a pointer to SAVED_USER, which iretq's back to user at
+    // the saved RIP.
+    struct YieldHandler;
+    impl RawSyscallHandler for YieldHandler {
+        fn invoke(&self, ctx: &mut dyn TrapContext) {
+            // SAFETY: SAVED_USER is a sized slot for this trap path.
+            unsafe {
+                ctx.save_user_state(core::ptr::addr_of_mut!(SAVED_USER) as *mut u8);
+            }
+            // The resume trampoline tail-calls user_mode_resume which
+            // pushes a 5-qword iretq frame — supply a real kernel
+            // stack so that doesn't fault.
+            let stack_top = unsafe {
+                let p = core::ptr::addr_of_mut!(RESUME_STACK) as *mut u64;
+                p.add(32) as u64
+            };
+            let _ = ctx.redirect_to_kernel(
+                resume_landing as usize as u64,
+                stack_top,
+            );
+        }
+    }
+
+    // Sleep handler: captures the second magic, longjmps back to
+    // the test's setjmp.
+    struct UnwindHandler;
+    impl RawSyscallHandler for UnwindHandler {
+        fn invoke(&self, ctx: &mut dyn TrapContext) {
+            SEEN_MAGIC.store(ctx.args().arg0, Ordering::Release);
+            let _ = ctx.redirect_to_kernel(
+                resume_trampoline as usize as u64,
+                0xFFFF_FFFF_FFFF_FFF0,
+            );
+        }
+    }
+
+    #[unsafe(naked)]
+    unsafe extern "C" fn resume_landing() -> ! {
+        naked_asm!(
+            "lea rdi, [rip + {state}]",
+            "jmp {resume}",
+            state  = sym SAVED_USER,
+            resume = sym user_mode_resume,
+        );
+    }
+
+    #[unsafe(naked)]
+    unsafe extern "C" fn resume_trampoline() -> ! {
+        naked_asm!(
+            "lea rdi, [rip + {jmp}]",
+            "mov rsi, 1",
+            "jmp {lj}",
+            jmp = sym JMP,
+            lj  = sym user_mode_longjmp,
+        );
+    }
+
+    SEEN_MAGIC.store(0, Ordering::Relaxed);
+    __test_clear_global();
+
+    let original_cr3: u64;
+    unsafe {
+        core::arch::asm!("mov {v}, cr3", v = out(reg) original_cr3,
+            options(nostack, preserves_flags));
+    }
+    SAVED_CR3.store(original_cr3, Ordering::Release);
+
+    let saved = unsafe { user_mode_setjmp(core::ptr::addr_of_mut!(JMP)) };
+    if saved != 0 {
+        unsafe {
+            let cr3 = SAVED_CR3.load(Ordering::Acquire);
+            core::arch::asm!("mov cr3, {v}", v = in(reg) cr3,
+                options(nostack, preserves_flags));
+            const IA32_KERNEL_GS_BASE: u32 = 0xC0000102;
+            core::arch::asm!(
+                "wrmsr",
+                in("ecx") IA32_KERNEL_GS_BASE,
+                in("eax") 0u32,
+                in("edx") 0u32,
+                options(nostack, preserves_flags),
+            );
+            core::arch::asm!("sti", options(nomem, nostack, preserves_flags));
+        }
+        __test_clear_global();
+        // The user wrote 0xCAFE_BABE between yield and sleep; the
+        // sleep handler captured it. If state was preserved, that's
+        // what we see here.
+        if SEEN_MAGIC.load(Ordering::Acquire) != 0xCAFE_BABE_DEAD_BEEF {
+            return TestResult::Fail("yield/resume did not preserve user state");
+        }
+        return TestResult::Pass;
+    }
+
+    let mut t = SyscallTable::new();
+    t.install_raw(Syscall::Yield, "ym-yield", YieldHandler);
+    t.install_raw(Syscall::Sleep, "ym-sleep", UnwindHandler);
+    install_global(t);
+
+    let mut addr_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Fail("new_for_user"),
+    };
+
+    const CODE_VADDR:  u64 = 0x0000_0080_0000_0000;
+    const STACK_VADDR: u64 = 0x0000_0080_0000_1000;
+
+    let code_frame = match narf_memory::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => return TestResult::Fail("alloc code"),
+    };
+    let stack_frame = match narf_memory::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => return TestResult::Fail("alloc stack"),
+    };
+
+    addr_space.map_region(Region {
+        base: VirtAddr::new(CODE_VADDR), len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::EXEC | RegionPerms::WRITE,
+        phys: code_frame,
+    }).ok();
+    addr_space.map_region(Region {
+        base: VirtAddr::new(STACK_VADDR), len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: stack_frame,
+    }).ok();
+
+    // Hand-assembled user program (40 bytes):
+    //   mov rax, 104           ; Syscall::Yield
+    //   int 0x80               ; (yield — kernel saves state, resumes)
+    //   mov rax, 105           ; Syscall::Sleep
+    //   movabs rdi, 0xCAFEBABEDEADBEEF
+    //   int 0x80               ; (handler captures magic + longjmps)
+    //   jmp $
+    let code_bytes: [u8; 30] = [
+        0x48, 0xC7, 0xC0, 0x68, 0x00, 0x00, 0x00,                                   // mov rax, 104
+        0xCD, 0x80,                                                                 // int 0x80
+        0x48, 0xC7, 0xC0, 0x69, 0x00, 0x00, 0x00,                                   // mov rax, 105
+        0x48, 0xBF, 0xEF, 0xBE, 0xAD, 0xDE, 0xBE, 0xBA, 0xFE, 0xCA,                 // movabs rdi, 0xCAFEBABEDEADBEEF
+        0xCD, 0x80,                                                                 // int 0x80
+        0xEB, 0xFE,                                                                 // jmp $
+    ];
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            code_bytes.as_ptr(),
+            code_frame.raw() as *mut u8,
+            code_bytes.len(),
+        );
+    }
+
+    if unsafe { addr_space.materialize() }.is_err() {
+        return TestResult::Fail("materialize");
+    }
+    if addr_space.activate().is_err() {
+        return TestResult::Fail("activate");
+    }
+
+    unsafe { core::arch::asm!("cli"); }
+
+    let stack_top = STACK_VADDR + 0x1000;
+    unsafe { user_mode_enter(CODE_VADDR, stack_top) }
+}
+#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
+kernel_test!(smoke_frame_x86_64_user_mode_yield_resume);
 
 // ── Real Rust user binary run through the full pipeline ──────────────
 
