@@ -121,10 +121,20 @@ pub enum LoadBytesError {
     /// JUMP_SLOT) named a sym_idx whose `Elf64_Sym` slot has
     /// `st_value == 0 && st_shndx == SHN_UNDEF (0)` — i.e. the
     /// symbol is declared but not defined in this image. External
-    /// symbol resolution is out of scope until DT_STRTAB walking
-    /// + a host-provided resolver land. The wrapped value is the
-    /// offending sym_idx so debugging can locate the entry.
-    UnresolvedSymbol(u32),
+    /// symbol resolution is out of scope until a host-provided
+    /// resolver lands; the loader walks DT_STRTAB so callers see
+    /// the symbol *name* alongside the index, which is what they
+    /// actually need to diagnose "where did this come from?".
+    ///
+    /// `name` holds the first 32 bytes of the NUL-terminated
+    /// symbol string captured from DT_STRTAB, NUL-padded if the
+    /// name is shorter and truncated if longer. An all-zero buffer
+    /// means lookup failed (DT_STRTAB missing, `st_name == 0`, or
+    /// the offset walked past any PT_LOAD segment).
+    UnresolvedSymbol {
+        idx:  u32,
+        name: [u8; 32],
+    },
     /// A symbol-resolved relocation referenced a sym_idx whose
     /// `Elf64_Sym` slot at `DT_SYMTAB + sym_idx * 24` lies outside
     /// any PT_LOAD segment's file region — either DT_SYMTAB itself
@@ -283,10 +293,11 @@ pub unsafe fn load_elf_bytes(
 // follow-up symbol-resolution pass can pick them up without
 // re-deriving the wire numbers.
 const DT_PLTRELSZ:   i64 = 2;
-// DT_STRTAB / DT_STRSZ are used by symbol-name lookup, which only
-// matters when external symbol resolution lands; internal-symbol
-// resolution (this round) only needs sym_idx + the SHN_UNDEF check.
-#[allow(dead_code)] const DT_STRTAB: i64 = 5;
+// DT_STRTAB drives symbol-name lookup for the unresolved-import
+// path: when an external symbol triggers `UnresolvedSymbol`, we
+// follow `st_name` into the string table so the error carries a
+// name (truncated to 32 bytes), not just an opaque sym_idx.
+const DT_STRTAB:     i64 = 5;
 const DT_SYMTAB:     i64 = 6;
 const DT_RELA:       i64 = 7;
 const DT_RELASZ:     i64 = 8;
@@ -419,9 +430,86 @@ fn resolve_symbol(
     let st_value = read_u64_le(&slice[8..16]);
 
     if st_value == 0 && st_shndx == SHN_UNDEF {
-        return Err(LoadBytesError::UnresolvedSymbol(sym_idx));
+        let name = resolve_symbol_name(bytes, image, sym_idx);
+        return Err(LoadBytesError::UnresolvedSymbol { idx: sym_idx, name });
     }
     Ok(st_value.wrapping_add(vaddr_bias))
+}
+
+/// Best-effort lookup of an `Elf64_Sym`'s name through DT_STRTAB.
+/// Returns a fixed 32-byte buffer holding the NUL-terminated name's
+/// leading bytes (NUL-padded if shorter than 32, truncated if longer).
+///
+/// Returns the all-zero buffer when:
+/// - `DT_SYMTAB` is missing or the sym_idx walks off any PT_LOAD,
+/// - `DT_STRTAB` is missing (no string-table pointer),
+/// - `st_name == 0` (SysV's "no name" convention — the strtab's
+///   leading byte is reserved as the empty string),
+/// - the strtab offset walks off any PT_LOAD segment.
+///
+/// The fixed-size buffer keeps the loader path alloc-free; the
+/// 32-byte cap is sized for typical libc symbols (`printf`, `malloc`,
+/// `__libc_start_main`) and documented as truncating for longer ones.
+fn resolve_symbol_name(
+    bytes:   &[u8],
+    image:   &ExecImage,
+    sym_idx: u32,
+) -> [u8; 32] {
+    let empty = [0u8; 32];
+
+    // Walk to the Elf64_Sym slot to read st_name. We mirror
+    // `resolve_symbol`'s arithmetic but swallow any failure into the
+    // empty buffer — name lookup is best-effort.
+    let symtab_addr = match dt_lookup(&image.dynamic, DT_SYMTAB) {
+        Some(a) => a,
+        None    => return empty,
+    };
+    let entry_addr = match (sym_idx as u64)
+        .checked_mul(ELF64_SYM_SIZE)
+        .and_then(|off| symtab_addr.checked_add(off))
+    {
+        Some(a) => a,
+        None    => return empty,
+    };
+    let sym_slice = match resolve_dt_pointer(bytes, image, entry_addr, ELF64_SYM_SIZE) {
+        Some(s) => s,
+        None    => return empty,
+    };
+    let st_name = u32::from_le_bytes([sym_slice[0], sym_slice[1], sym_slice[2], sym_slice[3]]);
+    // st_name == 0 → SysV "no name" convention; strtab[0] is the
+    // canonical empty string and we treat it the same as missing.
+    if st_name == 0 { return empty; }
+
+    let strtab_addr = match dt_lookup(&image.dynamic, DT_STRTAB) {
+        Some(a) => a,
+        None    => return empty,
+    };
+    let name_addr = match strtab_addr.checked_add(st_name as u64) {
+        Some(a) => a,
+        None    => return empty,
+    };
+
+    // We don't know the symbol-name length up front, and
+    // `resolve_dt_pointer` rejects reads that would walk off a
+    // segment's tail. Try the maximum 32-byte read first; if the
+    // strtab tail leaves fewer bytes available, shrink the request
+    // until it fits — this is at most 32 attempts so the cost is
+    // bounded. Once we have a slice, scan for the NUL terminator
+    // and copy the prefix.
+    let mut out = [0u8; 32];
+    for cap in (1u64..=32).rev() {
+        if let Some(s) = resolve_dt_pointer(bytes, image, name_addr, cap) {
+            for (i, &b) in s.iter().enumerate() {
+                // Stop on NUL: terminator is not part of the name,
+                // and the buffer's already pre-zeroed so the trailing
+                // bytes naturally NUL-pad.
+                if b == 0 { return out; }
+                out[i] = b;
+            }
+            return out;
+        }
+    }
+    empty
 }
 
 /// Walk DT_RELA + DT_JMPREL and patch each entry.
