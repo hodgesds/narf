@@ -6533,6 +6533,102 @@ fn smoke_userspace_load_user_process_builds_runnable_image() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_userspace_load_user_process_builds_runnable_image);
 
+fn smoke_userspace_init_sysv_stack_layout() -> TestResult {
+    // Verify `init_sysv_stack` lays out the System V x86_64 startup
+    // contract: argc at [rsp], then argv pointers + NULL, then envp
+    // pointers + NULL, then aux pairs ending in AT_NULL. Strings the
+    // pointers name live in the upper portion of the stack.
+    use narf_userspace::{init_sysv_stack, AuxEntry};
+    use narf_memory::PhysAddr;
+
+    let frame = match narf_memory::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => return TestResult::Fail("alloc_frame"),
+    };
+    // Zero the page first so leftover bytes can't masquerade as
+    // valid pointer values.
+    unsafe { core::ptr::write_bytes(frame.raw() as *mut u8, 0, 4096); }
+
+    // Pretend the frame is mapped at user vaddr 0x4000_0000 just for
+    // the purpose of computing pointer values that should appear in
+    // the array slots; the test then dereferences via the kernel
+    // identity-map (frame.raw()).
+    let user_base: u64 = 0x0000_0000_4000_0000;
+    let stack_top = user_base + 4096;
+
+    let argv = ["argv0", "alpha"];
+    let envp = ["KEY=val"];
+    let aux  = [
+        AuxEntry::Pagesz(4096),
+        AuxEntry::Random(0x1234_5678),
+    ];
+    let rsp_v = match unsafe {
+        init_sysv_stack(PhysAddr::new(frame.raw()), stack_top, 4096, &argv, &envp, &aux)
+    } {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("init_sysv_stack overflowed unexpectedly"),
+    };
+
+    if (rsp_v & 0xF) != 0 {
+        return TestResult::Fail("rsp not 16-byte aligned");
+    }
+
+    // Walk the layout via the identity-mapped phys.
+    let rsp_phys = frame.raw() + (rsp_v - user_base);
+    let read_u64 = |off: u64| -> u64 {
+        unsafe { *((rsp_phys + off) as *const u64) }
+    };
+
+    if read_u64(0) != 2 { return TestResult::Fail("argc != 2"); }
+
+    // argv[0..2] then NULL.
+    let argv_p0 = read_u64(8);
+    let argv_p1 = read_u64(16);
+    let argv_term = read_u64(24);
+    if argv_term != 0 { return TestResult::Fail("argv NULL terminator missing"); }
+
+    // envp[0] then NULL.
+    let envp_p0 = read_u64(32);
+    let envp_term = read_u64(40);
+    if envp_term != 0 { return TestResult::Fail("envp NULL terminator missing"); }
+
+    // aux pairs.
+    let aux_k0 = read_u64(48);
+    let aux_v0 = read_u64(56);
+    let aux_k1 = read_u64(64);
+    let aux_v1 = read_u64(72);
+    let aux_kn = read_u64(80);
+    let aux_vn = read_u64(88);
+    if aux_k0 != 6 || aux_v0 != 4096 {
+        return TestResult::Fail("aux[0] (PAGESZ) wrong");
+    }
+    if aux_k1 != 25 || aux_v1 != 0x1234_5678 {
+        return TestResult::Fail("aux[1] (RANDOM) wrong");
+    }
+    if aux_kn != 0 || aux_vn != 0 {
+        return TestResult::Fail("aux AT_NULL terminator missing");
+    }
+
+    // Verify argv pointers land in the user-vaddr range and that
+    // following them through the identity map yields the original
+    // strings.
+    let check_str = |user_p: u64, expected: &str| -> bool {
+        if user_p < user_base || user_p >= stack_top { return false; }
+        let kp = frame.raw() + (user_p - user_base);
+        let ebytes = expected.as_bytes();
+        for i in 0..ebytes.len() {
+            if unsafe { *((kp + i as u64) as *const u8) } != ebytes[i] { return false; }
+        }
+        unsafe { *((kp + ebytes.len() as u64) as *const u8) == 0 }
+    };
+    if !check_str(argv_p0, "argv0") { return TestResult::Fail("argv[0] string mismatch"); }
+    if !check_str(argv_p1, "alpha") { return TestResult::Fail("argv[1] string mismatch"); }
+    if !check_str(envp_p0, "KEY=val") { return TestResult::Fail("envp[0] string mismatch"); }
+
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_init_sysv_stack_layout);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_load_elf_bytes_end_to_end() -> TestResult {
     // End-to-end: hand-build a minimal ELF64 with a 1-page PT_LOAD

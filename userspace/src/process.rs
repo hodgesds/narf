@@ -17,9 +17,9 @@
 
 use alloc::sync::Arc;
 
-use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
+use narf_memory::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
-use crate::{alloc_pid, load_elf_bytes, loader::LoadBytesError, EntryPoint, ProcessId};
+use crate::{alloc_pid, load_elf_bytes, loader::LoadBytesError, AuxEntry, EntryPoint, ProcessId};
 
 /// Default user stack size: 16 KiB. Small enough to fit on boot
 /// images comfortably, big enough for relibc-style startup + a few
@@ -101,4 +101,209 @@ pub unsafe fn load_user_process(bytes: &[u8]) -> Result<UserProcess, ProcessLoad
         entry,
         stack_top:     VirtAddr::new(DEFAULT_USER_STACK_BASE + pages * 4096),
     })
+}
+
+// ── System V x86_64 startup-stack layout ────────────────────────────
+//
+// The SysV-AMD64 ABI ("System V Application Binary Interface,
+// x86-64 Architecture Processor Supplement", §3.4.1) pins the
+// initial process stack:
+//
+//   high  ┌──────────────────────────┐
+//         │ string area              │  envp[*], argv[*] bytes
+//         │ ...                      │
+//         ├──────────────────────────┤
+//         │ aux vector               │  AT_* (key, val) pairs, terminated AT_NULL
+//         ├──────────────────────────┤
+//         │ envp[n] = NULL           │
+//         │ envp[n-1] ptr            │
+//         │ ...                      │
+//         │ envp[0] ptr              │
+//         ├──────────────────────────┤
+//         │ argv[argc] = NULL        │
+//         │ argv[argc-1] ptr         │
+//         │ ...                      │
+//         │ argv[0] ptr              │
+//         ├──────────────────────────┤  ← rsp on entry to _start, 16-byte aligned
+//         │ argc                     │
+//   low   └──────────────────────────┘
+//
+// _start reads `argc` at [rsp]; the loader convention is that the
+// stack is 16-byte aligned at this point so XMM stores work without
+// `movups`. We arrange that explicitly.
+//
+// The string area lives above the aux/env/argv pointer arrays so
+// the pointers can name absolute addresses inside the stack region
+// without forward-references; we lay out strings first (top-down),
+// then walk back filling the arrays.
+
+/// Errors `init_sysv_stack` can surface.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SysVStackError {
+    /// Total bytes argv + envp + auxv + arrays + alignment exceed
+    /// the supplied stack region.
+    Overflow,
+}
+
+/// Initialise a user stack with the System V x86_64 startup
+/// contract: argc + argv pointers + envp pointers + aux vector +
+/// the strings they name. Returns the new RSP — the user vaddr
+/// the entry point should be invoked with so `[rsp] = argc`.
+///
+/// # Layout
+/// See module-level diagram. Strings live at the top, pointer
+/// arrays + argc at the bottom, and the result is 16-byte aligned.
+///
+/// # Safety
+/// - `stack_phys` must be the physical base of a contiguous run of
+///   pages identity-mapped in the low 4 GiB. The stack region built
+///   by `load_user_process` satisfies this when its allocation
+///   loop yields contiguous frames.
+/// - `stack_top_vaddr` must be the user vaddr corresponding to
+///   `stack_phys + stack_bytes` (i.e. one past the last byte the
+///   user can write).
+/// - `stack_bytes` must equal the size of the mapped region.
+pub unsafe fn init_sysv_stack(
+    stack_phys:        PhysAddr,
+    stack_top_vaddr:   u64,
+    stack_bytes:       u64,
+    argv:              &[&str],
+    envp:              &[&str],
+    aux:               &[AuxEntry],
+) -> Result<u64, SysVStackError> {
+    // 1. Compute total string bytes (each str + a NUL).
+    let mut strings_bytes: u64 = 0;
+    for s in argv.iter().chain(envp.iter()) {
+        strings_bytes = strings_bytes.saturating_add(s.len() as u64 + 1);
+    }
+    // Round up to 8-byte alignment so the aux/env/argv arrays below
+    // sit aligned; SysV doesn't require it for correctness but it
+    // matches Linux's startup layout and keeps inspection sane.
+    let strings_padded = (strings_bytes + 7) & !7;
+
+    // 2. Aux array: each AuxEntry occupies 16 bytes (key u64 + val u64).
+    //    Add a final AT_NULL terminator.
+    let aux_bytes = ((aux.len() as u64) + 1) * 16;
+
+    // 3. envp pointer array: one u64 per entry + NULL terminator.
+    let envp_bytes = ((envp.len() as u64) + 1) * 8;
+
+    // 4. argv pointer array: one u64 per entry + NULL terminator.
+    let argv_bytes = ((argv.len() as u64) + 1) * 8;
+
+    // 5. argc (one u64).
+    let argc_bytes = 8u64;
+
+    // 6. The bottom of the structure must be 16-byte aligned at argc.
+    //    Compute a tentative total, then pad on top.
+    let tentative = strings_padded + aux_bytes + envp_bytes + argv_bytes + argc_bytes;
+    let final_pad = (16 - (tentative & 0xF)) & 0xF;
+    let total = tentative + final_pad;
+
+    if total > stack_bytes { return Err(SysVStackError::Overflow); }
+
+    // Compute offsets from the top of the stack (highest address).
+    // `top_phys` is the kernel-side identity-mapped writable
+    // pointer to (stack_top_vaddr - 1) + 1.
+    let top_phys = stack_phys.raw() + stack_bytes;
+
+    // String area: layout top-down. Walk argv first (highest addrs),
+    // then envp. Track each string's user vaddr in two parallel
+    // Vecs; we'll spill the pointer arrays in step 2.
+    let mut argv_ptrs = alloc::vec::Vec::with_capacity(argv.len());
+    let mut envp_ptrs = alloc::vec::Vec::with_capacity(envp.len());
+    let mut cursor_kernel = top_phys; // shrinks downward
+    let mut cursor_vaddr  = stack_top_vaddr;
+    for s in argv.iter() {
+        let len = s.len() as u64 + 1;
+        cursor_kernel -= len;
+        cursor_vaddr  -= len;
+        // SAFETY: identity-mapped, bounds-checked above.
+        unsafe {
+            core::ptr::copy_nonoverlapping(s.as_ptr(), cursor_kernel as *mut u8, s.len());
+            *((cursor_kernel + s.len() as u64) as *mut u8) = 0;
+        }
+        argv_ptrs.push(cursor_vaddr);
+    }
+    for s in envp.iter() {
+        let len = s.len() as u64 + 1;
+        cursor_kernel -= len;
+        cursor_vaddr  -= len;
+        unsafe {
+            core::ptr::copy_nonoverlapping(s.as_ptr(), cursor_kernel as *mut u8, s.len());
+            *((cursor_kernel + s.len() as u64) as *mut u8) = 0;
+        }
+        envp_ptrs.push(cursor_vaddr);
+    }
+    // Drop kernel cursor down to the 8-byte boundary that anchors
+    // the array region. The padded gap is left as zeroes by the
+    // caller's stack zero-fill.
+    let _ = cursor_kernel; // strings_padded already accounted for
+
+    // Now compute the array positions. The bottom of the layout
+    // (lowest addr, the user RSP) sits `total` bytes below the top.
+    // From there going up: argc, argv*, envp*, aux*, then strings.
+    let rsp_vaddr   = stack_top_vaddr - total;
+    let rsp_kernel  = top_phys - total;
+
+    // Walk up from the RSP, writing each section.
+    let mut wp = rsp_kernel;
+    let mut wv = rsp_vaddr;
+
+    // argc.
+    unsafe { *(wp as *mut u64) = argv.len() as u64; }
+    wp += 8; wv += 8;
+
+    // argv pointers.
+    for &p in argv_ptrs.iter() {
+        unsafe { *(wp as *mut u64) = p; }
+        wp += 8; wv += 8;
+    }
+    unsafe { *(wp as *mut u64) = 0; } // NULL term.
+    wp += 8; wv += 8;
+
+    // envp pointers.
+    for &p in envp_ptrs.iter() {
+        unsafe { *(wp as *mut u64) = p; }
+        wp += 8; wv += 8;
+    }
+    unsafe { *(wp as *mut u64) = 0; } // NULL term.
+    wp += 8; wv += 8;
+
+    // aux entries.
+    for e in aux.iter() {
+        let (key, val) = aux_pair(e);
+        unsafe {
+            *(wp as *mut u64) = key as u64;
+            *((wp + 8) as *mut u64) = val;
+        }
+        wp += 16; wv += 16;
+    }
+    // AT_NULL terminator.
+    unsafe {
+        *(wp as *mut u64) = 0;
+        *((wp + 8) as *mut u64) = 0;
+    }
+
+    let _ = wv; // walked-up vaddr cursor; final value isn't returned
+
+    Ok(rsp_vaddr)
+}
+
+fn aux_pair(e: &AuxEntry) -> (u32, u64) {
+    let key = e.tag();
+    let val = match *e {
+        AuxEntry::Null         => 0,
+        AuxEntry::Entry(v)     => v,
+        AuxEntry::Phdr(v)      => v,
+        AuxEntry::PhEnt(v)     => v as u64,
+        AuxEntry::PhNum(v)     => v as u64,
+        AuxEntry::Base(v)      => v,
+        AuxEntry::ExecFn(v)    => v,
+        AuxEntry::Pagesz(v)    => v as u64,
+        AuxEntry::Hwcap(v)     => v,
+        AuxEntry::Random(v)    => v,
+        AuxEntry::Secure(b)    => if b { 1 } else { 0 },
+    };
+    (key, val)
 }
