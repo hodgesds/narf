@@ -6131,10 +6131,17 @@ fn smoke_userspace_bootstrap_returns_config_page() -> TestResult {
         }
     };
 
-    // Read header through identity map.
+    // Read header through identity map. Layout mirrors
+    // `BootstrapHeader` in userspace/handlers.rs — the test pins
+    // every field so silent ABI drift breaks here.
     #[repr(C)]
-    struct Hdr { magic: u32, version: u32, task_id: u64,
-                 sq_cap: u64, cq_cap: u64, sq_depth: u32, cq_depth: u32 }
+    struct Hdr {
+        magic: u32, version: u32, task_id: u64,
+        sq_cap: u64, cq_cap: u64,
+        sq_depth: u32, cq_depth: u32,
+        shared_sq_vaddr: u64, shared_cq_vaddr: u64,
+        shared_depth: u32, _pad: u32,
+    }
     let hdr = unsafe { core::ptr::read_volatile(phys.raw() as *const Hdr) };
 
     if hdr.magic != 0x4E_41_52_46 {
@@ -6161,6 +6168,29 @@ fn smoke_userspace_bootstrap_returns_config_page() -> TestResult {
         *USER_AS_BS.lock() = None;
         __test_clear_global();
         return TestResult::Fail("ring depths not 64");
+    }
+    if hdr.shared_sq_vaddr == 0 || hdr.shared_cq_vaddr == 0
+        || hdr.shared_sq_vaddr == hdr.shared_cq_vaddr {
+        *USER_AS_BS.lock() = None;
+        __test_clear_global();
+        return TestResult::Fail("shared SQ/CQ vaddrs unset or collide");
+    }
+    if hdr.shared_depth != narf_userspace::BOOTSTRAP_SHARED_RING_DEPTH as u32 {
+        *USER_AS_BS.lock() = None;
+        __test_clear_global();
+        return TestResult::Fail("shared ring depth mismatch");
+    }
+    // The shared pages must also be mapped in the AS; we can
+    // translate them to confirm.
+    if unsafe { paging::translate(addr_space.root, VirtAddr::new(hdr.shared_sq_vaddr)) }.is_none() {
+        *USER_AS_BS.lock() = None;
+        __test_clear_global();
+        return TestResult::Fail("shared SQ vaddr not mapped");
+    }
+    if unsafe { paging::translate(addr_space.root, VirtAddr::new(hdr.shared_cq_vaddr)) }.is_none() {
+        *USER_AS_BS.lock() = None;
+        __test_clear_global();
+        return TestResult::Fail("shared CQ vaddr not mapped");
     }
     if narf_userspace::bootstrap_live_count() < 1 {
         *USER_AS_BS.lock() = None;
