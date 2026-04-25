@@ -17,13 +17,17 @@
 //!
 //! Not covered yet (Stage-4+):
 //! - Section-header walk (we only need program headers for load).
-//! - `PT_NOTE` / `PT_GNU_STACK` / `PT_TLS` handling.
+//! - `PT_NOTE` / `PT_GNU_STACK` handling.
 //! - Relocation entries from `DT_REL` / `DT_RELA`.
+//!
+//! `PT_TLS` is parsed into `image.tls` (a `TlsTemplate`); the
+//! actual per-thread-block staging + `IA32_FS_BASE` programming
+//! still belongs to a follow-up round (parse-only here).
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::{DynEntry, ExecImage, ExecKind, Segment, SegmentFlags};
+use crate::{DynEntry, ExecImage, ExecKind, Segment, SegmentFlags, TlsTemplate};
 
 // ── Wire constants (ELF spec) ───────────────────────────────────────
 
@@ -43,6 +47,7 @@ const ET_DYN:  u16 = 3;
 const PT_LOAD:    u32 = 1;
 const PT_DYNAMIC: u32 = 2;
 const PT_INTERP:  u32 = 3;
+const PT_TLS:     u32 = 7;
 
 const PF_X: u32 = 1 << 0;
 const PF_W: u32 = 1 << 1;
@@ -64,6 +69,13 @@ pub enum ElfError {
     /// outside the input bytes or has a length that isn't a multiple
     /// of `sizeof(Elf64_Dyn) == 16`.
     DynamicOutOfBounds,
+    /// PT_TLS file region lies outside the input bytes, mem_size <
+    /// file_size, or the alignment isn't a power of two.
+    TlsOutOfBounds,
+    /// More than one PT_TLS segment was present. The SysV ABI allows
+    /// only one TLS template per ELF — the dynamic loader's IE-model
+    /// thread-pointer arithmetic assumes a single contiguous block.
+    MultiplePtTls,
 }
 
 // ── Parser ──────────────────────────────────────────────────────────
@@ -114,6 +126,7 @@ pub fn parse(bytes: &[u8]) -> Result<ExecImage, ElfError> {
     let mut segments = Vec::new();
     let mut interp: Option<String> = None;
     let mut dynamic: Vec<DynEntry> = Vec::new();
+    let mut tls: Option<TlsTemplate> = None;
 
     for i in 0..phnum {
         let off = phoff + i * entsize;
@@ -162,6 +175,39 @@ pub fn parse(bytes: &[u8]) -> Result<ExecImage, ElfError> {
                     dynamic.push(DynEntry { tag, val });
                 }
             }
+            PT_TLS => {
+                // SysV ABI permits at most one PT_TLS. Reject extras
+                // outright rather than silently overwriting — a binary
+                // with two TLS templates is malformed and the IE-model
+                // offsets would be ambiguous.
+                if tls.is_some() {
+                    return Err(ElfError::MultiplePtTls);
+                }
+                let p_align = read_u64(bytes, off + 0x30);
+                // Spec: p_align == 0 or 1 means "no alignment
+                // requirement" — normalise to 1 so callers can rely on
+                // the field being a non-zero power of two.
+                let align = if p_align == 0 { 1 } else { p_align };
+                if !align.is_power_of_two() {
+                    return Err(ElfError::TlsOutOfBounds);
+                }
+                if p_memsz < p_filesz {
+                    return Err(ElfError::TlsOutOfBounds);
+                }
+                let end = (p_offset as usize)
+                    .checked_add(p_filesz as usize)
+                    .ok_or(ElfError::TlsOutOfBounds)?;
+                if end > bytes.len() {
+                    return Err(ElfError::TlsOutOfBounds);
+                }
+                tls = Some(TlsTemplate {
+                    file_off:  p_offset,
+                    file_size: p_filesz,
+                    mem_size:  p_memsz,
+                    align,
+                    vaddr:     p_vaddr,
+                });
+            }
             PT_INTERP => {
                 let start = p_offset as usize;
                 let end   = start.checked_add(p_filesz as usize)
@@ -185,6 +231,7 @@ pub fn parse(bytes: &[u8]) -> Result<ExecImage, ElfError> {
         interp,
         segments,
         dynamic,
+        tls,
         argv: Vec::new(),
         envp: Vec::new(),
         aux:  Vec::new(),

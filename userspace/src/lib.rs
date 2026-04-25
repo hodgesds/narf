@@ -166,6 +166,27 @@ impl core::ops::BitOr for SegmentFlags {
     fn bitor(self, rhs: SegmentFlags) -> Self { SegmentFlags(self.0 | rhs.0) }
 }
 
+/// Description of an ELF's PT_TLS segment — the template the
+/// kernel uses to allocate a per-thread TLS block before
+/// `iretq` to user mode. Field meanings match the ELF spec.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TlsTemplate {
+    /// File-relative offset of the TLS image bytes (the
+    /// initial-image part of the per-thread block).
+    pub file_off:  u64,
+    /// Bytes of initial image to copy into a fresh TLS block.
+    pub file_size: u64,
+    /// Total per-thread TLS block size; bytes past `file_size`
+    /// are the BSS-style zero-fill.
+    pub mem_size:  u64,
+    /// Required alignment for the TLS block. Always a power of two.
+    pub align:     u64,
+    /// Linker-time vaddr of the TLS template within the binary.
+    /// The dynamic loader uses this to compute thread-pointer
+    /// offsets for the initial-exec model.
+    pub vaddr:     u64,
+}
+
 /// One PT_DYNAMIC table entry — the file-format `Elf64_Dyn`
 /// shape. Tags are signed (DT_* spec), values either pointer-typed
 /// or scalar — we preserve the raw 64-bit bit pattern so
@@ -188,6 +209,13 @@ pub struct ExecImage {
     /// without a PT_DYNAMIC program header. The DT_NULL terminator
     /// is stripped — what's left is what the loader actually walks.
     pub dynamic:    Vec<DynEntry>,
+    /// PT_TLS template if the ELF has one. The loader uses this in a
+    /// follow-up round to allocate the per-thread TLS block and program
+    /// `IA32_FS_BASE` for the initial-exec model. None means the binary
+    /// does not use thread-local storage (or only has dynamic-TLS through
+    /// the loader's own TCB, which is described via DT_* tags rather
+    /// than PT_TLS).
+    pub tls:        Option<TlsTemplate>,
     pub argv:       Vec<String>,
     pub envp:       Vec<String>,
     pub aux:        Vec<AuxEntry>,
@@ -198,6 +226,7 @@ impl ExecImage {
         Self {
             kind, entry: 0, interp: None,
             segments: Vec::new(), dynamic: Vec::new(),
+            tls: None,
             argv: Vec::new(), envp: Vec::new(),
             aux: Vec::new(),
         }

@@ -7454,6 +7454,127 @@ fn smoke_userspace_load_user_process_with_interp() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_userspace_load_user_process_with_interp);
 
+fn smoke_userspace_parse_pt_tls() -> TestResult {
+    // PT_TLS parsing. Hand-build a minimal ELF with one PT_LOAD (so the
+    // parser sees a "loadable" image) and one PT_TLS pointing at known
+    // bytes, then assert `parse_elf` populates `image.tls` with those
+    // exact field values. Parse-only — load/staging is a follow-up.
+    use narf_userspace::{parse_elf, ElfError};
+
+    const TLS_FILE_OFF:  u64 = 0x2000;
+    const TLS_FILE_SIZE: u64 = 0x40;
+    const TLS_MEM_SIZE:  u64 = 0x80; // 0x40 BSS-zero past file image
+    const TLS_ALIGN:     u64 = 16;
+    const TLS_VADDR:     u64 = 0x0000_0080_0000_3000;
+
+    fn write_one_tls() -> alloc::vec::Vec<u8> {
+        const FSIZE: usize = 0x3000;
+        let mut b = alloc::vec![0u8; FSIZE];
+        b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        b[0x10..0x12].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        b[0x12..0x14].copy_from_slice(&0x3Eu16.to_le_bytes());
+        b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+        b[0x18..0x20].copy_from_slice(&0x0000_0080_0000_1111u64.to_le_bytes());
+        b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        b[0x28..0x30].copy_from_slice(&0u64.to_le_bytes());
+        b[0x30..0x34].copy_from_slice(&0u32.to_le_bytes());
+        b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());
+        b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+        b[0x38..0x3A].copy_from_slice(&2u16.to_le_bytes()); // 2 phdrs
+        // Phdr 0 — PT_LOAD code (RX) at file off 0x1000.
+        let mut ph = 64usize;
+        b[ph + 0x00..ph + 0x04].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        b[ph + 0x04..ph + 0x08].copy_from_slice(&5u32.to_le_bytes()); // PF_R|PF_X
+        b[ph + 0x08..ph + 0x10].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x10..ph + 0x18].copy_from_slice(&0x0000_0080_0000_1000u64.to_le_bytes());
+        b[ph + 0x18..ph + 0x20].copy_from_slice(&0x0000_0080_0000_1000u64.to_le_bytes());
+        b[ph + 0x20..ph + 0x28].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x28..ph + 0x30].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x30..ph + 0x38].copy_from_slice(&0x1000u64.to_le_bytes());
+        // Phdr 1 — PT_TLS at file off 0x2000.
+        ph = 64 + 56;
+        b[ph + 0x00..ph + 0x04].copy_from_slice(&7u32.to_le_bytes()); // PT_TLS
+        b[ph + 0x04..ph + 0x08].copy_from_slice(&4u32.to_le_bytes()); // PF_R
+        b[ph + 0x08..ph + 0x10].copy_from_slice(&TLS_FILE_OFF.to_le_bytes());
+        b[ph + 0x10..ph + 0x18].copy_from_slice(&TLS_VADDR.to_le_bytes());
+        b[ph + 0x18..ph + 0x20].copy_from_slice(&TLS_VADDR.to_le_bytes());
+        b[ph + 0x20..ph + 0x28].copy_from_slice(&TLS_FILE_SIZE.to_le_bytes());
+        b[ph + 0x28..ph + 0x30].copy_from_slice(&TLS_MEM_SIZE.to_le_bytes());
+        b[ph + 0x30..ph + 0x38].copy_from_slice(&TLS_ALIGN.to_le_bytes());
+        b
+    }
+
+    let bytes = write_one_tls();
+    let image = match parse_elf(&bytes) {
+        Ok(i) => i,
+        Err(_) => return TestResult::Fail("parse_elf failed on PT_TLS image"),
+    };
+    let tls = match image.tls {
+        Some(t) => t,
+        None    => return TestResult::Fail("image.tls should be Some for PT_TLS ELF"),
+    };
+    if tls.file_off  != TLS_FILE_OFF  { return TestResult::Fail("tls.file_off mismatch");  }
+    if tls.file_size != TLS_FILE_SIZE { return TestResult::Fail("tls.file_size mismatch"); }
+    if tls.mem_size  != TLS_MEM_SIZE  { return TestResult::Fail("tls.mem_size mismatch");  }
+    if tls.align     != TLS_ALIGN     { return TestResult::Fail("tls.align mismatch");     }
+    if tls.vaddr     != TLS_VADDR     { return TestResult::Fail("tls.vaddr mismatch");     }
+
+    // Negative path: a second PT_TLS must be rejected. Cheaper to
+    // build a fresh 3-phdr image inline than to try patching the
+    // single-TLS bytes above.
+    fn write_two_tls() -> alloc::vec::Vec<u8> {
+        const FSIZE: usize = 0x3000;
+        let mut b = alloc::vec![0u8; FSIZE];
+        b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        b[0x10..0x12].copy_from_slice(&2u16.to_le_bytes());
+        b[0x12..0x14].copy_from_slice(&0x3Eu16.to_le_bytes());
+        b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+        b[0x18..0x20].copy_from_slice(&0x0000_0080_0000_1111u64.to_le_bytes());
+        b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes());
+        b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());
+        b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+        b[0x38..0x3A].copy_from_slice(&3u16.to_le_bytes());
+        // Phdr 0 — PT_LOAD.
+        let mut ph = 64usize;
+        b[ph + 0x00..ph + 0x04].copy_from_slice(&1u32.to_le_bytes());
+        b[ph + 0x04..ph + 0x08].copy_from_slice(&5u32.to_le_bytes());
+        b[ph + 0x08..ph + 0x10].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x10..ph + 0x18].copy_from_slice(&0x0000_0080_0000_1000u64.to_le_bytes());
+        b[ph + 0x18..ph + 0x20].copy_from_slice(&0x0000_0080_0000_1000u64.to_le_bytes());
+        b[ph + 0x20..ph + 0x28].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x28..ph + 0x30].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x30..ph + 0x38].copy_from_slice(&0x1000u64.to_le_bytes());
+        // Phdr 1 — first PT_TLS.
+        ph = 64 + 56;
+        b[ph + 0x00..ph + 0x04].copy_from_slice(&7u32.to_le_bytes());
+        b[ph + 0x04..ph + 0x08].copy_from_slice(&4u32.to_le_bytes());
+        b[ph + 0x08..ph + 0x10].copy_from_slice(&0x2000u64.to_le_bytes());
+        b[ph + 0x10..ph + 0x18].copy_from_slice(&TLS_VADDR.to_le_bytes());
+        b[ph + 0x18..ph + 0x20].copy_from_slice(&TLS_VADDR.to_le_bytes());
+        b[ph + 0x20..ph + 0x28].copy_from_slice(&0x40u64.to_le_bytes());
+        b[ph + 0x28..ph + 0x30].copy_from_slice(&0x40u64.to_le_bytes());
+        b[ph + 0x30..ph + 0x38].copy_from_slice(&16u64.to_le_bytes());
+        // Phdr 2 — second PT_TLS (illegal).
+        ph = 64 + 2 * 56;
+        b[ph + 0x00..ph + 0x04].copy_from_slice(&7u32.to_le_bytes());
+        b[ph + 0x04..ph + 0x08].copy_from_slice(&4u32.to_le_bytes());
+        b[ph + 0x08..ph + 0x10].copy_from_slice(&0x2040u64.to_le_bytes());
+        b[ph + 0x10..ph + 0x18].copy_from_slice(&(TLS_VADDR + 0x100).to_le_bytes());
+        b[ph + 0x18..ph + 0x20].copy_from_slice(&(TLS_VADDR + 0x100).to_le_bytes());
+        b[ph + 0x20..ph + 0x28].copy_from_slice(&0x40u64.to_le_bytes());
+        b[ph + 0x28..ph + 0x30].copy_from_slice(&0x40u64.to_le_bytes());
+        b[ph + 0x30..ph + 0x38].copy_from_slice(&16u64.to_le_bytes());
+        b
+    }
+
+    match parse_elf(&write_two_tls()) {
+        Err(ElfError::MultiplePtTls) => TestResult::Pass,
+        Err(_) => TestResult::Fail("two PT_TLS produced wrong error variant"),
+        Ok(_)  => TestResult::Fail("two PT_TLS should have been rejected"),
+    }
+}
+kernel_test!(smoke_userspace_parse_pt_tls);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_apply_relative_relocations() -> TestResult {
     // PT_DYNAMIC walk-through. Build a minimal ELF with one PT_LOAD
