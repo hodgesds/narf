@@ -703,6 +703,26 @@ fn sys_munmap(ctx: &mut dyn TrapContext) {
 // ── ExitTask — redirect to a kernel-registered landing ─────────────
 
 fn sys_exit_task(ctx: &mut dyn TrapContext) {
+    // Polling-future path: if a UserTaskCtx is installed AND an
+    // exit hook is registered, save the user state, mark the
+    // reason, and tail-call the hook — which longjmps back into
+    // the polling routine.
+    if let (Some(uctx), Some(hook)) =
+        (crate::user_task::current_user_task(), crate::user_task::exit_hook())
+    {
+        // SAFETY: uctx is valid for as long as the polling routine
+        // (its caller, on the same CPU) holds it pinned. We're
+        // about to never return.
+        unsafe {
+            let uc = &*uctx;
+            ctx.save_user_state(uc.state.get() as *mut u8);
+            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_EXITED;
+            hook(uctx);
+        }
+        // unreachable
+    }
+
+    // Legacy redirect-to-landing path (testbin runner uses this).
     let rip = EXIT_LANDING_RIP.load(Ordering::Acquire);
     let rsp = EXIT_LANDING_RSP.load(Ordering::Acquire);
     if rip == 0 {
@@ -714,6 +734,26 @@ fn sys_exit_task(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(0));
     }
     // Redirect succeeded → frame rewritten, `iretq` lands in kernel.
+}
+
+// ── Yield — cooperative scheduler hand-back ────────────────────────
+
+fn sys_yield(ctx: &mut dyn TrapContext) {
+    // Polling-future path mirroring sys_exit_task.
+    if let (Some(uctx), Some(hook)) =
+        (crate::user_task::current_user_task(), crate::user_task::yield_hook())
+    {
+        // SAFETY: same contract as sys_exit_task's hook path.
+        unsafe {
+            let uc = &*uctx;
+            ctx.save_user_state(uc.state.get() as *mut u8);
+            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            hook(uctx);
+        }
+        // unreachable
+    }
+    // Legacy: no polling executor wired yet — Yield is a no-op Ok.
+    ctx.set_return(SyscallReturn::ok(0));
 }
 
 // ── RingKick — drain the shared SQ, post completions to the CQ ────
@@ -882,6 +922,6 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::GetUid,   "getuid",   RawFnHandler(sys_noop_ok));
     table.install_raw(Syscall::GetGid,   "getgid",   RawFnHandler(sys_noop_ok));
     table.install_raw(Syscall::ExitTask, "exit",     RawFnHandler(sys_exit_task));
-    table.install_raw(Syscall::Yield,    "yield",    RawFnHandler(sys_noop_ok));
+    table.install_raw(Syscall::Yield,    "yield",    RawFnHandler(sys_yield));
     table.install_raw(Syscall::Sleep,    "sleep",    RawFnHandler(sys_noop_ok));
 }

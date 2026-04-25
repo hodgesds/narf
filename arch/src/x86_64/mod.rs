@@ -7,9 +7,11 @@ pub mod io_port;
 pub mod msr;
 pub mod pks;
 pub mod probe;
+pub mod user_mode;
 
 pub use asm::{halt_forever, disable_interrupts, enable_interrupts, cas128, patch_word};
 pub use cpuid::Features;
+pub use user_mode::{enter_user_mode_resume, UserState};
 
 /// x86_64's concrete `DomainPrimitive` type. All methods forward to
 /// the free functions in `pks` — the trait is just a way to let

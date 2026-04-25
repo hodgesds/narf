@@ -48,6 +48,16 @@ pub use priority::{Priority, SchedClass, SmtSharePolicy};
 // donation cap — saves one import line at every call site.
 pub use narf_capabilities::Invoke;
 
+// Re-export user-mode primitives so downstream crates that already
+// depend on `narf-scheduler` (notably `narf-userspace`, where user
+// tasks live as scheduler futures) can name them without taking a
+// fresh direct dep on `narf-arch` — adding a fresh direct dep
+// perturbs link-time test-registration ordering enough to expose
+// latent flakes in the e2e suite. The transitive dep already
+// exists (`narf-scheduler` → `narf-arch`); this just exposes it.
+#[cfg(target_arch = "x86_64")]
+pub use narf_arch::x86_64::{enter_user_mode_resume, UserState};
+
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;

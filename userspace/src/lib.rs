@@ -42,6 +42,7 @@ pub mod handlers;
 pub mod loader;
 pub mod process;
 pub mod syscall;
+pub mod user_task;
 
 pub use fd::{FdEntry, FdTable};
 
@@ -52,6 +53,12 @@ pub use handlers::{
     install_task_id_lookup, set_exit_landing, shared_rings_for,
     spawn_dispatcher_for, take_kernel_ends, take_user_ends, SharedRingPair,
     TaskRings, UserRingEnds, BOOTSTRAP_SHARED_RING_DEPTH,
+};
+pub use user_task::{
+    clear_current as clear_current_user_task, current_user_task,
+    install_current as install_current_user_task, install_exit_hook,
+    install_yield_hook, UserExit, UserTaskCtx, EXIT_REASON_EXITED,
+    EXIT_REASON_YIELDED,
 };
 pub use loader::{load_elf_bytes, load_into, EntryPoint, LoadBytesError, LoadError};
 pub use process::{

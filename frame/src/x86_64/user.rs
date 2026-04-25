@@ -104,72 +104,10 @@ pub unsafe extern "C" fn longjmp(buf: *const JmpBuf, val: u64) -> ! {
 /// user code shouldn't inherit kernel debug / alignment flags.
 pub const USER_RFLAGS: u64 = 0x0000_0202;
 
-/// Snapshot of a user-mode task's complete CPU state at trap time.
-/// The trap handler populates this when the task `Yield`s; the
-/// resume path re-enters user mode using these values exactly.
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Default)]
-pub struct UserState {
-    // GPRs in trap-frame order (matches TrapFrame).
-    pub r15: u64, pub r14: u64, pub r13: u64, pub r12: u64,
-    pub r11: u64, pub r10: u64, pub r9:  u64, pub r8:  u64,
-    pub rbp: u64, pub rdi: u64, pub rsi: u64, pub rdx: u64,
-    pub rcx: u64, pub rbx: u64, pub rax: u64,
-    /// User-mode RIP at the instruction the trap returns to.
-    pub rip:    u64,
-    /// User-mode RFLAGS at trap entry.
-    pub rflags: u64,
-    /// User-mode RSP.
-    pub rsp:    u64,
-    /// True once `enter_user_mode_resume` has been called at least
-    /// once for this state — diagnostic/test only.
-    pub valid:  u64,
-}
-
-/// Resume user mode at the state captured in `*state`. Counterpart
-/// to [`enter_user_mode`] — restores all GPRs, RIP, RFLAGS, RSP via
-/// the iretq frame, then iretq.
-///
-/// # Safety
-/// Same contract as [`enter_user_mode`] plus: `state` must have
-/// been populated by a prior trap from this task (the page tables,
-/// TSS.rsp0, and KERNEL_GS_BASE setup must still hold).
-#[unsafe(naked)]
-pub unsafe extern "C" fn enter_user_mode_resume(state: *const UserState) -> ! {
-    naked_asm!(
-        // SysV: state ptr in rdi.
-        // Push iretq frame in reverse (ss, rsp, rflags, cs, rip).
-        "mov rax, {udata}",
-        "push rax",                       // ss
-        "push qword ptr [rdi + 8*17]",    // rsp
-        "push qword ptr [rdi + 8*16]",    // rflags
-        "mov rax, {ucode}",
-        "push rax",                       // cs
-        "push qword ptr [rdi + 8*15]",    // rip
-        // Restore GPRs from `state` (rdi load goes last so we can
-        // use rdi as the base pointer until the very end).
-        "mov r15, [rdi + 8*0]",
-        "mov r14, [rdi + 8*1]",
-        "mov r13, [rdi + 8*2]",
-        "mov r12, [rdi + 8*3]",
-        "mov r11, [rdi + 8*4]",
-        "mov r10, [rdi + 8*5]",
-        "mov r9,  [rdi + 8*6]",
-        "mov r8,  [rdi + 8*7]",
-        "mov rbp, [rdi + 8*8]",
-        "mov rsi, [rdi + 8*10]",
-        "mov rdx, [rdi + 8*11]",
-        "mov rcx, [rdi + 8*12]",
-        "mov rbx, [rdi + 8*13]",
-        "mov rax, [rdi + 8*14]",
-        // Final rdi load (overwrites our base).
-        "mov rdi, [rdi + 8*9]",
-        "swapgs",
-        "iretq",
-        udata = const UDATA_SEL as u64,
-        ucode = const UCODE_SEL as u64,
-    );
-}
+// `UserState` + `enter_user_mode_resume` live in `narf-arch` so any
+// downstream crate (notably `narf-userspace`, where the polling-
+// future lives) can name them without depending on `narf-frame`.
+pub use narf_arch::x86_64::{enter_user_mode_resume, UserState};
 
 /// Transfer into user mode. Does not return.
 ///
