@@ -191,16 +191,17 @@ fn run_cmd(args: &BuildArgs) -> Result<()> {
     let mut child = cmd.spawn()
         .with_context(|| format!("failed to spawn {qemu}"))?;
 
-    // Wait for up to 15 seconds. If the kernel hasn't finished the
-    // exit-gate demo by then, it's likely hung.
-    match child.wait_timeout(Duration::from_secs(15))? {
+    // Wait for up to 60 seconds. The Stage-3+ test set runs more
+    // than 150 tests; the testbin (user-mode-e2e) adds another
+    // round of QEMU work. 15s was too tight as the suite grew.
+    match child.wait_timeout(Duration::from_secs(60))? {
         Some(status) => {
             println!("xtask: {qemu} exited with {status}");
         }
         None => {
             child.kill()?;
             child.wait()?;
-            bail!("xtask: {qemu} timed out after 15s (possible kernel hang)");
+            bail!("xtask: {qemu} timed out after 60s (possible kernel hang)");
         }
     }
     Ok(())
