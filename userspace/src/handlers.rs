@@ -669,27 +669,6 @@ pub fn abi_file_op_bridge(
     narf_abi::FileOpReturn { status: ctx.ret.status, value: ctx.ret.value }
 }
 
-// ── Dispatcher spawn helper ────────────────────────────────────────
-//
-// After Bootstrap mints the ring pair, the kernel-side ends sit in
-// the per-task table waiting for somebody to drive them. The boot
-// path (or a test fixture) calls `spawn_dispatcher_for(task_id)` to
-// transfer ownership of the kernel ends to a freshly-spawned async
-// task running `Dispatcher::run`. Returns the dispatcher's
-// scheduler `TaskId`, or `None` if Bootstrap hasn't run for `task_id`
-// (or its kernel ends were already taken).
-
-/// Spawn an `abi::Dispatcher` task to drive the ring pair Bootstrap
-/// minted for `task_id`. Returns the scheduler TaskId of the new
-/// dispatcher task, or `None` if there's nothing to drive.
-pub fn spawn_dispatcher_for(task_id: u64) -> Option<narf_scheduler::TaskId> {
-    let ends = take_kernel_ends(task_id)?;
-    Some(narf_scheduler::spawn(async move {
-        let mut d = narf_abi::Dispatcher::new(ends.sq_drain, ends.cq_prod);
-        d.run().await;
-    }))
-}
-
 /// Drop the core set of handlers into `table`. Idempotent — later
 /// subsystems can install richer handlers over the same slots
 /// (e.g. a real file-descriptor-backed `Read`).
