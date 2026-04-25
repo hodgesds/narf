@@ -119,7 +119,12 @@ fn sys_close(ctx: &mut dyn TrapContext) {
 
 // ── Mmap — arg0=hint, arg1=len, arg2=flags ─────────────────────────
 
-static MMAP_CURSOR: AtomicU64 = AtomicU64::new(0x0000_0050_0000_0000);
+// Mmap virt cursor: starts at PML4[129] = 64.5 TiB, well outside
+// the kernel's identity-map PML4[0] (which lacks the USER bit on
+// its PML4 entry — putting user mappings under it would deny user
+// access at the PML4 walk level even with USER set on every level
+// below).
+static MMAP_CURSOR: AtomicU64 = AtomicU64::new(0x0000_4080_0000_0000);
 
 fn sys_mmap(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
@@ -166,6 +171,7 @@ fn sys_mmap(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
+
     ctx.set_return(SyscallReturn::ok(base));
 }
 

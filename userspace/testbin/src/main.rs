@@ -66,10 +66,12 @@ pub extern "C" fn _start() -> ! {
     // SAFETY: we're the user program, the kernel has set up the
     // int-0x80 gate, and the message lives in our RX segment.
     unsafe {
-        // Use Mmap so the const is referenced; the address is
-        // returned into rax. We don't deference it yet — the
-        // Mmap-backed-page write-fault is tracked separately.
-        let _ = syscall3(SYS_MMAP, 0, 0x1000, 0);
+        let addr = syscall3(SYS_MMAP, 0, 0x1000, 0);
+        // Probe-write to the mmap'd page.
+        if addr != 0 && addr != !0u64 {
+            let p = addr as *mut u64;
+            core::ptr::write_volatile(p, 0xCAFEu64);
+        }
         syscall3(SYS_WRITE, 1, MSG.as_ptr() as u64, MSG.len() as u64);
         syscall0(SYS_EXIT_TASK);
     }
