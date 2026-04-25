@@ -5363,6 +5363,149 @@ fn smoke_memory_address_space_region_table() -> TestResult {
 }
 kernel_test!(smoke_memory_address_space_region_table);
 
+fn smoke_userspace_read_write_routes_through_fd_table() -> TestResult {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_filesystem::{FileOps, FsFuture, Stat};
+    use narf_userspace::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global,
+        FdEntry, Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+
+    // Backing FileOps that records writes in a static + serves
+    // bytes-of-offset on read.
+    static WRITE_LOG: AtomicU64 = AtomicU64::new(0);
+    WRITE_LOG.store(0, Ordering::Relaxed);
+
+    struct CountingFile;
+    impl FileOps for CountingFile {
+        fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+            // Fill buf with low byte of (offset + i).
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = ((offset + i as u64) & 0xFF) as u8;
+            }
+            alloc::boxed::Box::pin(async move { Ok(buf.len()) })
+        }
+        fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+            let n = buf.len();
+            alloc::boxed::Box::pin(async move {
+                WRITE_LOG.fetch_add(n as u64, Ordering::Relaxed);
+                Ok(n)
+            })
+        }
+        fn stat(&self) -> Stat {
+            Stat { size: 0, blocks: 0,
+                   mode: narf_filesystem::Mode::FILE_RW,
+                   mtime_cycles: 0 }
+        }
+    }
+
+    // Pretend "task 7" is running.
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(7);
+    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+
+    fd::__test_reset();
+    fd::init();
+    install_task_id_lookup(task_lookup);
+
+    // Open one fd in task 7's table.
+    let fd_n = fd::with_table(7, |t| {
+        t.open(FdEntry { ops: Arc::new(CountingFile), offset: 0 })
+    }).expect("with_table");
+    if fd_n != 3 {
+        return TestResult::Fail("expected first user fd to be 3");
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Synthetic TrapContext for direct kernel-side dispatch.
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    // Read 16 bytes — handler should poll the future and update offset.
+    let mut buf = [0u8; 16];
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: fd_n as u64, arg1: buf.as_mut_ptr() as u64, arg2: 16,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Read.raw(), &mut ctx);
+    if ctx.ret != Some(SyscallReturn::ok(16)) {
+        return TestResult::Fail("Read didn't return 16");
+    }
+    // Offset should now be 16.
+    let got_offset = fd::with_table(7, |t| t.get(fd_n).map(|e| e.offset)).flatten();
+    if got_offset != Some(16) {
+        return TestResult::Fail("Read didn't advance fd offset");
+    }
+    // Buffer content: bytes-of-offset starting at 0.
+    for (i, b) in buf.iter().enumerate() {
+        if *b != (i & 0xFF) as u8 {
+            return TestResult::Fail("CountingFile read content mismatch");
+        }
+    }
+
+    // Write 8 bytes — handler should poll the future + log.
+    let payload = [0xABu8; 8];
+    let mut ctx2 = FakeCtx {
+        args: SyscallArgs {
+            arg0: fd_n as u64, arg1: payload.as_ptr() as u64, arg2: 8,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Write.raw(), &mut ctx2);
+    if ctx2.ret != Some(SyscallReturn::ok(8)) {
+        return TestResult::Fail("Write didn't return 8");
+    }
+    if WRITE_LOG.load(Ordering::Relaxed) != 8 {
+        return TestResult::Fail("FileOps::write didn't observe payload bytes");
+    }
+    // Offset should be 16 + 8 = 24.
+    let got_offset2 = fd::with_table(7, |t| t.get(fd_n).map(|e| e.offset)).flatten();
+    if got_offset2 != Some(24) {
+        return TestResult::Fail("Write didn't advance fd offset");
+    }
+
+    // Close.
+    let mut ctx3 = FakeCtx {
+        args: SyscallArgs { arg0: fd_n as u64, ..Default::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Close.raw(), &mut ctx3);
+    if ctx3.ret != Some(SyscallReturn::ok(0)) {
+        return TestResult::Fail("Close didn't return 0");
+    }
+    // Closed fd should now error on Read.
+    let mut buf2 = [0u8; 4];
+    let mut ctx4 = FakeCtx {
+        args: SyscallArgs {
+            arg0: fd_n as u64, arg1: buf2.as_mut_ptr() as u64, arg2: 4,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Read.raw(), &mut ctx4);
+    if ctx4.ret != Some(SyscallReturn::invalid_op()) {
+        return TestResult::Fail("Read on closed fd should surface invalid_op");
+    }
+
+    fd::__test_reset();
+    __test_clear_global();
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_read_write_routes_through_fd_table);
+
 fn smoke_userspace_fd_table_roundtrip() -> TestResult {
     use alloc::sync::Arc;
     use narf_filesystem::{FileOps, FsFuture, Stat};

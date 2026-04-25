@@ -25,13 +25,65 @@
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
+use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use narf_console::Writer;
 use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
 
 use crate::{
-    RawFnHandler, Syscall, SyscallReturn, SyscallTable, TrapContext,
+    fd, RawFnHandler, Syscall, SyscallReturn, SyscallTable, TrapContext,
 };
+
+// ── Current-task lookup shim ───────────────────────────────────────
+//
+// Same shape as `AS_LOOKUP` — wired in by the kernel boot to
+// resolve "what task is running this syscall" without a direct
+// `narf_userspace → narf_scheduler` dep cycle.
+
+type TaskIdLookupFn = fn() -> u64;
+
+static TASK_LOOKUP: narf_lib::sync::IrqSafeSpinLock<Option<TaskIdLookupFn>>
+    = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Install the function that returns the current task's raw id.
+/// Boot wires `|| scheduler::current_task_id().raw()` here.
+pub fn install_task_id_lookup(lookup: TaskIdLookupFn) {
+    *TASK_LOOKUP.lock() = Some(lookup);
+}
+
+fn current_task_id() -> u64 {
+    let f = *TASK_LOOKUP.lock();
+    f.map(|lookup| lookup()).unwrap_or(0)
+}
+
+// ── Sync poll-once helper ──────────────────────────────────────────
+//
+// Stage-4 syscall handlers run in trap context — they can't `.await`.
+// Every Stage-3 in-memory FS (initramfs) returns `Ready` on the
+// first poll, so we use a no-op waker + a single `poll`. Disk-backed
+// FSes that yield will need a different shape; this is the
+// quick-path Stage-4 needs to hook real reads from initramfs.
+
+fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
+    use core::pin::Pin;
+    fn raw_waker() -> RawWaker {
+        unsafe fn no_clone(_: *const ()) -> RawWaker { raw_waker() }
+        unsafe fn no_op(_: *const ()) {}
+        const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
+        RawWaker::new(core::ptr::null(), &VTAB)
+    }
+    // SAFETY: vtable holds null-pointer-clean stubs; the waker is
+    // never woken (poll_once expects Ready on the first poll).
+    let waker = unsafe { Waker::from_raw(raw_waker()) };
+    let mut ctx = Context::from_waker(&waker);
+    // SAFETY: we own `fut` by value; pinning to a stack temporary
+    // is the standard "block_on of a !Unpin future".
+    let pinned = unsafe { Pin::new_unchecked(&mut fut) };
+    match pinned.poll(&mut ctx) {
+        Poll::Ready(v) => Some(v),
+        Poll::Pending  => None,
+    }
+}
 
 // ── Per-task AS lookup shim ────────────────────────────────────────
 //
@@ -82,9 +134,14 @@ pub fn clear_exit_landing() {
 }
 
 // ── Write — arg0=fd, arg1=buf, arg2=len ────────────────────────────
+//
+// fd 1 / fd 2: console (stdout/stderr) — direct path so user code
+// without an explicit Open of stdio still works.
+// Other fds: routed through the per-task fd table.
 
 fn sys_write(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
+    let fd = args.arg0 as u32;
     let ptr = args.arg1 as *const u8;
     let len = args.arg2 as usize;
     if ptr.is_null() || len == 0 {
@@ -92,29 +149,85 @@ fn sys_write(ctx: &mut dyn TrapContext) {
         return;
     }
     // SAFETY: `ptr` is a user-mode virt address; the current AS is
-    // still active (trap didn't swap CR3) so the walk resolves. We
-    // read length-bounded. The user could racily unmap via another
-    // thread, but we don't have multi-threaded user tasks yet.
+    // still active (trap didn't swap CR3) so the walk resolves.
     let slice = unsafe { core::slice::from_raw_parts(ptr, len) };
-    use core::fmt::Write as _;
-    let mut w = Writer;
-    for &b in slice {
-        let _ = w.write_char(b as char);
+
+    if fd == 1 || fd == 2 {
+        use core::fmt::Write as _;
+        let mut w = Writer;
+        for &b in slice {
+            let _ = w.write_char(b as char);
+        }
+        ctx.set_return(SyscallReturn::ok(len as u64));
+        return;
     }
-    ctx.set_return(SyscallReturn::ok(len as u64));
+
+    // Look up the fd in the calling task's table, advance the
+    // offset, return bytes-written.
+    let task = current_task_id();
+    let outcome = fd::with_table(task, |t| {
+        let entry = match t.get_mut(fd) {
+            Some(e) => e,
+            None    => return Err(()),
+        };
+        let off = entry.offset;
+        let written = poll_once(entry.ops.write(off, slice))
+            .and_then(|r| r.ok())
+            .unwrap_or(0);
+        entry.offset = off.saturating_add(written as u64);
+        Ok(written)
+    });
+    match outcome {
+        Some(Ok(n))   => ctx.set_return(SyscallReturn::ok(n as u64)),
+        _             => ctx.set_return(SyscallReturn::invalid_op()),
+    }
 }
 
-// ── Read — noop ────────────────────────────────────────────────────
+// ── Read — arg0=fd, arg1=buf, arg2=len ─────────────────────────────
 
 fn sys_read(ctx: &mut dyn TrapContext) {
-    // Stage-4+ wires to VFS; for now EOF.
-    ctx.set_return(SyscallReturn::ok(0));
+    let args = *ctx.args();
+    let fd = args.arg0 as u32;
+    let ptr = args.arg1 as *mut u8;
+    let len = args.arg2 as usize;
+    if ptr.is_null() || len == 0 {
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+    // SAFETY: same contract as `sys_write` — user pointer in the
+    // active AS, length-bounded.
+    let slice = unsafe { core::slice::from_raw_parts_mut(ptr, len) };
+
+    let task = current_task_id();
+    let outcome = fd::with_table(task, |t| {
+        let entry = match t.get_mut(fd) {
+            Some(e) => e,
+            None    => return Err(()),
+        };
+        let off = entry.offset;
+        let read = poll_once(entry.ops.read(off, slice))
+            .and_then(|r| r.ok())
+            .unwrap_or(0);
+        entry.offset = off.saturating_add(read as u64);
+        Ok(read)
+    });
+    match outcome {
+        Some(Ok(n))   => ctx.set_return(SyscallReturn::ok(n as u64)),
+        _             => ctx.set_return(SyscallReturn::invalid_op()),
+    }
 }
 
-// ── Close — noop ───────────────────────────────────────────────────
+// ── Close — arg0=fd ────────────────────────────────────────────────
 
 fn sys_close(ctx: &mut dyn TrapContext) {
-    ctx.set_return(SyscallReturn::ok(0));
+    let fd = ctx.args().arg0 as u32;
+    let task = current_task_id();
+    let ok = fd::with_table(task, |t| t.close(fd)).unwrap_or(false);
+    if ok {
+        ctx.set_return(SyscallReturn::ok(0));
+    } else {
+        ctx.set_return(SyscallReturn::invalid_op());
+    }
 }
 
 // ── Mmap — arg0=hint, arg1=len, arg2=flags ─────────────────────────

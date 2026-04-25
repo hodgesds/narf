@@ -48,7 +48,7 @@ pub use fd::{FdEntry, FdTable};
 pub use elf::{parse as parse_elf, ElfError};
 pub use handlers::{
     clear_exit_landing, install_address_space_lookup, install_core_syscalls,
-    set_exit_landing,
+    install_task_id_lookup, set_exit_landing,
 };
 pub use loader::{load_elf_bytes, load_into, EntryPoint, LoadBytesError, LoadError};
 pub use process::{
