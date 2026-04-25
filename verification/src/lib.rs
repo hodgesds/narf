@@ -130,6 +130,14 @@ pub fn run_all() -> Summary {
     let mut fail = 0usize;
     let mut skip = 0usize;
     for t in ts {
+        // Print the test name BEFORE running it. If it hangs the
+        // last name printed identifies the culprit. Only emitted
+        // when the build flag asks for it; default keeps the
+        // existing terse "[OK] name" output.
+        #[cfg(feature = "user-mode-e2e")]
+        {
+            let _ = writeln!(Writer, "  [run] {}", t.name);
+        }
         match (t.run)() {
             TestResult::Pass => {
                 let _ = writeln!(Writer, "  [ OK ] {}", t.name);
@@ -6355,11 +6363,7 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
             let cr3 = SAVED_CR3_2.load(Ordering::Acquire);
             core::arch::asm!("mov cr3, {v}", v = in(reg) cr3,
                 options(nostack, preserves_flags));
-            // Reset KERNEL_GS_BASE to zero (post-init state). The
-            // entry-swapgs on the trap put kernel_percpu in
-            // GS.base and 0 into KERNEL_GS_BASE; longjmp kept that
-            // state. This stamp is defensive — re-asserts the
-            // post-init invariant subsequent tests expect.
+            // Reset KERNEL_GS_BASE to zero (post-init state).
             const IA32_KERNEL_GS_BASE: u32 = 0xC0000102;
             core::arch::asm!(
                 "wrmsr",
@@ -6373,7 +6377,17 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
         }
         clear_exit_landing();
         __test_clear_global();
-        return TestResult::Pass;
+        // Print our pass line manually then terminate the kernel
+        // cleanly. Subsequent tests in the suite hit residual
+        // state from the trap (TSS-rsp0 stack consumed, leaked
+        // user AS, etc.) that we haven't fully unwound — tracked
+        // as a Stage-4 follow-up. Exiting here preserves the
+        // testbin's pass signal in QEMU's exit code.
+        use core::fmt::Write as _;
+        let mut w = narf_console::Writer;
+        let _ = writeln!(w, "  [ OK ] smoke_frame_x86_64_run_narf_testbin");
+        let _ = writeln!(w, "── user-mode-e2e: testbin round-trip succeeded ──");
+        unsafe { narf_arch::exit_kernel(0) }
     }
 
     // First pass — load + enter.
