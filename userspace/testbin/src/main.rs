@@ -43,6 +43,12 @@ const SYS_READ:      u64 = 111;
 #[cfg(target_arch = "x86_64")]
 const SYS_CLOSE:     u64 = 113;
 #[cfg(target_arch = "x86_64")]
+const SYS_BRK:           u64 = 150;
+#[cfg(target_arch = "x86_64")]
+const SYS_CLOCK_GETTIME: u64 = 151;
+#[cfg(target_arch = "x86_64")]
+const SYS_SIGACTION:     u64 = 152;
+#[cfg(target_arch = "x86_64")]
 const NARF_MAGIC:    u32 = 0x4E_41_52_46;  // "NARF" LE
 
 #[cfg(target_arch = "x86_64")]
@@ -362,6 +368,48 @@ fn start_rust(rsp_at_entry: u64) -> ! {
             let (pp, pl) = if pid_ok { (POK.as_ptr(), POK.len()) }
                             else      { (PBAD.as_ptr(), PBAD.len()) };
             syscall3(SYS_WRITE, 1, pp as u64, pl as u64);
+
+            // brk: query → grow by one page → write a byte to the
+            // newly-mapped slot to confirm it's R+W → query again to
+            // confirm the break stuck.
+            const BROK:  &[u8] = b"brk: ok\n";
+            const BBADX: &[u8] = b"brk: bad\n";
+            let initial = syscall3(SYS_BRK, 0, 0, 0);
+            let target  = initial + 0x1000;
+            let after   = syscall3(SYS_BRK, target, 0, 0);
+            let mut brk_ok = initial != 0 && initial != !0u64 && after == target;
+            if brk_ok {
+                // Write to the newly-mapped page; should not fault.
+                core::ptr::write_volatile(initial as *mut u8, 0x5A);
+                let again = syscall3(SYS_BRK, 0, 0, 0);
+                if again != target { brk_ok = false; }
+            }
+            let (bp, bl) = if brk_ok { (BROK.as_ptr(), BROK.len()) }
+                            else       { (BBADX.as_ptr(), BBADX.len()) };
+            syscall3(SYS_WRITE, 1, bp as u64, bl as u64);
+
+            // clock_gettime: write a timespec on the stack, ask the
+            // kernel to populate it, sanity-check the values.
+            const CKOK:  &[u8] = b"clk: ok\n";
+            const CKBAD: &[u8] = b"clk: bad\n";
+            let mut ts: [i64; 2] = [-1, -1];
+            let r = syscall3(SYS_CLOCK_GETTIME, 0, ts.as_mut_ptr() as u64, 0);
+            let clk_ok = r == 0 && ts[0] >= 0 && ts[1] >= 0 && ts[1] < 1_000_000_000;
+            let (cp, cl) = if clk_ok { (CKOK.as_ptr(), CKOK.len()) }
+                            else       { (CKBAD.as_ptr(), CKBAD.len()) };
+            syscall3(SYS_WRITE, 1, cp as u64, cl as u64);
+
+            // sigaction: install handler 0xDEADBEEF for SIGTERM, then
+            // clear it and confirm the prior handler is reported.
+            const SOK:  &[u8] = b"sig: ok\n";
+            const SBAD: &[u8] = b"sig: bad\n";
+            let mut old: u64 = 0;
+            let _ = syscall4(SYS_SIGACTION, 15, 0xDEADBEEF, &mut old as *mut u64 as u64, 0);
+            let _ = syscall4(SYS_SIGACTION, 15, 0, &mut old as *mut u64 as u64, 0);
+            let sig_ok = old == 0xDEADBEEF;
+            let (sp_, sl_) = if sig_ok { (SOK.as_ptr(), SOK.len()) }
+                              else        { (SBAD.as_ptr(), SBAD.len()) };
+            syscall3(SYS_WRITE, 1, sp_ as u64, sl_ as u64);
         }
         syscall3(SYS_WRITE, 1, MSG.as_ptr() as u64, MSG.len() as u64);
         syscall0(SYS_EXIT_TASK);

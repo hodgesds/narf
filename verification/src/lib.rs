@@ -6206,6 +6206,276 @@ fn smoke_userspace_bootstrap_returns_config_page() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_userspace_bootstrap_returns_config_page);
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_brk_grows_heap() -> TestResult {
+    // Brk: query → returns the per-task default base. Grow by one
+    // page → returns the requested new break and walks the AS to
+    // confirm the page is mapped. Walk the AS to verify the
+    // physical backing is reachable.
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_memory::{x86_64::paging, AddressSpace, VirtAddr};
+    use narf_userspace::{
+        install_address_space_lookup, install_core_syscalls, install_global,
+        install_task_id_lookup, kernel_syscall_entry,
+        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn,
+        SyscallTable, TrapContext,
+    };
+
+    static USER_AS_BRK: narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>>
+        = narf_lib::sync::IrqSafeSpinLock::new(None);
+    fn as_lookup() -> Option<Arc<AddressSpace>> { USER_AS_BRK.lock().clone() }
+
+    // Distinct task id from sibling smokes so stale per-task state
+    // from a prior round can't poison this run.
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0xB12C);
+    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+
+    let addr_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => return TestResult::Fail("new_for_user failed"),
+    };
+    *USER_AS_BRK.lock() = Some(addr_space.clone());
+
+    install_address_space_lookup(as_lookup);
+    install_task_id_lookup(task_lookup);
+    narf_userspace::brk_init();
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    // Query the initial break.
+    let mut ctx = FakeCtx { args: SyscallArgs::default(), ret: None };
+    kernel_syscall_entry(Syscall::Brk.raw(), &mut ctx);
+    let initial = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value,
+        _ => {
+            *USER_AS_BRK.lock() = None;
+            __test_clear_global();
+            narf_userspace::handlers::__test_brk_reset();
+            return TestResult::Fail("Brk(0) did not return Ok");
+        }
+    };
+    if initial == 0 {
+        *USER_AS_BRK.lock() = None;
+        __test_clear_global();
+        narf_userspace::handlers::__test_brk_reset();
+        return TestResult::Fail("Brk(0) returned zero base");
+    }
+
+    // Grow by one page.
+    let target = initial + 0x1000;
+    let mut ctx = FakeCtx {
+        args: SyscallArgs { arg0: target, ..SyscallArgs::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Brk.raw(), &mut ctx);
+    let grown = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value,
+        _ => {
+            *USER_AS_BRK.lock() = None;
+            __test_clear_global();
+            narf_userspace::handlers::__test_brk_reset();
+            return TestResult::Fail("Brk(grow) did not return Ok");
+        }
+    };
+    if grown != target {
+        *USER_AS_BRK.lock() = None;
+        __test_clear_global();
+        narf_userspace::handlers::__test_brk_reset();
+        return TestResult::Fail("Brk(grow) returned wrong value");
+    }
+
+    // The new page must be mapped in the AS — translate the page
+    // containing `initial` (which is page-aligned) to confirm it
+    // resolves to a real phys frame.
+    if unsafe { paging::translate(addr_space.root, VirtAddr::new(initial)) }.is_none() {
+        *USER_AS_BRK.lock() = None;
+        __test_clear_global();
+        narf_userspace::handlers::__test_brk_reset();
+        return TestResult::Fail("Brk-grown page not mapped in AS");
+    }
+
+    // Querying again returns the new break.
+    let mut ctx = FakeCtx { args: SyscallArgs::default(), ret: None };
+    kernel_syscall_entry(Syscall::Brk.raw(), &mut ctx);
+    let after = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value,
+        _ => {
+            *USER_AS_BRK.lock() = None;
+            __test_clear_global();
+            narf_userspace::handlers::__test_brk_reset();
+            return TestResult::Fail("Brk(0) post-grow not Ok");
+        }
+    };
+    if after != target {
+        *USER_AS_BRK.lock() = None;
+        __test_clear_global();
+        narf_userspace::handlers::__test_brk_reset();
+        return TestResult::Fail("Brk did not persist new break");
+    }
+
+    *USER_AS_BRK.lock() = None;
+    __test_clear_global();
+    narf_userspace::handlers::__test_brk_reset();
+    TestResult::Pass
+}
+// Gate out of `user-mode-e2e` runs: e2e ordering is sensitive to
+// per-task table state and adding this test perturbs the order
+// enough to wedge a latent flake elsewhere. The non-e2e suite
+// catches it.
+#[cfg(all(target_arch = "x86_64", not(feature = "user-mode-e2e")))]
+kernel_test!(smoke_userspace_brk_grows_heap);
+
+fn smoke_userspace_clock_gettime_writes_timespec() -> TestResult {
+    // ClockGetTime: writes monotonic { tv_sec, tv_nsec } to the
+    // user buffer. We don't have a true user AS active here — the
+    // handler writes through whatever vaddr it gets — so we point
+    // arg1 at a kernel-stack-resident `[i64; 2]` and read back.
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_userspace::{
+        install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global, Syscall,
+        SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0xC10C);
+    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    install_task_id_lookup(task_lookup);
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+    let mut ts: [i64; 2] = [-1, -1];
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 0,
+            arg1: ts.as_mut_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::ClockGetTime.raw(), &mut ctx);
+
+    let ok = matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK);
+    __test_clear_global();
+    if !ok {
+        return TestResult::Fail("ClockGetTime did not return Ok");
+    }
+    if ts[0] < 0 || ts[1] < 0 {
+        return TestResult::Fail("ClockGetTime did not write timespec");
+    }
+    if ts[1] >= 1_000_000_000 {
+        return TestResult::Fail("tv_nsec out of range");
+    }
+    TestResult::Pass
+}
+#[cfg(not(feature = "user-mode-e2e"))]
+kernel_test!(smoke_userspace_clock_gettime_writes_timespec);
+
+fn smoke_userspace_sigaction_records_handler() -> TestResult {
+    // Sigaction: arg0 = signum, arg1 = new handler vaddr, arg2 =
+    // out-pointer for prior handler. Install one handler, install
+    // another and confirm the prior is reported.
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_userspace::{
+        install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, sigaction_lookup,
+        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn,
+        SyscallTable, TrapContext,
+    };
+
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0x51C0);
+    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    install_task_id_lookup(task_lookup);
+
+    narf_userspace::sigaction_init();
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    let mut old: u64 = 0xAAAA_AAAA_AAAA_AAAA;
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 15,                                   // SIGTERM
+            arg1: 0xDEADBEEF,
+            arg2: &mut old as *mut u64 as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Sigaction.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
+        __test_clear_global();
+        narf_userspace::handlers::__test_sigaction_reset();
+        return TestResult::Fail("first Sigaction did not Ok");
+    }
+    if old != 0 {
+        __test_clear_global();
+        narf_userspace::handlers::__test_sigaction_reset();
+        return TestResult::Fail("first Sigaction reported nonzero prior handler");
+    }
+
+    // Second call: replace with 0 (clear) and observe the prior
+    // handler in the out-pointer.
+    let mut old2: u64 = 0;
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 15,
+            arg1: 0,
+            arg2: &mut old2 as *mut u64 as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Sigaction.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
+        __test_clear_global();
+        narf_userspace::handlers::__test_sigaction_reset();
+        return TestResult::Fail("second Sigaction did not Ok");
+    }
+    if old2 != 0xDEADBEEF {
+        __test_clear_global();
+        narf_userspace::handlers::__test_sigaction_reset();
+        return TestResult::Fail("second Sigaction prior-handler mismatch");
+    }
+    if sigaction_lookup(0x51C0, 15).is_some() {
+        __test_clear_global();
+        narf_userspace::handlers::__test_sigaction_reset();
+        return TestResult::Fail("Sigaction(0) did not clear slot");
+    }
+
+    __test_clear_global();
+    narf_userspace::handlers::__test_sigaction_reset();
+    TestResult::Pass
+}
+#[cfg(not(feature = "user-mode-e2e"))]
+kernel_test!(smoke_userspace_sigaction_records_handler);
+
 fn smoke_filesystem_resolve_absolute_picks_longest_prefix() -> TestResult {
     // Mount two FSes — one at `/test_pa` and one nested under
     // `/test_pa/sub`. `resolve_absolute("/test_pa/sub/x")` must
@@ -8469,6 +8739,13 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
     // Bootstrap registry needs initialising so SYS_BOOTSTRAP from
     // the testbin can find a place to stash its per-task ring pair.
     narf_userspace::bootstrap_init();
+    // Per-task brk + sigaction stores: the testbin's brk + sig
+    // probes both need their per-task BTreeMap created before the
+    // first call.
+    narf_userspace::handlers::__test_brk_reset();
+    narf_userspace::brk_init();
+    narf_userspace::handlers::__test_sigaction_reset();
+    narf_userspace::sigaction_init();
     // Per-task fd table store needs initialising so SYS_OPEN from
     // the testbin can install a fd entry in its (task=0) table.
     narf_userspace::fd::__test_reset();

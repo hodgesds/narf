@@ -140,6 +140,22 @@ pub enum Syscall {
     /// `geteuid()` / `getegid()` return a sane value.
     GetUid       = 142,
     GetGid       = 143,
+
+    /// Set or query the per-task heap break.
+    /// `arg0 = 0` → return current break; `arg0 != 0` → resize.
+    /// POSIX `brk(2)` semantics: failure returns the unchanged break.
+    Brk          = 150,
+
+    /// Write monotonic time to the user buffer at `arg1` for clock id
+    /// `arg0`. Buffer is `struct timespec { tv_sec: i64, tv_nsec: i64 }`.
+    /// Returns 0 on success.
+    ClockGetTime = 151,
+
+    /// Install a signal-handler stub. `arg0 = signum`,
+    /// `arg1 = handler-vaddr` (0 to clear), `arg2 = old-out-ptr`
+    /// (may be null). Stage-4 records but never delivers — signal
+    /// delivery lands in a future round. Returns 0.
+    Sigaction    = 152,
 }
 
 impl Syscall {
@@ -167,6 +183,9 @@ impl Syscall {
             141 => Syscall::GetPpid,
             142 => Syscall::GetUid,
             143 => Syscall::GetGid,
+            150 => Syscall::Brk,
+            151 => Syscall::ClockGetTime,
+            152 => Syscall::Sigaction,
             _   => return None,
         })
     }

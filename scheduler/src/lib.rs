@@ -58,6 +58,12 @@ pub use narf_capabilities::Invoke;
 #[cfg(target_arch = "x86_64")]
 pub use narf_arch::x86_64::{enter_user_mode_resume, UserState};
 
+// Re-export the time crate so `narf-userspace` (already a downstream
+// of `narf-scheduler`) can read the monotonic clock without taking a
+// direct `narf-time` dep — same dep-cycle / link-ordering rationale
+// as the `narf-arch` re-export above.
+pub use narf_time;
+
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;

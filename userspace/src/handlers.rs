@@ -847,6 +847,207 @@ fn sys_noop_ok(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(0));
 }
 
+// ── Brk — per-task heap break ──────────────────────────────────────
+//
+// POSIX `brk(2)` shape: arg0 carries the requested new break, or 0
+// to query. The per-task break starts at a fixed default well above
+// the mmap cursor (`MMAP_CURSOR` starts at 0x4080..) and below the
+// user stack (`DEFAULT_USER_STACK_BASE = 0x7FFF_FFFC_0000`). Growing
+// the heap allocates frames + maps them R+W; shrinking is a Stage-4
+// TODO — we just lower the recorded break without unmapping so the
+// physical pages leak until the task exits. POSIX brk's failure
+// contract is "return the unchanged break", so allocation/mapping
+// failure is silent: we just hand back the current value.
+
+/// Default per-task heap base. Far enough from the mmap cursor and
+/// the user stack to leave room for both to grow without colliding
+/// with the brk arena.
+const BRK_DEFAULT_BASE: u64 = 0x0000_5000_0000_0000;
+
+static BRK_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>>
+    = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Initialise the per-task brk registry. Boot calls this once before
+/// any user task can issue `Syscall::Brk`.
+pub fn brk_init() {
+    *BRK_TABLE.lock() = Some(BTreeMap::new());
+}
+
+/// Reset the registry — test hook.
+#[doc(hidden)]
+pub fn __test_brk_reset() { *BRK_TABLE.lock() = None; }
+
+fn sys_brk(ctx: &mut dyn TrapContext) {
+    let new_break = ctx.args().arg0;
+    let task = current_task_id();
+
+    // Snapshot the current break (initialising the slot on first call).
+    let cur = {
+        let mut g = BRK_TABLE.lock();
+        let map = match g.as_mut() {
+            Some(m) => m,
+            None    => { ctx.set_return(SyscallReturn::ok(0)); return; }
+        };
+        *map.entry(task).or_insert(BRK_DEFAULT_BASE)
+    };
+
+    // Query path: arg0 == 0 just returns the current break.
+    if new_break == 0 {
+        ctx.set_return(SyscallReturn::ok(cur));
+        return;
+    }
+
+    // Shrink path: lower the recorded break without unmapping. TODO:
+    // Stage-4 follow-up to actually unmap shrunken pages so the phys
+    // frames return to the allocator.
+    if new_break < cur {
+        BRK_TABLE.lock().as_mut().expect("brk_init").insert(task, new_break);
+        ctx.set_return(SyscallReturn::ok(new_break));
+        return;
+    }
+
+    // Grow path: page-align both ends, allocate + map every fresh page
+    // R+W into the calling task's AS. Any failure rolls the break
+    // back to `cur` (POSIX brk failure contract).
+    let as_ref = match current_address_space() {
+        Some(a) => a,
+        None    => { ctx.set_return(SyscallReturn::ok(cur)); return; }
+    };
+    let cur_aligned = (cur + 0xFFF) & !0xFFFu64;
+    let new_aligned = (new_break + 0xFFF) & !0xFFFu64;
+    let mut va = cur_aligned;
+    while va < new_aligned {
+        let phys = match narf_memory::alloc_frame() {
+            Ok(f) => f.start_address(),
+            Err(_) => {
+                ctx.set_return(SyscallReturn::ok(cur));
+                return;
+            }
+        };
+        // SAFETY: identity-mapped low 4 GiB; phys is page-aligned.
+        unsafe { core::ptr::write_bytes(phys.raw() as *mut u8, 0, 0x1000); }
+        if as_ref.map_region(Region {
+            base:  VirtAddr::new(va),
+            len:   0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys,
+        }).is_err() {
+            ctx.set_return(SyscallReturn::ok(cur));
+            return;
+        }
+        va += 0x1000;
+    }
+    if unsafe { as_ref.materialize() }.is_err() {
+        ctx.set_return(SyscallReturn::ok(cur));
+        return;
+    }
+
+    BRK_TABLE.lock().as_mut().expect("brk_init").insert(task, new_break);
+    ctx.set_return(SyscallReturn::ok(new_break));
+}
+
+// ── ClockGetTime — write monotonic timespec to user buffer ─────────
+//
+// arg0 ignored (only one clock today, matching CLOCK_MONOTONIC).
+// arg1 is the user vaddr of a `timespec { i64 tv_sec; i64 tv_nsec; }`.
+// We read the kernel's monotonic_ns counter, decompose into sec/nsec,
+// and write through the active AS — handlers run in the calling
+// task's CR3 / TTBR so the user pointer resolves directly.
+
+fn sys_clock_gettime(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let buf  = args.arg1;
+    if buf == 0 || buf & 0x7 != 0 {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    // Route through `narf_scheduler::narf_time` to keep narf-userspace
+    // off a direct narf-time dep (see scheduler/src/lib.rs re-export
+    // rationale).
+    let ns: u64 = narf_scheduler::narf_time::monotonic_ns();
+    let sec  = (ns / 1_000_000_000) as i64;
+    let nsec = (ns % 1_000_000_000) as i64;
+    // SAFETY: caller provides a writable user vaddr in the active AS.
+    // We've checked alignment above; a bad pointer is the user's
+    // problem (faulted access lands in their handler, not ours).
+    unsafe {
+        core::ptr::write_volatile(buf as *mut i64, sec);
+        core::ptr::write_volatile((buf + 8) as *mut i64, nsec);
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+// ── Sigaction — record a per-task handler vaddr ────────────────────
+//
+// Stage-4 records and never delivers. The signal-delivery path
+// requires (a) a way to inject a synthetic frame on top of the
+// user's saved state and (b) interrupt sources that map to signums;
+// both land in a later round. Until then we keep the table so
+// relibc's setup-time `sigaction()` calls don't fail and the
+// recorded handlers can be inspected by tests.
+
+const NSIG: usize = 32;
+
+static SIGACTION_TABLE:
+    narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, [Option<u64>; NSIG]>>>
+    = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Initialise the per-task sigaction registry. Boot calls this once
+/// before any user task can issue `Syscall::Sigaction`.
+pub fn sigaction_init() {
+    *SIGACTION_TABLE.lock() = Some(BTreeMap::new());
+}
+
+/// Reset the registry — test hook.
+#[doc(hidden)]
+pub fn __test_sigaction_reset() { *SIGACTION_TABLE.lock() = None; }
+
+/// Diagnostic: peek the recorded handler for `(task, signum)`.
+pub fn sigaction_lookup(task: u64, signum: usize) -> Option<u64> {
+    let g = SIGACTION_TABLE.lock();
+    let map = g.as_ref()?;
+    let slots = map.get(&task)?;
+    if signum >= NSIG { return None; }
+    slots[signum]
+}
+
+fn sys_sigaction(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let signum     = args.arg0 as usize;
+    let new_handler = args.arg1;
+    let old_out    = args.arg2;
+    if signum >= NSIG {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    let task = current_task_id();
+
+    let prior = {
+        let mut g = SIGACTION_TABLE.lock();
+        let map = match g.as_mut() {
+            Some(m) => m,
+            None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        };
+        let slots = map.entry(task).or_insert([None; NSIG]);
+        let prior = slots[signum];
+        slots[signum] = if new_handler == 0 { None } else { Some(new_handler) };
+        prior
+    };
+
+    if old_out != 0 {
+        // SAFETY: caller-supplied user vaddr in the active AS. We
+        // require natural u64 alignment; a misaligned pointer faults
+        // into the user's own handler, not ours.
+        if old_out & 0x7 == 0 {
+            unsafe {
+                core::ptr::write_volatile(old_out as *mut u64, prior.unwrap_or(0));
+            }
+        }
+    }
+
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
 // ── Installer ──────────────────────────────────────────────────────
 
 /// Bridge fn boot installs into `narf_abi::install_file_op_bridge`.
@@ -924,4 +1125,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::ExitTask, "exit",     RawFnHandler(sys_exit_task));
     table.install_raw(Syscall::Yield,    "yield",    RawFnHandler(sys_yield));
     table.install_raw(Syscall::Sleep,    "sleep",    RawFnHandler(sys_noop_ok));
+    table.install_raw(Syscall::Brk,          "brk",           RawFnHandler(sys_brk));
+    table.install_raw(Syscall::ClockGetTime, "clock_gettime", RawFnHandler(sys_clock_gettime));
+    table.install_raw(Syscall::Sigaction,    "sigaction",     RawFnHandler(sys_sigaction));
 }
