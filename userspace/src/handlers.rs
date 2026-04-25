@@ -642,10 +642,12 @@ pub fn abi_file_op_bridge(
     args: &narf_abi::FileOpArgs,
 ) -> narf_abi::FileOpReturn {
     let num: u32 = match kind {
-        narf_abi::FileOpKind::Open  => Syscall::OpenFile.raw(),
-        narf_abi::FileOpKind::Read  => Syscall::Read.raw(),
-        narf_abi::FileOpKind::Write => Syscall::Write.raw(),
-        narf_abi::FileOpKind::Close => Syscall::Close.raw(),
+        narf_abi::FileOpKind::Open   => Syscall::OpenFile.raw(),
+        narf_abi::FileOpKind::Read   => Syscall::Read.raw(),
+        narf_abi::FileOpKind::Write  => Syscall::Write.raw(),
+        narf_abi::FileOpKind::Close  => Syscall::Close.raw(),
+        narf_abi::FileOpKind::Mmap   => Syscall::Mmap.raw(),
+        narf_abi::FileOpKind::Munmap => Syscall::Munmap.raw(),
     };
     let sargs = crate::SyscallArgs {
         arg0: args.a0, arg1: args.a1, arg2: args.a2,

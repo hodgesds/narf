@@ -5545,6 +5545,121 @@ fn smoke_abi_dispatcher_serves_file_ops() -> TestResult {
 kernel_test!(smoke_abi_dispatcher_serves_file_ops);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_abi_dispatcher_serves_mmap() -> TestResult {
+    // Same shape as smoke_abi_dispatcher_serves_file_ops, but
+    // exercises the Mmap/Munmap ring path. Submit `OpCode::Mmap`
+    // for one page → expect `Ok` with a non-zero user vaddr in
+    // `result[0]`. Then `OpCode::Munmap` that base → expect `Ok`.
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU8, Ordering};
+    use narf_abi::{Dispatcher, Submission, OpCode, Tag, NarfStatus};
+    use narf_memory::AddressSpace;
+    use narf_userspace::{
+        abi_file_op_bridge, install_address_space_lookup, install_core_syscalls,
+        install_global, install_task_id_lookup, syscall::__test_clear_global,
+        SyscallTable,
+    };
+
+    static USER_AS_MMAP: narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>>
+        = narf_lib::sync::IrqSafeSpinLock::new(None);
+    fn as_lookup() -> Option<Arc<AddressSpace>> { USER_AS_MMAP.lock().clone() }
+    static FAKE_TASK: u64 = 0xACAC;
+    fn task_lookup() -> u64 { FAKE_TASK }
+
+    let addr_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => return TestResult::Fail("new_for_user failed"),
+    };
+    *USER_AS_MMAP.lock() = Some(addr_space);
+
+    install_address_space_lookup(as_lookup);
+    install_task_id_lookup(task_lookup);
+    narf_userspace::fd::__test_reset();
+    narf_userspace::fd::init();
+    narf_userspace::bootstrap_init();
+    narf_abi::install_file_op_bridge(abi_file_op_bridge);
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    use narf_userspace::{kernel_syscall_entry, Syscall, SyscallArgs,
+                         SyscallReturn, TrapContext};
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+    let mut ctx = FakeCtx { args: SyscallArgs::default(), ret: None };
+    kernel_syscall_entry(Syscall::Bootstrap.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
+        return TestResult::Fail("Bootstrap returned non-Ok");
+    }
+
+    let kernel_ends = narf_userspace::take_kernel_ends(FAKE_TASK).expect("ke");
+    let user_ends   = narf_userspace::take_user_ends(FAKE_TASK).expect("ue");
+
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+    OUTCOME.store(0, Ordering::Relaxed);
+
+    narf_scheduler::init();
+    narf_scheduler::spawn(async move {
+        let mut d = Dispatcher::new(kernel_ends.sq_drain, kernel_ends.cq_prod);
+        d.run().await;
+    });
+    narf_scheduler::spawn(async move {
+        let mut sq = user_ends.sq_prod;
+        let mut cq = user_ends.cq_drain;
+
+        // Mmap(hint=0, len=0x1000, flags=0).
+        let mut sub = Submission::noop(Tag::new(0x20));
+        sub.op = OpCode::Mmap;
+        sub.inline[0] = 0;
+        sub.inline[1] = 0x1000;
+        sub.inline[2] = 0;
+        sq.send(sub).await.unwrap();
+        let comp = cq.recv().await.unwrap();
+        if comp.status != NarfStatus::Ok || comp.result[0] == 0 {
+            OUTCOME.store(2, Ordering::Relaxed);
+            core::mem::drop(sq); core::mem::drop(cq);
+            return;
+        }
+        let base = comp.result[0];
+
+        // Munmap(base).
+        let mut sub = Submission::noop(Tag::new(0x21));
+        sub.op = OpCode::Munmap;
+        sub.inline[0] = base;
+        sq.send(sub).await.unwrap();
+        let comp = cq.recv().await.unwrap();
+        if comp.status != NarfStatus::Ok {
+            OUTCOME.store(3, Ordering::Relaxed);
+            core::mem::drop(sq); core::mem::drop(cq);
+            return;
+        }
+        OUTCOME.store(1, Ordering::Relaxed);
+        core::mem::drop(sq); core::mem::drop(cq);
+    });
+
+    narf_scheduler::run_until_empty();
+
+    *USER_AS_MMAP.lock() = None;
+    narf_userspace::fd::__test_reset();
+    narf_userspace::handlers::__test_bootstrap_reset();
+    __test_clear_global();
+
+    match OUTCOME.load(Ordering::Relaxed) {
+        1 => TestResult::Pass,
+        2 => TestResult::Fail("Mmap completion was not Ok / vaddr was 0"),
+        3 => TestResult::Fail("Munmap completion was not Ok"),
+        _ => TestResult::Fail("user-side task did not complete"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_abi_dispatcher_serves_mmap);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_userspace_bootstrap_rings_round_trip() -> TestResult {
     // Full Bootstrap path: mint config page + ring pair, spawn
     // an `abi::Dispatcher` task on the kernel-side ends, and

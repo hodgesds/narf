@@ -79,15 +79,17 @@ pub static ABI_CANCEL_CHECK_LATENCY: FnTime = FnTime::new("abi::cancel_check");
 // Boot wires `narf_userspace::handlers::abi_file_op_bridge` here;
 // without it the dispatcher returns `InvalidOp`.
 
-/// Numeric tag of the file-op the bridge is being asked to perform.
+/// Numeric tag of the syscall the bridge is being asked to perform.
 /// Mirrors `narf_userspace::Syscall::*` discriminants but kept
 /// arch-neutral here (abi/ can't depend on userspace).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum FileOpKind {
-    Open  = 110,
-    Read  = 111,
-    Write = 112,
-    Close = 113,
+    Open   = 110,
+    Read   = 111,
+    Write  = 112,
+    Close  = 113,
+    Mmap   = 120,
+    Munmap = 121,
 }
 
 /// 6-arg payload + a return slot. Mirrors the
@@ -174,6 +176,11 @@ pub enum OpCode {
     Read         = 0x0011,
     Write        = 0x0012,
     Close        = 0x0013,
+
+    /// Memory ops. `inline[0..3]` carry the args; `Completion::result[0]`
+    /// is the mapped vaddr (Mmap) or 0 (Munmap).
+    Mmap         = 0x0014,
+    Munmap       = 0x0015,
 }
 
 impl OpCode {
@@ -716,12 +723,15 @@ impl<const N: usize> Dispatcher<N> {
                 Completion::ok(tag)
             }
 
-            OpCode::OpenFile | OpCode::Read | OpCode::Write | OpCode::Close => {
+            OpCode::OpenFile | OpCode::Read | OpCode::Write | OpCode::Close
+                | OpCode::Mmap | OpCode::Munmap => {
                 let kind = match sub.op {
                     OpCode::OpenFile => FileOpKind::Open,
                     OpCode::Read     => FileOpKind::Read,
                     OpCode::Write    => FileOpKind::Write,
                     OpCode::Close    => FileOpKind::Close,
+                    OpCode::Mmap     => FileOpKind::Mmap,
+                    OpCode::Munmap   => FileOpKind::Munmap,
                     _ => unreachable!(),
                 };
                 let args = FileOpArgs {
