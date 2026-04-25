@@ -31,6 +31,8 @@ const SYS_MUNMAP:    u64 = 121;
 #[cfg(target_arch = "x86_64")]
 const SYS_BOOTSTRAP: u64 = 101;
 #[cfg(target_arch = "x86_64")]
+const SYS_RING_KICK: u64 = 130;
+#[cfg(target_arch = "x86_64")]
 const SYS_OPEN:      u64 = 110;
 #[cfg(target_arch = "x86_64")]
 const SYS_READ:      u64 = 111;
@@ -256,6 +258,57 @@ fn start_rust(rsp_at_entry: u64) -> ! {
             let (mp, ml) = if ok { (BOK.as_ptr(), BOK.len()) }
                            else   { (BBAD.as_ptr(), BBAD.len()) };
             syscall3(SYS_WRITE, 1, mp as u64, ml as u64);
+
+            // Shared ring fast-path: write a Submission directly into
+            // the SQ slot[0] (kernel and user share the page), bump
+            // head, kick the kernel, then read the Completion back
+            // from CQ slot[0]. Proves the SharedRing layout matches
+            // between kernel and CPL=3 views of the same phys.
+            const RING_OK:  &[u8] = b"ring: ok\n";
+            const RING_BAD: &[u8] = b"ring: bad\n";
+            let mut ring_ok = false;
+            if ok {
+                // BootstrapHeader layout (handlers.rs):
+                //   0x00 magic / 0x04 version / 0x08 task_id
+                //   0x10 sq_cap / 0x18 cq_cap
+                //   0x20 sq_depth / 0x24 cq_depth
+                //   0x28 shared_sq_vaddr / 0x30 shared_cq_vaddr
+                //   0x38 shared_depth / 0x3C _pad
+                let sq_v = core::ptr::read_volatile((cfg + 0x28) as *const u64);
+                let cq_v = core::ptr::read_volatile((cfg + 0x30) as *const u64);
+
+                // SharedRing layout: head u32 (0) | tail u32 (4) |
+                // closed u32 (8) | pad..64 | slots
+                let sq_head_p = sq_v as *mut u32;
+                let sq_slot0  = (sq_v + 64) as *mut u8;
+
+                // Submission (#[repr(C)], 144 bytes):
+                //   op u32 (0) / flags u32 (4) / pad..16 /
+                //   caps[4]CapSlot 16..80 / tag u64 80..88 /
+                //   inline[6]u64 88..136 / pad..144
+                core::ptr::write_bytes(sq_slot0, 0, 144);
+                core::ptr::write_volatile(sq_slot0 as *mut u32, 0u32);  // OpCode::Noop
+                core::ptr::write_volatile((sq_slot0 as u64 + 80) as *mut u64, 0xFEED_u64);
+                core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+                core::ptr::write_volatile(sq_head_p, 1u32);
+
+                let processed = syscall0(SYS_RING_KICK);
+                if processed == 1 {
+                    let cq_head = cq_v as *const u32;
+                    let cq_tail_p = (cq_v + 4) as *mut u32;
+                    let cq_slot0 = (cq_v + 64) as *const u8;
+                    if core::ptr::read_volatile(cq_head) == 1 {
+                        // Completion: tag u64 (0) / status u32 (8)
+                        let tag = core::ptr::read_volatile(cq_slot0 as *const u64);
+                        let status = core::ptr::read_volatile((cq_slot0 as u64 + 8) as *const u32);
+                        if tag == 0xFEED && status == 0 { ring_ok = true; }
+                        core::ptr::write_volatile(cq_tail_p, 1u32);
+                    }
+                }
+            }
+            let (rp, rl) = if ring_ok { (RING_OK.as_ptr(), RING_OK.len()) }
+                            else        { (RING_BAD.as_ptr(), RING_BAD.len()) };
+            syscall3(SYS_WRITE, 1, rp as u64, rl as u64);
 
             // VFS round-trip: open + read + close from real user
             // mode. Mounted under "/testbin"; "f" is the file name.
