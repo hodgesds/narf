@@ -176,6 +176,14 @@ fn start_rust(rsp_at_entry: u64) -> ! {
     const ABAD:       &[u8] = b"argv: bad\n";
     #[cfg(target_arch = "x86_64")]
     const EXPECT_ARGV0: &[u8] = b"narf-testbin";
+    #[cfg(target_arch = "x86_64")]
+    const AUX_OK:     &[u8] = b"aux: ok\n";
+    #[cfg(target_arch = "x86_64")]
+    const AUX_BAD:    &[u8] = b"aux: bad\n";
+    #[cfg(target_arch = "x86_64")]
+    const AT_NULL:    u64 = 0;
+    #[cfg(target_arch = "x86_64")]
+    const AT_PAGESZ:  u64 = 6;
     // SAFETY: we're the user program, the kernel has set up the
     // int-0x80 gate, and the message lives in our RX segment.
     unsafe {
@@ -198,6 +206,26 @@ fn start_rust(rsp_at_entry: u64) -> ! {
                 let (ap, al) = if argv_ok { (AOK.as_ptr(), AOK.len()) }
                                 else       { (ABAD.as_ptr(), ABAD.len()) };
                 syscall3(SYS_WRITE, 1, ap as u64, al as u64);
+
+                // Walk past argv (argc+1 entries) + envp (until NULL)
+                // to find the aux-vector. Verify AT_PAGESZ=4096 lives
+                // there.
+                let mut cursor = rsp_at_entry + 8 + (argc + 1) * 8;
+                while core::ptr::read_volatile(cursor as *const u64) != 0 {
+                    cursor += 8;
+                }
+                cursor += 8;  // step past envp NULL terminator
+                let mut aux_ok = false;
+                loop {
+                    let key = core::ptr::read_volatile(cursor as *const u64);
+                    let val = core::ptr::read_volatile((cursor + 8) as *const u64);
+                    if key == AT_NULL { break; }
+                    if key == AT_PAGESZ && val == 4096 { aux_ok = true; }
+                    cursor += 16;
+                }
+                let (xp, xl) = if aux_ok { (AUX_OK.as_ptr(), AUX_OK.len()) }
+                                else      { (AUX_BAD.as_ptr(), AUX_BAD.len()) };
+                syscall3(SYS_WRITE, 1, xp as u64, xl as u64);
             }
 
             let addr = syscall3(SYS_MMAP, 0, 0x1000, 0);
