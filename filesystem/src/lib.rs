@@ -403,6 +403,42 @@ impl VfsRegistry {
         q.iter().find(|m| m.path == path).map(|m| f(&*m.fs))
     }
 
+    /// Resolve a POSIX-shaped absolute path by finding the
+    /// longest mount-prefix match and running `f` against the
+    /// matching FS with the remaining suffix (leading `/`
+    /// stripped). Returns `None` when no mount covers the path.
+    ///
+    /// Examples (with `/test` and `/test/sub` both mounted):
+    ///   `/test/foo`     → `/test`     + `foo`
+    ///   `/test/sub/bar` → `/test/sub` + `bar`
+    ///   `/elsewhere`    → None
+    pub fn resolve_absolute<R, F>(&self, abs: &str, f: F) -> Option<R>
+    where F: FnOnce(&dyn FsInstance, &str) -> R {
+        if abs.is_empty() || abs.as_bytes()[0] != b'/' {
+            return None;
+        }
+        let q = self.inner.lock();
+        // Find the longest matching mount path.
+        let mut best: Option<&Mount> = None;
+        for m in q.iter() {
+            if abs == m.path
+                || (abs.starts_with(m.path)
+                    && abs.as_bytes().get(m.path.len()) == Some(&b'/'))
+            {
+                if best.map(|b| b.path.len()).unwrap_or(0) < m.path.len() {
+                    best = Some(m);
+                }
+            }
+        }
+        let m = best?;
+        let rel = &abs[m.path.len()..];
+        // Strip the leading slash; if the absolute path equals the
+        // mount path exactly, the relative is empty (caller's
+        // problem — `resolve` rejects empty paths).
+        let rel = rel.strip_prefix('/').unwrap_or(rel);
+        Some(f(&*m.fs, rel))
+    }
+
     /// Number of mounts.
     pub fn len(&self) -> usize { self.inner.lock().len() }
 

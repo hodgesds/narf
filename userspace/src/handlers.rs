@@ -150,25 +150,38 @@ fn sys_open(ctx: &mut dyn TrapContext) {
     let path_len = args.arg1 as usize;
     let mnt_ptr  = args.arg2 as *const u8;
     let mnt_len  = args.arg3 as usize;
-    if path_ptr.is_null() || path_len == 0 || mnt_ptr.is_null() || mnt_len == 0 {
+    if path_ptr.is_null() || path_len == 0 {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
     // SAFETY: user pointers in active AS, length-bounded.
     let path_bytes = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
-    let mnt_bytes  = unsafe { core::slice::from_raw_parts(mnt_ptr, mnt_len) };
     let path = match core::str::from_utf8(path_bytes) {
         Ok(s) => s,
         Err(_) => { ctx.set_return(SyscallReturn::invalid_op()); return; }
     };
-    let mount = match core::str::from_utf8(mnt_bytes) {
-        Ok(s) => s,
-        Err(_) => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+
+    // Two shapes:
+    // - Absolute: arg2/arg3 = (0, 0). The path itself is `/foo/bar`;
+    //   the registry finds the longest-matching mount.
+    // - Explicit-mount: arg2/arg3 = (ptr, len). The path is relative.
+    //   Useful when the caller already knows the mount.
+    let ops = if mnt_len == 0 {
+        narf_filesystem::registry().resolve_absolute(path, |fs, rel| {
+            narf_filesystem::resolve(fs.root(), rel).ok()
+        }).flatten()
+    } else {
+        let mnt_bytes = unsafe { core::slice::from_raw_parts(mnt_ptr, mnt_len) };
+        let mount = match core::str::from_utf8(mnt_bytes) {
+            Ok(s) => s,
+            Err(_) => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        };
+        narf_filesystem::registry().with_mount(mount, |fs| {
+            narf_filesystem::resolve(fs.root(), path).ok()
+        }).flatten()
     };
 
-    let ops = match narf_filesystem::registry().with_mount(mount, |fs| {
-        narf_filesystem::resolve(fs.root(), path).ok()
-    }).flatten() {
+    let ops = match ops {
         Some(o) => o,
         None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
     };

@@ -5363,6 +5363,92 @@ fn smoke_memory_address_space_region_table() -> TestResult {
 }
 kernel_test!(smoke_memory_address_space_region_table);
 
+fn smoke_filesystem_resolve_absolute_picks_longest_prefix() -> TestResult {
+    // Mount two FSes — one at `/test_pa` and one nested under
+    // `/test_pa/sub`. `resolve_absolute("/test_pa/sub/x")` must
+    // match the nested mount and hand the FS a relative path of
+    // `x`, NOT `sub/x` against the outer FS.
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+    use narf_capabilities::{Cap, Grant};
+    use narf_filesystem::{
+        bootstrap_mount_authority, registry, DirEntry, DirOps, FileOps,
+        FsFuture, FsInstance, MountPoint, Stat,
+    };
+
+    struct OuterFs;
+    struct InnerFs;
+    struct DummyDir;
+    struct DummyFile;
+    impl FileOps for DummyFile {
+        fn read<'a>(&'a self, _o: u64, _b: &'a mut [u8]) -> FsFuture<'a, usize> {
+            alloc::boxed::Box::pin(async { Ok(0) })
+        }
+        fn write<'a>(&'a self, _o: u64, _b: &'a [u8]) -> FsFuture<'a, usize> {
+            alloc::boxed::Box::pin(async { Ok(0) })
+        }
+        fn stat(&self) -> Stat {
+            Stat { size: 0, blocks: 0,
+                   mode: narf_filesystem::Mode::FILE_RO,
+                   mtime_cycles: 0 }
+        }
+    }
+    impl DirOps for DummyDir {
+        fn lookup(&self, _name: &str) -> Option<Arc<dyn FileOps>> {
+            Some(Arc::new(DummyFile))
+        }
+        fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
+            Box::new(core::iter::empty())
+        }
+    }
+    impl FsInstance for OuterFs {
+        fn root(&self) -> Arc<dyn DirOps> { Arc::new(DummyDir) }
+        fn name(&self) -> &str { "outer" }
+    }
+    impl FsInstance for InnerFs {
+        fn root(&self) -> Arc<dyn DirOps> { Arc::new(DummyDir) }
+        fn name(&self) -> &str { "inner" }
+    }
+
+    let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+    if registry().mount(&auth, "/test_pa",     OuterFs).is_err() {
+        return TestResult::Fail("outer mount failed");
+    }
+    if registry().mount(&auth, "/test_pa/sub", InnerFs).is_err() {
+        return TestResult::Fail("inner mount failed");
+    }
+
+    // Path under outer mount.
+    let outer = registry().resolve_absolute("/test_pa/x", |fs, rel| {
+        (fs.name() == "outer", alloc::string::String::from(rel))
+    });
+    match outer {
+        Some((true, ref s)) if s == "x" => {}
+        _ => return TestResult::Fail("outer mount + relative path mismatch"),
+    }
+
+    // Path under inner mount — longest-prefix wins over outer.
+    let inner = registry().resolve_absolute("/test_pa/sub/y", |fs, rel| {
+        (fs.name() == "inner", alloc::string::String::from(rel))
+    });
+    match inner {
+        Some((true, ref s)) if s == "y" => {}
+        _ => return TestResult::Fail("inner mount didn't win on longer prefix"),
+    }
+
+    // Unmounted prefix → None.
+    if registry().resolve_absolute("/elsewhere/z", |_, _| ()).is_some() {
+        return TestResult::Fail("non-existent prefix should not resolve");
+    }
+    // Empty path → None.
+    if registry().resolve_absolute("", |_, _| ()).is_some() {
+        return TestResult::Fail("empty path should not resolve");
+    }
+
+    TestResult::Pass
+}
+kernel_test!(smoke_filesystem_resolve_absolute_picks_longest_prefix);
+
 fn smoke_userspace_open_routes_through_vfs() -> TestResult {
     use alloc::boxed::Box;
     use alloc::sync::Arc;
