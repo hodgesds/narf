@@ -48,30 +48,29 @@ extern "C" fn cleanup() {
 /// the allocator's contract guarantees the returned regions are at
 /// least the requested length.
 unsafe fn heap_probe() -> bool {
-    // Track which sub-step fails so the smoke output points at the
-    // bug rather than just saying "heap: bad". Removed once stable.
-    use narf_libc::Arg;
+    narf_libc::printf_str("hdbg: 1\n", &[]);
     // (1) Single round-trip: write, read, free.
-    // SAFETY: 64 bytes is well within any sane chunk size; the
-    // returned pointer is writable for that span.
     let p1 = unsafe { narf_libc::malloc(64) };
     if p1.is_null() {
+        narf_libc::printf_str("hdbg: 1-null\n", &[]);
         return false;
     }
     unsafe {
         *p1 = 0xAA;
         *p1.add(63) = 0x55;
         if *p1 != 0xAA || *p1.add(63) != 0x55 {
+            narf_libc::printf_str("hdbg: 1-readback\n", &[]);
             return false;
         }
         narf_libc::free(p1);
     }
+    narf_libc::printf_str("hdbg: 2\n", &[]);
 
     // (2) Two live allocations carry distinct sentinels.
-    // SAFETY: same reasoning as (1) for each pointer.
     let a = unsafe { narf_libc::malloc(128) };
     let b = unsafe { narf_libc::malloc(128) };
     if a.is_null() || b.is_null() {
+        narf_libc::printf_str("hdbg: 2-null\n", &[]);
         return false;
     }
     unsafe {
@@ -79,12 +78,14 @@ unsafe fn heap_probe() -> bool {
         for i in 0..128 { *b.add(i) = 0x22; }
         for i in 0..128 {
             if *a.add(i) != 0x11 || *b.add(i) != 0x22 {
+                narf_libc::printf_str("hdbg: 2-rb\n", &[]);
                 return false;
             }
         }
         narf_libc::free(a);
         narf_libc::free(b);
     }
+    narf_libc::printf_str("hdbg: 3\n", &[]);
 
     // (3) Free-list reuse: free a chunk, immediately re-malloc the
     // same size, expect the same pointer back. With a LIFO push and
@@ -101,6 +102,7 @@ unsafe fn heap_probe() -> bool {
         return false;
     }
     unsafe { narf_libc::free(r2); }
+    narf_libc::printf_str("hdbg: 4\n", &[]);
 
     // (4) realloc grow: write a sentinel into a small alloc, grow
     // to 4096, verify the old prefix survived. The new tail is
