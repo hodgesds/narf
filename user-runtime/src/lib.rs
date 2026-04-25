@@ -54,6 +54,13 @@ pub const SYS_GETGID:         u64 = 143;
 pub const SYS_BRK:            u64 = 150;
 pub const SYS_CLOCK_GETTIME:  u64 = 151;
 pub const SYS_SIGACTION:      u64 = 152;
+pub const SYS_KILL:           u64 = 153;
+pub const SYS_SIGPROCMASK:    u64 = 154;
+
+/// `sigprocmask` how-flags — match POSIX.
+pub const SIG_BLOCK:   u32 = 0;
+pub const SIG_UNBLOCK: u32 = 1;
+pub const SIG_SETMASK: u32 = 2;
 
 /// "NARF" little-endian — first u32 of the bootstrap config page.
 pub const NARF_MAGIC: u32 = 0x4E_41_52_46;
@@ -410,8 +417,9 @@ pub fn clock_gettime(clock_id: u32) -> (i64, i64) {
 ///
 /// # Safety
 /// `handler` must be a valid code-page entry-point address (or 0
-/// to clear). Stage-4 records but never delivers — this is mostly
-/// useful for the testbin sigaction probe today.
+/// to clear). Subsequent calls to [`kill`] against this task will
+/// rewrite the trap-return frame to land at `handler`; the
+/// handler must therefore be a valid `extern "C" fn(u32)`.
 #[inline]
 pub unsafe fn sigaction(signum: u32, handler: usize) -> usize {
     let mut old: u64 = 0;
@@ -427,6 +435,28 @@ pub unsafe fn sigaction(signum: u32, handler: usize) -> usize {
         );
     }
     old as usize
+}
+
+/// Mark `signum` pending on `target_pid`. The signal is delivered
+/// the next time the target task returns to user mode through the
+/// trap gate (which for a self-targeted kill happens on the very
+/// next syscall trap-return). Returns `Ok(())` on success, `Err(())`
+/// when the kernel rejects the request (e.g. signum out of range).
+#[inline]
+pub fn kill(target_pid: u64, signum: u32) -> Result<(), ()> {
+    // SAFETY: SYS_KILL signature: (target_pid, signum).
+    let r = unsafe { syscall2(SYS_KILL, target_pid, signum as u64) };
+    if r == 0 { Ok(()) } else { Err(()) }
+}
+
+/// Update the calling task's signal-block mask and return the
+/// previous mask. `how` is one of [`SIG_BLOCK`], [`SIG_UNBLOCK`],
+/// [`SIG_SETMASK`].
+#[inline]
+pub fn sigprocmask(how: u32, set: u32) -> u32 {
+    // SAFETY: SYS_SIGPROCMASK signature: (how, set). The kernel
+    // returns the previous mask in the rax payload.
+    unsafe { syscall2(SYS_SIGPROCMASK, how as u64, set as u64) as u32 }
 }
 
 // ── Bootstrap / rings ──────────────────────────────────────────────

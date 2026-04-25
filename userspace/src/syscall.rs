@@ -68,6 +68,27 @@ pub trait TrapContext {
     /// `out` must point at a writable region of at least
     /// `UserState`-sized bytes for the calling arch.
     unsafe fn save_user_state(&self, _out: *mut u8) -> bool { false }
+
+    /// Rewrite the trap frame to deliver `handler_vaddr` with
+    /// `signum` to user mode. Pushes a synthetic `[saved_rip,
+    /// signum]` pair onto the user's RSP so the handler can
+    /// `ret` back into the trapped code, sets the first SysV
+    /// integer-arg register to `signum`, and points the trap
+    /// frame's instruction pointer at `handler_vaddr`.
+    ///
+    /// Default: returns `false` — arches without a delivery
+    /// implementation skip the rewrite, leaving the frame
+    /// untouched. x86_64 overrides.
+    fn deliver_signal(&mut self, _handler_vaddr: u64, _signum: u32) -> bool { false }
+
+    /// Whether the trap is about to return to user mode. The
+    /// signal-delivery hook only fires on user-bound returns;
+    /// kernel-bound returns (e.g. from a `redirect_to_kernel`
+    /// raw handler) skip delivery so we don't synthesize a
+    /// signal frame onto a kernel stack. Default: `false`
+    /// (treat as kernel-bound) so non-x86_64 arches without a
+    /// CPL/EL accessor behave conservatively.
+    fn returning_to_user(&self) -> bool { false }
 }
 
 // ── Numbers ─────────────────────────────────────────────────────────
@@ -153,9 +174,26 @@ pub enum Syscall {
 
     /// Install a signal-handler stub. `arg0 = signum`,
     /// `arg1 = handler-vaddr` (0 to clear), `arg2 = old-out-ptr`
-    /// (may be null). Stage-4 records but never delivers — signal
-    /// delivery lands in a future round. Returns 0.
+    /// (may be null). The recorded handler is fired on the
+    /// trap-return path of any subsequent int-0x80 from this
+    /// task that observes a pending signal; see `Kill` /
+    /// `Sigprocmask`. Returns 0.
     Sigaction    = 152,
+
+    /// Mark `signum` pending on the task identified by
+    /// `arg0 = target_pid`. `arg1 = signum`. Returns 0; the
+    /// signal is delivered the next time the target task
+    /// returns to user mode through the int-0x80 / svc-0 trap
+    /// gate (see `handlers::deliver_pending_signals`). Stage-4
+    /// stub: any task can signal any other; cap-gating lands
+    /// later.
+    Kill         = 153,
+
+    /// Update the calling task's signal-block mask.
+    /// `arg0 = how` (0 = BLOCK, 1 = UNBLOCK, 2 = SETMASK),
+    /// `arg1 = set` (32-bit bitmap). Returns the **previous**
+    /// mask in the syscall return value.
+    Sigprocmask  = 154,
 }
 
 impl Syscall {
@@ -186,6 +224,8 @@ impl Syscall {
             150 => Syscall::Brk,
             151 => Syscall::ClockGetTime,
             152 => Syscall::Sigaction,
+            153 => Syscall::Kill,
+            154 => Syscall::Sigprocmask,
             _   => return None,
         })
     }

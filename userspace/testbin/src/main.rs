@@ -18,6 +18,28 @@
 use core::panic::PanicInfo;
 use narf_user_runtime as rt;
 
+// The signal handler stores the received signum at a fixed user
+// vaddr that the brk probe previously grew into the AS. We can't
+// use a `static AtomicU32` because the testbin's linker script
+// collapses .data/.bss into the R+X PT_LOAD (Stage-4 loader
+// limitation) — every static is read-only. The brk-grown heap
+// page at `BRK_DEFAULT_BASE = 0x0000_5000_0000_0000` is R+W and
+// known-stable across the whole task.
+const SIG_RECV_VADDR: u64 = 0x0000_5000_0000_0000;
+
+// SysV-AMD64 signal handler: signum lives in rdi (first integer
+// arg). Must `ret` cleanly — the kernel synthesised a `[saved_rip,
+// signum]` pair on the user stack so the handler's epilogue pops
+// `saved_rip` and resumes the trapped instruction. Volatile
+// store-through-pointer only — anything reentrant-unsafe in here
+// would corrupt the trapped-context resumption.
+extern "C" fn signal_handler(signum: u32) {
+    // SAFETY: the brk probe earlier in `start_rust` grew the heap
+    // by one page so [BRK_DEFAULT_BASE, +0x1000) is R+W in the
+    // active AS for the lifetime of this task.
+    unsafe { core::ptr::write_volatile(SIG_RECV_VADDR as *mut u32, signum); }
+}
+
 // Naked entry point. SysV-AMD64 startup contract: at entry, [rsp]
 // = argc, [rsp+8..] = argv pointers, etc. We grab the original
 // rsp before any prologue runs, hand it to `start_rust` as the
@@ -238,6 +260,31 @@ fn run_probes_x86_64(rsp_at_entry: u64) {
     let prior = unsafe { rt::sigaction(15, 0) };
     let sig_ok = prior == 0xDEADBEEF;
     rt::print_str(if sig_ok { "sig: ok\n" } else { "sig: bad\n" });
+
+    // ── signal-delivery probe ─────────────────────────────────
+    // Install `signal_handler` for SIGUSR1 (10), kill ourselves,
+    // then yield a few times — the kernel pops the pending bit
+    // and rewrites the trap frame on the very next int-0x80
+    // trap-return so by the time `yield_now()` actually returns
+    // here, the handler has already run and stored the signum
+    // into SIG_RECV.
+    // SAFETY: brk-grown heap page is R+W in the active AS.
+    unsafe { core::ptr::write_volatile(SIG_RECV_VADDR as *mut u32, 0); }
+    // SAFETY: signal_handler is a valid SysV-AMD64 entry point;
+    // the kernel records the address against the calling task's
+    // sigaction table.
+    unsafe {
+        rt::sigaction(10, signal_handler as usize);
+    }
+    let _ = rt::kill(rt::getpid(), 10);
+    for _ in 0..4 {
+        rt::yield_now();
+        // SAFETY: same page as above.
+        if unsafe { core::ptr::read_volatile(SIG_RECV_VADDR as *const u32) } != 0 { break; }
+    }
+    // SAFETY: same page as above.
+    let signal_ok = unsafe { core::ptr::read_volatile(SIG_RECV_VADDR as *const u32) } == 10;
+    rt::print_str(if signal_ok { "signal: ok\n" } else { "signal: bad\n" });
 }
 
 #[panic_handler]

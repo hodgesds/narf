@@ -102,6 +102,16 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         let num = frame.rax as u32;
         let mut ctx = X86TrapContext::from_int80(frame);
         narf_userspace::kernel_syscall_entry(num, &mut ctx);
+        // Signal-delivery hook: if a `narf_userspace`-side hook
+        // is installed and we're heading back to user (CS RPL=3,
+        // i.e. the syscall handler didn't redirect to kernel),
+        // give it a chance to rewrite the frame to land at a
+        // pending signal handler. The hook self-checks
+        // `returning_to_user` so a redirect-to-kernel handler
+        // (exit, longjmp) bypasses delivery cleanly.
+        if let Some(hook) = narf_userspace::signal_delivery_hook() {
+            hook(&mut ctx);
+        }
         return;
     }
 
@@ -215,6 +225,51 @@ impl<'a> TrapContext for X86TrapContext<'a> {
         s.rcx = f.rcx; s.rbx = f.rbx; s.rax = f.rax;
         s.rip = f.rip; s.rflags = f.rflags; s.rsp = f.rsp;
         s.valid = 1;
+        true
+    }
+
+    fn returning_to_user(&self) -> bool {
+        // CS RPL = bits[1:0]. RPL=3 ⇒ user mode. A
+        // `redirect_to_kernel`'d frame has CS=KCODE_SEL (RPL=0)
+        // so this returns false and the hook short-circuits.
+        (self.frame.cs & 3) == 3
+    }
+
+    fn deliver_signal(&mut self, handler_vaddr: u64, signum: u32) -> bool {
+        // Synthetic frame on the user stack: push saved_rip and
+        // signum so the handler is reached by an `iretq` to
+        // `handler_vaddr` with a fresh `rsp` two words below the
+        // trapping rsp. The handler is `extern "C" fn(u32)` —
+        // SysV first integer arg lives in rdi (= signum), and
+        // the handler's `ret` epilogue pops `[saved_rip]` (the
+        // first word at the new rsp) so execution resumes at
+        // exactly the trapping instruction.
+        //
+        // Layout after the push (low → high):
+        //   [new_rsp + 0]  = saved_rip   (handler's `ret` pops)
+        //   [new_rsp + 8]  = signum (zero-extended to u64) — kept
+        //                    as a record for debug, never read
+        //                    by the handler
+        //
+        // CR3 is still the user's at this point (the trap path
+        // doesn't switch CR3 for int-0x80), so direct writes to
+        // the user vaddr resolve through the live page tables.
+        let new_rsp = self.frame.rsp.wrapping_sub(16);
+        // SAFETY: `new_rsp` lives in the calling task's user AS
+        // (the very stack the trapping instruction was using); we
+        // store two qwords at the freshly-allocated 16-byte slot.
+        // A bad user RSP faults the user into its own #PF, not
+        // ours. The pointer is u64-aligned because user code
+        // observes 16-byte stack alignment at every call site;
+        // even if it's only 8-byte aligned, x86_64 supports
+        // unaligned u64 stores.
+        unsafe {
+            core::ptr::write_volatile(new_rsp as *mut u64, self.frame.rip);
+            core::ptr::write_volatile((new_rsp + 8) as *mut u64, signum as u64);
+        }
+        self.frame.rsp = new_rsp;
+        self.frame.rdi = signum as u64;
+        self.frame.rip = handler_vaddr;
         true
     }
 }

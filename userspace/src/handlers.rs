@@ -977,14 +977,175 @@ fn sys_clock_gettime(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(0));
 }
 
+// ── Signal delivery: pending + mask + delivery hook ────────────────
+//
+// Stage-4 round 2: kill / sigprocmask + a hook on the trap-return
+// path that, for any int-0x80 from user mode, picks the lowest
+// pending unmasked signal, looks up its handler in the SIGACTION
+// table, and rewrites the trap frame so iretq lands at the user
+// handler with `[saved_rip, signum]` synthesised on the user
+// stack. The handler signature is `extern "C" fn(u32)` — `signum`
+// is in `rdi` (SysV first integer arg), and a `ret` pops the
+// saved_rip we pushed and resumes the trapped code.
+//
+// Storage shape mirrors SIGACTION_TABLE: BTreeMap<task_id, u32
+// bitmask>. Two tables: pending signals (set by `kill`) and the
+// per-task block mask (modified by `sigprocmask`). NSIG = 32 so
+// `1 << signum` is a u32-clean fit.
+
+static SIGNAL_PENDING:
+    narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>>
+    = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+static SIGNAL_MASK:
+    narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>>
+    = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Initialise the per-task pending+mask registries. Pair with
+/// `sigaction_init` at boot.
+pub fn signal_init() {
+    *SIGNAL_PENDING.lock() = Some(BTreeMap::new());
+    *SIGNAL_MASK.lock()    = Some(BTreeMap::new());
+}
+
+/// Reset the registries — test hook. Drops every per-task entry.
+#[doc(hidden)]
+pub fn __test_signal_reset() {
+    *SIGNAL_PENDING.lock() = None;
+    *SIGNAL_MASK.lock()    = None;
+}
+
+/// Diagnostic: peek the pending bitmap for `task`.
+pub fn signal_pending_of(task: u64) -> u32 {
+    SIGNAL_PENDING.lock().as_ref()
+        .and_then(|m| m.get(&task).copied())
+        .unwrap_or(0)
+}
+
+/// Diagnostic: peek the block mask for `task`.
+pub fn signal_mask_of(task: u64) -> u32 {
+    SIGNAL_MASK.lock().as_ref()
+        .and_then(|m| m.get(&task).copied())
+        .unwrap_or(0)
+}
+
+fn sys_kill(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let target = args.arg0;
+    let signum = args.arg1 as u32;
+    if signum >= 32 {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    let mut g = SIGNAL_PENDING.lock();
+    let map = match g.as_mut() {
+        Some(m) => m,
+        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+    };
+    let slot = map.entry(target).or_insert(0);
+    *slot |= 1u32 << signum;
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+const SIG_BLOCK:   u32 = 0;
+const SIG_UNBLOCK: u32 = 1;
+const SIG_SETMASK: u32 = 2;
+
+fn sys_sigprocmask(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let how  = args.arg0 as u32;
+    let set  = args.arg1 as u32;
+    let task = current_task_id();
+    let mut g = SIGNAL_MASK.lock();
+    let map = match g.as_mut() {
+        Some(m) => m,
+        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+    };
+    let slot = map.entry(task).or_insert(0);
+    let prior = *slot;
+    *slot = match how {
+        SIG_BLOCK   => prior | set,
+        SIG_UNBLOCK => prior & !set,
+        SIG_SETMASK => set,
+        _           => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+    ctx.set_return(SyscallReturn::ok(prior as u64));
+}
+
+// Function-pointer hook: arch trap dispatcher invokes this on
+// every int-0x80 trap-return that's heading back to user mode,
+// just before the asm tail iretq's. Same shape as
+// `install_address_space_lookup` so the trap path doesn't need
+// a direct dep on this crate's signal internals.
+type SignalDeliveryHook = fn(&mut dyn TrapContext);
+
+static SIGNAL_DELIVERY_HOOK:
+    narf_lib::sync::IrqSafeSpinLock<Option<SignalDeliveryHook>>
+    = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Install the function the arch trap path calls on every
+/// user-bound int-0x80 trap-return. `install_core_syscalls`
+/// auto-installs `default_signal_delivery`.
+pub fn install_signal_delivery_hook(hook: SignalDeliveryHook) {
+    *SIGNAL_DELIVERY_HOOK.lock() = Some(hook);
+}
+
+/// Look up the currently-installed delivery hook, if any. The
+/// arch trap dispatcher calls this on its way back to user.
+pub fn signal_delivery_hook() -> Option<SignalDeliveryHook> {
+    *SIGNAL_DELIVERY_HOOK.lock()
+}
+
+/// Default delivery hook: pick the lowest pending unmasked
+/// signal, look up its handler, ask the trap context to rewrite
+/// itself to deliver. Fast path — when nothing's pending it
+/// takes a single lock + a single bitmap read and returns.
+pub fn default_signal_delivery(ctx: &mut dyn TrapContext) {
+    if !ctx.returning_to_user() { return; }
+    let task = current_task_id();
+    // Single lock acquire on the fast path: peek pending+mask
+    // under one lock each, decide whether there's anything to
+    // do, then re-lock briefly to clear the chosen bit. The
+    // common case (nothing pending) falls out after the first
+    // peek with no work.
+    let pending = {
+        let g = SIGNAL_PENDING.lock();
+        match g.as_ref().and_then(|m| m.get(&task).copied()) {
+            Some(p) if p != 0 => p,
+            _ => return,
+        }
+    };
+    let mask = SIGNAL_MASK.lock().as_ref()
+        .and_then(|m| m.get(&task).copied()).unwrap_or(0);
+    let deliverable = pending & !mask;
+    if deliverable == 0 { return; }
+    let signum = deliverable.trailing_zeros();
+    let handler = match sigaction_lookup(task, signum as usize) {
+        Some(h) => h,
+        None    => return,
+    };
+    if !ctx.deliver_signal(handler, signum) { return; }
+    // Clear only after the rewrite succeeded — a failed
+    // delivery (e.g. arch returns false) should leave pending
+    // alone so the next trap retries.
+    if let Some(map) = SIGNAL_PENDING.lock().as_mut() {
+        if let Some(slot) = map.get_mut(&task) {
+            *slot &= !(1u32 << signum);
+        }
+    }
+}
+
 // ── Sigaction — record a per-task handler vaddr ────────────────────
 //
-// Stage-4 records and never delivers. The signal-delivery path
-// requires (a) a way to inject a synthetic frame on top of the
-// user's saved state and (b) interrupt sources that map to signums;
-// both land in a later round. Until then we keep the table so
-// relibc's setup-time `sigaction()` calls don't fail and the
-// recorded handlers can be inspected by tests.
+// Stage-4 round 2: the recorded handler is fired on the trap
+// return path of any subsequent int-0x80 from the same task that
+// observes a pending signal not blocked by SIGNAL_MASK. See
+// `default_signal_delivery` above. Cross-task delivery happens
+// when another task calls `Kill` to set a bit in this task's
+// pending bitmap.
 
 const NSIG: usize = 32;
 
@@ -1128,4 +1289,11 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Brk,          "brk",           RawFnHandler(sys_brk));
     table.install_raw(Syscall::ClockGetTime, "clock_gettime", RawFnHandler(sys_clock_gettime));
     table.install_raw(Syscall::Sigaction,    "sigaction",     RawFnHandler(sys_sigaction));
+    table.install_raw(Syscall::Kill,         "kill",          RawFnHandler(sys_kill));
+    table.install_raw(Syscall::Sigprocmask,  "sigprocmask",   RawFnHandler(sys_sigprocmask));
+
+    // Auto-wire the delivery hook so any kernel that uses
+    // `install_core_syscalls` automatically gets signal delivery
+    // on the trap-return path. Idempotent.
+    install_signal_delivery_hook(default_signal_delivery);
 }

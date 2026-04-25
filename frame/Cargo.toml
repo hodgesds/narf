@@ -30,8 +30,14 @@ idt-selftest = []
 # Run the narf-verification kernel-test harness instead of the async demo.
 # Used by `cargo xtask test` — exits 0 if all tests pass, non-zero otherwise.
 kernel-test  = ["dep:narf-verification"]
-# Chain into verification's opt-in end-to-end user-mode test.
+# Chain into verification's opt-in user-mode smoke tests (round-trip,
+# yield_resume, poll_yield_exit, future yield_exit). These pass the
+# kernel through to subsequent tests without exiting.
 user-mode-e2e = ["kernel-test", "narf-verification/user-mode-e2e"]
+# Chain into verification's full testbin runner (implies user-mode-e2e).
+# Enables the `narf-testbin` ELF build and the runner test, which calls
+# `exit_kernel(0)` on success and therefore must run last.
+user-mode-testbin = ["user-mode-e2e", "narf-verification/user-mode-testbin"]
 
 [lints]
 workspace = true

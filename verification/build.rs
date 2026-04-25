@@ -1,11 +1,11 @@
 //! Build narf-testbin (the Rust user binary) and expose its ELF
 //! bytes to the kernel_test harness via a compile-time env var.
 //!
-//! Gated by the `user-mode-e2e` cargo feature so default builds
-//! don't pay the cost. When the feature is off, we still set
-//! `NARF_TESTBIN_ELF` to an empty-string placeholder so
-//! `env!()` resolves cleanly; the gated test body checks the
-//! byte-length and skips if empty.
+//! Gated by the `user-mode-testbin` cargo feature so default builds
+//! (and `user-mode-e2e` smoke-only builds) don't pay the cost. When
+//! the feature is off, we still set `NARF_TESTBIN_ELF_*` to an
+//! empty-string placeholder so `env!()` resolves cleanly; the gated
+//! test body checks the byte-length and skips if empty.
 //!
 //! Why this lives here and not in `userspace/testbin/build.rs`:
 //! the verification crate is the one that embeds the bytes via
@@ -22,7 +22,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../userspace/testbin/testbin.ld");
     println!("cargo:rerun-if-changed=../userspace/testbin/Cargo.toml");
 
-    let enabled = env::var_os("CARGO_FEATURE_USER_MODE_E2E").is_some();
+    let enabled = env::var_os("CARGO_FEATURE_USER_MODE_TESTBIN").is_some();
     if !enabled {
         // Feature off — placeholders so both `env!()`-based
         // `include_bytes!` sites compile cleanly.
