@@ -23,7 +23,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::{ExecImage, ExecKind, Segment, SegmentFlags};
+use crate::{DynEntry, ExecImage, ExecKind, Segment, SegmentFlags};
 
 // ── Wire constants (ELF spec) ───────────────────────────────────────
 
@@ -40,8 +40,9 @@ const ELFDATA2LSB: u8 = 1;
 const ET_EXEC: u16 = 2;
 const ET_DYN:  u16 = 3;
 
-const PT_LOAD:   u32 = 1;
-const PT_INTERP: u32 = 3;
+const PT_LOAD:    u32 = 1;
+const PT_DYNAMIC: u32 = 2;
+const PT_INTERP:  u32 = 3;
 
 const PF_X: u32 = 1 << 0;
 const PF_W: u32 = 1 << 1;
@@ -59,6 +60,10 @@ pub enum ElfError {
     BadType,
     BadPhoff,
     InterpOutOfBounds,
+    /// PT_DYNAMIC's file region (p_offset .. p_offset+p_filesz) lies
+    /// outside the input bytes or has a length that isn't a multiple
+    /// of `sizeof(Elf64_Dyn) == 16`.
+    DynamicOutOfBounds,
 }
 
 // ── Parser ──────────────────────────────────────────────────────────
@@ -108,6 +113,7 @@ pub fn parse(bytes: &[u8]) -> Result<ExecImage, ElfError> {
 
     let mut segments = Vec::new();
     let mut interp: Option<String> = None;
+    let mut dynamic: Vec<DynEntry> = Vec::new();
 
     for i in 0..phnum {
         let off = phoff + i * entsize;
@@ -132,6 +138,30 @@ pub fn parse(bytes: &[u8]) -> Result<ExecImage, ElfError> {
                     flags,
                 });
             }
+            PT_DYNAMIC => {
+                // Walk the array of `Elf64_Dyn { d_tag: i64, d_val: u64 }`
+                // entries (16 bytes each). The terminator is DT_NULL (0).
+                // We capture every tag here verbatim so the loader
+                // (which knows which DT_* it cares about) can match
+                // against a flat list rather than re-parsing.
+                let start = p_offset as usize;
+                let end = start.checked_add(p_filesz as usize)
+                    .ok_or(ElfError::DynamicOutOfBounds)?;
+                if end > bytes.len() {
+                    return Err(ElfError::DynamicOutOfBounds);
+                }
+                if (end - start) % 16 != 0 {
+                    return Err(ElfError::DynamicOutOfBounds);
+                }
+                let mut cur = start;
+                while cur + 16 <= end {
+                    let tag = read_i64(bytes, cur);
+                    let val = read_u64(bytes, cur + 8);
+                    cur += 16;
+                    if tag == 0 { break; } // DT_NULL terminator.
+                    dynamic.push(DynEntry { tag, val });
+                }
+            }
             PT_INTERP => {
                 let start = p_offset as usize;
                 let end   = start.checked_add(p_filesz as usize)
@@ -154,6 +184,7 @@ pub fn parse(bytes: &[u8]) -> Result<ExecImage, ElfError> {
         entry: e_entry,
         interp,
         segments,
+        dynamic,
         argv: Vec::new(),
         envp: Vec::new(),
         aux:  Vec::new(),
@@ -177,6 +208,14 @@ fn read_u32(bytes: &[u8], off: usize) -> u32 {
 #[inline]
 fn read_u64(bytes: &[u8], off: usize) -> u64 {
     u64::from_le_bytes([
+        bytes[off    ], bytes[off + 1], bytes[off + 2], bytes[off + 3],
+        bytes[off + 4], bytes[off + 5], bytes[off + 6], bytes[off + 7],
+    ])
+}
+
+#[inline]
+fn read_i64(bytes: &[u8], off: usize) -> i64 {
+    i64::from_le_bytes([
         bytes[off    ], bytes[off + 1], bytes[off + 2], bytes[off + 3],
         bytes[off + 4], bytes[off + 5], bytes[off + 6], bytes[off + 7],
     ])

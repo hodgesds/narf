@@ -20,8 +20,9 @@ use alloc::sync::Arc;
 use narf_memory::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
 use crate::{
-    alloc_pid, interp, load_elf_bytes, loader::load_elf_into_at,
-    loader::LoadBytesError, AuxEntry, EntryPoint, ProcessId,
+    alloc_pid, interp, load_elf_bytes, loader::apply_relocations,
+    loader::load_elf_into_at, loader::LoadBytesError, AuxEntry,
+    EntryPoint, ProcessId,
 };
 
 /// Default user stack size: 16 KiB. Small enough to fit on boot
@@ -106,6 +107,17 @@ pub unsafe fn load_user_process_with(
     let image = crate::parse_elf(bytes).map_err(|e| LoadBytesError::Elf(e))?;
     let mut entry = program_entry;
     let mut interp_loaded = false;
+
+    // Program-side relocations. PT_DYNAMIC may name R_X86_64_RELATIVE
+    // entries that need patching before the interpreter (or the
+    // program itself) starts; the program loads at vaddr 0 by
+    // convention so the bias passed in is 0. Materialize already
+    // happened inside `load_elf_bytes`, so the patch sites are
+    // walkable through `paging::translate`.
+    if !image.dynamic.is_empty() {
+        unsafe { apply_relocations(bytes, &image, &address_space, 0) }?;
+    }
+
     if let Some(name) = image.interp.as_deref() {
         if let Some(interp_bytes) = interp::lookup_interpreter(name) {
             let interp_entry = unsafe {
@@ -116,6 +128,20 @@ pub unsafe fn load_user_process_with(
             // idempotent for the program pages already installed.
             unsafe { address_space.materialize() }
                 .map_err(|e| LoadBytesError::Load(crate::loader::LoadError::AddressSpace(e)))?;
+
+            // Re-parse so we can drive the interpreter's PT_DYNAMIC
+            // through the same relocation pass — the interpreter is
+            // typically an ET_DYN object with its own .rela.dyn that
+            // needs the INTERP_BIAS applied as the load offset.
+            let interp_image = crate::parse_elf(interp_bytes)
+                .map_err(|e| LoadBytesError::Elf(e))?;
+            if !interp_image.dynamic.is_empty() {
+                unsafe {
+                    apply_relocations(interp_bytes, &interp_image,
+                                      &address_space, INTERP_BIAS)
+                }?;
+            }
+
             entry = EntryPoint(VirtAddr::new(interp_entry));
             interp_loaded = true;
         }

@@ -7324,6 +7324,136 @@ fn smoke_userspace_load_user_process_with_interp() -> TestResult {
 kernel_test!(smoke_userspace_load_user_process_with_interp);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_userspace_apply_relative_relocations() -> TestResult {
+    // PT_DYNAMIC walk-through. Build a minimal ELF with one PT_LOAD
+    // covering [0x80_0000_1000, 0x80_0000_2000), one PT_DYNAMIC
+    // pointing at a 5-entry dynamic array inside the segment, and a
+    // single Elf64_Rela whose r_offset names a slot inside the same
+    // segment. After load, the R_X86_64_RELATIVE relocation should
+    // have written its addend into the slot — proving DT_RELA
+    // walking + r_offset → user-vaddr translation + page-table-
+    // backed write all work end-to-end.
+    use narf_memory::x86_64::paging;
+    use narf_memory::VirtAddr;
+    use narf_userspace::load_user_process_with;
+
+    const SEG_VA:   u64 = 0x0000_0080_0000_1000;
+    const SEG_FOFF: u64 = 0x1000;
+    // r_offset inside the segment (byte 0x80 from base — well clear
+    // of both the rela array and the dynamic array we lay out below).
+    const RELOC_OFF_IN_SEG: u64 = 0x80;
+    const RELOC_VA:  u64 = SEG_VA + RELOC_OFF_IN_SEG;
+    const ADDEND:    u64 = 0x12345678;
+    // Where the rela entry lives inside the segment (file + vaddr).
+    const RELA_OFF_IN_SEG: u64 = 0x100;
+    // Where the dynamic array lives inside the segment.
+    const DYN_OFF_IN_SEG:  u64 = 0x200;
+
+    fn build() -> alloc::vec::Vec<u8> {
+        // Total file size: 0x2000 — first 0x1000 = ELF header + phdrs
+        // (zero-padded), second 0x1000 = the PT_LOAD page.
+        const FSIZE: usize = 0x2000;
+        let mut b = alloc::vec![0u8; FSIZE];
+        // ELF header.
+        b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        b[0x10..0x12].copy_from_slice(&2u16.to_le_bytes());     // ET_EXEC
+        b[0x12..0x14].copy_from_slice(&0x3Eu16.to_le_bytes());  // EM_X86_64
+        b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());     // EV_CURRENT
+        b[0x18..0x20].copy_from_slice(&(SEG_VA + 0x111).to_le_bytes()); // entry inside seg
+        b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes());    // e_phoff
+        b[0x28..0x30].copy_from_slice(&0u64.to_le_bytes());     // e_shoff
+        b[0x30..0x34].copy_from_slice(&0u32.to_le_bytes());     // e_flags
+        b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());    // e_ehsize
+        b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());    // e_phentsize
+        b[0x38..0x3A].copy_from_slice(&2u16.to_le_bytes());     // e_phnum
+        // Phdr 0 — PT_LOAD covering the page at file_off 0x1000 →
+        // vaddr SEG_VA, with R+W perms (so the relocation can patch
+        // the slot — kernel writes through identity-map so PF_W is
+        // for completeness only).
+        let mut ph = 64usize;
+        b[ph + 0x00..ph + 0x04].copy_from_slice(&1u32.to_le_bytes());   // PT_LOAD
+        b[ph + 0x04..ph + 0x08].copy_from_slice(&6u32.to_le_bytes());   // PF_R|PF_W
+        b[ph + 0x08..ph + 0x10].copy_from_slice(&SEG_FOFF.to_le_bytes());
+        b[ph + 0x10..ph + 0x18].copy_from_slice(&SEG_VA.to_le_bytes());
+        b[ph + 0x18..ph + 0x20].copy_from_slice(&SEG_VA.to_le_bytes());
+        b[ph + 0x20..ph + 0x28].copy_from_slice(&0x1000u64.to_le_bytes()); // filesz
+        b[ph + 0x28..ph + 0x30].copy_from_slice(&0x1000u64.to_le_bytes()); // memsz
+        b[ph + 0x30..ph + 0x38].copy_from_slice(&0x1000u64.to_le_bytes()); // align
+        // Phdr 1 — PT_DYNAMIC. Its file region is the dynamic array
+        // we lay down at DYN_OFF_IN_SEG (5 × 16 bytes = 80).
+        ph = 64 + 56;
+        let dyn_foff = SEG_FOFF + DYN_OFF_IN_SEG;
+        let dyn_va   = SEG_VA  + DYN_OFF_IN_SEG;
+        b[ph + 0x00..ph + 0x04].copy_from_slice(&2u32.to_le_bytes());   // PT_DYNAMIC
+        b[ph + 0x04..ph + 0x08].copy_from_slice(&4u32.to_le_bytes());   // PF_R
+        b[ph + 0x08..ph + 0x10].copy_from_slice(&dyn_foff.to_le_bytes());
+        b[ph + 0x10..ph + 0x18].copy_from_slice(&dyn_va.to_le_bytes());
+        b[ph + 0x18..ph + 0x20].copy_from_slice(&dyn_va.to_le_bytes());
+        b[ph + 0x20..ph + 0x28].copy_from_slice(&80u64.to_le_bytes());  // 5 × 16
+        b[ph + 0x28..ph + 0x30].copy_from_slice(&80u64.to_le_bytes());
+        b[ph + 0x30..ph + 0x38].copy_from_slice(&8u64.to_le_bytes());
+
+        // Lay out the Elf64_Rela entry at SEG_FOFF + RELA_OFF_IN_SEG.
+        // r_offset = RELOC_VA, r_info = (sym=0 << 32) | type=8, addend=ADDEND.
+        let rela_foff = (SEG_FOFF + RELA_OFF_IN_SEG) as usize;
+        b[rela_foff       .. rela_foff + 8 ].copy_from_slice(&RELOC_VA.to_le_bytes());
+        b[rela_foff + 8   .. rela_foff + 16].copy_from_slice(&8u64.to_le_bytes());
+        b[rela_foff + 16  .. rela_foff + 24].copy_from_slice(&ADDEND.to_le_bytes());
+
+        // Lay out the dynamic array. Tags use the standard DT_* wire
+        // numbers — DT_RELA=7, DT_RELASZ=8, DT_RELAENT=9, DT_RELACOUNT=
+        // 0x6FFFFFF9, DT_NULL=0.
+        let rela_va = SEG_VA + RELA_OFF_IN_SEG;
+        let dyn_foff_us = dyn_foff as usize;
+        let mut p = dyn_foff_us;
+        // DT_RELA = rela array vaddr.
+        b[p       .. p + 8 ].copy_from_slice(&7i64.to_le_bytes());
+        b[p + 8   .. p + 16].copy_from_slice(&rela_va.to_le_bytes());
+        p += 16;
+        // DT_RELASZ = 24.
+        b[p       .. p + 8 ].copy_from_slice(&8i64.to_le_bytes());
+        b[p + 8   .. p + 16].copy_from_slice(&24u64.to_le_bytes());
+        p += 16;
+        // DT_RELAENT = 24.
+        b[p       .. p + 8 ].copy_from_slice(&9i64.to_le_bytes());
+        b[p + 8   .. p + 16].copy_from_slice(&24u64.to_le_bytes());
+        p += 16;
+        // DT_RELACOUNT = 1.
+        b[p       .. p + 8 ].copy_from_slice(&0x6FFFFFF9i64.to_le_bytes());
+        b[p + 8   .. p + 16].copy_from_slice(&1u64.to_le_bytes());
+        p += 16;
+        // DT_NULL terminator.
+        b[p       .. p + 8 ].copy_from_slice(&0i64.to_le_bytes());
+        b[p + 8   .. p + 16].copy_from_slice(&0u64.to_le_bytes());
+
+        b
+    }
+
+    let bytes = build();
+    let proc = match unsafe { load_user_process_with(&bytes, &[], &[], &[]) } {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("load_user_process_with failed"),
+    };
+
+    // Read back the slot through the AS — same translate-and-cast
+    // pattern the other smokes use.
+    let read_u64 = |vaddr: u64| -> Option<u64> {
+        let p = unsafe { paging::translate(proc.address_space.root, VirtAddr::new(vaddr & !0xFFF)) }?;
+        Some(unsafe { *((p.as_u64() | (vaddr & 0xFFF)) as *const u64) })
+    };
+    let got = match read_u64(RELOC_VA) {
+        Some(v) => v,
+        None    => return TestResult::Fail("relocation site not materialised"),
+    };
+    if got != ADDEND {
+        return TestResult::Fail("R_X86_64_RELATIVE didn't write the addend");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_userspace_apply_relative_relocations);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_userspace_init_sysv_stack_layout() -> TestResult {
     // Verify `init_sysv_stack` lays out the System V x86_64 startup
     // contract: argc at [rsp], then argv pointers + NULL, then envp

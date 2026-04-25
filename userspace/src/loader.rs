@@ -25,7 +25,7 @@ use alloc::sync::Arc;
 
 use narf_memory::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
 
-use crate::{ExecImage, SegmentFlags};
+use crate::{DynEntry, ExecImage, SegmentFlags};
 
 /// Entry point the loader hands back for the scheduler to branch
 /// into once the address space is activated.
@@ -102,6 +102,21 @@ pub enum LoadBytesError {
     Load(LoadError),
     NoFrame,
     ByteCopyOutOfBounds,
+    /// PT_DYNAMIC named a relocation table whose file-region
+    /// pointers (DT_RELA / DT_JMPREL) couldn't be located in the
+    /// ELF bytes — typically because the dynamic-linker fixed
+    /// in-memory addresses aren't covered by any PT_LOAD's file
+    /// span, so we can't read the entries.
+    RelaOutOfBounds,
+    /// Encountered a relocation type we don't implement yet
+    /// (anything outside R_X86_64_RELATIVE / _64 / _GLOB_DAT /
+    /// _JUMP_SLOT) or a relocation that needs symbol resolution
+    /// (which the Stage-4 first cut hasn't wired up).
+    UnsupportedRelocation,
+    /// A relocation's `r_offset` (after `vaddr_bias`) isn't backed
+    /// by a materialised page in the address space, so we can't
+    /// reach the patch site.
+    RelocTargetUnmapped,
 }
 
 impl From<crate::ElfError> for LoadBytesError {
@@ -231,4 +246,232 @@ pub unsafe fn load_elf_bytes(
         .map_err(|e| LoadBytesError::Load(LoadError::AddressSpace(e)))?;
 
     Ok((Arc::new(addr_space), EntryPoint(VirtAddr::new(entry))))
+}
+
+// ── PT_DYNAMIC relocation processing ────────────────────────────────
+//
+// PIE programs and dynamic libraries record relocations in the
+// `.rela.dyn` (covering data + GOT slots) and `.rela.plt` (covering
+// PLT jump slots) sections. PT_DYNAMIC's DT_RELA / DT_RELASZ and
+// DT_JMPREL / DT_PLTRELSZ tags name the in-memory addresses + sizes
+// of those tables; the linker's ld.so walks them and patches each
+// `r_offset` site.
+//
+// This first cut handles R_X86_64_RELATIVE end-to-end (the only
+// relocation a self-contained PIE actually needs — it expresses
+// "add the load bias to this slot") and refuses everything else
+// with `LoadBytesError::UnsupportedRelocation`. Symbol-resolving
+// relocations (R_X86_64_64 / GLOB_DAT / JUMP_SLOT) need a symbol
+// table and string table; we lay the parsing groundwork here so a
+// later round just plugs in `resolve_symbol`.
+
+// DT_* tag wire constants we care about. The "currently-unused"
+// SYMTAB/STRTAB/STRSZ/RELACOUNT entries are kept here so the
+// follow-up symbol-resolution pass can pick them up without
+// re-deriving the wire numbers.
+const DT_PLTRELSZ:   i64 = 2;
+#[allow(dead_code)] const DT_STRTAB: i64 = 5;
+#[allow(dead_code)] const DT_SYMTAB: i64 = 6;
+const DT_RELA:       i64 = 7;
+const DT_RELASZ:     i64 = 8;
+const DT_RELAENT:    i64 = 9;
+#[allow(dead_code)] const DT_STRSZ:  i64 = 10;
+const DT_PLTREL:     i64 = 20;
+const DT_JMPREL:     i64 = 23;
+#[allow(dead_code)] const DT_RELACOUNT: i64 = 0x6FFFFFF9;
+
+// x86_64 relocation type codes (low 32 bits of `r_info`).
+const R_X86_64_64:        u32 = 1;
+const R_X86_64_GLOB_DAT:  u32 = 6;
+const R_X86_64_JUMP_SLOT: u32 = 7;
+const R_X86_64_RELATIVE:  u32 = 8;
+
+/// Lookup helper — return the value paired with the *first*
+/// occurrence of `tag` in `dynamic`. PT_DYNAMIC duplicates would
+/// be malformed; we treat first-wins as the spec does.
+fn dt_lookup(dynamic: &[DynEntry], tag: i64) -> Option<u64> {
+    dynamic.iter().find(|e| e.tag == tag).map(|e| e.val)
+}
+
+/// Translate a DT_* in-memory address to a slice of the input ELF
+/// bytes. The dynamic-linker tables (DT_RELA / DT_JMPREL pointers)
+/// are recorded as the *vaddr* the linker assigned them at link
+/// time; we resolve them back to file offsets by matching against
+/// each PT_LOAD's `[vaddr, vaddr + file_size)` span and applying
+/// the same `(file_off - vaddr)` translation.
+fn resolve_dt_pointer<'a>(
+    bytes: &'a [u8],
+    image: &ExecImage,
+    dt_addr: u64,
+    needed: u64,
+) -> Option<&'a [u8]> {
+    for seg in &image.segments {
+        // A DT_* pointer is in-bounds for a segment when it lies in
+        // [vaddr, vaddr + file_size). file_size (not mem_size) is the
+        // right ceiling because relocation tables are file-resident.
+        if dt_addr < seg.vaddr { continue; }
+        let off_in_seg = dt_addr - seg.vaddr;
+        if off_in_seg >= seg.file_size { continue; }
+        let avail = seg.file_size - off_in_seg;
+        if avail < needed { return None; }
+        let file_start = (seg.file_off + off_in_seg) as usize;
+        let file_end   = file_start.checked_add(needed as usize)?;
+        if file_end > bytes.len() { return None; }
+        return Some(&bytes[file_start..file_end]);
+    }
+    None
+}
+
+#[inline]
+fn read_u64_le(bytes: &[u8]) -> u64 {
+    u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3],
+        bytes[4], bytes[5], bytes[6], bytes[7],
+    ])
+}
+
+/// Resolve a user vaddr (after `vaddr_bias`) to a kernel-writable
+/// pointer through the active address space. Mirrors
+/// `process::resolve_user_phys_byte` so the relocation processor
+/// can reach freshly-materialised pages without depending on the
+/// stack-init code path.
+#[cfg(target_arch = "x86_64")]
+fn user_vaddr_to_kernel_ptr(addr_space: &AddressSpace, vaddr: u64) -> Option<*mut u8> {
+    let page = vaddr & !0xFFFu64;
+    let off  = vaddr & 0xFFFu64;
+    let p = unsafe {
+        narf_memory::x86_64::paging::translate(addr_space.root, VirtAddr::new(page))
+    }?;
+    Some((p.as_u64() + off) as *mut u8)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn user_vaddr_to_kernel_ptr(_addr_space: &AddressSpace, _vaddr: u64) -> Option<*mut u8> {
+    // aarch64 paging::translate isn't wired in narf-memory yet, same
+    // story as `init_sysv_stack`. Relocation is x86_64-only at this
+    // tier; arches without translate fall through and return None,
+    // which the caller surfaces as `RelocTargetUnmapped`.
+    None
+}
+
+/// Walk DT_RELA + DT_JMPREL and patch each entry.
+///
+/// `vaddr_bias` is the load offset applied to PT_LOAD vaddrs and
+/// to R_X86_64_RELATIVE addends — `0` for an ET_EXEC program,
+/// non-zero for an ET_DYN interpreter loaded at a chosen base.
+///
+/// # Safety
+/// - `addr_space` must already be `materialize()`-d so each
+///   relocated `r_offset` is reachable through the AS.
+/// - The kernel must be running with the low 4 GiB identity-mapped
+///   (we write through `paging::translate`'s phys output cast to a
+///   raw pointer).
+pub unsafe fn apply_relocations(
+    bytes:      &[u8],
+    image:      &ExecImage,
+    addr_space: &AddressSpace,
+    vaddr_bias: u64,
+) -> Result<(), LoadBytesError> {
+    if image.dynamic.is_empty() { return Ok(()); }
+
+    // DT_RELA — the .rela.dyn array.
+    if let Some(rela_addr) = dt_lookup(&image.dynamic, DT_RELA) {
+        let relasz = dt_lookup(&image.dynamic, DT_RELASZ).unwrap_or(0);
+        let relaent = dt_lookup(&image.dynamic, DT_RELAENT).unwrap_or(24);
+        // DT_RELACOUNT, when present, is authoritative for the count
+        // of *contiguous R_X86_64_RELATIVE entries at the start of
+        // the array* (linker emits them in a block to allow a fast
+        // path). When absent we fall back to RELASZ/RELAENT.
+        let count = if relaent != 0 { relasz / relaent } else { 0 };
+        if count > 0 {
+            let needed = count.checked_mul(relaent).ok_or(LoadBytesError::RelaOutOfBounds)?;
+            let slice  = resolve_dt_pointer(bytes, image, rela_addr, needed)
+                .ok_or(LoadBytesError::RelaOutOfBounds)?;
+            unsafe {
+                process_rela_array(slice, count as usize, relaent as usize,
+                                   addr_space, vaddr_bias)?;
+            }
+        }
+    }
+
+    // DT_JMPREL — the .rela.plt array. We only walk it if DT_PLTREL
+    // signals RELA-format entries (DT_PLTREL == DT_RELA); REL-format
+    // doesn't appear on x86_64 in practice.
+    if let Some(jmprel_addr) = dt_lookup(&image.dynamic, DT_JMPREL) {
+        let pltrel = dt_lookup(&image.dynamic, DT_PLTREL).unwrap_or(0) as i64;
+        if pltrel == DT_RELA {
+            let pltrelsz = dt_lookup(&image.dynamic, DT_PLTRELSZ).unwrap_or(0);
+            let relaent  = dt_lookup(&image.dynamic, DT_RELAENT).unwrap_or(24);
+            let count = if relaent != 0 { pltrelsz / relaent } else { 0 };
+            if count > 0 {
+                let needed = count.checked_mul(relaent).ok_or(LoadBytesError::RelaOutOfBounds)?;
+                let slice  = resolve_dt_pointer(bytes, image, jmprel_addr, needed)
+                    .ok_or(LoadBytesError::RelaOutOfBounds)?;
+                unsafe {
+                    process_rela_array(slice, count as usize, relaent as usize,
+                                       addr_space, vaddr_bias)?;
+                }
+            }
+        } else if pltrel != 0 {
+            // DT_REL-format PLT relocations aren't implemented.
+            return Err(LoadBytesError::UnsupportedRelocation);
+        }
+    }
+
+    Ok(())
+}
+
+/// Iterate `Elf64_Rela { r_offset, r_info, r_addend }` entries and
+/// patch each one. Encapsulated so DT_RELA + DT_JMPREL can share
+/// the per-entry decoding without duplicating the loop.
+unsafe fn process_rela_array(
+    slice:      &[u8],
+    count:      usize,
+    entsize:    usize,
+    addr_space: &AddressSpace,
+    vaddr_bias: u64,
+) -> Result<(), LoadBytesError> {
+    if entsize < 24 { return Err(LoadBytesError::RelaOutOfBounds); }
+    if slice.len() < count.checked_mul(entsize).ok_or(LoadBytesError::RelaOutOfBounds)? {
+        return Err(LoadBytesError::RelaOutOfBounds);
+    }
+
+    for i in 0..count {
+        let off = i * entsize;
+        let r_offset = read_u64_le(&slice[off       .. off + 8]);
+        let r_info   = read_u64_le(&slice[off + 8   .. off + 16]);
+        let r_addend = read_u64_le(&slice[off + 16  .. off + 24]) as i64;
+
+        let rtype   = (r_info & 0xFFFF_FFFF) as u32;
+        let _sym_ix = (r_info >> 32) as u32;
+
+        // Compute the value we'll write.
+        let value: u64 = match rtype {
+            R_X86_64_RELATIVE => {
+                // S = 0 (no symbol). Result = B + A, where B is the
+                // load bias we're applying and A is r_addend.
+                vaddr_bias.wrapping_add(r_addend as u64)
+            }
+            R_X86_64_64 | R_X86_64_GLOB_DAT | R_X86_64_JUMP_SLOT => {
+                // These need a symbol-table lookup; Stage-4 first cut
+                // hasn't wired DT_SYMTAB walking yet. Refuse rather
+                // than write an undefined value.
+                return Err(LoadBytesError::UnsupportedRelocation);
+            }
+            _ => return Err(LoadBytesError::UnsupportedRelocation),
+        };
+
+        // Patch site. r_offset is the link-time vaddr of the slot;
+        // for a PIE we add `vaddr_bias` to land in the runtime image.
+        let target_va = r_offset.wrapping_add(vaddr_bias);
+        let dst = user_vaddr_to_kernel_ptr(addr_space, target_va)
+            .ok_or(LoadBytesError::RelocTargetUnmapped)?;
+        // SAFETY: dst points into an identity-mapped phys frame
+        // backing the user's mapped page; the slot is 8 bytes wide
+        // and aligned by construction (linker emits 8-aligned r_offsets
+        // for R_X86_64_64-class relocations).
+        unsafe { core::ptr::write_unaligned(dst as *mut u64, value); }
+    }
+
+    Ok(())
 }

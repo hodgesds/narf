@@ -52,11 +52,13 @@ pub use fd::{FdEntry, FdTable};
 pub use elf::{parse as parse_elf, ElfError};
 pub use handlers::{
     abi_file_op_bridge, bootstrap_init, bootstrap_live_count, brk_init,
-    clear_exit_landing, install_address_space_lookup, install_core_syscalls,
+    clear_exit_landing, default_signal_delivery, install_address_space_lookup,
+    install_core_syscalls, install_signal_delivery_hook,
     install_task_id_lookup, set_exit_landing, shared_rings_for,
-    sigaction_init, sigaction_lookup, spawn_dispatcher_for, take_kernel_ends,
-    take_user_ends, SharedRingPair, TaskRings, UserRingEnds,
-    BOOTSTRAP_SHARED_RING_DEPTH,
+    sigaction_init, sigaction_lookup, signal_delivery_hook, signal_init,
+    signal_mask_of, signal_pending_of, spawn_dispatcher_for,
+    take_kernel_ends, take_user_ends, SharedRingPair, TaskRings,
+    UserRingEnds, BOOTSTRAP_SHARED_RING_DEPTH,
 };
 pub use user_task::{
     clear_current as clear_current_user_task, current_user_task,
@@ -65,7 +67,8 @@ pub use user_task::{
     UserTaskCtx, UserTaskFuture, EXIT_REASON_EXITED, EXIT_REASON_YIELDED,
 };
 pub use loader::{
-    load_elf_bytes, load_elf_into_at, load_into, EntryPoint, LoadBytesError, LoadError,
+    apply_relocations, load_elf_bytes, load_elf_into_at, load_into,
+    EntryPoint, LoadBytesError, LoadError,
 };
 pub use process::{
     init_sysv_stack, load_user_process, load_user_process_with,
@@ -163,6 +166,17 @@ impl core::ops::BitOr for SegmentFlags {
     fn bitor(self, rhs: SegmentFlags) -> Self { SegmentFlags(self.0 | rhs.0) }
 }
 
+/// One PT_DYNAMIC table entry — the file-format `Elf64_Dyn`
+/// shape. Tags are signed (DT_* spec), values either pointer-typed
+/// or scalar — we preserve the raw 64-bit bit pattern so
+/// downstream consumers (the relocation processor) can re-interpret
+/// per-tag without us baking in tag semantics here.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DynEntry {
+    pub tag: i64,
+    pub val: u64,
+}
+
 /// In-memory description of a loaded program.
 #[derive(Clone, Debug)]
 pub struct ExecImage {
@@ -170,6 +184,10 @@ pub struct ExecImage {
     pub entry:      u64,
     pub interp:     Option<String>,
     pub segments:   Vec<Segment>,
+    /// PT_DYNAMIC entries (DT_* tag/value pairs), empty for an ELF
+    /// without a PT_DYNAMIC program header. The DT_NULL terminator
+    /// is stripped — what's left is what the loader actually walks.
+    pub dynamic:    Vec<DynEntry>,
     pub argv:       Vec<String>,
     pub envp:       Vec<String>,
     pub aux:        Vec<AuxEntry>,
@@ -179,8 +197,9 @@ impl ExecImage {
     pub fn empty(kind: ExecKind) -> Self {
         Self {
             kind, entry: 0, interp: None,
-            segments: Vec::new(), argv: Vec::new(),
-            envp: Vec::new(), aux: Vec::new(),
+            segments: Vec::new(), dynamic: Vec::new(),
+            argv: Vec::new(), envp: Vec::new(),
+            aux: Vec::new(),
         }
     }
 }
