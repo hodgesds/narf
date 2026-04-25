@@ -9,6 +9,7 @@ core::arch::global_asm!(include_str!("boot.S"));
 core::arch::global_asm!(include_str!("vec.S"));
 
 pub mod trap;
+pub mod user;
 
 extern "C" {
     /// Linker symbol for the EL1 vector table base (from `vec.S`).

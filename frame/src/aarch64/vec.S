@@ -45,15 +45,15 @@ __narf_vector_table:
     .align 7
     b       __narf_vec_serror          /* 0x380 — SError */
 
-    /* ─── Lower EL, AArch64 (0x400 .. 0x580) ─── unreachable today */
+    /* ─── Lower EL, AArch64 (0x400 .. 0x580) ─── EL0 → EL1 ─── */
     .align 7
-    b       __narf_vec_unimpl
+    b       __narf_vec_sync_el0   /* sync from EL0 (SVC, page faults) */
     .align 7
-    b       __narf_vec_unimpl
+    b       __narf_vec_irq        /* IRQ from EL0 — same handler */
     .align 7
-    b       __narf_vec_unimpl
+    b       __narf_vec_unimpl     /* FIQ from EL0 */
     .align 7
-    b       __narf_vec_unimpl
+    b       __narf_vec_serror     /* SError from EL0 */
 
     /* ─── Lower EL, AArch32 (0x600 .. 0x780) ─── unreachable */
     .align 7
@@ -172,6 +172,21 @@ __narf_vec_sync_sp0:
 1:  wfe
     b       1b
 .size __narf_vec_sync_sp0, . - __narf_vec_sync_sp0
+
+/* Sync from EL0 (lower EL) — same body as `__narf_vec_sync_spx`
+ * since `rust_aarch64_sync_dispatch` reads ESR_EL1 and routes by
+ * EC, and the SAVE/RESTORE macros are EL-agnostic. The macro
+ * stashes ELR/SPSR so the dispatcher can rewrite them via
+ * `redirect_to_kernel`; eret loads them back on return. */
+.align 4
+.type __narf_vec_sync_el0, @function
+__narf_vec_sync_el0:
+    SAVE_ALL_GPRS
+    mov     x0, sp
+    bl      rust_aarch64_sync_dispatch
+    RESTORE_ALL_GPRS
+    eret
+.size __narf_vec_sync_el0, . - __narf_vec_sync_el0
 
 .align 4
 .type __narf_vec_serror, @function
