@@ -361,7 +361,9 @@ pub unsafe extern "C" fn strstr(haystack: *const u8, needle: *const u8) -> *mut 
 pub unsafe extern "C" fn strdup(s: *const u8) -> *mut u8 {
     // SAFETY: per the function-level contract.
     let len = unsafe { strlen(s) };
-    let buf = crate::heap::malloc(len + 1);
+    // SAFETY: malloc is `unsafe extern "C"` to match the C-ABI
+    // shape exposed in heap.rs; passing a non-zero size is fine.
+    let buf = unsafe { crate::heap::malloc(len + 1) };
     if buf.is_null() {
         return core::ptr::null_mut();
     }

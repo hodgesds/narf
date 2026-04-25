@@ -1,77 +1,339 @@
-//! Bump allocator over `brk`. Validation-grade only — `free` is a
-//! no-op. A real freelist allocator (and a `realloc`/`calloc`
-//! pair) is a Stage-4 follow-up; the goal here is to give the
-//! validate binary a concrete `malloc` to call so we know the
-//! brk-syscall round-trip works.
+//! Tier-1.5 freelist allocator over `mmap`.
 //!
-//! The bump cursor is initialised lazily on first call so we don't
-//! have to wire a constructor into `__libc_start_main`. `brk(0)`
-//! reads the current break (the kernel guarantees a stable initial
-//! value); subsequent `brk(target)` grows it page-aligned.
+//! Replaces the prior bump-on-`brk` cursor: `free` now actually
+//! returns memory so long-running alloc/free cycles don't leak. The
+//! design is a single global free list of variable-sized chunks with
+//! a small in-band header. Callers see a `*mut u8` that points just
+//! past the header; the allocator recovers the header on `free` by
+//! subtracting `HEADER_SIZE`.
+//!
+//! Strategy: first-fit walk over a singly-linked free list. On a
+//! miss we grow the heap by mmapping at least `MIN_GROW_BYTES`
+//! (page-rounded) and seeding the result as a fresh free chunk. The
+//! kernel chooses the vaddr — `mmap`'s `hint` arg is suggestive
+//! only — so successive `mmap` calls return disjoint regions and we
+//! cannot rely on a contiguous heap. Each grown region therefore
+//! becomes its own free chunk; the free-list-reuse probe is
+//! satisfied by the *split-then-reuse* path on the second `malloc`,
+//! not by any vaddr math.
+//!
+//! Concurrency: NARF user mode is single-threaded. The free-list
+//! head lives in an `AtomicPtr` to match the `static mut`-avoidance
+//! pattern used elsewhere in narf-libc; loads/stores use
+//! Acquire/Release so future MT support won't have to revisit the
+//! ordering questions.
+//!
+//! Coalescing: not implemented. Adjacent free chunks remain split.
+//! TODO: coalesce on free (requires either sorted-by-address
+//! insertion or a footer that lets us find the predecessor in O(1)).
+//! Without coalescing, churn that allocates many sizes and frees in
+//! a different order will fragment. Acceptable for the validate
+//! probe; revisit when a real workload shows up.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::ptr;
+use core::sync::atomic::{AtomicPtr, Ordering};
 
-/// Initial break value, captured on first `malloc`. Used as a
-/// sentinel for lazy init (0 = not yet sampled).
-static HEAP_INITIAL: AtomicUsize = AtomicUsize::new(0);
-/// Current bump cursor. Always `>= HEAP_INITIAL`; grows on each
-/// successful allocation, never shrinks (free is a no-op).
-static HEAP_TOP: AtomicUsize = AtomicUsize::new(0);
-
-/// Allocate `size` bytes with 16-byte alignment. Returns null on
-/// `size == 0` (POSIX permits this) and on `brk` failure.
+/// In-band chunk header. The size includes the header itself, so
+/// `chunk.size - HEADER_SIZE` is what the caller actually sees.
 ///
-/// Concurrency: `fetch_add` on `HEAP_TOP` reserves the slot, then
-/// we ask the kernel to grow `brk` if needed. Two racing callers
-/// both succeed because the second `brk(new_top)` is a no-op
-/// (kernel honours the highest target).
-pub fn malloc(size: usize) -> *mut u8 {
-    if size == 0 {
-        return core::ptr::null_mut();
-    }
-    // Round up to 16-byte alignment so consecutive blocks satisfy
-    // the SysV-AMD64 max-align requirement (e.g. for `__int128` /
-    // `long double` buffers a future caller might want).
-    let size = (size + 15) & !15;
-
-    let initial = HEAP_INITIAL.load(Ordering::Acquire);
-    if initial == 0 {
-        // Lazy initialise. brk(0) returns the current break — the
-        // kernel guarantees this is non-zero on a successful
-        // address-space init, so we can use 0 as a sentinel.
-        let cur = narf_user_runtime::brk(0);
-        if cur == 0 || cur == usize::MAX {
-            return core::ptr::null_mut();
-        }
-        // CAS so two racing callers agree on the same initial.
-        if HEAP_INITIAL.compare_exchange(0, cur, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-            HEAP_TOP.store(cur, Ordering::Release);
-        }
-    }
-
-    let old_top = HEAP_TOP.fetch_add(size, Ordering::AcqRel);
-    let new_top = old_top + size;
-
-    // Grow brk if we crossed the current break. Re-querying the
-    // break each call is cheap (one syscall) and guards against the
-    // kernel having grown it for some other reason.
-    let cur_break = narf_user_runtime::brk(0);
-    if new_top > cur_break {
-        let grown = narf_user_runtime::brk(new_top);
-        if grown < new_top {
-            // brk failed — roll the bump cursor back so the slot
-            // can be reused. Note this is best-effort: another
-            // racing allocation may have already moved past us, in
-            // which case the rollback is a no-op (the sub-add still
-            // leaves a hole the next allocation skips).
-            HEAP_TOP.fetch_sub(size, Ordering::AcqRel);
-            return core::ptr::null_mut();
-        }
-    }
-
-    old_top as *mut u8
+/// `next` is only meaningful while the chunk is on the free list —
+/// when the caller holds the post-header pointer the field is dead
+/// space. We do NOT clear it on alloc; the next `free` overwrites it.
+#[repr(C)]
+struct Chunk {
+    /// Size of the chunk INCLUDING this header, in bytes.
+    size: usize,
+    /// Next free chunk. Null when this is the tail of the free list.
+    /// Only valid when the chunk is on the free list — uninitialised
+    /// when the chunk is in use by the caller.
+    next: *mut Chunk,
 }
 
-/// Free is a no-op for the bump allocator. Documented as a
-/// Stage-4 limitation; a freelist allocator follows.
-pub fn free(_ptr: *mut u8) {}
+const HEADER_SIZE: usize = core::mem::size_of::<Chunk>();
+/// Smallest free-list remainder we'll keep after a split. If a fit
+/// would leave less than this, we hand the entire chunk to the
+/// caller (slop tracked implicitly by `chunk.size`).
+const MIN_CHUNK_SPLIT: usize = HEADER_SIZE + 32;
+/// Minimum byte count we ask the kernel for on a free-list miss.
+/// Page-rounding happens after; this is the floor.
+const MIN_GROW_BYTES: usize = 64 * 1024;
+/// Page size used for grow rounding. The kernel mmap path is
+/// page-granular regardless; rounding here keeps the chunk size in
+/// step with what was actually mapped.
+const PAGE_SIZE: usize = 4096;
+/// User-visible alignment. SysV-AMD64 + AArch64 PCS both want
+/// 16-byte max-align for arbitrary scalars; matching that lets a
+/// future caller use the buffer for `long double` / `__int128`
+/// without surprises.
+const ALIGN: usize = 16;
+
+/// Free-list head. Single-threaded user mode means a plain `static
+/// mut` would work, but the codebase uses atomics for static state
+/// so we follow suit. Acquire on load pairs with Release on store
+/// via the head-write CAS path.
+static FREE_LIST: AtomicPtr<Chunk> = AtomicPtr::new(ptr::null_mut());
+
+/// Round `n` up to the next `ALIGN` boundary. `ALIGN` is a power of
+/// two so the bitmask form is correct.
+#[inline]
+fn align_up(n: usize) -> usize {
+    (n + ALIGN - 1) & !(ALIGN - 1)
+}
+
+/// Round `n` up to the next page boundary. Used to size the mmap
+/// request — the kernel rounds anyway, but matching here means the
+/// resulting Chunk records the true mapped length.
+#[inline]
+fn page_round_up(n: usize) -> usize {
+    (n + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+}
+
+/// Push `chunk` onto the free list. Caller owns `chunk` and must
+/// have already written `chunk.size`; we set `chunk.next` here.
+///
+/// # Safety
+/// `chunk` must point to a valid `Chunk` header with `size`
+/// initialised. The chunk must not already be on the free list.
+unsafe fn push_free(chunk: *mut Chunk) {
+    // Single-threaded today: load → write next → store. The CAS
+    // loop is cheap insurance for a future MT runtime.
+    loop {
+        let head = FREE_LIST.load(Ordering::Acquire);
+        // SAFETY: `chunk` is caller-owned; writing `next` is fine.
+        unsafe { (*chunk).next = head; }
+        if FREE_LIST
+            .compare_exchange(head, chunk, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+
+/// Walk the free list looking for the first chunk with at least
+/// `need` bytes (header included). On success removes it from the
+/// list and returns the pointer; on miss returns null.
+///
+/// # Safety
+/// Free-list pointers must all be valid `Chunk` headers — upheld by
+/// `push_free` being the only path that adds to the list and only
+/// adding chunks we've populated.
+unsafe fn pop_fit(need: usize) -> *mut Chunk {
+    // Single-pass first-fit. We unlink by rewriting the predecessor's
+    // `next` (or the head pointer if the fit is the head). No CAS
+    // loop here — single-threaded — but the loads/stores still go
+    // through the atomic so we don't have to juggle `static mut`.
+    let mut prev: *mut Chunk = ptr::null_mut();
+    let mut cur = FREE_LIST.load(Ordering::Acquire);
+    while !cur.is_null() {
+        // SAFETY: invariant — every list pointer is a valid Chunk.
+        let cur_size = unsafe { (*cur).size };
+        // SAFETY: same.
+        let cur_next = unsafe { (*cur).next };
+        if cur_size >= need {
+            if prev.is_null() {
+                FREE_LIST.store(cur_next, Ordering::Release);
+            } else {
+                // SAFETY: `prev` came from a prior loop iteration
+                // where we already deref'd it.
+                unsafe { (*prev).next = cur_next; }
+            }
+            return cur;
+        }
+        prev = cur;
+        cur = cur_next;
+    }
+    ptr::null_mut()
+}
+
+/// Ask the kernel for a fresh region of at least `min_bytes` (header
+/// included). Returns a `Chunk` pointer with `size` set to the
+/// actual mapped length, or null on mmap failure.
+unsafe fn grow_heap(min_bytes: usize) -> *mut Chunk {
+    let want = page_round_up(core::cmp::max(min_bytes, MIN_GROW_BYTES));
+    // SAFETY: mmap with hint=0 lets the kernel pick the vaddr; flags
+    // = 0 is the default RW user mapping. The returned pointer (if
+    // non-null) is valid for `want` bytes per the kernel contract.
+    let p = unsafe { narf_user_runtime::mmap(0, want, 0) };
+    if p.is_null() {
+        return ptr::null_mut();
+    }
+    let chunk = p as *mut Chunk;
+    // SAFETY: `chunk` is the start of a freshly mapped, writable
+    // region of `want` bytes. We don't write `next` here — the
+    // caller pushes onto the free list (or uses the chunk directly)
+    // which sets it.
+    unsafe { (*chunk).size = want; }
+    chunk
+}
+
+/// Allocate `size` bytes with 16-byte alignment. Returns null on
+/// `size == 0` (POSIX permits this) and on mmap failure.
+///
+/// The returned pointer is past the in-band header; `free` recovers
+/// the header by subtracting `HEADER_SIZE`. The chunk is at least
+/// `aligned_size + HEADER_SIZE` bytes including the header — i.e.
+/// the caller-visible region is at least `aligned_size` bytes.
+///
+/// # Safety
+/// Caller must eventually pair the result with `free` (or `realloc`).
+/// The C-ABI shape is the contract; this is `unsafe` to match
+/// `extern "C"` malloc declarations seen by C consumers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn malloc(size: usize) -> *mut u8 {
+    if size == 0 {
+        return ptr::null_mut();
+    }
+    let aligned = align_up(size);
+    // Total chunk footprint we need: aligned payload + header.
+    let need = aligned + HEADER_SIZE;
+
+    // First fit walk. On miss, grow once and retry — the grown
+    // chunk is guaranteed big enough because we asked for `need`.
+    // SAFETY: pop_fit / grow_heap / push_free invariants hold (see
+    // their docs).
+    let chunk = unsafe {
+        let c = pop_fit(need);
+        if !c.is_null() {
+            c
+        } else {
+            let g = grow_heap(need);
+            if g.is_null() {
+                return ptr::null_mut();
+            }
+            // The grown chunk is exactly the size we asked for; we
+            // don't push-then-pop, we just use it directly. (Pushing
+            // first would force a list walk; same outcome.)
+            g
+        }
+    };
+
+    // SAFETY: `chunk` is a valid header from either the free list
+    // or `grow_heap`.
+    let chunk_size = unsafe { (*chunk).size };
+
+    // Split off the remainder if it's worth keeping. The split tail
+    // becomes its own free chunk; the head becomes the caller's.
+    if chunk_size >= need + MIN_CHUNK_SPLIT {
+        let tail = (chunk as *mut u8).wrapping_add(need) as *mut Chunk;
+        let tail_size = chunk_size - need;
+        // SAFETY: `tail` lies inside the mapped region (need <
+        // chunk_size); writing the header is in-bounds.
+        unsafe {
+            (*tail).size = tail_size;
+            push_free(tail);
+            (*chunk).size = need;
+        }
+    }
+
+    // Hand the caller the post-header pointer.
+    (chunk as *mut u8).wrapping_add(HEADER_SIZE)
+}
+
+/// Free `ptr`. Null is a no-op (POSIX-required). The pointer must
+/// have come from a prior `malloc` / `realloc` / `calloc` returned
+/// by this allocator — passing arbitrary pointers is UB.
+///
+/// Does NOT coalesce — see the file-level TODO.
+///
+/// # Safety
+/// `ptr` must be either null or a pointer previously returned from
+/// this allocator and not already freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn free(ptr: *mut u8) {
+    if ptr.is_null() {
+        return;
+    }
+    let chunk = ptr.wrapping_sub(HEADER_SIZE) as *mut Chunk;
+    // SAFETY: per the function-level contract, `chunk` is a valid
+    // header recoverable by header-subtraction from a previously
+    // returned pointer.
+    unsafe { push_free(chunk); }
+}
+
+/// Resize a block. Conformant with POSIX realloc(3) edge cases:
+/// null `ptr` ⇒ malloc; zero `new_size` ⇒ free + null. The fast path
+/// returns the same pointer when the existing chunk already has
+/// enough capacity, avoiding a copy.
+///
+/// # Safety
+/// If `ptr` is non-null it must come from this allocator. The old
+/// region is invalidated on a successful resize that needed a new
+/// allocation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn realloc(ptr: *mut u8, new_size: usize) -> *mut u8 {
+    if ptr.is_null() {
+        // SAFETY: forwarding to malloc — the C-ABI contract is
+        // identical.
+        return unsafe { malloc(new_size) };
+    }
+    if new_size == 0 {
+        // SAFETY: forwarding to free.
+        unsafe { free(ptr); }
+        return ptr::null_mut();
+    }
+
+    let chunk = ptr.wrapping_sub(HEADER_SIZE) as *mut Chunk;
+    // SAFETY: per the function-level contract, `chunk` is a valid
+    // header.
+    let old_size = unsafe { (*chunk).size };
+    let aligned = align_up(new_size);
+    let need = aligned + HEADER_SIZE;
+
+    // Fast path: the existing chunk already has the requested
+    // capacity. We DON'T shrink the chunk in place — splitting on
+    // realloc-down would complicate the free path and isn't worth
+    // it for the validate-grade workload.
+    if old_size >= need {
+        return ptr;
+    }
+
+    // Slow path: malloc + memcpy + free. Copy `min(old_payload,
+    // new_size)` bytes; the new region's tail is uninitialised
+    // (POSIX permits this — realloc isn't required to zero).
+    // SAFETY: malloc / free are this module's own.
+    let new_ptr = unsafe { malloc(new_size) };
+    if new_ptr.is_null() {
+        // POSIX: failure leaves the original block intact.
+        return ptr::null_mut();
+    }
+    let old_payload = old_size - HEADER_SIZE;
+    let copy = core::cmp::min(old_payload, new_size);
+    // SAFETY: both regions are at least `copy` bytes; they're
+    // disjoint because `malloc` returned a fresh chunk.
+    unsafe {
+        core::ptr::copy_nonoverlapping(ptr, new_ptr, copy);
+        free(ptr);
+    }
+    new_ptr
+}
+
+/// `count * size` bytes, zero-filled. Overflow on the multiply
+/// returns null per POSIX guidance (calloc(3): "If the multiplication
+/// would overflow, calloc() returns an error").
+///
+/// # Safety
+/// Caller-visible C-ABI shape; the allocation contract is the same
+/// as `malloc`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn calloc(count: usize, size: usize) -> *mut u8 {
+    let total = match count.checked_mul(size) {
+        Some(t) => t,
+        None => return ptr::null_mut(),
+    };
+    if total == 0 {
+        return ptr::null_mut();
+    }
+    // SAFETY: forwarding to malloc; on success we own the buffer
+    // for the duration of the zero-fill.
+    let p = unsafe { malloc(total) };
+    if p.is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: `p` is `total` bytes of writable memory; write_bytes
+    // matches the rounded-up allocation footprint we asked for.
+    unsafe {
+        core::ptr::write_bytes(p, 0, total);
+    }
+    p
+}

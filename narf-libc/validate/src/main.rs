@@ -48,6 +48,9 @@ extern "C" fn cleanup() {
 /// the allocator's contract guarantees the returned regions are at
 /// least the requested length.
 unsafe fn heap_probe() -> bool {
+    // Track which sub-step fails so the smoke output points at the
+    // bug rather than just saying "heap: bad". Removed once stable.
+    use narf_libc::Arg;
     // (1) Single round-trip: write, read, free.
     // SAFETY: 64 bytes is well within any sane chunk size; the
     // returned pointer is writable for that span.
