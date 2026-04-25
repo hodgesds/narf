@@ -39,21 +39,42 @@ pub extern "C" fn main(
     _argv: *const *const u8,
     _envp: *const *const u8,
 ) -> i32 {
+    use narf_libc::Arg;
+
     let pid = narf_libc::getpid();
     narf_libc::printf_str(
         "hello from narf-libc; pid=%d\n",
-        &[narf_libc::Arg::Int(pid as i64)],
+        &[Arg::Int(pid as i64)],
     );
 
-    // Exercise the FILE* layer over the static stdout. We don't go
-    // through `fopen` here because the validate kernel runner does
-    // not stand up a mount table — fd 1 is sufficient to prove the
-    // buffered write path round-trips. `fflush` forces the line
-    // out even if the line-buffer heuristic ever changes underfoot.
+    // ── printf-shim format-spec probes ────────────────────────────
+    // Each probe drives a distinct branch of the format-spec parser.
+    // The round-trip succeeding proves no fault on width / precision
+    // / flag combinations.
+    narf_libc::printf_str("padded: '%5d'\n",   &[Arg::Int(42)]);
+    narf_libc::printf_str("zero: '%05d'\n",    &[Arg::Int(42)]);
+    narf_libc::printf_str("left: '%-5d|'\n",   &[Arg::Int(42)]);
+    narf_libc::printf_str("prec: '%.4x'\n",    &[Arg::Hex(0x2a)]);
+    narf_libc::printf_str("octal: '%o'\n",     &[Arg::Uint(42)]);
+    narf_libc::printf_str("binary: '%b'\n",    &[Arg::Uint(42)]);
+    narf_libc::printf_str("long: '%lld'\n",    &[Arg::Int(-1)]);
+    narf_libc::printf_str(
+        "strpad: '%-10s|%.3s'\n",
+        &[Arg::Str("hi"), Arg::Str("abcdef")],
+    );
+    narf_libc::printf_str(
+        "altsign: '%+d %#x'\n",
+        &[Arg::Int(7), Arg::Hex(0xdead)],
+    );
+    narf_libc::fprintf_str(1, "fprintf: '%u'\n", &[Arg::Uint(123)]);
+
+    // ── FILE* layer probes over static stdout ─────────────────────
+    // No fopen — the validate runner has no mount table. fd 1 via
+    // the static stdout() FILE is enough to prove the buffered
+    // write path round-trips.
     //
-    // SAFETY: `stdout()` returns a stable pointer to a static
-    // `narf_libc::File`; the byte pointers are `'static` literals;
-    // lengths match the literals exactly.
+    // SAFETY: stdout() is a stable pointer to a static File; byte
+    // pointers are 'static literals; lengths match the literals.
     unsafe {
         let s = narf_libc::stdout();
         let msg1 = b"stdio: fputs ok\n";
@@ -62,6 +83,7 @@ pub extern "C" fn main(
         narf_libc::fwrite(msg2.as_ptr(), 1, msg2.len(), s);
         narf_libc::fflush(s);
     }
+
     0
 }
 

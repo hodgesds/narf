@@ -43,7 +43,11 @@ pub mod string;
 pub use arch::_start;
 pub use errno::{errno, set_errno};
 pub use heap::{free, malloc};
-pub use io::{printf_str, write, Arg, Stdout};
+// `io::fputs(&str, fd)` deliberately omitted — the `stdio::fputs`
+// FILE*-shaped one (re-exported below) is the canonical public
+// surface. The internal helper is still reachable as
+// `crate::io::fputs` for non-public call sites that haven't migrated.
+pub use io::{fprintf_str, printf_str, vprintf_str, write, Arg, Stdout};
 pub use process::{exit, getpid, getppid, getuid};
 pub use startup::__libc_start_main;
 // Note: `stdio::fputs` shadows the older `io::fputs(&str, fd)` helper

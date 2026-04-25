@@ -10327,6 +10327,22 @@ fn smoke_frame_x86_64_run_narf_libc_validate() -> TestResult {
         let mut w = narf_console::Writer;
         let _ = writeln!(w, "  [ OK ] smoke_frame_x86_64_run_narf_libc_validate");
         let _ = writeln!(w, "── narf-libc-validate: validate round-trip succeeded ──");
+        // The validate binary's stdout (routed to the kernel
+        // console) now contains the Stage-4 round-2 printf-shim
+        // probes covering width/precision/flag handling plus the
+        // new `o`/`b` conversions. The harness doesn't yet capture
+        // user stdout for grep, so the expected lines are noted
+        // here for log inspection:
+        //   padded: '   42'
+        //   zero: '00042'
+        //   left:  '42   |'
+        //   prec:  '002a'
+        //   octal: '52'
+        //   binary:'101010'
+        //   long:  '-1'
+        //   strpad:'hi        |abc'
+        //   altsign:'+7 0xdead'
+        //   fprintf:'123'
         unsafe { narf_arch::exit_kernel(0) }
     }
 
