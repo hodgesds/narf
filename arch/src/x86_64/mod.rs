@@ -12,8 +12,8 @@ pub mod user_mode;
 pub use asm::{halt_forever, disable_interrupts, enable_interrupts, cas128, patch_word};
 pub use cpuid::Features;
 pub use user_mode::{
-    enter_user_mode, enter_user_mode_resume, longjmp, setjmp, JmpBuf,
-    UserState, USER_RFLAGS,
+    enter_user_mode, enter_user_mode_resume, longjmp, set_user_fs_base,
+    setjmp, JmpBuf, UserState, IA32_FS_BASE, USER_RFLAGS,
 };
 
 /// x86_64's concrete `DomainPrimitive` type. All methods forward to

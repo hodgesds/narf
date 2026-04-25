@@ -43,6 +43,8 @@ pub mod interp;
 pub mod loader;
 pub mod process;
 pub mod syscall;
+#[cfg(target_arch = "x86_64")]
+pub mod tls;
 pub mod user_task;
 
 pub use interp::{lookup_interpreter, register_interpreter};
@@ -75,6 +77,8 @@ pub use process::{
     ProcessLoadError, SysVStackError, UserProcess,
     DEFAULT_USER_STACK_BASE, DEFAULT_USER_STACK_BYTES,
 };
+#[cfg(target_arch = "x86_64")]
+pub use tls::{stage_tls, TlsError, TLS_REGION_BASE};
 pub use syscall::{
     install_global, kernel_syscall_entry, kernel_syscall_entry_plain,
     FnHandler, RawFnHandler, RawSyscallHandler, Syscall, SyscallArgs,

@@ -391,6 +391,22 @@ impl core::future::Future for UserTaskFuture {
         // MOV CR3 on x86_64.
         let _ = this.process.address_space.activate();
 
+        // Program the per-task TLS thread pointer. Done after CR3
+        // is in place — `IA32_FS_BASE` doesn't depend on the
+        // page-table root, but pairing the writes here keeps the
+        // "this batch of MSRs reflects the outgoing user task"
+        // mental model intact. Skipped when the binary has no
+        // PT_TLS (`fs_base = None`), in which case the previous
+        // task's FS base is left in place; the user code wouldn't
+        // dereference `fs:` if its image declared no TLS.
+        if let Some(fs_base) = this.process.fs_base {
+            // SAFETY: writing IA32_FS_BASE is unconditional at
+            // CPL=0 long-mode; `fs_base` is a canonical user vaddr
+            // (came from `stage_tls` which mapped a region in the
+            // low-half user range).
+            unsafe { narf_scheduler::set_user_fs_base(fs_base); }
+        }
+
         // Interrupts off across the iretq. The trap handler
         // re-enables them on its swapgs path; the hook + longjmp
         // path keeps IF=0 (per the kernel-test build's "no LAPIC

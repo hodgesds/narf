@@ -9669,6 +9669,7 @@ fn smoke_userspace_user_task_future_yield_exit() -> TestResult {
         address_space: Arc::new(addr_space),
         entry:         narf_userspace::EntryPoint(VirtAddr::new(CODE_VADDR)),
         stack_top:     VirtAddr::new(stack_top),
+        fs_base:       None,
     };
     let address_space_clone = proc.address_space.clone();
 
@@ -9731,6 +9732,296 @@ fn smoke_userspace_user_task_future_yield_exit() -> TestResult {
 }
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
 kernel_test!(smoke_userspace_user_task_future_yield_exit);
+
+#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
+fn smoke_userspace_tls_round_trip() -> TestResult {
+    // Milestone 2 of the relibc-shaped userland rollout: a binary
+    // with PT_TLS gets a per-task TLS block + IA32_FS_BASE
+    // programmed before iretq, so user code can read its thread
+    // pointer via `mov rax, fs:[0]` (the SysV-AMD64 model — same
+    // shape relibc / `narf-libc::__libc_start_main` reads on entry).
+    //
+    // The test hand-builds a minimal ELF (one PT_LOAD covering the
+    // header + code, one PT_TLS naming a 32-byte sentinel image),
+    // runs it through `load_user_process_with`, and verifies the
+    // returned `proc.fs_base.is_some()` (the integration site
+    // contract). Then it activates the AS, programs FS_BASE with
+    // the staged thread pointer, and enters user mode through the
+    // setjmp/longjmp dance — same shape as
+    // `smoke_frame_x86_64_user_mode_yield_resume` — so the test
+    // exercises the kernel-side `set_user_fs_base` path
+    // independent of the polling-future glue.
+    use core::arch::naked_asm;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_userspace::{
+        install_global, syscall::__test_clear_global,
+        RawSyscallHandler, Syscall, SyscallTable, TrapContext,
+    };
+
+    // The user code emits two syscalls:
+    //   1. mov rdi, fs:[0]  ; mov rax, 104 (Yield) ; int 0x80
+    //      → captures the thread-pointer self-pointer; the kernel
+    //        saves user state + resumes at the next instruction.
+    //   2. mov rdi, fs:[-32] ; mov rax, 105 (Sleep) ; int 0x80
+    //      → captures the first qword of the file image (= 0xABABAB…),
+    //        kernel longjmps back to the test.
+    static SEEN_TP:        AtomicU64 = AtomicU64::new(0);
+    static SEEN_FILEIMAGE: AtomicU64 = AtomicU64::new(0);
+    static SAVED_CR3:      AtomicU64 = AtomicU64::new(0);
+    static mut SAVED_USER: UserState = UserState {
+        r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
+        rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0,
+        rip: 0, rflags: 0, rsp: 0, valid: 0,
+    };
+    static mut JMP: UserModeJmpBuf = UserModeJmpBuf {
+        rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, rsp: 0, rip: 0,
+    };
+    #[repr(C, align(16))]
+    struct ResumeStack([u64; 32]);
+    static mut RESUME_STACK: ResumeStack = ResumeStack([0; 32]);
+
+    // Yield handler: capture rdi as the thread-pointer read, then
+    // resume user mode at the saved RIP so the binary can issue its
+    // second syscall. The trap path enters/exits CPL=0 with FS_BASE
+    // intact (no `swapgs`-like demote on the FS hidden base), so we
+    // don't need to re-program it on the resume.
+    struct CaptureTpHandler;
+    impl RawSyscallHandler for CaptureTpHandler {
+        fn invoke(&self, ctx: &mut dyn TrapContext) {
+            SEEN_TP.store(ctx.args().arg0, Ordering::Release);
+            // SAFETY: SAVED_USER is a sized slot for this trap path.
+            unsafe {
+                ctx.save_user_state(core::ptr::addr_of_mut!(SAVED_USER) as *mut u8);
+            }
+            let stack_top = unsafe {
+                let p = core::ptr::addr_of_mut!(RESUME_STACK) as *mut u64;
+                p.add(32) as u64
+            };
+            let _ = ctx.redirect_to_kernel(
+                resume_landing as usize as u64,
+                stack_top,
+            );
+        }
+    }
+
+    // Sleep handler: capture rdi as the file-image read, longjmp
+    // back to the test's setjmp.
+    struct CaptureFileHandler;
+    impl RawSyscallHandler for CaptureFileHandler {
+        fn invoke(&self, ctx: &mut dyn TrapContext) {
+            SEEN_FILEIMAGE.store(ctx.args().arg0, Ordering::Release);
+            let _ = ctx.redirect_to_kernel(
+                resume_trampoline as usize as u64,
+                0xFFFF_FFFF_FFFF_FFF0,
+            );
+        }
+    }
+
+    #[unsafe(naked)]
+    unsafe extern "C" fn resume_landing() -> ! {
+        naked_asm!(
+            "lea rdi, [rip + {state}]",
+            "jmp {resume}",
+            state  = sym SAVED_USER,
+            resume = sym user_mode_resume,
+        );
+    }
+
+    #[unsafe(naked)]
+    unsafe extern "C" fn resume_trampoline() -> ! {
+        naked_asm!(
+            "lea rdi, [rip + {jmp}]",
+            "mov rsi, 1",
+            "jmp {lj}",
+            jmp = sym JMP,
+            lj  = sym user_mode_longjmp,
+        );
+    }
+
+    SEEN_TP.store(0, Ordering::Relaxed);
+    SEEN_FILEIMAGE.store(0, Ordering::Relaxed);
+    __test_clear_global();
+
+    let original_cr3: u64;
+    unsafe {
+        core::arch::asm!("mov {v}, cr3", v = out(reg) original_cr3,
+            options(nostack, preserves_flags));
+    }
+    SAVED_CR3.store(original_cr3, Ordering::Release);
+
+    // ── Hand-build a minimal ELF64 little-endian executable ──────
+    //
+    // Layout (4096 bytes total = one PT_LOAD page):
+    //   0x0000   ELF header (64 bytes)
+    //   0x0040   Program header 0 — PT_LOAD  (56 bytes)
+    //   0x0078   Program header 1 — PT_TLS   (56 bytes)
+    //   0x00B0   padding to code start
+    //   0x0100   user code (entry point sits here)
+    //   0x0200   PT_TLS file image: 32 bytes of 0xAB
+    //   …        rest of page is unused / zero.
+    //
+    // PT_LOAD covers vaddr [0x40_0000_0000 .. 0x40_0000_1000) with
+    // file_off = 0, file_size = 4096, mem_size = 4096 — so the
+    // entire ELF byte slice is mapped + the TLS template is reachable
+    // for the loader's "copy file_size bytes" path on PT_LOAD AND
+    // for `stage_tls`'s read of `bytes[file_off ..]` for PT_TLS.
+    // PT_LOAD lives in PML4[1] (vaddr 0x80_0000_0000), well clear of
+    // PML4[0]'s kernel low-4-GiB identity map — that PML4 entry is
+    // copied into the user AS by `new_user_pml4` with USER=0, so a
+    // user-mode access through it #PFs even with a USER=1 leaf. The
+    // testbin's linker script lands at the same PML4 slot (one page
+    // higher) for the same reason.
+    const ELF_LEN:       usize = 4096;
+    const LOAD_VADDR:    u64   = 0x0000_0080_0000_0000;
+    const CODE_OFF:      usize = 0x100;
+    const TLS_FILE_OFF:  usize = 0x200;
+    const TLS_FILE_SIZE: u64   = 32;
+    const TLS_MEM_SIZE:  u64   = 32;
+    const TLS_ALIGN:     u64   = 8;
+
+    let mut elf = alloc::vec![0u8; ELF_LEN];
+
+    // ── ELF header ───────────────────────────────────────────────
+    elf[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
+    elf[4]  = 2;          // EI_CLASS = ELFCLASS64
+    elf[5]  = 1;          // EI_DATA  = ELFDATA2LSB
+    elf[6]  = 1;          // EI_VERSION = EV_CURRENT
+    // e_type = ET_EXEC (2)
+    elf[0x10..0x12].copy_from_slice(&2u16.to_le_bytes());
+    // e_machine = EM_X86_64 (62)
+    elf[0x12..0x14].copy_from_slice(&62u16.to_le_bytes());
+    // e_version = 1
+    elf[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+    // e_entry = LOAD_VADDR + CODE_OFF
+    elf[0x18..0x20].copy_from_slice(&(LOAD_VADDR + CODE_OFF as u64).to_le_bytes());
+    // e_phoff = 64
+    elf[0x20..0x28].copy_from_slice(&64u64.to_le_bytes());
+    // e_shoff = 0
+    elf[0x28..0x30].copy_from_slice(&0u64.to_le_bytes());
+    // e_flags = 0; e_ehsize = 64; e_phentsize = 56; e_phnum = 2;
+    // e_shentsize = 0; e_shnum = 0; e_shstrndx = 0.
+    elf[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());     // e_ehsize
+    elf[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());     // e_phentsize
+    elf[0x38..0x3A].copy_from_slice(&2u16.to_le_bytes());      // e_phnum
+
+    // ── Program header 0 — PT_LOAD ──────────────────────────────
+    let ph0 = 64;
+    elf[ph0      ..ph0 +  4].copy_from_slice(&1u32.to_le_bytes());            // p_type = PT_LOAD
+    elf[ph0 +  4 ..ph0 +  8].copy_from_slice(&7u32.to_le_bytes());            // p_flags = R+W+X
+    elf[ph0 +  8 ..ph0 + 16].copy_from_slice(&0u64.to_le_bytes());            // p_offset
+    elf[ph0 + 16 ..ph0 + 24].copy_from_slice(&LOAD_VADDR.to_le_bytes());      // p_vaddr
+    elf[ph0 + 24 ..ph0 + 32].copy_from_slice(&LOAD_VADDR.to_le_bytes());      // p_paddr
+    elf[ph0 + 32 ..ph0 + 40].copy_from_slice(&(ELF_LEN as u64).to_le_bytes());// p_filesz
+    elf[ph0 + 40 ..ph0 + 48].copy_from_slice(&(ELF_LEN as u64).to_le_bytes());// p_memsz
+    elf[ph0 + 48 ..ph0 + 56].copy_from_slice(&0x1000u64.to_le_bytes());       // p_align
+
+    // ── Program header 1 — PT_TLS ───────────────────────────────
+    let ph1 = 64 + 56;
+    elf[ph1      ..ph1 +  4].copy_from_slice(&7u32.to_le_bytes());            // p_type = PT_TLS
+    elf[ph1 +  4 ..ph1 +  8].copy_from_slice(&4u32.to_le_bytes());            // p_flags = R
+    elf[ph1 +  8 ..ph1 + 16].copy_from_slice(&(TLS_FILE_OFF as u64).to_le_bytes()); // p_offset
+    elf[ph1 + 16 ..ph1 + 24].copy_from_slice(&(LOAD_VADDR + TLS_FILE_OFF as u64).to_le_bytes()); // p_vaddr (link-time)
+    elf[ph1 + 24 ..ph1 + 32].copy_from_slice(&(LOAD_VADDR + TLS_FILE_OFF as u64).to_le_bytes()); // p_paddr
+    elf[ph1 + 32 ..ph1 + 40].copy_from_slice(&TLS_FILE_SIZE.to_le_bytes());   // p_filesz
+    elf[ph1 + 40 ..ph1 + 48].copy_from_slice(&TLS_MEM_SIZE.to_le_bytes());    // p_memsz
+    elf[ph1 + 48 ..ph1 + 56].copy_from_slice(&TLS_ALIGN.to_le_bytes());       // p_align
+
+    // ── TLS file image — 32 bytes of 0xAB sentinel ──────────────
+    for i in 0..TLS_FILE_SIZE as usize {
+        elf[TLS_FILE_OFF + i] = 0xAB;
+    }
+
+    // ── User code at CODE_OFF ───────────────────────────────────
+    //
+    // FS-segment-override prefix is `0x64` (Intel SDM Vol. 2A §2.1.1
+    // — `0x65` is GS, easy to mis-paste). Hand-assembled:
+    //   64 48 8B 3C 25 00 00 00 00   mov rdi, qword ptr fs:[0]
+    //   48 C7 C0 68 00 00 00          mov rax, 104              ; Syscall::Yield
+    //   CD 80                         int 0x80
+    //   64 48 8B 3C 25 E0 FF FF FF    mov rdi, qword ptr fs:[-32]
+    //   48 C7 C0 69 00 00 00          mov rax, 105              ; Syscall::Sleep
+    //   CD 80                         int 0x80
+    //   EB FE                         jmp $
+    let code: [u8; 38] = [
+        0x64, 0x48, 0x8B, 0x3C, 0x25, 0x00, 0x00, 0x00, 0x00,    // mov rdi, fs:[0]
+        0x48, 0xC7, 0xC0, 0x68, 0x00, 0x00, 0x00,                // mov rax, 104
+        0xCD, 0x80,                                              // int 0x80
+        0x64, 0x48, 0x8B, 0x3C, 0x25, 0xE0, 0xFF, 0xFF, 0xFF,    // mov rdi, fs:[-32]
+        0x48, 0xC7, 0xC0, 0x69, 0x00, 0x00, 0x00,                // mov rax, 105
+        0xCD, 0x80,                                              // int 0x80
+        0xEB, 0xFE,                                              // jmp $ (unreached)
+    ];
+    elf[CODE_OFF..CODE_OFF + code.len()].copy_from_slice(&code);
+
+    // ── Drive the loader + verify the integration site ──────────
+    let proc = match unsafe {
+        narf_userspace::load_user_process_with(&elf[..], &[], &[], &[])
+    } {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("load_user_process_with"),
+    };
+
+    let fs_base = match proc.fs_base {
+        Some(v) => v,
+        None    => return TestResult::Fail("fs_base not set on PT_TLS binary"),
+    };
+
+    // Install the two syscall handlers *after* the loader runs so
+    // it (which uses the global table for nothing) doesn't matter
+    // either way; what matters is the table is set before iretq.
+    let mut t = SyscallTable::new();
+    t.install_raw(Syscall::Yield, "tls-tp",   CaptureTpHandler);
+    t.install_raw(Syscall::Sleep, "tls-file", CaptureFileHandler);
+    install_global(t);
+
+    // setjmp — sleep handler longjmps back here on the second
+    // syscall capture.
+    let saved = unsafe { user_mode_setjmp(core::ptr::addr_of_mut!(JMP)) };
+    if saved != 0 {
+        unsafe {
+            let cr3 = SAVED_CR3.load(Ordering::Acquire);
+            core::arch::asm!("mov cr3, {v}", v = in(reg) cr3,
+                options(nostack, preserves_flags));
+            const IA32_KERNEL_GS_BASE: u32 = 0xC0000102;
+            core::arch::asm!(
+                "wrmsr",
+                in("ecx") IA32_KERNEL_GS_BASE,
+                in("eax") 0u32,
+                in("edx") 0u32,
+                options(nostack, preserves_flags),
+            );
+            // IF stays 0 — kernel-test build never enabled the LAPIC
+            // timer (commit 401b073's invariant).
+            core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+        }
+        __test_clear_global();
+        let tp   = SEEN_TP.load(Ordering::Acquire);
+        let file = SEEN_FILEIMAGE.load(Ordering::Acquire);
+        if tp != fs_base {
+            return TestResult::Fail("fs:[0] != fs_base (TCB self-pointer wrong)");
+        }
+        if file != 0xABAB_ABAB_ABAB_ABAB {
+            return TestResult::Fail("fs:[-32] sentinel mismatch");
+        }
+        return TestResult::Pass;
+    }
+
+    // Activate the AS + program FS_BASE before iretq. The split-form
+    // (`set_user_fs_base` followed by `enter_user_mode`) is the
+    // recommended shape — the polling future + testbin runner use
+    // exactly this two-step sequence.
+    if proc.address_space.activate().is_err() {
+        return TestResult::Fail("activate");
+    }
+    unsafe { narf_scheduler::set_user_fs_base(fs_base); }
+    unsafe { core::arch::asm!("cli"); }
+
+    let entry = proc.entry.0.as_u64();
+    let rsp   = proc.stack_top.as_u64();
+    unsafe { user_mode_enter(entry, rsp) }
+}
+#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
+kernel_test!(smoke_userspace_tls_round_trip);
 
 // ── Real Rust user binary run through the full pipeline ──────────────
 

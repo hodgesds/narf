@@ -45,6 +45,13 @@ pub struct UserProcess {
     /// Virtual address of the highest user-stack byte (RSP starts
     /// here). RSP grows downward into the mapped region.
     pub stack_top:    VirtAddr,
+    /// Per-task TLS thread-pointer (FS base on x86_64). `Some` when
+    /// the binary's PT_TLS template was staged; `None` when the
+    /// binary has no thread-local storage. The polling future and
+    /// the testbin runner write this into `IA32_FS_BASE` before
+    /// each user-mode entry so `mov rax, fs:[N]` lands in the
+    /// per-task TLS block.
+    pub fs_base:      Option<u64>,
 }
 
 /// Errors from `load_user_process`.
@@ -56,6 +63,16 @@ pub enum ProcessLoadError {
     StackMaterializeFailed,
     /// argv / envp / aux total exceeded the user stack region.
     StackOverflow,
+    /// PT_TLS staging (allocate + map + populate the per-task TLS
+    /// block) failed. Per-thread TLS is required by relibc Path B,
+    /// so a binary with `PT_TLS` that fails to stage is unrunnable.
+    #[cfg(target_arch = "x86_64")]
+    Tls(crate::tls::TlsError),
+}
+
+#[cfg(target_arch = "x86_64")]
+impl From<crate::tls::TlsError> for ProcessLoadError {
+    fn from(e: crate::tls::TlsError) -> Self { ProcessLoadError::Tls(e) }
 }
 
 impl From<LoadBytesError> for ProcessLoadError {
@@ -210,11 +227,30 @@ pub unsafe fn load_user_process_with(
             .map_err(|_| ProcessLoadError::StackOverflow)?
     };
 
+    // PT_TLS staging: if the binary names a TLS template, allocate
+    // a per-task block and program a thread pointer (returned as
+    // `fs_base`). The polling future + testbin runner plant this
+    // into `IA32_FS_BASE` on each user-mode entry. A binary without
+    // PT_TLS keeps `fs_base = None` and the entry path skips the
+    // wrmsr. aarch64 wires its tpidr_el0 equivalent in a follow-up
+    // round; until then `fs_base` stays `None` on non-x86_64.
+    #[cfg(target_arch = "x86_64")]
+    let fs_base = if image.tls.is_some() {
+        // SAFETY: low-4-GiB identity map + frame allocator are the
+        // same Stage-4 invariants the rest of this routine rides on.
+        Some(unsafe { crate::tls::stage_tls(&image, bytes, &address_space) }?)
+    } else {
+        None
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let fs_base: Option<u64> = None;
+
     Ok(UserProcess {
         pid:           alloc_pid(),
         address_space,
         entry,
         stack_top:     VirtAddr::new(rsp),
+        fs_base,
     })
 }
 

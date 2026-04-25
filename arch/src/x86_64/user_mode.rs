@@ -16,6 +16,54 @@
 #![allow(unused)]
 
 use core::arch::{asm, naked_asm};
+use core::sync::atomic::{compiler_fence, Ordering};
+
+/// MSR index `IA32_FS_BASE` (Intel SDM Vol. 4 §2.6, "MSRs Common to
+/// the IA-32 Family"). On x86_64 Linux and the SysV-AMD64 TLS model,
+/// the FS segment base is the thread pointer — `mov rax, fs:[0]`
+/// fetches `*(fs_base + 0)` which the ABI defines as the TCB self-
+/// pointer. Writing this MSR is the canonical way to plant a per-
+/// thread pointer in CPL=0 / CPL=3 transitions; the `wrfsbase`
+/// instruction is gated on `CR4.FSGSBASE = 1` and so is not relied
+/// upon here.
+pub const IA32_FS_BASE: u32 = 0xC000_0100;
+
+/// Program `IA32_FS_BASE` so the next user-mode entry observes
+/// `fs:[N]` reading from `fs_base + N`. The kernel calls this just
+/// before `enter_user_mode` / `enter_user_mode_resume` whenever the
+/// outgoing task carries a TLS block (relibc Path B / `narf-libc`'s
+/// `__libc_start_main` reads `*(fs:0)` for its TCB).
+///
+/// This is a thin `wrmsr` wrapper kept separate from
+/// `enter_user_mode` so we don't have to break the existing naked-
+/// asm signature (every call site would otherwise need to update);
+/// the polling future + testbin runner call this immediately after
+/// activating the AS and before the iretq trampoline.
+///
+/// # Safety
+/// Writing `IA32_FS_BASE` is always legal at CPL=0 on long-mode
+/// x86_64 (no CPUID gate — it's part of the architectural baseline).
+/// The supplied `fs_base` must be a canonical user vaddr if the
+/// next user-mode access through `fs:` is to land on a mapped page;
+/// nothing here validates that.
+#[inline]
+pub unsafe fn set_user_fs_base(fs_base: u64) {
+    let low  = fs_base as u32;
+    let high = (fs_base >> 32) as u32;
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: IA32_FS_BASE is unconditional on x86_64-long-mode; the
+    // caller owns the canonical-vaddr precondition.
+    unsafe {
+        asm!(
+            "wrmsr",
+            in("ecx") IA32_FS_BASE,
+            in("eax") low,
+            in("edx") high,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    compiler_fence(Ordering::SeqCst);
+}
 
 /// Snapshot of a user-mode task's CPU state at trap time. Field
 /// order is load-bearing — `enter_user_mode_resume`'s naked asm

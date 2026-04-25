@@ -57,8 +57,8 @@ pub use narf_capabilities::Invoke;
 // exists (`narf-scheduler` → `narf-arch`); this just exposes it.
 #[cfg(target_arch = "x86_64")]
 pub use narf_arch::x86_64::{
-    enter_user_mode, enter_user_mode_resume, longjmp, setjmp, JmpBuf,
-    UserState, USER_RFLAGS,
+    enter_user_mode, enter_user_mode_resume, longjmp, set_user_fs_base,
+    setjmp, JmpBuf, UserState, USER_RFLAGS,
 };
 
 // `halt_forever` is the right "I should never reach here" sink for

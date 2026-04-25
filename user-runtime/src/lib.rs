@@ -523,6 +523,59 @@ pub fn ring_kick() -> u64 {
     unsafe { syscall0(SYS_RING_KICK) }
 }
 
+// ── Thread-local-storage ───────────────────────────────────────────
+//
+// SysV-AMD64 uses `fs` as the thread pointer; the kernel programs
+// `IA32_FS_BASE` before each user-mode entry (see
+// `narf_userspace::tls::stage_tls`). The TCB self-pointer at
+// `*(fs:0)` equals `fs_base` itself — relibc / `narf-libc` reads it
+// to discover the canonical TCB address without depending on the
+// per-arch wrfsbase instruction.
+
+/// Read the SysV-AMD64 thread pointer (`fs:[0]` on x86_64). Returns
+/// the kernel-staged TCB self-pointer; for an inhabited TLS block
+/// this equals the FS base.
+///
+/// On aarch64 the equivalent is `tpidr_el0`.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn thread_pointer() -> *mut u8 {
+    let tp: u64;
+    // SAFETY: `mov rax, fs:[0]` has no memory effect outside loading
+    // 8 bytes from a mapped TLS slot — when no TLS is staged the
+    // load reads whatever the previous task's FS base pointed at,
+    // which is a kernel bug, not a UB hazard at this call site.
+    // Reading from the segment base never traps if the base is a
+    // valid canonical address (the TLS staging path enforces that).
+    unsafe {
+        core::arch::asm!(
+            "mov {tp}, fs:[0]",
+            tp = out(reg) tp,
+            options(nostack, preserves_flags, readonly),
+        );
+    }
+    tp as *mut u8
+}
+
+/// aarch64 equivalent reads `TPIDR_EL0` (the architectural thread
+/// pointer; mirrors what the kernel programs on EL0 entry).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn thread_pointer() -> *mut u8 {
+    let tp: u64;
+    // SAFETY: TPIDR_EL0 is unconditionally readable at EL0; the
+    // kernel writes it on each user-mode entry the same way x86_64
+    // writes IA32_FS_BASE.
+    unsafe {
+        core::arch::asm!(
+            "mrs {tp}, tpidr_el0",
+            tp = out(reg) tp,
+            options(nostack, preserves_flags),
+        );
+    }
+    tp as *mut u8
+}
+
 // ── Output convenience ─────────────────────────────────────────────
 
 /// `core::fmt::Write` adapter for stdout (`fd = 1`). Use with
