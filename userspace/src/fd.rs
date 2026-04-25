@@ -12,11 +12,12 @@
 //! calls `attach_to(current_task, ops)` after VFS resolves a path.
 //! `detach(task_id)` removes the whole table on task exit.
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use narf_filesystem::FileOps;
+use narf_filesystem::{FileOps, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
 
 /// Per-task fd table entry.
@@ -104,13 +105,56 @@ pub fn init() {
     *TABLES.lock() = Some(BTreeMap::new());
 }
 
-/// Look up + run `op` against the table for `task_id`. Creates an
-/// empty table on first reference. Returns the closure's value.
+/// Look up + run `op` against the table for `task_id`. Creates a
+/// fresh table — pre-populated with stdio at fds 0/1/2 — on first
+/// reference. Returns the closure's value.
 pub fn with_table<R>(task_id: u64, op: impl FnOnce(&mut FdTable) -> R) -> Option<R> {
     let mut g = TABLES.lock();
     let map = g.as_mut()?;
-    let table = map.entry(task_id).or_insert_with(FdTable::new);
+    let table = map.entry(task_id).or_insert_with(|| {
+        let mut t = FdTable::new();
+        // Stage-4 default: all three stdio slots route to the
+        // kernel console. stdin reads return 0 (EOF) until a
+        // real keyboard/serial backing lands.
+        let console: Arc<dyn FileOps> = Arc::new(ConsoleFile);
+        t.set(0, FdEntry { ops: console.clone(), offset: 0 });
+        t.set(1, FdEntry { ops: console.clone(), offset: 0 });
+        t.set(2, FdEntry { ops: console,         offset: 0 });
+        t
+    });
     Some(op(table))
+}
+
+/// Per-task default stdio backing. Reads always return 0 (EOF);
+/// writes go to the kernel console via `narf_console::Writer`.
+/// Replaces the historical hardcoded fd=1/2 console fast-path
+/// inside `sys_write` — sys_write now routes everything through
+/// the fd table uniformly.
+struct ConsoleFile;
+
+impl core::fmt::Debug for ConsoleFile {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ConsoleFile").finish()
+    }
+}
+
+impl FileOps for ConsoleFile {
+    fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move { Ok(0) })  // EOF
+    }
+    fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+        let n = buf.len();
+        // Eagerly write: the future just reports the count.
+        use core::fmt::Write as _;
+        let mut w = narf_console::Writer;
+        for &b in buf {
+            let _ = w.write_char(b as char);
+        }
+        Box::pin(async move { Ok(n) })
+    }
+    fn stat(&self) -> Stat {
+        Stat { size: 0, blocks: 0, mode: Mode::FILE_RW, mtime_cycles: 0 }
+    }
 }
 
 /// Drop the entire fd table for `task_id`. Call on task exit so

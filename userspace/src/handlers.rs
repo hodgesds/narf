@@ -27,7 +27,6 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-use narf_console::Writer;
 use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
 
 use crate::{
@@ -559,18 +558,9 @@ fn sys_write(ctx: &mut dyn TrapContext) {
     // still active (trap didn't swap CR3) so the walk resolves.
     let slice = unsafe { core::slice::from_raw_parts(ptr, len) };
 
-    if fd == 1 || fd == 2 {
-        use core::fmt::Write as _;
-        let mut w = Writer;
-        for &b in slice {
-            let _ = w.write_char(b as char);
-        }
-        ctx.set_return(SyscallReturn::ok(len as u64));
-        return;
-    }
-
-    // Look up the fd in the calling task's table, advance the
-    // offset, return bytes-written.
+    // Stdio (fd 0/1/2) is auto-installed in fresh fd tables by
+    // `fd::with_table`, so all fds — including stdio — route
+    // through the same per-task table path.
     let task = current_task_id();
     let outcome = fd::with_table(task, |t| {
         let entry = match t.get_mut(fd) {
