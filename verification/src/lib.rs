@@ -7623,6 +7623,60 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
     // Bootstrap registry needs initialising so SYS_BOOTSTRAP from
     // the testbin can find a place to stash its per-task ring pair.
     narf_userspace::bootstrap_init();
+    // Per-task fd table store needs initialising so SYS_OPEN from
+    // the testbin can install a fd entry in its (task=0) table.
+    narf_userspace::fd::__test_reset();
+    narf_userspace::fd::init();
+    // Mount a stub FS under /testbin with a file "f" carrying a
+    // known payload so the testbin's open + read can round-trip
+    // a real VFS path from CPL=3.
+    {
+        use alloc::boxed::Box;
+        use alloc::sync::Arc;
+        use narf_capabilities::{Cap, Grant};
+        use narf_filesystem::{
+            bootstrap_mount_authority, registry, DirEntry, DirOps, FileOps,
+            FsFuture, FsInstance, MountPoint, Stat,
+        };
+        static FILE_BYTES: &[u8] = b"hello-fs";
+        struct StubFile;
+        impl FileOps for StubFile {
+            fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+                Box::pin(async move {
+                    let off = offset as usize;
+                    if off >= FILE_BYTES.len() { return Ok(0); }
+                    let n = core::cmp::min(buf.len(), FILE_BYTES.len() - off);
+                    buf[..n].copy_from_slice(&FILE_BYTES[off..off + n]);
+                    Ok(n)
+                })
+            }
+            fn write<'a>(&'a self, _o: u64, b: &'a [u8]) -> FsFuture<'a, usize> {
+                let n = b.len();
+                Box::pin(async move { Ok(n) })
+            }
+            fn stat(&self) -> Stat {
+                Stat { size: FILE_BYTES.len() as u64, blocks: 1,
+                       mode: narf_filesystem::Mode::FILE_RO,
+                       mtime_cycles: 0 }
+            }
+        }
+        struct StubDir;
+        impl DirOps for StubDir {
+            fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+                if name == "f" { Some(Arc::new(StubFile)) } else { None }
+            }
+            fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
+                Box::new(core::iter::empty())
+            }
+        }
+        struct StubFs;
+        impl FsInstance for StubFs {
+            fn root(&self) -> Arc<dyn DirOps> { Arc::new(StubDir) }
+            fn name(&self) -> &str { "testbin_stub" }
+        }
+        let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+        let _ = registry().mount(&auth, "/testbin", StubFs);
+    }
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
     install_global(t);

@@ -29,6 +29,12 @@ const SYS_MMAP:      u64 = 120;
 #[cfg(target_arch = "x86_64")]
 const SYS_BOOTSTRAP: u64 = 101;
 #[cfg(target_arch = "x86_64")]
+const SYS_OPEN:      u64 = 110;
+#[cfg(target_arch = "x86_64")]
+const SYS_READ:      u64 = 111;
+#[cfg(target_arch = "x86_64")]
+const SYS_CLOSE:     u64 = 113;
+#[cfg(target_arch = "x86_64")]
 const NARF_MAGIC:    u32 = 0x4E_41_52_46;  // "NARF" LE
 
 #[cfg(target_arch = "x86_64")]
@@ -44,6 +50,24 @@ unsafe fn syscall3(num: u64, a0: u64, a1: u64, a2: u64) -> u64 {
             "int 0x80",
             inout("rax") rax,
             in("rdi") a0, in("rsi") a1, in("rdx") a2,
+            out("rcx") _, out("r11") _,
+            options(nostack, preserves_flags),
+        );
+    }
+    rax
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn syscall4(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    let mut rax: u64 = num;
+    // SAFETY: see `syscall3`. r10 is the 4th-arg register in NARF's
+    // syscall ABI (mirrors Linux's amd64 convention).
+    unsafe {
+        asm!(
+            "int 0x80",
+            inout("rax") rax,
+            in("rdi") a0, in("rsi") a1, in("rdx") a2, in("r10") a3,
             out("rcx") _, out("r11") _,
             options(nostack, preserves_flags),
         );
@@ -109,6 +133,16 @@ pub extern "C" fn _start() -> ! {
     const BOK:    &[u8] = b"boot: ok\n";
     #[cfg(target_arch = "x86_64")]
     const BBAD:   &[u8] = b"boot: bad\n";
+    #[cfg(target_arch = "x86_64")]
+    const FOK:    &[u8] = b"fs: ok\n";
+    #[cfg(target_arch = "x86_64")]
+    const FBAD:   &[u8] = b"fs: bad\n";
+    #[cfg(target_arch = "x86_64")]
+    const FILE_PATH: &[u8] = b"f";
+    #[cfg(target_arch = "x86_64")]
+    const MOUNT:     &[u8] = b"/testbin";
+    #[cfg(target_arch = "x86_64")]
+    const FILE_BYTES: &[u8] = b"hello-fs";
     // SAFETY: we're the user program, the kernel has set up the
     // int-0x80 gate, and the message lives in our RX segment.
     unsafe {
@@ -131,6 +165,28 @@ pub extern "C" fn _start() -> ! {
             let (mp, ml) = if ok { (BOK.as_ptr(), BOK.len()) }
                            else   { (BBAD.as_ptr(), BBAD.len()) };
             syscall3(SYS_WRITE, 1, mp as u64, ml as u64);
+
+            // VFS round-trip: open + read + close from real user
+            // mode. Mounted under "/testbin"; "f" is the file name.
+            let fd = syscall4(SYS_OPEN,
+                FILE_PATH.as_ptr() as u64, FILE_PATH.len() as u64,
+                MOUNT.as_ptr()     as u64, MOUNT.len()     as u64);
+            let mut buf = [0u8; 16];
+            let mut fs_ok = false;
+            if fd != !0u64 {
+                let n = syscall3(SYS_READ,
+                    fd, buf.as_mut_ptr() as u64, buf.len() as u64);
+                if n == FILE_BYTES.len() as u64 {
+                    fs_ok = true;
+                    for i in 0..(n as usize) {
+                        if buf[i] != FILE_BYTES[i] { fs_ok = false; break; }
+                    }
+                }
+                let _ = syscall3(SYS_CLOSE, fd, 0, 0);
+            }
+            let (fp, fl) = if fs_ok { (FOK.as_ptr(), FOK.len()) }
+                           else      { (FBAD.as_ptr(), FBAD.len()) };
+            syscall3(SYS_WRITE, 1, fp as u64, fl as u64);
         }
         syscall3(SYS_WRITE, 1, MSG.as_ptr() as u64, MSG.len() as u64);
         syscall0(SYS_EXIT_TASK);
