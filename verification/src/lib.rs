@@ -5363,6 +5363,105 @@ fn smoke_memory_address_space_region_table() -> TestResult {
 }
 kernel_test!(smoke_memory_address_space_region_table);
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_bootstrap_returns_config_page() -> TestResult {
+    // Bootstrap: allocate config page in the caller's AS, write a
+    // header into it (magic / version / task_id), return user
+    // vaddr. We don't activate the AS — we just walk it via
+    // `translate` to find the backing phys frame and verify the
+    // header bytes.
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_memory::{x86_64::paging, AddressSpace, VirtAddr};
+    use narf_userspace::{
+        install_address_space_lookup, install_core_syscalls, install_global,
+        install_task_id_lookup, kernel_syscall_entry,
+        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn,
+        SyscallTable, TrapContext,
+    };
+
+    static USER_AS_BS: narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>>
+        = narf_lib::sync::IrqSafeSpinLock::new(None);
+    fn as_lookup() -> Option<Arc<AddressSpace>> { USER_AS_BS.lock().clone() }
+
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0xCAFE);
+    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+
+    let addr_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => return TestResult::Fail("new_for_user failed"),
+    };
+    *USER_AS_BS.lock() = Some(addr_space.clone());
+
+    install_address_space_lookup(as_lookup);
+    install_task_id_lookup(task_lookup);
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+    let mut ctx = FakeCtx { args: SyscallArgs::default(), ret: None };
+    kernel_syscall_entry(Syscall::Bootstrap.raw(), &mut ctx);
+
+    let user_vaddr = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value,
+        _ => {
+            *USER_AS_BS.lock() = None;
+            __test_clear_global();
+            return TestResult::Fail("Bootstrap did not return Ok");
+        }
+    };
+    if user_vaddr == 0 {
+        *USER_AS_BS.lock() = None;
+        __test_clear_global();
+        return TestResult::Fail("Bootstrap returned null user_vaddr");
+    }
+
+    // Walk the AS to find the backing phys frame.
+    let phys = match unsafe { paging::translate(addr_space.root, VirtAddr::new(user_vaddr)) } {
+        Some(p) => p,
+        None => {
+            *USER_AS_BS.lock() = None;
+            __test_clear_global();
+            return TestResult::Fail("Bootstrap config page not mapped in AS");
+        }
+    };
+
+    // Read header through identity map.
+    #[repr(C)]
+    struct Hdr { magic: u32, version: u32, task_id: u64,
+                 sq_cap: u64, cq_cap: u64, sq_pages: u32, cq_pages: u32 }
+    let hdr = unsafe { core::ptr::read_volatile(phys.raw() as *const Hdr) };
+
+    if hdr.magic != 0x4E_41_52_46 {
+        *USER_AS_BS.lock() = None;
+        __test_clear_global();
+        return TestResult::Fail("config page magic mismatch");
+    }
+    if hdr.version != 1 {
+        *USER_AS_BS.lock() = None;
+        __test_clear_global();
+        return TestResult::Fail("config page version mismatch");
+    }
+    if hdr.task_id != 0xCAFE {
+        *USER_AS_BS.lock() = None;
+        __test_clear_global();
+        return TestResult::Fail("config page task_id mismatch");
+    }
+
+    *USER_AS_BS.lock() = None;
+    __test_clear_global();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_userspace_bootstrap_returns_config_page);
+
 fn smoke_filesystem_resolve_absolute_picks_longest_prefix() -> TestResult {
     // Mount two FSes — one at `/test_pa` and one nested under
     // `/test_pa/sub`. `resolve_absolute("/test_pa/sub/x")` must

@@ -133,6 +133,90 @@ pub fn clear_exit_landing() {
     EXIT_LANDING_RSP.store(0, Ordering::Release);
 }
 
+// ── Bootstrap — slow-path entry mint per-task config page ──────────
+//
+// Spec: `abi/specification/spec.md` §3.1. The full Stage-4
+// bootstrap mints SubmissionQueue + CompletionQueue ring caps + a
+// read-only config page cap. The minimum useful first cut is the
+// config-page side: allocate a 4 KiB page in the caller's AS, map
+// it R+U, write a header with task-id + ABI version + per-task
+// fixed magic so the user library can verify the kernel handed it
+// the page. Returns the user virt address.
+//
+// Future revision will return SQ + CQ caps too via the inline
+// result words; today we just return the page pointer. The shape
+// is `arg0..=arg5` ignored on entry; on success `value` =
+// config-page user vaddr.
+
+const ABI_BOOTSTRAP_MAGIC: u32 = 0x4E_41_52_46;  // "NARF" LE
+const ABI_BOOTSTRAP_VERSION: u32 = 1;
+
+#[repr(C)]
+struct BootstrapHeader {
+    magic:    u32,
+    version:  u32,
+    task_id:  u64,
+    /// Reserved for future pinning of (sq_cap, cq_cap, sq_size,
+    /// cq_size). Stage-4-first-cut leaves them zero.
+    sq_cap:   u64,
+    cq_cap:   u64,
+    sq_pages: u32,
+    cq_pages: u32,
+}
+
+fn sys_bootstrap(ctx: &mut dyn TrapContext) {
+    let as_ref = match current_address_space() {
+        Some(a) => a,
+        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+    };
+    let task = current_task_id();
+
+    // Allocate a phys frame, zero it, install at a fresh user vaddr
+    // (mmap-cursor-style — same scheme `sys_mmap` uses).
+    let phys = match narf_memory::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+    };
+    // SAFETY: identity-mapped low 4 GiB; phys is page-aligned.
+    unsafe {
+        core::ptr::write_bytes(phys.raw() as *mut u8, 0, 4096);
+    }
+    let user_vaddr = MMAP_CURSOR.fetch_add(0x1000, Ordering::Relaxed);
+
+    if as_ref.map_region(Region {
+        base:  VirtAddr::new(user_vaddr),
+        len:   0x1000,
+        // Stage-4 first cut: writable. Future revision flips the
+        // page to R-only after the kernel populates it; the user
+        // ring builders read from it but don't write.
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys,
+    }).is_err() {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    if unsafe { as_ref.materialize() }.is_err() {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+
+    // Write the bootstrap header into the freshly-mapped phys
+    // (still identity-reachable from kernel mode).
+    // SAFETY: identity-mapped low 4 GiB; aligned u64 + u32 stores.
+    unsafe {
+        let header = phys.raw() as *mut BootstrapHeader;
+        (*header).magic    = ABI_BOOTSTRAP_MAGIC;
+        (*header).version  = ABI_BOOTSTRAP_VERSION;
+        (*header).task_id  = task;
+        (*header).sq_cap   = 0;
+        (*header).cq_cap   = 0;
+        (*header).sq_pages = 0;
+        (*header).cq_pages = 0;
+    }
+
+    ctx.set_return(SyscallReturn::ok(user_vaddr));
+}
+
 // ── Open — arg0=path-ptr, arg1=path-len, arg2=mount-path-ptr,
 //          arg3=mount-path-len ───────────────────────────────────────
 //
@@ -394,6 +478,7 @@ fn sys_noop_ok(ctx: &mut dyn TrapContext) {
 /// subsystems can install richer handlers over the same slots
 /// (e.g. a real file-descriptor-backed `Read`).
 pub fn install_core_syscalls(table: &mut SyscallTable) {
+    table.install_raw(Syscall::Bootstrap, "bootstrap", RawFnHandler(sys_bootstrap));
     table.install_raw(Syscall::OpenFile, "open",     RawFnHandler(sys_open));
     table.install_raw(Syscall::Write,    "write",    RawFnHandler(sys_write));
     table.install_raw(Syscall::Read,     "read",     RawFnHandler(sys_read));
