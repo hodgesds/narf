@@ -7579,6 +7579,229 @@ fn smoke_userspace_apply_relative_relocations() -> TestResult {
 kernel_test!(smoke_userspace_apply_relative_relocations);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_userspace_apply_symbol_relocations() -> TestResult {
+    // Symbol-resolved relocation walk-through. Mirrors the
+    // RELATIVE-only smoke above, but the dynamic array also names a
+    // DT_SYMTAB pointing at a 2-entry symbol table; the rela entry's
+    // r_info encodes (sym_idx=1, type=R_X86_64_64). Sym 1 is defined
+    // (st_value=0x80_0000_1100, st_shndx=1), so the patch site at
+    // r_offset should end up holding `st_value + r_addend`.
+    use narf_memory::x86_64::paging;
+    use narf_memory::VirtAddr;
+    use narf_userspace::load_user_process_with;
+
+    const SEG_VA:   u64 = 0x0000_0080_0000_1000;
+    const SEG_FOFF: u64 = 0x1000;
+    const RELOC_OFF_IN_SEG: u64 = 0x80;
+    const RELOC_VA: u64 = SEG_VA + RELOC_OFF_IN_SEG;
+    const SYM_VALUE: u64 = SEG_VA + 0x100;
+    const ADDEND:    u64 = 0x42;
+    const RELA_OFF_IN_SEG: u64 = 0x180;
+    const SYMTAB_OFF_IN_SEG: u64 = 0x1C0;
+    const DYN_OFF_IN_SEG:    u64 = 0x300;
+
+    fn build() -> alloc::vec::Vec<u8> {
+        const FSIZE: usize = 0x2000;
+        let mut b = alloc::vec![0u8; FSIZE];
+        b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        b[0x10..0x12].copy_from_slice(&2u16.to_le_bytes());     // ET_EXEC
+        b[0x12..0x14].copy_from_slice(&0x3Eu16.to_le_bytes());  // EM_X86_64
+        b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());     // EV_CURRENT
+        b[0x18..0x20].copy_from_slice(&(SEG_VA + 0x111).to_le_bytes());
+        b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes());    // e_phoff
+        b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());    // e_ehsize
+        b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());    // e_phentsize
+        b[0x38..0x3A].copy_from_slice(&2u16.to_le_bytes());     // e_phnum
+
+        // Phdr 0: PT_LOAD covering the page.
+        let mut ph = 64usize;
+        b[ph + 0x00..ph + 0x04].copy_from_slice(&1u32.to_le_bytes());   // PT_LOAD
+        b[ph + 0x04..ph + 0x08].copy_from_slice(&6u32.to_le_bytes());   // PF_R|PF_W
+        b[ph + 0x08..ph + 0x10].copy_from_slice(&SEG_FOFF.to_le_bytes());
+        b[ph + 0x10..ph + 0x18].copy_from_slice(&SEG_VA.to_le_bytes());
+        b[ph + 0x18..ph + 0x20].copy_from_slice(&SEG_VA.to_le_bytes());
+        b[ph + 0x20..ph + 0x28].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x28..ph + 0x30].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x30..ph + 0x38].copy_from_slice(&0x1000u64.to_le_bytes());
+
+        // Phdr 1: PT_DYNAMIC. 5 dynamic entries × 16 = 80 bytes.
+        ph = 64 + 56;
+        let dyn_foff = SEG_FOFF + DYN_OFF_IN_SEG;
+        let dyn_va   = SEG_VA   + DYN_OFF_IN_SEG;
+        b[ph + 0x00..ph + 0x04].copy_from_slice(&2u32.to_le_bytes());   // PT_DYNAMIC
+        b[ph + 0x04..ph + 0x08].copy_from_slice(&4u32.to_le_bytes());   // PF_R
+        b[ph + 0x08..ph + 0x10].copy_from_slice(&dyn_foff.to_le_bytes());
+        b[ph + 0x10..ph + 0x18].copy_from_slice(&dyn_va.to_le_bytes());
+        b[ph + 0x18..ph + 0x20].copy_from_slice(&dyn_va.to_le_bytes());
+        b[ph + 0x20..ph + 0x28].copy_from_slice(&80u64.to_le_bytes());
+        b[ph + 0x28..ph + 0x30].copy_from_slice(&80u64.to_le_bytes());
+        b[ph + 0x30..ph + 0x38].copy_from_slice(&8u64.to_le_bytes());
+
+        // Elf64_Rela @ RELA_OFF_IN_SEG: r_offset, r_info, r_addend.
+        // r_info = (sym_idx 1 << 32) | type R_X86_64_64 (1).
+        let rela_foff = (SEG_FOFF + RELA_OFF_IN_SEG) as usize;
+        let r_info: u64 = (1u64 << 32) | 1u64;
+        b[rela_foff       .. rela_foff + 8 ].copy_from_slice(&RELOC_VA.to_le_bytes());
+        b[rela_foff + 8   .. rela_foff + 16].copy_from_slice(&r_info.to_le_bytes());
+        b[rela_foff + 16  .. rela_foff + 24].copy_from_slice(&ADDEND.to_le_bytes());
+
+        // Symbol table @ SYMTAB_OFF_IN_SEG. Two 24-byte entries.
+        // Entry 0: all-zero (the canonical STN_UNDEF placeholder).
+        // Entry 1: defined symbol — st_value=SYM_VALUE, st_shndx=1.
+        let sym_foff = (SEG_FOFF + SYMTAB_OFF_IN_SEG) as usize;
+        // Entry 0 is already zeroed by the vec init.
+        let s1 = sym_foff + 24;
+        // st_name(4) | st_info(1) | st_other(1) | st_shndx(2) | st_value(8) | st_size(8).
+        b[s1 + 0 .. s1 + 4 ].copy_from_slice(&0u32.to_le_bytes());      // st_name
+        b[s1 + 4]            = 0;                                       // st_info
+        b[s1 + 5]            = 0;                                       // st_other
+        b[s1 + 6 .. s1 + 8 ].copy_from_slice(&1u16.to_le_bytes());      // st_shndx (defined)
+        b[s1 + 8 .. s1 + 16].copy_from_slice(&SYM_VALUE.to_le_bytes()); // st_value
+        b[s1 + 16.. s1 + 24].copy_from_slice(&0u64.to_le_bytes());      // st_size
+
+        // Dynamic array.
+        let rela_va    = SEG_VA + RELA_OFF_IN_SEG;
+        let symtab_va  = SEG_VA + SYMTAB_OFF_IN_SEG;
+        let mut p = dyn_foff as usize;
+        // DT_RELA = 7.
+        b[p .. p + 8].copy_from_slice(&7i64.to_le_bytes());
+        b[p + 8 .. p + 16].copy_from_slice(&rela_va.to_le_bytes());
+        p += 16;
+        // DT_RELASZ = 8 → 24 bytes (one entry).
+        b[p .. p + 8].copy_from_slice(&8i64.to_le_bytes());
+        b[p + 8 .. p + 16].copy_from_slice(&24u64.to_le_bytes());
+        p += 16;
+        // DT_RELAENT = 9 → 24.
+        b[p .. p + 8].copy_from_slice(&9i64.to_le_bytes());
+        b[p + 8 .. p + 16].copy_from_slice(&24u64.to_le_bytes());
+        p += 16;
+        // DT_SYMTAB = 6 → symtab_va.
+        b[p .. p + 8].copy_from_slice(&6i64.to_le_bytes());
+        b[p + 8 .. p + 16].copy_from_slice(&symtab_va.to_le_bytes());
+        p += 16;
+        // DT_NULL.
+        b[p .. p + 8].copy_from_slice(&0i64.to_le_bytes());
+        b[p + 8 .. p + 16].copy_from_slice(&0u64.to_le_bytes());
+
+        b
+    }
+
+    let bytes = build();
+    let proc = match unsafe { load_user_process_with(&bytes, &[], &[], &[]) } {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("load_user_process_with failed"),
+    };
+
+    let read_u64 = |vaddr: u64| -> Option<u64> {
+        let p = unsafe { paging::translate(proc.address_space.root, VirtAddr::new(vaddr & !0xFFF)) }?;
+        Some(unsafe { *((p.as_u64() | (vaddr & 0xFFF)) as *const u64) })
+    };
+    let got = match read_u64(RELOC_VA) {
+        Some(v) => v,
+        None    => return TestResult::Fail("relocation site not materialised"),
+    };
+    if got != SYM_VALUE.wrapping_add(ADDEND) {
+        return TestResult::Fail("R_X86_64_64 didn't write S+A");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_userspace_apply_symbol_relocations);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_unresolved_symbol_errors() -> TestResult {
+    // Same shape as `smoke_userspace_apply_symbol_relocations` but
+    // sym_idx 1 is SHN_UNDEF (st_value=0, st_shndx=0). The loader
+    // must surface `LoadBytesError::UnresolvedSymbol(1)` rather than
+    // silently writing zero.
+    use narf_userspace::{load_user_process_with, LoadBytesError, ProcessLoadError};
+
+    const SEG_VA:   u64 = 0x0000_0080_0000_1000;
+    const SEG_FOFF: u64 = 0x1000;
+    const RELOC_OFF_IN_SEG:  u64 = 0x80;
+    const RELOC_VA:          u64 = SEG_VA + RELOC_OFF_IN_SEG;
+    const RELA_OFF_IN_SEG:   u64 = 0x180;
+    const SYMTAB_OFF_IN_SEG: u64 = 0x1C0;
+    const DYN_OFF_IN_SEG:    u64 = 0x300;
+
+    fn build() -> alloc::vec::Vec<u8> {
+        const FSIZE: usize = 0x2000;
+        let mut b = alloc::vec![0u8; FSIZE];
+        b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        b[0x10..0x12].copy_from_slice(&2u16.to_le_bytes());
+        b[0x12..0x14].copy_from_slice(&0x3Eu16.to_le_bytes());
+        b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+        b[0x18..0x20].copy_from_slice(&(SEG_VA + 0x111).to_le_bytes());
+        b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes());
+        b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());
+        b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+        b[0x38..0x3A].copy_from_slice(&2u16.to_le_bytes());
+
+        let mut ph = 64usize;
+        b[ph + 0x00..ph + 0x04].copy_from_slice(&1u32.to_le_bytes());
+        b[ph + 0x04..ph + 0x08].copy_from_slice(&6u32.to_le_bytes());
+        b[ph + 0x08..ph + 0x10].copy_from_slice(&SEG_FOFF.to_le_bytes());
+        b[ph + 0x10..ph + 0x18].copy_from_slice(&SEG_VA.to_le_bytes());
+        b[ph + 0x18..ph + 0x20].copy_from_slice(&SEG_VA.to_le_bytes());
+        b[ph + 0x20..ph + 0x28].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x28..ph + 0x30].copy_from_slice(&0x1000u64.to_le_bytes());
+        b[ph + 0x30..ph + 0x38].copy_from_slice(&0x1000u64.to_le_bytes());
+
+        ph = 64 + 56;
+        let dyn_foff = SEG_FOFF + DYN_OFF_IN_SEG;
+        let dyn_va   = SEG_VA   + DYN_OFF_IN_SEG;
+        b[ph + 0x00..ph + 0x04].copy_from_slice(&2u32.to_le_bytes());
+        b[ph + 0x04..ph + 0x08].copy_from_slice(&4u32.to_le_bytes());
+        b[ph + 0x08..ph + 0x10].copy_from_slice(&dyn_foff.to_le_bytes());
+        b[ph + 0x10..ph + 0x18].copy_from_slice(&dyn_va.to_le_bytes());
+        b[ph + 0x18..ph + 0x20].copy_from_slice(&dyn_va.to_le_bytes());
+        b[ph + 0x20..ph + 0x28].copy_from_slice(&80u64.to_le_bytes());
+        b[ph + 0x28..ph + 0x30].copy_from_slice(&80u64.to_le_bytes());
+        b[ph + 0x30..ph + 0x38].copy_from_slice(&8u64.to_le_bytes());
+
+        let rela_foff = (SEG_FOFF + RELA_OFF_IN_SEG) as usize;
+        let r_info: u64 = (1u64 << 32) | 1u64;
+        b[rela_foff       .. rela_foff + 8 ].copy_from_slice(&RELOC_VA.to_le_bytes());
+        b[rela_foff + 8   .. rela_foff + 16].copy_from_slice(&r_info.to_le_bytes());
+        b[rela_foff + 16  .. rela_foff + 24].copy_from_slice(&0u64.to_le_bytes());
+
+        // Symbol table — entry 1 is an undefined symbol (st_value=0,
+        // st_shndx=SHN_UNDEF=0). The vec is already zero, so leave
+        // both entries at their zero defaults.
+        let _sym_foff = (SEG_FOFF + SYMTAB_OFF_IN_SEG) as usize;
+
+        let rela_va   = SEG_VA + RELA_OFF_IN_SEG;
+        let symtab_va = SEG_VA + SYMTAB_OFF_IN_SEG;
+        let mut p = dyn_foff as usize;
+        b[p .. p + 8].copy_from_slice(&7i64.to_le_bytes());
+        b[p + 8 .. p + 16].copy_from_slice(&rela_va.to_le_bytes());
+        p += 16;
+        b[p .. p + 8].copy_from_slice(&8i64.to_le_bytes());
+        b[p + 8 .. p + 16].copy_from_slice(&24u64.to_le_bytes());
+        p += 16;
+        b[p .. p + 8].copy_from_slice(&9i64.to_le_bytes());
+        b[p + 8 .. p + 16].copy_from_slice(&24u64.to_le_bytes());
+        p += 16;
+        b[p .. p + 8].copy_from_slice(&6i64.to_le_bytes());
+        b[p + 8 .. p + 16].copy_from_slice(&symtab_va.to_le_bytes());
+        p += 16;
+        b[p .. p + 8].copy_from_slice(&0i64.to_le_bytes());
+        b[p + 8 .. p + 16].copy_from_slice(&0u64.to_le_bytes());
+
+        b
+    }
+
+    let bytes = build();
+    match unsafe { load_user_process_with(&bytes, &[], &[], &[]) } {
+        Err(ProcessLoadError::Load(LoadBytesError::UnresolvedSymbol(1))) => TestResult::Pass,
+        Err(_) => TestResult::Fail("expected UnresolvedSymbol(1), got different error"),
+        Ok(_)  => TestResult::Fail("expected UnresolvedSymbol error, got Ok"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_userspace_unresolved_symbol_errors);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_userspace_init_sysv_stack_layout() -> TestResult {
     // Verify `init_sysv_stack` lays out the System V x86_64 startup
     // contract: argc at [rsp], then argv pointers + NULL, then envp
@@ -8793,6 +9016,21 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
         rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, rsp: 0, rip: 0,
     };
 
+    // Diagnostic: write a single byte to COM1 (0x3F8). Lock-free,
+    // bypasses console infrastructure, safe inside a trap handler.
+    #[inline(always)]
+    fn dbg_byte(b: u8) {
+        unsafe {
+            core::arch::asm!(
+                "out dx, al",
+                in("dx") 0x3F8u16,
+                in("al") b,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+    fn dbg_str(s: &str) { for b in s.bytes() { dbg_byte(b); } }
+
     // Hooks: save_user_state already ran in the syscall handler.
     // The hook just longjmps back to the polling routine using the
     // sentinel value the handler stored in `exit_reason`.
@@ -8801,12 +9039,24 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
         // polling routine pinned it.
         let _ = uctx;
         unsafe {
+            core::arch::asm!(
+                "out dx, al",
+                in("dx") 0x3F8u16,
+                in("al") b'Y',
+                options(nostack, preserves_flags),
+            );
             user_mode_longjmp(core::ptr::addr_of_mut!(JMP), EXIT_REASON_YIELDED as u64);
         }
     }
     unsafe fn exit_hook_fn(uctx: *mut UserTaskCtx) -> ! {
         let _ = uctx;
         unsafe {
+            core::arch::asm!(
+                "out dx, al",
+                in("dx") 0x3F8u16,
+                in("al") b'X',
+                options(nostack, preserves_flags),
+            );
             user_mode_longjmp(core::ptr::addr_of_mut!(JMP), EXIT_REASON_EXITED as u64);
         }
     }
@@ -8888,15 +9138,20 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
 
     unsafe { core::arch::asm!("cli"); }
     let stack_top = STACK_VADDR + 0x1000;
+    dbg_str("[A]");
     let saved = unsafe { user_mode_setjmp(core::ptr::addr_of_mut!(JMP)) };
+    dbg_byte(b'B');
+    dbg_byte(b'0' + (saved as u8 & 0xF));
 
     if saved == 0 {
         // First-time poll: enter user mode at the entry point.
+        dbg_str("[E]");
         unsafe { user_mode_enter(CODE_VADDR, stack_top) }
     } else if saved as u32 == EXIT_REASON_YIELDED {
         // First yield observed. Re-enter via resume so user picks
         // up at the instruction after `int 0x80`.
         OBSERVED_REASONS.fetch_or(1, Ordering::Relaxed);
+        dbg_str("[R]");
         unsafe {
             // Resume from the saved state.
             user_mode_resume(uctx.state.get() as *const _ as *const UserState)
@@ -8934,11 +9189,7 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
         return TestResult::Fail("unexpected longjmp value");
     }
 }
-// Disabled — hangs when run alongside other user-mode smokes
-// in the unshadowed e2e order. Same suspected root cause as
-// smoke_userspace_user_task_future_yield_exit. Diagnosis in a
-// follow-up round.
-#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e", any()))]
+#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
 kernel_test!(smoke_frame_x86_64_user_task_poll_yield_exit);
 
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]

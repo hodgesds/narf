@@ -117,6 +117,19 @@ pub enum LoadBytesError {
     /// by a materialised page in the address space, so we can't
     /// reach the patch site.
     RelocTargetUnmapped,
+    /// A symbol-resolved relocation (R_X86_64_64 / GLOB_DAT /
+    /// JUMP_SLOT) named a sym_idx whose `Elf64_Sym` slot has
+    /// `st_value == 0 && st_shndx == SHN_UNDEF (0)` — i.e. the
+    /// symbol is declared but not defined in this image. External
+    /// symbol resolution is out of scope until DT_STRTAB walking
+    /// + a host-provided resolver land. The wrapped value is the
+    /// offending sym_idx so debugging can locate the entry.
+    UnresolvedSymbol(u32),
+    /// A symbol-resolved relocation referenced a sym_idx whose
+    /// `Elf64_Sym` slot at `DT_SYMTAB + sym_idx * 24` lies outside
+    /// any PT_LOAD segment's file region — either DT_SYMTAB itself
+    /// is missing or the index walks past the table's tail.
+    SymtabOutOfBounds,
 }
 
 impl From<crate::ElfError> for LoadBytesError {
@@ -270,8 +283,11 @@ pub unsafe fn load_elf_bytes(
 // follow-up symbol-resolution pass can pick them up without
 // re-deriving the wire numbers.
 const DT_PLTRELSZ:   i64 = 2;
+// DT_STRTAB / DT_STRSZ are used by symbol-name lookup, which only
+// matters when external symbol resolution lands; internal-symbol
+// resolution (this round) only needs sym_idx + the SHN_UNDEF check.
 #[allow(dead_code)] const DT_STRTAB: i64 = 5;
-#[allow(dead_code)] const DT_SYMTAB: i64 = 6;
+const DT_SYMTAB:     i64 = 6;
 const DT_RELA:       i64 = 7;
 const DT_RELASZ:     i64 = 8;
 const DT_RELAENT:    i64 = 9;
@@ -279,6 +295,15 @@ const DT_RELAENT:    i64 = 9;
 const DT_PLTREL:     i64 = 20;
 const DT_JMPREL:     i64 = 23;
 #[allow(dead_code)] const DT_RELACOUNT: i64 = 0x6FFFFFF9;
+
+/// `sizeof(Elf64_Sym)` per the ELF64 ABI:
+/// `{ st_name: u32, st_info: u8, st_other: u8, st_shndx: u16,
+///    st_value: u64, st_size: u64 }`.
+const ELF64_SYM_SIZE: u64 = 24;
+/// `SHN_UNDEF` — the section index meaning "this symbol isn't
+/// defined here". Combined with `st_value == 0` it identifies a
+/// purely-external symbol; non-zero `st_shndx` means defined-in-image.
+const SHN_UNDEF: u16 = 0;
 
 // x86_64 relocation type codes (low 32 bits of `r_info`).
 const R_X86_64_64:        u32 = 1;
@@ -354,6 +379,51 @@ fn user_vaddr_to_kernel_ptr(_addr_space: &AddressSpace, _vaddr: u64) -> Option<*
     None
 }
 
+/// Resolve an `Elf64_Sym` index against `DT_SYMTAB` to a runtime
+/// (biased) virtual address.
+///
+/// The symbol table has no `DT_SYMSZ` in the standard tags — its
+/// length is implicit, derived from the largest sym_idx used by any
+/// relocation. We don't know that bound up front, so we read the
+/// `Elf64_Sym` directly at `DT_SYMTAB + sym_idx * 24` and require
+/// the read to land inside a PT_LOAD segment's file region (via
+/// `resolve_dt_pointer`); if it doesn't, the index is out of bounds.
+///
+/// Internal symbol policy:
+/// - `st_shndx == SHN_UNDEF (0)` and `st_value == 0`: declared but
+///   not defined — external. Returns `UnresolvedSymbol`.
+/// - Otherwise: defined-in-image. Returns `st_value + vaddr_bias`.
+///
+/// String-table walking (DT_STRTAB / DT_STRSZ) is intentionally not
+/// performed: this round only resolves internally-defined symbols
+/// where sym_idx is sufficient. External symbol resolution needs
+/// `st_name → string table → host resolver` and lands later.
+fn resolve_symbol(
+    bytes:      &[u8],
+    image:      &ExecImage,
+    sym_idx:    u32,
+    vaddr_bias: u64,
+) -> Result<u64, LoadBytesError> {
+    let symtab_addr = dt_lookup(&image.dynamic, DT_SYMTAB)
+        .ok_or(LoadBytesError::SymtabOutOfBounds)?;
+    let entry_addr = symtab_addr
+        .checked_add((sym_idx as u64).checked_mul(ELF64_SYM_SIZE)
+            .ok_or(LoadBytesError::SymtabOutOfBounds)?)
+        .ok_or(LoadBytesError::SymtabOutOfBounds)?;
+    let slice = resolve_dt_pointer(bytes, image, entry_addr, ELF64_SYM_SIZE)
+        .ok_or(LoadBytesError::SymtabOutOfBounds)?;
+
+    // Layout: st_name(4) | st_info(1) | st_other(1) | st_shndx(2)
+    //       | st_value(8) | st_size(8).
+    let st_shndx = u16::from_le_bytes([slice[6], slice[7]]);
+    let st_value = read_u64_le(&slice[8..16]);
+
+    if st_value == 0 && st_shndx == SHN_UNDEF {
+        return Err(LoadBytesError::UnresolvedSymbol(sym_idx));
+    }
+    Ok(st_value.wrapping_add(vaddr_bias))
+}
+
 /// Walk DT_RELA + DT_JMPREL and patch each entry.
 ///
 /// `vaddr_bias` is the load offset applied to PT_LOAD vaddrs and
@@ -389,7 +459,7 @@ pub unsafe fn apply_relocations(
                 .ok_or(LoadBytesError::RelaOutOfBounds)?;
             unsafe {
                 process_rela_array(slice, count as usize, relaent as usize,
-                                   addr_space, vaddr_bias)?;
+                                   bytes, image, addr_space, vaddr_bias)?;
             }
         }
     }
@@ -409,7 +479,7 @@ pub unsafe fn apply_relocations(
                     .ok_or(LoadBytesError::RelaOutOfBounds)?;
                 unsafe {
                     process_rela_array(slice, count as usize, relaent as usize,
-                                       addr_space, vaddr_bias)?;
+                                       bytes, image, addr_space, vaddr_bias)?;
                 }
             }
         } else if pltrel != 0 {
@@ -428,6 +498,8 @@ unsafe fn process_rela_array(
     slice:      &[u8],
     count:      usize,
     entsize:    usize,
+    bytes:      &[u8],
+    image:      &ExecImage,
     addr_space: &AddressSpace,
     vaddr_bias: u64,
 ) -> Result<(), LoadBytesError> {
@@ -442,8 +514,8 @@ unsafe fn process_rela_array(
         let r_info   = read_u64_le(&slice[off + 8   .. off + 16]);
         let r_addend = read_u64_le(&slice[off + 16  .. off + 24]) as i64;
 
-        let rtype   = (r_info & 0xFFFF_FFFF) as u32;
-        let _sym_ix = (r_info >> 32) as u32;
+        let rtype  = (r_info & 0xFFFF_FFFF) as u32;
+        let sym_ix = (r_info >> 32) as u32;
 
         // Compute the value we'll write.
         let value: u64 = match rtype {
@@ -452,11 +524,15 @@ unsafe fn process_rela_array(
                 // load bias we're applying and A is r_addend.
                 vaddr_bias.wrapping_add(r_addend as u64)
             }
-            R_X86_64_64 | R_X86_64_GLOB_DAT | R_X86_64_JUMP_SLOT => {
-                // These need a symbol-table lookup; Stage-4 first cut
-                // hasn't wired DT_SYMTAB walking yet. Refuse rather
-                // than write an undefined value.
-                return Err(LoadBytesError::UnsupportedRelocation);
+            R_X86_64_64 => {
+                // S + A — symbol address (biased) plus addend.
+                let s = resolve_symbol(bytes, image, sym_ix, vaddr_bias)?;
+                s.wrapping_add(r_addend as u64)
+            }
+            R_X86_64_GLOB_DAT | R_X86_64_JUMP_SLOT => {
+                // S — bare symbol address. The addend slot is reserved
+                // by the ABI for these two types; ignore it.
+                resolve_symbol(bytes, image, sym_ix, vaddr_bias)?
             }
             _ => return Err(LoadBytesError::UnsupportedRelocation),
         };
