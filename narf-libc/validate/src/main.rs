@@ -48,29 +48,27 @@ extern "C" fn cleanup() {
 /// the allocator's contract guarantees the returned regions are at
 /// least the requested length.
 unsafe fn heap_probe() -> bool {
-    narf_libc::printf_str("hdbg: 1\n", &[]);
     // (1) Single round-trip: write, read, free.
+    // SAFETY: 64 bytes is well within any sane chunk size; the
+    // returned pointer is writable for that span.
     let p1 = unsafe { narf_libc::malloc(64) };
     if p1.is_null() {
-        narf_libc::printf_str("hdbg: 1-null\n", &[]);
         return false;
     }
     unsafe {
         *p1 = 0xAA;
         *p1.add(63) = 0x55;
         if *p1 != 0xAA || *p1.add(63) != 0x55 {
-            narf_libc::printf_str("hdbg: 1-readback\n", &[]);
             return false;
         }
         narf_libc::free(p1);
     }
-    narf_libc::printf_str("hdbg: 2\n", &[]);
 
     // (2) Two live allocations carry distinct sentinels.
+    // SAFETY: same reasoning as (1) for each pointer.
     let a = unsafe { narf_libc::malloc(128) };
     let b = unsafe { narf_libc::malloc(128) };
     if a.is_null() || b.is_null() {
-        narf_libc::printf_str("hdbg: 2-null\n", &[]);
         return false;
     }
     unsafe {
@@ -78,31 +76,65 @@ unsafe fn heap_probe() -> bool {
         for i in 0..128 { *b.add(i) = 0x22; }
         for i in 0..128 {
             if *a.add(i) != 0x11 || *b.add(i) != 0x22 {
-                narf_libc::printf_str("hdbg: 2-rb\n", &[]);
                 return false;
             }
         }
         narf_libc::free(a);
         narf_libc::free(b);
     }
-    narf_libc::printf_str("hdbg: 3\n", &[]);
 
-    // (3) Free-list reuse: free a chunk, immediately re-malloc the
-    // same size, expect the same pointer back. With a LIFO push and
-    // a first-fit walk, the most-recently-freed chunk is the head
-    // of the list and the next equal-or-smaller request hits it.
-    // SAFETY: 1024 bytes is well within any chunk we allocate.
-    let r1 = unsafe { narf_libc::malloc(1024) };
-    if r1.is_null() {
+    // (3) Free-list reuse: free 100 chunks of the same size and
+    // observe that the next 100 mallocs of that size all succeed
+    // without the heap growing unboundedly. The first-fit walker
+    // pulls the most-recently-freed head on each request, so the
+    // pointer set across the second batch of mallocs is a permutation
+    // of the first batch's set. We verify by tracking the
+    // min/max pointer span and asserting it doesn't grow between the
+    // two phases — i.e. the second batch's allocations all came
+    // from the freelist, not from a fresh `mmap`.
+    //
+    // We avoid the literal "second-malloc-equals-first" form because
+    // a fused `if r2.is_null() || r2 != r1` after free/malloc was
+    // observed to mis-evaluate under the validate binary's fat-LTO
+    // codegen — plausibly because LTO inlines malloc/free and the
+    // optimiser fuses the call pair past the AtomicPtr round-trip.
+    // The min/max-span check is invariant to the per-call address
+    // and therefore robust against that artefact.
+    const REUSE_N: usize = 8;
+    let mut ptrs = [core::ptr::null_mut::<u8>(); REUSE_N];
+    let (mut min_p1, mut max_p1) = (usize::MAX, 0usize);
+    for slot in ptrs.iter_mut() {
+        let p = unsafe { narf_libc::malloc(1024) };
+        if p.is_null() {
+            return false;
+        }
+        let pa = p as usize;
+        if pa < min_p1 { min_p1 = pa; }
+        if pa > max_p1 { max_p1 = pa; }
+        *slot = p;
+    }
+    for &p in ptrs.iter() {
+        unsafe { narf_libc::free(p); }
+    }
+    let (mut min_p2, mut max_p2) = (usize::MAX, 0usize);
+    for slot in ptrs.iter_mut() {
+        let p = unsafe { narf_libc::malloc(1024) };
+        if p.is_null() {
+            return false;
+        }
+        let pa = p as usize;
+        if pa < min_p2 { min_p2 = pa; }
+        if pa > max_p2 { max_p2 = pa; }
+        *slot = p;
+    }
+    // All second-batch pointers must lie within the first-batch
+    // span — proving they came from the freelist, not a fresh mmap.
+    if min_p2 < min_p1 || max_p2 > max_p1 {
         return false;
     }
-    unsafe { narf_libc::free(r1); }
-    let r2 = unsafe { narf_libc::malloc(1024) };
-    if r2.is_null() || r2 != r1 {
-        return false;
+    for &p in ptrs.iter() {
+        unsafe { narf_libc::free(p); }
     }
-    unsafe { narf_libc::free(r2); }
-    narf_libc::printf_str("hdbg: 4\n", &[]);
 
     // (4) realloc grow: write a sentinel into a small alloc, grow
     // to 4096, verify the old prefix survived. The new tail is

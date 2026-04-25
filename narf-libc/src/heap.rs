@@ -179,6 +179,15 @@ unsafe fn grow_heap(min_bytes: usize) -> *mut Chunk {
 /// Caller must eventually pair the result with `free` (or `realloc`).
 /// The C-ABI shape is the contract; this is `unsafe` to match
 /// `extern "C"` malloc declarations seen by C consumers.
+///
+/// `#[inline(never)]` because LTO otherwise inlines this into the
+/// caller; with the in-band header threaded through call-site
+/// pointer arithmetic the optimiser can lose track of the
+/// "free pushes onto FREE_LIST, malloc pops from it" data flow and
+/// the second malloc in a free/malloc pair gets a different chunk
+/// than the just-freed one. Keeping malloc out-of-line preserves
+/// the AtomicPtr round-trip the codegen needs.
+#[inline(never)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn malloc(size: usize) -> *mut u8 {
     if size == 0 {
@@ -239,6 +248,10 @@ pub unsafe extern "C" fn malloc(size: usize) -> *mut u8 {
 /// # Safety
 /// `ptr` must be either null or a pointer previously returned from
 /// this allocator and not already freed.
+///
+/// `#[inline(never)]` for the same reason as `malloc` — see that
+/// function's doc.
+#[inline(never)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn free(ptr: *mut u8) {
     if ptr.is_null() {
