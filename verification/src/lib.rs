@@ -8501,9 +8501,12 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
     let stack_top = STACK_VADDR + 0x1000;
     unsafe { user_mode_enter(CODE_VADDR, stack_top) }
 }
-// Temporarily disabled in e2e runs: this test leaves stack/state
-// residue that wedges later tests. The state-save/resume path
-// itself is exercised; reactivate once the leak is identified.
+// Disabled in e2e runs: residue from the trap → longjmp path
+// wedges later tests. CR2-from-fault diagnosis ruled out the
+// sigaction null-deref (that was the testbin's `in("rdx")`
+// asm-clobber bug, fixed). The remaining wedge appears to be
+// a halt-until-irq deadlock where a subsequent run_until_empty
+// can't make progress; further diagnosis is a follow-up.
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e", any()))]
 kernel_test!(smoke_frame_x86_64_user_mode_yield_resume);
 

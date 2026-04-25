@@ -131,6 +131,14 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
     let _ = writeln!(Writer, "\n*** CPU EXCEPTION ***");
     let _ = writeln!(Writer, "  vector: {:3} — {}", frame.vector, vector_name(frame.vector));
     let _ = writeln!(Writer, "  error:  {:#018x}", frame.error_code);
+    if frame.vector == 14 {
+        // #PF: CR2 holds the faulting linear address.
+        let cr2: u64;
+        // SAFETY: reading CR2 at CPL=0 is always defined.
+        unsafe { core::arch::asm!("mov {v}, cr2", v = out(reg) cr2,
+            options(nostack, preserves_flags)); }
+        let _ = writeln!(Writer, "  cr2:    {:#018x}", cr2);
+    }
     let _ = writeln!(Writer, "  rip:    {:#018x}   cs:     {:#018x}", frame.rip, frame.cs);
     let _ = writeln!(Writer, "  rflags: {:#018x}   rsp:    {:#018x}   ss: {:#018x}",
         frame.rflags, frame.rsp, frame.ss);

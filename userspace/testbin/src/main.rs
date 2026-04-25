@@ -63,7 +63,7 @@ unsafe fn syscall3(num: u64, a0: u64, a1: u64, a2: u64) -> u64 {
         asm!(
             "int 0x80",
             inout("rax") rax,
-            in("rdi") a0, in("rsi") a1, in("rdx") a2,
+            in("rdi") a0, in("rsi") a1, inout("rdx") a2 => _,
             out("rcx") _, out("r11") _,
             options(nostack, preserves_flags),
         );
@@ -81,7 +81,7 @@ unsafe fn syscall4(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         asm!(
             "int 0x80",
             inout("rax") rax,
-            in("rdi") a0, in("rsi") a1, in("rdx") a2, in("r10") a3,
+            in("rdi") a0, in("rsi") a1, inout("rdx") a2 => _, in("r10") a3,
             out("rcx") _, out("r11") _,
             options(nostack, preserves_flags),
         );
