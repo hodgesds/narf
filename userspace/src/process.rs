@@ -126,10 +126,11 @@ pub unsafe fn load_user_process_with(
     let stack_top_v  = DEFAULT_USER_STACK_BASE + stack_bytes;
     // Lay out argc/argv/envp/auxv if anything was supplied; an
     // entirely empty (no-args) process keeps the all-zero stack.
+    let _ = stack_phys;  // resolved per-page through the AS now
     let rsp = if argv.is_empty() && envp.is_empty() && aux.is_empty() {
         stack_top_v
     } else {
-        unsafe { init_sysv_stack(stack_phys, stack_top_v, stack_bytes, argv, envp, aux) }
+        unsafe { init_sysv_stack(&address_space, stack_top_v, stack_bytes, argv, envp, aux) }
             .map_err(|_| ProcessLoadError::StackOverflow)?
     };
 
@@ -183,6 +184,25 @@ pub enum SysVStackError {
     Overflow,
 }
 
+/// Resolve the page-table-installed phys backing for a user vaddr,
+/// going via the address-space root. Returns the byte the kernel
+/// would write to (identity-mapped low-4-GiB cast). Returns `None`
+/// when the vaddr isn't materialised.
+#[cfg(target_arch = "x86_64")]
+fn resolve_user_phys_byte(root: PhysAddr, vaddr: u64) -> Option<u64> {
+    let page = vaddr & !0xFFFu64;
+    let off  = vaddr & 0xFFFu64;
+    let p = unsafe { narf_memory::x86_64::paging::translate(root, VirtAddr::new(page)) }?;
+    Some(p.as_u64() + off)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn resolve_user_phys_byte(_root: PhysAddr, _vaddr: u64) -> Option<u64> {
+    // aarch64 paging::translate isn't in narf-memory yet; the
+    // SysV-stack init path is x86_64-only at Stage 4 first cut.
+    None
+}
+
 /// Initialise a user stack with the System V x86_64 startup
 /// contract: argc + argv pointers + envp pointers + aux vector +
 /// the strings they name. Returns the new RSP — the user vaddr
@@ -193,16 +213,13 @@ pub enum SysVStackError {
 /// arrays + argc at the bottom, and the result is 16-byte aligned.
 ///
 /// # Safety
-/// - `stack_phys` must be the physical base of a contiguous run of
-///   pages identity-mapped in the low 4 GiB. The stack region built
-///   by `load_user_process` satisfies this when its allocation
-///   loop yields contiguous frames.
-/// - `stack_top_vaddr` must be the user vaddr corresponding to
-///   `stack_phys + stack_bytes` (i.e. one past the last byte the
-///   user can write).
-/// - `stack_bytes` must equal the size of the mapped region.
+/// - The stack region must already be mapped + materialised in
+///   the address space at `stack_top_vaddr - stack_bytes ..
+///   stack_top_vaddr` with READ+WRITE perms.
+/// - The low-4-GiB identity map must be live; this routine writes
+///   through the kernel's identity view of each page's phys.
 pub unsafe fn init_sysv_stack(
-    stack_phys:        PhysAddr,
+    address_space:     &AddressSpace,
     stack_top_vaddr:   u64,
     stack_bytes:       u64,
     argv:              &[&str],
@@ -240,90 +257,72 @@ pub unsafe fn init_sysv_stack(
 
     if total > stack_bytes { return Err(SysVStackError::Overflow); }
 
-    // Compute offsets from the top of the stack (highest address).
-    // `top_phys` is the kernel-side identity-mapped writable
-    // pointer to (stack_top_vaddr - 1) + 1.
-    let top_phys = stack_phys.raw() + stack_bytes;
+    let root = address_space.root;
+
+    // Per-byte writer that resolves the destination phys per-page
+    // through the AS — multi-page user stacks aren't necessarily
+    // physically contiguous, so we can't precompute a single base.
+    let write_u8 = |vaddr: u64, byte: u8| -> Result<(), SysVStackError> {
+        let phys = resolve_user_phys_byte(root, vaddr).ok_or(SysVStackError::Overflow)?;
+        unsafe { *(phys as *mut u8) = byte; }
+        Ok(())
+    };
+    let write_u64 = |vaddr: u64, val: u64| -> Result<(), SysVStackError> {
+        // u64 writes never cross a page boundary if vaddr is 8-aligned
+        // (which all our targets are by construction).
+        let phys = resolve_user_phys_byte(root, vaddr).ok_or(SysVStackError::Overflow)?;
+        unsafe { *(phys as *mut u64) = val; }
+        Ok(())
+    };
 
     // String area: layout top-down. Walk argv first (highest addrs),
     // then envp. Track each string's user vaddr in two parallel
     // Vecs; we'll spill the pointer arrays in step 2.
     let mut argv_ptrs = alloc::vec::Vec::with_capacity(argv.len());
     let mut envp_ptrs = alloc::vec::Vec::with_capacity(envp.len());
-    let mut cursor_kernel = top_phys; // shrinks downward
     let mut cursor_vaddr  = stack_top_vaddr;
     for s in argv.iter() {
         let len = s.len() as u64 + 1;
-        cursor_kernel -= len;
-        cursor_vaddr  -= len;
-        // SAFETY: identity-mapped, bounds-checked above.
-        unsafe {
-            core::ptr::copy_nonoverlapping(s.as_ptr(), cursor_kernel as *mut u8, s.len());
-            *((cursor_kernel + s.len() as u64) as *mut u8) = 0;
+        cursor_vaddr -= len;
+        for (i, &b) in s.as_bytes().iter().enumerate() {
+            write_u8(cursor_vaddr + i as u64, b)?;
         }
+        write_u8(cursor_vaddr + s.len() as u64, 0)?;
         argv_ptrs.push(cursor_vaddr);
     }
     for s in envp.iter() {
         let len = s.len() as u64 + 1;
-        cursor_kernel -= len;
-        cursor_vaddr  -= len;
-        unsafe {
-            core::ptr::copy_nonoverlapping(s.as_ptr(), cursor_kernel as *mut u8, s.len());
-            *((cursor_kernel + s.len() as u64) as *mut u8) = 0;
+        cursor_vaddr -= len;
+        for (i, &b) in s.as_bytes().iter().enumerate() {
+            write_u8(cursor_vaddr + i as u64, b)?;
         }
+        write_u8(cursor_vaddr + s.len() as u64, 0)?;
         envp_ptrs.push(cursor_vaddr);
     }
-    // Drop kernel cursor down to the 8-byte boundary that anchors
-    // the array region. The padded gap is left as zeroes by the
-    // caller's stack zero-fill.
-    let _ = cursor_kernel; // strings_padded already accounted for
 
-    // Now compute the array positions. The bottom of the layout
-    // (lowest addr, the user RSP) sits `total` bytes below the top.
-    // From there going up: argc, argv*, envp*, aux*, then strings.
-    let rsp_vaddr   = stack_top_vaddr - total;
-    let rsp_kernel  = top_phys - total;
+    // The bottom of the layout (lowest addr, the user RSP) sits
+    // `total` bytes below the top. From there going up: argc,
+    // argv*, envp*, aux*, then strings.
+    let rsp_vaddr = stack_top_vaddr - total;
+    let mut wv    = rsp_vaddr;
 
-    // Walk up from the RSP, writing each section.
-    let mut wp = rsp_kernel;
-    let mut wv = rsp_vaddr;
+    write_u64(wv, argv.len() as u64)?;
+    wv += 8;
 
-    // argc.
-    unsafe { *(wp as *mut u64) = argv.len() as u64; }
-    wp += 8; wv += 8;
+    for &p in argv_ptrs.iter() { write_u64(wv, p)?; wv += 8; }
+    write_u64(wv, 0)?; wv += 8;  // argv NULL term.
 
-    // argv pointers.
-    for &p in argv_ptrs.iter() {
-        unsafe { *(wp as *mut u64) = p; }
-        wp += 8; wv += 8;
-    }
-    unsafe { *(wp as *mut u64) = 0; } // NULL term.
-    wp += 8; wv += 8;
+    for &p in envp_ptrs.iter() { write_u64(wv, p)?; wv += 8; }
+    write_u64(wv, 0)?; wv += 8;  // envp NULL term.
 
-    // envp pointers.
-    for &p in envp_ptrs.iter() {
-        unsafe { *(wp as *mut u64) = p; }
-        wp += 8; wv += 8;
-    }
-    unsafe { *(wp as *mut u64) = 0; } // NULL term.
-    wp += 8; wv += 8;
-
-    // aux entries.
     for e in aux.iter() {
         let (key, val) = aux_pair(e);
-        unsafe {
-            *(wp as *mut u64) = key as u64;
-            *((wp + 8) as *mut u64) = val;
-        }
-        wp += 16; wv += 16;
+        write_u64(wv, key as u64)?;
+        write_u64(wv + 8, val)?;
+        wv += 16;
     }
-    // AT_NULL terminator.
-    unsafe {
-        *(wp as *mut u64) = 0;
-        *((wp + 8) as *mut u64) = 0;
-    }
-
-    let _ = wv; // walked-up vaddr cursor; final value isn't returned
+    write_u64(wv, 0)?;        // AT_NULL key
+    write_u64(wv + 8, 0)?;    // AT_NULL val
 
     Ok(rsp_vaddr)
 }

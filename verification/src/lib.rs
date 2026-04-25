@@ -6533,28 +6533,140 @@ fn smoke_userspace_load_user_process_builds_runnable_image() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_userspace_load_user_process_builds_runnable_image);
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_load_user_process_with_argv() -> TestResult {
+    // Same shape as the no-args runnable-image test, but exercises
+    // `load_user_process_with`: pass argv/envp/aux, then verify
+    // the new RSP is inside the stack region and that walking the
+    // argv pointer-array yields the right strings.
+    use narf_memory::x86_64::paging;
+    use narf_memory::VirtAddr;
+    use narf_userspace::{
+        load_user_process_with, AuxEntry, DEFAULT_USER_STACK_BASE,
+        DEFAULT_USER_STACK_BYTES,
+    };
+
+    let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(64 + 56 + 0x1000);
+    bytes.extend_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    bytes.extend_from_slice(&2u16.to_le_bytes());
+    bytes.extend_from_slice(&0x3Eu16.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&0x0000_0080_0000_1111u64.to_le_bytes());
+    bytes.extend_from_slice(&64u64.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&64u16.to_le_bytes());
+    bytes.extend_from_slice(&56u16.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&5u32.to_le_bytes());
+    bytes.extend_from_slice(&(64u64 + 56).to_le_bytes());
+    bytes.extend_from_slice(&0x0000_0080_0000_1000u64.to_le_bytes());
+    bytes.extend_from_slice(&0x0000_0080_0000_1000u64.to_le_bytes());
+    bytes.extend_from_slice(&0x1000u64.to_le_bytes());
+    bytes.extend_from_slice(&0x1000u64.to_le_bytes());
+    bytes.extend_from_slice(&0x1000u64.to_le_bytes());
+    bytes.resize(64 + 56 + 0x1000, 0);
+
+    let argv = ["one", "two"];
+    let envp = ["A=1"];
+    let aux  = [AuxEntry::Pagesz(4096)];
+
+    let proc = match unsafe { load_user_process_with(&bytes, &argv, &envp, &aux) } {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("load_user_process_with failed"),
+    };
+
+    let stack_top  = DEFAULT_USER_STACK_BASE + DEFAULT_USER_STACK_BYTES;
+    let new_rsp    = proc.stack_top.as_u64();
+    if new_rsp >= stack_top || new_rsp < DEFAULT_USER_STACK_BASE {
+        return TestResult::Fail("rsp not inside stack region");
+    }
+    if (new_rsp & 0xF) != 0 {
+        return TestResult::Fail("rsp not 16-byte aligned");
+    }
+
+    // Per-byte read goes through translate again so we honour the
+    // user-vaddr offset within the page (translate itself returns
+    // page-aligned phys).
+    let read_u64 = |vaddr: u64| -> Option<u64> {
+        let p = unsafe { paging::translate(proc.address_space.root, VirtAddr::new(vaddr & !0xFFF)) }?;
+        Some(unsafe { *((p.as_u64() | (vaddr & 0xFFF)) as *const u64) })
+    };
+    let argc = match read_u64(new_rsp) {
+        Some(v) => v,
+        None    => return TestResult::Fail("rsp not materialised"),
+    };
+    if argc != 2 {
+        if argc == 0 { return TestResult::Fail("argc reads back as 0"); }
+        return TestResult::Fail("argc not 2 (non-zero)");
+    }
+    let argv0 = read_u64(new_rsp + 8).unwrap();
+    let argv1 = read_u64(new_rsp + 16).unwrap();
+    let argv_term = read_u64(new_rsp + 24).unwrap();
+    if argv_term != 0 {
+        return TestResult::Fail("argv NULL terminator missing");
+    }
+    // Resolve argv[0] / argv[1] via the same translate path.
+    let resolve = |v: u64, want: &str| -> bool {
+        let p = match unsafe { paging::translate(proc.address_space.root, VirtAddr::new(v & !0xFFF)) } {
+            Some(p) => p.as_u64() | (v & 0xFFF),
+            None    => return false,
+        };
+        let want_b = want.as_bytes();
+        for i in 0..want_b.len() {
+            if unsafe { *((p + i as u64) as *const u8) } != want_b[i] { return false; }
+        }
+        unsafe { *((p + want_b.len() as u64) as *const u8) == 0 }
+    };
+    if !resolve(argv0, "one") { return TestResult::Fail("argv[0] != \"one\""); }
+    if !resolve(argv1, "two") { return TestResult::Fail("argv[1] != \"two\""); }
+
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_userspace_load_user_process_with_argv);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_userspace_init_sysv_stack_layout() -> TestResult {
     // Verify `init_sysv_stack` lays out the System V x86_64 startup
     // contract: argc at [rsp], then argv pointers + NULL, then envp
     // pointers + NULL, then aux pairs ending in AT_NULL. Strings the
     // pointers name live in the upper portion of the stack.
+    //
+    // The helper walks the AS per page via translate, so the test
+    // builds a real one-page user mapping rather than a fake
+    // contiguous slab.
     use narf_userspace::{init_sysv_stack, AuxEntry};
-    use narf_memory::PhysAddr;
+    use narf_memory::{x86_64::paging, AddressSpace, Region, RegionPerms, VirtAddr};
 
+    let mut as_ = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Fail("new_for_user"),
+    };
     let frame = match narf_memory::alloc_frame() {
         Ok(f) => f.start_address(),
         Err(_) => return TestResult::Fail("alloc_frame"),
     };
-    // Zero the page first so leftover bytes can't masquerade as
-    // valid pointer values.
     unsafe { core::ptr::write_bytes(frame.raw() as *mut u8, 0, 4096); }
 
-    // Pretend the frame is mapped at user vaddr 0x4000_0000 just for
-    // the purpose of computing pointer values that should appear in
-    // the array slots; the test then dereferences via the kernel
-    // identity-map (frame.raw()).
-    let user_base: u64 = 0x0000_0000_4000_0000;
+    // PML4[1]; PML4[0] is the kernel's identity-map (1 GiB huge
+    // pages), where map_4kb can't carve a 4K mapping.
+    let user_base: u64 = 0x0000_0080_0000_0000;
     let stack_top = user_base + 4096;
+    if as_.map_region(Region {
+        base: VirtAddr::new(user_base), len: 4096,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: frame,
+    }).is_err() {
+        return TestResult::Fail("map_region");
+    }
+    if unsafe { as_.materialize() }.is_err() {
+        return TestResult::Fail("materialize");
+    }
 
     let argv = ["argv0", "alpha"];
     let envp = ["KEY=val"];
@@ -6563,7 +6675,7 @@ fn smoke_userspace_init_sysv_stack_layout() -> TestResult {
         AuxEntry::Random(0x1234_5678),
     ];
     let rsp_v = match unsafe {
-        init_sysv_stack(PhysAddr::new(frame.raw()), stack_top, 4096, &argv, &envp, &aux)
+        init_sysv_stack(&as_, stack_top, 4096, &argv, &envp, &aux)
     } {
         Ok(v) => v,
         Err(_) => return TestResult::Fail("init_sysv_stack overflowed unexpectedly"),
@@ -6573,60 +6685,51 @@ fn smoke_userspace_init_sysv_stack_layout() -> TestResult {
         return TestResult::Fail("rsp not 16-byte aligned");
     }
 
-    // Walk the layout via the identity-mapped phys.
-    let rsp_phys = frame.raw() + (rsp_v - user_base);
-    let read_u64 = |off: u64| -> u64 {
-        unsafe { *((rsp_phys + off) as *const u64) }
+    // Read back via translate so we exercise the same path the
+    // helper used for writes (and so a future per-page-phys
+    // refactor still yields identical output).
+    let read_u64 = |vaddr: u64| -> u64 {
+        let p = unsafe { paging::translate(as_.root, VirtAddr::new(vaddr & !0xFFF)) }
+            .map(|p| p.as_u64() | (vaddr & 0xFFF))
+            .unwrap();
+        unsafe { *(p as *const u64) }
     };
 
-    if read_u64(0) != 2 { return TestResult::Fail("argc != 2"); }
-
-    // argv[0..2] then NULL.
-    let argv_p0 = read_u64(8);
-    let argv_p1 = read_u64(16);
-    let argv_term = read_u64(24);
-    if argv_term != 0 { return TestResult::Fail("argv NULL terminator missing"); }
-
-    // envp[0] then NULL.
-    let envp_p0 = read_u64(32);
-    let envp_term = read_u64(40);
-    if envp_term != 0 { return TestResult::Fail("envp NULL terminator missing"); }
-
-    // aux pairs.
-    let aux_k0 = read_u64(48);
-    let aux_v0 = read_u64(56);
-    let aux_k1 = read_u64(64);
-    let aux_v1 = read_u64(72);
-    let aux_kn = read_u64(80);
-    let aux_vn = read_u64(88);
-    if aux_k0 != 6 || aux_v0 != 4096 {
-        return TestResult::Fail("aux[0] (PAGESZ) wrong");
+    if read_u64(rsp_v) != 2 { return TestResult::Fail("argc != 2"); }
+    let argv_p0 = read_u64(rsp_v + 8);
+    let argv_p1 = read_u64(rsp_v + 16);
+    if read_u64(rsp_v + 24) != 0 { return TestResult::Fail("argv NULL term"); }
+    let envp_p0 = read_u64(rsp_v + 32);
+    if read_u64(rsp_v + 40) != 0 { return TestResult::Fail("envp NULL term"); }
+    if read_u64(rsp_v + 48) != 6 || read_u64(rsp_v + 56) != 4096 {
+        return TestResult::Fail("aux[0] (PAGESZ)");
     }
-    if aux_k1 != 25 || aux_v1 != 0x1234_5678 {
-        return TestResult::Fail("aux[1] (RANDOM) wrong");
+    if read_u64(rsp_v + 64) != 25 || read_u64(rsp_v + 72) != 0x1234_5678 {
+        return TestResult::Fail("aux[1] (RANDOM)");
     }
-    if aux_kn != 0 || aux_vn != 0 {
-        return TestResult::Fail("aux AT_NULL terminator missing");
+    if read_u64(rsp_v + 80) != 0 || read_u64(rsp_v + 88) != 0 {
+        return TestResult::Fail("aux AT_NULL");
     }
 
-    // Verify argv pointers land in the user-vaddr range and that
-    // following them through the identity map yields the original
-    // strings.
     let check_str = |user_p: u64, expected: &str| -> bool {
         if user_p < user_base || user_p >= stack_top { return false; }
-        let kp = frame.raw() + (user_p - user_base);
+        let kp = match unsafe { paging::translate(as_.root, VirtAddr::new(user_p & !0xFFF)) } {
+            Some(p) => p.as_u64() | (user_p & 0xFFF),
+            None    => return false,
+        };
         let ebytes = expected.as_bytes();
         for i in 0..ebytes.len() {
             if unsafe { *((kp + i as u64) as *const u8) } != ebytes[i] { return false; }
         }
         unsafe { *((kp + ebytes.len() as u64) as *const u8) == 0 }
     };
-    if !check_str(argv_p0, "argv0") { return TestResult::Fail("argv[0] string mismatch"); }
-    if !check_str(argv_p1, "alpha") { return TestResult::Fail("argv[1] string mismatch"); }
-    if !check_str(envp_p0, "KEY=val") { return TestResult::Fail("envp[0] string mismatch"); }
+    if !check_str(argv_p0, "argv0") { return TestResult::Fail("argv[0]"); }
+    if !check_str(argv_p1, "alpha") { return TestResult::Fail("argv[1]"); }
+    if !check_str(envp_p0, "KEY=val") { return TestResult::Fail("envp[0]"); }
 
     TestResult::Pass
 }
+#[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_userspace_init_sysv_stack_layout);
 
 #[cfg(target_arch = "x86_64")]
