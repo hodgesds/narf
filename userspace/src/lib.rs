@@ -49,7 +49,8 @@ pub use elf::{parse as parse_elf, ElfError};
 pub use handlers::{
     bootstrap_init, bootstrap_live_count, clear_exit_landing,
     install_address_space_lookup, install_core_syscalls,
-    install_task_id_lookup, set_exit_landing, TaskRings, UserRingEnds,
+    install_task_id_lookup, set_exit_landing, take_kernel_ends,
+    take_user_ends, TaskRings, UserRingEnds,
 };
 pub use loader::{load_elf_bytes, load_into, EntryPoint, LoadBytesError, LoadError};
 pub use process::{

@@ -238,6 +238,60 @@ pub fn bootstrap_live_count() -> usize {
     BOOTSTRAP_TABLE.lock().as_ref().map(|m| m.len()).unwrap_or(0)
 }
 
+/// Pull this task's user-side ring ends out of the registry,
+/// transferring ownership to the caller. Used by the test
+/// harness (and a future relibc shim) to drive the rings from
+/// the user side.
+pub fn take_user_ends(task: u64) -> Option<UserRingEnds> {
+    let mut g = BOOTSTRAP_TABLE.lock();
+    let map = g.as_mut()?;
+    let entry = map.remove(&task)?;
+    // Re-insert just the kernel side so the dispatcher still has
+    // it. Replace the user side with one we can never pop again
+    // (a fresh ownerless pair so the table stays consistent).
+    let placeholder_user = {
+        let (_dead_sq, _drop_sq_drain) = submission_channel::<64>();
+        let (_drop_cq_prod, _dead_cq) = completion_channel::<64>();
+        UserRingEnds {
+            sq_prod:  _dead_sq,
+            cq_drain: _dead_cq,
+        }
+    };
+    map.insert(task, PerTaskBootstrap {
+        kernel: entry.kernel,
+        user:   placeholder_user,
+        sq_cap_id: entry.sq_cap_id,
+        cq_cap_id: entry.cq_cap_id,
+    });
+    Some(entry.user)
+}
+
+/// Pull this task's kernel-side ring ends out for the dispatcher
+/// task to drive. Returns `None` if Bootstrap hasn't run for
+/// `task`. Once taken, only one dispatcher can serve the task —
+/// re-taking returns the placeholder set the prior take left
+/// behind.
+pub fn take_kernel_ends(task: u64) -> Option<TaskRings> {
+    let mut g = BOOTSTRAP_TABLE.lock();
+    let map = g.as_mut()?;
+    let entry = map.remove(&task)?;
+    let placeholder_kernel = {
+        let (_drop_sq_prod, dead_sq_drain) = submission_channel::<64>();
+        let (dead_cq_prod, _drop_cq_drain) = completion_channel::<64>();
+        TaskRings {
+            sq_drain: dead_sq_drain,
+            cq_prod:  dead_cq_prod,
+        }
+    };
+    map.insert(task, PerTaskBootstrap {
+        kernel: placeholder_kernel,
+        user:   entry.user,
+        sq_cap_id: entry.sq_cap_id,
+        cq_cap_id: entry.cq_cap_id,
+    });
+    Some(entry.kernel)
+}
+
 /// Monotonic capslot allocator for the SQ/CQ pair. Stage-4
 /// structural — Stage-5 routes through the real `capabilities/`
 /// table so revoke + transfer work.

@@ -5364,6 +5364,120 @@ fn smoke_memory_address_space_region_table() -> TestResult {
 kernel_test!(smoke_memory_address_space_region_table);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_userspace_bootstrap_rings_round_trip() -> TestResult {
+    // Full Bootstrap path: mint config page + ring pair, spawn
+    // an `abi::Dispatcher` task on the kernel-side ends, and
+    // drive a Noop submission round-trip from the user-side ends
+    // (which the test takes via `take_user_ends`).
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU8, Ordering};
+    use narf_abi::{Dispatcher, Submission, Tag, NarfStatus};
+    use narf_memory::AddressSpace;
+    use narf_userspace::{
+        install_address_space_lookup, install_core_syscalls, install_global,
+        install_task_id_lookup, kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+
+    static USER_AS_RT: narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>>
+        = narf_lib::sync::IrqSafeSpinLock::new(None);
+    fn rt_as_lookup() -> Option<Arc<AddressSpace>> { USER_AS_RT.lock().clone() }
+    static FAKE_TASK: u64 = 0xBEEF;
+    fn rt_task_lookup() -> u64 { FAKE_TASK }
+
+    let addr_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => return TestResult::Fail("new_for_user failed"),
+    };
+    *USER_AS_RT.lock() = Some(addr_space);
+
+    install_address_space_lookup(rt_as_lookup);
+    install_task_id_lookup(rt_task_lookup);
+    narf_userspace::bootstrap_init();
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Fire Bootstrap.
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+    let mut ctx = FakeCtx { args: SyscallArgs::default(), ret: None };
+    kernel_syscall_entry(Syscall::Bootstrap.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
+        *USER_AS_RT.lock() = None;
+        __test_clear_global();
+        narf_userspace::handlers::__test_bootstrap_reset();
+        return TestResult::Fail("Bootstrap returned non-Ok");
+    }
+
+    // Take the kernel-side ring ends and spawn an abi::Dispatcher
+    // on them. Take the user-side ends to drive the rings.
+    let kernel_ends = match narf_userspace::take_kernel_ends(FAKE_TASK) {
+        Some(e) => e,
+        None => {
+            *USER_AS_RT.lock() = None;
+            __test_clear_global();
+            narf_userspace::handlers::__test_bootstrap_reset();
+            return TestResult::Fail("kernel ring ends missing post-Bootstrap");
+        }
+    };
+    let user_ends = match narf_userspace::take_user_ends(FAKE_TASK) {
+        Some(e) => e,
+        None => {
+            *USER_AS_RT.lock() = None;
+            __test_clear_global();
+            narf_userspace::handlers::__test_bootstrap_reset();
+            return TestResult::Fail("user ring ends missing post-Bootstrap");
+        }
+    };
+
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+    OUTCOME.store(0, Ordering::Relaxed);
+
+    narf_scheduler::init();
+    narf_scheduler::spawn(async move {
+        let mut d = Dispatcher::new(kernel_ends.sq_drain, kernel_ends.cq_prod);
+        d.run().await;
+    });
+    narf_scheduler::spawn(async move {
+        let mut sq = user_ends.sq_prod;
+        let mut cq = user_ends.cq_drain;
+        // Submit a Noop with tag 0xABCD.
+        let tag = Tag::new(0xABCD);
+        sq.send(Submission::noop(tag)).await.unwrap();
+        let comp = cq.recv().await.unwrap();
+        if comp.tag() == tag && comp.status == NarfStatus::Ok {
+            OUTCOME.store(1, Ordering::Relaxed);
+        } else {
+            OUTCOME.store(2, Ordering::Relaxed);
+        }
+        // Drop our halves so the dispatcher's recv unblocks-into-EOF
+        // and run_until_empty can drain.
+        core::mem::drop(sq);
+        core::mem::drop(cq);
+    });
+
+    narf_scheduler::run_until_empty();
+
+    *USER_AS_RT.lock() = None;
+    __test_clear_global();
+    narf_userspace::handlers::__test_bootstrap_reset();
+
+    match OUTCOME.load(Ordering::Relaxed) {
+        1 => TestResult::Pass,
+        2 => TestResult::Fail("completion didn't match submission tag/status"),
+        _ => TestResult::Fail("user-side task didn't complete"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_userspace_bootstrap_rings_round_trip);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_userspace_bootstrap_returns_config_page() -> TestResult {
     // Bootstrap: allocate config page in the caller's AS, write a
     // header into it (magic / version / task_id), return user
