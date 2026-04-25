@@ -8224,7 +8224,10 @@ fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
                 in("edx") 0u32,
                 options(nostack, preserves_flags),
             );
-            core::arch::asm!("sti", options(nomem, nostack, preserves_flags));
+            // Restore IF to boot state (0). See note in
+            // `smoke_frame_x86_64_user_mode_yield_resume`'s
+            // resume cleanup for the rationale.
+            core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
         }
         __test_clear_global();
         if SEEN_MAGIC.load(Ordering::Acquire) != 0xBADC_0FFE_E0DD_F00D {
@@ -8421,7 +8424,11 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
                 in("edx") 0u32,
                 options(nostack, preserves_flags),
             );
-            core::arch::asm!("sti", options(nomem, nostack, preserves_flags));
+            // Restore IF to its boot-time state (0). The
+            // kernel-test build never enables the LAPIC timer,
+            // so leaving IF=1 turns the next executor's
+            // `halt_until_irq` into a real HLT that never wakes.
+            core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
         }
         __test_clear_global();
         // The user wrote 0xCAFE_BABE between yield and sleep; the
@@ -8501,13 +8508,7 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
     let stack_top = STACK_VADDR + 0x1000;
     unsafe { user_mode_enter(CODE_VADDR, stack_top) }
 }
-// Disabled in e2e runs: residue from the trap → longjmp path
-// wedges later tests. CR2-from-fault diagnosis ruled out the
-// sigaction null-deref (that was the testbin's `in("rdx")`
-// asm-clobber bug, fixed). The remaining wedge appears to be
-// a halt-until-irq deadlock where a subsequent run_until_empty
-// can't make progress; further diagnosis is a follow-up.
-#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e", any()))]
+#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
 kernel_test!(smoke_frame_x86_64_user_mode_yield_resume);
 
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
@@ -8660,7 +8661,8 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
                 in("edx") 0u32,
                 options(nostack, preserves_flags),
             );
-            core::arch::asm!("sti", options(nomem, nostack, preserves_flags));
+            // Restore IF to boot state (0).
+            core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
         }
         clear_current_user_task();
         narf_userspace::user_task::__test_clear_hooks();
@@ -8677,15 +8679,8 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
         return TestResult::Fail("unexpected longjmp value");
     }
 }
-// `smoke_frame_x86_64_user_task_poll_yield_exit` is a manual mock
-// of the polling routine for `UserTaskFuture::poll`. The
-// `UserTaskCtx` + hook infrastructure under it is exercised by
-// `smoke_frame_x86_64_user_mode_yield_resume`'s state-save round-
-// trip; this version wedges on a yet-undiagnosed interaction
-// when registered. Disabled here; the function body stays so the
-// next round can pick it up.
-#[allow(dead_code)]
-fn _smoke_frame_x86_64_user_task_poll_yield_exit_unused() {}
+#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
+kernel_test!(smoke_frame_x86_64_user_task_poll_yield_exit);
 
 // ── Real Rust user binary run through the full pipeline ──────────────
 
