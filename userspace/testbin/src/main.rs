@@ -264,6 +264,10 @@ fn start_rust(rsp_at_entry: u64) -> ! {
                 MOUNT.as_ptr()     as u64, MOUNT.len()     as u64);
             let mut buf = [0u8; 16];
             let mut fs_ok = false;
+            const WROK:  &[u8] = b"wr: ok\n";
+            const WRBAD: &[u8] = b"wr: bad\n";
+            const PAYLOAD: &[u8] = b"PUT";
+            let mut wr_ok = false;
             if fd != !0u64 {
                 let n = syscall3(SYS_READ,
                     fd, buf.as_mut_ptr() as u64, buf.len() as u64);
@@ -273,11 +277,20 @@ fn start_rust(rsp_at_entry: u64) -> ! {
                         if buf[i] != FILE_BYTES[i] { fs_ok = false; break; }
                     }
                 }
+                // Write to the same fd: the stub FS accepts writes
+                // and returns the byte count. Verifies SYS_WRITE
+                // routes fd>2 through the per-task fd table.
+                let wn = syscall3(SYS_WRITE,
+                    fd, PAYLOAD.as_ptr() as u64, PAYLOAD.len() as u64);
+                wr_ok = wn == PAYLOAD.len() as u64;
                 let _ = syscall3(SYS_CLOSE, fd, 0, 0);
             }
             let (fp, fl) = if fs_ok { (FOK.as_ptr(), FOK.len()) }
                            else      { (FBAD.as_ptr(), FBAD.len()) };
             syscall3(SYS_WRITE, 1, fp as u64, fl as u64);
+            let (wp, wl) = if wr_ok { (WROK.as_ptr(), WROK.len()) }
+                            else     { (WRBAD.as_ptr(), WRBAD.len()) };
+            syscall3(SYS_WRITE, 1, wp as u64, wl as u64);
         }
         syscall3(SYS_WRITE, 1, MSG.as_ptr() as u64, MSG.len() as u64);
         syscall0(SYS_EXIT_TASK);
