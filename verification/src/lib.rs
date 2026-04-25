@@ -7271,13 +7271,23 @@ fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
 
     let saved = unsafe { user_mode_setjmp(core::ptr::addr_of_mut!(JMP)) };
     if saved != 0 {
-        // Resume path — restore the kernel's CR3, re-enable
-        // interrupts (the `cli` before enter_user_mode left them
-        // off), and return Pass if the magic matched.
+        // Resume path — restore the kernel's CR3, reset the
+        // KERNEL_GS_BASE MSR (user-mode entry programmed it; later
+        // int-0x80 traps in unrelated tests would otherwise hit a
+        // dangling per-CPU pointer through `swapgs`), re-enable
+        // interrupts, and return Pass if the magic matched.
         unsafe {
             let cr3 = SAVED_CR3.load(Ordering::Acquire);
             core::arch::asm!("mov cr3, {v}", v = in(reg) cr3,
                 options(nostack, preserves_flags));
+            const IA32_KERNEL_GS_BASE: u32 = 0xC0000102;
+            core::arch::asm!(
+                "wrmsr",
+                in("ecx") IA32_KERNEL_GS_BASE,
+                in("eax") 0u32,
+                in("edx") 0u32,
+                options(nostack, preserves_flags),
+            );
             core::arch::asm!("sti", options(nomem, nostack, preserves_flags));
         }
         __test_clear_global();
