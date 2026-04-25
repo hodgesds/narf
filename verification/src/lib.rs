@@ -5363,6 +5363,89 @@ fn smoke_memory_address_space_region_table() -> TestResult {
 }
 kernel_test!(smoke_memory_address_space_region_table);
 
+fn smoke_userspace_fd_table_roundtrip() -> TestResult {
+    use alloc::sync::Arc;
+    use narf_filesystem::{FileOps, FsFuture, Stat};
+    use narf_userspace::{fd, FdEntry};
+
+    // Tiny FileOps stub that returns a fixed buffer slice.
+    struct FixedFile;
+    impl FileOps for FixedFile {
+        fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+            buf.fill(0xAB);
+            alloc::boxed::Box::pin(async move { Ok(buf.len()) })
+        }
+        fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+            alloc::boxed::Box::pin(async move { Ok(buf.len()) })
+        }
+        fn stat(&self) -> Stat {
+            Stat { size: 0, blocks: 0,
+                   mode: narf_filesystem::Mode::FILE_RO,
+                   mtime_cycles: 0 }
+        }
+    }
+
+    fd::__test_reset();
+    fd::init();
+
+    let task_a: u64 = 0xAA;
+    let task_b: u64 = 0xBB;
+
+    // Open in task A: first user fd is 3 (slots 0..=2 reserved).
+    let fd_a = fd::with_table(task_a, |t| {
+        t.open(FdEntry { ops: Arc::new(FixedFile), offset: 0 })
+    });
+    if fd_a != Some(3) {
+        return TestResult::Fail("first user fd should be 3");
+    }
+
+    // Independent task B starts with a fresh table.
+    let fd_b = fd::with_table(task_b, |t| {
+        t.open(FdEntry { ops: Arc::new(FixedFile), offset: 0 })
+    });
+    if fd_b != Some(3) {
+        return TestResult::Fail("task B should also get fd 3");
+    }
+    if fd::live_task_count() < 2 {
+        return TestResult::Fail("two task tables should be live");
+    }
+
+    // Mutating offset via get_mut.
+    fd::with_table(task_a, |t| {
+        if let Some(e) = t.get_mut(3) { e.offset += 100; }
+    });
+    let off_a = fd::with_table(task_a, |t| t.get(3).map(|e| e.offset)).flatten();
+    if off_a != Some(100) {
+        return TestResult::Fail("offset update did not stick");
+    }
+    let off_b = fd::with_table(task_b, |t| t.get(3).map(|e| e.offset)).flatten();
+    if off_b != Some(0) {
+        return TestResult::Fail("task B's offset should be independent");
+    }
+
+    // Close fd 3 in A, then re-open should reuse slot 3.
+    let closed = fd::with_table(task_a, |t| t.close(3));
+    if closed != Some(true) {
+        return TestResult::Fail("close should report true on live fd");
+    }
+    let reused = fd::with_table(task_a, |t| {
+        t.open(FdEntry { ops: Arc::new(FixedFile), offset: 0 })
+    });
+    if reused != Some(3) {
+        return TestResult::Fail("close + open should reuse slot 3");
+    }
+
+    // Detach task A; table count drops back.
+    fd::detach(task_a);
+    if fd::live_task_count() != 1 {
+        return TestResult::Fail("detach did not drop task A's table");
+    }
+
+    fd::__test_reset();
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_fd_table_roundtrip);
+
 fn smoke_userspace_install_core_syscalls_fills_table() -> TestResult {
     // `install_core_syscalls` drops Write/Read/Close/Mmap/Munmap/
     // ExitTask/Yield/Sleep handlers into a fresh table. Confirm

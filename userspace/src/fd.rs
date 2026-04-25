@@ -1,0 +1,134 @@
+//! Per-task file-descriptor table.
+//!
+//! Stage-4 needed by real `Read` / `Write` / `Close` syscall
+//! handlers: a handler reads `arg0` as an `fd` (a small u32), looks
+//! it up in the calling task's table, and routes the operation to
+//! the backing `FileOps` impl. fd 0..=2 are reserved for stdin /
+//! stdout / stderr; subsequent slots are first-free.
+//!
+//! The table is per-task and stored in a global `BTreeMap<TaskId,
+//! FdTable>`. Tests + the scheduler call `attach_to(task_id, ops)`
+//! to install a backing FileOps; the `Open` handler (when wired)
+//! calls `attach_to(current_task, ops)` after VFS resolves a path.
+//! `detach(task_id)` removes the whole table on task exit.
+
+use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+
+use narf_filesystem::FileOps;
+use narf_lib::sync::IrqSafeSpinLock;
+
+/// Per-task fd table entry.
+#[derive(Clone)]
+pub struct FdEntry {
+    pub ops:    Arc<dyn FileOps>,
+    /// File-pointer offset into the underlying object. Updated on
+    /// every `Read` / `Write` so they're position-tracking by
+    /// default (POSIX semantics).
+    pub offset: u64,
+}
+
+impl core::fmt::Debug for FdEntry {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FdEntry")
+            .field("offset", &self.offset)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Per-task fd table. Slot 0/1/2 are stdin/stdout/stderr; the
+/// kernel populates them at task creation (today's helper:
+/// `attach_console_stdio`).
+#[derive(Debug, Default)]
+pub struct FdTable {
+    slots: Vec<Option<FdEntry>>,
+}
+
+impl FdTable {
+    pub const fn new() -> Self { Self { slots: Vec::new() } }
+
+    /// Insert `entry` at the lowest free slot ≥ 3. Slots 0..=2 are
+    /// reserved for stdio; install those via `set` directly.
+    pub fn open(&mut self, entry: FdEntry) -> u32 {
+        // Ensure stdio slots exist.
+        while self.slots.len() < 3 { self.slots.push(None); }
+        for (i, s) in self.slots.iter_mut().enumerate().skip(3) {
+            if s.is_none() {
+                *s = Some(entry);
+                return i as u32;
+            }
+        }
+        let i = self.slots.len();
+        self.slots.push(Some(entry));
+        i as u32
+    }
+
+    /// Place `entry` at a specific slot (typically used for stdio).
+    pub fn set(&mut self, fd: u32, entry: FdEntry) {
+        let i = fd as usize;
+        while self.slots.len() <= i { self.slots.push(None); }
+        self.slots[i] = Some(entry);
+    }
+
+    /// Remove the entry at `fd`. Returns `true` if it existed.
+    pub fn close(&mut self, fd: u32) -> bool {
+        let i = fd as usize;
+        match self.slots.get_mut(i) {
+            Some(slot @ Some(_)) => { *slot = None; true }
+            _ => false,
+        }
+    }
+
+    /// Borrow the entry at `fd` without removing it.
+    pub fn get(&self, fd: u32) -> Option<&FdEntry> {
+        self.slots.get(fd as usize).and_then(Option::as_ref)
+    }
+
+    /// Mutable borrow — used by Read/Write to advance the offset.
+    pub fn get_mut(&mut self, fd: u32) -> Option<&mut FdEntry> {
+        self.slots.get_mut(fd as usize).and_then(Option::as_mut)
+    }
+}
+
+// ── Global per-task table ──────────────────────────────────────────
+
+/// `TaskId.raw()` keys.
+type Tables = BTreeMap<u64, FdTable>;
+
+static TABLES: IrqSafeSpinLock<Option<Tables>> = IrqSafeSpinLock::new(None);
+
+/// Initialise the per-task fd table store. Called once at boot
+/// before any task can install fds.
+pub fn init() {
+    *TABLES.lock() = Some(BTreeMap::new());
+}
+
+/// Look up + run `op` against the table for `task_id`. Creates an
+/// empty table on first reference. Returns the closure's value.
+pub fn with_table<R>(task_id: u64, op: impl FnOnce(&mut FdTable) -> R) -> Option<R> {
+    let mut g = TABLES.lock();
+    let map = g.as_mut()?;
+    let table = map.entry(task_id).or_insert_with(FdTable::new);
+    Some(op(table))
+}
+
+/// Drop the entire fd table for `task_id`. Call on task exit so
+/// the FileOps `Arc`s can release.
+pub fn detach(task_id: u64) {
+    if let Some(map) = TABLES.lock().as_mut() {
+        map.remove(&task_id);
+    }
+}
+
+/// Test/reset hook — wipe every per-task table. Lets independent
+/// kernel_test cases share state cleanly.
+#[doc(hidden)]
+pub fn __test_reset() {
+    *TABLES.lock() = Some(BTreeMap::new());
+}
+
+/// Number of tasks with at least one fd installed. Diagnostic.
+pub fn live_task_count() -> usize {
+    TABLES.lock().as_ref().map(|m| m.len()).unwrap_or(0)
+}

@@ -37,10 +37,13 @@
 extern crate alloc;
 
 pub mod elf;
+pub mod fd;
 pub mod handlers;
 pub mod loader;
 pub mod process;
 pub mod syscall;
+
+pub use fd::{FdEntry, FdTable};
 
 pub use elf::{parse as parse_elf, ElfError};
 pub use handlers::{
