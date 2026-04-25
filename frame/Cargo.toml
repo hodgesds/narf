@@ -38,6 +38,11 @@ user-mode-e2e = ["kernel-test", "narf-verification/user-mode-e2e"]
 # Enables the `narf-testbin` ELF build and the runner test, which calls
 # `exit_kernel(0)` on success and therefore must run last.
 user-mode-testbin = ["user-mode-e2e", "narf-verification/user-mode-testbin"]
+# Chain into verification's narf-libc validate-binary runner.
+# Builds the libc shim + the validate sub-crate's ELF and runs it
+# end-to-end through the user-mode pipeline. Like user-mode-testbin,
+# this calls `exit_kernel(0)` on success and must run last.
+narf-libc-validate = ["user-mode-e2e", "narf-verification/narf-libc-validate"]
 
 [lints]
 workspace = true

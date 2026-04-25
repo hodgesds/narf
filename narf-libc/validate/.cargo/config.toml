@@ -1,0 +1,10 @@
+# Local cargo config for narf-libc-validate. The outer workspace's
+# `.cargo/config.toml` injects kernel-linker flags + `code-model=kernel`
+# that are wrong for user-space code; this file terminates the
+# walk-up search so those settings don't apply.
+
+[target.x86_64-unknown-none]
+rustflags = []
+
+[target.aarch64-unknown-none]
+rustflags = []

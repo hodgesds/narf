@@ -1,0 +1,27 @@
+[package]
+name         = "narf-libc-validate"
+description  = "Smoke binary for narf-libc — links against the relibc-shaped libc shim and prints a startup line."
+version      = "0.0.0"
+edition      = "2021"
+rust-version = "1.85"
+license      = "MPL-2.0"
+
+[[bin]]
+name = "narf-libc-validate"
+path = "src/main.rs"
+
+[dependencies]
+narf-libc = { path = ".." }
+
+# Sibling-of-narf-testbin pattern: terminate the workspace walk so
+# the kernel workspace's fat-LTO + code-model=kernel rustflags don't
+# apply. The validate binary's own [profile.release] below is what
+# governs codegen.
+[workspace]
+
+[profile.release]
+opt-level = "s"
+lto       = true
+panic     = "abort"
+debug     = false
+strip     = "none"

@@ -1,0 +1,29 @@
+[package]
+name         = "narf-libc"
+description  = "relibc-shaped libc shim for NARF user binaries (Path B)"
+version      = "0.0.0"
+edition      = "2021"
+rust-version = "1.85"
+license      = "MPL-2.0"
+repository   = "https://github.com/hodgesds/narf"
+
+[lib]
+name = "narf_libc"
+path = "src/lib.rs"
+
+[dependencies]
+narf-user-runtime = { path = "../user-runtime" }
+
+# Sibling-of-narf-testbin pattern: terminate the workspace walk so
+# the kernel workspace's fat-LTO release settings + code-model=kernel
+# rustflags don't apply to user-space code. The validate sub-crate
+# does the same and depends on this crate via path =, which works
+# regardless of workspace membership.
+[workspace]
+
+[profile.release]
+opt-level = "s"
+lto       = true
+panic     = "abort"
+debug     = false
+strip     = "none"

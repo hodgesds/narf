@@ -21,40 +21,68 @@ fn main() {
     println!("cargo:rerun-if-changed=../userspace/testbin/src/main.rs");
     println!("cargo:rerun-if-changed=../userspace/testbin/testbin.ld");
     println!("cargo:rerun-if-changed=../userspace/testbin/Cargo.toml");
+    println!("cargo:rerun-if-changed=../narf-libc/src/lib.rs");
+    println!("cargo:rerun-if-changed=../narf-libc/src/arch.rs");
+    println!("cargo:rerun-if-changed=../narf-libc/src/startup.rs");
+    println!("cargo:rerun-if-changed=../narf-libc/src/io.rs");
+    println!("cargo:rerun-if-changed=../narf-libc/src/process.rs");
+    println!("cargo:rerun-if-changed=../narf-libc/src/heap.rs");
+    println!("cargo:rerun-if-changed=../narf-libc/src/errno.rs");
+    println!("cargo:rerun-if-changed=../narf-libc/src/string.rs");
+    println!("cargo:rerun-if-changed=../narf-libc/validate/src/main.rs");
+    println!("cargo:rerun-if-changed=../narf-libc/validate/validate.ld");
+    println!("cargo:rerun-if-changed=../narf-libc/validate/Cargo.toml");
 
-    let enabled = env::var_os("CARGO_FEATURE_USER_MODE_TESTBIN").is_some();
-    if !enabled {
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let workspace = manifest_dir.parent().unwrap().to_path_buf();
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+
+    let testbin_enabled = env::var_os("CARGO_FEATURE_USER_MODE_TESTBIN").is_some();
+    if testbin_enabled {
+        let testbin_dir = workspace.join("userspace").join("testbin");
+        build_arch(
+            &testbin_dir,
+            &out_dir.join("testbin-target-x86_64"),
+            "x86_64-unknown-none",
+            &testbin_dir.join("testbin.ld"),
+            // `code-model=large` because the user vaddr is past the
+            // 2-GiB reach of small-model relocations.
+            Some("code-model=large"),
+            "NARF_TESTBIN_ELF_X86_64",
+            "narf-testbin",
+        );
+        build_arch(
+            &testbin_dir,
+            &out_dir.join("testbin-target-aarch64"),
+            "aarch64-unknown-none",
+            &testbin_dir.join("testbin-aarch64.ld"),
+            // aarch64 large code-model is the default; no extra flag.
+            None,
+            "NARF_TESTBIN_ELF_AARCH64",
+            "narf-testbin",
+        );
+    } else {
         // Feature off — placeholders so both `env!()`-based
         // `include_bytes!` sites compile cleanly.
         println!("cargo:rustc-env=NARF_TESTBIN_ELF_X86_64=/dev/null");
         println!("cargo:rustc-env=NARF_TESTBIN_ELF_AARCH64=/dev/null");
-        return;
     }
 
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let workspace = manifest_dir.parent().unwrap().to_path_buf();
-    let testbin_dir = workspace.join("userspace").join("testbin");
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-
-    build_arch(
-        &testbin_dir,
-        &out_dir.join("testbin-target-x86_64"),
-        "x86_64-unknown-none",
-        &testbin_dir.join("testbin.ld"),
-        // `code-model=large` because the user vaddr is past the
-        // 2-GiB reach of small-model relocations.
-        Some("code-model=large"),
-        "NARF_TESTBIN_ELF_X86_64",
-    );
-    build_arch(
-        &testbin_dir,
-        &out_dir.join("testbin-target-aarch64"),
-        "aarch64-unknown-none",
-        &testbin_dir.join("testbin-aarch64.ld"),
-        // aarch64 large code-model is the default; no extra flag.
-        None,
-        "NARF_TESTBIN_ELF_AARCH64",
-    );
+    let libc_validate_enabled = env::var_os("CARGO_FEATURE_NARF_LIBC_VALIDATE").is_some();
+    if libc_validate_enabled {
+        let validate_dir = workspace.join("narf-libc").join("validate");
+        build_arch(
+            &validate_dir,
+            &out_dir.join("narf-libc-validate-target-x86_64"),
+            "x86_64-unknown-none",
+            &validate_dir.join("validate.ld"),
+            Some("code-model=large"),
+            "NARF_LIBC_VALIDATE_ELF_X86_64",
+            "narf-libc-validate",
+        );
+    } else {
+        println!("cargo:rustc-env=NARF_LIBC_VALIDATE_ELF_X86_64=/dev/null");
+    }
 }
 
 fn build_arch(
@@ -64,6 +92,7 @@ fn build_arch(
     linker_script: &PathBuf,
     extra_flag: Option<&str>,
     env_var: &str,
+    bin_name: &str,
 ) {
     let mut flags: Vec<String> = vec![
         "-C".into(),
@@ -97,7 +126,7 @@ fn build_arch(
     let bin = target_dir
         .join(triple)
         .join("release")
-        .join("narf-testbin");
-    assert!(bin.exists(), "narf-testbin output missing for {triple}: {}", bin.display());
+        .join(bin_name);
+    assert!(bin.exists(), "{bin_name} output missing for {triple}: {}", bin.display());
     println!("cargo:rustc-env={}={}", env_var, bin.display());
 }

@@ -10224,6 +10224,137 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-testbin"))]
 kernel_test!(smoke_frame_x86_64_run_narf_testbin);
 
+// ── narf-libc validate binary ────────────────────────────────────────
+//
+// Same shape as the testbin runner above, but the user binary is
+// the relibc-shaped `narf-libc-validate`. The validate ELF carries
+// a PT_TLS phdr (16-byte template) that the kernel's tls staging
+// will plant at fs_base; the binary's `_start` is supplied by
+// narf-libc itself and bridges through `__libc_start_main` into
+// the validate's `main`.
+
+#[cfg(all(target_arch = "x86_64", feature = "narf-libc-validate"))]
+const NARF_LIBC_VALIDATE_ELF: &[u8] =
+    include_bytes!(env!("NARF_LIBC_VALIDATE_ELF_X86_64"));
+
+#[cfg(all(target_arch = "x86_64", feature = "narf-libc-validate"))]
+fn smoke_frame_x86_64_run_narf_libc_validate() -> TestResult {
+    use core::arch::naked_asm;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_userspace::{
+        clear_exit_landing, install_address_space_lookup, install_core_syscalls,
+        install_global, load_user_process_with, set_exit_landing,
+        syscall::__test_clear_global, AuxEntry, SyscallTable,
+    };
+
+    static mut JMP3: UserModeJmpBuf = UserModeJmpBuf {
+        rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, rsp: 0, rip: 0,
+    };
+    static SAVED_CR3_3: AtomicU64 = AtomicU64::new(0);
+
+    #[unsafe(naked)]
+    unsafe extern "C" fn libc_validate_resume_trampoline() -> ! {
+        naked_asm!(
+            "lea rdi, [rip + {jmp}]",
+            "mov rsi, 1",
+            "jmp {lj}",
+            jmp = sym JMP3,
+            lj  = sym user_mode_longjmp,
+        );
+    }
+
+    // Same test-only AS lookup pattern as the testbin runner: the
+    // validate binary is run outside the scheduler so we stash its
+    // AS in a static for the Mmap/Munmap handlers to find.
+    static USER_AS: narf_lib::sync::IrqSafeSpinLock<
+        Option<alloc::sync::Arc<narf_memory::AddressSpace>>,
+    > = narf_lib::sync::IrqSafeSpinLock::new(None);
+    fn test_as_lookup() -> Option<alloc::sync::Arc<narf_memory::AddressSpace>> {
+        USER_AS.lock().clone()
+    }
+
+    __test_clear_global();
+    install_address_space_lookup(test_as_lookup);
+    // Bootstrap + brk + sigaction + signal + fd init mirrors the
+    // testbin runner — the validate binary touches a smaller subset
+    // (only printf-shim + getpid) but initialising the rest is
+    // cheap and keeps the runner robust if the validate binary
+    // grows new probes.
+    narf_userspace::bootstrap_init();
+    narf_userspace::handlers::__test_brk_reset();
+    narf_userspace::brk_init();
+    narf_userspace::handlers::__test_sigaction_reset();
+    narf_userspace::sigaction_init();
+    narf_userspace::handlers::__test_signal_reset();
+    narf_userspace::signal_init();
+    narf_userspace::fd::__test_reset();
+    narf_userspace::fd::init();
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let original_cr3: u64;
+    unsafe {
+        core::arch::asm!("mov {v}, cr3", v = out(reg) original_cr3,
+            options(nostack, preserves_flags));
+    }
+    SAVED_CR3_3.store(original_cr3, Ordering::Release);
+
+    set_exit_landing(libc_validate_resume_trampoline as usize as u64, 0);
+
+    let saved = unsafe { user_mode_setjmp(core::ptr::addr_of_mut!(JMP3)) };
+    if saved != 0 {
+        unsafe {
+            let cr3 = SAVED_CR3_3.load(Ordering::Acquire);
+            core::arch::asm!("mov cr3, {v}", v = in(reg) cr3,
+                options(nostack, preserves_flags));
+            // Reset KERNEL_GS_BASE to zero (post-init state).
+            const IA32_KERNEL_GS_BASE: u32 = 0xC0000102;
+            core::arch::asm!(
+                "wrmsr",
+                in("ecx") IA32_KERNEL_GS_BASE,
+                in("eax") 0u32,
+                in("edx") 0u32,
+                options(nostack, preserves_flags),
+            );
+            // Per the testbin runner: do NOT issue `sti` here; the
+            // unwind path keeps interrupts disabled. (See 401b073.)
+        }
+        clear_exit_landing();
+        __test_clear_global();
+        use core::fmt::Write as _;
+        let mut w = narf_console::Writer;
+        let _ = writeln!(w, "  [ OK ] smoke_frame_x86_64_run_narf_libc_validate");
+        let _ = writeln!(w, "── narf-libc-validate: validate round-trip succeeded ──");
+        unsafe { narf_arch::exit_kernel(0) }
+    }
+
+    if NARF_LIBC_VALIDATE_ELF.is_empty() {
+        return TestResult::Skip("narf-libc-validate not built (feature disabled?)");
+    }
+    let argv = ["narf-libc-validate"];
+    let envp: [&str; 0] = [];
+    let aux  = [AuxEntry::Pagesz(4096)];
+    let proc = match unsafe {
+        load_user_process_with(NARF_LIBC_VALIDATE_ELF, &argv, &envp, &aux)
+    } {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("load_user_process_with failed on narf-libc-validate"),
+    };
+
+    *USER_AS.lock() = Some(proc.address_space.clone());
+
+    if proc.address_space.activate().is_err() {
+        return TestResult::Fail("activate failed");
+    }
+
+    unsafe { core::arch::asm!("cli"); }
+    unsafe { user_mode_enter(proc.entry.0.as_u64(), proc.stack_top.as_u64()) }
+}
+#[cfg(all(target_arch = "x86_64", feature = "narf-libc-validate"))]
+kernel_test!(smoke_frame_x86_64_run_narf_libc_validate);
+
 fn smoke_userspace_raw_handler_dispatch() -> TestResult {
     // Install a RawSyscallHandler and confirm it observes the
     // TrapContext, can set the return, and (on x86_64) can ask to

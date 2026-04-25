@@ -1,0 +1,47 @@
+//! narf-libc — relibc-shaped libc shim for NARF user binaries.
+//!
+//! Path B of the relibc rollout: an in-tree, `no_std`, no-alloc-by-
+//! default crate that supplies a user binary the relibc startup
+//! contract (`_start` -> `__libc_start_main` -> user `main`) plus a
+//! minimum libc surface (write/printf-shim, exit, getpid, malloc-on-
+//! brk, errno-via-TLS, mem/str helpers) needed to validate the
+//! Stage-4 user-mode toolchain end-to-end.
+//!
+//! Every libc-style entry delegates into [`narf_user_runtime`] for
+//! the actual syscall — this crate adds the C-ABI startup glue and
+//! a printf-shim parser, nothing more. A real C-variadic `printf`
+//! requires `core::ffi::VaList` (still unstable as of 1.85), so we
+//! ship a tagged-union [`Arg`] + [`printf_str`] pair instead. That
+//! is the practical Path-B shape; full POSIX printf is a follow-up.
+//!
+//! Layout assumptions:
+//! - x86_64 SysV: `_start` reads `[rsp]`, builds argc/argv/envp/
+//!   auxv off the entry-rsp, then tail-calls user `main`.
+//! - TLS: initial-exec model. The kernel programs `IA32_FS_BASE` to
+//!   the per-thread TCB self-pointer; `*(fs:0) == fs_base`. The TLS
+//!   template lives at `fs_base - mem_size`. errno occupies the
+//!   last 8 bytes of the template.
+
+#![no_std]
+#![forbid(unsafe_op_in_unsafe_fn)]
+
+extern "C" {
+    /// User-supplied entry point. Linked against the consumer
+    /// binary; signature mirrors C `int main(int, char**, char**)`.
+    fn main(argc: i32, argv: *const *const u8, envp: *const *const u8) -> i32;
+}
+
+pub mod arch;
+pub mod errno;
+pub mod heap;
+pub mod io;
+pub mod process;
+pub mod startup;
+pub mod string;
+
+pub use arch::_start;
+pub use errno::{errno, set_errno};
+pub use heap::{free, malloc};
+pub use io::{fputs, printf_str, write, Arg, Stdout};
+pub use process::{exit, getpid, getppid, getuid};
+pub use startup::__libc_start_main;

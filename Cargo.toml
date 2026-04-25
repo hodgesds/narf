@@ -41,6 +41,8 @@ members = [
 # fat-LTO release settings from contaminating the user binary.
 exclude = [
     "userspace/testbin",
+    "narf-libc",
+    "narf-libc/validate",
 ]
 
 [workspace.package]
