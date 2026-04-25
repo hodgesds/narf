@@ -37,11 +37,21 @@ pub mod heap;
 pub mod io;
 pub mod process;
 pub mod startup;
+pub mod stdio;
 pub mod string;
 
 pub use arch::_start;
 pub use errno::{errno, set_errno};
 pub use heap::{free, malloc};
-pub use io::{fputs, printf_str, write, Arg, Stdout};
+pub use io::{printf_str, write, Arg, Stdout};
 pub use process::{exit, getpid, getppid, getuid};
 pub use startup::__libc_start_main;
+// Note: `stdio::fputs` shadows the older `io::fputs(&str, fd)` helper
+// — the FILE*-shaped one is the POSIX-correct surface and is the one
+// downstream callers should use. The old `io::fputs` remains
+// accessible as `crate::io::fputs` for any internal call-sites that
+// haven't migrated yet.
+pub use stdio::{
+    clearerr, fclose, feof, ferror, fflush, fgets, fopen, fputs, fread, fwrite,
+    stderr, stdin, stdout, File,
+};

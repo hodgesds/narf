@@ -5,9 +5,14 @@
 //! `narf_libc::_start` (re-exported from the lib crate) is the
 //! ELF entry point per `validate.ld`'s `ENTRY(_start)`.
 //!
-//! Behaviour: prints a single line containing `hello from narf-libc;
-//! pid=<n>` to stdout, returns 0. The harness greps for the literal
-//! prefix to confirm the printf-shim parsed correctly.
+//! Behaviour: prints a `hello from narf-libc; pid=<n>` line via the
+//! printf-shim, then exercises the new FILE* layer over fd 1 by
+//! emitting `stdio: fputs ok` (via `fputs`) and `stdio: fwrite ok`
+//! (via `fwrite`), then `fflush`-ing the stdout stream. Returns 0.
+//! The harness's pass signal is the validate runner's "validate
+//! round-trip succeeded" line — the stdio output is observable in
+//! the kernel console for visual confirmation that the buffered
+//! layer round-tripped through `narf_user_runtime::write`.
 
 #![no_std]
 #![no_main]
@@ -39,6 +44,24 @@ pub extern "C" fn main(
         "hello from narf-libc; pid=%d\n",
         &[narf_libc::Arg::Int(pid as i64)],
     );
+
+    // Exercise the FILE* layer over the static stdout. We don't go
+    // through `fopen` here because the validate kernel runner does
+    // not stand up a mount table — fd 1 is sufficient to prove the
+    // buffered write path round-trips. `fflush` forces the line
+    // out even if the line-buffer heuristic ever changes underfoot.
+    //
+    // SAFETY: `stdout()` returns a stable pointer to a static
+    // `narf_libc::File`; the byte pointers are `'static` literals;
+    // lengths match the literals exactly.
+    unsafe {
+        let s = narf_libc::stdout();
+        let msg1 = b"stdio: fputs ok\n";
+        narf_libc::fputs(msg1.as_ptr(), msg1.len(), s);
+        let msg2 = b"stdio: fwrite ok\n";
+        narf_libc::fwrite(msg2.as_ptr(), 1, msg2.len(), s);
+        narf_libc::fflush(s);
+    }
     0
 }
 
