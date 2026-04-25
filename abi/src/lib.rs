@@ -54,6 +54,16 @@ use alloc::vec::Vec;
 
 use narf_capabilities::CapSlot;
 use narf_ipc::{Consumer, Producer};
+
+// Re-export the shared-ring primitive so callers that already depend
+// on narf-abi (e.g. narf-userspace) can reach `SharedRing` /
+// `SharedProducer` / `SharedConsumer` without adding a direct
+// narf-ipc dep — adding one perturbs link-time test-registration
+// ordering in the verification harness.
+pub use narf_ipc::{
+    SharedConsumer, SharedProducer, SharedRing,
+    SharedTryRecvError, SharedTrySendError,
+};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_tracing::FnTime;
 

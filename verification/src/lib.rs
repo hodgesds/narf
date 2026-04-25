@@ -5843,6 +5843,110 @@ fn smoke_userspace_spawn_dispatcher_for_helper() -> TestResult {
 kernel_test!(smoke_userspace_spawn_dispatcher_for_helper);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_userspace_shared_ring_kick_round_trip() -> TestResult {
+    // Bootstrap mints a SharedRing pair + maps it into the user
+    // AS. Drive it via the kernel-identity-mapped phys (which
+    // matches the mapping a user task sees) by pushing a Noop into
+    // the shared SQ, calling sys_ring_kick synchronously, and
+    // reading the Completion back from the shared CQ.
+    use alloc::sync::Arc;
+    use narf_abi::{
+        NarfStatus, OpCode, SharedConsumer, SharedProducer, SharedRing,
+        Submission, Tag,
+    };
+    use narf_memory::AddressSpace;
+    use narf_userspace::{
+        install_address_space_lookup, install_core_syscalls, install_global,
+        install_task_id_lookup, kernel_syscall_entry, shared_rings_for,
+        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn,
+        SyscallTable, TrapContext, BOOTSTRAP_SHARED_RING_DEPTH,
+    };
+
+    static USER_AS_SR: narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>>
+        = narf_lib::sync::IrqSafeSpinLock::new(None);
+    fn as_lookup() -> Option<Arc<AddressSpace>> { USER_AS_SR.lock().clone() }
+    static FAKE_TASK: u64 = 0xBABE;
+    fn task_lookup() -> u64 { FAKE_TASK }
+
+    let addr_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => return TestResult::Fail("new_for_user"),
+    };
+    *USER_AS_SR.lock() = Some(addr_space);
+
+    install_address_space_lookup(as_lookup);
+    install_task_id_lookup(task_lookup);
+    narf_userspace::fd::__test_reset();
+    narf_userspace::fd::init();
+    narf_userspace::bootstrap_init();
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+    let mut ctx = FakeCtx { args: SyscallArgs::default(), ret: None };
+    kernel_syscall_entry(Syscall::Bootstrap.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
+        return TestResult::Fail("Bootstrap returned non-Ok");
+    }
+    let pair = match shared_rings_for(FAKE_TASK) {
+        Some(p) => p,
+        None    => return TestResult::Fail("shared_rings_for None"),
+    };
+
+    type SqRing = SharedRing<Submission, BOOTSTRAP_SHARED_RING_DEPTH>;
+    type CqRing = narf_abi::Completion;
+    type CqRingT = SharedRing<CqRing, BOOTSTRAP_SHARED_RING_DEPTH>;
+
+    let mut sq_prod = unsafe {
+        SharedProducer::<Submission, BOOTSTRAP_SHARED_RING_DEPTH>::from_raw(
+            pair.sq_phys.raw() as *mut SqRing,
+        )
+    };
+    let mut sub = Submission::noop(Tag::new(0xFEED));
+    sub.op = OpCode::Noop;
+    if sq_prod.try_send(sub).is_err() {
+        return TestResult::Fail("shared SQ try_send");
+    }
+
+    let mut ctx = FakeCtx { args: SyscallArgs::default(), ret: None };
+    kernel_syscall_entry(Syscall::RingKick.raw(), &mut ctx);
+    let processed = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value,
+        _ => return TestResult::Fail("RingKick non-Ok"),
+    };
+    if processed != 1 {
+        return TestResult::Fail("RingKick processed != 1");
+    }
+
+    let mut cq_cons = unsafe {
+        SharedConsumer::<CqRing, BOOTSTRAP_SHARED_RING_DEPTH>::from_raw(
+            pair.cq_phys.raw() as *mut CqRingT,
+        )
+    };
+    let comp = match cq_cons.try_recv() {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("shared CQ try_recv"),
+    };
+    if comp.tag != 0xFEED { return TestResult::Fail("comp tag mismatch"); }
+    if comp.status != NarfStatus::Ok { return TestResult::Fail("comp status not Ok"); }
+
+    *USER_AS_SR.lock() = None;
+    narf_userspace::fd::__test_reset();
+    narf_userspace::handlers::__test_bootstrap_reset();
+    __test_clear_global();
+    TestResult::Pass
+}
+#[cfg(all(target_arch = "x86_64", not(feature = "user-mode-e2e")))]
+kernel_test!(smoke_userspace_shared_ring_kick_round_trip);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_userspace_bootstrap_rings_round_trip() -> TestResult {
     // Full Bootstrap path: mint config page + ring pair, spawn
     // an `abi::Dispatcher` task on the kernel-side ends, and
@@ -6038,7 +6142,7 @@ fn smoke_userspace_bootstrap_returns_config_page() -> TestResult {
         __test_clear_global();
         return TestResult::Fail("config page magic mismatch");
     }
-    if hdr.version != 2 {
+    if hdr.version != 3 {
         *USER_AS_BS.lock() = None;
         __test_clear_global();
         return TestResult::Fail("config page version mismatch");
