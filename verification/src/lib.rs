@@ -7411,6 +7411,9 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
 
     __test_clear_global();
     install_address_space_lookup(test_as_lookup);
+    // Bootstrap registry needs initialising so SYS_BOOTSTRAP from
+    // the testbin can find a place to stash its per-task ring pair.
+    narf_userspace::bootstrap_init();
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
     install_global(t);

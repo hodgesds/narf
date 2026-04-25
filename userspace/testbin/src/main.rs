@@ -26,6 +26,10 @@ const SYS_WRITE:     u64 = 112;
 const SYS_EXIT_TASK: u64 = 103;
 #[cfg(target_arch = "x86_64")]
 const SYS_MMAP:      u64 = 120;
+#[cfg(target_arch = "x86_64")]
+const SYS_BOOTSTRAP: u64 = 101;
+#[cfg(target_arch = "x86_64")]
+const NARF_MAGIC:    u32 = 0x4E_41_52_46;  // "NARF" LE
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
@@ -100,7 +104,11 @@ unsafe fn syscall0(num: u64) -> u64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
-    const MSG: &[u8] = b"user: ok\n";
+    const MSG:    &[u8] = b"user: ok\n";
+    #[cfg(target_arch = "x86_64")]
+    const BOK:    &[u8] = b"boot: ok\n";
+    #[cfg(target_arch = "x86_64")]
+    const BBAD:   &[u8] = b"boot: bad\n";
     // SAFETY: we're the user program, the kernel has set up the
     // int-0x80 gate, and the message lives in our RX segment.
     unsafe {
@@ -112,6 +120,17 @@ pub extern "C" fn _start() -> ! {
                 let p = addr as *mut u64;
                 core::ptr::write_volatile(p, 0xCAFEu64);
             }
+
+            // Bootstrap: mint per-task config page + SQ/CQ rings.
+            // Returns the user vaddr of the config page; first u32
+            // is the "NARF" magic. Proves SYS_BOOTSTRAP works from
+            // real user mode.
+            let cfg = syscall0(SYS_BOOTSTRAP);
+            let ok = cfg != 0 && cfg != !0u64
+                && core::ptr::read_volatile(cfg as *const u32) == NARF_MAGIC;
+            let (mp, ml) = if ok { (BOK.as_ptr(), BOK.len()) }
+                           else   { (BBAD.as_ptr(), BBAD.len()) };
+            syscall3(SYS_WRITE, 1, mp as u64, ml as u64);
         }
         syscall3(SYS_WRITE, 1, MSG.as_ptr() as u64, MSG.len() as u64);
         syscall0(SYS_EXIT_TASK);
