@@ -32,6 +32,7 @@ extern "C" {
 }
 
 pub mod arch;
+pub mod env;
 pub mod errno;
 pub mod heap;
 pub mod io;
@@ -41,6 +42,7 @@ pub mod stdio;
 pub mod string;
 
 pub use arch::_start;
+pub use env::{getenv, getenv_cstr, setenv, unsetenv, ENVIRON};
 pub use errno::{errno, set_errno};
 pub use heap::{free, malloc};
 // `io::fputs(&str, fd)` deliberately omitted — the `stdio::fputs`
@@ -48,7 +50,7 @@ pub use heap::{free, malloc};
 // surface. The internal helper is still reachable as
 // `crate::io::fputs` for non-public call sites that haven't migrated.
 pub use io::{fprintf_str, printf_str, vprintf_str, write, Arg, Stdout};
-pub use process::{exit, getpid, getppid, getuid};
+pub use process::{abort, atexit, exit, getpid, getppid, getuid};
 pub use startup::__libc_start_main;
 // Note: `stdio::fputs` shadows the older `io::fputs(&str, fd)` helper
 // — the FILE*-shaped one is the POSIX-correct surface and is the one
@@ -58,4 +60,8 @@ pub use startup::__libc_start_main;
 pub use stdio::{
     clearerr, fclose, feof, ferror, fflush, fgets, fopen, fputs, fread, fwrite,
     stderr, stdin, stdout, File,
+};
+pub use string::{
+    memcmp, memcpy, memmove, memset, strcat, strchr, strcmp, strcpy, strdup, strlen, strncmp,
+    strncpy, strrchr, strstr,
 };

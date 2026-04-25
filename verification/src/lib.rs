@@ -10276,10 +10276,17 @@ fn smoke_frame_x86_64_run_narf_libc_validate() -> TestResult {
     __test_clear_global();
     install_address_space_lookup(test_as_lookup);
     // Bootstrap + brk + sigaction + signal + fd init mirrors the
-    // testbin runner — the validate binary touches a smaller subset
-    // (only printf-shim + getpid) but initialising the rest is
-    // cheap and keeps the runner robust if the validate binary
-    // grows new probes.
+    // testbin runner. The validate binary now exercises a broader
+    // surface — printf-shim + getpid plus probes for `strchr`,
+    // `memmove`, `getenv`, and `atexit` — but the runner shape is
+    // identical: a clean exit round-trip is the pass condition.
+    // Expected stdout (visible in the QEMU console; not grepped):
+    //   hello from narf-libc; pid=<n>
+    //   strchr: ok
+    //   memmove: ok
+    //   getenv: ok
+    //   atexit: ok    <- emitted from the atexit callback, after
+    //                    `main` returns and before exit_task.
     narf_userspace::bootstrap_init();
     narf_userspace::handlers::__test_brk_reset();
     narf_userspace::brk_init();

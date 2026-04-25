@@ -10,6 +10,7 @@
 //! `__libc_init_first`) so we ship just the parsing + dispatch
 //! frame and keep the rest as TODO follow-ups.
 
+use crate::env::init_environ;
 use crate::process::exit;
 
 /// Saved entry-stack pointer, captured by the SysV `_start` shim.
@@ -47,6 +48,14 @@ pub unsafe extern "C" fn __libc_start_main(rsp_at_entry: u64) -> ! {
         // NULL | envp[..] | NULL | auxv[..] | AT_NULL.
         unsafe { parse_startup_stack(rsp_at_entry) }
     };
+
+    // Publish the kernel-supplied envp into the global `ENVIRON`
+    // BEFORE user `main` runs, so a `getenv` from inside `main`
+    // observes a populated table. Single-threaded startup means no
+    // race vs. concurrent readers.
+    //
+    // SAFETY: write-once during single-threaded startup.
+    unsafe { init_environ(envp) };
 
     // SAFETY: `main` is the consumer-supplied `extern "C" fn`
     // declared in `lib.rs`. It is the bin's responsibility to

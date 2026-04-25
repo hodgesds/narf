@@ -33,6 +33,12 @@ extern crate narf_libc;
 // 16 bytes into a per-task block; narf-libc's errno helpers read
 // `fs_base - 8`, which lands inside that image.
 
+/// Atexit callback for the validation probe. Must be `extern "C"`
+/// to match the registration ABI.
+extern "C" fn cleanup() {
+    narf_libc::printf_str("atexit: ok\n", &[]);
+}
+
 #[no_mangle]
 pub extern "C" fn main(
     _argc: i32,
@@ -76,12 +82,63 @@ pub extern "C" fn main(
     // SAFETY: stdout() is a stable pointer to a static File; byte
     // pointers are 'static literals; lengths match the literals.
     unsafe {
-        let s = narf_libc::stdout();
+        let stream = narf_libc::stdout();
         let msg1 = b"stdio: fputs ok\n";
-        narf_libc::fputs(msg1.as_ptr(), msg1.len(), s);
+        narf_libc::fputs(msg1.as_ptr(), msg1.len(), stream);
         let msg2 = b"stdio: fwrite ok\n";
-        narf_libc::fwrite(msg2.as_ptr(), 1, msg2.len(), s);
-        narf_libc::fflush(s);
+        narf_libc::fwrite(msg2.as_ptr(), 1, msg2.len(), stream);
+        narf_libc::fflush(stream);
+    }
+
+    // ── string battery + env + atexit probes ─────────────────────
+    // strchr probe — confirm the byte search lands on the first 'l'
+    // of "hello".
+    let hello: *const u8 = b"hello\0".as_ptr();
+    // SAFETY: `hello` points to a NUL-terminated static literal; the
+    // returned pointer (if non-null) is inside that literal.
+    let p = unsafe { narf_libc::strchr(hello, b'l' as i32) };
+    // SAFETY: `p` is either NULL or points into the literal "hello\0"
+    // which is alive for the program's lifetime.
+    unsafe {
+        if !p.is_null() && *p == b'l' {
+            narf_libc::printf_str("strchr: ok\n", &[]);
+        } else {
+            narf_libc::printf_str("strchr: bad\n", &[]);
+        }
+    }
+
+    // memmove with overlap — the destination overlaps the source
+    // (dst = src + 2). Direction-aware copy must take
+    // "abcdefgh" -> "ababcdgh" (bytes 0..4 land at positions 2..6).
+    let mut buf: [u8; 8] = *b"abcdefgh";
+    // SAFETY: `buf` is 8 bytes; src=buf, dst=buf+2, n=4 stays inside.
+    unsafe {
+        narf_libc::memmove(buf.as_mut_ptr().add(2), buf.as_ptr(), 4);
+    }
+    let ok = &buf == b"ababcdgh";
+    narf_libc::printf_str(
+        if ok { "memmove: ok\n" } else { "memmove: bad\n" },
+        &[],
+    );
+
+    // getenv probe — the validate harness boots with no envp, so any
+    // lookup must miss cleanly (NULL return). Confirms both the
+    // ENVIRON-init wiring AND the empty-table walk path.
+    let n: *const u8 = b"PATH\0".as_ptr();
+    // SAFETY: `n` is NUL-terminated and `name_len = 4` fits.
+    let v = unsafe { narf_libc::getenv(n, 4) };
+    narf_libc::printf_str(
+        if v.is_null() { "getenv: ok\n" } else { "getenv: bad\n" },
+        &[],
+    );
+
+    // atexit registration — `cleanup` runs after `main` returns,
+    // BEFORE the kernel-side exit_task. The ordering proves the
+    // dispatch loop in `narf_libc::exit` walks the table.
+    // SAFETY: `cleanup` is a `'static` extern "C" fn; single-threaded
+    // user mode keeps the table-write race-free.
+    unsafe {
+        let _ = narf_libc::atexit(cleanup);
     }
 
     0
