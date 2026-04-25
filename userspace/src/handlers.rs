@@ -149,10 +149,14 @@ pub fn clear_exit_landing() {
 // config-page user vaddr.
 
 const ABI_BOOTSTRAP_MAGIC: u32 = 0x4E_41_52_46;  // "NARF" LE
-const ABI_BOOTSTRAP_VERSION: u32 = 2;
-/// Ring depth NARF bootstraps. Powers-of-two only per `narf-ipc`.
-/// 64 mirrors what the existing dispatcher tests use.
+const ABI_BOOTSTRAP_VERSION: u32 = 3;
+/// Ring depth for the kernel-only Arc<Ring> pair. Powers-of-two only.
 const BOOTSTRAP_RING_DEPTH: u64 = 64;
+/// Ring depth for the user-mappable SharedRing pair. Powers-of-two
+/// only. Each SharedRing must fit in a single 4 KiB page; 16 entries
+/// keeps `SharedRing<Submission, 16>` (2368 bytes) and
+/// `SharedRing<Completion, 16>` (1088 bytes) well within budget.
+pub const BOOTSTRAP_SHARED_RING_DEPTH: usize = 16;
 
 #[repr(C)]
 struct BootstrapHeader {
@@ -167,6 +171,16 @@ struct BootstrapHeader {
     /// Ring depths the kernel chose for this task.
     sq_depth: u32,
     cq_depth: u32,
+    /// User vaddr of the shared SubmissionRing page. The user
+    /// builds a `SharedProducer<Submission, 16>` against this.
+    shared_sq_vaddr: u64,
+    /// User vaddr of the shared CompletionRing page. The user
+    /// builds a `SharedConsumer<Completion, 16>` against this.
+    shared_cq_vaddr: u64,
+    /// Depths for the SharedRing pair (must be a power of two; the
+    /// type-level `N` is fixed at `BOOTSTRAP_SHARED_RING_DEPTH`).
+    shared_depth: u32,
+    _pad: u32,
 }
 
 // ── Per-task SQ/CQ store ──────────────────────────────────────────
@@ -179,9 +193,11 @@ struct BootstrapHeader {
 
 use alloc::collections::BTreeMap;
 use narf_abi::{
-    completion_channel, submission_channel, CompletionDrain, CompletionQueue,
-    SubmissionDrain, SubmissionQueue,
+    completion_channel, submission_channel, Completion, CompletionDrain,
+    CompletionQueue, SubmissionDrain, SubmissionQueue, Submission,
 };
+use narf_ipc::SharedRing;
+use narf_memory::PhysAddr;
 
 /// Kernel-side keep of the ring pair Bootstrap minted for a task.
 /// Stored under the task id; SMP-safe via the outer lock.
@@ -211,11 +227,28 @@ impl core::fmt::Debug for UserRingEnds {
     }
 }
 
+/// Kernel-side handles to the user-mappable shared rings. The
+/// physical bases identify the backing pages; the kernel reaches
+/// them through the low-4-GiB identity map. `SharedProducer` /
+/// `SharedConsumer` are constructed on demand in `sys_ring_kick`.
+#[derive(Copy, Clone, Debug)]
+pub struct SharedRingPair {
+    /// Phys base of the SubmissionRing page (kernel reads).
+    pub sq_phys: PhysAddr,
+    /// Phys base of the CompletionRing page (kernel writes).
+    pub cq_phys: PhysAddr,
+    /// User vaddrs of the same pages (where the user binds its
+    /// own SharedProducer / SharedConsumer halves).
+    pub sq_user_vaddr: u64,
+    pub cq_user_vaddr: u64,
+}
+
 #[derive(Debug)]
 #[allow(dead_code)]  // fields read by the future dispatcher integration
 struct PerTaskBootstrap {
     kernel:     TaskRings,
     user:       UserRingEnds,
+    shared:     Option<SharedRingPair>,
     sq_cap_id:  u64,
     cq_cap_id:  u64,
 }
@@ -260,6 +293,7 @@ pub fn take_user_ends(task: u64) -> Option<UserRingEnds> {
     map.insert(task, PerTaskBootstrap {
         kernel: entry.kernel,
         user:   placeholder_user,
+        shared: entry.shared,
         sq_cap_id: entry.sq_cap_id,
         cq_cap_id: entry.cq_cap_id,
     });
@@ -286,10 +320,20 @@ pub fn take_kernel_ends(task: u64) -> Option<TaskRings> {
     map.insert(task, PerTaskBootstrap {
         kernel: placeholder_kernel,
         user:   entry.user,
+        shared: entry.shared,
         sq_cap_id: entry.sq_cap_id,
         cq_cap_id: entry.cq_cap_id,
     });
     Some(entry.kernel)
+}
+
+/// Look up the shared ring pair Bootstrap minted for `task`.
+/// Returns the kernel-side phys addresses + user vaddrs so the
+/// dispatcher (or `sys_ring_kick`) can attach to the same backing
+/// the user binds against. Idempotent.
+pub fn shared_rings_for(task: u64) -> Option<SharedRingPair> {
+    let g = BOOTSTRAP_TABLE.lock();
+    g.as_ref()?.get(&task)?.shared
 }
 
 /// Monotonic capslot allocator for the SQ/CQ pair. Stage-4
@@ -342,9 +386,21 @@ fn sys_bootstrap(ctx: &mut dyn TrapContext) {
     let sq_cap_id = NEXT_CAP_ID.fetch_add(1, Ordering::Relaxed);
     let cq_cap_id = NEXT_CAP_ID.fetch_add(1, Ordering::Relaxed);
 
+    // Mint the user-mappable SharedRing pair. Two phys frames, each
+    // a 4 KiB page; mapped into the user AS at successive vaddrs
+    // after the config page so the user can construct a
+    // `SharedProducer<Submission, 16>` against `shared_sq_vaddr`
+    // and a `SharedConsumer<Completion, 16>` against
+    // `shared_cq_vaddr` directly — no kernel hop on the fast path.
+    let shared = match unsafe { mint_shared_ring_pair(&as_ref) } {
+        Ok(s) => s,
+        Err(()) => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+    };
+
     let entry = PerTaskBootstrap {
         kernel: TaskRings { sq_drain, cq_prod },
         user:   UserRingEnds { sq_prod, cq_drain },
+        shared: Some(shared),
         sq_cap_id, cq_cap_id,
     };
     {
@@ -372,9 +428,55 @@ fn sys_bootstrap(ctx: &mut dyn TrapContext) {
         (*header).cq_cap   = cq_cap_id;
         (*header).sq_depth = BOOTSTRAP_RING_DEPTH as u32;
         (*header).cq_depth = BOOTSTRAP_RING_DEPTH as u32;
+        (*header).shared_sq_vaddr = shared.sq_user_vaddr;
+        (*header).shared_cq_vaddr = shared.cq_user_vaddr;
+        (*header).shared_depth    = BOOTSTRAP_SHARED_RING_DEPTH as u32;
+        (*header)._pad            = 0;
     }
 
     ctx.set_return(SyscallReturn::ok(user_vaddr));
+}
+
+/// Allocate two phys pages, init a SharedRing in each, map both
+/// into `as_ref` at successive vaddrs from the MMAP cursor, and
+/// return the kernel-side phys + user vaddr handles.
+unsafe fn mint_shared_ring_pair(
+    as_ref: &alloc::sync::Arc<AddressSpace>,
+) -> Result<SharedRingPair, ()> {
+    type SqRing = SharedRing<Submission, BOOTSTRAP_SHARED_RING_DEPTH>;
+    type CqRing = SharedRing<Completion, BOOTSTRAP_SHARED_RING_DEPTH>;
+    // Compile-time check: each ring fits in a single 4 KiB page.
+    const _: () = assert!(core::mem::size_of::<SqRing>() <= 4096);
+    const _: () = assert!(core::mem::size_of::<CqRing>() <= 4096);
+
+    let sq_phys = narf_memory::alloc_frame().map_err(|_| ())?.start_address();
+    let cq_phys = narf_memory::alloc_frame().map_err(|_| ())?.start_address();
+    // SAFETY: identity-mapped low 4 GiB + page-aligned phys.
+    unsafe {
+        core::ptr::write_bytes(sq_phys.raw() as *mut u8, 0, 4096);
+        core::ptr::write_bytes(cq_phys.raw() as *mut u8, 0, 4096);
+        SqRing::init_in(sq_phys.raw() as *mut SqRing);
+        CqRing::init_in(cq_phys.raw() as *mut CqRing);
+    }
+
+    let sq_vaddr = MMAP_CURSOR.fetch_add(0x1000, Ordering::Relaxed);
+    let cq_vaddr = MMAP_CURSOR.fetch_add(0x1000, Ordering::Relaxed);
+
+    as_ref.map_region(Region {
+        base:  VirtAddr::new(sq_vaddr), len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE, phys: sq_phys,
+    }).map_err(|_| ())?;
+    as_ref.map_region(Region {
+        base:  VirtAddr::new(cq_vaddr), len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE, phys: cq_phys,
+    }).map_err(|_| ())?;
+    unsafe { as_ref.materialize() }.map_err(|_| ())?;
+
+    Ok(SharedRingPair {
+        sq_phys, cq_phys,
+        sq_user_vaddr: sq_vaddr,
+        cq_user_vaddr: cq_vaddr,
+    })
 }
 
 // ── Open — arg0=path-ptr, arg1=path-len, arg2=mount-path-ptr,
@@ -626,6 +728,86 @@ fn sys_exit_task(ctx: &mut dyn TrapContext) {
     // Redirect succeeded → frame rewritten, `iretq` lands in kernel.
 }
 
+// ── RingKick — drain the shared SQ, post completions to the CQ ────
+//
+// The slow-path counterpart to a UIPI/UMWAIT-driven async dispatcher.
+// Once that wake side-channel lands, user code can submit + spin on
+// the CQ; for now, the user submits + calls `RingKick` + spin/poll.
+//
+// Reuses `abi_file_op_bridge` for OpenFile/Read/Write/Close/Mmap/Munmap
+// so a submission goes through the exact same handler path as a
+// trap-based syscall — keeps the two surfaces semantically identical.
+
+fn sys_ring_kick(ctx: &mut dyn TrapContext) {
+    use narf_abi::{FileOpArgs, FileOpKind, NarfStatus, OpCode};
+    use narf_ipc::{SharedConsumer, SharedProducer};
+
+    type SqRing = SharedRing<Submission, BOOTSTRAP_SHARED_RING_DEPTH>;
+    type CqRing = SharedRing<Completion, BOOTSTRAP_SHARED_RING_DEPTH>;
+
+    let task = current_task_id();
+    let pair = match shared_rings_for(task) {
+        Some(p) => p,
+        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+    };
+
+    // SAFETY: per-task BOOTSTRAP_TABLE owns the phys backings; only
+    // one ring-kick can run at a time per task because it executes
+    // synchronously inside this task's syscall trap.
+    let mut sq = unsafe {
+        SharedConsumer::<Submission, BOOTSTRAP_SHARED_RING_DEPTH>::from_raw(
+            pair.sq_phys.raw() as *mut SqRing,
+        )
+    };
+    let mut cq = unsafe {
+        SharedProducer::<Completion, BOOTSTRAP_SHARED_RING_DEPTH>::from_raw(
+            pair.cq_phys.raw() as *mut CqRing,
+        )
+    };
+
+    let mut processed: u64 = 0;
+    loop {
+        let sub = match sq.try_recv() {
+            Ok(s) => s,
+            Err(_) => break,
+        };
+        let tag = sub.tag();
+        let completion = match sub.op {
+            OpCode::Noop => Completion::ok(tag),
+            OpCode::OpenFile | OpCode::Read | OpCode::Write
+                | OpCode::Close | OpCode::Mmap | OpCode::Munmap => {
+                let kind = match sub.op {
+                    OpCode::OpenFile => FileOpKind::Open,
+                    OpCode::Read     => FileOpKind::Read,
+                    OpCode::Write    => FileOpKind::Write,
+                    OpCode::Close    => FileOpKind::Close,
+                    OpCode::Mmap     => FileOpKind::Mmap,
+                    OpCode::Munmap   => FileOpKind::Munmap,
+                    _ => unreachable!(),
+                };
+                let args = FileOpArgs {
+                    a0: sub.inline[0], a1: sub.inline[1], a2: sub.inline[2],
+                    a3: sub.inline[3], a4: sub.inline[4], a5: sub.inline[5],
+                };
+                let r = abi_file_op_bridge(kind, &args);
+                let status = if r.status == 0 { NarfStatus::Ok } else { NarfStatus::InvalidOp };
+                let mut result = [0u64; 6];
+                result[0] = r.value;
+                Completion::with(tag, status, result)
+            }
+            _ => Completion::with(tag, NarfStatus::InvalidOp, [0; 6]),
+        };
+        // CQ full = drop the completion; the user will see no
+        // completion for that tag and can detect via timeout. A
+        // production dispatcher backpressures the SQ instead;
+        // Stage-4 first cut keeps this minimal.
+        let _ = cq.try_send(completion);
+        processed = processed.saturating_add(1);
+    }
+
+    ctx.set_return(SyscallReturn::ok(processed));
+}
+
 // ── Yield / Sleep — Ok ─────────────────────────────────────────────
 
 fn sys_noop_ok(ctx: &mut dyn TrapContext) {
@@ -701,6 +883,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Close,    "close",    RawFnHandler(sys_close));
     table.install_raw(Syscall::Mmap,     "mmap",     RawFnHandler(sys_mmap));
     table.install_raw(Syscall::Munmap,   "munmap",   RawFnHandler(sys_munmap));
+    table.install_raw(Syscall::RingKick, "ringkick", RawFnHandler(sys_ring_kick));
     table.install_raw(Syscall::ExitTask, "exit",     RawFnHandler(sys_exit_task));
     table.install_raw(Syscall::Yield,    "yield",    RawFnHandler(sys_noop_ok));
     table.install_raw(Syscall::Sleep,    "sleep",    RawFnHandler(sys_noop_ok));
