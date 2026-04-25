@@ -5395,6 +5395,7 @@ fn smoke_userspace_bootstrap_returns_config_page() -> TestResult {
 
     install_address_space_lookup(as_lookup);
     install_task_id_lookup(task_lookup);
+    narf_userspace::bootstrap_init();
     __test_clear_global();
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
@@ -5436,7 +5437,7 @@ fn smoke_userspace_bootstrap_returns_config_page() -> TestResult {
     // Read header through identity map.
     #[repr(C)]
     struct Hdr { magic: u32, version: u32, task_id: u64,
-                 sq_cap: u64, cq_cap: u64, sq_pages: u32, cq_pages: u32 }
+                 sq_cap: u64, cq_cap: u64, sq_depth: u32, cq_depth: u32 }
     let hdr = unsafe { core::ptr::read_volatile(phys.raw() as *const Hdr) };
 
     if hdr.magic != 0x4E_41_52_46 {
@@ -5444,7 +5445,7 @@ fn smoke_userspace_bootstrap_returns_config_page() -> TestResult {
         __test_clear_global();
         return TestResult::Fail("config page magic mismatch");
     }
-    if hdr.version != 1 {
+    if hdr.version != 2 {
         *USER_AS_BS.lock() = None;
         __test_clear_global();
         return TestResult::Fail("config page version mismatch");
@@ -5454,9 +5455,25 @@ fn smoke_userspace_bootstrap_returns_config_page() -> TestResult {
         __test_clear_global();
         return TestResult::Fail("config page task_id mismatch");
     }
+    if hdr.sq_cap == 0 || hdr.cq_cap == 0 || hdr.sq_cap == hdr.cq_cap {
+        *USER_AS_BS.lock() = None;
+        __test_clear_global();
+        return TestResult::Fail("ring cap-slot ids unset or collide");
+    }
+    if hdr.sq_depth != 64 || hdr.cq_depth != 64 {
+        *USER_AS_BS.lock() = None;
+        __test_clear_global();
+        return TestResult::Fail("ring depths not 64");
+    }
+    if narf_userspace::bootstrap_live_count() < 1 {
+        *USER_AS_BS.lock() = None;
+        __test_clear_global();
+        return TestResult::Fail("bootstrap registry didn't record this task");
+    }
 
     *USER_AS_BS.lock() = None;
     __test_clear_global();
+    narf_userspace::handlers::__test_bootstrap_reset();
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]

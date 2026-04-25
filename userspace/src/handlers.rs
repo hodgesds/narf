@@ -149,20 +149,99 @@ pub fn clear_exit_landing() {
 // config-page user vaddr.
 
 const ABI_BOOTSTRAP_MAGIC: u32 = 0x4E_41_52_46;  // "NARF" LE
-const ABI_BOOTSTRAP_VERSION: u32 = 1;
+const ABI_BOOTSTRAP_VERSION: u32 = 2;
+/// Ring depth NARF bootstraps. Powers-of-two only per `narf-ipc`.
+/// 64 mirrors what the existing dispatcher tests use.
+const BOOTSTRAP_RING_DEPTH: u64 = 64;
 
 #[repr(C)]
 struct BootstrapHeader {
     magic:    u32,
     version:  u32,
     task_id:  u64,
-    /// Reserved for future pinning of (sq_cap, cq_cap, sq_size,
-    /// cq_size). Stage-4-first-cut leaves them zero.
+    /// Capslot ids the user runtime invokes against. They name
+    /// the SQ producer / CQ consumer the kernel-side dispatcher
+    /// is bound to.
     sq_cap:   u64,
     cq_cap:   u64,
-    sq_pages: u32,
-    cq_pages: u32,
+    /// Ring depths the kernel chose for this task.
+    sq_depth: u32,
+    cq_depth: u32,
 }
+
+// ── Per-task SQ/CQ store ──────────────────────────────────────────
+//
+// Bootstrap stores the kernel-side ring halves so the dispatcher
+// task (when wired) can pull from the SQ drain + push to the CQ
+// producer. Storage is the kernel-side ends only — the user-side
+// halves are pointed at by capslot ids written into the config
+// page.
+
+use alloc::collections::BTreeMap;
+use narf_abi::{
+    completion_channel, submission_channel, CompletionDrain, CompletionQueue,
+    SubmissionDrain, SubmissionQueue,
+};
+
+/// Kernel-side keep of the ring pair Bootstrap minted for a task.
+/// Stored under the task id; SMP-safe via the outer lock.
+pub struct TaskRings {
+    pub sq_drain: SubmissionDrain<64>,
+    pub cq_prod:  CompletionQueue<64>,
+}
+
+impl core::fmt::Debug for TaskRings {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TaskRings").finish_non_exhaustive()
+    }
+}
+
+/// User-side handles paired with the kernel-side ones above. Stored
+/// here too so the kernel can still talk to user-side endpoints
+/// before the user picks them up via cap (the cap slot id is just
+/// a stable opaque key Stage-4 callers exchange).
+pub struct UserRingEnds {
+    pub sq_prod:  SubmissionQueue<64>,
+    pub cq_drain: CompletionDrain<64>,
+}
+
+impl core::fmt::Debug for UserRingEnds {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("UserRingEnds").finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]  // fields read by the future dispatcher integration
+struct PerTaskBootstrap {
+    kernel:     TaskRings,
+    user:       UserRingEnds,
+    sq_cap_id:  u64,
+    cq_cap_id:  u64,
+}
+
+static BOOTSTRAP_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, PerTaskBootstrap>>>
+    = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Initialise the per-task bootstrap registry. Boot calls this
+/// once before any user task can issue `Syscall::Bootstrap`.
+pub fn bootstrap_init() {
+    *BOOTSTRAP_TABLE.lock() = Some(BTreeMap::new());
+}
+
+/// Reset the registry — test hook; drops every per-task ring set.
+#[doc(hidden)]
+pub fn __test_bootstrap_reset() { *BOOTSTRAP_TABLE.lock() = None; }
+
+/// Diagnostic: number of tasks that have called Bootstrap.
+pub fn bootstrap_live_count() -> usize {
+    BOOTSTRAP_TABLE.lock().as_ref().map(|m| m.len()).unwrap_or(0)
+}
+
+/// Monotonic capslot allocator for the SQ/CQ pair. Stage-4
+/// structural — Stage-5 routes through the real `capabilities/`
+/// table so revoke + transfer work.
+static NEXT_CAP_ID: AtomicU64 = AtomicU64::new(0x4000_0000);
 
 fn sys_bootstrap(ctx: &mut dyn TrapContext) {
     let as_ref = match current_address_space() {
@@ -200,18 +279,45 @@ fn sys_bootstrap(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    // Write the bootstrap header into the freshly-mapped phys
-    // (still identity-reachable from kernel mode).
+    // Mint the SQ + CQ ring pair. Kernel-side halves go into
+    // BOOTSTRAP_TABLE keyed by task id; user-side halves are
+    // tagged with newly-allocated cap-slot ids and stored beside
+    // them so the dispatcher knows who to talk to.
+    let (sq_prod, sq_drain) = submission_channel::<64>();
+    let (cq_prod, cq_drain) = completion_channel::<64>();
+    let sq_cap_id = NEXT_CAP_ID.fetch_add(1, Ordering::Relaxed);
+    let cq_cap_id = NEXT_CAP_ID.fetch_add(1, Ordering::Relaxed);
+
+    let entry = PerTaskBootstrap {
+        kernel: TaskRings { sq_drain, cq_prod },
+        user:   UserRingEnds { sq_prod, cq_drain },
+        sq_cap_id, cq_cap_id,
+    };
+    {
+        let mut g = BOOTSTRAP_TABLE.lock();
+        let map = match g.as_mut() {
+            Some(m) => m,
+            None    => {
+                ctx.set_return(SyscallReturn::invalid_op());
+                return;
+            }
+        };
+        // Replace any prior bootstrap state for this task.
+        map.insert(task, entry);
+    }
+
+    // Write the header. Capslot ids land in `sq_cap`/`cq_cap` so
+    // the user runtime can name the rings.
     // SAFETY: identity-mapped low 4 GiB; aligned u64 + u32 stores.
     unsafe {
         let header = phys.raw() as *mut BootstrapHeader;
         (*header).magic    = ABI_BOOTSTRAP_MAGIC;
         (*header).version  = ABI_BOOTSTRAP_VERSION;
         (*header).task_id  = task;
-        (*header).sq_cap   = 0;
-        (*header).cq_cap   = 0;
-        (*header).sq_pages = 0;
-        (*header).cq_pages = 0;
+        (*header).sq_cap   = sq_cap_id;
+        (*header).cq_cap   = cq_cap_id;
+        (*header).sq_depth = BOOTSTRAP_RING_DEPTH as u32;
+        (*header).cq_depth = BOOTSTRAP_RING_DEPTH as u32;
     }
 
     ctx.set_return(SyscallReturn::ok(user_vaddr));
