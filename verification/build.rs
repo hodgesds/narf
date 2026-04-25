@@ -24,75 +24,80 @@ fn main() {
 
     let enabled = env::var_os("CARGO_FEATURE_USER_MODE_E2E").is_some();
     if !enabled {
-        // Feature off — put a harmless placeholder path so
-        // `env!("NARF_TESTBIN_ELF")` still compiles on the gated
-        // `include_bytes!` site.
-        println!("cargo:rustc-env=NARF_TESTBIN_ELF=/dev/null");
+        // Feature off — placeholders so both `env!()`-based
+        // `include_bytes!` sites compile cleanly.
+        println!("cargo:rustc-env=NARF_TESTBIN_ELF_X86_64=/dev/null");
+        println!("cargo:rustc-env=NARF_TESTBIN_ELF_AARCH64=/dev/null");
         return;
     }
 
-    // Find the workspace root (parent of `verification`).
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let workspace = manifest_dir.parent().unwrap().to_path_buf();
     let testbin_dir = workspace.join("userspace").join("testbin");
-
-    // OUT_DIR to isolate the testbin's target directory from the
-    // host workspace's target — avoids LTO / build-std collisions.
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let target_dir = out_dir.join("testbin-target");
 
-    // Link-arg that feeds our script through the kernel-target
-    // rustc invocation. `-T` picks up the linker script.
-    let linker_script = testbin_dir.join("testbin.ld");
-    // Use CARGO_ENCODED_RUSTFLAGS so nothing from the outer
-    // workspace's `.cargo/config.toml` leaks through (its
-    // `[target.x86_64-unknown-none].rustflags` carries the
-    // kernel linker script + `code-model=kernel`, both wrong for
-    // user code). Encoded form is unit-separator-delimited.
-    let encoded_rustflags = [
-        "-C",
-        &format!("link-arg=-T{}", linker_script.display()),
-        "-C",
-        "relocation-model=static",
-        // The testbin links at 0x0000_0080_0000_1000 — well above
-        // the 2-GiB reach of code-model=small's R_X86_64_32S
-        // relocations. Large model uses 64-bit MOVABS for rodata
-        // references (slower, but correct for this vaddr).
-        "-C",
-        "code-model=large",
-    ].join("\x1f");
+    build_arch(
+        &testbin_dir,
+        &out_dir.join("testbin-target-x86_64"),
+        "x86_64-unknown-none",
+        &testbin_dir.join("testbin.ld"),
+        // `code-model=large` because the user vaddr is past the
+        // 2-GiB reach of small-model relocations.
+        Some("code-model=large"),
+        "NARF_TESTBIN_ELF_X86_64",
+    );
+    build_arch(
+        &testbin_dir,
+        &out_dir.join("testbin-target-aarch64"),
+        "aarch64-unknown-none",
+        &testbin_dir.join("testbin-aarch64.ld"),
+        // aarch64 large code-model is the default; no extra flag.
+        None,
+        "NARF_TESTBIN_ELF_AARCH64",
+    );
+}
+
+fn build_arch(
+    testbin_dir: &PathBuf,
+    target_dir: &PathBuf,
+    triple: &str,
+    linker_script: &PathBuf,
+    extra_flag: Option<&str>,
+    env_var: &str,
+) {
+    let mut flags: Vec<String> = vec![
+        "-C".into(),
+        format!("link-arg=-T{}", linker_script.display()),
+        "-C".into(),
+        "relocation-model=static".into(),
+    ];
+    if let Some(f) = extra_flag {
+        flags.push("-C".into());
+        flags.push(f.into());
+    }
+    let encoded_rustflags = flags.join("\x1f");
 
     let status = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
         .arg("build")
         .arg("--release")
-        .arg("--target").arg("x86_64-unknown-none")
-        .arg("--target-dir").arg(&target_dir)
-        // Nightly-only: build `core` from source for the
-        // `x86_64-unknown-none` target (rustup doesn't ship a
-        // precompiled `core` for the triple).
+        .arg("--target").arg(triple)
+        .arg("--target-dir").arg(target_dir)
         .arg("-Zbuild-std=core")
         .arg("-Zbuild-std-features=")
-        // Run from the testbin dir so cargo's config walk-up
-        // finds `userspace/testbin/.cargo/config.toml` (which
-        // clears the outer kernel-flags) instead of the outer
-        // workspace config. `--manifest-path` isn't enough — the
-        // config resolution follows CWD, not manifest location.
-        .current_dir(&testbin_dir)
+        .current_dir(testbin_dir)
         .env("CARGO_ENCODED_RUSTFLAGS", &encoded_rustflags)
         .env_remove("RUSTFLAGS")
-        // Clear the outer workspace's CARGO_TARGET_DIR so the
-        // nested invocation doesn't race on locks.
         .env_remove("CARGO_TARGET_DIR")
         .status()
-        .expect("spawn cargo for narf-testbin");
+        .unwrap_or_else(|e| panic!("spawn cargo for narf-testbin {triple}: {e}"));
     if !status.success() {
-        panic!("narf-testbin build failed with {status}");
+        panic!("narf-testbin {triple} build failed with {status}");
     }
 
     let bin = target_dir
-        .join("x86_64-unknown-none")
+        .join(triple)
         .join("release")
         .join("narf-testbin");
-    assert!(bin.exists(), "narf-testbin output missing: {}", bin.display());
-    println!("cargo:rustc-env=NARF_TESTBIN_ELF={}", bin.display());
+    assert!(bin.exists(), "narf-testbin output missing for {triple}: {}", bin.display());
+    println!("cargo:rustc-env={}={}", env_var, bin.display());
 }

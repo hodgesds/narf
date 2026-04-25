@@ -6292,7 +6292,10 @@ kernel_test!(smoke_frame_x86_64_user_mode_roundtrip);
 // ── Real Rust user binary run through the full pipeline ──────────────
 
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
-const NARF_TESTBIN_ELF: &[u8] = include_bytes!(env!("NARF_TESTBIN_ELF"));
+const NARF_TESTBIN_ELF: &[u8] = include_bytes!(env!("NARF_TESTBIN_ELF_X86_64"));
+
+#[cfg(all(target_arch = "aarch64", feature = "user-mode-e2e"))]
+const NARF_TESTBIN_ELF: &[u8] = include_bytes!(env!("NARF_TESTBIN_ELF_AARCH64"));
 
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
 fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
