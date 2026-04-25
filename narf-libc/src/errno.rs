@@ -18,6 +18,13 @@ use narf_user_runtime::thread_pointer;
 /// matches this layout.
 const ERRNO_TLS_OFFSET: isize = -8;
 
+/// POSIX errno values the libc shim sets. We keep the Linux
+/// numbering so a future relibc swap-in observes the same wire
+/// numbers without translation. The list grows as more shims
+/// land — only the values actually written show up here.
+pub const EINVAL: i32 = 22;
+pub const ERANGE: i32 = 34;
+
 /// Read `errno`. Returns 0 if no TLS is staged (thread pointer
 /// equals null) — this is a Stage-4 fallback so a binary without
 /// a PT_TLS segment doesn't fault on the first read.

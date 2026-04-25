@@ -129,6 +129,34 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         return;
     }
 
+    // Synchronous-signal delivery for user-mode CPU exceptions.
+    // Strict gate on CS RPL == 3 so kernel-mode exceptions stay
+    // on the existing probe-catch / panic path: the probe-catch
+    // surface below is for kernel-issued recovery (test
+    // infrastructure), and a kernel-mode crash is unambiguously
+    // a kernel bug we want to panic on.
+    //
+    // The hook returns true when it rewrote the trap frame to
+    // land at a user signal handler — fall through to the asm
+    // tail's iretq, which carries the rewritten RIP back to user
+    // mode where the handler runs. Returning false (no handler
+    // installed, or an unmappable vector like #DF) means the user
+    // genuinely deserves the panic surface below.
+    if (frame.cs & 3) == 3 {
+        if let Some(hook) = narf_userspace::sync_signal_hook() {
+            // Snapshot the vector before the mutable borrow of
+            // `frame` lands inside `from_int80`. The hook may
+            // rewrite RIP/RSP on the trap frame to deliver, so
+            // `frame` must be mutably borrowed for the duration
+            // of the call.
+            let vector = frame.vector;
+            let mut ctx = X86TrapContext::from_int80(frame);
+            if hook(&mut ctx, vector) {
+                return;
+            }
+        }
+    }
+
     // Recoverable-probe path. `consume` is atomic: a second fault
     // inside the handler can't double-claim the recovery.
     let recovery = narf_arch::x86_64::probe::consume(

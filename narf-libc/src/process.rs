@@ -113,3 +113,25 @@ pub fn getppid() -> i32 {
 pub fn getuid() -> i32 {
     narf_user_runtime::getuid() as i32
 }
+
+/// POSIX `sleep(3)`: suspend the calling task for `seconds`. The
+/// kernel-side handler today spin-waits in trap context (see
+/// `sys_sleep`), so this fundamentally burns the calling CPU
+/// until the deadline passes. Returns 0 (POSIX `sleep` returns
+/// the number of seconds left if interrupted by a signal; we
+/// don't yet interrupt sleeps mid-flight, so always 0).
+#[inline]
+pub fn sleep(seconds: u32) -> u32 {
+    let ns = (seconds as u64).saturating_mul(1_000_000_000);
+    let _ = narf_user_runtime::nanosleep(ns);
+    0
+}
+
+/// POSIX `usleep(3)`: suspend for `us` microseconds. Returns 0
+/// on success, -1 on error. Same caveat as [`sleep`] applies —
+/// the kernel handler spin-waits in trap context.
+#[inline]
+pub fn usleep(us: u32) -> i32 {
+    let ns = (us as u64).saturating_mul(1_000);
+    narf_user_runtime::nanosleep(ns)
+}
