@@ -1604,6 +1604,88 @@ fn smoke_ipc_spsc_round_trip() -> TestResult {
 }
 kernel_test!(smoke_ipc_spsc_round_trip);
 
+fn smoke_ipc_shared_ring_round_trip() -> TestResult {
+    // Allocate a frame, init a SharedRing<u64, 8> in it, then
+    // construct a producer through one raw pointer and a consumer
+    // through ANOTHER raw pointer aliasing the same backing — this
+    // mirrors how kernel and user mode reach a single shared page
+    // through different virtual mappings. Round-trip 8 messages and
+    // verify ordering + count.
+    use narf_ipc::{SharedConsumer, SharedProducer, SharedRing, SharedTryRecvError};
+
+    let frame = match narf_memory::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => return TestResult::Fail("alloc_frame"),
+    };
+    unsafe { core::ptr::write_bytes(frame.raw() as *mut u8, 0, 4096); }
+    let kernel_view = frame.raw() as *mut SharedRing<u64, 8>;
+
+    // Verify the layout fits in 4 KiB.
+    if SharedRing::<u64, 8>::size_bytes() > 4096 {
+        return TestResult::Fail("SharedRing<u64,8> larger than a 4 KiB page");
+    }
+
+    // Initialise.
+    unsafe { SharedRing::<u64, 8>::init_in(kernel_view); }
+
+    // Two distinct pointer values that resolve to the same backing
+    // (here, both are the same kernel-identity vaddr; in real use
+    // one of them would be the user's mapping of the same phys).
+    let user_view = frame.raw() as *mut SharedRing<u64, 8>;
+
+    let mut prod = unsafe { SharedProducer::<u64, 8>::from_raw(kernel_view) };
+    let mut cons = unsafe { SharedConsumer::<u64, 8>::from_raw(user_view) };
+
+    for v in 0u64..8 {
+        if prod.try_send(v).is_err() {
+            return TestResult::Fail("try_send unexpectedly failed");
+        }
+    }
+
+    // 9th must be Full.
+    if !matches!(prod.try_send(99), Err(narf_ipc::SharedTrySendError::Full(99))) {
+        return TestResult::Fail("9th send did not return Full(99)");
+    }
+
+    // Drain in order.
+    for expected in 0u64..8 {
+        match cons.try_recv() {
+            Ok(v) if v == expected => {}
+            Ok(_)  => return TestResult::Fail("recv out of order"),
+            Err(_) => return TestResult::Fail("recv failed early"),
+        }
+    }
+
+    // Empty path.
+    if !matches!(cons.try_recv(), Err(SharedTryRecvError::Empty)) {
+        return TestResult::Fail("empty recv did not surface Empty");
+    }
+
+    // Close from producer side; consumer should see Closed once empty.
+    prod.close();
+    if !matches!(cons.try_recv(), Err(SharedTryRecvError::Closed)) {
+        return TestResult::Fail("close not observed");
+    }
+
+    TestResult::Pass
+}
+kernel_test!(smoke_ipc_shared_ring_round_trip);
+
+fn smoke_ipc_shared_ring_size_bounds() -> TestResult {
+    // Both ABI-shape rings used by Stage-4 must fit in a single 4 KiB
+    // page so they're user-mappable as one mmap.
+    use narf_abi::{Completion, Submission};
+    use narf_ipc::SharedRing;
+    if SharedRing::<Submission, 16>::size_bytes() > 4096 {
+        return TestResult::Fail("SharedRing<Submission,16> > 4 KiB");
+    }
+    if SharedRing::<Completion, 16>::size_bytes() > 4096 {
+        return TestResult::Fail("SharedRing<Completion,16> > 4 KiB");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_ipc_shared_ring_size_bounds);
+
 fn smoke_ipc_spsc_try_send_full() -> TestResult {
     // Fill a 2-slot ring without a consumer; the third try_send must
     // return Full and hand the message back.

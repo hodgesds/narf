@@ -39,6 +39,12 @@ extern crate alloc;
 pub mod mpsc;
 pub use mpsc::{mpsc_channel, MpscConsumer, MpscProducer, MpscRecvError, MpscSendError};
 
+pub mod shared_ring;
+pub use shared_ring::{
+    SharedConsumer, SharedProducer, SharedRing,
+    TryRecvError as SharedTryRecvError, TrySendError as SharedTrySendError,
+};
+
 use alloc::sync::Arc;
 use core::cell::UnsafeCell;
 use core::future::Future;
