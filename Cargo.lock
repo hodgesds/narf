@@ -645,7 +645,6 @@ dependencies = [
  "narf-capabilities",
  "narf-console",
  "narf-filesystem",
- "narf-ipc",
  "narf-lib",
  "narf-memory",
  "narf-scheduler",

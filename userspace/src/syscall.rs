@@ -106,14 +106,6 @@ pub enum Syscall {
 
     /// Unmap memory.
     Munmap       = 121,
-
-    /// Kick the kernel-side dispatcher to drain the calling task's
-    /// shared SubmissionRing and post Completions to the shared
-    /// CompletionRing. Returns the number of submissions processed.
-    /// Used by the slow-path "submit + kick + poll" pattern when
-    /// the kernel doesn't yet have a UIPI / UMWAIT-driven async
-    /// dispatcher running.
-    RingKick     = 130,
 }
 
 impl Syscall {
@@ -136,7 +128,6 @@ impl Syscall {
             113 => Syscall::Close,
             120 => Syscall::Mmap,
             121 => Syscall::Munmap,
-            130 => Syscall::RingKick,
             _   => return None,
         })
     }
