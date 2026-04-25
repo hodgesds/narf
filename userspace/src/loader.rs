@@ -71,15 +71,16 @@ where
     if image.entry == 0          { return Err(LoadError::BadEntry); }
 
     for seg in &image.segments {
-        // First physical frame for this segment; subsequent pages
-        // walk contiguously from it (Stage-4 refinement will use a
-        // scatter list).
-        let phys = phys_pool.next().ok_or(LoadError::NoPhysFrames)?;
-        // Consume additional frames for any pages past the first so
-        // the pool is drained correctly — their addresses are
-        // implicit given `phys` is contiguous.
+        // Drain `pages` frames from the pool into a per-page scatter
+        // list. The freelist allocator returns frames in arbitrary
+        // order — collecting them per page is what makes multi-page
+        // and multi-segment loads correct.
         let pages = (seg.mem_size + 0xFFF) >> 12;
-        for _ in 1..pages { let _ = phys_pool.next().ok_or(LoadError::NoPhysFrames)?; }
+        let mut phys: alloc::vec::Vec<PhysAddr> =
+            alloc::vec::Vec::with_capacity(pages as usize);
+        for _ in 0..pages {
+            phys.push(phys_pool.next().ok_or(LoadError::NoPhysFrames)?);
+        }
 
         addr_space.map_region(Region {
             base:  VirtAddr::new(seg.vaddr),
@@ -192,28 +193,34 @@ pub unsafe fn load_elf_into_at(
     }
 
     // Push regions, mirroring `load_into` but with the bias applied
-    // to each segment's base vaddr.
-    let mut pool = allocated.iter().copied();
+    // to each segment's base vaddr. Each segment owns its own slice
+    // of the upfront-allocated frames as a per-page scatter list.
+    let mut cursor: usize = 0;
     for seg in &image.segments {
-        let first = pool.next().ok_or(LoadBytesError::NoFrame)?;
-        let pages = (seg.mem_size + 0xFFF) >> 12;
-        for _ in 1..pages { let _ = pool.next().ok_or(LoadBytesError::NoFrame)?; }
+        let pages = ((seg.mem_size + 0xFFF) >> 12) as usize;
+        let end = cursor.checked_add(pages).ok_or(LoadBytesError::NoFrame)?;
+        if end > allocated.len() { return Err(LoadBytesError::NoFrame); }
+        let phys: alloc::vec::Vec<PhysAddr> = allocated[cursor..end].to_vec();
+        cursor = end;
 
         addr_space.map_region(Region {
             base:  VirtAddr::new(seg.vaddr.wrapping_add(vaddr_bias)),
             len:   (pages as u64) << 12,
             perms: perms_of(seg.flags),
-            phys:  first,
+            phys,
         }).map_err(|e| LoadBytesError::Load(LoadError::AddressSpace(e)))?;
     }
 
-    // Copy segment data. Re-walk the pool in identical consumption
-    // order so each segment finds the frames it just got mapped to.
-    let mut pool = allocated.iter().copied();
+    // Copy segment data. The frames may not be physically contiguous
+    // (alloc_frame is a freelist), so we have to copy page by page,
+    // routing each 4 KiB chunk into its own backing frame. Pages
+    // past file_size stay zero (BSS) since the upfront zero pass
+    // covered the whole allocation.
+    let mut cursor: usize = 0;
     for seg in &image.segments {
-        let first = pool.next().ok_or(LoadBytesError::NoFrame)?;
-        let pages = (seg.mem_size + 0xFFF) >> 12;
-        for _ in 1..pages { let _ = pool.next(); }
+        let pages = ((seg.mem_size + 0xFFF) >> 12) as usize;
+        let frames = &allocated[cursor..cursor + pages];
+        cursor += pages;
 
         let start = seg.file_off as usize;
         let end   = start.checked_add(seg.file_size as usize)
@@ -222,14 +229,21 @@ pub unsafe fn load_elf_into_at(
             return Err(LoadBytesError::ByteCopyOutOfBounds);
         }
         let src = &bytes[start..end];
-        // SAFETY: allocated frames are identity-mapped; we write
-        // within the total size we allocated.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                src.as_ptr(),
-                first.raw() as *mut u8,
-                src.len(),
-            );
+
+        let mut written: usize = 0;
+        for &frame in frames.iter() {
+            if written >= src.len() { break; }
+            let chunk = core::cmp::min(4096, src.len() - written);
+            // SAFETY: `frame` is an identity-mapped freshly-allocated
+            // 4 KiB phys frame; chunk <= 4 KiB.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    src.as_ptr().add(written),
+                    frame.raw() as *mut u8,
+                    chunk,
+                );
+            }
+            written += chunk;
         }
     }
 

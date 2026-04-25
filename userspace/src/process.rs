@@ -148,27 +148,29 @@ pub unsafe fn load_user_process_with(
     }
 
     // Allocate + map a user stack. Pages come from the global
-    // frame allocator; they live in the AS's region table.
+    // frame allocator (a freelist — frames are not contiguous in
+    // general), so we collect each one into a per-page scatter list
+    // for the Region.
     let pages = (DEFAULT_USER_STACK_BYTES + 0xFFF) >> 12;
-    let mut stack_first_phys = None;
-    for i in 0..pages {
+    let mut stack_phys_list: alloc::vec::Vec<PhysAddr> =
+        alloc::vec::Vec::with_capacity(pages as usize);
+    for _ in 0..pages {
         let f = narf_memory::alloc_frame()
             .map_err(|_| ProcessLoadError::StackAllocFailed)?;
         let phys = f.start_address();
-        if i == 0 { stack_first_phys = Some(phys); }
         // Zero the stack page.
         // SAFETY: identity-mapped in low 4 GiB.
         unsafe {
             core::ptr::write_bytes(phys.raw() as *mut u8, 0, 4096);
         }
+        stack_phys_list.push(phys);
     }
-    let stack_phys = stack_first_phys.ok_or(ProcessLoadError::StackAllocFailed)?;
 
     address_space.map_region(Region {
         base:  VirtAddr::new(DEFAULT_USER_STACK_BASE),
         len:   pages * 4096,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys:  stack_phys,
+        phys:  stack_phys_list,
     }).map_err(|_| ProcessLoadError::StackMapFailed)?;
 
     // SAFETY: AS is from `load_elf_bytes` (hence `new_for_user`)
@@ -178,7 +180,6 @@ pub unsafe fn load_user_process_with(
 
     let stack_bytes  = pages * 4096;
     let stack_top_v  = DEFAULT_USER_STACK_BASE + stack_bytes;
-    let _ = stack_phys;  // resolved per-page through the AS now
 
     // Build the final aux vector: caller-supplied entries take
     // precedence; we append interp-related defaults (AT_ENTRY,

@@ -9164,12 +9164,12 @@ fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
     addr_space.map_region(Region {
         base: VirtAddr::new(CODE_VADDR), len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::EXEC | RegionPerms::WRITE,
-        phys: code_frame,
+        phys: alloc::vec![code_frame],
     }).ok();
     addr_space.map_region(Region {
         base: VirtAddr::new(STACK_VADDR), len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: stack_frame,
+        phys: alloc::vec![stack_frame],
     }).ok();
 
     // Hand-assembled user program (21 bytes):
@@ -9367,12 +9367,12 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
     addr_space.map_region(Region {
         base: VirtAddr::new(CODE_VADDR), len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::EXEC | RegionPerms::WRITE,
-        phys: code_frame,
+        phys: alloc::vec![code_frame],
     }).ok();
     addr_space.map_region(Region {
         base: VirtAddr::new(STACK_VADDR), len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: stack_frame,
+        phys: alloc::vec![stack_frame],
     }).ok();
 
     // Hand-assembled user program (40 bytes):
@@ -9498,12 +9498,12 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
     addr_space.map_region(Region {
         base: VirtAddr::new(CODE_VADDR), len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::EXEC | RegionPerms::WRITE,
-        phys: code_frame,
+        phys: alloc::vec![code_frame],
     }).ok();
     addr_space.map_region(Region {
         base: VirtAddr::new(STACK_VADDR), len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: stack_frame,
+        phys: alloc::vec![stack_frame],
     }).ok();
     let code_bytes: [u8; 20] = [
         0x48, 0xC7, 0xC0, 0x68, 0x00, 0x00, 0x00,    // mov rax, 104 (Yield)
@@ -9638,12 +9638,12 @@ fn smoke_userspace_user_task_future_yield_exit() -> TestResult {
     addr_space.map_region(Region {
         base: VirtAddr::new(CODE_VADDR), len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::EXEC | RegionPerms::WRITE,
-        phys: code_frame,
+        phys: alloc::vec![code_frame],
     }).ok();
     addr_space.map_region(Region {
         base: VirtAddr::new(STACK_VADDR), len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: stack_frame,
+        phys: alloc::vec![stack_frame],
     }).ok();
     // mov rax, 104 ; int 0x80 ; mov rax, 103 ; int 0x80 ; jmp $
     // First int 0x80 goes Yielded → re-poll → second int 0x80 Exited.

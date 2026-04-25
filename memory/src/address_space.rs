@@ -40,16 +40,21 @@ impl core::ops::BitOr for RegionPerms {
     fn bitor(self, rhs: RegionPerms) -> Self { RegionPerms(self.0 | rhs.0) }
 }
 
-/// A contiguous user-mode mapping.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+/// A user-mode mapping. The virtual range is contiguous; the
+/// physical backing is a per-page scatter list — `phys[i]` covers
+/// the page at `base + i * 4096`. The frame allocator is a freelist
+/// so consecutive `alloc_frame` calls don't return adjacent
+/// physical frames in general; the earlier "single base + assume
+/// contiguous" shape silently miscompiled multi-page mappings any
+/// time the freelist had been touched between page allocations.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Region {
     pub base:     VirtAddr,
     pub len:      u64,
     pub perms:    RegionPerms,
-    /// Physical frame the first page of `base` maps to. Multi-frame
-    /// mappings walk contiguous physical frames for Stage-4
-    /// structural — the Stage-4+ refinement uses a scatter list.
-    pub phys:     PhysAddr,
+    /// Per-page phys backing. Length must equal `len / 4096`; an
+    /// empty Vec is a structural error rejected by `map_region`.
+    pub phys:     Vec<PhysAddr>,
 }
 
 /// Errors from the address-space surface.
@@ -132,6 +137,13 @@ impl AddressSpace {
         if region.base.as_u64() & 0xFFF != 0 || region.len & 0xFFF != 0 {
             return Err(AddressSpaceError::AlignmentMismatch);
         }
+        // Per-page scatter list must cover every page in the region —
+        // anything else means the caller computed `len` and `phys`
+        // out of sync, which would silently leave pages unbacked or
+        // leak frames during materialize.
+        if region.phys.len() as u64 != region.len >> 12 {
+            return Err(AddressSpaceError::AlignmentMismatch);
+        }
         let end = region.base.as_u64().checked_add(region.len)
             .ok_or(AddressSpaceError::OutOfRange)?;
         let mut regions = self.regions.lock();
@@ -181,14 +193,13 @@ impl AddressSpace {
             if r.perms.contains(RegionPerms::WRITE) { flags = flags | PtFlags::WRITABLE; }
             if !r.perms.contains(RegionPerms::EXEC) { flags = flags | PtFlags::NO_EXEC; }
 
-            let pages = r.len >> 12;
-            for i in 0..pages {
-                let v = crate::VirtAddr::new(r.base.as_u64() + (i << 12));
-                let p = crate::PhysAddr::new(r.phys.as_u64() + (i << 12));
+            for (i, p) in r.phys.iter().enumerate() {
+                let v = crate::VirtAddr::new(r.base.as_u64() + ((i as u64) << 12));
                 // SAFETY: `self.root` is a valid PML4 per the
                 // `new_for_user` contract; pages walked are within
-                // the region we're materialising.
-                match unsafe { map_4kb(self.root, v, p, flags) } {
+                // the region we're materialising. `phys[i]` was
+                // length-checked against `len/4096` at map_region.
+                match unsafe { map_4kb(self.root, v, *p, flags) } {
                     Ok(()) => {}
                     Err(MapError::AlreadyMapped) => {}   // idempotent
                     Err(_)                        => return Err(AddressSpaceError::NotImplemented),
@@ -215,13 +226,12 @@ impl AddressSpace {
             if !r.perms.contains(RegionPerms::EXEC) {
                 flags = flags | PtFlags::UXN | PtFlags::PXN;
             }
-            let pages = r.len >> 12;
-            for i in 0..pages {
-                let v = crate::VirtAddr::new(r.base.as_u64() + (i << 12));
-                let p = crate::PhysAddr::new(r.phys.as_u64() + (i << 12));
+            for (i, p) in r.phys.iter().enumerate() {
+                let v = crate::VirtAddr::new(r.base.as_u64() + ((i as u64) << 12));
                 // SAFETY: root is valid per `new_for_user`; pages
                 // covered are within the just-allocated region.
-                match unsafe { map_4kb(self.root, v, p, flags) } {
+                // `phys[i]` length was checked at map_region.
+                match unsafe { map_4kb(self.root, v, *p, flags) } {
                     Ok(()) => {}
                     Err(MapError::AlreadyMapped) => {}
                     Err(_) => return Err(AddressSpaceError::NotImplemented),
@@ -242,7 +252,7 @@ impl AddressSpace {
         let a = vaddr.as_u64();
         self.regions.lock().iter().find(|r| {
             a >= r.base.as_u64() && a < r.base.as_u64() + r.len
-        }).copied()
+        }).cloned()
     }
 
     /// Make this address-space the active one. On x86_64 issues a

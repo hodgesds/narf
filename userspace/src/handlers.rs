@@ -367,7 +367,7 @@ fn sys_bootstrap(ctx: &mut dyn TrapContext) {
         // page to R-only after the kernel populates it; the user
         // ring builders read from it but don't write.
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys,
+        phys:  alloc::vec![phys],
     }).is_err() {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -461,11 +461,13 @@ unsafe fn mint_shared_ring_pair(
 
     as_ref.map_region(Region {
         base:  VirtAddr::new(sq_vaddr), len: 0x1000,
-        perms: RegionPerms::READ | RegionPerms::WRITE, phys: sq_phys,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys:  alloc::vec![sq_phys],
     }).map_err(|_| ())?;
     as_ref.map_region(Region {
         base:  VirtAddr::new(cq_vaddr), len: 0x1000,
-        perms: RegionPerms::READ | RegionPerms::WRITE, phys: cq_phys,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys:  alloc::vec![cq_phys],
     }).map_err(|_| ())?;
     unsafe { as_ref.materialize() }.map_err(|_| ())?;
 
@@ -648,23 +650,18 @@ fn sys_mmap(ctx: &mut dyn TrapContext) {
     let pages = len >> 12;
     let base  = MMAP_CURSOR.fetch_add(len, Ordering::Relaxed);
 
-    // Allocate contiguous frames (Stage-4 simplification; real
-    // Mmap uses scattered pages with demand-paging).
-    let first_phys = match narf_memory::alloc_frame() {
-        Ok(f) => f.start_address(),
-        Err(_) => { ctx.set_return(SyscallReturn::invalid_op()); return; }
-    };
-    for _ in 1..pages {
-        if narf_memory::alloc_frame().is_err() {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    }
-
-    // Zero the allocated region.
-    // SAFETY: identity-mapped in low 4 GiB.
-    unsafe {
-        core::ptr::write_bytes(first_phys.raw() as *mut u8, 0, len as usize);
+    // Allocate one frame per page and zero each. The freelist returns
+    // frames out of order so we collect into a per-page scatter list.
+    let mut phys_list: alloc::vec::Vec<narf_memory::PhysAddr> =
+        alloc::vec::Vec::with_capacity(pages as usize);
+    for _ in 0..pages {
+        let p = match narf_memory::alloc_frame() {
+            Ok(f) => f.start_address(),
+            Err(_) => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        };
+        // SAFETY: identity-mapped in low 4 GiB; phys is page-aligned.
+        unsafe { core::ptr::write_bytes(p.raw() as *mut u8, 0, 4096); }
+        phys_list.push(p);
     }
 
     // Install + materialise.
@@ -672,7 +669,7 @@ fn sys_mmap(ctx: &mut dyn TrapContext) {
         base:  VirtAddr::new(base),
         len,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys:  first_phys,
+        phys:  phys_list,
     }).is_err() {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -930,7 +927,7 @@ fn sys_brk(ctx: &mut dyn TrapContext) {
             base:  VirtAddr::new(va),
             len:   0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys,
+            phys:  alloc::vec![phys],
         }).is_err() {
             ctx.set_return(SyscallReturn::ok(cur));
             return;
