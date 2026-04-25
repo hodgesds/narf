@@ -71,6 +71,60 @@ pub static ABI_DISPATCH_LATENCY: FnTime = FnTime::new("abi::dispatch_one");
 /// cancel-chain consume/enter is observable in isolation.
 pub static ABI_CANCEL_CHECK_LATENCY: FnTime = FnTime::new("abi::cancel_check");
 
+// ── File-op delegate ──────────────────────────────────────────────
+//
+// The Dispatcher delegates `OpCode::OpenFile`/`Read`/`Write`/`Close`
+// to a kernel-installed bridge fn so the same code path that backs
+// the int-0x80 / svc-#0 syscalls also serves ABI-ring submissions.
+// Boot wires `narf_userspace::handlers::abi_file_op_bridge` here;
+// without it the dispatcher returns `InvalidOp`.
+
+/// Numeric tag of the file-op the bridge is being asked to perform.
+/// Mirrors `narf_userspace::Syscall::*` discriminants but kept
+/// arch-neutral here (abi/ can't depend on userspace).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FileOpKind {
+    Open  = 110,
+    Read  = 111,
+    Write = 112,
+    Close = 113,
+}
+
+/// 6-arg payload + a return slot. Mirrors the
+/// `Submission::inline` / `Completion::result` shape so the bridge
+/// can route between the two without knowing about either.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FileOpArgs {
+    pub a0: u64, pub a1: u64, pub a2: u64,
+    pub a3: u64, pub a4: u64, pub a5: u64,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub struct FileOpReturn {
+    pub status: u32,  // 0 = Ok, 1 = InvalidOp, ... — mirrors NarfStatus.
+    pub value:  u64,
+}
+
+type FileOpBridge = fn(FileOpKind, &FileOpArgs) -> FileOpReturn;
+
+static FILE_OP_BRIDGE: IrqSafeSpinLock<Option<FileOpBridge>> =
+    IrqSafeSpinLock::new(None);
+
+/// Install the bridge that routes ring-submitted file ops into the
+/// kernel's regular syscall path. Boot calls this once with
+/// `narf_userspace::handlers::abi_file_op_bridge`.
+pub fn install_file_op_bridge(bridge: FileOpBridge) {
+    *FILE_OP_BRIDGE.lock() = Some(bridge);
+}
+
+fn dispatch_file_op(kind: FileOpKind, args: &FileOpArgs) -> FileOpReturn {
+    let g = FILE_OP_BRIDGE.lock();
+    match *g {
+        Some(b) => b(kind, args),
+        None    => FileOpReturn { status: 1 /* InvalidOp */, value: 0 },
+    }
+}
+
 // ── OpCode ──────────────────────────────────────────────────────────
 //
 // `#[repr(u32)]` with explicit discriminants: the wire tag is the byte
@@ -111,6 +165,15 @@ pub enum OpCode {
 
     /// Exit the current protection domain; inverse of `DomainEnter`.
     DomainExit   = 0x0006,
+
+    /// File ops mirror `narf_userspace::Syscall`'s file numbers.
+    /// Inline operands match: `inline[0]=fd or path-ptr`,
+    /// `inline[1]=path-len or buf-ptr`, etc. `Completion::result[0]`
+    /// is the bytes-read/written or new fd, like `SyscallReturn::value`.
+    OpenFile     = 0x0010,
+    Read         = 0x0011,
+    Write        = 0x0012,
+    Close        = 0x0013,
 }
 
 impl OpCode {
@@ -651,6 +714,25 @@ impl<const N: usize> Dispatcher<N> {
             OpCode::Yield => {
                 narf_scheduler::yield_now().await;
                 Completion::ok(tag)
+            }
+
+            OpCode::OpenFile | OpCode::Read | OpCode::Write | OpCode::Close => {
+                let kind = match sub.op {
+                    OpCode::OpenFile => FileOpKind::Open,
+                    OpCode::Read     => FileOpKind::Read,
+                    OpCode::Write    => FileOpKind::Write,
+                    OpCode::Close    => FileOpKind::Close,
+                    _ => unreachable!(),
+                };
+                let args = FileOpArgs {
+                    a0: sub.inline[0], a1: sub.inline[1], a2: sub.inline[2],
+                    a3: sub.inline[3], a4: sub.inline[4], a5: sub.inline[5],
+                };
+                let r = dispatch_file_op(kind, &args);
+                let status = if r.status == 0 { NarfStatus::Ok } else { NarfStatus::InvalidOp };
+                let mut result = [0u64; 6];
+                result[0] = r.value;
+                Completion::with(tag, status, result)
             }
 
             _ => {

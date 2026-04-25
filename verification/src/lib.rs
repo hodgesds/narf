@@ -5364,6 +5364,187 @@ fn smoke_memory_address_space_region_table() -> TestResult {
 kernel_test!(smoke_memory_address_space_region_table);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_abi_dispatcher_serves_file_ops() -> TestResult {
+    // Bootstrap mints rings, kernel installs the
+    // abi-file-op-bridge, dispatcher runs on the kernel-side
+    // ends, user-side task issues an `OpCode::Open` followed by
+    // `OpCode::Read` against a stub-FS file mounted under
+    // `/test_abi`. The completion's result[0] carries the bytes-
+    // read count; the user-mapped buffer holds the file's bytes.
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU8, Ordering};
+    use narf_abi::{Dispatcher, Submission, OpCode, Tag, NarfStatus};
+    use narf_capabilities::{Cap, Grant};
+    use narf_filesystem::{
+        bootstrap_mount_authority, registry, DirEntry, DirOps, FileOps,
+        FsFuture, FsInstance, MountPoint, Stat,
+    };
+    use narf_memory::AddressSpace;
+    use narf_userspace::{
+        abi_file_op_bridge, install_address_space_lookup, install_core_syscalls,
+        install_global, install_task_id_lookup, syscall::__test_clear_global,
+        SyscallTable,
+    };
+
+    static FILE_BYTES: &[u8] = b"VFS-via-ABI";
+    struct StubFile;
+    impl FileOps for StubFile {
+        fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+            alloc::boxed::Box::pin(async move {
+                let off = offset as usize;
+                if off >= FILE_BYTES.len() { return Ok(0); }
+                let n = core::cmp::min(buf.len(), FILE_BYTES.len() - off);
+                buf[..n].copy_from_slice(&FILE_BYTES[off..off + n]);
+                Ok(n)
+            })
+        }
+        fn write<'a>(&'a self, _o: u64, b: &'a [u8]) -> FsFuture<'a, usize> {
+            let n = b.len();
+            alloc::boxed::Box::pin(async move { Ok(n) })
+        }
+        fn stat(&self) -> Stat {
+            Stat { size: FILE_BYTES.len() as u64, blocks: 1,
+                   mode: narf_filesystem::Mode::FILE_RO,
+                   mtime_cycles: 0 }
+        }
+    }
+    struct StubDir;
+    impl DirOps for StubDir {
+        fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+            if name == "f" { Some(Arc::new(StubFile)) } else { None }
+        }
+        fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
+            Box::new(core::iter::empty())
+        }
+    }
+    struct StubFs;
+    impl FsInstance for StubFs {
+        fn root(&self) -> Arc<dyn DirOps> { Arc::new(StubDir) }
+        fn name(&self) -> &str { "stub_abi" }
+    }
+
+    let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+    let _ = registry().mount(&auth, "/test_abi", StubFs);
+
+    static USER_AS_ABI: narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>>
+        = narf_lib::sync::IrqSafeSpinLock::new(None);
+    fn as_lookup() -> Option<Arc<AddressSpace>> { USER_AS_ABI.lock().clone() }
+    static FAKE_TASK: u64 = 0xABBA;
+    fn task_lookup() -> u64 { FAKE_TASK }
+
+    let addr_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => return TestResult::Fail("new_for_user failed"),
+    };
+    *USER_AS_ABI.lock() = Some(addr_space);
+
+    install_address_space_lookup(as_lookup);
+    install_task_id_lookup(task_lookup);
+    narf_userspace::fd::__test_reset();
+    narf_userspace::fd::init();
+    narf_userspace::bootstrap_init();
+    narf_abi::install_file_op_bridge(abi_file_op_bridge);
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Direct Bootstrap call (test runs in kernel context).
+    use narf_userspace::{kernel_syscall_entry, Syscall, SyscallArgs,
+                         SyscallReturn, TrapContext};
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+    let mut ctx = FakeCtx { args: SyscallArgs::default(), ret: None };
+    kernel_syscall_entry(Syscall::Bootstrap.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
+        return TestResult::Fail("Bootstrap returned non-Ok");
+    }
+
+    let kernel_ends = narf_userspace::take_kernel_ends(FAKE_TASK).expect("ke");
+    let user_ends   = narf_userspace::take_user_ends(FAKE_TASK).expect("ue");
+
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+    OUTCOME.store(0, Ordering::Relaxed);
+
+    // Stable-static buffers for the path/mount/data so the user
+    // task can hand pointers across awaits without lifetime
+    // complications.
+    static PATH:  &[u8] = b"f";
+    static MOUNT: &[u8] = b"/test_abi";
+    static mut READ_BUF: [u8; 16] = [0u8; 16];
+
+    narf_scheduler::init();
+    narf_scheduler::spawn(async move {
+        let mut d = Dispatcher::new(kernel_ends.sq_drain, kernel_ends.cq_prod);
+        d.run().await;
+    });
+    narf_scheduler::spawn(async move {
+        let mut sq = user_ends.sq_prod;
+        let mut cq = user_ends.cq_drain;
+
+        // Open(/test_abi, "f").
+        let mut sub = Submission::noop(Tag::new(0x10));
+        sub.op = OpCode::OpenFile;
+        sub.inline[0] = PATH.as_ptr() as u64;
+        sub.inline[1] = PATH.len() as u64;
+        sub.inline[2] = MOUNT.as_ptr() as u64;
+        sub.inline[3] = MOUNT.len() as u64;
+        sq.send(sub).await.unwrap();
+        let comp = cq.recv().await.unwrap();
+        if comp.status != NarfStatus::Ok || comp.result[0] != 3 {
+            OUTCOME.store(2, Ordering::Relaxed);
+            core::mem::drop(sq); core::mem::drop(cq);
+            return;
+        }
+        let fd = comp.result[0];
+
+        // Read(fd, READ_BUF, 16).
+        let mut sub = Submission::noop(Tag::new(0x11));
+        sub.op = OpCode::Read;
+        sub.inline[0] = fd;
+        sub.inline[1] = unsafe { core::ptr::addr_of_mut!(READ_BUF) as u64 };
+        sub.inline[2] = 16;
+        sq.send(sub).await.unwrap();
+        let comp = cq.recv().await.unwrap();
+        if comp.status != NarfStatus::Ok {
+            OUTCOME.store(3, Ordering::Relaxed);
+            core::mem::drop(sq); core::mem::drop(cq);
+            return;
+        }
+        let n = comp.result[0] as usize;
+        let buf = unsafe { &READ_BUF };
+        if &buf[..n] == FILE_BYTES {
+            OUTCOME.store(1, Ordering::Relaxed);
+        } else {
+            OUTCOME.store(4, Ordering::Relaxed);
+        }
+        core::mem::drop(sq); core::mem::drop(cq);
+    });
+
+    narf_scheduler::run_until_empty();
+
+    *USER_AS_ABI.lock() = None;
+    narf_userspace::fd::__test_reset();
+    narf_userspace::handlers::__test_bootstrap_reset();
+    __test_clear_global();
+
+    match OUTCOME.load(Ordering::Relaxed) {
+        1 => TestResult::Pass,
+        2 => TestResult::Fail("Open completion was not Ok / fd != 3"),
+        3 => TestResult::Fail("Read completion was not Ok"),
+        4 => TestResult::Fail("Read bytes mismatched expected payload"),
+        _ => TestResult::Fail("user-side task did not complete"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_abi_dispatcher_serves_file_ops);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_userspace_bootstrap_rings_round_trip() -> TestResult {
     // Full Bootstrap path: mint config page + ring pair, spawn
     // an `abi::Dispatcher` task on the kernel-side ends, and

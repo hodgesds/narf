@@ -634,6 +634,39 @@ fn sys_noop_ok(ctx: &mut dyn TrapContext) {
 
 // ── Installer ──────────────────────────────────────────────────────
 
+/// Bridge fn boot installs into `narf_abi::install_file_op_bridge`.
+/// Routes ring-submitted file ops through the same `SyscallTable`
+/// the int-0x80 / svc gate uses.
+pub fn abi_file_op_bridge(
+    kind: narf_abi::FileOpKind,
+    args: &narf_abi::FileOpArgs,
+) -> narf_abi::FileOpReturn {
+    let num: u32 = match kind {
+        narf_abi::FileOpKind::Open  => Syscall::OpenFile.raw(),
+        narf_abi::FileOpKind::Read  => Syscall::Read.raw(),
+        narf_abi::FileOpKind::Write => Syscall::Write.raw(),
+        narf_abi::FileOpKind::Close => Syscall::Close.raw(),
+    };
+    let sargs = crate::SyscallArgs {
+        arg0: args.a0, arg1: args.a1, arg2: args.a2,
+        arg3: args.a3, arg4: args.a4, arg5: args.a5,
+    };
+    // Plain entry only fires plain handlers; our file ops are
+    // raw. Build a synthetic `TrapContext` whose
+    // `redirect_to_kernel` returns false (so handlers that would
+    // unwind fall back to `set_return`), then route through
+    // `kernel_syscall_entry`.
+    struct BridgeCtx { args: crate::SyscallArgs, ret: crate::SyscallReturn }
+    impl crate::TrapContext for BridgeCtx {
+        fn args(&self) -> &crate::SyscallArgs { &self.args }
+        fn set_return(&mut self, r: crate::SyscallReturn) { self.ret = r; }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+    let mut ctx = BridgeCtx { args: sargs, ret: crate::SyscallReturn::invalid_op() };
+    crate::kernel_syscall_entry(num, &mut ctx);
+    narf_abi::FileOpReturn { status: ctx.ret.status, value: ctx.ret.value }
+}
+
 /// Drop the core set of handlers into `table`. Idempotent — later
 /// subsystems can install richer handlers over the same slots
 /// (e.g. a real file-descriptor-backed `Read`).
