@@ -27,6 +27,8 @@ const SYS_EXIT_TASK: u64 = 103;
 #[cfg(target_arch = "x86_64")]
 const SYS_MMAP:      u64 = 120;
 #[cfg(target_arch = "x86_64")]
+const SYS_MUNMAP:    u64 = 121;
+#[cfg(target_arch = "x86_64")]
 const SYS_BOOTSTRAP: u64 = 101;
 #[cfg(target_arch = "x86_64")]
 const SYS_OPEN:      u64 = 110;
@@ -229,11 +231,20 @@ fn start_rust(rsp_at_entry: u64) -> ! {
             }
 
             let addr = syscall3(SYS_MMAP, 0, 0x1000, 0);
-            // Probe-write to the mmap'd page.
+            // Probe-write + munmap round-trip. munmap returning 0
+            // proves the inverse of mmap works at CPL=3.
+            const MOK:    &[u8] = b"mmap: ok\n";
+            const MBAD:   &[u8] = b"mmap: bad\n";
+            let mut mmap_ok = false;
             if addr != 0 && addr != !0u64 {
                 let p = addr as *mut u64;
                 core::ptr::write_volatile(p, 0xCAFEu64);
+                let r = syscall3(SYS_MUNMAP, addr, 0, 0);
+                mmap_ok = r == 0;
             }
+            let (mp_a, ml_a) = if mmap_ok { (MOK.as_ptr(), MOK.len()) }
+                                else        { (MBAD.as_ptr(), MBAD.len()) };
+            syscall3(SYS_WRITE, 1, mp_a as u64, ml_a as u64);
 
             // Bootstrap: mint per-task config page + SQ/CQ rings.
             // Returns the user vaddr of the config page; first u32
