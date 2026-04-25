@@ -121,6 +121,13 @@ pub enum Syscall {
     /// stub: returns 0 unconditionally; real ppid lands once the
     /// scheduler tracks parentage.
     GetPpid      = 141,
+
+    /// POSIX-shaped uid/gid query. NARF doesn't model POSIX
+    /// uid/gid (capabilities replace them); these return 0
+    /// unconditionally so relibc's `getuid()` / `getgid()` /
+    /// `geteuid()` / `getegid()` return a sane value.
+    GetUid       = 142,
+    GetGid       = 143,
 }
 
 impl Syscall {
@@ -146,6 +153,8 @@ impl Syscall {
             130 => Syscall::RingKick,
             140 => Syscall::GetPid,
             141 => Syscall::GetPpid,
+            142 => Syscall::GetUid,
+            143 => Syscall::GetGid,
             _   => return None,
         })
     }

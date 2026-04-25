@@ -879,6 +879,8 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::RingKick, "ringkick", RawFnHandler(sys_ring_kick));
     table.install_raw(Syscall::GetPid,   "getpid",   RawFnHandler(sys_getpid));
     table.install_raw(Syscall::GetPpid,  "getppid",  RawFnHandler(sys_getppid));
+    table.install_raw(Syscall::GetUid,   "getuid",   RawFnHandler(sys_noop_ok));
+    table.install_raw(Syscall::GetGid,   "getgid",   RawFnHandler(sys_noop_ok));
     table.install_raw(Syscall::ExitTask, "exit",     RawFnHandler(sys_exit_task));
     table.install_raw(Syscall::Yield,    "yield",    RawFnHandler(sys_noop_ok));
     table.install_raw(Syscall::Sleep,    "sleep",    RawFnHandler(sys_noop_ok));
