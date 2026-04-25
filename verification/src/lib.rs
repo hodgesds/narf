@@ -8682,6 +8682,157 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
 kernel_test!(smoke_frame_x86_64_user_task_poll_yield_exit);
 
+#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
+fn smoke_userspace_user_task_future_yield_exit() -> TestResult {
+    // Stage-4 capstone: the polling future drives a CPL=3 task to
+    // completion via the cooperative executor. Same user binary as
+    // `smoke_frame_x86_64_user_task_poll_yield_exit` (Yield → Yield
+    // → ExitTask), but plumbed through `UserTaskFuture::poll` and
+    // `narf_scheduler::spawn_user` rather than a bespoke setjmp
+    // dance — proving the future shape is the load-bearing piece
+    // that wasn't possible before.
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
+    use narf_userspace::{
+        install_core_syscalls, install_global, install_user_task_hooks,
+        syscall::__test_clear_global, SyscallTable, UserProcess,
+        UserTaskFuture,
+    };
+
+    static SAVED_CR3: AtomicU64 = AtomicU64::new(0);
+    static OUTER_DONE: AtomicBool = AtomicBool::new(false);
+
+    OUTER_DONE.store(false, Ordering::Release);
+    __test_clear_global();
+    narf_userspace::user_task::__test_clear_hooks();
+
+    // Snapshot CR3 — `UserTaskFuture` restores its own snapshot on
+    // each poll, but the *outer* test cleanup also needs the right
+    // root in case the future is dropped without finishing (failure
+    // path).
+    let original_cr3: u64;
+    unsafe {
+        core::arch::asm!("mov {v}, cr3", v = out(reg) original_cr3,
+            options(nostack, preserves_flags));
+    }
+    SAVED_CR3.store(original_cr3, Ordering::Release);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let mut addr_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Fail("new_for_user"),
+    };
+    const CODE_VADDR:  u64 = 0x0000_0080_0000_0000;
+    const STACK_VADDR: u64 = 0x0000_0080_0000_1000;
+    let code_frame = match narf_memory::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => return TestResult::Fail("alloc code"),
+    };
+    let stack_frame = match narf_memory::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => return TestResult::Fail("alloc stack"),
+    };
+    addr_space.map_region(Region {
+        base: VirtAddr::new(CODE_VADDR), len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::EXEC | RegionPerms::WRITE,
+        phys: code_frame,
+    }).ok();
+    addr_space.map_region(Region {
+        base: VirtAddr::new(STACK_VADDR), len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: stack_frame,
+    }).ok();
+    // mov rax, 104 ; int 0x80 ; mov rax, 103 ; int 0x80 ; jmp $
+    // First int 0x80 goes Yielded → re-poll → second int 0x80 Exited.
+    let code_bytes: [u8; 20] = [
+        0x48, 0xC7, 0xC0, 0x68, 0x00, 0x00, 0x00,    // mov rax, 104 (Yield)
+        0xCD, 0x80,                                   // int 0x80
+        0x48, 0xC7, 0xC0, 0x67, 0x00, 0x00, 0x00,    // mov rax, 103 (ExitTask)
+        0xCD, 0x80,                                   // int 0x80
+        0xEB, 0xFE,                                   // jmp $
+    ];
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            code_bytes.as_ptr(), code_frame.raw() as *mut u8, code_bytes.len(),
+        );
+    }
+    if unsafe { addr_space.materialize() }.is_err() {
+        return TestResult::Fail("materialize");
+    }
+
+    let stack_top = STACK_VADDR + 0x1000;
+    let proc = UserProcess {
+        pid:           narf_userspace::alloc_pid(),
+        address_space: Arc::new(addr_space),
+        entry:         narf_userspace::EntryPoint(VirtAddr::new(CODE_VADDR)),
+        stack_top:     VirtAddr::new(stack_top),
+    };
+    let address_space_clone = proc.address_space.clone();
+
+    // Boot the executor + wire the user-task hooks so Yield/Exit
+    // longjmps reach the polling future.
+    narf_scheduler::init();
+    install_user_task_hooks();
+
+    // The user task itself, plus a ".join()" outer task that flips
+    // OUTER_DONE once the user task's future has Ready'd. Spawning
+    // the user task via `spawn_user` is the load-bearing line —
+    // this is the path that wasn't possible before.
+    let _user_id = narf_scheduler::spawn_user(
+        UserTaskFuture::new(proc),
+        narf_scheduler::TaskSpec::unthrottled(),
+        address_space_clone,
+    );
+    narf_scheduler::spawn(async {
+        // Wait one yield round so the user task gets polled at least
+        // once before we observe completion. With cooperative
+        // single-CPU execution, by the time the user task drops
+        // (Ready), this task's awake flag has been refreshed and we
+        // get to run.
+        narf_scheduler::yield_now().await;
+        narf_scheduler::yield_now().await;
+        narf_scheduler::yield_now().await;
+        OUTER_DONE.store(true, Ordering::Release);
+    });
+
+    narf_scheduler::run_until_empty();
+
+    // Final cleanup — UserTaskFuture's poll body already left CR3 +
+    // KERNEL_GS_BASE in their kernel-side states with IF=0, but we
+    // belt-and-suspender the kernel CR3 here too in case a divergent
+    // failure path skipped that.
+    unsafe {
+        let cr3 = SAVED_CR3.load(Ordering::Acquire);
+        core::arch::asm!("mov cr3, {v}", v = in(reg) cr3,
+            options(nostack, preserves_flags));
+        const IA32_KERNEL_GS_BASE: u32 = 0xC0000102;
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") IA32_KERNEL_GS_BASE,
+            in("eax") 0u32,
+            in("edx") 0u32,
+            options(nostack, preserves_flags),
+        );
+        // IF stays 0 — the kernel-test build never enabled the
+        // LAPIC timer, so leaving IF=1 wedges the next
+        // halt_until_irq. (See commit 401b073.)
+        core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+    }
+    narf_userspace::user_task::__test_clear_hooks();
+    __test_clear_global();
+
+    if !OUTER_DONE.load(Ordering::Acquire) {
+        return TestResult::Fail("outer task never ran — executor stalled?");
+    }
+    TestResult::Pass
+}
+#[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
+kernel_test!(smoke_userspace_user_task_future_yield_exit);
+
 // ── Real Rust user binary run through the full pipeline ──────────────
 
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]

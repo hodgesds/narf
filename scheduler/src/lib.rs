@@ -56,7 +56,17 @@ pub use narf_capabilities::Invoke;
 // latent flakes in the e2e suite. The transitive dep already
 // exists (`narf-scheduler` → `narf-arch`); this just exposes it.
 #[cfg(target_arch = "x86_64")]
-pub use narf_arch::x86_64::{enter_user_mode_resume, UserState};
+pub use narf_arch::x86_64::{
+    enter_user_mode, enter_user_mode_resume, longjmp, setjmp, JmpBuf,
+    UserState, USER_RFLAGS,
+};
+
+// `halt_forever` is the right "I should never reach here" sink for
+// the user-task hook fast-paths in `narf-userspace`. Re-exported
+// for the same reason the user-mode primitives are: avoids a fresh
+// direct `narf-arch` dep on `narf-userspace` that re-perturbs link
+// ordering.
+pub use narf_arch::halt_forever;
 
 // Re-export the time crate so `narf-userspace` (already a downstream
 // of `narf-scheduler`) can read the monotonic clock without taking a

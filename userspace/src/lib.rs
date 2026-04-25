@@ -61,8 +61,8 @@ pub use handlers::{
 pub use user_task::{
     clear_current as clear_current_user_task, current_user_task,
     install_current as install_current_user_task, install_exit_hook,
-    install_yield_hook, UserExit, UserTaskCtx, EXIT_REASON_EXITED,
-    EXIT_REASON_YIELDED,
+    install_user_task_hooks, install_yield_hook, TaskState, UserExit,
+    UserTaskCtx, UserTaskFuture, EXIT_REASON_EXITED, EXIT_REASON_YIELDED,
 };
 pub use loader::{
     load_elf_bytes, load_elf_into_at, load_into, EntryPoint, LoadBytesError, LoadError,

@@ -4,8 +4,10 @@
 //! downstream of `narf-arch` can build a polling future around a
 //! task that lives at CPL=3 between polls. `narf-frame` still
 //! owns the trap-side glue and the GDT/IDT setup; this module
-//! holds only the wire-stable state shape and the naked-asm
-//! `iretq` resume.
+//! holds only the wire-stable state shape, the naked-asm
+//! `iretq` resume / first-entry, and the kernel-side
+//! `setjmp`/`longjmp` pair the polling routine uses to bounce
+//! out of user mode on a trap.
 //!
 //! Pairs with `narf_userspace::TrapContext::save_user_state`,
 //! which the trap handler calls to populate a `UserState` slot
@@ -13,7 +15,7 @@
 
 #![allow(unused)]
 
-use core::arch::naked_asm;
+use core::arch::{asm, naked_asm};
 
 /// Snapshot of a user-mode task's CPU state at trap time. Field
 /// order is load-bearing — `enter_user_mode_resume`'s naked asm
@@ -43,6 +45,117 @@ pub struct UserState {
 const UCODE_SEL: u64 = 0x33;
 /// User-data segment selector (DPL=3).
 const UDATA_SEL: u64 = 0x2B;
+
+/// RFLAGS value to hand user mode: IF=1 (interrupts enabled), the
+/// always-set reserved bit at position 1. Everything else zero —
+/// user code shouldn't inherit kernel debug / alignment flags.
+pub const USER_RFLAGS: u64 = 0x0000_0202;
+
+/// Callee-saved register snapshot for the `setjmp`/`longjmp` pair
+/// the polling-future / verification harnesses use to resume
+/// cleanly after a user-mode round-trip. Field order is
+/// load-bearing — the naked asm reads by byte offset.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct JmpBuf {
+    pub rbx: u64,  // offset 0
+    pub rbp: u64,  // offset 8
+    pub r12: u64,  // offset 16
+    pub r13: u64,  // offset 24
+    pub r14: u64,  // offset 32
+    pub r15: u64,  // offset 40
+    pub rsp: u64,  // offset 48
+    pub rip: u64,  // offset 56
+}
+
+/// Save callee-saved registers + caller's RSP + caller's return
+/// RIP into `*buf`. Returns `0` on the initial call. A subsequent
+/// `longjmp(buf, val)` resumes at the saved RIP, returning `val`
+/// (forced non-zero so callers can distinguish) — effectively a
+/// second "return" from this call site.
+///
+/// # Safety
+/// `buf` must point at a valid, properly-aligned `JmpBuf`.
+#[unsafe(naked)]
+pub unsafe extern "C" fn setjmp(buf: *mut JmpBuf) -> u64 {
+    naked_asm!(
+        // SysV ABI: first ptr arg in rdi.
+        "mov [rdi +  0], rbx",
+        "mov [rdi +  8], rbp",
+        "mov [rdi + 16], r12",
+        "mov [rdi + 24], r13",
+        "mov [rdi + 32], r14",
+        "mov [rdi + 40], r15",
+        // Caller's RSP is one qword above the CALL-pushed return
+        // address — i.e. `rsp + 8` here inside this naked fn.
+        "lea rax, [rsp + 8]",
+        "mov [rdi + 48], rax",
+        // Caller's return RIP is at the top of the stack.
+        "mov rax, [rsp]",
+        "mov [rdi + 56], rax",
+        "xor rax, rax",
+        "ret",
+    );
+}
+
+/// Resume at `buf`'s saved state, returning `val` from the
+/// corresponding `setjmp`. `val = 0` is rewritten to `1` so the
+/// caller can always distinguish initial-call from longjmp paths.
+///
+/// # Safety
+/// `buf` must have been populated by a prior `setjmp`, and the
+/// saved RSP must still reference a live kernel stack.
+#[unsafe(naked)]
+pub unsafe extern "C" fn longjmp(buf: *const JmpBuf, val: u64) -> ! {
+    naked_asm!(
+        // SysV: buf in rdi, val in rsi.
+        "mov rbx, [rdi +  0]",
+        "mov rbp, [rdi +  8]",
+        "mov r12, [rdi + 16]",
+        "mov r13, [rdi + 24]",
+        "mov r14, [rdi + 32]",
+        "mov r15, [rdi + 40]",
+        "mov rsp, [rdi + 48]",
+        "mov rax, rsi",
+        "test rax, rax",
+        "jnz 1f",
+        "inc rax",
+        "1:",
+        "jmp qword ptr [rdi + 56]",
+    );
+}
+
+/// First-entry transfer into user mode. Builds a synthetic iretq
+/// frame `(ss, rsp, rflags, cs, rip)` and `iretq`s. Does not
+/// return — the only path back is a trap.
+///
+/// # Safety
+/// - The active page table must map `rip` executable + user-mode
+///   accessible, and `rsp` writable + user-mode accessible.
+/// - `TSS.rsp0` must hold a valid kernel-stack top so the inevitable
+///   trap back into the kernel has somewhere to land.
+/// - The caller must have set up any per-CPU state
+///   (`IA32_KERNEL_GS_BASE` etc.) the user context expects; the
+///   `swapgs` here moves the kernel's GS.base into KERNEL_GS_BASE
+///   so the entry-side swapgs in the trap path can swing it back.
+/// - Interrupts should be disabled across the iretq — this function
+///   does not disable them; the caller owns that invariant.
+#[unsafe(naked)]
+pub unsafe extern "C" fn enter_user_mode(rip: u64, rsp: u64) -> ! {
+    naked_asm!(
+        // SysV: rip in rdi, rsp in rsi.
+        "swapgs",
+        "push {udata}",                   // ss
+        "push rsi",                       // rsp
+        "push {rflags}",                  // rflags (IF=1)
+        "push {ucode}",                   // cs
+        "push rdi",                       // rip
+        "iretq",
+        udata  = const UDATA_SEL,
+        ucode  = const UCODE_SEL,
+        rflags = const USER_RFLAGS,
+    );
+}
 
 /// Resume user mode at the state captured in `*state`. Restores
 /// every GPR + RIP + RFLAGS + RSP via the iretq frame; never

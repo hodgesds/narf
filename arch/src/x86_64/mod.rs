@@ -11,7 +11,10 @@ pub mod user_mode;
 
 pub use asm::{halt_forever, disable_interrupts, enable_interrupts, cas128, patch_word};
 pub use cpuid::Features;
-pub use user_mode::{enter_user_mode_resume, UserState};
+pub use user_mode::{
+    enter_user_mode, enter_user_mode_resume, longjmp, setjmp, JmpBuf,
+    UserState, USER_RFLAGS,
+};
 
 /// x86_64's concrete `DomainPrimitive` type. All methods forward to
 /// the free functions in `pks` — the trait is just a way to let
