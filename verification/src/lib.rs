@@ -7586,8 +7586,8 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_userspace::{
         clear_exit_landing, install_address_space_lookup, install_core_syscalls,
-        install_global, load_user_process, set_exit_landing,
-        syscall::__test_clear_global, SyscallTable,
+        install_global, load_user_process_with, set_exit_landing,
+        syscall::__test_clear_global, AuxEntry, SyscallTable,
     };
 
     static mut JMP2: UserModeJmpBuf = UserModeJmpBuf {
@@ -7730,9 +7730,15 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
     if NARF_TESTBIN_ELF.is_empty() {
         return TestResult::Skip("narf-testbin not built (feature disabled?)");
     }
-    let proc = match unsafe { load_user_process(NARF_TESTBIN_ELF) } {
+    // Hand argv = ["narf-testbin", "argA"] to the loader so the
+    // testbin can exercise the SysV-stack startup contract from
+    // CPL=3 and verify [rsp]=argc, argv[0]="narf-testbin".
+    let argv = ["narf-testbin", "argA"];
+    let envp: [&str; 0] = [];
+    let aux  = [AuxEntry::Pagesz(4096)];
+    let proc = match unsafe { load_user_process_with(NARF_TESTBIN_ELF, &argv, &envp, &aux) } {
         Ok(p) => p,
-        Err(_) => return TestResult::Fail("load_user_process failed on narf-testbin"),
+        Err(_) => return TestResult::Fail("load_user_process_with failed on narf-testbin"),
     };
 
     // Stash the user AS so Mmap/Munmap handlers can find it via

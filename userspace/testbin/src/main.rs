@@ -126,8 +126,35 @@ unsafe fn syscall0(num: u64) -> u64 {
     ret
 }
 
+// Naked entry point. SysV-AMD64 startup contract: at entry, [rsp]
+// = argc, [rsp+8..] = argv pointers, etc. We grab the original
+// rsp before any prologue runs, hand it to `start_rust` as the
+// first argument, then align rsp to 16 (SysV ABI requires) and
+// tail-call.
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _start() -> ! {
+    core::arch::naked_asm!(
+        "mov rdi, rsp",
+        "and rsp, -16",
+        "call {entry}",
+        // start_rust is `-> !`; if it returns we're in trouble — fall
+        // through to ud2.
+        "ud2",
+        entry = sym start_rust,
+    );
+}
+
+// aarch64 has no argv-on-stack reading in this round; keep the
+// existing flow.
+#[cfg(target_arch = "aarch64")]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
+    start_rust(0)
+}
+
+fn start_rust(rsp_at_entry: u64) -> ! {
     const MSG:    &[u8] = b"user: ok\n";
     #[cfg(target_arch = "x86_64")]
     const BOK:    &[u8] = b"boot: ok\n";
@@ -143,11 +170,36 @@ pub extern "C" fn _start() -> ! {
     const MOUNT:     &[u8] = b"/testbin";
     #[cfg(target_arch = "x86_64")]
     const FILE_BYTES: &[u8] = b"hello-fs";
+    #[cfg(target_arch = "x86_64")]
+    const AOK:        &[u8] = b"argv: ok\n";
+    #[cfg(target_arch = "x86_64")]
+    const ABAD:       &[u8] = b"argv: bad\n";
+    #[cfg(target_arch = "x86_64")]
+    const EXPECT_ARGV0: &[u8] = b"narf-testbin";
     // SAFETY: we're the user program, the kernel has set up the
     // int-0x80 gate, and the message lives in our RX segment.
     unsafe {
         #[cfg(target_arch = "x86_64")]
         {
+            // argv probe: read argc + argv[0] string from the
+            // entry-rsp passed into start_rust. If the kernel ran
+            // load_user_process_with(["narf-testbin", ...]), argc
+            // is 2 and argv[0] points to "narf-testbin".
+            if rsp_at_entry != 0 {
+                let argc = core::ptr::read_volatile(rsp_at_entry as *const u64);
+                let argv0_p = core::ptr::read_volatile((rsp_at_entry + 8) as *const u64);
+                let mut argv_ok = argc >= 1 && argv0_p != 0;
+                if argv_ok {
+                    for i in 0..EXPECT_ARGV0.len() {
+                        let b = core::ptr::read_volatile((argv0_p + i as u64) as *const u8);
+                        if b != EXPECT_ARGV0[i] { argv_ok = false; break; }
+                    }
+                }
+                let (ap, al) = if argv_ok { (AOK.as_ptr(), AOK.len()) }
+                                else       { (ABAD.as_ptr(), ABAD.len()) };
+                syscall3(SYS_WRITE, 1, ap as u64, al as u64);
+            }
+
             let addr = syscall3(SYS_MMAP, 0, 0x1000, 0);
             // Probe-write to the mmap'd page.
             if addr != 0 && addr != !0u64 {
