@@ -133,6 +133,56 @@ pub fn clear_exit_landing() {
     EXIT_LANDING_RSP.store(0, Ordering::Release);
 }
 
+// ── Open — arg0=path-ptr, arg1=path-len, arg2=mount-path-ptr,
+//          arg3=mount-path-len ───────────────────────────────────────
+//
+// Stage-4 minimum: the user supplies (mount, path-under-mount) as
+// two separate strings rather than the POSIX absolute-path
+// convention. Resolves the mount, calls `filesystem::resolve` on
+// it, installs the resulting `FileOps` in the calling task's fd
+// table, returns the new fd. POSIX-shaped path parsing (split a
+// single absolute path into mount + relative) lands when the VFS
+// has a mount-point matcher.
+
+fn sys_open(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let path_ptr = args.arg0 as *const u8;
+    let path_len = args.arg1 as usize;
+    let mnt_ptr  = args.arg2 as *const u8;
+    let mnt_len  = args.arg3 as usize;
+    if path_ptr.is_null() || path_len == 0 || mnt_ptr.is_null() || mnt_len == 0 {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    // SAFETY: user pointers in active AS, length-bounded.
+    let path_bytes = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
+    let mnt_bytes  = unsafe { core::slice::from_raw_parts(mnt_ptr, mnt_len) };
+    let path = match core::str::from_utf8(path_bytes) {
+        Ok(s) => s,
+        Err(_) => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+    };
+    let mount = match core::str::from_utf8(mnt_bytes) {
+        Ok(s) => s,
+        Err(_) => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+    };
+
+    let ops = match narf_filesystem::registry().with_mount(mount, |fs| {
+        narf_filesystem::resolve(fs.root(), path).ok()
+    }).flatten() {
+        Some(o) => o,
+        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+    };
+
+    let task = current_task_id();
+    let new_fd = match fd::with_table(task, |t| {
+        t.open(crate::fd::FdEntry { ops, offset: 0 })
+    }) {
+        Some(n) => n,
+        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+    };
+    ctx.set_return(SyscallReturn::ok(new_fd as u64));
+}
+
 // ── Write — arg0=fd, arg1=buf, arg2=len ────────────────────────────
 //
 // fd 1 / fd 2: console (stdout/stderr) — direct path so user code
@@ -331,6 +381,7 @@ fn sys_noop_ok(ctx: &mut dyn TrapContext) {
 /// subsystems can install richer handlers over the same slots
 /// (e.g. a real file-descriptor-backed `Read`).
 pub fn install_core_syscalls(table: &mut SyscallTable) {
+    table.install_raw(Syscall::OpenFile, "open",     RawFnHandler(sys_open));
     table.install_raw(Syscall::Write,    "write",    RawFnHandler(sys_write));
     table.install_raw(Syscall::Read,     "read",     RawFnHandler(sys_read));
     table.install_raw(Syscall::Close,    "close",    RawFnHandler(sys_close));

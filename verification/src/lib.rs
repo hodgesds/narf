@@ -5363,6 +5363,134 @@ fn smoke_memory_address_space_region_table() -> TestResult {
 }
 kernel_test!(smoke_memory_address_space_region_table);
 
+fn smoke_userspace_open_routes_through_vfs() -> TestResult {
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_capabilities::{Cap, Grant};
+    use narf_filesystem::{
+        bootstrap_mount_authority, registry, DirEntry, DirOps, FileOps,
+        FsFuture, FsInstance, MountPoint, Stat,
+    };
+    use narf_userspace::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+
+    // ── Tiny FS: one file `hello` returning fixed bytes. ──────────
+    static FILE_BYTES: &[u8] = b"VFS-OPENED";
+    struct StubFile;
+    impl FileOps for StubFile {
+        fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+            alloc::boxed::Box::pin(async move {
+                let off = offset as usize;
+                if off >= FILE_BYTES.len() { return Ok(0); }
+                let n = core::cmp::min(buf.len(), FILE_BYTES.len() - off);
+                buf[..n].copy_from_slice(&FILE_BYTES[off..off + n]);
+                Ok(n)
+            })
+        }
+        fn write<'a>(&'a self, _o: u64, b: &'a [u8]) -> FsFuture<'a, usize> {
+            let n = b.len();
+            alloc::boxed::Box::pin(async move { Ok(n) })
+        }
+        fn stat(&self) -> Stat {
+            Stat { size: FILE_BYTES.len() as u64, blocks: 1,
+                   mode: narf_filesystem::Mode::FILE_RO,
+                   mtime_cycles: 0 }
+        }
+    }
+    struct StubDir;
+    impl DirOps for StubDir {
+        fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+            if name == "hello" { Some(Arc::new(StubFile)) } else { None }
+        }
+        fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
+            Box::new(core::iter::empty())
+        }
+    }
+    struct StubFs;
+    impl FsInstance for StubFs {
+        fn root(&self) -> Arc<dyn DirOps> { Arc::new(StubDir) }
+        fn name(&self) -> &str { "stub" }
+    }
+
+    // ── Mount the stub FS at "/test". ─────────────────────────────
+    let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+    if registry().mount(&auth, "/test", StubFs).is_err() {
+        return TestResult::Fail("VFS mount of stub failed");
+    }
+
+    // ── Wire the userspace fd + task-id lookups. ──────────────────
+    fd::__test_reset();
+    fd::init();
+
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(99);
+    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    install_task_id_lookup(task_lookup);
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // ── Fire Open via kernel_syscall_entry. ───────────────────────
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+    let path = b"hello";
+    let mount = b"/test";
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: path.as_ptr() as u64,  arg1: path.len() as u64,
+            arg2: mount.as_ptr() as u64, arg3: mount.len() as u64,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::OpenFile.raw(), &mut ctx);
+    let opened_fd = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value as u32,
+        _ => return TestResult::Fail("Open did not return Ok"),
+    };
+    if opened_fd != 3 {
+        return TestResult::Fail("Open did not return fd 3");
+    }
+
+    // ── Read 16 via the new fd, expect FILE_BYTES. ────────────────
+    let mut buf = [0u8; 16];
+    let mut rctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: opened_fd as u64,
+            arg1: buf.as_mut_ptr() as u64,
+            arg2: 16,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Read.raw(), &mut rctx);
+    let n = match rctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value as usize,
+        _ => return TestResult::Fail("Read after Open returned non-Ok"),
+    };
+    if n != FILE_BYTES.len() {
+        return TestResult::Fail("Read returned wrong byte count");
+    }
+    if &buf[..n] != FILE_BYTES {
+        return TestResult::Fail("Read returned wrong bytes");
+    }
+
+    // Cleanup so other tests don't trip over the mount.
+    fd::__test_reset();
+    __test_clear_global();
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_open_routes_through_vfs);
+
 fn smoke_userspace_read_write_routes_through_fd_table() -> TestResult {
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicU64, Ordering};
