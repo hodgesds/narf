@@ -71,6 +71,9 @@ pub const SYS_GETCWD:         u64 = 171;
 
 pub const SYS_LSEEK:          u64 = 164;
 pub const SYS_UNLINK:         u64 = 180;
+pub const SYS_MKDIR:          u64 = 190;
+pub const SYS_RMDIR:          u64 = 191;
+pub const SYS_RENAME:         u64 = 192;
 
 /// `fcntl` command constants — match Linux numbering for the subset
 /// NARF supports today (FD_CLOEXEC + the file-flag query/set pair).
@@ -193,6 +196,27 @@ unsafe fn syscall4(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     rax
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn syscall5(
+    num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64,
+) -> u64 {
+    let mut rax = num;
+    // SAFETY: r8 is the 5th-arg register (NARF mirrors Linux's
+    // amd64 kernel convention; see `syscall3` for the RDX rationale).
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inout("rax") rax,
+            in("rdi") a0, in("rsi") a1, inout("rdx") a2 => _,
+            in("r10") a3, in("r8") a4,
+            out("rcx") _, out("r11") _,
+            options(nostack, preserves_flags),
+        );
+    }
+    rax
+}
+
 // aarch64: x8 = number, x0..x5 = args, return in x0. svc #0 enters
 // the lower-EL sync vector which routes via
 // `rust_aarch64_sync_dispatch`.
@@ -273,6 +297,25 @@ unsafe fn syscall4(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
             in("x8") num,
             inout("x0") a0 => ret,
             in("x1") a1, in("x2") a2, in("x3") a3,
+            options(nostack, preserves_flags),
+        );
+    }
+    ret
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn syscall5(
+    num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64,
+) -> u64 {
+    let mut ret: u64;
+    // SAFETY: see `syscall0`.
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") num,
+            inout("x0") a0 => ret,
+            in("x1") a1, in("x2") a2, in("x3") a3, in("x4") a4,
             options(nostack, preserves_flags),
         );
     }
@@ -431,17 +474,32 @@ pub fn nanosleep(ns: u64) -> i32 {
 // ── VFS ────────────────────────────────────────────────────────────
 
 /// Open `path` under `mount`. Returns the fd on success, `None`
-/// on failure (kernel returns `!0u64`).
+/// on failure (kernel returns `!0u64`). Convenience for the
+/// `flags = 0` (read-existing) case; see [`open_flags`] for
+/// `O_CREAT` / `O_TRUNC`-style usage.
 #[inline]
 pub fn open(path: &str, mount: &str) -> Option<u32> {
-    // SAFETY: SYS_OPEN takes (path_ptr, path_len, mount_ptr, mount_len).
+    open_flags(path, mount, 0)
+}
+
+/// `O_CREAT` — create the file if missing. Numeric value matches
+/// Linux so a libc shim can re-use `<fcntl.h>` constants verbatim.
+pub const O_CREAT: u64 = 0o100;
+
+/// Open `path` under `mount` with explicit flags. The kernel
+/// honours `O_CREAT` on the absolute-path form (mount = "")
+/// today; other flags are accepted and ignored.
+#[inline]
+pub fn open_flags(path: &str, mount: &str, flags: u64) -> Option<u32> {
+    // SAFETY: SYS_OPEN takes (path_ptr, path_len, mount_ptr, mount_len, flags).
     // The pointers stay valid for the trap because `&str` borrows
     // outlive the call.
     let r = unsafe {
-        syscall4(
+        syscall5(
             SYS_OPEN,
             path.as_ptr() as u64, path.len() as u64,
             mount.as_ptr() as u64, mount.len() as u64,
+            flags,
         )
     };
     if r == !0u64 { None } else { Some(r as u32) }
@@ -589,16 +647,59 @@ pub fn lseek(fd: u32, offset: i64, whence: u32) -> i64 {
 }
 
 /// `unlink(path)` — remove a file by absolute path. Returns 0 on
-/// success, -1 on failure. Stage-4 stub: VFS doesn't yet expose a
-/// remove primitive, so the kernel returns InvalidOp and this
-/// always fails.
+/// success, -1 on failure. The kernel routes through
+/// `DirOps::unlink` on the parent directory; FSes that don't
+/// implement removal (initramfs, virtiofs skeleton) surface -1.
 #[inline]
 pub fn unlink(path: &str) -> i32 {
-    // SAFETY: SYS_UNLINK signature: (path_ptr, path_len).
+    // SAFETY: SYS_UNLINK signature: (path_ptr, path_len). Failure
+    // sentinel is `-1` cast to u64 because the asm wrapper observes
+    // only the value register, not the status.
     let r = unsafe {
         syscall2(SYS_UNLINK, path.as_ptr() as u64, path.len() as u64)
     };
-    if r == 0 { 0 } else { -1 }
+    if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `mkdir(path, mode)` — create a directory. Returns 0 / -1.
+/// `mode` is accepted and ignored today.
+#[inline]
+pub fn mkdir(path: &str, mode: u32) -> i32 {
+    // SAFETY: SYS_MKDIR signature: (path_ptr, path_len, mode).
+    let r = unsafe {
+        syscall3(
+            SYS_MKDIR,
+            path.as_ptr() as u64, path.len() as u64,
+            mode as u64,
+        )
+    };
+    if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `rmdir(path)` — remove an empty directory. Returns 0 / -1.
+#[inline]
+pub fn rmdir(path: &str) -> i32 {
+    // SAFETY: SYS_RMDIR signature: (path_ptr, path_len).
+    let r = unsafe {
+        syscall2(SYS_RMDIR, path.as_ptr() as u64, path.len() as u64)
+    };
+    if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `rename(old, new)` — same-directory rename. Returns 0 / -1.
+/// Cross-directory rename is unsupported today.
+#[inline]
+pub fn rename(old_path: &str, new_path: &str) -> i32 {
+    // SAFETY: SYS_RENAME signature:
+    //   (old_ptr, old_len, new_ptr, new_len).
+    let r = unsafe {
+        syscall4(
+            SYS_RENAME,
+            old_path.as_ptr() as u64, old_path.len() as u64,
+            new_path.as_ptr() as u64, new_path.len() as u64,
+        )
+    };
+    if r as i64 == -1 { -1 } else { 0 }
 }
 
 /// `pipe()` — allocate a fresh pipe and install both halves in the

@@ -374,6 +374,56 @@ pub extern "C" fn main(
         &[],
     );
 
+    // open(O_CREAT) — recreate a fresh /tmp/created file via the
+    // kernel's parent-directory `create()` path. The first open
+    // returns a valid fd (≥ 3); a second open WITHOUT O_CREAT then
+    // also succeeds, proving the file persists between calls.
+    let create_path: *const i8 = b"/tmp/created\0".as_ptr() as *const i8;
+    let open_create_ok = unsafe {
+        let fd1 = narf_libc::posix_open(create_path, narf_libc::O_CREAT, 0);
+        let fd2 = narf_libc::posix_open(create_path, 0, 0);
+        let ok = fd1 >= 3 && fd2 >= 3 && fd1 != fd2;
+        // Best-effort close. The fds drop on task exit anyway.
+        let _ = narf_libc::posix_close(fd1);
+        let _ = narf_libc::posix_close(fd2);
+        ok
+    };
+    narf_libc::printf_str(
+        if open_create_ok { "create: ok\n" } else { "create: bad\n" },
+        &[],
+    );
+
+    // rename — same-directory rename within /tmp. Move the just-
+    // created file to a new name, then verify the new name opens
+    // and the old name does not.
+    let new_path: *const i8 = b"/tmp/renamed\0".as_ptr() as *const i8;
+    let rename_ok = unsafe {
+        let r = narf_libc::posix_rename(create_path, new_path);
+        let fd_new = narf_libc::posix_open(new_path, 0, 0);
+        let fd_old = narf_libc::posix_open(create_path, 0, 0);
+        let ok = r == 0 && fd_new >= 3 && fd_old == -1;
+        let _ = narf_libc::posix_close(fd_new);
+        ok
+    };
+    narf_libc::printf_str(
+        if rename_ok { "rename: ok\n" } else { "rename: bad\n" },
+        &[],
+    );
+
+    // mkdir / rmdir — flat MemFs returns Unsupported on both, so the
+    // probe asserts the syscall is wired and surfaces -1 cleanly
+    // (rather than panicking or returning a spurious 0). When MemFs
+    // grows hierarchy this probe should switch to expecting success.
+    let dir_path: *const i8 = b"/tmp/somedir\0".as_ptr() as *const i8;
+    let mkdir_stub_ok = unsafe {
+        narf_libc::posix_mkdir(dir_path, 0o755) == -1
+            && narf_libc::posix_rmdir(dir_path) == -1
+    };
+    narf_libc::printf_str(
+        if mkdir_stub_ok { "mkdir: stub\n" } else { "mkdir: bad\n" },
+        &[],
+    );
+
     // ── Tier 3a probes: stdlib + isatty + signal ─────────────────
     //
     // atoi / strtol / qsort / bsearch round-trips. Each has one

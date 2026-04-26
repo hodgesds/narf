@@ -489,21 +489,31 @@ unsafe fn mint_shared_ring_pair(
 // single absolute path into mount + relative) lands when the VFS
 // has a mount-point matcher.
 
+/// `O_CREAT` — create the file if missing. Bit 6 to match Linux's
+/// numeric convention so a libc consumer's `<fcntl.h>` lines up.
+pub const O_CREAT: u64 = 0o100;
+
 fn sys_open(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let path_ptr = args.arg0 as *const u8;
     let path_len = args.arg1 as usize;
     let mnt_ptr  = args.arg2 as *const u8;
     let mnt_len  = args.arg3 as usize;
+    let flags    = args.arg4;
+    // user-runtime's `open` wrapper checks `r == !0u64` for failure
+    // (the asm wrapper observes only the value register, not the
+    // status word), so the kernel must mirror that sentinel rather
+    // than the generic `invalid_op` shape.
+    let fail = SyscallReturn::ok(!0u64);
     if path_ptr.is_null() || path_len == 0 {
-        ctx.set_return(SyscallReturn::invalid_op());
+        ctx.set_return(fail);
         return;
     }
     // SAFETY: user pointers in active AS, length-bounded.
     let path_bytes = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
     let path = match core::str::from_utf8(path_bytes) {
         Ok(s) => s,
-        Err(_) => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        Err(_) => { ctx.set_return(fail); return; }
     };
 
     // Two shapes:
@@ -519,16 +529,28 @@ fn sys_open(ctx: &mut dyn TrapContext) {
         let mnt_bytes = unsafe { core::slice::from_raw_parts(mnt_ptr, mnt_len) };
         let mount = match core::str::from_utf8(mnt_bytes) {
             Ok(s) => s,
-            Err(_) => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+            Err(_) => { ctx.set_return(fail); return; }
         };
         narf_filesystem::registry().with_mount(mount, |fs| {
             narf_filesystem::resolve(fs.root(), path).ok()
         }).flatten()
     };
 
+    // O_CREAT path: when the lookup misses and the caller asked for
+    // creation, route through the parent directory's `create()`. The
+    // explicit-mount form is rare on the create path and not yet
+    // wired; absolute paths are the supported entry.
     let ops = match ops {
         Some(o) => o,
-        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        None if (flags & O_CREAT) != 0 && mnt_len == 0 => {
+            match narf_filesystem::registry()
+                .resolve_parent_absolute(path, |_fs, parent, leaf| parent.create(leaf))
+            {
+                Some(Ok(o)) => o,
+                _ => { ctx.set_return(fail); return; }
+            }
+        }
+        None => { ctx.set_return(fail); return; }
     };
 
     let task = current_task_id();
@@ -536,7 +558,7 @@ fn sys_open(ctx: &mut dyn TrapContext) {
         t.open(crate::fd::FdEntry { ops, offset: 0, flags: 0 })
     }) {
         Some(n) => n,
-        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        None    => { ctx.set_return(fail); return; }
     };
     ctx.set_return(SyscallReturn::ok(new_fd as u64));
 }
@@ -945,6 +967,107 @@ fn sys_unlink(ctx: &mut dyn TrapContext) {
     };
     let outcome = narf_filesystem::registry()
         .resolve_parent_absolute(path, |_fs, parent, leaf| parent.unlink(leaf));
+    match outcome {
+        Some(Ok(())) => ctx.set_return(SyscallReturn::ok(0)),
+        _            => ctx.set_return(fail),
+    }
+}
+
+// ── Mkdir / Rmdir / Rename — Tier-3b directory mutation ────────────
+//
+// All three follow the unlink shape: resolve the parent through the
+// VFS registry, dispatch to the relevant `DirOps` method, return
+// POSIX-style 0 / -1. Mode argument on mkdir is accepted and ignored
+// — NARF doesn't model POSIX permission bits at the FS layer.
+
+fn sys_mkdir(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let ptr  = args.arg0 as *const u8;
+    let len  = args.arg1 as usize;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if ptr.is_null() || len == 0 {
+        ctx.set_return(fail);
+        return;
+    }
+    // SAFETY: user pointer in active AS, length-bounded.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+    let path = match core::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => { ctx.set_return(fail); return; }
+    };
+    let outcome = narf_filesystem::registry()
+        .resolve_parent_absolute(path, |_fs, parent, leaf| parent.mkdir(leaf));
+    match outcome {
+        Some(Ok(_)) => ctx.set_return(SyscallReturn::ok(0)),
+        _           => ctx.set_return(fail),
+    }
+}
+
+fn sys_rmdir(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let ptr  = args.arg0 as *const u8;
+    let len  = args.arg1 as usize;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if ptr.is_null() || len == 0 {
+        ctx.set_return(fail);
+        return;
+    }
+    // SAFETY: user pointer in active AS, length-bounded.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+    let path = match core::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => { ctx.set_return(fail); return; }
+    };
+    let outcome = narf_filesystem::registry()
+        .resolve_parent_absolute(path, |_fs, parent, leaf| parent.rmdir(leaf));
+    match outcome {
+        Some(Ok(())) => ctx.set_return(SyscallReturn::ok(0)),
+        _            => ctx.set_return(fail),
+    }
+}
+
+fn sys_rename(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let old_ptr = args.arg0 as *const u8;
+    let old_len = args.arg1 as usize;
+    let new_ptr = args.arg2 as *const u8;
+    let new_len = args.arg3 as usize;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if old_ptr.is_null() || new_ptr.is_null() || old_len == 0 || new_len == 0 {
+        ctx.set_return(fail);
+        return;
+    }
+    // SAFETY: user pointers in active AS, length-bounded.
+    let old_bytes = unsafe { core::slice::from_raw_parts(old_ptr, old_len) };
+    let new_bytes = unsafe { core::slice::from_raw_parts(new_ptr, new_len) };
+    let old_path = match core::str::from_utf8(old_bytes) {
+        Ok(s) => s,
+        Err(_) => { ctx.set_return(fail); return; }
+    };
+    let new_path = match core::str::from_utf8(new_bytes) {
+        Ok(s) => s,
+        Err(_) => { ctx.set_return(fail); return; }
+    };
+    // Both paths must split into the same parent directory — cross-
+    // directory rename isn't supported by the DirOps surface today
+    // (would need a registry-aware version that locks both parents).
+    let old_split = match old_path.rfind('/') {
+        Some(i) => i,
+        None    => { ctx.set_return(fail); return; }
+    };
+    let new_split = match new_path.rfind('/') {
+        Some(i) => i,
+        None    => { ctx.set_return(fail); return; }
+    };
+    if &old_path[..old_split] != &new_path[..new_split] {
+        ctx.set_return(fail);
+        return;
+    }
+    let new_leaf = &new_path[new_split + 1..];
+    let outcome = narf_filesystem::registry()
+        .resolve_parent_absolute(old_path, |_fs, parent, old_leaf| {
+            parent.rename(old_leaf, new_leaf)
+        });
     match outcome {
         Some(Ok(())) => ctx.set_return(SyscallReturn::ok(0)),
         _            => ctx.set_return(fail),
@@ -1881,6 +2004,9 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Getcwd, "getcwd", RawFnHandler(sys_getcwd));
     table.install_raw(Syscall::Lseek,  "lseek",  RawFnHandler(sys_lseek));
     table.install_raw(Syscall::Unlink, "unlink", RawFnHandler(sys_unlink));
+    table.install_raw(Syscall::Mkdir,  "mkdir",  RawFnHandler(sys_mkdir));
+    table.install_raw(Syscall::Rmdir,  "rmdir",  RawFnHandler(sys_rmdir));
+    table.install_raw(Syscall::Rename, "rename", RawFnHandler(sys_rename));
 
     // Auto-wire both delivery hooks so any kernel that uses
     // `install_core_syscalls` gets the async + sync signal paths

@@ -171,6 +171,20 @@ impl DirOps for MemFsRoot {
         g.insert(name.to_string(), Arc::clone(&f));
         Ok(f as Arc<dyn FileOps>)
     }
+
+    fn rename(&self, old_name: &str, new_name: &str) -> Result<(), FsError> {
+        let mut g = self.files.lock();
+        if !g.contains_key(old_name) {
+            return Err(FsError::NotFound);
+        }
+        if g.contains_key(new_name) {
+            return Err(FsError::Busy);
+        }
+        // Unwrap is safe — `contains_key` already proved presence.
+        let entry = g.remove(old_name).unwrap();
+        g.insert(new_name.to_string(), entry);
+        Ok(())
+    }
 }
 
 impl MemFs {

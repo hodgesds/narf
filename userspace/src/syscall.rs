@@ -274,10 +274,34 @@ pub enum Syscall {
     Lseek        = 164,
 
     /// `arg0 = path_ptr`, `arg1 = path_len`. Removes a file from the
-    /// VFS. Stage-4: stub — VFS does not yet expose a remove API, so
-    /// the handler returns `InvalidOp` (ENOSYS-equivalent on the
-    /// wire) until VFS support lands.
+    /// VFS via `DirOps::unlink` on the parent directory. Returns
+    /// `value = 0` on success and `value = -1` on failure (the user-
+    /// runtime asm wrapper observes only the value register, not the
+    /// status word, so the value channel must distinguish).
     Unlink       = 180,
+
+    // ── Tier-3b directory mutation ─────────────────────────────────
+    //
+    // mkdir / rmdir / rename. Each routes through
+    // `VfsRegistry::resolve_parent_absolute` and dispatches on the
+    // parent `DirOps`. The default trait impls for FSes that don't
+    // implement these return `Unsupported`; the handler then
+    // surfaces `value = -1`. POSIX-shaped 0/-1 return convention.
+
+    /// `arg0 = path_ptr`, `arg1 = path_len`, `arg2 = mode (ignored)`.
+    /// Creates an empty subdirectory at the absolute path's leaf.
+    Mkdir        = 190,
+
+    /// `arg0 = path_ptr`, `arg1 = path_len`. Removes an empty
+    /// subdirectory.
+    Rmdir        = 191,
+
+    /// `arg0 = old_path_ptr`, `arg1 = old_path_len`,
+    /// `arg2 = new_path_ptr`, `arg3 = new_path_len`. Cross-
+    /// directory rename is unsupported today; both paths must
+    /// resolve to the same parent directory or the syscall returns
+    /// failure.
+    Rename       = 192,
 }
 
 impl Syscall {
@@ -321,6 +345,9 @@ impl Syscall {
             171 => Syscall::Getcwd,
             164 => Syscall::Lseek,
             180 => Syscall::Unlink,
+            190 => Syscall::Mkdir,
+            191 => Syscall::Rmdir,
+            192 => Syscall::Rename,
             _   => return None,
         })
     }

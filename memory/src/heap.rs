@@ -13,10 +13,16 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-/// Heap capacity. 1 MiB is ample for the Stage-1 executor / time wheel
-/// / panic paths. Wave 2's buddy+slab replacement lands with the full
-/// memory/ spec.
-pub const HEAP_CAPACITY: usize = 1 << 20;
+/// Heap capacity. The Stage-1 bump allocator never reclaims, so the
+/// total budget is the sum of every allocation made for the lifetime
+/// of the kernel — including every smoke test's mounts / fd tables /
+/// MemFs files in a single QEMU boot. 1 MiB was the original Stage-1
+/// floor and was tight by the time Tier-3 VFS work landed
+/// (185+ tests, each retaining state in the global registry +
+/// per-task tables). 4 MiB gives enough headroom for the current
+/// suite plus a few rounds of growth before the Wave-2 buddy+slab
+/// replacement (per `memory/` spec) makes the question moot.
+pub const HEAP_CAPACITY: usize = 4 << 20;
 
 /// Byte storage for the bump arena. Lives in `.bss`; aligned to 16 so
 /// any alignment ≤ 16 alloc request is trivially satisfiable.

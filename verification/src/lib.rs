@@ -6957,9 +6957,10 @@ fn smoke_filesystem_memfs_unlink_round_trip() -> TestResult {
 
     let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
     let fs = MemFs::with_seeds("test-unlink", &[("doomed", b"x")]);
-    if registry().mount(&auth, "/test_unlink", fs).is_err() {
-        return TestResult::Fail("memfs mount failed");
-    }
+    let mount_handle = match registry().mount(&auth, "/test_unlink", fs) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("memfs mount failed"),
+    };
 
     // Pre-condition: lookup confirms the file exists via the open
     // path (FileOps reachable through resolve_absolute).
@@ -6996,6 +6997,10 @@ fn smoke_filesystem_memfs_unlink_round_trip() -> TestResult {
         return TestResult::Fail("second unlink should report NotFound");
     }
 
+    // Free the mount + FS so a long test sequence doesn't accumulate
+    // FS state (the global registry has no GC and the kernel heap is
+    // bounded).
+    let _ = registry().unmount(&mount_handle, "/test_unlink");
     TestResult::Pass
 }
 kernel_test!(smoke_filesystem_memfs_unlink_round_trip);
@@ -11021,6 +11026,16 @@ fn smoke_frame_x86_64_run_narf_libc_validate() -> TestResult {
     //                    second call returns -1 because the entry is
     //                    gone. Proves the real DirOps::unlink path,
     //                    not a no-op stub.
+    //   create: ok    <- Tier-3c open(O_CREAT): the kernel routes a
+    //                    missing path to parent.create(leaf). Two
+    //                    opens of /tmp/created return distinct fds.
+    //   rename: ok    <- Tier-3c same-directory rename:
+    //                    /tmp/created -> /tmp/renamed; the new name
+    //                    opens, the old name doesn't.
+    //   mkdir: stub   <- Tier-3c mkdir+rmdir wired but MemFs is flat
+    //                    and returns Unsupported; the syscall round-
+    //                    trips a -1 sentinel cleanly (proves the
+    //                    plumbing without requiring hierarchy).
     //   atoi: ok      <- Tier-3a stdlib: leading whitespace + sign +
     //                    digit-stop on non-digit ("  -42xyz" -> -42).
     //   strtol: ok    <- 0x prefix + endptr writeback ("0xdeadbeef ").

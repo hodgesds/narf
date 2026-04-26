@@ -264,6 +264,29 @@ pub trait DirOps: Send + Sync {
     fn create(&self, _name: &str) -> Result<Arc<dyn FileOps>, FsError> {
         Err(FsError::Unsupported)
     }
+
+    /// Create a new empty subdirectory named `name`. Returns the new
+    /// directory's handle on success; `Busy` if the name already
+    /// exists. Default: `Unsupported` — flat-dir FSes (the current
+    /// MemFs) override only when they grow real hierarchy.
+    fn mkdir(&self, _name: &str) -> Result<Arc<dyn DirOps>, FsError> {
+        Err(FsError::Unsupported)
+    }
+
+    /// Remove the empty subdirectory named `name`. Returns
+    /// `NotFound` if absent, `Busy` if the directory has entries.
+    fn rmdir(&self, _name: &str) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+
+    /// Rename the entry `old_name` to `new_name` within this
+    /// directory. Returns `NotFound` if `old_name` is absent;
+    /// `Busy` if `new_name` already exists (no clobber). Cross-
+    /// directory rename is a Stage-4+ operation; today's contract is
+    /// strictly within-directory.
+    fn rename(&self, _old_name: &str, _new_name: &str) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
 }
 
 // ── FsInstance ─────────────────────────────────────────────────────

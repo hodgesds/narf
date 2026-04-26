@@ -62,8 +62,10 @@ pub use heap::{calloc, free, malloc, realloc};
 // `crate::io::fputs` for non-public call sites that haven't migrated.
 pub use io::{fprintf_str, printf_str, snprintf_str, vprintf_str, vsnprintf_str, write, Arg, Stdout};
 pub use posix::{
-    close as posix_close, lseek as posix_lseek, open as posix_open,
-    read as posix_read, unlink as posix_unlink, write as posix_write,
+    close as posix_close, lseek as posix_lseek, mkdir as posix_mkdir,
+    open as posix_open, read as posix_read, rename as posix_rename,
+    rmdir as posix_rmdir, unlink as posix_unlink, write as posix_write,
+    O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
     SEEK_CUR, SEEK_END, SEEK_SET,
 };
 pub use process::{abort, atexit, exit, _exit, getpid, getppid, getuid, sleep, usleep};

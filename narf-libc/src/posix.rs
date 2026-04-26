@@ -29,6 +29,16 @@ pub const SEEK_SET: c_int = 0;
 pub const SEEK_CUR: c_int = 1;
 pub const SEEK_END: c_int = 2;
 
+// Open flags. Numeric values match Linux so a libc consumer's
+// `<fcntl.h>` lines up. Today the kernel only honours `O_CREAT`;
+// the rest are accepted and ignored.
+pub const O_RDONLY: c_int = 0o0;
+pub const O_WRONLY: c_int = 0o1;
+pub const O_RDWR:   c_int = 0o2;
+pub const O_CREAT:  c_int = 0o100;
+pub const O_TRUNC:  c_int = 0o1000;
+pub const O_APPEND: c_int = 0o2000;
+
 /// Walk `p` until the NUL terminator and return the byte length.
 /// Caller is responsible for ensuring `p` is a valid C string.
 #[inline]
@@ -64,17 +74,20 @@ unsafe fn cstr_to_str<'a>(p: *const c_char) -> &'a str {
     core::str::from_utf8(bytes).unwrap_or("")
 }
 
-/// `open(path, flags, mode)` — Stage-4 ignores `flags` / `mode` and
-/// routes to the absolute-path opener. Returns the fd or -1.
+/// `open(path, flags, mode)` — routes to the absolute-path opener
+/// in the kernel; `O_CREAT` is honoured (the kernel asks the parent
+/// directory to `create()` the leaf when missing). Other flags are
+/// accepted and ignored. `mode` is reserved for permission bits and
+/// currently unused by the kernel. Returns the fd on success or -1.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn open(
     path: *const c_char,
-    _flags: c_int,
+    flags: c_int,
     _mode: mode_t,
 ) -> c_int {
     // SAFETY: caller contract — `path` is a NUL-terminated C string.
     let s = unsafe { cstr_to_str(path) };
-    match narf_user_runtime::open_abs(s) {
+    match narf_user_runtime::open_flags(s, "", flags as u64) {
         Some(fd) => fd as c_int,
         None     => -1,
     }
@@ -140,10 +153,42 @@ pub unsafe extern "C" fn lseek(
 }
 
 /// `unlink(path)` — POSIX-shaped. Returns 0 on success, -1 on
-/// failure. Stage-4 always returns -1 (VFS lacks a remove primitive).
+/// failure. Routes through the kernel to `DirOps::unlink` on the
+/// parent directory; FSes that don't implement removal surface -1.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn unlink(path: *const c_char) -> c_int {
     // SAFETY: caller contract — `path` is a NUL-terminated C string.
     let s = unsafe { cstr_to_str(path) };
     narf_user_runtime::unlink(s)
+}
+
+/// `mkdir(path, mode)` — POSIX-shaped. Returns 0 / -1. `mode` is
+/// accepted and ignored.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mkdir(path: *const c_char, mode: mode_t) -> c_int {
+    // SAFETY: caller contract — `path` is a NUL-terminated C string.
+    let s = unsafe { cstr_to_str(path) };
+    narf_user_runtime::mkdir(s, mode)
+}
+
+/// `rmdir(path)` — POSIX-shaped. Returns 0 / -1.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rmdir(path: *const c_char) -> c_int {
+    // SAFETY: caller contract.
+    let s = unsafe { cstr_to_str(path) };
+    narf_user_runtime::rmdir(s)
+}
+
+/// `rename(old, new)` — POSIX-shaped. Returns 0 / -1. Cross-
+/// directory rename is unsupported (kernel rejects with -1 unless
+/// both paths share the same parent directory).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rename(
+    oldpath: *const c_char,
+    newpath: *const c_char,
+) -> c_int {
+    // SAFETY: caller contract.
+    let o = unsafe { cstr_to_str(oldpath) };
+    let n = unsafe { cstr_to_str(newpath) };
+    narf_user_runtime::rename(o, n)
 }
