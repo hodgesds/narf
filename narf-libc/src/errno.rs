@@ -77,3 +77,59 @@ pub unsafe extern "C" fn __errno_location() -> *mut i32 {
     let p = &raw mut FALLBACK_ERRNO;
     p
 }
+
+// ── strerror ────────────────────────────────────────────────────────
+//
+// Each entry is a NUL-terminated static byte literal. We index by
+// the Linux errno number; unknown codes route to "Unknown error".
+// Returns a pointer to a `'static` byte; callers must not free it
+// (matches the standard `char *strerror(int)` ABI).
+
+const UNKNOWN: &[u8] = b"Unknown error\0";
+const ESUCCESS: &[u8]  = b"Success\0";
+const EPERM_S:  &[u8]  = b"Operation not permitted\0";
+const ENOENT_S: &[u8]  = b"No such file or directory\0";
+const EIO_S:    &[u8]  = b"Input/output error\0";
+const EBADF_S:  &[u8]  = b"Bad file descriptor\0";
+const ENOMEM_S: &[u8]  = b"Out of memory\0";
+const EACCES_S: &[u8]  = b"Permission denied\0";
+const EBUSY_S:  &[u8]  = b"Device or resource busy\0";
+const EEXIST_S: &[u8]  = b"File exists\0";
+const ENOTDIR_S:&[u8]  = b"Not a directory\0";
+const EISDIR_S: &[u8]  = b"Is a directory\0";
+const EINVAL_S: &[u8]  = b"Invalid argument\0";
+const ESPIPE_S: &[u8]  = b"Illegal seek\0";
+const EROFS_S:  &[u8]  = b"Read-only file system\0";
+const EPIPE_S:  &[u8]  = b"Broken pipe\0";
+const ERANGE_S: &[u8]  = b"Numerical result out of range\0";
+const EAGAIN_S: &[u8]  = b"Resource temporarily unavailable\0";
+const ENOSYS_S: &[u8]  = b"Function not implemented\0";
+
+/// `strerror(errnum)` — return a pointer to a NUL-terminated
+/// description string. The pointer is `'static`; callers must not
+/// free it. Unknown codes route to a generic "Unknown error".
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strerror(errnum: i32) -> *mut u8 {
+    let bytes: &'static [u8] = match errnum {
+        0  => ESUCCESS,
+        1  => EPERM_S,
+        2  => ENOENT_S,
+        5  => EIO_S,
+        9  => EBADF_S,
+        11 => EAGAIN_S,
+        12 => ENOMEM_S,
+        13 => EACCES_S,
+        16 => EBUSY_S,
+        17 => EEXIST_S,
+        20 => ENOTDIR_S,
+        21 => EISDIR_S,
+        22 => EINVAL_S,
+        29 => ESPIPE_S,
+        30 => EROFS_S,
+        32 => EPIPE_S,
+        34 => ERANGE_S,
+        38 => ENOSYS_S,
+        _  => UNKNOWN,
+    };
+    bytes.as_ptr() as *mut u8
+}

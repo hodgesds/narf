@@ -59,7 +59,7 @@ pub use ctype::{
     ispunct, isspace, isupper, isxdigit, tolower, toupper,
 };
 pub use env::{getenv, getenv_cstr, putenv, setenv, unsetenv, ENVIRON};
-pub use errno::{errno, set_errno, __errno_location};
+pub use errno::{errno, set_errno, strerror, __errno_location};
 pub use fd::{
     dup, dup2, fcntl, fstat, isatty, pipe, stat, FD_CLOEXEC, F_GETFD, F_GETFL, F_SETFD,
     F_SETFL, StatBuf,
@@ -71,7 +71,10 @@ pub use heap::{calloc, free, malloc, realloc};
 // FILE*-shaped one (re-exported below) is the canonical public
 // surface. The internal helper is still reachable as
 // `crate::io::fputs` for non-public call sites that haven't migrated.
-pub use io::{fprintf_str, printf_str, snprintf_str, vprintf_str, vsnprintf_str, write, Arg, Stdout};
+pub use io::{
+    fprintf_str, printf_str, snprintf_str, sprintf_str, vprintf_str, vsnprintf_str,
+    write, Arg, Stdout,
+};
 pub use math::{
     ceil, ceilf, copysign, copysignf, fabs, fabsf, floor, floorf,
     fmax, fmaxf, fmin, fminf, fmod, fmodf, isfinite, isinf, isnan,
@@ -91,7 +94,10 @@ pub use signal::{
     SIG_DFL_RAW, SIG_IGN_RAW, SIGABRT, SIGALRM, SIGCHLD, SIGFPE, SIGHUP, SIGILL,
     SIGINT, SIGKILL, SIGPIPE, SIGQUIT, SIGSEGV, SIGTERM,
 };
-pub use stdlib::{atoi, atol, bsearch, qsort, strtol, strtoul};
+pub use stdlib::{
+    abs, atoi, atol, bsearch, div, div_t, labs, ldiv, ldiv_t, qsort, rand, srand,
+    sscanf_ints, strtol, strtoul, RAND_MAX,
+};
 pub use time::{clock_gettime, gettimeofday, time, timespec, timeval};
 pub use startup::__libc_start_main;
 // Note: `stdio::fputs` shadows the older `io::fputs(&str, fd)` helper
@@ -100,10 +106,11 @@ pub use startup::__libc_start_main;
 // accessible as `crate::io::fputs` for any internal call-sites that
 // haven't migrated yet.
 pub use stdio::{
-    clearerr, fclose, feof, ferror, fflush, fgets, fopen, fputs, fread, fwrite,
-    stderr, stdin, stdout, File,
+    clearerr, fclose, feof, ferror, fflush, fgetc, fgets, fopen, fputc, fputs, fread,
+    fseek, ftell, fwrite, getc, getchar, perror, putc, putchar, puts, rewind, stderr,
+    stdin, stdout, File,
 };
 pub use string::{
-    memcmp, memcpy, memmove, memset, strcat, strchr, strcmp, strcpy, strdup, strlen, strncmp,
-    strncpy, strrchr, strstr,
+    memchr, memcmp, memcpy, memmove, memset, strcat, strchr, strcmp, strcpy, strcspn,
+    strdup, strlen, strncmp, strncpy, strpbrk, strrchr, strspn, strstr, strtok_r,
 };

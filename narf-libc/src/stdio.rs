@@ -633,3 +633,228 @@ pub unsafe fn fflush(f: *mut File) -> i32 {
     }
     0
 }
+
+// ── perror ──────────────────────────────────────────────────────────
+
+/// `perror(s)`: emit `"<s>: <strerror(errno)>\n"` to stderr. If `s`
+/// is NULL or its first byte is NUL, only the strerror text + `\n`
+/// is emitted (matching glibc).
+///
+/// # Safety
+/// `s`, when non-null, must be a valid NUL-terminated C string.
+pub unsafe fn perror(s: *const u8) {
+    use crate::errno::{errno, strerror};
+    let stream = stderr();
+    // Optional caller prefix.
+    let has_prefix = !s.is_null() && unsafe { *s } != 0;
+    if has_prefix {
+        // SAFETY: caller asserts NUL-termination.
+        let mut len = 0usize;
+        unsafe {
+            while *s.add(len) != 0 { len += 1; }
+        }
+        // SAFETY: stable static stream; len-bounded readable region.
+        unsafe {
+            let _ = fwrite(s, 1, len, stream);
+            let _ = fwrite(b": ".as_ptr(), 1, 2, stream);
+        }
+    }
+    // SAFETY: strerror returns a `'static` NUL-terminated byte ptr.
+    let msg = unsafe { strerror(errno()) as *const u8 };
+    let mut mlen = 0usize;
+    // SAFETY: NUL terminator is guaranteed by the static table.
+    unsafe {
+        while *msg.add(mlen) != 0 { mlen += 1; }
+        let _ = fwrite(msg, 1, mlen, stream);
+        let _ = fwrite(b"\n".as_ptr(), 1, 1, stream);
+        let _ = fflush(stream);
+    }
+}
+
+// ── Positioning (fseek / ftell / rewind) ─────────────────────────────
+
+/// Whence constants for [`fseek`]. Values match the kernel's
+/// `lseek` ABI (`SEEK_SET=0`, `SEEK_CUR=1`, `SEEK_END=2`).
+pub const SEEK_SET: i32 = 0;
+pub const SEEK_CUR: i32 = 1;
+pub const SEEK_END: i32 = 2;
+
+/// Drop any pending buffered state on `file`. POSIX `fseek` is
+/// required to discard the read buffer (the kernel offset is the new
+/// truth) and to flush the write buffer (so the next syscall reflects
+/// the staged writes before the seek). Returns 0 on success, EOF
+/// if the implicit flush failed.
+fn drain_for_seek(file: &mut File, f_raw: *mut File) -> i32 {
+    let mut rc = 0;
+    if file.wbuf_len != 0 {
+        // SAFETY: caller supplies the same raw pointer; fflush only
+        // walks `file.wbuf_len` bytes from `file.wbuf` and resets.
+        if unsafe { fflush(f_raw) } != 0 {
+            rc = EOF;
+        }
+    }
+    file.rbuf_pos = 0;
+    file.rbuf_end = 0;
+    file.eof = false;
+    rc
+}
+
+/// `fseek(f, offset, whence)`: reposition the underlying fd, after
+/// flushing the write buffer and dropping any unread bytes from the
+/// read buffer. Returns 0 on success, -1 on error (errno-shaped — we
+/// stamp `f.err` to EIO for `ferror` callers).
+///
+/// # Safety
+/// `f` must point at a valid `File`.
+pub unsafe fn fseek(f: *mut File, offset: i64, whence: i32) -> i32 {
+    if f.is_null() { return -1; }
+    if !(whence == SEEK_SET || whence == SEEK_CUR || whence == SEEK_END) {
+        // SAFETY: caller asserts.
+        unsafe { (*f).err = EIO; }
+        set_errno(EIO);
+        return -1;
+    }
+    // SAFETY: caller asserts.
+    let file = unsafe { &mut *f };
+    if drain_for_seek(file, f) != 0 {
+        return -1;
+    }
+    let new = narf_user_runtime::lseek(file.fd, offset, whence as u32);
+    if new < 0 {
+        file.err = EIO;
+        set_errno(EIO);
+        return -1;
+    }
+    0
+}
+
+/// `ftell(f)`: report the current byte offset within `f`, accounting
+/// for buffered tails — bytes pending in the write buffer add to the
+/// kernel offset; bytes left unread in the read buffer subtract.
+/// Returns -1 on error.
+///
+/// In practice exactly one of the buffers is non-empty at any moment
+/// (a stream is either being read or being written), so the
+/// adjustment doesn't double-count.
+///
+/// # Safety
+/// `f` must point at a valid `File`.
+pub unsafe fn ftell(f: *mut File) -> i64 {
+    if f.is_null() { return -1; }
+    // SAFETY: caller asserts.
+    let file = unsafe { &mut *f };
+    let here = narf_user_runtime::lseek(file.fd, 0, SEEK_CUR as u32);
+    if here < 0 {
+        file.err = EIO;
+        set_errno(EIO);
+        return -1;
+    }
+    let unread = (file.rbuf_end - file.rbuf_pos) as i64;
+    let pending = file.wbuf_len as i64;
+    here + pending - unread
+}
+
+/// `rewind(f)`: equivalent to `fseek(f, 0, SEEK_SET)` followed by a
+/// `clearerr` (rewind explicitly clears the error indicator per
+/// POSIX, even though it has no return-value mechanism for failure).
+///
+/// # Safety
+/// `f` must point at a valid `File`.
+pub unsafe fn rewind(f: *mut File) {
+    if f.is_null() { return; }
+    // SAFETY: forwarded under the same caller contract.
+    unsafe {
+        let _ = fseek(f, 0, SEEK_SET);
+        clearerr(f);
+    }
+}
+
+// ── Character-level I/O ──────────────────────────────────────────────
+
+/// `fputc(c, f)`: write a single byte to `f`. Returns the byte
+/// (0..=255) on success, [`EOF`] on failure. Goes through the
+/// buffered [`fwrite`] path so the line-buffered flush policy on
+/// stdout/stderr applies.
+///
+/// # Safety
+/// `f` must point at a valid `File`.
+pub unsafe fn fputc(c: i32, f: *mut File) -> i32 {
+    if f.is_null() { return EOF; }
+    let byte = c as u8;
+    // SAFETY: a single stack-local byte; `fwrite` honours `&buf` for
+    // exactly one byte.
+    let n = unsafe { fwrite(&byte as *const u8, 1, 1, f) };
+    if n == 1 { (byte as i32) & 0xFF } else { EOF }
+}
+
+/// `fgetc(f)`: read a single byte from `f`. Returns the byte
+/// (0..=255) on success, [`EOF`] on EOF / error. Goes through the
+/// buffered [`fread`] path.
+///
+/// # Safety
+/// `f` must point at a valid `File`.
+pub unsafe fn fgetc(f: *mut File) -> i32 {
+    if f.is_null() { return EOF; }
+    let mut byte: u8 = 0;
+    // SAFETY: a single writable stack byte.
+    let n = unsafe { fread(&mut byte as *mut u8, 1, 1, f) };
+    if n == 1 { (byte as i32) & 0xFF } else { EOF }
+}
+
+/// `getc(f)` — alias for [`fgetc`]. Real libc allows `getc` to be a
+/// macro; we ship it as a function for simplicity.
+///
+/// # Safety
+/// See [`fgetc`].
+pub unsafe fn getc(f: *mut File) -> i32 {
+    // SAFETY: forwarded.
+    unsafe { fgetc(f) }
+}
+
+/// `putc(c, f)` — alias for [`fputc`].
+///
+/// # Safety
+/// See [`fputc`].
+pub unsafe fn putc(c: i32, f: *mut File) -> i32 {
+    // SAFETY: forwarded.
+    unsafe { fputc(c, f) }
+}
+
+/// `getchar()` — read one byte from `stdin`.
+pub fn getchar() -> i32 {
+    // SAFETY: `stdin()` returns a stable static `*mut File`.
+    unsafe { fgetc(stdin()) }
+}
+
+/// `putchar(c)` — write one byte to `stdout`.
+pub fn putchar(c: i32) -> i32 {
+    // SAFETY: `stdout()` returns a stable static `*mut File`.
+    unsafe { fputc(c, stdout()) }
+}
+
+/// `puts(s)`: write the NUL-terminated C string `s` to stdout
+/// followed by a `\n`. Returns a non-negative on success, [`EOF`]
+/// on failure (matching glibc — the exact non-negative is
+/// implementation-defined).
+///
+/// # Safety
+/// `s` must be a valid NUL-terminated C string.
+pub unsafe fn puts(s: *const u8) -> i32 {
+    if s.is_null() { return EOF; }
+    // Walk to NUL to find the length without depending on `strlen`'s
+    // re-export — keeps this function self-contained.
+    let mut len = 0usize;
+    // SAFETY: caller contract — NUL terminator within the allocation.
+    while unsafe { *s.add(len) } != 0 {
+        len += 1;
+    }
+    let out = stdout();
+    // SAFETY: `out` is a stable static `*mut File`; `s` is `len`
+    // readable bytes per the walk above.
+    let n = unsafe { fwrite(s, 1, len, out) };
+    if n != len { return EOF; }
+    let nl: u8 = b'\n';
+    // SAFETY: stack-local byte.
+    let m = unsafe { fwrite(&nl as *const u8, 1, 1, out) };
+    if m == 1 { 0 } else { EOF }
+}

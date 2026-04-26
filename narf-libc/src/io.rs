@@ -677,6 +677,21 @@ pub fn snprintf_str(buf: &mut [u8], fmt: &str, args: &[Arg<'_>]) -> usize {
     total
 }
 
+/// `sprintf_str(buf, fmt, args)` — like [`snprintf_str`] but with no
+/// length cap. Caller is responsible for ensuring `buf` is large
+/// enough; otherwise the formatted bytes will saturate at the slice
+/// length (we never write past `buf.len()`). Returns the count of
+/// bytes that *would* have been written.
+///
+/// We refuse to ship a `*mut u8` C-shaped sprintf because the C ABI
+/// has no length to bound the write — that's the canonical buffer-
+/// overflow surface and Path-B explicitly avoids it. This Rust-slice
+/// form gives the convenience of "no cap" without the unbounded
+/// pointer.
+pub fn sprintf_str(buf: &mut [u8], fmt: &str, args: &[Arg<'_>]) -> usize {
+    vsnprintf_str(buf, fmt, args)
+}
+
 // ── small helper: per-fd `core::fmt::Write` retained for callers
 // that build ad-hoc formatter chains. The hot `vformat` path no
 // longer needs it (the sink handles unknown-conv bytes directly).

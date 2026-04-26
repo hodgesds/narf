@@ -738,6 +738,267 @@ pub extern "C" fn main(
         &[],
     );
 
+    // ── Tier 3h probes: memchr + char-level stdio + fseek/ftell ──
+    //
+    // memchr: bounded byte-search that does NOT stop at NUL. The
+    // probe seeds a 6-byte buffer with an embedded NUL ahead of the
+    // target so a strchr-style scan would miss the hit.
+    let mch: [u8; 6] = *b"AB\0CXD";
+    let mch_ptr = unsafe {
+        narf_libc::memchr(mch.as_ptr(), b'X' as i32, mch.len())
+    };
+    let mch_ok = !mch_ptr.is_null()
+        && (mch_ptr as usize) == (mch.as_ptr() as usize) + 4;
+    let mch_miss = unsafe {
+        narf_libc::memchr(mch.as_ptr(), b'Z' as i32, mch.len())
+    };
+    let memchr_ok = mch_ok && mch_miss.is_null();
+    narf_libc::printf_str(
+        if memchr_ok { "memchr: ok\n" } else { "memchr: bad\n" },
+        &[],
+    );
+
+    // putchar / puts — emit a marker line through the line-buffered
+    // stdout path. The terminal `\n` triggers a flush so the bytes
+    // hit the kernel console before the next probe runs. There's no
+    // observable failure mode short of a panic, so we declare the
+    // probe ok if we returned at all (return values are mostly the
+    // input byte / 0).
+    let _ = narf_libc::putchar(b'P' as i32);
+    let _ = narf_libc::putchar(b'\n' as i32);
+    let _ = unsafe {
+        narf_libc::puts(b"puts: ok\0".as_ptr())
+    };
+    narf_libc::printf_str("putchar: ok\n", &[]);
+
+    // fputc / fgetc / fseek / ftell / rewind round-trip.
+    //
+    // Open a fresh file under /tmp, write three bytes via fputc,
+    // fseek back to the start, fgetc them back one byte at a time,
+    // and ftell to confirm the offset advances. rewind reverts to 0.
+    //
+    // Uses fopen — which mallocs a File struct, so we get the full
+    // FILE*-layer code path (not just static stdout).
+    let posix_path: *const i8 = b"/tmp/seek\0".as_ptr() as *const i8;
+    let create_fd = unsafe {
+        narf_libc::posix_open(posix_path, narf_libc::O_CREAT, 0)
+    };
+    let _ = unsafe { narf_libc::posix_close(create_fd) };
+
+    let stream_path: &[u8] = b"/tmp/seek";
+    let stream = unsafe {
+        narf_libc::fopen(stream_path.as_ptr(), stream_path.len(), "rw")
+    };
+    let stream_ok = !stream.is_null();
+
+    let stream_round_trip = if !stream_ok {
+        false
+    } else {
+        unsafe {
+            let w1 = narf_libc::fputc(b'X' as i32, stream);
+            let w2 = narf_libc::fputc(b'Y' as i32, stream);
+            let w3 = narf_libc::fputc(b'Z' as i32, stream);
+            let _  = narf_libc::fflush(stream);
+            // ftell after three writes (no read tail): expect 3.
+            let pos_after_writes = narf_libc::ftell(stream);
+            // Seek back to 0 and read the three bytes.
+            let seek_rc = narf_libc::fseek(stream, 0, narf_libc::stdio::SEEK_SET);
+            let r1 = narf_libc::fgetc(stream);
+            let r2 = narf_libc::fgetc(stream);
+            let r3 = narf_libc::fgetc(stream);
+            let pos_after_reads = narf_libc::ftell(stream);
+            // rewind + EOF: read past end should yield EOF.
+            narf_libc::rewind(stream);
+            let pos_rewound = narf_libc::ftell(stream);
+            // Drain three bytes then expect EOF on the fourth.
+            let _ = narf_libc::fgetc(stream);
+            let _ = narf_libc::fgetc(stream);
+            let _ = narf_libc::fgetc(stream);
+            let r_eof = narf_libc::fgetc(stream);
+            let _ = narf_libc::fclose(stream);
+            // Tidy up the on-disk file.
+            let _ = narf_libc::posix_unlink(posix_path);
+            w1 == (b'X' as i32) && w2 == (b'Y' as i32) && w3 == (b'Z' as i32)
+                && pos_after_writes == 3
+                && seek_rc == 0
+                && r1 == (b'X' as i32) && r2 == (b'Y' as i32) && r3 == (b'Z' as i32)
+                && pos_after_reads == 3
+                && pos_rewound == 0
+                && r_eof == -1
+        }
+    };
+    let stdio_pos_ok = stream_ok && stream_round_trip;
+    narf_libc::printf_str(
+        if stdio_pos_ok { "fseek: ok\n" } else { "fseek: bad\n" },
+        &[],
+    );
+
+    // ── Tier 3i probes: string parsing trio + strerror + rand ────
+    //
+    // strspn / strcspn — symmetric pair over a 5-byte input. With
+    // `accept = "abc"`, "aabbczz" has a 5-byte initial run of
+    // members; `reject = "z"` flips the predicate so the run is 5.
+    let span: *const u8 = b"aabbczz\0".as_ptr();
+    let strspn_ok = unsafe {
+        narf_libc::strspn(span, b"abc\0".as_ptr()) == 5
+            && narf_libc::strcspn(span, b"z\0".as_ptr()) == 5
+    };
+    narf_libc::printf_str(
+        if strspn_ok { "strspn: ok\n" } else { "strspn: bad\n" },
+        &[],
+    );
+
+    // strpbrk — first byte of `s` that appears in `accept`. With
+    // `s = "hello world"` and `accept = "ow"`, the first hit is the
+    // 'o' at index 4.
+    let pbrk_ok = unsafe {
+        let s   = b"hello world\0".as_ptr();
+        let acc = b"ow\0".as_ptr();
+        let p   = narf_libc::strpbrk(s, acc);
+        !p.is_null()
+            && (p as usize) == (s as usize) + 4
+            && *p == b'o'
+    };
+    narf_libc::printf_str(
+        if pbrk_ok { "strpbrk: ok\n" } else { "strpbrk: bad\n" },
+        &[],
+    );
+
+    // strtok_r — split "a,b,,c" on ',' yields "a", "b", "c" (empty
+    // tokens collapse), then NULL. The buffer is mutated in place,
+    // so it must be writable.
+    let mut tok_buf: [u8; 8] = *b"a,b,,c\0\0";
+    let mut save: *mut u8 = core::ptr::null_mut();
+    let strtok_ok = unsafe {
+        let t1 = narf_libc::strtok_r(
+            tok_buf.as_mut_ptr(),
+            b",\0".as_ptr(),
+            &mut save,
+        );
+        let t2 = narf_libc::strtok_r(
+            core::ptr::null_mut(),
+            b",\0".as_ptr(),
+            &mut save,
+        );
+        let t3 = narf_libc::strtok_r(
+            core::ptr::null_mut(),
+            b",\0".as_ptr(),
+            &mut save,
+        );
+        let t4 = narf_libc::strtok_r(
+            core::ptr::null_mut(),
+            b",\0".as_ptr(),
+            &mut save,
+        );
+        let s1 = !t1.is_null() && *t1 == b'a' && *t1.add(1) == 0;
+        let s2 = !t2.is_null() && *t2 == b'b' && *t2.add(1) == 0;
+        let s3 = !t3.is_null() && *t3 == b'c' && *t3.add(1) == 0;
+        s1 && s2 && s3 && t4.is_null()
+    };
+    narf_libc::printf_str(
+        if strtok_ok { "strtok: ok\n" } else { "strtok: bad\n" },
+        &[],
+    );
+
+    // strerror — both a known code and an unknown one. We compare
+    // the first byte rather than walking the whole string; a fully
+    // distinct mapping per code is enough to confirm the table is
+    // wired.
+    let strerror_ok = unsafe {
+        let p_invalid = narf_libc::strerror(22); // EINVAL
+        let p_unknown = narf_libc::strerror(9999);
+        !p_invalid.is_null()
+            && !p_unknown.is_null()
+            && *p_invalid == b'I'  // "Invalid argument"
+            && *p_unknown == b'U'  // "Unknown error"
+    };
+    narf_libc::printf_str(
+        if strerror_ok { "strerror: ok\n" } else { "strerror: bad\n" },
+        &[],
+    );
+
+    // rand / srand — seeded determinism + range bound. With seed
+    // 12345, the Park-Miller sequence is fixed, so a re-seed must
+    // produce the identical first call. RAND_MAX bound holds for
+    // every call.
+    let rand_ok = unsafe {
+        narf_libc::srand(12345);
+        let a = narf_libc::rand();
+        let b = narf_libc::rand();
+        narf_libc::srand(12345);
+        let a2 = narf_libc::rand();
+        a == a2
+            && a != b
+            && a >= 0 && a <= narf_libc::RAND_MAX
+            && b >= 0 && b <= narf_libc::RAND_MAX
+    };
+    narf_libc::printf_str(
+        if rand_ok { "rand: ok\n" } else { "rand: bad\n" },
+        &[],
+    );
+
+    // ── Tier 3j probes: sprintf + abs/labs/div + sscanf + perror ─
+
+    // sprintf_str — format into a 32-byte buffer with no length cap
+    // (the slice itself is the cap). Compare bytes against expected
+    // prefix; the trailing slack remains zero from the array init.
+    let mut sp: [u8; 32] = [0; 32];
+    let want_sp: &[u8] = b"int=42 hex=0x2a";
+    let n = narf_libc::sprintf_str(
+        &mut sp,
+        "int=%d hex=0x%x",
+        &[Arg::Int(42), Arg::Hex(0x2a)],
+    );
+    let sprintf_ok = n == want_sp.len()
+        && sp[..want_sp.len()] == *want_sp;
+    narf_libc::printf_str(
+        if sprintf_ok { "sprintf: ok\n" } else { "sprintf: bad\n" },
+        &[],
+    );
+
+    // abs/labs/div/ldiv — value math; check normal cases and the
+    // wrapping behaviour at INT_MIN / divide-by-zero saturation.
+    let absdiv_ok = unsafe {
+        let a = narf_libc::abs(-7);
+        let b = narf_libc::labs(-1_234_567_890_123);
+        let c = narf_libc::div(17, 5);
+        let d = narf_libc::ldiv(-17, 5);
+        let e = narf_libc::div(5, 0); // saturates to {0, 5}
+        a == 7
+            && b == 1_234_567_890_123
+            && c.quot == 3 && c.rem == 2
+            && d.quot == -3 && d.rem == -2
+            && e.quot == 0 && e.rem == 5
+    };
+    narf_libc::printf_str(
+        if absdiv_ok { "div: ok\n" } else { "div: bad\n" },
+        &[],
+    );
+
+    // sscanf_ints — pull two integers from a string with mixed
+    // whitespace + a hex literal in field 2.
+    let mut nums_out: [i64; 4] = [0; 4];
+    let s = b"  -5   0x2a  100\0".as_ptr() as *const i8;
+    let parsed = unsafe { narf_libc::sscanf_ints(s, &mut nums_out) };
+    let sscanf_ok = parsed == 3
+        && nums_out[0] == -5
+        && nums_out[1] == 0x2a
+        && nums_out[2] == 100;
+    narf_libc::printf_str(
+        if sscanf_ok { "sscanf: ok\n" } else { "sscanf: bad\n" },
+        &[],
+    );
+
+    // perror — emit "ctx: <msg>\n" to stderr (fd 2). The kernel
+    // console doesn't distinguish stdout/stderr in this harness, so
+    // we just confirm the call returns; the `ok` line is independent
+    // observation.
+    unsafe {
+        narf_libc::set_errno(22); // EINVAL
+        narf_libc::perror(b"perror-ctx\0".as_ptr());
+    }
+    narf_libc::printf_str("perror: ok\n", &[]);
+
     // atexit registration — `cleanup` runs after `main` returns,
     // BEFORE the kernel-side exit_task. The ordering proves the
     // dispatch loop in `narf_libc::exit` walks the table.

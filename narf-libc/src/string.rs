@@ -376,3 +376,167 @@ pub unsafe extern "C" fn strdup(s: *const u8) -> *mut u8 {
     }
     buf
 }
+
+/// Find first occurrence of byte `c` in the first `n` bytes of `s`.
+/// Returns a pointer to the matching byte, or NULL if no match in
+/// the bounded region. Unlike `strchr`, the scan is length-bounded
+/// and does not stop at a NUL byte (NUL is just another value of
+/// `c` here).
+///
+/// # Safety
+/// `s` must point to at least `n` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memchr(s: *const u8, c: i32, n: usize) -> *mut u8 {
+    let target = c as u8;
+    // SAFETY: per the function-level contract.
+    unsafe {
+        for i in 0..n {
+            if *s.add(i) == target {
+                return s.add(i) as *mut u8;
+            }
+        }
+    }
+    core::ptr::null_mut()
+}
+
+/// Test whether byte `b` appears in NUL-terminated `set`. Helper
+/// shared by `strspn`/`strcspn`/`strpbrk`. O(|set|) per probe.
+///
+/// # Safety
+/// `set` must be NUL-terminated.
+#[inline]
+unsafe fn byte_in_set(b: u8, set: *const u8) -> bool {
+    // SAFETY: caller contract — walk to NUL.
+    unsafe {
+        let mut i = 0usize;
+        loop {
+            let v = *set.add(i);
+            if v == 0 { return false; }
+            if v == b { return true; }
+            i += 1;
+        }
+    }
+}
+
+/// `strspn(s, accept)` — length of the initial run of bytes in `s`
+/// that are all members of `accept`. Both NUL-terminated.
+///
+/// # Safety
+/// Both arguments must be NUL-terminated.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strspn(s: *const u8, accept: *const u8) -> usize {
+    let mut n = 0usize;
+    // SAFETY: caller contract.
+    unsafe {
+        loop {
+            let b = *s.add(n);
+            if b == 0 || !byte_in_set(b, accept) {
+                return n;
+            }
+            n += 1;
+        }
+    }
+}
+
+/// `strcspn(s, reject)` — length of the initial run of bytes in `s`
+/// that are NOT members of `reject`. Both NUL-terminated.
+///
+/// # Safety
+/// Both arguments must be NUL-terminated.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strcspn(s: *const u8, reject: *const u8) -> usize {
+    let mut n = 0usize;
+    // SAFETY: caller contract.
+    unsafe {
+        loop {
+            let b = *s.add(n);
+            if b == 0 || byte_in_set(b, reject) {
+                return n;
+            }
+            n += 1;
+        }
+    }
+}
+
+/// `strpbrk(s, accept)` — pointer to the first byte of `s` that
+/// also appears in `accept`, or NULL if none. Both NUL-terminated.
+///
+/// # Safety
+/// Both arguments must be NUL-terminated.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strpbrk(s: *const u8, accept: *const u8) -> *mut u8 {
+    // SAFETY: caller contract.
+    unsafe {
+        let mut i = 0usize;
+        loop {
+            let b = *s.add(i);
+            if b == 0 { return core::ptr::null_mut(); }
+            if byte_in_set(b, accept) {
+                return s.add(i) as *mut u8;
+            }
+            i += 1;
+        }
+    }
+}
+
+/// `strtok_r(str, delim, saveptr)` — reentrant tokeniser. On the
+/// first call, `str` is the string to scan; on subsequent calls,
+/// pass NULL and the same `saveptr` to continue. The function
+/// rewrites the byte after each token to NUL and stashes its
+/// position in `*saveptr`. Returns NULL when no further tokens
+/// remain.
+///
+/// We deliberately ship the `_r` variant only — the stateful
+/// `strtok` would need a process-wide static save slot, which is
+/// trivially racy and not worth the surface for the validate-grade
+/// workload. Most modern callers use `_r` directly.
+///
+/// # Safety
+/// On the first call `str` must be writable and NUL-terminated;
+/// `delim` must be NUL-terminated; `saveptr` must be a writable
+/// pointer-to-pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strtok_r(
+    s: *mut u8,
+    delim: *const u8,
+    saveptr: *mut *mut u8,
+) -> *mut u8 {
+    if saveptr.is_null() { return core::ptr::null_mut(); }
+    // SAFETY: caller-supplied `saveptr` is a writable slot.
+    let mut p = if s.is_null() {
+        unsafe { *saveptr }
+    } else {
+        s
+    };
+    if p.is_null() { return core::ptr::null_mut(); }
+
+    // Skip leading delimiters.
+    // SAFETY: `p` points into the original NUL-terminated input;
+    // bytes past it are read-only walked.
+    unsafe {
+        while *p != 0 && byte_in_set(*p, delim) {
+            p = p.add(1);
+        }
+        if *p == 0 {
+            *saveptr = p;
+            return core::ptr::null_mut();
+        }
+    }
+
+    let token = p;
+    // Walk until the next delimiter / NUL.
+    // SAFETY: same in-bounds reasoning.
+    unsafe {
+        while *p != 0 && !byte_in_set(*p, delim) {
+            p = p.add(1);
+        }
+        if *p != 0 {
+            // Punch a NUL to terminate the token, then advance.
+            *p = 0;
+            *saveptr = p.add(1);
+        } else {
+            *saveptr = p;
+        }
+    }
+    token
+}

@@ -285,6 +285,176 @@ pub unsafe extern "C" fn qsort(
     }
 }
 
+// ── abs / labs / div / ldiv ─────────────────────────────────────────
+//
+// Pure value math — no allocation, no errno setting. C99 leaves
+// `abs(INT_MIN)` and `labs(LONG_MIN)` undefined; we wrap them via
+// `wrapping_abs` so the result is well-defined (returns the input
+// unchanged at the negative-extreme). That matches what every modern
+// libc actually does.
+
+/// `<stdlib.h>` `div_t` shape. Two `int` fields per C99 §7.20.6.2.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct div_t {
+    pub quot: c_int,
+    pub rem:  c_int,
+}
+
+/// `<stdlib.h>` `ldiv_t` shape. Two `long` fields per C99 §7.20.6.2.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct ldiv_t {
+    pub quot: c_long,
+    pub rem:  c_long,
+}
+
+/// `abs(j)` — magnitude of a C `int`. `INT_MIN` is wrapped (returns
+/// itself) rather than triggering UB.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn abs(j: c_int) -> c_int {
+    j.wrapping_abs()
+}
+
+/// `labs(j)` — magnitude of a C `long`. Same wrapping semantics as
+/// [`abs`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn labs(j: c_long) -> c_long {
+    j.wrapping_abs()
+}
+
+/// `div(num, denom)` — quotient + remainder. Behaviour with
+/// `denom == 0` follows the C99 rule: undefined. We saturate the
+/// quotient to 0 and the remainder to the numerator instead of
+/// trapping the divide.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn div(num: c_int, denom: c_int) -> div_t {
+    if denom == 0 {
+        return div_t { quot: 0, rem: num };
+    }
+    div_t {
+        quot: num.wrapping_div(denom),
+        rem:  num.wrapping_rem(denom),
+    }
+}
+
+/// `ldiv(num, denom)` — long-int variant of [`div`]. Same saturation
+/// rule on `denom == 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ldiv(num: c_long, denom: c_long) -> ldiv_t {
+    if denom == 0 {
+        return ldiv_t { quot: 0, rem: num };
+    }
+    ldiv_t {
+        quot: num.wrapping_div(denom),
+        rem:  num.wrapping_rem(denom),
+    }
+}
+
+// ── rand / srand ────────────────────────────────────────────────────
+//
+// C99 only requires deterministic per-seed output and `rand()` to
+// return a value in `[0, RAND_MAX]`. We ship a Park-Miller minimal
+// standard LCG (`x' = x * 48271 mod (2^31 - 1)`) which has full
+// period 2^31 - 2, no zero-seed degenerate, and one multiplication +
+// one modulo per call. RAND_MAX matches glibc's value (0x7FFF_FFFF)
+// because the LCG output already lives in that range.
+
+/// C99 / glibc-compatible upper bound on `rand()` results.
+pub const RAND_MAX: c_int = 0x7FFF_FFFF;
+
+/// LCG state. Initial value = 1 per C99: `srand(1)` is the implicit
+/// pre-seed. Single-threaded user mode keeps this race-free.
+static mut RAND_STATE: u32 = 1;
+
+/// `srand(seed)` — reseed the deterministic generator. A zero seed
+/// would lock the LCG at zero forever, so we substitute 1 instead
+/// (matching glibc's behaviour).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn srand(seed: u32) {
+    let s = if seed == 0 { 1 } else { seed & 0x7FFF_FFFF };
+    // SAFETY: single-threaded user-mode invariant; access is
+    // serialised by execution order.
+    unsafe { RAND_STATE = if s == 0 { 1 } else { s }; }
+}
+
+/// `rand()` — Park-Miller minimal standard LCG. Returns the next
+/// pseudo-random integer in `[0, RAND_MAX]`. Determinism per seed is
+/// the only contract; do not use this for cryptography.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rand() -> c_int {
+    // SAFETY: single-threaded invariant — see `srand`.
+    unsafe {
+        // Park-Miller in 64-bit arithmetic to avoid overflow.
+        let next = ((RAND_STATE as u64) * 48271) % 0x7FFF_FFFF;
+        RAND_STATE = next as u32;
+        next as c_int
+    }
+}
+
+// ── sscanf-shim (integer-only) ──────────────────────────────────────
+//
+// Real `sscanf` would parse a varadic format string with type-
+// dispatched assignment targets. We can't ship that on stable Rust.
+// What real callers need most often is "pull one or two integers
+// from a string" — `sscanf(s, "%d %d", &a, &b)` or
+// `sscanf(s, "%x", &x)`. We expose a Rust-shaped helper that returns
+// up to N parsed integers in a caller buffer, so consumers don't
+// have to reach for strtol's endptr by hand.
+
+/// Parse decimal/hex integers from `s`, storing up to `out.len()`
+/// values into `out`. Whitespace separates fields; an `0x`/`0X`
+/// prefix triggers hex on a per-field basis. Returns the number of
+/// successfully parsed values.
+///
+/// # Safety
+/// `s` must be a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sscanf_ints(s: *const c_char, out: &mut [i64]) -> usize {
+    if s.is_null() || out.is_empty() { return 0; }
+    let mut p = s;
+    let mut n = 0usize;
+    while n < out.len() {
+        // Skip whitespace.
+        // SAFETY: NUL-bounded walk per caller contract.
+        unsafe {
+            while *p != 0 && is_space(*p as u8) {
+                p = p.add(1);
+            }
+            if *p == 0 { break; }
+        }
+        // Detect optional sign + base prefix; reuse parse_prefix.
+        // SAFETY: `p` still in the caller's NUL-terminated string.
+        let (mut q, sign, base) = unsafe { parse_prefix(p, 0) };
+        // Need at least one digit for a successful parse.
+        // SAFETY: NUL-bounded read.
+        let first = unsafe { *q } as u8;
+        if digit_value(first, base).is_none() {
+            break;
+        }
+        let mut acc: i64 = 0;
+        loop {
+            // SAFETY: NUL-bounded.
+            let b = unsafe { *q } as u8;
+            let d = match digit_value(b, base) {
+                Some(v) => v as i64,
+                None    => break,
+            };
+            let signed_d = if sign < 0 { -d } else { d };
+            acc = acc
+                .checked_mul(base as i64)
+                .and_then(|x| x.checked_add(signed_d))
+                .unwrap_or(if sign < 0 { i64::MIN } else { i64::MAX });
+            // SAFETY: NUL-bounded.
+            q = unsafe { q.add(1) };
+        }
+        out[n] = acc;
+        n += 1;
+        p = q;
+    }
+    n
+}
+
 /// `bsearch(key, base, nmemb, size, cmp)` — binary search over a
 /// sorted array. Returns a pointer to the matching element or null.
 ///
