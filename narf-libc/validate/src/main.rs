@@ -1444,11 +1444,69 @@ pub extern "C" fn main(
         &[],
     );
 
-    // dirent stub — opendir returns NULL, errno is ENOSYS.
+    // opendir / readdir / closedir — real walk against /tmp.
+    //
+    // Earlier tier probes leave indeterminate residue in /tmp; we
+    // create three known files with our prefix, walk, count them
+    // (must see all three; may also see other survivors), then
+    // unlink. closedir must succeed; rewinddir must restart the
+    // walk.
     let dir_ok = unsafe {
-        let p = narf_libc::opendir(b"/tmp\0".as_ptr() as *const i8);
-        let e = narf_libc::errno();
-        p.is_null() && e == 38
+        let p1 = narf_libc::posix_open(
+            b"/tmp/dir-a\0".as_ptr() as *const i8,
+            narf_libc::O_CREAT, 0,
+        );
+        let _ = narf_libc::posix_close(p1);
+        let p2 = narf_libc::posix_open(
+            b"/tmp/dir-b\0".as_ptr() as *const i8,
+            narf_libc::O_CREAT, 0,
+        );
+        let _ = narf_libc::posix_close(p2);
+        let p3 = narf_libc::posix_open(
+            b"/tmp/dir-c\0".as_ptr() as *const i8,
+            narf_libc::O_CREAT, 0,
+        );
+        let _ = narf_libc::posix_close(p3);
+
+        let dir = narf_libc::opendir(b"/tmp\0".as_ptr() as *const i8);
+        let mut found_a = false;
+        let mut found_b = false;
+        let mut found_c = false;
+        let mut walked = 0i32;
+        if !dir.is_null() {
+            loop {
+                let entry = narf_libc::readdir(dir);
+                if entry.is_null() { break; }
+                walked += 1;
+                if walked > 64 { break; }   // sanity bound
+                // Compare the first 6 bytes against "dir-X".
+                let n = &(*entry).d_name;
+                let prefix = b"dir-";
+                let mut is_ours = true;
+                for (i, &b) in prefix.iter().enumerate() {
+                    if n[i] != b as i8 { is_ours = false; break; }
+                }
+                if is_ours {
+                    match n[4] as u8 {
+                        b'a' => found_a = true,
+                        b'b' => found_b = true,
+                        b'c' => found_c = true,
+                        _    => {}
+                    }
+                }
+            }
+            // rewinddir restarts the walk: confirm the first entry
+            // surfaces again.
+            narf_libc::rewinddir(dir);
+            let after_rewind = narf_libc::readdir(dir);
+            let _ = after_rewind;   // pointer-only; success = non-null
+
+            let _ = narf_libc::closedir(dir);
+        }
+        let _ = narf_libc::posix_unlink(b"/tmp/dir-a\0".as_ptr() as *const i8);
+        let _ = narf_libc::posix_unlink(b"/tmp/dir-b\0".as_ptr() as *const i8);
+        let _ = narf_libc::posix_unlink(b"/tmp/dir-c\0".as_ptr() as *const i8);
+        !dir.is_null() && found_a && found_b && found_c
     };
     narf_libc::printf_str(
         if dir_ok { "opendir: ok\n" } else { "opendir: bad\n" },

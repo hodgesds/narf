@@ -136,8 +136,9 @@ pub use poll::{
     FD_ZERO, POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT, POLLPRI, POLLRDHUP,
 };
 pub use path::{
-    basename, closedir, dirent, dirname, fnmatch, opendir, readdir,
-    DIR, FNM_NOESCAPE, FNM_NOMATCH, FNM_PATHNAME, FNM_PERIOD,
+    basename, closedir, dirent, dirname, fnmatch, opendir, readdir, rewinddir,
+    DIR, DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG, DT_UNKNOWN, FNM_NOESCAPE,
+    FNM_NOMATCH, FNM_PATHNAME, FNM_PERIOD,
 };
 pub use posix::{
     access, close as posix_close, getpagesize, lseek as posix_lseek,
