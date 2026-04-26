@@ -6701,7 +6701,16 @@ fn smoke_userspace_chdir_getcwd_round_trip() -> TestResult {
         ret: None,
     };
     kernel_syscall_entry(Syscall::Chdir.raw(), &mut ctx);
-    let rel_rejected = matches!(ctx.ret, Some(r) if r.status == SyscallReturn::INVALID_OP);
+    // sys_chdir now mirrors sys_unlink/sys_mkdir/etc. and surfaces
+    // failure as `ok((-1i64) as u64)` rather than `invalid_op`. The
+    // user-runtime asm wrapper only observes the value register, so
+    // a separate INVALID_OP status is invisible to the user side
+    // (success and failure both rax=0). The -1 sentinel is the
+    // wire-visible "no" the libc shim sees.
+    let rel_rejected = matches!(
+        ctx.ret,
+        Some(r) if r.status == SyscallReturn::OK && r.value == (-1i64) as u64,
+    );
 
     __test_clear_global();
     narf_userspace::handlers::__test_cwd_reset();
@@ -6709,7 +6718,7 @@ fn smoke_userspace_chdir_getcwd_round_trip() -> TestResult {
     if !len_ok      { return TestResult::Fail("Getcwd did not return length 4"); }
     if !bytes_ok    { return TestResult::Fail("Getcwd buffer did not match `/foo\\0`"); }
     if !small_invalid { return TestResult::Fail("Getcwd with too-small buf did not surface InvalidOp"); }
-    if !rel_rejected { return TestResult::Fail("Chdir(relative) did not surface InvalidOp"); }
+    if !rel_rejected { return TestResult::Fail("Chdir(relative) did not surface -1 sentinel"); }
     TestResult::Pass
 }
 kernel_test!(smoke_userspace_chdir_getcwd_round_trip);

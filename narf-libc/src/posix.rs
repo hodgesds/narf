@@ -186,13 +186,6 @@ pub unsafe extern "C" fn rmdir(path: *const c_char) -> c_int {
 /// `W_OK` / `X_OK` are treated as `F_OK` (existence implies all
 /// access). Returns 0 if reachable, -1 otherwise.
 ///
-/// Implementation note: `narf_user_runtime::stat` cannot
-/// distinguish `Ok(_)` from `InvalidOp` today (the syscall ABI
-/// only surfaces `rax = value`, both of which are 0 for the no-
-/// payload success and the no-payload error). We therefore probe
-/// existence via `open_abs` — the kernel returns `Some(fd)` only
-/// if path resolution succeeds. We immediately close the fd.
-///
 /// # Safety
 /// `path` must be a valid NUL-terminated C string.
 #[unsafe(no_mangle)]
@@ -200,14 +193,8 @@ pub unsafe extern "C" fn access(path: *const c_char, _mode: c_int) -> c_int {
     if path.is_null() { return -1; }
     // SAFETY: caller-asserted NUL-terminated string.
     let s = unsafe { cstr_to_str(path) };
-    if !s.starts_with('/') { return -1; }
-    match narf_user_runtime::open_abs(s) {
-        Some(fd) => {
-            let _ = narf_user_runtime::close(fd);
-            0
-        }
-        None => -1,
-    }
+    let mut sb = crate::fd::StatBuf::default();
+    if narf_user_runtime::stat(s, &mut sb) == 0 { 0 } else { -1 }
 }
 
 /// `getpagesize()` — POSIX-deprecated but still common. NARF uses

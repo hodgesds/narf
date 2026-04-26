@@ -816,22 +816,28 @@ fn sys_stat(ctx: &mut dyn TrapContext) {
     let path_ptr = args.arg0 as *const u8;
     let path_len = args.arg1 as usize;
     let out_ptr  = args.arg2 as *mut StatBuf;
+    // POSIX-shaped failure sentinel. The user-runtime asm wrapper
+    // observes only the `value` register, so we mirror libc and
+    // return -1 on failure to disambiguate from a 0-valued success.
+    // Without this the success ok(0) and the invalid_op rax=0 are
+    // indistinguishable at the user side.
+    let fail = SyscallReturn::ok((-1i64) as u64);
     if path_ptr.is_null() || path_len == 0 || out_ptr.is_null() {
-        ctx.set_return(SyscallReturn::invalid_op());
+        ctx.set_return(fail);
         return;
     }
     // SAFETY: user-mode pointer in the active AS, length-bounded.
     let path_bytes = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
     let path = match core::str::from_utf8(path_bytes) {
         Ok(s) => s,
-        Err(_) => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        Err(_) => { ctx.set_return(fail); return; }
     };
     let ops = narf_filesystem::registry().resolve_absolute(path, |fs, rel| {
         narf_filesystem::resolve(fs.root(), rel).ok()
     }).flatten();
     let ops = match ops {
         Some(o) => o,
-        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        None    => { ctx.set_return(fail); return; }
     };
     let stat = StatBuf::from_stat(ops.stat());
     // SAFETY: caller supplied a writable user vaddr; if the address
@@ -844,8 +850,10 @@ fn sys_fstat(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let fd = args.arg0 as u32;
     let out_ptr = args.arg1 as *mut StatBuf;
+    // See sys_stat for the failure-sentinel rationale.
+    let fail = SyscallReturn::ok((-1i64) as u64);
     if out_ptr.is_null() {
-        ctx.set_return(SyscallReturn::invalid_op());
+        ctx.set_return(fail);
         return;
     }
     let task = current_task_id();
@@ -854,7 +862,7 @@ fn sys_fstat(ctx: &mut dyn TrapContext) {
     });
     let stat = match stat {
         Some(Some(s)) => s,
-        _             => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        _             => { ctx.set_return(fail); return; }
     };
     // SAFETY: same contract as `sys_stat`.
     unsafe { core::ptr::write_volatile(out_ptr, stat); }
@@ -1380,8 +1388,12 @@ fn sys_chdir(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let ptr  = args.arg0 as *const u8;
     let len  = args.arg1 as usize;
+    // See sys_stat for the failure-sentinel rationale: the user-
+    // runtime asm wrapper observes only `value`, so success and
+    // invalid_op both surface as rax=0 without this.
+    let fail = SyscallReturn::ok((-1i64) as u64);
     if ptr.is_null() || len == 0 {
-        ctx.set_return(SyscallReturn::invalid_op());
+        ctx.set_return(fail);
         return;
     }
     // SAFETY: caller-supplied user pointer in the active AS,
@@ -1390,21 +1402,21 @@ fn sys_chdir(ctx: &mut dyn TrapContext) {
     let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
     let path = match core::str::from_utf8(bytes) {
         Ok(s) => s,
-        Err(_) => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        Err(_) => { ctx.set_return(fail); return; }
     };
     // Stage-4 first cut: absolute paths only. Relative-path
     // resolution joins with the *at(2) family in a follow-up; we
     // reject early so callers don't accidentally rely on a
     // half-implemented relative path being silently dropped.
     if !path.starts_with('/') {
-        ctx.set_return(SyscallReturn::invalid_op());
+        ctx.set_return(fail);
         return;
     }
     let task = current_task_id();
     let mut g = CWD_TABLE.lock();
     let map = match g.as_mut() {
         Some(m) => m,
-        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        None    => { ctx.set_return(fail); return; }
     };
     map.insert(task, alloc::string::String::from(path));
     ctx.set_return(SyscallReturn::ok(0));
