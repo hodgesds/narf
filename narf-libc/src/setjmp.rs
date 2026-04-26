@@ -168,3 +168,44 @@ extern "C" {
     /// Never returns to the caller.
     pub fn longjmp(env: *mut jmp_buf, val: i32) -> !;
 }
+
+// ── sigsetjmp / siglongjmp ──────────────────────────────────────────
+//
+// POSIX `sigsetjmp(env, savemask)` is `setjmp(env)` plus optional
+// signal-mask save/restore. NARF doesn't carry a per-task signal
+// mask in user mode (the kernel surfaces a structural sigprocmask
+// stub but the libc shim today is a no-op), so the `savemask`
+// argument is accepted-and-ignored. The forwarding macro shape
+// matches glibc: same `jmp_buf` type, same return contract.
+//
+// `siglongjmp(env, val)` is exactly `longjmp(env, val)` — there's
+// no mask to restore.
+
+/// Opaque sigjmp_buf: same shape as [`jmp_buf`] (real glibc grows
+/// it for the saved sigset_t; NARF doesn't ship a sigset
+/// representation worth saving, so we alias).
+pub type sigjmp_buf = jmp_buf;
+
+/// `sigsetjmp(env, savemask)` — POSIX. `savemask` is recorded into
+/// the supplied buffer for symmetry with `siglongjmp` but the
+/// signal-mask itself is not captured (NARF has no live mask).
+///
+/// # Safety
+/// `env` must be a writable `*mut sigjmp_buf` and outlive the
+/// matching `siglongjmp`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sigsetjmp(env: *mut sigjmp_buf, _savemask: i32) -> i32 {
+    // SAFETY: forwarded; setjmp expects the same buffer shape.
+    unsafe { setjmp(env) }
+}
+
+/// `siglongjmp(env, val)` — POSIX. The "restore signal mask if
+/// `sigsetjmp` saved one" step is a no-op on NARF.
+///
+/// # Safety
+/// See [`longjmp`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn siglongjmp(env: *mut sigjmp_buf, val: i32) -> ! {
+    // SAFETY: forwarded.
+    unsafe { longjmp(env, val) }
+}

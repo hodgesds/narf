@@ -1927,6 +1927,74 @@ pub extern "C" fn main(
         &[],
     );
 
+    // ── Tier 3v probes: regex skeleton + sigsetjmp/siglongjmp ────
+    //
+    // regcomp succeeds with a flag round-trip; regexec returns
+    // REG_NOMATCH and zeroes the match array.
+    let regex_ok = unsafe {
+        let mut re = narf_libc::regex_t::default();
+        let cr = narf_libc::regcomp(
+            &mut re,
+            b"abc\0".as_ptr() as *const i8,
+            narf_libc::REG_EXTENDED,
+        );
+        let mut m: [narf_libc::regmatch_t; 2] = [
+            narf_libc::regmatch_t::default(),
+            narf_libc::regmatch_t::default(),
+        ];
+        let er = narf_libc::regexec(
+            &re,
+            b"abcdef\0".as_ptr() as *const i8,
+            m.len(),
+            m.as_mut_ptr(),
+            0,
+        );
+        narf_libc::regfree(&mut re);
+        cr == narf_libc::REG_NOERROR
+            && er == narf_libc::REG_NOMATCH
+            && m[0].rm_so == -1 && m[0].rm_eo == -1
+    };
+    narf_libc::printf_str(
+        if regex_ok { "regex: ok\n" } else { "regex: bad\n" },
+        &[],
+    );
+
+    // regerror — non-empty description for REG_NOMATCH.
+    let regerror_ok = unsafe {
+        let mut buf: [u8; 32] = [0; 32];
+        let n = narf_libc::regerror(
+            narf_libc::REG_NOMATCH,
+            core::ptr::null(),
+            buf.as_mut_ptr() as *mut i8,
+            buf.len(),
+        );
+        let want: &[u8] = b"No match";
+        n == want.len() && buf[..want.len()] == *want
+    };
+    narf_libc::printf_str(
+        if regerror_ok { "regerror: ok\n" } else { "regerror: bad\n" },
+        &[],
+    );
+
+    // sigsetjmp / siglongjmp — full round-trip parallel to setjmp.
+    // (AtomicI32 / Ordering already imported above.)
+    static SIG_HITS: AtomicI32 = AtomicI32::new(0);
+    let mut senv = narf_libc::sigjmp_buf::default();
+    let sj_val = unsafe { narf_libc::sigsetjmp(&mut senv, 1) };
+    SIG_HITS.fetch_add(1, Ordering::SeqCst);
+    let sigjmp_ok;
+    if sj_val == 0 && SIG_HITS.load(Ordering::SeqCst) == 1 {
+        unsafe { narf_libc::siglongjmp(&mut senv, 11) };
+    } else if sj_val == 11 && SIG_HITS.load(Ordering::SeqCst) == 2 {
+        sigjmp_ok = true;
+    } else {
+        sigjmp_ok = false;
+    }
+    narf_libc::printf_str(
+        if sigjmp_ok { "sigsetjmp: ok\n" } else { "sigsetjmp: bad\n" },
+        &[],
+    );
+
     // atexit registration — `cleanup` runs after `main` returns,
     // BEFORE the kernel-side exit_task. The ordering proves the
     // dispatch loop in `narf_libc::exit` walks the table.

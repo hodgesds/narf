@@ -47,6 +47,7 @@ pub mod net;
 pub mod path;
 pub mod posix;
 pub mod pthread;
+pub mod regex;
 pub mod term;
 pub mod process;
 pub mod setjmp;
@@ -133,7 +134,16 @@ pub use pthread::{
     pthread_self, pthread_setspecific, pthread_t, MAIN_THREAD, PTHREAD_ONCE_INIT,
 };
 pub use process::{abort, atexit, exit, _exit, getpid, getppid, getuid, sleep, usleep};
-pub use setjmp::{jmp_buf, longjmp, setjmp, JMP_BUF_LEN};
+pub use setjmp::{
+    jmp_buf, longjmp, setjmp, sigjmp_buf, siglongjmp, sigsetjmp, JMP_BUF_LEN,
+};
+pub use regex::{
+    regcomp, regerror, regexec, regfree, regex_t, regmatch_t,
+    REG_BADBR, REG_BADPAT, REG_BADRPT, REG_EBRACE, REG_EBRACK, REG_ECOLLATE,
+    REG_ECTYPE, REG_EESCAPE, REG_EPAREN, REG_ERANGE, REG_ESPACE, REG_ESUBREG,
+    REG_EXTENDED, REG_ICASE, REG_NEWLINE, REG_NOERROR, REG_NOMATCH, REG_NOSUB,
+    REG_NOTBOL, REG_NOTEOL,
+};
 pub use signal::{
     kill, raise, signal, sighandler_t,
     SIG_DFL_RAW, SIG_IGN_RAW, SIGABRT, SIGALRM, SIGCHLD, SIGFPE, SIGHUP, SIGILL,
