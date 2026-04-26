@@ -62,6 +62,8 @@ pub const SYS_SETGID:         u64 = 145;
 pub const SYS_FTRUNCATE:      u64 = 118;
 pub const SYS_PREAD64:        u64 = 119;
 pub const SYS_PWRITE64:       u64 = 122;
+pub const SYS_FSYNC:          u64 = 123;
+pub const SYS_FDATASYNC:      u64 = 124;
 pub const SYS_GETHOSTNAME:    u64 = 146;
 pub const SYS_SETHOSTNAME:    u64 = 147;
 pub const SYS_BRK:            u64 = 150;
@@ -441,6 +443,25 @@ pub fn pwrite(fd: u32, buf: &[u8], offset: u64) -> isize {
         )
     };
     r as isize
+}
+
+/// `fsync(fd)` — flush buffered writes for `fd`. Stub for in-
+/// memory filesystems; returns 0 for an open fd, -1 for an
+/// unknown fd.
+#[inline]
+pub fn fsync(fd: u32) -> i32 {
+    // SAFETY: SYS_FSYNC takes a single arg (fd).
+    let r = unsafe { syscall1(SYS_FSYNC, fd as u64) };
+    if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `fdatasync(fd)` — like [`fsync`] but only metadata-omitted.
+/// Same handler as `fsync`; the FS surface doesn't distinguish.
+#[inline]
+pub fn fdatasync(fd: u32) -> i32 {
+    // SAFETY: SYS_FDATASYNC takes a single arg (fd).
+    let r = unsafe { syscall1(SYS_FDATASYNC, fd as u64) };
+    if r as i64 == -1 { -1 } else { 0 }
 }
 
 /// `gethostname(buf)` — copy the kernel-wide hostname into `buf`,

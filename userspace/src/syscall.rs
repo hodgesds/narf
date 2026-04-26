@@ -173,6 +173,18 @@ pub enum Syscall {
     /// per-fd cursor. Returns the byte count written on success.
     Pwrite64     = 122,
 
+    /// `arg0 = fd`. Flush buffered writes for the file. NARF FSes
+    /// are in-memory so this is a structural no-op that succeeds
+    /// for any open fd, fails (-1) for an unknown fd. The entry
+    /// exists so consumer code that error-checks fsync sees a sane
+    /// return.
+    Fsync        = 123,
+
+    /// `arg0 = fd`. Like Fsync but only metadata-omitted. Mapped
+    /// to the same handler — the FS surface has no metadata-only
+    /// flush distinction.
+    Fdatasync    = 124,
+
     /// Map memory: `arg0` addr hint, `arg1` length, `arg2` flags.
     Mmap         = 120,
 
@@ -395,6 +407,8 @@ impl Syscall {
             118 => Syscall::Ftruncate,
             119 => Syscall::Pread64,
             122 => Syscall::Pwrite64,
+            123 => Syscall::Fsync,
+            124 => Syscall::Fdatasync,
             120 => Syscall::Mmap,
             121 => Syscall::Munmap,
             130 => Syscall::RingKick,

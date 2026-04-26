@@ -141,10 +141,10 @@ pub use path::{
     FNM_NOMATCH, FNM_PATHNAME, FNM_PERIOD,
 };
 pub use posix::{
-    access, close as posix_close, ftruncate, gethostname, getpagesize,
-    lseek as posix_lseek, mkdir as posix_mkdir, open as posix_open,
+    access, close as posix_close, fdatasync, fsync, ftruncate, gethostname,
+    getpagesize, lseek as posix_lseek, mkdir as posix_mkdir, open as posix_open,
     pread, pwrite, read as posix_read, rename as posix_rename,
-    rmdir as posix_rmdir, sethostname, sysconf, truncate,
+    rmdir as posix_rmdir, sethostname, sync, sysconf, truncate,
     unlink as posix_unlink, write as posix_write, O_APPEND, O_CREAT, O_RDONLY,
     O_RDWR, O_TRUNC, O_WRONLY, SEEK_CUR, SEEK_END, SEEK_SET, _SC_OPEN_MAX,
     _SC_PAGESIZE, _SC_PAGE_SIZE,

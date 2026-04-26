@@ -212,6 +212,28 @@ pub unsafe extern "C" fn ftruncate(fd: c_int, len: off_t) -> c_int {
     narf_user_runtime::ftruncate(fd as u32, len as u64)
 }
 
+/// `fsync(fd)` — request a flush of buffered writes. NARF FSes
+/// are in-memory so the call is structural.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fsync(fd: c_int) -> c_int {
+    if fd < 0 { return -1; }
+    narf_user_runtime::fsync(fd as u32)
+}
+
+/// `fdatasync(fd)` — POSIX shape; identical to [`fsync`] under
+/// our model.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fdatasync(fd: c_int) -> c_int {
+    if fd < 0 { return -1; }
+    narf_user_runtime::fdatasync(fd as u32)
+}
+
+/// `sync()` — POSIX-shaped global flush. Structural no-op.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sync() {
+    // Nothing to flush.
+}
+
 /// `pread(fd, buf, count, offset)` — read at the explicit offset
 /// without changing the fd's per-position cursor.
 ///

@@ -962,6 +962,24 @@ fn sys_pwrite64(ctx: &mut dyn TrapContext) {
     }
 }
 
+// ── Fsync / Fdatasync — flush stubs ────────────────────────────────
+//
+// NARF's filesystems are in-memory; there's nothing to flush. We
+// surface success for any open fd so consumer code that error-
+// checks fsync sees a sane return, and -1 for an unknown fd so
+// the contract still distinguishes "valid handle" from "stale".
+
+fn sys_fsync(ctx: &mut dyn TrapContext) {
+    let fd = ctx.args().arg0 as u32;
+    let task = current_task_id();
+    let known = fd::with_table(task, |t| t.get(fd).is_some()).unwrap_or(false);
+    if known {
+        ctx.set_return(SyscallReturn::ok(0));
+    } else {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+    }
+}
+
 // ── Pipe ────────────────────────────────────────────────────────────
 //
 // Allocates a fresh `PipeRead`/`PipeWrite` pair, installs them into
@@ -2477,6 +2495,9 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Ftruncate, "ftruncate", RawFnHandler(sys_ftruncate));
     table.install_raw(Syscall::Pread64,   "pread64",   RawFnHandler(sys_pread64));
     table.install_raw(Syscall::Pwrite64,  "pwrite64",  RawFnHandler(sys_pwrite64));
+    table.install_raw(Syscall::Fsync,     "fsync",     RawFnHandler(sys_fsync));
+    // Fdatasync shares fsync's body — both are structural no-ops.
+    table.install_raw(Syscall::Fdatasync, "fdatasync", RawFnHandler(sys_fsync));
 
     // Tier-2 cwd state + nanosleep wired into the table. Sleep
     // already replaced the noop_ok stub above.
