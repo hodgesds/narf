@@ -2267,6 +2267,82 @@ pub extern "C" fn main(
         &[],
     );
 
+    // ── Tier 3aa probes: pwd / grp single-user account DB ────────
+
+    // getpwuid(0) returns a "narf" entry; getpwuid(1) returns NULL;
+    // iterator yields exactly one row.
+    let pw_ok = unsafe {
+        let p0 = narf_libc::getpwuid(0);
+        let p1 = narf_libc::getpwuid(1);
+        let pn = narf_libc::getpwnam(b"narf\0".as_ptr() as *const i8);
+        let px = narf_libc::getpwnam(b"root\0".as_ptr() as *const i8);
+        let mut name_ok = false;
+        if !p0.is_null() {
+            let want: &[u8] = b"narf\0";
+            name_ok = true;
+            let np = (*p0).pw_name;
+            for (i, &b) in want.iter().enumerate() {
+                if *np.add(i) as u8 != b { name_ok = false; break; }
+            }
+        }
+        narf_libc::setpwent();
+        let it1 = narf_libc::getpwent();
+        let it2 = narf_libc::getpwent();
+        narf_libc::endpwent();
+
+        !p0.is_null()
+            && p1.is_null()
+            && !pn.is_null()
+            && px.is_null()
+            && name_ok
+            && (*p0).pw_uid == 0
+            && (*p0).pw_gid == 0
+            && !it1.is_null()
+            && it2.is_null()
+    };
+    narf_libc::printf_str(
+        if pw_ok { "pwd: ok\n" } else { "pwd: bad\n" },
+        &[],
+    );
+
+    // getgrgid(0) returns "narf"; gr_mem terminates with NULL.
+    let gr_ok = unsafe {
+        let g0 = narf_libc::getgrgid(0);
+        let g1 = narf_libc::getgrgid(1);
+        let gn = narf_libc::getgrnam(b"narf\0".as_ptr() as *const i8);
+        let mem_terminates = if !g0.is_null() {
+            let m = (*g0).gr_mem;
+            !m.is_null() && !(*m).is_null() && (*m.add(1)).is_null()
+        } else { false };
+
+        !g0.is_null()
+            && g1.is_null()
+            && !gn.is_null()
+            && (*g0).gr_gid == 0
+            && mem_terminates
+    };
+    narf_libc::printf_str(
+        if gr_ok { "grp: ok\n" } else { "grp: bad\n" },
+        &[],
+    );
+
+    // getgrouplist returns 1 with the primary gid populated.
+    let grl_ok = unsafe {
+        let mut groups: [u32; 4] = [0xdead; 4];
+        let mut ng: i32 = 4;
+        let r = narf_libc::getgrouplist(
+            b"narf\0".as_ptr() as *const i8,
+            0,
+            groups.as_mut_ptr(),
+            &mut ng,
+        );
+        r == 1 && ng == 1 && groups[0] == 0
+    };
+    narf_libc::printf_str(
+        if grl_ok { "grouplist: ok\n" } else { "grouplist: bad\n" },
+        &[],
+    );
+
     // atexit registration — `cleanup` runs after `main` returns,
     // BEFORE the kernel-side exit_task. The ordering proves the
     // dispatch loop in `narf_libc::exit` walks the table.

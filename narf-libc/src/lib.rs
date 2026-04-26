@@ -31,6 +31,7 @@ extern "C" {
     fn main(argc: i32, argv: *const *const u8, envp: *const *const u8) -> i32;
 }
 
+pub mod account;
 pub mod arch;
 pub mod assert;
 pub mod ctype;
@@ -61,6 +62,10 @@ pub mod stdlib;
 pub mod string;
 pub mod time;
 
+pub use account::{
+    endgrent, endpwent, getgrent, getgrgid, getgrnam, getgrouplist, getpwent, getpwnam,
+    getpwuid, gid_t, group, passwd, setgrent, setpwent, uid_t,
+};
 pub use arch::_start;
 pub use assert::__assert_fail;
 pub use ctype::{
