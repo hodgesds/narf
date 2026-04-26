@@ -61,6 +61,13 @@ pub unsafe extern "C" fn isxdigit(c: c_int) -> c_int {
     (dec < 10 || lo < 6 || hi < 6) as c_int
 }
 
+/// Returns non-zero iff `c` is a blank character (POSIX 2001:
+/// space or horizontal tab). A strict subset of [`isspace`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn isblank(c: c_int) -> c_int {
+    (c == b' ' as c_int || c == b'\t' as c_int) as c_int
+}
+
 /// Returns non-zero iff `c` is whitespace per C99 (space, \t, \n,
 /// \v, \f, \r). Locale-independent.
 #[unsafe(no_mangle)]

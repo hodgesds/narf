@@ -399,6 +399,266 @@ pub unsafe extern "C" fn memchr(s: *const u8, c: i32, n: usize) -> *mut u8 {
     core::ptr::null_mut()
 }
 
+/// `strnlen(s, max)` — strlen with a hard upper bound. Returns the
+/// shorter of `strlen(s)` and `max`. Used by code that doesn't
+/// fully trust the input string's NUL-termination.
+///
+/// # Safety
+/// `s` must be readable for at least `min(strlen(s), max)` bytes —
+/// in practice "either NUL-terminated within `max` bytes, or
+/// readable for the full `max` bytes".
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strnlen(s: *const u8, max: usize) -> usize {
+    if s.is_null() { return 0; }
+    let mut n = 0usize;
+    // SAFETY: per the function-level contract.
+    unsafe {
+        while n < max && *s.add(n) != 0 {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// `strndup(s, max)` — `strdup` with a length cap. The returned
+/// pointer is always NUL-terminated.
+///
+/// # Safety
+/// `s` must satisfy [`strnlen`]'s contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strndup(s: *const u8, max: usize) -> *mut u8 {
+    if s.is_null() { return core::ptr::null_mut(); }
+    // SAFETY: caller contract.
+    let len = unsafe { strnlen(s, max) };
+    // SAFETY: malloc is `unsafe extern "C"`; size > 0.
+    let buf = unsafe { crate::heap::malloc(len + 1) };
+    if buf.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: buf has len + 1 writable bytes.
+    unsafe {
+        for i in 0..len {
+            *buf.add(i) = *s.add(i);
+        }
+        *buf.add(len) = 0;
+    }
+    buf
+}
+
+/// `memmem(haystack, hlen, needle, nlen)` — find the first
+/// occurrence of `needle` (length `nlen`) inside `haystack`
+/// (length `hlen`). Returns a pointer inside `haystack` on
+/// success, NULL otherwise. Length-bounded (no NUL stop).
+///
+/// Algorithm: naive O(h*n). Stage-4 callers feed tiny strings;
+/// KMP / SSE variants are not worth the audit surface.
+///
+/// # Safety
+/// `haystack` must be readable for `hlen` bytes; `needle` for
+/// `nlen` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memmem(
+    haystack: *const u8,
+    hlen:     usize,
+    needle:   *const u8,
+    nlen:     usize,
+) -> *mut u8 {
+    if needle.is_null() || nlen == 0 {
+        // POSIX-ish: a zero-length needle matches at start.
+        return haystack as *mut u8;
+    }
+    if haystack.is_null() || hlen < nlen {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: caller-bounded buffers.
+    unsafe {
+        for i in 0..=hlen - nlen {
+            let mut matched = true;
+            for j in 0..nlen {
+                if *haystack.add(i + j) != *needle.add(j) {
+                    matched = false;
+                    break;
+                }
+            }
+            if matched {
+                return haystack.add(i) as *mut u8;
+            }
+        }
+    }
+    core::ptr::null_mut()
+}
+
+/// Lowercase byte fold for ASCII a-z; passes other bytes through.
+#[inline]
+fn ascii_to_lower(b: u8) -> u8 {
+    if (b'A'..=b'Z').contains(&b) { b + 32 } else { b }
+}
+
+/// `strcasecmp(a, b)` — case-insensitive compare for ASCII; non-
+/// ASCII bytes compare verbatim (no locale-folding).
+///
+/// # Safety
+/// Both arguments must be NUL-terminated C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strcasecmp(a: *const u8, b: *const u8) -> i32 {
+    // SAFETY: per the function-level contract.
+    unsafe {
+        let mut i = 0usize;
+        loop {
+            let av = ascii_to_lower(*a.add(i));
+            let bv = ascii_to_lower(*b.add(i));
+            if av != bv { return (av as i32) - (bv as i32); }
+            if av == 0  { return 0; }
+            i += 1;
+        }
+    }
+}
+
+/// `strncasecmp(a, b, n)` — bounded case-insensitive compare.
+///
+/// # Safety
+/// `a` and `b` must each be readable for `min(strlen, n)` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strncasecmp(a: *const u8, b: *const u8, n: usize) -> i32 {
+    // SAFETY: per the function-level contract.
+    unsafe {
+        for i in 0..n {
+            let av = ascii_to_lower(*a.add(i));
+            let bv = ascii_to_lower(*b.add(i));
+            if av != bv { return (av as i32) - (bv as i32); }
+            if av == 0  { return 0; }
+        }
+    }
+    0
+}
+
+/// `strcoll(a, b)` — locale-aware compare. NARF only supports the
+/// `"C"` locale, so this aliases [`strcmp`] verbatim.
+///
+/// # Safety
+/// See [`strcmp`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strcoll(a: *const u8, b: *const u8) -> i32 {
+    // SAFETY: forwarded.
+    unsafe { strcmp(a, b) }
+}
+
+/// `strxfrm(dest, src, n)` — locale transform. Under the `"C"`
+/// locale this is a plain bounded copy of `src` into `dest`.
+/// Returns the source length (excluding NUL) per POSIX.
+///
+/// # Safety
+/// `src` must be NUL-terminated. `dest` must be writable for `n`
+/// bytes (or NULL when `n == 0`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strxfrm(dest: *mut u8, src: *const u8, n: usize) -> usize {
+    if src.is_null() { return 0; }
+    // SAFETY: caller-asserted NUL-termination.
+    let len = unsafe { strlen(src) };
+    if !dest.is_null() && n > 0 {
+        // SAFETY: caller-asserted writable region.
+        unsafe {
+            let copy = if len + 1 < n { len + 1 } else { n };
+            for i in 0..copy {
+                *dest.add(i) = *src.add(i);
+            }
+            // Always NUL-terminate within bounds.
+            if copy > 0 {
+                *dest.add(copy - 1) = if copy <= len { *src.add(copy - 1) } else { 0 };
+                if copy <= n - 1 || *dest.add(copy - 1) != 0 {
+                    let term = copy.min(n - 1);
+                    *dest.add(term) = 0;
+                }
+            }
+        }
+    }
+    len
+}
+
+// ── *_chk fortified shims ──────────────────────────────────────────
+//
+// glibc emits `__memcpy_chk`, `__strcpy_chk`, etc. when a binary is
+// compiled with `-D_FORTIFY_SOURCE=2`. Each takes a "destination
+// length" argument that the runtime checks against the requested
+// copy size; on overrun, it aborts. We're not in a position to
+// enforce the bound (we don't know the destination's true size
+// outside the supplied parameter), so we simply forward to the
+// unfortified primitive after a soft check that aborts on overflow.
+
+/// `__memcpy_chk(dest, src, len, destlen)` — fortified memcpy.
+/// # Safety
+/// As [`memcpy`] plus `destlen >= len`. We `abort` on violation so
+/// the unsafe block doesn't silently overflow.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __memcpy_chk(
+    dest:    *mut u8,
+    src:     *const u8,
+    len:     usize,
+    destlen: usize,
+) -> *mut u8 {
+    if len > destlen {
+        // SAFETY: abort never returns.
+        unsafe { crate::process::abort(); }
+    }
+    // SAFETY: caller-asserted via memcpy contract.
+    unsafe { memcpy(dest, src, len) }
+}
+
+/// `__memmove_chk(dest, src, len, destlen)` — fortified memmove.
+/// # Safety
+/// As [`memmove`] plus `destlen >= len`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __memmove_chk(
+    dest:    *mut u8,
+    src:     *const u8,
+    len:     usize,
+    destlen: usize,
+) -> *mut u8 {
+    if len > destlen {
+        // SAFETY: abort never returns.
+        unsafe { crate::process::abort(); }
+    }
+    // SAFETY: caller-asserted via memmove contract.
+    unsafe { memmove(dest, src, len) }
+}
+
+/// `__memset_chk(dest, byte, len, destlen)` — fortified memset.
+/// # Safety
+/// As [`memset`] plus `destlen >= len`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __memset_chk(
+    dest:    *mut u8,
+    byte:    i32,
+    len:     usize,
+    destlen: usize,
+) -> *mut u8 {
+    if len > destlen {
+        // SAFETY: abort never returns.
+        unsafe { crate::process::abort(); }
+    }
+    // SAFETY: caller-asserted via memset contract.
+    unsafe { memset(dest, byte, len) }
+}
+
+/// `__strcpy_chk(dest, src, destlen)` — fortified strcpy.
+/// # Safety
+/// As [`strcpy`] plus `strlen(src) < destlen`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __strcpy_chk(
+    dest:    *mut u8,
+    src:     *const u8,
+    destlen: usize,
+) -> *mut u8 {
+    // SAFETY: caller-asserted NUL-termination.
+    let len = unsafe { strlen(src) };
+    if len + 1 > destlen {
+        // SAFETY: abort never returns.
+        unsafe { crate::process::abort(); }
+    }
+    // SAFETY: forwarded.
+    unsafe { strcpy(dest, src) }
+}
+
 /// Test whether byte `b` appears in NUL-terminated `set`. Helper
 /// shared by `strspn`/`strcspn`/`strpbrk`. O(|set|) per probe.
 ///

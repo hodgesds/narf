@@ -58,7 +58,7 @@ pub mod time;
 pub use arch::_start;
 pub use assert::__assert_fail;
 pub use ctype::{
-    isalnum, isalpha, isascii, iscntrl, isdigit, isgraph, islower, isprint,
+    isalnum, isalpha, isascii, isblank, iscntrl, isdigit, isgraph, islower, isprint,
     ispunct, isspace, isupper, isxdigit, tolower, toupper,
 };
 pub use env::{getenv, getenv_cstr, putenv, setenv, unsetenv, ENVIRON};
@@ -138,6 +138,8 @@ pub use stdio::{
     setvbuf, stderr, stdin, stdout, ungetc, File, _IOFBF, _IOLBF, _IONBF,
 };
 pub use string::{
-    memchr, memcmp, memcpy, memmove, memset, strcat, strchr, strcmp, strcpy, strcspn,
-    strdup, strlen, strncmp, strncpy, strpbrk, strrchr, strspn, strstr, strtok_r,
+    memchr, memcmp, memcpy, memmem, memmove, memset, strcasecmp, strcat, strchr,
+    strcmp, strcoll, strcpy, strcspn, strdup, strlen, strncasecmp, strncmp, strncpy,
+    strndup, strnlen, strpbrk, strrchr, strspn, strstr, strtok_r, strxfrm,
+    __memcpy_chk, __memmove_chk, __memset_chk, __strcpy_chk,
 };

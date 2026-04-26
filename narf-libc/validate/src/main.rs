@@ -1630,6 +1630,107 @@ pub extern "C" fn main(
         &[],
     );
 
+    // ── Tier 3r probes: string extras + ctype isblank ────────────
+
+    // strcasecmp / strncasecmp — case-folded compare.
+    let case_ok = unsafe {
+        narf_libc::strcasecmp(
+            b"Hello\0".as_ptr(),
+            b"hELLO\0".as_ptr(),
+        ) == 0
+            && narf_libc::strcasecmp(
+                b"Hello\0".as_ptr(),
+                b"world\0".as_ptr(),
+            ) != 0
+            && narf_libc::strncasecmp(
+                b"AbcDef\0".as_ptr(),
+                b"abcXYZ\0".as_ptr(),
+                3,
+            ) == 0
+            && narf_libc::strncasecmp(
+                b"AbcDef\0".as_ptr(),
+                b"abcXYZ\0".as_ptr(),
+                4,
+            ) != 0
+    };
+    narf_libc::printf_str(
+        if case_ok { "case_cmp: ok\n" } else { "case_cmp: bad\n" },
+        &[],
+    );
+
+    // memmem — length-bounded byte search.
+    let memmem_ok = unsafe {
+        let hay = b"the quick brown fox";
+        let p = narf_libc::memmem(
+            hay.as_ptr(), hay.len(),
+            b"brown".as_ptr(), 5,
+        );
+        let miss = narf_libc::memmem(
+            hay.as_ptr(), hay.len(),
+            b"green".as_ptr(), 5,
+        );
+        !p.is_null()
+            && (p as usize) - (hay.as_ptr() as usize) == 10
+            && miss.is_null()
+    };
+    narf_libc::printf_str(
+        if memmem_ok { "memmem: ok\n" } else { "memmem: bad\n" },
+        &[],
+    );
+
+    // strnlen / strndup — bounded forms.
+    let nlen_ok = unsafe {
+        narf_libc::strnlen(b"hi\0".as_ptr(), 100) == 2
+            && narf_libc::strnlen(b"hello".as_ptr(), 3) == 3
+    };
+    let ndup = unsafe { narf_libc::strndup(b"abcdefghij".as_ptr(), 4) };
+    let ndup_ok = unsafe {
+        let mut ok = !ndup.is_null();
+        if ok {
+            for (i, &b) in b"abcd".iter().enumerate() {
+                if *ndup.add(i) != b { ok = false; break; }
+            }
+            if ok && *ndup.add(4) != 0 { ok = false; }
+            narf_libc::free(ndup);
+        }
+        ok
+    };
+    narf_libc::printf_str(
+        if nlen_ok && ndup_ok { "strn: ok\n" } else { "strn: bad\n" },
+        &[],
+    );
+
+    // *_chk — happy path forwards to the unfortified primitive.
+    let chk_ok = unsafe {
+        let mut buf: [u8; 8] = [0; 8];
+        let _ = narf_libc::__memcpy_chk(
+            buf.as_mut_ptr(),
+            b"abcd\0\0\0\0".as_ptr(),
+            5,
+            buf.len(),
+        );
+        let _ = narf_libc::__memset_chk(
+            buf.as_mut_ptr().add(5), b'X' as i32, 2, buf.len() - 5,
+        );
+        buf == *b"abcd\0XX\0"
+    };
+    narf_libc::printf_str(
+        if chk_ok { "fortify: ok\n" } else { "fortify: bad\n" },
+        &[],
+    );
+
+    // isblank — space + tab, nothing else.
+    let isblank_ok = unsafe {
+        narf_libc::isblank(b' ' as i32) != 0
+            && narf_libc::isblank(b'\t' as i32) != 0
+            && narf_libc::isblank(b'\n' as i32) == 0
+            && narf_libc::isblank(b'a' as i32) == 0
+    };
+    narf_libc::printf_str(
+        if isblank_ok { "isblank: ok\n" } else { "isblank: bad\n" },
+        &[],
+    );
+
     // atexit registration — `cleanup` runs after `main` returns,
     // BEFORE the kernel-side exit_task. The ordering proves the
     // dispatch loop in `narf_libc::exit` walks the table.
