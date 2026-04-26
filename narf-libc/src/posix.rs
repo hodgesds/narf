@@ -204,6 +204,33 @@ pub unsafe extern "C" fn getpagesize() -> c_int {
     4096
 }
 
+/// `ftruncate(fd, len)` — resize the file backing `fd` to `len`
+/// bytes. Returns 0 on success, -1 on bad fd or read-only FS.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ftruncate(fd: c_int, len: off_t) -> c_int {
+    if fd < 0 || len < 0 { return -1; }
+    narf_user_runtime::ftruncate(fd as u32, len as u64)
+}
+
+/// `truncate(path, len)` — open(path, O_WRONLY) + ftruncate + close.
+/// Convenience wrapper to match POSIX surface.
+///
+/// # Safety
+/// `path` must be a NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn truncate(path: *const c_char, len: off_t) -> c_int {
+    if path.is_null() || len < 0 { return -1; }
+    // SAFETY: caller-asserted NUL-terminator.
+    let s = unsafe { cstr_to_str(path) };
+    let fd = match narf_user_runtime::open_abs(s) {
+        Some(f) => f,
+        None    => return -1,
+    };
+    let r = narf_user_runtime::ftruncate(fd, len as u64);
+    let _ = narf_user_runtime::close(fd);
+    r
+}
+
 /// `gethostname(buf, len)` — copy the kernel hostname, NUL-
 /// terminated, into `buf`. Returns 0 on success, -1 if `len` is
 /// too small for the name + NUL.

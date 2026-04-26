@@ -80,6 +80,17 @@ impl FileOps for MemFile {
             mtime_cycles: 0,
         }
     }
+
+    fn truncate(&self, len: u64) -> Result<(), FsError> {
+        // Cap at usize::MAX so a 64-bit pathologically large `len`
+        // doesn't underflow into a tiny resize on 32-bit hosts. NARF
+        // user mode is 64-bit on every supported target, but Stage-5
+        // host-side test runners may differ.
+        let new_len = len as usize;
+        let mut g = self.bytes.lock();
+        g.resize(new_len, 0);
+        Ok(())
+    }
 }
 
 /// One directory entry. The discriminant carries either an `Arc`-

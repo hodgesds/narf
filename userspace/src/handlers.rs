@@ -869,6 +869,28 @@ fn sys_fstat(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(0));
 }
 
+// ── Ftruncate — arg0=fd, arg1=len ──────────────────────────────────
+//
+// Resize the file backing `fd` to exactly `len` bytes. Routes
+// through `FileOps::truncate` — read-only filesystems return
+// `Unsupported`, which we surface as the wire `-1` sentinel.
+
+fn sys_ftruncate(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let fd   = args.arg0 as u32;
+    let len  = args.arg1;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    let task = current_task_id();
+    let outcome = fd::with_table(task, |t| {
+        let entry = t.get(fd)?;
+        Some(entry.ops.truncate(len))
+    });
+    match outcome {
+        Some(Some(Ok(()))) => ctx.set_return(SyscallReturn::ok(0)),
+        _                  => ctx.set_return(fail),
+    }
+}
+
 // ── Pipe ────────────────────────────────────────────────────────────
 //
 // Allocates a fresh `PipeRead`/`PipeWrite` pair, installs them into
@@ -2381,6 +2403,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Stat,   "stat",   RawFnHandler(sys_stat));
     table.install_raw(Syscall::Fstat,  "fstat",  RawFnHandler(sys_fstat));
     table.install_raw(Syscall::Pipe,   "pipe",   RawFnHandler(sys_pipe));
+    table.install_raw(Syscall::Ftruncate, "ftruncate", RawFnHandler(sys_ftruncate));
 
     // Tier-2 cwd state + nanosleep wired into the table. Sleep
     // already replaced the noop_ok stub above.

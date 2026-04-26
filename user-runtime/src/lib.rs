@@ -59,6 +59,7 @@ pub const SYS_GETUID:         u64 = 142;
 pub const SYS_GETGID:         u64 = 143;
 pub const SYS_SETUID:         u64 = 144;
 pub const SYS_SETGID:         u64 = 145;
+pub const SYS_FTRUNCATE:      u64 = 118;
 pub const SYS_GETHOSTNAME:    u64 = 146;
 pub const SYS_SETHOSTNAME:    u64 = 147;
 pub const SYS_BRK:            u64 = 150;
@@ -396,6 +397,15 @@ pub fn setuid(uid: u32) -> i32 {
 pub fn setgid(gid: u32) -> i32 {
     // SAFETY: SYS_SETGID takes one arg (gid).
     let r = unsafe { syscall1(SYS_SETGID, gid as u64) };
+    if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `ftruncate(fd, len)` — resize the file backing `fd` to exactly
+/// `len` bytes. Returns 0 on success, -1 on read-only fs / bad fd.
+#[inline]
+pub fn ftruncate(fd: u32, len: u64) -> i32 {
+    // SAFETY: SYS_FTRUNCATE signature: (fd, len).
+    let r = unsafe { syscall2(SYS_FTRUNCATE, fd as u64, len) };
     if r as i64 == -1 { -1 } else { 0 }
 }
 

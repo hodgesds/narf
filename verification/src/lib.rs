@@ -11984,3 +11984,88 @@ fn smoke_userspace_hostname_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_userspace_hostname_round_trip);
+
+fn smoke_userspace_ftruncate_grows_and_shrinks_memfile() -> TestResult {
+    use core::pin::Pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use narf_filesystem::{
+        bootstrap_mount_authority, registry, MemFs,
+    };
+
+    // Inline single-shot future poller — MemFs reads/writes are
+    // immediately ready, so we don't need a real executor here.
+    fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
+        fn raw_waker() -> RawWaker {
+            unsafe fn no_clone(_: *const ()) -> RawWaker { raw_waker() }
+            unsafe fn no_op(_: *const ()) {}
+            const VTAB: RawWakerVTable = RawWakerVTable::new(
+                no_clone, no_op, no_op, no_op,
+            );
+            RawWaker::new(core::ptr::null(), &VTAB)
+        }
+        let waker = unsafe { Waker::from_raw(raw_waker()) };
+        let mut cx = Context::from_waker(&waker);
+        // SAFETY: future is on this stack frame and not moved.
+        let pinned = unsafe { Pin::new_unchecked(&mut fut) };
+        match pinned.poll(&mut cx) {
+            Poll::Ready(v) => Some(v),
+            Poll::Pending  => None,
+        }
+    }
+
+    // Mount a fresh MemFs with a seeded 6-byte file. Ftruncate
+    // grows it to 16, shrinks to 3, then reads to verify each.
+    let auth = bootstrap_mount_authority();
+    let _ = registry().mount(&auth, "/trunc", MemFs::with_seeds(
+        "trunc-test", &[("f", b"abcdef")],
+    ));
+
+    let ops = registry().resolve_absolute("/trunc/f", |fs, rel| {
+        narf_filesystem::resolve(fs.root(), rel).ok()
+    }).flatten();
+    let ops = match ops {
+        Some(o) => o,
+        None    => return TestResult::Fail("resolve /trunc/f failed"),
+    };
+
+    // Initial size = 6.
+    if ops.stat().size != 6 {
+        return TestResult::Fail("initial file size != 6");
+    }
+
+    // Grow to 16. The new tail is zero-filled per POSIX.
+    if ops.truncate(16).is_err() {
+        return TestResult::Fail("truncate grow failed");
+    }
+    if ops.stat().size != 16 {
+        return TestResult::Fail("size after grow != 16");
+    }
+    let mut buf = [0xAAu8; 16];
+    let n = match poll_once(ops.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("post-grow read failed"),
+    };
+    if n != 16 || &buf[0..6] != b"abcdef" || buf[6..16].iter().any(|&b| b != 0) {
+        return TestResult::Fail("post-grow contents wrong");
+    }
+
+    // Shrink to 3. Re-stat must report 3 bytes; read confirms tail
+    // is gone.
+    if ops.truncate(3).is_err() {
+        return TestResult::Fail("truncate shrink failed");
+    }
+    if ops.stat().size != 3 {
+        return TestResult::Fail("size after shrink != 3");
+    }
+    let mut buf2 = [0u8; 16];
+    let n2 = match poll_once(ops.read(0, &mut buf2)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("post-shrink read failed"),
+    };
+    if n2 != 3 || &buf2[..3] != b"abc" {
+        return TestResult::Fail("post-shrink contents wrong");
+    }
+
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_ftruncate_grows_and_shrinks_memfile);

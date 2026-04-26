@@ -154,6 +154,14 @@ pub enum Syscall {
     /// on success.
     Pipe         = 117,
 
+    /// `arg0 = fd`, `arg1 = len` (u64). Resize the underlying file
+    /// to exactly `len` bytes — zero-fill on grow, truncate on
+    /// shrink. Returns 0 on success, -1 on read-only FS / bad fd.
+    /// Touches the file directly via `FileOps::truncate`; no fd
+    /// offset state is altered (POSIX: ftruncate doesn't move the
+    /// per-fd cursor).
+    Ftruncate    = 118,
+
     /// Map memory: `arg0` addr hint, `arg1` length, `arg2` flags.
     Mmap         = 120,
 
@@ -373,6 +381,7 @@ impl Syscall {
             115 => Syscall::Stat,
             116 => Syscall::Fstat,
             117 => Syscall::Pipe,
+            118 => Syscall::Ftruncate,
             120 => Syscall::Mmap,
             121 => Syscall::Munmap,
             130 => Syscall::RingKick,

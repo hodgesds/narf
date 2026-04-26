@@ -216,6 +216,14 @@ pub trait FileOps: Send + Sync {
     /// Synchronous stat — every Stage-3 FS knows its file size + mtime
     /// cheaply.
     fn stat(&self) -> Stat;
+
+    /// Resize the file to exactly `len` bytes. Growing zero-fills;
+    /// shrinking truncates. Default: `Unsupported` so read-only
+    /// filesystems (initramfs) reject without per-impl boilerplate.
+    /// Mutable filesystems (`MemFs::MemFile`) override.
+    fn truncate(&self, _len: u64) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
 }
 
 /// Per-directory async op surface. `lookup` is synchronous because
