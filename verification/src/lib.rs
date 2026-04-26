@@ -11642,3 +11642,110 @@ fn smoke_userspace_getrandom_fills_buffer() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_userspace_getrandom_fills_buffer);
+
+fn smoke_userspace_listdir_walks_memfs() -> TestResult {
+    // Mount a fresh MemFs at /list-test seeded with three entries
+    // and walk it via SYS_LISTDIR. Each call advances the cursor
+    // by one; the kernel re-snapshots each invocation. End-of-
+    // directory surfaces as `value = 0`.
+    use narf_filesystem as fs;
+    use narf_userspace::{install_core_syscalls, install_global,
+                         kernel_syscall_entry, syscall::__test_clear_global,
+                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+                         TrapContext};
+
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let auth = fs::bootstrap_mount_authority();
+    // The validate harness may have left /list-test behind from a
+    // prior run; tolerate Busy to keep the test idempotent.
+    let _ = fs::registry().mount(
+        &auth,
+        "/list-test",
+        fs::MemFs::with_seeds(
+            "list-test",
+            &[("alpha", b"a"), ("beta", b"b"), ("gamma", b"c")],
+        ),
+    );
+
+    fn one_call(path: &str, cursor: u64, out: &mut [u8]) -> Option<SyscallReturn> {
+        struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+        impl TrapContext for FakeCtx {
+            fn args(&self) -> &SyscallArgs { &self.args }
+            fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+            fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        }
+        let mut ctx = FakeCtx {
+            args: SyscallArgs {
+                arg0: path.as_ptr() as u64,
+                arg1: path.len() as u64,
+                arg2: cursor,
+                arg3: out.as_mut_ptr() as u64,
+                arg4: out.len() as u64,
+                ..SyscallArgs::default()
+            },
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::Listdir.raw(), &mut ctx);
+        ctx.ret
+    }
+
+    fn parse(out: &[u8], n: usize) -> Option<(alloc::string::String, u32)> {
+        if n < 8 { return None; }
+        let name_len = u32::from_le_bytes(out[0..4].try_into().ok()?) as usize;
+        let ftype    = u32::from_le_bytes(out[4..8].try_into().ok()?);
+        if 8 + name_len > n { return None; }
+        let name = core::str::from_utf8(&out[8..8 + name_len]).ok()?.into();
+        Some((name, ftype))
+    }
+
+    let mut buf = [0u8; 64];
+    let mut names: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+    let mut types_ok = true;
+
+    for cursor in 0..4 {
+        let r = match one_call("/list-test", cursor, &mut buf) {
+            Some(r) if r.status == SyscallReturn::OK => r,
+            _ => return TestResult::Fail("listdir returned non-OK"),
+        };
+        if cursor == 3 {
+            // Past last entry — expect value = 0.
+            if r.value != 0 {
+                return TestResult::Fail("listdir cursor=3 did not surface end-of-dir");
+            }
+            break;
+        }
+        let n = r.value as usize;
+        if n == 0 {
+            return TestResult::Fail("listdir produced premature end-of-dir");
+        }
+        let (name, ft) = match parse(&buf, n) {
+            Some(p) => p,
+            None    => return TestResult::Fail("listdir wire-decode failed"),
+        };
+        if ft != 0 { types_ok = false; }   // 0 = File
+        names.push(name);
+    }
+
+    __test_clear_global();
+
+    names.sort();
+    if names.as_slice() != ["alpha", "beta", "gamma"] {
+        return TestResult::Fail("listdir entries did not match seed set");
+    }
+    if !types_ok {
+        return TestResult::Fail("listdir reported non-File type for seeded files");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_listdir_walks_memfs);

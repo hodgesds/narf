@@ -46,6 +46,7 @@ pub const SYS_WRITE:          u64 = 112;
 pub const SYS_CLOSE:          u64 = 113;
 // Tier-2 fd-table breadth + path resolution + pipe (115..=117 reserved).
 pub const SYS_GETRANDOM:      u64 = 200;
+pub const SYS_LISTDIR:        u64 = 195;
 pub const SYS_STAT:           u64 = 115;
 pub const SYS_FSTAT:          u64 = 116;
 pub const SYS_PIPE:           u64 = 117;
@@ -701,6 +702,32 @@ pub fn rename(old_path: &str, new_path: &str) -> i32 {
         )
     };
     if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `listdir(path, cursor, out)` — read one directory entry at the
+/// given cursor position into `out`. Wire format inside `out` is
+/// `[name_len: u32][file_type: u32][name bytes...]`. Returns the
+/// number of bytes written on success, 0 at end-of-directory, -1
+/// on error. Buffer must be at least 8 bytes (the header) — for a
+/// safe maximum, give it 264 bytes (8 header + 256 max name).
+///
+/// `file_type` values: 0=File, 1=Dir, 2=Symlink, 3=Special.
+#[inline]
+pub fn listdir(path: &str, cursor: u64, out: &mut [u8]) -> isize {
+    if path.is_empty() || out.is_empty() { return -1; }
+    // SAFETY: SYS_LISTDIR signature:
+    //   (path_ptr, path_len, cursor, out_ptr, out_len).
+    let r = unsafe {
+        syscall5(
+            SYS_LISTDIR,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            cursor,
+            out.as_mut_ptr() as u64,
+            out.len() as u64,
+        )
+    };
+    r as isize
 }
 
 /// `getrandom(buf, flags)` — fill `buf` with up-to `buf.len()`

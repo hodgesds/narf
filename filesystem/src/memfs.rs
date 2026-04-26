@@ -27,7 +27,7 @@ use core::fmt;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::{
-    DirEntry, DirOps, FileOps, FsError, FsFuture, FsInstance, Mode, Stat,
+    DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat,
 };
 
 /// In-memory file: a length-tracked byte buffer behind a lock.
@@ -124,12 +124,26 @@ impl DirOps for MemDir {
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
-        // DirEntry::name is &'static — we can't synthesise that from
-        // String keys. Stage-4 widens DirEntry to owned String; until
-        // then iter() returns empty for the mutable FS. Callers that
-        // need contents probe via lookup()/lookup_dir() against
-        // known names.
+        // `DirEntry::name` is `&'static str`; we can't synthesise
+        // that from our `String` keys without leaking. The kernel's
+        // readdir path uses `enumerate()` (overridden below) which
+        // returns owned `(String, FileType)` pairs instead.
         Box::new(core::iter::empty())
+    }
+
+    fn enumerate(&self, cursor: usize, max: usize) -> Vec<(String, FileType)> {
+        let g = self.entries.lock();
+        g.iter()
+            .skip(cursor)
+            .take(max)
+            .map(|(name, entry)| {
+                let ft = match entry {
+                    Entry::File(_) => FileType::File,
+                    Entry::Dir(_)  => FileType::Dir,
+                };
+                (name.clone(), ft)
+            })
+            .collect()
     }
 
     fn unlink(&self, name: &str) -> Result<(), FsError> {

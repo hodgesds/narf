@@ -1082,6 +1082,110 @@ fn sys_rename(ctx: &mut dyn TrapContext) {
     }
 }
 
+// ── Listdir — arg0=path, arg1=path_len, arg2=cursor,
+//             arg3=out_buf, arg4=out_buf_len ────────────────────────
+//
+// Path-based readdir. Resolves the absolute path to a directory,
+// snapshots the entry list via DirOps::enumerate, and serialises
+// the cursor-th entry into the user's buffer in
+// `[name_len: u32][file_type: u32][name bytes...]` format. The
+// libc shim (opendir / readdir / closedir) drives this with a
+// monotonically-increasing cursor; the kernel re-snapshots each
+// call rather than holding state per-fd. This is racy under
+// concurrent mutation but Stage-4 user mode is single-threaded
+// and the typical caller iterates a stable directory.
+//
+// Returns:
+//   `value` = bytes_written (8 + name_len) on success
+//   `value` = 0              on end-of-directory (cursor past end)
+//   `value` = -1             on bad input / lookup failure / buf
+//                            too small to hold the header + name.
+//
+// Returning the FileType as the second u32 lets the libc fill in
+// `dirent.d_type` directly without a follow-on stat.
+
+fn sys_listdir(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let path_ptr  = args.arg0 as *const u8;
+    let path_len  = args.arg1 as usize;
+    let cursor    = args.arg2 as usize;
+    let out_ptr   = args.arg3 as *mut u8;
+    let out_len   = args.arg4 as usize;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+
+    if path_ptr.is_null() || path_len == 0 || out_ptr.is_null() {
+        ctx.set_return(fail);
+        return;
+    }
+    if out_len < 8 {
+        // Need room for at least the header.
+        ctx.set_return(fail);
+        return;
+    }
+    // SAFETY: caller-supplied user pointer in the active AS.
+    let path_bytes = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
+    let path = match core::str::from_utf8(path_bytes) {
+        Ok(s) => s,
+        Err(_) => { ctx.set_return(fail); return; }
+    };
+
+    // Resolve to a DirOps. Empty path or root → use the FS root
+    // directly; otherwise descend through `lookup_dir`.
+    let entries = narf_filesystem::registry().resolve_absolute(path, |fs, rel| {
+        let dir: alloc::sync::Arc<dyn narf_filesystem::DirOps> = if rel.is_empty() {
+            fs.root()
+        } else {
+            // Walk segment by segment so we follow `lookup_dir`.
+            let mut cur = fs.root();
+            for seg in rel.split('/').filter(|s| !s.is_empty()) {
+                cur = cur.lookup_dir(seg)?;
+            }
+            cur
+        };
+        // Bound the snapshot at usize::MAX entries — practically
+        // walks every entry, but `enumerate` already takes a `max`
+        // so the contract is in our hands.
+        Some(dir.enumerate(cursor, 1))
+    }).flatten();
+
+    let entries = match entries {
+        Some(v) => v,
+        None    => { ctx.set_return(fail); return; }
+    };
+    if entries.is_empty() {
+        // End of directory.
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+    let (name, ftype) = &entries[0];
+    let name_bytes = name.as_bytes();
+    let total = 8 + name_bytes.len();
+    if total > out_len {
+        ctx.set_return(fail);
+        return;
+    }
+    // Encode FileType to the wire ordinal: 0=File, 1=Dir, 2=Symlink, 3=Special.
+    let ftype_wire: u32 = match ftype {
+        narf_filesystem::FileType::File    => 0,
+        narf_filesystem::FileType::Dir     => 1,
+        narf_filesystem::FileType::Symlink => 2,
+        narf_filesystem::FileType::Special => 3,
+    };
+    // SAFETY: out_ptr is a user-supplied writable region of `out_len`
+    // bytes; `total <= out_len` per the bounds check above. Use
+    // write_unaligned because user buffers may not be u32-aligned.
+    unsafe {
+        core::ptr::write_unaligned(out_ptr as *mut u32, name_bytes.len() as u32);
+        core::ptr::write_unaligned(out_ptr.add(4) as *mut u32, ftype_wire);
+        core::ptr::copy_nonoverlapping(
+            name_bytes.as_ptr(),
+            out_ptr.add(8),
+            name_bytes.len(),
+        );
+    }
+    ctx.set_return(SyscallReturn::ok(total as u64));
+}
+
 // ── Close — arg0=fd ────────────────────────────────────────────────
 
 fn sys_close(ctx: &mut dyn TrapContext) {
@@ -2101,6 +2205,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Mkdir,  "mkdir",  RawFnHandler(sys_mkdir));
     table.install_raw(Syscall::Rmdir,  "rmdir",  RawFnHandler(sys_rmdir));
     table.install_raw(Syscall::Rename, "rename", RawFnHandler(sys_rename));
+    table.install_raw(Syscall::Listdir, "listdir", RawFnHandler(sys_listdir));
 
     // Tier-3z entropy.
     table.install_raw(Syscall::GetRandom, "getrandom", RawFnHandler(sys_getrandom));

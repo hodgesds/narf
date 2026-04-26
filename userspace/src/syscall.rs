@@ -303,6 +303,20 @@ pub enum Syscall {
     /// failure.
     Rename       = 192,
 
+    /// `arg0 = path_ptr`, `arg1 = path_len`, `arg2 = cursor` (entry
+    /// index, 0-based), `arg3 = out_buf_ptr`, `arg4 = out_buf_len`.
+    /// Resolve the absolute path to a directory and serialise the
+    /// `cursor`-th entry into the caller's buffer in
+    /// `[name_len: u32][file_type: u32][name bytes...]` format
+    /// (8-byte header + name).
+    /// Returns the number of bytes written on success, 0 if the
+    /// cursor is past the directory's last entry, and -1 on error
+    /// (path not a directory, buf too small for the header + name,
+    /// path lookup failure). The libc `<dirent.h>` shim drives
+    /// this once per `readdir` call with a monotonically-increasing
+    /// cursor; the kernel re-snapshots each call.
+    Listdir      = 195,
+
     // ── Tier-3z entropy ────────────────────────────────────────────
     //
     // Slot 200 sits above the directory-mutation block to leave room
@@ -363,6 +377,7 @@ impl Syscall {
             190 => Syscall::Mkdir,
             191 => Syscall::Rmdir,
             192 => Syscall::Rename,
+            195 => Syscall::Listdir,
             200 => Syscall::GetRandom,
             _   => return None,
         })

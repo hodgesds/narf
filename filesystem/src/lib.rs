@@ -238,6 +238,27 @@ pub trait DirOps: Send + Sync {
     /// a GAT. Names are `&'static str` per `DirEntry`'s comment.
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a>;
 
+    /// Snapshot up-to `max` entries starting at `cursor` and return
+    /// them as `(owned_name, file_type)` pairs. Default impl walks
+    /// `iter()` and clones each entry's `&'static str` to a `String`.
+    /// Filesystems whose names live in non-static storage (e.g. the
+    /// `MemFs` `BTreeMap<String, _>`) override this to return their
+    /// real entries — `iter()` still returns empty for those, since
+    /// the trait's `&'static str` payload can't be synthesised.
+    ///
+    /// Used by `sys_listdir` (kernel readdir surface). Cheap: a
+    /// few dozen Strings per call at the typical scale.
+    fn enumerate(&self, cursor: usize, max: usize)
+        -> alloc::vec::Vec<(alloc::string::String, FileType)>
+    {
+        use alloc::string::ToString;
+        self.iter()
+            .skip(cursor)
+            .take(max)
+            .map(|de| (de.name.to_string(), de.file_type))
+            .collect()
+    }
+
     // ── Stage-4 r/w surface ──────────────────────────────────────
     //
     // These mutators carry a default returning `Unsupported` so the
