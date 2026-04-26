@@ -472,6 +472,33 @@ pub extern "C" fn main(
         &[],
     );
 
+    // setjmp/longjmp probe — first setjmp returns 0, body runs,
+    // longjmp(7) re-enters at the setjmp site with apparent return 7.
+    // The static counter guards against an infinite loop if the
+    // restore path somehow lands at the wrong rip.
+    use core::sync::atomic::{AtomicI32, Ordering};
+    static SJ_COUNTER: AtomicI32 = AtomicI32::new(0);
+    let mut env = narf_libc::jmp_buf::default();
+    // SAFETY: env outlives the longjmp call (it's on this stack
+    // frame and we don't return from main between the setjmp and
+    // the longjmp).
+    let sj_val = unsafe { narf_libc::setjmp(&mut env) };
+    SJ_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let setjmp_ok;
+    if sj_val == 0 && SJ_COUNTER.load(Ordering::SeqCst) == 1 {
+        // First arrival — longjmp back with 7. This call doesn't
+        // return; control resumes at the setjmp() above.
+        unsafe { narf_libc::longjmp(&mut env, 7) };
+    } else if sj_val == 7 && SJ_COUNTER.load(Ordering::SeqCst) == 2 {
+        setjmp_ok = true;
+    } else {
+        setjmp_ok = false;
+    }
+    narf_libc::printf_str(
+        if setjmp_ok { "setjmp: ok\n" } else { "setjmp: bad\n" },
+        &[],
+    );
+
     // ctype probe — exercise a representative slice of the
     // classification + case-fold surface. SAFETY: pure value math.
     let ctype_ok = unsafe {

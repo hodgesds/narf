@@ -11038,6 +11038,10 @@ fn smoke_frame_x86_64_run_narf_libc_validate() -> TestResult {
     //   rw: ok        <- Tier-3d write/read round-trip: open(O_CREAT),
     //                    write payload, close, reopen, read back,
     //                    compare bytes.
+    //   setjmp: ok    <- Tier-3e setjmp/longjmp: first call returns 0,
+    //                    longjmp(env, 7) re-enters with apparent
+    //                    return 7; static counter proves single
+    //                    re-entry, not infinite loop.
     //   ctype: ok     <- Tier-3d <ctype.h>: isdigit/isalpha/isspace/
     //                    isxdigit + tolower/toupper round-trip.
     //   atoi: ok      <- Tier-3a stdlib: leading whitespace + sign +

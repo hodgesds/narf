@@ -41,6 +41,7 @@ pub mod heap;
 pub mod io;
 pub mod posix;
 pub mod process;
+pub mod setjmp;
 pub mod signal;
 pub mod startup;
 pub mod stdio;
@@ -74,6 +75,7 @@ pub use posix::{
     SEEK_CUR, SEEK_END, SEEK_SET,
 };
 pub use process::{abort, atexit, exit, _exit, getpid, getppid, getuid, sleep, usleep};
+pub use setjmp::{jmp_buf, longjmp, setjmp, JMP_BUF_LEN};
 pub use signal::{
     kill, raise, signal, sighandler_t,
     SIG_DFL_RAW, SIG_IGN_RAW, SIGABRT, SIGALRM, SIGCHLD, SIGFPE, SIGHUP, SIGILL,
