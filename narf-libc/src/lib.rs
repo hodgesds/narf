@@ -41,6 +41,7 @@ pub mod fs;
 pub mod getopt;
 pub mod heap;
 pub mod io;
+pub mod locale;
 pub mod math;
 pub mod net;
 pub mod path;
@@ -93,6 +94,12 @@ pub use net::{
     htonl, htons, inet_addr, inet_aton, inet_ntop, inet_pton, ntohl, ntohs,
     AF_INET, INADDR_NONE, INET_ADDRSTRLEN,
 };
+pub use locale::{
+    iconv, iconv_close, iconv_open, mbtowc, nl_langinfo, setlocale, wchar_t, wcscmp,
+    wcslen, wctomb, AM_STR, CODESET, CRNCYSTR, D_FMT, D_T_FMT, EILSEQ, LC_ALL,
+    LC_COLLATE, LC_CTYPE, LC_MESSAGES, LC_MONETARY, LC_NUMERIC, LC_TIME, PM_STR,
+    RADIXCHAR, T_FMT, T_FMT_AMPM, THOUSEP,
+};
 pub use path::{
     basename, closedir, dirent, dirname, fnmatch, opendir, readdir,
     DIR, FNM_NOESCAPE, FNM_NOMATCH, FNM_PATHNAME, FNM_PERIOD,
@@ -127,8 +134,8 @@ pub use startup::__libc_start_main;
 // haven't migrated yet.
 pub use stdio::{
     clearerr, fclose, feof, ferror, fflush, fgetc, fgets, fopen, fputc, fputs, fread,
-    fseek, ftell, fwrite, getc, getchar, perror, putc, putchar, puts, rewind, stderr,
-    stdin, stdout, File,
+    fseek, ftell, fwrite, getc, getchar, perror, putc, putchar, puts, rewind, setbuf,
+    setvbuf, stderr, stdin, stdout, ungetc, File, _IOFBF, _IOLBF, _IONBF,
 };
 pub use string::{
     memchr, memcmp, memcpy, memmove, memset, strcat, strchr, strcmp, strcpy, strcspn,

@@ -1455,6 +1455,109 @@ pub extern "C" fn main(
         &[],
     );
 
+    // ── Tier 3p probes: locale + iconv + wide + setvbuf + ungetc ─
+
+    // setlocale always returns "C". We compare bytes 'C' + NUL.
+    let locale_ok = unsafe {
+        let p = narf_libc::setlocale(
+            narf_libc::LC_ALL,
+            b"\0".as_ptr() as *const i8,
+        );
+        !p.is_null() && *p == b'C' as i8 && *p.add(1) == 0
+    };
+    narf_libc::printf_str(
+        if locale_ok { "locale: ok\n" } else { "locale: bad\n" },
+        &[],
+    );
+
+    // nl_langinfo CODESET → "UTF-8".
+    let codeset_ok = unsafe {
+        let p = narf_libc::nl_langinfo(narf_libc::CODESET);
+        let want: &[u8] = b"UTF-8\0";
+        let mut ok = !p.is_null();
+        for (i, &b) in want.iter().enumerate() {
+            if *p.add(i) != b as i8 { ok = false; break; }
+        }
+        ok
+    };
+    narf_libc::printf_str(
+        if codeset_ok { "langinfo: ok\n" } else { "langinfo: bad\n" },
+        &[],
+    );
+
+    // iconv_open returns the !0 sentinel; iconv_close still succeeds.
+    let iconv_ok = unsafe {
+        let cd = narf_libc::iconv_open(
+            b"UTF-8\0".as_ptr() as *const i8,
+            b"UTF-8\0".as_ptr() as *const i8,
+        );
+        let close_rc = narf_libc::iconv_close(cd);
+        cd as usize == !0usize && close_rc == 0
+    };
+    narf_libc::printf_str(
+        if iconv_ok { "iconv: ok\n" } else { "iconv: bad\n" },
+        &[],
+    );
+
+    // wide-char minimal probes.
+    let wcs_in: [u32; 4] = [b'h' as u32, b'i' as u32, 0, 0xDEAD_BEEF];
+    let wcs_in2: [u32; 3] = [b'h' as u32, b'i' as u32, 0];
+    let wcs_diff: [u32; 4] = [b'h' as u32, b'j' as u32, 0, 0];
+    let wide_ok = unsafe {
+        narf_libc::wcslen(wcs_in.as_ptr()) == 2
+            && narf_libc::wcscmp(wcs_in.as_ptr(), wcs_in2.as_ptr()) == 0
+            && narf_libc::wcscmp(wcs_in.as_ptr(), wcs_diff.as_ptr()) < 0
+    };
+    narf_libc::printf_str(
+        if wide_ok { "wide: ok\n" } else { "wide: bad\n" },
+        &[],
+    );
+
+    // setvbuf stub — always returns 0; setvbuf(_IONBF) flushes.
+    let setvbuf_ok = unsafe {
+        narf_libc::setvbuf(
+            narf_libc::stdout(),
+            core::ptr::null_mut(),
+            narf_libc::_IOFBF,
+            4096,
+        ) == 0
+    };
+    narf_libc::printf_str(
+        if setvbuf_ok { "setvbuf: ok\n" } else { "setvbuf: bad\n" },
+        &[],
+    );
+
+    // ungetc: write a payload to a fresh file, fseek+fgetc one byte,
+    // ungetc it, then fgetc again — must return the same byte.
+    let unget_path: *const i8 = b"/tmp/unget\0".as_ptr() as *const i8;
+    let _ = unsafe {
+        let fd = narf_libc::posix_open(unget_path, narf_libc::O_CREAT, 0);
+        let _ = narf_libc::posix_write(
+            fd,
+            b"AB" as *const u8 as *const core::ffi::c_void,
+            2,
+        );
+        narf_libc::posix_close(fd);
+    };
+    let path_bytes: &[u8] = b"/tmp/unget";
+    let ungetc_ok = unsafe {
+        let stream = narf_libc::fopen(path_bytes.as_ptr(), path_bytes.len(), "r");
+        let mut ok = !stream.is_null();
+        if ok {
+            let r1 = narf_libc::fgetc(stream);
+            let push = narf_libc::ungetc(r1, stream);
+            let r2 = narf_libc::fgetc(stream);
+            ok = r1 == (b'A' as i32) && push == r1 && r2 == r1;
+            let _ = narf_libc::fclose(stream);
+        }
+        let _ = narf_libc::posix_unlink(unget_path);
+        ok
+    };
+    narf_libc::printf_str(
+        if ungetc_ok { "ungetc: ok\n" } else { "ungetc: bad\n" },
+        &[],
+    );
+
     // atexit registration — `cleanup` runs after `main` returns,
     // BEFORE the kernel-side exit_task. The ordering proves the
     // dispatch loop in `narf_libc::exit` walks the table.

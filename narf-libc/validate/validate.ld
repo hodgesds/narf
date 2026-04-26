@@ -41,8 +41,6 @@ SECTIONS {
         *(.ltext .ltext.*)
         *(.rodata .rodata.*)
         *(.lrodata .lrodata.*)
-        *(.data .data.*)
-        *(.bss .bss.*)
     } :image
 
     . = ALIGN(4096);
@@ -62,6 +60,19 @@ SECTIONS {
         BYTE(0x00); BYTE(0x00); BYTE(0x00); BYTE(0x00);
         BYTE(0x00); BYTE(0x00); BYTE(0x00); BYTE(0x00);
     } :tdata :tls
+
+    /* Writable data goes into the same `:tdata` R+W segment so it
+     * lands on a different page from the R+X .text output (the
+     * loader rejects same-page R+X / R+W overlap with
+     * AddressSpaceError::Overlap). Capture both the small-code-
+     * model `.data`/`.bss` and the large-code-model `.ldata`/
+     * `.lbss` variants — Rust's static-mut accesses can land in
+     * either depending on relocation reachability. The `.tdata`
+     * BYTE() literal above sets the segment's page-aligned start;
+     * these glob entries grow the segment in place.
+     */
+    .data : { *(.data .data.*) *(.ldata .ldata.*) } :tdata
+    .bss  : { *(.bss  .bss.*)  *(.lbss  .lbss.*)  } :tdata
 
     /DISCARD/ : {
         *(.eh_frame)

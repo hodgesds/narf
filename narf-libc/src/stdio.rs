@@ -634,6 +634,107 @@ pub unsafe fn fflush(f: *mut File) -> i32 {
     0
 }
 
+// ── setbuf / setvbuf / ungetc ───────────────────────────────────────
+//
+// Buffer-control surface. NARF's FILE* layer keeps its own 4-KiB
+// read/write buffers; setbuf and setvbuf are accepted but the
+// supplied buffer pointer/size is ignored — switching to a caller-
+// supplied buffer would mean tracking who owns the allocation, and
+// no current consumer needs that level of control. The mode is
+// honoured to the extent that `_IONBF` (unbuffered) drains the
+// existing buffer immediately; `_IOLBF` and `_IOFBF` map to the
+// existing line- vs full-buffered policy.
+//
+// ungetc pushes one byte back onto the read buffer so the next
+// fgetc returns it. We use a single-slot hold rather than a stack
+// (POSIX guarantees only one ungetc between reads).
+
+pub const _IOFBF: i32 = 0;
+pub const _IOLBF: i32 = 1;
+pub const _IONBF: i32 = 2;
+
+/// `setbuf(stream, buf)` — POSIX shim for `setvbuf(stream, buf,
+/// _IOFBF, BUFSIZ)`. We accept and ignore both the buffer and the
+/// implied size.
+///
+/// # Safety
+/// `stream` must be a valid `*mut File`.
+pub unsafe fn setbuf(stream: *mut File, _buf: *mut u8) {
+    if stream.is_null() { return; }
+    // SAFETY: forwarded under the same caller contract.
+    unsafe {
+        let _ = setvbuf(stream, core::ptr::null_mut(), _IOFBF, 4096);
+    }
+}
+
+/// `setvbuf(stream, buf, mode, size)` — buffer-mode hint. We only
+/// honour `_IONBF` to the extent of flushing the write side
+/// immediately; the supplied buffer is ignored.
+///
+/// # Safety
+/// `stream` must be a valid `*mut File`.
+pub unsafe fn setvbuf(stream: *mut File, _buf: *mut u8, mode: i32, _size: usize) -> i32 {
+    if stream.is_null() { return -1; }
+    if mode == _IONBF {
+        // SAFETY: stream pointer asserted by caller.
+        return unsafe { fflush(stream) };
+    }
+    0
+}
+
+/// `ungetc(c, stream)`: push one byte back onto the read buffer of
+/// `stream` so the next [`fgetc`] returns it. Returns the pushed
+/// byte on success, [`EOF`] on failure.
+///
+/// Implementation note: we lean on the existing read buffer — if
+/// `rbuf_pos > 0` we step it back by one and overwrite the slot;
+/// if no read buffer is present yet (or the buffer is exhausted
+/// at offset 0) we lazily allocate one and place the byte at the
+/// start. Subsequent reads see it before refill.
+///
+/// # Safety
+/// `stream` must be a valid `*mut File`.
+pub unsafe fn ungetc(c: i32, stream: *mut File) -> i32 {
+    if stream.is_null() || c == EOF { return EOF; }
+    let byte = c as u8;
+    // SAFETY: caller asserts the pointer.
+    let file = unsafe { &mut *stream };
+    if file.rbuf_pos > 0 {
+        if let Some(p) = file.rbuf {
+            file.rbuf_pos -= 1;
+            // SAFETY: rbuf is a BUF_CAP-byte alloc; rbuf_pos was just
+            // bounded by BUF_CAP via the prior subtraction.
+            unsafe { *p.add(file.rbuf_pos) = byte; }
+            file.eof = false;
+            return c & 0xFF;
+        }
+    }
+    // No room before rbuf_pos — allocate (if needed) and place at 0.
+    use crate::heap::malloc as ext_malloc;
+    if file.rbuf.is_none() {
+        // SAFETY: malloc is `unsafe extern "C"` with size > 0.
+        let p = unsafe { ext_malloc(BUF_CAP) };
+        if p.is_null() { return EOF; }
+        file.rbuf = Some(p);
+        file.rbuf_pos = 0;
+        file.rbuf_end = 0;
+    }
+    let p = file.rbuf.unwrap();
+    // Make room: shift the existing valid region right by one slot.
+    let len = file.rbuf_end - file.rbuf_pos;
+    if len + 1 > BUF_CAP {
+        return EOF;
+    }
+    // SAFETY: bounded shift within the BUF_CAP alloc.
+    unsafe {
+        core::ptr::copy(p.add(file.rbuf_pos), p.add(file.rbuf_pos + 1), len);
+        *p.add(file.rbuf_pos) = byte;
+    }
+    file.rbuf_end += 1;
+    file.eof = false;
+    c & 0xFF
+}
+
 // ── perror ──────────────────────────────────────────────────────────
 
 /// `perror(s)`: emit `"<s>: <strerror(errno)>\n"` to stderr. If `s`
