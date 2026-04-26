@@ -46,6 +46,7 @@ pub mod math;
 pub mod net;
 pub mod numeric;
 pub mod path;
+pub mod poll;
 pub mod posix;
 pub mod pthread;
 pub mod regex;
@@ -116,6 +117,13 @@ pub use locale::{
     wcslen, wctomb, AM_STR, CODESET, CRNCYSTR, D_FMT, D_T_FMT, EILSEQ, LC_ALL,
     LC_COLLATE, LC_CTYPE, LC_MESSAGES, LC_MONETARY, LC_NUMERIC, LC_TIME, PM_STR,
     RADIXCHAR, T_FMT, T_FMT_AMPM, THOUSEP,
+};
+pub use poll::{
+    epoll_create, epoll_create1, epoll_ctl, epoll_event, epoll_wait, eventfd, fd_set,
+    itimerspec, pollfd, poll, select, signalfd, timerfd_create, timerfd_gettime,
+    timerfd_settime, timeval_select, EPOLLERR, EPOLLHUP, EPOLLIN, EPOLLOUT,
+    EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD, FD_CLR, FD_ISSET, FD_SET, FD_SETSIZE,
+    FD_ZERO, POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT, POLLPRI, POLLRDHUP,
 };
 pub use path::{
     basename, closedir, dirent, dirname, fnmatch, opendir, readdir,

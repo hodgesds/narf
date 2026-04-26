@@ -2145,6 +2145,55 @@ pub extern "C" fn main(
         &[],
     );
 
+    // ── Tier 3y probes: poll/select/epoll stubs + fd_set macros ──
+
+    // poll() refuses; FD_SET / FD_ISSET / FD_CLR / FD_ZERO work.
+    let poll_ok = unsafe {
+        narf_libc::set_errno(0);
+        let mut fds = narf_libc::pollfd {
+            fd: 0,
+            events: narf_libc::POLLIN,
+            revents: 0,
+        };
+        let r = narf_libc::poll(&mut fds, 1, 0);
+        let e = narf_libc::errno();
+        r == -1 && e == 38
+    };
+    narf_libc::printf_str(
+        if poll_ok { "poll: ok\n" } else { "poll: bad\n" },
+        &[],
+    );
+
+    let fdset_ok = unsafe {
+        let mut s = narf_libc::fd_set::default();
+        narf_libc::FD_ZERO(&mut s);
+        narf_libc::FD_SET(0, &mut s);
+        narf_libc::FD_SET(7, &mut s);
+        let i0 = narf_libc::FD_ISSET(0, &s);
+        let i7 = narf_libc::FD_ISSET(7, &s);
+        let i9 = narf_libc::FD_ISSET(9, &s);
+        narf_libc::FD_CLR(0, &mut s);
+        let i0_after = narf_libc::FD_ISSET(0, &s);
+        i0 == 1 && i7 == 1 && i9 == 0 && i0_after == 0
+    };
+    narf_libc::printf_str(
+        if fdset_ok { "fd_set: ok\n" } else { "fd_set: bad\n" },
+        &[],
+    );
+
+    // epoll_create / eventfd / timerfd_create — all ENOSYS.
+    let epoll_ok = unsafe {
+        let e1 = narf_libc::epoll_create(1);
+        let e2 = narf_libc::epoll_create1(0);
+        let evfd = narf_libc::eventfd(0, 0);
+        let tfd = narf_libc::timerfd_create(0, 0);
+        e1 == -1 && e2 == -1 && evfd == -1 && tfd == -1
+    };
+    narf_libc::printf_str(
+        if epoll_ok { "epoll: ok\n" } else { "epoll: bad\n" },
+        &[],
+    );
+
     // atexit registration — `cleanup` runs after `main` returns,
     // BEFORE the kernel-side exit_task. The ordering proves the
     // dispatch loop in `narf_libc::exit` walks the table.
