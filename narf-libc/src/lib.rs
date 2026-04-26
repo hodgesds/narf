@@ -65,8 +65,14 @@ pub use fd::{
     dup, dup2, fcntl, fstat, isatty, pipe, stat, FD_CLOEXEC, F_GETFD, F_GETFL, F_SETFD,
     F_SETFL, StatBuf,
 };
-pub use fs::{chdir, getcwd};
-pub use getopt::{getopt, optarg, opterr, optind, optopt};
+pub use fs::{
+    chdir, chmod, getcwd, umask, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK,
+    S_IFMT, S_IFREG, S_IFSOCK, S_ISCHR, S_ISDIR, S_ISFIFO, S_ISLNK, S_ISREG,
+};
+pub use getopt::{
+    getopt, getopt_long, optarg, opterr, optind, optopt, option,
+    NO_ARGUMENT, OPTIONAL_ARGUMENT, REQUIRED_ARGUMENT,
+};
 pub use heap::{calloc, free, malloc, realloc};
 // `io::fputs(&str, fd)` deliberately omitted — the `stdio::fputs`
 // FILE*-shaped one (re-exported below) is the canonical public

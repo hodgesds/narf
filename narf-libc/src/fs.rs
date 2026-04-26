@@ -75,3 +75,82 @@ pub unsafe extern "C" fn getcwd(buf: *mut u8, size: usize) -> *mut u8 {
     }
     buf
 }
+
+// ── <sys/stat.h> mode constants + macros ────────────────────────────
+//
+// Numeric values match Linux's `<sys/stat.h>` so a libc consumer
+// can `#include <sys/stat.h>` and get the same bits.
+
+pub const S_IFMT:   u32 = 0o170000;
+pub const S_IFREG:  u32 = 0o100000;
+pub const S_IFDIR:  u32 = 0o040000;
+pub const S_IFCHR:  u32 = 0o020000;
+pub const S_IFIFO:  u32 = 0o010000;
+pub const S_IFLNK:  u32 = 0o120000;
+pub const S_IFSOCK: u32 = 0o140000;
+pub const S_IFBLK:  u32 = 0o060000;
+
+/// `S_ISREG(mode)` — non-zero if mode names a regular file.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn S_ISREG(mode: u32) -> i32 {
+    ((mode & S_IFMT) == S_IFREG) as i32
+}
+
+/// `S_ISDIR(mode)` — non-zero if mode names a directory.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn S_ISDIR(mode: u32) -> i32 {
+    ((mode & S_IFMT) == S_IFDIR) as i32
+}
+
+/// `S_ISCHR(mode)` — non-zero if mode names a character special file.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn S_ISCHR(mode: u32) -> i32 {
+    ((mode & S_IFMT) == S_IFCHR) as i32
+}
+
+/// `S_ISFIFO(mode)` — non-zero if mode names a FIFO.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn S_ISFIFO(mode: u32) -> i32 {
+    ((mode & S_IFMT) == S_IFIFO) as i32
+}
+
+/// `S_ISLNK(mode)` — non-zero if mode names a symlink.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn S_ISLNK(mode: u32) -> i32 {
+    ((mode & S_IFMT) == S_IFLNK) as i32
+}
+
+// ── chmod / umask (stubs) ───────────────────────────────────────────
+//
+// NARF's kernel surface exposes no per-file permission bits — every
+// file is universally read/write. The C-shaped chmod / umask are
+// retained for ABI compatibility (real programs `chmod()` their
+// state files, even when the underlying FS ignores mode), so we
+// accept any input and report success / a stable previous mask.
+
+static mut UMASK_CACHE: u32 = 0o022;
+
+/// `chmod(path, mode)` — accepted and ignored. Returns 0 if the path
+/// is reachable (so a consumer that error-checks chmod still sees
+/// a failure for a missing file), -1 otherwise.
+///
+/// # Safety
+/// `path` must be a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn chmod(path: *const i8, _mode: u32) -> i32 {
+    // SAFETY: forwarded; `access` walks the C string.
+    unsafe { crate::posix::access(path, 0) }
+}
+
+/// `umask(mask)` — record `mask` and return the previous value.
+/// The mask isn't actually consulted anywhere on NARF today; this
+/// just preserves the round-trip POSIX semantics.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn umask(mask: u32) -> u32 {
+    // SAFETY: single-threaded user-mode invariant.
+    unsafe {
+        let prev = UMASK_CACHE;
+        UMASK_CACHE = mask & 0o777;
+        prev
+    }
+}

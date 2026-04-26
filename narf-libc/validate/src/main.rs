@@ -1240,6 +1240,116 @@ pub extern "C" fn main(
         &[],
     );
 
+    // ── Tier 3n probes: getopt_long + S_IS* + chmod/umask ────────
+    //
+    // getopt_long over `prog --verbose --count=7 -x rest`. Long
+    // options:
+    //   verbose (no_argument, val 'v')
+    //   count   (required_argument, val 'c')
+    // Short options:
+    //   x (no_argument)
+    let larg0 = b"prog\0".as_ptr()         as *mut i8;
+    let larg1 = b"--verbose\0".as_ptr()    as *mut i8;
+    let larg2 = b"--count=7\0".as_ptr()    as *mut i8;
+    let larg3 = b"-x\0".as_ptr()           as *mut i8;
+    let larg4 = b"rest\0".as_ptr()         as *mut i8;
+    let lopts: [*mut i8; 5] = [larg0, larg1, larg2, larg3, larg4];
+    let lopt_short = b"xc:\0".as_ptr() as *const i8;
+    let lopt_table: [narf_libc::option; 3] = [
+        narf_libc::option {
+            name:    b"verbose\0".as_ptr() as *const i8,
+            has_arg: narf_libc::NO_ARGUMENT,
+            flag:    core::ptr::null_mut(),
+            val:     b'v' as i32,
+        },
+        narf_libc::option {
+            name:    b"count\0".as_ptr() as *const i8,
+            has_arg: narf_libc::REQUIRED_ARGUMENT,
+            flag:    core::ptr::null_mut(),
+            val:     b'c' as i32,
+        },
+        narf_libc::option {
+            name:    core::ptr::null(),
+            has_arg: 0,
+            flag:    core::ptr::null_mut(),
+            val:     0,
+        },
+    ];
+    let mut longidx: i32 = -1;
+    let getopt_long_ok = unsafe {
+        narf_libc::optind = 1;
+        narf_libc::opterr = 0;
+        let r1 = narf_libc::getopt_long(
+            5, lopts.as_ptr(), lopt_short,
+            lopt_table.as_ptr(), &mut longidx,
+        );
+        let li1 = longidx;
+        let r2 = narf_libc::getopt_long(
+            5, lopts.as_ptr(), lopt_short,
+            lopt_table.as_ptr(), &mut longidx,
+        );
+        let opt_after_count = narf_libc::optarg;
+        let li2 = longidx;
+        let r3 = narf_libc::getopt_long(
+            5, lopts.as_ptr(), lopt_short,
+            lopt_table.as_ptr(), &mut longidx,
+        );
+        let r4 = narf_libc::getopt_long(
+            5, lopts.as_ptr(), lopt_short,
+            lopt_table.as_ptr(), &mut longidx,
+        );
+        let count_ok = !opt_after_count.is_null() && *opt_after_count == b'7' as i8;
+        r1 == b'v' as i32 && li1 == 0
+            && r2 == b'c' as i32 && li2 == 1 && count_ok
+            && r3 == b'x' as i32
+            && r4 == -1
+            && narf_libc::optind == 4
+    };
+    narf_libc::printf_str(
+        if getopt_long_ok { "getopt_long: ok\n" } else { "getopt_long: bad\n" },
+        &[],
+    );
+
+    // S_IS* macros against synthetic mode bits.
+    let smode_ok = unsafe {
+        narf_libc::S_ISREG(narf_libc::S_IFREG | 0o644) == 1
+            && narf_libc::S_ISDIR(narf_libc::S_IFDIR | 0o755) == 1
+            && narf_libc::S_ISREG(narf_libc::S_IFDIR) == 0
+            && narf_libc::S_ISCHR(narf_libc::S_IFCHR) == 1
+            && narf_libc::S_ISFIFO(narf_libc::S_IFIFO) == 1
+            && narf_libc::S_ISLNK(narf_libc::S_IFLNK) == 1
+    };
+    narf_libc::printf_str(
+        if smode_ok { "smode: ok\n" } else { "smode: bad\n" },
+        &[],
+    );
+
+    // chmod / umask — chmod returns 0 for an existing path; umask
+    // returns the previous value and stores the new one.
+    let cm_path: *const i8 = b"/tmp/cm-probe\0".as_ptr() as *const i8;
+    let chmod_ok = unsafe {
+        let fd = narf_libc::posix_open(cm_path, narf_libc::O_CREAT, 0);
+        let _ = narf_libc::posix_close(fd);
+        let cm = narf_libc::chmod(cm_path, 0o644);
+        let _ = narf_libc::posix_unlink(cm_path);
+        let cm_miss = narf_libc::chmod(b"/no/such\0".as_ptr() as *const i8, 0o644);
+        cm == 0 && cm_miss == -1
+    };
+    narf_libc::printf_str(
+        if chmod_ok { "chmod: ok\n" } else { "chmod: bad\n" },
+        &[],
+    );
+
+    let umask_ok = unsafe {
+        let prev = narf_libc::umask(0o077);
+        let now  = narf_libc::umask(0o022);
+        prev == 0o022 && now == 0o077
+    };
+    narf_libc::printf_str(
+        if umask_ok { "umask: ok\n" } else { "umask: bad\n" },
+        &[],
+    );
+
     // atexit registration — `cleanup` runs after `main` returns,
     // BEFORE the kernel-side exit_task. The ordering proves the
     // dispatch loop in `narf_libc::exit` walks the table.
