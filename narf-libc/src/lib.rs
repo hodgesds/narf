@@ -57,6 +57,7 @@ pub mod term;
 pub mod process;
 pub mod setjmp;
 pub mod signal;
+pub mod socket_extra;
 pub mod startup;
 pub mod stdio;
 pub mod stdlib;
@@ -187,6 +188,11 @@ pub use signal::{
     kill, raise, signal, sighandler_t,
     SIG_DFL_RAW, SIG_IGN_RAW, SIGABRT, SIGALRM, SIGCHLD, SIGFPE, SIGHUP, SIGILL,
     SIGINT, SIGKILL, SIGPIPE, SIGQUIT, SIGSEGV, SIGTERM,
+};
+pub use socket_extra::{
+    cmsghdr, getpeername, getsockname, msghdr, recvmsg, sendmsg, sockaddr_un, sockatmark,
+    socketpair, MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_DONTROUTE, MSG_DONTWAIT, MSG_EOR,
+    MSG_NOSIGNAL, MSG_OOB, MSG_PEEK, MSG_TRUNC, MSG_WAITALL, SCM_CREDENTIALS, SCM_RIGHTS,
 };
 pub use stdlib::{
     abs, atoi, atol, bsearch, div, div_t, labs, ldiv, ldiv_t, qsort, rand, srand,

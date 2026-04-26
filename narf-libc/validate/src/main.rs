@@ -2413,6 +2413,46 @@ pub extern "C" fn main(
         narf_libc::printf_str("writev: bad\n", &[]);
     }
 
+    // ── Tier 3ac probes: sys/un + msghdr + sendmsg/recvmsg stubs ─
+
+    // sockaddr_un.sun_path is 108 bytes; sockaddr_un is the right size.
+    let unix_ok = unsafe {
+        let mut a = narf_libc::sockaddr_un::default();
+        a.sun_family = narf_libc::AF_UNIX as u16;
+        // Write a path; verify it round-trips.
+        let want = b"/tmp/narf.sock";
+        for (i, &b) in want.iter().enumerate() {
+            a.sun_path[i] = b as i8;
+        }
+        let mut ok = a.sun_family == narf_libc::AF_UNIX as u16
+            && core::mem::size_of::<narf_libc::sockaddr_un>() == 110;
+        for (i, &b) in want.iter().enumerate() {
+            if a.sun_path[i] as u8 != b { ok = false; break; }
+        }
+        ok
+    };
+    narf_libc::printf_str(
+        if unix_ok { "sockaddr_un: ok\n" } else { "sockaddr_un: bad\n" },
+        &[],
+    );
+
+    // sendmsg/recvmsg/socketpair/sockatmark/getsockname/getpeername
+    // all refuse with -1 + ENOSYS.
+    let msg_ok = unsafe {
+        let r1 = narf_libc::sendmsg(0, core::ptr::null(), 0);
+        let r2 = narf_libc::recvmsg(0, core::ptr::null_mut(), 0);
+        let mut sv: [i32; 2] = [0, 0];
+        let r3 = narf_libc::socketpair(1, 1, 0, sv.as_mut_ptr());
+        let r4 = narf_libc::sockatmark(0);
+        let r5 = narf_libc::getsockname(0, core::ptr::null_mut(), core::ptr::null_mut());
+        let r6 = narf_libc::getpeername(0, core::ptr::null_mut(), core::ptr::null_mut());
+        r1 == -1 && r2 == -1 && r3 == -1 && r4 == -1 && r5 == -1 && r6 == -1
+    };
+    narf_libc::printf_str(
+        if msg_ok { "msghdr: ok\n" } else { "msghdr: bad\n" },
+        &[],
+    );
+
     // atexit registration — `cleanup` runs after `main` returns,
     // BEFORE the kernel-side exit_task. The ordering proves the
     // dispatch loop in `narf_libc::exit` walks the table.
