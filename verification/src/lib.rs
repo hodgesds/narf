@@ -12198,3 +12198,80 @@ fn smoke_userspace_pread_pwrite_dont_move_cursor() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_userspace_pread_pwrite_dont_move_cursor);
+
+fn smoke_filesystem_devfs_null_zero() -> TestResult {
+    use core::pin::Pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use narf_filesystem::{
+        bootstrap_mount_authority, registry, DevFs,
+    };
+
+    fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
+        fn raw_waker() -> RawWaker {
+            unsafe fn no_clone(_: *const ()) -> RawWaker { raw_waker() }
+            unsafe fn no_op(_: *const ()) {}
+            const VTAB: RawWakerVTable = RawWakerVTable::new(
+                no_clone, no_op, no_op, no_op,
+            );
+            RawWaker::new(core::ptr::null(), &VTAB)
+        }
+        let waker = unsafe { Waker::from_raw(raw_waker()) };
+        let mut cx = Context::from_waker(&waker);
+        let pinned = unsafe { Pin::new_unchecked(&mut fut) };
+        match pinned.poll(&mut cx) {
+            Poll::Ready(v) => Some(v),
+            Poll::Pending  => None,
+        }
+    }
+
+    let auth = bootstrap_mount_authority();
+    let _ = registry().mount(&auth, "/dev", DevFs::new());
+
+    // /dev/null: read returns 0; write returns the requested length.
+    let null_ops = registry().resolve_absolute("/dev/null", |fs, rel| {
+        narf_filesystem::resolve(fs.root(), rel).ok()
+    }).flatten();
+    let null_ops = match null_ops {
+        Some(o) => o,
+        None    => return TestResult::Fail("resolve /dev/null failed"),
+    };
+    let mut buf = [0xAAu8; 8];
+    let r = poll_once(null_ops.read(0, &mut buf));
+    if !matches!(r, Some(Ok(0))) {
+        return TestResult::Fail("/dev/null read != 0");
+    }
+    // Write succeeds and returns the byte count.
+    let w = poll_once(null_ops.write(0, b"discarded payload"));
+    if !matches!(w, Some(Ok(n)) if n == 17) {
+        return TestResult::Fail("/dev/null write did not consume all bytes");
+    }
+
+    // /dev/zero: read fills with zeros + returns the requested length.
+    let zero_ops = registry().resolve_absolute("/dev/zero", |fs, rel| {
+        narf_filesystem::resolve(fs.root(), rel).ok()
+    }).flatten();
+    let zero_ops = match zero_ops {
+        Some(o) => o,
+        None    => return TestResult::Fail("resolve /dev/zero failed"),
+    };
+    let mut zbuf = [0xFFu8; 16];
+    let r = poll_once(zero_ops.read(0, &mut zbuf));
+    if !matches!(r, Some(Ok(n)) if n == 16) {
+        return TestResult::Fail("/dev/zero read != 16");
+    }
+    if zbuf.iter().any(|&b| b != 0) {
+        return TestResult::Fail("/dev/zero did not zero-fill");
+    }
+
+    // stat reports Special.
+    use narf_filesystem::FileType;
+    if null_ops.stat().mode.file_type != FileType::Special {
+        return TestResult::Fail("/dev/null stat is not Special");
+    }
+    if zero_ops.stat().mode.file_type != FileType::Special {
+        return TestResult::Fail("/dev/zero stat is not Special");
+    }
+
+    TestResult::Pass
+}
+kernel_test!(smoke_filesystem_devfs_null_zero);
