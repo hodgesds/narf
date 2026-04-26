@@ -52,6 +52,7 @@ pub mod posix;
 pub mod pthread;
 pub mod random;
 pub mod regex;
+pub mod search;
 pub mod sys;
 pub mod sysvipc;
 pub mod term;
@@ -195,6 +196,10 @@ pub use signal::{
     kill, raise, signal, sighandler_t,
     SIG_DFL_RAW, SIG_IGN_RAW, SIGABRT, SIGALRM, SIGCHLD, SIGFPE, SIGHUP, SIGILL,
     SIGINT, SIGKILL, SIGPIPE, SIGQUIT, SIGSEGV, SIGTERM,
+};
+pub use search::{
+    crypt, crypt_data, crypt_r, endutent, getutent, pututline, setutent, tdelete, tfind,
+    tsearch, twalk, utmp, utmpname, ENDORDER, LEAF, POSTORDER, PREORDER,
 };
 pub use socket_extra::{
     cmsghdr, getpeername, getsockname, msghdr, recvmsg, sendmsg, sockaddr_un, sockatmark,

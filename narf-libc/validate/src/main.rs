@@ -2502,6 +2502,122 @@ pub extern "C" fn main(
         &[],
     );
 
+    // ── Tier 3ae probes: search.h (tsearch) + utmp + crypt ───────
+
+    // tsearch inserts; tfind locates; tdelete removes; twalk visits.
+    let tree_ok = unsafe {
+        unsafe extern "C" fn cmp_int(
+            a: *const core::ffi::c_void,
+            b: *const core::ffi::c_void,
+        ) -> i32 {
+            // SAFETY: probe-supplied pointers; we know they were
+            // i32-typed when fed into tsearch.
+            let (ai, bi) = unsafe {
+                (*(a as *const i32), *(b as *const i32))
+            };
+            if ai < bi { -1 } else if ai > bi { 1 } else { 0 }
+        }
+
+        static mut WALK_COUNT: i32 = 0;
+        unsafe extern "C" fn walker(
+            _node: *const core::ffi::c_void,
+            which: i32,
+            _depth: i32,
+        ) {
+            // SAFETY: single-threaded user mode; the static is the
+            // probe-side counter we read after twalk returns.
+            unsafe {
+                if which == narf_libc::LEAF || which == narf_libc::POSTORDER {
+                    WALK_COUNT += 1;
+                }
+            }
+        }
+
+        // Static-lifetime keys so the tree node pointers remain valid.
+        static KEYS: [i32; 5] = [3, 1, 4, 1, 5];
+        let mut root: *mut core::ffi::c_void = core::ptr::null_mut();
+        for k in &KEYS {
+            let _ = narf_libc::tsearch(
+                k as *const i32 as *const core::ffi::c_void,
+                &mut root,
+                cmp_int,
+            );
+        }
+
+        // tfind for an existing key returns non-null.
+        let key3 = 3i32;
+        let f3 = narf_libc::tfind(
+            &key3 as *const i32 as *const core::ffi::c_void,
+            &root,
+            cmp_int,
+        );
+        // tfind for an absent key returns null.
+        let key99 = 99i32;
+        let f99 = narf_libc::tfind(
+            &key99 as *const i32 as *const core::ffi::c_void,
+            &root,
+            cmp_int,
+        );
+        // twalk visits each unique key exactly once at LEAF or
+        // POSTORDER. Tree has 4 unique keys (1, 3, 4, 5).
+        WALK_COUNT = 0;
+        narf_libc::twalk(root, walker);
+        let walk_n = WALK_COUNT;
+
+        // tdelete an existing key returns non-null.
+        let key1 = 1i32;
+        let d1 = narf_libc::tdelete(
+            &key1 as *const i32 as *const core::ffi::c_void,
+            &mut root,
+            cmp_int,
+        );
+
+        !f3.is_null()
+            && f99.is_null()
+            && walk_n == 4
+            // tdelete may return NULL if the deleted node is the root;
+            // in our tree the root was 3, so deleting 1 returns its
+            // parent (non-null).
+            && !d1.is_null()
+    };
+    narf_libc::printf_str(
+        if tree_ok { "tsearch: ok\n" } else { "tsearch: bad\n" },
+        &[],
+    );
+
+    // utmp iterator is empty; pututline echoes input; utmpname is 0.
+    let utmp_ok = unsafe {
+        narf_libc::setutent();
+        let e1 = narf_libc::getutent();
+        let dummy = core::ptr::null::<narf_libc::utmp>();
+        let p = narf_libc::pututline(dummy);
+        let n = narf_libc::utmpname(b"/var/log/wtmp\0".as_ptr() as *const i8);
+        narf_libc::endutent();
+        e1.is_null() && p.is_null() && n == 0
+    };
+    narf_libc::printf_str(
+        if utmp_ok { "utmp: ok\n" } else { "utmp: bad\n" },
+        &[],
+    );
+
+    // crypt / crypt_r both NULL with errno = ENOSYS.
+    let crypt_ok = unsafe {
+        let r1 = narf_libc::crypt(
+            b"hunter2\0".as_ptr() as *const i8,
+            b"$6$xx\0".as_ptr() as *const i8,
+        );
+        let r2 = narf_libc::crypt_r(
+            b"hunter2\0".as_ptr() as *const i8,
+            b"$6$xx\0".as_ptr() as *const i8,
+            core::ptr::null_mut(),
+        );
+        r1.is_null() && r2.is_null() && narf_libc::errno() == 38
+    };
+    narf_libc::printf_str(
+        if crypt_ok { "crypt: ok\n" } else { "crypt: bad\n" },
+        &[],
+    );
+
     // atexit registration — `cleanup` runs after `main` returns,
     // BEFORE the kernel-side exit_task. The ordering proves the
     // dispatch loop in `narf_libc::exit` walks the table.
