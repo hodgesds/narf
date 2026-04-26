@@ -155,3 +155,16 @@ pub unsafe fn fstat(fd: i32, out: *mut StatBuf) -> i32 {
         -1
     }
 }
+
+/// `isatty(fd)` — POSIX-shaped TTY check. Stage-4: stdin / stdout
+/// / stderr (fds 0/1/2) are wired to the kernel console, so they
+/// return 1; every other fd returns 0. Real device-aware probing
+/// lands when the kernel models a tty driver distinct from the
+/// console writer.
+///
+/// # Safety
+/// Pure read of the fd argument; `extern "C"` shape for C-link.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn isatty(fd: i32) -> i32 {
+    matches!(fd, 0 | 1 | 2) as i32
+}

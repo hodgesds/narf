@@ -135,3 +135,35 @@ pub unsafe fn init_environ(envp: *const *const u8) {
         ENVIRON = envp;
     }
 }
+
+/// `putenv(*const c_char)` — POSIX env modifier shaped as a single
+/// `NAME=VALUE` C string. We forward to [`setenv`] after splitting
+/// on `=`. Today `setenv` is a stub returning -1, so `putenv`
+/// inherits that behaviour and surfaces `errno = ENOSYS`.
+///
+/// # Safety
+/// `s` must be a valid NUL-terminated C string of the form
+/// `NAME=VALUE`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn putenv(s: *const u8) -> i32 {
+    if s.is_null() {
+        set_errno(ENOSYS);
+        return -1;
+    }
+    // SAFETY: caller contract; walk bounded by `=` or NUL.
+    let len = unsafe { strlen(s) };
+    let mut eq = 0usize;
+    // SAFETY: `len` is the strlen, so reads are in-bounds.
+    while eq < len && unsafe { *s.add(eq) } != b'=' {
+        eq += 1;
+    }
+    if eq == len {
+        // No `=` — POSIX returns -1.
+        set_errno(ENOSYS);
+        return -1;
+    }
+    // SAFETY: `eq < len`, so name + value slices are in-bounds.
+    unsafe {
+        setenv(s, eq, s.add(eq + 1), len - eq - 1, 1)
+    }
+}

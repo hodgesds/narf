@@ -353,6 +353,98 @@ pub extern "C" fn main(
         &[],
     );
 
+    // ── Tier 3a probes: stdlib + isatty + signal ─────────────────
+    //
+    // atoi / strtol / qsort / bsearch round-trips. Each has one
+    // happy-path check; failure modes (overflow, bad input) are
+    // covered by the stdlib unit-test target separately.
+    //
+    // SAFETY: all C-string args are static literals; the qsort/
+    // bsearch inputs are stack-local arrays of i32.
+    let atoi_ok = unsafe {
+        narf_libc::atoi(b"  -42xyz\0".as_ptr() as *const i8) == -42
+    };
+    narf_libc::printf_str(
+        if atoi_ok { "atoi: ok\n" } else { "atoi: bad\n" },
+        &[],
+    );
+
+    let strtol_ok = unsafe {
+        let s = b"0xdeadbeef rest\0".as_ptr() as *const i8;
+        let mut end: *mut i8 = core::ptr::null_mut();
+        let v = narf_libc::strtol(s, &mut end, 16);
+        v == 0xdead_beef && !end.is_null() && *end == b' ' as i8
+    };
+    narf_libc::printf_str(
+        if strtol_ok { "strtol: ok\n" } else { "strtol: bad\n" },
+        &[],
+    );
+
+    extern "C" fn cmp_i32(
+        a: *const core::ffi::c_void,
+        b: *const core::ffi::c_void,
+    ) -> i32 {
+        // SAFETY: qsort/bsearch always pass element-sized pointers.
+        unsafe {
+            let x = *(a as *const i32);
+            let y = *(b as *const i32);
+            (x - y).signum()
+        }
+    }
+    let mut nums: [i32; 6] = [9, 1, 5, 3, 7, 4];
+    unsafe {
+        narf_libc::qsort(
+            nums.as_mut_ptr() as *mut core::ffi::c_void,
+            nums.len(),
+            core::mem::size_of::<i32>(),
+            cmp_i32,
+        );
+    }
+    let qsort_ok = nums == [1, 3, 4, 5, 7, 9];
+    narf_libc::printf_str(
+        if qsort_ok { "qsort: ok\n" } else { "qsort: bad\n" },
+        &[],
+    );
+
+    let key: i32 = 5;
+    let bs = unsafe {
+        narf_libc::bsearch(
+            &key as *const i32 as *const core::ffi::c_void,
+            nums.as_ptr() as *const core::ffi::c_void,
+            nums.len(),
+            core::mem::size_of::<i32>(),
+            cmp_i32,
+        )
+    };
+    let bsearch_ok = !bs.is_null() && unsafe { *(bs as *const i32) } == 5;
+    narf_libc::printf_str(
+        if bsearch_ok { "bsearch: ok\n" } else { "bsearch: bad\n" },
+        &[],
+    );
+
+    // isatty: stdin is the kernel console (returns 1); fd 99 is
+    // unbacked (returns 0).
+    let isatty_ok = unsafe {
+        narf_libc::isatty(0) == 1 && narf_libc::isatty(99) == 0
+    };
+    narf_libc::printf_str(
+        if isatty_ok { "isatty: ok\n" } else { "isatty: bad\n" },
+        &[],
+    );
+
+    // signal: install a no-op handler for SIGUSR-equivalent (we use
+    // SIGTERM since the kernel maps it to vector 15) and observe
+    // the prior slot value coming back as SIG_DFL (0).
+    extern "C" fn noop_sig(_: i32) {}
+    let prior = unsafe {
+        narf_libc::signal(narf_libc::SIGTERM, noop_sig as usize)
+    };
+    let signal_ok = prior == narf_libc::SIG_DFL_RAW;
+    narf_libc::printf_str(
+        if signal_ok { "signal: ok\n" } else { "signal: bad\n" },
+        &[],
+    );
+
     // ── Tier 2.5 probes: snprintf / clock / errno_location ───────
     //
     // snprintf into a fixed buffer, then compare against the expected

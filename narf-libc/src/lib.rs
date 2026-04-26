@@ -40,16 +40,18 @@ pub mod heap;
 pub mod io;
 pub mod posix;
 pub mod process;
+pub mod signal;
 pub mod startup;
 pub mod stdio;
+pub mod stdlib;
 pub mod string;
 pub mod time;
 
 pub use arch::_start;
-pub use env::{getenv, getenv_cstr, setenv, unsetenv, ENVIRON};
+pub use env::{getenv, getenv_cstr, putenv, setenv, unsetenv, ENVIRON};
 pub use errno::{errno, set_errno, __errno_location};
 pub use fd::{
-    dup, dup2, fcntl, fstat, pipe, stat, FD_CLOEXEC, F_GETFD, F_GETFL, F_SETFD,
+    dup, dup2, fcntl, fstat, isatty, pipe, stat, FD_CLOEXEC, F_GETFD, F_GETFL, F_SETFD,
     F_SETFL, StatBuf,
 };
 pub use fs::{chdir, getcwd};
@@ -65,6 +67,12 @@ pub use posix::{
     SEEK_CUR, SEEK_END, SEEK_SET,
 };
 pub use process::{abort, atexit, exit, _exit, getpid, getppid, getuid, sleep, usleep};
+pub use signal::{
+    kill, raise, signal, sighandler_t,
+    SIG_DFL_RAW, SIG_IGN_RAW, SIGABRT, SIGALRM, SIGCHLD, SIGFPE, SIGHUP, SIGILL,
+    SIGINT, SIGKILL, SIGPIPE, SIGQUIT, SIGSEGV, SIGTERM,
+};
+pub use stdlib::{atoi, atol, bsearch, qsort, strtol, strtoul};
 pub use time::{clock_gettime, gettimeofday, time, timespec, timeval};
 pub use startup::__libc_start_main;
 // Note: `stdio::fputs` shadows the older `io::fputs(&str, fd)` helper

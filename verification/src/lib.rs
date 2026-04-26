@@ -10962,6 +10962,13 @@ fn smoke_frame_x86_64_run_narf_libc_validate() -> TestResult {
     //                    distinct-live-chunks, free-list-reuse, and
     //                    realloc-grow probes (see narf-libc-validate
     //                    `heap_probe`).
+    //   atoi: ok      <- Tier-3a stdlib: leading whitespace + sign +
+    //                    digit-stop on non-digit ("  -42xyz" -> -42).
+    //   strtol: ok    <- 0x prefix + endptr writeback ("0xdeadbeef ").
+    //   qsort: ok     <- insertion sort over a 6-element i32 slice.
+    //   bsearch: ok   <- key=5 lookup over the sorted output.
+    //   isatty: ok    <- fd 0 is the console (1); fd 99 is unbacked (0).
+    //   signal: ok    <- signal(SIGTERM, h) returns SIG_DFL_RAW prior.
     //   snprintf: ok  <- Tier-2.5 io::Sink-as-buf path: snprintf_str
     //                    of `%5d %s` matches `   42 hi\0` byte-for-byte.
     //   clock: ok     <- clock_gettime back-to-back returns monotonic
