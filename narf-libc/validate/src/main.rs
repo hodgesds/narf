@@ -1350,6 +1350,111 @@ pub extern "C" fn main(
         &[],
     );
 
+    // ── Tier 3o probes: basename/dirname + fnmatch + dirent stub ─
+    //
+    // basename / dirname — operate in place. Each probe uses a
+    // fresh writable copy because dirname punches a NUL.
+    let mut bn1: [u8; 32] = [0; 32];
+    bn1[..14].copy_from_slice(b"/usr/local/bin");
+    let bn1_ret = unsafe { narf_libc::basename(bn1.as_mut_ptr() as *mut i8) };
+    let bn1_ok = unsafe {
+        let want: &[u8] = b"bin\0";
+        for (i, &b) in want.iter().enumerate() {
+            if *bn1_ret.add(i) != b as i8 { return -1; }
+        }
+        0
+    };
+    let _ = bn1_ok; // unused-warning suppression
+    let bn1_match = unsafe {
+        // Compare bytes at the returned pointer.
+        let want: &[u8] = b"bin\0";
+        let mut ok = true;
+        for (i, &b) in want.iter().enumerate() {
+            if *(bn1_ret as *const u8).add(i) != b { ok = false; break; }
+        }
+        ok
+    };
+    narf_libc::printf_str(
+        if bn1_match { "basename: ok\n" } else { "basename: bad\n" },
+        &[],
+    );
+
+    let mut dn1: [u8; 32] = [0; 32];
+    dn1[..14].copy_from_slice(b"/usr/local/bin");
+    let dn1_ret = unsafe { narf_libc::dirname(dn1.as_mut_ptr() as *mut i8) };
+    let dn1_match = unsafe {
+        let want: &[u8] = b"/usr/local\0";
+        let mut ok = true;
+        for (i, &b) in want.iter().enumerate() {
+            if *(dn1_ret as *const u8).add(i) != b { ok = false; break; }
+        }
+        ok
+    };
+    narf_libc::printf_str(
+        if dn1_match { "dirname: ok\n" } else { "dirname: bad\n" },
+        &[],
+    );
+
+    // fnmatch — happy and unhappy patterns.
+    let fnmatch_ok = unsafe {
+        narf_libc::fnmatch(
+            b"*.txt\0".as_ptr() as *const i8,
+            b"hello.txt\0".as_ptr() as *const i8,
+            0,
+        ) == 0
+            && narf_libc::fnmatch(
+                b"*.txt\0".as_ptr() as *const i8,
+                b"hello.md\0".as_ptr() as *const i8,
+                0,
+            ) == narf_libc::FNM_NOMATCH
+            && narf_libc::fnmatch(
+                b"foo?bar\0".as_ptr() as *const i8,
+                b"fooXbar\0".as_ptr() as *const i8,
+                0,
+            ) == 0
+            && narf_libc::fnmatch(
+                b"a[xyz]b\0".as_ptr() as *const i8,
+                b"ayb\0".as_ptr() as *const i8,
+                0,
+            ) == 0
+            && narf_libc::fnmatch(
+                b"a[!xyz]b\0".as_ptr() as *const i8,
+                b"ayb\0".as_ptr() as *const i8,
+                0,
+            ) == narf_libc::FNM_NOMATCH
+            && narf_libc::fnmatch(
+                b"a[0-9]b\0".as_ptr() as *const i8,
+                b"a5b\0".as_ptr() as *const i8,
+                0,
+            ) == 0
+            // FNM_PATHNAME: '*' must not cross '/'.
+            && narf_libc::fnmatch(
+                b"*\0".as_ptr() as *const i8,
+                b"a/b\0".as_ptr() as *const i8,
+                narf_libc::FNM_PATHNAME,
+            ) == narf_libc::FNM_NOMATCH
+            && narf_libc::fnmatch(
+                b"*/b\0".as_ptr() as *const i8,
+                b"a/b\0".as_ptr() as *const i8,
+                narf_libc::FNM_PATHNAME,
+            ) == 0
+    };
+    narf_libc::printf_str(
+        if fnmatch_ok { "fnmatch: ok\n" } else { "fnmatch: bad\n" },
+        &[],
+    );
+
+    // dirent stub — opendir returns NULL, errno is ENOSYS.
+    let dir_ok = unsafe {
+        let p = narf_libc::opendir(b"/tmp\0".as_ptr() as *const i8);
+        let e = narf_libc::errno();
+        p.is_null() && e == 38
+    };
+    narf_libc::printf_str(
+        if dir_ok { "opendir: ok\n" } else { "opendir: bad\n" },
+        &[],
+    );
+
     // atexit registration — `cleanup` runs after `main` returns,
     // BEFORE the kernel-side exit_task. The ordering proves the
     // dispatch loop in `narf_libc::exit` walks the table.

@@ -43,6 +43,7 @@ pub mod heap;
 pub mod io;
 pub mod math;
 pub mod net;
+pub mod path;
 pub mod posix;
 pub mod process;
 pub mod setjmp;
@@ -91,6 +92,10 @@ pub use math::{
 pub use net::{
     htonl, htons, inet_addr, inet_aton, inet_ntop, inet_pton, ntohl, ntohs,
     AF_INET, INADDR_NONE, INET_ADDRSTRLEN,
+};
+pub use path::{
+    basename, closedir, dirent, dirname, fnmatch, opendir, readdir,
+    DIR, FNM_NOESCAPE, FNM_NOMATCH, FNM_PATHNAME, FNM_PERIOD,
 };
 pub use posix::{
     access, close as posix_close, getpagesize, lseek as posix_lseek,
