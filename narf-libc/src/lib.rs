@@ -47,6 +47,7 @@ pub mod net;
 pub mod path;
 pub mod posix;
 pub mod pthread;
+pub mod term;
 pub mod process;
 pub mod setjmp;
 pub mod signal;
@@ -111,6 +112,11 @@ pub use posix::{
     rename as posix_rename, rmdir as posix_rmdir, sysconf, unlink as posix_unlink,
     write as posix_write, O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
     SEEK_CUR, SEEK_END, SEEK_SET, _SC_OPEN_MAX, _SC_PAGESIZE, _SC_PAGE_SIZE,
+};
+pub use term::{
+    flock, futimens, ioctl, tcdrain, tcflush, tcgetattr, tcsetattr, termios,
+    timeval64, utime, utimbuf, utimes, LOCK_EX, LOCK_NB, LOCK_SH, LOCK_UN, NCCS,
+    TCSADRAIN, TCSAFLUSH, TCSANOW,
 };
 pub use pthread::{
     pthread_attr_destroy, pthread_attr_init, pthread_attr_t, pthread_cond_t,

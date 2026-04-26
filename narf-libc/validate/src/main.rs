@@ -1813,6 +1813,61 @@ pub extern "C" fn main(
         &[],
     );
 
+    // ── Tier 3t probes: termios + ioctl + flock + utime ─────────
+    //
+    // tcgetattr against fd 0 (a tty) succeeds; against fd 99 (not
+    // a tty) fails with errno = ENOTTY.
+    let termios_ok = unsafe {
+        let mut t = narf_libc::termios::default();
+        let r0 = narf_libc::tcgetattr(0, &mut t);
+        narf_libc::set_errno(0);
+        let r99 = narf_libc::tcgetattr(99, &mut t);
+        let e = narf_libc::errno();
+        r0 == 0 && r99 == -1 && e == narf_libc::term::ENOTTY
+    };
+    narf_libc::printf_str(
+        if termios_ok { "termios: ok\n" } else { "termios: bad\n" },
+        &[],
+    );
+
+    // tcsetattr accepts on tty; flock always succeeds.
+    let tcset_ok = unsafe {
+        let t = narf_libc::termios::default();
+        narf_libc::tcsetattr(0, narf_libc::TCSANOW, &t) == 0
+            && narf_libc::flock(7, narf_libc::LOCK_EX) == 0
+    };
+    narf_libc::printf_str(
+        if tcset_ok { "tcset_flock: ok\n" } else { "tcset_flock: bad\n" },
+        &[],
+    );
+
+    // ioctl always returns -1 with errno = ENOTTY.
+    let ioctl_ok = unsafe {
+        narf_libc::set_errno(0);
+        let r = narf_libc::ioctl(0, 0x1234, core::ptr::null_mut());
+        let e = narf_libc::errno();
+        r == -1 && e == narf_libc::term::ENOTTY
+    };
+    narf_libc::printf_str(
+        if ioctl_ok { "ioctl: ok\n" } else { "ioctl: bad\n" },
+        &[],
+    );
+
+    // utime on existing path succeeds; missing path fails.
+    let utime_path: *const i8 = b"/tmp/utime-probe\0".as_ptr() as *const i8;
+    let utime_ok = unsafe {
+        let fd = narf_libc::posix_open(utime_path, narf_libc::O_CREAT, 0);
+        let _ = narf_libc::posix_close(fd);
+        let r1 = narf_libc::utime(utime_path, core::ptr::null());
+        let _ = narf_libc::posix_unlink(utime_path);
+        let r2 = narf_libc::utime(utime_path, core::ptr::null());
+        r1 == 0 && r2 == -1
+    };
+    narf_libc::printf_str(
+        if utime_ok { "utime: ok\n" } else { "utime: bad\n" },
+        &[],
+    );
+
     // atexit registration — `cleanup` runs after `main` returns,
     // BEFORE the kernel-side exit_task. The ordering proves the
     // dispatch loop in `narf_libc::exit` walks the table.
