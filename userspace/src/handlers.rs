@@ -1488,6 +1488,85 @@ fn sys_setgid(ctx: &mut dyn TrapContext) {
     }
 }
 
+// ── Hostname (kernel-wide) ─────────────────────────────────────────
+//
+// One global string behind an IrqSafeSpinLock, initialised to
+// "narf" so a get-before-set call has something sensible to read.
+// Bound at 64 bytes to fit POSIX HOST_NAME_MAX (Linux's
+// __NEW_UTS_LEN is 64). Stage-4 simplification: any task can set
+// the hostname; the cap gate lands alongside a wider settable-
+// state surface in a follow-up.
+
+const HOSTNAME_MAX: usize = 64;
+
+static HOSTNAME:
+    narf_lib::sync::IrqSafeSpinLock<alloc::string::String>
+    = narf_lib::sync::IrqSafeSpinLock::new(alloc::string::String::new());
+
+/// Initialise the hostname slot to `"narf"`. Idempotent so the
+/// boot path can call this without coordination.
+pub fn hostname_init() {
+    let mut g = HOSTNAME.lock();
+    if g.is_empty() {
+        g.push_str("narf");
+    }
+}
+
+/// Test hook: clear the hostname back to the boot default.
+#[doc(hidden)]
+pub fn __test_hostname_reset() {
+    let mut g = HOSTNAME.lock();
+    g.clear();
+    g.push_str("narf");
+}
+
+fn sys_gethostname(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let buf  = args.arg0 as *mut u8;
+    let len  = args.arg1 as usize;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if buf.is_null() || len == 0 {
+        ctx.set_return(fail);
+        return;
+    }
+    let g = HOSTNAME.lock();
+    let bytes = g.as_bytes();
+    if bytes.len() + 1 > len {
+        ctx.set_return(fail);
+        return;
+    }
+    // SAFETY: caller-supplied user pointer in the active AS;
+    // length-bounded; bad pointer faults the user, not us.
+    unsafe {
+        for (i, &b) in bytes.iter().enumerate() {
+            core::ptr::write_volatile(buf.add(i), b);
+        }
+        core::ptr::write_volatile(buf.add(bytes.len()), 0);
+    }
+    ctx.set_return(SyscallReturn::ok(bytes.len() as u64));
+}
+
+fn sys_sethostname(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let buf  = args.arg0 as *const u8;
+    let len  = args.arg1 as usize;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if buf.is_null() || len == 0 || len > HOSTNAME_MAX {
+        ctx.set_return(fail);
+        return;
+    }
+    // SAFETY: user-mode pointer in the active AS, length-bounded.
+    let bytes = unsafe { core::slice::from_raw_parts(buf, len) };
+    let s = match core::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => { ctx.set_return(fail); return; }
+    };
+    let mut g = HOSTNAME.lock();
+    g.clear();
+    g.push_str(s);
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
 // ── Yield / Sleep — Ok ─────────────────────────────────────────────
 
 fn sys_noop_ok(ctx: &mut dyn TrapContext) {
@@ -2283,6 +2362,8 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::GetGid,   "getgid",   RawFnHandler(sys_getgid));
     table.install_raw(Syscall::SetUid,   "setuid",   RawFnHandler(sys_setuid));
     table.install_raw(Syscall::SetGid,   "setgid",   RawFnHandler(sys_setgid));
+    table.install_raw(Syscall::GetHostname, "gethostname", RawFnHandler(sys_gethostname));
+    table.install_raw(Syscall::SetHostname, "sethostname", RawFnHandler(sys_sethostname));
     table.install_raw(Syscall::ExitTask, "exit",     RawFnHandler(sys_exit_task));
     table.install_raw(Syscall::Yield,    "yield",    RawFnHandler(sys_yield));
     table.install_raw(Syscall::Sleep,    "sleep",    RawFnHandler(sys_sleep));

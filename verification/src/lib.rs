@@ -11884,3 +11884,103 @@ fn smoke_userspace_setuid_setgid_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_userspace_setuid_setgid_round_trip);
+
+fn smoke_userspace_hostname_round_trip() -> TestResult {
+    use narf_userspace::{install_core_syscalls, install_global,
+                         hostname_init, kernel_syscall_entry,
+                         syscall::__test_clear_global,
+                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+                         TrapContext};
+
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+    narf_userspace::handlers::__test_hostname_reset();
+    hostname_init();
+
+    // gethostname → "narf" (boot default).
+    let mut buf = [0u8; 64];
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: buf.as_mut_ptr() as u64,
+            arg1: buf.len() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::GetHostname.raw(), &mut ctx);
+    let n = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK
+                && r.value != (-1i64) as u64 => r.value as usize,
+        _ => return TestResult::Fail("gethostname did not return OK with len"),
+    };
+    if n != 4 || &buf[..4] != b"narf" || buf[4] != 0 {
+        return TestResult::Fail("default hostname not 'narf'");
+    }
+
+    // sethostname("box-7") → succeeds.
+    let new_name = b"box-7";
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: new_name.as_ptr() as u64,
+            arg1: new_name.len() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::SetHostname.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+        return TestResult::Fail("sethostname did not return 0");
+    }
+
+    // gethostname now returns "box-7".
+    let mut buf2 = [0u8; 64];
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: buf2.as_mut_ptr() as u64,
+            arg1: buf2.len() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::GetHostname.raw(), &mut ctx);
+    let n2 = match ctx.ret {
+        Some(r) if r.value != (-1i64) as u64 => r.value as usize,
+        _ => return TestResult::Fail("post-set gethostname failed"),
+    };
+    if n2 != 5 || &buf2[..5] != b"box-7" || buf2[5] != 0 {
+        return TestResult::Fail("hostname did not stick after sethostname");
+    }
+
+    // gethostname into too-small buf returns -1.
+    let mut tiny = [0u8; 3];
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: tiny.as_mut_ptr() as u64,
+            arg1: tiny.len() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::GetHostname.raw(), &mut ctx);
+    let too_small_rejected = matches!(
+        ctx.ret,
+        Some(r) if r.status == SyscallReturn::OK && r.value == (-1i64) as u64,
+    );
+    if !too_small_rejected {
+        return TestResult::Fail("gethostname did not reject small buf");
+    }
+
+    narf_userspace::handlers::__test_hostname_reset();
+    __test_clear_global();
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_hostname_round_trip);

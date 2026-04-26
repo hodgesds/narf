@@ -188,6 +188,19 @@ pub enum Syscall {
     SetUid       = 144,
     SetGid       = 145,
 
+    /// `arg0 = buf_ptr`, `arg1 = buf_len`. Copy the kernel-wide
+    /// hostname (NUL-terminated UTF-8) into the user buffer.
+    /// Returns the byte length excluding the NUL on success, -1 on
+    /// `buf_len < name_len + 1`.
+    GetHostname  = 146,
+
+    /// `arg0 = buf_ptr`, `arg1 = buf_len`. Replace the kernel-wide
+    /// hostname with the supplied bytes. Stage-4 simplification:
+    /// any task can set the hostname (no cap gate yet — landing
+    /// alongside the cap-table integration). Returns 0 on success,
+    /// -1 on rejection (length cap, malformed UTF-8).
+    SetHostname  = 147,
+
     /// Set or query the per-task heap break.
     /// `arg0 = 0` → return current break; `arg0 != 0` → resize.
     /// POSIX `brk(2)` semantics: failure returns the unchanged break.
@@ -369,6 +382,8 @@ impl Syscall {
             143 => Syscall::GetGid,
             144 => Syscall::SetUid,
             145 => Syscall::SetGid,
+            146 => Syscall::GetHostname,
+            147 => Syscall::SetHostname,
             150 => Syscall::Brk,
             151 => Syscall::ClockGetTime,
             152 => Syscall::Sigaction,

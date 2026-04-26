@@ -204,6 +204,36 @@ pub unsafe extern "C" fn getpagesize() -> c_int {
     4096
 }
 
+/// `gethostname(buf, len)` — copy the kernel hostname, NUL-
+/// terminated, into `buf`. Returns 0 on success, -1 if `len` is
+/// too small for the name + NUL.
+///
+/// # Safety
+/// `buf` must be writable for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gethostname(buf: *mut c_char, len: usize) -> c_int {
+    if buf.is_null() || len == 0 { return -1; }
+    // SAFETY: caller-supplied writable buffer.
+    let slice = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
+    if narf_user_runtime::gethostname(slice) < 0 { -1 } else { 0 }
+}
+
+/// `sethostname(buf, len)` — replace the kernel hostname.
+///
+/// # Safety
+/// `buf` must be readable for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sethostname(buf: *const c_char, len: usize) -> c_int {
+    if buf.is_null() || len == 0 { return -1; }
+    // SAFETY: caller-supplied readable buffer.
+    let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
+    let s = match core::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    narf_user_runtime::sethostname(s)
+}
+
 // ── sysconf ──────────────────────────────────────────────────────
 //
 // Glibc enumerates dozens of `_SC_*` codes; we honour the load-

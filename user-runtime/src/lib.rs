@@ -59,6 +59,8 @@ pub const SYS_GETUID:         u64 = 142;
 pub const SYS_GETGID:         u64 = 143;
 pub const SYS_SETUID:         u64 = 144;
 pub const SYS_SETGID:         u64 = 145;
+pub const SYS_GETHOSTNAME:    u64 = 146;
+pub const SYS_SETHOSTNAME:    u64 = 147;
 pub const SYS_BRK:            u64 = 150;
 pub const SYS_CLOCK_GETTIME:  u64 = 151;
 pub const SYS_SIGACTION:      u64 = 152;
@@ -394,6 +396,30 @@ pub fn setuid(uid: u32) -> i32 {
 pub fn setgid(gid: u32) -> i32 {
     // SAFETY: SYS_SETGID takes one arg (gid).
     let r = unsafe { syscall1(SYS_SETGID, gid as u64) };
+    if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `gethostname(buf)` — copy the kernel-wide hostname into `buf`,
+/// NUL-terminated. Returns the byte length excluding the NUL on
+/// success, -1 on `buf.len() < name_len + 1`.
+#[inline]
+pub fn gethostname(buf: &mut [u8]) -> i32 {
+    if buf.is_empty() { return -1; }
+    // SAFETY: SYS_GETHOSTNAME signature: (buf_ptr, buf_len).
+    let r = unsafe {
+        syscall2(SYS_GETHOSTNAME, buf.as_mut_ptr() as u64, buf.len() as u64)
+    };
+    if r as i64 == -1 { -1 } else { r as i32 }
+}
+
+/// `sethostname(s)` — replace the kernel-wide hostname.
+#[inline]
+pub fn sethostname(s: &str) -> i32 {
+    if s.is_empty() { return -1; }
+    // SAFETY: SYS_SETHOSTNAME signature: (buf_ptr, buf_len).
+    let r = unsafe {
+        syscall2(SYS_SETHOSTNAME, s.as_ptr() as u64, s.len() as u64)
+    };
     if r as i64 == -1 { -1 } else { 0 }
 }
 
