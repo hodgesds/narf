@@ -499,6 +499,51 @@ pub extern "C" fn main(
         &[],
     );
 
+    // getopt — feed a synthetic argv `prog -a -b val rest` and
+    // walk it. Expect: 'a' (no arg), 'b' with optarg="val",
+    // -1 with optind pointing at "rest".
+    //
+    // SAFETY: the argv strings are static literals; the array is
+    // stack-allocated and lives for the duration of the call.
+    let arg0 = b"prog\0".as_ptr() as *mut i8;
+    let arg1 = b"-a\0".as_ptr()   as *mut i8;
+    let arg2 = b"-b\0".as_ptr()   as *mut i8;
+    let arg3 = b"val\0".as_ptr()  as *mut i8;
+    let arg4 = b"rest\0".as_ptr() as *mut i8;
+    let argv: [*mut i8; 5] = [arg0, arg1, arg2, arg3, arg4];
+    let optstring = b"ab:\0".as_ptr() as *const i8;
+    let getopt_ok = unsafe {
+        // Reset the getopt globals — earlier probes may have
+        // poisoned them via process-wide statics.
+        narf_libc::optind  = 1;
+        narf_libc::opterr  = 0;
+        let r1 = narf_libc::getopt(5, argv.as_ptr(), optstring);
+        let r2 = narf_libc::getopt(5, argv.as_ptr(), optstring);
+        let opt_after = narf_libc::optarg;
+        let r3 = narf_libc::getopt(5, argv.as_ptr(), optstring);
+        let opt_after_b = !opt_after.is_null() && *opt_after == b'v' as i8;
+        r1 == b'a' as i32 && r2 == b'b' as i32 && opt_after_b && r3 == -1
+            && narf_libc::optind == 4
+    };
+    narf_libc::printf_str(
+        if getopt_ok { "getopt: ok\n" } else { "getopt: bad\n" },
+        &[],
+    );
+
+    // assert.h — call __assert_fail with a deliberately-passing
+    // expression cannot be exercised here (the function is
+    // no-return). We instead probe that the symbol resolves at
+    // link time and that its address is non-null. The output line
+    // is therefore a link-presence check, not a behaviour test.
+    //
+    // SAFETY: reading a function pointer's address is sound;
+    // calling it is what we avoid.
+    let assert_ok = (narf_libc::__assert_fail as usize) != 0;
+    narf_libc::printf_str(
+        if assert_ok { "assert: ok\n" } else { "assert: bad\n" },
+        &[],
+    );
+
     // ctype probe — exercise a representative slice of the
     // classification + case-fold surface. SAFETY: pure value math.
     let ctype_ok = unsafe {

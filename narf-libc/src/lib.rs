@@ -32,11 +32,13 @@ extern "C" {
 }
 
 pub mod arch;
+pub mod assert;
 pub mod ctype;
 pub mod env;
 pub mod errno;
 pub mod fd;
 pub mod fs;
+pub mod getopt;
 pub mod heap;
 pub mod io;
 pub mod posix;
@@ -50,6 +52,7 @@ pub mod string;
 pub mod time;
 
 pub use arch::_start;
+pub use assert::__assert_fail;
 pub use ctype::{
     isalnum, isalpha, isascii, iscntrl, isdigit, isgraph, islower, isprint,
     ispunct, isspace, isupper, isxdigit, tolower, toupper,
@@ -61,6 +64,7 @@ pub use fd::{
     F_SETFL, StatBuf,
 };
 pub use fs::{chdir, getcwd};
+pub use getopt::{getopt, optarg, opterr, optind, optopt};
 pub use heap::{calloc, free, malloc, realloc};
 // `io::fputs(&str, fd)` deliberately omitted — the `stdio::fputs`
 // FILE*-shaped one (re-exported below) is the canonical public

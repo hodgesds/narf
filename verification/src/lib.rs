@@ -11042,6 +11042,13 @@ fn smoke_frame_x86_64_run_narf_libc_validate() -> TestResult {
     //                    longjmp(env, 7) re-enters with apparent
     //                    return 7; static counter proves single
     //                    re-entry, not infinite loop.
+    //   getopt: ok    <- Tier-3f getopt: walks "-a -b val rest"
+    //                    against optstring "ab:", returns 'a',
+    //                    'b' with optarg="val", -1 with optind=4.
+    //   assert: ok    <- Tier-3f __assert_fail link-presence (the
+    //                    function is no-return so we can't exercise
+    //                    it without aborting; we just confirm the
+    //                    symbol resolves).
     //   ctype: ok     <- Tier-3d <ctype.h>: isdigit/isalpha/isspace/
     //                    isxdigit + tolower/toupper round-trip.
     //   atoi: ok      <- Tier-3a stdlib: leading whitespace + sign +
