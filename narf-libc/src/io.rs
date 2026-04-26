@@ -677,6 +677,149 @@ pub fn snprintf_str(buf: &mut [u8], fmt: &str, args: &[Arg<'_>]) -> usize {
     total
 }
 
+// ── C-ABI sprintf / snprintf / asprintf (Arg-slice form) ────────────
+//
+// Real C-variadic `sprintf(char *buf, const char *fmt, ...)` would
+// need `core::ffi::VaList`, which is still unstable on Rust 1.85.
+// Path-B ships a tagged-Arg form that keeps the C-callable shape
+// while letting Rust callers continue to use `&[Arg]` directly.
+// Each entry takes `(args_ptr, args_len)` so a C consumer can build
+// the array on the stack and pass it through.
+//
+// The format string is taken as a `*const i8` + walked-to-NUL.
+// `dst` for sprintf / snprintf must be writable for the requested
+// span. asprintf allocates via `heap::malloc` and writes the
+// resulting buffer pointer through `*out` (caller must `free` it).
+
+use crate::posix::c_char;
+
+/// Walk a NUL-terminated C string and build a `&str` slice. Returns
+/// "" if the bytes aren't valid UTF-8.
+unsafe fn cstr_to_str_io<'a>(p: *const c_char) -> &'a str {
+    if p.is_null() { return ""; }
+    let mut len = 0usize;
+    // SAFETY: caller-asserted NUL terminator.
+    unsafe {
+        while *p.add(len) != 0 { len += 1; }
+        let bytes = core::slice::from_raw_parts(p as *const u8, len);
+        core::str::from_utf8(bytes).unwrap_or("")
+    }
+}
+
+/// `sprintf(buf, fmt, args, n)` — C-shaped sprintf with no length
+/// cap. Returns the count of bytes written (excluding the NUL).
+/// Always NUL-terminates `buf` if at least one byte is reachable.
+///
+/// # Safety
+/// `buf` must be writable for at least the formatted result + 1
+/// NUL. `fmt` must be a valid NUL-terminated C string. `args` must
+/// point to `n` valid `Arg` entries.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sprintf_c(
+    buf:  *mut c_char,
+    fmt:  *const c_char,
+    args: *const Arg<'_>,
+    n:    usize,
+) -> i32 {
+    if buf.is_null() || fmt.is_null() { return -1; }
+    // SAFETY: caller-asserted NUL-termination on fmt.
+    let fmt_str = unsafe { cstr_to_str_io(fmt) };
+    // SAFETY: caller-supplied args slice of length n.
+    let arg_slice: &[Arg<'_>] = if args.is_null() || n == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(args, n) }
+    };
+    // Format-then-emit through a vsnprintf_str into a stack buffer
+    // sized at the would-have length — but we don't know that
+    // ahead of time. Rather than two passes, allocate a generous
+    // 4 KiB scratch on the caller's buffer (we trust the caller's
+    // contract) and copy.
+    //
+    // Simpler: vsnprintf_str into the caller's buffer directly,
+    // bounded by an "infinite" length we pretend. We can't, because
+    // Sink::Buf needs an actual slice. Use a 64 KiB max here as a
+    // sanity bound; callers wanting larger should use snprintf_c.
+    const MAX_SPRINTF: usize = 64 * 1024;
+    // SAFETY: caller declared `buf` is writable for at least the
+    // formatted result + NUL. We bound at MAX_SPRINTF to keep the
+    // raw_parts size finite.
+    let dst = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, MAX_SPRINTF) };
+    let n_written = snprintf_str(dst, fmt_str, arg_slice);
+    n_written as i32
+}
+
+/// `snprintf(buf, size, fmt, args, n)` — C-shaped snprintf. Returns
+/// the would-have-written byte count (excluding NUL) per C99.
+/// Always NUL-terminates `buf` when `size > 0`.
+///
+/// # Safety
+/// `buf` must be writable for `size` bytes; `fmt` must be a valid
+/// NUL-terminated C string; `args` must point to `n` valid `Arg`s.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn snprintf_c(
+    buf:  *mut c_char,
+    size: usize,
+    fmt:  *const c_char,
+    args: *const Arg<'_>,
+    n:    usize,
+) -> i32 {
+    if buf.is_null() || size == 0 || fmt.is_null() { return -1; }
+    // SAFETY: caller contracts.
+    let fmt_str = unsafe { cstr_to_str_io(fmt) };
+    let arg_slice: &[Arg<'_>] = if args.is_null() || n == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(args, n) }
+    };
+    // SAFETY: caller declared `buf` is writable for `size` bytes.
+    let dst = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, size) };
+    snprintf_str(dst, fmt_str, arg_slice) as i32
+}
+
+/// `asprintf(out, fmt, args, n)` — allocate a buffer large enough
+/// to hold the formatted result + NUL, write the bytes, and stash
+/// the pointer through `*out`. Returns the count of bytes written
+/// (excluding NUL), or -1 on allocation failure. Caller is
+/// responsible for `free`-ing `*out`.
+///
+/// # Safety
+/// `out` must be a writable pointer-to-pointer slot; `fmt` /
+/// `args` per [`snprintf_c`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn asprintf_c(
+    out:  *mut *mut c_char,
+    fmt:  *const c_char,
+    args: *const Arg<'_>,
+    n:    usize,
+) -> i32 {
+    if out.is_null() || fmt.is_null() { return -1; }
+    // SAFETY: caller contracts.
+    let fmt_str = unsafe { cstr_to_str_io(fmt) };
+    let arg_slice: &[Arg<'_>] = if args.is_null() || n == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(args, n) }
+    };
+    // First pass: compute would-have length. vsnprintf_str on an
+    // empty slice returns the count without writing.
+    let mut empty: [u8; 0] = [];
+    let len = vsnprintf_str(&mut empty, fmt_str, arg_slice);
+    // SAFETY: malloc is `unsafe extern "C"`; non-zero size = len + 1.
+    let buf = unsafe { crate::heap::malloc(len + 1) };
+    if buf.is_null() {
+        // SAFETY: caller-supplied writable slot — write null on failure.
+        unsafe { *out = core::ptr::null_mut(); }
+        return -1;
+    }
+    // SAFETY: malloc returned a (len + 1)-byte writable region.
+    let dst = unsafe { core::slice::from_raw_parts_mut(buf, len + 1) };
+    let _ = snprintf_str(dst, fmt_str, arg_slice);
+    // SAFETY: caller-supplied writable slot.
+    unsafe { *out = buf as *mut c_char; }
+    len as i32
+}
+
 /// `sprintf_str(buf, fmt, args)` — like [`snprintf_str`] but with no
 /// length cap. Caller is responsible for ensuring `buf` is large
 /// enough; otherwise the formatted bytes will saturate at the slice

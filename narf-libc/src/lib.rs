@@ -81,8 +81,8 @@ pub use heap::{calloc, free, malloc, realloc};
 // surface. The internal helper is still reachable as
 // `crate::io::fputs` for non-public call sites that haven't migrated.
 pub use io::{
-    fprintf_str, printf_str, snprintf_str, sprintf_str, vprintf_str, vsnprintf_str,
-    write, Arg, Stdout,
+    asprintf_c, fprintf_str, printf_str, snprintf_c, snprintf_str, sprintf_c,
+    sprintf_str, vprintf_str, vsnprintf_str, write, Arg, Stdout,
 };
 pub use math::{
     atan, atan2, atan2f, atanf, ceil, ceilf, copysign, copysignf, cos, cosf, exp, expf,

@@ -1558,6 +1558,78 @@ pub extern "C" fn main(
         &[],
     );
 
+    // ── Tier 3q probes: C-shaped sprintf / snprintf / asprintf ───
+    //
+    // C-shaped wrappers take an Arg slice as `*const Arg, len` so a
+    // C consumer can build the array on the stack. The Rust call
+    // site here builds a stack array and hands its pointer through.
+    let q_args: [Arg; 2] = [Arg::Int(42), Arg::Hex(0xabc)];
+    let q_fmt = b"k=%d v=0x%x\0".as_ptr() as *const i8;
+    let mut q_buf: [u8; 32] = [0; 32];
+    let snp = unsafe {
+        narf_libc::snprintf_c(
+            q_buf.as_mut_ptr() as *mut i8,
+            q_buf.len(),
+            q_fmt,
+            q_args.as_ptr(),
+            q_args.len(),
+        )
+    };
+    let want_q: &[u8] = b"k=42 v=0xabc";
+    let snprintf_c_ok = snp as usize == want_q.len()
+        && q_buf[..want_q.len()] == *want_q
+        && q_buf[want_q.len()] == 0;
+    narf_libc::printf_str(
+        if snprintf_c_ok { "snprintf_c: ok\n" } else { "snprintf_c: bad\n" },
+        &[],
+    );
+
+    // sprintf_c — same fmt, no length cap (we trust the buffer).
+    let mut sp_buf: [u8; 32] = [0; 32];
+    let spn = unsafe {
+        narf_libc::sprintf_c(
+            sp_buf.as_mut_ptr() as *mut i8,
+            q_fmt,
+            q_args.as_ptr(),
+            q_args.len(),
+        )
+    };
+    let sprintf_c_ok = spn as usize == want_q.len()
+        && sp_buf[..want_q.len()] == *want_q
+        && sp_buf[want_q.len()] == 0;
+    narf_libc::printf_str(
+        if sprintf_c_ok { "sprintf_c: ok\n" } else { "sprintf_c: bad\n" },
+        &[],
+    );
+
+    // asprintf_c — allocate, format, retrieve, compare, free.
+    let mut a_out: *mut i8 = core::ptr::null_mut();
+    let asn = unsafe {
+        narf_libc::asprintf_c(
+            &mut a_out,
+            q_fmt,
+            q_args.as_ptr(),
+            q_args.len(),
+        )
+    };
+    let asprintf_ok = unsafe {
+        let mut ok = asn as usize == want_q.len() && !a_out.is_null();
+        if ok {
+            for (i, &b) in want_q.iter().enumerate() {
+                if *(a_out as *const u8).add(i) != b { ok = false; break; }
+            }
+            if ok && *(a_out as *const u8).add(want_q.len()) != 0 {
+                ok = false;
+            }
+            narf_libc::free(a_out as *mut u8);
+        }
+        ok
+    };
+    narf_libc::printf_str(
+        if asprintf_ok { "asprintf: ok\n" } else { "asprintf: bad\n" },
+        &[],
+    );
+
     // atexit registration — `cleanup` runs after `main` returns,
     // BEFORE the kernel-side exit_task. The ordering proves the
     // dispatch loop in `narf_libc::exit` walks the table.
