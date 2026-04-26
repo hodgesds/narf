@@ -179,6 +179,73 @@ pub unsafe extern "C" fn rmdir(path: *const c_char) -> c_int {
     narf_user_runtime::rmdir(s)
 }
 
+/// `access(path, mode)` — test whether `path` is reachable. The
+/// `mode` bitmask (`F_OK = 0`, `R_OK = 4`, `W_OK = 2`, `X_OK = 1`)
+/// is accepted but only `F_OK` is honoured today: NARF has no
+/// per-file permission bits in the kernel surface, so `R_OK` /
+/// `W_OK` / `X_OK` are treated as `F_OK` (existence implies all
+/// access). Returns 0 if reachable, -1 otherwise.
+///
+/// Implementation note: `narf_user_runtime::stat` cannot
+/// distinguish `Ok(_)` from `InvalidOp` today (the syscall ABI
+/// only surfaces `rax = value`, both of which are 0 for the no-
+/// payload success and the no-payload error). We therefore probe
+/// existence via `open_abs` — the kernel returns `Some(fd)` only
+/// if path resolution succeeds. We immediately close the fd.
+///
+/// # Safety
+/// `path` must be a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn access(path: *const c_char, _mode: c_int) -> c_int {
+    if path.is_null() { return -1; }
+    // SAFETY: caller-asserted NUL-terminated string.
+    let s = unsafe { cstr_to_str(path) };
+    if !s.starts_with('/') { return -1; }
+    match narf_user_runtime::open_abs(s) {
+        Some(fd) => {
+            let _ = narf_user_runtime::close(fd);
+            0
+        }
+        None => -1,
+    }
+}
+
+/// `getpagesize()` — POSIX-deprecated but still common. NARF uses
+/// 4 KiB pages on every target.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn getpagesize() -> c_int {
+    4096
+}
+
+// ── sysconf ──────────────────────────────────────────────────────
+//
+// Glibc enumerates dozens of `_SC_*` codes; we honour the load-
+// bearing handful and return -1 for everything else (POSIX-correct
+// for "value indeterminate").
+
+pub const _SC_PAGESIZE:    c_int = 30;
+pub const _SC_PAGE_SIZE:   c_int = 30; // glibc alias
+pub const _SC_OPEN_MAX:    c_int = 4;
+pub const _SC_CLK_TCK:     c_int = 2;
+pub const _SC_NPROCESSORS_ONLN: c_int = 84;
+pub const _SC_NPROCESSORS_CONF: c_int = 83;
+pub const _SC_PHYS_PAGES:  c_int = 85;
+
+/// `sysconf(name)` — runtime configurable-system-value query.
+/// Returns -1 for unsupported codes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sysconf(name: c_int) -> i64 {
+    match name {
+        _SC_PAGESIZE | _SC_PAGE_SIZE => 4096,
+        _SC_OPEN_MAX                  => 256,
+        _SC_CLK_TCK                   => 100,
+        _SC_NPROCESSORS_ONLN
+        | _SC_NPROCESSORS_CONF        => 1,
+        _SC_PHYS_PAGES                => -1,
+        _ => -1,
+    }
+}
+
 /// `rename(old, new)` — POSIX-shaped. Returns 0 / -1. Cross-
 /// directory rename is unsupported (kernel rejects with -1 unless
 /// both paths share the same parent directory).

@@ -42,6 +42,7 @@ pub mod getopt;
 pub mod heap;
 pub mod io;
 pub mod math;
+pub mod net;
 pub mod posix;
 pub mod process;
 pub mod setjmp;
@@ -81,12 +82,16 @@ pub use math::{
     isnan, log, log10, log10f, log2, log2f, logf, pow, powf, round, roundf, signbit,
     sin, sinf, sqrt, sqrtf, tan, tanf, trunc, truncf,
 };
+pub use net::{
+    htonl, htons, inet_addr, inet_aton, inet_ntop, inet_pton, ntohl, ntohs,
+    AF_INET, INADDR_NONE, INET_ADDRSTRLEN,
+};
 pub use posix::{
-    close as posix_close, lseek as posix_lseek, mkdir as posix_mkdir,
-    open as posix_open, read as posix_read, rename as posix_rename,
-    rmdir as posix_rmdir, unlink as posix_unlink, write as posix_write,
-    O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
-    SEEK_CUR, SEEK_END, SEEK_SET,
+    access, close as posix_close, getpagesize, lseek as posix_lseek,
+    mkdir as posix_mkdir, open as posix_open, read as posix_read,
+    rename as posix_rename, rmdir as posix_rmdir, sysconf, unlink as posix_unlink,
+    write as posix_write, O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
+    SEEK_CUR, SEEK_END, SEEK_SET, _SC_OPEN_MAX, _SC_PAGESIZE, _SC_PAGE_SIZE,
 };
 pub use process::{abort, atexit, exit, _exit, getpid, getppid, getuid, sleep, usleep};
 pub use setjmp::{jmp_buf, longjmp, setjmp, JMP_BUF_LEN};

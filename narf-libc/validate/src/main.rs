@@ -1145,6 +1145,101 @@ pub extern "C" fn main(
         &[],
     );
 
+    // ── Tier 3m probes: byte-order + IPv4 inet + access/sysconf ──
+    //
+    // htonl / htons round-trip: swap-and-swap returns the original.
+    let bo_ok = unsafe {
+        narf_libc::htonl(0xDEAD_BEEF) == 0xEFBE_ADDE
+            && narf_libc::ntohl(narf_libc::htonl(0x1234_5678)) == 0x1234_5678
+            && narf_libc::htons(0x1234) == 0x3412
+            && narf_libc::ntohs(narf_libc::htons(0xABCD)) == 0xABCD
+    };
+    narf_libc::printf_str(
+        if bo_ok { "byteorder: ok\n" } else { "byteorder: bad\n" },
+        &[],
+    );
+
+    // inet_aton + inet_ntop round-trip across a known address.
+    let aton_ok = unsafe {
+        let mut packed: narf_libc::net::in_addr_t = 0;
+        let r = narf_libc::inet_aton(
+            b"192.168.1.10\0".as_ptr() as *const i8,
+            &mut packed,
+        );
+        // Network-order bytes: 192,168,1,10 → little-endian word
+        // 0x0A01_A8C0 on a little-endian host.
+        let bad = narf_libc::inet_aton(
+            b"999.0.0.1\0".as_ptr() as *const i8,
+            core::ptr::null_mut(),
+        );
+        r == 1 && packed == 0x0A01_A8C0 && bad == 0
+    };
+    narf_libc::printf_str(
+        if aton_ok { "inet_aton: ok\n" } else { "inet_aton: bad\n" },
+        &[],
+    );
+
+    // inet_pton + inet_ntop round-trip via AF_INET.
+    let mut packed4: u32 = 0;
+    let pton_rc = unsafe {
+        narf_libc::inet_pton(
+            narf_libc::AF_INET,
+            b"10.0.0.255\0".as_ptr() as *const i8,
+            &mut packed4 as *mut u32 as *mut core::ffi::c_void,
+        )
+    };
+    let mut ntop_buf: [u8; 16] = [0; 16];
+    let ntop_p = unsafe {
+        narf_libc::inet_ntop(
+            narf_libc::AF_INET,
+            &packed4 as *const u32 as *const core::ffi::c_void,
+            ntop_buf.as_mut_ptr() as *mut i8,
+            ntop_buf.len(),
+        )
+    };
+    let want_addr: &[u8] = b"10.0.0.255";
+    let ntop_ok = pton_rc == 1
+        && !ntop_p.is_null()
+        && ntop_buf[..want_addr.len()] == *want_addr
+        && ntop_buf[want_addr.len()] == 0;
+    narf_libc::printf_str(
+        if ntop_ok { "inet_pton: ok\n" } else { "inet_pton: bad\n" },
+        &[],
+    );
+
+    // access() — create a fresh file under /tmp, stat it via access,
+    // then unlink and confirm the second access returns -1. The
+    // earlier per-tier probes leave /tmp in an indeterminate state
+    // (rename moved /tmp/created to /tmp/renamed but that file's
+    // existence isn't guaranteed by the tier order); using a fresh
+    // path makes this probe self-contained.
+    let access_path: *const i8 = b"/tmp/access-probe\0".as_ptr() as *const i8;
+    let access_ok = unsafe {
+        let fd = narf_libc::posix_open(access_path, narf_libc::O_CREAT, 0);
+        let _ = narf_libc::posix_close(fd);
+        let here   = narf_libc::access(access_path, 0);
+        let _ = narf_libc::posix_unlink(access_path);
+        let gone   = narf_libc::access(access_path, 0);
+        let absent = narf_libc::access(b"/no/such/path\0".as_ptr() as *const i8, 0);
+        here == 0 && gone == -1 && absent == -1
+    };
+    narf_libc::printf_str(
+        if access_ok { "access: ok\n" } else { "access: bad\n" },
+        &[],
+    );
+
+    // getpagesize / sysconf — pure value checks.
+    let sysconf_ok = unsafe {
+        narf_libc::getpagesize() == 4096
+            && narf_libc::sysconf(narf_libc::_SC_PAGESIZE) == 4096
+            && narf_libc::sysconf(narf_libc::_SC_OPEN_MAX) == 256
+            && narf_libc::sysconf(9999) == -1
+    };
+    narf_libc::printf_str(
+        if sysconf_ok { "sysconf: ok\n" } else { "sysconf: bad\n" },
+        &[],
+    );
+
     // atexit registration — `cleanup` runs after `main` returns,
     // BEFORE the kernel-side exit_task. The ordering proves the
     // dispatch loop in `narf_libc::exit` walks the table.
