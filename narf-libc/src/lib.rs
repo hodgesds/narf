@@ -76,9 +76,10 @@ pub use io::{
     write, Arg, Stdout,
 };
 pub use math::{
-    ceil, ceilf, copysign, copysignf, fabs, fabsf, floor, floorf,
-    fmax, fmaxf, fmin, fminf, fmod, fmodf, isfinite, isinf, isnan,
-    round, roundf, signbit, sqrt, sqrtf, trunc, truncf,
+    atan, atan2, atan2f, atanf, ceil, ceilf, copysign, copysignf, cos, cosf, exp, expf,
+    fabs, fabsf, floor, floorf, fmax, fmaxf, fmin, fminf, fmod, fmodf, isfinite, isinf,
+    isnan, log, log10, log10f, log2, log2f, logf, pow, powf, round, roundf, signbit,
+    sin, sinf, sqrt, sqrtf, tan, tanf, trunc, truncf,
 };
 pub use posix::{
     close as posix_close, lseek as posix_lseek, mkdir as posix_mkdir,

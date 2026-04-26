@@ -1081,6 +1081,70 @@ pub extern "C" fn main(
         &[],
     );
 
+    // ── Tier 3l probes: math transcendentals ─────────────────────
+    //
+    // Polynomial approximations are accurate to ~1e-7 absolute over
+    // the reduced argument ranges. Each probe checks against a
+    // generous tolerance so floating-point round-off in the test
+    // expression itself doesn't trigger a spurious bad.
+    fn close(a: f64, b: f64, tol: f64) -> bool {
+        let diff = if a > b { a - b } else { b - a };
+        diff < tol
+    }
+
+    let trig_ok = unsafe {
+        close(narf_libc::sin(0.0),                      0.0, 1e-9)
+            && close(narf_libc::sin(1.570_796_326_794_896_6),  1.0, 1e-9)
+            && close(narf_libc::sin(3.141_592_653_589_793_2),  0.0, 1e-7)
+            && close(narf_libc::cos(0.0),                      1.0, 1e-9)
+            && close(narf_libc::cos(3.141_592_653_589_793_2), -1.0, 1e-7)
+            && close(narf_libc::tan(0.785_398_163_397_448_3),  1.0, 1e-7)
+    };
+    narf_libc::printf_str(
+        if trig_ok { "trig: ok\n" } else { "trig: bad\n" },
+        &[],
+    );
+
+    let exp_ok = unsafe {
+        close(narf_libc::exp(0.0),  1.0, 1e-12)
+            && close(narf_libc::exp(1.0),  2.718_281_828_459_045, 1e-9)
+            && close(narf_libc::exp(-1.0), 0.367_879_441_171_442_3, 1e-9)
+            && close(narf_libc::log(1.0), 0.0, 1e-12)
+            && close(narf_libc::log(2.718_281_828_459_045_2), 1.0, 1e-9)
+            && close(narf_libc::log2(8.0), 3.0, 1e-9)
+            && close(narf_libc::log10(1000.0), 3.0, 1e-7)
+    };
+    narf_libc::printf_str(
+        if exp_ok { "exp: ok\n" } else { "exp: bad\n" },
+        &[],
+    );
+
+    let pow_ok = unsafe {
+        close(narf_libc::pow(2.0, 10.0), 1024.0, 1e-6)
+            && close(narf_libc::pow(2.0, 0.5), 1.414_213_562_373_095, 1e-6)
+            && narf_libc::pow(0.0, 5.0) == 0.0
+            && narf_libc::pow(5.0, 0.0) == 1.0
+            && close(narf_libc::pow(-2.0, 3.0), -8.0, 1e-9)
+    };
+    narf_libc::printf_str(
+        if pow_ok { "pow: ok\n" } else { "pow: bad\n" },
+        &[],
+    );
+
+    let atan_ok = unsafe {
+        close(narf_libc::atan(0.0),                      0.0, 1e-12)
+            && close(narf_libc::atan(1.0),                0.785_398_163_397_448_3, 1e-9)
+            && close(narf_libc::atan(-1.0),              -0.785_398_163_397_448_3, 1e-9)
+            && close(narf_libc::atan2(1.0, 1.0),          0.785_398_163_397_448_3, 1e-9)
+            && close(narf_libc::atan2(1.0, -1.0),         2.356_194_490_192_345_0, 1e-9)
+            && close(narf_libc::atan2(-1.0, -1.0),       -2.356_194_490_192_345_0, 1e-9)
+            && narf_libc::atan2(0.0, 0.0) == 0.0
+    };
+    narf_libc::printf_str(
+        if atan_ok { "atan: ok\n" } else { "atan: bad\n" },
+        &[],
+    );
+
     // atexit registration — `cleanup` runs after `main` returns,
     // BEFORE the kernel-side exit_task. The ordering proves the
     // dispatch loop in `narf_libc::exit` walks the table.
