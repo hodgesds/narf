@@ -12327,3 +12327,23 @@ fn smoke_filesystem_devfs_random_urandom() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_filesystem_devfs_random_urandom);
+
+fn smoke_filesystem_devfs_mount_default_idempotent() -> TestResult {
+    use narf_filesystem::{mount_devfs_default, registry};
+
+    // Mount via the boot helper. Twice — second call should be a
+    // benign no-op (Busy-error swallowed internally).
+    mount_devfs_default();
+    mount_devfs_default();
+
+    // /dev is reachable: resolve_absolute against /dev/null finds
+    // a DirOps lookup hit.
+    let ops = registry().resolve_absolute("/dev/null", |fs, rel| {
+        narf_filesystem::resolve(fs.root(), rel).ok()
+    }).flatten();
+    if ops.is_none() {
+        return TestResult::Fail("mount_default did not mount /dev");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_filesystem_devfs_mount_default_idempotent);

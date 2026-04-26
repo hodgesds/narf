@@ -208,3 +208,12 @@ impl FsInstance for DevFs {
     fn root(&self) -> Arc<dyn DirOps> { Arc::new(DevDir) }
     fn name(&self) -> &str { &self.name }
 }
+
+/// Boot helper: mount DevFs at `/dev` if no FS is already mounted
+/// there. Idempotent — re-running silently no-ops on `Busy`.
+/// Use during kernel init to give every user task /dev/null,
+/// /dev/zero, /dev/random, /dev/urandom out of the box.
+pub fn mount_default() {
+    let auth = crate::bootstrap_mount_authority();
+    let _ = crate::registry().mount(&auth, "/dev", DevFs::new());
+}

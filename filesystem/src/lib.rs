@@ -64,7 +64,7 @@ pub mod devfs;
 pub mod fuse;
 pub mod memfs;
 pub mod page_cache;
-pub use devfs::DevFs;
+pub use devfs::{mount_default as mount_devfs_default, DevFs};
 pub use fuse::{
     FuseInHeader, FuseInitFlag, FuseInitIn, FuseInitOut, FuseOpcode,
     FuseOutHeader, FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION,
