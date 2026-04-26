@@ -999,6 +999,88 @@ pub extern "C" fn main(
     }
     narf_libc::printf_str("perror: ok\n", &[]);
 
+    // ── Tier 3k probes: time.h breakdown ─────────────────────────
+    //
+    // gmtime + mktime + strftime against a known epoch second.
+    // 1700000000 = 2023-11-14 22:13:20 UTC (Tue, day-of-year 318).
+    // Round-trip the value through mktime to confirm it returns the
+    // same time_t.
+    let known: narf_libc::time::time_t = 1_700_000_000;
+    let mut tmv = narf_libc::tm::default();
+    let _ = unsafe {
+        narf_libc::gmtime_r(&known as *const _, &mut tmv as *mut _)
+    };
+    let gmt_ok = tmv.tm_year == 2023 - 1900
+        && tmv.tm_mon == 10  // November (0-indexed)
+        && tmv.tm_mday == 14
+        && tmv.tm_hour == 22
+        && tmv.tm_min == 13
+        && tmv.tm_sec == 20
+        && tmv.tm_wday == 2  // Tuesday
+        && tmv.tm_yday == 317; // 0-indexed day-of-year
+    narf_libc::printf_str(
+        if gmt_ok { "gmtime: ok\n" } else { "gmtime: bad\n" },
+        &[],
+    );
+
+    // mktime round-trip.
+    let mut tm_round = tmv;
+    let back = unsafe { narf_libc::mktime(&mut tm_round as *mut _) };
+    let mktime_ok = back == known
+        && tm_round.tm_wday == 2
+        && tm_round.tm_yday == 317;
+    narf_libc::printf_str(
+        if mktime_ok { "mktime: ok\n" } else { "mktime: bad\n" },
+        &[],
+    );
+
+    // strftime — emit a known format and compare bytes.
+    let mut sf: [u8; 64] = [0; 64];
+    let n_sf = unsafe {
+        narf_libc::strftime(
+            sf.as_mut_ptr(),
+            sf.len(),
+            b"%Y-%m-%d %H:%M:%S %a %b\0".as_ptr(),
+            &tmv as *const _,
+        )
+    };
+    let want_sf: &[u8] = b"2023-11-14 22:13:20 Tue Nov";
+    let strftime_ok = n_sf == want_sf.len()
+        && sf[..want_sf.len()] == *want_sf
+        && sf[want_sf.len()] == 0;
+    narf_libc::printf_str(
+        if strftime_ok { "strftime: ok\n" } else { "strftime: bad\n" },
+        &[],
+    );
+
+    // asctime fixed format — exactly 25 chars + NUL ("Tue Nov 14
+    // 22:13:20 2023\n").
+    let asc_ptr = unsafe { narf_libc::asctime(&tmv as *const _) };
+    let asctime_ok = unsafe {
+        let want: &[u8] = b"Tue Nov 14 22:13:20 2023\n";
+        let mut ok = !asc_ptr.is_null();
+        if ok {
+            for (i, b) in want.iter().enumerate() {
+                if *asc_ptr.add(i) != *b { ok = false; break; }
+            }
+            if ok && *asc_ptr.add(want.len()) != 0 { ok = false; }
+        }
+        ok
+    };
+    narf_libc::printf_str(
+        if asctime_ok { "asctime: ok\n" } else { "asctime: bad\n" },
+        &[],
+    );
+
+    // difftime — pure subtraction; exact for integer values.
+    let diff_ok = unsafe {
+        narf_libc::difftime(known + 90, known) == 90.0
+    };
+    narf_libc::printf_str(
+        if diff_ok { "difftime: ok\n" } else { "difftime: bad\n" },
+        &[],
+    );
+
     // atexit registration — `cleanup` runs after `main` returns,
     // BEFORE the kernel-side exit_task. The ordering proves the
     // dispatch loop in `narf_libc::exit` walks the table.
