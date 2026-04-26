@@ -2194,6 +2194,79 @@ pub extern "C" fn main(
         &[],
     );
 
+    // ── Tier 3z probes: mmap/uname/sysinfo/dlopen ────────────────
+
+    // mmap anonymous → munmap round-trip; mprotect / mlock no-op
+    // success; dlopen returns NULL with dlerror non-NULL once.
+    let mmap_ok = unsafe {
+        let p = narf_libc::mmap(
+            core::ptr::null_mut(),
+            4096,
+            narf_libc::PROT_READ | narf_libc::PROT_WRITE,
+            narf_libc::MAP_PRIVATE | narf_libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        let allocated = !p.is_null() && p != narf_libc::MAP_FAILED;
+        let protected = narf_libc::mprotect(p, 4096, narf_libc::PROT_READ) == 0;
+        let locked = narf_libc::mlock(p, 4096) == 0;
+        let unmapped = if allocated {
+            narf_libc::munmap(p, 4096) == 0
+        } else { false };
+        allocated && protected && locked && unmapped
+    };
+    narf_libc::printf_str(
+        if mmap_ok { "mmap: ok\n" } else { "mmap: bad\n" },
+        &[],
+    );
+
+    // uname populates a known string in `sysname`.
+    let uname_ok = unsafe {
+        let mut u: narf_libc::utsname = core::mem::zeroed();
+        let r = narf_libc::uname(&mut u);
+        let want: &[u8] = b"NARF\0";
+        let mut ok = r == 0;
+        for (i, &b) in want.iter().enumerate() {
+            if u.sysname[i] != b as i8 { ok = false; break; }
+        }
+        ok
+    };
+    narf_libc::printf_str(
+        if uname_ok { "uname: ok\n" } else { "uname: bad\n" },
+        &[],
+    );
+
+    // sysinfo populates totalram = 256 MiB; getrusage zeroes; getrlimit infinite.
+    let sysinfo_ok = unsafe {
+        let mut s = narf_libc::sysinfo_t::default();
+        narf_libc::sysinfo(&mut s);
+        let mut ru = narf_libc::rusage::default();
+        narf_libc::getrusage(narf_libc::RUSAGE_SELF, &mut ru);
+        let mut rl = narf_libc::rlimit::default();
+        narf_libc::getrlimit(narf_libc::RLIMIT_NOFILE, &mut rl);
+        s.totalram == 256 * 1024 * 1024
+            && s.procs == 1
+            && ru.ru_maxrss == 0
+            && rl.rlim_cur == narf_libc::RLIM_INFINITY
+    };
+    narf_libc::printf_str(
+        if sysinfo_ok { "sysinfo: ok\n" } else { "sysinfo: bad\n" },
+        &[],
+    );
+
+    // dlopen returns NULL; dlerror returns a non-null string once
+    // then NULL on the next call.
+    let dl_ok = unsafe {
+        let h = narf_libc::dlopen(b"foo.so\0".as_ptr() as *const i8, narf_libc::RTLD_NOW);
+        let e1 = narf_libc::dlerror();
+        let e2 = narf_libc::dlerror();
+        h.is_null() && !e1.is_null() && e2.is_null()
+    };
+    narf_libc::printf_str(
+        if dl_ok { "dlopen: ok\n" } else { "dlopen: bad\n" },
+        &[],
+    );
+
     // atexit registration — `cleanup` runs after `main` returns,
     // BEFORE the kernel-side exit_task. The ordering proves the
     // dispatch loop in `narf_libc::exit` walks the table.

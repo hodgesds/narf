@@ -50,6 +50,7 @@ pub mod poll;
 pub mod posix;
 pub mod pthread;
 pub mod regex;
+pub mod sys;
 pub mod term;
 pub mod process;
 pub mod setjmp;
@@ -135,6 +136,14 @@ pub use posix::{
     rename as posix_rename, rmdir as posix_rmdir, sysconf, unlink as posix_unlink,
     write as posix_write, O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
     SEEK_CUR, SEEK_END, SEEK_SET, _SC_OPEN_MAX, _SC_PAGESIZE, _SC_PAGE_SIZE,
+};
+pub use sys::{
+    dlclose, dlerror, dlopen, dlsym, getrlimit, getrusage, madvise, mlock, mlockall,
+    mmap, mprotect, munlock, munlockall, munmap, rlimit, rusage, setrlimit, sysinfo,
+    sysinfo_t, uname, utsname, MAP_ANONYMOUS, MAP_FAILED, MAP_FIXED, MAP_PRIVATE,
+    MAP_SHARED, PROT_EXEC, PROT_NONE, PROT_READ, PROT_WRITE, RLIMIT_AS, RLIMIT_CORE,
+    RLIMIT_CPU, RLIMIT_DATA, RLIMIT_FSIZE, RLIMIT_NOFILE, RLIMIT_STACK, RLIM_INFINITY,
+    RTLD_GLOBAL, RTLD_LAZY, RTLD_LOCAL, RTLD_NOW, RUSAGE_CHILDREN, RUSAGE_SELF,
 };
 pub use term::{
     flock, futimens, ioctl, tcdrain, tcflush, tcgetattr, tcsetattr, termios,
