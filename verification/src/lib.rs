@@ -12275,3 +12275,55 @@ fn smoke_filesystem_devfs_null_zero() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_filesystem_devfs_null_zero);
+
+fn smoke_filesystem_devfs_random_urandom() -> TestResult {
+    use core::pin::Pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use narf_filesystem::{
+        bootstrap_mount_authority, registry, DevFs,
+    };
+
+    fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
+        fn raw_waker() -> RawWaker {
+            unsafe fn no_clone(_: *const ()) -> RawWaker { raw_waker() }
+            unsafe fn no_op(_: *const ()) {}
+            const VTAB: RawWakerVTable = RawWakerVTable::new(
+                no_clone, no_op, no_op, no_op,
+            );
+            RawWaker::new(core::ptr::null(), &VTAB)
+        }
+        let waker = unsafe { Waker::from_raw(raw_waker()) };
+        let mut cx = Context::from_waker(&waker);
+        let pinned = unsafe { Pin::new_unchecked(&mut fut) };
+        match pinned.poll(&mut cx) {
+            Poll::Ready(v) => Some(v),
+            Poll::Pending  => None,
+        }
+    }
+
+    let auth = bootstrap_mount_authority();
+    let _ = registry().mount(&auth, "/dev", DevFs::new());
+
+    // Each of /dev/random and /dev/urandom must (a) succeed reading
+    // 16 bytes and (b) produce a not-all-zero buffer.
+    for path in ["/dev/random", "/dev/urandom"] {
+        let ops = registry().resolve_absolute(path, |fs, rel| {
+            narf_filesystem::resolve(fs.root(), rel).ok()
+        }).flatten();
+        let ops = match ops {
+            Some(o) => o,
+            None    => return TestResult::Fail("resolve dev rng failed"),
+        };
+        let mut buf = [0u8; 16];
+        let r = poll_once(ops.read(0, &mut buf));
+        if !matches!(r, Some(Ok(n)) if n == 16) {
+            return TestResult::Fail("rng read != 16");
+        }
+        if buf.iter().all(|&b| b == 0) {
+            return TestResult::Fail("rng buffer is all zeros");
+        }
+    }
+
+    TestResult::Pass
+}
+kernel_test!(smoke_filesystem_devfs_random_urandom);
