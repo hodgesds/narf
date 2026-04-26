@@ -53,6 +53,7 @@ pub mod pthread;
 pub mod random;
 pub mod regex;
 pub mod sys;
+pub mod sysvipc;
 pub mod term;
 pub mod process;
 pub mod setjmp;
@@ -151,6 +152,12 @@ pub use sys::{
     MAP_SHARED, PROT_EXEC, PROT_NONE, PROT_READ, PROT_WRITE, RLIMIT_AS, RLIMIT_CORE,
     RLIMIT_CPU, RLIMIT_DATA, RLIMIT_FSIZE, RLIMIT_NOFILE, RLIMIT_STACK, RLIM_INFINITY,
     RTLD_GLOBAL, RTLD_LAZY, RTLD_LOCAL, RTLD_NOW, RUSAGE_CHILDREN, RUSAGE_SELF,
+};
+pub use sysvipc::{
+    ftok, ipc_perm, msgctl, msgget, msgrcv, msgsnd, msqid_ds, sembuf, semctl, semget,
+    semid_ds, semop, shmat, shmctl, shmdt, shmget, shmid_ds, IPC_CREAT, IPC_EXCL,
+    IPC_INFO, IPC_NOWAIT, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, MSG_EXCEPT,
+    MSG_NOERROR, SEM_UNDO, SHM_EXEC, SHM_RDONLY, SHM_REMAP, SHM_RND,
 };
 pub use term::{
     flock, futimens, ioctl, tcdrain, tcflush, tcgetattr, tcsetattr, termios,

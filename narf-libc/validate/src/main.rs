@@ -2453,6 +2453,55 @@ pub extern "C" fn main(
         &[],
     );
 
+    // ── Tier 3ad probes: System V IPC (all ENOSYS bar ftok) ──────
+
+    // ftok hashes the path + proj_id; same input → same key, low 8
+    // bits encode the proj_id.
+    let ftok_ok = unsafe {
+        let k1 = narf_libc::ftok(b"/tmp/narf\0".as_ptr() as *const i8, 0x42);
+        let k2 = narf_libc::ftok(b"/tmp/narf\0".as_ptr() as *const i8, 0x42);
+        let k3 = narf_libc::ftok(b"/tmp/other\0".as_ptr() as *const i8, 0x42);
+        let kn = narf_libc::ftok(core::ptr::null(), 0x42);
+        k1 == k2
+            && k1 != k3
+            && (k1 >> 24) & 0xFF == 0x42
+            && kn == -1
+    };
+    narf_libc::printf_str(
+        if ftok_ok { "ftok: ok\n" } else { "ftok: bad\n" },
+        &[],
+    );
+
+    // shm/msg/sem all refuse with -1 / ENOSYS; shmat returns (void*)-1.
+    let ipc_ok = unsafe {
+        let r1 = narf_libc::shmget(0, 4096, 0);
+        let r2 = narf_libc::shmat(0, core::ptr::null(), 0);
+        let r3 = narf_libc::shmdt(core::ptr::null());
+        let r4 = narf_libc::shmctl(0, 0, core::ptr::null_mut());
+        let r5 = narf_libc::msgget(0, 0);
+        let r6 = narf_libc::msgsnd(0, core::ptr::null(), 0, 0);
+        let r7 = narf_libc::msgrcv(0, core::ptr::null_mut(), 0, 0, 0);
+        let r8 = narf_libc::msgctl(0, 0, core::ptr::null_mut());
+        let r9 = narf_libc::semget(0, 1, 0);
+        let r10 = narf_libc::semop(0, core::ptr::null_mut(), 0);
+        let r11 = narf_libc::semctl(0, 0, 0);
+        r1 == -1
+            && r2 == !0usize as *mut core::ffi::c_void
+            && r3 == -1
+            && r4 == -1
+            && r5 == -1
+            && r6 == -1
+            && r7 == -1
+            && r8 == -1
+            && r9 == -1
+            && r10 == -1
+            && r11 == -1
+    };
+    narf_libc::printf_str(
+        if ipc_ok { "sysvipc: ok\n" } else { "sysvipc: bad\n" },
+        &[],
+    );
+
     // atexit registration — `cleanup` runs after `main` returns,
     // BEFORE the kernel-side exit_task. The ordering proves the
     // dispatch loop in `narf_libc::exit` walks the table.
