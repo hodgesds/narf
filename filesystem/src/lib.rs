@@ -61,11 +61,13 @@
 extern crate alloc;
 
 pub mod fuse;
+pub mod memfs;
 pub mod page_cache;
 pub use fuse::{
     FuseInHeader, FuseInitFlag, FuseInitIn, FuseInitOut, FuseOpcode,
     FuseOutHeader, FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION,
 };
+pub use memfs::MemFs;
 pub use page_cache::{Page, PageCache, PageKey, PAGE_SIZE};
 
 use alloc::boxed::Box;
@@ -235,6 +237,33 @@ pub trait DirOps: Send + Sync {
     /// trait stays object-safe; an `impl Iterator` shape would force
     /// a GAT. Names are `&'static str` per `DirEntry`'s comment.
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a>;
+
+    // ── Stage-4 r/w surface ──────────────────────────────────────
+    //
+    // These mutators carry a default returning `Unsupported` so the
+    // existing read-only FSes (initramfs, virtiofs skeleton) keep
+    // compiling without per-impl boilerplate. Mutable FSes
+    // (`MemFs`) override the relevant slots.
+    //
+    // Sync return type is intentional: today's mutable FS is
+    // in-memory + lock-protected, so an async surface would just box
+    // up a ready future. The async-variant lands alongside the
+    // first persistent r/w FS.
+
+    /// Remove the file entry named `name` from this directory.
+    /// Returns `NotFound` if the entry is absent, `Unsupported` on
+    /// read-only FSes, `InvalidPath` if `name` denotes a directory
+    /// (use `rmdir` for those).
+    fn unlink(&self, _name: &str) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+
+    /// Create a new empty file named `name` and return a handle. The
+    /// returned handle's `write` may immediately back-populate the
+    /// file. Returns `Busy` if the name already exists.
+    fn create(&self, _name: &str) -> Result<Arc<dyn FileOps>, FsError> {
+        Err(FsError::Unsupported)
+    }
 }
 
 // ── FsInstance ─────────────────────────────────────────────────────
@@ -437,6 +466,64 @@ impl VfsRegistry {
         // problem — `resolve` rejects empty paths).
         let rel = rel.strip_prefix('/').unwrap_or(rel);
         Some(f(&*m.fs, rel))
+    }
+
+    /// Resolve `abs` to its parent directory + leaf name and run
+    /// `f(fs, parent_dir, leaf)` against the result. Used by
+    /// directory-mutation syscalls (`unlink` / `mkdir` / `rmdir`)
+    /// which need to walk to the parent and operate on the leaf.
+    ///
+    /// Splits at the LAST `/` of the relative-to-mount portion. So
+    /// `/tmp/foo` against a `/tmp` mount produces `(parent=root,
+    /// leaf="foo")`; `/tmp/sub/bar` produces `(parent=root.sub,
+    /// leaf="bar")`. The walk uses `lookup_dir` for every parent
+    /// segment and bails with `NotFound` if any intermediate is
+    /// absent. Returns `None` when no mount covers `abs`.
+    pub fn resolve_parent_absolute<R, F>(&self, abs: &str, f: F) -> Option<R>
+    where F: FnOnce(&dyn FsInstance, Arc<dyn DirOps>, &str) -> R {
+        if abs.is_empty() || abs.as_bytes()[0] != b'/' {
+            return None;
+        }
+        // Split at last `/`. Need at least one slash and a leaf.
+        let last = abs.rfind('/')?;
+        let parent_path = &abs[..last];
+        let leaf = &abs[last + 1..];
+        if leaf.is_empty() {
+            return None;
+        }
+        // The parent path may be empty (e.g. abs == "/foo" → parent
+        // == "/"). In that case we resolve against the root mount of
+        // the leaf's mount; conceptually the parent is the mount
+        // root itself.
+        let parent_path = if parent_path.is_empty() { "/" } else { parent_path };
+        let q = self.inner.lock();
+        // Match the longest mount prefix against `parent_path`.
+        let mut best: Option<&Mount> = None;
+        for m in q.iter() {
+            if parent_path == m.path
+                || (parent_path.starts_with(m.path)
+                    && parent_path.as_bytes().get(m.path.len()) == Some(&b'/'))
+            {
+                if best.map(|b| b.path.len()).unwrap_or(0) < m.path.len() {
+                    best = Some(m);
+                }
+            }
+        }
+        let m = best?;
+        let rel = &parent_path[m.path.len()..];
+        let rel = rel.strip_prefix('/').unwrap_or(rel);
+        // Walk segments to reach the parent dir.
+        let mut dir = m.fs.root();
+        for seg in rel.split('/') {
+            if seg.is_empty() || seg == "." {
+                continue;
+            }
+            if seg == ".." {
+                return None;
+            }
+            dir = dir.lookup_dir(seg)?;
+        }
+        Some(f(&*m.fs, dir, leaf))
     }
 
     /// Number of mounts.

@@ -6946,6 +6946,60 @@ fn smoke_filesystem_resolve_absolute_picks_longest_prefix() -> TestResult {
 }
 kernel_test!(smoke_filesystem_resolve_absolute_picks_longest_prefix);
 
+fn smoke_filesystem_memfs_unlink_round_trip() -> TestResult {
+    // Mount a MemFs at /test_unlink seeded with one file. The first
+    // resolve_parent_absolute → unlink should succeed; the second
+    // should hit NotFound (file already gone).
+    use narf_capabilities::{Cap, Grant};
+    use narf_filesystem::{
+        bootstrap_mount_authority, registry, FsError, MemFs, MountPoint,
+    };
+
+    let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+    let fs = MemFs::with_seeds("test-unlink", &[("doomed", b"x")]);
+    if registry().mount(&auth, "/test_unlink", fs).is_err() {
+        return TestResult::Fail("memfs mount failed");
+    }
+
+    // Pre-condition: lookup confirms the file exists via the open
+    // path (FileOps reachable through resolve_absolute).
+    let pre = registry().resolve_absolute("/test_unlink/doomed", |fs, rel| {
+        narf_filesystem::resolve(fs.root(), rel).is_ok()
+    });
+    if pre != Some(true) {
+        return TestResult::Fail("seeded file not findable pre-unlink");
+    }
+
+    // First unlink: success.
+    let r1 = registry().resolve_parent_absolute(
+        "/test_unlink/doomed",
+        |_fs, parent, leaf| parent.unlink(leaf),
+    );
+    if !matches!(r1, Some(Ok(()))) {
+        return TestResult::Fail("first unlink should succeed");
+    }
+
+    // Post-condition: lookup now misses.
+    let post = registry().resolve_absolute("/test_unlink/doomed", |fs, rel| {
+        narf_filesystem::resolve(fs.root(), rel).is_ok()
+    });
+    if post != Some(false) {
+        return TestResult::Fail("file still findable after unlink");
+    }
+
+    // Second unlink: NotFound.
+    let r2 = registry().resolve_parent_absolute(
+        "/test_unlink/doomed",
+        |_fs, parent, leaf| parent.unlink(leaf),
+    );
+    if !matches!(r2, Some(Err(FsError::NotFound))) {
+        return TestResult::Fail("second unlink should report NotFound");
+    }
+
+    TestResult::Pass
+}
+kernel_test!(smoke_filesystem_memfs_unlink_round_trip);
+
 fn smoke_userspace_open_routes_through_vfs() -> TestResult {
     use alloc::boxed::Box;
     use alloc::sync::Arc;
@@ -10962,6 +11016,11 @@ fn smoke_frame_x86_64_run_narf_libc_validate() -> TestResult {
     //                    distinct-live-chunks, free-list-reuse, and
     //                    realloc-grow probes (see narf-libc-validate
     //                    `heap_probe`).
+    //   unlink: ok    <- Tier-3b VFS remove: posix_unlink("/tmp/removable")
+    //                    returns 0 on the seeded MemFs entry; the
+    //                    second call returns -1 because the entry is
+    //                    gone. Proves the real DirOps::unlink path,
+    //                    not a no-op stub.
     //   atoi: ok      <- Tier-3a stdlib: leading whitespace + sign +
     //                    digit-stop on non-digit ("  -42xyz" -> -42).
     //   strtol: ok    <- 0x prefix + endptr writeback ("0xdeadbeef ").
@@ -10988,6 +11047,37 @@ fn smoke_frame_x86_64_run_narf_libc_validate() -> TestResult {
     narf_userspace::cwd_init();
     narf_userspace::fd::__test_reset();
     narf_userspace::fd::init();
+
+    // Mount a MemFs at /tmp seeded with one file so the validate
+    // binary's unlink probe has a real target. The mount is allowed
+    // to fail with `Busy` if a prior test left /tmp mounted; in that
+    // case we proceed against the existing mount (which still
+    // implements unlink because it's the same MemFs left in place).
+    let auth_v = narf_filesystem::bootstrap_mount_authority();
+    match narf_filesystem::registry().mount(
+        &auth_v,
+        "/tmp",
+        narf_filesystem::MemFs::with_seeds(
+            "validate-tmp",
+            &[("removable", b"bye")],
+        ),
+    ) {
+        Ok(_) => {}
+        Err(narf_filesystem::FsError::Busy) => {
+            // Re-seed the existing mount so the probe finds the file.
+            let _ = narf_filesystem::registry().resolve_parent_absolute(
+                "/tmp/removable",
+                |_fs, parent, _leaf| parent.create("removable"),
+            );
+        }
+        Err(e) => {
+            return TestResult::Fail(match e {
+                narf_filesystem::FsError::PermissionDenied => "tmp mount: perm",
+                narf_filesystem::FsError::ReadOnly         => "tmp mount: ro",
+                _                                          => "tmp mount: other",
+            });
+        }
+    }
 
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);

@@ -918,15 +918,37 @@ fn sys_lseek(ctx: &mut dyn TrapContext) {
 
 // ── Unlink — arg0=path_ptr, arg1=path_len ──────────────────────────
 //
-// Stage-4: stub. The VFS does not yet expose a remove API (no
-// `FsInstance::unlink` method), so the syscall slot is reserved and
-// the handler returns `InvalidOp` (ENOSYS-equivalent). When VFS gains
-// remove, swap the body for a `vfs::resolve_absolute(path, |fs, ino|
-// fs.unlink(ino))` call.
+// Splits the absolute path at the last `/`, walks the parent dir via
+// the VFS registry, and dispatches to that DirOps's `unlink(leaf)`.
+// FSes that haven't overridden the trait default surface
+// `FsError::Unsupported`, which we translate to `InvalidOp` on the
+// wire (no errno channel today).
+
 fn sys_unlink(ctx: &mut dyn TrapContext) {
-    let _args = *ctx.args();
-    // TODO(narf-vfs): implement once VFS has a remove path.
-    ctx.set_return(SyscallReturn::invalid_op());
+    let args = *ctx.args();
+    let ptr  = args.arg0 as *const u8;
+    let len  = args.arg1 as usize;
+    // POSIX-shaped failure sentinel. The kernel's syscall ABI carries
+    // a separate `status` field but the user-runtime asm wrapper only
+    // observes the `value` register; we mirror libc and return -1 on
+    // failure so the caller can distinguish from a success return of 0.
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if ptr.is_null() || len == 0 {
+        ctx.set_return(fail);
+        return;
+    }
+    // SAFETY: user pointer in active AS, length-bounded.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+    let path = match core::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => { ctx.set_return(fail); return; }
+    };
+    let outcome = narf_filesystem::registry()
+        .resolve_parent_absolute(path, |_fs, parent, leaf| parent.unlink(leaf));
+    match outcome {
+        Some(Ok(())) => ctx.set_return(SyscallReturn::ok(0)),
+        _            => ctx.set_return(fail),
+    }
 }
 
 // ── Close — arg0=fd ────────────────────────────────────────────────

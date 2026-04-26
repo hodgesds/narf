@@ -353,6 +353,27 @@ pub extern "C" fn main(
         &[],
     );
 
+    // ── Tier 3b probe: VFS unlink against /tmp MemFs ─────────────
+    //
+    // The kernel test bootstrap mounted a MemFs at /tmp seeded with
+    // `removable`. First unlink should succeed (returns 0), second
+    // should fail (target absent → kernel returns InvalidOp → libc
+    // surface returns -1). The existence of the second-call failure
+    // proves we hit the live remove path rather than a no-op stub
+    // that always succeeds.
+    //
+    // SAFETY: posix_unlink takes a NUL-terminated C string.
+    let path: *const i8 = b"/tmp/removable\0".as_ptr() as *const i8;
+    let unlink_ok = unsafe {
+        let r1 = narf_libc::posix_unlink(path);
+        let r2 = narf_libc::posix_unlink(path);
+        r1 == 0 && r2 == -1
+    };
+    narf_libc::printf_str(
+        if unlink_ok { "unlink: ok\n" } else { "unlink: bad\n" },
+        &[],
+    );
+
     // ── Tier 3a probes: stdlib + isatty + signal ─────────────────
     //
     // atoi / strtol / qsort / bsearch round-trips. Each has one
