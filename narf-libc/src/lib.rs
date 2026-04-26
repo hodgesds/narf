@@ -32,6 +32,7 @@ extern "C" {
 }
 
 pub mod arch;
+pub mod ctype;
 pub mod env;
 pub mod errno;
 pub mod fd;
@@ -48,6 +49,10 @@ pub mod string;
 pub mod time;
 
 pub use arch::_start;
+pub use ctype::{
+    isalnum, isalpha, isascii, iscntrl, isdigit, isgraph, islower, isprint,
+    ispunct, isspace, isupper, isxdigit, tolower, toupper,
+};
 pub use env::{getenv, getenv_cstr, putenv, setenv, unsetenv, ENVIRON};
 pub use errno::{errno, set_errno, __errno_location};
 pub use fd::{

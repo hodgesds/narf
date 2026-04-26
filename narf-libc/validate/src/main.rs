@@ -410,17 +410,83 @@ pub extern "C" fn main(
         &[],
     );
 
-    // mkdir / rmdir — flat MemFs returns Unsupported on both, so the
-    // probe asserts the syscall is wired and surfaces -1 cleanly
-    // (rather than panicking or returning a spurious 0). When MemFs
-    // grows hierarchy this probe should switch to expecting success.
-    let dir_path: *const i8 = b"/tmp/somedir\0".as_ptr() as *const i8;
-    let mkdir_stub_ok = unsafe {
-        narf_libc::posix_mkdir(dir_path, 0o755) == -1
-            && narf_libc::posix_rmdir(dir_path) == -1
+    // ── Tier 3d: hierarchical MemFs + write/read round-trip ──────
+    //
+    // MemFs is now hierarchical. The mkdir+rmdir probe:
+    //   1. mkdir /tmp/sub                       → 0
+    //   2. mkdir /tmp/sub again                 → -1 (Busy)
+    //   3. open  /tmp/sub/inner with O_CREAT    → fd ≥ 3
+    //   4. rmdir /tmp/sub (non-empty)           → -1 (Busy)
+    //   5. unlink /tmp/sub/inner                → 0
+    //   6. rmdir /tmp/sub (now empty)           → 0
+    let dir_path:   *const i8 = b"/tmp/sub\0".as_ptr() as *const i8;
+    let inner_path: *const i8 = b"/tmp/sub/inner\0".as_ptr() as *const i8;
+    let mkdir_ok = unsafe {
+        let m1 = narf_libc::posix_mkdir(dir_path, 0o755);
+        let m2 = narf_libc::posix_mkdir(dir_path, 0o755);
+        let fd = narf_libc::posix_open(inner_path, narf_libc::O_CREAT, 0);
+        let r1 = narf_libc::posix_rmdir(dir_path);
+        let _  = narf_libc::posix_close(fd);
+        let u  = narf_libc::posix_unlink(inner_path);
+        let r2 = narf_libc::posix_rmdir(dir_path);
+        m1 == 0 && m2 == -1 && fd >= 3 && r1 == -1 && u == 0 && r2 == 0
     };
     narf_libc::printf_str(
-        if mkdir_stub_ok { "mkdir: stub\n" } else { "mkdir: bad\n" },
+        if mkdir_ok { "mkdir: ok\n" } else { "mkdir: bad\n" },
+        &[],
+    );
+
+    // write/read round-trip — open a fresh file, write a payload,
+    // close, reopen, read back, compare. Proves the FileOps path
+    // through MemFile's Mutex<Vec<u8>> end-to-end.
+    let rw_path: *const i8 = b"/tmp/io\0".as_ptr() as *const i8;
+    let payload: &[u8] = b"narf-libc rw round-trip!";
+    let mut readback: [u8; 32] = [0; 32];
+    let rw_ok = unsafe {
+        let fd_w = narf_libc::posix_open(rw_path, narf_libc::O_CREAT, 0);
+        if fd_w < 0 { false } else {
+            let n = narf_libc::posix_write(
+                fd_w,
+                payload.as_ptr() as *const core::ffi::c_void,
+                payload.len(),
+            );
+            let _ = narf_libc::posix_close(fd_w);
+            if n as usize != payload.len() { false } else {
+                let fd_r = narf_libc::posix_open(rw_path, 0, 0);
+                if fd_r < 0 { false } else {
+                    let m = narf_libc::posix_read(
+                        fd_r,
+                        readback.as_mut_ptr() as *mut core::ffi::c_void,
+                        readback.len(),
+                    );
+                    let _ = narf_libc::posix_close(fd_r);
+                    let _ = narf_libc::posix_unlink(rw_path);
+                    m as usize == payload.len()
+                        && &readback[..payload.len()] == payload
+                }
+            }
+        }
+    };
+    narf_libc::printf_str(
+        if rw_ok { "rw: ok\n" } else { "rw: bad\n" },
+        &[],
+    );
+
+    // ctype probe — exercise a representative slice of the
+    // classification + case-fold surface. SAFETY: pure value math.
+    let ctype_ok = unsafe {
+        narf_libc::isdigit(b'7' as i32) != 0
+            && narf_libc::isdigit(b'a' as i32) == 0
+            && narf_libc::isalpha(b'Z' as i32) != 0
+            && narf_libc::isspace(b' ' as i32) != 0
+            && narf_libc::isxdigit(b'F' as i32) != 0
+            && narf_libc::isxdigit(b'g' as i32) == 0
+            && narf_libc::tolower(b'Q' as i32) == b'q' as i32
+            && narf_libc::toupper(b'q' as i32) == b'Q' as i32
+            && narf_libc::isascii(0x80) == 0
+    };
+    narf_libc::printf_str(
+        if ctype_ok { "ctype: ok\n" } else { "ctype: bad\n" },
         &[],
     );
 

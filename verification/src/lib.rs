@@ -11032,10 +11032,14 @@ fn smoke_frame_x86_64_run_narf_libc_validate() -> TestResult {
     //   rename: ok    <- Tier-3c same-directory rename:
     //                    /tmp/created -> /tmp/renamed; the new name
     //                    opens, the old name doesn't.
-    //   mkdir: stub   <- Tier-3c mkdir+rmdir wired but MemFs is flat
-    //                    and returns Unsupported; the syscall round-
-    //                    trips a -1 sentinel cleanly (proves the
-    //                    plumbing without requiring hierarchy).
+    //   mkdir: ok     <- Tier-3d hierarchical MemFs: full mkdir +
+    //                    open-in-subdir + rmdir-busy + unlink +
+    //                    rmdir-empty round-trip.
+    //   rw: ok        <- Tier-3d write/read round-trip: open(O_CREAT),
+    //                    write payload, close, reopen, read back,
+    //                    compare bytes.
+    //   ctype: ok     <- Tier-3d <ctype.h>: isdigit/isalpha/isspace/
+    //                    isxdigit + tolower/toupper round-trip.
     //   atoi: ok      <- Tier-3a stdlib: leading whitespace + sign +
     //                    digit-stop on non-digit ("  -42xyz" -> -42).
     //   strtol: ok    <- 0x prefix + endptr writeback ("0xdeadbeef ").

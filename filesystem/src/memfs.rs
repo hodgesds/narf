@@ -1,17 +1,21 @@
-//! `MemFs` — an in-memory read/write filesystem.
+//! `MemFs` — an in-memory read/write filesystem with hierarchy.
 //!
 //! Stage-4 surface for exercising the mutable [`DirOps`] paths
-//! (`unlink`, `create`, eventually `mkdir`/`rmdir`/`rename`). Designed
-//! for the `/tmp` mount in the validate harness — small files, single
-//! flat directory, no persistence. Concurrency: a single
-//! `IrqSafeSpinLock` over the file map; writes are serialised through
-//! it. The validate harness is single-threaded so this is uncontended.
+//! (`unlink`, `create`, `mkdir`, `rmdir`, `rename`). Designed for the
+//! `/tmp` mount in the validate harness — small files, nested
+//! directories, no persistence. Concurrency: a single
+//! `IrqSafeSpinLock` per directory over the entry map; mutations are
+//! serialised through it. The validate harness is single-threaded so
+//! this is uncontended.
 //!
-//! Layout: `BTreeMap<String, Arc<MemFile>>`. Each `MemFile` carries a
-//! `Mutex<Vec<u8>>` so concurrent writers / readers see a consistent
-//! length+contents tuple. `unlink` removes the entry from the map but
-//! keeps the file's `Arc` alive for any outstanding fd holders — the
-//! bytes go away when the last fd drops, matching POSIX semantics.
+//! Layout: each directory owns a `BTreeMap<String, Entry>` where
+//! `Entry` is either a `File(Arc<MemFile>)` or a `Dir(Arc<MemDir>)`.
+//! `MemFile` carries a `Mutex<Vec<u8>>` so concurrent writers /
+//! readers see a consistent length+contents tuple. `unlink` removes
+//! the entry from the parent map but keeps the file's `Arc` alive
+//! for any outstanding fd holders — the bytes go away when the last
+//! fd drops, matching POSIX semantics. `rmdir` rejects non-empty
+//! directories (POSIX EEXIST→`Busy`).
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -78,19 +82,134 @@ impl FileOps for MemFile {
     }
 }
 
+/// One directory entry. The discriminant carries either an `Arc`-
+/// owned file or an `Arc`-owned subdirectory; both kinds drop their
+/// underlying storage when the last reference disappears.
+#[derive(Debug)]
+enum Entry {
+    File(Arc<MemFile>),
+    Dir(Arc<MemDir>),
+}
+
+/// A directory node: owns the `BTreeMap` of children behind a lock.
+/// `MemDir` is the unit of recursion — both the root and every
+/// subdirectory created via `mkdir` are `MemDir`s.
+struct MemDir {
+    entries: IrqSafeSpinLock<BTreeMap<String, Entry>>,
+}
+
+impl fmt::Debug for MemDir {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MemDir")
+            .field("entries", &self.entries.lock().len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl DirOps for MemDir {
+    fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+        let g = self.entries.lock();
+        match g.get(name)? {
+            Entry::File(f) => Some(Arc::clone(f) as Arc<dyn FileOps>),
+            Entry::Dir(_)  => None,
+        }
+    }
+
+    fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
+        let g = self.entries.lock();
+        match g.get(name)? {
+            Entry::Dir(d)  => Some(Arc::clone(d) as Arc<dyn DirOps>),
+            Entry::File(_) => None,
+        }
+    }
+
+    fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
+        // DirEntry::name is &'static — we can't synthesise that from
+        // String keys. Stage-4 widens DirEntry to owned String; until
+        // then iter() returns empty for the mutable FS. Callers that
+        // need contents probe via lookup()/lookup_dir() against
+        // known names.
+        Box::new(core::iter::empty())
+    }
+
+    fn unlink(&self, name: &str) -> Result<(), FsError> {
+        let mut g = self.entries.lock();
+        match g.get(name) {
+            None                   => Err(FsError::NotFound),
+            Some(Entry::Dir(_))    => Err(FsError::InvalidPath),
+            Some(Entry::File(_))   => {
+                g.remove(name);
+                Ok(())
+            }
+        }
+    }
+
+    fn create(&self, name: &str) -> Result<Arc<dyn FileOps>, FsError> {
+        let mut g = self.entries.lock();
+        if g.contains_key(name) {
+            return Err(FsError::Busy);
+        }
+        let f = Arc::new(MemFile {
+            bytes: IrqSafeSpinLock::new(Vec::new()),
+        });
+        g.insert(name.to_string(), Entry::File(Arc::clone(&f)));
+        Ok(f as Arc<dyn FileOps>)
+    }
+
+    fn mkdir(&self, name: &str) -> Result<Arc<dyn DirOps>, FsError> {
+        let mut g = self.entries.lock();
+        if g.contains_key(name) {
+            return Err(FsError::Busy);
+        }
+        let d = Arc::new(MemDir {
+            entries: IrqSafeSpinLock::new(BTreeMap::new()),
+        });
+        g.insert(name.to_string(), Entry::Dir(Arc::clone(&d)));
+        Ok(d as Arc<dyn DirOps>)
+    }
+
+    fn rmdir(&self, name: &str) -> Result<(), FsError> {
+        let mut g = self.entries.lock();
+        match g.get(name) {
+            None                  => Err(FsError::NotFound),
+            Some(Entry::File(_))  => Err(FsError::InvalidPath),
+            Some(Entry::Dir(d))   => {
+                if !d.entries.lock().is_empty() {
+                    return Err(FsError::Busy);
+                }
+                g.remove(name);
+                Ok(())
+            }
+        }
+    }
+
+    fn rename(&self, old_name: &str, new_name: &str) -> Result<(), FsError> {
+        let mut g = self.entries.lock();
+        if !g.contains_key(old_name) {
+            return Err(FsError::NotFound);
+        }
+        if g.contains_key(new_name) {
+            return Err(FsError::Busy);
+        }
+        let entry = g.remove(old_name).unwrap();
+        g.insert(new_name.to_string(), entry);
+        Ok(())
+    }
+}
+
 /// Mutable in-memory FS. Mount-time seeding is supported via
 /// [`MemFs::with_seeds`] so the validate harness can mount
 /// `/tmp` already populated with a few files for unlink/read probes.
 pub struct MemFs {
-    name:  &'static str,
-    files: Arc<IrqSafeSpinLock<BTreeMap<String, Arc<MemFile>>>>,
+    name: &'static str,
+    root: Arc<MemDir>,
 }
 
 impl fmt::Debug for MemFs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MemFs")
             .field("name", &self.name)
-            .field("files", &self.files.lock().len())
+            .field("root", &self.root)
             .finish_non_exhaustive()
     }
 }
@@ -100,97 +219,39 @@ impl MemFs {
     pub fn new(name: &'static str) -> Self {
         Self {
             name,
-            files: Arc::new(IrqSafeSpinLock::new(BTreeMap::new())),
+            root: Arc::new(MemDir {
+                entries: IrqSafeSpinLock::new(BTreeMap::new()),
+            }),
         }
     }
 
-    /// Construct with pre-seeded files. Each `(name, contents)` pair
-    /// becomes a regular file at `name` with `contents` bytes. Names
-    /// must not contain `/`.
+    /// Construct with pre-seeded files at the root. Each `(name,
+    /// contents)` pair becomes a regular file at the FS's root with
+    /// `contents` bytes. Names must not contain `/`.
     pub fn with_seeds(name: &'static str, seeds: &[(&str, &[u8])]) -> Self {
         let fs = Self::new(name);
         {
-            let mut g = fs.files.lock();
+            let mut g = fs.root.entries.lock();
             for (n, c) in seeds {
-                g.insert(
-                    (*n).to_string(),
-                    Arc::new(MemFile {
-                        bytes: IrqSafeSpinLock::new(c.to_vec()),
-                    }),
-                );
+                let f = Arc::new(MemFile {
+                    bytes: IrqSafeSpinLock::new(c.to_vec()),
+                });
+                g.insert((*n).to_string(), Entry::File(f));
             }
         }
         fs
+    }
+
+    /// Diagnostic: number of root-level entries currently in the FS.
+    /// Subdirectory contents are not counted recursively.
+    pub fn file_count(&self) -> usize {
+        self.root.entries.lock().len()
     }
 }
 
 impl FsInstance for MemFs {
     fn root(&self) -> Arc<dyn DirOps> {
-        Arc::new(MemFsRoot { files: Arc::clone(&self.files) })
+        Arc::clone(&self.root) as Arc<dyn DirOps>
     }
     fn name(&self) -> &str { self.name }
-}
-
-#[derive(Debug)]
-struct MemFsRoot {
-    files: Arc<IrqSafeSpinLock<BTreeMap<String, Arc<MemFile>>>>,
-}
-
-impl DirOps for MemFsRoot {
-    fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
-        let g = self.files.lock();
-        g.get(name)
-            .map(|f| Arc::clone(f) as Arc<dyn FileOps>)
-    }
-
-    fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
-        // DirEntry::name is &'static — we can't synthesise that from
-        // String keys. Stage-4 widens DirEntry to owned String; until
-        // then iter() returns empty for the mutable FS. Callers that
-        // need contents probe via lookup() against known names.
-        Box::new(core::iter::empty())
-    }
-
-    fn unlink(&self, name: &str) -> Result<(), FsError> {
-        let mut g = self.files.lock();
-        if g.remove(name).is_some() {
-            Ok(())
-        } else {
-            Err(FsError::NotFound)
-        }
-    }
-
-    fn create(&self, name: &str) -> Result<Arc<dyn FileOps>, FsError> {
-        let mut g = self.files.lock();
-        if g.contains_key(name) {
-            return Err(FsError::Busy);
-        }
-        let f = Arc::new(MemFile {
-            bytes: IrqSafeSpinLock::new(Vec::new()),
-        });
-        g.insert(name.to_string(), Arc::clone(&f));
-        Ok(f as Arc<dyn FileOps>)
-    }
-
-    fn rename(&self, old_name: &str, new_name: &str) -> Result<(), FsError> {
-        let mut g = self.files.lock();
-        if !g.contains_key(old_name) {
-            return Err(FsError::NotFound);
-        }
-        if g.contains_key(new_name) {
-            return Err(FsError::Busy);
-        }
-        // Unwrap is safe — `contains_key` already proved presence.
-        let entry = g.remove(old_name).unwrap();
-        g.insert(new_name.to_string(), entry);
-        Ok(())
-    }
-}
-
-impl MemFs {
-    /// Diagnostic: number of files currently in the FS. Reads under
-    /// the lock so the result is consistent with concurrent unlinks.
-    pub fn file_count(&self) -> usize {
-        self.files.lock().len()
-    }
 }
