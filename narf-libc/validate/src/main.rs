@@ -2343,6 +2343,76 @@ pub extern "C" fn main(
         &[],
     );
 
+    // ── Tier 3ab probes: getrandom + readv/writev ────────────────
+
+    // getrandom fills a buffer with non-zero bytes; deterministic
+    // PRNG output is fine for the smoke test.
+    let rand_ok = unsafe {
+        let mut buf: [u8; 32] = [0; 32];
+        let r = narf_libc::getrandom(
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+            buf.len(),
+            0,
+        );
+        // At least one byte should be non-zero — the PRNG seed is
+        // 0x9E37..; the first 8 bytes are a known mix.
+        let mut any_nz = false;
+        for &b in &buf {
+            if b != 0 { any_nz = true; break; }
+        }
+        r == buf.len() as isize && any_nz
+    };
+    narf_libc::printf_str(
+        if rand_ok { "getrandom: ok\n" } else { "getrandom: bad\n" },
+        &[],
+    );
+
+    // getentropy(257) → -1; getentropy(16) → 0.
+    let ent_ok = unsafe {
+        let mut buf: [u8; 16] = [0; 16];
+        let small = narf_libc::getentropy(
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+            16,
+        );
+        let big = narf_libc::getentropy(
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+            257,
+        );
+        small == 0 && big == -1
+    };
+    narf_libc::printf_str(
+        if ent_ok { "getentropy: ok\n" } else { "getentropy: bad\n" },
+        &[],
+    );
+
+    // writev(stdout, iov[3]) emits "wri" + "tev" + ": ok\n" — the
+    // probe is the side-effect: if the line below appears verbatim
+    // we know the gather walk was correct.
+    let writev_ok = unsafe {
+        let a: &[u8] = b"wri";
+        let b: &[u8] = b"tev";
+        let c: &[u8] = b": ok\n";
+        let iov: [narf_libc::iovec; 3] = [
+            narf_libc::iovec {
+                iov_base: a.as_ptr() as *mut core::ffi::c_void,
+                iov_len:  a.len(),
+            },
+            narf_libc::iovec {
+                iov_base: b.as_ptr() as *mut core::ffi::c_void,
+                iov_len:  b.len(),
+            },
+            narf_libc::iovec {
+                iov_base: c.as_ptr() as *mut core::ffi::c_void,
+                iov_len:  c.len(),
+            },
+        ];
+        let n = narf_libc::writev(1, iov.as_ptr(), 3);
+        n == (a.len() + b.len() + c.len()) as isize
+    };
+    if !writev_ok {
+        narf_libc::printf_str("writev: bad\n", &[]);
+    }
+
     // atexit registration — `cleanup` runs after `main` returns,
     // BEFORE the kernel-side exit_task. The ordering proves the
     // dispatch loop in `narf_libc::exit` walks the table.

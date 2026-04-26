@@ -50,6 +50,7 @@ pub mod path;
 pub mod poll;
 pub mod posix;
 pub mod pthread;
+pub mod random;
 pub mod regex;
 pub mod sys;
 pub mod term;
@@ -171,6 +172,9 @@ pub use process::{
 };
 pub use setjmp::{
     jmp_buf, longjmp, setjmp, sigjmp_buf, siglongjmp, sigsetjmp, JMP_BUF_LEN,
+};
+pub use random::{
+    getentropy, getrandom, iovec, readv, writev, GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM,
 };
 pub use regex::{
     regcomp, regerror, regexec, regfree, regex_t, regmatch_t,
