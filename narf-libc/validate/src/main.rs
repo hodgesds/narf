@@ -544,6 +544,42 @@ pub extern "C" fn main(
         &[],
     );
 
+    // math probe — sample the bit-twiddled rounding + arch-native
+    // sqrt + predicates. Each branch is one canonical case from
+    // its function's reference behaviour.
+    //
+    // SAFETY: every math:: entry is `unsafe extern "C"` for the
+    // C-ABI shape but performs only value computation.
+    let math_ok = unsafe {
+        let nan = f64::from_bits(0x7FF8_0000_0000_0000);
+        let inf = f64::INFINITY;
+        narf_libc::fabs(-3.5) == 3.5
+            && narf_libc::floor(2.7) == 2.0
+            && narf_libc::floor(-2.3) == -3.0
+            && narf_libc::ceil(2.3) == 3.0
+            && narf_libc::ceil(-2.7) == -2.0
+            && narf_libc::trunc(-2.7) == -2.0
+            && narf_libc::round(2.5) == 3.0
+            && narf_libc::round(-2.5) == -3.0
+            && narf_libc::sqrt(16.0) == 4.0
+            && narf_libc::sqrt(2.0) > 1.41
+            && narf_libc::sqrt(2.0) < 1.42
+            && narf_libc::fmod(10.0, 3.0) == 1.0
+            && narf_libc::fmin(2.0, nan) == 2.0
+            && narf_libc::fmax(nan, 5.0) == 5.0
+            && narf_libc::isnan(nan) != 0
+            && narf_libc::isnan(0.0) == 0
+            && narf_libc::isinf(inf) == 1
+            && narf_libc::isinf(-inf) == -1
+            && narf_libc::isfinite(1.0) != 0
+            && narf_libc::copysign(3.0, -1.0) == -3.0
+            && narf_libc::signbit(-0.0) == 1
+    };
+    narf_libc::printf_str(
+        if math_ok { "math: ok\n" } else { "math: bad\n" },
+        &[],
+    );
+
     // ctype probe — exercise a representative slice of the
     // classification + case-fold surface. SAFETY: pure value math.
     let ctype_ok = unsafe {

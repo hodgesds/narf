@@ -41,6 +41,7 @@ pub mod fs;
 pub mod getopt;
 pub mod heap;
 pub mod io;
+pub mod math;
 pub mod posix;
 pub mod process;
 pub mod setjmp;
@@ -71,6 +72,11 @@ pub use heap::{calloc, free, malloc, realloc};
 // surface. The internal helper is still reachable as
 // `crate::io::fputs` for non-public call sites that haven't migrated.
 pub use io::{fprintf_str, printf_str, snprintf_str, vprintf_str, vsnprintf_str, write, Arg, Stdout};
+pub use math::{
+    ceil, ceilf, copysign, copysignf, fabs, fabsf, floor, floorf,
+    fmax, fmaxf, fmin, fminf, fmod, fmodf, isfinite, isinf, isnan,
+    round, roundf, signbit, sqrt, sqrtf, trunc, truncf,
+};
 pub use posix::{
     close as posix_close, lseek as posix_lseek, mkdir as posix_mkdir,
     open as posix_open, read as posix_read, rename as posix_rename,

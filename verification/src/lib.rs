@@ -11049,6 +11049,9 @@ fn smoke_frame_x86_64_run_narf_libc_validate() -> TestResult {
     //                    function is no-return so we can't exercise
     //                    it without aborting; we just confirm the
     //                    symbol resolves).
+    //   math: ok      <- Tier-3g <math.h>: fabs/floor/ceil/trunc/
+    //                    round/sqrt/fmod/fmin/fmax + isnan/isinf/
+    //                    isfinite/copysign/signbit reference cases.
     //   ctype: ok     <- Tier-3d <ctype.h>: isdigit/isalpha/isspace/
     //                    isxdigit + tolower/toupper round-trip.
     //   atoi: ok      <- Tier-3a stdlib: leading whitespace + sign +
