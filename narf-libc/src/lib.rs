@@ -44,6 +44,7 @@ pub mod io;
 pub mod locale;
 pub mod math;
 pub mod net;
+pub mod numeric;
 pub mod path;
 pub mod posix;
 pub mod pthread;
@@ -89,9 +90,17 @@ pub use io::{
 };
 pub use math::{
     atan, atan2, atan2f, atanf, ceil, ceilf, copysign, copysignf, cos, cosf, exp, expf,
-    fabs, fabsf, floor, floorf, fmax, fmaxf, fmin, fminf, fmod, fmodf, isfinite, isinf,
-    isnan, log, log10, log10f, log2, log2f, logf, pow, powf, round, roundf, signbit,
-    sin, sinf, sqrt, sqrtf, tan, tanf, trunc, truncf,
+    fabs, fabsf, floor, floorf, fmax, fmaxf, fmin, fminf, fmod, fmodf, frexp, frexpf,
+    isfinite, isinf, isnan, ldexp, ldexpf, log, log10, log10f, log2, log2f, logf,
+    modf, modff, pow, powf, round, roundf, signbit, sin, sinf, sqrt, sqrtf, tan,
+    tanf, trunc, truncf,
+};
+pub use numeric::{
+    cabs, cadd, cdiv, cimag, cmul, complex_double, complex_float, conj, creal, csub,
+    feclearexcept, fegetenv, fegetround, feraiseexcept, fesetenv, fesetround,
+    fetestexcept, fenv_t, fexcept_t, FE_ALL_EXCEPT, FE_DIVBYZERO, FE_DOWNWARD,
+    FE_INEXACT, FE_INVALID, FE_OVERFLOW, FE_TONEAREST, FE_TOWARDZERO, FE_UNDERFLOW,
+    FE_UPWARD,
 };
 pub use net::{
     accept, addrinfo, bind, connect, freeaddrinfo, gai_strerror, getaddrinfo,

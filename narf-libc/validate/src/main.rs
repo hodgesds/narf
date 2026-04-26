@@ -1995,6 +1995,79 @@ pub extern "C" fn main(
         &[],
     );
 
+    // ── Tier 3w probes: ldexp/frexp/modf + complex + fenv ────────
+
+    let ldexp_ok = unsafe {
+        narf_libc::ldexp(1.5, 4) == 24.0
+            && narf_libc::ldexp(0.0, 100) == 0.0
+            && narf_libc::ldexp(-3.0, -1) == -1.5
+    };
+    narf_libc::printf_str(
+        if ldexp_ok { "ldexp: ok\n" } else { "ldexp: bad\n" },
+        &[],
+    );
+
+    let frexp_ok = unsafe {
+        let mut e: i32 = 0;
+        let m = narf_libc::frexp(24.0, &mut e);
+        // 24 = 0.75 * 2^5
+        m == 0.75 && e == 5
+    };
+    narf_libc::printf_str(
+        if frexp_ok { "frexp: ok\n" } else { "frexp: bad\n" },
+        &[],
+    );
+
+    let modf_ok = unsafe {
+        let mut ip: f64 = 0.0;
+        let frac = narf_libc::modf(3.75, &mut ip);
+        let mut ip2: f64 = 0.0;
+        let frac2 = narf_libc::modf(-2.25, &mut ip2);
+        ip == 3.0 && (frac - 0.75).abs() < 1e-12
+            && ip2 == -2.0 && (frac2 + 0.25).abs() < 1e-12
+    };
+    narf_libc::printf_str(
+        if modf_ok { "modf: ok\n" } else { "modf: bad\n" },
+        &[],
+    );
+
+    // <complex.h> — real / imag / conj / cabs / arithmetic.
+    let cplx_ok = unsafe {
+        let z1 = narf_libc::complex_double { real: 3.0, imag: 4.0 };
+        let z2 = narf_libc::complex_double { real: 1.0, imag: 2.0 };
+        let cz = narf_libc::conj(z1);
+        let m  = narf_libc::cabs(z1);
+        let s  = narf_libc::cadd(z1, z2);
+        let p  = narf_libc::cmul(z1, z2);
+        let q  = narf_libc::cdiv(z1, z2);
+        narf_libc::creal(z1) == 3.0
+            && narf_libc::cimag(z1) == 4.0
+            && cz == narf_libc::complex_double { real: 3.0, imag: -4.0 }
+            && (m - 5.0).abs() < 1e-9   // sqrt(9+16) = 5
+            && s == narf_libc::complex_double { real: 4.0, imag: 6.0 }
+            && p == narf_libc::complex_double { real: -5.0, imag: 10.0 }
+            && (narf_libc::creal(q) - 2.2).abs() < 1e-9
+            && (narf_libc::cimag(q) + 0.4).abs() < 1e-9
+    };
+    narf_libc::printf_str(
+        if cplx_ok { "complex: ok\n" } else { "complex: bad\n" },
+        &[],
+    );
+
+    // <fenv.h> — round mode reads as TONEAREST; set TONEAREST OK,
+    // anything else fails; clear/test exceptions are no-ops.
+    let fenv_ok = unsafe {
+        narf_libc::fegetround() == narf_libc::FE_TONEAREST
+            && narf_libc::fesetround(narf_libc::FE_TONEAREST) == 0
+            && narf_libc::fesetround(narf_libc::FE_DOWNWARD) != 0
+            && narf_libc::feclearexcept(narf_libc::FE_ALL_EXCEPT) == 0
+            && narf_libc::fetestexcept(narf_libc::FE_INVALID) == 0
+    };
+    narf_libc::printf_str(
+        if fenv_ok { "fenv: ok\n" } else { "fenv: bad\n" },
+        &[],
+    );
+
     // atexit registration — `cleanup` runs after `main` returns,
     // BEFORE the kernel-side exit_task. The ordering proves the
     // dispatch loop in `narf_libc::exit` walks the table.

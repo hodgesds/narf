@@ -728,3 +728,86 @@ pub unsafe extern "C" fn atan2f(y: f32, x: f32) -> f32 {
     // SAFETY: forwarded.
     unsafe { atan2(y as f64, x as f64) as f32 }
 }
+
+// ── ldexp / frexp / modf ───────────────────────────────────────────
+//
+// IEEE-754 mantissa/exponent splicers. ldexp / frexp use bit
+// manipulation directly; modf splits a finite value into integer
+// and fractional parts via trunc.
+
+/// `ldexp(x, exp)` — `x * 2^exp`. Saturates to ±inf / 0 outside the
+/// f64 representable range.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ldexp(x: f64, exp: i32) -> f64 {
+    if x == 0.0 || x.is_nan() || x.is_infinite() { return x; }
+    ldexp_f64(x, exp)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ldexpf(x: f32, exp: i32) -> f32 {
+    // SAFETY: forwarded.
+    unsafe { ldexp(x as f64, exp) as f32 }
+}
+
+/// `frexp(x, *exp)` — break `x` into a normalised mantissa `m` in
+/// `[0.5, 1.0)` and an exponent `e` such that `x = m * 2^e`. NaN /
+/// ±inf return as-is with `*exp = 0`. Zero returns `(0, 0)`.
+///
+/// # Safety
+/// `exp` must be a writable `*mut i32`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn frexp(x: f64, exp: *mut i32) -> f64 {
+    if exp.is_null() { return x; }
+    if x == 0.0 || x.is_nan() || x.is_infinite() {
+        // SAFETY: caller-supplied writable slot.
+        unsafe { *exp = 0; }
+        return x;
+    }
+    let bits = x.to_bits();
+    let raw_exp = ((bits >> 52) & 0x7FF) as i32;
+    let e = raw_exp - 1022;
+    // Clear and set the exponent so the result is in [0.5, 1.0).
+    let mantissa_bits = (bits & !((0x7FFu64) << 52)) | (1022u64 << 52);
+    // SAFETY: caller-supplied writable slot.
+    unsafe { *exp = e; }
+    f64::from_bits(mantissa_bits)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn frexpf(x: f32, exp: *mut i32) -> f32 {
+    // SAFETY: forwarded.
+    unsafe { frexp(x as f64, exp) as f32 }
+}
+
+/// `modf(x, *iptr)` — split `x` into integer and fractional parts.
+/// `*iptr` receives the integer part (a finite f64 with the same
+/// sign as `x`); the return value is the fractional part. NaN / inf
+/// propagate.
+///
+/// # Safety
+/// `iptr` must be a writable `*mut f64`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn modf(x: f64, iptr: *mut f64) -> f64 {
+    if iptr.is_null() { return x; }
+    // SAFETY: trunc is no-mangle wrapper around our own bit-twiddler.
+    let int_part = unsafe { trunc(x) };
+    // SAFETY: caller-supplied writable slot.
+    unsafe { *iptr = int_part; }
+    if x.is_nan() { return x; }
+    if x.is_infinite() {
+        // POSIX: modf(inf, iptr) writes ±inf to iptr and returns ±0.
+        return if x > 0.0 { 0.0 } else { -0.0 };
+    }
+    x - int_part
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn modff(x: f32, iptr: *mut f32) -> f32 {
+    if iptr.is_null() { return x; }
+    let mut int64: f64 = 0.0;
+    // SAFETY: forwarded; modf writes through our local slot.
+    let frac = unsafe { modf(x as f64, &mut int64) };
+    // SAFETY: caller-supplied writable slot.
+    unsafe { *iptr = int64 as f32; }
+    frac as f32
+}
