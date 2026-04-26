@@ -1741,27 +1741,50 @@ fn sys_brk(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(new_break));
 }
 
-// ── ClockGetTime — write monotonic timespec to user buffer ─────────
+// ── ClockGetTime — write timespec to user buffer ──────────────────
 //
-// arg0 ignored (only one clock today, matching CLOCK_MONOTONIC).
+// arg0 = clock id (POSIX-shaped):
+//   0 = CLOCK_REALTIME   — wall time via `time::now_wall()`,
+//                          driven by `set_wall_offset` / leap-smear.
+//   1 = CLOCK_MONOTONIC  — `narf_time::monotonic_ns()`.
+//   Anything else → InvalidOp (no boot-time / process-cpu clocks yet).
+//
 // arg1 is the user vaddr of a `timespec { i64 tv_sec; i64 tv_nsec; }`.
-// We read the kernel's monotonic_ns counter, decompose into sec/nsec,
-// and write through the active AS — handlers run in the calling
-// task's CR3 / TTBR so the user pointer resolves directly.
+// Handlers run in the calling task's CR3 / TTBR so the user pointer
+// resolves directly.
+//
+// The wall offset starts at 0 (the kernel's "epoch" coincides with
+// boot-time monotonic 0), and a future userspace `settimeofday`
+// surface will drive `set_wall_offset` to push it onto Unix time.
+// Until then a CLOCK_REALTIME read just looks like a monotonic
+// counter — which still satisfies the documented C99 "monotonic
+// non-decreasing" contract that `clock_gettime` consumers check.
+
+const CLOCK_REALTIME:  u64 = 0;
+const CLOCK_MONOTONIC: u64 = 1;
 
 fn sys_clock_gettime(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
+    let id   = args.arg0;
     let buf  = args.arg1;
     if buf == 0 || buf & 0x7 != 0 {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
-    // Route through `narf_scheduler::narf_time` to keep narf-userspace
-    // off a direct narf-time dep (see scheduler/src/lib.rs re-export
-    // rationale).
-    let ns: u64 = narf_scheduler::narf_time::monotonic_ns();
-    let sec  = (ns / 1_000_000_000) as i64;
-    let nsec = (ns % 1_000_000_000) as i64;
+    let (sec, nsec) = match id {
+        CLOCK_REALTIME => {
+            let w = narf_scheduler::narf_time::now_wall();
+            (w.secs, w.nanos as i64)
+        }
+        CLOCK_MONOTONIC => {
+            let ns: u64 = narf_scheduler::narf_time::monotonic_ns();
+            ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64)
+        }
+        _ => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
     // SAFETY: caller provides a writable user vaddr in the active AS.
     // We've checked alignment above; a bad pointer is the user's
     // problem (faulted access lands in their handler, not ours).

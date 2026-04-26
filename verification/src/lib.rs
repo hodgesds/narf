@@ -11749,3 +11749,81 @@ fn smoke_userspace_listdir_walks_memfs() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_userspace_listdir_walks_memfs);
+
+fn smoke_userspace_clock_gettime_distinguishes_clocks() -> TestResult {
+    // ClockGetTime now honours arg0:
+    //   0 = CLOCK_REALTIME  (wall via time::now_wall)
+    //   1 = CLOCK_MONOTONIC (monotonic_ns)
+    //   anything else → InvalidOp.
+    use narf_userspace::{install_core_syscalls, install_global,
+                         kernel_syscall_entry, syscall::__test_clear_global,
+                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+                         TrapContext};
+
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let mut buf = [0i64; 2];
+    let buf_addr = buf.as_mut_ptr() as u64;
+
+    // CLOCK_MONOTONIC: read twice, expect non-decreasing.
+    let mut ctx = FakeCtx {
+        args: SyscallArgs { arg0: 1, arg1: buf_addr, ..SyscallArgs::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::ClockGetTime.raw(), &mut ctx);
+    let m1 = (buf[0], buf[1]);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
+        return TestResult::Fail("monotonic clock_gettime did not return OK");
+    }
+
+    let mut ctx = FakeCtx {
+        args: SyscallArgs { arg0: 1, arg1: buf_addr, ..SyscallArgs::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::ClockGetTime.raw(), &mut ctx);
+    let m2 = (buf[0], buf[1]);
+    if (m2.0, m2.1) < (m1.0, m1.1) {
+        return TestResult::Fail("monotonic clock went backwards");
+    }
+
+    // CLOCK_REALTIME: must succeed and produce a non-negative time.
+    let mut ctx = FakeCtx {
+        args: SyscallArgs { arg0: 0, arg1: buf_addr, ..SyscallArgs::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::ClockGetTime.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
+        return TestResult::Fail("realtime clock_gettime did not return OK");
+    }
+    if buf[0] < 0 || buf[1] < 0 {
+        return TestResult::Fail("realtime clock surfaced a negative timespec");
+    }
+
+    // Bogus clock id rejected with InvalidOp status.
+    let mut ctx = FakeCtx {
+        args: SyscallArgs { arg0: 99, arg1: buf_addr, ..SyscallArgs::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::ClockGetTime.raw(), &mut ctx);
+    let bogus_rejected = matches!(
+        ctx.ret,
+        Some(r) if r.status == SyscallReturn::INVALID_OP,
+    );
+    if !bogus_rejected {
+        return TestResult::Fail("unknown clock id was not rejected");
+    }
+
+    __test_clear_global();
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_clock_gettime_distinguishes_clocks);
