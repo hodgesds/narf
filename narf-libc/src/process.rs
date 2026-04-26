@@ -286,17 +286,20 @@ pub unsafe extern "C" fn setpgid(_pid: i32, _pgid: i32) -> i32 {
     0
 }
 
-/// `setuid(uid)` — accept and ignore. NARF maps to capabilities,
-/// not uids.
+/// `setuid(uid)` — record the caller's uid in the kernel uid/gid
+/// table. NARF's authority is capabilities (the table is structural
+/// state with no security implication), so the call always
+/// succeeds; consumers that care about the value see it stick
+/// across subsequent `getuid()` reads.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn setuid(_uid: u32) -> i32 {
-    0
+pub unsafe extern "C" fn setuid(uid: u32) -> i32 {
+    narf_user_runtime::setuid(uid)
 }
 
-/// `setgid(gid)` — accept and ignore.
+/// `setgid(gid)` — see [`setuid`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn setgid(_gid: u32) -> i32 {
-    0
+pub unsafe extern "C" fn setgid(gid: u32) -> i32 {
+    narf_user_runtime::setgid(gid)
 }
 
 /// `getgid()` — always 0 (matches getuid).

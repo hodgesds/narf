@@ -57,6 +57,8 @@ pub const SYS_GETPID:         u64 = 140;
 pub const SYS_GETPPID:        u64 = 141;
 pub const SYS_GETUID:         u64 = 142;
 pub const SYS_GETGID:         u64 = 143;
+pub const SYS_SETUID:         u64 = 144;
+pub const SYS_SETGID:         u64 = 145;
 pub const SYS_BRK:            u64 = 150;
 pub const SYS_CLOCK_GETTIME:  u64 = 151;
 pub const SYS_SIGACTION:      u64 = 152;
@@ -375,6 +377,24 @@ pub fn getuid() -> u64 {
 pub fn getgid() -> u64 {
     // SAFETY: SYS_GETGID takes no args.
     unsafe { syscall0(SYS_GETGID) }
+}
+
+/// `setuid(uid)` — update the calling task's uid in the kernel
+/// uid/gid table. Always succeeds and returns 0; capabilities
+/// still gate every privileged operation.
+#[inline]
+pub fn setuid(uid: u32) -> i32 {
+    // SAFETY: SYS_SETUID takes one arg (uid).
+    let r = unsafe { syscall1(SYS_SETUID, uid as u64) };
+    if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `setgid(gid)` — update the calling task's gid; see [`setuid`].
+#[inline]
+pub fn setgid(gid: u32) -> i32 {
+    // SAFETY: SYS_SETGID takes one arg (gid).
+    let r = unsafe { syscall1(SYS_SETGID, gid as u64) };
+    if r as i64 == -1 { -1 } else { 0 }
 }
 
 // ── Memory ─────────────────────────────────────────────────────────

@@ -175,12 +175,18 @@ pub enum Syscall {
     /// scheduler tracks parentage.
     GetPpid      = 141,
 
-    /// POSIX-shaped uid/gid query. NARF doesn't model POSIX
-    /// uid/gid (capabilities replace them); these return 0
-    /// unconditionally so relibc's `getuid()` / `getgid()` /
-    /// `geteuid()` / `getegid()` return a sane value.
+    /// POSIX-shaped uid/gid query. NARF's authority model is
+    /// capabilities; the per-task uid/gid table is structural
+    /// state only (no security implication). Default identity
+    /// is (0, 0); `SetUid` / `SetGid` mutate it.
     GetUid       = 142,
     GetGid       = 143,
+
+    /// Set the calling task's uid (`arg0`) / gid (`arg0`). Both
+    /// always succeed and return 0; capabilities still gate every
+    /// privileged operation.
+    SetUid       = 144,
+    SetGid       = 145,
 
     /// Set or query the per-task heap break.
     /// `arg0 = 0` → return current break; `arg0 != 0` → resize.
@@ -361,6 +367,8 @@ impl Syscall {
             141 => Syscall::GetPpid,
             142 => Syscall::GetUid,
             143 => Syscall::GetGid,
+            144 => Syscall::SetUid,
+            145 => Syscall::SetGid,
             150 => Syscall::Brk,
             151 => Syscall::ClockGetTime,
             152 => Syscall::Sigaction,

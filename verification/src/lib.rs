@@ -11827,3 +11827,60 @@ fn smoke_userspace_clock_gettime_distinguishes_clocks() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_userspace_clock_gettime_distinguishes_clocks);
+
+fn smoke_userspace_setuid_setgid_round_trip() -> TestResult {
+    use narf_userspace::{install_core_syscalls, install_global,
+                         kernel_syscall_entry, syscall::__test_clear_global,
+                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+                         TrapContext, uidgid_init};
+
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+    uidgid_init();
+
+    fn call(s: Syscall, arg0: u64) -> Option<SyscallReturn> {
+        let mut ctx = FakeCtx {
+            args: SyscallArgs { arg0, ..SyscallArgs::default() },
+            ret: None,
+        };
+        kernel_syscall_entry(s.raw(), &mut ctx);
+        ctx.ret
+    }
+
+    // Default identity is (0, 0).
+    let u0 = call(Syscall::GetUid, 0).map(|r| r.value).unwrap_or(!0);
+    let g0 = call(Syscall::GetGid, 0).map(|r| r.value).unwrap_or(!0);
+    if u0 != 0 || g0 != 0 {
+        return TestResult::Fail("default uid/gid not (0, 0)");
+    }
+
+    // setuid(1234) → getuid sees 1234; gid unchanged.
+    let _ = call(Syscall::SetUid, 1234);
+    let u1 = call(Syscall::GetUid, 0).map(|r| r.value).unwrap_or(!0);
+    let g1 = call(Syscall::GetGid, 0).map(|r| r.value).unwrap_or(!0);
+    if u1 != 1234 || g1 != 0 {
+        return TestResult::Fail("setuid did not stick");
+    }
+
+    // setgid(56) → getgid sees 56; uid unchanged.
+    let _ = call(Syscall::SetGid, 56);
+    let u2 = call(Syscall::GetUid, 0).map(|r| r.value).unwrap_or(!0);
+    let g2 = call(Syscall::GetGid, 0).map(|r| r.value).unwrap_or(!0);
+    if u2 != 1234 || g2 != 56 {
+        return TestResult::Fail("setgid did not stick / overwrote uid");
+    }
+
+    narf_userspace::handlers::__test_uidgid_reset();
+    __test_clear_global();
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_setuid_setgid_round_trip);

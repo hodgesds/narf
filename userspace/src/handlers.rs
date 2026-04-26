@@ -1408,6 +1408,86 @@ fn sys_getppid(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(0));
 }
 
+// ── Per-task uid/gid table ─────────────────────────────────────────
+//
+// NARF's authority model is capabilities, not POSIX uids — but
+// real C programs (libstdc++, glibc init paths, some test
+// fixtures) check uid/gid early and refuse to run as root, or
+// require a specific gid before opening a privileged code path.
+// We honour the POSIX surface so those programs behave; the
+// values are kernel-side state with no security implication
+// (capabilities still gate everything that matters).
+//
+// Storage shape mirrors the cwd table (BTreeMap<task_id, _>
+// behind an IrqSafeSpinLock); same init / test-reset hooks.
+// Default identity is (uid=0, gid=0) — matches what the prior
+// noop_ok stubs returned, so consumers that didn't touch
+// setuid/setgid see no change.
+
+#[derive(Copy, Clone, Default)]
+struct UidGid { uid: u32, gid: u32 }
+
+static UIDGID_TABLE:
+    narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, UidGid>>>
+    = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Initialise the per-task uid/gid registry. Call once at boot
+/// before any user task issues `setuid` / `getuid`.
+pub fn uidgid_init() {
+    *UIDGID_TABLE.lock() = Some(BTreeMap::new());
+}
+
+/// Reset the registry — test hook.
+#[doc(hidden)]
+pub fn __test_uidgid_reset() { *UIDGID_TABLE.lock() = None; }
+
+fn read_uidgid(task: u64) -> UidGid {
+    let g = UIDGID_TABLE.lock();
+    g.as_ref()
+        .and_then(|m| m.get(&task).copied())
+        .unwrap_or_default()
+}
+
+fn write_uidgid<F: FnOnce(&mut UidGid)>(task: u64, f: F) -> bool {
+    let mut g = UIDGID_TABLE.lock();
+    let Some(m) = g.as_mut() else { return false; };
+    let entry = m.entry(task).or_default();
+    f(entry);
+    true
+}
+
+fn sys_getuid(ctx: &mut dyn TrapContext) {
+    let task = current_task_id();
+    ctx.set_return(SyscallReturn::ok(read_uidgid(task).uid as u64));
+}
+
+fn sys_getgid(ctx: &mut dyn TrapContext) {
+    let task = current_task_id();
+    ctx.set_return(SyscallReturn::ok(read_uidgid(task).gid as u64));
+}
+
+fn sys_setuid(ctx: &mut dyn TrapContext) {
+    let task = current_task_id();
+    let uid  = ctx.args().arg0 as u32;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if write_uidgid(task, |e| e.uid = uid) {
+        ctx.set_return(SyscallReturn::ok(0));
+    } else {
+        ctx.set_return(fail);
+    }
+}
+
+fn sys_setgid(ctx: &mut dyn TrapContext) {
+    let task = current_task_id();
+    let gid  = ctx.args().arg0 as u32;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if write_uidgid(task, |e| e.gid = gid) {
+        ctx.set_return(SyscallReturn::ok(0));
+    } else {
+        ctx.set_return(fail);
+    }
+}
+
 // ── Yield / Sleep — Ok ─────────────────────────────────────────────
 
 fn sys_noop_ok(ctx: &mut dyn TrapContext) {
@@ -2199,8 +2279,10 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::RingKick, "ringkick", RawFnHandler(sys_ring_kick));
     table.install_raw(Syscall::GetPid,   "getpid",   RawFnHandler(sys_getpid));
     table.install_raw(Syscall::GetPpid,  "getppid",  RawFnHandler(sys_getppid));
-    table.install_raw(Syscall::GetUid,   "getuid",   RawFnHandler(sys_noop_ok));
-    table.install_raw(Syscall::GetGid,   "getgid",   RawFnHandler(sys_noop_ok));
+    table.install_raw(Syscall::GetUid,   "getuid",   RawFnHandler(sys_getuid));
+    table.install_raw(Syscall::GetGid,   "getgid",   RawFnHandler(sys_getgid));
+    table.install_raw(Syscall::SetUid,   "setuid",   RawFnHandler(sys_setuid));
+    table.install_raw(Syscall::SetGid,   "setgid",   RawFnHandler(sys_setgid));
     table.install_raw(Syscall::ExitTask, "exit",     RawFnHandler(sys_exit_task));
     table.install_raw(Syscall::Yield,    "yield",    RawFnHandler(sys_yield));
     table.install_raw(Syscall::Sleep,    "sleep",    RawFnHandler(sys_sleep));
