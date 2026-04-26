@@ -350,3 +350,72 @@ pub unsafe extern "C" fn calloc(count: usize, size: usize) -> *mut u8 {
     }
     p
 }
+
+// ── posix_memalign / aligned_alloc ──────────────────────────────────
+//
+// The freelist allocator's chunks are 16-byte aligned by construction
+// (mmap pages are page-aligned; the chunk header is 16-byte; chunks
+// are always rounded up to a multiple of 16). For most callers that's
+// already enough — every alignment up to 16 is satisfied trivially.
+//
+// For larger alignments (e.g. 64 for cache lines, 4096 for pages) we
+// over-allocate by `alignment - 1` bytes, then return the lowest
+// aligned pointer inside the block. The caller's free / realloc will
+// see the original chunk header because we reach back from the
+// aligned pointer using the same offset the allocator did. Since our
+// freelist already uses an inline header at `ptr - HEADER_SIZE`, an
+// aligned-up pointer would not find that header. To keep this simple
+// we restrict aligned_alloc / posix_memalign to alignments <= 16
+// (the existing baseline). Larger alignments return EINVAL — real
+// callers are vanishingly rare in NARF's user surface.
+
+const EINVAL: i32 = 22;
+
+/// `posix_memalign(memptr, align, size)` — align must be a power of
+/// two and a multiple of `sizeof(void *)`. Stores the allocated
+/// pointer through `*memptr` on success and returns 0; otherwise
+/// returns the errno-shaped value (EINVAL / ENOMEM).
+///
+/// # Safety
+/// `memptr` must be a writable pointer-to-pointer slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn posix_memalign(
+    memptr: *mut *mut u8,
+    align:  usize,
+    size:   usize,
+) -> i32 {
+    if memptr.is_null() { return EINVAL; }
+    if align == 0 || (align & (align - 1)) != 0 || align % core::mem::size_of::<usize>() != 0 {
+        return EINVAL;
+    }
+    if align > 16 {
+        // Stage-4 simplification — see module-level comment.
+        return EINVAL;
+    }
+    // SAFETY: malloc returns a 16-byte-aligned pointer.
+    let p = unsafe { malloc(size) };
+    if p.is_null() {
+        return 12; // ENOMEM
+    }
+    // SAFETY: caller-supplied writable slot.
+    unsafe { *memptr = p; }
+    0
+}
+
+/// `aligned_alloc(align, size)` — C11 form. Same restrictions as
+/// [`posix_memalign`]; returns NULL on failure.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn aligned_alloc(align: usize, size: usize) -> *mut u8 {
+    if align == 0 || (align & (align - 1)) != 0 {
+        return ptr::null_mut();
+    }
+    if align > 16 {
+        return ptr::null_mut();
+    }
+    if size % align != 0 {
+        // C11: undefined; we choose to fail.
+        return ptr::null_mut();
+    }
+    // SAFETY: forwarded.
+    unsafe { malloc(size) }
+}

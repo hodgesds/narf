@@ -2068,6 +2068,83 @@ pub extern "C" fn main(
         &[],
     );
 
+    // ── Tier 3x probes: fork/exec stubs + posix_memalign ─────────
+
+    // fork / vfork / execve / execvp — refuse with ENOSYS.
+    let proc_stubs_ok = unsafe {
+        narf_libc::set_errno(0);
+        let f = narf_libc::fork();
+        let ef = narf_libc::errno();
+        let v = narf_libc::vfork();
+        let e = narf_libc::execve(
+            b"/bin/x\0".as_ptr() as *const i8,
+            core::ptr::null(),
+            core::ptr::null(),
+        );
+        f == -1 && ef == 38 && v == -1 && e == -1
+    };
+    narf_libc::printf_str(
+        if proc_stubs_ok { "fork: ok\n" } else { "fork: bad\n" },
+        &[],
+    );
+
+    // waitpid returns -1 with ECHILD; status is zeroed.
+    let wait_ok = unsafe {
+        let mut status: i32 = 0xDEAD;
+        narf_libc::set_errno(0);
+        let r = narf_libc::waitpid(-1, &mut status, 0);
+        let e = narf_libc::errno();
+        r == -1 && status == 0 && e == 10
+    };
+    narf_libc::printf_str(
+        if wait_ok { "waitpid: ok\n" } else { "waitpid: bad\n" },
+        &[],
+    );
+
+    // setsid / getpgrp coalesce to pid; setuid accept-and-ignore;
+    // getuid/geteuid return the kernel's stub uid (0).
+    let session_ok = unsafe {
+        let p = narf_libc::getpid();
+        narf_libc::setsid() == p
+            && narf_libc::getpgrp() == p
+            && narf_libc::getsid(0) == p
+            && narf_libc::setuid(42) == 0
+            && narf_libc::geteuid() == narf_libc::getuid()
+    };
+    narf_libc::printf_str(
+        if session_ok { "session: ok\n" } else { "session: bad\n" },
+        &[],
+    );
+
+    // posix_memalign — 16-byte alignment is honoured; > 16 fails.
+    let memalign_ok = unsafe {
+        let mut p: *mut u8 = core::ptr::null_mut();
+        let r1 = narf_libc::posix_memalign(&mut p, 16, 64);
+        let aligned = (p as usize) % 16 == 0;
+        narf_libc::free(p);
+        let r2 = narf_libc::posix_memalign(
+            &mut p, 4096, 64,
+        );
+        r1 == 0 && aligned && r2 == 22 // EINVAL
+    };
+    narf_libc::printf_str(
+        if memalign_ok { "memalign: ok\n" } else { "memalign: bad\n" },
+        &[],
+    );
+
+    // aligned_alloc — same 16-byte cap; size must be multiple of align.
+    let aalloc_ok = unsafe {
+        let p = narf_libc::aligned_alloc(8, 32);
+        let aligned = !p.is_null() && (p as usize) % 8 == 0;
+        narf_libc::free(p);
+        let bad = narf_libc::aligned_alloc(8, 33); // size % align != 0
+        aligned && bad.is_null()
+    };
+    narf_libc::printf_str(
+        if aalloc_ok { "aligned_alloc: ok\n" } else { "aligned_alloc: bad\n" },
+        &[],
+    );
+
     // atexit registration — `cleanup` runs after `main` returns,
     // BEFORE the kernel-side exit_task. The ordering proves the
     // dispatch loop in `narf_libc::exit` walks the table.

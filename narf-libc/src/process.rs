@@ -169,3 +169,151 @@ pub unsafe extern "C" fn usleep(us: u32) -> i32 {
     let ns = (us as u64).saturating_mul(1_000);
     narf_user_runtime::nanosleep(ns)
 }
+
+// ── fork / exec / wait — ENOSYS stubs ───────────────────────────────
+//
+// NARF doesn't expose fork/exec to user mode (the userspace daemon
+// model spawns processes via a privileged supervisor instead). The
+// libc entries exist so a binary that mentions them in a never-taken
+// branch links cleanly.
+
+const ENOSYS: i32 = 38;
+
+/// `fork()` — refuses with ENOSYS.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fork() -> i32 {
+    crate::errno::set_errno(ENOSYS);
+    -1
+}
+
+/// `vfork()` — same as [`fork`] under our model.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vfork() -> i32 {
+    crate::errno::set_errno(ENOSYS);
+    -1
+}
+
+/// `execve(path, argv, envp)` — refuses with ENOSYS.
+///
+/// # Safety
+/// All arguments are taken at face value; we don't dereference.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn execve(
+    _path: *const i8,
+    _argv: *const *const i8,
+    _envp: *const *const i8,
+) -> i32 {
+    crate::errno::set_errno(ENOSYS);
+    -1
+}
+
+/// `execv(path, argv)` — refuses with ENOSYS.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn execv(_path: *const i8, _argv: *const *const i8) -> i32 {
+    crate::errno::set_errno(ENOSYS);
+    -1
+}
+
+/// `execvp(file, argv)` — refuses with ENOSYS.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn execvp(_file: *const i8, _argv: *const *const i8) -> i32 {
+    crate::errno::set_errno(ENOSYS);
+    -1
+}
+
+/// `waitpid(pid, *status, options)` — no children to wait on; we
+/// report -1 with ECHILD.
+const ECHILD: i32 = 10;
+
+/// # Safety
+/// `status`, when non-null, must be a writable `*mut i32`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn waitpid(_pid: i32, status: *mut i32, _options: i32) -> i32 {
+    if !status.is_null() {
+        // SAFETY: caller-supplied writable slot.
+        unsafe { *status = 0; }
+    }
+    crate::errno::set_errno(ECHILD);
+    -1
+}
+
+/// `wait(*status)` — same as `waitpid(-1, status, 0)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wait(status: *mut i32) -> i32 {
+    // SAFETY: forwarded.
+    unsafe { waitpid(-1, status, 0) }
+}
+
+// ── session / process group stubs ───────────────────────────────────
+//
+// Single-process model: every "id" coalesces to the calling task's
+// pid. We surface the function shapes so init scripts that call
+// `setsid()` don't fail to link.
+
+/// `getpgrp()` — process group; coalesces to pid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn getpgrp() -> i32 {
+    // SAFETY: forwarded.
+    unsafe { getpid() }
+}
+
+/// `getpgid(pid)` — process group of `pid`. Reports the calling
+/// task's pid for any input.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn getpgid(_pid: i32) -> i32 {
+    // SAFETY: forwarded.
+    unsafe { getpid() }
+}
+
+/// `getsid(pid)` — session id of `pid`. Reports the calling task's pid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn getsid(_pid: i32) -> i32 {
+    // SAFETY: forwarded.
+    unsafe { getpid() }
+}
+
+/// `setsid()` — create a new session. We don't track sessions; just
+/// report the calling task's pid as the session id.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn setsid() -> i32 {
+    // SAFETY: forwarded.
+    unsafe { getpid() }
+}
+
+/// `setpgid(pid, pgid)` — accept and ignore.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn setpgid(_pid: i32, _pgid: i32) -> i32 {
+    0
+}
+
+/// `setuid(uid)` — accept and ignore. NARF maps to capabilities,
+/// not uids.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn setuid(_uid: u32) -> i32 {
+    0
+}
+
+/// `setgid(gid)` — accept and ignore.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn setgid(_gid: u32) -> i32 {
+    0
+}
+
+/// `getgid()` — always 0 (matches getuid).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn getgid() -> i32 {
+    narf_user_runtime::getgid() as i32
+}
+
+/// `geteuid()` / `getegid()` — same as their non-effective cousins.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn geteuid() -> i32 {
+    // SAFETY: forwarded.
+    unsafe { getuid() }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn getegid() -> i32 {
+    // SAFETY: forwarded.
+    unsafe { getgid() }
+}

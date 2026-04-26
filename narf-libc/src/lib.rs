@@ -79,7 +79,7 @@ pub use getopt::{
     getopt, getopt_long, optarg, opterr, optind, optopt, option,
     NO_ARGUMENT, OPTIONAL_ARGUMENT, REQUIRED_ARGUMENT,
 };
-pub use heap::{calloc, free, malloc, realloc};
+pub use heap::{aligned_alloc, calloc, free, malloc, posix_memalign, realloc};
 // `io::fputs(&str, fd)` deliberately omitted — the `stdio::fputs`
 // FILE*-shaped one (re-exported below) is the canonical public
 // surface. The internal helper is still reachable as
@@ -142,7 +142,11 @@ pub use pthread::{
     pthread_mutexattr_t, pthread_once, pthread_once_t, pthread_rwlock_t,
     pthread_self, pthread_setspecific, pthread_t, MAIN_THREAD, PTHREAD_ONCE_INIT,
 };
-pub use process::{abort, atexit, exit, _exit, getpid, getppid, getuid, sleep, usleep};
+pub use process::{
+    abort, atexit, execv, execve, execvp, exit, fork, getegid, geteuid, getgid,
+    getpgid, getpgrp, getpid, getppid, getsid, getuid, setgid, setpgid, setsid,
+    setuid, sleep, usleep, vfork, wait, waitpid, _exit,
+};
 pub use setjmp::{
     jmp_buf, longjmp, setjmp, sigjmp_buf, siglongjmp, sigsetjmp, JMP_BUF_LEN,
 };
