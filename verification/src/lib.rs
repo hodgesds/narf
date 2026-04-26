@@ -12069,3 +12069,132 @@ fn smoke_userspace_ftruncate_grows_and_shrinks_memfile() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_userspace_ftruncate_grows_and_shrinks_memfile);
+
+fn smoke_userspace_pread_pwrite_dont_move_cursor() -> TestResult {
+    use narf_filesystem::{
+        bootstrap_mount_authority, registry, MemFs,
+    };
+    use narf_userspace::{install_core_syscalls, install_global,
+                         kernel_syscall_entry, syscall::__test_clear_global,
+                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+                         TrapContext};
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+    narf_userspace::fd::__test_reset();
+    narf_userspace::fd::init();
+
+    let auth = bootstrap_mount_authority();
+    let _ = registry().mount(&auth, "/pio", MemFs::with_seeds(
+        "pio-test", &[("f", b"abcdefghij")],
+    ));
+
+    // Open the file via SYS_OPEN.
+    let path = "/pio/f";
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: path.as_ptr() as u64,
+            arg1: path.len() as u64,
+            arg2: 0, arg3: 0, arg4: 0, arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::OpenFile.raw(), &mut ctx);
+    let fd = match ctx.ret {
+        Some(r) if r.value != !0u64 => r.value as u32,
+        _ => return TestResult::Fail("open /pio/f failed"),
+    };
+
+    // pread at offset 5 → "fghij" (5 bytes).
+    let mut rbuf = [0u8; 5];
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: fd as u64,
+            arg1: rbuf.as_mut_ptr() as u64,
+            arg2: rbuf.len() as u64,
+            arg3: 5,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Pread64.raw(), &mut ctx);
+    let n = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value as usize,
+        _ => return TestResult::Fail("pread failed"),
+    };
+    if n != 5 || &rbuf != b"fghij" {
+        return TestResult::Fail("pread contents wrong");
+    }
+
+    // The fd's offset must still be 0 — confirm with a regular read.
+    let mut head = [0u8; 4];
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: fd as u64,
+            arg1: head.as_mut_ptr() as u64,
+            arg2: head.len() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Read.raw(), &mut ctx);
+    let m = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value as usize,
+        _ => return TestResult::Fail("post-pread read failed"),
+    };
+    if m != 4 || &head != b"abcd" {
+        return TestResult::Fail("pread moved the cursor");
+    }
+
+    // pwrite at offset 8 → overwrite "ij" with "ZZ".
+    let payload = b"ZZ";
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: fd as u64,
+            arg1: payload.as_ptr() as u64,
+            arg2: payload.len() as u64,
+            arg3: 8,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Pwrite64.raw(), &mut ctx);
+    let pw = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value as usize,
+        _ => return TestResult::Fail("pwrite failed"),
+    };
+    if pw != 2 {
+        return TestResult::Fail("pwrite did not write 2 bytes");
+    }
+
+    // Read at offset 8 to confirm.
+    let mut tail = [0u8; 2];
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: fd as u64,
+            arg1: tail.as_mut_ptr() as u64,
+            arg2: tail.len() as u64,
+            arg3: 8,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Pread64.raw(), &mut ctx);
+    if &tail != b"ZZ" {
+        return TestResult::Fail("pwrite did not stick");
+    }
+
+    let _ = narf_userspace::fd::with_table(0, |t| t.close(fd));
+    narf_userspace::fd::__test_reset();
+    __test_clear_global();
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_pread_pwrite_dont_move_cursor);

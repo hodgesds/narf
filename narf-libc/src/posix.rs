@@ -212,6 +212,41 @@ pub unsafe extern "C" fn ftruncate(fd: c_int, len: off_t) -> c_int {
     narf_user_runtime::ftruncate(fd as u32, len as u64)
 }
 
+/// `pread(fd, buf, count, offset)` — read at the explicit offset
+/// without changing the fd's per-position cursor.
+///
+/// # Safety
+/// `buf` must be writable for `count` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pread(
+    fd:     c_int,
+    buf:    *mut c_void,
+    count:  usize,
+    offset: off_t,
+) -> ssize_t {
+    if fd < 0 || buf.is_null() || offset < 0 { return -1; }
+    // SAFETY: caller-supplied writable region.
+    let slice = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, count) };
+    narf_user_runtime::pread(fd as u32, slice, offset as u64) as ssize_t
+}
+
+/// `pwrite(fd, buf, count, offset)` — write at the explicit offset.
+///
+/// # Safety
+/// `buf` must be readable for `count` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pwrite(
+    fd:     c_int,
+    buf:    *const c_void,
+    count:  usize,
+    offset: off_t,
+) -> ssize_t {
+    if fd < 0 || buf.is_null() || offset < 0 { return -1; }
+    // SAFETY: caller-supplied readable region.
+    let slice = unsafe { core::slice::from_raw_parts(buf as *const u8, count) };
+    narf_user_runtime::pwrite(fd as u32, slice, offset as u64) as ssize_t
+}
+
 /// `truncate(path, len)` — open(path, O_WRONLY) + ftruncate + close.
 /// Convenience wrapper to match POSIX surface.
 ///

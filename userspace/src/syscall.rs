@@ -162,6 +162,17 @@ pub enum Syscall {
     /// per-fd cursor).
     Ftruncate    = 118,
 
+    /// `arg0 = fd`, `arg1 = buf_ptr`, `arg2 = len`, `arg3 = offset`
+    /// (u64). Read at the explicit offset without altering the
+    /// per-fd cursor. Returns the byte count read on success
+    /// (possibly short), -1 on bad fd / null buffer.
+    Pread64      = 119,
+
+    /// `arg0 = fd`, `arg1 = buf_ptr`, `arg2 = len`, `arg3 = offset`
+    /// (u64). Write at the explicit offset without altering the
+    /// per-fd cursor. Returns the byte count written on success.
+    Pwrite64     = 122,
+
     /// Map memory: `arg0` addr hint, `arg1` length, `arg2` flags.
     Mmap         = 120,
 
@@ -382,6 +393,8 @@ impl Syscall {
             116 => Syscall::Fstat,
             117 => Syscall::Pipe,
             118 => Syscall::Ftruncate,
+            119 => Syscall::Pread64,
+            122 => Syscall::Pwrite64,
             120 => Syscall::Mmap,
             121 => Syscall::Munmap,
             130 => Syscall::RingKick,

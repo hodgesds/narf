@@ -891,6 +891,77 @@ fn sys_ftruncate(ctx: &mut dyn TrapContext) {
     }
 }
 
+// ── Pread / Pwrite — positional I/O without per-fd offset ─────────
+//
+// FileOps::read / write already take an offset arg; the regular
+// sys_read / sys_write handlers walk through the per-fd cursor on
+// top. pread / pwrite skip the cursor mutation — POSIX guarantees
+// the per-fd offset is unchanged after these calls.
+
+fn sys_pread64(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let fd     = args.arg0 as u32;
+    let ptr    = args.arg1 as *mut u8;
+    let len    = args.arg2 as usize;
+    let offset = args.arg3;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if ptr.is_null() {
+        ctx.set_return(fail);
+        return;
+    }
+    if len == 0 {
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+    // SAFETY: caller-supplied user pointer in the active AS.
+    let slice = unsafe { core::slice::from_raw_parts_mut(ptr, len) };
+    let task = current_task_id();
+    let outcome = fd::with_table(task, |t| {
+        let entry = t.get(fd)?;
+        let ops = entry.ops.clone();
+        let n = poll_once(ops.read(offset, slice))
+            .and_then(|r| r.ok())
+            .unwrap_or(0);
+        Some(n)
+    });
+    match outcome {
+        Some(Some(n)) => ctx.set_return(SyscallReturn::ok(n as u64)),
+        _             => ctx.set_return(fail),
+    }
+}
+
+fn sys_pwrite64(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let fd     = args.arg0 as u32;
+    let ptr    = args.arg1 as *const u8;
+    let len    = args.arg2 as usize;
+    let offset = args.arg3;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if ptr.is_null() {
+        ctx.set_return(fail);
+        return;
+    }
+    if len == 0 {
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+    // SAFETY: caller-supplied user pointer in the active AS.
+    let slice = unsafe { core::slice::from_raw_parts(ptr, len) };
+    let task = current_task_id();
+    let outcome = fd::with_table(task, |t| {
+        let entry = t.get(fd)?;
+        let ops = entry.ops.clone();
+        let n = poll_once(ops.write(offset, slice))
+            .and_then(|r| r.ok())
+            .unwrap_or(0);
+        Some(n)
+    });
+    match outcome {
+        Some(Some(n)) => ctx.set_return(SyscallReturn::ok(n as u64)),
+        _             => ctx.set_return(fail),
+    }
+}
+
 // ── Pipe ────────────────────────────────────────────────────────────
 //
 // Allocates a fresh `PipeRead`/`PipeWrite` pair, installs them into
@@ -2404,6 +2475,8 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Fstat,  "fstat",  RawFnHandler(sys_fstat));
     table.install_raw(Syscall::Pipe,   "pipe",   RawFnHandler(sys_pipe));
     table.install_raw(Syscall::Ftruncate, "ftruncate", RawFnHandler(sys_ftruncate));
+    table.install_raw(Syscall::Pread64,   "pread64",   RawFnHandler(sys_pread64));
+    table.install_raw(Syscall::Pwrite64,  "pwrite64",  RawFnHandler(sys_pwrite64));
 
     // Tier-2 cwd state + nanosleep wired into the table. Sleep
     // already replaced the noop_ok stub above.

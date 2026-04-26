@@ -60,6 +60,8 @@ pub const SYS_GETGID:         u64 = 143;
 pub const SYS_SETUID:         u64 = 144;
 pub const SYS_SETGID:         u64 = 145;
 pub const SYS_FTRUNCATE:      u64 = 118;
+pub const SYS_PREAD64:        u64 = 119;
+pub const SYS_PWRITE64:       u64 = 122;
 pub const SYS_GETHOSTNAME:    u64 = 146;
 pub const SYS_SETHOSTNAME:    u64 = 147;
 pub const SYS_BRK:            u64 = 150;
@@ -407,6 +409,38 @@ pub fn ftruncate(fd: u32, len: u64) -> i32 {
     // SAFETY: SYS_FTRUNCATE signature: (fd, len).
     let r = unsafe { syscall2(SYS_FTRUNCATE, fd as u64, len) };
     if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `pread(fd, buf, offset)` — read at the explicit offset without
+/// touching the per-fd cursor. Returns the byte count read, -1 on
+/// error.
+#[inline]
+pub fn pread(fd: u32, buf: &mut [u8], offset: u64) -> isize {
+    if buf.is_empty() { return 0; }
+    // SAFETY: SYS_PREAD64 signature: (fd, buf_ptr, len, offset).
+    let r = unsafe {
+        syscall4(
+            SYS_PREAD64, fd as u64,
+            buf.as_mut_ptr() as u64, buf.len() as u64,
+            offset,
+        )
+    };
+    r as isize
+}
+
+/// `pwrite(fd, buf, offset)` — write at the explicit offset.
+#[inline]
+pub fn pwrite(fd: u32, buf: &[u8], offset: u64) -> isize {
+    if buf.is_empty() { return 0; }
+    // SAFETY: SYS_PWRITE64 signature: (fd, buf_ptr, len, offset).
+    let r = unsafe {
+        syscall4(
+            SYS_PWRITE64, fd as u64,
+            buf.as_ptr() as u64, buf.len() as u64,
+            offset,
+        )
+    };
+    r as isize
 }
 
 /// `gethostname(buf)` — copy the kernel-wide hostname into `buf`,
