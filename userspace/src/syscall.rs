@@ -185,6 +185,14 @@ pub enum Syscall {
     /// flush distinction.
     Fdatasync    = 124,
 
+    /// `arg0 = pipefd_out_ptr`, `arg1 = flags`. Linux pipe2(2):
+    /// pipe + atomic flag set. Honoured flag: O_CLOEXEC (bit
+    /// 0x80000) — both ends get FD_CLOEXEC stamped at install
+    /// time. O_NONBLOCK is accepted and ignored (NARF pipes have
+    /// no blocking model worth toggling — read on an empty pipe
+    /// already short-returns).
+    Pipe2        = 125,
+
     /// Map memory: `arg0` addr hint, `arg1` length, `arg2` flags.
     Mmap         = 120,
 
@@ -409,6 +417,7 @@ impl Syscall {
             122 => Syscall::Pwrite64,
             123 => Syscall::Fsync,
             124 => Syscall::Fdatasync,
+            125 => Syscall::Pipe2,
             120 => Syscall::Mmap,
             121 => Syscall::Munmap,
             130 => Syscall::RingKick,

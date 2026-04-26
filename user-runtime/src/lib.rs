@@ -64,6 +64,7 @@ pub const SYS_PREAD64:        u64 = 119;
 pub const SYS_PWRITE64:       u64 = 122;
 pub const SYS_FSYNC:          u64 = 123;
 pub const SYS_FDATASYNC:      u64 = 124;
+pub const SYS_PIPE2:          u64 = 125;
 pub const SYS_GETHOSTNAME:    u64 = 146;
 pub const SYS_SETHOSTNAME:    u64 = 147;
 pub const SYS_BRK:            u64 = 150;
@@ -873,6 +874,23 @@ pub fn pipe() -> Option<(u32, u32)> {
     // i32s through the pointer; `fds` lives on this function's stack
     // for the duration of the syscall.
     let r = unsafe { syscall1(SYS_PIPE, fds.as_mut_ptr() as u64) };
+    if r != 0 || fds[0] < 0 || fds[1] < 0 {
+        None
+    } else {
+        Some((fds[0] as u32, fds[1] as u32))
+    }
+}
+
+/// `pipe2(flags)` — pipe + atomic flag set. `O_CLOEXEC` (bit
+/// 0x80000) stamps FD_CLOEXEC on both halves; `O_NONBLOCK` is
+/// accepted and ignored.
+#[inline]
+pub fn pipe2(flags: u32) -> Option<(u32, u32)> {
+    let mut fds: [i32; 2] = [-1, -1];
+    // SAFETY: SYS_PIPE2 signature: (out_ptr, flags).
+    let r = unsafe {
+        syscall2(SYS_PIPE2, fds.as_mut_ptr() as u64, flags as u64)
+    };
     if r != 0 || fds[0] < 0 || fds[1] < 0 {
         None
     } else {

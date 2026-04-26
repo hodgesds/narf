@@ -101,6 +101,31 @@ pub unsafe fn pipe(pipefd: *mut i32) -> i32 {
     }
 }
 
+/// `pipe2(pipefd, flags)` — Linux-shaped pipe with atomic flag
+/// set. Honoured: `O_CLOEXEC` (0x80000) stamps FD_CLOEXEC on both
+/// halves. `O_NONBLOCK` accepted and ignored.
+///
+/// # Safety
+/// As [`pipe`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pipe2(pipefd: *mut i32, flags: i32) -> i32 {
+    if pipefd.is_null() {
+        set_errno(EBADF);
+        return -1;
+    }
+    match narf_user_runtime::pipe2(flags as u32) {
+        Some((r, w)) => {
+            // SAFETY: caller asserts pipefd has room for two i32s.
+            unsafe {
+                *pipefd         = r as i32;
+                *pipefd.add(1) = w as i32;
+            }
+            0
+        }
+        None => { set_errno(EBADF); -1 }
+    }
+}
+
 /// `stat(path, &mut out)` — fill `out` with the stat result for
 /// the absolute path. Returns 0 on success, `-1` on failure.
 ///

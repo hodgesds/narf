@@ -1019,6 +1019,52 @@ fn sys_pipe(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(0));
 }
 
+// ── Pipe2 — pipe + atomic flag set ─────────────────────────────────
+//
+// Linux pipe2(2): same as pipe but the second arg sets per-fd
+// flags atomically with the install. We honour O_CLOEXEC by
+// stamping FD_CLOEXEC on both halves; O_NONBLOCK is accepted and
+// ignored (NARF pipe reads short-return on empty already, no
+// blocking model to toggle).
+
+const O_CLOEXEC_BIT: u64 = 0x80000;
+
+fn sys_pipe2(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let out_ptr = args.arg0 as *mut i32;
+    let flags   = args.arg1;
+    if out_ptr.is_null() {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    let want_cloexec = (flags & O_CLOEXEC_BIT) != 0;
+    let install_flags = if want_cloexec { crate::fd::FD_CLOEXEC } else { 0 };
+
+    let (rd, wr) = crate::pipe::pipe_pair();
+    let task = current_task_id();
+    let fds = fd::with_table(task, |t| {
+        let r = t.open(crate::fd::FdEntry {
+            ops: rd as alloc::sync::Arc<dyn narf_filesystem::FileOps>,
+            offset: 0, flags: install_flags,
+        });
+        let w = t.open(crate::fd::FdEntry {
+            ops: wr as alloc::sync::Arc<dyn narf_filesystem::FileOps>,
+            offset: 0, flags: install_flags,
+        });
+        (r, w)
+    });
+    let (r, w) = match fds {
+        Some(p) => p,
+        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+    };
+    // SAFETY: caller-supplied user vaddr; we write two i32s.
+    unsafe {
+        core::ptr::write_volatile(out_ptr,        r as i32);
+        core::ptr::write_volatile(out_ptr.add(1), w as i32);
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
 // ── Lseek — arg0=fd, arg1=offset(i64), arg2=whence ─────────────────
 //
 // Updates the per-fd offset and returns the new value. SEEK_CUR /
@@ -2498,6 +2544,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Fsync,     "fsync",     RawFnHandler(sys_fsync));
     // Fdatasync shares fsync's body — both are structural no-ops.
     table.install_raw(Syscall::Fdatasync, "fdatasync", RawFnHandler(sys_fsync));
+    table.install_raw(Syscall::Pipe2,     "pipe2",     RawFnHandler(sys_pipe2));
 
     // Tier-2 cwd state + nanosleep wired into the table. Sleep
     // already replaced the noop_ok stub above.
