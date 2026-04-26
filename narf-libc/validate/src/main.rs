@@ -1731,6 +1731,88 @@ pub extern "C" fn main(
         &[],
     );
 
+    // ── Tier 3s probes: pthread no-op shim ───────────────────────
+    //
+    // pthread_self / pthread_equal are constant under single-thread.
+    let pid_eq_ok = unsafe {
+        let me = narf_libc::pthread_self();
+        narf_libc::pthread_equal(me, narf_libc::MAIN_THREAD) != 0
+            && narf_libc::pthread_equal(me, 0) == 0
+    };
+    narf_libc::printf_str(
+        if pid_eq_ok { "pthread_self: ok\n" } else { "pthread_self: bad\n" },
+        &[],
+    );
+
+    // mutex round-trip — init, lock×2, unlock×2, destroy.
+    let mutex_ok = unsafe {
+        let mut m = narf_libc::pthread_mutex_t::default();
+        narf_libc::pthread_mutex_init(&mut m, core::ptr::null()) == 0
+            && narf_libc::pthread_mutex_lock(&mut m) == 0
+            && narf_libc::pthread_mutex_lock(&mut m) == 0
+            && m.locked == 2
+            && narf_libc::pthread_mutex_unlock(&mut m) == 0
+            && narf_libc::pthread_mutex_unlock(&mut m) == 0
+            && m.locked == 0
+            && narf_libc::pthread_mutex_destroy(&mut m) == 0
+    };
+    narf_libc::printf_str(
+        if mutex_ok { "mutex: ok\n" } else { "mutex: bad\n" },
+        &[],
+    );
+
+    // pthread_once — initialiser fires exactly once.
+    static ONCE_HITS: core::sync::atomic::AtomicI32
+        = core::sync::atomic::AtomicI32::new(0);
+    extern "C" fn once_init() {
+        ONCE_HITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    let mut ctl = narf_libc::PTHREAD_ONCE_INIT;
+    let once_ok = unsafe {
+        narf_libc::pthread_once(&mut ctl, once_init) == 0
+            && narf_libc::pthread_once(&mut ctl, once_init) == 0
+            && ONCE_HITS.load(core::sync::atomic::Ordering::Relaxed) == 1
+    };
+    narf_libc::printf_str(
+        if once_ok { "once: ok\n" } else { "once: bad\n" },
+        &[],
+    );
+
+    // pthread_key_create + setspecific + getspecific.
+    let key_ok = unsafe {
+        let mut key: narf_libc::pthread_key_t = 99;
+        let cr = narf_libc::pthread_key_create(&mut key, None);
+        let val: usize = 0xDEAD_BEEF;
+        let sr = narf_libc::pthread_setspecific(
+            key, val as *const core::ffi::c_void,
+        );
+        let g = narf_libc::pthread_getspecific(key);
+        let dr = narf_libc::pthread_key_delete(key);
+        cr == 0 && sr == 0 && (g as usize) == val && dr == 0
+    };
+    narf_libc::printf_str(
+        if key_ok { "tls_key: ok\n" } else { "tls_key: bad\n" },
+        &[],
+    );
+
+    // pthread_create refuses with EAGAIN; pthread_join is a no-op.
+    let create_ok = unsafe {
+        extern "C" fn never_runs(_: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+            core::ptr::null_mut()
+        }
+        let mut tid: narf_libc::pthread_t = 0;
+        let cr = narf_libc::pthread_create(
+            &mut tid, core::ptr::null(), never_runs, core::ptr::null_mut(),
+        );
+        let mut ret: *mut core::ffi::c_void = 1 as *mut _;
+        let jr = narf_libc::pthread_join(narf_libc::MAIN_THREAD, &mut ret);
+        cr == narf_libc::pthread::EAGAIN && jr == 0 && ret.is_null()
+    };
+    narf_libc::printf_str(
+        if create_ok { "pthread_create: ok\n" } else { "pthread_create: bad\n" },
+        &[],
+    );
+
     // atexit registration — `cleanup` runs after `main` returns,
     // BEFORE the kernel-side exit_task. The ordering proves the
     // dispatch loop in `narf_libc::exit` walks the table.

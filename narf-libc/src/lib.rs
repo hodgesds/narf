@@ -46,6 +46,7 @@ pub mod math;
 pub mod net;
 pub mod path;
 pub mod posix;
+pub mod pthread;
 pub mod process;
 pub mod setjmp;
 pub mod signal;
@@ -110,6 +111,15 @@ pub use posix::{
     rename as posix_rename, rmdir as posix_rmdir, sysconf, unlink as posix_unlink,
     write as posix_write, O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
     SEEK_CUR, SEEK_END, SEEK_SET, _SC_OPEN_MAX, _SC_PAGESIZE, _SC_PAGE_SIZE,
+};
+pub use pthread::{
+    pthread_attr_destroy, pthread_attr_init, pthread_attr_t, pthread_cond_t,
+    pthread_condattr_t, pthread_create, pthread_detach, pthread_equal,
+    pthread_getspecific, pthread_join, pthread_key_create, pthread_key_delete,
+    pthread_key_t, pthread_mutex_destroy, pthread_mutex_init, pthread_mutex_lock,
+    pthread_mutex_t, pthread_mutex_trylock, pthread_mutex_unlock,
+    pthread_mutexattr_t, pthread_once, pthread_once_t, pthread_rwlock_t,
+    pthread_self, pthread_setspecific, pthread_t, MAIN_THREAD, PTHREAD_ONCE_INIT,
 };
 pub use process::{abort, atexit, exit, _exit, getpid, getppid, getuid, sleep, usleep};
 pub use setjmp::{jmp_buf, longjmp, setjmp, JMP_BUF_LEN};
