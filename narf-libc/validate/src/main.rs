@@ -1868,6 +1868,65 @@ pub extern "C" fn main(
         &[],
     );
 
+    // ── Tier 3u probes: BSD socket stubs ─────────────────────────
+    //
+    // socket() refuses with ENOSYS. errno round-trips.
+    let sock_ok = unsafe {
+        narf_libc::set_errno(0);
+        let fd = narf_libc::socket(
+            narf_libc::AF_INET,
+            narf_libc::SOCK_STREAM,
+            narf_libc::IPPROTO_TCP,
+        );
+        let e = narf_libc::errno();
+        fd == -1 && e == 38
+    };
+    narf_libc::printf_str(
+        if sock_ok { "socket: ok\n" } else { "socket: bad\n" },
+        &[],
+    );
+
+    // bind/connect/listen all refuse the same way.
+    let bcl_ok = unsafe {
+        let sa = narf_libc::sockaddr {
+            sa_family: narf_libc::AF_INET as u16,
+            sa_data: [0; 14],
+        };
+        narf_libc::bind(3, &sa, core::mem::size_of::<narf_libc::sockaddr>() as u32) == -1
+            && narf_libc::connect(3, &sa, core::mem::size_of::<narf_libc::sockaddr>() as u32) == -1
+            && narf_libc::listen(3, 5) == -1
+    };
+    narf_libc::printf_str(
+        if bcl_ok { "bind/conn/listen: ok\n" } else { "bind/conn/listen: bad\n" },
+        &[],
+    );
+
+    // getaddrinfo returns EAI_NONAME and leaves *result NULL.
+    let gai_ok = unsafe {
+        let mut res: *mut narf_libc::addrinfo = 1 as *mut _;
+        let r = narf_libc::getaddrinfo(
+            b"example.com\0".as_ptr() as *const i8,
+            core::ptr::null(),
+            core::ptr::null(),
+            &mut res,
+        );
+        r == narf_libc::EAI_NONAME && res.is_null()
+    };
+    narf_libc::printf_str(
+        if gai_ok { "getaddrinfo: ok\n" } else { "getaddrinfo: bad\n" },
+        &[],
+    );
+
+    // gai_strerror returns a non-null static string.
+    let gai_str_ok = unsafe {
+        let p = narf_libc::gai_strerror(narf_libc::EAI_NONAME);
+        !p.is_null() && *p != 0
+    };
+    narf_libc::printf_str(
+        if gai_str_ok { "gai_strerror: ok\n" } else { "gai_strerror: bad\n" },
+        &[],
+    );
+
     // atexit registration — `cleanup` runs after `main` returns,
     // BEFORE the kernel-side exit_task. The ordering proves the
     // dispatch loop in `narf_libc::exit` walks the table.

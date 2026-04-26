@@ -93,8 +93,13 @@ pub use math::{
     sin, sinf, sqrt, sqrtf, tan, tanf, trunc, truncf,
 };
 pub use net::{
-    htonl, htons, inet_addr, inet_aton, inet_ntop, inet_pton, ntohl, ntohs,
-    AF_INET, INADDR_NONE, INET_ADDRSTRLEN,
+    accept, addrinfo, bind, connect, freeaddrinfo, gai_strerror, getaddrinfo,
+    getsockopt, htonl, htons, in_addr, inet_addr, inet_aton, inet_ntop, inet_pton,
+    listen, ntohl, ntohs, recv, recvfrom, send, sendto, setsockopt, shutdown, sockaddr,
+    sockaddr_in, sockaddr_in6, socket, AF_INET, AF_INET6, AF_UNIX, AF_UNSPEC,
+    EAI_FAIL, EAI_NONAME, INADDR_NONE, INET_ADDRSTRLEN, IPPROTO_IP, IPPROTO_TCP,
+    IPPROTO_UDP, SHUT_RD, SHUT_RDWR, SHUT_WR, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM,
+    SOL_SOCKET, SO_KEEPALIVE, SO_LINGER, SO_RCVBUF, SO_REUSEADDR, SO_SNDBUF,
 };
 pub use locale::{
     iconv, iconv_close, iconv_open, mbtowc, nl_langinfo, setlocale, wchar_t, wcscmp,

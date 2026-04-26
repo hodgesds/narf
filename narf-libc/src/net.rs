@@ -159,6 +159,271 @@ pub unsafe extern "C" fn inet_pton(
     1
 }
 
+// ── BSD socket API stubs ────────────────────────────────────────────
+//
+// NARF has no kernel socket layer. Real network I/O lives in a
+// future userspace stack daemon (per `net/specification/spec.md`).
+// Until that lands, all socket calls fail with `errno = ENOSYS`,
+// allowing consumers to fall back (e.g. tools that fork off
+// network-fetching code paths only when reachable). Surfaces below
+// are link-only.
+
+pub const ENOSYS: c_int = 38;
+
+pub type socklen_t = u32;
+pub type sa_family_t = u16;
+pub type in_port_t = u16;
+
+pub const SOCK_STREAM: c_int = 1;
+pub const SOCK_DGRAM:  c_int = 2;
+pub const SOCK_RAW:    c_int = 3;
+
+pub const AF_UNSPEC: c_int = 0;
+pub const AF_UNIX:   c_int = 1;
+pub const AF_INET6:  c_int = 10;
+
+pub const IPPROTO_IP:   c_int = 0;
+pub const IPPROTO_TCP:  c_int = 6;
+pub const IPPROTO_UDP:  c_int = 17;
+
+pub const SOL_SOCKET:   c_int = 1;
+pub const SO_REUSEADDR: c_int = 2;
+pub const SO_KEEPALIVE: c_int = 9;
+pub const SO_LINGER:    c_int = 13;
+pub const SO_RCVBUF:    c_int = 8;
+pub const SO_SNDBUF:    c_int = 7;
+
+pub const SHUT_RD:   c_int = 0;
+pub const SHUT_WR:   c_int = 1;
+pub const SHUT_RDWR: c_int = 2;
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct sockaddr {
+    pub sa_family: sa_family_t,
+    pub sa_data:   [c_char; 14],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct in_addr {
+    pub s_addr: in_addr_t,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct sockaddr_in {
+    pub sin_family: sa_family_t,
+    pub sin_port:   in_port_t,
+    pub sin_addr:   in_addr,
+    pub sin_zero:   [u8; 8],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct sockaddr_in6 {
+    pub sin6_family:   sa_family_t,
+    pub sin6_port:     in_port_t,
+    pub sin6_flowinfo: u32,
+    pub sin6_addr:     [u8; 16],
+    pub sin6_scope_id: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct addrinfo {
+    pub ai_flags:    c_int,
+    pub ai_family:   c_int,
+    pub ai_socktype: c_int,
+    pub ai_protocol: c_int,
+    pub ai_addrlen:  socklen_t,
+    pub ai_addr:     *mut sockaddr,
+    pub ai_canonname:*mut c_char,
+    pub ai_next:     *mut addrinfo,
+}
+
+pub const EAI_NONAME: c_int = -2;
+pub const EAI_FAIL:   c_int = -4;
+
+#[inline]
+unsafe fn enosys_minus_one() -> c_int {
+    crate::errno::set_errno(ENOSYS);
+    -1
+}
+
+/// `socket(domain, type, protocol)` — refuses with ENOSYS.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn socket(_domain: c_int, _type: c_int, _protocol: c_int) -> c_int {
+    // SAFETY: pure forwarding.
+    unsafe { enosys_minus_one() }
+}
+
+/// `bind(fd, *addr, len)` — refuses with ENOSYS.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bind(
+    _fd:   c_int,
+    _addr: *const sockaddr,
+    _len:  socklen_t,
+) -> c_int {
+    // SAFETY: pure forwarding.
+    unsafe { enosys_minus_one() }
+}
+
+/// `connect(fd, *addr, len)` — refuses with ENOSYS.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn connect(
+    _fd:   c_int,
+    _addr: *const sockaddr,
+    _len:  socklen_t,
+) -> c_int {
+    // SAFETY: pure forwarding.
+    unsafe { enosys_minus_one() }
+}
+
+/// `listen(fd, backlog)` — refuses with ENOSYS.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn listen(_fd: c_int, _backlog: c_int) -> c_int {
+    // SAFETY: pure forwarding.
+    unsafe { enosys_minus_one() }
+}
+
+/// `accept(fd, *addr, *len)` — refuses with ENOSYS.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn accept(
+    _fd:   c_int,
+    _addr: *mut sockaddr,
+    _len:  *mut socklen_t,
+) -> c_int {
+    // SAFETY: pure forwarding.
+    unsafe { enosys_minus_one() }
+}
+
+/// `shutdown(fd, how)` — refuses with ENOSYS.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn shutdown(_fd: c_int, _how: c_int) -> c_int {
+    // SAFETY: pure forwarding.
+    unsafe { enosys_minus_one() }
+}
+
+/// `send(fd, *buf, len, flags)` — refuses with ENOSYS.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn send(
+    _fd:    c_int,
+    _buf:   *const core::ffi::c_void,
+    _len:   usize,
+    _flags: c_int,
+) -> isize {
+    // SAFETY: pure forwarding.
+    unsafe { enosys_minus_one() as isize }
+}
+
+/// `recv(fd, *buf, len, flags)` — refuses with ENOSYS.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn recv(
+    _fd:    c_int,
+    _buf:   *mut core::ffi::c_void,
+    _len:   usize,
+    _flags: c_int,
+) -> isize {
+    // SAFETY: pure forwarding.
+    unsafe { enosys_minus_one() as isize }
+}
+
+/// `sendto(fd, *buf, len, flags, *addr, alen)` — refuses with ENOSYS.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sendto(
+    _fd:    c_int,
+    _buf:   *const core::ffi::c_void,
+    _len:   usize,
+    _flags: c_int,
+    _addr:  *const sockaddr,
+    _alen:  socklen_t,
+) -> isize {
+    // SAFETY: pure forwarding.
+    unsafe { enosys_minus_one() as isize }
+}
+
+/// `recvfrom(fd, *buf, len, flags, *addr, *alen)` — refuses with ENOSYS.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn recvfrom(
+    _fd:    c_int,
+    _buf:   *mut core::ffi::c_void,
+    _len:   usize,
+    _flags: c_int,
+    _addr:  *mut sockaddr,
+    _alen:  *mut socklen_t,
+) -> isize {
+    // SAFETY: pure forwarding.
+    unsafe { enosys_minus_one() as isize }
+}
+
+/// `getsockopt(fd, level, name, *val, *vlen)` — refuses with ENOSYS.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn getsockopt(
+    _fd:    c_int,
+    _level: c_int,
+    _name:  c_int,
+    _val:   *mut core::ffi::c_void,
+    _vlen:  *mut socklen_t,
+) -> c_int {
+    // SAFETY: pure forwarding.
+    unsafe { enosys_minus_one() }
+}
+
+/// `setsockopt(fd, level, name, *val, vlen)` — refuses with ENOSYS.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn setsockopt(
+    _fd:    c_int,
+    _level: c_int,
+    _name:  c_int,
+    _val:   *const core::ffi::c_void,
+    _vlen:  socklen_t,
+) -> c_int {
+    // SAFETY: pure forwarding.
+    unsafe { enosys_minus_one() }
+}
+
+/// `getaddrinfo(host, service, hints, *result)` — no resolver in
+/// tree, so we always report `EAI_NONAME` (host not found) and
+/// leave `*result` untouched. Real DNS lives in a userspace daemon
+/// per `net/specification/spec.md`.
+///
+/// # Safety
+/// `result` must be a writable `*mut *mut addrinfo`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn getaddrinfo(
+    _host:    *const c_char,
+    _service: *const c_char,
+    _hints:   *const addrinfo,
+    result:   *mut *mut addrinfo,
+) -> c_int {
+    if !result.is_null() {
+        // SAFETY: caller-supplied writable slot.
+        unsafe { *result = core::ptr::null_mut(); }
+    }
+    EAI_NONAME
+}
+
+/// `freeaddrinfo(p)` — no-op (we never returned a non-null result).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn freeaddrinfo(_p: *mut addrinfo) {}
+
+/// `gai_strerror(err)` — return a human-readable string for the
+/// `EAI_*` error code.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gai_strerror(err: c_int) -> *const c_char {
+    static NONAME: [u8; 33]  = *b"Name or service not known\0\0\0\0\0\0\0\0";
+    static FAILURE:[u8; 33]  = *b"Non-recoverable failure in name r";
+    static OK:     [u8; 8]   = *b"Success\0";
+    let p: *const u8 = match err {
+        0          => OK.as_ptr(),
+        EAI_NONAME => NONAME.as_ptr(),
+        EAI_FAIL   => FAILURE.as_ptr(),
+        _          => OK.as_ptr(),
+    };
+    p as *const c_char
+}
+
 /// `inet_ntop(af, src, dst, size)` — render a packed address into a
 /// dotted-quad string. Returns `dst` on success or NULL on failure
 /// (unsupported family, undersized buffer).
