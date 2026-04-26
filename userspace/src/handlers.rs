@@ -878,6 +878,57 @@ fn sys_pipe(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(0));
 }
 
+// ── Lseek — arg0=fd, arg1=offset(i64), arg2=whence ─────────────────
+//
+// Updates the per-fd offset and returns the new value. SEEK_CUR /
+// SEEK_END are computed against the current offset / current size
+// reported by the FileOps `stat()`. Negative resulting offsets are
+// rejected with `InvalidOp` so callers don't get a wraparound u64.
+
+const SEEK_SET: u64 = 0;
+const SEEK_CUR: u64 = 1;
+const SEEK_END: u64 = 2;
+
+fn sys_lseek(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let fd     = args.arg0 as u32;
+    let offset = args.arg1 as i64;
+    let whence = args.arg2;
+    let task   = current_task_id();
+    let outcome = fd::with_table(task, |t| {
+        let entry = t.get_mut(fd)?;
+        let base = match whence {
+            SEEK_SET => 0i64,
+            SEEK_CUR => entry.offset as i64,
+            SEEK_END => entry.ops.stat().size as i64,
+            _        => return Some(SyscallReturn::invalid_op()),
+        };
+        let new_off = base.checked_add(offset)?;
+        if new_off < 0 {
+            return Some(SyscallReturn::invalid_op());
+        }
+        entry.offset = new_off as u64;
+        Some(SyscallReturn::ok(new_off as u64))
+    });
+    match outcome {
+        Some(Some(r)) => ctx.set_return(r),
+        _             => ctx.set_return(SyscallReturn::invalid_op()),
+    }
+}
+
+// ── Unlink — arg0=path_ptr, arg1=path_len ──────────────────────────
+//
+// Stage-4: stub. The VFS does not yet expose a remove API (no
+// `FsInstance::unlink` method), so the syscall slot is reserved and
+// the handler returns `InvalidOp` (ENOSYS-equivalent). When VFS gains
+// remove, swap the body for a `vfs::resolve_absolute(path, |fs, ino|
+// fs.unlink(ino))` call.
+fn sys_unlink(ctx: &mut dyn TrapContext) {
+    let _args = *ctx.args();
+    // TODO(narf-vfs): implement once VFS has a remove path.
+    ctx.set_return(SyscallReturn::invalid_op());
+}
+
 // ── Close — arg0=fd ────────────────────────────────────────────────
 
 fn sys_close(ctx: &mut dyn TrapContext) {
@@ -1806,6 +1857,8 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     // already replaced the noop_ok stub above.
     table.install_raw(Syscall::Chdir,  "chdir",  RawFnHandler(sys_chdir));
     table.install_raw(Syscall::Getcwd, "getcwd", RawFnHandler(sys_getcwd));
+    table.install_raw(Syscall::Lseek,  "lseek",  RawFnHandler(sys_lseek));
+    table.install_raw(Syscall::Unlink, "unlink", RawFnHandler(sys_unlink));
 
     // Auto-wire both delivery hooks so any kernel that uses
     // `install_core_syscalls` gets the async + sync signal paths

@@ -69,6 +69,9 @@ pub const SYS_FCNTL:          u64 = 163;
 pub const SYS_CHDIR:          u64 = 170;
 pub const SYS_GETCWD:         u64 = 171;
 
+pub const SYS_LSEEK:          u64 = 164;
+pub const SYS_UNLINK:         u64 = 180;
+
 /// `fcntl` command constants — match Linux numbering for the subset
 /// NARF supports today (FD_CLOEXEC + the file-flag query/set pair).
 pub const F_GETFD:    u32 = 1;
@@ -563,6 +566,37 @@ pub fn fstat(fd: u32, out: &mut StatBuf) -> i32 {
     // SAFETY: SYS_FSTAT signature: (fd, out_ptr).
     let r = unsafe {
         syscall2(SYS_FSTAT, fd as u64, out as *mut StatBuf as u64)
+    };
+    if r == 0 { 0 } else { -1 }
+}
+
+/// `lseek(fd, offset, whence)` — update the per-fd offset and
+/// return the new value as i64. `whence` is 0=SET, 1=CUR, 2=END.
+/// Returns -1 on kernel-side failure (out-of-range fd, negative
+/// resulting offset, etc.); the C `off_t` shape preserves the i64
+/// width so callers can distinguish the sentinel from a valid
+/// large offset by the kernel `status` channel — but at the libc
+/// surface the only signal is the value itself.
+#[inline]
+pub fn lseek(fd: u32, offset: i64, whence: u32) -> i64 {
+    // SAFETY: SYS_LSEEK signature: (fd, offset, whence). The asm
+    // wrapper preserves the rdx clobber convention — see the
+    // `inout("rdx") a2 => _` clause in `syscall3`.
+    let r = unsafe {
+        syscall3(SYS_LSEEK, fd as u64, offset as u64, whence as u64)
+    };
+    r as i64
+}
+
+/// `unlink(path)` — remove a file by absolute path. Returns 0 on
+/// success, -1 on failure. Stage-4 stub: VFS doesn't yet expose a
+/// remove primitive, so the kernel returns InvalidOp and this
+/// always fails.
+#[inline]
+pub fn unlink(path: &str) -> i32 {
+    // SAFETY: SYS_UNLINK signature: (path_ptr, path_len).
+    let r = unsafe {
+        syscall2(SYS_UNLINK, path.as_ptr() as u64, path.len() as u64)
     };
     if r == 0 { 0 } else { -1 }
 }

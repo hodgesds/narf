@@ -66,8 +66,12 @@ pub unsafe extern "C" fn atexit(cb: extern "C" fn()) -> i32 {
 /// shutdown — we capture `count` at entry and walk only that
 /// snapshot, but a re-entrant `atexit` would mutate the underlying
 /// array. POSIX is silent on this; we don't promise re-entrancy.
-#[inline]
-pub fn exit(_code: i32) -> ! {
+///
+/// # Safety
+/// `extern "C"` shape so a C consumer can call this directly. There
+/// are no in-process invariants to violate — exit doesn't return.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn exit(_code: i32) -> ! {
     // SAFETY: single-threaded user mode; the snapshot read of
     // `ATEXIT_COUNT` races nothing.
     let count = unsafe { ATEXIT_COUNT };
@@ -81,6 +85,17 @@ pub fn exit(_code: i32) -> ! {
     narf_user_runtime::exit_task()
 }
 
+/// `_exit(2)` — terminate WITHOUT running atexit callbacks. POSIX
+/// distinguishes the two; we honour that by routing straight to the
+/// syscall. C consumers expect this name.
+///
+/// # Safety
+/// See [`exit`]; same shape.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _exit(_code: i32) -> ! {
+    narf_user_runtime::exit_task()
+}
+
 /// Abnormal termination. POSIX `abort(3)` raises `SIGABRT`; in NARF
 /// user mode signal self-delivery is a follow-up, so we instead
 /// write a recognisable marker to stderr and call into the exit
@@ -89,28 +104,41 @@ pub fn exit(_code: i32) -> ! {
 /// The marker is the documented contract: callers (kernel logs,
 /// validate harnesses) can grep for `narf-libc: abort` to detect an
 /// abort path even without a SIGABRT delivery mechanism.
-pub fn abort() -> ! {
+///
+/// # Safety
+/// `extern "C"` shape — never returns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn abort() -> ! {
     let _written = narf_user_runtime::write(2, b"narf-libc: abort\n");
     narf_user_runtime::exit_task()
 }
 
 /// Calling task's monotonic id.
-#[inline]
-pub fn getpid() -> i32 {
+///
+/// # Safety
+/// Pure read — `extern "C"` shape for C linkability.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn getpid() -> i32 {
     narf_user_runtime::getpid() as i32
 }
 
 /// Parent task id, or 0 if none. Stage-4 kernel always returns 0.
-#[inline]
-pub fn getppid() -> i32 {
+///
+/// # Safety
+/// Pure read.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn getppid() -> i32 {
     narf_user_runtime::getppid() as i32
 }
 
 /// POSIX-shaped uid query. NARF maps this to capability authority
 /// rather than POSIX uids; the runtime returns 0 (root-equivalent
 /// in the stub) so the libc surface mirrors that.
-#[inline]
-pub fn getuid() -> i32 {
+///
+/// # Safety
+/// Pure read.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn getuid() -> i32 {
     narf_user_runtime::getuid() as i32
 }
 
@@ -120,8 +148,11 @@ pub fn getuid() -> i32 {
 /// until the deadline passes. Returns 0 (POSIX `sleep` returns
 /// the number of seconds left if interrupted by a signal; we
 /// don't yet interrupt sleeps mid-flight, so always 0).
-#[inline]
-pub fn sleep(seconds: u32) -> u32 {
+///
+/// # Safety
+/// `extern "C"` shape; the argument is plain by-value u32.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sleep(seconds: u32) -> u32 {
     let ns = (seconds as u64).saturating_mul(1_000_000_000);
     let _ = narf_user_runtime::nanosleep(ns);
     0
@@ -130,8 +161,11 @@ pub fn sleep(seconds: u32) -> u32 {
 /// POSIX `usleep(3)`: suspend for `us` microseconds. Returns 0
 /// on success, -1 on error. Same caveat as [`sleep`] applies —
 /// the kernel handler spin-waits in trap context.
-#[inline]
-pub fn usleep(us: u32) -> i32 {
+///
+/// # Safety
+/// See [`sleep`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn usleep(us: u32) -> i32 {
     let ns = (us as u64).saturating_mul(1_000);
     narf_user_runtime::nanosleep(ns)
 }

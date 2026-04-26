@@ -178,7 +178,8 @@ pub extern "C" fn main(
 ) -> i32 {
     use narf_libc::Arg;
 
-    let pid = narf_libc::getpid();
+    // SAFETY: getpid is the C-ABI shape; pure read.
+    let pid = unsafe { narf_libc::getpid() };
     narf_libc::printf_str(
         "hello from narf-libc; pid=%d\n",
         &[Arg::Int(pid as i64)],
@@ -286,7 +287,8 @@ pub extern "C" fn main(
         &[],
     );
 
-    let sleep_ok = narf_libc::usleep(1000) == 0;
+    // SAFETY: usleep is C-ABI shape; spin-waits in the kernel.
+    let sleep_ok = unsafe { narf_libc::usleep(1000) } == 0;
     narf_libc::printf_str(
         if sleep_ok { "sleep: ok\n" } else { "sleep: bad\n" },
         &[],
@@ -348,6 +350,54 @@ pub extern "C" fn main(
     let heap_ok = unsafe { heap_probe() };
     narf_libc::printf_str(
         if heap_ok { "heap: ok\n" } else { "heap: bad\n" },
+        &[],
+    );
+
+    // ── Tier 2.5 probes: snprintf / clock / errno_location ───────
+    //
+    // snprintf into a fixed buffer, then compare against the expected
+    // formatted bytes. The vsnprintf_str path goes through the same
+    // Sink-as-buf branch the real C-style snprintf would.
+    let mut sn: [u8; 32] = [0; 32];
+    let n = narf_libc::snprintf_str(&mut sn, "%5d %s", &[Arg::Int(42), Arg::Str("hi")]);
+    let want: &[u8] = b"   42 hi\0";
+    let snprintf_ok = n == 8
+        && sn[..want.len()] == *want;
+    narf_libc::printf_str(
+        if snprintf_ok { "snprintf: ok\n" } else { "snprintf: bad\n" },
+        &[],
+    );
+
+    // clock_gettime: two reads back-to-back must produce monotonic
+    // non-decreasing values. The kernel's monotonic_ns() is the
+    // backing source; even with no spin between calls the cycle
+    // counter advances per RDTSC, so a bad wiring would surface as
+    // "second tv_sec/tv_nsec went backwards".
+    // SAFETY: timespec is #[repr(C)]; we hand the kernel a writable slot.
+    let mut t1 = narf_libc::timespec::default();
+    let mut t2 = narf_libc::timespec::default();
+    let clk_ok = unsafe {
+        let r1 = narf_libc::clock_gettime(0, &mut t1);
+        let r2 = narf_libc::clock_gettime(0, &mut t2);
+        r1 == 0 && r2 == 0
+            && (t2.tv_sec > t1.tv_sec
+                || (t2.tv_sec == t1.tv_sec && t2.tv_nsec >= t1.tv_nsec))
+    };
+    narf_libc::printf_str(
+        if clk_ok { "clock: ok\n" } else { "clock: bad\n" },
+        &[],
+    );
+
+    // __errno_location round-trip: write through the pointer and
+    // observe the change via the Rust errno() accessor.
+    // SAFETY: pointer is stable for the life of this thread.
+    let errno_ok = unsafe {
+        let p = narf_libc::__errno_location();
+        *p = 7;
+        narf_libc::errno() == 7
+    };
+    narf_libc::printf_str(
+        if errno_ok { "errno_loc: ok\n" } else { "errno_loc: bad\n" },
         &[],
     );
 

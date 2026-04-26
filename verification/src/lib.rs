@@ -10962,6 +10962,12 @@ fn smoke_frame_x86_64_run_narf_libc_validate() -> TestResult {
     //                    distinct-live-chunks, free-list-reuse, and
     //                    realloc-grow probes (see narf-libc-validate
     //                    `heap_probe`).
+    //   snprintf: ok  <- Tier-2.5 io::Sink-as-buf path: snprintf_str
+    //                    of `%5d %s` matches `   42 hi\0` byte-for-byte.
+    //   clock: ok     <- clock_gettime back-to-back returns monotonic
+    //                    non-decreasing timespec values.
+    //   errno_loc: ok <- __errno_location() pointer round-trips
+    //                    through the Rust errno() accessor.
     //   atexit: ok    <- emitted from the atexit callback, after
     //                    `main` returns and before exit_task.
     narf_userspace::bootstrap_init();

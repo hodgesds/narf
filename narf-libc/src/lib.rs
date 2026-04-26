@@ -38,14 +38,16 @@ pub mod fd;
 pub mod fs;
 pub mod heap;
 pub mod io;
+pub mod posix;
 pub mod process;
 pub mod startup;
 pub mod stdio;
 pub mod string;
+pub mod time;
 
 pub use arch::_start;
 pub use env::{getenv, getenv_cstr, setenv, unsetenv, ENVIRON};
-pub use errno::{errno, set_errno};
+pub use errno::{errno, set_errno, __errno_location};
 pub use fd::{
     dup, dup2, fcntl, fstat, pipe, stat, FD_CLOEXEC, F_GETFD, F_GETFL, F_SETFD,
     F_SETFL, StatBuf,
@@ -56,8 +58,14 @@ pub use heap::{calloc, free, malloc, realloc};
 // FILE*-shaped one (re-exported below) is the canonical public
 // surface. The internal helper is still reachable as
 // `crate::io::fputs` for non-public call sites that haven't migrated.
-pub use io::{fprintf_str, printf_str, vprintf_str, write, Arg, Stdout};
-pub use process::{abort, atexit, exit, getpid, getppid, getuid, sleep, usleep};
+pub use io::{fprintf_str, printf_str, snprintf_str, vprintf_str, vsnprintf_str, write, Arg, Stdout};
+pub use posix::{
+    close as posix_close, lseek as posix_lseek, open as posix_open,
+    read as posix_read, unlink as posix_unlink, write as posix_write,
+    SEEK_CUR, SEEK_END, SEEK_SET,
+};
+pub use process::{abort, atexit, exit, _exit, getpid, getppid, getuid, sleep, usleep};
+pub use time::{clock_gettime, gettimeofday, time, timespec, timeval};
 pub use startup::__libc_start_main;
 // Note: `stdio::fputs` shadows the older `io::fputs(&str, fd)` helper
 // — the FILE*-shaped one is the POSIX-correct surface and is the one

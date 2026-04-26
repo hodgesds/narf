@@ -61,7 +61,9 @@ pub unsafe extern "C" fn __libc_start_main(rsp_at_entry: u64) -> ! {
     // declared in `lib.rs`. It is the bin's responsibility to
     // honour the C ABI (we declared it `extern "C"`).
     let rc = unsafe { super::main(argc, argv, envp) };
-    exit(rc)
+    // SAFETY: `exit` is the C-ABI shape; calling it here completes
+    // the relibc startup contract and never returns.
+    unsafe { exit(rc) }
 }
 
 /// SAFETY: see [`__libc_start_main`]'s contract.

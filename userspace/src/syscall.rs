@@ -260,6 +260,24 @@ pub enum Syscall {
     /// a real libc translates that to ERANGE; the syscall return
     /// shape doesn't yet carry an errno channel.
     Getcwd       = 171,
+
+    // ── Tier-2.5 fd extensions ─────────────────────────────────────
+    //
+    // Slots 164/180 reserved for `lseek(2)` and `unlink(2)`. Numbers
+    // chosen to leave the dup family + cwd block contiguous and to
+    // give unlink room for a follow-on `rename(2)` at 181.
+
+    /// `arg0 = fd`, `arg1 = offset (i64)`, `arg2 = whence`
+    /// (0 = SEEK_SET, 1 = SEEK_CUR, 2 = SEEK_END). Updates the
+    /// per-fd offset and returns the new value as the syscall's
+    /// `value`. `InvalidOp` on out-of-range fd or negative result.
+    Lseek        = 164,
+
+    /// `arg0 = path_ptr`, `arg1 = path_len`. Removes a file from the
+    /// VFS. Stage-4: stub — VFS does not yet expose a remove API, so
+    /// the handler returns `InvalidOp` (ENOSYS-equivalent on the
+    /// wire) until VFS support lands.
+    Unlink       = 180,
 }
 
 impl Syscall {
@@ -301,6 +319,8 @@ impl Syscall {
             163 => Syscall::Fcntl,
             170 => Syscall::Chdir,
             171 => Syscall::Getcwd,
+            164 => Syscall::Lseek,
+            180 => Syscall::Unlink,
             _   => return None,
         })
     }
