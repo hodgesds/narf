@@ -11565,3 +11565,80 @@ fn smoke_block_deadline_tags_are_monotonic() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_block_deadline_tags_are_monotonic);
+
+fn smoke_userspace_getrandom_fills_buffer() -> TestResult {
+    use narf_userspace::{install_core_syscalls, install_global,
+                         kernel_syscall_entry, syscall::__test_clear_global,
+                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+                         TrapContext};
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // First call: fill a 16-byte buffer. Returns 16, buffer mostly
+    // non-zero (false-positive rate of "all zeros under a real RNG"
+    // is 2^-128 — tolerable as a smoke).
+    let mut buf = [0u8; 16];
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: buf.as_mut_ptr() as u64,
+            arg1: buf.len() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::GetRandom.raw(), &mut ctx);
+    let n = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value,
+        _ => return TestResult::Fail("getrandom did not return OK"),
+    };
+    if n != 16 { return TestResult::Fail("getrandom byte-count != 16"); }
+    if buf.iter().all(|&b| b == 0) {
+        return TestResult::Fail("getrandom buffer is all zeros");
+    }
+
+    // Second call: fill again, expect a different stream.
+    let prev = buf;
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: buf.as_mut_ptr() as u64,
+            arg1: buf.len() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::GetRandom.raw(), &mut ctx);
+    if buf == prev {
+        return TestResult::Fail("two consecutive getrandom calls returned identical bytes");
+    }
+
+    // Null pointer rejected with -1.
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 0,
+            arg1: 16,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::GetRandom.raw(), &mut ctx);
+    let null_rejected = matches!(
+        ctx.ret,
+        Some(r) if r.status == SyscallReturn::OK && r.value == (-1i64) as u64,
+    );
+    if !null_rejected {
+        return TestResult::Fail("getrandom did not reject null buffer");
+    }
+
+    __test_clear_global();
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_getrandom_fills_buffer);

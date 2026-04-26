@@ -302,6 +302,21 @@ pub enum Syscall {
     /// resolve to the same parent directory or the syscall returns
     /// failure.
     Rename       = 192,
+
+    // ── Tier-3z entropy ────────────────────────────────────────────
+    //
+    // Slot 200 sits above the directory-mutation block to leave room
+    // for future fs syscalls (read-link, sync, fdatasync, ...).
+
+    /// `arg0 = buf_ptr`, `arg1 = buf_len`, `arg2 = flags (ignored)`.
+    /// Fill the user buffer with up-to `buf_len` random bytes.
+    /// Returns the byte count actually written; -1 on bad pointer or
+    /// length. Stage-4 backing source is a Park-Miller LCG seeded
+    /// from `monotonic_ns()` mixed with the cycle counter — NOT
+    /// cryptographically secure. The seed quality matches
+    /// `crypto::per_task_rng()` so callers wanting real entropy
+    /// must also gate on a future `arch::has_hw_entropy()` probe.
+    GetRandom    = 200,
 }
 
 impl Syscall {
@@ -348,6 +363,7 @@ impl Syscall {
             190 => Syscall::Mkdir,
             191 => Syscall::Rmdir,
             192 => Syscall::Rename,
+            200 => Syscall::GetRandom,
             _   => return None,
         })
     }

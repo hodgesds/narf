@@ -1331,6 +1331,88 @@ fn sys_noop_ok(ctx: &mut dyn TrapContext) {
 // duration) but pessimal for throughput. The follow-up is to route
 // Sleep through `narf_time::sleep_cycles` once every user task is
 // itself a polling future.
+// ── GetRandom — arg0=buf, arg1=len, arg2=flags(ignored) ─────────────
+//
+// Fill the caller's user-mode buffer with random bytes. Stage-4
+// backing is a Park-Miller LCG seeded from monotonic_ns() — NOT
+// cryptographically secure (matches `crypto::per_task_rng`'s seed
+// quality, which carries the same caveat). When `arch/` exposes a
+// HW entropy probe (RDSEED on x86_64, RNDR on aarch64), the seed
+// path here gets replaced.
+//
+// Single-threaded user mode lets the static state work without a
+// lock; when SMP user tasks land this should grow per-task storage.
+//
+// Output bytes are written via `write_volatile` to stay safe against
+// LLVM eliding the loop on `&mut [u8]` views into user memory.
+
+/// Park-Miller minimal-standard LCG state. Initialised lazily on
+/// first call from `monotonic_ns()`. The value lives in an
+/// `AtomicU64` so a future SMP rework can keep the same shape.
+static GETRANDOM_STATE: core::sync::atomic::AtomicU64
+    = core::sync::atomic::AtomicU64::new(0);
+
+fn next_random_u32() -> u32 {
+    use core::sync::atomic::Ordering;
+    let mut s = GETRANDOM_STATE.load(Ordering::Relaxed);
+    if s == 0 {
+        // Lazy seed from monotonic_ns mixed with the cycle counter
+        // so two boots see different streams.
+        let ns = narf_scheduler::narf_time::monotonic_ns();
+        let cy = narf_scheduler::narf_time::now_cycles();
+        s = (ns ^ cy.wrapping_mul(0x9E37_79B9_7F4A_7C15)) & 0x7FFF_FFFF;
+        if s == 0 { s = 1; }
+    }
+    // x' = x * 48271 mod (2^31 - 1)
+    s = (s.wrapping_mul(48271)) % 0x7FFF_FFFF;
+    GETRANDOM_STATE.store(s, Ordering::Relaxed);
+    s as u32
+}
+
+fn sys_getrandom(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let ptr  = args.arg0 as *mut u8;
+    let len  = args.arg1 as usize;
+    let _flags = args.arg2; // accepted-and-ignored
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if ptr.is_null() {
+        ctx.set_return(fail);
+        return;
+    }
+    if len == 0 {
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+    // Walk the buffer in 4-byte chunks via volatile writes — a Rust
+    // `&mut [u8]` over user memory + LLVM optimisations could
+    // otherwise drop the writes if the compiler proves they're
+    // dead from the kernel's perspective.
+    // SAFETY: caller-supplied user pointer in the active AS;
+    // length-bounded; bad pointer faults the user, not us.
+    unsafe {
+        let mut i = 0usize;
+        while i + 4 <= len {
+            let v = next_random_u32();
+            core::ptr::write_volatile(ptr.add(i)     , (v        & 0xFF) as u8);
+            core::ptr::write_volatile(ptr.add(i + 1), ((v >> 8)  & 0xFF) as u8);
+            core::ptr::write_volatile(ptr.add(i + 2), ((v >> 16) & 0xFF) as u8);
+            core::ptr::write_volatile(ptr.add(i + 3), ((v >> 24) & 0xFF) as u8);
+            i += 4;
+        }
+        // Tail bytes (0..3 of them).
+        if i < len {
+            let v = next_random_u32();
+            let mut shift = 0u32;
+            while i < len {
+                core::ptr::write_volatile(ptr.add(i), ((v >> shift) & 0xFF) as u8);
+                i += 1;
+                shift += 8;
+            }
+        }
+    }
+    ctx.set_return(SyscallReturn::ok(len as u64));
+}
+
 fn sys_sleep(ctx: &mut dyn TrapContext) {
     let ns = ctx.args().arg0;
     if ns == 0 {
@@ -2019,6 +2101,9 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Mkdir,  "mkdir",  RawFnHandler(sys_mkdir));
     table.install_raw(Syscall::Rmdir,  "rmdir",  RawFnHandler(sys_rmdir));
     table.install_raw(Syscall::Rename, "rename", RawFnHandler(sys_rename));
+
+    // Tier-3z entropy.
+    table.install_raw(Syscall::GetRandom, "getrandom", RawFnHandler(sys_getrandom));
 
     // Auto-wire both delivery hooks so any kernel that uses
     // `install_core_syscalls` gets the async + sync signal paths

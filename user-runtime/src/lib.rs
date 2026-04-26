@@ -45,6 +45,7 @@ pub const SYS_READ:           u64 = 111;
 pub const SYS_WRITE:          u64 = 112;
 pub const SYS_CLOSE:          u64 = 113;
 // Tier-2 fd-table breadth + path resolution + pipe (115..=117 reserved).
+pub const SYS_GETRANDOM:      u64 = 200;
 pub const SYS_STAT:           u64 = 115;
 pub const SYS_FSTAT:          u64 = 116;
 pub const SYS_PIPE:           u64 = 117;
@@ -700,6 +701,28 @@ pub fn rename(old_path: &str, new_path: &str) -> i32 {
         )
     };
     if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `getrandom(buf, flags)` — fill `buf` with up-to `buf.len()`
+/// pseudo-random bytes. Stage-4 backing is a Park-Miller LCG
+/// seeded from `monotonic_ns()` mixed with the cycle counter —
+/// **not cryptographically secure**. Returns the byte count
+/// written, or -1 on error. `flags` is accepted-and-ignored
+/// (Linux's GRND_RANDOM / GRND_NONBLOCK / GRND_INSECURE have no
+/// distinction at this seed quality).
+#[inline]
+pub fn getrandom(buf: &mut [u8], flags: u32) -> isize {
+    if buf.is_empty() { return 0; }
+    // SAFETY: SYS_GETRANDOM signature: (buf_ptr, buf_len, flags).
+    let r = unsafe {
+        syscall3(
+            SYS_GETRANDOM,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            flags as u64,
+        )
+    };
+    r as isize
 }
 
 /// `pipe()` — allocate a fresh pipe and install both halves in the
