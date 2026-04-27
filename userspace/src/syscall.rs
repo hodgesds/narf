@@ -342,6 +342,21 @@ pub enum Syscall {
     /// `arg1 = tid`, `arg2 = signum`. Returns 0 on success.
     Tgkill       = 175,
 
+    /// Linux futex(2) minimal scaffold. `arg0 = uaddr_ptr`,
+    /// `arg1 = op`, `arg2 = val`, `arg3 = timeout/uaddr2`,
+    /// `arg4 = val3`. Honoured ops:
+    ///   - FUTEX_WAIT (0): if `*uaddr == val`, would block. NARF
+    ///                     is single-threaded so no other task can
+    ///                     wake us — we return 0 (spurious wakeup
+    ///                     allowed by spec) so consumer code falls
+    ///                     into its loop.
+    ///   - FUTEX_WAKE (1): would wake up to `val` waiters; we have
+    ///                     none, so return 0.
+    ///   - FUTEX_PRIVATE (0x80) and FUTEX_CLOCK_REALTIME (0x100)
+    ///                     bits are accepted-and-ignored.
+    /// Other ops return -1.
+    Futex        = 177,
+
     /// Linux prctl(2): per-task settings switchboard. `arg0 = op`,
     /// `arg1 = argA`, `arg2 = argB`. Honoured ops:
     ///   - PR_SET_NAME  (15): argA = pointer to up-to-15-byte
@@ -578,6 +593,7 @@ impl Syscall {
             168 => Syscall::Gettid,
             169 => Syscall::Prctl,
             175 => Syscall::Tgkill,
+            177 => Syscall::Futex,
             176 => Syscall::ClockSetTime,
             156 => Syscall::Getpriority,
             157 => Syscall::Setpriority,

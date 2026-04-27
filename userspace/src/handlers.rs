@@ -2880,6 +2880,43 @@ fn sys_kill(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(0));
 }
 
+// ── futex — minimal scaffold ────────────────────────────────────────
+//
+// Linux futex(2) is the kernel-side primitive backing pthread
+// mutexes / condvars / once-init. Even a no-op handler lets
+// libstdc++ + glibc thread fixtures load. NARF is single-
+// threaded; there are no waiters to wake or block.
+//
+// Honoured ops (after stripping the FUTEX_PRIVATE / FUTEX_CLOCK_
+// REALTIME bits):
+//   FUTEX_WAIT (0): would block until the futex word is woken
+//                   or the timeout fires. Single-threaded NARF
+//                   has no other task to do the wake, so we
+//                   return 0 (the spec permits spurious wakes
+//                   so the caller will re-check the condition).
+//   FUTEX_WAKE (1): would wake up to `val` waiters. We have
+//                   none; return 0.
+//
+// Anything else returns -1 with the libc shim setting
+// errno = ENOSYS.
+
+const FUTEX_WAIT:    u64 = 0;
+const FUTEX_WAKE:    u64 = 1;
+const FUTEX_PRIVATE: u64 = 0x80;
+const FUTEX_CLOCK_REALTIME: u64 = 0x100;
+const FUTEX_OP_MASK: u64 = !(FUTEX_PRIVATE | FUTEX_CLOCK_REALTIME);
+
+fn sys_futex(ctx: &mut dyn TrapContext) {
+    let op = ctx.args().arg1 & FUTEX_OP_MASK;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    match op {
+        FUTEX_WAIT | FUTEX_WAKE => {
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        _ => ctx.set_return(fail),
+    }
+}
+
 /// Linux tgkill(2): like kill but with an explicit (tgid, tid)
 /// pair. NARF is single-threaded per process — we forward tid as
 /// the kill target and ignore tgid (the disambiguation it provides
@@ -3266,6 +3303,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Sigaction,    "sigaction",     RawFnHandler(sys_sigaction));
     table.install_raw(Syscall::Kill,         "kill",          RawFnHandler(sys_kill));
     table.install_raw(Syscall::Tgkill,       "tgkill",        RawFnHandler(sys_tgkill));
+    table.install_raw(Syscall::Futex,        "futex",         RawFnHandler(sys_futex));
     table.install_raw(Syscall::Sigprocmask,  "sigprocmask",   RawFnHandler(sys_sigprocmask));
 
     // Tier-2 fd-table breadth + path-resolution + pipe(2).

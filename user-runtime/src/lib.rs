@@ -81,6 +81,7 @@ pub const SYS_SCHED_SETAFFINITY: u64 = 167;
 pub const SYS_GETTID:         u64 = 168;
 pub const SYS_PRCTL:          u64 = 169;
 pub const SYS_TGKILL:         u64 = 175;
+pub const SYS_FUTEX:          u64 = 177;
 pub const SYS_SETPRIORITY:    u64 = 157;
 pub const SYS_TIMES:          u64 = 158;
 pub const SYS_GETRUSAGE:      u64 = 159;
@@ -562,6 +563,31 @@ pub fn tgkill(tgid: i64, tid: u64, signum: u32) -> i32 {
         syscall3(SYS_TGKILL, tgid as u64, tid, signum as u64)
     };
     if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `futex(uaddr, op, val, timeout, uaddr2, val3)` — Linux futex(2).
+/// Stage-4 NARF honours only FUTEX_WAIT (0) and FUTEX_WAKE (1)
+/// (with optional FUTEX_PRIVATE and FUTEX_CLOCK_REALTIME bits);
+/// every other op returns -1.
+#[inline]
+pub fn futex(
+    uaddr:   *mut u32,
+    op:      u32,
+    val:     u32,
+    timeout: u64,
+    uaddr2:  u64,
+    val3:    u32,
+) -> i64 {
+    // SAFETY: SYS_FUTEX signature mirrors Linux:
+    //   (uaddr, op, val, timeout/uaddr2, uaddr2, val3).
+    let r = unsafe {
+        syscall6(
+            SYS_FUTEX,
+            uaddr as u64, op as u64, val as u64,
+            timeout, uaddr2, val3 as u64,
+        )
+    };
+    r as i64
 }
 
 /// `prctl(op, arg_a, arg_b)` — Linux per-task settings switchboard.

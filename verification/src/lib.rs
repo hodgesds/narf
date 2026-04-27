@@ -13167,3 +13167,58 @@ fn smoke_userspace_clock_settime_pushes_wall_offset() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_userspace_clock_settime_pushes_wall_offset);
+
+fn smoke_userspace_futex_wait_and_wake_no_op() -> TestResult {
+    use narf_userspace::{install_core_syscalls, install_global,
+                         kernel_syscall_entry, syscall::__test_clear_global,
+                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+                         TrapContext};
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    fn call(op: u64) -> Option<SyscallReturn> {
+        let mut ctx = FakeCtx {
+            args: SyscallArgs {
+                arg0: 0, arg1: op, arg2: 0, arg3: 0, arg4: 0, arg5: 0,
+            },
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::Futex.raw(), &mut ctx);
+        ctx.ret
+    }
+
+    // FUTEX_WAIT (0) → 0.
+    if !matches!(call(0), Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+        return TestResult::Fail("FUTEX_WAIT did not return 0");
+    }
+    // FUTEX_WAKE (1) → 0.
+    if !matches!(call(1), Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+        return TestResult::Fail("FUTEX_WAKE did not return 0");
+    }
+    // FUTEX_WAIT | FUTEX_PRIVATE (0x80) → 0 (private bit stripped).
+    if !matches!(call(0 | 0x80), Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+        return TestResult::Fail("FUTEX_WAIT_PRIVATE did not return 0");
+    }
+    // Unsupported op → -1.
+    let r = call(99);
+    let unknown_rejected = matches!(
+        r,
+        Some(rr) if rr.status == SyscallReturn::OK && rr.value == (-1i64) as u64,
+    );
+    if !unknown_rejected {
+        return TestResult::Fail("futex(99) was not rejected");
+    }
+
+    __test_clear_global();
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_futex_wait_and_wake_no_op);
