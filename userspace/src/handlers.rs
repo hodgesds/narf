@@ -1662,6 +1662,116 @@ fn sys_setgid(ctx: &mut dyn TrapContext) {
     }
 }
 
+// ── Per-task rlimit table ──────────────────────────────────────────
+//
+// POSIX getrlimit / setrlimit query and update per-resource soft
+// (`rlim_cur`) and hard (`rlim_max`) limits. NARF doesn't enforce
+// these — capabilities replace authority, and task-bound resource
+// budgets live in the scheduler's BudgetAccount path. The table
+// here is structural state only so a libc consumer that
+// round-trips `setrlimit(RLIMIT_NOFILE, &r)` followed by
+// `getrlimit(RLIMIT_NOFILE, &r2)` sees `r2 == r`.
+//
+// Defaults match what real Linux distros surface to a normal user:
+//   RLIMIT_CPU     = INFINITY
+//   RLIMIT_FSIZE   = INFINITY
+//   RLIMIT_DATA    = INFINITY
+//   RLIMIT_STACK   = (8 MiB cur, INFINITY max)
+//   RLIMIT_CORE    = (0 cur, INFINITY max)
+//   RLIMIT_NOFILE  = (256 cur, 4096 max) — matches our actual fd-table cap
+//   RLIMIT_AS      = INFINITY
+
+const RLIMIT_COUNT: usize = 16;
+
+/// Wire-shape pair: rlim_cur followed by rlim_max. Matches the
+/// glibc layout the libc shim already exposes.
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+struct RLimitPair { cur: u64, max: u64 }
+
+const RLIM_INFINITY: u64 = !0;
+
+fn default_rlimits() -> [RLimitPair; RLIMIT_COUNT] {
+    let mut t = [RLimitPair { cur: RLIM_INFINITY, max: RLIM_INFINITY }; RLIMIT_COUNT];
+    // RLIMIT_STACK = 3.
+    t[3] = RLimitPair { cur: 8 * 1024 * 1024, max: RLIM_INFINITY };
+    // RLIMIT_CORE = 4.
+    t[4] = RLimitPair { cur: 0,               max: RLIM_INFINITY };
+    // RLIMIT_NOFILE = 7.
+    t[7] = RLimitPair { cur: 256,             max: 4096 };
+    t
+}
+
+static RLIMIT_TABLE:
+    narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, [RLimitPair; RLIMIT_COUNT]>>>
+    = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+pub fn rlimit_init() {
+    *RLIMIT_TABLE.lock() = Some(BTreeMap::new());
+}
+
+#[doc(hidden)]
+pub fn __test_rlimit_reset() { *RLIMIT_TABLE.lock() = None; }
+
+fn read_rlimit(task: u64, resource: usize) -> Option<RLimitPair> {
+    if resource >= RLIMIT_COUNT { return None; }
+    let g = RLIMIT_TABLE.lock();
+    let m = g.as_ref()?;
+    let row = m.get(&task).copied().unwrap_or_else(default_rlimits);
+    Some(row[resource])
+}
+
+fn write_rlimit(task: u64, resource: usize, val: RLimitPair) -> bool {
+    if resource >= RLIMIT_COUNT { return false; }
+    let mut g = RLIMIT_TABLE.lock();
+    let Some(m) = g.as_mut() else { return false; };
+    let row = m.entry(task).or_insert_with(default_rlimits);
+    row[resource] = val;
+    true
+}
+
+fn sys_getrlimit(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let resource = args.arg0 as usize;
+    let out_ptr  = args.arg1 as *mut u64;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if out_ptr.is_null() {
+        ctx.set_return(fail);
+        return;
+    }
+    let task = current_task_id();
+    let pair = match read_rlimit(task, resource) {
+        Some(p) => p,
+        None    => { ctx.set_return(fail); return; }
+    };
+    // SAFETY: caller-supplied writable user vaddr; we write two u64s.
+    unsafe {
+        core::ptr::write_volatile(out_ptr,           pair.cur);
+        core::ptr::write_volatile(out_ptr.add(1),    pair.max);
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+fn sys_setrlimit(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let resource = args.arg0 as usize;
+    let in_ptr   = args.arg1 as *const u64;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if in_ptr.is_null() {
+        ctx.set_return(fail);
+        return;
+    }
+    // SAFETY: caller-supplied readable user vaddr; we read two u64s.
+    let cur = unsafe { core::ptr::read_volatile(in_ptr) };
+    let max = unsafe { core::ptr::read_volatile(in_ptr.add(1)) };
+    let task = current_task_id();
+    if write_rlimit(task, resource, RLimitPair { cur, max }) {
+        ctx.set_return(SyscallReturn::ok(0));
+    } else {
+        ctx.set_return(fail);
+    }
+}
+
 // ── Hostname (kernel-wide) ─────────────────────────────────────────
 //
 // One global string behind an IrqSafeSpinLock, initialised to
@@ -2538,6 +2648,8 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::SetGid,   "setgid",   RawFnHandler(sys_setgid));
     table.install_raw(Syscall::GetHostname, "gethostname", RawFnHandler(sys_gethostname));
     table.install_raw(Syscall::SetHostname, "sethostname", RawFnHandler(sys_sethostname));
+    table.install_raw(Syscall::Getrlimit,   "getrlimit",   RawFnHandler(sys_getrlimit));
+    table.install_raw(Syscall::Setrlimit,   "setrlimit",   RawFnHandler(sys_setrlimit));
     table.install_raw(Syscall::ExitTask, "exit",     RawFnHandler(sys_exit_task));
     table.install_raw(Syscall::Yield,    "yield",    RawFnHandler(sys_yield));
     table.install_raw(Syscall::Sleep,    "sleep",    RawFnHandler(sys_sleep));

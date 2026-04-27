@@ -240,6 +240,18 @@ pub enum Syscall {
     /// -1 on rejection (length cap, malformed UTF-8).
     SetHostname  = 147,
 
+    /// `arg0 = resource` (POSIX RLIMIT_*), `arg1 = rlimit_out_ptr`.
+    /// Write the current task's `rlimit { cur, max }` pair into the
+    /// user buffer. Returns 0 on success, -1 on bad pointer / out-
+    /// of-range resource. NARF tracks rlimits as structural state
+    /// only — capabilities still gate every privileged operation.
+    Getrlimit    = 148,
+
+    /// `arg0 = resource`, `arg1 = rlimit_in_ptr`. Update the
+    /// current task's `rlimit` for `resource`. Returns 0 on
+    /// success, -1 on rejection.
+    Setrlimit    = 149,
+
     /// Set or query the per-task heap break.
     /// `arg0 = 0` → return current break; `arg0 != 0` → resize.
     /// POSIX `brk(2)` semantics: failure returns the unchanged break.
@@ -441,6 +453,8 @@ impl Syscall {
             145 => Syscall::SetGid,
             146 => Syscall::GetHostname,
             147 => Syscall::SetHostname,
+            148 => Syscall::Getrlimit,
+            149 => Syscall::Setrlimit,
             150 => Syscall::Brk,
             151 => Syscall::ClockGetTime,
             152 => Syscall::Sigaction,

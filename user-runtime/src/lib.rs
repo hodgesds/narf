@@ -69,6 +69,8 @@ pub const SYS_FDATASYNC:      u64 = 124;
 pub const SYS_PIPE2:          u64 = 125;
 pub const SYS_GETHOSTNAME:    u64 = 146;
 pub const SYS_SETHOSTNAME:    u64 = 147;
+pub const SYS_GETRLIMIT:      u64 = 148;
+pub const SYS_SETRLIMIT:      u64 = 149;
 pub const SYS_BRK:            u64 = 150;
 pub const SYS_CLOCK_GETTIME:  u64 = 151;
 pub const SYS_SIGACTION:      u64 = 152;
@@ -464,6 +466,29 @@ pub fn fsync(fd: u32) -> i32 {
 pub fn fdatasync(fd: u32) -> i32 {
     // SAFETY: SYS_FDATASYNC takes a single arg (fd).
     let r = unsafe { syscall1(SYS_FDATASYNC, fd as u64) };
+    if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `getrlimit(resource, out)` — read the calling task's
+/// `rlim { cur, max }` pair for `resource`. `out` receives two
+/// u64s: rlim_cur, rlim_max. Returns 0 on success, -1 on bad
+/// pointer / out-of-range resource.
+#[inline]
+pub fn getrlimit(resource: u32, out: &mut [u64; 2]) -> i32 {
+    // SAFETY: SYS_GETRLIMIT signature: (resource, out_ptr).
+    let r = unsafe {
+        syscall2(SYS_GETRLIMIT, resource as u64, out.as_mut_ptr() as u64)
+    };
+    if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `setrlimit(resource, val)` — record `val = [cur, max]`.
+#[inline]
+pub fn setrlimit(resource: u32, val: &[u64; 2]) -> i32 {
+    // SAFETY: SYS_SETRLIMIT signature: (resource, in_ptr).
+    let r = unsafe {
+        syscall2(SYS_SETRLIMIT, resource as u64, val.as_ptr() as u64)
+    };
     if r as i64 == -1 { -1 } else { 0 }
 }
 

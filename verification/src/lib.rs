@@ -12347,3 +12347,108 @@ fn smoke_filesystem_devfs_mount_default_idempotent() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_filesystem_devfs_mount_default_idempotent);
+
+fn smoke_userspace_rlimit_round_trip() -> TestResult {
+    use narf_userspace::{install_core_syscalls, install_global,
+                         kernel_syscall_entry, rlimit_init,
+                         syscall::__test_clear_global,
+                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+                         TrapContext};
+
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+    narf_userspace::handlers::__test_rlimit_reset();
+    rlimit_init();
+
+    // Default RLIMIT_NOFILE (resource 7) is (256, 4096).
+    let mut out = [0u64; 2];
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 7,
+            arg1: out.as_mut_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Getrlimit.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+        return TestResult::Fail("getrlimit(NOFILE) did not return OK");
+    }
+    if out != [256, 4096] {
+        return TestResult::Fail("default RLIMIT_NOFILE not (256, 4096)");
+    }
+
+    // Default RLIMIT_STACK (resource 3) is (8 MiB, INFINITY).
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 3,
+            arg1: out.as_mut_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Getrlimit.raw(), &mut ctx);
+    if out != [8 * 1024 * 1024, !0u64] {
+        return TestResult::Fail("default RLIMIT_STACK not (8 MiB, INFINITY)");
+    }
+
+    // setrlimit(NOFILE, (1024, 2048)) sticks across a re-read.
+    let new_pair: [u64; 2] = [1024, 2048];
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 7,
+            arg1: new_pair.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Setrlimit.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+        return TestResult::Fail("setrlimit did not return OK");
+    }
+
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 7,
+            arg1: out.as_mut_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Getrlimit.raw(), &mut ctx);
+    if out != [1024, 2048] {
+        return TestResult::Fail("setrlimit did not stick");
+    }
+
+    // Out-of-range resource → -1.
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 99,
+            arg1: out.as_mut_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Getrlimit.raw(), &mut ctx);
+    let bad_resource_rejected = matches!(
+        ctx.ret,
+        Some(r) if r.status == SyscallReturn::OK && r.value == (-1i64) as u64,
+    );
+    if !bad_resource_rejected {
+        return TestResult::Fail("getrlimit(99) was not rejected");
+    }
+
+    narf_userspace::handlers::__test_rlimit_reset();
+    __test_clear_global();
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_rlimit_round_trip);

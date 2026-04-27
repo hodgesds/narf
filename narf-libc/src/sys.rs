@@ -258,28 +258,37 @@ pub const RLIMIT_CORE:   c_int = 4;
 pub const RLIMIT_NOFILE: c_int = 7;
 pub const RLIMIT_AS:     c_int = 9;
 
-/// `getrlimit(resource, *rlim)` — populate with `RLIM_INFINITY`
-/// for both fields (NARF doesn't enforce limits at user mode).
+/// `getrlimit(resource, *rlim)` — read the calling task's rlimit
+/// for `resource`. NARF tracks rlimits as structural state only
+/// (capabilities still gate every privileged operation), so the
+/// values round-trip via setrlimit / getrlimit but don't enforce.
 ///
 /// # Safety
 /// `rlim` must be a writable `*mut rlimit`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn getrlimit(_resource: c_int, rlim: *mut rlimit) -> c_int {
+pub unsafe extern "C" fn getrlimit(resource: c_int, rlim: *mut rlimit) -> c_int {
     if rlim.is_null() { return -1; }
+    let mut out: [u64; 2] = [0; 2];
+    let r = narf_user_runtime::getrlimit(resource as u32, &mut out);
+    if r != 0 { return -1; }
     // SAFETY: caller-supplied writable struct.
     unsafe {
-        *rlim = rlimit {
-            rlim_cur: RLIM_INFINITY,
-            rlim_max: RLIM_INFINITY,
-        };
+        *rlim = rlimit { rlim_cur: out[0], rlim_max: out[1] };
     }
     0
 }
 
-/// `setrlimit(resource, *rlim)` — accept and ignore.
+/// `setrlimit(resource, *rlim)` — record the new soft+hard limits.
+///
+/// # Safety
+/// `rlim` must be a readable `*const rlimit`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn setrlimit(_resource: c_int, _rlim: *const rlimit) -> c_int {
-    0
+pub unsafe extern "C" fn setrlimit(resource: c_int, rlim: *const rlimit) -> c_int {
+    if rlim.is_null() { return -1; }
+    // SAFETY: caller-supplied readable struct.
+    let r = unsafe { *rlim };
+    let pair: [u64; 2] = [r.rlim_cur, r.rlim_max];
+    narf_user_runtime::setrlimit(resource as u32, &pair)
 }
 
 // ── <dlfcn.h> ───────────────────────────────────────────────────────
