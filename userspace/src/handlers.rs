@@ -1549,6 +1549,111 @@ fn sys_listdir(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(total as u64));
 }
 
+// ── Getdents64 — batched directory read in linux_dirent64 format ──
+//
+// arg0 = path string (path-based, not fd-based — NARF doesn't have
+// directory fds yet); arg1/2 = path len + cursor; arg3/4 = buf+len.
+//
+// linux_dirent64 wire layout:
+//   d_ino:    u64
+//   d_off:    u64    — cursor of the *next* entry
+//   d_reclen: u16    — total record length, 8-byte aligned
+//   d_type:   u8
+//   d_name:  [u8]    — NUL-terminated, padded to alignment
+//
+// Total record size: round_up_8(19 + name_len + 1).
+//
+// Continues writing entries until either the directory is
+// exhausted or the next record won't fit. Returns the total
+// bytes written; 0 on end-of-directory.
+
+fn sys_getdents64(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let path_ptr = args.arg0 as *const u8;
+    let path_len = args.arg1 as usize;
+    let mut cursor = args.arg2 as usize;
+    let out_ptr  = args.arg3 as *mut u8;
+    let out_len  = args.arg4 as usize;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+
+    if path_ptr.is_null() || path_len == 0 || out_ptr.is_null() || out_len < 32 {
+        ctx.set_return(fail);
+        return;
+    }
+    // SAFETY: caller-supplied user pointer, length-bounded.
+    let path_bytes = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
+    let path = match core::str::from_utf8(path_bytes) {
+        Ok(s) => s,
+        Err(_) => { ctx.set_return(fail); return; }
+    };
+
+    // Resolve to a DirOps once. We iterate by re-issuing
+    // enumerate(cursor, 1) per entry — simpler than threading a
+    // batch enumerator through the closure-typed registry walker,
+    // and the per-call cost is bounded by the small fan-out of a
+    // typical directory in our test FSes.
+    let dir = narf_filesystem::registry().resolve_absolute(path, |fs, rel| {
+        let dir: alloc::sync::Arc<dyn narf_filesystem::DirOps> = if rel.is_empty() {
+            fs.root()
+        } else {
+            let mut cur = fs.root();
+            for seg in rel.split('/').filter(|s| !s.is_empty()) {
+                cur = cur.lookup_dir(seg)?;
+            }
+            cur
+        };
+        Some(dir)
+    }).flatten();
+    let dir = match dir {
+        Some(d) => d,
+        None    => { ctx.set_return(fail); return; }
+    };
+
+    let mut written = 0usize;
+    loop {
+        let mut entries = dir.enumerate(cursor, 1);
+        if entries.is_empty() { break; }
+        let (name, ftype) = entries.pop().unwrap();
+        let name_bytes = name.as_bytes();
+        // 19-byte fixed header + name + NUL, padded up to 8 bytes.
+        let raw_len = 19 + name_bytes.len() + 1;
+        let reclen  = (raw_len + 7) & !7;
+        if written + reclen > out_len {
+            // Record won't fit — stop here without advancing the
+            // cursor for this entry. Linux returns whatever fit.
+            break;
+        }
+        let next_cursor = cursor + 1;
+        let dt = match ftype {
+            narf_filesystem::FileType::File    => 8,  // DT_REG
+            narf_filesystem::FileType::Dir     => 4,  // DT_DIR
+            narf_filesystem::FileType::Symlink => 10, // DT_LNK
+            narf_filesystem::FileType::Special => 2,  // DT_CHR
+        };
+        // SAFETY: caller-supplied writable region; we bound the
+        // writes by `reclen <= remaining capacity`.
+        unsafe {
+            let base = out_ptr.add(written);
+            core::ptr::write_unaligned(base as *mut u64, next_cursor as u64); // d_ino
+            core::ptr::write_unaligned(base.add(8) as *mut u64, next_cursor as u64); // d_off
+            core::ptr::write_unaligned(base.add(16) as *mut u16, reclen as u16); // d_reclen
+            core::ptr::write_volatile(base.add(18), dt);                         // d_type
+            // d_name follows at offset 19.
+            for (i, &b) in name_bytes.iter().enumerate() {
+                core::ptr::write_volatile(base.add(19 + i), b);
+            }
+            // NUL terminator + zero-padding through the rec end.
+            for i in (19 + name_bytes.len())..reclen {
+                core::ptr::write_volatile(base.add(i), 0);
+            }
+        }
+        written += reclen;
+        cursor = next_cursor;
+    }
+
+    ctx.set_return(SyscallReturn::ok(written as u64));
+}
+
 // ── Close — arg0=fd ────────────────────────────────────────────────
 
 fn sys_close(ctx: &mut dyn TrapContext) {
@@ -3389,6 +3494,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Readlink, "readlink", RawFnHandler(sys_readlink));
     table.install_raw(Syscall::Symlink,  "symlink",  RawFnHandler(sys_symlink));
     table.install_raw(Syscall::Listdir, "listdir", RawFnHandler(sys_listdir));
+    table.install_raw(Syscall::Getdents64, "getdents64", RawFnHandler(sys_getdents64));
 
     // Tier-3z entropy.
     table.install_raw(Syscall::GetRandom, "getrandom", RawFnHandler(sys_getrandom));

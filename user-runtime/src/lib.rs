@@ -49,6 +49,7 @@ pub const SYS_GETRANDOM:      u64 = 200;
 pub const SYS_READLINK:       u64 = 193;
 pub const SYS_SYMLINK:        u64 = 194;
 pub const SYS_LISTDIR:        u64 = 195;
+pub const SYS_GETDENTS64:     u64 = 196;
 pub const SYS_STAT:           u64 = 115;
 pub const SYS_FSTAT:          u64 = 116;
 pub const SYS_PIPE:           u64 = 117;
@@ -1086,6 +1087,27 @@ pub fn symlink(target: &str, link: &str) -> i32 {
         )
     };
     if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `getdents64(path, cursor, out)` — batched directory read.
+/// Writes as many `linux_dirent64` records as fit into `out`,
+/// returning the total bytes written. The caller advances
+/// `cursor` by counting entries off the records' `d_off` fields.
+/// Returns 0 on end-of-directory, -1 on error.
+#[inline]
+pub fn getdents64(path: &str, cursor: u64, out: &mut [u8]) -> isize {
+    if path.is_empty() || out.is_empty() { return -1; }
+    // SAFETY: SYS_GETDENTS64 signature: (path_ptr, path_len, cursor,
+    // out_ptr, out_len).
+    let r = unsafe {
+        syscall5(
+            SYS_GETDENTS64,
+            path.as_ptr() as u64, path.len() as u64,
+            cursor,
+            out.as_mut_ptr() as u64, out.len() as u64,
+        )
+    };
+    r as isize
 }
 
 /// `listdir(path, cursor, out)` — read one directory entry at the

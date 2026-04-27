@@ -546,6 +546,15 @@ pub enum Syscall {
     /// cursor; the kernel re-snapshots each call.
     Listdir      = 195,
 
+    /// `arg0 = path_ptr`, `arg1 = path_len`, `arg2 = cursor`,
+    /// `arg3 = out_buf_ptr`, `arg4 = out_buf_len`. Batched
+    /// directory read: serialise as many entries as fit into the
+    /// caller's buffer in the Linux `linux_dirent64` wire format
+    /// `{ d_ino: u64, d_off: u64, d_reclen: u16, d_type: u8, d_name }`.
+    /// Each record is padded to 8-byte alignment. Returns the total
+    /// bytes written on success, 0 on end-of-directory, -1 on error.
+    Getdents64   = 196,
+
     // ── Tier-3z entropy ────────────────────────────────────────────
     //
     // Slot 200 sits above the directory-mutation block to leave room
@@ -639,6 +648,7 @@ impl Syscall {
             193 => Syscall::Readlink,
             194 => Syscall::Symlink,
             195 => Syscall::Listdir,
+            196 => Syscall::Getdents64,
             200 => Syscall::GetRandom,
             _   => return None,
         })

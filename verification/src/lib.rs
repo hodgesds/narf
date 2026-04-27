@@ -13305,3 +13305,79 @@ fn smoke_userspace_memfd_create_returns_writable_fd() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_userspace_memfd_create_returns_writable_fd);
+
+fn smoke_userspace_getdents64_writes_linux_records() -> TestResult {
+    use narf_filesystem::{
+        bootstrap_mount_authority, registry, MemFs,
+    };
+    use narf_userspace::{install_core_syscalls, install_global,
+                         kernel_syscall_entry, syscall::__test_clear_global,
+                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+                         TrapContext};
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let auth = bootstrap_mount_authority();
+    let _ = registry().mount(&auth, "/gd", MemFs::with_seeds(
+        "gd-test", &[("alpha", b"a"), ("beta", b"b"), ("gamma", b"c")],
+    ));
+
+    let mut buf = [0u8; 256];
+    let path = "/gd";
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: path.as_ptr() as u64,
+            arg1: path.len() as u64,
+            arg2: 0,
+            arg3: buf.as_mut_ptr() as u64,
+            arg4: buf.len() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Getdents64.raw(), &mut ctx);
+    let written = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value as usize,
+        _ => return TestResult::Fail("getdents64 did not return OK"),
+    };
+    if written == 0 {
+        return TestResult::Fail("getdents64 returned 0 bytes");
+    }
+
+    // Walk the records and collect names.
+    let mut names: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+    let mut pos = 0usize;
+    while pos + 19 <= written {
+        let reclen = u16::from_le_bytes(buf[pos+16..pos+18].try_into().unwrap()) as usize;
+        if reclen < 20 || pos + reclen > written { break; }
+        // d_name at offset 19, NUL-terminated.
+        let name_start = pos + 19;
+        let mut nlen = 0usize;
+        while name_start + nlen < pos + reclen && buf[name_start + nlen] != 0 {
+            nlen += 1;
+        }
+        let name = core::str::from_utf8(&buf[name_start..name_start+nlen]).unwrap();
+        names.push(name.into());
+        pos += reclen;
+    }
+    if pos != written {
+        return TestResult::Fail("walk did not cover the written length exactly");
+    }
+    names.sort();
+    if names.as_slice() != ["alpha", "beta", "gamma"] {
+        return TestResult::Fail("getdents64 didn't enumerate all entries");
+    }
+
+    __test_clear_global();
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_getdents64_writes_linux_records);
