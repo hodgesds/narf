@@ -273,30 +273,14 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     }
                 }
 
-                // Bus enumeration. The MMU's identity map covers the
-                // q35 ECAM at 0xb000_0000, so the walker can read raw
-                // 4-byte cfg-space words without a separate mapping
-                // step. Real MCFG parsing (boot/) feeds the base in
-                // when ACPI lands; until then we use the QEMU default.
-                // SAFETY: ECAM_DEFAULT_BASE is identity-mapped; the
-                // walker only does naturally-aligned reads + rejects
-                // 0xFFFF vendors.
-                let n_dev = unsafe {
-                    narf_bus::init(narf_bus::x86_64::ECAM_DEFAULT_BASE)
-                };
-                let _ = writeln!(console::Writer,
-                    "  bus: PCIe ECAM walk found {} function(s)", n_dev);
-
-                // SMP discovery via CPUID leaf 1 EBX[23:16] (logical
-                // processor count). Matches QEMU `-smp N`. Real
-                // hardware multi-package topology needs ACPI MADT —
-                // grows alongside MADT parsing in a later wave.
-                // SAFETY: CPUID is always legal at CPL=0.
-                // ACPI SRAT → NUMA topology. PVH bootloaders may or
-                // may not populate `rsdp_paddr`; QEMU's `-kernel`
-                // path leaves it zero even when ACPI is present.
-                // Fall back to a 0xE_0000..0x10_0000 BIOS-area scan
-                // for the "RSD PTR " signature.
+                // ACPI tables (RSDP → XSDT → SRAT/MADT/MCFG). PVH
+                // bootloaders may or may not populate `rsdp_paddr`;
+                // QEMU's `-kernel` path leaves it zero even when ACPI
+                // is present. Fall back to a 0xE_0000..0x10_0000
+                // BIOS-area scan for the "RSD PTR " signature.
+                // ACPI parsing precedes bus init so MCFG can supply
+                // the PCIe ECAM base, and precedes SMP discovery so
+                // MADT can provide the CPU count.
                 let rsdp = info.acpi_rsdp_phys
                     // SAFETY: identity-mapped low ROM scan.
                     .or_else(|| unsafe { narf_acpi::scan_bios_for_rsdp() });
@@ -316,6 +300,30 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                     "  acpi: SRAT parse skipped: {:?}", e);
                             }
                         }
+                        // SAFETY: same RSDP, validated above.
+                        match unsafe { narf_acpi::parse_madt(p) } {
+                            Ok(n) => {
+                                let _ = writeln!(console::Writer,
+                                    "  acpi: MADT parsed, {} entries, {} CPU(s), LAPIC base {:#x}",
+                                    n, narf_acpi::cpu_count_from_madt(),
+                                    narf_acpi::lapic_base().unwrap_or(0));
+                            }
+                            Err(e) => {
+                                let _ = writeln!(console::Writer,
+                                    "  acpi: MADT parse skipped: {:?}", e);
+                            }
+                        }
+                        // SAFETY: same.
+                        match unsafe { narf_acpi::parse_mcfg(p) } {
+                            Ok(base) => {
+                                let _ = writeln!(console::Writer,
+                                    "  acpi: MCFG ECAM base {:#x}", base);
+                            }
+                            Err(e) => {
+                                let _ = writeln!(console::Writer,
+                                    "  acpi: MCFG parse skipped: {:?}", e);
+                            }
+                        }
                     }
                     None => {
                         let _ = writeln!(console::Writer,
@@ -323,24 +331,39 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     }
                 }
 
-                // SMP CPU count: prefer SRAT (covers multi-socket
-                // configs where CPUID leaf 0xB sub-1 only sees the
-                // local core). Fall back to CPUID when SRAT didn't
-                // run / was empty.
+                // PCIe enumeration. Prefer the MCFG-derived ECAM
+                // base when ACPI was parsed; fall back to the QEMU
+                // q35 hardcoded default. SAFETY: ECAM base is
+                // identity-mapped; the walker only does
+                // naturally-aligned reads + rejects 0xFFFF vendors.
+                let ecam = narf_acpi::mcfg_ecam_base()
+                    .map(narf_memory::PhysAddr::new)
+                    .unwrap_or(narf_bus::x86_64::ECAM_DEFAULT_BASE);
+                let n_dev = unsafe { narf_bus::init(ecam) };
+                let _ = writeln!(console::Writer,
+                    "  bus: PCIe ECAM walk @ {:?} found {} function(s)",
+                    ecam, n_dev);
+
+                // SMP CPU count: prefer MADT (canonical APIC
+                // enumeration), then SRAT (covers multi-socket
+                // configs), then CPUID leaf 0xB sub-1 (per-core
+                // count, only correct on single-socket configs).
+                let n_madt = narf_acpi::cpu_count_from_madt();
                 let n_srat = narf_acpi::cpu_count_from_srat();
-                let n = if n_srat > 0 {
-                    n_srat
+                let (n, src) = if n_madt > 0 {
+                    (n_madt, "MADT")
+                } else if n_srat > 0 {
+                    (n_srat, "SRAT")
                 } else {
                     // SAFETY: CPUID is always legal at CPL=0.
-                    unsafe { narf_lib::smp::count_x86_64_cpus_via_cpuid() }
+                    (unsafe { narf_lib::smp::count_x86_64_cpus_via_cpuid() }, "CPUID")
                 };
                 if n > 0 {
                     narf_lib::smp::set_cpu_count(n);
                 }
                 let _ = writeln!(console::Writer,
                     "  smp: {} CPU(s) advertised (source: {})",
-                    narf_lib::smp::cpu_count(),
-                    if n_srat > 0 { "SRAT" } else { "CPUID" });
+                    narf_lib::smp::cpu_count(), src);
 
                 // Initialise per-CPU scheduler queues *before* AP
                 // bring-up — APs jump straight into the scheduler

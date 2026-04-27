@@ -29,6 +29,15 @@ use narf_lib::percpu::MAX_CPUS;
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::PhysAddr;
 
+/// Maximum IOAPICs we track. PC platforms ship 1; multi-IOAPIC
+/// configs (high-density servers, x2APIC topologies) max around 8.
+pub const MAX_IOAPICS: usize = 8;
+
+/// Maximum interrupt source overrides (ISA → GSI remappings). The
+/// MADT typically lists ≤ 4 entries on PC-class hardware; 16 covers
+/// any sane firmware.
+pub const MAX_ISA_OVERRIDES: usize = 16;
+
 /// Maximum number of memory-affinity ranges we track. Stage-4
 /// QEMU configs publish ≤ 4; real silicon maxes around 16-32 per
 /// node. 32 covers any sane single-socket-multi-node host.
@@ -473,6 +482,313 @@ pub fn copy_memory_ranges(out: &mut [MemRange]) -> usize {
     n
 }
 
+// ── MADT (Multiple APIC Description Table) ─────────────────────────
+//
+// MADT signature is `"APIC"` (historic name pre-dating its
+// generalisation). The table starts with a 36-byte SDT header,
+// followed by the LAPIC base (u32) and PCAT-compat flags (u32),
+// then a sequence of variable-length entries.
+//
+// Today's decoder covers Type 0 (Processor Local APIC), Type 1
+// (IOAPIC), Type 2 (Interrupt Source Override), and Type 9 (Local
+// x2APIC). Type 4 (Local APIC NMI), Type 5 (Local APIC Address
+// Override), Type 7+ (newer GIC entries) are skipped — narrow
+// consumers can grow them as needed.
+
+/// LAPIC base physical address from MADT. `0` = MADT not parsed
+/// or absent.
+static LAPIC_BASE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Number of enabled processor entries the MADT advertised.
+static MADT_CPU_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Per-CPU APIC ID list, indexed by enumeration order. `u32::MAX`
+/// = "no entry seen". Stage-4 callers care more about the count
+/// than the order; ordered storage simplifies the deterministic
+/// list used by `start_aps`.
+static APIC_IDS: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(u32::MAX) }; MAX_CPUS];
+
+/// Sticky flag: set once `parse_madt` has run successfully.
+static MADT_PARSED: AtomicBool = AtomicBool::new(false);
+
+/// IOAPIC entry from MADT.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct IoApic {
+    pub id:           u8,
+    pub address:      u32,
+    /// Global System Interrupt base — first GSI this IOAPIC owns.
+    pub gsi_base:     u32,
+}
+
+/// Interrupt source override entry from MADT.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct IsaOverride {
+    pub bus:    u8,
+    pub source: u8,
+    pub gsi:    u32,
+    pub flags:  u16,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct MadtTables {
+    ioapics:       [IoApic; MAX_IOAPICS],
+    n_ioapics:     usize,
+    overrides:     [IsaOverride; MAX_ISA_OVERRIDES],
+    n_overrides:   usize,
+}
+
+impl MadtTables {
+    const EMPTY: Self = Self {
+        ioapics:     [IoApic { id: 0, address: 0, gsi_base: 0 }; MAX_IOAPICS],
+        n_ioapics:   0,
+        overrides:   [IsaOverride { bus: 0, source: 0, gsi: 0, flags: 0 };
+            MAX_ISA_OVERRIDES],
+        n_overrides: 0,
+    };
+}
+
+static MADT_DATA: IrqSafeSpinLock<MadtTables> =
+    IrqSafeSpinLock::new(MadtTables::EMPTY);
+
+/// Discover and parse the MADT. Records the LAPIC base, the per-CPU
+/// APIC ID list, every IOAPIC entry, and ISA → GSI overrides.
+///
+/// Returns the count of entries decoded across all kinds.
+///
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → MADT pointers it leads to must also be identity-mapped.
+pub unsafe fn parse_madt(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+
+    let mut madt: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"APIC" && madt.is_none() {
+                madt = Some(phys);
+            }
+        })?;
+    }
+    let madt = madt.ok_or(AcpiError::NoSrat)?; // reuse error variant — narrow.
+
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (madt as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 8 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe {
+        core::slice::from_raw_parts(madt as *const u8, total)
+    };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+
+    // 4 bytes LAPIC base + 4 bytes flags after the SDT header.
+    let lapic_base = u32::from_le_bytes([
+        body[SDT_HEADER_SIZE], body[SDT_HEADER_SIZE + 1],
+        body[SDT_HEADER_SIZE + 2], body[SDT_HEADER_SIZE + 3],
+    ]) as u64;
+    LAPIC_BASE.store(lapic_base, Ordering::Release);
+
+    let mut cur = SDT_HEADER_SIZE + 8;
+    let mut count = 0u32;
+    let mut cpu_count = 0u32;
+
+    for slot in APIC_IDS.iter() { slot.store(u32::MAX, Ordering::Release); }
+    let mut tables = MADT_DATA.lock();
+    *tables = MadtTables::EMPTY;
+
+    while cur + 2 <= body.len() {
+        let kind = body[cur];
+        let len  = body[cur + 1] as usize;
+        if len < 2 || cur + len > body.len() { break; }
+        let entry = &body[cur..cur + len];
+
+        match kind {
+            0 if entry.len() >= 8 => {
+                // Type 0: Processor Local APIC.
+                // [2] ACPI processor id, [3] APIC id, [4..8] flags.
+                let apic_id = entry[3] as u32;
+                let flags = u32::from_le_bytes([
+                    entry[4], entry[5], entry[6], entry[7],
+                ]);
+                let enabled = flags & 1 != 0;
+                if enabled && (cpu_count as usize) < MAX_CPUS {
+                    APIC_IDS[cpu_count as usize].store(apic_id, Ordering::Release);
+                    cpu_count += 1;
+                    count += 1;
+                }
+            }
+            1 if entry.len() >= 12 => {
+                // Type 1: IOAPIC.
+                // [2] id, [3] reserved, [4..8] address, [8..12] GSI base.
+                let id = entry[2];
+                let address = u32::from_le_bytes([
+                    entry[4], entry[5], entry[6], entry[7],
+                ]);
+                let gsi_base = u32::from_le_bytes([
+                    entry[8], entry[9], entry[10], entry[11],
+                ]);
+                if tables.n_ioapics < MAX_IOAPICS {
+                    let i = tables.n_ioapics;
+                    tables.ioapics[i] = IoApic { id, address, gsi_base };
+                    tables.n_ioapics = i + 1;
+                    count += 1;
+                }
+            }
+            2 if entry.len() >= 10 => {
+                // Type 2: Interrupt Source Override.
+                // [2] bus, [3] source, [4..8] GSI, [8..10] flags.
+                let bus = entry[2];
+                let source = entry[3];
+                let gsi = u32::from_le_bytes([
+                    entry[4], entry[5], entry[6], entry[7],
+                ]);
+                let flags = u16::from_le_bytes([entry[8], entry[9]]);
+                if tables.n_overrides < MAX_ISA_OVERRIDES {
+                    let i = tables.n_overrides;
+                    tables.overrides[i] = IsaOverride { bus, source, gsi, flags };
+                    tables.n_overrides = i + 1;
+                    count += 1;
+                }
+            }
+            9 if entry.len() >= 16 => {
+                // Type 9: Local x2APIC.
+                // [4..8] x2APIC id (u32), [8..12] flags, [12..16] ACPI uid.
+                let apic_id = u32::from_le_bytes([
+                    entry[4], entry[5], entry[6], entry[7],
+                ]);
+                let flags = u32::from_le_bytes([
+                    entry[8], entry[9], entry[10], entry[11],
+                ]);
+                let enabled = flags & 1 != 0;
+                if enabled && (cpu_count as usize) < MAX_CPUS {
+                    APIC_IDS[cpu_count as usize].store(apic_id, Ordering::Release);
+                    cpu_count += 1;
+                    count += 1;
+                }
+            }
+            _ => {}
+        }
+        cur += len;
+    }
+
+    MADT_CPU_COUNT.store(cpu_count, Ordering::Release);
+    MADT_PARSED.store(true, Ordering::Release);
+    Ok(count)
+}
+
+/// LAPIC base physical address advertised by the MADT, or `None`
+/// when MADT has not been parsed.
+pub fn lapic_base() -> Option<u64> {
+    let v = LAPIC_BASE.load(Ordering::Acquire);
+    if v == 0 { None } else { Some(v) }
+}
+
+/// Number of enabled CPUs the MADT advertised.
+pub fn cpu_count_from_madt() -> u32 {
+    MADT_CPU_COUNT.load(Ordering::Acquire)
+}
+
+/// Lookup the APIC id at enumeration index `i`. Stage-4 SMP bring-up
+/// uses this list as the canonical AP target order. Returns `None`
+/// for indices beyond the enumerated count.
+pub fn apic_id_at(i: usize) -> Option<u32> {
+    if i >= MAX_CPUS { return None; }
+    let v = APIC_IDS[i].load(Ordering::Acquire);
+    if v == u32::MAX { None } else { Some(v) }
+}
+
+/// Snapshot of the IOAPIC list. Returns the count written.
+pub fn copy_ioapics(out: &mut [IoApic]) -> usize {
+    let g = MADT_DATA.lock();
+    let n = g.n_ioapics.min(out.len());
+    out[..n].copy_from_slice(&g.ioapics[..n]);
+    n
+}
+
+/// Snapshot of the ISA-override list. Returns the count written.
+pub fn copy_isa_overrides(out: &mut [IsaOverride]) -> usize {
+    let g = MADT_DATA.lock();
+    let n = g.n_overrides.min(out.len());
+    out[..n].copy_from_slice(&g.overrides[..n]);
+    n
+}
+
+/// True once `parse_madt` has succeeded at least once.
+pub fn is_madt_known() -> bool {
+    MADT_PARSED.load(Ordering::Acquire)
+}
+
+// ── MCFG (PCI Express Memory-mapped Configuration Space) ────────────
+//
+// MCFG signature is `"MCFG"`. After the SDT header and 8 reserved
+// bytes there are 16-byte segment-allocation entries:
+//
+//   offset  field             type
+//   0x00    base address      u64
+//   0x08    PCI segment       u16
+//   0x0A    start bus         u8
+//   0x0B    end bus           u8
+//   0x0C    reserved          u32
+//
+// Today we surface segment 0's base — multi-segment platforms grow
+// later when there's a consumer.
+
+static MCFG_BASE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Discover and parse the MCFG. Returns the segment-0 ECAM base
+/// physical address.
+///
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → MCFG pointers it leads to must also be identity-mapped.
+pub unsafe fn parse_mcfg(rsdp_phys: PhysAddr) -> Result<u64, AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+
+    let mut mcfg: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"MCFG" && mcfg.is_none() {
+                mcfg = Some(phys);
+            }
+        })?;
+    }
+    let mcfg = mcfg.ok_or(AcpiError::NoSrat)?;
+
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (mcfg as *const SdtHeader).read_unaligned().length as usize
+    };
+    let body_end = SDT_HEADER_SIZE + 8 + 16; // header + reserved + 1 entry
+    if total < body_end { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe {
+        core::slice::from_raw_parts(mcfg as *const u8, total)
+    };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+
+    let base = u64::from_le_bytes([
+        body[SDT_HEADER_SIZE + 8],  body[SDT_HEADER_SIZE + 9],
+        body[SDT_HEADER_SIZE + 10], body[SDT_HEADER_SIZE + 11],
+        body[SDT_HEADER_SIZE + 12], body[SDT_HEADER_SIZE + 13],
+        body[SDT_HEADER_SIZE + 14], body[SDT_HEADER_SIZE + 15],
+    ]);
+    MCFG_BASE.store(base, Ordering::Release);
+    Ok(base)
+}
+
+/// PCIe ECAM base from the most recent MCFG parse, segment 0.
+pub fn mcfg_ecam_base() -> Option<u64> {
+    let v = MCFG_BASE.load(Ordering::Acquire);
+    if v == 0 { None } else { Some(v) }
+}
+
 /// Test/diagnostic helper: clear the parsed topology so a subsequent
 /// `parse_srat` call starts from a clean slate. Intended for unit
 /// tests; production code calls `parse_srat` exactly once.
@@ -482,6 +798,12 @@ pub fn __reset_for_test() {
     *MEMORY_RANGES.lock() = MemRangeTable::EMPTY;
     SRAT_PARSED.store(false, Ordering::Release);
     NODE_COUNT.store(0, Ordering::Release);
+    for c in APIC_IDS.iter() { c.store(u32::MAX, Ordering::Release); }
+    *MADT_DATA.lock() = MadtTables::EMPTY;
+    MADT_PARSED.store(false, Ordering::Release);
+    MADT_CPU_COUNT.store(0, Ordering::Release);
+    LAPIC_BASE.store(0, Ordering::Release);
+    MCFG_BASE.store(0, Ordering::Release);
 }
 
 /// Raw SRAT entry kinds. Exposed for tests/diagnostics that want to

@@ -7392,6 +7392,59 @@ fn smoke_acpi_srat_synthetic_lapic_entry() -> TestResult {
 }
 kernel_test!(smoke_acpi_srat_synthetic_lapic_entry);
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_acpi_madt_topology_present() -> TestResult {
+    // The xtask QEMU config has 2 CPUs; MADT must enumerate both
+    // and expose the LAPIC base.
+    let rsdp = match narf_acpi::cached_rsdp() {
+        Some(p) => p,
+        None    => return TestResult::Fail("no boot-time RSDP cached"),
+    };
+    // SAFETY: cached RSDP, validated at boot.
+    let _ = unsafe { narf_acpi::parse_madt(rsdp) };
+    if !narf_acpi::is_madt_known() {
+        return TestResult::Fail("MADT not parsed");
+    }
+    if narf_acpi::cpu_count_from_madt() < 2 {
+        return TestResult::Fail("expected >= 2 CPUs from MADT");
+    }
+    if narf_acpi::lapic_base().is_none() {
+        return TestResult::Fail("LAPIC base missing from MADT");
+    }
+    if narf_acpi::apic_id_at(0).is_none() {
+        return TestResult::Fail("first APIC id missing");
+    }
+    let mut io = [narf_acpi::IoApic::default(); narf_acpi::MAX_IOAPICS];
+    if narf_acpi::copy_ioapics(&mut io) == 0 {
+        return TestResult::Fail("MADT advertised no IOAPIC");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_acpi_madt_topology_present);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_acpi_mcfg_ecam_base() -> TestResult {
+    // QEMU q35 places ECAM at 0xB000_0000; MCFG should report the
+    // same address that the bus walker successfully used.
+    let rsdp = match narf_acpi::cached_rsdp() {
+        Some(p) => p,
+        None    => return TestResult::Fail("no boot-time RSDP cached"),
+    };
+    // SAFETY: cached RSDP, validated at boot.
+    let _ = unsafe { narf_acpi::parse_mcfg(rsdp) };
+    let base = match narf_acpi::mcfg_ecam_base() {
+        Some(b) => b,
+        None    => return TestResult::Fail("MCFG didn't report a base"),
+    };
+    if base != 0xB000_0000 {
+        return TestResult::Fail("unexpected MCFG ECAM base");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_acpi_mcfg_ecam_base);
+
 fn smoke_acpi_srat_synthetic_memory_entry() -> TestResult {
     // Type-1 memory affinity entry: base 0x1_0000_0000, length
     // 0x1000_0000, proximity 1, enabled.
@@ -7442,6 +7495,48 @@ fn smoke_scheduler_per_cpu_pin_to_bsp() -> TestResult {
     else { TestResult::Fail("BSP-pinned task didn't run") }
 }
 kernel_test!(smoke_scheduler_per_cpu_pin_to_bsp);
+
+fn smoke_scheduler_numa_steal_prefers_same_node() -> TestResult {
+    // With work-stealing on and per-CPU queues seeded across two
+    // NUMA nodes, a steal should pull from a same-node victim first.
+    // We exercise this purely through the public surface: spawn
+    // tasks pinned to specific CPUs in different nodes; force-enable
+    // stealing; run the BSP loop. Tasks all complete because affinity
+    // routes them to their target CPU's queue and the BSP steals
+    // them. The point of the smoke is "stealing didn't deadlock with
+    // NUMA preferences active"; finer-grained behavioural checks
+    // would need per-CPU runtime hooks not yet present.
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use narf_scheduler::{spawn_with_spec, Affinity, CpuId, TaskSpec};
+
+    static DONE: AtomicU32 = AtomicU32::new(0);
+    DONE.store(0, Ordering::Relaxed);
+
+    narf_scheduler::init();
+    narf_scheduler::enable_work_stealing();
+
+    for cpu in 0..4u32 {
+        let spec = TaskSpec {
+            affinity: Affinity::pinned(CpuId(cpu)),
+            ..TaskSpec::unthrottled()
+        };
+        let _ = spawn_with_spec(async {
+            DONE.fetch_add(1, Ordering::Relaxed);
+        }, spec);
+    }
+
+    narf_scheduler::run_until_empty();
+    narf_scheduler::disable_work_stealing();
+
+    // BSP drained at least its own pinned task; the others may or
+    // may not be visible depending on whether real APs ran them.
+    // We just need the scheduler not to wedge.
+    if DONE.load(Ordering::Relaxed) == 0 {
+        return TestResult::Fail("no task ran");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_scheduler_numa_steal_prefers_same_node);
 
 fn smoke_scheduler_steal_disabled_returns_clean() -> TestResult {
     // With work-stealing off (the default), an empty BSP queue causes

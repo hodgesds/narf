@@ -281,6 +281,14 @@ pub fn defer_drop<T: Send + 'static>(owned: Owned<T>, _g: &ReadGuard) {
 #[inline]
 pub fn report_quiescent() { qsbr::report_quiescent(); }
 
+/// Declare that the current CPU is going idle (about to halt and
+/// stop polling). Resets the per-CPU `last_quiescent` to the
+/// inactive sentinel so `sync()` doesn't block on an asleep CPU.
+/// The CPU re-adopts the live epoch on its first
+/// `report_quiescent` after wake.
+#[inline]
+pub fn report_idle() { qsbr::report_idle(); }
+
 /// Wait one grace period and drain the resulting drop batch.
 ///
 /// This is the synchronous form intended for kernel-thread-style use and

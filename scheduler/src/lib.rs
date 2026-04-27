@@ -614,42 +614,71 @@ pub fn run_until_empty() {
     }
 }
 
-/// Try to steal one task from any other CPU's queue. Returns `true` if
-/// a slot was moved onto `cpu`'s queue. Round-robin starting at the
-/// neighbour with the lowest index above `cpu`, wrapping.
+/// Try to steal one task from another CPU's queue. Returns `true` if
+/// a slot was moved onto `cpu`'s queue.
+///
+/// Search order: same-NUMA-node victims first (when ACPI SRAT
+/// provided topology), then cross-node victims, then a flat
+/// round-robin fallback. The same-node pass is what makes the SRAT
+/// data load-bearing — stealing a task from the same NUMA node
+/// keeps cache-warm working sets local.
 ///
 /// No-op when `STEAL_ENABLED` is false (boot default). Callers in the
 /// idle path treat a `false` return as "nothing to do, return".
 fn try_steal_one(cpu: usize) -> bool {
     if !STEAL_ENABLED.load(Ordering::Acquire) { return false; }
     let max = narf_lib::percpu::MAX_CPUS;
+    let my_node = narf_acpi::cpu_node(cpu as u32);
+
+    // Phase 1: same-NUMA-node victims. Skipped when topology is
+    // unknown — falls through to flat round-robin.
+    if my_node.is_some() {
+        for i in 1..max {
+            let victim = (cpu + i) % max;
+            if victim == cpu { continue; }
+            if narf_acpi::cpu_node(victim as u32) != my_node { continue; }
+            if try_steal_from(victim, cpu) { return true; }
+        }
+    }
+
+    // Phase 2: cross-node victims (or every victim if topology is
+    // unknown). Round-robin starting at cpu+1.
     for i in 1..max {
         let victim = (cpu + i) % max;
         if victim == cpu { continue; }
-        // Pop one task from the victim's front *if* it's awake-eligible
-        // and not pinned to a CPU other than ours. We respect affinity
-        // here — stealing a pinned task to the wrong CPU would defeat
-        // the pin.
-        let stolen = {
-            let mut g = READY[victim].lock();
-            let q = match g.as_mut() {
-                Some(q) => q,
-                None    => continue,
-            };
-            // Linear scan for the first slot we're allowed to take.
-            let pos = q.iter().position(|s|
-                s.spec.affinity.allowed.contains(crate::affinity::CpuId(cpu as u32))
-            );
-            match pos {
-                Some(p) => q.remove(p),
-                None    => None,
-            }
-        };
-        if let Some(slot) = stolen {
-            let mut g = READY[cpu].lock();
-            g.as_mut().expect("scheduler: steal before init").push_back(slot);
-            return true;
+        // Skip same-node victims — phase 1 already covered them.
+        if my_node.is_some() && narf_acpi::cpu_node(victim as u32) == my_node {
+            continue;
         }
+        if try_steal_from(victim, cpu) { return true; }
+    }
+    false
+}
+
+/// Inner helper: try to move one affinity-allowed slot from
+/// `victim`'s queue onto `cpu`'s queue. Returns `true` on success.
+fn try_steal_from(victim: usize, cpu: usize) -> bool {
+    let stolen = {
+        let mut g = READY[victim].lock();
+        let q = match g.as_mut() {
+            Some(q) => q,
+            None    => return false,
+        };
+        // Linear scan for the first slot we're allowed to take.
+        // Stealing a pinned task to the wrong CPU would defeat
+        // the pin — respect `allowed`.
+        let pos = q.iter().position(|s|
+            s.spec.affinity.allowed.contains(crate::affinity::CpuId(cpu as u32))
+        );
+        match pos {
+            Some(p) => q.remove(p),
+            None    => None,
+        }
+    };
+    if let Some(slot) = stolen {
+        let mut g = READY[cpu].lock();
+        g.as_mut().expect("scheduler: steal before init").push_back(slot);
+        return true;
     }
     false
 }
@@ -658,12 +687,22 @@ fn try_steal_one(cpu: usize) -> bool {
 /// bring-up. Equivalent to `run_until_empty` but never returns —
 /// when both this CPU's queue and every steal target are empty,
 /// halts until an IRQ delivers a wake.
+///
+/// Reports a QSBR quiescent state immediately before the halt so
+/// `narf_rcu::sync` can advance even when this CPU has gone idle.
+/// Without this, an AP that polled one task and then halted would
+/// leave its `last_quiescent` stuck below the current epoch and
+/// stall every subsequent grace period kernel-wide.
 pub fn run_forever() -> ! {
     loop {
         run_until_empty();
-        // run_until_empty returned: either we're CPU 0 in a test
-        // context, or every CPU is empty. APs that reach here halt
-        // until something wakes them.
+        // Idle path: declare ourselves out of RCU consideration so
+        // `sync()` doesn't block on an asleep CPU. We re-adopt the
+        // live epoch on our first `report_quiescent` after wake.
+        // Safe at this point because `run_until_empty` only returns
+        // between polls, and read guards may not span awaits per
+        // rcu/ §3.7.
+        narf_rcu::report_idle();
         narf_arch::halt_until_irq();
     }
 }

@@ -160,6 +160,20 @@ pub fn report_quiescent() {
     drain_local_bucket(cell);
 }
 
+/// Declare that this CPU is going idle. Resets `last_quiescent` to
+/// the `u64::MAX` "inactive" sentinel so subsequent `sync()` calls
+/// don't wait on a CPU that may not poll again before its next
+/// wake. The CPU will re-adopt the live epoch on its first
+/// `report_quiescent` after wake. Drains the local bucket first so
+/// any pending deferred drops are reclaimed before this CPU stops
+/// reporting.
+pub fn report_idle() {
+    let cell = this_cpu();
+    if cell.active_readers.load(Ordering::Acquire) != 0 { return; }
+    drain_local_bucket(cell);
+    cell.last_quiescent.store(u64::MAX, Ordering::Release);
+}
+
 // ── Deferred-drop enqueue / drain ───────────────────────────────────
 
 pub(crate) fn defer_raw(ptr: *mut (), dropper: unsafe fn(*mut ())) {
