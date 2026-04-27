@@ -1,21 +1,24 @@
 //! `MemFs` — an in-memory read/write filesystem with hierarchy.
 //!
 //! Stage-4 surface for exercising the mutable [`DirOps`] paths
-//! (`unlink`, `create`, `mkdir`, `rmdir`, `rename`). Designed for the
-//! `/tmp` mount in the validate harness — small files, nested
-//! directories, no persistence. Concurrency: a single
+//! (`unlink`, `create`, `mkdir`, `rmdir`, `rename`, `symlink`).
+//! Designed for the `/tmp` mount in the validate harness — small
+//! files, nested directories, no persistence. Concurrency: a single
 //! `IrqSafeSpinLock` per directory over the entry map; mutations are
 //! serialised through it. The validate harness is single-threaded so
 //! this is uncontended.
 //!
 //! Layout: each directory owns a `BTreeMap<String, Entry>` where
-//! `Entry` is either a `File(Arc<MemFile>)` or a `Dir(Arc<MemDir>)`.
-//! `MemFile` carries a `Mutex<Vec<u8>>` so concurrent writers /
-//! readers see a consistent length+contents tuple. `unlink` removes
-//! the entry from the parent map but keeps the file's `Arc` alive
-//! for any outstanding fd holders — the bytes go away when the last
-//! fd drops, matching POSIX semantics. `rmdir` rejects non-empty
-//! directories (POSIX EEXIST→`Busy`).
+//! `Entry` is `File(Arc<MemFile>)`, `Dir(Arc<MemDir>)`, or
+//! `Symlink(Arc<MemSymlink>)`. `MemFile` carries a `Mutex<Vec<u8>>`
+//! so concurrent writers / readers see a consistent length+contents
+//! tuple. `MemSymlink` stores its target as an immutable `String`
+//! and exposes the bytes via `FileOps::read`; writes return
+//! `ReadOnly`. `unlink` removes the entry from the parent map but
+//! keeps the file's `Arc` alive for any outstanding fd holders —
+//! the bytes go away when the last fd drops, matching POSIX
+//! semantics. `rmdir` rejects non-empty directories (POSIX
+//! EEXIST→`Busy`).
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -102,13 +105,59 @@ impl FileOps for MemFile {
     }
 }
 
+/// In-memory symlink: an immutable target path. The target is stored
+/// verbatim and exposed to readers via `FileOps::read`; writes return
+/// `ReadOnly` (POSIX symlink targets are immutable — `symlink(2)`
+/// creates and `readlink(2)` reads, but there is no `writelink(2)`).
+struct MemSymlink {
+    target: String,
+}
+
+impl fmt::Debug for MemSymlink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MemSymlink")
+            .field("target", &self.target)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FileOps for MemSymlink {
+    fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move {
+            let bytes = self.target.as_bytes();
+            let off = offset as usize;
+            if off >= bytes.len() {
+                return Ok(0);
+            }
+            let n = core::cmp::min(buf.len(), bytes.len() - off);
+            buf[..n].copy_from_slice(&bytes[off..off + n]);
+            Ok(n)
+        })
+    }
+
+    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move { Err(FsError::ReadOnly) })
+    }
+
+    fn stat(&self) -> Stat {
+        Stat {
+            size:         self.target.len() as u64,
+            blocks:       1,
+            mode:         Mode { file_type: FileType::Symlink, perms: 0o777 },
+            mtime_cycles: 0,
+        }
+    }
+}
+
 /// One directory entry. The discriminant carries either an `Arc`-
-/// owned file or an `Arc`-owned subdirectory; both kinds drop their
-/// underlying storage when the last reference disappears.
+/// owned file, an `Arc`-owned subdirectory, or an `Arc`-owned
+/// symlink; all kinds drop their underlying storage when the last
+/// reference disappears.
 #[derive(Debug)]
 enum Entry {
     File(Arc<MemFile>),
     Dir(Arc<MemDir>),
+    Symlink(Arc<MemSymlink>),
 }
 
 /// A directory node: owns the `BTreeMap` of children behind a lock.
@@ -130,16 +179,22 @@ impl DirOps for MemDir {
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         let g = self.entries.lock();
         match g.get(name)? {
-            Entry::File(f) => Some(Arc::clone(f) as Arc<dyn FileOps>),
-            Entry::Dir(_)  => None,
+            Entry::File(f)    => Some(Arc::clone(f) as Arc<dyn FileOps>),
+            Entry::Symlink(s) => Some(Arc::clone(s) as Arc<dyn FileOps>),
+            Entry::Dir(_)     => None,
         }
     }
 
     fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
         let g = self.entries.lock();
         match g.get(name)? {
-            Entry::Dir(d)  => Some(Arc::clone(d) as Arc<dyn DirOps>),
-            Entry::File(_) => None,
+            Entry::Dir(d)      => Some(Arc::clone(d) as Arc<dyn DirOps>),
+            Entry::File(_)     => None,
+            // Symlinks are never auto-traversed: `readlink`-style
+            // callers want the target bytes via `lookup`, not a
+            // resolved DirOps. Path resolution that wants to follow
+            // a symlink chain must do so explicitly.
+            Entry::Symlink(_)  => None,
         }
     }
 
@@ -158,8 +213,9 @@ impl DirOps for MemDir {
             .take(max)
             .map(|(name, entry)| {
                 let ft = match entry {
-                    Entry::File(_) => FileType::File,
-                    Entry::Dir(_)  => FileType::Dir,
+                    Entry::File(_)    => FileType::File,
+                    Entry::Dir(_)     => FileType::Dir,
+                    Entry::Symlink(_) => FileType::Symlink,
                 };
                 (name.clone(), ft)
             })
@@ -169,9 +225,10 @@ impl DirOps for MemDir {
     fn unlink(&self, name: &str) -> Result<(), FsError> {
         let mut g = self.entries.lock();
         match g.get(name) {
-            None                   => Err(FsError::NotFound),
-            Some(Entry::Dir(_))    => Err(FsError::InvalidPath),
-            Some(Entry::File(_))   => {
+            None                      => Err(FsError::NotFound),
+            Some(Entry::Dir(_))       => Err(FsError::InvalidPath),
+            Some(Entry::File(_))
+            | Some(Entry::Symlink(_)) => {
                 g.remove(name);
                 Ok(())
             }
@@ -205,9 +262,10 @@ impl DirOps for MemDir {
     fn rmdir(&self, name: &str) -> Result<(), FsError> {
         let mut g = self.entries.lock();
         match g.get(name) {
-            None                  => Err(FsError::NotFound),
-            Some(Entry::File(_))  => Err(FsError::InvalidPath),
-            Some(Entry::Dir(d))   => {
+            None                      => Err(FsError::NotFound),
+            Some(Entry::File(_))      => Err(FsError::InvalidPath),
+            Some(Entry::Symlink(_))   => Err(FsError::InvalidPath),
+            Some(Entry::Dir(d))       => {
                 if !d.entries.lock().is_empty() {
                     return Err(FsError::Busy);
                 }
@@ -215,6 +273,16 @@ impl DirOps for MemDir {
                 Ok(())
             }
         }
+    }
+
+    fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn FileOps>, FsError> {
+        let mut g = self.entries.lock();
+        if g.contains_key(name) {
+            return Err(FsError::Busy);
+        }
+        let s = Arc::new(MemSymlink { target: target.to_string() });
+        g.insert(name.to_string(), Entry::Symlink(Arc::clone(&s)));
+        Ok(s as Arc<dyn FileOps>)
     }
 
     fn rename(&self, old_name: &str, new_name: &str) -> Result<(), FsError> {

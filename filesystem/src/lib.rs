@@ -310,6 +310,14 @@ pub trait DirOps: Send + Sync {
         Err(FsError::Unsupported)
     }
 
+    /// Create a symlink entry named `name` pointing at the textual
+    /// `target` path. The target is stored verbatim — the FS does not
+    /// validate it. Returns the new symlink as a `FileOps` whose
+    /// `read` yields the target bytes. Default: `Unsupported`.
+    fn symlink(&self, _name: &str, _target: &str) -> Result<alloc::sync::Arc<dyn FileOps>, FsError> {
+        Err(FsError::Unsupported)
+    }
+
     /// Rename the entry `old_name` to `new_name` within this
     /// directory. Returns `NotFound` if `old_name` is absent;
     /// `Busy` if `new_name` already exists (no clobber). Cross-
