@@ -39,6 +39,7 @@ narf-userspace  = { path = "../userspace" }
 narf-drivers-nvme = { path = "../drivers/nvme" }
 narf-drivers-net  = { path = "../drivers/net" }
 narf-drivers-gpu  = { path = "../drivers/gpu" }
+narf-drivers-storage = { path = "../drivers/storage" }
 
 [features]
 # Opt-in end-to-end user-mode smoke tests. Enabling this adds the

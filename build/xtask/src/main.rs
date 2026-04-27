@@ -147,6 +147,13 @@ impl Arch {
                     "rng-random,id=rng0,filename=/dev/urandom".into(),
                     "-device".into(),
                     "virtio-rng-pci,rng=rng0,disable-legacy=on,disable-modern=off".into(),
+                    // SATA disk on the q35 ICH9 AHCI controller (no
+                    // explicit -device needed; QEMU q35 includes
+                    // ahci by default at 00:1f.2).
+                    "-drive".into(),
+                    format!("if=none,id=sata0,format=raw,file={}",
+                            ahci_image_path().display()),
+                    "-device".into(),  "ide-hd,drive=sata0,bus=ide.0".into(),
                     "-kernel".into(),  kernel,
                 ]
             },
@@ -263,6 +270,19 @@ fn qemu_virt_dtb_path() -> PathBuf {
             .arg("-object").arg("rng-random,id=rng0,filename=/dev/urandom")
             .arg("-device").arg("virtio-rng-pci,rng=rng0")
             .status();
+    }
+    path
+}
+
+/// Backing image for the q35 AHCI/SATA disk.
+fn ahci_image_path() -> PathBuf {
+    let root = workspace_root().unwrap_or_else(|_| PathBuf::from("."));
+    let path = root.join("target").join("narf-sata.img");
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&path, vec![0u8; 1024 * 1024]);
     }
     path
 }

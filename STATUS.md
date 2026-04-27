@@ -562,12 +562,28 @@ The critical-path Stage-2 items remaining:
      non-virtio — exercises the generic BAR + MMIO surface end-to-end.
      Probes 5 device IDs covering 8254x and 8257x families
      (0x100C/E/F + 0x10D3 + 0x153A). Bring-up: BAR0 map; CTRL.RST
-     reset; read MAC from RAL/RAH; TX descriptor ring (`TxDesc`,
-     16 bytes × 8 entries); CTRL.SLU for link up. Polled
-     `tx(frame)` posts to TDT and waits for the descriptor's DD
-     bit. xtask attaches `-device e1000,netdev=n1` alongside
-     virtio-net-pci. Smoke `smoke_e1000_bring_up_and_tx` validates
-     a 64-byte frame round-trip.
+     reset; read MAC from RAL/RAH; TX + RX descriptor rings (8
+     entries each), 8-page RX buffer pool; CTRL.SLU for link up.
+     Polled `tx(frame)` posts to TDT and waits for the descriptor's
+     DD bit; `rx_recv(out)` reads DD-marked descriptors, copies the
+     payload, rearms the slot, advances RDT.
+   - **virtio-rng-pci** (`drivers/virtio/src/rng_pci.rs`). Modern
+     virtio-rng (vendor 0x1AF4, device 0x1044). Single virtqueue.
+     `read_bytes(out)` posts a device-writable descriptor, polls
+     used ring, returns entropy. Probe-only smoke (data-path
+     under QEMU-version-specific debug).
+   - **AHCI HBA** (`drivers/storage/src/ahci.rs`). ICH9 + ICH10
+     SATA controllers (0x8086:0x2922 / 0x3A22). Maps ABAR (BAR5),
+     forces AHCI mode (GHC.AE), resets the HBA (GHC.HR), enumerates
+     PI-implemented ports, classifies each via PORT_SIG +
+     PORT_SSTS into None/Sata/Atapi/Semb/Pmp. Per-port command
+     list + IDENTIFY DEVICE issuance is structural follow-up.
+
+   xtask attaches every driver's exemplar device on both arches.
+   Smokes:
+   `smoke_virtio_blk_pci_*`, `smoke_virtio_net_pci_tx`,
+   `smoke_virtio_rng_pci_probe`, `smoke_e1000_bring_up_and_tx`,
+   `smoke_e1000_rx_arp_request`, `smoke_ahci_hba_bring_up`.
 
    PCIe driver-match registry (`bus::driver_match`) lets drivers
    register `(name, MatchKind, probe_fn)` entries — `MatchKind` is
