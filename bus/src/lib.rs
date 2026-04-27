@@ -37,8 +37,12 @@ pub mod bar;
 pub mod device;
 pub mod driver_match;
 pub mod hotplug;
+pub mod msi;
 pub mod msix;
 pub mod pci;
+pub mod pci_cap;
+pub mod pci_cap_ext;
+pub mod pci_express;
 pub mod pcie;
 pub mod registry;
 

@@ -68,6 +68,47 @@ pub fn alloc() -> Result<u8, VectorError> {
     Err(VectorError::Exhausted)
 }
 
+/// Reserve `n` *contiguous* vectors. Useful for MSI / per-CPU MSI-X
+/// where the device fires consecutive vectors. Returns the base
+/// vector; the reserved range is `[base, base + n)`. All-or-nothing
+/// — partial reservations are rolled back on failure.
+pub fn alloc_block(n: u8) -> Result<u8, VectorError> {
+    if n == 0 { return Err(VectorError::OutOfRange); }
+    let last_start = ALLOC_MAX.saturating_sub(n - 1);
+    'outer: for base in ALLOC_BASE..=last_start {
+        // Speculatively flip every bit in [base, base+n). If any
+        // flip fails (already allocated), roll back the prior ones
+        // and try the next base.
+        let mut owned: u8 = 0;
+        for i in 0..n {
+            let v = base + i;
+            let (w, bit) = split(v);
+            let mut cur = USED[w].load(Ordering::Relaxed);
+            let mut acquired = false;
+            loop {
+                if cur & bit != 0 { break; }
+                match USED[w].compare_exchange_weak(
+                    cur, cur | bit, Ordering::AcqRel, Ordering::Relaxed,
+                ) {
+                    Ok(_)       => { acquired = true; break; }
+                    Err(actual) => cur = actual,
+                }
+            }
+            if !acquired {
+                // Rollback the prior i acquisitions.
+                for j in 0..owned {
+                    let (rw, rbit) = split(base + j);
+                    USED[rw].fetch_and(!rbit, Ordering::AcqRel);
+                }
+                continue 'outer;
+            }
+            owned += 1;
+        }
+        return Ok(base);
+    }
+    Err(VectorError::Exhausted)
+}
+
 /// Release a previously-allocated vector. `AlreadyFree` if the bit
 /// wasn't set — points at a double-free in caller code.
 pub fn free(vector: u8) -> Result<(), VectorError> {

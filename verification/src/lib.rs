@@ -5913,6 +5913,181 @@ fn smoke_syscall_versioning_dispatch() -> TestResult {
 }
 kernel_test!(smoke_syscall_versioning_dispatch);
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_pci_cap_walker_finds_msix() -> TestResult {
+    // The QEMU NVMe device exposes a standard cap list with at
+    // minimum MSI-X (0x11), Power Management (0x01), and PCI Express
+    // (0x10). Walk it via the generic walker + assert MSI-X is
+    // present.
+    use narf_bus::{devices, BusKind};
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let nvme = devs.iter().find(|d|
+        matches!(&d.kind, BusKind::Pcie { .. })
+        && d.id.vendor == 0x1B36 && d.id.device == 0x0010);
+    let Some(d) = nvme else { return TestResult::Skip("no QEMU NVMe"); };
+    // SAFETY: bounded walk on identity-mapped cfg-space.
+    let off = match unsafe { narf_bus::pci_cap::find_cap(d, narf_bus::pci_cap::id::MSI_X) } {
+        Ok(Some(o)) => o,
+        _           => return TestResult::Fail("MSI-X cap not found"),
+    };
+    if off == 0 || off >= 0x100 {
+        return TestResult::Fail("MSI-X cap offset out of range");
+    }
+    // PCI Express cap should also exist on a QEMU NVMe.
+    match unsafe { narf_bus::pci_cap::find_cap(d, narf_bus::pci_cap::id::PCI_EXPRESS) } {
+        Ok(Some(_)) => {}
+        _           => return TestResult::Fail("PCI Express cap not found"),
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_pci_cap_walker_finds_msix);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_pci_express_cap_link_status() -> TestResult {
+    // Read the PCIe cap's link_status on QEMU NVMe and verify the
+    // link-speed/width fields decode to non-zero values.
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+    use narf_bus::pci_express::read_status;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let nvme = devs.iter().find(|d|
+        matches!(&d.kind, BusKind::Pcie { .. })
+        && d.id.vendor == 0x1B36 && d.id.device == 0x0010);
+    let Some(d) = nvme.copied() else { return TestResult::Skip("no QEMU NVMe"); };
+    let authority = bootstrap_registry_authority();
+    let (_h, cap) = match claim_device_cap(&authority, d.addr) {
+        Ok(ok) => ok,
+        Err(_) => return TestResult::Fail("claim_device_cap"),
+    };
+    let read_cap = match cap.derive() {
+        Ok(c)  => c,
+        Err(_) => return TestResult::Fail("derive read"),
+    };
+    let s = match read_status(&read_cap, &d) {
+        Ok(s)  => s,
+        Err(_) => return TestResult::Fail("read_status"),
+    };
+    if s.link_speed() == 0 { return TestResult::Fail("link speed 0"); }
+    if s.link_width() == 0 { return TestResult::Fail("link width 0"); }
+    if s.max_payload_supported() < 128 { return TestResult::Fail("max payload < 128"); }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_pci_express_cap_link_status);
+
+fn smoke_vector_alloc_block_contiguous() -> TestResult {
+    // alloc_block(4) returns a contiguous run of 4 vectors.
+    use narf_interrupts::vector::{alloc_block, free, is_allocated};
+    let base = match alloc_block(4) {
+        Ok(b)  => b,
+        Err(_) => return TestResult::Fail("alloc_block(4) failed"),
+    };
+    for i in 0..4 {
+        if !is_allocated(base + i) {
+            return TestResult::Fail("alloc_block bit not set");
+        }
+    }
+    for i in 0..4 {
+        if free(base + i).is_err() {
+            return TestResult::Fail("free during cleanup");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_vector_alloc_block_contiguous);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_msix_program_block() -> TestResult {
+    // Alloc 4 contiguous IDT vectors + program block 0..4 of the
+    // QEMU NVMe MSI-X table to deliver them. We can't easily assert
+    // the device fires multiple IRQs from a smoke (the driver isn't
+    // running yet), but the structural path — alloc_block, walk the
+    // cap, program 4 entries, enable — must succeed without faulting.
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+    use narf_bus::msix::enable_msix;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_interrupts::vector;
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let nvme = devs.iter().find(|d|
+        matches!(&d.kind, BusKind::Pcie { .. })
+        && d.id.vendor == 0x1B36 && d.id.device == 0x0010);
+    let Some(d) = nvme.copied() else { return TestResult::Skip("no QEMU NVMe"); };
+    let authority = bootstrap_registry_authority();
+    let (_h, cap) = match claim_device_cap(&authority, d.addr) {
+        Ok(ok) => ok,
+        Err(_) => return TestResult::Fail("claim"),
+    };
+    let mut table = match enable_msix(&cap, &d) {
+        Ok(t)  => t,
+        Err(_) => return TestResult::Fail("enable_msix"),
+    };
+    if table.size() < 4 { return TestResult::Skip("table < 4"); }
+    if table.alloc_block(4).is_err() {
+        return TestResult::Fail("alloc_block(4)");
+    }
+    let base = match vector::alloc_block(4) {
+        Ok(b)  => b,
+        Err(_) => return TestResult::Fail("vector::alloc_block"),
+    };
+    // SAFETY: we own the device cap; cap-list walk + writes target
+    // identity-mapped MMIO.
+    let block = unsafe { table.program_vector_block(0, 4, 0, base) };
+    let v = match block {
+        Ok(v)  => v,
+        Err(_) => return TestResult::Fail("program_vector_block"),
+    };
+    if v.len() != 4 { return TestResult::Fail("program_vector_block returned wrong count"); }
+    // Cleanup: release vectors. (Table allocation persists; OK,
+    // re-running enable_msix discovers the same N.)
+    for i in 0..4 { let _ = vector::free(base + i); }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_msix_program_block);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_pci_cap_ext_walker() -> TestResult {
+    // The PCIe extended cap list lives at offset 0x100. QEMU NVMe
+    // generally doesn't expose AER, but the walker must terminate
+    // cleanly on an empty list (header reads 0 or 0xFFFF_FFFF).
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+    use narf_bus::pci_cap_ext::iter as ext_iter;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let nvme = devs.iter().find(|d|
+        matches!(&d.kind, BusKind::Pcie { .. })
+        && d.id.vendor == 0x1B36 && d.id.device == 0x0010);
+    let Some(d) = nvme.copied() else { return TestResult::Skip("no QEMU NVMe"); };
+    let authority = bootstrap_registry_authority();
+    let (_h, cap) = match claim_device_cap(&authority, d.addr) {
+        Ok(ok) => ok,
+        Err(_) => return TestResult::Fail("claim"),
+    };
+    let read_cap = match cap.derive() {
+        Ok(c)  => c,
+        Err(_) => return TestResult::Fail("derive"),
+    };
+    // Walker must produce a finite (possibly empty) iteration.
+    let it = match ext_iter(&read_cap, &d) {
+        Ok(i)  => i,
+        Err(_) => return TestResult::Fail("ext iter"),
+    };
+    let mut count = 0;
+    for _ in it { count += 1; if count > 256 { return TestResult::Fail("walker did not terminate"); } }
+    // Whether AER is present depends on the QEMU build; either is
+    // a clean smoke result.
+    let _ = count;
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_pci_cap_ext_walker);
+
 fn smoke_drivers_net_nic_model_ids() -> TestResult {
     use narf_drivers_net::{NicCaps, NicModel};
 

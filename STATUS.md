@@ -508,6 +508,33 @@ The critical-path Stage-2 items remaining:
    pattern *and* asserts the dispatch table observed at least one
    MSI during the I/O.
 
+   Full PCIe stack now in place. New surfaces:
+   - `bus::pci_cap` — generic capability-list walker with
+     `find_cap(device, id) -> Option<offset>` and an `iter()`
+     iterator. `bus::msix::enable_msix` is refactored to use it.
+   - `bus::pci_cap_ext` — PCIe extended capability list walker
+     (offset 0x100..0xFFF, 16-bit IDs); reader for AER status
+     (correctable + uncorrectable).
+   - `bus::pci_express` — PCI Express capability surface: read
+     Device Caps / Device Control / Link Status / Link Caps;
+     MaxPayload / link-speed / link-width decoders. FLR support
+     via `function_level_reset(cap, &dev)` that asserts the FLR
+     capability bit, sets DevCtl.InitiateFLR, and waits for the
+     device to come back.
+   - `bus::msi` — legacy MSI cap (cap ID 0x05) for devices that
+     don't expose MSI-X. Same shape as MSI-X with cfg-space-resident
+     message-address/data; supports 64-bit address + multi-message
+     enable up to 32 vectors.
+   - `MsixTable::program_vector_block(start, n, target, irq_base)`
+     for per-CPU IO queues; `mask_vector` / `unmask_vector` per
+     entry helpers.
+   - `narf_interrupts::vector::alloc_block(n)` reserves N
+     contiguous IDT vectors with rollback on failure.
+
+   Smokes: smoke_pci_cap_walker_finds_msix,
+   smoke_pci_express_cap_link_status, smoke_msix_program_block,
+   smoke_pci_cap_ext_walker, smoke_vector_alloc_block_contiguous.
+
    PCIe driver-match registry (`bus::driver_match`) lets drivers
    register `(name, MatchKind, probe_fn)` entries — `MatchKind` is
    `VendorDevice` (most specific), `Class { class, mask }`, or

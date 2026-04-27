@@ -32,13 +32,6 @@ use crate::registry::BusDeviceCap;
 /// PCI Express capability-list ID for MSI-X. Per PCIe spec §7.7.2.
 pub const MSIX_CAP_ID: u8 = 0x11;
 
-/// Offset of the Capabilities Pointer in type-0 config space.
-const CAP_POINTER_OFFSET: u64 = 0x34;
-/// Status register (offset 0x06) — bit 4 signals "capabilities list
-/// present". Without it, walking the cap pointer is undefined behaviour.
-const STATUS_OFFSET: u64 = 0x06;
-const STATUS_CAP_LIST_BIT: u16 = 1 << 4;
-
 /// A reserved MSI-X vector.
 ///
 /// Stage 3 stores placeholder `address` / `data` fields — real
@@ -269,6 +262,73 @@ impl MsixTable {
         })
     }
 
+    /// Program a contiguous block of `n_vectors` MSI-X table entries
+    /// starting at `start_idx`, each delivering `irq_base + i` to the
+    /// same target. Useful for per-CPU IO queues in storage / NIC
+    /// drivers — a single call sets up N completions in one go.
+    ///
+    /// Returns a Vec of the resulting `MsixVector`s. Errors at the
+    /// first failing entry; entries before that have already been
+    /// written and the table-control "enable" bit hasn't been
+    /// flipped, so the caller can recover by writing the masked
+    /// vector_control.
+    ///
+    /// # Safety
+    /// Same preconditions as `program_vector` — exclusive ownership
+    /// of the device + each `start_idx + i` came from `alloc_vector`
+    /// or `alloc_block` against this table.
+    pub unsafe fn program_vector_block(
+        &mut self,
+        start_idx:      u16,
+        n_vectors:      u16,
+        target_apic_id: u32,
+        irq_base:       u8,
+    ) -> Result<alloc::vec::Vec<MsixVector>, MsixError> {
+        if start_idx as u32 + n_vectors as u32 > self.size as u32 {
+            return Err(MsixError::VectorOutOfRange);
+        }
+        let mut out = alloc::vec::Vec::with_capacity(n_vectors as usize);
+        for i in 0..n_vectors {
+            let irq = irq_base.checked_add(i as u8)
+                .ok_or(MsixError::VectorOutOfRange)?;
+            // SAFETY: forwarded; per-vector_idx in range by check above.
+            let v = unsafe { self.program_vector(start_idx + i, target_apic_id, irq) }?;
+            out.push(v);
+        }
+        Ok(out)
+    }
+
+    /// Mask MSI-X entry `idx`. Sets vector_control bit 0 in the
+    /// BAR-mapped table; further IRQs for that entry are suppressed
+    /// until `unmask_vector` runs.
+    ///
+    /// # Safety
+    /// Caller owns the device exclusively; `idx < self.size`.
+    pub unsafe fn mask_vector(&self, idx: u16) -> Result<(), MsixError> {
+        if idx >= self.size { return Err(MsixError::VectorOutOfRange); }
+        // SAFETY: caller-owned device; map_bar reproducible.
+        let region = unsafe { map_bar(&self.device, self.bir)? };
+        let entry_off = self.table_offset as u64 + (idx as u64) * 16;
+        // SAFETY: entry_off + 16 <= bar.size by spec (MsixTable was
+        // built from the spec-mandated table size).
+        unsafe { region.write32(entry_off + 12, 1); }
+        Ok(())
+    }
+
+    /// Unmask MSI-X entry `idx` — clears vector_control bit 0.
+    ///
+    /// # Safety
+    /// Same as `mask_vector`.
+    pub unsafe fn unmask_vector(&self, idx: u16) -> Result<(), MsixError> {
+        if idx >= self.size { return Err(MsixError::VectorOutOfRange); }
+        // SAFETY: caller-owned device.
+        let region = unsafe { map_bar(&self.device, self.bir)? };
+        let entry_off = self.table_offset as u64 + (idx as u64) * 16;
+        // SAFETY: same.
+        unsafe { region.write32(entry_off + 12, 0); }
+        Ok(())
+    }
+
     /// Flip the MSI-X capability's "MSI-X enable" bit (Message
     /// Control bit 15). After this returns, programmed entries
     /// actually deliver. PCIe-recommended order: program first, then
@@ -320,61 +380,36 @@ pub fn enable_msix(
         BusKind::VirtioMmio { .. }     => return Err(MsixError::NotPcie),
     };
 
-    // SAFETY: the BusDevice came out of the registry, which only
-    // records functions whose cfg window is inside the identity-mapped
-    // ECAM region. 2-byte / 1-byte MMIO reads against an aligned
-    // offset are well-defined.
-    let status = unsafe { cfg_read16(cfg_phys, STATUS_OFFSET) };
-    if (status & STATUS_CAP_LIST_BIT) == 0 {
-        return Err(MsixError::CapabilityNotFound);
-    }
+    // SAFETY: caller-checked cap; pci_cap::find_cap walks the
+    // standard PCI cap list with a bounded hop count.
+    let cap_ptr = match unsafe { crate::pci_cap::find_cap(device, MSIX_CAP_ID) } {
+        Ok(Some(off)) => off,
+        Ok(None)
+        | Err(crate::pci_cap::CapError::NoCapList)
+        | Err(crate::pci_cap::CapError::NotPcie) => return Err(MsixError::CapabilityNotFound),
+    };
 
-    // SAFETY: same window.
-    let mut cap_ptr = (unsafe { cfg_read8(cfg_phys, CAP_POINTER_OFFSET) }) as u64;
-    // Bottom two bits are reserved per PCI spec 3.0 §6.7 and must be
-    // masked off when treating the pointer as an offset.
-    cap_ptr &= 0xFC;
+    // MSI-X capability layout (PCIe 7.7.2):
+    //   +0: Cap ID + Next Cap Ptr
+    //   +2: Message Control (u16)        — bits 10..0 = N-1
+    //   +4: Table (u32)                  — BIR (low 3) + offset
+    //   +8: Pending Bit Array (u32)
+    // SAFETY: cap_ptr lives inside the 256-byte config window.
+    let msg_ctrl = unsafe { cfg_read16(cfg_phys, cap_ptr + 2) };
+    let table    = unsafe { cfg_read32(cfg_phys, cap_ptr + 4) };
 
-    // The cap list is bounded to the 256-byte type-0 header; a
-    // malformed pointer could otherwise loop forever. 48 cap headers
-    // is a generous upper bound — far more than any real device.
-    let mut hops = 0u32;
-    while cap_ptr != 0 && hops < 48 {
-        // SAFETY: cap_ptr < 0x100 per the mask + the walk bound.
-        let id   = unsafe { cfg_read8(cfg_phys, cap_ptr)     };
-        // SAFETY: same.
-        let next = unsafe { cfg_read8(cfg_phys, cap_ptr + 1) };
-
-        if id == MSIX_CAP_ID {
-            // MSI-X capability layout (PCIe 7.7.2):
-            //   +0: Cap ID + Next Cap Ptr
-            //   +2: Message Control (u16)        — bits 10..0 = N-1
-            //   +4: Table (u32)                  — BIR (low 3) + offset
-            //   +8: Pending Bit Array (u32)
-            // SAFETY: still inside the 256-byte config window.
-            let msg_ctrl = unsafe { cfg_read16(cfg_phys, cap_ptr + 2) };
-            let table    = unsafe { cfg_read32(cfg_phys, cap_ptr + 4) };
-
-            // N-1 encoding: the actual table size is (msg_ctrl & 0x7FF) + 1.
-            let size         = ((msg_ctrl & 0x07FF) as u16) + 1;
-            let bir          = (table & 0x7) as u8;
-            let table_offset = table & !0x7;
-            return Ok(MsixTable {
-                bir,
-                table_offset,
-                size,
-                next_free: 0,
-                cfg_phys,
-                device:     *device,
-                cap_offset: cap_ptr,
-            });
-        }
-
-        cap_ptr = (next as u64) & 0xFC;
-        hops += 1;
-    }
-
-    Err(MsixError::CapabilityNotFound)
+    let size         = ((msg_ctrl & 0x07FF) as u16) + 1;
+    let bir          = (table & 0x7) as u8;
+    let table_offset = table & !0x7;
+    Ok(MsixTable {
+        bir,
+        table_offset,
+        size,
+        next_free: 0,
+        cfg_phys,
+        device:     *device,
+        cap_offset: cap_ptr,
+    })
 }
 
 /// Test-only helper: build an `MsixTable` from synthetic metadata
@@ -432,19 +467,6 @@ fn msi_message(target: u32, vector_or_event: u8) -> (u64, u32) {
 }
 
 // ── helpers ─────────────────────────────────────────────────────────
-
-/// Read a single byte out of an identity-mapped PCIe config window.
-///
-/// # Safety
-/// `cfg` + `off` must lie inside the function's 4-KiB cfg window.
-#[inline]
-unsafe fn cfg_read8(cfg: PhysAddr, off: u64) -> u8 {
-    compiler_fence(Ordering::SeqCst);
-    // SAFETY: caller promises the byte is readable.
-    let v = unsafe { core::ptr::read_volatile((cfg.raw() + off) as *const u8) };
-    compiler_fence(Ordering::SeqCst);
-    v
-}
 
 /// Read an aligned 16-bit word out of an identity-mapped PCIe config
 /// window.
