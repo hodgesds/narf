@@ -407,6 +407,7 @@ version = "0.0.0"
 dependencies = [
  "narf-boot",
  "narf-capabilities",
+ "narf-interrupts",
  "narf-lib",
  "narf-memory",
 ]
@@ -533,6 +534,7 @@ version = "0.0.0"
 dependencies = [
  "narf-arch",
  "narf-lib",
+ "narf-memory",
 ]
 
 [[package]]

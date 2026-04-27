@@ -65,7 +65,13 @@ pub extern "C" fn rust_aarch64_irq(_frame: &TrapFrame) {
             // don't EOI, just return.
             return;
         }
-        _ => { /* unregistered vector — drop */ }
+        _ => {
+            // Driver-registered IRQ. The dispatch table is keyed on a
+            // logical 8-bit vector; for SPIs in 32..=287 and LPIs >=
+            // 8192 the low byte is enough to disambiguate inside any
+            // one driver (Stage-3 contract).
+            narf_interrupts::on_irq((intid & 0xFF) as u8);
+        }
     }
 
     // SAFETY: write the same IAR value we read to EOI.

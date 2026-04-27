@@ -467,8 +467,30 @@ The critical-path Stage-2 items remaining:
    backed by `target/narf-nvme.img`. End-to-end guarded by
    `smoke_nvme_admin_identify_controller`, which asserts the
    IDENTIFY response carries QEMU's vendor id (0x1B36) and model
-   prefix (`"QEMU"`). Per-CPU I/O queue pairs + real MSI-X-driven
-   completions land next.
+   prefix (`"QEMU"`).
+
+   IRQ-driven driver readiness: `narf_interrupts` now exposes a
+   generic dispatch table (`on_irq(vector)` + per-vector fire counts
+   + waker bridge), an IDT-vector bitmap allocator
+   (`vector::alloc/free`), and a `wait_for_irq(vector).await` future
+   that bridges IRQ delivery to the async executor. Both arch trap
+   paths route vectors ≥ 32 (x86_64) / non-timer SPIs+LPIs (aarch64)
+   through `narf_interrupts::on_irq`. `MsixTable::program_vector`
+   is now arch-symmetric: x86_64 emits `0xFEE0_0000 | (apic_id<<12)`
+   + IDT vector; aarch64 emits the GIC ITS doorbell PA
+   (`GITS_TRANSLATER` = 0x0809_0040 on QEMU virt) + EventID. ITS
+   bring-up runs at boot under aarch64 — allocates device /
+   collection / command-queue tables, programs `GITS_BASER`,
+   `GITS_CBASER`, `GICR_PROPBASER`, `GICR_PENDBASER`, enables LPIs,
+   submits MAPC for collection 0 → CPU 0. `its::map_event(device,
+   event, lpi, collection)` issues MAPD + MAPTI. Smokes:
+   `smoke_irq_dispatch_fire_count`, `smoke_vector_alloc_unique`,
+   `smoke_wait_for_irq_resolves_after_on_irq`, `smoke_its_doorbell_addr`.
+
+   Remaining for full driver readiness: per-CPU I/O queue pairs +
+   real MSI-X-driven completions in the NVMe driver (now unblocked),
+   and aarch64 MMIO mapping above 4 GiB (needed before QEMU virt
+   PCIe transports — at 0x10_0000_0000 — are reachable).
 
 2. **Higher-half kernel relocation**. Conventional -2 GiB layout.
    Touches the linker script, boot.S (far-jump-to-virtual after

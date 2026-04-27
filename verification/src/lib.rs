@@ -423,6 +423,76 @@ fn smoke_timer_irq_fires() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_timer_irq_fires);
 
+fn smoke_irq_dispatch_fire_count() -> TestResult {
+    // Synthesise an IRQ delivery into the dispatch table and verify
+    // the fire-count atomic moves. Vector 100 is unused by the
+    // kernel; calling on_irq directly bypasses the trap path.
+    let before = narf_interrupts::fire_count(100);
+    narf_interrupts::on_irq(100);
+    narf_interrupts::on_irq(100);
+    let after = narf_interrupts::fire_count(100);
+    if after - before != 2 {
+        return TestResult::Fail("on_irq did not bump fire_count by 2");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_irq_dispatch_fire_count);
+
+fn smoke_vector_alloc_unique() -> TestResult {
+    use narf_interrupts::vector::{alloc, free, is_allocated};
+    let v0 = match alloc() { Ok(v) => v, Err(_) => return TestResult::Fail("alloc#0 failed") };
+    let v1 = match alloc() { Ok(v) => v, Err(_) => return TestResult::Fail("alloc#1 failed") };
+    if v0 == v1 { return TestResult::Fail("two allocs returned the same vector"); }
+    if !is_allocated(v0) || !is_allocated(v1) { return TestResult::Fail("alloc'd vector not marked"); }
+    if free(v0).is_err() { return TestResult::Fail("free returned error"); }
+    if free(v0).is_ok() { return TestResult::Fail("double-free silently accepted"); }
+    if free(v1).is_err() { return TestResult::Fail("free#1 returned error"); }
+    TestResult::Pass
+}
+kernel_test!(smoke_vector_alloc_unique);
+
+fn smoke_wait_for_irq_resolves_after_on_irq() -> TestResult {
+    // wait_for_irq on a never-fired vector polls Pending; firing the
+    // vector wakes the future and the next poll returns Ready.
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    // Hand-rolled noop-ish waker that flips a flag.
+    static WOKEN: AtomicBool = AtomicBool::new(false);
+    fn noop_clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VTABLE) }
+    fn noop_wake(_: *const ()) { WOKEN.store(true, Ordering::Release); }
+    fn noop_wake_by_ref(_: *const ()) { WOKEN.store(true, Ordering::Release); }
+    fn noop_drop(_: *const ()) {}
+    static VTABLE: RawWakerVTable =
+        RawWakerVTable::new(noop_clone, noop_wake, noop_wake_by_ref, noop_drop);
+
+    WOKEN.store(false, Ordering::Release);
+    // SAFETY: vtable functions are non-null; we're constructing a
+    // local Waker for a one-shot poll.
+    let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+    let mut cx = Context::from_waker(&w);
+
+    let mut fut = narf_interrupts::wait_for_irq(101);
+    // First poll: no IRQ yet, registers waker.
+    let mut pinned = unsafe { Pin::new_unchecked(&mut fut) };
+    if !matches!(pinned.as_mut().poll(&mut cx), Poll::Pending) {
+        return TestResult::Fail("wait_for_irq returned Ready before any IRQ");
+    }
+    // Fire the IRQ; the waker should be called.
+    narf_interrupts::on_irq(101);
+    if !WOKEN.load(Ordering::Acquire) {
+        return TestResult::Fail("on_irq did not invoke the registered waker");
+    }
+    // Second poll: IRQ fired → Ready.
+    match pinned.as_mut().poll(&mut cx) {
+        Poll::Ready(_) => TestResult::Pass,
+        Poll::Pending  => TestResult::Fail("wait_for_irq stayed Pending after IRQ"),
+    }
+}
+kernel_test!(smoke_wait_for_irq_resolves_after_on_irq);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_probe_catches_page_fault() -> TestResult {
     // Arm the recoverable-fault probe, write to an unmapped virtual
@@ -1289,22 +1359,20 @@ fn smoke_bus_bar_read_on_q35() -> TestResult {
 kernel_test!(smoke_bus_bar_read_on_q35);
 
 #[cfg(target_arch = "aarch64")]
-fn smoke_bus_msix_program_vector_unsupported_on_aarch64() -> TestResult {
-    // aarch64 has no LAPIC; `program_vector` is a stub returning
-    // Unsupported until the GIC ITS doorbell path lands. The check
-    // happens after VectorOutOfRange but before BAR mapping, so the
-    // synthetic table (cfg_phys=0) is safe to drive here.
-    use narf_bus::msix::__synth_msix_table;
-    let mut t = __synth_msix_table(2);
-    // SAFETY: aarch64 path returns Unsupported before any MMIO.
-    match unsafe { t.program_vector(0, 0, 32) } {
-        Err(narf_bus::MsixError::Unsupported) => TestResult::Pass,
-        Err(_) => TestResult::Fail("wrong error from program_vector on aarch64"),
-        Ok(_)  => TestResult::Fail("program_vector unexpectedly succeeded on aarch64"),
+fn smoke_its_doorbell_addr() -> TestResult {
+    // The ITS doorbell on QEMU virt is GITS_TRANSLATER at offset
+    // 0x10040 from the ITS base 0x0808_0000. `program_vector` on
+    // aarch64 emits this address into msg_addr; verify the helper
+    // returns the documented value so a regression in the constant
+    // is caught structurally.
+    let pa = narf_interrupts::aarch64::its::doorbell_pa();
+    if pa != 0x0808_0000 + 0x10040 {
+        return TestResult::Fail("ITS doorbell address mismatch");
     }
+    TestResult::Pass
 }
 #[cfg(target_arch = "aarch64")]
-kernel_test!(smoke_bus_msix_program_vector_unsupported_on_aarch64);
+kernel_test!(smoke_its_doorbell_addr);
 
 #[cfg(target_arch = "aarch64")]
 fn smoke_bus_msix_enable_on_virtio() -> TestResult {

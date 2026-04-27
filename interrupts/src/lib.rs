@@ -14,6 +14,15 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(missing_debug_implementations)]
 
+extern crate alloc;
+
+pub mod dispatch;
+pub mod vector;
+pub mod wait;
+
+pub use dispatch::{fire_count, on_irq, NUM_VECTORS};
+pub use wait::{wait_for_irq, WaitForIrq};
+
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;
 #[cfg(target_arch = "x86_64")]

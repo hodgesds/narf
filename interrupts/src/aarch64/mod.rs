@@ -1,6 +1,7 @@
 //! aarch64 interrupt-controller backend (GICv3 + generic timer).
 
 pub mod gic;
+pub mod its;
 pub mod timer;
 
 pub use gic::init_bsp;

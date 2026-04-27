@@ -115,15 +115,19 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         return;
     }
 
-    // External IRQ path (vectors 32..=255). Dispatch to the
-    // subsystem-registered handler (or ignore if no handler), then
-    // EOI. Bypasses the probe-catch path — probes are for catching
-    // CPU *exceptions* (vectors 0..=31), not asynchronous IRQs.
+    // External IRQ path (vectors 32..=255). Dispatch through the
+    // generic dispatch table (driver-registered IRQ wakers) and then
+    // EOI. Vector 32 still hits the timer-tick counter directly so
+    // boot-time stats remain stable; everything else lands in the
+    // dispatch table where waiters are tracked.
+    //
+    // Bypasses the probe-catch path — probes are for catching CPU
+    // *exceptions* (vectors 0..=31), not asynchronous IRQs.
     if frame.vector >= 32 {
-        match frame.vector {
-            32 => narf_interrupts::x86_64::apic::on_timer_tick(),
-            _  => {}
+        if frame.vector == 32 {
+            narf_interrupts::x86_64::apic::on_timer_tick();
         }
+        narf_interrupts::on_irq(frame.vector as u8);
         // SAFETY: APIC is initialised before interrupts are enabled.
         unsafe { narf_interrupts::eoi(); }
         return;

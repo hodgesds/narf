@@ -16,6 +16,7 @@ narf-lib          = { path = "../lib" }
 narf-memory       = { path = "../memory" }
 narf-boot         = { path = "../boot" }
 narf-capabilities = { path = "../capabilities" }
+narf-interrupts   = { path = "../interrupts" }
 
 [lints]
 workspace = true

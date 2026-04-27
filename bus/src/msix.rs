@@ -197,8 +197,12 @@ impl MsixTable {
     /// gate). Programming entries while disabled is the documented
     /// PCIe-recommended order.
     ///
-    /// On aarch64 this is a stub that returns `Unsupported` until the
-    /// GIC ITS doorbell path lands.
+    /// On aarch64 the `target_apic_id` argument is reinterpreted as
+    /// the GIC ITS DeviceID (24 bits, opaque to the caller — drivers
+    /// pick a sequential id per device) and `irq_vector` is the
+    /// EventID written to `GITS_TRANSLATER`. The caller is responsible
+    /// for issuing the ITS `MAPD` + `MAPTI` commands beforehand via
+    /// `narf_interrupts::aarch64::its::map_event`.
     ///
     /// # Safety
     /// - The caller owns the device's BAR for the duration of this
@@ -214,50 +218,33 @@ impl MsixTable {
     ) -> Result<MsixVector, MsixError> {
         if vector_idx >= self.size { return Err(MsixError::VectorOutOfRange); }
 
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            let _ = (target_apic_id, irq_vector);
-            return Err(MsixError::Unsupported);
+        // SAFETY: caller holds the device exclusively. map_bar
+        // does the size-detection write/restore against cfg-space.
+        let region = unsafe { map_bar(&self.device, self.bir)? };
+
+        let (msg_addr, msg_data) = msi_message(target_apic_id, irq_vector);
+        let msg_addr_lo = msg_addr as u32;
+        let msg_addr_hi = (msg_addr >> 32) as u32;
+
+        // Vector control bit 0 = mask. Clear to unmask the entry.
+        let vec_ctrl: u32 = 0;
+
+        let entry_off = self.table_offset as u64 + (vector_idx as u64) * 16;
+        // SAFETY: entry_off + 16 <= bar.size by spec — table_offset
+        // is u32-aligned and the table sits inside the BAR; map_bar
+        // returned `region.len` as the BAR size.
+        unsafe {
+            region.write32(entry_off,      msg_addr_lo);
+            region.write32(entry_off + 4,  msg_addr_hi);
+            region.write32(entry_off + 8,  msg_data);
+            region.write32(entry_off + 12, vec_ctrl);
         }
 
-        #[cfg(target_arch = "x86_64")]
-        {
-            // SAFETY: caller holds the device exclusively. map_bar
-            // does the size-detection write/restore against cfg-space.
-            let region = unsafe { map_bar(&self.device, self.bir)? };
-
-            // LAPIC MSI address: 0xFEE0_0000 | (apic_id << 12).
-            // Bits 11..=4 are the destination APIC id for the
-            // physical / no-redirection case; we use bits 19..=12 for
-            // the standard 8-bit destination ID and leave the upper
-            // bits at zero (extended dest-id requires interrupt-
-            // remapping, which we don't gate on).
-            let msg_addr_lo: u32 = 0xFEE0_0000 | ((target_apic_id & 0xFF) << 12);
-            let msg_addr_hi: u32 = 0;
-            // Data: vector in bits 7..0, delivery-mode 000 = Fixed,
-            // level 0, trigger-mode 0 (edge). The remaining bits stay
-            // zero.
-            let msg_data:    u32 = irq_vector as u32;
-            // Vector control bit 0 = mask. Clear to unmask the entry.
-            let vec_ctrl:    u32 = 0;
-
-            let entry_off = self.table_offset as u64 + (vector_idx as u64) * 16;
-            // SAFETY: entry_off + 16 <= bar.size by spec — table_offset
-            // is u32-aligned and the table sits inside the BAR; map_bar
-            // returned `region.len` as the BAR size.
-            unsafe {
-                region.write32(entry_off,      msg_addr_lo);
-                region.write32(entry_off + 4,  msg_addr_hi);
-                region.write32(entry_off + 8,  msg_data);
-                region.write32(entry_off + 12, vec_ctrl);
-            }
-
-            Ok(MsixVector {
-                vector:  vector_idx,
-                address: ((msg_addr_hi as u64) << 32) | (msg_addr_lo as u64),
-                data:    msg_data,
-            })
-        }
+        Ok(MsixVector {
+            vector:  vector_idx,
+            address: msg_addr,
+            data:    msg_data,
+        })
     }
 
     /// Flip the MSI-X capability's "MSI-X enable" bit (Message
@@ -389,6 +376,36 @@ pub fn __synth_msix_table(size: u16) -> MsixTable {
             kind: BusKind::Pcie { addr, cfg_phys: PhysAddr::new(0) },
         },
         cap_offset:   0,
+    }
+}
+
+/// Compute the `(msi_addr, msg_data)` pair for an MSI delivery.
+///
+/// x86_64: LAPIC-directed MSI per Intel SDM Vol 3 §10.11.1.
+/// aarch64: GIC ITS doorbell + EventID. The caller wires the EventID
+/// → LPI translation through `narf_interrupts::aarch64::its::map_event`
+/// before calling `program_vector`.
+#[inline]
+fn msi_message(target: u32, vector_or_event: u8) -> (u64, u32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // 0xFEE0_0000 | (apic_id << 12) ; data = vector.
+        let addr = 0xFEE0_0000u64 | ((target as u64 & 0xFF) << 12);
+        (addr, vector_or_event as u32)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // GIC ITS doorbell PA + EventID.
+        let _ = target;
+        (
+            narf_interrupts::aarch64::its::doorbell_pa(),
+            vector_or_event as u32,
+        )
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = (target, vector_or_event);
+        (0, 0)
     }
 }
 

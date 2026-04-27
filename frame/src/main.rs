@@ -312,6 +312,26 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 let n_dev = unsafe { narf_bus::init(None) };
                 let _ = writeln!(console::Writer,
                     "  bus: virtio-mmio probe found {} transport(s)", n_dev);
+
+                // GIC ITS bring-up. Memory is online, GICv3 is up
+                // (gic::init_bsp ran above). Programs the device /
+                // collection / command-queue tables, sets
+                // GICR_PROPBASER / GICR_PENDBASER, enables LPIs, then
+                // submits MAPC for collection 0 → CPU 0. Idempotent.
+                // SAFETY: GICv3 distributor + CPU 0 redistributor are
+                // enabled; allocator is online; QEMU virt's ITS lives
+                // at the documented MMIO base.
+                match unsafe { narf_interrupts::aarch64::its::init_bsp() } {
+                    Ok(())  => {
+                        let _ = writeln!(console::Writer,
+                            "  its: GICv3 ITS up, doorbell @ {:#x}",
+                            narf_interrupts::aarch64::its::doorbell_pa());
+                    }
+                    Err(e) => {
+                        let _ = writeln!(console::Writer,
+                            "  its: bring-up failed: {e:?}");
+                    }
+                }
             }
         }
         Err(e) => {
