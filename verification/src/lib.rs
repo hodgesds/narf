@@ -12674,3 +12674,53 @@ fn smoke_userspace_umask_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_userspace_umask_round_trip);
+
+fn smoke_userspace_getcpu_returns_zero() -> TestResult {
+    use narf_userspace::{install_core_syscalls, install_global,
+                         kernel_syscall_entry, syscall::__test_clear_global,
+                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+                         TrapContext};
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let mut cpu: u32  = 99;
+    let mut node: u32 = 99;
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: &mut cpu  as *mut u32 as u64,
+            arg1: &mut node as *mut u32 as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Getcpu.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+        return TestResult::Fail("getcpu did not return OK");
+    }
+    if cpu != 0 || node != 0 {
+        return TestResult::Fail("getcpu did not write (0, 0)");
+    }
+
+    // Null pointers tolerated.
+    let mut ctx = FakeCtx {
+        args: SyscallArgs { arg0: 0, arg1: 0, ..SyscallArgs::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Getcpu.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+        return TestResult::Fail("getcpu(NULL, NULL) did not succeed");
+    }
+
+    __test_clear_global();
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_getcpu_returns_zero);

@@ -316,6 +316,34 @@ pub unsafe extern "C" fn setrlimit(resource: c_int, rlim: *const rlimit) -> c_in
     narf_user_runtime::setrlimit(resource as u32, &pair)
 }
 
+// ── <sched.h> sched_getcpu ─────────────────────────────────────────
+
+/// `sched_getcpu()` — return the CPU id the calling task is
+/// currently running on. Linux extension; consumer code uses it
+/// to pin per-CPU caches. NARF user mode is single-CPU; this
+/// always returns 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sched_getcpu() -> c_int {
+    let (cpu, _node) = narf_user_runtime::getcpu();
+    cpu as c_int
+}
+
+/// `getcpu(cpu, node)` — Linux glibc shape. Both pointers may be
+/// null. Returns 0 on success.
+///
+/// # Safety
+/// `cpu` and `node`, when non-null, must be writable `*mut u32`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn getcpu(cpu: *mut u32, node: *mut u32) -> c_int {
+    let (c, n) = narf_user_runtime::getcpu();
+    // SAFETY: caller-supplied writable slots.
+    unsafe {
+        if !cpu.is_null()  { *cpu  = c; }
+        if !node.is_null() { *node = n; }
+    }
+    0
+}
+
 // ── <dlfcn.h> ───────────────────────────────────────────────────────
 //
 // NARF has no dynamic loader at user mode (Stage-4 binaries are

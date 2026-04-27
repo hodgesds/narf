@@ -290,6 +290,12 @@ pub enum Syscall {
     /// what consumer init code expects.
     Umask        = 155,
 
+    /// `arg0 = cpu_out_ptr`, `arg1 = node_out_ptr`. Linux getcpu(2):
+    /// write the calling CPU id + NUMA node id to the supplied
+    /// out-pointers (each may be null). NARF user mode is
+    /// single-CPU today — both return 0. Returns 0 on success.
+    Getcpu       = 165,
+
     /// Set or query the per-task heap break.
     /// `arg0 = 0` → return current break; `arg0 != 0` → resize.
     /// POSIX `brk(2)` semantics: failure returns the unchanged break.
@@ -494,6 +500,7 @@ impl Syscall {
             148 => Syscall::Getrlimit,
             149 => Syscall::Setrlimit,
             155 => Syscall::Umask,
+            165 => Syscall::Getcpu,
             156 => Syscall::Getpriority,
             157 => Syscall::Setpriority,
             158 => Syscall::Times,

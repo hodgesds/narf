@@ -73,6 +73,7 @@ pub const SYS_GETRLIMIT:      u64 = 148;
 pub const SYS_SETRLIMIT:      u64 = 149;
 pub const SYS_UMASK:          u64 = 155;
 pub const SYS_GETPRIORITY:    u64 = 156;
+pub const SYS_GETCPU:         u64 = 165;
 pub const SYS_SETPRIORITY:    u64 = 157;
 pub const SYS_TIMES:          u64 = 158;
 pub const SYS_GETRUSAGE:      u64 = 159;
@@ -502,6 +503,20 @@ pub fn getrusage(who: i32, buf: &mut [i64; 18]) -> i32 {
 pub fn umask(new_mask: u32) -> u32 {
     // SAFETY: SYS_UMASK signature: (new_mask).
     unsafe { syscall1(SYS_UMASK, new_mask as u64) as u32 }
+}
+
+/// `getcpu(*cpu, *node)` — write the current CPU id and NUMA
+/// node id through the out-pointers (either may be null). Always
+/// returns 0; NARF user mode is single-CPU so both write 0.
+#[inline]
+pub fn getcpu() -> (u32, u32) {
+    let mut cpu: u32  = !0;
+    let mut node: u32 = !0;
+    // SAFETY: SYS_GETCPU signature: (cpu_ptr, node_ptr).
+    let _ = unsafe {
+        syscall2(SYS_GETCPU, &mut cpu as *mut u32 as u64, &mut node as *mut u32 as u64)
+    };
+    (cpu, node)
 }
 
 /// `getpriority(which, who)` — read the calling task's nice value.

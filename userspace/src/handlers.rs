@@ -1772,6 +1772,28 @@ fn sys_setrlimit(ctx: &mut dyn TrapContext) {
     }
 }
 
+// ── Getcpu — current CPU + NUMA node query ─────────────────────────
+//
+// Linux getcpu(2): real CPU + NUMA node lookup. NARF user mode is
+// single-CPU and single-node today — both return 0 — but library
+// code (libnuma, RT performance probes) queries this at startup
+// and the entry must exist.
+
+fn sys_getcpu(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let cpu_ptr  = args.arg0 as *mut u32;
+    let node_ptr = args.arg1 as *mut u32;
+    // SAFETY: caller-supplied user vaddrs in the active AS; we
+    // only write through them when they're non-null.
+    if !cpu_ptr.is_null() {
+        unsafe { core::ptr::write_volatile(cpu_ptr, 0); }
+    }
+    if !node_ptr.is_null() {
+        unsafe { core::ptr::write_volatile(node_ptr, 0); }
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
 // ── Per-task umask ──────────────────────────────────────────────────
 //
 // POSIX umask(2) sets the file-creation mask: bits set in the
@@ -2840,6 +2862,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Getrlimit,   "getrlimit",   RawFnHandler(sys_getrlimit));
     table.install_raw(Syscall::Setrlimit,   "setrlimit",   RawFnHandler(sys_setrlimit));
     table.install_raw(Syscall::Umask,       "umask",       RawFnHandler(sys_umask));
+    table.install_raw(Syscall::Getcpu,      "getcpu",      RawFnHandler(sys_getcpu));
     table.install_raw(Syscall::Getpriority, "getpriority", RawFnHandler(sys_getpriority));
     table.install_raw(Syscall::Setpriority, "setpriority", RawFnHandler(sys_setpriority));
     table.install_raw(Syscall::Times,       "times",       RawFnHandler(sys_times));
