@@ -7266,6 +7266,44 @@ fn smoke_smp_aarch64_dtb_count() -> TestResult {
 kernel_test!(smoke_smp_aarch64_dtb_count);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_smp_x86_64_ap_online() -> TestResult {
+    // After INIT-SIPI-SIPI bring-up at boot, CPU 1 is online if QEMU
+    // was started with -smp >= 2. xtask sets -smp 2 by default.
+    use narf_lib::smp;
+    if smp::cpu_count() < 2 {
+        return TestResult::Skip("BSP-only QEMU config");
+    }
+    if !smp::is_online(1) {
+        return TestResult::Fail("AP CPU 1 didn't come online");
+    }
+    if smp::online_count() < 2 {
+        return TestResult::Fail("online_count < 2 with -smp 2");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_smp_x86_64_ap_online);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_smp_x86_64_cpuid_count() -> TestResult {
+    // CPUID leaf 0xB sub 1 EBX[15:0] should agree with cpu_count
+    // (both derive from the same QEMU -smp N value).
+    use narf_lib::smp;
+    let advertised = smp::cpu_count();
+    // SAFETY: CPUID at CPL=0.
+    let probed = unsafe { smp::count_x86_64_cpus_via_cpuid() };
+    if probed != advertised {
+        return TestResult::Fail("CPUID/cpu_count disagree");
+    }
+    if probed == 0 || probed > narf_lib::smp::MAX_CPUS as u32 {
+        return TestResult::Fail("CPUID count out of range");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_smp_x86_64_cpuid_count);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_virtio_balloon_pci_probe() -> TestResult {
     use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
     use narf_bus::driver_match::__reset_for_test;

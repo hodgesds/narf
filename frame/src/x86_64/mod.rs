@@ -2,10 +2,12 @@
 
 core::arch::global_asm!(include_str!("boot.S"));
 core::arch::global_asm!(include_str!("trap_entry.S"));
+core::arch::global_asm!(include_str!("ap_trampoline.S"));
 
 pub mod gdt;
 pub mod idt;
 pub mod percpu;
+pub mod smp;
 pub mod trap;
 pub mod user;
 

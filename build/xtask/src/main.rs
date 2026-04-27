@@ -105,6 +105,9 @@ impl Arch {
                 vec![
                     "-machine".into(), "q35".into(),
                     "-cpu".into(),     "max".into(),
+                    // 2 logical CPUs so AP bring-up via INIT-SIPI-SIPI
+                    // exercises a real second core under QEMU q35.
+                    "-smp".into(),     "2".into(),
                     "-m".into(),       "256M".into(),
                     "-serial".into(),  "stdio".into(),
                     "-display".into(), "none".into(),

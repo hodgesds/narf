@@ -83,6 +83,46 @@ pub fn __reset_for_test() {
     ONLINE_BITMAP.store(1, Ordering::Release);
 }
 
+/// Read CPUID leaf 1 EBX[23:16] for the logical-processor count
+/// reported by the BSP. On QEMU `-smp N -cpu max` this matches `N`;
+/// real hardware with multi-package topologies needs ACPI MADT
+/// (later wave). Returns 1 if CPUID indicates a single-CPU system
+/// (HTT bit clear in EDX:28).
+///
+/// # Safety
+/// CPUID is always legal at CPL=0; the unsafe boundary is purely
+/// for the inline-asm wrapper.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn count_x86_64_cpus_via_cpuid() -> u32 {
+    use core::arch::asm;
+    // CPUID leaf 0xB sub 1 (Core level). EBX[15:0] = logical
+    // processors at this level = total LPs in the package on
+    // single-package systems. QEMU `-smp N -cpu max` populates
+    // this correctly; CPUID leaf 1 EBX[23:16] is *not* reliable
+    // under QEMU.
+    let mut a: u32 = 0xB;
+    let b: u64;
+    let mut c: u32 = 1;     // sub-leaf
+    // SAFETY: CPUID is always legal at CPL=0; we preserve rbx.
+    unsafe {
+        asm!(
+            "push rbx",
+            "cpuid",
+            "mov {b:r}, rbx",
+            "pop rbx",
+            inout("eax") a,
+            inout("ecx") c,
+            out("edx") _,
+            b = out(reg) b,
+            options(nostack, preserves_flags),
+        );
+    }
+    let _ = a;
+    let _ = c;
+    let n = (b as u32) & 0xFFFF;
+    if n == 0 { 1 } else { n }
+}
+
 /// Walk an FDT blob counting `cpu@N` nodes under the `cpus` parent.
 /// Returns 0 on bad magic / truncation. Used by aarch64's discovery
 /// path; x86_64 grows ACPI MADT parsing instead.

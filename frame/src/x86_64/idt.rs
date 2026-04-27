@@ -267,5 +267,25 @@ pub unsafe fn init() {
     unsafe {
         asm!("lidt [{p}]", p = in(reg) &ptr, options(readonly, nostack, preserves_flags));
     }
+}
+
+/// Load the BSP-built IDT register on this CPU. Used by AP bring-up:
+/// the IDT entries are populated once on the BSP, but each CPU's
+/// IDTR is per-CPU and must be loaded individually.
+///
+/// # Safety
+/// `init` must have already populated the IDT on the BSP. Caller
+/// must be at CPL=0 with interrupts disabled.
+pub unsafe fn load_idtr_ap() {
+    let ptr = IdtPointer {
+        limit: (IDT_ENTRIES * core::mem::size_of::<IdtEntry>() - 1) as u16,
+        base:  core::ptr::addr_of!(IDT) as u64,
+    };
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: same as init's lidt — IDT is BSP-built and immutable
+    // post-init.
+    unsafe {
+        asm!("lidt [{p}]", p = in(reg) &ptr, options(readonly, nostack, preserves_flags));
+    }
     compiler_fence(Ordering::SeqCst);
 }

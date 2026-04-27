@@ -286,10 +286,28 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 };
                 let _ = writeln!(console::Writer,
                     "  bus: PCIe ECAM walk found {} function(s)", n_dev);
+
+                // SMP discovery via CPUID leaf 1 EBX[23:16] (logical
+                // processor count). Matches QEMU `-smp N`. Real
+                // hardware multi-package topology needs ACPI MADT —
+                // grows alongside MADT parsing in a later wave.
+                // SAFETY: CPUID is always legal at CPL=0.
+                let n = unsafe { narf_lib::smp::count_x86_64_cpus_via_cpuid() };
+                if n > 0 {
+                    narf_lib::smp::set_cpu_count(n);
+                }
                 let _ = writeln!(console::Writer,
-                    "  smp: {} CPU(s) advertised, {} online (ACPI MADT pending)",
-                    narf_lib::smp::cpu_count(),
-                    narf_lib::smp::online_count());
+                    "  smp: {} CPU(s) advertised", narf_lib::smp::cpu_count());
+
+                // AP bring-up via INIT-SIPI-SIPI. Trampoline lands at
+                // phys 0x8000; APs enter `_ap_start_rust` after the
+                // 16→32→64 mode walk.
+                // SAFETY: memory + LAPIC + IDT/GDT all initialised
+                // above; identity map covers 0x8000.
+                let started = unsafe { x86_64::smp::start_aps() };
+                let _ = writeln!(console::Writer,
+                    "  smp: started {} AP(s); {} CPU(s) online",
+                    started, narf_lib::smp::online_count());
             }
             #[cfg(target_arch = "aarch64")]
             {

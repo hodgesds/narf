@@ -144,6 +144,78 @@ pub unsafe fn self_ipi(vector: u8) {
     unsafe { wrmsr(0x83F, vector as u64); }
 }
 
+/// x2APIC ICR MSR (0x830). Writing this sends an IPI; the high 32
+/// bits of the value carry the destination APIC ID and the low 32
+/// bits carry the IPI fields (vector + delivery mode + level + etc).
+const APIC_ICR_MSR: u32 = 0x0000_0830;
+
+/// Read this CPU's APIC ID via x2APIC MSR 0x802.
+///
+/// # Safety
+/// x2APIC must be enabled.
+#[inline]
+pub unsafe fn apic_id() -> u32 {
+    // SAFETY: MSR 0x802 is x2APIC APIC_ID — read-only.
+    unsafe { rdmsr(0x0000_0802) as u32 }
+}
+
+/// Send an INIT IPI (assert) to the target APIC.
+///
+/// Used as the first step of the INIT-SIPI-SIPI bring-up sequence.
+/// Delivery mode = 0b101 (INIT), level = 1 (assert), trigger = 0
+/// (edge).
+///
+/// # Safety
+/// x2APIC must be enabled. Caller is responsible for the 10 ms
+/// delay PSCI/Intel SDM recommends between INIT and SIPI.
+#[inline]
+pub unsafe fn send_init_ipi(target_apic_id: u32) {
+    let dest = (target_apic_id as u64) << 32;
+    // INIT (delivery mode 0b101 = 0x500), level=assert (bit 14),
+    // trigger=edge (bit 15 = 0), destination=physical (bit 11 = 0).
+    let icr = dest | 0x0000_4500;
+    // SAFETY: MSR 0x830 is x2APIC ICR.
+    unsafe { wrmsr(APIC_ICR_MSR, icr); }
+}
+
+/// Send a STARTUP IPI (SIPI) to the target APIC.
+///
+/// `vector_page` is the page-aligned physical address of the AP
+/// trampoline, divided by 4 KiB (so 0x8000 → 0x08). The AP starts
+/// executing at `CS:IP = (vector_page << 8) : 0x0000` in real mode.
+///
+/// # Safety
+/// x2APIC must be enabled. Caller must have already issued INIT
+/// + waited 10 ms.
+#[inline]
+pub unsafe fn send_startup_ipi(target_apic_id: u32, vector_page: u8) {
+    let dest = (target_apic_id as u64) << 32;
+    // SIPI (delivery mode 0b110 = 0x600) + vector (low 8 bits).
+    let icr = dest | 0x0000_4600 | (vector_page as u64);
+    // SAFETY: MSR 0x830 is x2APIC ICR.
+    unsafe { wrmsr(APIC_ICR_MSR, icr); }
+}
+
+/// Initialise *this* CPU's LAPIC in x2APIC mode (no PIC-mask, no
+/// SIVR — those are BSP-only). Used by AP bring-up after the AP
+/// enters Rust.
+///
+/// # Safety
+/// - Must run on the CPU being initialised.
+/// - CPUID must confirm x2APIC support (gated by BSP).
+/// - Interrupts disabled at call time.
+pub unsafe fn init_ap() {
+    // SAFETY: x2APIC support is BSP-confirmed.
+    let base = unsafe { rdmsr(IA32_APIC_BASE) };
+    unsafe { wrmsr(IA32_APIC_BASE, base | APIC_BASE_EN | APIC_BASE_EXTD); }
+    // Spurious vector + software enable.
+    // SAFETY: x2APIC is now live on this CPU.
+    unsafe {
+        wrmsr(APIC_SIVR_MSR, SIVR_ENABLE | (super::super::VECTOR_SPURIOUS as u64));
+        wrmsr(APIC_LVT_TIMER_MSR, LVT_MASKED);
+    }
+}
+
 /// Called from the Rust trap handler on the timer IRQ.
 #[inline]
 pub fn on_timer_tick() {

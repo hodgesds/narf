@@ -256,6 +256,18 @@ pub unsafe fn set_kernel_rsp0(top: u64) {
     compiler_fence(Ordering::SeqCst);
 }
 
+/// Linear address of the BSP-built GDT. AP bring-up reads this to
+/// patch the AP trampoline's GDT-pointer parameter so the AP loads
+/// the same GDT the BSP uses.
+pub fn gdt_base() -> u64 {
+    core::ptr::addr_of!(GDT) as u64
+}
+
+/// Limit of the BSP-built GDT (size − 1). Used alongside `gdt_base`.
+pub fn gdt_limit() -> u16 {
+    (7 * 8 - 1) as u16
+}
+
 /// Read the currently-installed `TSS.rsp0`. Diagnostic helper —
 /// scheduler tests use it to confirm the setter took effect.
 pub fn kernel_rsp0() -> u64 {
