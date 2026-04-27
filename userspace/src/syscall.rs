@@ -251,6 +251,13 @@ pub enum Syscall {
     /// existence probe as SYS_OPEN (open + close).
     Faccessat    = 136,
 
+    /// `arg0 = dirfd`, `arg1 = path_ptr`, `arg2 = path_len`,
+    /// `arg3 = flags`, `arg4 = mode`. Linux openat(2).
+    /// dirfd ignored; path must be absolute. Returns the new fd
+    /// or `!0u64` on failure (matching SYS_OPEN's convention so
+    /// the user-runtime wrapper distinguishes consistently).
+    Openat       = 137,
+
     /// `arg0 = pipefd_out_ptr`, `arg1 = flags`. Linux pipe2(2):
     /// pipe + atomic flag set. Honoured flag: O_CLOEXEC (bit
     /// 0x80000) — both ends get FD_CLOEXEC stamped at install
@@ -689,6 +696,7 @@ impl Syscall {
             134 => Syscall::Fchmodat,
             135 => Syscall::Fchownat,
             136 => Syscall::Faccessat,
+            137 => Syscall::Openat,
             120 => Syscall::Mmap,
             121 => Syscall::Munmap,
             130 => Syscall::RingKick,

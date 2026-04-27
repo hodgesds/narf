@@ -30,7 +30,8 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
 
 use crate::{
-    fd, RawFnHandler, Syscall, SyscallReturn, SyscallTable, TrapContext,
+    fd, RawFnHandler, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+    TrapContext,
 };
 
 // ── Current-task lookup shim ───────────────────────────────────────
@@ -1168,6 +1169,49 @@ fn sys_truncate(ctx: &mut dyn TrapContext) {
         }
         None => ctx.set_return(fail),
     }
+}
+
+// ── openat — *at-keyed open ────────────────────────────────────────
+//
+// Linux openat(dirfd, path, flags, mode) — modern replacement for
+// open. dirfd is ignored (NARF has no directory-fd type); path
+// must be absolute. The body re-shapes args into the SYS_OPEN
+// signature (path_ptr, path_len, mount_ptr=0, mount_len=0, flags)
+// and routes through the existing sys_open handler so the open
+// path is identical.
+
+fn sys_openat(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let _dirfd = args.arg0;
+    let path_ptr = args.arg1;
+    let path_len = args.arg2;
+    let flags    = args.arg3;
+    let _mode    = args.arg4;
+    // Reshape into a SYS_OPEN-compatible context: arg0 = path_ptr,
+    // arg1 = path_len, arg2 = 0 (mount_ptr), arg3 = 0 (mount_len),
+    // arg4 = flags. We can't construct a fresh TrapContext here —
+    // we wrap in an inline struct that proxies the args.
+    struct Reshape<'a> {
+        inner: &'a mut dyn TrapContext,
+        args:  SyscallArgs,
+    }
+    impl<'a> TrapContext for Reshape<'a> {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.inner.set_return(r); }
+        fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
+            self.inner.redirect_to_kernel(rip, rsp)
+        }
+    }
+    let proxy_args = SyscallArgs {
+        arg0: path_ptr,
+        arg1: path_len,
+        arg2: 0,
+        arg3: 0,
+        arg4: flags,
+        arg5: 0,
+    };
+    let mut proxy = Reshape { inner: ctx, args: proxy_args };
+    sys_open(&mut proxy);
 }
 
 // ── fchmodat / fchownat — *at-keyed mode/owner ─────────────────────
@@ -3850,6 +3894,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Fchmodat, "fchmodat", RawFnHandler(sys_fchmodat_or_fchownat));
     table.install_raw(Syscall::Fchownat, "fchownat", RawFnHandler(sys_fchmodat_or_fchownat));
     table.install_raw(Syscall::Faccessat, "faccessat", RawFnHandler(sys_fchmodat_or_fchownat));
+    table.install_raw(Syscall::Openat,    "openat",    RawFnHandler(sys_openat));
 
     // Tier-2 cwd state + nanosleep wired into the table. Sleep
     // already replaced the noop_ok stub above.
