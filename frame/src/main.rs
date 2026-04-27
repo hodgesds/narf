@@ -286,6 +286,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 };
                 let _ = writeln!(console::Writer,
                     "  bus: PCIe ECAM walk found {} function(s)", n_dev);
+                let _ = writeln!(console::Writer,
+                    "  smp: {} CPU(s) advertised, {} online (ACPI MADT pending)",
+                    narf_lib::smp::cpu_count(),
+                    narf_lib::smp::online_count());
             }
             #[cfg(target_arch = "aarch64")]
             {
@@ -339,6 +343,22 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         let _ = writeln!(console::Writer,
                             "  its: bring-up failed: {e:?}");
                     }
+                }
+
+                // SMP discovery: count CPUs from the DTB. Real AP
+                // bring-up via PSCI lands as a follow-up.
+                if let Some(p) = info.dtb_phys {
+                    // SAFETY: DTB validated by boot/aarch64.
+                    let n = unsafe {
+                        narf_lib::smp::count_aarch64_cpus_in_dtb(p.raw())
+                    };
+                    if n > 0 {
+                        narf_lib::smp::set_cpu_count(n);
+                    }
+                    let _ = writeln!(console::Writer,
+                        "  smp: {} CPU(s) advertised, {} online",
+                        narf_lib::smp::cpu_count(),
+                        narf_lib::smp::online_count());
                 }
             }
 

@@ -7019,6 +7019,59 @@ fn smoke_aarch64_mpidr_aff_present() -> TestResult {
 #[cfg(target_arch = "aarch64")]
 kernel_test!(smoke_aarch64_mpidr_aff_present);
 
+fn smoke_smp_bsp_baseline() -> TestResult {
+    use narf_lib::smp;
+    if !smp::is_online(0) {
+        return TestResult::Fail("BSP not marked online");
+    }
+    if smp::online_count() < 1 {
+        return TestResult::Fail("online_count < 1");
+    }
+    if smp::cpu_count() < 1 {
+        return TestResult::Fail("cpu_count < 1");
+    }
+    if smp::online_bitmap() & 1 == 0 {
+        return TestResult::Fail("BSP bit clear");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_smp_bsp_baseline);
+
+fn smoke_smp_mark_online_offline() -> TestResult {
+    use narf_lib::smp;
+    // Toggle a hypothetical AP bit (CPU 1) without actually starting
+    // it — pure bookkeeping check.
+    if smp::is_online(1) {
+        return TestResult::Fail("CPU 1 spuriously online before bring-up");
+    }
+    // SAFETY: not actually running on CPU 1; this is a bookkeeping
+    // surface test, not real bring-up.
+    unsafe { smp::mark_online(1); }
+    if !smp::is_online(1) {
+        return TestResult::Fail("mark_online didn't set bit");
+    }
+    smp::mark_offline(1);
+    if smp::is_online(1) {
+        return TestResult::Fail("mark_offline didn't clear bit");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_smp_mark_online_offline);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_smp_aarch64_dtb_count() -> TestResult {
+    // QEMU virt -smp 1 (default) reports 1 CPU. The number bumps
+    // when xtask switches to `-smp N`.
+    use narf_lib::smp;
+    let n = smp::cpu_count();
+    if n == 0 || n > narf_lib::smp::MAX_CPUS as u32 {
+        return TestResult::Fail("cpu_count out of range");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test!(smoke_smp_aarch64_dtb_count);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_virtio_balloon_pci_probe() -> TestResult {
     use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};

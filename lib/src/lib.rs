@@ -17,4 +17,5 @@ pub mod bitmap;
 pub mod id;
 pub mod intrusive;
 pub mod percpu;
+pub mod smp;
 pub mod sync;
