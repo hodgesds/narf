@@ -9,6 +9,7 @@
 extern crate alloc;
 extern crate narf_io;
 
+pub mod balloon_pci;
 pub mod blk;
 pub mod blk_pci;
 pub mod net_pci;

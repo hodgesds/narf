@@ -6496,6 +6496,33 @@ fn smoke_ahci_identify_device() -> TestResult {
 kernel_test!(smoke_ahci_identify_device);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_virtio_balloon_pci_probe() -> TestResult {
+    use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_drivers_virtio::balloon_pci;
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let has = devs.iter().any(|d|
+        matches!(&d.kind, BusKind::Pcie { .. })
+        && d.id.vendor == balloon_pci::VIRTIO_BALLOON_PCI_VENDOR
+        && d.id.device == balloon_pci::VIRTIO_BALLOON_PCI_DEVICE);
+    if !has { return TestResult::Skip("no virtio-balloon-pci"); }
+    __reset_for_test();
+    balloon_pci::register_pci_driver();
+    let authority = bootstrap_registry_authority();
+    if probe_all_pci(&authority).is_err() {
+        return TestResult::Fail("probe_all_pci");
+    }
+    if !balloon_pci::is_probed() {
+        return TestResult::Fail("balloon probe didn't install controller");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_virtio_balloon_pci_probe);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_virtio_rng_pci_probe() -> TestResult {
     // Probe-only: verify that virtio-rng-pci's bring_up runs and
     // installs a controller. The data-path (read_bytes via queue

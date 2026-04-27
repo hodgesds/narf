@@ -154,6 +154,12 @@ impl Arch {
                     format!("if=none,id=sata0,format=raw,file={}",
                             ahci_image_path().display()),
                     "-device".into(),  "ide-hd,drive=sata0,bus=ide.0".into(),
+                    // virtio-balloon: cooperative memory pressure
+                    // device. We don't use it for actual ballooning
+                    // yet — the driver's structural bring-up is the
+                    // smoke target.
+                    "-device".into(),
+                    "virtio-balloon-pci,disable-legacy=on,disable-modern=off".into(),
                     "-kernel".into(),  kernel,
                 ]
             },
@@ -205,6 +211,8 @@ impl Arch {
                 "rng-random,id=rng0,filename=/dev/urandom".into(),
                 "-device".into(),
                 "virtio-rng-pci,rng=rng0,disable-legacy=on,disable-modern=off".into(),
+                "-device".into(),
+                "virtio-balloon-pci,disable-legacy=on,disable-modern=off".into(),
                 // QEMU's `-kernel <elf>` path on aarch64 does not
                 // load a `-dtb` blob into RAM (the DTB-loading code
                 // path is gated on `is_linux=1`). Instead we
