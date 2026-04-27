@@ -434,6 +434,90 @@ impl VirtioBlkPci {
     /// Negotiated queue size.
     pub fn queue_size(&self) -> u16 { self.qsize }
 
+    /// IRQ-driven variant of `write_sector`. Same shape as
+    /// `read_sector_irq` — submit, await fire_count or used-ring,
+    /// drain, return.
+    pub fn write_sector_irq(&self, sector: u64, data: &[u8; 512])
+        -> Result<(), VirtioPciError>
+    {
+        let v = match self.irq_vector {
+            Some(v) => v,
+            None    => return self.write_sector(sector, data),
+        };
+        let pool_phys = self.pool.phys_addr().raw();
+        let header_phys = pool_phys;
+        let status_phys = pool_phys + 16;
+        // SAFETY: identity-mapped DMA.
+        unsafe {
+            core::ptr::write_volatile(header_phys as *mut BlkHeader, BlkHeader {
+                type_tag: VIRTIO_BLK_T_OUT, _resv: 0, sector,
+            });
+            core::ptr::write_volatile(status_phys as *mut u8, 0xFFu8);
+        }
+        let payload = alloc_coherent(4096, DomainId::DRIVER_0)
+            .map_err(|_| VirtioPciError::BarMapFailed)?;
+        let payload_phys = payload.phys_addr().raw();
+        // SAFETY: page-sized DMA.
+        unsafe {
+            for i in 0..512usize {
+                core::ptr::write_volatile(
+                    (payload_phys + i as u64) as *mut u8, data[i]);
+            }
+        }
+        let descs = [
+            VirtqDesc { addr: header_phys,  len: 16,  flags: 0,                  next: 0 },
+            VirtqDesc { addr: payload_phys, len: 512, flags: 0,                  next: 0 },
+            VirtqDesc { addr: status_phys,  len: 1,   flags: VIRTQ_DESC_F_WRITE, next: 0 },
+        ];
+        let baseline = narf_interrupts::fire_count(v);
+        let head = {
+            let mut g = self.queue.lock();
+            let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
+            q.add_buffer(&descs).ok_or(VirtioPciError::QueueTooSmall)?
+        };
+        let notify_off = (self.queue_notify_off as u64)
+            * (self.notify_off_multiplier as u64);
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: identity-mapped notify region.
+        unsafe { self.notify.write16(notify_off, 0); }
+        let mut spins = 0u32;
+        loop {
+            if narf_interrupts::fire_count(v) > baseline { break; }
+            let elem = {
+                let mut g = self.queue.lock();
+                let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
+                q.poll_used()
+            };
+            if let Some((id, _)) = elem { if id == head as u32 { break; } }
+            spins += 1;
+            if spins > 10_000_000 { return Err(VirtioPciError::QueueTooSmall); }
+            core::hint::spin_loop();
+        }
+        loop {
+            let elem = {
+                let mut g = self.queue.lock();
+                let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
+                q.poll_used()
+            };
+            match elem {
+                Some((id, _)) if id == head as u32 => break,
+                Some(_) => continue,
+                None    => core::hint::spin_loop(),
+            }
+        }
+        // SAFETY: identity-mapped DMA.
+        let status = unsafe { core::ptr::read_volatile(status_phys as *const u8) };
+        if status != VIRTIO_BLK_S_OK {
+            let mut g = self.queue.lock();
+            if let Some(q) = g.as_mut() { q.free_chain(head); }
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        let mut g = self.queue.lock();
+        if let Some(q) = g.as_mut() { q.free_chain(head); }
+        let _ = payload;
+        Ok(())
+    }
+
     /// IRQ-driven variant of `read_sector`. Submits the request,
     /// then polls on `narf_interrupts::fire_count(irq_vector)` —
     /// the same atomic `wait_for_irq.await` consumes. Falls through
