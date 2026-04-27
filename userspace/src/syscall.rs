@@ -282,6 +282,18 @@ pub enum Syscall {
     /// absolute.
     Renameat     = 229,
 
+    /// `arg0 = target_ptr`, `arg1 = target_len`, `arg2 = dirfd`,
+    /// `arg3 = link_ptr`, `arg4 = link_len`. Linux symlinkat(2).
+    /// dirfd ignored; link path must be absolute. Forwards to
+    /// the SYS_SYMLINK body.
+    Symlinkat    = 230,
+
+    /// `arg0 = dirfd`, `arg1 = path_ptr`, `arg2 = path_len`,
+    /// `arg3 = buf_ptr`, `arg4 = buf_len`. Linux readlinkat(2).
+    /// dirfd ignored; path must be absolute. Forwards to the
+    /// SYS_READLINK body.
+    Readlinkat   = 231,
+
     /// `arg0 = pipefd_out_ptr`, `arg1 = flags`. Linux pipe2(2):
     /// pipe + atomic flag set. Honoured flag: O_CLOEXEC (bit
     /// 0x80000) — both ends get FD_CLOEXEC stamped at install
@@ -729,6 +741,8 @@ impl Syscall {
             139 => Syscall::Unlinkat,
             228 => Syscall::Mkdirat,
             229 => Syscall::Renameat,
+            230 => Syscall::Symlinkat,
+            231 => Syscall::Readlinkat,
             120 => Syscall::Mmap,
             121 => Syscall::Munmap,
             130 => Syscall::RingKick,

@@ -1260,6 +1260,67 @@ fn sys_renameat(ctx: &mut dyn TrapContext) {
     sys_rename(&mut proxy);
 }
 
+// ── symlinkat / readlinkat — *at-keyed symlink ops ─────────────────
+//
+// Both forward via Reshape proxies. dirfd ignored; path args are
+// absolute. The symlink handler reads (target_ptr, target_len,
+// link_ptr, link_len) from arg0..=arg3; readlink reads
+// (path_ptr, path_len, buf_ptr, buf_len) from arg0..=arg3.
+
+fn sys_symlinkat(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let target_ptr = args.arg0;
+    let target_len = args.arg1;
+    let _dirfd     = args.arg2;
+    let link_ptr   = args.arg3;
+    let link_len   = args.arg4;
+    struct Reshape<'a> {
+        inner: &'a mut dyn TrapContext,
+        args:  SyscallArgs,
+    }
+    impl<'a> TrapContext for Reshape<'a> {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.inner.set_return(r); }
+        fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
+            self.inner.redirect_to_kernel(rip, rsp)
+        }
+    }
+    let proxy_args = SyscallArgs {
+        arg0: target_ptr, arg1: target_len,
+        arg2: link_ptr,   arg3: link_len,
+        arg4: 0, arg5: 0,
+    };
+    let mut proxy = Reshape { inner: ctx, args: proxy_args };
+    sys_symlink(&mut proxy);
+}
+
+fn sys_readlinkat(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let _dirfd   = args.arg0;
+    let path_ptr = args.arg1;
+    let path_len = args.arg2;
+    let buf_ptr  = args.arg3;
+    let buf_len  = args.arg4;
+    struct Reshape<'a> {
+        inner: &'a mut dyn TrapContext,
+        args:  SyscallArgs,
+    }
+    impl<'a> TrapContext for Reshape<'a> {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.inner.set_return(r); }
+        fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
+            self.inner.redirect_to_kernel(rip, rsp)
+        }
+    }
+    let proxy_args = SyscallArgs {
+        arg0: path_ptr, arg1: path_len,
+        arg2: buf_ptr,  arg3: buf_len,
+        arg4: 0, arg5: 0,
+    };
+    let mut proxy = Reshape { inner: ctx, args: proxy_args };
+    sys_readlink(&mut proxy);
+}
+
 // ── newfstatat — *at-keyed stat ────────────────────────────────────
 //
 // Linux newfstatat(dirfd, path, statbuf, flags). Same dirfd-
@@ -4105,6 +4166,8 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Unlinkat,  "unlinkat",  RawFnHandler(sys_unlinkat));
     table.install_raw(Syscall::Mkdirat,   "mkdirat",   RawFnHandler(sys_mkdirat));
     table.install_raw(Syscall::Renameat,  "renameat",  RawFnHandler(sys_renameat));
+    table.install_raw(Syscall::Symlinkat, "symlinkat", RawFnHandler(sys_symlinkat));
+    table.install_raw(Syscall::Readlinkat,"readlinkat",RawFnHandler(sys_readlinkat));
 
     // Tier-2 cwd state + nanosleep wired into the table. Sleep
     // already replaced the noop_ok stub above.

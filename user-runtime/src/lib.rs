@@ -87,6 +87,8 @@ pub const SYS_NEWFSTATAT:     u64 = 138;
 pub const SYS_UNLINKAT:       u64 = 139;
 pub const SYS_MKDIRAT:        u64 = 228;
 pub const SYS_RENAMEAT:       u64 = 229;
+pub const SYS_SYMLINKAT:      u64 = 230;
+pub const SYS_READLINKAT:     u64 = 231;
 pub const SYS_GETHOSTNAME:    u64 = 146;
 pub const SYS_SETHOSTNAME:    u64 = 147;
 pub const SYS_GETRLIMIT:      u64 = 148;
@@ -1381,6 +1383,43 @@ pub fn renameat(old_dirfd: i32, old: &str, new_dirfd: i32, new: &str) -> i32 {
         )
     };
     if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `symlinkat(target, dirfd, link)` — Linux *at variant of
+/// symlink. dirfd is ignored; link must be absolute. Returns
+/// 0 on success, -1 on failure.
+#[inline]
+pub fn symlinkat(target: &str, dirfd: i32, link: &str) -> i32 {
+    if target.is_empty() || link.is_empty() { return -1; }
+    // SAFETY: SYS_SYMLINKAT signature: (target_ptr, target_len, dirfd,
+    // link_ptr, link_len).
+    let r = unsafe {
+        syscall5(
+            SYS_SYMLINKAT,
+            target.as_ptr() as u64, target.len() as u64,
+            dirfd as u64,
+            link.as_ptr() as u64, link.len() as u64,
+        )
+    };
+    if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `readlinkat(dirfd, path, buf)` — Linux *at variant of
+/// readlink. dirfd is ignored; path must be absolute. Returns
+/// the byte count copied on success, -1 on lookup failure.
+#[inline]
+pub fn readlinkat(dirfd: i32, path: &str, buf: &mut [u8]) -> isize {
+    if path.is_empty() || buf.is_empty() { return -1; }
+    // SAFETY: SYS_READLINKAT signature: (dirfd, path_ptr, path_len,
+    // buf_ptr, buf_len).
+    let r = unsafe {
+        syscall5(
+            SYS_READLINKAT, dirfd as u64,
+            path.as_ptr() as u64, path.len() as u64,
+            buf.as_mut_ptr() as u64, buf.len() as u64,
+        )
+    };
+    r as isize
 }
 
 /// `fstatat(dirfd, path, stat_out, flags)` — Linux *at variant

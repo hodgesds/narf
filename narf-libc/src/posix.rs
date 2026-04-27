@@ -395,6 +395,47 @@ pub unsafe extern "C" fn renameat(
     narf_user_runtime::renameat(old_dirfd, o, new_dirfd, n)
 }
 
+/// `symlinkat(target, dirfd, linkpath)` — Linux `*at(2)` variant
+/// of symlink. dirfd is ignored; linkpath must be absolute. Returns
+/// 0 on success, -1 on failure.
+///
+/// # Safety
+/// Both pointers must be NUL-terminated C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn symlinkat(
+    target:   *const c_char,
+    dirfd:    c_int,
+    linkpath: *const c_char,
+) -> c_int {
+    if target.is_null() || linkpath.is_null() { return -1; }
+    // SAFETY: caller-asserted NUL-terminators.
+    let t = unsafe { cstr_to_str(target) };
+    let l = unsafe { cstr_to_str(linkpath) };
+    narf_user_runtime::symlinkat(t, dirfd, l)
+}
+
+/// `readlinkat(dirfd, path, buf, bufsiz)` — Linux `*at(2)` variant
+/// of readlink. dirfd is ignored; path must be absolute. Returns
+/// the byte count copied on success, -1 on lookup failure.
+///
+/// # Safety
+/// `path` must be NUL-terminated; `buf` must be writable for
+/// `bufsiz` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn readlinkat(
+    dirfd:  c_int,
+    path:   *const c_char,
+    buf:    *mut c_char,
+    bufsiz: usize,
+) -> ssize_t {
+    if path.is_null() || buf.is_null() || bufsiz == 0 { return -1; }
+    // SAFETY: caller-asserted NUL-terminator.
+    let s = unsafe { cstr_to_str(path) };
+    // SAFETY: caller-asserted writable region.
+    let slice = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, bufsiz) };
+    narf_user_runtime::readlinkat(dirfd, s, slice) as ssize_t
+}
+
 /// `openat(dirfd, path, flags, mode)` — Linux `*at(2)` variant
 /// of open. dirfd is ignored; path must be absolute. Returns the
 /// new fd, or -1 on failure.
