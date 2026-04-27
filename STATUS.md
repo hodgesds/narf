@@ -18,11 +18,11 @@ asks for. Updated when observable kernel behaviour changes.
   delivers hardware LAPIC-timer IRQs, exits cleanly.
 - `cargo xtask run --arch=aarch64` boots, runs the full async demo
   using CNTPCT_EL0 as the clock, exits via ARM semihosting.
-- `cargo xtask test --arch=x86_64` passes **248/248** kernel tests.
-- `cargo xtask test --arch=aarch64` passes **190/190** kernel tests
+- `cargo xtask test --arch=x86_64` passes **255/255** kernel tests.
+- `cargo xtask test --arch=aarch64` passes **193/193** kernel tests
   (3 skipped tests are x86_64-specific PCIe surfaces — virtio
   device IDs that QEMU virt doesn't expose at the IDs we register).
-- 7 in-tree PCIe drivers running against real QEMU-emulated devices:
+- 8 in-tree PCIe drivers running against real QEMU-emulated devices:
 
 | driver           | scope                                            |
 |------------------|--------------------------------------------------|
@@ -33,6 +33,19 @@ asks for. Updated when observable kernel behaviour changes.
 | virtio-balloon-pci | Modern transport. Structural probe.             |
 | e1000 / e1000e   | Real Intel NIC (8254x + 8257x family). TX + RX.   |
 | AHCI (ICH9/10)   | HBA bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT. |
+| xHCI USB host    | HCRST reset + DCBAA + Command Ring + scratchpad pointers + USBCMD.RS=1. |
+
+Cross-driver integrations:
+- `block::registry` — unified `BlockDeviceSync` trait; NVMe +
+  virtio-blk-pci + AHCI register adapters (`nvme0`, `vblk0`,
+  `sata0`) so the kernel addresses heterogeneous storage uniformly.
+- `narf_drivers::bound` — live inventory of bound drivers
+  (`name`, `BoundKind`, vendor/device). Boot prints the full
+  portfolio.
+- `narf_net::pkt` — Ethernet / ARP / IPv4 / ICMP echo
+  parse+build helpers + RFC-1071 IP checksum. e1000 round-trip
+  smoke confirms the builders interop with QEMU's user-mode
+  network backend.
 
 Representative x86_64 boot transcript:
 

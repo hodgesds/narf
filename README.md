@@ -75,12 +75,22 @@ Live from boot through `cargo xtask run`:
   IDENTIFY DEVICE + READ DMA EXT + WRITE DMA EXT against a
   QEMU-emulated SATA disk.
 - virtio-rng-pci + virtio-balloon-pci: structural probe.
+- xHCI USB host controller: HCRST reset, DCBAA + Command Ring +
+  scratchpad pointers, USBCMD.RS=1 → running.
+
+Cross-driver integration: a unified `block::BlockDeviceSync`
+adapter lets the kernel address NVMe + virtio-blk-pci + AHCI
+behind one `dyn`-friendly trait. `narf_drivers::bound` keeps a
+live inventory of bound drivers; boot prints the full portfolio.
+`narf_net::pkt` ships Ethernet / ARP / IPv4 / ICMP echo
+parse+build helpers — the e1000 driver's RX loop verifies
+interop with QEMU's user-mode net backend.
 - Cap-system epoch tables, RCU (QSBR + epoch + hazard pointers),
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **248/0/0** smokes;
-`--arch=aarch64` passes **190/0/3** (the 3 skips are x86-specific
+`cargo xtask test --arch=x86_64` passes **255/0/0** smokes;
+`--arch=aarch64` passes **193/0/3** (the 3 skips are x86-specific
 PCIe surfaces). See `STATUS.md` for the full tally and per-subsystem
 breakdown.
 
