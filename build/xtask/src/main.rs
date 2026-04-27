@@ -125,6 +125,14 @@ impl Arch {
                             virtio_blk_image_path().display()),
                     "-device".into(),
                     "virtio-blk-pci,drive=vblk0,disable-legacy=on,disable-modern=off".into(),
+                    // virtio-net-pci over the QEMU user-mode net
+                    // backend. The driver doesn't run a full TCP/IP
+                    // stack — the smoke verifies it can post a frame
+                    // onto the TX queue and the device's used ring
+                    // returns it.
+                    "-netdev".into(),  "user,id=n0".into(),
+                    "-device".into(),
+                    "virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off".into(),
                     "-kernel".into(),  kernel,
                 ]
             },
@@ -165,6 +173,10 @@ impl Arch {
                         virtio_blk_image_path().display()),
                 "-device".into(),
                 "virtio-blk-pci,drive=vblk0,disable-legacy=on,disable-modern=off".into(),
+                // virtio-net-pci on aarch64 too.
+                "-netdev".into(),  "user,id=n0".into(),
+                "-device".into(),
+                "virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off".into(),
                 // QEMU's `-kernel <elf>` path on aarch64 does not
                 // load a `-dtb` blob into RAM (the DTB-loading code
                 // path is gated on `is_linux=1`). Instead we
@@ -223,6 +235,8 @@ fn qemu_virt_dtb_path() -> PathBuf {
                 "if=none,id=vblk0,format=raw,file={}",
                 virtio_blk_image_path().display()))
             .arg("-device").arg("virtio-blk-pci,drive=vblk0")
+            .arg("-netdev").arg("user,id=n0")
+            .arg("-device").arg("virtio-net-pci,netdev=n0")
             .status();
     }
     path

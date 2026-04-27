@@ -535,19 +535,28 @@ The critical-path Stage-2 items remaining:
    smoke_pci_express_cap_link_status, smoke_msix_program_block,
    smoke_pci_cap_ext_walker, smoke_vector_alloc_block_contiguous.
 
-   First in-tree PCIe driver shipped: **virtio-blk-pci** (modern
-   transport, vendor 0x1AF4, device 0x1042). `drivers/virtio/src/pci.rs`
-   walks the four vendor-specific caps (Common Cfg, Notify, ISR,
-   Device Cfg), maps each region via `bus::map_bar`, exposes
-   register access compatible with the existing virtqueue plumbing.
-   `drivers/virtio/src/blk_pci.rs` does feature negotiation
-   (VIRTIO_F_VERSION_1), queue-0 setup, and a polled
-   `read_sector(lba, &mut [u8; 512])`. xtask attaches the device
-   on both arches via `-device virtio-blk-pci,disable-legacy=on`
-   backed by a separate `target/narf-vblk.img`. Probes via
-   `bus::register_pci_driver`. Smoke
-   `smoke_virtio_blk_pci_read_sector` round-trips the sector-0
-   pattern xtask seeds the image with.
+   First in-tree PCIe drivers shipped:
+   - **virtio-blk-pci** (modern, vendor 0x1AF4, device 0x1042).
+     `drivers/virtio/src/pci.rs` walks the vendor-specific virtio
+     caps (Common Cfg, Notify, ISR, Device Cfg) and maps each via
+     `bus::map_bar`. `blk_pci.rs` does feature negotiation
+     (VIRTIO_F_VERSION_1), queue-0 setup, polled
+     `read_sector` / `write_sector`, plus an MSI-X-driven
+     `read_sector_irq` that snapshot-checks
+     `narf_interrupts::fire_count` after writing the queue's
+     notify register. `enable_msix_for_probed(cap, &device)` flips
+     the controller into IRQ-driven mode (programs MSI-X table 0,
+     writes `queue_msix_vector=0`).
+   - **virtio-net-pci** (modern, vendor 0x1AF4, device 0x1041).
+     RX + TX virtqueues, RX pre-populated with 8 empty buffers,
+     polled `tx(&[u8])` that posts a header + payload + waits for
+     the device to consume it.
+
+   xtask attaches both on both arches: `virtio-blk-pci` backed by
+   `target/narf-vblk.img`, `virtio-net-pci` over a QEMU user-mode
+   net backend. Smokes `smoke_virtio_blk_pci_read_sector`,
+   `smoke_virtio_blk_pci_write_then_read`,
+   `smoke_virtio_blk_pci_irq_driven`, `smoke_virtio_net_pci_tx`.
 
    PCIe driver-match registry (`bus::driver_match`) lets drivers
    register `(name, MatchKind, probe_fn)` entries — `MatchKind` is

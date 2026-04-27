@@ -11,6 +11,7 @@ extern crate narf_io;
 
 pub mod blk;
 pub mod blk_pci;
+pub mod net_pci;
 pub mod pci;
 pub mod queue;
 pub mod class_blk;

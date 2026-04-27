@@ -6239,6 +6239,54 @@ fn smoke_virtio_blk_pci_irq_driven() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_virtio_blk_pci_irq_driven);
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_virtio_net_pci_tx() -> TestResult {
+    // Bring up virtio-net-pci, post a small frame to the TX queue,
+    // assert the device acks it via the used ring (polled).
+    use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_drivers_virtio::net_pci;
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let has_net = devs.iter().any(|d|
+        matches!(&d.kind, BusKind::Pcie { .. })
+        && d.id.vendor == net_pci::VIRTIO_NET_PCI_VENDOR
+        && d.id.device == net_pci::VIRTIO_NET_PCI_DEVICE);
+    if !has_net {
+        return TestResult::Skip("no virtio-net-pci device");
+    }
+    __reset_for_test();
+    net_pci::register_pci_driver();
+    let authority = bootstrap_registry_authority();
+    if probe_all_pci(&authority).is_err() {
+        return TestResult::Fail("probe_all_pci");
+    }
+    if !net_pci::is_probed() {
+        return TestResult::Fail("virtio-net-pci not probed");
+    }
+
+    // 64-byte frame: [Ethernet header (14 bytes, all-zero) + 50 bytes
+    // of recognisable payload]. We don't expect the QEMU user backend
+    // to forward this anywhere — the smoke just verifies that the
+    // device accepts the frame on the TX virtqueue.
+    let mut frame = [0u8; 64];
+    for i in 14..64 { frame[i] = (i as u8).wrapping_mul(0x3D); }
+    let tx_ok = net_pci::with_controller(|c| c.tx(&frame))
+        .map(|r| r.is_ok()).unwrap_or(false);
+    if !tx_ok {
+        return TestResult::Fail("virtio-net-pci tx returned Err");
+    }
+    let qsizes = net_pci::with_controller(|c|
+        (c.rx_queue_size(), c.tx_queue_size())).unwrap_or((0, 0));
+    if qsizes.0 == 0 || qsizes.1 == 0 {
+        return TestResult::Fail("queue sizes zero — bring-up failed");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_virtio_net_pci_tx);
+
 fn smoke_drivers_net_nic_model_ids() -> TestResult {
     use narf_drivers_net::{NicCaps, NicModel};
 
