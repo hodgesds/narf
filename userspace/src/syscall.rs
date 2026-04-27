@@ -212,6 +212,15 @@ pub enum Syscall {
     /// directory entry), matching the spec.
     MemfdCreate  = 128,
 
+    /// `arg0 = fd`, `arg1 = mode`. fchmod(2). NARF doesn't
+    /// enforce permission bits; the call succeeds on a known fd
+    /// (-1 on closed fd). Round-trip is structural.
+    Fchmod       = 129,
+
+    /// `arg0 = fd`, `arg1 = uid`, `arg2 = gid`. fchown(2). Same
+    /// accept-and-record semantics as fchmod.
+    Fchown       = 131,
+
     /// `arg0 = pipefd_out_ptr`, `arg1 = flags`. Linux pipe2(2):
     /// pipe + atomic flag set. Honoured flag: O_CLOEXEC (bit
     /// 0x80000) — both ends get FD_CLOEXEC stamped at install
@@ -583,6 +592,8 @@ impl Syscall {
             126 => Syscall::Fallocate,
             127 => Syscall::CopyFileRange,
             128 => Syscall::MemfdCreate,
+            129 => Syscall::Fchmod,
+            131 => Syscall::Fchown,
             120 => Syscall::Mmap,
             121 => Syscall::Munmap,
             130 => Syscall::RingKick,

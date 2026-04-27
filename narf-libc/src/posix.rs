@@ -292,6 +292,51 @@ pub unsafe extern "C" fn link(_old: *const c_char, _new: *const c_char) -> c_int
     -1
 }
 
+/// `fchmod(fd, mode)` — accept the new mode. NARF has no per-file
+/// permission enforcement; round-trip is structural.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fchmod(fd: c_int, mode: u32) -> c_int {
+    if fd < 0 { return -1; }
+    narf_user_runtime::fchmod(fd as u32, mode)
+}
+
+/// `fchown(fd, uid, gid)` — accept the new owner.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fchown(fd: c_int, uid: u32, gid: u32) -> c_int {
+    if fd < 0 { return -1; }
+    narf_user_runtime::fchown(fd as u32, uid, gid)
+}
+
+/// `chown(path, uid, gid)` — path-keyed owner setter via
+/// open + fchown + close. Same structural-only semantics.
+///
+/// # Safety
+/// `path` must be a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn chown(path: *const c_char, uid: u32, gid: u32) -> c_int {
+    if path.is_null() { return -1; }
+    // SAFETY: caller-asserted NUL-terminator.
+    let s = unsafe { cstr_to_str(path) };
+    let fd = match narf_user_runtime::open_abs(s) {
+        Some(f) => f,
+        None    => return -1,
+    };
+    let r = narf_user_runtime::fchown(fd, uid, gid);
+    let _ = narf_user_runtime::close(fd);
+    r
+}
+
+/// `lchown(path, uid, gid)` — like chown but doesn't follow
+/// symlinks. NARF has no symlink support; alias of chown.
+///
+/// # Safety
+/// See [`chown`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lchown(path: *const c_char, uid: u32, gid: u32) -> c_int {
+    // SAFETY: forwarded.
+    unsafe { chown(path, uid, gid) }
+}
+
 /// `fsync(fd)` — request a flush of buffered writes. NARF FSes
 /// are in-memory so the call is structural.
 #[unsafe(no_mangle)]

@@ -70,6 +70,8 @@ pub const SYS_PIPE2:          u64 = 125;
 pub const SYS_FALLOCATE:      u64 = 126;
 pub const SYS_COPY_FILE_RANGE: u64 = 127;
 pub const SYS_MEMFD_CREATE:   u64 = 128;
+pub const SYS_FCHMOD:         u64 = 129;
+pub const SYS_FCHOWN:         u64 = 131;
 pub const SYS_GETHOSTNAME:    u64 = 146;
 pub const SYS_SETHOSTNAME:    u64 = 147;
 pub const SYS_GETRLIMIT:      u64 = 148;
@@ -1149,6 +1151,25 @@ pub fn pipe() -> Option<(u32, u32)> {
     } else {
         Some((fds[0] as u32, fds[1] as u32))
     }
+}
+
+/// `fchmod(fd, mode)` — fd-keyed permission setter. NARF doesn't
+/// enforce mode bits; the call succeeds on a known fd, fails on
+/// closed.
+#[inline]
+pub fn fchmod(fd: u32, mode: u32) -> i32 {
+    // SAFETY: SYS_FCHMOD signature: (fd, mode).
+    let r = unsafe { syscall2(SYS_FCHMOD, fd as u64, mode as u64) };
+    if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `fchown(fd, uid, gid)` — fd-keyed owner setter. Same
+/// accept-and-record semantics as [`fchmod`].
+#[inline]
+pub fn fchown(fd: u32, uid: u32, gid: u32) -> i32 {
+    // SAFETY: SYS_FCHOWN signature: (fd, uid, gid).
+    let r = unsafe { syscall3(SYS_FCHOWN, fd as u64, uid as u64, gid as u64) };
+    if r as i64 == -1 { -1 } else { 0 }
 }
 
 /// `memfd_create(name, flags)` — create an anonymous in-memory

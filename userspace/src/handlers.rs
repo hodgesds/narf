@@ -1103,6 +1103,24 @@ fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(copied as u64));
 }
 
+// ── fchmod / fchown — accept-and-ignore on known fd ───────────────
+//
+// NARF has no per-file permission bits or owner; the kernel
+// surface exists so consumers (tar, cp, install) can round-trip
+// the values without breaking. Both succeed for any open fd, fail
+// (-1) for a closed/unknown fd.
+
+fn sys_fchmod_or_fchown(ctx: &mut dyn TrapContext) {
+    let fd = ctx.args().arg0 as u32;
+    let task = current_task_id();
+    let known = fd::with_table(task, |t| t.get(fd).is_some()).unwrap_or(false);
+    if known {
+        ctx.set_return(SyscallReturn::ok(0));
+    } else {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+    }
+}
+
 // ── memfd_create — anonymous in-memory file ────────────────────────
 //
 // Linux memfd_create(2): mint a fresh in-memory file backed by a
@@ -3356,6 +3374,8 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         RawFnHandler(sys_copy_file_range));
     table.install_raw(Syscall::MemfdCreate, "memfd_create",
         RawFnHandler(sys_memfd_create));
+    table.install_raw(Syscall::Fchmod, "fchmod", RawFnHandler(sys_fchmod_or_fchown));
+    table.install_raw(Syscall::Fchown, "fchown", RawFnHandler(sys_fchmod_or_fchown));
 
     // Tier-2 cwd state + nanosleep wired into the table. Sleep
     // already replaced the noop_ok stub above.
