@@ -648,6 +648,50 @@ pub fn identify_model(id: &[u8; 512]) -> [u8; 40] {
     out
 }
 
+/// Sync block-device adapter for the registry. Routes reads /
+/// writes through `ahci_read_lba` / `ahci_write_lba` against the
+/// first SATA port (or port 0 as a fallback when probe-time
+/// PortKind classification missed the SIG window).
+#[derive(Debug)]
+pub struct AhciBlockSync;
+
+impl narf_block::BlockDeviceSync for AhciBlockSync {
+    fn lba_size(&self) -> u32 { 512 }
+    fn capacity(&self) -> u64 {
+        // Stage-4 stub. IDENTIFY DEVICE words 100..103 = total
+        // user-addressable LBAs (48-bit); we don't cache that yet.
+        0
+    }
+    fn read(&self, lba: u64, n_blocks: u16, out: &mut [u8])
+        -> Result<(), narf_block::BlockIoError>
+    {
+        if (n_blocks as usize) * 512 > 4096 || out.len() < (n_blocks as usize) * 512 {
+            return Err(narf_block::BlockIoError::BufferTooSmall);
+        }
+        let g = CONTROLLER.lock();
+        let ahci = g.as_ref().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
+        let port = ahci.ports.iter()
+            .find(|p| p.kind == PortKind::Sata).map(|p| p.index).unwrap_or(0);
+        // SAFETY: caller-trusted single-thread access.
+        unsafe { ahci_read_lba(ahci, port, lba, n_blocks, out) }
+            .map_err(|_| narf_block::BlockIoError::DriverError)
+    }
+    fn write(&self, lba: u64, n_blocks: u16, data: &[u8])
+        -> Result<(), narf_block::BlockIoError>
+    {
+        if (n_blocks as usize) * 512 > 4096 || data.len() < (n_blocks as usize) * 512 {
+            return Err(narf_block::BlockIoError::BufferTooSmall);
+        }
+        let g = CONTROLLER.lock();
+        let ahci = g.as_ref().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
+        let port = ahci.ports.iter()
+            .find(|p| p.kind == PortKind::Sata).map(|p| p.index).unwrap_or(0);
+        // SAFETY: same.
+        unsafe { ahci_write_lba(ahci, port, lba, n_blocks, data) }
+            .map_err(|_| narf_block::BlockIoError::DriverError)
+    }
+}
+
 // ── Driver-match registration ────────────────────────────────────────
 
 static CONTROLLER: IrqSafeSpinLock<Option<Ahci>> =
@@ -670,6 +714,10 @@ pub fn probe(
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
     *CONTROLLER.lock() = Some(dev);
+    // Register against the unified block-device registry.
+    narf_block::register_block_device("sata0",
+        alloc::sync::Arc::new(AhciBlockSync)
+            as alloc::sync::Arc<dyn narf_block::BlockDeviceSync>);
     Ok(())
 }
 

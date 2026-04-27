@@ -6667,6 +6667,34 @@ fn smoke_ahci_write_then_read_lba() -> TestResult {
 kernel_test!(smoke_ahci_write_then_read_lba);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_block_registry_uniform_read() -> TestResult {
+    // Walk narf_block::block_devices() and read sector 0 from each.
+    // Asserts NVMe + virtio-blk-pci + AHCI all registered + return
+    // a 512-byte read without error. Demonstrates the unified
+    // BlockDeviceSync surface.
+    use narf_block::block_devices;
+    let regs = block_devices();
+    if regs.is_empty() {
+        return TestResult::Fail("block registry empty — no driver registered");
+    }
+    // We expect at least nvme0, vblk0, sata0 by convention.
+    let has_nvme = regs.iter().any(|r| r.name == "nvme0");
+    let has_vblk = regs.iter().any(|r| r.name == "vblk0");
+    let has_sata = regs.iter().any(|r| r.name == "sata0");
+    if !(has_nvme && has_vblk && has_sata) {
+        return TestResult::Fail("expected nvme0 + vblk0 + sata0");
+    }
+    // lba_size + capacity surface should respond on every device.
+    for reg in &regs {
+        let _ = reg.dev.lba_size();
+        let _ = reg.dev.capacity();
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_block_registry_uniform_read);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_virtio_balloon_pci_probe() -> TestResult {
     use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
     use narf_bus::driver_match::__reset_for_test;

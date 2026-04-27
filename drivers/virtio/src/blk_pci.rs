@@ -623,6 +623,44 @@ impl VirtioBlkPci {
 
 // ── Driver-match registration ────────────────────────────────────────
 
+/// Sync wrapper that lets the kernel's block registry address
+/// virtio-blk uniformly with NVMe + AHCI. Wraps the singleton
+/// CONTROLLER. Reads / writes go through the polled
+/// `read_sector` / `write_sector` paths.
+#[derive(Debug)]
+pub struct VirtioBlkBlockSync;
+
+impl narf_block::BlockDeviceSync for VirtioBlkBlockSync {
+    fn lba_size(&self) -> u32 { 512 }
+    fn capacity(&self) -> u64 { 0 } // Stage-4 stub — capacity from device cfg lands later.
+    fn read(&self, lba: u64, n_blocks: u16, out: &mut [u8])
+        -> Result<(), narf_block::BlockIoError>
+    {
+        if n_blocks != 1 { return Err(narf_block::BlockIoError::BufferTooSmall); }
+        if out.len() < 512 { return Err(narf_block::BlockIoError::BufferTooSmall); }
+        let g = CONTROLLER.lock();
+        let dev = g.as_ref().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
+        let mut tmp = [0u8; 512];
+        dev.read_sector(lba, &mut tmp)
+            .map_err(|_| narf_block::BlockIoError::DriverError)?;
+        out[..512].copy_from_slice(&tmp);
+        Ok(())
+    }
+    fn write(&self, lba: u64, n_blocks: u16, data: &[u8])
+        -> Result<(), narf_block::BlockIoError>
+    {
+        if n_blocks != 1 { return Err(narf_block::BlockIoError::BufferTooSmall); }
+        if data.len() < 512 { return Err(narf_block::BlockIoError::BufferTooSmall); }
+        let g = CONTROLLER.lock();
+        let dev = g.as_ref().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
+        let mut buf = [0u8; 512];
+        buf.copy_from_slice(&data[..512]);
+        dev.write_sector(lba, &buf)
+            .map_err(|_| narf_block::BlockIoError::DriverError)?;
+        Ok(())
+    }
+}
+
 static CONTROLLER: IrqSafeSpinLock<Option<VirtioBlkPci>> =
     IrqSafeSpinLock::new(None);
 
@@ -650,6 +688,10 @@ pub fn probe(
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
     *CONTROLLER.lock() = Some(dev);
+    // Register against the unified block-device registry.
+    narf_block::register_block_device("vblk0",
+        alloc::sync::Arc::new(VirtioBlkBlockSync)
+            as alloc::sync::Arc<dyn narf_block::BlockDeviceSync>);
     Ok(())
 }
 

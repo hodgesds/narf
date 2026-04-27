@@ -1029,6 +1029,83 @@ pub const PCI_CLASS_STORAGE: u8 = 0x01;
 static CONTROLLER: IrqSafeSpinLock<Option<Controller>> =
     IrqSafeSpinLock::new(None);
 
+// ── BlockDeviceSync adapter (registry/lib.rs) ─────────────────────────
+
+/// Sync wrapper that lets the kernel's block registry address NVMe
+/// uniformly with virtio-blk-pci + AHCI. Wraps the singleton
+/// CONTROLLER static; reads / writes go through the polled
+/// `read_lba` / `write_lba` paths today.
+#[derive(Debug)]
+pub struct NvmeBlockSync;
+
+impl narf_block::BlockDeviceSync for NvmeBlockSync {
+    fn lba_size(&self) -> u32 {
+        with_controller(|c| c.lba_bytes).unwrap_or(512)
+    }
+    fn capacity(&self) -> u64 {
+        with_controller(|c| c.nsze).unwrap_or(0)
+    }
+    fn read(&self, lba: u64, n_blocks: u16, out: &mut [u8])
+        -> Result<(), narf_block::BlockIoError>
+    {
+        let need = (n_blocks as usize) * 512;
+        if out.len() < need {
+            return Err(narf_block::BlockIoError::BufferTooSmall);
+        }
+        // Allocate a single 4 KiB DMA buffer for the transfer (NVMe
+        // controllers happily handle one PRP1).
+        let buf = match alloc_coherent(4096, DomainId::DRIVER_0) {
+            Ok(b) => b,
+            Err(_) => return Err(narf_block::BlockIoError::DriverError),
+        };
+        let phys = buf.phys_addr().raw();
+        // Capped at 8 sectors for the single-PRP path.
+        if need > 4096 {
+            return Err(narf_block::BlockIoError::BufferTooSmall);
+        }
+        let mut g = CONTROLLER.lock();
+        let ctrl = g.as_mut().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
+        ctrl.read_lba(lba, n_blocks, &buf)
+            .map_err(|_| narf_block::BlockIoError::DriverError)?;
+        // SAFETY: identity-mapped DMA buffer.
+        for i in 0..need {
+            out[i] = unsafe {
+                core::ptr::read_volatile((phys + i as u64) as *const u8)
+            };
+        }
+        let _ = buf;
+        Ok(())
+    }
+    fn write(&self, lba: u64, n_blocks: u16, data: &[u8])
+        -> Result<(), narf_block::BlockIoError>
+    {
+        let need = (n_blocks as usize) * 512;
+        if data.len() < need {
+            return Err(narf_block::BlockIoError::BufferTooSmall);
+        }
+        if need > 4096 {
+            return Err(narf_block::BlockIoError::BufferTooSmall);
+        }
+        let buf = match alloc_coherent(4096, DomainId::DRIVER_0) {
+            Ok(b) => b,
+            Err(_) => return Err(narf_block::BlockIoError::DriverError),
+        };
+        let phys = buf.phys_addr().raw();
+        // SAFETY: identity-mapped DMA.
+        unsafe {
+            for i in 0..need {
+                core::ptr::write_volatile((phys + i as u64) as *mut u8, data[i]);
+            }
+        }
+        let mut g = CONTROLLER.lock();
+        let ctrl = g.as_mut().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
+        ctrl.write_lba(lba, n_blocks, &buf)
+            .map_err(|_| narf_block::BlockIoError::DriverError)?;
+        let _ = buf;
+        Ok(())
+    }
+}
+
 /// Probe entry point dispatched by `bus::probe_all_pci`. Brings the
 /// NVMe controller online (admin queue + IDENTIFY + I/O queue) and
 /// stashes it in `CONTROLLER`. Returns `BadDevice` on bring-up
@@ -1064,6 +1141,10 @@ pub fn probe(
     // Install the typed parameter surface so observers + tuners can
     // reach the driver via `Cap<DriverHandle, Write>`.
     PARAMS.install(NvmeParams { log_level: LogLevel::Info });
+    // Register against the unified block-device registry so the
+    // kernel can address NVMe uniformly with other storage drivers.
+    narf_block::register_block_device("nvme0",
+        alloc::sync::Arc::new(NvmeBlockSync) as alloc::sync::Arc<dyn narf_block::BlockDeviceSync>);
     Ok(())
 }
 
