@@ -21,6 +21,10 @@ narf-time          = { path = "../time" }
 narf-scheduler     = { path = "../scheduler" }
 narf-interrupts    = { path = "../interrupts" }
 narf-bus           = { path = "../bus" }
+narf-drivers-nvme    = { path = "../drivers/nvme" }
+narf-drivers-virtio  = { path = "../drivers/virtio" }
+narf-drivers-net     = { path = "../drivers/net" }
+narf-drivers-storage = { path = "../drivers/storage" }
 narf-userspace     = { path = "../userspace" }
 narf-verification  = { path = "../verification", optional = true }
 

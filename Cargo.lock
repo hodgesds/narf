@@ -470,8 +470,10 @@ version = "0.0.0"
 dependencies = [
  "narf-bus",
  "narf-capabilities",
+ "narf-interrupts",
  "narf-io",
  "narf-lib",
+ "narf-memory",
  "narf-net",
 ]
 
@@ -489,6 +491,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-drivers-storage"
+version = "0.0.0"
+dependencies = [
+ "narf-bus",
+ "narf-capabilities",
+ "narf-io",
+ "narf-lib",
+ "narf-memory",
+ "narf-time",
+]
+
+[[package]]
 name = "narf-drivers-virtio"
 version = "0.0.0"
 dependencies = [
@@ -496,6 +510,7 @@ dependencies = [
  "narf-bus",
  "narf-capabilities",
  "narf-drivers",
+ "narf-interrupts",
  "narf-io",
  "narf-ipc",
  "narf-lib",
@@ -522,6 +537,10 @@ dependencies = [
  "narf-boot",
  "narf-bus",
  "narf-console",
+ "narf-drivers-net",
+ "narf-drivers-nvme",
+ "narf-drivers-storage",
+ "narf-drivers-virtio",
  "narf-interrupts",
  "narf-lib",
  "narf-memory",
@@ -676,6 +695,7 @@ dependencies = [
  "narf-drivers-gpu",
  "narf-drivers-net",
  "narf-drivers-nvme",
+ "narf-drivers-storage",
  "narf-drivers-virtio",
  "narf-filesystem",
  "narf-interrupts",

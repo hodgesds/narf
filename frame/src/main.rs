@@ -341,6 +341,33 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     }
                 }
             }
+
+            // ── PCIe driver registration + dispatch ───────────────
+            // Register every in-tree PCIe driver with the bus
+            // match table, then walk the registry binding each
+            // discovered device to its driver. Keeps boot-time
+            // driver dispatch in one place (kernel-test harness
+            // re-runs this per smoke; the boot path establishes
+            // the canonical set of drivers).
+            narf_drivers_nvme::register_pci_driver();
+            narf_drivers_virtio::blk_pci::register_pci_driver();
+            narf_drivers_virtio::net_pci::register_pci_driver();
+            narf_drivers_virtio::rng_pci::register_pci_driver();
+            narf_drivers_virtio::balloon_pci::register_pci_driver();
+            narf_drivers_net::e1000::register_pci_driver();
+            narf_drivers_storage::ahci::register_pci_driver();
+
+            let auth = narf_bus::bootstrap_registry_authority();
+            match narf_bus::probe_all_pci(&auth) {
+                Ok(n) => {
+                    let _ = writeln!(console::Writer,
+                        "  drivers: bound {} PCIe device(s)", n);
+                }
+                Err(_) => {
+                    let _ = writeln!(console::Writer,
+                        "  drivers: probe_all_pci failed");
+                }
+            }
         }
         Err(e) => {
             let _ = writeln!(console::Writer, "  boot parse failed: {e:?}");
