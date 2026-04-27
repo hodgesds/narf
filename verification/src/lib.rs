@@ -7142,6 +7142,188 @@ fn smoke_userspace_open_routes_through_vfs() -> TestResult {
 }
 kernel_test!(smoke_userspace_open_routes_through_vfs);
 
+fn smoke_userspace_symlink_create_and_readlink_round_trip() -> TestResult {
+    // Mount a fresh MemFs at /sl-test seeded with one regular file
+    // `target` containing b"hello". Issue SYS_SYMLINK to create
+    // /sl-test/sl pointing at "/sl-test/target", then SYS_READLINK
+    // to read it back. Asserts the round-trip preserves the target
+    // bytes exactly.
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_capabilities::{Cap, Grant};
+    use narf_filesystem::{
+        bootstrap_mount_authority, registry, MemFs, MountPoint,
+    };
+    use narf_userspace::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+
+    __test_clear_global();
+    fd::__test_reset();
+    fd::init();
+
+    let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+    let fs = MemFs::with_seeds("sl-test", &[("target", b"hello")]);
+    let mount_handle = match registry().mount(&auth, "/sl-test", fs) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("memfs mount failed"),
+    };
+
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(99);
+    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    install_task_id_lookup(task_lookup);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    // ── SYS_SYMLINK: target=/sl-test/target, link=/sl-test/sl ────
+    let target = b"/sl-test/target";
+    let link   = b"/sl-test/sl";
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: target.as_ptr() as u64, arg1: target.len() as u64,
+            arg2: link.as_ptr()   as u64, arg3: link.len()   as u64,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Symlink.raw(), &mut ctx);
+    match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value == 0 => {}
+        _ => {
+            let _ = registry().unmount(&mount_handle, "/sl-test");
+            __test_clear_global();
+            fd::__test_reset();
+            return TestResult::Fail("Symlink did not return Ok(0)");
+        }
+    }
+
+    // ── SYS_READLINK: read /sl-test/sl into a 32-byte buf. ────────
+    let mut buf = [0u8; 32];
+    let path = b"/sl-test/sl";
+    let mut rctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: path.as_ptr()        as u64, arg1: path.len() as u64,
+            arg2: buf.as_mut_ptr()     as u64, arg3: buf.len()  as u64,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Readlink.raw(), &mut rctx);
+    let n = match rctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value as usize,
+        _ => {
+            let _ = registry().unmount(&mount_handle, "/sl-test");
+            __test_clear_global();
+            fd::__test_reset();
+            return TestResult::Fail("Readlink returned non-Ok");
+        }
+    };
+    if n != target.len() {
+        let _ = registry().unmount(&mount_handle, "/sl-test");
+        __test_clear_global();
+        fd::__test_reset();
+        return TestResult::Fail("Readlink returned wrong byte count");
+    }
+    if &buf[..n] != target {
+        let _ = registry().unmount(&mount_handle, "/sl-test");
+        __test_clear_global();
+        fd::__test_reset();
+        return TestResult::Fail("Readlink target bytes mismatched");
+    }
+
+    // Cleanup so the registry doesn't accumulate mounts across tests.
+    let _ = registry().unmount(&mount_handle, "/sl-test");
+    fd::__test_reset();
+    __test_clear_global();
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_symlink_create_and_readlink_round_trip);
+
+fn smoke_userspace_readlink_on_non_symlink_fails() -> TestResult {
+    // Mount a fresh MemFs at /sl-fail with a regular file `regular`.
+    // SYS_READLINK against it must return the -1 wire sentinel
+    // because `regular` isn't FileType::Symlink — POSIX EINVAL.
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_capabilities::{Cap, Grant};
+    use narf_filesystem::{
+        bootstrap_mount_authority, registry, MemFs, MountPoint,
+    };
+    use narf_userspace::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+
+    __test_clear_global();
+    fd::__test_reset();
+    fd::init();
+
+    let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+    let fs = MemFs::with_seeds("sl-fail", &[("regular", b"x")]);
+    let mount_handle = match registry().mount(&auth, "/sl-fail", fs) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("memfs mount failed"),
+    };
+
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(99);
+    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    install_task_id_lookup(task_lookup);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    let path = b"/sl-fail/regular";
+    let mut buf = [0u8; 32];
+    let mut rctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: path.as_ptr()    as u64, arg1: path.len() as u64,
+            arg2: buf.as_mut_ptr() as u64, arg3: buf.len()  as u64,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Readlink.raw(), &mut rctx);
+    let v = match rctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value,
+        _ => {
+            let _ = registry().unmount(&mount_handle, "/sl-fail");
+            __test_clear_global();
+            fd::__test_reset();
+            return TestResult::Fail("Readlink returned non-Ok status");
+        }
+    };
+    if v != ((-1i64) as u64) {
+        let _ = registry().unmount(&mount_handle, "/sl-fail");
+        __test_clear_global();
+        fd::__test_reset();
+        return TestResult::Fail("Readlink on non-symlink should return -1");
+    }
+
+    let _ = registry().unmount(&mount_handle, "/sl-fail");
+    fd::__test_reset();
+    __test_clear_global();
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_readlink_on_non_symlink_fails);
+
 fn smoke_userspace_read_write_routes_through_fd_table() -> TestResult {
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicU64, Ordering};
