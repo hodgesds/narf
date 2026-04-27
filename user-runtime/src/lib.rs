@@ -71,6 +71,7 @@ pub const SYS_GETHOSTNAME:    u64 = 146;
 pub const SYS_SETHOSTNAME:    u64 = 147;
 pub const SYS_GETRLIMIT:      u64 = 148;
 pub const SYS_SETRLIMIT:      u64 = 149;
+pub const SYS_UMASK:          u64 = 155;
 pub const SYS_GETPRIORITY:    u64 = 156;
 pub const SYS_SETPRIORITY:    u64 = 157;
 pub const SYS_TIMES:          u64 = 158;
@@ -493,6 +494,14 @@ pub fn getrusage(who: i32, buf: &mut [i64; 18]) -> i32 {
         syscall2(SYS_GETRUSAGE, who as u64, buf.as_mut_ptr() as u64)
     };
     if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `umask(new_mask)` — set the file-creation mask and return the
+/// previous value. Only the low 9 bits are honoured.
+#[inline]
+pub fn umask(new_mask: u32) -> u32 {
+    // SAFETY: SYS_UMASK signature: (new_mask).
+    unsafe { syscall1(SYS_UMASK, new_mask as u64) as u32 }
 }
 
 /// `getpriority(which, who)` — read the calling task's nice value.

@@ -1772,6 +1772,45 @@ fn sys_setrlimit(ctx: &mut dyn TrapContext) {
     }
 }
 
+// ── Per-task umask ──────────────────────────────────────────────────
+//
+// POSIX umask(2) sets the file-creation mask: bits set in the
+// mask are *cleared* in the mode passed to open(O_CREAT) /
+// mkdir / etc. NARF doesn't enforce mode bits today, so the
+// mask is structural state only. The round-trip is what
+// consumers care about — `umask(0o077)` followed by `umask(0o022)`
+// expects the second call to return the prior 0o077.
+
+static UMASK_TABLE:
+    narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>>
+    = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+pub fn umask_init() {
+    *UMASK_TABLE.lock() = Some(BTreeMap::new());
+}
+
+#[doc(hidden)]
+pub fn __test_umask_reset() { *UMASK_TABLE.lock() = None; }
+
+const UMASK_DEFAULT: u32 = 0o022;
+
+fn sys_umask(ctx: &mut dyn TrapContext) {
+    let new_mask = (ctx.args().arg0 as u32) & 0o777;
+    let task = current_task_id();
+    let mut g = UMASK_TABLE.lock();
+    let m = match g.as_mut() {
+        Some(m) => m,
+        None    => {
+            // Treat lack of init as default-mask — return that
+            // and accept the new mask going forward.
+            ctx.set_return(SyscallReturn::ok(UMASK_DEFAULT as u64));
+            return;
+        }
+    };
+    let prior = m.insert(task, new_mask).unwrap_or(UMASK_DEFAULT);
+    ctx.set_return(SyscallReturn::ok(prior as u64));
+}
+
 // ── Per-task nice / priority table ─────────────────────────────────
 //
 // POSIX getpriority / setpriority manage a task's nice value
@@ -2800,6 +2839,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::SetHostname, "sethostname", RawFnHandler(sys_sethostname));
     table.install_raw(Syscall::Getrlimit,   "getrlimit",   RawFnHandler(sys_getrlimit));
     table.install_raw(Syscall::Setrlimit,   "setrlimit",   RawFnHandler(sys_setrlimit));
+    table.install_raw(Syscall::Umask,       "umask",       RawFnHandler(sys_umask));
     table.install_raw(Syscall::Getpriority, "getpriority", RawFnHandler(sys_getpriority));
     table.install_raw(Syscall::Setpriority, "setpriority", RawFnHandler(sys_setpriority));
     table.install_raw(Syscall::Times,       "times",       RawFnHandler(sys_times));

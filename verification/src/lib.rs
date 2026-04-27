@@ -12622,3 +12622,55 @@ fn smoke_userspace_getrusage_writes_18_i64s() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_userspace_getrusage_writes_18_i64s);
+
+fn smoke_userspace_umask_round_trip() -> TestResult {
+    use narf_userspace::{install_core_syscalls, install_global,
+                         kernel_syscall_entry, syscall::__test_clear_global,
+                         umask_init,
+                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+                         TrapContext};
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+    narf_userspace::handlers::__test_umask_reset();
+    umask_init();
+
+    fn call(arg0: u64) -> u64 {
+        let mut ctx = FakeCtx {
+            args: SyscallArgs { arg0, ..SyscallArgs::default() },
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::Umask.raw(), &mut ctx);
+        ctx.ret.map(|r| r.value).unwrap_or(!0)
+    }
+
+    // First umask call: returns the default 0o022, sets new = 0o077.
+    let first = call(0o077);
+    if first != 0o022 {
+        return TestResult::Fail("first umask did not return default 0o022");
+    }
+    // Second call: returns the just-set 0o077, sets new = 0o002.
+    let second = call(0o002);
+    if second != 0o077 {
+        return TestResult::Fail("umask did not stick");
+    }
+    // High bits dropped: 0o7777 → low 9 bits = 0o777.
+    let _ = call(0o7777);
+    let after = call(0o022);
+    if after != 0o777 {
+        return TestResult::Fail("umask did not mask to low 9 bits");
+    }
+
+    narf_userspace::handlers::__test_umask_reset();
+    __test_clear_global();
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_umask_round_trip);

@@ -281,6 +281,15 @@ pub enum Syscall {
     /// zero. Returns 0 on success, -1 on bad pointer.
     Getrusage    = 159,
 
+    /// `arg0 = new_mask` (only the low 9 bits — POSIX 0o777). Sets
+    /// the calling task's file-creation mask and returns the
+    /// previous value. Stage-4 simplification: NARF doesn't yet
+    /// enforce mode bits at file creation, so the mask is
+    /// structural state — but the round-trip lets `umask(0o077)`
+    /// followed by `umask(0o022)` see the prior value, which is
+    /// what consumer init code expects.
+    Umask        = 155,
+
     /// Set or query the per-task heap break.
     /// `arg0 = 0` → return current break; `arg0 != 0` → resize.
     /// POSIX `brk(2)` semantics: failure returns the unchanged break.
@@ -484,6 +493,7 @@ impl Syscall {
             147 => Syscall::SetHostname,
             148 => Syscall::Getrlimit,
             149 => Syscall::Setrlimit,
+            155 => Syscall::Umask,
             156 => Syscall::Getpriority,
             157 => Syscall::Setpriority,
             158 => Syscall::Times,

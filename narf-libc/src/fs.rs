@@ -120,15 +120,14 @@ pub unsafe extern "C" fn S_ISLNK(mode: u32) -> i32 {
     ((mode & S_IFMT) == S_IFLNK) as i32
 }
 
-// ── chmod / umask (stubs) ───────────────────────────────────────────
+// ── chmod / umask ────────────────────────────────────────────────
 //
 // NARF's kernel surface exposes no per-file permission bits — every
-// file is universally read/write. The C-shaped chmod / umask are
-// retained for ABI compatibility (real programs `chmod()` their
-// state files, even when the underlying FS ignores mode), so we
-// accept any input and report success / a stable previous mask.
-
-static mut UMASK_CACHE: u32 = 0o022;
+// file is universally read/write. The C-shaped chmod is retained
+// for ABI compatibility (real programs `chmod()` their state files
+// even when the underlying FS ignores mode); umask is now per-task
+// kernel state so the round-trip is consistent across syscall
+// boundaries.
 
 /// `chmod(path, mode)` — accepted and ignored. Returns 0 if the path
 /// is reachable (so a consumer that error-checks chmod still sees
@@ -142,15 +141,10 @@ pub unsafe extern "C" fn chmod(path: *const i8, _mode: u32) -> i32 {
     unsafe { crate::posix::access(path, 0) }
 }
 
-/// `umask(mask)` — record `mask` and return the previous value.
-/// The mask isn't actually consulted anywhere on NARF today; this
-/// just preserves the round-trip POSIX semantics.
+/// `umask(mask)` — set the file-creation mask, returning the
+/// previous value. NARF tracks the mask kernel-side per task; the
+/// mask isn't consulted at file creation today.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn umask(mask: u32) -> u32 {
-    // SAFETY: single-threaded user-mode invariant.
-    unsafe {
-        let prev = UMASK_CACHE;
-        UMASK_CACHE = mask & 0o777;
-        prev
-    }
+    narf_user_runtime::umask(mask)
 }
