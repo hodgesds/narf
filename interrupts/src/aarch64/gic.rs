@@ -15,6 +15,15 @@ use narf_arch::aarch64::sysreg;
 const GICD_BASE: usize = 0x0800_0000;
 /// QEMU virt GICv3 CPU-0 redistributor MMIO base.
 const GICR_BASE: usize = 0x080A_0000;
+/// Per-CPU redistributor stride. GICv3 lays each CPU's RD frame
+/// 128 KiB apart on QEMU virt.
+const GICR_STRIDE: usize = 0x2_0000;
+
+/// Compute the GICR base for a given logical CPU index.
+#[inline]
+pub fn gicr_base(cpu_index: u32) -> usize {
+    GICR_BASE + (cpu_index as usize) * GICR_STRIDE
+}
 
 // Distributor register offsets (SDM of GICv3: IHI0069H).
 const GICD_CTLR:     usize = 0x0000;
@@ -35,34 +44,55 @@ const GICR_IPRIORITYR0_OFF:  usize = GICR_SGI_OFF + 0x0400;
 ///   (CPUID: `Features::probe().gicv3_sysreg`).
 /// - Interrupts must be disabled in DAIF at call time.
 pub unsafe fn init_bsp() {
-    // ─── CPU interface (system registers) ───────────────────────
-    // Enable system-register access (ICC_SRE_EL1.SRE = 1, DIB = DFB = 0
-    // for now — we don't use FIQ-binary bypass).
-    // SAFETY: GICv3 presence verified by caller.
-    unsafe { sysreg::write_icc_sre_el1(1); }
+    // SAFETY: BSP-only init does both the CPU-shared distributor
+    // and CPU 0's redistributor + cpu interface.
+    unsafe {
+        init_distributor();
+        init_per_cpu(0);
+    }
+}
 
-    // Allow all priorities to pass.
-    // SAFETY: SRE set above.
-    unsafe { sysreg::write_icc_pmr_el1(0xFF); }
+/// Per-CPU GICv3 init for an AP. Wakes its redistributor + sets up
+/// the EL1 CPU interface + enables the timer PPI.
+///
+/// # Safety
+/// - Must run on the CPU whose `cpu_index` is passed (this is the
+///   only place where IRQ delivery for that CPU gets enabled).
+/// - GICv3 system-register interface must be available.
+/// - Interrupts must be disabled in DAIF at call time.
+pub unsafe fn init_ap(cpu_index: u32) {
+    // SAFETY: caller-asserted per-CPU invariant.
+    unsafe { init_per_cpu(cpu_index); }
+}
 
-    // Enable Group 1 (non-secure) IRQs.
-    // SAFETY: SRE set above.
-    unsafe { sysreg::write_icc_igrpen1_el1(1); }
-
-    // ─── Distributor ────────────────────────────────────────────
-    // GICD_CTLR: enable Group 1 NS (bit 1). ARE_NS (bit 4) should be
-    // set on GICv3 for affinity routing. Bits 5+ reserved.
-    // SAFETY: MMIO to GIC distributor, identity-mapped in our PML4.
+/// Distributor-side init (CPU-shared). Only the BSP runs this.
+unsafe fn init_distributor() {
+    // GICD_CTLR: enable Group 1 NS (bit 1). ARE_NS (bit 4) for
+    // affinity routing.
+    // SAFETY: identity-mapped MMIO.
     unsafe {
         write_u32((GICD_BASE + GICD_CTLR) as *mut u32, (1 << 4) | (1 << 1));
     }
+}
 
-    // ─── Redistributor (CPU 0) ─────────────────────────────────
+/// CPU-private init: cpu interface (system registers) + the named
+/// CPU's redistributor + timer PPI.
+unsafe fn init_per_cpu(cpu_index: u32) {
+    // ─── CPU interface (system registers) ───────────────────────
+    // SAFETY: GICv3 presence verified by caller.
+    unsafe { sysreg::write_icc_sre_el1(1); }
+    // SAFETY: SRE set above.
+    unsafe { sysreg::write_icc_pmr_el1(0xFF); }
+    // SAFETY: SRE set above.
+    unsafe { sysreg::write_icc_igrpen1_el1(1); }
+
+    // ─── Redistributor ────────────────────────────────────────
+    let gicr = gicr_base(cpu_index);
     // Clear ProcessorSleep (bit 1 of GICR_WAKER). Then poll
     // ChildrenAsleep (bit 2) until 0.
-    // SAFETY: MMIO to GIC redistributor.
+    // SAFETY: identity-mapped MMIO; gicr is per-CPU stride.
     unsafe {
-        let waker = (GICR_BASE + GICR_WAKER) as *mut u32;
+        let waker = (gicr + GICR_WAKER) as *mut u32;
         let cur = read_u32(waker);
         write_u32(waker, cur & !(1 << 1));
         while read_u32(waker) & (1 << 2) != 0 {
@@ -70,30 +100,23 @@ pub unsafe fn init_bsp() {
         }
     }
 
-    // Put SGIs + PPIs in Group 1 NS (all bits set).
-    // SAFETY: MMIO; single 32-bit register covers INTID 0..=31.
+    // Put SGIs + PPIs in Group 1 NS.
+    // SAFETY: same MMIO window.
     unsafe {
-        write_u32(
-            (GICR_BASE + GICR_IGROUPR0_OFF) as *mut u32,
-            0xFFFF_FFFF,
-        );
+        write_u32((gicr + GICR_IGROUPR0_OFF) as *mut u32, 0xFFFF_FFFF);
     }
 
     // Set priority for the timer PPI (INTID 30) — byte-addressable.
-    // Priority 0xA0 (below the 0xFF mask). Kernel convention: timer is
-    // lower priority than "urgent" kernel work.
-    // SAFETY: MMIO; byte store at INTID-indexed offset.
+    // SAFETY: same.
     unsafe {
-        let prio = (GICR_BASE + GICR_IPRIORITYR0_OFF + 30) as *mut u8;
+        let prio = (gicr + GICR_IPRIORITYR0_OFF + 30) as *mut u8;
         core::ptr::write_volatile(prio, 0xA0);
     }
 
     // Enable the timer PPI.
-    // SAFETY: MMIO; bit 30 of GICR_ISENABLER0.
+    // SAFETY: bit 30 of GICR_ISENABLER0.
     unsafe {
-        write_u32(
-            (GICR_BASE + GICR_ISENABLER0_OFF) as *mut u32,
-            1 << super::TIMER_PPI,
-        );
+        write_u32((gicr + GICR_ISENABLER0_OFF) as *mut u32,
+                  1 << super::TIMER_PPI);
     }
 }

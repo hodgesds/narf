@@ -4,7 +4,12 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use narf_arch::aarch64::sysreg;
 
-/// Monotonic counter incremented on each timer-PPI delivery.
+/// Per-CPU monotonic counter incremented on each timer-PPI
+/// delivery. Indexed by `narf_lib::percpu::current_cpu()`.
+static TIMER_TICKS_PER_CPU: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
+
+/// Backwards-compat: aggregate across all CPUs (was `TIMER_TICKS`).
 static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 
 /// Start the physical timer with a countdown of `tval_ticks` counter
@@ -47,10 +52,18 @@ pub unsafe fn stop_timer() {
 /// Called from the generic-timer IRQ handler.
 #[inline]
 pub fn on_timer_tick() {
+    let cpu = narf_lib::percpu::current_cpu();
+    TIMER_TICKS_PER_CPU[cpu].fetch_add(1, Ordering::Relaxed);
     TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Snapshot of tick count since boot.
+/// Aggregate snapshot of tick count across all CPUs since boot.
 pub fn timer_ticks() -> u64 {
     TIMER_TICKS.load(Ordering::Relaxed)
+}
+
+/// Per-CPU tick count snapshot.
+pub fn timer_ticks_for(cpu_index: u32) -> u64 {
+    let i = (cpu_index as usize).min(narf_lib::percpu::MAX_CPUS - 1);
+    TIMER_TICKS_PER_CPU[i].load(Ordering::Relaxed)
 }

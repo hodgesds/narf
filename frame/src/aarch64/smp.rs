@@ -188,20 +188,50 @@ pub unsafe fn start_aps() -> u32 {
 /// + ATA enabled.
 #[unsafe(no_mangle)]
 pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
-    // Register MPIDR mapping so current_cpu() returns logical_id
-    // for this CPU.
+    // 1. Register MPIDR mapping so current_cpu() returns logical_id
+    //    for this CPU.
     let aff = narf_arch::aarch64::cpu::mpidr_aff();
     // SAFETY: per-CPU registration, called exactly once on this
     // CPU during bring-up.
     unsafe { narf_arch::aarch64::cpu::set_current_cpu(aff, logical_id as u32); }
-    // Mark online.
-    // SAFETY: same.
+
+    // 2. Install the EL1 vector table — APs share the BSP's table
+    //    in .text but each CPU writes its own VBAR_EL1 to point at
+    //    it.
+    extern "C" {
+        static __narf_vector_table: u8;
+    }
+    let vbar = core::ptr::addr_of!(__narf_vector_table) as u64;
+    // SAFETY: vector-table base is the linker-provided symbol, valid
+    // for every CPU's EL1 view.
+    unsafe { narf_arch::aarch64::sysreg::write_vbar_el1(vbar); }
+
+    // 3. Per-CPU GICv3 init: cpu interface + redistributor wake +
+    //    timer-PPI enable.
+    // SAFETY: distributor was already brought up by the BSP; this
+    // CPU only touches its own redistributor + sysregs.
+    unsafe { narf_interrupts::aarch64::gic::init_ap(logical_id as u32); }
+
+    // 4. Mark online — the BSP's start_aps() spins on this.
+    // SAFETY: per-CPU bookkeeping.
     unsafe { narf_lib::smp::mark_online(logical_id as u32); }
 
-    // Park the AP. Real per-AP init (GIC redistributor, scheduler
-    // run loop) is the next layer.
+    // 5. Start this CPU's generic timer + unmask DAIF for IRQ
+    //    delivery. With the timer firing the AP-side trap path
+    //    drives the per-CPU tick counter.
+    // SAFETY: GIC + vector table installed.
+    unsafe {
+        narf_interrupts::aarch64::timer::start_timer(
+            crate::aarch64::trap::TIMER_TVAL_DEFAULT);
+        narf_arch::enable_interrupts();
+    }
+
+    // 6. Park in WFI. Each timer IRQ wakes the AP for ack + tick
+    //    increment, then back to sleep. Real per-CPU scheduler
+    //    run-loop lands when the run queues become per-CPU.
     loop {
-        // SAFETY: WFI is always defined at EL1.
+        // SAFETY: WFI at EL1 wakes on IRQ regardless of DAIF mask
+        // state; we're unmasked so timer IRQs deliver.
         unsafe { asm!("wfi", options(nostack, preserves_flags)); }
     }
 }

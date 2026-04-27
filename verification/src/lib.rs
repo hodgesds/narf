@@ -7124,6 +7124,35 @@ fn smoke_smp_aarch64_ap_online() -> TestResult {
 kernel_test!(smoke_smp_aarch64_ap_online);
 
 #[cfg(target_arch = "aarch64")]
+fn smoke_smp_aarch64_ap_timer_ticks() -> TestResult {
+    // After AP bring-up, the AP enables its timer + unmasks DAIF.
+    // Sample the AP's per-CPU tick counter twice with a busy wait
+    // between; the second read must be strictly greater than the
+    // first.
+    use narf_interrupts::aarch64::timer;
+    use narf_lib::smp;
+    if !smp::is_online(1) {
+        return TestResult::Skip("AP CPU 1 not online");
+    }
+    let before = timer::timer_ticks_for(1);
+    // Busy-wait a measurable interval. CNTPCT_EL0 advances at
+    // 62.5 MHz on QEMU virt; ~50M cycles ≈ 800 ms. Plenty of room
+    // for several timer-PPI deliveries with TIMER_TVAL_DEFAULT
+    // (~80 ms).
+    let start = narf_time::Instant::now();
+    while narf_time::Instant::now().cycles_since(start) < 50_000_000 {
+        core::hint::spin_loop();
+    }
+    let after = timer::timer_ticks_for(1);
+    if after <= before {
+        return TestResult::Fail("AP timer never fired during wait");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test!(smoke_smp_aarch64_ap_timer_ticks);
+
+#[cfg(target_arch = "aarch64")]
 fn smoke_smp_aarch64_dtb_count() -> TestResult {
     // QEMU virt -smp 1 (default) reports 1 CPU. The number bumps
     // when xtask switches to `-smp N`.
