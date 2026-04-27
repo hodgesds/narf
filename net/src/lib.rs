@@ -44,6 +44,7 @@
 
 extern crate alloc;
 
+pub mod pkt;
 pub mod stack;
 pub use stack::{AdminCap, AttachError, StackAttach, StackAttachReply, StackDaemon};
 
