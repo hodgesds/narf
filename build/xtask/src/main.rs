@@ -113,6 +113,18 @@ impl Arch {
                     "-drive".into(),
                     format!("if=none,id=nvm0,format=raw,file={img}"),
                     "-device".into(),  "nvme,drive=nvm0,serial=narf".into(),
+                    // virtio-blk-pci over a separate backing image
+                    // (QEMU refuses to share write locks across two
+                    // -drive entries). Modern transport (vendor
+                    // 0x1AF4, device 0x1041) is the default in
+                    // modern QEMU; the Stage-4 virtio-blk-pci driver
+                    // registers a probe for that ID via
+                    // narf_drivers_virtio::blk_pci::register_pci_driver().
+                    "-drive".into(),
+                    format!("if=none,id=vblk0,format=raw,file={}",
+                            virtio_blk_image_path().display()),
+                    "-device".into(),
+                    "virtio-blk-pci,drive=vblk0,disable-legacy=on,disable-modern=off".into(),
                     "-kernel".into(),  kernel,
                 ]
             },
@@ -146,6 +158,13 @@ impl Arch {
                 format!("if=none,id=nvm0,format=raw,file={}",
                         nvme_image_path().display()),
                 "-device".into(),   "nvme,drive=nvm0,serial=narf".into(),
+                // virtio-blk-pci over a dedicated backing image (one
+                // -drive per file lets QEMU acquire its write lock).
+                "-drive".into(),
+                format!("if=none,id=vblk0,format=raw,file={}",
+                        virtio_blk_image_path().display()),
+                "-device".into(),
+                "virtio-blk-pci,drive=vblk0,disable-legacy=on,disable-modern=off".into(),
                 // QEMU's `-kernel <elf>` path on aarch64 does not
                 // load a `-dtb` blob into RAM (the DTB-loading code
                 // path is gated on `is_linux=1`). Instead we
@@ -200,7 +219,32 @@ fn qemu_virt_dtb_path() -> PathBuf {
                 "if=none,id=nvm0,format=raw,file={}",
                 nvme_image_path().display()))
             .arg("-device").arg("nvme,drive=nvm0,serial=narf")
+            .arg("-drive").arg(format!(
+                "if=none,id=vblk0,format=raw,file={}",
+                virtio_blk_image_path().display()))
+            .arg("-device").arg("virtio-blk-pci,drive=vblk0")
             .status();
+    }
+    path
+}
+
+/// Backing image for the QEMU virtio-blk-pci device. Same shape as
+/// the NVMe image but separate so QEMU's write lock doesn't trip.
+fn virtio_blk_image_path() -> PathBuf {
+    let root = workspace_root().unwrap_or_else(|_| PathBuf::from("."));
+    let path = root.join("target").join("narf-vblk.img");
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // 1 MiB image — same as the NVMe one. Pre-fill the first
+        // 512 bytes with a recognisable pattern so the
+        // virtio-blk-pci read smoke can verify the round trip.
+        let mut buf = vec![0u8; 1024 * 1024];
+        for i in 0..512usize {
+            buf[i] = (i as u8).wrapping_mul(0x97);
+        }
+        let _ = std::fs::write(&path, &buf);
     }
     path
 }

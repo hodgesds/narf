@@ -410,6 +410,7 @@ dependencies = [
  "narf-interrupts",
  "narf-lib",
  "narf-memory",
+ "narf-time",
 ]
 
 [[package]]
@@ -481,6 +482,7 @@ dependencies = [
  "narf-block",
  "narf-bus",
  "narf-capabilities",
+ "narf-drivers",
  "narf-interrupts",
  "narf-io",
  "narf-lib",

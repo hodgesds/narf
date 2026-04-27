@@ -6088,6 +6088,57 @@ fn smoke_pci_cap_ext_walker() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_pci_cap_ext_walker);
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_virtio_blk_pci_read_sector() -> TestResult {
+    // End-to-end virtio-blk-pci modern transport smoke: register
+    // the driver via the bus match table, run probe_all_pci, then
+    // read sector 0 and verify the pattern xtask wrote into the
+    // backing image (`(i * 0x97) & 0xFF`).
+    use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_drivers_virtio::blk_pci;
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+
+    let devs = devices();
+    let has_vblk = devs.iter().any(|d|
+        matches!(&d.kind, BusKind::Pcie { .. })
+        && d.id.vendor == blk_pci::VIRTIO_BLK_PCI_VENDOR
+        && d.id.device == blk_pci::VIRTIO_BLK_PCI_DEVICE);
+    if !has_vblk {
+        return TestResult::Skip("no virtio-blk-pci device");
+    }
+
+    __reset_for_test();
+    blk_pci::register_pci_driver();
+    let authority = bootstrap_registry_authority();
+    if probe_all_pci(&authority).is_err() {
+        return TestResult::Fail("probe_all_pci failed");
+    }
+    if !blk_pci::is_probed() {
+        return TestResult::Fail("virtio-blk-pci not probed");
+    }
+
+    let mut sector = [0u8; 512];
+    let read_ok = blk_pci::with_controller(|c| c.read_sector(0, &mut sector))
+        .map(|r| r.is_ok())
+        .unwrap_or(false);
+    if !read_ok {
+        return TestResult::Fail("read_sector(0) failed");
+    }
+    // xtask wrote `(i * 0x97) & 0xFF` into the first 512 bytes of
+    // the backing image. Verify the round trip.
+    for i in 0..512usize {
+        let expected = (i as u8).wrapping_mul(0x97);
+        if sector[i] != expected {
+            return TestResult::Fail("virtio-blk-pci read pattern mismatch");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_virtio_blk_pci_read_sector);
+
 fn smoke_drivers_net_nic_model_ids() -> TestResult {
     use narf_drivers_net::{NicCaps, NicModel};
 

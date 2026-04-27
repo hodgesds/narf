@@ -535,6 +535,20 @@ The critical-path Stage-2 items remaining:
    smoke_pci_express_cap_link_status, smoke_msix_program_block,
    smoke_pci_cap_ext_walker, smoke_vector_alloc_block_contiguous.
 
+   First in-tree PCIe driver shipped: **virtio-blk-pci** (modern
+   transport, vendor 0x1AF4, device 0x1042). `drivers/virtio/src/pci.rs`
+   walks the four vendor-specific caps (Common Cfg, Notify, ISR,
+   Device Cfg), maps each region via `bus::map_bar`, exposes
+   register access compatible with the existing virtqueue plumbing.
+   `drivers/virtio/src/blk_pci.rs` does feature negotiation
+   (VIRTIO_F_VERSION_1), queue-0 setup, and a polled
+   `read_sector(lba, &mut [u8; 512])`. xtask attaches the device
+   on both arches via `-device virtio-blk-pci,disable-legacy=on`
+   backed by a separate `target/narf-vblk.img`. Probes via
+   `bus::register_pci_driver`. Smoke
+   `smoke_virtio_blk_pci_read_sector` round-trips the sector-0
+   pattern xtask seeds the image with.
+
    PCIe driver-match registry (`bus::driver_match`) lets drivers
    register `(name, MatchKind, probe_fn)` entries — `MatchKind` is
    `VendorDevice` (most specific), `Class { class, mask }`, or
