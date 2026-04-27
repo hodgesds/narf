@@ -141,11 +141,15 @@ pub fn current_cpu_id() -> narf_lib::id::CpuId {
     narf_lib::id::CpuId::new(narf_arch_cpu_id() as u16)
 }
 
-/// Hook that `narf_lib::percpu` calls to avoid a dep cycle. Stage 2:
-/// returns 0 (BSP-only). Stage 3: reads CPU-ID register.
+/// Hook that `narf_lib::percpu` calls to avoid a dep cycle.
+/// Reads the current logical CPU id via the per-arch `cpu`
+/// module (RDTSCP/IA32_TSC_AUX on x86_64; MPIDR_EL1 lookup on
+/// aarch64). Single-CPU today: returns 0 because the BSP's
+/// per-CPU storage hasn't been populated with a non-zero id;
+/// AP bring-up will start writing real ids.
 #[unsafe(no_mangle)]
 pub extern "Rust" fn narf_arch_cpu_id() -> usize {
-    0
+    current::cpu::current_cpu() as usize
 }
 
 /// Hook that `narf_lib::assert::current_domain` calls to avoid a dep

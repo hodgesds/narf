@@ -1,6 +1,7 @@
 //! aarch64 arch backend.
 
 pub mod asm;
+pub mod cpu;
 pub mod cpuid;
 pub mod mmio;
 pub mod mte;

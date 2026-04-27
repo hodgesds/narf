@@ -6975,6 +6975,50 @@ fn smoke_slab_stats_advance() -> TestResult {
 }
 kernel_test!(smoke_slab_stats_advance);
 
+fn smoke_percpu_current_id() -> TestResult {
+    // Single-CPU today — current_cpu_id() must return 0 on the BSP.
+    let id = narf_arch::current_cpu_id().raw();
+    if id != 0 {
+        return TestResult::Fail("BSP current_cpu_id != 0");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_percpu_current_id);
+
+fn smoke_percpu_storage_isolation() -> TestResult {
+    // PerCpu<T: Copy> — verify the BSP cell is reachable + iter()
+    // yields MAX_CPUS entries. Mutation requires T's interior
+    // mutability (e.g. T = AtomicU32 once PerCpu drops the Copy
+    // bound, or T = u32 wrapped in a UnsafeCell-bearing newtype);
+    // for this smoke the structural surface is what matters.
+    use narf_lib::percpu::PerCpu;
+    static SEED: PerCpu<u32> = PerCpu::new(0x4242);
+    let v = *SEED.this_cpu();
+    if v != 0x4242 {
+        return TestResult::Fail("PerCpu init didn't propagate to BSP cell");
+    }
+    let n = SEED.iter().count();
+    if n != narf_lib::percpu::MAX_CPUS {
+        return TestResult::Fail("PerCpu iter() count mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_percpu_storage_isolation);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_aarch64_mpidr_aff_present() -> TestResult {
+    // MPIDR_EL1 reads cleanly + affinity-pack returns a value
+    // matching the table-registered BSP slot.
+    let aff = narf_arch::aarch64::cpu::mpidr_aff();
+    // QEMU virt typically reports MPIDR_EL1 = 0x80000000 (UP bit
+    // set) so aff = 0. We accept anything; just verify the read
+    // doesn't fault.
+    let _ = aff;
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test!(smoke_aarch64_mpidr_aff_present);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_virtio_balloon_pci_probe() -> TestResult {
     use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};

@@ -1,6 +1,7 @@
 //! x86_64 arch backend.
 
 pub mod asm;
+pub mod cpu;
 pub mod cpuid;
 pub mod cr;
 pub mod io_port;
