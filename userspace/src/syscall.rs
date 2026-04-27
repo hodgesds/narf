@@ -264,6 +264,16 @@ pub enum Syscall {
     /// on success, -1 on bad which / out-of-range prio.
     Setpriority  = 157,
 
+    /// `arg0 = tms_out_ptr`. POSIX times(2): write the calling
+    /// task's `struct tms { i64 utime, stime, cutime, cstime }`
+    /// (in CLK_TCK = 100Hz ticks) and return the elapsed wall-
+    /// clock ticks since boot. NARF doesn't track per-task
+    /// user/system splits yet — `utime` synthesises to monotonic
+    /// ticks, `stime` and child fields are zero — but the surface
+    /// round-trips so `clock(3)` and `time(1)`-shaped consumers
+    /// see a calibratable wall clock.
+    Times        = 158,
+
     /// Set or query the per-task heap break.
     /// `arg0 = 0` → return current break; `arg0 != 0` → resize.
     /// POSIX `brk(2)` semantics: failure returns the unchanged break.
@@ -469,6 +479,7 @@ impl Syscall {
             149 => Syscall::Setrlimit,
             156 => Syscall::Getpriority,
             157 => Syscall::Setpriority,
+            158 => Syscall::Times,
             150 => Syscall::Brk,
             151 => Syscall::ClockGetTime,
             152 => Syscall::Sigaction,

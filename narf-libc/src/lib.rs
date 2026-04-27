@@ -215,8 +215,9 @@ pub use stdlib::{
     sscanf_ints, strtol, strtoul, RAND_MAX,
 };
 pub use time::{
-    asctime, clock_gettime, ctime, difftime, gettimeofday, gmtime, gmtime_r,
-    localtime, localtime_r, mktime, strftime, time, timespec, timeval, tm,
+    asctime, clock, clock_gettime, ctime, difftime, gettimeofday, gmtime,
+    gmtime_r, localtime, localtime_r, mktime, strftime, time, times, timespec,
+    timeval, tm, tms,
 };
 pub use startup::__libc_start_main;
 // Note: `stdio::fputs` shadows the older `io::fputs(&str, fd)` helper

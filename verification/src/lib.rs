@@ -12525,3 +12525,44 @@ fn smoke_userspace_priority_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_userspace_priority_round_trip);
+
+fn smoke_userspace_times_writes_tms_struct() -> TestResult {
+    use narf_userspace::{install_core_syscalls, install_global,
+                         kernel_syscall_entry, syscall::__test_clear_global,
+                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+                         TrapContext};
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let mut buf = [0i64; 4];
+    let mut ctx = FakeCtx {
+        args: SyscallArgs { arg0: buf.as_mut_ptr() as u64, ..SyscallArgs::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Times.raw(), &mut ctx);
+    let wall = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value as i64,
+        _ => return TestResult::Fail("times did not return OK"),
+    };
+    // utime synthesised to wall-clock ticks; stime/cutime/cstime
+    // zeroed; wall return matches buf[0] (both source the same ns).
+    if buf[0] != wall || buf[1] != 0 || buf[2] != 0 || buf[3] != 0 {
+        return TestResult::Fail("times did not write the expected tms struct");
+    }
+    if wall < 0 {
+        return TestResult::Fail("times surfaced a negative wall-clock");
+    }
+
+    __test_clear_global();
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_times_writes_tms_struct);

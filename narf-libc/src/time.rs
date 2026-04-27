@@ -454,6 +454,54 @@ pub unsafe extern "C" fn ctime(timep: *const time_t) -> *mut u8 {
     unsafe { asctime(localtime(timep)) }
 }
 
+// ── times() — POSIX process CPU times ───────────────────────────────
+
+/// POSIX `<sys/times.h>` `struct tms`. `clock_t` is `i64` here
+/// (matches glibc x86_64). Times are in CLK_TCK = 100Hz ticks.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct tms {
+    pub tms_utime:  i64,
+    pub tms_stime:  i64,
+    pub tms_cutime: i64,
+    pub tms_cstime: i64,
+}
+
+/// `times(buf)` — write per-task CPU-time accumulation and return
+/// the wall-clock ticks since boot. NARF synthesises tms_utime
+/// from monotonic_ns and zeros the rest; consumers using `clock()`
+/// or `time(1)`-shaped wall measurements still get a valid clock.
+///
+/// # Safety
+/// `buf` must be a writable `*mut tms`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn times(buf: *mut tms) -> i64 {
+    if buf.is_null() {
+        let mut sink = [0i64; 4];
+        return narf_user_runtime::times(&mut sink);
+    }
+    let mut tmp = [0i64; 4];
+    let wall = narf_user_runtime::times(&mut tmp);
+    // SAFETY: caller-supplied writable struct.
+    unsafe {
+        (*buf).tms_utime  = tmp[0];
+        (*buf).tms_stime  = tmp[1];
+        (*buf).tms_cutime = tmp[2];
+        (*buf).tms_cstime = tmp[3];
+    }
+    wall
+}
+
+/// `clock()` — POSIX `clock(3)`. Returns the calling task's
+/// utime in CLK_TCK = 100Hz ticks. Aliases what `times` would
+/// write into `tms_utime`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clock() -> i64 {
+    let mut tmp = [0i64; 4];
+    let _ = narf_user_runtime::times(&mut tmp);
+    tmp[0]
+}
+
 /// `gettimeofday(*mut timeval, *mut c_void)`. The second argument is
 /// the legacy `struct timezone *` — POSIX deprecated it; we ignore
 /// it. Returns 0 on success, -1 if `tv` is null.

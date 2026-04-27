@@ -73,6 +73,7 @@ pub const SYS_GETRLIMIT:      u64 = 148;
 pub const SYS_SETRLIMIT:      u64 = 149;
 pub const SYS_GETPRIORITY:    u64 = 156;
 pub const SYS_SETPRIORITY:    u64 = 157;
+pub const SYS_TIMES:          u64 = 158;
 pub const SYS_BRK:            u64 = 150;
 pub const SYS_CLOCK_GETTIME:  u64 = 151;
 pub const SYS_SIGACTION:      u64 = 152;
@@ -469,6 +470,16 @@ pub fn fdatasync(fd: u32) -> i32 {
     // SAFETY: SYS_FDATASYNC takes a single arg (fd).
     let r = unsafe { syscall1(SYS_FDATASYNC, fd as u64) };
     if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `times(buf)` — write `[utime, stime, cutime, cstime]` (POSIX
+/// `struct tms` shape, in 100Hz clock ticks) into `buf` and
+/// return the wall-clock ticks since boot. -1 on error.
+#[inline]
+pub fn times(buf: &mut [i64; 4]) -> i64 {
+    // SAFETY: SYS_TIMES signature: (out_ptr).
+    let r = unsafe { syscall1(SYS_TIMES, buf.as_mut_ptr() as u64) };
+    r as i64
 }
 
 /// `getpriority(which, who)` — read the calling task's nice value.

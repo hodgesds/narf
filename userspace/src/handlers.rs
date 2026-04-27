@@ -1846,6 +1846,44 @@ fn sys_setpriority(ctx: &mut dyn TrapContext) {
     }
 }
 
+// ── Times — POSIX process CPU times ───────────────────────────────
+//
+// times(2) writes a `struct tms { utime, stime, cutime, cstime }`
+// in clock ticks (CLK_TCK = 100Hz, so 10 ms per tick). NARF
+// doesn't track per-task user/system splits yet — we synthesise
+// `utime = wall ticks since boot` and zero the rest — but the
+// returned wall-clock value is real and lets a consumer
+// calibrate `clock(3)` against the elapsed wall.
+//
+// The function returns the wall-clock ticks via the syscall
+// `value`; `tms_out` receives the same shape glibc / POSIX
+// expects. Caller-side libc translates negative-on-overflow
+// per the POSIX clock_t bound.
+
+const CLK_TCK_HZ: u64 = 100;
+
+fn sys_times(ctx: &mut dyn TrapContext) {
+    let out_ptr = ctx.args().arg0 as *mut i64;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    let ns: u64 = narf_scheduler::narf_time::monotonic_ns();
+    let ticks: i64 = (ns / (1_000_000_000 / CLK_TCK_HZ)) as i64;
+    if !out_ptr.is_null() {
+        // SAFETY: caller-supplied user vaddr in the active AS;
+        // we write four i64s. Bad pointer faults the user.
+        unsafe {
+            core::ptr::write_volatile(out_ptr,        ticks); // utime
+            core::ptr::write_volatile(out_ptr.add(1), 0);     // stime
+            core::ptr::write_volatile(out_ptr.add(2), 0);     // cutime
+            core::ptr::write_volatile(out_ptr.add(3), 0);     // cstime
+        }
+    }
+    if ticks < 0 {
+        ctx.set_return(fail);
+        return;
+    }
+    ctx.set_return(SyscallReturn::ok(ticks as u64));
+}
+
 // ── Hostname (kernel-wide) ─────────────────────────────────────────
 //
 // One global string behind an IrqSafeSpinLock, initialised to
@@ -2726,6 +2764,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Setrlimit,   "setrlimit",   RawFnHandler(sys_setrlimit));
     table.install_raw(Syscall::Getpriority, "getpriority", RawFnHandler(sys_getpriority));
     table.install_raw(Syscall::Setpriority, "setpriority", RawFnHandler(sys_setpriority));
+    table.install_raw(Syscall::Times,       "times",       RawFnHandler(sys_times));
     table.install_raw(Syscall::ExitTask, "exit",     RawFnHandler(sys_exit_task));
     table.install_raw(Syscall::Yield,    "yield",    RawFnHandler(sys_yield));
     table.install_raw(Syscall::Sleep,    "sleep",    RawFnHandler(sys_sleep));
