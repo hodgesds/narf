@@ -3529,6 +3529,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Dup3,   "dup3",   RawFnHandler(sys_dup3));
     table.install_raw(Syscall::Fcntl,  "fcntl",  RawFnHandler(sys_fcntl));
     table.install_raw(Syscall::Stat,   "stat",   RawFnHandler(sys_stat));
+    table.install_raw(Syscall::Lstat,  "lstat",  RawFnHandler(sys_stat));
     table.install_raw(Syscall::Fstat,  "fstat",  RawFnHandler(sys_fstat));
     table.install_raw(Syscall::Pipe,   "pipe",   RawFnHandler(sys_pipe));
     table.install_raw(Syscall::Ftruncate, "ftruncate", RawFnHandler(sys_ftruncate));

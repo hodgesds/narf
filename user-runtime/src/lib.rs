@@ -51,6 +51,7 @@ pub const SYS_SYMLINK:        u64 = 194;
 pub const SYS_LISTDIR:        u64 = 195;
 pub const SYS_GETDENTS64:     u64 = 196;
 pub const SYS_STAT:           u64 = 115;
+pub const SYS_LSTAT:          u64 = 133;
 pub const SYS_FSTAT:          u64 = 116;
 pub const SYS_PIPE:           u64 = 117;
 pub const SYS_MMAP:           u64 = 120;
@@ -977,6 +978,23 @@ pub fn stat(path: &str, out: &mut StatBuf) -> i32 {
     let r = unsafe {
         syscall3(
             SYS_STAT,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            out as *mut StatBuf as u64,
+        )
+    };
+    if r == 0 { 0 } else { -1 }
+}
+
+/// `lstat(path, &mut out)` — like [`stat`] but doesn't follow
+/// symlinks. NARF has no symlink support, so behaviour is
+/// identical to `stat`.
+#[inline]
+pub fn lstat(path: &str, out: &mut StatBuf) -> i32 {
+    // SAFETY: SYS_LSTAT signature mirrors SYS_STAT.
+    let r = unsafe {
+        syscall3(
+            SYS_LSTAT,
             path.as_ptr() as u64,
             path.len() as u64,
             out as *mut StatBuf as u64,

@@ -184,6 +184,36 @@ pub unsafe fn stat(path: *const u8, out: *mut StatBuf) -> i32 {
     }
 }
 
+/// `lstat(path, &mut out)` — like [`stat`] but doesn't follow
+/// symlinks. NARF has no symlinks; this aliases stat.
+///
+/// # Safety
+/// See [`stat`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lstat(path: *const u8, out: *mut StatBuf) -> i32 {
+    if path.is_null() || out.is_null() {
+        set_errno(EBADF);
+        return -1;
+    }
+    let mut len = 0usize;
+    while len < 4096 {
+        if unsafe { *path.add(len) } == 0 { break; }
+        len += 1;
+    }
+    let path_bytes = unsafe { core::slice::from_raw_parts(path, len) };
+    let path_str = match core::str::from_utf8(path_bytes) {
+        Ok(s) => s,
+        Err(_) => { set_errno(EBADF); return -1; }
+    };
+    let out_ref = unsafe { &mut *out };
+    if narf_user_runtime::lstat(path_str, out_ref) == 0 {
+        0
+    } else {
+        set_errno(EBADF);
+        -1
+    }
+}
+
 /// `fstat(fd, &mut out)` — fill `out` with the stat result for an
 /// open fd. Returns 0 on success, `-1` on failure.
 ///

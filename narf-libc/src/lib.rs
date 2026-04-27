@@ -79,7 +79,7 @@ pub use ctype::{
 pub use env::{getenv, getenv_cstr, putenv, setenv, unsetenv, ENVIRON};
 pub use errno::{errno, set_errno, strerror, __errno_location};
 pub use fd::{
-    dup, dup2, fcntl, fstat, isatty, memfd_create, pipe, pipe2, stat,
+    dup, dup2, fcntl, fstat, isatty, lstat, memfd_create, pipe, pipe2, stat,
     FD_CLOEXEC, F_GETFD, F_GETFL, F_SETFD, F_SETFL, StatBuf,
 };
 pub use fs::{

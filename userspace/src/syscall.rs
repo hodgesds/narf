@@ -149,6 +149,11 @@ pub enum Syscall {
     /// [`Stat`] otherwise.
     Fstat        = 116,
 
+    /// `arg0 = path_ptr, arg1 = path_len, arg2 = stat_out_ptr`.
+    /// Linux lstat(2): like stat but doesn't follow the final
+    /// symlink. NARF has no symlinks; this aliases sys_stat.
+    Lstat        = 133,
+
     /// Create a pipe pair. `arg0 = pipefd_out_ptr` — kernel writes
     /// two `i32`s (read fd, write fd) to that pointer. Returns 0
     /// on success.
@@ -611,6 +616,7 @@ impl Syscall {
             129 => Syscall::Fchmod,
             131 => Syscall::Fchown,
             132 => Syscall::Truncate,
+            133 => Syscall::Lstat,
             120 => Syscall::Mmap,
             121 => Syscall::Munmap,
             130 => Syscall::RingKick,
