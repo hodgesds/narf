@@ -449,9 +449,24 @@ impl Controller {
     ///    parse the buffer.
     pub fn bring_up(
         &mut self,
-        _cap: &Cap<BusDeviceCap, Write>,
+        cap: &Cap<BusDeviceCap, Write>,
     ) -> Result<(), NvmeError> {
         let device = self.device.ok_or(NvmeError::BadBar)?;
+
+        // ── 0. Flip on MEM_SPACE + BUS_MASTER in the cfg-space
+        //       command register ───────────────────────────────────
+        // Without BUS_MASTER, the controller can't DMA into the
+        // queue / IDENTIFY buffers. QEMU's emulated NVMe is
+        // permissive but real silicon refuses, so we set it
+        // unconditionally. INTX_DISABLE is also flipped on so the
+        // device doesn't try legacy IRQs in parallel with our
+        // MSI-X programming.
+        narf_bus::pci::set_command(
+            cap, &device,
+            narf_bus::pci::cmd::MEM_SPACE
+                | narf_bus::pci::cmd::BUS_MASTER
+                | narf_bus::pci::cmd::INTX_DISABLE,
+        ).map_err(|_| NvmeError::BadBar)?;
 
         // ── 1. Map BAR0 + read CAP / VS ───────────────────────────
         // SAFETY: BSP, no other writer to this device's cfg window.

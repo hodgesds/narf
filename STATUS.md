@@ -508,6 +508,21 @@ The critical-path Stage-2 items remaining:
    pattern *and* asserts the dispatch table observed at least one
    MSI during the I/O.
 
+   PCI command-register helper (`bus::pci::{set_command, clear_command,
+   read_command}`) is cap-gated on `Cap<BusDeviceCap, Write>` and
+   handles cfg-space offset 0x04 (`MEM_SPACE`, `BUS_MASTER`,
+   `INTX_DISABLE`, `IO_SPACE`). NVMe `bring_up` flips on
+   `MEM_SPACE | BUS_MASTER | INTX_DISABLE` before allocating queues
+   so DMA works on real silicon (not just permissive QEMU).
+   `bus::pci::requester_id(device)` packs PCIe BDF into the 16-bit
+   value the GIC ITS expects as DeviceID.
+
+   aarch64 MSI-X is now wired end-to-end: `MsixTable::program_vector`
+   on aarch64 calls `interrupts::aarch64::its::map_event(device_id,
+   event_id, lpi, collection)` before writing the table entry, so
+   `(DeviceID, EventID) → LPI` translation is registered in the ITS
+   and MSI deliveries actually land.
+
    PCIe ECAM walker is now shared between arches via `bus::pcie`.
    x86_64 (q35, 256-bus ECAM) walks live. aarch64 also walks live
    via DTB-driven host-bridge discovery: `bus::aarch64::walk_fdt`

@@ -5598,6 +5598,53 @@ fn smoke_nvme_io_msix_irq_driven() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_nvme_io_msix_irq_driven);
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_pci_command_bme_round_trip() -> TestResult {
+    // Sets MEM_SPACE | BUS_MASTER on the QEMU NVMe device and reads
+    // the command register back. Proves the cap-gated PCI
+    // command-register surface works end-to-end.
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+    use narf_bus::pci::{cmd, read_command, set_command};
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    // SAFETY: ECAM identity-mapped; init idempotent.
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+
+    let devs = devices();
+    let nvme_dev = devs.iter().find(|d| {
+        matches!(d.kind, BusKind::Pcie { .. })
+            && d.id.vendor == 0x1B36
+            && d.id.device == 0x0010
+    });
+    let Some(dev) = nvme_dev.copied() else {
+        return TestResult::Skip("no QEMU NVMe controller");
+    };
+
+    let authority = bootstrap_registry_authority();
+    let (_h, cap) = match claim_device_cap(&authority, dev.addr) {
+        Ok(ok)  => ok,
+        Err(_)  => return TestResult::Fail("claim_device_cap failed"),
+    };
+
+    let bits = cmd::MEM_SPACE | cmd::BUS_MASTER;
+    let new = match set_command(&cap, &dev, bits) {
+        Ok(v)  => v,
+        Err(_) => return TestResult::Fail("set_command failed"),
+    };
+    if (new & bits) != bits {
+        return TestResult::Fail("set_command did not OR the requested bits");
+    }
+    let readback = match read_command(&cap, &dev) {
+        Ok(v)  => v,
+        Err(_) => return TestResult::Fail("read_command failed"),
+    };
+    if (readback & bits) != bits {
+        return TestResult::Fail("read_command lost the requested bits");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_pci_command_bme_round_trip);
+
 fn smoke_drivers_net_nic_model_ids() -> TestResult {
     use narf_drivers_net::{NicCaps, NicModel};
 

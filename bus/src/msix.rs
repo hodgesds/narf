@@ -222,6 +222,28 @@ impl MsixTable {
         // does the size-detection write/restore against cfg-space.
         let region = unsafe { map_bar(&self.device, self.bir)? };
 
+        // aarch64-only: register the (DeviceID, EventID) → LPI
+        // translation in the GIC ITS before the device fires its
+        // first MSI. Without this, a write to GITS_TRANSLATER has
+        // no entry and the IRQ is silently dropped. On x86_64 the
+        // LAPIC delivers directly so no analog is needed.
+        #[cfg(target_arch = "aarch64")]
+        {
+            let device_id = crate::pci::requester_id(&self.device)
+                .ok_or(MsixError::NotPcie)?;
+            let event_id  = irq_vector as u32;
+            let lpi       = narf_interrupts::aarch64::its::LPI_BASE
+                          + irq_vector as u32;
+            let collection = (target_apic_id & 0xFFFF) as u16;
+            // SAFETY: ITS is initialised at boot; lpi is bounded by
+            // its::NUM_LPIS.
+            unsafe {
+                narf_interrupts::aarch64::its::map_event(
+                    device_id as u32, event_id, lpi, collection,
+                ).map_err(|_| MsixError::Unsupported)?;
+            }
+        }
+
         let (msg_addr, msg_data) = msi_message(target_apic_id, irq_vector);
         let msg_addr_lo = msg_addr as u32;
         let msg_addr_hi = (msg_addr >> 32) as u32;
