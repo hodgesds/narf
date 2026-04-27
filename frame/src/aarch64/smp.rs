@@ -212,6 +212,10 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
     // CPU only touches its own redistributor + sysregs.
     unsafe { narf_interrupts::aarch64::gic::init_ap(logical_id as u32); }
 
+    // 3b. Install framework-default SGI handlers (PANIC_HALT,
+    //     RESCHED). Drivers can override after.
+    narf_interrupts::aarch64::sgi::install_defaults();
+
     // 4. Mark online — the BSP's start_aps() spins on this.
     // SAFETY: per-CPU bookkeeping.
     unsafe { narf_lib::smp::mark_online(logical_id as u32); }

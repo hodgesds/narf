@@ -344,6 +344,8 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             "  its: bring-up failed: {e:?}");
                     }
                 }
+                // BSP's default SGI handlers (PANIC_HALT, RESCHED).
+                narf_interrupts::aarch64::sgi::install_defaults();
 
                 // SMP discovery: count CPUs from the DTB.
                 if let Some(p) = info.dtb_phys {

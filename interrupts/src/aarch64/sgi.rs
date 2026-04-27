@@ -26,6 +26,68 @@ pub const SGI_TLB_SHOOTDOWN:  u8 = 1;
 /// IPI vector for "panic — stop touching the serial port + halt."
 pub const SGI_PANIC_HALT:     u8 = 2;
 
+/// Per-CPU "scheduler should look for work next time it polls"
+/// flag. Set by `default_resched_handler` on SGI_RESCHED receipt;
+/// cleared by the scheduler when it next runs.
+static NEEDS_RESCHED: [core::sync::atomic::AtomicBool; narf_lib::percpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) };
+     narf_lib::percpu::MAX_CPUS];
+
+pub fn needs_resched(cpu: u32) -> bool {
+    let i = (cpu as usize).min(narf_lib::percpu::MAX_CPUS - 1);
+    NEEDS_RESCHED[i].load(Ordering::Acquire)
+}
+
+pub fn clear_resched(cpu: u32) {
+    let i = (cpu as usize).min(narf_lib::percpu::MAX_CPUS - 1);
+    NEEDS_RESCHED[i].store(false, Ordering::Release);
+}
+
+/// Default RESCHED handler — flips `NEEDS_RESCHED[current_cpu()]`
+/// so the scheduler's next poll knows to look for new work.
+fn default_resched_handler() {
+    let cpu = narf_lib::percpu::current_cpu();
+    NEEDS_RESCHED[cpu].store(true, Ordering::Release);
+}
+
+/// Default PANIC_HALT handler — masks IRQs + spins in WFI. Used
+/// when one CPU panics and broadcasts to the others before
+/// printing the trap frame so the serial port isn't raced.
+fn default_panic_halt_handler() -> ! {
+    // SAFETY: called from IRQ context on the receiving CPU; we
+    // never want to leave halt, so masking IRQs is permanent here.
+    unsafe { narf_arch::disable_interrupts(); }
+    loop {
+        // SAFETY: WFI in EL1 is always defined; with IRQs masked
+        // we never wake.
+        unsafe { core::arch::asm!("wfi", options(nostack, preserves_flags)); }
+    }
+}
+
+/// Install the framework-default handlers for RESCHED + PANIC_HALT.
+/// Called once at boot on the BSP and once per AP entry. Drivers
+/// can override via `set_handler` after this runs.
+pub fn install_defaults() {
+    set_handler(SGI_RESCHED, default_resched_handler);
+    // PANIC_HALT is `fn() -> !` while SgiHandler is `fn()`; the
+    // never-returning fn fits with one extra trampoline.
+    fn panic_halt_trampoline() {
+        default_panic_halt_handler();
+    }
+    set_handler(SGI_PANIC_HALT, panic_halt_trampoline);
+}
+
+/// Convenience: broadcast PANIC_HALT to every other CPU. Called
+/// from the panic path before the printer runs.
+///
+/// # Safety
+/// Caller is in panic state — already accepts that we're tearing
+/// down. The IPI handler on receiving CPUs masks IRQs + halts.
+pub unsafe fn broadcast_panic_halt() {
+    // SAFETY: GICv3 sysreg interface up.
+    unsafe { broadcast_others(SGI_PANIC_HALT); }
+}
+
 /// Per-(CPU, INTID) receive count. Drivers can sample to confirm
 /// IPI delivery.
 static RX_COUNT: [[AtomicU64; 16]; narf_lib::percpu::MAX_CPUS] =

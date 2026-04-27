@@ -7225,6 +7225,33 @@ fn smoke_smp_aarch64_cross_cpu_visibility() -> TestResult {
 kernel_test!(smoke_smp_aarch64_cross_cpu_visibility);
 
 #[cfg(target_arch = "aarch64")]
+fn smoke_smp_aarch64_resched_flag() -> TestResult {
+    // Sending SGI_RESCHED to the AP should set its needs_resched
+    // flag (via the framework-default handler installed at AP
+    // bring-up).
+    use narf_interrupts::aarch64::sgi;
+    use narf_lib::smp;
+    if !smp::is_online(1) { return TestResult::Skip("AP CPU 1 offline"); }
+    sgi::clear_resched(1);
+    if sgi::needs_resched(1) {
+        return TestResult::Fail("clear_resched didn't clear");
+    }
+    // SAFETY: GICv3 sysreg up.
+    unsafe { sgi::send_to_cpu_aff(sgi::SGI_RESCHED, 1); }
+    let start = narf_time::Instant::now();
+    while narf_time::Instant::now().cycles_since(start) < 5_000_000 {
+        if sgi::needs_resched(1) {
+            sgi::clear_resched(1);
+            return TestResult::Pass;
+        }
+        core::hint::spin_loop();
+    }
+    TestResult::Fail("AP didn't set needs_resched after SGI_RESCHED")
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test!(smoke_smp_aarch64_resched_flag);
+
+#[cfg(target_arch = "aarch64")]
 fn smoke_smp_aarch64_dtb_count() -> TestResult {
     // QEMU virt -smp 1 (default) reports 1 CPU. The number bumps
     // when xtask switches to `-smp N`.
