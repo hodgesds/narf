@@ -367,6 +367,26 @@ pub enum Syscall {
     /// ignored. Returns 0 on success, -1 on bad pointer.
     SchedSetaffinity = 167,
 
+    /// `arg0 = policy`. Linux sched_get_priority_max(2): return
+    /// the maximum valid `sched_priority` for `policy`.
+    /// SCHED_OTHER (0) / SCHED_BATCH (3) / SCHED_IDLE (5) → 0;
+    /// SCHED_FIFO (1) / SCHED_RR (2) → 99. Bad policy → -1.
+    SchedGetPriorityMax = 220,
+
+    /// `arg0 = policy`. sched_get_priority_min(2). Mirrors max
+    /// with the inverse: 0 / 1 / -1 by policy.
+    SchedGetPriorityMin = 221,
+
+    /// `arg0 = pid` (0 = self), `arg1 = sched_param_out_ptr`.
+    /// Linux sched_getparam(2): write a single-field
+    /// `struct sched_param { int sched_priority }` (POSIX).
+    /// Returns 0 on success, -1 on bad pointer.
+    SchedGetparam       = 222,
+
+    /// `arg0 = pid`, `arg1 = sched_param_in_ptr`. Read the
+    /// `sched_priority` field, store on the task. Returns 0.
+    SchedSetparam       = 223,
+
     /// Linux gettid(2): return the calling thread's distinct kernel
     /// id (in multi-threaded processes pid identifies the process,
     /// tid identifies the thread). NARF is single-threaded per
@@ -642,6 +662,10 @@ impl Syscall {
             165 => Syscall::Getcpu,
             166 => Syscall::SchedGetaffinity,
             167 => Syscall::SchedSetaffinity,
+            220 => Syscall::SchedGetPriorityMax,
+            221 => Syscall::SchedGetPriorityMin,
+            222 => Syscall::SchedGetparam,
+            223 => Syscall::SchedSetparam,
             168 => Syscall::Gettid,
             169 => Syscall::Prctl,
             175 => Syscall::Tgkill,

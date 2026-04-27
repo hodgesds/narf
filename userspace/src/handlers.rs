@@ -289,6 +289,7 @@ pub fn init_per_task_state() {
     nice_init();
     umask_init();
     prctl_init();
+    sched_param_init();
 }
 
 /// Reset the registry — test hook; drops every per-task ring set.
@@ -2306,6 +2307,107 @@ fn sys_prctl(ctx: &mut dyn TrapContext) {
     }
 }
 
+// ── sched_get_priority_max / min + getparam / setparam ────────────
+//
+// Linux exposes a small policy-shaped surface: each scheduling
+// policy has a (min, max) priority range, and each task has a
+// `sched_param { int sched_priority }` slot. NARF's scheduler
+// uses the cap-gated CpuBudget surface for actual routing; the
+// POSIX surface here is structural only — it round-trips so a
+// libc consumer that asserts `sched_get_priority_min(SCHED_RR) <=
+// param.sched_priority <= sched_get_priority_max(SCHED_RR)` sees
+// a coherent answer.
+
+const SCHED_OTHER: u64 = 0;
+const SCHED_FIFO:  u64 = 1;
+const SCHED_RR:    u64 = 2;
+const SCHED_BATCH: u64 = 3;
+const SCHED_IDLE:  u64 = 5;
+
+fn priority_max_for_policy(policy: u64) -> Option<i64> {
+    match policy {
+        SCHED_OTHER | SCHED_BATCH | SCHED_IDLE => Some(0),
+        SCHED_FIFO  | SCHED_RR                  => Some(99),
+        _ => None,
+    }
+}
+
+fn priority_min_for_policy(policy: u64) -> Option<i64> {
+    match policy {
+        SCHED_OTHER | SCHED_BATCH | SCHED_IDLE => Some(0),
+        SCHED_FIFO  | SCHED_RR                  => Some(1),
+        _ => None,
+    }
+}
+
+fn sys_sched_get_priority_max(ctx: &mut dyn TrapContext) {
+    let policy = ctx.args().arg0;
+    match priority_max_for_policy(policy) {
+        Some(p) => ctx.set_return(SyscallReturn::ok(p as u64)),
+        None    => ctx.set_return(SyscallReturn::ok((-1i64) as u64)),
+    }
+}
+
+fn sys_sched_get_priority_min(ctx: &mut dyn TrapContext) {
+    let policy = ctx.args().arg0;
+    match priority_min_for_policy(policy) {
+        Some(p) => ctx.set_return(SyscallReturn::ok(p as u64)),
+        None    => ctx.set_return(SyscallReturn::ok((-1i64) as u64)),
+    }
+}
+
+// Per-task sched_param slot. Single i32 (sched_priority).
+static SCHED_PARAM_TABLE:
+    narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, i32>>>
+    = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+pub fn sched_param_init() {
+    *SCHED_PARAM_TABLE.lock() = Some(BTreeMap::new());
+}
+
+#[doc(hidden)]
+pub fn __test_sched_param_reset() { *SCHED_PARAM_TABLE.lock() = None; }
+
+fn sys_sched_getparam(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let pid  = args.arg0;
+    let out  = args.arg1 as *mut i32;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if out.is_null() {
+        ctx.set_return(fail);
+        return;
+    }
+    let task = if pid == 0 { current_task_id() } else { pid };
+    let g = SCHED_PARAM_TABLE.lock();
+    let val = g.as_ref()
+        .and_then(|m| m.get(&task).copied())
+        .unwrap_or(0);
+    // SAFETY: caller-supplied writable user vaddr; one i32.
+    unsafe { core::ptr::write_volatile(out, val); }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+fn sys_sched_setparam(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let pid  = args.arg0;
+    let inp  = args.arg1 as *const i32;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if inp.is_null() {
+        ctx.set_return(fail);
+        return;
+    }
+    // SAFETY: caller-supplied readable user vaddr.
+    let val = unsafe { core::ptr::read_volatile(inp) };
+    let task = if pid == 0 { current_task_id() } else { pid };
+    let mut g = SCHED_PARAM_TABLE.lock();
+    let m = match g.as_mut() {
+        Some(m) => m,
+        None    => { ctx.set_return(fail); return; }
+    };
+    m.insert(task, val);
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
 // ── Sched_get/setaffinity — CPU bitmap ─────────────────────────────
 //
 // NARF user mode is single-CPU; the affinity bitmap is structural
@@ -3548,6 +3650,14 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         RawFnHandler(sys_sched_getaffinity));
     table.install_raw(Syscall::SchedSetaffinity, "sched_setaffinity",
         RawFnHandler(sys_sched_setaffinity));
+    table.install_raw(Syscall::SchedGetPriorityMax, "sched_get_priority_max",
+        RawFnHandler(sys_sched_get_priority_max));
+    table.install_raw(Syscall::SchedGetPriorityMin, "sched_get_priority_min",
+        RawFnHandler(sys_sched_get_priority_min));
+    table.install_raw(Syscall::SchedGetparam, "sched_getparam",
+        RawFnHandler(sys_sched_getparam));
+    table.install_raw(Syscall::SchedSetparam, "sched_setparam",
+        RawFnHandler(sys_sched_setparam));
     table.install_raw(Syscall::Prctl,       "prctl",       RawFnHandler(sys_prctl));
     table.install_raw(Syscall::Getpriority, "getpriority", RawFnHandler(sys_getpriority));
     table.install_raw(Syscall::Setpriority, "setpriority", RawFnHandler(sys_setpriority));

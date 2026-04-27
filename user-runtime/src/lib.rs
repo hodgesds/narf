@@ -85,6 +85,10 @@ pub const SYS_GETPRIORITY:    u64 = 156;
 pub const SYS_GETCPU:         u64 = 165;
 pub const SYS_SCHED_GETAFFINITY: u64 = 166;
 pub const SYS_SCHED_SETAFFINITY: u64 = 167;
+pub const SYS_SCHED_GET_PRIORITY_MAX: u64 = 220;
+pub const SYS_SCHED_GET_PRIORITY_MIN: u64 = 221;
+pub const SYS_SCHED_GETPARAM:    u64 = 222;
+pub const SYS_SCHED_SETPARAM:    u64 = 223;
 pub const SYS_GETTID:         u64 = 168;
 pub const SYS_PRCTL:          u64 = 169;
 pub const SYS_TGKILL:         u64 = 175;
@@ -627,6 +631,47 @@ pub fn prctl(op: u32, arg_a: u64, arg_b: u64) -> i64 {
 pub fn gettid() -> u64 {
     // SAFETY: SYS_GETTID takes no args.
     unsafe { syscall0(SYS_GETTID) }
+}
+
+/// `sched_get_priority_max(policy)` — POSIX scheduler bound.
+/// Returns the highest sched_priority valid for `policy`, or -1
+/// for an unknown policy.
+#[inline]
+pub fn sched_get_priority_max(policy: u32) -> i32 {
+    // SAFETY: SYS_SCHED_GET_PRIORITY_MAX signature: (policy).
+    let r = unsafe { syscall1(SYS_SCHED_GET_PRIORITY_MAX, policy as u64) };
+    r as i32
+}
+
+/// `sched_get_priority_min(policy)` — POSIX scheduler bound.
+#[inline]
+pub fn sched_get_priority_min(policy: u32) -> i32 {
+    // SAFETY: SYS_SCHED_GET_PRIORITY_MIN signature: (policy).
+    let r = unsafe { syscall1(SYS_SCHED_GET_PRIORITY_MIN, policy as u64) };
+    r as i32
+}
+
+/// `sched_getparam(pid)` — read the calling task's
+/// `sched_priority`. Pass `pid=0` for self.
+#[inline]
+pub fn sched_getparam(pid: u64) -> i32 {
+    let mut prio: i32 = 0;
+    // SAFETY: SYS_SCHED_GETPARAM signature: (pid, out_ptr).
+    let r = unsafe {
+        syscall2(SYS_SCHED_GETPARAM, pid, &mut prio as *mut i32 as u64)
+    };
+    if r as i64 == -1 { -1 } else { prio }
+}
+
+/// `sched_setparam(pid, prio)` — set sched_priority.
+#[inline]
+pub fn sched_setparam(pid: u64, prio: i32) -> i32 {
+    let val: i32 = prio;
+    // SAFETY: SYS_SCHED_SETPARAM signature: (pid, in_ptr).
+    let r = unsafe {
+        syscall2(SYS_SCHED_SETPARAM, pid, &val as *const i32 as u64)
+    };
+    if r as i64 == -1 { -1 } else { 0 }
 }
 
 /// `sched_getaffinity(pid, mask)` — fill `mask` with the CPU

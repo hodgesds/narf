@@ -13463,3 +13463,69 @@ fn smoke_userspace_init_per_task_state_is_idempotent() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_userspace_init_per_task_state_is_idempotent);
+
+fn smoke_userspace_sched_priority_bounds_and_param() -> TestResult {
+    use narf_userspace::{init_per_task_state, install_core_syscalls,
+                         install_global, kernel_syscall_entry,
+                         syscall::__test_clear_global,
+                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+                         TrapContext};
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+    narf_userspace::handlers::__test_sched_param_reset();
+    init_per_task_state();
+
+    fn call(s: Syscall, arg0: u64, arg1: u64) -> Option<SyscallReturn> {
+        let mut ctx = FakeCtx {
+            args: SyscallArgs { arg0, arg1, ..SyscallArgs::default() },
+            ret: None,
+        };
+        kernel_syscall_entry(s.raw(), &mut ctx);
+        ctx.ret
+    }
+
+    // Bounds: SCHED_OTHER → (0, 0); SCHED_FIFO/RR → (1, 99); bad → -1.
+    let max_other = call(Syscall::SchedGetPriorityMax, 0, 0).map(|r| r.value as i64).unwrap_or(99);
+    let min_other = call(Syscall::SchedGetPriorityMin, 0, 0).map(|r| r.value as i64).unwrap_or(99);
+    if max_other != 0 || min_other != 0 {
+        return TestResult::Fail("SCHED_OTHER bounds not (0,0)");
+    }
+    let max_rr = call(Syscall::SchedGetPriorityMax, 2, 0).map(|r| r.value as i64).unwrap_or(99);
+    let min_rr = call(Syscall::SchedGetPriorityMin, 2, 0).map(|r| r.value as i64).unwrap_or(99);
+    if max_rr != 99 || min_rr != 1 {
+        return TestResult::Fail("SCHED_RR bounds not (1, 99)");
+    }
+    let bad = call(Syscall::SchedGetPriorityMax, 99, 0)
+        .map(|r| r.value).unwrap_or(0);
+    if bad != (-1i64) as u64 {
+        return TestResult::Fail("bad policy not rejected");
+    }
+
+    // Param round-trip: default 0, set to 50, read back 50.
+    let mut prio: i32 = 0xAB;
+    let _ = call(Syscall::SchedGetparam, 0, &mut prio as *mut i32 as u64);
+    if prio != 0 {
+        return TestResult::Fail("default sched_priority not 0");
+    }
+    let want: i32 = 50;
+    let _ = call(Syscall::SchedSetparam, 0, &want as *const i32 as u64);
+    let mut got: i32 = 0xCD;
+    let _ = call(Syscall::SchedGetparam, 0, &mut got as *mut i32 as u64);
+    if got != 50 {
+        return TestResult::Fail("setparam did not stick");
+    }
+
+    narf_userspace::handlers::__test_sched_param_reset();
+    __test_clear_global();
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_sched_priority_bounds_and_param);

@@ -432,6 +432,60 @@ pub unsafe extern "C" fn sched_setaffinity(
     narf_user_runtime::sched_setaffinity(pid, bytes)
 }
 
+// ── <sched.h> priority surface ─────────────────────────────────────
+
+pub const SCHED_OTHER: c_int = 0;
+pub const SCHED_FIFO:  c_int = 1;
+pub const SCHED_RR:    c_int = 2;
+pub const SCHED_BATCH: c_int = 3;
+pub const SCHED_IDLE:  c_int = 5;
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct sched_param {
+    pub sched_priority: c_int,
+}
+
+/// `sched_get_priority_max(policy)` — POSIX scheduler upper bound.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sched_get_priority_max(policy: c_int) -> c_int {
+    if policy < 0 { return -1; }
+    narf_user_runtime::sched_get_priority_max(policy as u32)
+}
+
+/// `sched_get_priority_min(policy)` — POSIX scheduler lower bound.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sched_get_priority_min(policy: c_int) -> c_int {
+    if policy < 0 { return -1; }
+    narf_user_runtime::sched_get_priority_min(policy as u32)
+}
+
+/// `sched_getparam(pid, *param)` — read the task's sched_priority.
+///
+/// # Safety
+/// `param` must be a writable `*mut sched_param`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sched_getparam(pid: i32, param: *mut sched_param) -> c_int {
+    if param.is_null() { return -1; }
+    let prio = narf_user_runtime::sched_getparam(pid as u64);
+    if prio == -1 { return -1; }
+    // SAFETY: caller-supplied writable struct.
+    unsafe { (*param).sched_priority = prio; }
+    0
+}
+
+/// `sched_setparam(pid, *param)` — set sched_priority.
+///
+/// # Safety
+/// `param` must be a readable `*const sched_param`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sched_setparam(pid: i32, param: *const sched_param) -> c_int {
+    if param.is_null() { return -1; }
+    // SAFETY: caller-supplied readable struct.
+    let prio = unsafe { (*param).sched_priority };
+    narf_user_runtime::sched_setparam(pid as u64, prio)
+}
+
 // ── <sched.h> sched_getcpu ─────────────────────────────────────────
 
 /// `sched_getcpu()` — return the CPU id the calling task is
