@@ -18,10 +18,21 @@ asks for. Updated when observable kernel behaviour changes.
   delivers hardware LAPIC-timer IRQs, exits cleanly.
 - `cargo xtask run --arch=aarch64` boots, runs the full async demo
   using CNTPCT_EL0 as the clock, exits via ARM semihosting.
-- `cargo xtask test --arch=x86_64` passes **20/20** kernel tests.
-- `cargo xtask test --arch=aarch64` passes **11/11** kernel tests
-  (10 arch-neutral + `smoke_aarch64_features` for the ID-register
-  probe; x86_64-specific tests correctly cfg-out).
+- `cargo xtask test --arch=x86_64` passes **248/248** kernel tests.
+- `cargo xtask test --arch=aarch64` passes **190/190** kernel tests
+  (3 skipped tests are x86_64-specific PCIe surfaces — virtio
+  device IDs that QEMU virt doesn't expose at the IDs we register).
+- 7 in-tree PCIe drivers running against real QEMU-emulated devices:
+
+| driver           | scope                                            |
+|------------------|--------------------------------------------------|
+| NVMe             | Admin queue + IDENTIFY CTRL + IDENTIFY NS + I/O queue + Read/Write + MSI-X-driven completions. |
+| virtio-blk-pci   | Modern transport. Polled + IRQ-driven Read/Write. |
+| virtio-net-pci   | Modern transport. TX + RX (polled).               |
+| virtio-rng-pci   | Modern transport. Structural probe.               |
+| virtio-balloon-pci | Modern transport. Structural probe.             |
+| e1000 / e1000e   | Real Intel NIC (8254x + 8257x family). TX + RX.   |
+| AHCI (ICH9/10)   | HBA bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT. |
 
 Representative x86_64 boot transcript:
 

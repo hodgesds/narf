@@ -6,19 +6,24 @@ intra-address-space isolation.
 
 > "NARF: Because security shouldn't feel like a speed limit."
 
-Status: **Stage 4 driver readiness landed**. Stages 1 ("Skeleton") and 2
+Status: **Stage 4 driver-set landed**. Stages 1 ("Skeleton") and 2
 ("Barrier") are closed; Stage 3 ("Flow") shipped end-to-end with
 `smoke_exit_gate_*` proving the `DmaBuffer → Narf-Ring → cap-gated
 consumer` composition on both arches. The current round added the
-driver-readiness surfaces — full IDT (32..=254), generic IRQ dispatch
-+ vector allocator + `wait_for_irq` future, x2APIC, GICv3 ITS, BAR
-sizing/map, MSI-X programming on both arches, end-to-end NVMe admin
-and I/O queues with MSI-X-driven completions on x86_64, and DTB-driven
-PCIe ECAM enumeration on aarch64. Latest tally: **x86_64 223/0/0,
-aarch64 186/0/3**. Stage 4 ("Compatibility") proper — real PKS/MTE
-enforcement on buffer pages, IOMMU programming, user-mode consumer via
-`abi/` — is next. See `STATUS.md` for current details and `ROADMAP.md`
-for the stage × subsystem matrix.
+driver framework + 7 working in-tree PCIe drivers: NVMe (full I/O +
+MSI-X), virtio-blk-pci, virtio-net-pci, virtio-rng-pci,
+virtio-balloon-pci, e1000/e1000e (TX + RX), AHCI (IDENTIFY + READ +
+WRITE DMA EXT). Surfaces under it: full IDT (32..=254); generic IRQ
+dispatch + vector allocator + `wait_for_irq` future; x2APIC + GICv3
+ITS; BAR sizing/map; PCI command + cap-list + extended-cap walkers;
+MSI + MSI-X programming on both arches; PCIe driver-match registry;
+DTB-driven PCIe ECAM enumeration on aarch64; typed driver-parameter
+surface + rights lattice (`Read ⊂ Write/Invoke/Spend`); syscall
+versioning via upper 8 bits + stable-ABI promise. Latest tally:
+**x86_64 248/0/0, aarch64 190/0/3**. Stage 4 ("Compatibility")
+proper — real PKS/MTE enforcement, IOMMU programming, user-mode
+consumer via `abi/`, relibc — is next. See `STATUS.md` for current
+details and `ROADMAP.md` for the stage × subsystem matrix.
 
 ## Core ideas
 
@@ -60,13 +65,23 @@ Live from boot through `cargo xtask run`:
   reset, ASQ/ACQ allocation, IDENTIFY CONTROLLER + IDENTIFY
   NAMESPACE, I/O queue pair (`Create I/O CQ` + `Create I/O SQ`),
   Read/Write LBA with both polled and MSI-X-driven completions.
+- virtio-blk-pci modern: cap walk, queue-0 setup, polled +
+  IRQ-driven Read/Write sector.
+- virtio-net-pci: TX + RX over RX/TX virtqueues with QEMU's
+  user-mode net backend.
+- e1000 / e1000e: BAR0, MAC read from RAL/RAH, TX + RX descriptor
+  rings, link up via CTRL.SLU.
+- AHCI ICH9: HBA reset, port enumeration via PORT_SIG/SSTS,
+  IDENTIFY DEVICE + READ DMA EXT + WRITE DMA EXT against a
+  QEMU-emulated SATA disk.
+- virtio-rng-pci + virtio-balloon-pci: structural probe.
 - Cap-system epoch tables, RCU (QSBR + epoch + hazard pointers),
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **223/0/0** smokes;
-`--arch=aarch64` passes **186/0/3** (the 3 skips are x86-specific
-features). See `STATUS.md` for the full tally and per-subsystem
+`cargo xtask test --arch=x86_64` passes **248/0/0** smokes;
+`--arch=aarch64` passes **190/0/3** (the 3 skips are x86-specific
+PCIe surfaces). See `STATUS.md` for the full tally and per-subsystem
 breakdown.
 
 ## Repository layout
