@@ -7176,6 +7176,55 @@ fn smoke_smp_aarch64_sgi_to_ap() -> TestResult {
 kernel_test!(smoke_smp_aarch64_sgi_to_ap);
 
 #[cfg(target_arch = "aarch64")]
+fn smoke_smp_aarch64_cross_cpu_visibility() -> TestResult {
+    // The BSP stores a value into a static `SEED` atomic, sends
+    // SGI to the AP. The AP's handler reads SEED and stores
+    // SEED^MAGIC into RESULT. The BSP polls RESULT and verifies
+    // the AP saw its store.
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_interrupts::aarch64::sgi;
+    use narf_lib::smp;
+
+    if !smp::is_online(1) { return TestResult::Skip("AP CPU 1 offline"); }
+
+    static SEED:   AtomicU64 = AtomicU64::new(0);
+    static RESULT: AtomicU64 = AtomicU64::new(0);
+    const MAGIC:   u64       = 0xDEAD_BEEF_F00D_CAFE;
+    const INTID:   u8        = 5;
+
+    fn ap_handler() {
+        let s = SEED.load(Ordering::Acquire);
+        RESULT.store(s ^ MAGIC, Ordering::Release);
+    }
+
+    sgi::set_handler(INTID, ap_handler);
+    let seed: u64 = 0x0123_4567_89AB_CDEF;
+    SEED.store(seed, Ordering::Release);
+    RESULT.store(0, Ordering::Release);
+
+    // SAFETY: GICv3 is up; AP is online with handlers installed.
+    unsafe { sgi::send_to_cpu_aff(INTID, 1); }
+
+    let start = narf_time::Instant::now();
+    while narf_time::Instant::now().cycles_since(start) < 5_000_000 {
+        let r = RESULT.load(Ordering::Acquire);
+        if r != 0 {
+            sgi::clear_handler(INTID);
+            return if r == seed ^ MAGIC {
+                TestResult::Pass
+            } else {
+                TestResult::Fail("AP saw stale SEED — memory ordering broken")
+            };
+        }
+        core::hint::spin_loop();
+    }
+    sgi::clear_handler(INTID);
+    TestResult::Fail("AP handler didn't store RESULT")
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test!(smoke_smp_aarch64_cross_cpu_visibility);
+
+#[cfg(target_arch = "aarch64")]
 fn smoke_smp_aarch64_dtb_count() -> TestResult {
     // QEMU virt -smp 1 (default) reports 1 CPU. The number bumps
     // when xtask switches to `-smp N`.

@@ -31,6 +31,31 @@ pub const SGI_PANIC_HALT:     u8 = 2;
 static RX_COUNT: [[AtomicU64; 16]; narf_lib::percpu::MAX_CPUS] =
     [const { [const { AtomicU64::new(0) }; 16] }; narf_lib::percpu::MAX_CPUS];
 
+/// Per-INTID SGI handler. The handler runs in IRQ context on the
+/// receiving CPU after the trap path has read ICC_IAR1_EL1; it
+/// runs *before* the EOI write so handler-side fences land while
+/// the IRQ is still active.
+pub type SgiHandler = fn();
+
+/// Per-INTID handler table. A `None` slot just bumps the receive
+/// counter; a `Some(fn)` runs the handler additionally.
+static HANDLERS: [core::sync::atomic::AtomicUsize; 16] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; 16];
+
+/// Install a handler for the given SGI INTID. Replaces any prior
+/// handler. `intid` is bounded 0..16.
+pub fn set_handler(intid: u8, handler: SgiHandler) {
+    let i = (intid as usize).min(15);
+    HANDLERS[i].store(handler as usize, Ordering::Release);
+}
+
+/// Clear the handler for `intid`. Subsequent SGI deliveries only
+/// bump the receive counter.
+pub fn clear_handler(intid: u8) {
+    let i = (intid as usize).min(15);
+    HANDLERS[i].store(0, Ordering::Release);
+}
+
 /// Snapshot of an SGI's per-CPU receive count.
 pub fn rx_count(cpu: u32, intid: u8) -> u64 {
     let cpu_i = (cpu as usize).min(narf_lib::percpu::MAX_CPUS - 1);
@@ -39,13 +64,20 @@ pub fn rx_count(cpu: u32, intid: u8) -> u64 {
 }
 
 /// Called by the trap path when an SGI lands. Bumps the per-CPU
-/// counter for `intid`, then optional handler dispatch (TODO once
-/// reschedule + TLB shootdown handlers land).
+/// counter + dispatches to the per-INTID handler when one is
+/// installed.
 #[inline]
 pub fn on_sgi(intid: u8) {
     let cpu = narf_lib::percpu::current_cpu();
     let i = (intid as usize).min(15);
     RX_COUNT[cpu][i].fetch_add(1, Ordering::Relaxed);
+    let h = HANDLERS[i].load(Ordering::Acquire);
+    if h != 0 {
+        // SAFETY: stored as `SgiHandler as usize`; round-trip back
+        // to the function pointer is sound when `h != 0`.
+        let f: SgiHandler = unsafe { core::mem::transmute(h) };
+        f();
+    }
 }
 
 /// Send an SGI to a single CPU identified by its MPIDR affinity.
