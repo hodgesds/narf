@@ -962,6 +962,67 @@ fn sys_pwrite64(ctx: &mut dyn TrapContext) {
     }
 }
 
+// ── Fallocate — preallocate file space ─────────────────────────────
+//
+// Linux fallocate(2) modes we honour:
+//   - 0 (default)              : ensure file is >= offset + len.
+//   - FALLOC_FL_ZERO_RANGE 0x10: zero the given range; extend
+//                                the file if it ends before
+//                                offset + len.
+// Other modes (KEEP_SIZE, PUNCH_HOLE, COLLAPSE_RANGE, ...) are
+// rejected — MemFs has no hole-tracking and the validate harness
+// doesn't exercise them.
+
+const FALLOC_FL_ZERO_RANGE: u64 = 0x10;
+
+fn sys_fallocate(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let fd     = args.arg0 as u32;
+    let mode   = args.arg1;
+    let offset = args.arg2;
+    let len    = args.arg3;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+
+    if mode != 0 && mode != FALLOC_FL_ZERO_RANGE {
+        ctx.set_return(fail);
+        return;
+    }
+    let target_end = offset.saturating_add(len);
+    let task = current_task_id();
+    let outcome = fd::with_table(task, |t| {
+        let entry = t.get(fd)?;
+        let ops = entry.ops.clone();
+        let cur_size = ops.stat().size;
+        // Always ensure size >= offset + len. truncate handles
+        // grow + zero-fill.
+        if target_end > cur_size {
+            if ops.truncate(target_end).is_err() {
+                return Some(false);
+            }
+        }
+        if mode == FALLOC_FL_ZERO_RANGE && len > 0 && offset < cur_size {
+            // Zero existing bytes in [offset, min(target_end, old size)].
+            // We do this in 4-KiB chunks of zeros via a fresh write.
+            let zero_end = core::cmp::min(target_end, cur_size);
+            let mut cur = offset;
+            let chunk = [0u8; 4096];
+            while cur < zero_end {
+                let span = core::cmp::min(zero_end - cur, chunk.len() as u64) as usize;
+                let n = poll_once(ops.write(cur, &chunk[..span]))
+                    .and_then(|r| r.ok())
+                    .unwrap_or(0);
+                if n == 0 { break; }
+                cur += n as u64;
+            }
+        }
+        Some(true)
+    });
+    match outcome {
+        Some(Some(true)) => ctx.set_return(SyscallReturn::ok(0)),
+        _                => ctx.set_return(fail),
+    }
+}
+
 // ── Fsync / Fdatasync — flush stubs ────────────────────────────────
 //
 // NARF's filesystems are in-memory; there's nothing to flush. We
@@ -3110,6 +3171,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     // Fdatasync shares fsync's body — both are structural no-ops.
     table.install_raw(Syscall::Fdatasync, "fdatasync", RawFnHandler(sys_fsync));
     table.install_raw(Syscall::Pipe2,     "pipe2",     RawFnHandler(sys_pipe2));
+    table.install_raw(Syscall::Fallocate, "fallocate", RawFnHandler(sys_fallocate));
 
     // Tier-2 cwd state + nanosleep wired into the table. Sleep
     // already replaced the noop_ok stub above.

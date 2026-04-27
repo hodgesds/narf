@@ -12881,3 +12881,80 @@ fn smoke_userspace_prctl_name_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_userspace_prctl_name_round_trip);
+
+fn smoke_userspace_fallocate_extends_and_zero_ranges_memfile() -> TestResult {
+    use core::pin::Pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use narf_filesystem::{
+        bootstrap_mount_authority, registry, MemFs,
+    };
+
+    fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
+        fn raw_waker() -> RawWaker {
+            unsafe fn no_clone(_: *const ()) -> RawWaker { raw_waker() }
+            unsafe fn no_op(_: *const ()) {}
+            const VTAB: RawWakerVTable = RawWakerVTable::new(
+                no_clone, no_op, no_op, no_op,
+            );
+            RawWaker::new(core::ptr::null(), &VTAB)
+        }
+        let waker = unsafe { Waker::from_raw(raw_waker()) };
+        let mut cx = Context::from_waker(&waker);
+        let pinned = unsafe { Pin::new_unchecked(&mut fut) };
+        match pinned.poll(&mut cx) {
+            Poll::Ready(v) => Some(v),
+            Poll::Pending  => None,
+        }
+    }
+
+    let auth = bootstrap_mount_authority();
+    let _ = registry().mount(&auth, "/falloc", MemFs::with_seeds(
+        "falloc-test", &[("f", b"abcdefghij")],   // 10 bytes
+    ));
+    let ops = registry().resolve_absolute("/falloc/f", |fs, rel| {
+        narf_filesystem::resolve(fs.root(), rel).ok()
+    }).flatten();
+    let ops = match ops {
+        Some(o) => o,
+        None    => return TestResult::Fail("resolve /falloc/f failed"),
+    };
+
+    // Direct trait round-trip — the syscall path adds nothing
+    // beyond fd-table indirection and the smoke for that already
+    // exists in the ftruncate test.
+    if ops.truncate(20).is_err() {
+        return TestResult::Fail("baseline truncate failed");
+    }
+    if ops.stat().size != 20 {
+        return TestResult::Fail("size after truncate(20) != 20");
+    }
+    let mut buf = [0xFFu8; 20];
+    let n = match poll_once(ops.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("read post-truncate failed"),
+    };
+    // First 10 bytes preserved; tail zero from the grow.
+    if n != 20 || &buf[0..10] != b"abcdefghij" || buf[10..20].iter().any(|&b| b != 0) {
+        return TestResult::Fail("post-truncate(20) contents wrong");
+    }
+
+    // Now exercise FALLOC_FL_ZERO_RANGE in-place: zero bytes
+    // [3..7] of the file. The handler writes zeros; equivalent
+    // to writing four 0u8 bytes at offset 3.
+    let zeros = [0u8; 4];
+    let written = match poll_once(ops.write(3, &zeros)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("write zeros failed"),
+    };
+    if written != 4 {
+        return TestResult::Fail("zero-range write didn't write 4 bytes");
+    }
+    let mut buf2 = [0xAAu8; 20];
+    let _ = poll_once(ops.read(0, &mut buf2));
+    if &buf2[..3] != b"abc" || &buf2[3..7] != &[0; 4] || &buf2[7..10] != b"hij" {
+        return TestResult::Fail("zero-range did not zero [3..7]");
+    }
+
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_fallocate_extends_and_zero_ranges_memfile);

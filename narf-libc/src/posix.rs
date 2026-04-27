@@ -212,6 +212,39 @@ pub unsafe extern "C" fn ftruncate(fd: c_int, len: off_t) -> c_int {
     narf_user_runtime::ftruncate(fd as u32, len as u64)
 }
 
+pub const FALLOC_FL_KEEP_SIZE:      c_int = 0x01;
+pub const FALLOC_FL_PUNCH_HOLE:     c_int = 0x02;
+pub const FALLOC_FL_ZERO_RANGE:     c_int = 0x10;
+pub const FALLOC_FL_COLLAPSE_RANGE: c_int = 0x08;
+
+/// `fallocate(fd, mode, offset, len)` — Linux preallocation /
+/// hole-management. NARF honours mode 0 (extend + zero-fill) and
+/// FALLOC_FL_ZERO_RANGE; other modes return -1.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fallocate(
+    fd:     c_int,
+    mode:   c_int,
+    offset: off_t,
+    len:    off_t,
+) -> c_int {
+    if fd < 0 || offset < 0 || len < 0 { return -1; }
+    narf_user_runtime::fallocate(fd as u32, mode as u32, offset as u64, len as u64)
+}
+
+/// `posix_fallocate(fd, offset, len)` — POSIX-shaped flavour
+/// (mode = 0). Returns 0 on success or a positive errno value
+/// on error (POSIX inverts the convention).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn posix_fallocate(
+    fd:     c_int,
+    offset: off_t,
+    len:    off_t,
+) -> c_int {
+    if fd < 0 || offset < 0 || len < 0 { return 22; }   // EINVAL
+    let r = narf_user_runtime::fallocate(fd as u32, 0, offset as u64, len as u64);
+    if r == -1 { 5 } else { 0 }   // EIO on failure
+}
+
 /// `readlink(path, buf, bufsiz)` — read a symlink target. NARF
 /// doesn't ship a symlink implementation, so this always returns
 /// -1; consumers fall back accordingly.

@@ -185,6 +185,15 @@ pub enum Syscall {
     /// flush distinction.
     Fdatasync    = 124,
 
+    /// `arg0 = fd`, `arg1 = mode`, `arg2 = offset`, `arg3 = len`
+    /// (all u64). Linux fallocate(2): preallocate file space.
+    /// Honoured modes: 0 (default — extend the file to at least
+    /// offset + len bytes, zero-fill new tail) and FALLOC_FL_
+    /// ZERO_RANGE = 0x10 (zero the given range without changing
+    /// size unless extending). Returns 0 on success, -1 on bad fd
+    /// or read-only FS.
+    Fallocate    = 126,
+
     /// `arg0 = pipefd_out_ptr`, `arg1 = flags`. Linux pipe2(2):
     /// pipe + atomic flag set. Honoured flag: O_CLOEXEC (bit
     /// 0x80000) — both ends get FD_CLOEXEC stamped at install
@@ -530,6 +539,7 @@ impl Syscall {
             123 => Syscall::Fsync,
             124 => Syscall::Fdatasync,
             125 => Syscall::Pipe2,
+            126 => Syscall::Fallocate,
             120 => Syscall::Mmap,
             121 => Syscall::Munmap,
             130 => Syscall::RingKick,

@@ -67,6 +67,7 @@ pub const SYS_PWRITE64:       u64 = 122;
 pub const SYS_FSYNC:          u64 = 123;
 pub const SYS_FDATASYNC:      u64 = 124;
 pub const SYS_PIPE2:          u64 = 125;
+pub const SYS_FALLOCATE:      u64 = 126;
 pub const SYS_GETHOSTNAME:    u64 = 146;
 pub const SYS_SETHOSTNAME:    u64 = 147;
 pub const SYS_GETRLIMIT:      u64 = 148;
@@ -1080,6 +1081,18 @@ pub fn pipe() -> Option<(u32, u32)> {
     } else {
         Some((fds[0] as u32, fds[1] as u32))
     }
+}
+
+/// `fallocate(fd, mode, offset, len)` — preallocate file space.
+/// Mode 0 ensures the file is at least `offset + len` bytes.
+/// `FALLOC_FL_ZERO_RANGE` (0x10) additionally zeros the range.
+#[inline]
+pub fn fallocate(fd: u32, mode: u32, offset: u64, len: u64) -> i32 {
+    // SAFETY: SYS_FALLOCATE signature: (fd, mode, offset, len).
+    let r = unsafe {
+        syscall4(SYS_FALLOCATE, fd as u64, mode as u64, offset, len)
+    };
+    if r as i64 == -1 { -1 } else { 0 }
 }
 
 /// `pipe2(flags)` — pipe + atomic flag set. `O_CLOEXEC` (bit
