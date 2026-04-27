@@ -5244,6 +5244,62 @@ fn smoke_nvme_probe_stub_surfaces_not_implemented() -> TestResult {
 }
 kernel_test!(smoke_nvme_probe_stub_surfaces_not_implemented);
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_nvme_admin_identify_controller() -> TestResult {
+    // End-to-end NVMe admin-queue bring-up against the QEMU NVMe
+    // device that xtask attaches on x86_64 (vendor 0x1B36 / device
+    // 0x0010). Walks the bus registry, hands the device to
+    // `Controller::bring_up`, and asserts IDENTIFY CONTROLLER came
+    // back with QEMU's well-known model string ("QEMU NVMe Ctrl"
+    // ASCII-padded).
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_drivers_nvme::Controller;
+    // SAFETY: ECAM is identity-mapped; bus::init is idempotent.
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+
+    let devs = devices();
+    let nvme_dev = devs.iter().find(|d| {
+        matches!(d.kind, BusKind::Pcie { .. })
+            && d.id.vendor == 0x1B36
+            && d.id.device == 0x0010
+    });
+    let Some(dev) = nvme_dev.copied() else {
+        return TestResult::Skip("no QEMU NVMe controller in this flavour");
+    };
+
+    let authority = bootstrap_registry_authority();
+    let (_handle, dev_cap) = match claim_device_cap(&authority, dev.addr) {
+        Ok(ok)  => ok,
+        Err(_)  => return TestResult::Fail("claim_device_cap failed for NVMe"),
+    };
+
+    let mut ctrl = Controller::from_device(dev);
+    if let Err(e) = ctrl.bring_up(&dev_cap) {
+        let _ = e;
+        return TestResult::Fail("Controller::bring_up failed");
+    }
+    if !ctrl.is_ready() {
+        return TestResult::Fail("controller didn't transition to ready");
+    }
+    let id = match ctrl.identify() {
+        Some(i) => i,
+        None    => return TestResult::Fail("identify snapshot missing"),
+    };
+    // Identify VID matches the PCIe vendor id (QEMU 0x1B36 = Red Hat).
+    if id.vid != 0x1B36 {
+        return TestResult::Fail("identify VID mismatch");
+    }
+    // Model number is ASCII space-padded; first 4 chars on QEMU NVMe
+    // are "QEMU".
+    if &id.mn[..4] != b"QEMU" {
+        return TestResult::Fail("identify MN does not start with 'QEMU'");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_nvme_admin_identify_controller);
+
 fn smoke_drivers_net_nic_model_ids() -> TestResult {
     use narf_drivers_net::{NicCaps, NicModel};
 

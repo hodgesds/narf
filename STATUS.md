@@ -455,9 +455,20 @@ The critical-path Stage-2 items remaining:
    (`bus::bar::{read_bar, map_bar, MmioRegion}`), and LAPIC-directed
    MSI-X programming (`MsixTable::{program_vector, enable}`) on
    x86_64. aarch64 `program_vector` returns `Unsupported` until the
-   GIC ITS doorbell path lands. NVMe admin-queue bring-up is the
-   natural next step now that drivers can map BARs and request
-   MSI-directed IRQs.
+   GIC ITS doorbell path lands.
+
+   NVMe admin-queue bring-up landed on top: `Controller::bring_up`
+   maps BAR0, decodes CAP/VS, resets the controller, allocates the
+   ASQ + ACQ via `narf_io::alloc_coherent`, programs `AQA/ASQ/ACQ`,
+   re-enables `CC.EN`, polls `CSTS.RDY=1`, and issues IDENTIFY
+   CONTROLLER (CNS=1) — completion is observed via the CQE phase-tag
+   flip and acknowledged by ringing the head doorbell. xtask
+   attaches a QEMU `nvme,drive=nvm0,serial=narf` device on x86_64
+   backed by `target/narf-nvme.img`. End-to-end guarded by
+   `smoke_nvme_admin_identify_controller`, which asserts the
+   IDENTIFY response carries QEMU's vendor id (0x1B36) and model
+   prefix (`"QEMU"`). Per-CPU I/O queue pairs + real MSI-X-driven
+   completions land next.
 
 2. **Higher-half kernel relocation**. Conventional -2 GiB layout.
    Touches the linker script, boot.S (far-jump-to-virtual after

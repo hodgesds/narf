@@ -91,16 +91,31 @@ impl Arch {
             // x86_64 via PVH direct-kernel load. `isa-debug-exit` lets the
             // guest exit QEMU by writing to I/O port 0xF4 (status = value<<1 | 1).
             // `-no-reboot` stops QEMU on triple-fault instead of infinite resets.
-            Arch::X86_64 => vec![
-                "-machine".into(), "q35".into(),
-                "-cpu".into(),     "max".into(),
-                "-m".into(),       "256M".into(),
-                "-serial".into(),  "stdio".into(),
-                "-display".into(), "none".into(),
-                "-no-reboot".into(),
-                "-device".into(),  "isa-debug-exit,iobase=0xf4,iosize=0x04".into(),
-                "-kernel".into(),  kernel,
-            ],
+            //
+            // NVMe attachment: an `nvme` device backed by a small raw
+            // image gives the kernel a real PCIe controller to drive
+            // (vendor 0x1b36, device 0x0010 — QEMU's standard NVMe
+            // ID). The image is created lazily by `nvme_image_path`
+            // before launch; a 1 MiB blank file is plenty for the
+            // admin-queue bring-up test and any future single-LBA
+            // round-trip smoke.
+            Arch::X86_64 => {
+                let img = nvme_image_path()
+                    .display().to_string();
+                vec![
+                    "-machine".into(), "q35".into(),
+                    "-cpu".into(),     "max".into(),
+                    "-m".into(),       "256M".into(),
+                    "-serial".into(),  "stdio".into(),
+                    "-display".into(), "none".into(),
+                    "-no-reboot".into(),
+                    "-device".into(),  "isa-debug-exit,iobase=0xf4,iosize=0x04".into(),
+                    "-drive".into(),
+                    format!("if=none,id=nvm0,format=raw,file={img}"),
+                    "-device".into(),  "nvme,drive=nvm0,serial=narf".into(),
+                    "-kernel".into(),  kernel,
+                ]
+            },
             // aarch64 virt machine with GICv3 (system-register interface
             // at ICC_*_EL1). Default QEMU virt is GICv2 (MMIO); forcing
             // GICv3 gives us parity with x86_64's x2APIC programming
@@ -122,6 +137,25 @@ impl Arch {
             ],
         }
     }
+}
+
+/// Path to the NVMe-backing raw image that x86_64 QEMU attaches to
+/// the emulated NVMe controller. Created on demand at 1 MiB. Stored
+/// in `target/` so a `cargo clean` removes it; persists across runs
+/// to skip the write on subsequent boots.
+fn nvme_image_path() -> PathBuf {
+    let root = workspace_root().unwrap_or_else(|_| PathBuf::from("."));
+    let path = root.join("target").join("narf-nvme.img");
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // 1 MiB of zeros — small enough that the file isn't a
+        // commit-noise risk and large enough that QEMU NVMe accepts
+        // it as a non-empty namespace.
+        let _ = std::fs::write(&path, vec![0u8; 1024 * 1024]);
+    }
+    path
 }
 
 fn workspace_root() -> Result<PathBuf> {
