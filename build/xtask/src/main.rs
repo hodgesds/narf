@@ -140,6 +140,13 @@ impl Arch {
                     // an FD lock with virtio-net's backend.
                     "-netdev".into(),  "user,id=n1".into(),
                     "-device".into(),  "e1000,netdev=n1".into(),
+                    // virtio-rng-pci with /dev/urandom as the
+                    // backend. QEMU defers to the bound `-object
+                    // rng-*` for entropy.
+                    "-object".into(),
+                    "rng-random,id=rng0,filename=/dev/urandom".into(),
+                    "-device".into(),
+                    "virtio-rng-pci,rng=rng0,disable-legacy=on,disable-modern=off".into(),
                     "-kernel".into(),  kernel,
                 ]
             },
@@ -187,6 +194,10 @@ impl Arch {
                 // e1000 NIC alongside virtio-net.
                 "-netdev".into(),  "user,id=n1".into(),
                 "-device".into(),  "e1000,netdev=n1".into(),
+                "-object".into(),
+                "rng-random,id=rng0,filename=/dev/urandom".into(),
+                "-device".into(),
+                "virtio-rng-pci,rng=rng0,disable-legacy=on,disable-modern=off".into(),
                 // QEMU's `-kernel <elf>` path on aarch64 does not
                 // load a `-dtb` blob into RAM (the DTB-loading code
                 // path is gated on `is_linux=1`). Instead we
@@ -249,6 +260,8 @@ fn qemu_virt_dtb_path() -> PathBuf {
             .arg("-device").arg("virtio-net-pci,netdev=n0")
             .arg("-netdev").arg("user,id=n1")
             .arg("-device").arg("e1000,netdev=n1")
+            .arg("-object").arg("rng-random,id=rng0,filename=/dev/urandom")
+            .arg("-device").arg("virtio-rng-pci,rng=rng0")
             .status();
     }
     path

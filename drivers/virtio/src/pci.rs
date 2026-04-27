@@ -98,6 +98,10 @@ pub enum VirtioPciError {
     NoQueues,
     /// `queue_size` / `queue_num_max` returned 0.
     QueueTooSmall,
+    /// `add_buffer` couldn't fit the descriptor chain.
+    AddBufferFailed,
+    /// Polled completion never observed (timeout).
+    CompletionTimeout,
 }
 
 /// Walk the standard cap list looking for the four virtio caps and

@@ -14,6 +14,7 @@ pub mod blk_pci;
 pub mod net_pci;
 pub mod pci;
 pub mod queue;
+pub mod rng_pci;
 pub mod class_blk;
 
 use alloc::boxed::Box;

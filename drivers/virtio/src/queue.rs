@@ -183,6 +183,13 @@ impl Virtqueue {
         Some(head)
     }
 
+    /// Read the current used_idx without consuming any used-ring
+    /// entry. Diagnostic; drivers normally use `poll_used`.
+    pub fn used_idx_snapshot(&self) -> u16 {
+        // SAFETY: used ring is identity-mapped DMA; offset +2 = idx.
+        unsafe { core::ptr::read_volatile(self.used_base().add(1)) }
+    }
+
     pub fn poll_used(&mut self) -> Option<(u32, u32)> {
         // Used ring layout: flags(u16), idx(u16), ring[N](VirtqUsedElem), avail_event(u16)
         let used_idx = unsafe { *(self.used_base().add(1)) };
