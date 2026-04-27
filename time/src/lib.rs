@@ -17,7 +17,7 @@
 pub mod wall;
 pub use wall::{
     begin_leap_smear, monotonic_ns, now_wall, set_cycles_per_ns,
-    set_wall_offset, WallClock, WallError, WallInstant,
+    set_wall_offset, set_wall_offset_uncapped, WallClock, WallError, WallInstant,
 };
 
 use core::future::Future;

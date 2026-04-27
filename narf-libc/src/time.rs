@@ -25,8 +25,8 @@ pub struct timeval {
 }
 
 /// `clock_gettime(clk_id, *mut timespec)`. Returns 0 on success,
-/// -1 if `tp` is null. `clk_id` is currently ignored; all clocks
-/// alias to the kernel monotonic counter.
+/// -1 if `tp` is null. `clk_id = 0` reads CLOCK_REALTIME (wall),
+/// `clk_id = 1` reads CLOCK_MONOTONIC. Other ids return -1.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clock_gettime(clk_id: i32, tp: *mut timespec) -> i32 {
     if tp.is_null() {
@@ -39,6 +39,35 @@ pub unsafe extern "C" fn clock_gettime(clk_id: i32, tp: *mut timespec) -> i32 {
         (*tp).tv_nsec = nsec;
     }
     0
+}
+
+/// `clock_settime(clk_id, *const timespec)` — set the wall clock
+/// for CLOCK_REALTIME (clk_id = 0). Other clock ids return -1.
+///
+/// # Safety
+/// `tp` must be a valid `*const timespec`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn clock_settime(clk_id: i32, tp: *const timespec) -> i32 {
+    if tp.is_null() { return -1; }
+    // SAFETY: caller-asserted readable timespec.
+    let ts = unsafe { *tp };
+    narf_user_runtime::clock_settime(clk_id as u32, ts.tv_sec, ts.tv_nsec)
+}
+
+/// `settimeofday(*const timeval, *mut c_void)` — POSIX-deprecated
+/// wall-time setter. Routes through clock_settime(CLOCK_REALTIME).
+///
+/// # Safety
+/// `tv`, when non-null, must be a valid `*const timeval`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn settimeofday(
+    tv: *const timeval,
+    _tz: *mut core::ffi::c_void,
+) -> i32 {
+    if tv.is_null() { return -1; }
+    // SAFETY: caller-asserted readable timeval.
+    let v = unsafe { *tv };
+    narf_user_runtime::clock_settime(0, v.tv_sec, v.tv_usec * 1_000)
 }
 
 /// `time(*mut time_t)`. Returns the current second count and, if

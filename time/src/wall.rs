@@ -111,6 +111,15 @@ pub fn set_wall_offset(cap: &Cap<WallClock, Write>, offset_ns: i64) -> Result<()
     Ok(())
 }
 
+/// Stage-4 helper: set the wall offset without going through the
+/// `Cap<WallClock, Write>` gate. Used by `sys_clock_settime` so a
+/// userspace daemon can initialise wall time before the cap-table
+/// surface is wired into the syscall path. Removed once
+/// `bootstrap_wall_clock_authority` lands.
+pub fn set_wall_offset_uncapped(offset_ns: i64) {
+    WALL_OFFSET_NS.store(offset_ns, Ordering::Release);
+}
+
 /// Begin a leap-smear over `window_ns` — gradually fold a `delta_ns`
 /// correction into the wall offset instead of stepping. Negative
 /// deltas smear backwards; zero is rejected because it's nonsense.

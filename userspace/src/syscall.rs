@@ -368,6 +368,14 @@ pub enum Syscall {
     /// Returns 0 on success.
     ClockGetTime = 151,
 
+    /// `arg0 = clock_id`, `arg1 = timespec_ptr` (read). Linux
+    /// clock_settime(2): set the wall clock for CLOCK_REALTIME
+    /// (clock_id = 0). NARF computes the monotonic→wall offset
+    /// from the requested wall + current monotonic, then stores
+    /// it via `time::set_wall_offset_uncapped`. Other clock_ids
+    /// (CLOCK_MONOTONIC = 1, CLOCK_BOOTTIME = 7, ...) return -1.
+    ClockSetTime = 176,
+
     /// Install a signal-handler stub. `arg0 = signum`,
     /// `arg1 = handler-vaddr` (0 to clear), `arg2 = old-out-ptr`
     /// (may be null). The recorded handler is fired on the
@@ -570,6 +578,7 @@ impl Syscall {
             168 => Syscall::Gettid,
             169 => Syscall::Prctl,
             175 => Syscall::Tgkill,
+            176 => Syscall::ClockSetTime,
             156 => Syscall::Getpriority,
             157 => Syscall::Setpriority,
             158 => Syscall::Times,

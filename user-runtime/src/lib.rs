@@ -86,6 +86,7 @@ pub const SYS_TIMES:          u64 = 158;
 pub const SYS_GETRUSAGE:      u64 = 159;
 pub const SYS_BRK:            u64 = 150;
 pub const SYS_CLOCK_GETTIME:  u64 = 151;
+pub const SYS_CLOCK_SETTIME:  u64 = 176;
 pub const SYS_SIGACTION:      u64 = 152;
 pub const SYS_KILL:           u64 = 153;
 pub const SYS_SIGPROCMASK:    u64 = 154;
@@ -1191,6 +1192,19 @@ pub fn clock_gettime(clock_id: u32) -> (i64, i64) {
     // syscall.
     let _ = unsafe { syscall2(SYS_CLOCK_GETTIME, clock_id as u64, ts.as_mut_ptr() as u64) };
     (ts[0], ts[1])
+}
+
+/// `clock_settime(clock_id, sec, nsec)` — set the wall clock when
+/// `clock_id == CLOCK_REALTIME` (0). Returns 0 on success, -1
+/// when the clock isn't settable or the timespec is malformed.
+#[inline]
+pub fn clock_settime(clock_id: u32, sec: i64, nsec: i64) -> i32 {
+    let ts: [i64; 2] = [sec, nsec];
+    // SAFETY: SYS_CLOCK_SETTIME signature: (clock_id, timespec_ptr).
+    let r = unsafe {
+        syscall2(SYS_CLOCK_SETTIME, clock_id as u64, ts.as_ptr() as u64)
+    };
+    if r as i64 == -1 { -1 } else { 0 }
 }
 
 /// Install or clear a signal handler. Returns the prior handler

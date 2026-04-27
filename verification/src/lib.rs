@@ -13075,3 +13075,95 @@ fn smoke_userspace_copy_file_range_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_userspace_copy_file_range_round_trip);
+
+fn smoke_userspace_clock_settime_pushes_wall_offset() -> TestResult {
+    use narf_userspace::{install_core_syscalls, install_global,
+                         kernel_syscall_entry, syscall::__test_clear_global,
+                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+                         TrapContext};
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Reset wall offset to a known baseline: target = 1.7 billion
+    // seconds (≈ Nov 2023).
+    let target_sec: i64 = 1_700_000_000;
+    let target_nsec: i64 = 0;
+    let ts: [i64; 2] = [target_sec, target_nsec];
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 0,                            // CLOCK_REALTIME
+            arg1: ts.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::ClockSetTime.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+        return TestResult::Fail("clock_settime did not return OK");
+    }
+
+    // Read back via clock_gettime(REALTIME). Allow a 2-second
+    // window for monotonic-clock drift between the set and the get.
+    let mut out = [0i64; 2];
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 0,
+            arg1: out.as_mut_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::ClockGetTime.raw(), &mut ctx);
+    let got_sec = out[0];
+    if got_sec < target_sec || got_sec > target_sec + 2 {
+        return TestResult::Fail("clock_gettime did not reflect the new wall offset");
+    }
+
+    // CLOCK_MONOTONIC (1) is not settable — expect -1.
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 1,
+            arg1: ts.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::ClockSetTime.raw(), &mut ctx);
+    let mono_rejected = matches!(
+        ctx.ret,
+        Some(r) if r.status == SyscallReturn::OK && r.value == (-1i64) as u64,
+    );
+    if !mono_rejected {
+        return TestResult::Fail("clock_settime(MONOTONIC) was not rejected");
+    }
+
+    // Reset wall offset back to 0 so subsequent tests see normal
+    // behaviour. (Re-setting REALTIME to (current monotonic) leaves
+    // offset = 0.)
+    let cur_mono: u64 = narf_scheduler::narf_time::monotonic_ns();
+    let cur_sec  = (cur_mono / 1_000_000_000) as i64;
+    let cur_nsec = (cur_mono % 1_000_000_000) as i64;
+    let reset_ts: [i64; 2] = [cur_sec, cur_nsec];
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 0,
+            arg1: reset_ts.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::ClockSetTime.raw(), &mut ctx);
+
+    __test_clear_global();
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_clock_settime_pushes_wall_offset);

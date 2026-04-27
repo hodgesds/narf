@@ -2779,6 +2779,37 @@ fn sys_clock_gettime(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(0));
 }
 
+/// `sys_clock_settime(clock_id, *timespec)` — set CLOCK_REALTIME
+/// by computing the wall-offset from the requested (sec, nsec) and
+/// the current monotonic. Other clock_ids return -1.
+fn sys_clock_settime(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let id   = args.arg0;
+    let ts   = args.arg1 as *const i64;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if ts.is_null() || (ts as u64) & 0x7 != 0 {
+        ctx.set_return(fail);
+        return;
+    }
+    if id != CLOCK_REALTIME {
+        // CLOCK_MONOTONIC and friends are not settable.
+        ctx.set_return(fail);
+        return;
+    }
+    // SAFETY: caller-supplied readable `timespec`.
+    let sec  = unsafe { core::ptr::read_volatile(ts) };
+    let nsec = unsafe { core::ptr::read_volatile(ts.add(1)) };
+    if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
+        ctx.set_return(fail);
+        return;
+    }
+    let target_ns = (sec as i128) * 1_000_000_000 + (nsec as i128);
+    let mono_ns = narf_scheduler::narf_time::monotonic_ns() as i128;
+    let offset_ns = (target_ns - mono_ns) as i64;
+    narf_scheduler::narf_time::set_wall_offset_uncapped(offset_ns);
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
 // ── Signal delivery: pending + mask + delivery hook ────────────────
 //
 // Stage-4 round 2: kill / sigprocmask + a hook on the trap-return
@@ -3231,6 +3262,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Sleep,    "sleep",    RawFnHandler(sys_sleep));
     table.install_raw(Syscall::Brk,          "brk",           RawFnHandler(sys_brk));
     table.install_raw(Syscall::ClockGetTime, "clock_gettime", RawFnHandler(sys_clock_gettime));
+    table.install_raw(Syscall::ClockSetTime, "clock_settime", RawFnHandler(sys_clock_settime));
     table.install_raw(Syscall::Sigaction,    "sigaction",     RawFnHandler(sys_sigaction));
     table.install_raw(Syscall::Kill,         "kill",          RawFnHandler(sys_kill));
     table.install_raw(Syscall::Tgkill,       "tgkill",        RawFnHandler(sys_tgkill));
