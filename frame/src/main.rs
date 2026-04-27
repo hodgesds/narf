@@ -41,6 +41,20 @@ mod aarch64;
 ///   construction).
 /// - MMU / TLB / interrupt controller are in the bootloader-documented
 ///   state.
+// ── NUMA topology hooks for narf-memory's frame allocator ──────────
+//
+// `narf-memory` declares these as `extern "Rust"` so it doesn't take
+// a circular dependency on `narf-acpi`. We bridge here, since
+// `narf-frame` is the only crate that links both.
+#[unsafe(no_mangle)]
+pub fn narf_phys_to_node(addr: u64) -> u32 {
+    narf_acpi::memory_node(addr).unwrap_or(0)
+}
+#[unsafe(no_mangle)]
+pub fn narf_cpu_to_node(cpu: u32) -> u32 {
+    narf_acpi::cpu_node(cpu).unwrap_or(0)
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
     // Step 1: bring up the early serial console before doing anything else,
@@ -294,6 +308,21 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                 let _ = writeln!(console::Writer,
                                     "  acpi: SRAT parsed, {} entries, {} NUMA node(s)",
                                     n, narf_acpi::node_count());
+                                // Redistribute the frame allocator's
+                                // free pool by NUMA node now that
+                                // memory_node() is populated. Subsequent
+                                // alloc_frame() calls honour locality.
+                                narf_memory::rebalance_to_topology();
+                                let n_nodes = narf_acpi::node_count() as usize;
+                                let mut totals = 0usize;
+                                for i in 0..n_nodes.min(narf_memory::FRAME_MAX_NUMA_NODES) {
+                                    let f = narf_memory::node_free(i);
+                                    totals += f;
+                                    let _ = writeln!(console::Writer,
+                                        "    node {}: {} free frames", i, f);
+                                }
+                                let _ = writeln!(console::Writer,
+                                    "  frames: NUMA-rebalanced ({} per-node total)", totals);
                             }
                             Err(e) => {
                                 let _ = writeln!(console::Writer,

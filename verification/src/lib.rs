@@ -7446,6 +7446,98 @@ fn smoke_acpi_mcfg_ecam_base() -> TestResult {
 kernel_test!(smoke_acpi_mcfg_ecam_base);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_frame_alloc_per_node_distribution() -> TestResult {
+    // After SRAT-driven rebalance, each NUMA node should hold a
+    // non-trivial slice of free frames. With QEMU's 2-node config
+    // (128 MiB each), both bins should be non-empty.
+    if !narf_memory::is_numa_aware() {
+        return TestResult::Fail("frame allocator not NUMA-rebalanced");
+    }
+    let n0 = narf_memory::node_free(0);
+    let n1 = narf_memory::node_free(1);
+    if n0 == 0 || n1 == 0 {
+        return TestResult::Fail("expected both nodes to hold free frames");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_frame_alloc_per_node_distribution);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_frame_alloc_on_node_returns_local() -> TestResult {
+    // alloc_frame_on(node) should return a frame whose physical
+    // address falls within `node`'s SRAT memory range. Re-parse
+    // SRAT first because synthetic-body tests earlier in the
+    // harness scrub the shared NUMA tables.
+    use narf_memory::{alloc_frame_on, free_frame};
+    if !narf_memory::is_numa_aware() {
+        return TestResult::Fail("frame allocator not NUMA-rebalanced");
+    }
+    let rsdp = match narf_acpi::cached_rsdp() {
+        Some(p) => p,
+        None    => return TestResult::Fail("no boot-time RSDP cached"),
+    };
+    // SAFETY: cached RSDP, validated at boot.
+    let _ = unsafe { narf_acpi::parse_srat(rsdp) };
+
+    for node in 0..2u32 {
+        let f = match alloc_frame_on(node as usize) {
+            Ok(f) => f,
+            Err(_) => return TestResult::Fail("alloc_frame_on failed"),
+        };
+        let addr = f.start_address().raw();
+        let observed = narf_acpi::memory_node(addr);
+        free_frame(f);
+        match observed {
+            Some(n) if n == node => continue,
+            Some(_) => return TestResult::Fail("alloc_frame_on returned wrong-node frame"),
+            None    => return TestResult::Fail("frame address not in any SRAT range"),
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_frame_alloc_on_node_returns_local);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_frame_free_routes_to_owning_node() -> TestResult {
+    // free_frame() must use the frame's physical address to choose
+    // the destination bin — not the current CPU's node. Allocate
+    // from node 1, free, then re-alloc from node 1 and confirm we
+    // got it back (cheap check; the bin was empty otherwise).
+    // Re-parse SRAT first — synthetic-body tests upstream may have
+    // scrubbed the shared NUMA tables.
+    use narf_memory::{alloc_frame_on, free_frame, node_free};
+    if !narf_memory::is_numa_aware() {
+        return TestResult::Fail("frame allocator not NUMA-rebalanced");
+    }
+    let rsdp = match narf_acpi::cached_rsdp() {
+        Some(p) => p,
+        None    => return TestResult::Fail("no boot-time RSDP cached"),
+    };
+    // SAFETY: cached RSDP, validated at boot.
+    let _ = unsafe { narf_acpi::parse_srat(rsdp) };
+
+    let before = node_free(1);
+    let f = match alloc_frame_on(1) {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("alloc_frame_on(1) failed"),
+    };
+    let after_alloc = node_free(1);
+    if after_alloc != before - 1 {
+        return TestResult::Fail("node-1 free count didn't decrement on alloc");
+    }
+    free_frame(f);
+    let after_free = node_free(1);
+    if after_free != before {
+        return TestResult::Fail("node-1 free count didn't restore on free");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_frame_free_routes_to_owning_node);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_acpi_hmat_latency_lookup() -> TestResult {
     // The xtask QEMU config publishes a 2x2 HMAT lat/bw matrix:
     // same-node latency 10 ns, cross-node 20 ns. Verify the parser
