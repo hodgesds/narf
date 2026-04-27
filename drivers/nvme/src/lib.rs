@@ -1033,10 +1033,26 @@ static CONTROLLER: IrqSafeSpinLock<Option<Controller>> =
 /// NVMe controller online (admin queue + IDENTIFY + I/O queue) and
 /// stashes it in `CONTROLLER`. Returns `BadDevice` on bring-up
 /// failure — caller logs + continues with the next device.
+///
+/// Idempotent: re-probing a device that's already set up just
+/// returns `Ok(())`. The kernel-test harness re-runs probe_all
+/// across smokes; resetting + re-bringing-up an already-running
+/// NVMe controller risks crossing CC.EN=0/1 state with queues held
+/// by the prior smoke (e.g. MSI-X-configured I/O queues are easier
+/// to leave alone than rewire). Once Stage-4 wires unbind +
+/// hot-plug, this guard goes away.
 pub fn probe(
     device: narf_bus::BusDevice,
     cap:    narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
 ) -> Result<(), narf_bus::ProbeError> {
+    if CONTROLLER.lock().is_some() {
+        // Already brought up — make sure the param slot still has
+        // something installed (test harness may have cleared it).
+        if !PARAMS.is_installed() {
+            PARAMS.install(NvmeParams { log_level: LogLevel::Info });
+        }
+        return Ok(());
+    }
     let mut ctrl = Controller::from_device(device);
     if ctrl.bring_up(&cap).is_err() {
         return Err(narf_bus::ProbeError::BadDevice);
@@ -1155,23 +1171,18 @@ pub static PARAMS: narf_drivers::ParamSlot<NvmeParams> =
 /// Register the NVMe driver with the bus-level match table. Trusted
 /// in-tree drivers call this from `frame::_start_rust` (or the
 /// kernel-test harness) before invoking `bus::probe_all_pci`.
+///
+/// Today only the exact QEMU NVMe vendor/device pair binds. A
+/// follow-up that adds `MatchKind::ClassSubclass { class: 0x01,
+/// subclass: 0x08 }` (PCI subclass 0x08 = NVM Express) can pick up
+/// real-silicon NVMe controllers without claiming SATA / virtio-blk
+/// devices that share the storage base class.
 pub fn register_pci_driver() {
     narf_bus::register_pci_driver(narf_bus::PciMatch {
         name: "nvme",
         kind: narf_bus::MatchKind::VendorDevice {
             vendor: QEMU_NVME_VENDOR,
             device: QEMU_NVME_DEVICE,
-        },
-        probe,
-    });
-    // Also register a class match so non-QEMU NVMe controllers pick
-    // up the same probe. Class match is lower specificity, so an
-    // exact-match entry (above) wins when both apply.
-    narf_bus::register_pci_driver(narf_bus::PciMatch {
-        name: "nvme-class",
-        kind: narf_bus::MatchKind::Class {
-            class: PCI_CLASS_STORAGE,
-            mask:  0xFF,
         },
         probe,
     });

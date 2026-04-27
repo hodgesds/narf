@@ -16,6 +16,7 @@ narf-lib          = { path = "../../lib" }
 narf-bus          = { path = "../../bus" }
 narf-drivers      = { path = "../" }
 narf-capabilities = { path = "../../capabilities" }
+narf-interrupts   = { path = "../../interrupts" }
 narf-memory       = { path = "../../memory" }
 narf-block        = { path = "../../block" }
 narf-io           = { path = "../../io" }

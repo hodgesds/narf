@@ -5686,8 +5686,8 @@ fn smoke_pci_probe_all_dispatches_nvme() -> TestResult {
     __reset_for_test();
     narf_drivers_nvme::register_pci_driver();
     let n_drivers = narf_bus::registered_pci_drivers().len();
-    if n_drivers != 2 {
-        return TestResult::Fail("nvme should register both vendor+class entries");
+    if n_drivers != 1 {
+        return TestResult::Fail("nvme should register exactly the vendor/device entry");
     }
 
     let authority = bootstrap_registry_authority();
@@ -6138,6 +6138,106 @@ fn smoke_virtio_blk_pci_read_sector() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_virtio_blk_pci_read_sector);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_virtio_blk_pci_write_then_read() -> TestResult {
+    // Write a recognisable pattern at sector 4 (well past the
+    // pre-seeded sector 0), read it back, verify.
+    use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_drivers_virtio::blk_pci;
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    if !devs.iter().any(|d|
+        matches!(&d.kind, BusKind::Pcie { .. })
+        && d.id.vendor == blk_pci::VIRTIO_BLK_PCI_VENDOR
+        && d.id.device == blk_pci::VIRTIO_BLK_PCI_DEVICE)
+    {
+        return TestResult::Skip("no virtio-blk-pci device");
+    }
+    __reset_for_test();
+    blk_pci::register_pci_driver();
+    let authority = bootstrap_registry_authority();
+    if probe_all_pci(&authority).is_err() {
+        return TestResult::Fail("probe_all_pci failed");
+    }
+    let mut payload = [0u8; 512];
+    for i in 0..512usize { payload[i] = (i as u8).wrapping_mul(0x5B) ^ 0xC3; }
+
+    let wrote = blk_pci::with_controller(|c| c.write_sector(4, &payload))
+        .map(|r| r.is_ok()).unwrap_or(false);
+    if !wrote { return TestResult::Fail("write_sector(4) failed"); }
+
+    let mut readback = [0u8; 512];
+    let read_ok = blk_pci::with_controller(|c| c.read_sector(4, &mut readback))
+        .map(|r| r.is_ok()).unwrap_or(false);
+    if !read_ok { return TestResult::Fail("read_sector(4) failed"); }
+    if readback != payload {
+        return TestResult::Fail("write/read pattern mismatch");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_virtio_blk_pci_write_then_read);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_virtio_blk_pci_irq_driven() -> TestResult {
+    // Bring up MSI-X on the probed virtio-blk-pci, do a sector
+    // read via the IRQ-driven path, verify fire_count moved.
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind, probe_all_pci};
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_drivers_virtio::blk_pci;
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let dev = match devs.iter().find(|d|
+        matches!(&d.kind, BusKind::Pcie { .. })
+        && d.id.vendor == blk_pci::VIRTIO_BLK_PCI_VENDOR
+        && d.id.device == blk_pci::VIRTIO_BLK_PCI_DEVICE)
+    {
+        Some(d) => *d,
+        None    => return TestResult::Skip("no virtio-blk-pci device"),
+    };
+    __reset_for_test();
+    blk_pci::register_pci_driver();
+    let authority = bootstrap_registry_authority();
+    if probe_all_pci(&authority).is_err() {
+        return TestResult::Fail("probe_all_pci");
+    }
+    let (_h, cap) = match claim_device_cap(&authority, dev.addr) {
+        Ok(ok) => ok,
+        Err(_) => return TestResult::Fail("claim_device_cap"),
+    };
+
+    let v = match blk_pci::enable_msix_for_probed(&cap, &dev) {
+        Ok(v)  => v,
+        Err(_) => return TestResult::Fail("enable_msix"),
+    };
+
+    // SAFETY: APIC initialised; OK to enable for the test.
+    unsafe { narf_arch::enable_interrupts(); }
+    let baseline = narf_interrupts::fire_count(v);
+    let mut sector = [0u8; 512];
+    let read_ok = blk_pci::with_controller(|c| c.read_sector_irq(0, &mut sector))
+        .map(|r| r.is_ok()).unwrap_or(false);
+    let after = narf_interrupts::fire_count(v);
+    // SAFETY: counterpart.
+    unsafe { narf_arch::disable_interrupts(); }
+    if !read_ok { return TestResult::Fail("read_sector_irq failed"); }
+    for i in 0..512usize {
+        let expected = (i as u8).wrapping_mul(0x97);
+        if sector[i] != expected {
+            return TestResult::Fail("read_sector_irq pattern mismatch");
+        }
+    }
+    if after <= baseline {
+        return TestResult::Fail("MSI-X fire_count never moved");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_virtio_blk_pci_irq_driven);
 
 fn smoke_drivers_net_nic_model_ids() -> TestResult {
     use narf_drivers_net::{NicCaps, NicModel};
