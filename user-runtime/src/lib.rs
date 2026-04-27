@@ -1197,8 +1197,9 @@ pub fn rename(old_path: &str, new_path: &str) -> i32 {
     if r as i64 == -1 { -1 } else { 0 }
 }
 
-/// `readlink(path, buf)` — read a symlink target. NARF has no
-/// symlink implementation; this always returns -1.
+/// `readlink(path, buf)` — read a symlink target. Backed by
+/// SYS_READLINK / SYS_SYMLINK; NARF supports symlinks via MemFs.
+/// Returns the byte count copied on success, -1 on lookup failure.
 #[inline]
 pub fn readlink(path: &str, buf: &mut [u8]) -> isize {
     if path.is_empty() || buf.is_empty() { return -1; }
@@ -1213,7 +1214,9 @@ pub fn readlink(path: &str, buf: &mut [u8]) -> isize {
     r as isize
 }
 
-/// `symlink(target, link)` — create a symlink. Stage-4 stub returns -1.
+/// `symlink(target, link)` — create a symlink. Backed by
+/// SYS_READLINK / SYS_SYMLINK; NARF supports symlinks via MemFs.
+/// Returns 0 on success, -1 on duplicate or unmounted parent.
 #[inline]
 pub fn symlink(target: &str, link: &str) -> i32 {
     if target.is_empty() || link.is_empty() { return -1; }

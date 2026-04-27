@@ -245,9 +245,10 @@ pub unsafe extern "C" fn posix_fallocate(
     if r == -1 { 5 } else { 0 }   // EIO on failure
 }
 
-/// `readlink(path, buf, bufsiz)` — read a symlink target. NARF
-/// doesn't ship a symlink implementation, so this always returns
-/// -1; consumers fall back accordingly.
+/// `readlink(path, buf, bufsiz)` — read a symlink target. Now
+/// backed by SYS_READLINK / SYS_SYMLINK; NARF supports symlinks via
+/// MemFs. Returns the byte count copied (≤ `bufsiz`) on success,
+/// -1 if `path` doesn't resolve to a symlink entry.
 ///
 /// # Safety
 /// `path` must be NUL-terminated; `buf` must be writable for
@@ -266,7 +267,9 @@ pub unsafe extern "C" fn readlink(
     narf_user_runtime::readlink(s, slice) as ssize_t
 }
 
-/// `symlink(target, linkpath)` — Stage-4 stub returning -1.
+/// `symlink(target, linkpath)` — create a symlink. Now backed by
+/// SYS_READLINK / SYS_SYMLINK; NARF supports symlinks via MemFs.
+/// Returns 0 on success, -1 on duplicate or unmounted parent.
 ///
 /// # Safety
 /// Both pointers must be NUL-terminated C strings.

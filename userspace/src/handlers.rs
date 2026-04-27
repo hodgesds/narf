@@ -1703,21 +1703,103 @@ fn sys_rename(ctx: &mut dyn TrapContext) {
     }
 }
 
-// ── Readlink / Symlink stubs ───────────────────────────────────────
+// ── Readlink / Symlink — MemFs-backed symlink read + create ───────
 //
-// NARF has no symlink implementation; both syscalls just refuse
-// with -1 so consumers fall back. readlink in particular is often
-// probed at startup ("does $PATH/foo expand?") and a refuse-with-
-// fallback is the right shape.
+// MemFs grew an `Entry::Symlink(MemSymlink)` variant: the symlink
+// target lives as an immutable String exposed through `FileOps::read`,
+// and `DirOps::symlink` mints fresh entries. These two handlers are
+// the path-based bridges to that surface — readlink reads the bytes,
+// symlink installs the entry. Both operate over absolute paths via
+// the registry's resolve_parent_absolute helper, mirroring the shape
+// of sys_unlink / sys_mkdir / sys_rmdir.
 
 fn sys_readlink(ctx: &mut dyn TrapContext) {
-    // Don't dereference the user pointers — we know we're going
-    // to fail before reading them.
-    ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+    let args = *ctx.args();
+    let path_ptr = args.arg0 as *const u8;
+    let path_len = args.arg1 as usize;
+    let buf_ptr  = args.arg2 as *mut u8;
+    let buf_len  = args.arg3 as usize;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if path_ptr.is_null() || path_len == 0 || buf_ptr.is_null() || buf_len == 0 {
+        ctx.set_return(fail);
+        return;
+    }
+    // SAFETY: caller-supplied user pointer in the active AS, length-
+    // bounded.
+    let path_bytes = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
+    let path = match core::str::from_utf8(path_bytes) {
+        Ok(s) => s,
+        Err(_) => { ctx.set_return(fail); return; }
+    };
+    // resolve_parent_absolute returns Option<Option<Arc<dyn FileOps>>>:
+    // outer None = no mount covers the path, inner None = parent walk
+    // hit a missing component or the leaf is absent. Flatten both
+    // failure modes to `fail`.
+    let file = narf_filesystem::registry()
+        .resolve_parent_absolute(path, |_fs, parent, leaf| parent.lookup(leaf))
+        .flatten();
+    let file = match file {
+        Some(f) => f,
+        None    => { ctx.set_return(fail); return; }
+    };
+    // Refuse non-symlinks — POSIX readlink returns EINVAL for those.
+    let st = file.stat();
+    if st.mode.file_type != narf_filesystem::FileType::Symlink {
+        ctx.set_return(fail);
+        return;
+    }
+    // Allocate staging buffer at min(buf_len, target_len). MemSymlink
+    // reads the target verbatim from offset 0; n is the byte count.
+    let target_len = st.size as usize;
+    let len = core::cmp::min(buf_len, target_len);
+    let mut staging = alloc::vec![0u8; len];
+    let n = match poll_once(file.read(0, &mut staging)) {
+        Some(Ok(n)) => n,
+        _           => { ctx.set_return(fail); return; }
+    };
+    // Copy out volatile so the user's view is not subject to compiler
+    // reordering across the syscall return.
+    // SAFETY: caller-supplied writable region of `buf_len` bytes;
+    // `n <= len <= buf_len` by construction.
+    unsafe {
+        for i in 0..n {
+            core::ptr::write_volatile(buf_ptr.add(i), staging[i]);
+        }
+    }
+    ctx.set_return(SyscallReturn::ok(n as u64));
 }
 
 fn sys_symlink(ctx: &mut dyn TrapContext) {
-    ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+    let args = *ctx.args();
+    let target_ptr = args.arg0 as *const u8;
+    let target_len = args.arg1 as usize;
+    let link_ptr   = args.arg2 as *const u8;
+    let link_len   = args.arg3 as usize;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if target_ptr.is_null() || target_len == 0 || link_ptr.is_null() || link_len == 0 {
+        ctx.set_return(fail);
+        return;
+    }
+    // SAFETY: caller-supplied user pointers in the active AS, length-
+    // bounded.
+    let target_bytes = unsafe { core::slice::from_raw_parts(target_ptr, target_len) };
+    let link_bytes   = unsafe { core::slice::from_raw_parts(link_ptr,   link_len)   };
+    let target_str = match core::str::from_utf8(target_bytes) {
+        Ok(s) => s,
+        Err(_) => { ctx.set_return(fail); return; }
+    };
+    let link_path = match core::str::from_utf8(link_bytes) {
+        Ok(s) => s,
+        Err(_) => { ctx.set_return(fail); return; }
+    };
+    let outcome = narf_filesystem::registry()
+        .resolve_parent_absolute(link_path, |_fs, parent, leaf| {
+            parent.symlink(leaf, target_str)
+        });
+    match outcome {
+        Some(Ok(_)) => ctx.set_return(SyscallReturn::ok(0)),
+        _           => ctx.set_return(fail),
+    }
 }
 
 // ── Listdir — arg0=path, arg1=path_len, arg2=cursor,

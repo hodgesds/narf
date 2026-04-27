@@ -633,15 +633,19 @@ pub enum Syscall {
     Rename       = 192,
 
     /// `arg0 = path_ptr`, `arg1 = path_len`, `arg2 = buf_ptr`,
-    /// `arg3 = buf_len`. POSIX readlink. NARF has no symlink
-    /// implementation; we always return -1 (the user's libc shim
-    /// translates that to EINVAL "not a symlink"). Wired so a
-    /// utility that probes optional symlink expansion sees a sane
-    /// failure rather than a hang.
+    /// `arg3 = buf_len`. Path-based symlink read / create over MemFs
+    /// symlink entries. Resolves `path` via `resolve_parent_absolute`,
+    /// checks the leaf's `FileType::Symlink`, and copies up to
+    /// `buf_len` target-bytes into the caller's buffer. Returns the
+    /// byte count on success; -1 if the path doesn't resolve, the
+    /// entry isn't a symlink, or the user pointers are bad.
     Readlink     = 193,
 
     /// `arg0 = target_ptr`, `arg1 = target_len`, `arg2 = link_ptr`,
-    /// `arg3 = link_len`. POSIX symlink. Stub returning -1.
+    /// `arg3 = link_len`. Path-based symlink read / create over MemFs
+    /// symlink entries. Resolves `link_path`'s parent and inserts an
+    /// `Entry::Symlink` whose target is the verbatim `target` string.
+    /// Returns 0 on success, -1 on duplicate or bad input.
     Symlink      = 194,
 
     /// `arg0 = path_ptr`, `arg1 = path_len`, `arg2 = cursor` (entry
