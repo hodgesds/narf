@@ -6496,6 +6496,36 @@ fn smoke_ahci_identify_device() -> TestResult {
 kernel_test!(smoke_ahci_identify_device);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_ahci_read_lba() -> TestResult {
+    // Read sector 0 of the QEMU SATA disk and verify the pattern
+    // xtask seeds the image with: byte i = (i * 0x6D) ^ 0x42.
+    use narf_drivers_storage::ahci;
+    if !ahci::is_probed() { return TestResult::Skip("ahci not probed"); }
+    let port = ahci::with_controller(|c|
+        c.ports.iter().find(|p| p.kind == ahci::PortKind::Sata).map(|p| p.index)
+    ).flatten().unwrap_or(0);
+    let mut sector = [0u8; 512];
+    let r = ahci::with_controller(|c|
+        // SAFETY: kernel-test holds the HBA exclusively here.
+        unsafe { ahci::ahci_read_lba(c, port, 0, 1, &mut sector) }
+    );
+    match r {
+        Some(Ok(())) => {}
+        Some(Err(_)) => return TestResult::Fail("ahci_read_lba failed"),
+        None         => return TestResult::Fail("with_controller None"),
+    }
+    for i in 0..512usize {
+        let expected = (i as u8).wrapping_mul(0x6D) ^ 0x42;
+        if sector[i] != expected {
+            return TestResult::Fail("AHCI read pattern mismatch");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_ahci_read_lba);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_virtio_balloon_pci_probe() -> TestResult {
     use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
     use narf_bus::driver_match::__reset_for_test;

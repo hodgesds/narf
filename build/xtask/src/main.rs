@@ -282,7 +282,9 @@ fn qemu_virt_dtb_path() -> PathBuf {
     path
 }
 
-/// Backing image for the q35 AHCI/SATA disk.
+/// Backing image for the q35 AHCI/SATA disk. Pre-seeds the first
+/// 512 bytes with a recognisable pattern so the AHCI READ DMA EXT
+/// smoke can verify the round trip.
 fn ahci_image_path() -> PathBuf {
     let root = workspace_root().unwrap_or_else(|_| PathBuf::from("."));
     let path = root.join("target").join("narf-sata.img");
@@ -290,7 +292,11 @@ fn ahci_image_path() -> PathBuf {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::write(&path, vec![0u8; 1024 * 1024]);
+        let mut buf = vec![0u8; 1024 * 1024];
+        for i in 0..512usize {
+            buf[i] = (i as u8).wrapping_mul(0x6D) ^ 0x42;
+        }
+        let _ = std::fs::write(&path, &buf);
     }
     path
 }

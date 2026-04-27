@@ -388,6 +388,140 @@ impl Ahci {
     }
 }
 
+/// Issue ATA `READ DMA EXT` (opcode 0x25) for `n_sectors` 512-byte
+/// sectors starting at `lba`, copying the result into `out`. `out`
+/// must be at least `n_sectors * 512` bytes.
+///
+/// Stage-4 cut: same per-call DMA scratch + single-PRDT-entry shape
+/// as identify_device. Caps `n_sectors * 512` at 4096 bytes (one
+/// page) — multi-page reads need a multi-PRDT chain.
+///
+/// # Safety
+/// Same as `identify_device`.
+pub unsafe fn ahci_read_lba(
+    ahci: &Ahci,
+    port_idx: u8,
+    lba: u64,
+    n_sectors: u16,
+    out:       &mut [u8],
+) -> Result<(), AhciError> {
+    if n_sectors == 0 || (n_sectors as usize) * 512 > 4096 {
+        return Err(AhciError::BarMapFailed);
+    }
+    if out.len() < (n_sectors as usize) * 512 {
+        return Err(AhciError::BarMapFailed);
+    }
+    let off = PORT_BASE_OFF + (port_idx as u64) * PORT_STRIDE;
+    // SAFETY: caller-asserted.
+    let _ = unsafe { ahci.port_idle(port_idx) };
+
+    let scratch = alloc_coherent(4096, DomainId::DRIVER_0)
+        .map_err(|_| AhciError::BarMapFailed)?;
+    let base = scratch.phys_addr().raw();
+    let cmd_list = base + 0x000;
+    let fis_recv = base + 0x400;
+    let cmd_tbl  = base + 0x500;
+    let data_buf = base + 0x600;
+    // SAFETY: identity-mapped DMA.
+    unsafe {
+        for i in 0..(0x600 + (n_sectors as usize) * 512) {
+            core::ptr::write_volatile((base + i as u64) as *mut u8, 0);
+        }
+    }
+
+    // Cmd list slot 0: PRDT length = 1, CFL = 5 (H2D FIS).
+    // SAFETY: identity-mapped DMA.
+    unsafe {
+        core::ptr::write_volatile(cmd_list as *mut u32, (1u32 << 16) | 5);
+        core::ptr::write_volatile((cmd_list + 4) as *mut u32, 0);
+        core::ptr::write_volatile((cmd_list + 8) as *mut u64, cmd_tbl);
+    }
+
+    // CFIS: H2D Register FIS for READ DMA EXT.
+    //   +0  type = 0x27
+    //   +1  bit 7 = C (command)
+    //   +2  command = 0x25 (READ DMA EXT)
+    //   +3  features (low) = 0
+    //   +4  LBA[7:0]
+    //   +5  LBA[15:8]
+    //   +6  LBA[23:16]
+    //   +7  Device = 0x40 (LBA mode)
+    //   +8  LBA[31:24]
+    //   +9  LBA[39:32]
+    //   +10 LBA[47:40]
+    //   +11 features (high) = 0
+    //   +12 sector count low
+    //   +13 sector count high
+    //   +14 ICC = 0
+    //   +15 Control = 0
+    // SAFETY: identity-mapped DMA.
+    unsafe {
+        core::ptr::write_volatile(cmd_tbl as *mut u8, 0x27);
+        core::ptr::write_volatile((cmd_tbl + 1) as *mut u8, 0x80);
+        core::ptr::write_volatile((cmd_tbl + 2) as *mut u8, 0x25);
+        core::ptr::write_volatile((cmd_tbl + 3) as *mut u8, 0);
+        core::ptr::write_volatile((cmd_tbl + 4)  as *mut u8, (lba & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 5)  as *mut u8, ((lba >> 8)  & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 6)  as *mut u8, ((lba >> 16) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 7)  as *mut u8, 0x40);
+        core::ptr::write_volatile((cmd_tbl + 8)  as *mut u8, ((lba >> 24) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 9)  as *mut u8, ((lba >> 32) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 10) as *mut u8, ((lba >> 40) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 12) as *mut u8, (n_sectors & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 13) as *mut u8, ((n_sectors >> 8) & 0xFF) as u8);
+    }
+    let prdt = cmd_tbl + 0x80;
+    let bytes = (n_sectors as u32) * 512;
+    // SAFETY: same.
+    unsafe {
+        core::ptr::write_volatile(prdt as *mut u64, data_buf);
+        core::ptr::write_volatile((prdt + 8) as *mut u32, 0);
+        core::ptr::write_volatile((prdt + 12) as *mut u32, bytes - 1);
+    }
+
+    // SAFETY: identity-mapped MMIO.
+    unsafe {
+        ahci.mmio.write32(off + 0x00, cmd_list as u32);
+        ahci.mmio.write32(off + 0x04, (cmd_list >> 32) as u32);
+        ahci.mmio.write32(off + 0x08, fis_recv as u32);
+        ahci.mmio.write32(off + 0x0C, (fis_recv >> 32) as u32);
+        let serr = ahci.mmio.read32(off + PORT_SERR);
+        ahci.mmio.write32(off + PORT_SERR, serr);
+        ahci.mmio.write32(off + 0x10, 0xFFFF_FFFF);  // clear PORT_IS
+        let cmd = ahci.mmio.read32(off + PORT_CMD);
+        ahci.mmio.write32(off + PORT_CMD, cmd | CMD_FRE);
+        let cmd = ahci.mmio.read32(off + PORT_CMD);
+        ahci.mmio.write32(off + PORT_CMD, cmd | CMD_ST);
+    }
+
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: same.
+    unsafe { ahci.mmio.write32(off + 0x38, 1); }
+
+    let mut ok = false;
+    for _ in 0..10_000_000u32 {
+        // SAFETY: same.
+        let ci = unsafe { ahci.mmio.read32(off + 0x38) };
+        // SAFETY: same.
+        let tfd = unsafe { ahci.mmio.read32(off + 0x20) };
+        if tfd & 0x01 != 0 { return Err(AhciError::ResetTimeout); }
+        if ci & 1 == 0 { ok = true; break; }
+        core::hint::spin_loop();
+    }
+    if !ok { return Err(AhciError::ResetTimeout); }
+
+    // SAFETY: identity-mapped DMA.
+    for i in 0..(n_sectors as usize) * 512 {
+        out[i] = unsafe {
+            core::ptr::read_volatile((data_buf + i as u64) as *const u8)
+        };
+    }
+    // SAFETY: caller-asserted.
+    let _ = unsafe { ahci.port_idle(port_idx) };
+    let _ = scratch;
+    Ok(())
+}
+
 /// Decode the model-number string from an IDENTIFY DEVICE response.
 /// ATA strings are byte-swapped per pair (ATA-8 §7.16.7.36): byte 54
 /// = char 0 high, byte 55 = char 0 low, etc. 40 bytes total.

@@ -577,7 +577,17 @@ The critical-path Stage-2 items remaining:
      forces AHCI mode (GHC.AE), resets the HBA (GHC.HR), enumerates
      PI-implemented ports, classifies each via PORT_SIG +
      PORT_SSTS into None/Sata/Atapi/Semb/Pmp. Per-port command
-     list + IDENTIFY DEVICE issuance is structural follow-up.
+     list + Received-FIS allocated per-call. ATA `IDENTIFY DEVICE`
+     (opcode 0xEC) returns the 512-byte device-data block;
+     `identify_model` decodes the byte-swapped 40-byte model
+     string. `ahci_read_lba(port, lba, n_sectors, out)` issues
+     `READ DMA EXT` (opcode 0x25), polls `PORT_CI`, copies the
+     payload out — actual SATA disk reads working.
+   - **virtio-balloon-pci** (`drivers/virtio/src/balloon_pci.rs`).
+     Memory-pressure cooperative driver (0x1AF4:0x1045). Two
+     virtqueues (inflate / deflate) brought up structurally;
+     page-handoff hooks land once `narf_memory` exposes a
+     pressure callback.
 
    xtask attaches every driver's exemplar device on both arches.
    Smokes:
