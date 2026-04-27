@@ -3849,6 +3849,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Fchown, "fchown", RawFnHandler(sys_fchmod_or_fchown));
     table.install_raw(Syscall::Fchmodat, "fchmodat", RawFnHandler(sys_fchmodat_or_fchownat));
     table.install_raw(Syscall::Fchownat, "fchownat", RawFnHandler(sys_fchmodat_or_fchownat));
+    table.install_raw(Syscall::Faccessat, "faccessat", RawFnHandler(sys_fchmodat_or_fchownat));
 
     // Tier-2 cwd state + nanosleep wired into the table. Sleep
     // already replaced the noop_ok stub above.

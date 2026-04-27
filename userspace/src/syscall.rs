@@ -245,6 +245,12 @@ pub enum Syscall {
     /// Same path-must-be-absolute simplification as fchmodat.
     Fchownat     = 135,
 
+    /// `arg0 = dirfd`, `arg1 = path_ptr`, `arg2 = path_len`,
+    /// `arg3 = mode`, `arg4 = flags`. Linux faccessat(2).
+    /// dirfd ignored; path must be absolute. Routes to the same
+    /// existence probe as SYS_OPEN (open + close).
+    Faccessat    = 136,
+
     /// `arg0 = pipefd_out_ptr`, `arg1 = flags`. Linux pipe2(2):
     /// pipe + atomic flag set. Honoured flag: O_CLOEXEC (bit
     /// 0x80000) — both ends get FD_CLOEXEC stamped at install
@@ -682,6 +688,7 @@ impl Syscall {
             133 => Syscall::Lstat,
             134 => Syscall::Fchmodat,
             135 => Syscall::Fchownat,
+            136 => Syscall::Faccessat,
             120 => Syscall::Mmap,
             121 => Syscall::Munmap,
             130 => Syscall::RingKick,

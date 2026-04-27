@@ -339,6 +339,24 @@ pub unsafe extern "C" fn lchown(path: *const c_char, uid: u32, gid: u32) -> c_in
 
 pub const AT_FDCWD: c_int = -100;
 
+/// `faccessat(dirfd, path, mode, flags)` — Linux `*at(2)` variant
+/// of access. dirfd is ignored; path must be absolute.
+///
+/// # Safety
+/// `path` must be a NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn faccessat(
+    dirfd: c_int,
+    path:  *const c_char,
+    mode:  c_int,
+    flags: c_int,
+) -> c_int {
+    if path.is_null() { return -1; }
+    // SAFETY: caller-asserted NUL-terminator.
+    let s = unsafe { cstr_to_str(path) };
+    narf_user_runtime::faccessat(dirfd, s, mode as u32, flags)
+}
+
 /// `fchmodat(dirfd, path, mode, flags)` — Linux `*at(2)` variant.
 /// `dirfd` is ignored (NARF has no directory-fd type); path must
 /// be absolute.
