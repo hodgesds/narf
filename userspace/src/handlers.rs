@@ -262,6 +262,35 @@ pub fn bootstrap_init() {
     *BOOTSTRAP_TABLE.lock() = Some(BTreeMap::new());
 }
 
+/// Initialise every per-task state table the new syscalls depend
+/// on — convenient single-call wiring for boot paths and test
+/// fixtures so they don't have to enumerate every init helper.
+/// Idempotent: each underlying init is a `*lock = Some(BTreeMap::new())`
+/// or similar, safe to re-run.
+///
+/// This wires:
+///   - bootstrap (per-task SQ/CQ rings)
+///   - cwd
+///   - brk
+///   - sigaction + signal
+///   - uid/gid + hostname + rlimit + nice + umask + prctl
+///
+/// fd::init is kept separate (different module) but consumers
+/// almost always call it alongside.
+pub fn init_per_task_state() {
+    bootstrap_init();
+    cwd_init();
+    brk_init();
+    sigaction_init();
+    signal_init();
+    uidgid_init();
+    hostname_init();
+    rlimit_init();
+    nice_init();
+    umask_init();
+    prctl_init();
+}
+
 /// Reset the registry — test hook; drops every per-task ring set.
 #[doc(hidden)]
 pub fn __test_bootstrap_reset() { *BOOTSTRAP_TABLE.lock() = None; }

@@ -13381,3 +13381,85 @@ fn smoke_userspace_getdents64_writes_linux_records() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_userspace_getdents64_writes_linux_records);
+
+fn smoke_userspace_init_per_task_state_is_idempotent() -> TestResult {
+    use narf_userspace::{init_per_task_state, install_core_syscalls,
+                         install_global, kernel_syscall_entry,
+                         syscall::__test_clear_global,
+                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+                         TrapContext};
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Reset every per-task table so we observe the post-init state
+    // from a known floor.
+    narf_userspace::handlers::__test_uidgid_reset();
+    narf_userspace::handlers::__test_hostname_reset();
+    narf_userspace::handlers::__test_rlimit_reset();
+    narf_userspace::handlers::__test_nice_reset();
+    narf_userspace::handlers::__test_umask_reset();
+    narf_userspace::handlers::__test_prctl_reset();
+
+    // Single call wires everything.
+    init_per_task_state();
+    // Re-running must not corrupt state.
+    init_per_task_state();
+
+    // After init, getuid (a noop_ok-style call that depends on
+    // UIDGID_TABLE existing) must return the default 0.
+    let mut ctx = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::GetUid.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+        return TestResult::Fail("getuid did not return 0 after init_per_task_state");
+    }
+
+    // gethostname must surface "narf".
+    let mut buf = [0u8; 16];
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: buf.as_mut_ptr() as u64,
+            arg1: buf.len() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::GetHostname.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.value as i64 == 4) {
+        return TestResult::Fail("gethostname did not return 4 bytes");
+    }
+    if &buf[..4] != b"narf" {
+        return TestResult::Fail("hostname not initialised to 'narf'");
+    }
+
+    // umask returns 0o022 default.
+    let mut ctx = FakeCtx {
+        args: SyscallArgs { arg0: 0o077, ..SyscallArgs::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Umask.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.value == 0o022) {
+        return TestResult::Fail("umask default not 0o022 after init");
+    }
+
+    narf_userspace::handlers::__test_uidgid_reset();
+    narf_userspace::handlers::__test_hostname_reset();
+    narf_userspace::handlers::__test_rlimit_reset();
+    narf_userspace::handlers::__test_nice_reset();
+    narf_userspace::handlers::__test_umask_reset();
+    narf_userspace::handlers::__test_prctl_reset();
+    __test_clear_global();
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_init_per_task_state_is_idempotent);
