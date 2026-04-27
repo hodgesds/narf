@@ -13529,3 +13529,61 @@ fn smoke_userspace_sched_priority_bounds_and_param() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_userspace_sched_priority_bounds_and_param);
+
+fn smoke_userspace_pgid_round_trip() -> TestResult {
+    use narf_userspace::{init_per_task_state, install_core_syscalls,
+                         install_global, kernel_syscall_entry,
+                         syscall::__test_clear_global,
+                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+                         TrapContext};
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+    narf_userspace::handlers::__test_pgid_reset();
+    init_per_task_state();
+
+    fn call(s: Syscall, arg0: u64, arg1: u64) -> Option<SyscallReturn> {
+        let mut ctx = FakeCtx {
+            args: SyscallArgs { arg0, arg1, ..SyscallArgs::default() },
+            ret: None,
+        };
+        kernel_syscall_entry(s.raw(), &mut ctx);
+        ctx.ret
+    }
+
+    // Default pgid == pid (which is 0 for the test harness's
+    // current_task_id).
+    let pid = call(Syscall::GetPid, 0, 0).map(|r| r.value).unwrap_or(!0);
+    let p0 = call(Syscall::Getpgid, 0, 0).map(|r| r.value).unwrap_or(!0);
+    if p0 != pid {
+        return TestResult::Fail("default pgid != pid");
+    }
+
+    // setpgid(0, 7) — explicitly stick pgid to 7.
+    let _ = call(Syscall::Setpgid, 0, 7);
+    let p1 = call(Syscall::Getpgid, 0, 0).map(|r| r.value).unwrap_or(!0);
+    if p1 != 7 {
+        return TestResult::Fail("setpgid(7) did not stick");
+    }
+
+    // setpgid(0, 0) — pgid resolves to the target's pid (creates
+    // a fresh group leader).
+    let _ = call(Syscall::Setpgid, 0, 0);
+    let p2 = call(Syscall::Getpgid, 0, 0).map(|r| r.value).unwrap_or(!0);
+    if p2 != pid {
+        return TestResult::Fail("setpgid(0,0) did not resolve to pid");
+    }
+
+    narf_userspace::handlers::__test_pgid_reset();
+    __test_clear_global();
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_pgid_round_trip);

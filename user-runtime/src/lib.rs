@@ -63,6 +63,8 @@ pub const SYS_GETUID:         u64 = 142;
 pub const SYS_GETGID:         u64 = 143;
 pub const SYS_SETUID:         u64 = 144;
 pub const SYS_SETGID:         u64 = 145;
+pub const SYS_GETPGID:        u64 = 224;
+pub const SYS_SETPGID:        u64 = 225;
 pub const SYS_FTRUNCATE:      u64 = 118;
 pub const SYS_TRUNCATE:       u64 = 132;
 pub const SYS_PREAD64:        u64 = 119;
@@ -471,6 +473,23 @@ pub fn setuid(uid: u32) -> i32 {
 pub fn setgid(gid: u32) -> i32 {
     // SAFETY: SYS_SETGID takes one arg (gid).
     let r = unsafe { syscall1(SYS_SETGID, gid as u64) };
+    if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `getpgid(pid)` — POSIX process-group id query. `pid = 0` →
+/// self. Default pgid = pid (each task is its own group leader).
+#[inline]
+pub fn getpgid(pid: u64) -> u64 {
+    // SAFETY: SYS_GETPGID signature: (pid).
+    unsafe { syscall1(SYS_GETPGID, pid) }
+}
+
+/// `setpgid(pid, pgid)` — set the target task's pgid. `pid = 0` →
+/// self. `pgid = 0` → target's pid. Returns 0 on success.
+#[inline]
+pub fn setpgid(pid: u64, pgid: u64) -> i32 {
+    // SAFETY: SYS_SETPGID signature: (pid, pgid).
+    let r = unsafe { syscall2(SYS_SETPGID, pid, pgid) };
     if r as i64 == -1 { -1 } else { 0 }
 }
 

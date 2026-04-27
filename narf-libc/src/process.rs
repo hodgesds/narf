@@ -289,19 +289,18 @@ pub unsafe extern "C" fn wait(status: *mut i32) -> i32 {
 // pid. We surface the function shapes so init scripts that call
 // `setsid()` don't fail to link.
 
-/// `getpgrp()` — process group; coalesces to pid.
+/// `getpgrp()` — POSIX process-group id of the caller. Routes
+/// through SYS_GETPGID with pid = 0.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn getpgrp() -> i32 {
-    // SAFETY: forwarded.
-    unsafe { getpid() }
+    narf_user_runtime::getpgid(0) as i32
 }
 
-/// `getpgid(pid)` — process group of `pid`. Reports the calling
-/// task's pid for any input.
+/// `getpgid(pid)` — POSIX. Returns the target's pgid (or its pid
+/// if no setpgid has yet stuck).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn getpgid(_pid: i32) -> i32 {
-    // SAFETY: forwarded.
-    unsafe { getpid() }
+pub unsafe extern "C" fn getpgid(pid: i32) -> i32 {
+    narf_user_runtime::getpgid(pid as u64) as i32
 }
 
 /// `getsid(pid)` — session id of `pid`. Reports the calling task's pid.
@@ -319,10 +318,11 @@ pub unsafe extern "C" fn setsid() -> i32 {
     unsafe { getpid() }
 }
 
-/// `setpgid(pid, pgid)` — accept and ignore.
+/// `setpgid(pid, pgid)` — POSIX. `pid = 0` → self;
+/// `pgid = 0` → target's pid.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn setpgid(_pid: i32, _pgid: i32) -> i32 {
-    0
+pub unsafe extern "C" fn setpgid(pid: i32, pgid: i32) -> i32 {
+    narf_user_runtime::setpgid(pid as u64, pgid as u64)
 }
 
 /// `setuid(uid)` — record the caller's uid in the kernel uid/gid

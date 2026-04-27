@@ -290,6 +290,7 @@ pub fn init_per_task_state() {
     umask_init();
     prctl_init();
     sched_param_init();
+    pgid_init();
 }
 
 /// Reset the registry — test hook; drops every per-task ring set.
@@ -1946,6 +1947,58 @@ fn sys_gettid(ctx: &mut dyn TrapContext) {
     // threading lands this returns a distinct task id while
     // sys_getpid returns the process's primary id.
     ctx.set_return(SyscallReturn::ok(current_task_id()));
+}
+
+// ── Per-task pgid table ────────────────────────────────────────────
+//
+// POSIX setpgid / getpgid manage process-group ids. NARF doesn't
+// schedule per-process-group (no session leader semantics today),
+// but consumer code (job-control shells, init systems) calls
+// setpgid(0, 0) early to become a group leader and expects the
+// value to round-trip across getpgid.
+//
+// Default pgid = pid (each task is its own group leader). Setting
+// pgid = 0 in setpgid means "use the target's pid" per POSIX —
+// we resolve that in the handler.
+
+static PGID_TABLE:
+    narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>>
+    = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+pub fn pgid_init() {
+    *PGID_TABLE.lock() = Some(BTreeMap::new());
+}
+
+#[doc(hidden)]
+pub fn __test_pgid_reset() { *PGID_TABLE.lock() = None; }
+
+fn read_pgid(target: u64) -> u64 {
+    let g = PGID_TABLE.lock();
+    g.as_ref()
+        .and_then(|m| m.get(&target).copied())
+        .unwrap_or(target) // default: pgid == pid
+}
+
+fn sys_getpgid(ctx: &mut dyn TrapContext) {
+    let pid = ctx.args().arg0;
+    let target = if pid == 0 { current_task_id() } else { pid };
+    ctx.set_return(SyscallReturn::ok(read_pgid(target)));
+}
+
+fn sys_setpgid(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let pid    = args.arg0;
+    let pgid   = args.arg1;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    let target = if pid == 0 { current_task_id() } else { pid };
+    let value  = if pgid == 0 { target } else { pgid };
+    let mut g = PGID_TABLE.lock();
+    let m = match g.as_mut() {
+        Some(m) => m,
+        None    => { ctx.set_return(fail); return; }
+    };
+    m.insert(target, value);
+    ctx.set_return(SyscallReturn::ok(0));
 }
 
 // ── Per-task uid/gid table ─────────────────────────────────────────
@@ -3639,6 +3692,8 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::GetGid,   "getgid",   RawFnHandler(sys_getgid));
     table.install_raw(Syscall::SetUid,   "setuid",   RawFnHandler(sys_setuid));
     table.install_raw(Syscall::SetGid,   "setgid",   RawFnHandler(sys_setgid));
+    table.install_raw(Syscall::Getpgid,  "getpgid",  RawFnHandler(sys_getpgid));
+    table.install_raw(Syscall::Setpgid,  "setpgid",  RawFnHandler(sys_setpgid));
     table.install_raw(Syscall::GetHostname, "gethostname", RawFnHandler(sys_gethostname));
     table.install_raw(Syscall::SetHostname, "sethostname", RawFnHandler(sys_sethostname));
     table.install_raw(Syscall::Getrlimit,   "getrlimit",   RawFnHandler(sys_getrlimit));

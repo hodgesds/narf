@@ -275,6 +275,19 @@ pub enum Syscall {
     SetUid       = 144,
     SetGid       = 145,
 
+    /// `arg0 = pid` (0 = self). Linux getpgid(2): return the
+    /// process-group id of `pid`. NARF tracks pgids per-task in
+    /// a structural BTreeMap (no actual session/process-group
+    /// scheduling). Default pgid = pid (each task is its own
+    /// group leader). Returns the pgid on success, -1 on
+    /// unknown pid.
+    Getpgid      = 224,
+
+    /// `arg0 = pid` (0 = self), `arg1 = pgid` (0 = use pid).
+    /// Linux setpgid(2): record the new pgid for the target
+    /// task. Always succeeds.
+    Setpgid      = 225,
+
     /// `arg0 = buf_ptr`, `arg1 = buf_len`. Copy the kernel-wide
     /// hostname (NUL-terminated UTF-8) into the user buffer.
     /// Returns the byte length excluding the NUL on success, -1 on
@@ -654,6 +667,8 @@ impl Syscall {
             143 => Syscall::GetGid,
             144 => Syscall::SetUid,
             145 => Syscall::SetGid,
+            224 => Syscall::Getpgid,
+            225 => Syscall::Setpgid,
             146 => Syscall::GetHostname,
             147 => Syscall::SetHostname,
             148 => Syscall::Getrlimit,
