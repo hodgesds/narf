@@ -84,6 +84,9 @@ pub const SYS_FCHOWNAT:       u64 = 135;
 pub const SYS_FACCESSAT:      u64 = 136;
 pub const SYS_OPENAT:         u64 = 137;
 pub const SYS_NEWFSTATAT:     u64 = 138;
+pub const SYS_UNLINKAT:       u64 = 139;
+pub const SYS_MKDIRAT:        u64 = 228;
+pub const SYS_RENAMEAT:       u64 = 229;
 pub const SYS_GETHOSTNAME:    u64 = 146;
 pub const SYS_SETHOSTNAME:    u64 = 147;
 pub const SYS_GETRLIMIT:      u64 = 148;
@@ -1328,6 +1331,52 @@ pub fn fchmod(fd: u32, mode: u32) -> i32 {
 pub fn fchown(fd: u32, uid: u32, gid: u32) -> i32 {
     // SAFETY: SYS_FCHOWN signature: (fd, uid, gid).
     let r = unsafe { syscall3(SYS_FCHOWN, fd as u64, uid as u64, gid as u64) };
+    if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `unlinkat(dirfd, path, flags)` — Linux *at variant. flags
+/// honoured: AT_REMOVEDIR (0x200) routes to rmdir.
+#[inline]
+pub fn unlinkat(dirfd: i32, path: &str, flags: i32) -> i32 {
+    if path.is_empty() { return -1; }
+    // SAFETY: SYS_UNLINKAT signature: (dirfd, path_ptr, path_len, flags).
+    let r = unsafe {
+        syscall4(
+            SYS_UNLINKAT, dirfd as u64,
+            path.as_ptr() as u64, path.len() as u64, flags as u64,
+        )
+    };
+    if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `mkdirat(dirfd, path, mode)` — Linux *at variant.
+#[inline]
+pub fn mkdirat(dirfd: i32, path: &str, mode: u32) -> i32 {
+    if path.is_empty() { return -1; }
+    // SAFETY: SYS_MKDIRAT signature: (dirfd, path_ptr, path_len, mode).
+    let r = unsafe {
+        syscall4(
+            SYS_MKDIRAT, dirfd as u64,
+            path.as_ptr() as u64, path.len() as u64, mode as u64,
+        )
+    };
+    if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `renameat(old_dirfd, old, new_dirfd, new)` — Linux *at variant.
+#[inline]
+pub fn renameat(old_dirfd: i32, old: &str, new_dirfd: i32, new: &str) -> i32 {
+    if old.is_empty() || new.is_empty() { return -1; }
+    // SAFETY: SYS_RENAMEAT signature: (old_dirfd, old_ptr, old_len,
+    // new_dirfd, new_ptr, new_len).
+    let r = unsafe {
+        syscall6(
+            SYS_RENAMEAT, old_dirfd as u64,
+            old.as_ptr() as u64, old.len() as u64,
+            new_dirfd as u64,
+            new.as_ptr() as u64, new.len() as u64,
+        )
+    };
     if r as i64 == -1 { -1 } else { 0 }
 }
 

@@ -339,6 +339,59 @@ pub unsafe extern "C" fn lchown(path: *const c_char, uid: u32, gid: u32) -> c_in
 
 pub const AT_FDCWD: c_int = -100;
 
+pub const AT_REMOVEDIR: c_int = 0x200;
+
+/// `unlinkat(dirfd, path, flags)` — Linux `*at(2)` variant.
+/// Honours AT_REMOVEDIR (route to rmdir).
+///
+/// # Safety
+/// `path` must be a NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn unlinkat(
+    dirfd: c_int,
+    path:  *const c_char,
+    flags: c_int,
+) -> c_int {
+    if path.is_null() { return -1; }
+    // SAFETY: caller-asserted NUL-terminator.
+    let s = unsafe { cstr_to_str(path) };
+    narf_user_runtime::unlinkat(dirfd, s, flags)
+}
+
+/// `mkdirat(dirfd, path, mode)` — Linux `*at(2)` variant.
+///
+/// # Safety
+/// See [`unlinkat`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mkdirat(
+    dirfd: c_int,
+    path:  *const c_char,
+    mode:  mode_t,
+) -> c_int {
+    if path.is_null() { return -1; }
+    // SAFETY: caller-asserted NUL-terminator.
+    let s = unsafe { cstr_to_str(path) };
+    narf_user_runtime::mkdirat(dirfd, s, mode)
+}
+
+/// `renameat(old_dirfd, old, new_dirfd, new)` — Linux `*at(2)`.
+///
+/// # Safety
+/// Both pointers must be NUL-terminated C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn renameat(
+    old_dirfd: c_int,
+    old:       *const c_char,
+    new_dirfd: c_int,
+    new:       *const c_char,
+) -> c_int {
+    if old.is_null() || new.is_null() { return -1; }
+    // SAFETY: caller-asserted NUL-terminators.
+    let o = unsafe { cstr_to_str(old) };
+    let n = unsafe { cstr_to_str(new) };
+    narf_user_runtime::renameat(old_dirfd, o, new_dirfd, n)
+}
+
 /// `openat(dirfd, path, flags, mode)` — Linux `*at(2)` variant
 /// of open. dirfd is ignored; path must be absolute. Returns the
 /// new fd, or -1 on failure.

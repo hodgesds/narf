@@ -264,6 +264,24 @@ pub enum Syscall {
     /// to the same handler as SYS_STAT.
     Newfstatat   = 138,
 
+    /// `arg0 = dirfd`, `arg1 = path_ptr`, `arg2 = path_len`,
+    /// `arg3 = flags`. Linux unlinkat(2). dirfd ignored;
+    /// AT_REMOVEDIR (0x200) flag routes to rmdir, otherwise to
+    /// unlink. Returns 0 / -1.
+    Unlinkat     = 139,
+
+    /// `arg0 = dirfd`, `arg1 = path_ptr`, `arg2 = path_len`,
+    /// `arg3 = mode`. Linux mkdirat(2). dirfd ignored; routes
+    /// through SYS_MKDIR.
+    Mkdirat      = 228,
+
+    /// `arg0 = old_dirfd`, `arg1 = old_path_ptr`,
+    /// `arg2 = old_path_len`, `arg3 = new_dirfd`,
+    /// `arg4 = new_path_ptr`, `arg5 = new_path_len`. Linux
+    /// renameat(2). Both dirfds ignored; both paths must be
+    /// absolute.
+    Renameat     = 229,
+
     /// `arg0 = pipefd_out_ptr`, `arg1 = flags`. Linux pipe2(2):
     /// pipe + atomic flag set. Honoured flag: O_CLOEXEC (bit
     /// 0x80000) — both ends get FD_CLOEXEC stamped at install
@@ -704,6 +722,9 @@ impl Syscall {
             136 => Syscall::Faccessat,
             137 => Syscall::Openat,
             138 => Syscall::Newfstatat,
+            139 => Syscall::Unlinkat,
+            228 => Syscall::Mkdirat,
+            229 => Syscall::Renameat,
             120 => Syscall::Mmap,
             121 => Syscall::Munmap,
             130 => Syscall::RingKick,
