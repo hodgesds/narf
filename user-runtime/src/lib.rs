@@ -74,6 +74,7 @@ pub const SYS_SETRLIMIT:      u64 = 149;
 pub const SYS_GETPRIORITY:    u64 = 156;
 pub const SYS_SETPRIORITY:    u64 = 157;
 pub const SYS_TIMES:          u64 = 158;
+pub const SYS_GETRUSAGE:      u64 = 159;
 pub const SYS_BRK:            u64 = 150;
 pub const SYS_CLOCK_GETTIME:  u64 = 151;
 pub const SYS_SIGACTION:      u64 = 152;
@@ -480,6 +481,18 @@ pub fn times(buf: &mut [i64; 4]) -> i64 {
     // SAFETY: SYS_TIMES signature: (out_ptr).
     let r = unsafe { syscall1(SYS_TIMES, buf.as_mut_ptr() as u64) };
     r as i64
+}
+
+/// `getrusage(who, buf)` — fill the 18-i64 rusage struct (two
+/// timevals + 14 stat fields). Returns 0 on success, -1 on bad
+/// pointer.
+#[inline]
+pub fn getrusage(who: i32, buf: &mut [i64; 18]) -> i32 {
+    // SAFETY: SYS_GETRUSAGE signature: (who, out_ptr).
+    let r = unsafe {
+        syscall2(SYS_GETRUSAGE, who as u64, buf.as_mut_ptr() as u64)
+    };
+    if r as i64 == -1 { -1 } else { 0 }
 }
 
 /// `getpriority(which, who)` — read the calling task's nice value.

@@ -1884,6 +1884,44 @@ fn sys_times(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(ticks as u64));
 }
 
+// ── Getrusage — populate the glibc rusage struct ──────────────────
+//
+// Linux's `struct rusage` is 16 fields after the leading two
+// timevals (each timeval is two i64s on x86_64), totaling 18 i64s
+// = 144 bytes. We populate ru_utime from monotonic_ns and zero
+// the rest — same accounting story as sys_times. The two-field
+// timeval layout matches what glibc's <sys/time.h> exposes.
+
+const RUSAGE_TIMEVAL_FIELDS: usize = 4;       // ru_utime + ru_stime
+const RUSAGE_TAIL_FIELDS:    usize = 14;      // ru_maxrss .. ru_nivcsw
+const RUSAGE_TOTAL_I64S:     usize = RUSAGE_TIMEVAL_FIELDS + RUSAGE_TAIL_FIELDS;
+
+fn sys_getrusage(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let _who = args.arg0 as i64;
+    let out  = args.arg1 as *mut i64;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if out.is_null() {
+        ctx.set_return(fail);
+        return;
+    }
+    let ns: u64 = narf_scheduler::narf_time::monotonic_ns();
+    let utime_sec  = (ns / 1_000_000_000) as i64;
+    let utime_usec = ((ns % 1_000_000_000) / 1_000) as i64;
+    // SAFETY: caller-supplied user vaddr in the active AS; we
+    // write 18 i64s. Bad pointer faults the user.
+    unsafe {
+        // ru_utime
+        core::ptr::write_volatile(out,        utime_sec);
+        core::ptr::write_volatile(out.add(1), utime_usec);
+        // ru_stime + 14 tail fields all zero.
+        for i in 2..RUSAGE_TOTAL_I64S {
+            core::ptr::write_volatile(out.add(i), 0);
+        }
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
 // ── Hostname (kernel-wide) ─────────────────────────────────────────
 //
 // One global string behind an IrqSafeSpinLock, initialised to
@@ -2765,6 +2803,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Getpriority, "getpriority", RawFnHandler(sys_getpriority));
     table.install_raw(Syscall::Setpriority, "setpriority", RawFnHandler(sys_setpriority));
     table.install_raw(Syscall::Times,       "times",       RawFnHandler(sys_times));
+    table.install_raw(Syscall::Getrusage,   "getrusage",   RawFnHandler(sys_getrusage));
     table.install_raw(Syscall::ExitTask, "exit",     RawFnHandler(sys_exit_task));
     table.install_raw(Syscall::Yield,    "yield",    RawFnHandler(sys_yield));
     table.install_raw(Syscall::Sleep,    "sleep",    RawFnHandler(sys_sleep));

@@ -12566,3 +12566,59 @@ fn smoke_userspace_times_writes_tms_struct() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_userspace_times_writes_tms_struct);
+
+fn smoke_userspace_getrusage_writes_18_i64s() -> TestResult {
+    use narf_userspace::{install_core_syscalls, install_global,
+                         kernel_syscall_entry, syscall::__test_clear_global,
+                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+                         TrapContext};
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let mut buf = [0xFEi64; 18];
+    let mut ctx = FakeCtx {
+        args: SyscallArgs { arg0: 0, arg1: buf.as_mut_ptr() as u64, ..SyscallArgs::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Getrusage.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+        return TestResult::Fail("getrusage did not return OK");
+    }
+    // ru_utime.tv_sec / tv_usec from monotonic_ns; everything else
+    // zero.
+    if buf[0] < 0 || buf[1] < 0 {
+        return TestResult::Fail("ru_utime negative");
+    }
+    for i in 2..18 {
+        if buf[i] != 0 {
+            return TestResult::Fail("non-utime field of rusage was not zero");
+        }
+    }
+
+    // Null pointer rejected.
+    let mut ctx = FakeCtx {
+        args: SyscallArgs { arg0: 0, arg1: 0, ..SyscallArgs::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Getrusage.raw(), &mut ctx);
+    let null_rejected = matches!(
+        ctx.ret,
+        Some(r) if r.status == SyscallReturn::OK && r.value == (-1i64) as u64,
+    );
+    if !null_rejected {
+        return TestResult::Fail("getrusage did not reject null buffer");
+    }
+
+    __test_clear_global();
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_getrusage_writes_18_i64s);

@@ -228,16 +228,41 @@ pub struct rusage {
 pub const RUSAGE_SELF:     c_int = 0;
 pub const RUSAGE_CHILDREN: c_int = -1;
 
-/// `getrusage(who, *usage)` — zero the supplied struct. We don't
-/// surface real per-task accounting at user-mode today.
+/// `getrusage(who, *usage)` — populate utime from the kernel's
+/// monotonic clock; every other field is zero. NARF doesn't track
+/// per-task user/system splits yet — the surface round-trips so
+/// time(1)-shaped consumers see a usable wall measurement.
 ///
 /// # Safety
 /// `usage` must be a writable `*mut rusage`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn getrusage(_who: c_int, usage: *mut rusage) -> c_int {
+pub unsafe extern "C" fn getrusage(who: c_int, usage: *mut rusage) -> c_int {
     if usage.is_null() { return -1; }
-    // SAFETY: caller-supplied writable struct.
-    unsafe { *usage = rusage::default(); }
+    let mut tmp = [0i64; 18];
+    let r = narf_user_runtime::getrusage(who, &mut tmp);
+    if r != 0 { return -1; }
+    // SAFETY: caller-supplied writable struct; we re-shape the 18
+    // i64s into the C-shaped rusage.
+    unsafe {
+        *usage = rusage {
+            ru_utime: crate::time::timeval { tv_sec: tmp[0], tv_usec: tmp[1] },
+            ru_stime: crate::time::timeval { tv_sec: tmp[2], tv_usec: tmp[3] },
+            ru_maxrss:   tmp[4],
+            ru_ixrss:    tmp[5],
+            ru_idrss:    tmp[6],
+            ru_isrss:    tmp[7],
+            ru_minflt:   tmp[8],
+            ru_majflt:   tmp[9],
+            ru_nswap:    tmp[10],
+            ru_inblock:  tmp[11],
+            ru_oublock:  tmp[12],
+            ru_msgsnd:   tmp[13],
+            ru_msgrcv:   tmp[14],
+            ru_nsignals: tmp[15],
+            ru_nvcsw:    tmp[16],
+            ru_nivcsw:   tmp[17],
+        };
+    }
     0
 }
 

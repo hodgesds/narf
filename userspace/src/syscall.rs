@@ -274,6 +274,13 @@ pub enum Syscall {
     /// see a calibratable wall clock.
     Times        = 158,
 
+    /// `arg0 = who` (RUSAGE_SELF=0; RUSAGE_CHILDREN=-1 returns
+    /// zeroed struct), `arg1 = rusage_out_ptr`. Writes the
+    /// glibc-shaped 16-i64 rusage struct: ru_utime.tv_sec /
+    /// ru_utime.tv_usec from monotonic_ns, every other field
+    /// zero. Returns 0 on success, -1 on bad pointer.
+    Getrusage    = 159,
+
     /// Set or query the per-task heap break.
     /// `arg0 = 0` → return current break; `arg0 != 0` → resize.
     /// POSIX `brk(2)` semantics: failure returns the unchanged break.
@@ -480,6 +487,7 @@ impl Syscall {
             156 => Syscall::Getpriority,
             157 => Syscall::Setpriority,
             158 => Syscall::Times,
+            159 => Syscall::Getrusage,
             150 => Syscall::Brk,
             151 => Syscall::ClockGetTime,
             152 => Syscall::Sigaction,
