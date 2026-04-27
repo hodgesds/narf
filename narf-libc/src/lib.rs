@@ -154,9 +154,9 @@ pub use posix::{
 };
 pub use sys::{
     cpu_set_t, dlclose, dlerror, dlopen, dlsym, getcpu, getrlimit, getrusage,
-    madvise, mlock, mlockall, mmap, mprotect, munlock, munlockall, munmap, rlimit,
-    rusage, sched_getaffinity, sched_getcpu, sched_setaffinity, setrlimit,
-    sysinfo, sysinfo_t, uname, utsname, CPU_ISSET, CPU_SET, CPU_ZERO,
+    madvise, mlock, mlockall, mmap, mprotect, munlock, munlockall, munmap,
+    prlimit, rlimit, rusage, sched_getaffinity, sched_getcpu, sched_setaffinity,
+    setrlimit, sysinfo, sysinfo_t, uname, utsname, CPU_ISSET, CPU_SET, CPU_ZERO,
     MAP_ANONYMOUS, MAP_FAILED, MAP_FIXED, MAP_PRIVATE, MAP_SHARED, PROT_EXEC,
     PROT_NONE, PROT_READ, PROT_WRITE, RLIMIT_AS, RLIMIT_CORE, RLIMIT_CPU,
     RLIMIT_DATA, RLIMIT_FSIZE, RLIMIT_NOFILE, RLIMIT_STACK, RLIM_INFINITY,

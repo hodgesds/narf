@@ -79,6 +79,7 @@ pub const SYS_GETHOSTNAME:    u64 = 146;
 pub const SYS_SETHOSTNAME:    u64 = 147;
 pub const SYS_GETRLIMIT:      u64 = 148;
 pub const SYS_SETRLIMIT:      u64 = 149;
+pub const SYS_PRLIMIT64:      u64 = 178;
 pub const SYS_UMASK:          u64 = 155;
 pub const SYS_GETPRIORITY:    u64 = 156;
 pub const SYS_GETCPU:         u64 = 165;
@@ -716,6 +717,25 @@ pub fn setrlimit(resource: u32, val: &[u64; 2]) -> i32 {
     // SAFETY: SYS_SETRLIMIT signature: (resource, in_ptr).
     let r = unsafe {
         syscall2(SYS_SETRLIMIT, resource as u64, val.as_ptr() as u64)
+    };
+    if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `prlimit64(pid, resource, new, old)` — combined Linux get-and-
+/// set. Pass `pid = 0` for self. `new` / `old` may each be `None`.
+/// Returns 0 on success, -1 on bad input.
+#[inline]
+pub fn prlimit64(
+    pid:      u64,
+    resource: u32,
+    new_val:  Option<&[u64; 2]>,
+    old_out:  Option<&mut [u64; 2]>,
+) -> i32 {
+    let new_ptr = new_val.map(|v| v.as_ptr() as u64).unwrap_or(0);
+    let old_ptr = old_out.map(|v| v.as_mut_ptr() as u64).unwrap_or(0);
+    // SAFETY: SYS_PRLIMIT64 signature: (pid, resource, new_ptr, old_ptr).
+    let r = unsafe {
+        syscall4(SYS_PRLIMIT64, pid, resource as u64, new_ptr, old_ptr)
     };
     if r as i64 == -1 { -1 } else { 0 }
 }

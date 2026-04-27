@@ -2137,6 +2137,47 @@ fn sys_setrlimit(ctx: &mut dyn TrapContext) {
     }
 }
 
+fn sys_prlimit64(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let pid       = args.arg0;
+    let resource  = args.arg1 as usize;
+    let new_ptr   = args.arg2 as *const u64;
+    let old_ptr   = args.arg3 as *mut u64;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    // pid = 0 means "self"; non-zero pids are routed to that task
+    // unconditionally (no permission check today — capabilities
+    // would gate cross-task rlimit mutation in a real model).
+    let task = if pid == 0 { current_task_id() } else { pid };
+
+    // Validate resource bound up-front so the read+write is atomic
+    // from the user's perspective.
+    if resource >= RLIMIT_COUNT {
+        ctx.set_return(fail);
+        return;
+    }
+
+    // Snapshot prior so we can write `*old` *after* the update.
+    let prior = read_rlimit(task, resource).unwrap_or_default();
+
+    if !new_ptr.is_null() {
+        // SAFETY: caller-supplied readable region.
+        let cur = unsafe { core::ptr::read_volatile(new_ptr) };
+        let max = unsafe { core::ptr::read_volatile(new_ptr.add(1)) };
+        if !write_rlimit(task, resource, RLimitPair { cur, max }) {
+            ctx.set_return(fail);
+            return;
+        }
+    }
+    if !old_ptr.is_null() {
+        // SAFETY: caller-supplied writable region.
+        unsafe {
+            core::ptr::write_volatile(old_ptr,        prior.cur);
+            core::ptr::write_volatile(old_ptr.add(1), prior.max);
+        }
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
 // ── prctl — per-task settings switchboard ──────────────────────────
 //
 // Linux prctl(2) is a swiss-army-knife for per-task knobs. We
@@ -3500,6 +3541,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::SetHostname, "sethostname", RawFnHandler(sys_sethostname));
     table.install_raw(Syscall::Getrlimit,   "getrlimit",   RawFnHandler(sys_getrlimit));
     table.install_raw(Syscall::Setrlimit,   "setrlimit",   RawFnHandler(sys_setrlimit));
+    table.install_raw(Syscall::Prlimit64,   "prlimit64",   RawFnHandler(sys_prlimit64));
     table.install_raw(Syscall::Umask,       "umask",       RawFnHandler(sys_umask));
     table.install_raw(Syscall::Getcpu,      "getcpu",      RawFnHandler(sys_getcpu));
     table.install_raw(Syscall::SchedGetaffinity, "sched_getaffinity",

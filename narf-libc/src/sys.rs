@@ -316,6 +316,45 @@ pub unsafe extern "C" fn setrlimit(resource: c_int, rlim: *const rlimit) -> c_in
     narf_user_runtime::setrlimit(resource as u32, &pair)
 }
 
+/// `prlimit64(pid, resource, new, old)` — Linux combined get-and-
+/// set. `pid = 0` means "self". Either pointer may be NULL.
+///
+/// # Safety
+/// `new` / `old`, when non-null, must point at a writable rlimit.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn prlimit(
+    pid:      i32,
+    resource: c_int,
+    new_lim:  *const rlimit,
+    old_lim:  *mut rlimit,
+) -> c_int {
+    let new_pair = if new_lim.is_null() {
+        None
+    } else {
+        // SAFETY: caller-asserted readable rlimit.
+        let r = unsafe { *new_lim };
+        Some([r.rlim_cur, r.rlim_max])
+    };
+    let mut old_pair: [u64; 2] = [0; 2];
+    let r = narf_user_runtime::prlimit64(
+        pid as u64,
+        resource as u32,
+        new_pair.as_ref(),
+        if old_lim.is_null() { None } else { Some(&mut old_pair) },
+    );
+    if r != 0 { return -1; }
+    if !old_lim.is_null() {
+        // SAFETY: caller-asserted writable rlimit.
+        unsafe {
+            *old_lim = rlimit {
+                rlim_cur: old_pair[0],
+                rlim_max: old_pair[1],
+            };
+        }
+    }
+    0
+}
+
 // ── <sched.h> CPU affinity ─────────────────────────────────────────
 
 /// glibc-shaped `cpu_set_t`. 1024 bits = 128 bytes = 16 u64 words.

@@ -300,6 +300,14 @@ pub enum Syscall {
     /// success, -1 on rejection.
     Setrlimit    = 149,
 
+    /// `arg0 = pid` (0 = self), `arg1 = resource`,
+    /// `arg2 = new_in_ptr`, `arg3 = old_out_ptr`. Linux
+    /// prlimit64(2): combined get-and-set. If `new` is non-null,
+    /// write the [cur, max] pair. If `old` is non-null, return
+    /// the prior value into it. Both null is a no-op-success.
+    /// Returns 0 on success, -1 on bad pointer / out-of-range.
+    Prlimit64    = 178,
+
     /// `arg0 = which` (PRIO_PROCESS=0 only honoured), `arg1 = who`
     /// (0 = self). Returns the current task's nice value (-20..=19),
     /// shifted by +20 so the wire value is 0..=39 (matches Linux's
@@ -638,6 +646,7 @@ impl Syscall {
             169 => Syscall::Prctl,
             175 => Syscall::Tgkill,
             177 => Syscall::Futex,
+            178 => Syscall::Prlimit64,
             176 => Syscall::ClockSetTime,
             156 => Syscall::Getpriority,
             157 => Syscall::Setpriority,
