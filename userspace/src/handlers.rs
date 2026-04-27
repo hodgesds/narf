@@ -1772,6 +1772,60 @@ fn sys_setrlimit(ctx: &mut dyn TrapContext) {
     }
 }
 
+// ── Sched_get/setaffinity — CPU bitmap ─────────────────────────────
+//
+// NARF user mode is single-CPU; the affinity bitmap is structural
+// state only. getaffinity always reports a 1-bit mask (CPU 0 set);
+// setaffinity reads the supplied bitmap and discards it (no
+// pinning to perform). Surface exists so pthread / libnuma
+// probes succeed at startup.
+
+fn sys_sched_getaffinity(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let _pid = args.arg0;
+    let size = args.arg1 as usize;
+    let out  = args.arg2 as *mut u8;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if out.is_null() || size == 0 {
+        ctx.set_return(fail);
+        return;
+    }
+    // Linux requires `size` be a multiple of sizeof(unsigned long)
+    // (8 on x86_64). Round down for the actual write but reject
+    // truly tiny requests so a caller's `cpu_set_t` matches.
+    if size < 8 {
+        ctx.set_return(fail);
+        return;
+    }
+    let bytes = size & !7;   // round to 8
+    // SAFETY: caller-supplied user vaddr; we write `bytes` bytes,
+    // first byte = 0x01 (CPU 0 set), rest zero.
+    unsafe {
+        core::ptr::write_volatile(out, 0x01);
+        for i in 1..bytes {
+            core::ptr::write_volatile(out.add(i), 0);
+        }
+    }
+    ctx.set_return(SyscallReturn::ok(bytes as u64));
+}
+
+fn sys_sched_setaffinity(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let _pid = args.arg0;
+    let size = args.arg1 as usize;
+    let buf  = args.arg2 as *const u8;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if buf.is_null() || size == 0 {
+        ctx.set_return(fail);
+        return;
+    }
+    // Read but discard — we don't pin. Read the first byte to
+    // surface a fault on a truly bad pointer.
+    // SAFETY: caller-supplied readable region.
+    let _ = unsafe { core::ptr::read_volatile(buf) };
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
 // ── Getcpu — current CPU + NUMA node query ─────────────────────────
 //
 // Linux getcpu(2): real CPU + NUMA node lookup. NARF user mode is
@@ -2863,6 +2917,10 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Setrlimit,   "setrlimit",   RawFnHandler(sys_setrlimit));
     table.install_raw(Syscall::Umask,       "umask",       RawFnHandler(sys_umask));
     table.install_raw(Syscall::Getcpu,      "getcpu",      RawFnHandler(sys_getcpu));
+    table.install_raw(Syscall::SchedGetaffinity, "sched_getaffinity",
+        RawFnHandler(sys_sched_getaffinity));
+    table.install_raw(Syscall::SchedSetaffinity, "sched_setaffinity",
+        RawFnHandler(sys_sched_setaffinity));
     table.install_raw(Syscall::Getpriority, "getpriority", RawFnHandler(sys_getpriority));
     table.install_raw(Syscall::Setpriority, "setpriority", RawFnHandler(sys_setpriority));
     table.install_raw(Syscall::Times,       "times",       RawFnHandler(sys_times));

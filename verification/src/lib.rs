@@ -12724,3 +12724,87 @@ fn smoke_userspace_getcpu_returns_zero() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_userspace_getcpu_returns_zero);
+
+fn smoke_userspace_sched_affinity_round_trip() -> TestResult {
+    use narf_userspace::{install_core_syscalls, install_global,
+                         kernel_syscall_entry, syscall::__test_clear_global,
+                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+                         TrapContext};
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // sched_getaffinity into a 16-byte buffer.
+    let mut mask = [0xFFu8; 16];
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 0,
+            arg1: mask.len() as u64,
+            arg2: mask.as_mut_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::SchedGetaffinity.raw(), &mut ctx);
+    let n = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value,
+        _ => return TestResult::Fail("sched_getaffinity did not return OK"),
+    };
+    if n != 16 {
+        return TestResult::Fail("sched_getaffinity byte-count != 16");
+    }
+    if mask[0] != 0x01 {
+        return TestResult::Fail("sched_getaffinity did not set CPU 0");
+    }
+    if mask[1..16].iter().any(|&b| b != 0) {
+        return TestResult::Fail("sched_getaffinity stamped a non-zero tail");
+    }
+
+    // sched_setaffinity returns 0 on a valid bitmap.
+    let in_mask = [0xAAu8; 16];
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 0,
+            arg1: in_mask.len() as u64,
+            arg2: in_mask.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::SchedSetaffinity.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+        return TestResult::Fail("sched_setaffinity did not return 0");
+    }
+
+    // Tiny size rejected.
+    let mut tiny = [0u8; 4];
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 0,
+            arg1: tiny.len() as u64,
+            arg2: tiny.as_mut_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::SchedGetaffinity.raw(), &mut ctx);
+    let tiny_rejected = matches!(
+        ctx.ret,
+        Some(r) if r.status == SyscallReturn::OK && r.value == (-1i64) as u64,
+    );
+    if !tiny_rejected {
+        return TestResult::Fail("sched_getaffinity did not reject tiny buf");
+    }
+
+    __test_clear_global();
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_sched_affinity_round_trip);

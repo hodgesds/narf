@@ -316,6 +316,83 @@ pub unsafe extern "C" fn setrlimit(resource: c_int, rlim: *const rlimit) -> c_in
     narf_user_runtime::setrlimit(resource as u32, &pair)
 }
 
+// ── <sched.h> CPU affinity ─────────────────────────────────────────
+
+/// glibc-shaped `cpu_set_t`. 1024 bits = 128 bytes = 16 u64 words.
+/// Linux's actual cpu_set_t is the same shape.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct cpu_set_t {
+    pub bits: [u64; 16],
+}
+
+impl Default for cpu_set_t {
+    fn default() -> Self { Self { bits: [0; 16] } }
+}
+
+/// `CPU_ZERO(set)` — clear every bit.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn CPU_ZERO(set: *mut cpu_set_t) {
+    if set.is_null() { return; }
+    // SAFETY: caller-supplied writable struct.
+    unsafe { *set = cpu_set_t::default(); }
+}
+
+/// `CPU_SET(cpu, set)` — set bit `cpu`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn CPU_SET(cpu: c_int, set: *mut cpu_set_t) {
+    if set.is_null() || cpu < 0 || cpu >= 1024 { return; }
+    let i = (cpu / 64) as usize;
+    let b = (cpu % 64) as u64;
+    // SAFETY: caller-supplied; index in-range.
+    unsafe { (*set).bits[i] |= 1u64 << b; }
+}
+
+/// `CPU_ISSET(cpu, set)` — non-zero iff bit `cpu` is set.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn CPU_ISSET(cpu: c_int, set: *const cpu_set_t) -> c_int {
+    if set.is_null() || cpu < 0 || cpu >= 1024 { return 0; }
+    let i = (cpu / 64) as usize;
+    let b = (cpu % 64) as u64;
+    // SAFETY: caller-supplied readable struct.
+    let bit = unsafe { ((*set).bits[i] >> b) & 1 };
+    bit as c_int
+}
+
+/// `sched_getaffinity(pid, cpusetsize, mask)` — Linux signature.
+/// Returns 0 on success, -1 on bad pointer or oversized request.
+///
+/// # Safety
+/// `mask` must be writable for `cpusetsize` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sched_getaffinity(
+    pid: u32,
+    cpusetsize: usize,
+    mask: *mut cpu_set_t,
+) -> c_int {
+    if mask.is_null() || cpusetsize == 0 { return -1; }
+    // SAFETY: caller-supplied writable region.
+    let bytes = unsafe { core::slice::from_raw_parts_mut(mask as *mut u8, cpusetsize) };
+    let n = narf_user_runtime::sched_getaffinity(pid, bytes);
+    if n < 0 { -1 } else { 0 }
+}
+
+/// `sched_setaffinity(pid, cpusetsize, mask)`.
+///
+/// # Safety
+/// `mask` must be readable for `cpusetsize` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sched_setaffinity(
+    pid: u32,
+    cpusetsize: usize,
+    mask: *const cpu_set_t,
+) -> c_int {
+    if mask.is_null() || cpusetsize == 0 { return -1; }
+    // SAFETY: caller-supplied readable region.
+    let bytes = unsafe { core::slice::from_raw_parts(mask as *const u8, cpusetsize) };
+    narf_user_runtime::sched_setaffinity(pid, bytes)
+}
+
 // ── <sched.h> sched_getcpu ─────────────────────────────────────────
 
 /// `sched_getcpu()` — return the CPU id the calling task is

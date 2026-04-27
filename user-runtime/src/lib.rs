@@ -74,6 +74,8 @@ pub const SYS_SETRLIMIT:      u64 = 149;
 pub const SYS_UMASK:          u64 = 155;
 pub const SYS_GETPRIORITY:    u64 = 156;
 pub const SYS_GETCPU:         u64 = 165;
+pub const SYS_SCHED_GETAFFINITY: u64 = 166;
+pub const SYS_SCHED_SETAFFINITY: u64 = 167;
 pub const SYS_SETPRIORITY:    u64 = 157;
 pub const SYS_TIMES:          u64 = 158;
 pub const SYS_GETRUSAGE:      u64 = 159;
@@ -503,6 +505,38 @@ pub fn getrusage(who: i32, buf: &mut [i64; 18]) -> i32 {
 pub fn umask(new_mask: u32) -> u32 {
     // SAFETY: SYS_UMASK signature: (new_mask).
     unsafe { syscall1(SYS_UMASK, new_mask as u64) as u32 }
+}
+
+/// `sched_getaffinity(pid, mask)` — fill `mask` with the CPU
+/// affinity bitmap of `pid` (0 = self). Returns the byte count
+/// written on success, -1 on bad input.
+#[inline]
+pub fn sched_getaffinity(pid: u32, mask: &mut [u8]) -> isize {
+    if mask.is_empty() { return -1; }
+    // SAFETY: SYS_SCHED_GETAFFINITY signature: (pid, size, mask_ptr).
+    let r = unsafe {
+        syscall3(
+            SYS_SCHED_GETAFFINITY,
+            pid as u64, mask.len() as u64, mask.as_mut_ptr() as u64,
+        )
+    };
+    r as isize
+}
+
+/// `sched_setaffinity(pid, mask)` — record a desired affinity
+/// bitmap. NARF doesn't pin tasks; the bitmap is read but ignored.
+/// Returns 0 on success, -1 on bad input.
+#[inline]
+pub fn sched_setaffinity(pid: u32, mask: &[u8]) -> i32 {
+    if mask.is_empty() { return -1; }
+    // SAFETY: SYS_SCHED_SETAFFINITY signature: (pid, size, mask_ptr).
+    let r = unsafe {
+        syscall3(
+            SYS_SCHED_SETAFFINITY,
+            pid as u64, mask.len() as u64, mask.as_ptr() as u64,
+        )
+    };
+    if r as i64 == -1 { -1 } else { 0 }
 }
 
 /// `getcpu(*cpu, *node)` — write the current CPU id and NUMA

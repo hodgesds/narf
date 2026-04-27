@@ -296,6 +296,21 @@ pub enum Syscall {
     /// single-CPU today — both return 0. Returns 0 on success.
     Getcpu       = 165,
 
+    /// `arg0 = pid` (0 = self), `arg1 = mask_size` (bytes),
+    /// `arg2 = mask_out_ptr`. Linux sched_getaffinity(2): write
+    /// a CPU-set bitmap for the target task. NARF is single-CPU
+    /// in user mode; we always return a 1-bit mask (CPU 0 set,
+    /// every other bit clear). Returns the byte count written
+    /// on success (= `mask_size` rounded down to a multiple of 8),
+    /// -1 on bad pointer or oversized request.
+    SchedGetaffinity = 166,
+
+    /// `arg0 = pid`, `arg1 = mask_size` (bytes),
+    /// `arg2 = mask_in_ptr`. sched_setaffinity(2). NARF doesn't
+    /// pin tasks (single-CPU model); the bitmap is read but
+    /// ignored. Returns 0 on success, -1 on bad pointer.
+    SchedSetaffinity = 167,
+
     /// Set or query the per-task heap break.
     /// `arg0 = 0` → return current break; `arg0 != 0` → resize.
     /// POSIX `brk(2)` semantics: failure returns the unchanged break.
@@ -501,6 +516,8 @@ impl Syscall {
             149 => Syscall::Setrlimit,
             155 => Syscall::Umask,
             165 => Syscall::Getcpu,
+            166 => Syscall::SchedGetaffinity,
+            167 => Syscall::SchedSetaffinity,
             156 => Syscall::Getpriority,
             157 => Syscall::Setpriority,
             158 => Syscall::Times,
