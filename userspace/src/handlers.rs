@@ -1170,6 +1170,46 @@ fn sys_truncate(ctx: &mut dyn TrapContext) {
     }
 }
 
+// ── fchmodat / fchownat — *at-keyed mode/owner ─────────────────────
+//
+// NARF doesn't support directory fds, so the dirfd arg is
+// ignored. Path must be absolute; if it resolves we report
+// success (mode/uid/gid bits are structural-only state we don't
+// enforce). Relative paths are rejected with -1 to keep the
+// consumer's error-checking honest.
+
+fn sys_fchmodat_or_fchownat(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let _dirfd = args.arg0;
+    let ptr    = args.arg1 as *const u8;
+    let len    = args.arg2 as usize;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if ptr.is_null() || len == 0 {
+        ctx.set_return(fail);
+        return;
+    }
+    // SAFETY: caller-supplied user pointer in active AS.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+    let path = match core::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => { ctx.set_return(fail); return; }
+    };
+    if !path.starts_with('/') {
+        // Relative paths require dirfd resolution we don't have.
+        ctx.set_return(fail);
+        return;
+    }
+    // Existence check: any FileOps lookup returning Some is enough.
+    let exists = narf_filesystem::registry().resolve_absolute(path, |fs, rel| {
+        narf_filesystem::resolve(fs.root(), rel).ok()
+    }).flatten().is_some();
+    if exists {
+        ctx.set_return(SyscallReturn::ok(0));
+    } else {
+        ctx.set_return(fail);
+    }
+}
+
 // ── fchmod / fchown — accept-and-ignore on known fd ───────────────
 //
 // NARF has no per-file permission bits or owner; the kernel
@@ -3807,6 +3847,8 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         RawFnHandler(sys_memfd_create));
     table.install_raw(Syscall::Fchmod, "fchmod", RawFnHandler(sys_fchmod_or_fchown));
     table.install_raw(Syscall::Fchown, "fchown", RawFnHandler(sys_fchmod_or_fchown));
+    table.install_raw(Syscall::Fchmodat, "fchmodat", RawFnHandler(sys_fchmodat_or_fchownat));
+    table.install_raw(Syscall::Fchownat, "fchownat", RawFnHandler(sys_fchmodat_or_fchownat));
 
     // Tier-2 cwd state + nanosleep wired into the table. Sleep
     // already replaced the noop_ok stub above.

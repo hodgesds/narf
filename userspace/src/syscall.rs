@@ -233,6 +233,18 @@ pub enum Syscall {
     /// accept-and-record semantics as fchmod.
     Fchown       = 131,
 
+    /// `arg0 = dirfd` (ignored — NARF has no directory-fd type),
+    /// `arg1 = path_ptr`, `arg2 = path_len`, `arg3 = mode`,
+    /// `arg4 = flags` (ignored). Linux fchmodat(2). The path
+    /// must be absolute. Returns 0 on a reachable path, -1
+    /// otherwise (consumer code error-checks the chmod return).
+    Fchmodat     = 134,
+
+    /// `arg0 = dirfd`, `arg1 = path_ptr`, `arg2 = path_len`,
+    /// `arg3 = uid`, `arg4 = gid`, `arg5 = flags`. fchownat(2).
+    /// Same path-must-be-absolute simplification as fchmodat.
+    Fchownat     = 135,
+
     /// `arg0 = pipefd_out_ptr`, `arg1 = flags`. Linux pipe2(2):
     /// pipe + atomic flag set. Honoured flag: O_CLOEXEC (bit
     /// 0x80000) — both ends get FD_CLOEXEC stamped at install
@@ -668,6 +680,8 @@ impl Syscall {
             131 => Syscall::Fchown,
             132 => Syscall::Truncate,
             133 => Syscall::Lstat,
+            134 => Syscall::Fchmodat,
+            135 => Syscall::Fchownat,
             120 => Syscall::Mmap,
             121 => Syscall::Munmap,
             130 => Syscall::RingKick,

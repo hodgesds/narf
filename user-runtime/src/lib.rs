@@ -79,6 +79,8 @@ pub const SYS_COPY_FILE_RANGE: u64 = 127;
 pub const SYS_MEMFD_CREATE:   u64 = 128;
 pub const SYS_FCHMOD:         u64 = 129;
 pub const SYS_FCHOWN:         u64 = 131;
+pub const SYS_FCHMODAT:       u64 = 134;
+pub const SYS_FCHOWNAT:       u64 = 135;
 pub const SYS_GETHOSTNAME:    u64 = 146;
 pub const SYS_SETHOSTNAME:    u64 = 147;
 pub const SYS_GETRLIMIT:      u64 = 148;
@@ -1323,6 +1325,37 @@ pub fn fchmod(fd: u32, mode: u32) -> i32 {
 pub fn fchown(fd: u32, uid: u32, gid: u32) -> i32 {
     // SAFETY: SYS_FCHOWN signature: (fd, uid, gid).
     let r = unsafe { syscall3(SYS_FCHOWN, fd as u64, uid as u64, gid as u64) };
+    if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `fchmodat(dirfd, path, mode, flags)` — Linux *at variant.
+/// Path must be absolute; dirfd is ignored.
+#[inline]
+pub fn fchmodat(dirfd: i32, path: &str, mode: u32, flags: i32) -> i32 {
+    if path.is_empty() { return -1; }
+    // SAFETY: SYS_FCHMODAT signature: (dirfd, path_ptr, path_len, mode, flags).
+    let r = unsafe {
+        syscall5(
+            SYS_FCHMODAT, dirfd as u64,
+            path.as_ptr() as u64, path.len() as u64,
+            mode as u64, flags as u64,
+        )
+    };
+    if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `fchownat(dirfd, path, uid, gid, flags)` — Linux *at variant.
+#[inline]
+pub fn fchownat(dirfd: i32, path: &str, uid: u32, gid: u32, flags: i32) -> i32 {
+    if path.is_empty() { return -1; }
+    // SAFETY: SYS_FCHOWNAT signature: (dirfd, path_ptr, path_len, uid, gid, flags).
+    let r = unsafe {
+        syscall6(
+            SYS_FCHOWNAT, dirfd as u64,
+            path.as_ptr() as u64, path.len() as u64,
+            uid as u64, gid as u64, flags as u64,
+        )
+    };
     if r as i64 == -1 { -1 } else { 0 }
 }
 

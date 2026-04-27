@@ -337,6 +337,45 @@ pub unsafe extern "C" fn lchown(path: *const c_char, uid: u32, gid: u32) -> c_in
     unsafe { chown(path, uid, gid) }
 }
 
+pub const AT_FDCWD: c_int = -100;
+
+/// `fchmodat(dirfd, path, mode, flags)` — Linux `*at(2)` variant.
+/// `dirfd` is ignored (NARF has no directory-fd type); path must
+/// be absolute.
+///
+/// # Safety
+/// `path` must be a NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fchmodat(
+    dirfd: c_int,
+    path:  *const c_char,
+    mode:  u32,
+    flags: c_int,
+) -> c_int {
+    if path.is_null() { return -1; }
+    // SAFETY: caller-asserted NUL-terminator.
+    let s = unsafe { cstr_to_str(path) };
+    narf_user_runtime::fchmodat(dirfd, s, mode, flags)
+}
+
+/// `fchownat(dirfd, path, uid, gid, flags)` — Linux `*at(2)`.
+///
+/// # Safety
+/// See [`fchmodat`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fchownat(
+    dirfd: c_int,
+    path:  *const c_char,
+    uid:   u32,
+    gid:   u32,
+    flags: c_int,
+) -> c_int {
+    if path.is_null() { return -1; }
+    // SAFETY: caller-asserted NUL-terminator.
+    let s = unsafe { cstr_to_str(path) };
+    narf_user_runtime::fchownat(dirfd, s, uid, gid, flags)
+}
+
 /// `fsync(fd)` — request a flush of buffered writes. NARF FSes
 /// are in-memory so the call is structural.
 #[unsafe(no_mangle)]
