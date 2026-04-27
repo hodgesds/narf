@@ -508,6 +508,19 @@ The critical-path Stage-2 items remaining:
    pattern *and* asserts the dispatch table observed at least one
    MSI during the I/O.
 
+   PCIe driver-match registry (`bus::driver_match`) lets drivers
+   register `(name, MatchKind, probe_fn)` entries — `MatchKind` is
+   `VendorDevice` (most specific), `Class { class, mask }`, or
+   `Vendor` (least). `probe_all_pci(authority)` walks the bus
+   registry, picks the highest-specificity matching entry per
+   device, mints a `Cap<BusDeviceCap, Write>` via
+   `claim_device_cap`, and invokes the probe. NVMe registers two
+   match entries (exact 0x1B36:0x0010 + class 0x01 storage) plus
+   a `probe(device, cap)` fn that brings the controller up and
+   stashes it in a static; `narf_drivers_nvme::with_controller`
+   exposes the probed controller for inspection. Smokes:
+   `smoke_pci_match_specificity`, `smoke_pci_probe_all_dispatches_nvme`.
+
    PCI command-register helper (`bus::pci::{set_command, clear_command,
    read_command}`) is cap-gated on `Cap<BusDeviceCap, Write>` and
    handles cfg-space offset 0x04 (`MEM_SPACE`, `BUS_MASTER`,

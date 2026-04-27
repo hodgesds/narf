@@ -35,6 +35,7 @@ pub mod acpi_notify;
 pub mod addr;
 pub mod bar;
 pub mod device;
+pub mod driver_match;
 pub mod hotplug;
 pub mod msix;
 pub mod pci;
@@ -51,6 +52,11 @@ pub mod aarch64;
 
 pub use addr::{BusAddr, PcieAddr};
 pub use bar::{map_bar, read_bar, Bar, BarError, BarKind, MmioRegion, NUM_BARS};
+pub use driver_match::{
+    probe_all as probe_all_pci, register as register_pci_driver,
+    registered as registered_pci_drivers, MatchKind, PciMatch, PciProbeFn,
+    ProbeError,
+};
 pub use device::{BusDevice, BusKind, DeviceId};
 pub use hotplug::{
     dispatch_event, register_listener, HotplugError, HotplugEvent, HotplugListener,

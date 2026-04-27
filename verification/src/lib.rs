@@ -5645,6 +5645,74 @@ fn smoke_pci_command_bme_round_trip() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_pci_command_bme_round_trip);
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_pci_match_specificity() -> TestResult {
+    // Specificity rules: VendorDevice > Class > Vendor. When a
+    // device matches multiple entries `probe_all` picks the most
+    // specific.
+    use narf_bus::{MatchKind};
+    let vd = MatchKind::VendorDevice { vendor: 0x1B36, device: 0x0010 };
+    let cls = MatchKind::Class { class: 0x01, mask: 0xFF };
+    let v   = MatchKind::Vendor { vendor: 0x1B36 };
+    if vd.specificity() <= cls.specificity()
+        || cls.specificity() <= v.specificity() {
+        return TestResult::Fail("specificity ordering broken");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_pci_match_specificity);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_pci_probe_all_dispatches_nvme() -> TestResult {
+    // End-to-end registry path: register the NVMe driver via the
+    // bus-level match table, run probe_all, and assert the NVMe
+    // controller stashed itself in its own static after a
+    // successful probe.
+    use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    // SAFETY: ECAM identity-mapped; init idempotent.
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let has_nvme = devs.iter().any(|d| matches!(
+        &d.kind, BusKind::Pcie { .. }
+    ) && d.id.vendor == 0x1B36 && d.id.device == 0x0010);
+    if !has_nvme {
+        return TestResult::Skip("no QEMU NVMe controller");
+    }
+
+    // Hermetic: clear any earlier registrations.
+    __reset_for_test();
+    narf_drivers_nvme::register_pci_driver();
+    let n_drivers = narf_bus::registered_pci_drivers().len();
+    if n_drivers != 2 {
+        return TestResult::Fail("nvme should register both vendor+class entries");
+    }
+
+    let authority = bootstrap_registry_authority();
+    let bound = match probe_all_pci(&authority) {
+        Ok(n)  => n,
+        Err(_) => return TestResult::Fail("probe_all_pci returned AuthorityRevoked"),
+    };
+    if bound == 0 {
+        return TestResult::Fail("probe_all_pci bound zero drivers");
+    }
+    if !narf_drivers_nvme::is_probed() {
+        return TestResult::Fail("NVMe driver did not stash a controller");
+    }
+    // Verify the probed controller has the IDENTIFY snapshot.
+    let model_starts_with_qemu = narf_drivers_nvme::with_controller(|c| {
+        c.identify().is_some_and(|id| &id.mn[..4] == b"QEMU")
+    }).unwrap_or(false);
+    if !model_starts_with_qemu {
+        return TestResult::Fail("probe-loaded controller missing IDENTIFY MN=QEMU");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_pci_probe_all_dispatches_nvme);
+
 fn smoke_drivers_net_nic_model_ids() -> TestResult {
     use narf_drivers_net::{NicCaps, NicModel};
 

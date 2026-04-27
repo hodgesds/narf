@@ -1009,3 +1009,80 @@ impl BlockDevice for NvmeBlockDevice {
         async { CancelResult::NotFound }
     }
 }
+
+// ── PCI driver-match registration ─────────────────────────────────────
+
+use narf_lib::sync::IrqSafeSpinLock;
+
+/// QEMU NVMe vendor / device IDs (Red Hat / NVMe controller).
+pub const QEMU_NVME_VENDOR: u16 = 0x1B36;
+pub const QEMU_NVME_DEVICE: u16 = 0x0010;
+
+/// Storage class — PCIe base-class 0x01 (mass storage). The NVMe
+/// driver also matches by class so it picks up real-silicon NVMe
+/// controllers whose vendor IDs we don't know ahead of time.
+pub const PCI_CLASS_STORAGE: u8 = 0x01;
+
+/// Slot for the live controller produced by `probe`. Wave-3a
+/// single-instance — multi-controller support arrives with a real
+/// driver-handle table.
+static CONTROLLER: IrqSafeSpinLock<Option<Controller>> =
+    IrqSafeSpinLock::new(None);
+
+/// Probe entry point dispatched by `bus::probe_all_pci`. Brings the
+/// NVMe controller online (admin queue + IDENTIFY + I/O queue) and
+/// stashes it in `CONTROLLER`. Returns `BadDevice` on bring-up
+/// failure — caller logs + continues with the next device.
+pub fn probe(
+    device: narf_bus::BusDevice,
+    cap:    narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+) -> Result<(), narf_bus::ProbeError> {
+    let mut ctrl = Controller::from_device(device);
+    if ctrl.bring_up(&cap).is_err() {
+        return Err(narf_bus::ProbeError::BadDevice);
+    }
+    if ctrl.create_io_queue().is_err() {
+        return Err(narf_bus::ProbeError::BadDevice);
+    }
+    *CONTROLLER.lock() = Some(ctrl);
+    Ok(())
+}
+
+/// Read-only accessor for the probed controller. Returns `true` iff
+/// `probe` has run successfully.
+pub fn is_probed() -> bool {
+    CONTROLLER.lock().is_some()
+}
+
+/// Run `f` against the probed controller, if any. The closure
+/// receives `&Controller` for read-only inspection (capacity, model,
+/// etc.); `&mut` access for I/O is reserved for a Wave-3b API that
+/// threads the cap through.
+pub fn with_controller<R>(f: impl FnOnce(&Controller) -> R) -> Option<R> {
+    CONTROLLER.lock().as_ref().map(f)
+}
+
+/// Register the NVMe driver with the bus-level match table. Trusted
+/// in-tree drivers call this from `frame::_start_rust` (or the
+/// kernel-test harness) before invoking `bus::probe_all_pci`.
+pub fn register_pci_driver() {
+    narf_bus::register_pci_driver(narf_bus::PciMatch {
+        name: "nvme",
+        kind: narf_bus::MatchKind::VendorDevice {
+            vendor: QEMU_NVME_VENDOR,
+            device: QEMU_NVME_DEVICE,
+        },
+        probe,
+    });
+    // Also register a class match so non-QEMU NVMe controllers pick
+    // up the same probe. Class match is lower specificity, so an
+    // exact-match entry (above) wins when both apply.
+    narf_bus::register_pci_driver(narf_bus::PciMatch {
+        name: "nvme-class",
+        kind: narf_bus::MatchKind::Class {
+            class: PCI_CLASS_STORAGE,
+            mask:  0xFF,
+        },
+        probe,
+    });
+}
