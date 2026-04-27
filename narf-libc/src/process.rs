@@ -302,6 +302,51 @@ pub unsafe extern "C" fn setgid(gid: u32) -> i32 {
     narf_user_runtime::setgid(gid)
 }
 
+// ── nice / priority ─────────────────────────────────────────────────
+
+/// `<sys/resource.h>` `which` values for [`getpriority`] /
+/// [`setpriority`]. NARF only honours `PRIO_PROCESS`; the others
+/// return -1 with errno = EINVAL.
+pub const PRIO_PROCESS: i32 = 0;
+pub const PRIO_PGRP:    i32 = 1;
+pub const PRIO_USER:    i32 = 2;
+
+/// `getpriority(which, who)` — read the nice value (-20..=19) of
+/// the target task. POSIX returns the value directly; on error
+/// the function sets errno to a non-zero value and returns -1.
+/// Callers must clear errno before the call to disambiguate a
+/// real -1 from an error since -1 is a valid nice value.
+///
+/// # Safety
+/// Pure value math.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn getpriority(which: i32, who: u32) -> i32 {
+    if which < 0 { return -1; }
+    let r = narf_user_runtime::getpriority(which as u32, who);
+    if r == -1 {
+        crate::errno::set_errno(22); // EINVAL
+        return -1;
+    }
+    r as i32
+}
+
+/// `setpriority(which, who, prio)` — record a new nice value.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn setpriority(which: i32, who: u32, prio: i32) -> i32 {
+    if which < 0 { return -1; }
+    narf_user_runtime::setpriority(which as u32, who, prio)
+}
+
+/// `nice(inc)` — adjust the calling task's nice value by `inc`.
+/// Returns the new nice value on success, -1 on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nice(inc: i32) -> i32 {
+    let cur = narf_user_runtime::getpriority(0, 0) as i32;
+    let new = (cur + inc).clamp(-20, 19);
+    let r = narf_user_runtime::setpriority(0, 0, new);
+    if r == 0 { new } else { -1 }
+}
+
 /// `getgid()` — always 0 (matches getuid).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn getgid() -> i32 {

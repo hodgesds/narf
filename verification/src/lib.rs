@@ -12452,3 +12452,76 @@ fn smoke_userspace_rlimit_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_userspace_rlimit_round_trip);
+
+fn smoke_userspace_priority_round_trip() -> TestResult {
+    use narf_userspace::{install_core_syscalls, install_global,
+                         kernel_syscall_entry, nice_init,
+                         syscall::__test_clear_global,
+                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+                         TrapContext};
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+    narf_userspace::handlers::__test_nice_reset();
+    nice_init();
+
+    fn call(s: Syscall, arg0: u64, arg1: u64, arg2: u64) -> Option<SyscallReturn> {
+        let mut ctx = FakeCtx {
+            args: SyscallArgs { arg0, arg1, arg2, ..SyscallArgs::default() },
+            ret: None,
+        };
+        kernel_syscall_entry(s.raw(), &mut ctx);
+        ctx.ret
+    }
+
+    // Default nice = 0 → wire value 20 (0 + 20 shift).
+    let r = call(Syscall::Getpriority, 0, 0, 0).map(|r| r.value).unwrap_or(!0);
+    if r != 20 {
+        return TestResult::Fail("default nice wire value not 20");
+    }
+
+    // setpriority(PRIO_PROCESS, 0, 5).
+    let r = call(Syscall::Setpriority, 0, 0, 5);
+    if !matches!(r, Some(rr) if rr.status == SyscallReturn::OK && rr.value == 0) {
+        return TestResult::Fail("setpriority(5) did not return OK");
+    }
+
+    // Re-read: wire value = 25 (5 + 20).
+    let r = call(Syscall::Getpriority, 0, 0, 0).map(|r| r.value).unwrap_or(!0);
+    if r != 25 {
+        return TestResult::Fail("setpriority did not stick");
+    }
+
+    // Out-of-range nice rejected.
+    let r = call(Syscall::Setpriority, 0, 0, 100);
+    let bad_rejected = matches!(
+        r,
+        Some(rr) if rr.status == SyscallReturn::OK && rr.value == (-1i64) as u64,
+    );
+    if !bad_rejected {
+        return TestResult::Fail("setpriority(100) was not rejected");
+    }
+
+    // Bad which (1 = PRIO_PGRP) rejected.
+    let r = call(Syscall::Getpriority, 1, 0, 0);
+    let bad_which = matches!(
+        r,
+        Some(rr) if rr.status == SyscallReturn::OK && rr.value == (-1i64) as u64,
+    );
+    if !bad_which {
+        return TestResult::Fail("getpriority(PRIO_PGRP) was not rejected");
+    }
+
+    narf_userspace::handlers::__test_nice_reset();
+    __test_clear_global();
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_priority_round_trip);

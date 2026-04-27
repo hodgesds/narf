@@ -1772,6 +1772,80 @@ fn sys_setrlimit(ctx: &mut dyn TrapContext) {
     }
 }
 
+// ── Per-task nice / priority table ─────────────────────────────────
+//
+// POSIX getpriority / setpriority manage a task's nice value
+// (-20..=19, lower is more favoured). NARF's scheduler doesn't
+// use this for routing today (capability-gated CpuBudget caps and
+// the ResourceBudget surface own that), but real Linux programs
+// often setpriority(PRIO_PROCESS, 0, 10) to be polite when
+// running batch work. Honouring the round-trip lets that pattern
+// stick.
+
+const PRIO_PROCESS_VAL: i64 = 0;
+
+static NICE_TABLE:
+    narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, i32>>>
+    = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+pub fn nice_init() {
+    *NICE_TABLE.lock() = Some(BTreeMap::new());
+}
+
+#[doc(hidden)]
+pub fn __test_nice_reset() { *NICE_TABLE.lock() = None; }
+
+fn read_nice(task: u64) -> i32 {
+    let g = NICE_TABLE.lock();
+    g.as_ref()
+        .and_then(|m| m.get(&task).copied())
+        .unwrap_or(0)
+}
+
+fn write_nice(task: u64, prio: i32) -> bool {
+    let mut g = NICE_TABLE.lock();
+    let Some(m) = g.as_mut() else { return false; };
+    m.insert(task, prio);
+    true
+}
+
+fn sys_getpriority(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let which = args.arg0 as i64;
+    let _who  = args.arg1;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if which != PRIO_PROCESS_VAL {
+        ctx.set_return(fail);
+        return;
+    }
+    let task = current_task_id();
+    let nice = read_nice(task);
+    // Linux convention: getpriority returns the value pre-shifted
+    // by +20 so a -20..=19 nice maps to 0..=39 on the wire — the
+    // user-side libc subtracts 20 to recover the signed value.
+    // Errors then surface as the wire -1 distinct from a value of 19.
+    let shifted = (nice + 20) as u64;
+    ctx.set_return(SyscallReturn::ok(shifted));
+}
+
+fn sys_setpriority(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let which = args.arg0 as i64;
+    let _who  = args.arg1;
+    let prio  = args.arg2 as i64;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if which != PRIO_PROCESS_VAL || !(-20..=19).contains(&prio) {
+        ctx.set_return(fail);
+        return;
+    }
+    let task = current_task_id();
+    if write_nice(task, prio as i32) {
+        ctx.set_return(SyscallReturn::ok(0));
+    } else {
+        ctx.set_return(fail);
+    }
+}
+
 // ── Hostname (kernel-wide) ─────────────────────────────────────────
 //
 // One global string behind an IrqSafeSpinLock, initialised to
@@ -2650,6 +2724,8 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::SetHostname, "sethostname", RawFnHandler(sys_sethostname));
     table.install_raw(Syscall::Getrlimit,   "getrlimit",   RawFnHandler(sys_getrlimit));
     table.install_raw(Syscall::Setrlimit,   "setrlimit",   RawFnHandler(sys_setrlimit));
+    table.install_raw(Syscall::Getpriority, "getpriority", RawFnHandler(sys_getpriority));
+    table.install_raw(Syscall::Setpriority, "setpriority", RawFnHandler(sys_setpriority));
     table.install_raw(Syscall::ExitTask, "exit",     RawFnHandler(sys_exit_task));
     table.install_raw(Syscall::Yield,    "yield",    RawFnHandler(sys_yield));
     table.install_raw(Syscall::Sleep,    "sleep",    RawFnHandler(sys_sleep));

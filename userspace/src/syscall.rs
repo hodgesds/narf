@@ -252,6 +252,18 @@ pub enum Syscall {
     /// success, -1 on rejection.
     Setrlimit    = 149,
 
+    /// `arg0 = which` (PRIO_PROCESS=0 only honoured), `arg1 = who`
+    /// (0 = self). Returns the current task's nice value (-20..=19),
+    /// shifted by +20 so the wire value is 0..=39 (matches Linux's
+    /// pre-shift convention so user code can subtract 20 without
+    /// caring about negatives crossing the wire). -1 on bad which.
+    Getpriority  = 156,
+
+    /// `arg0 = which`, `arg1 = who`, `arg2 = prio` (-20..=19,
+    /// already user-side). Stores the new nice value. Returns 0
+    /// on success, -1 on bad which / out-of-range prio.
+    Setpriority  = 157,
+
     /// Set or query the per-task heap break.
     /// `arg0 = 0` → return current break; `arg0 != 0` → resize.
     /// POSIX `brk(2)` semantics: failure returns the unchanged break.
@@ -455,6 +467,8 @@ impl Syscall {
             147 => Syscall::SetHostname,
             148 => Syscall::Getrlimit,
             149 => Syscall::Setrlimit,
+            156 => Syscall::Getpriority,
+            157 => Syscall::Setpriority,
             150 => Syscall::Brk,
             151 => Syscall::ClockGetTime,
             152 => Syscall::Sigaction,

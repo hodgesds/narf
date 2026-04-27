@@ -71,6 +71,8 @@ pub const SYS_GETHOSTNAME:    u64 = 146;
 pub const SYS_SETHOSTNAME:    u64 = 147;
 pub const SYS_GETRLIMIT:      u64 = 148;
 pub const SYS_SETRLIMIT:      u64 = 149;
+pub const SYS_GETPRIORITY:    u64 = 156;
+pub const SYS_SETPRIORITY:    u64 = 157;
 pub const SYS_BRK:            u64 = 150;
 pub const SYS_CLOCK_GETTIME:  u64 = 151;
 pub const SYS_SIGACTION:      u64 = 152;
@@ -466,6 +468,29 @@ pub fn fsync(fd: u32) -> i32 {
 pub fn fdatasync(fd: u32) -> i32 {
     // SAFETY: SYS_FDATASYNC takes a single arg (fd).
     let r = unsafe { syscall1(SYS_FDATASYNC, fd as u64) };
+    if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `getpriority(which, who)` — read the calling task's nice value.
+/// Linux convention: returns the value shifted by +20 (so the
+/// caller subtracts 20 to recover the signed nice). Returns -1 on
+/// bad `which`.
+#[inline]
+pub fn getpriority(which: u32, who: u32) -> i64 {
+    // SAFETY: SYS_GETPRIORITY signature: (which, who).
+    let r = unsafe { syscall2(SYS_GETPRIORITY, which as u64, who as u64) };
+    if r as i64 == -1 { -1 } else { (r as i64) - 20 }
+}
+
+/// `setpriority(which, who, prio)` — record a new nice value
+/// (-20..=19). Returns 0 on success, -1 on bad `which` or
+/// out-of-range prio.
+#[inline]
+pub fn setpriority(which: u32, who: u32, prio: i32) -> i32 {
+    // SAFETY: SYS_SETPRIORITY signature: (which, who, prio).
+    let r = unsafe {
+        syscall3(SYS_SETPRIORITY, which as u64, who as u64, prio as u64)
+    };
     if r as i64 == -1 { -1 } else { 0 }
 }
 
