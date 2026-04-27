@@ -70,6 +70,11 @@ const REG_EERD:   u64 = 0x0014;
 const REG_IMS:    u64 = 0x00D0;
 const REG_RCTL:   u64 = 0x0100;
 const REG_TCTL:   u64 = 0x0400;
+const REG_RDBAL:  u64 = 0x2800;
+const REG_RDBAH:  u64 = 0x2804;
+const REG_RDLEN:  u64 = 0x2808;
+const REG_RDH:    u64 = 0x2810;
+const REG_RDT:    u64 = 0x2818;
 const REG_TDBAL:  u64 = 0x3800;
 const REG_TDBAH:  u64 = 0x3804;
 const REG_TDLEN:  u64 = 0x3808;
@@ -92,7 +97,22 @@ const TXD_CMD_IFCS: u8 = 1 << 1;    // Insert FCS
 const TXD_CMD_RS:   u8 = 1 << 3;    // Report Status
 const TXD_STAT_DD:  u8 = 1 << 0;    // Done
 
+// RCTL bits (Receive Control register).
+const RCTL_EN:      u32 = 1 << 1;   // Receiver Enable
+const RCTL_UPE:     u32 = 1 << 3;   // Unicast Promiscuous
+const RCTL_MPE:     u32 = 1 << 4;   // Multicast Promiscuous
+const RCTL_BAM:     u32 = 1 << 15;  // Broadcast Accept
+const RCTL_BSIZE_2K:u32 = 0 << 16;  // Buffer Size = 2048
+const RCTL_SECRC:   u32 = 1 << 26;  // Strip Ethernet CRC
+
+// RX descriptor status flags.
+const RXD_STAT_DD:   u8 = 1 << 0;   // Done
+const RXD_STAT_EOP:  u8 = 1 << 1;   // End of Packet
+
 const TX_RING_LEN:  usize = 8;
+const RX_RING_LEN:  usize = 8;
+/// Buffer size for each RX entry — must match RCTL.BSIZE.
+const RX_BUF_LEN:   usize = 2048;
 
 #[repr(C, align(16))]
 #[derive(Copy, Clone, Debug, Default)]
@@ -107,6 +127,19 @@ struct TxDesc {
 }
 
 const _: () = assert!(core::mem::size_of::<TxDesc>() == 16);
+
+#[repr(C, align(16))]
+#[derive(Copy, Clone, Debug, Default)]
+struct RxDesc {
+    addr:    u64,
+    length:  u16,
+    csum:    u16,
+    status:  u8,
+    errors:  u8,
+    special: u16,
+}
+
+const _: () = assert!(core::mem::size_of::<RxDesc>() == 16);
 
 /// e1000 driver errors.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -129,6 +162,15 @@ pub struct E1000 {
     tx_ring:    DmaBuffer,
     /// Driver-side TDT cursor (tail).
     tx_tail:    IrqSafeSpinLock<u32>,
+    /// RX descriptor-ring DMA buffer.
+    rx_ring:    DmaBuffer,
+    /// RX buffer pool — one DMA page per descriptor (`RX_BUF_LEN`
+    /// bytes consumed; remainder unused).
+    rx_pool:    alloc::vec::Vec<DmaBuffer>,
+    /// Driver-side RX head cursor (next descriptor to inspect for
+    /// completion). The hardware writes to RDT and we lag behind
+    /// reading at this index.
+    rx_head:    IrqSafeSpinLock<u32>,
     /// MAC address read from RAL/RAH at bring-up.
     pub mac:    [u8; 6],
     /// True after CTRL_SLU has been set + STATUS reports link up.
@@ -218,6 +260,44 @@ impl E1000 {
         // SAFETY: same.
         unsafe { mmio.write32(REG_TCTL, TCTL_EN | TCTL_PSP); }
 
+        // 5b. Allocate RX descriptor ring + buffer pool.
+        let rx_ring = alloc_coherent(4096, DomainId::DRIVER_0)
+            .map_err(|_| E1000Error::NoMemory)?;
+        let rx_ring_phys = rx_ring.phys_addr().raw();
+        let mut rx_pool: alloc::vec::Vec<DmaBuffer> =
+            alloc::vec::Vec::with_capacity(RX_RING_LEN);
+        for i in 0..RX_RING_LEN {
+            let buf = alloc_coherent(4096, DomainId::DRIVER_0)
+                .map_err(|_| E1000Error::NoMemory)?;
+            let buf_phys = buf.phys_addr().raw();
+            let desc = RxDesc {
+                addr: buf_phys,
+                length: 0, csum: 0, status: 0, errors: 0, special: 0,
+            };
+            // SAFETY: identity-mapped DMA ring.
+            unsafe {
+                core::ptr::write_volatile(
+                    (rx_ring_phys + (i * 16) as u64) as *mut RxDesc, desc);
+            }
+            rx_pool.push(buf);
+        }
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            mmio.write32(REG_RDBAL, rx_ring_phys as u32);
+            mmio.write32(REG_RDBAH, (rx_ring_phys >> 32) as u32);
+            mmio.write32(REG_RDLEN, (RX_RING_LEN * 16) as u32);
+            mmio.write32(REG_RDH, 0);
+            // RDT points to the last *available* slot (i.e. one past
+            // the last filled slot). With all slots filled, RDT =
+            // RX_RING_LEN - 1.
+            mmio.write32(REG_RDT, (RX_RING_LEN - 1) as u32);
+            // RCTL: enable, accept broadcast/unicast/multicast,
+            // strip CRC, 2K buffers.
+            mmio.write32(REG_RCTL,
+                RCTL_EN | RCTL_BAM | RCTL_UPE | RCTL_MPE
+                | RCTL_SECRC | RCTL_BSIZE_2K);
+        }
+
         // 6. Set link up.
         // SAFETY: same.
         let cur = unsafe { mmio.read32(REG_CTRL) };
@@ -233,6 +313,9 @@ impl E1000 {
             mmio,
             tx_ring,
             tx_tail: IrqSafeSpinLock::new(0),
+            rx_ring,
+            rx_pool,
+            rx_head: IrqSafeSpinLock::new(0),
             mac,
             link_up,
         })
@@ -294,6 +377,66 @@ impl E1000 {
         // scratch drops here.
         let _ = scratch;
         Ok(())
+    }
+
+    /// Drain one received frame from the RX ring, copying it into
+    /// `out` and returning the number of bytes. Returns 0 if no
+    /// frame is currently pending. After consuming, the descriptor
+    /// is rearmed and RDT is bumped so the device sees the freshly-
+    /// available slot.
+    pub fn rx_recv(&self, out: &mut [u8]) -> usize {
+        let mut head_g = self.rx_head.lock();
+        let head = (*head_g) as usize;
+        let ring_phys = self.rx_ring.phys_addr().raw();
+        let desc_addr = ring_phys + (head * 16) as u64;
+        // SAFETY: identity-mapped DMA ring; head < RX_RING_LEN.
+        let desc = unsafe { core::ptr::read_volatile(desc_addr as *const RxDesc) };
+        if desc.status & RXD_STAT_DD == 0 { return 0; }
+        // Copy out the payload.
+        let len = (desc.length as usize).min(out.len()).min(RX_BUF_LEN);
+        let buf_phys = desc.addr;
+        // SAFETY: identity-mapped DMA buffer.
+        for i in 0..len {
+            out[i] = unsafe {
+                core::ptr::read_volatile((buf_phys + i as u64) as *const u8)
+            };
+        }
+        // Rearm the descriptor: clear status, leave addr as-is.
+        let new_desc = RxDesc { addr: buf_phys, length: 0, csum: 0,
+            status: 0, errors: 0, special: 0 };
+        // SAFETY: identity-mapped DMA ring.
+        unsafe {
+            core::ptr::write_volatile(desc_addr as *mut RxDesc, new_desc);
+        }
+        // Bump RDT so the device sees this slot as available again.
+        // RDT points at the last available slot — i.e. the previous
+        // ring index relative to head's new value.
+        let new_head = ((head + 1) % RX_RING_LEN) as u32;
+        let new_rdt = ((head + RX_RING_LEN - 1) % RX_RING_LEN) as u32;
+        // No, that's wrong — rethink: RDT should be the slot most
+        // recently freed by the driver. After we just consumed
+        // descriptor `head`, the most recently freed slot is `head`
+        // itself, so RDT = head.
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: identity-mapped MMIO.
+        unsafe { self.mmio.write32(REG_RDT, head as u32); }
+        let _ = new_rdt;
+        *head_g = new_head;
+        len
+    }
+
+    /// `true` if at least one RX descriptor has its DD bit set.
+    /// Cheaper than `rx_recv` when callers want to poll without
+    /// consuming.
+    pub fn rx_has_pending(&self) -> bool {
+        let head = (*self.rx_head.lock()) as usize;
+        let ring_phys = self.rx_ring.phys_addr().raw();
+        let desc_addr = ring_phys + (head * 16) as u64;
+        // SAFETY: identity-mapped DMA ring.
+        let status = unsafe {
+            core::ptr::read_volatile((desc_addr + 12) as *const u8)
+        };
+        status & RXD_STAT_DD != 0
     }
 
     /// Read CTRL register — useful for tests + diagnostics.

@@ -6341,6 +6341,80 @@ fn smoke_e1000_bring_up_and_tx() -> TestResult {
 kernel_test!(smoke_e1000_bring_up_and_tx);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_e1000_rx_arp_request() -> TestResult {
+    // Build + transmit an ARP "who has 10.0.2.2 tell us" frame, then
+    // poll RX for ~250 ms looking for a response. QEMU's user-mode
+    // backend at 10.0.2.2 reliably ARPs back when asked.
+    use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_drivers_net::e1000;
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let has = devs.iter().any(|d|
+        matches!(&d.kind, BusKind::Pcie { .. })
+        && d.id.vendor == e1000::E1000_VENDOR
+        && (d.id.device == e1000::E1000_DEV_82540EM
+            || d.id.device == e1000::E1000_DEV_82545EM));
+    if !has { return TestResult::Skip("no e1000-class NIC"); }
+    __reset_for_test();
+    e1000::register_pci_driver();
+    let authority = bootstrap_registry_authority();
+    if probe_all_pci(&authority).is_err() {
+        return TestResult::Fail("probe_all_pci");
+    }
+    let mac = e1000::with_controller(|c| c.mac).unwrap_or([0; 6]);
+
+    // Build a 42-byte ARP request:
+    //   Eth: dst=FF:FF:FF:FF:FF:FF, src=mac, type=0x0806
+    //   ARP: htype=1 (Ethernet), ptype=0x0800 (IPv4), hlen=6, plen=4,
+    //        op=1 (request), sha=mac, spa=10.0.2.15, tha=0,
+    //        tpa=10.0.2.2 (QEMU gateway).
+    let mut frame = [0u8; 42];
+    for i in 0..6 { frame[i] = 0xFF; }
+    for i in 0..6 { frame[6 + i] = mac[i]; }
+    frame[12] = 0x08; frame[13] = 0x06;          // ethertype
+    frame[14] = 0x00; frame[15] = 0x01;          // htype = Ethernet
+    frame[16] = 0x08; frame[17] = 0x00;          // ptype = IPv4
+    frame[18] = 6;                                // hlen
+    frame[19] = 4;                                // plen
+    frame[20] = 0x00; frame[21] = 0x01;          // op = request
+    for i in 0..6 { frame[22 + i] = mac[i]; }    // sha
+    frame[28] = 10; frame[29] = 0; frame[30] = 2; frame[31] = 15; // spa
+    // tha = 0 (already)
+    frame[38] = 10; frame[39] = 0; frame[40] = 2; frame[41] = 2;  // tpa
+
+    if e1000::with_controller(|c| c.tx(&frame)).map(|r| r.is_ok())
+        .unwrap_or(false) == false
+    {
+        return TestResult::Fail("tx ARP request");
+    }
+
+    // Poll RX for up to ~10M iterations (~250 ms at typical QEMU
+    // emulation speed). Look for a frame whose ethertype is ARP
+    // (0x0806) AND ARP op is reply (2).
+    let mut rx_buf = [0u8; 1518];
+    let mut got_reply = false;
+    for _ in 0..10_000_000u32 {
+        let len = e1000::with_controller(|c| c.rx_recv(&mut rx_buf)).unwrap_or(0);
+        if len >= 42
+            && rx_buf[12] == 0x08 && rx_buf[13] == 0x06
+            && rx_buf[20] == 0x00 && rx_buf[21] == 0x02
+        {
+            got_reply = true;
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    if !got_reply {
+        return TestResult::Fail("no ARP reply received from QEMU gateway");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_e1000_rx_arp_request);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_virtio_rng_pci_probe() -> TestResult {
     // Probe-only: verify that virtio-rng-pci's bring_up runs and
     // installs a controller. The data-path (read_bytes via queue
