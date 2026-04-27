@@ -1,19 +1,24 @@
 # NARF
 
-**Not Another Rust Frankenkernel** — a Rust *framekernel* that combines the
+**Not Another Rust Frame Kernel** — a Rust *framekernel* that combines the
 safety of a microkernel TCB with the performance of hardware-assisted
 intra-address-space isolation.
 
 > "NARF: Because security shouldn't feel like a speed limit."
 
-Status: **Stage 3 composition landed**. Stages 1 ("Skeleton") and 2
-("Barrier") are closed; Stage 3 ("Flow") has every subsystem the
-ROADMAP lists for it wired end-to-end, with `smoke_exit_gate_*`
-proving the `DmaBuffer → Narf-Ring → cap-gated consumer` composition
-on both x86_64 and aarch64. Stage 4 ("Compatibility") — real PKS/MTE
-enforcement on buffer pages, driving real virtio hardware, IOMMU
-programming, user-mode consumer via `abi/` — is next. See `STATUS.md`
-for current test tallies and `ROADMAP.md` / `STAGE3.md` for the plan.
+Status: **Stage 4 driver readiness landed**. Stages 1 ("Skeleton") and 2
+("Barrier") are closed; Stage 3 ("Flow") shipped end-to-end with
+`smoke_exit_gate_*` proving the `DmaBuffer → Narf-Ring → cap-gated
+consumer` composition on both arches. The current round added the
+driver-readiness surfaces — full IDT (32..=254), generic IRQ dispatch
++ vector allocator + `wait_for_irq` future, x2APIC, GICv3 ITS, BAR
+sizing/map, MSI-X programming on both arches, end-to-end NVMe admin
+and I/O queues with MSI-X-driven completions on x86_64, and DTB-driven
+PCIe ECAM enumeration on aarch64. Latest tally: **x86_64 223/0/0,
+aarch64 186/0/3**. Stage 4 ("Compatibility") proper — real PKS/MTE
+enforcement on buffer pages, IOMMU programming, user-mode consumer via
+`abi/` — is next. See `STATUS.md` for current details and `ROADMAP.md`
+for the stage × subsystem matrix.
 
 ## Core ideas
 
@@ -32,19 +37,52 @@ for current test tallies and `ROADMAP.md` / `STAGE3.md` for the plan.
 - **Hardware bypass where it pays off.** P2P DMA, User Interrupts (UIPI),
   Global LTO across the whole kernel.
 
+## What works today (both arches on QEMU)
+
+Live from boot through `cargo xtask run`:
+
+- BSP bring-up, IDT (32..=254), GDT/TSS with IST stacks; PKS + NX
+  enabled on x86_64; GICv3 + GIC ITS bring-up on aarch64.
+- Frame allocator + heap, MMU handoff (4-level paging on x86_64,
+  TTBR0/TTBR1 split on aarch64), console remap.
+- Cooperative async executor with hardware LAPIC-timer / generic-timer
+  IRQs; per-task waker plumbing; cap-gated CPU-budget tasks.
+- Bus enumeration: PCIe ECAM walk on x86_64 (q35), DTB-driven PCIe
+  ECAM walk on aarch64 (QEMU virt with `highmem-ecam=off`),
+  virtio-mmio fallback. xtask attaches an `nvme,drive=nvm0` device
+  on both arches.
+- BAR sizing + MMIO mapping (`bus::bar`); LAPIC-directed MSI-X
+  programming on x86_64; GIC ITS doorbell + `MAPC`/`MAPD`/`MAPTI`
+  command queue on aarch64.
+- IRQ dispatch table + vector allocator + `wait_for_irq.await` future
+  bridging hardware IRQs to the async executor.
+- NVMe end-to-end on x86_64: BAR0 map, CAP/VS decode, controller
+  reset, ASQ/ACQ allocation, IDENTIFY CONTROLLER + IDENTIFY
+  NAMESPACE, I/O queue pair (`Create I/O CQ` + `Create I/O SQ`),
+  Read/Write LBA with both polled and MSI-X-driven completions.
+- Cap-system epoch tables, RCU (QSBR + epoch + hazard pointers),
+  filesystem skeleton (devfs + memfs), syscall surface (~230
+  syscalls), tracing/observability/PMU sampling probes.
+
+`cargo xtask test --arch=x86_64` passes **223/0/0** smokes;
+`--arch=aarch64` passes **186/0/3** (the 3 skips are x86-specific
+features). See `STATUS.md` for the full tally and per-subsystem
+breakdown.
+
 ## Repository layout
 
 ```
 narf/
 ├── DESIGN.md                 # Verbatim v1.0 vision doc
 ├── ROADMAP.md                # Stage 1→4 mapped to subsystems
+├── STATUS.md                 # What's implemented vs. what's planned
 ├── GLOSSARY.md               # Framekernel, Narf-Link, Narf-Ring, etc.
 │
 │ ── Cross-cutting ──
 ├── arch/                     # HAL: x86_64 + aarch64
 ├── abi/                      # Kernel↔user boundary
 ├── security-model/           # Threat model, capabilities × domains
-├── build/                    # Global LTO, cross-compile, linker
+├── build/                    # Global LTO, cross-compile, linker, xtask
 ├── verification/             # Tests, fuzzing, perf stats, formal methods
 ├── process/                  # Dev process: humans + AI agents, reviews, security
 │
@@ -54,11 +92,11 @@ narf/
 ├── capabilities/             # Cap tables, Rust-typed tokens
 ├── scheduler/                # Async executor, direct context transfer
 ├── ipc/                      # Narf-Ring zero-copy channels
-├── interrupts/               # UIPI + IRQ routing
+├── interrupts/               # x2APIC + GICv3/ITS + IRQ dispatch + wait_for_irq
 ├── io/                       # P2P DMA, IOMMU/SMMU
-├── drivers/                  # Framework + virtio/nvme/net/gpu
-├── bus/                      # PCIe / MMIO / devicetree enumeration
-├── boot/                     # Bootloader handoff
+├── drivers/                  # Framework + virtio/nvme/net/gpu/tpm
+├── bus/                      # PCIe ECAM + DTB walkers, BAR map, MSI-X
+├── boot/                     # Bootloader handoff (PVH on x86_64, FDT on aarch64)
 ├── console/                  # Early serial + logging
 ├── time/                     # Monotonic/wall clocks, hrtimers, NTP/PTP
 ├── rcu/                      # Deferred reclamation: QSBR, epoch, hazard, sleepable
@@ -70,7 +108,8 @@ narf/
 ├── crypto/                   # Primitives, RNG, Cap<Key>, measured boot
 ├── power/                    # Idle states, DVFS, suspend/resume, thermal
 ├── lib/                      # no_std shared primitives: sync, collections, bitmaps
-└── userspace/                # Process model, ELF, relibc
+├── userspace/                # Process model, ELF, syscall table
+└── narf-libc/                # libc shim layered over the Narf syscall ABI
 ```
 
 Every subsystem folder contains:
@@ -82,18 +121,36 @@ Every subsystem folder contains:
 ## Target architectures
 
 Dual-primary from day one: **x86_64** and **aarch64**. Every spec must
-address both in its *Architecture notes* section.
+address both in its *Architecture notes* section, and every commit
+runs `cargo xtask test` on both arches before landing.
 
 ## Roadmap
 
-| Stage | Theme |
-| --- | --- |
-| 1. Skeleton | Bootloader + async executor + serial console |
-| 2. Barrier | PKS/MTE domain switching + UIPI |
-| 3. Flow | Narf-Ring + capabilities + first VirtIO driver |
-| 4. Compatibility | relibc integration; run standard Rust binaries |
+| Stage | Theme | State |
+| --- | --- | --- |
+| 1. Skeleton | Bootloader + async executor + serial console | **closed** |
+| 2. Barrier | PKS/MTE domain switching + UIPI | **closed** |
+| 3. Flow | Narf-Ring + capabilities + first VirtIO driver | **closed** |
+| 4. Compatibility | relibc integration; run standard Rust binaries | **structural surfaces + driver readiness landed; relibc gate next** |
 
-See [`ROADMAP.md`](./ROADMAP.md) for the stage × subsystem matrix.
+See [`ROADMAP.md`](./ROADMAP.md) for the stage × subsystem matrix and
+[`STATUS.md`](./STATUS.md) for what specifically is implemented.
+
+## How to run
+
+```sh
+# Boot the async demo:
+cargo xtask run  --arch=x86_64
+cargo xtask run  --arch=aarch64
+
+# Run the kernel-test harness:
+cargo xtask test --arch=x86_64
+cargo xtask test --arch=aarch64
+```
+
+xtask cross-builds against `x86_64-unknown-none` / `aarch64-unknown-none`
+with `build-std`, then launches QEMU. NVMe images and the QEMU virt
+DTB are generated lazily into `target/`.
 
 ## Where to start reading
 
@@ -101,8 +158,7 @@ See [`ROADMAP.md`](./ROADMAP.md) for the stage × subsystem matrix.
    agents and humans in a hurry).
 2. [`DESIGN.md`](./DESIGN.md) — the one-page vision.
 3. [`GLOSSARY.md`](./GLOSSARY.md) — vocabulary you'll see repeated.
-4. [`STAGE1.md`](./STAGE1.md) — topo-sorted Stage 1 implementation
-   order once you're ready to write code.
+4. [`STATUS.md`](./STATUS.md) — current implementation state.
 5. [`process/specification/spec.md`](./process/specification/spec.md) —
    how to contribute (binding on both humans and AI agents).
 6. [`security-model/specification/spec.md`](./security-model/specification/spec.md)
