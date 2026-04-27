@@ -181,8 +181,8 @@ pub use pthread::{
 };
 pub use process::{
     abort, atexit, execv, execve, execvp, exit, fork, getegid, geteuid, getgid,
-    getpgid, getpgrp, getpid, getppid, getpriority, getsid, getuid, nice,
-    setgid, setpgid, setpriority, setsid, setuid, sleep, usleep, vfork,
+    getpgid, getpgrp, getpid, getppid, getpriority, getsid, gettid, getuid,
+    nice, setgid, setpgid, setpriority, setsid, setuid, sleep, usleep, vfork,
     wait, waitpid, _exit, PRIO_PGRP, PRIO_PROCESS, PRIO_USER,
 };
 pub use setjmp::{

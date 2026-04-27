@@ -311,6 +311,13 @@ pub enum Syscall {
     /// ignored. Returns 0 on success, -1 on bad pointer.
     SchedSetaffinity = 167,
 
+    /// Linux gettid(2): return the calling thread's distinct kernel
+    /// id (in multi-threaded processes pid identifies the process,
+    /// tid identifies the thread). NARF is single-threaded per
+    /// process, so gettid == getpid. Lands the surface so the
+    /// libc shim's ABI is right for when threading arrives.
+    Gettid       = 168,
+
     /// Set or query the per-task heap break.
     /// `arg0 = 0` → return current break; `arg0 != 0` → resize.
     /// POSIX `brk(2)` semantics: failure returns the unchanged break.
@@ -518,6 +525,7 @@ impl Syscall {
             165 => Syscall::Getcpu,
             166 => Syscall::SchedGetaffinity,
             167 => Syscall::SchedSetaffinity,
+            168 => Syscall::Gettid,
             156 => Syscall::Getpriority,
             157 => Syscall::Setpriority,
             158 => Syscall::Times,

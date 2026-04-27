@@ -122,6 +122,15 @@ pub unsafe extern "C" fn getpid() -> i32 {
     narf_user_runtime::getpid() as i32
 }
 
+/// Linux `gettid(2)` — return the calling thread's distinct
+/// kernel id. NARF is single-threaded per process today, so
+/// gettid coincides with getpid; the surface exists so the libc
+/// shim's ABI is right for when threading arrives.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gettid() -> i32 {
+    narf_user_runtime::gettid() as i32
+}
+
 /// Parent task id, or 0 if none. Stage-4 kernel always returns 0.
 ///
 /// # Safety

@@ -1582,6 +1582,13 @@ fn sys_getppid(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(0));
 }
 
+fn sys_gettid(ctx: &mut dyn TrapContext) {
+    // Single-threaded per process: tid coincides with pid. When
+    // threading lands this returns a distinct task id while
+    // sys_getpid returns the process's primary id.
+    ctx.set_return(SyscallReturn::ok(current_task_id()));
+}
+
 // ── Per-task uid/gid table ─────────────────────────────────────────
 //
 // NARF's authority model is capabilities, not POSIX uids — but
@@ -2907,6 +2914,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::RingKick, "ringkick", RawFnHandler(sys_ring_kick));
     table.install_raw(Syscall::GetPid,   "getpid",   RawFnHandler(sys_getpid));
     table.install_raw(Syscall::GetPpid,  "getppid",  RawFnHandler(sys_getppid));
+    table.install_raw(Syscall::Gettid,   "gettid",   RawFnHandler(sys_gettid));
     table.install_raw(Syscall::GetUid,   "getuid",   RawFnHandler(sys_getuid));
     table.install_raw(Syscall::GetGid,   "getgid",   RawFnHandler(sys_getgid));
     table.install_raw(Syscall::SetUid,   "setuid",   RawFnHandler(sys_setuid));

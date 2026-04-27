@@ -76,6 +76,7 @@ pub const SYS_GETPRIORITY:    u64 = 156;
 pub const SYS_GETCPU:         u64 = 165;
 pub const SYS_SCHED_GETAFFINITY: u64 = 166;
 pub const SYS_SCHED_SETAFFINITY: u64 = 167;
+pub const SYS_GETTID:         u64 = 168;
 pub const SYS_SETPRIORITY:    u64 = 157;
 pub const SYS_TIMES:          u64 = 158;
 pub const SYS_GETRUSAGE:      u64 = 159;
@@ -505,6 +506,15 @@ pub fn getrusage(who: i32, buf: &mut [i64; 18]) -> i32 {
 pub fn umask(new_mask: u32) -> u32 {
     // SAFETY: SYS_UMASK signature: (new_mask).
     unsafe { syscall1(SYS_UMASK, new_mask as u64) as u32 }
+}
+
+/// `gettid()` — Linux thread id. NARF is single-threaded per
+/// process so this aliases getpid; the surface exists so a libc
+/// shim has the right ABI for when threading lands.
+#[inline]
+pub fn gettid() -> u64 {
+    // SAFETY: SYS_GETTID takes no args.
+    unsafe { syscall0(SYS_GETTID) }
 }
 
 /// `sched_getaffinity(pid, mask)` — fill `mask` with the CPU
