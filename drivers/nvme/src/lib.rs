@@ -1045,6 +1045,9 @@ pub fn probe(
         return Err(narf_bus::ProbeError::BadDevice);
     }
     *CONTROLLER.lock() = Some(ctrl);
+    // Install the typed parameter surface so observers + tuners can
+    // reach the driver via `Cap<DriverHandle, Write>`.
+    PARAMS.install(NvmeParams { log_level: LogLevel::Info });
     Ok(())
 }
 
@@ -1061,6 +1064,93 @@ pub fn is_probed() -> bool {
 pub fn with_controller<R>(f: impl FnOnce(&Controller) -> R) -> Option<R> {
     CONTROLLER.lock().as_ref().map(f)
 }
+
+// ── Typed parameter surface ───────────────────────────────────────────
+//
+// What an observer can read about the driver post-probe + what tunables
+// a writer can flip. Wave-3a ships a small cut: read-only IDENTIFY
+// fields + I/O-queue topology, plus a single `LogLevel` writer knob
+// that drivers will route through `tracing/` once that surface is
+// usable from drivers. The shape demonstrates the typed-Rust contract
+// without rope-pulling the entire NVMe spec.
+
+/// Diagnostic verbosity for the NVMe driver. Mirrors the standard
+/// `Off / Error / Warn / Info / Debug` ladder. Persisted in
+/// `NvmeParams::log_level`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LogLevel { Off, Error, Warn, Info, Debug }
+
+/// Read-side snapshot. Cap-gated read returns a copy of these fields
+/// taken under the param slot's lock.
+#[derive(Copy, Clone, Debug)]
+pub struct NvmeSnapshot {
+    pub bar0:        u64,
+    pub lba_bytes:   u32,
+    pub nsze:        u64,
+    pub io_q_depth:  u16,
+    pub irq_vector:  Option<u8>,
+    pub log_level:   LogLevel,
+    pub identify_vid: u16,
+}
+
+/// Write-side update. One enum variant per knob — callers don't have
+/// to provide values for every field.
+#[derive(Copy, Clone, Debug)]
+pub enum NvmeUpdate {
+    /// Change the diagnostic log level.
+    SetLogLevel(LogLevel),
+}
+
+/// Live params instance. Stores the tunables that aren't kept on the
+/// `Controller` itself (because they're pure host-side state — the
+/// device doesn't see them).
+#[derive(Debug)]
+pub struct NvmeParams {
+    log_level: LogLevel,
+}
+
+impl narf_drivers::DriverParams for NvmeParams {
+    type Snapshot = NvmeSnapshot;
+    type Update   = NvmeUpdate;
+
+    fn snapshot(&self) -> NvmeSnapshot {
+        // Pull controller-side fields from the live Controller, if
+        // any. If the slot exists but the controller doesn't (a
+        // pre-probe install path), the snapshot reports the host-
+        // side defaults and zero device fields.
+        let g = CONTROLLER.lock();
+        let (bar0, lba_bytes, nsze, irq, vid) = match g.as_ref() {
+            Some(c) => (
+                c.bar0,
+                c.lba_bytes,
+                c.nsze,
+                c.irq_vector,
+                c.identify().map(|i| i.vid).unwrap_or(0),
+            ),
+            None => (0, 0, 0, None, 0),
+        };
+        NvmeSnapshot {
+            bar0,
+            lba_bytes,
+            nsze,
+            io_q_depth: IO_Q_DEPTH,
+            irq_vector: irq,
+            log_level:  self.log_level,
+            identify_vid: vid,
+        }
+    }
+
+    fn apply(&mut self, u: NvmeUpdate) -> Result<(), narf_drivers::ParamError> {
+        match u {
+            NvmeUpdate::SetLogLevel(l) => { self.log_level = l; Ok(()) }
+        }
+    }
+}
+
+/// Per-driver param slot. Drivers expose a `Cap<DriverHandle, Write>`-
+/// gated read/write surface through this static.
+pub static PARAMS: narf_drivers::ParamSlot<NvmeParams> =
+    narf_drivers::ParamSlot::new();
 
 /// Register the NVMe driver with the bus-level match table. Trusted
 /// in-tree drivers call this from `frame::_start_rust` (or the

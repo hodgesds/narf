@@ -42,6 +42,9 @@
 
 extern crate alloc;
 
+pub mod params;
+pub use params::{DriverParams, ParamError, ParamSlot};
+
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::future::Future;

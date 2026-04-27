@@ -5713,6 +5713,93 @@ fn smoke_pci_probe_all_dispatches_nvme() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_pci_probe_all_dispatches_nvme);
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_nvme_params_typed_round_trip() -> TestResult {
+    // Drive the typed driver-parameter surface end-to-end:
+    //   1. Probe NVMe via the registry (installs PARAMS).
+    //   2. Read a snapshot, verify IDENTIFY-derived fields.
+    //   3. Apply an Update::SetLogLevel, re-read, verify it stuck.
+    use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_capabilities::{Cap, Write};
+    use narf_drivers::DriverHandle;
+    use narf_drivers_nvme::{LogLevel, NvmeUpdate, PARAMS};
+
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let has_nvme = devs.iter().any(|d|
+        matches!(&d.kind, BusKind::Pcie { .. })
+        && d.id.vendor == 0x1B36 && d.id.device == 0x0010);
+    if !has_nvme {
+        return TestResult::Skip("no QEMU NVMe controller");
+    }
+
+    // Re-bind the driver via the match table.
+    __reset_for_test();
+    PARAMS.__reset_for_test();
+    narf_drivers_nvme::register_pci_driver();
+    let authority = bootstrap_registry_authority();
+    if probe_all_pci(&authority).is_err() {
+        return TestResult::Fail("probe_all_pci failed");
+    }
+    if !PARAMS.is_installed() {
+        return TestResult::Fail("PARAMS not installed by probe");
+    }
+
+    // Cap-gated typed read.
+    let driver_cap: Cap<DriverHandle, Write> = Cap::bootstrap();
+    let snap = match PARAMS.read(&driver_cap) {
+        Ok(s)  => s,
+        Err(_) => return TestResult::Fail("PARAMS.read failed"),
+    };
+    if snap.identify_vid != 0x1B36 {
+        return TestResult::Fail("snapshot.identify_vid mismatch");
+    }
+    if snap.lba_bytes != 512 {
+        return TestResult::Fail("snapshot.lba_bytes != 512");
+    }
+    if snap.log_level != LogLevel::Info {
+        return TestResult::Fail("snapshot.log_level default != Info");
+    }
+
+    // Cap-gated typed write.
+    if PARAMS.write(&driver_cap, NvmeUpdate::SetLogLevel(LogLevel::Debug)).is_err() {
+        return TestResult::Fail("PARAMS.write failed");
+    }
+    let snap2 = PARAMS.read(&driver_cap).expect("re-read");
+    if snap2.log_level != LogLevel::Debug {
+        return TestResult::Fail("Update::SetLogLevel did not stick");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_nvme_params_typed_round_trip);
+
+fn smoke_param_slot_not_installed() -> TestResult {
+    // ParamSlot.read on an empty slot returns NotInstalled, not UB.
+    use narf_capabilities::{Cap, Write};
+    use narf_drivers::{DriverHandle, DriverParams, ParamError, ParamSlot};
+
+    #[derive(Debug)]
+    struct Empty;
+    #[derive(Copy, Clone, Debug)] struct EmptySnap;
+    #[derive(Copy, Clone, Debug)] struct EmptyUpd;
+    impl DriverParams for Empty {
+        type Snapshot = EmptySnap; type Update = EmptyUpd;
+        fn snapshot(&self) -> EmptySnap { EmptySnap }
+        fn apply(&mut self, _: EmptyUpd) -> Result<(), ParamError> { Ok(()) }
+    }
+    static SLOT: ParamSlot<Empty> = ParamSlot::new();
+    SLOT.__reset_for_test();
+    let cap: Cap<DriverHandle, Write> = Cap::bootstrap();
+    match SLOT.read(&cap) {
+        Err(ParamError::NotInstalled) => TestResult::Pass,
+        _                              => TestResult::Fail("expected NotInstalled"),
+    }
+}
+kernel_test!(smoke_param_slot_not_installed);
+
 fn smoke_drivers_net_nic_model_ids() -> TestResult {
     use narf_drivers_net::{NicCaps, NicModel};
 

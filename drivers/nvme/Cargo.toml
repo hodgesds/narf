@@ -18,6 +18,7 @@ narf-io           = { path = "../../io" }
 narf-block        = { path = "../../block" }
 narf-bus          = { path = "../../bus" }
 narf-interrupts   = { path = "../../interrupts" }
+narf-drivers      = { path = "../../drivers" }
 
 [lints]
 workspace = true
