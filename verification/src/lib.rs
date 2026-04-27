@@ -5747,9 +5747,15 @@ fn smoke_nvme_params_typed_round_trip() -> TestResult {
         return TestResult::Fail("PARAMS not installed by probe");
     }
 
-    // Cap-gated typed read.
+    // Cap-gated typed read. Bootstrap a Write handle, derive a Read
+    // for the read side via the Read ⊂ Write lattice rule.
     let driver_cap: Cap<DriverHandle, Write> = Cap::bootstrap();
-    let snap = match PARAMS.read(&driver_cap) {
+    let read_cap: Cap<DriverHandle, narf_capabilities::Read> =
+        match driver_cap.derive() {
+            Ok(c) => c,
+            Err(_) => return TestResult::Fail("Read derivation from Write failed"),
+        };
+    let snap = match PARAMS.read(&read_cap) {
         Ok(s)  => s,
         Err(_) => return TestResult::Fail("PARAMS.read failed"),
     };
@@ -5767,7 +5773,7 @@ fn smoke_nvme_params_typed_round_trip() -> TestResult {
     if PARAMS.write(&driver_cap, NvmeUpdate::SetLogLevel(LogLevel::Debug)).is_err() {
         return TestResult::Fail("PARAMS.write failed");
     }
-    let snap2 = PARAMS.read(&driver_cap).expect("re-read");
+    let snap2 = PARAMS.read(&read_cap).expect("re-read");
     if snap2.log_level != LogLevel::Debug {
         return TestResult::Fail("Update::SetLogLevel did not stick");
     }
@@ -5778,7 +5784,7 @@ kernel_test!(smoke_nvme_params_typed_round_trip);
 
 fn smoke_param_slot_not_installed() -> TestResult {
     // ParamSlot.read on an empty slot returns NotInstalled, not UB.
-    use narf_capabilities::{Cap, Write};
+    use narf_capabilities::{Cap, Read};
     use narf_drivers::{DriverHandle, DriverParams, ParamError, ParamSlot};
 
     #[derive(Debug)]
@@ -5792,13 +5798,48 @@ fn smoke_param_slot_not_installed() -> TestResult {
     }
     static SLOT: ParamSlot<Empty> = ParamSlot::new();
     SLOT.__reset_for_test();
-    let cap: Cap<DriverHandle, Write> = Cap::bootstrap();
+    let cap: Cap<DriverHandle, Read> = Cap::bootstrap();
     match SLOT.read(&cap) {
         Err(ParamError::NotInstalled) => TestResult::Pass,
         _                              => TestResult::Fail("expected NotInstalled"),
     }
 }
 kernel_test!(smoke_param_slot_not_installed);
+
+fn smoke_rights_lattice_derive() -> TestResult {
+    // Allowed derivations under the rights lattice:
+    //   Read ⊂ Write   → Cap<_, Write>.derive::<Read>()
+    //   Read ⊂ Invoke  → Cap<_, Invoke>.derive::<Read>()
+    //   Read ⊂ Spend   → Cap<_, Spend>.derive::<Read>()
+    //   Read/Write/Spend/Invoke ⊂ Grant (existing).
+    // The reverse directions aren't declared and are caught by the
+    // SubsetOf trait bound at compile time.
+    use narf_capabilities::{Cap, Invoke, Read, Spend, Write};
+    use narf_drivers::DriverHandle;
+
+    let w: Cap<DriverHandle, Write> = Cap::bootstrap();
+    let r: Cap<DriverHandle, Read> = match w.derive() {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("Read ⊂ Write derive failed"),
+    };
+    if r.check_live().is_err() {
+        return TestResult::Fail("derived Read cap not live");
+    }
+
+    let i: Cap<DriverHandle, Invoke> = Cap::bootstrap();
+    let _ir: Cap<DriverHandle, Read> = match i.derive() {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("Read ⊂ Invoke derive failed"),
+    };
+
+    let s: Cap<DriverHandle, Spend> = Cap::bootstrap();
+    let _sr: Cap<DriverHandle, Read> = match s.derive() {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("Read ⊂ Spend derive failed"),
+    };
+    TestResult::Pass
+}
+kernel_test!(smoke_rights_lattice_derive);
 
 fn smoke_drivers_net_nic_model_ids() -> TestResult {
     use narf_drivers_net::{NicCaps, NicModel};

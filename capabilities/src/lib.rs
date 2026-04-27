@@ -49,12 +49,19 @@ pub struct Grant;
 #[derive(Copy, Clone, Debug)]
 pub struct Spend;
 
-/// Invoke: authority to call an object's operational surface — the
-/// classic EROS "invoke a service" right. Used by
-/// `scheduler/` spec §3.3's `Cap<Task, Invoke>` (donate time-slice) and
-/// by the driver framework for cap-gated entry points. Distinct from
-/// Write so an audit can tell "call this object" apart from "mutate
-/// this object's state".
+/// Invoke: authority to **execute / activate / trigger** an object's
+/// operational surface. NARF's "execute" right — the classic EROS
+/// "invoke a service" right with a clearer name. Held by callers that
+/// want to *fire* an action without necessarily reading or mutating
+/// state: bring up a CPU (`Cap<CpuLifecycle, Invoke>`), donate a
+/// time-slice (`Cap<Task, Invoke>` per `scheduler/` §3.3), fire a
+/// tracepoint (`Cap<Probe, Invoke>`), start/quiesce a driver
+/// (`Cap<DriverHandle, Invoke>`).
+///
+/// We deliberately don't introduce a separate `Execute` rights marker
+/// — `Invoke` is the same concept and the name avoids overloading
+/// page-table NX semantics. An audit reads `Read | Write | Invoke` as
+/// the orthogonal triple "observe / mutate / trigger."
 #[derive(Copy, Clone, Debug)]
 pub struct Invoke;
 
@@ -78,6 +85,26 @@ impl SubsetOf<Grant> for Read   {}
 impl SubsetOf<Grant> for Write  {}
 impl SubsetOf<Grant> for Spend  {}
 impl SubsetOf<Grant> for Invoke {}
+
+// Lattice rules. `SubsetOf<Y> for X` reads "X is a subset of Y, so
+// holders of Y may `derive::<X>()`." The reverse direction is
+// intentionally never declared so privilege escalation isn't
+// possible through `derive`. Write and Spend stay orthogonal —
+// neither can derive the other — because the scheduler wants
+// "may mutate budget policy" distinct from "may debit the budget."
+//
+// Read ⊂ Write: a writer can always observe what it can change.
+// Lets `Cap<T, Write>` derive `Cap<T, Read>` for the read-only side
+// of typed APIs (drivers::ParamSlot, observability hooks).
+impl SubsetOf<Write>  for Read   {}
+// Read ⊂ Invoke: an invoker can always observe the object it can
+// trigger. `Cap<Probe, Invoke>` (fire) → `Cap<Probe, Read>` (sample);
+// `Cap<Task, Invoke>` (donate) → `Cap<Task, Read>` (inspect the donee).
+impl SubsetOf<Invoke> for Read   {}
+// Read ⊂ Spend: a holder of spend authority can observe the quota
+// it's debiting. `Cap<CpuBudget, Spend>` → `Cap<CpuBudget, Read>`
+// for budget-status readouts without giving up the debit cap.
+impl SubsetOf<Spend>  for Read   {}
 
 // ── CapSlot ─────────────────────────────────────────────────────────
 

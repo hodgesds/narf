@@ -6,16 +6,19 @@
 //! parameters callers can change. Both are plain Rust structs — no
 //! string parsing, no path namespace, no implicit "uid+path" gating.
 //!
-//! Authority is `Cap<DriverHandle, Write>` (the per-driver handle
-//! returned by `DriverRegistry::register`). Stage-3 collapses the
-//! Read/Write split into a single cap because the rights-system's
-//! `SubsetOf` bound only derives into `Grant` today; a follow-up can
-//! introduce a true read-only path once `SubsetOf<Write> for Read`
-//! lands.
+//! Authority split:
+//! - `Cap<DriverHandle, Read>` for `read()` — observers, monitoring
+//!   tools, the kernel-test harness.
+//! - `Cap<DriverHandle, Write>` for `write()` — the registration
+//!   handle held by trusted in-tree drivers + any tooling explicitly
+//!   delegated mutation rights.
+//!
+//! Holders of `Cap<DriverHandle, Write>` can `derive::<Read>()` for
+//! the read side via the rights-lattice rule `Read ⊂ Write`.
 
 use core::marker::PhantomData;
 
-use narf_capabilities::{Cap, CapError, Write};
+use narf_capabilities::{Cap, CapError, Read, Write};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::DriverHandle;
@@ -92,10 +95,13 @@ impl<T: DriverParams> ParamSlot<T> {
         *self.inner.lock() = Some(t);
     }
 
-    /// Take a typed snapshot. Cap-gated.
+    /// Take a typed snapshot. Cap-gated on `Cap<DriverHandle, Read>`.
+    /// Holders of `Cap<DriverHandle, Write>` can call `derive::<Read>()`
+    /// on it to obtain the read cap (the rights lattice asserts
+    /// `Read ⊂ Write`).
     pub fn read(
         &self,
-        cap: &Cap<DriverHandle, Write>,
+        cap: &Cap<DriverHandle, Read>,
     ) -> Result<T::Snapshot, ParamError> {
         cap.check_live()?;
         let g = self.inner.lock();
