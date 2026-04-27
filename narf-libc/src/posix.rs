@@ -394,8 +394,7 @@ pub unsafe extern "C" fn pwrite(
     narf_user_runtime::pwrite(fd as u32, slice, offset as u64) as ssize_t
 }
 
-/// `truncate(path, len)` — open(path, O_WRONLY) + ftruncate + close.
-/// Convenience wrapper to match POSIX surface.
+/// `truncate(path, len)` — POSIX path-based resize.
 ///
 /// # Safety
 /// `path` must be a NUL-terminated C string.
@@ -404,13 +403,7 @@ pub unsafe extern "C" fn truncate(path: *const c_char, len: off_t) -> c_int {
     if path.is_null() || len < 0 { return -1; }
     // SAFETY: caller-asserted NUL-terminator.
     let s = unsafe { cstr_to_str(path) };
-    let fd = match narf_user_runtime::open_abs(s) {
-        Some(f) => f,
-        None    => return -1,
-    };
-    let r = narf_user_runtime::ftruncate(fd, len as u64);
-    let _ = narf_user_runtime::close(fd);
-    r
+    narf_user_runtime::truncate(s, len as u64)
 }
 
 /// `gethostname(buf, len)` — copy the kernel hostname, NUL-

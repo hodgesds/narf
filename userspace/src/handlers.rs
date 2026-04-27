@@ -1103,6 +1103,41 @@ fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(copied as u64));
 }
 
+// ── Truncate — path-based file resize ──────────────────────────────
+//
+// Linux truncate(2). Equivalent to open + ftruncate + close in one
+// syscall. Resolves the absolute path to a FileOps and calls
+// `truncate(len)` directly — no fd-table involvement. Routes to the
+// same trait method that backs SYS_FTRUNCATE.
+
+fn sys_truncate(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let ptr  = args.arg0 as *const u8;
+    let len  = args.arg1 as usize;
+    let new_size = args.arg2;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if ptr.is_null() || len == 0 {
+        ctx.set_return(fail);
+        return;
+    }
+    // SAFETY: caller-supplied user pointer in active AS.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+    let path = match core::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => { ctx.set_return(fail); return; }
+    };
+    let ops = narf_filesystem::registry().resolve_absolute(path, |fs, rel| {
+        narf_filesystem::resolve(fs.root(), rel).ok()
+    }).flatten();
+    match ops {
+        Some(o) => match o.truncate(new_size) {
+            Ok(())  => ctx.set_return(SyscallReturn::ok(0)),
+            Err(_)  => ctx.set_return(fail),
+        }
+        None => ctx.set_return(fail),
+    }
+}
+
 // ── fchmod / fchown — accept-and-ignore on known fd ───────────────
 //
 // NARF has no per-file permission bits or owner; the kernel
@@ -3468,6 +3503,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Fstat,  "fstat",  RawFnHandler(sys_fstat));
     table.install_raw(Syscall::Pipe,   "pipe",   RawFnHandler(sys_pipe));
     table.install_raw(Syscall::Ftruncate, "ftruncate", RawFnHandler(sys_ftruncate));
+    table.install_raw(Syscall::Truncate,  "truncate",  RawFnHandler(sys_truncate));
     table.install_raw(Syscall::Pread64,   "pread64",   RawFnHandler(sys_pread64));
     table.install_raw(Syscall::Pwrite64,  "pwrite64",  RawFnHandler(sys_pwrite64));
     table.install_raw(Syscall::Fsync,     "fsync",     RawFnHandler(sys_fsync));

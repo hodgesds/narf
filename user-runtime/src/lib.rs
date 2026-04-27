@@ -63,6 +63,7 @@ pub const SYS_GETGID:         u64 = 143;
 pub const SYS_SETUID:         u64 = 144;
 pub const SYS_SETGID:         u64 = 145;
 pub const SYS_FTRUNCATE:      u64 = 118;
+pub const SYS_TRUNCATE:       u64 = 132;
 pub const SYS_PREAD64:        u64 = 119;
 pub const SYS_PWRITE64:       u64 = 122;
 pub const SYS_FSYNC:          u64 = 123;
@@ -473,6 +474,18 @@ pub fn setgid(gid: u32) -> i32 {
 pub fn ftruncate(fd: u32, len: u64) -> i32 {
     // SAFETY: SYS_FTRUNCATE signature: (fd, len).
     let r = unsafe { syscall2(SYS_FTRUNCATE, fd as u64, len) };
+    if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `truncate(path, len)` — path-based resize. Returns 0 on
+/// success, -1 on bad path / read-only FS.
+#[inline]
+pub fn truncate(path: &str, len: u64) -> i32 {
+    if path.is_empty() { return -1; }
+    // SAFETY: SYS_TRUNCATE signature: (path_ptr, path_len, len).
+    let r = unsafe {
+        syscall3(SYS_TRUNCATE, path.as_ptr() as u64, path.len() as u64, len)
+    };
     if r as i64 == -1 { -1 } else { 0 }
 }
 

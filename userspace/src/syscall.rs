@@ -162,6 +162,13 @@ pub enum Syscall {
     /// per-fd cursor).
     Ftruncate    = 118,
 
+    /// `arg0 = path_ptr`, `arg1 = path_len`, `arg2 = len`. Path-
+    /// based truncate (POSIX truncate(2)). Resolves the absolute
+    /// path and calls `FileOps::truncate` directly — no fd table
+    /// involvement. Returns 0 on success, -1 on bad path / read-
+    /// only FS.
+    Truncate     = 132,
+
     /// `arg0 = fd`, `arg1 = buf_ptr`, `arg2 = len`, `arg3 = offset`
     /// (u64). Read at the explicit offset without altering the
     /// per-fd cursor. Returns the byte count read on success
@@ -603,6 +610,7 @@ impl Syscall {
             128 => Syscall::MemfdCreate,
             129 => Syscall::Fchmod,
             131 => Syscall::Fchown,
+            132 => Syscall::Truncate,
             120 => Syscall::Mmap,
             121 => Syscall::Munmap,
             130 => Syscall::RingKick,
