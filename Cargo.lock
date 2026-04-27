@@ -494,12 +494,24 @@ dependencies = [
 name = "narf-drivers-storage"
 version = "0.0.0"
 dependencies = [
+ "narf-block",
  "narf-bus",
  "narf-capabilities",
  "narf-io",
  "narf-lib",
  "narf-memory",
  "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-usb"
+version = "0.0.0"
+dependencies = [
+ "narf-bus",
+ "narf-capabilities",
+ "narf-io",
+ "narf-lib",
+ "narf-memory",
 ]
 
 [[package]]
@@ -540,6 +552,7 @@ dependencies = [
  "narf-drivers-net",
  "narf-drivers-nvme",
  "narf-drivers-storage",
+ "narf-drivers-usb",
  "narf-drivers-virtio",
  "narf-interrupts",
  "narf-lib",
@@ -696,6 +709,7 @@ dependencies = [
  "narf-drivers-net",
  "narf-drivers-nvme",
  "narf-drivers-storage",
+ "narf-drivers-usb",
  "narf-drivers-virtio",
  "narf-filesystem",
  "narf-interrupts",

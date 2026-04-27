@@ -6695,6 +6695,30 @@ fn smoke_block_registry_uniform_read() -> TestResult {
 kernel_test!(smoke_block_registry_uniform_read);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_xhci_bring_up() -> TestResult {
+    use narf_drivers_usb::xhci;
+    if !xhci::is_probed() { return TestResult::Skip("xhci not probed"); }
+    if !xhci::with_controller(|c| c.is_running()).unwrap_or(false) {
+        return TestResult::Fail("xhci not running after bring_up");
+    }
+    let v = xhci::with_controller(|c| c.version()).unwrap_or(0);
+    if v == 0 || v == 0xFFFF {
+        return TestResult::Fail("xhci HCIVERSION reads garbage");
+    }
+    let slots = xhci::with_controller(|c| c.max_slots()).unwrap_or(0);
+    if slots == 0 {
+        return TestResult::Fail("xhci max_slots = 0");
+    }
+    let ports = xhci::with_controller(|c| c.max_ports()).unwrap_or(0);
+    if ports == 0 {
+        return TestResult::Fail("xhci max_ports = 0");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_xhci_bring_up);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_virtio_balloon_pci_probe() -> TestResult {
     use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
     use narf_bus::driver_match::__reset_for_test;

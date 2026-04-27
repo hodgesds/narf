@@ -1,0 +1,22 @@
+[package]
+name         = "narf-drivers-usb"
+description  = "USB host controllers (xhci today; ehci/uhci/ohci later)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_usb"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../../lib" }
+narf-bus          = { path = "../../bus" }
+narf-capabilities = { path = "../../capabilities" }
+narf-io           = { path = "../../io" }
+narf-memory       = { path = "../../memory" }
+
+[lints]
+workspace = true

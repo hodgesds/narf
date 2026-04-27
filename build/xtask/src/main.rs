@@ -160,6 +160,8 @@ impl Arch {
                     // smoke target.
                     "-device".into(),
                     "virtio-balloon-pci,disable-legacy=on,disable-modern=off".into(),
+                    // QEMU's xHCI USB host controller.
+                    "-device".into(),  "qemu-xhci,id=xhci0".into(),
                     "-kernel".into(),  kernel,
                 ]
             },
@@ -213,6 +215,8 @@ impl Arch {
                 "virtio-rng-pci,rng=rng0,disable-legacy=on,disable-modern=off".into(),
                 "-device".into(),
                 "virtio-balloon-pci,disable-legacy=on,disable-modern=off".into(),
+                "-device".into(),
+                "qemu-xhci,id=xhci0".into(),
                 // QEMU's `-kernel <elf>` path on aarch64 does not
                 // load a `-dtb` blob into RAM (the DTB-loading code
                 // path is gated on `is_linux=1`). Instead we

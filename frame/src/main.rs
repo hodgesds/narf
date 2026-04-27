@@ -356,6 +356,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_drivers_virtio::balloon_pci::register_pci_driver();
             narf_drivers_net::e1000::register_pci_driver();
             narf_drivers_storage::ahci::register_pci_driver();
+            narf_drivers_usb::xhci::register_pci_driver();
 
             let auth = narf_bus::bootstrap_registry_authority();
             match narf_bus::probe_all_pci(&auth) {
