@@ -183,6 +183,9 @@ impl Arch {
                 // for >4 GiB lands.
                 "-machine".into(),  "virt,gic-version=3,mte=on,highmem-ecam=off".into(),
                 "-cpu".into(),      "max".into(),
+                // 2 logical CPUs so AP bring-up via PSCI CPU_ON
+                // exercises a real second core under QEMU virt.
+                "-smp".into(),      "2".into(),
                 "-m".into(),        "256M".into(),
                 "-serial".into(),   "stdio".into(),
                 "-display".into(),  "none".into(),
@@ -264,6 +267,7 @@ fn qemu_virt_dtb_path() -> PathBuf {
                 "virt,gic-version=3,mte=on,highmem-ecam=off,dumpdtb={}",
                 path.display()))
             .arg("-cpu").arg("max")
+            .arg("-smp").arg("2")
             .arg("-m").arg("256M")
             .arg("-display").arg("none")
             .arg("-no-reboot")

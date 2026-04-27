@@ -7081,24 +7081,47 @@ kernel_test!(smoke_smp_bsp_baseline);
 
 fn smoke_smp_mark_online_offline() -> TestResult {
     use narf_lib::smp;
-    // Toggle a hypothetical AP bit (CPU 1) without actually starting
-    // it — pure bookkeeping check.
-    if smp::is_online(1) {
-        return TestResult::Fail("CPU 1 spuriously online before bring-up");
+    // Use a slot well above any realistic AP count for bookkeeping
+    // — once aarch64 actually brings up CPU 1 via PSCI, slot 1 may
+    // already be set, so test against an unused slot.
+    const TEST_SLOT: u32 = 63;
+    let initial = smp::is_online(TEST_SLOT);
+    if initial { smp::mark_offline(TEST_SLOT); }
+    if smp::is_online(TEST_SLOT) {
+        return TestResult::Fail("offline didn't clear initial state");
     }
-    // SAFETY: not actually running on CPU 1; this is a bookkeeping
-    // surface test, not real bring-up.
-    unsafe { smp::mark_online(1); }
-    if !smp::is_online(1) {
+    // SAFETY: not actually running on CPU TEST_SLOT; this is a
+    // bookkeeping surface test, not real bring-up.
+    unsafe { smp::mark_online(TEST_SLOT); }
+    if !smp::is_online(TEST_SLOT) {
         return TestResult::Fail("mark_online didn't set bit");
     }
-    smp::mark_offline(1);
-    if smp::is_online(1) {
+    smp::mark_offline(TEST_SLOT);
+    if smp::is_online(TEST_SLOT) {
         return TestResult::Fail("mark_offline didn't clear bit");
     }
     TestResult::Pass
 }
 kernel_test!(smoke_smp_mark_online_offline);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_smp_aarch64_ap_online() -> TestResult {
+    // After PSCI bring-up at boot, CPU 1 is online if QEMU was
+    // started with -smp >= 2. xtask sets -smp 2 by default.
+    use narf_lib::smp;
+    if smp::cpu_count() < 2 {
+        return TestResult::Skip("BSP-only QEMU config");
+    }
+    if !smp::is_online(1) {
+        return TestResult::Fail("AP CPU 1 didn't come online");
+    }
+    if smp::online_count() < 2 {
+        return TestResult::Fail("online_count < 2 with -smp 2");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test!(smoke_smp_aarch64_ap_online);
 
 #[cfg(target_arch = "aarch64")]
 fn smoke_smp_aarch64_dtb_count() -> TestResult {

@@ -345,8 +345,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     }
                 }
 
-                // SMP discovery: count CPUs from the DTB. Real AP
-                // bring-up via PSCI lands as a follow-up.
+                // SMP discovery: count CPUs from the DTB.
                 if let Some(p) = info.dtb_phys {
                     // SAFETY: DTB validated by boot/aarch64.
                     let n = unsafe {
@@ -356,10 +355,18 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         narf_lib::smp::set_cpu_count(n);
                     }
                     let _ = writeln!(console::Writer,
-                        "  smp: {} CPU(s) advertised, {} online",
-                        narf_lib::smp::cpu_count(),
-                        narf_lib::smp::online_count());
+                        "  smp: {} CPU(s) advertised", narf_lib::smp::cpu_count());
                 }
+
+                // AP bring-up via PSCI CPU_ON. Each AP runs through
+                // smp_entry.S → _ap_start_rust which marks itself
+                // online via narf_lib::smp::mark_online.
+                // SAFETY: memory + GIC + DTB-supplied topology
+                // already initialised above.
+                let started = unsafe { aarch64::smp::start_aps() };
+                let _ = writeln!(console::Writer,
+                    "  smp: started {} AP(s); {} CPU(s) online",
+                    started, narf_lib::smp::online_count());
             }
 
             // ── PCIe driver registration + dispatch ───────────────
