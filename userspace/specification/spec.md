@@ -53,6 +53,68 @@ Exhaustion fails subsequent allocations with `Err(RingPairBudget)`.
   of which user PKU key the user side uses.
 - relibc never performs a syscall the kernel hasn't explicitly wired up.
 
+### 4.1 Stable user-space ABI promise
+
+**NARF commits to the Linux "do not break user-space" principle.**
+Once a syscall number lands in `Syscall` and is called by a binary
+in narf-libc, its v0 wire ABI — argument shape, return semantics,
+side effects observable to the caller — is stable indefinitely.
+
+**Mechanisms for evolving the surface without breaking pre-existing
+binaries:**
+
+1. **Mint a new syscall number** when the new operation is
+   conceptually distinct (e.g. `read` vs `pread64`).
+2. **Mint a new version of an existing syscall** when extending the
+   semantics of the same conceptual operation (e.g. tightening
+   error reporting, broadening permitted argument values, adding a
+   typed flag bits field). Versioning happens via the upper 8 bits
+   of the 32-bit syscall number — see below.
+
+**Wire format.** A raw syscall number is `(version << 24) | num`:
+
+| bits   | field        | notes                                       |
+|--------|--------------|---------------------------------------------|
+| 0..23  | syscall id   | canonical number (16M slots; ~234 used)     |
+| 24..31 | ABI version  | 0 = canonical wire ABI; 1..255 = overrides  |
+
+`narf_userspace::{syscall_pack, syscall_number, syscall_version,
+SYS_VERSION_SHIFT}` are the helpers. Pre-versioning binaries encode
+`version=0` implicitly (the upper bits are zero), so they keep
+dispatching to the v0 handler forever. New binaries opt in to a v1
+ABI at compile time by packing `1` into bits 24..31; the kernel's
+dispatch (`SyscallTable::dispatch_ctx_versioned`) probes the v1
+handler first and falls through to v0 when no override exists for
+the requested version.
+
+**What's allowed under this promise:**
+
+- Adding new syscall numbers (with reserved-zero argument fields
+  the new path checks for).
+- Adding new versions of existing syscalls.
+- Adding new flag bits to existing typed flag arguments **only when
+  zero is the prior caller's "I don't know about this bit" value**
+  and the kernel rejects unknown bits (so a pre-existing caller
+  that happens to set the bit gets a typed error instead of silently
+  surprising behavior).
+- Tightening reserved-zero fields to typed errors (callers that
+  previously sent zero are unaffected).
+- Loosening previously-rejected argument values (callers that sent
+  the rejected values were already broken; loosening them turns
+  failures into successes).
+
+**What's not allowed:**
+
+- Changing the meaning of an existing argument or return value at
+  the same `(syscall, version)`.
+- Removing a syscall number once published (it stays as a permanent
+  no-op or tombstone if obsolete).
+- Reusing a previously-published syscall number for a different op.
+
+The `Syscall` enum is therefore append-only across the kernel's
+lifetime; tombstoning an obsolete syscall is fine, removing the
+number is not.
+
 ## 5. Architecture notes
 
 ### x86_64

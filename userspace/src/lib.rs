@@ -89,8 +89,10 @@ pub use process::{
 pub use tls::{stage_tls, TlsError, TLS_REGION_BASE};
 pub use syscall::{
     install_global, kernel_syscall_entry, kernel_syscall_entry_plain,
-    FnHandler, RawFnHandler, RawSyscallHandler, Syscall, SyscallArgs,
-    SyscallEntry, SyscallHandler, SyscallReturn, SyscallTable, TrapContext,
+    syscall_number, syscall_pack, syscall_version, FnHandler, RawFnHandler,
+    RawSyscallHandler, Syscall, SyscallArgs, SyscallEntry, SyscallHandler,
+    SyscallReturn, SyscallTable, TrapContext, SYS_NUMBER_MASK,
+    SYS_VERSION_MASK, SYS_VERSION_SHIFT,
 };
 
 use alloc::string::String;

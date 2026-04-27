@@ -905,11 +905,23 @@ where F: Fn(&SyscallArgs) -> SyscallReturn + Send + Sync + 'static {
 
 /// One table slot: the diagnostic name + zero/one handler of each
 /// kind. Raw handler wins when both are installed.
+///
+/// **Versioning.** The Linux "don't break userspace" principle is
+/// load-bearing once a syscall lands in narf-libc. To extend
+/// semantics without minting a new number, callers can pack a
+/// version into the **upper 8 bits** of the 32-bit syscall number
+/// (see `SYS_VERSION_SHIFT`). Version 0 is the canonical wire ABI;
+/// versions 1..255 land as overrides in `versioned`. Old binaries
+/// always encode `version=0` implicitly, so they keep dispatching
+/// to the v0 handler forever even after a v1 override is added.
 pub struct SyscallEntry {
     pub number:      Syscall,
     pub name:        &'static str,
     pub handler:     Option<Box<dyn SyscallHandler>>,
     pub raw_handler: Option<Box<dyn RawSyscallHandler>>,
+    /// `(version, raw_handler)` pairs for non-zero versions. Probed
+    /// before falling through to `raw_handler` / `handler`.
+    pub versioned:   Vec<(u8, Box<dyn RawSyscallHandler>)>,
 }
 
 impl core::fmt::Debug for SyscallEntry {
@@ -919,8 +931,45 @@ impl core::fmt::Debug for SyscallEntry {
             .field("name",        &self.name)
             .field("has_handler", &self.handler.is_some())
             .field("has_raw",     &self.raw_handler.is_some())
+            .field("versions",    &self.versioned.len())
             .finish()
     }
+}
+
+// ── Syscall versioning ──────────────────────────────────────────────
+//
+// Wire format: the bottom 24 bits of the u32 syscall number are the
+// canonical syscall id (room for 16M numbers — far past the ~234 we
+// have). The top 8 bits are a version field. Userspace that knows
+// nothing about versions encodes 0 implicitly — the upper bits stay
+// zero — so it always reaches the canonical v0 handler.
+//
+// Adding a v1 of an existing syscall is a `install_raw_versioned`
+// call in the kernel + a recompile of the libc that wants to use it
+// with `(1 << SYS_VERSION_SHIFT) | SYS_FOO` at the call site. The v0
+// handler stays alive for old binaries indefinitely.
+
+/// Bit shift for the version field in a raw syscall number.
+pub const SYS_VERSION_SHIFT: u32 = 24;
+/// Mask isolating the version field.
+pub const SYS_VERSION_MASK:  u32 = 0xFF00_0000;
+/// Mask isolating the canonical syscall number (low 24 bits).
+pub const SYS_NUMBER_MASK:   u32 = 0x00FF_FFFF;
+
+/// Pull the version (0..=255) out of a raw syscall number.
+#[inline]
+pub const fn syscall_version(raw: u32) -> u8 {
+    ((raw & SYS_VERSION_MASK) >> SYS_VERSION_SHIFT) as u8
+}
+
+/// Pull the canonical syscall number out of a raw syscall number.
+#[inline]
+pub const fn syscall_number(raw: u32) -> u32 { raw & SYS_NUMBER_MASK }
+
+/// Pack a `(version, syscall)` pair into the wire-format u32.
+#[inline]
+pub const fn syscall_pack(version: u8, n: Syscall) -> u32 {
+    ((version as u32) << SYS_VERSION_SHIFT) | (n.raw() & SYS_NUMBER_MASK)
 }
 
 /// In-kernel syscall table. Constructed at boot, handed to
@@ -939,6 +988,7 @@ impl SyscallTable {
     pub fn register(&mut self, n: Syscall, name: &'static str) {
         self.entries.push(SyscallEntry {
             number: n, name, handler: None, raw_handler: None,
+            versioned: Vec::new(),
         });
     }
 
@@ -976,7 +1026,39 @@ impl SyscallTable {
         } else {
             self.entries.push(SyscallEntry {
                 number: n, name, handler: plain, raw_handler: raw,
+                versioned: Vec::new(),
             });
+        }
+    }
+
+    /// Register a raw handler for `(syscall, version)`. `version=0`
+    /// is reserved for the canonical wire ABI — register that with
+    /// `install_raw` instead. Re-registering the same `(n, version)`
+    /// pair replaces the prior handler.
+    pub fn install_raw_versioned<H: RawSyscallHandler + 'static>(
+        &mut self,
+        n: Syscall,
+        version: u8,
+        handler: H,
+    ) {
+        assert!(version != 0, "version=0 is the canonical ABI; use install_raw");
+        let boxed = Box::new(handler) as Box<dyn RawSyscallHandler>;
+        let slot = if let Some(s) = self.entries.iter_mut().find(|e| e.number == n) {
+            s
+        } else {
+            self.entries.push(SyscallEntry {
+                number: n,
+                name: "<versioned-only>",
+                handler: None,
+                raw_handler: None,
+                versioned: Vec::new(),
+            });
+            self.entries.last_mut().expect("just pushed")
+        };
+        if let Some(pos) = slot.versioned.iter().position(|(v, _)| *v == version) {
+            slot.versioned[pos] = (version, boxed);
+        } else {
+            slot.versioned.push((version, boxed));
         }
     }
 
@@ -1007,12 +1089,39 @@ impl SyscallTable {
         Some(h.invoke(args))
     }
 
-    /// Raw-aware dispatch. If a raw handler is installed, call it
-    /// with `ctx` (it's responsible for `set_return` /
-    /// `redirect_to_kernel`). Otherwise fall back to the plain
-    /// handler. Absence of both means `SyscallReturn::invalid_op`.
+    /// Raw-aware dispatch (canonical, version=0). If a raw handler is
+    /// installed, call it with `ctx` (it's responsible for
+    /// `set_return` / `redirect_to_kernel`). Otherwise fall back to
+    /// the plain handler. Absence of both means
+    /// `SyscallReturn::invalid_op`.
     pub fn dispatch_ctx(&self, n: Syscall, ctx: &mut dyn TrapContext) {
+        self.dispatch_ctx_versioned(n, 0, ctx)
+    }
+
+    /// Raw-aware dispatch with a version. Lookup order:
+    /// 1. If `version != 0` and the slot has a matching versioned
+    ///    handler, invoke it.
+    /// 2. Else fall through to the v0 raw handler.
+    /// 3. Else fall through to the v0 plain handler.
+    /// 4. Else `SyscallReturn::invalid_op`.
+    ///
+    /// This makes a v1 caller of an as-yet-unversioned syscall fall
+    /// back to v0 transparently — the right answer when v0 is the
+    /// canonical wire ABI.
+    pub fn dispatch_ctx_versioned(
+        &self,
+        n: Syscall,
+        version: u8,
+        ctx: &mut dyn TrapContext,
+    ) {
         if let Some(slot) = self.entries.iter().find(|e| e.number == n) {
+            if version != 0 {
+                if let Some((_, h)) = slot.versioned.iter().find(|(v, _)| *v == version) {
+                    h.invoke(ctx);
+                    return;
+                }
+                // Versioned handler not installed; fall through to v0.
+            }
             if let Some(h) = slot.raw_handler.as_ref() {
                 h.invoke(ctx);
                 return;
@@ -1120,7 +1229,12 @@ pub fn __test_clear_global() {
 /// The arch trap path in this tree uses the raw-aware form.
 #[inline]
 pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
-    let n = match Syscall::from_raw(num) {
+    // Split `num` into version (top 8 bits) + canonical syscall
+    // number (low 24 bits). v0 callers encode 0 in the upper bits
+    // implicitly, so pre-versioning binaries dispatch to v0 forever.
+    let version = syscall_version(num);
+    let raw_n   = syscall_number(num);
+    let n = match Syscall::from_raw(raw_n) {
         Some(v) => v,
         None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
     };
@@ -1133,7 +1247,7 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
     // so a `&` borrow is safe even if a raw handler unwinds via
     // longjmp — no lock guard survives the call.
     let table: &SyscallTable = unsafe { &*p };
-    table.dispatch_ctx(n, ctx);
+    table.dispatch_ctx_versioned(n, version, ctx);
 }
 
 /// Legacy plain entry retained for the existing

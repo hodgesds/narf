@@ -5841,6 +5841,78 @@ fn smoke_rights_lattice_derive() -> TestResult {
 }
 kernel_test!(smoke_rights_lattice_derive);
 
+fn smoke_syscall_versioning_dispatch() -> TestResult {
+    // Build a private SyscallTable with a v0 + v1 handler for the
+    // same syscall number, exercise dispatch_ctx_versioned for both
+    // versions, and assert each handler set its own canary value.
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use narf_userspace::{
+        syscall_pack, syscall_number, syscall_version, RawFnHandler,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+
+    static V0_SEEN: AtomicU32 = AtomicU32::new(0);
+    static V1_SEEN: AtomicU32 = AtomicU32::new(0);
+    V0_SEEN.store(0, Ordering::Relaxed);
+    V1_SEEN.store(0, Ordering::Relaxed);
+
+    let mut table = SyscallTable::new();
+    table.install_raw(Syscall::Yield, "yield-v0",
+        RawFnHandler(|ctx: &mut dyn TrapContext| {
+            V0_SEEN.fetch_add(1, Ordering::Relaxed);
+            ctx.set_return(SyscallReturn { value: 0xC0DE_0000, status: 0 });
+        }));
+    table.install_raw_versioned(Syscall::Yield, 1,
+        RawFnHandler(|ctx: &mut dyn TrapContext| {
+            V1_SEEN.fetch_add(1, Ordering::Relaxed);
+            ctx.set_return(SyscallReturn { value: 0xC0DE_0001, status: 0 });
+        }));
+
+    // Bit-packing helpers round-trip cleanly.
+    let raw = syscall_pack(1, Syscall::Yield);
+    if syscall_version(raw) != 1 {
+        return TestResult::Fail("version_of did not extract 1");
+    }
+    if syscall_number(raw) != Syscall::Yield.raw() {
+        return TestResult::Fail("number_of did not extract Yield");
+    }
+
+    // Manual ctx for dispatch.
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+    }
+    let mut ctx0 = FakeCtx { args: SyscallArgs::default(), ret: None };
+    table.dispatch_ctx_versioned(Syscall::Yield, 0, &mut ctx0);
+    if ctx0.ret.map(|r| r.value) != Some(0xC0DE_0000) {
+        return TestResult::Fail("v0 dispatch did not return v0 sentinel");
+    }
+    if V0_SEEN.load(Ordering::Relaxed) != 1 || V1_SEEN.load(Ordering::Relaxed) != 0 {
+        return TestResult::Fail("v0 path did not invoke v0 handler exclusively");
+    }
+
+    let mut ctx1 = FakeCtx { args: SyscallArgs::default(), ret: None };
+    table.dispatch_ctx_versioned(Syscall::Yield, 1, &mut ctx1);
+    if ctx1.ret.map(|r| r.value) != Some(0xC0DE_0001) {
+        return TestResult::Fail("v1 dispatch did not return v1 sentinel");
+    }
+    if V1_SEEN.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("v1 path did not invoke v1 handler");
+    }
+
+    // Unknown version (v2) falls through to v0 — the documented
+    // "if no override, use canonical" rule.
+    let mut ctx2 = FakeCtx { args: SyscallArgs::default(), ret: None };
+    table.dispatch_ctx_versioned(Syscall::Yield, 2, &mut ctx2);
+    if ctx2.ret.map(|r| r.value) != Some(0xC0DE_0000) {
+        return TestResult::Fail("v2 unknown did not fall through to v0");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_syscall_versioning_dispatch);
+
 fn smoke_drivers_net_nic_model_ids() -> TestResult {
     use narf_drivers_net::{NicCaps, NicModel};
 
