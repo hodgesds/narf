@@ -7445,6 +7445,203 @@ fn smoke_acpi_mcfg_ecam_base() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_acpi_mcfg_ecam_base);
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_acpi_hmat_latency_lookup() -> TestResult {
+    // The xtask QEMU config publishes a 2x2 HMAT lat/bw matrix:
+    // same-node latency 10 ns, cross-node 20 ns. Verify the parser
+    // returns sane values for both axes.
+    let rsdp = match narf_acpi::cached_rsdp() {
+        Some(p) => p,
+        None    => return TestResult::Fail("no boot-time RSDP cached"),
+    };
+    // SAFETY: cached RSDP, validated at boot.
+    let _ = unsafe { narf_acpi::parse_hmat(rsdp) };
+    if !narf_acpi::is_hmat_known() {
+        return TestResult::Fail("HMAT not parsed");
+    }
+    let same = narf_acpi::hmat_value(
+        narf_acpi::HmatLatBwKind::AccessLatency, 0, 0, 0,
+    );
+    let cross = narf_acpi::hmat_value(
+        narf_acpi::HmatLatBwKind::AccessLatency, 0, 0, 1,
+    );
+    let (same, cross) = match (same, cross) {
+        (Some(s), Some(c)) => (s, c),
+        _ => return TestResult::Fail("HMAT didn't return both lookups"),
+    };
+    if cross <= same {
+        return TestResult::Fail("cross-node latency should exceed same-node");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_acpi_hmat_latency_lookup);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_acpi_hmat_mem_attrs_present() -> TestResult {
+    let rsdp = match narf_acpi::cached_rsdp() {
+        Some(p) => p,
+        None    => return TestResult::Fail("no boot-time RSDP cached"),
+    };
+    // SAFETY: cached RSDP, validated at boot.
+    let _ = unsafe { narf_acpi::parse_hmat(rsdp) };
+    let mut buf = [narf_acpi::HmatMemAttr::default(); narf_acpi::MAX_HMAT_MEM_ATTRS];
+    let n = narf_acpi::copy_hmat_mem_attrs(&mut buf);
+    if n < 2 {
+        return TestResult::Fail("expected >=2 HMAT memory-proximity attrs");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_acpi_hmat_mem_attrs_present);
+
+fn smoke_acpi_pmtt_synthetic_dimm_entry() -> TestResult {
+    // Synthetic PMTT body: 1 socket containing 1 memory controller
+    // containing 2 DIMMs. Verify the hierarchical decoder threads
+    // socket id and controller id down to the DIMM entries.
+    narf_acpi::__reset_for_test();
+
+    // The synthetic-body shim isn't exposed for PMTT (the real
+    // parser walks hierarchically); construct a complete table
+    // body and call parse_pmtt against an in-memory pointer.
+    // We're test-only here, so a heap allocation is fine.
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    // SDT header (36) + memory-device-count (4) = 40 bytes.
+    buf.extend_from_slice(b"PMTT");
+    let len_pos = buf.len();
+    buf.extend_from_slice(&0u32.to_le_bytes()); // length placeholder
+    buf.push(1); // revision
+    buf.push(0); // checksum placeholder
+    buf.extend_from_slice(b"NARFCO");
+    buf.extend_from_slice(b"NARFTBL_");
+    buf.extend_from_slice(&0u32.to_le_bytes()); // OEM revision
+    buf.extend_from_slice(&0u32.to_le_bytes()); // creator id
+    buf.extend_from_slice(&0u32.to_le_bytes()); // creator revision
+    buf.extend_from_slice(&2u32.to_le_bytes()); // memory device count
+
+    // Socket header is 12 bytes; memory ctrl 12 bytes; each DIMM 12 bytes.
+    // Total socket length = 12 + 12 + 12 + 12 = 48.
+    let socket_start = buf.len();
+    buf.push(0);  // type=Socket
+    buf.push(0);  // reserved
+    buf.extend_from_slice(&48u16.to_le_bytes()); // length
+    buf.extend_from_slice(&0u16.to_le_bytes());  // flags
+    buf.extend_from_slice(&0u16.to_le_bytes());  // reserved
+    buf.extend_from_slice(&7u16.to_le_bytes());  // socket id = 7
+    buf.extend_from_slice(&0u16.to_le_bytes());  // reserved
+
+    // Memory controller (length = 12 + 2*12 = 36).
+    buf.push(1);  // type=MemCtrl
+    buf.push(0);
+    buf.extend_from_slice(&36u16.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&3u16.to_le_bytes()); // ctrl id = 3
+    buf.extend_from_slice(&0u16.to_le_bytes());
+
+    // DIMM 1 (length 12).
+    buf.push(2);
+    buf.push(0);
+    buf.extend_from_slice(&12u16.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&0xAAAA_BBBBu32.to_le_bytes()); // smbios
+
+    // DIMM 2.
+    buf.push(2);
+    buf.push(0);
+    buf.extend_from_slice(&12u16.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&0xCCCC_DDDDu32.to_le_bytes());
+    let _ = socket_start;
+
+    // Patch length in header.
+    let total_len = buf.len() as u32;
+    buf[len_pos..len_pos + 4].copy_from_slice(&total_len.to_le_bytes());
+
+    // Patch checksum so the parser accepts the table.
+    let sum: u8 = buf.iter().fold(0u8, |a, b| a.wrapping_add(*b));
+    let cksum_off = 9;
+    buf[cksum_off] = (0u8).wrapping_sub(sum);
+
+    // Build a fake XSDT pointing at this PMTT, and an RSDP pointing
+    // at that XSDT. All three live in our heap buffer; the parser
+    // reads them via `*const u8` ptrs which is fine in-process.
+    let pmtt_phys = buf.as_ptr() as u64;
+
+    let mut xsdt: Vec<u8> = Vec::new();
+    xsdt.extend_from_slice(b"XSDT");
+    let xlen_pos = xsdt.len();
+    xsdt.extend_from_slice(&0u32.to_le_bytes());
+    xsdt.push(1);  // revision
+    xsdt.push(0);  // checksum
+    xsdt.extend_from_slice(b"NARFCO");
+    xsdt.extend_from_slice(b"NARFTBL_");
+    xsdt.extend_from_slice(&0u32.to_le_bytes());
+    xsdt.extend_from_slice(&0u32.to_le_bytes());
+    xsdt.extend_from_slice(&0u32.to_le_bytes());
+    xsdt.extend_from_slice(&pmtt_phys.to_le_bytes());
+    let total_xlen = xsdt.len() as u32;
+    xsdt[xlen_pos..xlen_pos + 4].copy_from_slice(&total_xlen.to_le_bytes());
+    let xsum: u8 = xsdt.iter().fold(0u8, |a, b| a.wrapping_add(*b));
+    xsdt[9] = (0u8).wrapping_sub(xsum);
+    let xsdt_phys = xsdt.as_ptr() as u64;
+
+    let mut rsdp = [0u8; 36];
+    rsdp[..8].copy_from_slice(b"RSD PTR ");
+    rsdp[15] = 2; // revision >= 2 → use XSDT
+    rsdp[24..32].copy_from_slice(&xsdt_phys.to_le_bytes());
+    let v1_sum: u8 = rsdp[..20].iter().fold(0u8, |a, b| a.wrapping_add(*b));
+    rsdp[8] = (0u8).wrapping_sub(v1_sum);
+    let rsdp_phys = narf_memory::PhysAddr::new(rsdp.as_ptr() as u64);
+
+    // SAFETY: pointers refer to live in-process buffers backed by
+    // the heap; reads are bounded by the encoded lengths.
+    let n = match unsafe { narf_acpi::parse_pmtt(rsdp_phys) } {
+        Ok(n) => n,
+        Err(e) => {
+            // Keep buffers alive across the parse (Vec lifetimes).
+            let _ = (buf, xsdt, rsdp);
+            return TestResult::Fail(match e {
+                narf_acpi::AcpiError::BadRsdpSignature => "bad rsdp sig",
+                narf_acpi::AcpiError::BadRsdpChecksum  => "bad rsdp cksum",
+                narf_acpi::AcpiError::NoXsdt           => "no xsdt",
+                narf_acpi::AcpiError::BadXsdtSignature => "bad xsdt sig",
+                narf_acpi::AcpiError::NoSrat           => "no pmtt",
+                narf_acpi::AcpiError::BadTableChecksum => "bad table cksum",
+            });
+        }
+    };
+    if n != 4 {
+        let _ = (buf, xsdt, rsdp);
+        return TestResult::Fail("expected 4 PMTT structures (1+1+2)");
+    }
+    let (s, c, d) = narf_acpi::pmtt_counts();
+    if (s, c, d) != (1, 1, 2) {
+        let _ = (buf, xsdt, rsdp);
+        return TestResult::Fail("PMTT counts wrong");
+    }
+    let mut dimms = [narf_acpi::PmttDimm::default(); narf_acpi::MAX_PMTT_DIMMS];
+    let dn = narf_acpi::copy_pmtt_dimms(&mut dimms);
+    if dn != 2 {
+        let _ = (buf, xsdt, rsdp);
+        return TestResult::Fail("DIMM table didn't capture 2 entries");
+    }
+    if dimms[0].socket_id != 7 || dimms[0].controller_id != 3 {
+        let _ = (buf, xsdt, rsdp);
+        return TestResult::Fail("DIMM 0 parent ids wrong");
+    }
+    if dimms[1].smbios_handle != 0xCCCC_DDDD {
+        let _ = (buf, xsdt, rsdp);
+        return TestResult::Fail("DIMM 1 smbios handle wrong");
+    }
+    let _ = (buf, xsdt, rsdp);
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_pmtt_synthetic_dimm_entry);
+
 fn smoke_acpi_srat_synthetic_memory_entry() -> TestResult {
     // Type-1 memory affinity entry: base 0x1_0000_0000, length
     // 0x1000_0000, proximity 1, enabled.

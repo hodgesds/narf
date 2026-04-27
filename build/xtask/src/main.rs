@@ -103,7 +103,7 @@ impl Arch {
                 let img = nvme_image_path()
                     .display().to_string();
                 vec![
-                    "-machine".into(), "q35".into(),
+                    "-machine".into(), "q35,hmat=on".into(),
                     "-cpu".into(),     "max".into(),
                     // 2 logical CPUs so AP bring-up via INIT-SIPI-SIPI
                     // exercises a real second core under QEMU q35.
@@ -113,10 +113,30 @@ impl Arch {
                     // narf_acpi to parse. Each node owns one socket
                     // (one logical CPU under the smp config above)
                     // and 128 MiB of the total 256 MiB RAM.
-                    "-numa".into(),    "node,nodeid=0,cpus=0,memdev=mem0".into(),
-                    "-numa".into(),    "node,nodeid=1,cpus=1,memdev=mem1".into(),
+                    "-numa".into(),    "node,nodeid=0,cpus=0,memdev=mem0,initiator=0".into(),
+                    "-numa".into(),    "node,nodeid=1,cpus=1,memdev=mem1,initiator=1".into(),
                     "-object".into(),  "memory-backend-ram,id=mem0,size=128M".into(),
                     "-object".into(),  "memory-backend-ram,id=mem1,size=128M".into(),
+                    // HMAT lat/bw entries: same-node access fast,
+                    // cross-node 2x. The numbers are arbitrary but
+                    // distinguish the matrix axes so the parser sees
+                    // a non-trivial table.
+                    "-numa".into(),
+                    "hmat-lb,initiator=0,target=0,hierarchy=memory,data-type=access-latency,latency=10".into(),
+                    "-numa".into(),
+                    "hmat-lb,initiator=0,target=1,hierarchy=memory,data-type=access-latency,latency=20".into(),
+                    "-numa".into(),
+                    "hmat-lb,initiator=1,target=0,hierarchy=memory,data-type=access-latency,latency=20".into(),
+                    "-numa".into(),
+                    "hmat-lb,initiator=1,target=1,hierarchy=memory,data-type=access-latency,latency=10".into(),
+                    "-numa".into(),
+                    "hmat-lb,initiator=0,target=0,hierarchy=memory,data-type=access-bandwidth,bandwidth=10G".into(),
+                    "-numa".into(),
+                    "hmat-lb,initiator=0,target=1,hierarchy=memory,data-type=access-bandwidth,bandwidth=5G".into(),
+                    "-numa".into(),
+                    "hmat-lb,initiator=1,target=0,hierarchy=memory,data-type=access-bandwidth,bandwidth=5G".into(),
+                    "-numa".into(),
+                    "hmat-lb,initiator=1,target=1,hierarchy=memory,data-type=access-bandwidth,bandwidth=10G".into(),
                     "-serial".into(),  "stdio".into(),
                     "-display".into(), "none".into(),
                     "-no-reboot".into(),

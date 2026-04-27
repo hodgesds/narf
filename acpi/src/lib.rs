@@ -789,6 +789,502 @@ pub fn mcfg_ecam_base() -> Option<u64> {
     if v == 0 { None } else { Some(v) }
 }
 
+// ── HMAT (Heterogeneous Memory Attribute Table) ─────────────────────
+//
+// HMAT signature is `"HMAT"`. After the SDT header + 4 reserved
+// bytes there's a sequence of variable-length sub-structures:
+//
+//   offset 0: Type (u16)  — 0=Mem Proximity Attrs, 1=Locality lat/bw,
+//                            2=Memory Side Cache.
+//   offset 2: Reserved (u16)
+//   offset 4: Length (u32)
+//   ...type-specific body...
+//
+// Today's decoder covers Types 0 and 1; Type 2 (memory-side cache
+// info) is decoded only enough to walk past it. The lat/bw matrix
+// (Type 1) is the most useful piece — a NUMA-aware allocator or
+// scheduler-affinity hint can rank target nodes by access latency
+// from a given initiator.
+
+/// Maximum number of HMAT memory-proximity attribute entries we
+/// track. Each NUMA node has one; cap matches `MAX_NUMA_NODES`.
+pub const MAX_HMAT_MEM_ATTRS: usize = MAX_NUMA_NODES;
+
+/// Maximum HMAT latency/bandwidth records we keep. Each record can
+/// pack many initiators × targets, so 8 records covers the common
+/// "access latency + access bandwidth + read/write variants" set.
+pub const MAX_HMAT_LATBW: usize = 8;
+
+/// Maximum (initiator, target) pairs per HMAT lat/bw record. Bounds
+/// the per-record matrix size we copy into static storage.
+pub const MAX_HMAT_LATBW_PAIRS: usize = MAX_NUMA_NODES * MAX_NUMA_NODES;
+
+/// HMAT memory-proximity attribute entry (Type 0).
+#[derive(Copy, Clone, Debug, Default)]
+pub struct HmatMemAttr {
+    /// Initiator (CPU/GPU) proximity domain. Only meaningful when
+    /// `processor_proximity_valid` is set.
+    pub processor_pd:                 u32,
+    /// Memory proximity domain this entry describes.
+    pub memory_pd:                    u32,
+    /// Bit 0: processor_proximity_valid.
+    pub flags:                        u16,
+    /// Convenience accessor.
+    pub processor_proximity_valid:    bool,
+}
+
+/// HMAT lat/bw record kind (Type 1 `data_type`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HmatLatBwKind {
+    AccessLatency,
+    ReadLatency,
+    WriteLatency,
+    AccessBandwidth,
+    ReadBandwidth,
+    WriteBandwidth,
+    Other(u8),
+}
+
+impl HmatLatBwKind {
+    fn from_byte(b: u8) -> Self {
+        match b {
+            0 => Self::AccessLatency,
+            1 => Self::ReadLatency,
+            2 => Self::WriteLatency,
+            3 => Self::AccessBandwidth,
+            4 => Self::ReadBandwidth,
+            5 => Self::WriteBandwidth,
+            x => Self::Other(x),
+        }
+    }
+}
+
+/// HMAT lat/bw record (Type 1) header — value matrix lives in a
+/// separate fixed-size table because it can be large.
+#[derive(Copy, Clone, Debug)]
+pub struct HmatLatBwRecord {
+    pub kind:           HmatLatBwKind,
+    /// Memory hierarchy: 0=memory, 1=last-level cache, etc.
+    pub hierarchy:      u8,
+    pub n_initiators:   u32,
+    pub n_targets:      u32,
+    /// Multiplier in picoseconds (latency) or MB/s (bandwidth).
+    pub entry_base_unit: u64,
+    /// Index into `HMAT_LATBW_PAIRS` where this record's pair list
+    /// starts. `n_initiators * n_targets` pairs follow.
+    pub pairs_offset:   u32,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct HmatLatBwPair {
+    initiator: u32,
+    target:    u32,
+    /// Raw value in `entry_base_unit` units.
+    value:     u16,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct HmatTables {
+    mem_attrs:        [HmatMemAttr; MAX_HMAT_MEM_ATTRS],
+    n_mem_attrs:      usize,
+    records:          [HmatLatBwRecord; MAX_HMAT_LATBW],
+    n_records:        usize,
+    pairs:            [HmatLatBwPair; MAX_HMAT_LATBW_PAIRS],
+    n_pairs:          usize,
+}
+
+impl HmatTables {
+    const EMPTY: Self = Self {
+        mem_attrs: [HmatMemAttr {
+            processor_pd: 0, memory_pd: 0,
+            flags: 0, processor_proximity_valid: false,
+        }; MAX_HMAT_MEM_ATTRS],
+        n_mem_attrs: 0,
+        records: [HmatLatBwRecord {
+            kind: HmatLatBwKind::Other(0xFF),
+            hierarchy: 0,
+            n_initiators: 0, n_targets: 0,
+            entry_base_unit: 0, pairs_offset: 0,
+        }; MAX_HMAT_LATBW],
+        n_records: 0,
+        pairs: [HmatLatBwPair { initiator: 0, target: 0, value: 0 };
+            MAX_HMAT_LATBW_PAIRS],
+        n_pairs: 0,
+    };
+}
+
+static HMAT_DATA: IrqSafeSpinLock<HmatTables> =
+    IrqSafeSpinLock::new(HmatTables::EMPTY);
+static HMAT_PARSED: AtomicBool = AtomicBool::new(false);
+
+/// Discover and parse the HMAT.
+///
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → HMAT pointers must also be identity-mapped.
+pub unsafe fn parse_hmat(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut hmat: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"HMAT" && hmat.is_none() { hmat = Some(phys); }
+        })?;
+    }
+    let hmat = hmat.ok_or(AcpiError::NoSrat)?;
+
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (hmat as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 4 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(hmat as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+
+    // 4 reserved bytes after the SDT header.
+    let mut cur = SDT_HEADER_SIZE + 4;
+    let mut count = 0u32;
+    let mut tables = HMAT_DATA.lock();
+    *tables = HmatTables::EMPTY;
+
+    while cur + 8 <= body.len() {
+        let kind = u16::from_le_bytes([body[cur], body[cur + 1]]);
+        let len  = u32::from_le_bytes([
+            body[cur + 4], body[cur + 5], body[cur + 6], body[cur + 7],
+        ]) as usize;
+        if len < 8 || cur + len > body.len() { break; }
+        let entry = &body[cur..cur + len];
+
+        match kind {
+            0 if entry.len() >= 40 => {
+                // Type 0: Memory Proximity Domain Attributes.
+                // [8..10] flags, [10..12] reserved, [12..16] processor PD,
+                // [16..20] memory PD, [20..40] reserved.
+                let flags = u16::from_le_bytes([entry[8], entry[9]]);
+                let processor_pd = u32::from_le_bytes([
+                    entry[12], entry[13], entry[14], entry[15],
+                ]);
+                let memory_pd = u32::from_le_bytes([
+                    entry[16], entry[17], entry[18], entry[19],
+                ]);
+                if tables.n_mem_attrs < MAX_HMAT_MEM_ATTRS {
+                    let i = tables.n_mem_attrs;
+                    tables.mem_attrs[i] = HmatMemAttr {
+                        processor_pd,
+                        memory_pd,
+                        flags,
+                        processor_proximity_valid: flags & 0x1 != 0,
+                    };
+                    tables.n_mem_attrs = i + 1;
+                    count += 1;
+                }
+            }
+            1 if entry.len() >= 32 => {
+                // Type 1: System Locality Latency/Bandwidth.
+                // [8] flags, [9] data_type, [10] min_xfer_size, [11] reserved,
+                // [12..16] num_initiators, [16..20] num_targets,
+                // [20..24] reserved, [24..32] entry_base_unit,
+                // then num_initiators × u32, num_targets × u32, matrix
+                // num_initiators*num_targets × u16.
+                let hierarchy = entry[8] & 0x0F;
+                let dt   = HmatLatBwKind::from_byte(entry[9]);
+                let n_in  = u32::from_le_bytes([
+                    entry[12], entry[13], entry[14], entry[15],
+                ]);
+                let n_tg  = u32::from_le_bytes([
+                    entry[16], entry[17], entry[18], entry[19],
+                ]);
+                let base_unit = u64::from_le_bytes([
+                    entry[24], entry[25], entry[26], entry[27],
+                    entry[28], entry[29], entry[30], entry[31],
+                ]);
+
+                let init_off = 32;
+                let tgt_off  = init_off + (n_in as usize) * 4;
+                let mat_off  = tgt_off  + (n_tg as usize) * 4;
+                let mat_len  = (n_in as usize) * (n_tg as usize) * 2;
+                if mat_off + mat_len > entry.len() { break; }
+                if tables.n_records >= MAX_HMAT_LATBW { cur += len; continue; }
+
+                let pairs_offset = tables.n_pairs as u32;
+                // Decode matrix into the flat pair table.
+                'outer: for ii in 0..(n_in as usize) {
+                    for ti in 0..(n_tg as usize) {
+                        if tables.n_pairs >= MAX_HMAT_LATBW_PAIRS {
+                            break 'outer;
+                        }
+                        let initiator = u32::from_le_bytes([
+                            entry[init_off + ii * 4],
+                            entry[init_off + ii * 4 + 1],
+                            entry[init_off + ii * 4 + 2],
+                            entry[init_off + ii * 4 + 3],
+                        ]);
+                        let target = u32::from_le_bytes([
+                            entry[tgt_off + ti * 4],
+                            entry[tgt_off + ti * 4 + 1],
+                            entry[tgt_off + ti * 4 + 2],
+                            entry[tgt_off + ti * 4 + 3],
+                        ]);
+                        let val_off = mat_off + (ii * (n_tg as usize) + ti) * 2;
+                        let value = u16::from_le_bytes([
+                            entry[val_off], entry[val_off + 1],
+                        ]);
+                        let i = tables.n_pairs;
+                        tables.pairs[i] = HmatLatBwPair {
+                            initiator, target, value,
+                        };
+                        tables.n_pairs = i + 1;
+                    }
+                }
+                let i = tables.n_records;
+                tables.records[i] = HmatLatBwRecord {
+                    kind: dt,
+                    hierarchy,
+                    n_initiators: n_in,
+                    n_targets:    n_tg,
+                    entry_base_unit: base_unit,
+                    pairs_offset,
+                };
+                tables.n_records = i + 1;
+                count += 1;
+            }
+            // Type 2 (Memory Side Cache) — walked but not retained.
+            _ => {}
+        }
+        cur += len;
+    }
+
+    HMAT_PARSED.store(true, Ordering::Release);
+    Ok(count)
+}
+
+/// True once `parse_hmat` has succeeded.
+pub fn is_hmat_known() -> bool { HMAT_PARSED.load(Ordering::Acquire) }
+
+/// Snapshot the HMAT memory-proximity attribute list. Returns the
+/// number of entries written.
+pub fn copy_hmat_mem_attrs(out: &mut [HmatMemAttr]) -> usize {
+    let g = HMAT_DATA.lock();
+    let n = g.n_mem_attrs.min(out.len());
+    out[..n].copy_from_slice(&g.mem_attrs[..n]);
+    n
+}
+
+/// Look up a single (initiator, target) lat/bw value. `kind`
+/// disambiguates which record to consult; matching kind + hierarchy
+/// (default `0` = main memory) wins. Returns the raw u16 value
+/// times `entry_base_unit` (latency in picoseconds, bandwidth in
+/// MB/s by ACPI convention).
+pub fn hmat_value(
+    kind:      HmatLatBwKind,
+    hierarchy: u8,
+    initiator: u32,
+    target:    u32,
+) -> Option<u64> {
+    let g = HMAT_DATA.lock();
+    for r in &g.records[..g.n_records] {
+        if r.kind != kind || r.hierarchy != hierarchy { continue; }
+        let n_pairs = (r.n_initiators as usize) * (r.n_targets as usize);
+        let start = r.pairs_offset as usize;
+        for p in &g.pairs[start..start + n_pairs.min(g.n_pairs.saturating_sub(start))] {
+            if p.initiator == initiator && p.target == target {
+                return Some(r.entry_base_unit.saturating_mul(p.value as u64));
+            }
+        }
+    }
+    None
+}
+
+/// Copy out lat/bw record headers (without their pair data) for
+/// diagnostics. Returns the count.
+pub fn copy_hmat_records(out: &mut [HmatLatBwRecord]) -> usize {
+    let g = HMAT_DATA.lock();
+    let n = g.n_records.min(out.len());
+    out[..n].copy_from_slice(&g.records[..n]);
+    n
+}
+
+// ── PMTT (Platform Memory Topology Table) ───────────────────────────
+//
+// PMTT signature is `"PMTT"`. ACPI 6.0+ layout:
+//
+//   header: SDT (36) + memory-device-count u32 (4) — 40 bytes total.
+//   then a sequence of "common" structures, each:
+//     [0] type u8: 0=Socket, 1=Memory Controller, 2=DIMM,
+//                  0xFF=Vendor-specific.
+//     [1] reserved
+//     [2..4] length u16
+//     [4..6] flags u16
+//     [6..8] reserved
+//     ... type-specific body, then nested children up to length.
+//
+// Sockets contain Memory Controllers, which contain DIMMs.
+//
+// We flatten the hierarchy into three counters + a small DIMM table
+// (smbios handle + parent socket id). That covers what
+// observability/diagnostics typically need; deeper hierarchy walks
+// can layer on top.
+
+/// Maximum DIMM entries we track. 32 is comfortable for most
+/// platforms; multi-socket high-density servers can stretch this
+/// when a real consumer arrives.
+pub const MAX_PMTT_DIMMS: usize = 32;
+
+/// One DIMM entry from PMTT.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct PmttDimm {
+    /// SMBIOS Type-17 handle the DIMM corresponds to.
+    pub smbios_handle: u32,
+    /// Parent socket id (closest enclosing Type-0 Socket).
+    pub socket_id:     u16,
+    /// Parent memory-controller id (closest enclosing Type-1).
+    pub controller_id: u16,
+    /// Common-header flags from the DIMM struct.
+    pub flags:         u16,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct PmttTables {
+    n_sockets:     u32,
+    n_controllers: u32,
+    n_dimms:       u32,
+    dimms:         [PmttDimm; MAX_PMTT_DIMMS],
+    dimms_len:     usize,
+}
+
+impl PmttTables {
+    const EMPTY: Self = Self {
+        n_sockets: 0, n_controllers: 0, n_dimms: 0,
+        dimms: [PmttDimm {
+            smbios_handle: 0, socket_id: 0, controller_id: 0, flags: 0,
+        }; MAX_PMTT_DIMMS],
+        dimms_len: 0,
+    };
+}
+
+static PMTT_DATA: IrqSafeSpinLock<PmttTables> =
+    IrqSafeSpinLock::new(PmttTables::EMPTY);
+static PMTT_PARSED: AtomicBool = AtomicBool::new(false);
+
+/// Discover and parse the PMTT.
+///
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → PMTT pointers must also be identity-mapped.
+pub unsafe fn parse_pmtt(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut pmtt: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"PMTT" && pmtt.is_none() { pmtt = Some(phys); }
+        })?;
+    }
+    let pmtt = pmtt.ok_or(AcpiError::NoSrat)?;
+
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (pmtt as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 4 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(pmtt as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+
+    // After SDT header: u32 memory-device-count (informational).
+    let mut cur = SDT_HEADER_SIZE + 4;
+    let mut tables = PMTT_DATA.lock();
+    *tables = PmttTables::EMPTY;
+
+    let count = parse_pmtt_children(body, &mut cur, body.len(), 0xFFFF, 0xFFFF, &mut tables);
+    PMTT_PARSED.store(true, Ordering::Release);
+    Ok(count)
+}
+
+/// Walk siblings starting at `*cur`, recursing into children. Returns
+/// the count of structures decoded.
+fn parse_pmtt_children(
+    body:           &[u8],
+    cur:            &mut usize,
+    end:            usize,
+    parent_socket:  u16,
+    parent_ctrl:    u16,
+    out:            &mut PmttTables,
+) -> u32 {
+    let mut count = 0u32;
+    while *cur + 8 <= end {
+        let kind = body[*cur];
+        let len  = u16::from_le_bytes([body[*cur + 2], body[*cur + 3]]) as usize;
+        if len < 8 || *cur + len > end { break; }
+        let entry = &body[*cur..*cur + len];
+        let flags = u16::from_le_bytes([entry[4], entry[5]]);
+
+        match kind {
+            0 if entry.len() >= 12 => {
+                // Socket: [8..10] socket id, [10..12] reserved.
+                let socket_id = u16::from_le_bytes([entry[8], entry[9]]);
+                out.n_sockets += 1;
+                let mut child_cur = *cur + 12;
+                let child_end = *cur + len;
+                count += 1 + parse_pmtt_children(
+                    body, &mut child_cur, child_end,
+                    socket_id, parent_ctrl, out);
+            }
+            1 if entry.len() >= 12 => {
+                // Memory Controller: [8..10] id, [10..12] reserved.
+                let ctrl_id = u16::from_le_bytes([entry[8], entry[9]]);
+                out.n_controllers += 1;
+                let mut child_cur = *cur + 12;
+                let child_end = *cur + len;
+                count += 1 + parse_pmtt_children(
+                    body, &mut child_cur, child_end,
+                    parent_socket, ctrl_id, out);
+            }
+            2 if entry.len() >= 12 => {
+                // DIMM: [8..12] SMBIOS handle.
+                let smbios_handle = u32::from_le_bytes([
+                    entry[8], entry[9], entry[10], entry[11],
+                ]);
+                if out.dimms_len < MAX_PMTT_DIMMS {
+                    let i = out.dimms_len;
+                    out.dimms[i] = PmttDimm {
+                        smbios_handle,
+                        socket_id:     parent_socket,
+                        controller_id: parent_ctrl,
+                        flags,
+                    };
+                    out.dimms_len = i + 1;
+                }
+                out.n_dimms += 1;
+                count += 1;
+            }
+            _ => { /* vendor-specific or unknown — skip */ }
+        }
+        *cur += len;
+    }
+    count
+}
+
+/// True once `parse_pmtt` has succeeded.
+pub fn is_pmtt_known() -> bool { PMTT_PARSED.load(Ordering::Acquire) }
+
+/// Counts of structures observed in the most recent PMTT parse.
+pub fn pmtt_counts() -> (u32, u32, u32) {
+    let g = PMTT_DATA.lock();
+    (g.n_sockets, g.n_controllers, g.n_dimms)
+}
+
+/// Snapshot the DIMM list. Returns the count written.
+pub fn copy_pmtt_dimms(out: &mut [PmttDimm]) -> usize {
+    let g = PMTT_DATA.lock();
+    let n = g.dimms_len.min(out.len());
+    out[..n].copy_from_slice(&g.dimms[..n]);
+    n
+}
+
 /// Test/diagnostic helper: clear the parsed topology so a subsequent
 /// `parse_srat` call starts from a clean slate. Intended for unit
 /// tests; production code calls `parse_srat` exactly once.
@@ -804,6 +1300,10 @@ pub fn __reset_for_test() {
     MADT_CPU_COUNT.store(0, Ordering::Release);
     LAPIC_BASE.store(0, Ordering::Release);
     MCFG_BASE.store(0, Ordering::Release);
+    *HMAT_DATA.lock() = HmatTables::EMPTY;
+    HMAT_PARSED.store(false, Ordering::Release);
+    *PMTT_DATA.lock() = PmttTables::EMPTY;
+    PMTT_PARSED.store(false, Ordering::Release);
 }
 
 /// Raw SRAT entry kinds. Exposed for tests/diagnostics that want to

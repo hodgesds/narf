@@ -324,6 +324,30 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                     "  acpi: MCFG parse skipped: {:?}", e);
                             }
                         }
+                        // SAFETY: same.
+                        match unsafe { narf_acpi::parse_hmat(p) } {
+                            Ok(n) => {
+                                let _ = writeln!(console::Writer,
+                                    "  acpi: HMAT parsed, {} entries", n);
+                            }
+                            Err(e) => {
+                                let _ = writeln!(console::Writer,
+                                    "  acpi: HMAT parse skipped: {:?}", e);
+                            }
+                        }
+                        // SAFETY: same.
+                        match unsafe { narf_acpi::parse_pmtt(p) } {
+                            Ok(n) => {
+                                let (s, c, d) = narf_acpi::pmtt_counts();
+                                let _ = writeln!(console::Writer,
+                                    "  acpi: PMTT parsed, {} structures ({} socket, {} ctrl, {} dimm)",
+                                    n, s, c, d);
+                            }
+                            Err(e) => {
+                                let _ = writeln!(console::Writer,
+                                    "  acpi: PMTT parse skipped: {:?}", e);
+                            }
+                        }
                     }
                     None => {
                         let _ = writeln!(console::Writer,
