@@ -96,6 +96,7 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
         uart_phys:  PhysAddr::new(PL011_QEMU_VIRT),
         uart_virt:  VirtAddr::new(PL011_QEMU_VIRT),  // pre-MMU identity
         dtb_phys,
+        acpi_rsdp_phys: None,
     })
 }
 

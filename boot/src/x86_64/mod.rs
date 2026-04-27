@@ -68,11 +68,16 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
         return Err(BootError::NoUsableRam);
     }
 
+    // SAFETY: PVH header validated above.
+    let rsdp = unsafe { multiboot2::rsdp_phys(raw.payload.raw() as usize) }
+        .map(PhysAddr::new);
+
     Ok(BootInfo {
         memory_map: regions,
         cmdline:    CMDLINE,
         uart_phys:  PhysAddr::new(UART_DEFAULT_PORT as u64),
         uart_virt:  VirtAddr::new(UART_DEFAULT_PORT as u64),   // pre-MMU identity
         dtb_phys:   None,
+        acpi_rsdp_phys: rsdp,
     })
 }

@@ -48,7 +48,7 @@ struct HvmStartInfo {
     _nr_modules:    u32,
     _modlist:       u64,
     _cmdline:       u64,
-    _rsdp:          u64,
+    rsdp_paddr:     u64,
     memmap_paddr:   u64,
     memmap_entries: u32,
     _reserved:      u32,
@@ -73,6 +73,18 @@ pub unsafe fn is_hvm_start_info(payload: PhysAddr) -> bool {
     // SAFETY: caller promises 4-byte readability.
     let magic = unsafe { (payload.raw() as *const u32).read_unaligned() };
     magic == MAGIC
+}
+
+/// Read the RSDP physical address advertised in the PVH `hvm_start_info`
+/// struct. Returns `None` if the field is zero.
+///
+/// # Safety
+/// `info_ptr` must point at a valid `hvm_start_info`.
+pub unsafe fn rsdp_phys(info_ptr: usize) -> Option<u64> {
+    // SAFETY: caller-provided pointer to a valid PVH header.
+    let hdr = unsafe { (info_ptr as *const HvmStartInfo).read_unaligned() };
+    if hdr.magic != MAGIC || hdr.rsdp_paddr == 0 { None }
+    else { Some(hdr.rsdp_paddr) }
 }
 
 /// Walk the `hvm_start_info` at `info_ptr`, writing up to `out_cap` parsed

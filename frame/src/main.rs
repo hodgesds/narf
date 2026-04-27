@@ -292,12 +292,55 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // hardware multi-package topology needs ACPI MADT —
                 // grows alongside MADT parsing in a later wave.
                 // SAFETY: CPUID is always legal at CPL=0.
-                let n = unsafe { narf_lib::smp::count_x86_64_cpus_via_cpuid() };
+                // ACPI SRAT → NUMA topology. PVH bootloaders may or
+                // may not populate `rsdp_paddr`; QEMU's `-kernel`
+                // path leaves it zero even when ACPI is present.
+                // Fall back to a 0xE_0000..0x10_0000 BIOS-area scan
+                // for the "RSD PTR " signature.
+                let rsdp = info.acpi_rsdp_phys
+                    // SAFETY: identity-mapped low ROM scan.
+                    .or_else(|| unsafe { narf_acpi::scan_bios_for_rsdp() });
+                match rsdp {
+                    Some(p) => {
+                        // SAFETY: RSDP is in identity-mapped RAM /
+                        // ROM; the XSDT chain it leads to lives in
+                        // ACPI-reclaimable RAM the boot map listed.
+                        match unsafe { narf_acpi::parse_srat(p) } {
+                            Ok(n) => {
+                                let _ = writeln!(console::Writer,
+                                    "  acpi: SRAT parsed, {} entries, {} NUMA node(s)",
+                                    n, narf_acpi::node_count());
+                            }
+                            Err(e) => {
+                                let _ = writeln!(console::Writer,
+                                    "  acpi: SRAT parse skipped: {:?}", e);
+                            }
+                        }
+                    }
+                    None => {
+                        let _ = writeln!(console::Writer,
+                            "  acpi: no RSDP found; running flat");
+                    }
+                }
+
+                // SMP CPU count: prefer SRAT (covers multi-socket
+                // configs where CPUID leaf 0xB sub-1 only sees the
+                // local core). Fall back to CPUID when SRAT didn't
+                // run / was empty.
+                let n_srat = narf_acpi::cpu_count_from_srat();
+                let n = if n_srat > 0 {
+                    n_srat
+                } else {
+                    // SAFETY: CPUID is always legal at CPL=0.
+                    unsafe { narf_lib::smp::count_x86_64_cpus_via_cpuid() }
+                };
                 if n > 0 {
                     narf_lib::smp::set_cpu_count(n);
                 }
                 let _ = writeln!(console::Writer,
-                    "  smp: {} CPU(s) advertised", narf_lib::smp::cpu_count());
+                    "  smp: {} CPU(s) advertised (source: {})",
+                    narf_lib::smp::cpu_count(),
+                    if n_srat > 0 { "SRAT" } else { "CPUID" });
 
                 // Initialise per-CPU scheduler queues *before* AP
                 // bring-up — APs jump straight into the scheduler

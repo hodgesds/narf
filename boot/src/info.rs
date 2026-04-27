@@ -59,6 +59,10 @@ pub struct BootInfo {
     /// x86_64. Subsystems that need DTB-described topology (PCIe host
     /// bridge, etc.) walk this directly.
     pub dtb_phys:   Option<PhysAddr>,
+    /// Physical address of the ACPI RSDP, when the bootloader supplied
+    /// one (PVH `hvm_start_info.rsdp_paddr`, multiboot2 ACPI tag, or a
+    /// legacy EBDA scan). `None` on aarch64 / non-ACPI platforms.
+    pub acpi_rsdp_phys: Option<PhysAddr>,
 }
 
 /// Errors from `validate_boot_info`. Stage 1 raises `BadMagic` and

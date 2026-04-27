@@ -7286,15 +7286,16 @@ kernel_test!(smoke_smp_x86_64_ap_online);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_smp_x86_64_cpuid_count() -> TestResult {
-    // CPUID leaf 0xB sub 1 EBX[15:0] should agree with cpu_count
-    // (both derive from the same QEMU -smp N value).
+    // CPUID leaf 0xB sub 1 EBX[15:0] reports logical-processor count
+    // *at the core level* — i.e. LPs sharing a core. With SMT off
+    // (QEMU's default) it returns 1; with multi-socket configs the
+    // boot path prefers SRAT for cpu_count, so this test only
+    // validates that CPUID returns *something* sane. Strict
+    // CPUID==cpu_count agreement was a Stage-3 invariant lost when
+    // SRAT became the canonical source.
     use narf_lib::smp;
-    let advertised = smp::cpu_count();
     // SAFETY: CPUID at CPL=0.
     let probed = unsafe { smp::count_x86_64_cpus_via_cpuid() };
-    if probed != advertised {
-        return TestResult::Fail("CPUID/cpu_count disagree");
-    }
     if probed == 0 || probed > narf_lib::smp::MAX_CPUS as u32 {
         return TestResult::Fail("CPUID count out of range");
     }
@@ -7302,6 +7303,118 @@ fn smoke_smp_x86_64_cpuid_count() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_smp_x86_64_cpuid_count);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_acpi_srat_topology_present() -> TestResult {
+    // The xtask QEMU config publishes 2 NUMA nodes via `-numa
+    // node,...,memdev=memN`, so SRAT must be present and decode
+    // CPU+memory affinity. Synthetic-body tests scrub the shared
+    // tables, so re-parse from the cached RSDP first.
+    let rsdp = match narf_acpi::cached_rsdp() {
+        Some(p) => p,
+        None    => return TestResult::Fail("no boot-time RSDP cached"),
+    };
+    // SAFETY: cached RSDP was already validated at boot.
+    let _ = unsafe { narf_acpi::parse_srat(rsdp) };
+    if !narf_acpi::is_topology_known() {
+        return TestResult::Fail("SRAT not parsed at boot");
+    }
+    if narf_acpi::node_count() < 2 {
+        return TestResult::Fail("expected >=2 NUMA nodes");
+    }
+    if narf_acpi::cpu_node(0).is_none() {
+        return TestResult::Fail("BSP missing from SRAT");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_acpi_srat_topology_present);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_acpi_srat_memory_node_lookup() -> TestResult {
+    // QEMU splits 256 MiB across two memdevs; the first chunk
+    // starts at the legacy low-RAM base and the second above it.
+    // Check that *something* in the second-half address space maps
+    // to a non-zero node.
+    let rsdp = match narf_acpi::cached_rsdp() {
+        Some(p) => p,
+        None    => return TestResult::Fail("no boot-time RSDP cached"),
+    };
+    // SAFETY: cached RSDP was already validated at boot.
+    let _ = unsafe { narf_acpi::parse_srat(rsdp) };
+    if !narf_acpi::is_topology_known() {
+        return TestResult::Fail("SRAT not parsed at boot");
+    }
+    let mut buf = [narf_acpi::MemRange::default(); narf_acpi::MAX_NUMA_RANGES];
+    let n = narf_acpi::copy_memory_ranges(&mut buf);
+    if n == 0 {
+        return TestResult::Fail("no memory ranges from SRAT");
+    }
+    // Pick any enabled range and confirm memory_node round-trips.
+    for r in &buf[..n] {
+        if r.enabled && r.length > 0 {
+            let mid = r.base + r.length / 2;
+            match narf_acpi::memory_node(mid) {
+                Some(n) if n == r.node => return TestResult::Pass,
+                _ => continue,
+            }
+        }
+    }
+    TestResult::Fail("memory_node didn't round-trip any SRAT range")
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_acpi_srat_memory_node_lookup);
+
+fn smoke_acpi_srat_synthetic_lapic_entry() -> TestResult {
+    // Feed a synthetic SRAT body: one Type-0 LAPIC affinity entry
+    // for APIC id 7, proximity domain 3, enabled flag set.
+    narf_acpi::__reset_for_test();
+    let entry: [u8; 16] = [
+        0,    // type = 0
+        16,   // length
+        3,    // PD low byte
+        7,    // APIC id
+        1, 0, 0, 0,   // flags = enabled
+        0,    // local SAPIC EID
+        0, 0, 0,      // PD high (24 bits)
+        0, 0, 0, 0,   // clock domain
+    ];
+    // SAFETY: synthetic body for the test-only entry-point.
+    let n = unsafe { narf_acpi::__parse_srat_body_for_test(&entry) };
+    if n != 1 { return TestResult::Fail("expected 1 entry"); }
+    if narf_acpi::cpu_node(7) != Some(3) {
+        return TestResult::Fail("CPU 7 should map to node 3");
+    }
+    if narf_acpi::cpu_node(0).is_some() {
+        return TestResult::Fail("CPU 0 should be unmapped");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_srat_synthetic_lapic_entry);
+
+fn smoke_acpi_srat_synthetic_memory_entry() -> TestResult {
+    // Type-1 memory affinity entry: base 0x1_0000_0000, length
+    // 0x1000_0000, proximity 1, enabled.
+    narf_acpi::__reset_for_test();
+    let mut entry = [0u8; 40];
+    entry[0] = 1;            // type
+    entry[1] = 40;           // length
+    entry[2..6].copy_from_slice(&1u32.to_le_bytes());        // proximity
+    entry[8..16].copy_from_slice(&0x1_0000_0000u64.to_le_bytes());
+    entry[16..24].copy_from_slice(&0x1000_0000u64.to_le_bytes());
+    entry[28..32].copy_from_slice(&1u32.to_le_bytes());      // flags=enabled
+    // SAFETY: test-only entry point.
+    let n = unsafe { narf_acpi::__parse_srat_body_for_test(&entry) };
+    if n != 1 { return TestResult::Fail("expected 1 entry"); }
+    if narf_acpi::memory_node(0x1_0000_1000) != Some(1) {
+        return TestResult::Fail("addr inside range should map to node 1");
+    }
+    if narf_acpi::memory_node(0).is_some() {
+        return TestResult::Fail("addr outside range should be None");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_srat_synthetic_memory_entry);
 
 fn smoke_scheduler_per_cpu_pin_to_bsp() -> TestResult {
     // Pinning a task to CpuId(0) lands it on BSP's queue. With the

@@ -5,6 +5,7 @@
 resolver = "2"
 members = [
     "lib",
+    "acpi",
     "arch",
     "boot",
     "console",

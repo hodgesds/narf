@@ -1,0 +1,19 @@
+[package]
+name         = "narf-acpi"
+description  = "Minimal ACPI table walker — RSDP / XSDT discovery + SRAT (NUMA topology) parsing."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_acpi"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib    = { path = "../lib" }
+narf-memory = { path = "../memory" }
+
+[lints]
+workspace = true

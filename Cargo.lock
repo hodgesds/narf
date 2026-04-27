@@ -374,6 +374,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-acpi"
+version = "0.0.0"
+dependencies = [
+ "narf-lib",
+ "narf-memory",
+]
+
+[[package]]
 name = "narf-arch"
 version = "0.0.0"
 dependencies = [
@@ -548,6 +556,7 @@ dependencies = [
 name = "narf-frame"
 version = "0.0.0"
 dependencies = [
+ "narf-acpi",
  "narf-arch",
  "narf-boot",
  "narf-bus",
@@ -701,6 +710,7 @@ name = "narf-verification"
 version = "0.0.0"
 dependencies = [
  "narf-abi",
+ "narf-acpi",
  "narf-arch",
  "narf-block",
  "narf-boot",

@@ -107,8 +107,16 @@ impl Arch {
                     "-cpu".into(),     "max".into(),
                     // 2 logical CPUs so AP bring-up via INIT-SIPI-SIPI
                     // exercises a real second core under QEMU q35.
-                    "-smp".into(),     "2".into(),
+                    "-smp".into(),     "2,sockets=2".into(),
                     "-m".into(),       "256M".into(),
+                    // 2 NUMA nodes so QEMU emits an ACPI SRAT for
+                    // narf_acpi to parse. Each node owns one socket
+                    // (one logical CPU under the smp config above)
+                    // and 128 MiB of the total 256 MiB RAM.
+                    "-numa".into(),    "node,nodeid=0,cpus=0,memdev=mem0".into(),
+                    "-numa".into(),    "node,nodeid=1,cpus=1,memdev=mem1".into(),
+                    "-object".into(),  "memory-backend-ram,id=mem0,size=128M".into(),
+                    "-object".into(),  "memory-backend-ram,id=mem1,size=128M".into(),
                     "-serial".into(),  "stdio".into(),
                     "-display".into(), "none".into(),
                     "-no-reboot".into(),
