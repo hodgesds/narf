@@ -65,6 +65,8 @@ pub const SYS_SETUID:         u64 = 144;
 pub const SYS_SETGID:         u64 = 145;
 pub const SYS_GETPGID:        u64 = 224;
 pub const SYS_SETPGID:        u64 = 225;
+pub const SYS_GETSID:         u64 = 226;
+pub const SYS_SETSID:         u64 = 227;
 pub const SYS_FTRUNCATE:      u64 = 118;
 pub const SYS_TRUNCATE:       u64 = 132;
 pub const SYS_PREAD64:        u64 = 119;
@@ -491,6 +493,21 @@ pub fn setpgid(pid: u64, pgid: u64) -> i32 {
     // SAFETY: SYS_SETPGID signature: (pid, pgid).
     let r = unsafe { syscall2(SYS_SETPGID, pid, pgid) };
     if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `getsid(pid)` — POSIX session id query. `pid = 0` → self.
+#[inline]
+pub fn getsid(pid: u64) -> u64 {
+    // SAFETY: SYS_GETSID signature: (pid).
+    unsafe { syscall1(SYS_GETSID, pid) }
+}
+
+/// `setsid()` — POSIX. Caller becomes a new session leader.
+/// Returns the new sid (= caller's pid).
+#[inline]
+pub fn setsid() -> u64 {
+    // SAFETY: SYS_SETSID takes no args.
+    unsafe { syscall0(SYS_SETSID) }
 }
 
 /// `ftruncate(fd, len)` — resize the file backing `fd` to exactly

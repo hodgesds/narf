@@ -13587,3 +13587,73 @@ fn smoke_userspace_pgid_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_userspace_pgid_round_trip);
+
+fn smoke_userspace_setsid_makes_session_leader() -> TestResult {
+    use narf_userspace::{init_per_task_state, install_core_syscalls,
+                         install_global, kernel_syscall_entry,
+                         syscall::__test_clear_global,
+                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+                         TrapContext};
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+    narf_userspace::handlers::__test_pgid_reset();
+    narf_userspace::handlers::__test_sid_reset();
+    init_per_task_state();
+
+    fn call(s: Syscall, arg0: u64) -> Option<SyscallReturn> {
+        let mut ctx = FakeCtx {
+            args: SyscallArgs { arg0, ..SyscallArgs::default() },
+            ret: None,
+        };
+        kernel_syscall_entry(s.raw(), &mut ctx);
+        ctx.ret
+    }
+
+    let pid = call(Syscall::GetPid, 0).map(|r| r.value).unwrap_or(!0);
+
+    // Default sid == pid.
+    let s0 = call(Syscall::Getsid, 0).map(|r| r.value).unwrap_or(!0);
+    if s0 != pid {
+        return TestResult::Fail("default sid != pid");
+    }
+
+    // Stomp sid (no setter, so use pgid as a witness): setpgid
+    // table is wired to setsid below.
+
+    // Pre-stomp pgid to a distinct value, then setsid resets both.
+    let _ = {
+        let mut ctx = FakeCtx {
+            args: SyscallArgs { arg0: 0, arg1: 12345, ..SyscallArgs::default() },
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::Setpgid.raw(), &mut ctx);
+        ctx.ret
+    };
+
+    let new_sid = call(Syscall::Setsid, 0).map(|r| r.value).unwrap_or(!0);
+    if new_sid != pid {
+        return TestResult::Fail("setsid did not return the caller's pid");
+    }
+
+    // Both sid and pgid are now == pid (setsid resets both).
+    let s1 = call(Syscall::Getsid, 0).map(|r| r.value).unwrap_or(!0);
+    let p1 = call(Syscall::Getpgid, 0).map(|r| r.value).unwrap_or(!0);
+    if s1 != pid || p1 != pid {
+        return TestResult::Fail("setsid did not reset both sid and pgid to pid");
+    }
+
+    narf_userspace::handlers::__test_pgid_reset();
+    narf_userspace::handlers::__test_sid_reset();
+    __test_clear_global();
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_setsid_makes_session_leader);

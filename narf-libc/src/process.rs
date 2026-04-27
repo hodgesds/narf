@@ -303,19 +303,17 @@ pub unsafe extern "C" fn getpgid(pid: i32) -> i32 {
     narf_user_runtime::getpgid(pid as u64) as i32
 }
 
-/// `getsid(pid)` — session id of `pid`. Reports the calling task's pid.
+/// `getsid(pid)` — POSIX. `pid = 0` → self.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn getsid(_pid: i32) -> i32 {
-    // SAFETY: forwarded.
-    unsafe { getpid() }
+pub unsafe extern "C" fn getsid(pid: i32) -> i32 {
+    narf_user_runtime::getsid(pid as u64) as i32
 }
 
-/// `setsid()` — create a new session. We don't track sessions; just
-/// report the calling task's pid as the session id.
+/// `setsid()` — POSIX. Caller becomes a new session leader.
+/// Returns the new sid (= caller's pid).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn setsid() -> i32 {
-    // SAFETY: forwarded.
-    unsafe { getpid() }
+    narf_user_runtime::setsid() as i32
 }
 
 /// `setpgid(pid, pgid)` — POSIX. `pid = 0` → self;

@@ -291,6 +291,7 @@ pub fn init_per_task_state() {
     prctl_init();
     sched_param_init();
     pgid_init();
+    sid_init();
 }
 
 /// Reset the registry — test hook; drops every per-task ring set.
@@ -2001,6 +2002,56 @@ fn sys_setpgid(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(0));
 }
 
+// ── Per-task session-id table ──────────────────────────────────────
+//
+// POSIX setsid creates a new session with the caller as the
+// leader. NARF doesn't model sessions for scheduling but the
+// state round-trips so init/job-control consumers see the
+// expected behaviour.
+
+static SID_TABLE:
+    narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>>
+    = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+pub fn sid_init() {
+    *SID_TABLE.lock() = Some(BTreeMap::new());
+}
+
+#[doc(hidden)]
+pub fn __test_sid_reset() { *SID_TABLE.lock() = None; }
+
+fn read_sid(target: u64) -> u64 {
+    let g = SID_TABLE.lock();
+    g.as_ref()
+        .and_then(|m| m.get(&target).copied())
+        .unwrap_or(target) // default: sid == pid
+}
+
+fn sys_getsid(ctx: &mut dyn TrapContext) {
+    let pid = ctx.args().arg0;
+    let target = if pid == 0 { current_task_id() } else { pid };
+    ctx.set_return(SyscallReturn::ok(read_sid(target)));
+}
+
+fn sys_setsid(ctx: &mut dyn TrapContext) {
+    let task = current_task_id();
+    // POSIX: setsid(2) makes the caller a new session leader,
+    // pgid = sid = pid. Record both tables together.
+    {
+        let mut g = SID_TABLE.lock();
+        if let Some(m) = g.as_mut() {
+            m.insert(task, task);
+        }
+    }
+    {
+        let mut g = PGID_TABLE.lock();
+        if let Some(m) = g.as_mut() {
+            m.insert(task, task);
+        }
+    }
+    ctx.set_return(SyscallReturn::ok(task));
+}
+
 // ── Per-task uid/gid table ─────────────────────────────────────────
 //
 // NARF's authority model is capabilities, not POSIX uids — but
@@ -3694,6 +3745,8 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::SetGid,   "setgid",   RawFnHandler(sys_setgid));
     table.install_raw(Syscall::Getpgid,  "getpgid",  RawFnHandler(sys_getpgid));
     table.install_raw(Syscall::Setpgid,  "setpgid",  RawFnHandler(sys_setpgid));
+    table.install_raw(Syscall::Getsid,   "getsid",   RawFnHandler(sys_getsid));
+    table.install_raw(Syscall::Setsid,   "setsid",   RawFnHandler(sys_setsid));
     table.install_raw(Syscall::GetHostname, "gethostname", RawFnHandler(sys_gethostname));
     table.install_raw(Syscall::SetHostname, "sethostname", RawFnHandler(sys_sethostname));
     table.install_raw(Syscall::Getrlimit,   "getrlimit",   RawFnHandler(sys_getrlimit));

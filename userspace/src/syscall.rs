@@ -288,6 +288,16 @@ pub enum Syscall {
     /// task. Always succeeds.
     Setpgid      = 225,
 
+    /// `arg0 = pid` (0 = self). POSIX getsid(2): return the
+    /// session id of `pid`. NARF tracks sids per-task in a
+    /// structural BTreeMap; default sid = pid.
+    Getsid       = 226,
+
+    /// No args. POSIX setsid(2): the calling task creates a new
+    /// session with itself as the leader. Records sid = pid +
+    /// pgid = pid in their respective tables; returns pid.
+    Setsid       = 227,
+
     /// `arg0 = buf_ptr`, `arg1 = buf_len`. Copy the kernel-wide
     /// hostname (NUL-terminated UTF-8) into the user buffer.
     /// Returns the byte length excluding the NUL on success, -1 on
@@ -669,6 +679,8 @@ impl Syscall {
             145 => Syscall::SetGid,
             224 => Syscall::Getpgid,
             225 => Syscall::Setpgid,
+            226 => Syscall::Getsid,
+            227 => Syscall::Setsid,
             146 => Syscall::GetHostname,
             147 => Syscall::SetHostname,
             148 => Syscall::Getrlimit,

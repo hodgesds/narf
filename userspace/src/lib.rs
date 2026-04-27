@@ -66,8 +66,8 @@ pub use handlers::{
     signal_delivery_hook, signal_init, signal_mask_of, signal_pending_of,
     spawn_dispatcher_for, sync_signal_hook, take_kernel_ends,
     hostname_init, init_per_task_state, nice_init, pgid_init, prctl_init,
-    rlimit_init, sched_param_init, take_user_ends, uidgid_init, umask_init,
-    vector_to_signum, SharedRingPair, TaskRings, UserRingEnds,
+    rlimit_init, sched_param_init, sid_init, take_user_ends, uidgid_init,
+    umask_init, vector_to_signum, SharedRingPair, TaskRings, UserRingEnds,
     BOOTSTRAP_SHARED_RING_DEPTH,
 };
 pub use user_task::{
