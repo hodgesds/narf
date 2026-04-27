@@ -78,6 +78,7 @@ pub const SYS_SCHED_GETAFFINITY: u64 = 166;
 pub const SYS_SCHED_SETAFFINITY: u64 = 167;
 pub const SYS_GETTID:         u64 = 168;
 pub const SYS_PRCTL:          u64 = 169;
+pub const SYS_TGKILL:         u64 = 175;
 pub const SYS_SETPRIORITY:    u64 = 157;
 pub const SYS_TIMES:          u64 = 158;
 pub const SYS_GETRUSAGE:      u64 = 159;
@@ -507,6 +508,18 @@ pub fn getrusage(who: i32, buf: &mut [i64; 18]) -> i32 {
 pub fn umask(new_mask: u32) -> u32 {
     // SAFETY: SYS_UMASK signature: (new_mask).
     unsafe { syscall1(SYS_UMASK, new_mask as u64) as u32 }
+}
+
+/// `tgkill(tgid, tid, sig)` — Linux thread-group kill. Falls back
+/// to single-target kill on NARF (single-threaded per process).
+/// Returns 0 on success, -1 on bad signum / unknown tid.
+#[inline]
+pub fn tgkill(tgid: i64, tid: u64, signum: u32) -> i32 {
+    // SAFETY: SYS_TGKILL signature: (tgid, tid, signum).
+    let r = unsafe {
+        syscall3(SYS_TGKILL, tgid as u64, tid, signum as u64)
+    };
+    if r as i64 == -1 { -1 } else { 0 }
 }
 
 /// `prctl(op, arg_a, arg_b)` — Linux per-task settings switchboard.

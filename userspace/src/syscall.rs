@@ -318,6 +318,12 @@ pub enum Syscall {
     /// libc shim's ABI is right for when threading arrives.
     Gettid       = 168,
 
+    /// Linux tkill(2) / tgkill(2): like kill but targets a specific
+    /// thread within a process group. NARF is single-threaded per
+    /// process — tgkill aliases sys_kill. `arg0 = tgid` (-1 = any),
+    /// `arg1 = tid`, `arg2 = signum`. Returns 0 on success.
+    Tgkill       = 175,
+
     /// Linux prctl(2): per-task settings switchboard. `arg0 = op`,
     /// `arg1 = argA`, `arg2 = argB`. Honoured ops:
     ///   - PR_SET_NAME  (15): argA = pointer to up-to-15-byte
@@ -543,6 +549,7 @@ impl Syscall {
             167 => Syscall::SchedSetaffinity,
             168 => Syscall::Gettid,
             169 => Syscall::Prctl,
+            175 => Syscall::Tgkill,
             156 => Syscall::Getpriority,
             157 => Syscall::Setpriority,
             158 => Syscall::Times,

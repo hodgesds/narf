@@ -2708,6 +2708,29 @@ fn sys_kill(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(0));
 }
 
+/// Linux tgkill(2): like kill but with an explicit (tgid, tid)
+/// pair. NARF is single-threaded per process — we forward tid as
+/// the kill target and ignore tgid (the disambiguation it provides
+/// will matter once threading lands).
+fn sys_tgkill(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let _tgid = args.arg0;
+    let tid   = args.arg1;
+    let signum = args.arg2 as u32;
+    if signum >= 32 {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    let mut g = SIGNAL_PENDING.lock();
+    let map = match g.as_mut() {
+        Some(m) => m,
+        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+    };
+    let slot = map.entry(tid).or_insert(0);
+    *slot |= 1u32 << signum;
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
 const SIG_BLOCK:   u32 = 0;
 const SIG_UNBLOCK: u32 = 1;
 const SIG_SETMASK: u32 = 2;
@@ -3069,6 +3092,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::ClockGetTime, "clock_gettime", RawFnHandler(sys_clock_gettime));
     table.install_raw(Syscall::Sigaction,    "sigaction",     RawFnHandler(sys_sigaction));
     table.install_raw(Syscall::Kill,         "kill",          RawFnHandler(sys_kill));
+    table.install_raw(Syscall::Tgkill,       "tgkill",        RawFnHandler(sys_tgkill));
     table.install_raw(Syscall::Sigprocmask,  "sigprocmask",   RawFnHandler(sys_sigprocmask));
 
     // Tier-2 fd-table breadth + path-resolution + pipe(2).
