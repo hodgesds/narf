@@ -49,6 +49,10 @@ pub extern "C" fn rust_aarch64_irq(_frame: &TrapFrame) {
     let intid = (iar & 0x00FF_FFFF) as u32;
 
     match intid {
+        n if n < 16 => {
+            // Software-Generated Interrupt (cross-CPU IPI).
+            narf_interrupts::aarch64::sgi::on_sgi(n as u8);
+        }
         n if n == narf_interrupts::aarch64::TIMER_PPI => {
             narf_interrupts::aarch64::timer::on_timer_tick();
             // Re-arm the timer for another round. Same value as the

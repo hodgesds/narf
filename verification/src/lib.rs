@@ -7153,6 +7153,29 @@ fn smoke_smp_aarch64_ap_timer_ticks() -> TestResult {
 kernel_test!(smoke_smp_aarch64_ap_timer_ticks);
 
 #[cfg(target_arch = "aarch64")]
+fn smoke_smp_aarch64_sgi_to_ap() -> TestResult {
+    // Send an SGI to the AP + verify its receive counter advances.
+    use narf_interrupts::aarch64::sgi;
+    use narf_lib::smp;
+    if !smp::is_online(1) { return TestResult::Skip("AP CPU 1 offline"); }
+
+    let intid: u8 = 7;  // an unused vector slot
+    let before = sgi::rx_count(1, intid);
+    // SAFETY: GICv3 sysreg interface up post-init_bsp; target
+    // affinity 1 = AP 1 on QEMU virt's flat affinity layout.
+    unsafe { sgi::send_to_cpu_aff(intid, 1); }
+    // Poll briefly for the AP to receive + handle.
+    let start = narf_time::Instant::now();
+    while narf_time::Instant::now().cycles_since(start) < 5_000_000 {
+        if sgi::rx_count(1, intid) > before { return TestResult::Pass; }
+        core::hint::spin_loop();
+    }
+    TestResult::Fail("AP didn't receive SGI within window")
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test!(smoke_smp_aarch64_sgi_to_ap);
+
+#[cfg(target_arch = "aarch64")]
 fn smoke_smp_aarch64_dtb_count() -> TestResult {
     // QEMU virt -smp 1 (default) reports 1 CPU. The number bumps
     // when xtask switches to `-smp N`.

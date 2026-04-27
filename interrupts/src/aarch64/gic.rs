@@ -113,10 +113,20 @@ unsafe fn init_per_cpu(cpu_index: u32) {
         core::ptr::write_volatile(prio, 0xA0);
     }
 
-    // Enable the timer PPI.
-    // SAFETY: bit 30 of GICR_ISENABLER0.
+    // Enable the timer PPI + every SGI (INTID 0..15). SGIs are
+    // already in Group 1 via IGROUPR0 above; ISENABLER0 must be
+    // set per bit to actually deliver. Each SGI also needs a
+    // priority below the PMR mask (0xFF) — we set 0xA0 like the
+    // timer.
+    // SAFETY: identity-mapped MMIO.
     unsafe {
-        write_u32((gicr + GICR_ISENABLER0_OFF) as *mut u32,
-                  1 << super::TIMER_PPI);
+        // Priority for SGIs 0..15.
+        for sgi in 0..16u64 {
+            let prio = (gicr + GICR_IPRIORITYR0_OFF + sgi as usize) as *mut u8;
+            core::ptr::write_volatile(prio, 0xA0);
+        }
+        // Enable timer PPI + all SGIs.
+        let mask = (1u32 << super::TIMER_PPI) | 0x0000_FFFF;
+        write_u32((gicr + GICR_ISENABLER0_OFF) as *mut u32, mask);
     }
 }

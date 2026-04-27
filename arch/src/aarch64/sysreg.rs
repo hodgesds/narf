@@ -105,6 +105,29 @@ pub unsafe fn write_icc_eoir1_el1(iar: u64) {
     compiler_fence(Ordering::SeqCst);
 }
 
+/// Write `ICC_SGI1R_EL1` — generate a Group 1 software-generated
+/// interrupt to one or more CPUs. The encoding (Arm IHI 0069H §11.7):
+/// bits[3:0]   = INTID (0..15)
+/// bits[15:8]  = target list (which CPUs in the cluster)
+/// bits[23:16] = Aff1
+/// bits[33:32] = Aff2
+/// bits[55:48] = Aff3
+/// bit  40     = Range Selector (0 here = use the encoded affinity)
+/// bit  31     = IRM  (1 = broadcast all-but-self)
+///
+/// # Safety
+/// GICv3 system-register interface must be enabled (`ICC_SRE_EL1`).
+#[inline]
+pub unsafe fn write_icc_sgi1r_el1(value: u64) {
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: caller-asserted SGI dispatch.
+    unsafe {
+        asm!("msr icc_sgi1r_el1, {v}", v = in(reg) value,
+             options(nostack, preserves_flags));
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
 /// Write `CNTP_TVAL_EL0` — sets the physical timer's next-fire count
 /// as a delta from now. When written, the timer re-arms.
 ///

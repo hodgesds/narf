@@ -2,6 +2,7 @@
 
 pub mod gic;
 pub mod its;
+pub mod sgi;
 pub mod timer;
 
 pub use gic::init_bsp;
