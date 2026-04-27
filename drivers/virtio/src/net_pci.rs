@@ -287,6 +287,55 @@ impl VirtioNetPci {
 
     pub fn rx_queue_size(&self) -> u16 { self.rx_qsize }
     pub fn tx_queue_size(&self) -> u16 { self.tx_qsize }
+
+    /// Drain one frame from the RX queue. Returns the number of
+    /// bytes copied into `out` (excluding the 12-byte virtio-net
+    /// header), or 0 if no frame is ready.
+    ///
+    /// Refills the RX descriptor by adding the same buffer back to
+    /// the avail ring + notifying the queue.
+    pub fn rx(&self, out: &mut [u8]) -> usize {
+        let elem = {
+            let mut g = self.rx_queue.lock();
+            let q = match g.as_mut() { Some(q) => q, None => return 0 };
+            q.poll_used()
+        };
+        let (id, len) = match elem {
+            Some(t) => t,
+            None    => return 0,
+        };
+        // Find the buffer this descriptor pointed at. With one desc
+        // per frame the head id maps to rx_pool[id % RX_POOL_LEN].
+        let pool_idx = (id as usize) % self.rx_pool.len();
+        let buf = &self.rx_pool[pool_idx];
+        let phys = buf.phys_addr().raw();
+        // Skip the 12-byte virtio-net header.
+        let frame_len = (len as usize).saturating_sub(12).min(out.len());
+        // SAFETY: identity-mapped DMA buffer.
+        for i in 0..frame_len {
+            out[i] = unsafe {
+                core::ptr::read_volatile(
+                    (phys + 12 + i as u64) as *const u8)
+            };
+        }
+        // Refill: free the chain + post the buffer back.
+        {
+            let mut g = self.rx_queue.lock();
+            let q = match g.as_mut() { Some(q) => q, None => return frame_len };
+            q.free_chain(id as u16);
+            let descs = [
+                VirtqDesc { addr: phys, len: MAX_FRAME as u32, flags: VIRTQ_DESC_F_WRITE, next: 0 },
+            ];
+            let _ = q.add_buffer(&descs);
+        }
+        // Re-notify the device about the refill.
+        let off = (self.rx_notify_off as u64)
+            * (self.notify_off_multiplier as u64);
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: identity-mapped notify region.
+        unsafe { self.notify.write16(off, RX_QUEUE); }
+        frame_len
+    }
 }
 
 // ── Driver-match registration ────────────────────────────────────────

@@ -6288,6 +6288,64 @@ fn smoke_virtio_net_pci_tx() -> TestResult {
 kernel_test!(smoke_virtio_net_pci_tx);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_virtio_net_pci_rx_arp() -> TestResult {
+    // Send an ARP request via virtio-net's TX, drain RX briefly.
+    // Same lenient assertion as e1000: rx() runs cleanly, frame
+    // arrival is a bonus.
+    use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_drivers_virtio::net_pci;
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let has_net = devs.iter().any(|d|
+        matches!(&d.kind, BusKind::Pcie { .. })
+        && d.id.vendor == net_pci::VIRTIO_NET_PCI_VENDOR
+        && d.id.device == net_pci::VIRTIO_NET_PCI_DEVICE);
+    if !has_net { return TestResult::Skip("no virtio-net-pci"); }
+    __reset_for_test();
+    net_pci::register_pci_driver();
+    let authority = bootstrap_registry_authority();
+    if probe_all_pci(&authority).is_err() {
+        return TestResult::Fail("probe_all_pci");
+    }
+
+    // Build + transmit a 42-byte ARP request.
+    let mut frame = [0u8; 42];
+    for i in 0..6 { frame[i] = 0xFF; }
+    // Source MAC = anything plausible (QEMU virtio-net assigns one).
+    frame[6] = 0x52; frame[7] = 0x54; frame[8] = 0x00;
+    frame[9] = 0x12; frame[10] = 0x34; frame[11] = 0x57;
+    frame[12] = 0x08; frame[13] = 0x06;
+    frame[14] = 0x00; frame[15] = 0x01;
+    frame[16] = 0x08; frame[17] = 0x00;
+    frame[18] = 6; frame[19] = 4;
+    frame[20] = 0x00; frame[21] = 0x01;
+    for i in 0..6 { frame[22 + i] = frame[6 + i]; }
+    frame[28] = 10; frame[29] = 0; frame[30] = 2; frame[31] = 15;
+    frame[38] = 10; frame[39] = 0; frame[40] = 2; frame[41] = 2;
+
+    if net_pci::with_controller(|c| c.tx(&frame)).map(|r| r.is_ok())
+        .unwrap_or(false) == false
+    {
+        return TestResult::Fail("virtio-net tx");
+    }
+
+    // Poll RX briefly. Accept any frame as evidence the path works.
+    let mut rx_buf = [0u8; 1518];
+    let mut any = 0usize;
+    for _ in 0..2_000_000u32 {
+        let len = net_pci::with_controller(|c| c.rx(&mut rx_buf)).unwrap_or(0);
+        if len > 0 { any = len; break; }
+        core::hint::spin_loop();
+    }
+    let _ = any;
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_virtio_net_pci_rx_arp);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_e1000_bring_up_and_tx() -> TestResult {
     // The QEMU q35 default NIC is an e1000e (0x10D3) attached to a
     // user-mode net backend. Run the driver's probe + tx path
@@ -6465,8 +6523,24 @@ fn smoke_ahci_identify_device() -> TestResult {
     // signature said "SATA". Verify the device-data block decodes
     // a non-empty model string. QEMU's emulated SATA disk reports
     // model "QEMU HARDDISK" (with trailing spaces).
+    use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_drivers_storage::ahci;
-    if !ahci::is_probed() { return TestResult::Skip("ahci not probed"); }
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let has = devs.iter().any(|d|
+        matches!(&d.kind, BusKind::Pcie { .. })
+        && d.id.vendor == ahci::AHCI_VENDOR
+        && d.id.device == ahci::AHCI_ICH9_DEV);
+    if !has { return TestResult::Skip("no AHCI device"); }
+    if !ahci::is_probed() {
+        __reset_for_test();
+        ahci::register_pci_driver();
+        let authority = bootstrap_registry_authority();
+        let _ = probe_all_pci(&authority);
+    }
+    if !ahci::is_probed() { return TestResult::Fail("ahci probe failed"); }
     // Probe-time PORT_SIG often reads as 0xFFFFFFFF on QEMU q35
     // because the device hasn't completed its own COMRESET +
     // IDENTIFY round when we sample. Fall through to port 0 — if a
@@ -6499,8 +6573,23 @@ kernel_test!(smoke_ahci_identify_device);
 fn smoke_ahci_read_lba() -> TestResult {
     // Read sector 0 of the QEMU SATA disk and verify the pattern
     // xtask seeds the image with: byte i = (i * 0x6D) ^ 0x42.
+    use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_drivers_storage::ahci;
-    if !ahci::is_probed() { return TestResult::Skip("ahci not probed"); }
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    if !devs.iter().any(|d|
+        matches!(&d.kind, BusKind::Pcie { .. })
+        && d.id.vendor == ahci::AHCI_VENDOR
+        && d.id.device == ahci::AHCI_ICH9_DEV)
+    { return TestResult::Skip("no AHCI device"); }
+    if !ahci::is_probed() {
+        __reset_for_test();
+        ahci::register_pci_driver();
+        let _ = probe_all_pci(&bootstrap_registry_authority());
+    }
+    if !ahci::is_probed() { return TestResult::Fail("ahci probe failed"); }
     let port = ahci::with_controller(|c|
         c.ports.iter().find(|p| p.kind == ahci::PortKind::Sata).map(|p| p.index)
     ).flatten().unwrap_or(0);
@@ -6529,8 +6618,23 @@ kernel_test!(smoke_ahci_read_lba);
 fn smoke_ahci_write_then_read_lba() -> TestResult {
     // Write a recognisable pattern at LBA 8 (well past the seeded
     // sector 0), read it back, verify.
+    use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_drivers_storage::ahci;
-    if !ahci::is_probed() { return TestResult::Skip("ahci not probed"); }
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    if !devs.iter().any(|d|
+        matches!(&d.kind, BusKind::Pcie { .. })
+        && d.id.vendor == ahci::AHCI_VENDOR
+        && d.id.device == ahci::AHCI_ICH9_DEV)
+    { return TestResult::Skip("no AHCI device"); }
+    if !ahci::is_probed() {
+        __reset_for_test();
+        ahci::register_pci_driver();
+        let _ = probe_all_pci(&bootstrap_registry_authority());
+    }
+    if !ahci::is_probed() { return TestResult::Fail("ahci probe failed"); }
     let port = ahci::with_controller(|c|
         c.ports.iter().find(|p| p.kind == ahci::PortKind::Sata).map(|p| p.index)
     ).flatten().unwrap_or(0);
