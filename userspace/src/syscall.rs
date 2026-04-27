@@ -294,6 +294,26 @@ pub enum Syscall {
     /// SYS_READLINK body.
     Readlinkat   = 231,
 
+    /// `arg0 = path_ptr`, `arg1 = path_len`, `arg2 = mode`. Linux
+    /// access(2): legacy entry point that forwards to the
+    /// faccessat body with `dirfd = AT_FDCWD`. Path must be
+    /// absolute (NARF has no per-task cwd-relative resolution at
+    /// the syscall layer). Returns 0 if the path resolves, -1
+    /// otherwise.
+    Access       = 232,
+
+    /// `arg0 = path_ptr`, `arg1 = path_len`, `arg2 = mode`. Linux
+    /// chmod(2): legacy entry point that forwards to the
+    /// fchmodat body. Mode bits aren't enforced; we only verify
+    /// the path resolves.
+    Chmod        = 233,
+
+    /// `arg0 = path_ptr`, `arg1 = path_len`, `arg2 = uid`,
+    /// `arg3 = gid`. Linux chown(2): legacy entry point that
+    /// forwards to the fchownat body. uid/gid aren't enforced;
+    /// we only verify the path resolves.
+    Chown        = 234,
+
     /// `arg0 = pipefd_out_ptr`, `arg1 = flags`. Linux pipe2(2):
     /// pipe + atomic flag set. Honoured flag: O_CLOEXEC (bit
     /// 0x80000) — both ends get FD_CLOEXEC stamped at install
@@ -743,6 +763,9 @@ impl Syscall {
             229 => Syscall::Renameat,
             230 => Syscall::Symlinkat,
             231 => Syscall::Readlinkat,
+            232 => Syscall::Access,
+            233 => Syscall::Chmod,
+            234 => Syscall::Chown,
             120 => Syscall::Mmap,
             121 => Syscall::Munmap,
             130 => Syscall::RingKick,

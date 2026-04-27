@@ -89,6 +89,9 @@ pub const SYS_MKDIRAT:        u64 = 228;
 pub const SYS_RENAMEAT:       u64 = 229;
 pub const SYS_SYMLINKAT:      u64 = 230;
 pub const SYS_READLINKAT:     u64 = 231;
+pub const SYS_ACCESS:         u64 = 232;
+pub const SYS_CHMOD:          u64 = 233;
+pub const SYS_CHOWN:          u64 = 234;
 pub const SYS_GETHOSTNAME:    u64 = 146;
 pub const SYS_SETHOSTNAME:    u64 = 147;
 pub const SYS_GETRLIMIT:      u64 = 148;
@@ -1380,6 +1383,59 @@ pub fn renameat(old_dirfd: i32, old: &str, new_dirfd: i32, new: &str) -> i32 {
             old.as_ptr() as u64, old.len() as u64,
             new_dirfd as u64,
             new.as_ptr() as u64, new.len() as u64,
+        )
+    };
+    if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `access(path, mode)` — legacy POSIX accessibility check.
+/// Forwards to the SYS_ACCESS body (which reshapes onto the
+/// faccessat handler). Returns 0 if the path resolves, -1
+/// otherwise.
+#[inline]
+pub fn access(path: &str, mode: i32) -> i32 {
+    if path.is_empty() { return -1; }
+    // SAFETY: SYS_ACCESS signature: (path_ptr, path_len, mode).
+    let r = unsafe {
+        syscall3(
+            SYS_ACCESS,
+            path.as_ptr() as u64, path.len() as u64,
+            mode as u64,
+        )
+    };
+    if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `chmod(path, mode)` — legacy POSIX mode set. Forwards to the
+/// SYS_CHMOD body (which reshapes onto the fchmodat handler).
+/// Mode bits aren't enforced; we only verify the path resolves.
+#[inline]
+pub fn chmod(path: &str, mode: u32) -> i32 {
+    if path.is_empty() { return -1; }
+    // SAFETY: SYS_CHMOD signature: (path_ptr, path_len, mode).
+    let r = unsafe {
+        syscall3(
+            SYS_CHMOD,
+            path.as_ptr() as u64, path.len() as u64,
+            mode as u64,
+        )
+    };
+    if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `chown(path, uid, gid)` — legacy POSIX owner set. Forwards
+/// to the SYS_CHOWN body (which reshapes onto the fchownat
+/// handler). uid/gid aren't enforced; we only verify the path
+/// resolves.
+#[inline]
+pub fn chown(path: &str, uid: u32, gid: u32) -> i32 {
+    if path.is_empty() { return -1; }
+    // SAFETY: SYS_CHOWN signature: (path_ptr, path_len, uid, gid).
+    let r = unsafe {
+        syscall4(
+            SYS_CHOWN,
+            path.as_ptr() as u64, path.len() as u64,
+            uid as u64, gid as u64,
         )
     };
     if r as i64 == -1 { -1 } else { 0 }

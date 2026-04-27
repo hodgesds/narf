@@ -129,16 +129,19 @@ pub unsafe extern "C" fn S_ISLNK(mode: u32) -> i32 {
 // kernel state so the round-trip is consistent across syscall
 // boundaries.
 
-/// `chmod(path, mode)` — accepted and ignored. Returns 0 if the path
-/// is reachable (so a consumer that error-checks chmod still sees
-/// a failure for a missing file), -1 otherwise.
+/// `chmod(path, mode)` — legacy POSIX mode set. Forwards to the
+/// SYS_CHMOD body in the kernel, which reshapes onto the fchmodat
+/// handler. Mode bits aren't enforced; the call returns 0 if the
+/// path resolves, -1 otherwise.
 ///
 /// # Safety
 /// `path` must be a valid NUL-terminated C string.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn chmod(path: *const i8, _mode: u32) -> i32 {
-    // SAFETY: forwarded; `access` walks the C string.
-    unsafe { crate::posix::access(path, 0) }
+pub unsafe extern "C" fn chmod(path: *const i8, mode: u32) -> i32 {
+    if path.is_null() { return -1; }
+    // SAFETY: caller-asserted NUL-terminator.
+    let s = unsafe { crate::posix::cstr_to_str(path as *const _) };
+    narf_user_runtime::chmod(s, mode)
 }
 
 /// `umask(mask)` — set the file-creation mask, returning the

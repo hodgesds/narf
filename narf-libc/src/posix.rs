@@ -63,7 +63,7 @@ unsafe fn cstr_len(p: *const c_char) -> usize {
 /// `p` must be a valid NUL-terminated C string for the duration of
 /// the returned borrow.
 #[inline]
-unsafe fn cstr_to_str<'a>(p: *const c_char) -> &'a str {
+pub(crate) unsafe fn cstr_to_str<'a>(p: *const c_char) -> &'a str {
     if p.is_null() {
         return "";
     }
@@ -189,12 +189,11 @@ pub unsafe extern "C" fn rmdir(path: *const c_char) -> c_int {
 /// # Safety
 /// `path` must be a valid NUL-terminated C string.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn access(path: *const c_char, _mode: c_int) -> c_int {
+pub unsafe extern "C" fn access(path: *const c_char, mode: c_int) -> c_int {
     if path.is_null() { return -1; }
     // SAFETY: caller-asserted NUL-terminated string.
     let s = unsafe { cstr_to_str(path) };
-    let mut sb = crate::fd::StatBuf::default();
-    if narf_user_runtime::stat(s, &mut sb) == 0 { 0 } else { -1 }
+    narf_user_runtime::access(s, mode)
 }
 
 /// `getpagesize()` — POSIX-deprecated but still common. NARF uses
@@ -320,13 +319,7 @@ pub unsafe extern "C" fn chown(path: *const c_char, uid: u32, gid: u32) -> c_int
     if path.is_null() { return -1; }
     // SAFETY: caller-asserted NUL-terminator.
     let s = unsafe { cstr_to_str(path) };
-    let fd = match narf_user_runtime::open_abs(s) {
-        Some(f) => f,
-        None    => return -1,
-    };
-    let r = narf_user_runtime::fchown(fd, uid, gid);
-    let _ = narf_user_runtime::close(fd);
-    r
+    narf_user_runtime::chown(s, uid, gid)
 }
 
 /// `lchown(path, uid, gid)` — like chown but doesn't follow

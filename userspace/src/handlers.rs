@@ -1321,6 +1321,40 @@ fn sys_readlinkat(ctx: &mut dyn TrapContext) {
     sys_readlink(&mut proxy);
 }
 
+// ── access / chmod / chown — legacy entry points ───────────────────
+//
+// Linux access(path, mode), chmod(path, mode), chown(path, uid, gid)
+// — pre-*at calls that take a relative-or-absolute path with no
+// directory fd. NARF treats them as faccessat / fchmodat / fchownat
+// with `dirfd = AT_FDCWD` and forwards into the shared
+// `sys_fchmodat_or_fchownat` body, which already enforces the
+// "path must be absolute, mode/uid/gid bits ignored" contract.
+
+fn sys_access_chmod_chown(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let path_ptr = args.arg0;
+    let path_len = args.arg1;
+    struct Reshape<'a> {
+        inner: &'a mut dyn TrapContext,
+        args:  SyscallArgs,
+    }
+    impl<'a> TrapContext for Reshape<'a> {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.inner.set_return(r); }
+        fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
+            self.inner.redirect_to_kernel(rip, rsp)
+        }
+    }
+    let proxy_args = SyscallArgs {
+        arg0: 0,           // dirfd = AT_FDCWD (ignored anyway).
+        arg1: path_ptr,
+        arg2: path_len,
+        arg3: 0, arg4: 0, arg5: 0,
+    };
+    let mut proxy = Reshape { inner: ctx, args: proxy_args };
+    sys_fchmodat_or_fchownat(&mut proxy);
+}
+
 // ── newfstatat — *at-keyed stat ────────────────────────────────────
 //
 // Linux newfstatat(dirfd, path, statbuf, flags). Same dirfd-
@@ -4168,6 +4202,9 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Renameat,  "renameat",  RawFnHandler(sys_renameat));
     table.install_raw(Syscall::Symlinkat, "symlinkat", RawFnHandler(sys_symlinkat));
     table.install_raw(Syscall::Readlinkat,"readlinkat",RawFnHandler(sys_readlinkat));
+    table.install_raw(Syscall::Access, "access", RawFnHandler(sys_access_chmod_chown));
+    table.install_raw(Syscall::Chmod,  "chmod",  RawFnHandler(sys_access_chmod_chown));
+    table.install_raw(Syscall::Chown,  "chown",  RawFnHandler(sys_access_chmod_chown));
 
     // Tier-2 cwd state + nanosleep wired into the table. Sleep
     // already replaced the noop_ok stub above.
