@@ -299,6 +299,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 let _ = writeln!(console::Writer,
                     "  smp: {} CPU(s) advertised", narf_lib::smp::cpu_count());
 
+                // Initialise per-CPU scheduler queues *before* AP
+                // bring-up — APs jump straight into the scheduler
+                // run loop and need their own queue ready.
+                narf_scheduler::init();
+
                 // AP bring-up via INIT-SIPI-SIPI. Trampoline lands at
                 // phys 0x8000; APs enter `_ap_start_rust` after the
                 // 16→32→64 mode walk.
@@ -377,6 +382,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     let _ = writeln!(console::Writer,
                         "  smp: {} CPU(s) advertised", narf_lib::smp::cpu_count());
                 }
+
+                // Initialise per-CPU scheduler queues *before* AP
+                // bring-up — APs jump straight into the scheduler
+                // run loop and need their own queue ready.
+                narf_scheduler::init();
 
                 // AP bring-up via PSCI CPU_ON. Each AP runs through
                 // smp_entry.S → _ap_start_rust which marks itself

@@ -158,14 +158,10 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
     // SAFETY: per-CPU bookkeeping.
     unsafe { narf_lib::smp::mark_online(id); }
 
-    // 5. Park in HLT. Each external IRQ wakes the AP for ack-and-
-    //    return-to-HLT. Real per-CPU scheduler run-loop lands when
-    //    the run queues become per-CPU.
-    loop {
-        // SAFETY: HLT at CPL=0 with IRQs masked is a safe park; with
-        // IRQs unmasked it sleeps until the next external interrupt.
-        unsafe { asm!("hlt", options(nostack, preserves_flags)); }
-    }
+    // 5. Enter the per-CPU scheduler run loop. `run_forever` drains
+    //    this CPU's ready queue, attempts to steal from siblings,
+    //    and halts on IRQ when nothing is runnable. Returns never.
+    narf_scheduler::run_forever();
 }
 
 /// Bring up every AP advertised by `narf_lib::smp::cpu_count()`.

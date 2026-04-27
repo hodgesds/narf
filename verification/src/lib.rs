@@ -7303,6 +7303,44 @@ fn smoke_smp_x86_64_cpuid_count() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_smp_x86_64_cpuid_count);
 
+fn smoke_scheduler_per_cpu_pin_to_bsp() -> TestResult {
+    // Pinning a task to CpuId(0) lands it on BSP's queue. With the
+    // BSP running run_until_empty, the task completes — same outcome
+    // as an unpinned spawn from BSP, but exercising the affinity
+    // routing path through `target_cpu`.
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use narf_scheduler::{spawn_with_spec, Affinity, CpuId, TaskSpec};
+    static RAN: AtomicU32 = AtomicU32::new(0);
+    RAN.store(0, Ordering::Relaxed);
+
+    narf_scheduler::init();
+
+    let spec = TaskSpec {
+        affinity: Affinity::pinned(CpuId(0)),
+        ..TaskSpec::unthrottled()
+    };
+    let _ = spawn_with_spec(async {
+        RAN.store(1, Ordering::Relaxed);
+    }, spec);
+
+    narf_scheduler::run_until_empty();
+
+    if RAN.load(Ordering::Relaxed) == 1 { TestResult::Pass }
+    else { TestResult::Fail("BSP-pinned task didn't run") }
+}
+kernel_test!(smoke_scheduler_per_cpu_pin_to_bsp);
+
+fn smoke_scheduler_steal_disabled_returns_clean() -> TestResult {
+    // With work-stealing off (the default), an empty BSP queue causes
+    // run_until_empty to return promptly. A test that calls it with
+    // an empty queue must not block.
+    narf_scheduler::init();
+    narf_scheduler::disable_work_stealing();
+    narf_scheduler::run_until_empty();
+    TestResult::Pass
+}
+kernel_test!(smoke_scheduler_steal_disabled_returns_clean);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_virtio_balloon_pci_probe() -> TestResult {
     use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};

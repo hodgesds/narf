@@ -230,12 +230,9 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
         narf_arch::enable_interrupts();
     }
 
-    // 6. Park in WFI. Each timer IRQ wakes the AP for ack + tick
-    //    increment, then back to sleep. Real per-CPU scheduler
-    //    run-loop lands when the run queues become per-CPU.
-    loop {
-        // SAFETY: WFI at EL1 wakes on IRQ regardless of DAIF mask
-        // state; we're unmasked so timer IRQs deliver.
-        unsafe { asm!("wfi", options(nostack, preserves_flags)); }
-    }
+    // 6. Enter the per-CPU scheduler run loop. `run_forever` drains
+    //    this CPU's ready queue, attempts to steal from siblings,
+    //    and halts on IRQ (WFI inside `halt_until_irq`) when there
+    //    is nothing to run. Returns never.
+    narf_scheduler::run_forever();
 }

@@ -22,11 +22,19 @@
 //! - Per-task `BudgetAccount` accumulates measured poll cycles and
 //!   ticks `overruns` when a poll blows the burst allowance.
 //!
-//! Non-goals still (Stage 4):
+//! Stage 4 adds per-CPU run queues + opt-in work stealing. Each CPU
+//! owns one slot of `READY: [_; MAX_CPUS]`; `spawn` routes by the
+//! task's `affinity.preferred` (when online) or the current CPU. APs
+//! enter `run_forever` after bring-up and drain their own queue;
+//! `enable_work_stealing()` lets idle CPUs steal from siblings.
+//! Off by default so the BSP-only test harness sees stable single-
+//! CPU FIFO ordering.
+//!
+//! Non-goals still (later waves):
 //! - Direct context transfer / time-slice donation fast path.
-//! - Work stealing / multi-CPU run queues.
 //! - PKRS save/restore at yield points.
 //! - Fair-share enforcement (today's budget accounting is diagnostic).
+//! - NUMA-aware steal targeting.
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -92,11 +100,17 @@ use narf_time::Instant;
 /// A pinned boxed future representing one kernel task.
 type BoxedTask = Pin<Box<dyn Future<Output = ()> + Send>>;
 
-/// Ready queue of runnable tasks. Stage 1 uses `VecDeque` for FIFO
-/// fairness; Stage 3 upgrades to the intrusive doubly-linked structure
-/// in `narf_lib::IntrusiveList` so spawn is allocation-free for the
-/// queue itself (tasks are still boxed).
-static READY: IrqSafeSpinLock<Option<VecDeque<TaskSlot>>> = IrqSafeSpinLock::new(None);
+/// Per-CPU ready queues. Each CPU owns its own `VecDeque<TaskSlot>`;
+/// `spawn` enqueues onto the CPU named by the task's affinity hint
+/// (or the current CPU if no hint). `run_until_empty` drains the
+/// caller's queue then attempts to steal one task from another CPU's
+/// queue. With single-CPU configurations only index 0 is exercised,
+/// matching pre-SMP behaviour byte-for-byte.
+const NEW_QUEUE: IrqSafeSpinLock<Option<VecDeque<TaskSlot>>> =
+    IrqSafeSpinLock::new(None);
+static READY: [IrqSafeSpinLock<Option<VecDeque<TaskSlot>>>;
+    narf_lib::percpu::MAX_CPUS] =
+    [NEW_QUEUE; narf_lib::percpu::MAX_CPUS];
 
 /// Monotonic task identifier. Minted at `spawn` time. `0` is reserved
 /// as "no task"; the first spawn gets `TaskId(1)`.
@@ -121,6 +135,27 @@ impl CapType for Task {
 }
 
 static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Master switch for cross-CPU work stealing. Off by default so the
+/// BSP-only test harness sees stable single-CPU FIFO semantics. Boot
+/// code (or a runtime toggle) flips it on once the system is past
+/// the sequential setup phase, after which APs in `run_forever`
+/// drain their own queue first and steal from siblings only when
+/// idle.
+static STEAL_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable cross-CPU work stealing on this kernel. Callable from boot
+/// once the BSP has finished publishing its initial spawn batch and
+/// is ready to share work with online APs.
+pub fn enable_work_stealing() {
+    STEAL_ENABLED.store(true, Ordering::Release);
+}
+
+/// Disable work stealing. The toggle is process-wide; useful for
+/// tests that need the single-CPU FIFO invariant back.
+pub fn disable_work_stealing() {
+    STEAL_ENABLED.store(false, Ordering::Release);
+}
 
 /// Id of the task currently being polled by the executor, or
 /// `TaskId::NONE` when the executor is between polls. Syscall
@@ -237,12 +272,38 @@ impl TaskSpec {
     }
 }
 
-/// Call once at boot before spawning anything. Stage 3 promotes this to
-/// a per-CPU `Executor` struct; Stages 1–2 are single-CPU so a global
-/// works.
+/// Call once at boot before spawning anything. Initialises every
+/// per-CPU ready queue. Idempotent within a test run: re-init drops
+/// any tasks left over from a prior round, which is what test setup
+/// wants.
 pub fn init() {
-    let mut q = READY.lock();
-    *q = Some(VecDeque::new());
+    for q in READY.iter() {
+        *q.lock() = Some(VecDeque::new());
+    }
+}
+
+/// Pick the CPU index a task with `spec` should land on. Honours
+/// `affinity.preferred` when the named CPU is online; otherwise spawns
+/// on the current CPU. Falls back to CPU 0 if the current CPU is
+/// somehow not online (shouldn't happen — current_cpu() returning a
+/// CPU implies that CPU is executing).
+fn target_cpu(spec: &TaskSpec) -> usize {
+    if let Some(cpu) = spec.affinity.preferred {
+        let id = cpu.0 as usize;
+        if id < narf_lib::percpu::MAX_CPUS
+            && narf_lib::smp::is_online(cpu.0)
+        {
+            return id;
+        }
+    }
+    let here = narf_lib::percpu::current_cpu();
+    if here < narf_lib::percpu::MAX_CPUS { here } else { 0 }
+}
+
+/// Push `slot` onto `cpu`'s ready queue. Panics if `init()` hasn't run.
+fn enqueue_on(cpu: usize, slot: TaskSlot) {
+    let mut q = READY[cpu].lock();
+    q.as_mut().expect("scheduler: spawn before init").push_back(slot);
 }
 
 /// Queue a new task on the ready queue. Requires `init()` to have run.
@@ -270,8 +331,8 @@ where
         addr_space: None,
         account: BudgetAccount::new(),
     };
-    let mut q = READY.lock();
-    q.as_mut().expect("scheduler::spawn before init").push_back(slot);
+    let cpu = target_cpu(&spec);
+    enqueue_on(cpu, slot);
     id
 }
 
@@ -303,17 +364,27 @@ where
         addr_space: Some(addr_space),
         account: BudgetAccount::new(),
     };
-    let mut q = READY.lock();
-    q.as_mut().expect("scheduler::spawn_user before init").push_back(slot);
+    let cpu = target_cpu(&spec);
+    enqueue_on(cpu, slot);
     id
 }
 
 /// Look up the address space attached to `id`, if any. The returned
 /// `Arc` keeps the AS alive even if the task drops immediately —
 /// callers holding it observe a consistent snapshot.
+///
+/// Searches every per-CPU queue. The lock on each CPU's queue is held
+/// for the duration of its scan; no two CPUs' queues are held at once.
 pub fn address_space_of(id: TaskId) -> Option<Arc<AddressSpace>> {
-    let q = READY.lock();
-    q.as_ref()?.iter().find(|s| s.id == id).and_then(|s| s.addr_space.clone())
+    for q in READY.iter() {
+        let g = q.lock();
+        if let Some(ref dq) = *g {
+            if let Some(slot) = dq.iter().find(|s| s.id == id) {
+                return slot.addr_space.clone();
+            }
+        }
+    }
+    None
 }
 
 /// Errors `donate_to` can return.
@@ -336,22 +407,29 @@ pub enum DonateError {
 /// is Stage-4 work — this Stage-3 form is correct but not performant.
 pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateError> {
     cap.check_live().map_err(|_| DonateError::AuthorityRevoked)?;
-    let mut q = READY.lock();
-    let ready = q.as_mut().ok_or(DonateError::NotReady)?;
-    let pos = match ready.iter().position(|s| s.id == target) {
-        Some(p) => p,
-        None    => return Err(DonateError::TargetNotFound),
-    };
-    if pos != 0 {
-        let slot = ready.remove(pos).unwrap();
-        // Force-wake the donee so the executor doesn't skip it on the
-        // next round if its waker hasn't fired — donation is by
-        // definition "let me pick this task even though you wouldn't
-        // normally have chosen it".
-        slot.awake.store(true, Ordering::Release);
-        ready.push_front(slot);
+    let mut any_initialised = false;
+    for q in READY.iter() {
+        let mut g = q.lock();
+        let ready = match g.as_mut() {
+            Some(r) => r,
+            None    => continue,
+        };
+        any_initialised = true;
+        if let Some(pos) = ready.iter().position(|s| s.id == target) {
+            if pos != 0 {
+                let slot = ready.remove(pos).unwrap();
+                // Force-wake the donee so the executor doesn't skip
+                // it on the next round if its waker hasn't fired —
+                // donation is by definition "let me pick this task
+                // even though you wouldn't normally have chosen it".
+                slot.awake.store(true, Ordering::Release);
+                ready.push_front(slot);
+            }
+            return Ok(());
+        }
     }
-    Ok(())
+    if !any_initialised { return Err(DonateError::NotReady); }
+    Err(DonateError::TargetNotFound)
 }
 
 // ── Waker plumbing ──────────────────────────────────────────────────
@@ -408,36 +486,49 @@ fn make_waker(flag: Arc<AtomicBool>) -> Waker {
 
 /// Run the ready queue until it's empty.
 ///
-/// Strategy: round through every task in the queue; each slot is polled
-/// iff its awake flag is set. The flag is cleared (`swap(false)`) before
+/// Drives the *current CPU's* per-CPU queue. Each round visits every
+/// task currently on the queue at most once; each slot is polled iff
+/// its awake flag is set. The flag is cleared (`swap(false)`) before
 /// the poll so a waker that fires *during* the poll leaves the task
 /// marked for re-poll on the next round.
 ///
-/// After a full round where **no** task went `Ready`, halt the CPU via
-/// `arch::halt_until_irq`. An external interrupt (timer or otherwise)
-/// will wake us, and the next round either makes progress (a deadline
-/// met, waker fired) or we halt again. The halt is kept even though
-/// wakers are now per-task because today's self-waking futures
-/// (`SleepUntil`, `yield_now`) would otherwise spin the CPU between
-/// clock ticks — they re-set their own awake flag before returning
-/// Pending, so the "any awake?" check would always pass.
+/// After a local round produces no `Ready` tasks, the executor tries
+/// to steal one task from another CPU's queue (round-robin starting
+/// at `cpu+1`). If every queue is empty *and* nothing made progress,
+/// halt the CPU via `arch::halt_until_irq`. An external interrupt
+/// (timer or otherwise) will wake us, and the next round either makes
+/// progress (a deadline met, waker fired) or we halt again. The halt
+/// is kept even though wakers are now per-task because today's self-
+/// waking futures (`SleepUntil`, `yield_now`) would otherwise spin
+/// the CPU between clock ticks — they re-set their own awake flag
+/// before returning Pending, so the "any awake?" check would always
+/// pass.
+///
+/// Termination: returns when both this CPU's queue and every other
+/// CPU's queue are empty. Workers (APs) call this in a loop with no
+/// expectation of return; tests call it from BSP and rely on it
+/// returning once their spawned tasks complete.
 pub fn run_until_empty() {
+    let cpu = narf_lib::percpu::current_cpu();
+    let cpu = if cpu < narf_lib::percpu::MAX_CPUS { cpu } else { 0 };
+
     loop {
         // Snapshot queue length. We'll visit each task at most once per
         // round; spawns during the round land at the back and get
         // visited on the NEXT round.
         let round_len = {
-            let q = READY.lock();
-            q.as_ref().expect("scheduler::run_until_empty before init").len()
+            let q = READY[cpu].lock();
+            q.as_ref()
+                .expect("scheduler::run_until_empty before init")
+                .len()
         };
-        if round_len == 0 { return; }
 
         let mut ready_this_round: usize = 0;
 
         for _ in 0..round_len {
             // Pop; if empty, break (can happen if a task was cancelled).
             let mut slot = {
-                let mut q = READY.lock();
+                let mut q = READY[cpu].lock();
                 match q.as_mut().unwrap().pop_front() {
                     Some(t) => t,
                     None    => break,
@@ -456,7 +547,7 @@ pub fn run_until_empty() {
             // Skip if no waker has fired since the last poll. The slot
             // stays in the queue, waiting for an external signal.
             if !slot.awake.swap(false, Ordering::Acquire) {
-                let mut q = READY.lock();
+                let mut q = READY[cpu].lock();
                 q.as_mut().unwrap().push_back(slot);
                 continue;
             }
@@ -495,15 +586,85 @@ pub fn run_until_empty() {
             match poll_result {
                 Poll::Ready(()) => { ready_this_round += 1; /* drop slot */ }
                 Poll::Pending   => {
-                    let mut q = READY.lock();
+                    let mut q = READY[cpu].lock();
                     q.as_mut().unwrap().push_back(slot);
                 }
             }
         }
 
+        // Local queue done for this round. If empty, try to steal one
+        // task from another CPU's queue; if that fails, we have
+        // nothing to do — return so the caller decides whether to
+        // park (worker APs via `run_forever`) or proceed (BSP-side
+        // test callers).
+        let local_empty = {
+            let q = READY[cpu].lock();
+            q.as_ref().map(|d| d.is_empty()).unwrap_or(true)
+        };
+        if local_empty {
+            if !try_steal_one(cpu) { return; }
+            continue;
+        }
+
         if ready_this_round == 0 {
+            // Polled some Pending tasks but nothing completed; idle
+            // until an IRQ delivers a wake.
             narf_arch::halt_until_irq();
         }
+    }
+}
+
+/// Try to steal one task from any other CPU's queue. Returns `true` if
+/// a slot was moved onto `cpu`'s queue. Round-robin starting at the
+/// neighbour with the lowest index above `cpu`, wrapping.
+///
+/// No-op when `STEAL_ENABLED` is false (boot default). Callers in the
+/// idle path treat a `false` return as "nothing to do, return".
+fn try_steal_one(cpu: usize) -> bool {
+    if !STEAL_ENABLED.load(Ordering::Acquire) { return false; }
+    let max = narf_lib::percpu::MAX_CPUS;
+    for i in 1..max {
+        let victim = (cpu + i) % max;
+        if victim == cpu { continue; }
+        // Pop one task from the victim's front *if* it's awake-eligible
+        // and not pinned to a CPU other than ours. We respect affinity
+        // here — stealing a pinned task to the wrong CPU would defeat
+        // the pin.
+        let stolen = {
+            let mut g = READY[victim].lock();
+            let q = match g.as_mut() {
+                Some(q) => q,
+                None    => continue,
+            };
+            // Linear scan for the first slot we're allowed to take.
+            let pos = q.iter().position(|s|
+                s.spec.affinity.allowed.contains(crate::affinity::CpuId(cpu as u32))
+            );
+            match pos {
+                Some(p) => q.remove(p),
+                None    => None,
+            }
+        };
+        if let Some(slot) = stolen {
+            let mut g = READY[cpu].lock();
+            g.as_mut().expect("scheduler: steal before init").push_back(slot);
+            return true;
+        }
+    }
+    false
+}
+
+/// Worker-AP entry: the per-CPU run loop that an AP enters after
+/// bring-up. Equivalent to `run_until_empty` but never returns —
+/// when both this CPU's queue and every steal target are empty,
+/// halts until an IRQ delivers a wake.
+pub fn run_forever() -> ! {
+    loop {
+        run_until_empty();
+        // run_until_empty returned: either we're CPU 0 in a test
+        // context, or every CPU is empty. APs that reach here halt
+        // until something wakes them.
+        narf_arch::halt_until_irq();
     }
 }
 
