@@ -91,7 +91,26 @@ TRAP_STUB_NOERR 44
 TRAP_STUB_NOERR 45
 TRAP_STUB_NOERR 46
 TRAP_STUB_NOERR 47
+
+/* External IRQ vectors 48..=254 (skipping 128, which is the user-
+ * mode syscall gate and gets its own DPL=3 stub below). The
+ * MSI/MSI-X allocator (`narf_interrupts::vector::alloc`) hands out
+ * vectors in this range; without an IDT entry any MSI delivery
+ * would #GP at the IDT lookup. The .rept loops emit one
+ * TRAP_STUB_NOERR per vector. */
+.altmacro
+.set vec_n, 48
+.rept (128 - 48)
+    TRAP_STUB_NOERR %vec_n
+    .set vec_n, vec_n + 1
+.endr
 TRAP_STUB_NOERR 128
+.set vec_n, 129
+.rept (255 - 129)
+    TRAP_STUB_NOERR %vec_n
+    .set vec_n, vec_n + 1
+.endr
+.noaltmacro
 TRAP_STUB_NOERR 255
 
 .global common_trap

@@ -107,8 +107,33 @@ pub unsafe fn enumerate(dtb: Option<PhysAddr>) -> Vec<BusDevice> {
             out.push(dev);
         }
     }
+
+    // PCIe ECAM walk: structurally available via
+    // `crate::pcie::enumerate_n(VIRT_PCIE_ECAM_BASE, 16)` (16 MiB =
+    // 16 buses on QEMU `virt`'s `pcie@10000000`). Naked reads of
+    // `0x3F00_0000` *abort* with ESR.DFSC = 0x10 (synchronous
+    // external abort) until the host bridge is programmed via the
+    // DTB-described `pci-config` window. Linux walks the DTB,
+    // reads the `bus-range` + `reg` properties, and then issues
+    // the ECAM walk; we don't yet parse those properties, so the
+    // walk stays gated on real DTB plumbing.
+    //
+    // The shared walker is wired up; only the per-arch trigger is
+    // missing. The constant + helpers are exposed below so a
+    // follow-up DTB-walker change can flip this on with one line.
+
     out
 }
+
+/// QEMU `virt` PCIe ECAM base. The host bridge's MMCFG region lives
+/// at `0x3F00_0000` and is 16 MiB wide (i.e. 16 buses). Used by a
+/// future DTB-driven ECAM enable path; bare reads abort today
+/// because the host bridge requires programming first.
+pub const VIRT_PCIE_ECAM_BASE: narf_memory::PhysAddr =
+    narf_memory::PhysAddr::new(0x3F00_0000);
+
+/// PCIe bus count for QEMU `virt`. 16 MiB ECAM ÷ 1 MiB per bus.
+pub const VIRT_PCIE_NUM_BUSES: u16 = 16;
 
 /// FDT structure-block walker factored out so the `enumerate` entry
 /// point can try FDT first and fall back to the QEMU-virt default

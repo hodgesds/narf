@@ -33,7 +33,7 @@ use narf_block::{
     BlockCompletion, BlockDevice, BlockError, BlockFeature, BlockRequest,
     CancelResult, LbaRange,
 };
-use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
+use narf_bus::{enable_msix, map_bar, BusDevice, BusDeviceCap, MmioRegion, MsixTable};
 use narf_capabilities::{Cap, Write};
 use narf_io::{alloc_coherent, DmaBuffer};
 use narf_lib::id::DomainId;
@@ -54,8 +54,20 @@ pub enum NvmeError {
     OutOfDmaMemory,
     /// IDENTIFY CONTROLLER returned a non-zero NVMe status field.
     IdentifyFailed { status: u16 },
+    /// A submitted NVMe command (admin or I/O) returned a non-zero
+    /// NVMe status field. `cmd` is the opcode that failed.
+    CommandFailed { cmd: u8, status: u16 },
     /// The completion queue phase tag never flipped within our poll.
     CompletionTimeout,
+    /// `bring_up` hasn't run yet — admin queue isn't programmed.
+    NotReady,
+    /// Caller asked for an I/O command but `create_io_queue` hasn't
+    /// run yet (no I/O queue exists).
+    NoIoQueue,
+    /// LBA range is outside the namespace's reported capacity.
+    OutOfRange,
+    /// MSI-X enable / vector allocation / programming failed.
+    Msix,
 }
 
 // ── Register offsets (NVMe base spec §3.1) ──────────────────────────
@@ -219,6 +231,19 @@ const _: () = assert!(core::mem::size_of::<Cqe>() == 16);
 /// "queue not full" invariant when (head + 1) mod N == tail.
 const ADMIN_Q_DEPTH: u16 = 4;
 
+/// I/O queue depth — same constraint (single 4 KiB DMA page each), in
+/// practice we keep it equal to the admin depth.
+const IO_Q_DEPTH:    u16 = 4;
+
+/// Default I/O queue id (NVMe reserves qid=0 for the admin queue;
+/// the first I/O queue is qid=1).
+const IO_QID:        u16 = 1;
+
+/// Hardcoded namespace id used for I/O. QEMU NVMe always exposes
+/// NSID=1 with the default settings; multi-namespace support is a
+/// follow-up.
+const DEFAULT_NSID:  u32 = 1;
+
 /// NVMe controller handle.
 ///
 /// Three states:
@@ -237,13 +262,30 @@ pub struct Controller {
     device:       Option<BusDevice>,
     /// Set after a successful `bring_up`. Holds the live admin-queue
     /// state so subsequent admin commands can reuse it.
-    admin:        Option<AdminQueue>,
+    admin:        Option<Queue>,
+    /// Set after `create_io_queue` completes. Single I/O queue pair
+    /// (qid=1) handles all read/write traffic — multi-queue lands
+    /// once the executor is ready to schedule per-CPU completions.
+    io:           Option<Queue>,
     /// Live BAR0 mapping post-bring-up. Stored so admin commands
     /// don't have to re-map (which writes to cfg-space).
     bar0_region:  Option<MmioRegion>,
     /// Identify-controller response, copied out of the DMA buffer
     /// after the IDENTIFY admin command completes.
     identify:     Option<IdentifyController>,
+    /// LBA size in bytes (typically 512 or 4096) — populated from
+    /// IDENTIFY NAMESPACE during bring_up.
+    pub lba_bytes: u32,
+    /// Namespace capacity in LBAs (NSZE field of IDENTIFY NAMESPACE).
+    pub nsze:      u64,
+    /// Live MSI-X table set up by `create_io_queue_msix`. The table
+    /// stays alive (no `Drop` undoes the device-side enable) for the
+    /// lifetime of the controller.
+    msix:          Option<MsixTable>,
+    /// IDT vector allocated for I/O-queue completions, programmed
+    /// into MSI-X table entry 0. Drivers `wait_for_irq(self.irq_vector
+    /// .unwrap())` to await an I/O completion.
+    pub irq_vector: Option<u8>,
 }
 
 impl core::fmt::Debug for Controller {
@@ -257,13 +299,18 @@ impl core::fmt::Debug for Controller {
     }
 }
 
-/// Admin queue state tracked across commands. The DMA buffers are
-/// kept here so they live as long as the queue does — dropping them
-/// would unbind the physical pages from under the controller.
+/// One NVMe SQ/CQ pair tracked by the host. Same shape across admin
+/// and I/O queues; the only difference is the qid + depth.
+///
+/// The DMA buffers are kept here so they live as long as the queue
+/// does — dropping them would unbind the physical pages from under
+/// the controller.
 #[derive(Debug)]
-struct AdminQueue {
+struct Queue {
     sq_buf:     DmaBuffer,
     cq_buf:     DmaBuffer,
+    qid:        u16,
+    depth:      u16,
     sq_tail:    u16,
     cq_head:    u16,
     /// Phase tag we expect on the next CQ entry. Flips every time the
@@ -271,8 +318,60 @@ struct AdminQueue {
     cq_phase:   u16,
     /// Per-queue doorbell stride from CAP.DSTRD: `4 << DSTRD`.
     db_stride:  u64,
-    /// Next admin command id to assign (monotonic, wraps at u16).
+    /// Next command id to assign (monotonic, wraps at u16).
     next_cid:   u16,
+}
+
+impl Queue {
+    /// Doorbell offsets for this queue. NVMe layout: SQ tail at
+    /// `0x1000 + 2*qid * stride`, CQ head at
+    /// `0x1000 + (2*qid + 1) * stride`.
+    fn sq_db_off(&self) -> u64 {
+        REG_DOORBELL_BASE + 2 * (self.qid as u64) * self.db_stride
+    }
+    fn cq_db_off(&self) -> u64 {
+        REG_DOORBELL_BASE + (2 * (self.qid as u64) + 1) * self.db_stride
+    }
+
+    /// Submit `sqe` and synchronously poll for its completion.
+    /// Auto-assigns the CID (overwrites the upper 16 bits of cdw0).
+    ///
+    /// # Safety
+    /// The DMA buffers `sq_buf` / `cq_buf` are still mapped and the
+    /// controller is enabled. The caller owns the queue (no other
+    /// task posting concurrently — Stage-3 single-threaded).
+    unsafe fn submit(&mut self, bar0: &MmioRegion, mut sqe: Sqe)
+        -> Result<Cqe, NvmeError>
+    {
+        let cid = self.next_cid;
+        self.next_cid = self.next_cid.wrapping_add(1);
+        // Preserve opcode (low 8 bits) + FUSE/PSDT (bits 8..15) and
+        // overwrite CID (bits 16..31).
+        sqe.cdw0 = (sqe.cdw0 & 0x0000_FFFF) | ((cid as u32) << 16);
+
+        // SAFETY: queue is page-aligned; sq_tail < depth.
+        unsafe { write_sqe(&self.sq_buf, self.sq_tail, &sqe); }
+        self.sq_tail = (self.sq_tail + 1) % self.depth;
+        // SAFETY: identity-mapped MMIO doorbell.
+        unsafe { bar0.write32(self.sq_db_off(), self.sq_tail as u32); }
+
+        // SAFETY: cq_buf is a live DMA page sized for self.depth CQEs.
+        let cqe = unsafe { wait_cqe(&self.cq_buf, self.cq_head, self.cq_phase)? };
+
+        self.cq_head = (self.cq_head + 1) % self.depth;
+        if self.cq_head == 0 { self.cq_phase ^= 1; }
+        // SAFETY: identity-mapped MMIO doorbell.
+        unsafe { bar0.write32(self.cq_db_off(), self.cq_head as u32); }
+
+        let nvme_status = cqe.status >> 1;
+        if nvme_status != 0 {
+            return Err(NvmeError::CommandFailed {
+                cmd: (sqe.cdw0 & 0xFF) as u8,
+                status: nvme_status,
+            });
+        }
+        Ok(cqe)
+    }
 }
 
 /// Subset of the IDENTIFY CONTROLLER page we currently parse.
@@ -300,8 +399,13 @@ impl Controller {
             caps: None,
             device: None,
             admin: None,
+            io: None,
             bar0_region: None,
             identify: None,
+            lba_bytes: 512,
+            nsze: 0,
+            msix: None,
+            irq_vector: None,
         }
     }
 
@@ -417,9 +521,11 @@ impl Controller {
         // ── 6. Wait for CSTS.RDY = 1 ──────────────────────────────
         wait_csts(&bar0, |s| (s & CSTS_RDY) != 0)?;
 
-        let mut admin = AdminQueue {
+        let mut admin = Queue {
             sq_buf,
             cq_buf,
+            qid:       0,
+            depth:     ADMIN_Q_DEPTH,
             sq_tail:   0,
             cq_head:   0,
             cq_phase:  1,  // first valid CQE has phase = 1
@@ -430,57 +536,307 @@ impl Controller {
         // ── 7. IDENTIFY CONTROLLER ────────────────────────────────
         let id_buf = alloc_coherent(4096, DomainId::DRIVER_0)
             .map_err(|_| NvmeError::OutOfDmaMemory)?;
-        let id_phys = id_buf.phys_addr().raw();
-
-        let cid = admin.next_cid;
-        admin.next_cid = admin.next_cid.wrapping_add(1);
-
         let mut sqe = Sqe::zero();
-        // CDW0: opcode (bits 7:0), CID (bits 31:16). FUSE/PSDT zero.
-        sqe.cdw0  = (AdminOpcode::Identify as u32) | ((cid as u32) << 16);
+        sqe.cdw0  = AdminOpcode::Identify as u32;
         sqe.nsid  = 0;
-        sqe.prp1  = id_phys;
-        // CDW10: CNS = 1 (Identify Controller).
-        sqe.cdw10 = 1;
-
-        // SAFETY: the SQ DMA buffer is page-aligned and sized for
-        // ADMIN_Q_DEPTH SQEs; `sq_tail` is bounded by the modulo
-        // arithmetic below.
-        unsafe { write_sqe(&admin.sq_buf, admin.sq_tail, &sqe); }
-        admin.sq_tail = (admin.sq_tail + 1) % ADMIN_Q_DEPTH;
-
-        // Ring SQ0 tail doorbell: BAR0 + 0x1000 + (2*0)*stride.
-        let sq0_db = REG_DOORBELL_BASE + 0 * (2 * admin.db_stride);
-        // SAFETY: identity-mapped MMIO doorbell.
-        unsafe { bar0.write32(sq0_db, admin.sq_tail as u32); }
-
-        // Poll CQ entry 0 for the phase flip.
-        // SAFETY: cq_buf is a live DMA page sized for ADMIN_Q_DEPTH CQEs.
-        let cqe = unsafe { wait_cqe(&admin.cq_buf, admin.cq_head, admin.cq_phase)? };
-        // NVMe status field is in the upper 15 bits of CQE.status;
-        // bit 0 is the phase tag.
-        let nvme_status = cqe.status >> 1;
-        if nvme_status != 0 {
-            return Err(NvmeError::IdentifyFailed { status: nvme_status });
+        sqe.prp1  = id_buf.phys_addr().raw();
+        sqe.cdw10 = 1;  // CNS = 1: Identify Controller
+        // SAFETY: queue is live; bar0 is identity-mapped MMIO.
+        match unsafe { admin.submit(&bar0, sqe) } {
+            Ok(_)  => {}
+            Err(NvmeError::CommandFailed { status, .. })
+                   => return Err(NvmeError::IdentifyFailed { status }),
+            Err(e) => return Err(e),
         }
-
-        // Acknowledge the completion: bump head + ring CQ0 head doorbell.
-        admin.cq_head = (admin.cq_head + 1) % ADMIN_Q_DEPTH;
-        if admin.cq_head == 0 { admin.cq_phase ^= 1; }
-        let cq0_db = REG_DOORBELL_BASE + (2 * 0 + 1) * admin.db_stride;
-        // SAFETY: identity-mapped MMIO doorbell.
-        unsafe { bar0.write32(cq0_db, admin.cq_head as u32); }
-
-        // Parse IDENTIFY CONTROLLER (4 KiB page; only the first
-        // 0x100 bytes are interesting for our subset).
         // SAFETY: id_buf is a live, identity-mapped DMA page.
         let id = unsafe { parse_identify(&id_buf) };
-        self.identify = Some(id);
-        self.admin    = Some(admin);
+        drop(id_buf);
+
+        // ── 8. IDENTIFY NAMESPACE (NSID=1, CNS=0) ─────────────────
+        // Pulls LBA size + namespace capacity. Required before we
+        // can validate read/write LBA ranges or compute byte offsets.
+        let ns_buf = alloc_coherent(4096, DomainId::DRIVER_0)
+            .map_err(|_| NvmeError::OutOfDmaMemory)?;
+        let mut sqe = Sqe::zero();
+        sqe.cdw0  = AdminOpcode::Identify as u32;
+        sqe.nsid  = DEFAULT_NSID;
+        sqe.prp1  = ns_buf.phys_addr().raw();
+        sqe.cdw10 = 0;  // CNS = 0: Identify Namespace
+        // SAFETY: same queue + bar.
+        let _ = unsafe { admin.submit(&bar0, sqe)? };
+        // SAFETY: ns_buf is a live identity-mapped DMA page.
+        let (nsze, lba_bytes) = unsafe { parse_identify_namespace(&ns_buf) };
+        drop(ns_buf);
+
+        self.identify    = Some(id);
+        self.lba_bytes   = lba_bytes;
+        self.nsze        = nsze;
+        self.admin       = Some(admin);
         self.bar0_region = Some(bar0);
-        // id_buf drops here — IDENTIFY is one-shot, the controller
-        // doesn't reference the buffer after the CQE arrives.
-        let _ = id_buf;
+        Ok(())
+    }
+
+    /// Create a single I/O queue pair (qid=1, depth=`IO_Q_DEPTH`)
+    /// using polled completions. Issues admin Create I/O CQ + Create
+    /// I/O SQ commands. Idempotent: calling again replaces the
+    /// existing queue (the prior one's DmaBuffers drop, freeing the
+    /// backing frames; the controller's view is overwritten by the
+    /// new SQ/CQ phys addresses).
+    pub fn create_io_queue(&mut self) -> Result<(), NvmeError> {
+        let admin = self.admin.as_mut().ok_or(NvmeError::NotReady)?;
+        let bar0  = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+
+        // Allocate IOSQ + IOCQ DMA pages — same shape as admin.
+        let sq_buf = alloc_coherent(64 * IO_Q_DEPTH as usize, DomainId::DRIVER_0)
+            .map_err(|_| NvmeError::OutOfDmaMemory)?;
+        let cq_buf = alloc_coherent(16 * IO_Q_DEPTH as usize, DomainId::DRIVER_0)
+            .map_err(|_| NvmeError::OutOfDmaMemory)?;
+        let sq_phys = sq_buf.phys_addr().raw();
+        let cq_phys = cq_buf.phys_addr().raw();
+
+        // Create I/O CQ (admin opcode 0x05).
+        // CDW10: bits[31:16] = qsize-1, bits[15:0] = qid.
+        // CDW11: bits[31:16] = IV (interrupt vector index in MSI-X
+        //         table) — 0 since we poll, bit 1 = IEN (interrupt
+        //         enable) = 0 to suppress, bit 0 = PC (physically
+        //         contiguous) = 1.
+        let mut sqe = Sqe::zero();
+        sqe.cdw0  = AdminOpcode::CreateCq as u32;
+        sqe.prp1  = cq_phys;
+        sqe.cdw10 = ((IO_Q_DEPTH as u32 - 1) << 16) | (IO_QID as u32);
+        sqe.cdw11 = 1;  // PC=1, IEN=0 (polling), IV=0
+        // SAFETY: queue + bar live; CQ buffer is fresh DMA.
+        unsafe { admin.submit(bar0, sqe)?; }
+
+        // Create I/O SQ (admin opcode 0x01).
+        // CDW10: bits[31:16] = qsize-1, bits[15:0] = qid.
+        // CDW11: bits[31:16] = CQID, bits[2:1] = QPRIO = 0 (urgent),
+        //        bit 0 = PC = 1.
+        let mut sqe = Sqe::zero();
+        sqe.cdw0  = AdminOpcode::CreateSq as u32;
+        sqe.prp1  = sq_phys;
+        sqe.cdw10 = ((IO_Q_DEPTH as u32 - 1) << 16) | (IO_QID as u32);
+        sqe.cdw11 = ((IO_QID as u32) << 16) | 1;
+        // SAFETY: queue + bar live.
+        unsafe { admin.submit(bar0, sqe)?; }
+
+        // Stash the new IoQueue. Drop replaces any prior one.
+        self.io = Some(Queue {
+            sq_buf,
+            cq_buf,
+            qid:       IO_QID,
+            depth:     IO_Q_DEPTH,
+            sq_tail:   0,
+            cq_head:   0,
+            cq_phase:  1,
+            db_stride: admin.db_stride,
+            next_cid:  0,
+        });
+        Ok(())
+    }
+
+    /// Submit an NVM Read (`opcode = 0x02`) for `n_blocks` LBAs
+    /// starting at `lba`, copying into the page-sized DMA buffer
+    /// `buf`. Polls the I/O CQ for completion. Caller-owned.
+    ///
+    /// `n_blocks` is encoded zero-based on the wire (NLB = blocks-1);
+    /// the function takes the human-readable count.
+    pub fn read_lba(&mut self, lba: u64, n_blocks: u16, buf: &DmaBuffer)
+        -> Result<(), NvmeError>
+    {
+        self.nvm_io(IoOpcode::Read as u8, lba, n_blocks, buf)
+    }
+
+    /// Symmetric to `read_lba`: submit an NVM Write (`opcode = 0x01`).
+    pub fn write_lba(&mut self, lba: u64, n_blocks: u16, buf: &DmaBuffer)
+        -> Result<(), NvmeError>
+    {
+        self.nvm_io(IoOpcode::Write as u8, lba, n_blocks, buf)
+    }
+
+    /// Create the I/O queue pair with MSI-X-driven completions.
+    ///
+    /// Walks the device's MSI-X capability, allocates an IDT vector
+    /// from `narf_interrupts::vector`, programs MSI-X table entry 0
+    /// to deliver that vector to the BSP, flips the global MSI-X
+    /// enable bit, then issues Create I/O CQ (`IV=0, IEN=1`) +
+    /// Create I/O SQ.
+    ///
+    /// Returns the allocated IDT vector. Subsequent `submit_io_irq`
+    /// calls use `narf_interrupts::fire_count(vector)` (or, for
+    /// async callers, `wait_for_irq(vector)`) to detect completion.
+    pub fn create_io_queue_msix(
+        &mut self,
+        bus_dev_cap: &Cap<BusDeviceCap, Write>,
+    ) -> Result<u8, NvmeError> {
+        let device = self.device.ok_or(NvmeError::NotReady)?;
+        // 1. Walk the cap list + sniff the MSI-X table size.
+        let mut msix = enable_msix(bus_dev_cap, &device)
+            .map_err(|_| NvmeError::Msix)?;
+
+        // 2. Allocate IDT vector + MSI-X table slot 0.
+        let v = narf_interrupts::vector::alloc()
+            .map_err(|_| NvmeError::Msix)?;
+        let _ = msix.alloc_vector().ok_or(NvmeError::Msix)?;
+
+        // 3. Program MSI-X table entry 0 to deliver vector `v` to
+        //    APIC id 0 (the BSP). On aarch64 this routes through the
+        //    GIC ITS doorbell with EventID=v.
+        // SAFETY: caller holds the BusDeviceCap; we own the MSI-X
+        // table (no other writer); we issue this write before
+        // enabling so the device can't fire stale data.
+        let _ = unsafe { msix.program_vector(0, 0, v) }
+            .map_err(|_| NvmeError::Msix)?;
+
+        // 4. Flip the global MSI-X enable bit.
+        // SAFETY: cfg-space write to a known cap-list offset.
+        let _ = unsafe { msix.enable() }
+            .map_err(|_| NvmeError::Msix)?;
+
+        self.msix = Some(msix);
+        self.irq_vector = Some(v);
+
+        // 5. Allocate IOSQ + IOCQ DMA pages. Same shape as the
+        //    polling create_io_queue, but with IEN=1 + IV=0 on the CQ.
+        let admin = self.admin.as_mut().ok_or(NvmeError::NotReady)?;
+        let bar0  = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+        let sq_buf = alloc_coherent(64 * IO_Q_DEPTH as usize, DomainId::DRIVER_0)
+            .map_err(|_| NvmeError::OutOfDmaMemory)?;
+        let cq_buf = alloc_coherent(16 * IO_Q_DEPTH as usize, DomainId::DRIVER_0)
+            .map_err(|_| NvmeError::OutOfDmaMemory)?;
+        let sq_phys = sq_buf.phys_addr().raw();
+        let cq_phys = cq_buf.phys_addr().raw();
+
+        // Create I/O CQ: PC=1, IEN=1, IV=0.
+        let mut sqe = Sqe::zero();
+        sqe.cdw0  = AdminOpcode::CreateCq as u32;
+        sqe.prp1  = cq_phys;
+        sqe.cdw10 = ((IO_Q_DEPTH as u32 - 1) << 16) | (IO_QID as u32);
+        sqe.cdw11 = (0u32 << 16) | (1 << 1) | 1;  // IV=0, IEN=1, PC=1
+        // SAFETY: queue + bar live; CQ DMA fresh.
+        unsafe { admin.submit(bar0, sqe)?; }
+
+        // Create I/O SQ: PC=1, CQID=IO_QID, QPRIO=0.
+        let mut sqe = Sqe::zero();
+        sqe.cdw0  = AdminOpcode::CreateSq as u32;
+        sqe.prp1  = sq_phys;
+        sqe.cdw10 = ((IO_Q_DEPTH as u32 - 1) << 16) | (IO_QID as u32);
+        sqe.cdw11 = ((IO_QID as u32) << 16) | 1;
+        // SAFETY: queue + bar live.
+        unsafe { admin.submit(bar0, sqe)?; }
+
+        self.io = Some(Queue {
+            sq_buf,
+            cq_buf,
+            qid:       IO_QID,
+            depth:     IO_Q_DEPTH,
+            sq_tail:   0,
+            cq_head:   0,
+            cq_phase:  1,
+            db_stride: admin.db_stride,
+            next_cid:  0,
+        });
+
+        Ok(v)
+    }
+
+    /// Submit an NVM Read/Write to the I/O queue and wait for
+    /// MSI-X-delivered completion via `narf_interrupts::fire_count`.
+    /// Caller decides between `read_lba` (polled) and this for
+    /// IRQ-driven flows.
+    ///
+    /// Synchronous variant: spins on `fire_count` after submitting;
+    /// the underlying mechanism is the same one `wait_for_irq.await`
+    /// drives, just without an executor.
+    pub fn submit_io_irq(
+        &mut self,
+        opcode: u8,
+        lba: u64,
+        n_blocks: u16,
+        buf: &DmaBuffer,
+    ) -> Result<(), NvmeError> {
+        let v = self.irq_vector.ok_or(NvmeError::Msix)?;
+        let io   = self.io.as_mut().ok_or(NvmeError::NoIoQueue)?;
+        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+        if n_blocks == 0 { return Ok(()); }
+        if self.nsze != 0 && lba.saturating_add(n_blocks as u64) > self.nsze {
+            return Err(NvmeError::OutOfRange);
+        }
+
+        let baseline = narf_interrupts::fire_count(v);
+
+        let mut sqe = Sqe::zero();
+        sqe.cdw0  = opcode as u32;
+        sqe.nsid  = DEFAULT_NSID;
+        sqe.prp1  = buf.phys_addr().raw();
+        sqe.cdw10 = (lba & 0xFFFF_FFFF) as u32;
+        sqe.cdw11 = (lba >> 32) as u32;
+        sqe.cdw12 = (n_blocks - 1) as u32;
+
+        // Auto-CID + ring SQ tail doorbell.
+        let cid = io.next_cid;
+        io.next_cid = io.next_cid.wrapping_add(1);
+        sqe.cdw0 = (sqe.cdw0 & 0x0000_FFFF) | ((cid as u32) << 16);
+        // SAFETY: queue is page-aligned; sq_tail bounded.
+        unsafe { write_sqe(&io.sq_buf, io.sq_tail, &sqe); }
+        io.sq_tail = (io.sq_tail + 1) % io.depth;
+        // SAFETY: identity-mapped MMIO doorbell.
+        unsafe { bar0.write32(io.sq_db_off(), io.sq_tail as u32); }
+
+        // Wait for MSI-X delivery — the dispatch table's fire_count
+        // bumps from the ISR. As a defensive belt-and-braces check
+        // we also bail if the CQE phase flips first (e.g. if the
+        // interrupt got lost; QEMU has been observed to do this on
+        // hot reset paths).
+        let mut spins = 0u32;
+        loop {
+            if narf_interrupts::fire_count(v) > baseline { break; }
+            // SAFETY: cq_buf is a live identity-mapped DMA page.
+            let cqe = unsafe { peek_cqe(&io.cq_buf, io.cq_head) };
+            if (cqe.status & 1) == (io.cq_phase & 1) { break; }
+            spins += 1;
+            if spins > 10_000_000 { return Err(NvmeError::CompletionTimeout); }
+            core::hint::spin_loop();
+        }
+
+        // Drain the CQE.
+        // SAFETY: same buffer.
+        let cqe = unsafe { peek_cqe(&io.cq_buf, io.cq_head) };
+        io.cq_head = (io.cq_head + 1) % io.depth;
+        if io.cq_head == 0 { io.cq_phase ^= 1; }
+        // SAFETY: identity-mapped MMIO doorbell.
+        unsafe { bar0.write32(io.cq_db_off(), io.cq_head as u32); }
+
+        let nvme_status = cqe.status >> 1;
+        if nvme_status != 0 {
+            return Err(NvmeError::CommandFailed { cmd: opcode, status: nvme_status });
+        }
+        Ok(())
+    }
+
+    fn nvm_io(&mut self, opcode: u8, lba: u64, n_blocks: u16, buf: &DmaBuffer)
+        -> Result<(), NvmeError>
+    {
+        let io   = self.io.as_mut().ok_or(NvmeError::NoIoQueue)?;
+        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+        if n_blocks == 0 { return Ok(()); }
+        // Range check against the namespace's reported capacity.
+        if self.nsze != 0
+            && lba.saturating_add(n_blocks as u64) > self.nsze
+        {
+            return Err(NvmeError::OutOfRange);
+        }
+        let mut sqe = Sqe::zero();
+        sqe.cdw0  = opcode as u32;
+        sqe.nsid  = DEFAULT_NSID;
+        sqe.prp1  = buf.phys_addr().raw();
+        // CDW10/11 = SLBA (64-bit, little-endian split).
+        sqe.cdw10 = (lba & 0xFFFF_FFFF) as u32;
+        sqe.cdw11 = (lba >> 32) as u32;
+        // CDW12 bits[15:0] = NLB-1; flags (LR/FUA/PRINFO) zero.
+        sqe.cdw12 = (n_blocks - 1) as u32;
+        // SAFETY: io queue + bar are live; buf is identity-mapped DMA.
+        unsafe { io.submit(bar0, sqe)?; }
         Ok(())
     }
 }
@@ -511,6 +867,18 @@ unsafe fn write_sqe(buf: &DmaBuffer, index: u16, sqe: &Sqe) {
     // SAFETY: caller guarantees buf is page-aligned and large
     // enough; index is bounded.
     unsafe { core::ptr::write_volatile(base.add(index as usize), *sqe); }
+}
+
+/// Read the CQ entry at `index` without polling. Used by the
+/// MSI-X-driven path which tracks completion via fire_count instead.
+///
+/// # Safety
+/// `buf` must be a live coherent DMA buffer sized for at least
+/// `index + 1` 16-byte CQEs.
+unsafe fn peek_cqe(buf: &DmaBuffer, index: u16) -> Cqe {
+    let base = buf.phys_addr().raw() as *const Cqe;
+    // SAFETY: caller guarantees buf is page-aligned and large enough.
+    unsafe { core::ptr::read_volatile(base.add(index as usize)) }
 }
 
 /// Spin until CQ entry `index` has the expected phase tag, then
@@ -566,6 +934,33 @@ unsafe fn parse_identify(buf: &DmaBuffer) -> IdentifyController {
         mn,
         fr,
     }
+}
+
+/// Pull `(NSZE, lba_bytes)` out of an IDENTIFY NAMESPACE page.
+///
+/// IDENTIFY NAMESPACE layout (NVMe base spec §5.15.2.2):
+///   - bytes 0..7   : NSZE (Namespace Size, in LBAs)
+///   - byte  26     : FLBAS (Formatted LBA Size). Bits[3:0] index
+///                    into LBAF[].
+///   - bytes 128.. : LBAF[0..16] @ 4 bytes each. LBAF.LBADS is at
+///                    byte offset 2 (relative to the LBAF start), low
+///                    byte = log2(LBA size in bytes).
+///
+/// # Safety
+/// `buf` must be a 4 KiB coherent DMA buffer the controller has
+/// finished writing to (CQE arrived).
+unsafe fn parse_identify_namespace(buf: &DmaBuffer) -> (u64, u32) {
+    let base = buf.phys_addr().raw() as *const u8;
+    // SAFETY: 4 KiB DMA buffer.
+    let nsze = unsafe { core::ptr::read_volatile(base as *const u64) };
+    // SAFETY: same buffer.
+    let flbas = unsafe { core::ptr::read_volatile(base.add(26)) };
+    let lbaf_idx = (flbas & 0x0F) as usize;
+    let lbaf_off = 128 + lbaf_idx * 4;
+    // SAFETY: LBAF table fits well inside the 4 KiB page.
+    let lbads = unsafe { core::ptr::read_volatile(base.add(lbaf_off + 2)) };
+    let lba_bytes: u32 = if lbads == 0 { 512 } else { 1u32 << lbads };
+    (nsze, lba_bytes)
 }
 
 /// Stub `BlockDevice` impl. Every op returns `DeviceRemoved` —

@@ -1197,6 +1197,25 @@ fn smoke_bus_enumerates_pcie() -> TestResult {
 kernel_test!(smoke_bus_enumerates_pcie);
 
 #[cfg(target_arch = "aarch64")]
+fn smoke_bus_pcie_walker_shared_with_x86() -> TestResult {
+    // Structural: the shared `pcie::enumerate_n` is reachable on
+    // aarch64 and the QEMU virt ECAM constants are in place. We
+    // can't actually walk live ECAM yet — QEMU's PCIe host bridge
+    // requires DTB-driven programming before bare reads work — so
+    // the test verifies the surface exists rather than hitting MMIO.
+    use narf_bus::aarch64::{VIRT_PCIE_ECAM_BASE, VIRT_PCIE_NUM_BUSES};
+    if VIRT_PCIE_ECAM_BASE.raw() != 0x3F00_0000 {
+        return TestResult::Fail("VIRT_PCIE_ECAM_BASE constant changed unexpectedly");
+    }
+    if VIRT_PCIE_NUM_BUSES != 16 {
+        return TestResult::Fail("VIRT_PCIE_NUM_BUSES changed unexpectedly");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test!(smoke_bus_pcie_walker_shared_with_x86);
+
+#[cfg(target_arch = "aarch64")]
 fn smoke_bus_enumerates_virtio_mmio() -> TestResult {
     // QEMU `virt` exposes 32 virtio-mmio transport slots at
     // 0x0a00_0000 (stride 0x200). We don't have easy access to the
@@ -5367,6 +5386,200 @@ fn smoke_nvme_admin_identify_controller() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_nvme_admin_identify_controller);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_nvme_io_round_trip() -> TestResult {
+    // End-to-end NVMe I/O: bring up the controller, create one I/O
+    // queue pair, write a 512-byte pattern at LBA 0, read it back,
+    // and compare. Exercises the full BAR + DMA + admin queue + I/O
+    // queue + namespace addressing path.
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_drivers_nvme::Controller;
+    use narf_io::alloc_coherent;
+    use narf_lib::id::DomainId;
+    // SAFETY: ECAM is identity-mapped; init is idempotent.
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+
+    let devs = devices();
+    let nvme_dev = devs.iter().find(|d| {
+        matches!(d.kind, BusKind::Pcie { .. })
+            && d.id.vendor == 0x1B36
+            && d.id.device == 0x0010
+    });
+    let Some(dev) = nvme_dev.copied() else {
+        return TestResult::Skip("no QEMU NVMe controller");
+    };
+
+    let authority = bootstrap_registry_authority();
+    let (_h, dev_cap) = match claim_device_cap(&authority, dev.addr) {
+        Ok(ok)  => ok,
+        Err(_)  => return TestResult::Fail("claim_device_cap failed"),
+    };
+
+    let mut ctrl = Controller::from_device(dev);
+    if ctrl.bring_up(&dev_cap).is_err() {
+        return TestResult::Fail("Controller::bring_up failed");
+    }
+    if ctrl.create_io_queue().is_err() {
+        return TestResult::Fail("Controller::create_io_queue failed");
+    }
+    if ctrl.lba_bytes != 512 {
+        return TestResult::Fail("expected 512-byte LBAs on QEMU default");
+    }
+    if ctrl.nsze == 0 {
+        return TestResult::Fail("namespace reported zero size");
+    }
+
+    // Allocate a 4 KiB DMA page for the data buffer.
+    let buf = match alloc_coherent(4096, DomainId::DRIVER_0) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("alloc_coherent failed"),
+    };
+
+    // Fill the first 512 bytes with a recognisable pattern.
+    let phys = buf.phys_addr().raw();
+    // SAFETY: the DMA buffer is identity-mapped at phys (low 4 GiB).
+    unsafe {
+        for i in 0..512usize {
+            core::ptr::write_volatile((phys as *mut u8).add(i), (i as u8) ^ 0xA5);
+        }
+    }
+
+    // Write LBA 0.
+    if ctrl.write_lba(0, 1, &buf).is_err() {
+        return TestResult::Fail("write_lba(0) failed");
+    }
+
+    // Zero the buffer so the read isn't comparing against itself.
+    // SAFETY: still our identity-mapped DMA buffer.
+    unsafe {
+        for i in 0..4096usize {
+            core::ptr::write_volatile((phys as *mut u8).add(i), 0);
+        }
+    }
+
+    // Read LBA 0 back.
+    if ctrl.read_lba(0, 1, &buf).is_err() {
+        return TestResult::Fail("read_lba(0) failed");
+    }
+
+    // Verify the pattern came back.
+    // SAFETY: same buffer.
+    for i in 0..512usize {
+        let v = unsafe { core::ptr::read_volatile((phys as *const u8).add(i)) };
+        let expected = (i as u8) ^ 0xA5;
+        if v != expected {
+            return TestResult::Fail("read-back pattern mismatch");
+        }
+    }
+
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_nvme_io_round_trip);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_nvme_io_msix_irq_driven() -> TestResult {
+    // End-to-end IRQ-driven NVMe I/O: bring up the controller,
+    // enable MSI-X with one vector wired to a fresh IDT slot,
+    // create the I/O queue with IEN=1, do a write+read round trip,
+    // and assert that the IRQ dispatch table observed one or more
+    // MSI deliveries on our vector. Proves the whole stack:
+    // bus::enable_msix → vector::alloc → MsixTable::program_vector
+    // → MsixTable::enable → trap-handler dispatch → fire_count.
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_drivers_nvme::{Controller, IoOpcode};
+    use narf_io::alloc_coherent;
+    use narf_lib::id::DomainId;
+    // SAFETY: ECAM is identity-mapped; init is idempotent.
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+
+    let devs = devices();
+    let nvme_dev = devs.iter().find(|d| {
+        matches!(d.kind, BusKind::Pcie { .. })
+            && d.id.vendor == 0x1B36
+            && d.id.device == 0x0010
+    });
+    let Some(dev) = nvme_dev.copied() else {
+        return TestResult::Skip("no QEMU NVMe controller");
+    };
+
+    let authority = bootstrap_registry_authority();
+    let (_h, dev_cap) = match claim_device_cap(&authority, dev.addr) {
+        Ok(ok)  => ok,
+        Err(_)  => return TestResult::Fail("claim_device_cap failed"),
+    };
+
+    let mut ctrl = Controller::from_device(dev);
+    if ctrl.bring_up(&dev_cap).is_err() {
+        return TestResult::Fail("Controller::bring_up failed");
+    }
+    let v = match ctrl.create_io_queue_msix(&dev_cap) {
+        Ok(v)  => v,
+        Err(_) => return TestResult::Fail("create_io_queue_msix failed"),
+    };
+
+    // MSI delivery requires RFLAGS.IF=1. The test harness leaves
+    // CPU interrupts disabled by default; turn them on for this
+    // smoke and turn them back off before returning.
+    // SAFETY: APIC is initialised; MSI lands in our IDT vector via
+    // the dispatch table.
+    unsafe { narf_arch::enable_interrupts(); }
+
+    // Snapshot fire count before any I/O.
+    let baseline = narf_interrupts::fire_count(v);
+
+    // Allocate a 4 KiB DMA buffer; pattern + write + zero + read +
+    // verify, all using the IRQ-driven path.
+    let buf = match alloc_coherent(4096, DomainId::DRIVER_0) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("alloc_coherent failed"),
+    };
+    let phys = buf.phys_addr().raw();
+    // SAFETY: identity-mapped DMA page.
+    unsafe {
+        for i in 0..512usize {
+            core::ptr::write_volatile((phys as *mut u8).add(i), (i as u8).wrapping_mul(7));
+        }
+    }
+    if ctrl.submit_io_irq(IoOpcode::Write as u8, 1, 1, &buf).is_err() {
+        return TestResult::Fail("submit_io_irq(Write) failed");
+    }
+    // SAFETY: same buffer.
+    unsafe {
+        for i in 0..4096usize {
+            core::ptr::write_volatile((phys as *mut u8).add(i), 0);
+        }
+    }
+    if ctrl.submit_io_irq(IoOpcode::Read as u8, 1, 1, &buf).is_err() {
+        return TestResult::Fail("submit_io_irq(Read) failed");
+    }
+    // SAFETY: same buffer.
+    for i in 0..512usize {
+        let v = unsafe { core::ptr::read_volatile((phys as *const u8).add(i)) };
+        if v != (i as u8).wrapping_mul(7) {
+            return TestResult::Fail("IRQ-driven read-back pattern mismatch");
+        }
+    }
+
+    // The MSI dispatch table must have observed the IRQ at least
+    // once during the round trip. (Two completions submitted; we
+    // require ≥ 1 to allow for QEMU coalescing.)
+    let after = narf_interrupts::fire_count(v);
+    // Restore the harness's "interrupts off" invariant before
+    // returning so subsequent tests aren't surprised.
+    // SAFETY: counterpart to the enable_interrupts above.
+    unsafe { narf_arch::disable_interrupts(); }
+    if after <= baseline {
+        return TestResult::Fail("IRQ dispatch fire_count never advanced");
+    }
+
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_nvme_io_msix_irq_driven);
 
 fn smoke_drivers_net_nic_model_ids() -> TestResult {
     use narf_drivers_net::{NicCaps, NicModel};

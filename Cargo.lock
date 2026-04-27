@@ -481,6 +481,7 @@ dependencies = [
  "narf-block",
  "narf-bus",
  "narf-capabilities",
+ "narf-interrupts",
  "narf-io",
  "narf-lib",
 ]

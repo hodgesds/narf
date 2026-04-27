@@ -487,10 +487,36 @@ The critical-path Stage-2 items remaining:
    `smoke_irq_dispatch_fire_count`, `smoke_vector_alloc_unique`,
    `smoke_wait_for_irq_resolves_after_on_irq`, `smoke_its_doorbell_addr`.
 
-   Remaining for full driver readiness: per-CPU I/O queue pairs +
-   real MSI-X-driven completions in the NVMe driver (now unblocked),
-   and aarch64 MMIO mapping above 4 GiB (needed before QEMU virt
-   PCIe transports — at 0x10_0000_0000 — are reachable).
+   NVMe end-to-end I/O is now real on x86_64: `Controller::create_io_queue`
+   issues Create I/O CQ + Create I/O SQ admin commands and `read_lba`
+   / `write_lba` submit NVM Read/Write through the I/O queue, polled.
+   `smoke_nvme_io_round_trip` writes a 512-byte pattern at LBA 0 and
+   reads it back. IDENTIFY NAMESPACE is also issued during bring_up
+   so `Controller::lba_bytes` and `Controller::nsze` are real.
+
+   IRQ-driven NVMe is also live on x86_64: `create_io_queue_msix`
+   walks the MSI-X cap, allocates an IDT vector via
+   `narf_interrupts::vector::alloc`, programs MSI-X table entry 0
+   to deliver that vector to APIC 0, flips the global enable, then
+   re-issues Create I/O CQ with `IV=0, IEN=1`. `submit_io_irq`
+   spins on `narf_interrupts::fire_count(vector)` (the same atomic
+   `wait_for_irq.await` consumes), confirming MSI delivery actually
+   reaches the dispatch table. The full IDT now installs vectors
+   32..=254 (not just 32..=47) so the allocator pool 48..=240 is
+   guaranteed to land on a present gate. End-to-end guarded by
+   `smoke_nvme_io_msix_irq_driven`, which verifies the round-trip
+   pattern *and* asserts the dispatch table observed at least one
+   MSI during the I/O.
+
+   PCIe ECAM walker is now shared between arches via `bus::pcie`.
+   x86_64 (q35, 256-bus ECAM) walks live; aarch64 (QEMU virt,
+   16-bus ECAM) has the constants + the shared walker but no live
+   walk yet — QEMU's host bridge aborts naked reads of
+   `0x3F00_0000` until it's programmed via DTB-described init,
+   and we don't parse the relevant DTB properties yet (`bus-range`,
+   `reg`, `ranges`). That's the only remaining "real driver"
+   blocker on aarch64; once it lands, every IRQ + DMA + BAR + MSI-X
+   + ITS surface aarch64 already exposes connects to live PCIe.
 
 2. **Higher-half kernel relocation**. Conventional -2 GiB layout.
    Touches the linker script, boot.S (far-jump-to-virtual after

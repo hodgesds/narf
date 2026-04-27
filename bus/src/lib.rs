@@ -37,6 +37,7 @@ pub mod bar;
 pub mod device;
 pub mod hotplug;
 pub mod msix;
+pub mod pcie;
 pub mod registry;
 
 pub use acpi_notify::{AcpiNotify, NotifyEvent, NotifyKind};
