@@ -303,15 +303,23 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     }
                 }
 
-                // Bus enumeration. We don't pass a DTB pointer through
-                // the boot handoff yet, so the walker takes the
-                // virtio-mmio fallback (probes the known QEMU virt
-                // slots). Real DTB plumbing is a boot/ side-track.
-                // SAFETY: fallback path only touches identity-mapped
-                // virtio-mmio slots and tolerates absent magic.
-                let n_dev = unsafe { narf_bus::init(None) };
+                // Bus enumeration. The DTB pointer comes through
+                // `BootInfo`; if QEMU's `-kernel` path didn't supply
+                // one, the walker falls back to the QEMU virt
+                // virtio-mmio defaults.
+                // SAFETY: DTB blob is in identity-mapped low RAM;
+                // reads validate magic before trusting offsets.
+                let n_dev = unsafe { narf_bus::init(info.dtb_phys) };
+                let devs  = narf_bus::devices();
+                let n_pcie = devs.iter()
+                    .filter(|d| matches!(d.kind, narf_bus::BusKind::Pcie { .. }))
+                    .count();
+                let n_mmio = devs.iter()
+                    .filter(|d| matches!(d.kind, narf_bus::BusKind::VirtioMmio { .. }))
+                    .count();
                 let _ = writeln!(console::Writer,
-                    "  bus: virtio-mmio probe found {} transport(s)", n_dev);
+                    "  bus: dtb={:?} → {} dev ({} pcie, {} virtio-mmio)",
+                    info.dtb_phys, n_dev, n_pcie, n_mmio);
 
                 // GIC ITS bring-up. Memory is online, GICv3 is up
                 // (gic::init_bsp ran above). Programs the device /

@@ -73,5 +73,6 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
         cmdline:    CMDLINE,
         uart_phys:  PhysAddr::new(UART_DEFAULT_PORT as u64),
         uart_virt:  VirtAddr::new(UART_DEFAULT_PORT as u64),   // pre-MMU identity
+        dtb_phys:   None,
     })
 }

@@ -55,6 +55,10 @@ pub struct BootInfo {
     /// UART pre-MMU); Wave 2's MMU bring-up replaces this with the real
     /// kernel-virtual mapping.
     pub uart_virt:  VirtAddr,
+    /// Physical address of the device tree blob (aarch64) or 0 on
+    /// x86_64. Subsystems that need DTB-described topology (PCIe host
+    /// bridge, etc.) walk this directly.
+    pub dtb_phys:   Option<PhysAddr>,
 }
 
 /// Errors from `validate_boot_info`. Stage 1 raises `BadMagic` and

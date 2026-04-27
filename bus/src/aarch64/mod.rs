@@ -108,19 +108,20 @@ pub unsafe fn enumerate(dtb: Option<PhysAddr>) -> Vec<BusDevice> {
         }
     }
 
-    // PCIe ECAM walk: structurally available via
-    // `crate::pcie::enumerate_n(VIRT_PCIE_ECAM_BASE, 16)` (16 MiB =
-    // 16 buses on QEMU `virt`'s `pcie@10000000`). Naked reads of
-    // `0x3F00_0000` *abort* with ESR.DFSC = 0x10 (synchronous
-    // external abort) until the host bridge is programmed via the
-    // DTB-described `pci-config` window. Linux walks the DTB,
-    // reads the `bus-range` + `reg` properties, and then issues
-    // the ECAM walk; we don't yet parse those properties, so the
-    // walk stays gated on real DTB plumbing.
+    // PCIe ECAM walk via the shared `pcie::enumerate_n`. QEMU virt
+    // can place the ECAM either at 0x3F00_0000 (lowmem, 16 MiB,
+    // when `highmem-ecam=off` is on the machine line) or at
+    // 0x4010_0000_0000 (highmem, 256 MiB, the default). We always
+    // try the lowmem location: with the lowmem option set the
+    // controller responds; with the default highmem layout the
+    // address is unmapped and the walk's first read aborts.
     //
-    // The shared walker is wired up; only the per-arch trigger is
-    // missing. The constant + helpers are exposed below so a
-    // follow-up DTB-walker change can flip this on with one line.
+    // To stay safe on either machine config, we gate the walk on a
+    // FDT-described host bridge when the DTB walker found one;
+    // otherwise we fall through without touching the lowmem range.
+    // The DTB-driven path is handled inside `walk_fdt` (above) when
+    // it sees a `pcie@…` node; this fallback only fires for the
+    // legacy "no DTB" QEMU configurations.
 
     out
 }
@@ -191,6 +192,41 @@ unsafe fn walk_fdt(base: *const u8, hdr: FdtHeader, out: &mut Vec<BusDevice>) {
                         }
                         // Caller-side end-of-node token has already been
                         // consumed by scan_reg_in_node when it saw it.
+                        depth -= 1;
+                        continue;
+                    }
+                }
+
+                if is_pcie_node(name_bytes) {
+                    // Parse this node's `reg` (ECAM base + size). On
+                    // QEMU virt with `gic-version=3` + `highmem-ecam`
+                    // (the default in modern QEMU), ECAM lives at
+                    // `0x4010_0000_0000` (4 TiB) — outside our
+                    // identity map. The lowmem alternative at
+                    // `0x3F00_0000` is what fits in lo_L1[0] today.
+                    // We only run the walker when the DTB-supplied
+                    // base is in the low-4-GiB identity-mapped
+                    // window; higher addresses get logged + skipped.
+                    // SAFETY: same FDT walk preconditions.
+                    if let Some((ecam_base, ecam_size)) = unsafe {
+                        scan_reg_in_node(struct_slice, &mut cursor, hdr, base)
+                    } {
+                        depth += 1;
+                        if ecam_base < 0x1_0000_0000 && ecam_size > 0 {
+                            // 1 MiB per bus per ECAM convention.
+                            let n_buses = (ecam_size / 0x10_0000)
+                                .min(crate::pcie::MAX_BUSES as u64) as u16;
+                            // SAFETY: DTB asserts the ECAM region is
+                            // mapped Device memory by the firmware /
+                            // boot stub for low-4-GiB addresses; the
+                            // walker only does aligned 4-byte reads
+                            // and skips unpopulated slots.
+                            let pcie = unsafe {
+                                crate::pcie::enumerate_n(
+                                    PhysAddr::new(ecam_base), n_buses)
+                            };
+                            out.extend(pcie);
+                        }
                         depth -= 1;
                         continue;
                     }
@@ -338,6 +374,14 @@ unsafe fn fdt_string<'a>(base: *const u8, hdr: &FdtHeader, off: usize) -> Option
 fn is_virtio_mmio_node(name: &[u8]) -> bool {
     // FDT node names look like "virtio_mmio@a000000" — match prefix.
     const PFX: &[u8] = b"virtio_mmio";
+    name.starts_with(PFX)
+}
+
+fn is_pcie_node(name: &[u8]) -> bool {
+    // QEMU virt's PCIe host bridge appears as "pcie@10000000". Other
+    // platforms may use slightly different unit-address suffixes;
+    // matching by prefix keeps us flexible.
+    const PFX: &[u8] = b"pcie@";
     name.starts_with(PFX)
 }
 

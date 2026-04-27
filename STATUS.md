@@ -509,14 +509,21 @@ The critical-path Stage-2 items remaining:
    MSI during the I/O.
 
    PCIe ECAM walker is now shared between arches via `bus::pcie`.
-   x86_64 (q35, 256-bus ECAM) walks live; aarch64 (QEMU virt,
-   16-bus ECAM) has the constants + the shared walker but no live
-   walk yet — QEMU's host bridge aborts naked reads of
-   `0x3F00_0000` until it's programmed via DTB-described init,
-   and we don't parse the relevant DTB properties yet (`bus-range`,
-   `reg`, `ranges`). That's the only remaining "real driver"
-   blocker on aarch64; once it lands, every IRQ + DMA + BAR + MSI-X
-   + ITS surface aarch64 already exposes connects to live PCIe.
+   x86_64 (q35, 256-bus ECAM) walks live. aarch64 also walks live
+   via DTB-driven host-bridge discovery: `bus::aarch64::walk_fdt`
+   recognises `pcie@…` nodes, parses the `reg` property for the
+   ECAM base + size, and calls `pcie::enumerate_n` with the
+   DTB-supplied parameters. The DTB itself is generated on demand
+   by xtask (`qemu-system-aarch64 …,dumpdtb=…`) and force-loaded
+   into RAM at `0x4F00_0000` via `-device loader,…` since QEMU's
+   `-kernel <elf>` path doesn't pass a DTB pointer in x0 the way a
+   Linux Image would. `boot::aarch64::scan_for_dtb` checks the
+   xtask-loaded address first, then falls back to scanning RAM
+   for the FDT magic. The QEMU machine line gains
+   `highmem-ecam=off` to keep the ECAM in the lo_L1[0] Device-mapped
+   1 GiB block and an `nvme,drive=nvm0` device so the walker has
+   something to find. `smoke_bus_pcie_dtb_aarch64` asserts the
+   00:00.0 host bridge appears in the registry post-walk.
 
 2. **Higher-half kernel relocation**. Conventional -2 GiB layout.
    Touches the linker script, boot.S (far-jump-to-virtual after

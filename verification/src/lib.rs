@@ -1197,23 +1197,40 @@ fn smoke_bus_enumerates_pcie() -> TestResult {
 kernel_test!(smoke_bus_enumerates_pcie);
 
 #[cfg(target_arch = "aarch64")]
-fn smoke_bus_pcie_walker_shared_with_x86() -> TestResult {
-    // Structural: the shared `pcie::enumerate_n` is reachable on
-    // aarch64 and the QEMU virt ECAM constants are in place. We
-    // can't actually walk live ECAM yet — QEMU's PCIe host bridge
-    // requires DTB-driven programming before bare reads work — so
-    // the test verifies the surface exists rather than hitting MMIO.
-    use narf_bus::aarch64::{VIRT_PCIE_ECAM_BASE, VIRT_PCIE_NUM_BUSES};
-    if VIRT_PCIE_ECAM_BASE.raw() != 0x3F00_0000 {
-        return TestResult::Fail("VIRT_PCIE_ECAM_BASE constant changed unexpectedly");
+fn smoke_bus_pcie_dtb_aarch64() -> TestResult {
+    // The boot-time `bus::init` discovers the `pcie@10000000` node
+    // via the DTB walker, parses its `reg` property for the ECAM
+    // base, and runs the shared walker. Other smokes that do
+    // `init(None)` reset the registry; re-init explicitly with the
+    // xtask-loaded DTB physical address so this test is order-
+    // independent.
+    use narf_bus::{devices, BusKind};
+    use narf_memory::PhysAddr;
+    // SAFETY: xtask loads the DTB at this address; identity-mapped.
+    let _ = unsafe {
+        narf_bus::init(Some(PhysAddr::new(0x4F00_0000)))
+    };
+    let devs = devices();
+    let n_pcie = devs.iter()
+        .filter(|d| matches!(&d.kind, BusKind::Pcie { .. }))
+        .count();
+    if n_pcie == 0 {
+        return TestResult::Fail(
+            "DTB walk yielded no PCIe devices on aarch64 — host bridge missing");
     }
-    if VIRT_PCIE_NUM_BUSES != 16 {
-        return TestResult::Fail("VIRT_PCIE_NUM_BUSES changed unexpectedly");
+    // QEMU virt's host bridge appears at 00:00.0 by convention.
+    let has_root = devs.iter().any(|d| matches!(
+        &d.kind,
+        BusKind::Pcie { addr, .. }
+            if addr.bus == 0 && addr.device == 0 && addr.function == 0
+    ));
+    if !has_root {
+        return TestResult::Fail("no 00:00.0 PCIe host bridge entry on aarch64");
     }
     TestResult::Pass
 }
 #[cfg(target_arch = "aarch64")]
-kernel_test!(smoke_bus_pcie_walker_shared_with_x86);
+kernel_test!(smoke_bus_pcie_dtb_aarch64);
 
 #[cfg(target_arch = "aarch64")]
 fn smoke_bus_enumerates_virtio_mmio() -> TestResult {
