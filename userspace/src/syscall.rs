@@ -194,6 +194,15 @@ pub enum Syscall {
     /// or read-only FS.
     Fallocate    = 126,
 
+    /// `arg0 = fd_in`, `arg1 = fd_out`, `arg2 = off_in` (u64,
+    /// `!0` = use cur), `arg3 = off_out` (u64, `!0` = use cur),
+    /// `arg4 = len`, `arg5 = flags` (must be 0). Linux
+    /// copy_file_range(2): in-kernel copy between two file
+    /// descriptors. NARF executes a chunked read-then-write
+    /// loop. Returns the byte count copied on success, -1 on
+    /// bad fd / non-zero flags.
+    CopyFileRange = 127,
+
     /// `arg0 = pipefd_out_ptr`, `arg1 = flags`. Linux pipe2(2):
     /// pipe + atomic flag set. Honoured flag: O_CLOEXEC (bit
     /// 0x80000) — both ends get FD_CLOEXEC stamped at install
@@ -540,6 +549,7 @@ impl Syscall {
             124 => Syscall::Fdatasync,
             125 => Syscall::Pipe2,
             126 => Syscall::Fallocate,
+            127 => Syscall::CopyFileRange,
             120 => Syscall::Mmap,
             121 => Syscall::Munmap,
             130 => Syscall::RingKick,

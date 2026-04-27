@@ -1023,6 +1023,86 @@ fn sys_fallocate(ctx: &mut dyn TrapContext) {
     }
 }
 
+// ── CopyFileRange — chunked file→file copy ─────────────────────────
+//
+// Linux copy_file_range(2): in-kernel copy without bouncing the
+// data through user memory. Real consumers (cp, rsync, container
+// runtimes) prefer this over the read/write loop. NARF's MemFs
+// has no special "copy without unmapping pages" path; we just
+// read into a stack chunk and write it out, advancing the
+// per-fd cursor when the offset arg is `!0` (sentinel = "use
+// cur") and leaving the cursor alone when an explicit offset is
+// supplied.
+
+const CFR_USE_CUR: u64 = !0;
+
+fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let fd_in   = args.arg0 as u32;
+    let fd_out  = args.arg1 as u32;
+    let off_in  = args.arg2;
+    let off_out = args.arg3;
+    let len     = args.arg4 as usize;
+    let flags   = args.arg5;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+
+    if flags != 0 {
+        ctx.set_return(fail);
+        return;
+    }
+    if len == 0 {
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+
+    // Resolve both ops + their starting offsets up-front so we
+    // don't hold the fd table lock across the FsFuture polls.
+    let task = current_task_id();
+    let resolved = fd::with_table(task, |t| {
+        let in_e  = t.get(fd_in)?;
+        let in_off  = if off_in  == CFR_USE_CUR { in_e.offset } else { off_in };
+        let out_e = t.get(fd_out)?;
+        let out_off = if off_out == CFR_USE_CUR { out_e.offset } else { off_out };
+        Some((in_e.ops.clone(), in_off, out_e.ops.clone(), out_off))
+    });
+    let (in_ops, mut cur_in, out_ops, mut cur_out) = match resolved {
+        Some(Some(t)) => t,
+        _             => { ctx.set_return(fail); return; }
+    };
+
+    let mut chunk = [0u8; 4096];
+    let mut copied = 0usize;
+    while copied < len {
+        let span = core::cmp::min(len - copied, chunk.len());
+        let read_n = poll_once(in_ops.read(cur_in, &mut chunk[..span]))
+            .and_then(|r| r.ok())
+            .unwrap_or(0);
+        if read_n == 0 { break; }
+        let write_n = poll_once(out_ops.write(cur_out, &chunk[..read_n]))
+            .and_then(|r| r.ok())
+            .unwrap_or(0);
+        if write_n == 0 { break; }
+        copied  += write_n;
+        cur_in  += write_n as u64;
+        cur_out += write_n as u64;
+        if write_n < read_n { break; }
+    }
+
+    // Advance the per-fd cursors when the corresponding offset
+    // arg was the "use cur" sentinel.
+    let _ = fd::with_table(task, |t| {
+        if off_in == CFR_USE_CUR {
+            if let Some(e) = t.get_mut(fd_in)  { e.offset = cur_in;  }
+        }
+        if off_out == CFR_USE_CUR {
+            if let Some(e) = t.get_mut(fd_out) { e.offset = cur_out; }
+        }
+        Some(())
+    });
+
+    ctx.set_return(SyscallReturn::ok(copied as u64));
+}
+
 // ── Fsync / Fdatasync — flush stubs ────────────────────────────────
 //
 // NARF's filesystems are in-memory; there's nothing to flush. We
@@ -3172,6 +3252,8 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Fdatasync, "fdatasync", RawFnHandler(sys_fsync));
     table.install_raw(Syscall::Pipe2,     "pipe2",     RawFnHandler(sys_pipe2));
     table.install_raw(Syscall::Fallocate, "fallocate", RawFnHandler(sys_fallocate));
+    table.install_raw(Syscall::CopyFileRange, "copy_file_range",
+        RawFnHandler(sys_copy_file_range));
 
     // Tier-2 cwd state + nanosleep wired into the table. Sleep
     // already replaced the noop_ok stub above.

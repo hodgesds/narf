@@ -12958,3 +12958,120 @@ fn smoke_userspace_fallocate_extends_and_zero_ranges_memfile() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_userspace_fallocate_extends_and_zero_ranges_memfile);
+
+fn smoke_userspace_copy_file_range_round_trip() -> TestResult {
+    use narf_filesystem::{
+        bootstrap_mount_authority, registry, MemFs,
+    };
+    use narf_userspace::{install_core_syscalls, install_global,
+                         kernel_syscall_entry, syscall::__test_clear_global,
+                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+                         TrapContext};
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+    narf_userspace::fd::__test_reset();
+    narf_userspace::fd::init();
+
+    let auth = bootstrap_mount_authority();
+    let _ = registry().mount(&auth, "/cfr", MemFs::with_seeds(
+        "cfr-test",
+        &[("src", b"abcdefghij"), ("dst", b"")],
+    ));
+
+    fn open(path: &str) -> Option<u32> {
+        struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+        impl TrapContext for FakeCtx {
+            fn args(&self) -> &SyscallArgs { &self.args }
+            fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+            fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        }
+        let mut ctx = FakeCtx {
+            args: SyscallArgs {
+                arg0: path.as_ptr() as u64,
+                arg1: path.len() as u64,
+                ..SyscallArgs::default()
+            },
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::OpenFile.raw(), &mut ctx);
+        match ctx.ret {
+            Some(r) if r.value != !0u64 => Some(r.value as u32),
+            _ => None,
+        }
+    }
+
+    let fd_in  = match open("/cfr/src") { Some(f) => f, None => return TestResult::Fail("open src failed") };
+    let fd_out = match open("/cfr/dst") { Some(f) => f, None => return TestResult::Fail("open dst failed") };
+
+    // Copy 5 bytes from src@0 → dst@0. !0 sentinel means "use cur",
+    // explicit 0 means "start at 0 without moving the cursor".
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: fd_in as u64,
+            arg1: fd_out as u64,
+            arg2: 0,
+            arg3: 0,
+            arg4: 5,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::CopyFileRange.raw(), &mut ctx);
+    let copied = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value,
+        _ => return TestResult::Fail("copy_file_range did not return OK"),
+    };
+    if copied != 5 {
+        return TestResult::Fail("copy_file_range did not copy 5 bytes");
+    }
+
+    // Verify dst contents via a positional read.
+    let mut buf = [0u8; 5];
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: fd_out as u64,
+            arg1: buf.as_mut_ptr() as u64,
+            arg2: buf.len() as u64,
+            arg3: 0,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Pread64.raw(), &mut ctx);
+    if &buf != b"abcde" {
+        return TestResult::Fail("dst contents wrong after copy_file_range");
+    }
+
+    // flags != 0 rejected.
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: fd_in as u64,
+            arg1: fd_out as u64,
+            arg2: 0, arg3: 0, arg4: 1,
+            arg5: 1,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::CopyFileRange.raw(), &mut ctx);
+    let flags_rejected = matches!(
+        ctx.ret,
+        Some(r) if r.status == SyscallReturn::OK && r.value == (-1i64) as u64,
+    );
+    if !flags_rejected {
+        return TestResult::Fail("copy_file_range did not reject non-zero flags");
+    }
+
+    narf_userspace::fd::__test_reset();
+    __test_clear_global();
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_copy_file_range_round_trip);

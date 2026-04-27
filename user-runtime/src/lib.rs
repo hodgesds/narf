@@ -68,6 +68,7 @@ pub const SYS_FSYNC:          u64 = 123;
 pub const SYS_FDATASYNC:      u64 = 124;
 pub const SYS_PIPE2:          u64 = 125;
 pub const SYS_FALLOCATE:      u64 = 126;
+pub const SYS_COPY_FILE_RANGE: u64 = 127;
 pub const SYS_GETHOSTNAME:    u64 = 146;
 pub const SYS_SETHOSTNAME:    u64 = 147;
 pub const SYS_GETRLIMIT:      u64 = 148;
@@ -245,6 +246,26 @@ unsafe fn syscall5(
     rax
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn syscall6(
+    num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64,
+) -> u64 {
+    let mut rax = num;
+    // SAFETY: r9 is the 6th-arg register per the kernel convention.
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inout("rax") rax,
+            in("rdi") a0, in("rsi") a1, inout("rdx") a2 => _,
+            in("r10") a3, in("r8") a4, in("r9") a5,
+            out("rcx") _, out("r11") _,
+            options(nostack, preserves_flags),
+        );
+    }
+    rax
+}
+
 // aarch64: x8 = number, x0..x5 = args, return in x0. svc #0 enters
 // the lower-EL sync vector which routes via
 // `rust_aarch64_sync_dispatch`.
@@ -344,6 +365,25 @@ unsafe fn syscall5(
             in("x8") num,
             inout("x0") a0 => ret,
             in("x1") a1, in("x2") a2, in("x3") a3, in("x4") a4,
+            options(nostack, preserves_flags),
+        );
+    }
+    ret
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn syscall6(
+    num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64,
+) -> u64 {
+    let mut ret: u64;
+    // SAFETY: see `syscall0`.
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") num,
+            inout("x0") a0 => ret,
+            in("x1") a1, in("x2") a2, in("x3") a3, in("x4") a4, in("x5") a5,
             options(nostack, preserves_flags),
         );
     }
@@ -1081,6 +1121,32 @@ pub fn pipe() -> Option<(u32, u32)> {
     } else {
         Some((fds[0] as u32, fds[1] as u32))
     }
+}
+
+/// `copy_file_range(fd_in, fd_out, off_in, off_out, len, flags)` —
+/// in-kernel copy between two open files. `off_in` and `off_out`
+/// of `!0` mean "use the per-fd cursor"; any other value is the
+/// explicit offset to start at and leaves the cursor alone.
+/// flags must be 0.
+#[inline]
+pub fn copy_file_range(
+    fd_in:  u32,
+    fd_out: u32,
+    off_in:  u64,
+    off_out: u64,
+    len:     usize,
+    flags:   u32,
+) -> isize {
+    // SAFETY: SYS_COPY_FILE_RANGE signature:
+    //   (fd_in, fd_out, off_in, off_out, len, flags).
+    let r = unsafe {
+        syscall6(
+            SYS_COPY_FILE_RANGE,
+            fd_in as u64, fd_out as u64,
+            off_in, off_out, len as u64, flags as u64,
+        )
+    };
+    r as isize
 }
 
 /// `fallocate(fd, mode, offset, len)` — preallocate file space.
