@@ -212,6 +212,53 @@ pub unsafe extern "C" fn ftruncate(fd: c_int, len: off_t) -> c_int {
     narf_user_runtime::ftruncate(fd as u32, len as u64)
 }
 
+/// `readlink(path, buf, bufsiz)` — read a symlink target. NARF
+/// doesn't ship a symlink implementation, so this always returns
+/// -1; consumers fall back accordingly.
+///
+/// # Safety
+/// `path` must be NUL-terminated; `buf` must be writable for
+/// `bufsiz` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn readlink(
+    path:   *const c_char,
+    buf:    *mut c_char,
+    bufsiz: usize,
+) -> ssize_t {
+    if path.is_null() || buf.is_null() || bufsiz == 0 { return -1; }
+    // SAFETY: caller-asserted NUL-terminator.
+    let s = unsafe { cstr_to_str(path) };
+    // SAFETY: caller-asserted writable region.
+    let slice = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, bufsiz) };
+    narf_user_runtime::readlink(s, slice) as ssize_t
+}
+
+/// `symlink(target, linkpath)` — Stage-4 stub returning -1.
+///
+/// # Safety
+/// Both pointers must be NUL-terminated C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn symlink(
+    target:   *const c_char,
+    linkpath: *const c_char,
+) -> c_int {
+    if target.is_null() || linkpath.is_null() { return -1; }
+    // SAFETY: caller-asserted NUL-terminators.
+    let t = unsafe { cstr_to_str(target) };
+    let l = unsafe { cstr_to_str(linkpath) };
+    narf_user_runtime::symlink(t, l)
+}
+
+/// `link(old, new)` — hard link. NARF has no hard-link surface;
+/// stub returning -1 so consumers fall back to copy.
+///
+/// # Safety
+/// Both pointers must be NUL-terminated C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn link(_old: *const c_char, _new: *const c_char) -> c_int {
+    -1
+}
+
 /// `fsync(fd)` — request a flush of buffered writes. NARF FSes
 /// are in-memory so the call is structural.
 #[unsafe(no_mangle)]

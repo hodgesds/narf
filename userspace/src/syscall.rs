@@ -361,6 +361,18 @@ pub enum Syscall {
     /// failure.
     Rename       = 192,
 
+    /// `arg0 = path_ptr`, `arg1 = path_len`, `arg2 = buf_ptr`,
+    /// `arg3 = buf_len`. POSIX readlink. NARF has no symlink
+    /// implementation; we always return -1 (the user's libc shim
+    /// translates that to EINVAL "not a symlink"). Wired so a
+    /// utility that probes optional symlink expansion sees a sane
+    /// failure rather than a hang.
+    Readlink     = 193,
+
+    /// `arg0 = target_ptr`, `arg1 = target_len`, `arg2 = link_ptr`,
+    /// `arg3 = link_len`. POSIX symlink. Stub returning -1.
+    Symlink      = 194,
+
     /// `arg0 = path_ptr`, `arg1 = path_len`, `arg2 = cursor` (entry
     /// index, 0-based), `arg3 = out_buf_ptr`, `arg4 = out_buf_len`.
     /// Resolve the absolute path to a directory and serialise the
@@ -445,6 +457,8 @@ impl Syscall {
             190 => Syscall::Mkdir,
             191 => Syscall::Rmdir,
             192 => Syscall::Rename,
+            193 => Syscall::Readlink,
+            194 => Syscall::Symlink,
             195 => Syscall::Listdir,
             200 => Syscall::GetRandom,
             _   => return None,

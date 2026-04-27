@@ -46,6 +46,8 @@ pub const SYS_WRITE:          u64 = 112;
 pub const SYS_CLOSE:          u64 = 113;
 // Tier-2 fd-table breadth + path resolution + pipe (115..=117 reserved).
 pub const SYS_GETRANDOM:      u64 = 200;
+pub const SYS_READLINK:       u64 = 193;
+pub const SYS_SYMLINK:        u64 = 194;
 pub const SYS_LISTDIR:        u64 = 195;
 pub const SYS_STAT:           u64 = 115;
 pub const SYS_FSTAT:          u64 = 116;
@@ -811,6 +813,38 @@ pub fn rename(old_path: &str, new_path: &str) -> i32 {
             SYS_RENAME,
             old_path.as_ptr() as u64, old_path.len() as u64,
             new_path.as_ptr() as u64, new_path.len() as u64,
+        )
+    };
+    if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `readlink(path, buf)` — read a symlink target. NARF has no
+/// symlink implementation; this always returns -1.
+#[inline]
+pub fn readlink(path: &str, buf: &mut [u8]) -> isize {
+    if path.is_empty() || buf.is_empty() { return -1; }
+    // SAFETY: SYS_READLINK signature: (path_ptr, path_len, buf_ptr, buf_len).
+    let r = unsafe {
+        syscall4(
+            SYS_READLINK,
+            path.as_ptr() as u64, path.len() as u64,
+            buf.as_mut_ptr() as u64, buf.len() as u64,
+        )
+    };
+    r as isize
+}
+
+/// `symlink(target, link)` — create a symlink. Stage-4 stub returns -1.
+#[inline]
+pub fn symlink(target: &str, link: &str) -> i32 {
+    if target.is_empty() || link.is_empty() { return -1; }
+    // SAFETY: SYS_SYMLINK signature:
+    //   (target_ptr, target_len, link_ptr, link_len).
+    let r = unsafe {
+        syscall4(
+            SYS_SYMLINK,
+            target.as_ptr() as u64, target.len() as u64,
+            link.as_ptr() as u64, link.len() as u64,
         )
     };
     if r as i64 == -1 { -1 } else { 0 }

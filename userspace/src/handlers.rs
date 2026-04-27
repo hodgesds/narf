@@ -1239,6 +1239,23 @@ fn sys_rename(ctx: &mut dyn TrapContext) {
     }
 }
 
+// ── Readlink / Symlink stubs ───────────────────────────────────────
+//
+// NARF has no symlink implementation; both syscalls just refuse
+// with -1 so consumers fall back. readlink in particular is often
+// probed at startup ("does $PATH/foo expand?") and a refuse-with-
+// fallback is the right shape.
+
+fn sys_readlink(ctx: &mut dyn TrapContext) {
+    // Don't dereference the user pointers — we know we're going
+    // to fail before reading them.
+    ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+}
+
+fn sys_symlink(ctx: &mut dyn TrapContext) {
+    ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+}
+
 // ── Listdir — arg0=path, arg1=path_len, arg2=cursor,
 //             arg3=out_buf, arg4=out_buf_len ────────────────────────
 //
@@ -2555,6 +2572,8 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Mkdir,  "mkdir",  RawFnHandler(sys_mkdir));
     table.install_raw(Syscall::Rmdir,  "rmdir",  RawFnHandler(sys_rmdir));
     table.install_raw(Syscall::Rename, "rename", RawFnHandler(sys_rename));
+    table.install_raw(Syscall::Readlink, "readlink", RawFnHandler(sys_readlink));
+    table.install_raw(Syscall::Symlink,  "symlink",  RawFnHandler(sys_symlink));
     table.install_raw(Syscall::Listdir, "listdir", RawFnHandler(sys_listdir));
 
     // Tier-3z entropy.

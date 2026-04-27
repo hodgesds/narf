@@ -142,12 +142,12 @@ pub use path::{
 };
 pub use posix::{
     access, close as posix_close, fdatasync, fsync, ftruncate, gethostname,
-    getpagesize, lseek as posix_lseek, mkdir as posix_mkdir, open as posix_open,
-    pread, pwrite, read as posix_read, rename as posix_rename,
-    rmdir as posix_rmdir, sethostname, sync, sysconf, truncate,
-    unlink as posix_unlink, write as posix_write, O_APPEND, O_CREAT, O_RDONLY,
-    O_RDWR, O_TRUNC, O_WRONLY, SEEK_CUR, SEEK_END, SEEK_SET, _SC_OPEN_MAX,
-    _SC_PAGESIZE, _SC_PAGE_SIZE,
+    getpagesize, link, lseek as posix_lseek, mkdir as posix_mkdir,
+    open as posix_open, pread, pwrite, read as posix_read, readlink,
+    rename as posix_rename, rmdir as posix_rmdir, sethostname, symlink,
+    sync, sysconf, truncate, unlink as posix_unlink, write as posix_write,
+    O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, SEEK_CUR, SEEK_END,
+    SEEK_SET, _SC_OPEN_MAX, _SC_PAGESIZE, _SC_PAGE_SIZE,
 };
 pub use sys::{
     dlclose, dlerror, dlopen, dlsym, getrlimit, getrusage, madvise, mlock, mlockall,
