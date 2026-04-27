@@ -13222,3 +13222,86 @@ fn smoke_userspace_futex_wait_and_wake_no_op() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_userspace_futex_wait_and_wake_no_op);
+
+fn smoke_userspace_memfd_create_returns_writable_fd() -> TestResult {
+    use narf_userspace::{install_core_syscalls, install_global,
+                         kernel_syscall_entry, syscall::__test_clear_global,
+                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+                         TrapContext};
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+    narf_userspace::fd::__test_reset();
+    narf_userspace::fd::init();
+
+    let name = "anon-1";
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: name.as_ptr() as u64,
+            arg1: name.len() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::MemfdCreate.raw(), &mut ctx);
+    let fd = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK
+                && r.value != (-1i64) as u64 => r.value as u32,
+        _ => return TestResult::Fail("memfd_create did not return a fd"),
+    };
+
+    // Write 4 bytes via SYS_WRITE, read them back via SYS_READ.
+    let payload = b"narf";
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: fd as u64,
+            arg1: payload.as_ptr() as u64,
+            arg2: payload.len() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Write.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 4) {
+        return TestResult::Fail("write to memfd did not write 4 bytes");
+    }
+
+    // Seek back to 0 then read.
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: fd as u64, arg1: 0, arg2: 0,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Lseek.raw(), &mut ctx);
+
+    let mut buf = [0u8; 4];
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: fd as u64,
+            arg1: buf.as_mut_ptr() as u64,
+            arg2: buf.len() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Read.raw(), &mut ctx);
+    if &buf != b"narf" {
+        return TestResult::Fail("read-back from memfd contents wrong");
+    }
+
+    let _ = narf_userspace::fd::with_table(0, |t| t.close(fd));
+    narf_userspace::fd::__test_reset();
+    __test_clear_global();
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_memfd_create_returns_writable_fd);

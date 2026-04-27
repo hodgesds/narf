@@ -1103,6 +1103,36 @@ fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(copied as u64));
 }
 
+// ── memfd_create — anonymous in-memory file ────────────────────────
+//
+// Linux memfd_create(2): mint a fresh in-memory file backed by a
+// fresh (no directory entry) MemFile, install it in the caller's
+// fd table, return the fd. The name is recorded for debug-only
+// introspection; we don't preserve it in NARF today (no
+// /proc-style listing). Real consumers (sandboxes, IPC, tmpfile)
+// rely on the surface alone.
+
+fn sys_memfd_create(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let _name_ptr = args.arg0;
+    let _name_len = args.arg1;
+    let _flags    = args.arg2;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+
+    let ops = narf_filesystem::new_anon_memfile();
+    let task = current_task_id();
+    let fd = fd::with_table(task, |t| {
+        t.open(crate::fd::FdEntry { ops, offset: 0, flags: 0 })
+    });
+    // `with_table` returns `Option<u32>` (the fd or None on
+    // exhaustion); the outer Option signals "no fd table for the
+    // task". Both must be Some(Some(n)) for success.
+    match fd {
+        Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
+        None    => ctx.set_return(fail),
+    }
+}
+
 // ── Fsync / Fdatasync — flush stubs ────────────────────────────────
 //
 // NARF's filesystems are in-memory; there's nothing to flush. We
@@ -3324,6 +3354,8 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Fallocate, "fallocate", RawFnHandler(sys_fallocate));
     table.install_raw(Syscall::CopyFileRange, "copy_file_range",
         RawFnHandler(sys_copy_file_range));
+    table.install_raw(Syscall::MemfdCreate, "memfd_create",
+        RawFnHandler(sys_memfd_create));
 
     // Tier-2 cwd state + nanosleep wired into the table. Sleep
     // already replaced the noop_ok stub above.

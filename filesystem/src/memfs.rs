@@ -35,6 +35,15 @@ struct MemFile {
     bytes: IrqSafeSpinLock<Vec<u8>>,
 }
 
+/// Mint a fresh empty in-memory file outside any directory. The
+/// returned `FileOps` handle owns the storage; dropping the last
+/// reference frees the bytes. Used by `sys_memfd_create` so an
+/// anonymous fd can back a real `MemFile` without occupying a
+/// VFS path.
+pub fn new_anon_file() -> Arc<dyn FileOps> {
+    Arc::new(MemFile { bytes: IrqSafeSpinLock::new(Vec::new()) })
+}
+
 impl fmt::Debug for MemFile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MemFile")

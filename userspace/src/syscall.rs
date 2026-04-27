@@ -203,6 +203,15 @@ pub enum Syscall {
     /// bad fd / non-zero flags.
     CopyFileRange = 127,
 
+    /// `arg0 = name_ptr`, `arg1 = name_len` (debug only),
+    /// `arg2 = flags` (accepted-and-ignored). Linux
+    /// memfd_create(2): create an unnamed in-memory file and
+    /// install it in the calling task's fd table. Returns the
+    /// new fd on success, -1 on bad input or fd-table exhaustion.
+    /// The name is recorded only for debug introspection (no
+    /// directory entry), matching the spec.
+    MemfdCreate  = 128,
+
     /// `arg0 = pipefd_out_ptr`, `arg1 = flags`. Linux pipe2(2):
     /// pipe + atomic flag set. Honoured flag: O_CLOEXEC (bit
     /// 0x80000) — both ends get FD_CLOEXEC stamped at install
@@ -573,6 +582,7 @@ impl Syscall {
             125 => Syscall::Pipe2,
             126 => Syscall::Fallocate,
             127 => Syscall::CopyFileRange,
+            128 => Syscall::MemfdCreate,
             120 => Syscall::Mmap,
             121 => Syscall::Munmap,
             130 => Syscall::RingKick,

@@ -101,6 +101,29 @@ pub unsafe fn pipe(pipefd: *mut i32) -> i32 {
     }
 }
 
+/// `memfd_create(name, flags)` — Linux memfd_create(2). Returns
+/// a fresh fd backing an anonymous in-memory file, or -1 on
+/// failure. `name` is debug-only; not visible via any FS path.
+///
+/// # Safety
+/// `name` must be a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memfd_create(name: *const i8, flags: u32) -> i32 {
+    if name.is_null() { return -1; }
+    // SAFETY: caller-asserted NUL-terminator. Walk to find length.
+    let mut len = 0usize;
+    unsafe {
+        while *name.add(len) != 0 { len += 1; }
+    }
+    // SAFETY: in-bounds `len` per the walk above.
+    let bytes = unsafe { core::slice::from_raw_parts(name as *const u8, len) };
+    let s = match core::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    narf_user_runtime::memfd_create(s, flags)
+}
+
 /// `pipe2(pipefd, flags)` — Linux-shaped pipe with atomic flag
 /// set. Honoured: `O_CLOEXEC` (0x80000) stamps FD_CLOEXEC on both
 /// halves. `O_NONBLOCK` accepted and ignored.

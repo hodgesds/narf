@@ -69,6 +69,7 @@ pub const SYS_FDATASYNC:      u64 = 124;
 pub const SYS_PIPE2:          u64 = 125;
 pub const SYS_FALLOCATE:      u64 = 126;
 pub const SYS_COPY_FILE_RANGE: u64 = 127;
+pub const SYS_MEMFD_CREATE:   u64 = 128;
 pub const SYS_GETHOSTNAME:    u64 = 146;
 pub const SYS_SETHOSTNAME:    u64 = 147;
 pub const SYS_GETRLIMIT:      u64 = 148;
@@ -1148,6 +1149,20 @@ pub fn pipe() -> Option<(u32, u32)> {
     } else {
         Some((fds[0] as u32, fds[1] as u32))
     }
+}
+
+/// `memfd_create(name, flags)` — create an anonymous in-memory
+/// file. Returns a fresh fd or -1.
+#[inline]
+pub fn memfd_create(name: &str, flags: u32) -> i32 {
+    // SAFETY: SYS_MEMFD_CREATE signature: (name_ptr, name_len, flags).
+    let r = unsafe {
+        syscall3(
+            SYS_MEMFD_CREATE,
+            name.as_ptr() as u64, name.len() as u64, flags as u64,
+        )
+    };
+    if r as i64 == -1 { -1 } else { r as i32 }
 }
 
 /// `copy_file_range(fd_in, fd_out, off_in, off_out, len, flags)` —
