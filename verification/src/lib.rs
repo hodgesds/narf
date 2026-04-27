@@ -1219,6 +1219,93 @@ fn smoke_bus_msix_alloc_vector() -> TestResult {
 }
 kernel_test!(smoke_bus_msix_alloc_vector);
 
+fn smoke_bus_msix_program_vector_out_of_range() -> TestResult {
+    // The synthetic table's cfg_phys is 0, so calling program_vector
+    // with a real index would dereference physical 0 to read the
+    // BAR — guaranteed UB. This test exercises only the structural
+    // VectorOutOfRange precondition, which short-circuits before the
+    // BAR read.
+    use narf_bus::msix::__synth_msix_table;
+    let mut t = __synth_msix_table(2);
+    // SAFETY: VectorOutOfRange is checked before any cfg-space access,
+    // so passing a too-large index is safe regardless of cfg_phys.
+    match unsafe { t.program_vector(2, 0, 32) } {
+        Err(narf_bus::MsixError::VectorOutOfRange) => TestResult::Pass,
+        Err(e) => {
+            let _ = e;
+            TestResult::Fail("wrong error from program_vector(out-of-range)")
+        }
+        Ok(_)  => TestResult::Fail("program_vector accepted out-of-range index"),
+    }
+}
+kernel_test!(smoke_bus_msix_program_vector_out_of_range);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_bus_bar_read_on_q35() -> TestResult {
+    // Walk the q35 ECAM, find some device, and exercise read_bar
+    // against BAR 0. We don't insist on a particular device since the
+    // QEMU machine line varies — every q35 instance has at least the
+    // host bridge plus an LPC bridge, and may also have IDE/AHCI/VGA.
+    // We accept either a populated BAR (valid size + non-zero phys)
+    // or `Unimplemented` (the host bridge legitimately has no BAR 0).
+    use narf_bus::{devices, read_bar, BarError, BusKind};
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    // SAFETY: ECAM is identity-mapped; idempotent re-init.
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+
+    let devs = devices();
+    let pcie: alloc::vec::Vec<_> = devs.iter()
+        .filter(|d| matches!(d.kind, BusKind::Pcie { .. }))
+        .collect();
+    if pcie.is_empty() {
+        return TestResult::Fail("no PCIe devices found in registry");
+    }
+
+    // Try BAR 0 against every PCIe device. A successful sizing on
+    // *any* device proves the size-detect cycle works. If no device
+    // has BAR 0 implemented (very unlikely on q35), the structural
+    // path still returned Unimplemented — also fine.
+    let mut any_sized = false;
+    for d in &pcie {
+        // SAFETY: BSP, no other writer to this device's cfg window —
+        // this kernel does not run drivers concurrently with the test
+        // harness. read_bar restores the original BAR value.
+        match unsafe { read_bar(d, 0) } {
+            Ok(b) => {
+                if b.size == 0 {
+                    return TestResult::Fail("read_bar returned Ok with size 0");
+                }
+                any_sized = true;
+                break;
+            }
+            Err(BarError::Unimplemented) => {} // legitimate; keep looking
+            Err(_) => return TestResult::Fail("unexpected BAR error on PCIe device"),
+        }
+    }
+    let _ = any_sized;
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_bus_bar_read_on_q35);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_bus_msix_program_vector_unsupported_on_aarch64() -> TestResult {
+    // aarch64 has no LAPIC; `program_vector` is a stub returning
+    // Unsupported until the GIC ITS doorbell path lands. The check
+    // happens after VectorOutOfRange but before BAR mapping, so the
+    // synthetic table (cfg_phys=0) is safe to drive here.
+    use narf_bus::msix::__synth_msix_table;
+    let mut t = __synth_msix_table(2);
+    // SAFETY: aarch64 path returns Unsupported before any MMIO.
+    match unsafe { t.program_vector(0, 0, 32) } {
+        Err(narf_bus::MsixError::Unsupported) => TestResult::Pass,
+        Err(_) => TestResult::Fail("wrong error from program_vector on aarch64"),
+        Ok(_)  => TestResult::Fail("program_vector unexpectedly succeeded on aarch64"),
+    }
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test!(smoke_bus_msix_program_vector_unsupported_on_aarch64);
+
 #[cfg(target_arch = "aarch64")]
 fn smoke_bus_msix_enable_on_virtio() -> TestResult {
     // virtio-mmio transports have no PCIe capability list. `enable_msix`

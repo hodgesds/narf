@@ -20,6 +20,7 @@ narf-console       = { path = "../console" }
 narf-time          = { path = "../time" }
 narf-scheduler     = { path = "../scheduler" }
 narf-interrupts    = { path = "../interrupts" }
+narf-bus           = { path = "../bus" }
 narf-userspace     = { path = "../userspace" }
 narf-verification  = { path = "../verification", optional = true }
 

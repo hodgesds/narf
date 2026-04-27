@@ -33,6 +33,7 @@ extern crate alloc;
 
 pub mod acpi_notify;
 pub mod addr;
+pub mod bar;
 pub mod device;
 pub mod hotplug;
 pub mod msix;
@@ -47,6 +48,7 @@ pub mod x86_64;
 pub mod aarch64;
 
 pub use addr::{BusAddr, PcieAddr};
+pub use bar::{map_bar, read_bar, Bar, BarError, BarKind, MmioRegion, NUM_BARS};
 pub use device::{BusDevice, BusKind, DeviceId};
 pub use hotplug::{
     dispatch_event, register_listener, HotplugError, HotplugEvent, HotplugListener,

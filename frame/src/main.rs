@@ -272,6 +272,20 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             "  mmu: init failed: {e:?}");
                     }
                 }
+
+                // Bus enumeration. The MMU's identity map covers the
+                // q35 ECAM at 0xb000_0000, so the walker can read raw
+                // 4-byte cfg-space words without a separate mapping
+                // step. Real MCFG parsing (boot/) feeds the base in
+                // when ACPI lands; until then we use the QEMU default.
+                // SAFETY: ECAM_DEFAULT_BASE is identity-mapped; the
+                // walker only does naturally-aligned reads + rejects
+                // 0xFFFF vendors.
+                let n_dev = unsafe {
+                    narf_bus::init(narf_bus::x86_64::ECAM_DEFAULT_BASE)
+                };
+                let _ = writeln!(console::Writer,
+                    "  bus: PCIe ECAM walk found {} function(s)", n_dev);
             }
             #[cfg(target_arch = "aarch64")]
             {
@@ -288,6 +302,16 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             "  mmu: init failed: {e:?}");
                     }
                 }
+
+                // Bus enumeration. We don't pass a DTB pointer through
+                // the boot handoff yet, so the walker takes the
+                // virtio-mmio fallback (probes the known QEMU virt
+                // slots). Real DTB plumbing is a boot/ side-track.
+                // SAFETY: fallback path only touches identity-mapped
+                // virtio-mmio slots and tolerates absent magic.
+                let n_dev = unsafe { narf_bus::init(None) };
+                let _ = writeln!(console::Writer,
+                    "  bus: virtio-mmio probe found {} transport(s)", n_dev);
             }
         }
         Err(e) => {

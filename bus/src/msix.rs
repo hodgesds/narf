@@ -1,10 +1,17 @@
-//! MSI-X vector allocation path for PCIe devices.
+//! MSI-X vector allocation + programming path for PCIe devices.
 //!
-//! Spec: `bus/specification/spec.md` §3 + §5 — Stage 3 lands the
-//! discovery + enable surface. Per-vector LAPIC / GIC-ITS programming
-//! is Stage 4 (`interrupts/` + `arch/`); we stop at the point where a
-//! driver can ask "does this device have MSI-X, and how many vectors
-//! does its table contain?" and reserve slots without programming them.
+//! Spec: `bus/specification/spec.md` §3 + §5. Stage 3 landed the
+//! discovery + enable surface (cap walk + table-size sniff). Stage 4
+//! grows that into actual LAPIC-directed delivery on x86_64:
+//! `program_vector` does the BAR-mapped table write (msg_addr +
+//! msg_data + vector_control), and `enable` flips the
+//! Message-Control "MSI-X enable" bit so the device starts using the
+//! programmed entries.
+//!
+//! On aarch64 the same `program_vector` API will eventually emit a
+//! GIC ITS doorbell (`GITS_TRANSLATER` address + EventID), but the
+//! Stage-4 cut here is x86_64-only; aarch64 callers get an
+//! `Unsupported` error.
 //!
 //! Cap-gating: `enable_msix` takes the `Cap<BusDevice, Write>` the
 //! caller got from `claim_device_cap`. The `MsixTable` is `!Copy`; the
@@ -18,6 +25,7 @@ use core::sync::atomic::{compiler_fence, Ordering};
 use narf_capabilities::{Cap, CapError, Write};
 use narf_memory::PhysAddr;
 
+use crate::bar::{map_bar, BarError};
 use crate::device::{BusDevice, BusKind};
 use crate::registry::BusDeviceCap;
 
@@ -75,10 +83,22 @@ pub enum MsixError {
     /// Device has no PCIe cfg window (e.g. a virtio-mmio transport);
     /// MSI-X applies only to PCIe devices.
     NotPcie,
+    /// `program_vector` was given a vector index >= the table size.
+    VectorOutOfRange,
+    /// The BAR named by `MsixTable::bir()` couldn't be mapped (BAR
+    /// unimplemented / unprogrammed / out-of-range).
+    BarMapFailed,
+    /// MSI-X programming is not implemented on this arch (aarch64
+    /// stays a stub until the GIC ITS doorbell path lands).
+    Unsupported,
 }
 
 impl From<CapError> for MsixError {
     fn from(_: CapError) -> Self { MsixError::AuthorityRevoked }
+}
+
+impl From<BarError> for MsixError {
+    fn from(_: BarError) -> Self { MsixError::BarMapFailed }
 }
 
 /// Snapshot of a device's MSI-X table after `enable_msix`. Holding
@@ -97,8 +117,16 @@ pub struct MsixTable {
     /// Next free slot; reservations are monotonic within a table.
     next_free:     u16,
     /// Snapshot of the PCIe function the caller claimed. Stored so
-    /// vector programming (Stage 4) knows which config window to hit.
+    /// vector programming knows which config window to hit.
     cfg_phys:      PhysAddr,
+    /// BusDevice the table was discovered against. Stored so
+    /// `program_vector` can call `map_bar` without making the caller
+    /// thread the device through a second time.
+    device:        BusDevice,
+    /// Offset in cfg-space of the MSI-X capability header. Stage-4
+    /// uses this in `enable` to flip the Message-Control "MSI-X
+    /// enable" bit (bit 15 at cap_ptr + 2).
+    cap_offset:    u64,
 }
 
 impl MsixTable {
@@ -145,6 +173,119 @@ impl MsixTable {
         if self.free() < n { return Err(MsixError::TableOverflow); }
         self.next_free += n;
         Ok(())
+    }
+
+    /// Program a previously-allocated MSI-X table entry to deliver
+    /// IRQs to a target CPU's LAPIC at vector `irq_vector`.
+    ///
+    /// LAPIC-directed MSI on x86_64 (Intel SDM Vol 3 §10.11.1):
+    ///   - Address: `0xFEE0_0000 | (target_apic_id << 12)` with bits
+    ///     12..=11 of the field encoding redirection-hint / dest-mode
+    ///     left at 0 (physical, no redirection).
+    ///   - Data: bits 7..0 = vector, bits 10..8 = delivery-mode (0 =
+    ///     Fixed), bits 14 = level, 15 = trigger-mode (0 / 0 for
+    ///     edge-triggered Fixed delivery).
+    ///
+    /// The MSI-X table entry layout (PCIe §6.1.4) is four naturally
+    /// aligned u32s, total 16 bytes: `[msg_addr_lo, msg_addr_hi,
+    /// msg_data, vector_control]`. `vector_control` bit 0 is the
+    /// per-entry mask; we clear it here so the entry starts unmasked.
+    ///
+    /// The caller must have `enable_msix`-discovered the table on
+    /// `self.device`, and `enable()` must run before MSI delivery
+    /// actually starts (Message-Control's enable bit is the global
+    /// gate). Programming entries while disabled is the documented
+    /// PCIe-recommended order.
+    ///
+    /// On aarch64 this is a stub that returns `Unsupported` until the
+    /// GIC ITS doorbell path lands.
+    ///
+    /// # Safety
+    /// - The caller owns the device's BAR for the duration of this
+    ///   call (no other writer to the MSI-X table).
+    /// - `vector_idx` must have come from `alloc_vector` against
+    ///   `self`, otherwise this writes into a slot another driver may
+    ///   eventually claim.
+    pub unsafe fn program_vector(
+        &mut self,
+        vector_idx: u16,
+        target_apic_id: u32,
+        irq_vector: u8,
+    ) -> Result<MsixVector, MsixError> {
+        if vector_idx >= self.size { return Err(MsixError::VectorOutOfRange); }
+
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (target_apic_id, irq_vector);
+            return Err(MsixError::Unsupported);
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: caller holds the device exclusively. map_bar
+            // does the size-detection write/restore against cfg-space.
+            let region = unsafe { map_bar(&self.device, self.bir)? };
+
+            // LAPIC MSI address: 0xFEE0_0000 | (apic_id << 12).
+            // Bits 11..=4 are the destination APIC id for the
+            // physical / no-redirection case; we use bits 19..=12 for
+            // the standard 8-bit destination ID and leave the upper
+            // bits at zero (extended dest-id requires interrupt-
+            // remapping, which we don't gate on).
+            let msg_addr_lo: u32 = 0xFEE0_0000 | ((target_apic_id & 0xFF) << 12);
+            let msg_addr_hi: u32 = 0;
+            // Data: vector in bits 7..0, delivery-mode 000 = Fixed,
+            // level 0, trigger-mode 0 (edge). The remaining bits stay
+            // zero.
+            let msg_data:    u32 = irq_vector as u32;
+            // Vector control bit 0 = mask. Clear to unmask the entry.
+            let vec_ctrl:    u32 = 0;
+
+            let entry_off = self.table_offset as u64 + (vector_idx as u64) * 16;
+            // SAFETY: entry_off + 16 <= bar.size by spec — table_offset
+            // is u32-aligned and the table sits inside the BAR; map_bar
+            // returned `region.len` as the BAR size.
+            unsafe {
+                region.write32(entry_off,      msg_addr_lo);
+                region.write32(entry_off + 4,  msg_addr_hi);
+                region.write32(entry_off + 8,  msg_data);
+                region.write32(entry_off + 12, vec_ctrl);
+            }
+
+            Ok(MsixVector {
+                vector:  vector_idx,
+                address: ((msg_addr_hi as u64) << 32) | (msg_addr_lo as u64),
+                data:    msg_data,
+            })
+        }
+    }
+
+    /// Flip the MSI-X capability's "MSI-X enable" bit (Message
+    /// Control bit 15). After this returns, programmed entries
+    /// actually deliver. PCIe-recommended order: program first, then
+    /// enable.
+    ///
+    /// # Safety
+    /// Caller owns the device's cfg-space exclusively.
+    pub unsafe fn enable(&mut self) -> Result<(), MsixError> {
+        let off = self.cap_offset + 2;
+        // SAFETY: cap_offset came from the cap-list walk in
+        // `enable_msix` and is < 0x100; same window we read from
+        // during discovery.
+        let mc = unsafe { cfg_read16(self.cfg_phys, off) };
+        // SAFETY: same window; setting bit 15 is the documented
+        // global-enable.
+        unsafe { cfg_write16(self.cfg_phys, off, mc | (1 << 15)); }
+        Ok(())
+    }
+
+    /// `true` once `enable()` has flipped the MSI-X enable bit. Reads
+    /// the cap header live so re-enables are reflected.
+    pub fn is_enabled(&self) -> bool {
+        // SAFETY: cap_offset is the cached value from discovery, which
+        // confirmed it lives inside this function's cfg window.
+        let mc = unsafe { cfg_read16(self.cfg_phys, self.cap_offset + 2) };
+        (mc & (1 << 15)) != 0
     }
 }
 
@@ -215,6 +356,8 @@ pub fn enable_msix(
                 size,
                 next_free: 0,
                 cfg_phys,
+                device:     *device,
+                cap_offset: cap_ptr,
             });
         }
 
@@ -231,12 +374,21 @@ pub fn enable_msix(
 /// on a particular device's capability layout.
 #[doc(hidden)]
 pub fn __synth_msix_table(size: u16) -> MsixTable {
+    use crate::addr::{BusAddr, PcieAddr};
+    use crate::device::{BusKind, DeviceId};
+    let addr = PcieAddr::new(0, 0, 0, 0);
     MsixTable {
         bir:          0,
         table_offset: 0,
         size,
         next_free:    0,
         cfg_phys:     PhysAddr::new(0),
+        device:       BusDevice {
+            addr: BusAddr::Pcie(addr),
+            id:   DeviceId { vendor: 0, device: 0, class: 0 },
+            kind: BusKind::Pcie { addr, cfg_phys: PhysAddr::new(0) },
+        },
+        cap_offset:   0,
     }
 }
 
@@ -283,4 +435,18 @@ unsafe fn cfg_read32(cfg: PhysAddr, off: u64) -> u32 {
     let v = unsafe { core::ptr::read_volatile((cfg.raw() + off) as *const u32) };
     compiler_fence(Ordering::SeqCst);
     v
+}
+
+/// Write an aligned 16-bit word into an identity-mapped PCIe config
+/// window.
+///
+/// # Safety
+/// `cfg` + `off` must lie inside the function's 4-KiB cfg window and
+/// be 2-byte aligned. Caller owns the device exclusively.
+#[inline]
+unsafe fn cfg_write16(cfg: PhysAddr, off: u64, value: u16) {
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: caller promises the slot is writable + aligned.
+    unsafe { core::ptr::write_volatile((cfg.raw() + off) as *mut u16, value); }
+    compiler_fence(Ordering::SeqCst);
 }

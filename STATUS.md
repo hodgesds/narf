@@ -298,11 +298,23 @@ Remaining Stage 2 items (all additive / out of scope for local test):
   log2-bucket `Histogram` stub standing in for the Stage-4 tDigest.
   Real tDigest accuracy contract + per-CPU hazard-pointer handler
   table: Stage 4.
-- **`bus/`**: enumeration. PCIe ECAM walker on x86_64 (q35 default
-  `0xb000_0000`, MCFG deferred), FDT bus walker on aarch64 with a
-  QEMU-virt fallback layout, `BusDevice` / `BusKind::{Pcie, VirtioMmio}`
-  / `DeviceId`, read-only registry, `claim_device` stub. Hot-plug,
-  MSI-X, IOMMU-group coordination: Stage 4.
+- **`bus/`**: enumeration + BAR sizing + LAPIC-directed MSI-X
+  programming. PCIe ECAM walker on x86_64 (q35 default `0xb000_0000`,
+  MCFG deferred), FDT bus walker on aarch64 with a QEMU-virt fallback
+  layout, `BusDevice` / `BusKind::{Pcie, VirtioMmio}` / `DeviceId`,
+  read-only registry, `claim_device` stub. `bus::init` is now wired
+  into `frame::_start_rust` after MMU bring-up (x86_64 walks q35 ECAM,
+  aarch64 falls back to the virtio-mmio probe). `bus::bar` adds
+  `read_bar` (size detection via the standard write-all-1s / read-back
+  / restore cycle, decoding 32-bit MMIO / 64-bit MMIO / I/O BARs) and
+  `map_bar` returning an `MmioRegion` with volatile `read32`/`write32`.
+  `MsixTable::program_vector` writes the four-u32 MSI-X table entry
+  (msg_addr_lo = `0xFEE0_0000 | (apic_id<<12)`, msg_addr_hi = 0,
+  msg_data = vector, vector_control = 0); `MsixTable::enable` flips
+  the Message-Control "MSI-X enable" bit. aarch64 `program_vector`
+  returns `Unsupported` until the GIC ITS doorbell path lands.
+  Hot-plug, IOMMU-group coordination, real MCFG parsing: still later
+  waves.
 - **`scheduler/`**: per-task waker plumbing (Wave-0 + Stage-2 close)
   plus Stage-3 §3.3/§3.4 task-spec surface. Each `TaskSlot` owns an
   `Arc<AtomicBool>` awake flag; `Waker` vtable flips it via
@@ -431,11 +443,21 @@ cargo test -p narf-lib
 
 The critical-path Stage-2 items remaining:
 
-1. **Interrupt controller bring-up** (`interrupts/`). x2APIC init,
-   LAPIC timer → real IRQ handler driving the scheduler's waker.
-   ~300 LoC. Unblocks UIPI (remaining Stage 2) and preemption
-   (Stage 3). Today's scheduler busy-polls `Instant::now()`; with
-   a timer IRQ we'd use real wakers instead.
+1. **Interrupt controller bring-up** (`interrupts/`). ✓ landed —
+   x2APIC init + LAPIC-timer periodic IRQ + IRQ-vector IDT entries +
+   `rust_trap_handler` IRQ dispatch all wired into boot;
+   `smoke_timer_irq_fires` proves end-to-end delivery. The follow-up
+   "real waker driving the scheduler" remains a Stage-3 polish item;
+   today the timer just bumps a counter.
+
+   Adjacent driver-readiness work also closed in this round:
+   `bus::init` wired into boot, BAR sizing + MMIO mapping
+   (`bus::bar::{read_bar, map_bar, MmioRegion}`), and LAPIC-directed
+   MSI-X programming (`MsixTable::{program_vector, enable}`) on
+   x86_64. aarch64 `program_vector` returns `Unsupported` until the
+   GIC ITS doorbell path lands. NVMe admin-queue bring-up is the
+   natural next step now that drivers can map BARs and request
+   MSI-directed IRQs.
 
 2. **Higher-half kernel relocation**. Conventional -2 GiB layout.
    Touches the linker script, boot.S (far-jump-to-virtual after
