@@ -12808,3 +12808,76 @@ fn smoke_userspace_sched_affinity_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_userspace_sched_affinity_round_trip);
+
+fn smoke_userspace_prctl_name_round_trip() -> TestResult {
+    use narf_userspace::{install_core_syscalls, install_global,
+                         kernel_syscall_entry, prctl_init,
+                         syscall::__test_clear_global,
+                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+                         TrapContext};
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+    narf_userspace::handlers::__test_prctl_reset();
+    prctl_init();
+
+    fn call(op: u64, a: u64) -> Option<SyscallReturn> {
+        let mut ctx = FakeCtx {
+            args: SyscallArgs { arg0: op, arg1: a, ..SyscallArgs::default() },
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::Prctl.raw(), &mut ctx);
+        ctx.ret
+    }
+
+    // PR_SET_NAME = 15, PR_GET_NAME = 16.
+    let want = b"hello-task\0";
+    let r = call(15, want.as_ptr() as u64);
+    if !matches!(r, Some(rr) if rr.status == SyscallReturn::OK && rr.value == 0) {
+        return TestResult::Fail("PR_SET_NAME did not return 0");
+    }
+
+    let mut buf = [0u8; 16];
+    let r = call(16, buf.as_mut_ptr() as u64);
+    if !matches!(r, Some(rr) if rr.status == SyscallReturn::OK && rr.value == 0) {
+        return TestResult::Fail("PR_GET_NAME did not return 0");
+    }
+    if &buf[..10] != b"hello-task" || buf[10] != 0 {
+        return TestResult::Fail("PR_GET_NAME did not retrieve the set name");
+    }
+
+    // PR_SET_DUMPABLE / PR_GET_DUMPABLE round-trip.
+    let _ = call(4, 0);   // set dumpable = false
+    let r = call(3, 0).map(|r| r.value).unwrap_or(!0);
+    if r != 0 {
+        return TestResult::Fail("PR_SET_DUMPABLE(false) did not stick");
+    }
+    let _ = call(4, 1);
+    let r = call(3, 0).map(|r| r.value).unwrap_or(!0);
+    if r != 1 {
+        return TestResult::Fail("PR_SET_DUMPABLE(true) did not stick");
+    }
+
+    // Unknown op rejected.
+    let r = call(99, 0);
+    let unknown_rejected = matches!(
+        r,
+        Some(rr) if rr.status == SyscallReturn::OK && rr.value == (-1i64) as u64,
+    );
+    if !unknown_rejected {
+        return TestResult::Fail("prctl(99) was not rejected");
+    }
+
+    narf_userspace::handlers::__test_prctl_reset();
+    __test_clear_global();
+    TestResult::Pass
+}
+kernel_test!(smoke_userspace_prctl_name_round_trip);

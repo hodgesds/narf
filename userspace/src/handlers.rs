@@ -1779,6 +1779,134 @@ fn sys_setrlimit(ctx: &mut dyn TrapContext) {
     }
 }
 
+// ── prctl — per-task settings switchboard ──────────────────────────
+//
+// Linux prctl(2) is a swiss-army-knife for per-task knobs. We
+// honour the most-reached-for subops (PR_SET_NAME / PR_GET_NAME
+// for the task-name slot; PR_*_DUMPABLE and PR_*_NO_NEW_PRIVS
+// as round-trip booleans). The 16-byte name limit matches Linux's
+// TASK_COMM_LEN.
+
+const PR_SET_NAME:           u64 = 15;
+const PR_GET_NAME:           u64 = 16;
+const PR_SET_DUMPABLE:       u64 = 4;
+const PR_GET_DUMPABLE:       u64 = 3;
+const PR_SET_NO_NEW_PRIVS:   u64 = 38;
+const PR_GET_NO_NEW_PRIVS:   u64 = 39;
+const TASK_COMM_LEN:         usize = 16;
+
+#[derive(Copy, Clone)]
+struct PrctlState {
+    name:          [u8; TASK_COMM_LEN],
+    dumpable:      bool,
+    no_new_privs:  bool,
+}
+
+impl Default for PrctlState {
+    fn default() -> Self {
+        Self {
+            name:         [0; TASK_COMM_LEN],
+            dumpable:     true,    // Linux default
+            no_new_privs: false,
+        }
+    }
+}
+
+static PRCTL_TABLE:
+    narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, PrctlState>>>
+    = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+pub fn prctl_init() {
+    *PRCTL_TABLE.lock() = Some(BTreeMap::new());
+}
+
+#[doc(hidden)]
+pub fn __test_prctl_reset() { *PRCTL_TABLE.lock() = None; }
+
+fn read_prctl(task: u64) -> PrctlState {
+    let g = PRCTL_TABLE.lock();
+    g.as_ref()
+        .and_then(|m| m.get(&task).copied())
+        .unwrap_or_default()
+}
+
+fn modify_prctl<F: FnOnce(&mut PrctlState)>(task: u64, f: F) -> bool {
+    let mut g = PRCTL_TABLE.lock();
+    let Some(m) = g.as_mut() else { return false; };
+    let entry = m.entry(task).or_default();
+    f(entry);
+    true
+}
+
+fn sys_prctl(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let op    = args.arg0;
+    let arg_a = args.arg1;
+    let _arg_b = args.arg2;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    let task = current_task_id();
+
+    match op {
+        PR_SET_NAME => {
+            // arg_a is a pointer to a NUL-terminated or 16-byte
+            // bounded user buffer. Copy at most 15 bytes (leave
+            // room for the NUL).
+            let ptr = arg_a as *const u8;
+            if ptr.is_null() {
+                ctx.set_return(fail);
+                return;
+            }
+            let mut name = [0u8; TASK_COMM_LEN];
+            // SAFETY: caller-supplied user pointer; we read up to
+            // 15 bytes or the first NUL.
+            unsafe {
+                for i in 0..(TASK_COMM_LEN - 1) {
+                    let b = core::ptr::read_volatile(ptr.add(i));
+                    if b == 0 { break; }
+                    name[i] = b;
+                }
+            }
+            if !modify_prctl(task, |s| s.name = name) {
+                ctx.set_return(fail);
+                return;
+            }
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        PR_GET_NAME => {
+            let out = arg_a as *mut u8;
+            if out.is_null() {
+                ctx.set_return(fail);
+                return;
+            }
+            let s = read_prctl(task);
+            // SAFETY: caller-supplied 16-byte writable region.
+            unsafe {
+                for i in 0..TASK_COMM_LEN {
+                    core::ptr::write_volatile(out.add(i), s.name[i]);
+                }
+            }
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        PR_SET_DUMPABLE => {
+            modify_prctl(task, |s| s.dumpable = arg_a != 0);
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        PR_GET_DUMPABLE => {
+            let s = read_prctl(task);
+            ctx.set_return(SyscallReturn::ok(s.dumpable as u64));
+        }
+        PR_SET_NO_NEW_PRIVS => {
+            modify_prctl(task, |s| s.no_new_privs = arg_a != 0);
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        PR_GET_NO_NEW_PRIVS => {
+            let s = read_prctl(task);
+            ctx.set_return(SyscallReturn::ok(s.no_new_privs as u64));
+        }
+        _ => ctx.set_return(fail),
+    }
+}
+
 // ── Sched_get/setaffinity — CPU bitmap ─────────────────────────────
 //
 // NARF user mode is single-CPU; the affinity bitmap is structural
@@ -2929,6 +3057,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         RawFnHandler(sys_sched_getaffinity));
     table.install_raw(Syscall::SchedSetaffinity, "sched_setaffinity",
         RawFnHandler(sys_sched_setaffinity));
+    table.install_raw(Syscall::Prctl,       "prctl",       RawFnHandler(sys_prctl));
     table.install_raw(Syscall::Getpriority, "getpriority", RawFnHandler(sys_getpriority));
     table.install_raw(Syscall::Setpriority, "setpriority", RawFnHandler(sys_setpriority));
     table.install_raw(Syscall::Times,       "times",       RawFnHandler(sys_times));

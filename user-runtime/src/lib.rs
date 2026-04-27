@@ -77,6 +77,7 @@ pub const SYS_GETCPU:         u64 = 165;
 pub const SYS_SCHED_GETAFFINITY: u64 = 166;
 pub const SYS_SCHED_SETAFFINITY: u64 = 167;
 pub const SYS_GETTID:         u64 = 168;
+pub const SYS_PRCTL:          u64 = 169;
 pub const SYS_SETPRIORITY:    u64 = 157;
 pub const SYS_TIMES:          u64 = 158;
 pub const SYS_GETRUSAGE:      u64 = 159;
@@ -506,6 +507,17 @@ pub fn getrusage(who: i32, buf: &mut [i64; 18]) -> i32 {
 pub fn umask(new_mask: u32) -> u32 {
     // SAFETY: SYS_UMASK signature: (new_mask).
     unsafe { syscall1(SYS_UMASK, new_mask as u64) as u32 }
+}
+
+/// `prctl(op, arg_a, arg_b)` — Linux per-task settings switchboard.
+/// `op` selects the subop (PR_SET_NAME = 15, PR_GET_NAME = 16,
+/// PR_SET_DUMPABLE = 4, PR_GET_DUMPABLE = 3, etc.). Returns 0 on
+/// success or the requested value (PR_GET_*); -1 on bad op.
+#[inline]
+pub fn prctl(op: u32, arg_a: u64, arg_b: u64) -> i64 {
+    // SAFETY: SYS_PRCTL signature: (op, arg_a, arg_b).
+    let r = unsafe { syscall3(SYS_PRCTL, op as u64, arg_a, arg_b) };
+    r as i64
 }
 
 /// `gettid()` — Linux thread id. NARF is single-threaded per

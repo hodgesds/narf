@@ -131,6 +131,36 @@ pub unsafe extern "C" fn gettid() -> i32 {
     narf_user_runtime::gettid() as i32
 }
 
+// ── prctl ───────────────────────────────────────────────────────────
+
+pub const PR_SET_NAME:        i32 = 15;
+pub const PR_GET_NAME:        i32 = 16;
+pub const PR_SET_DUMPABLE:    i32 = 4;
+pub const PR_GET_DUMPABLE:    i32 = 3;
+pub const PR_SET_NO_NEW_PRIVS:i32 = 38;
+pub const PR_GET_NO_NEW_PRIVS:i32 = 39;
+
+/// `prctl(op, arg2, arg3, arg4, arg5)` — Linux signature. We
+/// honour the most-reached-for subops; everything else returns
+/// -1 with errno = EINVAL.
+///
+/// Note: the C signature is variadic in glibc; we expose the
+/// fixed three-arg form because it covers every honoured op.
+///
+/// # Safety
+/// When `op` is PR_SET_NAME or PR_GET_NAME, `arg2` must be a
+/// valid 16-byte buffer (read or write per direction).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn prctl(op: i32, arg2: u64, arg3: u64) -> i32 {
+    if op < 0 { return -1; }
+    let r = narf_user_runtime::prctl(op as u32, arg2, arg3);
+    if r == -1 {
+        crate::errno::set_errno(22); // EINVAL
+        return -1;
+    }
+    r as i32
+}
+
 /// Parent task id, or 0 if none. Stage-4 kernel always returns 0.
 ///
 /// # Safety

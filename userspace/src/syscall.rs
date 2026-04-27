@@ -318,6 +318,22 @@ pub enum Syscall {
     /// libc shim's ABI is right for when threading arrives.
     Gettid       = 168,
 
+    /// Linux prctl(2): per-task settings switchboard. `arg0 = op`,
+    /// `arg1 = argA`, `arg2 = argB`. Honoured ops:
+    ///   - PR_SET_NAME  (15): argA = pointer to up-to-15-byte
+    ///                        UTF-8 name; bytes copied into the
+    ///                        kernel-side name slot, NUL-padded
+    ///                        to 16. Returns 0.
+    ///   - PR_GET_NAME  (16): argA = writable 16-byte buffer;
+    ///                        kernel writes the recorded name +
+    ///                        NUL. Returns 0.
+    ///   - PR_SET_DUMPABLE (4) / PR_GET_DUMPABLE (3): round-trip
+    ///                        the boolean.
+    ///   - PR_SET_NO_NEW_PRIVS (38) / PR_GET_NO_NEW_PRIVS (39):
+    ///                        round-trip the boolean.
+    /// Everything else returns -1.
+    Prctl        = 169,
+
     /// Set or query the per-task heap break.
     /// `arg0 = 0` → return current break; `arg0 != 0` → resize.
     /// POSIX `brk(2)` semantics: failure returns the unchanged break.
@@ -526,6 +542,7 @@ impl Syscall {
             166 => Syscall::SchedGetaffinity,
             167 => Syscall::SchedSetaffinity,
             168 => Syscall::Gettid,
+            169 => Syscall::Prctl,
             156 => Syscall::Getpriority,
             157 => Syscall::Setpriority,
             158 => Syscall::Times,
