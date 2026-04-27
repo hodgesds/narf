@@ -718,6 +718,12 @@ pub fn probe(
     narf_block::register_block_device("sata0",
         alloc::sync::Arc::new(AhciBlockSync)
             as alloc::sync::Arc<dyn narf_block::BlockDeviceSync>);
+    narf_drivers::record_bound(narf_drivers::BoundDriver {
+        name:    alloc::string::String::from("sata0"),
+        kind:    narf_drivers::BoundKind::Block,
+        pci_vid: Some(device.id.vendor),
+        pci_did: Some(device.id.device),
+    });
     Ok(())
 }
 

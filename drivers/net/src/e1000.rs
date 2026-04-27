@@ -474,6 +474,12 @@ pub fn probe(
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
     *CONTROLLER.lock() = Some(dev);
+    narf_drivers::record_bound(narf_drivers::BoundDriver {
+        name:    alloc::string::String::from(name_for(device.id.device)),
+        kind:    narf_drivers::BoundKind::Net,
+        pci_vid: Some(device.id.vendor),
+        pci_did: Some(device.id.device),
+    });
     Ok(())
 }
 

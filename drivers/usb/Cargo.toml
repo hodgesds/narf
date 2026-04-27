@@ -17,6 +17,7 @@ narf-bus          = { path = "../../bus" }
 narf-capabilities = { path = "../../capabilities" }
 narf-io           = { path = "../../io" }
 narf-memory       = { path = "../../memory" }
+narf-drivers      = { path = "../" }
 
 [lints]
 workspace = true

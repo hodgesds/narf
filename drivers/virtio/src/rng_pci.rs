@@ -237,6 +237,12 @@ pub fn probe(
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
     *CONTROLLER.lock() = Some(dev);
+    narf_drivers::record_bound(narf_drivers::BoundDriver {
+        name:    alloc::string::String::from("vrng0"),
+        kind:    narf_drivers::BoundKind::Rng,
+        pci_vid: Some(VIRTIO_RNG_PCI_VENDOR),
+        pci_did: Some(VIRTIO_RNG_PCI_DEVICE),
+    });
     Ok(())
 }
 

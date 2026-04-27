@@ -1145,6 +1145,13 @@ pub fn probe(
     // kernel can address NVMe uniformly with other storage drivers.
     narf_block::register_block_device("nvme0",
         alloc::sync::Arc::new(NvmeBlockSync) as alloc::sync::Arc<dyn narf_block::BlockDeviceSync>);
+    // Record the bind in the framework's bound-driver inventory.
+    narf_drivers::record_bound(narf_drivers::BoundDriver {
+        name:    alloc::string::String::from("nvme0"),
+        kind:    narf_drivers::BoundKind::Block,
+        pci_vid: Some(device.id.vendor),
+        pci_did: Some(device.id.device),
+    });
     Ok(())
 }
 

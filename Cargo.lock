@@ -470,6 +470,7 @@ version = "0.0.0"
 dependencies = [
  "narf-bus",
  "narf-capabilities",
+ "narf-drivers",
  "narf-interrupts",
  "narf-io",
  "narf-lib",
@@ -497,6 +498,7 @@ dependencies = [
  "narf-block",
  "narf-bus",
  "narf-capabilities",
+ "narf-drivers",
  "narf-io",
  "narf-lib",
  "narf-memory",
@@ -509,6 +511,7 @@ version = "0.0.0"
 dependencies = [
  "narf-bus",
  "narf-capabilities",
+ "narf-drivers",
  "narf-io",
  "narf-lib",
  "narf-memory",
@@ -549,6 +552,7 @@ dependencies = [
  "narf-boot",
  "narf-bus",
  "narf-console",
+ "narf-drivers",
  "narf-drivers-net",
  "narf-drivers-nvme",
  "narf-drivers-storage",

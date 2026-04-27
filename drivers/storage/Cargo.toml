@@ -19,6 +19,7 @@ narf-io           = { path = "../../io" }
 narf-memory       = { path = "../../memory" }
 narf-time         = { path = "../../time" }
 narf-block        = { path = "../../block" }
+narf-drivers      = { path = "../" }
 
 [lints]
 workspace = true

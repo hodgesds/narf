@@ -361,8 +361,16 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             let auth = narf_bus::bootstrap_registry_authority();
             match narf_bus::probe_all_pci(&auth) {
                 Ok(n) => {
+                    let bound = narf_drivers::bound_drivers();
                     let _ = writeln!(console::Writer,
-                        "  drivers: bound {} PCIe device(s)", n);
+                        "  drivers: bound {} PCIe device(s); inventory={}",
+                        n, bound.len());
+                    for b in &bound {
+                        let _ = writeln!(console::Writer,
+                            "    {} ({:?}) {:04x}:{:04x}",
+                            b.name, b.kind,
+                            b.pci_vid.unwrap_or(0), b.pci_did.unwrap_or(0));
+                    }
                 }
                 Err(_) => {
                     let _ = writeln!(console::Writer,

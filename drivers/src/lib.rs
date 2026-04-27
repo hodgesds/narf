@@ -42,7 +42,9 @@
 
 extern crate alloc;
 
+pub mod bound;
 pub mod params;
+pub use bound::{record as record_bound, snapshot as bound_drivers, BoundDriver, BoundKind};
 pub use params::{DriverParams, ParamError, ParamSlot};
 
 use alloc::boxed::Box;

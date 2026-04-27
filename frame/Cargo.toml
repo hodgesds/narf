@@ -24,6 +24,7 @@ narf-bus           = { path = "../bus" }
 narf-drivers-nvme    = { path = "../drivers/nvme" }
 narf-drivers-virtio  = { path = "../drivers/virtio" }
 narf-drivers-net     = { path = "../drivers/net" }
+narf-drivers         = { path = "../drivers" }
 narf-drivers-storage = { path = "../drivers/storage" }
 narf-drivers-usb     = { path = "../drivers/usb" }
 narf-userspace     = { path = "../userspace" }

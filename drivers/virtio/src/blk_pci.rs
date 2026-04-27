@@ -692,6 +692,12 @@ pub fn probe(
     narf_block::register_block_device("vblk0",
         alloc::sync::Arc::new(VirtioBlkBlockSync)
             as alloc::sync::Arc<dyn narf_block::BlockDeviceSync>);
+    narf_drivers::record_bound(narf_drivers::BoundDriver {
+        name:    alloc::string::String::from("vblk0"),
+        kind:    narf_drivers::BoundKind::Block,
+        pci_vid: Some(VIRTIO_BLK_PCI_VENDOR),
+        pci_did: Some(VIRTIO_BLK_PCI_DEVICE),
+    });
     Ok(())
 }
 
