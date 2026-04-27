@@ -6873,6 +6873,108 @@ fn smoke_bound_drivers_inventory() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_bound_drivers_inventory);
 
+fn smoke_slab_alloc_free_round_trip() -> TestResult {
+    // Allocate one block from each size class, write a sentinel,
+    // free, re-allocate the same class, verify the new pointer
+    // can be written to (i.e. re-use works without corrupting the
+    // free list).
+    use core::alloc::Layout;
+    use narf_memory::slab;
+    for c in 0..slab::num_classes() {
+        let block_size = 16usize << c;
+        let layout = Layout::from_size_align(block_size, 16).unwrap();
+        let p1 = match slab::alloc(layout) {
+            Ok(p)  => p,
+            Err(_) => return TestResult::Fail("class alloc#1 failed"),
+        };
+        // SAFETY: pointer just allocated; class block_size bytes valid.
+        unsafe {
+            for i in 0..block_size {
+                core::ptr::write_volatile(p1.as_ptr().add(i), 0xAA);
+            }
+        }
+        // SAFETY: same layout we allocated with.
+        unsafe { slab::dealloc(p1, layout); }
+
+        let p2 = match slab::alloc(layout) {
+            Ok(p)  => p,
+            Err(_) => return TestResult::Fail("class alloc#2 failed"),
+        };
+        // The slab pushes onto the head of the free list, so the
+        // most recently freed block is the next one popped — `p2 == p1`
+        // in the single-thread case.
+        if p2 != p1 {
+            // Not strictly required (a multi-block-grown class may
+            // hand back a different block first); just ensure we
+            // can write without faulting.
+        }
+        // SAFETY: pointer just allocated.
+        unsafe {
+            for i in 0..block_size {
+                core::ptr::write_volatile(p2.as_ptr().add(i), 0x55);
+            }
+        }
+        // SAFETY: same layout.
+        unsafe { slab::dealloc(p2, layout); }
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_slab_alloc_free_round_trip);
+
+fn smoke_slab_class_picker() -> TestResult {
+    // Verify every class gets distinct backing blocks (no
+    // accidental aliasing across classes) by allocating one of
+    // each + asserting all pointers are unique.
+    use core::alloc::Layout;
+    use narf_memory::slab;
+    let mut ptrs = alloc::vec::Vec::with_capacity(slab::num_classes());
+    for c in 0..slab::num_classes() {
+        let block_size = 16usize << c;
+        let layout = Layout::from_size_align(block_size, 16).unwrap();
+        let p = match slab::alloc(layout) {
+            Ok(p)  => p,
+            Err(_) => return TestResult::Fail("alloc failed"),
+        };
+        ptrs.push((layout, p));
+    }
+    for i in 0..ptrs.len() {
+        for j in (i + 1)..ptrs.len() {
+            if ptrs[i].1 == ptrs[j].1 {
+                return TestResult::Fail("two classes returned the same pointer");
+            }
+        }
+    }
+    for (layout, p) in ptrs {
+        // SAFETY: just allocated with this layout.
+        unsafe { slab::dealloc(p, layout); }
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_slab_class_picker);
+
+fn smoke_slab_stats_advance() -> TestResult {
+    // After an alloc, the relevant class's `in_use` advances; after
+    // free it returns to baseline.
+    use core::alloc::Layout;
+    use narf_memory::slab;
+    let layout = Layout::from_size_align(64, 16).unwrap();
+    let class_idx = 2; // 64 = 16 << 2
+    let before = slab::stats().classes[class_idx].in_use;
+    let p = slab::alloc(layout).expect("alloc");
+    let after_alloc = slab::stats().classes[class_idx].in_use;
+    if after_alloc != before + 1 {
+        return TestResult::Fail("in_use didn't advance on alloc");
+    }
+    // SAFETY: just allocated.
+    unsafe { slab::dealloc(p, layout); }
+    let after_free = slab::stats().classes[class_idx].in_use;
+    if after_free != before {
+        return TestResult::Fail("in_use didn't return to baseline on free");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_slab_stats_advance);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_virtio_balloon_pci_probe() -> TestResult {
     use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};

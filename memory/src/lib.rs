@@ -14,6 +14,7 @@ pub mod addr;
 pub mod address_space;
 pub mod frame;
 pub mod heap;
+pub mod slab;
 
 pub use address_space::{AddressSpace, AddressSpaceError, Region, RegionPerms};
 
