@@ -79,8 +79,8 @@ pub use ctype::{
 pub use env::{getenv, getenv_cstr, putenv, setenv, unsetenv, ENVIRON};
 pub use errno::{errno, set_errno, strerror, __errno_location};
 pub use fd::{
-    dup, dup2, fcntl, fstat, isatty, lstat, memfd_create, pipe, pipe2, stat,
-    FD_CLOEXEC, F_GETFD, F_GETFL, F_SETFD, F_SETFL, StatBuf,
+    dup, dup2, fcntl, fstat, fstatat, isatty, lstat, memfd_create, pipe, pipe2,
+    stat, FD_CLOEXEC, F_GETFD, F_GETFL, F_SETFD, F_SETFL, StatBuf,
 };
 pub use fs::{
     chdir, chmod, getcwd, umask, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK,

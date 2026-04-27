@@ -83,6 +83,7 @@ pub const SYS_FCHMODAT:       u64 = 134;
 pub const SYS_FCHOWNAT:       u64 = 135;
 pub const SYS_FACCESSAT:      u64 = 136;
 pub const SYS_OPENAT:         u64 = 137;
+pub const SYS_NEWFSTATAT:     u64 = 138;
 pub const SYS_GETHOSTNAME:    u64 = 146;
 pub const SYS_SETHOSTNAME:    u64 = 147;
 pub const SYS_GETRLIMIT:      u64 = 148;
@@ -1328,6 +1329,28 @@ pub fn fchown(fd: u32, uid: u32, gid: u32) -> i32 {
     // SAFETY: SYS_FCHOWN signature: (fd, uid, gid).
     let r = unsafe { syscall3(SYS_FCHOWN, fd as u64, uid as u64, gid as u64) };
     if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `fstatat(dirfd, path, stat_out, flags)` — Linux *at variant
+/// of stat. Returns 0 on success, -1 on failure.
+#[inline]
+pub fn fstatat(
+    dirfd: i32,
+    path:  &str,
+    out:   &mut StatBuf,
+    flags: i32,
+) -> i32 {
+    if path.is_empty() { return -1; }
+    // SAFETY: SYS_NEWFSTATAT signature: (dirfd, path_ptr, path_len,
+    // stat_out, flags).
+    let r = unsafe {
+        syscall5(
+            SYS_NEWFSTATAT, dirfd as u64,
+            path.as_ptr() as u64, path.len() as u64,
+            out as *mut StatBuf as u64, flags as u64,
+        )
+    };
+    if r == 0 { 0 } else { -1 }
 }
 
 /// `openat(dirfd, path, flags, mode)` — Linux *at variant of

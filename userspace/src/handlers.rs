@@ -1171,6 +1171,41 @@ fn sys_truncate(ctx: &mut dyn TrapContext) {
     }
 }
 
+// ── newfstatat — *at-keyed stat ────────────────────────────────────
+//
+// Linux newfstatat(dirfd, path, statbuf, flags). Same dirfd-
+// ignored / path-must-be-absolute simplification. Re-shape args
+// to the SYS_STAT signature (path_ptr, path_len, stat_out) and
+// reuse sys_stat's body.
+
+fn sys_newfstatat(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let _dirfd = args.arg0;
+    let path_ptr = args.arg1;
+    let path_len = args.arg2;
+    let stat_out = args.arg3;
+    let _flags   = args.arg4;
+    struct Reshape<'a> {
+        inner: &'a mut dyn TrapContext,
+        args:  SyscallArgs,
+    }
+    impl<'a> TrapContext for Reshape<'a> {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.inner.set_return(r); }
+        fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
+            self.inner.redirect_to_kernel(rip, rsp)
+        }
+    }
+    let proxy_args = SyscallArgs {
+        arg0: path_ptr,
+        arg1: path_len,
+        arg2: stat_out,
+        arg3: 0, arg4: 0, arg5: 0,
+    };
+    let mut proxy = Reshape { inner: ctx, args: proxy_args };
+    sys_stat(&mut proxy);
+}
+
 // ── openat — *at-keyed open ────────────────────────────────────────
 //
 // Linux openat(dirfd, path, flags, mode) — modern replacement for
@@ -3895,6 +3930,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Fchownat, "fchownat", RawFnHandler(sys_fchmodat_or_fchownat));
     table.install_raw(Syscall::Faccessat, "faccessat", RawFnHandler(sys_fchmodat_or_fchownat));
     table.install_raw(Syscall::Openat,    "openat",    RawFnHandler(sys_openat));
+    table.install_raw(Syscall::Newfstatat,"newfstatat",RawFnHandler(sys_newfstatat));
 
     // Tier-2 cwd state + nanosleep wired into the table. Sleep
     // already replaced the noop_ok stub above.

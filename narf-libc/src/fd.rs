@@ -184,6 +184,43 @@ pub unsafe fn stat(path: *const u8, out: *mut StatBuf) -> i32 {
     }
 }
 
+/// `fstatat(dirfd, path, *out, flags)` — Linux *at variant.
+/// dirfd is ignored; path must be absolute.
+///
+/// # Safety
+/// `path` must be a NUL-terminated C string; `out` must be a
+/// writable `*mut StatBuf`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fstatat(
+    dirfd: i32,
+    path:  *const u8,
+    out:   *mut StatBuf,
+    flags: i32,
+) -> i32 {
+    if path.is_null() || out.is_null() {
+        set_errno(EBADF);
+        return -1;
+    }
+    // Walk path NUL-bounded, capped at 4 KiB.
+    let mut len = 0usize;
+    while len < 4096 {
+        if unsafe { *path.add(len) } == 0 { break; }
+        len += 1;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(path, len) };
+    let s = match core::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => { set_errno(EBADF); return -1; }
+    };
+    let out_ref = unsafe { &mut *out };
+    if narf_user_runtime::fstatat(dirfd, s, out_ref, flags) == 0 {
+        0
+    } else {
+        set_errno(EBADF);
+        -1
+    }
+}
+
 /// `lstat(path, &mut out)` — like [`stat`] but doesn't follow
 /// symlinks. NARF has no symlinks; this aliases stat.
 ///

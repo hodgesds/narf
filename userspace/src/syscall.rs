@@ -258,6 +258,12 @@ pub enum Syscall {
     /// the user-runtime wrapper distinguishes consistently).
     Openat       = 137,
 
+    /// `arg0 = dirfd`, `arg1 = path_ptr`, `arg2 = path_len`,
+    /// `arg3 = stat_out_ptr`, `arg4 = flags`. Linux newfstatat(2)
+    /// / fstatat(2). dirfd ignored; path must be absolute. Routes
+    /// to the same handler as SYS_STAT.
+    Newfstatat   = 138,
+
     /// `arg0 = pipefd_out_ptr`, `arg1 = flags`. Linux pipe2(2):
     /// pipe + atomic flag set. Honoured flag: O_CLOEXEC (bit
     /// 0x80000) — both ends get FD_CLOEXEC stamped at install
@@ -697,6 +703,7 @@ impl Syscall {
             135 => Syscall::Fchownat,
             136 => Syscall::Faccessat,
             137 => Syscall::Openat,
+            138 => Syscall::Newfstatat,
             120 => Syscall::Mmap,
             121 => Syscall::Munmap,
             130 => Syscall::RingKick,
