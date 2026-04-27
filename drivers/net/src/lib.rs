@@ -30,6 +30,8 @@
 
 extern crate alloc;
 
+pub mod e1000;
+
 /// Chipset families the Stage-4 driver set targets.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum NicModel {

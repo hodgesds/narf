@@ -6287,6 +6287,59 @@ fn smoke_virtio_net_pci_tx() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_virtio_net_pci_tx);
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_e1000_bring_up_and_tx() -> TestResult {
+    // The QEMU q35 default NIC is an e1000e (0x10D3) attached to a
+    // user-mode net backend. Run the driver's probe + tx path
+    // against it.
+    use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_drivers_net::e1000;
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let has_e1000 = devs.iter().any(|d|
+        matches!(&d.kind, BusKind::Pcie { .. })
+        && d.id.vendor == e1000::E1000_VENDOR
+        && (d.id.device == e1000::E1000_DEV_82540EM
+            || d.id.device == e1000::E1000_DEV_82545EM
+            || d.id.device == e1000::E1000_DEV_82544GC
+            || d.id.device == e1000::E1000E_DEV_82574L));
+    if !has_e1000 {
+        return TestResult::Skip("no e1000-class NIC");
+    }
+    __reset_for_test();
+    e1000::register_pci_driver();
+    let authority = bootstrap_registry_authority();
+    if probe_all_pci(&authority).is_err() {
+        return TestResult::Fail("probe_all_pci");
+    }
+    if !e1000::is_probed() {
+        return TestResult::Fail("e1000 not probed");
+    }
+    // QEMU emulates a deterministic MAC (52:54:00:12:34:56 by default).
+    let mac = e1000::with_controller(|c| c.mac).unwrap_or([0; 6]);
+    if mac == [0; 6] || mac == [0xFF; 6] {
+        return TestResult::Fail("MAC reads as all-zero or all-FF");
+    }
+    // Build a 64-byte Ethernet frame: dst=broadcast, src=our MAC,
+    // ethertype 0xFFFF (test), 50 bytes of recognisable payload.
+    let mut frame = [0u8; 64];
+    for i in 0..6 { frame[i] = 0xFF; }
+    for i in 0..6 { frame[6 + i] = mac[i]; }
+    frame[12] = 0xFF; frame[13] = 0xFF;
+    for i in 14..64 { frame[i] = (i as u8).wrapping_mul(0x4D); }
+
+    let tx_ok = e1000::with_controller(|c| c.tx(&frame))
+        .map(|r| r.is_ok()).unwrap_or(false);
+    if !tx_ok {
+        return TestResult::Fail("e1000::tx returned Err");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_e1000_bring_up_and_tx);
+
 fn smoke_drivers_net_nic_model_ids() -> TestResult {
     use narf_drivers_net::{NicCaps, NicModel};
 

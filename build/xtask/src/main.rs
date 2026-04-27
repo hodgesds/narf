@@ -133,6 +133,13 @@ impl Arch {
                     "-netdev".into(),  "user,id=n0".into(),
                     "-device".into(),
                     "virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off".into(),
+                    // e1000 NIC alongside virtio-net. Different
+                    // PCIe transport (no virtio caps), exercises the
+                    // generic BAR / MMIO surface end-to-end. Uses a
+                    // separate user-mode netdev so it doesn't share
+                    // an FD lock with virtio-net's backend.
+                    "-netdev".into(),  "user,id=n1".into(),
+                    "-device".into(),  "e1000,netdev=n1".into(),
                     "-kernel".into(),  kernel,
                 ]
             },
@@ -177,6 +184,9 @@ impl Arch {
                 "-netdev".into(),  "user,id=n0".into(),
                 "-device".into(),
                 "virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off".into(),
+                // e1000 NIC alongside virtio-net.
+                "-netdev".into(),  "user,id=n1".into(),
+                "-device".into(),  "e1000,netdev=n1".into(),
                 // QEMU's `-kernel <elf>` path on aarch64 does not
                 // load a `-dtb` blob into RAM (the DTB-loading code
                 // path is gated on `is_linux=1`). Instead we
@@ -237,6 +247,8 @@ fn qemu_virt_dtb_path() -> PathBuf {
             .arg("-device").arg("virtio-blk-pci,drive=vblk0")
             .arg("-netdev").arg("user,id=n0")
             .arg("-device").arg("virtio-net-pci,netdev=n0")
+            .arg("-netdev").arg("user,id=n1")
+            .arg("-device").arg("e1000,netdev=n1")
             .status();
     }
     path

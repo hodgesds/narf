@@ -558,6 +558,17 @@ The critical-path Stage-2 items remaining:
    `smoke_virtio_blk_pci_write_then_read`,
    `smoke_virtio_blk_pci_irq_driven`, `smoke_virtio_net_pci_tx`.
 
+   - **e1000** (`drivers/net/src/e1000.rs`). Real Intel NIC driver,
+     non-virtio — exercises the generic BAR + MMIO surface end-to-end.
+     Probes 5 device IDs covering 8254x and 8257x families
+     (0x100C/E/F + 0x10D3 + 0x153A). Bring-up: BAR0 map; CTRL.RST
+     reset; read MAC from RAL/RAH; TX descriptor ring (`TxDesc`,
+     16 bytes × 8 entries); CTRL.SLU for link up. Polled
+     `tx(frame)` posts to TDT and waits for the descriptor's DD
+     bit. xtask attaches `-device e1000,netdev=n1` alongside
+     virtio-net-pci. Smoke `smoke_e1000_bring_up_and_tx` validates
+     a 64-byte frame round-trip.
+
    PCIe driver-match registry (`bus::driver_match`) lets drivers
    register `(name, MatchKind, probe_fn)` entries — `MatchKind` is
    `VendorDevice` (most specific), `Class { class, mask }`, or
