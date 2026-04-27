@@ -388,6 +388,120 @@ impl Ahci {
     }
 }
 
+/// Issue ATA `WRITE DMA EXT` (opcode 0x35) for `n_sectors`
+/// 512-byte sectors starting at `lba`, sourcing from `data`. Same
+/// scratch-page shape as READ DMA EXT.
+///
+/// # Safety
+/// Same as `ahci_read_lba`.
+pub unsafe fn ahci_write_lba(
+    ahci: &Ahci,
+    port_idx: u8,
+    lba: u64,
+    n_sectors: u16,
+    data: &[u8],
+) -> Result<(), AhciError> {
+    if n_sectors == 0 || (n_sectors as usize) * 512 > 4096 {
+        return Err(AhciError::BarMapFailed);
+    }
+    if data.len() < (n_sectors as usize) * 512 {
+        return Err(AhciError::BarMapFailed);
+    }
+    let off = PORT_BASE_OFF + (port_idx as u64) * PORT_STRIDE;
+    // SAFETY: caller-asserted.
+    let _ = unsafe { ahci.port_idle(port_idx) };
+
+    let scratch = alloc_coherent(4096, DomainId::DRIVER_0)
+        .map_err(|_| AhciError::BarMapFailed)?;
+    let base = scratch.phys_addr().raw();
+    let cmd_list = base + 0x000;
+    let fis_recv = base + 0x400;
+    let cmd_tbl  = base + 0x500;
+    let data_buf = base + 0x600;
+    // Zero the cmd-list / FIS / cmd-table prefix; copy caller payload
+    // into the data buffer.
+    // SAFETY: identity-mapped DMA.
+    unsafe {
+        for i in 0..0x600 {
+            core::ptr::write_volatile((base + i as u64) as *mut u8, 0);
+        }
+        for i in 0..(n_sectors as usize) * 512 {
+            core::ptr::write_volatile(
+                (data_buf + i as u64) as *mut u8, data[i]);
+        }
+    }
+
+    // Cmd list slot 0: PRDT length = 1, CFL = 5, W bit = 1 (write).
+    // SAFETY: identity-mapped DMA.
+    unsafe {
+        core::ptr::write_volatile(cmd_list as *mut u32,
+            (1u32 << 16) | (1u32 << 6) | 5);  // bit 6 = W
+        core::ptr::write_volatile((cmd_list + 4) as *mut u32, 0);
+        core::ptr::write_volatile((cmd_list + 8) as *mut u64, cmd_tbl);
+    }
+
+    // CFIS = H2D for WRITE DMA EXT (0x35).
+    // SAFETY: identity-mapped DMA.
+    unsafe {
+        core::ptr::write_volatile(cmd_tbl as *mut u8, 0x27);
+        core::ptr::write_volatile((cmd_tbl + 1) as *mut u8, 0x80);
+        core::ptr::write_volatile((cmd_tbl + 2) as *mut u8, 0x35);
+        core::ptr::write_volatile((cmd_tbl + 3) as *mut u8, 0);
+        core::ptr::write_volatile((cmd_tbl + 4)  as *mut u8, (lba & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 5)  as *mut u8, ((lba >> 8)  & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 6)  as *mut u8, ((lba >> 16) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 7)  as *mut u8, 0x40);
+        core::ptr::write_volatile((cmd_tbl + 8)  as *mut u8, ((lba >> 24) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 9)  as *mut u8, ((lba >> 32) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 10) as *mut u8, ((lba >> 40) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 12) as *mut u8, (n_sectors & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 13) as *mut u8, ((n_sectors >> 8) & 0xFF) as u8);
+    }
+    let prdt = cmd_tbl + 0x80;
+    let bytes = (n_sectors as u32) * 512;
+    // SAFETY: same.
+    unsafe {
+        core::ptr::write_volatile(prdt as *mut u64, data_buf);
+        core::ptr::write_volatile((prdt + 8) as *mut u32, 0);
+        core::ptr::write_volatile((prdt + 12) as *mut u32, bytes - 1);
+    }
+
+    // SAFETY: identity-mapped MMIO.
+    unsafe {
+        ahci.mmio.write32(off + 0x00, cmd_list as u32);
+        ahci.mmio.write32(off + 0x04, (cmd_list >> 32) as u32);
+        ahci.mmio.write32(off + 0x08, fis_recv as u32);
+        ahci.mmio.write32(off + 0x0C, (fis_recv >> 32) as u32);
+        let serr = ahci.mmio.read32(off + PORT_SERR);
+        ahci.mmio.write32(off + PORT_SERR, serr);
+        ahci.mmio.write32(off + 0x10, 0xFFFF_FFFF);
+        let cmd = ahci.mmio.read32(off + PORT_CMD);
+        ahci.mmio.write32(off + PORT_CMD, cmd | CMD_FRE);
+        let cmd = ahci.mmio.read32(off + PORT_CMD);
+        ahci.mmio.write32(off + PORT_CMD, cmd | CMD_ST);
+    }
+
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: same.
+    unsafe { ahci.mmio.write32(off + 0x38, 1); }
+
+    let mut ok = false;
+    for _ in 0..10_000_000u32 {
+        // SAFETY: same.
+        let ci  = unsafe { ahci.mmio.read32(off + 0x38) };
+        // SAFETY: same.
+        let tfd = unsafe { ahci.mmio.read32(off + 0x20) };
+        if tfd & 0x01 != 0 { return Err(AhciError::ResetTimeout); }
+        if ci & 1 == 0 { ok = true; break; }
+        core::hint::spin_loop();
+    }
+    if !ok { return Err(AhciError::ResetTimeout); }
+    // SAFETY: caller-asserted.
+    let _ = unsafe { ahci.port_idle(port_idx) };
+    let _ = scratch;
+    Ok(())
+}
+
 /// Issue ATA `READ DMA EXT` (opcode 0x25) for `n_sectors` 512-byte
 /// sectors starting at `lba`, copying the result into `out`. `out`
 /// must be at least `n_sectors * 512` bytes.

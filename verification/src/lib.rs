@@ -6526,6 +6526,43 @@ fn smoke_ahci_read_lba() -> TestResult {
 kernel_test!(smoke_ahci_read_lba);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_ahci_write_then_read_lba() -> TestResult {
+    // Write a recognisable pattern at LBA 8 (well past the seeded
+    // sector 0), read it back, verify.
+    use narf_drivers_storage::ahci;
+    if !ahci::is_probed() { return TestResult::Skip("ahci not probed"); }
+    let port = ahci::with_controller(|c|
+        c.ports.iter().find(|p| p.kind == ahci::PortKind::Sata).map(|p| p.index)
+    ).flatten().unwrap_or(0);
+
+    let mut payload = [0u8; 512];
+    for i in 0..512usize { payload[i] = (i as u8).wrapping_mul(0x29) ^ 0xA1; }
+
+    let w = ahci::with_controller(|c|
+        // SAFETY: kernel-test holds the HBA exclusively.
+        unsafe { ahci::ahci_write_lba(c, port, 8, 1, &payload) }
+    );
+    if !matches!(w, Some(Ok(()))) {
+        return TestResult::Fail("ahci_write_lba failed");
+    }
+
+    let mut readback = [0u8; 512];
+    let r = ahci::with_controller(|c|
+        // SAFETY: same.
+        unsafe { ahci::ahci_read_lba(c, port, 8, 1, &mut readback) }
+    );
+    if !matches!(r, Some(Ok(()))) {
+        return TestResult::Fail("ahci_read_lba(8) after write failed");
+    }
+    if readback != payload {
+        return TestResult::Fail("AHCI write/read pattern mismatch");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_ahci_write_then_read_lba);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_virtio_balloon_pci_probe() -> TestResult {
     use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
     use narf_bus::driver_match::__reset_for_test;
