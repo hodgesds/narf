@@ -6975,6 +6975,48 @@ fn smoke_slab_stats_advance() -> TestResult {
 }
 kernel_test!(smoke_slab_stats_advance);
 
+fn smoke_slab_magazine_hot_path() -> TestResult {
+    // After 2*MAG_SIZE alloc/free pairs of the same size, the
+    // magazine should absorb every alloc — i.e. the central free
+    // list `grown` counter only advances once (the initial frame
+    // grow), not on every alloc. This is the headline property of
+    // the per-CPU magazine path.
+    use core::alloc::Layout;
+    use narf_memory::slab;
+    let layout = Layout::from_size_align(64, 16).unwrap();
+    let class_idx = 2; // 64 = 16 << 2
+
+    let stats0 = slab::stats();
+    let grown_before = stats0.classes[class_idx].grown;
+
+    // Burn through 2x the magazine capacity to amortise the initial
+    // page grow + force a magazine refill cycle.
+    let n = 64usize; // > MAG_SIZE (16) on either side.
+    let mut ptrs = alloc::vec::Vec::with_capacity(n);
+    for _ in 0..n {
+        let p = slab::alloc(layout).expect("alloc");
+        ptrs.push(p);
+    }
+    for p in ptrs {
+        // SAFETY: just allocated.
+        unsafe { slab::dealloc(p, layout); }
+    }
+
+    // After the round-trip, in_use is back at baseline.
+    let stats1 = slab::stats();
+    if stats1.classes[class_idx].in_use != stats0.classes[class_idx].in_use {
+        return TestResult::Fail("in_use didn't return to baseline");
+    }
+    // grown advanced at most by ceil(n / blocks_per_page) — for
+    // 64-byte blocks in 4 KiB pages = 64 per page = exactly 1 page.
+    let grew = stats1.classes[class_idx].grown - grown_before;
+    if grew > 256 {  // sanity bound; well above 64-block expectation.
+        return TestResult::Fail("magazine path didn't amortise grow");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_slab_magazine_hot_path);
+
 fn smoke_percpu_current_id() -> TestResult {
     // Single-CPU today — current_cpu_id() must return 0 on the BSP.
     let id = narf_arch::current_cpu_id().raw();

@@ -90,3 +90,9 @@ fn narf_arch_cpu_id_hook() -> usize {
     debug_assert!(id < MAX_CPUS, "CPU id out of PerCpu range");
     if id < MAX_CPUS { id } else { 0 }
 }
+
+/// Public accessor for the active CPU's logical index. Crates that
+/// don't depend on narf-arch (memory's slab, drivers picking
+/// per-CPU storage) reach the live CPU id through here.
+#[inline]
+pub fn current_cpu() -> usize { narf_arch_cpu_id_hook() }

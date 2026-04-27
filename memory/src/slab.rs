@@ -34,9 +34,11 @@
 //! central slab with a magazine pair without changing call sites.
 
 use core::alloc::Layout;
+use core::cell::UnsafeCell;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use narf_lib::percpu::{current_cpu, MAX_CPUS};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::frame::{alloc_frame, free_frame, PhysFrame};
@@ -72,22 +74,63 @@ struct FreeBlock {
     next: Option<NonNull<FreeBlock>>,
 }
 
-/// Per-size-class state. Free-list head is behind a spin-lock; the
-/// stat counters are atomics so observers can read them lock-free.
+/// Per-CPU magazine size — number of pre-cached free blocks per
+/// (CPU, class). 16 keeps the working set small while amortising
+/// the central-list lock cost across many alloc/free pairs. Tune
+/// once contention measurements arrive on real SMP hardware.
+const MAG_SIZE: usize = 16;
+
+/// One per-CPU magazine. The stack lives in an `UnsafeCell` so the
+/// owning CPU can mutate without an atomic; cross-CPU access is
+/// forbidden by construction (the slab dispatcher consults
+/// `current_cpu()` before touching the cell).
+#[repr(align(64))]  // cache-line-pad to avoid false sharing
+struct Magazine {
+    inner: UnsafeCell<MagazineInner>,
+}
+
+struct MagazineInner {
+    stack: [Option<NonNull<FreeBlock>>; MAG_SIZE],
+    top:   usize,
+}
+
+impl Magazine {
+    const fn new() -> Self {
+        Self {
+            inner: UnsafeCell::new(MagazineInner {
+                stack: [None; MAG_SIZE],
+                top:   0,
+            }),
+        }
+    }
+}
+
+// SAFETY: per-CPU access pattern. The dispatcher only reads/writes
+// the magazine for the active CPU, so the `UnsafeCell` is never
+// shared across CPUs in flight. The `Sync` bound is what lets us
+// store a `[Magazine; MAX_CPUS]` in a `static`.
+unsafe impl Sync for Magazine {}
+
+/// Per-size-class state. Central free-list head is behind a
+/// spin-lock; the magazine array gives each CPU a fast path that
+/// doesn't touch the lock until the magazine empties or fills.
 struct SizeClass {
     head:        IrqSafeSpinLock<Option<NonNull<FreeBlock>>>,
     /// Total blocks ever produced by this class (alloc-backed).
     grown:       AtomicUsize,
     /// Currently-allocated block count.
     in_use:      AtomicUsize,
+    /// Per-CPU magazines. Indexed by `current_cpu()`.
+    magazines:   [Magazine; MAX_CPUS],
 }
 
 impl SizeClass {
     const fn new() -> Self {
         Self {
-            head:   IrqSafeSpinLock::new(None),
-            grown:  AtomicUsize::new(0),
-            in_use: AtomicUsize::new(0),
+            head:      IrqSafeSpinLock::new(None),
+            grown:     AtomicUsize::new(0),
+            in_use:    AtomicUsize::new(0),
+            magazines: [const { Magazine::new() }; MAX_CPUS],
         }
     }
 }
@@ -156,60 +199,113 @@ pub unsafe fn dealloc(ptr: NonNull<u8>, layout: Layout) {
 
 fn alloc_class(c: usize) -> Result<NonNull<u8>, SlabError> {
     let class = &CLASSES[c];
-    // Fast path: pop the head.
-    let mut g = class.head.lock();
-    if let Some(head) = *g {
-        // SAFETY: head was a previously-pushed block in this class;
-        // its `next` field is the slab-managed link.
-        let next = unsafe { head.as_ref().next };
-        *g = next;
-        drop(g);
-        class.in_use.fetch_add(1, Ordering::Relaxed);
-        return Ok(head.cast());
-    }
-    drop(g);
+    let cpu   = current_cpu();
 
-    // Slow path: grow. Pull a fresh page, slab it into N blocks,
-    // push all-but-one onto the free list, return the last.
+    // FAST PATH: pop from the per-CPU magazine. No atomics, no
+    // lock — only the active CPU touches its own magazine cell.
+    // SAFETY: per-CPU access invariant.
+    let mag = unsafe { &mut *class.magazines[cpu].inner.get() };
+    if mag.top > 0 {
+        mag.top -= 1;
+        let blk = mag.stack[mag.top].take().expect("magazine top non-null");
+        class.in_use.fetch_add(1, Ordering::Relaxed);
+        return Ok(blk.cast());
+    }
+
+    // SLOW PATH 1: refill the magazine from the central free list.
+    // Take up to MAG_SIZE/2 blocks under one lock acquisition so
+    // the lock cost amortises across the next ~8 allocs.
+    {
+        let mut g = class.head.lock();
+        let take = MAG_SIZE / 2;
+        let mut taken = 0;
+        while taken < take {
+            match *g {
+                Some(head) => {
+                    // SAFETY: central blocks were inserted by this slab.
+                    let next = unsafe { head.as_ref().next };
+                    *g = next;
+                    mag.stack[mag.top] = Some(head);
+                    mag.top += 1;
+                    taken += 1;
+                }
+                None => break,
+            }
+        }
+        if taken > 0 {
+            mag.top -= 1;
+            let blk = mag.stack[mag.top].take().expect("just pushed");
+            class.in_use.fetch_add(1, Ordering::Relaxed);
+            return Ok(blk.cast());
+        }
+    }
+
+    // SLOW PATH 2: grow. Pull a fresh page, slab it into N blocks,
+    // push half into the magazine + the rest onto central, return
+    // the last block in the page.
     let frame: PhysFrame = alloc_frame()?;
     let base = frame.start_address().raw() as *mut u8;
     let block_size = class_size(c);
     let n_blocks   = PAGE_SIZE_USIZE / block_size;
-    // SAFETY: `base..base+PAGE_SIZE_USIZE` is a fresh frame mapped 1:1
-    // (low-4-GiB identity map on x86_64 / lo_L1[1] Normal block on
-    // aarch64). We carve N adjacent blocks each `block_size` bytes.
+    let to_mag = (MAG_SIZE / 2).min(n_blocks - 1);
+    // SAFETY: `base..base+PAGE_SIZE_USIZE` is a fresh identity-mapped
+    // frame.
     unsafe {
-        let mut g2 = class.head.lock();
-        // Push blocks 1..n in reverse so the first pop returns
-        // block 0 (purely cosmetic — keeps allocator output predictable
-        // in dumps).
-        for i in (1..n_blocks).rev() {
-            let blk = base.add(i * block_size) as *mut FreeBlock;
-            (*blk).next = *g2;
-            *g2 = NonNull::new(blk);
+        for i in 0..to_mag {
+            let blk = NonNull::new_unchecked(
+                base.add(i * block_size) as *mut FreeBlock);
+            mag.stack[mag.top] = Some(blk);
+            mag.top += 1;
         }
-        drop(g2);
+        let mut g = class.head.lock();
+        for i in to_mag..(n_blocks - 1) {
+            let blk = base.add(i * block_size) as *mut FreeBlock;
+            (*blk).next = *g;
+            *g = NonNull::new(blk);
+        }
+        drop(g);
     }
     class.grown.fetch_add(n_blocks, Ordering::Relaxed);
     class.in_use.fetch_add(1, Ordering::Relaxed);
-    // Block 0 is the one we return.
-    // SAFETY: same identity-mapped frame.
-    Ok(unsafe { NonNull::new_unchecked(base) })
+    // Last block is the one we return.
+    // SAFETY: identity-mapped frame.
+    Ok(unsafe { NonNull::new_unchecked(base.add((n_blocks - 1) * block_size)) })
 }
 
 unsafe fn dealloc_class(c: usize, ptr: NonNull<u8>) {
     let class = &CLASSES[c];
-    let blk = ptr.cast::<FreeBlock>();
-    let mut g = class.head.lock();
-    // SAFETY: caller asserts ptr was allocated from this class; we
-    // overwrite the block's `next` field with the current head and
-    // push.
-    unsafe {
-        let mut blk_mut = blk;
-        blk_mut.as_mut().next = *g;
+    let cpu = current_cpu();
+
+    // FAST PATH: push onto the per-CPU magazine.
+    // SAFETY: per-CPU access invariant.
+    let mag = unsafe { &mut *class.magazines[cpu].inner.get() };
+    if mag.top < MAG_SIZE {
+        mag.stack[mag.top] = Some(ptr.cast::<FreeBlock>());
+        mag.top += 1;
+        class.in_use.fetch_sub(1, Ordering::Relaxed);
+        return;
     }
-    *g = Some(blk);
+
+    // SLOW PATH: magazine full. Flush the bottom half back to the
+    // central free list, compact the top half down, then push the
+    // freshly-freed block.
+    let flush = MAG_SIZE / 2;
+    let mut g = class.head.lock();
+    for i in 0..flush {
+        let mut blk = mag.stack[i].expect("magazine full");
+        // SAFETY: blocks were originally allocated from this slab,
+        // so overwriting `next` re-links them onto the central head.
+        unsafe { blk.as_mut().next = *g; }
+        *g = Some(blk);
+    }
     drop(g);
+    // Compact: shift the surviving half down to slots 0..flush.
+    for i in 0..(MAG_SIZE - flush) {
+        mag.stack[i] = mag.stack[i + flush].take();
+    }
+    mag.top = MAG_SIZE - flush;
+    mag.stack[mag.top] = Some(ptr.cast::<FreeBlock>());
+    mag.top += 1;
     class.in_use.fetch_sub(1, Ordering::Relaxed);
 }
 
