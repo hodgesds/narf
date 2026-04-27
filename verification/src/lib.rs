@@ -6460,6 +6460,42 @@ fn smoke_ahci_hba_bring_up() -> TestResult {
 kernel_test!(smoke_ahci_hba_bring_up);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_ahci_identify_device() -> TestResult {
+    // Issue IDENTIFY DEVICE on the first port whose probe-time
+    // signature said "SATA". Verify the device-data block decodes
+    // a non-empty model string. QEMU's emulated SATA disk reports
+    // model "QEMU HARDDISK" (with trailing spaces).
+    use narf_drivers_storage::ahci;
+    if !ahci::is_probed() { return TestResult::Skip("ahci not probed"); }
+    // Probe-time PORT_SIG often reads as 0xFFFFFFFF on QEMU q35
+    // because the device hasn't completed its own COMRESET +
+    // IDENTIFY round when we sample. Fall through to port 0 — if a
+    // disk is attached there, IDENTIFY DEVICE succeeds even when
+    // PORT_SIG looks unpopulated at probe time.
+    let port = ahci::with_controller(|c|
+        c.ports.iter().find(|p| p.kind == ahci::PortKind::Sata).map(|p| p.index)
+    ).flatten();
+    let idx = port.unwrap_or(0);
+    // SAFETY: caller-trusted; the kernel-test harness owns the HBA
+    // exclusively here.
+    let id = match ahci::with_controller(|c|
+        unsafe { c.identify_device(idx) }
+    ).map(|r| r) {
+        Some(Ok(buf)) => buf,
+        Some(Err(_)) => return TestResult::Fail("identify_device failed"),
+        None         => return TestResult::Fail("with_controller None"),
+    };
+    let model = ahci::identify_model(&id);
+    // QEMU's SATA model starts with "QEMU".
+    if &model[..4] != b"QEMU" {
+        return TestResult::Fail("IDENTIFY model != QEMU prefix");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_ahci_identify_device);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_virtio_rng_pci_probe() -> TestResult {
     // Probe-only: verify that virtio-rng-pci's bring_up runs and
     // installs a controller. The data-path (read_bytes via queue

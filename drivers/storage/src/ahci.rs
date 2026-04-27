@@ -40,6 +40,8 @@ use core::sync::atomic::{compiler_fence, Ordering};
 
 use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
+use narf_io::alloc_coherent;
+use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 
 pub const AHCI_VENDOR: u16 = 0x8086;
@@ -231,6 +233,171 @@ impl Ahci {
 
     /// Implemented-port bitmap (PI register).
     pub fn ports_implemented(&self) -> u32 { self.pi }
+
+    /// Issue ATA `IDENTIFY DEVICE` (opcode 0xEC) on the given port,
+    /// returning the 512-byte device-data block.
+    ///
+    /// Stage-4 cut: allocates per-call DMA structures (command list +
+    /// FIS receive + command table + 512-byte data buffer) and frees
+    /// them after the response arrives. A real driver caches these
+    /// per port; we trade allocations for code simplicity until the
+    /// per-port BlockDevice surface lands.
+    ///
+    /// # Safety
+    /// Caller owns the HBA + the named port exclusively; `port_idx <
+    /// 32` and the port's PortKind was Sata at probe.
+    pub unsafe fn identify_device(&self, port_idx: u8)
+        -> Result<[u8; 512], AhciError>
+    {
+        let off = PORT_BASE_OFF + (port_idx as u64) * PORT_STRIDE;
+
+        // Stop the port if it's running.
+        // SAFETY: port_idx bound is the caller's contract.
+        let _ = unsafe { self.port_idle(port_idx) };
+
+        // Allocate one 4 KiB DMA page covering everything:
+        //   +0x000  Command List  (1 KiB, 32 entries × 32 bytes)
+        //   +0x400  Received FIS  (256 bytes)
+        //   +0x500  Command Table (128 bytes — 64 cfis + 0 acmd + 16 PRDT0)
+        //   +0x600  Data buffer   (512 bytes for IDENTIFY response)
+        let scratch = alloc_coherent(4096, DomainId::DRIVER_0)
+            .map_err(|_| AhciError::BarMapFailed)?;
+        let base = scratch.phys_addr().raw();
+        let cmd_list = base + 0x000;
+        let fis_recv = base + 0x400;
+        let cmd_tbl  = base + 0x500;
+        let data_buf = base + 0x600;
+
+        // Zero the regions we touch.
+        // SAFETY: identity-mapped DMA page.
+        unsafe {
+            for i in 0..(0x600 + 512) {
+                core::ptr::write_volatile(
+                    (base + i as u64) as *mut u8, 0);
+            }
+        }
+
+        // Command List entry 0: H[5..0] = FIS length in DWORDs (5
+        // for H2D Register FIS), W bit = 0 (read), PRDT length = 1.
+        // Fields:
+        //   +0x00 u32 = (PRDT length << 16) | flags
+        //   +0x04 u32 = bytes transferred (RW; HBA writes)
+        //   +0x08 u64 = command-table phys
+        //
+        // CFL = 5 (H2D FIS = 5 DWORDs). Bits[4:0]. R=0, B=0, C=0,
+        // RST=0, P=0. PRDT length = 1.
+        // SAFETY: identity-mapped DMA.
+        unsafe {
+            core::ptr::write_volatile(cmd_list as *mut u32,
+                (1u32 << 16) | 5);
+            core::ptr::write_volatile((cmd_list + 4) as *mut u32, 0);
+            core::ptr::write_volatile((cmd_list + 8) as *mut u64, cmd_tbl);
+        }
+
+        // Command Table:
+        //   +0x00..0x40  CFIS (Command FIS — 64 bytes)
+        //   +0x40..0x50  ACMD (ATAPI command — 16 bytes; unused)
+        //   +0x50..0x80  Reserved
+        //   +0x80..0x90  PRDT entry 0 (16 bytes)
+        //
+        // CFIS = H2D Register FIS (FIS type 0x27):
+        //   +0  type = 0x27
+        //   +1  bit 7 = C (command), bits[3:0] = port multiplier
+        //   +2  command = 0xEC (IDENTIFY DEVICE)
+        //   +3  features (low) = 0
+        // SAFETY: same DMA page.
+        unsafe {
+            core::ptr::write_volatile(cmd_tbl as *mut u8, 0x27);
+            core::ptr::write_volatile((cmd_tbl + 1) as *mut u8, 0x80);
+            core::ptr::write_volatile((cmd_tbl + 2) as *mut u8, 0xEC);
+        }
+        // PRDT entry 0 at +0x80 of cmd table:
+        //   +0x00 u64 data base PA
+        //   +0x08 u32 reserved
+        //   +0x0C u32 = (Interrupt-on-completion bit 31) | (byte count - 1)
+        let prdt = cmd_tbl + 0x80;
+        // SAFETY: same DMA page.
+        unsafe {
+            core::ptr::write_volatile(prdt as *mut u64, data_buf);
+            core::ptr::write_volatile((prdt + 8) as *mut u32, 0);
+            core::ptr::write_volatile((prdt + 12) as *mut u32, 511);
+        }
+
+        // Program port CLB / FB.
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            self.mmio.write32(off + 0x00, cmd_list as u32);
+            self.mmio.write32(off + 0x04, (cmd_list >> 32) as u32);
+            self.mmio.write32(off + 0x08, fis_recv as u32);
+            self.mmio.write32(off + 0x0C, (fis_recv >> 32) as u32);
+        }
+
+        // Clear PORT_IS / PORT_SERR (write-1-to-clear).
+        // SAFETY: same.
+        let serr = unsafe { self.mmio.read32(off + PORT_SERR) };
+        // SAFETY: same.
+        unsafe { self.mmio.write32(off + PORT_SERR, serr); }
+        // SAFETY: same.
+        unsafe { self.mmio.write32(off + 0x10, 0xFFFF_FFFF); }
+
+        // Start the port (FRE first, then ST).
+        // SAFETY: same.
+        let cmd = unsafe { self.mmio.read32(off + PORT_CMD) };
+        // SAFETY: same.
+        unsafe { self.mmio.write32(off + PORT_CMD, cmd | CMD_FRE); }
+        // SAFETY: same.
+        let cmd = unsafe { self.mmio.read32(off + PORT_CMD) };
+        // SAFETY: same.
+        unsafe { self.mmio.write32(off + PORT_CMD, cmd | CMD_ST); }
+
+        // Issue command 0 by writing PORT_CI bit 0.
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: same.
+        unsafe { self.mmio.write32(off + 0x38, 1); }
+
+        // Poll until CI bit clears.
+        let mut ok = false;
+        for _ in 0..10_000_000u32 {
+            // SAFETY: same.
+            let ci = unsafe { self.mmio.read32(off + 0x38) };
+            // SAFETY: same.
+            let tfd = unsafe { self.mmio.read32(off + 0x20) };
+            if tfd & 0x01 != 0 {  // ERR
+                return Err(AhciError::ResetTimeout);
+            }
+            if ci & 1 == 0 { ok = true; break; }
+            core::hint::spin_loop();
+        }
+        if !ok {
+            return Err(AhciError::ResetTimeout);
+        }
+
+        // Copy out the IDENTIFY DEVICE response.
+        let mut out = [0u8; 512];
+        // SAFETY: identity-mapped DMA.
+        for i in 0..512usize {
+            out[i] = unsafe {
+                core::ptr::read_volatile((data_buf + i as u64) as *const u8)
+            };
+        }
+        // Stop the port.
+        // SAFETY: caller-asserted.
+        let _ = unsafe { self.port_idle(port_idx) };
+        let _ = scratch;
+        Ok(out)
+    }
+}
+
+/// Decode the model-number string from an IDENTIFY DEVICE response.
+/// ATA strings are byte-swapped per pair (ATA-8 §7.16.7.36): byte 54
+/// = char 0 high, byte 55 = char 0 low, etc. 40 bytes total.
+pub fn identify_model(id: &[u8; 512]) -> [u8; 40] {
+    let mut out = [b' '; 40];
+    for i in 0..20 {
+        out[i * 2]     = id[54 + i * 2 + 1];
+        out[i * 2 + 1] = id[54 + i * 2];
+    }
+    out
 }
 
 // ── Driver-match registration ────────────────────────────────────────
