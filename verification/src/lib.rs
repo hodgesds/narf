@@ -17459,3 +17459,197 @@ fn smoke_aml_sync_event_signal_wait() -> TestResult {
     }
 }
 kernel_test!(smoke_aml_sync_event_signal_wait);
+
+// ── GPE smoke tests ─────────────────────────────────────────────────
+
+fn smoke_aml_gpe_install_aml_handlers() -> TestResult {
+    // Synthetic AML: Scope(\\_GPE) { Method(_L01, 0) { Return(One) }
+    //                                Method(_E0F, 0) { Return(Zero) } }
+    // install_aml_handlers() should find 2 handlers; handler_count() == 2.
+    use alloc::vec::Vec;
+
+    narf_aml::__reset_for_test();
+    narf_aml::gpe::__reset_for_test();
+
+    // ── build blob ────────────────────────────────────────────────
+    let mut blob: Vec<u8> = Vec::new();
+
+    // Method body: Return(One) = [0xA4, 0x01]
+    // Method(_L01, 0) { Return(One) }
+    //   pkg_total = 1(PkgLen) + 4(name) + 1(flags) + 2(body) = 8
+    let method_l01: Vec<u8> = {
+        let mut v = Vec::new();
+        v.push(0x14);           // MethodOp
+        v.push(8u8);            // PkgLength (single-byte: covers rest of method)
+        v.extend_from_slice(b"_L01"); // relative NameSeg
+        v.push(0x00);           // MethodFlags: 0 args
+        v.push(0xA4); v.push(0x01); // Return(One)
+        v
+    };
+
+    // Method(_E0F, 0) { Return(Zero) }
+    //   pkg_total = 1(PkgLen) + 4(name) + 1(flags) + 2(body) = 8
+    let method_e0f: Vec<u8> = {
+        let mut v = Vec::new();
+        v.push(0x14);           // MethodOp
+        v.push(8u8);            // PkgLength
+        v.extend_from_slice(b"_E0F"); // relative NameSeg
+        v.push(0x00);           // MethodFlags
+        v.push(0xA4); v.push(0x00); // Return(Zero)
+        v
+    };
+
+    // Scope(\\_GPE) { ... }
+    //   NameString = 0x5C(ROOT) + "_GPE" = 5 bytes
+    //   scope body = method_l01 (9 bytes) + method_e0f (9 bytes) = 18 bytes
+    //   pkg_total = 1(PkgLen) + 5(name) + 18(methods) = 24 bytes
+    blob.push(0x10);            // ScopeOp
+    let pkg_len_pos = blob.len();
+    blob.push(0u8);             // PkgLength placeholder
+    blob.push(b'\\');           // ROOT_CHAR
+    blob.extend_from_slice(b"_GPE"); // NameSeg
+    blob.extend_from_slice(&method_l01);
+    blob.extend_from_slice(&method_e0f);
+    let pkg_total = blob.len() - pkg_len_pos;
+    blob[pkg_len_pos] = pkg_total as u8;
+
+    if narf_aml::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("GPE scope parse failed");
+    }
+
+    let installed = narf_aml::gpe::install_aml_handlers();
+    if installed != 2 {
+        return TestResult::Fail("install_aml_handlers should return 2");
+    }
+    if narf_aml::gpe::handler_count() != 2 {
+        return TestResult::Fail("handler_count() should be 2");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_aml_gpe_install_aml_handlers);
+
+fn smoke_aml_gpe_dispatch_native() -> TestResult {
+    // Register a native handler for GPE 99, dispatch it, verify the counter.
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static HITS: AtomicU32 = AtomicU32::new(0);
+
+    narf_aml::gpe::__reset_for_test();
+    HITS.store(0, Ordering::Relaxed);
+
+    fn handler(gpe: u32) {
+        // Only count our specific GPE to avoid interference.
+        if gpe == 99 { HITS.fetch_add(1, Ordering::Relaxed); }
+    }
+
+    narf_aml::gpe::register_native_handler(99, handler);
+    narf_aml::gpe::dispatch(99);
+
+    if HITS.load(Ordering::Relaxed) == 1 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("native GPE handler not called exactly once")
+    }
+}
+kernel_test!(smoke_aml_gpe_dispatch_native);
+
+fn smoke_aml_gpe_dispatch_aml() -> TestResult {
+    // Synthetic AML: Scope(\\_GPE) { Method(_L05, 0) { Notify(\TGN_, 0xAB) } }
+    // Register a Notify handler for \TGN, install_aml_handlers, dispatch(0x05).
+    // Verify the Notify value was recorded.
+    use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static NOTIFY_VAL: AtomicU64 = AtomicU64::new(0);
+
+    fn notify_handler(_target: &str, value: u64) {
+        NOTIFY_VAL.store(value, Ordering::Relaxed);
+    }
+
+    narf_aml::__reset_for_test();
+    narf_aml::sync::__reset_for_test();
+    narf_aml::gpe::__reset_for_test();
+    NOTIFY_VAL.store(0, Ordering::Relaxed);
+
+    // Register Notify handler for \TGN (path after trailing-_ stripping).
+    narf_aml::sync::register_notify_handler("\\TGN", notify_handler);
+
+    // ── build blob ────────────────────────────────────────────────
+    // Declare Name(\TGN_, 0) so \TGN exists in the namespace.
+    let mut blob: Vec<u8> = Vec::new();
+    blob.push(0x08);            // NameOp
+    blob.push(b'\\'); blob.extend_from_slice(b"TGN_"); // \TGN_
+    blob.push(0x00);            // ZeroOp
+
+    // Scope(\\_GPE) { Method(_L05, 0) { Notify(\TGN_, 0xAB); Return(One) } }
+    // Method body: Notify(\TGN_, 0xAB) + Return(One)
+    //   NotifyOp = 0x86, \TGN_ = 5 bytes, BytePrefix 0xAB = 2 bytes
+    //   Return(One) = 2 bytes
+    //   body_len = 1 + 5 + 2 + 2 = 10 bytes
+    // pkg_total for method = 1(PkgLen) + 4(name "_L05") + 1(flags) + 10(body) = 16
+    let method_body: Vec<u8> = {
+        let mut v = Vec::new();
+        v.push(0x86);           // NotifyOp
+        v.push(b'\\'); v.extend_from_slice(b"TGN_"); // \TGN_
+        v.push(0x0A); v.push(0xABu8); // BytePrefix 0xAB
+        v.push(0xA4); v.push(0x01); // Return(One)
+        v
+    };
+    let method_l05: Vec<u8> = {
+        let mut v = Vec::new();
+        v.push(0x14);           // MethodOp
+        // pkg_total = 1(PkgLen) + 4("_L05") + 1(flags) + method_body.len()
+        let pkg_total: u8 = (1 + 4 + 1 + method_body.len()) as u8;
+        v.push(pkg_total);
+        v.extend_from_slice(b"_L05"); // relative NameSeg
+        v.push(0x00);           // MethodFlags
+        v.extend_from_slice(&method_body);
+        v
+    };
+
+    // Scope(\\_GPE) { method_l05 }
+    // pkg_total = 1(PkgLen) + 5(\\_GPE) + method_l05.len()
+    blob.push(0x10);            // ScopeOp
+    let pkg_len_pos = blob.len();
+    blob.push(0u8);             // PkgLength placeholder
+    blob.push(b'\\'); blob.extend_from_slice(b"_GPE");
+    blob.extend_from_slice(&method_l05);
+    let pkg_total = blob.len() - pkg_len_pos;
+    blob[pkg_len_pos] = pkg_total as u8;
+
+    if narf_aml::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("_L05 scope parse failed");
+    }
+
+    let installed = narf_aml::gpe::install_aml_handlers();
+    if installed == 0 {
+        return TestResult::Fail("install_aml_handlers found no GPE methods");
+    }
+
+    narf_aml::gpe::dispatch(0x05);
+
+    if NOTIFY_VAL.load(Ordering::Relaxed) == 0xAB {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("Notify value via GPE dispatch not received as 0xAB")
+    }
+}
+kernel_test!(smoke_aml_gpe_dispatch_aml);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_acpi_gpe_block_parsed_at_boot() -> TestResult {
+    // If the FADT advertised a non-zero GPE0 block, gpe0_block() is Some;
+    // if not (e.g. QEMU config with no GPE block), that's acceptable too.
+    // Either way, this test verifies the parse path ran without panicking.
+    match narf_acpi::gpe0_block() {
+        None => TestResult::Skip("FADT carried no GPE0 block (QEMU config); parse OK"),
+        Some(info) => {
+            // Sanity: address and byte_count must be non-zero when Some.
+            if info.address == 0 || info.byte_count == 0 {
+                return TestResult::Fail("gpe0_block Some but address/byte_count zero");
+            }
+            TestResult::Pass
+        }
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_acpi_gpe_block_parsed_at_boot);

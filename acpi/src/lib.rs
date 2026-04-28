@@ -1392,6 +1392,133 @@ pub fn __reset_for_test() {
     HMAT_PARSED.store(false, Ordering::Release);
     *PMTT_DATA.lock() = PmttTables::EMPTY;
     PMTT_PARSED.store(false, Ordering::Release);
+    *GPE0_BLOCK.lock() = None;
+    *GPE1_BLOCK.lock() = None;
+}
+
+// ── FADT (Fixed ACPI Description Table) → GPE block pointers ────────
+//
+// GPE0_BLK and GPE1_BLK carry port or memory addresses for the General
+// Purpose Event register blocks. ACPI 2.0+ adds extended 64-bit GAS
+// versions (X_GPE0_BLK / X_GPE1_BLK) in the extended FADT.
+//
+// FADT body offsets (including the 36-byte SDT header in the count):
+//   80:  GPE0_BLK        u32  — legacy 32-bit address
+//   84:  GPE1_BLK        u32  — legacy 32-bit address
+//   92:  GPE0_BLK_LEN    u8   — byte count
+//   93:  GPE1_BLK_LEN    u8   — byte count
+//   95:  GPE1_BASE       u8   — GPE1 event offset (base GSI for GPE1)
+//   220: X_GPE0_BLK      12-byte GAS (ACPI 2.0+, valid when total ≥ 232)
+//   232: X_GPE1_BLK      12-byte GAS
+//
+// GAS layout (ACPI §5.2.3.2 Generic Address Structure):
+//   [0]:    address_space_id  u8
+//   [1]:    bit_width         u8
+//   [2]:    bit_offset        u8
+//   [3]:    access_size       u8
+//   [4..12]: address          u64 LE
+
+/// Descriptor for one GPE register block.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct GpeBlockInfo {
+    /// Base port / MMIO address of the block.
+    pub address:    u64,
+    /// Total byte count of the status+enable register pair.
+    pub byte_count: u8,
+    /// First GPE number this block handles (0 for GPE0, GPE1_BASE for GPE1).
+    pub base_gsi:   u32,
+}
+
+static GPE0_BLOCK: IrqSafeSpinLock<Option<GpeBlockInfo>> = IrqSafeSpinLock::new(None);
+static GPE1_BLOCK: IrqSafeSpinLock<Option<GpeBlockInfo>> = IrqSafeSpinLock::new(None);
+
+/// Parse the FADT to discover GPE0 and GPE1 block descriptors. Uses
+/// X_GPE0_BLK / X_GPE1_BLK when the FADT total length is ≥ 232 and
+/// the extended address is non-zero; falls back to legacy 32-bit fields.
+///
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → FADT pointers it leads to must also be identity-mapped.
+pub unsafe fn parse_gpe_blocks(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut fadt: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"FACP" && fadt.is_none() { fadt = Some(phys); }
+        })?;
+    }
+    let fadt = fadt.ok_or(AcpiError::NoSrat)?;
+
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (fadt as *const SdtHeader).read_unaligned().length as usize
+    };
+    // Need at least offset 96 (past GPE1_BASE at byte 95).
+    if total < 96 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(fadt as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+
+    // ── legacy fields ────────────────────────────────────────────────
+    let legacy_gpe0_addr = u32::from_le_bytes([
+        body[80], body[81], body[82], body[83],
+    ]) as u64;
+    let legacy_gpe1_addr = u32::from_le_bytes([
+        body[84], body[85], body[86], body[87],
+    ]) as u64;
+    let gpe0_len    = body[92];
+    let gpe1_len    = body[93];
+    let gpe1_base   = body[95] as u32;
+
+    // ── extended GAS fields (ACPI 2.0+, FADT total ≥ 232+12=244) ───
+    // X_GPE0_BLK is at offset 220, X_GPE1_BLK at 232. Each is 12 bytes.
+    let (x_gpe0_addr, x_gpe1_addr) = if total >= 244 {
+        // GAS address is at byte offset 4 within the 12-byte GAS struct.
+        let x0 = u64::from_le_bytes([
+            body[220 + 4], body[220 + 5], body[220 + 6], body[220 + 7],
+            body[220 + 8], body[220 + 9], body[220 + 10], body[220 + 11],
+        ]);
+        let x1 = u64::from_le_bytes([
+            body[232 + 4], body[232 + 5], body[232 + 6], body[232 + 7],
+            body[232 + 8], body[232 + 9], body[232 + 10], body[232 + 11],
+        ]);
+        (x0, x1)
+    } else {
+        (0, 0)
+    };
+
+    // ── choose best address ──────────────────────────────────────────
+    let gpe0_addr = if x_gpe0_addr != 0 { x_gpe0_addr } else { legacy_gpe0_addr };
+    let gpe1_addr = if x_gpe1_addr != 0 { x_gpe1_addr } else { legacy_gpe1_addr };
+
+    if gpe0_addr != 0 && gpe0_len != 0 {
+        *GPE0_BLOCK.lock() = Some(GpeBlockInfo {
+            address:    gpe0_addr,
+            byte_count: gpe0_len,
+            base_gsi:   0,
+        });
+    }
+    if gpe1_addr != 0 && gpe1_len != 0 {
+        *GPE1_BLOCK.lock() = Some(GpeBlockInfo {
+            address:    gpe1_addr,
+            byte_count: gpe1_len,
+            base_gsi:   gpe1_base,
+        });
+    }
+
+    Ok(())
+}
+
+/// GPE0 block descriptor from the most recent `parse_gpe_blocks` call.
+pub fn gpe0_block() -> Option<GpeBlockInfo> {
+    *GPE0_BLOCK.lock()
+}
+
+/// GPE1 block descriptor from the most recent `parse_gpe_blocks` call.
+pub fn gpe1_block() -> Option<GpeBlockInfo> {
+    *GPE1_BLOCK.lock()
 }
 
 /// Raw SRAT entry kinds. Exposed for tests/diagnostics that want to

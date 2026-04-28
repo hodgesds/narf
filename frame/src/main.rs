@@ -378,6 +378,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                     "  aml: namespace build skipped: {:?}", e);
                             }
                         }
+                        // SAFETY: same RSDP, validated above.
+                        let _ = unsafe { narf_acpi::parse_gpe_blocks(p) };
+                        let n = narf_aml::gpe::install_aml_handlers();
+                        let _ = writeln!(console::Writer,
+                            "  acpi: GPE blocks parsed, {} AML handler(s)", n);
                         // SAFETY: same.
                         match unsafe { narf_acpi::parse_pmtt(p) } {
                             Ok(n) => {
