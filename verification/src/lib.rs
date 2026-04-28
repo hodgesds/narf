@@ -17241,3 +17241,209 @@ fn smoke_aml_oregion_pci_config_resolves() -> TestResult {
     }
 }
 kernel_test!(smoke_aml_oregion_pci_config_resolves);
+
+// ── AML sync smoke tests ──────────────────────────────────────────────────────
+//
+// These tests add synthetic Mutex/Event/Method nodes to the global namespace
+// (no __reset_for_test call on the namespace) using unique 4-char NameSegs
+// SM1..SM6 / TGT to avoid collisions with any other test nodes.
+
+/// Build a 7-byte NameString encoding `\XXXX` (root char + 4-byte NameSeg).
+fn name_seg_root(seg: &[u8; 4]) -> alloc::vec::Vec<u8> {
+    let mut v = alloc::vec::Vec::new();
+    v.push(b'\\');
+    v.extend_from_slice(seg);
+    v
+}
+
+fn smoke_aml_sync_mutex_acquire_release() -> TestResult {
+    // Declare Mutex(\SM1_, 0) then Method(\SM2_, 0) {
+    //   Acquire(\SM1, 0xFFFF); Release(\SM1); Return(One)
+    // }
+    // Evaluate \SM2; expect Integer(1).
+    use alloc::vec::Vec;
+
+    // -- Mutex(\SM1_, 0) declaration --
+    // EXT_OP_PREFIX EXT_MUTEX_OP NameString SyncFlags
+    let mut blob: Vec<u8> = Vec::new();
+    blob.push(0x5B);                      // EXT_OP_PREFIX
+    blob.push(0x01);                      // EXT_MUTEX_OP
+    blob.extend_from_slice(&name_seg_root(b"SM1_")); // \SM1_
+    blob.push(0x00);                      // SyncFlags
+
+    // -- Method(\SM2_, 0) body --
+    // AcquireOp \SM1_ 0xFFFF
+    let mut body: Vec<u8> = Vec::new();
+    body.push(0x5B); body.push(0x23);    // AcquireOp
+    body.extend_from_slice(&name_seg_root(b"SM1_")); // \SM1_
+    body.push(0xFF); body.push(0xFF);    // timeout = 0xFFFF
+    // ReleaseOp \SM1_
+    body.push(0x5B); body.push(0x27);    // ReleaseOp
+    body.extend_from_slice(&name_seg_root(b"SM1_")); // \SM1_
+    // Return(One)
+    body.push(0xA4); body.push(0x01);    // ReturnOp OneOp
+
+    // pkg_total = 1(pkglen) + 1(root) + 4(seg) + 1(flags) + body.len()
+    let pkg_total = 1 + 1 + 4 + 1 + body.len();
+    blob.push(0x14);                         // MethodOp
+    blob.push(pkg_total as u8);              // single-byte PkgLength
+    blob.extend_from_slice(&name_seg_root(b"SM2_")); // \SM2_
+    blob.push(0x00);                         // MethodFlags
+    blob.extend_from_slice(&body);
+
+    if narf_aml::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("SM2 parse failed");
+    }
+    // Clear any stale mutex state from a prior run (sync state only).
+    narf_aml::sync::__reset_for_test();
+
+    match narf_aml::eval::evaluate_method("\\SM2", &[]) {
+        Ok(narf_aml::Value::Integer(1)) => TestResult::Pass,
+        Ok(v) => {
+            let _ = v;
+            TestResult::Fail("expected Integer(1) from SM2")
+        }
+        Err(_) => TestResult::Fail("evaluate_method \\SM2 failed"),
+    }
+}
+kernel_test!(smoke_aml_sync_mutex_acquire_release);
+
+fn smoke_aml_sync_stall_sleep_no_trap() -> TestResult {
+    // Method(\SM3_, 0) { Stall(10); Sleep(1); Return(0x42) }
+    // Must not trap; expect Integer(0x42).
+    use alloc::vec::Vec;
+
+    // StallOp BytePrefix 10
+    let mut body: Vec<u8> = Vec::new();
+    body.push(0x5B); body.push(0x21);   // StallOp
+    body.push(0x0A); body.push(10);     // BytePrefix 10
+    // SleepOp BytePrefix 1
+    body.push(0x5B); body.push(0x22);   // SleepOp
+    body.push(0x0A); body.push(1);      // BytePrefix 1
+    // Return(0x42)
+    body.push(0xA4);                    // ReturnOp
+    body.push(0x0A); body.push(0x42);   // BytePrefix 0x42
+
+    let pkg_total = 1 + 1 + 4 + 1 + body.len();
+    let mut blob: Vec<u8> = Vec::new();
+    blob.push(0x14);
+    blob.push(pkg_total as u8);
+    blob.extend_from_slice(&name_seg_root(b"SM3_"));
+    blob.push(0x00);
+    blob.extend_from_slice(&body);
+
+    if narf_aml::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("SM3 parse failed");
+    }
+    match narf_aml::eval::evaluate_method("\\SM3", &[]) {
+        Ok(narf_aml::Value::Integer(0x42)) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("expected Integer(0x42) from SM3"),
+        Err(_) => TestResult::Fail("evaluate_method \\SM3 failed"),
+    }
+}
+kernel_test!(smoke_aml_sync_stall_sleep_no_trap);
+
+fn smoke_aml_sync_notify_dispatch() -> TestResult {
+    // Register a handler that stores the notified value into a static.
+    // Method(\SM4_, 0) { Notify(\TGT_, 5); Return(One) }
+    // Also register a Name(\TGT_, 0) so the path is in the namespace.
+    use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static NOTIFY_VAL: AtomicU64 = AtomicU64::new(0);
+
+    fn handler(_target: &str, value: u64) {
+        NOTIFY_VAL.store(value, Ordering::Relaxed);
+    }
+
+    // Register the handler for \TGT (the path read_name_string will produce
+    // from the 4-byte seg "TGT_" with trailing underscore stripped).
+    narf_aml::sync::register_notify_handler("\\TGT", handler);
+
+    // Declare Name(\TGT_, 0) so \TGT exists in the namespace.
+    let mut blob: Vec<u8> = Vec::new();
+    blob.push(0x08);                          // NameOp
+    blob.extend_from_slice(&name_seg_root(b"TGT_")); // \TGT_
+    blob.push(0x00);                          // ZeroOp (value = 0)
+
+    // Method(\SM4_, 0) { Notify(\TGT_, 5); Return(One) }
+    // NotifyOp \TGT_ BytePrefix 5 → 0x86 0x5C TGT_ 0x0A 0x05
+    let mut body: Vec<u8> = Vec::new();
+    body.push(0x86);                          // NotifyOp
+    body.extend_from_slice(&name_seg_root(b"TGT_")); // \TGT_
+    body.push(0x0A); body.push(5);           // BytePrefix 5
+    body.push(0xA4); body.push(0x01);        // Return(One)
+
+    let pkg_total = 1 + 1 + 4 + 1 + body.len();
+    blob.push(0x14);
+    blob.push(pkg_total as u8);
+    blob.extend_from_slice(&name_seg_root(b"SM4_"));
+    blob.push(0x00);
+    blob.extend_from_slice(&body);
+
+    if narf_aml::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("SM4 parse failed");
+    }
+
+    NOTIFY_VAL.store(0, Ordering::Relaxed);
+    match narf_aml::eval::evaluate_method("\\SM4", &[]) {
+        Err(_) => return TestResult::Fail("evaluate_method \\SM4 failed"),
+        Ok(_)  => {}
+    }
+    if NOTIFY_VAL.load(Ordering::Relaxed) == 5 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("notify handler not called with value 5")
+    }
+}
+kernel_test!(smoke_aml_sync_notify_dispatch);
+
+fn smoke_aml_sync_event_signal_wait() -> TestResult {
+    // Event(\SM5_) + Method(\SM6_, 0) {
+    //   Reset(\SM5); Signal(\SM5); Wait(\SM5, 0xFFFF); Return(One)
+    // }
+    // Wait returns Integer(0) = signaled (ACPI); the method still returns
+    // Integer(1) via Return(One). Expect Integer(1).
+    use alloc::vec::Vec;
+
+    // -- Event(\SM5_) declaration --
+    let mut blob: Vec<u8> = Vec::new();
+    blob.push(0x5B);                          // EXT_OP_PREFIX
+    blob.push(0x02);                          // EXT_EVENT_OP
+    blob.extend_from_slice(&name_seg_root(b"SM5_")); // \SM5_
+
+    // -- Method(\SM6_, 0) body --
+    // Reset(\SM5_): 0x5B 0x26 \SM5_
+    let mut body: Vec<u8> = Vec::new();
+    body.push(0x5B); body.push(0x26);        // ResetOp
+    body.extend_from_slice(&name_seg_root(b"SM5_")); // \SM5_
+    // Signal(\SM5_): 0x5B 0x24 \SM5_
+    body.push(0x5B); body.push(0x24);        // SignalOp
+    body.extend_from_slice(&name_seg_root(b"SM5_")); // \SM5_
+    // Wait(\SM5_, 0xFFFF): 0x5B 0x25 \SM5_ WordPrefix 0xFFFF
+    body.push(0x5B); body.push(0x25);        // WaitOp
+    body.extend_from_slice(&name_seg_root(b"SM5_")); // \SM5_
+    body.push(0x0B); body.push(0xFF); body.push(0xFF); // WordPrefix 0xFFFF
+    // Return(One): 0xA4 0x01
+    body.push(0xA4); body.push(0x01);
+
+    let pkg_total = 1 + 1 + 4 + 1 + body.len();
+    blob.push(0x14);
+    blob.push(pkg_total as u8);
+    blob.extend_from_slice(&name_seg_root(b"SM6_"));
+    blob.push(0x00);
+    blob.extend_from_slice(&body);
+
+    if narf_aml::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("SM6 parse failed");
+    }
+    // Clear any stale event state.
+    narf_aml::sync::__reset_for_test();
+
+    match narf_aml::eval::evaluate_method("\\SM6", &[]) {
+        Ok(narf_aml::Value::Integer(1)) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("expected Integer(1) from SM6"),
+        Err(_) => TestResult::Fail("evaluate_method \\SM6 failed"),
+    }
+}
+kernel_test!(smoke_aml_sync_event_signal_wait);

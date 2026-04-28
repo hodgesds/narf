@@ -410,12 +410,74 @@ fn eval_term(
             *cur = pkg_end;
         }
 
+        // ── NotifyOp (0x86): SuperName TermArg ────────────────────────────
+        0x86 => {
+            let target = read_name_string(buf, cur, "\\")?;
+            let value  = eval_term_arg(buf, cur, state)?.as_integer();
+            crate::sync::dispatch_notify(&target, value);
+        }
+
         // ── Extended opcodes (0x5B prefix) ────────────────────────────────
         0x5B => {
-            // Extended opcode — read second byte and skip.
-            let _ext = next_u8(buf, cur)?;
-            // We don't evaluate extended opcodes (Mutex acquire/release,
-            // etc.) — treat as noop.
+            let ext = next_u8(buf, cur)?;
+            match ext {
+                // StallOp: 0x5B 0x21  TermArg(microseconds)
+                0x21 => {
+                    let us = eval_term_arg(buf, cur, state)?.as_integer();
+                    crate::sync::stall(us as u32);
+                }
+                // SleepOp: 0x5B 0x22  TermArg(milliseconds)
+                0x22 => {
+                    let ms = eval_term_arg(buf, cur, state)?.as_integer();
+                    crate::sync::sleep(ms as u32);
+                }
+                // AcquireOp: 0x5B 0x23  SuperName  u16-timeout
+                0x23 => {
+                    let name = read_name_string(buf, cur, "\\")?;
+                    let lo   = next_u8(buf, cur)? as u16;
+                    let hi   = next_u8(buf, cur)? as u16;
+                    let timeout = lo | (hi << 8);
+                    // Result (0=acquired, 1=timeout) is discarded at
+                    // statement level.
+                    let _ = crate::sync::acquire(&name, timeout);
+                }
+                // SignalOp: 0x5B 0x24  SuperName
+                0x24 => {
+                    let name = read_name_string(buf, cur, "\\")?;
+                    let _ = crate::sync::signal(&name);
+                }
+                // WaitOp: 0x5B 0x25  SuperName  TermArg(timeout)
+                0x25 => {
+                    let name    = read_name_string(buf, cur, "\\")?;
+                    let timeout = eval_term_arg(buf, cur, state)?.as_integer();
+                    // Result discarded at statement level.
+                    let _ = crate::sync::wait(&name, timeout as u16);
+                }
+                // ResetOp: 0x5B 0x26  SuperName
+                0x26 => {
+                    let name = read_name_string(buf, cur, "\\")?;
+                    let _ = crate::sync::reset(&name);
+                }
+                // ReleaseOp: 0x5B 0x27  SuperName
+                0x27 => {
+                    let name = read_name_string(buf, cur, "\\")?;
+                    let _ = crate::sync::release(&name);
+                }
+                // FatalOp: 0x5B 0x32  u8-type  u32-code  TermArg
+                0x32 => {
+                    let _ftype = next_u8(buf, cur)?;
+                    // 4-byte code (little-endian).
+                    let mut code = 0u32;
+                    for i in 0..4u32 {
+                        code |= (next_u8(buf, cur)? as u32) << (i * 8);
+                    }
+                    let _arg = eval_term_arg(buf, cur, state)?.as_integer();
+                    // Log and continue — don't halt.
+                    let _ = code;
+                }
+                // Unknown extended op — skip (best-effort).
+                _ => {}
+            }
         }
 
         // ── NameString as statement (method call or name access) ──────────
@@ -728,10 +790,86 @@ fn eval_term_arg(
             }
         }
 
-        // Extended opcodes (0x5B xx) — skip, return 0.
-        0x5B => {
-            let _ext = next_u8(buf, cur)?;
+        // ── NotifyOp (0x86) as TermArg ────────────────────────────────────
+        0x86 => {
+            let target = read_name_string(buf, cur, "\\")?;
+            let value  = eval_term_arg(buf, cur, state)?.as_integer();
+            crate::sync::dispatch_notify(&target, value);
             Value::Integer(0)
+        }
+
+        // ── Extended opcodes (0x5B prefix) as TermArg ─────────────────────
+        0x5B => {
+            let ext = next_u8(buf, cur)?;
+            match ext {
+                // StallOp: 0x5B 0x21  TermArg
+                0x21 => {
+                    let us = eval_term_arg(buf, cur, state)?.as_integer();
+                    crate::sync::stall(us as u32);
+                    Value::Integer(0)
+                }
+                // SleepOp: 0x5B 0x22  TermArg
+                0x22 => {
+                    let ms = eval_term_arg(buf, cur, state)?.as_integer();
+                    crate::sync::sleep(ms as u32);
+                    Value::Integer(0)
+                }
+                // AcquireOp: 0x5B 0x23  SuperName  u16-timeout
+                // Returns Integer(0) = acquired, Integer(1) = timeout (ACPI spec).
+                0x23 => {
+                    let name = read_name_string(buf, cur, "\\")?;
+                    let lo   = next_u8(buf, cur)? as u16;
+                    let hi   = next_u8(buf, cur)? as u16;
+                    let timeout = lo | (hi << 8);
+                    match crate::sync::acquire(&name, timeout) {
+                        Ok(true)  => Value::Integer(0), // acquired
+                        Ok(false) => Value::Integer(1), // timeout
+                        Err(_)    => Value::Integer(1),
+                    }
+                }
+                // SignalOp: 0x5B 0x24  SuperName
+                0x24 => {
+                    let name = read_name_string(buf, cur, "\\")?;
+                    let _ = crate::sync::signal(&name);
+                    Value::Integer(0)
+                }
+                // WaitOp: 0x5B 0x25  SuperName  TermArg(timeout)
+                // Returns Integer(0) = signaled, Integer(1) = timeout (ACPI spec).
+                0x25 => {
+                    let name    = read_name_string(buf, cur, "\\")?;
+                    let timeout = eval_term_arg(buf, cur, state)?.as_integer();
+                    match crate::sync::wait(&name, timeout as u16) {
+                        Ok(true)  => Value::Integer(0), // signaled
+                        Ok(false) => Value::Integer(1), // timeout
+                        Err(_)    => Value::Integer(1),
+                    }
+                }
+                // ResetOp: 0x5B 0x26  SuperName
+                0x26 => {
+                    let name = read_name_string(buf, cur, "\\")?;
+                    let _ = crate::sync::reset(&name);
+                    Value::Integer(0)
+                }
+                // ReleaseOp: 0x5B 0x27  SuperName
+                0x27 => {
+                    let name = read_name_string(buf, cur, "\\")?;
+                    let _ = crate::sync::release(&name);
+                    Value::Integer(0)
+                }
+                // FatalOp: 0x5B 0x32  u8-type  u32-code  TermArg
+                0x32 => {
+                    let _ftype = next_u8(buf, cur)?;
+                    let mut code = 0u32;
+                    for i in 0..4u32 {
+                        code |= (next_u8(buf, cur)? as u32) << (i * 8);
+                    }
+                    let _arg = eval_term_arg(buf, cur, state)?.as_integer();
+                    let _ = code;
+                    Value::Integer(0)
+                }
+                // Unknown — return 0.
+                _ => Value::Integer(0),
+            }
         }
 
         // Default: return 0.

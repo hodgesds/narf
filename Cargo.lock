@@ -388,6 +388,7 @@ dependencies = [
  "narf-acpi",
  "narf-lib",
  "narf-memory",
+ "narf-time",
 ]
 
 [[package]]
