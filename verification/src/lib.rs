@@ -7448,26 +7448,38 @@ kernel_test!(smoke_acpi_mcfg_ecam_base);
 #[cfg(target_arch = "x86_64")]
 fn smoke_aml_namespace_built_at_boot() -> TestResult {
     // Boot built the namespace from DSDT + SSDTs. QEMU q35 ships
-    // a substantial table set; expect a non-trivial node count and
-    // at least a handful of Device declarations.
+    // a substantial table set; expect ≥4 Device declarations.
     //
-    // Re-parse if the namespace was cleared by a preceding test (e.g.
-    // __reset_for_test calls from eval/oregion test scaffolding).
-    if narf_aml::node_count() == 0 {
+    // Other tests in the harness mutate the global namespace
+    // (synthetic-body parsing, __reset_for_test calls). Re-parse
+    // whenever the device count is below threshold, not just when
+    // node_count == 0 — a previous test may leave a few non-Device
+    // nodes that satisfy node_count > 0 but not the device check.
+    let mut dev_count = 0u32;
+    narf_aml::for_each_device(|_| { dev_count += 1; });
+    if dev_count < 4 {
         let rsdp = match narf_acpi::cached_rsdp() {
             Some(p) => p,
             None    => return TestResult::Fail("no boot-time RSDP cached"),
         };
         // SAFETY: cached RSDP, validated at boot; identity-mapped.
-        if unsafe { narf_aml::parse_namespace(rsdp) }.is_err() {
-            return TestResult::Fail("AML namespace empty and re-parse failed");
+        match unsafe { narf_aml::parse_namespace(rsdp) } {
+            Ok(_)  => {}
+            Err(e) => return TestResult::Fail(match e {
+                narf_aml::AmlError::Truncated      => "re-parse: truncated",
+                narf_aml::AmlError::BadPkgLength   => "re-parse: bad pkglen",
+                narf_aml::AmlError::OutOfPkg       => "re-parse: out of pkg",
+                narf_aml::AmlError::Acpi(_)        => "re-parse: acpi err",
+                narf_aml::AmlError::BadNameSegment => "re-parse: bad nameseg",
+                narf_aml::AmlError::NoDsdt         => "re-parse: no dsdt",
+            }),
         }
+        dev_count = 0;
+        narf_aml::for_each_device(|_| { dev_count += 1; });
     }
     if narf_aml::node_count() == 0 {
         return TestResult::Fail("AML namespace still empty after re-parse");
     }
-    let mut dev_count = 0u32;
-    narf_aml::for_each_device(|_| { dev_count += 1; });
     if dev_count < 4 {
         return TestResult::Fail("expected >=4 devices in AML namespace");
     }

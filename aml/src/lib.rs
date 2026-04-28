@@ -225,7 +225,9 @@ pub unsafe fn parse_namespace(rsdp_phys: PhysAddr) -> Result<u32, AmlError> {
     {
         let mut g = NAMESPACE.lock();
         g.nodes.clear();
+        g.aml.clear();
     }
+    oregion::__reset_for_test();
 
     // SAFETY: caller assertion.
     let dsdt = unsafe { narf_acpi::parse_fadt_for_dsdt(rsdp_phys) }?;
