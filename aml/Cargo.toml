@@ -1,0 +1,20 @@
+[package]
+name         = "narf-aml"
+description  = "Minimum-viable AML (DSDT/SSDT) namespace builder."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_aml"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib    = { path = "../lib" }
+narf-acpi   = { path = "../acpi" }
+narf-memory = { path = "../memory" }
+
+[lints]
+workspace = true

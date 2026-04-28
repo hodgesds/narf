@@ -789,6 +789,93 @@ pub fn mcfg_ecam_base() -> Option<u64> {
     if v == 0 { None } else { Some(v) }
 }
 
+// ── FADT (Fixed ACPI Description Table) → DSDT pointer ─────────────
+//
+// FADT signature is `"FACP"`. Most fields are platform-power
+// related; for our purposes we only need the DSDT pointer:
+//   offset 40 (u32 DSDT) — the legacy 32-bit pointer.
+//   offset 140 (u64 X_DSDT) — the extended 64-bit pointer (ACPI 2.0+).
+// Use X_DSDT when non-zero, fall back to DSDT.
+
+static DSDT_PHYS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Discover the DSDT physical address by walking the XSDT to find
+/// the FADT and reading its DSDT/X_DSDT field.
+///
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → FADT pointers it leads to must also be identity-mapped.
+pub unsafe fn parse_fadt_for_dsdt(rsdp_phys: PhysAddr) -> Result<u64, AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut fadt: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"FACP" && fadt.is_none() { fadt = Some(phys); }
+        })?;
+    }
+    let fadt = fadt.ok_or(AcpiError::NoSrat)?;
+
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (fadt as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < 44 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(fadt as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+
+    // Legacy DSDT pointer at offset 40 (4 bytes).
+    let legacy_dsdt = u32::from_le_bytes([
+        body[40], body[41], body[42], body[43],
+    ]) as u64;
+
+    // X_DSDT at offset 140 (8 bytes), ACPI 2.0+. Some FADTs are
+    // shorter and don't carry it.
+    let x_dsdt = if total >= 148 {
+        u64::from_le_bytes([
+            body[140], body[141], body[142], body[143],
+            body[144], body[145], body[146], body[147],
+        ])
+    } else { 0 };
+
+    let dsdt = if x_dsdt != 0 { x_dsdt } else { legacy_dsdt };
+    if dsdt == 0 { return Err(AcpiError::NoSrat); }
+    DSDT_PHYS.store(dsdt, Ordering::Release);
+    Ok(dsdt)
+}
+
+/// DSDT physical address from the most recent `parse_fadt_for_dsdt` call.
+pub fn dsdt_phys() -> Option<u64> {
+    let v = DSDT_PHYS.load(Ordering::Acquire);
+    if v == 0 { None } else { Some(v) }
+}
+
+/// Walk every SSDT pointer in the XSDT, calling `f` with each
+/// SSDT's physical pointer + header. AML namespace builders need
+/// to walk DSDT *and* every SSDT to assemble the complete
+/// namespace.
+///
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain
+/// of XSDT → SSDT pointers must also be identity-mapped.
+pub unsafe fn walk_ssdts<F>(rsdp_phys: PhysAddr, mut f: F) -> Result<(), AcpiError>
+where
+    F: FnMut(u64, &SdtHeader),
+{
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"SSDT" { f(phys, hdr); }
+        })?;
+    }
+    Ok(())
+}
+
 // ── HMAT (Heterogeneous Memory Attribute Table) ─────────────────────
 //
 // HMAT signature is `"HMAT"`. After the SDT header + 4 reserved
@@ -1300,6 +1387,7 @@ pub fn __reset_for_test() {
     MADT_CPU_COUNT.store(0, Ordering::Release);
     LAPIC_BASE.store(0, Ordering::Release);
     MCFG_BASE.store(0, Ordering::Release);
+    DSDT_PHYS.store(0, Ordering::Release);
     *HMAT_DATA.lock() = HmatTables::EMPTY;
     HMAT_PARSED.store(false, Ordering::Release);
     *PMTT_DATA.lock() = PmttTables::EMPTY;

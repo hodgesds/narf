@@ -7446,6 +7446,125 @@ fn smoke_acpi_mcfg_ecam_base() -> TestResult {
 kernel_test!(smoke_acpi_mcfg_ecam_base);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_aml_namespace_built_at_boot() -> TestResult {
+    // Boot built the namespace from DSDT + SSDTs. QEMU q35 ships
+    // a substantial table set; expect a non-trivial node count and
+    // at least a handful of Device declarations.
+    if narf_aml::node_count() == 0 {
+        return TestResult::Fail("AML namespace empty");
+    }
+    let mut dev_count = 0u32;
+    narf_aml::for_each_device(|_| { dev_count += 1; });
+    if dev_count < 4 {
+        return TestResult::Fail("expected >=4 devices in AML namespace");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_aml_namespace_built_at_boot);
+
+fn smoke_aml_synthetic_scope_and_name() -> TestResult {
+    // Synthetic AML body: Scope(\X) { Name(_HID, 0x12345678) }.
+    // ScopeOp(0x10), PkgLength, NameString(\X), TermList:
+    //   NameOp(0x08), NameString(_HID), DWordPrefix, 0x78 0x56 0x34 0x12.
+    narf_aml::__reset_for_test();
+
+    let mut body: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    body.push(0x10); // ScopeOp
+    // We'll patch PkgLength after building the body.
+    let pkg_len_pos = body.len();
+    body.push(0); // placeholder
+    // NameString: \X___ (root + 1 seg, name "X" padded to 4 chars).
+    body.push(b'\\');
+    body.extend_from_slice(b"X___");
+    // Body inside scope: Name(_HID, DWord 0x12345678)
+    body.push(0x08); // NameOp
+    body.extend_from_slice(b"_HID");
+    body.push(0x0C); // DWord prefix
+    body.extend_from_slice(&0x12345678u32.to_le_bytes());
+
+    // Pkg length covers from pkg_len_pos to end of body (NOT
+    // including ScopeOp byte). Single-byte form supports up to
+    // 0x3F bytes — easily fits.
+    let pkg_total = body.len() - pkg_len_pos;
+    body[pkg_len_pos] = pkg_total as u8;
+
+    let n = match narf_aml::__parse_body_for_test(&body, "\\") {
+        Ok(n) => n,
+        Err(e) => return TestResult::Fail(match e {
+            narf_aml::AmlError::Truncated   => "truncated",
+            narf_aml::AmlError::BadPkgLength=> "bad pkglen",
+            narf_aml::AmlError::OutOfPkg    => "out of pkg",
+            narf_aml::AmlError::Acpi(_)     => "acpi err",
+            narf_aml::AmlError::BadNameSegment => "bad nameseg",
+            narf_aml::AmlError::NoDsdt      => "no dsdt",
+        }),
+    };
+    if n != 2 {
+        return TestResult::Fail("expected 2 nodes (Scope + Name)");
+    }
+
+    let scope = match narf_aml::find_node("\\X") {
+        Some(s) => s,
+        None    => return TestResult::Fail("Scope \\X missing"),
+    };
+    if scope.kind != narf_aml::NodeKind::Scope {
+        return TestResult::Fail("Scope kind wrong");
+    }
+
+    let hid = match narf_aml::find_node("\\X._HID") {
+        Some(n) => n,
+        None    => return TestResult::Fail("\\X._HID missing"),
+    };
+    match hid.value {
+        Some(narf_aml::NameValue::Integer(v)) if v == 0x12345678 => {}
+        _ => return TestResult::Fail("_HID value didn't decode"),
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_aml_synthetic_scope_and_name);
+
+fn smoke_aml_synthetic_method_skipped() -> TestResult {
+    // Method(\Y, 0) { Return(One) }. Verify Method is registered as
+    // a node, body offset/length recorded, and the sentinel Return
+    // op (0xA4 0x01) inside the body isn't treated as a top-level
+    // declaration.
+    narf_aml::__reset_for_test();
+
+    let mut body: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    body.push(0x14); // MethodOp
+    let pkg_len_pos = body.len();
+    body.push(0);
+    body.push(b'\\');
+    body.extend_from_slice(b"Y___");
+    body.push(0); // method flags: 0 args
+    body.push(0xA4); // ReturnOp
+    body.push(0x01); // OneOp
+    let pkg_total = body.len() - pkg_len_pos;
+    body[pkg_len_pos] = pkg_total as u8;
+
+    let n = match narf_aml::__parse_body_for_test(&body, "\\") {
+        Ok(n) => n,
+        Err(_) => return TestResult::Fail("parse failed"),
+    };
+    if n != 1 {
+        return TestResult::Fail("expected exactly 1 Method node");
+    }
+    let m = match narf_aml::find_node("\\Y") {
+        Some(m) => m,
+        None    => return TestResult::Fail("Method \\Y missing"),
+    };
+    if m.kind != narf_aml::NodeKind::Method {
+        return TestResult::Fail("kind wasn't Method");
+    }
+    if m.method_body.1 == 0 {
+        return TestResult::Fail("method body length not recorded");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_aml_synthetic_method_skipped);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_frame_alloc_per_node_distribution() -> TestResult {
     // After SRAT-driven rebalance, each NUMA node should hold a
     // non-trivial slice of free frames. With QEMU's 2-node config

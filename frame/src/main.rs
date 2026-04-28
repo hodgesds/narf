@@ -365,6 +365,20 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             }
                         }
                         // SAFETY: same.
+                        match unsafe { narf_aml::parse_namespace(p) } {
+                            Ok(n) => {
+                                let mut devs = 0u32;
+                                narf_aml::for_each_device(|_| { devs += 1; });
+                                let _ = writeln!(console::Writer,
+                                    "  aml: namespace built, {} nodes ({} devices)",
+                                    n, devs);
+                            }
+                            Err(e) => {
+                                let _ = writeln!(console::Writer,
+                                    "  aml: namespace build skipped: {:?}", e);
+                            }
+                        }
+                        // SAFETY: same.
                         match unsafe { narf_acpi::parse_pmtt(p) } {
                             Ok(n) => {
                                 let (s, c, d) = narf_acpi::pmtt_counts();
