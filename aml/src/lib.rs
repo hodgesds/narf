@@ -47,8 +47,11 @@ use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::PhysAddr;
 
 pub mod eval;
+pub mod gpe;
 pub mod oregion;
+pub mod prt_crs;
 pub mod resource;
+pub mod sync;
 
 /// Run-time AML value, used by the method evaluator + Field
 /// accessors. `Name(...)` flat-constant decoding stays in
