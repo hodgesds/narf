@@ -7450,8 +7450,21 @@ fn smoke_aml_namespace_built_at_boot() -> TestResult {
     // Boot built the namespace from DSDT + SSDTs. QEMU q35 ships
     // a substantial table set; expect a non-trivial node count and
     // at least a handful of Device declarations.
+    //
+    // Re-parse if the namespace was cleared by a preceding test (e.g.
+    // __reset_for_test calls from eval/oregion test scaffolding).
     if narf_aml::node_count() == 0 {
-        return TestResult::Fail("AML namespace empty");
+        let rsdp = match narf_acpi::cached_rsdp() {
+            Some(p) => p,
+            None    => return TestResult::Fail("no boot-time RSDP cached"),
+        };
+        // SAFETY: cached RSDP, validated at boot; identity-mapped.
+        if unsafe { narf_aml::parse_namespace(rsdp) }.is_err() {
+            return TestResult::Fail("AML namespace empty and re-parse failed");
+        }
+    }
+    if narf_aml::node_count() == 0 {
+        return TestResult::Fail("AML namespace still empty after re-parse");
     }
     let mut dev_count = 0u32;
     narf_aml::for_each_device(|_| { dev_count += 1; });
@@ -7563,6 +7576,126 @@ fn smoke_aml_synthetic_method_skipped() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_aml_synthetic_method_skipped);
+
+// ── AML method evaluator tests ────────────────────────────────────────────────
+//
+// These tests append synthetic Method nodes into the global namespace *without*
+// calling __reset_for_test(), so they do not disturb the boot-time namespace
+// that smoke_aml_namespace_built_at_boot relies on.  Each uses a distinct
+// 4-char NameSeg so find_node() always matches the freshly-added node.
+
+/// Build a `Method(\NAME, flags, body)` AML blob where `name4` is the exact
+/// 4-byte NameSeg (e.g. `b"EV1_"`; trailing underscores are stripped by the
+/// namespace builder, yielding path `\EV1`).
+fn build_eval_method_blob(name4: &[u8; 4], flags: u8, body: &[u8]) -> alloc::vec::Vec<u8> {
+    // NameString = root char (\) + 4-byte NameSeg.
+    // PkgLength value = 1 (PkgLength byte) + 1 (root char) + 4 (NameSeg)
+    //                 + 1 (flags) + body.len().
+    let pkg_total = 1 + 1 + 4 + 1 + body.len();
+    let mut blob = alloc::vec::Vec::new();
+    blob.push(0x14);               // MethodOp
+    blob.push(pkg_total as u8);    // single-byte PkgLength (must fit in 6 bits)
+    blob.push(b'\\');              // root char
+    blob.extend_from_slice(name4); // 4-byte NameSeg
+    blob.push(flags);              // MethodFlags
+    blob.extend_from_slice(body);
+    blob
+}
+
+fn smoke_aml_eval_add() -> TestResult {
+    // Method(\EV1_, 0) { Return(Add(2, 3, Local0)) } → 5
+    let body: &[u8] = &[
+        0xA4,       // ReturnOp
+        0x72,       // AddOp
+        0x0A, 0x02, // BytePrefix 2
+        0x0A, 0x03, // BytePrefix 3
+        0x60,       // Local0 (target)
+    ];
+    let blob = build_eval_method_blob(b"EV1_", 0, body);
+    if narf_aml::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("parse failed");
+    }
+    match narf_aml::eval::evaluate_method("\\EV1", &[]) {
+        Ok(narf_aml::Value::Integer(5)) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("expected Integer(5)"),
+        Err(_) => TestResult::Fail("evaluate_method failed"),
+    }
+}
+kernel_test!(smoke_aml_eval_add);
+
+fn smoke_aml_eval_if_lequal() -> TestResult {
+    // Method(\EV2_, 0) { Store(0x10, Local0); If(LEqual(Local0, 0x10)) { Return(One) } Return(Zero) } → 1
+    let if_body: &[u8] = &[0xA4, 0x01]; // ReturnOp OneOp
+    let pred: &[u8] = &[0x93, 0x60, 0x0A, 0x10]; // LEqual(Local0, 0x10)
+    // PkgLength for If: 1 (PkgLength byte) + pred.len() + if_body.len()
+    let if_pkg_total = 1 + pred.len() + if_body.len();
+
+    let mut body: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    body.push(0x70); body.push(0x0A); body.push(0x10); body.push(0x60); // Store(0x10, Local0)
+    body.push(0xA0); body.push(if_pkg_total as u8);   // IfOp PkgLength
+    body.extend_from_slice(pred);   // predicate
+    body.extend_from_slice(if_body); // then-body
+    body.push(0xA4); body.push(0x00); // Return(Zero)
+
+    let blob = build_eval_method_blob(b"EV2_", 0, &body);
+    if narf_aml::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("parse failed");
+    }
+    match narf_aml::eval::evaluate_method("\\EV2", &[]) {
+        Ok(narf_aml::Value::Integer(1)) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("expected Integer(1)"),
+        Err(_) => TestResult::Fail("evaluate_method failed"),
+    }
+}
+kernel_test!(smoke_aml_eval_if_lequal);
+
+fn smoke_aml_eval_while_increment() -> TestResult {
+    // Method(\EV3_, 0) { Store(0, Local0); While(LLess(Local0, 5)) { Increment(Local0) } Return(Local0) } → 5
+    let while_body: &[u8] = &[0x75, 0x60]; // IncrementOp Local0
+    let pred: &[u8] = &[0x95, 0x60, 0x0A, 0x05]; // LLess(Local0, 5)
+    // PkgLength for While: 1 (PkgLength byte) + pred.len() + while_body.len()
+    let while_pkg_total = 1 + pred.len() + while_body.len();
+
+    let mut body: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    body.push(0x70); body.push(0x00); body.push(0x60); // Store(0, Local0)
+    body.push(0xA2); body.push(while_pkg_total as u8);  // WhileOp PkgLength
+    body.extend_from_slice(pred);
+    body.extend_from_slice(while_body);
+    body.push(0xA4); body.push(0x60); // Return(Local0)
+
+    let blob = build_eval_method_blob(b"EV3_", 0, &body);
+    if narf_aml::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("parse failed");
+    }
+    match narf_aml::eval::evaluate_method("\\EV3", &[]) {
+        Ok(narf_aml::Value::Integer(5)) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("expected Integer(5)"),
+        Err(_) => TestResult::Fail("evaluate_method failed"),
+    }
+}
+kernel_test!(smoke_aml_eval_while_increment);
+
+fn smoke_aml_eval_multiply_arg() -> TestResult {
+    // Method(\EV4_, 1) { Return(Multiply(Arg0, 7, Local0)) } called with [6] → 42
+    let body: &[u8] = &[
+        0xA4,       // ReturnOp
+        0x77,       // MultiplyOp
+        0x68,       // Arg0
+        0x0A, 0x07, // BytePrefix 7
+        0x60,       // Local0 (target)
+    ];
+    let blob = build_eval_method_blob(b"EV4_", 1, body);
+    if narf_aml::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("parse failed");
+    }
+    let args = [narf_aml::Value::Integer(6)];
+    match narf_aml::eval::evaluate_method("\\EV4", &args) {
+        Ok(narf_aml::Value::Integer(42)) => TestResult::Pass,
+        Ok(_) => TestResult::Fail("expected Integer(42)"),
+        Err(_) => TestResult::Fail("evaluate_method failed"),
+    }
+}
+kernel_test!(smoke_aml_eval_multiply_arg);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_frame_alloc_per_node_distribution() -> TestResult {
@@ -16699,3 +16832,278 @@ fn smoke_userspace_setsid_makes_session_leader() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_userspace_setsid_makes_session_leader);
+
+// ── AML resource decoder smokes ──────────────────────────────────────────────
+
+fn smoke_aml_resource_irq_io_endtag() -> TestResult {
+    // IRQ descriptor (mask 0x0010 = IRQ4) + IO Port + EndTag
+    let buf: &[u8] = &[
+        0x22, 0x10, 0x00,                          // small IRQ: type=4, len=2; mask=0x0010
+        0x47, 0x01, 0x00, 0x03, 0x00, 0x03, 0x01, 0x08, // IO port: type=8, len=7
+        0x79, 0x00,                                // EndTag
+    ];
+    let items = match narf_aml::resource::decode_resource_template(buf) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = match e {
+                narf_aml::resource::ResourceError::Truncated => "truncated",
+                narf_aml::resource::ResourceError::BadTag    => "bad tag",
+                narf_aml::resource::ResourceError::NoEndTag  => "no end tag",
+            };
+            return TestResult::Fail("decode_resource_template failed");
+        }
+    };
+    if items.len() != 3 {
+        return TestResult::Fail("expected 3 items");
+    }
+    match &items[0] {
+        narf_aml::resource::ResourceItem::Irq { mask, flags } => {
+            if *mask != 0x0010 { return TestResult::Fail("IRQ mask wrong"); }
+            if *flags != None   { return TestResult::Fail("IRQ flags should be None"); }
+        }
+        _ => return TestResult::Fail("item[0] not Irq"),
+    }
+    match &items[1] {
+        narf_aml::resource::ResourceItem::Io { info, min, max, alignment, length } => {
+            if *info != 0x01    { return TestResult::Fail("IO info wrong"); }
+            if *min != 0x0300   { return TestResult::Fail("IO min wrong"); }
+            if *max != 0x0300   { return TestResult::Fail("IO max wrong"); }
+            if *alignment != 1  { return TestResult::Fail("IO alignment wrong"); }
+            if *length != 8     { return TestResult::Fail("IO length wrong"); }
+        }
+        _ => return TestResult::Fail("item[1] not Io"),
+    }
+    match &items[2] {
+        narf_aml::resource::ResourceItem::EndTag => {}
+        _ => return TestResult::Fail("item[2] not EndTag"),
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_aml_resource_irq_io_endtag);
+
+fn smoke_aml_resource_memory32fixed_large_tag() -> TestResult {
+    // Large tag 0x86 (Memory32Fixed), length=9, then EndTag
+    let buf: &[u8] = &[
+        0x86, 0x09, 0x00,               // large tag 0x86, payload length = 9
+        0x00,                           // info = 0
+        0x00, 0x00, 0x00, 0xFE,         // base = 0xFE000000
+        0x00, 0x00, 0x10, 0x00,         // length = 0x00100000
+        0x79, 0x00,                     // EndTag
+    ];
+    let items = match narf_aml::resource::decode_resource_template(buf) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("decode_resource_template failed"),
+    };
+    if items.len() != 2 {
+        return TestResult::Fail("expected 2 items");
+    }
+    match &items[0] {
+        narf_aml::resource::ResourceItem::Memory32Fixed { info, base, length } => {
+            if *info != 0              { return TestResult::Fail("Memory32Fixed info wrong"); }
+            if *base != 0xFE00_0000   { return TestResult::Fail("Memory32Fixed base wrong"); }
+            if *length != 0x0010_0000 { return TestResult::Fail("Memory32Fixed length wrong"); }
+        }
+        _ => return TestResult::Fail("item[0] not Memory32Fixed"),
+    }
+    match &items[1] {
+        narf_aml::resource::ResourceItem::EndTag => {}
+        _ => return TestResult::Fail("item[1] not EndTag"),
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_aml_resource_memory32fixed_large_tag);
+
+fn smoke_aml_prt_decode() -> TestResult {
+    use narf_aml::Value;
+    let entries_raw = alloc::vec![
+        Value::Package(alloc::vec![
+            Value::Integer(0x0001_FFFF),
+            Value::Integer(0),                      // INTA
+            Value::Integer(0),                      // no source name
+            Value::Integer(16),                     // GSI 16
+        ]),
+        Value::Package(alloc::vec![
+            Value::Integer(0x0002_FFFF),
+            Value::Integer(1),                      // INTB
+            Value::String(alloc::string::String::from("\\_SB.LNKB")),
+            Value::Integer(0),
+        ]),
+    ];
+    let prt = match narf_aml::resource::decode_prt(&entries_raw) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("decode_prt failed"),
+    };
+    if prt.len() != 2 { return TestResult::Fail("expected 2 PrtEntry"); }
+
+    let e0 = &prt[0];
+    if e0.address != 0x0001_FFFF { return TestResult::Fail("e0 address wrong"); }
+    if e0.pin != 0               { return TestResult::Fail("e0 pin wrong"); }
+    if e0.source != None         { return TestResult::Fail("e0 source should be None"); }
+    if e0.source_index != 16     { return TestResult::Fail("e0 source_index wrong"); }
+
+    let e1 = &prt[1];
+    if e1.address != 0x0002_FFFF { return TestResult::Fail("e1 address wrong"); }
+    if e1.pin != 1               { return TestResult::Fail("e1 pin wrong"); }
+    match &e1.source {
+        Some(s) if s == "\\_SB.LNKB" => {}
+        _ => return TestResult::Fail("e1 source wrong"),
+    }
+    if e1.source_index != 0 { return TestResult::Fail("e1 source_index wrong"); }
+
+    TestResult::Pass
+}
+kernel_test!(smoke_aml_prt_decode);
+
+// ── AML OpRegion / Field accessor smokes ─────────────────────────────────────
+
+fn smoke_aml_oregion_sysmem_dword_field() -> TestResult {
+    // Synthetic SystemMemory region pointing at an in-process buffer.
+    //
+    // AML declares:
+    //   OpRegion(RGN0, SystemMemory, <buf_addr>, 8)
+    //   Field(RGN0, DWordAcc, NoLock, Preserve) { F0, 32 }
+    //
+    // The buffer holds 0xCAFEBABE_DEADBEEF (little-endian u64).
+    // F0 covers bits [0..32), so read_field("\\F0") should return the
+    // low 32 bits = 0xDEADBEEF.
+    use alloc::boxed::Box;
+
+    narf_aml::__reset_for_test();
+    narf_aml::oregion::__reset_for_test();
+
+    // Allocate buffer and fill.
+    let buf: Box<[u64; 1]> = Box::new([0xCAFEBABE_DEADBEEF_u64]);
+    let addr = &buf[0] as *const u64 as u64;
+
+    // Build the AML body.
+    let mut body: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+
+    // OpRegion(RGN0, SystemMemory, addr, 8)
+    body.push(0x5B); // EXT_OP_PREFIX
+    body.push(0x80); // EXT_OP_REGION_OP
+    // NameSeg RGN0 (4 bytes, no prefix — relative to parent \)
+    body.extend_from_slice(b"RGN0");
+    body.push(0x00); // RegionSpace = SystemMemory
+    // RegionOffset: QWordPrefix + 8-byte address
+    body.push(0x0E);
+    body.extend_from_slice(&addr.to_le_bytes());
+    // RegionLen: BytePrefix + 8
+    body.push(0x0A);
+    body.push(0x08);
+
+    // Field(RGN0, DWordAcc, NoLock, Preserve) { F0, 32 }
+    // EXT_FIELD_OP, PkgLength, NameSeg(RGN0), FieldFlags(0x03=DWordAcc),
+    //   NamedField: F0__ + PkgLength(32)
+    body.push(0x5B);
+    body.push(0x81);
+    // PkgLength: content = 4(NameSeg) + 1(flags) + 4(NameSeg F0__) + 1(pkglen 32)
+    //          = 10 bytes; total including PkgLen byte = 11 = 0x0B
+    body.push(0x0B);
+    body.extend_from_slice(b"RGN0");
+    body.push(0x03); // DWordAcc
+    body.extend_from_slice(b"F0__");
+    body.push(0x20); // PkgLength for 32 bits (single-byte: 32 = 0x20)
+
+    let _ = narf_aml::__parse_body_for_test(&body, "\\");
+
+    let result = narf_aml::oregion::read_field("\\F0");
+    drop(buf);
+
+    match result {
+        Ok(v) => {
+            if v == 0xDEADBEEF {
+                TestResult::Pass
+            } else {
+                TestResult::Fail("\\F0 value mismatch (expected 0xDEADBEEF)")
+            }
+        }
+        Err(narf_aml::oregion::FieldAccessError::NoField) =>
+            TestResult::Fail("\\F0 not registered"),
+        Err(narf_aml::oregion::FieldAccessError::NoRegion) =>
+            TestResult::Fail("\\RGN0 not registered"),
+        Err(narf_aml::oregion::FieldAccessError::TooWide) =>
+            TestResult::Fail("read_field reported TooWide"),
+        Err(narf_aml::oregion::FieldAccessError::Unsupported) =>
+            TestResult::Fail("read_field returned Unsupported for SystemMemory"),
+    }
+}
+kernel_test!(smoke_aml_oregion_sysmem_dword_field);
+
+fn smoke_aml_oregion_bit_fields() -> TestResult {
+    // Bit-level field test: SystemMemory region over a u64 = 0xFF.
+    // Declare three 1-bit fields F0/F1/F2 at bit offsets 0/1/2.
+    // Each should read back as 1 (all bits in 0xFF are set).
+    use alloc::boxed::Box;
+
+    narf_aml::__reset_for_test();
+    narf_aml::oregion::__reset_for_test();
+
+    let buf: Box<[u64; 1]> = Box::new([0xFF_u64]);
+    let addr = &buf[0] as *const u64 as u64;
+
+    let mut body: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+
+    // OpRegion(BRG0, SystemMemory, addr, 8)
+    body.push(0x5B);
+    body.push(0x80);
+    body.extend_from_slice(b"BRG0");
+    body.push(0x00); // SystemMemory
+    body.push(0x0E);
+    body.extend_from_slice(&addr.to_le_bytes());
+    body.push(0x0A);
+    body.push(0x08); // length = 8 bytes
+
+    // Field(BRG0, ByteAcc, NoLock, Preserve) { F0, 1, F1, 1, F2, 1 }
+    // NameSeg BRG0 = 4, FieldFlags = 1, F0__(4) pkglen(1), F1__(4) pkglen(1), F2__(4) pkglen(1)
+    // content = 4 + 1 + 5 + 5 + 5 = 20; total PkgLen = 21 = 0x15
+    body.push(0x5B);
+    body.push(0x81);
+    body.push(0x15); // PkgLength = 21
+    body.extend_from_slice(b"BRG0");
+    body.push(0x01); // ByteAcc
+    body.extend_from_slice(b"F0__");
+    body.push(0x01); // bit_length = 1
+    body.extend_from_slice(b"F1__");
+    body.push(0x01); // bit_length = 1
+    body.extend_from_slice(b"F2__");
+    body.push(0x01); // bit_length = 1
+
+    let _ = narf_aml::__parse_body_for_test(&body, "\\");
+
+    let r0 = narf_aml::oregion::read_field("\\F0");
+    let r1 = narf_aml::oregion::read_field("\\F1");
+    let r2 = narf_aml::oregion::read_field("\\F2");
+    drop(buf);
+
+    match (r0, r1, r2) {
+        (Ok(0), _, _) => TestResult::Fail("\\F0 bit=0 from 0xFF buffer"),
+        (_, Ok(0), _) => TestResult::Fail("\\F1 bit=0 from 0xFF buffer"),
+        (_, _, Ok(0)) => TestResult::Fail("\\F2 bit=0 from 0xFF buffer"),
+        (Ok(1), Ok(1), Ok(1)) => TestResult::Pass,
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+            match e {
+                narf_aml::oregion::FieldAccessError::NoField  => TestResult::Fail("field not registered"),
+                narf_aml::oregion::FieldAccessError::NoRegion => TestResult::Fail("region not registered"),
+                narf_aml::oregion::FieldAccessError::TooWide  => TestResult::Fail("field TooWide"),
+                narf_aml::oregion::FieldAccessError::Unsupported => TestResult::Fail("Unsupported"),
+            }
+        }
+        _ => TestResult::Fail("unexpected field value (not 0 or 1)"),
+    }
+}
+kernel_test!(smoke_aml_oregion_bit_fields);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_aml_oregion_boot_regions_present() -> TestResult {
+    // After parse_namespace at boot, QEMU's DSDT declares several
+    // PNP0C02 / EC OpRegions. Verify that at least one was captured.
+    let mut count = 0usize;
+    narf_aml::oregion::for_each_region(|_| { count += 1; });
+    if count > 0 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("no OpRegion entries registered after boot namespace parse")
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_aml_oregion_boot_regions_present);

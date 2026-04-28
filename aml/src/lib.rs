@@ -165,7 +165,7 @@ struct Namespace {
     aml:   Vec<u8>,
 }
 
-static NAMESPACE: IrqSafeSpinLock<Namespace> =
+pub(crate) static NAMESPACE: IrqSafeSpinLock<Namespace> =
     IrqSafeSpinLock::new(Namespace { nodes: Vec::new(), aml: Vec::new() });
 
 /// Snapshot of a slice of the stored AML byte stream. Returns the
@@ -309,23 +309,23 @@ const EXT_THERMAL_ZONE_OP: u8= 0x85;
 const EXT_INDEX_FIELD_OP: u8 = 0x86;
 const EXT_BANK_FIELD_OP: u8  = 0x87;
 
-struct Parser<'a> {
-    buf: &'a [u8],
-    pos: usize,
+pub(crate) struct Parser<'a> {
+    pub(crate) buf: &'a [u8],
+    pub(crate) pos: usize,
 }
 
 impl<'a> Parser<'a> {
     fn new(buf: &'a [u8]) -> Self { Self { buf, pos: 0 } }
 
-    fn peek(&self) -> Option<u8> { self.buf.get(self.pos).copied() }
+    pub(crate) fn peek(&self) -> Option<u8> { self.buf.get(self.pos).copied() }
 
-    fn read_u8(&mut self) -> Result<u8, AmlError> {
+    pub(crate) fn read_u8(&mut self) -> Result<u8, AmlError> {
         let b = self.buf.get(self.pos).copied().ok_or(AmlError::Truncated)?;
         self.pos += 1;
         Ok(b)
     }
 
-    fn skip(&mut self, n: usize) -> Result<(), AmlError> {
+    pub(crate) fn skip(&mut self, n: usize) -> Result<(), AmlError> {
         if self.pos + n > self.buf.len() { return Err(AmlError::Truncated); }
         self.pos += n;
         Ok(())
@@ -345,7 +345,7 @@ impl<'a> Parser<'a> {
 /// When count==0, byte 0's low 6 bits are the length. Otherwise,
 /// byte 0's low 4 bits are the low nibble + each extra byte
 /// contributes 8 bits.
-fn read_pkg_length(p: &mut Parser<'_>) -> Result<usize, AmlError> {
+pub(crate) fn read_pkg_length(p: &mut Parser<'_>) -> Result<usize, AmlError> {
     let first = p.read_u8()?;
     let extra = (first >> 6) & 0x3;
     let mut len: usize = if extra == 0 {
@@ -366,7 +366,7 @@ fn read_pkg_length(p: &mut Parser<'_>) -> Result<usize, AmlError> {
 /// peek). Returns the canonical path string assembled relative to
 /// `parent`. NameSegs are stripped of trailing underscores (ACPI
 /// leading-zero / underscore convention).
-fn read_name_string(p: &mut Parser<'_>, parent: &str) -> Result<String, AmlError> {
+pub(crate) fn read_name_string(p: &mut Parser<'_>, parent: &str) -> Result<String, AmlError> {
     let mut s = String::new();
     let first = p.peek().ok_or(AmlError::Truncated)?;
 
@@ -443,7 +443,7 @@ fn read_name_string(p: &mut Parser<'_>, parent: &str) -> Result<String, AmlError
 
 /// Resolve a NameString relative to `parent`, producing a fully-
 /// qualified absolute path. NullName → `parent`.
-fn full_path(name: String, parent: &str) -> String {
+pub(crate) fn full_path(name: String, parent: &str) -> String {
     if name.is_empty() {
         if parent.is_empty() { String::from("\\") } else { String::from(parent) }
     } else if name.starts_with('\\') {
@@ -463,7 +463,7 @@ fn full_path(name: String, parent: &str) -> String {
 /// Try to decode a flat-constant value at the cursor. Returns the
 /// value + advances the parser past it. Anything we don't decode
 /// returns `Unparsed` and skips to `after_offset`.
-fn try_read_simple_value(p: &mut Parser<'_>, after_offset: usize)
+pub(crate) fn try_read_simple_value(p: &mut Parser<'_>, after_offset: usize)
     -> Result<NameValue, AmlError>
 {
     let start_pos = p.pos;
@@ -705,40 +705,46 @@ fn parse_term_list(
                         *count += 1;
                     }
                     EXT_OP_REGION_OP => {
+                        // Parse NameString then register the namespace node.
                         let name = read_name_string(p, parent)?;
                         let path = full_path(name, parent);
-                        // Body: RegionSpace(1) + RegionOffset(TermArg) +
-                        // RegionLen(TermArg). TermArgs are arbitrary —
-                        // we don't decode them, just record OpRegion
-                        // and bail. Since we don't know body length,
-                        // we conservatively stop the table walk at
-                        // this point — there's no PkgLength to skip.
-                        // This is a known limitation: tables that
-                        // declare OpRegions inline at top-level (rare;
-                        // usually nested inside a Device scope) may
-                        // truncate the namespace. PCI0/SB devices
-                        // normally enclose OpRegions in Device(...)
-                        // which has its own PkgLength.
                         push_node(AmlNode {
-                            path,
+                            path: path.clone(),
                             kind: NodeKind::OpRegion,
                             value: None,
                             method_body: (0, 0),
                         });
                         *count += 1;
-                        // Best-effort: skip 1 byte for RegionSpace and
-                        // hope the next opcodes are simple. If we go
-                        // off the rails, the outer pkg_end clamp
-                        // restores us.
-                        p.skip(1)?;
+                        // Try to decode RegionSpace + TermArg×2 and register
+                        // the region. Returns true when both TermArgs were flat
+                        // literals (parser is past the declaration, loop can
+                        // continue). Returns false for complex TermArgs — bail
+                        // so the outer pkg_end clamp re-anchors (same as the
+                        // original behaviour for non-literal regions).
+                        match oregion::parse_op_region_after_name(p, path) {
+                            Ok(true)  => {} // parsed cleanly; continue loop
+                            Ok(false) | Err(_) => return Ok(()),
+                        }
                     }
-                    EXT_FIELD_OP | EXT_INDEX_FIELD_OP | EXT_BANK_FIELD_OP => {
+                    EXT_FIELD_OP => {
                         let pkg_start = p.pos;
                         let pkg_len   = read_pkg_length(p)?;
                         let pkg_end   = pkg_start + pkg_len;
-                        // Field bodies declare individual register
-                        // bit-slices. We just record one Field node
-                        // and skip to pkg_end.
+                        push_node(AmlNode {
+                            path: full_path(String::new(), parent),
+                            kind: NodeKind::Field,
+                            value: None,
+                            method_body: (0, 0),
+                        });
+                        *count += 1;
+                        // Parse individual field entries and register them.
+                        let _ = oregion::parse_field_body(p, parent, pkg_end);
+                        p.pos = pkg_end;
+                    }
+                    EXT_INDEX_FIELD_OP | EXT_BANK_FIELD_OP => {
+                        let pkg_start = p.pos;
+                        let pkg_len   = read_pkg_length(p)?;
+                        let pkg_end   = pkg_start + pkg_len;
                         push_node(AmlNode {
                             path: full_path(String::new(), parent),
                             kind: NodeKind::Field,
@@ -780,6 +786,15 @@ fn parse_term_list(
 fn push_node(n: AmlNode) {
     let mut g = NAMESPACE.lock();
     g.nodes.push(n);
+}
+
+/// Update the `value` field of the first `Name` node matching `path`.
+/// Used by the method evaluator when `Store(v, named)` is executed.
+pub(crate) fn update_name_value(path: &str, value: NameValue) {
+    let mut g = NAMESPACE.lock();
+    if let Some(node) = g.nodes.iter_mut().find(|n| n.path == path) {
+        node.value = Some(value);
+    }
 }
 
 /// Reset the namespace. Test-only.
