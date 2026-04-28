@@ -46,6 +46,40 @@ use narf_acpi::{AcpiError, SdtHeader};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::PhysAddr;
 
+pub mod eval;
+pub mod oregion;
+pub mod resource;
+
+/// Run-time AML value, used by the method evaluator + Field
+/// accessors. `Name(...)` flat-constant decoding stays in
+/// `NameValue` for backwards compat; `Value` is the live form.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Value {
+    Integer(u64),
+    String(String),
+    Buffer(Vec<u8>),
+    Package(Vec<Value>),
+}
+
+impl Value {
+    /// Coerce to integer per ACPI implicit conversion rules: integers
+    /// stay as-is; strings/buffers fall back to 0 when they can't
+    /// trivially parse. Future evaluator passes can refine.
+    pub fn as_integer(&self) -> u64 {
+        match self {
+            Value::Integer(v) => *v,
+            Value::Buffer(b)  => {
+                let mut v = 0u64;
+                for (i, byte) in b.iter().take(8).enumerate() {
+                    v |= (*byte as u64) << (i * 8);
+                }
+                v
+            }
+            _ => 0,
+        }
+    }
+}
+
 /// Errors from AML parsing.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AmlError {
@@ -124,10 +158,30 @@ pub struct AmlNode {
 #[derive(Debug, Default)]
 struct Namespace {
     nodes: Vec<AmlNode>,
+    /// Concatenated AML byte streams of every table walked, so
+    /// Method body offsets resolve cheaply. Each node's
+    /// `method_body.0` is an offset into this Vec when the node
+    /// was registered from `walk_aml_table`.
+    aml:   Vec<u8>,
 }
 
 static NAMESPACE: IrqSafeSpinLock<Namespace> =
-    IrqSafeSpinLock::new(Namespace { nodes: Vec::new() });
+    IrqSafeSpinLock::new(Namespace { nodes: Vec::new(), aml: Vec::new() });
+
+/// Snapshot of a slice of the stored AML byte stream. Returns the
+/// number of bytes copied. Out of range → 0.
+pub fn copy_aml_bytes(offset: usize, out: &mut [u8]) -> usize {
+    let g = NAMESPACE.lock();
+    if offset >= g.aml.len() { return 0; }
+    let n = (g.aml.len() - offset).min(out.len());
+    out[..n].copy_from_slice(&g.aml[offset..offset + n]);
+    n
+}
+
+/// Length of the stored AML byte stream.
+pub fn aml_total_len() -> usize {
+    NAMESPACE.lock().aml.len()
+}
 
 /// Snapshot of the current namespace. Returns the count.
 pub fn copy_nodes(out: &mut Vec<AmlNode>) -> usize {
@@ -194,6 +248,8 @@ pub unsafe fn parse_namespace(rsdp_phys: PhysAddr) -> Result<u32, AmlError> {
 
 /// Internal: parse one AML table (DSDT or SSDT) starting at the
 /// given physical address, registering nodes under `root_path`.
+/// Appends the table's AML bytes to the namespace-wide AML store
+/// so `method_body` offsets are stable references into that store.
 unsafe fn walk_aml_table(phys: u64, root_path: &str) -> Result<u32, AmlError> {
     // SAFETY: caller assertion.
     let total = unsafe {
@@ -202,11 +258,20 @@ unsafe fn walk_aml_table(phys: u64, root_path: &str) -> Result<u32, AmlError> {
     if total <= 36 { return Ok(0); }
     // SAFETY: caller assertion.
     let body = unsafe { core::slice::from_raw_parts(phys as *const u8, total) };
-    let aml = &body[36..];
+    let aml_slice = &body[36..];
 
-    let mut p = Parser::new(aml);
+    // Append into the global AML store, remember the base offset so
+    // node body-offsets are absolute into that store.
+    let base = {
+        let mut g = NAMESPACE.lock();
+        let b = g.aml.len();
+        g.aml.extend_from_slice(aml_slice);
+        b
+    };
+
+    let mut p = Parser::new(aml_slice);
     let mut count = 0u32;
-    parse_term_list(&mut p, root_path, &mut count, aml.len())?;
+    parse_term_list(&mut p, root_path, &mut count, aml_slice.len(), base)?;
     Ok(count)
 }
 
@@ -468,6 +533,7 @@ fn parse_term_list(
     parent:   &str,
     count:    &mut u32,
     end_offset: usize,
+    base:       usize,
 ) -> Result<(), AmlError> {
     while p.pos < end_offset {
         let op = match p.peek() {
@@ -489,7 +555,7 @@ fn parse_term_list(
                     method_body: (0, 0),
                 });
                 *count += 1;
-                parse_term_list(p, &path, count, pkg_end)?;
+                parse_term_list(p, &path, count, pkg_end, base)?;
                 if p.pos != pkg_end { p.pos = pkg_end; }
             }
             NAME_OP => {
@@ -531,7 +597,7 @@ fn parse_term_list(
                 let path      = full_path(name, parent);
                 // 1 byte MethodFlags follows the name.
                 let _flags    = p.read_u8()?;
-                let body_off  = p.pos;
+                let body_off  = base + p.pos;
                 let body_len  = pkg_end.saturating_sub(p.pos);
                 push_node(AmlNode {
                     path,
@@ -559,7 +625,7 @@ fn parse_term_list(
                             method_body: (0, 0),
                         });
                         *count += 1;
-                        parse_term_list(p, &path, count, pkg_end)?;
+                        parse_term_list(p, &path, count, pkg_end, base)?;
                         if p.pos != pkg_end { p.pos = pkg_end; }
                     }
                     EXT_PROCESSOR_OP => {
@@ -577,7 +643,7 @@ fn parse_term_list(
                             method_body: (0, 0),
                         });
                         *count += 1;
-                        parse_term_list(p, &path, count, pkg_end)?;
+                        parse_term_list(p, &path, count, pkg_end, base)?;
                         if p.pos != pkg_end { p.pos = pkg_end; }
                     }
                     EXT_POWER_RES_OP => {
@@ -595,7 +661,7 @@ fn parse_term_list(
                             method_body: (0, 0),
                         });
                         *count += 1;
-                        parse_term_list(p, &path, count, pkg_end)?;
+                        parse_term_list(p, &path, count, pkg_end, base)?;
                         if p.pos != pkg_end { p.pos = pkg_end; }
                     }
                     EXT_THERMAL_ZONE_OP => {
@@ -611,7 +677,7 @@ fn parse_term_list(
                             method_body: (0, 0),
                         });
                         *count += 1;
-                        parse_term_list(p, &path, count, pkg_end)?;
+                        parse_term_list(p, &path, count, pkg_end, base)?;
                         if p.pos != pkg_end { p.pos = pkg_end; }
                     }
                     EXT_MUTEX_OP => {
@@ -721,6 +787,7 @@ fn push_node(n: AmlNode) {
 pub fn __reset_for_test() {
     let mut g = NAMESPACE.lock();
     g.nodes.clear();
+    g.aml.clear();
 }
 
 /// Test entry: parse a synthetic AML body (no SDT header) under the
@@ -728,8 +795,15 @@ pub fn __reset_for_test() {
 /// pieces without cooking a full ACPI table chain.
 #[doc(hidden)]
 pub fn __parse_body_for_test(body: &[u8], root: &str) -> Result<u32, AmlError> {
+    // Push body into AML store so method offsets resolve.
+    let base = {
+        let mut g = NAMESPACE.lock();
+        let b = g.aml.len();
+        g.aml.extend_from_slice(body);
+        b
+    };
     let mut p = Parser::new(body);
     let mut count = 0u32;
-    parse_term_list(&mut p, root, &mut count, body.len())?;
+    parse_term_list(&mut p, root, &mut count, body.len(), base)?;
     Ok(count)
 }
