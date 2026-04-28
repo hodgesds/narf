@@ -188,6 +188,104 @@ unsafe fn io_in(port: u16, width_bytes: usize) -> u64 {
 #[cfg(not(target_arch = "x86_64"))]
 unsafe fn io_in(_port: u16, _width_bytes: usize) -> u64 { 0 }
 
+// ── PciConfig ECAM address resolution ────────────────────────────────────────
+
+/// Resolve a PciConfig OpRegion's effective ECAM byte address.
+///
+/// Walks the parent chain from `region.path` to recover
+/// (segment, bus, device, function), then computes:
+///
+///   `ecam_base + ((segment << 28) | (bus << 20) | (device << 15) | (function << 12)) + region.offset`
+///
+/// Returns `None` when no `_ADR` ancestor is found, when the ECAM base is
+/// unavailable, or when the namespace lookup fails.
+fn resolve_pci_config_addr(region: &OpRegionInfo) -> Option<u64> {
+    // mcfg_ecam_base is segment-0's base; we default segment to 0.
+    let ecam_base = narf_acpi::mcfg_ecam_base()?;
+
+    // Strip the last segment of region.path to get the enclosing device scope.
+    // e.g. "\\_SB.PCI0.GPP0.RGN0" → "\\_SB.PCI0.GPP0"
+    let parent_path = {
+        let p = &region.path;
+        match p.rfind('.') {
+            Some(dot) => &p[..dot],
+            // Root-relative single-component path — no device ancestor possible.
+            None => return None,
+        }
+    };
+
+    // Walk the ancestor chain looking for Device nodes with _ADR / _BBN / _SEG.
+    let mut adr_val: Option<u64> = None; // _ADR on the enclosing device
+    let mut bbn_val: Option<u64> = None; // _BBN bus number
+    let mut seg_val: u64         = 0;    // _SEG segment, default 0
+
+    let mut current = String::from(parent_path);
+    loop {
+        // Check if this node is a Device.
+        let node = crate::find_node(&current)?;
+        if node.kind == crate::NodeKind::Device {
+            // Try to read _ADR from this device (first one found wins).
+            if adr_val.is_none() {
+                let mut adr_path = current.clone();
+                adr_path.push_str("._ADR");
+                if let Some(n) = crate::find_node(&adr_path) {
+                    if let Some(crate::NameValue::Integer(v)) = n.value {
+                        adr_val = Some(v);
+                    }
+                }
+            }
+
+            // Try to read _BBN (bus number) from this device.
+            if bbn_val.is_none() {
+                let mut bbn_path = current.clone();
+                bbn_path.push_str("._BBN");
+                if let Some(n) = crate::find_node(&bbn_path) {
+                    if let Some(crate::NameValue::Integer(v)) = n.value {
+                        bbn_val = Some(v);
+                    }
+                }
+            }
+
+            // Try to read _SEG (segment) from this device.
+            {
+                let mut seg_path = current.clone();
+                seg_path.push_str("._SEG");
+                if let Some(n) = crate::find_node(&seg_path) {
+                    if let Some(crate::NameValue::Integer(v)) = n.value {
+                        seg_val = v & 0xFFFF;
+                    }
+                }
+            }
+
+            // Done once we have both _ADR and _BBN.
+            if adr_val.is_some() && bbn_val.is_some() {
+                break;
+            }
+        }
+
+        // Walk up one level.
+        match current.rfind('.') {
+            Some(dot) => {
+                current = String::from(&current[..dot]);
+            }
+            None => {
+                // Reached root — stop.
+                break;
+            }
+        }
+    }
+
+    let adr = adr_val?;
+    // _BBN may be absent for bridges that inherit bus 0.
+    let bus    = bbn_val.unwrap_or(0) & 0xFF;
+    let device = (adr >> 16) & 0x1F;
+    let func   = adr & 0x7;
+
+    // ECAM offset per PCIe spec: bus[27:20] | device[19:15] | func[14:12]
+    let ecam_offset = (seg_val << 28) | (bus << 20) | (device << 15) | (func << 12);
+    Some(ecam_base + ecam_offset + region.offset)
+}
+
 // ── read_field ────────────────────────────────────────────────────────────────
 
 /// Read a field by absolute path.
@@ -238,6 +336,12 @@ pub fn read_field(path: &str) -> Result<u64, FieldAccessError> {
             }
             // SAFETY: AML table asserted the port is valid.
             unsafe { io_in(phys_addr as u16, access_bytes) }
+        }
+        RegionSpace::PciConfig => {
+            match resolve_pci_config_addr(&region) {
+                Some(addr) => unsafe { mmio_read(addr + byte_offset_in_region, access_bytes) },
+                None       => return Err(FieldAccessError::Unsupported),
+            }
         }
         _ => return Err(FieldAccessError::Unsupported),
     };

@@ -17107,3 +17107,137 @@ fn smoke_aml_oregion_boot_regions_present() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_aml_oregion_boot_regions_present);
+
+fn smoke_aml_oregion_pci_config_resolves() -> TestResult {
+    // Synthetic AML that declares a rooted PCI device with an
+    // ECAM-backed OpRegion.  Uses unique names (PCIT / RGNT / B0RT)
+    // that do not collide with either the boot DSDT or other tests.
+    // Does NOT call narf_aml::__reset_for_test() so the boot-time
+    // namespace is preserved intact.
+    //
+    //   Device(\PCIT) {
+    //     Name(_BBN, 0x00)
+    //     Name(_ADR, 0x00010000)   // slot 1, function 0
+    //     OpRegion(RGNT, PciConfig, 0x10, 0x10)
+    //     Field(RGNT, DWordAcc, NoLock, Preserve) { B0RT, 32 }
+    //   }
+    //
+    // Verify:
+    //   1. region_for("\\PCIT.RGNT") is registered with the right
+    //      space / offset / length.
+    //   2. read_field("\\PCIT.B0RT") does not return Unsupported when
+    //      the ECAM base is known; Unsupported is accepted when the
+    //      ECAM base is absent (e.g. aarch64 QEMU without MCFG).
+
+    // Only reset the oregion tables (not the namespace) so we do not
+    // disturb the boot-time node count relied on by other tests.
+    narf_aml::oregion::__reset_for_test();
+
+    // ── Build AML ────────────────────────────────────────────────────
+    //
+    // All sizes are exact.  Every PkgLength value ≤ 63 → 1-byte form.
+    //
+    // Device(\PCIT) inner content:
+    //   Name(_BBN, 0x00)  : NameOp(1) + "_BBN"(4) + ZeroOp(1)           =  6
+    //   Name(_ADR, DWord) : NameOp(1) + "_ADR"(4) + DWordPrefix(1) + 4  = 10
+    //   OpRegion(RGNT,…)  : 0x5B 0x80 "RGNT"(4) + space(1) + 2×(1+1)   = 11
+    //   Field(RGNT,…)     : 0x5B 0x81 PkgLen(1) + "RGNT"(4) + flags(1)
+    //                        + "B0RT"(4) + pkglen32(1)                   = 13
+    //                              inner total = 40
+    //
+    // Device(\PCIT): 0x5B(1)+0x82(1)+PkgLen(1)+root(1)+"PCIT"(4)+40
+    //   PkgLen value = 1 + 1 + 4 + 40 = 46 (≤ 63 ✓)
+    //   Device blob total = 48 bytes.
+
+    let mut body: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+
+    // Device(\PCIT): 0x5B 0x82
+    body.push(0x5B);
+    body.push(0x82);
+    // PkgLength = 46
+    body.push(46);
+    // Rooted NameString: root char + "PCIT"
+    body.push(b'\\');
+    body.extend_from_slice(b"PCIT");
+
+    // Name(_BBN, 0x00)
+    body.push(0x08); // NameOp
+    body.extend_from_slice(b"_BBN");
+    body.push(0x00); // ZeroOp
+
+    // Name(_ADR, DWord 0x00010000)
+    body.push(0x08); // NameOp
+    body.extend_from_slice(b"_ADR");
+    body.push(0x0C); // DWordPrefix
+    body.extend_from_slice(&0x0001_0000u32.to_le_bytes());
+
+    // OpRegion(RGNT, PciConfig, 0x10, 0x10)
+    body.push(0x5B);
+    body.push(0x80);
+    body.extend_from_slice(b"RGNT");
+    body.push(0x02); // RegionSpace = PciConfig
+    body.push(0x0A); // BytePrefix
+    body.push(0x10); // offset = 16
+    body.push(0x0A); // BytePrefix
+    body.push(0x10); // length = 16
+
+    // Field(RGNT, DWordAcc, NoLock, Preserve) { B0RT, 32 }
+    // content = 4("RGNT") + 1(flags) + 4("B0RT") + 1(pkglen32) = 10
+    // PkgLen byte = 11 (1 + 10)
+    body.push(0x5B);
+    body.push(0x81);
+    body.push(0x0B); // PkgLength = 11
+    body.extend_from_slice(b"RGNT");
+    body.push(0x03); // DWordAcc
+    body.extend_from_slice(b"B0RT");
+    body.push(0x20); // PkgLength for 32 bits
+
+    let n = match narf_aml::__parse_body_for_test(&body, "\\") {
+        Ok(n) => n,
+        Err(_) => return TestResult::Fail("parse failed"),
+    };
+    // Device(\PCIT) + Name(_BBN) + Name(_ADR) + OpRegion(RGNT) = 4 nodes.
+    if n < 4 {
+        return TestResult::Fail("expected at least 4 namespace nodes from Device blob");
+    }
+
+    // ── Verify region registration ────────────────────────────────────
+    let rgn = match narf_aml::oregion::region_for("\\PCIT.RGNT") {
+        Some(r) => r,
+        None    => return TestResult::Fail("RGNT not registered"),
+    };
+    if rgn.space != narf_aml::oregion::RegionSpace::PciConfig {
+        return TestResult::Fail("RGNT space is not PciConfig");
+    }
+    if rgn.offset != 0x10 {
+        return TestResult::Fail("RGNT offset mismatch");
+    }
+    if rgn.length != 0x10 {
+        return TestResult::Fail("RGNT length mismatch");
+    }
+
+    // ── Verify read_field does not return Unsupported when ECAM is known ──
+    let result = narf_aml::oregion::read_field("\\PCIT.B0RT");
+    let ecam_present = narf_acpi::mcfg_ecam_base().is_some();
+
+    match result {
+        // Any successful read is fine — 0xFFFFFFFF means no device at
+        // that slot, which is valid hardware behaviour.
+        Ok(_) => TestResult::Pass,
+        // When the ECAM base was available the resolver should have
+        // produced an address; Unsupported in that case is a bug.
+        Err(narf_aml::oregion::FieldAccessError::Unsupported) if ecam_present =>
+            TestResult::Fail("read_field returned Unsupported despite ECAM base being known"),
+        // When there is no ECAM base (e.g. aarch64 QEMU without MCFG),
+        // Unsupported is the correct graceful fallback.
+        Err(narf_aml::oregion::FieldAccessError::Unsupported) =>
+            TestResult::Pass,
+        Err(narf_aml::oregion::FieldAccessError::NoField) =>
+            TestResult::Fail("B0RT field not registered"),
+        Err(narf_aml::oregion::FieldAccessError::NoRegion) =>
+            TestResult::Fail("RGNT region missing"),
+        Err(narf_aml::oregion::FieldAccessError::TooWide) =>
+            TestResult::Fail("B0RT TooWide"),
+    }
+}
+kernel_test!(smoke_aml_oregion_pci_config_resolves);
