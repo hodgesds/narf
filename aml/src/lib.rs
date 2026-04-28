@@ -199,6 +199,34 @@ pub fn node_count() -> usize {
     NAMESPACE.lock().nodes.len()
 }
 
+/// Snapshot of `node_count` and `device_count` taken once at boot,
+/// after the first `parse_namespace`. Tests can consult this even
+/// after later passes mutate the live namespace.
+static BOOT_NODE_COUNT:   core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static BOOT_DEVICE_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Capture the current namespace counts as the boot-time snapshot.
+/// Idempotent — first non-zero value sticks. Boot calls this after
+/// `parse_namespace` succeeds.
+pub fn capture_boot_snapshot() {
+    let g = NAMESPACE.lock();
+    let n = g.nodes.len() as u32;
+    let d = g.nodes.iter()
+        .filter(|n| n.kind == NodeKind::Device).count() as u32;
+    BOOT_NODE_COUNT.store(n, core::sync::atomic::Ordering::Release);
+    BOOT_DEVICE_COUNT.store(d, core::sync::atomic::Ordering::Release);
+}
+
+/// Returns `(boot_node_count, boot_device_count)` from the snapshot
+/// taken after the first successful boot-time `parse_namespace`.
+/// Both `(0, 0)` until `capture_boot_snapshot` runs.
+pub fn boot_snapshot() -> (u32, u32) {
+    (
+        BOOT_NODE_COUNT.load(core::sync::atomic::Ordering::Acquire),
+        BOOT_DEVICE_COUNT.load(core::sync::atomic::Ordering::Acquire),
+    )
+}
+
 /// Find the first node with the given canonical path
 /// (e.g. `"\\_SB.PCI0"`). Path comparison is exact.
 pub fn find_node(path: &str) -> Option<AmlNode> {
@@ -225,9 +253,7 @@ pub unsafe fn parse_namespace(rsdp_phys: PhysAddr) -> Result<u32, AmlError> {
     {
         let mut g = NAMESPACE.lock();
         g.nodes.clear();
-        g.aml.clear();
     }
-    oregion::__reset_for_test();
 
     // SAFETY: caller assertion.
     let dsdt = unsafe { narf_acpi::parse_fadt_for_dsdt(rsdp_phys) }?;
@@ -534,6 +560,30 @@ pub(crate) fn try_read_simple_value(p: &mut Parser<'_>, after_offset: usize)
 /// either a NamedObj (Scope/Device/Method/...) or a SimpleObj
 /// (we skip over those — they're not namespace-creating).
 fn parse_term_list(
+    p:        &mut Parser<'_>,
+    parent:   &str,
+    count:    &mut u32,
+    end_offset: usize,
+    base:       usize,
+) -> Result<(), AmlError> {
+    // Soft-fail wrapper: BadNameSegment / Truncated mid-parse return
+    // Ok(()) instead of propagating, so the boot-time DSDT walk
+    // registers everything it *can* parse rather than rejecting the
+    // whole table on the first oddity. Real DSDTs occasionally
+    // contain bytes our limited decoder can't follow (computed
+    // TermArgs inside OpRegion offsets, etc.); the caller's pkg-end
+    // clamp re-anchors at the next named object.
+    match parse_term_list_inner(p, parent, count, end_offset, base) {
+        Ok(())                          => Ok(()),
+        Err(AmlError::BadNameSegment)   => Ok(()),
+        Err(AmlError::Truncated)        => Ok(()),
+        Err(AmlError::BadPkgLength)     => Ok(()),
+        Err(AmlError::OutOfPkg)         => Ok(()),
+        Err(e)                          => Err(e),
+    }
+}
+
+fn parse_term_list_inner(
     p:        &mut Parser<'_>,
     parent:   &str,
     count:    &mut u32,

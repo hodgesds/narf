@@ -372,6 +372,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                 let _ = writeln!(console::Writer,
                                     "  aml: namespace built, {} nodes ({} devices)",
                                     n, devs);
+                                // Snapshot — later tests that mutate
+                                // the live namespace can still consult
+                                // the boot-time numbers.
+                                narf_aml::capture_boot_snapshot();
                             }
                             Err(e) => {
                                 let _ = writeln!(console::Writer,
