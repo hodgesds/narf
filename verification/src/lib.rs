@@ -17653,3 +17653,302 @@ fn smoke_acpi_gpe_block_parsed_at_boot() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_acpi_gpe_block_parsed_at_boot);
+
+// ── _PRT / _CRS bridge smoke tests ───────────────────────────────────────────
+//
+// These tests use __reset_for_test() + __parse_body_for_test() to install
+// synthetic AML methods, then call evaluate_prt_for / evaluate_crs_for and
+// verify the decoded results.  Using distinct \_T1 / \_T2 scopes avoids
+// conflicts with any other test in the harness.
+
+fn smoke_aml_prt_evaluation_round_trip() -> TestResult {
+    // Build AML for:
+    //   Scope(\_T1) { Device(PT01) { Method(_PRT, 0) {
+    //     Return(Package(2) {
+    //       Package(4) { 0x0001FFFF, 0, 0, 16 },
+    //       Package(4) { 0x0002FFFF, 1, 0, 17 }
+    //     })
+    //   }}}
+    //
+    // PkgLength byte layout (single-byte form, value = total including itself):
+    //
+    // inner Package(4) { DWord, Zero, Zero, Byte }:
+    //   content-after-pkglen = 1(count) + 5(DWord) + 1(Zero) + 1(Zero) + 2(Byte) = 10
+    //   PkgLen = 11 = 0x0B
+    //   total = 1(op) + 1(pkglen) + 10 = 12 bytes
+    //
+    // outer Package(2) { pkg1, pkg2 }:
+    //   content = 1(count) + 12 + 12 = 25
+    //   PkgLen = 26 = 0x1A
+    //   total = 1+1+25 = 27 bytes
+    //
+    // Return(outer_package): 1(ReturnOp) + 27 = 28 bytes
+    //
+    // Method(_PRT, 0) { return }:
+    //   content-after-pkglen = 4("_PRT") + 1(flags) + 28 = 33
+    //   PkgLen = 34 = 0x22
+    //   total = 1(op)+1(pkglen)+33 = 35 bytes
+    //
+    // Device(PT01) { method }:
+    //   content-after-pkglen = 4("PT01") + 35 = 39
+    //   PkgLen = 40 = 0x28
+    //   total = 2(op)+1(pkglen)+39 = 42 bytes
+    //
+    // Scope(\_T1) { device }:
+    //   content-after-pkglen = 5(root+\_T1_) + 42 = 47
+    //   PkgLen = 48 = 0x30
+    //   total = 1(op)+1(pkglen)+47 = 49 bytes
+
+    narf_aml::__reset_for_test();
+
+    // inner Package(4) { 0x0001FFFF, 0, 0, 16 }
+    let inner1: alloc::vec::Vec<u8> = {
+        let mut v = alloc::vec::Vec::new();
+        v.push(0x12);                       // PackageOp
+        v.push(0x0B);                       // PkgLen = 11
+        v.push(0x04);                       // NumElements = 4
+        // DWord 0x0001FFFF
+        v.push(0x0C); v.push(0xFF); v.push(0xFF); v.push(0x01); v.push(0x00);
+        v.push(0x00);                       // ZeroOp (0)
+        v.push(0x00);                       // ZeroOp (0)
+        v.push(0x0A); v.push(0x10);         // BytePrefix 16
+        v
+    };
+
+    // inner Package(4) { 0x0002FFFF, 1, 0, 17 }
+    let inner2: alloc::vec::Vec<u8> = {
+        let mut v = alloc::vec::Vec::new();
+        v.push(0x12);                       // PackageOp
+        v.push(0x0B);                       // PkgLen = 11
+        v.push(0x04);                       // NumElements = 4
+        // DWord 0x0002FFFF
+        v.push(0x0C); v.push(0xFF); v.push(0xFF); v.push(0x02); v.push(0x00);
+        v.push(0x01);                       // OneOp (1)
+        v.push(0x00);                       // ZeroOp (0)
+        v.push(0x0A); v.push(0x11);         // BytePrefix 17
+        v
+    };
+
+    // outer Package(2) { inner1, inner2 }
+    let outer_pkg: alloc::vec::Vec<u8> = {
+        let mut v = alloc::vec::Vec::new();
+        v.push(0x12);                       // PackageOp
+        v.push(0x1A);                       // PkgLen = 26
+        v.push(0x02);                       // NumElements = 2
+        v.extend_from_slice(&inner1);
+        v.extend_from_slice(&inner2);
+        v
+    };
+
+    // Return(outer_pkg)
+    let return_stmt: alloc::vec::Vec<u8> = {
+        let mut v = alloc::vec::Vec::new();
+        v.push(0xA4);                       // ReturnOp
+        v.extend_from_slice(&outer_pkg);
+        v
+    };
+
+    // Method(_PRT, 0) { return_stmt }
+    let method: alloc::vec::Vec<u8> = {
+        let mut v = alloc::vec::Vec::new();
+        v.push(0x14);                       // MethodOp
+        v.push(0x22);                       // PkgLen = 34
+        v.extend_from_slice(b"_PRT");       // NameSeg (relative)
+        v.push(0x00);                       // MethodFlags
+        v.extend_from_slice(&return_stmt);
+        v
+    };
+
+    // Device(PT01) { method }
+    let device: alloc::vec::Vec<u8> = {
+        let mut v = alloc::vec::Vec::new();
+        v.push(0x5B); v.push(0x82);         // DeviceOp
+        v.push(0x28);                       // PkgLen = 40
+        v.extend_from_slice(b"PT01");       // NameSeg
+        v.extend_from_slice(&method);
+        v
+    };
+
+    // Scope(\_T1) { device } — name: root char + "_T1_"
+    let blob: alloc::vec::Vec<u8> = {
+        let mut v = alloc::vec::Vec::new();
+        v.push(0x10);                       // ScopeOp
+        v.push(0x30);                       // PkgLen = 48
+        v.push(b'\\');                      // root char
+        v.extend_from_slice(b"_T1_");       // NameSeg (strips to _T1)
+        v.extend_from_slice(&device);
+        v
+    };
+
+    if narf_aml::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("prt: parse failed");
+    }
+
+    match narf_aml::prt_crs::evaluate_prt_for("\\_T1.PT01") {
+        Ok(entries) if entries.len() == 2 => {
+            // Verify first entry: address=0x0001FFFF, pin=0, source=None, index=16
+            let e0 = &entries[0];
+            let e1 = &entries[1];
+            if e0.address != 0x0001FFFF {
+                return TestResult::Fail("prt: entry[0].address mismatch");
+            }
+            if e0.pin != 0 {
+                return TestResult::Fail("prt: entry[0].pin mismatch");
+            }
+            if e0.source_index != 16 {
+                return TestResult::Fail("prt: entry[0].source_index mismatch");
+            }
+            if e1.address != 0x0002FFFF {
+                return TestResult::Fail("prt: entry[1].address mismatch");
+            }
+            if e1.pin != 1 {
+                return TestResult::Fail("prt: entry[1].pin mismatch");
+            }
+            if e1.source_index != 17 {
+                return TestResult::Fail("prt: entry[1].source_index mismatch");
+            }
+            TestResult::Pass
+        }
+        Ok(entries) => {
+            let _ = entries;
+            TestResult::Fail("prt: expected 2 entries")
+        }
+        Err(_) => TestResult::Fail("prt: evaluate_prt_for failed"),
+    }
+}
+kernel_test!(smoke_aml_prt_evaluation_round_trip);
+
+fn smoke_aml_crs_evaluation_round_trip() -> TestResult {
+    // Build AML for:
+    //   Scope(\_T2) { Device(CS01) { Method(_CRS, 0) {
+    //     Return(Buffer(13) {
+    //       0x22, 0x10, 0x00,                   -- small IRQ, mask=0x0010
+    //       0x47, 0x01, 0x00, 0x03, 0x00, 0x03, 0x01, 0x08,  -- IO port
+    //       0x79, 0x00                           -- EndTag
+    //     })
+    //   }}}
+    //
+    // Buffer(13) { 13 bytes }:
+    //   ByteList after size = 13 bytes
+    //   SizeTermArg = BytePrefix(0x0A) + 0x0D = 2 bytes
+    //   content-after-pkglen = 2(size) + 13(data) = 15
+    //   PkgLen = 16 = 0x10
+    //   total = 1(op)+1(pkglen)+15 = 17 bytes
+    //
+    // Return(buffer): 1(ReturnOp)+17 = 18 bytes
+    //
+    // Method(_CRS, 0) { return }:
+    //   content-after-pkglen = 4("_CRS") + 1(flags) + 18 = 23
+    //   PkgLen = 24 = 0x18
+    //   total = 1+1+23 = 25 bytes
+    //
+    // Device(CS01) { method }:
+    //   content-after-pkglen = 4("CS01") + 25 = 29
+    //   PkgLen = 30 = 0x1E
+    //   total = 2+1+29 = 32 bytes
+    //
+    // Scope(\_T2) { device }:
+    //   content-after-pkglen = 5(root+\_T2_) + 32 = 37
+    //   PkgLen = 38 = 0x26
+    //   total = 1+1+37 = 39 bytes
+
+    narf_aml::__reset_for_test();
+
+    // Resource template bytes: IRQ(mask=0x0010) + IO port + EndTag
+    let res_bytes: [u8; 13] = [
+        0x22, 0x10, 0x00,                               // small IRQ descriptor, mask=0x0010
+        0x47, 0x01, 0x00, 0x03, 0x00, 0x03, 0x01, 0x08, // IO Port descriptor
+        0x79, 0x00,                                     // EndTag
+    ];
+
+    // Buffer(13) { res_bytes }
+    let buffer: alloc::vec::Vec<u8> = {
+        let mut v = alloc::vec::Vec::new();
+        v.push(0x11);                       // BufferOp
+        v.push(0x10);                       // PkgLen = 16
+        v.push(0x0A); v.push(0x0D);         // BytePrefix 13 (size TermArg)
+        v.extend_from_slice(&res_bytes);
+        v
+    };
+
+    // Return(buffer)
+    let return_stmt: alloc::vec::Vec<u8> = {
+        let mut v = alloc::vec::Vec::new();
+        v.push(0xA4);                       // ReturnOp
+        v.extend_from_slice(&buffer);
+        v
+    };
+
+    // Method(_CRS, 0) { return_stmt }
+    let method: alloc::vec::Vec<u8> = {
+        let mut v = alloc::vec::Vec::new();
+        v.push(0x14);                       // MethodOp
+        v.push(0x18);                       // PkgLen = 24
+        v.extend_from_slice(b"_CRS");       // NameSeg
+        v.push(0x00);                       // MethodFlags
+        v.extend_from_slice(&return_stmt);
+        v
+    };
+
+    // Device(CS01) { method }
+    let device: alloc::vec::Vec<u8> = {
+        let mut v = alloc::vec::Vec::new();
+        v.push(0x5B); v.push(0x82);         // DeviceOp
+        v.push(0x1E);                       // PkgLen = 30
+        v.extend_from_slice(b"CS01");       // NameSeg
+        v.extend_from_slice(&method);
+        v
+    };
+
+    // Scope(\_T2) { device }
+    let blob: alloc::vec::Vec<u8> = {
+        let mut v = alloc::vec::Vec::new();
+        v.push(0x10);                       // ScopeOp
+        v.push(0x26);                       // PkgLen = 38
+        v.push(b'\\');                      // root char
+        v.extend_from_slice(b"_T2_");       // NameSeg (strips to _T2)
+        v.extend_from_slice(&device);
+        v
+    };
+
+    if narf_aml::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("crs: parse failed");
+    }
+
+    match narf_aml::prt_crs::evaluate_crs_for("\\_T2.CS01") {
+        Ok(items) if items.len() == 3 => {
+            // items[0] must be Irq, items[1] Io, items[2] EndTag
+            match &items[0] {
+                narf_aml::resource::ResourceItem::Irq { .. } => {}
+                _ => return TestResult::Fail("crs: items[0] not Irq"),
+            }
+            match &items[1] {
+                narf_aml::resource::ResourceItem::Io { .. } => {}
+                _ => return TestResult::Fail("crs: items[1] not Io"),
+            }
+            match &items[2] {
+                narf_aml::resource::ResourceItem::EndTag => {}
+                _ => return TestResult::Fail("crs: items[2] not EndTag"),
+            }
+            TestResult::Pass
+        }
+        Ok(items) => {
+            let _ = items;
+            TestResult::Fail("crs: expected 3 resource items")
+        }
+        Err(_) => TestResult::Fail("crs: evaluate_crs_for failed"),
+    }
+}
+kernel_test!(smoke_aml_crs_evaluation_round_trip);
+
+fn smoke_aml_prt_method_not_found() -> TestResult {
+    // Reset namespace so \\NOPE definitely doesn't exist.
+    narf_aml::__reset_for_test();
+
+    match narf_aml::prt_crs::evaluate_prt_for("\\NOPE") {
+        Err(narf_aml::prt_crs::BridgeError::MethodNotFound) => TestResult::Pass,
+        Ok(_)  => TestResult::Fail("prt_not_found: expected MethodNotFound, got Ok"),
+        Err(_) => TestResult::Fail("prt_not_found: expected MethodNotFound, got different Err"),
+    }
+}
+kernel_test!(smoke_aml_prt_method_not_found);
