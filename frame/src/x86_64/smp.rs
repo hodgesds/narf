@@ -154,9 +154,38 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
     // it on for itself.
     unsafe { narf_interrupts::x86_64::apic::init_ap(); }
 
+    // 3b. Match the BSP's domain-enforcer state on this AP. CR4 is
+    //     per-CPU, so when the BSP picked the PCID backend at boot
+    //     each AP must also enable CR4.PCIDE to participate. CR3 was
+    //     loaded by the trampoline with PCID = 0 in its low bits, so
+    //     the PCIDE prerequisite is satisfied. The PML4 registry +
+    //     bootstrap PML4 are global state already armed by the BSP.
+    //
+    //     For the PKS path the same logic applies: AP CR4.PKS must
+    //     mirror BSP. We enable both per the BSP's effective backend.
+    if narf_arch::effective_backend() == narf_arch::DomainBackend::Pcid {
+        // SAFETY: PCID is a baseline x86_64 feature; CR3 has PCID = 0.
+        unsafe { narf_arch::x86_64::pcid::enable_pcide(); }
+    } else if narf_arch::effective_backend() == narf_arch::DomainBackend::Pks {
+        // Mirror CR4.PKS on this AP. CPUID gating already happened on
+        // the BSP — if PKS is selected we know the silicon supports it.
+        // SAFETY: BSP confirmed PKS support via CPUID.
+        unsafe {
+            let cr4 = narf_arch::x86_64::cr::read_cr4();
+            narf_arch::x86_64::cr::write_cr4(cr4 | narf_arch::x86_64::cr::CR4_PKS);
+            narf_arch::x86_64::msr::wrmsr(narf_arch::x86_64::msr::IA32_PKRS, 0);
+        }
+    }
+
     // 4. Mark online — the BSP's start_aps() spins on this.
     // SAFETY: per-CPU bookkeeping.
     unsafe { narf_lib::smp::mark_online(id); }
+
+    // 4b. Unmask IRQs so cross-CPU IPIs (TLB shootdown, RESCHED, …)
+    //     can land on this AP. Without this, the AP halts in
+    //     halt_until_irq's spin-loop fallback and never sees IPIs.
+    // SAFETY: IDT is loaded, x2APIC is up, traps are wired.
+    unsafe { narf_arch::enable_interrupts(); }
 
     // 5. Enter the per-CPU scheduler run loop. `run_forever` drains
     //    this CPU's ready queue, attempts to steal from siblings,

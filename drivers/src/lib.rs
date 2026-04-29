@@ -43,8 +43,10 @@
 extern crate alloc;
 
 pub mod bound;
+pub mod domain_alloc;
 pub mod params;
 pub use bound::{record as record_bound, snapshot as bound_drivers, BoundDriver, BoundKind};
+pub use domain_alloc::{claim_mmio_in_domain, claimed_in_domain, DomainAllocError};
 pub use params::{DriverParams, ParamError, ParamSlot};
 
 use alloc::boxed::Box;

@@ -241,6 +241,46 @@ pub unsafe fn write_cr3(pml4_phys: PhysAddr) {
     compiler_fence(Ordering::SeqCst);
 }
 
+/// Optional cross-CPU TLB-shootdown hook, installed at boot by
+/// `frame/` once the IPI handler is live. When `None`, mapping
+/// mutations only INVLPG locally — fine for single-CPU bring-up
+/// and for fresh mappings (no stale TLB entries on other CPUs).
+/// When `Some`, every `invlpg_global` call broadcasts to peers.
+///
+/// Stored as `AtomicUsize` rather than `Option<fn>` so it can be
+/// initialised in a `static` and updated atomically without a lock.
+static SHOOTDOWN_HOOK: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Hook signature: takes the VA whose mapping just changed and
+/// arranges for every other CPU's TLB to invalidate it.
+pub type TlbShootdownHook = fn(u64);
+
+/// Install the shootdown hook. Frame's boot path calls this after
+/// IPI handlers are installed and APs are online.
+pub fn set_shootdown_hook(hook: TlbShootdownHook) {
+    SHOOTDOWN_HOOK.store(hook as usize, core::sync::atomic::Ordering::Release);
+}
+
+/// Local INVLPG followed by a cross-CPU broadcast when the hook is
+/// installed. Use this from any path that *mutates* an existing
+/// mapping (remap or unmap) where stale TLB entries on peer CPUs
+/// would matter. Fresh mappings can use `invlpg` directly — no peer
+/// has the entry cached.
+///
+/// # Safety
+/// Same as `invlpg`.
+pub unsafe fn invlpg_global(virt: VirtAddr) {
+    // SAFETY: caller upholds invlpg's contract.
+    unsafe { invlpg(virt); }
+    let h = SHOOTDOWN_HOOK.load(core::sync::atomic::Ordering::Acquire);
+    if h != 0 {
+        // SAFETY: stored as `TlbShootdownHook as usize`.
+        let f: TlbShootdownHook = unsafe { core::mem::transmute(h) };
+        f(virt.raw());
+    }
+}
+
 /// Invalidate the TLB for a single virtual address via `INVLPG`.
 ///
 /// # Safety
@@ -381,8 +421,10 @@ pub unsafe fn map_4kb(
     }
     pt.entries[idx.pt] = PageTableEntry::new(phys, flags | PtFlags::PRESENT);
 
-    // SAFETY: INVLPG is always safe; syncs the TLB for the page we
-    // just mapped so subsequent accesses don't miss on stale entries.
+    // Local INVLPG is sufficient for a fresh mapping — peer CPUs have
+    // no entry to invalidate. Remap/unmap call sites broadcast via
+    // `invlpg_global`.
+    // SAFETY: INVLPG is always safe.
     unsafe { invlpg(virt); }
 
     Ok(())
@@ -425,8 +467,11 @@ pub unsafe fn unmap_4kb(
     if !removed.is_present() { return Err(MapError::AlreadyMapped); }
     pt.entries[idx.pt] = PageTableEntry::EMPTY;
 
-    // SAFETY: INVLPG always safe.
-    unsafe { invlpg(virt); }
+    // Unmap is the canonical "stale-TLB" case: peer CPUs may have
+    // cached the prior PA. Use the cross-CPU invalidator so any
+    // installed shootdown hook fires.
+    // SAFETY: INVLPG always safe; hook call is gated by atomic load.
+    unsafe { invlpg_global(virt); }
 
     Ok(removed.addr())
 }

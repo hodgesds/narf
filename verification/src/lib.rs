@@ -1136,6 +1136,140 @@ fn smoke_pcid_domain_private_va_layout() -> TestResult {
 kernel_test!(smoke_pcid_domain_private_va_layout);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_x86_64_tlb_shootdown_ipi() -> TestResult {
+    // Send a TLB-shootdown IPI to AP 1 + verify its ack counter
+    // advances. Doesn't actually need a mapped VA — the handler
+    // INVLPGs whatever the sender publishes, which is harmless on
+    // any address.
+    use narf_interrupts::x86_64::ipi;
+    use narf_lib::smp;
+    if !smp::is_online(1) { return TestResult::Skip("AP CPU 1 offline"); }
+
+    let before = ipi::ack_count(1);
+    // SAFETY: x2APIC online (BSP init), VECTOR_TLB_SHOOTDOWN handler
+    // installed at boot, AP 1 online.
+    unsafe { ipi::shoot_va(0xFFFF_FFFF_8000_0000); }
+    // shoot_va spins until AP acks; if it returned, the counter
+    // already moved.
+    let after = ipi::ack_count(1);
+    if after > before { TestResult::Pass }
+    else { TestResult::Fail("AP ack_count didn't advance") }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_x86_64_tlb_shootdown_ipi);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_x86_64_unmap_triggers_shootdown() -> TestResult {
+    // Map a fresh page in domain 0's PML4, then unmap it; the unmap
+    // path's invlpg_global call should fan out to AP 1 (and any other
+    // online APs). The AP's ack counter should advance.
+    use narf_arch::x86_64::pcid;
+    use narf_memory::{paging, PhysAddr, VirtAddr};
+    use narf_memory::frame::alloc_frame;
+    use narf_interrupts::x86_64::ipi;
+    use narf_lib::smp;
+
+    if !smp::is_online(1) { return TestResult::Skip("AP CPU 1 offline"); }
+
+    // Use the bootstrap PML4 (CR3) since QEMU's `-cpu max` runs the
+    // PKS path and pcid::get_domain_pml4 returns 0 there. The
+    // shootdown hook is independent of the enforcer choice.
+    // SAFETY: CR3 read at CPL=0.
+    let pml4_phys = unsafe { paging::read_cr3() };
+    let _ = pcid::get_domain_pml4(0); // silence unused
+
+    let frame = match alloc_frame() { Ok(f) => f, Err(_) => return TestResult::Fail("alloc_frame failed") };
+    let phys  = frame.start_address();
+    // Pick a VA in PML4 slot 256 + 5 (domain 5's range, but on PKS
+    // path we use the bootstrap PML4 and the slot is empty, so we
+    // own the whole walk). Far away from anything mapped.
+    let va = VirtAddr::new(0xFFFF_8280_DEAD_0000);
+
+    let before = ipi::ack_count(1);
+    // SAFETY: pml4_phys identity-mapped; VA canonical & 4KiB-aligned.
+    let map_ok = unsafe {
+        paging::map_4kb(pml4_phys, va, phys, paging::PtFlags::PRESENT | paging::PtFlags::WRITABLE)
+    };
+    if map_ok.is_err() {
+        return TestResult::Fail("map_4kb failed");
+    }
+    // SAFETY: paired with the map above.
+    let unmap_ok = unsafe { paging::unmap_4kb(pml4_phys, va) };
+    if unmap_ok.is_err() {
+        return TestResult::Fail("unmap_4kb failed");
+    }
+    let after = ipi::ack_count(1);
+    let _ = phys; let _ = PhysAddr::new(0); // type imports kept
+
+    if after > before { TestResult::Pass }
+    else { TestResult::Fail("AP didn't ack the shootdown after unmap_4kb") }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_x86_64_unmap_triggers_shootdown);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_drivers_claim_mmio_in_domain() -> TestResult {
+    // Driver-side call: claim a fresh MMIO range in domain 5 and
+    // verify (1) the returned VA lands in domain 5's slot, (2) the
+    // mapping is visible only in domain 5's PML4 (other domains'
+    // PML4 slot 256+5 has no walk into this VA's region).
+    use narf_arch::x86_64::pcid;
+    use narf_drivers::claim_mmio_in_domain;
+    use narf_memory::frame::alloc_frame;
+    use narf_memory::paging::PtFlags;
+    use narf_memory::domain::{cross_domain_slot_present, domain_va_base};
+
+    if !pcid::is_active() {
+        return TestResult::Skip("PCID enforcer not active (PKS-class CPU)");
+    }
+
+    // Pretend MMIO PA: just borrow a free frame so the helper has
+    // something legal to map. (Real drivers pass their BAR phys.)
+    let frame = match alloc_frame() {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("alloc_frame failed"),
+    };
+    let pa = frame.start_address().raw();
+    let domain: u8 = 5;
+
+    // SAFETY: pa is a frame we just allocated; flags are MMIO-style
+    // (PRESENT|WRITABLE|NO_CACHE).
+    let va_base = match unsafe {
+        claim_mmio_in_domain(
+            domain,
+            pa,
+            4096,
+            PtFlags::PRESENT | PtFlags::WRITABLE | PtFlags::NO_CACHE,
+        )
+    } {
+        Ok(v)  => v,
+        Err(_) => return TestResult::Fail("claim_mmio_in_domain failed"),
+    };
+
+    // VA must lie in domain 5's slot.
+    let slot_base = domain_va_base(domain).unwrap_or(0);
+    let slot_end  = slot_base + (1u64 << 39);
+    if va_base < slot_base || va_base >= slot_end {
+        return TestResult::Fail("VA escaped domain slot");
+    }
+
+    // Cross-domain: slot 256+5 must still be absent in every other
+    // domain's PML4 (the private PDPT installed at boot is per-domain,
+    // and the new mapping landed inside domain 5's subtree only).
+    for inspector in 0u8..16 {
+        if inspector == domain { continue; }
+        match cross_domain_slot_present(inspector, domain) {
+            Some(true)  => return TestResult::Fail("cross-domain slot leaked after claim"),
+            Some(false) => {}
+            None        => return TestResult::Fail("PML4 missing"),
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_drivers_claim_mmio_in_domain);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_pte_pk_field() -> TestResult {
     use narf_memory::paging::PtFlags;
     // Build a flag value with PK=7; check the round-trip + isolation

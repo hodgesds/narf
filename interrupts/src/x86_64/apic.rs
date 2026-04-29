@@ -149,6 +149,18 @@ pub unsafe fn self_ipi(vector: u8) {
 /// bits carry the IPI fields (vector + delivery mode + level + etc).
 const APIC_ICR_MSR: u32 = 0x0000_0830;
 
+/// Write the x2APIC ICR with a fully-formed value. Used by the
+/// cross-CPU IPI senders that compose their own ICR fields (delivery
+/// shorthand, vector, etc).
+///
+/// # Safety
+/// x2APIC must be enabled on this CPU.
+#[inline]
+pub unsafe fn wrmsr_icr(icr: u64) {
+    // SAFETY: caller upholds the x2APIC precondition.
+    unsafe { wrmsr(APIC_ICR_MSR, icr); }
+}
+
 /// Read this CPU's APIC ID via x2APIC MSR 0x802.
 ///
 /// # Safety

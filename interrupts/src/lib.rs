@@ -34,8 +34,12 @@ pub mod aarch64;
 pub use aarch64 as current;
 
 /// Typical IRQ-vector assignments.
-pub const VECTOR_TIMER:     u8 = 32;
-pub const VECTOR_SPURIOUS:  u8 = 0xFF;
+pub const VECTOR_TIMER:         u8 = 32;
+/// Cross-CPU TLB-shootdown IPI. Sender writes a target VA to a
+/// per-CPU shootdown slot then signals via x2APIC ICR all-but-self;
+/// the handler runs INVLPG and bumps an ack counter.
+pub const VECTOR_TLB_SHOOTDOWN: u8 = 0xF0;
+pub const VECTOR_SPURIOUS:      u8 = 0xFF;
 
 /// Send end-of-interrupt to the LAPIC.
 ///

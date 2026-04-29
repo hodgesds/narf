@@ -17,7 +17,7 @@
 //!   take the waker out and wake it without leaving anything for the
 //!   future to race with on its next poll.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use core::task::Waker;
 
 use narf_lib::sync::IrqSafeSpinLock;
@@ -47,6 +47,27 @@ impl Slot {
 
 static SLOTS: [Slot; NUM_VECTORS] = [const { Slot::new() }; NUM_VECTORS];
 
+/// Optional synchronous handler per vector. Invoked from `on_irq`
+/// *before* the waker fires, so handlers see a fully consistent
+/// `fire_count` snapshot. Cross-CPU IPI handlers (e.g. TLB shootdown)
+/// install themselves here.
+static HANDLERS: [AtomicUsize; NUM_VECTORS] =
+    [const { AtomicUsize::new(0) }; NUM_VECTORS];
+
+pub type SyncHandler = fn();
+
+/// Install a synchronous handler for `vector`. A second `install`
+/// overwrites the previous handler — there is one handler per
+/// vector, by design.
+pub fn install(vector: u8, handler: SyncHandler) {
+    HANDLERS[vector as usize].store(handler as usize, Ordering::Release);
+}
+
+/// Clear the synchronous handler for `vector`.
+pub fn clear_handler(vector: u8) {
+    HANDLERS[vector as usize].store(0, Ordering::Release);
+}
+
 /// Called from the per-arch IRQ handler with the logical vector that
 /// just fired. Increments the fire count + wakes any registered waker.
 ///
@@ -55,6 +76,18 @@ static SLOTS: [Slot; NUM_VECTORS] = [const { Slot::new() }; NUM_VECTORS];
 pub fn on_irq(vector: u8) {
     let s = &SLOTS[vector as usize];
     s.fired.fetch_add(1, Ordering::Release);
+
+    // Synchronous handler runs *before* any waker — the handler can
+    // mutate state the waker observes on its next poll.
+    let h = HANDLERS[vector as usize].load(Ordering::Acquire);
+    if h != 0 {
+        // SAFETY: stored as `SyncHandler as usize` in `install`;
+        // round-trip back to the function pointer is sound when
+        // `h != 0`.
+        let f: SyncHandler = unsafe { core::mem::transmute(h) };
+        f();
+    }
+
     let waker = s.waker.lock().take();
     if let Some(w) = waker { w.wake(); }
 }

@@ -151,15 +151,20 @@ differs.
 **What this means for security claims.** On PKS or MTE silicon, the
 framekernel's domain story is hardware-enforced at MSR/SR-write speed —
 the design's reference deployment. On AMD x86_64 today, the PCID
-backend is wired end-to-end: boot enables CR4.PCIDE, allocates 16
-per-domain PML4s as byte-clones of the bootstrap (so kernel-shared
-mappings auto-fan-out via shared downstream PDPTs), installs a
-private PDPT in each domain's PML4 at slot 256+N, and arms the
-CR3-swap path. A cross-domain access to a private VA hits a
-not-present PML4E and #PFs at the very first level of the walk —
-hardware-enforced, no software check. Domain crossings cost ~50–100
-cycles for the `MOV CR3` (vs the ~tens-of-cycles `WRMSR` cost on
-PKS); same correctness, different throughput class.
+backend is wired end-to-end: boot enables CR4.PCIDE on the BSP and
+on every AP, allocates 16 per-domain PML4s as byte-clones of the
+bootstrap (so kernel-shared mappings auto-fan-out via shared
+downstream PDPTs), installs a private PDPT in each domain's PML4 at
+slot 256+N, and arms the CR3-swap path. Cross-CPU TLB consistency is
+maintained by a `VECTOR_TLB_SHOOTDOWN` IPI broadcaster — `unmap_4kb`
+fans out to every online AP after the local INVLPG. Drivers claim
+private MMIO regions through `narf_drivers::claim_mmio_in_domain`,
+which lands the leaf inside the driver's own PML4 subtree only. A
+cross-domain access to a private VA hits a not-present PML4E and
+#PFs at the very first level of the walk — hardware-enforced, no
+software check. Domain crossings cost ~50–100 cycles for the
+`MOV CR3` (vs the ~tens-of-cycles `WRMSR` cost on PKS); same
+correctness, different throughput class.
 
 ## What works today (both arches on QEMU)
 

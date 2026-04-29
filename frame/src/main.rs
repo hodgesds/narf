@@ -201,6 +201,17 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             unsafe { narf_interrupts::x86_64::apic::init_bsp(); }
             let _ = writeln!(console::Writer,
                 "  apic: x2APIC enabled, 8259 PICs masked");
+            // Install the TLB-shootdown IPI handler now — APs may
+            // call shoot_va once they come up, and the handler must
+            // be live before the first IPI lands.
+            narf_interrupts::x86_64::ipi::install();
+            // Wire the memory subsystem's `invlpg_global` to
+            // broadcast through this IPI surface. After this call,
+            // every unmap_4kb fans out to peer CPUs.
+            narf_memory::paging::set_shootdown_hook(|va| {
+                // SAFETY: x2APIC online, IPI handler installed.
+                unsafe { narf_interrupts::x86_64::ipi::shoot_va(va); }
+            });
         }
     }
 
