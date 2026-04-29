@@ -17,8 +17,25 @@
 //!     other 15 domains' rights.
 
 use core::fmt;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::x86_64::msr::{rdmsr, wrmsr, IA32_PKRS};
+
+/// Runtime flag set by `frame/`'s boot path when CR4.PKS has been
+/// successfully enabled. The `DomainPrimitive` impl on `Pks` consults
+/// this to decide whether to drive PKRS (Intel SPR+) or to delegate
+/// to the PCID enforcer (AMD / pre-SPR Intel). Set once on the BSP
+/// before any domain crossing happens.
+static PKS_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Mark CR4.PKS as live. Called from `frame/main.rs` after writing
+/// CR4. After this returns, `Pks::*` methods drive `IA32_PKRS`
+/// directly; before, they delegate to `pcid::*`.
+pub fn mark_active() { PKS_ACTIVE.store(true, Ordering::Release) }
+
+/// True when CR4.PKS is enabled on the current CPU. Public so the
+/// `DomainPrimitive` impl in `mod.rs` can branch on it.
+pub fn is_active() -> bool { PKS_ACTIVE.load(Ordering::Acquire) }
 
 /// Saved PKRS value. `Copy` per `DomainPrimitive::SavedState`.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]

@@ -1007,6 +1007,74 @@ fn smoke_pks_set_get_rights() -> TestResult {
 kernel_test!(smoke_pks_set_get_rights);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_pcid_cr3_roundtrip() -> TestResult {
+    // Exercise the PCID enforcer's CR3-swap path. Only run when the
+    // boot path actually selected PCID — toggling CR4.PCIDE while
+    // CR4.PKS is also live is a CPU-model-dependent path that some
+    // QEMU CPU profiles don't emulate cleanly, and we have no need
+    // to dual-test the machinery on PKS silicon.
+    use narf_arch::x86_64::pcid;
+    use narf_arch::x86_64::cr;
+
+    if !pcid::is_active() {
+        return TestResult::Skip("PCID enforcer not active (PKS-class CPU)");
+    }
+
+    // SAFETY: CR3 read at CPL=0.
+    let cr3_before = unsafe { cr::read_cr3() };
+
+    // SAFETY: PCID active; domains 0/3 are valid.
+    let scope = unsafe { pcid::enter_domain(0, 3) };
+    // SAFETY: CR3 read at CPL=0.
+    let cr3_inside = unsafe { cr::read_cr3() };
+    // SAFETY: matched scope.
+    unsafe { pcid::exit_domain(scope); }
+    // SAFETY: CR3 read at CPL=0.
+    let cr3_after = unsafe { cr::read_cr3() };
+
+    if cr3_inside & 0xFFF != 4 {
+        return TestResult::Fail("CR3.PCID did not match driver_domain+1");
+    }
+    if (cr3_after & 0x000F_FFFF_FFFF_F000) != (cr3_before & 0x000F_FFFF_FFFF_F000) {
+        return TestResult::Fail("CR3 PML4 base did not round-trip");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_pcid_cr3_roundtrip);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_pcid_per_domain_pml4s_distinct() -> TestResult {
+    // Verify that boot allocated 16 distinct PML4 clones, one per
+    // domain, when the PCID enforcer is active.
+    use narf_arch::x86_64::pcid;
+
+    if !pcid::is_active() {
+        return TestResult::Skip("PCID enforcer not active (PKS-class CPU)");
+    }
+
+    let mut seen: [u64; 16] = [0; 16];
+    for d in 0u8..16 {
+        let p = pcid::get_domain_pml4(d);
+        if p == 0 {
+            return TestResult::Fail("a domain has no registered PML4");
+        }
+        seen[d as usize] = p;
+    }
+    // All 16 must be pairwise distinct.
+    for i in 0..16 {
+        for j in (i + 1)..16 {
+            if seen[i] == seen[j] {
+                return TestResult::Fail("two domains share a PML4 frame");
+            }
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_pcid_per_domain_pml4s_distinct);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_pte_pk_field() -> TestResult {
     use narf_memory::paging::PtFlags;
     // Build a flag value with PK=7; check the round-trip + isolation

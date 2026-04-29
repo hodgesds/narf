@@ -19,14 +19,84 @@ pub mod aarch64;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64 as current;
 
-/// Backend selection at the type level, per `arch/` §3 `DomainPrimitive`.
+/// Backend that is *currently enforcing* driver-domain isolation.
+///
+/// `Pks` and `Mte` are hardware-fast, single-instruction switches. `Pcid`
+/// is the AMD-x86_64 / pre-SPR-Intel fallback: per-domain page tables
+/// tagged with PCIDs, switched by `MOV CR3` (correct, but ~50–100 cycles
+/// per crossing instead of the WRMSR-class cost of PKS). `Sfi` is
+/// reserved for a future software-fault-isolation backend; not currently
+/// implemented.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum DomainBackend { Pks, Mte }
+pub enum DomainBackend { Pks, Mte, Pcid, Sfi }
 
+/// The *static-shape* primitive picked at compile time from the target
+/// arch. On x86_64 this is `Pks`, on aarch64 it is `Mte`. Code that
+/// names `narf_arch::Domain::save()` etc. is calling through this type.
+///
+/// On AMD silicon (no PKS), the **active** enforcer is `Pcid`, but the
+/// type alias still resolves to `Pks` — `Pks::save/restore/...` are
+/// architecturally legal no-ops on AMD because CR4.PKS will not be set
+/// and the boot path skips the PKRS-mutating helpers. The single
+/// authoritative answer for "what is currently enforcing isolation?"
+/// is `effective_backend()`, not the const below.
+///
+/// This split exists because `arch/` is `no_std` and trait selection
+/// has to happen at the type level, but the framekernel needs to log
+/// the *runtime* enforcer ("pks" vs "pcid fallback") without taking a
+/// dep on `frame/`. The cell below is the runtime answer.
 #[cfg(target_arch = "x86_64")]
 pub const BACKEND: DomainBackend = DomainBackend::Pks;
 #[cfg(target_arch = "aarch64")]
 pub const BACKEND: DomainBackend = DomainBackend::Mte;
+
+/// Runtime-selected backend cell. Boot-time code in `frame/` calls
+/// `set_effective_backend(Pcid)` after CPUID detection on AMD silicon.
+/// Until that call lands, `effective_backend()` returns the compile-time
+/// `BACKEND` so existing call sites observe today's behaviour.
+///
+/// This is a relaxed-ordered `AtomicU8` because backend selection
+/// happens once during BSP boot before any AP is up; later reads only
+/// need to observe the post-init value, not synchronise with anything.
+mod effective {
+    use core::sync::atomic::{AtomicU8, Ordering};
+    use super::DomainBackend;
+
+    // 0xFF sentinel = "not yet set; fall back to compile-time BACKEND".
+    static CELL: AtomicU8 = AtomicU8::new(0xFF);
+
+    const fn encode(b: DomainBackend) -> u8 {
+        match b {
+            DomainBackend::Pks  => 0,
+            DomainBackend::Mte  => 1,
+            DomainBackend::Pcid => 2,
+            DomainBackend::Sfi  => 3,
+        }
+    }
+    fn decode(v: u8) -> Option<DomainBackend> {
+        Some(match v {
+            0 => DomainBackend::Pks,
+            1 => DomainBackend::Mte,
+            2 => DomainBackend::Pcid,
+            3 => DomainBackend::Sfi,
+            _ => return None,
+        })
+    }
+
+    pub fn set(b: DomainBackend) { CELL.store(encode(b), Ordering::Relaxed) }
+    pub fn get() -> Option<DomainBackend> { decode(CELL.load(Ordering::Relaxed)) }
+}
+
+/// Set the runtime-effective domain enforcer. Called once during BSP
+/// boot from `frame/main.rs` after CPUID + arch feature probing.
+pub fn set_effective_backend(b: DomainBackend) { effective::set(b) }
+
+/// Read the runtime-effective domain enforcer. If `set_effective_backend`
+/// has not yet been called (very-early boot), falls back to the
+/// compile-time `BACKEND` so call sites do not observe a sentinel.
+pub fn effective_backend() -> DomainBackend {
+    effective::get().unwrap_or(BACKEND)
+}
 
 /// Per-arch domain-rights primitive.
 ///

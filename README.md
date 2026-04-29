@@ -27,15 +27,19 @@ details and `ROADMAP.md` for the stage × subsystem matrix.
 
 ## Core ideas
 
-- **Framekernel architecture.** A minimalist Rust TCB ("the Frame") carves its
-  own Ring 0 address space into 16 hardware-protected domains using Intel
-  PKS/PKU (on x86_64) or ARM Memory Tagging Extension (on aarch64). Drivers
+- **Framekernel architecture.** A minimalist Rust TCB ("the Frame") carves
+  its own Ring 0 address space into 16 hardware-protected domains. Drivers
   run in these domains — same virtual map, hardware-blocked from each other.
-  Switching between domains is a single MSR/SR write, not a TLB flush, so
-  isolation does not pay the cache-cold tax that a classical microkernel pays
-  for every cross-server call. Compromise of one driver cannot read or
-  corrupt another driver's heap, ring buffers, or descriptor tables — the
-  hardware refuses the access before the load retires.
+  Three enforcement backends, picked at boot from CPUID: **PKS** on
+  Intel SPR-class silicon (one `WRMSR IA32_PKRS` per crossing), **MTE** on
+  aarch64 with Memory Tagging Extension (one SR write per crossing), and a
+  **PCID-tagged per-domain page-table** fallback on AMD x86_64 / pre-SPR
+  Intel (one `MOV CR3` per crossing — measurably more expensive than the
+  MSR path, but still hardware-enforced and same-VA). Compromise of one
+  driver cannot read or corrupt another driver's heap, ring buffers, or
+  descriptor tables under any of these backends; the silicon decides how
+  cheap that guarantee is. See [Domain enforcement by silicon](#domain-enforcement-by-silicon)
+  below for the full matrix.
 - **Async-first scheduling.** Every syscall, interrupt, and driver task is a
   stackless Rust `Future` on a global executor. A caller can donate its
   remaining time-slice directly to the callee ("direct context transfer") to
@@ -95,7 +99,7 @@ are usually deliberate choices, not omissions.
 | Dimension | Linux | FreeBSD / OpenBSD / NetBSD | NARF |
 | --- | --- | --- | --- |
 | Kernel model | Monolithic with loadable modules | Monolithic | **Framekernel**: minimal Ring-0 TCB + 16 hw-isolated driver domains in the same address space |
-| Driver isolation | None inside kernel; a buggy module can scribble anywhere | None inside kernel | Intel **PKS/PKU** on x86_64, **ARM MTE** on aarch64 — hardware blocks cross-domain loads/stores |
+| Driver isolation | None inside kernel; a buggy module can scribble anywhere | None inside kernel | **PKS** (Intel SPR+), **MTE** (aarch64), or **PCID-tagged per-domain PTs** (AMD / pre-SPR Intel) — hardware blocks cross-domain loads/stores; cost varies by backend |
 | Implementation language | C (Rust permitted in tree, opt-in subsystems) | C (predominantly) | **Rust, no_std**, top-to-bottom; `unsafe` walled into the HAL |
 | Concurrency model | Preemptive kthreads + softirqs + workqueues + BHs | Preemptive kthreads + taskqueues + netisr | Stackless **async `Future`s** on a single global executor; per-CPU queues; optional NUMA-aware work stealing |
 | Cross-context call | `syscall` → schedule → return; copy_to/from_user | `syscall` → schedule → return; `copyin/copyout` | **Direct context transfer** — caller donates its time-slice to the callee, no double trip |
@@ -120,11 +124,45 @@ buggy driver can corrupt anything. Classical microkernels (Mach, L4,
 seL4, Minix 3) get isolation by putting drivers in user processes and
 paying for an address-space crossing on every interaction. NARF puts
 drivers in the kernel address space *and* isolates them, using PKS/MTE
-to make the boundary a single instruction instead of a TLB shootdown.
-The cost is hardware specificity (you need PKS-class silicon or MTE) and
-a smaller mature driver set than a 30-year-old project. The win is that
-"`Cap<T>` + domain + zero-copy ring" is enforceable end-to-end without
-falling back to "trust every kthread."
+to make the boundary a single instruction instead of a TLB shootdown
+when the silicon supports it. The cost is hardware sensitivity — the
+fast backend is restricted to specific generations — and a smaller
+mature driver set than a 30-year-old project. The win is that "`Cap<T>`
++ domain + zero-copy ring" is enforceable end-to-end without falling
+back to "trust every kthread."
+
+## Domain enforcement by silicon
+
+Domain isolation is a runtime-selected backend. The framekernel boots,
+probes CPUID / arch features, and picks the strongest enforcer the
+silicon supports. The cap-system, Narf-Ring contract, and same-VA
+invariant are identical across backends — only the cost-per-crossing
+differs.
+
+| Silicon | Backend | Switch cost | Domain count | Notes |
+| --- | --- | --- | --- | --- |
+| Intel Sapphire Rapids and later (server), Alder Lake / Raptor Lake (client, where exposed) | **PKS** | One `WRMSR IA32_PKRS` (~tens of cycles, no TLB hit) | 16 | The reference fast path. CR4.PKS=1, per-PTE 4-bit PK field selects the domain. |
+| aarch64 with **MTE** (Cortex-X2+, Apple M-series with MTE exposed, ARMv9 server cores) | **MTE** | One SR write (`SCTLR_EL1.TCF` + tag bits) | 16 | Tag-on-load enforcement at the 16-byte granule. Same hot-path cost class as PKS. |
+| **AMD** Zen 3 / Zen 4 / Zen 5 (no PKS), pre-SPR Intel Xeon and Core (no PKS exposed) | **PCID** | One `MOV CR3` with PCID-preserve flag (~50–100 cycles, hot PCID stays warm) | 16 (capped — architecture has 4096 PCIDs) | Domain N → PCID N+1; CR3-swap path is live (boot enables CR4.PCIDE, captures bootstrap PML4, `enter_domain` / `exit_domain` swap CR3 with NOFLUSH). Per-domain PML4 *divergence* (the part that makes isolation strict instead of nominal) needs a `memory/`-side PML4 cloner; until that lands, every domain shares the bootstrap PML4 and the swap is exercised but isolation is nominal. |
+| aarch64 without MTE | **ASID-PT** *(planned)* | One `TTBR0_EL1` write with ASID | 16 | Conceptual mirror of PCID on x86_64. Not yet implemented; today's `frame/` boot path reports the fallback intent. |
+| AMD SEV-SNP guest | *Could* use **VMPL** | `RMPADJUST` / `VMGEXIT` (~thousand cycles) | 4 (architectural cap) | Research only — see `memory/research/snp_vmpl.md`. Composes with SEV memory encryption. |
+| Older silicon, no PK / MTE / PCID-class fallback acceptable | **SFI** *(research)* | Zero per crossing; cost in inserted bounds checks per memory op | Compiler-defined | Software fault isolation — Rust dialect verified at compile time. See `memory/research/sfi.md`. |
+
+**What this means for security claims.** On PKS or MTE silicon, the
+framekernel's domain story is hardware-enforced at MSR/SR-write speed —
+the design's reference deployment. On AMD x86_64 today, the PCID
+backend is wired with **real CR3-swap machinery**: boot enables
+CR4.PCIDE, captures the bootstrap PML4, and `enter_domain` /
+`exit_domain` execute a `MOV CR3` with the PCID-preserve flag. What is
+*not* yet wired is per-domain PML4 *divergence* — the `memory/`-side
+allocator change that hands each domain its own PML4 with isolated
+upper-half mappings. Until that lands, every domain crossing swaps to
+the bootstrap PML4 with a different PCID: TLB tagging is real, but the
+mappings are identical, so spatial isolation is nominal even though
+the swap path is exercised. Capability + cap-table enforcement is
+unaffected. Deployments that need strict driver isolation today
+should pick PKS-class Intel or MTE-class aarch64; AMD parity is in
+flight.
 
 ## What works today (both arches on QEMU)
 

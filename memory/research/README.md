@@ -57,6 +57,15 @@
 - [`summaries/arm-mte.md`](./summaries/arm-mte.md) — MTE model, tag
   granule, sync vs async fault modes.
 
+## Domain-isolation backend candidates
+
+- [`snp_vmpl.md`](./snp_vmpl.md) — AMD SEV-SNP VMPL as a candidate
+  backend on confidential-VM deployments. Parked: 4-level cap, guest-only,
+  ~kilocycle switch. PCID is the AMD path of record.
+- [`sfi.md`](./sfi.md) — Software Fault Isolation as a silicon-agnostic
+  backend. Parked: trust shifts to compiler + verifier; Rust dialect
+  not yet ready.
+
 ## Fetched this round
 
 ### 2026-04-22

@@ -101,9 +101,14 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             feats.nx, feats.invariant_tsc, feats.pku, feats.pks,
             feats.uipi, feats.rdseed, feats.rdrand);
 
-        // Attempt to enable CR4.PKS if available. Success means the
-        // IA32_PKRS MSR is now accessible and per-page PK bits are
-        // active — Stage 2 domain-switch machinery can now use them.
+        // Domain-enforcer selection. PKS is the fast path (single
+        // WRMSR per crossing); when it's absent — typically AMD
+        // silicon or pre-SPR Intel — fall back to the PCID enforcer:
+        // CR3 swap with PCID-preserve. Per-domain PML4 *divergence*
+        // (the part that makes isolation strict instead of nominal)
+        // requires a memory/ surface change and is not yet wired —
+        // unregistered domains share the bootstrap PML4. The CR3
+        // swap path itself is exercised either way.
         if feats.pks {
             // SAFETY: CPUID confirmed PKS support.
             unsafe {
@@ -111,11 +116,54 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 narf_arch::x86_64::cr::write_cr4(cr4 | narf_arch::x86_64::cr::CR4_PKS);
                 narf_arch::x86_64::msr::wrmsr(narf_arch::x86_64::msr::IA32_PKRS, 0);
             }
+            narf_arch::x86_64::pks::mark_active();
+            narf_arch::set_effective_backend(narf_arch::DomainBackend::Pks);
             let _ = writeln!(console::Writer,
-                "  pks: enabled (CR4.PKS=1, IA32_PKRS=0 / all-allow)");
+                "  domain enforcer: pks (CR4.PKS=1, IA32_PKRS=0 / all-allow)");
         } else {
+            // PCID fallback. Order matters: enable CR4.PCIDE first
+            // (this requires CR3 to currently have PCID = 0, which is
+            // the case at boot — bootloader hands us a CR3 with the
+            // legacy PWT/PCD bits clear), then snapshot CR3 as the
+            // bootstrap PML4 in `pcid::init`. After init, allocate 16
+            // per-domain PML4s as byte-copies of the bootstrap. Because
+            // the copy preserves the PML4 entries (which are pointers
+            // to PDPT pages), the 16 clones share the same downstream
+            // page tables — KAISER-style fan-out: any kernel-side
+            // mapping change after boot is visible to all 16 domains
+            // automatically. Domain-private mappings (which require
+            // a per-domain PDPT under one PML4 slot) are a follow-up.
+            //
+            // SAFETY: PCID is a baseline x86_64 feature on all
+            // long-mode CPUs; the bootloader-provided CR3's low bits
+            // are zero.
+            unsafe {
+                narf_arch::x86_64::pcid::enable_pcide();
+                narf_arch::x86_64::pcid::init();
+            }
+            // Allocate + register 16 per-domain PML4 clones.
+            let mut registered = 0u8;
+            for domain in 0u8..16 {
+                // SAFETY: paging on, identity map covers low frames,
+                // alloc_frame returns identity-mapped 4 KiB.
+                match unsafe { narf_memory::paging::new_user_pml4() } {
+                    Ok(phys) => {
+                        // SAFETY: domain<16; phys is a valid 4KiB frame.
+                        unsafe { narf_arch::x86_64::pcid::set_domain_pml4(domain, phys.raw()); }
+                        registered += 1;
+                    }
+                    Err(_) => {
+                        // Out of frames at boot is unexpected, but bail
+                        // out of the loop and run nominal-isolation if so.
+                        break;
+                    }
+                }
+            }
+            narf_arch::set_effective_backend(narf_arch::DomainBackend::Pcid);
             let _ = writeln!(console::Writer,
-                "  pks: unavailable — Stage-2 Barrier domain switch will degrade");
+                "  domain enforcer: pcid (CR4.PCIDE=1, {} per-domain PML4 clones \
+                 registered with shared downstream PTs; \
+                 domain-private subtree COW pending follow-up)", registered);
         }
 
         // NX enable. PTE bit 63 (NO_EXEC) is reserved-zero unless
@@ -157,6 +205,27 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         let _ = writeln!(console::Writer,
             "  features: mte={} pauth={} bti={} gicv3_sr={} cntfrq={}Hz",
             feats.mte, feats.pauth, feats.bti, feats.gicv3_sysreg, hz);
+
+        // Domain-enforcer selection. MTE is the fast path on aarch64;
+        // when it's absent we will eventually fall back to ASID-tagged
+        // per-domain page tables (the aarch64 analogue of the PCID
+        // path on x86_64). Today only the MTE branch is wired.
+        // ID_AA64PFR1_EL1.MTE is a 4-bit field: 0=none, 1=instructions
+        // only, 2=memory tagging supported, 3+=advanced. Anything >=2
+        // is sufficient for our purposes.
+        if feats.mte >= 2 {
+            narf_arch::set_effective_backend(narf_arch::DomainBackend::Mte);
+            let _ = writeln!(console::Writer,
+                "  domain enforcer: mte");
+        } else {
+            // No MTE — for now stay on the Mte type alias (its
+            // unimplemented stubs are never invoked in this config)
+            // and report Pcid-class fallback intent.
+            narf_arch::set_effective_backend(narf_arch::DomainBackend::Pcid);
+            let _ = writeln!(console::Writer,
+                "  domain enforcer: pcid-class fallback \
+                 (no MTE — ASID-tagged per-domain page tables pending)");
+        }
 
         // Install EL1 vector table so exceptions route through Rust
         // handlers instead of whatever default state the bootloader
