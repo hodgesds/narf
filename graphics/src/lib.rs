@@ -157,5 +157,7 @@ impl Framebuffer {
 pub mod font8x8;
 pub mod console;
 pub mod cursor;
+pub mod splash;
 pub use console::{FbConsole, install_fb_console};
 pub use cursor::Cursor;
+pub use splash::{render as render_splash, BootInfo};

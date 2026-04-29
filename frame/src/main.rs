@@ -757,25 +757,6 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             "  splash: {}x{} bochs framebuffer console installed \
                              ({} cols x {} rows of 8x8 glyphs)",
                             cols * 8, rows * 8, cols, rows);
-                        // Mouse cursor: draw an arrow at screen
-                        // centre. Movement bookkeeping is hooked but
-                        // the redraw path lives in a future commit
-                        // when the scheduler tick lands as a UI
-                        // refresh source.
-                        let drew = narf_graphics_driver::bochs::with_controller(|d| {
-                            // SAFETY: BSP, post-FB-install.
-                            let mut fb = unsafe { d.framebuffer() };
-                            let mut cursor = narf_graphics::Cursor::new(
-                                (fb.width / 2) as i32,
-                                (fb.height / 2) as i32,
-                                narf_graphics::Pixel32::WHITE);
-                            cursor.draw_at(&mut fb);
-                            (cursor.x, cursor.y)
-                        });
-                        if let Some((cx, cy)) = drew {
-                            let _ = writeln!(console::Writer,
-                                "  cursor: arrow sprite drawn at ({}, {})", cx, cy);
-                        }
                     }
                 }
             }
@@ -834,6 +815,43 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         // SAFETY: `ud2` is an intentional fault; our handler catches it
         // and calls exit_kernel(42), so this asm never returns.
         unsafe { core::arch::asm!("ud2", options(noreturn)); }
+    }
+
+    // End-of-boot splash. Composes a one-screen "kernel up" panel
+    // through the framebuffer console: title bar + invariants + the
+    // arrow cursor centred over everything. Visible when QEMU runs
+    // with a display backend (`-display gtk` / `-vnc :1`); under
+    // `-display none` it still paints into FB memory but isn't
+    // rendered to a host window.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let arch_str   = "x86_64";
+        let backend    = match narf_arch::effective_backend() {
+            narf_arch::DomainBackend::Pks  => "pks",
+            narf_arch::DomainBackend::Mte  => "mte",
+            narf_arch::DomainBackend::Pcid => "pcid",
+            narf_arch::DomainBackend::Sfi  => "sfi",
+        };
+        let cpu_count    = narf_lib::smp::cpu_count() as u32;
+        let numa_nodes   = if narf_memory::is_numa_aware() {
+            (0..narf_memory::FRAME_MAX_NUMA_NODES)
+                .filter(|&i| narf_memory::node_free(i) > 0)
+                .count() as u32
+        } else { 1 };
+        let bound        = narf_drivers::bound_drivers().len() as u32;
+        let info = narf_graphics::BootInfo {
+            arch:          arch_str,
+            version:       env!("CARGO_PKG_VERSION"),
+            cpu_count,
+            numa_nodes,
+            bound_drivers: bound,
+            backend,
+        };
+        if narf_graphics::render_splash(&info) {
+            let _ = writeln!(console::Writer,
+                "  splash: end-of-boot panel composed ({} drivers, {} cpus, {} nodes)",
+                bound, cpu_count, numa_nodes);
+        }
     }
 
     // Run the kernel-test harness instead of the async demo when the

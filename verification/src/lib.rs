@@ -1850,6 +1850,48 @@ fn smoke_i8042_mouse_drops_unsynced_byte() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_i8042_mouse_drops_unsynced_byte);
 
+fn smoke_splash_render_with_no_console_returns_false() -> TestResult {
+    use narf_graphics::{render_splash, BootInfo};
+    // Reset the global FB console so render() returns false.
+    narf_graphics::console::__reset_for_test();
+    let info = BootInfo {
+        arch: "x86_64", version: "test",
+        cpu_count: 1, numa_nodes: 1, bound_drivers: 0, backend: "pks",
+    };
+    if render_splash(&info) {
+        return TestResult::Fail("render returned true with no console");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_splash_render_with_no_console_returns_false);
+
+fn smoke_splash_render_with_console_paints() -> TestResult {
+    use alloc::vec;
+    use narf_graphics::{render_splash, BootInfo, FbConsole, Framebuffer, Pixel32};
+    let mut buf = vec![0u32; 64 * 48];
+    let ptr = buf.as_mut_ptr();
+    // SAFETY: backing buffer outlives the borrow.
+    let fb = unsafe { Framebuffer::new(ptr, 64, 48, 64) };
+    let con = FbConsole::new(fb, Pixel32::WHITE, Pixel32::BLACK);
+    narf_graphics::install_fb_console(con);
+    let info = BootInfo {
+        arch: "x86_64", version: "0.0.0",
+        cpu_count: 2, numa_nodes: 1, bound_drivers: 8, backend: "pks",
+    };
+    let painted = render_splash(&info);
+    // Cleanup.
+    narf_graphics::console::__reset_for_test();
+    if !painted {
+        return TestResult::Fail("render returned false with console installed");
+    }
+    // Title bar should have written non-zero pixels in the first row.
+    if buf.iter().take(64).all(|&p| p == 0) {
+        return TestResult::Fail("title bar didn't paint");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_splash_render_with_console_paints);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_pte_pk_field() -> TestResult {
     use narf_memory::paging::PtFlags;
