@@ -45,8 +45,18 @@ extern crate alloc;
 pub mod bound;
 pub mod domain_alloc;
 pub mod params;
-pub use bound::{record as record_bound, snapshot as bound_drivers, BoundDriver, BoundKind};
-pub use domain_alloc::{claim_mmio_in_domain, claimed_in_domain, DomainAllocError};
+pub use bound::{
+    record as record_bound, snapshot as bound_drivers,
+    set_domain as set_driver_domain, domain_of as driver_domain,
+    BoundDriver, BoundKind,
+};
+#[cfg(target_arch = "x86_64")]
+pub use domain_alloc::claim_mmio_for_driver;
+pub use domain_alloc::{
+    claim_mmio_in_domain, claimed_in_domain, free_chunks_in_domain,
+    release as release_domain_mmio,
+    DomainAllocError,
+};
 pub use params::{DriverParams, ParamError, ParamSlot};
 
 use alloc::boxed::Box;

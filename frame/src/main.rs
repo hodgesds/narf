@@ -141,12 +141,24 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 narf_arch::x86_64::pcid::enable_pcide();
                 narf_arch::x86_64::pcid::init();
             }
-            // Allocate + register 16 per-domain PML4 clones.
+            // Allocate + register 16 per-domain PML4 clones, spread
+            // across NUMA nodes. Domain D's PML4 lands on node
+            // (D % num_nodes) so PML4 reads on a CPU local to that
+            // node hit local memory.
+            let num_nodes = if narf_memory::is_numa_aware() {
+                // Count nodes with non-zero free pages.
+                let mut n = 0usize;
+                for i in 0..narf_memory::FRAME_MAX_NUMA_NODES {
+                    if narf_memory::node_free(i) > 0 { n = i + 1; }
+                }
+                n.max(1)
+            } else { 1 };
             let mut registered = 0u8;
             for domain in 0u8..16 {
+                let node = (domain as usize) % num_nodes;
                 // SAFETY: paging on, identity map covers low frames,
-                // alloc_frame returns identity-mapped 4 KiB.
-                match unsafe { narf_memory::paging::new_user_pml4() } {
+                // alloc_frame_on returns identity-mapped 4 KiB.
+                match unsafe { narf_memory::paging::new_user_pml4_on(node) } {
                     Ok(phys) => {
                         // SAFETY: domain<16; phys is a valid 4KiB frame.
                         unsafe { narf_arch::x86_64::pcid::set_domain_pml4(domain, phys.raw()); }
@@ -211,6 +223,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_memory::paging::set_shootdown_hook(|va| {
                 // SAFETY: x2APIC online, IPI handler installed.
                 unsafe { narf_interrupts::x86_64::ipi::shoot_va(va); }
+            });
+            // Range hook: one IPI for a contiguous run of pages.
+            narf_memory::paging::set_range_shootdown_hook(|va, pages| {
+                // SAFETY: x2APIC online, IPI handler installed.
+                unsafe { narf_interrupts::x86_64::ipi::shoot_range(va, pages); }
             });
         }
     }

@@ -697,6 +697,7 @@ pub fn probe(
         kind:    narf_drivers::BoundKind::Block,
         pci_vid: Some(VIRTIO_BLK_PCI_VENDOR),
         pci_did: Some(VIRTIO_BLK_PCI_DEVICE),
+        domain:  narf_drivers::BoundKind::Block.default_domain(),
     });
     Ok(())
 }

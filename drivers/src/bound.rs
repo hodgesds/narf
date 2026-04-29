@@ -32,6 +32,32 @@ pub enum BoundKind {
     Other,
 }
 
+impl BoundKind {
+    /// Default isolation domain for drivers of this kind. Domain 0
+    /// (`FRAME`) is reserved for the kernel TCB; classes are
+    /// assigned 1..=15 by category. Multiple drivers of the same
+    /// kind share a domain — the design's unit of isolation is the
+    /// *category*, not the individual device.
+    ///
+    /// Mapping:
+    ///   * Block       → 1
+    ///   * Net         → 2
+    ///   * UsbHost     → 3
+    ///   * Rng         → 4
+    ///   * Balloon     → 5
+    ///   * Other       → 15  (the catch-all bucket)
+    pub const fn default_domain(self) -> u8 {
+        match self {
+            BoundKind::Block   => 1,
+            BoundKind::Net     => 2,
+            BoundKind::UsbHost => 3,
+            BoundKind::Rng     => 4,
+            BoundKind::Balloon => 5,
+            BoundKind::Other   => 15,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct BoundDriver {
     /// Driver-side short name (e.g. "nvme0", "vblk0", "e1000-82540em").
@@ -41,6 +67,10 @@ pub struct BoundDriver {
     /// `None` for non-PCI drivers.
     pub pci_vid:  Option<u16>,
     pub pci_did:  Option<u16>,
+    /// Isolation domain assigned to this driver. Defaults to
+    /// `kind.default_domain()` at registration; can be overridden
+    /// via `set_domain` for explicit placement.
+    pub domain:   u8,
 }
 
 static BOUND: IrqSafeSpinLock<Vec<BoundDriver>> =
@@ -62,6 +92,26 @@ pub fn snapshot() -> Vec<BoundDriver> { BOUND.lock().clone() }
 
 /// Number of bound drivers.
 pub fn count() -> usize { BOUND.lock().len() }
+
+/// Override the isolation domain of an already-bound driver. Returns
+/// `true` if the driver was found and updated. Callers typically
+/// invoke this only when a deployment policy needs a non-default
+/// placement (e.g. partitioning multiple block drivers across
+/// distinct domains for blast-radius reasons).
+pub fn set_domain(name: &str, domain: u8) -> bool {
+    let mut g = BOUND.lock();
+    if let Some(e) = g.iter_mut().find(|e| e.name == name) {
+        e.domain = domain & 0xF; // domains are 0..=15
+        true
+    } else {
+        false
+    }
+}
+
+/// Look up the assigned domain of a bound driver by name.
+pub fn domain_of(name: &str) -> Option<u8> {
+    BOUND.lock().iter().find(|e| e.name == name).map(|e| e.domain)
+}
 
 /// Test-only reset.
 #[doc(hidden)]

@@ -470,6 +470,7 @@ dependencies = [
 name = "narf-drivers"
 version = "0.0.0"
 dependencies = [
+ "narf-arch",
  "narf-capabilities",
  "narf-lib",
  "narf-memory",

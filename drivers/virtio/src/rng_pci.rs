@@ -242,6 +242,7 @@ pub fn probe(
         kind:    narf_drivers::BoundKind::Rng,
         pci_vid: Some(VIRTIO_RNG_PCI_VENDOR),
         pci_did: Some(VIRTIO_RNG_PCI_DEVICE),
+        domain:  narf_drivers::BoundKind::Rng.default_domain(),
     });
     Ok(())
 }

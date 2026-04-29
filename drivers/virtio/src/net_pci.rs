@@ -365,6 +365,7 @@ pub fn probe(
         kind:    narf_drivers::BoundKind::Net,
         pci_vid: Some(VIRTIO_NET_PCI_VENDOR),
         pci_did: Some(VIRTIO_NET_PCI_DEVICE),
+        domain:  narf_drivers::BoundKind::Net.default_domain(),
     });
     Ok(())
 }

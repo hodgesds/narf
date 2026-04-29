@@ -293,6 +293,7 @@ pub fn probe(
         kind:    narf_drivers::BoundKind::UsbHost,
         pci_vid: Some(device.id.vendor),
         pci_did: Some(device.id.device),
+        domain:  narf_drivers::BoundKind::UsbHost.default_domain(),
     });
     Ok(())
 }

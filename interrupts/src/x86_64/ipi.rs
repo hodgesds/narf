@@ -27,6 +27,15 @@ static PENDING_VA: [AtomicU64; MAX_CPUS] = {
     [Z; MAX_CPUS]
 };
 
+/// Per-CPU pending page count for `shoot_range`. When non-zero the
+/// handler INVLPGs a contiguous range starting at PENDING_VA;
+/// otherwise it INVLPGs a single page. `0` doubles as the "no
+/// range pending" sentinel for the single-page path.
+static PENDING_PAGES: [AtomicU64; MAX_CPUS] = {
+    const Z: AtomicU64 = AtomicU64::new(0);
+    [Z; MAX_CPUS]
+};
+
 /// Per-CPU ack counter. Incremented by the handler after INVLPG.
 /// Senders snapshot this before sending and spin until it advances
 /// past the snapshot for every online AP.
@@ -67,18 +76,24 @@ pub fn ever_received(cpu: u32) -> u64 {
 pub unsafe fn on_shootdown_irq() {
     let cpu = narf_lib::percpu::current_cpu();
     let i = cpu.min(MAX_CPUS - 1);
-    let va = PENDING_VA[i].load(Ordering::Acquire);
+    let va    = PENDING_VA[i].load(Ordering::Acquire);
+    let pages = PENDING_PAGES[i].load(Ordering::Acquire);
     if va != 0 {
-        // SAFETY: INVLPG at CPL=0 is always legal.
-        unsafe {
-            core::arch::asm!(
-                "invlpg [{addr}]",
-                addr = in(reg) va,
-                options(nostack, preserves_flags),
-            );
+        let n = if pages == 0 { 1 } else { pages };
+        for k in 0..n {
+            let addr = va + k * 4096;
+            // SAFETY: INVLPG at CPL=0 is always legal.
+            unsafe {
+                core::arch::asm!(
+                    "invlpg [{a}]",
+                    a = in(reg) addr,
+                    options(nostack, preserves_flags),
+                );
+            }
         }
-        // Clear the slot so subsequent stray fires don't double-flush.
+        // Clear the slots so subsequent stray fires don't re-flush.
         PENDING_VA[i].store(0, Ordering::Release);
+        PENDING_PAGES[i].store(0, Ordering::Release);
     }
     EVER_RECEIVED[i].fetch_add(1, Ordering::Relaxed);
     ACK_COUNT[i].fetch_add(1, Ordering::Release);
@@ -107,18 +122,31 @@ const ICR_BROADCAST_SHOOTDOWN: u64 =
 /// - Caller must already have invalidated `va` on this CPU (locally
 ///   `INVLPG`'d) — this routine handles only the *other* CPUs.
 pub unsafe fn shoot_va(va: u64) {
-    if va == 0 { return; }
+    // Single-page broadcast: pages = 0 sentinel = "1 page" in handler.
+    // SAFETY: see shoot_range.
+    unsafe { shoot_range(va, 1); }
+}
+
+/// Same shape as `shoot_va` but for a contiguous run of `pages`
+/// 4 KiB pages starting at `va`. Receivers loop INVLPG over the
+/// range — one IPI for N pages instead of N IPIs.
+///
+/// # Safety
+/// Same preconditions as `shoot_va`.
+pub unsafe fn shoot_range(va: u64, pages: u64) {
+    if va == 0 || pages == 0 { return; }
     let total = narf_lib::smp::cpu_count() as u32;
     if total <= 1 { return; }
 
     let self_cpu = narf_lib::percpu::current_cpu() as u32;
 
-    // Snapshot every other CPU's ack counter and publish the target VA.
+    // Snapshot every other CPU's ack counter and publish the target VA + range.
     let mut snap = [0u64; MAX_CPUS];
     for cpu in 0..total {
         if cpu == self_cpu { continue; }
         let i = (cpu as usize).min(MAX_CPUS - 1);
         snap[i] = ACK_COUNT[i].load(Ordering::Acquire);
+        PENDING_PAGES[i].store(pages, Ordering::Release);
         PENDING_VA[i].store(va, Ordering::Release);
     }
 

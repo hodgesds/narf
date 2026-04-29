@@ -1269,6 +1269,115 @@ fn smoke_drivers_claim_mmio_in_domain() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_drivers_claim_mmio_in_domain);
 
+fn smoke_drivers_default_domain_policy() -> TestResult {
+    use narf_drivers::BoundKind;
+    if BoundKind::Block.default_domain()  != 1 { return TestResult::Fail("Block != 1");  }
+    if BoundKind::Net.default_domain()    != 2 { return TestResult::Fail("Net != 2");    }
+    if BoundKind::UsbHost.default_domain()!= 3 { return TestResult::Fail("UsbHost != 3");}
+    if BoundKind::Rng.default_domain()    != 4 { return TestResult::Fail("Rng != 4");    }
+    if BoundKind::Balloon.default_domain()!= 5 { return TestResult::Fail("Balloon != 5");}
+    if BoundKind::Other.default_domain()  !=15 { return TestResult::Fail("Other != 15"); }
+    TestResult::Pass
+}
+kernel_test!(smoke_drivers_default_domain_policy);
+
+fn smoke_drivers_set_domain_override() -> TestResult {
+    use alloc::string::String;
+    use narf_drivers::{record_bound, BoundDriver, BoundKind,
+                       set_driver_domain, driver_domain};
+    let name = String::from("__test_driver_domain__");
+    record_bound(BoundDriver {
+        name:    name.clone(),
+        kind:    BoundKind::Block,
+        pci_vid: None,
+        pci_did: None,
+        domain:  BoundKind::Block.default_domain(),
+    });
+    if driver_domain(&name) != Some(1) {
+        return TestResult::Fail("default Block domain didn't take");
+    }
+    if !set_driver_domain(&name, 7) {
+        return TestResult::Fail("set_driver_domain returned false");
+    }
+    if driver_domain(&name) != Some(7) {
+        return TestResult::Fail("override didn't stick");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_drivers_set_domain_override);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_drivers_release_and_reuse_domain_va() -> TestResult {
+    // Claim → release → claim same size: the second claim should
+    // pop the free-list entry rather than advancing the bump
+    // pointer. Verified via free_chunks_in_domain returning to 0.
+    use narf_arch::x86_64::pcid;
+    use narf_drivers::{
+        claim_mmio_in_domain, free_chunks_in_domain, release_domain_mmio,
+    };
+    use narf_memory::frame::alloc_frame;
+    use narf_memory::paging::PtFlags;
+
+    if !pcid::is_active() {
+        return TestResult::Skip("PCID enforcer not active (PKS-class CPU)");
+    }
+    let domain: u8 = 7;
+    let frame = match alloc_frame() { Ok(f) => f, Err(_) => return TestResult::Fail("alloc_frame") };
+    let pa = frame.start_address().raw();
+
+    let before = free_chunks_in_domain(domain);
+    // SAFETY: pa is a fresh frame; flags are MMIO-style.
+    let va1 = match unsafe {
+        claim_mmio_in_domain(domain, pa, 4096,
+            PtFlags::PRESENT | PtFlags::WRITABLE | PtFlags::NO_CACHE)
+    } { Ok(v) => v, Err(_) => return TestResult::Fail("claim 1") };
+
+    // SAFETY: matched claim above.
+    if unsafe { release_domain_mmio(domain, va1, 4096) }.is_err() {
+        return TestResult::Fail("release failed");
+    }
+    if free_chunks_in_domain(domain) != before + 1 {
+        return TestResult::Fail("free-list did not grow on release");
+    }
+
+    // SAFETY: same shape as the first claim.
+    let va2 = match unsafe {
+        claim_mmio_in_domain(domain, pa, 4096,
+            PtFlags::PRESENT | PtFlags::WRITABLE | PtFlags::NO_CACHE)
+    } { Ok(v) => v, Err(_) => return TestResult::Fail("claim 2") };
+
+    if free_chunks_in_domain(domain) != before {
+        return TestResult::Fail("free-list did not shrink on reuse");
+    }
+    if va2 != va1 {
+        return TestResult::Fail("reuse didn't return the same VA");
+    }
+    // Cleanup: release the second claim too so the test is idempotent.
+    let _ = unsafe { release_domain_mmio(domain, va2, 4096) };
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_drivers_release_and_reuse_domain_va);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_x86_64_shoot_range_one_ipi() -> TestResult {
+    // shoot_range(va, N) should advance AP 1's ack counter by exactly
+    // 1 — proof that N contiguous pages cost only one IPI.
+    use narf_interrupts::x86_64::ipi;
+    use narf_lib::smp;
+    if !smp::is_online(1) { return TestResult::Skip("AP CPU 1 offline"); }
+    let before = ipi::ack_count(1);
+    // SAFETY: x2APIC online; IPI handler installed at boot.
+    unsafe { ipi::shoot_range(0xFFFF_FFFF_8000_0000, 8); }
+    let after = ipi::ack_count(1);
+    if after - before != 1 {
+        return TestResult::Fail("8-page range cost more than 1 IPI");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_x86_64_shoot_range_one_ipi);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_pte_pk_field() -> TestResult {
     use narf_memory::paging::PtFlags;

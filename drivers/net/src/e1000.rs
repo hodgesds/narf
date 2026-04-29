@@ -479,6 +479,7 @@ pub fn probe(
         kind:    narf_drivers::BoundKind::Net,
         pci_vid: Some(device.id.vendor),
         pci_did: Some(device.id.device),
+        domain:  narf_drivers::BoundKind::Net.default_domain(),
     });
     Ok(())
 }

@@ -158,7 +158,21 @@ pub enum PageTableAllocError {
 ///   allocator when the address space retires — leaks are live
 ///   pages until reboot.
 pub unsafe fn new_user_pml4() -> Result<PhysAddr, PageTableAllocError> {
-    let frame = crate::frame::alloc_frame().map_err(|_| PageTableAllocError::NoFrame)?;
+    // SAFETY: delegated; node 0 is always present.
+    unsafe { new_user_pml4_on(0) }
+}
+
+/// Same as `new_user_pml4` but allocates the fresh frame on a
+/// specific NUMA node. Used by the per-domain PML4 boot loop on
+/// AMD silicon to spread PML4 storage across the topology.
+///
+/// # Safety
+/// Same as `new_user_pml4`.
+pub unsafe fn new_user_pml4_on(node: usize)
+    -> Result<PhysAddr, PageTableAllocError>
+{
+    let frame = crate::frame::alloc_frame_on(node)
+        .map_err(|_| PageTableAllocError::NoFrame)?;
     let phys  = frame.start_address();
 
     // Read the currently-active PML4.
@@ -278,6 +292,52 @@ pub unsafe fn invlpg_global(virt: VirtAddr) {
         // SAFETY: stored as `TlbShootdownHook as usize`.
         let f: TlbShootdownHook = unsafe { core::mem::transmute(h) };
         f(virt.raw());
+    }
+}
+
+/// Optional cross-CPU TLB-shootdown range hook, paired with
+/// `set_range_shootdown_hook`. Same shape as the single-page hook
+/// but broadcasts an inclusive run of pages — one IPI for N pages.
+static RANGE_SHOOTDOWN_HOOK: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Hook signature for range broadcasts: `(va_base, page_count)`.
+pub type TlbShootdownRangeHook = fn(u64, u64);
+
+pub fn set_range_shootdown_hook(hook: TlbShootdownRangeHook) {
+    RANGE_SHOOTDOWN_HOOK.store(hook as usize, core::sync::atomic::Ordering::Release);
+}
+
+/// Local INVLPG over a contiguous range followed by a single-IPI
+/// cross-CPU broadcast when the range hook is installed. Falls back
+/// to per-page `invlpg_global` calls if the range hook is absent.
+///
+/// # Safety
+/// Each page in `[va_base, va_base + pages*4096)` must have
+/// satisfied `invlpg`'s safety contract.
+pub unsafe fn invlpg_global_range(va_base: VirtAddr, pages: u64) {
+    if pages == 0 { return; }
+    // Local INVLPG over each page.
+    for k in 0..pages {
+        let v = VirtAddr::new(va_base.raw() + k * 4096);
+        // SAFETY: per the function contract.
+        unsafe { invlpg(v); }
+    }
+    // Prefer the range hook for one-IPI broadcast; fall back to per-page.
+    let rh = RANGE_SHOOTDOWN_HOOK.load(core::sync::atomic::Ordering::Acquire);
+    if rh != 0 {
+        // SAFETY: stored as `TlbShootdownRangeHook as usize`.
+        let f: TlbShootdownRangeHook = unsafe { core::mem::transmute(rh) };
+        f(va_base.raw(), pages);
+        return;
+    }
+    let h = SHOOTDOWN_HOOK.load(core::sync::atomic::Ordering::Acquire);
+    if h != 0 {
+        // SAFETY: stored as `TlbShootdownHook as usize`.
+        let f: TlbShootdownHook = unsafe { core::mem::transmute(h) };
+        for k in 0..pages {
+            f(va_base.raw() + k * 4096);
+        }
     }
 }
 

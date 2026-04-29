@@ -176,6 +176,7 @@ pub fn probe(
         kind:    narf_drivers::BoundKind::Balloon,
         pci_vid: Some(VIRTIO_BALLOON_PCI_VENDOR),
         pci_did: Some(VIRTIO_BALLOON_PCI_DEVICE),
+        domain:  narf_drivers::BoundKind::Balloon.default_domain(),
     });
     Ok(())
 }
