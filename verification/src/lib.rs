@@ -20494,3 +20494,158 @@ fn smoke_power_dstate_classification() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_power_dstate_classification);
+// ── compat/win — PE32+ loader smoke ────────────────────────────────
+//
+// Exercises the Win32-on-NARF loader pipeline end-to-end: parse a
+// synthetic PE32+ image, allocate a fresh user AS, materialize all
+// sections, apply DIR64 relocs, resolve imports against a custom
+// resolver, populate PEB / TEB. The image imports
+// `kernel32!ExitProcess` so the resolver path is exercised.
+//
+// Note: this validates the loader contract — not user-mode
+// execution. The Ring-3 → kernel call path that turns a patched
+// IAT slot into an actual thunk invocation lands in M0.5; see
+// `compat/win/specification/spec.md` §8.
+
+#[cfg(target_arch = "x86_64")]
+fn build_synthetic_pe(machine: u16) -> alloc::vec::Vec<u8> {
+    use alloc::vec;
+    let mut buf = vec![0u8; 0x800];
+
+    // DOS header.
+    buf[0..2].copy_from_slice(&0x5A4Du16.to_le_bytes()); // 'MZ'
+    buf[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+    // NT signature.
+    buf[0x80..0x84].copy_from_slice(&0x0000_4550u32.to_le_bytes());
+    // File header.
+    let fh = 0x84;
+    buf[fh..fh + 2].copy_from_slice(&machine.to_le_bytes());
+    buf[fh + 2..fh + 4].copy_from_slice(&2u16.to_le_bytes()); // 2 sections
+    buf[fh + 16..fh + 18].copy_from_slice(&0xF0u16.to_le_bytes()); // opt-hdr size
+    // Optional header.
+    let oh = fh + 20; // 0x98
+    buf[oh..oh + 2].copy_from_slice(&0x20Bu16.to_le_bytes()); // PE32+
+    buf[oh + 0x10..oh + 0x14].copy_from_slice(&0x1000u32.to_le_bytes()); // entry
+    buf[oh + 0x18..oh + 0x20].copy_from_slice(&0x1_4000_0000u64.to_le_bytes()); // image base
+    buf[oh + 0x38..oh + 0x3C].copy_from_slice(&0x3000u32.to_le_bytes()); // size of image
+    buf[oh + 0x6C..oh + 0x70].copy_from_slice(&16u32.to_le_bytes()); // num dirs
+    // DataDirectory[1] = Import: RVA 0x2000, size 0x60.
+    buf[oh + 0x70 + 8..oh + 0x70 + 12].copy_from_slice(&0x2000u32.to_le_bytes());
+    buf[oh + 0x70 + 12..oh + 0x70 + 16].copy_from_slice(&0x60u32.to_le_bytes());
+    // DataDirectory[5] = BaseReloc: RVA 0x2100, size 0x10.
+    buf[oh + 0x70 + 5*8..oh + 0x70 + 5*8 + 4].copy_from_slice(&0x2100u32.to_le_bytes());
+    buf[oh + 0x70 + 5*8 + 4..oh + 0x70 + 5*8 + 8].copy_from_slice(&0x10u32.to_le_bytes());
+
+    // Section table (.text at 0x188, .idata at 0x1B0).
+    let sec = oh + 0xF0; // 0x188
+    buf[sec..sec + 5].copy_from_slice(b".text");
+    buf[sec + 8..sec + 12].copy_from_slice(&0x100u32.to_le_bytes());
+    buf[sec + 12..sec + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+    buf[sec + 16..sec + 20].copy_from_slice(&0x100u32.to_le_bytes());
+    buf[sec + 20..sec + 24].copy_from_slice(&0x400u32.to_le_bytes());
+    buf[sec + 36..sec + 40].copy_from_slice(&0x6000_0000u32.to_le_bytes()); // R+X
+    let s2 = sec + 40;
+    buf[s2..s2 + 6].copy_from_slice(b".idata");
+    buf[s2 + 8..s2 + 12].copy_from_slice(&0x300u32.to_le_bytes());
+    buf[s2 + 12..s2 + 16].copy_from_slice(&0x2000u32.to_le_bytes());
+    buf[s2 + 16..s2 + 20].copy_from_slice(&0x300u32.to_le_bytes());
+    buf[s2 + 20..s2 + 24].copy_from_slice(&0x500u32.to_le_bytes());
+    buf[s2 + 36..s2 + 40].copy_from_slice(&0x4000_0000u32.to_le_bytes()); // R only
+
+    // IID #0: ILT 0x2040, Name 0x2080, IAT 0x20A0.
+    let iid = 0x500;
+    buf[iid..iid + 4].copy_from_slice(&0x2040u32.to_le_bytes());
+    buf[iid + 12..iid + 16].copy_from_slice(&0x2080u32.to_le_bytes());
+    buf[iid + 16..iid + 20].copy_from_slice(&0x20A0u32.to_le_bytes());
+    // ILT @ 0x540 → IMAGE_IMPORT_BY_NAME @ 0x20C0.
+    buf[0x540..0x548].copy_from_slice(&0x20C0u64.to_le_bytes());
+    // IAT @ 0x5A0 (pre-resolution) → same.
+    buf[0x5A0..0x5A8].copy_from_slice(&0x20C0u64.to_le_bytes());
+    // Module name @ 0x580: "kernel32.dll".
+    buf[0x580..0x58C].copy_from_slice(b"kernel32.dll");
+    // IMAGE_IMPORT_BY_NAME @ 0x5C0: hint=0, name="ExitProcess".
+    buf[0x5C2..0x5CD].copy_from_slice(b"ExitProcess");
+    // Base reloc block @ 0x600: page 0x1000, size 0x10, one DIR64 at +0x008.
+    buf[0x600..0x604].copy_from_slice(&0x1000u32.to_le_bytes());
+    buf[0x604..0x608].copy_from_slice(&0x10u32.to_le_bytes());
+    let dir64_entry: u16 = (10u16 << 12) | 0x008;
+    buf[0x608..0x60A].copy_from_slice(&dir64_entry.to_le_bytes());
+    buf
+}
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_compat_win_load_pe_pipeline() -> TestResult {
+    use narf_compat_win::load_pe;
+
+    let bytes = build_synthetic_pe(0x8664); // AMD64
+
+    // Custom resolver: returns a sentinel for the one import the
+    // synthetic PE declares, None for everything else.
+    fn resolver(module: &str, symbol: &str) -> Option<u64> {
+        if module.eq_ignore_ascii_case("kernel32.dll")
+           && symbol.eq_ignore_ascii_case("exitprocess")
+        {
+            Some(0xDEAD_BEEF_CAFE_F00D)
+        } else {
+            None
+        }
+    }
+
+    // SAFETY: the kernel test harness runs with the low-4-GiB
+    // identity map and frame allocator initialised — both contracts
+    // load_pe documents.
+    let proc = match unsafe { load_pe(&bytes, resolver) } {
+        Ok(p)  => p,
+        Err(_) => return TestResult::Fail("compat-win: load_pe failed"),
+    };
+
+    // Entry point: image_base + AddressOfEntryPoint.
+    if proc.entry.as_u64() != 0x1_4000_0000 + 0x1000 {
+        return TestResult::Fail("compat-win: entry mismatch");
+    }
+    if proc.image_base != 0x1_4000_0000 {
+        return TestResult::Fail("compat-win: image_base mismatch");
+    }
+    if proc.size_of_image != 0x3000 {
+        return TestResult::Fail("compat-win: size_of_image mismatch");
+    }
+    if proc.peb_va.as_u64() != narf_compat_win::personality::DEFAULT_PEB_VA {
+        return TestResult::Fail("compat-win: peb_va mismatch");
+    }
+    if proc.teb_va.as_u64() != narf_compat_win::personality::DEFAULT_TEB_VA {
+        return TestResult::Fail("compat-win: teb_va mismatch");
+    }
+    if proc.stack_top.as_u64() <= proc.stack_base.as_u64() {
+        return TestResult::Fail("compat-win: stack range inverted");
+    }
+
+    // Region count: 2 PE sections + PEB + TEB = 4.
+    let regions = proc.address_space.regions_snapshot();
+    if regions.len() != 4 {
+        return TestResult::Fail("compat-win: expected 4 mapped regions");
+    }
+    // The two PE sections live at image_base + section.virt_addr.
+    let section_base_text = 0x1_4000_0000u64 + 0x1000;
+    let section_base_idata = 0x1_4000_0000u64 + 0x2000;
+    let mut saw_text = false;
+    let mut saw_idata = false;
+    let mut saw_peb = false;
+    let mut saw_teb = false;
+    for r in &regions {
+        let b = r.base.as_u64();
+        if b == section_base_text  { saw_text  = true; }
+        if b == section_base_idata { saw_idata = true; }
+        if b == narf_compat_win::personality::DEFAULT_PEB_VA { saw_peb = true; }
+        if b == narf_compat_win::personality::DEFAULT_TEB_VA { saw_teb = true; }
+    }
+    if !(saw_text && saw_idata && saw_peb && saw_teb) {
+        return TestResult::Fail("compat-win: expected regions missing");
+    }
+
+    // Mint a spawn cap — exercises the cap-typing path.
+    let _cap = proc.mint_spawn_cap();
+    TestResult::Pass
+}
+
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_compat_win_load_pe_pipeline);

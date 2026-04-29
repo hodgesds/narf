@@ -51,6 +51,7 @@ narf-drivers-net  = { path = "../drivers/net" }
 narf-drivers-gpu  = { path = "../drivers/gpu" }
 narf-drivers-storage = { path = "../drivers/storage" }
 narf-drivers-usb     = { path = "../drivers/usb" }
+narf-compat-win   = { path = "../compat/win" }
 
 [features]
 # Opt-in end-to-end user-mode smoke tests. Enabling this adds the
