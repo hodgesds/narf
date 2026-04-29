@@ -109,6 +109,87 @@ impl FbScanout for BochsScanout {
     }
 }
 
+// ── Test backend: in-memory scanout ────────────────────────────────
+//
+// A heap-backed FbScanout used by smokes that want to exercise the
+// drain + writer surface without a real display. Only one
+// `TestScanout` lives at a time — the global slot is None until
+// `install_test_scanout(width, height)` runs, at which point
+// `select_active()` returns it (overriding the bochs / virtio-gpu
+// preferences). `clear_test_scanout()` removes it.
+//
+// Used primarily on aarch64, where neither bochs (x86-only) nor
+// virtio-gpu (deferred behind ioremap) probes today.
+
+use alloc::vec::Vec;
+
+#[derive(Debug)]
+struct TestScanoutInner {
+    width:  u32,
+    height: u32,
+    /// Heap pixel buffer. Aliased through `framebuffer()`'s
+    /// raw-pointer view — caller-side write semantics handled by
+    /// FbWriter's check_live + the smoke's exclusive scope.
+    buf:    Vec<u32>,
+}
+
+#[derive(Debug)]
+pub struct TestScanout(narf_lib::sync::IrqSafeSpinLock<TestScanoutInner>);
+
+impl FbScanout for TestScanout {
+    fn width(&self)  -> u32 { self.0.lock().width }
+    fn height(&self) -> u32 { self.0.lock().height }
+    fn stride(&self) -> u32 { self.width() }
+    fn format(&self) -> PixelFormat { PixelFormat::XRGB8888 }
+    fn name(&self)   -> &'static str { "test" }
+    fn flush(&self, _x: u32, _y: u32, _w: u32, _h: u32) {}
+    unsafe fn framebuffer(&self) -> Framebuffer {
+        let g = self.0.lock();
+        // SAFETY: Vec stays alive for the scanout's lifetime;
+        // pointer is 4-byte aligned (Vec<u32>); caller's Cap +
+        // FbWriter exclusivity gates concurrent writers.
+        unsafe {
+            Framebuffer::new(
+                g.buf.as_ptr() as *mut u32,
+                g.width, g.height, g.width,
+            )
+        }
+    }
+}
+
+static TEST_SCANOUT: narf_lib::sync::IrqSafeSpinLock<Option<TestScanout>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Install a test scanout of the given dimensions. Subsequent
+/// `select_active()` calls return it (overriding the
+/// bochs / virtio-gpu picker). `clear_test_scanout()` undoes.
+///
+/// # Safety
+/// Test-only. Smokes call this synchronously to set up the
+/// surface, then tear it down with `clear_test_scanout` before
+/// returning.
+pub fn install_test_scanout(width: u32, height: u32) {
+    let buf = alloc::vec![0u32; (width * height) as usize];
+    *TEST_SCANOUT.lock() = Some(TestScanout(
+        narf_lib::sync::IrqSafeSpinLock::new(TestScanoutInner { width, height, buf }),
+    ));
+}
+
+pub fn clear_test_scanout() {
+    *TEST_SCANOUT.lock() = None;
+}
+
+/// Read a pixel from the test scanout. Used by smokes to verify
+/// that drained Fill commands actually wrote the expected pixel.
+pub fn test_scanout_pixel(x: u32, y: u32) -> Option<Pixel32> {
+    let g = TEST_SCANOUT.lock();
+    let s = g.as_ref()?;
+    let inner = s.0.lock();
+    if x >= inner.width || y >= inner.height { return None; }
+    let p = inner.buf[(y * inner.width + x) as usize];
+    Some(Pixel32(p))
+}
+
 // ── virtio-gpu backend ──────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -145,10 +226,31 @@ impl FbScanout for VirtioGpuScanout {
 static BOCHS:      BochsScanout      = BochsScanout;
 static VIRTIO_GPU: VirtioGpuScanout  = VirtioGpuScanout;
 
-/// Picker. Prefers bochs (no command-queue tax) when its BAR is
-/// reachable; otherwise falls back to virtio-gpu. Returns `None`
-/// when neither backend has probed successfully.
+/// Picker. Prefers a test scanout (when installed) for hermetic
+/// smokes; otherwise bochs (no command-queue tax) when its BAR is
+/// reachable; otherwise virtio-gpu. Returns `None` when none of
+/// the above is available.
+///
+/// The test-scanout branch leaks a 'static reference via a
+/// trick: we re-cast the lock contents' address. Since the
+/// TEST_SCANOUT static lives forever and the contained TestScanout
+/// is moved-only via `install_test_scanout` / `clear_test_scanout`
+/// (no other path mutates the slot), the resulting `&'static`
+/// stays valid until clear_test_scanout runs.
 pub fn select_active() -> Option<&'static dyn FbScanout> {
+    {
+        let g = TEST_SCANOUT.lock();
+        if let Some(s) = g.as_ref() {
+            // SAFETY: TEST_SCANOUT is a static IrqSafeSpinLock<Option<TestScanout>>;
+            // taking a raw pointer to the Some(...) interior and casting to
+            // &'static is sound while the slot remains Some. Smokes that
+            // install + use + clear within a single test boundary uphold
+            // this. Multi-threaded test access requires the smoke holds the
+            // lock externally, which today's single-CPU smokes do trivially.
+            let ptr: *const TestScanout = s as *const TestScanout;
+            return Some(unsafe { &*ptr });
+        }
+    }
     if narf_graphics_driver::bochs::is_probed() {
         let reachable = narf_graphics_driver::bochs::with_controller(|d| d.fb_reachable())
             .unwrap_or(false);

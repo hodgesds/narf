@@ -2375,6 +2375,75 @@ fn smoke_fb_drain_once_advances_counters() -> TestResult {
 }
 kernel_test!(smoke_fb_drain_once_advances_counters);
 
+fn smoke_fb_e2e_via_test_scanout() -> TestResult {
+    // End-to-end check that runs on every arch: install a test
+    // scanout, attach a registry ring, send a Fill via a kernel
+    // SharedProducer (the same surface a userspace producer would
+    // use after sys_mmap_phys), drain, and read the pixel back
+    // from the test scanout's heap buffer.
+    use narf_fb::{
+        bootstrap_writer, clear_test_scanout, cmd_ring, drain_once,
+        install_test_scanout, registry, test_scanout_pixel, FbWriter, Rect,
+    };
+    use narf_fb::cmd_ring::{DrawCmd, RING_DEPTH, DrawRing};
+    use narf_graphics::Pixel32;
+    use narf_ipc::shared_ring::SharedProducer;
+
+    install_test_scanout(64, 64);
+    registry::__reset_for_test();
+    narf_fb::drain_task::__reset_for_test();
+
+    let pid = 4001u64;
+    let phys = match registry::attach(pid) {
+        Ok(p)  => p,
+        Err(_) => { clear_test_scanout(); return TestResult::Fail("attach"); }
+    };
+    let mut producer: SharedProducer<DrawCmd, RING_DEPTH> =
+        // SAFETY: SPSC contract.
+        unsafe { SharedProducer::from_raw(phys.raw() as *mut DrawRing) };
+    let target_pix = Pixel32::rgb(0xCA, 0xFE, 0x42);
+    if cmd_ring::try_send(
+        &mut producer,
+        DrawCmd::fill(Rect::new(2, 2, 4, 4), target_pix.raw()),
+    ).is_err() {
+        clear_test_scanout();
+        return TestResult::Fail("send");
+    }
+
+    let cap    = bootstrap_writer();
+    let writer = FbWriter::new(cap).expect("writer");
+    let (ok, err) = drain_once(&writer);
+    if ok != 1 || err != 0 {
+        clear_test_scanout();
+        return TestResult::Fail("drain mismatch");
+    }
+
+    // Verify the pixel landed at (3, 3) — inside the filled rect.
+    let inside = match test_scanout_pixel(3, 3) {
+        Some(p) => p,
+        None    => { clear_test_scanout(); return TestResult::Fail("pixel read inside"); }
+    };
+    if inside != target_pix {
+        clear_test_scanout();
+        return TestResult::Fail("inside pixel didn't match");
+    }
+    // Outside the rect should still be 0 (untouched).
+    let outside = match test_scanout_pixel(20, 20) {
+        Some(p) => p,
+        None    => { clear_test_scanout(); return TestResult::Fail("pixel read outside"); }
+    };
+    if outside.raw() != 0 {
+        clear_test_scanout();
+        return TestResult::Fail("outside pixel got painted");
+    }
+
+    registry::__reset_for_test();
+    narf_fb::drain_task::__reset_for_test();
+    clear_test_scanout();
+    TestResult::Pass
+}
+kernel_test!(smoke_fb_e2e_via_test_scanout);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_pte_pk_field() -> TestResult {
     use narf_memory::paging::PtFlags;
