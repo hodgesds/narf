@@ -203,12 +203,26 @@ compose on top of it.
   layer; on aarch64 there is no Microsoft-supplied path
   (`xtajit64` is closed-source). Default answer: no, defer
   indefinitely, document as unsupported.
-- **DLL model.** Loading `.dll` files for real (multi-image
-  process, per-DLL `DllMain`, deferred imports) vs. faking every
-  DLL as a built-in thunk set forever. Real DLLs are needed for
-  any non-trivial game (game shipping its own engine DLLs); the
-  built-in path is what M0 will do and what unit tests will
-  continue to use.
+- **DLL model.** Real `.dll` loading lives behind
+  `compat/win/src/dll.rs` (currently a design-only module). M1
+  ships:
+  1. Recursive `load_pe` re-entry — every unmet import walks the
+     filesystem (`compat/win/src/dll.rs::ModuleTable`) for the
+     missing DLL and loads it under cap rules already enforced by
+     `filesystem/`.
+  2. `DllMain(hinst, DLL_PROCESS_ATTACH, 0)` invocation per
+     loaded DLL via the same syscall-trampoline path the import
+     IAT goes through — once the M0.5 trampoline lands a DLL's
+     entry point is just another thunk-id from the loader's
+     perspective.
+  3. Forwarder chasing — exports whose RVA points inside the
+     export directory are `module.symbol` strings to be re-resolved.
+  4. Bound-import directory acknowledged but ignored — bound RVAs
+     break under our always-relocate-on-load policy.
+  5. Delay-load (`__delayLoadHelper2`) deferred to M2.
+  Built-in thunk sets (`thunks::kernel32` etc.) remain valid for
+  Microsoft DLLs we don't want to ship binaries of — the resolver
+  walks the built-ins first, then the loaded `ModuleTable`.
 - **GDI / Direct3D backend.** When we get there: Vulkan via DXVK
   re-port (the DXVK author's path), or a from-scratch D3D→narf-gpu
   translation? Defer until `drivers/gpu` is real.
