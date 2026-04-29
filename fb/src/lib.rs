@@ -32,7 +32,9 @@
 
 extern crate alloc;
 
+pub mod client;
 pub mod cmd_ring;
+pub use client::{allocate_singleton_ring, FbClient};
 pub use cmd_ring::{DrawCmd, DrawRing, RING_DEPTH, TAG_FILL, TAG_FLUSH};
 
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -280,20 +282,48 @@ pub fn info() -> Option<ScanoutInfo> {
     })
 }
 
-/// Stage::Late initcall: log which backend won the picker.
+/// Stage::Late initcall: log which backend won the picker, then
+/// run a small kernel-resident producer→ring→consumer→FB demo
+/// that proves the architectural chain end-to-end. The demo is
+/// the same pattern a userspace process will eventually use over
+/// an mmap'd DrawRing; only the page-source differs.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
     narf_init::register(Stage::Late, "fb-scanout-picker", || {
         if let Some(s) = select_active() {
-            let _ = s.width(); // touch the call surface
-            // Successful pick — log via the init crate's log hook
-            // when one is set; otherwise quietly return Ok.
             INIT_BACKEND_NAME.store(s.name().as_ptr() as usize, Ordering::Release);
             INIT_BACKEND_LEN.store(s.name().len(),               Ordering::Release);
             InitResult::Ok
         } else {
             InitResult::NotPresent
         }
+    });
+    narf_init::register(Stage::Late, "fb-client-demo", || {
+        if select_active().is_none() {
+            return InitResult::NotPresent;
+        }
+        let cap    = bootstrap_writer();
+        let writer = match FbWriter::new(cap) {
+            Ok(w)  => w,
+            Err(_) => return InitResult::Error("FbWriter::new"),
+        };
+        // SAFETY: SPSC contract — local ring, locally-scoped halves.
+        let (_ring, producer, mut consumer) =
+            unsafe { client::allocate_singleton_ring() };
+        let mut c = client::FbClient::new(producer);
+        let mut total = 0u32;
+        // Three fills + a flush so flush also crosses the wire.
+        let _ = c.fill(Rect::new(0,  0, 4, 4),
+                       Pixel32::rgb(0xC0, 0x10, 0x10).raw());
+        let _ = c.fill(Rect::new(8,  0, 4, 4),
+                       Pixel32::rgb(0x10, 0xC0, 0x10).raw());
+        let _ = c.fill(Rect::new(16, 0, 4, 4),
+                       Pixel32::rgb(0x10, 0x10, 0xC0).raw());
+        let _ = c.flush(Rect::new(0, 0, 24, 4));
+        let (ok, err) = cmd_ring::drain(&mut consumer, &writer);
+        total += ok;
+        let _ = err;
+        if total >= 3 { InitResult::Ok } else { InitResult::Error("drain stalled") }
     });
 }
 

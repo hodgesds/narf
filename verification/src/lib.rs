@@ -2144,6 +2144,49 @@ fn smoke_fb_cmd_ring_round_trip() -> TestResult {
 }
 kernel_test!(smoke_fb_cmd_ring_round_trip);
 
+fn smoke_fb_client_drives_drain_to_pixel() -> TestResult {
+    // The full producer→ring→consumer→FB chain, end-to-end. A
+    // userspace process running over an mmap'd DrawRing would do
+    // exactly this — the kernel-resident version differs only in
+    // that the SharedProducer half is constructed locally instead
+    // of received via the future SYS_FB_RING_MAP. The cap+ring
+    // contract is otherwise identical.
+    use narf_fb::{
+        allocate_singleton_ring, bootstrap_writer, cmd_ring, FbClient,
+        FbWriter, Rect, select_active,
+    };
+    use narf_graphics::Pixel32;
+
+    if select_active().is_none() {
+        return TestResult::Skip("no FB backend probed");
+    }
+    let cap    = bootstrap_writer();
+    let writer = match FbWriter::new(cap) {
+        Ok(w)  => w,
+        Err(_) => return TestResult::Fail("FbWriter::new failed"),
+    };
+
+    // SAFETY: SPSC contract — we keep the producer + consumer
+    // exclusive to this test scope.
+    let (_ring, producer, mut consumer) = unsafe { allocate_singleton_ring() };
+    let mut client = FbClient::new(producer);
+
+    // Enqueue three Fill commands at distinct rects.
+    let pix1 = Pixel32::rgb(0x11, 0x22, 0x33).raw();
+    let pix2 = Pixel32::rgb(0x44, 0x55, 0x66).raw();
+    let pix3 = Pixel32::rgb(0x77, 0x88, 0x99).raw();
+    if client.fill(Rect::new(0,  0, 4, 4), pix1).is_err() { return TestResult::Fail("fill1 send"); }
+    if client.fill(Rect::new(8,  8, 4, 4), pix2).is_err() { return TestResult::Fail("fill2 send"); }
+    if client.fill(Rect::new(16, 16, 4, 4), pix3).is_err() { return TestResult::Fail("fill3 send"); }
+
+    let (executed, errors) = cmd_ring::drain(&mut consumer, &writer);
+    if executed != 3 || errors != 0 {
+        return TestResult::Fail("drain stats mismatched (3/0 expected)");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_fb_client_drives_drain_to_pixel);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_pte_pk_field() -> TestResult {
     use narf_memory::paging::PtFlags;
