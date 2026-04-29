@@ -20,12 +20,16 @@
 
 extern crate alloc;
 
+pub mod dll;
 pub mod pe;
 pub mod personality;
 pub mod process;
 pub mod thunks;
+pub mod trampoline;
 
 pub use pe::{parse as parse_pe, PeError, PeImage};
 pub use personality::{init_peb, init_teb, Layout};
 pub use process::{load_pe, ImportResolver, LoadError, Spawn, WinProcess};
-pub use thunks::{dispatch_thunk, install_registry, resolve_addr, Thunk};
+pub use thunks::{
+    dispatch_thunk, install_registry, resolve_addr, thunk_by_id, thunk_id, Thunk,
+};

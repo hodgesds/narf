@@ -35,6 +35,7 @@ use narf_memory::{
 
 use crate::pe::{self, BaseRelocKind, PeError, PeImage, Section};
 use crate::personality::{self, Layout};
+use crate::trampoline;
 
 // ── cap-typing ────────────────────────────────────────────────────
 
@@ -74,6 +75,11 @@ pub struct WinProcess {
     pub teb_va:        VirtAddr,
     pub stack_base:    VirtAddr,
     pub stack_top:     VirtAddr,
+    /// Base of the user-RX trampoline page. IAT slots resolved at
+    /// load time point at `trampoline_va + thunk_id * STUB_BYTES`;
+    /// each stub fires `syscall` (amd64) / `svc` (aarch64) which
+    /// the kernel-side `SYS_WIN_THUNK` handler dispatches by id.
+    pub trampoline_va: VirtAddr,
 }
 
 impl CapType for WinProcess {
@@ -113,11 +119,13 @@ impl From<PeError> for LoadError {
     fn from(e: PeError) -> Self { LoadError::Pe(e) }
 }
 
-/// Address resolved by an import handler — the runtime VA the IAT
-/// slot will be patched to. Distinct from `&'static dyn Thunk`
-/// because the value the CPU actually loads is the per-arch
-/// trampoline entry, not the trait-object pointer.
-pub type ImportResolver = fn(module: &str, symbol: &str) -> Option<u64>;
+/// Resolve an import to its stable thunk id (the index used by the
+/// per-process trampoline page). Returns `None` for an unimplemented
+/// import — the loader translates that to `LoadError::UnresolvedImport`.
+///
+/// The IAT slot itself is patched to `trampoline_va + id * STUB_BYTES`
+/// inside the loader; resolvers don't need to know the trampoline VA.
+pub type ImportResolver = fn(module: &str, symbol: &str) -> Option<u16>;
 
 // ── pure helpers (testable on host) ───────────────────────────────
 
@@ -144,18 +152,25 @@ pub fn perms_of(characteristics: u32) -> Result<RegionPerms, LoadError> {
     Ok(p)
 }
 
-/// Resolve every PE import to a (iat_rva, address) pair using
-/// `resolve`. Returns `UnresolvedImport` on the first miss — silent
-/// stubs are out per spec §4.
+/// Resolve every PE import to a (iat_rva, trampoline_address) pair
+/// given a thunk-id resolver and the runtime base of the process's
+/// trampoline page. Returns `UnresolvedImport` on the first miss
+/// — silent stubs are out per spec §4.
 pub fn resolve_imports(
-    image: &PeImage<'_>,
-    resolve: ImportResolver,
+    image:          &PeImage<'_>,
+    resolve:        ImportResolver,
+    trampoline_va:  u64,
 ) -> Result<Vec<(u32, u64)>, LoadError> {
     let mut out = Vec::with_capacity(image.imports.len());
     for imp in &image.imports {
         match resolve(&imp.module, &imp.symbol) {
-            Some(addr) => out.push((imp.iat_rva, addr)),
-            None       => return Err(LoadError::UnresolvedImport),
+            Some(id) => {
+                let addr = trampoline_va
+                    .checked_add(trampoline::trampoline_offset(id) as u64)
+                    .ok_or(LoadError::BadFixupRva)?;
+                out.push((imp.iat_rva, addr));
+            }
+            None => return Err(LoadError::UnresolvedImport),
         }
     }
     Ok(out)
@@ -326,8 +341,43 @@ pub unsafe fn load_pe(
         }
     }
 
-    // Patch the IAT.
-    for (rva, addr) in resolve_imports(&image, resolve)? {
+    // Pick the per-process address layout (PEB / TEB / stack VAs).
+    // Used both by the trampoline page (whose VA sits one page
+    // above the PEB) and by the PEB / TEB population below.
+    let layout = Layout::defaults(chosen_base, /*pid=*/ 1, /*tid=*/ 1);
+
+    // Build + map the per-process trampoline page (user-RX). One
+    // 4-KiB page covers up to 256 thunk stubs — well above the M0
+    // kernel32 surface of 4. Fill is `nop` so a mis-targeted
+    // `call` lands on a NOP slide rather than arbitrary data.
+    let trampoline_va = layout.peb_va.wrapping_add(0x1000); // page above PEB
+    let tramp_frame = alloc_frame().map_err(|_| LoadError::NoFrame)?.start_address();
+    {
+        let bytes = if cfg!(target_arch = "aarch64") {
+            trampoline::build_aarch64(trampoline::MAX_THUNKS)
+        } else {
+            // amd64 + host (cargo test) path.
+            trampoline::build_amd64(trampoline::MAX_THUNKS)
+        };
+        // SAFETY: identity-mapped fresh frame, exclusive owner.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                tramp_frame.raw() as *mut u8,
+                4096,
+            );
+        }
+    }
+    address_space.map_region(Region {
+        base:  VirtAddr::new(trampoline_va),
+        len:   4096,
+        perms: RegionPerms::READ | RegionPerms::EXEC,
+        phys:  alloc::vec![tramp_frame],
+    }).map_err(|_| LoadError::AddressSpace)?;
+
+    // Patch the IAT — each slot points at the stub for its thunk
+    // inside the trampoline page we just mapped.
+    for (rva, addr) in resolve_imports(&image, resolve, trampoline_va)? {
         let (frame, off) = rva_to_phys(&image.sections, &section_frames, rva)
             .ok_or(LoadError::BadFixupRva)?;
         if off + 8 > 4096 {
@@ -343,8 +393,6 @@ pub unsafe fn load_pe(
     // Materialize the PEB + TEB. One frame each, mapped user-RW at
     // the layout-defined VAs. Population is byte-level to dodge
     // having to maintain full PEB / TEB Rust structs.
-    let layout = Layout::defaults(chosen_base, /*pid=*/ 1, /*tid=*/ 1);
-
     let peb_frame = alloc_frame().map_err(|_| LoadError::NoFrame)?.start_address();
     let teb_frame = alloc_frame().map_err(|_| LoadError::NoFrame)?.start_address();
 
@@ -375,6 +423,30 @@ pub unsafe fn load_pe(
         phys:  alloc::vec![teb_frame],
     }).map_err(|_| LoadError::AddressSpace)?;
 
+    // Allocate the user stack at the layout-pinned VAs. Win32's
+    // documented default is 1 MiB; we honour it so any PE with
+    // __chkstk / SEH sees the range it expects. Frames are
+    // zero-initialised by the allocator's frame-zeroing pass; we
+    // do not memset here.
+    //
+    // The frames are kept inside the AS via `Region.phys`; the
+    // spawner consumes them at first-thread-entry to point RSP at
+    // `stack_top - 8` and (on amd64) `swapgs` into the user TEB.
+    let stack_pages = (layout.stack_top - layout.stack_base) >> 12;
+    let mut stack_frames: Vec<PhysAddr> = Vec::with_capacity(stack_pages as usize);
+    for _ in 0..stack_pages {
+        let f = alloc_frame().map_err(|_| LoadError::NoFrame)?;
+        // SAFETY: identity-mapped fresh frame.
+        unsafe { core::ptr::write_bytes(f.start_address().raw() as *mut u8, 0, 4096); }
+        stack_frames.push(f.start_address());
+    }
+    address_space.map_region(Region {
+        base:  VirtAddr::new(layout.stack_base),
+        len:   layout.stack_top - layout.stack_base,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys:  stack_frames,
+    }).map_err(|_| LoadError::AddressSpace)?;
+
     Ok(WinProcess {
         address_space: Arc::new(address_space),
         entry:         VirtAddr::new(chosen_base.wrapping_add(image.entry)),
@@ -384,6 +456,7 @@ pub unsafe fn load_pe(
         teb_va:        VirtAddr::new(layout.teb_va),
         stack_base:    VirtAddr::new(layout.stack_base),
         stack_top:     VirtAddr::new(layout.stack_top),
+        trampoline_va: VirtAddr::new(trampoline_va),
     })
 }
 
@@ -452,9 +525,10 @@ mod tests {
             symbol:  "exitprocess".into(),
             iat_rva: 0x20A0,
         }];
-        fn r(_m: &str, _s: &str) -> Option<u64> { Some(0xDEAD_BEEF) }
-        let v = resolve_imports(&img, r).unwrap();
-        assert_eq!(v, vec![(0x20A0, 0xDEAD_BEEF)]);
+        // Resolver returns thunk id 3 → IAT slot ← trampoline_va + 3*16.
+        fn r(_m: &str, _s: &str) -> Option<u16> { Some(3) }
+        let v = resolve_imports(&img, r, /*trampoline_va=*/ 0x1000_0000).unwrap();
+        assert_eq!(v, vec![(0x20A0, 0x1000_0000 + 3 * 16)]);
     }
 
     #[test]
@@ -466,8 +540,8 @@ mod tests {
             symbol:  "createfilew".into(),
             iat_rva: 0x20A0,
         }];
-        fn r(_m: &str, _s: &str) -> Option<u64> { None }
-        assert_eq!(resolve_imports(&img, r).unwrap_err(),
+        fn r(_m: &str, _s: &str) -> Option<u16> { None }
+        assert_eq!(resolve_imports(&img, r, /*trampoline_va=*/ 0x1000_0000).unwrap_err(),
                    LoadError::UnresolvedImport);
     }
 

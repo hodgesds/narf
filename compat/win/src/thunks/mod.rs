@@ -92,6 +92,46 @@ pub fn resolve_addr(module: &str, symbol: &str) -> Option<u64> {
     dispatch_thunk(module, symbol).map(|t| t.entry_addr())
 }
 
+/// Stable thunk id — the registry-slice index of the matched
+/// thunk. Used by the PE loader to compute trampoline offsets:
+/// `trampoline_va + thunk_id(...) * STUB_BYTES`.
+///
+/// Stable across the boot's lifetime because the registry is
+/// install-once; the kernel-side `SYS_WIN_THUNK` handler reads
+/// the id from the syscall instruction and looks the thunk up via
+/// [`thunk_by_id`].
+pub fn thunk_id(module: &str, symbol: &str) -> Option<u16> {
+    let ptr = REGISTRY.load(Ordering::Acquire);
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: same as dispatch_thunk — install_registry stores a
+    // `&'static` reference; once non-null it lives forever.
+    let table: &'static [&'static dyn Thunk] = unsafe { *(ptr as *const _) };
+    for (idx, t) in table.iter().enumerate() {
+        let (m, s) = t.name();
+        if m.eq_ignore_ascii_case(module) && s.eq_ignore_ascii_case(symbol) {
+            // u16 fits trivially: the trampoline page caps at 256
+            // stubs (16 B/stub × 256 = 4 KiB) so any registry that
+            // overflows u16 has bigger problems.
+            return Some(idx as u16);
+        }
+    }
+    None
+}
+
+/// Inverse of [`thunk_id`]: look the thunk up by its stable id.
+/// Used by the kernel-side `SYS_WIN_THUNK` handler.
+pub fn thunk_by_id(id: u16) -> Option<&'static dyn Thunk> {
+    let ptr = REGISTRY.load(Ordering::Acquire);
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: see thunk_id.
+    let table: &'static [&'static dyn Thunk] = unsafe { *(ptr as *const _) };
+    table.get(id as usize).copied()
+}
+
 /// Helper macro: declare a per-thunk entry function with the right
 /// per-arch ABI, plus a `Thunk` impl whose `entry_addr` returns
 /// that function's address.

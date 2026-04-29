@@ -20579,13 +20579,14 @@ fn smoke_compat_win_load_pe_pipeline() -> TestResult {
 
     let bytes = build_synthetic_pe(0x8664); // AMD64
 
-    // Custom resolver: returns a sentinel for the one import the
-    // synthetic PE declares, None for everything else.
-    fn resolver(module: &str, symbol: &str) -> Option<u64> {
+    // Custom resolver: returns a stable thunk id for the one
+    // import the synthetic PE declares; the loader translates that
+    // id into trampoline_va + id * STUB_BYTES for the IAT slot.
+    fn resolver(module: &str, symbol: &str) -> Option<u16> {
         if module.eq_ignore_ascii_case("kernel32.dll")
            && symbol.eq_ignore_ascii_case("exitprocess")
         {
-            Some(0xDEAD_BEEF_CAFE_F00D)
+            Some(3) // arbitrary id — exercises the offset arithmetic
         } else {
             None
         }
@@ -20619,10 +20620,23 @@ fn smoke_compat_win_load_pe_pipeline() -> TestResult {
         return TestResult::Fail("compat-win: stack range inverted");
     }
 
-    // Region count: 2 PE sections + PEB + TEB = 4.
+    // Region count: 2 PE sections + trampoline + PEB + TEB + stack = 6.
     let regions = proc.address_space.regions_snapshot();
-    if regions.len() != 4 {
-        return TestResult::Fail("compat-win: expected 4 mapped regions");
+    if regions.len() != 6 {
+        return TestResult::Fail("compat-win: expected 6 mapped regions");
+    }
+    if proc.trampoline_va.as_u64() == 0 {
+        return TestResult::Fail("compat-win: trampoline_va not set");
+    }
+    // Stack range matches the Layout default and is mapped R+W.
+    let stack_region = regions.iter()
+        .find(|r| r.base.as_u64() == proc.stack_base.as_u64());
+    let stack_region = match stack_region {
+        Some(r) => r,
+        None    => return TestResult::Fail("compat-win: stack region missing"),
+    };
+    if stack_region.len != (proc.stack_top.as_u64() - proc.stack_base.as_u64()) {
+        return TestResult::Fail("compat-win: stack region size mismatch");
     }
     // The two PE sections live at image_base + section.virt_addr.
     let section_base_text = 0x1_4000_0000u64 + 0x1000;
