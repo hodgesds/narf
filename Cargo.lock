@@ -615,6 +615,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-init"
+version = "0.0.0"
+dependencies = [
+ "narf-lib",
+]
+
+[[package]]
 name = "narf-input"
 version = "0.0.0"
 dependencies = [
@@ -786,6 +793,7 @@ dependencies = [
  "narf-filesystem",
  "narf-graphics",
  "narf-graphics-driver",
+ "narf-init",
  "narf-input",
  "narf-input-driver",
  "narf-interrupts",
