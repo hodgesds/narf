@@ -21,6 +21,7 @@
 extern crate alloc;
 
 pub mod dll;
+pub mod entry;
 pub mod pe;
 pub mod personality;
 pub mod process;

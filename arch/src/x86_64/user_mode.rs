@@ -65,6 +65,46 @@ pub unsafe fn set_user_fs_base(fs_base: u64) {
     compiler_fence(Ordering::SeqCst);
 }
 
+/// MSR index `IA32_KERNEL_GS_BASE` (Intel SDM Vol. 4 §2.6). On
+/// long-mode x86_64 this is the GS.base value that becomes the live
+/// `IA32_GS_BASE` after a `swapgs` instruction. The kernel keeps
+/// the per-CPU pointer in `IA32_GS_BASE` while in CPL=0; on
+/// transition to CPL=3 (`enter_user_mode`'s `swapgs`) the two
+/// MSR slots swap, so `IA32_KERNEL_GS_BASE` must hold the value
+/// the user task expects to observe through `gs:[N]`.
+pub const IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
+
+/// Program `IA32_KERNEL_GS_BASE` so the next user-mode entry's
+/// post-`swapgs` `gs:[N]` reads from `gs_base + N`. This is the
+/// Win32 / Win-on-NARF pre-entry hook — `compat/win` calls this
+/// with `WinProcess.teb_va` so a PE binary's
+/// `mov rax, gs:[0x30]` (TEB self-pointer) and `gs:[0x60]` (PEB
+/// pointer) resolve correctly.
+///
+/// # Safety
+/// Writing `IA32_KERNEL_GS_BASE` is always legal at CPL=0 on
+/// long-mode x86_64. The supplied `gs_base` must be a canonical
+/// user vaddr if the next user-mode access through `gs:` is to
+/// land on a mapped page; nothing here validates that.
+#[inline]
+pub unsafe fn set_user_gs_base(gs_base: u64) {
+    let low  = gs_base as u32;
+    let high = (gs_base >> 32) as u32;
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: IA32_KERNEL_GS_BASE is unconditional on long-mode
+    // x86_64; caller owns the canonical-vaddr precondition.
+    unsafe {
+        asm!(
+            "wrmsr",
+            in("ecx") IA32_KERNEL_GS_BASE,
+            in("eax") low,
+            in("edx") high,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
 /// Snapshot of a user-mode task's CPU state at trap time. Field
 /// order is load-bearing — `enter_user_mode_resume`'s naked asm
 /// reads by byte offset.
