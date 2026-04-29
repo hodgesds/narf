@@ -839,6 +839,8 @@ impl Syscall {
             195 => Syscall::Listdir,
             196 => Syscall::Getdents64,
             200 => Syscall::GetRandom,
+            240 => Syscall::MmapPhys,
+            241 => Syscall::FbRingAttach,
             _   => return None,
         })
     }

@@ -285,6 +285,55 @@ fn run_probes_x86_64(rsp_at_entry: u64) {
     // SAFETY: same page as above.
     let signal_ok = unsafe { core::ptr::read_volatile(SIG_RECV_VADDR as *const u32) } == 10;
     rt::print_str(if signal_ok { "signal: ok\n" } else { "signal: bad\n" });
+
+    // ── fb probe ──────────────────────────────────────────────
+    // Attach a DrawRing → mmap_phys it → enqueue a Fill. The
+    // kernel-side drain task picks it up on its next scheduler
+    // tick. Layout duplicated from narf-ipc::shared_ring +
+    // narf-fb::cmd_ring — the testbin can't pull those crates
+    // because of its disjoint workspace.
+    //
+    //   SharedRing<DrawCmd, 16> layout:
+    //     +0  head:   u32 (producer-owned cursor)
+    //     +4  tail:   u32 (consumer-owned cursor)
+    //     +8  closed: u32
+    //     +64 slots[16] of DrawCmd (32 bytes each):
+    //       tag:u32 / pad:u32 / x:u32 / y:u32 /
+    //       w:u32   / h:u32   / pixel:u32 / pad:u32
+    //
+    //   Tags: 1 = FILL, 2 = FLUSH.
+    let phys = unsafe { rt::fb_ring_attach() };
+    let mut fb_ok = false;
+    if phys != 0 {
+        let va = unsafe { rt::mmap_phys(phys, 4096, 0) };
+        if !va.is_null() {
+            // SAFETY: va is freshly mmap'd 4 KiB, RW. Layout
+            // mirrors narf-ipc + narf-fb wire format.
+            unsafe {
+                use core::sync::atomic::{AtomicU32, Ordering};
+                let head_p = va as *const AtomicU32;
+                let tail_p = va.add(4) as *const AtomicU32;
+                let head = (*head_p).load(Ordering::Relaxed);
+                let tail = (*tail_p).load(Ordering::Acquire);
+                if head.wrapping_sub(tail) < 16 {
+                    let slot_idx = (head & 15) as usize;
+                    let slot = va.add(64 + slot_idx * 32);
+                    // Write DrawCmd::fill(rect=(4,4, 8,8), 0x00BADF00D).
+                    core::ptr::write_volatile(slot as *mut u32, 1u32);          // tag = FILL
+                    core::ptr::write_volatile(slot.add(4) as *mut u32, 0u32);   // pad
+                    core::ptr::write_volatile(slot.add(8) as *mut u32, 4u32);   // x
+                    core::ptr::write_volatile(slot.add(12) as *mut u32, 4u32);  // y
+                    core::ptr::write_volatile(slot.add(16) as *mut u32, 8u32);  // w
+                    core::ptr::write_volatile(slot.add(20) as *mut u32, 8u32);  // h
+                    core::ptr::write_volatile(slot.add(24) as *mut u32, 0xFFBADF00u32); // pixel
+                    core::ptr::write_volatile(slot.add(28) as *mut u32, 0u32);  // pad
+                    (*head_p).store(head.wrapping_add(1), Ordering::Release);
+                    fb_ok = true;
+                }
+            }
+        }
+    }
+    rt::print_str(if fb_ok { "fb: ok\n" } else { "fb: bad\n" });
 }
 
 #[panic_handler]

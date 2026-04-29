@@ -15411,6 +15411,16 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
+    // FB-ring-attach hook: the boot path's Stage::Subsys initcall
+    // installs this; the test runner doesn't invoke initcalls so
+    // we wire the hook here directly.
+    narf_userspace::handlers::install_fb_ring_attach_hook(|pid| {
+        match narf_fb::registry::attach(pid) {
+            Ok(p)  => p.raw(),
+            Err(_) => 0,
+        }
+    });
+
     // Snapshot CR3 for restore post-unwind.
     let original_cr3: u64;
     unsafe {
@@ -15451,6 +15461,19 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
         // testbin's pass signal in QEMU's exit code.
         use core::fmt::Write as _;
         let mut w = narf_console::Writer;
+        // FB probe verification: after the testbin returns, drain
+        // anything it enqueued onto its DrawRing. The drain task
+        // we spawn at boot doesn't run inside the test harness
+        // (no scheduler tick from this runner), so we drain
+        // synchronously here.
+        if narf_fb::select_active().is_some() {
+            let cap = narf_fb::bootstrap_writer();
+            if let Ok(fb_writer) = narf_fb::FbWriter::new(cap) {
+                let (ok_n, _err_n) = narf_fb::drain_once(&fb_writer);
+                let _ = writeln!(w,
+                    "  fb: post-testbin drain executed {} cmd(s)", ok_n);
+            }
+        }
         let _ = writeln!(w, "  [ OK ] smoke_frame_x86_64_run_narf_testbin");
         let _ = writeln!(w, "── user-mode-testbin: testbin round-trip succeeded ──");
         unsafe { narf_arch::exit_kernel(0) }
