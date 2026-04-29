@@ -21,7 +21,7 @@ pub use address_space::{AddressSpace, AddressSpaceError, Region, RegionPerms};
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::{mmu, paging};
+pub use x86_64::{domain, mmu, paging};
 
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;

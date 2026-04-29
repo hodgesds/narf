@@ -159,11 +159,22 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     }
                 }
             }
+            // Install per-domain private PDPTs (slot 256+D in each
+            // domain's PML4). After this, accesses to domain D's
+            // private VA range from any other domain hard-fault at
+            // PML4 level.
+            // SAFETY: pcid::init has run; PML4s are registered;
+            // identity map still covers low frames.
+            let private_pdpts = match unsafe { narf_memory::domain::init_per_domain_pdpts() } {
+                Ok(n)  => n,
+                Err(_) => 0,
+            };
             narf_arch::set_effective_backend(narf_arch::DomainBackend::Pcid);
             let _ = writeln!(console::Writer,
-                "  domain enforcer: pcid (CR4.PCIDE=1, {} per-domain PML4 clones \
-                 registered with shared downstream PTs; \
-                 domain-private subtree COW pending follow-up)", registered);
+                "  domain enforcer: pcid (CR4.PCIDE=1, {} PML4 clones, \
+                 {} private PDPTs at slots 256..=271; cross-domain \
+                 access to private VAs faults at PML4 level)",
+                registered, private_pdpts);
         }
 
         // NX enable. PTE bit 63 (NO_EXEC) is reserved-zero unless

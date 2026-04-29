@@ -1075,6 +1075,67 @@ fn smoke_pcid_per_domain_pml4s_distinct() -> TestResult {
 kernel_test!(smoke_pcid_per_domain_pml4s_distinct);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_pcid_domain_private_slots_isolated() -> TestResult {
+    // Each domain's PML4 must have its OWN private slot present and
+    // every OTHER domain's private slot absent. This is the structural
+    // proof that a cross-domain access to a private VA hard-faults.
+    use narf_arch::x86_64::pcid;
+    use narf_memory::domain;
+
+    if !pcid::is_active() {
+        return TestResult::Skip("PCID enforcer not active (PKS-class CPU)");
+    }
+
+    // Self-slots: domain D's PML4 has PML4[256+D] present.
+    for (d, present) in domain::private_slot_status().iter().copied() {
+        if !present {
+            return TestResult::Fail("a domain's own private slot is not present");
+        }
+        let _ = d;
+    }
+    // Cross-slots: for every (inspector D', target D != D'), inspector
+    // sees PML4[256+D] absent.
+    for inspector in 0u8..16 {
+        for target in 0u8..16 {
+            if inspector == target { continue; }
+            match domain::cross_domain_slot_present(inspector, target) {
+                Some(true)  => return TestResult::Fail("cross-domain slot leaked"),
+                Some(false) => { /* expected */ }
+                None        => return TestResult::Fail("PML4 not registered"),
+            }
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_pcid_domain_private_slots_isolated);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_pcid_domain_private_va_layout() -> TestResult {
+    // Verify the canonical-VA layout: domain D's private base is
+    // 0xFFFF_8000_0000_0000 + D*512GiB, and the 16 ranges don't
+    // overlap or escape upper-half.
+    use narf_memory::domain;
+
+    for d in 0u8..16 {
+        let base = match domain::domain_va_base(d) {
+            Some(b) => b,
+            None    => return TestResult::Fail("domain_va_base returned None for valid id"),
+        };
+        let expected = 0xFFFF_8000_0000_0000u64 + (d as u64) * (1u64 << 39);
+        if base != expected {
+            return TestResult::Fail("domain_va_base layout drifted");
+        }
+    }
+    if domain::domain_va_base(16).is_some() {
+        return TestResult::Fail("domain_va_base accepted out-of-range id");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_pcid_domain_private_va_layout);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_pte_pk_field() -> TestResult {
     use narf_memory::paging::PtFlags;
     // Build a flag value with PK=7; check the round-trip + isolation
