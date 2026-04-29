@@ -1,0 +1,22 @@
+[package]
+name         = "narf-compat-win"
+description  = "Win32-on-NARF: PE32+ loader, NT-shaped process model, Win32 API thunks."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_compat_win"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../../lib" }
+narf-capabilities = { path = "../../capabilities" }
+narf-userspace    = { path = "../../userspace" }
+narf-memory       = { path = "../../memory" }
+narf-console      = { path = "../../console" }
+
+[lints]
+workspace = true

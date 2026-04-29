@@ -454,6 +454,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-compat-win"
+version = "0.0.0"
+dependencies = [
+ "narf-capabilities",
+ "narf-console",
+ "narf-lib",
+ "narf-memory",
+ "narf-userspace",
+]
+
+[[package]]
 name = "narf-console"
 version = "0.0.0"
 dependencies = [
@@ -839,6 +850,7 @@ dependencies = [
  "narf-boot",
  "narf-bus",
  "narf-capabilities",
+ "narf-compat-win",
  "narf-console",
  "narf-crypto",
  "narf-drivers",
