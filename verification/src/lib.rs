@@ -1620,6 +1620,78 @@ fn smoke_virtio_gpu_scanout_initialised() -> TestResult {
 }
 kernel_test!(smoke_virtio_gpu_scanout_initialised);
 
+fn smoke_graphics_font_glyph_lookup() -> TestResult {
+    use narf_graphics::font8x8;
+    // Space is a printable code → empty glyph (all zero bytes).
+    let space = font8x8::lookup(b' ');
+    if !space.iter().all(|&b| b == 0) {
+        return TestResult::Fail("space glyph not blank");
+    }
+    // Non-printable → also empty.
+    let nul = font8x8::lookup(0);
+    if !nul.iter().all(|&b| b == 0) {
+        return TestResult::Fail("non-printable glyph not blank");
+    }
+    // 'A' has a non-blank glyph in our font.
+    let a = font8x8::lookup(b'A');
+    if a.iter().all(|&b| b == 0) {
+        return TestResult::Fail("A glyph empty");
+    }
+    // 'A' should have its leftmost-pixel-of-row pattern be a triangle peak.
+    // Just verify the top row has the 0x18 pattern (a centred 2-pixel cap).
+    if a[0] != 0b00011000 {
+        return TestResult::Fail("A glyph top row drifted");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_graphics_font_glyph_lookup);
+
+fn smoke_fb_console_writes_glyphs() -> TestResult {
+    use alloc::vec;
+    use narf_graphics::{FbConsole, Framebuffer, Pixel32, font8x8};
+    // Build an in-memory FB just big enough for 4 chars × 1 row.
+    let mut buf = vec![0u32; 32 * 8];
+    let ptr = buf.as_mut_ptr();
+    // SAFETY: backing buffer outlives the borrow.
+    let fb = unsafe { Framebuffer::new(ptr, 32, 8, 32) };
+    let mut con = FbConsole::new(fb, Pixel32::WHITE, Pixel32::BLACK);
+    con.write_bytes(b"NARF");
+    if con.cursor() != (4, 0) {
+        return TestResult::Fail("cursor advance wrong");
+    }
+    // First char 'N' at (0..8, 0..8); top row's leftmost pixel set comes
+    // from the glyph. We verify the 'N' top row pattern got drawn.
+    let n_glyph = font8x8::lookup(b'N');
+    // Top row: pixels (0..8, 0). Each pixel is fg=WHITE iff the corresponding
+    // glyph-row bit is 1.
+    for col in 0..8u32 {
+        let bit = (n_glyph[0] >> (7 - col)) & 1 != 0;
+        let want = if bit { Pixel32::WHITE.raw() } else { Pixel32::BLACK.raw() };
+        if buf[col as usize] != want {
+            return TestResult::Fail("N glyph not painted at expected position");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_fb_console_writes_glyphs);
+
+fn smoke_fb_console_newline_advances_row() -> TestResult {
+    use alloc::vec;
+    use narf_graphics::{FbConsole, Framebuffer, Pixel32};
+    let mut buf = vec![0u32; 16 * 24];
+    let ptr = buf.as_mut_ptr();
+    // SAFETY: backing buffer outlives the borrow.
+    let fb = unsafe { Framebuffer::new(ptr, 16, 24, 16) };
+    let mut con = FbConsole::new(fb, Pixel32::WHITE, Pixel32::BLACK);
+    con.write_bytes(b"hi\nyo");
+    let (col, row) = con.cursor();
+    if row != 1 || col != 2 {
+        return TestResult::Fail("cursor after newline + 2 chars wrong");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_fb_console_newline_advances_row);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_pte_pk_field() -> TestResult {
     use narf_memory::paging::PtFlags;

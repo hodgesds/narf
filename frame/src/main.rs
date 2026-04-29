@@ -714,15 +714,15 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 }
             }
 
-            // Splash blit: if a framebuffer device probed AND its
-            // BAR0 lies inside the low-4-GiB identity map, paint a
-            // background + a centred "NARF" banner sketched from
-            // filled rectangles. Above 4 GiB the boot PML4 has no
-            // PTEs covering the BAR yet — log + skip.
+            // Framebuffer console: if bochs probed and its BAR is
+            // reachable through the boot identity map, install an
+            // FbConsole over it and wire console::write_str's fan-out
+            // hook. After this, every kernel log line dual-writes to
+            // serial and to the framebuffer.
             #[cfg(target_arch = "x86_64")]
             {
-                use narf_graphics::Pixel32;
-                let painted = narf_graphics_driver::bochs::with_controller(|d| {
+                use narf_graphics::{FbConsole, Pixel32};
+                let installed = narf_graphics_driver::bochs::with_controller(|d| {
                     if !d.fb_reachable() {
                         let _ = writeln!(console::Writer,
                             "  splash: bochs framebuffer at {:#x} above 4 GiB \
@@ -730,67 +730,22 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             d.fb_phys());
                         return (0u32, 0u32);
                     }
-                    // SAFETY: BSP, no concurrent draw, framebuffer is
-                    // the device's exclusive scanout buffer.
-                    let mut fb = unsafe { d.framebuffer() };
-                    fb.clear(Pixel32::NARF_BG);
-                    // Centred NARF banner: 4 letterforms, 64 px tall,
-                    // 6 px stroke, 16 px gap. Total width ≈ 4*48 + 3*16 = 240 px.
-                    let stroke = 6u32;
-                    let h = 64u32;
-                    let w = 48u32;
-                    let gap = 16u32;
-                    let total = 4 * w + 3 * gap;
-                    let x0 = (fb.width.saturating_sub(total)) / 2;
-                    let y0 = (fb.height.saturating_sub(h)) / 2;
-                    let fg = Pixel32::NARF_FG;
-                    // Helper: draw an "N".
-                    let mut x = x0;
-                    // Left vertical
-                    fb.fill_rect(x, y0, stroke, h, fg);
-                    // Right vertical
-                    fb.fill_rect(x + w - stroke, y0, stroke, h, fg);
-                    // Diagonal: approximated by a series of stepped
-                    // rects so we don't need a line primitive yet.
-                    {
-                        let steps = h / stroke;
-                        for i in 0..steps {
-                            let dx = (i * (w - stroke)) / steps;
-                            fb.fill_rect(x + dx, y0 + i * stroke, stroke, stroke, fg);
-                        }
-                    }
-                    // 'A'
-                    x += w + gap;
-                    fb.fill_rect(x, y0, stroke, h, fg);                                  // left vertical
-                    fb.fill_rect(x + w - stroke, y0, stroke, h, fg);                     // right vertical
-                    fb.fill_rect(x, y0, w, stroke, fg);                                  // top bar
-                    fb.fill_rect(x, y0 + h/2 - stroke/2, w, stroke, fg);                 // mid bar
-                    // 'R'
-                    x += w + gap;
-                    fb.fill_rect(x, y0, stroke, h, fg);                                  // left vertical
-                    fb.fill_rect(x, y0, w, stroke, fg);                                  // top bar
-                    fb.fill_rect(x + w - stroke, y0, stroke, h/2, fg);                   // upper-right vertical
-                    fb.fill_rect(x, y0 + h/2 - stroke/2, w, stroke, fg);                 // mid bar
-                    {
-                        // diagonal lower stroke (R's leg) via stepped rects.
-                        let steps = (h - h/2) / stroke;
-                        for i in 0..steps {
-                            let dx = (i * (w - stroke)) / steps.max(1);
-                            fb.fill_rect(x + dx, y0 + h/2 + i * stroke, stroke, stroke, fg);
-                        }
-                    }
-                    // 'F'
-                    x += w + gap;
-                    fb.fill_rect(x, y0, stroke, h, fg);                                  // left vertical
-                    fb.fill_rect(x, y0, w, stroke, fg);                                  // top bar
-                    fb.fill_rect(x, y0 + h/2 - stroke/2, w*3/4, stroke, fg);             // mid bar
-                    (d.width, d.height)
+                    // SAFETY: BSP, no concurrent draw.
+                    let fb = unsafe { d.framebuffer() };
+                    let console = FbConsole::new(fb,
+                        Pixel32::NARF_FG, Pixel32::NARF_BG);
+                    let cols = console.cols();
+                    let rows = console.rows();
+                    narf_graphics::install_fb_console(console);
+                    console::set_fb_hook(narf_graphics::console::write_bytes);
+                    (cols, rows)
                 });
-                if let Some((w, h)) = painted {
-                    if w > 0 {
+                if let Some((cols, rows)) = installed {
+                    if cols > 0 {
                         let _ = writeln!(console::Writer,
-                            "  splash: {}x{} bochs framebuffer painted with NARF banner",
-                            w, h);
+                            "  splash: {}x{} bochs framebuffer console installed \
+                             ({} cols x {} rows of 8x8 glyphs)",
+                            cols * 8, rows * 8, cols, rows);
                     }
                 }
             }

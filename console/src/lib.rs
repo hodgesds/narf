@@ -122,6 +122,28 @@ pub fn write_str(s: &str) {
     // or `remap_to_virtual`, and we hold the coarse lock; the backend
     // methods themselves uphold the compiler_fence discipline.
     unsafe { backend::write_bytes(base, kind, s.as_bytes()); }
+
+    // Fan out to the framebuffer-console hook when installed.
+    let h = FB_HOOK.load(Ordering::Acquire);
+    if h != 0 {
+        // SAFETY: stored as `FbHook as usize` in `set_fb_hook`.
+        let f: FbHook = unsafe { core::mem::transmute(h) };
+        f(s.as_bytes());
+    }
+}
+
+/// Type of the optional framebuffer fan-out callback. Boot-time
+/// install only; no per-call allocation.
+pub type FbHook = fn(&[u8]);
+
+/// Stored as `FbHook as usize` so the static can sit alongside the
+/// other AtomicUsize hooks without a Mutex.
+static FB_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the FB-console fan-out. Frame's boot path calls this
+/// after `graphics::install_fb_console` succeeds.
+pub fn set_fb_hook(hook: FbHook) {
+    FB_HOOK.store(hook as usize, Ordering::Release);
 }
 
 /// Panic sink — no allocation, no re-entry. `frame/`'s panic handler

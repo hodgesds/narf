@@ -155,3 +155,5 @@ impl Framebuffer {
 }
 
 pub mod font8x8;
+pub mod console;
+pub use console::{FbConsole, install_fb_console};
