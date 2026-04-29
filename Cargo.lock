@@ -568,6 +568,7 @@ dependencies = [
  "narf-graphics",
  "narf-graphics-driver",
  "narf-init",
+ "narf-ipc",
  "narf-lib",
 ]
 

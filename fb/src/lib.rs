@@ -32,6 +32,9 @@
 
 extern crate alloc;
 
+pub mod cmd_ring;
+pub use cmd_ring::{DrawCmd, DrawRing, RING_DEPTH, TAG_FILL, TAG_FLUSH};
+
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use narf_capabilities::{Cap, CapKind, CapType, Read, Write};
