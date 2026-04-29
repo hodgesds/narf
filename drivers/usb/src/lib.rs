@@ -7,3 +7,12 @@
 extern crate alloc;
 
 pub mod xhci;
+
+/// Stage::Subsys initcalls for this driver crate.
+pub fn register_initcalls() {
+    use narf_init::{InitResult, Stage};
+    narf_init::register(Stage::Subsys, "xhci", || {
+        xhci::register_pci_driver();
+        InitResult::Ok
+    });
+}

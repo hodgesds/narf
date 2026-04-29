@@ -23,6 +23,7 @@ narf-io           = { path = "../../io" }
 narf-ipc          = { path = "../../ipc" }
 narf-input        = { path = "../../input" }
 narf-graphics     = { path = "../../graphics" }
+narf-init         = { path = "../../init" }
 
 [lints]
 workspace = true

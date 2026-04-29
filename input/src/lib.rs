@@ -295,3 +295,14 @@ pub fn __reset_global_ring_for_test() {
     if let Some(r) = GLOBAL_RING.lock().as_ref() { r.__reset_for_test(); }
 }
 
+/// Stage::Subsys initcall: install the global event ring before
+/// any input driver pushes to it. Capacity 256 covers ~1 second
+/// of bursty keyboard / mouse input.
+pub fn register_initcalls() {
+    use narf_init::{InitResult, Stage};
+    narf_init::register(Stage::Subsys, "input-event-ring", || {
+        init_global_ring(256);
+        InitResult::Ok
+    });
+}
+

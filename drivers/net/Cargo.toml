@@ -20,6 +20,7 @@ narf-bus          = { path = "../../bus" }
 narf-interrupts   = { path = "../../interrupts" }
 narf-memory       = { path = "../../memory" }
 narf-drivers      = { path = "../" }
+narf-init         = { path = "../../init" }
 
 [lints]
 workspace = true

@@ -656,116 +656,81 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // driver dispatch in one place (kernel-test harness
             // re-runs this per smoke; the boot path establishes
             // the canonical set of drivers).
-            // Initialise the shared input event ring before any
-            // input driver pushes to it. Capacity 256 is enough for
-            // ~1 second of bursty keyboard input.
-            narf_input::init_global_ring(256);
+            // ── Staged init: Linux-style *_initcall registry ────
+            //
+            // Each subsystem crate exposes `register_initcalls()`
+            // which adds its driver bring-ups to the appropriate
+            // stage. Frame's role here is just to enumerate the
+            // crates once + run every stage in order.
+            //
+            //   Subsys: input event ring + register_pci_driver chain.
+            //   Device: probe_all_pci (binds drivers to discovered
+            //           PCIe devices), best-effort PS/2 init.
+            //   Late:   FB console install, virtio-gpu splash,
+            //           end-of-boot panel.
+            narf_input::register_initcalls();
+            narf_drivers_nvme::register_initcalls();
+            narf_drivers_virtio::register_initcalls();
+            narf_drivers_net::register_initcalls();
+            narf_drivers_storage::register_initcalls();
+            narf_drivers_usb::register_initcalls();
+            narf_graphics_driver::register_initcalls();
+            narf_input_driver::register_initcalls();
 
-            // Best-effort i8042 PS/2 keyboard + mouse bring-up on
-            // x86_64. QEMU q35 always exposes i8042 even with USB
-            // present; legacy hardware does too. A failure here
-            // just means no PS/2 events arrive — drivers fed from
-            // virtio-input still work.
+            // PCI probe lives in Stage::Device — it binds every
+            // driver registered by Subsys above.
+            narf_init::register(narf_init::Stage::Device, "pci-probe-all", || {
+                let auth = narf_bus::bootstrap_registry_authority();
+                match narf_bus::probe_all_pci(&auth) {
+                    Ok(n) => {
+                        let bound = narf_drivers::bound_drivers();
+                        let _ = writeln!(console::Writer,
+                            "  drivers: bound {} PCIe device(s); inventory={}",
+                            n, bound.len());
+                        for b in &bound {
+                            let _ = writeln!(console::Writer,
+                                "    {} ({:?}) {:04x}:{:04x}",
+                                b.name, b.kind,
+                                b.pci_vid.unwrap_or(0), b.pci_did.unwrap_or(0));
+                        }
+                        narf_init::InitResult::Ok
+                    }
+                    Err(_) => narf_init::InitResult::Error("probe_all_pci failed"),
+                }
+            });
+
+            // Stage::Late initcalls: FB console + virtio-gpu splash.
             #[cfg(target_arch = "x86_64")]
-            {
-                // SAFETY: BSP, no other agent driving 0x60/0x64.
-                match unsafe { narf_input_driver::i8042::init() } {
-                    Ok(()) => {
-                        let _ = writeln!(console::Writer,
-                            "  input: i8042 PS/2 keyboard initialised (IRQ 1)");
-                    }
-                    Err(e) => {
-                        let _ = writeln!(console::Writer,
-                            "  input: i8042 init skipped ({:?})", e);
-                    }
-                }
-                // SAFETY: BSP, post-keyboard-init.
-                match unsafe { narf_input_driver::i8042_mouse::init() } {
-                    Ok(()) => {
-                        let _ = writeln!(console::Writer,
-                            "  input: i8042 PS/2 mouse initialised (IRQ 12)");
-                    }
-                    Err(e) => {
-                        let _ = writeln!(console::Writer,
-                            "  input: i8042 mouse init skipped ({:?})", e);
-                    }
-                }
-            }
-
-            narf_drivers_nvme::register_pci_driver();
-            narf_drivers_virtio::blk_pci::register_pci_driver();
-            narf_drivers_virtio::net_pci::register_pci_driver();
-            narf_drivers_virtio::rng_pci::register_pci_driver();
-            narf_drivers_virtio::balloon_pci::register_pci_driver();
-            narf_drivers_virtio::input_pci::register_pci_driver();
-            narf_drivers_virtio::gpu_pci::register_pci_driver();
-            narf_drivers_net::e1000::register_pci_driver();
-            narf_drivers_storage::ahci::register_pci_driver();
-            narf_drivers_usb::xhci::register_pci_driver();
-            #[cfg(target_arch = "x86_64")]
-            narf_graphics_driver::bochs::register_pci_driver();
-
-            let auth = narf_bus::bootstrap_registry_authority();
-            match narf_bus::probe_all_pci(&auth) {
-                Ok(n) => {
-                    let bound = narf_drivers::bound_drivers();
-                    let _ = writeln!(console::Writer,
-                        "  drivers: bound {} PCIe device(s); inventory={}",
-                        n, bound.len());
-                    for b in &bound {
-                        let _ = writeln!(console::Writer,
-                            "    {} ({:?}) {:04x}:{:04x}",
-                            b.name, b.kind,
-                            b.pci_vid.unwrap_or(0), b.pci_did.unwrap_or(0));
-                    }
-                }
-                Err(_) => {
-                    let _ = writeln!(console::Writer,
-                        "  drivers: probe_all_pci failed");
-                }
-            }
-
-            // Framebuffer console: if bochs probed and its BAR is
-            // reachable through the boot identity map, install an
-            // FbConsole over it and wire console::write_str's fan-out
-            // hook. After this, every kernel log line dual-writes to
-            // serial and to the framebuffer.
-            #[cfg(target_arch = "x86_64")]
-            {
+            narf_init::register(narf_init::Stage::Late, "fb-console-install", || {
                 use narf_graphics::{FbConsole, Pixel32};
-                let installed = narf_graphics_driver::bochs::with_controller(|d| {
+                let r = narf_graphics_driver::bochs::with_controller(|d| {
                     if !d.fb_reachable() {
                         let _ = writeln!(console::Writer,
                             "  splash: bochs framebuffer at {:#x} above 4 GiB \
                              identity map; deferred until ioremap lands",
                             d.fb_phys());
-                        return (0u32, 0u32);
+                        return false;
                     }
                     // SAFETY: BSP, no concurrent draw.
                     let fb = unsafe { d.framebuffer() };
-                    let console = FbConsole::new(fb,
-                        Pixel32::NARF_FG, Pixel32::NARF_BG);
-                    let cols = console.cols();
-                    let rows = console.rows();
-                    narf_graphics::install_fb_console(console);
+                    let con = FbConsole::new(fb, Pixel32::NARF_FG, Pixel32::NARF_BG);
+                    let (cols, rows) = (con.cols(), con.rows());
+                    narf_graphics::install_fb_console(con);
                     console::set_fb_hook(narf_graphics::console::write_bytes);
-                    (cols, rows)
+                    let _ = writeln!(console::Writer,
+                        "  splash: {}x{} bochs framebuffer console installed \
+                         ({} cols x {} rows of 8x8 glyphs)",
+                        cols * 8, rows * 8, cols, rows);
+                    true
                 });
-                if let Some((cols, rows)) = installed {
-                    if cols > 0 {
-                        let _ = writeln!(console::Writer,
-                            "  splash: {}x{} bochs framebuffer console installed \
-                             ({} cols x {} rows of 8x8 glyphs)",
-                            cols * 8, rows * 8, cols, rows);
-                    }
+                match r {
+                    Some(true)  => narf_init::InitResult::Ok,
+                    Some(false) => narf_init::InitResult::NotPresent,
+                    None        => narf_init::InitResult::NotPresent,
                 }
-            }
+            });
 
-            // virtio-gpu splash (cross-arch). If bochs already drew
-            // its banner above, this paints the same banner on the
-            // virtio-gpu scanout so multi-display setups light up
-            // both heads. On aarch64 this is the primary path.
-            {
+            narf_init::register(narf_init::Stage::Late, "virtio-gpu-splash", || {
                 use narf_graphics::Pixel32;
                 let painted = narf_drivers_virtio::gpu_pci::with_controller_mut(|d| {
                     // SAFETY: BSP, post-bring_up.
@@ -776,29 +741,37 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             return (0u32, 0u32);
                         }
                     }
-                    // SAFETY: BSP, no concurrent draw. The 32×32
-                    // scanout is too small for the rectangular-NARF
-                    // banner used on bochs; instead paint a 4-coloured
-                    // diamond pattern that's visibly the kernel's
-                    // signature (TL=red, TR=green, BL=blue, BR=NARF_FG).
+                    // SAFETY: BSP, no concurrent draw.
                     let mut fb = unsafe { d.framebuffer() };
                     let half = 16u32;
                     fb.fill_rect(0,    0,    half, half, Pixel32::RED);
                     fb.fill_rect(half, 0,    half, half, Pixel32::GREEN);
                     fb.fill_rect(0,    half, half, half, Pixel32::BLUE);
                     fb.fill_rect(half, half, half, half, Pixel32::NARF_FG);
-                    // SAFETY: bring_up complete; ctrl_q ready.
+                    // SAFETY: bring_up complete.
                     let _ = unsafe { d.flush() };
                     (d.mode.width, d.mode.height)
                 });
-                if let Some((w, h)) = painted {
-                    if w > 0 {
+                match painted {
+                    Some((w, h)) if w > 0 => {
                         let _ = writeln!(console::Writer,
-                            "  splash: {}x{} virtio-gpu scanout painted (4-quadrant pattern)",
+                            "  splash: {}x{} virtio-gpu scanout painted (4-quadrant)",
                             w, h);
+                        narf_init::InitResult::Ok
                     }
+                    _ => narf_init::InitResult::NotPresent,
                 }
-            }
+            });
+
+            // Run every stage in order.
+            let _ = narf_init::run_all_through(narf_init::Stage::Late);
+            let _ = writeln!(console::Writer,
+                "  init: stages {} subsys / {} fs / {} device / {} late",
+                narf_init::stats(narf_init::Stage::Subsys).total,
+                narf_init::stats(narf_init::Stage::Fs).total,
+                narf_init::stats(narf_init::Stage::Device).total,
+                narf_init::stats(narf_init::Stage::Late).total,
+            );
         }
         Err(e) => {
             let _ = writeln!(console::Writer, "  boot parse failed: {e:?}");

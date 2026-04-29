@@ -32,6 +32,15 @@ extern crate alloc;
 
 pub mod e1000;
 
+/// Stage::Subsys initcalls for this driver crate.
+pub fn register_initcalls() {
+    use narf_init::{InitResult, Stage};
+    narf_init::register(Stage::Subsys, "e1000", || {
+        e1000::register_pci_driver();
+        InitResult::Ok
+    });
+}
+
 /// Chipset families the Stage-4 driver set targets.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum NicModel {

@@ -491,6 +491,7 @@ dependencies = [
  "narf-bus",
  "narf-capabilities",
  "narf-drivers",
+ "narf-init",
  "narf-interrupts",
  "narf-io",
  "narf-lib",
@@ -506,6 +507,7 @@ dependencies = [
  "narf-bus",
  "narf-capabilities",
  "narf-drivers",
+ "narf-init",
  "narf-interrupts",
  "narf-io",
  "narf-lib",
@@ -519,6 +521,7 @@ dependencies = [
  "narf-bus",
  "narf-capabilities",
  "narf-drivers",
+ "narf-init",
  "narf-io",
  "narf-lib",
  "narf-memory",
@@ -532,6 +535,7 @@ dependencies = [
  "narf-bus",
  "narf-capabilities",
  "narf-drivers",
+ "narf-init",
  "narf-io",
  "narf-lib",
  "narf-memory",
@@ -546,6 +550,7 @@ dependencies = [
  "narf-capabilities",
  "narf-drivers",
  "narf-graphics",
+ "narf-init",
  "narf-input",
  "narf-interrupts",
  "narf-io",
@@ -584,6 +589,7 @@ dependencies = [
  "narf-drivers-virtio",
  "narf-graphics",
  "narf-graphics-driver",
+ "narf-init",
  "narf-input",
  "narf-input-driver",
  "narf-interrupts",
@@ -610,6 +616,7 @@ dependencies = [
  "narf-capabilities",
  "narf-drivers",
  "narf-graphics",
+ "narf-init",
  "narf-lib",
  "narf-memory",
 ]
@@ -625,6 +632,7 @@ dependencies = [
 name = "narf-input"
 version = "0.0.0"
 dependencies = [
+ "narf-init",
  "narf-lib",
 ]
 
@@ -634,6 +642,7 @@ version = "0.0.0"
 dependencies = [
  "narf-arch",
  "narf-drivers",
+ "narf-init",
  "narf-input",
  "narf-interrupts",
  "narf-lib",

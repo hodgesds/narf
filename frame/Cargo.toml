@@ -33,6 +33,7 @@ narf-input           = { path = "../input" }
 narf-input-driver    = { path = "../drivers/input" }
 narf-graphics        = { path = "../graphics" }
 narf-graphics-driver = { path = "../drivers/graphics" }
+narf-init            = { path = "../init" }
 narf-userspace     = { path = "../userspace" }
 narf-verification  = { path = "../verification", optional = true }
 

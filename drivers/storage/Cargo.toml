@@ -20,6 +20,7 @@ narf-memory       = { path = "../../memory" }
 narf-time         = { path = "../../time" }
 narf-block        = { path = "../../block" }
 narf-drivers      = { path = "../" }
+narf-init         = { path = "../../init" }
 
 [lints]
 workspace = true

@@ -1276,3 +1276,12 @@ pub fn register_pci_driver() {
         probe,
     });
 }
+
+/// Stage::Subsys initcalls for this driver crate.
+pub fn register_initcalls() {
+    use narf_init::{InitResult, Stage};
+    narf_init::register(Stage::Subsys, "nvme", || {
+        register_pci_driver();
+        InitResult::Ok
+    });
+}

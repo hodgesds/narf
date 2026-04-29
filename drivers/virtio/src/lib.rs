@@ -20,6 +20,31 @@ pub mod queue;
 pub mod rng_pci;
 pub mod class_blk;
 
+/// Stage::Subsys initcalls — register every virtio-PCI driver with
+/// the bus match table. Each call is idempotent on its own; the
+/// `register` function only adds entries.
+pub fn register_initcalls() {
+    use narf_init::{InitResult, Stage};
+    narf_init::register(Stage::Subsys, "virtio-blk-pci",     || {
+        blk_pci::register_pci_driver();     InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "virtio-net-pci",     || {
+        net_pci::register_pci_driver();     InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "virtio-rng-pci",     || {
+        rng_pci::register_pci_driver();     InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "virtio-balloon-pci", || {
+        balloon_pci::register_pci_driver(); InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "virtio-input-pci",   || {
+        input_pci::register_pci_driver();   InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "virtio-gpu-pci",     || {
+        gpu_pci::register_pci_driver();     InitResult::Ok
+    });
+}
+
 use alloc::boxed::Box;
 use core::sync::atomic::{compiler_fence, AtomicU32, Ordering};
 
