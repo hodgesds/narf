@@ -560,6 +560,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-fb"
+version = "0.0.0"
+dependencies = [
+ "narf-capabilities",
+ "narf-drivers-virtio",
+ "narf-graphics",
+ "narf-graphics-driver",
+ "narf-init",
+ "narf-lib",
+]
+
+[[package]]
 name = "narf-filesystem"
 version = "0.0.0"
 dependencies = [
@@ -587,6 +599,7 @@ dependencies = [
  "narf-drivers-storage",
  "narf-drivers-usb",
  "narf-drivers-virtio",
+ "narf-fb",
  "narf-graphics",
  "narf-graphics-driver",
  "narf-init",
@@ -800,6 +813,7 @@ dependencies = [
  "narf-drivers-storage",
  "narf-drivers-usb",
  "narf-drivers-virtio",
+ "narf-fb",
  "narf-filesystem",
  "narf-graphics",
  "narf-graphics-driver",

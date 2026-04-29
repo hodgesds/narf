@@ -399,6 +399,9 @@ pub enum CapKind {
     // Process / governance
     Process              = 0x00A0,
     Driver               = 0x00A1,
+
+    // Display
+    FbScanout            = 0x00B0,
 }
 
 pub trait CapType: 'static {

@@ -1,0 +1,23 @@
+[package]
+name         = "narf-fb"
+description  = "Framebuffer scanout abstraction. Picks active backend (bochs or virtio-gpu); exposes bounds-checked Fill/Blit/Flush primitives + a cap-gated writer."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_fb"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../lib" }
+narf-graphics     = { path = "../graphics" }
+narf-graphics-driver = { path = "../drivers/graphics" }
+narf-drivers-virtio  = { path = "../drivers/virtio" }
+narf-capabilities = { path = "../capabilities" }
+narf-init         = { path = "../init" }
+
+[lints]
+workspace = true

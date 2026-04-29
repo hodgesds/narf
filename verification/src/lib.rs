@@ -2019,6 +2019,70 @@ fn smoke_init_records_cycle_totals() -> TestResult {
 }
 kernel_test!(smoke_init_records_cycle_totals);
 
+// ─── narf-fb smokes ─────────────────────────────────────────────────
+
+fn smoke_fb_picker_selects_a_backend() -> TestResult {
+    use narf_fb::{select_active, info};
+    if select_active().is_none() {
+        return TestResult::Skip("no framebuffer backend probed");
+    }
+    let i = match info() { Some(i) => i, None => return TestResult::Fail("info empty") };
+    if i.width == 0 || i.height == 0 {
+        return TestResult::Fail("scanout has zero dimensions");
+    }
+    if i.name != "bochs" && i.name != "virtio-gpu" {
+        return TestResult::Fail("picker returned unknown backend");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_fb_picker_selects_a_backend);
+
+fn smoke_fb_writer_fill_clips_and_paints() -> TestResult {
+    use narf_fb::{bootstrap_writer, FbWriter, Rect};
+    use narf_graphics::Pixel32;
+    if narf_fb::select_active().is_none() {
+        return TestResult::Skip("no framebuffer backend probed");
+    }
+    let cap = bootstrap_writer();
+    let w = match FbWriter::new(cap) {
+        Ok(w)  => w,
+        Err(_) => return TestResult::Fail("FbWriter::new failed"),
+    };
+    // Fill a small rect that fits inside any framebuffer.
+    if w.fill(Rect::new(0, 0, 8, 8), Pixel32::BLUE).is_err() {
+        return TestResult::Fail("fill 8x8 failed");
+    }
+    // Out-of-bounds rect fully off-screen → OutOfBounds.
+    let way_off = Rect::new(w.width() + 100, 0, 8, 8);
+    match w.fill(way_off, Pixel32::RED) {
+        Err(narf_fb::FbWriteError::OutOfBounds) => {}
+        _ => return TestResult::Fail("off-screen fill should report OutOfBounds"),
+    }
+    // Partially off-screen rect → clipped, returns Ok.
+    let partial = Rect::new(w.width().saturating_sub(4), 0, 100, 8);
+    if w.fill(partial, Pixel32::GREEN).is_err() {
+        return TestResult::Fail("partial-off-screen fill should clip and succeed");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_fb_writer_fill_clips_and_paints);
+
+fn smoke_fb_rect_clip_math() -> TestResult {
+    use narf_fb::Rect;
+    let r = Rect::new(10, 10, 100, 100).clip(50, 50).unwrap();
+    if r != Rect::new(10, 10, 40, 40) {
+        return TestResult::Fail("clip math wrong");
+    }
+    if Rect::new(60, 0, 10, 10).clip(50, 50).is_some() {
+        return TestResult::Fail("fully-off rect should clip to None");
+    }
+    if Rect::new(0, 0, 0, 10).clip(50, 50).is_some() {
+        return TestResult::Fail("zero-width rect should clip to None");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_fb_rect_clip_math);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_pte_pk_field() -> TestResult {
     use narf_memory::paging::PtFlags;
