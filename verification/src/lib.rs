@@ -2226,6 +2226,110 @@ fn smoke_mmap_phys_allowlist_lookup() -> TestResult {
 }
 kernel_test!(smoke_mmap_phys_allowlist_lookup);
 
+fn smoke_fb_registry_attach_detach() -> TestResult {
+    use narf_fb::registry::{
+        __reset_for_test, attach, count, detach, lookup, AttachError,
+    };
+
+    __reset_for_test();
+    if count() != 0 { return TestResult::Fail("registry not empty after reset"); }
+
+    // Attach two distinct pids.
+    let pid_a = 1001u64;
+    let pid_b = 1002u64;
+    let phys_a = match attach(pid_a) {
+        Ok(p)  => p,
+        Err(_) => return TestResult::Fail("attach pid_a failed"),
+    };
+    let phys_b = match attach(pid_b) {
+        Ok(p)  => p,
+        Err(_) => return TestResult::Fail("attach pid_b failed"),
+    };
+    if phys_a.raw() == phys_b.raw() {
+        return TestResult::Fail("two attaches returned the same phys");
+    }
+    if count() != 2 { return TestResult::Fail("count mismatch after 2 attaches"); }
+
+    // Re-attach same pid → AlreadyAttached.
+    match attach(pid_a) {
+        Err(AttachError::AlreadyAttached) => {}
+        _ => return TestResult::Fail("re-attach didn't return AlreadyAttached"),
+    }
+
+    // Lookup matches the original phys.
+    if lookup(pid_a) != Some(phys_a.raw()) {
+        return TestResult::Fail("lookup pid_a wrong");
+    }
+
+    // The phys must be on the mmap_phys allowlist.
+    if narf_userspace::mmap_phys::lookup(phys_a.raw(), 4096).is_none() {
+        return TestResult::Fail("attached phys not on mmap_phys allowlist");
+    }
+
+    // Detach → registry shrinks + allowlist drops the entry.
+    detach(pid_a);
+    if count() != 1 { return TestResult::Fail("count wrong after detach"); }
+    if narf_userspace::mmap_phys::lookup(phys_a.raw(), 4096).is_some() {
+        return TestResult::Fail("allowlist still carries detached phys");
+    }
+    detach(pid_b);
+    if count() != 0 { return TestResult::Fail("count not zero after both detaches"); }
+    __reset_for_test();
+    TestResult::Pass
+}
+kernel_test!(smoke_fb_registry_attach_detach);
+
+fn smoke_fb_registry_drain_all_executes_per_process() -> TestResult {
+    // Two processes each attach a ring; one enqueues a Fill; the
+    // global drain must execute exactly that one command.
+    use narf_fb::{
+        bootstrap_writer, cmd_ring, registry, select_active, FbWriter, Rect,
+    };
+    use narf_graphics::Pixel32;
+    use narf_ipc::shared_ring::SharedProducer;
+    use narf_fb::cmd_ring::{DrawCmd, RING_DEPTH, DrawRing};
+
+    if select_active().is_none() {
+        return TestResult::Skip("no FB backend probed");
+    }
+    registry::__reset_for_test();
+
+    let pid_a = 2001u64;
+    let pid_b = 2002u64;
+    let phys_a = match registry::attach(pid_a) {
+        Ok(p)  => p,
+        Err(_) => return TestResult::Fail("attach pid_a"),
+    };
+    let _phys_b = match registry::attach(pid_b) {
+        Ok(p)  => p,
+        Err(_) => return TestResult::Fail("attach pid_b"),
+    };
+
+    // Build a producer over A's ring (treating its phys as a
+    // kernel-side pointer — identity-mapped low memory).
+    let ring_ptr = phys_a.raw() as *mut DrawRing;
+    // SAFETY: SPSC contract — kernel side only constructs the
+    // producer here; the consumer was retained by the registry
+    // when attach() ran.
+    let mut producer: SharedProducer<DrawCmd, RING_DEPTH> =
+        unsafe { SharedProducer::from_raw(ring_ptr) };
+    let cmd = DrawCmd::fill(Rect::new(0, 0, 2, 2),
+                            Pixel32::rgb(0xAA, 0xBB, 0xCC).raw());
+    if cmd_ring::try_send(&mut producer, cmd).is_err() {
+        return TestResult::Fail("try_send failed");
+    }
+
+    let cap    = bootstrap_writer();
+    let writer = FbWriter::new(cap).expect("writer");
+    let (ok, err) = registry::drain_all(&writer);
+    if ok != 1 || err != 0 {
+        return TestResult::Fail("drain_all stats wrong (1/0 expected)");
+    }
+    registry::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test!(smoke_fb_registry_drain_all_executes_per_process);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_pte_pk_field() -> TestResult {
     use narf_memory::paging::PtFlags;

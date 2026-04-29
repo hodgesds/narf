@@ -338,6 +338,13 @@ pub enum Syscall {
     /// success.
     MmapPhys     = 240,
 
+    /// Attach a fresh DrawRing for the calling process. Returns
+    /// the backing phys (which the caller then maps via
+    /// SYS_MMAP_PHYS to construct a SharedProducer<DrawCmd>).
+    /// Idempotent — calling twice returns the same phys for the
+    /// same process.
+    FbRingAttach = 241,
+
     /// Kick the kernel-side dispatcher to drain the calling task's
     /// shared SubmissionRing and post Completions to the shared
     /// CompletionRing. Returns the number of submissions processed.

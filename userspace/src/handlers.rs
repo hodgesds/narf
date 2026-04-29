@@ -2172,6 +2172,38 @@ fn sys_mmap(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(base));
 }
 
+// ── FbRingAttach — no args ─────────────────────────────────────────
+//
+// Allocates a DrawRing for the calling process via the
+// fb-installed hook; returns the backing phys for the caller to
+// then SYS_MMAP_PHYS into its VA.
+
+/// Hook signature: fn(pid) -> phys, where 0 means "rejected".
+pub type FbRingAttachHook = fn(u64) -> u64;
+static FB_RING_ATTACH_HOOK: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+pub fn install_fb_ring_attach_hook(h: FbRingAttachHook) {
+    FB_RING_ATTACH_HOOK.store(h as usize, core::sync::atomic::Ordering::Release);
+}
+
+fn sys_fb_ring_attach(ctx: &mut dyn TrapContext) {
+    let h = FB_RING_ATTACH_HOOK.load(core::sync::atomic::Ordering::Acquire);
+    if h == 0 {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    // SAFETY: stored as `FbRingAttachHook as usize`.
+    let f: FbRingAttachHook = unsafe { core::mem::transmute(h) };
+    let pid = current_task_id();
+    let phys = f(pid);
+    if phys == 0 {
+        ctx.set_return(SyscallReturn::invalid_op());
+    } else {
+        ctx.set_return(SyscallReturn::ok(phys));
+    }
+}
+
 // ── MmapPhys — arg0=phys, arg1=len, arg2=flags ─────────────────────
 //
 // Maps a kernel-allowlisted phys range into userspace VA. The
@@ -4179,6 +4211,8 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Mmap,     "mmap",     RawFnHandler(sys_mmap));
     table.install_raw(Syscall::Munmap,   "munmap",   RawFnHandler(sys_munmap));
     table.install_raw(Syscall::MmapPhys, "mmap_phys", RawFnHandler(sys_mmap_phys));
+    table.install_raw(Syscall::FbRingAttach, "fb_ring_attach",
+                      RawFnHandler(sys_fb_ring_attach));
     table.install_raw(Syscall::RingKick, "ringkick", RawFnHandler(sys_ring_kick));
     table.install_raw(Syscall::GetPid,   "getpid",   RawFnHandler(sys_getpid));
     table.install_raw(Syscall::GetPpid,  "getppid",  RawFnHandler(sys_getppid));

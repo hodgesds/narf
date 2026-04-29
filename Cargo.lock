@@ -570,6 +570,8 @@ dependencies = [
  "narf-init",
  "narf-ipc",
  "narf-lib",
+ "narf-memory",
+ "narf-userspace",
 ]
 
 [[package]]

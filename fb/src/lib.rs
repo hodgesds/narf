@@ -34,8 +34,10 @@ extern crate alloc;
 
 pub mod client;
 pub mod cmd_ring;
+pub mod registry;
 pub use client::{allocate_singleton_ring, FbClient};
 pub use cmd_ring::{DrawCmd, DrawRing, RING_DEPTH, TAG_FILL, TAG_FLUSH};
+pub use registry::{attach as registry_attach, detach as registry_detach, AttachError};
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -289,6 +291,20 @@ pub fn info() -> Option<ScanoutInfo> {
 /// an mmap'd DrawRing; only the page-source differs.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
+    // Install the userspace SYS_FB_RING_ATTACH hook now so a
+    // userspace process can request a ring as soon as it runs
+    // (Stage::Subsys runs before Stage::Late, but installing the
+    // hook is idempotent — userspace can't actually call this
+    // syscall until after `install_core_syscalls` has run).
+    narf_init::register(Stage::Subsys, "fb-ring-attach-hook", || {
+        narf_userspace::handlers::install_fb_ring_attach_hook(|pid| {
+            match registry::attach(pid) {
+                Ok(p)  => p.raw(),
+                Err(_) => 0,
+            }
+        });
+        InitResult::Ok
+    });
     narf_init::register(Stage::Late, "fb-scanout-picker", || {
         if let Some(s) = select_active() {
             INIT_BACKEND_NAME.store(s.name().as_ptr() as usize, Ordering::Release);

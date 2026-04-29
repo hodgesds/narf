@@ -57,6 +57,7 @@ pub const SYS_PIPE:           u64 = 117;
 pub const SYS_MMAP:           u64 = 120;
 pub const SYS_MUNMAP:         u64 = 121;
 pub const SYS_MMAP_PHYS:      u64 = 240;
+pub const SYS_FB_RING_ATTACH: u64 = 241;
 pub const SYS_RING_KICK:      u64 = 130;
 pub const SYS_GETPID:         u64 = 140;
 pub const SYS_GETPPID:        u64 = 141;
@@ -879,6 +880,18 @@ pub unsafe fn mmap(hint: usize, len: usize, flags: u32) -> *mut u8 {
     } else {
         r as *mut u8
     }
+}
+
+/// Attach a fresh DrawRing to the calling process. Returns the
+/// backing phys (to be passed to [`mmap_phys`]) or 0 on failure.
+///
+/// # Safety
+/// Pure syscall — no preconditions. Calling twice on the same
+/// process returns 0 the second time (idempotent).
+#[inline]
+pub unsafe fn fb_ring_attach() -> u64 {
+    // SAFETY: SYS_FB_RING_ATTACH takes no arguments.
+    unsafe { syscall0(SYS_FB_RING_ATTACH) }
 }
 
 /// Map a kernel-allowlisted phys range into userspace VA. The
