@@ -687,6 +687,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_drivers_virtio::rng_pci::register_pci_driver();
             narf_drivers_virtio::balloon_pci::register_pci_driver();
             narf_drivers_virtio::input_pci::register_pci_driver();
+            narf_drivers_virtio::gpu_pci::register_pci_driver();
             narf_drivers_net::e1000::register_pci_driver();
             narf_drivers_storage::ahci::register_pci_driver();
             narf_drivers_usb::xhci::register_pci_driver();
@@ -789,6 +790,45 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     if w > 0 {
                         let _ = writeln!(console::Writer,
                             "  splash: {}x{} bochs framebuffer painted with NARF banner",
+                            w, h);
+                    }
+                }
+            }
+
+            // virtio-gpu splash (cross-arch). If bochs already drew
+            // its banner above, this paints the same banner on the
+            // virtio-gpu scanout so multi-display setups light up
+            // both heads. On aarch64 this is the primary path.
+            {
+                use narf_graphics::Pixel32;
+                let painted = narf_drivers_virtio::gpu_pci::with_controller_mut(|d| {
+                    // SAFETY: BSP, post-bring_up.
+                    if !d.ready {
+                        if let Err(e) = unsafe { d.init_scanout() } {
+                            let _ = writeln!(console::Writer,
+                                "  splash: virtio-gpu init_scanout failed: {:?}", e);
+                            return (0u32, 0u32);
+                        }
+                    }
+                    // SAFETY: BSP, no concurrent draw. The 32×32
+                    // scanout is too small for the rectangular-NARF
+                    // banner used on bochs; instead paint a 4-coloured
+                    // diamond pattern that's visibly the kernel's
+                    // signature (TL=red, TR=green, BL=blue, BR=NARF_FG).
+                    let mut fb = unsafe { d.framebuffer() };
+                    let half = 16u32;
+                    fb.fill_rect(0,    0,    half, half, Pixel32::RED);
+                    fb.fill_rect(half, 0,    half, half, Pixel32::GREEN);
+                    fb.fill_rect(0,    half, half, half, Pixel32::BLUE);
+                    fb.fill_rect(half, half, half, half, Pixel32::NARF_FG);
+                    // SAFETY: bring_up complete; ctrl_q ready.
+                    let _ = unsafe { d.flush() };
+                    (d.mode.width, d.mode.height)
+                });
+                if let Some((w, h)) = painted {
+                    if w > 0 {
+                        let _ = writeln!(console::Writer,
+                            "  splash: {}x{} virtio-gpu scanout painted (4-quadrant pattern)",
                             w, h);
                     }
                 }

@@ -1594,6 +1594,32 @@ fn smoke_bochs_display_probed_at_boot() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_bochs_display_probed_at_boot);
 
+fn smoke_virtio_gpu_probed_at_boot() -> TestResult {
+    use narf_drivers_virtio::gpu_pci;
+    if gpu_pci::is_probed() {
+        TestResult::Pass
+    } else {
+        TestResult::Skip("virtio-gpu-pci not present in this QEMU config")
+    }
+}
+kernel_test!(smoke_virtio_gpu_probed_at_boot);
+
+fn smoke_virtio_gpu_scanout_initialised() -> TestResult {
+    // After boot's splash blit, the virtio-gpu controller should be
+    // marked `ready` (init_scanout completed: GET_DISPLAY_INFO,
+    // RESOURCE_CREATE_2D, ATTACH_BACKING, SET_SCANOUT all OK).
+    use narf_drivers_virtio::gpu_pci;
+    if !gpu_pci::is_probed() {
+        return TestResult::Skip("virtio-gpu-pci not present");
+    }
+    match gpu_pci::with_controller(|d| d.ready) {
+        Some(true)  => TestResult::Pass,
+        Some(false) => TestResult::Fail("virtio-gpu probed but scanout not ready"),
+        None        => TestResult::Skip("virtio-gpu-pci controller missing"),
+    }
+}
+kernel_test!(smoke_virtio_gpu_scanout_initialised);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_pte_pk_field() -> TestResult {
     use narf_memory::paging::PtFlags;

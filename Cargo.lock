@@ -545,6 +545,7 @@ dependencies = [
  "narf-bus",
  "narf-capabilities",
  "narf-drivers",
+ "narf-graphics",
  "narf-input",
  "narf-interrupts",
  "narf-io",

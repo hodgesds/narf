@@ -12,6 +12,7 @@ extern crate narf_io;
 pub mod balloon_pci;
 pub mod blk;
 pub mod blk_pci;
+pub mod gpu_pci;
 pub mod input_pci;
 pub mod net_pci;
 pub mod pci;

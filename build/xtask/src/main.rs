@@ -209,6 +209,12 @@ impl Arch {
                     // q35 emits when no `-display` mode is forced.
                     "-vga".into(),     "none".into(),
                     "-device".into(),  "bochs-display".into(),
+                    // virtio-gpu (cross-arch). Coexists with
+                    // bochs-display on x86_64 — they're separate
+                    // PCI devices and the driver picks whichever
+                    // probes first to back the splash.
+                    "-device".into(),
+                    "virtio-gpu-pci,disable-legacy=on,disable-modern=off".into(),
                     "-kernel".into(),  kernel,
                 ]
             },
@@ -271,6 +277,11 @@ impl Arch {
                 // block above for rationale.
                 "-device".into(),
                 "virtio-keyboard-pci,disable-legacy=on,disable-modern=off".into(),
+                // virtio-gpu deferred on aarch64: its 16 MiB BAR
+                // pushes the QEMU virt machine's BAR window past
+                // the boot identity map's 1 GiB ceiling, which then
+                // makes other virtio drivers' BARs unreachable. Lift
+                // when an ioremap / vmap surface lands on aarch64.
                 // QEMU's `-kernel <elf>` path on aarch64 does not
                 // load a `-dtb` blob into RAM (the DTB-loading code
                 // path is gated on `is_linux=1`). Instead we
