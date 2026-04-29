@@ -1,0 +1,23 @@
+[package]
+name         = "narf-graphics-driver"
+description  = "Display drivers: bochs-display (x86_64 q35) + future."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_graphics_driver"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../../lib" }
+narf-graphics     = { path = "../../graphics" }
+narf-bus          = { path = "../../bus" }
+narf-capabilities = { path = "../../capabilities" }
+narf-memory       = { path = "../../memory" }
+narf-drivers      = { path = "../../drivers" }
+
+[lints]
+workspace = true

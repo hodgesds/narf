@@ -1,0 +1,18 @@
+[package]
+name         = "narf-graphics"
+description  = "Framebuffer + pixel + font primitives shared by display drivers and the framebuffer console."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_graphics"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib = { path = "../lib" }
+
+[lints]
+workspace = true

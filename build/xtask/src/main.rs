@@ -201,6 +201,14 @@ impl Arch {
                     // but the bring-up + queue setup still exercises.
                     "-device".into(),
                     "virtio-keyboard-pci,disable-legacy=on,disable-modern=off".into(),
+                    // bochs-display: linear-framebuffer device,
+                    // PCI vendor 0x1234 device 0x1111. BAR0 is the
+                    // framebuffer; BAR2 the VBE Dispi MMIO regs.
+                    // Using `-vga none -device bochs-display` avoids
+                    // a conflict with the default VGA device QEMU
+                    // q35 emits when no `-display` mode is forced.
+                    "-vga".into(),     "none".into(),
+                    "-device".into(),  "bochs-display".into(),
                     "-kernel".into(),  kernel,
                 ]
             },

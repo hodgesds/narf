@@ -1530,6 +1530,70 @@ fn smoke_input_kind_default_domain() -> TestResult {
 }
 kernel_test!(smoke_input_kind_default_domain);
 
+// ─── Graphics subsystem smokes ──────────────────────────────────────
+
+fn smoke_graphics_pixel_format() -> TestResult {
+    use narf_graphics::Pixel32;
+    if Pixel32::BLACK.raw()  != 0xFF00_0000 { return TestResult::Fail("BLACK"); }
+    if Pixel32::WHITE.raw()  != 0xFFFF_FFFF { return TestResult::Fail("WHITE"); }
+    if Pixel32::RED.raw()    != 0xFFFF_0000 { return TestResult::Fail("RED"); }
+    if Pixel32::GREEN.raw()  != 0xFF00_FF00 { return TestResult::Fail("GREEN"); }
+    if Pixel32::BLUE.raw()   != 0xFF00_00FF { return TestResult::Fail("BLUE"); }
+    let p = Pixel32::rgb(0x12, 0x34, 0x56);
+    if p.raw() != 0xFF12_3456 { return TestResult::Fail("rgb pack"); }
+    TestResult::Pass
+}
+kernel_test!(smoke_graphics_pixel_format);
+
+fn smoke_graphics_clear_and_fill_rect() -> TestResult {
+    use alloc::vec;
+    use narf_graphics::{Framebuffer, Pixel32};
+    // Build a small in-memory framebuffer (8×4) backed by a heap Vec.
+    let mut buf = vec![0u32; 32];
+    let ptr = buf.as_mut_ptr();
+    // SAFETY: backing store outlives the Framebuffer borrow.
+    let mut fb = unsafe { Framebuffer::new(ptr, 8, 4, 8) };
+    fb.clear(Pixel32::WHITE);
+    if !buf.iter().all(|&p| p == Pixel32::WHITE.raw()) {
+        return TestResult::Fail("clear didn't paint every pixel");
+    }
+    fb.fill_rect(2, 1, 4, 2, Pixel32::RED);
+    // Inside-rect pixels should be RED, outside should still be WHITE.
+    for y in 0..4 {
+        for x in 0..8 {
+            let p = buf[y * 8 + x];
+            let inside = (2..6).contains(&x) && (1..3).contains(&y);
+            let want = if inside { Pixel32::RED.raw() } else { Pixel32::WHITE.raw() };
+            if p != want {
+                return TestResult::Fail("fill_rect pixel mismatch");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_graphics_clear_and_fill_rect);
+
+fn smoke_graphics_kind_default_domain() -> TestResult {
+    use narf_drivers::BoundKind;
+    if BoundKind::Graphics.default_domain() != 7 {
+        return TestResult::Fail("Graphics domain != 7");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_graphics_kind_default_domain);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_bochs_display_probed_at_boot() -> TestResult {
+    use narf_graphics_driver::bochs;
+    if bochs::is_probed() {
+        TestResult::Pass
+    } else {
+        TestResult::Skip("bochs-display not present in this QEMU config")
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_bochs_display_probed_at_boot);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_pte_pk_field() -> TestResult {
     use narf_memory::paging::PtFlags;

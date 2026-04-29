@@ -690,6 +690,8 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_drivers_net::e1000::register_pci_driver();
             narf_drivers_storage::ahci::register_pci_driver();
             narf_drivers_usb::xhci::register_pci_driver();
+            #[cfg(target_arch = "x86_64")]
+            narf_graphics_driver::bochs::register_pci_driver();
 
             let auth = narf_bus::bootstrap_registry_authority();
             match narf_bus::probe_all_pci(&auth) {
@@ -708,6 +710,87 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 Err(_) => {
                     let _ = writeln!(console::Writer,
                         "  drivers: probe_all_pci failed");
+                }
+            }
+
+            // Splash blit: if a framebuffer device probed AND its
+            // BAR0 lies inside the low-4-GiB identity map, paint a
+            // background + a centred "NARF" banner sketched from
+            // filled rectangles. Above 4 GiB the boot PML4 has no
+            // PTEs covering the BAR yet — log + skip.
+            #[cfg(target_arch = "x86_64")]
+            {
+                use narf_graphics::Pixel32;
+                let painted = narf_graphics_driver::bochs::with_controller(|d| {
+                    if !d.fb_reachable() {
+                        let _ = writeln!(console::Writer,
+                            "  splash: bochs framebuffer at {:#x} above 4 GiB \
+                             identity map; deferred until ioremap lands",
+                            d.fb_phys());
+                        return (0u32, 0u32);
+                    }
+                    // SAFETY: BSP, no concurrent draw, framebuffer is
+                    // the device's exclusive scanout buffer.
+                    let mut fb = unsafe { d.framebuffer() };
+                    fb.clear(Pixel32::NARF_BG);
+                    // Centred NARF banner: 4 letterforms, 64 px tall,
+                    // 6 px stroke, 16 px gap. Total width ≈ 4*48 + 3*16 = 240 px.
+                    let stroke = 6u32;
+                    let h = 64u32;
+                    let w = 48u32;
+                    let gap = 16u32;
+                    let total = 4 * w + 3 * gap;
+                    let x0 = (fb.width.saturating_sub(total)) / 2;
+                    let y0 = (fb.height.saturating_sub(h)) / 2;
+                    let fg = Pixel32::NARF_FG;
+                    // Helper: draw an "N".
+                    let mut x = x0;
+                    // Left vertical
+                    fb.fill_rect(x, y0, stroke, h, fg);
+                    // Right vertical
+                    fb.fill_rect(x + w - stroke, y0, stroke, h, fg);
+                    // Diagonal: approximated by a series of stepped
+                    // rects so we don't need a line primitive yet.
+                    {
+                        let steps = h / stroke;
+                        for i in 0..steps {
+                            let dx = (i * (w - stroke)) / steps;
+                            fb.fill_rect(x + dx, y0 + i * stroke, stroke, stroke, fg);
+                        }
+                    }
+                    // 'A'
+                    x += w + gap;
+                    fb.fill_rect(x, y0, stroke, h, fg);                                  // left vertical
+                    fb.fill_rect(x + w - stroke, y0, stroke, h, fg);                     // right vertical
+                    fb.fill_rect(x, y0, w, stroke, fg);                                  // top bar
+                    fb.fill_rect(x, y0 + h/2 - stroke/2, w, stroke, fg);                 // mid bar
+                    // 'R'
+                    x += w + gap;
+                    fb.fill_rect(x, y0, stroke, h, fg);                                  // left vertical
+                    fb.fill_rect(x, y0, w, stroke, fg);                                  // top bar
+                    fb.fill_rect(x + w - stroke, y0, stroke, h/2, fg);                   // upper-right vertical
+                    fb.fill_rect(x, y0 + h/2 - stroke/2, w, stroke, fg);                 // mid bar
+                    {
+                        // diagonal lower stroke (R's leg) via stepped rects.
+                        let steps = (h - h/2) / stroke;
+                        for i in 0..steps {
+                            let dx = (i * (w - stroke)) / steps.max(1);
+                            fb.fill_rect(x + dx, y0 + h/2 + i * stroke, stroke, stroke, fg);
+                        }
+                    }
+                    // 'F'
+                    x += w + gap;
+                    fb.fill_rect(x, y0, stroke, h, fg);                                  // left vertical
+                    fb.fill_rect(x, y0, w, stroke, fg);                                  // top bar
+                    fb.fill_rect(x, y0 + h/2 - stroke/2, w*3/4, stroke, fg);             // mid bar
+                    (d.width, d.height)
+                });
+                if let Some((w, h)) = painted {
+                    if w > 0 {
+                        let _ = writeln!(console::Writer,
+                            "  splash: {}x{} bochs framebuffer painted with NARF banner",
+                            w, h);
+                    }
                 }
             }
         }

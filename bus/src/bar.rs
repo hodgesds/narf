@@ -213,6 +213,37 @@ pub struct MmioRegion {
 }
 
 impl MmioRegion {
+    /// Read a naturally-aligned 16-bit MMIO word at `offset`.
+    ///
+    /// # Safety
+    /// `offset + 2 <= self.len`, `offset` 2-byte aligned, and the
+    /// device behind the BAR must tolerate the read at this offset.
+    #[inline]
+    pub unsafe fn read16(&self, offset: u64) -> u16 {
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: caller-asserted in-range, naturally-aligned.
+        let v = unsafe {
+            core::ptr::read_volatile((self.phys.raw() + offset) as *const u16)
+        };
+        compiler_fence(Ordering::SeqCst);
+        v
+    }
+
+    /// Write a naturally-aligned 16-bit MMIO word at `offset`.
+    ///
+    /// # Safety
+    /// `offset + 2 <= self.len`, `offset` 2-byte aligned; caller owns
+    /// the device exclusively.
+    #[inline]
+    pub unsafe fn write16(&self, offset: u64, value: u16) {
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: caller-asserted in-range, naturally-aligned.
+        unsafe {
+            core::ptr::write_volatile((self.phys.raw() + offset) as *mut u16, value);
+        }
+        compiler_fence(Ordering::SeqCst);
+    }
+
     /// Read a naturally-aligned 32-bit MMIO word at `offset`.
     ///
     /// # Safety

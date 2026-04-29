@@ -39,7 +39,9 @@ members = [
     "drivers/storage",
     "drivers/usb",
     "drivers/input",
+    "drivers/graphics",
     "input",
+    "graphics",
 ]
 # narf-testbin is built out-of-line by verification's build.rs
 # because it needs a distinct linker script and release profile.
