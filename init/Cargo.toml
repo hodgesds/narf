@@ -12,7 +12,8 @@ name = "narf_init"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib = { path = "../lib" }
+narf-lib  = { path = "../lib" }
+narf-time = { path = "../time" }
 
 [lints]
 workspace = true

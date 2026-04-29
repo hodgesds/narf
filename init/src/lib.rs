@@ -121,6 +121,14 @@ pub struct StageStats {
     pub ok:           u32,
     pub not_present:  u32,
     pub error:        u32,
+    /// Sum of `cycles_since` deltas across every initcall in the
+    /// stage. Stays 0 when the cycle counter isn't available
+    /// (fallback time backend).
+    pub total_cycles: u64,
+    /// Cycles spent in the slowest single initcall of this stage.
+    pub max_cycles:   u64,
+    /// Name of the slowest single initcall, for diagnostics.
+    pub max_name:     &'static str,
 }
 
 /// Optional hook for emitting "init: stage X / call Y -> Z" lines.
@@ -151,6 +159,11 @@ struct Registry {
     stats:  IrqSafeSpinLock<[StageStats; 8]>,
 }
 
+const EMPTY_STATS: StageStats = StageStats {
+    total: 0, ok: 0, not_present: 0, error: 0,
+    total_cycles: 0, max_cycles: 0, max_name: "",
+};
+
 static REGISTRY: Registry = Registry {
     stages: [
         IrqSafeSpinLock::new(Vec::new()),
@@ -162,9 +175,7 @@ static REGISTRY: Registry = Registry {
         IrqSafeSpinLock::new(Vec::new()),
         IrqSafeSpinLock::new(Vec::new()),
     ],
-    stats: IrqSafeSpinLock::new(
-        [StageStats { total: 0, ok: 0, not_present: 0, error: 0 }; 8],
-    ),
+    stats: IrqSafeSpinLock::new([EMPTY_STATS; 8]),
 };
 
 /// Register an initcall under the given stage. The function will
@@ -188,7 +199,14 @@ pub fn run_stage(stage: Stage) -> StageStats {
     let mut stats = StageStats::default();
     for ic in &calls {
         stats.total += 1;
+        let t0 = narf_time::now_cycles();
         let result = (ic.func)();
+        let dt = narf_time::now_cycles().saturating_sub(t0);
+        stats.total_cycles = stats.total_cycles.saturating_add(dt);
+        if dt > stats.max_cycles {
+            stats.max_cycles = dt;
+            stats.max_name   = ic.name;
+        }
         match result {
             InitResult::Ok         => stats.ok += 1,
             InitResult::NotPresent => stats.not_present += 1,
@@ -234,7 +252,31 @@ pub fn registered_count(stage: Stage) -> usize {
 #[doc(hidden)]
 pub fn __reset_for_test() {
     for v in REGISTRY.stages.iter() { v.lock().clear(); }
-    *REGISTRY.stats.lock() = [StageStats::default(); 8];
+    *REGISTRY.stats.lock() = [EMPTY_STATS; 8];
+}
+
+/// Print a formatted boot summary table through the supplied
+/// writer (typically `console::Writer`). One row per stage; the
+/// caller can compute its own time-conversion (the stats hold
+/// raw cycles).
+pub fn print_summary(w: &mut dyn core::fmt::Write) -> core::fmt::Result {
+    use core::fmt::Write as _;
+    writeln!(w, "  init summary:")?;
+    writeln!(w, "    stage       calls  ok  skip  err  total_cyc      slowest")?;
+    for stage in Stage::ALL {
+        let s = stats(stage);
+        if s.total == 0 { continue; }
+        writeln!(
+            w,
+            "    {:8}    {:5}  {:>2}  {:>4}  {:>3}  {:>11}  {} ({} cyc)",
+            stage.name(),
+            s.total, s.ok, s.not_present, s.error,
+            s.total_cycles,
+            if s.max_name.is_empty() { "-" } else { s.max_name },
+            s.max_cycles,
+        )?;
+    }
+    Ok(())
 }
 
 // ── tiny formatter helper to avoid an alloc::format!() in the hot path ──

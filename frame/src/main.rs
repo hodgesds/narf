@@ -763,15 +763,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 }
             });
 
-            // Run every stage in order.
+            // Run every stage in order, then print the per-stage
+            // summary (call counts + cycles) to console + (after
+            // Stage::Late, since fb-console-install lives there)
+            // the framebuffer.
             let _ = narf_init::run_all_through(narf_init::Stage::Late);
-            let _ = writeln!(console::Writer,
-                "  init: stages {} subsys / {} fs / {} device / {} late",
-                narf_init::stats(narf_init::Stage::Subsys).total,
-                narf_init::stats(narf_init::Stage::Fs).total,
-                narf_init::stats(narf_init::Stage::Device).total,
-                narf_init::stats(narf_init::Stage::Late).total,
-            );
+            let _ = narf_init::print_summary(&mut console::Writer);
         }
         Err(e) => {
             let _ = writeln!(console::Writer, "  boot parse failed: {e:?}");

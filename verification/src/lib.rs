@@ -1985,6 +1985,40 @@ fn smoke_init_error_continues_to_next_call() -> TestResult {
 }
 kernel_test!(smoke_init_error_continues_to_next_call);
 
+fn smoke_init_records_cycle_totals() -> TestResult {
+    use narf_init::{__reset_for_test, register, run_stage, InitResult, Stage};
+    fn slow() -> InitResult {
+        // Spin a small loop so cycles accumulate above zero.
+        for _ in 0..1000 { core::hint::spin_loop(); }
+        InitResult::Ok
+    }
+    fn fast() -> InitResult { InitResult::Ok }
+
+    __reset_for_test();
+    register(Stage::Subsys, "slow", slow);
+    register(Stage::Subsys, "fast", fast);
+    let s = run_stage(Stage::Subsys);
+    if s.total != 2 || s.ok != 2 {
+        __reset_for_test();
+        return TestResult::Fail("counts wrong");
+    }
+    if s.total_cycles == 0 {
+        __reset_for_test();
+        return TestResult::Fail("cycles not accumulated");
+    }
+    if s.max_cycles == 0 {
+        __reset_for_test();
+        return TestResult::Fail("max_cycles not recorded");
+    }
+    if s.max_name != "slow" && s.max_name != "fast" {
+        __reset_for_test();
+        return TestResult::Fail("max_name unexpected");
+    }
+    __reset_for_test();
+    TestResult::Pass
+}
+kernel_test!(smoke_init_records_cycle_totals);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_pte_pk_field() -> TestResult {
     use narf_memory::paging::PtFlags;
