@@ -28,6 +28,7 @@ pub mod process;
 pub mod syscall;
 pub mod thunks;
 pub mod trampoline;
+pub mod user_ptr;
 
 pub use pe::{parse as parse_pe, PeError, PeImage};
 pub use personality::{init_peb, init_teb, Layout};

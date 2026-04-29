@@ -113,6 +113,13 @@ fn current_address_space() -> Option<Arc<AddressSpace>> {
     f.and_then(|lookup| lookup())
 }
 
+/// Public re-export of the per-task AS lookup. Used by external
+/// subsystems (currently `narf_compat_win`) that need to bound-check
+/// user pointers handed to thunks before dereferencing them.
+pub fn active_user_as() -> Option<Arc<AddressSpace>> {
+    current_address_space()
+}
+
 // ── Exit-landing registration ──────────────────────────────────────
 
 static EXIT_LANDING_RIP: AtomicU64 = AtomicU64::new(0);

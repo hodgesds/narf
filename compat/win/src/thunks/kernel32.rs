@@ -16,49 +16,40 @@ use crate::win_thunk;
 
 // ── M0 console helper ────────────────────────────────────────────
 //
-// WriteConsoleA / WriteConsoleW need to read the user-VA buffer the
-// caller passed in. NARF does not yet expose a cap-checked
-// user-pointer accessor (that lands with `narf_userspace`'s
-// boundary-crossing surface in Stage-4 follow-on work), so for M0
-// the helper does a bounded direct read with documented
-// preconditions:
-//
-// 1. The thunk runs with the caller's address space ACTIVE — i.e.
-//    `IA32_GS_BASE` already points at the caller's TEB, the user
-//    pages are CR3-resident, kernel-mode reads of user VAs are
-//    permitted (SMAP not enabled — gated by feature in `arch/`).
-// 2. The buffer is read in 256-byte chunks into a kernel stack
-//    buffer; non-ASCII bytes are mapped to '?' for the early
-//    16550A / PL011 console (which doesn't render UTF-8).
-// 3. A read past the buffer that hits an unmapped user page faults
-//    in the user range — the page-fault handler treats it as a
-//    user fault (kill the offending Win32 task) rather than a
-//    kernel oops.
+// `WriteConsoleA` / `WriteConsoleW` read the user-VA buffer the
+// caller passed in via `crate::user_ptr::copy_in` — bounds-checked
+// against the active task's `AddressSpace` region table. A miss
+// (zero VA, kernel-half VA, unmapped user range, oversized buffer)
+// returns `false`/0 to the Win32 caller per the spec.
 
 /// Best-effort copy of a user buffer into the kernel console stream.
+/// Returns `true` if the entire range was forwarded; `false` if any
+/// chunk failed the cap-checked accessor (and the partial output up
+/// to the failure remains visible — same contract Win32 advertises
+/// when `WriteConsole` returns short due to console-handle errors).
 ///
-/// `unit_bytes` is 1 for `WriteConsoleA`, 2 for `WriteConsoleW`. For
-/// the W variant we sample only the low byte of each u16 — fine for
+/// `unit_bytes` is 1 for `WriteConsoleA`, 2 for `WriteConsoleW`.
+/// The W variant samples only the low byte of each u16 — fine for
 /// pure ASCII content, which is what every M0-class PE produces.
-///
-/// # Safety
-/// `buf` must be a readable user-VA pointer for `count * unit_bytes`
-/// bytes. See the module-level note above.
-unsafe fn forward_to_console(buf: u64, count: u32, unit_bytes: usize) {
-    if buf == 0 || count == 0 { return; }
+fn forward_to_console(buf: u64, count: u32, unit_bytes: usize) -> bool {
+    if buf == 0 || count == 0 { return true; }
     let total_bytes = (count as usize).saturating_mul(unit_bytes);
-    let src = buf as *const u8;
-    let mut local = [0u8; 256];
+    let mut local = [0u8; crate::user_ptr::MAX_USER_COPY];
     let mut consumed: usize = 0;
     while consumed < total_bytes {
-        let chunk = core::cmp::min(256, total_bytes - consumed);
-        // SAFETY: per fn-level contract.
-        unsafe {
-            core::ptr::copy_nonoverlapping(src.add(consumed), local.as_mut_ptr(), chunk);
+        let chunk = core::cmp::min(crate::user_ptr::MAX_USER_COPY,
+                                   total_bytes - consumed);
+        let dst = &mut local[..chunk];
+        // SAFETY: copy_in bounds-checks against the active AS;
+        // safe inside a SyscallHandler body because the trap path
+        // entered with the user AS live.
+        let ok = unsafe { crate::user_ptr::copy_in(buf + consumed as u64, dst) };
+        if ok.is_err() {
+            return false;
         }
         // For UTF-16: drop the high byte of each pair (M0 ASCII-only).
         let usable = if unit_bytes == 2 { chunk / 2 } else { chunk };
-        let mut tmp = [0u8; 256];
+        let mut tmp = [0u8; crate::user_ptr::MAX_USER_COPY];
         for i in 0..usable {
             let b = if unit_bytes == 2 { local[i * 2] } else { local[i] };
             tmp[i] = if b.is_ascii() && b != 0 { b } else { b'?' };
@@ -68,6 +59,7 @@ unsafe fn forward_to_console(buf: u64, count: u32, unit_bytes: usize) {
         narf_console::write_str(s);
         consumed += chunk;
     }
+    true
 }
 
 // ── Win32 HANDLE constants for the standard streams ──────────────
@@ -139,8 +131,9 @@ win_thunk! {
         if handle != STD_OUTPUT_HANDLE && handle != STD_ERROR_HANDLE {
             return 0;
         }
-        // SAFETY: see module-level note on forward_to_console.
-        unsafe { forward_to_console(buffer, chars, 1); }
+        if !forward_to_console(buffer, chars, 1) {
+            return 0;
+        }
         if written_out != 0 {
             // SAFETY: same user-AS contract; written_out is a user
             // VA the caller wants the byte count stored at.
@@ -167,9 +160,11 @@ win_thunk! {
         if handle != STD_OUTPUT_HANDLE && handle != STD_ERROR_HANDLE {
             return 0;
         }
-        // SAFETY: see module-level note. unit_bytes=2 → UTF-16LE,
-        // M0 samples the low byte of each pair.
-        unsafe { forward_to_console(buffer, chars, 2); }
+        // unit_bytes=2 → UTF-16LE, M0 samples the low byte of each
+        // pair.
+        if !forward_to_console(buffer, chars, 2) {
+            return 0;
+        }
         if written_out != 0 {
             // SAFETY: see module-level note.
             unsafe { (written_out as *mut u32).write_unaligned(chars); }
