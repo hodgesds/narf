@@ -31,16 +31,100 @@ details and `ROADMAP.md` for the stage × subsystem matrix.
   own Ring 0 address space into 16 hardware-protected domains using Intel
   PKS/PKU (on x86_64) or ARM Memory Tagging Extension (on aarch64). Drivers
   run in these domains — same virtual map, hardware-blocked from each other.
+  Switching between domains is a single MSR/SR write, not a TLB flush, so
+  isolation does not pay the cache-cold tax that a classical microkernel pays
+  for every cross-server call. Compromise of one driver cannot read or
+  corrupt another driver's heap, ring buffers, or descriptor tables — the
+  hardware refuses the access before the load retires.
 - **Async-first scheduling.** Every syscall, interrupt, and driver task is a
   stackless Rust `Future` on a global executor. A caller can donate its
   remaining time-slice directly to the callee ("direct context transfer") to
-  eliminate double-trip context switches.
+  eliminate double-trip context switches. Per-CPU run queues with optional
+  NUMA-aware work stealing keep latency local; QSBR / epoch / hazard-pointer
+  RCU lets readers run without locks while reclamation is deferred to a safe
+  point. There is no kernel thread pool to size and no `kthread` to migrate
+  — the executor *is* the scheduler.
 - **Narf-Ring IPC.** Zero-copy shared-memory rings. Data moves via Rust
-  ownership transfer — the bytes never move in physical RAM.
-- **Capability-based security.** No root user. Every operation requires an
-  unforgeable `Cap<T>` token enforced by the Rust type system.
-- **Hardware bypass where it pays off.** P2P DMA, User Interrupts (UIPI),
-  Global LTO across the whole kernel.
+  ownership transfer — the bytes never move in physical RAM. A producer
+  surrenders a `DmaBuffer` into the ring; the consumer receives the
+  unforgeable owning handle and can read, mutate, or forward it without ever
+  re-entering the kernel. This collapses the classical "syscall →
+  copy-in → copy-out → syscall" dance to a pair of `release` / `acquire`
+  fences against a cache line.
+- **Capability-based security.** No root user, no ambient authority, no
+  `CAP_SYS_*` flag soup. Every operation requires an unforgeable `Cap<T>`
+  token whose *type* encodes what the holder may do (`Cap<Read>` ⊂
+  `Cap<Write>` / `Cap<Invoke>` / `Cap<Spend>`). Rights are checked by the
+  Rust type system at compile time and by an epoch-versioned cap table at
+  runtime, so a revoked capability becomes inert globally on the next epoch
+  boundary. Confused-deputy attacks are structurally precluded: there is no
+  "current user" the kernel could be tricked into impersonating.
+- **Hardware bypass where it pays off.** P2P DMA between PCIe devices
+  without a bounce through DRAM; User Interrupts (UIPI) on x86_64 to skip
+  ring transitions on signal delivery; Global LTO across the whole kernel
+  so cross-subsystem calls inline like a single binary; per-NUMA-node frame
+  allocators wired off ACPI SRAT/HMAT/PMTT so DMA buffers land local to the
+  device's home node.
+- **Two arches, one tree, every commit.** x86_64 and aarch64 are co-equal
+  primaries — there is no "port." Every subsystem spec has an *Architecture
+  notes* section that must address both; every PR runs `cargo xtask test`
+  on both arches before landing. PKS↔MTE, x2APIC↔GICv3, INVPCID↔TLBI, ECAM
+  on q35↔ECAM via DTB on QEMU virt — each pair is symmetric in the API and
+  asymmetric in the HAL only where the silicon forces it.
+- **ACPI / AML in tree, in Rust.** A from-scratch DSDT/SSDT parser and AML
+  bytecode interpreter (method evaluator, OpRegion accessors for
+  SystemMemory / SystemIO / PCI_Config, resource templates, Mutex/Event,
+  GPE dispatch, `_PRT` / `_CRS` round-trip) replaces ACPICA's C ball-of-mud
+  inside the TCB. Firmware is parsed under the same `unsafe`-discipline and
+  cap rules as the rest of the kernel; nothing executes outside the
+  framekernel's domain model.
+- **Verification and observability are first-class.** A kernel-resident
+  test harness (`cargo xtask test`) boots the real kernel under QEMU and
+  asserts on live invariants — 305 smokes on x86_64, 236 on aarch64 at
+  time of writing — alongside USDT-style probes, flight-recorder rings, a
+  PMU-sampling surface, and an ABI promise (syscall numbers carry an upper
+  8-bit version, `relibc` will gate against it). Bugs are caught at the
+  invariant boundary rather than diagnosed from a stack trace.
+
+## How NARF compares to Linux and the BSDs
+
+NARF is not a clone of either family — it occupies a different point in the
+design space. The table is for orientation, not scoring; "absent" features
+are usually deliberate choices, not omissions.
+
+| Dimension | Linux | FreeBSD / OpenBSD / NetBSD | NARF |
+| --- | --- | --- | --- |
+| Kernel model | Monolithic with loadable modules | Monolithic | **Framekernel**: minimal Ring-0 TCB + 16 hw-isolated driver domains in the same address space |
+| Driver isolation | None inside kernel; a buggy module can scribble anywhere | None inside kernel | Intel **PKS/PKU** on x86_64, **ARM MTE** on aarch64 — hardware blocks cross-domain loads/stores |
+| Implementation language | C (Rust permitted in tree, opt-in subsystems) | C (predominantly) | **Rust, no_std**, top-to-bottom; `unsafe` walled into the HAL |
+| Concurrency model | Preemptive kthreads + softirqs + workqueues + BHs | Preemptive kthreads + taskqueues + netisr | Stackless **async `Future`s** on a single global executor; per-CPU queues; optional NUMA-aware work stealing |
+| Cross-context call | `syscall` → schedule → return; copy_to/from_user | `syscall` → schedule → return; `copyin/copyout` | **Direct context transfer** — caller donates its time-slice to the callee, no double trip |
+| IPC | pipes, UDS, SysV, futex, io_uring (zero-copy in narrow paths) | pipes, UDS, kqueue, capsicum sandboxing | **Narf-Ring**: zero-copy ownership-transfer over shared-memory rings, cap-gated |
+| Authorization | uid/gid + capabilities(7) + LSM (SELinux/AppArmor) | uid/gid + (FreeBSD) Capsicum + (OpenBSD) pledge/unveil | **`Cap<T>` everywhere**: no root, no ambient authority, type-encoded rights, epoch-revocable |
+| RCU / deferred reclaim | RCU (classic / SRCU / Tasks RCU) | epoch (`epoch(9)`) | **QSBR + epoch + hazard pointers + sleepable** in tree |
+| Interrupt model | top-half ISR + softirq/threaded IRQ | ithread | **`wait_for_irq.await`** future bridging hw IRQ → executor; **UIPI** on x86_64 |
+| ACPI / AML | ACPICA (C, imported) | ACPI-CA (C, imported) | **From-scratch Rust** parser + AML interpreter inside the TCB |
+| PCIe enumeration | Per-arch ECAM + ACPI / DT bring-up | Per-arch ECAM + ACPI / DT bring-up | Unified ECAM walker: ACPI MCFG on x86_64, DTB on aarch64; same driver-match registry |
+| NUMA | `numactl`, per-node zoned allocator, autoNUMA | `cpuset`, per-domain VM | SRAT/HMAT/PMTT-driven **per-node frame allocator** + node-aware steal |
+| User-mode networking | Kernel TCP/IP; AF_XDP / DPDK for bypass | Kernel TCP/IP; netmap | **Stack lives in userspace**; kernel ships only the frame-ring contract + driver |
+| libc story | glibc / musl / etc. on a stable syscall ABI | platform libc bundled with kernel | **`relibc`** gated by a versioned syscall ABI (upper 8 bits of the syscall number) |
+| Build / link | Per-object compile, no whole-kernel LTO by default | Per-object compile | **Global LTO** across the whole kernel — cross-subsystem calls inline |
+| Test surface | kselftest, KUnit, LTP (out-of-tree mostly) | ATF / Kyua | **In-tree QEMU-resident** smokes; every commit runs both arches |
+| Architectures (primary) | x86_64, aarch64, many more | x86_64, aarch64, others | **x86_64 + aarch64 co-equal** from day one |
+| Stable kernel ABI | "We do not break userspace" — strong de-facto, no version stamp | Stable across a major branch | **Versioned**: syscall number carries an 8-bit ABI version, surfaced to libc |
+| TCB size | Multi-million LoC; every driver is in the TCB | ~Million LoC; every driver is in the TCB | **Frame** is small; drivers are *not* in the TCB even though they share the address space |
+
+The headline trade is **isolation without an IPC tax**. Linux and the BSDs
+get throughput by putting drivers inside the kernel and accepting that a
+buggy driver can corrupt anything. Classical microkernels (Mach, L4,
+seL4, Minix 3) get isolation by putting drivers in user processes and
+paying for an address-space crossing on every interaction. NARF puts
+drivers in the kernel address space *and* isolates them, using PKS/MTE
+to make the boundary a single instruction instead of a TLB shootdown.
+The cost is hardware specificity (you need PKS-class silicon or MTE) and
+a smaller mature driver set than a 30-year-old project. The win is that
+"`Cap<T>` + domain + zero-copy ring" is enforceable end-to-end without
+falling back to "trust every kthread."
 
 ## What works today (both arches on QEMU)
 

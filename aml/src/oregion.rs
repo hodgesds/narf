@@ -411,20 +411,6 @@ pub(crate) fn parse_op_region_after_name(
     Ok(true)
 }
 
-/// Parse the body of an `OpRegion` declaration starting immediately after the
-/// opcode bytes (`0x5B 0x80` already consumed). Registers the region.
-///
-/// Format (ACPI 6.5 §20.2.5.2):
-///   NameString  RegionSpace(u8)  RegionOffset(TermArg)  RegionLen(TermArg)
-///
-/// This is the helper used for direct parsing (e.g., test scaffolding).
-/// Returns `Ok(true)` if TermArgs were plain literals, `Ok(false)` if complex.
-pub(crate) fn parse_op_region_body(p: &mut Parser<'_>, parent: &str) -> Result<bool, AmlError> {
-    let name = read_name_string(p, parent)?;
-    let path = full_path(name, parent);
-    parse_op_region_after_name(p, path)
-}
-
 /// Parse the body of a `Field` declaration starting immediately after the
 /// opcode bytes (`0x5B 0x81` already consumed).
 ///
