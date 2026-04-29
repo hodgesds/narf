@@ -2330,6 +2330,51 @@ fn smoke_fb_registry_drain_all_executes_per_process() -> TestResult {
 }
 kernel_test!(smoke_fb_registry_drain_all_executes_per_process);
 
+fn smoke_fb_drain_once_advances_counters() -> TestResult {
+    use narf_fb::{
+        bootstrap_writer, cmd_ring, drain_once, drain_stats, registry,
+        select_active, FbWriter, Rect,
+    };
+    use narf_fb::cmd_ring::{DrawCmd, RING_DEPTH, DrawRing};
+    use narf_graphics::Pixel32;
+    use narf_ipc::shared_ring::SharedProducer;
+
+    if select_active().is_none() {
+        return TestResult::Skip("no FB backend probed");
+    }
+    registry::__reset_for_test();
+    narf_fb::drain_task::__reset_for_test();
+
+    let pid = 3001u64;
+    let phys = match registry::attach(pid) {
+        Ok(p)  => p,
+        Err(_) => return TestResult::Fail("attach"),
+    };
+    let mut producer: SharedProducer<DrawCmd, RING_DEPTH> =
+        // SAFETY: SPSC contract — kernel-side test.
+        unsafe { SharedProducer::from_raw(phys.raw() as *mut DrawRing) };
+    let cmd = DrawCmd::fill(Rect::new(0, 0, 2, 2),
+                            Pixel32::rgb(0xDE, 0xAD, 0xBE).raw());
+    if cmd_ring::try_send(&mut producer, cmd).is_err() {
+        return TestResult::Fail("send");
+    }
+
+    let cap    = bootstrap_writer();
+    let writer = FbWriter::new(cap).expect("writer");
+    let (ok, err) = drain_once(&writer);
+    if ok != 1 || err != 0 {
+        return TestResult::Fail("drain_once stats wrong");
+    }
+    let (ticks, executed, errors) = drain_stats();
+    if ticks == 0 || executed == 0 || errors != 0 {
+        return TestResult::Fail("global counters didn't advance");
+    }
+    registry::__reset_for_test();
+    narf_fb::drain_task::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test!(smoke_fb_drain_once_advances_counters);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_pte_pk_field() -> TestResult {
     use narf_memory::paging::PtFlags;

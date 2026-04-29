@@ -34,9 +34,11 @@ extern crate alloc;
 
 pub mod client;
 pub mod cmd_ring;
+pub mod drain_task;
 pub mod registry;
 pub use client::{allocate_singleton_ring, FbClient};
 pub use cmd_ring::{DrawCmd, DrawRing, RING_DEPTH, TAG_FILL, TAG_FLUSH};
+pub use drain_task::{drain_once, stats as drain_stats, DrainTask};
 pub use registry::{attach as registry_attach, detach as registry_detach, AttachError};
 
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -313,6 +315,19 @@ pub fn register_initcalls() {
         } else {
             InitResult::NotPresent
         }
+    });
+    narf_init::register(Stage::Late, "fb-drain-task", || {
+        if select_active().is_none() {
+            return InitResult::NotPresent;
+        }
+        let cap    = bootstrap_writer();
+        let writer = match FbWriter::new(cap) {
+            Ok(w)  => w,
+            Err(_) => return InitResult::Error("FbWriter::new"),
+        };
+        let task = drain_task::DrainTask::new(writer);
+        let _ = narf_scheduler::spawn(task);
+        InitResult::Ok
     });
     narf_init::register(Stage::Late, "fb-client-demo", || {
         if select_active().is_none() {
