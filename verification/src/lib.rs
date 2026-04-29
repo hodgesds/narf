@@ -1378,6 +1378,158 @@ fn smoke_x86_64_shoot_range_one_ipi() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_x86_64_shoot_range_one_ipi);
 
+// ─── Input subsystem smokes ─────────────────────────────────────────
+
+fn smoke_input_ring_push_pop_round_trip() -> TestResult {
+    use narf_input::{InputEvent, KeyCode, KeyEvent, Modifiers, EventRing};
+    let r = EventRing::new(4);
+    if !r.push(InputEvent::Key(KeyEvent {
+        code: KeyCode::A, pressed: true, modifiers: Modifiers::EMPTY,
+    })) {
+        return TestResult::Fail("push reported drop on empty ring");
+    }
+    let popped = match r.pop() { Some(e) => e, None => return TestResult::Fail("pop empty") };
+    if let InputEvent::Key(k) = popped {
+        if k.code != KeyCode::A || !k.pressed {
+            return TestResult::Fail("popped event mismatch");
+        }
+    } else {
+        return TestResult::Fail("wrong variant");
+    }
+    if r.pop().is_some() { return TestResult::Fail("pop should now be empty"); }
+    TestResult::Pass
+}
+kernel_test!(smoke_input_ring_push_pop_round_trip);
+
+fn smoke_input_ring_overflow_drops_oldest() -> TestResult {
+    use narf_input::{InputEvent, KeyCode, KeyEvent, Modifiers, EventRing};
+    let r = EventRing::new(2);
+    let ev = |c: KeyCode| InputEvent::Key(KeyEvent {
+        code: c, pressed: true, modifiers: Modifiers::EMPTY,
+    });
+    let _ = r.push(ev(KeyCode::A));
+    let _ = r.push(ev(KeyCode::B));
+    // Capacity reached; this push drops A.
+    let clean = r.push(ev(KeyCode::C));
+    if clean { return TestResult::Fail("third push reported clean on full ring"); }
+    if r.dropped() != 1 { return TestResult::Fail("dropped counter not bumped"); }
+    // Remaining events must be B, C in order.
+    if let Some(InputEvent::Key(k)) = r.pop() {
+        if k.code != KeyCode::B { return TestResult::Fail("expected B first after drop"); }
+    } else { return TestResult::Fail("ring unexpectedly empty"); }
+    if let Some(InputEvent::Key(k)) = r.pop() {
+        if k.code != KeyCode::C { return TestResult::Fail("expected C second"); }
+    } else { return TestResult::Fail("ring unexpectedly empty"); }
+    TestResult::Pass
+}
+kernel_test!(smoke_input_ring_overflow_drops_oldest);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_i8042_decode_a_keystroke() -> TestResult {
+    // Synthetic scancode-set-1 byte stream for: press 'A', release 'A'.
+    // Make code for KEY_A in set 1 = 0x1E. Release sets the 0x80 bit.
+    use narf_input::{__reset_global_ring_for_test, InputEvent, KeyCode, pop_global, init_global_ring};
+    use narf_input_driver::i8042;
+
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    i8042::__reset_for_test();
+
+    i8042::feed_bytes_for_test(&[0x1E, 0x9E]);
+
+    // Two events should now be in the global ring.
+    let press = pop_global();
+    let release = pop_global();
+    let press_ok = matches!(
+        press,
+        Some(InputEvent::Key(k)) if k.code == KeyCode::A && k.pressed
+    );
+    let release_ok = matches!(
+        release,
+        Some(InputEvent::Key(k)) if k.code == KeyCode::A && !k.pressed
+    );
+    if !press_ok   { return TestResult::Fail("A press event missing or wrong"); }
+    if !release_ok { return TestResult::Fail("A release event missing or wrong"); }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_i8042_decode_a_keystroke);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_i8042_modifier_tracking() -> TestResult {
+    // Press LeftShift (make 0x2A), press 'A' (make 0x1E), release both.
+    // The 'A' press event should carry SHIFT in its modifier bitset.
+    use narf_input::{__reset_global_ring_for_test, InputEvent, KeyCode, Modifiers, pop_global, init_global_ring};
+    use narf_input_driver::i8042;
+
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    i8042::__reset_for_test();
+
+    i8042::feed_bytes_for_test(&[0x2A, 0x1E, 0x9E, 0xAA]);
+
+    // Skip shift press, inspect 'A' press.
+    let _ = pop_global();
+    match pop_global() {
+        Some(InputEvent::Key(k)) => {
+            if k.code != KeyCode::A || !k.pressed {
+                return TestResult::Fail("expected A press second");
+            }
+            if !k.modifiers.contains(Modifiers::SHIFT) {
+                return TestResult::Fail("SHIFT modifier not carried on A");
+            }
+        }
+        _ => return TestResult::Fail("missing A event"),
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_i8042_modifier_tracking);
+
+fn smoke_virtio_input_decode_synthetic() -> TestResult {
+    use narf_input::{__reset_global_ring_for_test, InputEvent, KeyCode, pop_global, init_global_ring};
+    use narf_drivers_virtio::input_pci::feed_synthetic_events_for_test;
+
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+
+    // EV_KEY type=1, code=KEY_A=30, value=1 (press)
+    // EV_KEY type=1, code=KEY_A=30, value=0 (release)
+    let n = feed_synthetic_events_for_test(&[(1, 30, 1), (1, 30, 0)]);
+    if n != 2 { return TestResult::Fail("expected 2 synthetic events"); }
+    let press = matches!(
+        pop_global(),
+        Some(InputEvent::Key(k)) if k.code == KeyCode::A && k.pressed
+    );
+    let release = matches!(
+        pop_global(),
+        Some(InputEvent::Key(k)) if k.code == KeyCode::A && !k.pressed
+    );
+    if !press   { return TestResult::Fail("A press missing"); }
+    if !release { return TestResult::Fail("A release missing"); }
+    TestResult::Pass
+}
+kernel_test!(smoke_virtio_input_decode_synthetic);
+
+fn smoke_virtio_input_probed_at_boot() -> TestResult {
+    use narf_drivers_virtio::input_pci;
+    if input_pci::is_probed() {
+        TestResult::Pass
+    } else {
+        TestResult::Skip("virtio-keyboard-pci not present in this QEMU config")
+    }
+}
+kernel_test!(smoke_virtio_input_probed_at_boot);
+
+fn smoke_input_kind_default_domain() -> TestResult {
+    use narf_drivers::BoundKind;
+    if BoundKind::Input.default_domain() != 6 {
+        return TestResult::Fail("Input domain != 6");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_input_kind_default_domain);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_pte_pk_field() -> TestResult {
     use narf_memory::paging::PtFlags;

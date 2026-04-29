@@ -1,0 +1,18 @@
+[package]
+name         = "narf-input"
+description  = "Shared input event types + per-device event ring + subscriber registry."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_input"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib = { path = "../lib" }
+
+[lints]
+workspace = true

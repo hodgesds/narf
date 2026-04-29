@@ -21,6 +21,7 @@ narf-memory       = { path = "../../memory" }
 narf-block        = { path = "../../block" }
 narf-io           = { path = "../../io" }
 narf-ipc          = { path = "../../ipc" }
+narf-input        = { path = "../../input" }
 
 [lints]
 workspace = true

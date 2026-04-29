@@ -656,11 +656,37 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // driver dispatch in one place (kernel-test harness
             // re-runs this per smoke; the boot path establishes
             // the canonical set of drivers).
+            // Initialise the shared input event ring before any
+            // input driver pushes to it. Capacity 256 is enough for
+            // ~1 second of bursty keyboard input.
+            narf_input::init_global_ring(256);
+
+            // Best-effort i8042 PS/2 keyboard bring-up on x86_64.
+            // QEMU q35 always exposes i8042 even with USB present;
+            // legacy hardware does too. A failure here just means
+            // no keyboard events arrive — drivers fed from
+            // virtio-input still work.
+            #[cfg(target_arch = "x86_64")]
+            {
+                // SAFETY: BSP, no other agent driving 0x60/0x64.
+                match unsafe { narf_input_driver::i8042::init() } {
+                    Ok(()) => {
+                        let _ = writeln!(console::Writer,
+                            "  input: i8042 PS/2 keyboard initialised (IRQ 1)");
+                    }
+                    Err(e) => {
+                        let _ = writeln!(console::Writer,
+                            "  input: i8042 init skipped ({:?})", e);
+                    }
+                }
+            }
+
             narf_drivers_nvme::register_pci_driver();
             narf_drivers_virtio::blk_pci::register_pci_driver();
             narf_drivers_virtio::net_pci::register_pci_driver();
             narf_drivers_virtio::rng_pci::register_pci_driver();
             narf_drivers_virtio::balloon_pci::register_pci_driver();
+            narf_drivers_virtio::input_pci::register_pci_driver();
             narf_drivers_net::e1000::register_pci_driver();
             narf_drivers_storage::ahci::register_pci_driver();
             narf_drivers_usb::xhci::register_pci_driver();

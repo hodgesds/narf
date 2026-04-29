@@ -1,0 +1,22 @@
+[package]
+name         = "narf-input-driver"
+description  = "Input drivers: i8042 PS/2 keyboard (x86_64) + future."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_input_driver"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib         = { path = "../../lib" }
+narf-input       = { path = "../../input" }
+narf-arch        = { path = "../../arch" }
+narf-interrupts  = { path = "../../interrupts" }
+narf-drivers     = { path = "../../drivers" }
+
+[lints]
+workspace = true

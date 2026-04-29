@@ -545,6 +545,7 @@ dependencies = [
  "narf-bus",
  "narf-capabilities",
  "narf-drivers",
+ "narf-input",
  "narf-interrupts",
  "narf-io",
  "narf-ipc",
@@ -580,6 +581,8 @@ dependencies = [
  "narf-drivers-storage",
  "narf-drivers-usb",
  "narf-drivers-virtio",
+ "narf-input",
+ "narf-input-driver",
  "narf-interrupts",
  "narf-lib",
  "narf-memory",
@@ -587,6 +590,24 @@ dependencies = [
  "narf-time",
  "narf-userspace",
  "narf-verification",
+]
+
+[[package]]
+name = "narf-input"
+version = "0.0.0"
+dependencies = [
+ "narf-lib",
+]
+
+[[package]]
+name = "narf-input-driver"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-drivers",
+ "narf-input",
+ "narf-interrupts",
+ "narf-lib",
 ]
 
 [[package]]
@@ -741,6 +762,8 @@ dependencies = [
  "narf-drivers-usb",
  "narf-drivers-virtio",
  "narf-filesystem",
+ "narf-input",
+ "narf-input-driver",
  "narf-interrupts",
  "narf-io",
  "narf-ipc",

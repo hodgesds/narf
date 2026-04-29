@@ -193,6 +193,14 @@ impl Arch {
                     "virtio-balloon-pci,disable-legacy=on,disable-modern=off".into(),
                     // QEMU's xHCI USB host controller.
                     "-device".into(),  "qemu-xhci,id=xhci0".into(),
+                    // virtio-input keyboard so the virtio-input
+                    // driver has a real device to probe. QEMU's
+                    // virtio-keyboard-pci synthesizes EV_KEY events
+                    // when the QEMU window receives keystrokes;
+                    // under `-display none` the device is silent
+                    // but the bring-up + queue setup still exercises.
+                    "-device".into(),
+                    "virtio-keyboard-pci,disable-legacy=on,disable-modern=off".into(),
                     "-kernel".into(),  kernel,
                 ]
             },
@@ -251,6 +259,10 @@ impl Arch {
                 "virtio-balloon-pci,disable-legacy=on,disable-modern=off".into(),
                 "-device".into(),
                 "qemu-xhci,id=xhci0".into(),
+                // virtio-input keyboard (cross-arch); see x86_64
+                // block above for rationale.
+                "-device".into(),
+                "virtio-keyboard-pci,disable-legacy=on,disable-modern=off".into(),
                 // QEMU's `-kernel <elf>` path on aarch64 does not
                 // load a `-dtb` blob into RAM (the DTB-loading code
                 // path is gated on `is_linux=1`). Instead we

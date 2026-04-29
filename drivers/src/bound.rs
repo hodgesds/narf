@@ -28,6 +28,8 @@ pub enum BoundKind {
     Rng,
     /// Memory-pressure / ballooning device.
     Balloon,
+    /// Human-input device (keyboard, mouse, touchpad, virtio-input).
+    Input,
     /// Catch-all for things that don't fit a class yet.
     Other,
 }
@@ -45,6 +47,7 @@ impl BoundKind {
     ///   * UsbHost     → 3
     ///   * Rng         → 4
     ///   * Balloon     → 5
+    ///   * Input       → 6
     ///   * Other       → 15  (the catch-all bucket)
     pub const fn default_domain(self) -> u8 {
         match self {
@@ -53,6 +56,7 @@ impl BoundKind {
             BoundKind::UsbHost => 3,
             BoundKind::Rng     => 4,
             BoundKind::Balloon => 5,
+            BoundKind::Input   => 6,
             BoundKind::Other   => 15,
         }
     }
