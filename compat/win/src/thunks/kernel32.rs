@@ -91,8 +91,12 @@ const INVALID_HANDLE_VALUE: u64 = (-1i64) as u64;
 win_thunk! {
     name = ("kernel32.dll", "getstdhandle");
     struct GetStdHandle;
-    extern fn getstdhandle_entry(handle: u32) -> u64 {
-        let h = handle as i32 as i64 as u64;
+    extern fn getstdhandle_entry(a0: u64, _a1: u64, _a2: u64, _a3: u64) -> u64 {
+        // Win32: `HANDLE GetStdHandle(DWORD nStdHandle)`. The Win32
+        // arg sits in the low 32 bits of `a0` (rcx on amd64, x0 on
+        // aarch64) and is sign-extended to i64 via the as-i32-as-i64
+        // chain so the negative sentinels match.
+        let h = (a0 as u32 as i32 as i64) as u64;
         match h {
             STD_INPUT_HANDLE | STD_OUTPUT_HANDLE | STD_ERROR_HANDLE => h,
             _ => INVALID_HANDLE_VALUE,
@@ -122,19 +126,20 @@ win_thunk! {
 win_thunk! {
     name = ("kernel32.dll", "writeconsolea");
     struct WriteConsoleA;
-    extern fn writeconsolea_entry(
-        handle:      u64,
-        buffer:      u64,
-        chars:       u32,
-        written_out: u64,
-        _reserved:   u64,
-    ) -> u32 {
+    extern fn writeconsolea_entry(a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+        // Win32: `BOOL WriteConsoleA(HANDLE, LPCVOID, DWORD,
+        //          LPDWORD, LPVOID)`. Five args; the 5th
+        // (`lpReserved`) is documented "must be NULL" and we ignore
+        // it — passes through the unified-signature constraint
+        // because the M0 trampoline doesn't relay user stack args.
+        let handle      = a0;
+        let buffer      = a1;
+        let chars       = a2 as u32;
+        let written_out = a3;
         if handle != STD_OUTPUT_HANDLE && handle != STD_ERROR_HANDLE {
             return 0;
         }
-        // SAFETY: see module-level note on forward_to_console — the
-        // contract is the user AS is active and the user pages
-        // covering [buffer, buffer + chars) are mapped readable.
+        // SAFETY: see module-level note on forward_to_console.
         unsafe { forward_to_console(buffer, chars, 1); }
         if written_out != 0 {
             // SAFETY: same user-AS contract; written_out is a user
@@ -154,13 +159,11 @@ win_thunk! {
 win_thunk! {
     name = ("kernel32.dll", "writeconsolew");
     struct WriteConsoleW;
-    extern fn writeconsolew_entry(
-        handle:      u64,
-        buffer:      u64,
-        chars:       u32,
-        written_out: u64,
-        _reserved:   u64,
-    ) -> u32 {
+    extern fn writeconsolew_entry(a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+        let handle      = a0;
+        let buffer      = a1;
+        let chars       = a2 as u32;
+        let written_out = a3;
         if handle != STD_OUTPUT_HANDLE && handle != STD_ERROR_HANDLE {
             return 0;
         }
@@ -191,7 +194,12 @@ win_thunk! {
 win_thunk! {
     name = ("kernel32.dll", "exitprocess");
     struct ExitProcess;
-    extern fn exitprocess_entry(_code: u32) -> ! {
+    // Real Win32 prototype is `VOID ExitProcess(UINT)` (does not
+    // return). Our unified-signature wrapper returns u64 to match
+    // the dispatcher's call shape; the body never reaches the
+    // implicit return because M1 will redirect the trap frame to a
+    // synthetic exit landing — until then the thunk loops.
+    extern fn exitprocess_entry(_a0: u64, _a1: u64, _a2: u64, _a3: u64) -> u64 {
         loop { core::hint::spin_loop(); }
     }
 }
@@ -218,13 +226,15 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn getstdhandle_entry_returns_sentinel_for_known() {
-        // Replicate the function pointer cast the IAT would do.
+        // Replicate the function pointer cast the SYS_WIN_THUNK
+        // dispatcher does. All M0 thunks share the unified
+        // `extern "win64" fn(u64, u64, u64, u64) -> u64` signature.
         let ptr = GetStdHandle.entry_addr();
-        let f: extern "win64" fn(u32) -> u64 =
+        let f: extern "win64" fn(u64, u64, u64, u64) -> u64 =
             unsafe { core::mem::transmute(ptr) };
-        let stdout = f(0xFFFF_FFF5); // -11 as u32
+        let stdout = f(0xFFFF_FFF5, 0, 0, 0); // -11 as u32
         assert_eq!(stdout, STD_OUTPUT_HANDLE);
-        let bad = f(0x12345);
+        let bad = f(0x12345, 0, 0, 0);
         assert_eq!(bad, INVALID_HANDLE_VALUE);
     }
 
@@ -232,13 +242,14 @@ mod tests {
     #[test]
     fn writeconsolea_entry_accepts_stdout() {
         let ptr = WriteConsoleA.entry_addr();
-        let f: extern "win64" fn(u64, u64, u32, u64, u64) -> u32 =
+        let f: extern "win64" fn(u64, u64, u64, u64) -> u64 =
             unsafe { core::mem::transmute(ptr) };
         // stdout, null buffer (M0 ignores it), 5 chars, no
-        // written_out, no reserved.
-        assert_eq!(f(STD_OUTPUT_HANDLE, 0, 5, 0, 0), 1);
+        // written_out — 5th Win32 arg `_reserved` is not relayed
+        // through the M0 trampoline (see syscall.rs).
+        assert_eq!(f(STD_OUTPUT_HANDLE, 0, 5, 0), 1);
         // Bogus handle → FALSE.
-        assert_eq!(f(0x1234, 0, 5, 0, 0), 0);
+        assert_eq!(f(0x1234, 0, 5, 0), 0);
     }
 
     /// The kernel32 thunk table is ordered + populated.

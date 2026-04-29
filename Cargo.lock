@@ -457,6 +457,7 @@ dependencies = [
 name = "narf-compat-win"
 version = "0.0.0"
 dependencies = [
+ "narf-arch",
  "narf-capabilities",
  "narf-console",
  "narf-lib",

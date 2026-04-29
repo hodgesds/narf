@@ -24,6 +24,7 @@ pub mod dll;
 pub mod pe;
 pub mod personality;
 pub mod process;
+pub mod syscall;
 pub mod thunks;
 pub mod trampoline;
 

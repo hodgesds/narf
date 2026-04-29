@@ -17,6 +17,7 @@ narf-capabilities = { path = "../../capabilities" }
 narf-userspace    = { path = "../../userspace" }
 narf-memory       = { path = "../../memory" }
 narf-console      = { path = "../../console" }
+narf-arch         = { path = "../../arch" }
 
 [lints]
 workspace = true
