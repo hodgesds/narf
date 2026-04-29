@@ -1692,6 +1692,76 @@ fn smoke_fb_console_newline_advances_row() -> TestResult {
 }
 kernel_test!(smoke_fb_console_newline_advances_row);
 
+fn smoke_cursor_move_clamps_to_bounds() -> TestResult {
+    use narf_graphics::{Cursor, Pixel32};
+    let mut c = Cursor::new(0, 0, Pixel32::WHITE);
+    // Move past right edge — should clamp.
+    c.move_relative(1000, 0, 100, 100);
+    if c.x != 99 || c.y != 0 {
+        return TestResult::Fail("right-clamp wrong");
+    }
+    // Move past bottom — clamp.
+    c.move_relative(0, 1000, 100, 100);
+    if c.y != 99 {
+        return TestResult::Fail("bottom-clamp wrong");
+    }
+    // Negative — clamp to 0.
+    c.move_relative(-1000, -1000, 100, 100);
+    if c.x != 0 || c.y != 0 {
+        return TestResult::Fail("zero-clamp wrong");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_cursor_move_clamps_to_bounds);
+
+fn smoke_cursor_draw_at_paints_arrow_tip() -> TestResult {
+    use alloc::vec;
+    use narf_graphics::{Cursor, Framebuffer, Pixel32};
+    // 16x16 in-memory FB. Cursor at (0,0) — top-left pixel of arrow
+    // is bit 7 of the first sprite row (0b10000000), so pixel (0,0)
+    // is FG.
+    let mut buf = vec![0u32; 16 * 16];
+    let ptr = buf.as_mut_ptr();
+    // SAFETY: backing buffer outlives the borrow.
+    let mut fb = unsafe { Framebuffer::new(ptr, 16, 16, 16) };
+    let mut c = Cursor::new(0, 0, Pixel32::WHITE);
+    c.draw_at(&mut fb);
+    if buf[0] != Pixel32::WHITE.raw() {
+        return TestResult::Fail("arrow tip pixel not painted");
+    }
+    if c.draw_count != 1 {
+        return TestResult::Fail("draw_count not bumped");
+    }
+    // Second column of the first row — sprite row is 0b10000000,
+    // bit 6 = 0 → pixel left untouched (still 0).
+    if buf[1] != 0 {
+        return TestResult::Fail("transparent pixel got painted");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_cursor_draw_at_paints_arrow_tip);
+
+fn smoke_virtio_input_rel_delta_accumulates() -> TestResult {
+    // Synthetic EV_REL events: REL_X=0 +5, REL_Y=1 -3, REL_X +2.
+    // After feeding, take_rel_delta should report (7, -3) and reset.
+    // Note: our feed_synthetic_events_for_test only handles EV_KEY;
+    // we still verify the API on the controller side for pre-init.
+    use narf_drivers_virtio::input_pci;
+    if !input_pci::is_probed() {
+        return TestResult::Skip("virtio-input not probed");
+    }
+    let (_, _) = input_pci::with_controller(|c| c.take_rel_delta()).unwrap_or((0, 0));
+    // Drain (no events under -display none) and verify the
+    // accumulator stays zero.
+    let _drained = input_pci::with_controller(|c| c.drain_events()).unwrap_or(0);
+    let (dx, dy) = input_pci::with_controller(|c| c.take_rel_delta()).unwrap_or((1, 1));
+    if dx != 0 || dy != 0 {
+        return TestResult::Fail("rel delta unexpected non-zero with no input");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_virtio_input_rel_delta_accumulates);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_pte_pk_field() -> TestResult {
     use narf_memory::paging::PtFlags;

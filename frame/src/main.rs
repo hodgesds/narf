@@ -746,6 +746,25 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             "  splash: {}x{} bochs framebuffer console installed \
                              ({} cols x {} rows of 8x8 glyphs)",
                             cols * 8, rows * 8, cols, rows);
+                        // Mouse cursor: draw an arrow at screen
+                        // centre. Movement bookkeeping is hooked but
+                        // the redraw path lives in a future commit
+                        // when the scheduler tick lands as a UI
+                        // refresh source.
+                        let drew = narf_graphics_driver::bochs::with_controller(|d| {
+                            // SAFETY: BSP, post-FB-install.
+                            let mut fb = unsafe { d.framebuffer() };
+                            let mut cursor = narf_graphics::Cursor::new(
+                                (fb.width / 2) as i32,
+                                (fb.height / 2) as i32,
+                                narf_graphics::Pixel32::WHITE);
+                            cursor.draw_at(&mut fb);
+                            (cursor.x, cursor.y)
+                        });
+                        if let Some((cx, cy)) = drew {
+                            let _ = writeln!(console::Writer,
+                                "  cursor: arrow sprite drawn at ({}, {})", cx, cy);
+                        }
                     }
                 }
             }

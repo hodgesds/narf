@@ -78,6 +78,8 @@ pub struct VirtioInputPci {
     _q0_layout_buf:       DmaBuffer,
     event_q_notify_off:   u16,
     pub ready:            bool,
+    rel_dx_acc:           core::sync::atomic::AtomicI32,
+    rel_dy_acc:           core::sync::atomic::AtomicI32,
 }
 
 impl core::fmt::Debug for VirtioInputPci {
@@ -255,7 +257,18 @@ impl VirtioInputPci {
             _q0_layout_buf: q0_buf,
             event_q_notify_off,
             ready: true,
+            rel_dx_acc: core::sync::atomic::AtomicI32::new(0),
+            rel_dy_acc: core::sync::atomic::AtomicI32::new(0),
         })
+    }
+
+    /// Take the accumulated REL_X / REL_Y delta since last read.
+    /// virtio-input EV_REL events bump these; cursor consumers
+    /// poll-and-reset to convert into screen-space movement.
+    pub fn take_rel_delta(&self) -> (i32, i32) {
+        let dx = self.rel_dx_acc.swap(0, core::sync::atomic::Ordering::AcqRel);
+        let dy = self.rel_dy_acc.swap(0, core::sync::atomic::Ordering::AcqRel);
+        (dx, dy)
     }
 
     /// Drain whatever events the device has posted to the used ring.
@@ -294,11 +307,13 @@ impl VirtioInputPci {
                 let _ = push_global(InputEvent::Key(ev));
                 count += 1;
             } else if etype == EV_REL {
-                // M0: ignore mouse motion. Future extension: aggregate
-                // dx/dy across REL_X/REL_Y deltas, emit a PointerEvent
-                // on EV_SYN.
-                let _ = code;
-                let _ = value;
+                // EV_REL { code: REL_X=0 / REL_Y=1, value: i32 delta }
+                let delta = value as i32;
+                match code {
+                    0 => { self.rel_dx_acc.fetch_add(delta, Ordering::Relaxed); }
+                    1 => { self.rel_dy_acc.fetch_add(delta, Ordering::Relaxed); }
+                    _ => {} // wheel + others — future extension
+                }
             }
 
             // Re-post the slot as a fresh receive buffer.
