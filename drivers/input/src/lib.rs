@@ -12,3 +12,5 @@ extern crate alloc;
 
 #[cfg(target_arch = "x86_64")]
 pub mod i8042;
+#[cfg(target_arch = "x86_64")]
+pub mod i8042_mouse;

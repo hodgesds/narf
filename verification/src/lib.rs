@@ -1763,6 +1763,94 @@ fn smoke_virtio_input_rel_delta_accumulates() -> TestResult {
 kernel_test!(smoke_virtio_input_rel_delta_accumulates);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_i8042_mouse_packet_decode() -> TestResult {
+    use narf_input::{__reset_global_ring_for_test, init_global_ring,
+                      InputEvent, PointerButtons, pop_global};
+    use narf_input_driver::i8042_mouse;
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    i8042_mouse::__reset_for_test();
+
+    // Packet: status=0x09 (left button + sync), dx=+5, dy=+3.
+    // PS/2 reports +Y as up; our convention is +Y down → expect dy=-3.
+    i8042_mouse::feed_byte_for_test(0x09);
+    i8042_mouse::feed_byte_for_test(5);
+    i8042_mouse::feed_byte_for_test(3);
+
+    match pop_global() {
+        Some(InputEvent::Pointer(p)) => {
+            if p.dx != 5 || p.dy != -3 {
+                return TestResult::Fail("dx/dy decode wrong");
+            }
+            if !p.buttons.contains(PointerButtons::LEFT) {
+                return TestResult::Fail("LEFT button bit missing");
+            }
+        }
+        _ => return TestResult::Fail("no PointerEvent emitted"),
+    }
+    let (dx, dy) = i8042_mouse::take_rel_delta();
+    if dx != 5 || dy != -3 {
+        return TestResult::Fail("rel accumulator wrong");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_i8042_mouse_packet_decode);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_i8042_mouse_signed_dx_decodes() -> TestResult {
+    use narf_input::{__reset_global_ring_for_test, init_global_ring,
+                      InputEvent, pop_global};
+    use narf_input_driver::i8042_mouse;
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    i8042_mouse::__reset_for_test();
+
+    // Status with X-sign bit set (bit 4): dx is negative.
+    // 0x18 = sync (bit 3) + X-sign (bit 4); dx byte=0xFB (251) →
+    // signed = 251 - 256 = -5; dy byte=0, no Y-sign → +0 → dy=-0=0.
+    i8042_mouse::feed_byte_for_test(0x18);
+    i8042_mouse::feed_byte_for_test(0xFB);
+    i8042_mouse::feed_byte_for_test(0x00);
+    match pop_global() {
+        Some(InputEvent::Pointer(p)) => {
+            if p.dx != -5 || p.dy != 0 {
+                return TestResult::Fail("signed dx decode wrong");
+            }
+        }
+        _ => return TestResult::Fail("no PointerEvent"),
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_i8042_mouse_signed_dx_decodes);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_i8042_mouse_drops_unsynced_byte() -> TestResult {
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_global};
+    use narf_input_driver::i8042_mouse;
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    i8042_mouse::__reset_for_test();
+
+    // First byte without the sync bit (0x08) clear — should drop.
+    i8042_mouse::feed_byte_for_test(0x00);
+    if pop_global().is_some() {
+        return TestResult::Fail("non-sync byte produced an event");
+    }
+    // Then a proper packet — should produce one event.
+    i8042_mouse::feed_byte_for_test(0x08);
+    i8042_mouse::feed_byte_for_test(0x01);
+    i8042_mouse::feed_byte_for_test(0x02);
+    if pop_global().is_none() {
+        return TestResult::Fail("packet after re-sync didn't produce event");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_i8042_mouse_drops_unsynced_byte);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_pte_pk_field() -> TestResult {
     use narf_memory::paging::PtFlags;
     // Build a flag value with PK=7; check the round-trip + isolation

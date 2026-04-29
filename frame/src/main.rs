@@ -661,10 +661,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // ~1 second of bursty keyboard input.
             narf_input::init_global_ring(256);
 
-            // Best-effort i8042 PS/2 keyboard bring-up on x86_64.
-            // QEMU q35 always exposes i8042 even with USB present;
-            // legacy hardware does too. A failure here just means
-            // no keyboard events arrive — drivers fed from
+            // Best-effort i8042 PS/2 keyboard + mouse bring-up on
+            // x86_64. QEMU q35 always exposes i8042 even with USB
+            // present; legacy hardware does too. A failure here
+            // just means no PS/2 events arrive — drivers fed from
             // virtio-input still work.
             #[cfg(target_arch = "x86_64")]
             {
@@ -677,6 +677,17 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     Err(e) => {
                         let _ = writeln!(console::Writer,
                             "  input: i8042 init skipped ({:?})", e);
+                    }
+                }
+                // SAFETY: BSP, post-keyboard-init.
+                match unsafe { narf_input_driver::i8042_mouse::init() } {
+                    Ok(()) => {
+                        let _ = writeln!(console::Writer,
+                            "  input: i8042 PS/2 mouse initialised (IRQ 12)");
+                    }
+                    Err(e) => {
+                        let _ = writeln!(console::Writer,
+                            "  input: i8042 mouse init skipped ({:?})", e);
                     }
                 }
             }
