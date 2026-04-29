@@ -2172,6 +2172,64 @@ fn sys_mmap(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(base));
 }
 
+// ── MmapPhys — arg0=phys, arg1=len, arg2=flags ─────────────────────
+//
+// Maps a kernel-allowlisted phys range into userspace VA. The
+// caller has no way to forge a phys — the allowlist is populated
+// only by kernel-side code (e.g. the per-process FbRing
+// allocator) before any userspace process can request it.
+
+fn sys_mmap_phys(ctx: &mut dyn TrapContext) {
+    let args  = *ctx.args();
+    let phys  = args.arg0;
+    let len   = ((args.arg1 + 0xFFF) & !0xFFFu64).max(0x1000);
+    let flags = args.arg2;
+
+    // Lookup must contain the full (phys, len) request.
+    let entry = match crate::mmap_phys::lookup(phys, len) {
+        Some(e) => e,
+        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+    };
+
+    let as_ref = match current_address_space() {
+        Some(a) => a,
+        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+    };
+
+    // Build the per-page phys list from the contiguous range. The
+    // allowlist guarantees `entry` covers `[phys, phys + len)`.
+    let pages = (len >> 12) as usize;
+    let mut phys_list: alloc::vec::Vec<narf_memory::PhysAddr> =
+        alloc::vec::Vec::with_capacity(pages);
+    for i in 0..pages {
+        phys_list.push(narf_memory::PhysAddr::new(phys + (i as u64) * 4096));
+    }
+
+    let perms = match entry.perms {
+        crate::mmap_phys::MapPerms::ReadWrite => RegionPerms::READ | RegionPerms::WRITE,
+        crate::mmap_phys::MapPerms::ReadOnly  => RegionPerms::READ,
+    };
+    // `flags` is reserved for future RO-narrow / EXEC-grant; today
+    // we honour the allowlist's perms unconditionally.
+    let _ = flags;
+
+    let base = MMAP_CURSOR.fetch_add(len, Ordering::Relaxed);
+    if as_ref.map_region(Region {
+        base:  VirtAddr::new(base),
+        len,
+        perms,
+        phys:  phys_list,
+    }).is_err() {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    if unsafe { as_ref.materialize() }.is_err() {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    ctx.set_return(SyscallReturn::ok(base));
+}
+
 // ── Munmap — arg0=base ─────────────────────────────────────────────
 
 fn sys_munmap(ctx: &mut dyn TrapContext) {
@@ -4120,6 +4178,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Close,    "close",    RawFnHandler(sys_close));
     table.install_raw(Syscall::Mmap,     "mmap",     RawFnHandler(sys_mmap));
     table.install_raw(Syscall::Munmap,   "munmap",   RawFnHandler(sys_munmap));
+    table.install_raw(Syscall::MmapPhys, "mmap_phys", RawFnHandler(sys_mmap_phys));
     table.install_raw(Syscall::RingKick, "ringkick", RawFnHandler(sys_ring_kick));
     table.install_raw(Syscall::GetPid,   "getpid",   RawFnHandler(sys_getpid));
     table.install_raw(Syscall::GetPpid,  "getppid",  RawFnHandler(sys_getppid));

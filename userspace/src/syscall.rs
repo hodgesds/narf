@@ -328,6 +328,16 @@ pub enum Syscall {
     /// Unmap memory.
     Munmap       = 121,
 
+    /// Map a kernel-owned phys range into userspace.
+    ///   `arg0` = phys addr (must be page-aligned).
+    ///   `arg1` = length in bytes (rounded up to a page).
+    ///   `arg2` = flags (RW vs RO; reserved for future).
+    /// The phys range must be on the kernel-side allowlist
+    /// (`narf_userspace::mmap_phys::allow(phys, len)`); otherwise
+    /// the call returns InvalidOp. Returns the new userspace VA on
+    /// success.
+    MmapPhys     = 240,
+
     /// Kick the kernel-side dispatcher to drain the calling task's
     /// shared SubmissionRing and post Completions to the shared
     /// CompletionRing. Returns the number of submissions processed.

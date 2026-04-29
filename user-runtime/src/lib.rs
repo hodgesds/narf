@@ -56,6 +56,7 @@ pub const SYS_FSTAT:          u64 = 116;
 pub const SYS_PIPE:           u64 = 117;
 pub const SYS_MMAP:           u64 = 120;
 pub const SYS_MUNMAP:         u64 = 121;
+pub const SYS_MMAP_PHYS:      u64 = 240;
 pub const SYS_RING_KICK:      u64 = 130;
 pub const SYS_GETPID:         u64 = 140;
 pub const SYS_GETPPID:        u64 = 141;
@@ -873,6 +874,28 @@ pub fn sethostname(s: &str) -> i32 {
 pub unsafe fn mmap(hint: usize, len: usize, flags: u32) -> *mut u8 {
     // SAFETY: SYS_MMAP signature: arg0 hint, arg1 len, arg2 flags.
     let r = unsafe { syscall3(SYS_MMAP, hint as u64, len as u64, flags as u64) };
+    if r == 0 || r == !0u64 {
+        core::ptr::null_mut()
+    } else {
+        r as *mut u8
+    }
+}
+
+/// Map a kernel-allowlisted phys range into userspace VA. The
+/// caller passes the (phys, len) the kernel has previously
+/// allow-listed (e.g. through narf-fb's per-process FbRing
+/// allocator). Returns the new VA, or `null_mut` on rejection
+/// (range not allowlisted, alignment violation, OOM).
+///
+/// # Safety
+/// `phys` and `len` must match an allowlist entry; the resulting
+/// VA aliases kernel-owned memory (a virtio-style shared ring).
+/// Concurrent kernel writers + this user mapping are the contract
+/// the ring's SPSC primitives uphold.
+#[inline]
+pub unsafe fn mmap_phys(phys: u64, len: usize, flags: u32) -> *mut u8 {
+    // SAFETY: SYS_MMAP_PHYS signature: arg0 phys, arg1 len, arg2 flags.
+    let r = unsafe { syscall3(SYS_MMAP_PHYS, phys, len as u64, flags as u64) };
     if r == 0 || r == !0u64 {
         core::ptr::null_mut()
     } else {

@@ -2187,6 +2187,45 @@ fn smoke_fb_client_drives_drain_to_pixel() -> TestResult {
 }
 kernel_test!(smoke_fb_client_drives_drain_to_pixel);
 
+fn smoke_mmap_phys_allowlist_lookup() -> TestResult {
+    use narf_userspace::mmap_phys::{
+        __reset_for_test, allow, lookup, revoke, MapPerms,
+    };
+    __reset_for_test();
+    // Reject pre-allow.
+    if lookup(0x10_0000, 4096).is_some() {
+        return TestResult::Fail("lookup hit before allow");
+    }
+    allow(0x10_0000, 8192, MapPerms::ReadWrite);
+    // Exact match wins.
+    let e = match lookup(0x10_0000, 4096) {
+        Some(e) => e,
+        None    => return TestResult::Fail("lookup miss after allow"),
+    };
+    if e.perms != MapPerms::ReadWrite {
+        return TestResult::Fail("perms mismatch");
+    }
+    // Sub-range still inside the entry.
+    if lookup(0x10_1000, 4096).is_none() {
+        return TestResult::Fail("sub-range missed");
+    }
+    // Out-of-range request rejected.
+    if lookup(0x10_0000, 16384).is_some() {
+        return TestResult::Fail("oversize request matched");
+    }
+    // Misaligned phys rejected.
+    if lookup(0x10_0001, 4096).is_some() {
+        return TestResult::Fail("misaligned matched");
+    }
+    revoke(0x10_0000, 8192);
+    if lookup(0x10_0000, 4096).is_some() {
+        return TestResult::Fail("post-revoke still matched");
+    }
+    __reset_for_test();
+    TestResult::Pass
+}
+kernel_test!(smoke_mmap_phys_allowlist_lookup);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_pte_pk_field() -> TestResult {
     use narf_memory::paging::PtFlags;
