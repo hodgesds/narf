@@ -10,6 +10,7 @@
 #![deny(missing_debug_implementations)]
 
 pub mod mmio;
+pub mod percpu;
 
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;

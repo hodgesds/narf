@@ -267,6 +267,39 @@ fn smoke_arch_mmio_round_trip() -> TestResult {
 }
 kernel_test!(smoke_arch_mmio_round_trip);
 
+fn smoke_arch_percpu_basic() -> TestResult {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_arch::percpu::{current_cpu_id, ThisCpu, MAX_CPUS};
+
+    narf_arch::per_cpu! {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+    }
+
+    // Pre-condition: BSP-only today.
+    if current_cpu_id() != 0 {
+        return TestResult::Fail("current_cpu_id should be 0 BSP-only");
+    }
+    if COUNTER.len() != MAX_CPUS {
+        return TestResult::Fail("array length != MAX_CPUS");
+    }
+    // this_cpu() returns the slot at index 0; mutate via it.
+    let prior = COUNTER.this_cpu().load(Ordering::Relaxed);
+    COUNTER.this_cpu().fetch_add(7, Ordering::Relaxed);
+    if COUNTER[0].load(Ordering::Relaxed) != prior + 7 {
+        return TestResult::Fail("this_cpu() didn't route to slot 0");
+    }
+    // Other slots untouched.
+    for i in 1..MAX_CPUS {
+        if COUNTER[i].load(Ordering::Relaxed) != 0 {
+            return TestResult::Fail("non-current slot was modified");
+        }
+    }
+    // Reset so re-runs are idempotent (no test ordering hazard).
+    COUNTER.this_cpu().store(prior, Ordering::Relaxed);
+    TestResult::Pass
+}
+kernel_test!(smoke_arch_percpu_basic);
+
 fn smoke_monotonic_advances() -> TestResult {
     let a = narf_time::now_cycles();
     for _ in 0..100_000 { core::hint::spin_loop(); }
