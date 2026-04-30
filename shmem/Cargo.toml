@@ -1,0 +1,23 @@
+[package]
+name         = "narf-shmem"
+description  = "Userspace-mappable shared-memory handles. One handle = one pid-owned, kernel-coherent region; mappable into the owning process's VA, attachable to FB / audio / future driver-side consumers; reaped on process exit."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_shmem"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../lib" }
+narf-capabilities = { path = "../capabilities" }
+narf-init         = { path = "../init" }
+narf-memory       = { path = "../memory" }
+narf-userspace    = { path = "../userspace" }
+narf-io           = { path = "../io" }
+
+[lints]
+workspace = true

@@ -626,6 +626,7 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-scheduler",
+ "narf-shmem",
  "narf-time",
  "narf-userspace",
  "narf-verification",
@@ -774,6 +775,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-shmem"
+version = "0.0.0"
+dependencies = [
+ "narf-capabilities",
+ "narf-init",
+ "narf-io",
+ "narf-lib",
+ "narf-memory",
+ "narf-userspace",
+]
+
+[[package]]
 name = "narf-time"
 version = "0.0.0"
 dependencies = [
@@ -848,6 +861,7 @@ dependencies = [
  "narf-power",
  "narf-rcu",
  "narf-scheduler",
+ "narf-shmem",
  "narf-time",
  "narf-tracing",
  "narf-userspace",

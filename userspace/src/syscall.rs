@@ -361,6 +361,27 @@ pub enum Syscall {
     /// graceful shutdown.
     FbDisconnect = 244,
 
+    /// Allocate a fresh shared-memory region. `arg0` = byte length
+    /// (rounded up to a page). Returns a non-zero `ShmemHandleId`
+    /// on success, 0 on OOM / oversize / no kernel support. The
+    /// region is page-aligned, zero-filled, and owned by the
+    /// calling process; auto-reaped on exit.
+    ShmemCreate  = 250,
+
+    /// Map a shmem region into the caller's VA. `arg0` =
+    /// `ShmemHandleId`. Returns the user VA (page-aligned) or 0 on
+    /// failure (bad handle, foreign owner, OOM). The mapping is RW
+    /// and contiguous in VA even though the backing frames are
+    /// scattered.
+    ShmemMap     = 251,
+
+    /// Tear down a shmem region. `arg0` = `ShmemHandleId`. The
+    /// userspace mapping stays installed for now (page-table
+    /// teardown lands when shmem grows a `Drop` path that walks
+    /// + unmaps the user VA range). Returns 0 on success, !0 on
+    /// bad handle / not-owner.
+    ShmemDestroy = 252,
+
     /// Kick the kernel-side dispatcher to drain the calling task's
     /// shared SubmissionRing and post Completions to the shared
     /// CompletionRing. Returns the number of submissions processed.
@@ -860,6 +881,9 @@ impl Syscall {
             242 => Syscall::FbRingMap,
             243 => Syscall::FbFlushWait,
             244 => Syscall::FbDisconnect,
+            250 => Syscall::ShmemCreate,
+            251 => Syscall::ShmemMap,
+            252 => Syscall::ShmemDestroy,
             _   => return None,
         })
     }

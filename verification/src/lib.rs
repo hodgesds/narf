@@ -2323,6 +2323,96 @@ fn smoke_fb_registry_connect_disconnect() -> TestResult {
 }
 kernel_test!(smoke_fb_registry_connect_disconnect);
 
+fn smoke_shmem_create_destroy_round_trip() -> TestResult {
+    use narf_shmem::{__reset_for_test, count, create, destroy, len_of, pid_of, phys_at};
+    __reset_for_test();
+    let pid_a = 9001u64;
+    // Single-page region.
+    let h1 = match create(pid_a, 4096) {
+        Ok(h)  => h,
+        Err(_) => return TestResult::Fail("create 4 KiB"),
+    };
+    if h1 == 0 { return TestResult::Fail("zero handle"); }
+    if len_of(h1) != Some(4096) {
+        return TestResult::Fail("len mismatch single page");
+    }
+    if pid_of(h1) != Some(pid_a) {
+        return TestResult::Fail("pid mismatch");
+    }
+    // Multi-page: 7 KiB rounds to 8 KiB (2 pages).
+    let h2 = match create(pid_a, 7000) {
+        Ok(h)  => h,
+        Err(_) => return TestResult::Fail("create 7000 bytes"),
+    };
+    if h1 == h2 { return TestResult::Fail("handles aliased"); }
+    if len_of(h2) != Some(8192) {
+        return TestResult::Fail("len roundup wrong");
+    }
+    // phys_at must straddle pages cleanly: phys at +0 and +4096
+    // are different (different frames) but at +0 and +1 are
+    // contiguous (same frame).
+    let p0    = phys_at(h2, 0).expect("phys 0");
+    let p1    = phys_at(h2, 1).expect("phys 1");
+    let p4096 = phys_at(h2, 4096).expect("phys 4096");
+    if p1 != p0 + 1 {
+        return TestResult::Fail("phys_at intra-page math wrong");
+    }
+    if p4096 == p0 + 4096 {
+        // Frame allocator rarely returns contiguous pages — this
+        // would be a real (but unlikely) coincidence; the smoke
+        // is structural so don't flake on it.
+    }
+    // Out-of-range offset rejected.
+    if phys_at(h2, 8192).is_some() {
+        return TestResult::Fail("phys_at past end accepted");
+    }
+    // 0-len rejected.
+    if create(pid_a, 0).is_ok() {
+        return TestResult::Fail("0-len should reject");
+    }
+    if count() != 2 { return TestResult::Fail("count mismatch"); }
+    if !destroy(h1) { return TestResult::Fail("destroy h1"); }
+    if destroy(h1)  { return TestResult::Fail("double-destroy succeeded"); }
+    if count() != 1 { return TestResult::Fail("count after destroy"); }
+    if !destroy(h2) { return TestResult::Fail("destroy h2"); }
+    if count() != 0 { return TestResult::Fail("count after both destroys"); }
+    __reset_for_test();
+    TestResult::Pass
+}
+kernel_test!(smoke_shmem_create_destroy_round_trip);
+
+fn smoke_shmem_exit_observer_reaps_handles() -> TestResult {
+    // Mirrors the fb exit-observer smoke. notify_task_exited(pid)
+    // must reap every shmem region the dying pid owned.
+    use narf_shmem::{__reset_for_test, count, create, destroy_all_for_pid};
+    use narf_userspace::user_task::{
+        __test_clear_exit_observers, register_exit_observer, notify_task_exited,
+    };
+    __reset_for_test();
+    __test_clear_exit_observers();
+    register_exit_observer(|pid| {
+        let _ = destroy_all_for_pid(pid);
+    });
+    let pid_dies  = 9101u64;
+    let pid_keeps = 9102u64;
+    let _ = create(pid_dies,  4096).expect("h1");
+    let _ = create(pid_dies,  4096).expect("h2");
+    let _ = create(pid_keeps, 4096).expect("h3");
+    if count() != 3 { return TestResult::Fail("setup"); }
+    notify_task_exited(pid_dies);
+    if count() != 1 {
+        return TestResult::Fail("observer didn't reap dying pid's shmem");
+    }
+    notify_task_exited(pid_keeps);
+    if count() != 0 {
+        return TestResult::Fail("survivor not reaped on its own exit");
+    }
+    __reset_for_test();
+    __test_clear_exit_observers();
+    TestResult::Pass
+}
+kernel_test!(smoke_shmem_exit_observer_reaps_handles);
+
 fn smoke_fb_exit_observer_reaps_handles() -> TestResult {
     // Process-exit cleanup: when notify_task_exited fires for a
     // pid, every FB connection that pid holds disappears. Sets up
@@ -15829,6 +15919,9 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
     // we wire the vtable here directly.
     narf_userspace::handlers::install_fb_syscall_vtable(
         narf_fb::registry::syscall_vtable(),
+    );
+    narf_userspace::handlers::install_shmem_syscall_vtable(
+        narf_shmem::syscall_vtable(),
     );
 
     // Snapshot CR3 for restore post-unwind.

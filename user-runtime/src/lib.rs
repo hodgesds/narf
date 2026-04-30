@@ -28,6 +28,7 @@
 use core::fmt;
 
 pub mod graphics;
+pub mod shmem;
 
 // ── Syscall numbers ────────────────────────────────────────────────
 //
@@ -63,6 +64,9 @@ pub const SYS_FB_INFO:        u64 = 241;
 pub const SYS_FB_RING_MAP:    u64 = 242;
 pub const SYS_FB_FLUSH_WAIT:  u64 = 243;
 pub const SYS_FB_DISCONNECT:  u64 = 244;
+pub const SYS_SHMEM_CREATE:   u64 = 250;
+pub const SYS_SHMEM_MAP:      u64 = 251;
+pub const SYS_SHMEM_DESTROY:  u64 = 252;
 pub const SYS_RING_KICK:      u64 = 130;
 pub const SYS_GETPID:         u64 = 140;
 pub const SYS_GETPPID:        u64 = 141;

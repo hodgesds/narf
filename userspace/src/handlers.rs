@@ -2342,6 +2342,125 @@ fn sys_fb_disconnect(ctx: &mut dyn TrapContext) {
     }
 }
 
+// ── Shmem syscalls ─────────────────────────────────────────────────
+//
+// Three syscalls (Create / Map / Destroy) form the shared-memory
+// surface. The narf-shmem crate installs a vtable here at boot;
+// without it, all three calls return InvalidOp.
+
+#[derive(Copy, Clone)]
+pub struct ShmemSyscallVtable {
+    pub create:  fn(pid: u64, len: u64) -> u64,
+    pub len_of:  fn(handle: u64) -> u64,
+    pub frames:  fn(handle: u64, out: &mut alloc::vec::Vec<u64>) -> bool,
+    pub destroy: fn(handle: u64) -> bool,
+    pub pid_of:  fn(handle: u64) -> u64,
+}
+
+impl core::fmt::Debug for ShmemSyscallVtable {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ShmemSyscallVtable").finish_non_exhaustive()
+    }
+}
+
+static SHMEM_VTABLE: core::sync::atomic::AtomicPtr<ShmemSyscallVtable> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+pub fn install_shmem_syscall_vtable(v: &'static ShmemSyscallVtable) {
+    SHMEM_VTABLE.store(
+        v as *const ShmemSyscallVtable as *mut ShmemSyscallVtable,
+        core::sync::atomic::Ordering::Release,
+    );
+}
+
+fn shmem_vtable() -> Option<&'static ShmemSyscallVtable> {
+    let p = SHMEM_VTABLE.load(core::sync::atomic::Ordering::Acquire);
+    if p.is_null() { None } else {
+        // SAFETY: install_shmem_syscall_vtable requires a 'static input.
+        Some(unsafe { &*p })
+    }
+}
+
+fn sys_shmem_create(ctx: &mut dyn TrapContext) {
+    let len = ctx.args().arg0;
+    let v = match shmem_vtable() {
+        Some(v) => v,
+        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+    };
+    let pid = current_task_id();
+    let h = (v.create)(pid, len);
+    if h == 0 {
+        ctx.set_return(SyscallReturn::invalid_op());
+    } else {
+        ctx.set_return(SyscallReturn::ok(h));
+    }
+}
+
+fn sys_shmem_map(ctx: &mut dyn TrapContext) {
+    let handle = ctx.args().arg0;
+    let v = match shmem_vtable() {
+        Some(v) => v,
+        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+    };
+    // Cross-pid auth: the calling task must own this region. The
+    // future cross-process sharing path adds an explicit grant /
+    // attach syscall; today, foreign maps are rejected outright.
+    let pid = current_task_id();
+    if (v.pid_of)(handle) != pid {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    let len = (v.len_of)(handle);
+    if len == 0 {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    let mut frames_raw: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    if !(v.frames)(handle, &mut frames_raw) {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    let as_ref = match current_address_space() {
+        Some(a) => a,
+        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+    };
+    let phys_list: alloc::vec::Vec<narf_memory::PhysAddr> =
+        frames_raw.into_iter().map(narf_memory::PhysAddr::new).collect();
+    let base = MMAP_CURSOR.fetch_add(len, Ordering::Relaxed);
+    if as_ref.map_region(Region {
+        base:  VirtAddr::new(base),
+        len,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys:  phys_list,
+    }).is_err() {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    if unsafe { as_ref.materialize() }.is_err() {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    ctx.set_return(SyscallReturn::ok(base));
+}
+
+fn sys_shmem_destroy(ctx: &mut dyn TrapContext) {
+    let handle = ctx.args().arg0;
+    let v = match shmem_vtable() {
+        Some(v) => v,
+        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+    };
+    let pid = current_task_id();
+    if (v.pid_of)(handle) != pid {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    if (v.destroy)(handle) {
+        ctx.set_return(SyscallReturn::ok(0));
+    } else {
+        ctx.set_return(SyscallReturn::invalid_op());
+    }
+}
+
 // ── Munmap — arg0=base ─────────────────────────────────────────────
 
 fn sys_munmap(ctx: &mut dyn TrapContext) {
@@ -4295,6 +4414,9 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::FbRingMap,    "fb_ring_map",    RawFnHandler(sys_fb_ring_map));
     table.install_raw(Syscall::FbFlushWait,  "fb_flush_wait",  RawFnHandler(sys_fb_flush_wait));
     table.install_raw(Syscall::FbDisconnect, "fb_disconnect",  RawFnHandler(sys_fb_disconnect));
+    table.install_raw(Syscall::ShmemCreate,  "shmem_create",   RawFnHandler(sys_shmem_create));
+    table.install_raw(Syscall::ShmemMap,     "shmem_map",      RawFnHandler(sys_shmem_map));
+    table.install_raw(Syscall::ShmemDestroy, "shmem_destroy",  RawFnHandler(sys_shmem_destroy));
     table.install_raw(Syscall::RingKick, "ringkick", RawFnHandler(sys_ring_kick));
     table.install_raw(Syscall::GetPid,   "getpid",   RawFnHandler(sys_getpid));
     table.install_raw(Syscall::GetPpid,  "getppid",  RawFnHandler(sys_getppid));
