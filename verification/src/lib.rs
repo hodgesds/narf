@@ -9783,11 +9783,6 @@ fn smoke_virtio_snd_pci_probe() -> TestResult {
     if !snd_pci::is_probed() {
         return TestResult::Fail("snd probe didn't install controller");
     }
-    // QEMU virtio-sound only advertises non-zero jack/stream/chmap
-    // counts when an audiodev with a real backend is wired in; with
-    // `audiodev=none` the device negotiates the surface but exposes
-    // 0/0/0. We just confirm topology() returns Some — the probe
-    // path read the device-cfg without trapping.
     if snd_pci::topology().is_none() {
         return TestResult::Fail("topology missing after probe");
     }
@@ -9815,6 +9810,56 @@ fn smoke_audio_picker_no_backend_when_unprobed() -> TestResult {
     }
 }
 kernel_test!(smoke_audio_picker_no_backend_when_unprobed);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_audio_writer_submit_round_trip() -> TestResult {
+    // End-to-end PCM submit through AudioWriter → snd_pci. Probes
+    // the device, opens an AudioWriter at the default playback
+    // format (S16LE / 48 kHz / stereo), and submits 1024 bytes
+    // (256 stereo frames). The QEMU `audiodev=none` backend acks
+    // the buffer immediately so the smoke completes deterministically.
+    use narf_audio::{
+        bootstrap_writer, AudioFormat, AudioWriter,
+    };
+    use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
+    use narf_bus::driver_match::__reset_for_test as bus_reset;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_drivers_virtio::snd_pci;
+
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let has = devs.iter().any(|d|
+        matches!(&d.kind, BusKind::Pcie { .. })
+        && d.id.vendor == snd_pci::VIRTIO_SND_PCI_VENDOR
+        && d.id.device == snd_pci::VIRTIO_SND_PCI_DEVICE);
+    if !has { return TestResult::Skip("no virtio-snd-pci"); }
+    snd_pci::__reset_for_test();
+    bus_reset();
+    snd_pci::register_pci_driver();
+    let authority = bootstrap_registry_authority();
+    if probe_all_pci(&authority).is_err() {
+        return TestResult::Fail("probe_all_pci");
+    }
+
+    let cap = bootstrap_writer();
+    let writer = match AudioWriter::open(cap, AudioFormat::default_playback()) {
+        Ok(w)  => w,
+        Err(_) => return TestResult::Fail("AudioWriter::open"),
+    };
+
+    // 1024 bytes = 256 stereo S16 frames = ~5.3 ms @ 48 kHz.
+    let silence = [0u8; 1024];
+    let frames = match writer.submit(&silence) {
+        Ok(f)  => f,
+        Err(_) => return TestResult::Fail("submit returned error"),
+    };
+    if frames != 256 {
+        return TestResult::Fail("submit returned wrong frame count");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_audio_writer_submit_round_trip);
 
 fn smoke_audio_format_unsupported_rate_rejects() -> TestResult {
     use narf_audio::{

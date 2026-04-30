@@ -203,18 +203,46 @@ impl AudioWriter {
             .map_err(|_| AudioWriteError::StreamClosed)
     }
 
-    /// Submit a buffer of PCM frames for playback. Returns the
-    /// frame id assigned by the backend, or an error.
+    /// Submit a buffer of PCM frames for playback. Blocks until the
+    /// backend acks the buffer; returns the cumulative frame count
+    /// played (today: synthesised from the byte count, since the
+    /// virtio-sound device doesn't expose a frame counter directly).
     ///
-    /// Stage-4 stub: returns `NoActiveStream` until snd_pci's tx
-    /// virtqueue lands. The signature is the contract callers
-    /// build against; the body lights up when the data plane does.
-    pub fn submit(&self, _pcm: &[u8]) -> Result<u64, AudioWriteError> {
+    /// `pcm.len()` must be a non-zero multiple of `format.bytes_per_frame()`.
+    pub fn submit(&self, pcm: &[u8]) -> Result<u64, AudioWriteError> {
         self.check_live()?;
-        // Until snd_pci grows submit_pcm, every submission errors
-        // out. Callers can still wire their submit-loop scaffolding
-        // and gate the actual playback on the capability landing.
-        Err(AudioWriteError::NoActiveStream)
+        let bpf = self.format.bytes_per_frame() as usize;
+        if pcm.is_empty() || bpf == 0 || pcm.len() % bpf != 0 {
+            return Err(AudioWriteError::UnsupportedFormat);
+        }
+        // Translate AudioFormat → virtio-sound spec codes. Stage-4
+        // baseline only knows about S16LE @ 44.1/48 kHz; supports()
+        // already gated on these.
+        use narf_drivers_virtio::snd_pci::{
+            self, PcmParams, VIRTIO_SND_PCM_FMT_S16,
+            VIRTIO_SND_PCM_RATE_44100, VIRTIO_SND_PCM_RATE_48000,
+        };
+        let rate_code = match self.format.sample_rate_hz {
+            44_100 => VIRTIO_SND_PCM_RATE_44100,
+            48_000 => VIRTIO_SND_PCM_RATE_48000,
+            _ => return Err(AudioWriteError::UnsupportedFormat),
+        };
+        let format_code = match self.format.format {
+            SampleFormat::S16Le => VIRTIO_SND_PCM_FMT_S16,
+            // F32Le not on the supports() list yet; rejecting here
+            // so a fmt that snuck past becomes a clean error.
+            SampleFormat::F32Le => return Err(AudioWriteError::UnsupportedFormat),
+        };
+        let params = PcmParams {
+            buffer_bytes: 8192,
+            period_bytes: 2048,
+            channels:     self.format.channels as u8,
+            format:       format_code,
+            rate:         rate_code,
+        };
+        snd_pci::play_buffer(params, pcm)
+            .map_err(|_| AudioWriteError::StreamClosed)?;
+        Ok((pcm.len() / bpf) as u64)
     }
 }
 

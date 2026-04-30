@@ -18,6 +18,8 @@
 //! audio crate the "is_probed + topology snapshot" surface it needs
 //! to advertise a stream.
 
+use core::sync::atomic::{compiler_fence, Ordering};
+
 use narf_bus::{BusDevice, BusDeviceCap};
 use narf_capabilities::{Cap, Write};
 use narf_io::{alloc_coherent, DmaBuffer};
@@ -25,17 +27,37 @@ use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::pci::{
-    discover, map_cap, VirtioCaps, VirtioPciError,
+    discover, map_cap, VirtioCaps, VirtioPciError, VirtioRegion,
     CC_DEVICE_FEATURE, CC_DEVICE_FEATURE_SELECT, CC_DEVICE_STATUS,
     CC_DRIVER_FEATURE, CC_DRIVER_FEATURE_SELECT,
     CC_QUEUE_DESC, CC_QUEUE_DEVICE, CC_QUEUE_DRIVER, CC_QUEUE_ENABLE,
     CC_QUEUE_NOTIFY_OFF, CC_QUEUE_SELECT, CC_QUEUE_SIZE,
 };
-use crate::queue::{Virtqueue, VirtqueueLayout};
+use crate::queue::{Virtqueue, VirtqueueLayout, VirtqDesc, VIRTQ_DESC_F_WRITE};
 use crate::{
     VIRTIO_F_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER,
     VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FEATURES_OK,
 };
+
+// ── Spec constants (VirtIO 1.2 §5.14.6) ─────────────────────────────
+
+const VIRTIO_SND_R_PCM_SET_PARAMS: u32 = 0x0101;
+const VIRTIO_SND_R_PCM_PREPARE:    u32 = 0x0102;
+const VIRTIO_SND_R_PCM_RELEASE:    u32 = 0x0103;
+const VIRTIO_SND_R_PCM_START:      u32 = 0x0104;
+#[allow(dead_code)]
+const VIRTIO_SND_R_PCM_STOP:       u32 = 0x0105;
+
+const VIRTIO_SND_S_OK: u32 = 0x8000;
+
+// virtio_snd_pcm_fmt (VirtIO 1.2 §5.14.6.6.3.1.1).
+// IMA_ADPCM=0, MU_LAW=1, A_LAW=2, S8=3, U8=4, S16=5, U16=6, ...
+pub const VIRTIO_SND_PCM_FMT_S16: u8 = 5;
+
+// virtio_snd_pcm_rate (VirtIO 1.2 §5.14.6.6.3.1.2).
+// 5512=0, 8000=1, 11025=2, 16000=3, 22050=4, 32000=5, 44100=6, 48000=7, ...
+pub const VIRTIO_SND_PCM_RATE_44100: u8 = 6;
+pub const VIRTIO_SND_PCM_RATE_48000: u8 = 7;
 
 pub const VIRTIO_SND_PCI_VENDOR: u16 = 0x1AF4;
 pub const VIRTIO_SND_PCI_DEVICE: u16 = 0x1059;
@@ -61,6 +83,26 @@ pub struct VirtioSoundPci {
     _q_buf_event:   DmaBuffer,
     _q_buf_tx:      DmaBuffer,
     _q_buf_rx:      DmaBuffer,
+    /// Notify region + per-queue notify offsets, captured at probe.
+    /// Writing a 2-byte 0 to `notify.virt + notify_off_mul *
+    /// queue_notify_off[i]` kicks queue `i`.
+    notify:                VirtioRegion,
+    notify_off_multiplier: u32,
+    queue_notify_off:      [u16; 4],
+    /// Scratch DMA region for synchronous control-vq round-trips.
+    /// Big enough for `virtio_snd_pcm_set_params` (24 B) + the
+    /// response (4 B); we lay them out at +0 and +64 so the
+    /// device-write-back doesn't stomp the request mid-flight.
+    ctrl_buf: DmaBuffer,
+    /// Scratch DMA region for tx-vq submissions: header (8 B at
+    /// +0) + payload (up to 4032 B at +64) + status (8 B at
+    /// +4088). One outstanding submission at a time today; a
+    /// pool lands when the user-facing surface needs concurrency.
+    tx_buf: DmaBuffer,
+    /// Tracks whether the playback stream (id 0) is in the
+    /// STARTED state. set_params + prepare + start are
+    /// idempotent on first play; subsequent plays skip them.
+    started: IrqSafeSpinLock<bool>,
     pub cfg:   VirtioSndConfig,
     pub ready: bool,
 }
@@ -135,13 +177,20 @@ impl VirtioSoundPci {
             }
         };
 
+        // Map the notify cap and capture its multiplier — needed
+        // to kick queues after submission.
+        // SAFETY: caller-owned device.
+        let notify = unsafe { map_cap(device, &caps.notify) }?;
+        let notify_off_multiplier = caps.notify.notify_off_multiplier;
+        let mut queue_notify_off = [0u16; 4];
+
         // Set up four virtqueues: 0=control, 1=event, 2=tx, 3=rx.
         // Each gets a 4 KiB coherent buffer for descriptor + ring
         // storage. Stage-4: queue depth 4 per queue — virtio-sound
         // spec's minimum + matches balloon's stub footprint. Real
         // playback wants tx depth 32+, but that's a tx-data-plane
-        // concern that lands with submit_pcm.
-        let setup_q = |idx: u16| -> Result<(VirtqueueLayout, DmaBuffer), VirtioPciError> {
+        // concern that lands with the unified DmaBuffer surface.
+        let mut setup_q = |idx: u16| -> Result<(VirtqueueLayout, DmaBuffer), VirtioPciError> {
             // SAFETY: identity-mapped MMIO.
             let qmax = unsafe {
                 common.write16(CC_QUEUE_SELECT, idx);
@@ -162,15 +211,23 @@ impl VirtioSoundPci {
                 common.write16(crate::pci::CC_QUEUE_MSIX_VECTOR, 0xFFFF);
                 common.write16(CC_QUEUE_ENABLE, 1);
             }
-            // queue_notify_off captured but unused at probe time.
             // SAFETY: same.
-            let _ = unsafe { common.read16(CC_QUEUE_NOTIFY_OFF) };
+            let off = unsafe { common.read16(CC_QUEUE_NOTIFY_OFF) };
+            queue_notify_off[idx as usize] = off;
             Ok((layout, buf))
         };
         let (ctrl_layout, ctrl_buf)  = setup_q(0)?;
         let (event_layout, event_buf) = setup_q(1)?;
         let (tx_layout, tx_buf)       = setup_q(2)?;
         let (rx_layout, rx_buf)       = setup_q(3)?;
+
+        // Scratch DMA buffers for ctrl + tx round-trips. Allocated
+        // once at probe so submissions don't allocate on the hot
+        // path.
+        let ctrl_scratch = alloc_coherent(4096, DomainId::DRIVER_0)
+            .map_err(|_| VirtioPciError::BarMapFailed)?;
+        let tx_scratch = alloc_coherent(4096, DomainId::DRIVER_0)
+            .map_err(|_| VirtioPciError::BarMapFailed)?;
 
         // DRIVER_OK.
         // SAFETY: same.
@@ -197,9 +254,235 @@ impl VirtioSoundPci {
             _q_buf_event:   event_buf,
             _q_buf_tx:      tx_buf,
             _q_buf_rx:      rx_buf,
+            notify, notify_off_multiplier, queue_notify_off,
+            ctrl_buf: ctrl_scratch,
+            tx_buf:   tx_scratch,
+            started:  IrqSafeSpinLock::new(false),
             cfg,
             ready: true,
         })
+    }
+
+    /// Submit a request to the control vq + poll for the response.
+    /// `req` is copied into the ctrl scratch buffer at offset 0;
+    /// the device writes its `virtio_snd_hdr { u32 status }` at
+    /// offset 64. Returns the response status code.
+    fn ctrl_request(&self, req: &[u8]) -> Result<u32, VirtioPciError> {
+        if req.len() > 60 {
+            return Err(VirtioPciError::QueueTooSmall);
+        }
+        let req_phys = self.ctrl_buf.phys_addr().raw();
+        let resp_phys = req_phys + 64;
+        // SAFETY: identity-mapped DMA.
+        unsafe {
+            for (i, b) in req.iter().enumerate() {
+                core::ptr::write_volatile((req_phys + i as u64) as *mut u8, *b);
+            }
+            // Pre-clear the response slot so we can detect a
+            // device that didn't write anything.
+            core::ptr::write_volatile(resp_phys as *mut u32, 0xFFFF_FFFF);
+        }
+        let descs = [
+            VirtqDesc { addr: req_phys,  len: req.len() as u32, flags: 0,                  next: 0 },
+            VirtqDesc { addr: resp_phys, len: 4,                flags: VIRTQ_DESC_F_WRITE, next: 0 },
+        ];
+        let head = {
+            let mut g = self.control_q.lock();
+            let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
+            q.add_buffer(&descs).ok_or(VirtioPciError::QueueTooSmall)?
+        };
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: identity-mapped notify region.
+        unsafe {
+            self.notify.write16(
+                self.notify_off_multiplier as u64
+                    * self.queue_notify_off[0] as u64,
+                0,
+            );
+        }
+        // Poll used ring for the matching head, bounded.
+        let mut spins = 0u32;
+        loop {
+            let elem = {
+                let mut g = self.control_q.lock();
+                let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
+                q.poll_used()
+            };
+            match elem {
+                Some((id, _)) if id == head as u32 => break,
+                Some(_) => continue,
+                None => {
+                    spins += 1;
+                    if spins > 10_000_000 {
+                        let mut g = self.control_q.lock();
+                        if let Some(q) = g.as_mut() { q.free_chain(head); }
+                        return Err(VirtioPciError::QueueTooSmall);
+                    }
+                    core::hint::spin_loop();
+                }
+            }
+        }
+        // SAFETY: identity-mapped DMA.
+        let status = unsafe { core::ptr::read_volatile(resp_phys as *const u32) };
+        let mut g = self.control_q.lock();
+        if let Some(q) = g.as_mut() { q.free_chain(head); }
+        Ok(status)
+    }
+
+    /// Run SET_PARAMS + PREPARE + START on stream id 0 if not
+    /// already started. Idempotent.
+    fn ensure_started(
+        &self,
+        params: PcmParams,
+    ) -> Result<(), VirtioPciError> {
+        let mut started = self.started.lock();
+        if *started { return Ok(()); }
+
+        // SET_PARAMS request: virtio_snd_pcm_set_params layout.
+        //   +0  hdr.code (u32)        = VIRTIO_SND_R_PCM_SET_PARAMS
+        //   +4  hdr.stream_id (u32)   = 0
+        //   +8  buffer_bytes (u32)
+        //   +12 period_bytes (u32)
+        //   +16 features (u32)        = 0
+        //   +20 channels (u8)
+        //   +21 format (u8)
+        //   +22 rate (u8)
+        //   +23 padding (u8)
+        let mut req = [0u8; 24];
+        req[0..4].copy_from_slice(&VIRTIO_SND_R_PCM_SET_PARAMS.to_le_bytes());
+        req[4..8].copy_from_slice(&0u32.to_le_bytes());
+        req[8..12].copy_from_slice(&params.buffer_bytes.to_le_bytes());
+        req[12..16].copy_from_slice(&params.period_bytes.to_le_bytes());
+        req[16..20].copy_from_slice(&0u32.to_le_bytes());
+        req[20] = params.channels;
+        req[21] = params.format;
+        req[22] = params.rate;
+        let s = self.ctrl_request(&req)?;
+        if s != VIRTIO_SND_S_OK { return Err(VirtioPciError::DeviceRejectedFeatures); }
+
+        // PREPARE: virtio_snd_pcm_hdr { code, stream_id }.
+        let mut req = [0u8; 8];
+        req[0..4].copy_from_slice(&VIRTIO_SND_R_PCM_PREPARE.to_le_bytes());
+        req[4..8].copy_from_slice(&0u32.to_le_bytes());
+        let s = self.ctrl_request(&req)?;
+        if s != VIRTIO_SND_S_OK { return Err(VirtioPciError::DeviceRejectedFeatures); }
+
+        // START.
+        let mut req = [0u8; 8];
+        req[0..4].copy_from_slice(&VIRTIO_SND_R_PCM_START.to_le_bytes());
+        req[4..8].copy_from_slice(&0u32.to_le_bytes());
+        let s = self.ctrl_request(&req)?;
+        if s != VIRTIO_SND_S_OK { return Err(VirtioPciError::DeviceRejectedFeatures); }
+
+        *started = true;
+        Ok(())
+    }
+
+    /// Submit one PCM buffer for playback on stream 0. Blocks
+    /// until the device acks via the tx vq used ring.
+    pub fn play_buffer(
+        &self,
+        params: PcmParams,
+        pcm:    &[u8],
+    ) -> Result<(), VirtioPciError> {
+        if pcm.len() > 4032 {
+            // The 4 KiB tx scratch holds the 8-byte header + the
+            // payload + an 8-byte status. Larger buffers chain
+            // multiple submissions; the unified DmaBuffer surface
+            // will lift this when it lands.
+            return Err(VirtioPciError::QueueTooSmall);
+        }
+        self.ensure_started(params)?;
+
+        let base = self.tx_buf.phys_addr().raw();
+        let hdr_phys     = base;          // 8 bytes
+        let payload_phys = base + 64;     // up to 4032 bytes
+        let status_phys  = base + 4088;   // 8 bytes
+
+        // SAFETY: identity-mapped DMA.
+        unsafe {
+            // virtio_snd_pcm_xfer { u32 stream_id, u32 padding }
+            core::ptr::write_volatile(hdr_phys      as *mut u32, 0u32);
+            core::ptr::write_volatile((hdr_phys+4)  as *mut u32, 0u32);
+            for (i, b) in pcm.iter().enumerate() {
+                core::ptr::write_volatile((payload_phys + i as u64) as *mut u8, *b);
+            }
+            // Pre-clear status to detect non-write-back.
+            core::ptr::write_volatile(status_phys     as *mut u32, 0xFFFF_FFFF);
+            core::ptr::write_volatile((status_phys+4) as *mut u32, 0u32);
+        }
+        let descs = [
+            VirtqDesc { addr: hdr_phys,     len: 8,                  flags: 0,                  next: 0 },
+            VirtqDesc { addr: payload_phys, len: pcm.len() as u32,   flags: 0,                  next: 0 },
+            VirtqDesc { addr: status_phys,  len: 8,                  flags: VIRTQ_DESC_F_WRITE, next: 0 },
+        ];
+        let head = {
+            let mut g = self.tx_q.lock();
+            let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
+            q.add_buffer(&descs).ok_or(VirtioPciError::QueueTooSmall)?
+        };
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: identity-mapped notify region.
+        unsafe {
+            self.notify.write16(
+                self.notify_off_multiplier as u64
+                    * self.queue_notify_off[2] as u64,
+                2,
+            );
+        }
+        let mut spins = 0u32;
+        loop {
+            let elem = {
+                let mut g = self.tx_q.lock();
+                let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
+                q.poll_used()
+            };
+            match elem {
+                Some((id, _)) if id == head as u32 => break,
+                Some(_) => continue,
+                None => {
+                    spins += 1;
+                    if spins > 10_000_000 {
+                        let mut g = self.tx_q.lock();
+                        if let Some(q) = g.as_mut() { q.free_chain(head); }
+                        return Err(VirtioPciError::QueueTooSmall);
+                    }
+                    core::hint::spin_loop();
+                }
+            }
+        }
+        // SAFETY: identity-mapped DMA.
+        let status = unsafe { core::ptr::read_volatile(status_phys as *const u32) };
+        let mut g = self.tx_q.lock();
+        if let Some(q) = g.as_mut() { q.free_chain(head); }
+        if status != VIRTIO_SND_S_OK {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        Ok(())
+    }
+}
+
+/// PCM stream parameters.
+#[derive(Copy, Clone, Debug)]
+pub struct PcmParams {
+    pub buffer_bytes: u32,
+    pub period_bytes: u32,
+    pub channels:     u8,
+    pub format:       u8,
+    pub rate:         u8,
+}
+
+impl PcmParams {
+    /// Stage-4 default: 8 KiB ring, 2 KiB period, S16LE @ 48 kHz
+    /// stereo. Matches `narf_audio::AudioFormat::default_playback`.
+    pub const fn default_playback() -> Self {
+        Self {
+            buffer_bytes: 8192,
+            period_bytes: 2048,
+            channels:     2,
+            format:       VIRTIO_SND_PCM_FMT_S16,
+            rate:         VIRTIO_SND_PCM_RATE_48000,
+        }
     }
 }
 
@@ -251,6 +534,18 @@ pub fn is_probed() -> bool { CONTROLLER.lock().is_some() }
 pub fn topology() -> Option<(u32, u32, u32)> {
     CONTROLLER.lock().as_ref()
         .map(|c| (c.cfg.jacks, c.cfg.streams, c.cfg.chmaps))
+}
+
+/// Submit one PCM buffer through the probed virtio-sound device's
+/// stream 0. Blocks until the device acks. Returns `NotImplemented`
+/// (mapped to caller's error vocabulary) if no controller is up.
+pub fn play_buffer(
+    params: PcmParams,
+    pcm:    &[u8],
+) -> Result<(), VirtioPciError> {
+    let g = CONTROLLER.lock();
+    let c = g.as_ref().ok_or(VirtioPciError::NoQueues)?;
+    c.play_buffer(params, pcm)
 }
 
 #[doc(hidden)]
