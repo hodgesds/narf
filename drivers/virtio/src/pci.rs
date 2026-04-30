@@ -297,6 +297,16 @@ pub unsafe fn map_cap(
     let bar_phys_pg = region.phys.raw() & !0xFFFu64;
     let bar_end     = (region.phys.raw() + region.len + 0xFFF) & !0xFFFu64;
     let bar_len_pg  = bar_end - bar_phys_pg;
+    // Reject zero-phys BARs — happens on aarch64 today because
+    // QEMU virt + `-kernel` means no firmware assigned the BARs.
+    // Until a kernel-side BAR allocator runs during PCIe
+    // enumeration, virtio devices on aarch64 will return BAR=0
+    // and we can't map a real window. Without this check ioremap
+    // would happily map phys 0 (low RAM!) and reads would
+    // succeed but return wrong data.
+    if bar_phys_pg == 0 {
+        return Err(VirtioPciError::BarMapFailed);
+    }
     // SAFETY: caller owns the BAR window; we map in kernel VA
     // space using strongly-uncached attributes for MMIO.
     let mapping = unsafe {

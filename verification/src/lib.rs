@@ -2444,6 +2444,49 @@ fn smoke_fb_e2e_via_test_scanout() -> TestResult {
 }
 kernel_test!(smoke_fb_e2e_via_test_scanout);
 
+fn smoke_ioremap_direct_round_trip() -> TestResult {
+    // Allocate a frame, scribble a sentinel through the identity
+    // map, ioremap it as WriteBack-cached memory, read the
+    // sentinel back through the new VA. Tests that the ioremap
+    // actually produces a working mapping.
+    use narf_memory::ioremap::{self, MmioAttrs};
+    use narf_memory::frame::alloc_frame;
+    use core::sync::atomic::{compiler_fence, Ordering};
+
+    let frame = match alloc_frame() {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("alloc_frame"),
+    };
+    let phys = frame.start_address().raw();
+    const SENTINEL: u64 = 0xCAFE_BABE_DEAD_BEEF;
+    // SAFETY: identity-mapped low-RAM frame; we own it.
+    unsafe {
+        core::ptr::write_volatile(phys as *mut u64, SENTINEL);
+    }
+    compiler_fence(Ordering::SeqCst);
+
+    // SAFETY: phys is a frame we just got from alloc_frame.
+    let m = match unsafe { ioremap::ioremap(phys, 4096, MmioAttrs::WriteBack) } {
+        Ok(m)  => m,
+        Err(_) => return TestResult::Fail("ioremap returned err"),
+    };
+    if m.virt == 0 {
+        // SAFETY: m came from ioremap, but virt is invalid.
+        unsafe { ioremap::iounmap(m); }
+        return TestResult::Fail("ioremap returned virt=0");
+    }
+    // SAFETY: ioremap's contract guarantees the VA is now mapped.
+    let v = unsafe { core::ptr::read_volatile(m.virt as *const u64) };
+    let ok = v == SENTINEL;
+    // SAFETY: paired with ioremap.
+    unsafe { ioremap::iounmap(m); }
+    if !ok {
+        return TestResult::Fail("ioremap'd VA didn't read back the sentinel");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_ioremap_direct_round_trip);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_pte_pk_field() -> TestResult {
     use narf_memory::paging::PtFlags;
