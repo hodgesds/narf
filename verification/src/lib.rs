@@ -9951,6 +9951,80 @@ fn smoke_audio_writer_submit_round_trip() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_audio_writer_submit_round_trip);
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_audio_submit_shmem_zero_copy() -> TestResult {
+    // End-to-end zero-copy submit: allocate a Shmem region, fill
+    // it with silence via the kernel-side phys_at, and submit
+    // through AudioWriter::submit_shmem. The tx descriptor points
+    // directly at the Shmem-backed phys; no intermediate copy
+    // through snd_pci's scratch.
+    use narf_audio::{bootstrap_writer, AudioFormat, AudioWriter};
+    use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
+    use narf_bus::driver_match::__reset_for_test as bus_reset;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_drivers_virtio::snd_pci;
+    use narf_shmem::{__reset_for_test as shmem_reset, create as shmem_create, phys_at};
+
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let has = devs.iter().any(|d|
+        matches!(&d.kind, BusKind::Pcie { .. })
+        && d.id.vendor == snd_pci::VIRTIO_SND_PCI_VENDOR
+        && d.id.device == snd_pci::VIRTIO_SND_PCI_DEVICE);
+    if !has { return TestResult::Skip("no virtio-snd-pci"); }
+    snd_pci::__reset_for_test();
+    bus_reset();
+    snd_pci::register_pci_driver();
+    let authority = bootstrap_registry_authority();
+    if probe_all_pci(&authority).is_err() {
+        return TestResult::Fail("probe_all_pci");
+    }
+
+    shmem_reset();
+    // Single-page region — submit_shmem requires intra-page
+    // contiguity for now.
+    let h = match shmem_create(0, 4096) {
+        Ok(h)  => h,
+        Err(_) => return TestResult::Fail("shmem_create"),
+    };
+    // Fill with 1024 bytes of silence at offset 0. shmem zero-
+    // fills on alloc so this is technically redundant; explicit
+    // for the zero-copy story.
+    let phys = phys_at(h, 0).expect("phys");
+    // SAFETY: identity-mapped low-RAM page we just allocated.
+    unsafe { core::ptr::write_bytes(phys as *mut u8, 0, 1024); }
+
+    let cap = bootstrap_writer();
+    let writer = match AudioWriter::open(cap, AudioFormat::default_playback()) {
+        Ok(w)  => w,
+        Err(_) => return TestResult::Fail("AudioWriter::open"),
+    };
+    let frames = match writer.submit_shmem(h, 0, 1024) {
+        Ok(f)  => f,
+        Err(_) => return TestResult::Fail("submit_shmem"),
+    };
+    if frames != 256 {
+        return TestResult::Fail("frame count wrong");
+    }
+
+    // Page-crossing rejected.
+    if writer.submit_shmem(h, 4000, 1024).is_ok() {
+        return TestResult::Fail("page-crossing should reject");
+    }
+    // Bad handle rejected.
+    if writer.submit_shmem(0xDEADBEEF, 0, 256).is_ok() {
+        return TestResult::Fail("bad handle should reject");
+    }
+    // Length not a frame multiple rejected (default fmt = 4 bytes/frame).
+    if writer.submit_shmem(h, 0, 5).is_ok() {
+        return TestResult::Fail("non-frame-multiple len should reject");
+    }
+    shmem_reset();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_audio_submit_shmem_zero_copy);
+
 fn smoke_audio_format_unsupported_rate_rejects() -> TestResult {
     use narf_audio::{
         AudioFormat, ChannelLayout, SampleFormat,

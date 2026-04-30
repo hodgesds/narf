@@ -407,6 +407,7 @@ dependencies = [
  "narf-init",
  "narf-lib",
  "narf-memory",
+ "narf-shmem",
  "narf-userspace",
 ]
 

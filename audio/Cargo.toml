@@ -18,6 +18,7 @@ narf-init         = { path = "../init" }
 narf-memory       = { path = "../memory" }
 narf-userspace    = { path = "../userspace" }
 narf-drivers-virtio = { path = "../drivers/virtio" }
+narf-shmem        = { path = "../shmem" }
 
 [lints]
 workspace = true

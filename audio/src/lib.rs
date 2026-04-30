@@ -244,6 +244,60 @@ impl AudioWriter {
             .map_err(|_| AudioWriteError::StreamClosed)?;
         Ok((pcm.len() / bpf) as u64)
     }
+
+    /// Zero-copy submit: forwards a `(shmem_handle, byte_offset,
+    /// byte_len)` triple to the backend. The PCM bytes already
+    /// live in the kernel-coherent shmem region; the device reads
+    /// them in place. Same blocking + completion semantics as
+    /// `submit`.
+    ///
+    /// The payload must be physically contiguous — i.e. it must
+    /// stay within a single page of the shmem region. Multi-page
+    /// submissions (chained descriptor groups) land when a real
+    /// streaming consumer needs them.
+    pub fn submit_shmem(
+        &self,
+        shmem_handle: u64,
+        byte_offset:  u64,
+        byte_len:     u64,
+    ) -> Result<u64, AudioWriteError> {
+        self.check_live()?;
+        let bpf = self.format.bytes_per_frame() as u64;
+        if byte_len == 0 || bpf == 0 || byte_len % bpf != 0 {
+            return Err(AudioWriteError::UnsupportedFormat);
+        }
+        // Single-page contiguity: offset + len must not cross a
+        // page boundary. The Stage-4 contract — multi-page chains
+        // are a follow-up.
+        if (byte_offset & 0xFFF) + byte_len > 4096 {
+            return Err(AudioWriteError::UnsupportedFormat);
+        }
+        let phys = narf_shmem::phys_at(shmem_handle, byte_offset)
+            .ok_or(AudioWriteError::StreamClosed)?;
+        use narf_drivers_virtio::snd_pci::{
+            self, PcmParams, VIRTIO_SND_PCM_FMT_S16,
+            VIRTIO_SND_PCM_RATE_44100, VIRTIO_SND_PCM_RATE_48000,
+        };
+        let rate_code = match self.format.sample_rate_hz {
+            44_100 => VIRTIO_SND_PCM_RATE_44100,
+            48_000 => VIRTIO_SND_PCM_RATE_48000,
+            _ => return Err(AudioWriteError::UnsupportedFormat),
+        };
+        let format_code = match self.format.format {
+            SampleFormat::S16Le => VIRTIO_SND_PCM_FMT_S16,
+            SampleFormat::F32Le => return Err(AudioWriteError::UnsupportedFormat),
+        };
+        let params = PcmParams {
+            buffer_bytes: 8192,
+            period_bytes: 2048,
+            channels:     self.format.channels as u8,
+            format:       format_code,
+            rate:         rate_code,
+        };
+        snd_pci::play_buffer_phys(params, phys, byte_len as u32)
+            .map_err(|_| AudioWriteError::StreamClosed)?;
+        Ok(byte_len / bpf)
+    }
 }
 
 // ── Test-mode authority bootstrap ───────────────────────────────────

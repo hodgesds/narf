@@ -378,43 +378,49 @@ impl VirtioSoundPci {
         Ok(())
     }
 
-    /// Submit one PCM buffer for playback on stream 0. Blocks
-    /// until the device acks via the tx vq used ring.
-    pub fn play_buffer(
+    /// Generic PCM submit: header + status come from the
+    /// per-controller scratch (small, fixed); the payload
+    /// descriptor points at caller-supplied phys. The payload
+    /// must be physically contiguous for `payload_len` bytes
+    /// (single-page from a `narf-shmem` region, or any kernel
+    /// `DmaBuffer`).
+    ///
+    /// Blocks until the device acks via the tx vq used ring.
+    pub fn play_buffer_phys(
         &self,
-        params: PcmParams,
-        pcm:    &[u8],
+        params:      PcmParams,
+        payload_phys: u64,
+        payload_len:  u32,
     ) -> Result<(), VirtioPciError> {
-        if pcm.len() > 4032 {
-            // The 4 KiB tx scratch holds the 8-byte header + the
-            // payload + an 8-byte status. Larger buffers chain
-            // multiple submissions; the unified DmaBuffer surface
-            // will lift this when it lands.
+        if payload_len == 0 {
             return Err(VirtioPciError::QueueTooSmall);
         }
+        // virtio-spec requires the payload not cross into
+        // unmapped pages; that's the caller's contract on
+        // `payload_phys + payload_len`.
         self.ensure_started(params)?;
 
+        // Header (+0) and status (+4088) live in the controller's
+        // 4 KiB scratch. Per-controller, single-outstanding-submit
+        // today; concurrency lands when AudioWriter grows a
+        // submission ring.
         let base = self.tx_buf.phys_addr().raw();
-        let hdr_phys     = base;          // 8 bytes
-        let payload_phys = base + 64;     // up to 4032 bytes
-        let status_phys  = base + 4088;   // 8 bytes
+        let hdr_phys    = base;
+        let status_phys = base + 4088;
 
-        // SAFETY: identity-mapped DMA.
+        // SAFETY: identity-mapped scratch DMA.
         unsafe {
             // virtio_snd_pcm_xfer { u32 stream_id, u32 padding }
             core::ptr::write_volatile(hdr_phys      as *mut u32, 0u32);
             core::ptr::write_volatile((hdr_phys+4)  as *mut u32, 0u32);
-            for (i, b) in pcm.iter().enumerate() {
-                core::ptr::write_volatile((payload_phys + i as u64) as *mut u8, *b);
-            }
             // Pre-clear status to detect non-write-back.
             core::ptr::write_volatile(status_phys     as *mut u32, 0xFFFF_FFFF);
             core::ptr::write_volatile((status_phys+4) as *mut u32, 0u32);
         }
         let descs = [
-            VirtqDesc { addr: hdr_phys,     len: 8,                  flags: 0,                  next: 0 },
-            VirtqDesc { addr: payload_phys, len: pcm.len() as u32,   flags: 0,                  next: 0 },
-            VirtqDesc { addr: status_phys,  len: 8,                  flags: VIRTQ_DESC_F_WRITE, next: 0 },
+            VirtqDesc { addr: hdr_phys,     len: 8,           flags: 0,                  next: 0 },
+            VirtqDesc { addr: payload_phys, len: payload_len, flags: 0,                  next: 0 },
+            VirtqDesc { addr: status_phys,  len: 8,           flags: VIRTQ_DESC_F_WRITE, next: 0 },
         ];
         let head = {
             let mut g = self.tx_q.lock();
@@ -459,6 +465,30 @@ impl VirtioSoundPci {
             return Err(VirtioPciError::DeviceRejectedFeatures);
         }
         Ok(())
+    }
+
+    /// Slice-friendly wrapper. Copies `pcm` into the controller's
+    /// payload-scratch region within the existing tx_buf, then
+    /// forwards to `play_buffer_phys`. Bounded to 4032 bytes by
+    /// the scratch layout — call `play_buffer_phys` directly with
+    /// a `narf-shmem`-backed phys for arbitrary lengths.
+    pub fn play_buffer(
+        &self,
+        params: PcmParams,
+        pcm:    &[u8],
+    ) -> Result<(), VirtioPciError> {
+        if pcm.len() > 4032 {
+            return Err(VirtioPciError::QueueTooSmall);
+        }
+        let base = self.tx_buf.phys_addr().raw();
+        let payload_phys = base + 64;
+        // SAFETY: identity-mapped scratch DMA; we own the slot.
+        unsafe {
+            for (i, b) in pcm.iter().enumerate() {
+                core::ptr::write_volatile((payload_phys + i as u64) as *mut u8, *b);
+            }
+        }
+        self.play_buffer_phys(params, payload_phys, pcm.len() as u32)
     }
 }
 
@@ -537,8 +567,8 @@ pub fn topology() -> Option<(u32, u32, u32)> {
 }
 
 /// Submit one PCM buffer through the probed virtio-sound device's
-/// stream 0. Blocks until the device acks. Returns `NotImplemented`
-/// (mapped to caller's error vocabulary) if no controller is up.
+/// stream 0. Blocks until the device acks. Slice-friendly; copies
+/// into the per-controller scratch.
 pub fn play_buffer(
     params: PcmParams,
     pcm:    &[u8],
@@ -546,6 +576,21 @@ pub fn play_buffer(
     let g = CONTROLLER.lock();
     let c = g.as_ref().ok_or(VirtioPciError::NoQueues)?;
     c.play_buffer(params, pcm)
+}
+
+/// Zero-copy submit: the payload descriptor points directly at
+/// `(payload_phys, payload_len)`. The header + status still come
+/// from the per-controller scratch. Use this when the PCM source
+/// is already in DMA-coherent memory — typically a `narf-shmem`
+/// region's `phys_at(handle, offset)`.
+pub fn play_buffer_phys(
+    params:       PcmParams,
+    payload_phys: u64,
+    payload_len:  u32,
+) -> Result<(), VirtioPciError> {
+    let g = CONTROLLER.lock();
+    let c = g.as_ref().ok_or(VirtioPciError::NoQueues)?;
+    c.play_buffer_phys(params, payload_phys, payload_len)
 }
 
 #[doc(hidden)]
