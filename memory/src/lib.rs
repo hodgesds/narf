@@ -15,18 +15,19 @@ pub mod address_space;
 pub mod frame;
 pub mod heap;
 pub mod slab;
+pub mod vmalloc;
 
 pub use address_space::{AddressSpace, AddressSpaceError, Region, RegionPerms};
 
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::{domain, mmu, paging};
+pub use x86_64::{domain, ioremap, mmu, paging};
 
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;
 #[cfg(target_arch = "aarch64")]
-pub use aarch64::{mmu, paging};
+pub use aarch64::{ioremap, mmu, paging};
 
 pub use addr::{PhysAddr, VirtAddr};
 pub use frame::{
