@@ -134,7 +134,11 @@ pub type DriverFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
 /// The contract every driver implements. `start` runs to completion
 /// (the driver's main event loop); `quiesce` is called when the
-/// framework wants the driver to shut down cleanly.
+/// framework wants the driver to shut down cleanly; `reset` is the
+/// recovery hook the framework calls when the device is wedged
+/// (timeout, AER fatal, hot-unplug-then-replug) — the driver throws
+/// away any in-flight state, brings the device back to a known
+/// post-reset register layout, and is ready for `start` again.
 pub trait Driver: Send + 'static {
     /// Spin up the driver. Runs as a scheduler task.
     fn start<'a>(&'a mut self, env: DriverEnv<'a>) -> DriverFuture<'a>;
@@ -143,6 +147,25 @@ pub trait Driver: Send + 'static {
     /// work and release its resources. A well-behaved driver returns
     /// in bounded time.
     fn quiesce<'a>(&'a mut self) -> DriverFuture<'a>;
+
+    /// Reset — discard in-flight state and bring the device back to
+    /// post-power-on register defaults. Called on:
+    /// - Test teardown between hermetic smokes (one device, many
+    ///   probe cycles in the same QEMU boot).
+    /// - PCIe AER fatal recovery, after the bus crate has issued
+    ///   FLR (function-level reset) on the device.
+    /// - Hot-unplug-then-replug, where the device is the same
+    ///   physical part but driver state was for a now-dead session.
+    ///
+    /// Default implementation is a no-op so existing drivers stay
+    /// compatible — they get the documentation invariant ("reset
+    /// must restore post-POR state") for free, and recovery hooks
+    /// silently no-op until each driver fills it in. Cap-revocation
+    /// drivers and tightly-coupled stubs that don't hold device
+    /// state can leave it at the default.
+    fn reset<'a>(&'a mut self) -> DriverFuture<'a> {
+        Box::pin(async move {})
+    }
 }
 
 // ── Registry ────────────────────────────────────────────────────────
@@ -332,6 +355,33 @@ impl DriverRegistry {
         if let Some(e) = self.inner.lock().iter_mut().find(|r| r.manifest.name == name) {
             e.phase = DriverPhase::Quiesced;
         }
+        Ok(())
+    }
+
+    /// Drive the named driver's `reset` future. Restores the device
+    /// to post-POR state so the driver is ready for a fresh `start`
+    /// after recovery. Phase tracking does NOT enter Loaded again on
+    /// its own — the caller (test harness, AER recovery, hot-replug
+    /// path) decides whether to invoke `start_named` afterward.
+    /// Idempotent: multiple resets in a row reach the same state.
+    pub async fn reset_named(&self, name: &str) -> Result<(), ()> {
+        let driver_ptr = {
+            let mut q = self.inner.lock();
+            let entry = q.iter_mut().find(|r| r.manifest.name == name).ok_or(())?;
+            // Reset is legal from any phase except in-flight start /
+            // quiesce — those would corrupt the &mut driver alias.
+            match entry.phase {
+                DriverPhase::Starting | DriverPhase::Quiescing => return Ok(()),
+                _ => {}
+            }
+            (&mut *entry.driver) as *mut dyn Driver
+        };
+        // SAFETY: phase gate above proves no concurrent start /
+        // quiesce holds the &mut alias. Reset itself doesn't change
+        // phase (the caller decides what comes next), so no post-
+        // await store is needed.
+        let driver: &mut dyn Driver = unsafe { &mut *driver_ptr };
+        driver.reset().await;
         Ok(())
     }
 
