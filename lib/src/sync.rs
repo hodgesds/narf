@@ -248,15 +248,18 @@ pub struct IrqSavedState(u64);
 #[inline(always)]
 unsafe fn irq_save_disable() -> IrqSavedState {
     let rflags: u64;
-    // SAFETY: pushfq + cli is a pure save+disable. RFLAGS read into a
-    // register, no memory side effect.
+    // SAFETY: pushfq pushes RFLAGS to the stack; cli clears IF. We
+    // intentionally do NOT pass `nostack` (pushfq adjusts RSP) or
+    // `preserves_flags` (cli mutates IF) — those would license
+    // miscompiles like the compiler putting a local in the red zone
+    // or caching a flag across the cli.
     unsafe {
         core::arch::asm!(
             "pushfq",
             "cli",
             "pop {0}",
             out(reg) rflags,
-            options(nostack, preserves_flags),
+            options(),
         );
     }
     IrqSavedState(rflags)
@@ -269,8 +272,11 @@ unsafe fn irq_restore(saved: IrqSavedState) {
     // a full popfq because we don't want to restore arithmetic flags
     // and risk surprising the surrounding code.
     if saved.0 & (1u64 << 9) != 0 {
-        // SAFETY: sti just sets IF; pure local-CPU state.
-        unsafe { core::arch::asm!("sti", options(nostack, preserves_flags, nomem)); }
+        // SAFETY: sti just sets IF. Don't claim `preserves_flags` —
+        // sti mutates IF — and don't claim `nomem`, since the
+        // moment IF flips, an IRQ handler may run and observe
+        // memory.
+        unsafe { core::arch::asm!("sti", options()); }
     }
 }
 
@@ -279,12 +285,14 @@ unsafe fn irq_restore(saved: IrqSavedState) {
 unsafe fn irq_save_disable() -> IrqSavedState {
     let daif: u64;
     // SAFETY: read DAIF, then mask I (IRQ). Pure local-CPU state.
+    // `nomem` is fine (no memory accesses), but DAIFSet mutates
+    // PSTATE — don't claim `preserves_flags`.
     unsafe {
         core::arch::asm!(
             "mrs {0}, DAIF",
             "msr DAIFSet, #0x2",
             out(reg) daif,
-            options(nostack, preserves_flags),
+            options(nostack),
         );
     }
     IrqSavedState(daif)
@@ -297,8 +305,8 @@ unsafe fn irq_restore(saved: IrqSavedState) {
     // restore only the I bit; touching the full DAIF would risk
     // re-enabling FIQ/SError/D unintentionally.
     if saved.0 & (1u64 << 7) == 0 {
-        // SAFETY: clear DAIF.I; pure local-CPU state.
-        unsafe { core::arch::asm!("msr DAIFClr, #0x2", options(nostack, preserves_flags, nomem)); }
+        // SAFETY: clear DAIF.I. PSTATE-mutating, IRQ may fire after.
+        unsafe { core::arch::asm!("msr DAIFClr, #0x2", options(nostack)); }
     }
 }
 
