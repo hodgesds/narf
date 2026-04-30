@@ -294,3 +294,155 @@ unsafe fn cfg_write32(cfg: PhysAddr, off: u64, value: u32) {
     unsafe { core::ptr::write_volatile((cfg.raw() + off) as *mut u32, value); }
     compiler_fence(Ordering::SeqCst);
 }
+
+// ── BAR self-assignment ─────────────────────────────────────────────
+//
+// Substitute for the firmware-side BAR allocation that UEFI / EDK2
+// would normally have done before kernel boot. NARF is launched
+// directly via `-kernel` on QEMU virt (aarch64) so no firmware
+// stage runs; PCIe BARs come up unassigned (read as 0) and the
+// kernel must do the assignment itself.
+//
+// Pool is a single bump-pointer over a configurable phys range.
+// Per-arch boot calls `init_mmio_pool(base, len)` once before
+// `assign_pci_bars`. On x86_64 the seabios firmware has already
+// done the assignment, so we skip the pass entirely; on aarch64
+// virt the pool covers `0x1000_0000 .. 0x3eff_0000` (~750 MiB).
+
+use core::sync::atomic::AtomicU64;
+
+static MMIO_POOL_BASE: AtomicU64 = AtomicU64::new(0);
+static MMIO_POOL_END:  AtomicU64 = AtomicU64::new(0);
+static MMIO_POOL_NEXT: AtomicU64 = AtomicU64::new(0);
+
+/// Initialise the PCIe-MMIO pool. Idempotent — re-init clobbers
+/// the previous range + cursor.
+pub fn init_mmio_pool(base: u64, len: u64) {
+    MMIO_POOL_BASE.store(base, Ordering::Release);
+    MMIO_POOL_END .store(base + len, Ordering::Release);
+    MMIO_POOL_NEXT.store(base, Ordering::Release);
+}
+
+/// Reserve a `size`-byte window aligned to `align`. Returns the
+/// phys base or `None` if the pool is exhausted. `align` is
+/// forced to a power of two (usually `size`).
+pub fn allocate_pci_mmio(size: u64, align: u64) -> Option<u64> {
+    let align = align.max(0x1000).next_power_of_two();
+    loop {
+        let cur = MMIO_POOL_NEXT.load(Ordering::Relaxed);
+        let aligned = (cur + align - 1) & !(align - 1);
+        let end = aligned.checked_add(size)?;
+        if end > MMIO_POOL_END.load(Ordering::Relaxed) { return None; }
+        if MMIO_POOL_NEXT
+            .compare_exchange_weak(cur, end, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Some(aligned);
+        }
+    }
+}
+
+/// Errors from `assign_pci_bars`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AssignError {
+    PoolExhausted,
+}
+
+/// Walk every device's BAR window. For each unprogrammed BAR
+/// (phys == 0 but size > 0), allocate from the MMIO pool and
+/// write the assignment back to cfg space. Sets the device's
+/// PCI_COMMAND.MEM_SPACE bit so the BAR decode is enabled.
+///
+/// Skipped silently when the pool wasn't initialised (typical on
+/// x86_64 where seabios already programmed BARs).
+///
+/// # Safety
+/// `device` must be PCIe with cfg space writable; caller owns
+/// the device exclusively for the duration of the call.
+pub unsafe fn assign_unprogrammed_bars(device: &BusDevice)
+    -> Result<u32, AssignError>
+{
+    if MMIO_POOL_BASE.load(Ordering::Acquire) == 0 {
+        return Ok(0); // Pool not initialised — assume firmware did it.
+    }
+    let cfg_phys = match device.kind {
+        BusKind::Pcie { cfg_phys, .. } => cfg_phys,
+        _ => return Ok(0),
+    };
+    let mut assigned = 0u32;
+    let mut idx = 0u8;
+    while idx < NUM_BARS {
+        // SAFETY: caller-asserted cfg-space ownership.
+        let bar = match unsafe { read_bar(device, idx) } {
+            Ok(b)  => b,
+            Err(_) => { idx += 1; continue; } // unimplemented slot
+        };
+        // Already programmed? Skip. (firmware path or earlier pass.)
+        if bar.phys.raw() != 0 {
+            idx += if matches!(bar.kind, BarKind::Mmio64 { .. }) { 2 } else { 1 };
+            continue;
+        }
+        match bar.kind {
+            BarKind::Mmio32 { prefetchable: _ } => {
+                // Allocate + write low half.
+                let base = match allocate_pci_mmio(bar.size, bar.size) {
+                    Some(p) => p,
+                    None    => return Err(AssignError::PoolExhausted),
+                };
+                let off = BAR0_OFFSET + (idx as u64) * 4;
+                // SAFETY: cfg-space write at validated offset.
+                let original = unsafe { cfg_read32(cfg_phys, off) };
+                let type_bits = original & 0x0F;
+                // SAFETY: same.
+                unsafe {
+                    cfg_write32(cfg_phys, off, (base as u32 & BAR_MMIO_ADDR_MASK_32) | type_bits);
+                }
+                assigned += 1;
+                idx += 1;
+            }
+            BarKind::Mmio64 { prefetchable: _ } => {
+                let base = match allocate_pci_mmio(bar.size, bar.size) {
+                    Some(p) => p,
+                    None    => return Err(AssignError::PoolExhausted),
+                };
+                let off_lo = BAR0_OFFSET + (idx as u64) * 4;
+                let off_hi = off_lo + 4;
+                // SAFETY: cfg-space writes at validated offsets.
+                let orig_lo = unsafe { cfg_read32(cfg_phys, off_lo) };
+                let type_bits = orig_lo & 0x0F;
+                unsafe {
+                    cfg_write32(cfg_phys, off_lo,
+                        (base as u32 & BAR_MMIO_ADDR_MASK_32) | type_bits);
+                    cfg_write32(cfg_phys, off_hi, (base >> 32) as u32);
+                }
+                assigned += 1;
+                idx += 2;
+            }
+            BarKind::Io => {
+                // I/O BARs not allocated by this pool. Skip.
+                idx += 1;
+            }
+        }
+    }
+    if assigned > 0 {
+        // Enable MEM_SPACE in the command register so the new BAR
+        // window decodes.
+        const COMMAND_OFFSET: u64 = 0x04;
+        const CMD_MEM_SPACE:  u32 = 1 << 1;
+        // SAFETY: cfg-space access at validated offset.
+        let cmd = unsafe { cfg_read32(cfg_phys, COMMAND_OFFSET) };
+        // SAFETY: same.
+        unsafe { cfg_write32(cfg_phys, COMMAND_OFFSET, cmd | CMD_MEM_SPACE); }
+    }
+    Ok(assigned)
+}
+
+/// Test-only: read back current pool state.
+#[doc(hidden)]
+pub fn pool_snapshot() -> (u64, u64, u64) {
+    (
+        MMIO_POOL_BASE.load(Ordering::Relaxed),
+        MMIO_POOL_NEXT.load(Ordering::Relaxed),
+        MMIO_POOL_END.load(Ordering::Relaxed),
+    )
+}

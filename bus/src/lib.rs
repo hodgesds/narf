@@ -55,7 +55,10 @@ pub mod x86_64;
 pub mod aarch64;
 
 pub use addr::{BusAddr, PcieAddr};
-pub use bar::{map_bar, read_bar, Bar, BarError, BarKind, MmioRegion, NUM_BARS};
+pub use bar::{
+    allocate_pci_mmio, assign_unprogrammed_bars, init_mmio_pool, map_bar, read_bar,
+    AssignError, Bar, BarError, BarKind, MmioRegion, NUM_BARS,
+};
 pub use driver_match::{
     probe_all as probe_all_pci, register as register_pci_driver,
     registered as registered_pci_drivers, MatchKind, PciMatch, PciProbeFn,

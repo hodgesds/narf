@@ -598,6 +598,28 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     "  bus: dtb={:?} → {} dev ({} pcie, {} virtio-mmio)",
                     info.dtb_phys, n_dev, n_pcie, n_mmio);
 
+                // PCIe BAR self-allocator. NARF on QEMU virt boots
+                // via `-kernel` without firmware, so PCIe BARs come
+                // up unassigned (read as 0). Initialise the MMIO
+                // pool with the QEMU virt PCIe MMIO low window
+                // (0x1000_0000 .. 0x3eff_0000 = ~750 MiB) and walk
+                // every device to assign + enable BARs before
+                // drivers probe.
+                narf_bus::init_mmio_pool(0x1000_0000, 0x3eff_0000 - 0x1000_0000);
+                let mut bar_assigned_total = 0u32;
+                for dev in &devs {
+                    if !matches!(dev.kind, narf_bus::BusKind::Pcie { .. }) { continue; }
+                    // SAFETY: BSP, exclusive cfg-space access here.
+                    if let Ok(n) = unsafe { narf_bus::assign_unprogrammed_bars(dev) } {
+                        bar_assigned_total += n;
+                    }
+                }
+                if bar_assigned_total > 0 {
+                    let _ = writeln!(console::Writer,
+                        "  bus: assigned {} unprogrammed BAR(s) from MMIO pool",
+                        bar_assigned_total);
+                }
+
                 // GIC ITS bring-up. Memory is online, GICv3 is up
                 // (gic::init_bsp ran above). Programs the device /
                 // collection / command-queue tables, sets
