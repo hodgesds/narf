@@ -20,11 +20,36 @@
 
 #![cfg(target_arch = "x86_64")]
 
+extern crate alloc;
+
+use alloc::vec::Vec;
+
+use narf_lib::sync::IrqSafeSpinLock;
+
 use crate::paging::{
     self, invlpg_global, map_4kb, read_cr3, unmap_4kb, MapError, PtFlags,
 };
 use crate::vmalloc::{self, VmRange, VmallocError};
 use crate::{PhysAddr, VirtAddr};
+
+/// Cache of (phys, len) → IoMapping. Repeated `ioremap` calls on
+/// the same range return the same kernel VA — avoids leaking
+/// vmalloc ranges + PTE frames when test smokes re-probe the
+/// same hardware.
+static CACHE: IrqSafeSpinLock<Vec<IoMapping>> =
+    IrqSafeSpinLock::new(Vec::new());
+
+fn cache_lookup(phys: u64, len: u64) -> Option<IoMapping> {
+    CACHE.lock().iter().copied().find(|m| m.phys == phys && m.len == len)
+}
+
+fn cache_insert(m: IoMapping) {
+    CACHE.lock().push(m);
+}
+
+fn cache_remove(virt: u64) {
+    CACHE.lock().retain(|m| m.virt != virt);
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MmioAttrs {
@@ -87,6 +112,12 @@ pub unsafe fn ioremap(phys: u64, len: u64, _attrs: MmioAttrs)
     if phys & 0xFFF != 0 { return Err(IoremapError::BadAlign); }
     if len  & 0xFFF != 0 || len == 0 { return Err(IoremapError::BadLen); }
 
+    // Cache hit? Return the prior mapping. Avoids the per-test-
+    // re-probe leak that otherwise eats vmalloc + PT frames.
+    if let Some(m) = cache_lookup(phys, len) {
+        return Ok(m);
+    }
+
     let range = vmalloc::alloc(len)?;
     let pml4_phys = unsafe { read_cr3() };
     let flags = PtFlags::PRESENT | PtFlags::WRITABLE | PtFlags::NO_CACHE;
@@ -120,7 +151,9 @@ pub unsafe fn ioremap(phys: u64, len: u64, _attrs: MmioAttrs)
         unsafe { paging::invlpg(v); }
     }
 
-    Ok(IoMapping { phys, virt: range.base, len })
+    let m = IoMapping { phys, virt: range.base, len };
+    cache_insert(m);
+    Ok(m)
 }
 
 /// Tear down a mapping. Each unmapped page broadcasts a TLB
@@ -132,6 +165,9 @@ pub unsafe fn ioremap(phys: u64, len: u64, _attrs: MmioAttrs)
 /// drained any in-flight MMIO accesses through the mapping
 /// before calling iounmap.
 pub unsafe fn iounmap(m: IoMapping) {
+    // Pull from cache first so a future ioremap of the same range
+    // gets a fresh mapping rather than the now-torn-down one.
+    cache_remove(m.virt);
     // SAFETY: caller-provided mapping handle.
     let pml4_phys = unsafe { read_cr3() };
     let pages = (m.len >> 12) as usize;

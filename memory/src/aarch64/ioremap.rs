@@ -18,11 +18,31 @@
 
 #![cfg(target_arch = "aarch64")]
 
+extern crate alloc;
+
+use alloc::vec::Vec;
+
+use narf_lib::sync::IrqSafeSpinLock;
+
 use crate::aarch64::paging::{
     self, map_4kb, read_ttbr1_el1, tlb_invalidate_vae1, MapError, PtFlags,
 };
 use crate::vmalloc::{self, VmRange, VmallocError};
 use crate::{PhysAddr, VirtAddr};
+
+/// Cache of (phys, len) → IoMapping. Same rationale as x86_64:
+/// repeated probes / map_cap calls on the same BAR return the
+/// cached VA so we don't leak vmalloc + PTE frames.
+static CACHE: IrqSafeSpinLock<Vec<IoMapping>> =
+    IrqSafeSpinLock::new(Vec::new());
+
+fn cache_lookup(phys: u64, len: u64) -> Option<IoMapping> {
+    CACHE.lock().iter().copied().find(|m| m.phys == phys && m.len == len)
+}
+
+fn cache_insert(m: IoMapping) { CACHE.lock().push(m); }
+
+fn cache_remove(virt: u64)    { CACHE.lock().retain(|m| m.virt != virt); }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MmioAttrs {
@@ -70,6 +90,8 @@ pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs)
     if phys & 0xFFF != 0 { return Err(IoremapError::BadAlign); }
     if len  & 0xFFF != 0 || len == 0 { return Err(IoremapError::BadLen); }
 
+    if let Some(m) = cache_lookup(phys, len) { return Ok(m); }
+
     let range = vmalloc::alloc(len)?;
     let root  = unsafe { read_ttbr1_el1() };
 
@@ -115,7 +137,9 @@ pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs)
         unsafe { tlb_invalidate_vae1(v); }
     }
 
-    Ok(IoMapping { phys, virt: range.base, len })
+    let m = IoMapping { phys, virt: range.base, len };
+    cache_insert(m);
+    Ok(m)
 }
 
 /// Tear down a mapping. Today: clears the TLB locally + calls
@@ -125,6 +149,7 @@ pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs)
 /// # Safety
 /// `m` must originate from `ioremap`.
 pub unsafe fn iounmap(m: IoMapping) {
+    cache_remove(m.virt);
     let pages = (m.len >> 12) as usize;
     for i in 0..pages {
         let off = (i as u64) * 4096;
