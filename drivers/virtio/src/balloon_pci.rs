@@ -137,7 +137,8 @@ impl VirtioBalloonPci {
                  | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK) as u8);
         }
 
-        // SAFETY: queue buffers freshly zeroed.
+        // SAFETY: Virtqueue::new wipes the layout regions; the
+        // backing pages may be recycled (alloc_frame doesn't zero).
         let inflate_q = unsafe { Virtqueue::new(inf_layout) };
         // SAFETY: same.
         let deflate_q = unsafe { Virtqueue::new(def_layout) };

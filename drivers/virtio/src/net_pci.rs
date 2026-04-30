@@ -192,7 +192,8 @@ impl VirtioNetPci {
                  | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK) as u8);
         }
 
-        // SAFETY: queue buffers freshly zeroed.
+        // SAFETY: Virtqueue::new wipes the layout regions; the
+        // backing pages may be recycled (alloc_frame doesn't zero).
         let mut rx_q = unsafe { Virtqueue::new(rx_layout) };
         // SAFETY: same.
         let tx_q = unsafe { Virtqueue::new(tx_layout) };

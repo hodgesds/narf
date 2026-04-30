@@ -203,7 +203,8 @@ impl VirtioBlkPci {
         let pool = alloc_coherent(4096, DomainId::DRIVER_0)
             .map_err(|_| VirtioPciError::BarMapFailed)?;
 
-        // SAFETY: q_buf is freshly-allocated zeroed coherent DMA.
+        // SAFETY: Virtqueue::new wipes the layout regions; the
+        // backing pages may be recycled (alloc_frame doesn't zero).
         let queue = unsafe { Virtqueue::new(layout) };
 
         Ok(Self {

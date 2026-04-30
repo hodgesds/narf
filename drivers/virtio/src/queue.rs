@@ -95,8 +95,21 @@ impl Virtqueue {
     /// Create a new Virtqueue from a validated layout.
     ///
     /// # Safety
-    /// Memory at `layout` must be zeroed and device-accessible.
+    /// Memory at `layout` must be device-accessible. Contents are
+    /// reset by this constructor — recycled frames are safe.
     pub unsafe fn new(layout: VirtqueueLayout) -> Self {
+        // Wipe desc_table + avail_ring + used_ring. `alloc_frame`
+        // returns recycled (un-zeroed) frames, so a stale used_idx
+        // or avail entry left by a previous tenant would otherwise
+        // poison this fresh queue: the device would skip the first
+        // submission, or `poll_used` would walk junk ring slots.
+        let used_ring_size = 6u64 + 8u64 * layout.capacity as u64;
+        let total = (layout.used_ring + used_ring_size) - layout.desc_table;
+        // SAFETY: layout was validated by VirtqueueLayout::new to
+        // fit within PAGE_SIZE; the buffer is owned by the caller.
+        unsafe {
+            core::ptr::write_bytes(layout.desc_table as *mut u8, 0, total as usize);
+        }
         let desc = layout.desc_table as *mut VirtqDesc;
         // Initialise free descriptors stack.
         for i in 0..(layout.capacity - 1) {

@@ -237,7 +237,8 @@ impl VirtioSoundPci {
                  | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK) as u8);
         }
 
-        // SAFETY: queue buffers freshly zeroed by the allocator.
+        // SAFETY: Virtqueue::new wipes the layout regions; the
+        // backing pages may be recycled (alloc_frame doesn't zero).
         let control_q = unsafe { Virtqueue::new(ctrl_layout) };
         // SAFETY: same.
         let event_q   = unsafe { Virtqueue::new(event_layout) };
