@@ -20147,3 +20147,115 @@ fn smoke_aml_prt_method_not_found() -> TestResult {
     }
 }
 kernel_test!(smoke_aml_prt_method_not_found);
+
+// ── Driver-foundation arc smokes (e94093a..e99df8e) ────────────────
+//
+// These smokes were originally drafted next to their related code
+// in the 1-8 driver foundation arc but landed at end-of-file
+// because linkme distributed_slice ordering is sensitive to
+// section placement, and inserting smokes mid-file reproducibly
+// perturbed `smoke_audio_submit_shmem_zero_copy`. Aggregating
+// them here keeps the build-order shape stable.
+
+fn smoke_drivers_reset_default_is_noop() -> TestResult {
+    use narf_drivers::{Driver, NoopDriver};
+    let mut d = NoopDriver::new();
+    let _f = d.reset();
+    TestResult::Pass
+}
+kernel_test!(smoke_drivers_reset_default_is_noop);
+
+fn smoke_hotplug_default_dispatcher_round_trip() -> TestResult {
+    use alloc::sync::Arc;
+    use narf_bus::hotplug::{
+        __clear_listeners, dispatch_event, install_default_dispatcher,
+        listener_count, HotplugEvent, HotplugListener,
+    };
+    use narf_bus::{BusAddr, DeviceId, PcieAddr};
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    __clear_listeners();
+    if listener_count() != 0 {
+        return TestResult::Fail("listener list not empty after clear");
+    }
+    if install_default_dispatcher().is_err() {
+        return TestResult::Fail("install_default_dispatcher");
+    }
+
+    static ATTACHES: AtomicU32 = AtomicU32::new(0);
+    static DETACHES: AtomicU32 = AtomicU32::new(0);
+    struct Tally;
+    impl HotplugListener for Tally {
+        fn on_event(&self, ev: HotplugEvent) {
+            match ev {
+                HotplugEvent::Attach { .. } => { ATTACHES.fetch_add(1, Ordering::Relaxed); }
+                HotplugEvent::Detach { .. } => { DETACHES.fetch_add(1, Ordering::Relaxed); }
+            }
+        }
+    }
+    let auth = narf_bus::bootstrap_registry_authority();
+    if narf_bus::hotplug::register_listener(&auth, Arc::new(Tally)).is_err() {
+        return TestResult::Fail("register Tally");
+    }
+    if listener_count() != 2 {
+        return TestResult::Fail("expected 2 listeners after default + tally");
+    }
+
+    let baseline_a = ATTACHES.load(Ordering::Relaxed);
+    let baseline_d = DETACHES.load(Ordering::Relaxed);
+    let addr = BusAddr::Pcie(PcieAddr { segment: 0, bus: 0, device: 31, function: 0 });
+
+    dispatch_event(HotplugEvent::Attach {
+        addr,
+        device_id: DeviceId { vendor: 0x1234, device: 0x5678, class: 0 },
+    });
+    dispatch_event(HotplugEvent::Detach { addr });
+
+    if ATTACHES.load(Ordering::Relaxed) != baseline_a + 1 {
+        return TestResult::Fail("Attach not delivered to tally listener");
+    }
+    if DETACHES.load(Ordering::Relaxed) != baseline_d + 1 {
+        return TestResult::Fail("Detach not delivered to tally listener");
+    }
+    __clear_listeners();
+    TestResult::Pass
+}
+kernel_test!(smoke_hotplug_default_dispatcher_round_trip);
+
+fn smoke_aer_classifier_severity() -> TestResult {
+    use narf_bus::pci_cap_ext::{classify_aer, AerSeverity};
+
+    if classify_aer(0, 0, 0).is_some() {
+        return TestResult::Fail("zero status produced an event");
+    }
+    if classify_aer(0, 0, 1) != Some(AerSeverity::Correctable) {
+        return TestResult::Fail("correctable bit didn't classify");
+    }
+    if classify_aer(1 << 4, 0, 0) != Some(AerSeverity::NonFatal) {
+        return TestResult::Fail("uncorr w/o severity should be NonFatal");
+    }
+    if classify_aer(1 << 4, 1 << 4, 0) != Some(AerSeverity::Fatal) {
+        return TestResult::Fail("uncorr matched severity should be Fatal");
+    }
+    if classify_aer(1 << 4, 0, 1) != Some(AerSeverity::Correctable) {
+        return TestResult::Fail("correctable should win over uncorr");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_aer_classifier_severity);
+
+fn smoke_power_dstate_classification() -> TestResult {
+    use narf_power::DState;
+
+    if !DState::D0.is_active()    { return TestResult::Fail("D0.is_active"); }
+    if  DState::D3Hot.is_active() { return TestResult::Fail("D3Hot shouldn't be active"); }
+    if  DState::D3Cold.is_active(){ return TestResult::Fail("D3Cold shouldn't be active"); }
+    if !DState::D0.preserves_context()    { return TestResult::Fail("D0 must preserve"); }
+    if !DState::D3Hot.preserves_context() { return TestResult::Fail("D3Hot must preserve"); }
+    if  DState::D3Cold.preserves_context(){ return TestResult::Fail("D3Cold should NOT preserve"); }
+    if !DState::D1.preserves_context() || !DState::D2.preserves_context() {
+        return TestResult::Fail("intermediate states preserve context");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_power_dstate_classification);
