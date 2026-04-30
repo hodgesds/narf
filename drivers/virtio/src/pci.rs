@@ -38,8 +38,6 @@
 //! The driver maps the BARs the caps point at (via `bus::map_bar`)
 //! and reads/writes through the resulting `MmioRegion`s.
 
-use core::sync::atomic::{compiler_fence, Ordering};
-
 use narf_bus::{map_bar, BusDevice, MmioRegion};
 use narf_memory::PhysAddr;
 
@@ -205,11 +203,8 @@ impl VirtioRegion {
     /// `off + 4 <= self.length`.
     #[inline]
     pub unsafe fn read32(&self, off: u64) -> u32 {
-        compiler_fence(Ordering::SeqCst);
         // SAFETY: caller-bounded; addr() honours the kernel-VA mapping.
-        let v = unsafe { core::ptr::read_volatile(self.addr(off) as *const u32) };
-        compiler_fence(Ordering::SeqCst);
-        v
+        unsafe { narf_arch::mmio::read32(self.addr(off)) }
     }
 
     /// Write a 32-bit register at `off` bytes into the region.
@@ -218,10 +213,8 @@ impl VirtioRegion {
     /// Same as `read32`.
     #[inline]
     pub unsafe fn write32(&self, off: u64, v: u32) {
-        compiler_fence(Ordering::SeqCst);
         // SAFETY: caller-bounded.
-        unsafe { core::ptr::write_volatile(self.addr(off) as *mut u32, v); }
-        compiler_fence(Ordering::SeqCst);
+        unsafe { narf_arch::mmio::write32(self.addr(off), v); }
     }
 
     /// 64-bit register split into two 32-bit writes (LE).
@@ -240,36 +233,26 @@ impl VirtioRegion {
 
     #[inline]
     pub unsafe fn read16(&self, off: u64) -> u16 {
-        compiler_fence(Ordering::SeqCst);
         // SAFETY: caller-bounded.
-        let v = unsafe { core::ptr::read_volatile(self.addr(off) as *const u16) };
-        compiler_fence(Ordering::SeqCst);
-        v
+        unsafe { narf_arch::mmio::read16(self.addr(off)) }
     }
 
     #[inline]
     pub unsafe fn write16(&self, off: u64, v: u16) {
-        compiler_fence(Ordering::SeqCst);
         // SAFETY: caller-bounded.
-        unsafe { core::ptr::write_volatile(self.addr(off) as *mut u16, v); }
-        compiler_fence(Ordering::SeqCst);
+        unsafe { narf_arch::mmio::write16(self.addr(off), v); }
     }
 
     #[inline]
     pub unsafe fn read8(&self, off: u64) -> u8 {
-        compiler_fence(Ordering::SeqCst);
         // SAFETY: caller-bounded.
-        let v = unsafe { core::ptr::read_volatile(self.addr(off) as *const u8) };
-        compiler_fence(Ordering::SeqCst);
-        v
+        unsafe { narf_arch::mmio::read8(self.addr(off)) }
     }
 
     #[inline]
     pub unsafe fn write8(&self, off: u64, v: u8) {
-        compiler_fence(Ordering::SeqCst);
         // SAFETY: caller-bounded.
-        unsafe { core::ptr::write_volatile(self.addr(off) as *mut u8, v); }
-        compiler_fence(Ordering::SeqCst);
+        unsafe { narf_arch::mmio::write8(self.addr(off), v); }
     }
 }
 
@@ -348,18 +331,12 @@ pub const CC_QUEUE_DEVICE:          u64 = 0x30;
 
 #[inline]
 unsafe fn cfg_read8(cfg: PhysAddr, off: u64) -> u8 {
-    compiler_fence(Ordering::SeqCst);
     // SAFETY: caller asserts the slot is readable.
-    let v = unsafe { core::ptr::read_volatile((cfg.raw() + off) as *const u8) };
-    compiler_fence(Ordering::SeqCst);
-    v
+    unsafe { narf_arch::mmio::read8(cfg.raw() + off) }
 }
 
 #[inline]
 unsafe fn cfg_read32(cfg: PhysAddr, off: u64) -> u32 {
-    compiler_fence(Ordering::SeqCst);
     // SAFETY: caller asserts the slot is readable + 4-byte aligned.
-    let v = unsafe { core::ptr::read_volatile((cfg.raw() + off) as *const u32) };
-    compiler_fence(Ordering::SeqCst);
-    v
+    unsafe { narf_arch::mmio::read32(cfg.raw() + off) }
 }
