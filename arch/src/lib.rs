@@ -9,6 +9,8 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(missing_debug_implementations)]
 
+pub mod mmio;
+
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;
 #[cfg(target_arch = "x86_64")]

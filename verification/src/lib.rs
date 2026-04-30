@@ -219,6 +219,54 @@ fn smoke_arch_backend() -> TestResult {
 }
 kernel_test!(smoke_arch_backend);
 
+fn smoke_arch_mmio_round_trip() -> TestResult {
+    // Allocate a frame, treat it as MMIO, write a sentinel pattern
+    // through narf_arch::mmio::write32, read it back via read32.
+    // The frame is identity-mapped low RAM — not a real device,
+    // but the access path exercises the per-arch barrier discipline
+    // (dmb ishst/ishld + dsb st on aarch64; compiler_fence + volatile
+    // on x86_64).
+    use narf_memory::frame::alloc_frame;
+    let frame = match alloc_frame() {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("alloc_frame"),
+    };
+    let va = frame.start_address().raw();
+    // 32-bit round trip.
+    // SAFETY: identity-mapped frame; we own it.
+    unsafe { narf_arch::mmio::write32(va, 0xDEAD_BEEF); }
+    let r32 = unsafe { narf_arch::mmio::read32(va) };
+    if r32 != 0xDEAD_BEEF {
+        return TestResult::Fail("32-bit round trip mismatch");
+    }
+    // 16-bit at +4.
+    // SAFETY: same.
+    unsafe { narf_arch::mmio::write16(va + 4, 0xCAFE); }
+    if unsafe { narf_arch::mmio::read16(va + 4) } != 0xCAFE {
+        return TestResult::Fail("16-bit round trip mismatch");
+    }
+    // 8-bit at +6 + 7.
+    // SAFETY: same.
+    unsafe {
+        narf_arch::mmio::write8(va + 6, 0xAB);
+        narf_arch::mmio::write8(va + 7, 0xCD);
+    }
+    if unsafe { narf_arch::mmio::read8(va + 6) } != 0xAB
+        || unsafe { narf_arch::mmio::read8(va + 7) } != 0xCD
+    {
+        return TestResult::Fail("8-bit round trip mismatch");
+    }
+    // Width independence: a 32-bit write at +4 should overwrite the
+    // 16-bit + two 8-bit values.
+    // SAFETY: same.
+    unsafe { narf_arch::mmio::write32(va + 4, 0xFEED_FACE); }
+    if unsafe { narf_arch::mmio::read32(va + 4) } != 0xFEED_FACE {
+        return TestResult::Fail("32-bit overwrite of mixed widths");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_arch_mmio_round_trip);
+
 fn smoke_monotonic_advances() -> TestResult {
     let a = narf_time::now_cycles();
     for _ in 0..100_000 { core::hint::spin_loop(); }
