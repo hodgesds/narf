@@ -340,6 +340,45 @@ pub fn select_freq(load_permille: u16) -> Result<FreqHint, PowerError> {
         .ok_or(PowerError::GovernorMissing)
 }
 
+// ── D-states (PCIe Power Management Capability §7.5.2) ─────────────
+
+/// PCIe device power state. Drivers map these onto suspend/resume in
+/// `DeviceRuntimePm::transition`. Most callers only ever target D0 +
+/// D3Hot; D1/D2 are rare in practice (few real devices implement them
+/// and the OS savings are usually negligible vs the cost of a
+/// transition).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DState {
+    /// Active: device is fully operational.
+    D0     = 0,
+    /// Intermediate low-power state. Optional; many devices alias
+    /// to D2 or D3Hot.
+    D1     = 1,
+    /// Intermediate low-power state. Optional.
+    D2     = 2,
+    /// Lowest active state; driver context preserved so resume to D0
+    /// is fast (no re-init). Most drivers' "go idle" target.
+    D3Hot  = 3,
+    /// Powered off; context lost. Resume implies full re-init (a
+    /// fresh `Driver::start` after `Driver::reset`). Used for
+    /// long-idle / battery-aware suspend.
+    D3Cold = 4,
+}
+
+impl DState {
+    /// Whether this state preserves driver-side context across
+    /// the transition. D3Cold loses context; everything else
+    /// preserves it.
+    pub const fn preserves_context(self) -> bool {
+        matches!(self, DState::D0 | DState::D1 | DState::D2 | DState::D3Hot)
+    }
+    /// Whether the device can issue / process I/O in this state.
+    /// Only D0 is fully active; everything else is suspended.
+    pub const fn is_active(self) -> bool {
+        matches!(self, DState::D0)
+    }
+}
+
 // ── Per-driver runtime PM ───────────────────────────────────────────
 
 /// Per-device runtime-PM hooks. Returning `Pin<Box<dyn Future>>` rather
@@ -353,6 +392,18 @@ pub trait DeviceRuntimePm: Send + 'static {
     /// Resume the device. The future resolves once the device is ready
     /// to accept new work.
     fn resume<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+    /// Transition the device to a specific PCIe D-state. The default
+    /// implementation maps `D0` to `resume()` and any other target
+    /// to `suspend()`, which is correct for drivers that don't
+    /// distinguish D1/D2/D3Hot/D3Cold (today's common case). Drivers
+    /// that want fine-grained per-state behaviour (different register
+    /// dance per target) override this.
+    fn transition<'a>(
+        &'a mut self,
+        target: DState,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        if target.is_active() { self.resume() } else { self.suspend() }
+    }
 }
 
 struct PmEntry {
