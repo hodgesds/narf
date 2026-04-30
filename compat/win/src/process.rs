@@ -30,7 +30,8 @@ use narf_capabilities::{Cap, CapKind, CapType, Invoke};
 #[allow(unused_imports)]
 use narf_capabilities as _;
 use narf_memory::{
-    alloc_frame, AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr,
+    alloc_frame, free_frame, AddressSpace, PhysAddr, PhysFrame, Region,
+    RegionPerms, VirtAddr,
 };
 
 use crate::pe::{self, BaseRelocKind, PeError, PeImage, Section};
@@ -41,13 +42,56 @@ use crate::trampoline;
 
 /// Spawn-authority alias for a loaded Win32 image.
 ///
-/// Per `capabilities/src/lib.rs`, `Invoke` is the right tag for
-/// "execute / activate / trigger an object's behavior" — exactly
-/// the semantic we want here ("may turn this loaded image into a
-/// running thread"). The `Rights` trait is sealed so we reuse
-/// `Invoke` rather than mint a new tag; downstream code reads
-/// `Cap<WinProcess, Spawn>` to make the intent self-documenting.
+/// `Invoke` is the cap-rights tag NARF defines as
+/// "execute / activate / trigger an object's behavior"
+/// (`capabilities/src/lib.rs` §"Invoke"). A loaded but not-yet-
+/// running `WinProcess` is exactly such an object: holding
+/// `Cap<WinProcess, Invoke>` authorises turning it into a runnable
+/// thread via `entry::enter_winprocess`, the same way
+/// `Cap<CpuLifecycle, Invoke>` authorises bringing up a CPU.
+///
+/// The `Spawn` alias exists at the type level only — readers see
+/// `Cap<WinProcess, Spawn>` and immediately know what the cap does.
+/// The `Rights` trait is sealed (and intentionally so per
+/// `capabilities/`'s spec), so a fresh tag isn't on the table; the
+/// alias is the cleanest way to keep the call-site vocabulary
+/// without forking the rights lattice.
 pub type Spawn = Invoke;
+
+/// RAII guard that frees a vec of physical frames on drop unless
+/// `commit()` has been called. The loader allocates frames in a
+/// loop; if any iteration fails after some succeed, the guard's
+/// drop returns the already-allocated frames to the allocator
+/// rather than leaking them. `commit()` is called after a
+/// successful `map_region` transfers ownership into the
+/// `AddressSpace`'s `Region`.
+struct FrameGuard {
+    frames: Vec<PhysAddr>,
+}
+
+impl FrameGuard {
+    fn new() -> Self { Self { frames: Vec::new() } }
+
+    fn push(&mut self, p: PhysAddr) { self.frames.push(p); }
+
+    /// Take ownership of the frames out of the guard so the caller
+    /// can hand them to a Region. The guard becomes a no-op on
+    /// drop afterwards.
+    fn commit(mut self) -> Vec<PhysAddr> {
+        core::mem::take(&mut self.frames)
+    }
+}
+
+impl Drop for FrameGuard {
+    fn drop(&mut self) {
+        for p in self.frames.drain(..) {
+            // Each addr was returned by alloc_frame and not yet
+            // handed to the AS — exclusive ownership held by this
+            // guard. `free_frame` returns no error.
+            free_frame(PhysFrame::new(p));
+        }
+    }
+}
 
 /// A loaded Win32 process. `address_space` is the underlying NARF
 /// address space with every PE section mapped + relocated +
@@ -266,6 +310,8 @@ pub fn rva_to_phys<'a>(
 pub unsafe fn load_pe(
     bytes:   &[u8],
     resolve: ImportResolver,
+    pid:     u64,
+    tid:     u64,
 ) -> Result<WinProcess, LoadError> {
     let image = pe::parse(bytes)?;
     let chosen_base = image.image_base;
@@ -275,17 +321,19 @@ pub unsafe fn load_pe(
         .map_err(|_| LoadError::AddressSpace)?;
 
     // Materialize each section into freshly-allocated frames.
+    // Frames go through a `FrameGuard` so an alloc failure mid-loop
+    // releases the partial allocation rather than leaking it.
     let mut section_frames: Vec<Vec<PhysAddr>> =
         Vec::with_capacity(image.sections.len());
     for s in &image.sections {
         let pages = ((s.virt_size as u64 + 0xFFF) >> 12) as usize;
-        let mut frames = Vec::with_capacity(pages);
+        let mut guard = FrameGuard::new();
         for _ in 0..pages {
             let f = alloc_frame().map_err(|_| LoadError::NoFrame)?;
-            frames.push(f.start_address());
+            guard.push(f.start_address());
         }
         // Zero every page so the virt_size > raw_size tail is BSS-zero.
-        for &p in &frames {
+        for &p in &guard.frames {
             // SAFETY: identity-mapped low-4-GiB frames.
             unsafe { core::ptr::write_bytes(p.raw() as *mut u8, 0, 4096); }
         }
@@ -299,7 +347,7 @@ pub unsafe fn load_pe(
             }
             let src = &bytes[raw_off..raw_off + raw_size];
             let mut written = 0;
-            for &frame in &frames {
+            for &frame in &guard.frames {
                 if written >= src.len() { break; }
                 let chunk = core::cmp::min(4096, src.len() - written);
                 // SAFETY: identity-mapped freshly-allocated frame; chunk <= 4 KiB.
@@ -314,14 +362,25 @@ pub unsafe fn load_pe(
             }
         }
         // Map the region at chosen_base + virt_addr with PE perms.
+        // perms_of failure returns LoadError before commit() so the
+        // guard's Drop releases the frames.
         let perms = perms_of(s.characteristics)?;
+        let frames_committed = guard.commit();
+        let frames_for_section = frames_committed.clone();
         address_space.map_region(Region {
             base:  VirtAddr::new(chosen_base.wrapping_add(s.virt_addr as u64)),
             len:   (pages as u64) << 12,
             perms,
-            phys:  frames.clone(),
-        }).map_err(|_| LoadError::AddressSpace)?;
-        section_frames.push(frames);
+            phys:  frames_committed,
+        }).map_err(|_| {
+            // map_region failed: the AS doesn't own the frames yet,
+            // so we have to free them here.
+            for p in &frames_for_section {
+                free_frame(PhysFrame::new(*p));
+            }
+            LoadError::AddressSpace
+        })?;
+        section_frames.push(frames_for_section);
     }
 
     // Apply DIR64 relocs.
@@ -341,10 +400,11 @@ pub unsafe fn load_pe(
         }
     }
 
-    // Pick the per-process address layout (PEB / TEB / stack VAs).
-    // Used both by the trampoline page (whose VA sits one page
-    // above the PEB) and by the PEB / TEB population below.
-    let layout = Layout::defaults(chosen_base, /*pid=*/ 1, /*tid=*/ 1);
+    // Pick the per-process address layout (PEB / TEB / stack VAs +
+    // process / thread identifiers + reported OS personality). Used
+    // both by the trampoline page (whose VA sits one page above the
+    // PEB) and by the PEB / TEB population below.
+    let layout = Layout::new(chosen_base, pid, tid);
 
     // Build + map the per-process trampoline page (user-RX). One
     // 4-KiB page covers up to 256 thunk stubs — well above the M0

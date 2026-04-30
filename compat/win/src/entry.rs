@@ -37,11 +37,12 @@ pub unsafe fn enter_winprocess(proc: &WinProcess) -> ! {
     // safe at CPL=0 with the AS in a coherent state (load_pe
     // guarantees that).
     unsafe {
-        // Discard NotImplemented errors — Stage-4 backends lower
-        // the activate call to a real CR3 write; pre-Stage-4 stubs
-        // return NotImplemented and the executor logs them
-        // upstream.
-        let _ = proc.address_space.activate();
+        // A failed activation is unrecoverable — we cannot enter
+        // user mode without the right page table live. Panic with
+        // context rather than silently dropping the error.
+        proc.address_space
+            .activate()
+            .expect("compat/win: AddressSpace::activate failed");
 
         // Program IA32_KERNEL_GS_BASE so post-`swapgs` user mode
         // sees gs_base = teb_va. enter_user_mode does the swapgs

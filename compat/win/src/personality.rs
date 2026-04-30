@@ -67,26 +67,59 @@ pub const DEFAULT_STACK_TOP: u64 = 0x0000_7FFD_E000_0000; // high — RSP starts
 pub const DEFAULT_STACK_LEN: u64 = 0x100_000;             // 1 MiB — Win32 default
 pub const DEFAULT_STACK_BASE: u64 = DEFAULT_STACK_TOP - DEFAULT_STACK_LEN;
 
-/// Bundle of VAs the loader picks for a fresh `WinProcess`. The
-/// stack VAs are populated into `TEB.NT_TIB.StackBase / StackLimit`
-/// at TEB-init time so a Win32 caller's `__chkstk` sees the right
-/// range; the loader does not allocate the stack itself (the
-/// spawner does, mirroring `narf_userspace`'s split between
-/// `load_user_process` and the executor's first-entry stack
-/// allocation).
+/// Bundle of VAs + identifiers the loader uses for a fresh
+/// `WinProcess`. Caller-supplied to keep `load_pe` from baking
+/// process identity into a single hardcoded place — every WinProcess
+/// must get a fresh `pid` / `tid` so two simultaneously-loaded
+/// processes don't collide on `TEB.ClientId`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Layout {
-    pub peb_va:     u64,
-    pub teb_va:     u64,
-    pub image_base: u64,
-    pub stack_base: u64, // LOW address — TEB.NT_TIB.StackLimit
-    pub stack_top:  u64, // HIGH address — TEB.NT_TIB.StackBase
-    pub pid:        u64,
-    pub tid:        u64,
+    pub peb_va:      u64,
+    pub teb_va:      u64,
+    pub image_base:  u64,
+    pub stack_base:  u64, // LOW address — TEB.NT_TIB.StackLimit
+    pub stack_top:   u64, // HIGH address — TEB.NT_TIB.StackBase
+    pub pid:         u64,
+    pub tid:         u64,
+    /// OS-version triple reported through `PEB.OSMajorVersion / -Minor / -Build`.
+    /// PE binaries routinely gate on this — historically NT 6.1+ was
+    /// the floor, modern toolchains assume Windows 10. The default
+    /// pretends to be late-Win10 (the *minimum lie* needed for
+    /// modern PEs to load); a future `compat-win-strict` mode could
+    /// report NARF's own version (0, 0, 0) and refuse to run binaries
+    /// that gate on Windows. Keep this field explicit so the lie is
+    /// never silent.
+    pub os_version: OsVersion,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct OsVersion {
+    pub major: u32,
+    pub minor: u32,
+    pub build: u16,
+}
+
+impl OsVersion {
+    /// Win10 1809 (build 17763) is the floor for any modern toolchain;
+    /// 19045 is a concrete late-Win10 build that satisfies version
+    /// checks without claiming Win11 (which gates on a different
+    /// `ProcessorFeatureSet` field we haven't filled in).
+    pub const WIN10_LATE: Self = Self { major: 10, minor: 0, build: 19045 };
+
+    /// NARF reports itself. PE binaries that gate on
+    /// `OSMajorVersion >= 6` will refuse to load — fine for tests
+    /// that want to confirm a binary actually walks `PEB.OSVersion`.
+    pub const NARF_HONEST: Self = Self { major: 0, minor: 0, build: 0 };
 }
 
 impl Layout {
-    pub const fn defaults(image_base: u64, pid: u64, tid: u64) -> Self {
+    /// Pin all of: VAs (defaults from this module's `DEFAULT_*` consts),
+    /// process / thread identifiers (caller-supplied so two WinProcesses
+    /// don't collide on `TEB.ClientId`), and OS-version personality
+    /// (defaults to `OsVersion::WIN10_LATE` so modern PE toolchains
+    /// pass their version gates — flip to `OsVersion::NARF_HONEST` for
+    /// tests that want to observe a binary's gate behaviour).
+    pub const fn new(image_base: u64, pid: u64, tid: u64) -> Self {
         Self {
             peb_va:     DEFAULT_PEB_VA,
             teb_va:     DEFAULT_TEB_VA,
@@ -95,6 +128,7 @@ impl Layout {
             stack_top:  DEFAULT_STACK_TOP,
             pid,
             tid,
+            os_version: OsVersion::WIN10_LATE,
         }
     }
 }
@@ -126,13 +160,9 @@ fn put_u16(buf: &mut [u8], off: usize, val: u16) {
 /// rather than make up zero-pointers.
 pub fn init_peb(peb: &mut [u8; PAGE], layout: Layout) {
     put_u64(peb, PEB_IMAGE_BASE_ADDRESS, layout.image_base);
-    // Win10 1809+ (build 17763) is the floor for any modern toolchain;
-    // we report a concrete late-Win10 build to satisfy version checks
-    // without claiming Win11 (which gates on a different
-    // ProcessorFeatureSet field we haven't filled in).
-    put_u32(peb, PEB_OS_MAJOR_VERSION, 10);
-    put_u32(peb, PEB_OS_MINOR_VERSION, 0);
-    put_u16(peb, PEB_OS_BUILD_NUMBER, 19045);
+    put_u32(peb, PEB_OS_MAJOR_VERSION, layout.os_version.major);
+    put_u32(peb, PEB_OS_MINOR_VERSION, layout.os_version.minor);
+    put_u16(peb, PEB_OS_BUILD_NUMBER, layout.os_version.build);
 }
 
 /// Populate a freshly-zeroed TEB page. M0 fills the NT_TIB stack
@@ -172,6 +202,7 @@ mod tests {
             stack_top:  0x7FF8_0000,
             pid:        0xCAFE,
             tid:        0xBABE,
+            os_version: OsVersion::WIN10_LATE,
         }
     }
 
@@ -239,13 +270,15 @@ mod tests {
     }
 
     #[test]
-    fn defaults_make_sense() {
-        let l = Layout::defaults(0x1_4000_0000, 1, 1);
+    fn new_layout_makes_sense() {
+        let l = Layout::new(0x1_4000_0000, 1, 1);
         // Stack range must not overlap PEB / TEB — sanity check on
         // the constants chosen above.
         assert!(l.stack_top <= l.teb_va);
         assert!(l.teb_va < l.peb_va);
         // Stack is the documented Win32 default 1 MiB.
         assert_eq!(l.stack_top - l.stack_base, 0x100_000);
+        // OS-version default is the Win10-late lie.
+        assert_eq!(l.os_version, OsVersion::WIN10_LATE);
     }
 }

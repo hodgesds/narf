@@ -20595,7 +20595,7 @@ fn smoke_compat_win_load_pe_pipeline() -> TestResult {
     // SAFETY: the kernel test harness runs with the low-4-GiB
     // identity map and frame allocator initialised — both contracts
     // load_pe documents.
-    let proc = match unsafe { load_pe(&bytes, resolver) } {
+    let proc = match unsafe { load_pe(&bytes, resolver, /*pid=*/ 0xCAFE, /*tid=*/ 0xBABE) } {
         Ok(p)  => p,
         Err(_) => return TestResult::Fail("compat-win: load_pe failed"),
     };
