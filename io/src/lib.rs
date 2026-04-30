@@ -162,8 +162,22 @@ fn alloc_with(len: usize, domain: DomainId, coherency: Coherency) -> Result<DmaB
     }
 
     let frame = alloc_frame()?;
+    let phys = frame.start_address();
+    // Zero-fill the buffer. `alloc_frame` returns recycled frames
+    // un-zeroed; drivers that build descriptor rings, completion
+    // queues, or any phase-tagged structure on top of the buffer
+    // rely on starting from a known-zero state. Without this,
+    // stale phase bits / used-ring entries / status words from a
+    // previous tenant cause non-deterministic init failures
+    // (NVMe identify VID mismatch, virtio control-vq wedge, etc.)
+    // depending on which test ran before.
+    //
+    // SAFETY: `phys.raw()` is a freshly allocated page; identity-
+    // mapped on x86_64 + the boot identity map on aarch64 (DMA
+    // buffers must be reachable by the CPU on both arches).
+    unsafe { core::ptr::write_bytes(phys.raw() as *mut u8, 0, page); }
     Ok(DmaBuffer {
-        phys:      frame.start_address(),
+        phys,
         len:       page,
         domain,
         coherency,
