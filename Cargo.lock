@@ -585,6 +585,7 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-scheduler",
+ "narf-shmem",
  "narf-userspace",
 ]
 

@@ -37,7 +37,7 @@ pub mod cmd_ring;
 pub mod drain_task;
 pub mod registry;
 pub use client::{allocate_singleton_ring, FbClient};
-pub use cmd_ring::{DrawCmd, DrawRing, RING_DEPTH, TAG_FILL, TAG_FLUSH};
+pub use cmd_ring::{DrawCmd, DrawRing, RING_DEPTH, TAG_BLIT, TAG_FILL, TAG_FLUSH};
 pub use drain_task::{drain_once, stats as drain_stats, DrainTask};
 pub use registry::{
     connect as registry_connect, disconnect as registry_disconnect,
@@ -375,11 +375,9 @@ impl FbWriter {
     /// rects are clipped; the source is sub-sampled accordingly
     /// (top-left aligned at the unclipped origin).
     ///
-    /// Kernel-side primitive — userspace blit lands when the FB
-    /// surface gains a per-handle staging buffer (`SYS_FB_BUFFER_MAP`)
-    /// and a `TAG_BLIT` wire format. Until then, the splash composer,
-    /// font glyph paths, and any future kernel-side compositor use
-    /// this directly.
+    /// Kernel-side primitive for callers that already have the
+    /// pixels in a `&[Pixel32]`. Userspace producers go through
+    /// `blit_from_shmem` via `TAG_BLIT` instead.
     pub fn blit(
         &self,
         rect: Rect,
@@ -404,6 +402,65 @@ impl FbWriter {
                 let s = src[(dy + row as usize) * (rect.w as usize)
                           + (dx + col as usize)];
                 fb.draw_pixel(clipped.x + col, clipped.y + row, s);
+            }
+        }
+        Ok(())
+    }
+
+    /// Blit from a `narf-shmem` region. `buffer` is the shmem
+    /// handle; `src_offset` is the byte offset of the top-left
+    /// source pixel; `src_stride` is bytes per source row
+    /// (typically `w * 4`, but may be larger to blit a sub-rect
+    /// of a wider image). The source format is XRGB8888.
+    ///
+    /// Out-of-bounds destination rects are clipped; clipped
+    /// pixels skip the source read so an off-screen edge of the
+    /// blit doesn't fault on a missing shmem byte.
+    pub fn blit_from_shmem(
+        &self,
+        rect:       Rect,
+        buffer:     u64,
+        src_offset: u32,
+        src_stride: u32,
+    ) -> Result<(), FbWriteError> {
+        self.check_live()?;
+        if src_stride < rect.w.saturating_mul(4) {
+            return Err(FbWriteError::OutOfBounds);
+        }
+        let clipped = rect.clip(self.scanout.width(), self.scanout.height())
+            .ok_or(FbWriteError::OutOfBounds)?;
+        let dx = (clipped.x - rect.x) as u32;
+        let dy = (clipped.y - rect.y) as u32;
+        // Pre-validate the deepest source byte: if the buffer is
+        // too small or the handle is bogus, fail before any pixel
+        // lands on the scanout.
+        let last_row = dy + clipped.h - 1;
+        let last_col = dx + clipped.w - 1;
+        let last_off = src_offset as u64
+            + last_row as u64 * src_stride as u64
+            + last_col as u64 * 4
+            + 3;
+        if narf_shmem::phys_at(buffer, last_off).is_none() {
+            return Err(FbWriteError::OutOfBounds);
+        }
+        // SAFETY: cap-checked above; FbWriter owns exclusive Write.
+        let mut fb = unsafe { self.scanout.framebuffer() };
+        for row in 0..clipped.h {
+            let row_base = src_offset as u64
+                + (dy + row) as u64 * src_stride as u64
+                + dx as u64 * 4;
+            for col in 0..clipped.w {
+                let off = row_base + col as u64 * 4;
+                // SAFETY: identity-mapped low-RAM frame; we
+                // pre-validated `last_off`, so every (row, col)
+                // pair within the clipped region maps to a valid
+                // phys we own (kernel-allocated shmem frames).
+                let phys = match narf_shmem::phys_at(buffer, off) {
+                    Some(p) => p,
+                    None    => return Err(FbWriteError::OutOfBounds),
+                };
+                let pix = unsafe { core::ptr::read_volatile(phys as *const u32) };
+                fb.draw_pixel(clipped.x + col, clipped.y + row, Pixel32(pix));
             }
         }
         Ok(())

@@ -22,6 +22,7 @@ narf-ipc          = { path = "../ipc" }
 narf-memory       = { path = "../memory" }
 narf-userspace    = { path = "../userspace" }
 narf-scheduler    = { path = "../scheduler" }
+narf-shmem        = { path = "../shmem" }
 
 [lints]
 workspace = true

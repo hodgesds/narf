@@ -4,11 +4,13 @@
 //! `FbWriter`.
 //!
 //! Layout note: `DrawCmd` is `#[repr(C)]` with a u32 discriminant
-//! tag and a fixed-size payload union represented as inline fields.
-//! The whole struct is 32 bytes — small enough that 16 commands
-//! plus the 64-byte SharedRing header fit in the first ~640 bytes
-//! of one page. Userspace and kernel see the same bytes, so we
-//! cannot use `Rust` enums (their layout is implementation-defined).
+//! tag and inline payload fields; we cannot use Rust enums
+//! (their layout is implementation-defined, and userspace +
+//! kernel must see the same bytes). The whole struct is 48 bytes
+//! — large enough for `TAG_BLIT`'s 64-bit shmem handle + offset +
+//! stride alongside the existing FILL/FLUSH fields, and 16
+//! commands × 48 bytes + the 64-byte SharedRing header still
+//! fits comfortably in one 4 KiB page (832 / 4096 used).
 //!
 //! Pixel value is XRGB8888 packed into a u32 to match
 //! `narf_graphics::Pixel32`.
@@ -24,21 +26,40 @@ use crate::{FbWriter, FbWriteError, Rect};
 /// Wire-stable draw-command tags.
 pub const TAG_FILL:  u32 = 1;
 pub const TAG_FLUSH: u32 = 2;
+pub const TAG_BLIT:  u32 = 3;
 
-/// 32-byte wire-format command. `tag` selects which fields are
+/// 48-byte wire-format command. `tag` selects which fields are
 /// meaningful; the consumer matches on it.
+///
+/// Field semantics by tag:
+/// - `TAG_FILL`:  `(x, y, w, h)` rect; `pixel` = XRGB8888.
+/// - `TAG_FLUSH`: `(x, y, w, h)` rect to push; other fields zero.
+/// - `TAG_BLIT`:  `(x, y, w, h)` = dst rect on scanout;
+///                `buffer` = `narf-shmem` handle owned by the
+///                same pid as the connection's `FbHandle`;
+///                `src_offset` = byte offset into the shmem
+///                where the row-major XRGB8888 source begins;
+///                `src_stride` = bytes per source row (typically
+///                `w * 4`, but caller may set larger to blit a
+///                sub-rect of a wider image).
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct DrawCmd {
-    pub tag:    u32,
-    pub _pad:   u32,
-    pub x:      u32,
-    pub y:      u32,
-    pub w:      u32,
-    pub h:      u32,
-    /// XRGB8888 pixel for FILL; ignored for FLUSH.
-    pub pixel:  u32,
-    pub _pad2:  u32,
+    pub tag:        u32,
+    pub _pad:       u32,
+    pub x:          u32,
+    pub y:          u32,
+    pub w:          u32,
+    pub h:          u32,
+    /// XRGB8888 pixel for FILL; ignored for FLUSH/BLIT.
+    pub pixel:      u32,
+    pub _pad2:      u32,
+    /// Shmem handle for BLIT; ignored for FILL/FLUSH.
+    pub buffer:     u64,
+    /// Byte offset into the shmem buffer for BLIT.
+    pub src_offset: u32,
+    /// Bytes per row in the source buffer for BLIT.
+    pub src_stride: u32,
 }
 
 impl core::fmt::Debug for DrawCmd {
@@ -48,6 +69,9 @@ impl core::fmt::Debug for DrawCmd {
                                    self.x, self.y, self.w, self.h, self.pixel),
             TAG_FLUSH => write!(f, "Flush {{ rect: ({},{}, {}x{}) }}",
                                    self.x, self.y, self.w, self.h),
+            TAG_BLIT  => write!(f, "Blit {{ rect: ({},{}, {}x{}), shmem: {}, off: {}, stride: {} }}",
+                                   self.x, self.y, self.w, self.h,
+                                   self.buffer, self.src_offset, self.src_stride),
             _         => write!(f, "DrawCmd {{ unknown tag {:#x} }}", self.tag),
         }
     }
@@ -59,6 +83,7 @@ impl DrawCmd {
             tag: TAG_FILL, _pad: 0,
             x: rect.x, y: rect.y, w: rect.w, h: rect.h,
             pixel, _pad2: 0,
+            buffer: 0, src_offset: 0, src_stride: 0,
         }
     }
     pub const fn flush(rect: Rect) -> Self {
@@ -66,6 +91,15 @@ impl DrawCmd {
             tag: TAG_FLUSH, _pad: 0,
             x: rect.x, y: rect.y, w: rect.w, h: rect.h,
             pixel: 0, _pad2: 0,
+            buffer: 0, src_offset: 0, src_stride: 0,
+        }
+    }
+    pub const fn blit(rect: Rect, buffer: u64, src_offset: u32, src_stride: u32) -> Self {
+        Self {
+            tag: TAG_BLIT, _pad: 0,
+            x: rect.x, y: rect.y, w: rect.w, h: rect.h,
+            pixel: 0, _pad2: 0,
+            buffer, src_offset, src_stride,
         }
     }
 }
@@ -126,6 +160,9 @@ pub fn drain(consumer: &mut SharedConsumer<DrawCmd, RING_DEPTH>,
                 let res: Result<(), FbWriteError> = match cmd.tag {
                     TAG_FILL  => writer.fill(rect, narf_graphics::Pixel32(cmd.pixel)),
                     TAG_FLUSH => writer.flush(rect),
+                    TAG_BLIT  => writer.blit_from_shmem(
+                        rect, cmd.buffer, cmd.src_offset, cmd.src_stride,
+                    ),
                     _         => Err(FbWriteError::OutOfBounds),
                 };
                 if res.is_err() { errors += 1; } else { executed += 1; }

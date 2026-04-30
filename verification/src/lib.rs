@@ -2123,6 +2123,106 @@ fn smoke_fb_writer_blit_round_trip() -> TestResult {
 }
 kernel_test!(smoke_fb_writer_blit_round_trip);
 
+fn smoke_fb_tag_blit_via_shmem() -> TestResult {
+    // End-to-end TAG_BLIT: allocate a Shmem, fill with a 4×4
+    // checkerboard pattern, enqueue a TAG_BLIT cmd referencing
+    // it, drain through the cmd ring, verify pixels landed on
+    // the test scanout.
+    use narf_fb::{
+        bootstrap_writer, clear_test_scanout, cmd_ring, drain_once,
+        install_test_scanout, registry, test_scanout_pixel,
+        DrawCmd, FbWriter, Rect,
+    };
+    use narf_fb::cmd_ring::{RING_DEPTH, DrawRing};
+    use narf_graphics::Pixel32;
+    use narf_ipc::shared_ring::SharedProducer;
+    use narf_shmem::{__reset_for_test as shmem_reset, create as shmem_create, phys_at};
+
+    install_test_scanout(64, 64);
+    registry::__reset_for_test();
+    narf_fb::drain_task::__reset_for_test();
+    shmem_reset();
+
+    // Connect FB + populate a 4×4 source.
+    let pid = 6001u64;
+    let h = match registry::connect(pid, 0) {
+        Ok(h)  => h,
+        Err(_) => { clear_test_scanout(); return TestResult::Fail("connect"); }
+    };
+    let phys_ring = match registry::ring_phys(h) {
+        Some(p) => p,
+        None    => { clear_test_scanout(); return TestResult::Fail("ring_phys"); }
+    };
+    let mut producer: SharedProducer<DrawCmd, RING_DEPTH> =
+        // SAFETY: SPSC contract — kernel-side test, sole producer.
+        unsafe { SharedProducer::from_raw(phys_ring as *mut DrawRing) };
+
+    // Source shmem: 64 bytes (4 × 4 × 4). Fill with a checker.
+    let buf = match shmem_create(pid, 64) {
+        Ok(h)  => h,
+        Err(_) => { clear_test_scanout(); return TestResult::Fail("shmem_create"); }
+    };
+    let on  = Pixel32::rgb(0xAA, 0xBB, 0xCC).raw();
+    let off = Pixel32::rgb(0x11, 0x22, 0x33).raw();
+    for row in 0..4u32 {
+        for col in 0..4u32 {
+            let off_b = row * 16 + col * 4;
+            let pix   = if (row + col) % 2 == 0 { on } else { off };
+            let phys  = phys_at(buf, off_b as u64).expect("phys");
+            // SAFETY: identity-mapped fresh shmem frame.
+            unsafe { core::ptr::write_volatile(phys as *mut u32, pix); }
+        }
+    }
+
+    // Enqueue TAG_BLIT into dst rect (8, 8, 4, 4); src stride 16.
+    if cmd_ring::try_send(
+        &mut producer,
+        DrawCmd::blit(Rect::new(8, 8, 4, 4), buf, 0, 16),
+    ).is_err() {
+        clear_test_scanout();
+        return TestResult::Fail("send blit");
+    }
+
+    let cap    = bootstrap_writer();
+    let writer = FbWriter::new(cap).expect("writer");
+    let (ok, err) = drain_once(&writer);
+    if ok != 1 || err != 0 {
+        clear_test_scanout();
+        return TestResult::Fail("drain mismatch");
+    }
+
+    // Verify each cell of the checker landed at the right scanout
+    // pos. (8,8) is on, (9,8) off, (8,9) off, (9,9) on, etc.
+    let cases = [
+        (8,  8, on),
+        (9,  8, off),
+        (8,  9, off),
+        (9,  9, on),
+        (11, 11, on), // bottom-right corner, (3+3) even
+    ];
+    for (x, y, want) in cases.iter() {
+        match test_scanout_pixel(*x, *y) {
+            Some(p) if p.raw() == *want => {}
+            Some(_) => { clear_test_scanout(); return TestResult::Fail("blit pixel mismatch"); }
+            None    => { clear_test_scanout(); return TestResult::Fail("oob"); }
+        }
+    }
+    // Outside the dst rect should still be 0.
+    if let Some(p) = test_scanout_pixel(20, 20) {
+        if p.raw() != 0 {
+            clear_test_scanout();
+            return TestResult::Fail("blit overran dst rect");
+        }
+    }
+
+    registry::__reset_for_test();
+    narf_fb::drain_task::__reset_for_test();
+    shmem_reset();
+    clear_test_scanout();
+    TestResult::Pass
+}
+kernel_test!(smoke_fb_tag_blit_via_shmem);
+
 fn smoke_fb_rect_clip_math() -> TestResult {
     use narf_fb::Rect;
     let r = Rect::new(10, 10, 100, 100).clip(50, 50).unwrap();
@@ -2139,15 +2239,15 @@ fn smoke_fb_rect_clip_math() -> TestResult {
 }
 kernel_test!(smoke_fb_rect_clip_math);
 
-fn smoke_fb_drawcmd_size_is_32() -> TestResult {
+fn smoke_fb_drawcmd_size_is_48() -> TestResult {
     use core::mem::size_of;
     use narf_fb::DrawCmd;
-    if size_of::<DrawCmd>() != 32 {
-        return TestResult::Fail("DrawCmd size drifted from 32 bytes");
+    if size_of::<DrawCmd>() != 48 {
+        return TestResult::Fail("DrawCmd size drifted from 48 bytes");
     }
     TestResult::Pass
 }
-kernel_test!(smoke_fb_drawcmd_size_is_32);
+kernel_test!(smoke_fb_drawcmd_size_is_48);
 
 fn smoke_fb_cmd_ring_round_trip() -> TestResult {
     // Build a ring backed by a heap-allocated DrawRing, send a Fill,
