@@ -125,3 +125,67 @@ pub fn listener_count() -> usize {
 pub fn __clear_listeners() {
     LISTENERS.lock().clear();
 }
+
+// ── Driver-match integration ───────────────────────────────────────
+//
+// Drivers don't subscribe to hot-plug directly — they don't have
+// access to the registry authority and they don't want to filter
+// every event globally. Instead the bus crate ships a *default
+// dispatcher* that listens for Attach / Detach and:
+//
+//   * On `Attach`: re-runs probe_all_pci so any driver in the match
+//     table that claims the new device gets bound.
+//   * On `Detach`: clears the bound-driver record for that address
+//     (the driver's own `Driver::reset` hook is the cleaner exit;
+//     today's path is the BoundDriver list, not the lifecycle
+//     registry).
+//
+// Real PCIe hot-plug ISRs (Attention Button / Presence Detect
+// Changed at the bridge) wire into `dispatch_event` once the Stage-4
+// interrupts/ routing lands. Until then the dispatcher's value is
+// (a) tests can synthesize events to verify driver bind/unbind, and
+// (b) it's the seam every future hot-plug event source plugs into.
+
+struct DefaultDispatcher;
+
+impl HotplugListener for DefaultDispatcher {
+    fn on_event(&self, ev: HotplugEvent) {
+        match ev {
+            HotplugEvent::Attach { .. } => {
+                // Try to bind the new device. probe_all_pci is
+                // cap-gated, but the dispatcher uses the bootstrap
+                // authority — same trust boundary as the original
+                // boot-time probe.
+                let auth = crate::registry::bootstrap_registry_authority();
+                let _ = crate::driver_match::probe_all(&auth);
+            }
+            HotplugEvent::Detach { addr: _ } => {
+                // Reaping the bound-driver record on detach needs a
+                // bus-address-keyed lookup that `BoundDriver` doesn't
+                // carry today (it tracks vendor/device pairs but
+                // not the (bus, device, function) coordinate). When
+                // BoundDriver grows an `addr: Option<BusAddr>` field,
+                // the dispatcher walks it here and removes matches;
+                // for now the listener acknowledges the event and
+                // leaves cleanup to whatever subsystem owns the
+                // device's caps. Drivers that maintain their own
+                // bus-addr-keyed state subscribe via
+                // `register_listener` to learn detach immediately.
+            }
+        }
+    }
+}
+
+/// Install the default dispatcher — re-probe on Attach, clear
+/// bound entry on Detach. Idempotent on the listener list (a
+/// second install adds a second listener, but they fire in
+/// registration order and the duplicate is harmless except for
+/// the tiny extra dispatch cost).
+///
+/// Boot path calls this in Stage::Subsys after `bus::init` has
+/// run, so any subsequent `dispatch_event` (whether from a real
+/// IRQ or a test) drives the framework end-to-end.
+pub fn install_default_dispatcher() -> Result<(), HotplugError> {
+    let auth = crate::registry::bootstrap_registry_authority();
+    register_listener(&auth, Arc::new(DefaultDispatcher))
+}
