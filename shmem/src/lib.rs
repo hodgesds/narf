@@ -118,6 +118,67 @@ pub fn phys_at(handle: u64, byte_offset: u64) -> Option<u64> {
     Some(e.frames[page_idx] + intra)
 }
 
+/// Scatter-gather descriptor: one physically-contiguous run within
+/// a shmem region. Drivers iterate these to build per-segment
+/// device-side descriptors (virtio chained desc, NVMe PRP/SGL,
+/// GPU command-buffer entries).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SgEntry {
+    pub phys: u64,
+    pub len:  u32,
+}
+
+/// Walk a `(handle, byte_offset, byte_len)` slice as scatter-
+/// gather entries. Each entry is bounded above by `byte_len`,
+/// the page boundary, and the region's end. Returns `None` if
+/// the handle is unknown or `(byte_offset + byte_len)` exceeds
+/// the region.
+///
+/// # Example
+/// A 7000-byte slice starting at offset 100 of a 2-page region
+/// yields two entries:
+/// - `(frame0 + 100, 4096 - 100 = 3996)`
+/// - `(frame1, 7000 - 3996 = 3004)`
+pub fn sg_iter(
+    handle:      u64,
+    byte_offset: u64,
+    byte_len:    u64,
+) -> Option<SgIter> {
+    let g = REGISTRY.lock();
+    let e = g.iter().find(|e| e.handle == handle)?;
+    let end = byte_offset.checked_add(byte_len)?;
+    if end > e.len { return None; }
+    Some(SgIter {
+        frames:    e.frames.clone(),
+        cursor:    byte_offset,
+        remaining: byte_len,
+    })
+}
+
+/// Iterator returned by [`sg_iter`]. `Iterator::Item` is one
+/// `SgEntry` per contiguous page-bounded run.
+#[derive(Debug)]
+pub struct SgIter {
+    frames:    Vec<u64>,
+    cursor:    u64,
+    remaining: u64,
+}
+
+impl Iterator for SgIter {
+    type Item = SgEntry;
+    fn next(&mut self) -> Option<SgEntry> {
+        if self.remaining == 0 { return None; }
+        let page_idx = (self.cursor / PAGE) as usize;
+        let intra    = self.cursor & (PAGE - 1);
+        let in_page  = PAGE - intra;
+        let take     = in_page.min(self.remaining);
+        let phys     = self.frames[page_idx] + intra;
+        self.cursor    += take;
+        self.remaining -= take;
+        Some(SgEntry { phys, len: take as u32 })
+    }
+}
+
 /// Snapshot of the per-page phys list, for the syscall handler
 /// that installs the user-VA mapping.
 pub fn frames_of(handle: u64) -> Option<Vec<PhysAddr>> {
