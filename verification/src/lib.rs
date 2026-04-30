@@ -8216,7 +8216,20 @@ fn smoke_virtio_blk_pci_irq_driven() -> TestResult {
     let mut sector = [0u8; 512];
     let read_ok = blk_pci::with_controller(|c| c.read_sector_irq(0, &mut sector))
         .map(|r| r.is_ok()).unwrap_or(false);
-    let after = narf_interrupts::fire_count(v);
+    // The driver runs entirely under `with_controller`'s IrqSafeSpinLock,
+    // which now (correctly) disables IRQs for its critical section.
+    // MSI-X delivery is latched in the LAPIC IRR for the duration and
+    // only fires once the lock drops + IF re-enables — that happens
+    // a few instructions before this point, but the latched IRQ may
+    // not have been delivered to the CPU yet. Wait briefly for the
+    // counter to move; if it doesn't, the device truly didn't fire.
+    let mut spins = 0u32;
+    let after = loop {
+        let now = narf_interrupts::fire_count(v);
+        if now > baseline || spins > 1_000_000 { break now; }
+        spins += 1;
+        core::hint::spin_loop();
+    };
     // SAFETY: counterpart.
     unsafe { narf_arch::disable_interrupts(); }
     if !read_ok { return TestResult::Fail("read_sector_irq failed"); }
@@ -8233,6 +8246,95 @@ fn smoke_virtio_blk_pci_irq_driven() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_virtio_blk_pci_irq_driven);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_virtio_blk_pci_irq_async() -> TestResult {
+    // Diagnostic variant: drives `read_sector_irq_async` via a
+    // manual poll loop with a tight bound; reports the phase
+    // counter on stall so we see exactly where the future wedges.
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind, probe_all_pci};
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_drivers_virtio::blk_pci;
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use core::sync::atomic::Ordering;
+
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let dev = match devs.iter().find(|d|
+        matches!(&d.kind, BusKind::Pcie { .. })
+        && d.id.vendor == blk_pci::VIRTIO_BLK_PCI_VENDOR
+        && d.id.device == blk_pci::VIRTIO_BLK_PCI_DEVICE)
+    {
+        Some(d) => *d,
+        None    => return TestResult::Skip("no virtio-blk-pci device"),
+    };
+    __reset_for_test();
+    blk_pci::register_pci_driver();
+    let authority = bootstrap_registry_authority();
+    if probe_all_pci(&authority).is_err() {
+        return TestResult::Fail("probe_all_pci");
+    }
+    let (_h, cap) = match claim_device_cap(&authority, dev.addr) {
+        Ok(ok) => ok,
+        Err(_) => return TestResult::Fail("claim_device_cap"),
+    };
+    let v = match blk_pci::enable_msix_for_probed(&cap, &dev) {
+        Ok(v)  => v,
+        Err(_) => return TestResult::Fail("enable_msix"),
+    };
+
+    fn nw_clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VT) }
+    fn nw_wake(_: *const ()) {}
+    fn nw_wake_by_ref(_: *const ()) {}
+    fn nw_drop(_: *const ()) {}
+    static VT: RawWakerVTable =
+        RawWakerVTable::new(nw_clone, nw_wake, nw_wake_by_ref, nw_drop);
+    // SAFETY: vtable functions are non-null; constructed for a
+    // one-shot local poll.
+    let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT)) };
+    let mut ctx = Context::from_waker(&waker);
+
+    // SAFETY: APIC initialised; OK to enable for the test.
+    unsafe { narf_arch::enable_interrupts(); }
+    let baseline = narf_interrupts::fire_count(v);
+    let mut fut = alloc::boxed::Box::pin(blk_pci::read_sector_irq_async(0));
+    let mut polls = 0u32;
+    let result = loop {
+        match Pin::new(&mut fut).poll(&mut ctx) {
+            Poll::Ready(r) => break Some(r),
+            Poll::Pending  => {
+                polls += 1;
+                if polls > 100 { break None; }
+                narf_arch::halt_until_irq();
+            }
+        }
+    };
+    let after = narf_interrupts::fire_count(v);
+    // SAFETY: counterpart.
+    unsafe { narf_arch::disable_interrupts(); }
+
+    match result {
+        Some(Ok(sector)) => {
+            for i in 0..512usize {
+                let expected = (i as u8).wrapping_mul(0x97);
+                if sector[i] != expected {
+                    return TestResult::Fail("pattern mismatch");
+                }
+            }
+            if after <= baseline {
+                return TestResult::Fail("MSI-X fire_count never moved");
+            }
+            TestResult::Pass
+        }
+        Some(Err(_)) => TestResult::Fail("read_sector_irq_async returned Err"),
+        None         => TestResult::Fail("future never resolved within poll budget"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_virtio_blk_pci_irq_async);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_virtio_net_pci_tx() -> TestResult {
@@ -16287,7 +16389,7 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
         // as a Stage-4 follow-up. Exiting here preserves the
         // testbin's pass signal in QEMU's exit code.
         use core::fmt::Write as _;
-        let mut w = narf_console::Writer;
+        let mut w = Writer;
         // FB probe verification: after the testbin returns, drain
         // anything it enqueued onto its DrawRing. The drain task
         // we spawn at boot doesn't run inside the test harness
@@ -16537,7 +16639,7 @@ fn smoke_frame_x86_64_run_narf_libc_validate() -> TestResult {
         clear_exit_landing();
         __test_clear_global();
         use core::fmt::Write as _;
-        let mut w = narf_console::Writer;
+        let mut w = Writer;
         let _ = writeln!(w, "  [ OK ] smoke_frame_x86_64_run_narf_libc_validate");
         let _ = writeln!(w, "── narf-libc-validate: validate round-trip succeeded ──");
         // The validate binary's stdout (routed to the kernel

@@ -150,8 +150,10 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for SpinLock<T> {
 // ──────────────────────────────────────────────────────────────────
 
 /// Spinlock variant that disables IRQs for the duration of the critical
-/// section. Stage 1 implements IRQ disable as a stub (we have no IRQ
-/// controller yet); the `IrqGate` hook is where `frame/` plugs in.
+/// section. Required when the lock may be contended between a thread
+/// holding it and an IRQ handler running on the same CPU — without IRQ
+/// disable, the IRQ handler that tries to take the same lock spins
+/// forever waiting for the holder it preempted.
 pub struct IrqSafeSpinLock<T: ?Sized> {
     inner: SpinLock<T>,
 }
@@ -169,10 +171,11 @@ impl<T> IrqSafeSpinLock<T> {
 
 impl<T: ?Sized> IrqSafeSpinLock<T> {
     #[inline]
-    pub fn lock(&self) -> SpinLockGuard<'_, T, IrqsDisabled> {
-        // TODO(stage-2): save and disable IRQs via `arch::irq::save_and_disable`.
-        // Stage 1 has no IRQ controller, so we just acquire. The guard's `Drop`
-        // path will reinstate via the complementary `arch::irq::restore`.
+    pub fn lock(&self) -> IrqSafeSpinLockGuard<'_, T> {
+        // SAFETY: save+disable inline asm is the canonical local IRQ-
+        // disable sequence on each arch; no platform state is touched
+        // beyond the IF / DAIF.I bit of the running CPU.
+        let saved = unsafe { irq_save_disable() };
         while self
             .inner
             .locked
@@ -183,9 +186,120 @@ impl<T: ?Sized> IrqSafeSpinLock<T> {
                 spin_loop();
             }
         }
-        SpinLockGuard { lock: &self.inner, _irq: IrqsDisabled }
+        IrqSafeSpinLockGuard { lock: &self.inner, saved }
     }
 }
+
+/// Guard for [`IrqSafeSpinLock`]. Restores the caller's IRQ state on
+/// drop and releases the lock.
+pub struct IrqSafeSpinLockGuard<'a, T: ?Sized> {
+    lock:  &'a SpinLock<T>,
+    saved: IrqSavedState,
+}
+
+impl<T: ?Sized> fmt::Debug for IrqSafeSpinLockGuard<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IrqSafeSpinLockGuard").finish_non_exhaustive()
+    }
+}
+
+impl<T: ?Sized> Deref for IrqSafeSpinLockGuard<'_, T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        // SAFETY: lock is held exclusively for the lifetime of the guard.
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<T: ?Sized> DerefMut for IrqSafeSpinLockGuard<'_, T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: lock is held exclusively.
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+impl<T: ?Sized> Drop for IrqSafeSpinLockGuard<'_, T> {
+    #[inline]
+    fn drop(&mut self) {
+        self.lock.locked.store(false, Ordering::Release);
+        // SAFETY: pairs with `irq_save_disable` from the matching lock
+        // call; restoring the saved state is always sound.
+        unsafe { irq_restore(self.saved); }
+    }
+}
+
+/// Opaque saved IRQ state — the value stashed by `irq_save_disable`
+/// and consumed by `irq_restore`.
+#[derive(Copy, Clone, Debug)]
+pub struct IrqSavedState(u64);
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn irq_save_disable() -> IrqSavedState {
+    let rflags: u64;
+    // SAFETY: pushfq + cli is a pure save+disable. RFLAGS read into a
+    // register, no memory side effect.
+    unsafe {
+        core::arch::asm!(
+            "pushfq",
+            "cli",
+            "pop {0}",
+            out(reg) rflags,
+            options(nostack, preserves_flags),
+        );
+    }
+    IrqSavedState(rflags)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn irq_restore(saved: IrqSavedState) {
+    // If the caller had IRQs enabled (bit 9 = IF), re-enable. We avoid
+    // a full popfq because we don't want to restore arithmetic flags
+    // and risk surprising the surrounding code.
+    if saved.0 & (1u64 << 9) != 0 {
+        // SAFETY: sti just sets IF; pure local-CPU state.
+        unsafe { core::arch::asm!("sti", options(nostack, preserves_flags, nomem)); }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn irq_save_disable() -> IrqSavedState {
+    let daif: u64;
+    // SAFETY: read DAIF, then mask I (IRQ). Pure local-CPU state.
+    unsafe {
+        core::arch::asm!(
+            "mrs {0}, DAIF",
+            "msr DAIFSet, #0x2",
+            out(reg) daif,
+            options(nostack, preserves_flags),
+        );
+    }
+    IrqSavedState(daif)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn irq_restore(saved: IrqSavedState) {
+    // If the caller had IRQs enabled (DAIF.I clear), unmask. We
+    // restore only the I bit; touching the full DAIF would risk
+    // re-enabling FIQ/SError/D unintentionally.
+    if saved.0 & (1u64 << 7) == 0 {
+        // SAFETY: clear DAIF.I; pure local-CPU state.
+        unsafe { core::arch::asm!("msr DAIFClr, #0x2", options(nostack, preserves_flags, nomem)); }
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline(always)]
+unsafe fn irq_save_disable() -> IrqSavedState { IrqSavedState(0) }
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline(always)]
+unsafe fn irq_restore(_: IrqSavedState) {}
 
 impl<T: ?Sized + fmt::Debug> fmt::Debug for IrqSafeSpinLock<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
