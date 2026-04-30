@@ -555,7 +555,7 @@ impl VirtioBlkPci {
             VirtqDesc { addr: status_phys,  len: 1,   flags: VIRTQ_DESC_F_WRITE, next: 0 },
         ];
 
-        let baseline = narf_interrupts::fire_count(v);
+        let _ = v; // fire_count is observed by the caller, not here.
         let head = {
             let mut g = self.queue.lock();
             let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
@@ -568,23 +568,14 @@ impl VirtioBlkPci {
         // SAFETY: identity-mapped notify region.
         unsafe { self.notify.write16(notify_off, 0); }
 
-        // Wait for either the IRQ to fire or the used ring to
-        // advance. Defensive — stale or coalesced IRQ deliveries
-        // won't strand the request.
+        // Wait for the used ring to surface our head. We don't break
+        // on `fire_count > baseline` — a stale or coalesced MSI-X
+        // delivery (from a prior submission, an enable-interrupts
+        // bookkeeping race, etc.) can advance fire_count *before* the
+        // device actually completes this request. The IRQ will still
+        // fire during this poll (MSI-X is wired), so the caller's
+        // post-submit fire_count check still observes the wakeup.
         let mut spins = 0u32;
-        loop {
-            if narf_interrupts::fire_count(v) > baseline { break; }
-            let elem = {
-                let mut g = self.queue.lock();
-                let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
-                q.poll_used()
-            };
-            if let Some((id, _)) = elem { if id == head as u32 { break; } }
-            spins += 1;
-            if spins > 10_000_000 { return Err(VirtioPciError::QueueTooSmall); }
-            core::hint::spin_loop();
-        }
-        // Drain the used ring.
         loop {
             let elem = {
                 let mut g = self.queue.lock();
@@ -594,9 +585,13 @@ impl VirtioBlkPci {
             match elem {
                 Some((id, _)) if id == head as u32 => break,
                 Some(_) => continue,
-                None    => {
-                    // IRQ fired but used ring wasn't fully populated
-                    // yet; tight wait-and-retry.
+                None => {
+                    spins += 1;
+                    if spins > 10_000_000 {
+                        let mut g = self.queue.lock();
+                        if let Some(q) = g.as_mut() { q.free_chain(head); }
+                        return Err(VirtioPciError::QueueTooSmall);
+                    }
                     core::hint::spin_loop();
                 }
             }
