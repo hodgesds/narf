@@ -154,6 +154,15 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for SpinLock<T> {
 /// holding it and an IRQ handler running on the same CPU — without IRQ
 /// disable, the IRQ handler that tries to take the same lock spins
 /// forever waiting for the holder it preempted.
+///
+/// The IRQ disable is implemented inline against the running CPU's
+/// flags register (RFLAGS.IF on x86_64, DAIF.I on aarch64). We do
+/// **not** route through a function-pointer hook installed by the
+/// arch backend: a CPU-local mask is one instruction per arch with
+/// no controller indirection, and a hook would add an indirection
+/// without removing complexity. Multi-controller policy (GIC group
+/// priorities, APIC TPR-based masking, etc.) is the IRQ
+/// dispatcher's job, not the lock's.
 pub struct IrqSafeSpinLock<T: ?Sized> {
     inner: SpinLock<T>,
 }
