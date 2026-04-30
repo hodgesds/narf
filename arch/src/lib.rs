@@ -242,6 +242,12 @@ pub extern "Rust" fn narf_arch_current_domain() -> u8 {
 #[inline(always)]
 pub fn halt_until_irq() { current::asm::halt_until_irq() }
 
+/// Whether IRQs are currently enabled on this CPU. Diagnostic only —
+/// don't gate logic on the result; that races with concurrent IRQ
+/// state changes.
+#[inline(always)]
+pub fn interrupts_enabled() -> bool { current::asm::interrupts_enabled() }
+
 /// End the kernel run with an exit code. Under QEMU this triggers a clean
 /// VM exit; on real hardware / other VMMs it falls back to `halt_forever`.
 /// `code == 0` is "normal success"; non-zero is "failure" — verification

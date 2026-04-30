@@ -8249,9 +8249,20 @@ kernel_test!(smoke_virtio_blk_pci_irq_driven);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_virtio_blk_pci_irq_async() -> TestResult {
-    // Diagnostic variant: drives `read_sector_irq_async` via a
-    // manual poll loop with a tight bound; reports the phase
-    // counter on stall so we see exactly where the future wedges.
+    // Drives `read_sector_irq_async` via a manual poll loop —
+    // exercises wait_for_irq().await end-to-end against a real
+    // MSI-X-driven device.
+    //
+    // KNOWN INTERMITTENT FLAKE on x86_64 SMP=2: about 5% of runs
+    // will hang here because the device's post-submit MSI-X
+    // delivery races with `WaitForIrq::poll`'s second fire_count
+    // read in a way I haven't fully root-caused. Adding any kind
+    // of latency between submit and the await (a print, a small
+    // spin) makes the hang disappear, and dropping to SMP=1 makes
+    // it disappear deterministically — neither of which is a real
+    // fix. The IrqSafeSpinLock asm-options fix landed alongside
+    // this comment is independent and IS load-bearing; this smoke
+    // is left in place as a target for the next debugging pass.
     use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind, probe_all_pci};
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
@@ -8259,7 +8270,6 @@ fn smoke_virtio_blk_pci_irq_async() -> TestResult {
     use core::future::Future;
     use core::pin::Pin;
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-    use core::sync::atomic::Ordering;
 
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
