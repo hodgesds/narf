@@ -120,6 +120,20 @@ pub fn active_user_as() -> Option<Arc<AddressSpace>> {
     current_address_space()
 }
 
+/// Snapshot of the registered kernel-side `(rip, rsp)` exit landing
+/// — the same pair `set_exit_landing` writes and `sys_exit_task`
+/// reads. Returns `None` when no landing has been registered.
+///
+/// Used by `narf_compat_win::syscall::WinThunkHandler` so a Win32
+/// `ExitProcess` thunk can `redirect_to_kernel` into the same
+/// teardown landing native `Syscall::ExitTask` uses, rather than
+/// hanging the kernel in a spin-forever placeholder.
+pub fn exit_landing() -> Option<(u64, u64)> {
+    let rip = EXIT_LANDING_RIP.load(Ordering::Acquire);
+    let rsp = EXIT_LANDING_RSP.load(Ordering::Acquire);
+    if rip == 0 { None } else { Some((rip, rsp)) }
+}
+
 // ── Exit-landing registration ──────────────────────────────────────
 
 static EXIT_LANDING_RIP: AtomicU64 = AtomicU64::new(0);

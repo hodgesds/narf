@@ -30,7 +30,7 @@
 //! so we dropped it before it ossified — each thunk is now a typed
 //! Rust function with the actual Win32 signature.
 
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
 
 pub mod kernel32;
 
@@ -54,6 +54,18 @@ pub trait Thunk: Send + Sync + core::fmt::Debug {
 static REGISTRY: AtomicPtr<&'static [&'static dyn Thunk]> =
     AtomicPtr::new(core::ptr::null_mut());
 
+/// Cached thunk id of `kernel32.dll!ExitProcess`. Populated by
+/// `install_registry`. `-1` means "no registry installed yet" /
+/// "the registry doesn't include ExitProcess" — the WinThunk
+/// dispatcher in `compat/win::syscall` reads this and bypasses the
+/// thunk-call path with a kernel-side exit redirect when the
+/// dispatched id matches.
+///
+/// Cached as `i32` rather than `Option<u16>` so a single atomic
+/// load (sentinel = -1) replaces what would otherwise need a lock
+/// on every dispatch.
+static EXIT_PROCESS_ID: AtomicI32 = AtomicI32::new(-1);
+
 /// Install the canonical thunk table. Called once per boot from
 /// the kernel's per-arch init, *before* any PE image is loaded.
 /// Idempotent within a boot — re-installing the same table is fine;
@@ -63,6 +75,21 @@ pub fn install_registry(table: &'static &'static [&'static dyn Thunk]) {
         table as *const _ as *mut _,
         Ordering::Release,
     );
+    // Cache the well-known ExitProcess id so the kernel-side
+    // dispatcher can short-circuit it without re-walking the table.
+    let id = thunk_id("kernel32.dll", "exitprocess")
+        .map(|i| i as i32)
+        .unwrap_or(-1);
+    EXIT_PROCESS_ID.store(id, Ordering::Release);
+}
+
+/// Stable id of `kernel32.dll!ExitProcess` if installed, else `None`.
+/// Consulted by the WinThunk dispatcher to decide whether to
+/// `redirect_to_kernel` the user task into a teardown landing
+/// instead of dispatching the thunk body.
+pub fn exit_process_id() -> Option<u16> {
+    let raw = EXIT_PROCESS_ID.load(Ordering::Acquire);
+    if raw < 0 { None } else { Some(raw as u16) }
 }
 
 /// Look up a thunk by `(module, symbol)`. Returns `None` if the

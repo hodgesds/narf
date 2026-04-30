@@ -177,25 +177,24 @@ win_thunk! {
 //
 // VOID WINAPI ExitProcess(UINT uExitCode);  // does not return.
 //
-// M0 placeholder — spin forever so a stray call during testing
-// does not silently fall through. M1 wires this into
-// `narf_userspace::handlers::set_exit_landing` so the calling task
-// is torn down by the scheduler the way a native `exit(2)` is.
-//
-// The function is declared diverging (`-> !`) so the compiler will
-// refuse to call any code after it on the caller side — the same
-// guarantee the Microsoft prototype gives.
+// Dispatched specially by `compat/win::syscall::WinThunkHandler`:
+// when the SYS_WIN_THUNK trap fires with the cached ExitProcess
+// id, the handler `redirect_to_kernel`s the trap frame into the
+// registered exit landing instead of dispatching this body —
+// symmetric with how `Syscall::ExitTask` tears a native task
+// down. The body therefore exists only as a registry entry whose
+// `entry_addr` populates the trampoline page; running it directly
+// would mean the redirect was bypassed.
 
 win_thunk! {
     name = ("kernel32.dll", "exitprocess");
     struct ExitProcess;
-    // Real Win32 prototype is `VOID ExitProcess(UINT)` (does not
-    // return). Our unified-signature wrapper returns u64 to match
-    // the dispatcher's call shape; the body never reaches the
-    // implicit return because M1 will redirect the trap frame to a
-    // synthetic exit landing — until then the thunk loops.
     extern fn exitprocess_entry(_a0: u64, _a1: u64, _a2: u64, _a3: u64) -> u64 {
-        loop { core::hint::spin_loop(); }
+        // Unreachable under correct dispatch. Panic loudly rather
+        // than spin if the dispatcher is broken or no exit landing
+        // was registered before user mode entered.
+        panic!("compat/win: ExitProcess thunk body reached — \
+                WinThunkHandler exit-redirect path was bypassed");
     }
 }
 

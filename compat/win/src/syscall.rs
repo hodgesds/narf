@@ -54,7 +54,8 @@
 //!      mirrors the kernel-side ones. M2+ work.
 
 use narf_userspace::syscall::{
-    Syscall, SyscallArgs, SyscallHandler, SyscallReturn, SyscallTable,
+    RawSyscallHandler, Syscall, SyscallArgs, SyscallHandler, SyscallReturn,
+    SyscallTable, TrapContext,
 };
 
 use crate::thunks;
@@ -74,20 +75,53 @@ pub const SYS_WIN_THUNK: u32 = Syscall::WinThunk as u32;
 /// `extern "C" fn(u64, u64, u64, u64) -> u64` (aarch64) signature,
 /// and calls it with the user-supplied args.
 ///
-/// Returns `SyscallReturn::ok(thunk_return)` on success,
-/// `SyscallReturn::invalid_op()` when the id doesn't resolve.
+/// Special-cased: when the dispatched id matches the cached
+/// `kernel32!ExitProcess` id and a kernel-side exit landing has
+/// been registered, the handler `redirect_to_kernel`s into the
+/// landing instead of dispatching the thunk body — symmetric with
+/// the way `Syscall::ExitTask` exits a native task. This avoids
+/// the would-be deadlock of calling a `-> !` thunk from inside
+/// the kernel syscall handler and never returning.
+///
+/// Returns `SyscallReturn::ok(thunk_return)` on a normal
+/// dispatch, `SyscallReturn::invalid_op()` when the id doesn't
+/// resolve. After a successful exit redirect the return is
+/// irrelevant — control transfers to the kernel landing.
 #[derive(Debug)]
 pub struct WinThunkHandler;
 
-impl SyscallHandler for WinThunkHandler {
-    fn invoke(&self, args: &SyscallArgs) -> SyscallReturn {
+impl RawSyscallHandler for WinThunkHandler {
+    fn invoke(&self, ctx: &mut dyn TrapContext) {
+        let args = *ctx.args();
         let id = args.arg0 as u16;
+
+        // ExitProcess short-circuit. The thunk's body is a
+        // placeholder loop (it can't actually tear the user task
+        // down from inside extern fn context); the dispatcher
+        // routes around it, mirroring how `Syscall::ExitTask`
+        // does the redirect for native tasks.
+        if let (Some(exit_id), Some((rip, rsp))) =
+            (thunks::exit_process_id(), narf_userspace::exit_landing())
+        {
+            if id == exit_id {
+                if !ctx.redirect_to_kernel(rip, rsp) {
+                    // Arch can't redirect — fall through to a
+                    // generic Ok so at least the user side sees a
+                    // clean return rather than a hang.
+                    ctx.set_return(SyscallReturn::ok(0));
+                }
+                return;
+            }
+        }
+
         let Some(thunk) = thunks::thunk_by_id(id) else {
-            return SyscallReturn::invalid_op();
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
         };
         let addr = thunk.entry_addr();
         if addr == 0 {
-            return SyscallReturn::invalid_op();
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
         }
 
         // Pull the Win32 args out of the arg slots the trampoline
@@ -122,6 +156,47 @@ impl SyscallHandler for WinThunkHandler {
                 f(a0, a1, a2, a3)
             }
         };
+        ctx.set_return(SyscallReturn::ok(ret));
+    }
+}
+
+/// Plain-handler facade over the same dispatch logic. Tests reach
+/// this through a synthesized `SyscallArgs` since they don't have
+/// a real TrapContext. The kernel always installs the `Raw`
+/// variant via [`install`] — this `SyscallHandler` impl is for
+/// host smokes only and never sees the ExitProcess short-circuit
+/// (which requires a real trap frame to redirect).
+impl SyscallHandler for WinThunkHandler {
+    fn invoke(&self, args: &SyscallArgs) -> SyscallReturn {
+        let id = args.arg0 as u16;
+        let Some(thunk) = thunks::thunk_by_id(id) else {
+            return SyscallReturn::invalid_op();
+        };
+        let addr = thunk.entry_addr();
+        if addr == 0 {
+            return SyscallReturn::invalid_op();
+        }
+        #[cfg(target_arch = "x86_64")]
+        let (a0, a1, a2, a3) = (args.arg1, args.arg2, args.arg4, args.arg5);
+        #[cfg(target_arch = "aarch64")]
+        let (a0, a1, a2, a3) = (args.arg0, args.arg1, args.arg2, args.arg3);
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let (a0, a1, a2, a3) = (args.arg1, args.arg2, args.arg4, args.arg5);
+        // SAFETY: see the raw-handler impl above.
+        let ret: u64 = unsafe {
+            #[cfg(target_arch = "aarch64")]
+            {
+                let f: extern "C" fn(u64, u64, u64, u64) -> u64 =
+                    core::mem::transmute(addr);
+                f(a0, a1, a2, a3)
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                let f: extern "win64" fn(u64, u64, u64, u64) -> u64 =
+                    core::mem::transmute(addr);
+                f(a0, a1, a2, a3)
+            }
+        };
         SyscallReturn::ok(ret)
     }
 }
@@ -129,9 +204,11 @@ impl SyscallHandler for WinThunkHandler {
 /// Register the WinThunk dispatcher in `table`. Idempotent — call
 /// it once per boot from the kernel's compat-init path. The
 /// trampoline pages built by `process::load_pe` reach this slot
-/// via `int 0x80` (amd64) / `svc #0` (aarch64).
+/// via `int 0x80` (amd64) / `svc #0` (aarch64). Installs the raw
+/// handler so the dispatcher sees the full trap context (needed
+/// for the ExitProcess redirect path).
 pub fn install(table: &mut SyscallTable) {
-    table.install(Syscall::WinThunk, "win_thunk", WinThunkHandler);
+    table.install_raw(Syscall::WinThunk, "win_thunk", WinThunkHandler);
 }
 
 #[cfg(test)]
@@ -169,7 +246,7 @@ mod tests {
             arg1: (-11i64) as u64,    // STD_OUTPUT_HANDLE
             arg2: 0, arg3: 0, arg4: 0, arg5: 0,
         };
-        let ret = WinThunkHandler.invoke(&args);
+        let ret = SyscallHandler::invoke(&WinThunkHandler, &args);
         assert_eq!(ret.status, SyscallReturn::OK);
         // GetStdHandle returns the sentinel back when the input
         // matches a recognised stream.
@@ -185,7 +262,7 @@ mod tests {
         let args = SyscallArgs {
             arg0: 9999, arg1: 0, arg2: 0, arg3: 0, arg4: 0, arg5: 0,
         };
-        let ret = WinThunkHandler.invoke(&args);
+        let ret = SyscallHandler::invoke(&WinThunkHandler, &args);
         assert_eq!(ret.status, SyscallReturn::INVALID_OP);
     }
 }

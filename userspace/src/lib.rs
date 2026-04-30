@@ -57,7 +57,7 @@ pub use pipe::{pipe_pair, PipeRead, PipeWrite};
 
 pub use elf::{parse as parse_elf, ElfError};
 pub use handlers::{
-    active_user_as,
+    active_user_as, exit_landing,
     abi_file_op_bridge, bootstrap_init, bootstrap_live_count, brk_init,
     clear_exit_landing, cwd_init, cwd_of, default_signal_delivery,
     default_sync_signal_delivery, install_address_space_lookup,
