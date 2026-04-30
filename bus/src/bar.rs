@@ -23,7 +23,7 @@
 //! slots (low + high u32); we sniff bit 2 of the type field to detect
 //! that case and read the upper word too.
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::Ordering;
 
 use narf_memory::PhysAddr;
 
@@ -220,13 +220,9 @@ impl MmioRegion {
     /// device behind the BAR must tolerate the read at this offset.
     #[inline]
     pub unsafe fn read16(&self, offset: u64) -> u16 {
-        compiler_fence(Ordering::SeqCst);
-        // SAFETY: caller-asserted in-range, naturally-aligned.
-        let v = unsafe {
-            core::ptr::read_volatile((self.phys.raw() + offset) as *const u16)
-        };
-        compiler_fence(Ordering::SeqCst);
-        v
+        // SAFETY: caller-asserted in-range, naturally-aligned;
+        // arch::mmio supplies the volatile + arch-correct barrier.
+        unsafe { narf_arch::mmio::read16(self.phys.raw() + offset) }
     }
 
     /// Write a naturally-aligned 16-bit MMIO word at `offset`.
@@ -236,12 +232,8 @@ impl MmioRegion {
     /// the device exclusively.
     #[inline]
     pub unsafe fn write16(&self, offset: u64, value: u16) {
-        compiler_fence(Ordering::SeqCst);
         // SAFETY: caller-asserted in-range, naturally-aligned.
-        unsafe {
-            core::ptr::write_volatile((self.phys.raw() + offset) as *mut u16, value);
-        }
-        compiler_fence(Ordering::SeqCst);
+        unsafe { narf_arch::mmio::write16(self.phys.raw() + offset, value); }
     }
 
     /// Read a naturally-aligned 32-bit MMIO word at `offset`.
@@ -252,13 +244,8 @@ impl MmioRegion {
     /// the caller doesn't want).
     #[inline]
     pub unsafe fn read32(&self, offset: u64) -> u32 {
-        compiler_fence(Ordering::SeqCst);
         // SAFETY: caller-asserted in-range, naturally-aligned.
-        let v = unsafe {
-            core::ptr::read_volatile((self.phys.raw() + offset) as *const u32)
-        };
-        compiler_fence(Ordering::SeqCst);
-        v
+        unsafe { narf_arch::mmio::read32(self.phys.raw() + offset) }
     }
 
     /// Write a naturally-aligned 32-bit MMIO word at `offset`.
@@ -267,12 +254,8 @@ impl MmioRegion {
     /// `offset + 4 <= self.len`; caller owns the device exclusively.
     #[inline]
     pub unsafe fn write32(&self, offset: u64, value: u32) {
-        compiler_fence(Ordering::SeqCst);
         // SAFETY: caller-asserted in-range, naturally-aligned.
-        unsafe {
-            core::ptr::write_volatile((self.phys.raw() + offset) as *mut u32, value);
-        }
-        compiler_fence(Ordering::SeqCst);
+        unsafe { narf_arch::mmio::write32(self.phys.raw() + offset, value); }
     }
 }
 
@@ -280,19 +263,14 @@ impl MmioRegion {
 
 #[inline]
 unsafe fn cfg_read32(cfg: PhysAddr, off: u64) -> u32 {
-    compiler_fence(Ordering::SeqCst);
     // SAFETY: caller asserts the slot is readable.
-    let v = unsafe { core::ptr::read_volatile((cfg.raw() + off) as *const u32) };
-    compiler_fence(Ordering::SeqCst);
-    v
+    unsafe { narf_arch::mmio::read32(cfg.raw() + off) }
 }
 
 #[inline]
 unsafe fn cfg_write32(cfg: PhysAddr, off: u64, value: u32) {
-    compiler_fence(Ordering::SeqCst);
     // SAFETY: caller asserts the slot is writable.
-    unsafe { core::ptr::write_volatile((cfg.raw() + off) as *mut u32, value); }
-    compiler_fence(Ordering::SeqCst);
+    unsafe { narf_arch::mmio::write32(cfg.raw() + off, value); }
 }
 
 // ── BAR self-assignment ─────────────────────────────────────────────
