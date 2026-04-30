@@ -2487,6 +2487,75 @@ fn smoke_ioremap_direct_round_trip() -> TestResult {
 }
 kernel_test!(smoke_ioremap_direct_round_trip);
 
+fn smoke_fb_userspace_chain_against_real_backend() -> TestResult {
+    // Userspace-equivalent producer → ring → drain chain against
+    // whichever real FB backend the picker selected (bochs on
+    // x86_64, virtio-gpu on aarch64). The kernel-side producer
+    // here uses the exact same SharedRing layout a userspace
+    // process would build over a SYS_MMAP_PHYS'd page; the only
+    // difference vs the testbin's fb probe is we skip the
+    // mmap_phys hop because we're running in kernel context.
+    use narf_fb::{
+        bootstrap_writer, cmd_ring, drain_once, registry, select_active,
+        FbWriter, Rect,
+    };
+    use narf_fb::cmd_ring::{DrawCmd, RING_DEPTH, DrawRing};
+    use narf_graphics::Pixel32;
+    use narf_ipc::shared_ring::SharedProducer;
+
+    let backend = match select_active() {
+        Some(b) => b,
+        None    => return TestResult::Skip("no real FB backend probed"),
+    };
+    // Skip if the picker chose the test scanout (other smokes
+    // may have left it installed).
+    if backend.name() == "test" {
+        return TestResult::Skip("test scanout in place");
+    }
+
+    registry::__reset_for_test();
+    narf_fb::drain_task::__reset_for_test();
+
+    let pid = 5001u64;
+    let phys = match registry::attach(pid) {
+        Ok(p)  => p,
+        Err(_) => return TestResult::Fail("attach"),
+    };
+    // Producer over the kernel-side view of the ring (identity-
+    // mapped phys = identity-VA in low 4 GiB).
+    let mut producer: SharedProducer<DrawCmd, RING_DEPTH> =
+        // SAFETY: SPSC contract — kernel-side test, sole producer.
+        unsafe { SharedProducer::from_raw(phys.raw() as *mut DrawRing) };
+    let pix = Pixel32::rgb(0x55, 0xAA, 0x55).raw();
+    if cmd_ring::try_send(
+        &mut producer,
+        DrawCmd::fill(Rect::new(0, 0, 4, 4), pix),
+    ).is_err() {
+        registry::__reset_for_test();
+        return TestResult::Fail("send");
+    }
+    if cmd_ring::try_send(
+        &mut producer,
+        DrawCmd::flush(Rect::new(0, 0, 4, 4)),
+    ).is_err() {
+        registry::__reset_for_test();
+        return TestResult::Fail("send flush");
+    }
+
+    let cap    = bootstrap_writer();
+    let writer = FbWriter::new(cap).expect("writer");
+    let (ok, err) = drain_once(&writer);
+
+    registry::__reset_for_test();
+    narf_fb::drain_task::__reset_for_test();
+
+    if ok != 2 || err != 0 {
+        return TestResult::Fail("drain stats wrong (2/0 expected)");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_fb_userspace_chain_against_real_backend);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_pte_pk_field() -> TestResult {
     use narf_memory::paging::PtFlags;
