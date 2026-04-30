@@ -174,6 +174,111 @@ pub fn read_aer(
     Ok(Some(s))
 }
 
+// ── AER event dispatch ──────────────────────────────────────────────
+//
+// AER status can be polled (today's path) or interrupt-driven (the
+// root port's PCIe Capabilities Pointer points at an AER MSI vector
+// the kernel programs at boot). Either way, the bus driver
+// classifies the error word into `AerSeverity` and fires
+// `dispatch_aer` to all registered listeners; drivers (or a global
+// recovery coordinator) subscribe via `register_aer_listener`.
+//
+// This is the seam for: Fatal recovery (call `Driver::reset` on
+// the bound driver), surface telemetry to userspace observability,
+// and policy decisions like "isolate this device" or "panic". The
+// dispatch table is intentionally separate from the hot-plug one
+// so a global panic-on-fatal handler doesn't have to filter every
+// hot-add event.
+
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+
+use crate::addr::BusAddr;
+
+/// Severity classification for an AER event. PCIe §7.8.2.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AerSeverity {
+    /// Bit set in `correctable_status` — recovered transparently
+    /// (replayed TLP, etc.). Telemetry only; no driver action.
+    Correctable,
+    /// Bit set in `uncorrectable_status` & ~severity — fatal-class
+    /// uncorrectable but software can attempt recovery (FLR + bring
+    /// up). Driver-level reset is the typical response.
+    NonFatal,
+    /// Bit set in `uncorrectable_status` & severity — link-level
+    /// fatal; recovery requires segment / slot reset (the root
+    /// port's downstream link is unusable). Today the policy is
+    /// "log + isolate"; a future hot-replug arc may attempt full
+    /// link retraining.
+    Fatal,
+}
+
+/// One AER event. `status_word` is the raw `(un)correctable_status`
+/// register value the bus driver decoded; `severity` is the
+/// classification derived from it.
+#[derive(Copy, Clone, Debug)]
+pub struct AerEvent {
+    pub addr:        BusAddr,
+    pub severity:    AerSeverity,
+    pub status_word: u32,
+}
+
+/// Subscriber interface. Listeners are `Send + Sync` so the AER
+/// IRQ handler can fan out from the root-port interrupt directly.
+pub trait AerListener: Send + Sync {
+    fn on_aer(&self, ev: AerEvent);
+}
+
+static AER_LISTENERS: narf_lib::sync::IrqSafeSpinLock<Vec<Arc<dyn AerListener>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
+
+/// Register an AER listener. Not cap-gated today — error
+/// observation is considered system-wide telemetry rather than
+/// a privileged operation; if that policy changes, the gate
+/// becomes a `Cap<BusRegistryCap, Grant>` like hot-plug.
+pub fn register_aer_listener(listener: Arc<dyn AerListener>) {
+    AER_LISTENERS.lock().push(listener);
+}
+
+/// Fire an AER event to every registered listener. Called from
+/// the bus driver after it has decoded the status word + cleared
+/// the RW1C bits in the device's AER capability.
+pub fn dispatch_aer(ev: AerEvent) {
+    let list: Vec<Arc<dyn AerListener>> = {
+        let g = AER_LISTENERS.lock();
+        g.clone()
+    };
+    for l in list.iter() {
+        l.on_aer(ev);
+    }
+}
+
+/// Number of currently-registered AER listeners — useful for tests.
+pub fn aer_listener_count() -> usize {
+    AER_LISTENERS.lock().len()
+}
+
+#[doc(hidden)]
+pub fn __clear_aer_listeners() {
+    AER_LISTENERS.lock().clear();
+}
+
+/// Classify a raw AER status word + severity-mask pair into an
+/// `AerSeverity`. Returns `None` if no error bits are set.
+pub fn classify_aer(uncorr_status: u32, uncorr_severity: u32, corr_status: u32) -> Option<AerSeverity> {
+    if corr_status != 0 {
+        return Some(AerSeverity::Correctable);
+    }
+    if uncorr_status == 0 {
+        return None;
+    }
+    if uncorr_status & uncorr_severity != 0 {
+        Some(AerSeverity::Fatal)
+    } else {
+        Some(AerSeverity::NonFatal)
+    }
+}
+
 // ── helpers ─────────────────────────────────────────────────────────
 
 #[inline]
