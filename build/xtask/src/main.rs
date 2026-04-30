@@ -32,6 +32,13 @@ enum Cmd {
     Test(BuildArgs),
     /// Produce a bootable image. (Stage 1: stub.)
     Image(BuildArgs),
+    /// Boot under QEMU with a graphical display + the user-mode
+    /// testbin running. Drives the userspace FB demo end-to-end:
+    /// the testbin opens a scanout, draws color bars + a centered
+    /// square, flushes, and sleeps a few seconds before exiting.
+    /// Defaults to --display=gtk; pass --display=sdl on macOS or
+    /// --display=none if you only want the serial trace.
+    Demo(BuildArgs),
 }
 
 #[derive(Parser, Clone)]
@@ -53,6 +60,14 @@ struct BuildArgs {
     /// Example: `--features idt-selftest`.
     #[arg(long, default_value = "")]
     features: String,
+
+    /// QEMU display mode. `none` (default) is headless — what CI
+    /// uses. `gtk` / `sdl` / `cocoa` open a real window so the
+    /// kernel's framebuffer (bochs-display / virtio-gpu) is
+    /// actually visible. Use with `cargo xtask run --display gtk
+    /// --features user-mode-testbin` to see the testbin's FB demo.
+    #[arg(long, default_value = "none")]
+    display: String,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -85,8 +100,9 @@ impl Arch {
         }
     }
 
-    fn qemu_args(self, kernel: &Path) -> Vec<String> {
+    fn qemu_args(self, kernel: &Path, display: &str) -> Vec<String> {
         let kernel = kernel.display().to_string();
+        let display = display.to_string();
         match self {
             // x86_64 via PVH direct-kernel load. `isa-debug-exit` lets the
             // guest exit QEMU by writing to I/O port 0xF4 (status = value<<1 | 1).
@@ -138,7 +154,7 @@ impl Arch {
                     "-numa".into(),
                     "hmat-lb,initiator=1,target=1,hierarchy=memory,data-type=access-bandwidth,bandwidth=10G".into(),
                     "-serial".into(),  "stdio".into(),
-                    "-display".into(), "none".into(),
+                    "-display".into(), display.clone(),
                     "-no-reboot".into(),
                     "-device".into(),  "isa-debug-exit,iobase=0xf4,iosize=0x04".into(),
                     "-drive".into(),
@@ -250,7 +266,7 @@ impl Arch {
                 "-smp".into(),      "2".into(),
                 "-m".into(),        "256M".into(),
                 "-serial".into(),   "stdio".into(),
-                "-display".into(),  "none".into(),
+                "-display".into(),  display.clone(),
                 "-no-reboot".into(),
                 "-semihosting".into(),
                 // Attach an NVMe device on aarch64 too — same image as
@@ -482,7 +498,7 @@ fn run_cmd(args: &BuildArgs) -> Result<()> {
 
     let qemu = args.arch.qemu_bin();
     let mut cmd = Command::new(qemu);
-    cmd.args(args.arch.qemu_args(&kernel));
+    cmd.args(args.arch.qemu_args(&kernel, &args.display));
     
     println!("xtask: launching {} {}", qemu, kernel.display());
     
@@ -527,6 +543,25 @@ fn main() -> Result<()> {
             eprintln!("xtask image: stub (arch={:?}); wires in with boot/ at Stage 1 Wave 1.",
                 args.arch.triple());
             Ok(())
+        }
+        Cmd::Demo(mut args) => {
+            // Bundle: kernel-test + user-mode-testbin features so
+            // the testbin's FB demo runs, plus default the display
+            // to gtk so the result is actually visible.
+            if args.features.is_empty() {
+                args.features = "kernel-test,user-mode-testbin".into();
+            } else {
+                if !args.features.contains("kernel-test") {
+                    args.features.push_str(",kernel-test");
+                }
+                if !args.features.contains("user-mode-testbin") {
+                    args.features.push_str(",user-mode-testbin");
+                }
+            }
+            if args.display == "none" {
+                args.display = "gtk".into();
+            }
+            run_cmd(&args)
         }
     }
 }
