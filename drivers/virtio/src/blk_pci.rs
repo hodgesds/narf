@@ -521,6 +521,89 @@ impl VirtioBlkPci {
         Ok(())
     }
 
+    /// Submit a single 512-byte write without waiting for the device.
+    /// Returns the descriptor chain head + the payload DmaBuffer +
+    /// the status phys address. Caller must keep the returned
+    /// `payload` alive until drain completes.
+    pub fn submit_write(&self, sector: u64, data: &[u8; 512])
+        -> Result<(u16, DmaBuffer, u64), VirtioPciError>
+    {
+        let pool_phys = self.pool.phys_addr().raw();
+        let header_phys = pool_phys;
+        let status_phys = pool_phys + 16;
+        // SAFETY: identity-mapped DMA.
+        unsafe {
+            core::ptr::write_volatile(header_phys as *mut BlkHeader, BlkHeader {
+                type_tag: VIRTIO_BLK_T_OUT, _resv: 0, sector,
+            });
+            core::ptr::write_volatile(status_phys as *mut u8, 0xFFu8);
+        }
+        let payload = alloc_coherent(4096, DomainId::DRIVER_0)
+            .map_err(|_| VirtioPciError::BarMapFailed)?;
+        let payload_phys = payload.phys_addr().raw();
+        // SAFETY: page-sized DMA buffer; copy in caller's data.
+        unsafe {
+            for i in 0..512usize {
+                core::ptr::write_volatile(
+                    (payload_phys + i as u64) as *mut u8, data[i]);
+            }
+        }
+        // Write payload is read-only from the device's POV (no
+        // VIRTQ_DESC_F_WRITE on the payload desc).
+        let descs = [
+            VirtqDesc { addr: header_phys,  len: 16,  flags: 0,                  next: 0 },
+            VirtqDesc { addr: payload_phys, len: 512, flags: 0,                  next: 0 },
+            VirtqDesc { addr: status_phys,  len: 1,   flags: VIRTQ_DESC_F_WRITE, next: 0 },
+        ];
+        let head = {
+            let mut g = self.queue.lock();
+            let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
+            q.add_buffer(&descs).ok_or(VirtioPciError::QueueTooSmall)?
+        };
+        let notify_off = (self.queue_notify_off as u64)
+            * (self.notify_off_multiplier as u64);
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: identity-mapped notify region.
+        unsafe { self.notify.write16(notify_off, 0); }
+        Ok((head, payload, status_phys))
+    }
+
+    /// Drain a previously submitted write. Returns Ok if the device
+    /// reported success.
+    pub fn drain_write(&self, head: u16, status_phys: u64)
+        -> Result<(), VirtioPciError>
+    {
+        let mut spins = 0u32;
+        loop {
+            let elem = {
+                let mut g = self.queue.lock();
+                let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
+                q.poll_used()
+            };
+            match elem {
+                Some((id, _)) if id == head as u32 => break,
+                Some(_) => continue,
+                None => {
+                    spins += 1;
+                    if spins > 10_000_000 {
+                        let mut g = self.queue.lock();
+                        if let Some(q) = g.as_mut() { q.free_chain(head); }
+                        return Err(VirtioPciError::QueueTooSmall);
+                    }
+                    core::hint::spin_loop();
+                }
+            }
+        }
+        // SAFETY: identity-mapped DMA.
+        let status = unsafe { core::ptr::read_volatile(status_phys as *const u8) };
+        let mut g = self.queue.lock();
+        if let Some(q) = g.as_mut() { q.free_chain(head); }
+        if status != VIRTIO_BLK_S_OK {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        Ok(())
+    }
+
     /// IRQ-driven variant of `write_sector`. Same shape as
     /// `read_sector_irq` — submit, await fire_count or used-ring,
     /// drain, return.
@@ -732,6 +815,31 @@ pub async fn read_sector_irq_async(sector: u64) -> Result<[u8; 512], VirtioPciEr
     };
     drop(payload);
     r.map(|()| out)
+}
+
+/// Async, IRQ-driven 512-byte write to `sector`. Mirrors
+/// [`read_sector_irq_async`] — see that doc for the protocol.
+pub async fn write_sector_irq_async(sector: u64, data: [u8; 512]) -> Result<(), VirtioPciError> {
+    let vector = {
+        let g = CONTROLLER.lock();
+        g.as_ref().ok_or(VirtioPciError::NoQueues)?.irq_vector
+    };
+    let waiter = vector.map(narf_interrupts::wait_for_irq);
+    let (head, payload, status_phys) = {
+        let g = CONTROLLER.lock();
+        let c = g.as_ref().ok_or(VirtioPciError::NoQueues)?;
+        c.submit_write(sector, &data)?
+    };
+    if let Some(w) = waiter {
+        let _ = w.await;
+    }
+    let r = {
+        let g = CONTROLLER.lock();
+        let c = g.as_ref().ok_or(VirtioPciError::NoQueues)?;
+        c.drain_write(head, status_phys)
+    };
+    drop(payload);
+    r
 }
 
 // ── Driver-match registration ────────────────────────────────────────

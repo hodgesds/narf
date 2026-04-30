@@ -8337,6 +8337,100 @@ fn smoke_virtio_blk_pci_irq_async() -> TestResult {
 kernel_test!(smoke_virtio_blk_pci_irq_async);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_virtio_blk_pci_write_irq_async() -> TestResult {
+    // Round-trip: async write a known pattern at sector 1 (the
+    // virtio-blk image's 0-th sector is what `smoke_…_irq_async`
+    // reads, so we stay clear of it), then async read it back and
+    // verify byte-for-byte. Exercises both `write_sector_irq_async`
+    // and `read_sector_irq_async` end-to-end.
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind, probe_all_pci};
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_drivers_virtio::blk_pci;
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let dev = match devs.iter().find(|d|
+        matches!(&d.kind, BusKind::Pcie { .. })
+        && d.id.vendor == blk_pci::VIRTIO_BLK_PCI_VENDOR
+        && d.id.device == blk_pci::VIRTIO_BLK_PCI_DEVICE)
+    {
+        Some(d) => *d,
+        None    => return TestResult::Skip("no virtio-blk-pci device"),
+    };
+    __reset_for_test();
+    blk_pci::register_pci_driver();
+    let authority = bootstrap_registry_authority();
+    if probe_all_pci(&authority).is_err() {
+        return TestResult::Fail("probe_all_pci");
+    }
+    let (_h, cap) = match claim_device_cap(&authority, dev.addr) {
+        Ok(ok) => ok,
+        Err(_) => return TestResult::Fail("claim_device_cap"),
+    };
+    if blk_pci::enable_msix_for_probed(&cap, &dev).is_err() {
+        return TestResult::Fail("enable_msix");
+    }
+
+    fn nw_clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VT) }
+    fn nw_wake(_: *const ()) {}
+    fn nw_wake_by_ref(_: *const ()) {}
+    fn nw_drop(_: *const ()) {}
+    static VT: RawWakerVTable =
+        RawWakerVTable::new(nw_clone, nw_wake, nw_wake_by_ref, nw_drop);
+    // SAFETY: vtable fns non-null; one-shot local Waker.
+    let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT)) };
+    let mut ctx = Context::from_waker(&waker);
+
+    fn drive<F: Future>(fut: F, ctx: &mut Context<'_>) -> Option<F::Output> {
+        let mut fut = alloc::boxed::Box::pin(fut);
+        let mut polls = 0u32;
+        loop {
+            match Pin::new(&mut fut).poll(ctx) {
+                Poll::Ready(r) => return Some(r),
+                Poll::Pending  => {
+                    polls += 1;
+                    if polls > 100 { return None; }
+                    narf_arch::halt_until_irq();
+                }
+            }
+        }
+    }
+
+    let mut pattern = [0u8; 512];
+    for i in 0..512usize { pattern[i] = (i as u8).wrapping_add(0x37); }
+
+    // SAFETY: APIC initialised; OK to enable for the test.
+    unsafe { narf_arch::enable_interrupts(); }
+    let write_res = drive(blk_pci::write_sector_irq_async(1, pattern), &mut ctx);
+    let read_res  = drive(blk_pci::read_sector_irq_async(1), &mut ctx);
+    // SAFETY: counterpart.
+    unsafe { narf_arch::disable_interrupts(); }
+
+    match write_res {
+        Some(Ok(()))   => {}
+        Some(Err(_))   => return TestResult::Fail("write_sector_irq_async returned Err"),
+        None           => return TestResult::Fail("write future never resolved"),
+    }
+    let readback = match read_res {
+        Some(Ok(b))    => b,
+        Some(Err(_))   => return TestResult::Fail("read_sector_irq_async returned Err"),
+        None           => return TestResult::Fail("read future never resolved"),
+    };
+    for i in 0..512usize {
+        if readback[i] != pattern[i] {
+            return TestResult::Fail("read-back pattern mismatch");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_virtio_blk_pci_write_irq_async);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_virtio_net_pci_tx() -> TestResult {
     // Bring up virtio-net-pci, post a small frame to the TX queue,
     // assert the device acks it via the used ring (polled).
