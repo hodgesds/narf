@@ -1,0 +1,267 @@
+//! narf-audio — PCM audio subsystem.
+//!
+//! Sits between PCM-capable device drivers (virtio-sound today;
+//! intel-hda / ac97 in the future) and any consumer that wants to
+//! play or capture audio: kernel-side beep / boot chime in commit B,
+//! userspace `narf_user_runtime::audio::AudioContext` once the
+//! syscall surface lands.
+//!
+//! Surface (parallels narf-fb's shape):
+//!
+//!   * `AudioStream` — trait every backend implements. Exposes the
+//!     supported formats + a `submit / wait / close` lifecycle.
+//!   * `select_active_playback() -> Option<&'static dyn AudioStream>`
+//!     — picker that returns the best-available output stream.
+//!   * `AudioWriter` — typed handle over a `Cap<AudioStreamCap, Write>`
+//!     that submits PCM buffers + observes completions.
+//!
+//! Cap typing — `AudioStreamCap`:
+//!     `Cap<AudioStreamCap, Read>`  — capture (recording)
+//!     `Cap<AudioStreamCap, Write>` — playback
+//!
+//! Stage-4 cut: probe only, no submission path. The data plane lands
+//! once virtio-sound's tx virtqueue is fully wired in
+//! `narf-drivers-virtio::snd_pci`. The trait shape is intentionally
+//! complete so consumers can be written against it now and switch to
+//! a real backend without API churn.
+
+#![no_std]
+#![forbid(unsafe_op_in_unsafe_fn)]
+#![deny(missing_debug_implementations)]
+
+extern crate alloc;
+
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+use narf_capabilities::{Cap, CapKind, CapType, Read, Write};
+
+/// Sample format the kernel exposes. New formats add new variants;
+/// the integer wire encoding lives in `narf-user-runtime` as
+/// `AUDIO_FORMAT_*` and must stay in sync.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SampleFormat {
+    /// 16-bit signed little-endian. Stage-4 baseline; matches the
+    /// virtio-sound "S16" feature flag and what nearly every PCM
+    /// stream actually carries.
+    S16Le,
+    /// 32-bit IEEE float little-endian. Optional; backends advertise
+    /// support via `AudioStream::supports`.
+    F32Le,
+}
+
+/// Channel layout. Stage-4 supports mono + stereo; multichannel
+/// (5.1, 7.1) lands when the audio server / mixer arrives.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ChannelLayout {
+    Mono   = 1,
+    Stereo = 2,
+}
+
+/// PCM format triple: rate × format × channels. The kernel-side
+/// driver negotiates this at stream open; userspace requests a
+/// preferred triple via `SYS_AUDIO_OPEN` (when it lands).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct AudioFormat {
+    pub sample_rate_hz: u32,
+    pub format:         SampleFormat,
+    pub channels:       ChannelLayout,
+}
+
+impl AudioFormat {
+    /// Stage-4 default: 48 kHz / S16LE / Stereo. Covers >95% of
+    /// userspace consumers and matches the virtio-sound spec's
+    /// recommended baseline.
+    pub const fn default_playback() -> Self {
+        Self {
+            sample_rate_hz: 48_000,
+            format:         SampleFormat::S16Le,
+            channels:       ChannelLayout::Stereo,
+        }
+    }
+
+    /// Bytes per PCM frame (one sample per channel).
+    pub const fn bytes_per_frame(self) -> u32 {
+        let per_sample = match self.format {
+            SampleFormat::S16Le => 2,
+            SampleFormat::F32Le => 4,
+        };
+        per_sample * (self.channels as u32)
+    }
+}
+
+/// Cap-typed authority over an audio stream.
+#[derive(Copy, Clone, Debug)]
+pub struct AudioStreamCap;
+
+impl CapType for AudioStreamCap {
+    const KIND: CapKind = CapKind::AudioStream;
+}
+
+/// Backend-agnostic audio stream. Implementations are zero-cost
+/// wrappers over the underlying driver's stream state.
+pub trait AudioStream: Send + Sync + core::fmt::Debug {
+    /// Currently negotiated format. `None` if the stream hasn't
+    /// been opened yet.
+    fn current_format(&self) -> Option<AudioFormat>;
+    /// `true` if this stream can transport `fmt`. Used by the
+    /// negotiator + by tests asserting QEMU's exposed support.
+    fn supports(&self, fmt: AudioFormat) -> bool;
+    /// Identifier — "virtio-sound", "hda", "ac97". Used by the
+    /// picker log and tests that want to assert which backend won.
+    fn name(&self) -> &'static str;
+    /// `true` iff this stream is configured for playback (writes
+    /// PCM to host). `false` for capture (reads PCM from host).
+    fn is_playback(&self) -> bool;
+}
+
+// ── virtio-sound backend ────────────────────────────────────────────
+//
+// Light wrapper that asks the virtio-sound driver whether its tx
+// stream is up. Real format negotiation lands when snd_pci grows
+// `current_format` + `submit_pcm`.
+
+#[derive(Debug)]
+struct VirtioSoundPlayback;
+
+impl AudioStream for VirtioSoundPlayback {
+    fn current_format(&self) -> Option<AudioFormat> {
+        // Stage-4: hardcoded default until snd_pci negotiates.
+        if narf_drivers_virtio::snd_pci::is_probed() {
+            Some(AudioFormat::default_playback())
+        } else {
+            None
+        }
+    }
+    fn supports(&self, fmt: AudioFormat) -> bool {
+        // QEMU virtio-sound supports S16LE @ {44.1, 48} kHz × {mono,
+        // stereo}; F32LE only with the `format=f32` audiodev hint.
+        // Stage-4 advertises only the baseline triple.
+        fmt.format == SampleFormat::S16Le
+            && (fmt.sample_rate_hz == 48_000 || fmt.sample_rate_hz == 44_100)
+    }
+    fn name(&self) -> &'static str { "virtio-sound" }
+    fn is_playback(&self) -> bool { true }
+}
+
+static PLAYBACK: VirtioSoundPlayback = VirtioSoundPlayback;
+
+/// Pick the best-available playback stream. Stage-4: virtio-sound
+/// or nothing. Future backends register via `register_backend` once
+/// HDA / AC97 land.
+pub fn select_active_playback() -> Option<&'static dyn AudioStream> {
+    if PLAYBACK.current_format().is_some() {
+        Some(&PLAYBACK)
+    } else {
+        None
+    }
+}
+
+// ── AudioWriter ─────────────────────────────────────────────────────
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AudioWriteError {
+    NoActiveStream,
+    UnsupportedFormat,
+    StreamClosed,
+}
+
+/// Cap-gated handle over a playback stream. Holding this by-value
+/// guarantees the cap is live for the duration; cap revocation
+/// invalidates the writer at construction time + on each op.
+#[derive(Debug)]
+pub struct AudioWriter {
+    stream: &'static dyn AudioStream,
+    cap:    Cap<AudioStreamCap, Write>,
+    format: AudioFormat,
+}
+
+impl AudioWriter {
+    /// Construct from a Write cap + requested format. Returns
+    /// `NoActiveStream` if no playback backend is up;
+    /// `UnsupportedFormat` if the backend rejects the triple.
+    pub fn open(
+        cap: Cap<AudioStreamCap, Write>,
+        fmt: AudioFormat,
+    ) -> Result<Self, AudioWriteError> {
+        let stream = select_active_playback().ok_or(AudioWriteError::NoActiveStream)?;
+        if !stream.supports(fmt) {
+            return Err(AudioWriteError::UnsupportedFormat);
+        }
+        Ok(Self { stream, cap, format: fmt })
+    }
+
+    /// Currently negotiated format.
+    pub fn format(&self) -> AudioFormat { self.format }
+
+    /// Backend name — for diagnostics.
+    pub fn name(&self) -> &'static str { self.stream.name() }
+
+    /// Validate cap is still live.
+    fn check_live(&self) -> Result<(), AudioWriteError> {
+        self.cap
+            .check_live()
+            .map_err(|_| AudioWriteError::StreamClosed)
+    }
+
+    /// Submit a buffer of PCM frames for playback. Returns the
+    /// frame id assigned by the backend, or an error.
+    ///
+    /// Stage-4 stub: returns `NoActiveStream` until snd_pci's tx
+    /// virtqueue lands. The signature is the contract callers
+    /// build against; the body lights up when the data plane does.
+    pub fn submit(&self, _pcm: &[u8]) -> Result<u64, AudioWriteError> {
+        self.check_live()?;
+        // Until snd_pci grows submit_pcm, every submission errors
+        // out. Callers can still wire their submit-loop scaffolding
+        // and gate the actual playback on the capability landing.
+        Err(AudioWriteError::NoActiveStream)
+    }
+}
+
+// ── Test-mode authority bootstrap ───────────────────────────────────
+
+/// Mint a Write cap for the active playback stream. Same shape as
+/// `narf_fb::bootstrap_writer` — the kernel-test runner / boot
+/// initcalls call this; userspace consumers eventually receive a
+/// derived cap from the audio server.
+pub fn bootstrap_writer() -> Cap<AudioStreamCap, Write> {
+    Cap::<AudioStreamCap, Write>::bootstrap()
+}
+
+// ── Init wiring ─────────────────────────────────────────────────────
+
+static INIT_BACKEND_NAME: AtomicUsize = AtomicUsize::new(0);
+static INIT_BACKEND_LEN:  AtomicUsize = AtomicUsize::new(0);
+
+/// Test helper: name of the playback backend the boot picker
+/// selected, or `None` if none was available at init time.
+pub fn last_picked_backend() -> Option<&'static str> {
+    let p = INIT_BACKEND_NAME.load(Ordering::Acquire) as *const u8;
+    let l = INIT_BACKEND_LEN.load(Ordering::Acquire);
+    if p.is_null() || l == 0 { return None; }
+    // SAFETY: published from a `&'static str`.
+    unsafe {
+        let slice = core::slice::from_raw_parts(p, l);
+        Some(core::str::from_utf8_unchecked(slice))
+    }
+}
+
+/// Stage::Late initcall: probe the picker + record the chosen
+/// backend so smokes can assert which won without re-running the
+/// picker.
+pub fn register_initcalls() {
+    use narf_init::{InitResult, Stage};
+    narf_init::register(Stage::Late, "audio-playback-picker", || {
+        if let Some(s) = select_active_playback() {
+            INIT_BACKEND_NAME.store(s.name().as_ptr() as usize, Ordering::Release);
+            INIT_BACKEND_LEN.store(s.name().len(),               Ordering::Release);
+            InitResult::Ok
+        } else {
+            InitResult::NotPresent
+        }
+    });
+}
+
+// Read-cap stub for completeness; used by future capture audits.
+#[allow(dead_code)]
+fn _read_cap_demo(_c: Cap<AudioStreamCap, Read>) {}

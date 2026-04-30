@@ -399,6 +399,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-audio"
+version = "0.0.0"
+dependencies = [
+ "narf-capabilities",
+ "narf-drivers-virtio",
+ "narf-init",
+ "narf-lib",
+ "narf-memory",
+ "narf-userspace",
+]
+
+[[package]]
 name = "narf-block"
 version = "0.0.0"
 dependencies = [
@@ -594,6 +606,7 @@ dependencies = [
  "narf-acpi",
  "narf-aml",
  "narf-arch",
+ "narf-audio",
  "narf-boot",
  "narf-bus",
  "narf-console",
@@ -804,6 +817,7 @@ dependencies = [
  "narf-acpi",
  "narf-aml",
  "narf-arch",
+ "narf-audio",
  "narf-block",
  "narf-boot",
  "narf-bus",

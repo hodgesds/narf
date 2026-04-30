@@ -215,6 +215,15 @@ impl Arch {
                     // probes first to back the splash.
                     "-device".into(),
                     "virtio-gpu-pci,disable-legacy=on,disable-modern=off".into(),
+                    // virtio-sound-pci with the dummy audiodev — we
+                    // get the device-cfg + virtqueue surface to
+                    // probe against without needing the host to
+                    // actually play sound. Swap `none` for `pa,id=`
+                    // / `pipewire,id=` when interactively running
+                    // the kernel and you want audible output.
+                    "-audiodev".into(), "none,id=snd0".into(),
+                    "-device".into(),
+                    "virtio-sound-pci,audiodev=snd0,disable-legacy=on,disable-modern=off".into(),
                     "-kernel".into(),  kernel,
                 ]
             },
@@ -283,6 +292,11 @@ impl Arch {
                 // so high BARs work the same as low ones now.
                 "-device".into(),
                 "virtio-gpu-pci,disable-legacy=on,disable-modern=off".into(),
+                // virtio-sound-pci with the dummy audiodev — see
+                // x86_64 block for rationale.
+                "-audiodev".into(), "none,id=snd0".into(),
+                "-device".into(),
+                "virtio-sound-pci,audiodev=snd0,disable-legacy=on,disable-modern=off".into(),
                 // QEMU's `-kernel <elf>` path on aarch64 does not
                 // load a `-dtb` blob into RAM (the DTB-loading code
                 // path is gated on `is_linux=1`). Instead we

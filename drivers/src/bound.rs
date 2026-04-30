@@ -32,6 +32,8 @@ pub enum BoundKind {
     Input,
     /// Display / framebuffer (bochs, virtio-gpu, ramfb).
     Graphics,
+    /// PCM audio playback / capture (virtio-sound, hda, ac97).
+    Audio,
     /// Catch-all for things that don't fit a class yet.
     Other,
 }
@@ -51,6 +53,7 @@ impl BoundKind {
     ///   * Balloon     → 5
     ///   * Input       → 6
     ///   * Graphics    → 7
+    ///   * Audio       → 8
     ///   * Other       → 15  (the catch-all bucket)
     pub const fn default_domain(self) -> u8 {
         match self {
@@ -61,6 +64,7 @@ impl BoundKind {
             BoundKind::Balloon  => 5,
             BoundKind::Input    => 6,
             BoundKind::Graphics => 7,
+            BoundKind::Audio    => 8,
             BoundKind::Other    => 15,
         }
     }

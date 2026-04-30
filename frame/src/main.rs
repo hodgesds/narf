@@ -699,6 +699,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_graphics_driver::register_initcalls();
             narf_input_driver::register_initcalls();
             narf_fb::register_initcalls();
+            narf_audio::register_initcalls();
 
             // PCI probe lives in Stage::Device — it binds every
             // driver registered by Subsys above.

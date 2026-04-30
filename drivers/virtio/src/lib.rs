@@ -18,6 +18,7 @@ pub mod net_pci;
 pub mod pci;
 pub mod queue;
 pub mod rng_pci;
+pub mod snd_pci;
 pub mod class_blk;
 
 /// Stage::Subsys initcalls — register every virtio-PCI driver with
@@ -42,6 +43,9 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "virtio-gpu-pci",     || {
         gpu_pci::register_pci_driver();     InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "virtio-snd-pci",     || {
+        snd_pci::register_pci_driver();     InitResult::Ok
     });
 }
 

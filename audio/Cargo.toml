@@ -1,0 +1,23 @@
+[package]
+name         = "narf-audio"
+description  = "PCM audio subsystem. Backend-agnostic playback / capture surface; cap-gated AudioStream writers with format negotiation + per-stream buffer pools."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_audio"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../lib" }
+narf-capabilities = { path = "../capabilities" }
+narf-init         = { path = "../init" }
+narf-memory       = { path = "../memory" }
+narf-userspace    = { path = "../userspace" }
+narf-drivers-virtio = { path = "../drivers/virtio" }
+
+[lints]
+workspace = true

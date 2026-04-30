@@ -402,6 +402,9 @@ pub enum CapKind {
 
     // Display
     FbScanout            = 0x00B0,
+
+    // Audio
+    AudioStream          = 0x00C0,
 }
 
 pub trait CapType: 'static {
@@ -471,6 +474,8 @@ const KIND_NAMES: &[(&str, CapKind)] = &[
     ("SleepableReader",     CapKind::SleepableReader),
     ("Process",             CapKind::Process),
     ("Driver",              CapKind::Driver),
+    ("FbScanout",           CapKind::FbScanout),
+    ("AudioStream",         CapKind::AudioStream),
 ];
 
 // ── Badge ───────────────────────────────────────────────────────────

@@ -35,6 +35,7 @@ narf-graphics        = { path = "../graphics" }
 narf-graphics-driver = { path = "../drivers/graphics" }
 narf-init            = { path = "../init" }
 narf-fb              = { path = "../fb" }
+narf-audio           = { path = "../audio" }
 narf-userspace     = { path = "../userspace" }
 narf-verification  = { path = "../verification", optional = true }
 

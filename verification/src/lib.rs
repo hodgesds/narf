@@ -9761,6 +9761,88 @@ fn smoke_virtio_balloon_pci_probe() -> TestResult {
 kernel_test!(smoke_virtio_balloon_pci_probe);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_virtio_snd_pci_probe() -> TestResult {
+    use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_drivers_virtio::snd_pci;
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let has = devs.iter().any(|d|
+        matches!(&d.kind, BusKind::Pcie { .. })
+        && d.id.vendor == snd_pci::VIRTIO_SND_PCI_VENDOR
+        && d.id.device == snd_pci::VIRTIO_SND_PCI_DEVICE);
+    if !has { return TestResult::Skip("no virtio-snd-pci"); }
+    __reset_for_test();
+    snd_pci::__reset_for_test();
+    snd_pci::register_pci_driver();
+    let authority = bootstrap_registry_authority();
+    if probe_all_pci(&authority).is_err() {
+        return TestResult::Fail("probe_all_pci");
+    }
+    if !snd_pci::is_probed() {
+        return TestResult::Fail("snd probe didn't install controller");
+    }
+    // QEMU virtio-sound only advertises non-zero jack/stream/chmap
+    // counts when an audiodev with a real backend is wired in; with
+    // `audiodev=none` the device negotiates the surface but exposes
+    // 0/0/0. We just confirm topology() returns Some — the probe
+    // path read the device-cfg without trapping.
+    if snd_pci::topology().is_none() {
+        return TestResult::Fail("topology missing after probe");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_virtio_snd_pci_probe);
+
+fn smoke_audio_picker_no_backend_when_unprobed() -> TestResult {
+    // Without the snd_pci controller installed, the picker must
+    // return None so AudioWriter::open propagates NoActiveStream.
+    use narf_audio::{
+        bootstrap_writer, select_active_playback, AudioFormat, AudioWriter,
+        AudioWriteError,
+    };
+    use narf_drivers_virtio::snd_pci;
+    snd_pci::__reset_for_test();
+    if select_active_playback().is_some() {
+        return TestResult::Fail("picker returned a stream with no controller");
+    }
+    let cap = bootstrap_writer();
+    match AudioWriter::open(cap, AudioFormat::default_playback()) {
+        Err(AudioWriteError::NoActiveStream) => TestResult::Pass,
+        _ => TestResult::Fail("AudioWriter::open should error when unprobed"),
+    }
+}
+kernel_test!(smoke_audio_picker_no_backend_when_unprobed);
+
+fn smoke_audio_format_unsupported_rate_rejects() -> TestResult {
+    use narf_audio::{
+        AudioFormat, ChannelLayout, SampleFormat,
+    };
+    let s = match narf_audio::select_active_playback() {
+        Some(s) => s,
+        None    => return TestResult::Skip("no audio backend probed"),
+    };
+    // Spec: only 44.1 / 48 kHz S16LE supported today. 96 kHz must
+    // be rejected so future advertisement bugs surface.
+    let bad = AudioFormat {
+        sample_rate_hz: 96_000,
+        format:         SampleFormat::S16Le,
+        channels:       ChannelLayout::Stereo,
+    };
+    if s.supports(bad) {
+        return TestResult::Fail("96 kHz advertised but unsupported");
+    }
+    let good = AudioFormat::default_playback();
+    if !s.supports(good) {
+        return TestResult::Fail("48 kHz S16 stereo should be supported");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_audio_format_unsupported_rate_rejects);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_virtio_rng_pci_probe() -> TestResult {
     // Probe-only: verify that virtio-rng-pci's bring_up runs and
     // installs a controller. The data-path (read_bytes via queue
