@@ -27,6 +27,8 @@
 
 use core::fmt;
 
+pub mod graphics;
+
 // ── Syscall numbers ────────────────────────────────────────────────
 //
 // Mirror of `narf_userspace::syscall::Syscall`. NARF reserves 100+

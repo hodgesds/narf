@@ -369,6 +369,45 @@ impl FbWriter {
         self.scanout.flush(clipped.x, clipped.y, clipped.w, clipped.h);
         Ok(())
     }
+
+    /// Blit a row-major XRGB8888 source buffer into `rect`.
+    /// `src.len()` must equal `rect.w * rect.h`. Out-of-bounds
+    /// rects are clipped; the source is sub-sampled accordingly
+    /// (top-left aligned at the unclipped origin).
+    ///
+    /// Kernel-side primitive — userspace blit lands when the FB
+    /// surface gains a per-handle staging buffer (`SYS_FB_BUFFER_MAP`)
+    /// and a `TAG_BLIT` wire format. Until then, the splash composer,
+    /// font glyph paths, and any future kernel-side compositor use
+    /// this directly.
+    pub fn blit(
+        &self,
+        rect: Rect,
+        src:  &[Pixel32],
+    ) -> Result<(), FbWriteError> {
+        self.check_live()?;
+        if src.len() != (rect.w as usize) * (rect.h as usize) {
+            return Err(FbWriteError::OutOfBounds);
+        }
+        let clipped = rect.clip(self.scanout.width(), self.scanout.height())
+            .ok_or(FbWriteError::OutOfBounds)?;
+        // Offsets into `src` accounting for the clip. Clipping can
+        // shrink the rect from any edge; preserve the unclipped
+        // origin so a partially-offscreen blit still places its
+        // visible pixels at the right place.
+        let dx = (clipped.x - rect.x) as usize;
+        let dy = (clipped.y - rect.y) as usize;
+        // SAFETY: cap-checked above; FbWriter owns exclusive Write.
+        let mut fb = unsafe { self.scanout.framebuffer() };
+        for row in 0..clipped.h {
+            for col in 0..clipped.w {
+                let s = src[(dy + row as usize) * (rect.w as usize)
+                          + (dx + col as usize)];
+                fb.draw_pixel(clipped.x + col, clipped.y + row, s);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Read-only view of the active scanout's geometry. Doesn't take a
@@ -406,6 +445,15 @@ pub fn register_initcalls() {
     // place.)
     narf_init::register(Stage::Subsys, "fb-syscall-vtable", || {
         narf_userspace::handlers::install_fb_syscall_vtable(registry::syscall_vtable());
+        InitResult::Ok
+    });
+    // Process-exit observer: reap any FB connections the dying
+    // process held. Without this, a crashed userspace leaks ring
+    // pages + handle entries until reboot.
+    narf_init::register(Stage::Subsys, "fb-exit-observer", || {
+        narf_userspace::user_task::register_exit_observer(|pid| {
+            let _ = registry::disconnect_all_for_pid(pid);
+        });
         InitResult::Ok
     });
     narf_init::register(Stage::Late, "fb-scanout-picker", || {

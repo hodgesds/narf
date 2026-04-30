@@ -167,6 +167,46 @@ pub fn install_exit_hook(hook: ExitHook) {
     EXIT_HOOK.store(hook as *mut (), Ordering::Release);
 }
 
+// ── Process-exit observers ────────────────────────────────────────
+//
+// Subsystems that hold per-process resources (FB connections, fd
+// tables, ipc rings) register an observer here. When a polled
+// UserTaskFuture sees EXIT_REASON_EXITED, every registered observer
+// is invoked with the dying process's pid before the future resolves
+// to Ready. Observers run in plain kernel context (not in the trap
+// path) and may take spinlocks / call into other subsystems.
+//
+// Observers are append-only — there's no unregister. The intent is
+// boot-time wiring, not runtime hot-swap.
+
+pub type ExitObserver = fn(pid: u64);
+
+static EXIT_OBSERVERS: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<ExitObserver>> =
+    narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+/// Register a callback to fire when a polled user task transitions
+/// to Exited. Invoked exactly once per task with the task's pid.
+pub fn register_exit_observer(o: ExitObserver) {
+    EXIT_OBSERVERS.lock().push(o);
+}
+
+/// Fan out the exit notification. Called by `UserTaskFuture::poll`
+/// when it sees `EXIT_REASON_EXITED`. Also exposed for test
+/// harnesses that want to drive the observer fan-out without
+/// running a full polling future.
+pub fn notify_task_exited(pid: u64) {
+    let observers = EXIT_OBSERVERS.lock().clone();
+    for o in observers.iter() {
+        o(pid);
+    }
+}
+
+/// Test-only reset.
+#[doc(hidden)]
+pub fn __test_clear_exit_observers() {
+    EXIT_OBSERVERS.lock().clear();
+}
+
 /// Test-only reset.
 #[doc(hidden)]
 pub fn __test_clear_hooks() {
@@ -480,6 +520,11 @@ impl core::future::Future for UserTaskFuture {
 
         let reason = saved as u32;
         if reason == EXIT_REASON_EXITED {
+            // Fan out to per-pid observers (FB connections, fd
+            // tables, future ipc rings) before flipping state so
+            // any subsystem that wants to inspect the live process
+            // sees it pre-teardown.
+            notify_task_exited(this.process.pid.raw());
             this.state = TaskState::Exited;
             core::task::Poll::Ready(())
         } else {

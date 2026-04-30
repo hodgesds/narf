@@ -2067,6 +2067,62 @@ fn smoke_fb_writer_fill_clips_and_paints() -> TestResult {
 }
 kernel_test!(smoke_fb_writer_fill_clips_and_paints);
 
+fn smoke_fb_writer_blit_round_trip() -> TestResult {
+    // Self-contained against the test scanout: blit a 4×4
+    // checkerboard, read back the pixel grid, verify each cell.
+    // Uses install_test_scanout so a real bochs / virtio-gpu
+    // backend isn't required.
+    use narf_fb::{
+        bootstrap_writer, clear_test_scanout, install_test_scanout,
+        test_scanout_pixel, FbWriter, Rect,
+    };
+    use narf_graphics::Pixel32;
+
+    install_test_scanout(32, 32);
+    let cap = bootstrap_writer();
+    let w = match FbWriter::new(cap) {
+        Ok(w)  => w,
+        Err(_) => { clear_test_scanout(); return TestResult::Fail("FbWriter::new"); }
+    };
+
+    let on  = Pixel32::rgb(0xAA, 0xBB, 0xCC);
+    let off = Pixel32::rgb(0x11, 0x22, 0x33);
+    // 4×4 checkerboard: row-major pixels.
+    let src = [
+        on,  off, on,  off,
+        off, on,  off, on,
+        on,  off, on,  off,
+        off, on,  off, on,
+    ];
+    if w.blit(Rect::new(2, 2, 4, 4), &src).is_err() {
+        clear_test_scanout();
+        return TestResult::Fail("blit");
+    }
+    // Spot-check four corners + a middle cell.
+    let cases = [
+        (2, 2, on),  // top-left of blit
+        (5, 2, off), // top-right
+        (2, 5, off), // bottom-left
+        (5, 5, on),  // bottom-right
+        (3, 3, on),  // diagonal cell
+    ];
+    for (x, y, want) in cases.iter() {
+        match test_scanout_pixel(*x, *y) {
+            Some(p) if p == *want => {}
+            Some(_) => { clear_test_scanout(); return TestResult::Fail("pixel mismatch"); }
+            None    => { clear_test_scanout(); return TestResult::Fail("oob pixel"); }
+        }
+    }
+    // Length mismatch must error.
+    if w.blit(Rect::new(0, 0, 4, 4), &src[..15]).is_ok() {
+        clear_test_scanout();
+        return TestResult::Fail("len-mismatch should error");
+    }
+    clear_test_scanout();
+    TestResult::Pass
+}
+kernel_test!(smoke_fb_writer_blit_round_trip);
+
 fn smoke_fb_rect_clip_math() -> TestResult {
     use narf_fb::Rect;
     let r = Rect::new(10, 10, 100, 100).clip(50, 50).unwrap();
@@ -2266,6 +2322,57 @@ fn smoke_fb_registry_connect_disconnect() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_fb_registry_connect_disconnect);
+
+fn smoke_fb_exit_observer_reaps_handles() -> TestResult {
+    // Process-exit cleanup: when notify_task_exited fires for a
+    // pid, every FB connection that pid holds disappears. Sets up
+    // 3 connections across two pids, then notifies the first;
+    // only the second's connection should survive.
+    use narf_fb::registry::{
+        __reset_for_test, connect, count, disconnect_all_for_pid,
+    };
+    use narf_fb::{clear_test_scanout, install_test_scanout};
+    use narf_userspace::user_task::{
+        __test_clear_exit_observers, register_exit_observer,
+        notify_task_exited,
+    };
+
+    install_test_scanout(64, 64);
+    __reset_for_test();
+    __test_clear_exit_observers();
+
+    // Register the FB exit observer (boot-time wiring; the
+    // verification harness re-applies it here).
+    register_exit_observer(|pid| {
+        let _ = disconnect_all_for_pid(pid);
+    });
+
+    let pid_dies = 7001u64;
+    let pid_keeps = 7002u64;
+    let _h1 = connect(pid_dies,  0).expect("h1");
+    let _h2 = connect(pid_dies,  0).expect("h2");
+    let _h3 = connect(pid_keeps, 0).expect("h3");
+    if count() != 3 { clear_test_scanout(); return TestResult::Fail("setup"); }
+
+    notify_task_exited(pid_dies);
+
+    if count() != 1 {
+        clear_test_scanout();
+        return TestResult::Fail("observer didn't reap dying pid's handles");
+    }
+
+    notify_task_exited(pid_keeps);
+    if count() != 0 {
+        clear_test_scanout();
+        return TestResult::Fail("second notify didn't reap survivor");
+    }
+
+    __reset_for_test();
+    __test_clear_exit_observers();
+    clear_test_scanout();
+    TestResult::Pass
+}
+kernel_test!(smoke_fb_exit_observer_reaps_handles);
 
 fn smoke_fb_registry_drain_all_executes_per_process() -> TestResult {
     // Two processes each attach a ring; one enqueues a Fill; the
