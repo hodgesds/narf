@@ -288,15 +288,51 @@ fn run_probes_x86_64(rsp_at_entry: u64) {
 
     // ── fb probe ──────────────────────────────────────────────
     // Open the active scanout via libnarf-graphics, sanity-check
-    // geometry, draw a fill, drop closes the connection (kernel
-    // reaps the handle on the FbContext::drop syscall).
+    // geometry, draw a colorful demo pattern (so a developer
+    // running `cargo xtask run --display gtk --features
+    // user-mode-testbin` can actually SEE userspace pixels land
+    // on the framebuffer), flush, and pause briefly so the demo
+    // is visible before QEMU exits. Drop closes the connection.
     let fb_ok = match rt::graphics::FbContext::open() {
         Ok(mut fb) => {
-            let info = fb.info();
+            let info = *fb.info();
             let geom_ok = info.width > 0
                        && info.height > 0
                        && info.format == rt::FB_FORMAT_XRGB8888;
-            geom_ok && fb.fill(4, 4, 8, 8, 0xFFBADF00u32).is_ok()
+            if !geom_ok {
+                false
+            } else {
+                let mut all_ok = true;
+                // Background: solid dark blue.
+                all_ok &= fb.fill(0, 0, info.width, info.height, 0xFF101840).is_ok();
+                // 8 vertical color bars across the full height.
+                let bar_w = info.width / 8;
+                let palette = [
+                    0xFFE53935u32, 0xFFFB8C00, 0xFFFDD835, 0xFF43A047,
+                    0xFF1E88E5, 0xFF5E35B1, 0xFFD81B60, 0xFFE0E0E0,
+                ];
+                for (i, &color) in palette.iter().enumerate() {
+                    let x = (i as u32) * bar_w;
+                    let h = info.height / 2;
+                    all_ok &= fb.fill(x, info.height / 4, bar_w, h, color).is_ok();
+                }
+                // Centered yellow square as the userspace-pixels
+                // visual anchor (a Stage-3 testbin tradition).
+                let cx = info.width / 2;
+                let cy = info.height / 2;
+                let s = 64u32.min(info.width.min(info.height));
+                all_ok &= fb.fill(cx.saturating_sub(s/2), cy.saturating_sub(s/2),
+                                   s, s, 0xFFFFD700).is_ok();
+                // Push the dirty region so the device actually
+                // scans out our pixels.
+                all_ok &= fb.flush(0, 0, info.width, info.height).is_ok();
+                // Linger ~3s so a human running with --display
+                // gtk has time to see the result before QEMU
+                // exits. Headless test runs incur the same
+                // delay; cheap.
+                rt::nanosleep(3_000_000_000);
+                all_ok
+            }
         }
         Err(_) => false,
     };
