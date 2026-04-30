@@ -2172,85 +2172,142 @@ fn sys_mmap(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(base));
 }
 
-// ── FbRingAttach — no args ─────────────────────────────────────────
+// ── FB syscalls ────────────────────────────────────────────────────
 //
-// Allocates a DrawRing for the calling process via the
-// fb-installed hook; returns the backing phys for the caller to
-// then SYS_MMAP_PHYS into its VA.
+// Five syscalls (Connect/Info/RingMap/FlushWait/Disconnect) form the
+// userspace framebuffer surface. The kernel-side narf-fb crate
+// installs a vtable here at boot; without it, all five calls return
+// InvalidOp. This indirection keeps narf-userspace independent of
+// narf-fb's transitive dependencies (graphics drivers).
 
-/// Hook signature: fn(pid) -> phys, where 0 means "rejected".
-pub type FbRingAttachHook = fn(u64) -> u64;
-static FB_RING_ATTACH_HOOK: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-
-pub fn install_fb_ring_attach_hook(h: FbRingAttachHook) {
-    FB_RING_ATTACH_HOOK.store(h as usize, core::sync::atomic::Ordering::Release);
+/// Vtable installed by narf-fb. Each fn pointer is the kernel-side
+/// implementation of one syscall.
+///
+/// Contract:
+/// - `connect(pid, scanout_id) -> Option<handle>` — `0` is reserved as
+///   "invalid handle" so `Option<NonZeroU64>` shape is encoded as
+///   `0 = None, n = Some(n)` on the wire.
+/// - `info(handle, out: &mut [u32; 6])` — fills `width, height,
+///   stride_bytes, format, scanout_id, _resv`. Returns `false` on
+///   bad handle.
+/// - `ring_map(handle) -> Option<phys>` — kernel returns the ring's
+///   phys, the syscall handler does the user-VA mapping.
+/// - `flush_wait(handle) -> Option<u64>` — drain count snapshot, or
+///   `None` on bad handle.
+/// - `disconnect(handle) -> bool` — `true` on success.
+#[derive(Copy, Clone)]
+pub struct FbSyscallVtable {
+    pub connect:    fn(pid: u64, scanout_id: u64) -> u64,
+    pub info:       fn(handle: u64, out: &mut [u32; 6]) -> bool,
+    pub ring_map:   fn(handle: u64) -> u64,
+    pub flush_wait: fn(handle: u64) -> u64,
+    pub disconnect: fn(handle: u64) -> bool,
 }
 
-fn sys_fb_ring_attach(ctx: &mut dyn TrapContext) {
-    let h = FB_RING_ATTACH_HOOK.load(core::sync::atomic::Ordering::Acquire);
+impl core::fmt::Debug for FbSyscallVtable {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FbSyscallVtable").finish_non_exhaustive()
+    }
+}
+
+static FB_VTABLE: core::sync::atomic::AtomicPtr<FbSyscallVtable> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Install the narf-fb-supplied syscall vtable. Idempotent — last
+/// install wins. The static lives for the kernel's lifetime, so
+/// callers should pass a `&'static FbSyscallVtable`.
+pub fn install_fb_syscall_vtable(v: &'static FbSyscallVtable) {
+    FB_VTABLE.store(
+        v as *const FbSyscallVtable as *mut FbSyscallVtable,
+        core::sync::atomic::Ordering::Release,
+    );
+}
+
+#[doc(hidden)]
+pub fn __fb_vtable_for_test() -> Option<&'static FbSyscallVtable> {
+    let p = FB_VTABLE.load(core::sync::atomic::Ordering::Acquire);
+    if p.is_null() { None } else {
+        // SAFETY: install_fb_syscall_vtable requires a 'static input.
+        Some(unsafe { &*p })
+    }
+}
+
+fn fb_vtable() -> Option<&'static FbSyscallVtable> {
+    let p = FB_VTABLE.load(core::sync::atomic::Ordering::Acquire);
+    if p.is_null() { None } else {
+        // SAFETY: install_fb_syscall_vtable requires a 'static input.
+        Some(unsafe { &*p })
+    }
+}
+
+fn sys_fb_connect(ctx: &mut dyn TrapContext) {
+    let scanout_id = ctx.args().arg0;
+    let v = match fb_vtable() {
+        Some(v) => v,
+        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+    };
+    let pid = current_task_id();
+    let h = (v.connect)(pid, scanout_id);
     if h == 0 {
+        ctx.set_return(SyscallReturn::invalid_op());
+    } else {
+        ctx.set_return(SyscallReturn::ok(h));
+    }
+}
+
+fn sys_fb_info(ctx: &mut dyn TrapContext) {
+    let args   = *ctx.args();
+    let handle = args.arg0;
+    let user_p = args.arg1;
+    let v = match fb_vtable() {
+        Some(v) => v,
+        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+    };
+    let mut out = [0u32; 6];
+    if !(v.info)(handle, &mut out) {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
-    // SAFETY: stored as `FbRingAttachHook as usize`.
-    let f: FbRingAttachHook = unsafe { core::mem::transmute(h) };
-    let pid = current_task_id();
-    let phys = f(pid);
-    if phys == 0 {
+    // Write 6 u32s into the user pointer. The address space's
+    // page tables already gate writability — a bad pointer faults
+    // back into the trap path and the caller's process gets the
+    // page fault, which is the right blast radius.
+    if user_p == 0 || (user_p & 0x3) != 0 {
         ctx.set_return(SyscallReturn::invalid_op());
-    } else {
-        ctx.set_return(SyscallReturn::ok(phys));
+        return;
     }
+    // SAFETY: caller-supplied user VA; alignment checked above.
+    // A fault here is the caller's responsibility.
+    unsafe {
+        for (i, w) in out.iter().enumerate() {
+            core::ptr::write_volatile((user_p as *mut u32).add(i), *w);
+        }
+    }
+    ctx.set_return(SyscallReturn::ok(0));
 }
 
-// ── MmapPhys — arg0=phys, arg1=len, arg2=flags ─────────────────────
-//
-// Maps a kernel-allowlisted phys range into userspace VA. The
-// caller has no way to forge a phys — the allowlist is populated
-// only by kernel-side code (e.g. the per-process FbRing
-// allocator) before any userspace process can request it.
-
-fn sys_mmap_phys(ctx: &mut dyn TrapContext) {
-    let args  = *ctx.args();
-    let phys  = args.arg0;
-    let len   = ((args.arg1 + 0xFFF) & !0xFFFu64).max(0x1000);
-    let flags = args.arg2;
-
-    // Lookup must contain the full (phys, len) request.
-    let entry = match crate::mmap_phys::lookup(phys, len) {
-        Some(e) => e,
+fn sys_fb_ring_map(ctx: &mut dyn TrapContext) {
+    let handle = ctx.args().arg0;
+    let v = match fb_vtable() {
+        Some(v) => v,
         None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
     };
-
+    let phys = (v.ring_map)(handle);
+    if phys == 0 {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
     let as_ref = match current_address_space() {
         Some(a) => a,
         None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
     };
-
-    // Build the per-page phys list from the contiguous range. The
-    // allowlist guarantees `entry` covers `[phys, phys + len)`.
-    let pages = (len >> 12) as usize;
-    let mut phys_list: alloc::vec::Vec<narf_memory::PhysAddr> =
-        alloc::vec::Vec::with_capacity(pages);
-    for i in 0..pages {
-        phys_list.push(narf_memory::PhysAddr::new(phys + (i as u64) * 4096));
-    }
-
-    let perms = match entry.perms {
-        crate::mmap_phys::MapPerms::ReadWrite => RegionPerms::READ | RegionPerms::WRITE,
-        crate::mmap_phys::MapPerms::ReadOnly  => RegionPerms::READ,
-    };
-    // `flags` is reserved for future RO-narrow / EXEC-grant; today
-    // we honour the allowlist's perms unconditionally.
-    let _ = flags;
-
+    let len = 4096u64;
     let base = MMAP_CURSOR.fetch_add(len, Ordering::Relaxed);
     if as_ref.map_region(Region {
         base:  VirtAddr::new(base),
         len,
-        perms,
-        phys:  phys_list,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys:  alloc::vec![narf_memory::PhysAddr::new(phys)],
     }).is_err() {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -2260,6 +2317,29 @@ fn sys_mmap_phys(ctx: &mut dyn TrapContext) {
         return;
     }
     ctx.set_return(SyscallReturn::ok(base));
+}
+
+fn sys_fb_flush_wait(ctx: &mut dyn TrapContext) {
+    let handle = ctx.args().arg0;
+    let v = match fb_vtable() {
+        Some(v) => v,
+        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+    };
+    let drained = (v.flush_wait)(handle);
+    ctx.set_return(SyscallReturn::ok(drained));
+}
+
+fn sys_fb_disconnect(ctx: &mut dyn TrapContext) {
+    let handle = ctx.args().arg0;
+    let v = match fb_vtable() {
+        Some(v) => v,
+        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+    };
+    if (v.disconnect)(handle) {
+        ctx.set_return(SyscallReturn::ok(0));
+    } else {
+        ctx.set_return(SyscallReturn::invalid_op());
+    }
 }
 
 // ── Munmap — arg0=base ─────────────────────────────────────────────
@@ -4210,9 +4290,11 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Close,    "close",    RawFnHandler(sys_close));
     table.install_raw(Syscall::Mmap,     "mmap",     RawFnHandler(sys_mmap));
     table.install_raw(Syscall::Munmap,   "munmap",   RawFnHandler(sys_munmap));
-    table.install_raw(Syscall::MmapPhys, "mmap_phys", RawFnHandler(sys_mmap_phys));
-    table.install_raw(Syscall::FbRingAttach, "fb_ring_attach",
-                      RawFnHandler(sys_fb_ring_attach));
+    table.install_raw(Syscall::FbConnect,    "fb_connect",     RawFnHandler(sys_fb_connect));
+    table.install_raw(Syscall::FbInfo,       "fb_info",        RawFnHandler(sys_fb_info));
+    table.install_raw(Syscall::FbRingMap,    "fb_ring_map",    RawFnHandler(sys_fb_ring_map));
+    table.install_raw(Syscall::FbFlushWait,  "fb_flush_wait",  RawFnHandler(sys_fb_flush_wait));
+    table.install_raw(Syscall::FbDisconnect, "fb_disconnect",  RawFnHandler(sys_fb_disconnect));
     table.install_raw(Syscall::RingKick, "ringkick", RawFnHandler(sys_ring_kick));
     table.install_raw(Syscall::GetPid,   "getpid",   RawFnHandler(sys_getpid));
     table.install_raw(Syscall::GetPpid,  "getppid",  RawFnHandler(sys_getppid));

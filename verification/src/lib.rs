@@ -2187,97 +2187,85 @@ fn smoke_fb_client_drives_drain_to_pixel() -> TestResult {
 }
 kernel_test!(smoke_fb_client_drives_drain_to_pixel);
 
-fn smoke_mmap_phys_allowlist_lookup() -> TestResult {
-    use narf_userspace::mmap_phys::{
-        __reset_for_test, allow, lookup, revoke, MapPerms,
-    };
-    __reset_for_test();
-    // Reject pre-allow.
-    if lookup(0x10_0000, 4096).is_some() {
-        return TestResult::Fail("lookup hit before allow");
-    }
-    allow(0x10_0000, 8192, MapPerms::ReadWrite);
-    // Exact match wins.
-    let e = match lookup(0x10_0000, 4096) {
-        Some(e) => e,
-        None    => return TestResult::Fail("lookup miss after allow"),
-    };
-    if e.perms != MapPerms::ReadWrite {
-        return TestResult::Fail("perms mismatch");
-    }
-    // Sub-range still inside the entry.
-    if lookup(0x10_1000, 4096).is_none() {
-        return TestResult::Fail("sub-range missed");
-    }
-    // Out-of-range request rejected.
-    if lookup(0x10_0000, 16384).is_some() {
-        return TestResult::Fail("oversize request matched");
-    }
-    // Misaligned phys rejected.
-    if lookup(0x10_0001, 4096).is_some() {
-        return TestResult::Fail("misaligned matched");
-    }
-    revoke(0x10_0000, 8192);
-    if lookup(0x10_0000, 4096).is_some() {
-        return TestResult::Fail("post-revoke still matched");
-    }
-    __reset_for_test();
-    TestResult::Pass
-}
-kernel_test!(smoke_mmap_phys_allowlist_lookup);
-
-fn smoke_fb_registry_attach_detach() -> TestResult {
+fn smoke_fb_registry_connect_disconnect() -> TestResult {
     use narf_fb::registry::{
-        __reset_for_test, attach, count, detach, lookup, AttachError,
+        __reset_for_test, connect, count, disconnect, disconnect_all_for_pid,
+        ring_phys, info, drain_count,
     };
+    use narf_fb::{clear_test_scanout, install_test_scanout};
 
+    // Self-contained backend so this smoke doesn't depend on a real
+    // bochs / virtio-gpu having been picked. clear_test_scanout
+    // restores prior state at exit so neighbouring smokes that
+    // require a real backend still work.
+    install_test_scanout(64, 64);
     __reset_for_test();
     if count() != 0 { return TestResult::Fail("registry not empty after reset"); }
 
-    // Attach two distinct pids.
+    // Connect two distinct pids.
     let pid_a = 1001u64;
     let pid_b = 1002u64;
-    let phys_a = match attach(pid_a) {
-        Ok(p)  => p,
-        Err(_) => return TestResult::Fail("attach pid_a failed"),
+    let h_a = match connect(pid_a, 0) {
+        Ok(h)  => h,
+        Err(_) => return TestResult::Fail("connect pid_a failed"),
     };
-    let phys_b = match attach(pid_b) {
-        Ok(p)  => p,
-        Err(_) => return TestResult::Fail("attach pid_b failed"),
+    let h_b = match connect(pid_b, 0) {
+        Ok(h)  => h,
+        Err(_) => return TestResult::Fail("connect pid_b failed"),
     };
-    if phys_a.raw() == phys_b.raw() {
-        return TestResult::Fail("two attaches returned the same phys");
+    if h_a == 0 || h_b == 0 || h_a == h_b {
+        return TestResult::Fail("connect returned bad / duplicate handle");
     }
-    if count() != 2 { return TestResult::Fail("count mismatch after 2 attaches"); }
+    if count() != 2 { return TestResult::Fail("count after 2 connects"); }
 
-    // Re-attach same pid → AlreadyAttached.
-    match attach(pid_a) {
-        Err(AttachError::AlreadyAttached) => {}
-        _ => return TestResult::Fail("re-attach didn't return AlreadyAttached"),
+    // Same pid can open a second handle — handles are independent.
+    let h_a2 = connect(pid_a, 0).expect("second connect for pid_a");
+    if h_a2 == h_a { return TestResult::Fail("second connect aliased the first"); }
+    if count() != 3 { return TestResult::Fail("count after 3 connects"); }
+
+    // ring_phys distinct + info populated.
+    let phys_a = ring_phys(h_a).expect("ring_phys(h_a)");
+    let phys_b = ring_phys(h_b).expect("ring_phys(h_b)");
+    if phys_a == phys_b {
+        return TestResult::Fail("two handles share the same ring phys");
+    }
+    let info_a = match info(h_a) {
+        Some(i) => i,
+        None    => return TestResult::Fail("info(h_a) missing"),
+    };
+    if info_a[0] == 0 || info_a[1] == 0 || info_a[3] != 1 {
+        return TestResult::Fail("info populated incorrectly");
     }
 
-    // Lookup matches the original phys.
-    if lookup(pid_a) != Some(phys_a.raw()) {
-        return TestResult::Fail("lookup pid_a wrong");
+    // drain_count starts at 0.
+    if drain_count(h_a) != Some(0) {
+        return TestResult::Fail("drain_count not 0 at connect");
     }
 
-    // The phys must be on the mmap_phys allowlist.
-    if narf_userspace::mmap_phys::lookup(phys_a.raw(), 4096).is_none() {
-        return TestResult::Fail("attached phys not on mmap_phys allowlist");
+    // Reject scanout_id != 0 today.
+    if connect(pid_a, 1).is_ok() {
+        return TestResult::Fail("scanout_id=1 should reject (no multi-scanout)");
     }
 
-    // Detach → registry shrinks + allowlist drops the entry.
-    detach(pid_a);
-    if count() != 1 { return TestResult::Fail("count wrong after detach"); }
-    if narf_userspace::mmap_phys::lookup(phys_a.raw(), 4096).is_some() {
-        return TestResult::Fail("allowlist still carries detached phys");
+    // Explicit disconnect for h_a; pid-scoped disconnect for the rest.
+    if !disconnect(h_a) { return TestResult::Fail("disconnect h_a"); }
+    if count() != 2 { return TestResult::Fail("count after disconnect h_a"); }
+    if disconnect(h_a) {
+        return TestResult::Fail("double-disconnect should fail");
     }
-    detach(pid_b);
-    if count() != 0 { return TestResult::Fail("count not zero after both detaches"); }
+
+    let reaped = disconnect_all_for_pid(pid_a);
+    if reaped != 1 {
+        return TestResult::Fail("disconnect_all_for_pid(a) reaped wrong count");
+    }
+    if count() != 1 { return TestResult::Fail("count after pid_a sweep"); }
+    let _ = disconnect_all_for_pid(pid_b);
+    if count() != 0 { return TestResult::Fail("count after pid_b sweep"); }
     __reset_for_test();
+    clear_test_scanout();
     TestResult::Pass
 }
-kernel_test!(smoke_fb_registry_attach_detach);
+kernel_test!(smoke_fb_registry_connect_disconnect);
 
 fn smoke_fb_registry_drain_all_executes_per_process() -> TestResult {
     // Two processes each attach a ring; one enqueues a Fill; the
@@ -2296,18 +2284,19 @@ fn smoke_fb_registry_drain_all_executes_per_process() -> TestResult {
 
     let pid_a = 2001u64;
     let pid_b = 2002u64;
-    let phys_a = match registry::attach(pid_a) {
-        Ok(p)  => p,
-        Err(_) => return TestResult::Fail("attach pid_a"),
+    let h_a = match registry::connect(pid_a, 0) {
+        Ok(h)  => h,
+        Err(_) => return TestResult::Fail("connect pid_a"),
     };
-    let _phys_b = match registry::attach(pid_b) {
-        Ok(p)  => p,
-        Err(_) => return TestResult::Fail("attach pid_b"),
+    let _h_b = match registry::connect(pid_b, 0) {
+        Ok(h)  => h,
+        Err(_) => return TestResult::Fail("connect pid_b"),
     };
+    let phys_a = registry::ring_phys(h_a).expect("ring_phys");
 
     // Build a producer over A's ring (treating its phys as a
     // kernel-side pointer — identity-mapped low memory).
-    let ring_ptr = phys_a.raw() as *mut DrawRing;
+    let ring_ptr = phys_a as *mut DrawRing;
     // SAFETY: SPSC contract — kernel side only constructs the
     // producer here; the consumer was retained by the registry
     // when attach() ran.
@@ -2346,13 +2335,14 @@ fn smoke_fb_drain_once_advances_counters() -> TestResult {
     narf_fb::drain_task::__reset_for_test();
 
     let pid = 3001u64;
-    let phys = match registry::attach(pid) {
-        Ok(p)  => p,
-        Err(_) => return TestResult::Fail("attach"),
+    let h = match registry::connect(pid, 0) {
+        Ok(h)  => h,
+        Err(_) => return TestResult::Fail("connect"),
     };
+    let phys = registry::ring_phys(h).expect("ring_phys");
     let mut producer: SharedProducer<DrawCmd, RING_DEPTH> =
         // SAFETY: SPSC contract — kernel-side test.
-        unsafe { SharedProducer::from_raw(phys.raw() as *mut DrawRing) };
+        unsafe { SharedProducer::from_raw(phys as *mut DrawRing) };
     let cmd = DrawCmd::fill(Rect::new(0, 0, 2, 2),
                             Pixel32::rgb(0xDE, 0xAD, 0xBE).raw());
     if cmd_ring::try_send(&mut producer, cmd).is_err() {
@@ -2379,7 +2369,7 @@ fn smoke_fb_e2e_via_test_scanout() -> TestResult {
     // End-to-end check that runs on every arch: install a test
     // scanout, attach a registry ring, send a Fill via a kernel
     // SharedProducer (the same surface a userspace producer would
-    // use after sys_mmap_phys), drain, and read the pixel back
+    // use after SYS_FB_RING_MAP), drain, and read the pixel back
     // from the test scanout's heap buffer.
     use narf_fb::{
         bootstrap_writer, clear_test_scanout, cmd_ring, drain_once,
@@ -2394,13 +2384,17 @@ fn smoke_fb_e2e_via_test_scanout() -> TestResult {
     narf_fb::drain_task::__reset_for_test();
 
     let pid = 4001u64;
-    let phys = match registry::attach(pid) {
-        Ok(p)  => p,
-        Err(_) => { clear_test_scanout(); return TestResult::Fail("attach"); }
+    let h = match registry::connect(pid, 0) {
+        Ok(h)  => h,
+        Err(_) => { clear_test_scanout(); return TestResult::Fail("connect"); }
+    };
+    let phys = match registry::ring_phys(h) {
+        Some(p) => p,
+        None    => { clear_test_scanout(); return TestResult::Fail("ring_phys"); }
     };
     let mut producer: SharedProducer<DrawCmd, RING_DEPTH> =
         // SAFETY: SPSC contract.
-        unsafe { SharedProducer::from_raw(phys.raw() as *mut DrawRing) };
+        unsafe { SharedProducer::from_raw(phys as *mut DrawRing) };
     let target_pix = Pixel32::rgb(0xCA, 0xFE, 0x42);
     if cmd_ring::try_send(
         &mut producer,
@@ -2492,9 +2486,9 @@ fn smoke_fb_userspace_chain_against_real_backend() -> TestResult {
     // whichever real FB backend the picker selected (bochs on
     // x86_64, virtio-gpu on aarch64). The kernel-side producer
     // here uses the exact same SharedRing layout a userspace
-    // process would build over a SYS_MMAP_PHYS'd page; the only
+    // process would build over a SYS_FB_RING_MAP'd page; the only
     // difference vs the testbin's fb probe is we skip the
-    // mmap_phys hop because we're running in kernel context.
+    // SYS_FB_RING_MAP hop because we're running in kernel context.
     use narf_fb::{
         bootstrap_writer, cmd_ring, drain_once, registry, select_active,
         FbWriter, Rect,
@@ -2517,15 +2511,19 @@ fn smoke_fb_userspace_chain_against_real_backend() -> TestResult {
     narf_fb::drain_task::__reset_for_test();
 
     let pid = 5001u64;
-    let phys = match registry::attach(pid) {
-        Ok(p)  => p,
-        Err(_) => return TestResult::Fail("attach"),
+    let h = match registry::connect(pid, 0) {
+        Ok(h)  => h,
+        Err(_) => return TestResult::Fail("connect"),
+    };
+    let phys = match registry::ring_phys(h) {
+        Some(p) => p,
+        None    => return TestResult::Fail("ring_phys"),
     };
     // Producer over the kernel-side view of the ring (identity-
     // mapped phys = identity-VA in low 4 GiB).
     let mut producer: SharedProducer<DrawCmd, RING_DEPTH> =
         // SAFETY: SPSC contract — kernel-side test, sole producer.
-        unsafe { SharedProducer::from_raw(phys.raw() as *mut DrawRing) };
+        unsafe { SharedProducer::from_raw(phys as *mut DrawRing) };
     let pix = Pixel32::rgb(0x55, 0xAA, 0x55).raw();
     if cmd_ring::try_send(
         &mut producer,
@@ -15592,15 +15590,12 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
-    // FB-ring-attach hook: the boot path's Stage::Subsys initcall
+    // FB syscall vtable: the boot path's Stage::Subsys initcall
     // installs this; the test runner doesn't invoke initcalls so
-    // we wire the hook here directly.
-    narf_userspace::handlers::install_fb_ring_attach_hook(|pid| {
-        match narf_fb::registry::attach(pid) {
-            Ok(p)  => p.raw(),
-            Err(_) => 0,
-        }
-    });
+    // we wire the vtable here directly.
+    narf_userspace::handlers::install_fb_syscall_vtable(
+        narf_fb::registry::syscall_vtable(),
+    );
 
     // Snapshot CR3 for restore post-unwind.
     let original_cr3: u64;

@@ -328,22 +328,38 @@ pub enum Syscall {
     /// Unmap memory.
     Munmap       = 121,
 
-    /// Map a kernel-owned phys range into userspace.
-    ///   `arg0` = phys addr (must be page-aligned).
-    ///   `arg1` = length in bytes (rounded up to a page).
-    ///   `arg2` = flags (RW vs RO; reserved for future).
-    /// The phys range must be on the kernel-side allowlist
-    /// (`narf_userspace::mmap_phys::allow(phys, len)`); otherwise
-    /// the call returns InvalidOp. Returns the new userspace VA on
-    /// success.
-    MmapPhys     = 240,
+    /// Open an FB connection to a scanout. `arg0` = scanout id (0
+    /// for the active scanout). Returns a non-zero `FbHandleId` on
+    /// success, 0 on failure (no backend / OOM / not authorised).
+    /// Auto-closed on process exit.
+    FbConnect    = 240,
 
-    /// Attach a fresh DrawRing for the calling process. Returns
-    /// the backing phys (which the caller then maps via
-    /// SYS_MMAP_PHYS to construct a SharedProducer<DrawCmd>).
-    /// Idempotent — calling twice returns the same phys for the
-    /// same process.
-    FbRingAttach = 241,
+    /// Query the connected scanout's geometry + format. `arg0` =
+    /// `FbHandleId`, `arg1` = userspace pointer to a 24-byte
+    /// `FbInfo` (`{u32 width, height, stride, format, scanout_id, _resv}`).
+    /// Returns 0 on success, !0 on bad handle / bad pointer.
+    FbInfo       = 241,
+
+    /// Map the connection's draw-ring into the caller's VA. `arg0`
+    /// = `FbHandleId`. Returns the user VA (4 KiB region) or 0 on
+    /// failure. The mapping is RW; userspace constructs a
+    /// `SharedProducer<DrawCmd>` over it.
+    FbRingMap    = 242,
+
+    /// Block (or report) until the kernel drain task has consumed
+    /// at least one command past the caller's prior wait point.
+    /// `arg0` = `FbHandleId`. Returns the current drain count
+    /// snapshot. Today this is non-blocking — it returns immediately
+    /// — but the contract leaves room for vsync / backpressure
+    /// blocking once the scheduler-aware drain lands.
+    FbFlushWait  = 243,
+
+    /// Tear down a connection. `arg0` = `FbHandleId`. Frees the
+    /// ring, removes the mapping, and reaps the kernel-side
+    /// consumer. Returns 0 on success, !0 on bad handle. Also
+    /// auto-called on process exit; explicit calls are for
+    /// graceful shutdown.
+    FbDisconnect = 244,
 
     /// Kick the kernel-side dispatcher to drain the calling task's
     /// shared SubmissionRing and post Completions to the shared
@@ -839,8 +855,11 @@ impl Syscall {
             195 => Syscall::Listdir,
             196 => Syscall::Getdents64,
             200 => Syscall::GetRandom,
-            240 => Syscall::MmapPhys,
-            241 => Syscall::FbRingAttach,
+            240 => Syscall::FbConnect,
+            241 => Syscall::FbInfo,
+            242 => Syscall::FbRingMap,
+            243 => Syscall::FbFlushWait,
+            244 => Syscall::FbDisconnect,
             _   => return None,
         })
     }

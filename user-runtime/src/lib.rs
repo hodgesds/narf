@@ -56,8 +56,11 @@ pub const SYS_FSTAT:          u64 = 116;
 pub const SYS_PIPE:           u64 = 117;
 pub const SYS_MMAP:           u64 = 120;
 pub const SYS_MUNMAP:         u64 = 121;
-pub const SYS_MMAP_PHYS:      u64 = 240;
-pub const SYS_FB_RING_ATTACH: u64 = 241;
+pub const SYS_FB_CONNECT:     u64 = 240;
+pub const SYS_FB_INFO:        u64 = 241;
+pub const SYS_FB_RING_MAP:    u64 = 242;
+pub const SYS_FB_FLUSH_WAIT:  u64 = 243;
+pub const SYS_FB_DISCONNECT:  u64 = 244;
 pub const SYS_RING_KICK:      u64 = 130;
 pub const SYS_GETPID:         u64 = 140;
 pub const SYS_GETPPID:        u64 = 141;
@@ -882,38 +885,89 @@ pub unsafe fn mmap(hint: usize, len: usize, flags: u32) -> *mut u8 {
     }
 }
 
-/// Attach a fresh DrawRing to the calling process. Returns the
-/// backing phys (to be passed to [`mmap_phys`]) or 0 on failure.
-///
-/// # Safety
-/// Pure syscall — no preconditions. Calling twice on the same
-/// process returns 0 the second time (idempotent).
-#[inline]
-pub unsafe fn fb_ring_attach() -> u64 {
-    // SAFETY: SYS_FB_RING_ATTACH takes no arguments.
-    unsafe { syscall0(SYS_FB_RING_ATTACH) }
+/// Geometry + format of a connected scanout. Filled by [`fb_info`].
+/// Layout matches the kernel-side `[u32; 6]` wire format.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct FbInfo {
+    pub width:        u32,
+    pub height:       u32,
+    pub stride_bytes: u32,
+    /// `1 = XRGB8888`. New formats add new tags; this is not a
+    /// bitfield.
+    pub format:       u32,
+    pub scanout_id:   u32,
+    pub _resv:        u32,
 }
 
-/// Map a kernel-allowlisted phys range into userspace VA. The
-/// caller passes the (phys, len) the kernel has previously
-/// allow-listed (e.g. through narf-fb's per-process FbRing
-/// allocator). Returns the new VA, or `null_mut` on rejection
-/// (range not allowlisted, alignment violation, OOM).
+/// Format tag returned in `FbInfo::format` for XRGB8888 scanouts.
+pub const FB_FORMAT_XRGB8888: u32 = 1;
+
+/// Open an FB connection to `scanout_id` (`0` for the active
+/// scanout). Returns a non-zero handle on success, `0` on failure.
 ///
 /// # Safety
-/// `phys` and `len` must match an allowlist entry; the resulting
-/// VA aliases kernel-owned memory (a virtio-style shared ring).
-/// Concurrent kernel writers + this user mapping are the contract
-/// the ring's SPSC primitives uphold.
+/// Pure syscall — no preconditions.
 #[inline]
-pub unsafe fn mmap_phys(phys: u64, len: usize, flags: u32) -> *mut u8 {
-    // SAFETY: SYS_MMAP_PHYS signature: arg0 phys, arg1 len, arg2 flags.
-    let r = unsafe { syscall3(SYS_MMAP_PHYS, phys, len as u64, flags as u64) };
-    if r == 0 || r == !0u64 {
-        core::ptr::null_mut()
-    } else {
-        r as *mut u8
-    }
+pub unsafe fn fb_connect(scanout_id: u32) -> u64 {
+    // SAFETY: SYS_FB_CONNECT takes (scanout_id) in arg0.
+    unsafe { syscall1(SYS_FB_CONNECT, scanout_id as u64) }
+}
+
+/// Query the connected scanout's geometry. Returns `Ok` on success,
+/// `Err` on bad handle / bad pointer.
+///
+/// # Safety
+/// `handle` must be a live handle from [`fb_connect`].
+#[inline]
+pub unsafe fn fb_info(handle: u64) -> Result<FbInfo, ()> {
+    let mut out = FbInfo::default();
+    // SAFETY: SYS_FB_INFO writes 6 u32s through the user pointer;
+    // FbInfo is repr(C) and 24 bytes (u32 × 6).
+    let r = unsafe {
+        syscall2(SYS_FB_INFO, handle, &mut out as *mut FbInfo as u64)
+    };
+    if r == 0 { Ok(out) } else { Err(()) }
+}
+
+/// Map the connection's draw-ring into the caller's VA. Returns the
+/// 4 KiB region's base, or `null_mut` on failure.
+///
+/// # Safety
+/// `handle` must be a live handle from [`fb_connect`]. The
+/// returned VA aliases kernel-owned memory; the caller upholds the
+/// SharedRing SPSC contract on the producer side.
+#[inline]
+pub unsafe fn fb_ring_map(handle: u64) -> *mut u8 {
+    // SAFETY: SYS_FB_RING_MAP signature: arg0 handle.
+    let r = unsafe { syscall1(SYS_FB_RING_MAP, handle) };
+    if r == 0 || r == !0u64 { core::ptr::null_mut() } else { r as *mut u8 }
+}
+
+/// Snapshot the cumulative drain count for `handle`. Today this is
+/// non-blocking; the contract leaves room for vsync / backpressure
+/// blocking in the future.
+///
+/// # Safety
+/// `handle` must be a live handle from [`fb_connect`].
+#[inline]
+pub unsafe fn fb_flush_wait(handle: u64) -> u64 {
+    // SAFETY: SYS_FB_FLUSH_WAIT signature: arg0 handle.
+    unsafe { syscall1(SYS_FB_FLUSH_WAIT, handle) }
+}
+
+/// Tear down a connection. Auto-called on process exit; explicit
+/// calls are for graceful shutdown.
+///
+/// # Safety
+/// `handle` must be a live handle from [`fb_connect`]; the caller
+/// must not retain any pointer derived from [`fb_ring_map`] past
+/// this call.
+#[inline]
+pub unsafe fn fb_disconnect(handle: u64) -> Result<(), ()> {
+    // SAFETY: SYS_FB_DISCONNECT signature: arg0 handle.
+    let r = unsafe { syscall1(SYS_FB_DISCONNECT, handle) };
+    if r == 0 { Ok(()) } else { Err(()) }
 }
 
 /// Unmap a previously [`mmap`]-returned region. Returns Ok on
