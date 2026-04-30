@@ -489,17 +489,19 @@ fn run_cmd(args: &BuildArgs) -> Result<()> {
     let mut child = cmd.spawn()
         .with_context(|| format!("failed to spawn {qemu}"))?;
 
-    // Wait for up to 240 seconds. e2e suite + new syscall additions
-    // push total runtime higher; healthy runs still finish well
-    // under this.
-    match child.wait_timeout(Duration::from_secs(240))? {
+    // Wait for up to 240 seconds by default. Override via
+    // `XTASK_QEMU_TIMEOUT_SECS=N` for diagnostics on a hang.
+    let secs = std::env::var("XTASK_QEMU_TIMEOUT_SECS")
+        .ok().and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(240);
+    match child.wait_timeout(Duration::from_secs(secs))? {
         Some(status) => {
             println!("xtask: {qemu} exited with {status}");
         }
         None => {
             child.kill()?;
             child.wait()?;
-            bail!("xtask: {qemu} timed out after 240s (possible kernel hang)");
+            bail!("xtask: {qemu} timed out after {secs}s (possible kernel hang)");
         }
     }
     Ok(())
