@@ -177,22 +177,39 @@ pub struct VirtioCaps {
 
 /// Mapped region for a virtio-PCI cap. Wraps `MmioRegion` + the
 /// in-BAR offset so reads / writes target the right window.
+///
+/// Carries a `virt` field — the kernel virtual address that
+/// resolves to the BAR. On x86_64 BARs in low RAM this is just
+/// the phys (identity-mapped); on aarch64 (and any BAR above the
+/// boot identity map) it's an ioremap'd kernel VA. All reads /
+/// writes use `virt`, so the same code path works on both arches.
 #[derive(Debug)]
 pub struct VirtioRegion {
     pub region: MmioRegion,
+    /// Kernel virtual base of the mapped BAR.
+    pub virt:   u64,
     pub offset: u64,
     pub length: u64,
 }
 
 impl VirtioRegion {
+    /// Address of register at `off` bytes into the region. Always
+    /// goes through `self.virt` so cross-arch / above-identity-map
+    /// BARs work uniformly.
+    #[inline]
+    fn addr(&self, off: u64) -> u64 { self.virt + self.offset + off }
+
     /// Read a 32-bit register at `off` bytes into the region.
     ///
     /// # Safety
     /// `off + 4 <= self.length`.
     #[inline]
     pub unsafe fn read32(&self, off: u64) -> u32 {
-        // SAFETY: forwarded.
-        unsafe { self.region.read32(self.offset + off) }
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: caller-bounded; addr() honours the kernel-VA mapping.
+        let v = unsafe { core::ptr::read_volatile(self.addr(off) as *const u32) };
+        compiler_fence(Ordering::SeqCst);
+        v
     }
 
     /// Write a 32-bit register at `off` bytes into the region.
@@ -201,8 +218,10 @@ impl VirtioRegion {
     /// Same as `read32`.
     #[inline]
     pub unsafe fn write32(&self, off: u64, v: u32) {
-        // SAFETY: forwarded.
-        unsafe { self.region.write32(self.offset + off, v); }
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: caller-bounded.
+        unsafe { core::ptr::write_volatile(self.addr(off) as *mut u32, v); }
+        compiler_fence(Ordering::SeqCst);
     }
 
     /// 64-bit register split into two 32-bit writes (LE).
@@ -223,10 +242,7 @@ impl VirtioRegion {
     pub unsafe fn read16(&self, off: u64) -> u16 {
         compiler_fence(Ordering::SeqCst);
         // SAFETY: caller-bounded.
-        let v = unsafe {
-            core::ptr::read_volatile(
-                (self.region.phys.raw() + self.offset + off) as *const u16)
-        };
+        let v = unsafe { core::ptr::read_volatile(self.addr(off) as *const u16) };
         compiler_fence(Ordering::SeqCst);
         v
     }
@@ -235,10 +251,7 @@ impl VirtioRegion {
     pub unsafe fn write16(&self, off: u64, v: u16) {
         compiler_fence(Ordering::SeqCst);
         // SAFETY: caller-bounded.
-        unsafe {
-            core::ptr::write_volatile(
-                (self.region.phys.raw() + self.offset + off) as *mut u16, v);
-        }
+        unsafe { core::ptr::write_volatile(self.addr(off) as *mut u16, v); }
         compiler_fence(Ordering::SeqCst);
     }
 
@@ -246,10 +259,7 @@ impl VirtioRegion {
     pub unsafe fn read8(&self, off: u64) -> u8 {
         compiler_fence(Ordering::SeqCst);
         // SAFETY: caller-bounded.
-        let v = unsafe {
-            core::ptr::read_volatile(
-                (self.region.phys.raw() + self.offset + off) as *const u8)
-        };
+        let v = unsafe { core::ptr::read_volatile(self.addr(off) as *const u8) };
         compiler_fence(Ordering::SeqCst);
         v
     }
@@ -258,18 +268,22 @@ impl VirtioRegion {
     pub unsafe fn write8(&self, off: u64, v: u8) {
         compiler_fence(Ordering::SeqCst);
         // SAFETY: caller-bounded.
-        unsafe {
-            core::ptr::write_volatile(
-                (self.region.phys.raw() + self.offset + off) as *mut u8, v);
-        }
+        unsafe { core::ptr::write_volatile(self.addr(off) as *mut u8, v); }
         compiler_fence(Ordering::SeqCst);
     }
 }
 
 /// Map a virtio-PCI cap's BAR + carve out the cap's window.
 ///
+/// On x86_64 with BARs in low RAM the BAR phys is identity-mapped,
+/// so `virt = phys` for free. On aarch64 (and any BAR above the
+/// boot identity map), we ioremap the BAR onto a fresh kernel VA
+/// so subsequent reads / writes don't fault. The choice happens
+/// per-arch via the ioremap module — both arches have it.
+///
 /// # Safety
-/// Forwarded to `bus::map_bar`. Caller owns the device exclusively.
+/// Forwarded to `bus::map_bar` + `memory::ioremap`. Caller owns
+/// the device exclusively.
 pub unsafe fn map_cap(
     device: &BusDevice,
     cap:    &VirtioCap,
@@ -277,7 +291,28 @@ pub unsafe fn map_cap(
     // SAFETY: caller-asserted.
     let region = unsafe { map_bar(device, cap.bar) }
         .map_err(|_| VirtioPciError::BarMapFailed)?;
-    Ok(VirtioRegion { region, offset: cap.offset as u64, length: cap.length as u64 })
+    // ioremap covers the whole BAR (page-aligned both ends). The
+    // cap's `offset` is added inside `VirtioRegion::addr` on every
+    // access.
+    let bar_phys_pg = region.phys.raw() & !0xFFFu64;
+    let bar_end     = (region.phys.raw() + region.len + 0xFFF) & !0xFFFu64;
+    let bar_len_pg  = bar_end - bar_phys_pg;
+    // SAFETY: caller owns the BAR window; we map in kernel VA
+    // space using strongly-uncached attributes for MMIO.
+    let mapping = unsafe {
+        narf_memory::ioremap::ioremap(
+            bar_phys_pg, bar_len_pg, narf_memory::ioremap::MmioAttrs::Device,
+        )
+    }.map_err(|_| VirtioPciError::BarMapFailed)?;
+    // virt aligns to the page boundary of the BAR; add back the
+    // offset within the page.
+    let intra_page = region.phys.raw() - bar_phys_pg;
+    Ok(VirtioRegion {
+        region,
+        virt:   mapping.virt + intra_page,
+        offset: cap.offset as u64,
+        length: cap.length as u64,
+    })
 }
 
 // ── Common Cfg register offsets ─────────────────────────────────────

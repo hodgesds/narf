@@ -277,11 +277,12 @@ impl Arch {
                 // block above for rationale.
                 "-device".into(),
                 "virtio-keyboard-pci,disable-legacy=on,disable-modern=off".into(),
-                // virtio-gpu deferred on aarch64: its 16 MiB BAR
-                // pushes the QEMU virt machine's BAR window past
-                // the boot identity map's 1 GiB ceiling, which then
-                // makes other virtio drivers' BARs unreachable. Lift
-                // when an ioremap / vmap surface lands on aarch64.
+                // virtio-gpu on aarch64. Its 16 MiB BAR is allocated
+                // above the boot identity map; the driver's BAR access
+                // goes through `narf_memory::ioremap` in `map_cap`,
+                // so high BARs work the same as low ones now.
+                "-device".into(),
+                "virtio-gpu-pci,disable-legacy=on,disable-modern=off".into(),
                 // QEMU's `-kernel <elf>` path on aarch64 does not
                 // load a `-dtb` blob into RAM (the DTB-loading code
                 // path is gated on `is_linux=1`). Instead we
