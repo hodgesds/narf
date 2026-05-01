@@ -21,6 +21,8 @@ narf-interrupts   = { path = "../../interrupts" }
 narf-memory       = { path = "../../memory" }
 narf-drivers      = { path = "../" }
 narf-init         = { path = "../../init" }
+narf-kernel-test  = { path = "../../verification/kernel-test" }
+narf-driver-runtime = { path = "../runtime", default-features = false, features = ["kernel"] }
 
 [lints]
 workspace = true

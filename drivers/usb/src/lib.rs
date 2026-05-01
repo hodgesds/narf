@@ -7,6 +7,10 @@
 extern crate alloc;
 
 pub mod xhci;
+pub mod msc;
+pub mod hid;
+
+mod tests;
 
 /// Stage::Subsys initcalls for this driver crate.
 pub fn register_initcalls() {

@@ -13,12 +13,17 @@ path = "src/lib.rs"
 
 [dependencies]
 narf-lib          = { path = "../../lib" }
+narf-arch         = { path = "../../arch" }
 narf-bus          = { path = "../../bus" }
 narf-capabilities = { path = "../../capabilities" }
 narf-io           = { path = "../../io" }
 narf-memory       = { path = "../../memory" }
 narf-drivers      = { path = "../" }
 narf-init         = { path = "../../init" }
+narf-interrupts   = { path = "../../interrupts" }
+narf-console      = { path = "../../console" }
+narf-scheduler    = { path = "../../scheduler" }
+narf-kernel-test  = { path = "../../verification/kernel-test" }
 
 [lints]
 workspace = true

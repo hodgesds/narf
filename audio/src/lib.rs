@@ -31,6 +31,10 @@
 
 extern crate alloc;
 
+pub mod hda;
+
+mod hda_tests;
+
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use narf_capabilities::{Cap, CapKind, CapType, Read, Write};
@@ -333,6 +337,12 @@ pub fn last_picked_backend() -> Option<&'static str> {
 /// picker.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
+    // Register the Intel-HDA PCI match so the bus probe walker
+    // binds AMD Phoenix / Radeon HD Audio Controllers.
+    narf_init::register(Stage::Subsys, "hda-pci", || {
+        hda::register_pci_driver();
+        InitResult::Ok
+    });
     narf_init::register(Stage::Late, "audio-playback-picker", || {
         if let Some(s) = select_active_playback() {
             INIT_BACKEND_NAME.store(s.name().as_ptr() as usize, Ordering::Release);

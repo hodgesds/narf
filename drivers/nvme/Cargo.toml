@@ -20,6 +20,8 @@ narf-bus          = { path = "../../bus" }
 narf-interrupts   = { path = "../../interrupts" }
 narf-drivers      = { path = "../../drivers" }
 narf-init         = { path = "../../init" }
+narf-kernel-test  = { path = "../../verification/kernel-test" }
+narf-arch         = { path = "../../arch" }
 
 [lints]
 workspace = true

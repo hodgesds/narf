@@ -31,12 +31,28 @@
 extern crate alloc;
 
 pub mod e1000;
+pub mod r8169;
+pub mod qcnfa765;
+
+// Per-driver smoke tests register against `narf-kernel-test` and
+// land in the same `narf.tests` ELF section as the rest of the
+// suite. Kept in its own module so a future `cfg(test_in_tree)`
+// or feature gate can drop them from production binaries.
+mod tests;
 
 /// Stage::Subsys initcalls for this driver crate.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
     narf_init::register(Stage::Subsys, "e1000", || {
         e1000::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "r8169", || {
+        r8169::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "qcnfa765", || {
+        qcnfa765::register_pci_driver();
         InitResult::Ok
     });
 }
@@ -54,6 +70,10 @@ pub enum NicModel {
     MellanoxMlx5,
     /// Realtek RTL8139 — legacy smoke target.
     RealtekRtl8139,
+    /// Realtek RTL8168 / RTL8111 — modern PCIe Gigabit family.
+    RealtekRtl8168,
+    /// Qualcomm QCNFA765 / WCN6855 — WiFi 6E PCIe host, MHI-based.
+    QcnfaQcnfa765,
 }
 
 impl NicModel {
@@ -67,6 +87,8 @@ impl NicModel {
             NicModel::IntelIxgbe      => (0x8086, 0x10B6),
             NicModel::MellanoxMlx5    => (0x15B3, 0x1013),
             NicModel::RealtekRtl8139  => (0x10EC, 0x8139),
+            NicModel::RealtekRtl8168  => (0x10EC, 0x8168),
+            NicModel::QcnfaQcnfa765   => (0x17CB, 0x1103),
         }
     }
 }

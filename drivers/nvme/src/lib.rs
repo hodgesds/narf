@@ -27,6 +27,8 @@
 
 extern crate alloc;
 
+mod tests;
+
 use core::future::Future;
 
 use narf_block::{
@@ -1018,10 +1020,27 @@ use narf_lib::sync::IrqSafeSpinLock;
 pub const QEMU_NVME_VENDOR: u16 = 0x1B36;
 pub const QEMU_NVME_DEVICE: u16 = 0x0010;
 
+/// Samsung NVMe controllers. The Ryzen 7 PRO 8840HS reference
+/// laptop ships with a Samsung PM9A1 / 980 PRO (`144D:A80A`); a
+/// few other commonly-encountered Samsung consumer NVMe device
+/// IDs are listed alongside so the driver binds without an
+/// xtask-level match update for each new SKU.
+pub const SAMSUNG_VENDOR: u16 = 0x144D;
+/// PM9A1 / PM9A3 / 980 PRO — the modern Samsung NVMe family.
+pub const SAMSUNG_PM9A1:  u16 = 0xA80A;
+/// 970 EVO / EVO Plus.
+pub const SAMSUNG_970EVO: u16 = 0xA808;
+/// 990 PRO.
+pub const SAMSUNG_990PRO: u16 = 0xA80C;
+
 /// Storage class — PCIe base-class 0x01 (mass storage). The NVMe
 /// driver also matches by class so it picks up real-silicon NVMe
 /// controllers whose vendor IDs we don't know ahead of time.
 pub const PCI_CLASS_STORAGE: u8 = 0x01;
+/// PCI subclass for NVM Express (§13.4 PCI Local Bus 3.0).
+pub const PCI_SUBCLASS_NVM:  u8 = 0x08;
+/// PCI prog-if for NVMe (vs. AHCI / SATA / etc).
+pub const PCI_PROGIF_NVME:   u8 = 0x02;
 
 /// Slot for the live controller produced by `probe`. Wave-3a
 /// single-instance — multi-controller support arrives with a real
@@ -1122,6 +1141,21 @@ pub fn probe(
     device: narf_bus::BusDevice,
     cap:    narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
 ) -> Result<(), narf_bus::ProbeError> {
+    // The class-match backstop catches every PCI mass-storage
+    // device. Reject non-NVMe (subclass != 0x08 or prog_if !=
+    // 0x02) so AHCI / virtio-blk silicon doesn't get driven through
+    // the NVMe register layout. Skip the gate when the device
+    // arrived via an explicit VendorDevice match (vid/did are
+    // pre-validated): if class==0x00 the device didn't report a
+    // standard class triple and we trust the explicit match.
+    let class    = ((device.id.class >> 16) & 0xFF) as u8;
+    let subclass = ((device.id.class >>  8) & 0xFF) as u8;
+    let prog_if  =  (device.id.class        & 0xFF) as u8;
+    if class == PCI_CLASS_STORAGE
+        && (subclass != PCI_SUBCLASS_NVM || prog_if != PCI_PROGIF_NVME)
+    {
+        return Err(narf_bus::ProbeError::BadDevice);
+    }
     if CONTROLLER.lock().is_some() {
         // Already brought up — make sure the param slot still has
         // something installed (test harness may have cleared it).
@@ -1261,17 +1295,35 @@ pub static PARAMS: narf_drivers::ParamSlot<NvmeParams> =
 /// in-tree drivers call this from `frame::_start_rust` (or the
 /// kernel-test harness) before invoking `bus::probe_all_pci`.
 ///
-/// Today only the exact QEMU NVMe vendor/device pair binds. A
-/// follow-up that adds `MatchKind::ClassSubclass { class: 0x01,
-/// subclass: 0x08 }` (PCI subclass 0x08 = NVM Express) can pick up
-/// real-silicon NVMe controllers without claiming SATA / virtio-blk
-/// devices that share the storage base class.
+/// Registration shape:
+/// - Explicit `(vendor, device)` matches for QEMU + Samsung
+///   (PM9A1 / 970 EVO / 990 PRO) so those bind at full
+///   specificity (the bus tie-breaker prefers VendorDevice).
+/// - A `MatchKind::Class { 0x01 }` backstop binds any PCI mass-
+///   storage controller; `probe` then filters by subclass+prog_if
+///   so only true NVMe (`01:08:02`) silicon gets driven.
 pub fn register_pci_driver() {
+    let exact: &[(&'static str, u16, u16)] = &[
+        ("nvme-qemu",         QEMU_NVME_VENDOR, QEMU_NVME_DEVICE),
+        ("nvme-samsung-pm9a1", SAMSUNG_VENDOR,  SAMSUNG_PM9A1),
+        ("nvme-samsung-970",   SAMSUNG_VENDOR,  SAMSUNG_970EVO),
+        ("nvme-samsung-990",   SAMSUNG_VENDOR,  SAMSUNG_990PRO),
+    ];
+    for (name, v, d) in exact.iter().copied() {
+        narf_bus::register_pci_driver(narf_bus::PciMatch {
+            name,
+            kind: narf_bus::MatchKind::VendorDevice {
+                vendor: v, device: d,
+            },
+            probe,
+        });
+    }
+    // Class-match backstop. `probe` checks subclass + prog_if so
+    // we don't accidentally claim SATA / virtio-blk controllers.
     narf_bus::register_pci_driver(narf_bus::PciMatch {
-        name: "nvme",
-        kind: narf_bus::MatchKind::VendorDevice {
-            vendor: QEMU_NVME_VENDOR,
-            device: QEMU_NVME_DEVICE,
+        name: "nvme-class",
+        kind: narf_bus::MatchKind::Class {
+            class: PCI_CLASS_STORAGE, mask: 0xFF,
         },
         probe,
     });
