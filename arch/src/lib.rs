@@ -248,6 +248,22 @@ pub fn halt_until_irq() { current::asm::halt_until_irq() }
 #[inline(always)]
 pub fn interrupts_enabled() -> bool { current::asm::interrupts_enabled() }
 
+/// Atomic enable-IRQs / halt / disable-IRQs primitive. Use from a
+/// `cli; while !cond { idle_halt_then_disable() } sti` loop to
+/// avoid the check-halt race in `halt_until_irq`. Mirrors Linux's
+/// `default_idle` (sti;hlt;cli on x86) and the equivalent
+/// DAIFClr;wfi;DAIFSet on aarch64.
+///
+/// # Safety
+/// Caller must have IRQs DISABLED on entry; this returns with IRQs
+/// DISABLED.
+#[inline(always)]
+pub unsafe fn idle_halt_then_disable() {
+    // SAFETY: forwarded — caller upholds the IRQs-disabled
+    // precondition.
+    unsafe { current::asm::idle_halt_then_disable(); }
+}
+
 /// End the kernel run with an exit code. Under QEMU this triggers a clean
 /// VM exit; on real hardware / other VMMs it falls back to `halt_forever`.
 /// `code == 0` is "normal success"; non-zero is "failure" — verification

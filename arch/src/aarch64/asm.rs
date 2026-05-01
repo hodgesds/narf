@@ -78,6 +78,32 @@ pub fn halt_until_irq() {
     }
 }
 
+/// aarch64 counterpart to x86_64's `sti; hlt; cli`. The aarch64
+/// architecture provides this atomicity natively: WFI does not
+/// deliver IRQs that arrived before the WFI but does cause WFI to
+/// wake on them, so a `msr DAIFClr, #2; wfi; msr DAIFSet, #2`
+/// sequence is the obvious analogue. The trailing DAIFSet returns
+/// with IRQs disabled so the caller can re-check without a wake
+/// being silently consumed.
+///
+/// # Safety
+/// Caller must currently have IRQs masked (DAIF.I == 1). Returns
+/// with IRQs masked.
+#[inline(always)]
+pub unsafe fn idle_halt_then_disable() {
+    // SAFETY: caller-asserted DAIF.I=1 entering. The unmask + wfi
+    // + remask sequence is atomic with respect to IRQ delivery on
+    // aarch64.
+    unsafe {
+        core::arch::asm!(
+            "msr DAIFClr, #0x2",
+            "wfi",
+            "msr DAIFSet, #0x2",
+            options(),
+        );
+    }
+}
+
 /// 128-bit atomic compare-and-swap via `CASP`.
 ///
 /// # Safety

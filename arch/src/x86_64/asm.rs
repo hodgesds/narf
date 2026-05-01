@@ -59,6 +59,14 @@ pub fn interrupts_enabled() -> bool {
 /// Halt the CPU until the next interrupt, but only if IRQs are enabled
 /// (otherwise HLT would deadlock because nothing can wake us). When
 /// IRQs are masked, falls back to a `spin_loop` hint.
+///
+/// Note: this has the classic check-halt race when used in a
+/// "wait for condition" loop — an IRQ that fires between the
+/// caller's condition check and the HLT is serviced *before*
+/// HLT executes, so HLT then waits for the *next* IRQ. Use
+/// [`idle_halt_then_disable`] from such loops instead; this
+/// function is fine for opportunistic idle paths where a missed
+/// wake just means we spin again on the next condition check.
 #[inline(always)]
 pub fn halt_until_irq() {
     if interrupts_enabled() {
@@ -67,6 +75,39 @@ pub fn halt_until_irq() {
     } else {
         core::hint::spin_loop();
     }
+}
+
+/// Atomic enable-IRQs / halt / disable-IRQs. Mirrors Linux's
+/// `default_idle`: `sti; hlt; cli`. The `sti;hlt` pair is special
+/// on x86 — IRQs cannot deliver between them, so any IRQ that was
+/// pending in the LAPIC IRR when the caller called this still
+/// wakes HLT. The trailing `cli` returns with IRQs DISABLED so the
+/// caller can re-check the wait condition without a window where
+/// an arriving IRQ could be silently consumed before the next
+/// halt.
+///
+/// Canonical wait-for-condition loop:
+///
+/// ```ignore
+/// // SAFETY: caller starts critical section.
+/// unsafe { asm!("cli"); }
+/// while !condition_met() {
+///     // SAFETY: cli above; idle_halt_then_disable returns with cli.
+///     unsafe { idle_halt_then_disable(); }
+/// }
+/// unsafe { asm!("sti"); }
+/// ```
+///
+/// # Safety
+/// Caller must currently have IRQs DISABLED (IF=0); otherwise the
+/// `sti` here is a no-op and the trailing `cli` mutates surrounding
+/// IRQ state. Returns with IRQs DISABLED.
+#[inline(always)]
+pub unsafe fn idle_halt_then_disable() {
+    // SAFETY: caller-asserted IF=0 entering. sti; hlt; cli is
+    // atomic on x86 — no IRQ delivers between sti and hlt; HLT
+    // then wakes on the IRQ; cli leaves IF=0.
+    unsafe { core::arch::asm!("sti", "hlt", "cli", options()); }
 }
 
 /// Disable interrupts, then spin on `HLT` forever. Used for panic and Stage-1
