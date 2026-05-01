@@ -123,14 +123,18 @@ impl Arch {
                     "-cpu".into(),     "max".into(),
                     // 2 logical CPUs so AP bring-up via INIT-SIPI-SIPI
                     // exercises a real second core under QEMU q35.
-                    "-smp".into(),     "2,sockets=2".into(),
+                    "-smp".into(),     "16,sockets=2,cores=8".into(),
                     "-m".into(),       "256M".into(),
                     // 2 NUMA nodes so QEMU emits an ACPI SRAT for
                     // narf_acpi to parse. Each node owns one socket
-                    // (one logical CPU under the smp config above)
-                    // and 128 MiB of the total 256 MiB RAM.
-                    "-numa".into(),    "node,nodeid=0,cpus=0,memdev=mem0,initiator=0".into(),
-                    "-numa".into(),    "node,nodeid=1,cpus=1,memdev=mem1,initiator=1".into(),
+                    // (8 logical CPUs under the smp config above)
+                    // and 128 MiB of the total 256 MiB RAM. Going
+                    // wider stresses cross-CPU IRQ / lock paths —
+                    // exposed (and helped fix) the halt_until_irq
+                    // check-halt race that the virtio-blk-pci
+                    // async smokes hit reliably above smp=2.
+                    "-numa".into(),    "node,nodeid=0,cpus=0-7,memdev=mem0,initiator=0".into(),
+                    "-numa".into(),    "node,nodeid=1,cpus=8-15,memdev=mem1,initiator=1".into(),
                     "-object".into(),  "memory-backend-ram,id=mem0,size=128M".into(),
                     "-object".into(),  "memory-backend-ram,id=mem1,size=128M".into(),
                     // HMAT lat/bw entries: same-node access fast,
