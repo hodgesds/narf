@@ -124,10 +124,11 @@ pub fn active_user_as() -> Option<Arc<AddressSpace>> {
 /// — the same pair `set_exit_landing` writes and `sys_exit_task`
 /// reads. Returns `None` when no landing has been registered.
 ///
-/// Used by `narf_compat_win::syscall::WinThunkHandler` so a Win32
-/// `ExitProcess` thunk can `redirect_to_kernel` into the same
-/// teardown landing native `Syscall::ExitTask` uses, rather than
-/// hanging the kernel in a spin-forever placeholder.
+/// Win32 `ExitProcess` (now a userspace `compat-win-rt` thunk) calls
+/// the native `Syscall::ExitTask` directly — there is no Win32-
+/// specific exit path needing to consult this; the helper is left
+/// as a public read-only accessor for any future kernel-side
+/// component that wants to know the registered landing.
 pub fn exit_landing() -> Option<(u64, u64)> {
     let rip = EXIT_LANDING_RIP.load(Ordering::Acquire);
     let rsp = EXIT_LANDING_RSP.load(Ordering::Acquire);

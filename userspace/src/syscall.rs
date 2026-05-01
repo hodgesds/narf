@@ -772,16 +772,6 @@ pub enum Syscall {
     /// must also gate on a future `arch::has_hw_entropy()` probe.
     GetRandom    = 200,
 
-    /// `compat/win` thunk dispatch — invoked from a per-process
-    /// user-RX trampoline page so PE binaries can `call qword
-    /// ptr [iat]` into the Win32 thunk surface. The trampoline
-    /// places the thunk id in the SysV arg0 register (rdi/x4) and
-    /// the Win32 args in their natural slots; the kernel-side
-    /// handler in `narf_compat_win::syscall` reads the id, looks
-    /// up the thunk via `narf_compat_win::thunks::thunk_by_id`,
-    /// and dispatches via the unified entry signature. Spec:
-    /// `compat/win/specification/spec.md` §8 option (1).
-    WinThunk     = 300,
 }
 
 impl Syscall {
@@ -895,7 +885,6 @@ impl Syscall {
             250 => Syscall::ShmemCreate,
             251 => Syscall::ShmemMap,
             252 => Syscall::ShmemDestroy,
-            300 => Syscall::WinThunk,
             _   => return None,
         })
     }

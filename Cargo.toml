@@ -47,6 +47,7 @@ members = [
     "audio",
     "shmem",
     "compat/win",
+    "compat/win-rt",
 ]
 # narf-testbin is built out-of-line by verification's build.rs
 # because it needs a distinct linker script and release profile.

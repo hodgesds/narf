@@ -1,6 +1,13 @@
 # compat/win — Specification
 
-> Status: **Outline v0.1** (Stage 4+, post-userspace).
+> Status: **v1.0** (Stage 4+ design lock). v0.1 prototyped a
+> kernel-side thunk dispatcher (`SYS_WIN_THUNK`); v1.0 commits
+> to the userspace-thunk architecture (option 2 in v0.1 §8) per
+> the locked design rules in `userspace/spec` §8.1 (native-first
+> ABI + relibc-style compat) and `drivers/spec` §12 (user-mode
+> hosting via the SDK). No new kernel syscall number is added
+> for Win32 — thunks live in a userspace runtime crate and call
+> existing NARF native syscalls.
 
 ## 1. Purpose & scope
 
@@ -230,103 +237,248 @@ Stage 4+. Lands **after** `userspace/` reaches its Stage 4 exit gate
 loader and thunk plumbing have no value before that gate; they
 compose on top of it.
 
-## 8. Open questions
+## 8. Architecture (locked at v1.0)
 
-- **Ring-3 → kernel call path for thunks (load-bearing).**
-  An IAT slot patched with a kernel-mode function address cannot
-  be `call`-ed from a Ring-3 PE caller — `call` does not perform a
-  privilege transition; `syscall` / `int` do. Two options on the
-  table:
+### 8.1 Two-crate split
 
-  1. **Per-process user-RX trampoline page.** Loader allocates a
-     user-RX page in the WinProcess AS containing one tiny stub
-     per imported thunk: `mov rax, <thunk_id>; syscall; ret`
-     (amd64) / equivalent on aarch64. IAT slots get patched with
-     trampoline VAs, not kernel function addresses. A new syscall
-     number `SYS_WIN_THUNK` reads `rax`, dispatches to the
-     registered thunk's entry function (running in kernel mode),
-     and returns the result in `rax`. Closest to NARF's existing
-     model — every cross-ring call goes through abi/syscall.
-  2. **User-mode thunk crate** (WINE-style). Thunks compile as a
-     user-mode `narf_compat_win_user` library, mapped into the
-     WinProcess AS. IAT slots point at user-mode functions; the
-     thunks themselves use abi rings to talk to the kernel. More
-     code, but no new syscall surface and a tighter parity with
-     how WINE actually works.
+```text
+┌─────────────────────────── kernel space ──────────────────────────┐
+│  compat/win/                                                      │
+│    pe.rs              — PE32+ parser (headers / sections / imports / relocs) │
+│    user_ptr.rs        — cap-checked user-pointer accessor (kept)  │
+│    process.rs         — WinProcess struct, AS materialisation,    │
+│                         IAT patching against userspace symbols    │
+│  (no syscall.rs, no trampoline.rs, no thunks/ — all moved out)    │
+└───────────────────────────────────────────────────────────────────┘
 
-  M0 ships the kernel-side thunk entries + the loader pipeline
-  (parse, materialize, IAT patching, PEB/TEB) but not the
-  trampoline mechanism that makes the patched IAT slots actually
-  callable from Ring 3. M0.5 picks one of the two options above.
-  Lean toward (1) — fewer moving parts and the existing syscall
-  surface already does the work; (2) becomes interesting once we
-  want to load the equivalent of `winemenubuilder` or other
-  optional Win32 services.
+┌────────────────────────── user space ─────────────────────────────┐
+│  compat/win-rt/                                                   │
+│    rt entry           — `_NarfWinStart` user-mode entry           │
+│    kernel32.dll       — GetStdHandle, WriteConsole, ExitProcess,  │
+│                         ... (each fn calls narf-userspace-runtime  │
+│                         native syscalls)                          │
+│    user32.dll, …      — added incrementally                        │
+│    PEB / TEB setup    — populated by rt entry from cap-passed ptrs │
+└───────────────────────────────────────────────────────────────────┘
+```
 
-- **Thunk ABI codegen.** Hand-written asm stubs per thunk vs. a
-  single generated trampoline that consults a per-symbol metadata
-  table. The generated route saves binary size and centralises
-  shadow-space handling but costs an indirection on every thunk
-  call. Lean toward a `win_thunk!` macro that picks per-target
-  (a generated stub on x86_64 where the ABI conversion is
-  non-trivial; a direct branch on aarch64 where it isn't).
-- **WoW64 / PE32.** Do we want to run 32-bit Windows binaries at
-  all? On amd64 this needs a 32-bit usermode mapping + a thunk-down
-  layer; on aarch64 there is no Microsoft-supplied path
-  (`xtajit64` is closed-source). Default answer: no, defer
-  indefinitely, document as unsupported.
-- **DLL model.** Real `.dll` loading lives behind
-  `compat/win/src/dll.rs` (currently a design-only module). M1
-  ships:
-  1. Recursive `load_pe` re-entry — every unmet import walks the
-     filesystem (`compat/win/src/dll.rs::ModuleTable`) for the
-     missing DLL and loads it under cap rules already enforced by
-     `filesystem/`.
-  2. `DllMain(hinst, DLL_PROCESS_ATTACH, 0)` invocation per
-     loaded DLL via the same syscall-trampoline path the import
-     IAT goes through — once the M0.5 trampoline lands a DLL's
-     entry point is just another thunk-id from the loader's
-     perspective.
-  3. Forwarder chasing — exports whose RVA points inside the
-     export directory are `module.symbol` strings to be re-resolved.
-  4. Bound-import directory acknowledged but ignored — bound RVAs
-     break under our always-relocate-on-load policy.
-  5. Delay-load (`__delayLoadHelper2`) deferred to M2.
-  Built-in thunk sets (`thunks::kernel32` etc.) remain valid for
-  Microsoft DLLs we don't want to ship binaries of — the resolver
-  walks the built-ins first, then the loaded `ModuleTable`.
-- **GDI / Direct3D backend.** When we get there: Vulkan via DXVK
-  re-port (the DXVK author's path), or a from-scratch D3D→narf-gpu
-  translation? Defer until `drivers/gpu` is real.
-- **Domain isolation for thunks (deferred).** An earlier draft of
-  §4 claimed "thunks are domain-isolated — a thunk that calls into
-  a driver domain crosses the same PKS/MTE/PCID barrier any NARF
-  caller would." That isn't true today: the M0 dispatcher runs
-  every thunk inline in the kernel-side syscall handler, in the
-  same domain as the rest of `narf_userspace::handlers`. Calls
-  *out* of the thunk into a driver (e.g. console) cross the
-  driver's domain barrier the same way any kernel caller does, but
-  the thunk itself does not run in a private compat-only domain.
-  M2 work: assign `compat-win` its own `DomainId`, route all
-  thunk dispatch through a `DomainEnter` so a buggy thunk is
-  blast-radius-limited to a private heap. Acceptable to defer
-  because the M0 thunk surface is read-only Microsoft-specified
-  shape with no allocation; the blast radius in practice is the
-  console driver, which is already domain-isolated against the
-  rest of the kernel.
+### 8.2 Why no new syscall
 
-- **Tracing events.** Spec §4 used to say "an unimplemented
-  import...raises a `tracing` event." We removed that wording
-  because we don't currently take a `narf-tracing` dependency from
-  `compat/win`. M1 adds the dep and emits events for: load-time
-  unresolved imports, ASCII substitutions in `WriteConsole`,
-  `OsVersion::WIN10_LATE` reads (so the lie is observable in
-  prod traces).
+Per `userspace/spec` §4.1 the syscall enum is **append-only,
+forever**, so adding `Syscall::WinThunk` would burn a slot
+indefinitely for an architectural shape we now reject. Moving
+thunks to userspace means:
 
-- **Anti-cheat.** Out of scope, possibly forever — kernel anti-cheat
-  modules expect to load as Windows kernel drivers, which has no
-  analogue under NARF's cap model.
-- **Filesystem semantics.** Win32 path resolution (`\\?\`, drive
-  letters, case-insensitive lookups) layered over NARF's
-  cap-addressed VFS. M0 sidesteps this by giving the test image
-  zero filesystem access.
+- Win32 callers issue ordinary `call` instructions to the
+  user-mode thunk function — no ring transition, no
+  trampoline.
+- Thunks call existing NARF native syscalls (`write`, `exit`,
+  etc.) for I/O. This is the same shape as relibc per
+  `userspace/spec` §8.1.
+- The kernel's syscall numberspace stays clean.
+
+### 8.3 IAT patching
+
+The PE loader (`compat/win::process::load_pe`, runs at PT_INTERP
+time per `userspace/spec` §8.4) populates each imported
+slot with the address of the corresponding symbol in the
+already-mapped `compat-win-rt` library:
+
+```rust
+fn resolve_iat(
+    name:    &str,                          // "kernel32.dll!ExitProcess"
+    win_rt:  &MappedLibrary,                // compat-win-rt mapping in this AS
+) -> Option<VirtAddr> {
+    win_rt.lookup_export(name).map(|e| e.va)
+}
+```
+
+Each IAT slot ends up holding a **user-mode VA**. Win32 calls
+through these slots are ordinary user-mode indirect calls.
+The kernel is not involved in the call path.
+
+### 8.4 ExitProcess
+
+`kernel32!ExitProcess` is implemented in the rt crate as:
+
+```rust
+#[no_mangle]
+pub extern "win64" fn ExitProcess(code: u32) -> ! {
+    // SAFETY: SYS_EXIT_TASK never returns.
+    unsafe { narf_userspace_runtime::exit_task(code as i32) }
+}
+```
+
+That's it. No kernel-side `redirect_to_kernel` plumbing needed
+— the existing `Syscall::ExitTask` does the work.
+
+### 8.5 Per-process compat-win-rt mapping
+
+`compat-win-rt` is a kernel-blessed system DLL — analogous to
+Linux's `vDSO` page or NARF's own `narf-ld.so` — mapped into
+every WinProcess at a fixed VA at load time. The loader
+treats it specially:
+
+- Bytes are pre-built and stored in the kernel image (or
+  served from `/lib/narf/compat-win-rt.so` once
+  `filesystem/` is up).
+- Mapped read-only-execute into every WinProcess at the same
+  fixed VA across processes (KASLR-randomised once per boot).
+- Cap minted to the WinProcess at load is `Cap<WinRtBinding,
+  Read>` — read-only access to the rt's exports table for
+  IAT resolution. The rt itself runs purely in user mode and
+  has no special privilege.
+
+### 8.6 Migration from v0.1 prototype
+
+The v0.1 code shipped:
+
+- `compat/win/src/syscall.rs` (`SYS_WIN_THUNK` handler) —
+  **removed in v1.0**.
+- `compat/win/src/trampoline.rs` (per-process syscall stub
+  page) — **removed in v1.0**.
+- `compat/win/src/thunks/` (kernel-mode thunk impls) —
+  **moved to `compat/win-rt/`** and rewritten as user-mode
+  functions.
+- `compat/win/src/{pe.rs, process.rs, user_ptr.rs,
+  personality.rs, dll.rs, entry.rs, lib.rs}` — **kept**, with
+  `process.rs::load_pe` updated to patch IAT against the
+  rt mapping instead of the trampoline.
+- `Syscall::WinThunk` slot — **removed from the kernel
+  enum**. The branch was never merged, so `userspace/spec`
+  §4.1 append-only rule does not apply.
+
+The wine branch had a v0.1 audit commit (`94b4f02`) that
+documented the v0.1 implementation; v1.0 explicitly supersedes
+it.
+
+## 9. ABI versioning
+
+`compat/win` (kernel side) exports through SDK at `@v0`:
+
+- `WinProcess` (opaque to drivers; consumed only by the
+  process-spawn syscall path).
+- `parse_pe`, `load_pe` (used by the spawn-Win32 syscall
+  handler).
+- `Cap<WinRtBinding, _>` cap kind.
+- `user_ptr` cap-checked accessor (re-exported for any
+  kernel code that needs to read user memory; not Win32-
+  specific).
+
+`compat/win-rt` (user side) is a versioned shared library
+loaded into every WinProcess. Its export table is the Win32
+ABI surface; adds and removes follow the standard symbol-
+versioning model (per `lib/spec` §9 / Linux glibc conventions).
+
+`COMPAT_WIN_ABI_MAJOR = 1`, `COMPAT_WIN_ABI_MINOR = 0`.
+
+## 10. Resolved decisions
+
+### 10.1 WoW64 / PE32 (resolved)
+
+**Decision:** **out of scope, indefinitely**. NARF supports
+PE32+ AMD64 (x86_64) and PE32+ ARM64 (aarch64). 32-bit
+binaries are not supported. The cost of WoW64 thunking
+(32-bit usermode mapping, ABI translation per syscall) is
+prohibitive for niche value; users with 32-bit Windows
+binaries should run them on Windows or under WINE-on-Linux.
+
+### 10.2 DLL model (resolved)
+
+**Decision:** standard PE DLL loading via recursive
+`load_pe` re-entry, mirroring how Linux's `ld.so` resolves
+shared library imports. Rt-side mock DLLs (`kernel32.dll`,
+`user32.dll`, etc.) live in `compat/win-rt`; real PE DLLs
+load from `filesystem/` per their `IMAGE_DIRECTORY_ENTRY_IMPORT`
+chain.
+
+The `compat-win-rt` mock DLLs are tried first by the
+import resolver; falls through to filesystem-loaded real
+DLLs if the symbol isn't in the rt. This means:
+
+- Microsoft system DLLs (`kernel32`, `ntdll`, `user32`,
+  `gdi32`, `kernel32`, etc.) → rt provides; no real DLL
+  needed.
+- Application or vendor DLLs (the binary's own DLLs,
+  third-party libraries) → loaded from disk.
+
+`DllMain(hinst, DLL_PROCESS_ATTACH, 0)` is called via
+ordinary user-mode call (no trampoline) once the IAT is
+patched. Forwarder chasing follows the standard PE rules.
+Bound-import directory ignored (always-relocate-on-load).
+Delay-load (`__delayLoadHelper2`) is also user-mode call —
+the helper is a rt export.
+### 10.3 GDI / Direct3D backend (resolved)
+
+**Decision:** **DXVK port targeting `drivers/gpu` Vulkan
+backend** when `drivers/gpu` lands a Vulkan-capable surface
+(Stage 5+). Per `drivers/gpu/spec` §8.1, 3D rendering lives in
+userspace; DXVK fits that model directly — it's a userspace
+shared library translating D3D9/10/11/12 to Vulkan. No kernel
+changes needed beyond the existing user-mode-domain GPU
+driver.
+
+D3D headers / surface types in `compat-win-rt` ship as part
+of the Win32 ABI surface. The DXVK shim is a separate crate
+(`compat/win-d3d-rt` or similar) that links into the
+WinProcess at load time when the binary imports D3D APIs.
+
+### 10.4 Thunk domain isolation (resolved)
+
+**Decision:** **rt thunks run in the WinProcess's
+`DOMAIN_USERSPACE_K` shadow** (the standard user-process
+kernel-side mirror domain per `security-model/spec` §4.1
+slot 8). Since v1.0 thunks are user-mode functions, they
+have no kernel-mode domain at all in the calling process —
+the only kernel-side thunk-related state is the IAT mapping
+(read-only after load).
+
+Cross-domain calls (a thunk reaching into a driver via cap)
+follow the standard cap+domain rules already in the
+security model. No special compat-only domain is needed.
+
+### 10.5 Tracing events (resolved)
+
+**Decision:** v1.0 emits `tracing/` events from the rt for:
+
+- `compat_win.unresolved_import` — load-time unresolved
+  symbol (loader logs name + module).
+- `compat_win.ascii_substitution` — `WriteConsoleA` /
+  `MultiByteToWideChar` did a lossy conversion.
+- `compat_win.os_version_lie` — application read
+  `GetVersion*` and got a synthetic Windows 10 response.
+- `compat_win.exit_process` — application called
+  `ExitProcess` with the exit code.
+
+`compat-win-rt` takes a `Cap<Probe, Emit>` at process spawn
+to populate these.
+
+### 10.6 Anti-cheat (resolved)
+
+**Decision:** **out of scope, permanently**. Windows
+kernel anti-cheat modules (Vanguard, EAC kernel-mode, BattlEye)
+expect to load as Windows kernel drivers (.sys). There is no
+analogue under NARF's cap model — kernel-mode third-party
+code is forbidden by the framework. Games using
+kernel-mode anti-cheat are unsupported.
+
+User-mode anti-cheat (BattlEye user-mode component, EAC
+user-mode component) works normally — same Win32 thunks,
+no special handling.
+
+### 10.7 Filesystem semantics (resolved)
+
+**Decision:** Win32 path translation lives in `compat-win-rt`,
+applied per-syscall. `\\?\` is stripped, drive letters map to
+configured VFS prefixes (`C:\` → cap-rooted VFS path
+configured per-process), case-insensitive lookups walk via
+`filesystem/`'s case-fold helper (which `filesystem/spec`
+§8.3 keeps internal to compat filesystems).
+
+The mapping table is per-process state in PEB. Default mapping
+matches WINE convention (`Z:\` → root, `C:\` → user home
+equivalent), overridable via `compat-win-rt` config.
+
+## 11. Open questions
+
+(none — all v0.1 questions resolved in §10)

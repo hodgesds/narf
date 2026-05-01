@@ -14,9 +14,10 @@
 //!    the apply path is exercised regardless so M1 can drop ASLR in
 //!    without re-plumbing the loader).
 //! 5. Resolve every import via the supplied `ImportResolver`, patching
-//!    the IAT slot with the resolver's returned address (the M0
-//!    resolver returns trampoline VAs — not the raw `Thunk` pointer
-//!    — once `thunks::abi` lands).
+//!    the IAT slot with the resolver's returned user-mode VA — the
+//!    address of the symbol's implementation in the mapped
+//!    `compat-win-rt` system DLL or a real PE DLL loaded via
+//!    `dll::ModuleTable` (per spec v1.0 §8.3).
 //!
 //! `resolve_imports` and `compute_relocs` are pure helpers exposed
 //! for unit testing without any kernel-mode plumbing. The full
@@ -36,7 +37,6 @@ use narf_memory::{
 
 use crate::pe::{self, BaseRelocKind, PeError, PeImage, Section};
 use crate::personality::{self, Layout};
-use crate::trampoline;
 
 // ── cap-typing ────────────────────────────────────────────────────
 
@@ -99,8 +99,8 @@ impl Drop for FrameGuard {
 /// TEB page at `teb_va`. SEH dispatch tables and the ldr-data /
 /// process-parameters blocks land in M1.
 ///
-/// On entry to user mode the per-arch trampoline programs the
-/// segment / system register that holds the TEB pointer:
+/// On entry to user mode the per-arch entry-up sequence programs
+/// the segment / system register that holds the TEB pointer:
 ///
 /// - **amd64:** `IA32_GS_BASE` ← `teb_va`. Win32 code reaches the
 ///   PEB via `gs:[0x60]`, the TEB self-pointer via `gs:[0x30]`,
@@ -109,6 +109,11 @@ impl Drop for FrameGuard {
 ///
 /// `entry` is the ImageBase-adjusted entry point — `image_base +
 /// PE.AddressOfEntryPoint`.
+///
+/// IAT slots are patched at load time to user-mode VAs in the
+/// `compat-win-rt` system DLL mapped into this AS (per spec
+/// v1.0 §8.3). No trampoline page; calls through the IAT are
+/// ordinary user-mode indirect calls.
 #[derive(Debug)]
 pub struct WinProcess {
     pub address_space: Arc<AddressSpace>,
@@ -119,11 +124,6 @@ pub struct WinProcess {
     pub teb_va:        VirtAddr,
     pub stack_base:    VirtAddr,
     pub stack_top:     VirtAddr,
-    /// Base of the user-RX trampoline page. IAT slots resolved at
-    /// load time point at `trampoline_va + thunk_id * STUB_BYTES`;
-    /// each stub fires `syscall` (amd64) / `svc` (aarch64) which
-    /// the kernel-side `SYS_WIN_THUNK` handler dispatches by id.
-    pub trampoline_va: VirtAddr,
 }
 
 impl CapType for WinProcess {
@@ -163,13 +163,16 @@ impl From<PeError> for LoadError {
     fn from(e: PeError) -> Self { LoadError::Pe(e) }
 }
 
-/// Resolve an import to its stable thunk id (the index used by the
-/// per-process trampoline page). Returns `None` for an unimplemented
+/// Resolve an import to a user-mode VA in the WinProcess's address
+/// space — the address of the function in the mapped
+/// `compat-win-rt` system DLL (or a real PE DLL loaded via
+/// `dll::ModuleTable`). Returns `None` for an unimplemented
 /// import — the loader translates that to `LoadError::UnresolvedImport`.
 ///
-/// The IAT slot itself is patched to `trampoline_va + id * STUB_BYTES`
-/// inside the loader; resolvers don't need to know the trampoline VA.
-pub type ImportResolver = fn(module: &str, symbol: &str) -> Option<u16>;
+/// IAT slots are patched directly with the returned VA; PE
+/// callers issue ordinary `call qword ptr [iat]` instructions.
+/// No syscall, no trampoline.
+pub type ImportResolver = fn(module: &str, symbol: &str) -> Option<u64>;
 
 // ── pure helpers (testable on host) ───────────────────────────────
 
@@ -196,25 +199,18 @@ pub fn perms_of(characteristics: u32) -> Result<RegionPerms, LoadError> {
     Ok(p)
 }
 
-/// Resolve every PE import to a (iat_rva, trampoline_address) pair
-/// given a thunk-id resolver and the runtime base of the process's
-/// trampoline page. Returns `UnresolvedImport` on the first miss
-/// — silent stubs are out per spec §4.
+/// Resolve every PE import to a `(iat_rva, user_mode_va)` pair
+/// using the supplied resolver. Returns `UnresolvedImport` on the
+/// first miss — silent stubs are out per spec §4.
 pub fn resolve_imports(
-    image:          &PeImage<'_>,
-    resolve:        ImportResolver,
-    trampoline_va:  u64,
+    image:   &PeImage<'_>,
+    resolve: ImportResolver,
 ) -> Result<Vec<(u32, u64)>, LoadError> {
     let mut out = Vec::with_capacity(image.imports.len());
     for imp in &image.imports {
         match resolve(&imp.module, &imp.symbol) {
-            Some(id) => {
-                let addr = trampoline_va
-                    .checked_add(trampoline::trampoline_offset(id) as u64)
-                    .ok_or(LoadError::BadFixupRva)?;
-                out.push((imp.iat_rva, addr));
-            }
-            None => return Err(LoadError::UnresolvedImport),
+            Some(addr) => out.push((imp.iat_rva, addr)),
+            None       => return Err(LoadError::UnresolvedImport),
         }
     }
     Ok(out)
@@ -402,42 +398,15 @@ pub unsafe fn load_pe(
 
     // Pick the per-process address layout (PEB / TEB / stack VAs +
     // process / thread identifiers + reported OS personality). Used
-    // both by the trampoline page (whose VA sits one page above the
-    // PEB) and by the PEB / TEB population below.
+    // by PEB / TEB population below.
     let layout = Layout::new(chosen_base, pid, tid);
 
-    // Build + map the per-process trampoline page (user-RX). One
-    // 4-KiB page covers up to 256 thunk stubs — well above the M0
-    // kernel32 surface of 4. Fill is `nop` so a mis-targeted
-    // `call` lands on a NOP slide rather than arbitrary data.
-    let trampoline_va = layout.peb_va.wrapping_add(0x1000); // page above PEB
-    let tramp_frame = alloc_frame().map_err(|_| LoadError::NoFrame)?.start_address();
-    {
-        let bytes = if cfg!(target_arch = "aarch64") {
-            trampoline::build_aarch64(trampoline::MAX_THUNKS)
-        } else {
-            // amd64 + host (cargo test) path.
-            trampoline::build_amd64(trampoline::MAX_THUNKS)
-        };
-        // SAFETY: identity-mapped fresh frame, exclusive owner.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                tramp_frame.raw() as *mut u8,
-                4096,
-            );
-        }
-    }
-    address_space.map_region(Region {
-        base:  VirtAddr::new(trampoline_va),
-        len:   4096,
-        perms: RegionPerms::READ | RegionPerms::EXEC,
-        phys:  alloc::vec![tramp_frame],
-    }).map_err(|_| LoadError::AddressSpace)?;
-
-    // Patch the IAT — each slot points at the stub for its thunk
-    // inside the trampoline page we just mapped.
-    for (rva, addr) in resolve_imports(&image, resolve, trampoline_va)? {
+    // Patch the IAT — each slot points at the user-mode VA the
+    // resolver returns. Per spec v1.0 §8.3 the resolver typically
+    // looks the symbol up in the `compat-win-rt` system DLL
+    // mapped into this AS, but it can also forward to a real PE
+    // DLL loaded via `dll::ModuleTable`.
+    for (rva, addr) in resolve_imports(&image, resolve)? {
         let (frame, off) = rva_to_phys(&image.sections, &section_frames, rva)
             .ok_or(LoadError::BadFixupRva)?;
         if off + 8 > 4096 {
@@ -516,7 +485,6 @@ pub unsafe fn load_pe(
         teb_va:        VirtAddr::new(layout.teb_va),
         stack_base:    VirtAddr::new(layout.stack_base),
         stack_top:     VirtAddr::new(layout.stack_top),
-        trampoline_va: VirtAddr::new(trampoline_va),
     })
 }
 
@@ -585,10 +553,11 @@ mod tests {
             symbol:  "exitprocess".into(),
             iat_rva: 0x20A0,
         }];
-        // Resolver returns thunk id 3 → IAT slot ← trampoline_va + 3*16.
-        fn r(_m: &str, _s: &str) -> Option<u16> { Some(3) }
-        let v = resolve_imports(&img, r, /*trampoline_va=*/ 0x1000_0000).unwrap();
-        assert_eq!(v, vec![(0x20A0, 0x1000_0000 + 3 * 16)]);
+        // Resolver returns the user-mode VA of ExitProcess in the
+        // mapped compat-win-rt library.
+        fn r(_m: &str, _s: &str) -> Option<u64> { Some(0x7FFE_0000_1234) }
+        let v = resolve_imports(&img, r).unwrap();
+        assert_eq!(v, vec![(0x20A0, 0x7FFE_0000_1234)]);
     }
 
     #[test]
@@ -600,8 +569,8 @@ mod tests {
             symbol:  "createfilew".into(),
             iat_rva: 0x20A0,
         }];
-        fn r(_m: &str, _s: &str) -> Option<u16> { None }
-        assert_eq!(resolve_imports(&img, r, /*trampoline_va=*/ 0x1000_0000).unwrap_err(),
+        fn r(_m: &str, _s: &str) -> Option<u64> { None }
+        assert_eq!(resolve_imports(&img, r).unwrap_err(),
                    LoadError::UnresolvedImport);
     }
 

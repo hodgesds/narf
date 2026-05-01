@@ -466,6 +466,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-compat-win-rt"
+version = "0.0.0"
+dependencies = [
+ "narf-user-runtime",
+]
+
+[[package]]
 name = "narf-console"
 version = "0.0.0"
 dependencies = [

@@ -20579,14 +20579,15 @@ fn smoke_compat_win_load_pe_pipeline() -> TestResult {
 
     let bytes = build_synthetic_pe(0x8664); // AMD64
 
-    // Custom resolver: returns a stable thunk id for the one
-    // import the synthetic PE declares; the loader translates that
-    // id into trampoline_va + id * STUB_BYTES for the IAT slot.
-    fn resolver(module: &str, symbol: &str) -> Option<u16> {
+    // Custom resolver: returns a synthetic user-mode VA for the
+    // one import the synthetic PE declares. In the real flow this
+    // VA points into the mapped compat-win-rt system DLL; for the
+    // smoke we just need any non-zero VA to exercise IAT patching.
+    fn resolver(module: &str, symbol: &str) -> Option<u64> {
         if module.eq_ignore_ascii_case("kernel32.dll")
            && symbol.eq_ignore_ascii_case("exitprocess")
         {
-            Some(3) // arbitrary id — exercises the offset arithmetic
+            Some(0x7FFE_0000_2000) // synthetic compat-win-rt VA
         } else {
             None
         }
@@ -20620,13 +20621,12 @@ fn smoke_compat_win_load_pe_pipeline() -> TestResult {
         return TestResult::Fail("compat-win: stack range inverted");
     }
 
-    // Region count: 2 PE sections + trampoline + PEB + TEB + stack = 6.
+    // Region count: 2 PE sections + PEB + TEB + stack = 5.
+    // (No trampoline page in v1.0 — IAT slots resolve to user-mode
+    // VAs in the compat-win-rt mapping; spec §8.3.)
     let regions = proc.address_space.regions_snapshot();
-    if regions.len() != 6 {
-        return TestResult::Fail("compat-win: expected 6 mapped regions");
-    }
-    if proc.trampoline_va.as_u64() == 0 {
-        return TestResult::Fail("compat-win: trampoline_va not set");
+    if regions.len() != 5 {
+        return TestResult::Fail("compat-win: expected 5 mapped regions");
     }
     // Stack range matches the Layout default and is mapped R+W.
     let stack_region = regions.iter()

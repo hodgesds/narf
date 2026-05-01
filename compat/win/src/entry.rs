@@ -26,9 +26,11 @@ use crate::process::WinProcess;
 ///   `enter_user_mode`'s contract).
 /// - The frame allocator and TSS.rsp0 must be set up so the
 ///   inevitable trap back into the kernel has a stack to land on.
-/// - The kernel-side `compat/win::syscall::install` must already
-///   have registered the WinThunk handler — the trampoline page
-///   the PE will hit through its IAT relies on it.
+/// - The `compat-win-rt` system DLL must already be mapped into
+///   the WinProcess's AS and the IAT patched with its symbol
+///   VAs — `load_pe` does this. PE's `call qword ptr [iat]`
+///   instructions are ordinary user-mode calls; no kernel-side
+///   thunk handler is involved per spec v1.0.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn enter_winprocess(proc: &WinProcess) -> ! {
     use narf_arch::x86_64::user_mode::{enter_user_mode, set_user_gs_base};

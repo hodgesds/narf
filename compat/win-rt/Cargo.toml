@@ -1,0 +1,18 @@
+[package]
+name         = "narf-compat-win-rt"
+description  = "Win32-on-NARF user-mode runtime — kernel32/user32/ntdll thunks. Mapped into every WinProcess as a system DLL; called directly via the patched IAT (no kernel syscall)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_compat_win_rt"
+path = "src/lib.rs"
+
+[dependencies]
+narf-user-runtime = { path = "../../user-runtime" }
+
+[lints]
+workspace = true
