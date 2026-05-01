@@ -749,35 +749,286 @@ Stage 5 unlocks user-mode hosting. Each stage is independently
 useful; each commits to the SDK boundary, which is the
 load-bearing decision.
 
-## 17. Open questions
+## 17. Resolved decisions
 
-- **Inline vs. trampoline for `@v0` symbols.** Inlining old
-  versions into a single function with version dispatch keeps
-  the kernel image smaller but complicates debugging. Linux
-  uses trampolines (`alias` symbols); we should probably do
-  the same.
-- **Capability quota per driver.** A misbehaving driver could
-  request unlimited caps. Manifest-declared caps are bounded,
-  but runtime-allocated DMA buffers could exhaust memory. Per-
-  instance budget cap (Stage 4 work in `memory/`).
-- **Cross-driver IPC stable wire format.** Drivers that
-  publish services (§10 `provides`) need a stable
-  inter-version IPC format. Defer to Stage 4 once the first
-  driver-to-driver service ships.
-- **`auto_restart_with_backoff` policy details.** Linear
-  backoff? Exponential? Per-instance or per-module? Defer
-  until the first driver actually wants restart semantics.
-- **Devicetree hot-plug.** PCIe hot-plug is solved; DT-based
-  devices (typical on aarch64 SoCs) have less standardised
-  hot-plug. Defer to a per-platform driver.
-- **Module unload during in-flight syscall.** A user process
-  may be blocked on a syscall serviced by a module being
-  unloaded. The cap-revocation flow handles correctness
-  (syscall returns `Err(Revoked)`), but the policy decision
-  — wait for syscall completion vs. kick the user back —
-  needs explicit thought. Defer to Stage 5.
-- **Multi-version coexistence.** Two versions of the same
-  driver loaded simultaneously (during a live upgrade).
-  Match-table tie-break by version covers the static case;
-  upgrade flow needs a "bind new instances to vNew, leave
-  in-flight on vOld" knob. Stage 5+.
+These are the policy decisions that round out the spec — each
+one was an open question in the v0.1 outline; the resolution is
+now the contract.
+
+### 17.1 Symbol versioning: trampolines, not in-function dispatch
+
+**Decision:** versioned symbols are real distinct ELF exports
+named via the GNU `.symver` directive (or its
+`#[link_name = "alloc_coherent@v1"]` Rust analogue), one ELF
+symbol per `(name, version)` pair. The kernel's module symbol
+table publishes each as a separate entry. Drivers' relocations
+resolve against the specific version they imported, with no
+runtime dispatch overhead.
+
+When two versions share an implementation (the new version is
+purely an additive parameter that defaults to the old behaviour),
+both symbols point at the same function body via aliasing — no
+duplication, but they remain independently resolvable so the
+kernel can later separate them.
+
+**Rationale:** matches Linux's `EXPORT_SYMBOL_VERSION` /
+`MODVERSIONS` model, which has worked across decades of kernel
+churn. Inline-dispatch (single function with a version arg)
+saves a few kilobytes of `.text` but loses native-debugger
+backtrace clarity, breaks single-stepping into a specific
+version, and makes the kernel ABI surface invisible to standard
+ELF tooling. The cost of a few extra symbol-table entries per
+SDK call is irrelevant at hundreds-of-drivers scale.
+
+**Builds:** the SDK build (driven by `sdk.toml`) emits an
+`asm` shim file with one `.symver` line per `(symbol, version)`
+that the kernel `narf-frame` link picks up. CI verifies every
+entry in `sdk.toml` has a matching shim and every shim has a
+matching entry.
+
+### 17.2 Per-instance capability quota
+
+**Decision:** each driver instance receives a `Cap<Quota,
+Spend>` at BIND time (§7.2 step 6). The quota descriptor is a
+hard-bounded multidimensional budget:
+
+```rust
+pub struct Quota {
+    pub max_dma_bytes:        u64,    // sum of live DmaBuffer extents
+    pub max_dma_buffers:      u32,    // distinct DmaBuffer caps
+    pub max_irq_vectors:      u8,     // distinct IrqVector caps
+    pub max_msix_entries:     u16,    // sum of MsiXTable entries
+    pub max_kernel_vm_kb:     u32,    // module text + data + dynamic alloc
+    pub max_outstanding_ipc:  u32,    // in-flight Narf-Ring messages
+}
+```
+
+Every cap-minting SDK call (`alloc_coherent`,
+`request_irq_vector`, etc.) charges the quota; exhaustion
+returns `Err(QuotaExceeded)` deterministically. No silent
+backpressure.
+
+**Defaults** are set per `host` mode (kernel-mode drivers get
+larger budgets than user-mode-domain drivers because they share
+the kernel address space and can't be killed cheaply). Each
+driver's manifest may **request** a higher budget in
+`driver.toml`:
+
+```toml
+[driver.quota_request]
+max_dma_bytes = "16 MiB"
+max_irq_vectors = 4
+```
+
+The loader compares the request against the **cert allowlist**
+(§5.3): vendor certs ship with a max-quota tuple; requests that
+exceed the cert's authorisation reject at load. In-tree
+drivers' build-time CA cert is permissive; third-party certs
+can be more restrictive.
+
+### 17.3 Cross-driver IPC wire format
+
+**Decision:** services declared via `provides` carry a
+**three-tuple identity**: `(service_id: Uuid, sdk_minor: u16,
+wire_version: u16)`. The wire version is independent of both
+the SDK version and the driver-crate version — it tracks the
+on-the-wire CBOR schema for the service's IPC.
+
+`depends_on` consumers declare a **range**:
+
+```toml
+depends_on = [
+    { service = "block-backend", wire_min = 1, wire_max = 3 },
+]
+```
+
+Loader matches against providers whose `wire_version` is in
+range; multiple compatible providers are picked by SDK-minor
+freshness.
+
+**Wire format itself** is CBOR over Narf-Rings (CBOR is already
+used in `.narfmod` headers, so the encoder/decoder is shared
+infrastructure — no new format implementation). Each service's
+schema is published in `services/<service-id>/schema.cddl`
+alongside its driver crate, version-locked.
+
+Old wire versions stay supported by the provider indefinitely,
+exactly like SDK `@v0` symbols. A provider may drop a wire
+version only after a 2-minor-cycle deprecation window
+(announced in `sdk.toml` deprecation entries).
+
+### 17.4 Restart policy
+
+**Decision:** exponential backoff with a hard ceiling, per
+**instance** (not per module — different devices' driver
+instances have independent failure histories).
+
+```rust
+pub struct RestartPolicy {
+    pub strategy:    RestartStrategy,    // None | OneShot | Exponential
+    pub initial_ms:  u32,                // first-retry delay
+    pub cap_ms:      u32,                // upper bound on retry delay
+    pub max_failures: u8,                // before transitioning to Failed-permanent
+    pub window_secs: u32,                // sliding window for failure counting
+}
+```
+
+**Defaults** when manifest sets `on_panic = "auto_restart"`:
+
+```toml
+restart = {
+    strategy = "Exponential",
+    initial_ms = 100,
+    cap_ms = 3200,         # 100, 200, 400, 800, 1600, 3200, 3200, ...
+    max_failures = 8,
+    window_secs = 1800,    # 30 minutes
+}
+```
+
+After `max_failures` panics within `window_secs`, the instance
+transitions to `Failed`-permanent. The kernel surfaces this via
+a `BusEvent::DriverFailed { instance, reason }` event the
+modload daemon can observe; manual intervention (signed reload
+command from a privileged process holding `Cap<ModuleLoader,
+Grant>`) clears the failure state.
+
+**State machine** is per-instance and lives in the loader
+(not in the driver — drivers can't scribble their own restart
+counts). The post-mortem buffer (§7.4) is keyed by instance and
+preserves the last `N` failure backtraces for inspection,
+where `N` is configurable per-system (default 8).
+
+### 17.5 Devicetree hot-plug
+
+**Decision:** a uniform `Cap<DtOverlay, Apply>` surface that
+parallels PCIe Native Hot Plug. Userspace (or a kernel-side
+hook responding to a platform-specific notification — e.g.
+ACPI _Lxx GPE on x86, GIC SPI on aarch64) submits a signed DT
+overlay blob via the loader syscall; the kernel parses it,
+validates against the live tree, applies the merge, and fires
+`BusEvent::DeviceArrived` for each new node — same dispatcher
+the static DT walker feeds.
+
+**Removal** is the symmetric path: a `DtOverlay::Remove(NodeId)`
+applies a subtree drop, fires `BusEvent::DeviceRemoved` for
+each node in the dropped subtree, and the bus dispatcher
+schedules the affected driver instances for unbind via the
+§7.3 protocol.
+
+**Validation** rejects overlays that (a) duplicate an existing
+node's `phandle`, (b) reference compat strings outside the
+overlay's own subtree, (c) declare reg/interrupts overlapping
+with already-claimed devices. Overlay signature verification
+uses the same cert chain as `.narfmod` modules — DT overlay
+publishers are vendor-key-equivalent.
+
+This makes DT hot-plug a sibling of PCIe hot-plug, not a
+special case: the bus dispatcher's match table doesn't care
+how a device arrived.
+
+### 17.6 Module unload during in-flight syscall
+
+**Decision:** two-phase unload protocol with a configurable
+drain timeout.
+
+**Phase 1 — drain.** When unload starts (§7.3 step 1
+QUIESCING), the module's published service entries are flipped
+to `Unloading`. New IPC calls to the module return
+`Err(Unloading)` immediately. In-flight calls continue to
+completion. A timer is armed for `drain_timeout_ms` (default
+5000). Driver-side `Driver::quiesce()` runs in parallel — it
+must not block on its own pending IPC, only on hardware state.
+
+**Phase 2 — force.** When the timer fires, any remaining
+in-flight calls have their per-call `Cap<IpcChannel,_>` revoked
+synchronously. The blocked caller's syscall return path
+observes `Err(Revoked)` and unwinds. The driver's RCU grace
+period (§7.3 step 4) waits one full epoch after the last
+revocation to ensure no in-flight handler is mid-execution.
+
+**Configuration** is per-module in `driver.toml`:
+
+```toml
+[driver.unload]
+drain_timeout_ms = 5000
+on_drain_timeout = "force"   # | "abort_unload"
+```
+
+`abort_unload` returns the module to RUNNING state if drain
+times out — useful for "I'm stuck and don't trust force-unload
+to be safe" drivers. Default is `force` because the cap-check
+machinery makes force-unload mechanically safe.
+
+**Caller-visible contract:** a syscall hitting an unloading
+module returns `Err(Unloading)` (drain phase) or
+`Err(Revoked)` (force phase). Both are recoverable —
+caller can retry, which will then pick up the replacement
+module if any (§17.7).
+
+### 17.7 Multi-version coexistence + live upgrade
+
+**Decision:** modules are keyed by `(identity: Uuid,
+sdk_version, driver_version)`; multiple registrations with the
+same identity but different versions can coexist in the match
+dispatcher.
+
+**Match priority** when multiple versions could bind a new
+device:
+
+1. Most-specific match (vendor+device beats vendor+catchall).
+2. Among equal specificity: newest `driver_version` wins.
+3. Tie: registration order (earlier wins; deterministic).
+
+**Live upgrade** flow:
+
+1. Load `vNew` of the module via the §7 protocol. It
+   registers alongside `vOld` in the match dispatcher.
+2. New device arrivals bind to `vNew` (rule 2 above).
+3. Existing `vOld` instances continue running their requests.
+4. Operator (or auto-policy) issues
+   `request_drain(identity, version=Old)`: dispatcher unbinds
+   `vOld` from new matches, signals each `vOld` instance to
+   `Driver::quiesce()` after its current request completes.
+5. As each `vOld` instance completes its drain, the unload
+   protocol (§7.3) reclaims its caps + module text. Note that
+   `vOld`'s text stays mapped (RCU-pinned by live instances)
+   until the last instance drops; `vNew`'s text is mapped
+   independently from load time. The two coexist in kernel VM.
+6. Once all `vOld` instances drained, `vOld` module fully
+   unloads.
+
+**Constraints:**
+
+- The two versions' SDK majors must match (§4.2). Live upgrade
+  across an SDK-major bump is impossible — it requires a
+  reboot. This is the "you can't change ABI majors at runtime"
+  contract, equivalent to Linux's "kernel binary is immutable
+  once booted."
+- Two versions sharing the same `provides` service must
+  agree on at least one wire-version (§17.3). Otherwise the
+  load-time wire-compat check rejects.
+- Per-instance state (e.g. NVMe namespace metadata) does not
+  migrate between versions — `vNew` instances re-discover
+  state from the device. Drivers that need stateful migration
+  must publish a `migration` entry in their manifest pointing
+  at a per-version migration function; the loader runs it
+  during the §17.7-step-4 quiesce. (Stage 5 work; not Stage
+  3/4 critical path.)
+
+This makes "deploy a fixed driver" a non-disruptive operation
+for the running fleet at scale. The cost is carrying both
+versions' module text in kernel VM during the upgrade window —
+bounded by the `Quota` (§17.2) and reclaimed automatically
+once drain completes.
+
+---
+
+With these resolutions, the spec is complete: there are no
+"defer to later" decisions blocking the Stage 3 implementation.
+Everything that touches the SDK boundary (which is the only
+load-bearing decision in the whole spec) is fixed; everything
+else can land as Stage 4/5 features without retroactive ABI
+churn.
+
+(Section preserved here as a record of the open-question
+state; new genuinely-open issues would be added below.)
