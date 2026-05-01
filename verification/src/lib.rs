@@ -8251,24 +8251,19 @@ kernel_test!(smoke_virtio_blk_pci_irq_driven);
 fn smoke_virtio_blk_pci_irq_async() -> TestResult {
     // Drives `read_sector_irq_async` via a manual poll loop —
     // exercises wait_for_irq().await end-to-end against a real
-    // MSI-X-driven device.
-    //
-    // KNOWN INTERMITTENT FLAKE on x86_64 SMP=2: about 5% of runs
-    // will hang here because the device's post-submit MSI-X
-    // delivery races with `WaitForIrq::poll`'s second fire_count
-    // read in a way I haven't fully root-caused. Adding any kind
-    // of latency between submit and the await (a print, a small
-    // spin) makes the hang disappear, and dropping to SMP=1 makes
-    // it disappear deterministically — neither of which is a real
-    // fix. The IrqSafeSpinLock asm-options fix landed alongside
-    // this comment is independent and IS load-bearing; this smoke
-    // is left in place as a target for the next debugging pass.
+    // MSI-X-driven device. The waker the smoke installs is a
+    // simple AtomicBool flag: WaitForIrq's IRQ handler calls
+    // wake(), which sets the flag; the loop checks the flag
+    // before halting so a wake that races with the
+    // Pending-return-to-halt window isn't lost (the missed-wake
+    // pattern that wedges a noop waker on SMP).
     use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind, probe_all_pci};
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_drivers_virtio::blk_pci;
     use core::future::Future;
     use core::pin::Pin;
+    use core::sync::atomic::{AtomicBool, Ordering};
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
@@ -8296,19 +8291,36 @@ fn smoke_virtio_blk_pci_irq_async() -> TestResult {
         Err(_) => return TestResult::Fail("enable_msix"),
     };
 
-    fn nw_clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VT) }
-    fn nw_wake(_: *const ()) {}
-    fn nw_wake_by_ref(_: *const ()) {}
-    fn nw_drop(_: *const ()) {}
+    // Flag-backed waker. wake() sets WOKEN; the smoke loop swaps
+    // and checks before halting, so a wake that races with the
+    // Pending → halt transition can't be lost. The pointer in
+    // RawWaker is the AtomicBool's address.
+    static WOKEN: AtomicBool = AtomicBool::new(false);
+    fn flag_clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VT) }
+    fn flag_wake(p: *const ()) {
+        // SAFETY: p was constructed from `&WOKEN`; AtomicBool is
+        // 'static so dereferencing here is sound.
+        unsafe { (*(p as *const AtomicBool)).store(true, Ordering::Release); }
+    }
+    fn flag_wake_by_ref(p: *const ()) { flag_wake(p); }
+    fn flag_drop(_: *const ()) {}
     static VT: RawWakerVTable =
-        RawWakerVTable::new(nw_clone, nw_wake, nw_wake_by_ref, nw_drop);
-    // SAFETY: vtable functions are non-null; constructed for a
-    // one-shot local poll.
-    let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT)) };
+        RawWakerVTable::new(flag_clone, flag_wake, flag_wake_by_ref, flag_drop);
+    WOKEN.store(false, Ordering::Release);
+    let raw = RawWaker::new(&WOKEN as *const AtomicBool as *const (), &VT);
+    // SAFETY: vtable + payload constructed above.
+    let waker = unsafe { Waker::from_raw(raw) };
     let mut ctx = Context::from_waker(&waker);
 
-    // SAFETY: APIC initialised; OK to enable for the test.
-    unsafe { narf_arch::enable_interrupts(); }
+    // Canonical Linux-style idle loop: enter with IRQs DISABLED,
+    // re-check the flag with IRQs disabled (so an arriving IRQ
+    // can't set WOKEN between the check and the halt), then call
+    // `idle_halt_then_disable` which is the atomic sti;hlt;cli
+    // primitive. Returns with IRQs disabled, so the next iteration
+    // re-checks safely.
+    //
+    // SAFETY: APIC initialised; we own IRQ state for this test.
+    unsafe { narf_arch::disable_interrupts(); }
     let baseline = narf_interrupts::fire_count(v);
     let mut fut = alloc::boxed::Box::pin(blk_pci::read_sector_irq_async(0));
     let mut polls = 0u32;
@@ -8317,14 +8329,19 @@ fn smoke_virtio_blk_pci_irq_async() -> TestResult {
             Poll::Ready(r) => break Some(r),
             Poll::Pending  => {
                 polls += 1;
-                if polls > 100 { break None; }
-                narf_arch::halt_until_irq();
+                if polls > 1000 { break None; }
+                // If wake() fired during the poll itself (or
+                // between the previous halt's wake and now), the
+                // flag is set — re-poll without halting.
+                if WOKEN.swap(false, Ordering::AcqRel) { continue; }
+                // SAFETY: IRQs disabled by the cli above /
+                // by the previous idle_halt_then_disable.
+                unsafe { narf_arch::idle_halt_then_disable(); }
             }
         }
     };
     let after = narf_interrupts::fire_count(v);
-    // SAFETY: counterpart.
-    unsafe { narf_arch::disable_interrupts(); }
+    // counterpart already at IF=0; nothing to do.
 
     match result {
         Some(Ok(sector)) => {
@@ -8385,26 +8402,38 @@ fn smoke_virtio_blk_pci_write_irq_async() -> TestResult {
         return TestResult::Fail("enable_msix");
     }
 
-    fn nw_clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VT) }
-    fn nw_wake(_: *const ()) {}
-    fn nw_wake_by_ref(_: *const ()) {}
-    fn nw_drop(_: *const ()) {}
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static WOKEN: AtomicBool = AtomicBool::new(false);
+    fn flag_clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VT) }
+    fn flag_wake(p: *const ()) {
+        // SAFETY: p was constructed from `&WOKEN`; AtomicBool is 'static.
+        unsafe { (*(p as *const AtomicBool)).store(true, Ordering::Release); }
+    }
+    fn flag_wake_by_ref(p: *const ()) { flag_wake(p); }
+    fn flag_drop(_: *const ()) {}
     static VT: RawWakerVTable =
-        RawWakerVTable::new(nw_clone, nw_wake, nw_wake_by_ref, nw_drop);
-    // SAFETY: vtable fns non-null; one-shot local Waker.
-    let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT)) };
+        RawWakerVTable::new(flag_clone, flag_wake, flag_wake_by_ref, flag_drop);
+    WOKEN.store(false, Ordering::Release);
+    let raw = RawWaker::new(&WOKEN as *const AtomicBool as *const (), &VT);
+    // SAFETY: vtable + payload constructed above.
+    let waker = unsafe { Waker::from_raw(raw) };
     let mut ctx = Context::from_waker(&waker);
 
-    fn drive<F: Future>(fut: F, ctx: &mut Context<'_>) -> Option<F::Output> {
+    fn drive<F: Future>(fut: F, ctx: &mut Context<'_>, woken: &AtomicBool)
+        -> Option<F::Output>
+    {
         let mut fut = alloc::boxed::Box::pin(fut);
         let mut polls = 0u32;
+        // SAFETY: caller arranged IF=0 before invoking; we leave IF=0.
         loop {
             match Pin::new(&mut fut).poll(ctx) {
                 Poll::Ready(r) => return Some(r),
                 Poll::Pending  => {
                     polls += 1;
-                    if polls > 100 { return None; }
-                    narf_arch::halt_until_irq();
+                    if polls > 1000 { return None; }
+                    if woken.swap(false, Ordering::AcqRel) { continue; }
+                    // SAFETY: IF=0 by precondition / previous halt.
+                    unsafe { narf_arch::idle_halt_then_disable(); }
                 }
             }
         }
@@ -8413,12 +8442,12 @@ fn smoke_virtio_blk_pci_write_irq_async() -> TestResult {
     let mut pattern = [0u8; 512];
     for i in 0..512usize { pattern[i] = (i as u8).wrapping_add(0x37); }
 
-    // SAFETY: APIC initialised; OK to enable for the test.
-    unsafe { narf_arch::enable_interrupts(); }
-    let write_res = drive(blk_pci::write_sector_irq_async(1, pattern), &mut ctx);
-    let read_res  = drive(blk_pci::read_sector_irq_async(1), &mut ctx);
-    // SAFETY: counterpart.
+    // SAFETY: enter the wait loop with IRQs DISABLED — the
+    // canonical Linux idle pattern, see read smoke for rationale.
     unsafe { narf_arch::disable_interrupts(); }
+    let write_res = drive(blk_pci::write_sector_irq_async(1, pattern), &mut ctx, &WOKEN);
+    let read_res  = drive(blk_pci::read_sector_irq_async(1), &mut ctx, &WOKEN);
+    // Already at IF=0; nothing to do.
 
     match write_res {
         Some(Ok(()))   => {}

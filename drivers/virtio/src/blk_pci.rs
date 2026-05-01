@@ -242,9 +242,14 @@ impl VirtioBlkPci {
         let v = narf_interrupts::vector::alloc()
             .map_err(|_| VirtioPciError::BarMapFailed)?;
         let _ = table.alloc_vector().ok_or(VirtioPciError::BarMapFailed)?;
-        // 3. Program slot 0.
+        // 3. Program slot 0 to fire on this CPU. SAFETY: x2APIC
+        //    online by the time any driver is brought up.
+        // Hardcoded `target_apic_id=0` here was wrong: with -smp >1
+        // sockets, the BSP's APIC ID may not be 0, and the MSI-X
+        // would route to a CPU that isn't running the driver.
+        let target_apic = unsafe { narf_interrupts::x86_64::apic::apic_id() };
         // SAFETY: caller-authority, exclusive ownership.
-        let _ = unsafe { table.program_vector(0, 0, v) }
+        let _ = unsafe { table.program_vector(0, target_apic, v) }
             .map_err(|_| VirtioPciError::BarMapFailed)?;
         // SAFETY: same.
         let _ = unsafe { table.enable() }
