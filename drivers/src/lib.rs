@@ -45,6 +45,8 @@ extern crate alloc;
 pub mod bound;
 pub mod domain_alloc;
 pub mod params;
+
+mod tests;
 pub use bound::{
     record as record_bound, snapshot as bound_drivers,
     set_domain as set_driver_domain, domain_of as driver_domain,

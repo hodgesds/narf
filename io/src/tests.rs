@@ -1,0 +1,148 @@
+//! Per-crate smoke tests for `narf-io`.
+
+use narf_kernel_test::{kernel_test_in, TestResult};
+
+fn smoke_io_dma_alloc_free() -> TestResult {
+    // alloc_coherent returns a page-aligned nonzero phys address with
+    // the requested (rounded) length; drop returns the storage.
+    use crate::{alloc_coherent, free_coherent};
+    use narf_lib::id::DomainId;
+    use narf_memory::PAGE_SIZE;
+
+    let buf = match alloc_coherent(256, DomainId::DRIVER_0) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Skip("frame allocator unavailable in this flavour"),
+    };
+    if buf.phys_addr().raw() == 0 {
+        return TestResult::Fail("DMA buffer phys addr is zero");
+    }
+    if buf.phys_addr().raw() & (PAGE_SIZE - 1) != 0 {
+        return TestResult::Fail("DMA buffer phys addr not page-aligned");
+    }
+    if buf.len() != PAGE_SIZE as usize {
+        return TestResult::Fail("DMA buffer length not rounded to a page");
+    }
+    if buf.domain() != DomainId::DRIVER_0 {
+        return TestResult::Fail("DMA buffer domain mismatch");
+    }
+    free_coherent(buf);
+    TestResult::Pass
+}
+kernel_test_in!("io", smoke_io_dma_alloc_free);
+
+fn smoke_io_dma_cap_bootstrap() -> TestResult {
+    // Exercises Wave-2 cap table + Wave-3a DmaBuffer: bootstrap a
+    // Cap<DmaBuffer, Write>, confirm it's live, revoke, confirm dead.
+    use narf_capabilities::{Cap, CapError, CapType, Write};
+    use crate::DmaBuffer;
+
+    if DmaBuffer::KIND as u32 != narf_capabilities::CapKind::DmaBuffer as u32 {
+        return TestResult::Fail("DmaBuffer::KIND not DmaBuffer");
+    }
+
+    let cap: Cap<DmaBuffer, Write> = Cap::<DmaBuffer, Write>::bootstrap();
+    if !cap.is_live() { return TestResult::Fail("fresh DmaBuffer cap not live"); }
+    if cap.check_live().is_err() {
+        return TestResult::Fail("check_live on fresh DmaBuffer cap failed");
+    }
+    let clone = cap;
+    cap.revoke();
+    match clone.check_live() {
+        Err(CapError::Revoked) => {}
+        Ok(_) => return TestResult::Fail("DmaBuffer cap still live after revoke"),
+        Err(_) => return TestResult::Fail("DmaBuffer cap reported wrong error"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("io", smoke_io_dma_cap_bootstrap);
+
+fn smoke_io_iommu_stub_map_unmap() -> TestResult {
+    // Wave-3a IOMMU stub: construct a context, map a DmaBuffer, unmap.
+    use crate::{alloc_coherent, IommuContext, IoError};
+    use narf_lib::id::DomainId;
+
+    let dom = DomainId::DRIVER_1;
+    let buf = match alloc_coherent(4096, dom) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Skip("frame allocator unavailable in this flavour"),
+    };
+
+    let ctx = IommuContext::new(dom);
+    if ctx.domain() != dom { return TestResult::Fail("IommuContext domain mismatch"); }
+    if ctx.mapping_count() != 0 { return TestResult::Fail("fresh context not empty"); }
+
+    if ctx.map(&buf, 0x1000_0000).is_err() {
+        return TestResult::Fail("stub map returned error");
+    }
+    if ctx.mapping_count() != 1 { return TestResult::Fail("mapping count not bumped"); }
+
+    let other = match alloc_coherent(4096, DomainId::DRIVER_2) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Skip("frame allocator exhausted mid-test"),
+    };
+    match ctx.map(&other, 0x2000_0000) {
+        Err(IoError::DomainMismatch) => {}
+        _ => return TestResult::Fail("cross-domain map should have rejected"),
+    }
+
+    if ctx.unmap(0x1000_0000, 4096).is_err() {
+        return TestResult::Fail("stub unmap returned error");
+    }
+    if ctx.mapping_count() != 0 { return TestResult::Fail("mapping count not decremented"); }
+
+    match ctx.unmap(0x1000_0000, 4096) {
+        Err(IoError::NotMapped) => {}
+        _ => return TestResult::Fail("unmap of empty context should fail"),
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("io", smoke_io_iommu_stub_map_unmap);
+
+fn smoke_ioremap_direct_round_trip() -> TestResult {
+    // Allocate a frame, scribble a sentinel through the identity
+    // map, ioremap it as WriteBack-cached memory, read the
+    // sentinel back through the new VA.
+    //
+    // Note: this exercises `narf_memory::ioremap`, not anything inside
+    // `narf-io`. It lives here because the verification harness groups
+    // it with the rest of the IO smokes; the underlying surface belongs
+    // to memory/. If memory grows its own per-crate tests this should
+    // migrate again.
+    use narf_memory::ioremap::{self, MmioAttrs};
+    use narf_memory::frame::alloc_frame;
+    use core::sync::atomic::{compiler_fence, Ordering};
+
+    let frame = match alloc_frame() {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("alloc_frame"),
+    };
+    let phys = frame.start_address().raw();
+    const SENTINEL: u64 = 0xCAFE_BABE_DEAD_BEEF;
+    // SAFETY: identity-mapped low-RAM frame; we own it.
+    unsafe {
+        core::ptr::write_volatile(phys as *mut u64, SENTINEL);
+    }
+    compiler_fence(Ordering::SeqCst);
+
+    // SAFETY: phys is a frame we just got from alloc_frame.
+    let m = match unsafe { ioremap::ioremap(phys, 4096, MmioAttrs::WriteBack) } {
+        Ok(m)  => m,
+        Err(_) => return TestResult::Fail("ioremap returned err"),
+    };
+    if m.virt == 0 {
+        // SAFETY: m came from ioremap, but virt is invalid.
+        unsafe { ioremap::iounmap(m); }
+        return TestResult::Fail("ioremap returned virt=0");
+    }
+    // SAFETY: ioremap's contract guarantees the VA is now mapped.
+    let v = unsafe { core::ptr::read_volatile(m.virt as *const u64) };
+    let ok = v == SENTINEL;
+    // SAFETY: paired with ioremap.
+    unsafe { ioremap::iounmap(m); }
+    if !ok {
+        return TestResult::Fail("ioremap'd VA didn't read back the sentinel");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("io", smoke_ioremap_direct_round_trip);

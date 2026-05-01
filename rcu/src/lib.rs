@@ -52,6 +52,8 @@ pub mod policy;
 pub mod qsbr;
 pub mod sleepable;
 
+mod tests;
+
 pub use batched::{BatchedReclaimer, ReclaimBatch, BATCH_CAP};
 pub use hazard::{HazardDomain, HazardGuard, HazardSlot, retire};
 pub use policy::ReclamationPolicy;

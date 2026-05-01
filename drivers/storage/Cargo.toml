@@ -21,6 +21,7 @@ narf-time         = { path = "../../time" }
 narf-block        = { path = "../../block" }
 narf-drivers      = { path = "../" }
 narf-init         = { path = "../../init" }
+narf-kernel-test  = { path = "../../verification/kernel-test" }
 
 [lints]
 workspace = true

@@ -161,3 +161,5 @@ pub mod splash;
 pub use console::{FbConsole, install_fb_console};
 pub use cursor::Cursor;
 pub use splash::{render as render_splash, BootInfo};
+
+mod tests;

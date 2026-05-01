@@ -20,6 +20,8 @@ pub mod dispatch;
 pub mod vector;
 pub mod wait;
 
+mod tests;
+
 pub use dispatch::{fire_count, on_irq, NUM_VECTORS};
 pub use wait::{wait_for_irq, WaitForIrq};
 

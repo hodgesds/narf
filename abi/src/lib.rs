@@ -67,6 +67,8 @@ pub use narf_ipc::{
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_tracing::FnTime;
 
+mod tests;
+
 /// Per-call latency accumulator for `Dispatcher::dispatch_one`.
 /// Exposed for read-back by tests / observability: a `FnTime` gives
 /// a running Welford mean + variance plus a log2-bucket histogram so

@@ -36,6 +36,8 @@ pub mod client;
 pub mod cmd_ring;
 pub mod drain_task;
 pub mod registry;
+
+mod tests;
 pub use client::{allocate_singleton_ring, FbClient};
 pub use cmd_ring::{DrawCmd, DrawRing, RING_DEPTH, TAG_BLIT, TAG_FILL, TAG_FLUSH};
 pub use drain_task::{drain_once, stats as drain_stats, DrainTask};

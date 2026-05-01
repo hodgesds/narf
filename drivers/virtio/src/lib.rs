@@ -21,6 +21,8 @@ pub mod rng_pci;
 pub mod snd_pci;
 pub mod class_blk;
 
+mod tests;
+
 /// Stage::Subsys initcalls — register every virtio-PCI driver with
 /// the bus match table. Each call is idempotent on its own; the
 /// `register` function only adds entries.

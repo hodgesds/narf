@@ -11,5 +11,8 @@ repository.workspace   = true
 name = "narf_lib"
 path = "src/lib.rs"
 
+[dependencies]
+narf-kernel-test = { path = "../verification/kernel-test" }
+
 [lints]
 workspace = true

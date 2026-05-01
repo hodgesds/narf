@@ -40,6 +40,8 @@ extern crate alloc;
 pub mod gdb;
 pub mod peek;
 
+mod tests;
+
 pub use gdb::{GdbCommand, GdbError, GdbPacket};
 pub use peek::{MetricSample, MetricValue, PeekError, Provider};
 

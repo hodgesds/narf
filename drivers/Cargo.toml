@@ -16,6 +16,8 @@ narf-lib          = { path = "../lib" }
 narf-capabilities = { path = "../capabilities" }
 narf-memory       = { path = "../memory" }
 narf-arch         = { path = "../arch" }
+narf-scheduler    = { path = "../scheduler" }
+narf-kernel-test  = { path = "../verification/kernel-test" }
 
 [lints]
 workspace = true

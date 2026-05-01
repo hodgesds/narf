@@ -17,6 +17,8 @@ pub mod heap;
 pub mod slab;
 pub mod vmalloc;
 
+mod tests;
+
 pub use address_space::{AddressSpace, AddressSpaceError, Region, RegionPerms};
 
 #[cfg(target_arch = "x86_64")]

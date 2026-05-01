@@ -18,6 +18,7 @@ narf-init         = { path = "../init" }
 narf-memory       = { path = "../memory" }
 narf-userspace    = { path = "../userspace" }
 narf-io           = { path = "../io" }
+narf-kernel-test  = { path = "../verification/kernel-test" }
 
 [lints]
 workspace = true

@@ -36,6 +36,8 @@ extern crate alloc;
 pub mod suspend;
 pub mod thermal;
 
+mod tests;
+
 pub use suspend::{SuspendError, SuspendPhase};
 pub use thermal::{
     ThermalEvent, ThermalError, ThermalState, ThermalZone, Thermal,

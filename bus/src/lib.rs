@@ -31,6 +31,8 @@
 
 extern crate alloc;
 
+mod tests;
+
 pub mod acpi_notify;
 pub mod addr;
 pub mod bar;

@@ -18,6 +18,7 @@ narf-lib          = { path = "../lib" }
 narf-scheduler    = { path = "../scheduler" }
 narf-rcu          = { path = "../rcu" }
 narf-tracing      = { path = "../tracing" }
+narf-kernel-test  = { path = "../verification/kernel-test" }
 
 [lints]
 workspace = true

@@ -19,6 +19,7 @@ narf-boot         = { path = "../boot" }
 narf-capabilities = { path = "../capabilities" }
 narf-interrupts   = { path = "../interrupts" }
 narf-time         = { path = "../time" }
+narf-kernel-test  = { path = "../verification/kernel-test" }
 
 [lints]
 workspace = true

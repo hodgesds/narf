@@ -31,6 +31,8 @@ pub mod deadline;
 pub mod mq;
 pub mod registry;
 
+mod tests;
+
 pub use deadline::{DeadlineScheduler, Lane, STARVE_BOUND};
 pub use mq::{MqDeadlineScheduler, MAX_LANES};
 pub use registry::{

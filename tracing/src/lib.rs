@@ -37,6 +37,8 @@
 
 extern crate alloc;
 
+mod tests;
+
 pub mod dispatch;
 pub mod fntime;
 pub mod hwtrace;

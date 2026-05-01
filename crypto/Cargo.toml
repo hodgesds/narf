@@ -16,6 +16,7 @@ narf-lib          = { path = "../lib" }
 narf-capabilities = { path = "../capabilities" }
 narf-ipc          = { path = "../ipc" }
 narf-time         = { path = "../time" }
+narf-kernel-test  = { path = "../verification/kernel-test" }
 
 # RustCrypto primitives. Default features disabled to keep no_std clean —
 # every feature pull is explicit. See spec/specification/spec.md §3 for

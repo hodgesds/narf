@@ -39,3 +39,9 @@ pub fn register_initcalls() {
 
 #[cfg(not(target_arch = "x86_64"))]
 pub fn register_initcalls() {}
+
+// Per-crate smoke tests register against `narf-kernel-test` and
+// land in the same `narf.tests` ELF section as the rest of the
+// suite.
+#[cfg(target_arch = "x86_64")]
+mod tests;

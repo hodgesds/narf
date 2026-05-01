@@ -17,6 +17,8 @@ extern crate alloc;
 
 pub mod ahci;
 
+mod tests;
+
 /// Stage::Subsys initcalls for this driver crate.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};

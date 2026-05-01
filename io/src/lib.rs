@@ -11,6 +11,8 @@
 
 extern crate alloc;
 
+mod tests;
+
 use core::fmt;
 
 use narf_capabilities::{CapKind, CapType, Cap, CapOp, CapError};

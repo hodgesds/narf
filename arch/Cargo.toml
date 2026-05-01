@@ -12,7 +12,8 @@ name = "narf_arch"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib = { path = "../lib" }
+narf-lib         = { path = "../lib" }
+narf-kernel-test = { path = "../verification/kernel-test" }
 
 [lints]
 workspace = true

@@ -12,12 +12,14 @@ name = "narf_input_driver"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib         = { path = "../../lib" }
-narf-input       = { path = "../../input" }
-narf-arch        = { path = "../../arch" }
-narf-interrupts  = { path = "../../interrupts" }
-narf-drivers     = { path = "../../drivers" }
-narf-init        = { path = "../../init" }
+narf-lib            = { path = "../../lib" }
+narf-input          = { path = "../../input" }
+narf-arch           = { path = "../../arch" }
+narf-interrupts     = { path = "../../interrupts" }
+narf-drivers        = { path = "../../drivers" }
+narf-init           = { path = "../../init" }
+narf-drivers-virtio = { path = "../virtio" }
+narf-kernel-test    = { path = "../../verification/kernel-test" }
 
 [lints]
 workspace = true

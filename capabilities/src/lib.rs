@@ -9,6 +9,8 @@
 
 extern crate alloc;
 
+mod tests;
+
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU32, Ordering};
 

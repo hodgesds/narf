@@ -15,6 +15,8 @@
 #![deny(missing_debug_implementations)]
 
 pub mod wall;
+
+mod tests;
 pub use wall::{
     begin_leap_smear, monotonic_ns, now_wall, set_cycles_per_ns,
     set_wall_offset, set_wall_offset_uncapped, WallClock, WallError, WallInstant,

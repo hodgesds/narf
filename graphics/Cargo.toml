@@ -13,6 +13,8 @@ path = "src/lib.rs"
 
 [dependencies]
 narf-lib = { path = "../lib" }
+narf-kernel-test = { path = "../verification/kernel-test" }
+narf-drivers     = { path = "../drivers" }
 
 [lints]
 workspace = true

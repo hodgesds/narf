@@ -12,8 +12,10 @@ name = "narf_input"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib  = { path = "../lib" }
-narf-init = { path = "../init" }
+narf-lib          = { path = "../lib" }
+narf-init         = { path = "../init" }
+narf-drivers      = { path = "../drivers" }
+narf-kernel-test  = { path = "../verification/kernel-test" }
 
 [lints]
 workspace = true

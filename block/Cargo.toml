@@ -14,6 +14,7 @@ narf-ipc = { path = "../ipc" }
 narf-time = { path = "../time" }
 narf-tracing = { path = "../tracing" }
 narf-scheduler = { path = "../scheduler" }
+narf-kernel-test = { path = "../verification/kernel-test" }
 
 [lints]
 workspace = true

@@ -28,6 +28,8 @@
 pub mod tpm;
 pub mod pq;
 
+mod tests;
+
 extern crate alloc;
 
 use core::marker::PhantomData;

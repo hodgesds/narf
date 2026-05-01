@@ -367,6 +367,7 @@ version = "0.0.0"
 dependencies = [
  "narf-capabilities",
  "narf-ipc",
+ "narf-kernel-test",
  "narf-lib",
  "narf-rcu",
  "narf-scheduler",
@@ -395,6 +396,7 @@ dependencies = [
 name = "narf-arch"
 version = "0.0.0"
 dependencies = [
+ "narf-kernel-test",
  "narf-lib",
 ]
 
@@ -402,9 +404,13 @@ dependencies = [
 name = "narf-audio"
 version = "0.0.0"
 dependencies = [
+ "narf-bus",
  "narf-capabilities",
+ "narf-drivers",
  "narf-drivers-virtio",
  "narf-init",
+ "narf-io",
+ "narf-kernel-test",
  "narf-lib",
  "narf-memory",
  "narf-shmem",
@@ -418,6 +424,7 @@ dependencies = [
  "narf-capabilities",
  "narf-io",
  "narf-ipc",
+ "narf-kernel-test",
  "narf-lib",
  "narf-scheduler",
  "narf-time",
@@ -440,6 +447,7 @@ dependencies = [
  "narf-boot",
  "narf-capabilities",
  "narf-interrupts",
+ "narf-kernel-test",
  "narf-lib",
  "narf-memory",
  "narf-time",
@@ -450,6 +458,7 @@ name = "narf-capabilities"
 version = "0.0.0"
 dependencies = [
  "narf-arch",
+ "narf-kernel-test",
  "narf-lib",
 ]
 
@@ -491,6 +500,7 @@ dependencies = [
  "hkdf",
  "narf-capabilities",
  "narf-ipc",
+ "narf-kernel-test",
  "narf-lib",
  "narf-time",
  "rand_chacha",
@@ -500,13 +510,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-driver-runtime"
+version = "0.0.0"
+dependencies = [
+ "narf-bus",
+ "narf-capabilities",
+ "narf-interrupts",
+ "narf-io",
+ "narf-lib",
+]
+
+[[package]]
 name = "narf-drivers"
 version = "0.0.0"
 dependencies = [
  "narf-arch",
  "narf-capabilities",
+ "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-scheduler",
 ]
 
 [[package]]
@@ -514,6 +537,9 @@ name = "narf-drivers-gpu"
 version = "0.0.0"
 dependencies = [
  "narf-capabilities",
+ "narf-drivers-virtio",
+ "narf-graphics-driver",
+ "narf-kernel-test",
  "narf-lib",
 ]
 
@@ -523,10 +549,12 @@ version = "0.0.0"
 dependencies = [
  "narf-bus",
  "narf-capabilities",
+ "narf-driver-runtime",
  "narf-drivers",
  "narf-init",
  "narf-interrupts",
  "narf-io",
+ "narf-kernel-test",
  "narf-lib",
  "narf-memory",
  "narf-net",
@@ -536,6 +564,7 @@ dependencies = [
 name = "narf-drivers-nvme"
 version = "0.0.0"
 dependencies = [
+ "narf-arch",
  "narf-block",
  "narf-bus",
  "narf-capabilities",
@@ -543,6 +572,7 @@ dependencies = [
  "narf-init",
  "narf-interrupts",
  "narf-io",
+ "narf-kernel-test",
  "narf-lib",
 ]
 
@@ -556,6 +586,7 @@ dependencies = [
  "narf-drivers",
  "narf-init",
  "narf-io",
+ "narf-kernel-test",
  "narf-lib",
  "narf-memory",
  "narf-time",
@@ -565,13 +596,18 @@ dependencies = [
 name = "narf-drivers-usb"
 version = "0.0.0"
 dependencies = [
+ "narf-arch",
  "narf-bus",
  "narf-capabilities",
+ "narf-console",
  "narf-drivers",
  "narf-init",
+ "narf-interrupts",
  "narf-io",
+ "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-scheduler",
 ]
 
 [[package]]
@@ -589,6 +625,7 @@ dependencies = [
  "narf-interrupts",
  "narf-io",
  "narf-ipc",
+ "narf-kernel-test",
  "narf-lib",
  "narf-memory",
 ]
@@ -603,6 +640,7 @@ dependencies = [
  "narf-graphics-driver",
  "narf-init",
  "narf-ipc",
+ "narf-kernel-test",
  "narf-lib",
  "narf-memory",
  "narf-scheduler",
@@ -617,6 +655,7 @@ dependencies = [
  "narf-block",
  "narf-capabilities",
  "narf-io",
+ "narf-kernel-test",
  "narf-lib",
  "narf-scheduler",
  "narf-time",
@@ -659,6 +698,8 @@ dependencies = [
 name = "narf-graphics"
 version = "0.0.0"
 dependencies = [
+ "narf-drivers",
+ "narf-kernel-test",
  "narf-lib",
 ]
 
@@ -679,6 +720,7 @@ dependencies = [
 name = "narf-init"
 version = "0.0.0"
 dependencies = [
+ "narf-kernel-test",
  "narf-lib",
  "narf-time",
 ]
@@ -687,7 +729,9 @@ dependencies = [
 name = "narf-input"
 version = "0.0.0"
 dependencies = [
+ "narf-drivers",
  "narf-init",
+ "narf-kernel-test",
  "narf-lib",
 ]
 
@@ -697,9 +741,11 @@ version = "0.0.0"
 dependencies = [
  "narf-arch",
  "narf-drivers",
+ "narf-drivers-virtio",
  "narf-init",
  "narf-input",
  "narf-interrupts",
+ "narf-kernel-test",
  "narf-lib",
 ]
 
@@ -708,8 +754,10 @@ name = "narf-interrupts"
 version = "0.0.0"
 dependencies = [
  "narf-arch",
+ "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-time",
 ]
 
 [[package]]
@@ -717,6 +765,7 @@ name = "narf-io"
 version = "0.0.0"
 dependencies = [
  "narf-capabilities",
+ "narf-kernel-test",
  "narf-lib",
  "narf-memory",
 ]
@@ -726,18 +775,30 @@ name = "narf-ipc"
 version = "0.0.0"
 dependencies = [
  "narf-capabilities",
+ "narf-io",
+ "narf-kernel-test",
  "narf-lib",
+ "narf-memory",
+ "narf-scheduler",
 ]
+
+[[package]]
+name = "narf-kernel-test"
+version = "0.0.0"
 
 [[package]]
 name = "narf-lib"
 version = "0.0.0"
+dependencies = [
+ "narf-kernel-test",
+]
 
 [[package]]
 name = "narf-memory"
 version = "0.0.0"
 dependencies = [
  "narf-arch",
+ "narf-kernel-test",
  "narf-lib",
 ]
 
@@ -748,6 +809,7 @@ dependencies = [
  "narf-capabilities",
  "narf-io",
  "narf-ipc",
+ "narf-kernel-test",
  "narf-lib",
  "narf-scheduler",
 ]
@@ -758,6 +820,7 @@ version = "0.0.0"
 dependencies = [
  "narf-arch",
  "narf-capabilities",
+ "narf-kernel-test",
  "narf-lib",
  "narf-time",
  "narf-tracing",
@@ -769,6 +832,7 @@ version = "0.0.0"
 dependencies = [
  "narf-arch",
  "narf-capabilities",
+ "narf-kernel-test",
  "narf-lib",
  "narf-scheduler",
  "narf-time",
@@ -780,6 +844,7 @@ version = "0.0.0"
 dependencies = [
  "narf-arch",
  "narf-capabilities",
+ "narf-kernel-test",
  "narf-lib",
  "narf-time",
 ]
@@ -791,6 +856,7 @@ dependencies = [
  "narf-acpi",
  "narf-arch",
  "narf-capabilities",
+ "narf-kernel-test",
  "narf-lib",
  "narf-memory",
  "narf-rcu",
@@ -804,6 +870,7 @@ dependencies = [
  "narf-capabilities",
  "narf-init",
  "narf-io",
+ "narf-kernel-test",
  "narf-lib",
  "narf-memory",
  "narf-userspace",
@@ -815,6 +882,7 @@ version = "0.0.0"
 dependencies = [
  "narf-arch",
  "narf-capabilities",
+ "narf-kernel-test",
  "narf-lib",
 ]
 
@@ -824,6 +892,7 @@ version = "0.0.0"
 dependencies = [
  "narf-arch",
  "narf-capabilities",
+ "narf-kernel-test",
  "narf-lib",
  "narf-time",
 ]
@@ -878,6 +947,7 @@ dependencies = [
  "narf-interrupts",
  "narf-io",
  "narf-ipc",
+ "narf-kernel-test",
  "narf-lib",
  "narf-memory",
  "narf-net",

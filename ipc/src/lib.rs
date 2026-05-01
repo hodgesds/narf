@@ -45,6 +45,8 @@ pub use shared_ring::{
     TryRecvError as SharedTryRecvError, TrySendError as SharedTrySendError,
 };
 
+mod tests;
+
 use alloc::sync::Arc;
 use core::cell::UnsafeCell;
 use core::future::Future;

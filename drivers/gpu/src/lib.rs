@@ -101,3 +101,5 @@ pub enum GpuError {
     InvalidMode,
     InvalidSubmission,
 }
+
+mod tests;

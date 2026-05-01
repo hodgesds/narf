@@ -12,8 +12,9 @@ name = "narf_init"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib  = { path = "../lib" }
-narf-time = { path = "../time" }
+narf-lib          = { path = "../lib" }
+narf-time         = { path = "../time" }
+narf-kernel-test  = { path = "../verification/kernel-test" }
 
 [lints]
 workspace = true

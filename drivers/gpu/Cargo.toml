@@ -12,8 +12,11 @@ name = "narf_drivers_gpu"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib          = { path = "../../lib" }
-narf-capabilities = { path = "../../capabilities" }
+narf-lib             = { path = "../../lib" }
+narf-capabilities    = { path = "../../capabilities" }
+narf-kernel-test     = { path = "../../verification/kernel-test" }
+narf-graphics-driver = { path = "../graphics" }
+narf-drivers-virtio  = { path = "../virtio" }
 
 [lints]
 workspace = true

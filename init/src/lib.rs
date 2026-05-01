@@ -306,3 +306,8 @@ impl<'a> core::fmt::Write for TruncatingWriter<'a> {
         Ok(())
     }
 }
+
+// Per-crate smoke tests register against `narf-kernel-test` and
+// land in the same `narf.tests` ELF section as the rest of the
+// suite.
+mod tests;

@@ -295,3 +295,8 @@ pub fn register_initcalls() {
 fn _read_cap_demo(_c: Cap<ShmemCap, Read>) {}
 #[allow(dead_code)]
 fn _write_cap_demo(_c: Cap<ShmemCap, Write>) {}
+
+// Per-crate smoke tests register against `narf-kernel-test` and
+// land in the same `narf.tests` ELF section as the rest of the
+// suite.
+mod tests;

@@ -47,6 +47,8 @@ pub mod budget;
 pub mod cpu_lifecycle;
 pub mod priority;
 
+mod tests;
+
 pub use affinity::{Affinity, CpuId, CpuSet};
 pub use budget::{BudgetAccount, CpuBudget, OverrunPolicy, ResourceBudget};
 pub use cpu_lifecycle::{cpu_bring_up, cpu_online, cpu_take_offline, online_count, CpuLifecycle, HotPlugError};
