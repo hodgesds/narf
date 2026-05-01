@@ -78,6 +78,16 @@ fn start_rust(rsp_at_entry: u64) -> ! {
     rt::exit_task();
 }
 
+/// Triangle wave: 0 → span → 0 over `period` frames. Lets the
+/// FB demo bounce a sprite without dragging in libm.
+fn tri_wave(frame: u32, period: u32, span: u32) -> u32 {
+    if span == 0 || period == 0 { return 0; }
+    let phase = frame % period;
+    let half = period / 2;
+    let progress = if phase < half { phase } else { period - phase };
+    ((progress as u64 * span as u64) / half.max(1) as u64) as u32
+}
+
 #[cfg(target_arch = "x86_64")]
 fn run_probes_x86_64(rsp_at_entry: u64) {
     const EXPECT_ARGV0: &[u8] = b"narf-testbin";
@@ -303,34 +313,49 @@ fn run_probes_x86_64(rsp_at_entry: u64) {
                 false
             } else {
                 let mut all_ok = true;
-                // Background: solid dark blue.
-                all_ok &= fb.fill(0, 0, info.width, info.height, 0xFF101840).is_ok();
-                // 8 vertical color bars across the full height.
-                let bar_w = info.width / 8;
                 let palette = [
                     0xFFE53935u32, 0xFFFB8C00, 0xFFFDD835, 0xFF43A047,
                     0xFF1E88E5, 0xFF5E35B1, 0xFFD81B60, 0xFFE0E0E0,
                 ];
-                for (i, &color) in palette.iter().enumerate() {
-                    let x = (i as u32) * bar_w;
-                    let h = info.height / 2;
-                    all_ok &= fb.fill(x, info.height / 4, bar_w, h, color).is_ok();
+                let bar_w = info.width / 8;
+                let s = 96u32.min(info.width.min(info.height) / 4);
+
+                // ~30 fps × 10 s = 300 frames. The producer ring is
+                // 16 deep, so a `RingFull` just means yield + retry
+                // — `nanosleep` is the natural pacing source.
+                const FRAMES: u32 = 300;
+                const FRAME_NS: u64 = 33_333_333;
+                for frame in 0..FRAMES {
+                    // Background: solid dark blue.
+                    while fb.fill(0, 0, info.width, info.height, 0xFF101840).is_err() {
+                        rt::yield_now();
+                    }
+                    // Static 8 vertical color bars (the visual
+                    // anchor that says "userspace pixels landed").
+                    for (i, &color) in palette.iter().enumerate() {
+                        let x = (i as u32) * bar_w;
+                        let h = info.height / 2;
+                        while fb.fill(x, info.height / 4, bar_w, h, color).is_err() {
+                            rt::yield_now();
+                        }
+                    }
+                    // Bouncing yellow square: triangle-wave on x,
+                    // cosine-ish on y via a second triangle-wave at
+                    // a different period so the motion is visibly
+                    // 2D without pulling in libm.
+                    let span_x = info.width.saturating_sub(s);
+                    let span_y = info.height.saturating_sub(s);
+                    let x = tri_wave(frame, 120, span_x);
+                    let y = tri_wave(frame.wrapping_add(30), 90, span_y);
+                    while fb.fill(x, y, s, s, 0xFFFFD700).is_err() {
+                        rt::yield_now();
+                    }
+                    while fb.flush(0, 0, info.width, info.height).is_err() {
+                        rt::yield_now();
+                    }
+                    rt::nanosleep(FRAME_NS);
+                    if frame == FRAMES - 1 { all_ok = true; }
                 }
-                // Centered yellow square as the userspace-pixels
-                // visual anchor (a Stage-3 testbin tradition).
-                let cx = info.width / 2;
-                let cy = info.height / 2;
-                let s = 64u32.min(info.width.min(info.height));
-                all_ok &= fb.fill(cx.saturating_sub(s/2), cy.saturating_sub(s/2),
-                                   s, s, 0xFFFFD700).is_ok();
-                // Push the dirty region so the device actually
-                // scans out our pixels.
-                all_ok &= fb.flush(0, 0, info.width, info.height).is_ok();
-                // Linger ~3s so a human running with --display
-                // gtk has time to see the result before QEMU
-                // exits. Headless test runs incur the same
-                // delay; cheap.
-                rt::nanosleep(3_000_000_000);
                 all_ok
             }
         }

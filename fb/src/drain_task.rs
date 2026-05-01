@@ -1,17 +1,20 @@
 //! Kernel-resident drain task for the per-process DrawRing
 //! registry.
 //!
-//! Spawned once at boot. Each scheduler tick polls every
-//! registered ring and executes queued draw commands against the
-//! shared FbWriter. Throughput is one ring round per scheduler
-//! quantum — fine for the human-input cadence the framebuffer is
-//! actually driven at.
+//! Spawned once at boot. The scheduler polls every registered
+//! ring and executes queued draw commands against the shared
+//! FbWriter. The task self-wakes — `cx.waker().wake_by_ref()`
+//! before each `Poll::Pending` — so the executor re-polls it on
+//! every round (mirrors `narf_scheduler::yield_now`). This is the
+//! display-engine kthread shape: one CPU keeps the scanout fed
+//! whenever any producer ring has work.
 //!
-//! No UIPI yet — a producer that wants faster turn-around than
-//! the next tick must call SYS_FB_DRAIN_KICK (added separately
-//! when the use case arrives). The cadence-only approach gets the
-//! interesting userspace-writes-to-FB chain working without
-//! crossing into the architecture's interrupt-delivery path.
+//! `registry::drain_all` is cheap on empty rings (a single
+//! relaxed load per ring), so the spin cost is bounded by the
+//! ring count when nothing is producing. A future
+//! producer-driven waker handoff (set on `fb_connect`, fired on
+//! producer-side `head` advance) replaces self-waking when SMP
+//! IPI plumbing for FB lands.
 
 use core::pin::Pin;
 use core::task::{Context, Poll};
@@ -44,9 +47,11 @@ pub fn drain_once(writer: &FbWriter) -> (u32, u32) {
     (ok, err)
 }
 
-/// Future shape: poll → drain → return Pending → repeat. The
-/// scheduler re-polls on every tick because we don't install a
-/// waker (no condition gates the next pass).
+/// Future shape: poll → drain → self-wake → return Pending →
+/// repeat. The self-wake (`wake_by_ref` before returning) keeps
+/// the task's awake flag set so the executor re-polls it on
+/// every round. Without it the task would park after the first
+/// poll and producer rings would fill up un-drained.
 pub struct DrainTask {
     writer: FbWriter,
 }
@@ -63,11 +68,14 @@ impl DrainTask {
 
 impl Future for DrainTask {
     type Output = ();
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
-        // Run one pass, then yield. The scheduler's next tick
-        // will re-poll us; on every poll we drain whatever has
-        // accumulated since the previous round.
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        // Run one pass, then re-arm the awake flag so the
+        // executor re-polls us next round. Same pattern as
+        // narf_scheduler::yield_now — without the wake_by_ref the
+        // scheduler's `awake.swap(false)` gate parks us after one
+        // poll and the FB scanout stops advancing.
         drain_once(&self.writer);
+        cx.waker().wake_by_ref();
         Poll::Pending
     }
 }

@@ -2273,6 +2273,13 @@ fn sys_fb_connect(ctx: &mut dyn TrapContext) {
     if h == 0 {
         ctx.set_return(SyscallReturn::invalid_op());
     } else {
+        // First active FB-handle takes ownership of the framebuffer
+        // away from the kernel-side FB console so kernel prints
+        // don't paint glyphs over the user's pixels. Last
+        // disconnect restores it. Serial / UART output is
+        // unaffected — Console::Writer fans out to the FB only
+        // through the optional hook this swaps.
+        fb_console_owner::on_connect();
         ctx.set_return(SyscallReturn::ok(h));
     }
 }
@@ -2358,9 +2365,57 @@ fn sys_fb_disconnect(ctx: &mut dyn TrapContext) {
         None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
     };
     if (v.disconnect)(handle) {
+        // Pair with on_connect: when the last live handle goes
+        // away, restore the kernel FB console hook so subsequent
+        // kernel prints render to screen again.
+        fb_console_owner::on_disconnect();
         ctx.set_return(SyscallReturn::ok(0));
     } else {
         ctx.set_return(SyscallReturn::invalid_op());
+    }
+}
+
+/// Kernel-FB-console ownership tracker. First Connect detaches
+/// the console hook (saving the prior); last Disconnect restores
+/// it. Refcount is the count of live FB handles seen by the
+/// syscall layer — sub-handle reaping (e.g. the FB driver
+/// silently expiring a handle) doesn't decrement it; a
+/// Disconnect syscall does. That mirrors the userspace-driven
+/// connect/disconnect lifecycle.
+mod fb_console_owner {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Saved FB hook value (the `usize` returned by
+    /// `narf_console::take_fb_hook`). Only meaningful when the
+    /// refcount is non-zero.
+    static SAVED: AtomicUsize = AtomicUsize::new(0);
+    /// Active FB-handle count.
+    static REFS: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn on_connect() {
+        // Refcount transition 0 → 1 takes the hook. fetch_add
+        // returns the prior value; only the thread that observed
+        // a 0 may swap the hook out, ensuring exactly one save
+        // per take/restore pair.
+        if REFS.fetch_add(1, Ordering::AcqRel) == 0 {
+            let prior = narf_console::take_fb_hook();
+            SAVED.store(prior, Ordering::Release);
+        }
+    }
+
+    pub fn on_disconnect() {
+        // Refcount transition 1 → 0 restores the hook. fetch_sub
+        // returns the prior value; only the 1 → 0 thread reads
+        // SAVED. Defend against unbalanced calls by saturating
+        // at 0 — never underflow.
+        let prev = REFS.load(Ordering::Acquire);
+        if prev == 0 {
+            return;
+        }
+        if REFS.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let saved = SAVED.swap(0, Ordering::AcqRel);
+            narf_console::restore_fb_hook(saved);
+        }
     }
 }
 
@@ -2550,7 +2605,13 @@ fn sys_yield(ctx: &mut dyn TrapContext) {
         }
         // unreachable
     }
-    // Legacy: no polling executor wired yet — Yield is a no-op Ok.
+    // No polling executor wired yet — but a user task that yields
+    // is asking for "let other work run." Drive the same pumps
+    // sys_sleep does so the FB drain (and any other registered
+    // background work) makes progress on yields. Without this, a
+    // user-mode busy-wait pattern (e.g., retry-on-RingFull) spins
+    // forever because nothing else runs.
+    sleep_pumps::run();
     ctx.set_return(SyscallReturn::ok(0));
 }
 
@@ -3668,15 +3729,92 @@ fn sys_sleep(ctx: &mut dyn TrapContext) {
         return;
     }
     let start = narf_scheduler::narf_time::monotonic_ns();
-    // Saturating add: a u64 overflow on `start + ns` is structurally
+    // Saturating add: u64 overflow on `start + ns` is structurally
     // impossible at realistic clock rates, but the saturate keeps
     // the loop bound tight against pathological inputs.
     let deadline = start.saturating_add(ns);
     while narf_scheduler::narf_time::monotonic_ns() < deadline {
+        sleep_pumps::run();
         core::hint::spin_loop();
     }
     ctx.set_return(SyscallReturn::ok(0));
 }
+
+/// Registry of "background-work" callbacks that run inside the
+/// `sys_sleep` busy-wait. Subsystems whose forward progress is
+/// gated on the scheduler's polling tick — chiefly the FB drain
+/// task — register a pump here at boot so their work continues
+/// even while a user task is sleeping.
+///
+/// The registry is fixed-size and lock-free: writes are
+/// boot-time, reads are hot-path. A `0` slot is "vacant".
+pub mod sleep_pumps {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Maximum simultaneously-registered pumps. 8 is comfortably
+    /// over the foreseeable subsystem count (FB drain, future
+    /// audio drain, future input poll, etc.). Rejecting registers
+    /// past the cap is a boot-time programming error, surfaced as
+    /// a panic so it can't escape into a silent starvation bug.
+    const MAX_PUMPS: usize = 8;
+
+    /// One pump function — runs once per iteration of the sleep
+    /// busy-wait. Must not block, allocate, or take long-held
+    /// kernel locks; treat it like an IRQ handler.
+    pub type Pump = fn();
+
+    static SLOTS: [AtomicUsize; MAX_PUMPS] = [
+        AtomicUsize::new(0), AtomicUsize::new(0),
+        AtomicUsize::new(0), AtomicUsize::new(0),
+        AtomicUsize::new(0), AtomicUsize::new(0),
+        AtomicUsize::new(0), AtomicUsize::new(0),
+    ];
+
+    /// Register a pump. Boot-only; idempotent on the same
+    /// function pointer (registering the same `Pump` twice fills
+    /// two slots — callers should arrange to register exactly
+    /// once per subsystem).
+    pub fn register(p: Pump) {
+        let p_addr = p as usize;
+        for slot in SLOTS.iter() {
+            if slot
+                .compare_exchange(0, p_addr, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+        panic!("sleep_pumps: registry full ({} slots)", MAX_PUMPS);
+    }
+
+    /// Run every registered pump in registration order. Called
+    /// from `sys_sleep` on each spin iteration.
+    pub fn run() {
+        for slot in SLOTS.iter() {
+            let p = slot.load(Ordering::Acquire);
+            if p == 0 {
+                // Slots are filled densely from index 0; the
+                // first 0 we see is the end of the live region.
+                return;
+            }
+            // SAFETY: slot was populated by `register` with a
+            // valid `Pump` (`fn()`), and the static lifetime is
+            // the kernel's. The atomic ensures we read a
+            // committed value.
+            let f: super::Pump = unsafe { core::mem::transmute(p) };
+            f();
+        }
+    }
+
+    /// Test hook — clear all slots so unit tests don't leak
+    /// pumps across runs.
+    #[doc(hidden)]
+    pub fn __reset_for_test() {
+        for slot in SLOTS.iter() { slot.store(0, Ordering::Release); }
+    }
+}
+
+type Pump = fn();
 
 // ── Per-task cwd state ────────────────────────────────────────────
 //

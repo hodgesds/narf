@@ -487,6 +487,67 @@ pub fn info() -> Option<ScanoutInfo> {
     })
 }
 
+/// Cached `FbWriter` for the synchronous drain pump. Constructed
+/// **once** at boot via `init_pump_writer` (under
+/// `register_initcalls`'s `fb-drain-task` step). The pump reads
+/// it through `UnsafeCell` because `FbWriter` is not `Sync` —
+/// safety relies on the pump-call discipline below.
+///
+/// Why static: `Cap::bootstrap()` allocates a fresh object-table
+/// slot on every call. The pump fires from `sys_sleep`'s busy-
+/// wait at ~3 kHz; minting a cap per call grows the cap table
+/// without bound and eventually wedges allocation.
+static PUMP_WRITER: PumpWriterCell = PumpWriterCell::new();
+
+struct PumpWriterCell(core::cell::UnsafeCell<Option<FbWriter>>);
+
+// SAFETY: PUMP_WRITER is written exactly once during boot
+// (single-threaded init), then read-only thereafter from sys_sleep
+// pump callers. Concurrent pump invocations only call
+// `drain_task::drain_once(&FbWriter)` which takes `&self`; no
+// mutation crosses cores.
+unsafe impl Sync for PumpWriterCell {}
+
+impl PumpWriterCell {
+    const fn new() -> Self {
+        Self(core::cell::UnsafeCell::new(None))
+    }
+}
+
+/// Synchronous drain pump for the userspace `sys_sleep` hook.
+/// Reads the boot-cached writer and runs one drain pass; cheap
+/// on empty rings.
+fn fb_drain_pump() {
+    // SAFETY: PUMP_WRITER is initialised once at boot before any
+    // user task calls sys_sleep (the FB-drain initcall runs in
+    // Stage::Late which precedes user-task spawn). After that
+    // it's read-only.
+    let opt = unsafe { &*PUMP_WRITER.0.get() };
+    if let Some(w) = opt.as_ref() {
+        let _ = drain_task::drain_once(w);
+    }
+}
+
+/// One-shot initialiser for `PUMP_WRITER`. Called from the
+/// `fb-drain-task` initcall after `FbWriter::new` succeeds for
+/// the spawned drain future. Idempotent: only the first call
+/// stores; subsequent calls are silently dropped.
+fn init_pump_writer(writer: FbWriter) {
+    static DONE: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+    if DONE
+        .compare_exchange(false, true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire)
+        .is_ok()
+    {
+        // SAFETY: first-and-only writer; no concurrent reader yet
+        // (the pump can't fire before `register_initcalls`
+        // completes Stage::Late).
+        unsafe { *PUMP_WRITER.0.get() = Some(writer); }
+    }
+}
+
 /// Stage::Late initcall: log which backend won the picker, then
 /// run a small kernel-resident producer→ring→consumer→FB demo
 /// that proves the architectural chain end-to-end. The demo is
@@ -531,8 +592,28 @@ pub fn register_initcalls() {
             Ok(w)  => w,
             Err(_) => return InitResult::Error("FbWriter::new"),
         };
+        // Cache a second writer for the synchronous drain pump
+        // (the spawned task consumed `writer`). Building two
+        // capability slots up-front is fine; building them on
+        // every pump call would not be (Cap::bootstrap allocates
+        // an object-table slot each time, and the pump fires at
+        // ~3 kHz from sys_sleep's busy-wait).
+        let pump_cap = bootstrap_writer();
+        if let Ok(pump_writer) = FbWriter::new(pump_cap) {
+            init_pump_writer(pump_writer);
+            // Register the synchronous-drain pump so user-mode
+            // tasks that nanosleep don't starve scanout. The
+            // scheduler doesn't preempt syscall handlers;
+            // without this hook a long-running animation that
+            // flushes its DrawRing every 33 ms would wedge in
+            // `RingFull` because the boot-time drain task can't
+            // be polled from inside a sleep busy-wait.
+            narf_userspace::handlers::sleep_pumps::register(fb_drain_pump);
+        }
+
         let task = drain_task::DrainTask::new(writer);
         let _ = narf_scheduler::spawn(task);
+
         InitResult::Ok
     });
     narf_init::register(Stage::Late, "fb-client-demo", || {

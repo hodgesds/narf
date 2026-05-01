@@ -146,6 +146,27 @@ pub fn set_fb_hook(hook: FbHook) {
     FB_HOOK.store(hook as usize, Ordering::Release);
 }
 
+/// Atomically detach the current FB-console fan-out and return its
+/// prior value as an opaque token. Subsequent kernel prints stay on
+/// the serial / UART backend until [`restore_fb_hook`] is called
+/// with the returned token.
+///
+/// Used by FB-handle owners (e.g. a userspace process that opened a
+/// scanout via `Syscall::FbConnect`) to take exclusive ownership of
+/// the framebuffer for the lifetime of the handle, so kernel
+/// console glyphs don't paint over the user's pixels.
+#[must_use = "the returned token must be passed to restore_fb_hook on disconnect"]
+pub fn take_fb_hook() -> usize {
+    FB_HOOK.swap(0, Ordering::AcqRel)
+}
+
+/// Re-install a previously-detached FB hook. Pass the value returned
+/// by [`take_fb_hook`]; passing 0 leaves the hook unset (e.g. if no
+/// FB console was ever installed).
+pub fn restore_fb_hook(prior: usize) {
+    FB_HOOK.store(prior, Ordering::Release);
+}
+
 /// Panic sink — no allocation, no re-entry. `frame/`'s panic handler
 /// forwards here.
 pub fn panic_sink(info: &core::panic::PanicInfo<'_>) -> ! {
