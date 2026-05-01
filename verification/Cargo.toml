@@ -12,6 +12,7 @@ name = "narf_verification"
 path = "src/lib.rs"
 
 [dependencies]
+narf-kernel-test  = { path = "kernel-test" }
 narf-lib         = { path = "../lib" }
 narf-acpi        = { path = "../acpi" }
 narf-aml         = { path = "../aml" }

@@ -1,0 +1,38 @@
+[package]
+name         = "narf-driver-runtime"
+description  = "Driver-runtime abstraction. Re-exports the small surface (MMIO, DMA, IRQ wait, locks) that hardware drivers need, behind feature flags so the same driver source compiles against the kernel runtime (`kernel`) or a userspace cap-mediated runtime (`userspace`)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_driver_runtime"
+path = "src/lib.rs"
+
+[features]
+default  = ["kernel"]
+# Plug into the kernel-side primitives. Drivers built against this
+# run in ring 0 with full hardware access.
+kernel   = [
+    "dep:narf-bus", "dep:narf-io", "dep:narf-lib",
+    "dep:narf-interrupts", "dep:narf-capabilities",
+]
+# Plug into the userspace cap-mediated runtime. Drivers built
+# against this run in user mode and reach hardware through
+# Cap<BusDeviceCap>-gated syscalls (BAR mapping, DMA-coherent
+# allocation, IRQ delivery via IPC). Stage-1: trait surface only —
+# the user-side syscall plumbing is a follow-up that lands the
+# `narf-user-driver-runtime` companion crate.
+userspace = []
+
+[dependencies]
+narf-bus          = { path = "../../bus",      optional = true }
+narf-io           = { path = "../../io",       optional = true }
+narf-lib          = { path = "../../lib",      optional = true }
+narf-interrupts   = { path = "../../interrupts", optional = true }
+narf-capabilities = { path = "../../capabilities", optional = true }
+
+[lints]
+workspace = true

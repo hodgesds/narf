@@ -213,6 +213,28 @@ pub struct MmioRegion {
 }
 
 impl MmioRegion {
+    /// Read an 8-bit MMIO byte at `offset`.
+    ///
+    /// # Safety
+    /// `offset + 1 <= self.len` and the device behind the BAR must
+    /// tolerate the read at this offset.
+    #[inline]
+    pub unsafe fn read8(&self, offset: u64) -> u8 {
+        // SAFETY: caller-asserted in-range; arch::mmio supplies the
+        // volatile + arch-correct barrier.
+        unsafe { narf_arch::mmio::read8(self.phys.raw() + offset) }
+    }
+
+    /// Write an 8-bit MMIO byte at `offset`.
+    ///
+    /// # Safety
+    /// `offset + 1 <= self.len`; caller owns the device exclusively.
+    #[inline]
+    pub unsafe fn write8(&self, offset: u64, value: u8) {
+        // SAFETY: caller-asserted in-range.
+        unsafe { narf_arch::mmio::write8(self.phys.raw() + offset, value); }
+    }
+
     /// Read a naturally-aligned 16-bit MMIO word at `offset`.
     ///
     /// # Safety

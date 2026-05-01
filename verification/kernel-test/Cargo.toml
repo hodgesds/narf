@@ -1,0 +1,15 @@
+[package]
+name         = "narf-kernel-test"
+description  = "Zero-dep kernel-test framework — macro + section symbols + result types. Driver / library crates depend on this so they can register subsystem-aware smoke tests without cycling on the higher-level harness."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_kernel_test"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
