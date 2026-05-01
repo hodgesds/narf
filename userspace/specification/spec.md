@@ -1,6 +1,10 @@
 # userspace — Specification
 
-> Status: **Outline v0.1** (Stage 4).
+> Status: **v1.0** (Stage 4 design lock). v0.1 covered the
+> Process abstraction + bootstrap + stable user-ABI promise;
+> v1.0 locks the syscall versioning wire format that the
+> drivers framework SDK mirrors, the PT_INTERP bootstrap, the
+> POSIX-shim scope, and fork/exec semantics.
 
 ## 1. Purpose & scope
 
@@ -134,16 +138,102 @@ number is not.
 
 Stage 4.
 
-## 8. Open questions
+## 8. Resolved decisions
 
-- **POSIX shim scope:** true POSIX compatibility via full relibc, or
-  native-first ABI with relibc as a thin compat layer?
-- Dynamic linking: do we ship `ld-musl`-style dynamic linker, or static-only first?
-- fork / exec semantics — do we do Linux-compatible fork at all, or
-  spawn-only? (Preferred: spawn-only; fork is painful in a capability OS.)
-- **Custom `PT_INTERP` as the capability-bootstrap site (Shiva-inspired).**
-  NARF ships its own program interpreter; binaries point their
-  `PT_INTERP` at it. The interpreter resolves relocations, sets up the
-  submission/completion Narf-Rings, installs the cap table, and
-  initialises TLS before handing control to `_start`. This is the
-  natural home for the ABI bootstrap currently described in `abi/`.
+### 8.1 POSIX shim scope (resolved)
+
+**Decision (was open):** **native-first ABI with relibc as a
+thin compat layer**, not full POSIX compatibility.
+
+The native NARF userspace ABI is the ring-pair model in §3.
+relibc lives on top, translating POSIX calls (`read`, `write`,
+`open`, `mmap`, …) into NARF submissions. Programs that link
+against relibc compile from POSIX source unchanged; programs
+that link against `narf-userspace-runtime` (a thin
+typed-async crate) skip the POSIX layer entirely.
+
+**Rationale:** full POSIX compatibility (every syscall, every
+flag, every edge case) is the long-tail cost that has dominated
+every "POSIX-on-microkernel" project. By making NARF-native
+the primary ABI and relibc the bridge, we keep the surface
+area honest. Production NARF code should target the native
+ABI; relibc is for porting existing code.
+
+### 8.2 Dynamic linking (resolved)
+
+**Decision (was open):** **dynamic linker ships in v1.0** —
+the `narf-ld.so` interpreter referenced via `PT_INTERP` (see
+§8.4). Static-only would force every userspace binary to
+re-include relibc + the runtime, multiplying image size; for
+hundreds-of-applications scaling the dynamic linker is not
+optional.
+
+The dynamic linker is the same Shiva-style relocation engine
+the driver framework's loader uses (`drivers/spec` §14). One
+implementation, two consumers.
+
+### 8.3 fork/exec semantics (resolved)
+
+**Decision (was open):** **spawn-only**. NARF does not
+implement Linux-compatible `fork()`. The
+posix_spawn-equivalent native primitive is
+`spawn_process(elf, caps)` in §3.
+
+**Rationale:** `fork()` requires copy-on-write of the parent
+address space, which interacts badly with cap tables (does
+the child get a copy of every cap? clones are an explicit
+operation in NARF, not implicit copies), with PKS/MTE domain
+state (each domain's PKRS/TCF would need cloning), and with
+the bootstrap ring pairs (you'd have two processes sharing a
+ring and immediately diverging). The semantic mess is not
+worth Linux source-compatibility for the small set of
+programs that genuinely need fork-without-exec.
+
+relibc's `fork()` returns `Err(ENOSYS)`. POSIX programs that
+call `posix_spawn` work; programs that `fork(); exec()` are
+patched (typically by replacing with `posix_spawn`).
+`vfork()` is similarly unsupported. This is a known porting
+cost for legacy code; the alternative is unsoundness in the
+cap+domain model.
+
+### 8.4 PT_INTERP capability bootstrap (resolved)
+
+**Decision (was open):** **NARF ships `narf-ld.so`**, the
+custom program interpreter referenced by every userspace ELF's
+`PT_INTERP`. The interpreter is the Shiva-inspired model:
+
+1. Kernel loads ELF, sets up address space, jumps to interp's
+   entry point (not the program's).
+2. Interpreter runs in user mode with bootstrap caps (provided
+   via the kernel-mapped config page from `abi/spec` §3.1).
+3. Interpreter resolves relocations against shared libraries
+   (loaded via further bootstrap caps), populates the GOT,
+   installs the program's cap table, allocates submission +
+   completion rings.
+4. Interpreter jumps to the program's `_start`.
+
+This **moves the ABI bootstrap currently in `abi/spec` §3.1
+into user mode**. The kernel's only role is loading the
+interpreter and minting one bootstrap cap; everything else is
+user code that can be debugged, traced, and updated without
+kernel changes.
+
+The interpreter is the same code path the driver loader uses
+(see `drivers/spec` §11), just running in user mode instead of
+kernel mode. One relocation engine, two callers.
+
+## 9. ABI versioning
+
+Syscall versioning per §4.1 is the canonical ABI-version
+pattern across the kernel — all subsequent specs (`drivers/`,
+`capabilities/`, etc.) mirror it.
+
+`USERSPACE_ABI_MAJOR = 1`, `USERSPACE_ABI_MINOR = 0`.
+
+The Syscall enum is **append-only** indefinitely (§4.1). Removed
+entries become tombstones (returns `Err(ENOSYS)`) but keep
+their number reserved.
+
+## 10. Open questions
+
+(none — all v0.1 questions resolved in §8)

@@ -1,9 +1,10 @@
 # capabilities — Specification
 
-> Status: **Outline v0.2** (Stage 1 sketch → Stage 3 full). v0.2
-> commits to **EROS-style epoch revocation** over seL4 CDT walks and
-> specifies the per-slot generation stamp that distinguishes prior
-> authorisation from current validity.
+> Status: **v1.0** (Stage 3 design lock). Builds on v0.2's
+> EROS-style epoch revocation + 128-bit slot decisions; v1 locks
+> the `CapKind` registry, the cross-boundary wire format, and
+> the cap-table storage layout that the rest of the framework
+> consumes.
 
 ## 1. Purpose & scope
 
@@ -241,32 +242,181 @@ preferred for cap slots (see Open Questions).
 Stage 1: design sketch of `Cap<T, R>` in a design doc; no runtime.
 Stage 3: full cap table, derivation, revocation, ABI integration.
 
-## 8. Open questions
+## 8. Cross-boundary wire format
 
-- ~~**CDT vs. refcount+badges**~~ **Resolved (v0.2):** EROS-style epoch
-  revocation for authority, CDT-shape tree for audit and subtree-scoped
-  mass revoke. The epoch is the hot-path check; the CDT only participates
-  in explicit `revoke_subtree` operations.
-- ~~64-bit vs 128-bit cap slot layout~~ **Resolved (v0.2):** 128-bit slot
-  (generation + index + rights + type_tag), updated via CMPXCHG16B on
-  x86_64 and LDXP/STXP on aarch64. The LDXP/STXP sequence is
-  load-linked/store-conditional, not a true CAS — revoke logic must
-  retry on spurious failure.
-- Cross-task transfer semantics — explicit `grant` cap only, or any cap
-  with Grant right?
-- **Per-object epoch storage.** Where does the `u32` object epoch
-  live — alongside the object, or in a dedicated epoch table in
-  `DOMAIN_CAPS`? In-object is faster (one cache line for the access
-  check); separate table is cleaner for revoke auditability.
-- **DOMAIN_CAPS == DOMAIN_KERNEL?** If they are the same domain,
-  cap-table isolation provides no additional protection. If they are
-  distinct, every syscall entry must domain-switch twice. Likely
-  answer: distinct; budget the double switch.
-- **`FileNode` vs `NodeRef` naming.** `filesystem/` §3 declares
-  `pub type FileCap = Cap<NodeRef, FileRights>` — the Rust-level
-  type is `NodeRef`, but the manifest-level `CapKind::FileNode`
-  names the same object (with `DirNode`/`Symlink` distinguished
-  by rights flavour). Decide whether to rename the Rust type to
-  `FileNode` for consistency, or note `NodeRef` as the Rust-side
-  name and keep `FileNode` as the wire label. Leaning toward the
-  rename; blocked on `filesystem/` spec review.
+When a `CapSlot` crosses a kernel boundary — a syscall argument,
+an IPC payload, an audit log entry — it serialises to a fixed
+16-byte little-endian record. This is the only legal external
+representation of a cap.
+
+```text
++0  generation : u32  LE      // slot.generation snapshot
++4  index      : u32  LE      // slot.index
++8  rights     : u32  LE      // slot.rights
++12 type_tag   : u32  LE      // slot.type_tag (CapKind as u32)
+```
+
+The wire format is **frozen as of v1.0**. Adding fields requires
+a major-version bump of the cap ABI (`CAP_ABI_MAJOR`, exported
+to `abi/` and `userspace/`), not a renumber. Receivers that don't
+recognise a future-version cap reject it with `CapError::WireVersionTooNew`.
+
+A cap arriving over the wire is **always** revalidated by:
+1. `type_tag` lookup against the kernel's `CapKind` registry;
+   unknown → `Err(TypeMismatch)`.
+2. Per-task cap-table lookup at `index`; out-of-range or empty →
+   `Err(Revoked)`.
+3. `generation` compared to object epoch; older →
+   `Err(Revoked)`.
+4. `rights` AND-checked against required rights for the
+   operation; insufficient → `Err(RightsTooWeak)`.
+5. Domain-tag match between the requested operation's required
+   domain and the calling task's active domain →
+   `Err(DomainMismatch)` if mismatched.
+
+All five steps are mandatory; skipping any is a soundness bug.
+
+## 9. Resolved decisions
+
+### 9.1 Cross-task transfer
+
+**Decision:** any cap with `Grant` right may be transferred to
+another task via the `Endpoint` IPC primitive (`CapKind::Endpoint`,
+in `ipc/`). There is no separate "transferable" cap kind; the
+`Grant` rights bit is the gate.
+
+The receiving task gets a fresh slot in *its* cap table referring
+to the same underlying object (same `index`, same `generation`).
+The sending task either retains its own slot (the cap is
+essentially shared) or revokes it explicitly (`Cap::revoke()`
+on the sender side bumps the object epoch — affecting all
+holders, including the receiver). The framework does not
+distinguish "move" from "copy"; both are explicit operations
+on the sender.
+
+### 9.2 Per-object epoch storage
+
+**Decision:** epoch lives **in-object**, in a fixed-position
+header word added to the kernel-side struct. Concretely, every
+type that implements `CapType` must include:
+
+```rust
+#[repr(C)]
+pub struct CapHeader {
+    pub epoch:    AtomicU32,
+    pub kind_tag: u32,      // matches CapKind::KIND, for double-check
+}
+```
+
+as the first 8 bytes of its struct. The `cap_invoke!` macro
+generated by the `CapType` derive writes the field at the right
+offset on object construction. Hot-path `invoke()` reads
+`(*ptr).epoch.load(Acquire)` — one cache line, no indirection.
+
+A separate audit-only epoch table is **not** maintained; if
+audit needs to know "what was the previous epoch", it can
+inspect the panic / revoke event log. Saves a domain hop and
+the per-revoke double write.
+
+### 9.3 `DOMAIN_CAPS` vs `DOMAIN_FRAME`
+
+**Decision:** `DOMAIN_CAPS` (slot 1) is **distinct from**
+`DOMAIN_FRAME` (slot 0). Cap-table reads/writes go through a
+`enter_domain(DomainId::CAPS)` switch. The double switch on
+syscall entry (FRAME → CAPS → caller-domain) is budgeted at
+~50 cycles per syscall on contemporary x86_64 silicon — a real
+cost but the isolation is load-bearing for the security model
+(`security-model/` §4.1).
+
+`enter_domain` is hand-rolled inline asm: `WRMSR(IA32_PKRS,
+new_pkrs)` on x86_64, `MSR(SCTLR_EL1.TCF, new_tcf)` +
+`MSR(GCR_EL1, new_gcr)` on aarch64. Inlined at every syscall
+boundary; not a function call.
+
+### 9.4 `FileNode` vs `NodeRef`
+
+**Decision:** the Rust-level type is renamed to `FileNode`
+(matching `CapKind::FileNode`). `NodeRef` is removed. The
+filesystem spec is being updated in lockstep; this is a Stage 3
+PR that touches `filesystem/`, `vfs/`, and the few callers in
+`userspace/`.
+
+`DirNode` is a distinct Rust type (also matching
+`CapKind::DirNode`); the rights bitset on a `Cap<FileNode,_>`
+or `Cap<DirNode,_>` distinguishes regular file / directory /
+symlink semantics. Symlinks are `FileNode` with the `SYMLINK`
+right tag, not a separate type — there are too few semantic
+differences to justify a third type.
+
+### 9.5 Revocation propagation guarantee
+
+**Decision:** epoch bump is **immediately visible to all CPUs**
+modulo the AtomicU32 release-acquire ordering. There is no
+TLB-shootdown analogue; cap checks read the epoch atomically
+and observe the new value within a few cycles (cache-line
+invalidate latency).
+
+**Edge case:** an in-flight `invoke()` that already loaded the
+old epoch and is about to dereference completes with the old
+authority. This is the same race as a userspace process
+unmapping a page after another thread has loaded its address
+into a register; the kernel does not promise serialisation
+beyond the atomic load. Callers requiring strict revocation
+(e.g. an emergency revoke for a compromised driver) must
+also call `Driver::reset()` on the affected instance to halt
+in-flight operations — same protocol the loader uses on unload
+(`drivers/spec` §7.3).
+
+### 9.6 Subtree revocation
+
+**Decision:** the CDT (capability derivation tree) is preserved
+per-object as a compact arena of `(parent_slot, child_slot)`
+pairs allocated alongside cap-table rows. `Cap::revoke_subtree(self)`
+walks the tree depth-first and bumps the **per-object** epoch
+once at the end — not once per descendant. The tree exists
+purely so audit logs and the `revoke_subtree` operation can
+identify which derived caps were affected; it is **never** on
+the hot path.
+
+CDT memory is bounded: each cap derivation adds one
+`(u32 parent, u32 child)` pair; a cap with N derivations costs
+8 × N bytes. The arena is in `DOMAIN_CAPS`. Revocation of the
+entire object frees the arena O(1).
+
+### 9.7 Cap-table sizing
+
+**Decision:** per-task cap tables are **growable, paged**, with
+a starting size of one 4 KiB page (256 slots). Growth doubles
+the table up to a per-task hard cap of 2 MiB (131072 slots).
+Insertion past the cap returns `Err(CapTableFull)`.
+
+The hard cap is a sanity bound; tasks legitimately needing more
+caps should be split into multiple tasks. Trying to enlarge
+past the cap is a strong signal of a leak.
+
+The first 16 slots of every task's table are **reserved** for
+bootstrap caps installed by the kernel at task creation
+(boot-time process holds `Cap<RootAuthority, Grant>` at slot 0,
+etc.). Slot 0 in any cap table that doesn't have a
+RootAuthority is the well-known sentinel "null cap" — `invoke`
+on it returns `Err(Revoked)` deterministically.
+
+## 10. ABI versioning
+
+`CAP_ABI_MAJOR = 1`, `CAP_ABI_MINOR = 0` exported via the
+`narf-driver-sdk` re-export and consumed by the loader's
+ABI-check (`drivers/spec` §4.3).
+
+Bumping `CAP_ABI_MAJOR` (which would change the wire format
+in §8 or rename a `CapKind` integer) is a flag-day reboot;
+all drivers and userspace need recompilation. Such bumps are
+governed by `process/` Interface-class review.
+
+Bumping `CAP_ABI_MINOR` is additive — new `CapKind` values,
+new rights bits, new operations. Existing wire-format records
+still decode correctly. Old binaries see new minor as
+backward-compatible.
+
+## 11. Open questions
+
+(none — all v0.2 questions resolved in §9)

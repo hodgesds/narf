@@ -1,6 +1,10 @@
 # bus — Specification
 
-> Status: **Outline v0.1** (Stage 2 → 3).
+> Status: **v1.0** (Stage 3 design lock). v0.1 covered
+> enumeration + claim; v1.0 locks the `Cap<BusDevice, _>` mint
+> protocol the drivers framework relies on, the match-table
+> dispatcher contract, the hot-plug event API, per-driver IOMMU
+> group binding, and ABI versioning.
 
 ## 1. Purpose & scope
 
@@ -188,12 +192,158 @@ Hot-plug paths:
   questions. Platforms that require AML for basic device discovery
   (some pre-2018 desktop boards, certain embedded ACPI-on-aarch64
   systems) are unsupported in Stage 1–4.
-- **Config-space access from drivers.** A driver legitimately needs
-  to read/write its own config space (MSI-X capability, PCIe
-  capability registers). Mediate through `bus/`, or hand the driver
-  a direct-mapped cap? Leaning: mediate for writes to
-  security-sensitive fields (ACS, ATS), direct for others.
-- **NUMA discovery.** Driven from ACPI SRAT / `numa-node-id` in DT.
-  Who owns the parsing — `bus/` or `memory/`?
-- **Legacy PCI (pre-PCIe) and legacy IRQ.** Support needed for some
-  embedded targets; deferred to Stage 4.
+
+## 9. Match-table dispatcher
+
+The dispatcher is the single point that binds a `BusDevice` to
+a driver. Static-linked and dynamically-loaded drivers feed
+into the same table.
+
+### 9.1 Match entry types
+
+```rust
+pub enum MatchEntry {
+    Pcie       { vendor: u16, device: u16, class: Option<u32> },
+    VirtioMmio { device_id: u32 },
+    AcpiHid    { hid: &'static str },
+    DtCompat   { compat: &'static str },
+    Catchall,                       // explicit "I'll match anything"
+}
+```
+
+### 9.2 Specificity ordering
+
+When multiple registrations could match a given device:
+
+1. **Specificity**: `(vendor, device, class)` > `(vendor,
+   device)` > `(vendor)` > `Catchall`. Class-only matches
+   slot between vendor+device and vendor-only.
+2. **Driver version** (newer wins) — supports live upgrade
+   per `drivers/spec` §17.7.
+3. **SDK minor** (newer wins) — when two driver versions are
+   tied, prefer the build against a newer SDK.
+4. **Registration order** (earlier wins) — final
+   deterministic tie-break.
+
+The dispatcher maintains the table in specificity order; lookup
+is linear in the number of entries matching the device's bus
+type. With hundreds of drivers this is still microseconds; the
+table can be promoted to a hash on (vendor, device) if it
+becomes hot.
+
+### 9.3 Probe outcomes
+
+After mint + `Driver::probe(env)`:
+
+- `Ok(())`: binding committed; device removed from candidate
+  list. Match dispatcher records `instance_id`.
+- `Err(NotForMe)`: this driver declines (e.g. virtio-blk
+  driver inspecting the device's `device_id` register and
+  finding it's not actually blk despite the PCI ID match).
+  Caps minted for probing are revoked; device returns to
+  candidate list, next-most-specific match attempted.
+- `Err(other)`: driver bound but failed init. Device is left
+  in `FailedBind` state; tracing event emitted; no further
+  match attempts (would-be infinite-loop on broken devices).
+
+### 9.4 Hot-plug retroactive matching
+
+When a driver registers (statically at boot or dynamically at
+load), the dispatcher walks the existing device registry and
+attempts probing for any device that previously had no match.
+This is what lets a module load late and pick up its devices.
+
+## 10. `Cap<BusDevice, _>` mint protocol
+
+Resource bundle minted at probe binding (`drivers/spec` §7.2
+step 6), every cap badged with the bound `instance_id`:
+
+| Cap                        | Rights granted | Purpose                       |
+| -------------------------- | -------------- | ----------------------------- |
+| `Cap<BusDevice, Read>`     | config-space read, BAR map | Driver discovers device      |
+| `Cap<BusDevice, Write>`    | + config-space write       | Capability programming, MSI-X enable |
+| `Cap<BusDevice, Dma>`      | + DMA bus mastering        | Allocate `Cap<DmaBuffer,_>`  |
+| `Cap<BusDevice, P2pDma>`   | + P2P DMA across bridges   | Only granted if ACS clean     |
+| `Cap<MsiXTable, Write>`    | program MSI-X table        | Required for `enable_msix`    |
+| `Cap<IrqVector, Read>`     | call `wait_for_irq`        | Per-vector after `enable_msix` allocates |
+| `Cap<IommuContext, Read>`  | per-driver IOMMU domain    | Bound by `io/` for DMA        |
+
+Rights are additive (each subsumes the prior). A driver that
+only needs read access to config space (a passive enumerator)
+gets `Cap<BusDevice, Read>` and can derive nothing further.
+
+The cap bundle is **non-transferable** between driver
+instances (`capabilities/spec` §8) — instance A cannot pass
+its `Cap<BusDevice, _>` to instance B even within the same
+driver crate.
+
+## 11. Resolved decisions
+
+### 11.1 Config-space access policy (resolved)
+
+**Decision (was open):** the driver gets a direct-mapped cap
+to **its own** config space (the 4 KiB ECAM page); read/write
+go through MMIO accessors that route through the cap's badge
+check (`Cap<BusDevice, Write>` → can write).
+
+Two security-sensitive fields are **redirected through `bus/`**
+even with `Write` rights:
+
+- **ACS bits** (Access Control Services) — flipping ACS could
+  enable peer-to-peer DMA bypassing the IOMMU. Only `bus/` may
+  modify; drivers that need ACS reconfiguration request it via
+  `Cap<BusDevice, BusReconfigureAcs>` (a privileged cap held
+  only by the bus admin process).
+- **ATS enable bit** — modified only via the `enable_ats` op
+  in `io/spec` §9.1, which validates IOMMU readiness.
+
+Other config-space writes (vendor-specific registers,
+device-specific capabilities) are direct: drivers know best
+how to drive their own devices.
+
+### 11.2 NUMA discovery ownership (resolved)
+
+**Decision (was open):** **`bus/` parses NUMA**, not `memory/`.
+ACPI SRAT and DT `numa-node-id` are device-topology tables; they
+fit naturally with the rest of bus enumeration. `memory/`
+consumes the parsed `NumaNodeId` per page-frame allocation but
+doesn't own the source-of-truth.
+
+`bus/` exports `cpu_node(cpu_id)` and the per-`BusDevice`
+`numa: Option<NumaNodeId>` field. `memory/` and `io/` consume
+both. `scheduler/` consumes `cpu_node` for stealing locality.
+
+### 11.3 Legacy PCI / legacy IRQ (resolved)
+
+**Decision (was open):** **deferred to a separate
+`drivers/legacy-pci` crate at Stage 5+**. Stage 1–4 supports
+PCIe-only and PCIe-presented-as-PCI (QEMU q35, modern hardware
+with legacy compatibility modes). True legacy PCI (no ECAM,
+8259 PIC, IDE/UHCI controllers) is not in the critical path
+for hundreds-of-drivers scaling; it's a niche per-platform
+thing.
+
+The legacy support, when it lands, is a separate driver crate
+that registers its own match table for vendor IDs known only
+in legacy form. The framework doesn't need awareness; the
+crate does its own probing and capability minting using the
+same cap kinds.
+
+## 12. ABI versioning
+
+`bus/` exports tagged at `@v0`:
+
+- `MatchEntry` enum layout — frozen at v1.0.
+- `BusDevice` struct field set — additions are minor bumps.
+- `BusEvent` variants for hot-plug — adding variants is a
+  minor bump (callers must use exhaustive match with a
+  fall-through `_ => {}` arm; the SDK's exported enum is
+  `#[non_exhaustive]`).
+- Cap badge layout — part of cap-ABI, follows
+  `CAP_ABI_MAJOR`.
+
+Currently `BUS_ABI_MAJOR = 1`, `BUS_ABI_MINOR = 0`.
+
+## 13. Open questions
+
+(none — all v0.1 questions resolved in §11)

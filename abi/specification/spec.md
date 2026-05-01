@@ -1,8 +1,9 @@
 # abi — Specification
 
-> Status: **Outline v0.2** (Stage 3). v0.2 codifies the uniform
-> cancellation protocol that every subsystem crossing this boundary
-> must follow — the single most common UAF source in async kernels.
+> Status: **v1.0** (Stage 3 design lock). v0.2's cancellation
+> protocol carries forward; v1.0 locks the per-op versioning
+> policy, the bootstrap negotiation contract, the ring header
+> layout, and the syscall-vs-ring partition.
 
 ## 1. Purpose & scope
 
@@ -210,17 +211,119 @@ does expensive work MUST be cancellable within O(ms).
 
 Stage 3.
 
-## 8. Open questions
+## 8. Versioning
 
-- Submission-ring back-pressure: block task, drop with error, or spill to
-  a per-task overflow queue?
-- How many capability slots per submission entry — fixed 4, variable?
-- Do we version each op independently or the whole ABI as a unit?
-- ~~PLT-hook-style capability checks at call sites~~ **Resolved
-  (v0.2): PLT-hook checks live in *userspace*, not in the kernel
-  ABI.** The kernel ABI verifies cap validity at ring-drain time
-  (the only authoritative point). PLT hooks are an optional
-  userspace optimisation that can short-circuit a syscall if the
-  local cap-table cache says the cap is invalid. Putting them in
-  the kernel grows the TCB; leaving them as a userspace convention
-  keeps them auditable and per-process-tunable.
+The ABI version is a single `u32` partitioned identically to the
+syscall versioning scheme in `userspace/syscall.rs`:
+
+```text
+bits 31..24  abi_major     (breaking)
+bits 23..16  abi_minor     (additive)
+bits 15.. 0  abi_patch     (clarifications, doc-only)
+```
+
+Currently `abi_version = 0x01_00_0000` (1.0.0).
+
+### 8.1 Per-op versioning
+
+`OpCode` is a `u32`. The ABI uses the same versioning trick as
+syscalls: the high 8 bits encode the op-version, the low 24 bits
+encode the canonical op number. A user task that knows nothing
+about versions submits `(0, opcode)` (v0); the kernel routes to
+the v0 handler. New behaviour ships as v1 alongside v0; v0 is
+retained indefinitely.
+
+```rust
+pub const OP_VERSION_SHIFT: u32 = 24;
+pub const OP_VERSION_MASK:  u32 = 0xFF00_0000;
+pub const OP_NUMBER_MASK:   u32 = 0x00FF_FFFF;
+```
+
+This **mirrors `userspace/syscall.rs`'s `SYS_VERSION_SHIFT` byte-
+for-byte** so userspace runtime can reuse one helper across both
+surfaces.
+
+### 8.2 Bootstrap negotiation
+
+`BootstrapRequest::min_abi` and `max_abi` are inclusive bounds
+of full ABI versions (`(major, minor, patch)` packed). Kernel
+selects:
+
+```text
+chosen_major = clamp(caller_max_major, kernel_min_major, kernel_max_major)
+              ↳ if no overlap → BootstrapError::AbiMismatch
+chosen_minor = min(caller_max_minor on chosen_major, kernel_max_minor on chosen_major)
+chosen_patch = kernel's current patch on (chosen_major, chosen_minor)
+```
+
+The kernel exports `kernel_min_major` and `kernel_max_major` as
+constants; in v1.0 both are `1`. Bumping `kernel_min_major` is
+the breaking-change knob — older binaries are refused at
+bootstrap.
+
+### 8.3 SubmissionFlags / CompletionStatus
+
+Both bitfields have **reserved-must-be-zero** ranges. v1.0 uses:
+
+| Flags                 | Bit | Purpose                                |
+| --------------------- | --- | -------------------------------------- |
+| `CANCELLABLE`         | 0   | drop of handle issues `Cancel(tag)`    |
+| `LINKED`              | 1   | next entry is part of this chain       |
+| `DRAIN`               | 2   | wait for prior submissions to retire   |
+| `IO_FENCE`            | 3   | barrier vs all previously-submitted IO |
+| `RESERVED_MBZ`        | 4..63 | must be zero; non-zero → `Err(Reserved)` |
+
+Adding a flag occupies the next reserved bit, bumps `abi_minor`,
+and ships in v1.1. Old binaries that didn't know about the flag
+won't set it; kernel handlers ignore (zero) bits they don't know
+about.
+
+`NarfStatus` has the same shape: a `u32` opcode space with
+reserved-MBZ ranges; new statuses are minor bumps.
+
+### 8.4 Back-pressure (resolved)
+
+**Decision (was open):** `SQ full on submit` blocks the
+submitter via the executor's waker integration (waker fires when
+the consumer advances). For non-blocking callers, the
+`TrySubmission` API returns `Err(Full)` — same shape as Linux's
+`io_uring_enter` `EBUSY`.
+
+`CQ full on produce` sets an overflow flag in the ring header
+(see §4). Completions are queued on a per-task overflow list
+allocated lazily in `DOMAIN_USERSPACE_K`. Userspace clears the
+flag and re-drains; the overflow list is consumed FIFO into the
+CQ as space opens.
+
+**Why not drop:** completions carry capability-revocation acks
+and partial-write disclosures; dropping them is a soundness
+violation. The cost of an overflow list is bounded by the
+per-task budget cap (`scheduler/` §4.5).
+
+### 8.5 Caps per submission entry (resolved)
+
+**Decision (was open):** **fixed 4 slots** per submission entry.
+Operations needing more pass extra caps via an indirect entry
+(an inline cap-list buffer referenced by one of the four slots).
+Indirect cap lists cost an extra cap-table lookup but keep the
+hot-path entry size at 64 bytes (the natural cache-line size on
+x86_64 + aarch64).
+
+Operations needing fewer than 4 caps leave unused slots zero;
+the kernel skips zero slots in the cap-resolve loop.
+
+### 8.6 Per-op vs whole-ABI versioning (resolved)
+
+**Decision (was open):** **per-op** versioning (§8.1). Whole-ABI
+versioning (one major bump rebuilds everything) was rejected
+because hundreds of drivers each owning their own ops would
+make any breakage of one op force a global ABI bump — the
+opposite of what hundreds-of-drivers scaling needs.
+
+The whole-ABI version (§8.0 `abi_version`) is bumped only for
+**structural** changes (ring layout, bootstrap protocol, cap-
+slot wire format). Per-op evolution is the high-frequency path.
+
+## 9. Open questions
+
+(none — all v0.2 questions resolved in §8)
