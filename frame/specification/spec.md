@@ -1,7 +1,9 @@
 # frame — Specification
 
-> Status: **Outline v0.2** (Stage 1 → 2). v0.2 tightens `enter_domain`
-> re-entrancy and specifies PKRS save/restore on trap entry.
+> Status: **v1.0** (Stage 2 design lock). v0.2 tightened
+> `enter_domain` re-entrancy + trap PKRS save; v1.0 locks the
+> nested-exception policy, the per-CPU layout target, and the
+> time-of-day ownership boundary.
 
 ## 1. Purpose & scope
 
@@ -124,8 +126,97 @@ Rust function that forwards to `interrupts/` or handles synchronous faults.
 Stage 1 (boot, trap dispatch, panic). Stage 2 (domain enter/exit hooks
 once `memory/` has domains).
 
-## 8. Open questions
+## 8. Resolved decisions
 
-- Do we trust nested exceptions, or force serialisation?
-- Per-CPU `CpuLocal` size budget — we want it in one cache line if possible.
-- Does the Frame own time-of-day, or defer to a `time/` subsystem later?
+### 8.1 Nested-exception policy (resolved)
+
+**Decision (was open):** **serialise** nested exceptions
+explicitly via IST stacks (x86_64) and SP banking (aarch64).
+
+The kernel has IST entries for NMI, #DF, #MC, #VC (per §5);
+each gets its own 16 KiB stack. A nested exception arriving
+mid-handler does not push onto the interrupted handler's
+stack — it switches to the IST-assigned stack, preventing
+stack overflow if the handler itself faults.
+
+For non-IST exceptions (page fault, GP fault), the prologue
+runs with `IF=0` (interrupt gate) so external IRQs cannot
+nest. Synchronous faults nesting on synchronous faults
+(double fault) are caught by #DF on its own IST.
+
+aarch64 mirrors via SPSel=1 + separate vector groups for
+"current EL with SP_EL1" vs "from lower EL" — same effect:
+the handler context is segregated.
+
+### 8.2 Per-CPU layout budget (resolved)
+
+**Decision (was open):** **one cache line** for the hot fields,
+not the entire `CpuLocal`. The hot-path fields:
+
+```rust
+#[repr(C, align(64))]
+pub struct CpuLocalHot {
+    pub current_task:    AtomicU64,    // task id
+    pub current_domain:  DomainId,     // u8
+    pub flags:           u8,
+    pub padding:         [u8; 6],
+    pub kernel_stack:    *mut u8,
+    pub trap_frame_ptr:  *mut TrapFrame,
+    pub saved_user_gs:   u64,          // x86_64 only; aarch64 = 0
+    pub _reserved:       [u64; 3],
+}
+```
+
+Cold fields (per-CPU run queue head, debug counters, GDT
+pointer, IDT pointer) live elsewhere in the per-CPU page —
+referenced through the hot struct's pointers when needed.
+
+The 64-byte hot line is what `swapgs` / `TPIDR_EL1` points to
+on x86_64 / aarch64 respectively. Fits in a single cache fetch
+on every trap.
+
+### 8.3 Time-of-day ownership (resolved)
+
+**Decision (was open):** **`time/` owns time-of-day; `frame/`
+owns the per-CPU TSC/timer counter cache only.**
+
+`frame/` reads the raw counter (`RDTSC` / `CNTPCT_EL0`) for
+the trap-entry timestamp embedded in the trap frame; it does
+not convert to wall-clock. `time/` owns the wall-clock
+calibration, leap-smear, NTP sync, and all conversion
+arithmetic.
+
+This is the existing v0.2 boundary; v1.0 just locks it.
+
+### 8.4 Trap frame layout
+
+The trap frame is part of the kernel-side ABI between
+`frame/`'s asm prologue and `dispatch_trap` in Rust. Layout
+is fixed at v1.0 and any change is a major bump:
+
+```rust
+#[repr(C)]
+pub struct TrapFrame {
+    // GPRs (arch-specific layout — 16 on x86_64, 31 on aarch64)
+    pub gpr:       [u64; ARCH_GPR_COUNT],
+    // saved domain state (x86_64: PKRS; aarch64: TCF + GCR)
+    pub domain:    DomainSavedState,
+    // architectural fields
+    pub vector:    u64,            // IDT vector / exception class
+    pub err_code:  u64,            // page-fault error / FAR_EL1 /...
+    pub rip:       u64,            // saved RIP / ELR_EL1
+    pub cs_or_spsr:u64,            // saved CS / SPSR_EL1
+    pub rflags_:   u64,            // saved RFLAGS / 0 (aarch64)
+    pub rsp:       u64,            // saved RSP / SP_EL0
+    pub ss_or_zero:u64,            // saved SS / 0
+    pub timestamp: u64,            // RDTSC / CNTPCT_EL0 at entry
+}
+```
+
+Drivers do not see this struct (it's in `DOMAIN_FRAME`,
+TCB-only). Tracing / observability / panic-dump code that
+needs to inspect a trap frame holds `Cap<Diagnostics, Read>`.
+
+## 9. Open questions
+
+(none — all v0.2 questions resolved in §8)

@@ -1,6 +1,9 @@
 # time — Specification
 
-> Status: **Outline v0.1** (Stage 1 → 4).
+> Status: **v1.0** (Stage 4 design lock). v0.1 outlined the
+> wall-clock + monotonic surfaces; v1.0 locks the per-CPU
+> timekeeper snapshot, the non-invariant-TSC policy, per-domain
+> time semantics, leap-smear, and ABI versioning.
 
 ## 1. Purpose & scope
 
@@ -193,19 +196,102 @@ rating that's also monotonic. Record the decision for telemetry.
 | 3     | Per-task cap-gated timers, integration with `crypto/` reseed.    |
 | 4     | NTP/PTP userspace hooks, leap-second smear, wall-clock signing for audit trail. |
 
-## 8. Open questions
+## 8. Resolved decisions
 
-- **Coarse wall-time path.** Wall time derived on every call vs. a
-  maintained per-CPU `timekeeper` snapshot updated on tick. The
-  snapshot approach is cheaper; the per-call approach has no update
-  jitter. Decide with benchmarks.
-- **Counter frequencies that change under power management.**
-  Non-invariant TSC on older x86_64 silicon — refuse those CPUs, or
-  fall back to HPET?
-- **Per-domain time.** Should each driver domain see its own
-  monotonic clock (for deterministic replay) or share the global? Default: global.
-- **Time capability granularity.** Is "read monotonic" always allowed,
-  or do we gate even that? Leaning: universally allowed (reading time
-  leaks nothing).
-- **Leap-second policy.** Smear vs. step vs. repeat — smear is the
-  only one that preserves monotonic guarantees; ratify this.
+### 8.1 Per-CPU timekeeper snapshot (resolved)
+
+**Decision:** **per-CPU snapshot updated on each timer tick**,
+not per-call wall-clock derivation. Snapshot fields are
+{`tsc_at_tick`, `wall_at_tick`, `tsc_freq_hz`}. `wall_clock()`
+reads the snapshot, computes elapsed TSC since last tick,
+multiplies by frequency. Total cost: ~30 cycles + a single
+`RDTSC`.
+
+The per-call derivation alternative was rejected because the
+`RDTSC` overhead is identical but the conversion path adds
+~50 more cycles for floating-point or fixed-point scaling
+that snapshot pre-computes once per tick.
+
+The snapshot ages by at most one tick (~1 ms); applications
+needing sub-millisecond wall-clock precision should poll
+`monotonic_ns()` and convert offline against the
+boot-time-anchored wall-clock base (exposed as
+`wall_clock_anchor()`).
+
+### 8.2 Non-invariant TSC fallback (resolved)
+
+**Decision:** **refuse to boot** on x86_64 silicon without
+invariant TSC. The kernel panics at the timer-init stage with
+a clear message ("CPU lacks invariant TSC; minimum required
+since Nehalem; replace hardware").
+
+HPET fallback was rejected because:
+- HPET is being deprecated by Intel.
+- HPET reads cost ~500 cycles each — 10× the invariant-TSC
+  path; entire scheduler hot path slows down.
+- aarch64's Generic Timer is always invariant; the asymmetry
+  would mean two scheduler hot paths.
+
+Pre-Nehalem x86_64 silicon (>15 years old) is the only
+hardware excluded; this is acceptable.
+
+### 8.3 Per-domain time (resolved)
+
+**Decision:** **shared global monotonic clock**. Per-domain
+monotonic clocks would help deterministic replay but at the
+cost of every cross-domain message carrying a clock
+translation. The complexity isn't worth it for v1.0.
+
+Replay-debugging future work: a `Cap<TimeReplay, _>` that
+gives a per-task virtualised clock for record-replay sessions.
+Out of scope for v1.0.
+
+### 8.4 Read-time capability (resolved)
+
+**Decision:** **`monotonic_ns()` and `wall_clock()` are
+universally callable**, no cap required. Reading time leaks
+nothing (timing channels exist regardless; access to the
+clock just makes them measurable, not exploitable).
+
+Capabilities apply to time *modification* — only
+`Cap<Time, Set>` may call `set_wall_clock` (held by the time
+daemon, NTP client, or boot-time clock setup).
+
+### 8.5 Leap-second policy (resolved)
+
+**Decision:** **leap smear over a 24-hour window**. When the
+NTP source signals an upcoming leap, the kernel adjusts the
+wall-clock-vs-monotonic offset gradually: 1 second is smeared
+across the 24 hours bracketing midnight UTC. Monotonic time
+is unaffected.
+
+Step adjustments and "repeat the second" alternatives were
+rejected because they break monotonicity assumptions in
+applications. Smearing matches Google's published policy
+(adopted across most cloud platforms) and keeps user-visible
+clocks monotonic.
+
+The smear is observable to applications: during the smear
+window, wall-clock progresses at 1.0000115 ×
+monotonic-rate. This is documented; applications that need
+strict UTC during a leap window read the leap-status flag
+and explicit-step internally if desired.
+
+## 9. ABI versioning
+
+`time/` exports through SDK at `@v0`:
+
+- `monotonic_ns()`, `monotonic_us()`, `monotonic_ms()`.
+- `wall_clock()` returning `WallClock { sec, nsec }`.
+- `Instant` / `Duration` types (Rust `core::time` re-exports
+  + `Instant` newtype around monotonic_ns).
+- Sleep primitives: `sleep_ns(ns).await`,
+  `sleep_until(deadline).await`.
+
+`TIME_ABI_MAJOR = 1`, `TIME_ABI_MINOR = 0`. New clock domains
+(per-process clocks for cgroup-style accounting) would be
+minor bumps.
+
+## 10. Open questions
+
+(none — all v0.1 questions resolved in §8)

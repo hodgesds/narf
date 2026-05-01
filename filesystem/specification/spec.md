@@ -1,6 +1,10 @@
 # filesystem — Specification
 
-> Status: **Outline v0.1** (Stage 3 → 4).
+> Status: **v1.0** (Stage 4 design lock). v0.1 outlined the
+> mount + node-cap surface; v1.0 locks the persistent-FS
+> first target, the POSIX-semantics scope, xattrs, directory
+> atomicity, encryption layer, and the system-caps tooling
+> filesystem.
 
 ## 1. Purpose & scope
 
@@ -185,22 +189,126 @@ Arch-neutral at the spec level. Two arch-touches:
 | 4     | virtiofs driver, simple persistent FS (candidate: a Rust-native fs — littlefs-ish or a NARF-specific design), unified page cache, rename/link, `crypto/` integrity option. |
 | post-1.0 | Copy-on-write filesystems, snapshots, quotas, ACL-like caps.      |
 
-## 8. Open questions
+## 8. Resolved decisions
 
-- **Persistent FS first target.** Port ext4? Adopt littlefs? Write
-  NARF-native? Each path has a multi-month budget; decide in Stage 3.
-- **POSIX semantics.** How close to POSIX file semantics does NARF
-  go by default? The cleaner cap-model is stricter than POSIX;
-  relibc compat shim emulates the rest in `userspace/`.
-- **Case sensitivity** — mandatory case-sensitive; compat filesystems
-  may fold, but core doesn't.
-- **Extended attributes / xattrs.** Useful for integrity tags; worth
-  the surface-area cost?
-- **Directory operations atomicity.** Rename across a crash — what's
-  the guarantee each FS driver provides, and does `filesystem/` core
-  enforce a baseline?
-- **Encryption layer placement.** In `filesystem/` (per-file,
-  per-dir), in `block/` (full-device), or both?
-- **No `/proc` / `/sys` replacement.** Confirmed; but is there a
-  thin "system caps" read-only filesystem for tooling discovery, or
-  do tools query `observability/` directly?
+### 8.1 Persistent FS first target (resolved)
+
+**Decision:** **NARF-native FS, "narffs"**, designed alongside
+the kernel. ext4 port and littlefs adoption were both
+considered; both are technically reasonable but neither
+matches NARF's invariants:
+
+- ext4 has too much POSIX legacy that doesn't fit the cap
+  model (UID/GID, perms bits semantics).
+- littlefs is great for embedded but lacks features needed
+  for general-purpose use (xattrs, large file support,
+  per-file encryption without bolt-ons).
+
+narffs is a copy-on-write FS with:
+- Per-file encryption built in (consumes
+  `Cap<Key<Aes256Gcm>, Use>` from `crypto/`).
+- xattrs as a first-class feature (no separate inode
+  walk).
+- Atomic rename via copy-on-write (every write is
+  on a fresh extent until commit).
+- B-tree-of-B-trees layout (Linux btrfs-shaped) for good
+  scaling.
+
+ext4 / FAT / NTFS support comes later as separate
+read-write driver crates implementing the same FS trait.
+
+### 8.2 POSIX semantics scope (resolved)
+
+**Decision:** **NARF-native cap-strict semantics by default;
+POSIX compat shim in `userspace/` for `relibc`**.
+
+Native API:
+- File access via `Cap<FileNode, Read | Write | Append>`.
+- No UID/GID — caps replace ambient identity.
+- No `seek` global state; reads/writes carry explicit
+  offset.
+- No symlink-following ambiguity; either `O_NOFOLLOW`-equivalent
+  or explicit `read_link` then re-resolve.
+
+POSIX compat in relibc emulates seek state, errno mapping,
+default symlink-follow. Programs that link `relibc` see
+POSIX-ish semantics; native programs see the cap-strict
+form.
+
+### 8.3 Case sensitivity (resolved)
+
+**Decision:** **mandatory case-sensitive at the FS core**.
+Compatibility filesystems (FAT, NTFS, HFS+) implement
+case-folding internally but expose case-sensitive comparison
+at the FS-trait boundary. Two files differing only in case
+are distinct files at the cap layer.
+
+### 8.4 xattrs (resolved)
+
+**Decision:** **xattrs are first-class**, used for:
+- Integrity tags (per-file content hash, signature).
+- Encryption metadata (key id, IV).
+- Per-file caps (audit info, compression hints).
+- `tracing/` correlation metadata.
+
+The `Cap<FileNode, _>` rights include
+`ReadXattr | WriteXattr` so xattrs can be access-controlled
+distinct from data. Reserved namespaces:
+
+- `narf.*` — NARF-internal, restricted.
+- `user.*` — application data, freely writable with
+  `Write` rights.
+- `security.*` — capability system, restricted.
+- `trusted.*` — equivalent to Linux; restricted to
+  privileged caps.
+
+### 8.5 Directory atomicity (resolved)
+
+**Decision:** **`filesystem/` core enforces atomic-rename
+contract**; FS drivers must provide it. Specifically:
+
+- `rename(old, new)` is atomic across crashes — either
+  succeeds entirely or leaves the FS as-if-unchanged.
+- Same for `link`, `unlink`, `mkdir`, `rmdir`.
+
+narffs achieves this via CoW + atomic root-pointer flip.
+ext4-port achieves it via journal. FAT achieves it via —
+well, FAT can't fully; the FAT driver explicitly declares
+`atomic_dir_ops = false` and the VFS rejects rename calls
+that would cross-device on a non-atomic FS.
+
+### 8.6 Encryption layer (resolved)
+
+**Decision:** **per-file in `filesystem/`** (see `block/spec`
+§8.4). Full-device encryption is a degenerate case of
+per-file with one key applied uniformly.
+
+### 8.7 System-caps tooling FS (resolved)
+
+**Decision:** **a thin read-only `capfs` mount at
+`/sys/narf/`** exposing the cap registry for tooling
+discovery.
+
+`/sys/narf/caps/<name>` returns the `CapKind` integer + the
+list of holders (process IDs). Read-only; intended for
+tooling like `narf-capdump` to enumerate the system without
+querying `observability/` directly.
+
+Mounted by default at boot; can be unmounted by privileged
+process if not needed (production hardening).
+
+## 9. ABI versioning
+
+`filesystem/` exports through SDK at `@v0`:
+
+- `Cap<FileNode, _>`, `Cap<DirNode, _>`, `Cap<MountPoint, _>`,
+  `Cap<FsInstance, _>` (driver-side).
+- `FileSystemOp` enum and result types.
+- xattr namespace allowlist (frozen at v1.0; new namespaces
+  are minor bumps).
+
+`FILESYSTEM_ABI_MAJOR = 1`, `FILESYSTEM_ABI_MINOR = 0`.
+
+## 10. Open questions
+
+(none — all v0.1 questions resolved in §8)

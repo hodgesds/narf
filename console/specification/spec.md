@@ -1,9 +1,8 @@
 # console — Specification
 
-> Status: **Outline v0.2** (Stage 1). v0.2 specifies the MMU-enable
-> handoff — the protocol that keeps the UART visible after `memory/`
-> takes the MMU live. Without this, every kernel silently went dark
-> the moment paging turned on.
+> Status: **v1.0** (Stage 1 design lock). v0.2 specified the
+> MMU-enable handoff; v1.0 locks the structured-log format,
+> virtio-console redirection, and ABI versioning.
 
 ## 1. Purpose & scope
 
@@ -109,8 +108,65 @@ goes silent at the worst possible moment.
 
 Stage 1.
 
-## 8. Open questions
+## 8. Resolved decisions
 
-- Structured log format: plain text + key=value, or JSON Lines, or binary
-  token stream for low-overhead.
-- Console redirection to virtio-console in Stage 3+.
+### 8.1 Structured log format (resolved)
+
+**Decision:** **plain text + key=value pairs** for the wire
+format; binary token stream is a separate fast-path for
+high-volume sources (`tracing/` consumes this directly).
+
+Plain-text format:
+
+```text
+TIMESTAMP_NS LEVEL DOMAIN COMPONENT: message {key1=val1 key2=val2}
+```
+
+- TIMESTAMP_NS is monotonic-ns at the log call site.
+- LEVEL is one of `TRACE|DEBUG|INFO|WARN|ERROR|CRITICAL`.
+- DOMAIN is the calling task's `DomainId`.
+- COMPONENT is the calling crate (`narf-drivers-virtio-blk`).
+- key=value pairs are space-separated, single-quoted on
+  embedded whitespace.
+
+Plain text was chosen over JSONL because:
+- Easier to grep / awk on serial-only systems.
+- Smaller overhead per line on the early-boot UART.
+- The kvp section captures structure adequately.
+
+Binary token stream is separate (`tracing/` ring buffers);
+console is the human-readable surface.
+
+### 8.2 virtio-console redirection (resolved)
+
+**Decision:** **mandatory in Stage 3** via the
+`Console::redirect_to_virtio` API.
+
+When `bus/` probes a virtio-console device, `console/`
+auto-redirects log output to it (in addition to the UART).
+The redirected output is the same plain-text format. This
+is what makes `cargo xtask run` show a clean kernel log
+without serial-port plumbing.
+
+The UART stays the primary; virtio-console is additive. If
+virtio-console becomes unavailable (device removed, host
+disconnect), log continues on UART without interruption.
+
+## 9. ABI versioning
+
+`console/` exports through SDK at `@v0`:
+
+- `Writer` impl of `core::fmt::Write` (drivers use
+  `writeln!(narf_console::Writer, ...)` for early-boot
+  diagnostics; production code uses `tracing/` instead).
+- The structured-log format above (parsers depend on this
+  layout being stable).
+
+`CONSOLE_ABI_MAJOR = 1`, `CONSOLE_ABI_MINOR = 0`. Adding a
+log level or kvp delimiter is a major bump (parsers break).
+Adding a new optional kvp on existing logs is freely allowed
+(parsers ignore unknown keys).
+
+## 10. Open questions
+
+(none — all v0.2 questions resolved in §8)

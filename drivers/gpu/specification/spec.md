@@ -1,6 +1,9 @@
 # drivers/gpu — Specification
 
-> Status: **Outline v0.1** (Stage 4, partial).
+> Status: **v1.0** (Stage 4 design lock). v0.1 outlined the
+> minimum-viable presentation surface; v1.0 locks the in-tree
+> vs userspace split, the minimum-viable terminal path, and
+> ABI versioning.
 
 ## 1. Purpose & scope
 
@@ -66,8 +69,72 @@ GPU (Intel iGFX or an AMD GPU whose docs are open).
 
 Stage 4, and may continue past Stage 4 into a post-1.0 milestone.
 
-## 8. Open questions
+## 8. Resolved decisions
 
-- How much of GPU does NARF need in-tree vs. delegated to a userspace
-  driver component? (Modern Linux pushes a lot to userspace.)
-- What's the minimum-viable presentation path for a terminal?
+### 8.1 In-tree vs. userspace split (resolved)
+
+**Decision:** **kernel owns mode-set + scanout + cursor;
+userspace owns everything else** (rendering, shader
+compilation, command submission, DRM-like compositing).
+
+In-tree (under `drivers/gpu/`):
+- `bochs-display` (linear FB; for QEMU emulation testing).
+- `virtio-gpu` 2D mode (linear FB through virtio commands).
+- Modesetting infrastructure for real PCIe display
+  controllers (Stage 5+).
+- `Cap<Scanout, Configure>` API gate for resolution + format.
+
+In userspace (Stage 5+):
+- 3D rendering driver (Mesa-equivalent).
+- Compositing surface manager (Wayland-equivalent).
+- Shader compilation.
+
+This mirrors modern Linux's split (`drm/i915` does
+modesetting in-kernel; Mesa does rendering in userspace).
+NARF's strict cap model means the userspace 3D driver runs
+in a sandboxed user-mode-domain with `Cap<BusDevice, Dma>`
+to its GPU; no kernel-side 3D code, no kernel-side shader
+compiler.
+
+### 8.2 Minimum-viable terminal path (resolved)
+
+**Decision:** **`graphics/console.rs` rendering 8x8 glyphs
+to a linear framebuffer**, driven by whichever in-tree
+driver probed (bochs-display preferred for x86_64 emulation,
+virtio-gpu for both arches, real GPUs Stage 5+).
+
+This is the same FB console already implemented in code
+(see `graphics/`). The MVP path is:
+
+1. Kernel boot → `bochs-display` or `virtio-gpu` probes.
+2. `graphics/` `splash::install_console` claims the
+   scanout via `Cap<Scanout, Configure>`, programs
+   1024×768 XRGB8888 (or device default).
+3. `console/` → `graphics/console.rs` renders each log line
+   as an 8x8-glyph row.
+
+Userspace processes that want pixels on screen open a
+scanout via `Cap<FbContext, Open>` (per `user-runtime/graphics.rs`)
+and submit DrawCmds through a per-process ring; the
+kernel-side drain task converts to FB writes.
+
+This is the testbin demo path (see `cargo xtask demo`) — it
+works today, locked at v1.0.
+
+## 9. ABI versioning
+
+`drivers/gpu/` exports through SDK at `@v0`:
+
+- `Cap<Scanout, _>` types (Read | Configure | Submit).
+- DrawCmd wire format (frozen at v1.0).
+- The 8x8 font glyph table — frozen so userspace renderers
+  can match.
+
+`GPU_DRIVER_ABI_MAJOR = 1`, `GPU_DRIVER_ABI_MINOR = 0`.
+
+Stage 5+: the 3D-render userspace API (Vulkan-shaped) is a
+separate spec, layered above the v1 mode-set surface.
+
+## 10. Open questions
+
+(none — all v0.1 questions resolved in §8)

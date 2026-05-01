@@ -1,6 +1,9 @@
 # drivers/nvme — Specification
 
-> Status: **Outline v0.1** (Stage 4).
+> Status: **v1.0** (Stage 4 design lock). v0.1 outlined the
+> queue-pair model + identify flow; v1.0 locks the
+> multi-queue policy, the CMB/HMB scope, and the data-protection
+> posture.
 
 ## 1. Purpose & scope
 
@@ -59,8 +62,69 @@ multipath / fabrics (defer).
 
 Stage 4.
 
-## 8. Open questions
+## 8. Resolved decisions
 
-- Multi-queue policy: one I/O queue per CPU, or per-domain?
-- CMB / HMB usage — Stage 4 worth it?
-- End-to-end data protection (DIF/DIX) — Stage 4 scope or later?
+### 8.1 Multi-queue policy (resolved)
+
+**Decision:** **one I/O queue per CPU**, capped at the
+device's `MaxQueueCount`. The driver creates queues at
+bring-up sized to `min(cpu_count, max_q_count_supported)`.
+Each queue is bound to a specific CPU's APIC ID for MSI-X
+delivery.
+
+Per-domain queues were considered but rejected: domains
+multiplex onto CPUs (per `memory/spec` §8.1), so a
+per-CPU queue serves all the domains running on that CPU
+without per-domain bookkeeping.
+
+I/O submissions choose a queue based on the submitting
+task's CPU affinity. Cross-CPU queue submissions are
+permitted (with the obvious cache-locality cost).
+
+### 8.2 CMB / HMB (resolved)
+
+**Decision:** **out of scope for v1.0**.
+
+CMB (Controller Memory Buffer): only useful for P2P DMA
+between NVMe and other devices (e.g. RDMA NIC writing
+directly into NVMe's SQ); requires `Cap<BusDevice, P2pDma>`
++ ACS-clean topology. Defer to Stage 5+ when there's a
+concrete consumer.
+
+HMB (Host Memory Buffer): primarily a power-savings
+feature for consumer-class NVMe drives. Out of scope until
+a workload makes it worth the implementation cost.
+
+The driver advertises support flags for both via its
+`IfaceStats`, so a future consumer can detect availability
+without the driver code growing.
+
+### 8.3 End-to-end data protection (resolved)
+
+**Decision:** **DIF/DIX integration in Stage 5+**, not v1.0.
+
+v1.0 NVMe driver does not negotiate DIF/DIX. The protection
+information feature is unused; metadata fields are zero.
+
+When `block/spec` §8.4's encryption-at-rest layer matures,
+DIF/DIX becomes interesting (per-block integrity tags
+that the device verifies). At that point the driver gains
+a `Cap<NamespaceProtection, _>` cap, enabled per-namespace.
+
+For v1.0, NVMe relies on the device's internal ECC for
+end-to-end data integrity; software adds no further
+protection.
+
+## 9. ABI versioning
+
+`narf-drivers-nvme` exports its `Controller` type opaquely
+through the block-device adapter (`NvmeBlockSync` /
+`NvmeBlockAsync`) which implement `BlockDeviceSync` /
+`BlockDeviceAsync` from `block/spec` §9. There is no
+NVMe-specific public API beyond that.
+
+`NVME_DRIVER_ABI_MAJOR = 1`, `NVME_DRIVER_ABI_MINOR = 0`.
+
+## 10. Open questions
+
+(none — all v0.1 questions resolved in §8)

@@ -1,6 +1,10 @@
 # tracing — Specification
 
-> Status: **Outline v0.1** (Stage 1 → 4).
+> Status: **v1.0** (Stage 4 design lock). v0.1 outlined the
+> per-domain ring model + USDT/probe semantics; v1.0 locks
+> the histogram sketch (HdrHistogram), the snapshot policy,
+> the USDT format, the BPF-free aggregation gate, and the
+> audit-trail integration.
 
 ## 1. Purpose & scope
 
@@ -344,26 +348,145 @@ the tracer (centralised cross-domain view). `FnProfileSnapshot` in
 | 3     | Dynamic probes (entry/return/at); `FnTime`; Welford/tDigest aggregates; per-probe `FnProfileSnapshot`. |
 | 4     | HW trace integration (Intel PT / CoreSight ETM); richer probe actions (causal delay, aggregation); userspace tracer tooling. |
 
-## 8. Open questions
+## 8. Resolved decisions
 
-- **Aggregate sketch choice.** tDigest vs. HdrHistogram vs. KLL —
-  measure memory and error on typical NARF latency shapes before locking.
-- **Per-CPU vs per-domain for streaming rings.** Per-CPU is fastest;
-  per-domain composes with caps. §3.4 defaults per-domain; revisit
-  under measurement.
-- **Snapshot atomicity at scale.** Snapshotting 16 recorder rings of
-  64 KiB each under a panic path — is 1 ms acceptable, or do we need
-  a pre-reserved double buffer everywhere?
-- **USDT arg spec format.** Mimic DTrace's register-spec string (tool
-  compatibility) vs. NARF-native typed format (cleaner).
-- **Shiva-style PLT-hook arming for userspace targets.** For Stage 4
-  user-space tracing, arming a USDT in a process = resolving its PLT
-  slot and redirecting; doubles as the capability-check stub in `abi/`.
-- **HW trace exposure.** Intel PT / CoreSight ETM behind a dedicated
-  `Cap<HwTrace, _>` — not folded into the generic Probe cap.
-- **BPF-free declarative aggregation.** A probe action that histograms
-  an argument value without streaming would be very cheap and very
-  useful; define a safe subset that isn't a slippery slope to a VM.
-- **Relationship with `process/` §6 audit trail.** Can the tracer
-  record AI-agent actions as a first-class event stream for the audit
-  log, or is that kept separate for tamper-evidence?
+### 8.1 Histogram sketch (resolved)
+
+**Decision:** **HdrHistogram**. Bounded relative-error
+guarantee (default 2 significant figures), tiny memory
+footprint at high range (~3 KB for 0-1ms with 2 sigfigs),
+and well-understood merge semantics across CPUs / domains.
+
+tDigest and KLL were evaluated:
+- tDigest: better tail accuracy but variable memory + harder
+  to reason about merge correctness in adversarial inputs.
+- KLL: cleaner theory but ~5× HdrHistogram memory at our
+  precision.
+
+HdrHistogram's bounded-error model is what `verification/`'s
+statistical-protocol regression analysis depends on; lock it
+in.
+
+### 8.2 Per-CPU vs per-domain rings (resolved)
+
+**Decision:** **per-domain rings as primary; per-CPU rings
+when bypassing tracing infrastructure**.
+
+Per-domain matches the cap model and lets a privileged
+observer subscribe to "all events from domain X" without
+walking N rings. The cost of cross-CPU writers contending on
+one ring is mitigated by per-CPU magazines that drain
+periodically into the per-domain ring.
+
+For high-frequency low-overhead tracing (function entry/exit
+profiling), per-CPU rings are still available; they bypass
+the per-domain stream and surface only via post-hoc merge.
+
+### 8.3 Snapshot atomicity (resolved)
+
+**Decision:** **pre-reserved double buffer for the panic
+path**. Each recorder maintains an "active" and "scratch"
+ring; on panic, the kernel atomically flips the active
+pointer and emits the prior-active ring as the panic dump.
+
+Cost: 2× memory per recorder. Benefit: snapshot is O(1)
+pointer flip, not a copy.
+
+For non-panic introspection (live debugger peek), readers
+acquire a per-ring `IrqSafeSpinLock` for the duration of the
+read — slow but bounded, doesn't perturb writer.
+
+### 8.4 USDT arg spec format (resolved)
+
+**Decision:** **NARF-native typed format with optional
+DTrace-string emit for tool compat**.
+
+Native format:
+```rust
+#[narf_tracing::usdt(provider = "blkdev", probe = "io_complete")]
+fn io_complete(latency_ns: u64, lba: u64, status: BlkStatus);
+```
+
+The macro emits both:
+- A typed Rust call site for in-tree consumers.
+- A DTrace-compatible string descriptor (`@1=u64; @2=u64; @3=u8`)
+  in the `.note.stapsdt` ELF section so existing tooling
+  (`bpftrace`, `dtrace`) can subscribe.
+
+This avoids forking the ecosystem while letting in-tree code
+consume the typed form.
+
+### 8.5 PLT-hook arming for userspace USDT (resolved)
+
+**Decision:** **shared with `userspace/` §8.4 PT_INTERP
+relocation engine**. The `narf-ld.so` interpreter exposes a
+USDT-arming hook that resolves the probe's PLT slot and
+redirects to a capability-check stub. This doubles as the
+capability-check infrastructure in `abi/` PLT hooks (already
+v0.2-resolved as userspace optimisation).
+
+One relocation engine, three callers (driver loader, dynamic
+linker, USDT armer).
+
+### 8.6 HW trace exposure (resolved)
+
+**Decision:** **`Cap<HwTrace, _>` separate from `Cap<Probe, _>`**,
+gated more tightly. HW trace (Intel PT, CoreSight ETM)
+provides instruction-level visibility that's qualitatively
+more sensitive than ordinary tracing. Different cap, different
+allowlist (typically held only by debug tools).
+
+Stage 4 lands the basic `Cap<HwTrace, _>` API; Stage 5 adds
+per-domain HW-trace filtering for cross-tenant safety.
+
+### 8.7 BPF-free declarative aggregation (resolved)
+
+**Decision:** **declarative aggregation via a tiny safe DSL**,
+not a VM.
+
+```rust
+#[narf_tracing::usdt(...)]
+#[narf_tracing::aggregate(latency_ns => histogram(2_sig_figs, max=1_000_000_000))]
+fn io_complete(latency_ns: u64, lba: u64);
+```
+
+The aggregate clause runs declaratively: every probe firing
+hits the histogram inline (HdrHistogram increment, ~30 cycles).
+No streaming, no BPF VM. The DSL accepts:
+
+- `histogram(N_sig_figs, max)` — HdrHistogram.
+- `count_by(field)` — counter per distinct value of `field`
+  (capped at K distinct values).
+- `sum(field)`, `mean(field)` — running statistics.
+
+Probes that need richer logic stream their events as before.
+This bounded DSL covers the 80% case without slippery-slope
+to a kernel BPF interpreter.
+
+### 8.8 Audit-trail integration (resolved)
+
+**Decision:** **`process/` audit-trail consumes a dedicated
+`Cap<TraceRing, AuditRead>` — same ring infrastructure,
+different cap rights**. AI-agent actions are written through
+the same probe API; the audit consumer reads with a
+tamper-evident replay log (signed entries, sequence numbers).
+
+This unifies the introspection surface. Tampering protection
+comes from the cap-revocation model (the audit ring is
+write-once-from-each-source) plus periodic crypto-signed
+snapshots taken by `process/`'s audit-snapshot daemon.
+
+## 9. ABI versioning
+
+`tracing/` exports through SDK at `@v0`:
+
+- `usdt!` and `probe!` macros.
+- `Cap<Probe, _>`, `Cap<TraceRing, _>`, `Cap<Recorder, _>`.
+- HdrHistogram primitive types.
+- Aggregate DSL above (frozen at v1.0 syntax).
+
+`TRACING_ABI_MAJOR = 1`, `TRACING_ABI_MINOR = 0`.
+
+## 10. Open questions
+
+(none — all v0.1 questions resolved in §8)

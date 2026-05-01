@@ -1,6 +1,10 @@
 # crypto — Specification
 
-> Status: **Outline v0.1** (Stage 1 → 4).
+> Status: **v1.0** (Stage 4 design lock). v0.1 outlined the
+> Cap<Key>-typed primitives + SecureRing direction; v1.0 locks
+> the in-kernel-vs-userspace split, the RustCrypto adoption
+> policy, the FIPS posture, the post-quantum migration path,
+> the TPM requirement, and ABI versioning.
 
 ## 1. Purpose & scope
 
@@ -260,26 +264,190 @@ All HW-accel paths are probed at init via `arch/` feature-detect.
 | 3     | Ed25519 sign, full key-mgmt cap surface, `SecureRing`, per-task RNGs. |
 | 4     | Measured-boot / TPM integration, post-quantum algorithm plan, FIPS-mode decision. |
 
-## 9. Open questions
+## 9. Resolved decisions
 
-- **In-kernel vs userspace crypto daemon.** Framekernel purity says
-  put non-hot-path crypto in a userspace domain; performance says
-  keep AEAD in-kernel for `SecureRing`. The current design keeps
-  both on the table: primitives live in the kernel behind a
-  `DomainId::CRYPTO` domain; a userspace daemon is free to own key
-  policy.
-- **RustCrypto vs. vetted-vendor.** Use `RustCrypto` traits and
-  selected implementations as the baseline; audit status per crate
-  (see summaries). Replace individual crates where we find gaps.
-- **FIPS mode.** Do we care pre-1.0? If yes, algorithm choice is
-  narrowed and power-on self-tests are mandatory.
-- **Post-quantum timeline.** ML-KEM + ML-DSA are the likely picks
-  once standards stabilise. Design cap types so swapping is a
-  type-level change.
-- **Side channels beyond timing.** Power / EM side channels are
-  out-of-scope for the kernel; we trust the platform. Document this
-  in `security-model/`.
-- **TPM requirement.** Mandate TPM 2.0 for Stage 4 measured boot, or
-  accept software attestation as a parallel path?
-- **AI-agent key custody.** Where do agent signing keys live, and who
-  holds the rotation authority? (Ties to `process/` §6.)
+### 9.1 In-kernel vs userspace crypto split (resolved)
+
+**Decision:** **primitives in-kernel; key policy in
+userspace daemon**.
+
+In-kernel (under `DomainId::KEYS`):
+- AEAD encrypt/decrypt for `SecureRing` (hot path).
+- HMAC / signature verify for module-load checks (hot path).
+- TLS-record encrypt/decrypt if a network driver wants
+  per-connection offload (hot path).
+
+In userspace:
+- Key generation (rare; crypto daemon).
+- Certificate validation chain (rare; PKI policy daemon).
+- Key rotation policy (declarative).
+
+The kernel exposes `Cap<Key, Use>` to drivers; the daemon
+exposes `Cap<KeyMgr, Mint>` to operators. Drivers never see
+key bytes; operations on `Cap<Key, Use>` apply the key inside
+`DomainId::KEYS` and return ciphertext / signatures only.
+
+### 9.2 RustCrypto adoption (resolved)
+
+**Decision:** **RustCrypto traits as the API baseline**, with
+hand-vetted implementations for the primitives the kernel
+depends on for security (AES-GCM, ChaCha20-Poly1305, SHA-256,
+SHA-3, BLAKE3, Ed25519, X25519, HKDF).
+
+Each adopted crate is pinned by audited commit hash in
+`crypto/Cargo.toml`. CI verifies the crates haven't
+unilaterally updated against the audit baseline.
+
+For algorithms outside this list (older / experimental),
+RustCrypto remains available but unaudited; drivers needing
+them mark `requires_unaudited_crypto = true` in their
+manifest and the cert chain must explicitly authorise.
+
+### 9.3 FIPS mode (resolved)
+
+**Decision:** **FIPS-compliance is a Stage 5+ effort**, not
+v1.0. Algorithm choice is FIPS-friendly (AES-GCM, SHA-2/3,
+ECDSA-P256, ECDH-P256, HMAC) so the eventual FIPS push is a
+mechanical exercise — power-on-self-test wrappers,
+boundary-defined cryptographic-module spec, validation
+submission. None of these changes the API.
+
+For now, the kernel runs in non-FIPS-mode permanently. Build
+flag `narf.crypto.fips_strict` is reserved for the future.
+
+### 9.4 Post-quantum from v1.0 (resolved)
+
+**Decision:** **NARF ships PQ algorithms as first-class
+primitives at v1.0**, not as a future migration. ML-KEM-768
+(FIPS 203) and ML-DSA-65 (FIPS 204) were finalised in August
+2024; the spec lifetimes (decades for stored secrets, years
+for signed code) make "ship classical, swap later" a
+foreseeable mistake.
+
+The default algorithm selections at v1.0:
+
+| Use                       | Classical (legacy peers) | PQ (default for new) | Hybrid (mixed-trust) |
+| ------------------------- | ------------------------ | -------------------- | -------------------- |
+| Module signature          | Ed25519                  | **ML-DSA-65**        | Ed25519 + ML-DSA-65  |
+| KEM (TLS, IPsec, SecureRing handshake) | X25519     | **ML-KEM-768**       | X25519 + ML-KEM-768  |
+| Long-term identity        | Ed25519                  | **ML-DSA-87**        | Ed25519 + ML-DSA-87  |
+| AEAD (per-record)         | AES-256-GCM / ChaCha20-Poly1305  | unchanged    | n/a (symmetric, PQ-safe with 256-bit keys) |
+| Hash                      | SHA-256 / SHA-3-256 / BLAKE3 | unchanged       | n/a (PQ-safe at ≥256-bit output) |
+
+**Hybrid mode** is the recommended default for cross-system
+communication during the migration window: combine a
+classical primitive with a PQ primitive so the connection is
+secure if **either** holds. NARF's `SecureRing` handshake
+(see `ipc/spec` §8.4 + `crypto/`'s ring spec) defaults to
+hybrid X25519+ML-KEM-768.
+
+For module signing, the kernel CA can issue **either** an
+Ed25519-only cert (legacy vendor compat) or an ML-DSA cert
+(post-quantum) or a dual-signed cert. The loader accepts any;
+the security policy declares which it requires (release
+builds require at least one PQ signature for code loaded
+after Stage 5).
+
+The type-parametric `Cap<Key<Alg>,_>` shape is the same as in
+the prior outline:
+
+```rust
+pub struct Key<Alg: KeyAlg>;
+
+pub trait KeyAlg: 'static {
+    const ID: AlgorithmId;
+    type Plaintext;
+    type Ciphertext;
+    const PQ_SECURE: bool;     // true for ML-KEM, ML-DSA, Hybrid wrappers
+}
+
+impl KeyAlg for Ed25519     { const PQ_SECURE: bool = false; ... }
+impl KeyAlg for MlDsa65     { const PQ_SECURE: bool = true; ... }
+impl KeyAlg for Hybrid<X25519, MlKem768>  { const PQ_SECURE: bool = true; ... }
+```
+
+The `PQ_SECURE` flag lets policy code reject PQ-insecure caps
+in security-sensitive contexts at compile time.
+
+**Implementation status** at v1.0: the audited
+implementations consumed are:
+
+- **ML-KEM**: the `pqcrypto-mlkem` reference impl, vendored +
+  audited at the FIPS 203 final draft commit.
+- **ML-DSA**: the `pqcrypto-mldsa` reference impl, similarly
+  vendored.
+- **Hybrid combiners**: implemented in-tree (~50 LoC each),
+  composing classical + PQ KEM outputs via HKDF-Expand.
+
+Both PQ libraries are larger than the classical equivalents
+(~100 KB code, vs ~10 KB for Ed25519). This is acceptable;
+the kernel image budget already accounts for it.
+
+**Performance** at v1.0 (Cascade Lake, KVM):
+- Ed25519 sign: ~50 µs; verify: ~150 µs.
+- ML-DSA-65 sign: ~250 µs; verify: ~110 µs.
+- X25519: ~25 µs; ML-KEM-768 encaps: ~80 µs / decaps: ~90 µs.
+
+PQ is slower per-op but acceptable for the use cases (module
+load is rare; SecureRing handshake is per-connection not
+per-message). Drivers that need crypto-agility on the data
+plane (e.g. encrypted swap) should batch operations to
+amortise.
+
+Stage 5+ may add ML-KEM-1024 / ML-DSA-87 for higher security
+levels; these are minor SDK bumps.
+
+### 9.5 Side channels (resolved)
+
+**Decision:** **timing channels mitigated, power/EM
+out-of-scope** (per `security-model/spec` §10.1). Constant-time
+implementations are mandated for all key-touching code (e.g.
+the AES round function uses table-free `vaes` instructions on
+x86_64; ChaCha20 is naturally constant-time).
+
+Power/EM side channels require physical-attack mitigations
+(masked AES variants, secure enclaves) that are platform-
+engineering, not kernel.
+
+### 9.6 TPM requirement (resolved)
+
+**Decision:** **TPM 2.0 required for release builds**, optional
+for dev/CI. See `boot/spec` §8.2 + `security-model/spec` §9.
+
+Without TPM, the kernel CA root key is stored unsealed; an
+attacker with kernel-image-write access could substitute a
+rogue CA. With TPM, the CA root is sealed against PCR 7+14;
+attackers must defeat both the boot chain and the TPM unseal.
+
+### 9.7 AI-agent key custody (resolved)
+
+**Decision:** **agent signing keys live under
+`Cap<KeyMgr, MintAgent>` held by `process/`'s build-pipeline
+process**, not in the running kernel. Agent commits are
+signed at PR merge time by the build pipeline, not by a key
+present at runtime.
+
+Rotation authority: the `process/` review board controls
+agent key rotation as a privileged operation requiring
+multi-party authorisation (per `process/` §6).
+
+This keeps the kernel's runtime trust surface small — no
+"AI-agent" key category exists at runtime; everything is
+either kernel CA, vendor cert, or device firmware.
+
+## 10. ABI versioning
+
+`crypto/` exports through SDK at `@v0`:
+
+- `Cap<Key<Alg>, _>` for each adopted algorithm.
+- AEAD encrypt/decrypt operations.
+- Signature verify operations.
+- `extend_pcr(pcr, data)` for measured-boot extension.
+
+`CRYPTO_ABI_MAJOR = 1`, `CRYPTO_ABI_MINOR = 0`. Adding a new
+algorithm (e.g. ML-KEM) is a minor bump. Removing or changing
+an algorithm's wire format is a major bump.
+
+## 11. Open questions
+
+(none — all v0.1 questions resolved in §9)

@@ -1,7 +1,10 @@
 # verification — Specification
 
-> Status: **Outline v0.2**. Statistical protocol is the v0.2 addition;
-> earlier sections remain outlines.
+> Status: **v1.0** (Stage 4 design lock). v0.2 added the
+> statistical regression protocol; v1.0 locks the
+> benchmark-runner hardware policy, the perf-record publication
+> stance, the PR-comment integration, and ABI versioning for
+> the harness consumers.
 
 ## 1. Purpose & scope
 
@@ -279,17 +282,106 @@ visible.
 - Stage 4: stress / soak suite, expanded fuzz targets, optional Kani
   proofs on cap-table core.
 
-## 14. Open questions
+## 14. Resolved decisions
 
-- Benchmark runner HW: cloud instances (cheap, variable) vs. bare-metal
-  boxes we rent (pricier, consistent).
-- How to integrate perf records into PR comments without spam.
-- When (if ever) to adopt a "frequentist + Bayesian" dual report on
-  regressions — Bayesian credible intervals can be easier to reason
-  about but adds machinery.
-- Whether to publish perf records publicly (transparency win, attack
-  surface for cherry-picking).
-- Integration with `observability/` — verification consumes trace /
-  perf-counter output from `observability/`, especially for performance
-  benchmarks. Keep instrumentation definitions there; keep statistical
-  analysis here.
+### 14.1 Benchmark runner hardware (resolved)
+
+**Decision:** **bare-metal rented boxes for perf-critical
+benchmarks; cloud instances for functional CI**.
+
+Two CI tiers:
+
+- **Functional CI** (every PR): GitHub-hosted runners under
+  KVM. Runs `cargo xtask test` on x86_64 + aarch64, all
+  smokes, basic correctness. Variable hardware OK because
+  results are pass/fail.
+- **Perf CI** (nightly + on `perf-test` PR label): rented
+  bare-metal (one Cascade Lake, one Ampere Altra, one
+  Sapphire Rapids). Runs the perf benchmark suite under the
+  statistical protocol; outputs comparison vs. last release.
+
+Bare-metal rental is ~$200/month per box at v1.0 vendors;
+the budget is committed.
+
+### 14.2 Perf record publication (resolved)
+
+**Decision:** **publish perf records publicly under
+`reports.narf.dev` (or analogue)**. Each release tag and each
+nightly emits a signed JSON-Lines file with: timestamp, git
+sha, hardware ID, benchmark name, p50/p95/p99 latency,
+throughput.
+
+Signing per `crypto/spec` §9 (kernel CA). Publication is
+write-once; historical records are immutable.
+
+The cherry-picking risk (an attacker exploits a transient
+regression to scare users) is mitigated by:
+- Statistical protocol (§v0.2) requires significance, not
+  single-data-point regressions.
+- Public records show the trend over time.
+- Each record is reproducible (we publish the test command).
+
+Net: transparency wins.
+
+### 14.3 PR-comment integration (resolved)
+
+**Decision:** **inline summary comment on PRs that touch
+performance-sensitive code paths**, with a "show details"
+link to the full perf-CI run.
+
+Heuristic for "performance-sensitive": touches files under
+`scheduler/`, `interrupts/`, `arch/`, `ipc/`, `io/`, or any
+driver's hot path. CI computes the touched-files set and
+gates whether to run perf-CI.
+
+Comments are minimal:
+- Headline change in p99 latency for relevant benchmarks.
+- "No statistically significant regression" when applicable.
+- Link to full report.
+
+No spam: PRs not touching perf-sensitive paths get no perf
+comment.
+
+### 14.4 Frequentist + Bayesian (resolved)
+
+**Decision:** **frequentist only at v1.0**, with Bayesian as
+a possible v1.x addition.
+
+Frequentist (current v0.2 protocol): Welch's t-test +
+Bonferroni for the multiple-benchmark family. Fast,
+well-understood, supports CI gates with clear false-positive
+rates.
+
+Bayesian credible intervals would be useful for long-term
+trend analysis but require more careful prior selection per
+benchmark. Defer until we have enough historical data to
+parameterise the priors.
+
+### 14.5 `observability/` integration (resolved)
+
+**Decision:** **verification consumes `tracing/` events for
+performance attribution, but the statistical analysis stays
+here**.
+
+The `tracing/` ring during a benchmark captures per-event
+timing breakdowns. `verification/`'s perf harness reads the
+ring at the end of the run, attributes time to subsystems,
+and includes the breakdown in the PR comment ("regression
+spent 80% in `narf-bus::probe_all_pci`").
+
+This makes perf regressions actionable: not just "slower"
+but "slower in this code path."
+
+## 15. ABI versioning
+
+`verification/`'s `kernel_test!` macro and `Cap<TestHarness, _>`
+are exported at `@v0` for in-tree test consumers. Out-of-tree
+verification consumers (e.g. CI scripts that consume
+`reports.narf.dev`) follow the JSON-Lines schema, frozen at
+v1.0.
+
+`VERIFICATION_ABI_MAJOR = 1`.
+
+## 16. Open questions
+
+(none — all v0.2 questions resolved in §14)

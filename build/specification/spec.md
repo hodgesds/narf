@@ -1,8 +1,10 @@
 # build — Specification
 
-> Status: **Outline v0.2** (Stage 1). v0.2 acknowledges that fat LTO
-> can legally reorder memory accesses across domain-switch intrinsics
-> and specifies the compiler-fence discipline that prevents it.
+> Status: **v1.0** (Stage 1 design lock). v0.2 specified the
+> compiler-fence discipline for LTO; v1.0 locks the toolchain
+> pinning policy, the linker selection, the
+> reorder-hazard audit gate, and the FDO/BOLT integration
+> path.
 
 ## 1. Purpose & scope
 
@@ -80,13 +82,99 @@ per arch, xtask commands (`run`, `test`, `qemu`, `image`), Global LTO config.
 
 Stage 1; extended each stage as new targets/tests appear.
 
-## 8. Open questions
+## 8. Resolved decisions
 
-- Should we pin a specific nightly, or track a rolling pin?
-- `cargo-binutils` vs. `llvm-tools-preview` vs. host `lld` for linking.
-- How do we wire `bolt`/FDO for Global LTO post-Stage-4?
-- **Audit-via-build for LTO reorder hazards.** Can we statically
-  guarantee the `compiler_fence` wrappers are the *only* path to
-  PKRS / TCF / CR3 / TLBI in the built kernel, e.g. via a Clippy
-  lint or a post-link symbol-reference pass? A Stage 2 investment
-  that pays off every release.
+### 8.1 Toolchain pinning (resolved)
+
+**Decision:** **pin a specific nightly per kernel release**,
+recorded in `rust-toolchain.toml`. Bumps happen at
+each minor kernel release after CI validates the new
+toolchain.
+
+Rolling pin was rejected because nightly Rust changes can
+introduce miscompiles on `unsafe` code paths (the kernel's
+asm wrappers historically have caught nightly regressions).
+A pinned toolchain means CI is reproducible and historical
+builds remain buildable.
+
+The pin file plus the `Cargo.lock` plus the `narf.toml` give
+a fully-reproducible build from any commit.
+
+### 8.2 Linker selection (resolved)
+
+**Decision:** **`lld` from `llvm-tools-preview` (Rust-bundled)
+as primary**, with `mold` as an opt-in for faster local dev
+builds.
+
+`lld` is what `cargo` resolves to with `-Z linker-flavor=lld`
+on bare-metal targets; it handles all the relocations the
+kernel uses (PIE for the loadable-driver path,
+section-merging for the `narf.tests` distributed slice).
+
+`mold` is faster for incremental dev builds but doesn't
+handle aarch64 PIE relocations as completely as `lld` at the
+versions we target. `mold` is allowed via `narf.build.linker=mold`
+but CI uses `lld`.
+
+`cargo-binutils` is rejected (deprecated in favour of
+`llvm-tools-preview`).
+
+### 8.3 FDO / BOLT (resolved)
+
+**Decision:** **post-Stage-4 work, behind a build flag**.
+
+Profile-guided optimisation flow:
+1. Build a profiling kernel with `narf.build.profile_gen=1`.
+2. Run the verification benchmark suite to gather profiles.
+3. Build a release kernel with `narf.build.profile_use=<dir>`.
+4. Optionally apply `bolt` to re-order hot functions for
+   I-cache locality.
+
+Each step is invocable from `xtask`. Stage 5 deliverable.
+
+For v1.0 we ship without FDO/BOLT — the perf gain is nice
+but not load-bearing. The mechanism is designed so it can
+be turned on later without refactoring.
+
+### 8.4 LTO reorder-hazard audit gate (resolved)
+
+**Decision:** **mandatory CI gate** that statically verifies
+`compiler_fence` wrappers are the only path to:
+
+- PKRS write (`WRMSR IA32_PKRS`).
+- TCF / GCR write on aarch64.
+- CR3 write.
+- TLB invalidation (`INVLPG`, `TLBI`).
+
+Implementation: a post-link pass that walks the linked
+kernel ELF, finds every `wrmsr` / `mrs` / `invlpg` /
+`tlbi` instruction, and verifies it's bracketed by
+`compiler_fence` wrapper functions exported from `narf-arch`.
+Any direct emission outside the wrappers fails CI.
+
+The gate is a small Rust binary in `xtask check-fence-discipline`,
+run on every PR. Cost: ~5 seconds on a release-mode kernel.
+
+This pays off every release: it catches the "developer
+inlined a raw asm! to PKRS for one weird edge case"
+class of regression at PR time, not at deploy time.
+
+## 9. ABI versioning
+
+`build/`'s outputs (the kernel ELF, the `.narfmod` artefacts,
+the manifest format) define the on-disk ABI. The container
+formats are versioned per their respective specs:
+
+- Kernel ELF format: standard ELF + NARF note types
+  (per `observability/spec` §8.4).
+- `.narfmod`: per `drivers/spec` §5.
+- `narf.toml` (workspace manifest): per `drivers/spec` §6.
+
+`build/` itself doesn't have an exported ABI surface — it's a
+build-time tool. Reproducible builds are the "ABI" guarantee:
+two builds of the same commit + toolchain produce
+byte-identical outputs.
+
+## 10. Open questions
+
+(none — all v0.2 questions resolved in §8)

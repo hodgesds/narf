@@ -1,7 +1,10 @@
 # memory — Specification
 
-> Status: **Outline v0.2** (Stage 1 → 2). v0.2 adds PKRS save/restore
-> invariants and acknowledges PKS/MTE asymmetry at the arch boundary.
+> Status: **v1.0** (Stage 2 design lock). v0.2 covered PKS/MTE
+> asymmetry + PKRS save/restore; v1.0 locks the domain
+> multiplexing policy, the Folio API as the canonical
+> multi-page abstraction, per-CPU slab magazines, and the
+> kernel ASLR posture.
 
 ## 1. Purpose & scope
 
@@ -242,24 +245,118 @@ flip.
 Stage 1: buddy + page tables + identity map for the Frame.
 Stage 2: domain manager, PKS/MTE enable, per-domain slab allocator.
 
-## 8. Open questions
+## 8. Resolved decisions
 
-- 16 domains is a hard ceiling on x86_64 PKS. **Resolve multiplexing
-  policy before Stage 2:** if task-local domain-id remapping is allowed,
-  every `DomainId` is meaningful only relative to a task context; if
-  not, we are allocating a global static sparse resource. This decision
-  couples to the scheduler's PKRS save/restore and to `security-model/`'s
-  domain-assignment table.
-- MTE tag width is 4 bits (16 values) matching PKS's 16 — coincidence is
-  lucky but decide policy when one arch has fewer.
-- How aggressive is kernel ASLR, and does it interact with domain tagging?
-- **Linux folio API precedent.** Should NARF model multi-page
-  allocations as a `Folio`-shaped abstraction (head page + order +
-  per-folio metadata) the way Linux 5.15+ does, rather than tracking
-  individual `PhysFrame`s for large allocations? Folios would
-  compose better with the filesystem page cache once that exists and
-  reduce per-page bookkeeping for huge-page slabs. Decide once
-  `filesystem/` is being written — the answer depends on whether we
-  adopt a unified page cache.
-- Per-CPU slab magazines (tcmalloc-style) to avoid global buddy-lock
-  contention on SMP — design before Stage 2 or accept the serialisation cost?
+### 8.1 Domain multiplexing policy (resolved)
+
+**Decision (was open):** **task-local domain-id remapping**
+is the chosen policy. `DomainId::DRIVER(n)` is a logical slot;
+the actual PKS key in use depends on which task is currently
+polling on this CPU.
+
+Implementation: `CpuLocal` carries a per-task remap table
+`[u8; 16]` mapping logical domain → PKS key. The scheduler
+restores this table on context switch alongside PKRS. Logical
+domain 9 ("first driver") might be PKS key 9 in task A's
+context but PKS key 12 in task B's context.
+
+Cost: an extra `[u8; 16]` per task (16 bytes), one
+`memcpy_volatile` on context switch (negligible compared to
+the existing PKRS save/restore).
+
+Benefit: NARF can support far more concurrent drivers than the
+hardware's 16 PKS keys would suggest, because each task's
+working set rarely needs more than 4-5 distinct domains active
+simultaneously.
+
+This decision is what makes hundreds-of-drivers scaling
+possible at the domain level.
+
+### 8.2 MTE tag width policy (resolved)
+
+**Decision (was open):** **NARF assumes ≥16 tags** and gates
+booting on the assumption. Currently both PKS (x86_64) and
+MTE (aarch64) provide exactly 16; if a future arch had fewer
+(e.g. 8), NARF would either:
+
+- Boot with a reduced `DomainId` enum (some drivers refuse
+  to load).
+- Reject boot and require the platform-specific kernel build
+  to opt out of strict isolation.
+
+The choice would be platform-engineering at port time, not a
+runtime degradation. For the foreseeable future (x86_64 PKS,
+aarch64 MTE) we have 16; lock this assumption.
+
+### 8.3 Kernel ASLR (resolved)
+
+**Decision (was open):** **kernel ASLR is enabled and
+randomises 24 bits** of the kernel image base. Page-table
+walks and domain-tagging are unaffected — the randomised
+offset is applied at boot before any domain assignment.
+
+Per-allocation ASLR (each kalloc result randomly placed) is
+**not** done; the cost is too high for the benefit (kernel
+heap allocations are typically known to a local attacker via
+side channels regardless).
+
+The 24-bit kernel-base entropy interacts with domain tagging
+trivially: domain assignment is per-virtual-region, the region
+is determined post-randomisation. No coupling.
+
+### 8.4 Folio API (resolved)
+
+**Decision (was open):** **adopt the Folio abstraction**. The
+v0.2 spec already includes the Folio types; v1.0 makes them
+the canonical multi-page allocation primitive.
+
+Single-page (4 KiB) allocations still go through `alloc_frame`
+returning `PhysFrame`. Multi-page allocations go through
+`alloc_folio(order)` returning `Folio`. The buddy allocator
+internally always works in folios; `PhysFrame` is just `Folio`
+of order 0 with a thinner wrapper.
+
+`filesystem/` will use Folios as the page-cache currency
+when it adopts a unified page cache. Drivers consuming DMA
+buffers see `Cap<DmaBuffer, _>` whose backing is a Folio of
+the appropriate order.
+
+### 8.5 Per-CPU slab magazines (resolved)
+
+**Decision (was open):** **per-CPU magazines mandatory** for
+hot caches. The slab API in §3 already declares `MagSize`;
+v1.0 makes the default non-`None` for any cache used by hot-
+path code.
+
+Defaults:
+
+- Allocations < 256 bytes: `MagSize::Small(16)` per-CPU
+  magazine.
+- Allocations 256 bytes ≤ size < 4 KiB: `MagSize::Medium(64)`.
+- Allocations ≥ 4 KiB: `MagSize::Large(256)` for caches with
+  > 1 K obj/sec churn, `None` for cold caches.
+
+Cache stats are tracked (`tracing/`) so the magazine size can
+be tuned per-cache. The default heuristic above is the v1
+contract; the tunable knob is `SlabOpts::magazine`.
+
+## 9. ABI versioning
+
+`memory/` exports through SDK at `@v0`:
+
+- `DomainId` enum + driver-slot accessor — frozen (any change
+  is `MEMORY_ABI_MAJOR` bump).
+- `Folio` / `PhysFrame` types — fields are `pub(crate)`; only
+  the trait operations are exported.
+- `MapFlags` bitfield — additions are minor bumps,
+  reserved-MBZ.
+
+Drivers don't allocate frames or folios directly (the SDK
+gate forbids it); they consume `Cap<DmaBuffer, _>` via `io/`.
+The exported types are for kernel-internal subsystems only.
+
+`MEMORY_ABI_MAJOR = 1`, `MEMORY_ABI_MINOR = 0`.
+
+## 10. Open questions
+
+(none — all v0.2 questions resolved in §8)

@@ -1,6 +1,9 @@
 # block — Specification
 
-> Status: **Outline v0.1** (Stage 3 → 4).
+> Status: **v1.0** (Stage 4 design lock). v0.1 outlined the
+> queue-based block surface; v1.0 locks the page-cache home,
+> request-fairness model, barrier semantics, encryption-layer
+> placement, hot-remove handling, and ABI versioning.
 
 ## 1. Purpose & scope
 
@@ -180,17 +183,108 @@ Largely arch-neutral. Two points of contact:
 | 4     | Multi-queue dispatch, discard/TRIM, write-zeroes, per-consumer fair-share, NVMe backing. |
 | post-1.0 | Zoned block devices, atomic writes, write hints (stream IDs). |
 
-## 8. Open questions
+## 8. Resolved decisions
 
-- **Cache home.** Is there a page-cache equivalent, and if so does it
-  live in `block/` or `filesystem/`? Current lean: in `filesystem/`,
-  with `block/` pure pass-through, because caching is a per-FS policy
-  decision.
-- **Request fairness at scale.** Per-task or per-cap-chain fair share?
-  Per-cap-chain is more defensible but harder to account.
-- **Barrier semantics.** Do we need explicit barrier requests, or is
-  `flush` sufficient? Modern NVMe suggests flush is enough.
-- **Encrypted-at-rest path.** Between `block/` and driver, or between
-  `filesystem/` and `block/`? Affects where `crypto/` plugs in.
-- **Live-migration of in-flight I/O** (e.g. device hot-remove).
-  Complexity vs. value pre-1.0.
+### 8.1 Page-cache home (resolved)
+
+**Decision:** **page cache lives in `filesystem/`**, not
+`block/`. `block/` is a pure pass-through queue layer:
+queue, dispatch, complete. Caching policy (read-ahead, dirty
+write-back, eviction) is FS-specific and benefits from FS
+metadata (which blocks are inodes vs data, which dirs are
+hot).
+
+`block/` does NOT cache; every read/write hits the device
+unless the FS layer above intercepts. This keeps `block/`
+simple and lets per-FS caching strategies coexist.
+
+### 8.2 Request fairness (resolved)
+
+**Decision:** **per-cap-chain fair share** with a fallback
+to per-process when the cap chain is unidentifiable. The
+queue scheduler tracks a "request origin" cap chain (provided
+by the caller's `Cap<BlockDevice, Submit>` badge) and
+applies weighted fair queueing across chains.
+
+Default weights:
+- Latency-sensitive (badge flag set): 4×.
+- Default: 1×.
+- Background (badge flag set): 0.25×.
+
+Drivers receive requests in a single FIFO; the fairness is
+above the driver. Per-driver fairness (one driver hogs a
+device at the expense of another) is a separate concern
+handled by `Cap<Quota, Spend>` (drivers spec §17.2).
+
+### 8.3 Barrier semantics (resolved)
+
+**Decision:** **`flush` is sufficient; no explicit barriers**.
+Modern devices (NVMe, virtio-blk) provide flush + write-back
+caching that satisfies POSIX `fsync` semantics. NARF's block
+layer exposes:
+
+```rust
+pub enum BlockOp {
+    Read   { lba: u64, n: u16, buf: Cap<DmaBuffer, Write> },
+    Write  { lba: u64, n: u16, buf: Cap<DmaBuffer, Read> },
+    Flush,                            // wait for prior writes durable
+    Discard{ lba: u64, n: u32 },     // TRIM/UNMAP
+}
+```
+
+`Flush` is ordered: it completes after all prior `Write`s on
+the same queue have hit durable media. This is the only
+ordering guarantee at the block layer; FS layers compose
+their own crash-consistency around `Flush`.
+
+### 8.4 Encryption-at-rest placement (resolved)
+
+**Decision:** **between `filesystem/` and `block/`** (per-file
+or per-FS encryption), not at the device level.
+
+`crypto/` exposes `Cap<Key<Aes256Gcm>, Use>`; the FS layer
+encrypts payloads before submitting to `block/`. Full-device
+encryption is a special case where the FS layer treats every
+block uniformly, and is configured at mount time.
+
+This placement lets:
+- Per-file encryption (different keys per directory tree).
+- Cross-device encryption survival (data on one device
+  decrypts the same way on another).
+- Driver-side simplicity (no crypto in driver code).
+
+The minor cost is the FS pays the encrypt/decrypt overhead;
+acceptable for v1.0. AES-NI / Crypto Extensions on modern
+silicon makes it cheap.
+
+### 8.5 Hot-remove handling (resolved)
+
+**Decision:** **fail-fast all in-flight I/O on hot-remove**,
+no live migration in v1.0.
+
+When `bus/` signals `BusEvent::Removed` for a block device:
+1. Driver's `Driver::quiesce()` runs — driver stops issuing
+   new ops, waits for hardware to drain or times out.
+2. `block/` revokes the device's `Cap<BlockDevice, _>`; all
+   in-flight requests complete with `Err(DeviceRemoved)`.
+3. FS layer above receives the errors and propagates them
+   (typically as `EIO`).
+
+Live migration (transfer in-flight requests to a different
+device) is Stage 5+ work — requires multi-device replication
+that's an FS concern, not a block-layer one.
+
+## 9. ABI versioning
+
+`block/` exports through SDK at `@v0`:
+
+- `BlockOp` enum.
+- `BlockDeviceSync` and `BlockDeviceAsync` traits (drivers
+  implement; FS layers consume).
+- `Cap<BlockDevice, _>` and badging (priority hints).
+
+`BLOCK_ABI_MAJOR = 1`, `BLOCK_ABI_MINOR = 0`.
+
+## 10. Open questions
+
+(none — all v0.1 questions resolved in §8)

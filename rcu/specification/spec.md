@@ -1,6 +1,9 @@
 # rcu — Specification
 
-> Status: **Outline v0.1** (Stage 1 → 4).
+> Status: **v1.0** (Stage 4 design lock). v0.1 outlined QSBR
+> + sleepable readers; v1.0 locks the IRQ-context policy, the
+> sleepable-scope granularity, the per-domain reclamation
+> fairness, and the priority-inversion handling.
 >
 > **Name vs. mechanism.** The folder is `rcu/` because engineers search
 > for "RCU" when they want this shape. The underlying mechanism is
@@ -299,28 +302,111 @@ Largely arch-neutral. Two points of contact:
 | 3     | Hazard-pointer variant; **Sleepable variant** with cap-gated scopes, budgets, and timeout-bounded sync; first consumers adopt (`capabilities/`, `interrupts/`, `time/`, `filesystem/` dentry). |
 | 4     | Tuning: batched reclamation, per-domain deferred-drop pacing, NUMA-aware queues, expanded consumers. |
 
-## 8. Open questions
+## 8. Resolved decisions
 
-- **QSBR on NMI / IRQ paths.** Code running in an interrupt handler
-  hasn't been scheduled as a Future. Do we forbid RCU primitives
-  there (simple rule), or provide a minimal IRQ-safe variant?
-  Leaning: forbid; handlers produce short messages and let a Future
-  process them.
-- **Sleepable scope granularity.** One scope per mount? Per
-  filesystem driver? Per-scope cost is small but not zero.
-- **Budget policy for sleepable readers.** Default numbers (max
-  duration, max simultaneous) should be measurable — derive from
-  observed filesystem workloads in Stage 4.
-- **Reclamation fairness across domains.** A chatty domain's
-  deferred-drop queue shouldn't crowd out a quiet domain's.
-  Per-domain budget in the reclamation worker?
-- **Priority inversion in `sync`.** A high-priority writer waiting
-  on low-priority readers — do we boost the reader(s)? (Probably
-  yes for sleepable; rarely matters for QSBR since readers are
-  short.)
-- **Cross-kernel migration** (if NARF ever supports live-update of
-  the kernel itself) — how do in-flight RCU readers survive?
-  Defer far beyond 1.0.
-- **Debugging.** What `tracing/` events does the RCU subsystem
-  emit? At minimum: scope census samples, sync durations, timeout
-  firings, reclaim-queue depths.
+### 8.1 IRQ-context RCU (resolved)
+
+**Decision:** **forbidden**. RCU primitives must not be
+called from interrupt handlers. Handlers produce short
+messages (atomic writes, ring-pushes) and a Future processes
+them. This keeps the QSBR model simple — every read is
+in-Future, every quiescent state is a poll boundary.
+
+The `narf-rcu` crate enforces via `#[narf_rcu::no_irq]` lint
+(checked by CI) on functions that take RCU read-guards.
+Handlers calling into a function tagged with this fail
+build.
+
+### 8.2 Sleepable-scope granularity (resolved)
+
+**Decision:** **one scope per filesystem instance**, not per
+mount and not per driver. A filesystem driver may be hosting
+multiple mounts (each its own `FsInstance`); each instance
+gets its own SRCU-style scope. This bounds the worst-case
+"how long can a sleepable reader hold up sync" to a single
+mount's IO patterns.
+
+Driver-internal RCU usage (e.g. driver's own data structures)
+uses QSBR scopes, not sleepable. SRCU scopes are reserved for
+the IO-blocking path that filesystems need.
+
+### 8.3 Sleepable budget defaults (resolved)
+
+**Decision:** **defaults driven by per-system measurement**,
+revisited every release. Initial v1.0 numbers:
+
+- Max sleepable read duration: 5 seconds (then escalates to
+  warn + force-quiesce).
+- Max simultaneous sleepable readers per scope: 256.
+- Max scopes system-wide: 64 (1 per FS instance).
+
+These are tunable via `narf.rcu.*` boot params. The 5-second
+ceiling is generous for normal IO; a reader exceeding it is
+almost certainly buggy.
+
+### 8.4 Reclamation per-domain fairness (resolved)
+
+**Decision:** **round-robin across domains in the
+reclamation worker**, not strict equal allocation. The worker
+is a Future that polls each domain's deferred-drop queue in
+turn, draining a bounded chunk per pass. A chatty domain's
+queue doesn't block others — at worst its drains are spread
+across N round-robin passes.
+
+Per-domain quota on outstanding deferrals: 1000 items default.
+Exhaustion blocks the producer (synchronous drop) instead of
+unbounded queue growth.
+
+### 8.5 Priority inversion in `sync` (resolved)
+
+**Decision:** **priority boost for sleepable readers blocking
+a high-priority writer**. The writer's priority is propagated
+to all current readers in the same scope; readers run at
+boosted priority until quiescence. Mirrors Linux's PREEMPT_RT
+priority inheritance for RCU.
+
+For QSBR (non-sleepable): readers complete in O(µs) — boost
+doesn't matter and adds complexity. No boost; the writer's
+sync just polls.
+
+### 8.6 Cross-kernel-migration (resolved by punting)
+
+**Decision:** **out of scope for v1.0**. Live kernel update
+is deferred indefinitely; if it ever lands, RCU semantics
+across kernels would need fresh design.
+
+### 8.7 Tracing events (resolved)
+
+**Decision:** v1.0 emits these `tracing/` events:
+
+- `rcu.qsbr.scope_size` — periodic gauge of active QSBR
+  scopes per CPU.
+- `rcu.sync.duration` — histogram of `sync` wait times.
+- `rcu.timeout.fired` — count of timeouts on
+  `sync_with_timeout`.
+- `rcu.reclaim.queue_depth` — per-domain reclamation queue
+  depth gauge.
+- `rcu.sleepable.read_duration` — histogram of sleepable
+  read durations.
+
+All fields are stable at v1.0; adding new events / fields is
+a minor bump.
+
+## 9. ABI versioning
+
+`narf-rcu` exports through SDK at `@v0`:
+
+- Scope guards (`ReadGuard`, `SleepableReadGuard`).
+- `synchronize_rcu`, `synchronize_rcu_with_timeout`.
+- `Cap<SleepableReader, _>` (drivers requesting sleepable
+  semantics).
+
+Drivers consume RCU through these stable APIs; the
+implementation (epoch counters, deferred-drop machinery) is
+internal.
+
+`RCU_ABI_MAJOR = 1`, `RCU_ABI_MINOR = 0`.
+
+## 10. Open questions
+
+(none — all v0.1 questions resolved in §8)

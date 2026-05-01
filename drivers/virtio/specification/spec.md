@@ -1,6 +1,10 @@
 # drivers/virtio — Specification
 
-> Status: **Outline v0.1** (Stage 3).
+> Status: **v1.0** (Stage 3 design lock). v0.1 outlined the
+> shared transport + per-device drivers; v1.0 locks the
+> ring-format choice (split-only at v1.0, packed at v1.1+),
+> the console-backend strategy, and the multi-queue sizing
+> policy.
 
 ## 1. Purpose & scope
 
@@ -64,9 +68,54 @@ Internal modules: `transport_pci`, `transport_mmio`, `queue_split`,
 
 Stage 3 — *the* Stage 3 milestone driver.
 
-## 8. Open questions
+## 8. Resolved decisions
 
-- Split-only first (simpler), packed later — or both from day one?
-- Do we use virtio-console as the Stage 3 console fallback, or stick
-  with 16550A/PL011 until Stage 4?
-- Multi-queue sizing policy — CPU count based vs. fixed.
+### 8.1 Ring format (resolved)
+
+**Decision:** **split-only at v1.0; packed-ring support
+at v1.1+**. The split-virtqueue format is universally
+supported by every virtio device QEMU emits and is what
+existing NARF code uses. Packed-ring is a 30-50%
+throughput win on hot paths and lands as a separate driver
+SDK feature in v1.1.
+
+`narf-drivers-virtio` v1 enables only split via VIRTIO_F_RING_PACKED
+NOT being negotiated; v1.1 will add the negotiation path.
+
+### 8.2 virtio-console as console backend (resolved)
+
+**Decision:** **virtio-console is an additive sink, not a
+replacement** (per `console/spec` §8.2). The 16550A (x86_64)
+or PL011 (aarch64) UART remains primary; virtio-console
+mirrors output when the device is probed, providing a
+clean log surface for VM environments.
+
+This means NARF runs on bare metal without virtio-console
+and inside QEMU with both — no fork in the console path.
+
+### 8.3 Multi-queue sizing (resolved)
+
+**Decision:** **CPU-count based with caps**. virtio-net,
+virtio-blk allocate `min(cpu_count, max_supported_by_device)`
+queues at probe time, one per CPU. Devices with smaller
+hardware ceilings (e.g. virtio-blk-pci defaulting to 1
+virtqueue) fall back to single-queue + IRQ steering.
+
+Stage 4 work: per-driver tunable to override the
+auto-sizing for fast-path workloads (`net/spec` §8.4).
+
+## 9. ABI versioning
+
+`narf-drivers-virtio`'s public surface (the per-device-class
+match tables, the `enable_msix_for_probed` shape, the
+shared transport helpers used by other virtio drivers) are
+re-exported through SDK at `@v0`.
+
+`VIRTIO_DRIVER_ABI_MAJOR = 1`, `VIRTIO_DRIVER_ABI_MINOR = 0`.
+Adding a new device-class driver under `drivers/virtio/`
+is a minor bump (registers a new match-table entry; doesn't
+break existing).
+
+## 10. Open questions
+
+(none — all v0.1 questions resolved in §8)

@@ -1,6 +1,10 @@
 # power — Specification
 
-> Status: **Outline v0.1** (Stage 2 → 4).
+> Status: **v1.0** (Stage 4 design lock). v0.1 outlined
+> CPU/device PM + governors; v1.0 locks the tickless idle
+> policy, the energy model coupling with `scheduler/`, the
+> AML-evaluation posture (no AML), the modern-standby strategy,
+> and SCMI integration.
 
 ## 1. Purpose & scope
 
@@ -206,19 +210,123 @@ driver implementation.
 | 4     | Suspend-to-RAM (S3 / PSCI), thermal zones + throttling, EnergyAware governor coupled to `scheduler/`. |
 | post-1.0 | S4 hibernate, deep platform states, battery / AC integration on laptop-class targets. |
 
-## 8. Open questions
+## 8. Resolved decisions
 
-- **Tickless idle.** Linux's `NOHZ_FULL` equivalent — do we want
-  per-CPU tickless operation and what does it cost the
-  `time/` subsystem? Likely yes for Stage 3+.
-- **E-core / P-core scheduling policy** — ties to `scheduler/` open
-  question; `power/` contributes the energy model.
-- **PM firmware trust.** ACPI DSDT (AML) for full PM; refuse to
-  evaluate AML means losing some platforms' features. Table-only
-  path for Stage 2, full AML only if needed in Stage 4.
-- **S3 vs. modern standby.** Modern laptops often lack S3 entirely
-  (only S0ix). Modern-standby is a very different implementation
-  story; defer the decision.
-- **Thermal coprocessor integration.** Many aarch64 SoCs hide
-  thermal/DVFS behind SCMI; do we integrate SCMI as a bus-like
-  subsystem under `bus/`?
+### 8.1 Tickless idle (resolved)
+
+**Decision:** **opt-in tickless via `narf.power.tickless=1`
+boot param**, off by default. When enabled, an idle CPU
+disarms its periodic timer and reprograms only when the
+nearest scheduled wake (timer, hrtimer, sleep) requires it.
+
+Cost to `time/`: tickless CPUs produce no per-tick
+`timekeeper` snapshot updates; `monotonic_ns()` still works
+(reads the per-call TSC + last-tick anchor; staleness bounded
+by re-arm latency). Wall-clock readers may see microsecond-
+range jitter; acceptable per `time/spec` §8.1.
+
+Default is off for v1.0 — the per-tick scheduler-budget
+accounting and tracing-event timestamps are slightly more
+predictable with ticks. Datacenter / DPDK-style workloads
+can opt in.
+
+### 8.2 E-core / P-core energy model (resolved)
+
+**Decision:** **`power/` exposes per-class energy curves
+that `scheduler/` consumes**. Each `CpuClass` (`Performance`,
+`Efficient`, `Mixed`) has a model:
+
+```rust
+pub struct EnergyCurve {
+    pub perf_at_freq:    fn(MHz) -> PerfScore,    // monotonic
+    pub power_at_freq:   fn(MHz) -> Milliwatt,    // monotonic
+    pub min_freq:        MHz,
+    pub max_freq:        MHz,
+    pub idle_power:      Milliwatt,
+}
+```
+
+The scheduler picks the (cpu_class, freq) tuple that
+minimises `power / perf` for each task subject to its
+deadline / interactivity hint. RT tasks are treated as
+"max perf at any energy"; Idle tasks as "min energy at any
+perf."
+
+The energy curves are populated from CPUID (x86_64) /
+PSCI/SCMI (aarch64) at boot. Platforms without published
+curves get a heuristic default (linear power vs. freq).
+
+### 8.3 AML evaluation (resolved)
+
+**Decision:** **NARF does not execute AML**, mirroring
+`bus/spec` §11.1. This loses some PM features on legacy
+platforms (S3 wake notifications, dynamic DVFS tables on
+older Intel) but keeps the kernel free of an AML interpreter
+attack surface.
+
+PM info comes from:
+- ACPI tables: FADT, MADT, SRAT, MCFG, HPET (no AML).
+- ACPI _PSS / _CST tables that are static-data variants.
+- Devicetree `cpu-supply`, `operating-points`, `power-domains`
+  on aarch64.
+- SCMI for runtime-negotiated PM on SCMI-capable platforms.
+
+Platforms that require AML for PM functionality run with
+reduced PM support (no DVFS, no per-device runtime PM).
+Mainstream server x86_64 + modern aarch64 SoCs are fine; old
+desktop ACPI-heavy systems are second-class.
+
+### 8.4 S3 vs modern standby (resolved)
+
+**Decision:** **modern standby (S0ix / connected standby) is
+v1.0 default**; legacy S3 is supported as a fallback.
+
+Modern-standby flow:
+1. User initiates suspend.
+2. NARF freezes user processes.
+3. Drivers receive `Driver::quiesce()` → enter D3hot/D3cold
+   per their PM hooks.
+4. Kernel waits for wake events (network packet, lid open,
+   timer alarm) on idle CPUs in deepest C-state.
+5. On wake, the inverse — drivers exit D-state, processes
+   thaw.
+
+S3 (RAM-only suspend with full CPU power-off) is supported
+where the platform offers it; the flow is the same with
+deeper sleep.
+
+The driver-side hooks (`Driver::quiesce`, `Driver::resume`,
+`DState` transitions) are already in `drivers/spec`; this
+spec just wires them to the system-level transition.
+
+### 8.5 SCMI integration (resolved)
+
+**Decision:** **SCMI is a bus-like service under `bus/`**,
+not a separate top-level subsystem. SCMI-attached devices
+(thermal sensors, DVFS controllers, reset controllers,
+voltage regulators) appear as `BusDevice`s with `BusKind::Scmi`
+and matched by their SCMI protocol id.
+
+A small `narf-drivers-scmi-transport` driver owns the
+shared-memory mailbox to the SCMI server (firmware), and
+specific protocol drivers (e.g.
+`narf-drivers-scmi-perf` for performance-domain DVFS) bind
+to it via `bus/`'s match-table.
+
+This keeps the framework uniform — SCMI is just another bus
+— and lets PM features evolve as ordinary driver code.
+
+## 9. ABI versioning
+
+`power/` exports through SDK at `@v0`:
+
+- `DState` enum (D0..D3Cold).
+- `Cap<DevicePm, _>`, `Cap<FreqHint, _>`, `Cap<Power, _>`.
+- `DeviceRuntimePm::transition(target: DState)`.
+- `EnergyCurve` accessor.
+
+`POWER_ABI_MAJOR = 1`, `POWER_ABI_MINOR = 0`.
+
+## 10. Open questions
+
+(none — all v0.1 questions resolved in §8)

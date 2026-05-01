@@ -1,6 +1,9 @@
 # lib — Specification
 
-> Status: **Outline v0.1**. Grows incrementally across all stages.
+> Status: **v1.0** (Stage 2 design lock). v0.1 outlined the
+> primitives; v1.0 locks vendored-vs-in-tree policy, the
+> allocator-collections boundary, the async-Mutex policy,
+> the crate layout, and ABI versioning.
 
 ## 1. Purpose & scope
 
@@ -185,19 +188,46 @@ Eliminates "is this a `u32` a PID or a CPU id?" bug class.
 | 3     | Domain-aware assertion macros integrated with `tracing/` and `frame/` panic path. |
 | 4     | Additional intrusive structures as consumers demand; skiplist if a use case earns it. |
 
-## 8. Open questions
+## 8. Resolved decisions
 
-- **In-tree vs. vendored.** `spin`, `crossbeam-utils`, `hashbrown` —
-  do we re-export with thin wrappers, or fork-and-vet? `build/`
-  currently prefers pinned external crates; `lib/` should codify a
-  criterion for when we bring something in-tree.
-- **Allocator-backed collections home.** `Vec`-like and `BTreeMap`-like
-  types from `alloc` are fine in subsystems that have an allocator;
-  but do we mirror them here as a domain-aware variant? Probably not
-  — reuse `alloc` when available, let `memory/` own the allocator.
-- **Async Mutex vs. spin + donation.** For short critical sections
-  donation via `scheduler/` beats a sleeping mutex; when does the
-  mutex earn its keep? Expect benchmarks to decide.
-- **Whether `lib/` becomes a namespace for crate-per-primitive or
-  one big crate.** Cargo workspace tidiness argues for several
-  crates; compile-time argues for one. `build/` decides.
+### 8.1 In-tree vs vendored (resolved)
+
+**Decision:** in-tree implementations for primitives that
+touch PKS/MTE state, run in trap context, define
+cap-crossing types, or are read by the audit team. Vendored
++ pinned external crates are fine for non-TCB auxiliaries.
+
+`IrqSafeSpinLock`, `SpinLock`, intrusive lists, typed IDs,
+`Once`, atomic primitives → in-tree. `hashbrown` (non-domain
+hash maps), `crossbeam-utils` (non-trap queues) → vendored.
+
+### 8.2 Allocator-backed collections (resolved)
+
+**Decision:** reuse `alloc` crate transparently. `memory/`'s
+allocator implements `GlobalAlloc`; `Vec`/`BTreeMap`/`Box`
+work without `lib/`-side mirroring. Domain tagging is implicit
+from the calling context.
+
+### 8.3 Async Mutex policy (resolved)
+
+**Decision:** donation-via-scheduler for critical sections
+< 100 µs (the common case); async `Mutex<T>` for genuinely
+long sections. The crossover is profile-driven via
+`tracing/` lock-hold-time histograms.
+
+### 8.4 Crate layout (resolved)
+
+**Decision:** **one `narf-lib` crate**, not per-primitive.
+Foundational primitives change rarely; rebuild scope is
+acceptable. Compile-time and dependency-graph clarity outweigh
+workspace tidiness.
+
+## 9. ABI versioning
+
+`LIB_ABI_MAJOR = 1`, `LIB_ABI_MINOR = 0`. Re-exported through
+SDK at `@v0`: `IrqSafeSpinLock`, `SpinLock`, `Once`,
+`OnceLock`, intrusive primitives, typed-ID types.
+
+## 10. Open questions
+
+(none — all v0.1 questions resolved in §8)

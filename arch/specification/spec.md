@@ -1,8 +1,10 @@
 # arch — Specification
 
-> Status: **Outline v0.2** (Stage 1→2). v0.2 splits the `DomainPrimitive`
-> trait to acknowledge that PKS and MTE are structurally different —
-> not two implementations of the same abstraction.
+> Status: **v1.0** (Stage 2 design lock). v0.2 split DomainPrimitive
+> into a backend-aware trait; v1.0 locks the MSR/system-register
+> access policy, the crate layout, the canonical idle primitive
+> (`idle_halt_then_disable`), the per-arch MMIO discipline, and
+> the SDK ABI versioning policy.
 
 ## 1. Purpose & scope
 
@@ -135,8 +137,120 @@ pub enum DomainBackend { Pks, Mte }
 Stage 1 (minimal trait + per-arch stubs sufficient to boot & print), Stage 2
 (full surface: PKS/MTE, UIPI/GICv3 ITS, cache ops).
 
-## 8. Open questions
+## 8. Resolved decisions
 
-- Should the HAL expose raw MSR/system-register access, or only typed helpers?
-- Single workspace with `#[cfg]` vs. separate crates per arch — decide in
-  Stage 1.
+### 8.1 Raw MSR/system-register access (resolved)
+
+**Decision (was open):** **typed helpers only** for the public
+surface; raw MSR/MRS access is `pub(crate)` inside `arch/` and
+gated behind specific Cap kinds for any escapee path.
+
+The typed-helper layer wraps every privileged register the
+kernel actually uses (PKRS, IA32_APIC_*, IA32_UINTR_*,
+SCTLR_EL1, TCR_EL1, TTBR0/1_EL1, GICR_*, etc.). Adding a new
+register goes through:
+
+1. Add a typed accessor in `arch/x86_64/msr.rs` or
+   `arch/aarch64/sysreg.rs`.
+2. If a driver needs it, expose via SDK at `@v0`.
+3. If it's TCB-only (e.g. PKRS), keep `pub(crate)` and let
+   `frame/` and `interrupts/` consume it.
+
+Raw `WRMSR` / `MSR` from outside `arch/` is a build-time error
+(rejected by the `xtask check-driver-isolation` SDK gate).
+
+### 8.2 Crate layout (resolved)
+
+**Decision (was open):** **single `narf-arch` crate with
+`#[cfg(target_arch = "...")]` modules**, not separate per-arch
+crates.
+
+Rationale: the trait surface is shared; per-arch modules
+implement it. Two crates would require either (a) a third
+`narf-arch-trait` crate with no implementation (extra
+indirection, slower compile), or (b) duplicated trait
+definitions (maintenance burden). The `#[cfg]` approach has
+been working; promote to permanent.
+
+The internal layout (already in code as of `arch/src/`):
+
+```text
+arch/
+  src/
+    lib.rs              # public API + re-exports
+    mmio.rs             # arch-portable MMIO accessors
+    percpu.rs           # arch-portable per-CPU primitives
+    x86_64/
+      mod.rs
+      asm.rs            # halt_until_irq, idle_halt_then_disable, sti/cli
+      msr.rs            # typed MSR accessors
+      io_port.rs        # in/out instructions
+      cr.rs             # CR0..4 access
+      ...
+    aarch64/
+      mod.rs
+      asm.rs            # halt_until_irq, idle_halt_then_disable, wfi
+      sysreg.rs         # typed system-register accessors
+      ...
+```
+
+### 8.3 The canonical idle primitive
+
+**Decision:** `arch::idle_halt_then_disable()` is the spec's
+mandated way to wait-for-condition. The previously-existing
+`halt_until_irq()` has the documented check-halt race for
+condition-loop use; new code uses `idle_halt_then_disable`
+in the canonical pattern:
+
+```text
+cli;
+while !condition() {
+    idle_halt_then_disable();   // sti;hlt;cli (atomic)
+}
+sti;
+```
+
+Mirrors Linux's `default_idle` (`raw_safe_halt` then
+`raw_local_irq_disable`). On x86_64: `sti;hlt;cli`. On
+aarch64: `msr DAIFClr,#2; wfi; msr DAIFSet,#2`.
+
+`halt_until_irq()` is retained for opportunistic-idle paths
+(scheduler runs out of work) where a missed wake just means
+the next condition check spins; it's documented as racy and
+must not be used in correctness-critical condition loops.
+
+### 8.4 MMIO accessor discipline
+
+**Decision:** all driver-side MMIO goes through
+`arch::mmio::{read8,16,32, write8,16,32}` which:
+
+- Are `unsafe fn` (caller asserts the address is mapped).
+- Use `core::ptr::read_volatile` / `write_volatile`.
+- On x86_64: emit a `compiler_fence(SeqCst)` before and after.
+- On aarch64: emit `dmb ishld` after a load, `dmb ishst`
+  before / `dsb st` after a store — the equivalent of x86's
+  TSO ordering for MMIO.
+
+Drivers do not write inline `read_volatile` / `write_volatile`
+calls; the driver-isolation gate rejects such calls in driver
+crates. (See `drivers/spec` §3 for the gate.)
+
+## 9. ABI versioning
+
+`narf-arch` re-exports through `narf-driver-sdk` at `@v0`:
+
+- `mmio::read8/16/32`, `mmio::write8/16/32`
+- `idle_halt_then_disable`
+- `halt_until_irq`
+- `interrupts_enabled`
+- `enable_interrupts` / `disable_interrupts` (slow-path
+  drivers' explicit IRQ control; most drivers shouldn't touch
+  these directly)
+
+`ARCH_ABI_MAJOR = 1`, `ARCH_ABI_MINOR = 0`. Adding a new MMIO
+width (`read64`/`write64`) is a minor bump. Removing or
+changing existing semantics is a major bump.
+
+## 10. Open questions
+
+(none — all v0.2 questions resolved in §8)

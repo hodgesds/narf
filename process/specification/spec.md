@@ -1,6 +1,11 @@
 # process — Specification
 
-> Status: **Outline v0.1**. Adopted in Stage 1, revised every stage.
+> Status: **v1.0** (Stage 4 design lock). v0.1 outlined the
+> review process, change classification, and AI-agent
+> protocol; v1.0 locks the issue-tracker conventions, the
+> CODEOWNERS layout, the conflict-of-interest rules, the CVSS
+> profile, the LTS window policy, and the agent-provenance
+> format.
 > Treat this spec as *binding on both humans and AI agents*.
 
 ## 1. Purpose & scope
@@ -331,15 +336,92 @@ logged and reviewed retrospectively.
 Stage 1 (v0.1 adopted before first external PR).
 Revised at the start of each stage with at minimum a short review.
 
-## 14. Open questions
+## 14. Resolved decisions
 
-- Concrete issue tracker and review platform. (Currently unspecified;
-  most of this spec is platform-agnostic but some wording assumes
-  PR-style review.)
-- Do we want `CODEOWNERS`-style per-file ownership once the tree grows?
-- Conflict-of-interest rules when the same person wrote the code and
-  is the only qualified reviewer for that subsystem.
-- Exact CVSS profile and whether we adopt CVSS 4.0 once it stabilises.
-- Long-term support windows — not decided pre-1.0.
-- Machine-readable provenance format for AI-agent audit trails
-  (SLSA? SBOM + attestations? custom?).
+### 14.1 Issue tracker / review platform (resolved)
+
+**Decision:** **GitHub issues + PRs as the canonical
+platform**. All spec wording assuming "PRs" / "review board"
+maps to GitHub workflows.
+
+Mirror to a self-hosted forge (Forgejo / Gitea) is permitted
+for vendors who require offline development; the canonical
+state is GitHub. PRs to the canonical repo are the official
+record.
+
+CI gates run via GitHub Actions; release tags are created in
+GitHub.
+
+### 14.2 CODEOWNERS (resolved)
+
+**Decision:** **`CODEOWNERS` files added per top-level
+subsystem** once that subsystem's spec is at v1.0. Each
+subsystem maintains a `CODEOWNERS` listing 1-3 reviewers
+required for any PR touching its files.
+
+Cross-subsystem PRs (the common case for ABI changes) require
+review from each affected `CODEOWNERS` set. Interface-class
+changes (per §4) require additional review from a separate
+"ABI-stewards" group.
+
+### 14.3 Conflict-of-interest rules (resolved)
+
+**Decision:** **author may not single-sign-off their own
+work**. If a PR's only qualified reviewer is the author:
+
+1. The PR is held until a second reviewer is found, OR
+2. An ABI-steward (separate person from the author) reviews
+   for soundness even if not subsystem-expert.
+
+This bounds risk on small subsystem teams — the cost is some
+PRs blocking on additional review. In practice this surfaces
+the need to grow review depth; the steward's "I checked
+soundness even though I'm not the expert" review is
+explicitly logged.
+
+### 14.4 CVSS profile (resolved)
+
+**Decision:** **CVSS 4.0 from v1.0**. CVSS 3.1 is grandfathered
+for historical CVEs only. New advisories use 4.0.
+
+### 14.5 LTS windows (resolved)
+
+**Decision:** **two LTS streams: 2-year and 5-year**.
+
+- 2-year LTS: even-numbered minor releases (v1.0, v1.2, …).
+  Receive bug fixes for 2 years, no new features.
+- 5-year LTS: every fifth minor release (v1.0, v1.5, …).
+  Receive critical bug fixes + security patches for 5 years.
+
+A given release can be both (v1.0 is both 2-year and 5-year).
+Vendors / system integrators pick which stream they track.
+Out-of-tree drivers SHOULD specify which LTS stream(s) they
+support in their `driver.toml`.
+
+### 14.6 AI-agent provenance format (resolved)
+
+**Decision:** **SLSA Provenance v1.0 + in-repo attestation
+files**. Each AI-agent commit is accompanied by a signed
+attestation in `attestations/<commit-sha>.intoto.jsonl`:
+
+```json
+{
+  "_type": "https://in-toto.io/Statement/v0.1",
+  "predicateType": "https://slsa.dev/provenance/v1",
+  "subject": [{"name": "...", "digest": {"sha256": "..."}}],
+  "predicate": {
+    "buildDefinition": {"buildType": "narf-ai-agent/v1", ...},
+    "runDetails": {"builder": {"id": "claude-opus-4-7"}, ...}
+  }
+}
+```
+
+This is human-readable, tooling-friendly, and standard. Tools
+can verify the chain "code → AI agent → reviewing human → CI
+build → release artefact" using existing SLSA infrastructure.
+
+Agent signing keys per `crypto/spec` §9.7.
+
+## 15. Open questions
+
+(none — all v0.1 questions resolved in §14)

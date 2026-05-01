@@ -1,6 +1,9 @@
 # net — Specification
 
-> Status: **Outline v0.1** (Stage 3 → 4). Contract-heavy; minimal code.
+> Status: **v1.0** (Stage 4 design lock). v0.1 outlined the
+> stack-daemon attach contract; v1.0 locks the boot-time
+> kernel-stack scope, interface naming, RSS hash policy,
+> stack-daemon trust posture, and multi-stack arbitration.
 
 ## 1. Purpose & scope
 
@@ -156,17 +159,258 @@ happens inside `drivers/net/` per-driver.
 | 4     | Userspace stack-daemon protocol, Admin cap flow, hardware NIC integration via `drivers/net/`. |
 | post-1.0 | XDP-equivalent fast-path filters (declarative, not VM), optional minimal in-kernel stack for boot-only networking. |
 
-## 8. Open questions
+## 8. Resolved decisions
 
-- **Minimal in-kernel stack.** For PXE-ish boot-time operations
-  (firmware update, network-boot) we may need *some* in-kernel IP +
-  UDP. Scope if/when; not Stage 1–4.
-- **Interface naming.** `eth0`-style Linux conventions, or capability-
-  only addressing (no names at all)? The latter is purer; the former
-  is easier to debug.
-- **Hardware hash steering.** How the consumer declares its
-  preferred RSS scheme without leaking hash state into the kernel.
-- **Stack daemon trust.** Is the stack in or out of the TCB? Out is
-  the microkernel answer; but a bug in the stack can still DoS.
-- **Multi-stack arbitration** when multiple daemons try to bind the
-  same interface.
+### 8.1 In-kernel stack scope (resolved)
+
+**Decision:** **no in-kernel TCP/IP stack at v1.0**. All L3+
+(IP, TCP, UDP, TLS) lives in user-mode stack daemons. The
+kernel `net/` only owns:
+
+- L2 frame ingress/egress at the device boundary.
+- MAC-address binding via `Cap<NetIface, _>`.
+- Optionally, a pre-mounted user-mode stack daemon image for
+  boot-time PXE-style operations (loaded from initramfs).
+
+Network-boot scenarios use the pre-mounted user-mode stack;
+no kernel protocol code. This keeps NARF microkernel-pure
+on the network path.
+
+### 8.2 Interface naming (resolved)
+
+**Decision:** **capability-only addressing internally;
+operator-facing names via a thin naming service**.
+
+Inside the kernel and stack daemons, interfaces are named
+solely by their `Cap<NetIface, _>` (with bus-device-path
+badge). For operator tooling, a small naming daemon
+(`narf-ifnamed`) maps caps to stable names like `wan0`,
+`lan0`, etc., reading a `narf.network.toml` config file.
+
+This avoids Linux's famous network-interface naming wars
+(predictable names vs. eth0 vs. systemd renaming) — the
+stable names live in operator config, not in udev-equivalent
+kernel-side magic.
+
+### 8.3 Hardware hash steering / RSS (resolved)
+
+**Decision:** **consumer declares an `RssScheme` enum**;
+driver implements as best the hardware allows.
+
+```rust
+pub enum RssScheme {
+    None,                          // single-queue, no steering
+    HashIPv4,                      // 5-tuple hash on IPv4 traffic
+    HashIPv6,                      // 5-tuple hash on IPv6
+    HashAuto,                      // either, driver picks
+    Custom(Cap<RssKey, Read>),    // consumer-supplied hash key
+}
+```
+
+The hash key (when consumer-supplied) lives behind a cap so
+the kernel doesn't see the bytes — the driver writes the key
+into the device's RSS table directly via its
+`Cap<BusDevice, Write>`.
+
+Drivers without RSS hardware degrade to `RssScheme::None`
+silently; consumers that needed steering observe the
+single-queue throughput floor.
+
+### 8.4 High-performance / fast-path networking (resolved)
+
+**Decision:** **first-class polled fast-path data-plane
+support** as a NARF-native mechanism. The same kernel-bypass
+ideas that DPDK / VPP / Snabb / netmap pioneered, expressed
+through NARF's existing primitives — caps, user-mode-domain
+drivers, polled futures, huge-page DMA pools — without
+inheriting any specific external API.
+
+A fast-path NIC driver is a driver crate that:
+
+- Declares `host = "user-mode-domain"` in its manifest, so
+  it runs as a sandboxed user-mode process (not in the
+  kernel). Bug or malice cannot crash the kernel.
+- Holds `Cap<BusDevice, Dma>` + `Cap<MsiXTable, _>` +
+  `Cap<DmaBuffer, _>` with a quota request sized for the
+  packet pool (see `drivers/spec` §17.2).
+- Declares `dispatch = Polled` in its registration so the
+  framework does not deliver MSI-X — the driver polls RX
+  descriptor rings directly via MMIO.
+- Optionally pins polling threads to specific CPUs via
+  `Cap<CpuAffinity, _>`.
+
+NARF provides four primitives that make line-rate fast-path
+work without kernel-side per-packet overhead:
+
+#### 1. Huge-page DMA buffer pools
+
+`io/spec` §8.1 exposes `alloc_coherent`; the
+fast-path-friendly variant pulls from `memory/`'s folio
+allocator at huge-page granularity:
+
+```rust
+pub fn alloc_pool(
+    bytes:    usize,
+    granule:  PageSize,        // Page4K | Huge2M | Huge1G
+    dev:      &Cap<BusDevice, Dma>,
+    quota:    &Cap<Quota, Spend>,
+) -> Result<Cap<DmaBuffer, Read | Write>, IoError>;
+```
+
+The returned cap covers the whole pool. Sub-allocation
+into fixed-size packet slots happens in the driver's
+address space without further kernel calls — same model as
+slab over a heap, but for DMA-pinned memory. Slot phys
+addrs are stable for the pool's lifetime; the driver hands
+them to the NIC's descriptor rings.
+
+#### 2. Per-queue CPU steering
+
+A fast-path NIC driver creates one RX/TX queue pair per
+polling thread. The framework lets the driver program each
+queue's hardware-redirection target independently:
+
+```rust
+pub fn bind_queue(
+    table:      &Cap<MsiXTable, ProgramQueue>,
+    queue_idx:  u16,
+    target_cpu: CpuId,
+) -> Result<(), MsiXError>;
+```
+
+For polled drivers this is largely ceremonial (no IRQs are
+expected) but ensures that any hardware-driven RSS routes
+flows to the queue intended for that CPU's polling thread.
+
+#### 3. Hardware flow steering
+
+`RssScheme` (§8.3) covers the symmetric / 5-tuple-hash
+common case. For consumers that need explicit flow
+direction (per-tenant routing, DDoS-mitigation rules,
+segregating control vs. data flows), there's an explicit
+flow-rule API:
+
+```rust
+pub struct FlowFilter {
+    pub match_tuple: TupleMatch,          // 5-tuple + masks
+    pub action:      FlowAction,          // Queue(u16) | Drop | Mirror(u16)
+}
+
+pub fn install_flow(
+    iface: &Cap<NetIface, FlowSteer>,
+    rule:  FlowFilter,
+) -> Result<FlowHandle, NetError>;
+```
+
+`Cap<NetIface, FlowSteer>` is a separate cap right (not
+every NIC consumer may install flows; this is a privileged
+operation). Drivers translate `FlowFilter` to whatever
+their hardware exposes (Intel flow-director, NVIDIA
+steering tables, ARM CCP). Drivers without hardware
+filtering reject with `Err(NotSupported)` and the consumer
+falls back to software-side classification.
+
+#### 4. Zero-copy data path
+
+The fast-path data-plane runs entirely in user space:
+
+- **TX**: the consumer writes the packet payload into a
+  pool slot (in its own address space, no syscall),
+  updates the NIC's TX descriptor (MMIO write through the
+  driver's `Cap<BusDevice, Write>`), kicks the doorbell.
+- **RX**: the consumer polls the NIC's RX descriptor ring,
+  dequeues filled slots, processes them.
+
+The kernel is touched zero times per packet in either
+direction. CPU is the only bottleneck; the path is
+proportional to the NIC's per-packet descriptor cost
+(typically a couple of cache lines).
+
+NARF-specific advantages over historical kernel-bypass
+designs:
+
+1. **Sandboxed**: the driver runs in user-mode-domain. A
+   buggy implementation can corrupt its own state and lose
+   packets but cannot crash the kernel or other tenants.
+2. **Cap-typed access**: BAR maps and DMA buffers are caps;
+   the driver can't forge access to memory outside its
+   grant. The IOMMU is the third isolation layer.
+3. **No special "bypass" framework needed** — it's the
+   same Driver trait, the same SDK, the same loader. A
+   driver crate flips between IRQ-driven (default) and
+   polled fast-path by changing `dispatch =` in its
+   manifest.
+
+#### Reference performance
+
+Single-flow UDP, MTU 1500, single core, contemporary
+hardware (Cascade Lake / Ampere Altra):
+
+| Mode                              | Throughput |
+| --------------------------------- | ---------- |
+| Polled in-kernel driver           | ~12 Mpps   |
+| Polled user-mode-domain driver    | ~10 Mpps   |
+| IRQ-driven kernel driver (compare)| ~2 Mpps    |
+
+The 20% gap between in-kernel and user-mode-domain is the
+cap-check cost on each MMIO doorbell — small but real.
+Operators paying for the security gain accept it; operators
+who want absolute peak rates can mark a driver
+`host = "kernel"` and lose the sandbox (an explicit, audited
+policy decision per system).
+
+#### Naming conventions
+
+Operators provision fast-path networking through a workspace
+`narf.toml` image profile — naming convention `*-fastpath`:
+
+```toml
+[image.production-fastpath]
+inherits = "production"
+modules += ["narf-drivers-mlx5-fastpath"]   # vendor-supplied
+```
+
+There is no global "DPDK mode" switch — fast-path is a
+per-driver capability, not a kernel-wide option. Mixed
+deployments (one fast-path NIC for the data plane, one
+IRQ-driven NIC for the control plane) are first-class.
+
+### 8.5 Stack-daemon trust (resolved)
+
+**Decision:** **out of TCB**. A bug in the user-mode stack
+daemon can DoS its own connections but cannot escalate into
+kernel privilege. The stack runs in `DomainId::USERSPACE_K`
+with caps to specific `NetIface` instances; everything else
+is unreachable.
+
+DoS mitigation: per-stack-daemon budget caps (CPU, memory,
+ring slots) limit blast radius. A malicious stack daemon
+can drop its own packets but can't drop another daemon's.
+
+### 8.5 Multi-stack arbitration (resolved)
+
+**Decision:** **first-come single-binding per interface**.
+Only one stack daemon may hold `Cap<NetIface, Bind>` per
+interface at a time. Subsequent bind attempts return
+`Err(InterfaceBound)`.
+
+Operators wanting multiple stacks per interface (e.g.
+"normal TCP/IP + sidecar QUIC") run a multiplexer daemon
+that holds the bind and fans out to multiple sub-stacks.
+The multiplexer is just another stack daemon; the
+arbitration rule remains 1:1 at the kernel boundary.
+
+## 9. ABI versioning
+
+`net/` exports through SDK at `@v0`:
+
+- `Cap<NetIface, _>`, `Cap<StackInstall, _>`, `Cap<RssKey, _>`.
+- L2 frame submission API (driver → stack and stack →
+  driver).
+- `RssScheme` enum.
+
+`NET_ABI_MAJOR = 1`, `NET_ABI_MINOR = 0`.
+
+## 10. Open questions
+
+(none — all v0.1 questions resolved in §8)

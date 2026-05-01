@@ -1,6 +1,9 @@
 # boot — Specification
 
-> Status: **Outline v0.1** (Stage 1).
+> Status: **v1.0** (Stage 1 design lock). v0.1 outlined entry
+> + handoff; v1.0 locks the bootloader portfolio, the
+> measured-boot integration that drivers framework signing
+> rests on, and the framebuffer handoff.
 
 ## 1. Purpose & scope
 
@@ -104,8 +107,93 @@ from turning into a kernel-side memory-corruption primitive.
 
 Stage 1.
 
-## 8. Open questions
+## 8. Resolved decisions
 
-- Single Limine-only on x86_64, or dual-support with multiboot2 for CI flexibility?
-- Measured boot / TPM integration — defer or plan slot in Stage 4?
-- Early framebuffer handoff for `console/` on systems without serial.
+### 8.1 Bootloader portfolio (resolved)
+
+**Decision (was open):** **Limine on x86_64; UEFI-stub on
+aarch64; multiboot2 fallback for CI.** Three loaders, all
+producing the same `RawBootInfo` shape that `frame/` consumes.
+
+- **Limine** is the primary x86_64 bootloader: well-maintained,
+  modern, supports the protocol features we care about
+  (high-half kernel, KASLR, Smarter ACPI handoff).
+- **multiboot2** stays as a CI fallback because QEMU's
+  `-kernel` direct-load path is multiboot2; this lets us boot
+  fresh kernels in xtask without re-imaging.
+- **UEFI-stub** on aarch64 is the SystemReady-compliant path;
+  on QEMU `virt` we fall back to `-kernel` direct entry.
+
+The three loaders converge on `RawBootInfo` before any
+NARF-specific code runs; downstream subsystems see only the
+unified structure.
+
+### 8.2 Measured boot / TPM (resolved)
+
+**Decision (was open):** **TPM measured boot is mandatory in
+release builds, optional in dev/CI builds.**
+
+Release builds:
+- PCR 7 captures Secure Boot state (UEFI standard).
+- PCR 14 captures the kernel image SHA-256.
+- PCR 15+ are reserved for per-driver firmware measurement
+  (see `security-model/spec` §10.3).
+
+The kernel CA root key (signing chain in `security-model/`
+§9) is sealed against PCRs 7 + 14. Bootloader compromise is
+caught at unseal time; kernel modification is caught at
+PCR 14 mismatch.
+
+Dev/CI builds boot without TPM (no `narf.modules.allow_unsigned`
+loosening). The CA root is read from an unsealed location;
+modules sign with a CI-only CA. Production images explicitly
+re-key.
+
+### 8.3 Framebuffer handoff (resolved)
+
+**Decision (was open):** **bootloader provides framebuffer
+descriptor in `RawBootInfo`**; `console/` consumes it during
+its `Stage::Early` init. Limine fills `framebuffer = Some(fb)`;
+UEFI-stub fills from GOP; multiboot2 fills from the framebuffer
+tag.
+
+If no framebuffer is described (serial-only QEMU), `console/`
+runs serial-only. The framebuffer console is opt-in based on
+the descriptor's presence.
+
+`graphics/` (the FB renderer) takes over the framebuffer at
+Stage::Late once a real driver (bochs-display, virtio-gpu) is
+probed. Until then, `console/` owns the linear FB at the
+boot-mapped address.
+
+## 9. RawBootInfo wire format
+
+Locked at v1.0. Bootloaders MUST produce this exact layout;
+subsequent kernel code reads it once and discards.
+
+```rust
+#[repr(C)]
+pub struct RawBootInfo {
+    pub magic:        u64,           // 0x4E_41_52_46_42_4F_4F_54 = "NARFBOOT"
+    pub abi_version:  u32,           // currently 1
+    pub _reserved:    u32,
+    pub mem_map:      [MemRegion; MEM_MAP_MAX],   // 64 entries
+    pub mem_map_len:  u32,
+    pub kernel_phys:  u64,           // physical base of loaded kernel
+    pub kernel_size:  u64,
+    pub framebuffer:  Option<Framebuffer>,
+    pub rsdp:         Option<PhysAddr>,           // x86_64
+    pub dtb:          Option<PhysAddr>,           // aarch64
+    pub initramfs:    Option<(PhysAddr, u64)>,    // (base, size)
+    pub cmdline:      [u8; 256],
+    pub cmdline_len:  u32,
+}
+```
+
+Adding a field at the end with a `_reserved`-renaming follows
+`BOOT_ABI_MINOR` bump rules. Any layout change is a
+`BOOT_ABI_MAJOR` bump (flag-day).
+
+## 10. Open questions
+
+(none — all v0.1 questions resolved in §8)

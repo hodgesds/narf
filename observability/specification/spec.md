@@ -1,7 +1,10 @@
 # observability — Specification
 
-> Status: **Outline v0.2**. Scope narrowed: event-stream tracing moved
-> to `tracing/`. This spec now covers state inspection only.
+> Status: **v1.0** (Stage 4 design lock). v0.2 narrowed scope
+> to state inspection (event streams moved to `tracing/`);
+> v1.0 locks the core-dump storage path, the debugger-attach
+> trust model, the live-peek policy, the ELF-core layout, and
+> the pre-panic telemetry channel.
 
 ## 1. Purpose & scope
 
@@ -188,17 +191,103 @@ pub fn peek_cap_root(t: TaskId, cap: &Cap<Diagnostics, Read>) -> CapRootView;
 | 3     | PMU sampling via `tracing/` transport; core-dump enrichment with flight-recorder snapshots. |
 | 4     | GDB remote stub; live-inspection peek API; userland tooling to parse core dumps. |
 
-## 8. Open questions
+## 8. Resolved decisions
 
-- **Core-dump storage.** Persistent sink for dumps — block device via
-  `drivers/nvme`, or only console for Stage 1?
-- **Debugger attach trust.** Debugger attach is essentially a
-  privileged TCB operation — lock behind a boot-time switch only?
-- **Live-peek attack surface.** Even read-only peeks can leak secrets
-  or side-channel state. What's the policy? Default-off with explicit
-  enable cap is the likely answer.
-- **Unified or split ELF-core.** One ELF-core per panic, or separate
-  artefacts for CPU state vs. ring snapshots?
-- **Out-of-band telemetry.** Pre-panic health signals (e.g. low
-  memory, cap-table near-full) reported via a tiny PMU-adjacent
-  channel, or via `tracing/`?
+### 8.1 Core-dump storage (resolved)
+
+**Decision:** **block device via the kernel's persistent
+storage stack, with serial-console as a fallback**.
+
+The boot manifest declares a `dump_partition: Option<DiskUuid>`
+(typically a small partition, ~256 MiB). On panic, the
+`narf-frame` panic path:
+1. Quiesces APs via NMI-IPI.
+2. Composes the ELF-core (§8.4) in a pre-reserved buffer.
+3. Writes to the dump partition via the panic-safe block
+   write path (`drivers/nvme` panic_write hook, similar for
+   AHCI / virtio-blk).
+4. If the dump partition is unavailable / write fails,
+   streams the dump out the console (slow but always works).
+
+On next boot, a userspace daemon (`narf-dumpd`) detects the
+fresh dump on the partition and uploads / archives it before
+clearing.
+
+### 8.2 Debugger attach trust (resolved)
+
+**Decision:** **debugger attach requires `Cap<Debugger,
+Attach>` AND a boot-time enable**. Two-factor:
+
+1. The boot param `narf.debug.allow_attach=1` must be set;
+   otherwise the cap is unmintable regardless of who claims
+   it.
+2. Even with the boot param, the `Cap<Debugger, Attach>` is
+   minted only by the bootstrap-authority chain to a
+   designated "debug" process (configured per system).
+
+Production images set `narf.debug.allow_attach=0` permanently.
+Dev images set it 1; the cap is held by the running
+debugger's process which exits releasing it.
+
+### 8.3 Live-peek policy (resolved)
+
+**Decision:** **default-off with explicit `Cap<Diagnostics,
+Read>` enable**.
+
+Live peek (read-only access to kernel-side state for
+inspection) is gated by `Cap<Diagnostics, Read>`. Default
+production builds don't mint this cap to any process.
+Dev/CI builds mint it to the test harness; vendor support
+images can mint it to a vendor-tools process behind audited
+authorisation.
+
+The cap badges with a per-domain allowlist: a `Diagnostics`
+cap may be scoped to "read driver-domain N's state only,"
+not unlimited kernel introspection.
+
+### 8.4 ELF-core layout (resolved)
+
+**Decision:** **single ELF-core per panic** containing:
+
+- One `PT_NOTE` with NARF-specific note types describing
+  which CPUs were running which tasks, the panic message,
+  the kernel version + commit hash.
+- `PT_LOAD` segments for the kernel image (text + data).
+- `PT_LOAD` segments per-recorder ring (per `tracing/spec`
+  §8.3 double-buffer flip).
+- A `PT_NOTE` with the per-CPU register state snapshots.
+
+Tools (`gdb`, `readelf`, `objdump`) read the ELF natively.
+Note types are in the `NARF` vendor namespace; `narf-coretools`
+is the friendly extractor.
+
+### 8.5 Pre-panic telemetry (resolved)
+
+**Decision:** **via `tracing/` rings**, not a separate PMU
+channel. `tracing/` already supports per-domain rings with
+priority dispatch; pre-panic health signals (low memory,
+cap-table near-full, slab-high-watermark) emit as structured
+events to the `kernel-health` ring.
+
+A userspace daemon (`narf-healthd`) subscribes and exposes a
+Prometheus-style metric endpoint or syslog output. The
+in-kernel cost is the same as any tracing event (~50 cycles).
+
+This unifies introspection — there's no parallel
+"out-of-band" channel separate from the rest of telemetry.
+
+## 9. ABI versioning
+
+`observability/` exports through SDK at `@v0`:
+
+- `Cap<Diagnostics, Read>` for live-peek consumers.
+- `Cap<Debugger, _>` for attach.
+- ELF-core note-type IDs (frozen at v1.0).
+- Pre-panic event field schemas (drivers wanting to emit
+  health signals use these).
+
+`OBS_ABI_MAJOR = 1`, `OBS_ABI_MINOR = 0`.
+
+## 10. Open questions
+
+(none — all v0.2 questions resolved in §8)

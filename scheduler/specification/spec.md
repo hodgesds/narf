@@ -1,9 +1,11 @@
 # scheduler — Specification
 
-> Status: **Outline v0.3** (Stage 1 → Stage 4). v0.2 added topology,
-> affinity, resource accounting, and CPU hot-plug. v0.3 specifies
-> PKRS / TCF save-restore at every preemption and direct-context-transfer
-> boundary.
+> Status: **v1.0** (Stage 4 design lock). v0.3 specified PKRS/TCF
+> save-restore on every preemption + direct-context-transfer
+> boundary; v1.0 locks the priority class taxonomy, the
+> heterogeneous-core policy, the wake-overhead cap, the
+> realtime class shape, hot-plug PKS coherence, and ABI
+> versioning.
 
 ## 1. Purpose & scope
 
@@ -195,21 +197,128 @@ stealing, affinity honoured, `ResourceBudget` accounting.
 Stage 4: CPU take-offline path for suspend/resume (with `power/`),
 SMT-aware placement, deadline-ish realtime class.
 
-## 8. Open questions
+## 8. Resolved decisions
 
-- What wake overhead is acceptable before Narf-Ring fast-paths bypass
-  the executor entirely?
-- Priorities — static levels, rate-monotonic, or something CFS-shaped?
-- Do we need fairness guarantees for driver domains vs. user tasks?
-- **E-core / P-core heterogeneity** (Alder Lake+, big.LITTLE).
-  How are heterogeneous cores represented in `Topology`, and what
-  scheduler policy decides which class each task runs on? Probably
-  a class tag on `CpuInfo` and a task-supplied preference; defer
-  concrete policy to Stage 4.
-- **Gang scheduling** for cooperating driver pairs (e.g. IPC
-  producer + consumer on same LLC) — worth the complexity, or lean
-  on direct context transfer?
-- **Realtime class.** SCHED_DEADLINE-style or simpler fixed-priority?
-  Ties to `power/` decisions about DVFS-during-RT.
-- **Hot-plug + PKS** — when a CPU comes online late, does it see a
-  coherent domain-rights state? Spec the bring-up barrier.
+### 8.1 Wake-overhead cap (resolved)
+
+**Decision:** **2 µs** (≈ 6000 cycles at 3 GHz) is the budget
+for a wake-and-poll round trip in the executor. Above this,
+hot paths bypass the executor with direct context transfer
+(`donate_to`, mirroring seL4's IPC fast path) or with
+Narf-Ring polling on the consumer side.
+
+The 2 µs cap is profile-tracked; `tracing/` emits
+`scheduler.wake_latency` histograms and a CI gate fails if
+the p99 regresses past 2.5 µs.
+
+### 8.2 Priority taxonomy (resolved)
+
+**Decision:** **fixed-priority levels with budget-based
+preemption**, not CFS-shaped. Five classes:
+
+```rust
+pub enum SchedClass {
+    Idle,         // background; preempted by anything
+    Batch,        // non-interactive bulk work
+    Default,      // ordinary kernel/user tasks
+    Interactive,  // boosted for low-latency response
+    Realtime,     // bounded latency; see §8.4
+}
+```
+
+Within a class, scheduling is per-CPU FIFO with budget caps.
+Inter-class is strict priority (Realtime preempts
+Interactive preempts Default …).
+
+### 8.3 Driver-domain vs user-task fairness (resolved)
+
+**Decision:** **per-domain budget caps**. Each `DomainId`
+gets a budget pool (configurable at boot, manifest-overridable
+per driver). Tasks attribute CPU to their domain; a
+spendthrift domain is throttled, not its individual tasks.
+
+Default budgets:
+- `DOMAIN_FRAME / CAPS / MEMORY_MGR` — uncapped (TCB).
+- Driver domains — 100 ms / sec / CPU each (tunable).
+- `DOMAIN_USERSPACE_K` — uncapped per-task; per-process caps
+  set by `process/`.
+
+### 8.4 E-core / P-core (resolved)
+
+**Decision:** **`CpuInfo::class` enumerates {`Performance`,
+`Efficient`, `Mixed`}**, populated by `bus/` from CPUID +
+ACPI on x86_64 / DT `cpu-capacity` on aarch64. Tasks declare
+`pref: Option<CpuClass>` in `TaskSpec`; default is `None` =
+"don't care."
+
+Scheduler policy:
+- Realtime tasks → P cores when available.
+- Interactive tasks → P cores preferred, E cores acceptable
+  when P cores are saturated.
+- Batch / Idle tasks → E cores preferred.
+- Driver tasks → P core, can be relocated under thermal
+  pressure (signalled by `power/`).
+
+### 8.5 Gang scheduling (resolved)
+
+**Decision (was open):** **no gang scheduling**. Direct
+context transfer (`donate_to`) handles the IPC-pair case
+adequately and avoids the complexity of multi-CPU
+coordinated dispatch. Producer-consumer pairs that benefit
+from cache-locality express it via affinity hints, not gang.
+
+Revisit if profiling shows specific pairs that lose >10% to
+inter-CPU cache misses.
+
+### 8.6 Realtime class shape (resolved)
+
+**Decision:** **fixed-priority with deadline annotations**,
+not full SCHED_DEADLINE. RT tasks declare:
+
+```rust
+pub struct RtSpec {
+    pub priority: u8,               // 0..=63 (RT range)
+    pub deadline_us: Option<u32>,   // soft hint; not enforced
+    pub period_us:   Option<u32>,   // for periodic tasks
+}
+```
+
+The deadline is a hint to `power/` for DVFS decisions and to
+the scheduler for tie-breaking among same-priority RT tasks.
+True deadline-bounded RT requires hardware support and a
+carefully designed energy model that we're not attempting in
+v1.
+
+### 8.7 CPU hot-plug PKS coherence (resolved)
+
+**Decision:** **AP bring-up sequence includes a PKS-init
+barrier** before the AP is marked ready. Sequence:
+
+1. AP boot trampoline: enable PKS (`CR4.PKS=1` on x86_64;
+   equivalent MTE init on aarch64).
+2. Initialise per-CPU `current_domain = DomainId::FRAME`
+   and write the corresponding PKRS / TCF.
+3. Issue a memory fence visible to the BSP.
+4. BSP polls a shared `online_count` until the AP has
+   completed steps 1-3.
+5. Only then is the AP accepted into the run-queue
+   shuffler.
+
+This guarantees that any task migrated to the new AP sees a
+coherent domain-rights state from the first instruction.
+
+## 9. ABI versioning
+
+`scheduler/` exports through SDK at `@v0`:
+- `spawn`, `spawn_with_spec`, `spawn_user`.
+- `run_until_empty`, `yield_now`.
+- `Cap<Task, _>`, `Cap<CpuBudget, _>`.
+
+Task waking and IRQ integration follows
+`interrupts/spec` §8 (`wait_for_irq`'s waker contract).
+
+`SCHEDULER_ABI_MAJOR = 1`, `SCHEDULER_ABI_MINOR = 0`.
+
+## 10. Open questions
+
+(none — all v0.3 questions resolved in §8)
