@@ -1843,3 +1843,27 @@ fn smoke_mlx5_eqe_pop_event_walks_ring() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/mlx5", smoke_mlx5_eqe_pop_event_walks_ring);
+
+// ── Stage 16: destroy / dealloc opcodes ────────────────────────────
+
+fn smoke_mlx5_destroy_opcodes() -> TestResult {
+    let pairs: &[(super::cmd::CmdOp, u16)] = &[
+        (super::cmd::CmdOp::DestroyQp, 0x501),
+        (super::cmd::CmdOp::DestroyEq, 0x302),
+        (super::cmd::CmdOp::DestroyCq, 0x401),
+        (super::cmd::CmdOp::DeallocPd, 0x801),
+        (super::cmd::CmdOp::DeallocUar, 0x803),
+        (super::cmd::CmdOp::DestroyMkey, 0x202),
+        (super::cmd::CmdOp::DestroyTir, 0x902),
+        (super::cmd::CmdOp::DestroyTis, 0x914),
+        (super::cmd::CmdOp::DestroyRqt, 0x918),
+        (super::cmd::CmdOp::DestroyFlowTable, 0x931),
+    ];
+    for &(op, want) in pairs {
+        if op as u16 != want {
+            return TestResult::Fail("destroy/dealloc opcode discriminant drifted");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_destroy_opcodes);

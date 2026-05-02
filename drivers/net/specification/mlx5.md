@@ -1,6 +1,6 @@
 # mlx5 — Specification
 
-> Status: **v0.15** (Stage 15: async events — EQE polling + EQ doorbell).
+> Status: **v1.0** (Stage 16: destroy paths + teardown — feature-complete clean-room).
 >
 > Clean-room driver for Mellanox / NVIDIA ConnectX-4 / 5 / 6 / 7
 > family Ethernet + InfiniBand HCAs. Reference material: the
@@ -136,6 +136,19 @@ have a server target with a ConnectX HCA in CI.
 
 - **v0.1** (Stage 1): PCI match + init-segment decoder +
   initializing-bit poll + smokes co-located in driver dir.
+- **v1.0** (Stage 16): destroy / dealloc paths. Five new
+  opcodes — `DestroyEq` (0x302), `DestroyCq` (0x401),
+  `DeallocPd` (0x801), `DeallocUar` (0x803). (`DestroyQp`
+  / `DestroyMkey` / `DestroyTir` / `DestroyTis` / `DestroyRqt`
+  / `DestroyFlowTable` were already in the catalog.)
+  `Mlx5Hca::destroy_qp` / `destroy_cq` / `destroy_eq` /
+  `dealloc_pd` / `dealloc_uar` post the matching inline command
+  and remove the resource from its driver-side registry.
+  `teardown_all()` drains every QP/CQ/EQ/PD/UAR in dependency
+  order — used by driver-shutdown + re-bring-up paths. One
+  smoke pinning all destroy/dealloc opcodes to wire values.
+  This closes out the clean-room driver's bring-up + steady-
+  state + tear-down lifecycle.
 - **v0.15** (Stage 15): async events. `mlx5/eqe.rs` lays out
   the 64-byte EQE — event_type at byte 0x01, event_sub_type
   at 0x03, owner bit (bit 0 of byte 0x3F). Typed `EventType`

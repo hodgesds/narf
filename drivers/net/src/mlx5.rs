@@ -1085,6 +1085,67 @@ impl Mlx5Hca {
         Ok(Some(view))
     }
 
+    /// Stage 16: destroy a QP. Sends DESTROY_QP and removes the
+    /// LiveQp record from the registry — the DMA backing drops
+    /// when the LiveQp is freed.
+    pub fn destroy_qp(&self, qp_number: u32) -> Result<(), Mlx5Error> {
+        let _resp = self.issue_command_inline(
+            CmdOp::DestroyQp, qp_number & 0x00FF_FFFF, &[])?;
+        self.qps.lock().retain(|q| q.qp_number != qp_number);
+        Ok(())
+    }
+
+    /// Stage 16: destroy a CQ.
+    pub fn destroy_cq(&self, cq_number: u32) -> Result<(), Mlx5Error> {
+        let _resp = self.issue_command_inline(
+            CmdOp::DestroyCq, cq_number & 0x00FF_FFFF, &[])?;
+        self.cqs.lock().retain(|c| c.cq_number != cq_number);
+        Ok(())
+    }
+
+    /// Stage 16: destroy an EQ.
+    pub fn destroy_eq(&self, eq_number: u32) -> Result<(), Mlx5Error> {
+        let _resp = self.issue_command_inline(
+            CmdOp::DestroyEq, eq_number & 0x00FF_FFFF, &[])?;
+        self.eqs.lock().retain(|e| e.eq_number != eq_number);
+        Ok(())
+    }
+
+    /// Stage 16: release a UAR page back to firmware.
+    pub fn dealloc_uar(&self, uar_page: u32) -> Result<(), Mlx5Error> {
+        let _resp = self.issue_command_inline(
+            CmdOp::DeallocUar, uar_page & 0x00FF_FFFF, &[])?;
+        self.uars.lock().retain(|&u| u != uar_page);
+        Ok(())
+    }
+
+    /// Stage 16: release a PD back to firmware.
+    pub fn dealloc_pd(&self, pd: u32) -> Result<(), Mlx5Error> {
+        let _resp = self.issue_command_inline(
+            CmdOp::DeallocPd, pd & 0x00FF_FFFF, &[])?;
+        self.pds.lock().retain(|&p| p != pd);
+        Ok(())
+    }
+
+    /// Stage 16: orderly tear-down — destroy every tracked QP/CQ/EQ
+    /// and free every PD/UAR. Used by driver-shutdown paths and for
+    /// re-bring-up scenarios. Errors are surfaced via the return,
+    /// but the driver still tries to free everything.
+    pub fn teardown_all(&self) -> Result<(), Mlx5Error> {
+        let mut last_err: Result<(), Mlx5Error> = Ok(());
+        let qpns: Vec<u32> = self.qps.lock().iter().map(|q| q.qp_number).collect();
+        for qpn in qpns { if let Err(e) = self.destroy_qp(qpn)  { last_err = Err(e); } }
+        let cqns: Vec<u32> = self.cqs.lock().iter().map(|c| c.cq_number).collect();
+        for cqn in cqns { if let Err(e) = self.destroy_cq(cqn)  { last_err = Err(e); } }
+        let eqns: Vec<u32> = self.eqs.lock().iter().map(|e| e.eq_number).collect();
+        for eqn in eqns { if let Err(e) = self.destroy_eq(eqn)  { last_err = Err(e); } }
+        let pds: Vec<u32>  = self.pds.lock().clone();
+        for pd  in pds  { if let Err(e) = self.dealloc_pd(pd)   { last_err = Err(e); } }
+        let uars: Vec<u32> = self.uars.lock().clone();
+        for u   in uars { if let Err(e) = self.dealloc_uar(u)   { last_err = Err(e); } }
+        last_err
+    }
+
     /// Stage 14: create a TIR (RX endpoint). Returns the
     /// FW-assigned `tirn`.
     pub fn create_tir(&self, params: steering::TirParams)

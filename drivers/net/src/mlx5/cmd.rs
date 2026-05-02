@@ -147,6 +147,14 @@ pub enum CmdOp {
     DestroyFlowTable = 0x931,
     /// `SET_FLOW_TABLE_ROOT` — Opcode `0x92F`.
     SetFlowTableRoot = 0x92F,
+    /// `DESTROY_EQ` — Opcode `0x302`.
+    DestroyEq   = 0x302,
+    /// `DESTROY_CQ` — Opcode `0x401`.
+    DestroyCq   = 0x401,
+    /// `DEALLOC_PD` — Opcode `0x801`.
+    DeallocPd   = 0x801,
+    /// `DEALLOC_UAR` — Opcode `0x803`.
+    DeallocUar  = 0x803,
 }
 
 /// Status codes the firmware writes into byte 0x20 of the CQE.
