@@ -565,3 +565,93 @@ fn smoke_mlx5_hca_cap_group_discriminants() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/mlx5", smoke_mlx5_hca_cap_group_discriminants);
+
+// ── Stage 5: typed cap decoders ────────────────────────────────────
+
+use super::caps::{
+    CapsDecodeError, EthernetOffloadCaps, HcaGeneralCaps,
+    HCA_CAP_OFF_LOG_MAX_CQ_SZ, HCA_CAP_OFF_LOG_MAX_EQ_SZ,
+    HCA_CAP_OFF_LOG_MAX_MKEY, HCA_CAP_OFF_LOG_MAX_PD,
+    HCA_CAP_OFF_LOG_MAX_QP_SZ, HCA_CAP_OFF_LOG_MAX_SRQ_SZ,
+    HCA_CAP_OFF_VHCA_ID, HCA_CAP_OUT_LEN,
+    ETH_OFF_LRO, ETH_OFF_LSO, ETH_OFF_MAX_LSO_SIZE, ETH_OFF_RSS_IND_TBL,
+    ETH_OFF_RX_CSUM, ETH_OFF_TX_CSUM, ETH_OFF_VLAN_INSERT,
+    ETH_OFF_VLAN_STRIP,
+};
+
+fn smoke_mlx5_general_caps_decode() -> TestResult {
+    let mut bytes = alloc::vec![0u8; HCA_CAP_OUT_LEN];
+    bytes[HCA_CAP_OFF_VHCA_ID]        = 0x12; // BE u16
+    bytes[HCA_CAP_OFF_VHCA_ID + 1]    = 0x34;
+    bytes[HCA_CAP_OFF_LOG_MAX_SRQ_SZ] = 16;
+    bytes[HCA_CAP_OFF_LOG_MAX_QP_SZ]  = 17;
+    bytes[HCA_CAP_OFF_LOG_MAX_CQ_SZ]  = 23;
+    bytes[HCA_CAP_OFF_LOG_MAX_EQ_SZ]  = 21;
+    bytes[HCA_CAP_OFF_LOG_MAX_MKEY]   = 24;
+    bytes[HCA_CAP_OFF_LOG_MAX_PD]     = 15;
+    let caps = match HcaGeneralCaps::from_bytes(bytes) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("HcaGeneralCaps::from_bytes rejected a full payload"),
+    };
+    if caps.vhca_id() != 0x1234 { return TestResult::Fail("vhca_id BE decode wrong"); }
+    if caps.log_max_srq_sz() != 16 { return TestResult::Fail("log_max_srq_sz wrong"); }
+    if caps.log_max_qp_sz()  != 17 { return TestResult::Fail("log_max_qp_sz wrong"); }
+    if caps.log_max_cq_sz()  != 23 { return TestResult::Fail("log_max_cq_sz wrong"); }
+    if caps.log_max_eq_sz()  != 21 { return TestResult::Fail("log_max_eq_sz wrong"); }
+    if caps.log_max_mkey()   != 24 { return TestResult::Fail("log_max_mkey wrong"); }
+    if caps.log_max_pd()     != 15 { return TestResult::Fail("log_max_pd wrong"); }
+    if caps.raw().len()      != HCA_CAP_OUT_LEN
+       { return TestResult::Fail("raw() length not preserved"); }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_general_caps_decode);
+
+fn smoke_mlx5_general_caps_truncated() -> TestResult {
+    // A buffer shorter than the highest committed offset (0x68)
+    // must be rejected.
+    let bytes = alloc::vec![0u8; HCA_CAP_OFF_LOG_MAX_PD];
+    match HcaGeneralCaps::from_bytes(bytes) {
+        Err(CapsDecodeError::Truncated) => TestResult::Pass,
+        _ => TestResult::Fail(
+            "from_bytes accepted a buffer too short for log_max_pd"),
+    }
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_general_caps_truncated);
+
+fn smoke_mlx5_ethernet_offload_caps_decode() -> TestResult {
+    let mut bytes = alloc::vec![0u8; HCA_CAP_OUT_LEN];
+    bytes[ETH_OFF_TX_CSUM]     = 1;
+    bytes[ETH_OFF_RX_CSUM]     = 1;
+    bytes[ETH_OFF_LSO]         = 1;
+    bytes[ETH_OFF_LRO]         = 0;
+    bytes[ETH_OFF_RSS_IND_TBL] = 1;
+    bytes[ETH_OFF_VLAN_INSERT] = 1;
+    bytes[ETH_OFF_VLAN_STRIP]  = 0;
+    // max_lso_size = 65536 BE.
+    bytes[ETH_OFF_MAX_LSO_SIZE..ETH_OFF_MAX_LSO_SIZE + 4]
+        .copy_from_slice(&65536u32.to_be_bytes());
+    let caps = match EthernetOffloadCaps::from_bytes(bytes) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("EthernetOffloadCaps rejected full payload"),
+    };
+    if !caps.supports_tx_csum()        { return TestResult::Fail("tx_csum"); }
+    if !caps.supports_rx_csum()        { return TestResult::Fail("rx_csum"); }
+    if !caps.supports_lso()            { return TestResult::Fail("lso"); }
+    if  caps.supports_lro()            { return TestResult::Fail("lro should be off"); }
+    if !caps.supports_rss()            { return TestResult::Fail("rss"); }
+    if !caps.supports_vlan_insert()    { return TestResult::Fail("vlan_insert"); }
+    if  caps.supports_vlan_strip()     { return TestResult::Fail("vlan_strip should be off"); }
+    if  caps.max_lso_size() != 65536   { return TestResult::Fail("max_lso_size BE wrong"); }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_ethernet_offload_caps_decode);
+
+fn smoke_mlx5_ethernet_offload_caps_truncated() -> TestResult {
+    let bytes = alloc::vec![0u8; ETH_OFF_VLAN_STRIP];
+    match EthernetOffloadCaps::from_bytes(bytes) {
+        Err(CapsDecodeError::Truncated) => TestResult::Pass,
+        _ => TestResult::Fail(
+            "EthernetOffloadCaps accepted a buffer too short"),
+    }
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_ethernet_offload_caps_truncated);

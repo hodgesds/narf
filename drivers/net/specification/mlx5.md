@@ -1,6 +1,6 @@
 # mlx5 — Specification
 
-> Status: **v0.4** (Stage 4: chained mailboxes + QUERY_HCA_CAP + NOP self-test).
+> Status: **v0.5** (Stage 5: typed cap decoders — General + Ethernet offload).
 >
 > Clean-room driver for Mellanox / NVIDIA ConnectX-4 / 5 / 6 / 7
 > family Ethernet + InfiniBand HCAs. Reference material: the
@@ -136,6 +136,21 @@ have a server target with a ConnectX HCA in CI.
 
 - **v0.1** (Stage 1): PCI match + init-segment decoder +
   initializing-bit poll + smokes co-located in driver dir.
+- **v0.5** (Stage 5): typed cap decoders in `mlx5/caps.rs`.
+  `HcaGeneralCaps` exposes vhca_id (BE u16 at 0x10),
+  log_max_srq_sz (0x40), log_max_qp_sz (0x41), log_max_cq_sz
+  (0x53), log_max_eq_sz (0x5B), log_max_mkey (0x60), log_max_pd
+  (0x68); `EthernetOffloadCaps` exposes per-byte offload flags
+  (tx_csum / rx_csum / lso / lro / rss / vlan_insert /
+  vlan_strip) plus max_lso_size (BE u32 at 0x14). Both retain
+  `raw()` for fields we haven't committed to and reject buffers
+  shorter than the highest committed offset
+  (`CapsDecodeError::Truncated`). `Mlx5Hca::query_general_caps`
+  + `query_ethernet_offload_caps` wrap Stage-4
+  `query_hca_cap` with the typed views. Bit-packed sub-fields
+  (e.g. log_max_qp at the low 5 bits of 0x47) defer to a later
+  stage that adds a `bit_field!` helper rather than inlining
+  masks here.
 - **v0.4** (Stage 4): multi-block mailbox chain support
   (`mailbox.rs` — `block_count_for`, `write_input_chain`,
   `read_output_chain`), `Mlx5Hca::issue_command_with_mailboxes`

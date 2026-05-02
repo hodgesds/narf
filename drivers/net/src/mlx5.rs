@@ -39,6 +39,7 @@ use cmd::{
 // Smokes live in the driver directory, not the shared tests.rs.
 mod tests;
 
+pub mod caps;
 pub mod cmd;
 pub mod mailbox;
 
@@ -534,6 +535,28 @@ impl Mlx5Hca {
             blocks.push(block);
         }
         Ok(mailbox::read_output_chain(&blocks, output_len))
+    }
+
+    /// Stage 5: typed wrapper around QUERY_HCA_CAP(GeneralDevice).
+    /// Returns the decoded view; callers needing fields beyond the
+    /// Stage-5 subset go through `caps::HcaGeneralCaps::raw()`.
+    pub fn query_general_caps(
+        &self,
+        current: bool,
+    ) -> Result<caps::HcaGeneralCaps, Mlx5Error> {
+        let bytes = self.query_hca_cap(HcaCapGroup::GeneralDevice, current)?;
+        caps::HcaGeneralCaps::from_bytes(bytes)
+            .map_err(|_| Mlx5Error::CmdFailed(CmdError::NotComplete))
+    }
+
+    /// Stage 5: typed wrapper around QUERY_HCA_CAP(EthernetOffload).
+    pub fn query_ethernet_offload_caps(
+        &self,
+        current: bool,
+    ) -> Result<caps::EthernetOffloadCaps, Mlx5Error> {
+        let bytes = self.query_hca_cap(HcaCapGroup::EthernetOffload, current)?;
+        caps::EthernetOffloadCaps::from_bytes(bytes)
+            .map_err(|_| Mlx5Error::CmdFailed(CmdError::NotComplete))
     }
 
     /// Stage 4: issue `QUERY_HCA_CAP` for a chosen capability group
