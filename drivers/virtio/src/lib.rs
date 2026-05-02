@@ -12,13 +12,16 @@ extern crate narf_io;
 pub mod balloon_pci;
 pub mod blk;
 pub mod blk_pci;
+pub mod fs_pci;
 pub mod gpu_pci;
 pub mod input_pci;
 pub mod iommu_pci;
 pub mod net_pci;
+pub mod p9_pci;
 pub mod pci;
 pub mod queue;
 pub mod rng_pci;
+pub mod scsi_pci;
 pub mod snd_pci;
 pub mod class_blk;
 
@@ -52,6 +55,15 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "virtio-iommu-pci",   || {
         iommu_pci::register_pci_driver();   InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "virtio-scsi-pci",    || {
+        scsi_pci::register_pci_driver();    InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "virtio-9p-pci",      || {
+        p9_pci::register_pci_driver();      InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "virtio-fs-pci",      || {
+        fs_pci::register_pci_driver();      InitResult::Ok
     });
 }
 
