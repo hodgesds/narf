@@ -383,3 +383,172 @@ fn smoke_dp_aux_native_write_encodes_payload() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu", smoke_dp_aux_native_write_encodes_payload);
+
+fn smoke_amdgpu_atom_fwinfo_v3_round_trip() -> TestResult {
+    use crate::amdgpu_atom_fwinfo::{parse, FwInfoError};
+    let mut t = alloc::vec::Vec::new();
+    t.resize(0x80, 0u8);
+    // ATOM_COMMON_TABLE_HEADER: usSize=0x80, fmt=4, content=0x34
+    t[0..2].copy_from_slice(&0x80u16.to_le_bytes());
+    t[2] = 4;
+    t[3] = 0x34;
+    // firmware_revision = 0x0000_1234
+    t[0x04..0x08].copy_from_slice(&0x1234u32.to_le_bytes());
+    // engine clock = 1500 MHz = 150_000 (10kHz units)
+    t[0x08..0x0C].copy_from_slice(&150_000u32.to_le_bytes());
+    // memory clock = 6400 MHz = 640_000
+    t[0x0C..0x10].copy_from_slice(&640_000u32.to_le_bytes());
+    // max pixel clock = 1188 MHz = 118_800
+    t[0x20..0x24].copy_from_slice(&118_800u32.to_le_bytes());
+    // bootup VDDC = 950 mV
+    t[0x2E..0x30].copy_from_slice(&950u16.to_le_bytes());
+    // memory module id = 7, cooling solution id = 2
+    t[0x59] = 7; t[0x5A] = 2;
+    let info = match parse(&t) {
+        Ok(i)  => i,
+        Err(_) => return TestResult::Fail("FwInfo parse rejected synthetic table"),
+    };
+    if info.format_revision != 4 || info.content_revision != 0x34 {
+        return TestResult::Fail("revision fields wrong");
+    }
+    if info.firmware_revision != 0x1234 {
+        return TestResult::Fail("firmware_revision round-trip");
+    }
+    if info.default_engine_mhz() != 1500 {
+        return TestResult::Fail("engine clock MHz conversion");
+    }
+    if info.default_memory_mhz() != 6400 {
+        return TestResult::Fail("memory clock MHz conversion");
+    }
+    if info.max_pixel_clock_pll_10khz != 118_800 {
+        return TestResult::Fail("max pixel clock");
+    }
+    if info.bootup_vddc_mv != 950 {
+        return TestResult::Fail("bootup VDDC");
+    }
+    if info.memory_module_id != 7 || info.cooling_solution_id != 2 {
+        return TestResult::Fail("memory/cooling ids");
+    }
+    // V2.x rejected.
+    let mut bad = t.clone();
+    bad[3] = 0x24; // content rev V2.4
+    if !matches!(parse(&bad), Err(FwInfoError::UnsupportedVersion(_))) {
+        return TestResult::Fail("V2 should be rejected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu", smoke_amdgpu_atom_fwinfo_v3_round_trip);
+
+fn smoke_amdgpu_ucode_header_round_trip() -> TestResult {
+    use crate::amdgpu_ucode::{parse, payload, UCODE_MAGIC, UcodeError};
+    // Build a 1024-byte synthetic blob: 4-byte magic + 32-byte
+    // common header at offset 4 + zero-fill to 256, then a
+    // 768-byte fake payload starting at offset 256.
+    let mut blob = alloc::vec::Vec::new();
+    blob.resize(1024, 0u8);
+    blob[0..4].copy_from_slice(&UCODE_MAGIC.to_le_bytes());
+    blob[4..8].copy_from_slice(&256u32.to_le_bytes());   // start_offset
+    blob[8..12].copy_from_slice(&768u32.to_le_bytes());  // payload_size
+    blob[12..16].copy_from_slice(&0x0001_0203u32.to_le_bytes()); // version
+    blob[16..20].copy_from_slice(&0x0042u32.to_le_bytes());      // feature ver
+    let hdr = match parse(&blob) {
+        Ok(h)  => h,
+        Err(_) => return TestResult::Fail("ucode parse rejected synthetic blob"),
+    };
+    if hdr.start_offset != 256 || hdr.payload_size != 768 {
+        return TestResult::Fail("offsets round-trip");
+    }
+    if hdr.version != 0x0001_0203 || hdr.feature_version != 0x0042 {
+        return TestResult::Fail("version round-trip");
+    }
+    let p = payload(&blob, &hdr);
+    if p.len() != 768 {
+        return TestResult::Fail("payload length");
+    }
+    // Bad magic.
+    let mut bad = blob.clone();
+    bad[0] ^= 0xFF;
+    if !matches!(parse(&bad), Err(UcodeError::BadMagic)) {
+        return TestResult::Fail("bad magic should reject");
+    }
+    // Payload-out-of-bounds.
+    let mut bad = blob.clone();
+    bad[8..12].copy_from_slice(&2000u32.to_le_bytes()); // size > blob
+    if !matches!(parse(&bad), Err(UcodeError::PayloadOutOfBounds)) {
+        return TestResult::Fail("oversize payload should reject");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu", smoke_amdgpu_ucode_header_round_trip);
+
+fn smoke_dp_link_training_completes_against_stub() -> TestResult {
+    // Stub AUX channel that simulates a healthy 2-lane sink: CR
+    // succeeds on the second poll (after one swing bump);
+    // EQ succeeds on the third poll.
+    use crate::dp_aux::{
+        AuxChannel, AuxRequest, AuxResponse, AuxStatus, AuxError,
+        AuxCommand,
+    };
+    use crate::dp_link_training::{run, TrainingParams, TrainingState};
+
+    struct StubAux {
+        // Counter the stub uses to step through pretend sink state.
+        cr_polls: u32,
+        eq_polls: u32,
+    }
+    impl AuxChannel for StubAux {
+        fn transact<'a>(
+            &mut self,
+            req: &AuxRequest<'_>,
+            reply_buf: &'a mut [u8],
+        ) -> Result<AuxResponse<'a>, AuxError> {
+            // All writes succeed silently. Reads: gate on the
+            // address; LANE0_1_STATUS at 0x202, LANE2_3_STATUS at
+            // 0x203, LANE_ALIGN_STATUS_UPDATED at 0x204.
+            match req.cmd {
+                AuxCommand::NativeWrite => {
+                    reply_buf[0] = 0;   // ACK
+                    Ok(AuxResponse { status: AuxStatus::Ack, data: &reply_buf[1..1] })
+                }
+                AuxCommand::NativeRead => {
+                    let v = match req.address {
+                        0x0_0202 => {
+                            // Lane 0/1 nibbles. After 2 polls, CR_DONE
+                            // + EQ_DONE + SYMBOL_LOCKED on both lanes.
+                            self.cr_polls += 1;
+                            if self.cr_polls < 2 { 0x00 }
+                            else if self.eq_polls == 0 { 0x11 } // CR only
+                            else { 0x77 }                       // EQ done
+                        }
+                        0x0_0203 => 0x00, // lane 2/3 unused (2-lane link)
+                        0x0_0204 => {
+                            // INTERLANE_ALIGN_DONE bit 0; flips on
+                            // after EQ symbols lock.
+                            self.eq_polls += 1;
+                            if self.eq_polls < 2 { 0 } else { 1 }
+                        }
+                        _ => 0,
+                    };
+                    reply_buf[0] = 0; // ACK status
+                    reply_buf[1] = v;
+                    Ok(AuxResponse {
+                        status: AuxStatus::Ack,
+                        data: &reply_buf[1..2],
+                    })
+                }
+                _ => Err(AuxError::UnknownStatus),
+            }
+        }
+    }
+    let mut aux = StubAux { cr_polls: 0, eq_polls: 0 };
+    let params = TrainingParams { link_bw_set: 0x0A, lane_count: 2 };
+    let result = match run(&mut aux, params, |_| {}) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("link training surfaced AUX error"),
+    };
+    if result != TrainingState::Trained {
+        return TestResult::Fail("training did not converge to Trained");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu", smoke_dp_link_training_completes_against_stub);

@@ -1,6 +1,28 @@
 # drivers/gpu/amdgpu — Specification
 
-> Status: **v0.4** (Stage 4 — PM4 packet builder + GFX/SDMA ring + DP AUX framing).
+> Status: **v0.5** (Stage 5 — ATOM_FIRMWARE_INFO + GFX ucode header + DP link training).
+>
+> ### v0.5 changes vs v0.4
+>
+> - **`ATOM_FIRMWARE_INFO_V3` walker** (`amdgpu_atom_fwinfo`):
+>   decodes the per-table BIOS-metadata fields (firmware
+>   revision, default engine clock, default memory clock, max
+>   pixel clock, bootup VDDC, memory module id). Pairs with the
+>   `Atombios` directory parser landed in v0.3.
+> - **GFX ucode header parser** (`amdgpu_ucode`): the 256-byte
+>   common header that prefixes every AMD GFX/SDMA/RLC/SMU/PSP
+>   firmware blob. Validates the `0x012345AB` magic, decodes
+>   `start_offset` / `payload_size` / `version` /
+>   `feature_version`, exposes `payload(blob, &header)` for the
+>   PSP DMA-stage path.
+> - **DP link-training state machine** (`dp_link_training`):
+>   transport-agnostic source-side state machine driving CR +
+>   EQ phases per DP 1.4a §3.5. Caller supplies an `AuxChannel`
+>   impl + a `delay_us` closure; state machine handles
+>   per-lane voltage-swing + pre-emphasis tuning, retry counts,
+>   and TPS1→TPS2 progression. A future DCN-AUX transport
+>   plugs in via `AuxChannel`; today's smoke uses an in-memory
+>   stub.
 >
 > ### v0.4 changes vs v0.3
 >
