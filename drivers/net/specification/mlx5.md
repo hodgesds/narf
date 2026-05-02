@@ -1,6 +1,6 @@
 # mlx5 — Specification
 
-> Status: **v0.2** (Stage 2: command-mailbox transport format).
+> Status: **v0.3** (Stage 3: cmdq DMA + live transport).
 >
 > Clean-room driver for Mellanox / NVIDIA ConnectX-4 / 5 / 6 / 7
 > family Ethernet + InfiniBand HCAs. Reference material: the
@@ -136,6 +136,20 @@ have a server target with a ConnectX HCA in CI.
 
 - **v0.1** (Stage 1): PCI match + init-segment decoder +
   initializing-bit poll + smokes co-located in driver dir.
+- **v0.3** (Stage 3): cmdq DMA backing allocated in `bring_up`
+  + `cmdq_addr_high` / `cmdq_addr_low_sz` registers programmed
+  to point firmware at it (4-KiB-aligned phys, log_size = 0,
+  one slot for synchronous bring-up). Live transport surface:
+  `Mlx5Hca::issue_command_inline(op, input_modifier, &inline)`
+  writes the CQE into slot 0, calls `ring_cmd_doorbell(1)` (BAR0
+  + 0x18, BE-encoded slot mask), polls the slot's `status_own`
+  byte until bit 0 clears, and decodes the inline reply through
+  Stage-2 `decode_response`. DMA-mailbox transport: 512-byte
+  `MailboxBlock` layout (480-byte payload + chain pointer at
+  0x1F0/0x1F4 + block metadata at 0x1FC..0x200) and
+  `build_cqe_with_mailboxes` for opcodes whose input + output
+  exceed the inline 8-byte windows. Stage 4 will chain multi-
+  block mailbox payloads + post the first NOP from probe.
 - **v0.2** (Stage 2): 64-byte Command Queue Entry layout
   (`cmd.rs`) — builder for inline-mode CQEs, BE opcode + input
   modifier encoding, byte-XOR signature, ownership-bit poll,

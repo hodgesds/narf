@@ -20,10 +20,18 @@
 //! works live next door at `mlx5/tests.rs`.
 
 use core::fmt;
+use core::sync::atomic::{compiler_fence, Ordering};
 
 use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
+use narf_io::{alloc_coherent, DmaBuffer};
+use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
+
+use cmd::{
+    build_cqe_inline, decode_response, is_complete, CmdError, CmdOp,
+    CmdResponse, CQE_LEN, CQE_OFF_STATUS_OWN, STATUS_OWN_BIT,
+};
 
 // Smokes live in the driver directory, not the shared tests.rs.
 mod tests;
@@ -82,6 +90,19 @@ const INITIALIZING_BIT: u32 = 1 << 31;
 /// should declare the HCA dead. Scaled to spin-loop iterations; on
 /// real silicon a sleep-pump is preferred — Stage 1 just polls.
 const INIT_POLL_LIMIT: u32 = 20_000_000;
+
+/// Stage 3: cmdq sizing.
+///
+/// `log_size = 0` → 1 outstanding command (smallest legal value, plenty
+/// for synchronous bring-up). One CQE = 64 B; we still allocate a 4-KiB
+/// page for natural alignment.
+const STAGE3_CMDQ_LOG_SIZE: u8 = 0;
+const STAGE3_CMDQ_PAGE_LEN: usize = 4096;
+
+/// Per-CQE polling budget. mlx5 NOP / QUERY_HCA_CAP latency is
+/// well under a microsecond; we give plenty of headroom for a busy
+/// host before declaring the firmware hung.
+const CMD_POLL_LIMIT: u32 = 50_000_000;
 
 // ── Decoded init-segment ───────────────────────────────────────────
 
@@ -154,11 +175,27 @@ pub enum Mlx5Error {
     BarMapFailed,
     InitTimeout,
     UnsupportedDevice,
+    /// Stage 3: failed to allocate the cmdq DMA backing.
+    CmdqAlloc,
+    /// Stage 3: CQE polling exceeded the per-command budget.
+    CmdTimeout,
+    /// Stage 3: command builder rejected the call (inline overflow,
+    /// etc.).
+    CmdBuild(CmdError),
+    /// Stage 3: firmware completed the CQE with a non-OK status.
+    CmdFailed(CmdError),
 }
 
 pub struct Mlx5Hca {
     mmio:    MmioRegion,
     segment: InitSegment,
+    /// Stage 3: 4-KiB DMA-coherent backing for the command queue.
+    /// One slot used (log_size = 0); kept resident for the life of
+    /// the device.
+    cmdq:    DmaBuffer,
+    /// Per-command polling cursor — token rotates so each issued CQE
+    /// gets a unique tag, useful for diagnostics.
+    next_token: IrqSafeSpinLock<u8>,
 }
 
 impl fmt::Debug for Mlx5Hca {
@@ -174,9 +211,18 @@ impl fmt::Debug for Mlx5Hca {
 }
 
 impl Mlx5Hca {
-    /// Bring the HCA up to the point where it has cleared its
-    /// initializing bit and we have a decoded init segment in hand.
-    /// Stage 1 stops here — Stage 2 issues the first command.
+    /// Bring the HCA up to the point where the cmdq is alive and the
+    /// init segment is cached. Stage 3 lifecycle:
+    ///
+    /// 1. Map BAR0.
+    /// 2. Poll the initializing bit clear (PRM §1.6).
+    /// 3. Snapshot the init segment.
+    /// 4. Allocate the cmdq DMA backing (one 4-KiB page).
+    /// 5. Program `cmdq_addr_high` / `cmdq_addr_low_sz` so firmware
+    ///    sees the cmdq.
+    ///
+    /// Stage 4 will issue the first NOP from probe; Stage 3 only
+    /// stages the transport.
     ///
     /// # Safety
     /// Caller owns the device's BARs exclusively for the duration of
@@ -213,8 +259,93 @@ impl Mlx5Hca {
         }
         let segment = decode_init_segment(&raw);
 
-        Ok(Self { mmio, segment })
+        // Stage 3: cmdq allocation + register programming.
+        let cmdq = alloc_coherent(STAGE3_CMDQ_PAGE_LEN, DomainId::DRIVER_0)
+            .map_err(|_| Mlx5Error::CmdqAlloc)?;
+        let cmdq_phys = cmdq.phys_addr().raw();
+        program_cmdq_registers(&mmio, cmdq_phys, STAGE3_CMDQ_LOG_SIZE);
+
+        Ok(Self {
+            mmio,
+            segment,
+            cmdq,
+            next_token: IrqSafeSpinLock::new(1),
+        })
     }
+
+    /// Issue an inline-mode command (≤8 B input, ≤8 B output) to slot
+    /// 0 of the cmdq, ring the doorbell, poll for completion, and
+    /// decode the inline response. Used by Stage 3 to bring up NOP
+    /// and any other small synchronous command.
+    pub fn issue_command_inline(
+        &self,
+        op:             CmdOp,
+        input_modifier: u32,
+        inline_input:   &[u8],
+    ) -> Result<CmdResponse, Mlx5Error> {
+        let token = {
+            let mut tok = self.next_token.lock();
+            let v = *tok;
+            *tok = tok.wrapping_add(1);
+            v
+        };
+        let cqe = build_cqe_inline(op, input_modifier, inline_input, token)
+            .map_err(Mlx5Error::CmdBuild)?;
+
+        // Write the CQE bytes into slot 0 of the cmdq DMA buffer.
+        let slot_phys = self.cmdq.phys_addr().raw();
+        // SAFETY: identity-mapped DMA; cmdq is exclusively owned by
+        // this driver.
+        unsafe {
+            for (i, &b) in cqe.iter().enumerate() {
+                core::ptr::write_volatile(
+                    (slot_phys + i as u64) as *mut u8, b);
+            }
+        }
+        compiler_fence(Ordering::SeqCst);
+
+        // Ring the cmd_dbell doorbell with bit 0 set (slot 0).
+        self.ring_cmd_doorbell(1);
+
+        // Poll the slot's status_own byte until the ownership bit
+        // clears.
+        let own_phys = slot_phys + CQE_OFF_STATUS_OWN as u64;
+        let mut spins = 0u32;
+        loop {
+            // SAFETY: identity-mapped DMA.
+            let v = unsafe { core::ptr::read_volatile(own_phys as *const u8) };
+            if v & STATUS_OWN_BIT == 0 { break; }
+            spins += 1;
+            if spins > CMD_POLL_LIMIT { return Err(Mlx5Error::CmdTimeout); }
+            core::hint::spin_loop();
+        }
+
+        // Read the completed CQE back out.
+        let mut completed = [0u8; CQE_LEN];
+        // SAFETY: identity-mapped DMA.
+        unsafe {
+            for i in 0..CQE_LEN {
+                completed[i] = core::ptr::read_volatile(
+                    (slot_phys + i as u64) as *const u8);
+            }
+        }
+        // Sanity check + decode.
+        debug_assert!(is_complete(&completed));
+        decode_response(&completed).map_err(Mlx5Error::CmdFailed)
+    }
+
+    /// Ring the BAR0+0x18 cmd_dbell register with `slot_mask` — bit
+    /// `i` set launches CQE in slot `i`. Field is BE on wire.
+    pub fn ring_cmd_doorbell(&self, slot_mask: u32) {
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            self.mmio.write32(ISEG_CMD_DBELL as u64,
+                              slot_mask.swap_bytes());
+        }
+    }
+
+    /// Phys address of the cmdq DMA backing (Stage 3+).
+    pub fn cmdq_phys(&self) -> u64 { self.cmdq.phys_addr().raw() }
 
     pub fn fw_rev(&self) -> (u16, u16, u16) {
         (self.segment.fw_rev_major,
@@ -237,6 +368,31 @@ impl Mlx5Hca {
         // SAFETY: identity-mapped MMIO.
         let v = unsafe { self.mmio.read32(off) };
         v.swap_bytes()
+    }
+}
+
+// ── cmdq register programming ──────────────────────────────────────
+
+/// Program the init-segment's `cmdq_addr_high` (BAR0+0x10) and
+/// `cmdq_addr_low_sz` (BAR0+0x14) registers to point firmware at the
+/// driver-allocated cmdq backing. Both fields are BE on wire.
+///
+/// `cmdq_phys` MUST be ≥ 4-KiB aligned (the low 12 bits are reserved
+/// in the register and discarded — page-aligned DMA satisfies that).
+/// `log_size` is packed into the low 4 bits of the low register.
+pub(crate) fn program_cmdq_registers(
+    mmio:      &MmioRegion,
+    cmdq_phys: u64,
+    log_size:  u8,
+) {
+    let high = (cmdq_phys >> 32) as u32;
+    let low_aligned = (cmdq_phys as u32) & 0xFFFF_F000;
+    let low_sz  = low_aligned | ((log_size as u32) & 0xF);
+    // SAFETY: identity-mapped MMIO; offsets bounded; caller has
+    // exclusive ownership of the device.
+    unsafe {
+        mmio.write32(ISEG_CMDQ_ADDR_HIGH as u64, high.swap_bytes());
+        mmio.write32(ISEG_CMDQ_ADDR_LO_SZ as u64, low_sz.swap_bytes());
     }
 }
 

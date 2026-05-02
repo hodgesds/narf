@@ -299,3 +299,134 @@ kernel_test_in!("drivers/net/mlx5", smoke_mlx5_cqe_inline_overflow);
 
 // Compile-time guard: CQE struct length is exactly 64 bytes.
 const _: () = assert!(CQE_LEN == 64);
+
+// ── Stage 3: DMA mailbox + cmdq programming ────────────────────────
+
+use super::cmd::{
+    build_cqe_with_mailboxes, build_mailbox_block,
+    MAILBOX_BLOCK_LEN, MAILBOX_PAYLOAD_LEN, MAILBOX_OFF_BLOCK_NUM,
+    MAILBOX_OFF_NEXT_H, MAILBOX_OFF_NEXT_L, MAILBOX_OFF_SIGNATURE,
+    MAILBOX_OFF_TOKEN, MAILBOX_PHYS_ALIGN_MASK,
+};
+use super::cmd::{
+    CQE_OFF_INPUT_LEN, CQE_OFF_INPUT_MB_H, CQE_OFF_INPUT_MB_L,
+    CQE_OFF_OUTPUT_LEN, CQE_OFF_OUTPUT_MB_H, CQE_OFF_OUTPUT_MB_L,
+};
+
+fn smoke_mlx5_cqe_mailbox_phys_be_encoded() -> TestResult {
+    // Choose a 64-bit phys addr with a non-zero high half; the
+    // low 9 bits are deliberately set to confirm they get masked
+    // off (mailbox phys must be 512-B aligned).
+    let in_phys:  u64 = 0x0000_0001_DEAD_BEFFu64;
+    let out_phys: u64 = 0x0000_0002_CAFE_F1FFu64;
+    let cqe = build_cqe_with_mailboxes(
+        CmdOp::QueryHcaCap, 0xAABB_CCDD,
+        in_phys,  0x100,
+        out_phys, 0x200,
+        0x77,
+    );
+    let want_in_h  = ((in_phys  >> 32) as u32).to_be_bytes();
+    let want_in_l  = ((in_phys  & MAILBOX_PHYS_ALIGN_MASK) as u32).to_be_bytes();
+    let want_out_h = ((out_phys >> 32) as u32).to_be_bytes();
+    let want_out_l = ((out_phys & MAILBOX_PHYS_ALIGN_MASK) as u32).to_be_bytes();
+    if cqe[CQE_OFF_INPUT_MB_H..CQE_OFF_INPUT_MB_H + 4] != want_in_h {
+        return TestResult::Fail("input_mb_h not BE-encoded");
+    }
+    if cqe[CQE_OFF_INPUT_MB_L..CQE_OFF_INPUT_MB_L + 4] != want_in_l {
+        return TestResult::Fail("input_mb_l low-bit mask wrong");
+    }
+    if cqe[CQE_OFF_OUTPUT_MB_H..CQE_OFF_OUTPUT_MB_H + 4] != want_out_h {
+        return TestResult::Fail("output_mb_h not BE-encoded");
+    }
+    if cqe[CQE_OFF_OUTPUT_MB_L..CQE_OFF_OUTPUT_MB_L + 4] != want_out_l {
+        return TestResult::Fail("output_mb_l low-bit mask wrong");
+    }
+    let want_in_len  = 0x100u32.to_be_bytes();
+    let want_out_len = 0x200u32.to_be_bytes();
+    if cqe[CQE_OFF_INPUT_LEN..CQE_OFF_INPUT_LEN + 4] != want_in_len {
+        return TestResult::Fail("input_length not BE-encoded");
+    }
+    if cqe[CQE_OFF_OUTPUT_LEN..CQE_OFF_OUTPUT_LEN + 4] != want_out_len {
+        return TestResult::Fail("output_length not BE-encoded");
+    }
+    // Even with mailboxes, the type / opcode / signature /
+    // ownership invariants from Stage 2 still hold.
+    if cqe[CQE_OFF_TYPE] != CQE_TYPE_MAILBOX {
+        return TestResult::Fail("mailbox CQE type field wrong");
+    }
+    if cqe[CQE_OFF_STATUS_OWN] & STATUS_OWN_BIT == 0 {
+        return TestResult::Fail("mailbox CQE ownership bit not set");
+    }
+    let mut xor = 0u8;
+    for &b in cqe.iter() { xor ^= b; }
+    if xor != 0 {
+        return TestResult::Fail("mailbox CQE signature not XOR-checksum");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_cqe_mailbox_phys_be_encoded);
+
+fn smoke_mlx5_mailbox_block_layout() -> TestResult {
+    // Plant a payload that exercises the boundary: byte 0 and the
+    // last payload byte at offset 479 are non-zero so we can confirm
+    // they land in the right window.
+    let mut payload = [0u8; MAILBOX_PAYLOAD_LEN];
+    payload[0]   = 0xAA;
+    payload[479] = 0xBB;
+    let next_phys: u64 = 0x0000_0003_FACE_F00Du64;
+    let block = build_mailbox_block(&payload, /* num */ 7, /* tok */ 0x33, next_phys);
+    if block.len() != MAILBOX_BLOCK_LEN {
+        return TestResult::Fail("mailbox block size != 512 B");
+    }
+    if block[0]   != 0xAA { return TestResult::Fail("payload byte 0 dropped"); }
+    if block[479] != 0xBB { return TestResult::Fail("payload byte 479 dropped"); }
+    // No payload bleed past 480 (offsets 0x1E0..0x1EF are payload's
+    // tail, but we put 0 there — it should still be 0).
+    for i in 480..MAILBOX_OFF_NEXT_H {
+        if block[i] != 0 {
+            return TestResult::Fail("payload bleed into reserved post-payload region");
+        }
+    }
+    let want_h = ((next_phys >> 32) as u32).to_be_bytes();
+    let want_l = ((next_phys & 0xFFFF_FFFF) as u32).to_be_bytes();
+    if block[MAILBOX_OFF_NEXT_H..MAILBOX_OFF_NEXT_H + 4] != want_h {
+        return TestResult::Fail("next_block_h not BE-encoded");
+    }
+    if block[MAILBOX_OFF_NEXT_L..MAILBOX_OFF_NEXT_L + 4] != want_l {
+        return TestResult::Fail("next_block_l not BE-encoded");
+    }
+    if block[MAILBOX_OFF_BLOCK_NUM] != 0
+       || block[MAILBOX_OFF_BLOCK_NUM + 1] != 7 {
+        return TestResult::Fail("block_number not BE-encoded at 0x1FC");
+    }
+    if block[MAILBOX_OFF_TOKEN] != 0x33 {
+        return TestResult::Fail("token byte at 0x1FE wrong");
+    }
+    // Signature is XOR-checksum; XOR-of-all should be 0.
+    let mut xor = 0u8;
+    for &b in block.iter() { xor ^= b; }
+    if xor != 0 {
+        return TestResult::Fail("mailbox-block signature not XOR-checksum");
+    }
+    let _ = MAILBOX_OFF_SIGNATURE; // kept exported for diag callers
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_mailbox_block_layout);
+
+fn smoke_mlx5_mailbox_payload_truncates() -> TestResult {
+    // > 480-byte payload must be silently truncated (Stage 4 will
+    // chain blocks; Stage 3 only ever fills one).
+    let too_big = [0xCCu8; 1024];
+    let block = build_mailbox_block(&too_big, 0, 0, 0);
+    for i in 0..MAILBOX_PAYLOAD_LEN {
+        if block[i] != 0xCC {
+            return TestResult::Fail("payload byte not copied through");
+        }
+    }
+    // Beyond 480: must be the chain pointer / metadata, NOT 0xCC.
+    if block[MAILBOX_PAYLOAD_LEN] == 0xCC {
+        return TestResult::Fail("oversize payload bled past 480-byte window");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_mailbox_payload_truncates);

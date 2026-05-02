@@ -230,6 +230,98 @@ pub fn decode_response(cqe: &[u8; CQE_LEN]) -> Result<CmdResponse, CmdError> {
     Ok(resp)
 }
 
+// ── Stage 3: DMA-mailbox blocks ────────────────────────────────────
+
+/// One mailbox block. PRM §3.5.3 fixes the size at 512 bytes with a
+/// 480-byte payload window followed by chain pointers + per-block
+/// metadata. Blocks chain through the next-pointer at offset 0x1F0.
+pub const MAILBOX_BLOCK_LEN:    usize = 512;
+pub const MAILBOX_PAYLOAD_LEN:  usize = 480;
+pub const MAILBOX_OFF_NEXT_H:   usize = 0x1F0;
+pub const MAILBOX_OFF_NEXT_L:   usize = 0x1F4;
+pub const MAILBOX_OFF_BLOCK_NUM: usize = 0x1FC;
+pub const MAILBOX_OFF_TOKEN:    usize = 0x1FE;
+pub const MAILBOX_OFF_SIGNATURE: usize = 0x1FF;
+
+/// Mailbox blocks must be 512-B-aligned in host phys; the low 9 bits
+/// of the CQE's `input_mb_l` / `output_mb_l` register fields carry
+/// reserved bits, so we mask them off when encoding the pointer.
+pub const MAILBOX_PHYS_ALIGN_MASK: u64 = !0x1FFu64;
+
+/// Build a single 512-byte mailbox block from a payload slice. The
+/// caller is responsible for splitting longer payloads across linked
+/// blocks (Stage 4); Stage 3 only sends commands whose input + output
+/// fit in 480 bytes each.
+pub fn build_mailbox_block(
+    payload:    &[u8],
+    block_num:  u16,
+    token:      u8,
+    next_phys:  u64,
+) -> [u8; MAILBOX_BLOCK_LEN] {
+    let mut b = [0u8; MAILBOX_BLOCK_LEN];
+    let n = payload.len().min(MAILBOX_PAYLOAD_LEN);
+    b[..n].copy_from_slice(&payload[..n]);
+    let next_h = (next_phys >> 32) as u32;
+    let next_l = (next_phys & 0xFFFF_FFFF) as u32;
+    b[MAILBOX_OFF_NEXT_H..MAILBOX_OFF_NEXT_H + 4]
+        .copy_from_slice(&next_h.to_be_bytes());
+    b[MAILBOX_OFF_NEXT_L..MAILBOX_OFF_NEXT_L + 4]
+        .copy_from_slice(&next_l.to_be_bytes());
+    b[MAILBOX_OFF_BLOCK_NUM..MAILBOX_OFF_BLOCK_NUM + 2]
+        .copy_from_slice(&block_num.to_be_bytes());
+    b[MAILBOX_OFF_TOKEN] = token;
+    let mut sig = 0u8;
+    for (i, &x) in b.iter().enumerate() {
+        if i == MAILBOX_OFF_SIGNATURE { continue; }
+        sig ^= x;
+    }
+    b[MAILBOX_OFF_SIGNATURE] = sig;
+    b
+}
+
+/// Build a CQE that points at DMA-mailbox blocks for both input and
+/// output. The mailbox phys addrs are 512-B aligned; lower bits are
+/// masked off before encoding so callers passing a misaligned addr
+/// don't silently corrupt the cmdq.
+pub fn build_cqe_with_mailboxes(
+    op:              CmdOp,
+    input_modifier:  u32,
+    input_mb_phys:   u64,
+    input_len:       u32,
+    output_mb_phys:  u64,
+    output_len:      u32,
+    token:           u8,
+) -> [u8; CQE_LEN] {
+    let mut cqe = [0u8; CQE_LEN];
+    cqe[CQE_OFF_TYPE] = CQE_TYPE_MAILBOX;
+
+    cqe[CQE_OFF_INPUT_LEN..CQE_OFF_INPUT_LEN + 4]
+        .copy_from_slice(&input_len.to_be_bytes());
+    let in_aligned = input_mb_phys & MAILBOX_PHYS_ALIGN_MASK;
+    cqe[CQE_OFF_INPUT_MB_H..CQE_OFF_INPUT_MB_H + 4]
+        .copy_from_slice(&((in_aligned >> 32) as u32).to_be_bytes());
+    cqe[CQE_OFF_INPUT_MB_L..CQE_OFF_INPUT_MB_L + 4]
+        .copy_from_slice(&((in_aligned as u32)).to_be_bytes());
+
+    cqe[CQE_OFF_OPCODE..CQE_OFF_OPCODE + 2]
+        .copy_from_slice(&(op as u16).to_be_bytes());
+    cqe[CQE_OFF_INPUT_MOD..CQE_OFF_INPUT_MOD + 4]
+        .copy_from_slice(&input_modifier.to_be_bytes());
+
+    let out_aligned = output_mb_phys & MAILBOX_PHYS_ALIGN_MASK;
+    cqe[CQE_OFF_OUTPUT_MB_H..CQE_OFF_OUTPUT_MB_H + 4]
+        .copy_from_slice(&((out_aligned >> 32) as u32).to_be_bytes());
+    cqe[CQE_OFF_OUTPUT_MB_L..CQE_OFF_OUTPUT_MB_L + 4]
+        .copy_from_slice(&((out_aligned as u32)).to_be_bytes());
+    cqe[CQE_OFF_OUTPUT_LEN..CQE_OFF_OUTPUT_LEN + 4]
+        .copy_from_slice(&output_len.to_be_bytes());
+
+    cqe[CQE_OFF_TOKEN]      = token;
+    cqe[CQE_OFF_SIGNATURE]  = compute_signature(&cqe);
+    cqe[CQE_OFF_STATUS_OWN] = STATUS_OWN_BIT;
+    cqe
+}
+
 /// Convenience: simulate firmware completing `cqe` in place by
 /// clearing the ownership bit and writing a status / syndrome /
 /// output payload. Used by smokes to drive the decoder against
