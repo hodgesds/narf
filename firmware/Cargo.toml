@@ -1,0 +1,30 @@
+[package]
+name         = "narf-firmware"
+description  = "Firmware blob registry. Cap-gated `Cap<FirmwareBlob, Read>` surface drivers use to fetch device firmware images at probe time. Three sources (in-tree → initramfs → hot install), Ed25519-signed by default. Spec: firmware/specification/spec.md."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_firmware"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Accept unsigned firmware blobs. Developer / CI builds only — every
+# blob hand-out emits a one-line warning. Production builds leave
+# this feature off so the registry rejects unsigned blobs.
+firmware-allow-unsigned = []
+
+[dependencies]
+narf-lib          = { path = "../lib" }
+narf-capabilities = { path = "../capabilities" }
+narf-io           = { path = "../io" }
+narf-rcu          = { path = "../rcu" }
+narf-crypto       = { path = "../crypto" }
+narf-kernel-test  = { path = "../verification/kernel-test" }
+
+[lints]
+workspace = true

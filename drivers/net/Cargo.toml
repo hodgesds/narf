@@ -23,6 +23,7 @@ narf-drivers      = { path = "../" }
 narf-init         = { path = "../../init" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
 narf-driver-runtime = { path = "../runtime", default-features = false, features = ["kernel"] }
+narf-firmware    = { path = "../../firmware" }
 
 [lints]
 workspace = true
