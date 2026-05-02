@@ -28,6 +28,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 // Smokes live in the driver directory, not the shared tests.rs.
 mod tests;
 
+pub mod cmd;
+
 // ── PCI device IDs (ConnectX-4 .. ConnectX-6 Dx) ───────────────────
 
 /// Vendor: Mellanox (now NVIDIA Networking).

@@ -8,6 +8,14 @@
 //! - `decode_init_segment` round-trips a synthetic BE-encoded
 //!   buffer.
 //! - `is_initializing` reads bit 31 of the `0x0FFC` register.
+//!
+//! Stage 2 cover:
+//! - `build_cqe_inline` BE-encodes the opcode at offset 0x10.
+//! - `compute_signature` is the byte-XOR-excluding-signature.
+//! - `is_complete` tracks the ownership bit (bit 0 of byte 0x3F).
+//! - `decode_response` round-trips a `simulate_completion` reply.
+//! - `decode_response` rejects HW-owned CQEs and FW-error status.
+//! - `CmdStatus::from_raw` maps documented codes; unmapped → Unknown.
 
 #![cfg(target_arch = "x86_64")]
 
@@ -132,3 +140,162 @@ fn smoke_mlx5_is_initializing_bit() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/mlx5", smoke_mlx5_is_initializing_bit);
+
+// ── Stage 2: command-mailbox layout ────────────────────────────────
+
+use super::cmd::{
+    build_cqe_inline, compute_signature, decode_response, is_complete,
+    simulate_completion, CmdError, CmdOp, CmdStatus, CQE_LEN,
+    CQE_OFF_OPCODE, CQE_OFF_INPUT_MOD, CQE_OFF_STATUS_OWN,
+    CQE_OFF_SIGNATURE, CQE_OFF_TYPE, CQE_TYPE_MAILBOX,
+    STATUS_OWN_BIT,
+};
+
+fn smoke_mlx5_cqe_nop_opcode_be_encoded() -> TestResult {
+    let cqe = match build_cqe_inline(CmdOp::Nop, 0xDEAD_BEEF, &[], 0x42) {
+        Ok(c)  => c,
+        Err(_) => return TestResult::Fail("build_cqe_inline rejected NOP"),
+    };
+    // Opcode 0x0101, BE → bytes [0x01, 0x01] at offset 0x10.
+    if cqe[CQE_OFF_OPCODE] != 0x01 || cqe[CQE_OFF_OPCODE + 1] != 0x01 {
+        return TestResult::Fail("NOP opcode not BE-encoded at offset 0x10");
+    }
+    // input_modifier 0xDEAD_BEEF, BE at offset 0x14.
+    let want = [0xDE, 0xAD, 0xBE, 0xEF];
+    if cqe[CQE_OFF_INPUT_MOD..CQE_OFF_INPUT_MOD + 4] != want {
+        return TestResult::Fail("input_modifier not BE-encoded at offset 0x14");
+    }
+    if cqe[CQE_OFF_TYPE] != CQE_TYPE_MAILBOX {
+        return TestResult::Fail("CQE type field not set to mailbox (0x07)");
+    }
+    if cqe[CQE_OFF_STATUS_OWN] & STATUS_OWN_BIT == 0 {
+        return TestResult::Fail("ownership bit not set after build (SW must hand off)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_cqe_nop_opcode_be_encoded);
+
+fn smoke_mlx5_cqe_signature_xor() -> TestResult {
+    let cqe = build_cqe_inline(CmdOp::Nop, 0, &[1, 2, 3, 4], 0xAA).unwrap();
+    let sig = cqe[CQE_OFF_SIGNATURE];
+    let recomputed = compute_signature(&cqe);
+    if sig != recomputed {
+        return TestResult::Fail("stored signature does not match recompute");
+    }
+    // XOR all bytes including signature should equal 0 (because the
+    // signature is exactly the XOR of all other bytes).
+    let mut xor = 0u8;
+    for &b in cqe.iter() { xor ^= b; }
+    if xor != 0 {
+        return TestResult::Fail("signature is not the XOR-checksum of the CQE");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_cqe_signature_xor);
+
+fn smoke_mlx5_cqe_is_complete_tracks_own_bit() -> TestResult {
+    let mut cqe = build_cqe_inline(CmdOp::Nop, 0, &[], 0).unwrap();
+    if is_complete(&cqe) {
+        return TestResult::Fail("freshly built CQE reported complete (own bit cleared)");
+    }
+    cqe[CQE_OFF_STATUS_OWN] &= !STATUS_OWN_BIT;
+    if !is_complete(&cqe) {
+        return TestResult::Fail("CQE with own=0 reported as not complete");
+    }
+    // Higher bits in status_own MUST NOT be confused for the own
+    // bit.
+    cqe[CQE_OFF_STATUS_OWN] = 0xFE;
+    if !is_complete(&cqe) {
+        return TestResult::Fail("only bit 0 of status_own is the own bit");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_cqe_is_complete_tracks_own_bit);
+
+fn smoke_mlx5_cqe_decode_response_round_trip() -> TestResult {
+    let mut cqe = build_cqe_inline(CmdOp::QueryHcaCap, 0, &[], 0x55).unwrap();
+    // HW still owns → decode_response must refuse.
+    if !matches!(decode_response(&cqe), Err(CmdError::NotComplete)) {
+        return TestResult::Fail(
+            "decode_response did not refuse a HW-owned CQE");
+    }
+    let payload = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+    simulate_completion(&mut cqe, /* status */ 0, /* syn */ 0,
+                        /* output_mod */ 0xCAFE_F00D, &payload);
+    let resp = match decode_response(&cqe) {
+        Ok(r)  => r,
+        Err(e) => {
+            let _ = e;
+            return TestResult::Fail("decode_response failed on a clean OK reply");
+        }
+    };
+    if resp.status != CmdStatus::Ok { return TestResult::Fail("status not OK"); }
+    if resp.output_modifier != 0xCAFE_F00D {
+        return TestResult::Fail("output_modifier not BE-decoded");
+    }
+    if resp.inline_output != payload {
+        return TestResult::Fail("inline_output bytes did not round-trip");
+    }
+    if resp.token != 0x55 {
+        return TestResult::Fail("token did not survive round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_cqe_decode_response_round_trip);
+
+fn smoke_mlx5_cqe_fw_status_surfaced() -> TestResult {
+    let mut cqe = build_cqe_inline(CmdOp::Nop, 0, &[], 0).unwrap();
+    // BAD_PARAM with syndrome 0xABCDEF.
+    simulate_completion(&mut cqe, 0x03, 0x00AB_CDEF, 0, &[]);
+    match decode_response(&cqe) {
+        Err(CmdError::FwStatus(CmdStatus::BadParam, syn)) if syn == 0x00AB_CDEF
+            => TestResult::Pass,
+        Err(CmdError::FwStatus(_, _))
+            => TestResult::Fail("FwStatus mapped wrong status code"),
+        _ => TestResult::Fail(
+            "non-OK status was not reported as FwStatus"),
+    }
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_cqe_fw_status_surfaced);
+
+fn smoke_mlx5_cmd_status_from_raw_catalog() -> TestResult {
+    let pairs: &[(u8, CmdStatus)] = &[
+        (0x00, CmdStatus::Ok),
+        (0x01, CmdStatus::InternalErr),
+        (0x02, CmdStatus::BadOp),
+        (0x03, CmdStatus::BadParam),
+        (0x04, CmdStatus::BadSysState),
+        (0x05, CmdStatus::BadResource),
+        (0x06, CmdStatus::ResourceBusy),
+        (0x08, CmdStatus::ExceedLim),
+        (0x09, CmdStatus::BadResState),
+        (0x0A, CmdStatus::BadIndex),
+        (0x0F, CmdStatus::NoResources),
+        (0x50, CmdStatus::BadInputLen),
+        (0x51, CmdStatus::BadOutputLen),
+    ];
+    for &(raw, want) in pairs {
+        if CmdStatus::from_raw(raw) != want {
+            return TestResult::Fail("CmdStatus::from_raw catalog mismatch");
+        }
+    }
+    // Any unmapped byte falls into Unknown(b).
+    match CmdStatus::from_raw(0x7F) {
+        CmdStatus::Unknown(0x7F) => TestResult::Pass,
+        _ => TestResult::Fail("unmapped status code lost the raw byte"),
+    }
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_cmd_status_from_raw_catalog);
+
+fn smoke_mlx5_cqe_inline_overflow() -> TestResult {
+    let too_long = [0u8; 9];
+    match build_cqe_inline(CmdOp::Nop, 0, &too_long, 0) {
+        Err(CmdError::InlineOverflow) => TestResult::Pass,
+        _ => TestResult::Fail(
+            "build_cqe_inline accepted a >8-byte inline input"),
+    }
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_cqe_inline_overflow);
+
+// Compile-time guard: CQE struct length is exactly 64 bytes.
+const _: () = assert!(CQE_LEN == 64);

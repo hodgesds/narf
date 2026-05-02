@@ -1,6 +1,6 @@
 # mlx5 — Specification
 
-> Status: **v0.1** (Stage 1: presence + init-segment decoder).
+> Status: **v0.2** (Stage 2: command-mailbox transport format).
 >
 > Clean-room driver for Mellanox / NVIDIA ConnectX-4 / 5 / 6 / 7
 > family Ethernet + InfiniBand HCAs. Reference material: the
@@ -136,3 +136,49 @@ have a server target with a ConnectX HCA in CI.
 
 - **v0.1** (Stage 1): PCI match + init-segment decoder +
   initializing-bit poll + smokes co-located in driver dir.
+- **v0.2** (Stage 2): 64-byte Command Queue Entry layout
+  (`cmd.rs`) — builder for inline-mode CQEs, BE opcode + input
+  modifier encoding, byte-XOR signature, ownership-bit poll,
+  inline-response decoder, mapped status-code catalog
+  (`CmdStatus`), `simulate_completion` test-harness helper for
+  driving the decoder against synthesised replies. Opcodes
+  surfaced: `Nop` (0x101) and `QueryHcaCap` (0x100).
+  Live cmdq DMA + doorbell programming is deferred to Stage 3
+  so the format can be locked + smoke-tested in isolation.
+
+## 9. Stage 2 — command-mailbox layout
+
+The Command Queue Entry (CQE) is a 64-byte structure laid out
+according to PRM §3.5. All multi-byte fields are big-endian.
+Software:
+
+1. Builds a CQE in a 64-byte slot of the cmdq (allocated in
+   Stage 3); the CQE has `status_own` bit 0 set to 1 ("HW owns").
+2. Rings the `cmd_dbell` register at BAR0+0x18 with a bitmask of
+   slot indices to launch.
+3. Polls the slot's `status_own` byte until bit 0 clears.
+4. Decodes the `command_output_inline` (16 B) + status code at
+   offset 0x20.
+
+Inline-mode CQEs are sufficient for opcodes whose input + output
+both fit in 8 bytes each (NOP, simple QUERY_*). Larger commands
+use DMA-mailbox pointers at offsets 0x08 / 0x30 — Stage 3.
+
+### Status codes
+
+| Raw | Variant         | Meaning                            |
+|-----|-----------------|------------------------------------|
+| 00  | `Ok`            | Command completed successfully     |
+| 01  | `InternalErr`   | Firmware internal error            |
+| 02  | `BadOp`         | Opcode unknown to firmware         |
+| 03  | `BadParam`      | Bad input modifier / inline arg    |
+| 04  | `BadSysState`   | HCA in wrong state for opcode      |
+| 05  | `BadResource`   | Resource handle invalid            |
+| 06  | `ResourceBusy`  | Resource currently in use          |
+| 08  | `ExceedLim`     | Resource limit reached             |
+| 09  | `BadResState`   | Resource in wrong state            |
+| 0A  | `BadIndex`      | Index out of range                 |
+| 0F  | `NoResources`   | Out of HW resources                |
+| 50  | `BadInputLen`   | input_length mismatch              |
+| 51  | `BadOutputLen`  | output_length mismatch             |
+| —   | `Unknown(b)`    | Unmapped — preserves the raw byte  |
