@@ -29,6 +29,7 @@ narf-drivers-net     = { path = "../drivers/net" }
 narf-drivers         = { path = "../drivers" }
 narf-drivers-storage = { path = "../drivers/storage" }
 narf-drivers-usb     = { path = "../drivers/usb" }
+narf-drivers-platform = { path = "../drivers/platform" }
 narf-input           = { path = "../input" }
 narf-input-driver    = { path = "../drivers/input" }
 narf-graphics        = { path = "../graphics" }

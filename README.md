@@ -65,7 +65,7 @@ intra-address-space isolation.
   framekernel's domain model.
 - **Verification and observability are first-class.** A kernel-resident
   test harness (`cargo xtask test`) boots the real kernel under QEMU and
-  asserts on live invariants — 562 smokes on x86_64, 292 on aarch64 at
+  asserts on live invariants — 564 smokes on x86_64, 292 on aarch64 at
   time of writing — alongside USDT-style probes, flight-recorder rings, a
   PMU-sampling surface, and an ABI promise (syscall numbers carry an upper
   8-bit version, `relibc` will gate against it). Bugs are caught at the
@@ -225,6 +225,31 @@ Live from boot through `cargo xtask run`:
   + I226 LM/V/IT families, CTRL.RST reset, MAC read from RAL/RAH,
   legacy TX + RX descriptor rings, polled `tx(&[u8])` / `rx(&mut)`
   + `HwNic` adapter.
+- RTL8139: clean-room from the public Realtek programming guide
+  — the canonical legacy 10/100 Mbps PCI NIC. CONFIG1 unlock +
+  CR.RST + MAC read from IDR0..5 + 64 KiB cyclic RX ring + four
+  2 KiB TX buffers + `tx` / `rx` + link-status read.
+- HPET (`narf_time::hpet`): clean-room from the Intel HPET 1.0a
+  spec — capabilities + clock-period decode at the
+  platform-fixed `0xFED00000` MMIO base, main counter read,
+  enable / disable, ticks-to-nanos conversion. Used as a
+  TSC-validation cross-check + fallback clocksource.
+- Intel ICH SMBus (`narf_drivers_platform::smbus`): clean-room
+  from the public ICH9 datasheet. PCI class 0x0C / subclass 0x05
+  match (any vendor), IO BAR4 capture, byte-data + word-data
+  read/write transactions through the host-controller PIO
+  registers.
+- TPM 2.0 (`narf_drivers_platform::tpm`): clean-room from the
+  TCG-published PC Client PTP (CRB interface) and TIS v1.21
+  (legacy memory-mapped) specs. Auto-detects which interface the
+  silicon exposes at `0xFED40000` (locality 0), exposes
+  `submit(cmd)` for callers that already speak the TPM2 wire
+  format, and a `tpm2_get_random(bytes)` convenience.
+- USB Hub class (`narf_drivers_usb::hub`): clean-room from the
+  USB 2.0 Specification chapter 11. GET_DESCRIPTOR(Hub) + per-
+  downstream-port SET_FEATURE(PORT_POWER) + GET_STATUS +
+  PORT_RESET / C_PORT_RESET drive the per-port reset flow that
+  enables enumeration through external hubs.
 - Intel HD Audio (HDA): clean-room driver for the AMD Ryzen /
   Phoenix and Radeon HD Audio Controllers — BAR0 mapping, GCTL
   reset, CORB/RIRB ring DMA, STATESTS codec walk, Get Parameter
@@ -248,7 +273,7 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **562/0/22** smokes;
+`cargo xtask test --arch=x86_64` passes **564/0/22** smokes;
 `--arch=aarch64` passes **292/0/10**. Skips are x86-specific PCIe
 surfaces or live-device tests that skip cleanly when QEMU doesn't
 expose the device. See `STATUS.md` for the full tally and per-

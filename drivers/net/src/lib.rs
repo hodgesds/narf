@@ -32,6 +32,7 @@ extern crate alloc;
 
 pub mod e1000;
 pub mod igc;
+pub mod rtl8139;
 pub mod r8169;
 pub mod rtl8125;
 pub mod qcnfa765;
@@ -74,6 +75,10 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "igc", || {
         igc::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "rtl8139", || {
+        rtl8139::register_pci_driver();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "iwlwifi", || {

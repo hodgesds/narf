@@ -18,7 +18,7 @@ asks for. Updated when observable kernel behaviour changes.
   delivers hardware LAPIC-timer IRQs, exits cleanly.
 - `cargo xtask run --arch=aarch64` boots, runs the full async demo
   using CNTPCT_EL0 as the clock, exits via ARM semihosting.
-- `cargo xtask test --arch=x86_64` passes **562/0/22** (pass / fail / skip).
+- `cargo xtask test --arch=x86_64` passes **564/0/22** (pass / fail / skip).
 - `cargo xtask test --arch=aarch64` passes **292/0/10** (pass / fail / skip).
   Skips are x86_64-specific PCIe surfaces or live-device tests that
   skip cleanly when QEMU doesn't expose the device.
@@ -48,6 +48,11 @@ asks for. Updated when observable kernel behaviour changes.
 | e1000 / e1000e   | Real Intel NIC (8254x + 8257x family). TX + RX.   |
 | ixgbe            | Intel 82599 / X540 / X550 10 GbE. PCI match + reset + EEPROM MAC + advanced TX ring + RX ring + MSI-X + `HwNic`. Live bring-up smoke skips on QEMU (no emulated 82599). |
 | igc              | Intel I225 / I226 family 2.5 GbE. Clean-room from public Intel datasheets — CTRL.RST + RAL/RAH MAC read + legacy TX/RX descriptor rings + tx/rx. MSI-X + advanced descriptors are follow-ups. |
+| rtl8139          | Realtek RTL8139 10/100 Mbps. Clean-room from public Realtek programming guide — CONFIG1 unlock + CR.RST + IDR0..5 MAC + 64 KiB cyclic RX ring + 4 × 2 KiB TX buffers + tx/rx + link-status. |
+| HPET             | Intel HPET 1.0a — caps decode at 0xFED00000, counter read + enable/disable + ticks-to-nanos conversion. Used as TSC-validation cross-check + fallback clocksource. |
+| SMBus (ICH)      | Intel ICH SMBus controller, PCI class 0x0C/subclass 0x05 (any vendor) — IO BAR4 + byte-data + word-data read/write transactions. |
+| TPM 2.0          | TCG PC Client PTP (CRB) + TIS v1.21 (legacy) auto-detect at 0xFED40000 — `submit(cmd)` + `tpm2_get_random` helpers. |
+| USB Hub class    | USB 2.0 Chapter 11 — GET_DESCRIPTOR(Hub) + SET_FEATURE(PORT_POWER) + GET_STATUS + per-port reset for downstream device enumeration. |
 | iwlwifi          | Intel Wi-Fi 6 / 6E (AX200 / AX201 / AX210 / AX211). **Structural probe only** — PCI match table + spec doc. Operational register map (CSR/PRPH offsets, firmware loader, TFD/RBD descriptors, host-command opcodes) is not in any public Intel doc; further stages blocked on public register docs. See `drivers/net/specification/iwlwifi.md`. |
 | AHCI (ICH9/10)   | HBA bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT. |
 | xHCI USB host    | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT. |

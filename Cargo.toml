@@ -42,6 +42,7 @@ members = [
     "drivers/usb",
     "drivers/input",
     "drivers/graphics",
+    "drivers/platform",
     "input",
     "graphics",
     "init",

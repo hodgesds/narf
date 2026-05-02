@@ -14,6 +14,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(missing_debug_implementations)]
 
+pub mod hpet;
 pub mod wall;
 
 mod tests;

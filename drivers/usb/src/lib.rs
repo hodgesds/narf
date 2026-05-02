@@ -9,6 +9,7 @@ extern crate alloc;
 pub mod xhci;
 pub mod msc;
 pub mod hid;
+pub mod hub;
 
 mod tests;
 
