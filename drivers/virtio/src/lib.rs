@@ -14,6 +14,7 @@ pub mod blk;
 pub mod blk_pci;
 pub mod gpu_pci;
 pub mod input_pci;
+pub mod iommu_pci;
 pub mod net_pci;
 pub mod pci;
 pub mod queue;
@@ -48,6 +49,9 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "virtio-snd-pci",     || {
         snd_pci::register_pci_driver();     InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "virtio-iommu-pci",   || {
+        iommu_pci::register_pci_driver();   InitResult::Ok
     });
 }
 
