@@ -50,6 +50,14 @@ pub const VIRTIO_GPU_PCI_DEVICE:        u16 = 0x1050;
 /// Legacy (transitional) virtio-gpu (VirtIO 1.2 §4.1.2 transitional ids).
 pub const VIRTIO_GPU_PCI_DEVICE_LEGACY: u16 = 0x1010;
 
+// VirtIO 1.2 §5.7.2: virtio-gpu exposes two virtqueues —
+// controlq (idx 0) for command/response, cursorq (idx 1) for
+// cursor updates. Driver-side default depths.
+pub const CTRL_Q_INDEX:   u16 = 0;
+pub const CURSOR_Q_INDEX: u16 = 1;
+pub const CTRL_Q_DEPTH:   u16 = 16;
+pub const CURSOR_Q_DEPTH: u16 = 4;
+
 mod tests;
 
 // Command codes (VirtIO 1.2 §5.7.6).
