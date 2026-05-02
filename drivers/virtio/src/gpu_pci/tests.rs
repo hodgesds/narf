@@ -221,3 +221,22 @@ fn smoke_virtio_gpu_pci_resource_flush_round_trip() -> TestResult {
 }
 kernel_test_in!("drivers/virtio/gpu_pci",
     smoke_virtio_gpu_pci_resource_flush_round_trip);
+
+fn smoke_virtio_gpu_pci_live_paint_pattern() -> TestResult {
+    use crate::gpu_pci;
+    if !gpu_pci::is_probed() {
+        return TestResult::Skip("no virtio-gpu-pci device on this run");
+    }
+    // SAFETY: live device + bring_up succeeded if `is_probed`; the
+    // lock guards concurrent submitters.
+    let r = gpu_pci::with_controller_mut(|c| unsafe {
+        c.init_scanout()?;
+        c.paint_test_pattern()
+    });
+    match r {
+        Some(Ok(())) => TestResult::Pass,
+        Some(Err(_)) => TestResult::Fail("paint_test_pattern failed"),
+        None         => TestResult::Skip("controller missing"),
+    }
+}
+kernel_test_in!("drivers/virtio/gpu_pci", smoke_virtio_gpu_pci_live_paint_pattern);

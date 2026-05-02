@@ -294,6 +294,50 @@ impl VirtioGpuPci {
         }
     }
 
+    /// Paint a solid 32-bit BGRA color across the entire scanout
+    /// buffer, then issue TRANSFER + FLUSH so it's visible. Test
+    /// hook + sanity smoke.
+    ///
+    /// # Safety
+    /// `init_scanout` must have completed; no concurrent draw
+    /// in flight.
+    pub unsafe fn paint_solid(&mut self, bgra: u32) -> Result<(), VirtioPciError> {
+        // SAFETY: scanout_buf is identity-mapped + sized w*h*4.
+        unsafe {
+            let p = self.scanout_buf.phys_addr().raw() as *mut u32;
+            for i in 0..(SCANOUT_W * SCANOUT_H) as usize {
+                core::ptr::write_volatile(p.add(i), bgra);
+            }
+            self.flush()
+        }
+    }
+
+    /// Paint a 32x32 BGRA test pattern centered in the scanout, on
+    /// top of a contrasting fill — useful for visual confirmation
+    /// that the TRANSFER + FLUSH path actually pushed pixels.
+    ///
+    /// # Safety
+    /// As `paint_solid`.
+    pub unsafe fn paint_test_pattern(&mut self) -> Result<(), VirtioPciError> {
+        // Magenta background + cyan center square.
+        // SAFETY: caller-asserted preconditions.
+        unsafe {
+            let p = self.scanout_buf.phys_addr().raw() as *mut u32;
+            for y in 0..SCANOUT_H as usize {
+                for x in 0..SCANOUT_W as usize {
+                    let in_box = x >= (SCANOUT_W as usize / 2 - 16)
+                              && x <  (SCANOUT_W as usize / 2 + 16)
+                              && y >= (SCANOUT_H as usize / 2 - 16)
+                              && y <  (SCANOUT_H as usize / 2 + 16);
+                    let c = if in_box { 0xFF00FFFFu32 } else { 0xFFFF00FFu32 };
+                    core::ptr::write_volatile(
+                        p.add(y * SCANOUT_W as usize + x), c);
+                }
+            }
+            self.flush()
+        }
+    }
+
     /// TRANSFER_TO_HOST_2D + RESOURCE_FLUSH for the entire scanout.
     /// Call after every batch of FB writes the user wants visible.
     ///
