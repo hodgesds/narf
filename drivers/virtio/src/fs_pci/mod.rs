@@ -34,7 +34,8 @@ use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::pci::{
-    discover, map_cap, VirtioCaps, VirtioPciError, VirtioRegion,
+    discover, enable_msix_queue, map_cap, VirtioCaps, VirtioPciError,
+    VirtioRegion,
     CC_DEVICE_FEATURE, CC_DEVICE_FEATURE_SELECT, CC_DEVICE_STATUS,
     CC_DRIVER_FEATURE, CC_DRIVER_FEATURE_SELECT, CC_NUM_QUEUES,
     CC_QUEUE_DESC, CC_QUEUE_DEVICE, CC_QUEUE_DRIVER, CC_QUEUE_ENABLE,
@@ -61,6 +62,8 @@ pub struct VirtioFsPci {
     pool:                  DmaBuffer,
     request_notify_off:    u16,
     pub config:            FsConfig,
+    pub irq_vector:        Option<u8>,
+    msix:                  Option<narf_bus::MsixTable>,
     pub ready:             bool,
 }
 
@@ -170,8 +173,27 @@ impl VirtioFsPci {
             pool,
             request_notify_off,
             config: cfg,
+            irq_vector: None, msix: None,
             ready: true,
         })
+    }
+
+    /// Bind the first request queue (queue 1) to MSI-X.
+    ///
+    /// # Safety
+    /// Caller owns the device's BAR + cfg-space exclusively.
+    pub unsafe fn enable_msix(
+        &mut self,
+        cap:    &Cap<BusDeviceCap, Write>,
+        device: &BusDevice,
+    ) -> Result<u8, VirtioPciError> {
+        // SAFETY: caller-asserted.
+        let (v, table) = unsafe {
+            enable_msix_queue(&self.common, cap, device, REQUEST_IDX_0)?
+        };
+        self.irq_vector = Some(v);
+        self.msix       = Some(table);
+        Ok(v)
     }
 
     /// Submit a single FUSE request on the first request queue.
@@ -324,10 +346,12 @@ fn probe(
             | narf_bus::pci::cmd::INTX_DISABLE,
     ).map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // SAFETY: probe contract.
-    let dev = match unsafe { VirtioFsPci::bring_up(&device, &cap) } {
+    let mut dev = match unsafe { VirtioFsPci::bring_up(&device, &cap) } {
         Ok(d)  => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
+    // SAFETY: same.
+    let _ = unsafe { dev.enable_msix(&cap, &device) };
     *CONTROLLER.lock() = Some(dev);
     Ok(())
 }

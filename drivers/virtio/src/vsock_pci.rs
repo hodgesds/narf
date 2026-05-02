@@ -17,7 +17,8 @@ use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::pci::{
-    discover, map_cap, VirtioCaps, VirtioPciError, VirtioRegion,
+    discover, enable_msix_queue, map_cap, VirtioCaps, VirtioPciError,
+    VirtioRegion,
     CC_DEVICE_FEATURE, CC_DEVICE_FEATURE_SELECT, CC_DEVICE_STATUS,
     CC_DRIVER_FEATURE, CC_DRIVER_FEATURE_SELECT, CC_NUM_QUEUES,
     CC_QUEUE_DESC, CC_QUEUE_DEVICE, CC_QUEUE_DRIVER, CC_QUEUE_ENABLE,
@@ -206,6 +207,8 @@ pub struct VirtioVsockPci {
     rx_slots:              IrqSafeSpinLock<Vec<u64>>,
     rx_notify_off:         u16,
     tx_notify_off:         u16,
+    pub irq_vector:        Option<u8>,
+    msix:                  Option<narf_bus::MsixTable>,
     pub ready:             bool,
 }
 
@@ -352,8 +355,25 @@ impl VirtioVsockPci {
             rx_pool,
             rx_slots: IrqSafeSpinLock::new(rx_slots),
             rx_notify_off, tx_notify_off,
+            irq_vector: None, msix: None,
             ready: true,
         })
+    }
+
+    /// Bind queue 0 (rx) to MSI-X so the kernel wakes on incoming packets.
+    ///
+    /// # Safety
+    /// Caller owns the device's BAR + cfg-space exclusively.
+    pub unsafe fn enable_msix(
+        &mut self,
+        cap:    &Cap<BusDeviceCap, Write>,
+        device: &BusDevice,
+    ) -> Result<u8, VirtioPciError> {
+        // SAFETY: caller-asserted.
+        let (v, table) = unsafe { enable_msix_queue(&self.common, cap, device, 0)? };
+        self.irq_vector = Some(v);
+        self.msix       = Some(table);
+        Ok(v)
     }
 
     /// Send a single vsock packet — `hdr` carries the destination
@@ -540,10 +560,12 @@ pub fn probe(
             | narf_bus::pci::cmd::INTX_DISABLE,
     ).map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // SAFETY: caller-authority over the device.
-    let dev = match unsafe { VirtioVsockPci::bring_up(&device, &cap) } {
+    let mut dev = match unsafe { VirtioVsockPci::bring_up(&device, &cap) } {
         Ok(d)  => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
+    // SAFETY: same.
+    let _ = unsafe { dev.enable_msix(&cap, &device) };
     *CONTROLLER.lock() = Some(dev);
     Ok(())
 }

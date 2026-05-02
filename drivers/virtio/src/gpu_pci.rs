@@ -101,6 +101,8 @@ pub struct DisplayMode {
 pub struct VirtioGpuPci {
     notify:               VirtioRegion,
     notify_off_multiplier: u32,
+    pub irq_vector:       Option<u8>,
+    msix:                 Option<narf_bus::MsixTable>,
     ctrl_q:               IrqSafeSpinLock<Option<Virtqueue>>,
     _cursor_q:            IrqSafeSpinLock<Option<Virtqueue>>,
     _ctrl_layout_buf:     DmaBuffer,
@@ -132,7 +134,7 @@ impl VirtioGpuPci {
     /// Caller owns the device exclusively.
     pub unsafe fn bring_up(
         device: &BusDevice,
-        _cap:   &Cap<BusDeviceCap, Write>,
+        cap:    &Cap<BusDeviceCap, Write>,
     ) -> Result<Self, VirtioPciError> {
         // SAFETY: bounded walk.
         let caps: VirtioCaps = unsafe { discover(device) }?;
@@ -205,8 +207,18 @@ impl VirtioGpuPci {
         let resp_buf = alloc_coherent(4096, DomainId::DRIVER_0)
             .map_err(|_| VirtioPciError::BarMapFailed)?;
 
+        // Best-effort MSI-X for the controlq (queue 0).
+        // SAFETY: caller-asserted exclusive ownership.
+        let (irq_vector, msix) = match unsafe {
+            crate::pci::enable_msix_queue(&common, cap, device, 0)
+        } {
+            Ok((v, t)) => (Some(v), Some(t)),
+            Err(_)     => (None, None),
+        };
+
         let me = Self {
             notify, notify_off_multiplier,
+            irq_vector, msix,
             ctrl_q:        IrqSafeSpinLock::new(Some(ctrl_q)),
             _cursor_q:     IrqSafeSpinLock::new(Some(cursor_q)),
             _ctrl_layout_buf:   ctrl_buf,

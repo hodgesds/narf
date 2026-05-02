@@ -34,7 +34,8 @@ use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::pci::{
-    discover, map_cap, VirtioCaps, VirtioPciError, VirtioRegion,
+    discover, enable_msix_queue, map_cap, VirtioCaps, VirtioPciError,
+    VirtioRegion,
     CC_DEVICE_FEATURE, CC_DEVICE_FEATURE_SELECT, CC_DEVICE_STATUS,
     CC_DRIVER_FEATURE, CC_DRIVER_FEATURE_SELECT, CC_NUM_QUEUES,
     CC_QUEUE_DESC, CC_QUEUE_DEVICE, CC_QUEUE_DRIVER, CC_QUEUE_ENABLE,
@@ -178,6 +179,11 @@ pub struct VirtioConsolePci {
     cfg:                   ConsoleConfig,
     rx_notify_off:         u16,
     tx_notify_off:         u16,
+    /// Allocated MSI-X IDT vector (queue 0 / receiveq); `None` until
+    /// `enable_msix` runs. Consumers wait via
+    /// `narf_interrupts::wait_for_irq(irq_vector)`.
+    pub irq_vector:        Option<u8>,
+    msix:                  Option<narf_bus::MsixTable>,
     pub ready:             bool,
 }
 
@@ -341,8 +347,29 @@ impl VirtioConsolePci {
             cfg,
             rx_notify_off,
             tx_notify_off,
+            irq_vector: None,
+            msix:       None,
             ready: true,
         })
+    }
+
+    /// Bind queue 0 (receiveq) to an MSI-X vector so the kernel
+    /// gets woken on incoming console bytes.
+    ///
+    /// # Safety
+    /// Caller owns the device's BAR + cfg-space exclusively.
+    pub unsafe fn enable_msix(
+        &mut self,
+        cap:    &Cap<BusDeviceCap, Write>,
+        device: &BusDevice,
+    ) -> Result<u8, VirtioPciError> {
+        // SAFETY: caller-asserted.
+        let (v, table) = unsafe {
+            enable_msix_queue(&self.common, cap, device, QIDX_RX)?
+        };
+        self.irq_vector = Some(v);
+        self.msix       = Some(table);
+        Ok(v)
     }
 
     pub fn cols(&self) -> u16 { self.cfg.cols }
@@ -520,10 +547,12 @@ pub fn probe(
             | narf_bus::pci::cmd::INTX_DISABLE,
     ).map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // SAFETY: probe contract — bus hands us exclusive BAR ownership.
-    let dev = match unsafe { VirtioConsolePci::bring_up(&device, &cap) } {
+    let mut dev = match unsafe { VirtioConsolePci::bring_up(&device, &cap) } {
         Ok(d)  => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
+    // SAFETY: same.
+    let _ = unsafe { dev.enable_msix(&cap, &device) }; // best-effort
     *CONTROLLER.lock() = Some(dev);
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name:    alloc::string::String::from("vcon0"),

@@ -33,7 +33,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 use narf_input::{InputEvent, KeyCode, KeyEvent, Modifiers, push_global};
 
 use crate::pci::{
-    discover, map_cap, VirtioCaps, VirtioPciError,
+    discover, enable_msix_queue, map_cap, VirtioCaps, VirtioPciError,
     CC_DEVICE_FEATURE, CC_DEVICE_FEATURE_SELECT, CC_DEVICE_STATUS,
     CC_DRIVER_FEATURE, CC_DRIVER_FEATURE_SELECT,
     CC_QUEUE_DESC, CC_QUEUE_DEVICE, CC_QUEUE_DRIVER, CC_QUEUE_ENABLE,
@@ -71,12 +71,15 @@ struct Queues {
 #[doc(hidden)]
 pub struct VirtioInputPci {
     notify:               crate::pci::VirtioRegion,
+    common:               crate::pci::VirtioRegion,
     notify_off_multiplier: u32,
     queues:               IrqSafeSpinLock<Option<Queues>>,
     rx_buf:               DmaBuffer,
     _status_buf:          DmaBuffer,
     _q0_layout_buf:       DmaBuffer,
     event_q_notify_off:   u16,
+    pub irq_vector:       Option<u8>,
+    msix:                 Option<narf_bus::MsixTable>,
     pub ready:            bool,
     rel_dx_acc:           core::sync::atomic::AtomicI32,
     rel_dy_acc:           core::sync::atomic::AtomicI32,
@@ -250,16 +253,34 @@ impl VirtioInputPci {
         unsafe { notify.write16(off, 0); }
 
         Ok(Self {
-            notify, notify_off_multiplier,
+            notify, common,
+            notify_off_multiplier,
             queues: IrqSafeSpinLock::new(Some(Queues { event_q, _status_q: status_q })),
             rx_buf,
             _status_buf:    q1_buf,
             _q0_layout_buf: q0_buf,
             event_q_notify_off,
+            irq_vector: None, msix: None,
             ready: true,
             rel_dx_acc: core::sync::atomic::AtomicI32::new(0),
             rel_dy_acc: core::sync::atomic::AtomicI32::new(0),
         })
+    }
+
+    /// Bind the eventQ (queue 0) to MSI-X so input events wake the kernel.
+    ///
+    /// # Safety
+    /// Caller owns the device's BAR + cfg-space exclusively.
+    pub unsafe fn enable_msix(
+        &mut self,
+        cap:    &Cap<BusDeviceCap, Write>,
+        device: &BusDevice,
+    ) -> Result<u8, VirtioPciError> {
+        // SAFETY: caller-asserted.
+        let (v, table) = unsafe { enable_msix_queue(&self.common, cap, device, 0)? };
+        self.irq_vector = Some(v);
+        self.msix       = Some(table);
+        Ok(v)
     }
 
     /// Take the accumulated REL_X / REL_Y delta since last read.
@@ -372,10 +393,12 @@ pub fn probe(
             | narf_bus::pci::cmd::INTX_DISABLE,
     ).map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // SAFETY: caller-authority.
-    let dev = match unsafe { VirtioInputPci::bring_up(&device, &cap) } {
+    let mut dev = match unsafe { VirtioInputPci::bring_up(&device, &cap) } {
         Ok(d)  => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
+    // SAFETY: same.
+    let _ = unsafe { dev.enable_msix(&cap, &device) };
     *CONTROLLER.lock() = Some(dev);
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name:    alloc::string::String::from("vinput0"),

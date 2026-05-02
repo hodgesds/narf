@@ -327,6 +327,48 @@ pub const CC_QUEUE_DESC:            u64 = 0x20;
 pub const CC_QUEUE_DRIVER:          u64 = 0x28;
 pub const CC_QUEUE_DEVICE:          u64 = 0x30;
 
+// ── MSI-X enablement (shared across virtio-PCI drivers) ────────────
+
+/// Enable MSI-X on a virtio-PCI device and bind one queue to one
+/// MSI-X vector. Factored out of virtio-blk-pci so every live
+/// driver can share it. Returned `(irq_vector, MsixTable)` is
+/// stashed by the driver so completion paths can wait on it via
+/// `narf_interrupts::wait_for_irq(irq_vector)`.
+///
+/// # Safety
+/// Caller owns the device's BAR + cfg-space exclusively.
+pub unsafe fn enable_msix_queue(
+    common: &VirtioRegion,
+    cap:    &narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+    device: &narf_bus::BusDevice,
+    q_idx:  u16,
+) -> Result<(u8, narf_bus::MsixTable), VirtioPciError> {
+    let mut table = narf_bus::msix::enable_msix(cap, device)
+        .map_err(|_| VirtioPciError::BarMapFailed)?;
+    let v = narf_interrupts::vector::alloc()
+        .map_err(|_| VirtioPciError::BarMapFailed)?;
+    let _ = table.alloc_vector().ok_or(VirtioPciError::BarMapFailed)?;
+    // SAFETY: x2APIC online for any post-init driver.
+    let target_apic = unsafe { narf_interrupts::current_cpu_target_id() };
+    // SAFETY: caller-asserted exclusive ownership.
+    unsafe { table.program_vector(0, target_apic, v) }
+        .map_err(|_| VirtioPciError::BarMapFailed)?;
+    // SAFETY: same.
+    unsafe { table.enable() }
+        .map_err(|_| VirtioPciError::BarMapFailed)?;
+    // SAFETY: identity-mapped MMIO common-cfg region.
+    unsafe {
+        common.write16(CC_QUEUE_SELECT, q_idx);
+        common.write16(CC_QUEUE_MSIX_VECTOR, 0);
+    }
+    // SAFETY: same.
+    let actual = unsafe { common.read16(CC_QUEUE_MSIX_VECTOR) };
+    if actual != 0 {
+        return Err(VirtioPciError::BarMapFailed);
+    }
+    Ok((v, table))
+}
+
 // ── helpers ─────────────────────────────────────────────────────────
 
 #[inline]
