@@ -102,6 +102,34 @@ impl fmt::Debug for DisplayPath {
     }
 }
 
+/// One link in the per-path object chain. Each path entry's
+/// 8-byte header is followed by a list of intermediate
+/// (encoder / transmitter / clock-source) object ids, the chain
+/// terminating with a sentinel object id of `0`.
+#[derive(Copy, Clone, Debug)]
+pub struct ObjectLink {
+    /// Object enum-type byte (`bits[15:8]` of the object id):
+    ///   - 0x21 = encoder
+    ///   - 0x22 = transmitter
+    ///   - 0x23 = clock source
+    ///   - 0x12 = router
+    pub kind:     u8,
+    /// Per-instance index (`bits[7:0]` of the object id).
+    pub instance: u8,
+}
+
+/// Object-link kind bytes per ATOM `ATOM_OBJECT_TYPE_*`.
+pub const ATOM_OBJECT_TYPE_ENCODER:    u8 = 0x21;
+pub const ATOM_OBJECT_TYPE_TRANSMITTER:u8 = 0x22;
+pub const ATOM_OBJECT_TYPE_CLOCK_SRC:  u8 = 0x23;
+pub const ATOM_OBJECT_TYPE_ROUTER:     u8 = 0x12;
+
+impl ObjectLink {
+    pub fn is_encoder(self)     -> bool { self.kind == ATOM_OBJECT_TYPE_ENCODER }
+    pub fn is_transmitter(self) -> bool { self.kind == ATOM_OBJECT_TYPE_TRANSMITTER }
+    pub fn is_clock_source(self) -> bool { self.kind == ATOM_OBJECT_TYPE_CLOCK_SRC }
+}
+
 /// Iterator surface over the path table.
 #[derive(Debug)]
 pub struct DisplayObjectTable<'a> {
@@ -138,6 +166,48 @@ impl<'a> DisplayObjectTable<'a> {
 
     /// Reset the iterator's cursor to the first path.
     pub fn rewind(&mut self) { self.cursor = 8; }
+
+    /// Iterate the object-chain links following the 8-byte path
+    /// header at `path_off`. Each path's chain is a sequence of
+    /// 16-bit object ids terminated by a `0` sentinel. Returns
+    /// an iterator borrowing from the underlying table.
+    ///
+    /// `path_off` is the offset of the path header (i.e. value
+    /// of the iterator's `cursor` BEFORE the most recent `next`).
+    /// The chain starts at `path_off + 8` and continues until
+    /// either the sentinel or the path's `usSize` bound.
+    pub fn chain_at<'b>(&'b self, path_off: usize, path_size: usize)
+        -> ObjectLinkIter<'b>
+    {
+        let start = path_off + 8;
+        let end = (path_off + path_size).min(self.raw.len());
+        ObjectLinkIter { raw: self.raw, cursor: start, end }
+    }
+}
+
+/// Iterator over an object chain. Yields one `ObjectLink` per
+/// 16-bit id, stopping at the first `0` id or at `end`.
+#[derive(Debug)]
+pub struct ObjectLinkIter<'a> {
+    raw: &'a [u8],
+    cursor: usize,
+    end: usize,
+}
+
+impl<'a> Iterator for ObjectLinkIter<'a> {
+    type Item = ObjectLink;
+    fn next(&mut self) -> Option<ObjectLink> {
+        if self.cursor + 2 > self.end { return None; }
+        let id = u16::from_le_bytes([
+            self.raw[self.cursor], self.raw[self.cursor + 1],
+        ]);
+        self.cursor += 2;
+        if id == 0 { return None; }
+        Some(ObjectLink {
+            kind:     ((id >> 8) & 0xFF) as u8,
+            instance: (id & 0xFF) as u8,
+        })
+    }
 }
 
 impl<'a> Iterator for DisplayObjectTable<'a> {

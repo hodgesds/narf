@@ -104,8 +104,10 @@ pub enum GpuError {
 
 pub mod amdgpu;
 pub mod amdgpu_atombios;
+pub mod amdgpu_atom_dcn;
 pub mod amdgpu_atom_displayobj;
 pub mod amdgpu_atom_fwinfo;
+pub mod amdgpu_offsets;
 pub mod amdgpu_pm4;
 pub mod amdgpu_pptable;
 pub mod amdgpu_ring;

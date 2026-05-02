@@ -192,20 +192,26 @@ pub enum Family {
 
 impl Family {
     /// MP0 (PSP) register block base, in BAR5 register-bus
-    /// address space. Per `drivers/gpu/specification/amdgpu.md`
-    /// §5: documented for Vega + Navi1; Navi2/Navi3/Renoir
-    /// pending datasheet sourcing → `None` (firmware load fails
-    /// closed).
+    /// address space. Resolution order:
+    ///
+    /// 1. Runtime registration via
+    ///    `crate::amdgpu_offsets::register_family_offsets`. The
+    ///    trusted bootstrap plugs in offsets sourced from the
+    ///    AMD PPR for the family.
+    /// 2. Compile-time fallbacks for families whose offsets are
+    ///    in publicly-documented AMD GPUOpen IP tables (Vega +
+    ///    Navi 1).
+    /// 3. `None` for families whose offsets need datasheet
+    ///    sourcing — `load_firmware` fails closed rather than
+    ///    poking the wrong register window.
     pub fn mp0_base(self) -> Option<u32> {
+        // Runtime override wins.
+        let runtime = crate::amdgpu_offsets::offsets_of(self);
+        if let Some(base) = runtime.mp0_base { return Some(base); }
+        // Compile-time fallback for documented families.
         match self {
             Family::Vega   => Some(0x000B_0000),
             Family::Navi1  => Some(0x000B_0000),
-            // Phoenix / Strix / Renoir / Navi 2x: register block
-            // is publicly known to exist but the precise BAR5
-            // offset isn't in any FOSS-friendly reference yet.
-            // Filling these in is a follow-up; until then,
-            // load_firmware fails with FirmwareLoadFailed instead
-            // of writing garbage to the wrong register window.
             Family::Navi2  => None,
             Family::Navi3  => None,
             Family::Renoir => None,

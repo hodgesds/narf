@@ -741,3 +741,150 @@ fn smoke_dp_edid_over_aux_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu", smoke_dp_edid_over_aux_round_trip);
+
+fn smoke_amdgpu_offsets_runtime_registry_overrides_compile_time() -> TestResult {
+    use crate::amdgpu::Family;
+    use crate::amdgpu_offsets::{
+        FamilyOffsets, register_family_offsets, offsets_of,
+        registered_count, __reset_for_test,
+    };
+    __reset_for_test();
+    if registered_count() != 0 {
+        return TestResult::Fail("reset didn't clear registry");
+    }
+    // Compile-time fallback wins when registry is empty.
+    if Family::Vega.mp0_base() != Some(0x000B_0000) {
+        return TestResult::Fail("Vega compile-time fallback");
+    }
+    if Family::Navi3.mp0_base() != None {
+        return TestResult::Fail("Navi3 should default None");
+    }
+    // Plug in Navi3 + override Vega.
+    register_family_offsets(Family::Navi3, FamilyOffsets {
+        mp0_base: Some(0x0010_0000),
+        dcn_hubp_base: Some(0x0040_0000),
+        dcn_otg_base:  Some(0x0050_0000),
+        ..FamilyOffsets::empty()
+    });
+    register_family_offsets(Family::Vega, FamilyOffsets {
+        mp0_base: Some(0x4242_4242),
+        ..FamilyOffsets::empty()
+    });
+    // Runtime override takes precedence on Vega (compile-time
+    // had Some(0x000B_0000)).
+    if Family::Vega.mp0_base() != Some(0x4242_4242) {
+        return TestResult::Fail("runtime override didn't beat compile-time");
+    }
+    if Family::Navi3.mp0_base() != Some(0x0010_0000) {
+        return TestResult::Fail("Navi3 runtime registration");
+    }
+    let n3 = offsets_of(Family::Navi3);
+    if n3.dcn_hubp_base != Some(0x0040_0000) || n3.dcn_otg_base != Some(0x0050_0000) {
+        return TestResult::Fail("DCN block bases lost");
+    }
+    if registered_count() != 2 {
+        return TestResult::Fail("registered_count != 2");
+    }
+    __reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu", smoke_amdgpu_offsets_runtime_registry_overrides_compile_time);
+
+fn smoke_amdgpu_atom_dcn_init_data_round_trip() -> TestResult {
+    use crate::amdgpu_atom_dcn::{parse, DcnInitError};
+    let mut t = alloc::vec::Vec::new();
+    t.resize(0x20, 0u8);
+    t[0..2].copy_from_slice(&0x1Au16.to_le_bytes());
+    t[2] = 1; t[3] = 0;
+    t[0x04] = 4;  // max_disp_engines
+    t[0x05] = 2;  // max_active
+    t[0x06] = 6;  // max_ppll
+    t[0x07] = 1;  // core_ref_clk_source
+    // disp_clk_used = 600 MHz = 60_000 (10 kHz units)
+    t[0x08..0x0C].copy_from_slice(&60_000u32.to_le_bytes());
+    // max_disp_clk = 1500 MHz
+    t[0x0C..0x10].copy_from_slice(&150_000u32.to_le_bytes());
+    // boot mode 1920x1080 @ 148.5 MHz
+    t[0x10..0x12].copy_from_slice(&1920u16.to_le_bytes());
+    t[0x12..0x14].copy_from_slice(&1080u16.to_le_bytes());
+    t[0x14..0x18].copy_from_slice(&14_850u32.to_le_bytes());
+    t[0x18] = 0; // XRGB8888
+    let info = match parse(&t) {
+        Ok(i)  => i,
+        Err(_) => return TestResult::Fail("parse rejected"),
+    };
+    if info.format_revision != 1 {
+        return TestResult::Fail("format revision");
+    }
+    if info.max_disp_engines != 4 || info.max_active_engines != 2 {
+        return TestResult::Fail("engine counts");
+    }
+    if info.boot_h_active != 1920 || info.boot_v_active != 1080 {
+        return TestResult::Fail("boot mode resolution");
+    }
+    if info.boot_pixel_clock_10khz != 14_850 {
+        return TestResult::Fail("boot pixel clock");
+    }
+    if info.max_disp_clk_10khz != 150_000 {
+        return TestResult::Fail("max disp clock");
+    }
+    // V2 rejected.
+    let mut bad = t.clone();
+    bad[2] = 2;
+    if !matches!(parse(&bad), Err(DcnInitError::UnsupportedVersion(_))) {
+        return TestResult::Fail("V2 should reject");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu", smoke_amdgpu_atom_dcn_init_data_round_trip);
+
+fn smoke_amdgpu_displayobj_object_chain_walker() -> TestResult {
+    use crate::amdgpu_atom_displayobj::{
+        DisplayObjectTable, ATOM_OBJECT_TYPE_ENCODER,
+        ATOM_OBJECT_TYPE_TRANSMITTER, ATOM_OBJECT_TYPE_CLOCK_SRC,
+    };
+    // Path-with-chain layout: 8-byte header + 6 bytes of chain
+    // (3 × u16 — encoder, transmitter, sentinel). One path,
+    // size = 14 bytes total.
+    let mut t = alloc::vec::Vec::new();
+    t.resize(8 + 14, 0u8);
+    // Header.
+    t[0..2].copy_from_slice(&((8u16 + 14).to_le_bytes()));
+    t[2] = 1; t[3] = 0;
+    t[4..6].copy_from_slice(&0u16.to_le_bytes());
+    t[6] = 1;
+    // Path 0 header (8 bytes):
+    let off = 8;
+    t[off..off + 2].copy_from_slice(&0x0001u16.to_le_bytes()); // device_tag
+    t[off + 2..off + 4].copy_from_slice(&14u16.to_le_bytes()); // path size
+    t[off + 4..off + 6].copy_from_slice(&((0x13u16 << 8) | 0).to_le_bytes()); // DP/0
+    t[off + 6..off + 8].copy_from_slice(&0x1100u16.to_le_bytes());            // GPU obj
+    // Chain: encoder/0 (0x21<<8), transmitter/2 (0x22<<8 | 2), sentinel.
+    t[off + 8..off + 10].copy_from_slice(
+        &((ATOM_OBJECT_TYPE_ENCODER as u16) << 8 | 0u16).to_le_bytes());
+    t[off + 10..off + 12].copy_from_slice(
+        &((ATOM_OBJECT_TYPE_TRANSMITTER as u16) << 8 | 2u16).to_le_bytes());
+    t[off + 12..off + 14].copy_from_slice(&0u16.to_le_bytes());
+
+    let mut tbl = match DisplayObjectTable::parse(&t) {
+        Ok(p)  => p,
+        Err(_) => return TestResult::Fail("path parse"),
+    };
+    let _path = tbl.next().expect("first path");
+    // Walk the chain following that path.
+    let mut chain = tbl.chain_at(8, 14);
+    let l1 = chain.next().expect("link 1");
+    if l1.kind != ATOM_OBJECT_TYPE_ENCODER || l1.instance != 0 {
+        return TestResult::Fail("link 1 not encoder/0");
+    }
+    let l2 = chain.next().expect("link 2");
+    if l2.kind != ATOM_OBJECT_TYPE_TRANSMITTER || l2.instance != 2 {
+        return TestResult::Fail("link 2 not transmitter/2");
+    }
+    if chain.next().is_some() {
+        return TestResult::Fail("sentinel didn't terminate chain");
+    }
+    let _ = ATOM_OBJECT_TYPE_CLOCK_SRC; // referenced for visibility check
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu", smoke_amdgpu_displayobj_object_chain_walker);

@@ -1,6 +1,42 @@
 # drivers/gpu/amdgpu — Specification
 
-> Status: **v0.6** (Stage 6 — PPTable directory + display-object table + EDID-over-AUX).
+> Status: **v0.7** (Stage 7 — runtime offset registry + DCN init walker + object chains).
+>
+> ### v0.7 changes vs v0.6
+>
+> - **Runtime offset registry** (`amdgpu_offsets`):
+>   `register_family_offsets(family, FamilyOffsets { mp0_base,
+>   dcn_hubp_base, dcn_opp_base, dcn_otg_base, dcn_aux_base,
+>   gfx_rb_base })` lets the trusted bootstrap plug per-family
+>   register-bus offsets at boot. `Family::mp0_base()` now
+>   prefers a runtime registration over the compile-time
+>   fallback. Unblocks Phoenix / Strix / Renoir / Navi 2 once
+>   their AMD PPR offsets are sourced — no driver-core change
+>   needed, just a registration site.
+> - **`ATOM_DCN_INIT_DATA` walker** (`amdgpu_atom_dcn`): table
+>   id `0x14`. Decodes max-engine count, max-active engines,
+>   max PPLL count, default + max display clock, and the
+>   firmware boot-display preferred mode (h/v active + pixel
+>   clock + format).
+> - **Encoder/transmitter object-chain walker** (`amdgpu_atom_displayobj`
+>   extension): `DisplayObjectTable::chain_at(path_off, path_size)`
+>   yields `ObjectLink { kind, instance }` entries past each
+>   path's GPU-object header until the `0` sentinel. `kind`
+>   discriminates encoder / transmitter / clock-source / router
+>   per the ATOM_OBJECT_TYPE_* constants. Multi-link display
+>   topologies (DP MST hub + lane-router boards) decode for free.
+>
+> ### Clean-room methodology note
+>
+> Per-family register offsets (Phoenix/Strix MP0 base, DCN block
+> bases, etc.) are facts about silicon — not creative work — but
+> transcribing AMD PPR tables into kernel source is a derivative
+> work in scope of the PPR's documentation copyright. The runtime
+> registry separates "where do these numbers come from"
+> (registration site) from "how does the driver consume them"
+> (this crate). A future bootstrap with PPRs in hand calls
+> `register_family_offsets` once per family; no patches to the
+> driver core needed.
 >
 > ### v0.6 changes vs v0.5
 >
