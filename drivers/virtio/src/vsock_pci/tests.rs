@@ -206,3 +206,25 @@ fn smoke_virtio_vsock_pci_hdr_short_slice() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/virtio/vsock_pci", smoke_virtio_vsock_pci_hdr_short_slice);
+
+fn smoke_virtio_vsock_pci_live_send_rst() -> TestResult {
+    use crate::vsock_pci;
+    if !vsock_pci::is_probed() {
+        return TestResult::Skip("no virtio-vsock-pci device on this run");
+    }
+    let cid = vsock_pci::with_controller(|c| c.guest_cid()).unwrap_or(0);
+    let hdr = vsock_pci::VsockHdr {
+        src_cid: cid, dst_cid: 2, src_port: 1024, dst_port: 5,
+        len: 0,
+        typ: vsock_pci::VsockHdr::TYPE_STREAM,
+        op: vsock_pci::VsockOp::Rst,
+        flags: 0, buf_alloc: 0, fwd_cnt: 0,
+    };
+    let r = vsock_pci::with_controller(|c| c.send(hdr, &[]));
+    match r {
+        Some(Ok(()))  => TestResult::Pass,
+        Some(Err(_))  => TestResult::Fail("send failed"),
+        None          => TestResult::Skip("controller missing"),
+    }
+}
+kernel_test_in!("drivers/virtio/vsock_pci", smoke_virtio_vsock_pci_live_send_rst);

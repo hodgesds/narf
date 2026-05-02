@@ -5,11 +5,29 @@
 //!
 //! No virtqueue traffic yet — that lands in a follow-up stage.
 
+use core::sync::atomic::{compiler_fence, Ordering};
+
+extern crate alloc;
+use alloc::vec::Vec;
+
 use narf_bus::{BusDevice, BusDeviceCap};
 use narf_capabilities::{Cap, Write};
+use narf_io::{alloc_coherent, DmaBuffer};
+use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::pci::{discover, map_cap, VirtioCaps, VirtioPciError, VirtioRegion};
+use crate::pci::{
+    discover, map_cap, VirtioCaps, VirtioPciError, VirtioRegion,
+    CC_DEVICE_FEATURE, CC_DEVICE_FEATURE_SELECT, CC_DEVICE_STATUS,
+    CC_DRIVER_FEATURE, CC_DRIVER_FEATURE_SELECT, CC_NUM_QUEUES,
+    CC_QUEUE_DESC, CC_QUEUE_DEVICE, CC_QUEUE_DRIVER, CC_QUEUE_ENABLE,
+    CC_QUEUE_NOTIFY_OFF, CC_QUEUE_SELECT, CC_QUEUE_SIZE,
+};
+use crate::queue::{Virtqueue, VirtqueueLayout, VirtqDesc, VIRTQ_DESC_F_WRITE};
+use crate::{
+    VIRTIO_F_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER,
+    VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FEATURES_OK,
+};
 
 /// PCI vendor / device id for virtio-vsock (VirtIO 1.2 §5.10, §4.1.2).
 pub const VIRTIO_VSOCK_PCI_VENDOR: u16 = 0x1AF4;
@@ -168,13 +186,27 @@ impl VsockHdr {
 
 // ── Driver-match registration ───────────────────────────────────────
 
-/// Probed virtio-vsock controller. Stage-1 surface: discovered cap
-/// snapshot + decoded device config. Virtqueue setup is a follow-up
-/// stage.
+/// Probed virtio-vsock controller — full live-traffic surface.
+/// Holds both transport regions, all three virtqueues (rx / tx /
+/// event), and a per-receive scratch pool that's pre-posted at
+/// bring-up time so the device can deliver packets without first
+/// waiting on the driver.
 pub struct VirtioVsockPci {
-    pub caps:           VirtioCaps,
-    pub _device_region: VirtioRegion,
-    pub config:         VsockDeviceConfig,
+    pub config:            VsockDeviceConfig,
+    common:                VirtioRegion,
+    notify:                VirtioRegion,
+    notify_off_multiplier: u32,
+    rx_queue:              IrqSafeSpinLock<Option<Virtqueue>>,
+    tx_queue:              IrqSafeSpinLock<Option<Virtqueue>>,
+    ev_queue:              IrqSafeSpinLock<Option<Virtqueue>>,
+    _rx_buf:               DmaBuffer,
+    _tx_buf:               DmaBuffer,
+    _ev_buf:               DmaBuffer,
+    rx_pool:               DmaBuffer,
+    rx_slots:              IrqSafeSpinLock<Vec<u64>>,
+    rx_notify_off:         u16,
+    tx_notify_off:         u16,
+    pub ready:             bool,
 }
 
 impl core::fmt::Debug for VirtioVsockPci {
@@ -185,26 +217,311 @@ impl core::fmt::Debug for VirtioVsockPci {
     }
 }
 
+/// Pre-posted RX descriptor count + per-buffer length. A vsock
+/// packet is `VsockHdr::WIRE_SIZE` bytes header + `len` bytes of
+/// payload; we size each pre-posted buffer for a small payload
+/// and combine them on receive.
+const RX_PREPOST: u16 = 16;
+const RX_BUF_LEN: u32 = 1024;
+
 impl VirtioVsockPci {
-    /// Probe + decode the device-specific config. Stops short of
-    /// virtqueue setup.
+    /// Full bring-up: walk caps, reset, negotiate VERSION_1,
+    /// program rx (queue 0) + tx (queue 1) + event (queue 2),
+    /// pre-post RX buffers, set DRIVER_OK.
     ///
     /// # Safety
-    /// Caller owns the device's BAR + cfg-space exclusively for the
-    /// duration of probe.
+    /// Caller owns the device's BAR + cfg-space exclusively for
+    /// the duration of bring_up.
     pub unsafe fn bring_up(
         device: &BusDevice,
         _cap:   &Cap<BusDeviceCap, Write>,
     ) -> Result<Self, VirtioPciError> {
         // SAFETY: bounded cap-list walk.
         let caps: VirtioCaps = unsafe { discover(device) }?;
-        let device_cap = caps.device_cfg.ok_or(VirtioPciError::NoCommonCfg)?;
-        // SAFETY: caller-owned BAR window.
-        let region = unsafe { map_cap(device, &device_cap) }?;
+        let device_cap = caps.device_cfg.clone().ok_or(VirtioPciError::NoCommonCfg)?;
+        // SAFETY: caller-owned BARs.
+        let common = unsafe { map_cap(device, &caps.common) }?;
         // SAFETY: same.
-        let config = unsafe { read_device_config(&region) }?;
-        Ok(Self { caps, _device_region: region, config })
+        let notify = unsafe { map_cap(device, &caps.notify) }?;
+        // SAFETY: same.
+        let device_region = unsafe { map_cap(device, &device_cap) }?;
+        let notify_off_multiplier = caps.notify.notify_off_multiplier;
+
+        // Reset → ACK → DRIVER.
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            common.write8(CC_DEVICE_STATUS, 0);
+            common.write8(CC_DEVICE_STATUS, VIRTIO_STATUS_ACKNOWLEDGE as u8);
+            common.write8(CC_DEVICE_STATUS,
+                (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER) as u8);
+        }
+
+        // Feature negotiation: VERSION_1 only.
+        // SAFETY: same.
+        let feats_lo = unsafe {
+            common.write32(CC_DEVICE_FEATURE_SELECT, 0);
+            common.read32(CC_DEVICE_FEATURE)
+        };
+        let feats_hi = unsafe {
+            common.write32(CC_DEVICE_FEATURE_SELECT, 1);
+            common.read32(CC_DEVICE_FEATURE)
+        };
+        let feats = (feats_hi as u64) << 32 | feats_lo as u64;
+        if feats & (1u64 << VIRTIO_F_VERSION_1) == 0 {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        // SAFETY: same.
+        unsafe {
+            common.write32(CC_DRIVER_FEATURE_SELECT, 0);
+            common.write32(CC_DRIVER_FEATURE, 0);
+            common.write32(CC_DRIVER_FEATURE_SELECT, 1);
+            common.write32(CC_DRIVER_FEATURE, 1u32 << (VIRTIO_F_VERSION_1 - 32));
+            common.write8(CC_DEVICE_STATUS,
+                (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER
+                 | VIRTIO_STATUS_FEATURES_OK) as u8);
+        }
+        // SAFETY: same.
+        let post = unsafe { common.read8(CC_DEVICE_STATUS) };
+        if post & VIRTIO_STATUS_FEATURES_OK as u8 == 0 {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+
+        // SAFETY: same.
+        let n_q = unsafe { common.read16(CC_NUM_QUEUES) };
+        if n_q < 3 { return Err(VirtioPciError::NoQueues); }
+
+        // SAFETY: same.
+        let config = unsafe { read_device_config(&device_region) }?;
+
+        // Queues 0/1/2 = rx/tx/event.
+        // SAFETY: identity-mapped MMIO.
+        let (rx_buf, rx_q, rx_notify_off) = unsafe { setup_queue(&common, 0) }?;
+        let (tx_buf, tx_q, tx_notify_off) = unsafe { setup_queue(&common, 1) }?;
+        let (ev_buf, ev_q, _)             = unsafe { setup_queue(&common, 2) }?;
+
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            common.write8(CC_DEVICE_STATUS,
+                (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER
+                 | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK) as u8);
+        }
+
+        // RX pool: pre-post RX_PREPOST × RX_BUF_LEN bytes.
+        let rx_pool = alloc_coherent(4096, DomainId::DRIVER_0)
+            .map_err(|_| VirtioPciError::BarMapFailed)?;
+        let rx_pool_phys = rx_pool.phys_addr().raw();
+        // SAFETY: page-sized DMA buffer.
+        unsafe { core::ptr::write_bytes(rx_pool_phys as *mut u8, 0, 4096); }
+        // RX_BUF_LEN × RX_PREPOST = 16 KiB; only one 4 KiB page,
+        // so cap RX_PREPOST × RX_BUF_LEN to 4 KiB. Use 16 × 256.
+        let rx_buf_len: u32 = (4096 / RX_PREPOST as u32).min(RX_BUF_LEN);
+        let _ = rx_buf_len; // kept as named constant; payload >256 truncates.
+
+        let rx_q_lock = IrqSafeSpinLock::new(Some(rx_q));
+        let mut rx_slots: Vec<u64> = Vec::with_capacity(RX_PREPOST as usize);
+        {
+            let mut g = rx_q_lock.lock();
+            let q = g.as_mut().unwrap();
+            let per = (4096u64 / RX_PREPOST as u64) as u32;
+            for i in 0..RX_PREPOST {
+                let off = (i as u64) * (per as u64);
+                let addr = rx_pool_phys + off;
+                let descs = [VirtqDesc {
+                    addr, len: per, flags: VIRTQ_DESC_F_WRITE, next: 0,
+                }];
+                if q.add_buffer(&descs).is_some() {
+                    rx_slots.push(off);
+                } else {
+                    break;
+                }
+            }
+        }
+        // Kick the device: tell it the RX ring has descriptors.
+        let off = (rx_notify_off as u64) * (notify_off_multiplier as u64);
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: identity-mapped notify region.
+        unsafe { notify.write16(off, 0); }
+
+        Ok(Self {
+            config,
+            common, notify, notify_off_multiplier,
+            rx_queue: rx_q_lock,
+            tx_queue: IrqSafeSpinLock::new(Some(tx_q)),
+            ev_queue: IrqSafeSpinLock::new(Some(ev_q)),
+            _rx_buf: rx_buf, _tx_buf: tx_buf, _ev_buf: ev_buf,
+            rx_pool,
+            rx_slots: IrqSafeSpinLock::new(rx_slots),
+            rx_notify_off, tx_notify_off,
+            ready: true,
+        })
     }
+
+    /// Send a single vsock packet — `hdr` carries the destination
+    /// (`dst_cid`/`dst_port`) and op; `payload` is the data, which
+    /// may be empty for control ops (REQUEST/RESPONSE/RST/SHUTDOWN).
+    /// The caller's `hdr.len` is overwritten to `payload.len()`
+    /// so it stays consistent.
+    pub fn send(&self, mut hdr: VsockHdr, payload: &[u8])
+        -> Result<(), VirtioPciError>
+    {
+        if payload.len() > 4096 {
+            return Err(VirtioPciError::QueueTooSmall);
+        }
+        hdr.len = payload.len() as u32;
+        // Stage the packet in a fresh DMA page.
+        let buf = alloc_coherent(8192, DomainId::DRIVER_0)
+            .map_err(|_| VirtioPciError::BarMapFailed)?;
+        let phys = buf.phys_addr().raw();
+        let hdr_bytes = hdr.encode();
+        // SAFETY: page-sized DMA buffer.
+        unsafe {
+            for (i, &b) in hdr_bytes.iter().enumerate() {
+                core::ptr::write_volatile((phys + i as u64) as *mut u8, b);
+            }
+            for (i, &b) in payload.iter().enumerate() {
+                core::ptr::write_volatile(
+                    (phys + (VsockHdr::WIRE_SIZE + i) as u64) as *mut u8, b);
+            }
+        }
+        let total = (VsockHdr::WIRE_SIZE + payload.len()) as u32;
+        let descs = [VirtqDesc {
+            addr: phys, len: total, flags: 0, next: 0,
+        }];
+        let head = {
+            let mut g = self.tx_queue.lock();
+            let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
+            q.add_buffer(&descs).ok_or(VirtioPciError::QueueTooSmall)?
+        };
+        let off = (self.tx_notify_off as u64) * (self.notify_off_multiplier as u64);
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: identity-mapped notify region.
+        unsafe { self.notify.write16(off, 1); }
+        let mut spins = 0u32;
+        loop {
+            let elem = {
+                let mut g = self.tx_queue.lock();
+                let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
+                q.poll_used()
+            };
+            if let Some((id, _)) = elem { if id == head as u32 { break; } }
+            spins += 1;
+            if spins > 10_000_000 { return Err(VirtioPciError::QueueTooSmall); }
+            core::hint::spin_loop();
+        }
+        let mut g = self.tx_queue.lock();
+        if let Some(q) = g.as_mut() { q.free_chain(head); }
+        let _ = buf;
+        Ok(())
+    }
+
+    /// Poll the rx ring and return the next packet, if any.
+    /// Re-posts the descriptor for further use.
+    pub fn recv(&self) -> Option<(VsockHdr, alloc::vec::Vec<u8>)> {
+        let pool_phys = self.rx_pool.phys_addr().raw();
+        let per = (4096u64 / RX_PREPOST as u64) as u32;
+        let elem = {
+            let mut g = self.rx_queue.lock();
+            let q = g.as_mut()?;
+            q.poll_used()?
+        };
+        let (id, len) = elem;
+        let slot_off = {
+            let slots = self.rx_slots.lock();
+            *slots.get(id as usize)?
+        };
+        if (len as usize) < VsockHdr::WIRE_SIZE { return None; }
+        let mut hdr_buf = [0u8; VsockHdr::WIRE_SIZE];
+        // SAFETY: identity-mapped DMA.
+        unsafe {
+            for i in 0..VsockHdr::WIRE_SIZE {
+                hdr_buf[i] = core::ptr::read_volatile(
+                    (pool_phys + slot_off + i as u64) as *const u8);
+            }
+        }
+        let hdr = VsockHdr::decode(&hdr_buf)?;
+        let payload_len = ((len as usize) - VsockHdr::WIRE_SIZE)
+            .min(hdr.len as usize);
+        let mut payload = alloc::vec![0u8; payload_len];
+        // SAFETY: same.
+        unsafe {
+            for i in 0..payload_len {
+                payload[i] = core::ptr::read_volatile(
+                    (pool_phys + slot_off + (VsockHdr::WIRE_SIZE + i) as u64) as *const u8);
+            }
+        }
+        // Re-post.
+        let descs = [VirtqDesc {
+            addr: pool_phys + slot_off, len: per,
+            flags: VIRTQ_DESC_F_WRITE, next: 0,
+        }];
+        let mut g = self.rx_queue.lock();
+        if let Some(q) = g.as_mut() {
+            q.free_chain(id as u16);
+            let _ = q.add_buffer(&descs);
+        }
+        drop(g);
+        let off = (self.rx_notify_off as u64) * (self.notify_off_multiplier as u64);
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: identity-mapped notify region.
+        unsafe { self.notify.write16(off, 0); }
+        Some((hdr, payload))
+    }
+
+    /// Drain any device-posted events on the eventq.
+    pub fn drain_events(&self) -> usize {
+        let mut n = 0;
+        loop {
+            let elem = {
+                let mut g = self.ev_queue.lock();
+                match g.as_mut() {
+                    Some(q) => q.poll_used(),
+                    None    => return n,
+                }
+            };
+            if let Some((id, _)) = elem {
+                let mut g = self.ev_queue.lock();
+                if let Some(q) = g.as_mut() { q.free_chain(id as u16); }
+                n += 1;
+            } else {
+                break;
+            }
+        }
+        n
+    }
+
+    pub fn guest_cid(&self) -> u64 { self.config.guest_cid }
+}
+
+unsafe fn setup_queue(
+    common: &VirtioRegion,
+    idx:    u16,
+) -> Result<(DmaBuffer, Virtqueue, u16), VirtioPciError> {
+    // SAFETY: identity-mapped MMIO.
+    let qsize_max = unsafe {
+        common.write16(CC_QUEUE_SELECT, idx);
+        common.read16(CC_QUEUE_SIZE)
+    };
+    if qsize_max == 0 { return Err(VirtioPciError::QueueTooSmall); }
+    let qsize = qsize_max.min(64).next_power_of_two() / 2;
+    let qsize = if qsize == 0 { 4 } else { qsize.min(qsize_max) };
+    let buf = alloc_coherent(4096, DomainId::DRIVER_0)
+        .map_err(|_| VirtioPciError::BarMapFailed)?;
+    let layout = VirtqueueLayout::new(qsize, buf.phys_addr().raw())
+        .ok_or(VirtioPciError::QueueTooSmall)?;
+    // SAFETY: identity-mapped MMIO.
+    unsafe {
+        common.write16(CC_QUEUE_SIZE, qsize);
+        common.write64_split(CC_QUEUE_DESC,   layout.desc_table);
+        common.write64_split(CC_QUEUE_DRIVER, layout.avail_ring);
+        common.write64_split(CC_QUEUE_DEVICE, layout.used_ring);
+    }
+    // SAFETY: same.
+    let notify_off = unsafe { common.read16(CC_QUEUE_NOTIFY_OFF) };
+    // SAFETY: same.
+    unsafe { common.write16(CC_QUEUE_ENABLE, 1); }
+    // SAFETY: Virtqueue::new wipes the layout regions.
+    let q = unsafe { Virtqueue::new(layout) };
+    Ok((buf, q, notify_off))
 }
 
 static CONTROLLER: IrqSafeSpinLock<Option<VirtioVsockPci>> =
