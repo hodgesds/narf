@@ -1,6 +1,23 @@
 # drivers/gpu/amdgpu — Specification
 
-> Status: **v0.3** (Stage 3 — passive scanout + ATOMBIOS + EDID).
+> Status: **v0.4** (Stage 4 — PM4 packet builder + GFX/SDMA ring + DP AUX framing).
+>
+> ### v0.4 changes vs v0.3
+>
+> - **PM4 packet builder** (`amdgpu_pm4`): TYPE3 header encode +
+>   `INDIRECT_BUFFER` / `WRITE_DATA` / `WAIT_REG_MEM` / `NOP`
+>   builders. Produces ring-ready dword arrays.
+> - **GFX/SDMA ring scaffolding** (`amdgpu_ring`): 4-KiB DMA-
+>   coherent ring backing, host wptr tracking, BAR2 doorbell
+>   offset computation, `submit(packet)` + `ring_doorbell(bar2)`.
+>   Ring submission to a live engine still gates on PSP firmware
+>   being loaded; the scaffolding lights up the moment that
+>   lands.
+> - **DP AUX framing layer** (`dp_aux`): wire-format encode /
+>   decode for native + I²C-over-AUX transactions, `AuxChannel`
+>   trait with `dpcd_read` / `dpcd_write` defaults. Per-family
+>   DCN AUX-register transport is the Stage-5 follow-up; the
+>   framing is transport-agnostic.
 >
 > Companion to `drivers/gpu/specification/spec.md`. Documents the
 > AMD-specific bring-up sequence the generic GPU spec deliberately

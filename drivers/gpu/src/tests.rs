@@ -205,3 +205,181 @@ fn smoke_amdgpu_atombios_table_directory_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu", smoke_amdgpu_atombios_table_directory_round_trip);
+
+fn smoke_amdgpu_pm4_indirect_buffer_packet() -> TestResult {
+    // INDIRECT_BUFFER is 4 dwords: header + ib_lo + ib_hi +
+    // (size | vmid<<24). Verify the header type/opcode/count
+    // fields and the data words round-trip correctly.
+    use crate::amdgpu_pm4::Pm4Builder;
+    let mut buf = [0u32; 8];
+    let mut b = Pm4Builder::new(&mut buf);
+    if b.indirect_buffer(0x1234_5678_ABCD_0000, 0x100, 3).is_err() {
+        return TestResult::Fail("indirect_buffer build failed");
+    }
+    if b.bytes_written() != 16 {
+        return TestResult::Fail("expected 16 bytes (4 dwords)");
+    }
+    // Header: type3 (3<<30) | (count_minus_1 = 2) << 16 | opcode 0x3F << 8.
+    let header = buf[0];
+    if (header >> 30) != 3 {
+        return TestResult::Fail("packet type != TYPE3");
+    }
+    if ((header >> 16) & 0x3FFF) != 2 {
+        return TestResult::Fail("count_minus_1 != 2 (3 data dwords - 1)");
+    }
+    if ((header >> 8) & 0xFF) != 0x3F {
+        return TestResult::Fail("opcode != INDIRECT_BUFFER");
+    }
+    if buf[1] != 0xABCD_0000 || buf[2] != 0x1234_5678 {
+        return TestResult::Fail("ib_base round-trip");
+    }
+    if (buf[3] & 0x000F_FFFF) != 0x100 {
+        return TestResult::Fail("ib_size_dw round-trip");
+    }
+    if ((buf[3] >> 24) & 0xF) != 3 {
+        return TestResult::Fail("vmid round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu", smoke_amdgpu_pm4_indirect_buffer_packet);
+
+fn smoke_amdgpu_pm4_write_data_fence_packet() -> TestResult {
+    use crate::amdgpu_pm4::Pm4Builder;
+    let mut buf = [0u32; 8];
+    let mut b = Pm4Builder::new(&mut buf);
+    let dst = 0xDEAD_BEEF_CAFE_F00D;
+    if b.write_data(dst, 0x1234_5678).is_err() {
+        return TestResult::Fail("write_data build failed");
+    }
+    if b.bytes_written() != 20 {
+        return TestResult::Fail("expected 20 bytes (5 dwords)");
+    }
+    // Header opcode = 0x37, count_minus_1 = 3 (4 data dwords - 1).
+    let header = buf[0];
+    if ((header >> 8) & 0xFF) != 0x37 {
+        return TestResult::Fail("opcode != WRITE_DATA");
+    }
+    if ((header >> 16) & 0x3FFF) != 3 {
+        return TestResult::Fail("count_minus_1 != 3");
+    }
+    // Control word: dst_sel (5 << 8) | wr_confirm (1 << 20).
+    let ctrl = buf[1];
+    if (ctrl >> 8) & 0xF != 5 {
+        return TestResult::Fail("dst_sel != MEM");
+    }
+    if ctrl & (1 << 20) == 0 {
+        return TestResult::Fail("wr_confirm not set");
+    }
+    if buf[2] != dst as u32 || buf[3] != (dst >> 32) as u32 {
+        return TestResult::Fail("dst_addr round-trip");
+    }
+    if buf[4] != 0x1234_5678 {
+        return TestResult::Fail("value round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu", smoke_amdgpu_pm4_write_data_fence_packet);
+
+fn smoke_amdgpu_ring_submit_advances_wptr() -> TestResult {
+    use crate::amdgpu_ring::{Ring, RING_SIZE_DW, DOORBELL_STRIDE_BYTES};
+    let mut ring = match Ring::new(7) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("Ring::new failed"),
+    };
+    if ring.queue_idx != 7 {
+        return TestResult::Fail("queue_idx not preserved");
+    }
+    if ring.doorbell_offset() != 7 * DOORBELL_STRIDE_BYTES {
+        return TestResult::Fail("doorbell offset wrong");
+    }
+    if ring.wptr() != 0 {
+        return TestResult::Fail("fresh ring should have wptr=0");
+    }
+    let pkt = [0xDEAD_BEEFu32, 0x1234_5678, 0xAAAA_5555, 0x0000_0001];
+    // SAFETY: smoke harness owns the ring exclusively.
+    let new_wptr = match unsafe { ring.submit(&pkt) } {
+        Ok(w)  => w,
+        Err(_) => return TestResult::Fail("submit rejected 4-dword packet"),
+    };
+    if new_wptr != 4 || ring.wptr() != 4 {
+        return TestResult::Fail("wptr didn't advance by 4 dwords");
+    }
+    // Trying to submit a packet that would overflow the ring's
+    // contiguous tail returns NotEnoughRoomBeforeWrap.
+    let huge = alloc::vec![0u32; RING_SIZE_DW];
+    // SAFETY: same.
+    if unsafe { ring.submit(&huge) }.is_ok() {
+        return TestResult::Fail("oversized packet should fail");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu", smoke_amdgpu_ring_submit_advances_wptr);
+
+fn smoke_dp_aux_native_read_request_round_trip() -> TestResult {
+    use crate::dp_aux::{encode_request, decode_response,
+        AuxCommand, AuxRequest, AuxStatus};
+    let req = AuxRequest {
+        cmd: AuxCommand::NativeRead,
+        address: 0x0_2000, // DPCD_REV
+        data: &[],
+    };
+    let mut wire = [0u8; 4];
+    let n = match encode_request(&req, &mut wire) {
+        Ok(n)  => n,
+        Err(_) => return TestResult::Fail("encode rejected NATIVE_READ"),
+    };
+    if n != 4 {
+        return TestResult::Fail("read request should be 4 bytes");
+    }
+    if wire[0] >> 4 != AuxCommand::NativeRead as u8 {
+        return TestResult::Fail("command nibble mis-encoded");
+    }
+    // Reply: 1 status byte + 1 data byte. ACK + data 0x14 (DP 1.4).
+    let raw_reply = [0x00u8, 0x14];
+    let resp = match decode_response(&raw_reply, 1) {
+        Ok(r)  => r,
+        Err(_) => return TestResult::Fail("decode rejected ACK reply"),
+    };
+    if resp.status != AuxStatus::Ack {
+        return TestResult::Fail("status != ACK");
+    }
+    if resp.data != [0x14u8] {
+        return TestResult::Fail("payload mis-decoded");
+    }
+    // A NACK reply surfaces as Nacked.
+    let nack_reply = [0x10u8];
+    match decode_response(&nack_reply, 0) {
+        Err(crate::dp_aux::AuxError::Nacked) => TestResult::Pass,
+        _ => TestResult::Fail("NACK reply not surfaced"),
+    }
+}
+kernel_test_in!("drivers/gpu", smoke_dp_aux_native_read_request_round_trip);
+
+fn smoke_dp_aux_native_write_encodes_payload() -> TestResult {
+    use crate::dp_aux::{encode_request, AuxCommand, AuxRequest};
+    let payload = [0x01u8, 0x02, 0x03, 0x04];
+    let req = AuxRequest {
+        cmd: AuxCommand::NativeWrite,
+        address: 0x0_0103, // TRAINING_PATTERN_SET
+        data: &payload,
+    };
+    let mut wire = [0u8; 8];
+    let n = match encode_request(&req, &mut wire) {
+        Ok(n)  => n,
+        Err(_) => return TestResult::Fail("encode failed"),
+    };
+    if n != 8 {
+        return TestResult::Fail("4 byte header + 4 byte payload");
+    }
+    if wire[0] >> 4 != AuxCommand::NativeWrite as u8 {
+        return TestResult::Fail("command nibble wrong");
+    }
+    if wire[3] != 3 {
+        return TestResult::Fail("len nibble != 3 (4 bytes - 1)");
+    }
+    if wire[4..8] != payload {
+        return TestResult::Fail("payload not appended");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu", smoke_dp_aux_native_write_encodes_payload);
