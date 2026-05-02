@@ -57,7 +57,10 @@ mod signature;
 
 mod tests;
 
-pub use signature::{BLOB_TRAILER_MAGIC, BlobTrailer};
+pub use signature::{
+    BLOB_TRAILER_MAGIC, BlobTrailer,
+    register_trusted_signer, trusted_signer_count,
+};
 
 /// Cap-type marker for a loaded firmware blob.
 ///
@@ -247,6 +250,43 @@ pub fn install_trusted_loader_authority(cap: Cap<FirmwareRegistry, Write>) {
 /// `install_trusted_loader_authority` runs at boot.
 pub fn trusted_loader_authority() -> Option<Cap<FirmwareRegistry, Write>> {
     TRUSTED_LOADER.lock().as_ref().cloned()
+}
+
+// ── Trusted-loader task allowlist ──────────────────────────────────
+//
+// Until a per-task cap table for firmware-registry holdings ships,
+// the privilege gate on `sys_firmware_install` is a small allowlist
+// of task PIDs the kernel boot path marks as authorized firmware
+// loaders. Mirrors the trusted-signer pattern but at the syscall
+// caller's identity rather than at the blob signer's identity.
+//
+// In production, exactly one task — the firmware-load daemon
+// installed by the trusted bootstrap — appears here. Developer
+// builds may add additional PIDs for testing.
+
+static TRUSTED_LOADERS: IrqSafeSpinLock<alloc::vec::Vec<u64>>
+    = IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+/// Mark `task_id` as authorized to call `sys_firmware_install`.
+/// Idempotent. Called by the kernel boot path for the firmware-
+/// load daemon's PID; userspace can never call this (it has no
+/// public syscall surface for the same reason `sys_setuid` is
+/// privileged).
+pub fn add_trusted_firmware_loader_task(task_id: u64) {
+    let mut g = TRUSTED_LOADERS.lock();
+    if !g.contains(&task_id) {
+        g.push(task_id);
+    }
+}
+
+/// `true` if `task_id` is an authorized firmware loader.
+pub fn is_trusted_firmware_loader_task(task_id: u64) -> bool {
+    TRUSTED_LOADERS.lock().contains(&task_id)
+}
+
+#[doc(hidden)]
+pub fn __reset_trusted_loader_tasks() {
+    TRUSTED_LOADERS.lock().clear();
 }
 
 /// In-tree blob registration. Drivers can register a blob shipped

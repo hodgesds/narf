@@ -32,6 +32,11 @@
 //! accepted, gated on the `firmware-allow-unsigned` feature.
 
 use alloc::string::String;
+use alloc::vec::Vec;
+
+use narf_capabilities::{Cap, Read};
+use narf_crypto::{Ed25519Verify, Key};
+use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::FirmwareError;
 
@@ -130,16 +135,14 @@ pub fn decode(blob: &[u8]) -> Result<BlobTrailer<'_>, FirmwareError> {
 /// On unsigned blobs (signature + signer both all-zero) the
 /// outcome depends on the build profile: `firmware-allow-unsigned`
 /// → `Ok(())`; otherwise `UnsignedRejected`. On signed blobs the
-/// fingerprint is looked up against the trusted-firmware-signers
-/// list — today empty, so unrecognised fingerprints fail closed.
+/// signer fingerprint is looked up in the in-kernel trusted-
+/// signers list; on a match the Ed25519 signature is verified
+/// against the payload digest using `narf_crypto::ed25519_verify`.
+/// Unrecognised signers fail closed.
 ///
-/// Stage-6 step-1 cut: the production Ed25519 verification path
-/// (the call into `narf_crypto::ed25519_verify`) lands once the
-/// kernel's trusted-firmware-signers public-key store is exposed
-/// behind a `Cap<Key<Ed25519Verify>, Read>` (Stage-7). Until then
-/// signed blobs are accepted only when their fingerprint matches
-/// a known signer entry — currently none, so signed blobs fail
-/// closed and only the unsigned path actually works.
+/// The trusted-signers list is populated by
+/// `register_trusted_signer(fingerprint, pubkey)` — typically
+/// from a build-time-baked array in the trusted bootstrap.
 pub fn verify(trailer: &BlobTrailer<'_>) -> Result<(), FirmwareError> {
     if trailer.is_unsigned() {
         if cfg!(feature = "firmware-allow-unsigned") {
@@ -147,15 +150,21 @@ pub fn verify(trailer: &BlobTrailer<'_>) -> Result<(), FirmwareError> {
         }
         return Err(FirmwareError::UnsignedRejected);
     }
-    if !signer_is_trusted(&trailer.signer) {
-        return Err(FirmwareError::SignatureInvalid);
+    let pubkey = match trusted_signer_pubkey(&trailer.signer) {
+        Some(k) => k,
+        None    => return Err(FirmwareError::SignatureInvalid),
+    };
+    let key_cap = match verify_key_cap() {
+        Some(c) => c,
+        None    => return Err(FirmwareError::SignatureInvalid),
+    };
+    let digest = digest_of(trailer.payload);
+    match narf_crypto::ed25519_verify(
+        &key_cap, &pubkey, &digest, &trailer.signature,
+    ) {
+        Ok(()) => Ok(()),
+        Err(_) => Err(FirmwareError::SignatureInvalid),
     }
-    // TODO(stage-7): when the trusted-signers public-key store
-    // ships its `Cap<Key<Ed25519Verify>, Read>`, replace the
-    // closed-fail return above with a real `narf_crypto::
-    // ed25519_verify(&key_cap, &pubkey, &digest, &trailer.signature)`
-    // call. The digest is `digest_of(trailer.payload)`.
-    Ok(())
 }
 
 /// Hash function used to compute the firmware-blob digest. Wraps
@@ -175,9 +184,77 @@ pub fn digest_of(bytes: &[u8]) -> [u8; 32] {
 /// once that surface lands; consumers see `[u8; 32]` either way.
 pub fn sha256(bytes: &[u8]) -> [u8; 32] { digest_of(bytes) }
 
-/// Is this signer fingerprint in the trusted-firmware-signers list?
-fn signer_is_trusted(_fingerprint: &[u8; 32]) -> bool {
-    // No production keys baked yet — the only accepted shape is
-    // the unsigned sentinel handled in `verify`.
-    false
+/// In-kernel trusted-signers list. Populated by
+/// `register_trusted_signer`. The trusted bootstrap stages the
+/// fingerprints+pubkeys at boot.
+static TRUSTED_SIGNERS: IrqSafeSpinLock<Vec<TrustedSigner>>
+    = IrqSafeSpinLock::new(Vec::new());
+
+#[derive(Clone, Debug)]
+struct TrustedSigner {
+    fingerprint: [u8; 32],
+    pubkey:      [u8; 32],
+}
+
+/// Cap used by the Ed25519 verifier. Bootstrapped once on first
+/// signed-blob verification; signed-build production replaces this
+/// with a daemon-minted cap.
+static VERIFY_KEY_CAP: IrqSafeSpinLock<Option<Cap<Key<Ed25519Verify>, Read>>>
+    = IrqSafeSpinLock::new(None);
+
+fn verify_key_cap() -> Option<Cap<Key<Ed25519Verify>, Read>> {
+    let mut g = VERIFY_KEY_CAP.lock();
+    if g.is_none() {
+        // Bootstrap a Read cap from a fresh Write authority. The
+        // crypto crate doesn't gate verification on cap rights
+        // beyond `check_live`, so a kernel-bootstrapped Read is
+        // sufficient. Stage-7 swaps this for a daemon-minted cap.
+        let write: Cap<Key<Ed25519Verify>, narf_capabilities::Write> = Cap::bootstrap();
+        let read = write.derive().ok();
+        *g = read.clone();
+    }
+    g.clone()
+}
+
+/// Register a `(fingerprint, pubkey)` entry in the trusted-
+/// signers list. Idempotent on `fingerprint`. Called by the
+/// trusted bootstrap with build-time-baked keys.
+pub fn register_trusted_signer(fingerprint: [u8; 32], pubkey: [u8; 32]) {
+    let mut g = TRUSTED_SIGNERS.lock();
+    if let Some(e) = g.iter_mut().find(|e| e.fingerprint == fingerprint) {
+        e.pubkey = pubkey;
+    } else {
+        g.push(TrustedSigner { fingerprint, pubkey });
+    }
+}
+
+/// Number of registered trusted signers.
+pub fn trusted_signer_count() -> usize {
+    TRUSTED_SIGNERS.lock().len()
+}
+
+#[doc(hidden)]
+pub fn __reset_trusted_signers() {
+    TRUSTED_SIGNERS.lock().clear();
+}
+
+/// Look up the pubkey for `fingerprint`. Constant-time match
+/// across the list — the list is small (single-digit entries in
+/// practice), and the actual fingerprint comparison is constant-
+/// time per entry.
+fn trusted_signer_pubkey(fingerprint: &[u8; 32]) -> Option<[u8; 32]> {
+    let g = TRUSTED_SIGNERS.lock();
+    for s in g.iter() {
+        // Constant-time fingerprint compare so a side-channel
+        // probing attempt to enumerate the trusted-signer list
+        // can't time which entries are present.
+        let mut diff = 0u8;
+        for i in 0..32 {
+            diff |= s.fingerprint[i] ^ fingerprint[i];
+        }
+        if diff == 0 {
+            return Some(s.pubkey);
+        }
+    }
+    None
 }

@@ -281,6 +281,63 @@ fn smoke_firmware_sys_install_trusted_loader_round_trip() -> TestResult {
 }
 kernel_test_in!("firmware", smoke_firmware_sys_install_trusted_loader_round_trip);
 
+fn smoke_firmware_trusted_signer_registry_round_trip() -> TestResult {
+    use crate::{register_trusted_signer, trusted_signer_count};
+    use crate::signature::__reset_trusted_signers;
+    __reset_trusted_signers();
+    if trusted_signer_count() != 0 {
+        return TestResult::Fail("reset didn't clear trusted-signer list");
+    }
+    let fp1 = [0xA1u8; 32];
+    let pk1 = [0xB2u8; 32];
+    register_trusted_signer(fp1, pk1);
+    if trusted_signer_count() != 1 {
+        return TestResult::Fail("register didn't add entry");
+    }
+    // Re-registering the same fingerprint should be idempotent.
+    register_trusted_signer(fp1, [0xC3u8; 32]);
+    if trusted_signer_count() != 1 {
+        return TestResult::Fail("re-register grew the list");
+    }
+    let fp2 = [0xD4u8; 32];
+    register_trusted_signer(fp2, [0xE5u8; 32]);
+    if trusted_signer_count() != 2 {
+        return TestResult::Fail("second-fingerprint register didn't add entry");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("firmware", smoke_firmware_trusted_signer_registry_round_trip);
+
+fn smoke_firmware_loader_task_allowlist_round_trip() -> TestResult {
+    use crate::{
+        add_trusted_firmware_loader_task, is_trusted_firmware_loader_task,
+        __reset_trusted_loader_tasks,
+    };
+    __reset_trusted_loader_tasks();
+    if is_trusted_firmware_loader_task(7) {
+        return TestResult::Fail("untouched allowlist accepts arbitrary pid");
+    }
+    add_trusted_firmware_loader_task(7);
+    if !is_trusted_firmware_loader_task(7) {
+        return TestResult::Fail("after-add lookup missed pid");
+    }
+    if is_trusted_firmware_loader_task(8) {
+        return TestResult::Fail("allowlist accepts an unregistered pid");
+    }
+    // Idempotent re-add.
+    add_trusted_firmware_loader_task(7);
+    add_trusted_firmware_loader_task(7);
+    let mut hits = 0;
+    for pid in 0..16u64 {
+        if is_trusted_firmware_loader_task(pid) { hits += 1; }
+    }
+    if hits != 1 {
+        return TestResult::Fail("re-add grew the list");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("firmware", smoke_firmware_loader_task_allowlist_round_trip);
+
 /// Build a minimal CPIO newc archive — header + path + data — for
 /// each `(name, data)` plus the `TRAILER!!!` sentinel. Used by
 /// `smoke_firmware_initramfs_scan_*` to exercise the walker

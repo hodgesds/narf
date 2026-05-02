@@ -408,6 +408,7 @@ dependencies = [
  "narf-capabilities",
  "narf-drivers",
  "narf-drivers-virtio",
+ "narf-firmware",
  "narf-init",
  "narf-io",
  "narf-kernel-test",

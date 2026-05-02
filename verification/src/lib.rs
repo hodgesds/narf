@@ -13130,10 +13130,16 @@ fn smoke_firmware_install_syscall_round_trip() -> TestResult {
     };
 
     // Stage the trusted-loader authority so the trap handler can
-    // find it.
+    // find it. Also mark the calling task PID as a trusted loader
+    // so the privilege gate doesn't reject the test (the trap
+    // handler reads `current_task_id()` for the gate check).
     narf_firmware::registry::__reset_for_test();
+    narf_firmware::__reset_trusted_loader_tasks();
     let (write, _r) = bootstrap_authority();
     install_trusted_loader_authority(write);
+    // The smoke harness runs as kernel task id 0 by default;
+    // allowlist that pid so the gate passes.
+    narf_firmware::add_trusted_firmware_loader_task(0);
 
     // Build an unsigned blob the registry will accept under the
     // `firmware-allow-unsigned` build feature.

@@ -275,6 +275,11 @@ pub enum HdaError {
     NoOutputStream,
     DmaAllocFailed,
     CommandTimeout,
+    /// `narf-firmware` had no entry for the requested codec patch.
+    FirmwareMissing,
+    /// Patch payload size isn't a multiple of 4 (one u32 verb per
+    /// 4-byte word).
+    FirmwarePatchMalformed,
 }
 
 impl IntelHda {
@@ -788,6 +793,56 @@ impl IntelHda {
     /// Synchronous Get-Parameter for the post-bring-up codec walker.
     /// Polls the RIRB for a single response.
     ///
+    /// Load a codec firmware patch via the kernel firmware registry.
+    ///
+    /// Looks `blob_name` up through `narf-firmware`, walks the
+    /// payload as a stream of 32-bit verbs (little-endian), sends
+    /// each one through the polled CORB/RIRB path, records the
+    /// firmware-version coupling for the bound driver. Used to
+    /// stage codec-specific quirk patches that vendor BIOSes
+    /// would otherwise apply via DSDT _DSM methods (see HDA spec
+    /// §7.3 and the Realtek / Conexant codec datasheets).
+    ///
+    /// # Safety
+    /// Caller owns the BAR0 mapping. The blob's `view().bytes`
+    /// must remain valid for the duration of the call (the cap
+    /// stays alive until this function returns).
+    pub unsafe fn load_codec_patch(
+        &self,
+        blob_name: &str,
+        fw_authority: &narf_capabilities::Cap<
+            narf_firmware::FirmwareRegistry, narf_capabilities::Read,
+        >,
+    ) -> Result<u32, HdaError> {
+        let cap = narf_firmware::open(blob_name, fw_authority)
+            .map_err(|_| HdaError::FirmwareMissing)?;
+        let view = narf_firmware::view_of(&cap)
+            .map_err(|_| HdaError::FirmwareMissing)?;
+        let bytes = view.bytes;
+        if bytes.len() % 4 != 0 {
+            return Err(HdaError::FirmwarePatchMalformed);
+        }
+        let mut sent = 0u32;
+        let mut i = 0;
+        while i + 4 <= bytes.len() {
+            let verb = u32::from_le_bytes([
+                bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3],
+            ]);
+            // SAFETY: caller-asserted exclusive ownership.
+            let _ = unsafe { self.send_verb(verb)? };
+            sent += 1;
+            i += 4;
+        }
+        // Record the firmware coupling on the bound driver.
+        narf_drivers::set_bound_firmware("hda0", narf_drivers::BoundFirmware {
+            blob_name: alloc::string::String::from(blob_name),
+            sha256:    view.sha256,
+            signer:    view.signer,
+            version:   None,
+        });
+        Ok(sent)
+    }
+
     /// # Safety
     /// Caller owns the BAR0 mapping (the post-bring-up driver does,
     /// because we hold the only `bar0` for the controller's lifetime).

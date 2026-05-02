@@ -712,6 +712,13 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             {
                 let (write, _read) = narf_firmware::bootstrap_authority();
                 narf_firmware::install_trusted_loader_authority(write);
+                // Mark task 0 (the kernel boot path's identity)
+                // as a trusted firmware loader so the
+                // sys_firmware_install privilege gate accepts
+                // calls from kernel-side bootstrap. A future
+                // userspace firmware-load daemon registers its
+                // own pid through the same hook.
+                narf_firmware::add_trusted_firmware_loader_task(0);
             }
 
             // PCI probe lives in Stage::Device — it binds every

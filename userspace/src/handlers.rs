@@ -2553,6 +2553,17 @@ fn sys_shmem_destroy(ctx: &mut dyn TrapContext) {
 // signed by a trusted firmware signer).
 
 fn sys_firmware_install(ctx: &mut dyn TrapContext) {
+    // Privilege gate: only PIDs the kernel boot path marked as
+    // trusted firmware loaders may call this. Until per-task
+    // cap tables for the firmware registry land (Stage-7), this
+    // allowlist is the actual gate; the trailer signature check
+    // inside `firmware::sys_install` is the second line.
+    let pid = current_task_id();
+    if !narf_firmware::is_trusted_firmware_loader_task(pid) {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+
     let args = *ctx.args();
     let name_ptr  = args.arg0 as *const u8;
     let name_len  = args.arg1 as usize;
