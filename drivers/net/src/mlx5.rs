@@ -28,15 +28,19 @@ use narf_io::{alloc_coherent, DmaBuffer};
 use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 
+use alloc::vec::Vec;
+
 use cmd::{
-    build_cqe_inline, decode_response, is_complete, CmdError, CmdOp,
-    CmdResponse, CQE_LEN, CQE_OFF_STATUS_OWN, STATUS_OWN_BIT,
+    build_cqe_inline, build_cqe_with_mailboxes, decode_response,
+    is_complete, CmdError, CmdOp, CmdResponse, CQE_LEN,
+    CQE_OFF_STATUS_OWN, MAILBOX_BLOCK_LEN, STATUS_OWN_BIT,
 };
 
 // Smokes live in the driver directory, not the shared tests.rs.
 mod tests;
 
 pub mod cmd;
+pub mod mailbox;
 
 // ── PCI device IDs (ConnectX-4 .. ConnectX-6 Dx) ───────────────────
 
@@ -103,6 +107,18 @@ const STAGE3_CMDQ_PAGE_LEN: usize = 4096;
 /// well under a microsecond; we give plenty of headroom for a busy
 /// host before declaring the firmware hung.
 const CMD_POLL_LIMIT: u32 = 50_000_000;
+
+/// Capability groups for `QUERY_HCA_CAP` (PRM §15.2). Encoded into
+/// the op_mod field; combined with a "current vs max" bit.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u16)]
+pub enum HcaCapGroup {
+    GeneralDevice  = 0x0,
+    EthernetOffload = 0x1,
+    Atomic          = 0x3,
+    Roce            = 0x4,
+    IpoibOffloads   = 0x5,
+}
 
 // ── Decoded init-segment ───────────────────────────────────────────
 
@@ -196,6 +212,11 @@ pub struct Mlx5Hca {
     /// Per-command polling cursor — token rotates so each issued CQE
     /// gets a unique tag, useful for diagnostics.
     next_token: IrqSafeSpinLock<u8>,
+    /// Stage 4: result of the bring-up self-test NOP. `Some(Ok(()))`
+    /// means the cmdq transport works end-to-end with this device;
+    /// `Some(Err(_))` means probe ran but the NOP self-test failed
+    /// (driver still bound — operator can investigate).
+    nop_selftest: Option<Result<(), Mlx5Error>>,
 }
 
 impl fmt::Debug for Mlx5Hca {
@@ -270,7 +291,25 @@ impl Mlx5Hca {
             segment,
             cmdq,
             next_token: IrqSafeSpinLock::new(1),
+            nop_selftest: None,
         })
+    }
+
+    /// Stage 4 self-check: post a single NOP through the live cmdq
+    /// transport. Records the result on the driver so callers can
+    /// query it later via `nop_selftest()`. Idempotent — each call
+    /// re-runs the NOP and overwrites the stored result.
+    pub fn run_nop_selftest(&mut self) -> Result<(), Mlx5Error> {
+        let r = self.issue_command_inline(CmdOp::Nop, 0, &[])
+                    .map(|_| ());
+        self.nop_selftest = Some(r);
+        r
+    }
+
+    /// Latest stored NOP self-test outcome, or `None` if it was
+    /// never run.
+    pub fn nop_selftest(&self) -> Option<Result<(), Mlx5Error>> {
+        self.nop_selftest
     }
 
     /// Issue an inline-mode command (≤8 B input, ≤8 B output) to slot
@@ -347,6 +386,184 @@ impl Mlx5Hca {
     /// Phys address of the cmdq DMA backing (Stage 3+).
     pub fn cmdq_phys(&self) -> u64 { self.cmdq.phys_addr().raw() }
 
+    /// Stage 4: issue a command with DMA-mailbox input and output.
+    /// Allocates an N-block input chain + an M-block output chain,
+    /// posts the CQE pointing at the head of each, polls for
+    /// completion, and returns the raw output bytes.
+    ///
+    /// `output_len` is the firmware-declared byte count to read back;
+    /// we trust caller-provided bounds (the FW writes exactly that
+    /// many bytes — extra block storage is left zero).
+    pub fn issue_command_with_mailboxes(
+        &self,
+        op:             CmdOp,
+        input_modifier: u32,
+        input:          &[u8],
+        output_len:     usize,
+    ) -> Result<Vec<u8>, Mlx5Error> {
+        let token = {
+            let mut tok = self.next_token.lock();
+            let v = *tok;
+            *tok = tok.wrapping_add(1);
+            v
+        };
+        let n_in  = mailbox::block_count_for(input.len());
+        let n_out = mailbox::block_count_for(output_len);
+
+        // Allocate per-block DMA pages (one block per page is
+        // wasteful but simplifies alignment + safety; mailbox blocks
+        // must be 512-B aligned and a fresh page is page-aligned).
+        let mut in_blocks:  Vec<DmaBuffer> = Vec::with_capacity(n_in);
+        let mut out_blocks: Vec<DmaBuffer> = Vec::with_capacity(n_out);
+        for _ in 0..n_in {
+            in_blocks.push(
+                alloc_coherent(4096, DomainId::DRIVER_0)
+                    .map_err(|_| Mlx5Error::CmdqAlloc)?);
+        }
+        for _ in 0..n_out {
+            out_blocks.push(
+                alloc_coherent(4096, DomainId::DRIVER_0)
+                    .map_err(|_| Mlx5Error::CmdqAlloc)?);
+        }
+        let in_phys: Vec<u64> = in_blocks.iter()
+            .map(|b| b.phys_addr().raw()).collect();
+        let out_phys: Vec<u64> = out_blocks.iter()
+            .map(|b| b.phys_addr().raw()).collect();
+
+        // Populate input mailbox blocks.
+        let in_data = mailbox::write_input_chain(input, &in_phys, token);
+        for (block, dma) in in_data.iter().zip(in_blocks.iter()) {
+            let phys = dma.phys_addr().raw();
+            // SAFETY: identity-mapped DMA; driver-owned buffer.
+            unsafe {
+                for (i, &b) in block.iter().enumerate() {
+                    core::ptr::write_volatile(
+                        (phys + i as u64) as *mut u8, b);
+                }
+            }
+        }
+        // Output blocks: zero them so any "left untouched" bytes
+        // read back as 0 rather than stale DMA contents.
+        for dma in out_blocks.iter() {
+            let phys = dma.phys_addr().raw();
+            // SAFETY: identity-mapped DMA; driver-owned buffer.
+            unsafe {
+                for i in 0..MAILBOX_BLOCK_LEN {
+                    core::ptr::write_volatile(
+                        (phys + i as u64) as *mut u8, 0);
+                }
+            }
+        }
+        // Stitch output-block chain pointers (FW reads the chain to
+        // know where to deposit each segment of output).
+        for i in 0..n_out {
+            let next = if i + 1 < n_out { out_phys[i + 1] } else { 0 };
+            // Write next-pointer at offset 0x1F0 / 0x1F4 (BE).
+            let phys = out_phys[i];
+            let h = (next >> 32) as u32;
+            let l = (next & 0xFFFF_FFFF) as u32;
+            // SAFETY: identity-mapped DMA; offsets within block.
+            unsafe {
+                for (j, &b) in h.to_be_bytes().iter().enumerate() {
+                    core::ptr::write_volatile(
+                        (phys + 0x1F0 + j as u64) as *mut u8, b);
+                }
+                for (j, &b) in l.to_be_bytes().iter().enumerate() {
+                    core::ptr::write_volatile(
+                        (phys + 0x1F4 + j as u64) as *mut u8, b);
+                }
+            }
+        }
+
+        // Build + post the CQE.
+        let cqe = build_cqe_with_mailboxes(
+            op, input_modifier,
+            in_phys[0],  input.len() as u32,
+            out_phys[0], output_len as u32,
+            token,
+        );
+        let slot_phys = self.cmdq.phys_addr().raw();
+        // SAFETY: identity-mapped DMA cmdq, exclusively owned.
+        unsafe {
+            for (i, &b) in cqe.iter().enumerate() {
+                core::ptr::write_volatile(
+                    (slot_phys + i as u64) as *mut u8, b);
+            }
+        }
+        compiler_fence(Ordering::SeqCst);
+        self.ring_cmd_doorbell(1);
+
+        // Poll for completion.
+        let own_phys = slot_phys + CQE_OFF_STATUS_OWN as u64;
+        let mut spins = 0u32;
+        loop {
+            // SAFETY: identity-mapped DMA.
+            let v = unsafe { core::ptr::read_volatile(own_phys as *const u8) };
+            if v & STATUS_OWN_BIT == 0 { break; }
+            spins += 1;
+            if spins > CMD_POLL_LIMIT { return Err(Mlx5Error::CmdTimeout); }
+            core::hint::spin_loop();
+        }
+
+        // Decode CQE status; even on failure we want to surface
+        // exactly what FW reported.
+        let mut completed = [0u8; CQE_LEN];
+        // SAFETY: identity-mapped DMA.
+        unsafe {
+            for i in 0..CQE_LEN {
+                completed[i] = core::ptr::read_volatile(
+                    (slot_phys + i as u64) as *const u8);
+            }
+        }
+        debug_assert!(is_complete(&completed));
+        let _resp = decode_response(&completed).map_err(Mlx5Error::CmdFailed)?;
+
+        // Read output blocks back into a contiguous Vec.
+        let mut blocks: Vec<[u8; MAILBOX_BLOCK_LEN]> =
+            Vec::with_capacity(n_out);
+        for dma in out_blocks.iter() {
+            let phys = dma.phys_addr().raw();
+            let mut block = [0u8; MAILBOX_BLOCK_LEN];
+            // SAFETY: identity-mapped DMA.
+            unsafe {
+                for i in 0..MAILBOX_BLOCK_LEN {
+                    block[i] = core::ptr::read_volatile(
+                        (phys + i as u64) as *const u8);
+                }
+            }
+            blocks.push(block);
+        }
+        Ok(mailbox::read_output_chain(&blocks, output_len))
+    }
+
+    /// Stage 4: issue `QUERY_HCA_CAP` for a chosen capability group
+    /// and return the raw response bytes. Decoding the structured
+    /// fields lands in Stage 5.
+    pub fn query_hca_cap(
+        &self,
+        group:   HcaCapGroup,
+        current: bool,
+    ) -> Result<Vec<u8>, Mlx5Error> {
+        // Op modifier per PRM §15.2.1: bits [15:1] = cap group, bit
+        // [0] = 0 (max) / 1 (current).
+        let op_mod_high  = (group as u16) << 1
+                         | if current { 1 } else { 0 };
+        // The op_mod field rides in the upper 16 bits of the
+        // input_modifier slot for QUERY_HCA_CAP — different
+        // commands position op_mod differently, but for QUERY_HCA_CAP
+        // the entire 32-bit input_modifier carries the op_mod_high
+        // value (other bits reserved, zero).
+        let input_modifier = op_mod_high as u32;
+        // QUERY_HCA_CAP general-cap output is documented at 0x1000
+        // bytes (4 KiB → 9 mailbox blocks). Reserve that and let
+        // Stage-5 trim to what's actually meaningful.
+        const HCA_CAP_OUTPUT_LEN: usize = 0x1000;
+        self.issue_command_with_mailboxes(
+            CmdOp::QueryHcaCap, input_modifier,
+            &[], HCA_CAP_OUTPUT_LEN,
+        )
+    }
+
     pub fn fw_rev(&self) -> (u16, u16, u16) {
         (self.segment.fw_rev_major,
          self.segment.fw_rev_minor,
@@ -413,10 +630,16 @@ pub fn probe(
             | narf_bus::pci::cmd::INTX_DISABLE,
     ).map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // SAFETY: caller-authority over device.
-    let dev = match unsafe { Mlx5Hca::bring_up(&device, &cap) } {
+    let mut dev = match unsafe { Mlx5Hca::bring_up(&device, &cap) } {
         Ok(d)  => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
+    // Stage 4: post a NOP through the live cmdq transport to verify
+    // bring-up didn't just program registers but actually has FW
+    // talking. We log via the stored selftest result rather than
+    // failing probe — a NOP timeout might be a slow host, not a
+    // broken device.
+    let _ = dev.run_nop_selftest();
     *CONTROLLER.lock() = Some(dev);
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name:    alloc::string::String::from(name_for(device.id.device)),

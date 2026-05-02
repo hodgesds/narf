@@ -430,3 +430,138 @@ fn smoke_mlx5_mailbox_payload_truncates() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/mlx5", smoke_mlx5_mailbox_payload_truncates);
+
+// ── Stage 4: chained mailboxes + QUERY_HCA_CAP ─────────────────────
+
+use super::mailbox::{
+    block_count_for, read_output_chain, write_input_chain,
+};
+
+fn smoke_mlx5_chain_block_count() -> TestResult {
+    if block_count_for(0)   != 1 { return TestResult::Fail("0-byte payload should still need 1 block"); }
+    if block_count_for(1)   != 1 { return TestResult::Fail("1-byte payload should fit in 1 block"); }
+    if block_count_for(MAILBOX_PAYLOAD_LEN)     != 1
+       { return TestResult::Fail("exactly 480 bytes should fit in 1 block"); }
+    if block_count_for(MAILBOX_PAYLOAD_LEN + 1) != 2
+       { return TestResult::Fail("481 bytes should need 2 blocks"); }
+    if block_count_for(2 * MAILBOX_PAYLOAD_LEN) != 2
+       { return TestResult::Fail("960 bytes should need 2 blocks"); }
+    if block_count_for(2 * MAILBOX_PAYLOAD_LEN + 1) != 3
+       { return TestResult::Fail("961 bytes should need 3 blocks"); }
+    // 0x1000 = QUERY_HCA_CAP output → ceil(4096 / 480) = 9 blocks.
+    if block_count_for(0x1000) != 9
+       { return TestResult::Fail("4096-byte payload should need 9 blocks"); }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_chain_block_count);
+
+fn smoke_mlx5_chain_input_round_trip() -> TestResult {
+    // Build a 1000-byte payload with a recognisable byte pattern,
+    // run it through write_input_chain → read_output_chain, and
+    // confirm we get the same bytes back.
+    const N: usize = 1000;
+    let mut payload = [0u8; N];
+    for i in 0..N { payload[i] = (i & 0xFF) as u8; }
+    let n_blocks = block_count_for(N);
+    if n_blocks != 3 {
+        return TestResult::Fail("1000 bytes should chain to 3 blocks");
+    }
+    let block_phys: alloc::vec::Vec<u64> = (0..n_blocks as u64)
+        .map(|i| 0x1_0000_0000u64 + i * 0x1000)
+        .collect();
+    let blocks = write_input_chain(&payload, &block_phys, 0x42);
+    if blocks.len() != n_blocks {
+        return TestResult::Fail("write_input_chain produced wrong block count");
+    }
+    // Verify each block's chain pointer threads to the next phys.
+    for i in 0..n_blocks {
+        let want_next = if i + 1 < n_blocks { block_phys[i + 1] } else { 0 };
+        let h_bytes = ((want_next >> 32) as u32).to_be_bytes();
+        let l_bytes = ((want_next & 0xFFFF_FFFF) as u32).to_be_bytes();
+        if blocks[i][0x1F0..0x1F4] != h_bytes
+           || blocks[i][0x1F4..0x1F8] != l_bytes {
+            return TestResult::Fail("chain pointer wrong somewhere in chain");
+        }
+        // block_number is BE u16 at 0x1FC.
+        let bn = u16::from_be_bytes([blocks[i][0x1FC], blocks[i][0x1FD]]);
+        if bn != i as u16 {
+            return TestResult::Fail("block_number not sequential / not BE");
+        }
+        // token byte at 0x1FE constant across the chain.
+        if blocks[i][0x1FE] != 0x42 {
+            return TestResult::Fail("token byte not constant across chain");
+        }
+        // signature == XOR-of-everything-else → XOR-of-block == 0.
+        let mut xor = 0u8;
+        for &b in blocks[i].iter() { xor ^= b; }
+        if xor != 0 {
+            return TestResult::Fail("chain block signature not XOR-checksum");
+        }
+    }
+    // Reassemble through read_output_chain; should match original.
+    let out = read_output_chain(&blocks, N);
+    if out.len() != N {
+        return TestResult::Fail("read_output_chain returned wrong length");
+    }
+    for i in 0..N {
+        if out[i] != payload[i] {
+            return TestResult::Fail("chain payload mismatch on round-trip");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_chain_input_round_trip);
+
+fn smoke_mlx5_chain_last_block_zero_next() -> TestResult {
+    let payload = [0xFFu8; 480 * 2];
+    let phys = [0x2_0000_0000u64, 0x2_0000_1000u64];
+    let blocks = write_input_chain(&payload, &phys, 0);
+    // First block points at second.
+    let want_h = ((phys[1] >> 32) as u32).to_be_bytes();
+    let want_l = ((phys[1] & 0xFFFF_FFFF) as u32).to_be_bytes();
+    if blocks[0][0x1F0..0x1F4] != want_h
+       || blocks[0][0x1F4..0x1F8] != want_l {
+        return TestResult::Fail("first block chain pointer wrong");
+    }
+    // Last block must have next = 0.
+    if blocks[1][0x1F0..0x1F4] != [0; 4] || blocks[1][0x1F4..0x1F8] != [0; 4] {
+        return TestResult::Fail("last block next-pointer not zeroed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_chain_last_block_zero_next);
+
+fn smoke_mlx5_chain_short_output_truncates() -> TestResult {
+    // FW declared output_len smaller than the chain's full byte
+    // capacity; read_output_chain must stop at output_len bytes.
+    let blocks = [[0xAAu8; 512], [0xBBu8; 512], [0xCCu8; 512]];
+    let out = read_output_chain(&blocks, 700);
+    if out.len() != 700 {
+        return TestResult::Fail("read_output_chain didn't honor output_len");
+    }
+    // First 480 bytes from block 0 (0xAA), next 220 from block 1 (0xBB).
+    for i in 0..MAILBOX_PAYLOAD_LEN {
+        if out[i] != 0xAA {
+            return TestResult::Fail("block 0 payload miscopied");
+        }
+    }
+    for i in MAILBOX_PAYLOAD_LEN..700 {
+        if out[i] != 0xBB {
+            return TestResult::Fail("block 1 payload miscopied");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_chain_short_output_truncates);
+
+// HcaCapGroup discriminants are stable wire values — guard them.
+fn smoke_mlx5_hca_cap_group_discriminants() -> TestResult {
+    use super::HcaCapGroup;
+    if HcaCapGroup::GeneralDevice  as u16 != 0x0 { return TestResult::Fail("GeneralDevice"); }
+    if HcaCapGroup::EthernetOffload as u16 != 0x1 { return TestResult::Fail("EthernetOffload"); }
+    if HcaCapGroup::Atomic         as u16 != 0x3 { return TestResult::Fail("Atomic"); }
+    if HcaCapGroup::Roce           as u16 != 0x4 { return TestResult::Fail("Roce"); }
+    if HcaCapGroup::IpoibOffloads  as u16 != 0x5 { return TestResult::Fail("IpoibOffloads"); }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_hca_cap_group_discriminants);

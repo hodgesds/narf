@@ -1,6 +1,6 @@
 # mlx5 — Specification
 
-> Status: **v0.3** (Stage 3: cmdq DMA + live transport).
+> Status: **v0.4** (Stage 4: chained mailboxes + QUERY_HCA_CAP + NOP self-test).
 >
 > Clean-room driver for Mellanox / NVIDIA ConnectX-4 / 5 / 6 / 7
 > family Ethernet + InfiniBand HCAs. Reference material: the
@@ -136,6 +136,19 @@ have a server target with a ConnectX HCA in CI.
 
 - **v0.1** (Stage 1): PCI match + init-segment decoder +
   initializing-bit poll + smokes co-located in driver dir.
+- **v0.4** (Stage 4): multi-block mailbox chain support
+  (`mailbox.rs` — `block_count_for`, `write_input_chain`,
+  `read_output_chain`), `Mlx5Hca::issue_command_with_mailboxes`
+  full-stack live transport (allocates input + output chain
+  pages, populates input chunks, threads next-pointers through
+  output blocks so FW can scatter its reply, posts the
+  mailbox-CQE, polls completion, reassembles the contiguous
+  output Vec<u8>), `query_hca_cap(group, current)` returning the
+  raw 4-KiB response (structured decode lives in Stage 5),
+  `HcaCapGroup` enum (GeneralDevice / EthernetOffload / Atomic /
+  Roce / IpoibOffloads), and a NOP self-test posted from probe
+  whose result lives on `Mlx5Hca::nop_selftest()` — non-fatal
+  so a slow host doesn't fail bring-up.
 - **v0.3** (Stage 3): cmdq DMA backing allocated in `bring_up`
   + `cmdq_addr_high` / `cmdq_addr_low_sz` registers programmed
   to point firmware at it (4-KiB-aligned phys, log_size = 0,
