@@ -171,3 +171,71 @@ fn smoke_splash_render_with_console_paints() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("graphics", smoke_splash_render_with_console_paints);
+
+fn smoke_edid_parses_known_block() -> TestResult {
+    use crate::edid::{Edid, EdidError};
+    let mut blob = [0u8; 128];
+    blob[0..8].copy_from_slice(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
+    // Manufacturer "NRF" — N=14, R=18, F=6.
+    let mfr_raw: u16 = ((14u16) << 10) | ((18u16) << 5) | 6;
+    blob[8] = (mfr_raw >> 8) as u8;
+    blob[9] = mfr_raw as u8;
+    blob[10..12].copy_from_slice(&0x1234u16.to_le_bytes());
+    blob[16] = 30; // week
+    blob[17] = 30; // year = 1990 + 30 = 2020
+    blob[18] = 1;
+    blob[19] = 4;
+    // Detailed timing #1 at offset 0x36: 1920x1080 @ 148.5 MHz.
+    blob[0x36..0x38].copy_from_slice(&14850u16.to_le_bytes());
+    let h_active: u16 = 1920;
+    let h_blanking: u16 = 280;
+    blob[0x38] = (h_active & 0xFF) as u8;
+    blob[0x39] = (h_blanking & 0xFF) as u8;
+    blob[0x3A] = (((h_active >> 8) << 4) as u8) | ((h_blanking >> 8) & 0x0F) as u8;
+    let v_active: u16 = 1080;
+    let v_blanking: u16 = 45;
+    blob[0x3B] = (v_active & 0xFF) as u8;
+    blob[0x3C] = (v_blanking & 0xFF) as u8;
+    blob[0x3D] = (((v_active >> 8) << 4) as u8) | ((v_blanking >> 8) & 0x0F) as u8;
+    blob[0x3E] = 88;
+    blob[0x3F] = 44;
+    blob[0x40] = (4u8 << 4) | 5;
+    blob[0x41] = 0;
+    let s: u8 = blob[..127].iter().fold(0u8, |a, &b| a.wrapping_add(b));
+    blob[127] = 0u8.wrapping_sub(s);
+
+    let parsed = match Edid::parse(&blob) {
+        Ok(e)  => e,
+        Err(_) => return TestResult::Fail("Edid::parse rejected synthetic block"),
+    };
+    if parsed.manufacturer() != *b"NRF" {
+        return TestResult::Fail("manufacturer mis-decoded");
+    }
+    if parsed.product_code() != 0x1234 {
+        return TestResult::Fail("product_code mis-decoded");
+    }
+    if parsed.manufacture_year() != 2020 {
+        return TestResult::Fail("manufacture_year mis-decoded");
+    }
+    let timing = match parsed.preferred_timing() {
+        Ok(t)  => t,
+        Err(_) => return TestResult::Fail("preferred_timing rejected"),
+    };
+    if timing.h_active != 1920 || timing.v_active != 1080 {
+        return TestResult::Fail("active resolution mis-decoded");
+    }
+    if timing.pixel_clock_khz != 148_500 {
+        return TestResult::Fail("pixel clock mis-decoded");
+    }
+    let r = timing.refresh_hz();
+    if !(58..=62).contains(&r) {
+        return TestResult::Fail("refresh rate not ~60 Hz");
+    }
+    let mut bad = blob;
+    bad[127] ^= 0xFF;
+    match Edid::parse(&bad) {
+        Err(EdidError::BadChecksum) => TestResult::Pass,
+        _ => TestResult::Fail("checksum corruption not surfaced"),
+    }
+}
+kernel_test_in!("graphics", smoke_edid_parses_known_block);

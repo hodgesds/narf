@@ -301,11 +301,17 @@ pub fn select_active() -> Option<&'static dyn FbScanout> {
     // Native AMD GPU wins over QEMU bochs / virtio-gpu when both
     // are present (typical: Phoenix iGPU on the bare-metal laptop
     // running alongside a passthrough QEMU display).
+    //
+    // `current_mode()` accepts the passive (UEFI-GOP-left)
+    // mode without requiring a successful `set_mode`, so the
+    // amdgpu scanout lights up even before DCN bring-up lands.
+    // The firmware-loaded gate (`is_ready`) is intentionally NOT
+    // required: passive scanout is firmware-by-default.
     if narf_drivers_gpu::amdgpu::is_probed() {
-        let ready = narf_drivers_gpu::amdgpu::with_controller(|d|
-            d.is_ready() && d.current_mode().is_some()
+        let mode_ok = narf_drivers_gpu::amdgpu::with_controller(|d|
+            d.current_mode().is_some()
         ).unwrap_or(false);
-        if ready {
+        if mode_ok {
             return Some(&AMDGPU);
         }
     }

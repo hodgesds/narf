@@ -1,10 +1,27 @@
 # drivers/gpu/amdgpu — Specification
 
-> Status: **v0.2** (Stage 2 bring-up draft).
+> Status: **v0.3** (Stage 3 — passive scanout + ATOMBIOS + EDID).
 >
 > Companion to `drivers/gpu/specification/spec.md`. Documents the
 > AMD-specific bring-up sequence the generic GPU spec deliberately
 > doesn't pin down.
+>
+> ### v0.3 changes vs v0.2
+>
+> - **Passive scanout** path landed: when `set_mode` hasn't run
+>   yet, `current_mode()` reads the firmware-programmed mode out
+>   of the OTG timing registers (UEFI GOP / pre-OS POST leaves
+>   them configured). The picker accepts the passive mode without
+>   waiting on PSP firmware load — mirrors Linux's `simpledrm`
+>   fallback.
+> - **EDID parser** moved to `narf-graphics::edid` (cross-vendor
+>   utility per VESA E-EDID 1.4 §3).
+> - **ATOMBIOS table-directory parser** lives at
+>   `narf-drivers-gpu::amdgpu_atombios`. Locates the master data
+>   table via the `0x4C` pointer, indexes per-table-id offsets,
+>   borrows the table payload as `&[u8]`. Doesn't yet walk
+>   individual tables (`ATOM_DCN_INIT_DATA` etc.) — that's per-
+>   table mechanical work.
 
 ## 1. Purpose & scope
 

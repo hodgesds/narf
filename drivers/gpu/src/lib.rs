@@ -103,6 +103,7 @@ pub enum GpuError {
 }
 
 pub mod amdgpu;
+pub mod amdgpu_atombios;
 
 mod tests;
 

@@ -141,3 +141,67 @@ kernel_test_in!("drivers/gpu", smoke_amdgpu_family_table_documented_offsets);
 // `smoke_amdgpu_scanout_picker_idle` lives in `fb/src/tests.rs`
 // to avoid a `narf-drivers-gpu` ↔ `narf-fb` Cargo cycle (fb
 // already depends on drivers/gpu for the picker).
+
+fn smoke_amdgpu_atombios_table_directory_round_trip() -> TestResult {
+    // Synthesize an ATOMBIOS image: PCI ROM signature + ATOM
+    // marker + master data table at a known offset + 3 indexable
+    // tables with distinct payloads. Verify the parser locates
+    // the master, decodes the count, and resolves each table id.
+    use crate::amdgpu_atombios::{Atombios, AtomError};
+    let mut img = alloc::vec::Vec::new();
+    img.resize(0x200, 0u8);
+    // PCI ROM signature.
+    img[0] = 0xAA; img[1] = 0x55;
+    // "ATOM" marker at offset 4.
+    img[4..8].copy_from_slice(b"ATOM");
+    // Master data table at offset 0x100.
+    img[0x4C..0x50].copy_from_slice(&0x100u32.to_le_bytes());
+    // ATOM_COMMON_TABLE_HEADER: usStructureSize covers header (4) +
+    // 3 × u16 entries = 10 bytes.
+    img[0x100..0x102].copy_from_slice(&10u16.to_le_bytes());
+    img[0x102] = 1; // ucTableFormatRevision
+    img[0x103] = 1; // ucTableContentRevision
+    // Per-table offset array: ids 0/1/2 → 0x150, 0x160, 0x170.
+    img[0x104..0x106].copy_from_slice(&0x150u16.to_le_bytes());
+    img[0x106..0x108].copy_from_slice(&0x160u16.to_le_bytes());
+    img[0x108..0x10A].copy_from_slice(&0x170u16.to_le_bytes());
+    // Each table's first 2 bytes are usStructureSize.
+    img[0x150..0x152].copy_from_slice(&8u16.to_le_bytes());
+    img[0x160..0x162].copy_from_slice(&12u16.to_le_bytes());
+    img[0x170..0x172].copy_from_slice(&16u16.to_le_bytes());
+
+    let atom = match Atombios::parse(&img) {
+        Ok(a)  => a,
+        Err(_) => return TestResult::Fail("ATOMBIOS parse rejected synthetic image"),
+    };
+    if atom.data_table_count() != 3 {
+        return TestResult::Fail("data_table_count mis-decoded");
+    }
+    if atom.data_table_offset(0) != Ok(0x150) { return TestResult::Fail("table 0 offset"); }
+    if atom.data_table_offset(1) != Ok(0x160) { return TestResult::Fail("table 1 offset"); }
+    if atom.data_table_offset(2) != Ok(0x170) { return TestResult::Fail("table 2 offset"); }
+    if atom.data_table_offset(3) != Err(AtomError::UnknownTableId) {
+        return TestResult::Fail("out-of-range id should fail");
+    }
+    let t = match atom.data_table(1) {
+        Ok(s)  => s,
+        Err(_) => return TestResult::Fail("data_table(1) borrow"),
+    };
+    if t.len() != 12 {
+        return TestResult::Fail("data_table length wrong");
+    }
+    // Bad PCI ROM signature.
+    let mut bad = img.clone();
+    bad[0] = 0;
+    if !matches!(Atombios::parse(&bad), Err(AtomError::NotPciRom)) {
+        return TestResult::Fail("missing PCI ROM signature should reject");
+    }
+    // Bad ATOM marker.
+    let mut bad = img.clone();
+    bad[4] = b'X';
+    if !matches!(Atombios::parse(&bad), Err(AtomError::NotAtombios)) {
+        return TestResult::Fail("missing ATOM marker should reject");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu", smoke_amdgpu_atombios_table_directory_round_trip);
