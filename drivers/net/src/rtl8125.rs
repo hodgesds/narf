@@ -109,6 +109,46 @@ pub(crate) const INT_TDU:     u16 = 1 << 7;
 // PHYStatus bits (§2.10).
 pub(crate) const PHYSTAT_LINKSTS: u8 = 1 << 1;
 
+// ── MAC reset / MAC-address decode ──────────────────────────────────
+// Stage 2: pure-data helpers. The live `bring_up` path lands later;
+// these routines isolate the parts a unit test can exercise without
+// touching MMIO.
+
+/// Maximum number of polling iterations to spend waiting for CR.RST
+/// to self-clear. RTL8125 datasheet §2.4 notes the reset typically
+/// completes in << 1 ms; the cap is a watchdog on hung silicon.
+pub const RESET_POLL_LIMIT: u32 = 1_000_000;
+
+/// Decode a 6-byte MAC from the IDR0..5 register window. The
+/// datasheet §2.1 specifies IDR is byte-readable and 4-byte writable;
+/// the on-wire byte order is `IDR0` = first MAC octet, `IDR5` = last.
+/// `bytes` must be a slice of length ≥ 6 starting at the IDR0 offset.
+pub fn decode_mac(bytes: &[u8]) -> Option<[u8; 6]> {
+    if bytes.len() < 6 { return None; }
+    Some([bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]])
+}
+
+/// `true` iff the MAC reads as either all-zero (no EEPROM image) or
+/// all-FF (controller floor / disconnected). Used as a sanity gate
+/// after `decode_mac`.
+pub const fn mac_is_invalid(mac: [u8; 6]) -> bool {
+    let mut all_zero = true;
+    let mut all_ff   = true;
+    let mut i = 0;
+    while i < 6 {
+        if mac[i] != 0x00 { all_zero = false; }
+        if mac[i] != 0xFF { all_ff   = false; }
+        i += 1;
+    }
+    all_zero || all_ff
+}
+
+/// Build the byte to write to CR (§2.4) to kick a software reset.
+/// Provided as a helper so the test suite can assert the bit pattern
+/// without poking MMIO. RST is self-clearing once the chip has
+/// re-initialised the FIFOs + descriptor pointers.
+pub const fn cr_reset_value() -> u8 { CR_RST }
+
 // ── Driver-match registration ────────────────────────────────────────
 
 /// Probe entry — Stage 1 returns `Ok(())` without touching hardware.
