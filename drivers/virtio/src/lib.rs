@@ -12,6 +12,7 @@ extern crate narf_io;
 pub mod balloon_pci;
 pub mod blk;
 pub mod blk_pci;
+pub mod console_pci;
 pub mod fs_pci;
 pub mod gpu_pci;
 pub mod input_pci;
@@ -68,6 +69,9 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "virtio-vsock-pci",   || {
         vsock_pci::register_pci_driver();   InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "virtio-console-pci", || {
+        console_pci::register_pci_driver(); InitResult::Ok
     });
 }
 
