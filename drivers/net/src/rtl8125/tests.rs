@@ -2,14 +2,16 @@
 //!
 //! Stage 1: PCI match-table entries for RTL8125 + RTL8125B.
 //! Stage 2: MAC-address decode + reset-value bit pattern.
+//! Stage 3: TX descriptor packing + 16-byte layout assertions.
 
 #![cfg(target_arch = "x86_64")]
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use super::{
-    cr_reset_value, decode_mac, mac_is_invalid, name_for,
-    CR_RST, RTL_DEV_8125, RTL_DEV_8125B, RTL_VENDOR,
+    build_tx_desc, cr_reset_value, decode_mac, mac_is_invalid, name_for,
+    CR_RST, RING_LEN, RTL_DEV_8125, RTL_DEV_8125B, RTL_VENDOR,
+    TxDesc, TXD_EOR, TXD_FS, TXD_LS, TXD_OWN,
 };
 
 // ── Stage 1: PCI match table ───────────────────────────────────────
@@ -82,3 +84,73 @@ fn smoke_rtl8125_cr_reset_bit() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/rtl8125", smoke_rtl8125_cr_reset_bit);
+
+// ── Stage 3: TX descriptor layout ──────────────────────────────────
+
+fn smoke_rtl8125_txdesc_layout() -> TestResult {
+    if core::mem::size_of::<TxDesc>()  != 16 {
+        return TestResult::Fail("TxDesc not 16 bytes");
+    }
+    if core::mem::align_of::<TxDesc>() != 16 {
+        return TestResult::Fail("TxDesc not 16-byte aligned");
+    }
+    // Word ordering: flags_len at offset 0, vlan @ 4, addr_lo @ 8,
+    // addr_hi @ 12. The chip DMAs the descriptor in this exact order.
+    let d = TxDesc { flags_len: 0x11223344, vlan: 0x55667788,
+                     addr_lo:   0x99AABBCC, addr_hi: 0xDDEEFF00 };
+    let p = (&d) as *const _ as *const u32;
+    // SAFETY: structurally-sized read in-bounds, repr(C) layout.
+    let (w0, w1, w2, w3) = unsafe { (*p, *p.add(1), *p.add(2), *p.add(3)) };
+    if w0 != 0x11223344 || w1 != 0x55667788
+        || w2 != 0x99AABBCC || w3 != 0xDDEEFF00 {
+        return TestResult::Fail("TxDesc word order mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/rtl8125", smoke_rtl8125_txdesc_layout);
+
+fn smoke_rtl8125_build_tx_desc_round_trip() -> TestResult {
+    // Mid-ring slot: must NOT carry EOR.
+    let d = build_tx_desc(7, 0xDEAD_BEEF_CAFE_F00Du64, 0x05DC); // 1500
+    let want_flags = TXD_OWN | TXD_FS | TXD_LS | 0x05DC;
+    if d.flags_len != want_flags {
+        return TestResult::Fail("mid-ring flags_len mismatch");
+    }
+    if d.flags_len & TXD_EOR != 0 {
+        return TestResult::Fail("mid-ring slot wrongly carries EOR");
+    }
+    if d.vlan    != 0           { return TestResult::Fail("vlan not zero"); }
+    if d.addr_lo != 0xCAFE_F00D  { return TestResult::Fail("addr_lo wrong"); }
+    if d.addr_hi != 0xDEAD_BEEF  { return TestResult::Fail("addr_hi wrong"); }
+
+    // Last slot: EOR must be set so the controller's internal pointer
+    // wraps to slot 0.
+    let last = build_tx_desc(RING_LEN - 1, 0x1_0000_0000u64, 64);
+    if last.flags_len & TXD_EOR == 0 {
+        return TestResult::Fail("RING_LEN-1 slot missing EOR");
+    }
+    if last.flags_len & 0xFFFF != 64 {
+        return TestResult::Fail("length field corrupted by EOR set");
+    }
+    if last.addr_lo != 0 || last.addr_hi != 1 {
+        return TestResult::Fail("64-bit phys split wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/rtl8125", smoke_rtl8125_build_tx_desc_round_trip);
+
+fn smoke_rtl8125_tx_desc_len_truncates() -> TestResult {
+    // §3.1.1 frame-length field is 16 bits; values > 0xFFFF should
+    // mask cleanly without bleeding into the flag bits.
+    let d = build_tx_desc(0, 0, 0x1_FFFF);
+    if d.flags_len & 0xFFFF != 0xFFFF {
+        return TestResult::Fail("length not masked to 16 bits");
+    }
+    // Make sure flags above bit 16 still carry only OWN/FS/LS.
+    let want_top = TXD_OWN | TXD_FS | TXD_LS;
+    if d.flags_len & 0xFFFF_0000 != want_top {
+        return TestResult::Fail("length overflow leaked into flag bits");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/rtl8125", smoke_rtl8125_tx_desc_len_truncates);

@@ -149,6 +149,67 @@ pub const fn mac_is_invalid(mac: [u8; 6]) -> bool {
 /// re-initialised the FIFOs + descriptor pointers.
 pub const fn cr_reset_value() -> u8 { CR_RST }
 
+// ── TX descriptor ring layout (Stage 3) ────────────────────────────
+// Datasheet §3.1.1 "Transmit Descriptor Format" — RTL8125 inherits
+// the 16-byte descriptor of the RTL8169/8168 family unchanged on the
+// normal-priority queue. Each descriptor is four little-endian 32-bit
+// words:
+//
+//   word0:  flags (OWN/EOR/FS/LS/...) | frame_length[15:0]
+//   word1:  VLAN tag bits             (Stage 3: always 0)
+//   word2:  buffer phys addr  low  32 bits
+//   word3:  buffer phys addr  high 32 bits
+
+/// Descriptor count per ring. Datasheet §3.1 caps each ring at 1024
+/// descriptors; 256 fills one 4 KiB page (256 × 16 = 4096) which is
+/// the same Stage-4 ring sizing the r8169 driver uses.
+pub const RING_LEN: usize = 256;
+/// Total bytes occupied by one descriptor ring.
+pub const RING_BYTES: usize = RING_LEN * 16;
+
+// TX descriptor word0 flag bits (§3.1.1 Table 3-1).
+pub(crate) const TXD_OWN: u32 = 1 << 31;
+pub(crate) const TXD_EOR: u32 = 1 << 30;
+pub(crate) const TXD_FS:  u32 = 1 << 29;
+pub(crate) const TXD_LS:  u32 = 1 << 28;
+/// word0 frame-length field mask (16 bits, §3.1.1).
+pub(crate) const TXD_LEN_MASK: u32 = 0xFFFF;
+
+/// In-memory shape of a single TX descriptor. `repr(C, align(16))`
+/// matches the on-wire layout the chip DMAs from. `Default::default()`
+/// produces a host-owned (OWN=0) descriptor, which is what
+/// `alloc_coherent`-zeroed pages give us.
+#[repr(C, align(16))]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct TxDesc {
+    pub flags_len: u32,
+    pub vlan:      u32,
+    pub addr_lo:   u32,
+    pub addr_hi:   u32,
+}
+const _: () = assert!(core::mem::size_of::<TxDesc>() == 16);
+const _: () = assert!(core::mem::align_of::<TxDesc>() == 16);
+
+/// Build a single-buffer TX descriptor for a frame of `len` bytes
+/// living at physical address `phys`. `slot` is the descriptor's
+/// position within the ring; the EOR bit is set on slot
+/// `RING_LEN - 1` so the controller's internal pointer wraps to slot
+/// 0 instead of running off the end. FS+LS are always set since the
+/// Stage-3 driver only emits single-segment packets.
+///
+/// `len` is masked to 16 bits per §3.1.1; values > 0xFFFF are silently
+/// truncated (caller is expected to enforce ≤ 1518 / MTU).
+pub const fn build_tx_desc(slot: usize, phys: u64, len: u32) -> TxDesc {
+    let mut flags = TXD_OWN | TXD_FS | TXD_LS | (len & TXD_LEN_MASK);
+    if slot == RING_LEN - 1 { flags |= TXD_EOR; }
+    TxDesc {
+        flags_len: flags,
+        vlan:      0,
+        addr_lo:   phys as u32,
+        addr_hi:   (phys >> 32) as u32,
+    }
+}
+
 // ── Driver-match registration ────────────────────────────────────────
 
 /// Probe entry — Stage 1 returns `Ok(())` without touching hardware.
