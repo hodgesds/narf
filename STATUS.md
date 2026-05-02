@@ -18,8 +18,8 @@ asks for. Updated when observable kernel behaviour changes.
   delivers hardware LAPIC-timer IRQs, exits cleanly.
 - `cargo xtask run --arch=aarch64` boots, runs the full async demo
   using CNTPCT_EL0 as the clock, exits via ARM semihosting.
-- `cargo xtask test --arch=x86_64` passes **564/0/22** (pass / fail / skip).
-- `cargo xtask test --arch=aarch64` passes **292/0/10** (pass / fail / skip).
+- `cargo xtask test --arch=x86_64` passes **565/0/24** (pass / fail / skip).
+- `cargo xtask test --arch=aarch64` passes **293/0/10** (pass / fail / skip).
   Skips are x86_64-specific PCIe surfaces or live-device tests that
   skip cleanly when QEMU doesn't expose the device.
 - In-tree PCIe drivers running against real QEMU-emulated devices.
@@ -53,6 +53,10 @@ asks for. Updated when observable kernel behaviour changes.
 | SMBus (ICH)      | Intel ICH SMBus controller, PCI class 0x0C/subclass 0x05 (any vendor) — IO BAR4 + byte-data + word-data read/write transactions. |
 | TPM 2.0          | TCG PC Client PTP (CRB) + TIS v1.21 (legacy) auto-detect at 0xFED40000 — `submit(cmd)` + `tpm2_get_random` helpers. |
 | USB Hub class    | USB 2.0 Chapter 11 — GET_DESCRIPTOR(Hub) + SET_FEATURE(PORT_POWER) + GET_STATUS + per-port reset for downstream device enumeration. |
+| ACPI parser (x86_64) | RSDP discovery (EBDA + BIOS area + Limine override) → XSDT walk → MADT / HPET / MCFG / FADT decode. |
+| TSC calibration  | CPUID 15h (TSC/crystal ratio) + CPUID 16h (base frequency) + HPET cross-check hook. Replaces 1 GHz fallback. |
+| Microcode (Intel + AMD) | Vendor detection + revision read (MSR 0x8B with CPUID handshake) + Intel WRMSR 0x79 / AMD WRMSR 0xC0010020 update path. |
+| PSCI + SMCCC (aarch64) | SMC + HVC conduit wrappers + PSCI_VERSION / SYSTEM_OFF / SYSTEM_RESET / CPU_OFF per Arm DEN0022D. HVC default (QEMU virt + KVM); SMC selectable for bare-metal. |
 | iwlwifi          | Intel Wi-Fi 6 / 6E (AX200 / AX201 / AX210 / AX211). **Structural probe only** — PCI match table + spec doc. Operational register map (CSR/PRPH offsets, firmware loader, TFD/RBD descriptors, host-command opcodes) is not in any public Intel doc; further stages blocked on public register docs. See `drivers/net/specification/iwlwifi.md`. |
 | AHCI (ICH9/10)   | HBA bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT. |
 | xHCI USB host    | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT. |

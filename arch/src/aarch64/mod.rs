@@ -5,6 +5,7 @@ pub mod cpu;
 pub mod cpuid;
 pub mod mmio;
 pub mod mte;
+pub mod psci;
 pub mod sysreg;
 
 pub use asm::{halt_forever, disable_interrupts, enable_interrupts, cas128, patch_word};

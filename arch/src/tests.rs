@@ -168,3 +168,69 @@ fn smoke_percpu_this_cpu() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("arch", smoke_percpu_this_cpu);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_acpi_discover_xsdt() -> TestResult {
+    use crate::x86_64::acpi;
+    // SAFETY: kernel-test runs at CPL=0; low memory + identity-
+    // mapped phys windows are safe to read.
+    let res = unsafe { acpi::discover() };
+    let t = match res {
+        Ok(t) => t,
+        Err(_) => return TestResult::Skip("no ACPI tables present"),
+    };
+    if t.local_apics.is_empty() {
+        return TestResult::Fail("MADT had no local-APIC entries");
+    }
+    if t.hpet_base.is_none() {
+        return TestResult::Fail("HPET table missing");
+    }
+    if t.mcfg_segments.is_empty() {
+        return TestResult::Fail("MCFG had no segments");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/acpi", smoke_acpi_discover_xsdt);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_tsc_calibrate_via_cpuid() -> TestResult {
+    use crate::x86_64::tsc;
+    tsc::__reset_for_test();
+    let hz = tsc::calibrate_via_cpuid();
+    if hz == 0 {
+        return TestResult::Skip("CPUID 15h/16h unavailable");
+    }
+    if hz < 100_000_000 || hz > 10_000_000_000 {
+        return TestResult::Fail("TSC frequency out of plausible range");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/tsc", smoke_tsc_calibrate_via_cpuid);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_microcode_vendor_detect() -> TestResult {
+    use crate::x86_64::microcode;
+    match microcode::vendor() {
+        microcode::Vendor::Intel | microcode::Vendor::Amd => TestResult::Pass,
+        microcode::Vendor::Unknown => TestResult::Fail("unknown vendor on x86_64"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/microcode", smoke_microcode_vendor_detect);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_psci_version() -> TestResult {
+    use crate::aarch64::psci;
+    let (major, minor) = psci::version();
+    if major == 0 && minor == 0 {
+        return TestResult::Skip("no PSCI implementation");
+    }
+    if major == 0xFFFF && minor == 0xFFFF {
+        return TestResult::Fail("PSCI_VERSION returned junk");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/psci", smoke_psci_version);

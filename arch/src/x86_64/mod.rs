@@ -1,14 +1,17 @@
 //! x86_64 arch backend.
 
+pub mod acpi;
 pub mod asm;
 pub mod cpu;
 pub mod cpuid;
 pub mod cr;
 pub mod io_port;
+pub mod microcode;
 pub mod msr;
 pub mod pcid;
 pub mod pks;
 pub mod probe;
+pub mod tsc;
 pub mod user_mode;
 
 pub use asm::{halt_forever, disable_interrupts, enable_interrupts, cas128, patch_word};

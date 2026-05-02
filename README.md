@@ -65,7 +65,7 @@ intra-address-space isolation.
   framekernel's domain model.
 - **Verification and observability are first-class.** A kernel-resident
   test harness (`cargo xtask test`) boots the real kernel under QEMU and
-  asserts on live invariants — 564 smokes on x86_64, 292 on aarch64 at
+  asserts on live invariants — 565 smokes on x86_64, 292 on aarch64 at
   time of writing — alongside USDT-style probes, flight-recorder rings, a
   PMU-sampling surface, and an ABI promise (syscall numbers carry an upper
   8-bit version, `relibc` will gate against it). Bugs are caught at the
@@ -250,6 +250,27 @@ Live from boot through `cargo xtask run`:
   downstream-port SET_FEATURE(PORT_POWER) + GET_STATUS +
   PORT_RESET / C_PORT_RESET drive the per-port reset flow that
   enables enumeration through external hubs.
+- ACPI parser (`narf_arch::x86_64::acpi`): RSDP scan (EBDA + BIOS
+  read-only area, with override for Limine-discovered RSDP) →
+  XSDT walk → MADT (LAPIC + x2APIC + IOAPIC + interrupt
+  overrides) + HPET (MMIO base) + MCFG (PCIe ECAM segments) +
+  FADT (IA-PC boot flags). Replaces the hard-coded HPET / ECAM
+  base addresses with firmware-discovered ones.
+- TSC calibration (`narf_arch::x86_64::tsc`): CPUID 15h
+  (TSC/crystal ratio) primary + CPUID 16h (processor base
+  frequency) fallback. HPET cross-check hook is exposed for
+  older CPUs that don't implement either leaf. Replaces the
+  1 GHz nominal that `narf-time` was using.
+- Microcode loading (`narf_arch::x86_64::microcode`): vendor
+  detection (Intel / AMD via CPUID leaf 0), revision read via
+  MSR 0x8B (with the Intel CPUID handshake), Intel update via
+  WRMSR 0x79 + AMD patch via WRMSR 0xC0010020, plus an
+  `IntelUcodeHeader` decoder for caller-side blob validation.
+- PSCI + SMCCC (`narf_arch::aarch64::psci`): clean-room from
+  Arm DEN0022D + DEN0028E. `smc` / `hvc` instruction wrappers,
+  conduit selector (HVC default for QEMU virt + KVM, SMC for
+  bare-metal with secure monitor), and PSCI_VERSION /
+  SYSTEM_OFF / SYSTEM_RESET / CPU_OFF.
 - Intel HD Audio (HDA): clean-room driver for the AMD Ryzen /
   Phoenix and Radeon HD Audio Controllers — BAR0 mapping, GCTL
   reset, CORB/RIRB ring DMA, STATESTS codec walk, Get Parameter
@@ -273,8 +294,8 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **564/0/22** smokes;
-`--arch=aarch64` passes **292/0/10**. Skips are x86-specific PCIe
+`cargo xtask test --arch=x86_64` passes **565/0/24** smokes;
+`--arch=aarch64` passes **293/0/10**. Skips are x86-specific PCIe
 surfaces or live-device tests that skip cleanly when QEMU doesn't
 expose the device. See `STATUS.md` for the full tally and per-
 subsystem breakdown.
