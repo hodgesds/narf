@@ -13,6 +13,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 pub const VIRTIO_SCSI_PCI_VENDOR: u16 = 0x1AF4;
 pub const VIRTIO_SCSI_PCI_DEVICE: u16 = 0x1048;
 
+pub mod wire;
+
 mod tests;
 
 /// Probed virtio-scsi-pci controller. Stage-1 placeholder: only the

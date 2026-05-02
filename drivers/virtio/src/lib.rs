@@ -23,6 +23,7 @@ pub mod queue;
 pub mod rng_pci;
 pub mod scsi_pci;
 pub mod snd_pci;
+pub mod vsock_pci;
 pub mod class_blk;
 
 mod tests;
@@ -64,6 +65,9 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "virtio-fs-pci",      || {
         fs_pci::register_pci_driver();      InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "virtio-vsock-pci",   || {
+        vsock_pci::register_pci_driver();   InitResult::Ok
     });
 }
 
