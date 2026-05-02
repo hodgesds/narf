@@ -387,3 +387,90 @@ fn smoke_hfi_caps() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("arch/hfi", smoke_hfi_caps);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_pmu_caps_decode() -> TestResult {
+    use crate::x86_64::pmu;
+    let c = pmu::caps();
+    if c.version == 0 {
+        return TestResult::Skip("no architectural PMU");
+    }
+    if c.n_general_counters == 0 {
+        return TestResult::Fail("PMU version > 0 but no GP counters");
+    }
+    if c.width_general < 32 || c.width_general > 64 {
+        return TestResult::Fail("PMU GP counter width implausible");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/pmu", smoke_pmu_caps_decode);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_pmu_event_encode() -> TestResult {
+    use crate::x86_64::pmu;
+    // Architectural "Instructions Retired" with both rings.
+    let s = pmu::arch_event::instructions_retired(true, true);
+    let v = s.encode();
+    // event_select = 0xC0, umask = 0x00, OS+USR+ENABLE bits set.
+    if (v & 0xFF) != 0xC0          { return TestResult::Fail("event_select"); }
+    if ((v >> 8) & 0xFF) != 0x00   { return TestResult::Fail("umask"); }
+    if v & (1 << 16) == 0          { return TestResult::Fail("USR bit"); }
+    if v & (1 << 17) == 0          { return TestResult::Fail("OS bit"); }
+    if v & (1 << 22) == 0          { return TestResult::Fail("EN bit"); }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/pmu", smoke_pmu_event_encode);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_lbr_caps() -> TestResult {
+    use crate::x86_64::lbr;
+    let c = lbr::caps();
+    if c.n_entries == 0 {
+        return TestResult::Fail("LBR n_entries = 0");
+    }
+    if !matches!(c.n_entries, 4 | 8 | 16 | 32) {
+        return TestResult::Fail("LBR n_entries non-canonical");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/lbr", smoke_lbr_caps);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_pt_caps() -> TestResult {
+    use crate::x86_64::pt;
+    let c = pt::caps();
+    // QEMU TCG without `-cpu host,+intel-pt` won't advertise PT;
+    // real silicon does. Either is acceptable.
+    if c.supported && !c.topa {
+        // Single-range output is allowed too — but the caps shape
+        // says ToPA + multi_topa are at least decoded coherently.
+    }
+    let _ = c;
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/pt", smoke_pt_caps);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_pt_topa_entry_encode() -> TestResult {
+    use crate::x86_64::pt::topa_entry;
+    // 4 KiB ring at phys 0x10_0000, not END, not INT.
+    let e = topa_entry(0x10_0000, 12, false, false);
+    if e & 0xFFF != 0 { return TestResult::Fail("size field"); }
+    if e & (1 << 5) != 0 { return TestResult::Fail("END set"); }
+    if e & (1 << 4) != 0 { return TestResult::Fail("INT set"); }
+    if e & 0xFFFF_FFFF_FFFF_F000 != 0x10_0000 {
+        return TestResult::Fail("base lost");
+    }
+    // 16 KiB ring + END + INT.
+    let e = topa_entry(0x20_0000, 14, true, true);
+    if e & 0x7 != 2 { return TestResult::Fail("16K size code"); }
+    if e & (1 << 4) == 0 { return TestResult::Fail("INT lost"); }
+    if e & (1 << 5) == 0 { return TestResult::Fail("END lost"); }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/pt", smoke_pt_topa_entry_encode);

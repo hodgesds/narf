@@ -65,7 +65,7 @@ intra-address-space isolation.
   framekernel's domain model.
 - **Verification and observability are first-class.** A kernel-resident
   test harness (`cargo xtask test`) boots the real kernel under QEMU and
-  asserts on live invariants — 573 smokes on x86_64, 292 on aarch64 at
+  asserts on live invariants — 577 smokes on x86_64, 292 on aarch64 at
   time of writing — alongside USDT-style probes, flight-recorder rings, a
   PMU-sampling surface, and an ABI promise (syscall numbers carry an upper
   8-bit version, `relibc` will gate against it). Bugs are caught at the
@@ -336,6 +336,29 @@ Live from boot through `cargo xtask run`:
   MSR write surface, and a timestamp poll for detecting class
   changes on the per-package feedback page. Spec:
   `arch/specification/smp-topology.md` §3.
+- PMU (`narf_arch::x86_64::pmu`): Intel architectural perfmon
+  per SDM Vol 3 Ch 19. CPUID(0xA) capabilities decode, per-CPU
+  general-purpose counter programming via `IA32_PERFEVTSELi`,
+  fixed-counter enable via `MSR_PERF_FIXED_CTR_CTRL`, atomic
+  enable/disable via `IA32_PERF_GLOBAL_CTRL`. Pre-baked
+  `arch_event` constructors for the seven architectural events
+  (unhalted core cycles, instructions retired, ref cycles,
+  LLC reference / miss, branch retired / mispredict). Spec:
+  `observability/specification/perfmon.md` §1.
+- LBR (`narf_arch::x86_64::lbr`): Last Branch Records per SDM
+  Vol 3 §17.5. Family/model classification picks the ring
+  depth (4 / 8 / 16 / 32 entries) and the corresponding MSR
+  base (Skylake+ 0x680/0x6C0 vs legacy 0x40/0x60).
+  `enable(filter)` / `disable` / `read_pair(idx)` / `read_tos`
+  for the standard ring walk. Spec:
+  `observability/specification/perfmon.md` §2.
+- Intel PT (`narf_arch::x86_64::pt`): Processor Trace per SDM
+  Vol 3 Ch 35. CPUID(0x14) caps decode, `topa_entry(base,
+  size_log2, end, int)` builder, single-entry ToPA install +
+  ring-buffer wiring, `enable(os, usr)` flips `IA32_RTIT_CTL`
+  with branch-trace + ToPA + per-ring filter; `output_offset` +
+  `status` surface ring progress to userspace decoders. Spec:
+  `observability/specification/perfmon.md` §3.
 - Intel HD Audio (HDA): clean-room driver for the AMD Ryzen /
   Phoenix and Radeon HD Audio Controllers — BAR0 mapping, GCTL
   reset, CORB/RIRB ring DMA, STATESTS codec walk, Get Parameter
@@ -359,7 +382,7 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **573/0/27** smokes;
+`cargo xtask test --arch=x86_64` passes **577/0/28** smokes;
 `--arch=aarch64` passes **294/0/10**. Skips are x86-specific PCIe
 surfaces or live-device tests that skip cleanly when QEMU doesn't
 expose the device. See `STATUS.md` for the full tally and per-
