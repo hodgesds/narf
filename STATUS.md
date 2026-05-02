@@ -18,8 +18,8 @@ asks for. Updated when observable kernel behaviour changes.
   delivers hardware LAPIC-timer IRQs, exits cleanly.
 - `cargo xtask run --arch=aarch64` boots, runs the full async demo
   using CNTPCT_EL0 as the clock, exits via ARM semihosting.
-- `cargo xtask test --arch=x86_64` passes **565/0/24** (pass / fail / skip).
-- `cargo xtask test --arch=aarch64` passes **293/0/10** (pass / fail / skip).
+- `cargo xtask test --arch=x86_64` passes **569/0/24** (pass / fail / skip).
+- `cargo xtask test --arch=aarch64` passes **294/0/10** (pass / fail / skip).
   Skips are x86_64-specific PCIe surfaces or live-device tests that
   skip cleanly when QEMU doesn't expose the device.
 - In-tree PCIe drivers running against real QEMU-emulated devices.
@@ -57,6 +57,12 @@ asks for. Updated when observable kernel behaviour changes.
 | TSC calibration  | CPUID 15h (TSC/crystal ratio) + CPUID 16h (base frequency) + HPET cross-check hook. Replaces 1 GHz fallback. |
 | Microcode (Intel + AMD) | Vendor detection + revision read (MSR 0x8B with CPUID handshake) + Intel WRMSR 0x79 / AMD WRMSR 0xC0010020 update path. |
 | PSCI + SMCCC (aarch64) | SMC + HVC conduit wrappers + PSCI_VERSION / SYSTEM_OFF / SYSTEM_RESET / CPU_OFF per Arm DEN0022D. HVC default (QEMU virt + KVM); SMC selectable for bare-metal. |
+| MCA / MCE (x86_64) | Per SDM Vol 3 Ch 16 — `MCG_CAP` / `MCG_STATUS` decode, per-bank `MCi_STATUS`/`ADDR`/`MISC` snapshot + W1C clear, init-time enable for every architectural bank. |
+| MTRR (x86_64)    | Variable + fixed range MTRRs per SDM §12.11 — capabilities decode, `set_variable_range`, `set_write_combining(phys, size)` for framebuffer / GPU BAR claims. |
+| Spectre mitigations | IA32_SPEC_CTRL (IBRS / STIBP / SSBD) + IA32_PRED_CMD (IBPB) + IA32_FLUSH_CMD (L1D_FLUSH) per SDM Vol 4 §2.16 — feature probe, default-enable, IBPB barrier, L1D flush. |
+| CMOS RTC (MC146818) | IO ports 0x70/0x71 wall-clock read with UIP-poll, BCD/binary + 12/24 h decode, century byte, Unix epoch conversion. |
+| i8254 PIT        | Mode 0 (one-shot) + Mode 2 (rate generator) + Mode 3 (square wave) at IO 0x40-0x43 with 1.193182 MHz input clock. Channel 2 latch + PPI gate for free-running boot timer. |
+| Generic Timer (aarch64) | `CNTFRQ_EL0` calibration + `CNTPCT_EL0` read with `isb` ordering. Replaces 1 GHz fallback in `narf-time`. |
 | iwlwifi          | Intel Wi-Fi 6 / 6E (AX200 / AX201 / AX210 / AX211). **Structural probe only** — PCI match table + spec doc. Operational register map (CSR/PRPH offsets, firmware loader, TFD/RBD descriptors, host-command opcodes) is not in any public Intel doc; further stages blocked on public register docs. See `drivers/net/specification/iwlwifi.md`. |
 | AHCI (ICH9/10)   | HBA bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT. |
 | xHCI USB host    | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT. |

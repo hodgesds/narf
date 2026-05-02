@@ -234,3 +234,90 @@ fn smoke_psci_version() -> TestResult {
 }
 #[cfg(target_arch = "aarch64")]
 kernel_test_in!("arch/psci", smoke_psci_version);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_mce_supported_and_snapshot() -> TestResult {
+    use crate::x86_64::mce;
+    if !mce::is_supported() {
+        return TestResult::Skip("MCA not advertised");
+    }
+    // SAFETY: kernel-test runs at CPL=0; MCA architecturally
+    // available when CPUID flags it.
+    let cap = unsafe { mce::mcg_cap() };
+    if cap.count == 0 {
+        return TestResult::Fail("MCG_CAP reported 0 banks");
+    }
+    // SAFETY: same.
+    let snap = unsafe { mce::snapshot() };
+    let _ = snap;
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/mce", smoke_mce_supported_and_snapshot);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_mtrr_cap_decode() -> TestResult {
+    use crate::x86_64::mtrr;
+    // SAFETY: kernel-test CPL=0.
+    let cap = unsafe { mtrr::cap() };
+    if cap.vcnt == 0 {
+        return TestResult::Skip("no variable MTRRs (MTRR-less host?)");
+    }
+    // SAFETY: same.
+    let dt = unsafe { mtrr::def_type() };
+    let _ = dt;
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/mtrr", smoke_mtrr_cap_decode);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_spec_ctrl_features_probe() -> TestResult {
+    use crate::x86_64::spec_ctrl;
+    spec_ctrl::__reset_for_test();
+    let f = spec_ctrl::features();
+    // We don't fail when no mitigations are advertised — QEMU TCG
+    // leaves the mitigation CPUID bits clear by default. Just
+    // verify the probe ran without faulting.
+    let _ = f;
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/spec_ctrl", smoke_spec_ctrl_features_probe);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_rtc_read_now_plausible() -> TestResult {
+    use crate::x86_64::rtc;
+    // SAFETY: kernel-test runs in boot context; CMOS IO ports
+    // are owned.
+    let t = unsafe { rtc::read_now() };
+    if t.year < 1990 || t.year > 2100 {
+        return TestResult::Fail("RTC year implausible");
+    }
+    if t.month == 0 || t.month > 12 { return TestResult::Fail("month"); }
+    if t.day   == 0 || t.day   > 31 { return TestResult::Fail("day");   }
+    if t.hour  > 23                 { return TestResult::Fail("hour");  }
+    if t.minute > 59                { return TestResult::Fail("min");   }
+    if t.second > 60                { return TestResult::Fail("sec");   }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/rtc", smoke_rtc_read_now_plausible);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_generic_timer_calibrate() -> TestResult {
+    use crate::aarch64::timer;
+    timer::__reset_for_test();
+    let hz = timer::calibrate();
+    if hz == 0 {
+        return TestResult::Fail("CNTFRQ_EL0 returned 0");
+    }
+    // QEMU virt reports 62.5 MHz by default; real silicon ranges
+    // from 24 MHz to 100 MHz. 1 MHz..1 GHz is a generous window.
+    if hz < 1_000_000 || hz > 1_000_000_000 {
+        return TestResult::Fail("Generic timer freq out of plausible range");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/timer", smoke_generic_timer_calibrate);

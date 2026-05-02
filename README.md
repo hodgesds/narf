@@ -65,7 +65,7 @@ intra-address-space isolation.
   framekernel's domain model.
 - **Verification and observability are first-class.** A kernel-resident
   test harness (`cargo xtask test`) boots the real kernel under QEMU and
-  asserts on live invariants — 565 smokes on x86_64, 292 on aarch64 at
+  asserts on live invariants — 569 smokes on x86_64, 292 on aarch64 at
   time of writing — alongside USDT-style probes, flight-recorder rings, a
   PMU-sampling surface, and an ABI promise (syscall numbers carry an upper
   8-bit version, `relibc` will gate against it). Bugs are caught at the
@@ -271,6 +271,32 @@ Live from boot through `cargo xtask run`:
   conduit selector (HVC default for QEMU virt + KVM, SMC for
   bare-metal with secure monitor), and PSCI_VERSION /
   SYSTEM_OFF / SYSTEM_RESET / CPU_OFF.
+- MCA / MCE (`narf_arch::x86_64::mce`): Machine-Check
+  Architecture per SDM Vol 3 Ch 16. `MCG_CAP` / `MCG_STATUS`
+  decode, per-bank `MCi_STATUS` / `ADDR` / `MISC` snapshot, W1C
+  clear, init-time enable of every architectural bank. The
+  `#MC` IDT vector handler in `frame/` calls into `snapshot()`
+  to log + recover instead of triple-faulting.
+- MTRR (`narf_arch::x86_64::mtrr`): per SDM §12.11. Capabilities
+  + default-type decode, variable-range read/write, plus
+  `set_write_combining(phys, size)` for the framebuffer / GPU
+  drivers to claim WC on their MMIO BARs.
+- Spectre mitigations (`narf_arch::x86_64::spec_ctrl`): per SDM
+  Vol 4 §2.16. CPUID-gated `IA32_SPEC_CTRL` (IBRS / STIBP /
+  SSBD), `IA32_PRED_CMD` (IBPB), `IA32_FLUSH_CMD` (L1D_FLUSH).
+  `enable_default_mitigations()` flips on every supported bit;
+  `ibpb()` / `l1d_flush()` are call-site barriers.
+- CMOS RTC (`narf_arch::x86_64::rtc`): MC146818 wall-clock read
+  via IO 0x70/0x71 with UIP poll for coherency, BCD/binary +
+  12/24-hour decode, optional century byte handling, plus a
+  `to_unix_seconds(WallTime)` helper for epoch conversion.
+- i8254 PIT (`narf_arch::x86_64::pit`): one-shot + rate-gen +
+  square-wave modes at IO 0x40-0x43 with the 1.193182 MHz input
+  clock. Channel 2 latch + PPI gate at 0x61 for a free-running
+  boot timer used as the TSC pre-LAPIC calibration source.
+- Generic Timer (`narf_arch::aarch64::timer`): `CNTFRQ_EL0`
+  calibration + `CNTPCT_EL0` read with `isb` ordering.
+  Replaces the 1 GHz aarch64 fallback in `narf-time::wall`.
 - Intel HD Audio (HDA): clean-room driver for the AMD Ryzen /
   Phoenix and Radeon HD Audio Controllers — BAR0 mapping, GCTL
   reset, CORB/RIRB ring DMA, STATESTS codec walk, Get Parameter
@@ -294,8 +320,8 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **565/0/24** smokes;
-`--arch=aarch64` passes **293/0/10**. Skips are x86-specific PCIe
+`cargo xtask test --arch=x86_64` passes **569/0/24** smokes;
+`--arch=aarch64` passes **294/0/10**. Skips are x86-specific PCIe
 surfaces or live-device tests that skip cleanly when QEMU doesn't
 expose the device. See `STATUS.md` for the full tally and per-
 subsystem breakdown.
