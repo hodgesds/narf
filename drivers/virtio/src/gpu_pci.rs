@@ -59,6 +59,7 @@ pub const CTRL_Q_DEPTH:   u16 = 16;
 pub const CURSOR_Q_DEPTH: u16 = 4;
 
 mod tests;
+pub mod cmd;
 
 // Command codes (VirtIO 1.2 §5.7.6).
 const CMD_GET_DISPLAY_INFO:    u32 = 0x0100;

@@ -31,6 +31,7 @@ asks for. Updated when observable kernel behaviour changes.
 | virtio-net-pci   | Modern transport. TX + RX (polled).               |
 | virtio-rng-pci   | Modern transport. Structural probe.               |
 | virtio-balloon-pci | Modern transport. Structural probe.             |
+| virtio-gpu-pci   | Modern + legacy PCI match (1AF4:1050 / 1AF4:1010). Pure-data builders for the six 2D commands (GET_DISPLAY_INFO / RESOURCE_CREATE_2D / ATTACH_BACKING / SET_SCANOUT / TRANSFER_TO_HOST_2D / RESOURCE_FLUSH) per VirtIO 1.2 §5.7.6. controlq + cursorq layout constants. Live bring-up + scanout flush already wired (`bring_up`, `init_scanout`, `flush`); QEMU live-submit smoke is the next stage. |
 | e1000 / e1000e   | Real Intel NIC (8254x + 8257x family). TX + RX.   |
 | ixgbe            | Intel 82599 / X540 / X550 10 GbE. PCI match + reset + EEPROM MAC + advanced TX ring + RX ring + MSI-X + `HwNic`. Live bring-up smoke skips on QEMU (no emulated 82599). |
 | iwlwifi          | Intel Wi-Fi 6 / 6E (AX200 / AX201 / AX210 / AX211). **Structural probe only** — PCI match table + spec doc. Operational register map (CSR/PRPH offsets, firmware loader, TFD/RBD descriptors, host-command opcodes) is not in any public Intel doc; further stages blocked on public register docs. See `drivers/net/specification/iwlwifi.md`. |

@@ -4,6 +4,8 @@
 //!   (1AF4:1050 modern, 1AF4:1010 legacy).
 //! Stage 2: VirtqueueLayout for controlq + cursorq — pure-data offsets
 //!   (VirtIO 1.2 §3.2.1).
+//! Stage 3: pure-data builders/decoders for the six 2D commands
+//!   round-trip to byte-identical output (VirtIO 1.2 §5.7.6).
 
 #![cfg(target_arch = "x86_64")]
 
@@ -77,3 +79,145 @@ fn smoke_virtio_gpu_pci_queue_layout() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/virtio/gpu_pci", smoke_virtio_gpu_pci_queue_layout);
+
+// ── Stage 3: command builder round-trips (VirtIO §5.7.6) ───────────
+
+fn smoke_virtio_gpu_pci_get_display_info_round_trip() -> TestResult {
+    use super::cmd::{build_get_display_info, read_hdr,
+        GET_DISPLAY_INFO_LEN, VIRTIO_GPU_CMD_GET_DISPLAY_INFO};
+    let mut a = [0u8; GET_DISPLAY_INFO_LEN];
+    let mut b = [0u8; GET_DISPLAY_INFO_LEN];
+    build_get_display_info(&mut a);
+    let h = read_hdr(&a);
+    if h.cmd_type != VIRTIO_GPU_CMD_GET_DISPLAY_INFO {
+        return TestResult::Fail("cmd_type mismatch");
+    }
+    if h.flags != 0 || h.fence_id != 0 || h.ctx_id != 0 {
+        return TestResult::Fail("non-zero header tail");
+    }
+    build_get_display_info(&mut b);
+    if a != b { return TestResult::Fail("get_display_info not deterministic"); }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/virtio/gpu_pci",
+    smoke_virtio_gpu_pci_get_display_info_round_trip);
+
+fn smoke_virtio_gpu_pci_resource_create_2d_round_trip() -> TestResult {
+    use super::cmd::{build_resource_create_2d, decode_resource_create_2d,
+        ResourceCreate2D, RESOURCE_CREATE_2D_LEN};
+    let r = ResourceCreate2D {
+        resource_id: 0xCAFE_BABE,
+        format:      1, // B8G8R8X8_UNORM
+        width:       1024,
+        height:      768,
+    };
+    let mut buf  = [0u8; RESOURCE_CREATE_2D_LEN];
+    let mut buf2 = [0u8; RESOURCE_CREATE_2D_LEN];
+    build_resource_create_2d(&mut buf, r);
+    let decoded = decode_resource_create_2d(&buf);
+    if decoded != r {
+        return TestResult::Fail("resource_create_2d decode mismatch");
+    }
+    build_resource_create_2d(&mut buf2, decoded);
+    if buf != buf2 {
+        return TestResult::Fail("resource_create_2d round-trip not byte-identical");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/virtio/gpu_pci",
+    smoke_virtio_gpu_pci_resource_create_2d_round_trip);
+
+fn smoke_virtio_gpu_pci_attach_backing_round_trip() -> TestResult {
+    use super::cmd::{build_resource_attach_backing,
+        decode_resource_attach_backing, AttachBacking, ATTACH_BACKING_LEN};
+    let a = AttachBacking {
+        resource_id: 0x0000_0001,
+        addr:        0xDEAD_BEEF_0000_1000,
+        length:      4096,
+    };
+    let mut buf  = [0u8; ATTACH_BACKING_LEN];
+    let mut buf2 = [0u8; ATTACH_BACKING_LEN];
+    build_resource_attach_backing(&mut buf, a);
+    let decoded = decode_resource_attach_backing(&buf);
+    if decoded != a {
+        return TestResult::Fail("attach_backing decode mismatch");
+    }
+    // nr_entries field at offset 28 must be 1.
+    if u32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]) != 1 {
+        return TestResult::Fail("attach_backing nr_entries != 1");
+    }
+    build_resource_attach_backing(&mut buf2, decoded);
+    if buf != buf2 {
+        return TestResult::Fail("attach_backing round-trip not byte-identical");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/virtio/gpu_pci",
+    smoke_virtio_gpu_pci_attach_backing_round_trip);
+
+fn smoke_virtio_gpu_pci_set_scanout_round_trip() -> TestResult {
+    use super::cmd::{build_set_scanout, decode_set_scanout,
+        SetScanout, SET_SCANOUT_LEN};
+    let s = SetScanout {
+        x: 10, y: 20, width: 1280, height: 720,
+        scanout_id: 0, resource_id: 1,
+    };
+    let mut buf  = [0u8; SET_SCANOUT_LEN];
+    let mut buf2 = [0u8; SET_SCANOUT_LEN];
+    build_set_scanout(&mut buf, s);
+    let decoded = decode_set_scanout(&buf);
+    if decoded != s { return TestResult::Fail("set_scanout decode mismatch"); }
+    build_set_scanout(&mut buf2, decoded);
+    if buf != buf2 {
+        return TestResult::Fail("set_scanout round-trip not byte-identical");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/virtio/gpu_pci",
+    smoke_virtio_gpu_pci_set_scanout_round_trip);
+
+fn smoke_virtio_gpu_pci_transfer_to_host_2d_round_trip() -> TestResult {
+    use super::cmd::{build_transfer_to_host_2d, decode_transfer_to_host_2d,
+        TransferToHost2D, TRANSFER_TO_HOST_2D_LEN};
+    let t = TransferToHost2D {
+        x: 0, y: 0, width: 32, height: 32,
+        offset:      0,
+        resource_id: 1,
+    };
+    let mut buf  = [0u8; TRANSFER_TO_HOST_2D_LEN];
+    let mut buf2 = [0u8; TRANSFER_TO_HOST_2D_LEN];
+    build_transfer_to_host_2d(&mut buf, t);
+    let decoded = decode_transfer_to_host_2d(&buf);
+    if decoded != t {
+        return TestResult::Fail("transfer_to_host_2d decode mismatch");
+    }
+    build_transfer_to_host_2d(&mut buf2, decoded);
+    if buf != buf2 {
+        return TestResult::Fail("transfer_to_host_2d round-trip not byte-identical");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/virtio/gpu_pci",
+    smoke_virtio_gpu_pci_transfer_to_host_2d_round_trip);
+
+fn smoke_virtio_gpu_pci_resource_flush_round_trip() -> TestResult {
+    use super::cmd::{build_resource_flush, decode_resource_flush,
+        ResourceFlush, RESOURCE_FLUSH_LEN};
+    let r = ResourceFlush {
+        x: 0, y: 0, width: 32, height: 32, resource_id: 1,
+    };
+    let mut buf  = [0u8; RESOURCE_FLUSH_LEN];
+    let mut buf2 = [0u8; RESOURCE_FLUSH_LEN];
+    build_resource_flush(&mut buf, r);
+    let decoded = decode_resource_flush(&buf);
+    if decoded != r {
+        return TestResult::Fail("resource_flush decode mismatch");
+    }
+    build_resource_flush(&mut buf2, decoded);
+    if buf != buf2 {
+        return TestResult::Fail("resource_flush round-trip not byte-identical");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/virtio/gpu_pci",
+    smoke_virtio_gpu_pci_resource_flush_round_trip);
