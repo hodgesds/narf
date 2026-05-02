@@ -27,6 +27,7 @@ narf-crypto       = { path = "../crypto" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 narf-init         = { path = "../init" }
 narf-filesystem   = { path = "../filesystem" }
+narf-initramfs    = { path = "../initramfs" }
 
 [lints]
 workspace = true

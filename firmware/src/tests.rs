@@ -339,9 +339,13 @@ fn smoke_firmware_loader_task_allowlist_round_trip() -> TestResult {
 kernel_test_in!("firmware", smoke_firmware_loader_task_allowlist_round_trip);
 
 fn smoke_firmware_initramfs_staging_round_trip() -> TestResult {
-    use crate::{
-        install_initramfs, initramfs_staged, __reset_staged_initramfs,
-    };
+    // `install_initramfs` / `initramfs_staged` /
+    // `__reset_staged_initramfs` are now thin deprecated shims
+    // around `narf-initramfs`; the smoke calls the canonical API
+    // directly so the eventual shim removal is invisible.
+    use narf_initramfs::{install as install_initramfs,
+                         is_staged as initramfs_staged,
+                         __reset_staged as __reset_staged_initramfs};
     if !cfg!(feature = "firmware-allow-unsigned") {
         return TestResult::Skip("firmware-allow-unsigned off");
     }

@@ -385,7 +385,10 @@ pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
     narf_init::register(Stage::Subsys, "firmware-init", || InitResult::Ok);
     narf_init::register(Stage::Late, "firmware-scan-initramfs", || {
-        let fs = match staged_initramfs() {
+        // The staged initramfs lives in `narf-initramfs` (spec §6
+        // step-2 consolidation). When the boot path stages one,
+        // we pick up `firmware/*` entries; otherwise no-op.
+        let fs = match narf_initramfs::staged() {
             Some(f) => f,
             None    => return InitResult::NotPresent,
         };
@@ -400,33 +403,28 @@ pub fn register_initcalls() {
     });
 }
 
-/// Stage an initramfs for the Stage::Late firmware scanner. Called
-/// once at boot by the trusted bootstrap after the bootloader-
-/// supplied CPIO image has been parsed; the scanner picks it up
-/// during `Stage::Late`. Idempotent — first install wins.
+/// Stage an initramfs for the Stage::Late firmware scanner.
+///
+/// Deprecated: thin shim around `narf_initramfs::install`. New
+/// callers should reach `narf-initramfs` directly so the eventual
+/// removal of this re-export (spec §6 step-3) is invisible.
+#[deprecated(note = "use narf_initramfs::install instead")]
 pub fn install_initramfs(fs: &'static narf_filesystem::Initramfs) {
-    let mut g = STAGED_INITRAMFS.lock();
-    if g.is_none() {
-        *g = Some(fs);
-    }
+    narf_initramfs::install(fs);
 }
 
 /// `true` once a kernel-supplied initramfs has been staged.
+///
+/// Deprecated: thin shim around `narf_initramfs::is_staged`.
+#[deprecated(note = "use narf_initramfs::is_staged instead")]
 pub fn initramfs_staged() -> bool {
-    STAGED_INITRAMFS.lock().is_some()
-}
-
-fn staged_initramfs() -> Option<&'static narf_filesystem::Initramfs> {
-    *STAGED_INITRAMFS.lock()
+    narf_initramfs::is_staged()
 }
 
 #[doc(hidden)]
 pub fn __reset_staged_initramfs() {
-    *STAGED_INITRAMFS.lock() = None;
+    narf_initramfs::__reset_staged();
 }
-
-static STAGED_INITRAMFS: IrqSafeSpinLock<Option<&'static narf_filesystem::Initramfs>>
-    = IrqSafeSpinLock::new(None);
 
 /// Walk every `firmware/*` entry in an initramfs and register it
 /// with the registry under `BlobSource::Initramfs`. Per spec §5,

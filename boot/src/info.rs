@@ -63,6 +63,19 @@ pub struct BootInfo {
     /// one (PVH `hvm_start_info.rsdp_paddr`, multiboot2 ACPI tag, or a
     /// legacy EBDA scan). `None` on aarch64 / non-ACPI platforms.
     pub acpi_rsdp_phys: Option<PhysAddr>,
+    /// Physical region carrying the bootloader-supplied initramfs
+    /// (CPIO newc archive). On multiboot2 this is the first
+    /// `MULTIBOOT2_TAG_TYPE_MODULE` whose cmdline equals
+    /// `"initramfs"`; on PVH the equivalent `hvm_modlist_entry`;
+    /// on FDT the `chosen` node's `linux,initrd-{start,end}` pair.
+    /// `None` when the bootloader supplied no initramfs (raw
+    /// `-kernel` boot, smoke-test images).
+    ///
+    /// `narf-initramfs` consumes this region during `Stage::Early`
+    /// to populate its staging static; subsequent consumers
+    /// (`narf-firmware`'s scan, the userspace init-binary loader,
+    /// …) borrow `&'static Initramfs` from `narf_initramfs::staged()`.
+    pub initramfs: Option<MemRegion>,
 }
 
 /// Errors from `validate_boot_info`. Stage 1 raises `BadMagic` and

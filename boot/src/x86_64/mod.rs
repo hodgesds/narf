@@ -72,6 +72,15 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
     let rsdp = unsafe { multiboot2::rsdp_phys(raw.payload.raw() as usize) }
         .map(PhysAddr::new);
 
+    // Initramfs handoff: scan the multiboot2 module-list for a
+    // module whose cmdline is `"initramfs"` (case-insensitive).
+    // PVH boots reuse the same `hvm_modlist_entry` shape via the
+    // multiboot2 stub, so a single parser path covers both. The
+    // module's `start` is 4-KiB-aligned by the bootloader; we
+    // keep it as-is here and let `narf-initramfs` enforce that
+    // invariant before staging.
+    let initramfs = scan_initramfs_module(raw);
+
     Ok(BootInfo {
         memory_map: regions,
         cmdline:    CMDLINE,
@@ -79,5 +88,23 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
         uart_virt:  VirtAddr::new(UART_DEFAULT_PORT as u64),   // pre-MMU identity
         dtb_phys:   None,
         acpi_rsdp_phys: rsdp,
+        initramfs,
     })
+}
+
+/// Scan a multiboot2 info structure for the first module entry
+/// whose cmdline is `"initramfs"` (case-insensitive). Returns
+/// the module's phys range as a `MemRegion`. `None` when no
+/// matching module is present, when the bootloader didn't pass
+/// multiboot2 magic, or when the info pointer is null.
+fn scan_initramfs_module(_raw: &crate::RawBootInfo) -> Option<MemRegion> {
+    // Stage-1 cut: multiboot2 module parsing isn't wired here
+    // yet; the existing memory-map walker has a separate path
+    // and the module-tag parser is its own work item. Returns
+    // `None` for now so `narf-initramfs::register_initcalls`
+    // emits `NotPresent` and consumers see no initramfs. When
+    // the parser lands it walks `_raw.payload` looking for
+    // `MULTIBOOT2_TAG_TYPE_MODULE` (= 3) entries and returns the
+    // first whose cmdline matches.
+    None
 }

@@ -90,6 +90,11 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
         unsafe { scan_for_dtb() }
     };
 
+    // FDT-based initramfs handoff lands once the DTB walker
+    // grows a `chosen` node parser that reads
+    // `linux,initrd-{start,end}`. Stage-1 cut: emit `None`.
+    let initramfs = None;
+
     Ok(BootInfo {
         memory_map: regions,
         cmdline:    CMDLINE,
@@ -97,6 +102,7 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
         uart_virt:  VirtAddr::new(PL011_QEMU_VIRT),  // pre-MMU identity
         dtb_phys,
         acpi_rsdp_phys: None,
+        initramfs,
     })
 }
 
