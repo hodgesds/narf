@@ -132,23 +132,45 @@ const BAR_REGS: u8 = 5;
 
 /// `MM_INDEX` — register-window address latch. Write a 32-bit
 /// register-bus address here, then access `MM_DATA`.
-const MM_INDEX:    u64 = 0x0000;
+const MM_INDEX: u64 = 0x0000;
 /// `MM_DATA` — register-window data port.
-#[allow(dead_code)]
-const MM_DATA:     u64 = 0x0004;
+const MM_DATA:  u64 = 0x0004;
 
-/// SMC indirection registers — used to talk to the System
-/// Management Controller (SMU). The C2PMSG block is the host →
-/// SMU mailbox; reading C2PMSG_33 returns the SMU firmware
-/// version which doubles as a presence test.
-#[allow(dead_code)]
-const MP1_C2PMSG_33: u32 = 0x000B_0008; // Vega-style; offset family-dependent.
+/// MC (Memory Controller) framebuffer-location registers in the
+/// register-bus address space. Read through MM_INDEX/MM_DATA to
+/// learn the visible-VRAM phys range. Same offsets across Vega +
+/// Navi families per the public AMD MC IP block docs.
+const MC_VM_FB_LOCATION_BASE: u32 = 0x0000_6B0F;
+const MC_VM_FB_LOCATION_TOP:  u32 = 0x0000_6B10;
 
-/// AMDGPU-family revision register baseline. Offset within BAR5
-/// depending on family; the family-detection table lives in
-/// `chip_info_for_pci_id`.
-#[allow(dead_code)]
-const REG_RCC_DEV0_EPF0_STRAP0: u32 = 0x0001_0E80;
+// ── PSP (Platform Security Processor) MP0 mailbox protocol ────────
+//
+// Firmware-load handshake per AMD public PSP-protocol docs:
+//
+//   MP0_C2PMSG_64 = phys lo  (image base, low 32 bits)
+//   MP0_C2PMSG_67 = phys hi  (image base, high 32 bits)
+//   MP0_C2PMSG_69 = (CMD_LOAD_TA = 5) | (image_size << 8)
+//   poll MP0_C2PMSG_64 — bit31 set → done; bits[30:0] = status code.
+//   status == 0 → success.
+//
+// All three message slots are register-bus addresses computed
+// against the per-family `Family::mp0_base()` offset.
+//
+// `MP0_C2PMSG_N = mp0_base + 0x29C + N*4`. The 0x29C offset is
+// constant; only the `mp0_base` shifts per family.
+
+const MP0_C2PMSG_REL: u32 = 0x0000_029C;
+const MP0_C2PMSG_64_REL: u32 = MP0_C2PMSG_REL + 64 * 4;
+const MP0_C2PMSG_67_REL: u32 = MP0_C2PMSG_REL + 67 * 4;
+const MP0_C2PMSG_69_REL: u32 = MP0_C2PMSG_REL + 69 * 4;
+
+/// PSP `LOAD_TA` (Trusted Application) command code. Other codes
+/// (`UNLOAD_TA`, `INVOKE_CMD`) aren't load-bearing for Stage-2.
+const PSP_CMD_LOAD_TA: u32 = 0x05;
+
+/// MP0_C2PMSG_64 status fields after LOAD_TA polling completes.
+const PSP_STATUS_DONE_BIT: u32 = 1 << 31;
+const PSP_STATUS_CODE_MASK: u32 = 0x7FFF_FFFF;
 
 // ── Chip-info table ────────────────────────────────────────────────
 
@@ -166,6 +188,29 @@ pub enum Family {
     Navi2,
     /// Navi 3x — RDNA3 (RX 7000-series, Strix iGPU's GFX block).
     Navi3,
+}
+
+impl Family {
+    /// MP0 (PSP) register block base, in BAR5 register-bus
+    /// address space. Per `drivers/gpu/specification/amdgpu.md`
+    /// §5: documented for Vega + Navi1; Navi2/Navi3/Renoir
+    /// pending datasheet sourcing → `None` (firmware load fails
+    /// closed).
+    pub fn mp0_base(self) -> Option<u32> {
+        match self {
+            Family::Vega   => Some(0x000B_0000),
+            Family::Navi1  => Some(0x000B_0000),
+            // Phoenix / Strix / Renoir / Navi 2x: register block
+            // is publicly known to exist but the precise BAR5
+            // offset isn't in any FOSS-friendly reference yet.
+            // Filling these in is a follow-up; until then,
+            // load_firmware fails with FirmwareLoadFailed instead
+            // of writing garbage to the wrong register window.
+            Family::Navi2  => None,
+            Family::Navi3  => None,
+            Family::Renoir => None,
+        }
+    }
 }
 
 /// What Stage-1 knows about a probed AMD GPU.
@@ -219,13 +264,35 @@ pub enum AmdgpuError {
 
 // ── Driver state ───────────────────────────────────────────────────
 
+/// VRAM aperture parameters read from MC_VM_FB_LOCATION_BASE/TOP.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct VramInfo {
+    /// Phys base of the visible VRAM aperture.
+    pub base: u64,
+    /// Aperture size in bytes (TOP - BASE + 1, scaled by the
+    /// MC's natural granularity of 4 KiB).
+    pub size: u64,
+}
+
+/// Scanout mode the driver programs into DCN.
+#[derive(Copy, Clone, Debug)]
+pub struct Mode {
+    pub width:  u32,
+    pub height: u32,
+    pub stride: u32,
+}
+
 /// One probed AMD GPU. Pre-firmware: BAR0 + BAR5 mapped, chip
-/// identified. Post-firmware (Stage-2+): PSP/SMU loaded, GFX ring
-/// + DCN display engine running.
+/// identified, VRAM aperture sized. Post-firmware: PSP loaded,
+/// DCN bring-up + scanout registration possible.
 pub struct AmdGpu {
     pub fb_bar:    MmioRegion,
     pub regs:      MmioRegion,
     pub chip:      ChipInfo,
+    /// VRAM aperture read from the MC at probe time.
+    pub vram:      VramInfo,
+    /// Currently-programmed mode, if `set_mode` has run.
+    pub mode:      Option<Mode>,
     pub fw_loaded: bool,
 }
 
@@ -278,31 +345,57 @@ impl AmdGpu {
             return Err(AmdgpuError::DeviceGone);
         }
 
+        // Read the VRAM aperture through MM_INDEX/MM_DATA. Both
+        // base and top live in the MC IP block at register-bus
+        // offsets 0x6B0F / 0x6B10. Each value is in 24-byte-shifted
+        // units (the MC's natural granularity); the visible
+        // aperture is `[base << 24, ((top + 1) << 24))`.
+        // SAFETY: identity-mapped MMIO; MM_INDEX/MM_DATA are a
+        // sequential pair with no side effects beyond the access.
+        let vram = unsafe { read_vram_info(&regs) };
+
         Ok(Self {
-            fb_bar, regs, chip,
+            fb_bar, regs, chip, vram,
+            mode: None,
             fw_loaded: false,
         })
     }
 
     pub fn chip_info(&self) -> ChipInfo { self.chip }
+    pub fn vram_info(&self) -> VramInfo { self.vram }
     pub fn is_ready(&self) -> bool { self.fw_loaded }
+    pub fn current_mode(&self) -> Option<Mode> { self.mode }
 
-    /// Look up the chip's firmware blob through `narf-firmware` and
-    /// stage it via PSP. Stage-1 cut: opens the cap to verify the
-    /// blob is registered + records the version coupling on the
-    /// bound driver. The PSP register sequence (write image phys
-    /// to `MP0_C2PMSG_64`/`_67`, ring `MP0_C2PMSG_69`, poll
-    /// `MP0_C2PMSG_64.bit31`) lands once the per-family register
-    /// offset table is sourced.
+    /// Stage the chip's firmware blob through `narf-firmware` and
+    /// drive the PSP MP0 mailbox handshake to load it.
+    ///
+    /// Sequence per `drivers/gpu/specification/amdgpu.md` §4
+    /// step 2:
+    ///   1. open the blob from the registry
+    ///   2. write `view.phys` (lo / hi) to MP0_C2PMSG_64 / _67
+    ///   3. write `(LOAD_TA = 5) | (size << 8)` to MP0_C2PMSG_69
+    ///   4. poll MP0_C2PMSG_64 until bit 31 is set
+    ///   5. status code in bits[30:0]; 0 = success
+    ///   6. record `BoundFirmware` on the bound driver
+    ///
+    /// Families whose `Family::mp0_base()` returns `None` fail
+    /// closed with `FirmwareLoadFailed` rather than poking the
+    /// wrong register window.
     ///
     /// # Safety
-    /// Caller owns BAR0 + BAR5 exclusively.
+    /// Caller owns BAR0 + BAR5 exclusively. The blob's
+    /// `view().phys` must remain valid for the duration of the
+    /// PSP handshake (the cap stays alive until this function
+    /// returns).
     pub unsafe fn load_firmware(
         &mut self,
         fw_authority: &Cap<
             narf_firmware::FirmwareRegistry, narf_capabilities::Read,
         >,
     ) -> Result<(), AmdgpuError> {
+        let mp0_base = self.chip.family.mp0_base()
+            .ok_or(AmdgpuError::FirmwareLoadFailed)?;
+
         let cap = narf_firmware::open(self.chip.fw_name, fw_authority)
             .map_err(|e| match e {
                 narf_firmware::FirmwareError::NotFound => AmdgpuError::FirmwareMissing,
@@ -310,20 +403,48 @@ impl AmdGpu {
             })?;
         let view = narf_firmware::view_of(&cap)
             .map_err(|_| AmdgpuError::FirmwareLoadFailed)?;
-        // PSP write sequence per AMD public PSP-protocol docs:
-        //   MP0_C2PMSG_64 = phys lo
-        //   MP0_C2PMSG_67 = phys hi
-        //   MP0_C2PMSG_69 = (MSG_LOAD_TA = 0x05) | (image_size << 8)
-        //   poll MP0_C2PMSG_64 for bit31 + status code
-        //
-        // The MP0 register block lives at BAR5 + a per-family
-        // offset (0x1681AC on Vega, 0x100000 on Navi1, 0x101680 on
-        // Navi2, …). Sourcing the exact table for Phoenix /
-        // HawkPoint1 / Strix is Stage-2+. For now we accept the
-        // cap-resolved blob, record the version coupling, and
-        // declare success without programming the device.
-        let _ = view.phys;
-        let _ = view.bytes.len();
+
+        let phys = view.phys;
+        let size = view.bytes.len() as u32;
+        if size == 0 || size & 0xFF00_0000 != 0 {
+            // PSP `LOAD_TA` packs size into bits[31:8] of the
+            // command word; image > 16 MiB doesn't fit. Real
+            // images are at most a few MiB.
+            return Err(AmdgpuError::FirmwareLoadFailed);
+        }
+
+        // Step 2-3: program phys + size + command.
+        // SAFETY: BAR5 mapped, exclusive owner; mp0_base + offsets
+        // are valid register-bus addresses for this family.
+        unsafe {
+            mm_write(&self.regs, mp0_base + MP0_C2PMSG_64_REL, phys as u32);
+            mm_write(&self.regs, mp0_base + MP0_C2PMSG_67_REL, (phys >> 32) as u32);
+        }
+        compiler_fence(Ordering::SeqCst);
+        let cmd = PSP_CMD_LOAD_TA | (size << 8);
+        // SAFETY: same.
+        unsafe { mm_write(&self.regs, mp0_base + MP0_C2PMSG_69_REL, cmd); }
+
+        // Step 4-5: poll MP0_C2PMSG_64 for the done bit. PSP
+        // typically responds within ~50 ms; bound the spin so a
+        // wedged controller surfaces as FirmwareLoadFailed.
+        let mut last = 0u32;
+        for _ in 0..10_000_000u32 {
+            // SAFETY: same.
+            last = unsafe { mm_read(&self.regs, mp0_base + MP0_C2PMSG_64_REL) };
+            if last & PSP_STATUS_DONE_BIT != 0 { break; }
+            core::hint::spin_loop();
+        }
+        if last & PSP_STATUS_DONE_BIT == 0 {
+            return Err(AmdgpuError::FirmwareLoadFailed);
+        }
+        if last & PSP_STATUS_CODE_MASK != 0 {
+            // PSP rejected the image. Status codes are
+            // ASIC-specific; surface them so callers can log.
+            return Err(AmdgpuError::FirmwareLoadFailed);
+        }
+
+        // Step 6: record the version coupling.
         narf_drivers::set_bound_firmware("amdgpu", narf_drivers::BoundFirmware {
             blob_name: alloc::string::String::from(self.chip.fw_name),
             sha256:    view.sha256,
@@ -333,6 +454,89 @@ impl AmdGpu {
         self.fw_loaded = true;
         Ok(())
     }
+
+    /// Program a scanout mode through DCN.
+    ///
+    /// Stage-2 ships only the linear-scanout path: one primary
+    /// plane covering the full VRAM aperture at the requested
+    /// `Mode`. Cursor / overlay / DCC compression / multi-plane
+    /// land in Phase B (`drivers/gpu/spec.md` §1).
+    ///
+    /// Returns `FirmwareLoadFailed` until firmware is loaded;
+    /// otherwise stashes the mode in `self.mode` for the
+    /// `AmdgpuScanout: FbScanout` impl to expose. The actual
+    /// HUBP / OPP / OTG register sequence requires per-family
+    /// DCN offsets that aren't yet sourced — this stub records
+    /// the intent so the picker integration can light up the
+    /// moment the offset tables land.
+    ///
+    /// # Safety
+    /// Caller owns BAR0 + BAR5 exclusively.
+    pub unsafe fn set_mode(&mut self, mode: Mode) -> Result<(), AmdgpuError> {
+        if !self.fw_loaded { return Err(AmdgpuError::FirmwareLoadFailed); }
+        // TODO(stage-3): DCN HUBP/OPP/OTG programming.
+        //   1. Disable scanout (HUBP_BLANK = 1).
+        //   2. Program HUBP_PRIMARY_SURFACE_ADDR = self.vram.base.
+        //   3. Program HUBP_PRIMARY_SURFACE_PITCH = mode.stride.
+        //   4. Program OPP gamma passthrough.
+        //   5. Program OTG_H_TOTAL / OTG_V_TOTAL from mode timing.
+        //   6. HUBP_BLANK = 0; assert OTG_MASTER_EN.
+        self.mode = Some(mode);
+        Ok(())
+    }
+}
+
+/// Indexed register read through MM_INDEX / MM_DATA.
+///
+/// # Safety
+/// `regs` must map BAR5 of an AMD GPU; the caller must hold
+/// exclusive ownership of the register window for the duration
+/// of the read (MM_INDEX is a shared latch).
+unsafe fn mm_read(regs: &MmioRegion, addr: u32) -> u32 {
+    // SAFETY: caller-asserted ownership.
+    unsafe { regs.write32(MM_INDEX, addr); }
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: same.
+    unsafe { regs.read32(MM_DATA) }
+}
+
+/// Indexed register write.
+///
+/// # Safety
+/// Same as `mm_read`.
+unsafe fn mm_write(regs: &MmioRegion, addr: u32, value: u32) {
+    // SAFETY: caller-asserted ownership.
+    unsafe { regs.write32(MM_INDEX, addr); }
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: same.
+    unsafe { regs.write32(MM_DATA, value); }
+}
+
+/// Read the visible-VRAM aperture from the MC IP block.
+///
+/// MC_VM_FB_LOCATION_BASE / TOP are both in 16-MiB units (low 24
+/// bits of the address are implicit zero). The visible aperture
+/// is `[base, top + 16 MiB)`.
+///
+/// On Phoenix / Strix iGPUs (UMA), VRAM is carved from system
+/// DRAM and the aperture covers the whole carve-out. On discrete
+/// cards, it's the GPU's local memory.
+///
+/// # Safety
+/// Caller owns BAR5 exclusively.
+unsafe fn read_vram_info(regs: &MmioRegion) -> VramInfo {
+    // SAFETY: caller-asserted ownership; MM_INDEX/MM_DATA pair.
+    let base_field = unsafe { mm_read(regs, MC_VM_FB_LOCATION_BASE) };
+    let top_field  = unsafe { mm_read(regs, MC_VM_FB_LOCATION_TOP) };
+    // Bits[23:0] are the FB location; high bits are reserved.
+    let base = (base_field as u64 & 0x00FF_FFFF) << 24;
+    let top  = (top_field  as u64 & 0x00FF_FFFF) << 24;
+    let size = if top >= base {
+        top - base + (1u64 << 24)   // top is inclusive, last 16 MiB unit
+    } else {
+        0
+    };
+    VramInfo { base, size }
 }
 
 // ── Driver-match registration ───────────────────────────────────────

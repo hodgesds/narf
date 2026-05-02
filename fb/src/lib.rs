@@ -226,10 +226,52 @@ impl FbScanout for VirtioGpuScanout {
     }
 }
 
+// ── amdgpu backend ──────────────────────────────────────────────────
+
+#[derive(Debug)]
+struct AmdgpuScanout;
+
+impl FbScanout for AmdgpuScanout {
+    fn width(&self) -> u32 {
+        narf_drivers_gpu::amdgpu::with_controller(|d|
+            d.current_mode().map(|m| m.width).unwrap_or(0)
+        ).unwrap_or(0)
+    }
+    fn height(&self) -> u32 {
+        narf_drivers_gpu::amdgpu::with_controller(|d|
+            d.current_mode().map(|m| m.height).unwrap_or(0)
+        ).unwrap_or(0)
+    }
+    fn stride(&self) -> u32 {
+        narf_drivers_gpu::amdgpu::with_controller(|d|
+            d.current_mode().map(|m| m.stride).unwrap_or(0)
+        ).unwrap_or(0)
+    }
+    fn format(&self) -> PixelFormat { PixelFormat::XRGB8888 }
+    fn name(&self) -> &'static str { "amdgpu" }
+    fn flush(&self, _x: u32, _y: u32, _w: u32, _h: u32) {
+        // amdgpu is a direct-FB backend (CPU writes to VRAM via
+        // the BAR0 MMIO mapping; the DCN scanout DMA's from VRAM
+        // straight to the panel). No host-side flush needed —
+        // matches the bochs path.
+    }
+    unsafe fn framebuffer(&self) -> Framebuffer {
+        narf_drivers_gpu::amdgpu::with_controller(|d| {
+            let mode = d.current_mode().expect("amdgpu scanout without mode");
+            let base = d.vram_info().base as *mut u32;
+            // SAFETY: amdgpu's BAR0 is mapped + DCN configured to
+            // scan out from `base`; the caller holds the FbScanout
+            // cap that serializes writers. Stride is in pixels.
+            unsafe { Framebuffer::new(base, mode.width, mode.height, mode.stride) }
+        }).expect("amdgpu scanout selected without controller")
+    }
+}
+
 // ── active-scanout picker ───────────────────────────────────────────
 
 static BOCHS:      BochsScanout      = BochsScanout;
 static VIRTIO_GPU: VirtioGpuScanout  = VirtioGpuScanout;
+static AMDGPU:     AmdgpuScanout     = AmdgpuScanout;
 
 /// Picker. Prefers a test scanout (when installed) for hermetic
 /// smokes; otherwise bochs (no command-queue tax) when its BAR is
@@ -254,6 +296,17 @@ pub fn select_active() -> Option<&'static dyn FbScanout> {
             // lock externally, which today's single-CPU smokes do trivially.
             let ptr: *const TestScanout = s as *const TestScanout;
             return Some(unsafe { &*ptr });
+        }
+    }
+    // Native AMD GPU wins over QEMU bochs / virtio-gpu when both
+    // are present (typical: Phoenix iGPU on the bare-metal laptop
+    // running alongside a passthrough QEMU display).
+    if narf_drivers_gpu::amdgpu::is_probed() {
+        let ready = narf_drivers_gpu::amdgpu::with_controller(|d|
+            d.is_ready() && d.current_mode().is_some()
+        ).unwrap_or(false);
+        if ready {
+            return Some(&AMDGPU);
         }
     }
     if narf_graphics_driver::bochs::is_probed() {

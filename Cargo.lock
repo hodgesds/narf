@@ -642,6 +642,7 @@ name = "narf-fb"
 version = "0.0.0"
 dependencies = [
  "narf-capabilities",
+ "narf-drivers-gpu",
  "narf-drivers-virtio",
  "narf-graphics",
  "narf-graphics-driver",

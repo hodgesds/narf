@@ -9,6 +9,25 @@ extern crate alloc;
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+fn smoke_fb_picker_skips_unprobed_amdgpu() -> TestResult {
+    // The amdgpu backend joins the picker ahead of bochs +
+    // virtio-gpu; without a probed amdgpu controller the picker
+    // must fall through cleanly rather than handing back a
+    // phantom AmdgpuScanout (which would crash FbWriter on first
+    // dereference of `current_mode().expect`).
+    if narf_drivers_gpu::amdgpu::is_probed() {
+        return TestResult::Skip(
+            "amdgpu probed — covered by the live-silicon scanout smoke");
+    }
+    let chosen = crate::select_active().map(|s| s.name());
+    if chosen == Some("amdgpu") {
+        return TestResult::Fail(
+            "picker chose amdgpu without a probed controller");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("fb", smoke_fb_picker_skips_unprobed_amdgpu);
+
 fn smoke_fb_console_writes_glyphs() -> TestResult {
     use alloc::vec;
     use narf_graphics::{FbConsole, Framebuffer, Pixel32, font8x8};

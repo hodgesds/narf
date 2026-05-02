@@ -16,6 +16,7 @@ narf-lib          = { path = "../lib" }
 narf-graphics     = { path = "../graphics" }
 narf-graphics-driver = { path = "../drivers/graphics" }
 narf-drivers-virtio  = { path = "../drivers/virtio" }
+narf-drivers-gpu     = { path = "../drivers/gpu" }
 narf-capabilities = { path = "../capabilities" }
 narf-init         = { path = "../init" }
 narf-ipc          = { path = "../ipc" }

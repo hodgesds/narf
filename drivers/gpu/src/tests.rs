@@ -111,3 +111,33 @@ fn smoke_amdgpu_pci_matches_registered() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu", smoke_amdgpu_pci_matches_registered);
+
+fn smoke_amdgpu_family_table_documented_offsets() -> TestResult {
+    // Family::mp0_base() is documented for Vega + Navi1; the
+    // Stage-2 spec leaves Phoenix/Strix/Renoir/Navi2 marked TBD
+    // pending datasheet sourcing. Lock this in so accidentally
+    // shipping a placeholder offset for an undocumented family
+    // surfaces as a test failure.
+    use crate::amdgpu::Family;
+    if Family::Vega.mp0_base()  != Some(0x000B_0000) {
+        return TestResult::Fail("Vega MP0 base wrong");
+    }
+    if Family::Navi1.mp0_base() != Some(0x000B_0000) {
+        return TestResult::Fail("Navi1 MP0 base wrong");
+    }
+    if Family::Navi2.mp0_base().is_some() {
+        return TestResult::Fail("Navi2 should be TBD");
+    }
+    if Family::Navi3.mp0_base().is_some() {
+        return TestResult::Fail("Navi3 should be TBD");
+    }
+    if Family::Renoir.mp0_base().is_some() {
+        return TestResult::Fail("Renoir should be TBD");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu", smoke_amdgpu_family_table_documented_offsets);
+
+// `smoke_amdgpu_scanout_picker_idle` lives in `fb/src/tests.rs`
+// to avoid a `narf-drivers-gpu` ↔ `narf-fb` Cargo cycle (fb
+// already depends on drivers/gpu for the picker).
