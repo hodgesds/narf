@@ -109,6 +109,34 @@ pub enum KeyCode {
     F6 = 64, F7 = 65, F8 = 66, F9 = 67, F10 = 68,
     NumLock    = 69,
     ScrollLock = 70,
+    F11        = 87,
+    F12        = 88,
+    Kp7        = 71,
+    Kp8        = 72,
+    Kp9        = 73,
+    KpMinus    = 74,
+    Kp4        = 75,
+    Kp5        = 76,
+    Kp6        = 77,
+    KpPlus     = 78,
+    Kp1        = 79,
+    Kp2        = 80,
+    Kp3        = 81,
+    Kp0        = 82,
+    KpDot      = 83,
+    KpEnter    = 96,
+    KpSlash    = 98,
+    SysRq      = 99,
+    Home       = 102,
+    PageUp     = 104,
+    End        = 107,
+    PageDown   = 109,
+    Insert     = 110,
+    Delete     = 111,
+    Pause      = 119,
+    LeftMeta   = 125,
+    RightMeta  = 126,
+    Menu       = 127,
     Up         = 103,
     Down       = 108,
     Left       = 105,
@@ -128,6 +156,7 @@ impl KeyCode {
             KeyCode::LeftShift | KeyCode::RightShift |
             KeyCode::LeftCtrl  | KeyCode::RightCtrl  |
             KeyCode::LeftAlt   | KeyCode::RightAlt   |
+            KeyCode::LeftMeta  | KeyCode::RightMeta  |
             KeyCode::CapsLock  | KeyCode::NumLock    | KeyCode::ScrollLock
         )
     }
@@ -144,6 +173,7 @@ bitflags_like! {
         const CAPS_LOCK   = 1 << 3;
         const NUM_LOCK    = 1 << 4;
         const SCROLL_LOCK = 1 << 5;
+        const META        = 1 << 6;
     }
 }
 

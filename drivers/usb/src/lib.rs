@@ -19,4 +19,14 @@ pub fn register_initcalls() {
         xhci::register_pci_driver();
         InitResult::Ok
     });
+    // Stage::Device runs after Stage::Subsys, so the xHCI controller
+    // (probed by the bus walker once `register_pci_driver` runs) is
+    // up by the time this fires. If no xHCI is present, skip.
+    narf_init::register(Stage::Device, "usb-hid-keyboard", || {
+        if !xhci::is_probed() { return InitResult::NotPresent; }
+        let attached = xhci::with_controller(|c|
+            hid::enumerate_and_attach_keyboards(c)
+        ).unwrap_or(0);
+        if attached == 0 { InitResult::NotPresent } else { InitResult::Ok }
+    });
 }

@@ -33,7 +33,8 @@ asks for. Updated when observable kernel behaviour changes.
 | virtio-balloon-pci | Modern transport. Structural probe.             |
 | e1000 / e1000e   | Real Intel NIC (8254x + 8257x family). TX + RX.   |
 | AHCI (ICH9/10)   | HBA bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT. |
-| xHCI USB host    | HCRST reset + DCBAA + Command Ring + scratchpad pointers + USBCMD.RS=1. |
+| xHCI USB host    | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT. |
+| USB HID keyboard | Hot-plug enumeration → Set Protocol(Boot) → interrupt-IN polling → HID Usage 0x07 → `narf_input::KeyCode` press/release diffing, 8-modifier tracking, roll-over filter, feeding the global `InputEvent` ring. |
 
 Cross-driver integrations:
 - `block::registry` — unified `BlockDeviceSync` trait; NVMe +
