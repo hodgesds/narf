@@ -139,3 +139,36 @@ fn smoke_virtio_fs_pci_fuse_in_header_roundtrip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/virtio/fs_pci", smoke_virtio_fs_pci_fuse_in_header_roundtrip);
+
+fn smoke_virtio_fs_pci_live_fuse_init() -> TestResult {
+    use crate::fs_pci;
+    use crate::fs_pci::{FuseInHeader, FuseOpcode, FUSE_IN_HEADER_LEN};
+    if !fs_pci::is_probed() {
+        return TestResult::Skip("no virtio-fs-pci device on this run");
+    }
+    // FUSE_INIT request: 40-byte header + 16-byte init body
+    // (major u32, minor u32, max_readahead u32, flags u32) all LE.
+    const INIT_BODY: usize = 16;
+    let hdr = FuseInHeader::new(
+        FuseOpcode::Init, 1, 0, 0, 0, 0, INIT_BODY as u32);
+    let mut req = alloc::vec![0u8; FUSE_IN_HEADER_LEN + INIT_BODY];
+    req[..FUSE_IN_HEADER_LEN].copy_from_slice(&hdr.encode());
+    let body_off = FUSE_IN_HEADER_LEN;
+    req[body_off..body_off + 4].copy_from_slice(&7u32.to_le_bytes()); // major
+    req[body_off + 4..body_off + 8].copy_from_slice(&31u32.to_le_bytes()); // minor
+    req[body_off + 8..body_off + 12].copy_from_slice(&0u32.to_le_bytes()); // max_readahead
+    req[body_off + 12..body_off + 16].copy_from_slice(&0u32.to_le_bytes()); // flags
+
+    let resp = fs_pci::with_controller(|c| c.submit_request(&req, 256));
+    match resp {
+        Some(Ok(r)) => {
+            // Response = fuse_out_header (16 bytes) + fuse_init_out.
+            // Just verify we got at least a header back.
+            if r.len() < 16 { return TestResult::Fail("short FUSE_INIT response"); }
+            TestResult::Pass
+        }
+        Some(Err(_))  => TestResult::Fail("submit_request failed"),
+        None          => TestResult::Skip("controller missing"),
+    }
+}
+kernel_test_in!("drivers/virtio/fs_pci", smoke_virtio_fs_pci_live_fuse_init);
