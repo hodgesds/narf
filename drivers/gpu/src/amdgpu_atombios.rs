@@ -52,6 +52,10 @@ const ATOM_MARKER:   &[u8]   = b"ATOM";
 /// Offset of the 32-bit pointer to the master data table, per
 /// AtomBios.h `OFFSET_TO_POINTER_TO_ATOM_ROM_HEADER`.
 const OFFSET_DATA_TABLE_PTR: usize = 0x4C;
+/// Offset of the 32-bit pointer to the master command table.
+/// Symmetric to the data-table pointer; both live in the
+/// `ATOM_ROM_HEADER` block 4 bytes apart.
+const OFFSET_CMD_TABLE_PTR: usize = 0x48;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AtomError {
@@ -67,15 +71,19 @@ pub enum AtomError {
     UnknownTableId,
 }
 
-/// One ATOMBIOS image, viewed as `(slice, parsed-master-pointer)`.
+/// One ATOMBIOS image, viewed as `(slice, parsed-master-pointers)`.
 /// Borrows from the source; convert via methods below.
 #[derive(Copy, Clone)]
 pub struct Atombios<'a> {
     image: &'a [u8],
     /// Offset of the master data table within `image`.
     data_master_off: u32,
-    /// Number of 16-bit per-table entries in the master.
+    /// Number of 16-bit per-table entries in the data master.
     n_tables: u16,
+    /// Offset of the master command table within `image`.
+    cmd_master_off: u32,
+    /// Number of 16-bit per-table entries in the command master.
+    n_cmd_tables: u16,
 }
 
 impl<'a> fmt::Debug for Atombios<'a> {
@@ -113,7 +121,34 @@ impl<'a> Atombios<'a> {
             return Err(AtomError::BadTablePointer);
         }
         let n_tables = ((struct_size - 4) / 2) as u16;
-        Ok(Self { image, data_master_off: data_off, n_tables })
+
+        // Command-table master directory — symmetric layout 4
+        // bytes lower in the ATOM_ROM_HEADER. May be 0 on images
+        // that don't ship command tables (rare; modern Vega+
+        // always does).
+        let cmd_off = u32::from_le_bytes([
+            image[OFFSET_CMD_TABLE_PTR],
+            image[OFFSET_CMD_TABLE_PTR + 1],
+            image[OFFSET_CMD_TABLE_PTR + 2],
+            image[OFFSET_CMD_TABLE_PTR + 3],
+        ]);
+        let (n_cmd_tables, cmd_off_final) = if cmd_off == 0 {
+            (0u16, 0u32)
+        } else {
+            let coff = cmd_off as usize;
+            if coff + 6 > image.len() { return Err(AtomError::BadTablePointer); }
+            let csz = u16::from_le_bytes([image[coff], image[coff + 1]]) as usize;
+            if csz < 4 || coff + csz > image.len() {
+                return Err(AtomError::BadTablePointer);
+            }
+            (((csz - 4) / 2) as u16, cmd_off)
+        };
+
+        Ok(Self {
+            image,
+            data_master_off: data_off, n_tables,
+            cmd_master_off: cmd_off_final, n_cmd_tables,
+        })
     }
 
     /// Number of indexable data tables.
@@ -144,6 +179,42 @@ impl<'a> Atombios<'a> {
     /// `usStructureSize` (first 2 bytes of the table).
     pub fn data_table<'b>(&'b self, table_id: u16) -> Result<&'a [u8], AtomError> {
         let off = self.data_table_offset(table_id)? as usize;
+        if off + 2 > self.image.len() { return Err(AtomError::BadTablePointer); }
+        let len = u16::from_le_bytes([self.image[off], self.image[off + 1]]) as usize;
+        if off + len > self.image.len() { return Err(AtomError::BadTablePointer); }
+        Ok(&self.image[off..off + len])
+    }
+
+    // ── Command-table directory ─────────────────────────────────────
+
+    /// Number of indexable command tables. `0` when the BIOS
+    /// image doesn't ship a command-table master directory.
+    pub fn cmd_table_count(&self) -> u16 { self.n_cmd_tables }
+
+    /// Offset of `table_id`'s command-table payload within the
+    /// BIOS image. Symmetric to `data_table_offset`.
+    pub fn cmd_table_offset(&self, table_id: u16) -> Result<u32, AtomError> {
+        if self.n_cmd_tables == 0 { return Err(AtomError::UnknownTableId); }
+        if table_id >= self.n_cmd_tables { return Err(AtomError::UnknownTableId); }
+        let off = self.cmd_master_off as usize
+            + 4
+            + (table_id as usize) * 2;
+        let p = u16::from_le_bytes([self.image[off], self.image[off + 1]]) as u32;
+        if p == 0 || p as usize >= self.image.len() {
+            return Err(AtomError::BadTablePointer);
+        }
+        Ok(p)
+    }
+
+    /// Borrow the bytes of `table_id`'s command-table payload.
+    /// Each command table starts with an `ATOM_COMMON_TABLE_HEADER`
+    /// (4 bytes) followed by the AtomBIOS bytecode for that
+    /// command. Stage-8 doesn't include the bytecode interpreter
+    /// — drivers reach into the offset themselves and either
+    /// dispatch to a hand-written replacement or run the
+    /// bytecode in a future Stage-9+ interpreter.
+    pub fn cmd_table<'b>(&'b self, table_id: u16) -> Result<&'a [u8], AtomError> {
+        let off = self.cmd_table_offset(table_id)? as usize;
         if off + 2 > self.image.len() { return Err(AtomError::BadTablePointer); }
         let len = u16::from_le_bytes([self.image[off], self.image[off + 1]]) as usize;
         if off + len > self.image.len() { return Err(AtomError::BadTablePointer); }

@@ -888,3 +888,212 @@ fn smoke_amdgpu_displayobj_object_chain_walker() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu", smoke_amdgpu_displayobj_object_chain_walker);
+
+fn smoke_amdgpu_pptable_fan_table_round_trip() -> TestResult {
+    use crate::amdgpu_pptable_subtables::{FanTable, PpSubtableError};
+    let mut t = alloc::vec::Vec::new();
+    t.resize(0x40, 0u8);
+    // Header: usSize=0x40, fmt=11, content=0
+    t[0..2].copy_from_slice(&0x40u16.to_le_bytes());
+    t[2] = 11;
+    t[3] = 0;
+    // Body.
+    t[4]  = 9;     // rev_id
+    t[5]  = 30;    // thyst
+    t[6..8].copy_from_slice(&3_000u16.to_le_bytes());   // t_min = 30.00 C
+    t[8..10].copy_from_slice(&6_000u16.to_le_bytes());  // t_med = 60.00 C
+    t[10..12].copy_from_slice(&8_000u16.to_le_bytes()); // t_high = 80.00 C
+    t[12..14].copy_from_slice(&50u16.to_le_bytes());     // pwm_min
+    t[14..16].copy_from_slice(&128u16.to_le_bytes());    // pwm_med
+    t[16..18].copy_from_slice(&200u16.to_le_bytes());    // pwm_high
+    t[18..20].copy_from_slice(&9_500u16.to_le_bytes()); // t_max = 95.00 C
+    t[20] = 1;     // fan_control_mode
+    t[21..23].copy_from_slice(&255u16.to_le_bytes());    // fan_pwm_max
+    t[31] = 80;    // target_temperature (whole C)
+    t[51] = 1;     // enable_zero_rpm
+    t[52] = 50;    // fan_stop_temperature (whole C)
+    t[53] = 60;    // fan_start_temperature (whole C)
+
+    let fan = match FanTable::parse(&t) {
+        Ok(f)  => f,
+        Err(_) => return TestResult::Fail("FanTable parse rejected"),
+    };
+    if fan.rev_id != 9 {
+        return TestResult::Fail("rev_id");
+    }
+    if fan.t_min != 3_000 || fan.t_max != 9_500 {
+        return TestResult::Fail("temperature range");
+    }
+    if fan.pwm_min != 50 || fan.fan_pwm_max != 255 {
+        return TestResult::Fail("pwm values");
+    }
+    if fan.target_temperature != 80 || fan.fan_stop_temperature != 50 {
+        return TestResult::Fail("target/stop temps");
+    }
+    if fan.enable_zero_rpm != 1 {
+        return TestResult::Fail("zero_rpm");
+    }
+    // rev_id 11 rejected.
+    let mut bad = t.clone();
+    bad[4] = 11;
+    if !matches!(FanTable::parse(&bad), Err(PpSubtableError::UnsupportedRevision(11))) {
+        return TestResult::Fail("rev 11 should reject");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu", smoke_amdgpu_pptable_fan_table_round_trip);
+
+fn smoke_amdgpu_pptable_powertune_table_round_trip() -> TestResult {
+    use crate::amdgpu_pptable_subtables::{PowerTuneTable, PpSubtableError};
+    let mut t = alloc::vec::Vec::new();
+    t.resize(0x40, 0u8);
+    t[0..2].copy_from_slice(&0x40u16.to_le_bytes());
+    t[2] = 11;
+    t[3] = 0;
+    t[4] = 1; // rev_id
+    // TDP = 80 W = 640 (Q5.3).
+    t[5..7].copy_from_slice(&640u16.to_le_bytes());
+    t[7..9].copy_from_slice(&720u16.to_le_bytes());   // configurable_tdp = 90 W
+    t[9..11].copy_from_slice(&20_480u16.to_le_bytes()); // tdc = 80 A in Q8.8
+    t[21..23].copy_from_slice(&10_000u16.to_le_bytes()); // tj_max = 100.00 C
+    t[27..29].copy_from_slice(&10_500u16.to_le_bytes()); // shutdown = 105.00 C
+
+    let pt = match PowerTuneTable::parse(&t) {
+        Ok(p)  => p,
+        Err(_) => return TestResult::Fail("PowerTuneTable parse rejected"),
+    };
+    if pt.tdp_watts() != 80 {
+        return TestResult::Fail("TDP watts conversion");
+    }
+    if pt.tj_max_celsius() != 100 {
+        return TestResult::Fail("TjMax celsius conversion");
+    }
+    if pt.software_shutdown_temp != 10_500 {
+        return TestResult::Fail("shutdown temp round-trip");
+    }
+    // rev_id 6 rejected (>5).
+    let mut bad = t.clone();
+    bad[4] = 6;
+    if !matches!(PowerTuneTable::parse(&bad), Err(PpSubtableError::UnsupportedRevision(6))) {
+        return TestResult::Fail("rev 6 should reject");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu", smoke_amdgpu_pptable_powertune_table_round_trip);
+
+fn smoke_amdgpu_atombios_command_table_directory() -> TestResult {
+    // Symmetric to the data-table directory smoke from Stage 3
+    // — but exercise the command-table path. Build an ATOMBIOS
+    // image with both directories and verify each indexes its
+    // own subtable list.
+    use crate::amdgpu_atombios::{Atombios, AtomError};
+    let mut img = alloc::vec::Vec::new();
+    img.resize(0x300, 0u8);
+    img[0] = 0xAA; img[1] = 0x55;
+    img[4..8].copy_from_slice(b"ATOM");
+    // Data master @ 0x100, command master @ 0x200.
+    img[0x4C..0x50].copy_from_slice(&0x100u32.to_le_bytes());
+    img[0x48..0x4C].copy_from_slice(&0x200u32.to_le_bytes());
+    // Data master: 1 entry → 0x150.
+    img[0x100..0x102].copy_from_slice(&6u16.to_le_bytes());
+    img[0x104..0x106].copy_from_slice(&0x150u16.to_le_bytes());
+    img[0x150..0x152].copy_from_slice(&8u16.to_le_bytes());
+    // Command master: 2 entries → 0x250 (cmd 0), 0x260 (cmd 1).
+    img[0x200..0x202].copy_from_slice(&8u16.to_le_bytes());
+    img[0x204..0x206].copy_from_slice(&0x250u16.to_le_bytes());
+    img[0x206..0x208].copy_from_slice(&0x260u16.to_le_bytes());
+    img[0x250..0x252].copy_from_slice(&16u16.to_le_bytes());
+    img[0x260..0x262].copy_from_slice(&20u16.to_le_bytes());
+
+    let atom = match Atombios::parse(&img) {
+        Ok(a)  => a,
+        Err(_) => return TestResult::Fail("ATOMBIOS parse"),
+    };
+    if atom.data_table_count() != 1 {
+        return TestResult::Fail("data table count");
+    }
+    if atom.cmd_table_count() != 2 {
+        return TestResult::Fail("cmd table count");
+    }
+    if atom.cmd_table_offset(0) != Ok(0x250) {
+        return TestResult::Fail("cmd table 0 offset");
+    }
+    if atom.cmd_table_offset(1) != Ok(0x260) {
+        return TestResult::Fail("cmd table 1 offset");
+    }
+    if !matches!(atom.cmd_table_offset(2), Err(AtomError::UnknownTableId)) {
+        return TestResult::Fail("out-of-range cmd id should fail");
+    }
+    let cmd = match atom.cmd_table(0) {
+        Ok(s)  => s,
+        Err(_) => return TestResult::Fail("cmd_table borrow"),
+    };
+    if cmd.len() != 16 {
+        return TestResult::Fail("cmd table length");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu", smoke_amdgpu_atombios_command_table_directory);
+
+fn smoke_amdgpu_rlc_header_and_autoload_round_trip() -> TestResult {
+    use crate::amdgpu_rlc::{parse, autoload_iter, looks_like_rlc};
+    use crate::amdgpu_ucode::UCODE_MAGIC;
+    // Build a 1024-byte synthetic RLC blob:
+    //   - 4-byte magic + common ucode header (version etc.)
+    //   - RLC extension at offset 0x24
+    //   - autoload offset table at 0x100, 3 × 12 byte entries
+    //   - payload at 0x200 (24-byte filler — autoload entries
+    //     point into it)
+    let mut blob = alloc::vec::Vec::new();
+    blob.resize(1024, 0u8);
+    blob[0..4].copy_from_slice(&UCODE_MAGIC.to_le_bytes());
+    blob[4..8].copy_from_slice(&256u32.to_le_bytes());   // start_offset
+    blob[8..12].copy_from_slice(&512u32.to_le_bytes());  // payload_size
+    blob[12..16].copy_from_slice(&1u32.to_le_bytes());   // version
+    // RLC extension fields.
+    blob[0x58..0x5C].copy_from_slice(&0x100u32.to_le_bytes()); // autoload offset
+    blob[0x5C..0x60].copy_from_slice(&36u32.to_le_bytes());    // autoload size
+    // Autoload entries: 3 × 12 bytes.
+    let entries = [
+        (0x10u32, 0x200u32, 8u32),
+        (0x11u32, 0x208u32, 8u32),
+        (0x12u32, 0x210u32, 8u32),
+    ];
+    for (i, (id, off, sz)) in entries.iter().enumerate() {
+        let base = 0x100 + i * 12;
+        blob[base..base + 4].copy_from_slice(&id.to_le_bytes());
+        blob[base + 4..base + 8].copy_from_slice(&off.to_le_bytes());
+        blob[base + 8..base + 12].copy_from_slice(&sz.to_le_bytes());
+    }
+    let header = match parse(&blob) {
+        Ok(h)  => h,
+        Err(_) => return TestResult::Fail("RLC parse"),
+    };
+    if header.autoload_offset_table_offset != 0x100
+       || header.autoload_offset_table_size != 36
+    {
+        return TestResult::Fail("autoload table fields");
+    }
+    let walked: alloc::vec::Vec<_> = match autoload_iter(&blob, &header) {
+        Ok(it)  => it.collect(),
+        Err(_)  => return TestResult::Fail("autoload_iter"),
+    };
+    if walked.len() != 3 {
+        return TestResult::Fail("autoload entry count");
+    }
+    if walked[0].firmware_id != 0x10 || walked[0].offset != 0x200 || walked[0].size != 8 {
+        return TestResult::Fail("autoload entry 0");
+    }
+    if walked[2].firmware_id != 0x12 {
+        return TestResult::Fail("autoload entry 2 id");
+    }
+    if !looks_like_rlc(&blob) {
+        return TestResult::Fail("looks_like_rlc rejected synthetic blob");
+    }
+    let bogus = [0u8; 1024];
+    if looks_like_rlc(&bogus) {
+        return TestResult::Fail("looks_like_rlc accepted zeroed blob");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu", smoke_amdgpu_rlc_header_and_autoload_round_trip);

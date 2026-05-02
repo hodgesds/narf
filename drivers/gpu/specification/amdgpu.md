@@ -1,6 +1,32 @@
 # drivers/gpu/amdgpu — Specification
 
-> Status: **v0.7** (Stage 7 — runtime offset registry + DCN init walker + object chains).
+> Status: **v0.8** (Stage 8 — PPTable subtables + ATOMBIOS command directory + RLC autoload).
+>
+> ### v0.8 changes vs v0.7
+>
+> - **PPTable per-subtable decoders** (`amdgpu_pptable_subtables`):
+>   `FanTable` (rev 9–10) — PWM ranges, hysteresis, target / stop /
+>   start temperatures, fan-control mode, zero-RPM flag.
+>   `PowerTuneTable` (rev 1–5) — TDP, TDC, battery / max-power
+>   limits, TjMax, EDC, software-shutdown temperature, clock
+>   stretch. Temperature fields use centi-celsius encoding
+>   (0.01 °C) for u16 slots; `tdp_watts` / `tj_max_celsius`
+>   accessors return whole-unit values.
+> - **ATOMBIOS command-table directory** (`amdgpu_atombios`
+>   extension): symmetric to the data-table directory.
+>   `cmd_table_count`, `cmd_table_offset(id)`, `cmd_table(id)`.
+>   The bytecode-interpreter for AtomBIOS command tables is
+>   deferred to Stage-9+; consumers that need a specific command
+>   can reach into the offset and dispatch to a hand-written
+>   replacement.
+> - **RLC autoload header parser** (`amdgpu_rlc`): decodes the
+>   RLC firmware-blob's per-section subheader past the common
+>   ucode header — saved-restored list offsets/sizes, indirect
+>   register list, FW jump-table cache, autoload offset table.
+>   `autoload_iter(blob, &header)` yields the per-firmware
+>   `(firmware_id, offset, size)` tuples the RLC autoload
+>   sequencer fetches at GFX bring-up. `looks_like_rlc(blob)`
+>   sanity-check for early dispatch.
 >
 > ### v0.7 changes vs v0.6
 >
