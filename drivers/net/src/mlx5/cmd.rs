@@ -88,6 +88,18 @@ pub enum CmdOp {
     /// mailbox carries the 256-byte eqc + an 8-byte phys-addr list
     /// for the backing pages.
     CreateEq    = 0x301,
+    /// `CREATE_CQ` — allocate a Completion Queue. Opcode `0x400`.
+    /// Input mailbox carries the 256-byte cqc + an 8-byte phys-addr
+    /// list for the CQE buffer pages.
+    CreateCq    = 0x400,
+    /// `ALLOC_PD` — allocate a Protection Domain. Opcode `0x800`.
+    /// No input data; FW returns the assigned `pd` in
+    /// `output_modifier` low 24 bits.
+    AllocPd     = 0x800,
+    /// `ALLOC_UAR` — allocate a User Access Region page. Opcode
+    /// `0x802`. No input data; FW returns the assigned `uar` page
+    /// index in `output_modifier` low 24 bits.
+    AllocUar    = 0x802,
 }
 
 /// Status codes the firmware writes into byte 0x20 of the CQE.

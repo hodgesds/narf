@@ -1,6 +1,6 @@
 # mlx5 — Specification
 
-> Status: **v0.7** (Stage 7: live CREATE_EQ + UAR doorbell).
+> Status: **v0.8** (Stage 8: ALLOC_UAR + ALLOC_PD + CREATE_CQ).
 >
 > Clean-room driver for Mellanox / NVIDIA ConnectX-4 / 5 / 6 / 7
 > family Ethernet + InfiniBand HCAs. Reference material: the
@@ -136,6 +136,27 @@ have a server target with a ConnectX HCA in CI.
 
 - **v0.1** (Stage 1): PCI match + init-segment decoder +
   initializing-bit poll + smokes co-located in driver dir.
+- **v0.8** (Stage 8): three new opcodes — `AllocUar` (0x802),
+  `AllocPd` (0x800), `CreateCq` (0x400). `Mlx5Hca::alloc_uar()`
+  + `alloc_pd()` issue inline-output commands and stash the
+  FW-assigned 24-bit IDs on the driver's `uars` / `pds`
+  registries (every alloc stays owned until a future free path
+  is added). `mlx5/cq.rs` lays out the 256-byte CQ context
+  (cqc) + `build_create_cq_input(params, &pages)` —
+  bit-packed `log_cq_size` (5 bits at byte 0x07 low) +
+  `uar_page` (24 bits across 0x08..0x0A), byte-aligned
+  `log_page_size` (0x0C) + `c_eqn` (0x0F — the bound EQ for
+  async events), followed by an N-entry 8-byte BE phys-addr
+  list. `Mlx5Hca::create_cq(params, page_count)` allocates
+  the CQE-buffer pages, posts CREATE_CQ via the Stage-7
+  input-mailbox transport, masks 24 bits of `output_modifier`
+  as `cq_number`, and pushes a `LiveCq` onto the registry.
+  `Mlx5Error::CqBuild` surfaces validation errors.
+  Introspection: `cq_count()` / `uar_count()` / `pd_count()`.
+  Four new smokes: opcode discriminants pinned, CREATE_CQ
+  layout (length, log_page_size + c_eqn placements, BE
+  phys-addr list, full param round-trip), validation rejection
+  paths, `c_eqn` binding lands at byte 0x0F.
 - **v0.7** (Stage 7): `Mlx5Hca::issue_command_with_input_mailbox`
   — input rides through the chained-mailbox transport, output
   fits in the CQE's 8-byte inline window (eq_number / cq_number

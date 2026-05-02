@@ -42,6 +42,7 @@ mod tests;
 pub mod bit_field;
 pub mod caps;
 pub mod cmd;
+pub mod cq;
 pub mod eq;
 pub mod mailbox;
 
@@ -205,6 +206,8 @@ pub enum Mlx5Error {
     CmdFailed(CmdError),
     /// Stage 7: caller-supplied EQ parameters were invalid.
     EqBuild(eq::EqError),
+    /// Stage 8: caller-supplied CQ parameters were invalid.
+    CqBuild(cq::CqError),
 }
 
 /// Stage 7: live-EQ bookkeeping. Holds the FW-assigned `eq_number`
@@ -214,6 +217,23 @@ pub struct LiveEq {
     pub eq_number: u32,
     _pages:        Vec<DmaBuffer>,
     pub params:    eq::EqParams,
+}
+
+/// Stage 8: live-CQ bookkeeping. Same shape as `LiveEq` but tracks
+/// the bound EQ via params.c_eqn.
+pub struct LiveCq {
+    pub cq_number: u32,
+    _pages:        Vec<DmaBuffer>,
+    pub params:    cq::CqParams,
+}
+
+impl fmt::Debug for LiveCq {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LiveCq")
+            .field("cq_number", &self.cq_number)
+            .field("params",    &self.params)
+            .finish_non_exhaustive()
+    }
 }
 
 impl fmt::Debug for LiveEq {
@@ -242,6 +262,12 @@ pub struct Mlx5Hca {
     nop_selftest: Option<Result<(), Mlx5Error>>,
     /// Stage 7: registry of live EQs (eq_number + backing DMA).
     eqs: IrqSafeSpinLock<Vec<LiveEq>>,
+    /// Stage 8: registry of live CQs.
+    cqs: IrqSafeSpinLock<Vec<LiveCq>>,
+    /// Stage 8: FW-assigned UAR page indices owned by this driver.
+    uars: IrqSafeSpinLock<Vec<u32>>,
+    /// Stage 8: FW-assigned PD numbers owned by this driver.
+    pds: IrqSafeSpinLock<Vec<u32>>,
     /// Stage 7: BAR0 byte-offset where UAR pages start. PRM-documented
     /// for ConnectX-4..6 at 0x100000 (1 MiB into BAR0). Driver-level
     /// override is kept on the struct so a future stage can refine
@@ -326,6 +352,9 @@ impl Mlx5Hca {
             next_token: IrqSafeSpinLock::new(1),
             nop_selftest: None,
             eqs: IrqSafeSpinLock::new(Vec::new()),
+            cqs: IrqSafeSpinLock::new(Vec::new()),
+            uars: IrqSafeSpinLock::new(Vec::new()),
+            pds: IrqSafeSpinLock::new(Vec::new()),
             uar_base: UAR_BASE_DEFAULT,
         })
     }
@@ -697,6 +726,65 @@ impl Mlx5Hca {
 
     /// Number of currently-allocated EQs.
     pub fn eq_count(&self) -> usize { self.eqs.lock().len() }
+
+    /// Stage 8: live `ALLOC_UAR`. No input data; FW returns the
+    /// assigned UAR-page index in `output_modifier` low 24 bits.
+    /// Tracked on the driver registry — every alloc'd UAR stays
+    /// owned by the driver until a (future) free is added.
+    pub fn alloc_uar(&self) -> Result<u32, Mlx5Error> {
+        let resp = self.issue_command_inline(CmdOp::AllocUar, 0, &[])?;
+        let uar = resp.output_modifier & 0x00FF_FFFF;
+        self.uars.lock().push(uar);
+        Ok(uar)
+    }
+
+    /// Stage 8: live `ALLOC_PD`. No input data; FW returns the
+    /// assigned PD number in `output_modifier` low 24 bits.
+    pub fn alloc_pd(&self) -> Result<u32, Mlx5Error> {
+        let resp = self.issue_command_inline(CmdOp::AllocPd, 0, &[])?;
+        let pd = resp.output_modifier & 0x00FF_FFFF;
+        self.pds.lock().push(pd);
+        Ok(pd)
+    }
+
+    /// Stage 8: live `CREATE_CQ`. Allocates `page_count` 4-KiB
+    /// DMA-coherent pages for the CQ buffer, builds the CREATE_CQ
+    /// payload via `cq::build_create_cq_input`, posts via the
+    /// input-mailbox transport, and returns the FW-assigned
+    /// `cq_number` (low 24 bits of `output_modifier`). The CQ is
+    /// bound to `params.c_eqn` for async events.
+    pub fn create_cq(
+        &self,
+        params:     cq::CqParams,
+        page_count: usize,
+    ) -> Result<u32, Mlx5Error> {
+        let mut pages: Vec<DmaBuffer> = Vec::with_capacity(page_count);
+        for _ in 0..page_count {
+            pages.push(
+                alloc_coherent(4096, DomainId::DRIVER_0)
+                    .map_err(|_| Mlx5Error::CmdqAlloc)?);
+        }
+        let phys: Vec<u64> = pages.iter()
+            .map(|p| p.phys_addr().raw()).collect();
+        let payload = cq::build_create_cq_input(params, &phys)
+            .map_err(Mlx5Error::CqBuild)?;
+        let resp = self.issue_command_with_input_mailbox(
+            CmdOp::CreateCq, 0, &payload)?;
+        let cq_number = resp.output_modifier & 0x00FF_FFFF;
+        self.cqs.lock().push(LiveCq {
+            cq_number,
+            _pages: pages,
+            params,
+        });
+        Ok(cq_number)
+    }
+
+    /// Number of currently-allocated CQs.
+    pub fn cq_count(&self)  -> usize { self.cqs.lock().len() }
+    /// Number of currently-allocated UARs.
+    pub fn uar_count(&self) -> usize { self.uars.lock().len() }
+    /// Number of currently-allocated PDs.
+    pub fn pd_count(&self)  -> usize { self.pds.lock().len() }
 
     /// Stage 5: typed wrapper around QUERY_HCA_CAP(GeneralDevice).
     /// Returns the decoded view; callers needing fields beyond the

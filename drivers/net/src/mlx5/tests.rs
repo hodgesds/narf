@@ -900,3 +900,102 @@ fn smoke_mlx5_uar_doorbell_offset_calc() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/mlx5", smoke_mlx5_uar_doorbell_offset_calc);
+
+// ── Stage 8: ALLOC_UAR + ALLOC_PD + CREATE_CQ ──────────────────────
+
+use super::cq::{
+    build_create_cq_input, decode_create_cq_input, CqError, CqParams,
+    CQC_LEN, CQC_OFF_C_EQN, CQC_OFF_LOG_PAGE_SIZE,
+    CQC_PA_ENTRY_LEN, CQC_PA_LIST_OFF,
+};
+
+fn smoke_mlx5_alloc_uar_pd_opcodes() -> TestResult {
+    if super::cmd::CmdOp::AllocUar as u16 != 0x802 {
+        return TestResult::Fail("ALLOC_UAR opcode discriminant drifted");
+    }
+    if super::cmd::CmdOp::AllocPd as u16 != 0x800 {
+        return TestResult::Fail("ALLOC_PD opcode discriminant drifted");
+    }
+    if super::cmd::CmdOp::CreateCq as u16 != 0x400 {
+        return TestResult::Fail("CREATE_CQ opcode discriminant drifted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_alloc_uar_pd_opcodes);
+
+fn smoke_mlx5_cq_input_layout() -> TestResult {
+    let pages = [0x1_0000_0000u64, 0x1_0000_1000u64];
+    let params = CqParams {
+        log_cq_size:    9,
+        uar_page:       0x123456,
+        log_page_size:  12,
+        c_eqn:          3,
+    };
+    let bytes = match build_create_cq_input(params, &pages) {
+        Ok(b)  => b,
+        Err(_) => return TestResult::Fail("build_create_cq_input rejected valid params"),
+    };
+    if bytes.len() != CQC_PA_LIST_OFF + 2 * CQC_PA_ENTRY_LEN {
+        return TestResult::Fail("CREATE_CQ payload length wrong");
+    }
+    if bytes[CQC_OFF_LOG_PAGE_SIZE] != 12 {
+        return TestResult::Fail("log_page_size byte missing at 0x0C");
+    }
+    if bytes[CQC_OFF_C_EQN] != 3 {
+        return TestResult::Fail("c_eqn byte missing at 0x0F");
+    }
+    for (i, &expect) in pages.iter().enumerate() {
+        let off = CQC_PA_LIST_OFF + i * CQC_PA_ENTRY_LEN;
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&bytes[off..off + 8]);
+        if u64::from_be_bytes(buf) != expect {
+            return TestResult::Fail("CQ phys-addr list entry not BE-encoded");
+        }
+    }
+    let back = decode_create_cq_input(&bytes);
+    if back.log_cq_size  != params.log_cq_size
+       || back.uar_page     != params.uar_page
+       || back.log_page_size != params.log_page_size
+       || back.c_eqn        != params.c_eqn {
+        return TestResult::Fail("CREATE_CQ params didn't round-trip");
+    }
+    let _ = CQC_LEN;
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_cq_input_layout);
+
+fn smoke_mlx5_cq_input_validation() -> TestResult {
+    let pages = [0x1_0000_0000u64];
+    let bad_size = CqParams { log_cq_size: 32, uar_page: 0,
+                              log_page_size: 12, c_eqn: 0 };
+    if !matches!(build_create_cq_input(bad_size, &pages), Err(CqError::BadLogCqSize)) {
+        return TestResult::Fail("oversize log_cq_size accepted");
+    }
+    let bad_uar = CqParams { log_cq_size: 9, uar_page: 0x100_0000,
+                             log_page_size: 12, c_eqn: 0 };
+    if !matches!(build_create_cq_input(bad_uar, &pages), Err(CqError::BadUarPage)) {
+        return TestResult::Fail("oversize uar_page accepted");
+    }
+    let ok = CqParams { log_cq_size: 9, uar_page: 0,
+                        log_page_size: 12, c_eqn: 0 };
+    if !matches!(build_create_cq_input(ok, &[]), Err(CqError::NoPages)) {
+        return TestResult::Fail("empty page list accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_cq_input_validation);
+
+fn smoke_mlx5_cq_binds_to_eq() -> TestResult {
+    // The c_eqn field at byte 0x0F is what binds the CQ to a
+    // specific EQ for async events. Synthesise a CQ with c_eqn=42
+    // and confirm the byte landed where Stage-8 writes it.
+    let pages = [0xF000_0000_0000_0000u64];
+    let params = CqParams { log_cq_size: 7, uar_page: 0,
+                            log_page_size: 12, c_eqn: 42 };
+    let bytes = build_create_cq_input(params, &pages).unwrap();
+    if bytes[CQC_OFF_C_EQN] != 42 {
+        return TestResult::Fail("c_eqn binding not at byte 0x0F");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_cq_binds_to_eq);
