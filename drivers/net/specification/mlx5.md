@@ -1,6 +1,6 @@
 # mlx5 — Specification
 
-> Status: **v0.10** (Stage 10: WQE / CQE wire format + SQ doorbell).
+> Status: **v0.11** (Stage 11: post_send / post_recv / poll_cq).
 >
 > Clean-room driver for Mellanox / NVIDIA ConnectX-4 / 5 / 6 / 7
 > family Ethernet + InfiniBand HCAs. Reference material: the
@@ -136,6 +136,40 @@ have a server target with a ConnectX HCA in CI.
 
 - **v0.1** (Stage 1): PCI match + init-segment decoder +
   initializing-bit poll + smokes co-located in driver dir.
+- **v0.11** (Stage 11): high-level `post_send` / `post_recv` /
+  `poll_cq`. `mlx5/ring.rs` factors the SQ/RQ/CQ ring layout
+  into pure-data helpers: `WQE_STRIDE` = 64 (16-byte ctrl + up
+  to 3 16-byte data segments — `MAX_DATA_SEGS_PER_WQE` = 3),
+  `CQE_STRIDE` = 64, `sq_offset_of` / `rq_offset_of` /
+  `cq_offset_of` index calculators, `sq_size_bytes` /
+  `rq_size_bytes` for QP-buffer region sizing (SQ first, RQ
+  follows). `IoVec { va, l_key, len }` scatter/gather descriptor.
+  `build_send_wqe(qp, idx, opcode, cqe_req, &iovecs)` produces
+  a complete 64-byte send WQE with control segment + data
+  segments; `build_recv_wqe(&iovecs)` produces the 64-byte recv
+  WQE (segment-count u16 BE at offset 0 + data segments).
+  `pop_completion(cq_bytes, capacity, consumer)` walks the CQ
+  ring at the consumer cursor and returns the first SW-owned
+  CQE + advanced consumer. `QpParams::uar_page` records the
+  UAR bound to the QP for SQ doorbells.
+  Live transport on `Mlx5Hca`: `post_send(qp_num, opcode,
+  cqe_req, &iovecs)` builds the WQE, copies it into the SQ
+  slot at `sq_tail`, advances the tail, and rings the SQ
+  doorbell via the QP's `uar_page`. `post_recv(qp_num,
+  &iovecs)` does the same against the RQ region. `poll_cq(
+  cq_num)` reads the CQE at the CQ's consumer cursor, returns
+  `None` if HW still owns it, otherwise decodes + advances the
+  cursor. New errors: `RingBuild(RingError)`, `UnknownQp`,
+  `UnknownCq`. `LiveQp` gains `sq_tail` / `rq_tail`; `LiveCq`
+  gains `consumer`.
+  Five new smokes: ring-offset arithmetic + wraparound, send-WQE
+  layout for a 2-iovec list (ds = 1 + 2, qp_num + wqe_idx in
+  control, both data segments round-trip), recv-WQE layout
+  (segment-count BE at 0x00 + data seg at 0x10), validation
+  rejection paths (NoSegments / TooManySegments for both
+  send + recv), pop_completion walks a synthetic 8-CQE ring
+  (slot 0 SW-owned → returned + cursor advances; slot 1
+  HW-owned → None).
 - **v0.10** (Stage 10): WQE / CQE wire format work + SQ
   doorbell. `mlx5/wqe.rs` lays out the 16-byte send-WQE control
   segment (`build_ctrl_segment(opcode, qp_num, wqe_idx, ds,

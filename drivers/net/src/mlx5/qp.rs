@@ -129,6 +129,10 @@ pub struct QpParams {
     /// log2 of the RQ depth.
     pub log_rq_size:    u8,
     pub log_page_size:  u8,
+    /// UAR page bound to this QP for SQ/RQ doorbells. Stage 11
+    /// uses this directly when posting work; the qpc encoding for
+    /// uar_page lands in a later stage.
+    pub uar_page:       u32,
 }
 
 /// Build the CREATE_QP input mailbox payload — 512-byte qpc + an
@@ -217,5 +221,6 @@ pub fn decode_create_qp_input(bytes: &[u8]) -> QpParams {
         log_rq_size:    read_bits_be(bytes, QPC_BIT_LOG_RQ_SIZE,
                                      QPC_BIT_LOG_RQ_SIZE_W) as u8,
         log_page_size:  bytes[QPC_OFF_LOG_PAGE_SIZE],
+        uar_page:       0,
     }
 }

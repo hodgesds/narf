@@ -47,6 +47,7 @@ pub mod eq;
 pub mod cqe;
 pub mod mailbox;
 pub mod qp;
+pub mod ring;
 pub mod wqe;
 
 // ── PCI device IDs (ConnectX-4 .. ConnectX-6 Dx) ───────────────────
@@ -213,6 +214,13 @@ pub enum Mlx5Error {
     CqBuild(cq::CqError),
     /// Stage 9: caller-supplied QP parameters were invalid.
     QpBuild(qp::QpError),
+    /// Stage 11: caller-supplied IoVec list was malformed.
+    RingBuild(ring::RingError),
+    /// Stage 11: post_send/post_recv referenced a qp_number that
+    /// isn't in the driver's QP registry.
+    UnknownQp,
+    /// Stage 11: poll_cq referenced a cq_number not in the registry.
+    UnknownCq,
 }
 
 /// Stage 7: live-EQ bookkeeping. Holds the FW-assigned `eq_number`
@@ -224,23 +232,30 @@ pub struct LiveEq {
     pub params:    eq::EqParams,
 }
 
-/// Stage 8: live-CQ bookkeeping. Same shape as `LiveEq` but tracks
-/// the bound EQ via params.c_eqn.
+/// Stage 8 + 11: live-CQ bookkeeping. Same shape as `LiveEq` but
+/// tracks the bound EQ via params.c_eqn and the polling cursor
+/// used by Stage-11 `poll_cq`.
 pub struct LiveCq {
     pub cq_number: u32,
-    _pages:        Vec<DmaBuffer>,
+    pages:         Vec<DmaBuffer>,
     pub params:    cq::CqParams,
+    /// Next-to-read CQE index (mod cq_capacity).
+    pub consumer:  u32,
 }
 
-/// Stage 9: live-QP bookkeeping. Holds the FW-assigned `qp_number`,
-/// the DMA pages backing the SQ + RQ buffers, and the most-recently-
-/// observed state. Drivers driving the state machine update `state`
-/// after each successful MODIFY_QP.
+/// Stage 9 + 11: live-QP bookkeeping. Holds the FW-assigned
+/// `qp_number`, the DMA pages backing the SQ + RQ buffers, the
+/// state mirror (Stage 9), and the SQ/RQ tail counters used by
+/// `post_send` / `post_recv` (Stage 11).
 pub struct LiveQp {
     pub qp_number: u32,
-    _pages:        Vec<DmaBuffer>,
+    pages:         Vec<DmaBuffer>,
     pub params:    qp::QpParams,
     pub state:     qp::QpState,
+    /// Next-to-write SQ index (mod sq_capacity).
+    pub sq_tail:   u32,
+    /// Next-to-write RQ index (mod rq_capacity).
+    pub rq_tail:   u32,
 }
 
 impl fmt::Debug for LiveQp {
@@ -802,8 +817,9 @@ impl Mlx5Hca {
         let cq_number = resp.output_modifier & 0x00FF_FFFF;
         self.cqs.lock().push(LiveCq {
             cq_number,
-            _pages: pages,
+            pages,
             params,
+            consumer: 0,
         });
         Ok(cq_number)
     }
@@ -843,9 +859,11 @@ impl Mlx5Hca {
         let qp_number = resp.output_modifier & 0x00FF_FFFF;
         self.qps.lock().push(LiveQp {
             qp_number,
-            _pages: pages,
+            pages,
             params,
-            state:  qp::QpState::Rst,
+            state:   qp::QpState::Rst,
+            sq_tail: 0,
+            rq_tail: 0,
         });
         Ok(qp_number)
     }
@@ -891,6 +909,106 @@ impl Mlx5Hca {
         self.qps.lock().iter()
             .find(|q| q.qp_number == qp_number)
             .map(|q| q.state)
+    }
+
+    /// Stage 11: post a SEND through the QP's SQ. Builds the WQE
+    /// from `iovecs`, copies it into the SQ slot at the QP's
+    /// current `sq_tail`, advances the tail, and rings the SQ
+    /// doorbell. Returns the wqe_idx of the posted WQE — callers
+    /// use it to correlate with completions in the CQ.
+    pub fn post_send(
+        &self,
+        qp_number: u32,
+        opcode:    wqe::SendOpcode,
+        cqe_req:   wqe::CqeRequest,
+        iovecs:    &[ring::IoVec],
+    ) -> Result<u32, Mlx5Error> {
+        let mut qps = self.qps.lock();
+        let q = qps.iter_mut()
+            .find(|q| q.qp_number == qp_number)
+            .ok_or(Mlx5Error::UnknownQp)?;
+        let sq_capacity = 1u32 << q.params.log_sq_size;
+        let wqe_idx = q.sq_tail % sq_capacity;
+        let wqe_bytes = ring::build_send_wqe(
+            qp_number, wqe_idx as u16, opcode, cqe_req, iovecs)
+                .map_err(Mlx5Error::RingBuild)?;
+        // SQ starts at offset 0 of the QP buffer.
+        let sq_phys = q.pages[0].phys_addr().raw();
+        let dst = sq_phys + ring::sq_offset_of(wqe_idx) as u64;
+        // SAFETY: identity-mapped DMA, exclusively owned by this QP.
+        unsafe {
+            for (i, &b) in wqe_bytes.iter().enumerate() {
+                core::ptr::write_volatile((dst + i as u64) as *mut u8, b);
+            }
+        }
+        compiler_fence(Ordering::SeqCst);
+        let uar_page = q.params.uar_page;
+        q.sq_tail = q.sq_tail.wrapping_add(1);
+        let next_idx = (q.sq_tail % sq_capacity) as u16;
+        drop(qps);
+        self.ring_sq_doorbell(uar_page, qp_number, next_idx);
+        Ok(wqe_idx)
+    }
+
+    /// Stage 11: post a RECV onto the QP's RQ. Builds the recv-WQE
+    /// from `iovecs`, copies it into the RQ slot, advances the tail,
+    /// and bumps the RQ doorbell record. Returns the wqe_idx posted.
+    pub fn post_recv(
+        &self,
+        qp_number: u32,
+        iovecs:    &[ring::IoVec],
+    ) -> Result<u32, Mlx5Error> {
+        let mut qps = self.qps.lock();
+        let q = qps.iter_mut()
+            .find(|q| q.qp_number == qp_number)
+            .ok_or(Mlx5Error::UnknownQp)?;
+        let rq_capacity = 1u32 << q.params.log_rq_size;
+        let wqe_idx = q.rq_tail % rq_capacity;
+        let wqe_bytes = ring::build_recv_wqe(iovecs)
+                .map_err(Mlx5Error::RingBuild)?;
+        // RQ region starts after the SQ.
+        let qp_phys = q.pages[0].phys_addr().raw();
+        let rq_base = qp_phys + ring::sq_size_bytes(q.params.log_sq_size) as u64;
+        let dst = rq_base + ring::rq_offset_of(wqe_idx) as u64;
+        // SAFETY: identity-mapped DMA, owned by this QP.
+        unsafe {
+            for (i, &b) in wqe_bytes.iter().enumerate() {
+                core::ptr::write_volatile((dst + i as u64) as *mut u8, b);
+            }
+        }
+        compiler_fence(Ordering::SeqCst);
+        q.rq_tail = q.rq_tail.wrapping_add(1);
+        Ok(wqe_idx)
+    }
+
+    /// Stage 11: pop one completion off `cq_number`'s ring, if any.
+    /// Walks the CQ buffer at the consumer cursor, returns the
+    /// decoded `CqeView` if HW has handed it back, and advances the
+    /// cursor on the live LiveCq record.
+    pub fn poll_cq(&self, cq_number: u32)
+        -> Result<Option<cqe::CqeView>, Mlx5Error>
+    {
+        let mut cqs = self.cqs.lock();
+        let c = cqs.iter_mut()
+            .find(|c| c.cq_number == cq_number)
+            .ok_or(Mlx5Error::UnknownCq)?;
+        let cq_capacity = 1u32 << c.params.log_cq_size;
+        let off = ring::cq_offset_of(c.consumer, cq_capacity);
+        let cq_phys = c.pages[0].phys_addr().raw();
+        let mut bytes = [0u8; cqe::CQE_LEN];
+        // SAFETY: identity-mapped DMA.
+        unsafe {
+            for i in 0..cqe::CQE_LEN {
+                bytes[i] = core::ptr::read_volatile(
+                    (cq_phys + off as u64 + i as u64) as *const u8);
+            }
+        }
+        if cqe::is_hw_owned(&bytes) {
+            return Ok(None);
+        }
+        let view = cqe::decode_cqe(&bytes);
+        c.consumer = c.consumer.wrapping_add(1);
+        Ok(Some(view))
     }
 
     /// Stage 10: ring the SQ doorbell for `qp_number`. UAR offset

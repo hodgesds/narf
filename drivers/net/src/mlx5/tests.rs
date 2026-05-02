@@ -1036,7 +1036,7 @@ fn smoke_mlx5_qp_input_layout() -> TestResult {
         cqn_rcv:        0x0044_5566,
         log_sq_size:    8,
         log_rq_size:    9,
-        log_page_size:  12,
+        log_page_size:  12, uar_page: 0,
     };
     let bytes = match build_create_qp_input(params, &pages) {
         Ok(b)  => b,
@@ -1082,7 +1082,7 @@ fn smoke_mlx5_qp_input_validation() -> TestResult {
     let bad_sq = QpParams {
         qp_type: QpType::Rc, pd: 0,
         cqn_snd: 0, cqn_rcv: 0,
-        log_sq_size: 32, log_rq_size: 0, log_page_size: 12,
+        log_sq_size: 32, log_rq_size: 0, log_page_size: 12, uar_page: 0,
     };
     if !matches!(build_create_qp_input(bad_sq, &pages), Err(QpError::BadLogSqSize)) {
         return TestResult::Fail("oversize log_sq_size accepted");
@@ -1090,7 +1090,7 @@ fn smoke_mlx5_qp_input_validation() -> TestResult {
     let bad_rq = QpParams {
         qp_type: QpType::Rc, pd: 0,
         cqn_snd: 0, cqn_rcv: 0,
-        log_sq_size: 0, log_rq_size: 32, log_page_size: 12,
+        log_sq_size: 0, log_rq_size: 32, log_page_size: 12, uar_page: 0,
     };
     if !matches!(build_create_qp_input(bad_rq, &pages), Err(QpError::BadLogRqSize)) {
         return TestResult::Fail("oversize log_rq_size accepted");
@@ -1098,7 +1098,7 @@ fn smoke_mlx5_qp_input_validation() -> TestResult {
     let bad_pd = QpParams {
         qp_type: QpType::Rc, pd: 0x100_0000,
         cqn_snd: 0, cqn_rcv: 0,
-        log_sq_size: 0, log_rq_size: 0, log_page_size: 12,
+        log_sq_size: 0, log_rq_size: 0, log_page_size: 12, uar_page: 0,
     };
     if !matches!(build_create_qp_input(bad_pd, &pages), Err(QpError::BadPd)) {
         return TestResult::Fail("oversize pd accepted");
@@ -1106,7 +1106,7 @@ fn smoke_mlx5_qp_input_validation() -> TestResult {
     let bad_cqn = QpParams {
         qp_type: QpType::Rc, pd: 0,
         cqn_snd: 0x0100_0000, cqn_rcv: 0,
-        log_sq_size: 0, log_rq_size: 0, log_page_size: 12,
+        log_sq_size: 0, log_rq_size: 0, log_page_size: 12, uar_page: 0,
     };
     if !matches!(build_create_qp_input(bad_cqn, &pages), Err(QpError::BadCqn)) {
         return TestResult::Fail("oversize cqn accepted");
@@ -1114,7 +1114,7 @@ fn smoke_mlx5_qp_input_validation() -> TestResult {
     let ok = QpParams {
         qp_type: QpType::Rc, pd: 0,
         cqn_snd: 0, cqn_rcv: 0,
-        log_sq_size: 0, log_rq_size: 0, log_page_size: 12,
+        log_sq_size: 0, log_rq_size: 0, log_page_size: 12, uar_page: 0,
     };
     if !matches!(build_create_qp_input(ok, &[]), Err(QpError::NoPages)) {
         return TestResult::Fail("empty page list accepted");
@@ -1130,7 +1130,7 @@ fn smoke_mlx5_qp_state_decode() -> TestResult {
     let mut bytes = build_create_qp_input(QpParams {
         qp_type: QpType::Ud, pd: 0,
         cqn_snd: 0, cqn_rcv: 0,
-        log_sq_size: 0, log_rq_size: 0, log_page_size: 12,
+        log_sq_size: 0, log_rq_size: 0, log_page_size: 12, uar_page: 0,
     }, &pages).unwrap();
     if decode_qp_state(&bytes) != QpState::Rst {
         return TestResult::Fail("freshly-built qpc not in Rst");
@@ -1333,3 +1333,155 @@ fn smoke_mlx5_cqe_status_catalog() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/mlx5", smoke_mlx5_cqe_status_catalog);
+
+// ── Stage 11: ring helpers (post_send/post_recv/poll_cq layout) ────
+
+use super::ring::{
+    build_recv_wqe, build_send_wqe, cq_offset_of, pop_completion,
+    rq_offset_of, rq_size_bytes, sq_offset_of, sq_size_bytes,
+    IoVec, RingError, CQE_STRIDE, MAX_DATA_SEGS_PER_WQE, WQE_STRIDE,
+};
+
+fn smoke_mlx5_ring_offsets() -> TestResult {
+    if WQE_STRIDE != 64 { return TestResult::Fail("WQE_STRIDE drifted from 64"); }
+    if CQE_STRIDE != 64 { return TestResult::Fail("CQE_STRIDE drifted from 64"); }
+    if MAX_DATA_SEGS_PER_WQE != 3 { return TestResult::Fail("max data segs != 3"); }
+    if sq_offset_of(0)  != 0   { return TestResult::Fail("SQ slot 0 offset"); }
+    if sq_offset_of(1)  != 64  { return TestResult::Fail("SQ slot 1 offset"); }
+    if rq_offset_of(2)  != 128 { return TestResult::Fail("RQ slot 2 offset"); }
+    if sq_size_bytes(4) != 16 * 64 { return TestResult::Fail("sq_size_bytes(4)"); }
+    if rq_size_bytes(5) != 32 * 64 { return TestResult::Fail("rq_size_bytes(5)"); }
+    // CQ offset wraps modulo capacity.
+    if cq_offset_of(0, 8) != 0   { return TestResult::Fail("CQ slot 0"); }
+    if cq_offset_of(8, 8) != 0   { return TestResult::Fail("CQ wraparound"); }
+    if cq_offset_of(9, 8) != 64  { return TestResult::Fail("CQ wrap+1"); }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_ring_offsets);
+
+fn smoke_mlx5_send_wqe_for_iovecs() -> TestResult {
+    let iovs = [
+        IoVec { va: 0x4000_0000, l_key: 0xAB, len: 256 },
+        IoVec { va: 0x4000_1000, l_key: 0xAB, len: 128 },
+    ];
+    let wqe = match build_send_wqe(
+        /* qp */ 0x55_5555, /* idx */ 7,
+        SendOpcode::Send, CqeRequest::AlwaysCqe, &iovs)
+    {
+        Ok(w) => w,
+        Err(_) => return TestResult::Fail("build_send_wqe rejected valid iovecs"),
+    };
+    if wqe.len() != WQE_STRIDE {
+        return TestResult::Fail("WQE size != WQE_STRIDE");
+    }
+    // ds = 1 ctrl + 2 data = 3.
+    let ctrl: [u8; 16] = wqe[..16].try_into().unwrap();
+    if ctrl_ds(&ctrl) != 3 {
+        return TestResult::Fail("ds count wrong for 2 iovecs");
+    }
+    if ctrl_qp_num(&ctrl) != 0x55_5555 {
+        return TestResult::Fail("qp_num lost in WQE assembly");
+    }
+    if ctrl_wqe_idx(&ctrl) != 7 {
+        return TestResult::Fail("wqe_idx lost in WQE assembly");
+    }
+    // First data segment at offset 16 with iov[0].
+    let mut seg = [0u8; 16];
+    seg.copy_from_slice(&wqe[16..32]);
+    let (bc, lk, va) = decode_data_seg_ptr(&seg);
+    if bc != 256 || lk != 0xAB || va != 0x4000_0000 {
+        return TestResult::Fail("data seg 0 round-trip wrong");
+    }
+    // Second data segment at offset 32 with iov[1].
+    seg.copy_from_slice(&wqe[32..48]);
+    let (bc, lk, va) = decode_data_seg_ptr(&seg);
+    if bc != 128 || lk != 0xAB || va != 0x4000_1000 {
+        return TestResult::Fail("data seg 1 round-trip wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_send_wqe_for_iovecs);
+
+fn smoke_mlx5_recv_wqe_round_trip() -> TestResult {
+    let iovs = [
+        IoVec { va: 0x5000_0000, l_key: 0xCD, len: 1500 },
+    ];
+    let wqe = build_recv_wqe(&iovs).unwrap();
+    if wqe.len() != WQE_STRIDE {
+        return TestResult::Fail("RQ WQE size != WQE_STRIDE");
+    }
+    // Segment count BE u16 at offset 0.
+    let n = u16::from_be_bytes([wqe[0], wqe[1]]);
+    if n != 1 {
+        return TestResult::Fail("recv WQE seg count wrong");
+    }
+    // Data segment at offset 16.
+    let mut seg = [0u8; 16];
+    seg.copy_from_slice(&wqe[16..32]);
+    let (bc, lk, va) = decode_data_seg_ptr(&seg);
+    if bc != 1500 || lk != 0xCD || va != 0x5000_0000 {
+        return TestResult::Fail("recv data seg round-trip wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_recv_wqe_round_trip);
+
+fn smoke_mlx5_ring_validation() -> TestResult {
+    // Empty iovec list rejected.
+    if !matches!(build_send_wqe(0, 0, SendOpcode::Send, CqeRequest::AlwaysCqe, &[]),
+                 Err(RingError::NoSegments)) {
+        return TestResult::Fail("empty iovecs accepted by send");
+    }
+    if !matches!(build_recv_wqe(&[]), Err(RingError::NoSegments)) {
+        return TestResult::Fail("empty iovecs accepted by recv");
+    }
+    // > MAX data segments rejected.
+    let many = [IoVec { va: 0, l_key: 0, len: 1 }; 8];
+    if !matches!(build_send_wqe(0, 0, SendOpcode::Send, CqeRequest::AlwaysCqe, &many),
+                 Err(RingError::TooManySegments)) {
+        return TestResult::Fail("too-many iovecs accepted by send");
+    }
+    if !matches!(build_recv_wqe(&many), Err(RingError::TooManySegments)) {
+        return TestResult::Fail("too-many iovecs accepted by recv");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_ring_validation);
+
+fn smoke_mlx5_pop_completion_walks_ring() -> TestResult {
+    // Build an 8-CQE synthetic ring; mark slot 0 as SW-owned with
+    // a known completion, slots 1+ as HW-owned. pop_completion at
+    // consumer=0 should return slot 0 + advance to 1; at
+    // consumer=1 should return None (HW still owns).
+    const CAP: usize = 8;
+    let mut bytes = alloc::vec![0u8; CAP * CQE_STRIDE];
+    // Mark every slot HW-owned by default.
+    for i in 0..CAP {
+        bytes[i * CQE_STRIDE + 0x3F] |= 1; // owner bit
+    }
+    // Now write a completed CQE into slot 0 (clears owner via
+    // simulate_completion).
+    let mut tmp = [0u8; CQE_STRIDE];
+    simulate_cqe(&mut tmp, /* bc */ 64, /* status */ 0,
+        /* wqe_counter */ 0xAAAA, /* qp_num */ 0xCAFE_42,
+        CqeOpcode::ResponderSend);
+    bytes[0..CQE_STRIDE].copy_from_slice(&tmp);
+
+    let (view, next) = match pop_completion(&bytes, CAP as u32, 0) {
+        Some(v) => v,
+        None    => return TestResult::Fail("slot 0 completed not found"),
+    };
+    if view.qp_num != 0xCAFE_42 {
+        return TestResult::Fail("popped CQE qp_num wrong");
+    }
+    if view.byte_count != 64 {
+        return TestResult::Fail("popped CQE byte_count wrong");
+    }
+    if next != 1 { return TestResult::Fail("consumer didn't advance"); }
+    // Slot 1 is HW-owned → None.
+    if pop_completion(&bytes, CAP as u32, 1).is_some() {
+        return TestResult::Fail("HW-owned slot returned a CQE");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_pop_completion_walks_ring);
