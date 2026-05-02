@@ -65,7 +65,7 @@ intra-address-space isolation.
   framekernel's domain model.
 - **Verification and observability are first-class.** A kernel-resident
   test harness (`cargo xtask test`) boots the real kernel under QEMU and
-  asserts on live invariants — 558 smokes on x86_64, 292 on aarch64 at
+  asserts on live invariants — 559 smokes on x86_64, 292 on aarch64 at
   time of writing — alongside USDT-style probes, flight-recorder rings, a
   PMU-sampling surface, and an ABI promise (syscall numbers carry an upper
   8-bit version, `relibc` will gate against it). Bugs are caught at the
@@ -171,14 +171,21 @@ Live from boot through `cargo xtask run`:
   NAMESPACE, I/O queue pair (`Create I/O CQ` + `Create I/O SQ`),
   Read/Write LBA with both polled and MSI-X-driven completions.
 - The complete modern virtio-PCI matrix: blk / net / rng / balloon /
-  console / scsi / 9p / fs / vsock / iommu / gpu / input / snd. Each
-  live driver brings up its virtqueues, programs MSI-X on its primary
-  completion queue (via the shared `pci::enable_msix_queue` helper),
-  and exposes a high-level API (e.g. `submit_cmd` / `report_luns` for
-  scsi, `tversion` for 9p, `paint_test_pattern` for gpu, `send`/`recv`
-  for vsock, `attach`/`map`/`unmap` for iommu). Polled-completion
-  fallbacks stay in place so sync callers and IRQ-less environments
-  keep working.
+  console / scsi / 9p / fs / vsock / iommu / gpu / input / snd. Every
+  driver in the matrix is live data-path, not just bring-up: scsi
+  exposes `submit_cmd` / `submit_tmf` / `report_luns`, 9p exposes the
+  full Tversion / Tattach / Twalk / Tlopen / Tread / Tclunk request
+  set with R-side decoding, fs ships FUSE_INIT / FUSE_LOOKUP /
+  FUSE_READ helpers on top of the FUSE-on-virtio submit path, gpu
+  paints (`init_scanout` / `paint_solid` / `paint_test_pattern` /
+  `flush`), vsock has `send` / `recv` / `drain_events`, iommu has
+  `attach` / `detach` / `map` / `unmap` with §5.16.6 tail-status
+  decode, snd has `set_params` / `prepare` / `start` + `play_buffer`
+  PCM submit, balloon does live `inflate(pfns)` / `deflate(pfns)`,
+  rng pumps entropy via `read_bytes(out)`. Each driver programs MSI-X
+  on its primary completion queue via the shared
+  `pci::enable_msix_queue` helper; polled-completion fallbacks stay
+  in place so sync callers and IRQ-less environments keep working.
 - e1000 / e1000e: BAR0, MAC read from RAL/RAH, TX + RX descriptor
   rings, link up via CTRL.SLU.
 - AHCI ICH9: HBA reset, port enumeration via PORT_SIG/SSTS,
@@ -214,7 +221,7 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **558/0/21** smokes;
+`cargo xtask test --arch=x86_64` passes **559/0/21** smokes;
 `--arch=aarch64` passes **292/0/10**. Skips are x86-specific PCIe
 surfaces or live-device tests that skip cleanly when QEMU doesn't
 expose the device. See `STATUS.md` for the full tally and per-

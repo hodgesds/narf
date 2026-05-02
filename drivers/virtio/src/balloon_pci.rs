@@ -5,9 +5,12 @@
 //!   - 0 = inflate (driver hands pages to the host).
 //!   - 1 = deflate (host returns pages to the driver).
 //!
-//! Stage-4 cut: structural bring-up. The actual page-handoff logic
-//! ties into `narf_memory`'s frame allocator and lands once the
-//! kernel needs guest-side memory pressure response. Probe-only.
+//! Wire format for both queues (VirtIO 1.2 §5.5.6.1): the driver
+//! posts a single descriptor whose payload is a packed
+//! `le32` array of PFNs (page-frame numbers, page = 4 KiB). Host
+//! ack'd via the used ring; no per-element status.
+
+use core::sync::atomic::{compiler_fence, Ordering};
 
 use narf_bus::{BusDevice, BusDeviceCap};
 use narf_capabilities::{Cap, Write};
@@ -22,7 +25,7 @@ use crate::pci::{
     CC_QUEUE_DESC, CC_QUEUE_DEVICE, CC_QUEUE_DRIVER, CC_QUEUE_ENABLE,
     CC_QUEUE_NOTIFY_OFF, CC_QUEUE_SELECT, CC_QUEUE_SIZE,
 };
-use crate::queue::{Virtqueue, VirtqueueLayout};
+use crate::queue::{Virtqueue, VirtqueueLayout, VirtqDesc};
 use crate::{
     VIRTIO_F_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER,
     VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FEATURES_OK,
@@ -31,11 +34,23 @@ use crate::{
 pub const VIRTIO_BALLOON_PCI_VENDOR: u16 = 0x1AF4;
 pub const VIRTIO_BALLOON_PCI_DEVICE: u16 = 0x1045;
 
+/// Maximum PFN array length per submission. Inflate / deflate scratch
+/// is a single 4 KiB page; with 4 B per PFN that's 1024 PFNs per call.
+pub const MAX_PFNS_PER_REQ: usize = 1024;
+
 pub struct VirtioBalloonPci {
+    notify: VirtioRegion,
+    notify_off_multiplier: u32,
     inflate_q: IrqSafeSpinLock<Option<Virtqueue>>,
     deflate_q: IrqSafeSpinLock<Option<Virtqueue>>,
     _q_buf_inflate: DmaBuffer,
     _q_buf_deflate: DmaBuffer,
+    /// Scratch DMA pages holding the PFN array for one outstanding
+    /// inflate / deflate at a time.
+    inflate_buf: DmaBuffer,
+    deflate_buf: DmaBuffer,
+    inflate_notify_off: u16,
+    deflate_notify_off: u16,
     pub ready: bool,
 }
 
@@ -58,6 +73,9 @@ impl VirtioBalloonPci {
         let caps: VirtioCaps = unsafe { discover(device) }?;
         // SAFETY: caller-owned.
         let common = unsafe { map_cap(device, &caps.common) }?;
+        // SAFETY: caller-owned.
+        let notify = unsafe { map_cap(device, &caps.notify) }?;
+        let notify_off_multiplier = caps.notify.notify_off_multiplier;
 
         // Reset + ACK + DRIVER.
         // SAFETY: identity-mapped MMIO.
@@ -100,7 +118,7 @@ impl VirtioBalloonPci {
         }
 
         // Queues 0 (inflate) and 1 (deflate).
-        let setup_q = |idx: u16| -> Result<(VirtqueueLayout, DmaBuffer), VirtioPciError> {
+        let setup_q = |idx: u16| -> Result<(VirtqueueLayout, DmaBuffer, u16), VirtioPciError> {
             // SAFETY: identity-mapped MMIO.
             let qmax = unsafe {
                 common.write16(CC_QUEUE_SELECT, idx);
@@ -121,13 +139,20 @@ impl VirtioBalloonPci {
                 common.write16(crate::pci::CC_QUEUE_MSIX_VECTOR, 0xFFFF);
                 common.write16(CC_QUEUE_ENABLE, 1);
             }
-            // queue_notify_off captured but not used by this stub.
             // SAFETY: same.
-            let _ = unsafe { common.read16(CC_QUEUE_NOTIFY_OFF) };
-            Ok((layout, buf))
+            let nof = unsafe { common.read16(CC_QUEUE_NOTIFY_OFF) };
+            Ok((layout, buf, nof))
         };
-        let (inf_layout, inf_buf) = setup_q(0)?;
-        let (def_layout, def_buf) = setup_q(1)?;
+        let (inf_layout, inf_buf, inflate_notify_off) = setup_q(0)?;
+        let (def_layout, def_buf, deflate_notify_off) = setup_q(1)?;
+
+        // Scratch DMA buffers for the per-call PFN arrays. One page
+        // each → 1024 PFNs per submission. Allocated once at probe so
+        // inflate / deflate don't allocate on the hot path.
+        let inflate_buf = alloc_coherent(4096, DomainId::DRIVER_0)
+            .map_err(|_| VirtioPciError::BarMapFailed)?;
+        let deflate_buf = alloc_coherent(4096, DomainId::DRIVER_0)
+            .map_err(|_| VirtioPciError::BarMapFailed)?;
 
         // DRIVER_OK.
         // SAFETY: same.
@@ -143,12 +168,88 @@ impl VirtioBalloonPci {
         // SAFETY: same.
         let deflate_q = unsafe { Virtqueue::new(def_layout) };
         Ok(Self {
+            notify, notify_off_multiplier,
             inflate_q: IrqSafeSpinLock::new(Some(inflate_q)),
             deflate_q: IrqSafeSpinLock::new(Some(deflate_q)),
             _q_buf_inflate: inf_buf,
             _q_buf_deflate: def_buf,
+            inflate_buf, deflate_buf,
+            inflate_notify_off, deflate_notify_off,
             ready: true,
         })
+    }
+
+    /// Submit `pfns` to the inflate queue. Each PFN is a guest
+    /// 4 KiB page index (phys >> 12). Polled completion. Bounded
+    /// to `MAX_PFNS_PER_REQ` (1024) per call by the scratch buffer.
+    pub fn inflate(&self, pfns: &[u32]) -> Result<(), VirtioPciError> {
+        self.submit_pfns(/*queue=*/0, pfns)
+    }
+
+    /// Submit `pfns` to the deflate queue (return pages to driver).
+    /// Same constraints as `inflate`.
+    pub fn deflate(&self, pfns: &[u32]) -> Result<(), VirtioPciError> {
+        self.submit_pfns(/*queue=*/1, pfns)
+    }
+
+    fn submit_pfns(&self, queue: u8, pfns: &[u32]) -> Result<(), VirtioPciError> {
+        if pfns.is_empty() { return Ok(()); }
+        if pfns.len() > MAX_PFNS_PER_REQ {
+            return Err(VirtioPciError::QueueTooSmall);
+        }
+        let (lock, buf, q_notify_off, q_idx) = match queue {
+            0 => (&self.inflate_q, &self.inflate_buf, self.inflate_notify_off, 0u16),
+            1 => (&self.deflate_q, &self.deflate_buf, self.deflate_notify_off, 1u16),
+            _ => return Err(VirtioPciError::NoQueues),
+        };
+        let phys = buf.phys_addr().raw();
+        // SAFETY: identity-mapped scratch DMA, single-flight per queue.
+        unsafe {
+            for (i, p) in pfns.iter().enumerate() {
+                core::ptr::write_volatile(
+                    (phys + (i * 4) as u64) as *mut u32, p.to_le());
+            }
+        }
+        let descs = [
+            VirtqDesc {
+                addr:  phys,
+                len:   (pfns.len() * 4) as u32,
+                flags: 0,
+                next:  0,
+            },
+        ];
+        let head = {
+            let mut g = lock.lock();
+            let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
+            q.add_buffer(&descs).ok_or(VirtioPciError::AddBufferFailed)?
+        };
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: identity-mapped notify region.
+        unsafe {
+            self.notify.write16(
+                self.notify_off_multiplier as u64 * q_notify_off as u64,
+                q_idx,
+            );
+        }
+        let mut spins = 0u32;
+        loop {
+            let elem = {
+                let mut g = lock.lock();
+                let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
+                q.poll_used()
+            };
+            if let Some((id, _)) = elem { if id == head as u32 { break; } }
+            spins += 1;
+            if spins > 10_000_000 {
+                let mut g = lock.lock();
+                if let Some(q) = g.as_mut() { q.free_chain(head); }
+                return Err(VirtioPciError::CompletionTimeout);
+            }
+            core::hint::spin_loop();
+        }
+        let mut g = lock.lock();
+        if let Some(q) = g.as_mut() { q.free_chain(head); }
+        Ok(())
     }
 }
 
@@ -194,3 +295,7 @@ pub fn register_pci_driver() {
 }
 
 pub fn is_probed() -> bool { CONTROLLER.lock().is_some() }
+
+pub fn with_controller<R>(f: impl FnOnce(&VirtioBalloonPci) -> R) -> Option<R> {
+    CONTROLLER.lock().as_ref().map(f)
+}

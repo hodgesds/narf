@@ -80,6 +80,11 @@ pub struct VirtioNetPci {
     tx_qsize: u16,
     rx_notify_off: u16,
     tx_notify_off: u16,
+    /// IDT vector bound to receiveq (queue 0) when MSI-X is enabled.
+    /// `None` means polled-only completion. Consumers wait via
+    /// `narf_interrupts::wait_for_irq(v).await`.
+    pub irq_vector: Option<u8>,
+    msix: Option<narf_bus::MsixTable>,
     pub ready: bool,
 }
 
@@ -232,8 +237,31 @@ impl VirtioNetPci {
             rx_pool, tx_buf,
             rx_qsize, tx_qsize,
             rx_notify_off, tx_notify_off,
+            irq_vector: None,
+            msix:       None,
             ready: true,
         })
+    }
+
+    /// Bind the receiveq (queue 0) to a fresh MSI-X vector. After
+    /// this call, frame-arrival is observable via
+    /// `narf_interrupts::wait_for_irq(self.irq_vector.unwrap())`.
+    /// The polled `rx()` path keeps working unchanged.
+    ///
+    /// # Safety
+    /// Caller owns the device's BAR + cfg-space exclusively.
+    pub unsafe fn enable_msix(
+        &mut self,
+        cap: &Cap<BusDeviceCap, Write>,
+        device: &BusDevice,
+    ) -> Result<u8, VirtioPciError> {
+        // SAFETY: caller-owns the device.
+        let (v, table) = unsafe {
+            crate::pci::enable_msix_queue(&self.common, cap, device, RX_QUEUE)
+        }?;
+        self.irq_vector = Some(v);
+        self.msix       = Some(table);
+        Ok(v)
     }
 
     /// Transmit a single frame on the TX queue. Polled completion.
@@ -361,6 +389,15 @@ pub fn probe(
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
     *CONTROLLER.lock() = Some(dev);
+    // Best-effort MSI-X for receiveq (queue 0). Failure is fine —
+    // the polled `rx()` path stays in place.
+    {
+        let mut g = CONTROLLER.lock();
+        if let Some(c) = g.as_mut() {
+            // SAFETY: probe-time caller owns the device.
+            let _ = unsafe { c.enable_msix(&cap, &device) };
+        }
+    }
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name:    alloc::string::String::from("vnet0"),
         kind:    narf_drivers::BoundKind::Net,
@@ -386,4 +423,24 @@ pub fn is_probed() -> bool { CONTROLLER.lock().is_some() }
 
 pub fn with_controller<R>(f: impl FnOnce(&VirtioNetPci) -> R) -> Option<R> {
     CONTROLLER.lock().as_ref().map(f)
+}
+
+/// Async, IRQ-driven RX. Awaits the receiveq's MSI-X vector, then
+/// drains one frame into `out`. Falls through to the polled drain if
+/// MSI-X isn't enabled. Returns the byte count copied (0 if no frame
+/// was ready after the IRQ — caller should re-await).
+pub async fn rx_irq_async(out: &mut [u8]) -> usize {
+    let vector = {
+        let g = CONTROLLER.lock();
+        match g.as_ref() {
+            Some(c) => c.irq_vector,
+            None    => return 0,
+        }
+    };
+    if let Some(v) = vector {
+        narf_interrupts::wait::wait_for_irq(v).await;
+    }
+    let g = CONTROLLER.lock();
+    let c = match g.as_ref() { Some(c) => c, None => return 0 };
+    c.rx(out)
 }

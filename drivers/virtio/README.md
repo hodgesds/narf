@@ -21,18 +21,18 @@ working.
 | driver         | virtio device id | scope |
 |----------------|------------------|-------|
 | `blk_pci`      | 2  (`0x1042`)    | header / data / status descriptor chain, sync + async (IRQ-driven) read/write, MSI-X. |
-| `console_pci`  | 3  (`0x1043`)    | receiveq + transmitq + ConsoleConfig (cols/rows/emerg_wr) + ControlEvent decode + write_bytes / read_bytes. |
-| `rng_pci`      | 4  (`0x1044`)    | structural probe. |
-| `balloon_pci`  | 5  (`0x1045`)    | structural probe. |
-| `scsi_pci`     | 8  (`0x1048`)    | controlq + eventq + cmdq[0] + submit_cmd + submit_tmf + REPORT LUNS helper. |
-| `p9_pci`       | 9  (`0x1009`)    | requestq + 9P2000.L Tversion / Rversion / Tattach / Twalk / Tlopen / Tread / Tclunk. |
-| `gpu_pci`      | 16 (`0x1050`)    | controlq + cursorq, 2D pipeline (`init_scanout` / `paint_solid` / `paint_test_pattern` / `flush`), pure-data GPU command builders. |
-| `input_pci`    | 18 (`0x1052`)    | eventQ drain → `narf_input` global ring (KEY / REL events), MSI-X. |
-| `vsock_pci`    | 19 (`0x1053`)    | rx + tx + event queues, `VsockHdr` builders, `send` / `recv` / `drain_events`. |
-| `iommu_pci`    | 23 (`0x1057`)    | requestq + eventq, attach / detach / map / unmap with §5.16.6 tail-status decode. |
-| `fs_pci`       | 26 (`0x105A`)    | hiprio + request[0] queues, FUSE-on-virtio header builders, `submit_request`. |
-| `net_pci`      | 1  (`0x1041`)    | TX + RX queues (polled). |
-| `snd_pci`      | 25 (`0x1059`)    | structural probe. |
+| `net_pci`      | 1  (`0x1041`)    | RX + TX virtqueues, polled `tx` / `rx`, async `rx_irq_async` on receiveq MSI-X. |
+| `console_pci`  | 3  (`0x1043`)    | receiveq + transmitq + ConsoleConfig (cols/rows/emerg_wr) + ControlEvent decode + write_bytes / read_bytes + MSI-X. |
+| `rng_pci`      | 4  (`0x1044`)    | requestq + `read_bytes(out)` polled entropy fetch. |
+| `balloon_pci`  | 5  (`0x1045`)    | inflate + deflate queues, `inflate(pfns)` / `deflate(pfns)` polled, ≤ 1024 PFNs / call. |
+| `scsi_pci`     | 8  (`0x1048`)    | controlq + eventq + cmdq[0] + submit_cmd + submit_tmf + REPORT LUNS helper + MSI-X. |
+| `p9_pci`       | 9  (`0x1009`)    | requestq + 9P2000.L `tversion` / `tattach` / `twalk` / `tlopen` / `tread` / `tclunk` live ops + MSI-X. |
+| `gpu_pci`      | 16 (`0x1050`)    | controlq + cursorq, 2D pipeline (`init_scanout` / `paint_solid` / `paint_test_pattern` / `flush`) + MSI-X. |
+| `input_pci`    | 18 (`0x1052`)    | eventQ drain → `narf_input` global ring (KEY / REL events) + MSI-X. |
+| `vsock_pci`    | 19 (`0x1053`)    | rx + tx + event queues, `VsockHdr` builders, `send` / `recv` / `drain_events` + MSI-X. |
+| `iommu_pci`    | 23 (`0x1057`)    | requestq + eventq, attach / detach / map / unmap with §5.16.6 tail-status decode + MSI-X. |
+| `fs_pci`       | 26 (`0x105A`)    | hiprio + request[0] queues, FUSE-on-virtio submit + `fuse_init` / `fuse_lookup` / `fuse_read` helpers + MSI-X. |
+| `snd_pci`      | 25 (`0x1059`)    | controlq + eventq + tx + rx queues, `set_params` / `prepare` / `start` + `play_buffer` / `play_buffer_phys` PCM submit. |
 
 ## Shared infra
 

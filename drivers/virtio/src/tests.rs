@@ -493,3 +493,46 @@ fn smoke_virtio_balloon_pci_probe() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/virtio/balloon-pci", smoke_virtio_balloon_pci_probe);
+
+fn smoke_virtio_balloon_pci_inflate_deflate() -> TestResult {
+    use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use crate::balloon_pci;
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let has = devs.iter().any(|d|
+        matches!(&d.kind, BusKind::Pcie { .. })
+        && d.id.vendor == balloon_pci::VIRTIO_BALLOON_PCI_VENDOR
+        && d.id.device == balloon_pci::VIRTIO_BALLOON_PCI_DEVICE);
+    if !has { return TestResult::Skip("no virtio-balloon-pci"); }
+    __reset_for_test();
+    balloon_pci::register_pci_driver();
+    let authority = bootstrap_registry_authority();
+    if probe_all_pci(&authority).is_err() {
+        return TestResult::Fail("probe_all_pci");
+    }
+    // Allocate a single guest page + hand its PFN to the host through
+    // the inflate queue, then deflate it back. Polled completion;
+    // succeeds iff the device acks both submissions.
+    let buf = match narf_io::alloc_coherent(4096, narf_lib::id::DomainId::DRIVER_0) {
+        Ok(b)  => b,
+        Err(_) => return TestResult::Fail("alloc_coherent"),
+    };
+    let pfn = (buf.phys_addr().raw() >> 12) as u32;
+    let pfns = [pfn];
+    let r = balloon_pci::with_controller(|c| c.inflate(&pfns));
+    match r {
+        Some(Ok(())) => {}
+        Some(Err(_)) => return TestResult::Fail("inflate"),
+        None         => return TestResult::Fail("controller missing"),
+    }
+    let r = balloon_pci::with_controller(|c| c.deflate(&pfns));
+    match r {
+        Some(Ok(())) => {}
+        Some(Err(_)) => return TestResult::Fail("deflate"),
+        None         => return TestResult::Fail("controller missing"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/virtio/balloon-pci", smoke_virtio_balloon_pci_inflate_deflate);

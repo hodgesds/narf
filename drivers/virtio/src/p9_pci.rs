@@ -293,6 +293,92 @@ impl VirtioP9Pci {
         let resp = self.submit(&req, 0x100)?;
         p9::Rversion::decode(&resp).map_err(|_| VirtioPciError::DeviceRejectedFeatures)
     }
+
+    /// Tattach: bind `fid` to the file-system root advertised by the
+    /// device (`uname` is the user, `aname` is the requested
+    /// subtree — empty for the mount root). 9P2000.L uses
+    /// `n_uname` as the numeric uid.
+    pub fn tattach(
+        &self,
+        tag:     u16,
+        fid:     u32,
+        uname:   &[u8],
+        aname:   &[u8],
+        n_uname: u32,
+    ) -> Result<p9::Rattach, VirtioPciError> {
+        let req = p9::Tattach {
+            tag, fid, afid: p9::NOFID,
+            uname:   uname.to_vec(),
+            aname:   aname.to_vec(),
+            n_uname,
+        }.encode();
+        let resp = self.submit(&req, 0x100)?;
+        p9::Rattach::decode(&resp)
+            .map_err(|_| VirtioPciError::DeviceRejectedFeatures)
+    }
+
+    /// Twalk from `fid` to `newfid` traversing `wnames` (each is
+    /// a path component, no `/`). Bounded to 16 by the protocol.
+    pub fn twalk(
+        &self,
+        tag:    u16,
+        fid:    u32,
+        newfid: u32,
+        wnames: &[&[u8]],
+    ) -> Result<p9::Rwalk, VirtioPciError> {
+        let req = p9::Twalk {
+            tag, fid, newfid,
+            wnames: wnames.iter().map(|s| s.to_vec()).collect(),
+        }
+        .encode()
+        .map_err(|_| VirtioPciError::QueueTooSmall)?;
+        let resp = self.submit(&req, 0x400)?;
+        p9::Rwalk::decode(&resp)
+            .map_err(|_| VirtioPciError::DeviceRejectedFeatures)
+    }
+
+    /// Tlopen: open `fid` with POSIX `flags` (O_RDONLY/etc).
+    pub fn tlopen(
+        &self,
+        tag:   u16,
+        fid:   u32,
+        flags: u32,
+    ) -> Result<p9::Rlopen, VirtioPciError> {
+        let req = p9::Tlopen { tag, fid, flags }.encode();
+        let resp = self.submit(&req, 0x100)?;
+        p9::Rlopen::decode(&resp)
+            .map_err(|_| VirtioPciError::DeviceRejectedFeatures)
+    }
+
+    /// Tread `count` bytes from `fid` at byte `offset`. Caller must
+    /// have first opened `fid` with `tlopen`. The response payload
+    /// max is bounded by the 4 KiB scratch (4080 bytes minus header
+    /// and count word).
+    pub fn tread(
+        &self,
+        tag:    u16,
+        fid:    u32,
+        offset: u64,
+        count:  u32,
+    ) -> Result<p9::Rread, VirtioPciError> {
+        // Payload cap: response buffer = 0x1000, minus the
+        // R_READ frame overhead of 7 (header) + 4 (count).
+        let cap = (0x1000u32 - 11).min(count);
+        let req = p9::Tread { tag, fid, offset, count: cap }.encode();
+        let resp = self.submit(&req, 0x1000)?;
+        p9::Rread::decode(&resp)
+            .map_err(|_| VirtioPciError::DeviceRejectedFeatures)
+    }
+
+    /// Tclunk: forget `fid`.
+    pub fn tclunk(&self, tag: u16, fid: u32)
+        -> Result<p9::Rclunk, VirtioPciError>
+    {
+        let req = p9::Tclunk { tag, fid }.encode();
+        let resp = self.submit(&req, 0x100)?;
+        p9::Rclunk::decode(&resp)
+            .map_err(|_| VirtioPciError::DeviceRejectedFeatures)
+    }
 }
 
 unsafe fn setup_queue(

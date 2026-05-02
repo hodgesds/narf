@@ -37,18 +37,18 @@ device to the highest-specificity matching probe.
 |----------------------------------|-----------------------------------------|----------------------------------------------|
 | `narf-drivers-nvme`              | 0x1B36 : 0x0010 (QEMU) + 3 Samsung VID/DIDs + class-storage backstop | admin queue + IDENTIFY CTRL/NS + I/O queue + Read/Write LBA + MSI-X-driven completions |
 | `narf-drivers-virtio` (blk)      | 0x1AF4 : 0x1042 | virtqueue 0 + polled & IRQ-driven Read/Write sector + MSI-X (q0) |
-| `narf-drivers-virtio` (net)      | 0x1AF4 : 0x1041 | RX + TX virtqueues, polled |
-| `narf-drivers-virtio` (rng)      | 0x1AF4 : 0x1044 | structural probe |
-| `narf-drivers-virtio` (balloon)  | 0x1AF4 : 0x1045 | structural probe |
+| `narf-drivers-virtio` (net)      | 0x1AF4 : 0x1041 | RX + TX virtqueues, polled `tx`/`rx`, async `rx_irq_async` on receiveq MSI-X |
+| `narf-drivers-virtio` (rng)      | 0x1AF4 : 0x1044 | requestq + polled `read_bytes(out)` entropy fetch |
+| `narf-drivers-virtio` (balloon)  | 0x1AF4 : 0x1045 | inflate + deflate queues + `inflate(pfns)` / `deflate(pfns)` polled |
 | `narf-drivers-virtio` (console)  | 0x1AF4 : 0x1043 / 0x1003 | receiveq + transmitq + emerg_wr cfg + write_bytes / read_bytes + MSI-X (receiveq) |
 | `narf-drivers-virtio` (scsi)     | 0x1AF4 : 0x1048 | controlq + eventq + cmdq[0] + submit_cmd + submit_tmf + REPORT LUNS + MSI-X (cmdq[0]) |
-| `narf-drivers-virtio` (9p)       | 0x1AF4 : 0x1009 | requestq + 9P2000.L Tversion/Rversion handshake + MSI-X (requestq) |
-| `narf-drivers-virtio` (fs)       | 0x1AF4 : 0x105A | hiprio + request[0] + FUSE-on-virtio submit_request + MSI-X (request[0]) |
+| `narf-drivers-virtio` (9p)       | 0x1AF4 : 0x1009 | requestq + 9P2000.L `tversion` / `tattach` / `twalk` / `tlopen` / `tread` / `tclunk` live ops + MSI-X |
+| `narf-drivers-virtio` (fs)       | 0x1AF4 : 0x105A | hiprio + request[0] + FUSE submit + `fuse_init`/`fuse_lookup`/`fuse_read` + MSI-X (request[0]) |
 | `narf-drivers-virtio` (vsock)    | 0x1AF4 : 0x1053 | rx + tx + event queues + send/recv/drain_events + MSI-X (rx) |
 | `narf-drivers-virtio` (iommu)    | 0x1AF4 : 0x1057 | requestq + eventq + attach/detach/map/unmap + MSI-X (requestq) |
 | `narf-drivers-virtio` (gpu)      | 0x1AF4 : 0x1050 / 0x1010 | controlq + cursorq + 2D pipeline (init_scanout / paint_solid / paint_test_pattern / flush) + MSI-X (controlQ) |
 | `narf-drivers-virtio` (input)    | 0x1AF4 : 0x1052 | eventQ drain → `narf_input` global ring + MSI-X (eventQ) |
-| `narf-drivers-virtio` (snd)      | 0x1AF4 : 0x1059 | structural probe |
+| `narf-drivers-virtio` (snd)      | 0x1AF4 : 0x1059 | controlq + tx + rx + eventq, set_params/prepare/start + `play_buffer` / `play_buffer_phys` PCM submit |
 | `narf-drivers-net` (e1000)       | 0x8086 : 0x100C/0x100E/0x100F/0x10D3/0x153A | TX descriptor ring + RX descriptor ring + buffer pool, polled |
 | `narf-drivers-net` (ixgbe)       | 0x8086 : 0x10FB / 0x1528 / 0x1563 / 0x15AB | reset + EEPROM MAC + advanced TX/RX + MSI-X + `HwNic` |
 | `narf-drivers-net` (mlx5)        | Mellanox ConnectX-4/5/6 family | clean-room cmdq + EQ/CQ/QP + WQE/CQE + flow steering + mkey + vport + teardown |

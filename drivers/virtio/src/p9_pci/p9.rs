@@ -333,3 +333,128 @@ impl Rversion {
         Ok(Self { tag: h.tag, msize, version })
     }
 }
+
+// ── Rattach (105) ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rattach {
+    pub tag: u16,
+    pub qid: Qid,
+}
+
+impl Rattach {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut body = Vec::with_capacity(QID_LEN);
+        self.qid.encode_into(&mut body);
+        frame(R_ATTACH, self.tag, &body)
+    }
+    pub fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
+        let h = Header::decode(buf)?;
+        if h.kind != R_ATTACH { return Err(DecodeError::BadType); }
+        let (qid, _) = Qid::decode(&buf[HEADER_LEN..])?;
+        Ok(Self { tag: h.tag, qid })
+    }
+}
+
+// ── Rwalk (111) ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rwalk {
+    pub tag:   u16,
+    pub wqids: Vec<Qid>,
+}
+
+impl Rwalk {
+    pub fn encode(&self) -> Result<Vec<u8>, DecodeError> {
+        if self.wqids.len() > Twalk::MAX_WNAMES {
+            return Err(DecodeError::TooManyWnames);
+        }
+        let mut body = Vec::with_capacity(2 + self.wqids.len() * QID_LEN);
+        put_u16(&mut body, self.wqids.len() as u16);
+        for q in &self.wqids { q.encode_into(&mut body); }
+        Ok(frame(R_WALK, self.tag, &body))
+    }
+    pub fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
+        let h = Header::decode(buf)?;
+        if h.kind != R_WALK { return Err(DecodeError::BadType); }
+        let mut off = HEADER_LEN;
+        let n = take_u16(buf, &mut off)? as usize;
+        if n > Twalk::MAX_WNAMES { return Err(DecodeError::TooManyWnames); }
+        let mut wqids = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (q, used) = Qid::decode(&buf[off..])?;
+            off += used;
+            wqids.push(q);
+        }
+        Ok(Self { tag: h.tag, wqids })
+    }
+}
+
+// ── Rlopen (13) ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rlopen {
+    pub tag:    u16,
+    pub qid:    Qid,
+    pub iounit: u32,
+}
+
+impl Rlopen {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut body = Vec::with_capacity(QID_LEN + 4);
+        self.qid.encode_into(&mut body);
+        put_u32(&mut body, self.iounit);
+        frame(R_LOPEN, self.tag, &body)
+    }
+    pub fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
+        let h = Header::decode(buf)?;
+        if h.kind != R_LOPEN { return Err(DecodeError::BadType); }
+        let (qid, used) = Qid::decode(&buf[HEADER_LEN..])?;
+        let mut off = HEADER_LEN + used;
+        let iounit = take_u32(buf, &mut off)?;
+        Ok(Self { tag: h.tag, qid, iounit })
+    }
+}
+
+// ── Rread (117) ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rread {
+    pub tag:  u16,
+    pub data: Vec<u8>,
+}
+
+impl Rread {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut body = Vec::with_capacity(4 + self.data.len());
+        put_u32(&mut body, self.data.len() as u32);
+        body.extend_from_slice(&self.data);
+        frame(R_READ, self.tag, &body)
+    }
+    pub fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
+        let h = Header::decode(buf)?;
+        if h.kind != R_READ { return Err(DecodeError::BadType); }
+        let mut off = HEADER_LEN;
+        let count = take_u32(buf, &mut off)? as usize;
+        if buf.len() < off + count { return Err(DecodeError::Short); }
+        let mut data = Vec::with_capacity(count);
+        data.extend_from_slice(&buf[off..off + count]);
+        Ok(Self { tag: h.tag, data })
+    }
+}
+
+// ── Rclunk (121) ───────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rclunk { pub tag: u16 }
+
+impl Rclunk {
+    pub fn encode(&self) -> Vec<u8> {
+        frame(R_CLUNK, self.tag, &[])
+    }
+    pub fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
+        let h = Header::decode(buf)?;
+        if h.kind != R_CLUNK { return Err(DecodeError::BadType); }
+        Ok(Self { tag: h.tag })
+    }
+}

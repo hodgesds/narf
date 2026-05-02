@@ -18,7 +18,11 @@ pub use config::{
 };
 pub use fuse::{
     FuseInHeader, FuseOpcode, FUSE_IN_HEADER_LEN,
+    FuseOutHeader, FUSE_OUT_HEADER_LEN,
+    FuseInitIn, FuseInitOut,
+    FuseReadIn, FuseEntryOut,
     FUSE_GETATTR, FUSE_INIT, FUSE_LOOKUP, FUSE_READ, FUSE_RELEASE,
+    FUSE_ROOT_ID, FUSE_KERNEL_VERSION, FUSE_KERNEL_MINOR_VERSION,
 };
 
 extern crate alloc;
@@ -257,6 +261,103 @@ impl VirtioFsPci {
         let mut g = self.requestq.lock();
         if let Some(q) = g.as_mut() { q.free_chain(head); }
         Ok(out)
+    }
+
+    /// FUSE_INIT handshake. Sends a `fuse_init_in` carrying the
+    /// driver's protocol version and reads back the device's
+    /// `fuse_init_out`. Required first round-trip per FUSE wire docs.
+    pub fn fuse_init(&self, unique: u64) -> Result<FuseInitOut, VirtioPciError> {
+        let payload = FuseInitIn {
+            major: fuse::FUSE_KERNEL_VERSION,
+            minor: fuse::FUSE_KERNEL_MINOR_VERSION,
+            max_readahead: 0,
+            flags:         0,
+        }.encode();
+        let hdr = FuseInHeader::new(
+            FuseOpcode::Init, unique, /*nodeid=*/0, /*uid=*/0, /*gid=*/0,
+            /*pid=*/0, payload.len() as u32,
+        ).encode();
+        let mut req = Vec::with_capacity(hdr.len() + payload.len());
+        req.extend_from_slice(&hdr);
+        req.extend_from_slice(&payload);
+        let resp = self.submit_request(&req, 0x200)?;
+        if resp.len() < FUSE_OUT_HEADER_LEN {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        let oh = FuseOutHeader::decode(&resp)
+            .ok_or(VirtioPciError::DeviceRejectedFeatures)?;
+        if oh.error != 0 { return Err(VirtioPciError::DeviceRejectedFeatures); }
+        FuseInitOut::decode(&resp[FUSE_OUT_HEADER_LEN..])
+            .ok_or(VirtioPciError::DeviceRejectedFeatures)
+    }
+
+    /// FUSE_LOOKUP: look up `name` under `parent_nodeid`. The name
+    /// is passed as a NUL-terminated payload per FUSE wire docs.
+    /// Returns the entry's nodeid (the value the host assigns) or
+    /// `Err` if the name doesn't exist.
+    pub fn fuse_lookup(
+        &self,
+        unique:        u64,
+        parent_nodeid: u64,
+        name:          &[u8],
+    ) -> Result<FuseEntryOut, VirtioPciError> {
+        if name.is_empty() || name.contains(&0) {
+            return Err(VirtioPciError::QueueTooSmall);
+        }
+        let mut payload = Vec::with_capacity(name.len() + 1);
+        payload.extend_from_slice(name);
+        payload.push(0);
+        let hdr = FuseInHeader::new(
+            FuseOpcode::Lookup, unique, parent_nodeid,
+            /*uid=*/0, /*gid=*/0, /*pid=*/0,
+            payload.len() as u32,
+        ).encode();
+        let mut req = Vec::with_capacity(hdr.len() + payload.len());
+        req.extend_from_slice(&hdr);
+        req.extend_from_slice(&payload);
+        let resp = self.submit_request(&req, 0x200)?;
+        if resp.len() < FUSE_OUT_HEADER_LEN {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        let oh = FuseOutHeader::decode(&resp)
+            .ok_or(VirtioPciError::DeviceRejectedFeatures)?;
+        if oh.error != 0 { return Err(VirtioPciError::DeviceRejectedFeatures); }
+        FuseEntryOut::decode(&resp[FUSE_OUT_HEADER_LEN..])
+            .ok_or(VirtioPciError::DeviceRejectedFeatures)
+    }
+
+    /// FUSE_READ: read up to `size` bytes from a previously-opened
+    /// file handle `fh` at byte `offset`. Bounded by the response
+    /// scratch (≤ 4 KiB minus the 16-byte fuse_out_header).
+    pub fn fuse_read(
+        &self,
+        unique: u64,
+        nodeid: u64,
+        fh:     u64,
+        offset: u64,
+        size:   u32,
+    ) -> Result<Vec<u8>, VirtioPciError> {
+        let cap = size.min((0x1000 - FUSE_OUT_HEADER_LEN) as u32);
+        let payload = FuseReadIn {
+            fh, offset, size: cap,
+            read_flags: 0, lock_owner: 0, flags: 0, padding: 0,
+        }.encode();
+        let hdr = FuseInHeader::new(
+            FuseOpcode::Read, unique, nodeid,
+            /*uid=*/0, /*gid=*/0, /*pid=*/0,
+            payload.len() as u32,
+        ).encode();
+        let mut req = Vec::with_capacity(hdr.len() + payload.len());
+        req.extend_from_slice(&hdr);
+        req.extend_from_slice(&payload);
+        let resp = self.submit_request(&req, 0x1000)?;
+        if resp.len() < FUSE_OUT_HEADER_LEN {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        let oh = FuseOutHeader::decode(&resp)
+            .ok_or(VirtioPciError::DeviceRejectedFeatures)?;
+        if oh.error != 0 { return Err(VirtioPciError::DeviceRejectedFeatures); }
+        Ok(resp[FUSE_OUT_HEADER_LEN..].to_vec())
     }
 
     /// Drain hiprioq used ring (forget completions).

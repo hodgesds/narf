@@ -18,7 +18,7 @@ asks for. Updated when observable kernel behaviour changes.
   delivers hardware LAPIC-timer IRQs, exits cleanly.
 - `cargo xtask run --arch=aarch64` boots, runs the full async demo
   using CNTPCT_EL0 as the clock, exits via ARM semihosting.
-- `cargo xtask test --arch=x86_64` passes **558/0/21** (pass / fail / skip).
+- `cargo xtask test --arch=x86_64` passes **559/0/21** (pass / fail / skip).
 - `cargo xtask test --arch=aarch64` passes **292/0/10** (pass / fail / skip).
   Skips are x86_64-specific PCIe surfaces or live-device tests that
   skip cleanly when QEMU doesn't expose the device.
@@ -33,15 +33,16 @@ asks for. Updated when observable kernel behaviour changes.
 |------------------|--------------------------------------------------|
 | NVMe             | Admin queue + IDENTIFY CTRL + IDENTIFY NS + I/O queue + Read/Write + MSI-X-driven completions. |
 | virtio-blk-pci   | Polled + IRQ-driven Read/Write. MSI-X (q0). |
-| virtio-net-pci   | TX + RX (polled). |
-| virtio-rng-pci   | Structural probe. |
-| virtio-balloon-pci | Structural probe. |
+| virtio-net-pci   | RX + TX virtqueues; polled `tx`/`rx` + async `rx_irq_async` on receiveq MSI-X. |
+| virtio-rng-pci   | Live requestq + polled `read_bytes(out)` entropy fetch. |
+| virtio-balloon-pci | Live inflate + deflate queues + `inflate(pfns)` / `deflate(pfns)` polled, ≤1024 PFNs / call. |
+| virtio-snd-pci   | Live controlq + tx + rx + eventq; `set_params` / `prepare` / `start` + `play_buffer` / `play_buffer_phys` PCM submit. |
+| virtio-9p-pci    | Live requestq + 9P2000.L `tversion` / `tattach` / `twalk` / `tlopen` / `tread` / `tclunk` live ops + R-side decoders + MSI-X (requestq). |
+| virtio-fs-pci    | Live hiprio + request[0] queues; FUSE submit + `fuse_init` / `fuse_lookup` / `fuse_read` helpers + MSI-X (request[0]). |
 | virtio-console-pci | Modern + legacy match (1AF4:1043 / 1003). receiveq + transmitq + `ConsoleConfig` (cols/rows/emerg_wr) + `ControlEvent` decode. `write_bytes` / `read_bytes`. MSI-X (receiveq). |
 | virtio-iommu-pci | PCI match (1AF4:1057). Live requestq + eventq, attach/detach/map/unmap with §5.16.6 tail-status. MSI-X (requestq). |
 | virtio-scsi-pci  | PCI match (1AF4:1048). Live controlq + eventq + cmdq[0]; `submit_cmd` + `submit_tmf` + REPORT LUNS helper. MSI-X (cmdq[0]). |
 | virtio-vsock-pci | PCI match (1AF4:1053). Live rx + tx + event queues; `VsockHdr` builders, `send` / `recv` / `drain_events`. MSI-X (rx). |
-| virtio-fs-pci    | PCI match (1AF4:105A). Live hiprio + request[0] queues; FUSE-on-virtio header builders + `submit_request`. MSI-X (request[0]). |
-| virtio-9p-pci    | Legacy PCI match (1AF4:1009). Live requestq; 9P2000.L builders (Tversion/Tattach/Twalk/Tlopen/Tread/Tclunk) + `Rversion` + `tversion` handshake helper. MSI-X (requestq). |
 | virtio-gpu-pci   | Modern + legacy match (1AF4:1050 / 1010). controlq + cursorq, 2D pipeline (`init_scanout` / `paint_solid` / `paint_test_pattern` / `flush`). MSI-X (controlQ). |
 | virtio-input-pci | PCI match (1AF4:1052). eventQ drain → `narf_input` (KEY + REL events). MSI-X (eventQ). |
 | e1000 / e1000e   | Real Intel NIC (8254x + 8257x family). TX + RX.   |
