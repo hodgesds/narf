@@ -44,8 +44,13 @@ use crate::{
     VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FEATURES_OK,
 };
 
-pub const VIRTIO_GPU_PCI_VENDOR: u16 = 0x1AF4;
-pub const VIRTIO_GPU_PCI_DEVICE: u16 = 0x1050;
+pub const VIRTIO_GPU_PCI_VENDOR:        u16 = 0x1AF4;
+/// Modern transitional virtio-gpu — `0x1040 + virtio_device_id` (16).
+pub const VIRTIO_GPU_PCI_DEVICE:        u16 = 0x1050;
+/// Legacy (transitional) virtio-gpu (VirtIO 1.2 §4.1.2 transitional ids).
+pub const VIRTIO_GPU_PCI_DEVICE_LEGACY: u16 = 0x1010;
+
+mod tests;
 
 // Command codes (VirtIO 1.2 §5.7.6).
 const CMD_GET_DISPLAY_INFO:    u32 = 0x0100;
@@ -577,6 +582,14 @@ pub fn register_pci_driver() {
         kind: narf_bus::MatchKind::VendorDevice {
             vendor: VIRTIO_GPU_PCI_VENDOR,
             device: VIRTIO_GPU_PCI_DEVICE,
+        },
+        probe,
+    });
+    narf_bus::register_pci_driver(narf_bus::PciMatch {
+        name: "virtio-gpu-pci-legacy",
+        kind: narf_bus::MatchKind::VendorDevice {
+            vendor: VIRTIO_GPU_PCI_VENDOR,
+            device: VIRTIO_GPU_PCI_DEVICE_LEGACY,
         },
         probe,
     });
