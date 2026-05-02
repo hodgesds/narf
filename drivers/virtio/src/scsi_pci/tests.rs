@@ -104,3 +104,22 @@ fn smoke_virtio_scsi_pci_report_luns_roundtrip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/virtio/scsi_pci", smoke_virtio_scsi_pci_report_luns_roundtrip);
+
+fn smoke_virtio_scsi_pci_live_report_luns() -> TestResult {
+    use crate::scsi_pci;
+    if !scsi_pci::is_probed() {
+        return TestResult::Skip("no virtio-scsi-pci device on this run");
+    }
+    let r = scsi_pci::with_controller(|c| c.report_luns(0, 256));
+    match r {
+        Some(Ok((resp, _data))) => {
+            // CHECK CONDITION (status=0x02) is acceptable when no
+            // disk is attached at target 0; we just want a response.
+            let _ = resp;
+            TestResult::Pass
+        }
+        Some(Err(_))  => TestResult::Fail("submit_cmd returned err"),
+        None          => TestResult::Skip("controller missing"),
+    }
+}
+kernel_test_in!("drivers/virtio/scsi_pci", smoke_virtio_scsi_pci_live_report_luns);
