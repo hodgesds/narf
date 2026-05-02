@@ -1,6 +1,32 @@
 # drivers/gpu/amdgpu — Specification
 
-> Status: **v0.8** (Stage 8 — PPTable subtables + ATOMBIOS command directory + RLC autoload).
+> Status: **v0.9** (Stage 9 — GPIO pin LUT + encoder caps + DP link-rate fallback).
+>
+> ### v0.9 changes vs v0.8
+>
+> - **`ATOM_GPIO_PIN_LUT` walker** (`amdgpu_atom_gpiopin`):
+>   data-table id `0x16`. Iterates per-board GPIO pin
+>   assignments — DDC SCL / SDA, hot-plug-detect,
+>   panel-power, backlight-PWM, fan-tach. `GpioPinLut::find(GpioId)`
+>   short-cuts the most common lookup ("give me the DDC SCL pin
+>   for this board"). The `GpioId` enum models the documented
+>   `ATOM_GPIO_PINID_*` constants and falls through to
+>   `Other(u16)` for unknown ids.
+> - **Encoder-cap walker** (`amdgpu_atom_encoder_caps`): iterator
+>   over the TLV records appended past each display-object
+>   path's object chain (HPD ID / I²C ID / connector device /
+>   encoder caps / DP channel mapping / END sentinel).
+>   `find_encoder_caps(tail)` decodes the `usEncoderCap` bitmap
+>   into typed booleans (HBR2 / HBR3 / 10-bpc / YCbCr 4:2:0
+>   support). Pairs with the path-iterator landed in v0.7.
+> - **DP link-rate fallback policy** (`dp_link_training`
+>   extension): `run_with_fallback(aux, initial_bw,
+>   initial_lanes, delay_us)` walks the documented DP §3.5.4
+>   fallback ladder (HBR3 → HBR2 → HBR → RBR; halve lane count
+>   only after RBR fails). Returns the `(link_bw_set,
+>   lane_count)` that succeeded. `LinkRate::next_lower` exposes
+>   the ladder for callers that want to do their own retry
+>   policy.
 >
 > ### v0.8 changes vs v0.7
 >

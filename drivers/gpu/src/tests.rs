@@ -1097,3 +1097,177 @@ fn smoke_amdgpu_rlc_header_and_autoload_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu", smoke_amdgpu_rlc_header_and_autoload_round_trip);
+
+fn smoke_amdgpu_atom_gpio_pin_lut_round_trip() -> TestResult {
+    use crate::amdgpu_atom_gpiopin::{GpioId, GpioPinLut};
+    // Synthetic LUT: header + 4 pin assignments
+    //   pin 0: DDC SCL (id 0x0A) on byte 0x10 mask 0x01
+    //   pin 1: DDC SDA (0x0B)    on byte 0x11 mask 0x02
+    //   pin 2: HPD     (0x01)    on byte 0x20 mask 0x10
+    //   pin 3: Backlight (0x03)  on byte 0x40 mask 0x80
+    let mut t = alloc::vec::Vec::new();
+    t.resize(4 + 4 * 8, 0u8);
+    t[0..2].copy_from_slice(&((4u16 + 4 * 8).to_le_bytes()));
+    t[2] = 1; t[3] = 0;
+    let pins = [
+        (0x000Au16, 0u8, 1u8, 0x10u8, 0x01u8),
+        (0x000Bu16, 0u8, 1u8, 0x11u8, 0x02u8),
+        (0x0001u16, 1u8, 0u8, 0x20u8, 0x10u8),
+        (0x0003u16, 2u8, 1u8, 0x40u8, 0x80u8),
+    ];
+    for (i, (id, idx, ty, off, mask)) in pins.iter().enumerate() {
+        let p = 4 + i * 8;
+        t[p..p + 2].copy_from_slice(&id.to_le_bytes());
+        t[p + 2] = *idx;
+        t[p + 3] = *ty;
+        t[p + 4] = *off;
+        t[p + 5] = *mask;
+    }
+    let mut lut = match GpioPinLut::parse(&t) {
+        Ok(l)  => l,
+        Err(_) => return TestResult::Fail("LUT parse rejected"),
+    };
+    if lut.pin_count() != 4 {
+        return TestResult::Fail("pin_count != 4");
+    }
+    let scl = lut.find(GpioId::DdcScl).expect("DDC SCL");
+    if scl.gpio_byte_offset != 0x10 || scl.gpio_mask != 0x01 {
+        return TestResult::Fail("DDC SCL byte/mask");
+    }
+    let sda = lut.find(GpioId::DdcSda).expect("DDC SDA");
+    if sda.gpio_byte_offset != 0x11 || sda.gpio_mask != 0x02 {
+        return TestResult::Fail("DDC SDA byte/mask");
+    }
+    let hpd = lut.find(GpioId::Hpd).expect("HPD");
+    if hpd.pin_type != 0 {
+        return TestResult::Fail("HPD pin_type != 0 (input)");
+    }
+    if lut.find(GpioId::PanelPower).is_some() {
+        return TestResult::Fail("PanelPower should be absent");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu", smoke_amdgpu_atom_gpio_pin_lut_round_trip);
+
+fn smoke_amdgpu_encoder_caps_record_iter() -> TestResult {
+    use crate::amdgpu_atom_encoder_caps::{
+        find_encoder_caps, RecordIter,
+        ATOM_RECORD_TYPE_HPD_INT_ID, ATOM_RECORD_TYPE_ENCODER_CAP,
+        ATOM_RECORD_TYPE_END,
+    };
+    // Build a TLV tail with three records:
+    //   HPD_INT_ID (kind 1, len 4) — payload "AB"
+    //   ENCODER_CAP (kind 6, len 4) — caps = HBR2|HBR3|10bpc = 0x0B
+    //   END (kind 0xFF, len 2) — sentinel
+    let mut tail = alloc::vec::Vec::new();
+    tail.extend_from_slice(&[ATOM_RECORD_TYPE_HPD_INT_ID, 4, b'A', b'B']);
+    tail.extend_from_slice(&[ATOM_RECORD_TYPE_ENCODER_CAP, 4, 0x0B, 0x00]);
+    tail.extend_from_slice(&[ATOM_RECORD_TYPE_END, 2]);
+    // Iterator should yield 2 records (HPD + caps), stopping at END.
+    let count = RecordIter::new(&tail).count();
+    if count != 2 {
+        return TestResult::Fail("expected 2 records before END");
+    }
+    let caps = match find_encoder_caps(&tail) {
+        Ok(Some(c)) => c,
+        Ok(None)    => return TestResult::Fail("encoder caps record not found"),
+        Err(_)      => return TestResult::Fail("decode error"),
+    };
+    if !caps.supports_hbr2() || !caps.supports_hbr3() {
+        return TestResult::Fail("HBR2/HBR3 bits");
+    }
+    if !caps.supports_10bpc() {
+        return TestResult::Fail("10bpc bit");
+    }
+    if caps.supports_ycbcr420() {
+        return TestResult::Fail("YCbCr420 bit unexpectedly set");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu", smoke_amdgpu_encoder_caps_record_iter);
+
+fn smoke_dp_link_training_fallback_walks_ladder() -> TestResult {
+    // StubAux that fails CR at HBR3 + HBR2 + HBR, succeeds at
+    // RBR (1.62 Gbps). The fallback policy should walk down the
+    // ladder and return Trained at the right link_bw_set.
+    use crate::dp_aux::{
+        AuxChannel, AuxCommand, AuxError, AuxRequest, AuxResponse, AuxStatus,
+    };
+    use crate::dp_link_training::{run_with_fallback, LinkRate};
+
+    struct StubAux {
+        current_bw: u8,
+        cr_polls: u32,
+        eq_polls: u32,
+    }
+    impl AuxChannel for StubAux {
+        fn transact<'a>(
+            &mut self,
+            req: &AuxRequest<'_>,
+            reply_buf: &'a mut [u8],
+        ) -> Result<AuxResponse<'a>, AuxError> {
+            match req.cmd {
+                AuxCommand::NativeWrite => {
+                    // The very first write per training round is
+                    // LINK_BW_SET; capture it so the read-side
+                    // can decide whether to ACK CR.
+                    if req.address == 0x0_0100 && !req.data.is_empty() {
+                        self.current_bw = req.data[0];
+                        self.cr_polls = 0;
+                        self.eq_polls = 0;
+                    }
+                    reply_buf[0] = 0;
+                    Ok(AuxResponse { status: AuxStatus::Ack, data: &reply_buf[1..1] })
+                }
+                AuxCommand::NativeRead => {
+                    let v = match req.address {
+                        0x0_0202 => {
+                            // Fail CR at every rate above RBR.
+                            // "Fail" = lane status nibble that
+                            // reports CR_DONE = 0 forever, so the
+                            // CR loop exhausts retries.
+                            self.cr_polls += 1;
+                            if self.current_bw == LinkRate::Rbr as u8 {
+                                if self.cr_polls < 2 { 0x00 }
+                                else if self.eq_polls == 0 { 0x11 } // both lanes CR
+                                else { 0x77 }                       // EQ done
+                            } else {
+                                0x00 // lanes never report CR_DONE → CR fails
+                            }
+                        }
+                        0x0_0203 => 0x00,
+                        0x0_0204 => {
+                            self.eq_polls += 1;
+                            if self.current_bw == LinkRate::Rbr as u8
+                                && self.eq_polls >= 2
+                            {
+                                1
+                            } else { 0 }
+                        }
+                        _ => 0,
+                    };
+                    reply_buf[0] = 0;
+                    reply_buf[1] = v;
+                    Ok(AuxResponse {
+                        status: AuxStatus::Ack,
+                        data: &reply_buf[1..2],
+                    })
+                }
+                _ => Err(AuxError::UnknownStatus),
+            }
+        }
+    }
+    let mut aux = StubAux { current_bw: 0, cr_polls: 0, eq_polls: 0 };
+    let result = match run_with_fallback(&mut aux, LinkRate::Hbr3, 2, |_| {}) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("fallback driver surfaced AUX error"),
+    };
+    if result.link_bw_set != LinkRate::Rbr as u8 {
+        return TestResult::Fail("fallback didn't bottom out at RBR");
+    }
+    if result.lane_count != 2 {
+        return TestResult::Fail("lane count shouldn't have been halved");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu", smoke_dp_link_training_fallback_walks_ladder);

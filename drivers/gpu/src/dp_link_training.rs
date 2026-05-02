@@ -100,6 +100,87 @@ pub struct TrainingParams {
     pub lane_count:  u8,
 }
 
+/// DP link-rate codes per DPCD §3.3.5. Ordered low → high so
+/// `LinkRate::next_lower` walks the documented fallback ladder.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum LinkRate {
+    /// 1.62 Gbps per lane — RBR (Reduced Bit Rate). Mandatory
+    /// floor; DP 1.0 baseline.
+    Rbr  = 0x06,
+    /// 2.7 Gbps — HBR.
+    Hbr  = 0x0A,
+    /// 5.4 Gbps — HBR2.
+    Hbr2 = 0x14,
+    /// 8.1 Gbps — HBR3.
+    Hbr3 = 0x1E,
+}
+
+impl LinkRate {
+    pub fn from_dpcd_byte(v: u8) -> Option<Self> {
+        match v {
+            0x06 => Some(LinkRate::Rbr),
+            0x0A => Some(LinkRate::Hbr),
+            0x14 => Some(LinkRate::Hbr2),
+            0x1E => Some(LinkRate::Hbr3),
+            _    => None,
+        }
+    }
+    /// One step lower on the fallback ladder. RBR has no lower
+    /// step → `None` (caller's training has truly failed).
+    pub fn next_lower(self) -> Option<Self> {
+        match self {
+            LinkRate::Hbr3 => Some(LinkRate::Hbr2),
+            LinkRate::Hbr2 => Some(LinkRate::Hbr),
+            LinkRate::Hbr  => Some(LinkRate::Rbr),
+            LinkRate::Rbr  => None,
+        }
+    }
+}
+
+/// Drive link training with the documented DP §3.5.4 fallback
+/// policy: on `Failed`, fall to the next-lower link rate and
+/// retry. If RBR fails too, halve the lane count and retry from
+/// the highest rate. Returns the parameters that succeeded
+/// (caller programs DCN with these), or `Failed` after the full
+/// ladder bottoms out.
+pub fn run_with_fallback<A: AuxChannel>(
+    aux:        &mut A,
+    initial_bw: LinkRate,
+    initial_lanes: u8,
+    delay_us:   impl Fn(u32) + Copy,
+) -> Result<TrainingParams, AuxError> {
+    let mut bw    = initial_bw;
+    let mut lanes = match initial_lanes { 1 | 2 | 4 => initial_lanes, _ => return Ok(TrainingParams { link_bw_set: bw as u8, lane_count: 0 }) };
+    loop {
+        let params = TrainingParams {
+            link_bw_set: bw as u8,
+            lane_count:  lanes,
+        };
+        match run(aux, params, delay_us)? {
+            TrainingState::Trained => return Ok(params),
+            _ => {
+                // Step down link rate first.
+                if let Some(lower) = bw.next_lower() {
+                    bw = lower;
+                    continue;
+                }
+                // Bottom of rate ladder. Halve lane count and
+                // restart from the original rate.
+                if lanes > 1 {
+                    lanes /= 2;
+                    bw = initial_bw;
+                    continue;
+                }
+                // Single lane at RBR has nowhere lower to go.
+                return Ok(TrainingParams {
+                    link_bw_set: 0, lane_count: 0,
+                });
+            }
+        }
+    }
+}
+
 /// Drives the link-training state machine to completion. Returns
 /// `Trained` on success, `Failed` on permanent failure.
 ///
