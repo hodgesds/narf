@@ -32,6 +32,10 @@ use alloc::vec::Vec;
 use crate::xhci::{self, Xhci, EndpointConfig, EndpointKind};
 use narf_lib::sync::IrqSafeSpinLock;
 
+/// Maximum payload (in target blocks) we'll cram into a single
+/// READ(10) / WRITE(10). Bounded by the bulk transfer scratch.
+pub const MSC_MAX_BLOCKS_PER_XFER: u16 = 8;
+
 // USB class triple identifying a Mass Storage device with the SCSI
 // transparent command set + Bulk-Only Transport (§4.0 of the BOT
 // spec; §3.1 of the parent MSC spec). These show up in the
@@ -341,4 +345,131 @@ impl MscDevice {
         if n != data.len() { return Err(MscError::BadLength); }
         Ok(())
     }
+
+    /// Multi-block `READ(10)`. Reads `nblocks` consecutive blocks
+    /// starting at `lba`. Bounded to `MSC_MAX_BLOCKS_PER_XFER` per
+    /// call. Returns the concatenated payload.
+    pub fn read_blocks(
+        &self,
+        xhci:    &Xhci,
+        lba:     u32,
+        nblocks: u16,
+    ) -> Result<Vec<u8>, MscError> {
+        if self.lba_bytes == 0
+            || nblocks == 0
+            || nblocks > MSC_MAX_BLOCKS_PER_XFER
+        {
+            return Err(MscError::BadLength);
+        }
+        let total = self.lba_bytes as usize * nblocks as usize;
+        let lba_be = lba.to_be_bytes();
+        let nb     = nblocks.to_be_bytes();
+        let cb = [
+            SCSI_READ_10, 0,
+            lba_be[0], lba_be[1], lba_be[2], lba_be[3],
+            0, nb[0], nb[1], 0,
+        ];
+        let mut out: Vec<u8> = alloc::vec![0u8; total];
+        let n = self.cmd_data_in(xhci, &cb, &mut out[..])?;
+        if n != total { return Err(MscError::BadLength); }
+        Ok(out)
+    }
+
+    /// Multi-block `WRITE(10)`. Writes `nblocks` blocks starting at
+    /// `lba`. `data.len()` must equal `nblocks * lba_bytes`.
+    pub fn write_blocks(
+        &self,
+        xhci:    &Xhci,
+        lba:     u32,
+        nblocks: u16,
+        data:    &[u8],
+    ) -> Result<(), MscError> {
+        if self.lba_bytes == 0
+            || nblocks == 0
+            || nblocks > MSC_MAX_BLOCKS_PER_XFER
+            || data.len() != self.lba_bytes as usize * nblocks as usize
+        {
+            return Err(MscError::BadLength);
+        }
+        let lba_be = lba.to_be_bytes();
+        let nb     = nblocks.to_be_bytes();
+        let cb = [
+            SCSI_WRITE_10, 0,
+            lba_be[0], lba_be[1], lba_be[2], lba_be[3],
+            0, nb[0], nb[1], 0,
+        ];
+        let n = self.cmd_data_out(xhci, &cb, data)?;
+        if n != data.len() { return Err(MscError::BadLength); }
+        Ok(())
+    }
 }
+
+// ── Hot-plug enumeration ──────────────────────────────────────────
+
+/// System-wide registry of attached USB Mass Storage devices.
+/// Populated by `enumerate_and_attach_msc`; consumed by the
+/// `block::BlockDeviceSync` adapter once one is wired up.
+static MSC_DEVICES: IrqSafeSpinLock<Vec<MscDevice>> =
+    IrqSafeSpinLock::new(Vec::new());
+
+/// Walk every connected port on the supplied xHCI controller and
+/// try to bring up an MSC BOT device on each one. Per-port flow
+/// mirrors the HID keyboard path: port_reset → enable_slot →
+/// address_device → fetch CONFIG → `find_bot_endpoints` →
+/// configure_endpoints → `MscDevice::attach` (which also issues
+/// READ CAPACITY(10)).
+///
+/// Returns the count of devices successfully attached. Per-port
+/// failures are skipped silently.
+pub fn enumerate_and_attach_msc(xhci_dev: &Xhci) -> usize {
+    let mut attached = 0usize;
+    for (port, _portsc) in xhci_dev.connected_ports() {
+        if try_attach_msc_port(xhci_dev, port).is_ok() { attached += 1; }
+    }
+    attached
+}
+
+fn try_attach_msc_port(xhci_dev: &Xhci, port: u8) -> Result<(), MscError> {
+    xhci_dev.port_reset(port).map_err(MscError::Xhci)?;
+    let speed = xhci_dev.port_speed(port)
+        .ok_or(MscError::EndpointsMissing)?;
+    let slot_id = xhci_dev.enable_slot().map_err(MscError::Xhci)?;
+    xhci_dev.address_device(slot_id, port, speed).map_err(MscError::Xhci)?;
+
+    // Read 9-byte cfg header for wTotalLength.
+    let mut head = [0u8; 9];
+    let n = xhci_dev.get_config_descriptor(slot_id, 0, &mut head)?;
+    if n < 9 { return Err(MscError::NotMsc); }
+    let total = u16::from_le_bytes([head[2], head[3]]) as usize;
+    if total < 9 || total > 4096 { return Err(MscError::NotMsc); }
+
+    // Pull the full descriptor tree.
+    let mut full = alloc::vec![0u8; total];
+    let n2 = xhci_dev.get_config_descriptor(slot_id, 0, &mut full)?;
+    if n2 < total { full.truncate(n2); }
+
+    let (ep_in, ep_out) = find_bot_endpoints(&full)?;
+    xhci_dev.configure_endpoints(slot_id, &[ep_in, ep_out])
+        .map_err(MscError::Xhci)?;
+
+    let bulk_in_dci  = ((ep_in.ep_addr  & 0x0F) * 2) + 1;
+    let bulk_out_dci = ((ep_out.ep_addr & 0x0F) * 2) + 0;
+    let dev = MscDevice::attach(xhci_dev, slot_id, bulk_in_dci, bulk_out_dci)?;
+    MSC_DEVICES.lock().push(dev);
+    Ok(())
+}
+
+/// Number of MSC devices currently bound.
+pub fn attached_msc_count() -> usize { MSC_DEVICES.lock().len() }
+
+/// Run a closure against an attached MSC device by index; returns
+/// `None` if `idx` is out of range. The closure runs while the
+/// global registry is locked, so don't perform xHCI traffic that
+/// re-enters MSC bookkeeping.
+pub fn with_device<R>(idx: usize, f: impl FnOnce(&MscDevice) -> R) -> Option<R> {
+    let g = MSC_DEVICES.lock();
+    g.get(idx).map(f)
+}
+
+#[doc(hidden)]
+pub fn __reset_msc_for_test() { MSC_DEVICES.lock().clear(); }

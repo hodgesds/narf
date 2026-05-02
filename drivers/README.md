@@ -55,9 +55,11 @@ device to the highest-specificity matching probe.
 | `narf-drivers-net` (r8169)       | 0x10EC : RTL8169 family | clean-room TX + RX descriptor ring + MSI-X |
 | `narf-drivers-net` (rtl8125)     | 0x10EC : 0x8125 / 0x3000 | clean-room PCI match + reset + MAC decode + TX descriptor layout |
 | `narf-drivers-net` (iwlwifi)     | 0x8086 : AX200/AX201/AX210/AX211 | structural probe only — operational register map blocked on public docs |
-| `narf-drivers-storage` (AHCI)    | 0x8086 : 0x2922 (ICH9), 0x3A22 (ICH10)  | HBA reset + port enumeration + IDENTIFY DEVICE + READ/WRITE DMA EXT |
+| `narf-drivers-storage` (AHCI)    | 0x8086 : 0x2922 (ICH9), 0x3A22 (ICH10)  | HBA reset + port enumeration + IDENTIFY DEVICE + READ/WRITE DMA EXT + READ/WRITE FPDMA QUEUED (NCQ) + port-multiplier topology snapshot |
 | `narf-drivers-usb` (xHCI)        | QEMU + AMD Phoenix VID/DIDs | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT |
 | `narf-drivers-usb` (HID kbd)     | xHCI hot-plug | Set Protocol(Boot) → interrupt-IN polling → Usage 0x07 → KeyCode press/release diff → `narf_input` |
+| `narf-drivers-usb` (Mass Storage)| xHCI hot-plug, USB class 08:06:50 | enumerate-and-attach → CBW/CSW Bulk-Only Transport → INQUIRY / READ CAPACITY(10) / READ(10) / WRITE(10) + multi-block read/write up to 8 LBAs/xfer |
+| `narf-audio` (Intel HDA)         | 0x1022:0x15E3 (AMD Phoenix), 0x1002:0x1640 (Radeon) | BAR0 + GCTL.CRST + CORB/RIRB rings + STATESTS codec walk + Get Parameter verbs + output stream descriptor + BDL + cyclic period buffer + 48 kHz S16LE stereo + `start_output` / `load_period` / `load_sine_test_tone` for audible playback |
 | `narf-firmware-fw-cfg`           | x86_64 PIO 0x510/0x511 | QEMU `fw_cfg` directory parse + `find` / `read` / `read_string` |
 
 ## Bus-level helpers each driver builds on

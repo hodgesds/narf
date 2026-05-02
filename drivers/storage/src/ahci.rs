@@ -636,6 +636,235 @@ pub unsafe fn ahci_read_lba(
     Ok(())
 }
 
+/// Issue ATA `READ FPDMA QUEUED` (NCQ, opcode 0x60) for a single
+/// outstanding command on slot `tag` (0..31), reading `n_sectors`
+/// 512-byte sectors at `lba`. Polled completion on PORT_CI bit
+/// `tag` clearing. Same single-page scratch shape as the non-NCQ
+/// variants.
+///
+/// NCQ wire-form differs from READ DMA EXT (§7.21 of ATA8-ACS): the
+/// "sector count" register holds the tag (bits[7:3]) instead of the
+/// xfer length, and the xfer length lives in the features register.
+/// Tag-zero scheduling ("priority 0, normal") is used here.
+///
+/// `pmp` is the port-multiplier port number (0 for direct-attach).
+///
+/// # Safety
+/// Same as `ahci_read_lba`. Caller asserts `tag < 32`.
+pub unsafe fn ahci_read_lba_ncq(
+    ahci:      &Ahci,
+    port_idx:  u8,
+    pmp:       u8,
+    tag:       u8,
+    lba:       u64,
+    n_sectors: u16,
+    out:       &mut [u8],
+) -> Result<(), AhciError> {
+    if tag >= 32 || n_sectors == 0 || (n_sectors as usize) * 512 > 4096
+        || out.len() < (n_sectors as usize) * 512 {
+        return Err(AhciError::BarMapFailed);
+    }
+    // SAFETY: caller-asserted.
+    unsafe { ahci_lba_ncq(ahci, port_idx, pmp, tag, /*write=*/false,
+        lba, n_sectors, out, &[]) }
+}
+
+/// Issue ATA `WRITE FPDMA QUEUED` (NCQ, opcode 0x61). Mirror of
+/// `ahci_read_lba_ncq` for outbound transfers.
+///
+/// # Safety
+/// Same as `ahci_write_lba`.
+pub unsafe fn ahci_write_lba_ncq(
+    ahci:      &Ahci,
+    port_idx:  u8,
+    pmp:       u8,
+    tag:       u8,
+    lba:       u64,
+    n_sectors: u16,
+    data:      &[u8],
+) -> Result<(), AhciError> {
+    if tag >= 32 || n_sectors == 0 || (n_sectors as usize) * 512 > 4096
+        || data.len() < (n_sectors as usize) * 512 {
+        return Err(AhciError::BarMapFailed);
+    }
+    let mut sink = [0u8; 0];
+    // SAFETY: caller-asserted.
+    unsafe { ahci_lba_ncq(ahci, port_idx, pmp, tag, /*write=*/true,
+        lba, n_sectors, &mut sink, data) }
+}
+
+unsafe fn ahci_lba_ncq(
+    ahci:      &Ahci,
+    port_idx:  u8,
+    pmp:       u8,
+    tag:       u8,
+    write:     bool,
+    lba:       u64,
+    n_sectors: u16,
+    out:       &mut [u8],
+    data_in:   &[u8],
+) -> Result<(), AhciError> {
+    let off = PORT_BASE_OFF + (port_idx as u64) * PORT_STRIDE;
+    // SAFETY: caller-asserted.
+    let _ = unsafe { ahci.port_idle(port_idx) };
+
+    let scratch = alloc_coherent(4096, DomainId::DRIVER_0)
+        .map_err(|_| AhciError::BarMapFailed)?;
+    let base = scratch.phys_addr().raw();
+    let cmd_list = base + 0x000;
+    let fis_recv = base + 0x400;
+    let cmd_tbl  = base + 0x500;
+    let data_buf = base + 0x600;
+    // Zero scratch + (for writes) copy caller payload in.
+    // SAFETY: identity-mapped DMA.
+    unsafe {
+        for i in 0..0x600 {
+            core::ptr::write_volatile((base + i as u64) as *mut u8, 0);
+        }
+        if write {
+            for i in 0..(n_sectors as usize) * 512 {
+                core::ptr::write_volatile(
+                    (data_buf + i as u64) as *mut u8, data_in[i]);
+            }
+        }
+    }
+
+    // Cmd-list slot for `tag`. Each command-header is 32 bytes; we
+    // only program slot `tag` so seek to its base.
+    let slot = cmd_list + (tag as u64) * 32;
+    // CFL = 5 (H2D FIS = 5 DWORDs), W bit = 1 if writing, P bit
+    // (prefetchable) = 0 for NCQ. PRDT length = 1.
+    let header_w0 = (1u32 << 16) | (if write { 1u32 << 6 } else { 0 }) | 5;
+    // SAFETY: identity-mapped DMA.
+    unsafe {
+        core::ptr::write_volatile(slot as *mut u32, header_w0);
+        core::ptr::write_volatile((slot + 4)  as *mut u32, 0);
+        core::ptr::write_volatile((slot + 8)  as *mut u64, cmd_tbl);
+    }
+
+    // CFIS H2D (FIS type 0x27) for FPDMA QUEUED:
+    //   +0  type = 0x27
+    //   +1  bit 7 = C (command), bits[3:0] = PMP target
+    //   +2  command = 0x60 (READ) or 0x61 (WRITE)
+    //   +3  features (low) = sector count low
+    //   +4..7 LBA[23..0] + Device (0x40 = LBA)
+    //   +8..10 LBA[47..24]
+    //   +11 features (high) = sector count high
+    //   +12 sector_count register = (tag << 3) | priority
+    //   +13 0 (auxiliary)
+    //   +14 ICC = 0
+    //   +15 Control = 0
+    let opcode = if write { 0x61u8 } else { 0x60u8 };
+    let sec_lo = (n_sectors & 0xFF) as u8;
+    let sec_hi = ((n_sectors >> 8) & 0xFF) as u8;
+    // SAFETY: identity-mapped DMA.
+    unsafe {
+        core::ptr::write_volatile(cmd_tbl as *mut u8, 0x27);
+        core::ptr::write_volatile((cmd_tbl + 1) as *mut u8, 0x80 | (pmp & 0x0F));
+        core::ptr::write_volatile((cmd_tbl + 2) as *mut u8, opcode);
+        core::ptr::write_volatile((cmd_tbl + 3) as *mut u8, sec_lo);
+        core::ptr::write_volatile((cmd_tbl + 4)  as *mut u8, (lba & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 5)  as *mut u8, ((lba >> 8)  & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 6)  as *mut u8, ((lba >> 16) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 7)  as *mut u8, 0x40);
+        core::ptr::write_volatile((cmd_tbl + 8)  as *mut u8, ((lba >> 24) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 9)  as *mut u8, ((lba >> 32) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 10) as *mut u8, ((lba >> 40) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 11) as *mut u8, sec_hi);
+        core::ptr::write_volatile((cmd_tbl + 12) as *mut u8, tag << 3);
+    }
+    let prdt = cmd_tbl + 0x80;
+    let bytes = (n_sectors as u32) * 512;
+    // SAFETY: same.
+    unsafe {
+        core::ptr::write_volatile(prdt as *mut u64, data_buf);
+        core::ptr::write_volatile((prdt + 8) as *mut u32, 0);
+        core::ptr::write_volatile((prdt + 12) as *mut u32, bytes - 1);
+    }
+
+    // SAFETY: identity-mapped MMIO.
+    unsafe {
+        ahci.mmio.write32(off + 0x00, cmd_list as u32);
+        ahci.mmio.write32(off + 0x04, (cmd_list >> 32) as u32);
+        ahci.mmio.write32(off + 0x08, fis_recv as u32);
+        ahci.mmio.write32(off + 0x0C, (fis_recv >> 32) as u32);
+        let serr = ahci.mmio.read32(off + PORT_SERR);
+        ahci.mmio.write32(off + PORT_SERR, serr);
+        ahci.mmio.write32(off + 0x10, 0xFFFF_FFFF);
+        let cmd = ahci.mmio.read32(off + PORT_CMD);
+        ahci.mmio.write32(off + PORT_CMD, cmd | CMD_FRE);
+        let cmd = ahci.mmio.read32(off + PORT_CMD);
+        ahci.mmio.write32(off + PORT_CMD, cmd | CMD_ST);
+    }
+
+    // Set PORT_SACT bit `tag` BEFORE PORT_CI to mark this command
+    // queued (NCQ requirement, AHCI 1.3.1 §5.3.13).
+    compiler_fence(Ordering::SeqCst);
+    let bit = 1u32 << tag;
+    // SAFETY: same.
+    unsafe {
+        ahci.mmio.write32(off + 0x34, bit);  // PORT_SACT
+        ahci.mmio.write32(off + 0x38, bit);  // PORT_CI
+    }
+
+    let mut ok = false;
+    for _ in 0..10_000_000u32 {
+        // SAFETY: same.
+        let ci  = unsafe { ahci.mmio.read32(off + 0x38) };
+        // SAFETY: same.
+        let tfd = unsafe { ahci.mmio.read32(off + 0x20) };
+        if tfd & 0x01 != 0 { return Err(AhciError::ResetTimeout); }
+        if ci & bit == 0 { ok = true; break; }
+        core::hint::spin_loop();
+    }
+    if !ok { return Err(AhciError::ResetTimeout); }
+
+    // For reads, copy back.
+    if !write {
+        // SAFETY: identity-mapped DMA.
+        for i in 0..(n_sectors as usize) * 512 {
+            out[i] = unsafe {
+                core::ptr::read_volatile((data_buf + i as u64) as *const u8)
+            };
+        }
+    }
+    // SAFETY: caller-asserted.
+    let _ = unsafe { ahci.port_idle(port_idx) };
+    let _ = scratch;
+    Ok(())
+}
+
+/// Snapshot of port-multiplier topology behind a port whose
+/// `PortKind` was reported as `Pmp` at probe.
+///
+/// Per SATA 3.x PMP spec §10.3, the host queries the multiplier's
+/// GSCR[2] (Number of Device Ports) to learn how many downstream
+/// ports it exposes; the GSCR registers are read via READ PORT
+/// MULTIPLIER (0xE4). This snapshot is what `discover_pmp_topology`
+/// returns.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PmpTopology {
+    /// Number of downstream ports advertised by the multiplier.
+    pub num_ports: u8,
+    /// Port-multiplier vendor id (GSCR[0] low half).
+    pub vendor:    u16,
+    /// Port-multiplier product id (GSCR[0] high half).
+    pub product:   u16,
+}
+
+/// Discover the topology behind a PMP-attached port. Returns `None`
+/// if the port wasn't a PMP at probe.
+///
+/// Stage-4 cut: the actual GSCR readback uses READ PORT MULTIPLIER
+/// (ATA 0xE4) which targets the PMP control port (PMP port = 0x0F).
+/// Until that command lands, this returns a topology placeholder
+/// `(num_ports = 0)` so callers can branch on PMP presence.
+pub fn discover_pmp_topology(ahci: &Ahci, port_idx: u8) -> Option<PmpTopology> {
+    let info = ahci.ports.iter().find(|p| p.index == port_idx)?;
+    if info.kind != PortKind::Pmp { return None; }
+    Some(PmpTopology { num_ports: 0, vendor: 0, product: 0 })
+}
+
 /// Decode the model-number string from an IDENTIFY DEVICE response.
 /// ATA strings are byte-swapped per pair (ATA-8 §7.16.7.36): byte 54
 /// = char 0 high, byte 55 = char 0 low, etc. 40 bytes total.

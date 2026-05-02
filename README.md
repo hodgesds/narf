@@ -65,7 +65,7 @@ intra-address-space isolation.
   framekernel's domain model.
 - **Verification and observability are first-class.** A kernel-resident
   test harness (`cargo xtask test`) boots the real kernel under QEMU and
-  asserts on live invariants — 559 smokes on x86_64, 292 on aarch64 at
+  asserts on live invariants — 560 smokes on x86_64, 292 on aarch64 at
   time of writing — alongside USDT-style probes, flight-recorder rings, a
   PMU-sampling surface, and an ABI promise (syscall numbers carry an upper
   8-bit version, `relibc` will gate against it). Bugs are caught at the
@@ -206,6 +206,23 @@ Live from boot through `cargo xtask run`:
   Protocol(Boot) → interrupt-IN polling → HID Usage 0x07 →
   `narf_input::KeyCode` press/release diffing with 8-modifier
   tracking + roll-over filter.
+- USB Mass Storage (Bulk-Only Transport): hot-plug enumeration
+  over xHCI for class 08:06:50, descriptor walk for the bulk-IN +
+  bulk-OUT pair, CBW/CSW protocol per USB MSC BBB rev 1.0,
+  INQUIRY / READ CAPACITY(10) / READ(10) / WRITE(10) on top, plus
+  multi-block read/write helpers (≤ 8 LBAs per call).
+- AHCI: HBA reset, port enumeration, IDENTIFY DEVICE +
+  READ/WRITE DMA EXT, plus READ/WRITE FPDMA QUEUED (NCQ on a
+  per-tag basis with PORT_SACT bookkeeping) and a placeholder for
+  port-multiplier topology discovery.
+- Intel HD Audio (HDA): clean-room driver for the AMD Ryzen /
+  Phoenix and Radeon HD Audio Controllers — BAR0 mapping, GCTL
+  reset, CORB/RIRB ring DMA, STATESTS codec walk, Get Parameter
+  verbs for codec discovery, output stream descriptor + BDL +
+  cyclic 4 KiB period buffer, 48 kHz S16LE stereo, `start_output`
+  + `stop_output` (SDnCTL.RUN) + `load_period` + sine-wave test
+  tone. Wired into `narf_audio::AudioWriter::submit` so consumers
+  hit it transparently when virtio-sound isn't available.
 - QEMU `fw_cfg` interface (x86_64 PIO): magic-string presence
   probe, file-directory parse, `find` / `read` / `read_string`
   for SMBIOS / boot-order / cmdline-style entries.
@@ -221,7 +238,7 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **559/0/21** smokes;
+`cargo xtask test --arch=x86_64` passes **560/0/22** smokes;
 `--arch=aarch64` passes **292/0/10**. Skips are x86-specific PCIe
 surfaces or live-device tests that skip cleanly when QEMU doesn't
 expose the device. See `STATUS.md` for the full tally and per-

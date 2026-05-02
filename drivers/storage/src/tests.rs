@@ -174,3 +174,51 @@ fn smoke_ahci_write_then_read_lba() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/storage/ahci", smoke_ahci_write_then_read_lba);
+
+fn smoke_ahci_ncq_write_then_read_lba() -> TestResult {
+    // NCQ round-trip: write at LBA 16 with WRITE FPDMA QUEUED on
+    // tag 0, read back with READ FPDMA QUEUED on tag 1, verify
+    // the payload survives the queued path.
+    use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use crate::ahci;
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    if !devs.iter().any(|d|
+        matches!(&d.kind, BusKind::Pcie { .. })
+        && d.id.vendor == ahci::AHCI_VENDOR
+        && d.id.device == ahci::AHCI_ICH9_DEV)
+    { return TestResult::Skip("no AHCI device"); }
+    if !ahci::is_probed() {
+        __reset_for_test();
+        ahci::register_pci_driver();
+        let _ = probe_all_pci(&bootstrap_registry_authority());
+    }
+    if !ahci::is_probed() { return TestResult::Fail("ahci probe failed"); }
+    let port = ahci::with_controller(|c|
+        c.ports.iter().find(|p| p.kind == ahci::PortKind::Sata).map(|p| p.index)
+    ).flatten().unwrap_or(0);
+    let mut payload = [0u8; 512];
+    for i in 0..512usize { payload[i] = (i as u8).wrapping_mul(0x53) ^ 0x9E; }
+    let w = ahci::with_controller(|c|
+        // SAFETY: kernel-test holds the HBA exclusively.
+        unsafe { ahci::ahci_write_lba_ncq(c, port, 0, 0, 16, 1, &payload) }
+    );
+    if !matches!(w, Some(Ok(()))) {
+        return TestResult::Fail("ahci_write_lba_ncq failed");
+    }
+    let mut readback = [0u8; 512];
+    let r = ahci::with_controller(|c|
+        // SAFETY: same.
+        unsafe { ahci::ahci_read_lba_ncq(c, port, 0, 1, 16, 1, &mut readback) }
+    );
+    if !matches!(r, Some(Ok(()))) {
+        return TestResult::Fail("ahci_read_lba_ncq failed");
+    }
+    if readback != payload {
+        return TestResult::Fail("NCQ write/read pattern mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/ahci", smoke_ahci_ncq_write_then_read_lba);

@@ -136,6 +136,28 @@ fn smoke_msc_config_descriptor_parse() -> TestResult {
 }
 kernel_test_in!("drivers/usb/msc", smoke_msc_config_descriptor_parse);
 
+fn smoke_msc_attach_via_xhci_qemu() -> TestResult {
+    use crate::{msc, xhci};
+    if !xhci::is_probed() { return TestResult::Skip("xhci not probed"); }
+    msc::__reset_msc_for_test();
+    let attached = xhci::with_controller(|c|
+        msc::enumerate_and_attach_msc(c)
+    ).unwrap_or(0);
+    if attached == 0 {
+        return TestResult::Skip("no MSC device attached to xhci");
+    }
+    if msc::attached_msc_count() != attached {
+        return TestResult::Fail("registry count diverged from return");
+    }
+    let cap_ok = msc::with_device(0, |d| d.lba_bytes != 0 && d.last_lba != 0)
+        .unwrap_or(false);
+    if !cap_ok {
+        return TestResult::Fail("READ CAPACITY(10) didn't populate dev");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/msc", smoke_msc_attach_via_xhci_qemu);
+
 // ── HID class-driver descriptor parser + report decode ─────────────
 
 fn smoke_hid_boot_keyboard_parse() -> TestResult {

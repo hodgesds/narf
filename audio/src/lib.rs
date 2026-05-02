@@ -150,15 +150,42 @@ impl AudioStream for VirtioSoundPlayback {
 
 static PLAYBACK: VirtioSoundPlayback = VirtioSoundPlayback;
 
-/// Pick the best-available playback stream. Stage-4: virtio-sound
-/// or nothing. Future backends register via `register_backend` once
-/// HDA / AC97 land.
-pub fn select_active_playback() -> Option<&'static dyn AudioStream> {
-    if PLAYBACK.current_format().is_some() {
-        Some(&PLAYBACK)
-    } else {
-        None
+// ── Intel HDA backend ───────────────────────────────────────────────
+//
+// HDA reaches its `current_format` once the controller is probed +
+// at least one codec has been enumerated. The format is fixed at the
+// driver's bring-up choice (48 kHz S16LE stereo) — a `set_format`
+// path lands when the codec verb walker grows beyond enumeration.
+
+#[derive(Debug)]
+struct IntelHdaPlayback;
+
+impl AudioStream for IntelHdaPlayback {
+    fn current_format(&self) -> Option<AudioFormat> {
+        if hda::is_probed() {
+            Some(AudioFormat::default_playback())
+        } else {
+            None
+        }
     }
+    fn supports(&self, fmt: AudioFormat) -> bool {
+        fmt.format == SampleFormat::S16Le
+            && fmt.sample_rate_hz == 48_000
+            && fmt.channels == ChannelLayout::Stereo
+    }
+    fn name(&self) -> &'static str { "intel-hda" }
+    fn is_playback(&self) -> bool { true }
+}
+
+static HDA_PLAYBACK: IntelHdaPlayback = IntelHdaPlayback;
+
+/// Pick the best-available playback stream. virtio-sound wins when
+/// it's probed (more flexibility today: 44.1 + 48 kHz, mono +
+/// stereo); fall through to Intel HDA on bare metal.
+pub fn select_active_playback() -> Option<&'static dyn AudioStream> {
+    if PLAYBACK.current_format().is_some() { return Some(&PLAYBACK); }
+    if HDA_PLAYBACK.current_format().is_some() { return Some(&HDA_PLAYBACK); }
+    None
 }
 
 // ── AudioWriter ─────────────────────────────────────────────────────
@@ -220,6 +247,14 @@ impl AudioWriter {
         if pcm.is_empty() || bpf == 0 || pcm.len() % bpf != 0 {
             return Err(AudioWriteError::UnsupportedFormat);
         }
+        match self.stream.name() {
+            "intel-hda" => self.submit_hda(pcm),
+            _           => self.submit_virtio_sound(pcm),
+        }
+    }
+
+    fn submit_virtio_sound(&self, pcm: &[u8]) -> Result<u64, AudioWriteError> {
+        let bpf = self.format.bytes_per_frame() as usize;
         // Translate AudioFormat → virtio-sound spec codes. Stage-4
         // baseline only knows about S16LE @ 44.1/48 kHz; supports()
         // already gated on these.
@@ -248,6 +283,36 @@ impl AudioWriter {
         snd_pci::play_buffer(params, pcm)
             .map_err(|_| AudioWriteError::StreamClosed)?;
         Ok((pcm.len() / bpf) as u64)
+    }
+
+    /// Intel HDA submit path. Loads the PCM samples into the
+    /// driver's cyclic period buffer + sets SDnCTL.RUN. Returns the
+    /// number of frames the period buffer accepted.
+    ///
+    /// Note: HDA is cyclic, not packet-oriented like virtio-sound —
+    /// the period buffer is fixed-size + the engine wraps. For
+    /// `pcm.len() <= period_bytes()` this looks like a one-shot
+    /// playback; longer streams need the consumer to call `submit`
+    /// once per period at LPIB intervals.
+    fn submit_hda(&self, pcm: &[u8]) -> Result<u64, AudioWriteError> {
+        let bpf = self.format.bytes_per_frame() as usize;
+        // i16 samples are interleaved; reinterpret the byte slice.
+        let samples_n = pcm.len() / 2;
+        let mut tmp: alloc::vec::Vec<i16> = alloc::vec::Vec::with_capacity(samples_n);
+        for i in 0..samples_n {
+            let lo = pcm[i * 2];
+            let hi = pcm[i * 2 + 1];
+            tmp.push(i16::from_le_bytes([lo, hi]));
+        }
+        let loaded = hda::with_controller(|c| c.load_period(&tmp))
+            .ok_or(AudioWriteError::NoActiveStream)?;
+        // Kick the engine if it isn't already running. Idempotent
+        // per HDA::start_output.
+        let _started = hda::with_controller(|c|
+            // SAFETY: singleton owns BAR0 for its lifetime.
+            unsafe { c.start_output() }
+        ).unwrap_or(false);
+        Ok((loaded * 2 / bpf) as u64)
     }
 
     /// Zero-copy submit: forwards a `(shmem_handle, byte_offset,

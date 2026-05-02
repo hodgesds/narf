@@ -9,13 +9,14 @@
 //! that document. Codec verb encodings come from the same spec
 //! (§7.3) and the codec vendor's datasheet.
 //!
-//! Stage-4 cut: bring the controller out of reset, allocate CORB +
+//! Live surface: bring the controller out of reset, allocate CORB +
 //! RIRB rings, walk STATESTS for live codec slots, fetch each
 //! codec's vendor / sub-system / function-group descriptor via Get
 //! Parameter verbs, pick one output stream descriptor, allocate a
-//! BDL + a single 4-KiB silence period, and program the stream for
-//! 48 kHz / 16-bit / 2-ch. **No audible playback** — RUN bit is not
-//! set; that lands once the audio mixer / submission API is wired.
+//! BDL + a 4-KiB cyclic period buffer, and program the stream for
+//! 48 kHz / 16-bit / 2-ch. `start_output` / `stop_output` set
+//! SDnCTL.RUN so loaded samples reach the analog output, and
+//! `load_period` / `load_sine_test_tone` populate the cyclic buffer.
 //!
 //! # Layout
 //!

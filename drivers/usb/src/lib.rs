@@ -29,4 +29,11 @@ pub fn register_initcalls() {
         ).unwrap_or(0);
         if attached == 0 { InitResult::NotPresent } else { InitResult::Ok }
     });
+    narf_init::register(Stage::Device, "usb-mass-storage", || {
+        if !xhci::is_probed() { return InitResult::NotPresent; }
+        let attached = xhci::with_controller(|c|
+            msc::enumerate_and_attach_msc(c)
+        ).unwrap_or(0);
+        if attached == 0 { InitResult::NotPresent } else { InitResult::Ok }
+    });
 }
