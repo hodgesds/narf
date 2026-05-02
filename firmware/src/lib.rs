@@ -220,6 +220,35 @@ pub fn bootstrap_authority()
     (write, read)
 }
 
+/// Trusted-loader authority — a process-global Write cap minted
+/// once at boot and stored here for the kernel-side syscall
+/// trampoline (`sys_install`). Userspace callers reach the
+/// authority through the syscall's privilege check rather than
+/// holding the cap directly.
+///
+/// In-kernel callers should NOT touch this static; they bootstrap
+/// their own cap pair via `bootstrap_authority()` and revoke at
+/// will. The static is for the syscall layer only.
+static TRUSTED_LOADER: IrqSafeSpinLock<Option<Cap<FirmwareRegistry, Write>>>
+    = IrqSafeSpinLock::new(None);
+
+/// Install (idempotently) the trusted-loader authority used by the
+/// `sys_firmware_install` syscall. The first caller wins;
+/// subsequent calls are no-ops. Called once from the kernel boot
+/// path.
+pub fn install_trusted_loader_authority(cap: Cap<FirmwareRegistry, Write>) {
+    let mut g = TRUSTED_LOADER.lock();
+    if g.is_none() {
+        *g = Some(cap);
+    }
+}
+
+/// Borrow the trusted-loader authority. `None` until
+/// `install_trusted_loader_authority` runs at boot.
+pub fn trusted_loader_authority() -> Option<Cap<FirmwareRegistry, Write>> {
+    TRUSTED_LOADER.lock().as_ref().cloned()
+}
+
 /// In-tree blob registration. Drivers can register a blob shipped
 /// via `include_bytes!` from their `register_initcalls` step. The
 /// blob's bytes are copied into a DMA-coherent page at

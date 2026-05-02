@@ -17,6 +17,7 @@ narf-abi          = { path = "../abi" }
 narf-capabilities = { path = "../capabilities" }
 narf-console      = { path = "../console" }
 narf-filesystem   = { path = "../filesystem" }
+narf-firmware     = { path = "../firmware" }
 narf-memory       = { path = "../memory" }
 narf-scheduler    = { path = "../scheduler" }
 

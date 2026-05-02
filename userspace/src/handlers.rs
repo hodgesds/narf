@@ -2538,6 +2538,84 @@ fn sys_shmem_destroy(ctx: &mut dyn TrapContext) {
     }
 }
 
+// ── FirmwareInstall — arg0=name_ptr, arg1=name_len,
+//                       arg2=bytes_ptr, arg3=bytes_len ──────────────
+//
+// Install (or replace) a firmware blob at `BlobSource::HotInstall`
+// priority. The userspace daemon shape mirrors `sys_shmem_*`:
+// the kernel holds the registry-authority cap; the syscall is
+// implicitly cap-gated through `trusted_loader_authority()` which
+// returns `None` until the kernel boot path stages it. Until the
+// per-task firmware-loader cap-table lands (Stage-7 follow-up),
+// any task can call this — the trailer signature check inside
+// `firmware::sys_install` is the actual gate (production builds
+// without `firmware-allow-unsigned` reject anything that isn't
+// signed by a trusted firmware signer).
+
+fn sys_firmware_install(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let name_ptr  = args.arg0 as *const u8;
+    let name_len  = args.arg1 as usize;
+    let bytes_ptr = args.arg2 as *const u8;
+    let bytes_len = args.arg3 as usize;
+    if name_ptr.is_null() || bytes_ptr.is_null() || name_len == 0 || bytes_len == 0 {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    // Cap the staging size so a userspace task can't ask the
+    // kernel to copy gigabytes through the syscall path. 16 MiB
+    // is well above any real firmware blob (QCNFA765 AMSS is
+    // ~5 MiB) and below the limit that would force the registry
+    // into a multi-page IOMMU-backed allocation Stage-7 owns.
+    const MAX_BLOB_BYTES: usize = 16 * 1024 * 1024;
+    if bytes_len > MAX_BLOB_BYTES {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    // SAFETY: `name_ptr` + `name_len` are user-mode virt addresses
+    // in the calling task's AS; the trap didn't swap CR3 so the
+    // walk resolves. We immediately copy the name into a kernel-
+    // owned `String` so the canonical-name lifetime in the
+    // registry isn't pinned to user memory.
+    let name_bytes = unsafe { core::slice::from_raw_parts(name_ptr, name_len) };
+    let name_str = match core::str::from_utf8(name_bytes) {
+        Ok(s)  => s,
+        Err(_) => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+    // Leak the name into 'static memory. The registry stores it
+    // by reference; on hot-replace the prior 'static name string
+    // is dropped from the registry but stays leaked. Acceptable
+    // because firmware-install events are rare (vendor updates,
+    // not per-frame).
+    let leaked: &'static str = alloc::boxed::Box::leak(
+        alloc::string::String::from(name_str).into_boxed_str());
+
+    // Borrow the trusted-loader authority; `None` until the
+    // kernel boot path runs `firmware::install_trusted_loader_authority`.
+    let auth = match narf_firmware::trusted_loader_authority() {
+        Some(a) => a,
+        None    => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+    // SAFETY: `bytes_ptr` + `bytes_len` are user-mode addresses in
+    // the calling task's AS; the trap didn't swap CR3. The kernel
+    // path inside `firmware::sys_install` copies bytes into a
+    // DMA-coherent page before returning, so the user pointer's
+    // lifetime is bounded by this call.
+    let r = unsafe {
+        narf_firmware::sys_install(leaked, bytes_ptr, bytes_len, &auth)
+    };
+    match r {
+        Ok(())  => ctx.set_return(SyscallReturn::ok(0)),
+        Err(_)  => ctx.set_return(SyscallReturn::invalid_op()),
+    }
+}
+
 // ── Munmap — arg0=base ─────────────────────────────────────────────
 
 fn sys_munmap(ctx: &mut dyn TrapContext) {
@@ -4577,6 +4655,8 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::ShmemCreate,  "shmem_create",   RawFnHandler(sys_shmem_create));
     table.install_raw(Syscall::ShmemMap,     "shmem_map",      RawFnHandler(sys_shmem_map));
     table.install_raw(Syscall::ShmemDestroy, "shmem_destroy",  RawFnHandler(sys_shmem_destroy));
+    table.install_raw(Syscall::FirmwareInstall, "firmware_install",
+                      RawFnHandler(sys_firmware_install));
     table.install_raw(Syscall::RingKick, "ringkick", RawFnHandler(sys_ring_kick));
     table.install_raw(Syscall::GetPid,   "getpid",   RawFnHandler(sys_getpid));
     table.install_raw(Syscall::GetPpid,  "getppid",  RawFnHandler(sys_getppid));

@@ -382,6 +382,23 @@ pub enum Syscall {
     /// bad handle / not-owner.
     ShmemDestroy = 252,
 
+    /// Install (or replace) a firmware blob in the kernel firmware
+    /// registry. `arg0 = name_ptr`, `arg1 = name_len` (the
+    /// canonical name, e.g. `"qcom/qcnfa765/amss.bin"`),
+    /// `arg2 = bytes_ptr`, `arg3 = bytes_len` (the raw blob with
+    /// the signature trailer described in
+    /// `firmware/specification/spec.md` §6).
+    ///
+    /// Cap-gated against the calling task holding a
+    /// `Cap<FirmwareRegistry, Write>`. The privileged firmware-
+    /// load daemon owns one such cap; ordinary tasks see
+    /// `SyscallReturn::invalid_op()`. On success the blob lands
+    /// at `BlobSource::HotInstall` priority and overrides any
+    /// initramfs / in-tree entry of the same name.
+    ///
+    /// Returns 0 on success, `!0u64` on any failure.
+    FirmwareInstall = 260,
+
     /// Kick the kernel-side dispatcher to drain the calling task's
     /// shared SubmissionRing and post Completions to the shared
     /// CompletionRing. Returns the number of submissions processed.
@@ -885,6 +902,7 @@ impl Syscall {
             250 => Syscall::ShmemCreate,
             251 => Syscall::ShmemMap,
             252 => Syscall::ShmemDestroy,
+            260 => Syscall::FirmwareInstall,
             _   => return None,
         })
     }

@@ -238,6 +238,49 @@ fn smoke_firmware_priority_hot_install_overrides_in_tree() -> TestResult {
 }
 kernel_test_in!("firmware", smoke_firmware_priority_hot_install_overrides_in_tree);
 
+fn smoke_firmware_sys_install_trusted_loader_round_trip() -> TestResult {
+    // Exercises the sys_firmware_install kernel-side path:
+    //   1. install_trusted_loader_authority() → cap stashed.
+    //   2. trusted_loader_authority() → cap visible.
+    //   3. sys_install() through that cap → blob lands at HotInstall.
+    // The actual trap-handler shim (sys_firmware_install in
+    // narf-userspace) is exercised end-to-end only by the smoke
+    // harness's user-mode-testbin path; this smoke covers the
+    // lower half so a regression in the cap stash / call-through
+    // is caught without spinning up a user task.
+    if !cfg!(feature = "firmware-allow-unsigned") {
+        return TestResult::Skip("firmware-allow-unsigned off");
+    }
+    use crate::{install_trusted_loader_authority, trusted_loader_authority};
+    __reset_for_test();
+    let (write, _r) = bootstrap_authority();
+    install_trusted_loader_authority(write);
+    let auth = match trusted_loader_authority() {
+        Some(a) => a,
+        None    => return TestResult::Fail("trusted_loader_authority not stashed"),
+    };
+    let blob = build_unsigned_blob(b"sys_install round-trip", None);
+    // SAFETY: blob is a kernel-owned heap allocation; ptr+len
+    // describe a valid range for the duration of this call.
+    let r = unsafe {
+        crate::sys_install(
+            "test/sys-install/blob",
+            blob.as_ptr(),
+            blob.len(),
+            &auth,
+        )
+    };
+    match r {
+        Ok(()) => {}
+        Err(_) => return TestResult::Fail("sys_install rejected"),
+    }
+    if source_for("test/sys-install/blob") != Some(BlobSource::HotInstall) {
+        return TestResult::Fail("sys_install didn't land at HotInstall priority");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("firmware", smoke_firmware_sys_install_trusted_loader_round_trip);
+
 /// Build a minimal CPIO newc archive — header + path + data — for
 /// each `(name, data)` plus the `TRAILER!!!` sentinel. Used by
 /// `smoke_firmware_initramfs_scan_*` to exercise the walker

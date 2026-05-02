@@ -701,6 +701,18 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_fb::register_initcalls();
             narf_audio::register_initcalls();
             narf_shmem::register_initcalls();
+            narf_firmware::register_initcalls();
+            // Stage the trusted-loader authority so the
+            // `sys_firmware_install` syscall can hot-install blobs
+            // from a privileged userspace daemon. The Read half is
+            // dropped because the registry's `open()` path is
+            // currently in-kernel only; once a per-task cap-table
+            // for firmware lookups lands (Stage-7), the Read cap
+            // moves into the daemon's bootstrap kit.
+            {
+                let (write, _read) = narf_firmware::bootstrap_authority();
+                narf_firmware::install_trusted_loader_authority(write);
+            }
 
             // PCI probe lives in Stage::Device — it binds every
             // driver registered by Subsys above.
