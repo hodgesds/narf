@@ -1213,9 +1213,27 @@ fn smoke_pci_probe_all_dispatches_nvme() -> TestResult {
     // Hermetic: clear any earlier registrations.
     __reset_for_test();
     narf_drivers_nvme::register_pci_driver();
-    let n_drivers = narf_bus::registered_pci_drivers().len();
-    if n_drivers != 1 {
-        return TestResult::Fail("nvme should register exactly the vendor/device entry");
+    // nvme registers 4 exact VID/DID entries (QEMU + Samsung
+    // PM9A1 / 970 EVO / 990 PRO) plus a class-storage backstop —
+    // 5 entries total. Probe filters by subclass + prog_if so the
+    // backstop doesn't accidentally claim SATA / virtio-blk.
+    let regs = narf_bus::registered_pci_drivers();
+    if regs.len() < 2 {
+        return TestResult::Fail("nvme registered fewer than the expected entries");
+    }
+    let has_qemu_vid = regs.iter().any(|m|
+        matches!(m.kind, narf_bus::MatchKind::VendorDevice {
+            vendor: 0x1B36, device: 0x0010,
+        }));
+    let has_class = regs.iter().any(|m|
+        matches!(m.kind, narf_bus::MatchKind::Class {
+            class: 0x01, mask: 0xFF,
+        }));
+    if !has_qemu_vid {
+        return TestResult::Fail("nvme missing QEMU VID/DID entry");
+    }
+    if !has_class {
+        return TestResult::Fail("nvme missing storage-class backstop");
     }
 
     let authority = bootstrap_registry_authority();

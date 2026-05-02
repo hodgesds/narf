@@ -29,8 +29,12 @@ fn build_unsigned_blob(payload: &[u8], version: Option<&str>) -> alloc::vec::Vec
         md.extend_from_slice(v.as_bytes());
     }
     let mlen = md.len() as u32;
-    out.extend_from_slice(&mlen.to_le_bytes());
+    // Layout per `signature::decode`: payload | sig(64) | signer(32) |
+    // metadata(mlen) | mlen(4) | magic(4). mlen sits at fixed offset
+    // (n-8..n-4) so the decoder can find it without first knowing
+    // metadata's length.
     out.extend_from_slice(&md);
+    out.extend_from_slice(&mlen.to_le_bytes());
     out.extend_from_slice(&BLOB_TRAILER_MAGIC);
     out
 }

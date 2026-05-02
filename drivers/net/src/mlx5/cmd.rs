@@ -242,8 +242,8 @@ pub fn build_cqe_inline(
     cqe[CQE_OFF_INPUT_INLINE..CQE_OFF_INPUT_INLINE + inline_input.len()]
         .copy_from_slice(inline_input);
     cqe[CQE_OFF_TOKEN]      = token;
-    cqe[CQE_OFF_SIGNATURE]  = compute_signature(&cqe);
     cqe[CQE_OFF_STATUS_OWN] = STATUS_OWN_BIT;
+    cqe[CQE_OFF_SIGNATURE]  = compute_signature(&cqe);
     Ok(cqe)
 }
 
@@ -388,8 +388,8 @@ pub fn build_cqe_with_mailboxes(
         .copy_from_slice(&output_len.to_be_bytes());
 
     cqe[CQE_OFF_TOKEN]      = token;
-    cqe[CQE_OFF_SIGNATURE]  = compute_signature(&cqe);
     cqe[CQE_OFF_STATUS_OWN] = STATUS_OWN_BIT;
+    cqe[CQE_OFF_SIGNATURE]  = compute_signature(&cqe);
     cqe
 }
 

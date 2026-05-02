@@ -9,11 +9,15 @@
 //! +----------------------------+
 //! |  Ed25519 signature (64 B)   |
 //! |  signer fingerprint (32 B)  |
-//! |  metadata length (4 B LE)   |
 //! |  metadata (variable)        |
+//! |  metadata length (4 B LE)   |
 //! |  trailing magic 'NRFW' (4 B)|
 //! +----------------------------+
 //! ```
+//!
+//! `mlen` sits at a fixed offset from the end (immediately before
+//! the magic) so `decode` can find it without first knowing the
+//! metadata length.
 //!
 //! Verification:
 //!   1. Read the trailing 4 bytes; check magic == `b"NRFW"`.
@@ -89,6 +93,10 @@ pub fn decode(blob: &[u8]) -> Result<BlobTrailer<'_>, FirmwareError> {
     let trailer_size = 64 + 32 + 4 + mlen + 4;
     if trailer_size > n { return Err(FirmwareError::BadFormat); }
 
+    // Trailer layout (back from end):
+    //   payload | sig(64) | signer(32) | metadata(mlen) | mlen(4) | magic(4)
+    // mlen sits at fixed offset (n-8..n-4) so the decoder can find
+    // it without walking metadata first.
     let payload_end = n - trailer_size;
     let mut off = payload_end;
     let mut sig = [0u8; 64];
@@ -97,9 +105,8 @@ pub fn decode(blob: &[u8]) -> Result<BlobTrailer<'_>, FirmwareError> {
     let mut signer = [0u8; 32];
     signer.copy_from_slice(&blob[off..off + 32]);
     off += 32;
-    off += 4; // skip mlen we've already read
     let metadata = &blob[off..off + mlen];
-    // off += mlen; off += 4;  // would land on `n`; not needed.
+    // remaining: 4 (mlen) + 4 (magic) — we've already validated both.
 
     // Metadata format: a sequence of TLV records with 1-byte tag
     // and 1-byte length. Tag 0x01 = ASCII version string.
