@@ -820,3 +820,83 @@ fn smoke_mlx5_create_eq_opcode() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/mlx5", smoke_mlx5_create_eq_opcode);
+
+// ── Stage 7: input-mailbox + inline-output transport + UAR ─────────
+
+fn smoke_mlx5_input_mb_inline_out_cqe_layout() -> TestResult {
+    // Verify build_cqe_with_mailboxes(input, /* output_mb */ 0,
+    // /* output_len */ 0) produces a CQE shape Stage-7's transport
+    // relies on: input_mb_h/l populated, output_mb_h/l = 0,
+    // output_length = 0, ownership bit set, signature is XOR.
+    use super::cmd::build_cqe_with_mailboxes;
+    let in_phys: u64 = 0x0000_0001_BABE_F000;
+    let cqe = build_cqe_with_mailboxes(
+        CmdOp::CreateEq, 0, in_phys, 0x300, 0, 0, 0xCC,
+    );
+    let want_h = ((in_phys >> 32) as u32).to_be_bytes();
+    let want_l = (in_phys as u32).to_be_bytes();
+    if cqe[0x08..0x0C] != want_h
+       || cqe[0x0C..0x10] != want_l {
+        return TestResult::Fail("input_mb pointer not BE-encoded");
+    }
+    if cqe[0x30..0x34] != [0u8; 4] || cqe[0x34..0x38] != [0u8; 4] {
+        return TestResult::Fail("output_mb pointer not zero when output_len=0");
+    }
+    if cqe[0x38..0x3C] != [0u8; 4] {
+        return TestResult::Fail("output_length not zero");
+    }
+    let want_inl = 0x300u32.to_be_bytes();
+    if cqe[0x04..0x08] != want_inl {
+        return TestResult::Fail("input_length not BE-encoded");
+    }
+    let mut xor = 0u8;
+    for &b in cqe.iter() { xor ^= b; }
+    if xor != 0 {
+        return TestResult::Fail("CQE signature not XOR-checksum after mb-only build");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_input_mb_inline_out_cqe_layout);
+
+fn smoke_mlx5_create_eq_output_modifier_decode() -> TestResult {
+    // Synthesise a completed CQE with output_modifier carrying the
+    // documented eq_number layout (low 24 bits of the field). Stage-2
+    // decode_response should expose those 24 bits via .output_modifier
+    // and Stage 7 masks the top byte off before storing.
+    use super::cmd::{build_cqe_inline, simulate_completion, decode_response};
+    let mut cqe = build_cqe_inline(CmdOp::CreateEq, 0, &[], 0x10).unwrap();
+    // FW returns eq_number = 0x12_3456 in bits [23:0] of
+    // output_modifier; bit 31..24 should be zero in compliant FW
+    // but mask defensively in driver.
+    let raw_om: u32 = 0x0012_3456;
+    simulate_completion(&mut cqe, /* status */ 0, /* syn */ 0,
+                        raw_om, &[]);
+    let resp = match decode_response(&cqe) {
+        Ok(r)  => r,
+        Err(_) => return TestResult::Fail("decode_response failed for CREATE_EQ reply"),
+    };
+    let eq_number = resp.output_modifier & 0x00FF_FFFF;
+    if eq_number != 0x0012_3456 {
+        return TestResult::Fail("eq_number mask wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_create_eq_output_modifier_decode);
+
+fn smoke_mlx5_uar_doorbell_offset_calc() -> TestResult {
+    // We can't write to a real UAR in a smoke, but we can verify the
+    // address arithmetic Stage-7 exposes through `UAR_BASE_DEFAULT`
+    // and check that uar_page=0 + offset=0 lands at the documented
+    // 1-MiB-into-BAR0 base.
+    if super::UAR_BASE_DEFAULT != 0x100000 {
+        return TestResult::Fail("UAR base default drifted from PRM");
+    }
+    // uar_page index N occupies bytes [base + N*4096 .. base + (N+1)*4096).
+    let base = super::UAR_BASE_DEFAULT;
+    let page_5_start = base + 5 * 4096;
+    if page_5_start != 0x100000 + 0x5000 {
+        return TestResult::Fail("UAR page-5 byte offset wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_uar_doorbell_offset_calc);

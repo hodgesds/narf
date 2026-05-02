@@ -203,6 +203,26 @@ pub enum Mlx5Error {
     CmdBuild(CmdError),
     /// Stage 3: firmware completed the CQE with a non-OK status.
     CmdFailed(CmdError),
+    /// Stage 7: caller-supplied EQ parameters were invalid.
+    EqBuild(eq::EqError),
+}
+
+/// Stage 7: live-EQ bookkeeping. Holds the FW-assigned `eq_number`
+/// + the DMA pages backing the EQ buffer so they're not dropped
+/// while the EQ is live.
+pub struct LiveEq {
+    pub eq_number: u32,
+    _pages:        Vec<DmaBuffer>,
+    pub params:    eq::EqParams,
+}
+
+impl fmt::Debug for LiveEq {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LiveEq")
+            .field("eq_number", &self.eq_number)
+            .field("params",    &self.params)
+            .finish_non_exhaustive()
+    }
 }
 
 pub struct Mlx5Hca {
@@ -220,7 +240,17 @@ pub struct Mlx5Hca {
     /// `Some(Err(_))` means probe ran but the NOP self-test failed
     /// (driver still bound — operator can investigate).
     nop_selftest: Option<Result<(), Mlx5Error>>,
+    /// Stage 7: registry of live EQs (eq_number + backing DMA).
+    eqs: IrqSafeSpinLock<Vec<LiveEq>>,
+    /// Stage 7: BAR0 byte-offset where UAR pages start. PRM-documented
+    /// for ConnectX-4..6 at 0x100000 (1 MiB into BAR0). Driver-level
+    /// override is kept on the struct so a future stage can refine
+    /// after a proper QUERY_HCA_CAP read.
+    uar_base: u64,
 }
+
+/// Default BAR0 offset where UAR pages live on ConnectX-4..6.
+const UAR_BASE_DEFAULT: u64 = 0x100000;
 
 impl fmt::Debug for Mlx5Hca {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -295,6 +325,8 @@ impl Mlx5Hca {
             cmdq,
             next_token: IrqSafeSpinLock::new(1),
             nop_selftest: None,
+            eqs: IrqSafeSpinLock::new(Vec::new()),
+            uar_base: UAR_BASE_DEFAULT,
         })
     }
 
@@ -538,6 +570,133 @@ impl Mlx5Hca {
         }
         Ok(mailbox::read_output_chain(&blocks, output_len))
     }
+
+    /// Stage 7: issue a command whose input rides through a DMA
+    /// mailbox chain but whose output fits in the CQE's 8-byte
+    /// inline window — much cheaper than `issue_command_with_mailboxes`
+    /// when the response is just status + a small ID (CREATE_EQ /
+    /// CREATE_CQ / ALLOC_PD return wire IDs in the
+    /// `output_modifier` field of the inline response).
+    pub fn issue_command_with_input_mailbox(
+        &self,
+        op:             CmdOp,
+        input_modifier: u32,
+        input:          &[u8],
+    ) -> Result<CmdResponse, Mlx5Error> {
+        let token = {
+            let mut tok = self.next_token.lock();
+            let v = *tok;
+            *tok = tok.wrapping_add(1);
+            v
+        };
+        let n_in = mailbox::block_count_for(input.len());
+        let mut in_blocks: Vec<DmaBuffer> = Vec::with_capacity(n_in);
+        for _ in 0..n_in {
+            in_blocks.push(
+                alloc_coherent(4096, DomainId::DRIVER_0)
+                    .map_err(|_| Mlx5Error::CmdqAlloc)?);
+        }
+        let in_phys: Vec<u64> = in_blocks.iter()
+            .map(|b| b.phys_addr().raw()).collect();
+        let in_data = mailbox::write_input_chain(input, &in_phys, token);
+        for (block, dma) in in_data.iter().zip(in_blocks.iter()) {
+            let phys = dma.phys_addr().raw();
+            // SAFETY: identity-mapped DMA; driver-owned buffer.
+            unsafe {
+                for (i, &b) in block.iter().enumerate() {
+                    core::ptr::write_volatile(
+                        (phys + i as u64) as *mut u8, b);
+                }
+            }
+        }
+        // Build the CQE: input mailbox set, output mailbox = 0, len = 0.
+        let cqe = build_cqe_with_mailboxes(
+            op, input_modifier,
+            in_phys[0], input.len() as u32,
+            /* output_mb_phys */ 0, /* output_len */ 0,
+            token,
+        );
+        let slot_phys = self.cmdq.phys_addr().raw();
+        // SAFETY: identity-mapped cmdq DMA.
+        unsafe {
+            for (i, &b) in cqe.iter().enumerate() {
+                core::ptr::write_volatile(
+                    (slot_phys + i as u64) as *mut u8, b);
+            }
+        }
+        compiler_fence(Ordering::SeqCst);
+        self.ring_cmd_doorbell(1);
+
+        let own_phys = slot_phys + CQE_OFF_STATUS_OWN as u64;
+        let mut spins = 0u32;
+        loop {
+            // SAFETY: identity-mapped DMA.
+            let v = unsafe { core::ptr::read_volatile(own_phys as *const u8) };
+            if v & STATUS_OWN_BIT == 0 { break; }
+            spins += 1;
+            if spins > CMD_POLL_LIMIT { return Err(Mlx5Error::CmdTimeout); }
+            core::hint::spin_loop();
+        }
+
+        let mut completed = [0u8; CQE_LEN];
+        // SAFETY: identity-mapped DMA.
+        unsafe {
+            for i in 0..CQE_LEN {
+                completed[i] = core::ptr::read_volatile(
+                    (slot_phys + i as u64) as *const u8);
+            }
+        }
+        debug_assert!(is_complete(&completed));
+        decode_response(&completed).map_err(Mlx5Error::CmdFailed)
+    }
+
+    /// Stage 7: live `CREATE_EQ`. Allocates `page_count` 4-KiB DMA
+    /// pages for the EQ buffer, hands them to `build_create_eq_input`,
+    /// posts the command via the input-mailbox transport, and returns
+    /// the firmware-assigned `eq_number` from the inline response.
+    /// The backing pages + recorded eq_number live on the driver's
+    /// `eqs` registry so they're not dropped while the EQ is live.
+    pub fn create_eq(
+        &self,
+        params:     eq::EqParams,
+        page_count: usize,
+    ) -> Result<u32, Mlx5Error> {
+        let mut pages: Vec<DmaBuffer> = Vec::with_capacity(page_count);
+        for _ in 0..page_count {
+            pages.push(
+                alloc_coherent(4096, DomainId::DRIVER_0)
+                    .map_err(|_| Mlx5Error::CmdqAlloc)?);
+        }
+        let phys: Vec<u64> = pages.iter()
+            .map(|p| p.phys_addr().raw()).collect();
+        let payload = eq::build_create_eq_input(params, &phys)
+            .map_err(Mlx5Error::EqBuild)?;
+        let resp = self.issue_command_with_input_mailbox(
+            CmdOp::CreateEq, 0, &payload)?;
+        // PRM: eq_number rides in the low 24 bits of output_modifier.
+        let eq_number = resp.output_modifier & 0x00FF_FFFF;
+        self.eqs.lock().push(LiveEq {
+            eq_number,
+            _pages: pages,
+            params,
+        });
+        Ok(eq_number)
+    }
+
+    /// Stage 7: write a 4-byte BE doorbell into a UAR page. `uar_page`
+    /// is the index assigned by `ALLOC_UAR` (Stage 8); `byte_offset`
+    /// is the offset within the 4-KiB UAR page. Used by EQ arming
+    /// + WQ tail bumps.
+    pub fn uar_write32(&self, uar_page: u32, byte_offset: u32, value: u32) {
+        let abs = self.uar_base + (uar_page as u64) * 4096
+                 + byte_offset as u64;
+        // SAFETY: identity-mapped MMIO; caller asserts uar_page is
+        // owned.
+        unsafe { self.mmio.write32(abs, value.swap_bytes()); }
+    }
+
+    /// Number of currently-allocated EQs.
+    pub fn eq_count(&self) -> usize { self.eqs.lock().len() }
 
     /// Stage 5: typed wrapper around QUERY_HCA_CAP(GeneralDevice).
     /// Returns the decoded view; callers needing fields beyond the

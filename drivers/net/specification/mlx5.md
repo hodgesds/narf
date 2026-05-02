@@ -1,6 +1,6 @@
 # mlx5 — Specification
 
-> Status: **v0.6** (Stage 6: bit_field helper + bit-packed caps + CREATE_EQ layout).
+> Status: **v0.7** (Stage 7: live CREATE_EQ + UAR doorbell).
 >
 > Clean-room driver for Mellanox / NVIDIA ConnectX-4 / 5 / 6 / 7
 > family Ethernet + InfiniBand HCAs. Reference material: the
@@ -136,6 +136,25 @@ have a server target with a ConnectX HCA in CI.
 
 - **v0.1** (Stage 1): PCI match + init-segment decoder +
   initializing-bit poll + smokes co-located in driver dir.
+- **v0.7** (Stage 7): `Mlx5Hca::issue_command_with_input_mailbox`
+  — input rides through the chained-mailbox transport, output
+  fits in the CQE's 8-byte inline window (eq_number / cq_number
+  / pd ride in `output_modifier`). `Mlx5Hca::create_eq(params,
+  page_count)` is the first live resource-creating command:
+  allocates `page_count` 4-KiB DMA pages, builds the CREATE_EQ
+  payload via Stage-6 `eq::build_create_eq_input`, posts via
+  the input-mailbox transport, masks low 24 bits of
+  output_modifier as `eq_number`, and stashes a `LiveEq` record
+  (eq_number + DMA pages + params) on the driver so the backing
+  isn't dropped while the EQ is live. `eq_count()` query.
+  `uar_write32(uar_page, byte_offset, value)` — 4-byte BE
+  doorbell into the UAR page at BAR0 + `UAR_BASE_DEFAULT (0x100000)
+  + uar_page*4096 + byte_offset`. `Mlx5Error::EqBuild` surfaces
+  Stage-6 EQ-builder validation errors. Three new smokes:
+  input-mb + inline-output CQE layout (input_mb populated,
+  output_mb zero, signature still XOR-balanced), eq_number
+  mask of low 24 bits from output_modifier, UAR base + per-page
+  byte-offset arithmetic.
 - **v0.6** (Stage 6): `bit_field.rs` provides MSB-first absolute-bit
   read/write helpers (`read_bits_be` / `write_bits_be`) for the
   `mlx5_ifc` convention used everywhere in the PRM. Two new
