@@ -39,8 +39,10 @@ use cmd::{
 // Smokes live in the driver directory, not the shared tests.rs.
 mod tests;
 
+pub mod bit_field;
 pub mod caps;
 pub mod cmd;
+pub mod eq;
 pub mod mailbox;
 
 // ── PCI device IDs (ConnectX-4 .. ConnectX-6 Dx) ───────────────────

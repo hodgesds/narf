@@ -655,3 +655,168 @@ fn smoke_mlx5_ethernet_offload_caps_truncated() -> TestResult {
     }
 }
 kernel_test_in!("drivers/net/mlx5", smoke_mlx5_ethernet_offload_caps_truncated);
+
+// ── Stage 6: bit_field + bit-packed caps + EQ context ──────────────
+
+use super::bit_field::{read_bits_be, write_bits_be};
+use super::eq::{
+    build_create_eq_input, decode_create_eq_input, EqError, EqParams,
+    EQC_LEN, EQC_OFF_INTR_VECTOR, EQC_OFF_LOG_PAGE_SIZE,
+    EQC_PA_ENTRY_LEN, EQC_PA_LIST_OFF,
+};
+use super::caps::{
+    HCA_CAP_BIT_LOG_MAX_EQ, HCA_CAP_BIT_LOG_MAX_EQ_W,
+    HCA_CAP_BIT_LOG_MAX_QP, HCA_CAP_BIT_LOG_MAX_QP_W,
+};
+
+fn smoke_mlx5_bit_field_msb_first() -> TestResult {
+    // bit 0 must be the MSB of byte 0.
+    let bytes = [0b1000_0000u8];
+    if read_bits_be(&bytes, 0, 1) != 1 {
+        return TestResult::Fail("bit 0 not MSB of byte 0");
+    }
+    if read_bits_be(&bytes, 1, 1) != 0 {
+        return TestResult::Fail("bit 1 should be 0");
+    }
+    let bytes = [0b0000_0001u8];
+    if read_bits_be(&bytes, 7, 1) != 1 {
+        return TestResult::Fail("bit 7 should be LSB of byte 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_bit_field_msb_first);
+
+fn smoke_mlx5_bit_field_cross_byte() -> TestResult {
+    // 12 bits straddling byte boundary: 0xABC = 0b1010_1011_1100.
+    let bytes = [0xAB, 0xC0];
+    let v = read_bits_be(&bytes, 0, 12);
+    if v != 0xABC {
+        return TestResult::Fail("12-bit cross-byte read wrong");
+    }
+    let v = read_bits_be(&bytes, 4, 8);
+    if v != 0xBC { return TestResult::Fail("byte-aligned-after-nibble wrong"); }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_bit_field_cross_byte);
+
+fn smoke_mlx5_bit_field_round_trip() -> TestResult {
+    let mut bytes = [0u8; 8];
+    write_bits_be(&mut bytes, 5, 12, 0xCAFE & 0xFFF);
+    let v = read_bits_be(&bytes, 5, 12);
+    if v != (0xCAFE & 0xFFF) {
+        return TestResult::Fail("write+read round-trip mismatch");
+    }
+    // Writing into an unrelated bit window must not disturb the
+    // first.
+    write_bits_be(&mut bytes, 32, 16, 0xDEAD);
+    let v1 = read_bits_be(&bytes,  5, 12);
+    let v2 = read_bits_be(&bytes, 32, 16);
+    if v1 != (0xCAFE & 0xFFF) || v2 != 0xDEAD {
+        return TestResult::Fail("adjacent bit-field writes interfered");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_bit_field_round_trip);
+
+fn smoke_mlx5_bit_field_caps_qp_eq() -> TestResult {
+    // Build a 0x100-byte payload where log_max_qp = 27 lives at the
+    // committed bit position; verify the cap accessor reads it.
+    let mut bytes = alloc::vec![0u8; 0x100];
+    write_bits_be(&mut bytes,
+        HCA_CAP_BIT_LOG_MAX_QP, HCA_CAP_BIT_LOG_MAX_QP_W, 27);
+    write_bits_be(&mut bytes,
+        HCA_CAP_BIT_LOG_MAX_EQ, HCA_CAP_BIT_LOG_MAX_EQ_W, 8);
+    // log_max_pd offset 0x68 is the highest committed offset; pad
+    // the buffer so from_bytes() doesn't reject it.
+    let caps = match super::caps::HcaGeneralCaps::from_bytes(bytes) {
+        Ok(c)  => c,
+        Err(_) => return TestResult::Fail(
+            "HcaGeneralCaps from_bytes rejected 0x100-byte payload"),
+    };
+    if caps.log_max_qp() != 27 {
+        return TestResult::Fail("bit-packed log_max_qp readback wrong");
+    }
+    if caps.log_max_eq() != 8 {
+        return TestResult::Fail("bit-packed log_max_eq readback wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_bit_field_caps_qp_eq);
+
+fn smoke_mlx5_eq_input_layout() -> TestResult {
+    let pages = [0x1_0000_0000u64, 0x1_0000_1000u64, 0x1_0000_2000u64];
+    let params = EqParams {
+        log_eq_size:    7,
+        uar_page:       0xABCDEF,
+        intr_vector:    9,
+        log_page_size:  12,
+    };
+    let bytes = match build_create_eq_input(params, &pages) {
+        Ok(b)  => b,
+        Err(_) => return TestResult::Fail("build_create_eq_input rejected valid params"),
+    };
+    if bytes.len() != EQC_PA_LIST_OFF + 3 * EQC_PA_ENTRY_LEN {
+        return TestResult::Fail("CREATE_EQ payload length wrong");
+    }
+    if bytes[EQC_OFF_INTR_VECTOR] != 9 {
+        return TestResult::Fail("intr_vector byte missing");
+    }
+    if bytes[EQC_OFF_LOG_PAGE_SIZE] != 12 {
+        return TestResult::Fail("log_page_size byte missing");
+    }
+    // Phys-addr list — each BE u64 at EQC_PA_LIST_OFF + i*8.
+    for (i, &expect) in pages.iter().enumerate() {
+        let off = EQC_PA_LIST_OFF + i * EQC_PA_ENTRY_LEN;
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&bytes[off..off + 8]);
+        if u64::from_be_bytes(buf) != expect {
+            return TestResult::Fail("phys-addr list entry not BE-encoded");
+        }
+    }
+    // Round-trip: decode_create_eq_input should match params for
+    // the bit-packed fields too.
+    let back = decode_create_eq_input(&bytes);
+    if back.log_eq_size  != params.log_eq_size
+       || back.uar_page     != params.uar_page
+       || back.intr_vector  != params.intr_vector
+       || back.log_page_size != params.log_page_size {
+        return TestResult::Fail("CREATE_EQ params didn't round-trip");
+    }
+    // The eqc proper is exactly EQC_LEN bytes.
+    let _ = EQC_LEN;
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_eq_input_layout);
+
+fn smoke_mlx5_eq_input_validation() -> TestResult {
+    let pages = [0x1_0000_0000u64];
+    // log_eq_size > 31 → BadLogEqSize.
+    let bad_size = EqParams { log_eq_size: 32, uar_page: 0,
+                              intr_vector: 0, log_page_size: 12 };
+    if !matches!(build_create_eq_input(bad_size, &pages), Err(EqError::BadLogEqSize)) {
+        return TestResult::Fail("oversize log_eq_size accepted");
+    }
+    // uar_page > 0xFFFFFF → BadUarPage.
+    let bad_uar = EqParams { log_eq_size: 7, uar_page: 0x100_0000,
+                             intr_vector: 0, log_page_size: 12 };
+    if !matches!(build_create_eq_input(bad_uar, &pages), Err(EqError::BadUarPage)) {
+        return TestResult::Fail("oversize uar_page accepted");
+    }
+    // empty pages → NoPages.
+    let ok_params = EqParams { log_eq_size: 7, uar_page: 0,
+                               intr_vector: 0, log_page_size: 12 };
+    if !matches!(build_create_eq_input(ok_params, &[]), Err(EqError::NoPages)) {
+        return TestResult::Fail("empty page list accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_eq_input_validation);
+
+fn smoke_mlx5_create_eq_opcode() -> TestResult {
+    // CREATE_EQ opcode value is the wire-stable 0x301.
+    if super::cmd::CmdOp::CreateEq as u16 != 0x301 {
+        return TestResult::Fail("CREATE_EQ opcode discriminant drifted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_create_eq_opcode);

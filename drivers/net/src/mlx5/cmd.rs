@@ -84,6 +84,10 @@ pub enum CmdOp {
     /// Opcode `0x101`. Useful as the very first command exchanged
     /// after bring-up to confirm the cmd-mailbox transport works.
     Nop         = 0x101,
+    /// `CREATE_EQ` — allocate an Event Queue. Opcode `0x301`. Input
+    /// mailbox carries the 256-byte eqc + an 8-byte phys-addr list
+    /// for the backing pages.
+    CreateEq    = 0x301,
 }
 
 /// Status codes the firmware writes into byte 0x20 of the CQE.

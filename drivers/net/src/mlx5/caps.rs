@@ -33,6 +33,8 @@
 extern crate alloc;
 use alloc::vec::Vec;
 
+use super::bit_field::read_bits_be;
+
 /// Decoded-payload length for QUERY_HCA_CAP. Firmware returns a
 /// 4-KiB structure regardless of which subgroup of fields is
 /// populated.
@@ -47,6 +49,17 @@ pub const HCA_CAP_OFF_LOG_MAX_CQ_SZ:  usize = 0x53;
 pub const HCA_CAP_OFF_LOG_MAX_EQ_SZ:  usize = 0x5B;
 pub const HCA_CAP_OFF_LOG_MAX_MKEY:   usize = 0x60;
 pub const HCA_CAP_OFF_LOG_MAX_PD:     usize = 0x68;
+
+// Bit-packed fields (see Stage 6 — `bit_field.rs` does the math).
+//
+// Per PRM mlx5_ifc layout, log_max_qp lives at the low 5 bits of
+// the 32-bit BE word at byte offset 0x44 — i.e. bit positions
+// 0x44*8 + 27 .. 0x44*8 + 31. log_max_eq lives at low 4 bits of
+// byte 0x47.
+pub const HCA_CAP_BIT_LOG_MAX_QP:   usize = 0x44 * 8 + 27;
+pub const HCA_CAP_BIT_LOG_MAX_QP_W: usize = 5;
+pub const HCA_CAP_BIT_LOG_MAX_EQ:   usize = 0x47 * 8 + 28;
+pub const HCA_CAP_BIT_LOG_MAX_EQ_W: usize = 4;
 
 // Ethernet-offload field offsets (relative to start of the cap
 // payload — the same 4-KiB structure shape, just different
@@ -109,6 +122,20 @@ impl HcaGeneralCaps {
     pub fn log_max_mkey(&self)   -> u8 { self.bytes[HCA_CAP_OFF_LOG_MAX_MKEY] }
     /// Max number of protection domains, 2^N.
     pub fn log_max_pd(&self)     -> u8 { self.bytes[HCA_CAP_OFF_LOG_MAX_PD] }
+
+    /// Max number of QPs, 2^N. Bit-packed at the low 5 bits of byte
+    /// 0x47 (within the 32-bit BE word starting at 0x44).
+    pub fn log_max_qp(&self) -> u8 {
+        read_bits_be(&self.bytes,
+            HCA_CAP_BIT_LOG_MAX_QP, HCA_CAP_BIT_LOG_MAX_QP_W) as u8
+    }
+
+    /// Max number of EQs, 2^N. Bit-packed at the low 4 bits of byte
+    /// 0x47 (within the 32-bit BE word starting at 0x44).
+    pub fn log_max_eq(&self) -> u8 {
+        read_bits_be(&self.bytes,
+            HCA_CAP_BIT_LOG_MAX_EQ, HCA_CAP_BIT_LOG_MAX_EQ_W) as u8
+    }
 
     /// Raw bytes — full 4-KiB payload. Stable so callers decoding
     /// fields beyond Stage-5's committed subset don't have to fork

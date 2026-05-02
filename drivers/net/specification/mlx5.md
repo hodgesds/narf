@@ -1,6 +1,6 @@
 # mlx5 — Specification
 
-> Status: **v0.5** (Stage 5: typed cap decoders — General + Ethernet offload).
+> Status: **v0.6** (Stage 6: bit_field helper + bit-packed caps + CREATE_EQ layout).
 >
 > Clean-room driver for Mellanox / NVIDIA ConnectX-4 / 5 / 6 / 7
 > family Ethernet + InfiniBand HCAs. Reference material: the
@@ -136,6 +136,20 @@ have a server target with a ConnectX HCA in CI.
 
 - **v0.1** (Stage 1): PCI match + init-segment decoder +
   initializing-bit poll + smokes co-located in driver dir.
+- **v0.6** (Stage 6): `bit_field.rs` provides MSB-first absolute-bit
+  read/write helpers (`read_bits_be` / `write_bits_be`) for the
+  `mlx5_ifc` convention used everywhere in the PRM. Two new
+  bit-packed cap accessors land on `HcaGeneralCaps` —
+  `log_max_qp` (5 bits at byte 0x47 low) and `log_max_eq` (4 bits
+  at byte 0x47 low nibble). `CmdOp::CreateEq = 0x301` opcode.
+  `mlx5/eq.rs` lays out the 256-byte EQ context (eqc) +
+  `build_create_eq_input(params, &pages)` producing the
+  CREATE_EQ input mailbox payload (eqc + 8-byte BE phys-addr
+  list); `decode_create_eq_input` round-trips the bit-packed +
+  byte-aligned fields (log_eq_size, uar_page, intr_vector,
+  log_page_size). Validation rejects oversize log_eq_size /
+  uar_page + empty page lists. Live CREATE_EQ posting + UAR
+  doorbell wiring are Stage 7.
 - **v0.5** (Stage 5): typed cap decoders in `mlx5/caps.rs`.
   `HcaGeneralCaps` exposes vhca_id (BE u16 at 0x10),
   log_max_srq_sz (0x40), log_max_qp_sz (0x41), log_max_cq_sz
