@@ -67,6 +67,105 @@ pub unsafe fn read_device_config(region: &VirtioRegion)
 
 mod tests;
 
+// ── Stage 2: §5.10.6 virtio_vsock_hdr + ops ─────────────────────────
+
+/// Per-packet operation type (VirtIO 1.2 §5.10.6).
+#[repr(u16)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum VsockOp {
+    Request       = 1,
+    Response      = 2,
+    Rst           = 3,
+    Shutdown      = 4,
+    Rw            = 5,
+    CreditUpdate  = 6,
+    CreditRequest = 7,
+}
+
+impl VsockOp {
+    pub fn from_raw(v: u16) -> Option<Self> {
+        Some(match v {
+            1 => Self::Request,
+            2 => Self::Response,
+            3 => Self::Rst,
+            4 => Self::Shutdown,
+            5 => Self::Rw,
+            6 => Self::CreditUpdate,
+            7 => Self::CreditRequest,
+            _ => return None,
+        })
+    }
+}
+
+/// `virtio_vsock_hdr` — packet header (VirtIO 1.2 §5.10.6).
+///
+/// Wire layout (44 bytes, all LE):
+///   +0x00 src_cid    : u64
+///   +0x08 dst_cid    : u64
+///   +0x10 src_port   : u32
+///   +0x14 dst_port   : u32
+///   +0x18 len        : u32
+///   +0x1C type       : u16
+///   +0x1E op         : u16
+///   +0x20 flags      : u32
+///   +0x24 buf_alloc  : u32
+///   +0x28 fwd_cnt    : u32
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct VsockHdr {
+    pub src_cid:   u64,
+    pub dst_cid:   u64,
+    pub src_port:  u32,
+    pub dst_port:  u32,
+    pub len:       u32,
+    pub typ:       u16,
+    pub op:        VsockOp,
+    pub flags:     u32,
+    pub buf_alloc: u32,
+    pub fwd_cnt:   u32,
+}
+
+impl VsockHdr {
+    /// §5.10.6 header wire size.
+    pub const WIRE_SIZE: usize = 44;
+
+    /// `type = VIRTIO_VSOCK_TYPE_STREAM` (§5.10.6).
+    pub const TYPE_STREAM: u16 = 1;
+
+    pub fn encode(&self) -> [u8; Self::WIRE_SIZE] {
+        let mut b = [0u8; Self::WIRE_SIZE];
+        b[0x00..0x08].copy_from_slice(&self.src_cid.to_le_bytes());
+        b[0x08..0x10].copy_from_slice(&self.dst_cid.to_le_bytes());
+        b[0x10..0x14].copy_from_slice(&self.src_port.to_le_bytes());
+        b[0x14..0x18].copy_from_slice(&self.dst_port.to_le_bytes());
+        b[0x18..0x1C].copy_from_slice(&self.len.to_le_bytes());
+        b[0x1C..0x1E].copy_from_slice(&self.typ.to_le_bytes());
+        b[0x1E..0x20].copy_from_slice(&(self.op as u16).to_le_bytes());
+        b[0x20..0x24].copy_from_slice(&self.flags.to_le_bytes());
+        b[0x24..0x28].copy_from_slice(&self.buf_alloc.to_le_bytes());
+        b[0x28..0x2C].copy_from_slice(&self.fwd_cnt.to_le_bytes());
+        b
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::WIRE_SIZE { return None; }
+        let src_cid   = u64::from_le_bytes(bytes[0x00..0x08].try_into().ok()?);
+        let dst_cid   = u64::from_le_bytes(bytes[0x08..0x10].try_into().ok()?);
+        let src_port  = u32::from_le_bytes(bytes[0x10..0x14].try_into().ok()?);
+        let dst_port  = u32::from_le_bytes(bytes[0x14..0x18].try_into().ok()?);
+        let len       = u32::from_le_bytes(bytes[0x18..0x1C].try_into().ok()?);
+        let typ       = u16::from_le_bytes(bytes[0x1C..0x1E].try_into().ok()?);
+        let op_raw    = u16::from_le_bytes(bytes[0x1E..0x20].try_into().ok()?);
+        let op        = VsockOp::from_raw(op_raw)?;
+        let flags     = u32::from_le_bytes(bytes[0x20..0x24].try_into().ok()?);
+        let buf_alloc = u32::from_le_bytes(bytes[0x24..0x28].try_into().ok()?);
+        let fwd_cnt   = u32::from_le_bytes(bytes[0x28..0x2C].try_into().ok()?);
+        Some(Self {
+            src_cid, dst_cid, src_port, dst_port, len, typ, op,
+            flags, buf_alloc, fwd_cnt,
+        })
+    }
+}
+
 // ── Driver-match registration ───────────────────────────────────────
 
 /// Probed virtio-vsock controller. Stage-1 surface: discovered cap
