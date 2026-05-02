@@ -5,6 +5,7 @@ pub mod asm;
 pub mod cpu;
 pub mod cpuid;
 pub mod cr;
+pub mod hfi;
 pub mod io_port;
 pub mod mce;
 pub mod microcode;
@@ -15,7 +16,9 @@ pub mod pit;
 pub mod pks;
 pub mod probe;
 pub mod rtc;
+pub mod smp;
 pub mod spec_ctrl;
+pub mod topology;
 pub mod tsc;
 pub mod user_mode;
 

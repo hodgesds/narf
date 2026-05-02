@@ -65,7 +65,7 @@ intra-address-space isolation.
   framekernel's domain model.
 - **Verification and observability are first-class.** A kernel-resident
   test harness (`cargo xtask test`) boots the real kernel under QEMU and
-  asserts on live invariants — 571 smokes on x86_64, 292 on aarch64 at
+  asserts on live invariants — 573 smokes on x86_64, 292 on aarch64 at
   time of writing — alongside USDT-style probes, flight-recorder rings, a
   PMU-sampling surface, and an ABI promise (syscall numbers carry an upper
   8-bit version, `relibc` will gate against it). Bugs are caught at the
@@ -315,6 +315,27 @@ Live from boot through `cargo xtask run`:
   DRAM energy reads, plus `read_temp_c` / `read_pkg_temp_c`
   built on `MSR_IA32_THERM_STATUS` + `MSR_TEMPERATURE_TARGET`.
   Spec: `power/specification/cpu-power.md` §3.
+- CPU topology (`narf_arch::x86_64::topology`): CPUID 0x1F (V2
+  extended topology) preferred + 0x0B (extended topology) +
+  0x04 (deterministic cache parameters) + 0x1A (hybrid info).
+  Returns `Topology { levels, n_levels, package_count,
+  core_count, thread_count, hybrid, core_type }` + per-level
+  `CacheLevelInfo` for L1/L2/L3 size, line, ways, sets,
+  threads-sharing. Spec: `arch/specification/smp-topology.md` §1.
+- SMP CPU bring-up (`narf_arch::x86_64::smp`): xAPIC + x2APIC
+  ICR helpers for the INIT-IPI / SIPI-IPI / SIPI-IPI sequence
+  per SDM Vol 3 §9.4.4.1. `aps_from_madt(&Tables, bsp_apic_id)`
+  extracts the AP APIC-id list from ACPI MADT entries
+  (LocalApic + LocalX2Apic), `start_ap_xapic(lapic_mmio,
+  apic_id, trampoline_phys)` blocks until the AP bumps the
+  alive counter via `mark_alive()`. Spec:
+  `arch/specification/smp-topology.md` §2.
+- Intel HFI / Thread Director (`narf_arch::x86_64::hfi`):
+  per SDM Vol 4 §14.6 — CPUID(7, 1).EAX[19] gate, the
+  `IA32_HW_FEEDBACK_PTR` / `CONFIG` / `THREAD_FEEDBACK_CHAR`
+  MSR write surface, and a timestamp poll for detecting class
+  changes on the per-package feedback page. Spec:
+  `arch/specification/smp-topology.md` §3.
 - Intel HD Audio (HDA): clean-room driver for the AMD Ryzen /
   Phoenix and Radeon HD Audio Controllers — BAR0 mapping, GCTL
   reset, CORB/RIRB ring DMA, STATESTS codec walk, Get Parameter
@@ -338,7 +359,7 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **571/0/25** smokes;
+`cargo xtask test --arch=x86_64` passes **573/0/27** smokes;
 `--arch=aarch64` passes **294/0/10**. Skips are x86-specific PCIe
 surfaces or live-device tests that skip cleanly when QEMU doesn't
 expose the device. See `STATUS.md` for the full tally and per-

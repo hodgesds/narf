@@ -321,3 +321,69 @@ fn smoke_generic_timer_calibrate() -> TestResult {
 }
 #[cfg(target_arch = "aarch64")]
 kernel_test_in!("arch/timer", smoke_generic_timer_calibrate);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_topology_discover() -> TestResult {
+    use crate::x86_64::topology;
+    let t = topology::discover();
+    if t.thread_count == 0 {
+        return TestResult::Fail("thread_count = 0");
+    }
+    if t.core_count == 0 {
+        return TestResult::Fail("core_count = 0");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/topology", smoke_topology_discover);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_topology_caches_l1() -> TestResult {
+    use crate::x86_64::topology;
+    let caches = topology::discover_caches();
+    let l1 = caches.iter().flatten().find(|c| c.level == 1);
+    let l1 = match l1 {
+        Some(c) => c,
+        None    => return TestResult::Skip("no L1 cache info"),
+    };
+    if l1.line_size < 16 || l1.line_size > 256 {
+        return TestResult::Fail("L1 line size implausible");
+    }
+    if l1.bytes < 1024 {
+        return TestResult::Fail("L1 size implausible");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/topology", smoke_topology_caches_l1);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_smp_aps_from_madt() -> TestResult {
+    use crate::x86_64::{acpi, smp};
+    // SAFETY: kernel-test CPL=0; ACPI low-memory walk safe.
+    let t = match unsafe { acpi::discover() } {
+        Ok(t) => t,
+        Err(_) => return TestResult::Skip("no ACPI tables"),
+    };
+    // Treat APIC id 0 as the BSP for the QEMU default `-smp 1`
+    // case; on real `-smp >1` the list grows.
+    let aps = smp::aps_from_madt(&t, /*bsp=*/0);
+    let _ = aps;
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/smp", smoke_smp_aps_from_madt);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_hfi_caps() -> TestResult {
+    use crate::x86_64::hfi;
+    let c = hfi::caps();
+    // QEMU TCG won't advertise HFI; on real Alder Lake hosts it
+    // will. Either is acceptable — just verify shape consistency.
+    if c.supported && c.n_classes == 0 {
+        return TestResult::Fail("HFI supported but n_classes = 0");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/hfi", smoke_hfi_caps);
