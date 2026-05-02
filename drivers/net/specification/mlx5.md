@@ -1,6 +1,6 @@
 # mlx5 — Specification
 
-> Status: **v0.9** (Stage 9: CREATE_QP + MODIFY_QP state machine).
+> Status: **v0.10** (Stage 10: WQE / CQE wire format + SQ doorbell).
 >
 > Clean-room driver for Mellanox / NVIDIA ConnectX-4 / 5 / 6 / 7
 > family Ethernet + InfiniBand HCAs. Reference material: the
@@ -136,6 +136,38 @@ have a server target with a ConnectX HCA in CI.
 
 - **v0.1** (Stage 1): PCI match + init-segment decoder +
   initializing-bit poll + smokes co-located in driver dir.
+- **v0.10** (Stage 10): WQE / CQE wire format work + SQ
+  doorbell. `mlx5/wqe.rs` lays out the 16-byte send-WQE control
+  segment (`build_ctrl_segment(opcode, qp_num, wqe_idx, ds,
+  cqe_req, signature)` — opcode at bits[7:0] of dword 0, wqe_idx
+  at bits[23:8] of dword 0, qp_num at bits[31:8] of dword 1, ds
+  count at bits[7:0] of dword 1, signature at bits[31:24] of
+  dword 2) plus the 16-byte pointer-data segment (`build_data_seg_ptr(
+  byte_count, l_key, va)` — four BE u32 dwords). `SendOpcode`
+  enum surfaces NOP / SND_INV / RDMA_WRITE / SEND / SEND_IMM /
+  RDMA_READ / ATOMIC_CS / ATOMIC_FA at their PRM-pinned values.
+  `mlx5/cqe.rs` lays out the 64-byte CQE — `byte_count` (BE u32
+  at 0x14), `status` (byte 0x37), `wqe_counter` (BE u16 at 0x38),
+  `qp_op_own` (BE u32 at 0x3C: bits[31:8] qp_num, bits[7:4]
+  opcode, bit[0] owner). `decode_cqe` returns a typed `CqeView`;
+  `is_hw_owned` polls bit 0 of byte 0x3F. `CqeOpcode` enum
+  (Requester / ResponderRdmaWrite / ResponderSend / Resize /
+  NoOp / Error) + `CqeStatus` catalog (Success / LocalLengthError
+  / LocalQpOpError / LocalProtectionError / WrFlushedError /
+  MwBindError / BadResponseError / LocalAccessError /
+  RemoteInvalidRequest / RemoteAccessError / RemoteOpError /
+  Unknown(raw)). `simulate_completion` test-harness helper.
+  `Mlx5Hca::ring_sq_doorbell(uar_page, qp_num, wqe_idx)` writes
+  to UAR offset 0x800 — the documented SQ-doorbell offset within
+  a UAR page; doorbell value packs qp_num in high 24 bits and
+  the wqe_idx low byte. Live `post_send` / `post_recv` /
+  `poll_cq` higher-level wrappers will land in Stage 11 once the
+  SQ/RQ-region offsets within the QP buffer are finalised.
+  Six new smokes: control-segment round-trip, data-segment
+  round-trip, send-opcode discriminants pinned, CQE
+  decode round-trip via simulate_completion, ownership-bit
+  toggle isolated to bit 0 of byte 0x3F, CqeStatus catalog
+  including unmapped → Unknown.
 - **v0.9** (Stage 9): six new opcodes for the QP family —
   `CreateQp` (0x500), `DestroyQp` (0x501), `Rst2InitQp`
   (0x502), `Init2RtrQp` (0x503), `Rtr2RtsQp` (0x504), `ToRstQp`

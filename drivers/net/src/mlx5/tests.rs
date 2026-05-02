@@ -1184,3 +1184,152 @@ fn smoke_mlx5_qp_transition_opcode_mapping() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/mlx5", smoke_mlx5_qp_transition_opcode_mapping);
+
+// ── Stage 10: WQE + CQE layout ─────────────────────────────────────
+
+use super::wqe::{
+    build_ctrl_segment, build_data_seg_ptr,
+    ctrl_ds, ctrl_opcode, ctrl_qp_num, ctrl_wqe_idx,
+    decode_data_seg_ptr,
+    CqeRequest, SendOpcode, CTRL_SEG_LEN, DATA_SEG_LEN,
+};
+use super::cqe::{
+    decode_cqe, is_hw_owned, simulate_completion as simulate_cqe,
+    CqeOpcode, CqeStatus, CqeView, CQE_LEN as CQE_RING_LEN,
+    CQE_OFF_QP_OP_OWN, CQE_OWNER_BIT,
+};
+
+fn smoke_mlx5_wqe_ctrl_segment_round_trip() -> TestResult {
+    let seg = build_ctrl_segment(
+        SendOpcode::Send,
+        /* qp_num */ 0x12_3456,
+        /* wqe_idx */ 0xABCD,
+        /* ds */ 3,
+        CqeRequest::AlwaysCqe,
+        /* signature */ 0x77,
+    );
+    if seg.len() != CTRL_SEG_LEN {
+        return TestResult::Fail("control segment length wrong");
+    }
+    if ctrl_opcode(&seg) != SendOpcode::Send as u8 {
+        return TestResult::Fail("opcode not BE-encoded at bits[7:0] of dword 0");
+    }
+    if ctrl_qp_num(&seg) != 0x12_3456 {
+        return TestResult::Fail("qp_num not BE-encoded at bits[31:8] of dword 1");
+    }
+    if ctrl_wqe_idx(&seg) != 0xABCD {
+        return TestResult::Fail("wqe_idx not BE-encoded at bits[23:8] of dword 0");
+    }
+    if ctrl_ds(&seg) != 3 {
+        return TestResult::Fail("ds count not BE-encoded at bits[7:0] of dword 1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_wqe_ctrl_segment_round_trip);
+
+fn smoke_mlx5_wqe_data_seg_round_trip() -> TestResult {
+    let seg = build_data_seg_ptr(
+        /* byte_count */ 0xDEAD_BEEF,
+        /* l_key */     0xCAFE_F00D,
+        /* va */        0x0000_0001_2345_6789,
+    );
+    if seg.len() != DATA_SEG_LEN {
+        return TestResult::Fail("data segment length wrong");
+    }
+    let (bc, lk, va) = decode_data_seg_ptr(&seg);
+    if bc != 0xDEAD_BEEF { return TestResult::Fail("byte_count round-trip"); }
+    if lk != 0xCAFE_F00D { return TestResult::Fail("l_key round-trip"); }
+    if va != 0x0000_0001_2345_6789 { return TestResult::Fail("va round-trip"); }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_wqe_data_seg_round_trip);
+
+fn smoke_mlx5_send_opcode_pins() -> TestResult {
+    let pairs: &[(SendOpcode, u8)] = &[
+        (SendOpcode::Nop,                0x00),
+        (SendOpcode::SndInv,             0x01),
+        (SendOpcode::RdmaWrite,          0x08),
+        (SendOpcode::RdmaWriteImmediate, 0x09),
+        (SendOpcode::Send,               0x0A),
+        (SendOpcode::SendImmediate,      0x0B),
+        (SendOpcode::RdmaRead,           0x10),
+        (SendOpcode::AtomicCs,           0x11),
+        (SendOpcode::AtomicFa,           0x12),
+    ];
+    for &(op, want) in pairs {
+        if op as u8 != want {
+            return TestResult::Fail("send opcode discriminant drifted");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_send_opcode_pins);
+
+fn smoke_mlx5_cqe_decode_round_trip() -> TestResult {
+    let mut cqe = [0u8; CQE_RING_LEN];
+    // SW-completed CQE — owner bit cleared.
+    simulate_cqe(&mut cqe,
+        /* byte_count */ 1500,
+        /* status */     0,
+        /* wqe_counter */ 0xBEEF,
+        /* qp_num */     0x12_3456,
+        CqeOpcode::ResponderSend);
+    if is_hw_owned(&cqe) {
+        return TestResult::Fail("simulate_completion left HW-owner bit set");
+    }
+    let view = decode_cqe(&cqe);
+    let want = CqeView {
+        byte_count:  1500,
+        status:      CqeStatus::Success,
+        wqe_counter: 0xBEEF,
+        qp_num:      0x12_3456,
+        opcode:      CqeOpcode::ResponderSend,
+        owner:       false,
+    };
+    if view != want {
+        return TestResult::Fail("CQE round-trip mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_cqe_decode_round_trip);
+
+fn smoke_mlx5_cqe_owner_bit_check() -> TestResult {
+    let mut cqe = [0u8; CQE_RING_LEN];
+    // Initially HW owns (default firmware-side init sets bit 0).
+    cqe[CQE_OFF_QP_OP_OWN + 3] |= CQE_OWNER_BIT;
+    if !is_hw_owned(&cqe) {
+        return TestResult::Fail("HW-owner bit not detected");
+    }
+    cqe[CQE_OFF_QP_OP_OWN + 3] &= !CQE_OWNER_BIT;
+    if is_hw_owned(&cqe) {
+        return TestResult::Fail("clear owner bit still reported HW-owned");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_cqe_owner_bit_check);
+
+fn smoke_mlx5_cqe_status_catalog() -> TestResult {
+    let pairs: &[(u8, CqeStatus)] = &[
+        (0x00, CqeStatus::Success),
+        (0x01, CqeStatus::LocalLengthError),
+        (0x02, CqeStatus::LocalQpOpError),
+        (0x04, CqeStatus::LocalProtectionError),
+        (0x05, CqeStatus::WrFlushedError),
+        (0x06, CqeStatus::MwBindError),
+        (0x10, CqeStatus::BadResponseError),
+        (0x11, CqeStatus::LocalAccessError),
+        (0x12, CqeStatus::RemoteInvalidRequest),
+        (0x13, CqeStatus::RemoteAccessError),
+        (0x14, CqeStatus::RemoteOpError),
+    ];
+    for &(raw, want) in pairs {
+        if CqeStatus::from_raw(raw) != want {
+            return TestResult::Fail("CqeStatus catalog mismatch");
+        }
+    }
+    if !matches!(CqeStatus::from_raw(0xFE), CqeStatus::Unknown(0xFE)) {
+        return TestResult::Fail("unmapped status not preserved as Unknown");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_cqe_status_catalog);

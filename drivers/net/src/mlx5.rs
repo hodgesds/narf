@@ -44,8 +44,10 @@ pub mod caps;
 pub mod cmd;
 pub mod cq;
 pub mod eq;
+pub mod cqe;
 pub mod mailbox;
 pub mod qp;
+pub mod wqe;
 
 // ── PCI device IDs (ConnectX-4 .. ConnectX-6 Dx) ───────────────────
 
@@ -889,6 +891,23 @@ impl Mlx5Hca {
         self.qps.lock().iter()
             .find(|q| q.qp_number == qp_number)
             .map(|q| q.state)
+    }
+
+    /// Stage 10: ring the SQ doorbell for `qp_number`. UAR offset
+    /// 0x800 is the documented PRM SQ-doorbell offset within a UAR
+    /// page; the value carries the wqe_idx of the next-to-post WQE
+    /// + the qp_num. PRM §11.4.4.
+    pub fn ring_sq_doorbell(
+        &self,
+        uar_page:  u32,
+        qp_number: u32,
+        wqe_idx:   u16,
+    ) {
+        // Doorbell value: bits[31:8] = qp_num, bits[7:0] = wqe_idx
+        // low byte. Some HCAs use a 16-bit wqe_idx — Stage 10 stays
+        // with the documented 8-bit form for SEND.
+        let val = ((qp_number & 0x00FF_FFFF) << 8) | (wqe_idx as u32 & 0xFF);
+        self.uar_write32(uar_page, 0x800, val);
     }
 
     /// Stage 5: typed wrapper around QUERY_HCA_CAP(GeneralDevice).
