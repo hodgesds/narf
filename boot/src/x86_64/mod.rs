@@ -92,19 +92,24 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
     })
 }
 
-/// Scan a multiboot2 info structure for the first module entry
-/// whose cmdline is `"initramfs"` (case-insensitive). Returns
-/// the module's phys range as a `MemRegion`. `None` when no
-/// matching module is present, when the bootloader didn't pass
-/// multiboot2 magic, or when the info pointer is null.
-fn scan_initramfs_module(_raw: &crate::RawBootInfo) -> Option<MemRegion> {
-    // Stage-1 cut: multiboot2 module parsing isn't wired here
-    // yet; the existing memory-map walker has a separate path
-    // and the module-tag parser is its own work item. Returns
-    // `None` for now so `narf-initramfs::register_initcalls`
-    // emits `NotPresent` and consumers see no initramfs. When
-    // the parser lands it walks `_raw.payload` looking for
-    // `MULTIBOOT2_TAG_TYPE_MODULE` (= 3) entries and returns the
-    // first whose cmdline matches.
-    None
+/// Scan the PVH `hvm_start_info` module-list for the first
+/// entry whose cmdline is `"initramfs"` (case-insensitive).
+/// Returns the module's phys range as a `MemRegion` of kind
+/// `Reserved` (initramfs lives outside Usable RAM by spec). `None`
+/// when no matching module is present, when the bootloader didn't
+/// pass PVH magic, or when the info pointer is null.
+fn scan_initramfs_module(raw: &crate::RawBootInfo) -> Option<MemRegion> {
+    if raw.payload.raw() == 0 { return None; }
+    // SAFETY: bootloader contract — `raw.payload` points at a
+    // valid `hvm_start_info`; magic mismatch returns `None` from
+    // the parser without dereferencing modlist memory.
+    let (start, size) = unsafe {
+        multiboot2::initramfs_module(raw.payload.raw() as usize)?
+    };
+    if size == 0 { return None; }
+    Some(MemRegion {
+        start: PhysAddr::new(start),
+        len:   size,
+        kind:  MemRegionKind::Reserved,
+    })
 }

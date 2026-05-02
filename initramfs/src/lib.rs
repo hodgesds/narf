@@ -67,16 +67,86 @@ pub fn __reset_staged() {
     *STAGED.lock() = None;
 }
 
-/// Stage::Early initcall. Today a no-op marker — the boot
-/// path's bootloader-handoff parser (multiboot2 module / PVH
-/// modlist / FDT chosen-node) lives in `boot/`; once it lands
-/// it stages the parsed `Initramfs` here directly. The slot
-/// exists so consumers registered AFTER `initramfs-stage` at
-/// `Stage::Early` can rely on `staged()` returning
-/// `Some(_)` if the build profile expects an initramfs.
+/// Stage the parsed initramfs from a bootloader-supplied phys
+/// region, then call `install` so subsequent consumers see it.
+///
+/// The boot path calls this once, immediately after constructing
+/// `BootInfo`, with `boot_info.initramfs` if present. The phys
+/// range is identity-mapped at this point in boot. The parsed
+/// `Initramfs` is allocated on the heap and leaked via
+/// `Box::leak` so it lives for the kernel's lifetime, matching
+/// the spec's "stage once, borrow forever" principle.
+///
+/// # Safety
+/// `phys` + `len` must point at a readable, identity-mapped CPIO
+/// newc archive of exactly `len` bytes. The bootloader contract
+/// guarantees both for the region it advertises in
+/// `BootInfo::initramfs`.
+pub unsafe fn stage_from_phys(
+    name: &'static str,
+    phys: u64,
+    len:  u64,
+) -> Result<(), CpioError> {
+    if len == 0 { return Ok(()); }
+    // SAFETY: caller-asserted readability + identity mapping.
+    let archive: &'static [u8] = unsafe {
+        core::slice::from_raw_parts(phys as *const u8, len as usize)
+    };
+    let fs = Initramfs::from_cpio(name, archive)?;
+    let leaked: &'static Initramfs =
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));
+    install(leaked);
+    Ok(())
+}
+
+/// Mount the staged initramfs at `/boot` through the standard
+/// VFS surface. Idempotent — the FS registry rejects duplicate
+/// mount points, so a second call is a structural no-op. Returns
+/// `Ok(())` on successful mount, `Err(())` when no initramfs has
+/// been staged or the mount call rejected the request.
+pub fn mount_at_boot(
+    auth: &narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Grant>,
+) -> Result<(), ()> {
+    let fs = staged().ok_or(())?;
+    let proxy = MountProxy { fs };
+    narf_filesystem::registry()
+        .mount(auth, "/boot", proxy)
+        .map(|_handle| ())
+        .map_err(|_| ())
+}
+
+/// Newtype around `&'static Initramfs` that re-implements
+/// `FsInstance` by delegating to the underlying value. Used so
+/// `mount_at_boot` can hand the registry an owned value while
+/// preserving the canonical `'static` reference held by `STAGED`.
+#[derive(Debug)]
+struct MountProxy { fs: &'static Initramfs }
+
+impl narf_filesystem::FsInstance for MountProxy {
+    fn root(&self) -> alloc::sync::Arc<dyn narf_filesystem::DirOps> {
+        self.fs.root()
+    }
+    fn name(&self) -> &str {
+        self.fs.name()
+    }
+}
+
+/// Stage::Early `initramfs-stage` initcall reports whether
+/// `staged()` is populated by the boot-path handoff. Stage::Late
+/// `initramfs-mount-at-boot` mounts the staged FS at `/boot` so
+/// in-kernel + userspace consumers can resolve paths through the
+/// VFS rather than reaching `staged()` directly.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
     narf_init::register(Stage::Early, "initramfs-stage", || {
         if is_staged() { InitResult::Ok } else { InitResult::NotPresent }
+    });
+    narf_init::register(Stage::Late, "initramfs-mount-at-boot", || {
+        if !is_staged() { return InitResult::NotPresent; }
+        let auth = narf_filesystem::bootstrap_mount_authority();
+        match mount_at_boot(&auth) {
+            Ok(())  => InitResult::Ok,
+            Err(()) => InitResult::Error("mount_at_boot rejected"),
+        }
     });
 }

@@ -339,6 +339,39 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             let _ = writeln!(console::Writer,
                 "  usable RAM: {} MiB", usable_bytes / (1024 * 1024));
 
+            // Stage the bootloader-supplied initramfs (if any) so
+            // Stage::Late consumers (firmware scanner, /boot mount,
+            // userspace init binary loader) can borrow it. Done
+            // BEFORE the frame allocator goes live so the
+            // bootloader's reserved phys range is still
+            // unambiguously identity-mapped readable.
+            if let Some(region) = info.initramfs {
+                // SAFETY: bootloader contract — the region is
+                // identity-mapped reserved memory of exactly
+                // `region.len` bytes carrying a CPIO newc
+                // archive. `narf-initramfs` parses + leaks the
+                // result so the lifetime extends to kernel
+                // shutdown.
+                let staged = unsafe {
+                    narf_initramfs::stage_from_phys(
+                        "boot-initramfs",
+                        region.start.raw(),
+                        region.len,
+                    )
+                };
+                match staged {
+                    Ok(())  => {
+                        let _ = writeln!(console::Writer,
+                            "  initramfs: staged {} byte(s) at phys {:#x}",
+                            region.len, region.start.raw());
+                    }
+                    Err(e) => {
+                        let _ = writeln!(console::Writer,
+                            "  initramfs: parse rejected ({:?})", e);
+                    }
+                }
+            }
+
             // Bring the frame allocator online. Exclude the kernel image
             // itself so we don't hand out our own code/data as free frames.
             // SAFETY: __kernel_start / __kernel_end are linker-provided

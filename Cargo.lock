@@ -671,6 +671,7 @@ dependencies = [
  "narf-crypto",
  "narf-filesystem",
  "narf-init",
+ "narf-initramfs",
  "narf-io",
  "narf-kernel-test",
  "narf-lib",
@@ -699,6 +700,7 @@ dependencies = [
  "narf-graphics",
  "narf-graphics-driver",
  "narf-init",
+ "narf-initramfs",
  "narf-input",
  "narf-input-driver",
  "narf-interrupts",
@@ -740,6 +742,18 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-time",
+]
+
+[[package]]
+name = "narf-initramfs"
+version = "0.0.0"
+dependencies = [
+ "narf-boot",
+ "narf-capabilities",
+ "narf-filesystem",
+ "narf-init",
+ "narf-kernel-test",
+ "narf-lib",
 ]
 
 [[package]]

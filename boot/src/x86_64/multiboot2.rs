@@ -87,6 +87,84 @@ pub unsafe fn rsdp_phys(info_ptr: usize) -> Option<u64> {
     else { Some(hdr.rsdp_paddr) }
 }
 
+/// Walk the PVH `hvm_start_info` module-list and return the
+/// phys range of the first module whose cmdline is `"initramfs"`
+/// (case-insensitive). Returns `(start, size)` in bytes.
+///
+/// PVH `hvm_modlist_entry` layout (32 bytes, little-endian):
+///
+/// ```text
+/// offset  field          type
+/// 0x00    paddr          u64
+/// 0x08    size           u64
+/// 0x10    cmdline_paddr  u64
+/// 0x18    reserved       u64
+/// ```
+///
+/// `cmdline_paddr` is 0 when the bootloader supplied no cmdline,
+/// in which case the entry is skipped. `nr_modules == 0` returns
+/// `None` immediately.
+///
+/// # Safety
+/// - `info_ptr` must point at a valid `hvm_start_info` whose magic
+///   matches the PVH constant.
+/// - The modlist + each cmdline string must be readable for the
+///   bytes they describe (bootloader contract).
+pub unsafe fn initramfs_module(info_ptr: usize) -> Option<(u64, u64)> {
+    // SAFETY: caller-provided pointer to a valid PVH header.
+    let hdr = unsafe { (info_ptr as *const HvmStartInfo).read_unaligned() };
+    if hdr.magic != MAGIC || hdr._nr_modules == 0 || hdr._modlist == 0 {
+        return None;
+    }
+    let n = hdr._nr_modules as usize;
+    for i in 0..n {
+        let entry_ptr = hdr._modlist as usize
+            + i * core::mem::size_of::<HvmModlistEntry>();
+        // SAFETY: bootloader contract guarantees `n` valid
+        // entries at `modlist_paddr`.
+        let e = unsafe {
+            (entry_ptr as *const HvmModlistEntry).read_unaligned()
+        };
+        if e.cmdline_paddr == 0 { continue; }
+        // SAFETY: cmdline is a NUL-terminated ASCII string at
+        // `cmdline_paddr` per the PVH spec. We bound the scan at
+        // 256 bytes; "initramfs" fits in 9 + NUL.
+        let cmd = unsafe { read_cstr(e.cmdline_paddr as usize, 256) };
+        if cmd.eq_ignore_ascii_case(b"initramfs") {
+            return Some((e.paddr, e.size));
+        }
+    }
+    None
+}
+
+/// Read a NUL-terminated ASCII string from phys + bound the
+/// length at `max`. Returned slice borrows from physical memory;
+/// caller must drop it before the bootloader's reserved
+/// region can be reclaimed.
+///
+/// # Safety
+/// `phys + max` must be readable.
+unsafe fn read_cstr<'a>(phys: usize, max: usize) -> &'a [u8] {
+    let mut len = 0;
+    while len < max {
+        // SAFETY: caller-asserted readability.
+        let b = unsafe { ((phys + len) as *const u8).read_volatile() };
+        if b == 0 { break; }
+        len += 1;
+    }
+    // SAFETY: same readability contract; len ≤ max.
+    unsafe { core::slice::from_raw_parts(phys as *const u8, len) }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct HvmModlistEntry {
+    paddr:         u64,
+    size:          u64,
+    cmdline_paddr: u64,
+    _reserved:     u64,
+}
+
 /// Walk the `hvm_start_info` at `info_ptr`, writing up to `out_cap` parsed
 /// memory regions into `out`. Returns the count written.
 ///
