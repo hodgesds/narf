@@ -33,6 +33,7 @@ extern crate alloc;
 pub mod e1000;
 pub mod r8169;
 pub mod qcnfa765;
+pub mod mlx5;
 
 // Per-driver smoke tests register against `narf-kernel-test` and
 // land in the same `narf.tests` ELF section as the rest of the
@@ -53,6 +54,10 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "qcnfa765", || {
         qcnfa765::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "mlx5", || {
+        mlx5::register_pci_driver();
         InitResult::Ok
     });
 }

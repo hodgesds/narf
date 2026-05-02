@@ -1,0 +1,138 @@
+# mlx5 — Specification
+
+> Status: **v0.1** (Stage 1: presence + init-segment decoder).
+>
+> Clean-room driver for Mellanox / NVIDIA ConnectX-4 / 5 / 6 / 7
+> family Ethernet + InfiniBand HCAs. Reference material: the
+> public *Mellanox Programmer's Reference Manual* (PRM) — the
+> register layout, command-interface format, WQE/CQE shapes
+> are all openly published. No GPL Linux source consulted.
+
+## 1. Purpose & scope
+
+**Owns:** Bring-up of ConnectX-class HCAs through the documented
+init-segment register set + 64-byte command-mailbox interface,
+followed by EQ/CQ/QP/WQ allocation via firmware commands.
+
+**Does NOT own (Stage 1):** RDMA verbs, fast-path WQE
+construction, RoCE / steering tables, SR-IOV management.
+
+## 2. Why mlx5 is clean-room friendly
+
+Unlike GPUs (per-family register-offset sprawl), an mlx5 HCA
+exposes a tiny, *uniform* surface:
+
+- **BAR0 init segment** — ~32 documented dwords (fw_rev,
+  cmdif_rev, cmd_dbell, initializing-bit, health buffer). Same
+  layout across every ConnectX-4..7 SKU.
+- **64-byte command mailbox** at `cmdq_addr` — input/output
+  blocks both 64 bytes, opcode + opmod fields, all opcodes
+  enumerated in the PRM.
+- **BAR2 doorbell** — 4-KiB UAR (User Access Region) pages,
+  uniform across the family.
+- **WQE / CQE descriptors** in host RAM — formats fully
+  documented per packet type (Send / Recv / RoCE-v2 / etc.).
+
+There is no equivalent to amdgpu's "DCN block base shifts per
+SKU" — one offset table covers the whole family.
+
+## 3. Stage 1 scope
+
+This stage lands the *passive* pieces:
+
+- PCI match table covering ConnectX-4 (`0x1011`),
+  ConnectX-4 Lx (`0x1013`), ConnectX-4 Lx VF (`0x1015`),
+  ConnectX-5 (`0x1017`), ConnectX-5 Ex (`0x1019`),
+  ConnectX-6 (`0x101B`), and ConnectX-6 Dx (`0x101D`),
+  vendor `0x15B3` (Mellanox / NVIDIA).
+- `InitSegment` decoder over a 4 KiB BAR0 buffer, surfacing:
+  - `fw_rev_major` / `fw_rev_minor` / `fw_rev_subminor`
+  - `cmd_interface_rev`
+  - `cmdq_log_size` / `cmdq_addr` (host phys for the cmd
+    mailbox)
+  - `initializing` bit (set by FW while it is starting up;
+    driver waits for it to clear).
+  - 64-byte `health_buffer` raw block (parsed deeper in a
+    later stage).
+- `Mlx5Hca` struct with a `bring_up()` placeholder that:
+  - claims BAR0,
+  - decodes the init segment,
+  - polls the initializing bit with a documented timeout,
+  - records the bound driver against `narf-drivers`.
+- All register fields decoded as **big-endian**, per PRM §1.4
+  (the HCA register space is BE; driver byte-swaps on read).
+
+What this stage does NOT do:
+
+- Issue any firmware command (Stage 2).
+- Allocate EQ/CQ/QP (Stage 3+).
+- Bring up a queue or send/receive a packet.
+
+## 4. Init-segment layout (BAR0)
+
+The PRM defines the init segment at offset 0 of BAR0. Stage-1
+fields:
+
+| BAR0 off | name                | width | notes                |
+|----------|---------------------|-------|----------------------|
+| 0x0000   | `fw_rev_major`      | u16   | BE                   |
+| 0x0002   | `fw_rev_minor`      | u16   | BE                   |
+| 0x0004   | `fw_rev_subminor`   | u16   | BE                   |
+| 0x0006   | `cmd_interface_rev` | u16   | BE                   |
+| 0x0010   | `cmdq_addr_high`    | u32   | BE                   |
+| 0x0014   | `cmdq_addr_low_sz`  | u32   | low 4 bits = log2 sz |
+| 0x0018   | `cmd_dbell_vector`  | u32   | BE; one bit per slot |
+| 0x001C   | `health_buffer[64]` | bytes | raw, parsed later    |
+| 0x0FFC   | `initializing`      | u32   | bit 31 = initializing |
+
+The "initializing" register at offset `0x0FFC` is the documented
+gate: the driver MUST poll it and only proceed once bit 31
+clears. The PRM specifies a 2-second worst-case wait before the
+driver should declare the HCA dead.
+
+## 5. Public API (Stage 1)
+
+```rust
+pub struct InitSegment { /* decoded fields above */ }
+pub fn decode_init_segment(raw: &[u8; 0x1000]) -> InitSegment;
+pub fn is_initializing(raw: &[u8; 0x1000]) -> bool;
+
+pub struct Mlx5Hca { /* mmio + decoded segment */ }
+impl Mlx5Hca {
+    pub unsafe fn bring_up(dev: &BusDevice, cap: &Cap<…, Write>)
+        -> Result<Self, Mlx5Error>;
+    pub fn fw_rev(&self) -> (u16, u16, u16);
+    pub fn cmd_interface_rev(&self) -> u16;
+}
+```
+
+## 6. Smokes
+
+Per the user's "co-locate driver smokes with the driver" rule,
+all mlx5 smokes live in `drivers/net/src/mlx5/tests.rs` rather
+than the shared `drivers/net/src/tests.rs`. They:
+
+- assert the PCI match table is registered for the seven
+  ConnectX-4..6 IDs,
+- decode a synthetic 4 KiB init-segment buffer round-trip,
+- verify `is_initializing` correctly reads bit 31 of the
+  `0x0FFC` dword.
+
+Live-silicon `bring_up` tests will land alongside these once we
+have a server target with a ConnectX HCA in CI.
+
+## 7. Future stages
+
+- **Stage 2** — issue NOP / QUERY_HCA_CAP commands through the
+  64-byte mailbox, verify `cmd_dbell_vector` polling.
+- **Stage 3** — allocate UAR + EQ + CQ; subscribe to async
+  events.
+- **Stage 4** — allocate QP/SQ/RQ + send a single Ethernet
+  frame.
+- **Stage 5** — RSS steering table + multi-queue.
+- **Stage 6+** — RoCE-v2, RDMA verbs surface.
+
+## 8. Changelog
+
+- **v0.1** (Stage 1): PCI match + init-segment decoder +
+  initializing-bit poll + smokes co-located in driver dir.
