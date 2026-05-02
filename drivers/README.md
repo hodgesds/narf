@@ -33,15 +33,32 @@ kernel-test harness or boot-time driver loader calls those + then
 `bus::probe_all_pci(authority)` walks the bus and dispatches each
 device to the highest-specificity matching probe.
 
-| crate                          | match (vendor : device ids)             | data path                                    |
-|--------------------------------|-----------------------------------------|----------------------------------------------|
-| `narf-drivers-nvme`            | 0x1B36 : 0x0010 (QEMU NVMe)             | admin queue + IDENTIFY CTRL/NS + I/O queue + Read/Write LBA + MSI-X-driven completions |
-| `narf-drivers-virtio` (blk)    | 0x1AF4 : 0x1042 (virtio-blk modern)     | virtqueue 0 + polled & IRQ-driven Read/Write sector |
-| `narf-drivers-virtio` (net)    | 0x1AF4 : 0x1041 (virtio-net modern)     | RX + TX virtqueues, polled                   |
-| `narf-drivers-virtio` (rng)    | 0x1AF4 : 0x1044 (virtio-rng modern)     | structural probe (single virtqueue brought up) |
-| `narf-drivers-virtio` (balloon)| 0x1AF4 : 0x1045 (virtio-balloon modern) | structural probe (inflate+deflate queues)    |
-| `narf-drivers-net` (e1000)     | 0x8086 : 0x100C/0x100E/0x100F/0x10D3/0x153A | TX descriptor ring + RX descriptor ring + buffer pool, polled |
-| `narf-drivers-storage` (AHCI)  | 0x8086 : 0x2922 (ICH9), 0x3A22 (ICH10)  | HBA reset + port enumeration + IDENTIFY DEVICE + READ/WRITE DMA EXT |
+| crate                            | match (vendor : device ids)             | data path                                    |
+|----------------------------------|-----------------------------------------|----------------------------------------------|
+| `narf-drivers-nvme`              | 0x1B36 : 0x0010 (QEMU) + 3 Samsung VID/DIDs + class-storage backstop | admin queue + IDENTIFY CTRL/NS + I/O queue + Read/Write LBA + MSI-X-driven completions |
+| `narf-drivers-virtio` (blk)      | 0x1AF4 : 0x1042 | virtqueue 0 + polled & IRQ-driven Read/Write sector + MSI-X (q0) |
+| `narf-drivers-virtio` (net)      | 0x1AF4 : 0x1041 | RX + TX virtqueues, polled |
+| `narf-drivers-virtio` (rng)      | 0x1AF4 : 0x1044 | structural probe |
+| `narf-drivers-virtio` (balloon)  | 0x1AF4 : 0x1045 | structural probe |
+| `narf-drivers-virtio` (console)  | 0x1AF4 : 0x1043 / 0x1003 | receiveq + transmitq + emerg_wr cfg + write_bytes / read_bytes + MSI-X (receiveq) |
+| `narf-drivers-virtio` (scsi)     | 0x1AF4 : 0x1048 | controlq + eventq + cmdq[0] + submit_cmd + submit_tmf + REPORT LUNS + MSI-X (cmdq[0]) |
+| `narf-drivers-virtio` (9p)       | 0x1AF4 : 0x1009 | requestq + 9P2000.L Tversion/Rversion handshake + MSI-X (requestq) |
+| `narf-drivers-virtio` (fs)       | 0x1AF4 : 0x105A | hiprio + request[0] + FUSE-on-virtio submit_request + MSI-X (request[0]) |
+| `narf-drivers-virtio` (vsock)    | 0x1AF4 : 0x1053 | rx + tx + event queues + send/recv/drain_events + MSI-X (rx) |
+| `narf-drivers-virtio` (iommu)    | 0x1AF4 : 0x1057 | requestq + eventq + attach/detach/map/unmap + MSI-X (requestq) |
+| `narf-drivers-virtio` (gpu)      | 0x1AF4 : 0x1050 / 0x1010 | controlq + cursorq + 2D pipeline (init_scanout / paint_solid / paint_test_pattern / flush) + MSI-X (controlQ) |
+| `narf-drivers-virtio` (input)    | 0x1AF4 : 0x1052 | eventQ drain → `narf_input` global ring + MSI-X (eventQ) |
+| `narf-drivers-virtio` (snd)      | 0x1AF4 : 0x1059 | structural probe |
+| `narf-drivers-net` (e1000)       | 0x8086 : 0x100C/0x100E/0x100F/0x10D3/0x153A | TX descriptor ring + RX descriptor ring + buffer pool, polled |
+| `narf-drivers-net` (ixgbe)       | 0x8086 : 0x10FB / 0x1528 / 0x1563 / 0x15AB | reset + EEPROM MAC + advanced TX/RX + MSI-X + `HwNic` |
+| `narf-drivers-net` (mlx5)        | Mellanox ConnectX-4/5/6 family | clean-room cmdq + EQ/CQ/QP + WQE/CQE + flow steering + mkey + vport + teardown |
+| `narf-drivers-net` (r8169)       | 0x10EC : RTL8169 family | clean-room TX + RX descriptor ring + MSI-X |
+| `narf-drivers-net` (rtl8125)     | 0x10EC : 0x8125 / 0x3000 | clean-room PCI match + reset + MAC decode + TX descriptor layout |
+| `narf-drivers-net` (iwlwifi)     | 0x8086 : AX200/AX201/AX210/AX211 | structural probe only — operational register map blocked on public docs |
+| `narf-drivers-storage` (AHCI)    | 0x8086 : 0x2922 (ICH9), 0x3A22 (ICH10)  | HBA reset + port enumeration + IDENTIFY DEVICE + READ/WRITE DMA EXT |
+| `narf-drivers-usb` (xHCI)        | QEMU + AMD Phoenix VID/DIDs | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT |
+| `narf-drivers-usb` (HID kbd)     | xHCI hot-plug | Set Protocol(Boot) → interrupt-IN polling → Usage 0x07 → KeyCode press/release diff → `narf_input` |
+| `narf-firmware-fw-cfg`           | x86_64 PIO 0x510/0x511 | QEMU `fw_cfg` directory parse + `find` / `read` / `read_string` |
 
 ## Bus-level helpers each driver builds on
 

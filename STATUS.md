@@ -18,25 +18,32 @@ asks for. Updated when observable kernel behaviour changes.
   delivers hardware LAPIC-timer IRQs, exits cleanly.
 - `cargo xtask run --arch=aarch64` boots, runs the full async demo
   using CNTPCT_EL0 as the clock, exits via ARM semihosting.
-- `cargo xtask test --arch=x86_64` passes **255/255** kernel tests.
-- `cargo xtask test --arch=aarch64` passes **193/193** kernel tests
-  (3 skipped tests are x86_64-specific PCIe surfaces — virtio
-  device IDs that QEMU virt doesn't expose at the IDs we register).
-- 8 in-tree PCIe drivers running against real QEMU-emulated devices:
+- `cargo xtask test --arch=x86_64` passes **558/0/21** (pass / fail / skip).
+- `cargo xtask test --arch=aarch64` passes **292/0/10** (pass / fail / skip).
+  Skips are x86_64-specific PCIe surfaces or live-device tests that
+  skip cleanly when QEMU doesn't expose the device.
+- In-tree PCIe drivers running against real QEMU-emulated devices.
+  Every live virtio-PCI driver enables MSI-X on its primary
+  completion queue via the shared `pci::enable_msix_queue` helper;
+  consumers wait via `narf_interrupts::wait_for_irq(vector).await`.
+  The polled-completion fallback stays in place so sync callers and
+  IRQ-less environments keep working.
 
 | driver           | scope                                            |
 |------------------|--------------------------------------------------|
 | NVMe             | Admin queue + IDENTIFY CTRL + IDENTIFY NS + I/O queue + Read/Write + MSI-X-driven completions. |
-| virtio-blk-pci   | Modern transport. Polled + IRQ-driven Read/Write. |
-| virtio-net-pci   | Modern transport. TX + RX (polled).               |
-| virtio-rng-pci   | Modern transport. Structural probe.               |
-| virtio-balloon-pci | Modern transport. Structural probe.             |
-| virtio-iommu-pci | Modern transport. Stages 1-2 — PCI match (1AF4:1057) + §5.16.4 device-cfg decode + §5.16.6 request builders (ATTACH/DETACH/MAP/UNMAP/PROBE). No virtqueue traffic yet. |
-| virtio-scsi-pci  | Modern transport. Stages 1-2 — PCI match (1AF4:1048) + §5.6.6 pure-data builders for `virtio_scsi_cmd_req` / `virtio_scsi_cmd_resp` / `virtio_scsi_ctrl_tmf_req`. REPORT LUNS round-trip smoke. No virtqueue traffic yet. |
-| virtio-vsock-pci | Modern transport. Stages 1-2 — PCI match (1AF4:1053) + §5.10.4 device-cfg decode (`guest_cid: u64 LE`) + §5.10.6 `virtio_vsock_hdr` builder (44 bytes) with `VsockOp` enum (REQUEST/RESPONSE/RST/SHUTDOWN/RW/CREDIT_UPDATE/CREDIT_REQUEST). Per-op header round-trip smokes. No virtqueue traffic yet. |
-| virtio-fs-pci    | Modern transport. Stages 1-2 — PCI match (1AF4:105A) + §5.11.4 device-cfg decode (`tag[36]` + `num_request_queues: u32 LE`) + FUSE-on-virtio `fuse_in_header` (40 bytes, LE) builder with `FuseOpcode` (INIT=26 / LOOKUP=1 / GETATTR=3 / READ=15 / RELEASE=18). Encode/decode round-trip smoke. No virtqueue traffic, no VFS wire-up. |
-| virtio-9p-pci    | Legacy PCI match (1AF4:1009). Stages 1-2 — §5.9.4 device-cfg decode (`mount_tag_len: u16 LE` + `mount_tag`) + 9P2000.L wire-protocol builders for Tversion (100), Tattach (104), Twalk (110), Tlopen (12), Tread (116), Tclunk (120), plus `Header` / `Qid` (13 B) round-trips. Pure-data only — no virtqueue traffic yet. |
-| virtio-gpu-pci   | Modern + legacy PCI match (1AF4:1050 / 1AF4:1010). Pure-data builders for the six 2D commands (GET_DISPLAY_INFO / RESOURCE_CREATE_2D / ATTACH_BACKING / SET_SCANOUT / TRANSFER_TO_HOST_2D / RESOURCE_FLUSH) per VirtIO 1.2 §5.7.6. controlq + cursorq layout constants. Live bring-up + scanout flush already wired (`bring_up`, `init_scanout`, `flush`); QEMU live-submit smoke is the next stage. |
+| virtio-blk-pci   | Polled + IRQ-driven Read/Write. MSI-X (q0). |
+| virtio-net-pci   | TX + RX (polled). |
+| virtio-rng-pci   | Structural probe. |
+| virtio-balloon-pci | Structural probe. |
+| virtio-console-pci | Modern + legacy match (1AF4:1043 / 1003). receiveq + transmitq + `ConsoleConfig` (cols/rows/emerg_wr) + `ControlEvent` decode. `write_bytes` / `read_bytes`. MSI-X (receiveq). |
+| virtio-iommu-pci | PCI match (1AF4:1057). Live requestq + eventq, attach/detach/map/unmap with §5.16.6 tail-status. MSI-X (requestq). |
+| virtio-scsi-pci  | PCI match (1AF4:1048). Live controlq + eventq + cmdq[0]; `submit_cmd` + `submit_tmf` + REPORT LUNS helper. MSI-X (cmdq[0]). |
+| virtio-vsock-pci | PCI match (1AF4:1053). Live rx + tx + event queues; `VsockHdr` builders, `send` / `recv` / `drain_events`. MSI-X (rx). |
+| virtio-fs-pci    | PCI match (1AF4:105A). Live hiprio + request[0] queues; FUSE-on-virtio header builders + `submit_request`. MSI-X (request[0]). |
+| virtio-9p-pci    | Legacy PCI match (1AF4:1009). Live requestq; 9P2000.L builders (Tversion/Tattach/Twalk/Tlopen/Tread/Tclunk) + `Rversion` + `tversion` handshake helper. MSI-X (requestq). |
+| virtio-gpu-pci   | Modern + legacy match (1AF4:1050 / 1010). controlq + cursorq, 2D pipeline (`init_scanout` / `paint_solid` / `paint_test_pattern` / `flush`). MSI-X (controlQ). |
+| virtio-input-pci | PCI match (1AF4:1052). eventQ drain → `narf_input` (KEY + REL events). MSI-X (eventQ). |
 | e1000 / e1000e   | Real Intel NIC (8254x + 8257x family). TX + RX.   |
 | ixgbe            | Intel 82599 / X540 / X550 10 GbE. PCI match + reset + EEPROM MAC + advanced TX ring + RX ring + MSI-X + `HwNic`. Live bring-up smoke skips on QEMU (no emulated 82599). |
 | iwlwifi          | Intel Wi-Fi 6 / 6E (AX200 / AX201 / AX210 / AX211). **Structural probe only** — PCI match table + spec doc. Operational register map (CSR/PRPH offsets, firmware loader, TFD/RBD descriptors, host-command opcodes) is not in any public Intel doc; further stages blocked on public register docs. See `drivers/net/specification/iwlwifi.md`. |

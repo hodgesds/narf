@@ -65,7 +65,7 @@ intra-address-space isolation.
   framekernel's domain model.
 - **Verification and observability are first-class.** A kernel-resident
   test harness (`cargo xtask test`) boots the real kernel under QEMU and
-  asserts on live invariants — 305 smokes on x86_64, 236 on aarch64 at
+  asserts on live invariants — 558 smokes on x86_64, 292 on aarch64 at
   time of writing — alongside USDT-style probes, flight-recorder rings, a
   PMU-sampling surface, and an ABI promise (syscall numbers carry an upper
   8-bit version, `relibc` will gate against it). Bugs are caught at the
@@ -170,18 +170,38 @@ Live from boot through `cargo xtask run`:
   reset, ASQ/ACQ allocation, IDENTIFY CONTROLLER + IDENTIFY
   NAMESPACE, I/O queue pair (`Create I/O CQ` + `Create I/O SQ`),
   Read/Write LBA with both polled and MSI-X-driven completions.
-- virtio-blk-pci modern: cap walk, queue-0 setup, polled +
-  IRQ-driven Read/Write sector.
-- virtio-net-pci: TX + RX over RX/TX virtqueues with QEMU's
-  user-mode net backend.
+- The complete modern virtio-PCI matrix: blk / net / rng / balloon /
+  console / scsi / 9p / fs / vsock / iommu / gpu / input / snd. Each
+  live driver brings up its virtqueues, programs MSI-X on its primary
+  completion queue (via the shared `pci::enable_msix_queue` helper),
+  and exposes a high-level API (e.g. `submit_cmd` / `report_luns` for
+  scsi, `tversion` for 9p, `paint_test_pattern` for gpu, `send`/`recv`
+  for vsock, `attach`/`map`/`unmap` for iommu). Polled-completion
+  fallbacks stay in place so sync callers and IRQ-less environments
+  keep working.
 - e1000 / e1000e: BAR0, MAC read from RAL/RAH, TX + RX descriptor
   rings, link up via CTRL.SLU.
 - AHCI ICH9: HBA reset, port enumeration via PORT_SIG/SSTS,
   IDENTIFY DEVICE + READ DMA EXT + WRITE DMA EXT against a
   QEMU-emulated SATA disk.
-- virtio-rng-pci + virtio-balloon-pci: structural probe.
-- xHCI USB host controller: HCRST reset, DCBAA + Command Ring +
-  scratchpad pointers, USBCMD.RS=1 → running.
+- ixgbe (Intel 82599 / X540 / X550 10 GbE): clean-room from the
+  public Intel datasheet — PCI match, master reset, EEPROM-backed
+  MAC read, advanced TX + RX rings, MSI-X, `HwNic` impl.
+- iwlwifi (Intel Wi-Fi 6 / 6E AX200..AX211): structural probe only;
+  operational register map is not in any public Intel doc, so the
+  driver lands the PCI-match table + spec doc and stops at the
+  documented public-docs wall.
+- xHCI USB host controller: HCRST reset, DCBAA + Command/Event
+  Rings + scratchpad pointers, USBCMD.RS=1, port reset, Enable
+  Slot, Address Device, GET_DESCRIPTOR, Configure Endpoint,
+  bulk + interrupt IN/OUT.
+- USB HID keyboard: hot-plug enumeration over xHCI → Set
+  Protocol(Boot) → interrupt-IN polling → HID Usage 0x07 →
+  `narf_input::KeyCode` press/release diffing with 8-modifier
+  tracking + roll-over filter.
+- QEMU `fw_cfg` interface (x86_64 PIO): magic-string presence
+  probe, file-directory parse, `find` / `read` / `read_string`
+  for SMBIOS / boot-order / cmdline-style entries.
 
 Cross-driver integration: a unified `block::BlockDeviceSync`
 adapter lets the kernel address NVMe + virtio-blk-pci + AHCI
@@ -194,10 +214,11 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **255/0/0** smokes;
-`--arch=aarch64` passes **193/0/3** (the 3 skips are x86-specific
-PCIe surfaces). See `STATUS.md` for the full tally and per-subsystem
-breakdown.
+`cargo xtask test --arch=x86_64` passes **558/0/21** smokes;
+`--arch=aarch64` passes **292/0/10**. Skips are x86-specific PCIe
+surfaces or live-device tests that skip cleanly when QEMU doesn't
+expose the device. See `STATUS.md` for the full tally and per-
+subsystem breakdown.
 
 ## Repository layout
 
