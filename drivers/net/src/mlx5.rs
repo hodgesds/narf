@@ -46,6 +46,7 @@ pub mod cq;
 pub mod eq;
 pub mod cqe;
 pub mod mailbox;
+pub mod mkey;
 pub mod qp;
 pub mod ring;
 pub mod vport;
@@ -224,6 +225,8 @@ pub enum Mlx5Error {
     UnknownCq,
     /// Stage 12: vport-context decoder rejected the response.
     VportDecode,
+    /// Stage 13: caller-supplied mkey parameters were invalid.
+    MkeyBuild(mkey::MkeyError),
 }
 
 /// Stage 7: live-EQ bookkeeping. Holds the FW-assigned `eq_number`
@@ -1037,6 +1040,31 @@ impl Mlx5Hca {
         let view = cqe::decode_cqe(&bytes);
         c.consumer = c.consumer.wrapping_add(1);
         Ok(Some(view))
+    }
+
+    /// Stage 13: register a memory region. Returns the L_KEY for
+    /// use in WQE pointer-data segments. The DMA pages remain
+    /// owned by the caller.
+    pub fn create_mkey(&self, params: mkey::MkeyParams, pages: &[u64])
+        -> Result<u32, Mlx5Error>
+    {
+        let payload = mkey::build_create_mkey_input(params, pages)
+            .map_err(Mlx5Error::MkeyBuild)?;
+        let resp = self.issue_command_with_input_mailbox(
+            CmdOp::CreateMkey, 0, &payload)?;
+        let mkey_index = resp.output_modifier & 0x00FF_FFFF;
+        Ok(mkey::lkey_for(mkey_index))
+    }
+
+    /// Stage 13: release a memory region by L_KEY. Stage 13 sends
+    /// the destroy command but doesn't track keys on the driver
+    /// (Stage 16 wires the registry alongside the other destroy
+    /// paths).
+    pub fn destroy_mkey(&self, l_key: u32) -> Result<(), Mlx5Error> {
+        let mkey_index = l_key >> 8;
+        let _resp = self.issue_command_inline(
+            CmdOp::DestroyMkey, mkey_index & 0x00FF_FFFF, &[])?;
+        Ok(())
     }
 
     /// Stage 12: read the per-vport NIC context — MAC + MTU.

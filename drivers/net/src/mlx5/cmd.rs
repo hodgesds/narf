@@ -120,6 +120,12 @@ pub enum CmdOp {
     /// `MODIFY_NIC_VPORT_CONTEXT` — write per-vport NIC state.
     /// Opcode `0x755`. Field-mask in `op_mod_high`.
     ModifyNicVportContext = 0x755,
+    /// `CREATE_MKEY` — register a memory region. Opcode `0x200`.
+    /// Returns mkey_index in low 24 bits of output_modifier;
+    /// the full l_key/r_key wraps mkey_index plus a variant byte.
+    CreateMkey  = 0x200,
+    /// `DESTROY_MKEY` — release a memory region. Opcode `0x202`.
+    DestroyMkey = 0x202,
 }
 
 /// Status codes the firmware writes into byte 0x20 of the CQE.

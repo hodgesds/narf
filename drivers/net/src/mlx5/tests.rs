@@ -1547,3 +1547,100 @@ fn smoke_mlx5_vport_opcodes() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/mlx5", smoke_mlx5_vport_opcodes);
+
+// ── Stage 13: memory-key (mkey) ────────────────────────────────────
+
+use super::mkey::{
+    build_create_mkey_input, lkey_for, MkeyError, MkeyParams,
+    MKC_ACCESS_LOCAL_READ, MKC_ACCESS_LOCAL_WRITE, MKC_LEN,
+    MKC_OFF_ACCESS, MKC_OFF_LENGTH, MKC_OFF_LOG_PAGE_SIZE,
+    MKC_OFF_QPN_PD, MKC_OFF_START_ADDR,
+    MKC_PA_ENTRY_LEN, MKC_PA_LIST_OFF,
+};
+
+fn smoke_mlx5_mkey_input_layout() -> TestResult {
+    let pages = [0x1_0000_0000u64, 0x1_0000_1000u64];
+    let params = MkeyParams {
+        pd:             0xABCDEF,
+        access:         MKC_ACCESS_LOCAL_READ | MKC_ACCESS_LOCAL_WRITE,
+        start_addr:     0x4000_0000_0000_0000,
+        length:         0x10000,
+        log_page_size:  12,
+    };
+    let bytes = match build_create_mkey_input(params, &pages) {
+        Ok(b)  => b,
+        Err(_) => return TestResult::Fail("build_create_mkey_input rejected valid params"),
+    };
+    if bytes.len() != MKC_PA_LIST_OFF + 2 * MKC_PA_ENTRY_LEN {
+        return TestResult::Fail("CREATE_MKEY payload length wrong");
+    }
+    if bytes[MKC_OFF_ACCESS] != (MKC_ACCESS_LOCAL_READ | MKC_ACCESS_LOCAL_WRITE) {
+        return TestResult::Fail("access byte missing");
+    }
+    let pd_bytes = &bytes[MKC_OFF_QPN_PD..MKC_OFF_QPN_PD + 4];
+    if u32::from_be_bytes([pd_bytes[0], pd_bytes[1], pd_bytes[2], pd_bytes[3]]) != 0xABCDEF {
+        return TestResult::Fail("pd not BE-encoded");
+    }
+    let sa_bytes = &bytes[MKC_OFF_START_ADDR..MKC_OFF_START_ADDR + 8];
+    let mut buf = [0u8; 8]; buf.copy_from_slice(sa_bytes);
+    if u64::from_be_bytes(buf) != 0x4000_0000_0000_0000 {
+        return TestResult::Fail("start_addr not BE-encoded");
+    }
+    let len_bytes = &bytes[MKC_OFF_LENGTH..MKC_OFF_LENGTH + 8];
+    buf.copy_from_slice(len_bytes);
+    if u64::from_be_bytes(buf) != 0x10000 {
+        return TestResult::Fail("length not BE-encoded");
+    }
+    let lps = &bytes[MKC_OFF_LOG_PAGE_SIZE..MKC_OFF_LOG_PAGE_SIZE + 4];
+    if u32::from_be_bytes([lps[0], lps[1], lps[2], lps[3]]) != 12 {
+        return TestResult::Fail("log_page_size not BE-encoded");
+    }
+    for (i, &expect) in pages.iter().enumerate() {
+        let off = MKC_PA_LIST_OFF + i * MKC_PA_ENTRY_LEN;
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&bytes[off..off + 8]);
+        if u64::from_be_bytes(buf) != expect {
+            return TestResult::Fail("phys-addr list entry not BE-encoded");
+        }
+    }
+    let _ = MKC_LEN;
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_mkey_input_layout);
+
+fn smoke_mlx5_mkey_validation() -> TestResult {
+    let pages = [0x1_0000_0000u64];
+    let bad_pd = MkeyParams { pd: 0x100_0000, access: 0,
+                              start_addr: 0, length: 0, log_page_size: 12 };
+    if !matches!(build_create_mkey_input(bad_pd, &pages), Err(MkeyError::BadPd)) {
+        return TestResult::Fail("oversize pd accepted");
+    }
+    let ok = MkeyParams { pd: 0, access: 0, start_addr: 0,
+                          length: 0, log_page_size: 12 };
+    if !matches!(build_create_mkey_input(ok, &[]), Err(MkeyError::NoPages)) {
+        return TestResult::Fail("empty page list accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_mkey_validation);
+
+fn smoke_mlx5_mkey_lkey_packing() -> TestResult {
+    // lkey = mkey_index << 8, low 8 bits are the variant.
+    if lkey_for(0x12_3456) != 0x1234_5600 {
+        return TestResult::Fail("lkey packing wrong");
+    }
+    if lkey_for(0xFF_FFFF) != 0xFFFF_FF00 {
+        return TestResult::Fail("lkey high-mask wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_mkey_lkey_packing);
+
+fn smoke_mlx5_mkey_opcodes() -> TestResult {
+    if super::cmd::CmdOp::CreateMkey  as u16 != 0x200
+       { return TestResult::Fail("CREATE_MKEY opcode drift"); }
+    if super::cmd::CmdOp::DestroyMkey as u16 != 0x202
+       { return TestResult::Fail("DESTROY_MKEY opcode drift"); }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_mkey_opcodes);

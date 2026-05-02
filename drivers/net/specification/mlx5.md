@@ -1,6 +1,6 @@
 # mlx5 — Specification
 
-> Status: **v0.12** (Stage 12: vport context + HwNic trait impl).
+> Status: **v0.13** (Stage 13: memory keys — CREATE_MKEY).
 >
 > Clean-room driver for Mellanox / NVIDIA ConnectX-4 / 5 / 6 / 7
 > family Ethernet + InfiniBand HCAs. Reference material: the
@@ -136,6 +136,19 @@ have a server target with a ConnectX HCA in CI.
 
 - **v0.1** (Stage 1): PCI match + init-segment decoder +
   initializing-bit poll + smokes co-located in driver dir.
+- **v0.13** (Stage 13): memory-region registration. Two new
+  opcodes `CreateMkey` (0x200) + `DestroyMkey` (0x202).
+  `mlx5/mkey.rs` lays out the 64-byte mkey context — access
+  flags (high nibble of byte 0x00, MKC_ACCESS_LOCAL_WRITE/
+  LOCAL_READ/REMOTE_READ/REMOTE_WRITE), pd (BE u32 at 0x04 low
+  24 bits), start_addr (BE u64 at 0x18), length (BE u64 at 0x20),
+  log_page_size (BE u32 at 0x2C) — followed by an N-entry
+  8-byte BE phys-addr list at offset 0x40.
+  `Mlx5Hca::create_mkey(params, &pages)` posts CREATE_MKEY and
+  returns the L_KEY (mkey_index << 8); WQE pointer-data segments
+  carry this directly. `destroy_mkey(l_key)` releases. New error:
+  `MkeyBuild`. Four smokes: full layout round-trip, validation
+  (BadPd / NoPages), L_KEY packing math, opcode pins.
 - **v0.12** (Stage 12): per-vport NIC context (MAC + MTU). Two
   new opcodes `QueryNicVportContext` (0x754) +
   `ModifyNicVportContext` (0x755). `mlx5/vport.rs` decodes the
