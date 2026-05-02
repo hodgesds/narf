@@ -1644,3 +1644,118 @@ fn smoke_mlx5_mkey_opcodes() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/mlx5", smoke_mlx5_mkey_opcodes);
+
+// ── Stage 14: flow steering (TIR / TIS / RQT) ──────────────────────
+
+use super::steering::{
+    build_create_rqt_input, build_create_tir_input, build_create_tis_input,
+    RqtError, RqtParams, TirParams, TisParams,
+    RQTC_OFF_RQ_LIST, RQTC_OFF_RQT_ACTUAL_SIZE, RQTC_OFF_RQT_MAX_SIZE,
+    TIRC_OFF_DISP_TYPE, TIRC_OFF_INLINE_RQN, TIRC_OFF_TRANSPORT_DOMAIN,
+    TIRC_LEN, TISC_OFF_PRIO, TISC_OFF_TRANSPORT_DOMAIN, TISC_LEN,
+    TIR_DISP_DIRECT, TIR_DISP_INDIRECT_RQT,
+};
+
+fn smoke_mlx5_steering_opcodes() -> TestResult {
+    let pairs: &[(super::cmd::CmdOp, u16)] = &[
+        (super::cmd::CmdOp::CreateTir,        0x900),
+        (super::cmd::CmdOp::DestroyTir,       0x902),
+        (super::cmd::CmdOp::CreateTis,        0x912),
+        (super::cmd::CmdOp::DestroyTis,       0x914),
+        (super::cmd::CmdOp::CreateRqt,        0x916),
+        (super::cmd::CmdOp::DestroyRqt,       0x918),
+        (super::cmd::CmdOp::CreateFlowTable,  0x930),
+        (super::cmd::CmdOp::DestroyFlowTable, 0x931),
+        (super::cmd::CmdOp::SetFlowTableRoot, 0x92F),
+    ];
+    for &(op, want) in pairs {
+        if op as u16 != want {
+            return TestResult::Fail("steering opcode discriminant drifted");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_steering_opcodes);
+
+fn smoke_mlx5_tir_layout() -> TestResult {
+    let p = TirParams { disp_type: TIR_DISP_DIRECT,
+                        inline_rqn: 0xCAFE,
+                        transport_domain: 0x42 };
+    let bytes = build_create_tir_input(p);
+    if bytes.len() != TIRC_LEN {
+        return TestResult::Fail("TIR payload size wrong");
+    }
+    if bytes[TIRC_OFF_DISP_TYPE] != TIR_DISP_DIRECT {
+        return TestResult::Fail("TIR disp_type byte wrong");
+    }
+    let rqn = u32::from_be_bytes([
+        bytes[TIRC_OFF_INLINE_RQN], bytes[TIRC_OFF_INLINE_RQN + 1],
+        bytes[TIRC_OFF_INLINE_RQN + 2], bytes[TIRC_OFF_INLINE_RQN + 3],
+    ]);
+    if rqn != 0xCAFE { return TestResult::Fail("inline_rqn not BE-encoded"); }
+    let td = u32::from_be_bytes([
+        bytes[TIRC_OFF_TRANSPORT_DOMAIN],     bytes[TIRC_OFF_TRANSPORT_DOMAIN + 1],
+        bytes[TIRC_OFF_TRANSPORT_DOMAIN + 2], bytes[TIRC_OFF_TRANSPORT_DOMAIN + 3],
+    ]);
+    if td != 0x42 { return TestResult::Fail("transport_domain not BE-encoded"); }
+    // disp=indirect path also encodes correctly.
+    let p2 = TirParams { disp_type: TIR_DISP_INDIRECT_RQT,
+                         inline_rqn: 0, transport_domain: 0 };
+    let bytes2 = build_create_tir_input(p2);
+    if bytes2[TIRC_OFF_DISP_TYPE] != TIR_DISP_INDIRECT_RQT {
+        return TestResult::Fail("TIR_DISP_INDIRECT_RQT path wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_tir_layout);
+
+fn smoke_mlx5_tis_layout() -> TestResult {
+    let p = TisParams { priority: 3, transport_domain: 0xABC };
+    let bytes = build_create_tis_input(p);
+    if bytes.len() != TISC_LEN {
+        return TestResult::Fail("TIS payload size wrong");
+    }
+    if bytes[TISC_OFF_PRIO] != 3 {
+        return TestResult::Fail("TIS priority byte wrong");
+    }
+    let td = u32::from_be_bytes([
+        bytes[TISC_OFF_TRANSPORT_DOMAIN],     bytes[TISC_OFF_TRANSPORT_DOMAIN + 1],
+        bytes[TISC_OFF_TRANSPORT_DOMAIN + 2], bytes[TISC_OFF_TRANSPORT_DOMAIN + 3],
+    ]);
+    if td != 0xABC { return TestResult::Fail("TIS transport_domain not BE-encoded"); }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_tis_layout);
+
+fn smoke_mlx5_rqt_layout() -> TestResult {
+    let p = RqtParams { max_size: 8, actual_size: 4 };
+    let rqs = [0x100u32, 0x101, 0x102, 0x103];
+    let bytes = build_create_rqt_input(p, &rqs).unwrap();
+    let need = RQTC_OFF_RQ_LIST + 4 * 4;
+    if bytes.len() != need {
+        return TestResult::Fail("RQT payload size wrong");
+    }
+    let max = u32::from_be_bytes([
+        bytes[RQTC_OFF_RQT_MAX_SIZE],     bytes[RQTC_OFF_RQT_MAX_SIZE + 1],
+        bytes[RQTC_OFF_RQT_MAX_SIZE + 2], bytes[RQTC_OFF_RQT_MAX_SIZE + 3],
+    ]);
+    if max != 8 { return TestResult::Fail("max_size not BE"); }
+    let act = u32::from_be_bytes([
+        bytes[RQTC_OFF_RQT_ACTUAL_SIZE],     bytes[RQTC_OFF_RQT_ACTUAL_SIZE + 1],
+        bytes[RQTC_OFF_RQT_ACTUAL_SIZE + 2], bytes[RQTC_OFF_RQT_ACTUAL_SIZE + 3],
+    ]);
+    if act != 4 { return TestResult::Fail("actual_size not BE"); }
+    for (i, &expect) in rqs.iter().enumerate() {
+        let off = RQTC_OFF_RQ_LIST + i * 4;
+        let v = u32::from_be_bytes([bytes[off], bytes[off + 1],
+                                     bytes[off + 2], bytes[off + 3]]);
+        if v != expect { return TestResult::Fail("RQT entry wrong"); }
+    }
+    // Validation rejects > 128 entries.
+    let many = alloc::vec![0u32; 129];
+    if !matches!(build_create_rqt_input(RqtParams { max_size: 128, actual_size: 129 }, &many), Err(RqtError::TooLarge)) {
+        return TestResult::Fail("> 128 rqs accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_rqt_layout);

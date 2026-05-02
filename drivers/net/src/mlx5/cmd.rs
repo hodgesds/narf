@@ -126,6 +126,27 @@ pub enum CmdOp {
     CreateMkey  = 0x200,
     /// `DESTROY_MKEY` — release a memory region. Opcode `0x202`.
     DestroyMkey = 0x202,
+    /// `CREATE_TIR` — Transport Interface Receive (RX). Opcode
+    /// `0x900`. Binds an inline RQ (or RQT for RSS) to an output
+    /// channel.
+    CreateTir   = 0x900,
+    /// `DESTROY_TIR` — Opcode `0x902`.
+    DestroyTir  = 0x902,
+    /// `CREATE_TIS` — Transport Interface Send (TX). Opcode
+    /// `0x912`.
+    CreateTis   = 0x912,
+    /// `DESTROY_TIS` — Opcode `0x914`.
+    DestroyTis  = 0x914,
+    /// `CREATE_RQT` — Receive Queue Table for RSS. Opcode `0x916`.
+    CreateRqt   = 0x916,
+    /// `DESTROY_RQT` — Opcode `0x918`.
+    DestroyRqt  = 0x918,
+    /// `CREATE_FLOW_TABLE` — Opcode `0x930`.
+    CreateFlowTable  = 0x930,
+    /// `DESTROY_FLOW_TABLE` — Opcode `0x931`.
+    DestroyFlowTable = 0x931,
+    /// `SET_FLOW_TABLE_ROOT` — Opcode `0x92F`.
+    SetFlowTableRoot = 0x92F,
 }
 
 /// Status codes the firmware writes into byte 0x20 of the CQE.

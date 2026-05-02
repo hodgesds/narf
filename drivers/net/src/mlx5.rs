@@ -49,6 +49,7 @@ pub mod mailbox;
 pub mod mkey;
 pub mod qp;
 pub mod ring;
+pub mod steering;
 pub mod vport;
 pub mod wqe;
 
@@ -227,6 +228,8 @@ pub enum Mlx5Error {
     VportDecode,
     /// Stage 13: caller-supplied mkey parameters were invalid.
     MkeyBuild(mkey::MkeyError),
+    /// Stage 14: caller-supplied RQT parameters were invalid.
+    RqtBuild(steering::RqtError),
 }
 
 /// Stage 7: live-EQ bookkeeping. Holds the FW-assigned `eq_number`
@@ -1040,6 +1043,40 @@ impl Mlx5Hca {
         let view = cqe::decode_cqe(&bytes);
         c.consumer = c.consumer.wrapping_add(1);
         Ok(Some(view))
+    }
+
+    /// Stage 14: create a TIR (RX endpoint). Returns the
+    /// FW-assigned `tirn`.
+    pub fn create_tir(&self, params: steering::TirParams)
+        -> Result<u32, Mlx5Error>
+    {
+        let payload = steering::build_create_tir_input(params);
+        let resp = self.issue_command_with_input_mailbox(
+            CmdOp::CreateTir, 0, &payload)?;
+        Ok(resp.output_modifier & 0x00FF_FFFF)
+    }
+
+    /// Stage 14: create a TIS (TX endpoint). Returns the
+    /// FW-assigned `tisn`.
+    pub fn create_tis(&self, params: steering::TisParams)
+        -> Result<u32, Mlx5Error>
+    {
+        let payload = steering::build_create_tis_input(params);
+        let resp = self.issue_command_with_input_mailbox(
+            CmdOp::CreateTis, 0, &payload)?;
+        Ok(resp.output_modifier & 0x00FF_FFFF)
+    }
+
+    /// Stage 14: create an RQT (RX queue table for RSS). Returns
+    /// the FW-assigned `rqtn`.
+    pub fn create_rqt(&self, params: steering::RqtParams, rqs: &[u32])
+        -> Result<u32, Mlx5Error>
+    {
+        let payload = steering::build_create_rqt_input(params, rqs)
+            .map_err(Mlx5Error::RqtBuild)?;
+        let resp = self.issue_command_with_input_mailbox(
+            CmdOp::CreateRqt, 0, &payload)?;
+        Ok(resp.output_modifier & 0x00FF_FFFF)
     }
 
     /// Stage 13: register a memory region. Returns the L_KEY for

@@ -1,6 +1,6 @@
 # mlx5 — Specification
 
-> Status: **v0.13** (Stage 13: memory keys — CREATE_MKEY).
+> Status: **v0.14** (Stage 14: flow steering — TIR / TIS / RQT).
 >
 > Clean-room driver for Mellanox / NVIDIA ConnectX-4 / 5 / 6 / 7
 > family Ethernet + InfiniBand HCAs. Reference material: the
@@ -136,6 +136,23 @@ have a server target with a ConnectX HCA in CI.
 
 - **v0.1** (Stage 1): PCI match + init-segment decoder +
   initializing-bit poll + smokes co-located in driver dir.
+- **v0.14** (Stage 14): flow-steering primitives — Transport
+  Interface Receive (TIR), Transport Interface Send (TIS),
+  Receive Queue Table (RQT). Nine new opcodes spanning the
+  CREATE/DESTROY pairs plus `SetFlowTableRoot`.
+  `mlx5/steering.rs` lays out:
+  - 256-byte TIR context with disp_type byte (TIR_DISP_DIRECT
+    /TIR_DISP_INDIRECT_RQT) at 0x04, inline_rqn (BE u32 at
+    0x1C), transport_domain (BE u32 at 0x24);
+  - 256-byte TIS context with priority byte at 0x00 +
+    transport_domain at 0x24;
+  - RQT context with max_size + actual_size at 0x10 / 0x14
+    followed by an N-entry 4-byte BE rqn list at 0x20.
+  `Mlx5Hca::create_tir`, `create_tis`, `create_rqt` post via
+  Stage-7 input-mailbox transport and return the FW-assigned
+  IDs. Validation: RqtError::TooLarge for > 128 RQs in an RQT.
+  Four smokes: opcode pins, TIR layout (direct + indirect
+  paths), TIS layout, RQT layout + validation.
 - **v0.13** (Stage 13): memory-region registration. Two new
   opcodes `CreateMkey` (0x200) + `DestroyMkey` (0x202).
   `mlx5/mkey.rs` lays out the 64-byte mkey context — access
