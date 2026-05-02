@@ -13107,3 +13107,79 @@ fn smoke_compat_win_load_pe_pipeline() -> TestResult {
 
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_compat_win_load_pe_pipeline);
+
+#[cfg(feature = "user-mode-e2e")]
+fn smoke_firmware_install_syscall_round_trip() -> TestResult {
+    // End-to-end: dispatch the FirmwareInstall syscall through the
+    // SyscallTable with a fake TrapContext, exactly like an arch
+    // trap would. Verifies the trap-handler shim's pointer
+    // validation, kernel-side sys_install delegation, and the
+    // registry round-trip. Gated by `user-mode-e2e` because it
+    // mutates the global firmware registry; the gate keeps it out
+    // of the structural smoke set that runs on every build.
+    if !cfg!(feature = "firmware-allow-unsigned") {
+        return TestResult::Skip("firmware-allow-unsigned off — registry rejects unsigned");
+    }
+    use narf_firmware::{
+        bootstrap_authority, install_trusted_loader_authority, source_for,
+        BlobSource, BLOB_TRAILER_MAGIC,
+    };
+    use narf_userspace::{
+        install_core_syscalls, Syscall, SyscallArgs, SyscallReturn,
+        SyscallTable, TrapContext,
+    };
+
+    // Stage the trusted-loader authority so the trap handler can
+    // find it.
+    narf_firmware::registry::__reset_for_test();
+    let (write, _r) = bootstrap_authority();
+    install_trusted_loader_authority(write);
+
+    // Build an unsigned blob the registry will accept under the
+    // `firmware-allow-unsigned` build feature.
+    let mut blob = alloc::vec::Vec::with_capacity(256);
+    blob.extend_from_slice(b"syscall e2e payload");
+    blob.extend_from_slice(&[0u8; 64]);          // signature
+    blob.extend_from_slice(&[0u8; 32]);          // signer
+    blob.extend_from_slice(&0u32.to_le_bytes()); // mlen=0
+    blob.extend_from_slice(&BLOB_TRAILER_MAGIC); // 'NRFW'
+
+    let name = b"e2e/syscall/blob";
+
+    // Build the SyscallTable + install handlers.
+    let mut table = SyscallTable::new();
+    install_core_syscalls(&mut table);
+
+    // Fake TrapContext.
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+    }
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: name.as_ptr() as u64,
+            arg1: name.len() as u64,
+            arg2: blob.as_ptr() as u64,
+            arg3: blob.len() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    table.dispatch_ctx(Syscall::FirmwareInstall, &mut ctx);
+
+    let r = match ctx.ret {
+        Some(r) => r,
+        None    => return TestResult::Fail("handler set no return value"),
+    };
+    if r.value != 0 {
+        return TestResult::Fail("FirmwareInstall returned non-zero");
+    }
+    if source_for("e2e/syscall/blob") != Some(BlobSource::HotInstall) {
+        return TestResult::Fail("blob not landed at HotInstall priority");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "user-mode-e2e")]
+kernel_test!(smoke_firmware_install_syscall_round_trip);

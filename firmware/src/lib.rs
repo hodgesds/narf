@@ -52,7 +52,7 @@ use narf_io::{alloc_coherent, DmaBuffer};
 use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 
-mod registry;
+pub mod registry;
 mod signature;
 
 mod tests;

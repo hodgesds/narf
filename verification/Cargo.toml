@@ -37,6 +37,7 @@ narf-init         = { path = "../init" }
 narf-fb           = { path = "../fb" }
 narf-audio        = { path = "../audio" }
 narf-shmem        = { path = "../shmem" }
+narf-firmware     = { path = "../firmware" }
 narf-block      = { path = "../block" }
 narf-console    = { path = "../console" }
 narf-interrupts = { path = "../interrupts" }

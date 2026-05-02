@@ -956,6 +956,7 @@ dependencies = [
  "narf-drivers-virtio",
  "narf-fb",
  "narf-filesystem",
+ "narf-firmware",
  "narf-graphics",
  "narf-graphics-driver",
  "narf-init",
