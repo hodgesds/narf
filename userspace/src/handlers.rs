@@ -2553,16 +2553,23 @@ fn sys_shmem_destroy(ctx: &mut dyn TrapContext) {
 // signed by a trusted firmware signer).
 
 fn sys_firmware_install(ctx: &mut dyn TrapContext) {
-    // Privilege gate: only PIDs the kernel boot path marked as
-    // trusted firmware loaders may call this. Until per-task
-    // cap tables for the firmware registry land (Stage-7), this
-    // allowlist is the actual gate; the trailer signature check
-    // inside `firmware::sys_install` is the second line.
+    // Privilege gate: pull the calling task's per-task firmware-
+    // registry authority cap. Tasks granted authority via
+    // `narf_firmware::grant_firmware_authority(pid)` hold a
+    // live `Cap<FirmwareRegistry, Write>` here; tasks without
+    // authority (or whose cap was revoked) see no entry and the
+    // syscall fails.
+    //
+    // The trailer signature check inside `firmware::sys_install`
+    // remains the second line of defense; this gate is the first.
     let pid = current_task_id();
-    if !narf_firmware::is_trusted_firmware_loader_task(pid) {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
+    let auth = match narf_firmware::firmware_authority_of(pid) {
+        Some(c) => c,
+        None    => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
 
     let args = *ctx.args();
     let name_ptr  = args.arg0 as *const u8;
@@ -2604,15 +2611,6 @@ fn sys_firmware_install(ctx: &mut dyn TrapContext) {
     let leaked: &'static str = alloc::boxed::Box::leak(
         alloc::string::String::from(name_str).into_boxed_str());
 
-    // Borrow the trusted-loader authority; `None` until the
-    // kernel boot path runs `firmware::install_trusted_loader_authority`.
-    let auth = match narf_firmware::trusted_loader_authority() {
-        Some(a) => a,
-        None    => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
     // SAFETY: `bytes_ptr` + `bytes_len` are user-mode addresses in
     // the calling task's AS; the trap didn't swap CR3. The kernel
     // path inside `firmware::sys_install` copies bytes into a

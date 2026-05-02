@@ -13121,7 +13121,7 @@ fn smoke_firmware_install_syscall_round_trip() -> TestResult {
         return TestResult::Skip("firmware-allow-unsigned off — registry rejects unsigned");
     }
     use narf_firmware::{
-        bootstrap_authority, install_trusted_loader_authority, source_for,
+        bootstrap_authority, source_for,
         BlobSource, BLOB_TRAILER_MAGIC,
     };
     use narf_userspace::{
@@ -13129,17 +13129,19 @@ fn smoke_firmware_install_syscall_round_trip() -> TestResult {
         SyscallTable, TrapContext,
     };
 
-    // Stage the trusted-loader authority so the trap handler can
-    // find it. Also mark the calling task PID as a trusted loader
-    // so the privilege gate doesn't reject the test (the trap
-    // handler reads `current_task_id()` for the gate check).
+    // Reset both halves of the registry: the blob storage and
+    // the per-task cap table. Then grant task 0 (the smoke
+    // harness's pid) a fresh firmware-registry authority cap so
+    // the trap-handler privilege gate accepts the call.
     narf_firmware::registry::__reset_for_test();
     narf_firmware::__reset_trusted_loader_tasks();
-    let (write, _r) = bootstrap_authority();
-    install_trusted_loader_authority(write);
-    // The smoke harness runs as kernel task id 0 by default;
-    // allowlist that pid so the gate passes.
-    narf_firmware::add_trusted_firmware_loader_task(0);
+    let _ = narf_firmware::grant_firmware_authority(0);
+    // The legacy process-global trusted-loader authority is no
+    // longer consulted by the trap handler (it now uses the per-
+    // task cap), but `bootstrap_authority` is still useful as a
+    // compatibility shim — bring one up so dependent helpers
+    // continue to work.
+    let (_write, _r) = bootstrap_authority();
 
     // Build an unsigned blob the registry will accept under the
     // `firmware-allow-unsigned` build feature.

@@ -252,41 +252,90 @@ pub fn trusted_loader_authority() -> Option<Cap<FirmwareRegistry, Write>> {
     TRUSTED_LOADER.lock().as_ref().cloned()
 }
 
-// ── Trusted-loader task allowlist ──────────────────────────────────
+// ── Per-task firmware-loader cap table ─────────────────────────────
 //
-// Until a per-task cap table for firmware-registry holdings ships,
-// the privilege gate on `sys_firmware_install` is a small allowlist
-// of task PIDs the kernel boot path marks as authorized firmware
-// loaders. Mirrors the trusted-signer pattern but at the syscall
-// caller's identity rather than at the blob signer's identity.
+// Replaces the earlier `TRUSTED_LOADERS: Vec<u64>` pid allowlist
+// with a real cap table: each privileged task holds its own
+// `Cap<FirmwareRegistry, Write>`, kept here so the syscall trap
+// handler can pull the calling task's cap and feed it into
+// `sys_install`. Revoking the cap (or removing the entry) revokes
+// the task's authority instantly.
 //
-// In production, exactly one task — the firmware-load daemon
-// installed by the trusted bootstrap — appears here. Developer
-// builds may add additional PIDs for testing.
+// Backwards-compatible accessors `add_trusted_firmware_loader_task`
+// and `is_trusted_firmware_loader_task` mint / probe entries here
+// without exposing the cap directly — those are kept for the boot
+// path's bootstrap shape (it grants task 0 by pid alone) and for
+// the existing pid-allowlist smoke. The cap-aware API
+// (`grant_firmware_authority` / `firmware_authority_of`) replaces
+// them as call sites move over to cap-typed grants.
 
-static TRUSTED_LOADERS: IrqSafeSpinLock<alloc::vec::Vec<u64>>
+static LOADER_AUTHORITIES:
+    IrqSafeSpinLock<alloc::vec::Vec<(u64, Cap<FirmwareRegistry, Write>)>>
     = IrqSafeSpinLock::new(alloc::vec::Vec::new());
 
-/// Mark `task_id` as authorized to call `sys_firmware_install`.
-/// Idempotent. Called by the kernel boot path for the firmware-
-/// load daemon's PID; userspace can never call this (it has no
-/// public syscall surface for the same reason `sys_setuid` is
-/// privileged).
-pub fn add_trusted_firmware_loader_task(task_id: u64) {
-    let mut g = TRUSTED_LOADERS.lock();
-    if !g.contains(&task_id) {
-        g.push(task_id);
+/// Grant `task_id` a fresh `Cap<FirmwareRegistry, Write>` minted
+/// from the trusted-loader authority. The trap handler for
+/// `sys_firmware_install` uses this cap to gate the call.
+///
+/// Returns the granted cap so the granting code can also hand it
+/// to userspace if the cap-mint syscall plumbing is wired (today
+/// kernel-side only; the cap stays in the kernel's per-task table
+/// and the trap handler reaches for it via `firmware_authority_of`).
+///
+/// Idempotent on `task_id` — re-granting replaces the prior cap
+/// (the prior cap is implicitly revoked by being dropped from the
+/// table).
+pub fn grant_firmware_authority(task_id: u64) -> Cap<FirmwareRegistry, Write> {
+    let cap: Cap<FirmwareRegistry, Write> = Cap::bootstrap();
+    let mut g = LOADER_AUTHORITIES.lock();
+    if let Some(pos) = g.iter().position(|(t, _)| *t == task_id) {
+        g[pos] = (task_id, cap.clone());
+    } else {
+        g.push((task_id, cap.clone()));
     }
+    cap
 }
 
-/// `true` if `task_id` is an authorized firmware loader.
+/// Borrow `task_id`'s firmware-registry authority cap. `None` if
+/// the task hasn't been granted one (or its grant was revoked).
+pub fn firmware_authority_of(task_id: u64)
+    -> Option<Cap<FirmwareRegistry, Write>>
+{
+    LOADER_AUTHORITIES.lock().iter()
+        .find(|(t, _)| *t == task_id)
+        .map(|(_, c)| c.clone())
+}
+
+/// Revoke `task_id`'s firmware-registry authority. The cap is
+/// dropped from the per-task table; subsequent
+/// `firmware_authority_of(task_id)` calls return `None` so the
+/// trap handler rejects the next syscall from that task.
+/// Returns `true` if an entry was actually removed.
+pub fn revoke_firmware_authority(task_id: u64) -> bool {
+    let mut g = LOADER_AUTHORITIES.lock();
+    let n = g.len();
+    g.retain(|(t, _)| *t != task_id);
+    g.len() != n
+}
+
+/// Backwards-compatible: mint an authority cap for `task_id`
+/// without exposing it to the caller. Equivalent to
+/// `grant_firmware_authority(task_id)` followed by dropping the
+/// returned cap (the table keeps a clone). Kept so existing call
+/// sites that just want pid-level grants stay terse.
+pub fn add_trusted_firmware_loader_task(task_id: u64) {
+    let _ = grant_firmware_authority(task_id);
+}
+
+/// `true` if `task_id` holds a live firmware-loader authority.
 pub fn is_trusted_firmware_loader_task(task_id: u64) -> bool {
-    TRUSTED_LOADERS.lock().contains(&task_id)
+    LOADER_AUTHORITIES.lock().iter()
+        .any(|(t, c)| *t == task_id && c.check_live().is_ok())
 }
 
 #[doc(hidden)]
 pub fn __reset_trusted_loader_tasks() {
-    TRUSTED_LOADERS.lock().clear();
+    LOADER_AUTHORITIES.lock().clear();
 }
 
 /// In-tree blob registration. Drivers can register a blob shipped

@@ -374,6 +374,63 @@ fn smoke_firmware_initramfs_staging_round_trip() -> TestResult {
 }
 kernel_test_in!("firmware", smoke_firmware_initramfs_staging_round_trip);
 
+fn smoke_firmware_per_task_authority_grant_and_revoke() -> TestResult {
+    use crate::{
+        firmware_authority_of, grant_firmware_authority, revoke_firmware_authority,
+        is_trusted_firmware_loader_task, __reset_trusted_loader_tasks,
+    };
+    __reset_trusted_loader_tasks();
+
+    // Pre-grant: no entry, gate rejects.
+    if firmware_authority_of(42).is_some() {
+        return TestResult::Fail("untouched table holds a cap for arbitrary pid");
+    }
+    if is_trusted_firmware_loader_task(42) {
+        return TestResult::Fail("untouched table accepts arbitrary pid");
+    }
+
+    // Grant + lookup.
+    let cap1 = grant_firmware_authority(42);
+    let cap_lookup = firmware_authority_of(42);
+    if cap_lookup.is_none() {
+        return TestResult::Fail("after-grant lookup missed pid");
+    }
+    if !is_trusted_firmware_loader_task(42) {
+        return TestResult::Fail("trusted-loader probe missed granted pid");
+    }
+    // The granted cap must be live.
+    if cap1.check_live().is_err() {
+        return TestResult::Fail("granted cap not live");
+    }
+
+    // Re-grant replaces (idempotent on pid).
+    let _cap2 = grant_firmware_authority(42);
+    let mut hits = 0;
+    for pid in 0..64u64 {
+        if firmware_authority_of(pid).is_some() { hits += 1; }
+    }
+    if hits != 1 {
+        return TestResult::Fail("re-grant grew the table");
+    }
+
+    // Revoke: lookup goes back to None.
+    if !revoke_firmware_authority(42) {
+        return TestResult::Fail("revoke didn't find pid");
+    }
+    if firmware_authority_of(42).is_some() {
+        return TestResult::Fail("revoke didn't clear the entry");
+    }
+    if is_trusted_firmware_loader_task(42) {
+        return TestResult::Fail("trusted-loader probe accepted revoked pid");
+    }
+    // Re-revoke is harmless and reports "no removal".
+    if revoke_firmware_authority(42) {
+        return TestResult::Fail("re-revoke claimed to remove a non-entry");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("firmware", smoke_firmware_per_task_authority_grant_and_revoke);
+
 /// Build a minimal CPIO newc archive — header + path + data — for
 /// each `(name, data)` plus the `TRAILER!!!` sentinel. Used by
 /// `smoke_firmware_initramfs_scan_*` to exercise the walker
