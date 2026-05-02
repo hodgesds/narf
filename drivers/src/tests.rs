@@ -7,6 +7,48 @@ extern crate alloc;
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+fn smoke_drivers_bound_firmware_round_trip() -> TestResult {
+    use crate::{
+        bound_firmware_of, bound_firmware_snapshot, record_bound,
+        set_bound_firmware, BoundDriver, BoundFirmware, BoundKind,
+    };
+    record_bound(BoundDriver {
+        name:    alloc::string::String::from("smoke-fw-driver"),
+        kind:    BoundKind::Net,
+        pci_vid: Some(0x17CB),
+        pci_did: Some(0x1103),
+        domain:  BoundKind::Net.default_domain(),
+    });
+    let fw = BoundFirmware {
+        blob_name: alloc::string::String::from("vendor/smoke/blob.bin"),
+        sha256:    [0xAB; 32],
+        signer:    None,
+        version:   Some(alloc::string::String::from("1.2.3")),
+    };
+    let bound_found = set_bound_firmware("smoke-fw-driver", fw.clone());
+    if !bound_found {
+        return TestResult::Fail("set_bound_firmware didn't see the bound driver");
+    }
+    let recovered = match bound_firmware_of("smoke-fw-driver") {
+        Some(f) => f,
+        None    => return TestResult::Fail("firmware_of missed entry"),
+    };
+    if recovered.blob_name != "vendor/smoke/blob.bin" {
+        return TestResult::Fail("blob_name round-trip");
+    }
+    if recovered.sha256 != [0xAB; 32] {
+        return TestResult::Fail("sha256 round-trip");
+    }
+    if recovered.version.as_deref() != Some("1.2.3") {
+        return TestResult::Fail("version round-trip");
+    }
+    if !bound_firmware_snapshot().iter().any(|(n, _)| n == "smoke-fw-driver") {
+        return TestResult::Fail("snapshot missed entry");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers", smoke_drivers_bound_firmware_round_trip);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_drivers_claim_mmio_in_domain() -> TestResult {
     use narf_arch::x86_64::pcid;

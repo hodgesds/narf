@@ -48,9 +48,12 @@ pub mod params;
 
 mod tests;
 pub use bound::{
-    record as record_bound, snapshot as bound_drivers,
+    record as record_bound, set_firmware as set_bound_firmware,
+    firmware_of as bound_firmware_of,
+    firmware_snapshot as bound_firmware_snapshot,
+    snapshot as bound_drivers,
     set_domain as set_driver_domain, domain_of as driver_domain,
-    BoundDriver, BoundKind,
+    BoundDriver, BoundFirmware, BoundKind,
 };
 #[cfg(target_arch = "x86_64")]
 pub use domain_alloc::claim_mmio_for_driver;

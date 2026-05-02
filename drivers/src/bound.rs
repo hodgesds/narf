@@ -85,6 +85,23 @@ pub struct BoundDriver {
     pub domain:   u8,
 }
 
+/// Firmware-version coupling for a bound driver. Captured at the
+/// moment the driver successfully consumed a `Cap<FirmwareBlob,
+/// Read>` from the registry. Stored in a side table indexed by
+/// driver name so the public `BoundDriver` struct stays
+/// struct-literal-compatible across the existing bind sites.
+#[derive(Clone, Debug)]
+pub struct BoundFirmware {
+    /// Canonical name of the blob (e.g. "qcom/qcnfa765/amss.bin").
+    pub blob_name: String,
+    /// Digest of the firmware payload.
+    pub sha256:    [u8; 32],
+    /// Signer fingerprint, when the blob was signed.
+    pub signer:    Option<[u8; 32]>,
+    /// Vendor-supplied version string, when the trailer carried one.
+    pub version:   Option<String>,
+}
+
 static BOUND: IrqSafeSpinLock<Vec<BoundDriver>> =
     IrqSafeSpinLock::new(Vec::new());
 
@@ -104,6 +121,42 @@ pub fn snapshot() -> Vec<BoundDriver> { BOUND.lock().clone() }
 
 /// Number of bound drivers.
 pub fn count() -> usize { BOUND.lock().len() }
+
+/// Side table of firmware-version couplings, indexed by driver
+/// name. Set via `set_firmware`; queried via `firmware_of`. Kept
+/// out of `BoundDriver` so the existing struct-literal bind sites
+/// don't need an extra field.
+static BOUND_FIRMWARE: IrqSafeSpinLock<Vec<(String, BoundFirmware)>>
+    = IrqSafeSpinLock::new(Vec::new());
+
+/// Record the firmware blob a driver loaded. Replaces any prior
+/// firmware entry on the same driver (re-loads pick up new
+/// versions on rebind). Returns `true` if the driver is in the
+/// bound-driver inventory; the firmware entry is stored
+/// regardless so a future `set_firmware`-then-`record` ordering
+/// is also supported.
+pub fn set_firmware(name: &str, fw: BoundFirmware) -> bool {
+    let mut g = BOUND_FIRMWARE.lock();
+    if let Some(e) = g.iter_mut().find(|(n, _)| n == name) {
+        e.1 = fw;
+    } else {
+        g.push((alloc::string::String::from(name), fw));
+    }
+    BOUND.lock().iter().any(|d| d.name == name)
+}
+
+/// Look up the firmware coupling recorded for `driver_name`, if any.
+pub fn firmware_of(driver_name: &str) -> Option<BoundFirmware> {
+    BOUND_FIRMWARE.lock().iter()
+        .find(|(n, _)| n == driver_name)
+        .map(|(_, fw)| fw.clone())
+}
+
+/// Snapshot of every recorded firmware coupling. Used by
+/// observability for the kernel system-state report.
+pub fn firmware_snapshot() -> Vec<(String, BoundFirmware)> {
+    BOUND_FIRMWARE.lock().clone()
+}
 
 /// Override the isolation domain of an already-bound driver. Returns
 /// `true` if the driver was found and updated. Callers typically

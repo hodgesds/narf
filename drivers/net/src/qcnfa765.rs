@@ -264,6 +264,16 @@ impl WifiNic {
             return Err(WifiError::FirmwareLoadFailed);
         }
 
+        // Record the firmware-version coupling so the bound-driver
+        // inventory + kernel crash bundles know which AMSS image
+        // is running.
+        let _ = view.bytes; // hold the borrow alive through the record
+        narf_drivers::set_bound_firmware("qcnfa765", narf_drivers::BoundFirmware {
+            blob_name: alloc::string::String::from("qcom/qcnfa765/amss.bin"),
+            sha256:    view.sha256,
+            signer:    view.signer,
+            version:   None, // step-1 BlobView always emits None
+        });
         self.fw_loaded = true;
         Ok(())
     }
