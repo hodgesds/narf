@@ -999,3 +999,188 @@ fn smoke_mlx5_cq_binds_to_eq() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/mlx5", smoke_mlx5_cq_binds_to_eq);
+
+// ── Stage 9: CREATE_QP + MODIFY_QP state machine ───────────────────
+
+use super::qp::{
+    build_create_qp_input, decode_create_qp_input, decode_qp_state,
+    decode_qp_type, QpError, QpParams, QpState, QpTransition, QpType,
+    QPC_LEN, QPC_OFF_LOG_PAGE_SIZE, QPC_OFF_STATE_TYPE,
+    QPC_PA_ENTRY_LEN, QPC_PA_LIST_OFF,
+};
+
+fn smoke_mlx5_qp_opcodes_pinned() -> TestResult {
+    let pairs: &[(super::cmd::CmdOp, u16)] = &[
+        (super::cmd::CmdOp::CreateQp,    0x500),
+        (super::cmd::CmdOp::DestroyQp,   0x501),
+        (super::cmd::CmdOp::Rst2InitQp,  0x502),
+        (super::cmd::CmdOp::Init2RtrQp,  0x503),
+        (super::cmd::CmdOp::Rtr2RtsQp,   0x504),
+        (super::cmd::CmdOp::ToRstQp,     0x50A),
+    ];
+    for &(op, want) in pairs {
+        if op as u16 != want {
+            return TestResult::Fail("QP opcode discriminant drifted");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_qp_opcodes_pinned);
+
+fn smoke_mlx5_qp_input_layout() -> TestResult {
+    let pages = [0x1_0000_0000u64, 0x1_0000_1000u64];
+    let params = QpParams {
+        qp_type:        QpType::RawEthernet,
+        pd:             0x000A_BCDE,
+        cqn_snd:        0x0011_2233,
+        cqn_rcv:        0x0044_5566,
+        log_sq_size:    8,
+        log_rq_size:    9,
+        log_page_size:  12,
+    };
+    let bytes = match build_create_qp_input(params, &pages) {
+        Ok(b)  => b,
+        Err(_) => return TestResult::Fail("build_create_qp_input rejected valid params"),
+    };
+    if bytes.len() != QPC_PA_LIST_OFF + 2 * QPC_PA_ENTRY_LEN {
+        return TestResult::Fail("CREATE_QP payload length wrong");
+    }
+    // state | qp_type byte: state=Rst (0), qp_type=RawEthernet (0x9).
+    if bytes[QPC_OFF_STATE_TYPE] != 0x09 {
+        return TestResult::Fail("state|qp_type byte wrong (expected RST<<4|RawEth)");
+    }
+    if bytes[QPC_OFF_LOG_PAGE_SIZE] != 12 {
+        return TestResult::Fail("log_page_size byte wrong");
+    }
+    // Phys-addr list BE.
+    for (i, &expect) in pages.iter().enumerate() {
+        let off = QPC_PA_LIST_OFF + i * QPC_PA_ENTRY_LEN;
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&bytes[off..off + 8]);
+        if u64::from_be_bytes(buf) != expect {
+            return TestResult::Fail("QP phys-addr list entry not BE-encoded");
+        }
+    }
+    // Round-trip the bit-packed + byte-aligned subset.
+    let back = decode_create_qp_input(&bytes);
+    if back.qp_type      != params.qp_type
+       || back.pd            != params.pd
+       || back.cqn_snd       != params.cqn_snd
+       || back.cqn_rcv       != params.cqn_rcv
+       || back.log_sq_size   != params.log_sq_size
+       || back.log_rq_size   != params.log_rq_size
+       || back.log_page_size != params.log_page_size {
+        return TestResult::Fail("CREATE_QP params didn't round-trip");
+    }
+    let _ = QPC_LEN;
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_qp_input_layout);
+
+fn smoke_mlx5_qp_input_validation() -> TestResult {
+    let pages = [0x1_0000_0000u64];
+    let bad_sq = QpParams {
+        qp_type: QpType::Rc, pd: 0,
+        cqn_snd: 0, cqn_rcv: 0,
+        log_sq_size: 32, log_rq_size: 0, log_page_size: 12,
+    };
+    if !matches!(build_create_qp_input(bad_sq, &pages), Err(QpError::BadLogSqSize)) {
+        return TestResult::Fail("oversize log_sq_size accepted");
+    }
+    let bad_rq = QpParams {
+        qp_type: QpType::Rc, pd: 0,
+        cqn_snd: 0, cqn_rcv: 0,
+        log_sq_size: 0, log_rq_size: 32, log_page_size: 12,
+    };
+    if !matches!(build_create_qp_input(bad_rq, &pages), Err(QpError::BadLogRqSize)) {
+        return TestResult::Fail("oversize log_rq_size accepted");
+    }
+    let bad_pd = QpParams {
+        qp_type: QpType::Rc, pd: 0x100_0000,
+        cqn_snd: 0, cqn_rcv: 0,
+        log_sq_size: 0, log_rq_size: 0, log_page_size: 12,
+    };
+    if !matches!(build_create_qp_input(bad_pd, &pages), Err(QpError::BadPd)) {
+        return TestResult::Fail("oversize pd accepted");
+    }
+    let bad_cqn = QpParams {
+        qp_type: QpType::Rc, pd: 0,
+        cqn_snd: 0x0100_0000, cqn_rcv: 0,
+        log_sq_size: 0, log_rq_size: 0, log_page_size: 12,
+    };
+    if !matches!(build_create_qp_input(bad_cqn, &pages), Err(QpError::BadCqn)) {
+        return TestResult::Fail("oversize cqn accepted");
+    }
+    let ok = QpParams {
+        qp_type: QpType::Rc, pd: 0,
+        cqn_snd: 0, cqn_rcv: 0,
+        log_sq_size: 0, log_rq_size: 0, log_page_size: 12,
+    };
+    if !matches!(build_create_qp_input(ok, &[]), Err(QpError::NoPages)) {
+        return TestResult::Fail("empty page list accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_qp_input_validation);
+
+fn smoke_mlx5_qp_state_decode() -> TestResult {
+    // Synthesise qpc bytes with each documented state in the high
+    // nibble + verify decode_qp_state surfaces the right enum.
+    let pages = [0xFFFF_0000_0000_0000u64];
+    let mut bytes = build_create_qp_input(QpParams {
+        qp_type: QpType::Ud, pd: 0,
+        cqn_snd: 0, cqn_rcv: 0,
+        log_sq_size: 0, log_rq_size: 0, log_page_size: 12,
+    }, &pages).unwrap();
+    if decode_qp_state(&bytes) != QpState::Rst {
+        return TestResult::Fail("freshly-built qpc not in Rst");
+    }
+    // Move state through INIT → RTR → RTS by rewriting the high
+    // nibble of byte 0 (preserve the qp_type low nibble).
+    let qt_nib = bytes[QPC_OFF_STATE_TYPE] & 0x0F;
+    let cases = [
+        (QpState::Init, 0x1u8),
+        (QpState::Rtr,  0x2),
+        (QpState::Rts,  0x3),
+        (QpState::Sqer, 0x4),
+        (QpState::Err,  0x6),
+    ];
+    for (want, nib) in cases {
+        bytes[QPC_OFF_STATE_TYPE] = (nib << 4) | qt_nib;
+        if decode_qp_state(&bytes) != want {
+            return TestResult::Fail("decode_qp_state wrong for state nibble");
+        }
+    }
+    // Type round-trip.
+    if decode_qp_type(&bytes) != Some(QpType::Ud) {
+        return TestResult::Fail("qp_type low nibble lost during state writes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_qp_state_decode);
+
+fn smoke_mlx5_qp_transition_opcode_mapping() -> TestResult {
+    // Stage 9 maps each documented MODIFY_QP transition to a unique
+    // opcode. Confirm none collide and all use 0x5xx range.
+    let pairs: &[(QpTransition, super::cmd::CmdOp)] = &[
+        (QpTransition::ToRst,     super::cmd::CmdOp::ToRstQp),
+        (QpTransition::RstToInit, super::cmd::CmdOp::Rst2InitQp),
+        (QpTransition::InitToRtr, super::cmd::CmdOp::Init2RtrQp),
+        (QpTransition::RtrToRts,  super::cmd::CmdOp::Rtr2RtsQp),
+    ];
+    let mut seen = [0u16; 4];
+    for (i, &(_, op)) in pairs.iter().enumerate() {
+        let v = op as u16;
+        if (v & 0xF00) != 0x500 {
+            return TestResult::Fail("MODIFY_QP opcode outside 0x5xx range");
+        }
+        for j in 0..i {
+            if seen[j] == v {
+                return TestResult::Fail("MODIFY_QP opcodes collide");
+            }
+        }
+        seen[i] = v;
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_qp_transition_opcode_mapping);

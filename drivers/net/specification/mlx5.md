@@ -1,6 +1,6 @@
 # mlx5 — Specification
 
-> Status: **v0.8** (Stage 8: ALLOC_UAR + ALLOC_PD + CREATE_CQ).
+> Status: **v0.9** (Stage 9: CREATE_QP + MODIFY_QP state machine).
 >
 > Clean-room driver for Mellanox / NVIDIA ConnectX-4 / 5 / 6 / 7
 > family Ethernet + InfiniBand HCAs. Reference material: the
@@ -136,6 +136,36 @@ have a server target with a ConnectX HCA in CI.
 
 - **v0.1** (Stage 1): PCI match + init-segment decoder +
   initializing-bit poll + smokes co-located in driver dir.
+- **v0.9** (Stage 9): six new opcodes for the QP family —
+  `CreateQp` (0x500), `DestroyQp` (0x501), `Rst2InitQp`
+  (0x502), `Init2RtrQp` (0x503), `Rtr2RtsQp` (0x504), `ToRstQp`
+  (0x50A). `mlx5/qp.rs` lays out the 512-byte QP context
+  (qpc) + `build_create_qp_input(params, &pages)` — state
+  (high nibble of byte 0x00) | qp_type (low nibble: Rc 0x0 / Uc
+  0x1 / Ud 0x2 / Xrc 0x3 / Dct 0x6 / RawEthernet 0x9), bit-
+  packed pd (24 bits at byte 0x10), cqn_snd (24 bits at 0x18),
+  cqn_rcv (24 bits at 0x20), log_sq_size (5 bits at byte 0x29
+  low) + log_rq_size (5 bits at 0x2B low), byte-aligned
+  log_page_size (0x2C), followed by an 8-byte BE phys-addr
+  list at offset 0x200. `decode_qp_state` / `decode_qp_type`
+  / `decode_create_qp_input` round-trip. `Mlx5Hca::create_qp(
+  params, page_count)` posts CREATE_QP via the input-mailbox
+  transport, masks 24 bits of output_modifier as `qp_number`,
+  and pushes a `LiveQp { qp_number, _pages, params, state }`
+  onto the registry — initial state is `Rst`. `Mlx5Hca::
+  modify_qp(qp_number, transition)` walks the documented state
+  machine — each `QpTransition` (ToRst / RstToInit / InitToRtr
+  / RtrToRts) maps to one of the dedicated opcodes; qp_number
+  rides in input_modifier; the driver's mirrored state field is
+  updated on success. `qp_state(qp_number)` introspection.
+  `Mlx5Error::QpBuild` surfaces builder errors. Five new smokes:
+  six QP opcodes pinned, CREATE_QP layout (length, state|type
+  byte, log_page_size, BE phys list, full param round-trip),
+  validation rejection paths (BadLogSqSize / BadLogRqSize / BadPd
+  / BadCqn / NoPages), state-byte high-nibble round-trip across
+  Rst/Init/Rtr/Rts/Sqer/Err while preserving qp_type low nibble,
+  transition-to-opcode mapping (no collisions, all in 0x5xx
+  range).
 - **v0.8** (Stage 8): three new opcodes — `AllocUar` (0x802),
   `AllocPd` (0x800), `CreateCq` (0x400). `Mlx5Hca::alloc_uar()`
   + `alloc_pd()` issue inline-output commands and stash the

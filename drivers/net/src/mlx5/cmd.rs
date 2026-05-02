@@ -100,6 +100,20 @@ pub enum CmdOp {
     /// `0x802`. No input data; FW returns the assigned `uar` page
     /// index in `output_modifier` low 24 bits.
     AllocUar    = 0x802,
+    /// `CREATE_QP` — create a Queue Pair in the RST state. Opcode
+    /// `0x500`. Input mailbox: 512-byte qpc + phys-addr list.
+    CreateQp    = 0x500,
+    /// `DESTROY_QP` — release a QP. Opcode `0x501`. Input modifier
+    /// carries `qpn`.
+    DestroyQp   = 0x501,
+    /// `RST2INIT_QP` — RST → INIT state transition. Opcode `0x502`.
+    Rst2InitQp  = 0x502,
+    /// `INIT2RTR_QP` — INIT → RTR (Ready To Receive). Opcode `0x503`.
+    Init2RtrQp  = 0x503,
+    /// `RTR2RTS_QP` — RTR → RTS (Ready To Send). Opcode `0x504`.
+    Rtr2RtsQp   = 0x504,
+    /// `2RST_QP` — any state → RST. Opcode `0x50A`.
+    ToRstQp     = 0x50A,
 }
 
 /// Status codes the firmware writes into byte 0x20 of the CQE.

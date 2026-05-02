@@ -45,6 +45,7 @@ pub mod cmd;
 pub mod cq;
 pub mod eq;
 pub mod mailbox;
+pub mod qp;
 
 // ── PCI device IDs (ConnectX-4 .. ConnectX-6 Dx) ───────────────────
 
@@ -208,6 +209,8 @@ pub enum Mlx5Error {
     EqBuild(eq::EqError),
     /// Stage 8: caller-supplied CQ parameters were invalid.
     CqBuild(cq::CqError),
+    /// Stage 9: caller-supplied QP parameters were invalid.
+    QpBuild(qp::QpError),
 }
 
 /// Stage 7: live-EQ bookkeeping. Holds the FW-assigned `eq_number`
@@ -225,6 +228,27 @@ pub struct LiveCq {
     pub cq_number: u32,
     _pages:        Vec<DmaBuffer>,
     pub params:    cq::CqParams,
+}
+
+/// Stage 9: live-QP bookkeeping. Holds the FW-assigned `qp_number`,
+/// the DMA pages backing the SQ + RQ buffers, and the most-recently-
+/// observed state. Drivers driving the state machine update `state`
+/// after each successful MODIFY_QP.
+pub struct LiveQp {
+    pub qp_number: u32,
+    _pages:        Vec<DmaBuffer>,
+    pub params:    qp::QpParams,
+    pub state:     qp::QpState,
+}
+
+impl fmt::Debug for LiveQp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LiveQp")
+            .field("qp_number", &self.qp_number)
+            .field("state",     &self.state)
+            .field("params",    &self.params)
+            .finish_non_exhaustive()
+    }
 }
 
 impl fmt::Debug for LiveCq {
@@ -268,6 +292,8 @@ pub struct Mlx5Hca {
     uars: IrqSafeSpinLock<Vec<u32>>,
     /// Stage 8: FW-assigned PD numbers owned by this driver.
     pds: IrqSafeSpinLock<Vec<u32>>,
+    /// Stage 9: registry of live QPs.
+    qps: IrqSafeSpinLock<Vec<LiveQp>>,
     /// Stage 7: BAR0 byte-offset where UAR pages start. PRM-documented
     /// for ConnectX-4..6 at 0x100000 (1 MiB into BAR0). Driver-level
     /// override is kept on the struct so a future stage can refine
@@ -355,6 +381,7 @@ impl Mlx5Hca {
             cqs: IrqSafeSpinLock::new(Vec::new()),
             uars: IrqSafeSpinLock::new(Vec::new()),
             pds: IrqSafeSpinLock::new(Vec::new()),
+            qps: IrqSafeSpinLock::new(Vec::new()),
             uar_base: UAR_BASE_DEFAULT,
         })
     }
@@ -785,6 +812,84 @@ impl Mlx5Hca {
     pub fn uar_count(&self) -> usize { self.uars.lock().len() }
     /// Number of currently-allocated PDs.
     pub fn pd_count(&self)  -> usize { self.pds.lock().len() }
+    /// Number of currently-allocated QPs.
+    pub fn qp_count(&self)  -> usize { self.qps.lock().len() }
+
+    /// Stage 9: live `CREATE_QP`. Allocates `page_count` 4-KiB DMA
+    /// pages for the QP buffers (SQ + RQ + doorbell), builds the
+    /// CREATE_QP payload via `qp::build_create_qp_input`, posts via
+    /// the input-mailbox transport, and returns the FW-assigned
+    /// `qp_number` (low 24 bits of `output_modifier`). The newly
+    /// created QP starts in the RST state.
+    pub fn create_qp(
+        &self,
+        params:     qp::QpParams,
+        page_count: usize,
+    ) -> Result<u32, Mlx5Error> {
+        let mut pages: Vec<DmaBuffer> = Vec::with_capacity(page_count);
+        for _ in 0..page_count {
+            pages.push(
+                alloc_coherent(4096, DomainId::DRIVER_0)
+                    .map_err(|_| Mlx5Error::CmdqAlloc)?);
+        }
+        let phys: Vec<u64> = pages.iter()
+            .map(|p| p.phys_addr().raw()).collect();
+        let payload = qp::build_create_qp_input(params, &phys)
+            .map_err(Mlx5Error::QpBuild)?;
+        let resp = self.issue_command_with_input_mailbox(
+            CmdOp::CreateQp, 0, &payload)?;
+        let qp_number = resp.output_modifier & 0x00FF_FFFF;
+        self.qps.lock().push(LiveQp {
+            qp_number,
+            _pages: pages,
+            params,
+            state:  qp::QpState::Rst,
+        });
+        Ok(qp_number)
+    }
+
+    /// Stage 9: live `MODIFY_QP` — drive a QP through the documented
+    /// state-machine transitions. Each transition maps to a distinct
+    /// PRM-documented opcode; `qp_number` rides in `input_modifier`.
+    /// On success, the driver's `LiveQp.state` is updated.
+    pub fn modify_qp(
+        &self,
+        qp_number:  u32,
+        transition: qp::QpTransition,
+    ) -> Result<(), Mlx5Error> {
+        let opcode = match transition {
+            qp::QpTransition::ToRst       => CmdOp::ToRstQp,
+            qp::QpTransition::RstToInit   => CmdOp::Rst2InitQp,
+            qp::QpTransition::InitToRtr   => CmdOp::Init2RtrQp,
+            qp::QpTransition::RtrToRts    => CmdOp::Rtr2RtsQp,
+        };
+        // Stage-9 minimal MODIFY_QP: zero-input. Real callers will
+        // need to populate the qpc-update mailbox in Stage 10 to
+        // hand FW path/MTU/PSN fields; for the state-machine plumbing
+        // a zero-input modify is enough to validate the transport.
+        let _resp = self.issue_command_inline(
+            opcode, qp_number & 0x00FF_FFFF, &[])?;
+        // Update the driver-side state mirror.
+        let new_state = match transition {
+            qp::QpTransition::ToRst     => qp::QpState::Rst,
+            qp::QpTransition::RstToInit => qp::QpState::Init,
+            qp::QpTransition::InitToRtr => qp::QpState::Rtr,
+            qp::QpTransition::RtrToRts  => qp::QpState::Rts,
+        };
+        let mut qps = self.qps.lock();
+        if let Some(q) = qps.iter_mut().find(|q| q.qp_number == qp_number) {
+            q.state = new_state;
+        }
+        Ok(())
+    }
+
+    /// Look up the driver-side state mirror for a QP. Returns `None`
+    /// if the qp_number doesn't match any tracked QP.
+    pub fn qp_state(&self, qp_number: u32) -> Option<qp::QpState> {
+        self.qps.lock().iter()
+            .find(|q| q.qp_number == qp_number)
+            .map(|q| q.state)
+    }
 
     /// Stage 5: typed wrapper around QUERY_HCA_CAP(GeneralDevice).
     /// Returns the decoded view; callers needing fields beyond the
