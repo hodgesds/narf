@@ -65,7 +65,7 @@ intra-address-space isolation.
   framekernel's domain model.
 - **Verification and observability are first-class.** A kernel-resident
   test harness (`cargo xtask test`) boots the real kernel under QEMU and
-  asserts on live invariants — 569 smokes on x86_64, 292 on aarch64 at
+  asserts on live invariants — 571 smokes on x86_64, 292 on aarch64 at
   time of writing — alongside USDT-style probes, flight-recorder rings, a
   PMU-sampling surface, and an ABI promise (syscall numbers carry an upper
   8-bit version, `relibc` will gate against it). Bugs are caught at the
@@ -297,6 +297,24 @@ Live from boot through `cargo xtask run`:
 - Generic Timer (`narf_arch::aarch64::timer`): `CNTFRQ_EL0`
   calibration + `CNTPCT_EL0` read with `isb` ordering.
   Replaces the 1 GHz aarch64 fallback in `narf-time::wall`.
+- P-states (`narf_power::pstate`): clean-room from SDM Vol 4
+  §14.4 + AMD APM Vol 2 §17. Detection picks Intel HWP first
+  (CPUID(6).EAX[7]), legacy SpeedStep second (CPUID(1).ECX[7]),
+  AMD legacy P-states third (CPUID(0x80000007).EDX[7]); HWP
+  capabilities + per-CPU request (`min` / `max` / `desired` /
+  `EPP`); legacy `IA32_PERF_CTL` / `MSR_PSTATE_LIMIT` write
+  path. Spec: `power/specification/cpu-power.md` §1.
+- MWAIT idle (`narf_power::idle`): CPUID(5) decode for the
+  supported sub-state set, encode helper for C1..C7 hint
+  values, MONITOR/MWAIT entry with interrupt-break extension.
+  `idle()` is the canonical kernel idle entry; falls back to
+  STI;HLT when MWAIT isn't advertised.
+  Spec: `power/specification/cpu-power.md` §2.
+- RAPL (`narf_power::rapl`): MSR_RAPL_POWER_UNIT decode into
+  µJ-per-unit, package / PP0 (cores) / PP1 (uncore + iGPU) /
+  DRAM energy reads, plus `read_temp_c` / `read_pkg_temp_c`
+  built on `MSR_IA32_THERM_STATUS` + `MSR_TEMPERATURE_TARGET`.
+  Spec: `power/specification/cpu-power.md` §3.
 - Intel HD Audio (HDA): clean-room driver for the AMD Ryzen /
   Phoenix and Radeon HD Audio Controllers — BAR0 mapping, GCTL
   reset, CORB/RIRB ring DMA, STATESTS codec walk, Get Parameter
@@ -320,7 +338,7 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **569/0/24** smokes;
+`cargo xtask test --arch=x86_64` passes **571/0/25** smokes;
 `--arch=aarch64` passes **294/0/10**. Skips are x86-specific PCIe
 surfaces or live-device tests that skip cleanly when QEMU doesn't
 expose the device. See `STATUS.md` for the full tally and per-

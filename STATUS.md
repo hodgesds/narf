@@ -18,7 +18,7 @@ asks for. Updated when observable kernel behaviour changes.
   delivers hardware LAPIC-timer IRQs, exits cleanly.
 - `cargo xtask run --arch=aarch64` boots, runs the full async demo
   using CNTPCT_EL0 as the clock, exits via ARM semihosting.
-- `cargo xtask test --arch=x86_64` passes **569/0/24** (pass / fail / skip).
+- `cargo xtask test --arch=x86_64` passes **571/0/25** (pass / fail / skip).
 - `cargo xtask test --arch=aarch64` passes **294/0/10** (pass / fail / skip).
   Skips are x86_64-specific PCIe surfaces or live-device tests that
   skip cleanly when QEMU doesn't expose the device.
@@ -63,6 +63,9 @@ asks for. Updated when observable kernel behaviour changes.
 | CMOS RTC (MC146818) | IO ports 0x70/0x71 wall-clock read with UIP-poll, BCD/binary + 12/24 h decode, century byte, Unix epoch conversion. |
 | i8254 PIT        | Mode 0 (one-shot) + Mode 2 (rate generator) + Mode 3 (square wave) at IO 0x40-0x43 with 1.193182 MHz input clock. Channel 2 latch + PPI gate for free-running boot timer. |
 | Generic Timer (aarch64) | `CNTFRQ_EL0` calibration + `CNTPCT_EL0` read with `isb` ordering. Replaces 1 GHz fallback in `narf-time`. |
+| P-states (x86_64) | Intel HWP (MSRs 0x770-0x777) primary + SpeedStep (0x198/0x199) fallback + AMD legacy (MSR_PSTATE_* 0xC0010061-0xC0010064). Capabilities decode + `hwp_set(min,max,desired,EPP)` + `legacy_set(id)`. Spec: `power/specification/cpu-power.md` §1. |
+| MWAIT idle (x86_64) | CPUID(5) caps decode + `MWAIT EAX = encode_cstate(d)` for C1..C7 entry, falls back to STI;HLT. Spec: `power/specification/cpu-power.md` §2. |
+| RAPL (x86_64)    | MSR_RAPL_POWER_UNIT decode → µJ-per-unit, `read_pkg_uj` / `read_pp0_uj` / `read_pp1_uj` / `read_dram_uj` + `read_temp_c` / `read_pkg_temp_c` thermal. Spec: `power/specification/cpu-power.md` §3. |
 | iwlwifi          | Intel Wi-Fi 6 / 6E (AX200 / AX201 / AX210 / AX211). **Structural probe only** — PCI match table + spec doc. Operational register map (CSR/PRPH offsets, firmware loader, TFD/RBD descriptors, host-command opcodes) is not in any public Intel doc; further stages blocked on public register docs. See `drivers/net/specification/iwlwifi.md`. |
 | AHCI (ICH9/10)   | HBA bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT. |
 | xHCI USB host    | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT. |

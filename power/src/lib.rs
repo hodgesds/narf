@@ -36,6 +36,10 @@ extern crate alloc;
 pub mod suspend;
 pub mod thermal;
 
+#[cfg(target_arch = "x86_64")] pub mod pstate;
+#[cfg(target_arch = "x86_64")] pub mod idle;
+#[cfg(target_arch = "x86_64")] pub mod rapl;
+
 mod tests;
 
 pub use suspend::{SuspendError, SuspendPhase};

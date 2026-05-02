@@ -163,3 +163,58 @@ fn smoke_power_suspend_phase_progression() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("power", smoke_power_suspend_phase_progression);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_pstate_detect_mechanism() -> TestResult {
+    use crate::pstate;
+    pstate::__reset_for_test();
+    let m = pstate::detect();
+    let m2 = pstate::detect();
+    if m != m2 {
+        return TestResult::Fail("pstate::detect() not memoised");
+    }
+    if m == pstate::Mechanism::Hwp {
+        // SAFETY: kernel-test CPL=0; HWP advertised.
+        let caps = unsafe { pstate::hwp_capabilities() };
+        if caps.min_perf == 0 || caps.max_perf == 0 || caps.min_perf > caps.max_perf {
+            return TestResult::Fail("HwpCaps min/max degenerate");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("power/pstate", smoke_pstate_detect_mechanism);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_idle_caps_and_encode() -> TestResult {
+    use crate::idle;
+    idle::__reset_for_test();
+    let c = idle::caps();
+    if idle::encode_cstate(0) != 0    { return TestResult::Fail("C0 encode"); }
+    if idle::encode_cstate(1) != 0    { return TestResult::Fail("C1 encode"); }
+    if idle::encode_cstate(3) != 0x20 { return TestResult::Fail("C3 encode"); }
+    if idle::encode_cstate(6) != 0x40 { return TestResult::Fail("C6 encode"); }
+    let _ = c;
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("power/idle", smoke_idle_caps_and_encode);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_rapl_unit_decode() -> TestResult {
+    use crate::rapl;
+    if !rapl::is_supported() {
+        return TestResult::Skip("RAPL not advertised");
+    }
+    // SAFETY: kernel-test CPL=0.
+    let u = unsafe { rapl::units() };
+    if u.energy_exp < 8 || u.energy_exp > 20 {
+        return TestResult::Fail("RAPL energy_units out of plausible range");
+    }
+    if u.energy_uj_per_unit == 0 {
+        return TestResult::Fail("RAPL energy_uj_per_unit = 0");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("power/rapl", smoke_rapl_unit_decode);
