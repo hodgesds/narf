@@ -670,6 +670,17 @@ pub enum CpioError {
 }
 
 impl Initramfs {
+    /// Iterate every regular-file entry as `(name, data)` pairs.
+    /// `name` is the path-as-it-appeared in the archive (CPIO has
+    /// no directory hierarchy beyond what's encoded in slashes).
+    /// External crates use this to scoop subtrees — e.g.
+    /// `narf-firmware` walks `firmware/*` entries at boot.
+    pub fn iter_files(&self) -> impl Iterator<Item = (&'static str, &'static [u8])> + '_ {
+        self.entries.iter()
+            .filter(|e| (e.mode & 0o170000) == 0o100000) // S_IFREG
+            .map(|e| (e.name, e.data))
+    }
+
     /// Parse a CPIO newc archive. The slice must outlive the
     /// `Initramfs` (we borrow names + file data straight from it);
     /// `&'static [u8]` is the natural Stage-3 lifetime because the

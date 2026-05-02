@@ -25,6 +25,8 @@ narf-io           = { path = "../io" }
 narf-rcu          = { path = "../rcu" }
 narf-crypto       = { path = "../crypto" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
+narf-init         = { path = "../init" }
+narf-filesystem   = { path = "../filesystem" }
 
 [lints]
 workspace = true

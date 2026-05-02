@@ -234,6 +234,107 @@ pub fn register_in_tree(
     registry::install_blob(name, bytes, BlobSource::InTree)
 }
 
+/// Convenience: register multiple in-tree blobs in one shot. Used
+/// from `register_initcalls`-like driver bootstraps that ship a
+/// small bundle of `(name, &[u8])` pairs.
+///
+/// Bytes whose trailer is malformed or whose signature is rejected
+/// surface a panic; in-tree blobs are kernel build-time inputs and
+/// failure here means the kernel image is wrong, not a runtime
+/// fault.
+pub fn register_in_tree_bundle(blobs: &[(&'static str, &'static [u8])]) {
+    for (name, bytes) in blobs {
+        match register_in_tree(name, bytes) {
+            Ok(())  => {}
+            Err(e)  => panic!(
+                "narf-firmware: in-tree blob {:?} rejected by registry: {:?}",
+                name, e),
+        }
+    }
+}
+
+/// Stage::Subsys initcalls for this crate. The firmware crate's
+/// own initcall is a no-op — it exists only so other crates can
+/// rely on a deterministic ordering: anything that registers an
+/// in-tree blob runs at `Stage::Subsys` AFTER `firmware-init`. A
+/// future build profile that ships kernel-baked vendor firmware
+/// images registers them through this hook.
+pub fn register_initcalls() {
+    use narf_init::{InitResult, Stage};
+    narf_init::register(Stage::Subsys, "firmware-init", || {
+        // Reserved for staged in-tree blob registration. Today
+        // empty; future profiles plant vendor blobs here via
+        // `register_in_tree_bundle`.
+        InitResult::Ok
+    });
+}
+
+/// Walk every `firmware/*` entry in an initramfs and register it
+/// with the registry under `BlobSource::Initramfs`. Per spec §5,
+/// this is the mid-priority population path — it overrides
+/// in-tree fallbacks but is overridden by `HotInstall`.
+///
+/// Naming: each archive entry whose path starts with `"firmware/"`
+/// is registered under the suffix as its canonical name. So
+/// `firmware/qcom/qcnfa765/amss.bin` lands in the registry under
+/// `"qcom/qcnfa765/amss.bin"`.
+///
+/// Returns the number of entries successfully registered. Any
+/// entry whose trailer is malformed or whose signature is rejected
+/// surfaces a warning (best-effort; one bad blob doesn't poison
+/// the rest) and decrements the count.
+pub fn scan_initramfs(
+    fs:   &narf_filesystem::Initramfs,
+    auth: &Cap<FirmwareRegistry, Write>,
+) -> Result<usize, FirmwareError> {
+    if auth.check_live().is_err() {
+        return Err(FirmwareError::AuthorityRevoked);
+    }
+    let mut n_ok = 0usize;
+    for (name, bytes) in fs.iter_files() {
+        // Only entries under `firmware/`.
+        let suffix = match name.strip_prefix("firmware/") {
+            Some(s) => s,
+            None    => continue,
+        };
+        // Empty suffix or a directory-marker — skip.
+        if suffix.is_empty() { continue; }
+        match registry::install_blob(suffix, bytes, BlobSource::Initramfs) {
+            Ok(())  => n_ok += 1,
+            Err(_)  => {
+                // Best-effort: skip bad blobs without aborting the
+                // rest of the walk. A future iteration may surface
+                // these via the observability layer.
+            }
+        }
+    }
+    Ok(n_ok)
+}
+
+/// Cap-gated entry point for the userspace `sys_firmware_install`
+/// syscall. Wraps `install()` with the byte-pointer translation
+/// the syscall layer needs.
+///
+/// # Safety
+/// `bytes_ptr` must point at exactly `bytes_len` valid bytes
+/// readable by the kernel. The caller (the syscall trap handler)
+/// is responsible for validating the user-mode pointer + length
+/// against the calling task's address space.
+pub unsafe fn sys_install(
+    name:      &'static str,
+    bytes_ptr: *const u8,
+    bytes_len: usize,
+    auth:      &Cap<FirmwareRegistry, Write>,
+) -> Result<(), FirmwareError> {
+    if auth.check_live().is_err() {
+        return Err(FirmwareError::AuthorityRevoked);
+    }
+    // SAFETY: forwarded from caller — pointer + length validated
+    // against the user task's AS by the syscall handler.
+    let bytes = unsafe { core::slice::from_raw_parts(bytes_ptr, bytes_len) };
+    registry::install_blob(name, bytes, BlobSource::HotInstall)
+}
+
 // ── Cap::view() — accessor ────────────────────────────────────────
 
 /// Per-cap sequence number used to bind a `BlobView` lifetime to

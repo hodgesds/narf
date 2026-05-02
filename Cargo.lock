@@ -551,6 +551,7 @@ dependencies = [
  "narf-capabilities",
  "narf-driver-runtime",
  "narf-drivers",
+ "narf-firmware",
  "narf-init",
  "narf-interrupts",
  "narf-io",
@@ -659,6 +660,20 @@ dependencies = [
  "narf-lib",
  "narf-scheduler",
  "narf-time",
+]
+
+[[package]]
+name = "narf-firmware"
+version = "0.0.0"
+dependencies = [
+ "narf-capabilities",
+ "narf-crypto",
+ "narf-filesystem",
+ "narf-init",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-rcu",
 ]
 
 [[package]]

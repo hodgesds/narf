@@ -36,6 +36,8 @@
 //! using the MHI control registers documented in `MhiRegs` below
 //! (still public-spec — no GPL reference).
 
+use core::sync::atomic::{compiler_fence, Ordering};
+
 use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -45,19 +47,47 @@ pub const QCN_VENDOR:    u16 = 0x17CB;
 /// QCNFA765 / WCN6855 WiFi 6E.
 pub const QCNFA765_DEV:  u16 = 0x1103;
 
-/// BAR0 register-block offsets the public MHI spec documents. Real
-/// WCN6855 layout *may* place the BHI block behind a different
-/// front-end window (silicon-specific BHIOFF + RTSOFF redirection
-/// is read out of `BHIOFF` / `MHIVER` at runtime, not hard-coded).
-/// The offsets below are the spec's first-window defaults, used
-/// as a starting point for reading those redirection registers.
+/// BAR0 register-block offsets per the public MHI host spec. Real
+/// WCN6855 silicon places the BHI block behind a runtime-readable
+/// `BHIOFF` redirection word; bring-up reads `BHIOFF` from the
+/// front-of-BAR window and uses that to locate BHI registers.
+///
+/// References:
+///   - MHI Host Interface §4.2 (register layout)
+///   - MHI Host Interface §3.2.4 (BHI boot sequence)
 mod regs {
-    /// MHI register block; offsets per `§4.2`.
-    pub const MHIVER:    u64 = 0x0008;
-    /// MHIVER read of `0xFFFFFFFF` means the BAR isn't backed by
-    /// the chip (PCIe link gone, device in D3cold, etc.). Used as a
-    /// presence test.
+    // ── front-of-BAR (always at fixed offset) ─────────────────────
+    /// MHI version register. `0xFFFFFFFF` ↔ device-gone presence test.
+    pub const MHIVER:      u64 = 0x0008;
+    /// BHIOFF: BHI block offset within BAR0 (read once, cached).
+    pub const BHIOFF:      u64 = 0x0028;
+    /// Sentinel — front-of-BAR reads for absent silicon.
     pub const MHIVER_GONE: u32 = 0xFFFF_FFFF;
+
+    // ── BHI block (offsets RELATIVE to BHIOFF) ────────────────────
+    /// BHI Boot Image transmit doorbell — write image length +
+    /// sequence id here to kick off staging (§3.2.4).
+    pub const BHI_IMGTXDB:    u64 = 0x18;
+    /// BHI Image Address — phys address of the staged image. Two
+    /// 32-bit halves: low at +0x108, high at +0x10C.
+    pub const BHI_IMGADDR_LO: u64 = 0x108;
+    pub const BHI_IMGADDR_HI: u64 = 0x10C;
+    /// BHI Image Size in bytes (§3.2.4 Table 3-3).
+    pub const BHI_IMGSIZE:    u64 = 0x110;
+    /// BHI EXECENV — current execution environment (0=PBL, 1=SBL,
+    /// 2=AMSS). Driver polls this to confirm firmware loaded.
+    pub const BHI_EXECENV:    u64 = 0x28;
+    /// BHI STATUS — boot-loader writes 1 (success) / 2 (error)
+    /// once it consumes the staged image.
+    pub const BHI_STATUS:     u64 = 0x2C;
+
+    /// BHI_STATUS values (§3.2.4 Table 3-4).
+    pub const BHI_STATUS_RESET:   u32 = 0;
+    pub const BHI_STATUS_SUCCESS: u32 = 1;
+    pub const BHI_STATUS_ERROR:   u32 = 2;
+
+    /// EXECENV after AMSS firmware is running.
+    pub const EXECENV_AMSS: u32 = 2;
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -84,14 +114,17 @@ pub struct ChipInfo {
     pub mhi_version: u32,
 }
 
-/// One QCNFA765 host. Pre-firmware: BAR mapped, MHIVER read, that's
-/// it. Post-firmware (Stage-6+): MHI control region + channel +
-/// event rings + 802.11 data plane all hang off this struct.
+/// One QCNFA765 host. Pre-firmware: BAR mapped, MHIVER read, BHI
+/// offset cached. Post-firmware: AMSS staged + MHI engine in M0,
+/// per-channel rings + 802.11 data plane attach.
 pub struct WifiNic {
     pub mmio: MmioRegion,
     pub chip: ChipInfo,
-    /// `false` until firmware loading completes. Bringing this to
-    /// `true` is a Stage-6 follow-up driven by the firmware loader.
+    /// BHI register-block offset within BAR0, read from `BHIOFF`
+    /// at bring-up. Cached so `load_firmware` doesn't re-read it.
+    bhi_off:  u64,
+    /// `false` until firmware loading completes (BHI_STATUS reads
+    /// SUCCESS + EXECENV reads AMSS).
     pub fw_loaded: bool,
 }
 
@@ -127,10 +160,15 @@ impl WifiNic {
         if mhi_version == regs::MHIVER_GONE {
             return Err(WifiError::DeviceGone);
         }
+        // Cache BHIOFF so `load_firmware` can address the BHI
+        // register block without re-reading the redirection word.
+        // SAFETY: identity-mapped MMIO; readable in PBL state.
+        let bhi_off = unsafe { mmio.read32(regs::BHIOFF) } as u64;
 
         Ok(Self {
             mmio,
             chip: ChipInfo { mhi_version },
+            bhi_off,
             fw_loaded: false,
         })
     }
@@ -144,15 +182,25 @@ impl WifiNic {
     /// Stage AMSS firmware via BHI + drive the MHI engine into M0.
     ///
     /// Looks the AMSS image up by canonical name through the
-    /// kernel firmware registry (`narf-firmware`), points BHI at
-    /// the staged image, and waits for `BHI_STATUS` = success.
-    /// On real silicon the chip then transitions PBL → SBL → AMSS
-    /// and `MHISTATUS.READY` asserts within ~200 ms.
+    /// kernel firmware registry (`narf-firmware`), runs the BHI
+    /// staging sequence per MHI spec §3.2.4, and waits for
+    /// `BHI_STATUS = SUCCESS` plus `EXECENV = AMSS`. On real
+    /// silicon the chip transitions PBL → SBL → AMSS and
+    /// `MHISTATUS.READY` asserts within ~200 ms after that.
+    ///
+    /// BHI sequence:
+    ///   1. Write image phys address (low / high) to
+    ///      `BHI_IMGADDR_LO` / `BHI_IMGADDR_HI`.
+    ///   2. Write image length to `BHI_IMGSIZE`.
+    ///   3. Write `(0u32 << 16) | sequence_id` to `BHI_IMGTXDB`
+    ///      to ring the boot-host doorbell.
+    ///   4. Poll `BHI_STATUS` until non-zero. Success = 1, Error = 2.
+    ///   5. Confirm `EXECENV` reads `AMSS` (= 2).
     ///
     /// Returns `FirmwareMissing` if the registry has no entry for
-    /// the requested blob — typical state before Stage-6 step-2
-    /// (in-tree fallback) or step-3 (initramfs unpack) lands the
-    /// AMSS image into the registry.
+    /// the requested blob — typical before in-tree fallback or
+    /// initramfs unpack stages the AMSS image. Returns
+    /// `FirmwareLoadFailed` on any device-side failure or timeout.
     ///
     /// # Safety
     /// Caller owns BAR0 + cfg windows exclusively. The blob's
@@ -173,21 +221,49 @@ impl WifiNic {
         })?;
         let view = narf_firmware::view_of(&cap)
             .map_err(|_| WifiError::FirmwareLoadFailed)?;
-        // Stage-6 step-2 will land the BHI register sequence:
-        //   write BHI_INTVEC = view.phys (low / high)
-        //   write BHI_IMGTXDB = (image length << 16) | sequence_id
-        //   poll BHI_STATUS for SUCCESS
-        // The QCNFA765 MHI register layout for those writes lives
-        // behind a per-silicon redirection word (BHIOFF) and the
-        // exact register block isn't fully covered by the public
-        // MHI spec — it lands once the closed datasheet's BHI
-        // section is reverse-engineered or sourced. Today we
-        // accept the cap-resolved blob and stop short of the
-        // device write so the registry round-trip is exercised.
-        // SAFETY: BAR0 mapped, exclusive owner; placeholder for
-        // the actual BHI write sequence.
-        let _ = view.phys;
-        let _ = view.bytes.len();
+
+        let bhi = self.bhi_off;
+        let phys = view.phys;
+        let len  = view.bytes.len() as u32;
+        // Step 1+2: program image base + size.
+        // SAFETY: BAR0 mapped, exclusive owner; bhi_off in-range.
+        unsafe {
+            self.mmio.write32(bhi + regs::BHI_IMGADDR_LO, phys as u32);
+            self.mmio.write32(bhi + regs::BHI_IMGADDR_HI, (phys >> 32) as u32);
+            self.mmio.write32(bhi + regs::BHI_IMGSIZE,    len);
+        }
+        // Memory barrier so the device sees the staging writes
+        // before the doorbell ring.
+        compiler_fence(Ordering::SeqCst);
+
+        // Step 3: ring the doorbell. Sequence id = 1; sufficient
+        // for the first (and only) AMSS load this driver ever
+        // does. Multi-stage loaders (PBL → SBL → AMSS) reuse the
+        // same doorbell with monotonically-incrementing seq ids.
+        // SAFETY: same.
+        unsafe { self.mmio.write32(bhi + regs::BHI_IMGTXDB, 1); }
+
+        // Step 4: poll BHI_STATUS. Spec says ~200 ms typical;
+        // bound the spin so a wedged controller surfaces as
+        // FirmwareLoadFailed rather than livelock.
+        let mut status = regs::BHI_STATUS_RESET;
+        for _ in 0..10_000_000u32 {
+            // SAFETY: same.
+            status = unsafe { self.mmio.read32(bhi + regs::BHI_STATUS) };
+            if status != regs::BHI_STATUS_RESET { break; }
+            core::hint::spin_loop();
+        }
+        if status != regs::BHI_STATUS_SUCCESS {
+            return Err(WifiError::FirmwareLoadFailed);
+        }
+
+        // Step 5: confirm EXECENV reads AMSS.
+        // SAFETY: same.
+        let env = unsafe { self.mmio.read32(bhi + regs::BHI_EXECENV) };
+        if env != regs::EXECENV_AMSS {
+            return Err(WifiError::FirmwareLoadFailed);
+        }
+
         self.fw_loaded = true;
         Ok(())
     }
