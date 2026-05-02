@@ -6,11 +6,26 @@
 //!
 //! No virtqueue traffic yet — that lands in a follow-up stage.
 
+use core::sync::atomic::{compiler_fence, Ordering};
+
 use narf_bus::{BusDevice, BusDeviceCap};
 use narf_capabilities::{Cap, Write};
+use narf_io::{alloc_coherent, DmaBuffer};
+use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::pci::{discover, map_cap, VirtioCaps, VirtioPciError, VirtioRegion};
+use crate::pci::{
+    discover, map_cap, VirtioCaps, VirtioPciError, VirtioRegion,
+    CC_DEVICE_FEATURE, CC_DEVICE_FEATURE_SELECT, CC_DEVICE_STATUS,
+    CC_DRIVER_FEATURE, CC_DRIVER_FEATURE_SELECT, CC_NUM_QUEUES,
+    CC_QUEUE_DESC, CC_QUEUE_DEVICE, CC_QUEUE_DRIVER, CC_QUEUE_ENABLE,
+    CC_QUEUE_NOTIFY_OFF, CC_QUEUE_SELECT, CC_QUEUE_SIZE,
+};
+use crate::queue::{Virtqueue, VirtqueueLayout, VirtqDesc, VIRTQ_DESC_F_WRITE};
+use crate::{
+    VIRTIO_F_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER,
+    VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FEATURES_OK,
+};
 
 /// PCI vendor / device id for virtio-iommu (VirtIO 1.2 §5.16, §4.1.2).
 pub const VIRTIO_IOMMU_PCI_VENDOR: u16 = 0x1AF4;
@@ -321,13 +336,31 @@ impl ReqUnmap {
 
 // ── Driver-match registration ───────────────────────────────────────
 
-/// Probed virtio-iommu controller. Holds the discovered cap snapshot
-/// + decoded device config. Stage-3 bring-up will fold in queue
-/// setup; for now this is structural.
+/// `virtio_iommu_req_tail` (§5.16.6): 4-byte device-written tail
+/// appended after every request. Status 0 = OK, 1 = IO error,
+/// 2 = unsupported, 3 = invalid, 4 = range, 5 = entry-conflict.
+pub const REQ_TAIL_LEN: usize = 4;
+pub const STATUS_OK: u8 = 0;
+
+/// Probed virtio-iommu controller. Holds the live transport
+/// regions, the request queue, plus a 4 KiB request scratch
+/// pool — the driver issues one request at a time.
 pub struct VirtioIommuPci {
-    pub caps:   VirtioCaps,
-    pub _device_region: VirtioRegion,
     pub config: IommuDeviceConfig,
+    common:                VirtioRegion,
+    notify:                VirtioRegion,
+    notify_off_multiplier: u32,
+    requestq:              IrqSafeSpinLock<Option<Virtqueue>>,
+    eventq:                IrqSafeSpinLock<Option<Virtqueue>>,
+    _q_buf:                DmaBuffer,
+    _eq_buf:               DmaBuffer,
+    /// 4 KiB pool for the next request: the encoded request lives
+    /// at offset 0; the device writes the 4-byte tail at offset
+    /// 0x800. Single-inflight driver — the lock around `requestq`
+    /// already serialises callers.
+    pool:                  DmaBuffer,
+    request_notify_off:    u16,
+    pub ready:             bool,
 }
 
 impl core::fmt::Debug for VirtioIommuPci {
@@ -339,25 +372,243 @@ impl core::fmt::Debug for VirtioIommuPci {
 }
 
 impl VirtioIommuPci {
-    /// Probe + decode the device-specific config. Stops short of
-    /// virtqueue setup.
+    /// Full bring-up: walk caps, reset, negotiate VERSION_1,
+    /// program both virtqueues, set DRIVER_OK.
     ///
     /// # Safety
-    /// Caller owns the device's BAR + cfg-space exclusively for the
-    /// duration of probe.
+    /// Caller owns the device's BAR + cfg-space exclusively for
+    /// the duration of bring_up.
     pub unsafe fn bring_up(
         device: &BusDevice,
         _cap:   &Cap<BusDeviceCap, Write>,
     ) -> Result<Self, VirtioPciError> {
         // SAFETY: bounded cap-list walk.
         let caps: VirtioCaps = unsafe { discover(device) }?;
-        let device_cap = caps.device_cfg.ok_or(VirtioPciError::NoCommonCfg)?;
-        // SAFETY: caller-owned BAR window.
-        let region = unsafe { map_cap(device, &device_cap) }?;
+        let device_cap = caps.device_cfg.clone().ok_or(VirtioPciError::NoCommonCfg)?;
+        // SAFETY: caller-owned BAR.
+        let common = unsafe { map_cap(device, &caps.common) }?;
         // SAFETY: same.
-        let config = unsafe { read_device_config(&region) }?;
-        Ok(Self { caps, _device_region: region, config })
+        let notify = unsafe { map_cap(device, &caps.notify) }?;
+        // SAFETY: same.
+        let device_region = unsafe { map_cap(device, &device_cap) }?;
+        let notify_off_multiplier = caps.notify.notify_off_multiplier;
+
+        // Reset → ACK → DRIVER.
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            common.write8(CC_DEVICE_STATUS, 0);
+            common.write8(CC_DEVICE_STATUS, VIRTIO_STATUS_ACKNOWLEDGE as u8);
+            common.write8(CC_DEVICE_STATUS,
+                (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER) as u8);
+        }
+
+        // Feature negotiation: VERSION_1 only.
+        // SAFETY: identity-mapped MMIO.
+        let feats_lo = unsafe {
+            common.write32(CC_DEVICE_FEATURE_SELECT, 0);
+            common.read32(CC_DEVICE_FEATURE)
+        };
+        let feats_hi = unsafe {
+            common.write32(CC_DEVICE_FEATURE_SELECT, 1);
+            common.read32(CC_DEVICE_FEATURE)
+        };
+        let feats = (feats_hi as u64) << 32 | feats_lo as u64;
+        if feats & (1u64 << VIRTIO_F_VERSION_1) == 0 {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        // SAFETY: same.
+        unsafe {
+            common.write32(CC_DRIVER_FEATURE_SELECT, 0);
+            common.write32(CC_DRIVER_FEATURE, 0);
+            common.write32(CC_DRIVER_FEATURE_SELECT, 1);
+            common.write32(CC_DRIVER_FEATURE, 1u32 << (VIRTIO_F_VERSION_1 - 32));
+            common.write8(CC_DEVICE_STATUS,
+                (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER
+                 | VIRTIO_STATUS_FEATURES_OK) as u8);
+        }
+        // SAFETY: same.
+        let post = unsafe { common.read8(CC_DEVICE_STATUS) };
+        if post & VIRTIO_STATUS_FEATURES_OK as u8 == 0 {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+
+        // SAFETY: same.
+        let n_q = unsafe { common.read16(CC_NUM_QUEUES) };
+        if n_q < 2 { return Err(VirtioPciError::NoQueues); }
+
+        // SAFETY: same.
+        let config = unsafe { read_device_config(&device_region) }?;
+
+        // Queue 0 = requestq, queue 1 = eventq.
+        let (q_buf, requestq, request_notify_off) =
+            // SAFETY: identity-mapped MMIO.
+            unsafe { setup_queue(&common, 0) }?;
+        let (eq_buf, eventq, _) =
+            // SAFETY: same.
+            unsafe { setup_queue(&common, 1) }?;
+
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            common.write8(CC_DEVICE_STATUS,
+                (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER
+                 | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK) as u8);
+        }
+
+        // Pool: 4 KiB scratch — request at +0, tail-write slot
+        // at +0x800.
+        let pool = alloc_coherent(4096, DomainId::DRIVER_0)
+            .map_err(|_| VirtioPciError::BarMapFailed)?;
+        let pool_phys = pool.phys_addr().raw();
+        // SAFETY: page-sized DMA.
+        unsafe { core::ptr::write_bytes(pool_phys as *mut u8, 0, 4096); }
+
+        Ok(Self {
+            config,
+            common, notify, notify_off_multiplier,
+            requestq: IrqSafeSpinLock::new(Some(requestq)),
+            eventq:   IrqSafeSpinLock::new(Some(eventq)),
+            _q_buf: q_buf, _eq_buf: eq_buf,
+            pool,
+            request_notify_off,
+            ready: true,
+        })
     }
+
+    /// Issue a single request (encoded bytes), wait for completion,
+    /// return the tail status. The request is staged at pool[0..N];
+    /// the device writes its 4-byte tail at pool[0x800..0x804].
+    fn submit_request(&self, req: &[u8]) -> Result<u8, VirtioPciError> {
+        if req.is_empty() || req.len() > 0x800 {
+            return Err(VirtioPciError::QueueTooSmall);
+        }
+        let pool_phys = self.pool.phys_addr().raw();
+        let req_phys  = pool_phys;
+        let tail_phys = pool_phys + 0x800;
+        // SAFETY: identity-mapped DMA buffer.
+        unsafe {
+            for (i, &b) in req.iter().enumerate() {
+                core::ptr::write_volatile((req_phys + i as u64) as *mut u8, b);
+            }
+            // Mark the tail slot so a stale 0 can't masquerade as OK.
+            core::ptr::write_volatile(tail_phys as *mut u8, 0xFF);
+            for i in 1..REQ_TAIL_LEN {
+                core::ptr::write_volatile((tail_phys + i as u64) as *mut u8, 0);
+            }
+        }
+        let descs = [
+            VirtqDesc { addr: req_phys,  len: req.len() as u32, flags: 0,                  next: 0 },
+            VirtqDesc { addr: tail_phys, len: REQ_TAIL_LEN as u32,
+                        flags: VIRTQ_DESC_F_WRITE, next: 0 },
+        ];
+        let head = {
+            let mut g = self.requestq.lock();
+            let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
+            q.add_buffer(&descs).ok_or(VirtioPciError::QueueTooSmall)?
+        };
+        let off = (self.request_notify_off as u64) * (self.notify_off_multiplier as u64);
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: identity-mapped notify region.
+        unsafe { self.notify.write16(off, 0); }
+
+        let mut spins = 0u32;
+        loop {
+            let elem = {
+                let mut g = self.requestq.lock();
+                let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
+                q.poll_used()
+            };
+            if let Some((id, _)) = elem { if id == head as u32 { break; } }
+            spins += 1;
+            if spins > 10_000_000 { return Err(VirtioPciError::QueueTooSmall); }
+            core::hint::spin_loop();
+        }
+        // SAFETY: identity-mapped DMA.
+        let status = unsafe { core::ptr::read_volatile(tail_phys as *const u8) };
+        let mut g = self.requestq.lock();
+        if let Some(q) = g.as_mut() { q.free_chain(head); }
+        Ok(status)
+    }
+
+    pub fn attach(&self, domain: u32, endpoint: u32) -> Result<u8, VirtioPciError> {
+        let r = ReqAttach { domain, endpoint }.encode(0);
+        self.submit_request(&r)
+    }
+    pub fn detach(&self, domain: u32, endpoint: u32) -> Result<u8, VirtioPciError> {
+        let r = ReqDetach { domain, endpoint }.encode(0);
+        self.submit_request(&r)
+    }
+    pub fn map(&self, domain: u32, virt_start: u64, virt_end: u64,
+               phys_start: u64, map_flags: u32)
+        -> Result<u8, VirtioPciError>
+    {
+        let r = ReqMap { domain, virt_start, virt_end, phys_start, map_flags }.encode(0);
+        self.submit_request(&r)
+    }
+    pub fn unmap(&self, domain: u32, virt_start: u64, virt_end: u64)
+        -> Result<u8, VirtioPciError>
+    {
+        let r = ReqUnmap { domain, virt_start, virt_end }.encode(0);
+        self.submit_request(&r)
+    }
+
+    /// Draw down any async events the device has posted on the
+    /// eventq. Returns the count drained. Stage-N: Fault events
+    /// (§5.16.7.1). For now we just free the descriptors so the
+    /// queue doesn't stall.
+    pub fn drain_events(&self) -> usize {
+        let mut n = 0;
+        loop {
+            let elem = {
+                let mut g = self.eventq.lock();
+                match g.as_mut() {
+                    Some(q) => q.poll_used(),
+                    None    => return n,
+                }
+            };
+            if let Some((id, _)) = elem {
+                let mut g = self.eventq.lock();
+                if let Some(q) = g.as_mut() { q.free_chain(id as u16); }
+                n += 1;
+            } else {
+                break;
+            }
+        }
+        n
+    }
+}
+
+/// Helper: select queue `idx`, allocate 4 KiB backing page,
+/// program addresses, enable. Same shape as console_pci's helper.
+unsafe fn setup_queue(
+    common: &VirtioRegion,
+    idx:    u16,
+) -> Result<(DmaBuffer, Virtqueue, u16), VirtioPciError> {
+    // SAFETY: identity-mapped MMIO.
+    let qsize_max = unsafe {
+        common.write16(CC_QUEUE_SELECT, idx);
+        common.read16(CC_QUEUE_SIZE)
+    };
+    if qsize_max == 0 { return Err(VirtioPciError::QueueTooSmall); }
+    let qsize = qsize_max.min(64).next_power_of_two() / 2;
+    let qsize = if qsize == 0 { 4 } else { qsize.min(qsize_max) };
+    let buf = alloc_coherent(4096, DomainId::DRIVER_0)
+        .map_err(|_| VirtioPciError::BarMapFailed)?;
+    let layout = VirtqueueLayout::new(qsize, buf.phys_addr().raw())
+        .ok_or(VirtioPciError::QueueTooSmall)?;
+    // SAFETY: identity-mapped MMIO.
+    unsafe {
+        common.write16(CC_QUEUE_SIZE, qsize);
+        common.write64_split(CC_QUEUE_DESC,   layout.desc_table);
+        common.write64_split(CC_QUEUE_DRIVER, layout.avail_ring);
+        common.write64_split(CC_QUEUE_DEVICE, layout.used_ring);
+    }
+    // SAFETY: same.
+    let notify_off = unsafe { common.read16(CC_QUEUE_NOTIFY_OFF) };
+    // SAFETY: same.
+    unsafe { common.write16(CC_QUEUE_ENABLE, 1); }
+    // SAFETY: Virtqueue::new wipes the layout regions.
+    let q = unsafe { Virtqueue::new(layout) };
+    Ok((buf, q, notify_off))
 }
 
 static CONTROLLER: IrqSafeSpinLock<Option<VirtioIommuPci>> =

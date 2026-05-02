@@ -222,3 +222,27 @@ fn smoke_virtio_iommu_pci_req_header_roundtrip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/virtio/iommu_pci", smoke_virtio_iommu_pci_req_header_roundtrip);
+
+fn smoke_virtio_iommu_pci_live_attach_map_unmap_detach() -> TestResult {
+    use crate::iommu_pci;
+    if !iommu_pci::is_probed() {
+        return TestResult::Skip("no virtio-iommu-pci device on this run");
+    }
+    let r: Option<Result<(), ()>> = iommu_pci::with_controller(|c| {
+        let s_attach = c.attach(1, 0).map_err(|_| ())?;
+        if s_attach != iommu_pci::STATUS_OK { return Err(()); }
+        let s_map = c.map(1, 0x1_0000, 0x1_0FFF, 0x1000_0000, 0).map_err(|_| ())?;
+        if s_map != iommu_pci::STATUS_OK { return Err(()); }
+        let s_unmap = c.unmap(1, 0x1_0000, 0x1_0FFF).map_err(|_| ())?;
+        if s_unmap != iommu_pci::STATUS_OK { return Err(()); }
+        let s_det = c.detach(1, 0).map_err(|_| ())?;
+        if s_det != iommu_pci::STATUS_OK { return Err(()); }
+        Ok(())
+    });
+    match r {
+        Some(Ok(()))  => TestResult::Pass,
+        Some(Err(_))  => TestResult::Fail("non-OK status from device"),
+        None          => TestResult::Skip("controller missing"),
+    }
+}
+kernel_test_in!("drivers/virtio/iommu_pci", smoke_virtio_iommu_pci_live_attach_map_unmap_detach);
