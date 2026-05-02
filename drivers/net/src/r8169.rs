@@ -418,7 +418,7 @@ impl RtlNic {
             .map_err(|_| NicError::MsixSetup)?;
         let _ = table.alloc_vector().ok_or(NicError::MsixSetup)?;
         // SAFETY: x2APIC is online by Stage-4 boot.
-        let target_apic = unsafe { narf_interrupts::x86_64::apic::apic_id() };
+        let target_apic = unsafe { narf_interrupts::current_cpu_target_id() };
         // SAFETY: caller-authority over the device.
         unsafe { table.program_vector(0, target_apic, v) }
             .map_err(|_| NicError::MsixSetup)?;

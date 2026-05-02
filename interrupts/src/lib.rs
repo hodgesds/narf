@@ -58,3 +58,26 @@ pub unsafe fn eoi() {
 /// Stub: aarch64 GIC EOI lands with the GICv3 skeleton.
 #[cfg(not(target_arch = "x86_64"))]
 pub unsafe fn eoi() {}
+
+/// Per-arch CPU "target id" used in MSI / MSI-X routing fields.
+///
+/// On x86_64 this is the local x2APIC ID (read from MSR 0x802),
+/// which is what an MSI-X table entry's upper-address field
+/// expects. On aarch64 it is the GICv3 collection / affinity
+/// triple in a form suitable for `GITS_TYPER` routing — until
+/// the ITS skeleton is wired we return 0 so PCIe MSI-X paths
+/// at least compile and pass structural smokes.
+///
+/// # Safety
+/// On x86_64 the x2APIC must be online (init runs at boot, so
+/// this is satisfied for any post-`init` driver).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub unsafe fn current_cpu_target_id() -> u32 {
+    // SAFETY: x2APIC online, MSR 0x802 is read-only.
+    unsafe { current::apic::apic_id() }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+pub unsafe fn current_cpu_target_id() -> u32 { 0 }

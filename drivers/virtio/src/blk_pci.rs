@@ -247,7 +247,7 @@ impl VirtioBlkPci {
         // Hardcoded `target_apic_id=0` here was wrong: with -smp >1
         // sockets, the BSP's APIC ID may not be 0, and the MSI-X
         // would route to a CPU that isn't running the driver.
-        let target_apic = unsafe { narf_interrupts::x86_64::apic::apic_id() };
+        let target_apic = unsafe { narf_interrupts::current_cpu_target_id() };
         // SAFETY: caller-authority, exclusive ownership.
         let _ = unsafe { table.program_vector(0, target_apic, v) }
             .map_err(|_| VirtioPciError::BarMapFailed)?;
