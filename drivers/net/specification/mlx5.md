@@ -1,6 +1,6 @@
 # mlx5 — Specification
 
-> Status: **v0.14** (Stage 14: flow steering — TIR / TIS / RQT).
+> Status: **v0.15** (Stage 15: async events — EQE polling + EQ doorbell).
 >
 > Clean-room driver for Mellanox / NVIDIA ConnectX-4 / 5 / 6 / 7
 > family Ethernet + InfiniBand HCAs. Reference material: the
@@ -136,6 +136,20 @@ have a server target with a ConnectX HCA in CI.
 
 - **v0.1** (Stage 1): PCI match + init-segment decoder +
   initializing-bit poll + smokes co-located in driver dir.
+- **v0.15** (Stage 15): async events. `mlx5/eqe.rs` lays out
+  the 64-byte EQE — event_type at byte 0x01, event_sub_type
+  at 0x03, owner bit (bit 0 of byte 0x3F). Typed `EventType`
+  catalog (CompletionEvent / PathMigrated / CommErrorReceived
+  / SendQueueDrained / SrqLastWqeReached / PortStateChange /
+  CommandInterfaceCompletion / PageRequest / SrqLimitReached /
+  NicVportChange / Unknown(raw)) per PRM §16.4.5.
+  `pop_event(eq_bytes, capacity, consumer)` mirrors
+  `pop_completion`. `Mlx5Hca::poll_eq(eq_number)` reads from the
+  EQ DMA backing at the cursor, advances on success.
+  `arm_eq(uar_page, eq_number, consumer)` writes the EQ doorbell
+  at UAR offset 0x40 to ack consumed events. `LiveEq` gains a
+  `consumer` cursor. Three smokes: EQE decode round-trip,
+  EventType catalog, pop_event ring walk.
 - **v0.14** (Stage 14): flow-steering primitives — Transport
   Interface Receive (TIR), Transport Interface Send (TIS),
   Receive Queue Table (RQT). Nine new opcodes spanning the

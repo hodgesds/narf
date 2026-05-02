@@ -1759,3 +1759,87 @@ fn smoke_mlx5_rqt_layout() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/mlx5", smoke_mlx5_rqt_layout);
+
+// ── Stage 15: async events (EQE) ───────────────────────────────────
+
+use super::eqe::{
+    decode_eqe, is_hw_owned as eqe_is_hw_owned, pop_event,
+    simulate_event, EventType, EQE_LEN, EQE_OFF_OWNER, EQE_OWNER_BIT,
+};
+
+fn smoke_mlx5_eqe_decode_round_trip() -> TestResult {
+    let mut eqe = [0u8; EQE_LEN];
+    eqe[EQE_OFF_OWNER] |= EQE_OWNER_BIT; // start HW-owned
+    if !eqe_is_hw_owned(&eqe) {
+        return TestResult::Fail("freshly initialised EQE not HW-owned");
+    }
+    simulate_event(&mut eqe, /* port-state */ 0x09, /* sub */ 4);
+    if eqe_is_hw_owned(&eqe) {
+        return TestResult::Fail("simulate_event left owner bit set");
+    }
+    let view = decode_eqe(&eqe);
+    if view.event_type != EventType::PortStateChange {
+        return TestResult::Fail("event_type decode wrong");
+    }
+    if view.event_sub_type != 4 {
+        return TestResult::Fail("event_sub_type lost");
+    }
+    if view.owner {
+        return TestResult::Fail("owner field not synced with byte 0x3F bit 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_eqe_decode_round_trip);
+
+fn smoke_mlx5_eqe_event_type_catalog() -> TestResult {
+    let pairs: &[(u8, EventType)] = &[
+        (0x00, EventType::CompletionEvent),
+        (0x01, EventType::PathMigrated),
+        (0x02, EventType::CommErrorReceived),
+        (0x03, EventType::SendQueueDrained),
+        (0x05, EventType::SrqLastWqeReached),
+        (0x09, EventType::PortStateChange),
+        (0x0A, EventType::CommandInterfaceCompletion),
+        (0x0B, EventType::PageRequest),
+        (0x0C, EventType::SrqLimitReached),
+        (0x0D, EventType::NicVportChange),
+    ];
+    for &(raw, want) in pairs {
+        if EventType::from_raw(raw) != want {
+            return TestResult::Fail("EventType catalog mismatch");
+        }
+    }
+    if !matches!(EventType::from_raw(0x42), EventType::Unknown(0x42)) {
+        return TestResult::Fail("unmapped EventType lost raw byte");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_eqe_event_type_catalog);
+
+fn smoke_mlx5_eqe_pop_event_walks_ring() -> TestResult {
+    const CAP: usize = 4;
+    let mut bytes = alloc::vec![0u8; CAP * EQE_LEN];
+    // Mark all slots HW-owned.
+    for i in 0..CAP {
+        bytes[i * EQE_LEN + EQE_OFF_OWNER] |= EQE_OWNER_BIT;
+    }
+    // Drop a completed event into slot 0.
+    let mut tmp = [0u8; EQE_LEN];
+    tmp[EQE_OFF_OWNER] |= EQE_OWNER_BIT;
+    simulate_event(&mut tmp, 0x09, 1);
+    bytes[0..EQE_LEN].copy_from_slice(&tmp);
+
+    let (view, next) = match pop_event(&bytes, CAP as u32, 0) {
+        Some(v) => v,
+        None => return TestResult::Fail("slot 0 EQE not found"),
+    };
+    if view.event_type != EventType::PortStateChange {
+        return TestResult::Fail("popped EQE event_type wrong");
+    }
+    if next != 1 { return TestResult::Fail("EQ consumer didn't advance"); }
+    if pop_event(&bytes, CAP as u32, 1).is_some() {
+        return TestResult::Fail("HW-owned EQE returned");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_eqe_pop_event_walks_ring);

@@ -44,6 +44,7 @@ pub mod caps;
 pub mod cmd;
 pub mod cq;
 pub mod eq;
+pub mod eqe;
 pub mod cqe;
 pub mod mailbox;
 pub mod mkey;
@@ -232,13 +233,15 @@ pub enum Mlx5Error {
     RqtBuild(steering::RqtError),
 }
 
-/// Stage 7: live-EQ bookkeeping. Holds the FW-assigned `eq_number`
-/// + the DMA pages backing the EQ buffer so they're not dropped
-/// while the EQ is live.
+/// Stage 7 + 15: live-EQ bookkeeping. Holds the FW-assigned
+/// `eq_number`, DMA pages backing the EQ buffer, and the polling
+/// cursor used by Stage-15 `poll_eq`.
 pub struct LiveEq {
     pub eq_number: u32,
-    _pages:        Vec<DmaBuffer>,
+    pages:         Vec<DmaBuffer>,
     pub params:    eq::EqParams,
+    /// Next-to-read EQE index (Stage 15).
+    pub consumer:  u32,
 }
 
 /// Stage 8 + 11: live-CQ bookkeeping. Same shape as `LiveEq` but
@@ -784,10 +787,47 @@ impl Mlx5Hca {
         let eq_number = resp.output_modifier & 0x00FF_FFFF;
         self.eqs.lock().push(LiveEq {
             eq_number,
-            _pages: pages,
+            pages,
             params,
+            consumer: 0,
         });
         Ok(eq_number)
+    }
+
+    /// Stage 15: pop one async event off `eq_number`. Returns
+    /// `Ok(None)` if HW still owns the next slot.
+    pub fn poll_eq(&self, eq_number: u32)
+        -> Result<Option<eqe::EqeView>, Mlx5Error>
+    {
+        let mut eqs = self.eqs.lock();
+        let e = eqs.iter_mut()
+            .find(|e| e.eq_number == eq_number)
+            .ok_or(Mlx5Error::UnknownQp)?;
+        let cap = 1u32 << e.params.log_eq_size;
+        let phys = e.pages[0].phys_addr().raw();
+        let off = ((e.consumer % cap) as usize) * eqe::EQE_LEN;
+        let mut bytes = [0u8; eqe::EQE_LEN];
+        // SAFETY: identity-mapped DMA.
+        unsafe {
+            for i in 0..eqe::EQE_LEN {
+                bytes[i] = core::ptr::read_volatile(
+                    (phys + off as u64 + i as u64) as *const u8);
+            }
+        }
+        if eqe::is_hw_owned(&bytes) { return Ok(None); }
+        let view = eqe::decode_eqe(&bytes);
+        e.consumer = e.consumer.wrapping_add(1);
+        Ok(Some(view))
+    }
+
+    /// Stage 15: arm an EQ — write the EQ doorbell at UAR offset
+    /// 0x40 to acknowledge consumed events and (re-)enable
+    /// interrupts. PRM-documented value packs eq_number in the
+    /// high byte and the consumer index low 24 bits.
+    pub fn arm_eq(&self, uar_page: u32, eq_number: u32, consumer: u32) {
+        let val = ((eq_number & 0xFF) << 24)
+                | (consumer & 0x00FF_FFFF);
+        self.uar_write32(uar_page, 0x40, val);
     }
 
     /// Stage 7: write a 4-byte BE doorbell into a UAR page. `uar_page`
