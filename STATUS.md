@@ -32,6 +32,7 @@ asks for. Updated when observable kernel behaviour changes.
 | virtio-rng-pci   | Modern transport. Structural probe.               |
 | virtio-balloon-pci | Modern transport. Structural probe.             |
 | e1000 / e1000e   | Real Intel NIC (8254x + 8257x family). TX + RX.   |
+| ixgbe            | Intel 82599 / X540 / X550 10 GbE. PCI match + reset + EEPROM MAC + advanced TX ring + RX ring + MSI-X + `HwNic`. Live bring-up smoke skips on QEMU (no emulated 82599). |
 | AHCI (ICH9/10)   | HBA bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT. |
 | xHCI USB host    | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT. |
 | USB HID keyboard | Hot-plug enumeration → Set Protocol(Boot) → interrupt-IN polling → HID Usage 0x07 → `narf_input::KeyCode` press/release diffing, 8-modifier tracking, roll-over filter, feeding the global `InputEvent` ring. |
@@ -736,7 +737,7 @@ capability-gated paths") is unreachable from this tree alone.
 | `observability::peek` | `Provider` trait + cap-gated `sample_all(cap, out)` registry for live-peek metrics. |
 | `userspace`           | `ProcessId`, `ExecImage` with `Segment` + `SegmentFlags` matching ELF `PF_*`, `AuxEntry` with `AT_*` tags, `SyscallTable` pinning the canonical numbers (Submit=100, …, Munmap=121). |
 | `drivers/nvme`        | BAR0 register offsets, `NvmeCaps::from_raw` bitfield decoder, `AdminOpcode` + `IoOpcode` tables, `Controller::probe(cap)` stub, `NvmeBlockDevice` impl of `BlockDevice`. |
-| `drivers/net`         | `NicModel` enum (e1000/igb/ixgbe/mlx5/rtl8139) with `primary_pci_id()` lookup, `NicCaps` feature bitmap, `NicDescriptor`, `HwNic` trait. |
+| `drivers/net`         | `NicModel` enum (e1000/igb/ixgbe/mlx5/rtl8139) with `primary_pci_id()` lookup, `NicCaps` feature bitmap, `NicDescriptor`, `HwNic` trait. Live drivers: e1000/e1000e, r8169, qcnfa765, mlx5, ixgbe. |
 | `drivers/gpu`         | `GpuFamily` backend list, `Mode { width, height, refresh_hz, bpp }` with `FHD_60` / `XGA_60` presets, `SubmitKind` + `CommandBuffer` + `GpuFence`. |
 | `crypto::tpm`         | TCG-spec `TpmCc` command codes (PcrExtend/Read/GetRandom/Startup/SelfTest/…), `TpmAlgHash` enum, `Tpm2Command` wrapper, `submit()` stub. |
 | `crypto::pq`          | `MlKem768` / `MlDsa65` / `SphincsPlus` CapType markers, `HybridMode`, runtime `fips_mode()` + `fips_allowed(alg)` gate. |
