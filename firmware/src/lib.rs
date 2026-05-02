@@ -322,21 +322,62 @@ pub fn register_in_tree_bundle(blobs: &[(&'static str, &'static [u8])]) {
     }
 }
 
-/// Stage::Subsys initcalls for this crate. The firmware crate's
-/// own initcall is a no-op — it exists only so other crates can
-/// rely on a deterministic ordering: anything that registers an
-/// in-tree blob runs at `Stage::Subsys` AFTER `firmware-init`. A
-/// future build profile that ships kernel-baked vendor firmware
-/// images registers them through this hook.
+/// Stage::Subsys + Stage::Late initcalls for this crate.
+///
+/// `Stage::Subsys` slot reserved for build profiles that ship
+/// kernel-baked vendor firmware images via `register_in_tree_bundle`.
+///
+/// `Stage::Late` slot scans whatever initramfs the boot path
+/// staged via `install_initramfs(&'static Initramfs)` and
+/// populates the registry's `Initramfs` priority tier. When no
+/// initramfs is staged the slot returns `NotPresent` so the init
+/// harness records the absence without flagging it as failure.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
-    narf_init::register(Stage::Subsys, "firmware-init", || {
-        // Reserved for staged in-tree blob registration. Today
-        // empty; future profiles plant vendor blobs here via
-        // `register_in_tree_bundle`.
-        InitResult::Ok
+    narf_init::register(Stage::Subsys, "firmware-init", || InitResult::Ok);
+    narf_init::register(Stage::Late, "firmware-scan-initramfs", || {
+        let fs = match staged_initramfs() {
+            Some(f) => f,
+            None    => return InitResult::NotPresent,
+        };
+        let auth = match trusted_loader_authority() {
+            Some(a) => a,
+            None    => return InitResult::Error("no trusted-loader authority"),
+        };
+        match scan_initramfs(fs, &auth) {
+            Ok(_)  => InitResult::Ok,
+            Err(_) => InitResult::Error("scan_initramfs failed"),
+        }
     });
 }
+
+/// Stage an initramfs for the Stage::Late firmware scanner. Called
+/// once at boot by the trusted bootstrap after the bootloader-
+/// supplied CPIO image has been parsed; the scanner picks it up
+/// during `Stage::Late`. Idempotent — first install wins.
+pub fn install_initramfs(fs: &'static narf_filesystem::Initramfs) {
+    let mut g = STAGED_INITRAMFS.lock();
+    if g.is_none() {
+        *g = Some(fs);
+    }
+}
+
+/// `true` once a kernel-supplied initramfs has been staged.
+pub fn initramfs_staged() -> bool {
+    STAGED_INITRAMFS.lock().is_some()
+}
+
+fn staged_initramfs() -> Option<&'static narf_filesystem::Initramfs> {
+    *STAGED_INITRAMFS.lock()
+}
+
+#[doc(hidden)]
+pub fn __reset_staged_initramfs() {
+    *STAGED_INITRAMFS.lock() = None;
+}
+
+static STAGED_INITRAMFS: IrqSafeSpinLock<Option<&'static narf_filesystem::Initramfs>>
+    = IrqSafeSpinLock::new(None);
 
 /// Walk every `firmware/*` entry in an initramfs and register it
 /// with the registry under `BlobSource::Initramfs`. Per spec §5,

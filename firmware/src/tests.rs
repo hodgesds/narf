@@ -338,6 +338,42 @@ fn smoke_firmware_loader_task_allowlist_round_trip() -> TestResult {
 }
 kernel_test_in!("firmware", smoke_firmware_loader_task_allowlist_round_trip);
 
+fn smoke_firmware_initramfs_staging_round_trip() -> TestResult {
+    use crate::{
+        install_initramfs, initramfs_staged, __reset_staged_initramfs,
+    };
+    if !cfg!(feature = "firmware-allow-unsigned") {
+        return TestResult::Skip("firmware-allow-unsigned off");
+    }
+    __reset_staged_initramfs();
+    if initramfs_staged() {
+        return TestResult::Fail("reset didn't clear staged initramfs");
+    }
+    // Build + leak a synthetic CPIO with a single firmware blob.
+    let payload = build_unsigned_blob(b"staged from initramfs", None);
+    let archive = make_cpio_newc(&[
+        ("firmware/staged/blob.bin", &payload),
+    ]);
+    let archive_static: &'static [u8] = alloc::boxed::Box::leak(
+        archive.into_boxed_slice());
+    let fs = match narf_filesystem::Initramfs::from_cpio(
+        "fw-staging-smoke", archive_static)
+    {
+        Ok(f)  => f,
+        Err(_) => return TestResult::Fail("CPIO parse"),
+    };
+    let fs_static: &'static narf_filesystem::Initramfs =
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));
+    install_initramfs(fs_static);
+    if !initramfs_staged() {
+        return TestResult::Fail("install_initramfs didn't take effect");
+    }
+    // Idempotent re-install.
+    install_initramfs(fs_static);
+    TestResult::Pass
+}
+kernel_test_in!("firmware", smoke_firmware_initramfs_staging_round_trip);
+
 /// Build a minimal CPIO newc archive — header + path + data — for
 /// each `(name, data)` plus the `TRAILER!!!` sentinel. Used by
 /// `smoke_firmware_initramfs_scan_*` to exercise the walker

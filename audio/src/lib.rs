@@ -32,6 +32,7 @@
 extern crate alloc;
 
 pub mod hda;
+pub mod acp6;
 
 mod hda_tests;
 
@@ -341,6 +342,14 @@ pub fn register_initcalls() {
     // binds AMD Phoenix / Radeon HD Audio Controllers.
     narf_init::register(Stage::Subsys, "hda-pci", || {
         hda::register_pci_driver();
+        InitResult::Ok
+    });
+    // AMD Phoenix ACP6.0 PCI registration. Probe maps BAR0 +
+    // brings the DSP out of soft reset; full PCM capture path is
+    // gated on the ACP RI runtime image being present in the
+    // firmware registry (see narf-firmware + audio::acp6).
+    narf_init::register(Stage::Subsys, "acp6-pci", || {
+        acp6::register_pci_driver();
         InitResult::Ok
     });
     narf_init::register(Stage::Late, "audio-playback-picker", || {

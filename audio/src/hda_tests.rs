@@ -90,3 +90,25 @@ fn smoke_hda_period_load_silence() -> TestResult {
     }
 }
 kernel_test_in!("audio/hda", smoke_hda_period_load_silence);
+
+fn smoke_acp6_pci_match_registered() -> TestResult {
+    // Structural: register the ACP6 driver and assert the
+    // AMD Phoenix ACP6.0 (1022:15E2) match is in the bus's table.
+    use crate::acp6;
+    use narf_bus::{registered_pci_drivers, MatchKind};
+    use narf_bus::driver_match::__reset_for_test as bus_reset;
+    bus_reset();
+    acp6::register_pci_driver();
+    let regs = registered_pci_drivers();
+    let matched = regs.iter().any(|m|
+        m.name == "acp6"
+        && matches!(m.kind, MatchKind::VendorDevice {
+            vendor: acp6::ACP_VENDOR,
+            device: acp6::ACP_PHOENIX,
+        }));
+    if !matched {
+        return TestResult::Fail("acp6 PCI match table entry missing");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/acp6", smoke_acp6_pci_match_registered);
