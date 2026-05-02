@@ -7,14 +7,23 @@
 //!   * stage 1 — PCI match-table entry + decode of the device-specific
 //!     config struct (§5.11.4): `tag[36]: u8` + `num_request_queues: u32`
 //!     little-endian. No virtqueue traffic.
+//!   * stage 2 — FUSE-on-virtio wire-format builders for the 40-byte
+//!     `fuse_in_header` (FUSE wire-protocol docs) plus a few opcodes
+//!     (FUSE_INIT=26, FUSE_LOOKUP=1, FUSE_GETATTR=3, FUSE_READ=15,
+//!     FUSE_RELEASE=18). No VFS wire-up.
 
 pub mod config;
+pub mod fuse;
 
 mod tests;
 
 pub use config::{
     decode_device_config, FsConfig, FS_TAG_LEN,
     VIRTIO_FS_PCI_DEVICE, VIRTIO_FS_PCI_VENDOR,
+};
+pub use fuse::{
+    FuseInHeader, FuseOpcode, FUSE_IN_HEADER_LEN,
+    FUSE_GETATTR, FUSE_INIT, FUSE_LOOKUP, FUSE_READ, FUSE_RELEASE,
 };
 
 /// Stage 1: register the PCI match-table entry. No probe body yet —

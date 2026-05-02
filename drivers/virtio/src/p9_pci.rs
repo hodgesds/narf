@@ -83,4 +83,8 @@ pub fn register_pci_driver() {
     });
 }
 
+// ── 9P2000.L wire protocol (stage 2) ───────────────────────────────
+
+pub mod p9;
+
 mod tests;
