@@ -1,6 +1,6 @@
 # mlx5 — Specification
 
-> Status: **v0.11** (Stage 11: post_send / post_recv / poll_cq).
+> Status: **v0.12** (Stage 12: vport context + HwNic trait impl).
 >
 > Clean-room driver for Mellanox / NVIDIA ConnectX-4 / 5 / 6 / 7
 > family Ethernet + InfiniBand HCAs. Reference material: the
@@ -136,6 +136,16 @@ have a server target with a ConnectX HCA in CI.
 
 - **v0.1** (Stage 1): PCI match + init-segment decoder +
   initializing-bit poll + smokes co-located in driver dir.
+- **v0.12** (Stage 12): per-vport NIC context (MAC + MTU). Two
+  new opcodes `QueryNicVportContext` (0x754) +
+  `ModifyNicVportContext` (0x755). `mlx5/vport.rs` decodes the
+  256-byte vport context — MTU as BE u32 at byte 0x24,
+  permanent_mac (6 B at 0xF4) + current_mac (6 B at 0xFA).
+  `Mlx5Hca::query_nic_vport_context()` + `set_mtu(mtu)` live
+  wrappers. `refresh_nic_state()` caches MAC + MTU on the
+  driver. `impl HwNic for Mlx5Hca` plugs the driver into the
+  shared `narf-drivers-net` registry alongside e1000 / r8169 /
+  qcnfa765. New error: `VportDecode`. Four smokes.
 - **v0.11** (Stage 11): high-level `post_send` / `post_recv` /
   `poll_cq`. `mlx5/ring.rs` factors the SQ/RQ/CQ ring layout
   into pure-data helpers: `WQE_STRIDE` = 64 (16-byte ctrl + up

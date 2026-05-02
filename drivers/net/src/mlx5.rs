@@ -48,6 +48,7 @@ pub mod cqe;
 pub mod mailbox;
 pub mod qp;
 pub mod ring;
+pub mod vport;
 pub mod wqe;
 
 // ── PCI device IDs (ConnectX-4 .. ConnectX-6 Dx) ───────────────────
@@ -221,6 +222,8 @@ pub enum Mlx5Error {
     UnknownQp,
     /// Stage 11: poll_cq referenced a cq_number not in the registry.
     UnknownCq,
+    /// Stage 12: vport-context decoder rejected the response.
+    VportDecode,
 }
 
 /// Stage 7: live-EQ bookkeeping. Holds the FW-assigned `eq_number`
@@ -316,6 +319,15 @@ pub struct Mlx5Hca {
     /// override is kept on the struct so a future stage can refine
     /// after a proper QUERY_HCA_CAP read.
     uar_base: u64,
+    /// Stage 12: cached MAC + MTU from the last `QUERY_NIC_VPORT_CONTEXT`.
+    nic_state: IrqSafeSpinLock<NicCachedState>,
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct NicCachedState {
+    pub mac:     [u8; 6],
+    pub mtu:     u32,
+    pub link_up: bool,
 }
 
 /// Default BAR0 offset where UAR pages live on ConnectX-4..6.
@@ -400,8 +412,24 @@ impl Mlx5Hca {
             pds: IrqSafeSpinLock::new(Vec::new()),
             qps: IrqSafeSpinLock::new(Vec::new()),
             uar_base: UAR_BASE_DEFAULT,
+            nic_state: IrqSafeSpinLock::new(NicCachedState::default()),
         })
     }
+
+    /// Stage 12: refresh the cached MAC + MTU off the live HCA.
+    pub fn refresh_nic_state(&self) -> Result<NicCachedState, Mlx5Error> {
+        let ctx = self.query_nic_vport_context()?;
+        let state = NicCachedState {
+            mac: ctx.permanent_mac(),
+            mtu: ctx.mtu(),
+            link_up: true,
+        };
+        *self.nic_state.lock() = state;
+        Ok(state)
+    }
+
+    /// Stage 12: snapshot of the cached NIC state.
+    pub fn nic_state(&self) -> NicCachedState { *self.nic_state.lock() }
 
     /// Stage 4 self-check: post a single NOP through the live cmdq
     /// transport. Records the result on the driver so callers can
@@ -1011,6 +1039,26 @@ impl Mlx5Hca {
         Ok(Some(view))
     }
 
+    /// Stage 12: read the per-vport NIC context — MAC + MTU.
+    pub fn query_nic_vport_context(&self)
+        -> Result<vport::NicVportContext, Mlx5Error>
+    {
+        let bytes = self.issue_command_with_mailboxes(
+            CmdOp::QueryNicVportContext, 0, &[],
+            vport::VPORT_CTX_LEN)?;
+        vport::NicVportContext::from_bytes(bytes)
+            .map_err(|_| Mlx5Error::VportDecode)
+    }
+
+    /// Stage 12: write the vport's MTU.
+    pub fn set_mtu(&self, mtu: u32) -> Result<(), Mlx5Error> {
+        let payload = vport::build_set_mtu_payload(mtu);
+        // op_mod_high bit 0 = "modify MTU"; rides as input_modifier.
+        let _resp = self.issue_command_with_input_mailbox(
+            CmdOp::ModifyNicVportContext, /* op_mod */ 1, &payload)?;
+        Ok(())
+    }
+
     /// Stage 10: ring the SQ doorbell for `qp_number`. UAR offset
     /// 0x800 is the documented PRM SQ-doorbell offset within a UAR
     /// page; the value carries the wqe_idx of the next-to-post WQE
@@ -1197,4 +1245,16 @@ pub fn is_probed() -> bool { CONTROLLER.lock().is_some() }
 
 pub fn with_controller<R>(f: impl FnOnce(&Mlx5Hca) -> R) -> Option<R> {
     CONTROLLER.lock().as_ref().map(f)
+}
+
+// ── Stage 12: HwNic trait impl ─────────────────────────────────────
+
+impl crate::HwNic for Mlx5Hca {
+    fn name(&self) -> &'static str { "mlx5" }
+    fn mac(&self) -> [u8; 6]       { self.nic_state().mac }
+    fn mtu(&self) -> u32           { let m = self.nic_state().mtu; if m == 0 { 1500 } else { m } }
+    fn link_up(&self) -> bool      { self.nic_state().link_up }
+    fn model(&self) -> crate::NicModel { crate::NicModel::MellanoxMlx5 }
+    fn caps(&self) -> crate::NicCaps   { crate::NicCaps::NONE }
+    fn ring_capacity(&self) -> usize { 1 << 8 }
 }

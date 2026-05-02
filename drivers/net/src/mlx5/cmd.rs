@@ -114,6 +114,12 @@ pub enum CmdOp {
     Rtr2RtsQp   = 0x504,
     /// `2RST_QP` — any state → RST. Opcode `0x50A`.
     ToRstQp     = 0x50A,
+    /// `QUERY_NIC_VPORT_CONTEXT` — read per-vport NIC state (MAC,
+    /// MTU, mtu_cap). Opcode `0x754`.
+    QueryNicVportContext  = 0x754,
+    /// `MODIFY_NIC_VPORT_CONTEXT` — write per-vport NIC state.
+    /// Opcode `0x755`. Field-mask in `op_mod_high`.
+    ModifyNicVportContext = 0x755,
 }
 
 /// Status codes the firmware writes into byte 0x20 of the CQE.

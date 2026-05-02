@@ -1485,3 +1485,65 @@ fn smoke_mlx5_pop_completion_walks_ring() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/mlx5", smoke_mlx5_pop_completion_walks_ring);
+
+// ── Stage 12: vport context + HwNic ────────────────────────────────
+
+use super::vport::{
+    build_set_mtu_payload, NicVportContext, VportError,
+    VPORT_CTX_LEN, VPORT_OFF_CURRENT_MAC, VPORT_OFF_MTU,
+    VPORT_OFF_PERMANENT_MAC,
+};
+
+fn smoke_mlx5_vport_decode() -> TestResult {
+    let mut bytes = alloc::vec![0u8; VPORT_CTX_LEN];
+    bytes[VPORT_OFF_MTU..VPORT_OFF_MTU + 4]
+        .copy_from_slice(&9000u32.to_be_bytes());
+    bytes[VPORT_OFF_PERMANENT_MAC..VPORT_OFF_PERMANENT_MAC + 6]
+        .copy_from_slice(&[0x02, 0x11, 0x22, 0x33, 0x44, 0x55]);
+    bytes[VPORT_OFF_CURRENT_MAC..VPORT_OFF_CURRENT_MAC + 6]
+        .copy_from_slice(&[0x06, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE]);
+    let ctx = match NicVportContext::from_bytes(bytes) {
+        Ok(c)  => c,
+        Err(_) => return TestResult::Fail("from_bytes rejected full payload"),
+    };
+    if ctx.mtu() != 9000 { return TestResult::Fail("MTU not BE-decoded"); }
+    if ctx.permanent_mac() != [0x02, 0x11, 0x22, 0x33, 0x44, 0x55] {
+        return TestResult::Fail("permanent_mac wrong");
+    }
+    if ctx.current_mac() != [0x06, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE] {
+        return TestResult::Fail("current_mac wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_vport_decode);
+
+fn smoke_mlx5_vport_truncated() -> TestResult {
+    let bytes = alloc::vec![0u8; VPORT_CTX_LEN - 1];
+    if !matches!(NicVportContext::from_bytes(bytes), Err(VportError::Truncated)) {
+        return TestResult::Fail("under-length payload accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_vport_truncated);
+
+fn smoke_mlx5_vport_set_mtu_payload() -> TestResult {
+    let payload = build_set_mtu_payload(1500);
+    if payload.len() != VPORT_CTX_LEN {
+        return TestResult::Fail("set_mtu payload length wrong");
+    }
+    let want = 1500u32.to_be_bytes();
+    if payload[VPORT_OFF_MTU..VPORT_OFF_MTU + 4] != want {
+        return TestResult::Fail("MTU not BE-encoded at 0x24");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_vport_set_mtu_payload);
+
+fn smoke_mlx5_vport_opcodes() -> TestResult {
+    if super::cmd::CmdOp::QueryNicVportContext as u16  != 0x754
+       { return TestResult::Fail("QUERY_NIC_VPORT_CONTEXT opcode drift"); }
+    if super::cmd::CmdOp::ModifyNicVportContext as u16 != 0x755
+       { return TestResult::Fail("MODIFY_NIC_VPORT_CONTEXT opcode drift"); }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/mlx5", smoke_mlx5_vport_opcodes);
