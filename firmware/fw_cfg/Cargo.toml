@@ -1,0 +1,21 @@
+[package]
+name         = "narf-firmware-fw-cfg"
+description  = "QEMU fw_cfg interface driver. Indexed key/value firmware-config store; cmdline, bootorder, ACPI tables, SMBIOS, custom -fw_cfg name=opt/foo,file=... blobs. Spec: docs/specs/fw_cfg.rst (clean-room)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_firmware_fw_cfg"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../../lib" }
+narf-arch         = { path = "../../arch" }
+narf-init         = { path = "../../init" }
+narf-kernel-test  = { path = "../../verification/kernel-test" }
+
+[lints]
+workspace = true

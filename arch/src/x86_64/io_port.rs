@@ -31,3 +31,29 @@ pub unsafe fn outb(port: u16, value: u8) {
     }
     compiler_fence(Ordering::SeqCst);
 }
+
+/// Read a 16-bit word from I/O port `port`.
+#[inline(always)]
+pub unsafe fn inw(port: u16) -> u16 {
+    let value: u16;
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: `in ax, dx` reads from the chipset's I/O fabric.
+    unsafe {
+        asm!("in ax, dx", out("ax") value, in("dx") port,
+             options(nomem, nostack, preserves_flags));
+    }
+    compiler_fence(Ordering::SeqCst);
+    value
+}
+
+/// Write a 16-bit word to I/O port `port`.
+#[inline(always)]
+pub unsafe fn outw(port: u16, value: u16) {
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: `out dx, ax` writes to the chipset's I/O fabric.
+    unsafe {
+        asm!("out dx, ax", in("dx") port, in("ax") value,
+             options(nomem, nostack, preserves_flags));
+    }
+    compiler_fence(Ordering::SeqCst);
+}

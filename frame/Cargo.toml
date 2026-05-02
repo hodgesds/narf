@@ -39,6 +39,7 @@ narf-fb              = { path = "../fb" }
 narf-audio           = { path = "../audio" }
 narf-shmem           = { path = "../shmem" }
 narf-firmware        = { path = "../firmware" }
+narf-firmware-fw-cfg = { path = "../firmware/fw_cfg" }
 narf-initramfs       = { path = "../initramfs" }
 narf-userspace     = { path = "../userspace" }
 narf-verification  = { path = "../verification", optional = true }

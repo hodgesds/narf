@@ -32,6 +32,7 @@ asks for. Updated when observable kernel behaviour changes.
 | virtio-rng-pci   | Modern transport. Structural probe.               |
 | virtio-balloon-pci | Modern transport. Structural probe.             |
 | virtio-iommu-pci | Modern transport. Stages 1-2 — PCI match (1AF4:1057) + §5.16.4 device-cfg decode + §5.16.6 request builders (ATTACH/DETACH/MAP/UNMAP/PROBE). No virtqueue traffic yet. |
+| virtio-scsi-pci  | Modern transport. Stages 1-2 — PCI match (1AF4:1048) + §5.6.6 pure-data builders for `virtio_scsi_cmd_req` / `virtio_scsi_cmd_resp` / `virtio_scsi_ctrl_tmf_req`. REPORT LUNS round-trip smoke. No virtqueue traffic yet. |
 | virtio-gpu-pci   | Modern + legacy PCI match (1AF4:1050 / 1AF4:1010). Pure-data builders for the six 2D commands (GET_DISPLAY_INFO / RESOURCE_CREATE_2D / ATTACH_BACKING / SET_SCANOUT / TRANSFER_TO_HOST_2D / RESOURCE_FLUSH) per VirtIO 1.2 §5.7.6. controlq + cursorq layout constants. Live bring-up + scanout flush already wired (`bring_up`, `init_scanout`, `flush`); QEMU live-submit smoke is the next stage. |
 | e1000 / e1000e   | Real Intel NIC (8254x + 8257x family). TX + RX.   |
 | ixgbe            | Intel 82599 / X540 / X550 10 GbE. PCI match + reset + EEPROM MAC + advanced TX ring + RX ring + MSI-X + `HwNic`. Live bring-up smoke skips on QEMU (no emulated 82599). |
