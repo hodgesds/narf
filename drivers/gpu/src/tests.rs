@@ -71,3 +71,43 @@ fn smoke_virtio_gpu_scanout_initialised() -> TestResult {
     }
 }
 kernel_test_in!("drivers/gpu", smoke_virtio_gpu_scanout_initialised);
+
+fn smoke_amdgpu_pci_matches_registered() -> TestResult {
+    // Structural: register the amdgpu driver and assert every
+    // explicit AMD VID/DID match plus the class-match backstop
+    // are in the bus's table. Doesn't require live silicon.
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::{registered_pci_drivers, MatchKind};
+    use crate::amdgpu;
+    __reset_for_test();
+    amdgpu::register_pci_driver();
+    let regs = registered_pci_drivers();
+    let want: &[(u16, u16)] = &[
+        (amdgpu::AMD_VENDOR, amdgpu::PHOENIX_HAWKPOINT1),
+        (amdgpu::AMD_VENDOR, amdgpu::PHOENIX_DISCRETE),
+        (amdgpu::AMD_VENDOR, amdgpu::STRIX_POINT),
+        (amdgpu::AMD_VENDOR, amdgpu::RAPHAEL),
+        (amdgpu::AMD_VENDOR, amdgpu::CEZANNE),
+        (amdgpu::AMD_VENDOR, amdgpu::RENOIR),
+        (amdgpu::AMD_VENDOR, amdgpu::NAVI22),
+        (amdgpu::AMD_VENDOR, amdgpu::NAVI31),
+    ];
+    for (v, d) in want.iter().copied() {
+        let found = regs.iter().any(|m|
+            matches!(m.kind, MatchKind::VendorDevice {
+                vendor, device,
+            } if vendor == v && device == d));
+        if !found {
+            return TestResult::Fail("missing amdgpu VID/DID match");
+        }
+    }
+    let class_match = regs.iter().any(|m|
+        matches!(m.kind, MatchKind::Class {
+            class: 0x03, mask: 0xFF,
+        }));
+    if !class_match {
+        return TestResult::Fail("amdgpu class-match backstop missing");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu", smoke_amdgpu_pci_matches_registered);

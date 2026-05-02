@@ -102,4 +102,16 @@ pub enum GpuError {
     InvalidSubmission,
 }
 
+pub mod amdgpu;
+
 mod tests;
+
+/// Stage::Subsys initcalls — register every GPU driver with the
+/// bus match table.
+pub fn register_initcalls() {
+    use narf_init::{InitResult, Stage};
+    narf_init::register(Stage::Subsys, "amdgpu-pci", || {
+        amdgpu::register_pci_driver();
+        InitResult::Ok
+    });
+}

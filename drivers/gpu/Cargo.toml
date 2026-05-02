@@ -17,6 +17,11 @@ narf-capabilities    = { path = "../../capabilities" }
 narf-kernel-test     = { path = "../../verification/kernel-test" }
 narf-graphics-driver = { path = "../graphics" }
 narf-drivers-virtio  = { path = "../virtio" }
+narf-driver-runtime  = { path = "../runtime", default-features = false, features = ["kernel"] }
+narf-drivers         = { path = ".." }
+narf-firmware        = { path = "../../firmware" }
+narf-bus             = { path = "../../bus" }
+narf-init            = { path = "../../init" }
 
 [lints]
 workspace = true

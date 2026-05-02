@@ -537,9 +537,14 @@ dependencies = [
 name = "narf-drivers-gpu"
 version = "0.0.0"
 dependencies = [
+ "narf-bus",
  "narf-capabilities",
+ "narf-driver-runtime",
+ "narf-drivers",
  "narf-drivers-virtio",
+ "narf-firmware",
  "narf-graphics-driver",
+ "narf-init",
  "narf-kernel-test",
  "narf-lib",
 ]
@@ -690,6 +695,7 @@ dependencies = [
  "narf-bus",
  "narf-console",
  "narf-drivers",
+ "narf-drivers-gpu",
  "narf-drivers-net",
  "narf-drivers-nvme",
  "narf-drivers-storage",
