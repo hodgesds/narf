@@ -16,6 +16,7 @@
 extern crate alloc;
 
 pub mod ahci;
+pub mod sdhci;
 
 mod tests;
 
@@ -24,6 +25,10 @@ pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
     narf_init::register(Stage::Subsys, "ahci", || {
         ahci::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "sdhci", || {
+        sdhci::register_pci_driver();
         InitResult::Ok
     });
 }

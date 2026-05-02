@@ -12,6 +12,7 @@ Network device drivers. Exports frames via the `HwNic` trait and the
 |---|---|---|
 | `e1000` | Intel 8254x family | clean-room from public Intel datasheet; TX + RX descriptor rings, polled. |
 | `e1000e` | Intel 8257x family | shares the `e1000` core, extension VID/DIDs. |
+| `igc` | Intel I225 / I226 family — 2.5 GbE | clean-room from public Intel datasheets; CTRL.RST + RAL/RAH MAC + legacy TX/RX descriptor rings + tx/rx (Stage cut: MSI-X + advanced descriptors are follow-ups). |
 | `r8169` | Realtek RTL81xx 1 GbE family | clean-room TX/RX descriptor rings + MSI-X. |
 | `rtl8125` | Realtek RTL8125 / 8125B 2.5 GbE | clean-room PCI match + reset + MAC decode + TX descriptor layout (stages 1-3). |
 | `ixgbe` | Intel 82599 / X540 / X550 / X550EM 10 GbE | clean-room; reset + EEPROM MAC + advanced TX + RX + MSI-X + `HwNic` impl. |

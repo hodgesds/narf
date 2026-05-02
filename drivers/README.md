@@ -56,6 +56,8 @@ device to the highest-specificity matching probe.
 | `narf-drivers-net` (rtl8125)     | 0x10EC : 0x8125 / 0x3000 | clean-room PCI match + reset + MAC decode + TX descriptor layout |
 | `narf-drivers-net` (iwlwifi)     | 0x8086 : AX200/AX201/AX210/AX211 | structural probe only — operational register map blocked on public docs |
 | `narf-drivers-storage` (AHCI)    | 0x8086 : 0x2922 (ICH9), 0x3A22 (ICH10)  | HBA reset + port enumeration + IDENTIFY DEVICE + READ/WRITE DMA EXT + READ/WRITE FPDMA QUEUED (NCQ) + port-multiplier topology snapshot |
+| `narf-drivers-storage` (SDHCI)   | PCI class 08:05 (any vendor)            | software reset + 3.3V power + 400 kHz init clock + CMD0/CMD8/ACMD41/CMD2/CMD3/CMD7 SD identification + CMD17/CMD24 PIO read/write_block |
+| `narf-drivers-net` (igc)         | 0x8086 : 0x15F2/0x15F3/0x0D9F (I225) + 0x125B/0x125C/0x125D (I226) | clean-room from public Intel datasheets — CTRL.RST reset + RAL/RAH MAC + legacy TX + RX rings + tx/rx |
 | `narf-drivers-usb` (xHCI)        | QEMU + AMD Phoenix VID/DIDs | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT |
 | `narf-drivers-usb` (HID kbd)     | xHCI hot-plug | Set Protocol(Boot) → interrupt-IN polling → Usage 0x07 → KeyCode press/release diff → `narf_input` |
 | `narf-drivers-usb` (Mass Storage)| xHCI hot-plug, USB class 08:06:50 | enumerate-and-attach → CBW/CSW Bulk-Only Transport → INQUIRY / READ CAPACITY(10) / READ(10) / WRITE(10) + multi-block read/write up to 8 LBAs/xfer |

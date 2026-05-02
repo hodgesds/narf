@@ -65,7 +65,7 @@ intra-address-space isolation.
   framekernel's domain model.
 - **Verification and observability are first-class.** A kernel-resident
   test harness (`cargo xtask test`) boots the real kernel under QEMU and
-  asserts on live invariants — 560 smokes on x86_64, 292 on aarch64 at
+  asserts on live invariants — 562 smokes on x86_64, 292 on aarch64 at
   time of writing — alongside USDT-style probes, flight-recorder rings, a
   PMU-sampling surface, and an ABI promise (syscall numbers carry an upper
   8-bit version, `relibc` will gate against it). Bugs are caught at the
@@ -215,6 +215,16 @@ Live from boot through `cargo xtask run`:
   READ/WRITE DMA EXT, plus READ/WRITE FPDMA QUEUED (NCQ on a
   per-tag basis with PORT_SACT bookkeeping) and a placeholder for
   port-multiplier topology discovery.
+- SDHCI: SD Host Controller (any vendor, PCI class 08:05) —
+  software reset, 3.3V power, 400 kHz init clock, full SD
+  identification sequence (CMD0 / CMD8 / ACMD41 / CMD2 / CMD3 /
+  CMD7), and `read_block(lba)` / `write_block(lba, data)` over
+  PIO with the standard Buffer Data Port.
+- igc (Intel I225 / I226): clean-room from public Intel
+  datasheets. PCI match against 6 VID/DIDs across the I225 LM/V/IT
+  + I226 LM/V/IT families, CTRL.RST reset, MAC read from RAL/RAH,
+  legacy TX + RX descriptor rings, polled `tx(&[u8])` / `rx(&mut)`
+  + `HwNic` adapter.
 - Intel HD Audio (HDA): clean-room driver for the AMD Ryzen /
   Phoenix and Radeon HD Audio Controllers — BAR0 mapping, GCTL
   reset, CORB/RIRB ring DMA, STATESTS codec walk, Get Parameter
@@ -238,7 +248,7 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **560/0/22** smokes;
+`cargo xtask test --arch=x86_64` passes **562/0/22** smokes;
 `--arch=aarch64` passes **292/0/10**. Skips are x86-specific PCIe
 surfaces or live-device tests that skip cleanly when QEMU doesn't
 expose the device. See `STATUS.md` for the full tally and per-

@@ -152,3 +152,29 @@ fn smoke_e1000_rx_arp_request() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/e1000", smoke_e1000_rx_arp_request);
+
+// ── igc ────────────────────────────────────────────────────────────
+
+fn smoke_igc_pci_match_table() -> TestResult {
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::{registered_pci_drivers, MatchKind};
+    use crate::igc;
+    __reset_for_test();
+    igc::register_pci_driver();
+    let registered = registered_pci_drivers();
+    let want: &[u16] = &[
+        igc::IGC_I225_LM, igc::IGC_I225_V, igc::IGC_I225_IT,
+        igc::IGC_I226_LM, igc::IGC_I226_V, igc::IGC_I226_IT,
+    ];
+    for did in want.iter().copied() {
+        let found = registered.iter().any(|m|
+            matches!(m.kind, MatchKind::VendorDevice {
+                vendor, device,
+            } if vendor == igc::IGC_VENDOR && device == did));
+        if !found {
+            return TestResult::Fail("igc match entry missing");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/igc", smoke_igc_pci_match_table);
