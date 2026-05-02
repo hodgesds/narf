@@ -1,6 +1,26 @@
 # drivers/gpu/amdgpu — Specification
 
-> Status: **v0.5** (Stage 5 — ATOM_FIRMWARE_INFO + GFX ucode header + DP link training).
+> Status: **v0.6** (Stage 6 — PPTable directory + display-object table + EDID-over-AUX).
+>
+> ### v0.6 changes vs v0.5
+>
+> - **PPTable V11.0 directory walker** (`amdgpu_pptable`):
+>   decodes the 16-entry offset directory carrying SoC clock /
+>   memory clock / VDDC voltage / fan / power-tune subtable
+>   pointers. Per-subtable decoders are deferred to the SMU
+>   bring-up path; the directory is the load-bearing piece.
+> - **ATOM display-object table walker** (`amdgpu_atom_displayobj`):
+>   iterates the per-board connector paths, decoding
+>   connector kind (DP / eDP / HDMI-A/B / DVI-I/D / VGA / LVDS / DSI),
+>   instance number, and GPU object id. Multi-monitor topology
+>   for free.
+> - **EDID-over-AUX helper** (`dp_edid::read_panel_edid`): wires
+>   `dp_aux::AuxChannel` to `narf-graphics::edid::Edid::parse`
+>   via I²C-over-AUX at slave `0x50`. Reads the 128-byte base
+>   block in 16-byte AUX chunks, parses, returns a borrowed
+>   `Edid` view. End-to-end EDID round-trip without family-
+>   specific DCN registers — works against any `AuxChannel`
+>   transport (DCN-AUX, virtio-gpu pass-through, smoke stub).
 >
 > ### v0.5 changes vs v0.4
 >

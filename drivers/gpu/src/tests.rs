@@ -552,3 +552,192 @@ fn smoke_dp_link_training_completes_against_stub() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu", smoke_dp_link_training_completes_against_stub);
+
+fn smoke_amdgpu_pptable_v11_directory_round_trip() -> TestResult {
+    use crate::amdgpu_pptable::{PpTable, PpTableError, Subtable};
+    let mut t = alloc::vec::Vec::new();
+    t.resize(80, 0u8);
+    // Header: usSize=80, fmt=11, content=0
+    t[0..2].copy_from_slice(&80u16.to_le_bytes());
+    t[2] = 11;
+    t[3] = 0;
+    // Set a subset of offsets.
+    // Subtable::PlatformDescriptor (idx 0) → 0x100
+    t[4..8].copy_from_slice(&0x100u32.to_le_bytes());
+    // Subtable::FanTable (idx 4) → 0x200
+    t[20..24].copy_from_slice(&0x200u32.to_le_bytes());
+    // Subtable::SocClockDependency (idx 6) → 0x300
+    t[28..32].copy_from_slice(&0x300u32.to_le_bytes());
+    let pp = match PpTable::parse(&t) {
+        Ok(p)  => p,
+        Err(_) => return TestResult::Fail("PpTable parse rejected V11.0"),
+    };
+    if pp.format_revision != 11 {
+        return TestResult::Fail("format revision");
+    }
+    if pp.present_count() != 3 {
+        return TestResult::Fail("present_count != 3");
+    }
+    if pp.offset(Subtable::PlatformDescriptor) != Ok(0x100) {
+        return TestResult::Fail("PlatformDescriptor offset");
+    }
+    if pp.offset(Subtable::FanTable) != Ok(0x200) {
+        return TestResult::Fail("FanTable offset");
+    }
+    if !matches!(pp.offset(Subtable::OverdriveTable8), Err(PpTableError::TableAbsent)) {
+        return TestResult::Fail("absent subtable should fail");
+    }
+    // V8 rejected.
+    let mut bad = t.clone();
+    bad[2] = 8;
+    if !matches!(PpTable::parse(&bad), Err(PpTableError::UnsupportedVersion(_))) {
+        return TestResult::Fail("V8 should reject");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu", smoke_amdgpu_pptable_v11_directory_round_trip);
+
+fn smoke_amdgpu_atom_displayobj_iter_paths() -> TestResult {
+    use crate::amdgpu_atom_displayobj::{
+        ConnectorKind, DisplayObjectTable, DisplayObjError,
+    };
+    // Build a synthetic display-object table with 3 paths:
+    //   path 0: DP connector (object id 0x13), instance 0
+    //   path 1: HDMI-A (0x0C), instance 1
+    //   path 2: eDP   (0x14), instance 0
+    let mut t = alloc::vec::Vec::new();
+    t.resize(8 + 3 * 8, 0u8);
+    // Header.
+    t[0..2].copy_from_slice(&((8u16 + 3 * 8).to_le_bytes()));
+    t[2] = 1; // format_revision
+    t[3] = 0; // content_revision
+    t[4..6].copy_from_slice(&0x0001u16.to_le_bytes()); // device_support bitmap
+    t[6] = 3; // num_paths
+    // Paths start at 8.
+    let paths = [
+        (0x0001u16, (0x13u16 << 8) | 0u16, 0x1100u16), // DP
+        (0x0002u16, (0x0Cu16 << 8) | 1u16, 0x1101u16), // HDMI-A
+        (0x0004u16, (0x14u16 << 8) | 0u16, 0x1102u16), // eDP
+    ];
+    for (i, (tag, conn, gpu)) in paths.iter().enumerate() {
+        let off = 8 + i * 8;
+        t[off..off + 2].copy_from_slice(&tag.to_le_bytes());
+        t[off + 2..off + 4].copy_from_slice(&8u16.to_le_bytes());
+        t[off + 4..off + 6].copy_from_slice(&conn.to_le_bytes());
+        t[off + 6..off + 8].copy_from_slice(&gpu.to_le_bytes());
+    }
+    let mut tbl = match DisplayObjectTable::parse(&t) {
+        Ok(p)  => p,
+        Err(_) => return TestResult::Fail("displayobj parse rejected"),
+    };
+    if tbl.path_count() != 3 {
+        return TestResult::Fail("path_count != 3");
+    }
+    if tbl.device_support_bitmap() != 0x0001 {
+        return TestResult::Fail("device_support bitmap mis-decoded");
+    }
+    let p0 = tbl.next().expect("first path");
+    if p0.connector_kind != ConnectorKind::Dp {
+        return TestResult::Fail("path 0 not DP");
+    }
+    let p1 = tbl.next().expect("second path");
+    if p1.connector_kind != ConnectorKind::HdmiA || p1.connector_index != 1 {
+        return TestResult::Fail("path 1 not HDMI-A.1");
+    }
+    let p2 = tbl.next().expect("third path");
+    if p2.connector_kind != ConnectorKind::Edp {
+        return TestResult::Fail("path 2 not eDP");
+    }
+    if tbl.next().is_some() {
+        return TestResult::Fail("iterator yielded extra path");
+    }
+    // Bad version → rejected.
+    let mut bad = t.clone();
+    bad[2] = 0;
+    if !matches!(DisplayObjectTable::parse(&bad), Err(DisplayObjError::UnsupportedVersion(_))) {
+        return TestResult::Fail("version 0 should reject");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu", smoke_amdgpu_atom_displayobj_iter_paths);
+
+fn smoke_dp_edid_over_aux_round_trip() -> TestResult {
+    // StubAux that returns canned EDID bytes for I2C reads at
+    // address 0x50<<1 + read flag.
+    use crate::dp_aux::{
+        AuxChannel, AuxCommand, AuxError, AuxRequest, AuxResponse, AuxStatus,
+    };
+    use crate::dp_edid::read_panel_edid;
+
+    // Build a valid 128-byte EDID 1.4 block (minimal: header,
+    // manufacturer "AMD", version 1.4, no detailed timing — we
+    // only check that the bytes flow end-to-end and the parser
+    // accepts the block; preferred-timing decoding is covered
+    // by the dedicated EDID smoke).
+    let mut edid = [0u8; 128];
+    edid[0..8].copy_from_slice(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
+    // Manufacturer "AMD" — A=1, M=13, D=4
+    let mfr: u16 = (1u16 << 10) | (13u16 << 5) | 4;
+    edid[8] = (mfr >> 8) as u8;
+    edid[9] = mfr as u8;
+    edid[18] = 1;
+    edid[19] = 4;
+    // Detailed-timing slot: pixel clock 0 marks the slot as a
+    // generic descriptor (display name etc.); the parser
+    // accepts the block but `preferred_timing()` returns
+    // NoPreferredTiming. We only check round-trip here.
+    let s: u8 = edid[..127].iter().fold(0u8, |a, &b| a.wrapping_add(b));
+    edid[127] = 0u8.wrapping_sub(s);
+
+    struct StubAux { edid: [u8; 128], cursor: usize }
+    impl AuxChannel for StubAux {
+        fn transact<'a>(
+            &mut self,
+            req: &AuxRequest<'_>,
+            reply_buf: &'a mut [u8],
+        ) -> Result<AuxResponse<'a>, AuxError> {
+            match req.cmd {
+                AuxCommand::I2cWrite => {
+                    // The driver writes the EDID offset (0) to
+                    // position the slave; reset the cursor.
+                    self.cursor = 0;
+                    reply_buf[0] = 0;
+                    Ok(AuxResponse { status: AuxStatus::Ack, data: &reply_buf[1..1] })
+                }
+                AuxCommand::I2cReadMot => {
+                    // Return up to (reply_buf.len() - 1) bytes
+                    // starting at cursor.
+                    let n = reply_buf.len() - 1;
+                    reply_buf[0] = 0;
+                    let end = (self.cursor + n).min(self.edid.len());
+                    let slice = &self.edid[self.cursor..end];
+                    reply_buf[1..1 + slice.len()].copy_from_slice(slice);
+                    self.cursor += slice.len();
+                    Ok(AuxResponse {
+                        status: AuxStatus::Ack,
+                        data: &reply_buf[1..1 + n],
+                    })
+                }
+                _ => Err(AuxError::UnknownStatus),
+            }
+        }
+    }
+    let mut aux = StubAux { edid, cursor: 0 };
+    let mut buf = [0u8; 128];
+    let parsed = match read_panel_edid(&mut aux, &mut buf) {
+        Ok(e)  => e,
+        Err(_) => return TestResult::Fail("read_panel_edid rejected stub bytes"),
+    };
+    if parsed.manufacturer() != *b"AMD" {
+        return TestResult::Fail("manufacturer round-trip");
+    }
+    if parsed.version_major() != 1 || parsed.version_minor() != 4 {
+        return TestResult::Fail("version round-trip");
+    }
+    // Buffer should now hold the original EDID bytes.
+    if buf != edid {
+        return TestResult::Fail("buffer doesn't match original EDID");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu", smoke_dp_edid_over_aux_round_trip);
