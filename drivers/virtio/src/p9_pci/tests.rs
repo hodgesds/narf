@@ -203,3 +203,38 @@ fn smoke_p9_qid_roundtrip() -> TestResult {
     }
 }
 kernel_test_in!("drivers/virtio/p9_pci", smoke_p9_qid_roundtrip);
+
+fn smoke_virtio_p9_pci_live_tversion() -> TestResult {
+    use crate::p9_pci;
+    if !p9_pci::is_probed() {
+        return TestResult::Skip("no virtio-9p-pci device on this run");
+    }
+    let r = p9_pci::with_controller(|c| c.tversion(8192, "9P2000.L"));
+    match r {
+        Some(Ok(rv)) => {
+            if rv.msize == 0 || rv.version.is_empty() {
+                return TestResult::Fail("Rversion fields unset");
+            }
+            TestResult::Pass
+        }
+        Some(Err(_))  => TestResult::Fail("tversion failed"),
+        None          => TestResult::Skip("controller missing"),
+    }
+}
+kernel_test_in!("drivers/virtio/p9_pci", smoke_virtio_p9_pci_live_tversion);
+
+fn smoke_virtio_p9_pci_rversion_round_trip() -> TestResult {
+    use crate::p9_pci::p9::Rversion;
+    let want = Rversion {
+        tag: 0xFFFF, msize: 8192,
+        version: b"9P2000.L".to_vec(),
+    };
+    let bytes = want.encode();
+    let got = match Rversion::decode(&bytes) {
+        Ok(g)  => g,
+        Err(_) => return TestResult::Fail("decode failed"),
+    };
+    if got != want { return TestResult::Fail("round-trip"); }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/virtio/p9_pci", smoke_virtio_p9_pci_rversion_round_trip);

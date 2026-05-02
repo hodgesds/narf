@@ -307,3 +307,29 @@ impl Tclunk {
         Ok(Self { tag: h.tag, fid })
     }
 }
+
+// ── Rversion (101) ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rversion {
+    pub tag:     u16,
+    pub msize:   u32,
+    pub version: Vec<u8>,
+}
+
+impl Rversion {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut body = Vec::with_capacity(4 + 2 + self.version.len());
+        put_u32(&mut body, self.msize);
+        put_str(&mut body, &self.version);
+        frame(R_VERSION, self.tag, &body)
+    }
+    pub fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
+        let h = Header::decode(buf)?;
+        if h.kind != R_VERSION { return Err(DecodeError::BadType); }
+        let mut off = HEADER_LEN;
+        let msize   = take_u32(buf, &mut off)?;
+        let version = take_str(buf, &mut off)?;
+        Ok(Self { tag: h.tag, msize, version })
+    }
+}
