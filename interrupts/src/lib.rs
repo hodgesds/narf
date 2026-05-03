@@ -59,6 +59,76 @@ pub unsafe fn eoi() {
 #[cfg(not(target_arch = "x86_64"))]
 pub unsafe fn eoi() {}
 
+/// Wire `narf-memory`'s `tlb_shootdown::shootdown` IPI fan-out hook
+/// to the per-arch IPI primitive. Called once by the boot path
+/// after SMP comes up; on a single-CPU boot it's still safe but
+/// reduces to a no-op (the hook itself short-circuits when only
+/// one CPU is online).
+pub fn install_tlb_shootdown_bridge() {
+    narf_memory::tlb_shootdown::set_ipi_fanout(ipi_fanout_bridge);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn ipi_fanout_bridge(req: narf_memory::tlb_shootdown::ShootdownRequest) {
+    if narf_lib::smp::cpu_count() <= 1 { return; }
+    match (req.tag, req.addr, req.size) {
+        // Tag + VA + size: range shootdown the existing IPI infra
+        // already supports. Convert size to page count (4 KiB pages).
+        (Some(_tag), Some(va), Some(size)) => {
+            let pages = (size + 0xFFF) / 0x1000;
+            // SAFETY: x2APIC online post-boot; vector installed.
+            unsafe { x86_64::ipi::shoot_range(va, pages.max(1)); }
+        }
+        // Tag + VA single-page.
+        (Some(_tag), Some(va), None) => {
+            // SAFETY: same.
+            unsafe { x86_64::ipi::shoot_va(va); }
+        }
+        // Tag-only (full per-tag flush) — coarsen to broadcast
+        // VMALLE-equivalent. The existing IPI handler is VA-based,
+        // so we use a sentinel large-range shoot covering the kernel
+        // half low boundary; a tag-aware IPI lands in a follow-up.
+        // For now the local apply_local already invalidated the
+        // tag, so peers stay coherent for that tag's entries via
+        // their own apply_local on next switch_to.
+        (Some(_tag), None, _) => {
+            // No-op for fan-out: peer CPUs will pick up the
+            // generation bump on their next page-table switch.
+            // This matches the spec's "tag-scoped fan-out is a
+            // follow-up" line in §4.
+        }
+        // No tag — full TLB flush via VA = 0 sentinel won't work;
+        // the existing IPI handler skips va == 0. Fall back to
+        // per-CPU broadcast at vector level.
+        (None, _, _) => {
+            // SAFETY: x2APIC online; broadcast to all-but-self.
+            // The handler will INVLPG nothing (PENDING_VA is 0)
+            // and just bump its counter; peers should reload CR3
+            // explicitly when they observe a generation bump.
+            // Bumping every peer's ack counter still validates
+            // delivery during smokes.
+            unsafe {
+                x86_64::apic::wrmsr_icr(
+                    0xC0u64 << 12     // dest shorthand all-excluding-self
+                  | (1 << 14)         // level=assert
+                  | (VECTOR_TLB_SHOOTDOWN as u64),
+                );
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn ipi_fanout_bridge(_req: narf_memory::tlb_shootdown::ShootdownRequest) {
+    if narf_lib::smp::cpu_count() <= 1 { return; }
+    // SAFETY: GIC is up post-boot; SGI_TLB_SHOOTDOWN is the
+    // reserved vector for this purpose.
+    unsafe { aarch64::sgi::broadcast_others(aarch64::sgi::SGI_TLB_SHOOTDOWN); }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn ipi_fanout_bridge(_req: narf_memory::tlb_shootdown::ShootdownRequest) {}
+
 /// Per-arch CPU "target id" used in MSI / MSI-X routing fields.
 ///
 /// On x86_64 this is the local x2APIC ID (read from MSR 0x802),

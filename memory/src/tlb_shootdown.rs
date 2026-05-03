@@ -43,20 +43,41 @@ pub fn shootdown_count() -> u64 {
     SHOOTDOWN_COUNT.load(Ordering::Acquire)
 }
 
-/// Apply `req` locally + (when SMP is wired) IPI peer CPUs.
-/// Single-CPU path is the default until APs come up.
+// ── IPI fan-out hook ──────────────────────────────────────────────
+//
+// `narf-memory` can't depend on `narf-interrupts` (the dependency
+// runs the other way), so the cross-CPU IPI shoot path is wired by
+// the interrupts crate via `set_ipi_fanout` at boot. UP boots leave
+// the hook unset and `shootdown` reduces to local invalidation.
+
+use core::sync::atomic::AtomicUsize;
+type IpiFanoutFn = fn(req: ShootdownRequest);
+
+static IPI_FANOUT: AtomicUsize = AtomicUsize::new(0);
+
+/// Wire the IPI fan-out function. Called once by the interrupts
+/// crate after the IPI vector + per-CPU pending state are ready.
+pub fn set_ipi_fanout(f: IpiFanoutFn) {
+    IPI_FANOUT.store(f as usize, Ordering::Release);
+}
+
+fn ipi_fanout(req: ShootdownRequest) {
+    let f = IPI_FANOUT.load(Ordering::Acquire);
+    if f != 0 {
+        // SAFETY: stored as `IpiFanoutFn as usize`; round-trip back
+        // is sound when non-null.
+        let func: IpiFanoutFn = unsafe { core::mem::transmute(f) };
+        func(req);
+    }
+}
+
+/// Apply `req` locally + IPI peer CPUs (when the fan-out hook is
+/// installed by the interrupts crate). On UP boots the hook stays
+/// unset and `shootdown` reduces to local invalidation.
 pub fn shootdown(req: ShootdownRequest) {
     apply_local(req);
     SHOOTDOWN_COUNT.fetch_add(1, Ordering::AcqRel);
-    // Peer-CPU fan-out lands when SMP bring-up wires APs:
-    //
-    //   for cpu in peers() {
-    //       send_ipi(cpu, IPI_TLB_SHOOTDOWN);
-    //       wait_ack();
-    //   }
-    //
-    // The IPI handler on each peer calls `apply_local(req)` itself
-    // and bumps a per-CPU ack counter the writer polls.
+    ipi_fanout(req);
 }
 
 #[cfg(target_arch = "x86_64")]

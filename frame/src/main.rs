@@ -153,6 +153,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 }
                 n.max(1)
             } else { 1 };
+            // Initialise the cross-arch per-domain root registry +
+            // ASID/PCID allocator before populating per-domain PML4s.
+            narf_memory::asid_alloc::allocator_init();
+            narf_memory::per_domain_root::init();
             let mut registered = 0u8;
             for domain in 0u8..16 {
                 let node = (domain as usize) % num_nodes;
@@ -162,6 +166,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     Ok(phys) => {
                         // SAFETY: domain<16; phys is a valid 4KiB frame.
                         unsafe { narf_arch::x86_64::pcid::set_domain_pml4(domain, phys.raw()); }
+                        // Mirror into the unified registry. Errors
+                        // here are benign — the pcid registry above
+                        // is the authoritative copy.
+                        let _ = narf_memory::per_domain_root::register_root(
+                            narf_lib::id::DomainId::new(domain), phys.raw(),
+                        );
                         registered += 1;
                     }
                     Err(_) => {
@@ -229,6 +239,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // SAFETY: x2APIC online, IPI handler installed.
                 unsafe { narf_interrupts::x86_64::ipi::shoot_range(va, pages); }
             });
+            // Install the unified `narf_memory::tlb_shootdown::shootdown`
+            // → IPI fan-out hook so the asid/pcid-isolation surface
+            // also benefits from cross-CPU dispatch.
+            narf_interrupts::install_tlb_shootdown_bridge();
         }
     }
 
@@ -282,6 +296,9 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             unsafe { narf_interrupts::aarch64::init_bsp(); }
             let _ = writeln!(console::Writer,
                 "  gic: v3 enabled, timer PPI {} unmasked", narf_interrupts::aarch64::TIMER_PPI);
+            // Install the unified `narf_memory::tlb_shootdown::shootdown`
+            // → SGI fan-out hook on aarch64 too.
+            narf_interrupts::install_tlb_shootdown_bridge();
         } else {
             let _ = writeln!(console::Writer,
                 "  gic: v3 sysreg interface unavailable — IRQs stay masked");

@@ -58,8 +58,13 @@ pub fn init() {
 fn ready() -> bool { INITIALISED.load(Ordering::Acquire) != 0 }
 
 /// Register a previously-allocated root for `domain`. The caller
-/// has run `clone_kernel_half(into)` on `root_phys`; this function
-/// just records the mapping.
+/// has run `paging::new_user_pml4` (which already clones the
+/// upper-half kernel mappings) so `root_phys` is ready to swap in.
+///
+/// On x86_64 this also publishes the root through the existing
+/// `pcid::set_domain_pml4` registry so the rest of the kernel
+/// (which already consults that registry for PCID-based switching)
+/// stays consistent.
 pub fn register_root(domain: DomainId, root_phys: u64) -> Result<PerDomainRoot, AllocError> {
     if !ready() { return Err(AllocError::NotInitialised); }
     let idx = domain.raw() as usize;
@@ -74,6 +79,13 @@ pub fn register_root(domain: DomainId, root_phys: u64) -> Result<PerDomainRoot, 
         generation: tag.generation,
     };
     g[idx] = r;
+    // Mirror to the x86_64 pcid registry so the existing
+    // PCID-aware switch primitives consume the same mapping.
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: domain.raw() < 16; root_phys is a valid 4 KiB frame.
+        unsafe { narf_arch::x86_64::pcid::set_domain_pml4(domain.raw(), root_phys); }
+    }
     Ok(r)
 }
 

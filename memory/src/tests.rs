@@ -699,3 +699,4 @@ fn smoke_tlb_shootdown_local_only() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory/tlb_shootdown", smoke_tlb_shootdown_local_only);
+

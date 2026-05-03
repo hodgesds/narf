@@ -65,7 +65,7 @@ intra-address-space isolation.
   framekernel's domain model.
 - **Verification and observability are first-class.** A kernel-resident
   test harness (`cargo xtask test`) boots the real kernel under QEMU and
-  asserts on live invariants — 587 smokes on x86_64, 292 on aarch64 at
+  asserts on live invariants — 588 smokes on x86_64, 292 on aarch64 at
   time of writing — alongside USDT-style probes, flight-recorder rings, a
   PMU-sampling surface, and an ABI promise (syscall numbers carry an upper
   8-bit version, `relibc` will gate against it). Bugs are caught at the
@@ -442,7 +442,7 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **587/0/29** smokes;
+`cargo xtask test --arch=x86_64` passes **588/0/29** smokes;
 `--arch=aarch64` passes **298/0/10**. Skips are x86-specific PCIe
 surfaces or live-device tests that skip cleanly when QEMU doesn't
 expose the device. See `STATUS.md` for the full tally and per-

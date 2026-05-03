@@ -112,3 +112,49 @@ fn smoke_wait_for_irq_resolves_after_on_irq() -> TestResult {
     }
 }
 kernel_test_in!("interrupts", smoke_wait_for_irq_resolves_after_on_irq);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_tlb_shootdown_bridge_smp_fanout() -> TestResult {
+    // End-to-end: with SMP up + the IPI bridge installed, calling
+    // `narf_memory::tlb_shootdown::shootdown` for a (tag, va) request
+    // should advance every peer CPU's EVER_RECEIVED counter (the IPI
+    // handler bumps it on every shootdown delivery).
+    use narf_memory::tlb_shootdown;
+    use crate::x86_64::ipi;
+    if narf_lib::smp::cpu_count() <= 1 {
+        return TestResult::Skip("UP boot — no peer CPUs to shoot");
+    }
+    let self_cpu = narf_lib::percpu::current_cpu() as u32;
+    let total = narf_lib::smp::cpu_count() as u32;
+    let mut snap = [0u64; narf_lib::percpu::MAX_CPUS];
+    for cpu in 0..total {
+        if cpu == self_cpu { continue; }
+        snap[cpu as usize] = ipi::ever_received(cpu);
+    }
+    let req = tlb_shootdown::ShootdownRequest {
+        tag:  Some(1),
+        addr: Some(0xFFFF_FFFF_8000_0000),
+        size: Some(4096),
+    };
+    tlb_shootdown::shootdown(req);
+    let mut spins = 0u32;
+    loop {
+        let mut all_advanced = true;
+        for cpu in 0..total {
+            if cpu == self_cpu { continue; }
+            if ipi::ever_received(cpu) <= snap[cpu as usize] {
+                all_advanced = false;
+                break;
+            }
+        }
+        if all_advanced { break; }
+        spins += 1;
+        if spins > 10_000_000 {
+            return TestResult::Fail("peer CPUs never received shootdown");
+        }
+        core::hint::spin_loop();
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("interrupts/ipi", smoke_tlb_shootdown_bridge_smp_fanout);

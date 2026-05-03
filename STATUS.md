@@ -18,7 +18,7 @@ asks for. Updated when observable kernel behaviour changes.
   delivers hardware LAPIC-timer IRQs, exits cleanly.
 - `cargo xtask run --arch=aarch64` boots, runs the full async demo
   using CNTPCT_EL0 as the clock, exits via ARM semihosting.
-- `cargo xtask test --arch=x86_64` passes **587/0/29** (pass / fail / skip).
+- `cargo xtask test --arch=x86_64` passes **588/0/29** (pass / fail / skip).
 - `cargo xtask test --arch=aarch64` passes **298/0/10** (pass / fail / skip).
   Skips are x86_64-specific PCIe surfaces or live-device tests that
   skip cleanly when QEMU doesn't expose the device.
@@ -79,7 +79,7 @@ asks for. Updated when observable kernel behaviour changes.
 | SVM caps (AMD)   | CPUID(0x80000001).ECX[2] gate + CPUID(0x8000000A) capability decode → `SvmCaps { supported, disabled, revision, n_asids, np, lbr_virt, svm_lock, nrip_save, ... }`. Spec: `arch/specification/virt-confidential.md` §2. |
 | SGX caps (Intel) | CPUID(0x12, 0/1/N) → `SgxCaps { sgx1, sgx2, miscselect, max_size_64, max_size_32, epc_sections }`. Spec: `arch/specification/virt-confidential.md` §3. |
 | Confidential guest | TDX (CPUID(0x21, 0) signature) + SEV / SEV-ES / SEV-SNP (`MSR_AMD64_SEV` 0xC0010131) detection → `ConfidentialEnvironment { Bare, TdxGuest, SevGuest, SevEsGuest, SevSnpGuest }`. Spec: `arch/specification/virt-confidential.md` §4. |
-| ASID/PCID isolation | Per-domain page-table root (`memory::per_domain_root`) + generation-tagged ASID/PCID allocator (`memory::asid_alloc`) + selective TLB invalidation (x86 INVPCID type 0/1/2/3 + aarch64 `TLBI ASIDE1IS` / `VAE1IS`) + cross-CPU shootdown skeleton (`memory::tlb_shootdown`, single-CPU local for now). Spec: `memory/specification/asid-pcid-isolation.md`. |
+| ASID/PCID isolation | Per-domain page-table root (`memory::per_domain_root`) registers each domain's PML4 (mirrored to `pcid::set_domain_pml4`) at boot. Generation-tagged ASID/PCID allocator (`memory::asid_alloc`). Selective TLB invalidation (INVPCID 0/1/2/3 + `TLBI ASIDE1IS` / `VAE1IS`). Cross-CPU shootdown wired through `narf_interrupts::install_tlb_shootdown_bridge`: x86_64 fans out via existing `ipi::shoot_range` (vector 0xF0), aarch64 broadcasts SGI_TLB_SHOOTDOWN. Spec: `memory/specification/asid-pcid-isolation.md`. |
 | iwlwifi          | Intel Wi-Fi 6 / 6E (AX200 / AX201 / AX210 / AX211). **Structural probe only** — PCI match table + spec doc. Operational register map (CSR/PRPH offsets, firmware loader, TFD/RBD descriptors, host-command opcodes) is not in any public Intel doc; further stages blocked on public register docs. See `drivers/net/specification/iwlwifi.md`. |
 | AHCI (ICH9/10)   | HBA bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT. |
 | xHCI USB host    | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT. |
