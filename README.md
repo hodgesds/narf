@@ -65,7 +65,7 @@ intra-address-space isolation.
   framekernel's domain model.
 - **Verification and observability are first-class.** A kernel-resident
   test harness (`cargo xtask test`) boots the real kernel under QEMU and
-  asserts on live invariants — 583 smokes on x86_64, 292 on aarch64 at
+  asserts on live invariants — 587 smokes on x86_64, 292 on aarch64 at
   time of writing — alongside USDT-style probes, flight-recorder rings, a
   PMU-sampling surface, and an ABI promise (syscall numbers carry an upper
   8-bit version, `relibc` will gate against it). Bugs are caught at the
@@ -405,6 +405,20 @@ Live from boot through `cargo xtask run`:
   returns `ConfidentialEnvironment { Bare, TdxGuest,
   SevGuest, SevEsGuest, SevSnpGuest }`. Spec:
   `arch/specification/virt-confidential.md` §4.
+- ASID/PCID-based domain isolation: per-domain page-table root
+  (`narf_memory::per_domain_root`) registers a private user-half
+  PML4 (x86_64) / TTBR0 (aarch64) for each `DomainId`; the
+  generation-tagged allocator (`narf_memory::asid_alloc`) maps
+  `DomainId → (tag, generation)` and rolls over when the
+  architectural tag space (12-bit PCID / 8-or-16-bit ASID)
+  wraps. Selective TLB invalidation lands as `INVPCID` type 0
+  through 3 on x86_64 (`narf_arch::x86_64::pcid::invpcid_*`)
+  and `TLBI ASIDE1IS` / `TLBI VAE1IS` on aarch64
+  (`narf_arch::aarch64::sysreg::tlbi_*`). The
+  `narf_memory::tlb_shootdown::shootdown(req)` cross-CPU
+  shootdown surface dispatches locally today; the peer-IPI
+  fan-out becomes real once SMP bring-up wires APs. Spec:
+  `memory/specification/asid-pcid-isolation.md`.
 - Intel HD Audio (HDA): clean-room driver for the AMD Ryzen /
   Phoenix and Radeon HD Audio Controllers — BAR0 mapping, GCTL
   reset, CORB/RIRB ring DMA, STATESTS codec walk, Get Parameter
@@ -428,8 +442,8 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **583/0/29** smokes;
-`--arch=aarch64` passes **294/0/10**. Skips are x86-specific PCIe
+`cargo xtask test --arch=x86_64` passes **587/0/29** smokes;
+`--arch=aarch64` passes **298/0/10**. Skips are x86-specific PCIe
 surfaces or live-device tests that skip cleanly when QEMU doesn't
 expose the device. See `STATUS.md` for the full tally and per-
 subsystem breakdown.

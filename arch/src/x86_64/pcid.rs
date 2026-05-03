@@ -253,3 +253,80 @@ pub unsafe fn exit_domain(saved: SavedPcid) {
     // SAFETY: see restore.
     unsafe { restore(saved); }
 }
+
+
+// ── INVPCID instruction wrappers ───────────────────────────────────
+//
+// Spec: `memory/specification/asid-pcid-isolation.md` §3.1.
+//
+// Per SDM Vol 2 INVPCID layout: INVPCID r64, m128 — RAX is the
+// type field, XMM/m128 carries (PCID in low 12 bits, linear
+// address in next 64 bits).
+
+#[repr(C, align(16))]
+struct InvpcidDescriptor { pcid: u64, addr: u64 }
+
+#[inline]
+unsafe fn invpcid_raw(typ: u64, desc: &InvpcidDescriptor) {
+    // SAFETY: caller-asserted CPL=0 + INVPCID supported (CPUID(7).EBX[10]).
+    unsafe {
+        core::arch::asm!(
+            "invpcid {t}, [{d}]",
+            t = in(reg) typ,
+            d = in(reg) desc,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Type 0: invalidate the TLB entry for `addr` tagged with `pcid`.
+///
+/// # Safety
+/// CPL = 0; INVPCID supported.
+#[inline]
+pub unsafe fn invpcid_addr(pcid: u16, addr: u64) {
+    let d = InvpcidDescriptor { pcid: pcid as u64 & 0xFFF, addr };
+    // SAFETY: caller-asserted.
+    unsafe { invpcid_raw(0, &d); }
+}
+
+/// Type 1: invalidate every TLB entry tagged with `pcid` on this CPU.
+///
+/// # Safety
+/// CPL = 0; INVPCID supported.
+#[inline]
+pub unsafe fn invpcid_single(pcid: u16) {
+    let d = InvpcidDescriptor { pcid: pcid as u64 & 0xFFF, addr: 0 };
+    // SAFETY: caller-asserted.
+    unsafe { invpcid_raw(1, &d); }
+}
+
+/// Type 2: invalidate every TLB entry on this CPU including globals.
+///
+/// # Safety
+/// CPL = 0; INVPCID supported.
+#[inline]
+pub unsafe fn invpcid_all_with_globals() {
+    let d = InvpcidDescriptor { pcid: 0, addr: 0 };
+    // SAFETY: caller-asserted.
+    unsafe { invpcid_raw(2, &d); }
+}
+
+/// Type 3: invalidate every TLB entry on this CPU excluding globals.
+///
+/// # Safety
+/// CPL = 0; INVPCID supported.
+#[inline]
+pub unsafe fn invpcid_all_without_globals() {
+    let d = InvpcidDescriptor { pcid: 0, addr: 0 };
+    // SAFETY: caller-asserted.
+    unsafe { invpcid_raw(3, &d); }
+}
+
+/// `true` iff the CPU supports the INVPCID instruction
+/// (CPUID(7, 0).EBX[10]).
+pub fn invpcid_supported() -> bool {
+    // SAFETY: leaf 7 always defined.
+    let (_, ebx, _, _) = unsafe { crate::x86_64::cpuid::cpuid(7, 0) };
+    ebx & (1 << 10) != 0
+}

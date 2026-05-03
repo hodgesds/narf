@@ -619,3 +619,83 @@ fn smoke_domain_switch() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_domain_switch);
+
+// ── ASID/PCID allocator + per-domain root + shootdown ──────────────
+
+fn smoke_asid_alloc_unique_per_domain() -> TestResult {
+    use crate::asid_alloc;
+    use narf_lib::id::DomainId;
+    asid_alloc::__reset_for_test();
+    let d0 = DomainId::FRAME;
+    let d1 = DomainId::DRIVER_0;
+    let t0 = asid_alloc::alloc(d0);
+    let t1 = asid_alloc::alloc(d1);
+    if t0.tag == t1.tag {
+        return TestResult::Fail("distinct domains got same tag");
+    }
+    if t0.tag == asid_alloc::TAG_RESERVED || t1.tag == asid_alloc::TAG_RESERVED {
+        return TestResult::Fail("allocator returned reserved tag");
+    }
+    if asid_alloc::alloc(d0).tag != t0.tag {
+        return TestResult::Fail("alloc(d0) returned different tag on second call");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/asid_alloc", smoke_asid_alloc_unique_per_domain);
+
+fn smoke_asid_rollover_bumps_generation() -> TestResult {
+    use crate::asid_alloc;
+    use narf_lib::id::DomainId;
+    asid_alloc::__reset_for_test();
+    let g_before = asid_alloc::current_generation();
+    let _ = asid_alloc::alloc(DomainId::FRAME);
+    asid_alloc::rollover_now();
+    let g_after = asid_alloc::current_generation();
+    if g_after <= g_before {
+        return TestResult::Fail("generation didn't bump on rollover");
+    }
+    if asid_alloc::cached(DomainId::FRAME).is_some() {
+        return TestResult::Fail("cached tag survived rollover");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/asid_alloc", smoke_asid_rollover_bumps_generation);
+
+fn smoke_per_domain_root_register_lookup() -> TestResult {
+    use crate::per_domain_root;
+    use narf_lib::id::DomainId;
+    per_domain_root::__reset_for_test();
+    let d = DomainId::DRIVER_1;
+    let phys = 0x4_0000u64;
+    match per_domain_root::register_root(d, phys) {
+        Ok(r) => {
+            if r.root_phys != phys { return TestResult::Fail("root_phys lost"); }
+            if r.domain != d { return TestResult::Fail("domain lost"); }
+        }
+        Err(_) => return TestResult::Fail("register_root failed"),
+    }
+    let looked = per_domain_root::lookup(d);
+    if looked.map(|r| r.root_phys) != Some(phys) {
+        return TestResult::Fail("lookup failed");
+    }
+    per_domain_root::unregister_root(d);
+    if per_domain_root::lookup(d).is_some() {
+        return TestResult::Fail("unregister didn't clear");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/per_domain_root", smoke_per_domain_root_register_lookup);
+
+fn smoke_tlb_shootdown_local_only() -> TestResult {
+    use crate::tlb_shootdown;
+    tlb_shootdown::__reset_for_test();
+    let before = tlb_shootdown::shootdown_count();
+    tlb_shootdown::shootdown(tlb_shootdown::ShootdownRequest::full());
+    tlb_shootdown::shootdown(tlb_shootdown::ShootdownRequest::for_tag(7));
+    let after = tlb_shootdown::shootdown_count();
+    if after - before != 2 {
+        return TestResult::Fail("shootdown counter didn't advance by 2");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/tlb_shootdown", smoke_tlb_shootdown_local_only);

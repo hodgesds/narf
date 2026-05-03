@@ -358,4 +358,105 @@ pub unsafe fn isb() {
     compiler_fence(Ordering::SeqCst);
 }
 
+// ── ASID-scoped TLB invalidation ───────────────────────────────────
+//
+// Spec: `memory/specification/asid-pcid-isolation.md` §3.2.
+//
+// `TLBI ASIDE1IS` operand layout: bits[63:48] = ASID, rest reserved.
+// `TLBI VAE1IS` operand layout: bits[63:48] = ASID, bits[43:0] = VA[55:12].
+
+/// Invalidate every TLB entry tagged with `asid` across all CPUs in
+/// the inner-shareable domain.
+///
+/// # Safety
+/// EL1; `asid` ≤ the architectural max (8 or 16 bits).
+#[inline]
+pub unsafe fn tlbi_asid_inner_shareable(asid: u16) {
+    compiler_fence(Ordering::SeqCst);
+    let operand = (asid as u64) << 48;
+    // SAFETY: TLBI ASIDE1IS is legal at EL1.
+    unsafe {
+        asm!(
+            "dsb ishst",
+            "tlbi aside1is, {v}",
+            "dsb ish",
+            "isb",
+            v = in(reg) operand,
+            options(nostack, preserves_flags),
+        );
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// Invalidate the TLB entry for `va` tagged with `asid` across the
+/// inner-shareable domain.
+///
+/// # Safety
+/// EL1; `va` is a canonical aarch64 virtual address (low half).
+#[inline]
+pub unsafe fn tlbi_va_asid_inner_shareable(asid: u16, va: u64) {
+    compiler_fence(Ordering::SeqCst);
+    // VAE1IS encoding: bits[43:0] = VA[55:12], bits[63:48] = ASID.
+    let operand = ((asid as u64) << 48) | ((va >> 12) & 0x0000_FFFF_FFFF_FFFF);
+    // SAFETY: TLBI VAE1IS is legal at EL1.
+    unsafe {
+        asm!(
+            "dsb ishst",
+            "tlbi vae1is, {v}",
+            "dsb ish",
+            "isb",
+            v = in(reg) operand,
+            options(nostack, preserves_flags),
+        );
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// Number of ASID bits the CPU implements (8 or 16). Read from
+/// `ID_AA64MMFR0_EL1.ASIDBits` (bits[7:4]); 0 = 8-bit ASIDs,
+/// 2 = 16-bit ASIDs.
+#[inline]
+pub fn asid_bits() -> u8 {
+    let v: u64;
+    // SAFETY: ID_AA64MMFR0_EL1 is always readable at EL1.
+    unsafe {
+        asm!("mrs {}, id_aa64mmfr0_el1", out(reg) v, options(nomem, nostack));
+    }
+    if (v >> 4) & 0xF == 2 { 16 } else { 8 }
+}
+
+/// Read the current TTBR0_EL1 ASID field (bits[63:48]).
+#[inline]
+pub fn read_ttbr0_asid() -> u16 {
+    let v: u64;
+    // SAFETY: TTBR0_EL1 is always readable at EL1.
+    unsafe {
+        asm!("mrs {}, ttbr0_el1", out(reg) v, options(nomem, nostack));
+    }
+    ((v >> 48) & 0xFFFF) as u16
+}
+
+/// Write `TTBR0_EL1` with `(root_phys, asid)`. The root phys is
+/// kept in BADDR (bits[47:1]); the ASID lives in bits[63:48].
+///
+/// # Safety
+/// EL1; `root_phys` is a valid translation-table base; `asid` ≤
+/// the architectural max.
+#[inline]
+pub unsafe fn write_ttbr0_el1_with_asid(root_phys: u64, asid: u16) {
+    compiler_fence(Ordering::SeqCst);
+    let v = (root_phys & 0x0000_FFFF_FFFF_FFFE) | ((asid as u64) << 48);
+    // SAFETY: caller-asserted EL1 + valid root.
+    unsafe {
+        asm!(
+            "msr ttbr0_el1, {v}",
+            "dsb ish",
+            "isb",
+            v = in(reg) v,
+            options(nostack, preserves_flags),
+        );
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
 
