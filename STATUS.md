@@ -18,7 +18,7 @@ asks for. Updated when observable kernel behaviour changes.
   delivers hardware LAPIC-timer IRQs, exits cleanly.
 - `cargo xtask run --arch=aarch64` boots, runs the full async demo
   using CNTPCT_EL0 as the clock, exits via ARM semihosting.
-- `cargo xtask test --arch=x86_64` passes **579/0/29** (pass / fail / skip).
+- `cargo xtask test --arch=x86_64` passes **583/0/29** (pass / fail / skip).
 - `cargo xtask test --arch=aarch64` passes **294/0/10** (pass / fail / skip).
   Skips are x86_64-specific PCIe surfaces or live-device tests that
   skip cleanly when QEMU doesn't expose the device.
@@ -75,6 +75,10 @@ asks for. Updated when observable kernel behaviour changes.
 | CET (Control-flow Enforcement) | Shadow stack (`CPUID(7,0).ECX[7]`) + IBT (`CPUID(7,0).EDX[20]`) gate, `enable_supervisor` / `enable_user` MSR programming, `IA32_PL0_SSP` access, CR4.CET enable. Spec: `arch/specification/security-hardening.md` §1. |
 | PEBS             | Precise Event-Based Sampling — DS save area install + per-counter PEBS enable + Skylake basic-record buffer builder. Spec: `arch/specification/security-hardening.md` §2. |
 | Boot CPU validation | CPUID + CR4 + EFER probe surfaced as `CpuValidation { long_mode, rdtscp, invariant_tsc, nx, smep, smap, umip, wrgsbase, pcid, x2apic, xsave, ... }` + `baseline_ok` guard. Spec: `arch/specification/security-hardening.md` §3. |
+| VMX caps (Intel) | `IA32_FEATURE_CONTROL` + `IA32_VMX_BASIC` + `IA32_VMX_PROCBASED_CTLS2` + `IA32_VMX_EPT_VPID_CAP` decode → `VmxCaps { supported, feature_locked, vmxon_outside_smx, basic, ept_supported, vpid_supported, unrestricted_guest, apicv, vmcs_shadowing }`. Spec: `arch/specification/virt-confidential.md` §1. |
+| SVM caps (AMD)   | CPUID(0x80000001).ECX[2] gate + CPUID(0x8000000A) capability decode → `SvmCaps { supported, disabled, revision, n_asids, np, lbr_virt, svm_lock, nrip_save, ... }`. Spec: `arch/specification/virt-confidential.md` §2. |
+| SGX caps (Intel) | CPUID(0x12, 0/1/N) → `SgxCaps { sgx1, sgx2, miscselect, max_size_64, max_size_32, epc_sections }`. Spec: `arch/specification/virt-confidential.md` §3. |
+| Confidential guest | TDX (CPUID(0x21, 0) signature) + SEV / SEV-ES / SEV-SNP (`MSR_AMD64_SEV` 0xC0010131) detection → `ConfidentialEnvironment { Bare, TdxGuest, SevGuest, SevEsGuest, SevSnpGuest }`. Spec: `arch/specification/virt-confidential.md` §4. |
 | iwlwifi          | Intel Wi-Fi 6 / 6E (AX200 / AX201 / AX210 / AX211). **Structural probe only** — PCI match table + spec doc. Operational register map (CSR/PRPH offsets, firmware loader, TFD/RBD descriptors, host-command opcodes) is not in any public Intel doc; further stages blocked on public register docs. See `drivers/net/specification/iwlwifi.md`. |
 | AHCI (ICH9/10)   | HBA bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT. |
 | xHCI USB host    | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT. |

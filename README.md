@@ -65,7 +65,7 @@ intra-address-space isolation.
   framekernel's domain model.
 - **Verification and observability are first-class.** A kernel-resident
   test harness (`cargo xtask test`) boots the real kernel under QEMU and
-  asserts on live invariants — 579 smokes on x86_64, 292 on aarch64 at
+  asserts on live invariants — 583 smokes on x86_64, 292 on aarch64 at
   time of writing — alongside USDT-style probes, flight-recorder rings, a
   PMU-sampling surface, and an ABI promise (syscall numbers carry an upper
   8-bit version, `relibc` will gate against it). Bugs are caught at the
@@ -379,6 +379,32 @@ Live from boot through `cargo xtask run`:
   (LME / NXE) actually-on bits. `baseline_ok(&v)` returns
   `Err(reason)` for the first hard-required miss. Spec:
   `arch/specification/security-hardening.md` §3.
+- VMX caps (`narf_arch::x86_64::vmx`): Intel VMX detection per
+  SDM Vol 3 Ch 24-25. CPUID(1).ECX[5] gate +
+  `IA32_FEATURE_CONTROL` lock check + `IA32_VMX_BASIC` decode
+  (revision id, VMCS region size, memory type, true-controls
+  bit) + `IA32_VMX_PROCBASED_CTLS2` decode for EPT / VPID /
+  unrestricted-guest / APICv / VMCS-shadowing. Spec:
+  `arch/specification/virt-confidential.md` §1.
+- SVM caps (`narf_arch::x86_64::svm`): AMD SVM detection per
+  AMD APM Vol 2 Ch 15. CPUID(0x80000001).ECX[2] gate +
+  CPUID(0x8000000A) decode (revision, n_asids, NP, LBR-virt,
+  SVM lock, NRIPS, TSC-rate-MSR, VMCB-clean, flush-by-ASID,
+  decode-assists, pause-filter) + `MSR_VM_CR.SVMDIS` check.
+  Spec: `arch/specification/virt-confidential.md` §2.
+- SGX caps (`narf_arch::x86_64::sgx`): SGX detection per SDM
+  Vol 3 §38.7. CPUID(7, 0).EBX[2] gate + CPUID(0x12, 0/1/N)
+  decode → SGX1/SGX2 + miscselect bitmap + max enclave size +
+  EPC section list (up to 4 sections, base/size from sub-leaves
+  ≥ 2). Spec: `arch/specification/virt-confidential.md` §3.
+- Confidential guest detection
+  (`narf_arch::x86_64::confidential`): TDX detection via
+  CPUID(0x21, 0) `b"IntelTDX    "` vendor signature; SEV /
+  SEV-ES / SEV-SNP detection via `CPUID(0x8000001F)` gate +
+  `MSR_AMD64_SEV` (0xC0010131) bits. `detect_environment()`
+  returns `ConfidentialEnvironment { Bare, TdxGuest,
+  SevGuest, SevEsGuest, SevSnpGuest }`. Spec:
+  `arch/specification/virt-confidential.md` §4.
 - Intel HD Audio (HDA): clean-room driver for the AMD Ryzen /
   Phoenix and Radeon HD Audio Controllers — BAR0 mapping, GCTL
   reset, CORB/RIRB ring DMA, STATESTS codec walk, Get Parameter
@@ -402,7 +428,7 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **579/0/29** smokes;
+`cargo xtask test --arch=x86_64` passes **583/0/29** smokes;
 `--arch=aarch64` passes **294/0/10**. Skips are x86-specific PCIe
 surfaces or live-device tests that skip cleanly when QEMU doesn't
 expose the device. See `STATUS.md` for the full tally and per-

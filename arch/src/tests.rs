@@ -523,3 +523,58 @@ fn smoke_cpu_validate_baseline() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("arch/cpu_validate", smoke_cpu_validate_baseline);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_vmx_caps_decode() -> TestResult {
+    use crate::x86_64::vmx;
+    let c = vmx::caps();
+    if c.supported && c.feature_locked && c.vmxon_outside_smx
+        && c.basic.vmcs_region_size == 0
+    {
+        return TestResult::Fail("VMX advertised but vmcs_region_size = 0");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/vmx", smoke_vmx_caps_decode);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_svm_caps_decode() -> TestResult {
+    use crate::x86_64::svm;
+    let c = svm::caps();
+    if c.supported && !c.disabled && c.revision == 0 {
+        return TestResult::Fail("SVM advertised but revision = 0");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/svm", smoke_svm_caps_decode);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_sgx_caps_decode() -> TestResult {
+    use crate::x86_64::sgx;
+    let c = sgx::caps();
+    if c.instruction_supported && !c.sgx1 {
+        return TestResult::Fail("SGX instr advertised without SGX1 support");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/sgx", smoke_sgx_caps_decode);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_confidential_detect() -> TestResult {
+    use crate::x86_64::confidential::{detect_environment, ConfidentialEnvironment};
+    let env = detect_environment();
+    // Any of the variants is acceptable — Bare is what every QEMU
+    // smoke target reports today; running this same test inside a
+    // TDX / SEV-SNP guest would surface those variants instead.
+    let _ = matches!(env, ConfidentialEnvironment::Bare
+                        | ConfidentialEnvironment::TdxGuest
+                        | ConfidentialEnvironment::SevGuest
+                        | ConfidentialEnvironment::SevEsGuest
+                        | ConfidentialEnvironment::SevSnpGuest);
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/confidential", smoke_confidential_detect);

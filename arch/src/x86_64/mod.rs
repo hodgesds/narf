@@ -3,6 +3,7 @@
 pub mod acpi;
 pub mod asm;
 pub mod cet;
+pub mod confidential;
 pub mod cpu;
 pub mod cpu_validate;
 pub mod cpuid;
@@ -22,11 +23,14 @@ pub mod pmu;
 pub mod probe;
 pub mod pt;
 pub mod rtc;
+pub mod sgx;
 pub mod smp;
 pub mod spec_ctrl;
+pub mod svm;
 pub mod topology;
 pub mod tsc;
 pub mod user_mode;
+pub mod vmx;
 
 pub use asm::{halt_forever, disable_interrupts, enable_interrupts, cas128, patch_word};
 pub use cpuid::Features;
