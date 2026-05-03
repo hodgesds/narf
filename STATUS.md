@@ -18,7 +18,7 @@ asks for. Updated when observable kernel behaviour changes.
   delivers hardware LAPIC-timer IRQs, exits cleanly.
 - `cargo xtask run --arch=aarch64` boots, runs the full async demo
   using CNTPCT_EL0 as the clock, exits via ARM semihosting.
-- `cargo xtask test --arch=x86_64` passes **588/0/29** (pass / fail / skip).
+- `cargo xtask test --arch=x86_64` passes **592/0/29** (pass / fail / skip).
 - `cargo xtask test --arch=aarch64` passes **298/0/10** (pass / fail / skip).
   Skips are x86_64-specific PCIe surfaces or live-device tests that
   skip cleanly when QEMU doesn't expose the device.
@@ -80,6 +80,10 @@ asks for. Updated when observable kernel behaviour changes.
 | SGX caps (Intel) | CPUID(0x12, 0/1/N) → `SgxCaps { sgx1, sgx2, miscselect, max_size_64, max_size_32, epc_sections }`. Spec: `arch/specification/virt-confidential.md` §3. |
 | Confidential guest | TDX (CPUID(0x21, 0) signature) + SEV / SEV-ES / SEV-SNP (`MSR_AMD64_SEV` 0xC0010131) detection → `ConfidentialEnvironment { Bare, TdxGuest, SevGuest, SevEsGuest, SevSnpGuest }`. Spec: `arch/specification/virt-confidential.md` §4. |
 | ASID/PCID isolation | Per-domain page-table root (`memory::per_domain_root`) registers each domain's PML4 (mirrored to `pcid::set_domain_pml4`) at boot. Generation-tagged ASID/PCID allocator (`memory::asid_alloc`). Selective TLB invalidation (INVPCID 0/1/2/3 + `TLBI ASIDE1IS` / `VAE1IS`). Cross-CPU shootdown wired through `narf_interrupts::install_tlb_shootdown_bridge`: x86_64 fans out via existing `ipi::shoot_range` (vector 0xF0), aarch64 broadcasts SGI_TLB_SHOOTDOWN. Spec: `memory/specification/asid-pcid-isolation.md`. |
+| Hypervisor detection | CPUID(1).ECX[31] gate + CPUID(0x40000000) signature decode → `Hypervisor { None, Kvm, HyperV, Xen, VMware, QemuTcg, Bhyve, Parallels, Other }` + KVM feature bitmap + Hyper-V version/recommendations. Spec: `arch/specification/modern-cpu.md` §1. |
+| XSAVE state      | CPUID(0x0D, 0/1/N) decode → `XsaveCaps { xcr0_supported, xss_supported, area_size, avx, avx512, amx, pkru, ... }`, XCR0 / IA32_XSS read+write, `enable_default()` boot policy, `xsave` / `xrstor` instruction wrappers. Spec: `arch/specification/modern-cpu.md` §2. |
+| WAITPKG          | CPUID(7,0).ECX[5] gate, `IA32_UMWAIT_CONTROL` (0xE1) configuration, `umonitor` / `umwait` / `tpause` instruction wrappers with monitor-fired vs timeout return. Spec: `arch/specification/modern-cpu.md` §3. |
+| AMD SMCA         | CPUID(0x80000007).EBX[3] gate + per-bank extended MSRs at `0xC0002000+` (CONFIG / IPID / SYND / DESTAT / MISC0) + `SmcaBankInfo` decoder + `BankType` enum (LS / IF / L2 / DE / EX / FP / L3 / MP5 / SMU / PB / UMC / PCIe). Spec: `arch/specification/modern-cpu.md` §4. |
 | iwlwifi          | Intel Wi-Fi 6 / 6E (AX200 / AX201 / AX210 / AX211). **Structural probe only** — PCI match table + spec doc. Operational register map (CSR/PRPH offsets, firmware loader, TFD/RBD descriptors, host-command opcodes) is not in any public Intel doc; further stages blocked on public register docs. See `drivers/net/specification/iwlwifi.md`. |
 | AHCI (ICH9/10)   | HBA bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT. |
 | xHCI USB host    | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT. |

@@ -578,3 +578,70 @@ fn smoke_confidential_detect() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("arch/confidential", smoke_confidential_detect);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_hypervisor_detect() -> TestResult {
+    use crate::x86_64::hypervisor::{detect, signature, Hypervisor};
+    let hv = detect();
+    // QEMU TCG advertises `TCGTCGTCGTCG`; KVM advertises
+    // `KVMKVMKVM`. Either is acceptable; bare metal returns None.
+    if hv != Hypervisor::None {
+        let s = signature();
+        if s.is_none() {
+            return TestResult::Fail("hypervisor present but no signature");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/hypervisor", smoke_hypervisor_detect);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_xsave_caps_decode() -> TestResult {
+    use crate::x86_64::xsave;
+    let c = xsave::caps();
+    // x87 + SSE bits must be set on every x86_64 CPU.
+    if c.xcr0_supported & xsave::XSAVE_X87 == 0 {
+        return TestResult::Fail("x87 bit missing in XCR0_supported");
+    }
+    if c.xcr0_supported & xsave::XSAVE_SSE == 0 {
+        return TestResult::Fail("SSE bit missing in XCR0_supported");
+    }
+    if c.area_size_xcr0 == 0 {
+        return TestResult::Fail("area_size_xcr0 = 0");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/xsave", smoke_xsave_caps_decode);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_waitpkg_supported_path() -> TestResult {
+    use crate::x86_64::waitpkg;
+    // Just verify the gate doesn't panic; QEMU TCG default `-cpu`
+    // doesn't advertise WAITPKG.
+    let _ = waitpkg::supported();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/waitpkg", smoke_waitpkg_supported_path);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_smca_supported_path() -> TestResult {
+    use crate::x86_64::smca;
+    let _ = smca::supported();
+    // Decode helper is data-only; verify it compiles + runs.
+    //   bits[15:0]  = 0x0042 = instance_id
+    //   bits[31:16] = 0xBEEF = hardware_id
+    //   bits[47:44] = 0x7    = mca_type → bits[47:32] = 0x7000
+    let info = smca::SmcaBankInfo::decode(0x0000_7000_BEEF_0042);
+    if info.instance_id != 0x0042
+        || info.hardware_id != 0xBEEF
+        || info.mca_type != 0x07
+    {
+        return TestResult::Fail("SmcaBankInfo decode misaligned");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/smca", smoke_smca_supported_path);

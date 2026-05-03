@@ -65,7 +65,7 @@ intra-address-space isolation.
   framekernel's domain model.
 - **Verification and observability are first-class.** A kernel-resident
   test harness (`cargo xtask test`) boots the real kernel under QEMU and
-  asserts on live invariants — 588 smokes on x86_64, 292 on aarch64 at
+  asserts on live invariants — 592 smokes on x86_64, 292 on aarch64 at
   time of writing — alongside USDT-style probes, flight-recorder rings, a
   PMU-sampling surface, and an ABI promise (syscall numbers carry an upper
   8-bit version, `relibc` will gate against it). Bugs are caught at the
@@ -416,9 +416,41 @@ Live from boot through `cargo xtask run`:
   and `TLBI ASIDE1IS` / `TLBI VAE1IS` on aarch64
   (`narf_arch::aarch64::sysreg::tlbi_*`). The
   `narf_memory::tlb_shootdown::shootdown(req)` cross-CPU
-  shootdown surface dispatches locally today; the peer-IPI
-  fan-out becomes real once SMP bring-up wires APs. Spec:
+  shootdown is wired through
+  `narf_interrupts::install_tlb_shootdown_bridge` to fan out via
+  the existing IPI infra (x86_64: vector 0xF0 + per-CPU pending
+  state; aarch64: `SGI_TLB_SHOOTDOWN`). Spec:
   `memory/specification/asid-pcid-isolation.md`.
+- Hypervisor detection (`narf_arch::x86_64::hypervisor`):
+  CPUID(1).ECX[31] gate + CPUID(0x40000000) 12-byte signature
+  decode → `Hypervisor { None, Kvm, HyperV, Xen, VMware,
+  QemuTcg, Bhyve, Parallels, Other }`. KVM feature bitmap from
+  CPUID(0x40000001).EAX, Hyper-V version + recommendations
+  from 0x40000002 / 0x40000004. Spec:
+  `arch/specification/modern-cpu.md` §1.
+- XSAVE state management (`narf_arch::x86_64::xsave`): per SDM
+  Vol 1 §13. CPUID(0x0D, 0/1/N) decode for XCR0/XSS supported
+  bits, area size, per-component feature flags (XSAVEOPT /
+  XSAVEC / XSAVES, AVX / AVX-512 / AMX / PKRU classification).
+  XGETBV/XSETBV-based `read_xcr0` / `write_xcr0`, MSR-based
+  `read_xss` / `write_xss`, `enable_default()` boot policy,
+  `xsave` / `xrstor` instruction wrappers. Spec:
+  `arch/specification/modern-cpu.md` §2.
+- WAITPKG (`narf_arch::x86_64::waitpkg`): per SDM Vol 2.
+  CPUID(7, 0).ECX[5] gate, `IA32_UMWAIT_CONTROL` (0xE1)
+  config + `umonitor` / `umwait` / `tpause` instruction
+  wrappers; latter two return `true` if the monitor fired
+  before the deadline. Spec:
+  `arch/specification/modern-cpu.md` §3.
+- AMD SMCA (`narf_arch::x86_64::smca`): Scalable MCA per AMD
+  APM Vol 2 + BKDG. CPUID(0x80000007).EBX[3] gate, per-bank
+  extended registers at `0xC0002000 + 16*i + offset` (CONFIG /
+  IPID / SYND / DESTAT / MISC0) read + decoded into
+  `SmcaBankInfo { instance_id, hardware_id, mca_type }` +
+  `BankType` enum (LS, IF, L2, DE, EX, FP, L3, MP5, SMU, PB,
+  UMC, PCIe). Augments the legacy MCA decode in `mce` for
+  Zen+ silicon. Spec:
+  `arch/specification/modern-cpu.md` §4.
 - Intel HD Audio (HDA): clean-room driver for the AMD Ryzen /
   Phoenix and Radeon HD Audio Controllers — BAR0 mapping, GCTL
   reset, CORB/RIRB ring DMA, STATESTS codec walk, Get Parameter
@@ -442,7 +474,7 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **588/0/29** smokes;
+`cargo xtask test --arch=x86_64` passes **592/0/29** smokes;
 `--arch=aarch64` passes **298/0/10**. Skips are x86-specific PCIe
 surfaces or live-device tests that skip cleanly when QEMU doesn't
 expose the device. See `STATUS.md` for the full tally and per-
