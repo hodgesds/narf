@@ -18,8 +18,8 @@ asks for. Updated when observable kernel behaviour changes.
   delivers hardware LAPIC-timer IRQs, exits cleanly.
 - `cargo xtask run --arch=aarch64` boots, runs the full async demo
   using CNTPCT_EL0 as the clock, exits via ARM semihosting.
-- `cargo xtask test --arch=x86_64` passes **592/0/29** (pass / fail / skip).
-- `cargo xtask test --arch=aarch64` passes **298/0/10** (pass / fail / skip).
+- `cargo xtask test --arch=x86_64` passes **595/0/29** (pass / fail / skip).
+- `cargo xtask test --arch=aarch64` passes **301/0/10** (pass / fail / skip).
   Skips are x86_64-specific PCIe surfaces or live-device tests that
   skip cleanly when QEMU doesn't expose the device.
 - In-tree PCIe drivers running against real QEMU-emulated devices.
@@ -84,6 +84,12 @@ asks for. Updated when observable kernel behaviour changes.
 | XSAVE state      | CPUID(0x0D, 0/1/N) decode → `XsaveCaps { xcr0_supported, xss_supported, area_size, avx, avx512, amx, pkru, ... }`, XCR0 / IA32_XSS read+write, `enable_default()` boot policy, `xsave` / `xrstor` instruction wrappers. Spec: `arch/specification/modern-cpu.md` §2. |
 | WAITPKG          | CPUID(7,0).ECX[5] gate, `IA32_UMWAIT_CONTROL` (0xE1) configuration, `umonitor` / `umwait` / `tpause` instruction wrappers with monitor-fired vs timeout return. Spec: `arch/specification/modern-cpu.md` §3. |
 | AMD SMCA         | CPUID(0x80000007).EBX[3] gate + per-bank extended MSRs at `0xC0002000+` (CONFIG / IPID / SYND / DESTAT / MISC0) + `SmcaBankInfo` decoder + `BankType` enum (LS / IF / L2 / DE / EX / FP / L3 / MP5 / SMU / PB / UMC / PCIe). Spec: `arch/specification/modern-cpu.md` §4. |
+| aarch64 PAC      | `ID_AA64ISAR1` / `ID_AA64ISAR2` decode → `PacCaps { address_auth, generic_auth, enhanced }`. Per-key writers (APIA/APIB/APDA/APDB/APGA) using raw `S3_0_C2_*` MSR encoding. `enable_keys(ia, ib, da, db)` flips SCTLR_EL1 enable bits. Spec: `arch/specification/cpu-security.md` §1. |
+| aarch64 BTI      | `ID_AA64PFR1_EL1.BT` detection. Page-flag plumbing for the GP bit lives in `memory/`. Spec: `arch/specification/cpu-security.md` §2. |
+| aarch64 SSBS     | `ID_AA64PFR1_EL1.SSBS` detection + `enable()` / `disable()` flipping PSTATE.SSBS via raw `.inst` encoding. Spec: `arch/specification/cpu-security.md` §3. |
+| Intel LAM        | CPUID(7, 1).EAX[26] gate + CR3.LAM_U48 / LAM_U57 + CR4.LAM_SUP enable. Spec: `arch/specification/cpu-security.md` §4. |
+| Intel UINTR      | CPUID(7, 0).EDX[5] gate + `IA32_UINTR_HANDLER` / `PD` / `STACKADJUST` / `MISC` / `RR` / `TT` MSR programming + `senduipi` / `clui` / `stui` / `testui` instruction wrappers. Spec: `arch/specification/cpu-security.md` §5. |
+| Intel KeyLocker  | CPUID(7, 0).ECX[23] gate + CPUID(0x19, 0).EAX bitmap decode. Spec: `arch/specification/cpu-security.md` §6. |
 | iwlwifi          | Intel Wi-Fi 6 / 6E (AX200 / AX201 / AX210 / AX211). **Structural probe only** — PCI match table + spec doc. Operational register map (CSR/PRPH offsets, firmware loader, TFD/RBD descriptors, host-command opcodes) is not in any public Intel doc; further stages blocked on public register docs. See `drivers/net/specification/iwlwifi.md`. |
 | AHCI (ICH9/10)   | HBA bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT. |
 | xHCI USB host    | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT. |

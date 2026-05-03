@@ -645,3 +645,65 @@ fn smoke_smca_supported_path() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("arch/smca", smoke_smca_supported_path);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_lam_supported_path() -> TestResult {
+    use crate::x86_64::lam;
+    let _ = lam::supported();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/lam", smoke_lam_supported_path);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_uintr_supported_path() -> TestResult {
+    use crate::x86_64::uintr;
+    let _ = uintr::supported();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/uintr", smoke_uintr_supported_path);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_keylocker_caps() -> TestResult {
+    use crate::x86_64::keylocker;
+    let s = keylocker::supported();
+    let c = keylocker::caps();
+    if !s && c != 0 {
+        return TestResult::Fail("KL caps non-zero with supported = false");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/keylocker", smoke_keylocker_caps);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_pac_caps() -> TestResult {
+    use crate::aarch64::pac;
+    let c = pac::caps();
+    let _ = (c.address_auth, c.generic_auth, c.enhanced);
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/pac", smoke_pac_caps);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_bti_caps() -> TestResult {
+    use crate::aarch64::bti;
+    let _ = bti::caps();
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/bti", smoke_bti_caps);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_ssbs_caps() -> TestResult {
+    use crate::aarch64::ssbs;
+    let v = ssbs::caps();
+    if v > 3 {
+        return TestResult::Fail("SSBS field > 3 (architectural max)");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/ssbs", smoke_ssbs_caps);

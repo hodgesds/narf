@@ -1,11 +1,14 @@
 //! aarch64 arch backend.
 
 pub mod asm;
+pub mod bti;
 pub mod cpu;
 pub mod cpuid;
 pub mod mmio;
 pub mod mte;
+pub mod pac;
 pub mod psci;
+pub mod ssbs;
 pub mod sysreg;
 pub mod timer;
 
