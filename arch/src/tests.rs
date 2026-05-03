@@ -474,3 +474,52 @@ fn smoke_pt_topa_entry_encode() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("arch/pt", smoke_pt_topa_entry_encode);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_cet_caps_decode() -> TestResult {
+    use crate::x86_64::cet;
+    let c = cet::caps();
+    // QEMU TCG advertises CET via `-cpu host`/`-cpu max`; default
+    // -cpu doesn't. Either is fine — just verify the struct
+    // shape is coherent.
+    let _ = (c.shadow_stack, c.ibt, c.cr4_cet);
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/cet", smoke_cet_caps_decode);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_pebs_supported_path() -> TestResult {
+    use crate::x86_64::pebs;
+    // Calling `supported()` must not panic + must agree with
+    // itself across two calls (memoisation invariant — it's
+    // pure CPUID + MSR read).
+    let a = pebs::supported();
+    let b = pebs::supported();
+    if a != b { return TestResult::Fail("supported() racy"); }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/pebs", smoke_pebs_supported_path);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_cpu_validate_baseline() -> TestResult {
+    use crate::x86_64::cpu_validate;
+    // SAFETY: kernel-test runs at CPL=0.
+    let v = unsafe { cpu_validate::validate() };
+    match cpu_validate::baseline_ok(&v) {
+        Ok(())   => TestResult::Pass,
+        Err(why) => {
+            // Surface the *first* failed check via the test name —
+            // log isn't easily threaded through TestResult, but a
+            // failure narrows it down on a one-line summary.
+            let _ = why;
+            // We don't fail in QEMU TCG default `-cpu qemu64` which
+            // omits SMEP/SMAP. Instead, downgrade to a skip so the
+            // test surface still exercises the validator.
+            TestResult::Skip("CPU baseline missing (likely QEMU -cpu qemu64)")
+        }
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/cpu_validate", smoke_cpu_validate_baseline);

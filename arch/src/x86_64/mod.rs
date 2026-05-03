@@ -2,7 +2,9 @@
 
 pub mod acpi;
 pub mod asm;
+pub mod cet;
 pub mod cpu;
+pub mod cpu_validate;
 pub mod cpuid;
 pub mod cr;
 pub mod hfi;
@@ -13,6 +15,7 @@ pub mod microcode;
 pub mod msr;
 pub mod mtrr;
 pub mod pcid;
+pub mod pebs;
 pub mod pit;
 pub mod pks;
 pub mod pmu;

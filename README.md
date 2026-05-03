@@ -65,7 +65,7 @@ intra-address-space isolation.
   framekernel's domain model.
 - **Verification and observability are first-class.** A kernel-resident
   test harness (`cargo xtask test`) boots the real kernel under QEMU and
-  asserts on live invariants — 577 smokes on x86_64, 292 on aarch64 at
+  asserts on live invariants — 579 smokes on x86_64, 292 on aarch64 at
   time of writing — alongside USDT-style probes, flight-recorder rings, a
   PMU-sampling surface, and an ABI promise (syscall numbers carry an upper
   8-bit version, `relibc` will gate against it). Bugs are caught at the
@@ -359,6 +359,26 @@ Live from boot through `cargo xtask run`:
   with branch-trace + ToPA + per-ring filter; `output_offset` +
   `status` surface ring progress to userspace decoders. Spec:
   `observability/specification/perfmon.md` §3.
+- CET (`narf_arch::x86_64::cet`): Control-flow Enforcement per
+  SDM Vol 1 §17.2. Shadow-stack (CPUID(7,0).ECX[7]) and IBT
+  (CPUID(7,0).EDX[20]) gates, CR4.CET global enable,
+  `IA32_S_CET` / `IA32_U_CET` per-ring config (SH_STK_EN +
+  WR_SHSTK_EN + ENDBR_EN + NO_TRACK_EN), `IA32_PL0_SSP` /
+  `IA32_PL3_SSP` shadow-stack pointer access. Spec:
+  `arch/specification/security-hardening.md` §1.
+- PEBS (`narf_arch::x86_64::pebs`): Precise Event-Based
+  Sampling per SDM Vol 3 §19.6. CPUID + `IA32_MISC_ENABLE.bit12`
+  gate, DS save-area install (BTS/PEBS pointer block at
+  offsets 0x20..0x40), `MSR_PEBS_ENABLE` per-counter mask, +
+  a `PebsBuffer::skylake_basic` constructor for 192-byte
+  records. Spec: `arch/specification/security-hardening.md` §2.
+- Boot CPU validation (`narf_arch::x86_64::cpu_validate`):
+  probes CPUID (Long Mode, RDTSCP, Invariant TSC, NX, SMEP,
+  SMAP, UMIP, FSGSBASE, PCID, x2APIC, XSAVE) + CR4 (PAE / PGE /
+  OSFXSR / OSXSAVE / SMEP / SMAP / UMIP / FSGSBASE) + EFER
+  (LME / NXE) actually-on bits. `baseline_ok(&v)` returns
+  `Err(reason)` for the first hard-required miss. Spec:
+  `arch/specification/security-hardening.md` §3.
 - Intel HD Audio (HDA): clean-room driver for the AMD Ryzen /
   Phoenix and Radeon HD Audio Controllers — BAR0 mapping, GCTL
   reset, CORB/RIRB ring DMA, STATESTS codec walk, Get Parameter
@@ -382,7 +402,7 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **577/0/28** smokes;
+`cargo xtask test --arch=x86_64` passes **579/0/29** smokes;
 `--arch=aarch64` passes **294/0/10**. Skips are x86-specific PCIe
 surfaces or live-device tests that skip cleanly when QEMU doesn't
 expose the device. See `STATUS.md` for the full tally and per-

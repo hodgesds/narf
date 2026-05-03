@@ -18,7 +18,7 @@ asks for. Updated when observable kernel behaviour changes.
   delivers hardware LAPIC-timer IRQs, exits cleanly.
 - `cargo xtask run --arch=aarch64` boots, runs the full async demo
   using CNTPCT_EL0 as the clock, exits via ARM semihosting.
-- `cargo xtask test --arch=x86_64` passes **577/0/28** (pass / fail / skip).
+- `cargo xtask test --arch=x86_64` passes **579/0/29** (pass / fail / skip).
 - `cargo xtask test --arch=aarch64` passes **294/0/10** (pass / fail / skip).
   Skips are x86_64-specific PCIe surfaces or live-device tests that
   skip cleanly when QEMU doesn't expose the device.
@@ -72,6 +72,9 @@ asks for. Updated when observable kernel behaviour changes.
 | PMU (architectural) | CPUID(0xA) caps + `IA32_PERFEVTSELi` / `IA32_PMCi` / fixed counters + `IA32_PERF_GLOBAL_CTRL` / `STATUS` / `OVF_CTRL`. Pre-baked architectural events (cycles / instr / LLC / branch). Spec: `observability/specification/perfmon.md` §1. |
 | LBR              | Last Branch Records — model-classified ring depth (4/8/16/32), `MSR_LBR_SELECT` filter, Skylake+ MSR base (0x680/0x6C0) with legacy fallback (0x40/0x60), `enable` / `disable` / `read_pair(idx)` / `read_tos`. Spec: `observability/specification/perfmon.md` §2. |
 | Intel PT         | Processor Trace — CPUID(0x14) caps decode, `topa_entry` builder + single-entry ToPA installation, `enable(os, usr)` with `IA32_RTIT_CTL` + branch filter, `output_offset` / `status` for diagnostics. Spec: `observability/specification/perfmon.md` §3. |
+| CET (Control-flow Enforcement) | Shadow stack (`CPUID(7,0).ECX[7]`) + IBT (`CPUID(7,0).EDX[20]`) gate, `enable_supervisor` / `enable_user` MSR programming, `IA32_PL0_SSP` access, CR4.CET enable. Spec: `arch/specification/security-hardening.md` §1. |
+| PEBS             | Precise Event-Based Sampling — DS save area install + per-counter PEBS enable + Skylake basic-record buffer builder. Spec: `arch/specification/security-hardening.md` §2. |
+| Boot CPU validation | CPUID + CR4 + EFER probe surfaced as `CpuValidation { long_mode, rdtscp, invariant_tsc, nx, smep, smap, umip, wrgsbase, pcid, x2apic, xsave, ... }` + `baseline_ok` guard. Spec: `arch/specification/security-hardening.md` §3. |
 | iwlwifi          | Intel Wi-Fi 6 / 6E (AX200 / AX201 / AX210 / AX211). **Structural probe only** — PCI match table + spec doc. Operational register map (CSR/PRPH offsets, firmware loader, TFD/RBD descriptors, host-command opcodes) is not in any public Intel doc; further stages blocked on public register docs. See `drivers/net/specification/iwlwifi.md`. |
 | AHCI (ICH9/10)   | HBA bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT. |
 | xHCI USB host    | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT. |
