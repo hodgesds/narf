@@ -18,8 +18,8 @@ asks for. Updated when observable kernel behaviour changes.
   delivers hardware LAPIC-timer IRQs, exits cleanly.
 - `cargo xtask run --arch=aarch64` boots, runs the full async demo
   using CNTPCT_EL0 as the clock, exits via ARM semihosting.
-- `cargo xtask test --arch=x86_64` passes **671/0/29** (pass / fail / skip).
-- `cargo xtask test --arch=aarch64` passes **376/0/10** (pass / fail / skip).
+- `cargo xtask test --arch=x86_64` passes **672/0/29** (pass / fail / skip).
+- `cargo xtask test --arch=aarch64` passes **377/0/10** (pass / fail / skip).
   Skips are x86_64-specific PCIe surfaces or live-device tests that
   skip cleanly when QEMU doesn't expose the device.
 - In-tree PCIe drivers running against real QEMU-emulated devices.
@@ -183,7 +183,7 @@ asks for. Updated when observable kernel behaviour changes.
 | ACPI PHAT        | Platform Health Assessment — Type 1 (Health Data) → `PhatHealthRecord { am_healthy, device_guid }`. Spec: `acpi/specification/tables-tcpa-mchi-phat-stao-uefi.md` §3. |
 | ACPI StAO        | Status Override — `StaoInfo { ignore_uart }`. Spec: `acpi/specification/tables-tcpa-mchi-phat-stao-uefi.md` §4. |
 | ACPI UEFI        | UEFI ACPI Data Table — `UefiTableInfo { identifier, data_offset }`. Spec: `acpi/specification/tables-tcpa-mchi-phat-stao-uefi.md` §5. |
-| SMBIOS / DMI     | Entry-point-agnostic structure-stream parser → Type 0 (BIOS), Type 1 (System), Type 2 (Baseboard), Type 4 (Processor), Type 17 (Memory Device). Skips unknown types. Spec: `firmware/smbios/specification/spec.md`. |
+| SMBIOS / DMI     | Entry-point-agnostic structure-stream parser. **Full SMBIOS 3.x type coverage** — Types 0..46 decoded into per-type accessors (`copy_*` / `*_info`), plus 5/6/10 walked-but-deprecated, 126 counted, 127 terminating. 47 distinct decoder functions; full-dispatch coverage smoke pushes one of every supported type and confirms each accessor surfaces it. Spec: `firmware/smbios/specification/spec.md`. |
 | iwlwifi          | Intel Wi-Fi 6 / 6E (AX200 / AX201 / AX210 / AX211). **Structural probe only** — PCI match table + spec doc. Operational register map (CSR/PRPH offsets, firmware loader, TFD/RBD descriptors, host-command opcodes) is not in any public Intel doc; further stages blocked on public register docs. See `drivers/net/specification/iwlwifi.md`. |
 | AHCI (ICH9/10)   | HBA bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT. |
 | xHCI USB host    | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT. |

@@ -6,11 +6,41 @@ Locates the SMBIOS entry point, walks the structure stream
 referenced by it, and decodes the most-useful fixed-size
 records:
 
-  * **Type 0** — BIOS Information.
-  * **Type 1** — System Information.
-  * **Type 2** — Baseboard.
-  * **Type 4** — Processor Information.
-  * **Type 17** — Memory Device.
+Every SMBIOS structure type defined by the v3.x specification is
+decoded:
+
+  * **0** BIOS Information, **1** System, **2** Baseboard,
+    **3** Chassis, **4** Processor.
+  * **5** / **6** / **10** are deprecated by SMBIOS 3 and walked
+    but not decoded.
+  * **7** Cache, **8** Port Connector, **9** System Slot.
+  * **11** OEM Strings, **12** System Config Options,
+    **13** BIOS Language, **14** Group Associations,
+    **15** System Event Log.
+  * **16** Physical Memory Array, **17** Memory Device,
+    **18** 32-bit Memory Error Information,
+    **19** Memory Array Mapped Address,
+    **20** Memory Device Mapped Address.
+  * **21** Built-in Pointing Device, **22** Portable Battery,
+    **23** System Reset, **24** Hardware Security,
+    **25** System Power Controls.
+  * **26** Voltage Probe, **27** Cooling Device,
+    **28** Temperature Probe, **29** Electrical Current Probe.
+  * **30** Out-of-Band Remote Access,
+    **31** Boot Integrity Services (BIS).
+  * **32** System Boot Information.
+  * **33** 64-bit Memory Error Information.
+  * **34** Management Device, **35** Management Device Component,
+    **36** Management Device Threshold Data.
+  * **37** Memory Channel, **38** IPMI Device, **39** System
+    Power Supply.
+  * **40** Additional Information, **41** Onboard Devices
+    Extended, **42** Management Controller Host Interface.
+  * **43** TPM Device, **44** Processor Additional Information.
+  * **45** Firmware Inventory Information,
+    **46** String Property.
+  * **126** Inactive (counted, not decoded).
+  * **127** End-of-Table (terminates the walk).
 
 Other record types are skipped over but their lengths +
 trailing string pools are still walked so the parser stays in

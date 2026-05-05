@@ -4,8 +4,20 @@ use alloc::vec::Vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::{
-    self as smbios, SmbiosBaseboard, SmbiosBios, SmbiosMemoryDevice,
-    SmbiosProcessor, SmbiosSystem,
+    self as smbios, SmbiosAdditionalInfo, SmbiosBaseboard, SmbiosBattery,
+    SmbiosBios, SmbiosBiosLanguage, SmbiosBis, SmbiosBootInfo, SmbiosCache,
+    SmbiosChassis, SmbiosCoolingDevice, SmbiosCurrentProbe, SmbiosEventLog,
+    SmbiosFirmwareInventory, SmbiosGroupAssoc, SmbiosHwSecurity,
+    SmbiosIpmiDevice, SmbiosMemoryArrayAddr, SmbiosMemoryChannel,
+    SmbiosMemoryDevice, SmbiosMemoryDeviceAddr, SmbiosMemoryError32,
+    SmbiosMemoryError64, SmbiosMgmtCtrlHci, SmbiosMgmtDevice,
+    SmbiosMgmtDeviceComponent, SmbiosMgmtDeviceThreshold, SmbiosOemStrings,
+    SmbiosOnboardExt, SmbiosPhysicalMemoryArray, SmbiosPointingDevice,
+    SmbiosPortConnector, SmbiosPowerSupply, SmbiosProcessor,
+    SmbiosProcessorAdditional, SmbiosRemoteAccess, SmbiosStringProperty,
+    SmbiosSystem, SmbiosSystemConfig, SmbiosSystemPowerControls,
+    SmbiosSystemReset, SmbiosSystemSlot, SmbiosTemperatureProbe,
+    SmbiosTpmDevice, SmbiosVoltageProbe,
 };
 
 fn smoke_smbios_bios_record() -> TestResult {
@@ -270,3 +282,142 @@ fn smoke_smbios_skips_unknown() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("firmware/smbios", smoke_smbios_skips_unknown);
+
+/// Helper: append a fixed-size structure with no string pool.
+fn push_minimal(buf: &mut Vec<u8>, kind: u8, fixed_len: u8) {
+    let entry_start = buf.len();
+    buf.push(kind);
+    buf.push(fixed_len);
+    buf.extend_from_slice(&0u16.to_le_bytes());           // handle
+    while buf.len() - entry_start < fixed_len as usize {
+        buf.push(0);
+    }
+    buf.push(0); buf.push(0);                             // empty pool
+}
+
+fn smoke_smbios_full_dispatch_coverage() -> TestResult {
+    // Push one minimal entry of every supported type, then verify
+    // the corresponding `is/copy` accessor sees ≥ 1 result.
+    let mut buf: Vec<u8> = Vec::new();
+    push_minimal(&mut buf, 3,  20);                       // chassis
+    push_minimal(&mut buf, 7,  19);                       // cache
+    push_minimal(&mut buf, 8,  9);                        // port
+    push_minimal(&mut buf, 9,  17);                       // slot
+    push_minimal(&mut buf, 11, 5);                        // OEM strings
+    push_minimal(&mut buf, 12, 5);                        // sys config
+    push_minimal(&mut buf, 13, 22);                       // BIOS language
+    push_minimal(&mut buf, 14, 5);                        // group assoc
+    push_minimal(&mut buf, 15, 17);                       // event log
+    push_minimal(&mut buf, 16, 23);                       // physical mem array
+    push_minimal(&mut buf, 18, 23);                       // mem err 32
+    push_minimal(&mut buf, 19, 31);                       // mem array addr
+    push_minimal(&mut buf, 20, 35);                       // mem device addr
+    push_minimal(&mut buf, 21, 7);                        // pointing
+    push_minimal(&mut buf, 22, 26);                       // battery
+    push_minimal(&mut buf, 23, 13);                       // sys reset
+    push_minimal(&mut buf, 24, 5);                        // hw security
+    push_minimal(&mut buf, 25, 9);                        // sys power ctrl
+    push_minimal(&mut buf, 26, 20);                       // voltage probe
+    push_minimal(&mut buf, 27, 15);                       // cooling
+    push_minimal(&mut buf, 28, 20);                       // temp probe
+    push_minimal(&mut buf, 29, 20);                       // current probe
+    push_minimal(&mut buf, 30, 6);                        // remote access
+    push_minimal(&mut buf, 31, 18);                       // BIS
+    push_minimal(&mut buf, 32, 11);                       // boot info
+    push_minimal(&mut buf, 33, 31);                       // mem err 64
+    push_minimal(&mut buf, 34, 11);                       // mgmt device
+    push_minimal(&mut buf, 35, 11);                       // mgmt device component
+    push_minimal(&mut buf, 36, 16);                       // mgmt device threshold
+    push_minimal(&mut buf, 37, 7);                        // mem channel
+    push_minimal(&mut buf, 38, 18);                       // IPMI
+    push_minimal(&mut buf, 39, 22);                       // power supply
+    push_minimal(&mut buf, 40, 5);                        // additional info
+    push_minimal(&mut buf, 41, 11);                       // onboard ext
+    push_minimal(&mut buf, 42, 6);                        // mgmt ctrl HCI
+    push_minimal(&mut buf, 43, 32);                       // TPM
+    push_minimal(&mut buf, 44, 7);                        // proc addl
+    push_minimal(&mut buf, 45, 24);                       // FW inventory
+    push_minimal(&mut buf, 46, 9);                        // string property
+    push_minimal(&mut buf, 126, 4);                       // inactive
+    push_minimal(&mut buf, 127, 4);                       // end-of-table
+
+    smbios::parse_stream(&buf);
+
+    let mut chassis = [SmbiosChassis::ZERO; 1];
+    if smbios::copy_chassis(&mut chassis) != 1 { return TestResult::Fail("type 3"); }
+    let mut caches = [SmbiosCache::ZERO; 1];
+    if smbios::copy_caches(&mut caches) != 1 { return TestResult::Fail("type 7"); }
+    let mut ports = [SmbiosPortConnector::ZERO; 1];
+    if smbios::copy_port_connectors(&mut ports) != 1 { return TestResult::Fail("type 8"); }
+    let mut slots = [SmbiosSystemSlot::ZERO; 1];
+    if smbios::copy_system_slots(&mut slots) != 1 { return TestResult::Fail("type 9"); }
+    if smbios::oem_strings().is_none() { return TestResult::Fail("type 11"); }
+    if smbios::system_config().is_none() { return TestResult::Fail("type 12"); }
+    let mut bl = [SmbiosBiosLanguage::ZERO; 1];
+    if smbios::copy_bios_language(&mut bl) != 1 { return TestResult::Fail("type 13"); }
+    let mut ga = [SmbiosGroupAssoc::ZERO; 1];
+    if smbios::copy_group_assoc(&mut ga) != 1 { return TestResult::Fail("type 14"); }
+    let mut el = [SmbiosEventLog::ZERO; 1];
+    if smbios::copy_event_log(&mut el) != 1 { return TestResult::Fail("type 15"); }
+    let mut pma = [SmbiosPhysicalMemoryArray::ZERO; 1];
+    if smbios::copy_physical_memory_arrays(&mut pma) != 1 { return TestResult::Fail("type 16"); }
+    let mut me32 = [SmbiosMemoryError32::ZERO; 1];
+    if smbios::copy_memory_error32(&mut me32) != 1 { return TestResult::Fail("type 18"); }
+    let mut maa = [SmbiosMemoryArrayAddr::ZERO; 1];
+    if smbios::copy_memory_array_addrs(&mut maa) != 1 { return TestResult::Fail("type 19"); }
+    let mut mda = [SmbiosMemoryDeviceAddr::ZERO; 1];
+    if smbios::copy_memory_device_addrs(&mut mda) != 1 { return TestResult::Fail("type 20"); }
+    let mut pd = [SmbiosPointingDevice::ZERO; 1];
+    if smbios::copy_pointing_devices(&mut pd) != 1 { return TestResult::Fail("type 21"); }
+    let mut bat = [SmbiosBattery::ZERO; 1];
+    if smbios::copy_batteries(&mut bat) != 1 { return TestResult::Fail("type 22"); }
+    let mut sr = [SmbiosSystemReset::ZERO; 1];
+    if smbios::copy_system_reset(&mut sr) != 1 { return TestResult::Fail("type 23"); }
+    if smbios::hw_security().is_none() { return TestResult::Fail("type 24"); }
+    if smbios::system_power_controls().is_none() { return TestResult::Fail("type 25"); }
+    let mut vp = [SmbiosVoltageProbe::ZERO; 1];
+    if smbios::copy_voltage_probes(&mut vp) != 1 { return TestResult::Fail("type 26"); }
+    let mut cd = [SmbiosCoolingDevice::ZERO; 1];
+    if smbios::copy_cooling_devices(&mut cd) != 1 { return TestResult::Fail("type 27"); }
+    let mut tp = [SmbiosTemperatureProbe::ZERO; 1];
+    if smbios::copy_temperature_probes(&mut tp) != 1 { return TestResult::Fail("type 28"); }
+    let mut cp = [SmbiosCurrentProbe::ZERO; 1];
+    if smbios::copy_current_probes(&mut cp) != 1 { return TestResult::Fail("type 29"); }
+    if smbios::remote_access().is_none() { return TestResult::Fail("type 30"); }
+    if smbios::bis().is_none() { return TestResult::Fail("type 31"); }
+    let mut bi = [SmbiosBootInfo::ZERO; 1];
+    if smbios::copy_boot_info(&mut bi) != 1 { return TestResult::Fail("type 32"); }
+    let mut me64 = [SmbiosMemoryError64::ZERO; 1];
+    if smbios::copy_memory_error64(&mut me64) != 1 { return TestResult::Fail("type 33"); }
+    let mut md = [SmbiosMgmtDevice::ZERO; 1];
+    if smbios::copy_mgmt_devices(&mut md) != 1 { return TestResult::Fail("type 34"); }
+    let mut mdc = [SmbiosMgmtDeviceComponent::ZERO; 1];
+    if smbios::copy_mgmt_device_components(&mut mdc) != 1 { return TestResult::Fail("type 35"); }
+    let mut mdt = [SmbiosMgmtDeviceThreshold::ZERO; 1];
+    if smbios::copy_mgmt_device_thresholds(&mut mdt) != 1 { return TestResult::Fail("type 36"); }
+    let mut mc = [SmbiosMemoryChannel::ZERO; 1];
+    if smbios::copy_memory_channels(&mut mc) != 1 { return TestResult::Fail("type 37"); }
+    if smbios::ipmi_device().is_none() { return TestResult::Fail("type 38"); }
+    let mut ps = [SmbiosPowerSupply::ZERO; 1];
+    if smbios::copy_power_supplies(&mut ps) != 1 { return TestResult::Fail("type 39"); }
+    let mut ai = [SmbiosAdditionalInfo::ZERO; 1];
+    if smbios::copy_additional_info(&mut ai) != 1 { return TestResult::Fail("type 40"); }
+    let mut oe = [SmbiosOnboardExt::ZERO; 1];
+    if smbios::copy_onboard_ext(&mut oe) != 1 { return TestResult::Fail("type 41"); }
+    if smbios::mgmt_ctrl_hci().is_none() { return TestResult::Fail("type 42"); }
+    if smbios::tpm_device().is_none() { return TestResult::Fail("type 43"); }
+    let mut pa = [SmbiosProcessorAdditional::ZERO; 1];
+    if smbios::copy_processor_additional(&mut pa) != 1 { return TestResult::Fail("type 44"); }
+    let mut fw = [SmbiosFirmwareInventory::ZERO; 1];
+    if smbios::copy_firmware_inventory(&mut fw) != 1 { return TestResult::Fail("type 45"); }
+    let mut sp = [SmbiosStringProperty::ZERO; 1];
+    if smbios::copy_string_properties(&mut sp) != 1 { return TestResult::Fail("type 46"); }
+    if smbios::inactive_count() != 1 { return TestResult::Fail("type 126"); }
+    let _ = (SmbiosOemStrings::ZERO, SmbiosSystemConfig::ZERO,
+             SmbiosHwSecurity::ZERO, SmbiosSystemPowerControls::ZERO,
+             SmbiosRemoteAccess::ZERO, SmbiosBis::ZERO,
+             SmbiosIpmiDevice::ZERO, SmbiosMgmtCtrlHci::ZERO,
+             SmbiosTpmDevice::ZERO);
+    TestResult::Pass
+}
+kernel_test_in!("firmware/smbios", smoke_smbios_full_dispatch_coverage);
