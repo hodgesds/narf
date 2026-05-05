@@ -1,0 +1,28 @@
+[package]
+name         = "narf-drivers-wireless"
+description  = "Hardware Wireless drivers (MT7921) skeleton — Stage-4."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_wireless"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../../lib" }
+narf-capabilities = { path = "../../capabilities" }
+narf-io           = { path = "../../io" }
+narf-wireless     = { path = "../../wireless" }
+narf-net          = { path = "../../net" }
+narf-bus          = { path = "../../bus" }
+narf-interrupts   = { path = "../../interrupts" }
+narf-memory       = { path = "../../memory" }
+narf-drivers      = { path = "../" }
+narf-driver-runtime = { path = "../runtime", default-features = false, features = ["kernel"] }
+async-trait = "0.1"
+
+[lints]
+workspace = true

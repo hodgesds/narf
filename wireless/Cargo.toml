@@ -1,0 +1,19 @@
+[package]
+name = "narf-wireless"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+narf-lib = { path = "../lib" }
+narf-net = { path = "../net" }
+narf-capabilities = { path = "../capabilities" }
+narf-ipc = { path = "../ipc" }
+narf-io = { path = "../io" }
+narf-drivers = { path = "../drivers" }
+async-trait = "0.1"
+futures = { version = "0.3", default-features = false }
+narf-kernel-test = { path = "../verification/kernel-test" }
+bitflags = "2.4"
+
+[features]
+kernel-test = []
