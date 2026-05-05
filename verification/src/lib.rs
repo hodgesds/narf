@@ -2863,8 +2863,10 @@ fn smoke_audio_picker_no_backend_when_unprobed() -> TestResult {
         bootstrap_writer, select_active_playback, AudioFormat, AudioWriter,
         AudioWriteError,
     };
+    use narf_audio::hda;
     use narf_drivers_virtio::snd_pci;
     snd_pci::__reset_for_test();
+    hda::__reset_for_test();
     if select_active_playback().is_some() {
         return TestResult::Fail("picker returned a stream with no controller");
     }

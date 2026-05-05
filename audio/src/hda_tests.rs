@@ -36,6 +36,19 @@ fn smoke_hda_match_amd_phoenix_ids() -> TestResult {
     if !saw_radeon {
         return TestResult::Fail("AMD Radeon 1002:1640 not in match table");
     }
+    let mut saw_ich9 = false;
+    for m in regs.iter() {
+        if let MatchKind::VendorDevice { vendor, device } = m.kind {
+            if vendor == hda::HDA_INTEL_ICH9_VENDOR
+                && device == hda::HDA_INTEL_ICH9_DEVICE
+            {
+                saw_ich9 = true;
+            }
+        }
+    }
+    if !saw_ich9 {
+        return TestResult::Fail("Intel ICH9 0x8086:0x293E not in match table");
+    }
     TestResult::Pass
 }
 kernel_test_in!("audio/hda", smoke_hda_match_amd_phoenix_ids);

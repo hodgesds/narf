@@ -244,6 +244,9 @@ impl Arch {
                     "-audiodev".into(), "none,id=snd0".into(),
                     "-device".into(),
                     "virtio-sound-pci,audiodev=snd0,disable-legacy=on,disable-modern=off".into(),
+                    // Intel HDA controller (ICH9) with a duplex codec.
+                    "-device".into(),  "intel-hda".into(),
+                    "-device".into(),  "hda-duplex,audiodev=snd0".into(),
                     "-kernel".into(),  kernel,
                 ]
             },

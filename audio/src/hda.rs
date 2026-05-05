@@ -53,6 +53,18 @@ pub const HDA_AMD_PHOENIX_DEVICE: u16 = 0x15e3;
 pub const HDA_AMD_RADEON_VENDOR: u16 = 0x1002;
 pub const HDA_AMD_RADEON_DEVICE: u16 = 0x1640;
 
+/// Intel ICH6 HD Audio.
+pub const HDA_INTEL_ICH6_VENDOR: u16 = 0x8086;
+pub const HDA_INTEL_ICH6_DEVICE: u16 = 0x2668;
+
+/// Intel ICH7 HD Audio.
+pub const HDA_INTEL_ICH7_VENDOR: u16 = 0x8086;
+pub const HDA_INTEL_ICH7_DEVICE: u16 = 0x27D8;
+
+/// Intel ICH9 HD Audio (QEMU default).
+pub const HDA_INTEL_ICH9_VENDOR: u16 = 0x8086;
+pub const HDA_INTEL_ICH9_DEVICE: u16 = 0x293E;
+
 // ── Global register offsets (HDA 1.0a §3.3) ────────────────────────
 
 const REG_GCAP:      u64 = 0x00;
@@ -1013,6 +1025,30 @@ pub fn register_pci_driver() {
         kind: narf_bus::MatchKind::VendorDevice {
             vendor: HDA_AMD_RADEON_VENDOR,
             device: HDA_AMD_RADEON_DEVICE,
+        },
+        probe,
+    });
+    narf_bus::register_pci_driver(narf_bus::PciMatch {
+        name: "hda-intel-ich6",
+        kind: narf_bus::MatchKind::VendorDevice {
+            vendor: HDA_INTEL_ICH6_VENDOR,
+            device: HDA_INTEL_ICH6_DEVICE,
+        },
+        probe,
+    });
+    narf_bus::register_pci_driver(narf_bus::PciMatch {
+        name: "hda-intel-ich7",
+        kind: narf_bus::MatchKind::VendorDevice {
+            vendor: HDA_INTEL_ICH7_VENDOR,
+            device: HDA_INTEL_ICH7_DEVICE,
+        },
+        probe,
+    });
+    narf_bus::register_pci_driver(narf_bus::PciMatch {
+        name: "hda-intel-ich9",
+        kind: narf_bus::MatchKind::VendorDevice {
+            vendor: HDA_INTEL_ICH9_VENDOR,
+            device: HDA_INTEL_ICH9_DEVICE,
         },
         probe,
     });
