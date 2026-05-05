@@ -4376,3 +4376,488 @@ pub fn __test_parse_prmt_body(body: &[u8]) -> u32 {
     PRMT_PARSED.store(true, Ordering::Release);
     n
 }
+
+// ───────────────────────────────────────────────────────────────────
+// CCEL — Confidential Computing Event Log.
+// Spec: `acpi/specification/tables-confidential-power-secure.md` §1.
+// ───────────────────────────────────────────────────────────────────
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct CcelInfo {
+    pub cc_type:       u8,
+    pub cc_subtype:    u8,
+    pub log_area_min:  u64,
+    pub log_area_phys: u64,
+}
+
+static CCEL_DATA: IrqSafeSpinLock<CcelInfo> = IrqSafeSpinLock::new(CcelInfo {
+    cc_type: 0, cc_subtype: 0, log_area_min: 0, log_area_phys: 0,
+});
+static CCEL_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_ccel_body(body: &[u8]) {
+    if body.len() < SDT_HEADER_SIZE + 20 { return; }
+    let off = SDT_HEADER_SIZE;
+    let cc_type = body[off];
+    let cc_subtype = body[off + 1];
+    let log_area_min = u64::from_le_bytes([
+        body[off + 4],  body[off + 5],
+        body[off + 6],  body[off + 7],
+        body[off + 8],  body[off + 9],
+        body[off + 10], body[off + 11],
+    ]);
+    let log_area_phys = u64::from_le_bytes([
+        body[off + 12], body[off + 13],
+        body[off + 14], body[off + 15],
+        body[off + 16], body[off + 17],
+        body[off + 18], body[off + 19],
+    ]);
+    *CCEL_DATA.lock() = CcelInfo {
+        cc_type, cc_subtype, log_area_min, log_area_phys,
+    };
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → CCEL must also be identity-mapped.
+pub unsafe fn parse_ccel(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut ccel: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"CCEL" && ccel.is_none() {
+                ccel = Some(phys);
+            }
+        })?;
+    }
+    let ccel = ccel.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (ccel as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 20 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(ccel as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    parse_ccel_body(body);
+    CCEL_PARSED.store(true, Ordering::Release);
+    Ok(())
+}
+
+pub fn ccel_info() -> Option<CcelInfo> {
+    if !CCEL_PARSED.load(Ordering::Acquire) { return None; }
+    Some(*CCEL_DATA.lock())
+}
+
+#[doc(hidden)]
+pub fn __test_parse_ccel_body(body: &[u8]) {
+    parse_ccel_body(body);
+    CCEL_PARSED.store(true, Ordering::Release);
+}
+
+// ───────────────────────────────────────────────────────────────────
+// MPST — Memory Power State Table.
+// Spec: `acpi/specification/tables-confidential-power-secure.md` §2.
+// ───────────────────────────────────────────────────────────────────
+
+pub const MAX_MPST_NODES: usize = 16;
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct MpstNode {
+    pub node_id:       u16,
+    pub enabled:       bool,
+    pub power_managed: bool,
+    pub hot_pluggable: bool,
+    pub base:          u64,
+    pub length_bytes:  u64,
+}
+
+struct MpstTables {
+    nodes:   [MpstNode; MAX_MPST_NODES],
+    n_nodes: usize,
+}
+
+impl MpstTables {
+    const EMPTY: Self = Self {
+        nodes:   [MpstNode {
+                     node_id: 0, enabled: false, power_managed: false,
+                     hot_pluggable: false, base: 0, length_bytes: 0
+                 }; MAX_MPST_NODES],
+        n_nodes: 0,
+    };
+}
+
+static MPST_DATA:   IrqSafeSpinLock<MpstTables> = IrqSafeSpinLock::new(MpstTables::EMPTY);
+static MPST_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_mpst_body(body: &[u8]) -> u32 {
+    let mut tables = MPST_DATA.lock();
+    *tables = MpstTables::EMPTY;
+    // Header: PccId (1) + Reserved (3) + NodeCount (2) + Reserved (2) = 8 bytes
+    if body.len() < SDT_HEADER_SIZE + 8 { return 0; }
+    let n_nodes = u16::from_le_bytes([
+        body[SDT_HEADER_SIZE + 4], body[SDT_HEADER_SIZE + 5],
+    ]) as usize;
+    let mut cur = SDT_HEADER_SIZE + 8;
+    let mut count = 0u32;
+    for _ in 0..n_nodes {
+        if cur + 32 > body.len() { break; }
+        // Per-node header: Flags (1) + Reserved (1) + Id (2) +
+        //                  Length (4) + Base (8) + LengthBytes (8) +
+        //                  StateValueCount (4) + PhysComponentCount (4)
+        let entry = &body[cur..];
+        let flags = entry[0];
+        let node_id = u16::from_le_bytes([entry[2], entry[3]]);
+        let len = u32::from_le_bytes([
+            entry[4], entry[5], entry[6], entry[7],
+        ]) as usize;
+        let base = u64::from_le_bytes([
+            entry[8],  entry[9],  entry[10], entry[11],
+            entry[12], entry[13], entry[14], entry[15],
+        ]);
+        let length_bytes = u64::from_le_bytes([
+            entry[16], entry[17], entry[18], entry[19],
+            entry[20], entry[21], entry[22], entry[23],
+        ]);
+        if tables.n_nodes < MAX_MPST_NODES {
+            let i = tables.n_nodes;
+            tables.nodes[i] = MpstNode {
+                node_id,
+                enabled:       flags & (1 << 0) != 0,
+                power_managed: flags & (1 << 1) != 0,
+                hot_pluggable: flags & (1 << 2) != 0,
+                base, length_bytes,
+            };
+            tables.n_nodes = i + 1;
+            count += 1;
+        }
+        if len < 32 || cur + len > body.len() { break; }
+        cur += len;
+    }
+    count
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → MPST must also be identity-mapped.
+pub unsafe fn parse_mpst(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut mpst: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"MPST" && mpst.is_none() {
+                mpst = Some(phys);
+            }
+        })?;
+    }
+    let mpst = mpst.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (mpst as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 8 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(mpst as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    let n = parse_mpst_body(body);
+    MPST_PARSED.store(true, Ordering::Release);
+    Ok(n)
+}
+
+pub fn is_mpst_known() -> bool { MPST_PARSED.load(Ordering::Acquire) }
+
+pub fn copy_mpst_nodes(out: &mut [MpstNode]) -> usize {
+    let t = MPST_DATA.lock();
+    let n = t.n_nodes.min(out.len());
+    out[..n].copy_from_slice(&t.nodes[..n]);
+    n
+}
+
+#[doc(hidden)]
+pub fn __test_parse_mpst_body(body: &[u8]) -> u32 {
+    let n = parse_mpst_body(body);
+    MPST_PARSED.store(true, Ordering::Release);
+    n
+}
+
+// ───────────────────────────────────────────────────────────────────
+// SDEV — Secure Devices Table.
+// Spec: `acpi/specification/tables-confidential-power-secure.md` §3.
+// ───────────────────────────────────────────────────────────────────
+
+pub const MAX_SDEV_PCI: usize = 16;
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct SdevPci {
+    pub segment:   u16,
+    pub start_bdf: u16,
+}
+
+struct SdevTables {
+    pcis:   [SdevPci; MAX_SDEV_PCI],
+    n_pcis: usize,
+}
+
+impl SdevTables {
+    const EMPTY: Self = Self {
+        pcis:   [SdevPci { segment: 0, start_bdf: 0 }; MAX_SDEV_PCI],
+        n_pcis: 0,
+    };
+}
+
+static SDEV_DATA:   IrqSafeSpinLock<SdevTables> = IrqSafeSpinLock::new(SdevTables::EMPTY);
+static SDEV_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_sdev_body(body: &[u8]) -> u32 {
+    let mut tables = SDEV_DATA.lock();
+    *tables = SdevTables::EMPTY;
+    let mut cur = SDT_HEADER_SIZE;
+    let mut count = 0u32;
+    while cur + 4 <= body.len() {
+        let kind = body[cur];
+        let len = u16::from_le_bytes([body[cur + 2], body[cur + 3]]) as usize;
+        if len < 4 || cur + len > body.len() { break; }
+        let entry = &body[cur..cur + len];
+
+        // Type 1 — PCI endpoint, header is 16 bytes.
+        if kind == 1 && entry.len() >= 16 {
+            let segment = u16::from_le_bytes([entry[4], entry[5]]);
+            let start_bdf = u16::from_le_bytes([entry[6], entry[7]]);
+            if tables.n_pcis < MAX_SDEV_PCI {
+                let i = tables.n_pcis;
+                tables.pcis[i] = SdevPci { segment, start_bdf };
+                tables.n_pcis = i + 1;
+                count += 1;
+            }
+        }
+        cur += len;
+    }
+    count
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → SDEV must also be identity-mapped.
+pub unsafe fn parse_sdev(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut sdev: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"SDEV" && sdev.is_none() {
+                sdev = Some(phys);
+            }
+        })?;
+    }
+    let sdev = sdev.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (sdev as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(sdev as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    let n = parse_sdev_body(body);
+    SDEV_PARSED.store(true, Ordering::Release);
+    Ok(n)
+}
+
+pub fn is_sdev_known() -> bool { SDEV_PARSED.load(Ordering::Acquire) }
+
+pub fn copy_sdev_pci(out: &mut [SdevPci]) -> usize {
+    let t = SDEV_DATA.lock();
+    let n = t.n_pcis.min(out.len());
+    out[..n].copy_from_slice(&t.pcis[..n]);
+    n
+}
+
+#[doc(hidden)]
+pub fn __test_parse_sdev_body(body: &[u8]) -> u32 {
+    let n = parse_sdev_body(body);
+    SDEV_PARSED.store(true, Ordering::Release);
+    n
+}
+
+// ───────────────────────────────────────────────────────────────────
+// SBST — Smart Battery Specification Table.
+// Spec: `acpi/specification/tables-confidential-power-secure.md` §4.
+// ───────────────────────────────────────────────────────────────────
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct SbstInfo {
+    pub warning_level_mwh:  u32,
+    pub low_level_mwh:      u32,
+    pub critical_level_mwh: u32,
+}
+
+static SBST_DATA: IrqSafeSpinLock<SbstInfo> = IrqSafeSpinLock::new(SbstInfo {
+    warning_level_mwh: 0, low_level_mwh: 0, critical_level_mwh: 0,
+});
+static SBST_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_sbst_body(body: &[u8]) {
+    if body.len() < SDT_HEADER_SIZE + 12 { return; }
+    let off = SDT_HEADER_SIZE;
+    let warning_level_mwh = u32::from_le_bytes([
+        body[off],     body[off + 1], body[off + 2], body[off + 3],
+    ]);
+    let low_level_mwh = u32::from_le_bytes([
+        body[off + 4], body[off + 5], body[off + 6], body[off + 7],
+    ]);
+    let critical_level_mwh = u32::from_le_bytes([
+        body[off + 8], body[off + 9], body[off + 10], body[off + 11],
+    ]);
+    *SBST_DATA.lock() = SbstInfo {
+        warning_level_mwh, low_level_mwh, critical_level_mwh,
+    };
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → SBST must also be identity-mapped.
+pub unsafe fn parse_sbst(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut sbst: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"SBST" && sbst.is_none() {
+                sbst = Some(phys);
+            }
+        })?;
+    }
+    let sbst = sbst.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (sbst as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 12 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(sbst as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    parse_sbst_body(body);
+    SBST_PARSED.store(true, Ordering::Release);
+    Ok(())
+}
+
+pub fn sbst_info() -> Option<SbstInfo> {
+    if !SBST_PARSED.load(Ordering::Acquire) { return None; }
+    Some(*SBST_DATA.lock())
+}
+
+#[doc(hidden)]
+pub fn __test_parse_sbst_body(body: &[u8]) {
+    parse_sbst_body(body);
+    SBST_PARSED.store(true, Ordering::Release);
+}
+
+// ───────────────────────────────────────────────────────────────────
+// RAS2 — RAS Feature Table.
+// Spec: `acpi/specification/tables-confidential-power-secure.md` §5.
+// ───────────────────────────────────────────────────────────────────
+
+pub const MAX_RAS2_DESCRIPTORS: usize = 16;
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct Ras2Descriptor {
+    pub pcc_id:         u8,
+    pub feature_type:   u8,
+    pub instance_count: u32,
+}
+
+struct Ras2Tables {
+    descs:   [Ras2Descriptor; MAX_RAS2_DESCRIPTORS],
+    n_descs: usize,
+}
+
+impl Ras2Tables {
+    const EMPTY: Self = Self {
+        descs:   [Ras2Descriptor { pcc_id: 0, feature_type: 0, instance_count: 0 };
+                  MAX_RAS2_DESCRIPTORS],
+        n_descs: 0,
+    };
+}
+
+static RAS2_DATA:   IrqSafeSpinLock<Ras2Tables> = IrqSafeSpinLock::new(Ras2Tables::EMPTY);
+static RAS2_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_ras2_body(body: &[u8]) -> u32 {
+    let mut tables = RAS2_DATA.lock();
+    *tables = Ras2Tables::EMPTY;
+    if body.len() < SDT_HEADER_SIZE + 4 { return 0; }
+    let n_desc = u16::from_le_bytes([
+        body[SDT_HEADER_SIZE + 2], body[SDT_HEADER_SIZE + 3],
+    ]) as usize;
+    let mut cur = SDT_HEADER_SIZE + 4;
+    let mut count = 0u32;
+    for _ in 0..n_desc {
+        if cur + 8 > body.len() { break; }
+        let pcc_id = body[cur];
+        let feature_type = body[cur + 3];
+        let instance_count = u32::from_le_bytes([
+            body[cur + 4], body[cur + 5], body[cur + 6], body[cur + 7],
+        ]);
+        if tables.n_descs < MAX_RAS2_DESCRIPTORS {
+            let i = tables.n_descs;
+            tables.descs[i] = Ras2Descriptor {
+                pcc_id, feature_type, instance_count,
+            };
+            tables.n_descs = i + 1;
+            count += 1;
+        }
+        cur += 8;
+    }
+    count
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → RAS2 must also be identity-mapped.
+pub unsafe fn parse_ras2(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut ras2: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"RAS2" && ras2.is_none() {
+                ras2 = Some(phys);
+            }
+        })?;
+    }
+    let ras2 = ras2.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (ras2 as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 4 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(ras2 as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    let n = parse_ras2_body(body);
+    RAS2_PARSED.store(true, Ordering::Release);
+    Ok(n)
+}
+
+pub fn is_ras2_known() -> bool { RAS2_PARSED.load(Ordering::Acquire) }
+
+pub fn copy_ras2_descriptors(out: &mut [Ras2Descriptor]) -> usize {
+    let t = RAS2_DATA.lock();
+    let n = t.n_descs.min(out.len());
+    out[..n].copy_from_slice(&t.descs[..n]);
+    n
+}
+
+#[doc(hidden)]
+pub fn __test_parse_ras2_body(body: &[u8]) -> u32 {
+    let n = parse_ras2_body(body);
+    RAS2_PARSED.store(true, Ordering::Release);
+    n
+}

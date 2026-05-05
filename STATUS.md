@@ -18,8 +18,8 @@ asks for. Updated when observable kernel behaviour changes.
   delivers hardware LAPIC-timer IRQs, exits cleanly.
 - `cargo xtask run --arch=aarch64` boots, runs the full async demo
   using CNTPCT_EL0 as the clock, exits via ARM semihosting.
-- `cargo xtask test --arch=x86_64` passes **644/0/30** (pass / fail / skip).
-- `cargo xtask test --arch=aarch64` passes **349/0/11** (pass / fail / skip).
+- `cargo xtask test --arch=x86_64` passes **650/0/29** (pass / fail / skip).
+- `cargo xtask test --arch=aarch64` passes **354/0/11** (pass / fail / skip).
   Skips are x86_64-specific PCIe surfaces or live-device tests that
   skip cleanly when QEMU doesn't expose the device.
 - In-tree PCIe drivers running against real QEMU-emulated devices.
@@ -163,6 +163,11 @@ asks for. Updated when observable kernel behaviour changes.
 | ACPI HPET-desc   | HPET Description Table — `HpetDesc { block_id, base, addr_space_id, hpet_number, main_counter_min, oem_attributes }`. Spec: `acpi/specification/tables-firmware-hpet-prm.md` §3. |
 | ACPI FACS        | Firmware ACPI Control Structure — reached via FADT.firmware_ctrl / X_FirmwareCtrl. `FacsInfo { hardware_signature, firmware_waking_vector_{32,64}, global_lock, flags, version }`. Spec: `acpi/specification/tables-firmware-hpet-prm.md` §4. |
 | ACPI PRMT        | Platform Runtime Mechanism Table — per-module decode → `PrmtModule { major_revision, minor_revision, handler_count, mmio_range }`. Spec: `acpi/specification/tables-firmware-hpet-prm.md` §5. |
+| ACPI CCEL        | Confidential Computing Event Log — `CcelInfo { cc_type, cc_subtype, log_area_min, log_area_phys }`. Spec: `acpi/specification/tables-confidential-power-secure.md` §1. |
+| ACPI MPST        | Memory Power State Table — per-node header decode → `MpstNode { node_id, enabled, power_managed, hot_pluggable, base, length_bytes }`. Spec: `acpi/specification/tables-confidential-power-secure.md` §2. |
+| ACPI SDEV        | Secure Devices Table — Type 1 (PCI endpoint) → `SdevPci { segment, start_bdf }`. Spec: `acpi/specification/tables-confidential-power-secure.md` §3. |
+| ACPI SBST        | Smart Battery Specification — `SbstInfo { warning_level_mwh, low_level_mwh, critical_level_mwh }`. Spec: `acpi/specification/tables-confidential-power-secure.md` §4. |
+| ACPI RAS2        | RAS Feature Table — per-PCC descriptor decode → `Ras2Descriptor { pcc_id, feature_type, instance_count }`. Spec: `acpi/specification/tables-confidential-power-secure.md` §5. |
 | iwlwifi          | Intel Wi-Fi 6 / 6E (AX200 / AX201 / AX210 / AX211). **Structural probe only** — PCI match table + spec doc. Operational register map (CSR/PRPH offsets, firmware loader, TFD/RBD descriptors, host-command opcodes) is not in any public Intel doc; further stages blocked on public register docs. See `drivers/net/specification/iwlwifi.md`. |
 | AHCI (ICH9/10)   | HBA bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT. |
 | xHCI USB host    | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT. |

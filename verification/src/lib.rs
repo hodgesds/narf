@@ -3660,6 +3660,153 @@ fn smoke_acpi_prmt_synthetic_decode() -> TestResult {
 }
 kernel_test!(smoke_acpi_prmt_synthetic_decode);
 
+fn smoke_acpi_ccel_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"CCEL");
+    buf.extend_from_slice(&[0u8; 32]);
+    buf.push(0);                                          // cc_type = TDX
+    buf.push(2);                                          // cc_subtype
+    buf.extend_from_slice(&[0u8; 2]);                     // reserved
+    buf.extend_from_slice(&0x4000u64.to_le_bytes());      // log area min
+    buf.extend_from_slice(&0xC000_0000u64.to_le_bytes()); // log area phys
+
+    narf_acpi::__test_parse_ccel_body(&buf);
+    let info = narf_acpi::ccel_info().expect("CCEL not parsed");
+    if info.cc_type != 0 || info.cc_subtype != 2
+        || info.log_area_min != 0x4000
+        || info.log_area_phys != 0xC000_0000
+    {
+        return TestResult::Fail("CCEL decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_ccel_synthetic_decode);
+
+fn smoke_acpi_mpst_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    use narf_acpi::MpstNode;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"MPST");
+    buf.extend_from_slice(&[0u8; 32]);
+    // MPST header: PccId (1) + Reserved (3) + NodeCount (2) + Reserved (2)
+    buf.push(0);
+    buf.extend_from_slice(&[0u8; 3]);
+    buf.extend_from_slice(&1u16.to_le_bytes());           // 1 node
+    buf.extend_from_slice(&[0u8; 2]);
+
+    // Node header: Flags + Rsvd + Id + Length + Base + LengthBytes +
+    //              StateValueCount + PhysComponentCount = 32 bytes total.
+    buf.push(0b101);                                      // flags: enabled + hot-pluggable
+    buf.push(0);                                          // reserved
+    buf.extend_from_slice(&0x42u16.to_le_bytes());        // node id
+    buf.extend_from_slice(&32u32.to_le_bytes());          // length
+    buf.extend_from_slice(&0x1_0000u64.to_le_bytes());    // base
+    buf.extend_from_slice(&0x10_0000u64.to_le_bytes());   // length bytes
+    buf.extend_from_slice(&0u32.to_le_bytes());           // state count
+    buf.extend_from_slice(&0u32.to_le_bytes());           // phys count
+
+    let n = narf_acpi::__test_parse_mpst_body(&buf);
+    if n != 1 {
+        return TestResult::Fail("expected 1 MPST node parsed");
+    }
+    let mut nodes = [MpstNode::default(); 4];
+    let nn = narf_acpi::copy_mpst_nodes(&mut nodes);
+    if nn != 1
+        || nodes[0].node_id != 0x42
+        || !nodes[0].enabled
+        || nodes[0].power_managed
+        || !nodes[0].hot_pluggable
+        || nodes[0].base != 0x1_0000
+        || nodes[0].length_bytes != 0x10_0000
+    {
+        return TestResult::Fail("MPST node decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_mpst_synthetic_decode);
+
+fn smoke_acpi_sdev_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    use narf_acpi::SdevPci;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"SDEV");
+    buf.extend_from_slice(&[0u8; 32]);
+
+    // PCI endpoint entry (type 1, length 16).
+    buf.push(1);                                          // type
+    buf.push(0);                                          // flags
+    buf.extend_from_slice(&16u16.to_le_bytes());          // length
+    buf.extend_from_slice(&0xABu16.to_le_bytes());        // segment
+    buf.extend_from_slice(&0x1234u16.to_le_bytes());      // start_bdf
+    buf.extend_from_slice(&[0u8; 8]);                     // remaining hdr fields
+
+    let n = narf_acpi::__test_parse_sdev_body(&buf);
+    if n != 1 {
+        return TestResult::Fail("expected 1 SDEV PCI entry parsed");
+    }
+    let mut pcis = [SdevPci::default(); 4];
+    let np = narf_acpi::copy_sdev_pci(&mut pcis);
+    if np != 1 || pcis[0].segment != 0xAB || pcis[0].start_bdf != 0x1234 {
+        return TestResult::Fail("SDEV PCI decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_sdev_synthetic_decode);
+
+fn smoke_acpi_sbst_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"SBST");
+    buf.extend_from_slice(&[0u8; 32]);
+    buf.extend_from_slice(&5000u32.to_le_bytes());        // warning
+    buf.extend_from_slice(&2000u32.to_le_bytes());        // low
+    buf.extend_from_slice(&500u32.to_le_bytes());         // critical
+
+    narf_acpi::__test_parse_sbst_body(&buf);
+    let info = narf_acpi::sbst_info().expect("SBST not parsed");
+    if info.warning_level_mwh != 5000
+        || info.low_level_mwh != 2000
+        || info.critical_level_mwh != 500
+    {
+        return TestResult::Fail("SBST decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_sbst_synthetic_decode);
+
+fn smoke_acpi_ras2_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    use narf_acpi::Ras2Descriptor;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"RAS2");
+    buf.extend_from_slice(&[0u8; 32]);
+    buf.extend_from_slice(&0u16.to_le_bytes());            // reserved
+    buf.extend_from_slice(&1u16.to_le_bytes());            // descriptor count
+
+    // Descriptor (8 B): PccId + Reserved (2) + FeatureType + InstanceCount
+    buf.push(7);                                           // pcc_id
+    buf.extend_from_slice(&[0u8; 2]);                      // reserved
+    buf.push(0);                                           // feature_type = MemPatrolScrub
+    buf.extend_from_slice(&3u32.to_le_bytes());            // instance count
+
+    let n = narf_acpi::__test_parse_ras2_body(&buf);
+    if n != 1 {
+        return TestResult::Fail("expected 1 RAS2 descriptor parsed");
+    }
+    let mut descs = [Ras2Descriptor::default(); 4];
+    let nd = narf_acpi::copy_ras2_descriptors(&mut descs);
+    if nd != 1
+        || descs[0].pcc_id != 7
+        || descs[0].feature_type != 0
+        || descs[0].instance_count != 3
+    {
+        return TestResult::Fail("RAS2 descriptor decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_ras2_synthetic_decode);
+
 fn smoke_acpi_srat_synthetic_memory_entry() -> TestResult {
     // Type-1 memory affinity entry: base 0x1_0000_0000, length
     // 0x1000_0000, proximity 1, enabled.

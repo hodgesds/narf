@@ -735,6 +735,18 @@ Live from boot through `cargo xtask run`:
   Memory Window). BERT yields `BertInfo { region_addr,
   region_length }` for the boot-error region. Spec:
   `acpi/specification/tables-ras-cxl-locality.md`.
+- ACPI CCEL / MPST / SDEV / SBST / RAS2 (`narf_acpi`):
+  Confidential-compute + memory-power + secure-devices +
+  smart-battery + RAS-feature parsers. CCEL yields
+  `CcelInfo` (CC type / subtype, log buffer min length, log
+  buffer physical address). MPST yields per-node `MpstNode`
+  with enable / power-managed / hot-pluggable flags + base +
+  length. SDEV yields `SdevPci` (segment + start-BDF) for
+  Type-1 PCI-endpoint entries. SBST yields `SbstInfo`
+  (warning / low / critical levels in mWh). RAS2 yields
+  per-PCC `Ras2Descriptor` (pcc id, feature type, instance
+  count). Spec:
+  `acpi/specification/tables-confidential-power-secure.md`.
 - ACPI WSMT / WAET / HPET / FACS / PRMT (`narf_acpi`):
   Windows-mitigation + emulated-device + HPET-description +
   firmware-control + Platform-Runtime-Mechanism parsers.
@@ -804,8 +816,8 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **644/0/30** smokes;
-`--arch=aarch64` passes **349/0/11**. Skips are x86-specific PCIe
+`cargo xtask test --arch=x86_64` passes **650/0/29** smokes;
+`--arch=aarch64` passes **354/0/11**. Skips are x86-specific PCIe
 surfaces or live-device tests that skip cleanly when QEMU doesn't
 expose the device. See `STATUS.md` for the full tally and per-
 subsystem breakdown.
