@@ -4861,3 +4861,498 @@ pub fn __test_parse_ras2_body(body: &[u8]) -> u32 {
     RAS2_PARSED.store(true, Ordering::Release);
     n
 }
+
+// ───────────────────────────────────────────────────────────────────
+// ECDT — Embedded Controller Boot Resources Table.
+// Spec: `acpi/specification/tables-ec-audio-iscsi-csrt-agdi.md` §1.
+// ───────────────────────────────────────────────────────────────────
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct EcdtInfo {
+    pub control_addr: u64,
+    pub data_addr:    u64,
+    pub uid:          u32,
+    pub gpe_bit:      u8,
+}
+
+static ECDT_DATA: IrqSafeSpinLock<EcdtInfo> = IrqSafeSpinLock::new(EcdtInfo {
+    control_addr: 0, data_addr: 0, uid: 0, gpe_bit: 0,
+});
+static ECDT_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_ecdt_body(body: &[u8]) {
+    // SDT header (36) + EcControl GAS (12) + EcData GAS (12) +
+    // Uid (4) + GpeBitNumber (1) + EcId (variable).
+    if body.len() < SDT_HEADER_SIZE + 29 { return; }
+    let off = SDT_HEADER_SIZE;
+    // GAS.Address @ +4..12 of each GAS.
+    let control_addr = u64::from_le_bytes([
+        body[off + 4],  body[off + 5],
+        body[off + 6],  body[off + 7],
+        body[off + 8],  body[off + 9],
+        body[off + 10], body[off + 11],
+    ]);
+    let data_addr = u64::from_le_bytes([
+        body[off + 16], body[off + 17],
+        body[off + 18], body[off + 19],
+        body[off + 20], body[off + 21],
+        body[off + 22], body[off + 23],
+    ]);
+    let uid = u32::from_le_bytes([
+        body[off + 24], body[off + 25],
+        body[off + 26], body[off + 27],
+    ]);
+    let gpe_bit = body[off + 28];
+    *ECDT_DATA.lock() = EcdtInfo {
+        control_addr, data_addr, uid, gpe_bit,
+    };
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → ECDT must also be identity-mapped.
+pub unsafe fn parse_ecdt(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut ecdt: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"ECDT" && ecdt.is_none() {
+                ecdt = Some(phys);
+            }
+        })?;
+    }
+    let ecdt = ecdt.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (ecdt as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 29 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(ecdt as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    parse_ecdt_body(body);
+    ECDT_PARSED.store(true, Ordering::Release);
+    Ok(())
+}
+
+pub fn ecdt_info() -> Option<EcdtInfo> {
+    if !ECDT_PARSED.load(Ordering::Acquire) { return None; }
+    Some(*ECDT_DATA.lock())
+}
+
+#[doc(hidden)]
+pub fn __test_parse_ecdt_body(body: &[u8]) {
+    parse_ecdt_body(body);
+    ECDT_PARSED.store(true, Ordering::Release);
+}
+
+// ───────────────────────────────────────────────────────────────────
+// NHLT — Non-HD Audio Link Table.
+// Spec: `acpi/specification/tables-ec-audio-iscsi-csrt-agdi.md` §2.
+// ───────────────────────────────────────────────────────────────────
+
+pub const MAX_NHLT_ENDPOINTS: usize = 16;
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct NhltEndpoint {
+    pub link_type:   u8,
+    pub instance_id: u8,
+    pub vendor_id:   u16,
+    pub device_id:   u16,
+    pub direction:   u8,
+}
+
+struct NhltTables {
+    eps:   [NhltEndpoint; MAX_NHLT_ENDPOINTS],
+    n_eps: usize,
+}
+
+impl NhltTables {
+    const EMPTY: Self = Self {
+        eps:   [NhltEndpoint {
+                   link_type: 0, instance_id: 0, vendor_id: 0,
+                   device_id: 0, direction: 0
+               }; MAX_NHLT_ENDPOINTS],
+        n_eps: 0,
+    };
+}
+
+static NHLT_DATA:   IrqSafeSpinLock<NhltTables> = IrqSafeSpinLock::new(NhltTables::EMPTY);
+static NHLT_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_nhlt_body(body: &[u8]) -> u32 {
+    let mut tables = NHLT_DATA.lock();
+    *tables = NhltTables::EMPTY;
+    if body.len() < SDT_HEADER_SIZE + 1 { return 0; }
+    let n_eps = body[SDT_HEADER_SIZE] as usize;
+    let mut cur = SDT_HEADER_SIZE + 1;
+    let mut count = 0u32;
+    for _ in 0..n_eps {
+        if cur + 4 > body.len() { break; }
+        let len = u32::from_le_bytes([
+            body[cur], body[cur + 1], body[cur + 2], body[cur + 3],
+        ]) as usize;
+        if len < 19 || cur + len > body.len() { break; }
+        let entry = &body[cur..cur + len];
+        // Endpoint header offsets within entry:
+        //   0..4   Length
+        //   4      LinkType
+        //   5      InstanceId
+        //   6..8   VendorId
+        //   8..10  DeviceId
+        //   10..12 RevisionId
+        //   12..16 SubsystemId
+        //   16     DeviceType
+        //   17     Direction
+        //   18     VirtualBusId
+        let link_type   = entry[4];
+        let instance_id = entry[5];
+        let vendor_id   = u16::from_le_bytes([entry[6], entry[7]]);
+        let device_id   = u16::from_le_bytes([entry[8], entry[9]]);
+        let direction   = entry[17];
+        if tables.n_eps < MAX_NHLT_ENDPOINTS {
+            let i = tables.n_eps;
+            tables.eps[i] = NhltEndpoint {
+                link_type, instance_id, vendor_id, device_id, direction,
+            };
+            tables.n_eps = i + 1;
+            count += 1;
+        }
+        cur += len;
+    }
+    count
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → NHLT must also be identity-mapped.
+pub unsafe fn parse_nhlt(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut nhlt: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"NHLT" && nhlt.is_none() {
+                nhlt = Some(phys);
+            }
+        })?;
+    }
+    let nhlt = nhlt.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (nhlt as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 1 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(nhlt as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    let n = parse_nhlt_body(body);
+    NHLT_PARSED.store(true, Ordering::Release);
+    Ok(n)
+}
+
+pub fn is_nhlt_known() -> bool { NHLT_PARSED.load(Ordering::Acquire) }
+
+pub fn copy_nhlt_endpoints(out: &mut [NhltEndpoint]) -> usize {
+    let t = NHLT_DATA.lock();
+    let n = t.n_eps.min(out.len());
+    out[..n].copy_from_slice(&t.eps[..n]);
+    n
+}
+
+#[doc(hidden)]
+pub fn __test_parse_nhlt_body(body: &[u8]) -> u32 {
+    let n = parse_nhlt_body(body);
+    NHLT_PARSED.store(true, Ordering::Release);
+    n
+}
+
+// ───────────────────────────────────────────────────────────────────
+// IBFT — iSCSI Boot Firmware Table.
+// Spec: `acpi/specification/tables-ec-audio-iscsi-csrt-agdi.md` §3.
+// ───────────────────────────────────────────────────────────────────
+
+pub const MAX_IBFT_TARGETS: usize = 8;
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct IbftTarget {
+    pub ip:   [u8; 16],
+    pub port: u16,
+    pub lun:  u64,
+}
+
+struct IbftTables {
+    targets:   [IbftTarget; MAX_IBFT_TARGETS],
+    n_targets: usize,
+}
+
+impl IbftTables {
+    const EMPTY: Self = Self {
+        targets:   [IbftTarget { ip: [0u8; 16], port: 0, lun: 0 }; MAX_IBFT_TARGETS],
+        n_targets: 0,
+    };
+}
+
+static IBFT_DATA:   IrqSafeSpinLock<IbftTables> = IrqSafeSpinLock::new(IbftTables::EMPTY);
+static IBFT_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_ibft_body(body: &[u8]) -> u32 {
+    let mut tables = IBFT_DATA.lock();
+    *tables = IbftTables::EMPTY;
+    // Reserved (12) after SDT header per IBFT layout.
+    if body.len() < SDT_HEADER_SIZE + 12 { return 0; }
+    let mut cur = SDT_HEADER_SIZE + 12;
+    let mut count = 0u32;
+    while cur + 6 <= body.len() {
+        let id  = body[cur];
+        let len = u16::from_le_bytes([body[cur + 2], body[cur + 3]]) as usize;
+        if len < 6 || cur + len > body.len() { break; }
+        let entry = &body[cur..cur + len];
+        if id == 4 && entry.len() >= 32 {
+            // Target: header (6) + IP (16) @ 6..22, port (2) @ 22..24,
+            // LUN (8) @ 24..32.
+            let mut ip = [0u8; 16];
+            ip.copy_from_slice(&entry[6..22]);
+            let port = u16::from_le_bytes([entry[22], entry[23]]);
+            let lun = u64::from_le_bytes([
+                entry[24], entry[25], entry[26], entry[27],
+                entry[28], entry[29], entry[30], entry[31],
+            ]);
+            if tables.n_targets < MAX_IBFT_TARGETS {
+                let i = tables.n_targets;
+                tables.targets[i] = IbftTarget { ip, port, lun };
+                tables.n_targets = i + 1;
+                count += 1;
+            }
+        }
+        cur += len;
+    }
+    count
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → IBFT must also be identity-mapped.
+pub unsafe fn parse_ibft(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut ibft: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"IBFT" && ibft.is_none() {
+                ibft = Some(phys);
+            }
+        })?;
+    }
+    let ibft = ibft.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (ibft as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 12 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(ibft as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    let n = parse_ibft_body(body);
+    IBFT_PARSED.store(true, Ordering::Release);
+    Ok(n)
+}
+
+pub fn is_ibft_known() -> bool { IBFT_PARSED.load(Ordering::Acquire) }
+
+pub fn copy_ibft_targets(out: &mut [IbftTarget]) -> usize {
+    let t = IBFT_DATA.lock();
+    let n = t.n_targets.min(out.len());
+    out[..n].copy_from_slice(&t.targets[..n]);
+    n
+}
+
+#[doc(hidden)]
+pub fn __test_parse_ibft_body(body: &[u8]) -> u32 {
+    let n = parse_ibft_body(body);
+    IBFT_PARSED.store(true, Ordering::Release);
+    n
+}
+
+// ───────────────────────────────────────────────────────────────────
+// CSRT — Core System Resource Table.
+// Spec: `acpi/specification/tables-ec-audio-iscsi-csrt-agdi.md` §4.
+// ───────────────────────────────────────────────────────────────────
+
+pub const MAX_CSRT_GROUPS: usize = 16;
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct CsrtGroup {
+    pub vendor_id: u32,
+    pub device_id: u16,
+    pub revision:  u16,
+}
+
+struct CsrtTables {
+    groups:   [CsrtGroup; MAX_CSRT_GROUPS],
+    n_groups: usize,
+}
+
+impl CsrtTables {
+    const EMPTY: Self = Self {
+        groups:   [CsrtGroup { vendor_id: 0, device_id: 0, revision: 0 };
+                   MAX_CSRT_GROUPS],
+        n_groups: 0,
+    };
+}
+
+static CSRT_DATA:   IrqSafeSpinLock<CsrtTables> = IrqSafeSpinLock::new(CsrtTables::EMPTY);
+static CSRT_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_csrt_body(body: &[u8]) -> u32 {
+    let mut tables = CSRT_DATA.lock();
+    *tables = CsrtTables::EMPTY;
+    let mut cur = SDT_HEADER_SIZE;
+    let mut count = 0u32;
+    while cur + 24 <= body.len() {
+        let len = u32::from_le_bytes([
+            body[cur], body[cur + 1], body[cur + 2], body[cur + 3],
+        ]) as usize;
+        if len < 24 || cur + len > body.len() { break; }
+        let entry = &body[cur..cur + len];
+        let vendor_id = u32::from_le_bytes([
+            entry[4], entry[5], entry[6], entry[7],
+        ]);
+        let device_id = u16::from_le_bytes([entry[12], entry[13]]);
+        let revision  = u16::from_le_bytes([entry[16], entry[17]]);
+        if tables.n_groups < MAX_CSRT_GROUPS {
+            let i = tables.n_groups;
+            tables.groups[i] = CsrtGroup { vendor_id, device_id, revision };
+            tables.n_groups = i + 1;
+            count += 1;
+        }
+        cur += len;
+    }
+    count
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → CSRT must also be identity-mapped.
+pub unsafe fn parse_csrt(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut csrt: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"CSRT" && csrt.is_none() {
+                csrt = Some(phys);
+            }
+        })?;
+    }
+    let csrt = csrt.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (csrt as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(csrt as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    let n = parse_csrt_body(body);
+    CSRT_PARSED.store(true, Ordering::Release);
+    Ok(n)
+}
+
+pub fn is_csrt_known() -> bool { CSRT_PARSED.load(Ordering::Acquire) }
+
+pub fn copy_csrt_groups(out: &mut [CsrtGroup]) -> usize {
+    let t = CSRT_DATA.lock();
+    let n = t.n_groups.min(out.len());
+    out[..n].copy_from_slice(&t.groups[..n]);
+    n
+}
+
+#[doc(hidden)]
+pub fn __test_parse_csrt_body(body: &[u8]) -> u32 {
+    let n = parse_csrt_body(body);
+    CSRT_PARSED.store(true, Ordering::Release);
+    n
+}
+
+// ───────────────────────────────────────────────────────────────────
+// AGDI — Arm Generic Diagnostic Dump and Reset Interface.
+// Spec: `acpi/specification/tables-ec-audio-iscsi-csrt-agdi.md` §5.
+// ───────────────────────────────────────────────────────────────────
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct AgdiInfo {
+    pub use_smc:           bool,
+    pub sdei_event_number: u32,
+    pub smc_id:            u64,
+}
+
+static AGDI_DATA: IrqSafeSpinLock<AgdiInfo> = IrqSafeSpinLock::new(AgdiInfo {
+    use_smc: false, sdei_event_number: 0, smc_id: 0,
+});
+static AGDI_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_agdi_body(body: &[u8]) {
+    if body.len() < SDT_HEADER_SIZE + 16 { return; }
+    let off = SDT_HEADER_SIZE;
+    let flags = body[off];
+    let sdei_event_number = u32::from_le_bytes([
+        body[off + 4], body[off + 5], body[off + 6], body[off + 7],
+    ]);
+    let smc_id = u64::from_le_bytes([
+        body[off + 8],  body[off + 9],
+        body[off + 10], body[off + 11],
+        body[off + 12], body[off + 13],
+        body[off + 14], body[off + 15],
+    ]);
+    *AGDI_DATA.lock() = AgdiInfo {
+        use_smc: flags & 1 != 0,
+        sdei_event_number,
+        smc_id,
+    };
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → AGDI must also be identity-mapped.
+pub unsafe fn parse_agdi(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut agdi: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"AGDI" && agdi.is_none() {
+                agdi = Some(phys);
+            }
+        })?;
+    }
+    let agdi = agdi.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (agdi as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 16 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(agdi as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    parse_agdi_body(body);
+    AGDI_PARSED.store(true, Ordering::Release);
+    Ok(())
+}
+
+pub fn agdi_info() -> Option<AgdiInfo> {
+    if !AGDI_PARSED.load(Ordering::Acquire) { return None; }
+    Some(*AGDI_DATA.lock())
+}
+
+#[doc(hidden)]
+pub fn __test_parse_agdi_body(body: &[u8]) {
+    parse_agdi_body(body);
+    AGDI_PARSED.store(true, Ordering::Release);
+}

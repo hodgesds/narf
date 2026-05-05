@@ -18,8 +18,8 @@ asks for. Updated when observable kernel behaviour changes.
   delivers hardware LAPIC-timer IRQs, exits cleanly.
 - `cargo xtask run --arch=aarch64` boots, runs the full async demo
   using CNTPCT_EL0 as the clock, exits via ARM semihosting.
-- `cargo xtask test --arch=x86_64` passes **650/0/29** (pass / fail / skip).
-- `cargo xtask test --arch=aarch64` passes **354/0/11** (pass / fail / skip).
+- `cargo xtask test --arch=x86_64` passes **653/0/31** (pass / fail / skip).
+- `cargo xtask test --arch=aarch64` passes **359/0/11** (pass / fail / skip).
   Skips are x86_64-specific PCIe surfaces or live-device tests that
   skip cleanly when QEMU doesn't expose the device.
 - In-tree PCIe drivers running against real QEMU-emulated devices.
@@ -168,6 +168,11 @@ asks for. Updated when observable kernel behaviour changes.
 | ACPI SDEV        | Secure Devices Table — Type 1 (PCI endpoint) → `SdevPci { segment, start_bdf }`. Spec: `acpi/specification/tables-confidential-power-secure.md` §3. |
 | ACPI SBST        | Smart Battery Specification — `SbstInfo { warning_level_mwh, low_level_mwh, critical_level_mwh }`. Spec: `acpi/specification/tables-confidential-power-secure.md` §4. |
 | ACPI RAS2        | RAS Feature Table — per-PCC descriptor decode → `Ras2Descriptor { pcc_id, feature_type, instance_count }`. Spec: `acpi/specification/tables-confidential-power-secure.md` §5. |
+| ACPI ECDT        | Embedded Controller Boot Resources — `EcdtInfo { control_addr, data_addr, uid, gpe_bit }`. Spec: `acpi/specification/tables-ec-audio-iscsi-csrt-agdi.md` §1. |
+| ACPI NHLT        | Non-HD Audio Link — per-endpoint decode → `NhltEndpoint { link_type, instance_id, vendor_id, device_id, direction }`. Spec: `acpi/specification/tables-ec-audio-iscsi-csrt-agdi.md` §2. |
+| ACPI IBFT        | iSCSI Boot Firmware Table — Type 4 (Target) → `IbftTarget { ip[16], port, lun }`. Spec: `acpi/specification/tables-ec-audio-iscsi-csrt-agdi.md` §3. |
+| ACPI CSRT        | Core System Resource Table — per-Resource-Group decode → `CsrtGroup { vendor_id, device_id, revision }`. Spec: `acpi/specification/tables-ec-audio-iscsi-csrt-agdi.md` §4. |
+| ACPI AGDI        | Arm Generic Diagnostic Dump and Reset Interface — `AgdiInfo { use_smc, sdei_event_number, smc_id }`. Spec: `acpi/specification/tables-ec-audio-iscsi-csrt-agdi.md` §5. |
 | iwlwifi          | Intel Wi-Fi 6 / 6E (AX200 / AX201 / AX210 / AX211). **Structural probe only** — PCI match table + spec doc. Operational register map (CSR/PRPH offsets, firmware loader, TFD/RBD descriptors, host-command opcodes) is not in any public Intel doc; further stages blocked on public register docs. See `drivers/net/specification/iwlwifi.md`. |
 | AHCI (ICH9/10)   | HBA bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT. |
 | xHCI USB host    | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT. |

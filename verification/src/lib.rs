@@ -3807,6 +3807,168 @@ fn smoke_acpi_ras2_synthetic_decode() -> TestResult {
 }
 kernel_test!(smoke_acpi_ras2_synthetic_decode);
 
+fn smoke_acpi_ecdt_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"ECDT");
+    buf.extend_from_slice(&[0u8; 32]);
+    // EcControl GAS — addr @ +4..12.
+    buf.extend_from_slice(&[0u8; 4]);
+    buf.extend_from_slice(&0x62u64.to_le_bytes());        // control = 0x62
+    // EcData GAS — addr @ +4..12.
+    buf.extend_from_slice(&[0u8; 4]);
+    buf.extend_from_slice(&0x66u64.to_le_bytes());        // data = 0x66
+    buf.extend_from_slice(&0xABCDu32.to_le_bytes());      // uid
+    buf.push(9);                                          // gpe bit
+    buf.push(b'E'); buf.push(b'C'); buf.push(0);          // namespace string
+
+    narf_acpi::__test_parse_ecdt_body(&buf);
+    let info = narf_acpi::ecdt_info().expect("ECDT not parsed");
+    if info.control_addr != 0x62 || info.data_addr != 0x66
+        || info.uid != 0xABCD || info.gpe_bit != 9
+    {
+        return TestResult::Fail("ECDT decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_ecdt_synthetic_decode);
+
+fn smoke_acpi_nhlt_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    use narf_acpi::NhltEndpoint;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"NHLT");
+    buf.extend_from_slice(&[0u8; 32]);
+    buf.push(1);                                          // endpoint count
+
+    // Endpoint: length (4) + linkType (1) + instanceId (1) +
+    //           vendorId (2) + deviceId (2) + revisionId (2) +
+    //           subsystemId (4) + deviceType (1) + direction (1) +
+    //           virtualBusId (1) = 19 bytes minimum.
+    buf.extend_from_slice(&19u32.to_le_bytes());
+    buf.push(2);                                          // link_type = PDM
+    buf.push(5);                                          // instance_id
+    buf.extend_from_slice(&0x8086u16.to_le_bytes());      // vendor
+    buf.extend_from_slice(&0x1234u16.to_le_bytes());      // device
+    buf.extend_from_slice(&0u16.to_le_bytes());           // revision
+    buf.extend_from_slice(&0u32.to_le_bytes());           // subsystem
+    buf.push(0);                                          // device type
+    buf.push(1);                                          // direction = capture
+    buf.push(0);                                          // virtual bus id
+
+    let n = narf_acpi::__test_parse_nhlt_body(&buf);
+    if n != 1 {
+        return TestResult::Fail("expected 1 NHLT endpoint parsed");
+    }
+    let mut eps = [NhltEndpoint::default(); 4];
+    let nn = narf_acpi::copy_nhlt_endpoints(&mut eps);
+    if nn != 1
+        || eps[0].link_type != 2
+        || eps[0].instance_id != 5
+        || eps[0].vendor_id != 0x8086
+        || eps[0].device_id != 0x1234
+        || eps[0].direction != 1
+    {
+        return TestResult::Fail("NHLT endpoint decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_nhlt_synthetic_decode);
+
+fn smoke_acpi_ibft_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    use narf_acpi::IbftTarget;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"IBFT");
+    buf.extend_from_slice(&[0u8; 32]);
+    buf.extend_from_slice(&[0u8; 12]);                    // reserved
+
+    // Target structure (id=4, len=32).
+    buf.push(4);
+    buf.push(0);                                          // version
+    buf.extend_from_slice(&32u16.to_le_bytes());          // length
+    buf.push(0);                                          // index
+    buf.push(0);                                          // flags
+    // 16-byte IPv6-mapped target IP.
+    let ip = [0,0,0,0, 0,0,0,0, 0,0,0xFF,0xFF, 192,168,1,42];
+    buf.extend_from_slice(&ip);
+    buf.extend_from_slice(&3260u16.to_le_bytes());
+    buf.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+
+    let n = narf_acpi::__test_parse_ibft_body(&buf);
+    if n != 1 {
+        return TestResult::Fail("expected 1 IBFT target parsed");
+    }
+    let mut targets = [IbftTarget::default(); 4];
+    let nt = narf_acpi::copy_ibft_targets(&mut targets);
+    if nt != 1 || targets[0].port != 3260 || targets[0].lun != 0x0102_0304_0506_0708 {
+        return TestResult::Fail("IBFT target decode mismatch");
+    }
+    if &targets[0].ip[12..] != &[192, 168, 1, 42] {
+        return TestResult::Fail("IBFT IP decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_ibft_synthetic_decode);
+
+fn smoke_acpi_csrt_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    use narf_acpi::CsrtGroup;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"CSRT");
+    buf.extend_from_slice(&[0u8; 32]);
+
+    // Resource Group: length (4) + vendor_id (4) + sub_vendor (4) +
+    //                  device_id (2) + sub_device (2) + revision (2) +
+    //                  reserved (2) + shared_info_len (4) = 24
+    buf.extend_from_slice(&24u32.to_le_bytes());
+    buf.extend_from_slice(&0x8086u32.to_le_bytes());      // vendor
+    buf.extend_from_slice(&0u32.to_le_bytes());           // sub vendor
+    buf.extend_from_slice(&0xCAFEu16.to_le_bytes());      // device
+    buf.extend_from_slice(&0u16.to_le_bytes());           // sub device
+    buf.extend_from_slice(&3u16.to_le_bytes());           // revision
+    buf.extend_from_slice(&0u16.to_le_bytes());           // reserved
+    buf.extend_from_slice(&0u32.to_le_bytes());           // shared info len
+
+    let n = narf_acpi::__test_parse_csrt_body(&buf);
+    if n != 1 {
+        return TestResult::Fail("expected 1 CSRT group parsed");
+    }
+    let mut groups = [CsrtGroup::default(); 4];
+    let ng = narf_acpi::copy_csrt_groups(&mut groups);
+    if ng != 1
+        || groups[0].vendor_id != 0x8086
+        || groups[0].device_id != 0xCAFE
+        || groups[0].revision  != 3
+    {
+        return TestResult::Fail("CSRT group decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_csrt_synthetic_decode);
+
+fn smoke_acpi_agdi_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"AGDI");
+    buf.extend_from_slice(&[0u8; 32]);
+    buf.push(1);                                          // flags: SMC
+    buf.extend_from_slice(&[0u8; 3]);                     // reserved
+    buf.extend_from_slice(&0x42u32.to_le_bytes());        // sdei event num
+    buf.extend_from_slice(&0x8400_FFFFu64.to_le_bytes()); // smc id
+
+    narf_acpi::__test_parse_agdi_body(&buf);
+    let info = narf_acpi::agdi_info().expect("AGDI not parsed");
+    if !info.use_smc
+        || info.sdei_event_number != 0x42
+        || info.smc_id != 0x8400_FFFF
+    {
+        return TestResult::Fail("AGDI decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_agdi_synthetic_decode);
+
 fn smoke_acpi_srat_synthetic_memory_entry() -> TestResult {
     // Type-1 memory affinity entry: base 0x1_0000_0000, length
     // 0x1000_0000, proximity 1, enabled.

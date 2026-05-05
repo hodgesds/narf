@@ -735,6 +735,16 @@ Live from boot through `cargo xtask run`:
   Memory Window). BERT yields `BertInfo { region_addr,
   region_length }` for the boot-error region. Spec:
   `acpi/specification/tables-ras-cxl-locality.md`.
+- ACPI ECDT / NHLT / IBFT / CSRT / AGDI (`narf_acpi`):
+  embedded-controller, audio-link, iSCSI-boot, generic-resource,
+  Arm-diagnostic parsers. ECDT yields `EcdtInfo` (control GAS,
+  data GAS, UID, GPE bit). NHLT yields per-endpoint
+  `NhltEndpoint` (link type, instance id, vendor / device id,
+  direction). IBFT yields `IbftTarget` (16-byte IPv6-mapped
+  target IP, port, LUN). CSRT yields per-Resource-Group
+  `CsrtGroup` (vendor, device, revision). AGDI yields
+  `AgdiInfo` (SDEI vs SMC, SDEI event number, SMC id). Spec:
+  `acpi/specification/tables-ec-audio-iscsi-csrt-agdi.md`.
 - ACPI CCEL / MPST / SDEV / SBST / RAS2 (`narf_acpi`):
   Confidential-compute + memory-power + secure-devices +
   smart-battery + RAS-feature parsers. CCEL yields
@@ -816,8 +826,8 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **650/0/29** smokes;
-`--arch=aarch64` passes **354/0/11**. Skips are x86-specific PCIe
+`cargo xtask test --arch=x86_64` passes **653/0/31** smokes;
+`--arch=aarch64` passes **359/0/11**. Skips are x86-specific PCIe
 surfaces or live-device tests that skip cleanly when QEMU doesn't
 expose the device. See `STATUS.md` for the full tally and per-
 subsystem breakdown.
