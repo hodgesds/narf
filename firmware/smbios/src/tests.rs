@@ -421,3 +421,88 @@ fn smoke_smbios_full_dispatch_coverage() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("firmware/smbios", smoke_smbios_full_dispatch_coverage);
+
+fn smoke_smbios_entry_point_sm3() -> TestResult {
+    // 24-byte SMBIOS3 anchor:
+    //   "_SM3_" (5) + checksum (1) + length=24 (1) + major (1) +
+    //   minor (1) + docrev (1) + ep-rev (1) + reserved (1) +
+    //   max-size (4) + table-phys (8) = 24
+    let mut buf = [0u8; 24];
+    buf[0..5].copy_from_slice(b"_SM3_");
+    buf[6] = 24;            // length
+    buf[7] = 3;             // major = 3
+    buf[8] = 4;             // minor = 4
+    buf[9] = 0;             // docrev
+    buf[10] = 1;            // ep rev
+    buf[12..16].copy_from_slice(&0x4000u32.to_le_bytes());
+    buf[16..24].copy_from_slice(&0xCAFE_F00D_0000u64.to_le_bytes());
+
+    // Patch checksum so the bytes sum to 0.
+    let raw_sum: u8 = buf.iter().fold(0u8, |a, b| a.wrapping_add(*b));
+    buf[5] = (0u8).wrapping_sub(raw_sum);
+
+    let ep = smbios::from_anchor_bytes(&buf).expect("SM3 not decoded");
+    if ep.version_major != 3
+        || ep.version_minor != 4
+        || ep.struct_table_phys != 0xCAFE_F00D_0000
+        || ep.struct_table_len != 0x4000
+        || ep.structure_count != 0
+    {
+        return TestResult::Fail("SM3 decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("firmware/smbios", smoke_smbios_entry_point_sm3);
+
+fn smoke_smbios_entry_point_sm() -> TestResult {
+    // 31-byte legacy SMBIOS anchor:
+    //   "_SM_" (4) + ep-checksum (1) + ep-length=31 (1) +
+    //   major (1) + minor (1) + max-struct-size (2) +
+    //   ep-revision (1) + formatted-area (5) +
+    //   "_DMI_" (5) + inter-checksum (1) +
+    //   table-length (2) + table-addr32 (4) +
+    //   structure-count (2) + bcd-revision (1) = 31
+    let mut buf = [0u8; 31];
+    buf[0..4].copy_from_slice(b"_SM_");
+    buf[5] = 31;                                          // ep length
+    buf[6] = 2;                                           // major = 2
+    buf[7] = 8;                                           // minor = 8
+    buf[8..10].copy_from_slice(&64u16.to_le_bytes());     // max struct size
+    buf[16..21].copy_from_slice(b"_DMI_");
+    buf[22..24].copy_from_slice(&0x800u16.to_le_bytes()); // table length
+    buf[24..28].copy_from_slice(&0x000F_0000u32.to_le_bytes()); // table phys
+    buf[28..30].copy_from_slice(&7u16.to_le_bytes());     // structure count
+    buf[30] = 0x28;                                       // BCD revision
+
+    // Patch the inter-checksum (over bytes 16..) so 16..32 sums to 0.
+    let inter_sum: u8 = buf[16..31].iter().fold(0u8, |a, b| a.wrapping_add(*b));
+    buf[21] = (0u8).wrapping_sub(inter_sum);
+    // Patch the entry-point checksum (over bytes 0..) so 0..ep_len sums to 0.
+    let ep_sum: u8 = buf.iter().fold(0u8, |a, b| a.wrapping_add(*b));
+    buf[4] = (0u8).wrapping_sub(ep_sum);
+
+    let ep = smbios::from_anchor_bytes(&buf).expect("SM not decoded");
+    if ep.version_major != 2
+        || ep.version_minor != 8
+        || ep.struct_table_phys != 0x000F_0000
+        || ep.struct_table_len != 0x800
+        || ep.structure_count != 7
+    {
+        return TestResult::Fail("SM decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("firmware/smbios", smoke_smbios_entry_point_sm);
+
+fn smoke_smbios_entry_point_rejects_bad_checksum() -> TestResult {
+    let mut buf = [0u8; 24];
+    buf[0..5].copy_from_slice(b"_SM3_");
+    buf[5] = 0xFF;                                        // intentionally wrong
+    buf[6] = 24;
+    buf[7] = 3; buf[8] = 4;
+    if smbios::from_anchor_bytes(&buf).is_some() {
+        return TestResult::Fail("expected None on bad checksum");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("firmware/smbios", smoke_smbios_entry_point_rejects_bad_checksum);

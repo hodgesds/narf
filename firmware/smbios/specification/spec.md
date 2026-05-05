@@ -50,6 +50,37 @@ that slice (e.g., via QEMU `fw_cfg`'s `etc/smbios/smbios-tables`
 key, the EFI configuration table, or a UEFI-discovered
 SMBIOS3 entry point).
 
+## Entry-point discovery
+
+The parser ships two ways to locate the structure stream:
+
+1. **`scan_legacy_bios()`** — x86_64 only. Walks
+   `0x000F_0000 .. 0x0010_0000` on 16-byte boundaries looking
+   for the `_SM3_` / `_SM_` anchor. Validates the entry-point
+   checksum before declaring victory; firmware sometimes leaves
+   stale anchors lying around. Returns `(struct_table_phys,
+   struct_table_len, version_major, version_minor)` on success.
+   The caller copies the structure stream into a slice and
+   hands that to `parse_stream`.
+
+2. **`from_anchor_bytes(bytes)`** — pure-data: takes a slice
+   covering the entry-point structure (e.g. content of QEMU
+   `fw_cfg`'s `etc/smbios/smbios-anchor` key) and decodes it.
+   Returns the same `EntryPoint` shape. Use this when the
+   firmware-config interface hands the entry point in-band.
+
+Both helpers share the `EntryPoint` decoded shape:
+
+```rust
+pub struct EntryPoint {
+    pub version_major:   u8,
+    pub version_minor:   u8,
+    pub struct_table_phys: u64,
+    pub struct_table_len:  u32,
+    pub structure_count:   u16,    // 0 for SMBIOS3 (terminator-driven)
+}
+```
+
 ## 1. Entry point
 
 Two formats:

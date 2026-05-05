@@ -18,8 +18,8 @@ asks for. Updated when observable kernel behaviour changes.
   delivers hardware LAPIC-timer IRQs, exits cleanly.
 - `cargo xtask run --arch=aarch64` boots, runs the full async demo
   using CNTPCT_EL0 as the clock, exits via ARM semihosting.
-- `cargo xtask test --arch=x86_64` passes **672/0/29** (pass / fail / skip).
-- `cargo xtask test --arch=aarch64` passes **377/0/10** (pass / fail / skip).
+- `cargo xtask test --arch=x86_64` passes **675/0/29** (pass / fail / skip).
+- `cargo xtask test --arch=aarch64` passes **380/0/10** (pass / fail / skip).
   Skips are x86_64-specific PCIe surfaces or live-device tests that
   skip cleanly when QEMU doesn't expose the device.
 - In-tree PCIe drivers running against real QEMU-emulated devices.

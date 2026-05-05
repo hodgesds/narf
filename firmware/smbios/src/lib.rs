@@ -30,6 +30,110 @@ mod tests;
 /// `kernel_test_in!` registrations in `tests.rs`.
 pub fn register_initcalls() {}
 
+// ───────────────────────────────────────────────────────────────────
+// Entry-point discovery
+// ───────────────────────────────────────────────────────────────────
+
+/// Decoded SMBIOS entry point (handles both legacy `_SM_` / 32-bit
+/// and `_SM3_` / 64-bit forms).
+#[derive(Copy, Clone, Debug, Default)]
+pub struct EntryPoint {
+    pub version_major:     u8,
+    pub version_minor:     u8,
+    pub struct_table_phys: u64,
+    pub struct_table_len:  u32,
+    /// 0 for SMBIOS 3 (the structure stream is walked until the
+    /// Type-127 end-of-table marker).
+    pub structure_count:   u16,
+}
+
+fn checksum(bytes: &[u8]) -> u8 {
+    bytes.iter().fold(0u8, |a, b| a.wrapping_add(*b))
+}
+
+fn decode_sm3(bytes: &[u8]) -> Option<EntryPoint> {
+    if bytes.len() < 24 || &bytes[0..5] != b"_SM3_" { return None; }
+    let len = bytes[6] as usize;
+    if len < 24 || bytes.len() < len { return None; }
+    if checksum(&bytes[..len]) != 0 { return None; }
+    let major = bytes[7];
+    let minor = bytes[8];
+    let max_size = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+    let table_phys = u64::from_le_bytes([
+        bytes[16], bytes[17], bytes[18], bytes[19],
+        bytes[20], bytes[21], bytes[22], bytes[23],
+    ]);
+    Some(EntryPoint {
+        version_major:     major,
+        version_minor:     minor,
+        struct_table_phys: table_phys,
+        struct_table_len:  max_size,
+        structure_count:   0,
+    })
+}
+
+fn decode_sm(bytes: &[u8]) -> Option<EntryPoint> {
+    if bytes.len() < 31 || &bytes[0..4] != b"_SM_" { return None; }
+    let ep_len = bytes[5] as usize;
+    if ep_len < 31 || bytes.len() < ep_len { return None; }
+    if checksum(&bytes[..ep_len]) != 0 { return None; }
+    if &bytes[16..21] != b"_DMI_" { return None; }
+    if checksum(&bytes[16..32.min(bytes.len())]) != 0 { return None; }
+    let major = bytes[6];
+    let minor = bytes[7];
+    let table_len = u16::from_le_bytes([bytes[22], bytes[23]]) as u32;
+    let table_phys = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]) as u64;
+    let count = u16::from_le_bytes([bytes[28], bytes[29]]);
+    Some(EntryPoint {
+        version_major:     major,
+        version_minor:     minor,
+        struct_table_phys: table_phys,
+        struct_table_len:  table_len,
+        structure_count:   count,
+    })
+}
+
+/// Decode an entry-point structure handed in as a byte slice.
+/// Tries `_SM3_` first, then falls back to `_SM_`. Validates
+/// checksums on both forms.
+pub fn from_anchor_bytes(bytes: &[u8]) -> Option<EntryPoint> {
+    decode_sm3(bytes).or_else(|| decode_sm(bytes))
+}
+
+/// Scan the legacy BIOS region `0x000F_0000 .. 0x0010_0000` for an
+/// SMBIOS entry-point anchor. x86_64 only; returns `None` on every
+/// other architecture.
+///
+/// # Safety
+/// The scanned range is identity-mapped low ROM on every PC firmware
+/// path the kernel boots through. Reads are 32-byte-bounded against
+/// the upper limit.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn scan_legacy_bios() -> Option<EntryPoint> {
+    const START: usize = 0x000F_0000;
+    const END:   usize = 0x0010_0000;
+    let mut p = START;
+    while p + 32 <= END {
+        // SAFETY: identity-mapped low ROM; 32-byte read at 16-byte
+        // alignment is defined.
+        let slice = unsafe { core::slice::from_raw_parts(p as *const u8, 32) };
+        if &slice[0..5] == b"_SM3_" {
+            // SAFETY: 24-byte read fits the 32-byte window.
+            if let Some(ep) = decode_sm3(slice) { return Some(ep); }
+        }
+        if &slice[0..4] == b"_SM_" {
+            if let Some(ep) = decode_sm(slice) { return Some(ep); }
+        }
+        p += 16;
+    }
+    None
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub unsafe fn scan_legacy_bios() -> Option<EntryPoint> {
+    None
+}
+
 pub const MAX_BIOS:                 usize = 1;
 pub const MAX_SYSTEM:               usize = 1;
 pub const MAX_BASEBOARD:            usize = 4;
