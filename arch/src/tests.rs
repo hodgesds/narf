@@ -1074,3 +1074,81 @@ fn smoke_pasid_supported_path() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("arch/pasid", smoke_pasid_supported_path);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_vtd_caps_decode() -> TestResult {
+    use crate::x86_64::vtd;
+    // Build a synthetic register block:
+    //   ver = 0x10  → major 1, minor 0
+    //   cap.ND = 0  → 16 domains
+    //   cap.SAGAW bits[12:8] = 0b00100 (39-bit) → sagaw = 0x4
+    //   cap.NFR (bits[47:40]) = 0x07 → 8 regs
+    //   ecap.QI (bit 1) + IR (bit 3)
+    let ver  = 0x0000_0010u32;
+    let cap  = (0x4u64 << 8) | (0x7u64 << 40);
+    let ecap = 0b1010u64;
+    let c = vtd::decode_caps(ver, cap, ecap);
+    if c.version_major != 1 || c.version_minor != 0 {
+        return TestResult::Fail("version decode mismatch");
+    }
+    if c.num_domains != 16 {
+        return TestResult::Fail("num_domains decode mismatch");
+    }
+    if c.sagaw != 0x4 || c.num_fault_regs != 8 {
+        return TestResult::Fail("sagaw / nfr decode mismatch");
+    }
+    if !c.queued_invalidation || !c.interrupt_remap {
+        return TestResult::Fail("ecap bits not decoded");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/vtd", smoke_vtd_caps_decode);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_amd_vi_caps_decode() -> TestResult {
+    use crate::x86_64::amd_vi;
+    let ctrl = amd_vi::CTRL_IOMMUEN | amd_vi::CTRL_EVTLOGEN | amd_vi::CTRL_CMDBUFEN;
+    let efr  = amd_vi::EFR_PPRSUP   | amd_vi::EFR_GTSUP     | amd_vi::EFR_XTSUP;
+    let c = amd_vi::decode_caps(ctrl, efr);
+    if !c.iommu_enabled || !c.event_log_enabled || !c.command_buf_enabled {
+        return TestResult::Fail("ctrl bits not decoded");
+    }
+    if !c.ppr_supported || !c.gt_supported || !c.xts_supported {
+        return TestResult::Fail("efr bits not decoded");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/amd_vi", smoke_amd_vi_caps_decode);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_rar_supported_path() -> TestResult {
+    use crate::x86_64::rar;
+    let _ = rar::supported();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/rar", smoke_rar_supported_path);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_smmuv3_caps_decode() -> TestResult {
+    use crate::aarch64::smmuv3;
+    // S1P + S2P, TTF = 0b11 (4K + 16K + 64K), QUEUE share = 0b11
+    let idr0 = 0b11u32 | (0b11 << 10) | (0b11 << 12);
+    let idr1 = 0x10u32; // SIDSIZE = 16
+    let idr5 = 0x5u32;  // OAS class = 5
+    let c = smmuv3::decode_caps(idr0, idr1, idr5);
+    if !c.s1p || !c.s2p {
+        return TestResult::Fail("S1P/S2P decode mismatch");
+    }
+    if !c.ttf16 || !c.ttf64 {
+        return TestResult::Fail("TTF granule decode mismatch");
+    }
+    if c.sid_width != 0x10 || c.oas != 5 || c.queue_base_share != 0b11 {
+        return TestResult::Fail("idr1/5/queue-share decode mismatch");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/smmuv3", smoke_smmuv3_caps_decode);

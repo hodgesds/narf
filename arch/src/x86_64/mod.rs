@@ -1,6 +1,7 @@
 //! x86_64 arch backend.
 
 pub mod acpi;
+pub mod amd_vi;
 pub mod asm;
 pub mod avx10;
 pub mod bhi;
@@ -36,6 +37,7 @@ pub mod pasid;
 pub mod pmu;
 pub mod probe;
 pub mod pt;
+pub mod rar;
 pub mod rdpru;
 pub mod rdt;
 pub mod rtc;
@@ -49,6 +51,7 @@ pub mod tsc;
 pub mod uintr;
 pub mod user_mode;
 pub mod vmx;
+pub mod vtd;
 pub mod waitpkg;
 pub mod wrmsrns;
 pub mod xsave;

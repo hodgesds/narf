@@ -18,8 +18,8 @@ asks for. Updated when observable kernel behaviour changes.
   delivers hardware LAPIC-timer IRQs, exits cleanly.
 - `cargo xtask run --arch=aarch64` boots, runs the full async demo
   using CNTPCT_EL0 as the clock, exits via ARM semihosting.
-- `cargo xtask test --arch=x86_64` passes **610/0/29** (pass / fail / skip).
-- `cargo xtask test --arch=aarch64` passes **314/0/10** (pass / fail / skip).
+- `cargo xtask test --arch=x86_64` passes **613/0/29** (pass / fail / skip).
+- `cargo xtask test --arch=aarch64` passes **315/0/10** (pass / fail / skip).
   Skips are x86_64-specific PCIe surfaces or live-device tests that
   skip cleanly when QEMU doesn't expose the device.
 - In-tree PCIe drivers running against real QEMU-emulated devices.
@@ -117,6 +117,10 @@ asks for. Updated when observable kernel behaviour changes.
 | aarch64 SPECRES  | `ID_AA64ISAR1_EL1.SPECRES` (bits[43:40]) decode + `cfp_rctx(ctx)` raw `SYS #3, C7, C3, #4, Xt` wrapper. Spec: `arch/specification/cpu-compute-confidential.md` §3. |
 | Intel BHI ctrl   | CPUID(7, 2).EDX[4] `BHI_NO` + IA32_SPEC_CTRL.BHI_DIS_S (bit 10) enable / disable. Spec: `arch/specification/cpu-compute-confidential.md` §4. |
 | Intel PASID      | CPUID(7, 0).ECX[2] gate + IA32_PASID (`0xD93`) read/write/invalidate (20-bit PASID + VALID bit) for accelerator SVA. Spec: `arch/specification/cpu-compute-confidential.md` §5. |
+| Intel VT-d       | DMA-Remap engine register layout (VER / CAP / ECAP / GCMD / GSTS / RTADDR / FSTS / PMEN) + `decode_caps(ver, cap, ecap)` → `VtdCaps { version, num_domains, sagaw, num_fault_regs, queued_invalidation, interrupt_remap }` + `read_caps` / `read_gsts` / `write_gcmd` / `write_rtaddr` MMIO helpers. Spec: `arch/specification/iommu-interconnect.md` §1. |
+| AMD-Vi IOMMU     | MMIO register layout (DEV_TAB_BASE / CMD_BUF_BASE / EVT_LOG_BASE / IOMMU_CTRL / EXT_FEATURES / PPR_LOG_BASE) + `decode_caps(ctrl, efr)` → `AmdViCaps { iommu_enabled, event_log_enabled, command_buf_enabled, ppr/gt/xts supported }` + `read_caps` / `read_ctrl` / `write_ctrl` MMIO helpers. Spec: `arch/specification/iommu-interconnect.md` §2. |
+| Intel RAR        | CPUID(7, 1).EAX[31] gate + IA32_RAR_INFO_BASE (`0x1024`) / IA32_RAR_CTRL (`0x1025`) read/write + `doorbell(mmio_base, action, target_lpid, payload)` for vector-less remote actions (TLB shootdown / RDPMC / INVD). Spec: `arch/specification/iommu-interconnect.md` §3. |
+| ARM SMMUv3       | MMIO register layout (IDR0..5 / CR0..2 / GBPA / STRTAB_BASE) + `decode_caps(idr0, idr1, idr5)` → `SmmuCaps { s1p, s2p, ttf16, ttf64, oas, sid_width, queue_base_share }` + `read_caps` / `read_cr0` / `write_cr0` / `write_strtab_base` MMIO helpers. Spec: `arch/specification/iommu-interconnect.md` §4. |
 | iwlwifi          | Intel Wi-Fi 6 / 6E (AX200 / AX201 / AX210 / AX211). **Structural probe only** — PCI match table + spec doc. Operational register map (CSR/PRPH offsets, firmware loader, TFD/RBD descriptors, host-command opcodes) is not in any public Intel doc; further stages blocked on public register docs. See `drivers/net/specification/iwlwifi.md`. |
 | AHCI (ICH9/10)   | HBA bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT. |
 | xHCI USB host    | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT. |

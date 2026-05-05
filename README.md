@@ -600,6 +600,32 @@ Live from boot through `cargo xtask run`:
   .ECX[2] gate + `IA32_PASID` (`0xD93`) read/write/invalidate
   (20-bit PASID + VALID bit). Spec:
   `arch/specification/cpu-compute-confidential.md` §5.
+- Intel VT-d (`narf_arch::x86_64::vtd`): DMA-Remap engine
+  register-block layout per SDM Vol 3 §10. VER / CAP / ECAP /
+  GCMD / GSTS / RTADDR / FSTS / PMEN offsets, GCMD/GSTS bit
+  constants, and `decode_caps(ver, cap, ecap)` → `VtdCaps`
+  (version, num_domains, sagaw, num_fault_regs, queued
+  invalidation, interrupt remap) + MMIO read / write helpers.
+  Spec: `arch/specification/iommu-interconnect.md` §1.
+- AMD-Vi IOMMU (`narf_arch::x86_64::amd_vi`): per the AMD IOMMU
+  spec rev 3.10. DEV_TAB_BASE / CMD_BUF_BASE / EVT_LOG_BASE /
+  IOMMU_CTRL / EXT_FEATURES / PPR_LOG_BASE offsets,
+  `decode_caps(ctrl, efr)` → `AmdViCaps` (enable bits + PPR /
+  GT / XTS) + MMIO read / write helpers. Spec:
+  `arch/specification/iommu-interconnect.md` §2.
+- Intel RAR (`narf_arch::x86_64::rar`): Remote Action Request
+  fast-path doorbell. CPUID(7, 1).EAX[31] gate +
+  IA32_RAR_INFO_BASE / IA32_RAR_CTRL MSRs +
+  `doorbell(mmio_base, action, target_lpid, payload)` for
+  vector-less remote TLB shootdown / RDPMC / INVD on Sapphire
+  Rapids+. Spec:
+  `arch/specification/iommu-interconnect.md` §3.
+- ARM SMMUv3 (`narf_arch::aarch64::smmuv3`): per Arm IHI 0070.
+  IDR0..5 / CR0..2 / GBPA / STRTAB_BASE offsets,
+  `decode_caps(idr0, idr1, idr5)` → `SmmuCaps` (S1P / S2P,
+  TTF16 / TTF64 granule support, OAS class, SIDSIZE,
+  queue-base shareability) + MMIO read / write helpers. Spec:
+  `arch/specification/iommu-interconnect.md` §4.
 - aarch64 SVE / SVE2 (`narf_arch::aarch64::sve`):
   `ID_AA64PFR0_EL1.SVE` + `ID_AA64ZFR0_EL1.SVEver` decode →
   `SveCaps { sve, sve2, sve21 }` (CPACR-safe; reads ID-group
@@ -630,8 +656,8 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **610/0/29** smokes;
-`--arch=aarch64` passes **314/0/10**. Skips are x86-specific PCIe
+`cargo xtask test --arch=x86_64` passes **613/0/29** smokes;
+`--arch=aarch64` passes **315/0/10**. Skips are x86-specific PCIe
 surfaces or live-device tests that skip cleanly when QEMU doesn't
 expose the device. See `STATUS.md` for the full tally and per-
 subsystem breakdown.
