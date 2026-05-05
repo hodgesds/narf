@@ -868,11 +868,11 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **675/0/29** smokes;
-`--arch=aarch64` passes **380/0/10**. Skips are x86-specific PCIe
-surfaces or live-device tests that skip cleanly when QEMU doesn't
-expose the device. See `STATUS.md` for the full tally and per-
-subsystem breakdown.
+Run `cargo xtask test --arch=x86_64` (or `--arch=aarch64`) for the
+full kernel-test summary; the runner prints
+`── summary: <pass> pass, <fail> fail, <skip> skip ──`. Skips are
+x86-specific PCIe surfaces or live-device tests that skip cleanly
+when QEMU doesn't expose the device.
 
 ## Repository layout
 
