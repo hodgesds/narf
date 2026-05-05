@@ -1,0 +1,18 @@
+[package]
+name = "narf-accel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+narf-lib = { path = "../lib" }
+narf-capabilities = { path = "../capabilities" }
+narf-ipc = { path = "../ipc" }
+narf-io = { path = "../io" }
+narf-net = { path = "../net" }
+async-trait = "0.1"
+futures = { version = "0.3", default-features = false }
+narf-kernel-test = { path = "../verification/kernel-test" }
+bitflags = "2.4"
+
+[features]
+kernel-test = []
