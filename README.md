@@ -626,6 +626,39 @@ Live from boot through `cargo xtask run`:
   TTF16 / TTF64 granule support, OAS class, SIDSIZE,
   queue-base shareability) + MMIO read / write helpers. Spec:
   `arch/specification/iommu-interconnect.md` §4.
+- Intel IR (`narf_arch::x86_64::ir`): Interrupt Remapping Table
+  Entry encode / decode (present, fault-disable, dest-mode,
+  vector, delivery-mode, destination) + `write_irtar(reg_base,
+  table_pa, log2_size)` IRTAR programming on top of the
+  existing VT-d primitives. Spec:
+  `arch/specification/irq-cache-numa.md` §1.
+- AMD GA (`narf_arch::x86_64::amd_ga`): thin predicates
+  `ga_supported(efr)` / `ia_supported(efr)` over the AMD-Vi
+  `EXT_FEATURES` bitmap so callers don't reach into the bitmap
+  directly. Spec: `arch/specification/irq-cache-numa.md` §2.
+- GICv3 ITS (`narf_arch::aarch64::gits`): per Arm IHI 0069.
+  CTLR / IIDR / TYPER / CBASER / CWRITER / CREADR / BASER0
+  offsets, `decode_caps(typer)` → `GitsCaps` (id_bits, dev_bits,
+  hcc, physical) + enable / disable / write_cbaser MMIO
+  helpers. Spec: `arch/specification/irq-cache-numa.md` §3.
+- x86_64 cache topology (`narf_arch::x86_64::cache_topology`):
+  per-level enumerator over CPUID(4) (Intel) / CPUID(0x80000_01D)
+  (AMD/Hygon) → `CacheLevel { level, kind, line_bytes,
+  partitions, ways, sets, size_bytes, fully_assoc,
+  apic_ids_sharing }`. Spec:
+  `arch/specification/irq-cache-numa.md` §4.
+- aarch64 cache topology (`narf_arch::aarch64::cache_topology`):
+  per-level enumerator over CLIDR_EL1 + CSSELR_EL1 + CCSIDR_EL1
+  → `CacheLevel { level, kind, line_bytes, ways, sets,
+  size_bytes }`. Handles separate I/D + unified caches via the
+  CLIDR field-per-level encoding. Spec:
+  `arch/specification/irq-cache-numa.md` §5.
+- NUMA primitives (`narf_arch::x86_64::numa` /
+  `narf_arch::aarch64::numa`): x86 `set_apic_to_domain(cb)`
+  hook for SRAT consumers + `domain_for_apic_id(apic_id)`
+  lookup; aarch64 `cluster_id(mpidr)` decode helper +
+  `domain_for_current_cpu()` (Aff2). Spec:
+  `arch/specification/irq-cache-numa.md` §6.
 - aarch64 SVE / SVE2 (`narf_arch::aarch64::sve`):
   `ID_AA64PFR0_EL1.SVE` + `ID_AA64ZFR0_EL1.SVEver` decode →
   `SveCaps { sve, sve2, sve21 }` (CPACR-safe; reads ID-group
@@ -656,8 +689,8 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **613/0/29** smokes;
-`--arch=aarch64` passes **315/0/10**. Skips are x86-specific PCIe
+`cargo xtask test --arch=x86_64` passes **616/0/29** smokes;
+`--arch=aarch64` passes **318/0/10**. Skips are x86-specific PCIe
 surfaces or live-device tests that skip cleanly when QEMU doesn't
 expose the device. See `STATUS.md` for the full tally and per-
 subsystem breakdown.

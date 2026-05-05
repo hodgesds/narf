@@ -1152,3 +1152,95 @@ fn smoke_smmuv3_caps_decode() -> TestResult {
 }
 #[cfg(target_arch = "aarch64")]
 kernel_test_in!("arch/smmuv3", smoke_smmuv3_caps_decode);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_irte_encode_decode() -> TestResult {
+    use crate::x86_64::ir;
+    let e = ir::Irte {
+        present:       true,
+        fault_disable: true,
+        dest_logical:  false,
+        vector:        0xA,
+        delivery_mode: 0b100,   // NMI
+        destination:   0x1234,
+    };
+    let raw = ir::encode_irte(e);
+    let back = ir::decode_irte(raw);
+    if back != e {
+        return TestResult::Fail("IRTE encode/decode round-trip mismatch");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/ir", smoke_irte_encode_decode);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_amd_ga_predicate() -> TestResult {
+    use crate::x86_64::amd_ga;
+    use crate::x86_64::amd_vi::{EFR_GASUP, EFR_IASUP};
+    if !amd_ga::ga_supported(EFR_GASUP) {
+        return TestResult::Fail("ga_supported false on EFR with GASUP set");
+    }
+    if amd_ga::ga_supported(EFR_IASUP) {
+        return TestResult::Fail("ga_supported true on EFR with only IASUP");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/amd_ga", smoke_amd_ga_predicate);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_x86_cache_levels_present() -> TestResult {
+    use crate::x86_64::cache_topology;
+    let mut count = 0u32;
+    cache_topology::levels(|_| count += 1);
+    if count == 0 {
+        return TestResult::Fail("no cache levels enumerated");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/cache_topology", smoke_x86_cache_levels_present);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_gits_caps_decode() -> TestResult {
+    use crate::aarch64::gits;
+    // ID-bits = 16, Devbits = 8, HCC = 0xABCD, physical bit set.
+    let typer: u64 = (15)            // (id_bits - 1) = 15 → 16
+                   | ((7u64) << 8)   // (dev_bits - 1) = 7 → 8
+                   | ((0xABCDu64) << 16)
+                   | (1u64 << 32);
+    let c = gits::decode_caps(typer);
+    if c.id_bits != 16 || c.dev_bits != 8 || c.hcc != 0xABCD || !c.physical {
+        return TestResult::Fail("ITS TYPER decode mismatch");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/gits", smoke_gits_caps_decode);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_aarch_cache_levels_present() -> TestResult {
+    use crate::aarch64::cache_topology;
+    let mut count = 0u32;
+    cache_topology::levels(|_| count += 1);
+    if count == 0 {
+        return TestResult::Fail("no cache levels enumerated");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/cache_topology", smoke_aarch_cache_levels_present);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_numa_cluster_id() -> TestResult {
+    use crate::aarch64::numa;
+    // Aff2 = 0x42, Aff1 = 0x55, Aff0 = 0x07.
+    let mpidr: u64 = 0x07 | (0x55 << 8) | (0x42 << 16);
+    if numa::cluster_id(mpidr) != 0x42 {
+        return TestResult::Fail("aarch64 cluster_id decode mismatch");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/numa", smoke_numa_cluster_id);

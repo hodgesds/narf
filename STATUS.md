@@ -18,8 +18,8 @@ asks for. Updated when observable kernel behaviour changes.
   delivers hardware LAPIC-timer IRQs, exits cleanly.
 - `cargo xtask run --arch=aarch64` boots, runs the full async demo
   using CNTPCT_EL0 as the clock, exits via ARM semihosting.
-- `cargo xtask test --arch=x86_64` passes **613/0/29** (pass / fail / skip).
-- `cargo xtask test --arch=aarch64` passes **315/0/10** (pass / fail / skip).
+- `cargo xtask test --arch=x86_64` passes **616/0/29** (pass / fail / skip).
+- `cargo xtask test --arch=aarch64` passes **318/0/10** (pass / fail / skip).
   Skips are x86_64-specific PCIe surfaces or live-device tests that
   skip cleanly when QEMU doesn't expose the device.
 - In-tree PCIe drivers running against real QEMU-emulated devices.
@@ -121,6 +121,12 @@ asks for. Updated when observable kernel behaviour changes.
 | AMD-Vi IOMMU     | MMIO register layout (DEV_TAB_BASE / CMD_BUF_BASE / EVT_LOG_BASE / IOMMU_CTRL / EXT_FEATURES / PPR_LOG_BASE) + `decode_caps(ctrl, efr)` → `AmdViCaps { iommu_enabled, event_log_enabled, command_buf_enabled, ppr/gt/xts supported }` + `read_caps` / `read_ctrl` / `write_ctrl` MMIO helpers. Spec: `arch/specification/iommu-interconnect.md` §2. |
 | Intel RAR        | CPUID(7, 1).EAX[31] gate + IA32_RAR_INFO_BASE (`0x1024`) / IA32_RAR_CTRL (`0x1025`) read/write + `doorbell(mmio_base, action, target_lpid, payload)` for vector-less remote actions (TLB shootdown / RDPMC / INVD). Spec: `arch/specification/iommu-interconnect.md` §3. |
 | ARM SMMUv3       | MMIO register layout (IDR0..5 / CR0..2 / GBPA / STRTAB_BASE) + `decode_caps(idr0, idr1, idr5)` → `SmmuCaps { s1p, s2p, ttf16, ttf64, oas, sid_width, queue_base_share }` + `read_caps` / `read_cr0` / `write_cr0` / `write_strtab_base` MMIO helpers. Spec: `arch/specification/iommu-interconnect.md` §4. |
+| Intel IR         | IRTE encode/decode (present / fault-disable / dest-mode / vector / delivery-mode / destination) + `write_irtar(reg_base, table_pa, log2_size)` for IRTAR programming. Spec: `arch/specification/irq-cache-numa.md` §1. |
+| AMD GA mode      | `ga_supported(efr)` / `ia_supported(efr)` predicates over the AMD-Vi `EXT_FEATURES` register. Spec: `arch/specification/irq-cache-numa.md` §2. |
+| GICv3 ITS        | MMIO register layout (CTLR / IIDR / TYPER / CBASER / CWRITER / CREADR / BASER0) + `decode_caps(typer)` → `GitsCaps { id_bits, dev_bits, hcc, physical }` + `enable` / `disable` / `write_cbaser` MMIO helpers. Spec: `arch/specification/irq-cache-numa.md` §3. |
+| x86 cache topo   | CPUID(4) / CPUID(0x8000_001D) per-level enumerator → `CacheLevel { level, kind, line_bytes, partitions, ways, sets, size_bytes, fully_assoc, apic_ids_sharing }` (Intel + AMD share decoded shape). Spec: `arch/specification/irq-cache-numa.md` §4. |
+| aarch64 cache topo | CLIDR_EL1 + CSSELR_EL1 + CCSIDR_EL1 enumerator → `CacheLevel { level, kind, line_bytes, ways, sets, size_bytes }`. Spec: `arch/specification/irq-cache-numa.md` §5. |
+| NUMA primitives  | x86: `set_apic_to_domain(cb)` hook + `domain_for_apic_id` lookup (SRAT-driven). aarch64: `cluster_id(mpidr)` + `domain_for_current_cpu()` Aff2-derived. Spec: `arch/specification/irq-cache-numa.md` §6. |
 | iwlwifi          | Intel Wi-Fi 6 / 6E (AX200 / AX201 / AX210 / AX211). **Structural probe only** — PCI match table + spec doc. Operational register map (CSR/PRPH offsets, firmware loader, TFD/RBD descriptors, host-command opcodes) is not in any public Intel doc; further stages blocked on public register docs. See `drivers/net/specification/iwlwifi.md`. |
 | AHCI (ICH9/10)   | HBA bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT. |
 | xHCI USB host    | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT. |

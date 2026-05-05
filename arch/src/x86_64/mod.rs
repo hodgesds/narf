@@ -1,11 +1,13 @@
 //! x86_64 arch backend.
 
 pub mod acpi;
+pub mod amd_ga;
 pub mod amd_vi;
 pub mod asm;
 pub mod avx10;
 pub mod bhi;
 pub mod cache;
+pub mod cache_topology;
 pub mod cet;
 pub mod confidential;
 pub mod cpu;
@@ -19,6 +21,7 @@ pub mod hypervisor;
 pub mod ident;
 pub mod invlpgb;
 pub mod io_port;
+pub mod ir;
 pub mod keylocker;
 pub mod lam;
 pub mod lass;
@@ -28,6 +31,7 @@ pub mod microcode;
 pub mod movdir;
 pub mod msr;
 pub mod mtrr;
+pub mod numa;
 pub mod pcid;
 pub mod pebs;
 pub mod pit;
