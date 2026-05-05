@@ -39,6 +39,7 @@ narf-audio        = { path = "../audio" }
 narf-shmem        = { path = "../shmem" }
 narf-firmware     = { path = "../firmware" }
 narf-firmware-fw-cfg = { path = "../firmware/fw_cfg" }
+narf-firmware-smbios = { path = "../firmware/smbios" }
 narf-block      = { path = "../block" }
 narf-console    = { path = "../console" }
 narf-interrupts = { path = "../interrupts" }

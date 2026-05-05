@@ -23,6 +23,10 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(missing_debug_implementations)]
 
+extern crate alloc;
+
+mod tests;
+
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use narf_lib::percpu::MAX_CPUS;

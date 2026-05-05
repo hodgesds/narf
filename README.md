@@ -735,6 +735,19 @@ Live from boot through `cargo xtask run`:
   Memory Window). BERT yields `BertInfo { region_addr,
   region_length }` for the boot-error region. Spec:
   `acpi/specification/tables-ras-cxl-locality.md`.
+- SMBIOS / DMI (`narf_firmware_smbios`): entry-point-
+  agnostic structure-stream parser. Decodes Type 0 (BIOS:
+  vendor / version / release date / ROM size), Type 1
+  (System: manufacturer / product / UUID / wake-up type),
+  Type 2 (Baseboard), Type 4 (Processor: socket designation,
+  family, max + current speed in MHz, status, core / thread
+  counts), Type 17 (Memory Device: size in MB with extended-
+  size 32-bit fold, form factor, locators, memory type, MT/s
+  speed, manufacturer, serial). String-pool indices resolve
+  via 1-based lookup with double-NUL pool termination. Skips
+  unknown record types but still walks them so the offset
+  cursor stays in sync. Spec:
+  `firmware/smbios/specification/spec.md`.
 - ACPI TCPA / MCHI / PHAT / StAO / UEFI (`narf_acpi`):
   TPM-1.2 + management-controller + platform-health +
   status-override + UEFI-data parsers. TCPA yields `TcpaInfo`
@@ -849,8 +862,8 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **664/0/30** smokes;
-`--arch=aarch64` passes **369/0/11**. Skips are x86-specific PCIe
+`cargo xtask test --arch=x86_64` passes **671/0/29** smokes;
+`--arch=aarch64` passes **376/0/10**. Skips are x86-specific PCIe
 surfaces or live-device tests that skip cleanly when QEMU doesn't
 expose the device. See `STATUS.md` for the full tally and per-
 subsystem breakdown.

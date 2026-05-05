@@ -378,6 +378,7 @@ dependencies = [
 name = "narf-acpi"
 version = "0.0.0"
 dependencies = [
+ "narf-kernel-test",
  "narf-lib",
  "narf-memory",
 ]
@@ -712,6 +713,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-firmware-smbios"
+version = "0.0.0"
+dependencies = [
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+]
+
+[[package]]
 name = "narf-frame"
 version = "0.0.0"
 dependencies = [
@@ -733,6 +743,7 @@ dependencies = [
  "narf-fb",
  "narf-firmware",
  "narf-firmware-fw-cfg",
+ "narf-firmware-smbios",
  "narf-graphics",
  "narf-graphics-driver",
  "narf-init",
@@ -1010,6 +1021,7 @@ dependencies = [
  "narf-filesystem",
  "narf-firmware",
  "narf-firmware-fw-cfg",
+ "narf-firmware-smbios",
  "narf-graphics",
  "narf-graphics-driver",
  "narf-init",

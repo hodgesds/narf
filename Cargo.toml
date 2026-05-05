@@ -53,6 +53,7 @@ members = [
     "compat/win-rt",
     "firmware",
     "firmware/fw_cfg",
+    "firmware/smbios",
     "initramfs",
 ]
 # narf-testbin is built out-of-line by verification's build.rs
