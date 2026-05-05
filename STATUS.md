@@ -18,8 +18,8 @@ asks for. Updated when observable kernel behaviour changes.
   delivers hardware LAPIC-timer IRQs, exits cleanly.
 - `cargo xtask run --arch=aarch64` boots, runs the full async demo
   using CNTPCT_EL0 as the clock, exits via ARM semihosting.
-- `cargo xtask test --arch=x86_64` passes **608/0/29** (pass / fail / skip).
-- `cargo xtask test --arch=aarch64` passes **311/0/10** (pass / fail / skip).
+- `cargo xtask test --arch=x86_64` passes **610/0/29** (pass / fail / skip).
+- `cargo xtask test --arch=aarch64` passes **314/0/10** (pass / fail / skip).
   Skips are x86_64-specific PCIe surfaces or live-device tests that
   skip cleanly when QEMU doesn't expose the device.
 - In-tree PCIe drivers running against real QEMU-emulated devices.
@@ -112,6 +112,11 @@ asks for. Updated when observable kernel behaviour changes.
 | aarch64 GCS      | `ID_AA64PFR1_EL1.GCS` (bits[47:44]) decode + GCSCR_EL1 / GCSCRE0_EL1 / GCSPR_EL{0,1} access via raw `S3_0_C2_C5_*` + `S3_3_C2_C5_1` + `enable_el1(rvcheck, exception_push)` / `enable_el0(rvcheck)` / disablers. Spec: `arch/specification/cpu-arch-extensions.md` §3. |
 | aarch64 RNDR     | `ID_AA64ISAR0_EL1.RNDR` (bits[63:60]) gate + `try_rndr()` / `try_rndrrs()` returning `Option<u64>` (NZCV.C → `cset` capture). Spec: `arch/specification/cpu-arch-extensions.md` §4. |
 | Intel LASS       | CPUID(7, 1).EAX[6] gate + CR4.LASS (bit 27) enable / disable. Spec: `arch/specification/cpu-arch-extensions.md` §5. |
+| aarch64 SME      | `ID_AA64PFR1_EL1.SME` (bits[27:24]) decode → `SmeCaps { sme, sme2 }` + SVCR (`S3_3_C4_C2_2`) + SMCR_EL1 (`S3_0_C1_C2_6`) read/write + `enter_streaming` / `leave_streaming` / `enable_za` / `disable_za`. Spec: `arch/specification/cpu-compute-confidential.md` §1. |
+| aarch64 RME      | `ID_AA64PFR0_EL1.RME` (bits[55:52]) decode + `supported()` predicate (state-management lives at EL3). Spec: `arch/specification/cpu-compute-confidential.md` §2. |
+| aarch64 SPECRES  | `ID_AA64ISAR1_EL1.SPECRES` (bits[43:40]) decode + `cfp_rctx(ctx)` raw `SYS #3, C7, C3, #4, Xt` wrapper. Spec: `arch/specification/cpu-compute-confidential.md` §3. |
+| Intel BHI ctrl   | CPUID(7, 2).EDX[4] `BHI_NO` + IA32_SPEC_CTRL.BHI_DIS_S (bit 10) enable / disable. Spec: `arch/specification/cpu-compute-confidential.md` §4. |
+| Intel PASID      | CPUID(7, 0).ECX[2] gate + IA32_PASID (`0xD93`) read/write/invalidate (20-bit PASID + VALID bit) for accelerator SVA. Spec: `arch/specification/cpu-compute-confidential.md` §5. |
 | iwlwifi          | Intel Wi-Fi 6 / 6E (AX200 / AX201 / AX210 / AX211). **Structural probe only** — PCI match table + spec doc. Operational register map (CSR/PRPH offsets, firmware loader, TFD/RBD descriptors, host-command opcodes) is not in any public Intel doc; further stages blocked on public register docs. See `drivers/net/specification/iwlwifi.md`. |
 | AHCI (ICH9/10)   | HBA bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT. |
 | xHCI USB host    | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT. |

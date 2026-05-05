@@ -577,6 +577,29 @@ Live from boot through `cargo xtask run`:
   any cross-half load/store before paging permissions are
   consulted. Spec:
   `arch/specification/cpu-arch-extensions.md` §5.
+- aarch64 SME (`narf_arch::aarch64::sme`): Scalable Matrix
+  Extension. `ID_AA64PFR1_EL1.SME` decode → `SmeCaps { sme,
+  sme2 }`, `SVCR` (`S3_3_C4_C2_2`) + `SMCR_EL1`
+  (`S3_0_C1_C2_6`) read/write, plus `enter_streaming` /
+  `leave_streaming` / `enable_za` / `disable_za`. Spec:
+  `arch/specification/cpu-compute-confidential.md` §1.
+- aarch64 RME (`narf_arch::aarch64::rme`): Realm Management
+  Extension. `ID_AA64PFR0_EL1.RME` decode + `supported()`
+  predicate; state-management lives in the RMM at EL3. Spec:
+  `arch/specification/cpu-compute-confidential.md` §2.
+- aarch64 SPECRES (`narf_arch::aarch64::specres`): speculation-
+  restriction primitives. `ID_AA64ISAR1_EL1.SPECRES` decode +
+  `cfp_rctx(ctx)` raw `SYS #3, C7, C3, #4, Xt` wrapper. Spec:
+  `arch/specification/cpu-compute-confidential.md` §3.
+- Intel BHI controls (`narf_arch::x86_64::bhi`): branch-history
+  injection mitigation. CPUID(7, 2).EDX[4] `BHI_NO` detection +
+  `IA32_SPEC_CTRL.BHI_DIS_S` (bit 10) enable / disable. Spec:
+  `arch/specification/cpu-compute-confidential.md` §4.
+- Intel PASID (`narf_arch::x86_64::pasid`): Process-Address-
+  Space-ID for accelerator Shared Virtual Memory. CPUID(7, 0)
+  .ECX[2] gate + `IA32_PASID` (`0xD93`) read/write/invalidate
+  (20-bit PASID + VALID bit). Spec:
+  `arch/specification/cpu-compute-confidential.md` §5.
 - aarch64 SVE / SVE2 (`narf_arch::aarch64::sve`):
   `ID_AA64PFR0_EL1.SVE` + `ID_AA64ZFR0_EL1.SVEver` decode →
   `SveCaps { sve, sve2, sve21 }` (CPACR-safe; reads ID-group
@@ -607,8 +630,8 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **608/0/29** smokes;
-`--arch=aarch64` passes **311/0/10**. Skips are x86-specific PCIe
+`cargo xtask test --arch=x86_64` passes **610/0/29** smokes;
+`--arch=aarch64` passes **314/0/10**. Skips are x86-specific PCIe
 surfaces or live-device tests that skip cleanly when QEMU doesn't
 expose the device. See `STATUS.md` for the full tally and per-
 subsystem breakdown.

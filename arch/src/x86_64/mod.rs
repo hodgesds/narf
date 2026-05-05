@@ -3,6 +3,7 @@
 pub mod acpi;
 pub mod asm;
 pub mod avx10;
+pub mod bhi;
 pub mod cache;
 pub mod cet;
 pub mod confidential;
@@ -31,6 +32,7 @@ pub mod pebs;
 pub mod pit;
 pub mod pks;
 pub mod pmi;
+pub mod pasid;
 pub mod pmu;
 pub mod probe;
 pub mod pt;

@@ -1019,3 +1019,58 @@ fn smoke_lass_supported_path() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("arch/lass", smoke_lass_supported_path);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_sme_caps() -> TestResult {
+    use crate::aarch64::sme;
+    let c = sme::caps();
+    if c.sme2 && !c.sme {
+        return TestResult::Fail("SME2 set without SME");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/sme", smoke_sme_caps);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_rme_caps() -> TestResult {
+    use crate::aarch64::rme;
+    let v = rme::caps();
+    if v > 1 {
+        return TestResult::Fail("RME field > 1 (architectural max as of v0.1)");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/rme", smoke_rme_caps);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_specres_caps() -> TestResult {
+    use crate::aarch64::specres;
+    let v = specres::caps();
+    if v > 2 {
+        return TestResult::Fail("SPECRES field > 2 (architectural max)");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/specres", smoke_specres_caps);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_bhi_supported_path() -> TestResult {
+    use crate::x86_64::bhi;
+    let _ = bhi::bhi_no();
+    let _ = bhi::bhi_dis_s_supported();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/bhi", smoke_bhi_supported_path);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_pasid_supported_path() -> TestResult {
+    use crate::x86_64::pasid;
+    let _ = pasid::supported();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/pasid", smoke_pasid_supported_path);
