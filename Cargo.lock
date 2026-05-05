@@ -81,6 +81,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
+name = "async-trait"
+version = "0.1.89"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "bitflags"
+version = "2.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
+
+[[package]]
 name = "blake3"
 version = "1.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -307,6 +324,66 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
+name = "futures"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b147ee9d1f6d097cef9ce628cd2ee62288d963e16fb287bd9286455b241382d"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "futures-io",
+ "futures-sink",
+ "futures-task",
+ "futures-util",
+]
+
+[[package]]
+name = "futures-channel"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07bbe89c50d7a535e539b8c17bc0b49bdb77747034daa8087407d655f3f7cc1d"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+]
+
+[[package]]
+name = "futures-core"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e3450815272ef58cec6d564423f6e755e25379b217b0bc688e295ba24df6b1d"
+
+[[package]]
+name = "futures-io"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cecba35d7ad927e23624b22ad55235f2239cfa44fd10428eecbeba6d6a717718"
+
+[[package]]
+name = "futures-sink"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c39754e157331b013978ec91992bde1ac089843443c49cbc7f46150b0fad0893"
+
+[[package]]
+name = "futures-task"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "037711b3d59c33004d3856fbdc83b99d4ff37a24768fa1be9ce3538a1cde4393"
+
+[[package]]
+name = "futures-util"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "389ca41296e6190b48053de0321d02a77f32f8a5d2461dd38762c0593805c6d6"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "futures-task",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -372,6 +449,21 @@ dependencies = [
  "narf-rcu",
  "narf-scheduler",
  "narf-tracing",
+]
+
+[[package]]
+name = "narf-accel"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bitflags",
+ "futures",
+ "narf-capabilities",
+ "narf-io",
+ "narf-ipc",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-net",
 ]
 
 [[package]]
@@ -526,12 +618,14 @@ dependencies = [
 name = "narf-drivers"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "narf-arch",
  "narf-capabilities",
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
  "narf-scheduler",
+ "narf-tpm",
 ]
 
 [[package]]
@@ -589,6 +683,7 @@ dependencies = [
 name = "narf-drivers-platform"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "narf-arch",
  "narf-bus",
  "narf-capabilities",
@@ -598,6 +693,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-tpm",
 ]
 
 [[package]]
@@ -653,6 +749,23 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+]
+
+[[package]]
+name = "narf-drivers-wireless"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-driver-runtime",
+ "narf-drivers",
+ "narf-interrupts",
+ "narf-io",
+ "narf-lib",
+ "narf-memory",
+ "narf-net",
+ "narf-wireless",
 ]
 
 [[package]]
@@ -733,6 +846,7 @@ dependencies = [
 name = "narf-frame"
 version = "0.0.0"
 dependencies = [
+ "narf-accel",
  "narf-acpi",
  "narf-aml",
  "narf-arch",
@@ -755,6 +869,7 @@ dependencies = [
  "narf-firmware-smbios",
  "narf-graphics",
  "narf-graphics-driver",
+ "narf-i3c",
  "narf-init",
  "narf-initramfs",
  "narf-input",
@@ -765,8 +880,10 @@ dependencies = [
  "narf-scheduler",
  "narf-shmem",
  "narf-time",
+ "narf-tpm",
  "narf-userspace",
  "narf-verification",
+ "narf-wireless",
 ]
 
 [[package]]
@@ -789,6 +906,19 @@ dependencies = [
  "narf-init",
  "narf-lib",
  "narf-memory",
+]
+
+[[package]]
+name = "narf-i3c"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bitflags",
+ "futures",
+ "narf-capabilities",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
 ]
 
 [[package]]
@@ -974,6 +1104,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-tpm"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "narf-capabilities",
+ "narf-crypto",
+ "narf-kernel-test",
+ "narf-lib",
+]
+
+[[package]]
 name = "narf-tracing"
 version = "0.0.0"
 dependencies = [
@@ -1007,6 +1149,7 @@ name = "narf-verification"
 version = "0.0.0"
 dependencies = [
  "narf-abi",
+ "narf-accel",
  "narf-acpi",
  "narf-aml",
  "narf-arch",
@@ -1033,6 +1176,7 @@ dependencies = [
  "narf-firmware-smbios",
  "narf-graphics",
  "narf-graphics-driver",
+ "narf-i3c",
  "narf-init",
  "narf-input",
  "narf-input-driver",
@@ -1049,8 +1193,26 @@ dependencies = [
  "narf-scheduler",
  "narf-shmem",
  "narf-time",
+ "narf-tpm",
  "narf-tracing",
  "narf-userspace",
+ "narf-wireless",
+]
+
+[[package]]
+name = "narf-wireless"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bitflags",
+ "futures",
+ "narf-capabilities",
+ "narf-drivers",
+ "narf-io",
+ "narf-ipc",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-net",
 ]
 
 [[package]]
@@ -1064,6 +1226,12 @@ name = "opaque-debug"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
+
+[[package]]
+name = "pin-project-lite"
+version = "0.2.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "poly1305"

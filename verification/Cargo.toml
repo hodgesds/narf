@@ -36,6 +36,10 @@ narf-graphics-driver = { path = "../drivers/graphics" }
 narf-init         = { path = "../init" }
 narf-fb           = { path = "../fb" }
 narf-audio        = { path = "../audio" }
+narf-wireless     = { path = "../wireless" }
+narf-accel        = { path = "../accel" }
+narf-tpm          = { path = "../tpm" }
+narf-i3c          = { path = "../i3c" }
 narf-shmem        = { path = "../shmem" }
 narf-firmware     = { path = "../firmware" }
 narf-firmware-fw-cfg = { path = "../firmware/fw_cfg" }
