@@ -735,6 +735,20 @@ Live from boot through `cargo xtask run`:
   Memory Window). BERT yields `BertInfo { region_addr,
   region_length }` for the boot-error region. Spec:
   `acpi/specification/tables-ras-cxl-locality.md`.
+- ACPI WSMT / WAET / HPET / FACS / PRMT (`narf_acpi`):
+  Windows-mitigation + emulated-device + HPET-description +
+  firmware-control + Platform-Runtime-Mechanism parsers.
+  WSMT yields `WsmtInfo` (fixed comm buffers, nested-ptr
+  protection, system-resource protection). WAET yields
+  `WaetInfo` (RTC-good, ACPI-PM-timer-good). HPET-desc yields
+  `HpetDesc` (block id, GAS base, HPET number, counter-min,
+  OEM attrs) — pairs with the existing
+  `arch::x86_64::hpet` driver. FACS is reached via FADT and
+  yields `FacsInfo` (hardware signature, 32-bit + 64-bit
+  firmware waking vectors, global lock, flags, version).
+  PRMT yields per-module `PrmtModule` (major / minor revision,
+  handler count, MMIO range). Spec:
+  `acpi/specification/tables-firmware-hpet-prm.md`.
 - ACPI ERST / EINJ / TPM2 / BGRT / DBG2 (`narf_acpi`):
   RAS-injection + serialization + TPM2 + boot-graphics +
   debug-port parsers. ERST and EINJ share the 32-byte
@@ -790,8 +804,8 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **639/0/30** smokes;
-`--arch=aarch64` passes **344/0/11**. Skips are x86-specific PCIe
+`cargo xtask test --arch=x86_64` passes **644/0/30** smokes;
+`--arch=aarch64` passes **349/0/11**. Skips are x86-specific PCIe
 surfaces or live-device tests that skip cleanly when QEMU doesn't
 expose the device. See `STATUS.md` for the full tally and per-
 subsystem breakdown.

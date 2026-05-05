@@ -3911,3 +3911,468 @@ pub fn __test_parse_dbg2_body(body: &[u8]) -> u32 {
     DBG2_PARSED.store(true, Ordering::Release);
     n
 }
+
+// ───────────────────────────────────────────────────────────────────
+// WSMT — Windows SMM Mitigation Table.
+// Spec: `acpi/specification/tables-firmware-hpet-prm.md` §1.
+// ───────────────────────────────────────────────────────────────────
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct WsmtInfo {
+    pub fixed_comm_buffers:         bool,
+    pub comm_buffer_nested_ptr:     bool,
+    pub system_resource_protection: bool,
+}
+
+static WSMT_DATA: IrqSafeSpinLock<WsmtInfo> = IrqSafeSpinLock::new(WsmtInfo {
+    fixed_comm_buffers: false, comm_buffer_nested_ptr: false,
+    system_resource_protection: false,
+});
+static WSMT_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_wsmt_body(body: &[u8]) {
+    if body.len() < SDT_HEADER_SIZE + 4 { return; }
+    let flags = u32::from_le_bytes([
+        body[SDT_HEADER_SIZE],     body[SDT_HEADER_SIZE + 1],
+        body[SDT_HEADER_SIZE + 2], body[SDT_HEADER_SIZE + 3],
+    ]);
+    *WSMT_DATA.lock() = WsmtInfo {
+        fixed_comm_buffers:         flags & (1 << 0) != 0,
+        comm_buffer_nested_ptr:     flags & (1 << 1) != 0,
+        system_resource_protection: flags & (1 << 2) != 0,
+    };
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → WSMT must also be identity-mapped.
+pub unsafe fn parse_wsmt(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut wsmt: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"WSMT" && wsmt.is_none() {
+                wsmt = Some(phys);
+            }
+        })?;
+    }
+    let wsmt = wsmt.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (wsmt as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 4 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(wsmt as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    parse_wsmt_body(body);
+    WSMT_PARSED.store(true, Ordering::Release);
+    Ok(())
+}
+
+pub fn wsmt_info() -> Option<WsmtInfo> {
+    if !WSMT_PARSED.load(Ordering::Acquire) { return None; }
+    Some(*WSMT_DATA.lock())
+}
+
+#[doc(hidden)]
+pub fn __test_parse_wsmt_body(body: &[u8]) {
+    parse_wsmt_body(body);
+    WSMT_PARSED.store(true, Ordering::Release);
+}
+
+// ───────────────────────────────────────────────────────────────────
+// WAET — Windows ACPI Emulated Devices Table.
+// Spec: `acpi/specification/tables-firmware-hpet-prm.md` §2.
+// ───────────────────────────────────────────────────────────────────
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct WaetInfo {
+    pub rtc_good:          bool,
+    pub acpi_pmtimer_good: bool,
+}
+
+static WAET_DATA: IrqSafeSpinLock<WaetInfo> = IrqSafeSpinLock::new(WaetInfo {
+    rtc_good: false, acpi_pmtimer_good: false,
+});
+static WAET_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_waet_body(body: &[u8]) {
+    if body.len() < SDT_HEADER_SIZE + 4 { return; }
+    let flags = u32::from_le_bytes([
+        body[SDT_HEADER_SIZE],     body[SDT_HEADER_SIZE + 1],
+        body[SDT_HEADER_SIZE + 2], body[SDT_HEADER_SIZE + 3],
+    ]);
+    *WAET_DATA.lock() = WaetInfo {
+        rtc_good:          flags & (1 << 0) != 0,
+        acpi_pmtimer_good: flags & (1 << 1) != 0,
+    };
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → WAET must also be identity-mapped.
+pub unsafe fn parse_waet(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut waet: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"WAET" && waet.is_none() {
+                waet = Some(phys);
+            }
+        })?;
+    }
+    let waet = waet.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (waet as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 4 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(waet as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    parse_waet_body(body);
+    WAET_PARSED.store(true, Ordering::Release);
+    Ok(())
+}
+
+pub fn waet_info() -> Option<WaetInfo> {
+    if !WAET_PARSED.load(Ordering::Acquire) { return None; }
+    Some(*WAET_DATA.lock())
+}
+
+#[doc(hidden)]
+pub fn __test_parse_waet_body(body: &[u8]) {
+    parse_waet_body(body);
+    WAET_PARSED.store(true, Ordering::Release);
+}
+
+// ───────────────────────────────────────────────────────────────────
+// HPET — Description Table.
+// Spec: `acpi/specification/tables-firmware-hpet-prm.md` §3.
+// ───────────────────────────────────────────────────────────────────
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct HpetDesc {
+    pub block_id:         u32,
+    pub base:             u64,
+    pub addr_space_id:    u8,
+    pub hpet_number:      u8,
+    pub main_counter_min: u16,
+    pub oem_attributes:   u8,
+}
+
+static HPET_DATA: IrqSafeSpinLock<HpetDesc> = IrqSafeSpinLock::new(HpetDesc {
+    block_id: 0, base: 0, addr_space_id: 0,
+    hpet_number: 0, main_counter_min: 0, oem_attributes: 0,
+});
+static HPET_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_hpet_body(body: &[u8]) {
+    // Layout: SDT_HEADER + EventTimerBlockId (4) +
+    //   GAS (12; AddressSpaceId @ 0, Address @ 4..12) +
+    //   HpetNumber (1) + MainCounterMin (2) + OemAttributes (1)
+    if body.len() < SDT_HEADER_SIZE + 4 + 12 + 4 { return; }
+    let off = SDT_HEADER_SIZE;
+    let block_id = u32::from_le_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]);
+    let addr_space_id = body[off + 4];
+    let base = u64::from_le_bytes([
+        body[off + 8],  body[off + 9],
+        body[off + 10], body[off + 11],
+        body[off + 12], body[off + 13],
+        body[off + 14], body[off + 15],
+    ]);
+    let hpet_number = body[off + 16];
+    let main_counter_min = u16::from_le_bytes([body[off + 17], body[off + 18]]);
+    let oem_attributes = body[off + 19];
+    *HPET_DATA.lock() = HpetDesc {
+        block_id, base, addr_space_id,
+        hpet_number, main_counter_min, oem_attributes,
+    };
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → HPET must also be identity-mapped.
+pub unsafe fn parse_hpet(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut hpet: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"HPET" && hpet.is_none() {
+                hpet = Some(phys);
+            }
+        })?;
+    }
+    let hpet = hpet.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (hpet as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 20 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(hpet as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    parse_hpet_body(body);
+    HPET_PARSED.store(true, Ordering::Release);
+    Ok(())
+}
+
+pub fn hpet_desc() -> Option<HpetDesc> {
+    if !HPET_PARSED.load(Ordering::Acquire) { return None; }
+    Some(*HPET_DATA.lock())
+}
+
+#[doc(hidden)]
+pub fn __test_parse_hpet_body(body: &[u8]) {
+    parse_hpet_body(body);
+    HPET_PARSED.store(true, Ordering::Release);
+}
+
+// ───────────────────────────────────────────────────────────────────
+// FACS — Firmware ACPI Control Structure (reached via FADT).
+// Spec: `acpi/specification/tables-firmware-hpet-prm.md` §4.
+// ───────────────────────────────────────────────────────────────────
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FacsInfo {
+    pub hardware_signature:        u32,
+    pub firmware_waking_vector_32: u32,
+    pub firmware_waking_vector_64: u64,
+    pub global_lock:               u32,
+    pub flags:                     u32,
+    pub version:                   u8,
+}
+
+static FACS_DATA: IrqSafeSpinLock<FacsInfo> = IrqSafeSpinLock::new(FacsInfo {
+    hardware_signature: 0, firmware_waking_vector_32: 0,
+    firmware_waking_vector_64: 0, global_lock: 0, flags: 0, version: 0,
+});
+static FACS_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_facs_body(body: &[u8]) {
+    // Layout (from offset 0 of the FACS body):
+    //   0..4   Signature (FACS)
+    //   4..8   Length
+    //   8..12  HardwareSignature
+    //   12..16 FirmwareWakingVector
+    //   16..20 GlobalLock
+    //   20..24 Flags
+    //   24..32 XFirmwareWakingVector
+    //   32     Version
+    if body.len() < 33 { return; }
+    let hardware_signature = u32::from_le_bytes([body[8], body[9], body[10], body[11]]);
+    let firmware_waking_vector_32 = u32::from_le_bytes([
+        body[12], body[13], body[14], body[15],
+    ]);
+    let global_lock = u32::from_le_bytes([body[16], body[17], body[18], body[19]]);
+    let flags       = u32::from_le_bytes([body[20], body[21], body[22], body[23]]);
+    let firmware_waking_vector_64 = u64::from_le_bytes([
+        body[24], body[25], body[26], body[27],
+        body[28], body[29], body[30], body[31],
+    ]);
+    let version = body[32];
+    *FACS_DATA.lock() = FacsInfo {
+        hardware_signature, firmware_waking_vector_32,
+        firmware_waking_vector_64, global_lock, flags, version,
+    };
+}
+
+/// Parse FACS. Reaches FACS via FADT.firmware_ctrl /
+/// X_FirmwareCtrl. v0.1 also accepts a stand-alone walk by
+/// looking for the FACS signature directly in the XSDT in case
+/// the platform is misbehaving.
+///
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → FADT → FACS must also be identity-mapped.
+pub unsafe fn parse_facs(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut fadt: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"FACP" && fadt.is_none() {
+                fadt = Some(phys);
+            }
+        })?;
+    }
+    let fadt = fadt.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion. FADT body — we only need
+    // FirmwareCtrl @ 36 (32-bit) or X_FirmwareCtrl @ 132 (64-bit).
+    let fadt_total = unsafe {
+        (fadt as *const SdtHeader).read_unaligned().length as usize
+    };
+    if fadt_total < 44 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let fbody = unsafe { core::slice::from_raw_parts(fadt as *const u8, fadt_total) };
+    let fw32 = u32::from_le_bytes([fbody[36], fbody[37], fbody[38], fbody[39]]) as u64;
+    let fw64 = if fadt_total >= 140 {
+        u64::from_le_bytes([
+            fbody[132], fbody[133], fbody[134], fbody[135],
+            fbody[136], fbody[137], fbody[138], fbody[139],
+        ])
+    } else { 0 };
+    let facs = if fw64 != 0 { fw64 } else { fw32 };
+    if facs == 0 { return Err(AcpiError::NoSrat); }
+
+    // SAFETY: caller assertion. FACS lacks an SDT header — it
+    // begins with its own 4-byte "FACS" signature + 4-byte length.
+    let facs_len = unsafe {
+        (facs as *const u8).add(4).cast::<u32>().read_unaligned()
+    } as usize;
+    if facs_len < 64 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(facs as *const u8, facs_len) };
+    if &body[0..4] != b"FACS" { return Err(AcpiError::BadXsdtSignature); }
+    parse_facs_body(body);
+    FACS_PARSED.store(true, Ordering::Release);
+    Ok(())
+}
+
+pub fn facs_info() -> Option<FacsInfo> {
+    if !FACS_PARSED.load(Ordering::Acquire) { return None; }
+    Some(*FACS_DATA.lock())
+}
+
+#[doc(hidden)]
+pub fn __test_parse_facs_body(body: &[u8]) {
+    parse_facs_body(body);
+    FACS_PARSED.store(true, Ordering::Release);
+}
+
+// ───────────────────────────────────────────────────────────────────
+// PRMT — Platform Runtime Mechanism Table.
+// Spec: `acpi/specification/tables-firmware-hpet-prm.md` §5.
+// ───────────────────────────────────────────────────────────────────
+
+pub const MAX_PRMT_MODULES: usize = 16;
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct PrmtModule {
+    pub major_revision: u16,
+    pub minor_revision: u16,
+    pub handler_count:  u16,
+    pub mmio_range:     u64,
+}
+
+struct PrmtTables {
+    mods:    [PrmtModule; MAX_PRMT_MODULES],
+    n_mods:  usize,
+}
+
+impl PrmtTables {
+    const EMPTY: Self = Self {
+        mods:    [PrmtModule {
+                     major_revision: 0, minor_revision: 0,
+                     handler_count: 0, mmio_range: 0
+                 }; MAX_PRMT_MODULES],
+        n_mods:  0,
+    };
+}
+
+static PRMT_DATA:   IrqSafeSpinLock<PrmtTables> = IrqSafeSpinLock::new(PrmtTables::EMPTY);
+static PRMT_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_prmt_body(body: &[u8]) -> u32 {
+    let mut tables = PRMT_DATA.lock();
+    *tables = PrmtTables::EMPTY;
+    if body.len() < SDT_HEADER_SIZE + 24 { return 0; }
+    let hdr_off = SDT_HEADER_SIZE + 16; // skip PrmPlatformGuid (16)
+    let mod_off = u32::from_le_bytes([
+        body[hdr_off], body[hdr_off + 1],
+        body[hdr_off + 2], body[hdr_off + 3],
+    ]) as usize;
+    let mod_count = u32::from_le_bytes([
+        body[hdr_off + 4], body[hdr_off + 5],
+        body[hdr_off + 6], body[hdr_off + 7],
+    ]) as usize;
+    let mut cur = mod_off;
+    let mut count = 0u32;
+    for _ in 0..mod_count {
+        if cur + 4 > body.len() { break; }
+        let len = u16::from_le_bytes([body[cur + 2], body[cur + 3]]) as usize;
+        if len < 36 || cur + len > body.len() { break; }
+        let entry = &body[cur..cur + len];
+        // Layout (offsets within entry):
+        //   0..2   Revision
+        //   2..4   Length
+        //   4..20  ModuleGuid
+        //   20..22 MajorRevision
+        //   22..24 MinorRevision
+        //   24..26 HandlerCount
+        //   26..30 HandlerInfoOffset
+        //   30..38 MmioRangeAddr (alignment-shifted in real layout;
+        //                        we read a u64 starting at offset 28
+        //                        per ACPI 6.5 PRMT layout).
+        let major_revision = u16::from_le_bytes([entry[20], entry[21]]);
+        let minor_revision = u16::from_le_bytes([entry[22], entry[23]]);
+        let handler_count = u16::from_le_bytes([entry[24], entry[25]]);
+        let mmio_range = u64::from_le_bytes([
+            entry[28], entry[29], entry[30], entry[31],
+            entry[32], entry[33], entry[34], entry[35],
+        ]);
+        if tables.n_mods < MAX_PRMT_MODULES {
+            let i = tables.n_mods;
+            tables.mods[i] = PrmtModule {
+                major_revision, minor_revision, handler_count, mmio_range,
+            };
+            tables.n_mods = i + 1;
+            count += 1;
+        }
+        cur += len;
+    }
+    count
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → PRMT must also be identity-mapped.
+pub unsafe fn parse_prmt(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut prmt: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"PRMT" && prmt.is_none() {
+                prmt = Some(phys);
+            }
+        })?;
+    }
+    let prmt = prmt.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (prmt as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 24 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(prmt as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    let n = parse_prmt_body(body);
+    PRMT_PARSED.store(true, Ordering::Release);
+    Ok(n)
+}
+
+pub fn is_prmt_known() -> bool { PRMT_PARSED.load(Ordering::Acquire) }
+
+pub fn copy_prmt_modules(out: &mut [PrmtModule]) -> usize {
+    let t = PRMT_DATA.lock();
+    let n = t.n_mods.min(out.len());
+    out[..n].copy_from_slice(&t.mods[..n]);
+    n
+}
+
+#[doc(hidden)]
+pub fn __test_parse_prmt_body(body: &[u8]) -> u32 {
+    let n = parse_prmt_body(body);
+    PRMT_PARSED.store(true, Ordering::Release);
+    n
+}

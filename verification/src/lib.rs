@@ -3522,6 +3522,144 @@ fn smoke_acpi_dbg2_synthetic_decode() -> TestResult {
 const SDT_HEADER_SIZE_DBG2: usize = 36;
 kernel_test!(smoke_acpi_dbg2_synthetic_decode);
 
+fn smoke_acpi_wsmt_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"WSMT");
+    buf.extend_from_slice(&[0u8; 32]);
+    buf.extend_from_slice(&0b101u32.to_le_bytes());        // bits 0 + 2
+
+    narf_acpi::__test_parse_wsmt_body(&buf);
+    let info = narf_acpi::wsmt_info().expect("WSMT not parsed");
+    if !info.fixed_comm_buffers
+        || info.comm_buffer_nested_ptr
+        || !info.system_resource_protection
+    {
+        return TestResult::Fail("WSMT decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_wsmt_synthetic_decode);
+
+fn smoke_acpi_waet_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"WAET");
+    buf.extend_from_slice(&[0u8; 32]);
+    buf.extend_from_slice(&0b11u32.to_le_bytes());
+
+    narf_acpi::__test_parse_waet_body(&buf);
+    let info = narf_acpi::waet_info().expect("WAET not parsed");
+    if !info.rtc_good || !info.acpi_pmtimer_good {
+        return TestResult::Fail("WAET decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_waet_synthetic_decode);
+
+fn smoke_acpi_hpet_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"HPET");
+    buf.extend_from_slice(&[0u8; 32]);
+    buf.extend_from_slice(&0xCAFE_BABEu32.to_le_bytes());  // block id
+    // GAS: addr_space_id @ 0, address @ 4..12.
+    buf.push(0);                                           // SystemMemory
+    buf.extend_from_slice(&[0u8; 3]);                      // bw / bo / access
+    buf.extend_from_slice(&0xFED0_0000u64.to_le_bytes());  // base
+    buf.push(2);                                           // hpet_number
+    buf.extend_from_slice(&0x42u16.to_le_bytes());         // counter min
+    buf.push(0xAA);                                        // oem attrs
+
+    narf_acpi::__test_parse_hpet_body(&buf);
+    let d = narf_acpi::hpet_desc().expect("HPET not parsed");
+    if d.block_id != 0xCAFE_BABE
+        || d.base != 0xFED0_0000
+        || d.hpet_number != 2
+        || d.main_counter_min != 0x42
+        || d.oem_attributes != 0xAA
+    {
+        return TestResult::Fail("HPET decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_hpet_synthetic_decode);
+
+fn smoke_acpi_facs_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    // Note: FACS body has no SDT header; the body itself starts
+    // with the FACS signature.
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"FACS");
+    buf.extend_from_slice(&64u32.to_le_bytes());           // length
+    buf.extend_from_slice(&0xDEAD_BEEFu32.to_le_bytes());  // hardware sig
+    buf.extend_from_slice(&0x10000u32.to_le_bytes());      // fw waking vec 32
+    buf.extend_from_slice(&0u32.to_le_bytes());            // global lock
+    buf.extend_from_slice(&0b11u32.to_le_bytes());         // flags
+    buf.extend_from_slice(&0xCAFE_F0000000u64.to_le_bytes()); // X fw waking vec
+    buf.push(2);                                           // version
+    buf.extend_from_slice(&[0u8; 31]);                     // reserved/pad to 64
+
+    narf_acpi::__test_parse_facs_body(&buf);
+    let info = narf_acpi::facs_info().expect("FACS not parsed");
+    if info.hardware_signature != 0xDEAD_BEEF
+        || info.firmware_waking_vector_32 != 0x10000
+        || info.firmware_waking_vector_64 != 0xCAFE_F0000000
+        || info.flags != 0b11
+        || info.version != 2
+    {
+        return TestResult::Fail("FACS decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_facs_synthetic_decode);
+
+fn smoke_acpi_prmt_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    use narf_acpi::PrmtModule;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"PRMT");
+    buf.extend_from_slice(&[0u8; 32]);
+
+    // 16-byte PrmPlatformGuid + 4 B mod off + 4 B mod count.
+    buf.extend_from_slice(&[0u8; 16]);                     // platform guid
+    let mod_off_pos = buf.len();
+    buf.extend_from_slice(&0u32.to_le_bytes());            // mod off (patched)
+    buf.extend_from_slice(&1u32.to_le_bytes());            // mod count
+
+    let mod_off_actual = buf.len() as u32;
+
+    // Module entry, length = 36.
+    buf.extend_from_slice(&0u16.to_le_bytes());            // revision
+    buf.extend_from_slice(&36u16.to_le_bytes());           // length
+    buf.extend_from_slice(&[0u8; 16]);                     // module guid
+    buf.extend_from_slice(&3u16.to_le_bytes());            // major
+    buf.extend_from_slice(&7u16.to_le_bytes());            // minor
+    buf.extend_from_slice(&5u16.to_le_bytes());            // handler count
+    buf.extend_from_slice(&0u16.to_le_bytes());            // padding to 28
+    buf.extend_from_slice(&0xBEEF_0000u64.to_le_bytes());  // mmio range
+
+    // Patch mod offset.
+    buf[mod_off_pos..mod_off_pos + 4].copy_from_slice(&mod_off_actual.to_le_bytes());
+
+    let n = narf_acpi::__test_parse_prmt_body(&buf);
+    if n != 1 {
+        return TestResult::Fail("expected 1 PRMT module parsed");
+    }
+    let mut mods = [PrmtModule::default(); 4];
+    let nm = narf_acpi::copy_prmt_modules(&mut mods);
+    if nm != 1
+        || mods[0].major_revision != 3
+        || mods[0].minor_revision != 7
+        || mods[0].handler_count  != 5
+        || mods[0].mmio_range     != 0xBEEF_0000
+    {
+        return TestResult::Fail("PRMT module decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_prmt_synthetic_decode);
+
 fn smoke_acpi_srat_synthetic_memory_entry() -> TestResult {
     // Type-1 memory affinity entry: base 0x1_0000_0000, length
     // 0x1000_0000, proximity 1, enabled.
