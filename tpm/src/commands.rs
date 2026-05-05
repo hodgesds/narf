@@ -99,6 +99,7 @@ impl<'a> ResponseParser<'a> {
         if buf.len() < 10 { return Err(TpmError::BadResponse); }
         let rc = u32::from_be_bytes([buf[6], buf[7], buf[8], buf[9]]);
         if rc != 0 {
+            // TODO: Map TPM2 error codes (RC) to TpmError
             return Err(TpmError::HardwareError);
         }
         Ok(Self { buf })

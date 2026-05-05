@@ -7,6 +7,7 @@ edition = "2021"
 narf-lib = { path = "../lib" }
 narf-capabilities = { path = "../capabilities" }
 narf-io = { path = "../io" }
+narf-scheduler = { path = "../scheduler" }
 async-trait = "0.1"
 futures = { version = "0.3", default-features = false }
 narf-kernel-test = { path = "../verification/kernel-test" }

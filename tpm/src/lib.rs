@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use narf_capabilities::{CapType, CapKind};
 
 pub mod types;
+pub mod commands;
 
 pub use types::{TpmError, PcrSet, PolicyHash};
 

@@ -9,6 +9,7 @@ narf-net = { path = "../net" }
 narf-capabilities = { path = "../capabilities" }
 narf-ipc = { path = "../ipc" }
 narf-io = { path = "../io" }
+narf-scheduler = { path = "../scheduler" }
 narf-drivers = { path = "../drivers" }
 async-trait = "0.1"
 futures = { version = "0.3", default-features = false }

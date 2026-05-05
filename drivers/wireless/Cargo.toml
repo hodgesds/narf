@@ -15,6 +15,8 @@ path = "src/lib.rs"
 narf-lib          = { path = "../../lib" }
 narf-capabilities = { path = "../../capabilities" }
 narf-io           = { path = "../../io" }
+narf-ipc          = { path = "../../ipc" }
+narf-time         = { path = "../../time" }
 narf-wireless     = { path = "../../wireless" }
 narf-net          = { path = "../../net" }
 narf-bus          = { path = "../../bus" }
@@ -22,7 +24,12 @@ narf-interrupts   = { path = "../../interrupts" }
 narf-memory       = { path = "../../memory" }
 narf-drivers      = { path = "../" }
 narf-driver-runtime = { path = "../runtime", default-features = false, features = ["kernel"] }
+narf-kernel-test  = { path = "../../verification/kernel-test" }
+narf-scheduler    = { path = "../../scheduler" }
 async-trait = "0.1"
+
+[features]
+kernel-test = []
 
 [lints]
 workspace = true
