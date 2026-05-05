@@ -659,6 +659,32 @@ Live from boot through `cargo xtask run`:
   lookup; aarch64 `cluster_id(mpidr)` decode helper +
   `domain_for_current_cpu()` (Aff2). Spec:
   `arch/specification/irq-cache-numa.md` §6.
+- Intel TME / MKTME (`narf_arch::x86_64::tme`): Total Memory
+  Encryption + multi-key extension. CPUID(7, 0).ECX[13] gate +
+  `IA32_TME_CAPABILITY` (`0x981`) decode → `TmeCaps`
+  (AES-XTS-128 / AES-XTS-128-integrity / AES-XTS-256,
+  max_keyid_bits, max_keys) + `IA32_TME_ACTIVATE` (`0x982`)
+  read / write + LOCK predicate. Spec:
+  `arch/specification/cpu-mem-encrypt-virt.md` §1.
+- Intel RTM-abort kill-switch (`narf_arch::x86_64::rtm_abort`):
+  CPUID(7, 0).EDX[11] `RTM_ALWAYS_ABORT` detection +
+  `IA32_TSX_FORCE_ABORT` (`0x10F`) read / write +
+  `force_rtm_abort()` boot-baseline helper that sets bit 0.
+  Spec: `arch/specification/cpu-mem-encrypt-virt.md` §2.
+- aarch64 ECV (`narf_arch::aarch64::ecv`): Enhanced Counter
+  Virtualization. `ID_AA64MMFR0_EL1.ECV` decode +
+  `supported()` / `cntpoff_supported()` (ECV ≥ 2). Spec:
+  `arch/specification/cpu-mem-encrypt-virt.md` §3.
+- aarch64 NV / NV2 (`narf_arch::aarch64::nv2`): Nested
+  Virtualization. `ID_AA64MMFR2_EL1.NV` decode +
+  `supported()` (FEAT_NV) and `nv2_supported()` (FEAT_NV2).
+  Spec: `arch/specification/cpu-mem-encrypt-virt.md` §4.
+- aarch64 FEAT_E0PD (`narf_arch::aarch64::e0pd`):
+  privileged-only-data on TTBR0/TTBR1.
+  `ID_AA64MMFR2_EL1.E0PD` decode + `enable_kernel_half()` /
+  `disable_kernel_half()` flipping `TCR_EL1.E0PD1` (Meltdown-
+  style KASLR-bypass mitigation independent of KPTI). Spec:
+  `arch/specification/cpu-mem-encrypt-virt.md` §5.
 - aarch64 SVE / SVE2 (`narf_arch::aarch64::sve`):
   `ID_AA64PFR0_EL1.SVE` + `ID_AA64ZFR0_EL1.SVEver` decode →
   `SveCaps { sve, sve2, sve21 }` (CPACR-safe; reads ID-group
@@ -689,8 +715,8 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **616/0/29** smokes;
-`--arch=aarch64` passes **318/0/10**. Skips are x86-specific PCIe
+`cargo xtask test --arch=x86_64` passes **618/0/29** smokes;
+`--arch=aarch64` passes **321/0/10**. Skips are x86-specific PCIe
 surfaces or live-device tests that skip cleanly when QEMU doesn't
 expose the device. See `STATUS.md` for the full tally and per-
 subsystem breakdown.

@@ -18,8 +18,8 @@ asks for. Updated when observable kernel behaviour changes.
   delivers hardware LAPIC-timer IRQs, exits cleanly.
 - `cargo xtask run --arch=aarch64` boots, runs the full async demo
   using CNTPCT_EL0 as the clock, exits via ARM semihosting.
-- `cargo xtask test --arch=x86_64` passes **616/0/29** (pass / fail / skip).
-- `cargo xtask test --arch=aarch64` passes **318/0/10** (pass / fail / skip).
+- `cargo xtask test --arch=x86_64` passes **618/0/29** (pass / fail / skip).
+- `cargo xtask test --arch=aarch64` passes **321/0/10** (pass / fail / skip).
   Skips are x86_64-specific PCIe surfaces or live-device tests that
   skip cleanly when QEMU doesn't expose the device.
 - In-tree PCIe drivers running against real QEMU-emulated devices.
@@ -127,6 +127,11 @@ asks for. Updated when observable kernel behaviour changes.
 | x86 cache topo   | CPUID(4) / CPUID(0x8000_001D) per-level enumerator → `CacheLevel { level, kind, line_bytes, partitions, ways, sets, size_bytes, fully_assoc, apic_ids_sharing }` (Intel + AMD share decoded shape). Spec: `arch/specification/irq-cache-numa.md` §4. |
 | aarch64 cache topo | CLIDR_EL1 + CSSELR_EL1 + CCSIDR_EL1 enumerator → `CacheLevel { level, kind, line_bytes, ways, sets, size_bytes }`. Spec: `arch/specification/irq-cache-numa.md` §5. |
 | NUMA primitives  | x86: `set_apic_to_domain(cb)` hook + `domain_for_apic_id` lookup (SRAT-driven). aarch64: `cluster_id(mpidr)` + `domain_for_current_cpu()` Aff2-derived. Spec: `arch/specification/irq-cache-numa.md` §6. |
+| Intel TME / MKTME | CPUID(7, 0).ECX[13] gate + IA32_TME_CAPABILITY (`0x981`) decode → `TmeCaps { aes_xts_128, aes_xts_128_integrity, aes_xts_256, max_keyid_bits, max_keys }` + IA32_TME_ACTIVATE (`0x982`) read/write + LOCK predicate. Spec: `arch/specification/cpu-mem-encrypt-virt.md` §1. |
+| Intel RTM-abort  | CPUID(7, 0).EDX[11] gate + IA32_TSX_FORCE_ABORT (`0x10F`) read/write + `force_rtm_abort()` boot-baseline helper. Spec: `arch/specification/cpu-mem-encrypt-virt.md` §2. |
+| aarch64 ECV      | `ID_AA64MMFR0_EL1.ECV` (bits[63:60]) decode + `supported()` + `cntpoff_supported()` predicates. Spec: `arch/specification/cpu-mem-encrypt-virt.md` §3. |
+| aarch64 NV2      | `ID_AA64MMFR2_EL1.NV` (bits[27:24]) decode + `supported()` (FEAT_NV) / `nv2_supported()` (FEAT_NV2) predicates. Spec: `arch/specification/cpu-mem-encrypt-virt.md` §4. |
+| aarch64 E0PD     | `ID_AA64MMFR2_EL1.E0PD` (bits[63:60]) decode + `enable_kernel_half()` / `disable_kernel_half()` flipping `TCR_EL1.E0PD1`. Spec: `arch/specification/cpu-mem-encrypt-virt.md` §5. |
 | iwlwifi          | Intel Wi-Fi 6 / 6E (AX200 / AX201 / AX210 / AX211). **Structural probe only** — PCI match table + spec doc. Operational register map (CSR/PRPH offsets, firmware loader, TFD/RBD descriptors, host-command opcodes) is not in any public Intel doc; further stages blocked on public register docs. See `drivers/net/specification/iwlwifi.md`. |
 | AHCI (ICH9/10)   | HBA bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT. |
 | xHCI USB host    | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT. |

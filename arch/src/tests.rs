@@ -1244,3 +1244,67 @@ fn smoke_numa_cluster_id() -> TestResult {
 }
 #[cfg(target_arch = "aarch64")]
 kernel_test_in!("arch/numa", smoke_numa_cluster_id);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_tme_supported_path() -> TestResult {
+    use crate::x86_64::tme;
+    let _ = tme::supported();
+    // Pure-data decoder test: synthetic CAPABILITY value.
+    //   AES_XTS_128 + AES_XTS_256, max_keyid_bits = 4, max_keys = 0x1F.
+    let raw = tme::TME_CAPS_AES_XTS_128
+            | tme::TME_CAPS_AES_XTS_256
+            | (4u64 << 32)
+            | (0x1Fu64 << 36);
+    let c = tme::decode_caps(raw);
+    if !c.aes_xts_128 || c.aes_xts_128_integrity || !c.aes_xts_256 {
+        return TestResult::Fail("AES_XTS bits decoded incorrectly");
+    }
+    if c.max_keyid_bits != 4 || c.max_keys != 0x1F {
+        return TestResult::Fail("MK-TME range fields decoded incorrectly");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/tme", smoke_tme_supported_path);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_rtm_always_abort_path() -> TestResult {
+    use crate::x86_64::rtm_abort;
+    let _ = rtm_abort::rtm_always_abort_supported();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/rtm_abort", smoke_rtm_always_abort_path);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_ecv_caps() -> TestResult {
+    use crate::aarch64::ecv;
+    if ecv::caps() > 2 {
+        return TestResult::Fail("ECV field > 2 (architectural max as of v0.1)");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/ecv", smoke_ecv_caps);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_nv2_caps() -> TestResult {
+    use crate::aarch64::nv2;
+    if nv2::caps() > 2 {
+        return TestResult::Fail("NV field > 2 (architectural max as of v0.1)");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/nv2", smoke_nv2_caps);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_e0pd_caps() -> TestResult {
+    use crate::aarch64::e0pd;
+    if e0pd::caps() > 1 {
+        return TestResult::Fail("E0PD field > 1 (architectural max as of v0.1)");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/e0pd", smoke_e0pd_caps);
