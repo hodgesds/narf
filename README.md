@@ -735,6 +735,19 @@ Live from boot through `cargo xtask run`:
   Memory Window). BERT yields `BertInfo { region_addr,
   region_length }` for the boot-error region. Spec:
   `acpi/specification/tables-ras-cxl-locality.md`.
+- ACPI AEST / SDEI / WDDT / LPIT / NFIT (`narf_acpi`):
+  Arm-RAS, software-delegated-exception, watchdog,
+  low-power-idle, and NVDIMM table parsers. AEST yields
+  per-node `AestNode { kind, iface, base }`. SDEI surfaces
+  just a sticky `is_sdei_known()` flag — the actual SDEI ABI
+  is reached via SMCCC. WDDT yields `WddtInfo` (timer
+  min/max/period, status, capability, GAS base). LPIT yields
+  `LpitState` (UID + trigger GAS + residency + latency +
+  counter GAS + counter freq) for the Native-C-State subtable.
+  NFIT yields `NfitSpaRange` (range index, proximity, base,
+  length, memory-mapping attribute) for the System-Physical-
+  Address subtable. Spec:
+  `acpi/specification/tables-arm-ras-power-pm.md`.
 - aarch64 SVE / SVE2 (`narf_arch::aarch64::sve`):
   `ID_AA64PFR0_EL1.SVE` + `ID_AA64ZFR0_EL1.SVEver` decode →
   `SveCaps { sve, sve2, sve21 }` (CPACR-safe; reads ID-group
@@ -765,8 +778,8 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **629/0/30** smokes;
-`--arch=aarch64` passes **335/0/10**. Skips are x86-specific PCIe
+`cargo xtask test --arch=x86_64` passes **635/0/29** smokes;
+`--arch=aarch64` passes **339/0/11**. Skips are x86-specific PCIe
 surfaces or live-device tests that skip cleanly when QEMU doesn't
 expose the device. See `STATUS.md` for the full tally and per-
 subsystem breakdown.

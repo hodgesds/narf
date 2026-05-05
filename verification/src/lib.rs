@@ -3177,6 +3177,168 @@ fn smoke_acpi_bert_synthetic_decode() -> TestResult {
 }
 kernel_test!(smoke_acpi_bert_synthetic_decode);
 
+fn smoke_acpi_aest_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    use narf_acpi::AestNode;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"AEST");
+    buf.extend_from_slice(&[0u8; 32]);
+
+    // Node header (12 B at offset 0..12 of entry):
+    //   0..1 type, 1..2 reserved, 2..4 length, 4..8 reserved,
+    //   8..12 NodeDataOffset (unused here)
+    // Then per the v0.1 spec we surface NodeIfaceOffset at [12..16]
+    // and read the iface block (Type @ off, Address @ off+4..off+12).
+    let entry_start = buf.len();
+    buf.push(2);                                    // type = SMMU
+    buf.push(0);                                    // reserved
+    buf.extend_from_slice(&28u16.to_le_bytes());    // length = 28
+    buf.extend_from_slice(&[0u8; 4]);               // reserved
+    buf.extend_from_slice(&[0u8; 4]);               // NodeDataOffset
+    buf.extend_from_slice(&16u32.to_le_bytes());    // NodeIfaceOffset = 16
+    // Interface block at +16: Type (1 = MMIO) + 3 padding + Address (8 B).
+    buf.push(1);                                    // iface type
+    buf.extend_from_slice(&[0u8; 3]);               // padding
+    buf.extend_from_slice(&0xCD_0000u64.to_le_bytes()); // base
+    debug_assert_eq!(buf.len() - entry_start, 28);
+    let _ = entry_start;
+
+    let n = narf_acpi::__test_parse_aest_body(&buf);
+    if n != 1 {
+        return TestResult::Fail("expected 1 AEST node parsed");
+    }
+    let mut nodes = [AestNode::default(); 4];
+    let nn = narf_acpi::copy_aest_nodes(&mut nodes);
+    if nn != 1 || nodes[0].kind != 2 || nodes[0].iface != 1 || nodes[0].base != 0xCD_0000 {
+        return TestResult::Fail("AEST node decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_aest_synthetic_decode);
+
+fn smoke_acpi_sdei_supported_path() -> TestResult {
+    narf_acpi::__test_set_sdei_known();
+    if !narf_acpi::is_sdei_known() {
+        return TestResult::Fail("SDEI sticky-flag did not flip");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_sdei_supported_path);
+
+fn smoke_acpi_wddt_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"WDDT");
+    buf.extend_from_slice(&[0u8; 32]);
+
+    // 6 bytes header (SpecVersion + TableVersion + PciVendorId).
+    buf.extend_from_slice(&[0u8; 6]);
+    // GAS (12 B): asid + bw + bo + access + Address (8).
+    buf.extend_from_slice(&[0u8; 4]);
+    buf.extend_from_slice(&0xBA50_0000u64.to_le_bytes());
+    // Counts + status + capability:
+    buf.extend_from_slice(&0xFFFFu16.to_le_bytes()); // max
+    buf.extend_from_slice(&0x0001u16.to_le_bytes()); // min
+    buf.extend_from_slice(&100u16.to_le_bytes());    // period_us
+    buf.extend_from_slice(&0x0007u16.to_le_bytes()); // status
+    buf.extend_from_slice(&0x0003u16.to_le_bytes()); // capability
+
+    narf_acpi::__test_parse_wddt_body(&buf);
+    let info = narf_acpi::wddt_info().expect("WDDT not parsed");
+    if info.timer_max_count != 0xFFFF
+        || info.timer_min_count != 1
+        || info.period_us != 100
+        || info.status != 0x0007
+        || info.capability != 0x0003
+        || info.base != 0xBA50_0000
+    {
+        return TestResult::Fail("WDDT decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_wddt_synthetic_decode);
+
+fn smoke_acpi_lpit_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    use narf_acpi::LpitState;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"LPIT");
+    buf.extend_from_slice(&[0u8; 32]);
+
+    // Type 0 native-c-state subtable, length = 56.
+    buf.extend_from_slice(&0u32.to_le_bytes());          // type
+    buf.extend_from_slice(&56u32.to_le_bytes());         // length
+    buf.extend_from_slice(&7u32.to_le_bytes());          // UID = 7
+    buf.extend_from_slice(&[0u8; 4]);                    // reserved
+    // EntryTrigger GAS (12 B); address @ +4..12.
+    buf.extend_from_slice(&[0u8; 4]);                    // GAS hdr
+    buf.extend_from_slice(&0xDEAD_0000u64.to_le_bytes()); // trigger addr
+    buf.extend_from_slice(&500u32.to_le_bytes());        // residency
+    buf.extend_from_slice(&50u32.to_le_bytes());         // latency
+    // ResidencyCounter GAS (12 B).
+    buf.extend_from_slice(&[0u8; 4]);
+    buf.extend_from_slice(&0xBEEF_0000u64.to_le_bytes()); // counter addr
+    buf.extend_from_slice(&3_000_000u64.to_le_bytes());  // counter freq
+
+    let n = narf_acpi::__test_parse_lpit_body(&buf);
+    if n != 1 {
+        return TestResult::Fail("expected 1 LPIT state parsed");
+    }
+    let mut states = [LpitState::default(); 4];
+    let ns = narf_acpi::copy_lpit_states(&mut states);
+    if ns != 1
+        || states[0].uid != 7
+        || states[0].trigger_addr != 0xDEAD_0000
+        || states[0].residency != 500
+        || states[0].latency != 50
+        || states[0].counter_addr != 0xBEEF_0000
+        || states[0].counter_freq != 3_000_000
+    {
+        return TestResult::Fail("LPIT state decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_lpit_synthetic_decode);
+
+fn smoke_acpi_nfit_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    use narf_acpi::NfitSpaRange;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"NFIT");
+    buf.extend_from_slice(&[0u8; 32]);
+    buf.extend_from_slice(&[0u8; 4]);                    // reserved
+
+    // SPA Range subtable (type 0, length 56).
+    buf.extend_from_slice(&0u16.to_le_bytes());          // type
+    buf.extend_from_slice(&56u16.to_le_bytes());         // length
+    buf.extend_from_slice(&0xAABBu16.to_le_bytes());     // range_index
+    buf.extend_from_slice(&0u16.to_le_bytes());          // flags
+    buf.extend_from_slice(&[0u8; 4]);                    // reserved
+    buf.extend_from_slice(&3u32.to_le_bytes());          // proximity = 3
+    buf.extend_from_slice(&[0u8; 16]);                   // GUID
+    buf.extend_from_slice(&0xC000_0000u64.to_le_bytes()); // base
+    buf.extend_from_slice(&0x4000_0000u64.to_le_bytes()); // length
+    buf.extend_from_slice(&0x55u64.to_le_bytes());       // mem_attr
+
+    let n = narf_acpi::__test_parse_nfit_body(&buf);
+    if n != 1 {
+        return TestResult::Fail("expected 1 NFIT SPA range parsed");
+    }
+    let mut ranges = [NfitSpaRange::default(); 4];
+    let nr = narf_acpi::copy_nfit_spa_ranges(&mut ranges);
+    if nr != 1
+        || ranges[0].range_index != 0xAABB
+        || ranges[0].proximity != 3
+        || ranges[0].base != 0xC000_0000
+        || ranges[0].length != 0x4000_0000
+        || ranges[0].mem_attr != 0x55
+    {
+        return TestResult::Fail("NFIT SPA range decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_nfit_synthetic_decode);
+
 fn smoke_acpi_srat_synthetic_memory_entry() -> TestResult {
     // Type-1 memory affinity entry: base 0x1_0000_0000, length
     // 0x1000_0000, proximity 1, enabled.
