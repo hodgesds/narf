@@ -2281,3 +2281,630 @@ pub fn __test_parse_spcr_body(body: &[u8]) {
     parse_spcr_body(body);
     SPCR_PARSED.store(true, Ordering::Release);
 }
+
+// ───────────────────────────────────────────────────────────────────
+// HEST — Hardware Error Source Table.
+// Spec: `acpi/specification/tables-ras-cxl-locality.md` §1.
+// ───────────────────────────────────────────────────────────────────
+
+pub const MAX_HEST_MCE:  usize = 16;
+pub const MAX_HEST_GHES: usize = 16;
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct HestMceSource {
+    pub source_id:         u16,
+    pub enabled:           bool,
+    pub num_hw_banks:      u8,
+    pub global_capability: u64,
+    pub global_control:    u64,
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct HestGhesSource {
+    pub source_id:               u16,
+    pub enabled:                 bool,
+    pub max_sections_per_record: u32,
+    pub error_status_block_addr: u64,
+}
+
+struct HestTables {
+    mce:    [HestMceSource; MAX_HEST_MCE],
+    ghes:   [HestGhesSource; MAX_HEST_GHES],
+    n_mce:  usize,
+    n_ghes: usize,
+}
+
+impl HestTables {
+    const EMPTY: Self = Self {
+        mce:    [HestMceSource {
+                    source_id: 0, enabled: false, num_hw_banks: 0,
+                    global_capability: 0, global_control: 0
+                }; MAX_HEST_MCE],
+        ghes:   [HestGhesSource {
+                    source_id: 0, enabled: false,
+                    max_sections_per_record: 0, error_status_block_addr: 0
+                }; MAX_HEST_GHES],
+        n_mce:  0,
+        n_ghes: 0,
+    };
+}
+
+static HEST_DATA:   IrqSafeSpinLock<HestTables> = IrqSafeSpinLock::new(HestTables::EMPTY);
+static HEST_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_hest_body(body: &[u8]) -> u32 {
+    let mut tables = HEST_DATA.lock();
+    *tables = HestTables::EMPTY;
+    if body.len() < SDT_HEADER_SIZE + 4 { return 0; }
+    let n_sources = u32::from_le_bytes([
+        body[SDT_HEADER_SIZE],     body[SDT_HEADER_SIZE + 1],
+        body[SDT_HEADER_SIZE + 2], body[SDT_HEADER_SIZE + 3],
+    ]) as usize;
+
+    let mut cur = SDT_HEADER_SIZE + 4;
+    let mut count = 0u32;
+    for _ in 0..n_sources {
+        if cur + 2 > body.len() { break; }
+        let kind = u16::from_le_bytes([body[cur], body[cur + 1]]);
+
+        match kind {
+            // Type 0: Machine Check.
+            0 if cur + 92 <= body.len() => {
+                let source_id = u16::from_le_bytes([body[cur + 2], body[cur + 3]]);
+                let enabled = body[cur + 7] != 0;
+                let global_capability = u64::from_le_bytes([
+                    body[cur + 16], body[cur + 17], body[cur + 18], body[cur + 19],
+                    body[cur + 20], body[cur + 21], body[cur + 22], body[cur + 23],
+                ]);
+                let global_control = u64::from_le_bytes([
+                    body[cur + 24], body[cur + 25], body[cur + 26], body[cur + 27],
+                    body[cur + 28], body[cur + 29], body[cur + 30], body[cur + 31],
+                ]);
+                let num_hw_banks = body[cur + 32];
+                if tables.n_mce < MAX_HEST_MCE {
+                    let i = tables.n_mce;
+                    tables.mce[i] = HestMceSource {
+                        source_id, enabled, num_hw_banks,
+                        global_capability, global_control,
+                    };
+                    tables.n_mce = i + 1;
+                    count += 1;
+                }
+                cur += 40 + 28 * num_hw_banks as usize;
+            }
+            // Type 9 / 10: GHES / GHESv2.
+            9 | 10 if cur + 92 <= body.len() => {
+                let source_id = u16::from_le_bytes([body[cur + 2], body[cur + 3]]);
+                let enabled = body[cur + 7] != 0;
+                let max_sections_per_record = u32::from_le_bytes([
+                    body[cur + 12], body[cur + 13], body[cur + 14], body[cur + 15],
+                ]);
+                // GAS.Address at offset cur + 24..32 of the GHES entry.
+                let err_addr = u64::from_le_bytes([
+                    body[cur + 24], body[cur + 25], body[cur + 26], body[cur + 27],
+                    body[cur + 28], body[cur + 29], body[cur + 30], body[cur + 31],
+                ]);
+                if tables.n_ghes < MAX_HEST_GHES {
+                    let i = tables.n_ghes;
+                    tables.ghes[i] = HestGhesSource {
+                        source_id, enabled, max_sections_per_record,
+                        error_status_block_addr: err_addr,
+                    };
+                    tables.n_ghes = i + 1;
+                    count += 1;
+                }
+                cur += if kind == 9 { 92 } else { 92 + 8 };
+            }
+            _ => break,   // unknown type — bail rather than misparse the rest
+        }
+    }
+    count
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → HEST must also be identity-mapped.
+pub unsafe fn parse_hest(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut hest: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"HEST" && hest.is_none() {
+                hest = Some(phys);
+            }
+        })?;
+    }
+    let hest = hest.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (hest as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 4 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(hest as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    let n = parse_hest_body(body);
+    HEST_PARSED.store(true, Ordering::Release);
+    Ok(n)
+}
+
+pub fn is_hest_known() -> bool { HEST_PARSED.load(Ordering::Acquire) }
+
+pub fn copy_hest_mce(out: &mut [HestMceSource]) -> usize {
+    let t = HEST_DATA.lock();
+    let n = t.n_mce.min(out.len());
+    out[..n].copy_from_slice(&t.mce[..n]);
+    n
+}
+
+pub fn copy_hest_ghes(out: &mut [HestGhesSource]) -> usize {
+    let t = HEST_DATA.lock();
+    let n = t.n_ghes.min(out.len());
+    out[..n].copy_from_slice(&t.ghes[..n]);
+    n
+}
+
+#[doc(hidden)]
+pub fn __test_parse_hest_body(body: &[u8]) -> u32 {
+    let n = parse_hest_body(body);
+    HEST_PARSED.store(true, Ordering::Release);
+    n
+}
+
+// ───────────────────────────────────────────────────────────────────
+// PCCT — Platform Communication Channels Table.
+// Spec: `acpi/specification/tables-ras-cxl-locality.md` §2.
+// ───────────────────────────────────────────────────────────────────
+
+pub const MAX_PCCT_CHANNELS: usize = 16;
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct PcctChannel {
+    pub kind:              u8,
+    pub shmem_base:        u64,
+    pub shmem_length:      u64,
+    pub doorbell_addr:     u64,
+    pub doorbell_write:    u64,
+    pub min_turnaround_us: u16,
+}
+
+struct PcctTables {
+    chans:    [PcctChannel; MAX_PCCT_CHANNELS],
+    n_chans:  usize,
+}
+
+impl PcctTables {
+    const EMPTY: Self = Self {
+        chans:    [PcctChannel {
+                      kind: 0, shmem_base: 0, shmem_length: 0,
+                      doorbell_addr: 0, doorbell_write: 0,
+                      min_turnaround_us: 0,
+                  }; MAX_PCCT_CHANNELS],
+        n_chans:  0,
+    };
+}
+
+static PCCT_DATA:   IrqSafeSpinLock<PcctTables> = IrqSafeSpinLock::new(PcctTables::EMPTY);
+static PCCT_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_pcct_body(body: &[u8]) -> u32 {
+    let mut tables = PCCT_DATA.lock();
+    *tables = PcctTables::EMPTY;
+    if body.len() < SDT_HEADER_SIZE + 12 { return 0; }
+    let mut cur = SDT_HEADER_SIZE + 12;
+    let mut count = 0u32;
+    while cur + 2 <= body.len() {
+        let kind = body[cur];
+        let len = body[cur + 1] as usize;
+        if len < 2 || cur + len > body.len() { break; }
+        let entry = &body[cur..cur + len];
+
+        if matches!(kind, 0 | 1 | 2) && entry.len() >= 62 {
+            // Generic PCCT channel layout (offsets within entry):
+            //   8..16  = BaseAddress
+            //   16..24 = Length
+            //   24..36 = DoorbellRegister GAS (Address @ +28..36)
+            //   36..44 = DoorbellPreserve
+            //   44..52 = DoorbellWrite
+            //   52..56 = NominalLatency_us
+            //   56..60 = MaxPeriodicAccessRate
+            //   60..62 = MinRequestTurnaround_us
+            let shmem_base = u64::from_le_bytes([
+                entry[8],  entry[9],  entry[10], entry[11],
+                entry[12], entry[13], entry[14], entry[15],
+            ]);
+            let shmem_length = u64::from_le_bytes([
+                entry[16], entry[17], entry[18], entry[19],
+                entry[20], entry[21], entry[22], entry[23],
+            ]);
+            let doorbell_addr = u64::from_le_bytes([
+                entry[28], entry[29], entry[30], entry[31],
+                entry[32], entry[33], entry[34], entry[35],
+            ]);
+            let doorbell_write = u64::from_le_bytes([
+                entry[44], entry[45], entry[46], entry[47],
+                entry[48], entry[49], entry[50], entry[51],
+            ]);
+            let min_turnaround_us = u16::from_le_bytes([entry[60], entry[61]]);
+            if tables.n_chans < MAX_PCCT_CHANNELS {
+                let i = tables.n_chans;
+                tables.chans[i] = PcctChannel {
+                    kind, shmem_base, shmem_length,
+                    doorbell_addr, doorbell_write, min_turnaround_us,
+                };
+                tables.n_chans = i + 1;
+                count += 1;
+            }
+        }
+        cur += len;
+    }
+    count
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → PCCT must also be identity-mapped.
+pub unsafe fn parse_pcct(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut pcct: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"PCCT" && pcct.is_none() {
+                pcct = Some(phys);
+            }
+        })?;
+    }
+    let pcct = pcct.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (pcct as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 12 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(pcct as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    let n = parse_pcct_body(body);
+    PCCT_PARSED.store(true, Ordering::Release);
+    Ok(n)
+}
+
+pub fn is_pcct_known() -> bool { PCCT_PARSED.load(Ordering::Acquire) }
+
+pub fn copy_pcct_channels(out: &mut [PcctChannel]) -> usize {
+    let t = PCCT_DATA.lock();
+    let n = t.n_chans.min(out.len());
+    out[..n].copy_from_slice(&t.chans[..n]);
+    n
+}
+
+#[doc(hidden)]
+pub fn __test_parse_pcct_body(body: &[u8]) -> u32 {
+    let n = parse_pcct_body(body);
+    PCCT_PARSED.store(true, Ordering::Release);
+    n
+}
+
+// ───────────────────────────────────────────────────────────────────
+// SLIT — System Locality Information Table.
+// Spec: `acpi/specification/tables-ras-cxl-locality.md` §3.
+// ───────────────────────────────────────────────────────────────────
+
+pub const MAX_SLIT_NODES: usize = 16;
+
+struct SlitTables {
+    locality_count: u32,
+    matrix:         [[u8; MAX_SLIT_NODES]; MAX_SLIT_NODES],
+}
+
+impl SlitTables {
+    const EMPTY: Self = Self {
+        locality_count: 0,
+        matrix:         [[0u8; MAX_SLIT_NODES]; MAX_SLIT_NODES],
+    };
+}
+
+static SLIT_DATA:   IrqSafeSpinLock<SlitTables> = IrqSafeSpinLock::new(SlitTables::EMPTY);
+static SLIT_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_slit_body(body: &[u8]) -> u32 {
+    let mut tables = SLIT_DATA.lock();
+    *tables = SlitTables::EMPTY;
+    if body.len() < SDT_HEADER_SIZE + 8 { return 0; }
+    let n = u64::from_le_bytes([
+        body[SDT_HEADER_SIZE],     body[SDT_HEADER_SIZE + 1],
+        body[SDT_HEADER_SIZE + 2], body[SDT_HEADER_SIZE + 3],
+        body[SDT_HEADER_SIZE + 4], body[SDT_HEADER_SIZE + 5],
+        body[SDT_HEADER_SIZE + 6], body[SDT_HEADER_SIZE + 7],
+    ]) as usize;
+    let n = n.min(MAX_SLIT_NODES);
+    if body.len() < SDT_HEADER_SIZE + 8 + n * n { return 0; }
+    let mut off = SDT_HEADER_SIZE + 8;
+    for i in 0..n {
+        for j in 0..n {
+            tables.matrix[i][j] = body[off];
+            off += 1;
+        }
+    }
+    tables.locality_count = n as u32;
+    n as u32
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → SLIT must also be identity-mapped.
+pub unsafe fn parse_slit(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut slit: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"SLIT" && slit.is_none() {
+                slit = Some(phys);
+            }
+        })?;
+    }
+    let slit = slit.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (slit as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 8 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(slit as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    let n = parse_slit_body(body);
+    SLIT_PARSED.store(true, Ordering::Release);
+    Ok(n)
+}
+
+pub fn is_slit_known() -> bool { SLIT_PARSED.load(Ordering::Acquire) }
+
+pub fn slit_distance(from: u8, to: u8) -> Option<u8> {
+    if !is_slit_known() { return None; }
+    let t = SLIT_DATA.lock();
+    if (from as u32) >= t.locality_count || (to as u32) >= t.locality_count {
+        return None;
+    }
+    Some(t.matrix[from as usize][to as usize])
+}
+
+pub fn slit_locality_count() -> u32 {
+    SLIT_DATA.lock().locality_count
+}
+
+#[doc(hidden)]
+pub fn __test_parse_slit_body(body: &[u8]) -> u32 {
+    let n = parse_slit_body(body);
+    SLIT_PARSED.store(true, Ordering::Release);
+    n
+}
+
+// ───────────────────────────────────────────────────────────────────
+// CEDT — CXL Early Discovery Table.
+// Spec: `acpi/specification/tables-ras-cxl-locality.md` §4.
+// ───────────────────────────────────────────────────────────────────
+
+pub const MAX_CEDT_CHBS:  usize = 8;
+pub const MAX_CEDT_CFMWS: usize = 8;
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct CedtChbs {
+    pub uid:     u32,
+    pub cxl_ver: u32,
+    pub base:    u64,
+    pub length:  u64,
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct CedtCfmws {
+    pub base_hpa:    u64,
+    pub window_size: u64,
+    pub encoded_iw:  u8,
+}
+
+struct CedtTables {
+    chbs:    [CedtChbs;  MAX_CEDT_CHBS],
+    cfmws:   [CedtCfmws; MAX_CEDT_CFMWS],
+    n_chbs:  usize,
+    n_cfmws: usize,
+}
+
+impl CedtTables {
+    const EMPTY: Self = Self {
+        chbs:    [CedtChbs { uid: 0, cxl_ver: 0, base: 0, length: 0 };
+                  MAX_CEDT_CHBS],
+        cfmws:   [CedtCfmws { base_hpa: 0, window_size: 0, encoded_iw: 0 };
+                  MAX_CEDT_CFMWS],
+        n_chbs:  0,
+        n_cfmws: 0,
+    };
+}
+
+static CEDT_DATA:   IrqSafeSpinLock<CedtTables> = IrqSafeSpinLock::new(CedtTables::EMPTY);
+static CEDT_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_cedt_body(body: &[u8]) -> u32 {
+    let mut tables = CEDT_DATA.lock();
+    *tables = CedtTables::EMPTY;
+    let mut cur = SDT_HEADER_SIZE;
+    let mut count = 0u32;
+    while cur + 4 <= body.len() {
+        let kind = body[cur];
+        let len = u16::from_le_bytes([body[cur + 2], body[cur + 3]]) as usize;
+        if len < 4 || cur + len > body.len() { break; }
+        let entry = &body[cur..cur + len];
+
+        match kind {
+            // CHBS — CXL Host Bridge Structure (length 32).
+            0 if entry.len() >= 32 => {
+                let uid = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
+                let cxl_ver = u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]);
+                let base = u64::from_le_bytes([
+                    entry[16], entry[17], entry[18], entry[19],
+                    entry[20], entry[21], entry[22], entry[23],
+                ]);
+                let length = u64::from_le_bytes([
+                    entry[24], entry[25], entry[26], entry[27],
+                    entry[28], entry[29], entry[30], entry[31],
+                ]);
+                if tables.n_chbs < MAX_CEDT_CHBS {
+                    let i = tables.n_chbs;
+                    tables.chbs[i] = CedtChbs { uid, cxl_ver, base, length };
+                    tables.n_chbs = i + 1;
+                    count += 1;
+                }
+            }
+            // CFMWS — CXL Fixed Memory Window (variable length, ≥36).
+            1 if entry.len() >= 36 => {
+                let base_hpa = u64::from_le_bytes([
+                    entry[8],  entry[9],  entry[10], entry[11],
+                    entry[12], entry[13], entry[14], entry[15],
+                ]);
+                let window_size = u64::from_le_bytes([
+                    entry[16], entry[17], entry[18], entry[19],
+                    entry[20], entry[21], entry[22], entry[23],
+                ]);
+                let encoded_iw = entry[24];
+                if tables.n_cfmws < MAX_CEDT_CFMWS {
+                    let i = tables.n_cfmws;
+                    tables.cfmws[i] = CedtCfmws {
+                        base_hpa, window_size, encoded_iw,
+                    };
+                    tables.n_cfmws = i + 1;
+                    count += 1;
+                }
+            }
+            _ => {}
+        }
+        cur += len;
+    }
+    count
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → CEDT must also be identity-mapped.
+pub unsafe fn parse_cedt(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut cedt: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"CEDT" && cedt.is_none() {
+                cedt = Some(phys);
+            }
+        })?;
+    }
+    let cedt = cedt.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (cedt as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(cedt as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    let n = parse_cedt_body(body);
+    CEDT_PARSED.store(true, Ordering::Release);
+    Ok(n)
+}
+
+pub fn is_cedt_known() -> bool { CEDT_PARSED.load(Ordering::Acquire) }
+
+pub fn copy_cedt_chbs(out: &mut [CedtChbs]) -> usize {
+    let t = CEDT_DATA.lock();
+    let n = t.n_chbs.min(out.len());
+    out[..n].copy_from_slice(&t.chbs[..n]);
+    n
+}
+
+pub fn copy_cedt_cfmws(out: &mut [CedtCfmws]) -> usize {
+    let t = CEDT_DATA.lock();
+    let n = t.n_cfmws.min(out.len());
+    out[..n].copy_from_slice(&t.cfmws[..n]);
+    n
+}
+
+#[doc(hidden)]
+pub fn __test_parse_cedt_body(body: &[u8]) -> u32 {
+    let n = parse_cedt_body(body);
+    CEDT_PARSED.store(true, Ordering::Release);
+    n
+}
+
+// ───────────────────────────────────────────────────────────────────
+// BERT — Boot Error Record Table.
+// Spec: `acpi/specification/tables-ras-cxl-locality.md` §5.
+// ───────────────────────────────────────────────────────────────────
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct BertInfo {
+    pub region_addr:   u64,
+    pub region_length: u32,
+}
+
+static BERT_DATA: IrqSafeSpinLock<BertInfo> = IrqSafeSpinLock::new(BertInfo {
+    region_addr: 0, region_length: 0,
+});
+static BERT_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_bert_body(body: &[u8]) {
+    if body.len() < SDT_HEADER_SIZE + 12 { return; }
+    let region_length = u32::from_le_bytes([
+        body[SDT_HEADER_SIZE],     body[SDT_HEADER_SIZE + 1],
+        body[SDT_HEADER_SIZE + 2], body[SDT_HEADER_SIZE + 3],
+    ]);
+    let region_addr = u64::from_le_bytes([
+        body[SDT_HEADER_SIZE + 4],  body[SDT_HEADER_SIZE + 5],
+        body[SDT_HEADER_SIZE + 6],  body[SDT_HEADER_SIZE + 7],
+        body[SDT_HEADER_SIZE + 8],  body[SDT_HEADER_SIZE + 9],
+        body[SDT_HEADER_SIZE + 10], body[SDT_HEADER_SIZE + 11],
+    ]);
+    *BERT_DATA.lock() = BertInfo { region_addr, region_length };
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → BERT must also be identity-mapped.
+pub unsafe fn parse_bert(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut bert: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"BERT" && bert.is_none() {
+                bert = Some(phys);
+            }
+        })?;
+    }
+    let bert = bert.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (bert as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 12 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(bert as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    parse_bert_body(body);
+    BERT_PARSED.store(true, Ordering::Release);
+    Ok(())
+}
+
+pub fn bert_info() -> Option<BertInfo> {
+    if !BERT_PARSED.load(Ordering::Acquire) { return None; }
+    Some(*BERT_DATA.lock())
+}
+
+#[doc(hidden)]
+pub fn __test_parse_bert_body(body: &[u8]) {
+    parse_bert_body(body);
+    BERT_PARSED.store(true, Ordering::Release);
+}

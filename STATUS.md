@@ -18,8 +18,8 @@ asks for. Updated when observable kernel behaviour changes.
   delivers hardware LAPIC-timer IRQs, exits cleanly.
 - `cargo xtask run --arch=aarch64` boots, runs the full async demo
   using CNTPCT_EL0 as the clock, exits via ARM semihosting.
-- `cargo xtask test --arch=x86_64` passes **625/0/29** (pass / fail / skip).
-- `cargo xtask test --arch=aarch64` passes **329/0/11** (pass / fail / skip).
+- `cargo xtask test --arch=x86_64` passes **629/0/30** (pass / fail / skip).
+- `cargo xtask test --arch=aarch64` passes **335/0/10** (pass / fail / skip).
   Skips are x86_64-specific PCIe surfaces or live-device tests that
   skip cleanly when QEMU doesn't expose the device.
 - In-tree PCIe drivers running against real QEMU-emulated devices.
@@ -143,6 +143,11 @@ asks for. Updated when observable kernel behaviour changes.
 | ACPI DMAR        | DMA Remap Reporting — DRHD enumeration → `DmarDrhd { register_base, segment, include_all_pci }` + `dmar_intr_remap_supported()`. Spec: `acpi/specification/tables-iommu-topology.md` §3. |
 | ACPI IVRS        | I/O Virtualization Reporting (AMD) — IVHD entries (types 0x10/0x11/0x40) → `IvrsIommu { base, pci_segment, capability_off }`. Spec: `acpi/specification/tables-iommu-topology.md` §4. |
 | ACPI SPCR        | Serial Port Console Redirection — interface type + GAS base + GSI + baud-code → `SpcrInfo`. Spec: `acpi/specification/tables-iommu-topology.md` §5. |
+| ACPI HEST        | Hardware Error Source Table — Type 0 (Machine Check) + Type 9/10 (GHES/GHESv2) decode → `HestMceSource` / `HestGhesSource`. `parse_hest(rsdp)` + `copy_hest_mce` / `copy_hest_ghes`. Spec: `acpi/specification/tables-ras-cxl-locality.md` §1. |
+| ACPI PCCT        | Platform Communication Channels — generic / HW-reduced / HW-reduced-v2 channels (types 0/1/2) → `PcctChannel { kind, shmem_base, shmem_length, doorbell_addr, doorbell_write, min_turnaround_us }`. Spec: `acpi/specification/tables-ras-cxl-locality.md` §2. |
+| ACPI SLIT        | System Locality Information — N×N distance matrix lookup. `slit_distance(from, to)` + `slit_locality_count()`. Spec: `acpi/specification/tables-ras-cxl-locality.md` §3. |
+| ACPI CEDT        | CXL Early Discovery — CHBS (CXL Host Bridge) + CFMWS (CXL Fixed Memory Window) → `CedtChbs` / `CedtCfmws`. Spec: `acpi/specification/tables-ras-cxl-locality.md` §4. |
+| ACPI BERT        | Boot Error Record Table — `BertInfo { region_addr, region_length }`. Spec: `acpi/specification/tables-ras-cxl-locality.md` §5. |
 | iwlwifi          | Intel Wi-Fi 6 / 6E (AX200 / AX201 / AX210 / AX211). **Structural probe only** — PCI match table + spec doc. Operational register map (CSR/PRPH offsets, firmware loader, TFD/RBD descriptors, host-command opcodes) is not in any public Intel doc; further stages blocked on public register docs. See `drivers/net/specification/iwlwifi.md`. |
 | AHCI (ICH9/10)   | HBA bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT. |
 | xHCI USB host    | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT. |

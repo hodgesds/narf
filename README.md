@@ -723,6 +723,18 @@ Live from boot through `cargo xtask run`:
   table follows the existing idempotent / sticky-flag pattern
   on top of `walk_xsdt`. Spec:
   `acpi/specification/tables-iommu-topology.md`.
+- ACPI HEST / PCCT / SLIT / CEDT / BERT (`narf_acpi`):
+  RAS + locality + CXL + boot-error parsers. HEST yields
+  `HestMceSource` (Type 0) + `HestGhesSource` (Type 9/10) for
+  the Machine-Check and Generic Hardware Error reporting
+  paths. PCCT yields `PcctChannel` (shmem base + length,
+  doorbell GAS + write mask, min turnaround) for OSPM↔BMC /
+  HFI plumbing. SLIT yields an N×N distance-matrix lookup
+  via `slit_distance(from, to)`. CEDT yields `CedtChbs` (CXL
+  Host Bridge MMIO base + version) and `CedtCfmws` (Fixed
+  Memory Window). BERT yields `BertInfo { region_addr,
+  region_length }` for the boot-error region. Spec:
+  `acpi/specification/tables-ras-cxl-locality.md`.
 - aarch64 SVE / SVE2 (`narf_arch::aarch64::sve`):
   `ID_AA64PFR0_EL1.SVE` + `ID_AA64ZFR0_EL1.SVEver` decode →
   `SveCaps { sve, sve2, sve21 }` (CPACR-safe; reads ID-group
@@ -753,8 +765,8 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **625/0/29** smokes;
-`--arch=aarch64` passes **329/0/11**. Skips are x86-specific PCIe
+`cargo xtask test --arch=x86_64` passes **629/0/30** smokes;
+`--arch=aarch64` passes **335/0/10**. Skips are x86-specific PCIe
 surfaces or live-device tests that skip cleanly when QEMU doesn't
 expose the device. See `STATUS.md` for the full tally and per-
 subsystem breakdown.

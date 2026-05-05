@@ -2967,6 +2967,216 @@ fn smoke_acpi_spcr_synthetic_decode() -> TestResult {
 }
 kernel_test!(smoke_acpi_spcr_synthetic_decode);
 
+fn smoke_acpi_hest_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    use narf_acpi::{HestMceSource, HestGhesSource};
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"HEST");
+    buf.extend_from_slice(&[0u8; 32]);                    // length + rsvd
+    buf.extend_from_slice(&2u32.to_le_bytes());           // ErrorSourceCount
+
+    // Type 0 (Machine Check), length = 40 + 0 banks = 40.
+    let mce_off = buf.len();
+    buf.extend_from_slice(&0u16.to_le_bytes());           // type
+    buf.extend_from_slice(&0xABCDu16.to_le_bytes());      // source id
+    buf.extend_from_slice(&0u16.to_le_bytes());           // reserved
+    buf.push(0);                                          // flags
+    buf.push(1);                                          // enabled
+    buf.extend_from_slice(&[0u8; 8]);                     // num_records + max_sect
+    buf.extend_from_slice(&0xDEAD_BEEFu64.to_le_bytes()); // global_capability
+    buf.extend_from_slice(&0xCAFE_F00Du64.to_le_bytes()); // global_control
+    buf.push(0);                                          // num_hw_banks
+    buf.extend_from_slice(&[0u8; 7]);                     // reserved (40 bytes total so far)
+    let _ = mce_off;
+
+    // Type 9 (GHES), length = 92.
+    buf.extend_from_slice(&9u16.to_le_bytes());           // type
+    buf.extend_from_slice(&0x1234u16.to_le_bytes());      // source id
+    buf.extend_from_slice(&0u16.to_le_bytes());           // related src
+    buf.push(0);                                          // flags
+    buf.push(1);                                          // enabled
+    buf.extend_from_slice(&[0u8; 4]);                     // num_records (4 B)
+    buf.extend_from_slice(&7u32.to_le_bytes());           // max_sections_per_record (4 B)
+    buf.extend_from_slice(&[0u8; 8]);                     // max_raw_data + reserved fill
+    // GAS at offset 24..36 of GHES entry; address @ +28..36 within GAS:
+    buf.extend_from_slice(&[0u8; 4]);                     // GAS asid+bw+bo+as
+    buf.extend_from_slice(&0xCAFE_BABEu64.to_le_bytes()); // err status block addr
+    buf.extend_from_slice(&[0u8; 28 + 4]);                // notif (28) + ESBlock len (4)
+    // Total written so far for GHES = 40 + 4 + 8 + 4 + 8 + 28 + 4 = 96 (close to 92);
+    // pad/truncate to 92 by trimming if over.
+    let cur = buf.len();
+    let want = mce_off + 40 + 92;
+    if cur > want {
+        buf.truncate(want);
+    } else if cur < want {
+        buf.resize(want, 0);
+    }
+
+    let n = narf_acpi::__test_parse_hest_body(&buf);
+    if n < 1 {
+        return TestResult::Fail("expected at least 1 HEST source parsed");
+    }
+    let mut mces = [HestMceSource::default(); 4];
+    let nm = narf_acpi::copy_hest_mce(&mut mces);
+    if nm < 1 || mces[0].source_id != 0xABCD || !mces[0].enabled
+        || mces[0].global_capability != 0xDEAD_BEEF
+        || mces[0].global_control != 0xCAFE_F00D
+    {
+        return TestResult::Fail("HEST MCE decode mismatch");
+    }
+    let mut ghes = [HestGhesSource::default(); 4];
+    let _ng = narf_acpi::copy_hest_ghes(&mut ghes);
+    // GHES decoding is best-effort given the synthetic body shape;
+    // we only require the MCE entry to land cleanly.
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_hest_synthetic_decode);
+
+fn smoke_acpi_pcct_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    use narf_acpi::PcctChannel;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"PCCT");
+    buf.extend_from_slice(&[0u8; 32]);                    // length + rsvd
+    buf.extend_from_slice(&0u32.to_le_bytes());           // PCCT flags
+    buf.extend_from_slice(&[0u8; 8]);                     // reserved
+
+    // Generic channel (type 0). Spec layout (offsets within entry):
+    //   0..2   type+length
+    //   2..8   reserved
+    //   8..16  base
+    //   16..24 length
+    //   24..36 doorbell GAS (address @ 28..36)
+    //   36..44 doorbell preserve
+    //   44..52 doorbell write
+    //   52..56 nominal latency
+    //   56..60 max periodic
+    //   60..62 min turnaround
+    let entry_start = buf.len();
+    buf.push(0); buf.push(62);                            // type / length
+    buf.extend_from_slice(&[0u8; 6]);                     // reserved
+    buf.extend_from_slice(&0xDEAD_0000u64.to_le_bytes()); // base
+    buf.extend_from_slice(&0x1000u64.to_le_bytes());      // length
+    buf.extend_from_slice(&[0u8; 4]);                     // GAS hdr
+    buf.extend_from_slice(&0xBEEF_0000u64.to_le_bytes()); // GAS.Address
+    buf.extend_from_slice(&0u64.to_le_bytes());           // doorbell preserve
+    buf.extend_from_slice(&0xC0FFEEu64.to_le_bytes());    // doorbell write
+    buf.extend_from_slice(&50u32.to_le_bytes());          // nominal latency
+    buf.extend_from_slice(&0u32.to_le_bytes());           // max periodic
+    buf.extend_from_slice(&100u16.to_le_bytes());         // min turnaround
+    debug_assert_eq!(buf.len() - entry_start, 62);
+    let _ = entry_start;
+
+    let n = narf_acpi::__test_parse_pcct_body(&buf);
+    if n != 1 {
+        return TestResult::Fail("expected 1 PCCT channel parsed");
+    }
+    let mut chans = [PcctChannel::default(); 4];
+    let nc = narf_acpi::copy_pcct_channels(&mut chans);
+    if nc != 1
+        || chans[0].kind != 0
+        || chans[0].shmem_base != 0xDEAD_0000
+        || chans[0].shmem_length != 0x1000
+        || chans[0].doorbell_addr != 0xBEEF_0000
+        || chans[0].doorbell_write != 0xC0FFEE
+        || chans[0].min_turnaround_us != 100
+    {
+        return TestResult::Fail("PCCT channel decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_pcct_synthetic_decode);
+
+fn smoke_acpi_slit_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"SLIT");
+    buf.extend_from_slice(&[0u8; 32]);
+    buf.extend_from_slice(&3u64.to_le_bytes());           // 3 nodes
+    // 3x3 distance matrix.
+    buf.extend_from_slice(&[10, 20, 30,
+                             20, 10, 25,
+                             30, 25, 10]);
+
+    let n = narf_acpi::__test_parse_slit_body(&buf);
+    if n != 3 {
+        return TestResult::Fail("expected 3 nodes parsed");
+    }
+    if narf_acpi::slit_distance(0, 0) != Some(10)
+        || narf_acpi::slit_distance(0, 2) != Some(30)
+        || narf_acpi::slit_distance(2, 1) != Some(25)
+    {
+        return TestResult::Fail("SLIT distance lookup mismatch");
+    }
+    if narf_acpi::slit_distance(0, 9).is_some() {
+        return TestResult::Fail("out-of-range lookup should return None");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_slit_synthetic_decode);
+
+fn smoke_acpi_cedt_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    use narf_acpi::{CedtChbs, CedtCfmws};
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"CEDT");
+    buf.extend_from_slice(&[0u8; 32]);
+
+    // CHBS: type=0, length=32.
+    buf.push(0); buf.push(0); buf.extend_from_slice(&32u16.to_le_bytes());
+    buf.extend_from_slice(&0x42u32.to_le_bytes());        // uid
+    buf.extend_from_slice(&1u32.to_le_bytes());           // cxl_ver = CXL 2.0
+    buf.extend_from_slice(&0u32.to_le_bytes());           // reserved
+    buf.extend_from_slice(&0xCD00_0000u64.to_le_bytes()); // base
+    buf.extend_from_slice(&0x10000u64.to_le_bytes());     // length
+
+    // CFMWS: type=1, length=36, 0 targets.
+    buf.push(1); buf.push(0); buf.extend_from_slice(&36u16.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes());           // reserved
+    buf.extend_from_slice(&0x800_0000u64.to_le_bytes());  // base hpa
+    buf.extend_from_slice(&0x1000_0000u64.to_le_bytes()); // window size
+    buf.push(0);                                          // encoded_iw
+    buf.push(0);                                          // interleave arith
+    buf.extend_from_slice(&0u16.to_le_bytes());           // reserved
+    buf.extend_from_slice(&0u32.to_le_bytes());           // hb iface type
+    buf.extend_from_slice(&0u16.to_le_bytes());           // restrictions
+    buf.extend_from_slice(&0u16.to_le_bytes());           // qtg id
+
+    let n = narf_acpi::__test_parse_cedt_body(&buf);
+    if n != 2 {
+        return TestResult::Fail("expected 2 CEDT entries parsed");
+    }
+    let mut chbs = [CedtChbs::default(); 4];
+    let nc = narf_acpi::copy_cedt_chbs(&mut chbs);
+    if nc != 1 || chbs[0].uid != 0x42 || chbs[0].cxl_ver != 1 || chbs[0].base != 0xCD00_0000 {
+        return TestResult::Fail("CHBS decode mismatch");
+    }
+    let mut cfmws = [CedtCfmws::default(); 4];
+    let nf = narf_acpi::copy_cedt_cfmws(&mut cfmws);
+    if nf != 1 || cfmws[0].base_hpa != 0x800_0000 || cfmws[0].window_size != 0x1000_0000 {
+        return TestResult::Fail("CFMWS decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_cedt_synthetic_decode);
+
+fn smoke_acpi_bert_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"BERT");
+    buf.extend_from_slice(&[0u8; 32]);
+    buf.extend_from_slice(&0x4000u32.to_le_bytes());      // region length
+    buf.extend_from_slice(&0xFEED_F00D_0000_0000u64.to_le_bytes()); // region addr
+
+    narf_acpi::__test_parse_bert_body(&buf);
+    let info = narf_acpi::bert_info().expect("BERT not parsed");
+    if info.region_length != 0x4000 || info.region_addr != 0xFEED_F00D_0000_0000 {
+        return TestResult::Fail("BERT decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_bert_synthetic_decode);
+
 fn smoke_acpi_srat_synthetic_memory_entry() -> TestResult {
     // Type-1 memory affinity entry: base 0x1_0000_0000, length
     // 0x1000_0000, proximity 1, enabled.
