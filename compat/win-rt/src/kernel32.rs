@@ -19,8 +19,18 @@ use crate::{handle, stdhandle};
 pub struct Export {
     pub module: &'static str,
     pub symbol: &'static str,
-    pub addr:   unsafe extern "C" fn(),
+    /// Link-time VA of the thunk. We store it as `*const ()` so
+    /// the table can hold thunks declared with the architectural
+    /// PE ABI (`extern "win64"` on x86_64, `extern "C"` on
+    /// aarch64) without an ABI-changing fn-pointer cast — the
+    /// loader patches the IAT slot with this address verbatim.
+    pub addr:   *const (),
 }
+
+// SAFETY: `addr` is a static function pointer; sharing it across
+// threads is sound. The struct is `Copy`, but Rust 2024 still
+// expects an explicit `Sync` bound for raw pointers.
+unsafe impl Sync for Export {}
 
 /// `GetStdHandle(nStdHandle: i32) -> HANDLE`.
 ///
@@ -149,7 +159,7 @@ fn handle_to_fd(h: u64) -> Option<u32> {
 /// runtime VA based on where the rt was mapped in the
 /// WinProcess AS.
 pub const EXPORTS: &[Export] = &[
-    Export { module: "kernel32.dll", symbol: "GetStdHandle",  addr: GetStdHandle as _ },
-    Export { module: "kernel32.dll", symbol: "WriteConsoleA", addr: WriteConsoleA as _ },
-    Export { module: "kernel32.dll", symbol: "ExitProcess",   addr: ExitProcess as _ },
+    Export { module: "kernel32.dll", symbol: "GetStdHandle",  addr: GetStdHandle  as *const () },
+    Export { module: "kernel32.dll", symbol: "WriteConsoleA", addr: WriteConsoleA as *const () },
+    Export { module: "kernel32.dll", symbol: "ExitProcess",   addr: ExitProcess   as *const () },
 ];
