@@ -735,6 +735,17 @@ Live from boot through `cargo xtask run`:
   Memory Window). BERT yields `BertInfo { region_addr,
   region_length }` for the boot-error region. Spec:
   `acpi/specification/tables-ras-cxl-locality.md`.
+- ACPI TCPA / MCHI / PHAT / StAO / UEFI (`narf_acpi`):
+  TPM-1.2 + management-controller + platform-health +
+  status-override + UEFI-data parsers. TCPA yields `TcpaInfo`
+  (platform class, log area min, log area phys). MCHI yields
+  `MchiInfo` (interface type — KCS / SMIC / BT / SMBus —
+  protocols bitmap, identifier, GAS base). PHAT yields per-
+  Type-1-record `PhatHealthRecord` (AmHealthy + 16-byte device
+  GUID). StAO yields `StaoInfo` (ignore-UART boolean). UEFI
+  yields `UefiTableInfo` (16-byte vendor / data GUID + payload
+  data offset). Spec:
+  `acpi/specification/tables-tcpa-mchi-phat-stao-uefi.md`.
 - ACPI BOOT / DBGP / WPBT / MSCT / XENV (`narf_acpi`):
   boot-flag + legacy-debug-port + Windows-platform-binary +
   max-system-characteristics + Xen-environment parsers. BOOT
@@ -838,8 +849,8 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **659/0/30** smokes;
-`--arch=aarch64` passes **364/0/11**. Skips are x86-specific PCIe
+`cargo xtask test --arch=x86_64` passes **664/0/30** smokes;
+`--arch=aarch64` passes **369/0/11**. Skips are x86-specific PCIe
 surfaces or live-device tests that skip cleanly when QEMU doesn't
 expose the device. See `STATUS.md` for the full tally and per-
 subsystem breakdown.

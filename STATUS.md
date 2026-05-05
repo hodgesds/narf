@@ -18,8 +18,8 @@ asks for. Updated when observable kernel behaviour changes.
   delivers hardware LAPIC-timer IRQs, exits cleanly.
 - `cargo xtask run --arch=aarch64` boots, runs the full async demo
   using CNTPCT_EL0 as the clock, exits via ARM semihosting.
-- `cargo xtask test --arch=x86_64` passes **659/0/30** (pass / fail / skip).
-- `cargo xtask test --arch=aarch64` passes **364/0/11** (pass / fail / skip).
+- `cargo xtask test --arch=x86_64` passes **664/0/30** (pass / fail / skip).
+- `cargo xtask test --arch=aarch64` passes **369/0/11** (pass / fail / skip).
   Skips are x86_64-specific PCIe surfaces or live-device tests that
   skip cleanly when QEMU doesn't expose the device.
 - In-tree PCIe drivers running against real QEMU-emulated devices.
@@ -178,6 +178,11 @@ asks for. Updated when observable kernel behaviour changes.
 | ACPI WPBT        | Windows Platform Binary Table — `WpbtInfo { handoff_size, handoff_addr, layout_type, content_type }`. Spec: `acpi/specification/tables-boot-dbgp-wpbt-msct-xenv.md` §3. |
 | ACPI MSCT        | Maximum System Characteristics — `MsctInfo { max_proximity_domains, max_clock_domains, max_phys_addr_cap }` + per-PDIS `MsctPdis { low_domain, high_domain, max_processor_capacity, max_memory_capacity }`. Spec: `acpi/specification/tables-boot-dbgp-wpbt-msct-xenv.md` §4. |
 | ACPI XENV        | Xen Environment — `XenvInfo { grant_table_base, grant_table_size, event_vector }`. Spec: `acpi/specification/tables-boot-dbgp-wpbt-msct-xenv.md` §5. |
+| ACPI TCPA        | TPM 1.2 event log location — `TcpaInfo { platform_class, log_area_min, log_area_phys }`. Spec: `acpi/specification/tables-tcpa-mchi-phat-stao-uefi.md` §1. |
+| ACPI MCHI        | Management Controller Host Interface — `MchiInfo { interface_type, protocols, identifier, base }`. Spec: `acpi/specification/tables-tcpa-mchi-phat-stao-uefi.md` §2. |
+| ACPI PHAT        | Platform Health Assessment — Type 1 (Health Data) → `PhatHealthRecord { am_healthy, device_guid }`. Spec: `acpi/specification/tables-tcpa-mchi-phat-stao-uefi.md` §3. |
+| ACPI StAO        | Status Override — `StaoInfo { ignore_uart }`. Spec: `acpi/specification/tables-tcpa-mchi-phat-stao-uefi.md` §4. |
+| ACPI UEFI        | UEFI ACPI Data Table — `UefiTableInfo { identifier, data_offset }`. Spec: `acpi/specification/tables-tcpa-mchi-phat-stao-uefi.md` §5. |
 | iwlwifi          | Intel Wi-Fi 6 / 6E (AX200 / AX201 / AX210 / AX211). **Structural probe only** — PCI match table + spec doc. Operational register map (CSR/PRPH offsets, firmware loader, TFD/RBD descriptors, host-command opcodes) is not in any public Intel doc; further stages blocked on public register docs. See `drivers/net/specification/iwlwifi.md`. |
 | AHCI (ICH9/10)   | HBA bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT. |
 | xHCI USB host    | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT. |

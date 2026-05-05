@@ -4100,6 +4100,117 @@ fn smoke_acpi_xenv_synthetic_decode() -> TestResult {
 }
 kernel_test!(smoke_acpi_xenv_synthetic_decode);
 
+fn smoke_acpi_tcpa_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"TCPA");
+    buf.extend_from_slice(&[0u8; 32]);
+    buf.extend_from_slice(&0u16.to_le_bytes());           // platform class = Client
+    buf.extend_from_slice(&0x4000u32.to_le_bytes());      // log area min
+    buf.extend_from_slice(&0xC100_0000u64.to_le_bytes()); // log area phys
+
+    narf_acpi::__test_parse_tcpa_body(&buf);
+    let info = narf_acpi::tcpa_info().expect("TCPA not parsed");
+    if info.platform_class != 0
+        || info.log_area_min != 0x4000
+        || info.log_area_phys != 0xC100_0000
+    {
+        return TestResult::Fail("TCPA decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_tcpa_synthetic_decode);
+
+fn smoke_acpi_mchi_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"MCHI");
+    buf.extend_from_slice(&[0u8; 32]);
+    buf.push(1);                                          // KCS
+    buf.push(0x0F);                                       // protocols
+    buf.extend_from_slice(&[0u8; 6]);                     // reserved
+    buf.extend_from_slice(&0x1234_5678_9ABC_DEF0u64.to_le_bytes()); // identifier
+    // GAS at +16: hdr (4) + addr (8).
+    buf.extend_from_slice(&[0u8; 4]);
+    buf.extend_from_slice(&0xCA_0000u64.to_le_bytes());
+
+    narf_acpi::__test_parse_mchi_body(&buf);
+    let info = narf_acpi::mchi_info().expect("MCHI not parsed");
+    if info.interface_type != 1
+        || info.protocols != 0x0F
+        || info.identifier != 0x1234_5678_9ABC_DEF0
+        || info.base != 0xCA_0000
+    {
+        return TestResult::Fail("MCHI decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_mchi_synthetic_decode);
+
+fn smoke_acpi_phat_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    use narf_acpi::PhatHealthRecord;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"PHAT");
+    buf.extend_from_slice(&[0u8; 32]);
+
+    // Type 1 (Health), length 22.
+    buf.extend_from_slice(&1u16.to_le_bytes());
+    buf.extend_from_slice(&22u16.to_le_bytes());
+    buf.push(0);                                          // reserved
+    buf.push(3);                                          // am_healthy = healthy
+    let guid: [u8; 16] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11,
+                           0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99];
+    buf.extend_from_slice(&guid);
+
+    let n = narf_acpi::__test_parse_phat_body(&buf);
+    if n != 1 {
+        return TestResult::Fail("expected 1 PHAT health record parsed");
+    }
+    let mut hs = [PhatHealthRecord::default(); 4];
+    let nh = narf_acpi::copy_phat_health(&mut hs);
+    if nh != 1 || hs[0].am_healthy != 3 || hs[0].device_guid != guid {
+        return TestResult::Fail("PHAT health decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_phat_synthetic_decode);
+
+fn smoke_acpi_stao_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"STAO");
+    buf.extend_from_slice(&[0u8; 32]);
+    buf.push(1);                                          // ignore UART
+
+    narf_acpi::__test_parse_stao_body(&buf);
+    let info = narf_acpi::stao_info().expect("StAO not parsed");
+    if !info.ignore_uart {
+        return TestResult::Fail("StAO ignore_uart not set");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_stao_synthetic_decode);
+
+fn smoke_acpi_uefi_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"UEFI");
+    buf.extend_from_slice(&[0u8; 32]);
+    let guid: [u8; 16] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
+                           0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10];
+    buf.extend_from_slice(&guid);
+    buf.extend_from_slice(&0x1Au16.to_le_bytes());
+
+    narf_acpi::__test_parse_uefi_body(&buf);
+    let info = narf_acpi::uefi_table_info().expect("UEFI not parsed");
+    if info.identifier != guid || info.data_offset != 0x1A {
+        return TestResult::Fail("UEFI decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_uefi_synthetic_decode);
+
 fn smoke_acpi_srat_synthetic_memory_entry() -> TestResult {
     // Type-1 memory affinity entry: base 0x1_0000_0000, length
     // 0x1000_0000, proximity 1, enabled.

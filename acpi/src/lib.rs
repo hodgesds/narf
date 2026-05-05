@@ -5796,3 +5796,392 @@ pub fn __test_parse_xenv_body(body: &[u8]) {
     parse_xenv_body(body);
     XENV_PARSED.store(true, Ordering::Release);
 }
+
+// ───────────────────────────────────────────────────────────────────
+// TCPA — TPM 1.2 event log location.
+// Spec: `acpi/specification/tables-tcpa-mchi-phat-stao-uefi.md` §1.
+// ───────────────────────────────────────────────────────────────────
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct TcpaInfo {
+    pub platform_class: u16,
+    pub log_area_min:   u32,
+    pub log_area_phys:  u64,
+}
+
+static TCPA_DATA: IrqSafeSpinLock<TcpaInfo> = IrqSafeSpinLock::new(TcpaInfo {
+    platform_class: 0, log_area_min: 0, log_area_phys: 0,
+});
+static TCPA_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_tcpa_body(body: &[u8]) {
+    if body.len() < SDT_HEADER_SIZE + 14 { return; }
+    let off = SDT_HEADER_SIZE;
+    let platform_class = u16::from_le_bytes([body[off], body[off + 1]]);
+    let log_area_min = u32::from_le_bytes([
+        body[off + 2], body[off + 3], body[off + 4], body[off + 5],
+    ]);
+    let log_area_phys = u64::from_le_bytes([
+        body[off + 6],  body[off + 7],
+        body[off + 8],  body[off + 9],
+        body[off + 10], body[off + 11],
+        body[off + 12], body[off + 13],
+    ]);
+    *TCPA_DATA.lock() = TcpaInfo {
+        platform_class, log_area_min, log_area_phys,
+    };
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → TCPA must also be identity-mapped.
+pub unsafe fn parse_tcpa(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut tcpa: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"TCPA" && tcpa.is_none() {
+                tcpa = Some(phys);
+            }
+        })?;
+    }
+    let tcpa = tcpa.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (tcpa as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 14 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(tcpa as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    parse_tcpa_body(body);
+    TCPA_PARSED.store(true, Ordering::Release);
+    Ok(())
+}
+
+pub fn tcpa_info() -> Option<TcpaInfo> {
+    if !TCPA_PARSED.load(Ordering::Acquire) { return None; }
+    Some(*TCPA_DATA.lock())
+}
+
+#[doc(hidden)]
+pub fn __test_parse_tcpa_body(body: &[u8]) {
+    parse_tcpa_body(body);
+    TCPA_PARSED.store(true, Ordering::Release);
+}
+
+// ───────────────────────────────────────────────────────────────────
+// MCHI — Management Controller Host Interface.
+// Spec: `acpi/specification/tables-tcpa-mchi-phat-stao-uefi.md` §2.
+// ───────────────────────────────────────────────────────────────────
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct MchiInfo {
+    pub interface_type: u8,
+    pub protocols:      u8,
+    pub identifier:     u64,
+    pub base:           u64,
+}
+
+static MCHI_DATA: IrqSafeSpinLock<MchiInfo> = IrqSafeSpinLock::new(MchiInfo {
+    interface_type: 0, protocols: 0, identifier: 0, base: 0,
+});
+static MCHI_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_mchi_body(body: &[u8]) {
+    // Body offsets: InterfaceType (1) + Protocols (1) + Reserved (6) +
+    //               Identifier (8) + BaseAddress GAS (12).
+    if body.len() < SDT_HEADER_SIZE + 28 { return; }
+    let off = SDT_HEADER_SIZE;
+    let interface_type = body[off];
+    let protocols = body[off + 1];
+    let identifier = u64::from_le_bytes([
+        body[off + 8],  body[off + 9],
+        body[off + 10], body[off + 11],
+        body[off + 12], body[off + 13],
+        body[off + 14], body[off + 15],
+    ]);
+    // GAS at off+16..off+28, address @ +20..28.
+    let base = u64::from_le_bytes([
+        body[off + 20], body[off + 21],
+        body[off + 22], body[off + 23],
+        body[off + 24], body[off + 25],
+        body[off + 26], body[off + 27],
+    ]);
+    *MCHI_DATA.lock() = MchiInfo {
+        interface_type, protocols, identifier, base,
+    };
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → MCHI must also be identity-mapped.
+pub unsafe fn parse_mchi(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut mchi: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"MCHI" && mchi.is_none() {
+                mchi = Some(phys);
+            }
+        })?;
+    }
+    let mchi = mchi.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (mchi as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 28 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(mchi as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    parse_mchi_body(body);
+    MCHI_PARSED.store(true, Ordering::Release);
+    Ok(())
+}
+
+pub fn mchi_info() -> Option<MchiInfo> {
+    if !MCHI_PARSED.load(Ordering::Acquire) { return None; }
+    Some(*MCHI_DATA.lock())
+}
+
+#[doc(hidden)]
+pub fn __test_parse_mchi_body(body: &[u8]) {
+    parse_mchi_body(body);
+    MCHI_PARSED.store(true, Ordering::Release);
+}
+
+// ───────────────────────────────────────────────────────────────────
+// PHAT — Platform Health Assessment Table.
+// Spec: `acpi/specification/tables-tcpa-mchi-phat-stao-uefi.md` §3.
+// ───────────────────────────────────────────────────────────────────
+
+pub const MAX_PHAT_HEALTH: usize = 16;
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct PhatHealthRecord {
+    pub am_healthy:  u8,
+    pub device_guid: [u8; 16],
+}
+
+struct PhatTables {
+    health:   [PhatHealthRecord; MAX_PHAT_HEALTH],
+    n_health: usize,
+}
+
+impl PhatTables {
+    const EMPTY: Self = Self {
+        health:   [PhatHealthRecord {
+                      am_healthy: 0, device_guid: [0u8; 16]
+                  }; MAX_PHAT_HEALTH],
+        n_health: 0,
+    };
+}
+
+static PHAT_DATA:   IrqSafeSpinLock<PhatTables> = IrqSafeSpinLock::new(PhatTables::EMPTY);
+static PHAT_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_phat_body(body: &[u8]) -> u32 {
+    let mut tables = PHAT_DATA.lock();
+    *tables = PhatTables::EMPTY;
+    let mut cur = SDT_HEADER_SIZE;
+    let mut count = 0u32;
+    while cur + 4 <= body.len() {
+        let kind = u16::from_le_bytes([body[cur], body[cur + 1]]);
+        let len = u16::from_le_bytes([body[cur + 2], body[cur + 3]]) as usize;
+        if len < 4 || cur + len > body.len() { break; }
+        let entry = &body[cur..cur + len];
+
+        // Type 1: Health Data — 5..6 = AmHealthy, 6..22 = DeviceGuid.
+        if kind == 1 && entry.len() >= 22 {
+            let am_healthy = entry[5];
+            let mut guid = [0u8; 16];
+            guid.copy_from_slice(&entry[6..22]);
+            if tables.n_health < MAX_PHAT_HEALTH {
+                let i = tables.n_health;
+                tables.health[i] = PhatHealthRecord {
+                    am_healthy, device_guid: guid,
+                };
+                tables.n_health = i + 1;
+                count += 1;
+            }
+        }
+        cur += len;
+    }
+    count
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → PHAT must also be identity-mapped.
+pub unsafe fn parse_phat(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut phat: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"PHAT" && phat.is_none() {
+                phat = Some(phys);
+            }
+        })?;
+    }
+    let phat = phat.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (phat as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(phat as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    let n = parse_phat_body(body);
+    PHAT_PARSED.store(true, Ordering::Release);
+    Ok(n)
+}
+
+pub fn is_phat_known() -> bool { PHAT_PARSED.load(Ordering::Acquire) }
+
+pub fn copy_phat_health(out: &mut [PhatHealthRecord]) -> usize {
+    let t = PHAT_DATA.lock();
+    let n = t.n_health.min(out.len());
+    out[..n].copy_from_slice(&t.health[..n]);
+    n
+}
+
+#[doc(hidden)]
+pub fn __test_parse_phat_body(body: &[u8]) -> u32 {
+    let n = parse_phat_body(body);
+    PHAT_PARSED.store(true, Ordering::Release);
+    n
+}
+
+// ───────────────────────────────────────────────────────────────────
+// StAO — Status Override Table.
+// Spec: `acpi/specification/tables-tcpa-mchi-phat-stao-uefi.md` §4.
+// ───────────────────────────────────────────────────────────────────
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct StaoInfo {
+    pub ignore_uart: bool,
+}
+
+static STAO_DATA: IrqSafeSpinLock<StaoInfo> =
+    IrqSafeSpinLock::new(StaoInfo { ignore_uart: false });
+static STAO_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_stao_body(body: &[u8]) {
+    if body.len() < SDT_HEADER_SIZE + 1 { return; }
+    *STAO_DATA.lock() = StaoInfo {
+        ignore_uart: body[SDT_HEADER_SIZE] != 0,
+    };
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → StAO must also be identity-mapped.
+pub unsafe fn parse_stao(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut stao: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"STAO" && stao.is_none() {
+                stao = Some(phys);
+            }
+        })?;
+    }
+    let stao = stao.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (stao as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 1 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(stao as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    parse_stao_body(body);
+    STAO_PARSED.store(true, Ordering::Release);
+    Ok(())
+}
+
+pub fn stao_info() -> Option<StaoInfo> {
+    if !STAO_PARSED.load(Ordering::Acquire) { return None; }
+    Some(*STAO_DATA.lock())
+}
+
+#[doc(hidden)]
+pub fn __test_parse_stao_body(body: &[u8]) {
+    parse_stao_body(body);
+    STAO_PARSED.store(true, Ordering::Release);
+}
+
+// ───────────────────────────────────────────────────────────────────
+// UEFI — UEFI ACPI Data Table.
+// Spec: `acpi/specification/tables-tcpa-mchi-phat-stao-uefi.md` §5.
+// ───────────────────────────────────────────────────────────────────
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct UefiTableInfo {
+    pub identifier:  [u8; 16],
+    pub data_offset: u16,
+}
+
+static UEFI_DATA: IrqSafeSpinLock<UefiTableInfo> = IrqSafeSpinLock::new(UefiTableInfo {
+    identifier: [0u8; 16], data_offset: 0,
+});
+static UEFI_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_uefi_body(body: &[u8]) {
+    if body.len() < SDT_HEADER_SIZE + 18 { return; }
+    let off = SDT_HEADER_SIZE;
+    let mut identifier = [0u8; 16];
+    identifier.copy_from_slice(&body[off..off + 16]);
+    let data_offset = u16::from_le_bytes([body[off + 16], body[off + 17]]);
+    *UEFI_DATA.lock() = UefiTableInfo { identifier, data_offset };
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → UEFI must also be identity-mapped.
+pub unsafe fn parse_uefi(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut uefi: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"UEFI" && uefi.is_none() {
+                uefi = Some(phys);
+            }
+        })?;
+    }
+    let uefi = uefi.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (uefi as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 18 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(uefi as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    parse_uefi_body(body);
+    UEFI_PARSED.store(true, Ordering::Release);
+    Ok(())
+}
+
+pub fn uefi_table_info() -> Option<UefiTableInfo> {
+    if !UEFI_PARSED.load(Ordering::Acquire) { return None; }
+    Some(*UEFI_DATA.lock())
+}
+
+#[doc(hidden)]
+pub fn __test_parse_uefi_body(body: &[u8]) {
+    parse_uefi_body(body);
+    UEFI_PARSED.store(true, Ordering::Release);
+}
