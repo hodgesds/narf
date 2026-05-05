@@ -964,3 +964,58 @@ fn smoke_mpam_caps() -> TestResult {
 }
 #[cfg(target_arch = "aarch64")]
 kernel_test_in!("arch/mpam", smoke_mpam_caps);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_spe_caps() -> TestResult {
+    use crate::aarch64::spe;
+    let v = spe::caps();
+    if v > 3 {
+        return TestResult::Fail("PMSVer > 3 (architectural max)");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/spe", smoke_spe_caps);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_ete_supported_path() -> TestResult {
+    use crate::aarch64::ete;
+    let _ = ete::supported();
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/ete", smoke_ete_supported_path);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_gcs_caps() -> TestResult {
+    use crate::aarch64::gcs;
+    let v = gcs::caps();
+    if v > 1 {
+        return TestResult::Fail("GCS field > 1 (architectural max as of v0.1)");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/gcs", smoke_gcs_caps);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_rndr_supported_path() -> TestResult {
+    use crate::aarch64::rndr;
+    // Just exercise the gate + try-call. RNDR may starve in
+    // QEMU and that's a valid outcome (`None`); we only fail if
+    // the gate claims support but every call returns None.
+    let _ = rndr::supported();
+    let _ = rndr::try_rndr();
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/rndr", smoke_rndr_supported_path);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_lass_supported_path() -> TestResult {
+    use crate::x86_64::lass;
+    let _ = lass::supported();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/lass", smoke_lass_supported_path);

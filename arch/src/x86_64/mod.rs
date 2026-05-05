@@ -19,6 +19,7 @@ pub mod invlpgb;
 pub mod io_port;
 pub mod keylocker;
 pub mod lam;
+pub mod lass;
 pub mod lbr;
 pub mod mce;
 pub mod microcode;

@@ -546,6 +546,37 @@ Live from boot through `cargo xtask run`:
   minor decode, `MPAMIDR_EL1` PARTID/PMG ranges, `write_mpam0` /
   `write_mpam1` packing PARTID_D + PARTID_I + PMG_D + PMG_I +
   MPAMEN. Spec: `arch/specification/cpu-telemetry-qos.md` §5.
+- aarch64 SPE (`narf_arch::aarch64::spe`): Statistical Profiling
+  Extension — PEBS analogue. `ID_AA64DFR0_EL1.PMSVer` decode +
+  PMSCR / PMSIRR / PMSIDR / PMBLIMITR / PMBPTR programming via
+  raw `S3_0_C9_C9_*` and `S3_0_C9_C10_*` encodings,
+  `program_buffer(base, limit)` + `enable` / `disable`. Spec:
+  `arch/specification/cpu-arch-extensions.md` §1.
+- aarch64 ETE (`narf_arch::aarch64::ete`): Embedded Trace
+  Extension — pairs with TRBE as the in-core trace generator.
+  `ID_AA64DFR0_EL1.TraceVer` gate + TRCPRGCTLR (`S2_1_C0_C1_0`)
+  enable bit + TRCSTATR readback. Spec:
+  `arch/specification/cpu-arch-extensions.md` §2.
+- aarch64 GCS (`narf_arch::aarch64::gcs`): Guarded Control Stack
+  — CET-SHSTK analogue. `ID_AA64PFR1_EL1.GCS` decode +
+  GCSCR_EL1 / GCSCRE0_EL1 / GCSPR_EL{0,1} access via raw
+  `S3_0_C2_C5_*` + `S3_3_C2_C5_1` encodings.
+  `enable_el1(rvcheck, exception_push)` / `enable_el0(rvcheck)`
+  + matching disablers. Spec:
+  `arch/specification/cpu-arch-extensions.md` §3.
+- aarch64 RNDR / RNDRRS (`narf_arch::aarch64::rndr`):
+  architecturally-mandated hardware RNG.
+  `ID_AA64ISAR0_EL1.RNDR` gate + `try_rndr()` and
+  `try_rndrrs()` returning `Option<u64>` — failures map to
+  `None` via the architectural `NZCV.C = 0` signal captured
+  with `cset`. Spec:
+  `arch/specification/cpu-arch-extensions.md` §4.
+- Intel LASS (`narf_arch::x86_64::lass`): Linear Address Space
+  Separation. CPUID(7, 1).EAX[6] gate + CR4.LASS (bit 27)
+  enable / disable. Defeats SMAP-bypass-style probes by faulting
+  any cross-half load/store before paging permissions are
+  consulted. Spec:
+  `arch/specification/cpu-arch-extensions.md` §5.
 - aarch64 SVE / SVE2 (`narf_arch::aarch64::sve`):
   `ID_AA64PFR0_EL1.SVE` + `ID_AA64ZFR0_EL1.SVEver` decode →
   `SveCaps { sve, sve2, sve21 }` (CPACR-safe; reads ID-group
@@ -576,8 +607,8 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **607/0/29** smokes;
-`--arch=aarch64` passes **307/0/10**. Skips are x86-specific PCIe
+`cargo xtask test --arch=x86_64` passes **608/0/29** smokes;
+`--arch=aarch64` passes **311/0/10**. Skips are x86-specific PCIe
 surfaces or live-device tests that skip cleanly when QEMU doesn't
 expose the device. See `STATUS.md` for the full tally and per-
 subsystem breakdown.
