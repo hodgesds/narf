@@ -2,8 +2,10 @@
 
 pub mod asm;
 pub mod bti;
+pub mod cache;
 pub mod cpu;
 pub mod cpuid;
+pub mod ident;
 pub mod mmio;
 pub mod mte;
 pub mod pac;

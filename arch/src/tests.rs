@@ -778,3 +778,129 @@ fn smoke_sve_caps() -> TestResult {
 }
 #[cfg(target_arch = "aarch64")]
 kernel_test_in!("arch/sve", smoke_sve_caps);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_x86_ident_decode() -> TestResult {
+    use crate::x86_64::ident;
+    let c = ident::read();
+    if c.signature == 0 {
+        return TestResult::Fail("CPUID(1).EAX returned 0");
+    }
+    if c.family < 6 {
+        return TestResult::Fail("family < 6 (QEMU should expose ≥ 6)");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/ident", smoke_x86_ident_decode);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_x86_brand_string_nonempty() -> TestResult {
+    use crate::x86_64::ident;
+    let c = ident::read();
+    let s = ident::brand_str(&c);
+    let has_nonspace = s.bytes().any(|b| b != b' ' && b != 0);
+    if !has_nonspace {
+        return TestResult::Fail("brand string is empty / all spaces");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/ident", smoke_x86_brand_string_nonempty);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_x86_cache_caps() -> TestResult {
+    use crate::x86_64::cache;
+    let c = cache::caps();
+    if c.line_bytes < 32 {
+        return TestResult::Fail("cache line_bytes < 32");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/cache", smoke_x86_cache_caps);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_x86_errata_table_sorted() -> TestResult {
+    use crate::x86_64::errata;
+    // The marker-noop sentinel sits at the tail; ignore it for
+    // ordering. Real entries must be sorted by (vendor-discriminant,
+    // family, model_lo).
+    fn vendor_key(v: &crate::x86_64::ident::Vendor) -> u32 {
+        use crate::x86_64::ident::Vendor::*;
+        match v {
+            Intel => 1, Amd => 2, Hygon => 3, Centaur => 4,
+            Via => 5, Zhaoxin => 6, Other(_) => 7,
+        }
+    }
+    let t = errata::table();
+    for w in t.windows(2) {
+        let a = (vendor_key(&w[0].vendor), w[0].family, w[0].model_lo);
+        let b = (vendor_key(&w[1].vendor), w[1].family, w[1].model_lo);
+        if a > b {
+            return TestResult::Fail("errata table not sorted");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/errata", smoke_x86_errata_table_sorted);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_lvt_pc_program_helper() -> TestResult {
+    use crate::x86_64::pmi;
+    // Use a kernel-mode buffer as a stand-in for the LAPIC MMIO
+    // page so the test exercises program / mask / unmask without
+    // needing a real LAPIC mapped at a known address.
+    let mut buf = [0u32; 0x100];
+    // base + 0x340 = address of buf[0]; reading buf[0] reads the
+    // emitted LVT-PC entry.
+    let base = buf.as_mut_ptr() as usize - 0x340;
+    // SAFETY: the buffer covers the offset we touch.
+    unsafe {
+        pmi::program_lvt_pc(base, 0xEE, false, true);
+    }
+    if buf[0] & 0xFF != 0xEE {
+        return TestResult::Fail("vector mismatch");
+    }
+    if buf[0] & (1 << 16) == 0 {
+        return TestResult::Fail("mask bit not set after program");
+    }
+    // SAFETY: same buffer.
+    unsafe { pmi::unmask_lvt_pc(base); }
+    if buf[0] & (1 << 16) != 0 {
+        return TestResult::Fail("mask bit still set after unmask");
+    }
+    // SAFETY: same buffer.
+    unsafe { pmi::mask_lvt_pc(base); }
+    if buf[0] & (1 << 16) == 0 {
+        return TestResult::Fail("mask bit cleared after re-mask");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/pmi", smoke_lvt_pc_program_helper);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_aarch_midr_decode() -> TestResult {
+    use crate::aarch64::ident;
+    let id = ident::ident();
+    if id.raw == 0 {
+        return TestResult::Fail("MIDR_EL1 reads as 0");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/ident", smoke_aarch_midr_decode);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_aarch_cache_caps() -> TestResult {
+    use crate::aarch64::cache;
+    let c = cache::caps();
+    if c.iline_bytes < 16 || c.dline_bytes < 16 {
+        return TestResult::Fail("cache line bytes < 16");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/cache", smoke_aarch_cache_caps);

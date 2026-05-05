@@ -478,6 +478,41 @@ Live from boot through `cargo xtask run`:
   version, xmm, ymm, zmm, converged_with_avx512 }` for the
   unified AVX-512 / AVX2 ISA enumeration leaf. Spec:
   `arch/specification/cpu-perf-niche.md` §5.
+- x86_64 CPU identification (`narf_arch::x86_64::ident`):
+  CPUID(0) vendor decode → `Vendor { Intel, Amd, Hygon, Centaur,
+  Via, Zhaoxin, Other }`. CPUID(1).EAX → family / model /
+  stepping with extended-family + extended-model fold per
+  SDM §3.2. CPUID(0x80000002..4) brand string + leading-space
+  trim. Spec: `arch/specification/cpu-info-errata.md` §1.
+- x86_64 cache geometry (`narf_arch::x86_64::cache`): CPUID(1).EBX
+  `CLFLUSH line size`, CPUID(7,0).EBX[23/24] for CLFLUSHOPT /
+  CLWB, CPUID(0x80000008).EBX[9] for WBNOINVD. Instruction
+  wrappers (`clflush`, `clflushopt`, `clwb`, `wbnoinvd`) +
+  `CacheCaps` snapshot. Spec:
+  `arch/specification/cpu-info-errata.md` §2.
+- x86_64 errata workarounds (`narf_arch::x86_64::errata`):
+  `&'static [Errata]` table sorted by (vendor, family,
+  model_lo). v0.1 carries Intel SKL-X TSX-RTM disable
+  (`MSR_IA32_TSX_CTRL`) and AMD Zen1 erratum 1474
+  (`MSR_DE_CFG[9]`). `apply_for_current_cpu()` fans out matching
+  entries; tail-of-table marker keeps appends mechanical. Spec:
+  `arch/specification/cpu-info-errata.md` §3.
+- x86_64 PMI binding (`narf_arch::x86_64::pmi`): LAPIC LVT-PC
+  programming at `LAPIC_BASE + 0x340` — `program_lvt_pc(vector,
+  nmi, masked)`, `mask_lvt_pc`, `unmask_lvt_pc`. Wire-once
+  primitive for the PMU / LBR / Intel-PT subsystems; the actual
+  handler stays in `pmu`. Spec:
+  `arch/specification/cpu-info-errata.md` §4.
+- aarch64 CPU identification (`narf_arch::aarch64::ident`):
+  MIDR_EL1 → `AarchIdent { implementer, variant, part, revision,
+  raw }` + REVIDR_EL1 + implementer-name lookup (Arm / Apple /
+  Ampere / Qualcomm / NVIDIA / Marvell / Samsung / Broadcom /
+  Cavium / Fujitsu / Faraday). Spec:
+  `arch/specification/cpu-info-errata.md` §5.1.
+- aarch64 cache geometry (`narf_arch::aarch64::cache`): CTR_EL0
+  decode → `AarchCacheCaps { iline_bytes, dline_bytes,
+  cwg_bytes }` per the architectural `4 << field` rule. Spec:
+  `arch/specification/cpu-info-errata.md` §5.2.
 - aarch64 SVE / SVE2 (`narf_arch::aarch64::sve`):
   `ID_AA64PFR0_EL1.SVE` + `ID_AA64ZFR0_EL1.SVEver` decode →
   `SveCaps { sve, sve2, sve21 }` (CPACR-safe; reads ID-group
@@ -508,8 +543,8 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **600/0/29** smokes;
-`--arch=aarch64` passes **302/0/10**. Skips are x86-specific PCIe
+`cargo xtask test --arch=x86_64` passes **605/0/29** smokes;
+`--arch=aarch64` passes **304/0/10**. Skips are x86-specific PCIe
 surfaces or live-device tests that skip cleanly when QEMU doesn't
 expose the device. See `STATUS.md` for the full tally and per-
 subsystem breakdown.

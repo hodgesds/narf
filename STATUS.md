@@ -18,8 +18,8 @@ asks for. Updated when observable kernel behaviour changes.
   delivers hardware LAPIC-timer IRQs, exits cleanly.
 - `cargo xtask run --arch=aarch64` boots, runs the full async demo
   using CNTPCT_EL0 as the clock, exits via ARM semihosting.
-- `cargo xtask test --arch=x86_64` passes **600/0/29** (pass / fail / skip).
-- `cargo xtask test --arch=aarch64` passes **302/0/10** (pass / fail / skip).
+- `cargo xtask test --arch=x86_64` passes **605/0/29** (pass / fail / skip).
+- `cargo xtask test --arch=aarch64` passes **304/0/10** (pass / fail / skip).
   Skips are x86_64-specific PCIe surfaces or live-device tests that
   skip cleanly when QEMU doesn't expose the device.
 - In-tree PCIe drivers running against real QEMU-emulated devices.
@@ -96,6 +96,12 @@ asks for. Updated when observable kernel behaviour changes.
 | WRMSRNS          | CPUID(7, 1).EAX[19] gate + raw `WRMSRNS` (`0F 01 C6`) wrapper + `write(msr, value)` convenience that picks WRMSRNS when available. Spec: `arch/specification/cpu-perf-niche.md` §4. |
 | AVX10            | CPUID(7, 1).EDX[19] gate + CPUID(0x24, 0) decode → `Avx10Caps { supported, version, xmm, ymm, zmm, converged_with_avx512 }`. Spec: `arch/specification/cpu-perf-niche.md` §5. |
 | aarch64 SVE / SVE2 | `ID_AA64PFR0_EL1.SVE` + `ID_AA64ZFR0_EL1.SVEver` decode → `SveCaps { sve, sve2, sve21 }` (CPACR-safe). `probe_max_vl_bits` / `set_vl_bits` / `read|write_zcr_el1` (require CPACR.ZEN open) using raw `S3_0_*` system-register encoding. Spec: `arch/specification/cpu-perf-niche.md` §6. |
+| x86_64 CPU ident | CPUID(0) vendor → `Vendor { Intel, Amd, Hygon, Centaur, Via, Zhaoxin, Other }`, CPUID(1).EAX → family / model / stepping (with extended-family/extended-model fold), CPUID(0x80000002..4) brand-string read + leading-space-trim helper. Spec: `arch/specification/cpu-info-errata.md` §1. |
+| x86_64 cache geom | `CacheCaps { clflush, clflushopt, clwb, wbnoinvd, line_bytes }` from CPUID(1).EBX[15:8] + (7,0).EBX[23/24] + (0x80000008).EBX[9]; instruction wrappers for CLFLUSH / CLFLUSHOPT / CLWB / WBNOINVD. Spec: `arch/specification/cpu-info-errata.md` §2. |
+| x86_64 errata | `&'static [Errata]` table dispatched on `(vendor, family, model_lo..=hi, stepping_mask)`; `apply_for_current_cpu()` fans out matching workarounds. v0.1 entries: Intel SKL-X TSX-RTM disable + AMD Zen1 erratum 1474. Spec: `arch/specification/cpu-info-errata.md` §3. |
+| x86_64 PMI binding | LVT-PC programming primitive at `LAPIC_BASE + 0x340` — `program_lvt_pc(vector, nmi, masked)` + `mask_lvt_pc` / `unmask_lvt_pc`. Wire-once API used by PMU / LBR / Intel-PT subsystems. Spec: `arch/specification/cpu-info-errata.md` §4. |
+| aarch64 CPU ident | MIDR_EL1 decode → `AarchIdent { implementer, variant, part, revision, raw }` + REVIDR_EL1 + implementer-name table (Arm / Apple / Ampere / Qualcomm / NVIDIA / …). Spec: `arch/specification/cpu-info-errata.md` §5.1. |
+| aarch64 cache geom | CTR_EL0 decode → `AarchCacheCaps { iline_bytes, dline_bytes, cwg_bytes }` (line-size-in-bytes = `4 << field`). Spec: `arch/specification/cpu-info-errata.md` §5.2. |
 | iwlwifi          | Intel Wi-Fi 6 / 6E (AX200 / AX201 / AX210 / AX211). **Structural probe only** — PCI match table + spec doc. Operational register map (CSR/PRPH offsets, firmware loader, TFD/RBD descriptors, host-command opcodes) is not in any public Intel doc; further stages blocked on public register docs. See `drivers/net/specification/iwlwifi.md`. |
 | AHCI (ICH9/10)   | HBA bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT. |
 | xHCI USB host    | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT. |
