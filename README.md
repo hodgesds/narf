@@ -513,6 +513,39 @@ Live from boot through `cargo xtask run`:
   decode → `AarchCacheCaps { iline_bytes, dline_bytes,
   cwg_bytes }` per the architectural `4 << field` rule. Spec:
   `arch/specification/cpu-info-errata.md` §5.2.
+- Intel RDT (`narf_arch::x86_64::rdt`): Cache + memory-bandwidth
+  QoS per SDM Vol 3 §17. CPUID(7, 0).EBX[12/15] master gates,
+  CPUID(0x0F) / CPUID(0x10) sub-feature decode → `RdtCaps`
+  (monitoring, allocation, L3-CMT, L3-CAT, L2-CAT, MBA, RMID +
+  CLOSID ranges). `assoc(rmid, closid)` via IA32_PQR_ASSOC,
+  `read_event(rmid, evt_id)` via QM_EVTSEL / QM_CTR,
+  `write_l3_mask` / `write_l2_mask` / `write_mba_throttle`
+  per CLOSID. Spec: `arch/specification/cpu-telemetry-qos.md` §1.
+- Intel FRED (`narf_arch::x86_64::fred`): Flexible Return and
+  Event Delivery. CPUID(7, 1).EAX[17] gate, IA32_FRED_RSP{0..3} /
+  SSP{1..3} / STKLVLS / CONFIG MSR programming, CR4.FRED (bit 32)
+  enable + disable, `write_handler_base(va)` for the page-aligned
+  event-handler base. Spec:
+  `arch/specification/cpu-telemetry-qos.md` §2.
+- aarch64 BRBE (`narf_arch::aarch64::brbe`): Branch Record Buffer
+  Extension — LBR analogue. `ID_AA64DFR0_EL1.BRBE` decode +
+  `BRBCR_EL1` / `BRBFCR_EL1` read/write via raw
+  `S2_1_C9_C0_0/1` encodings + `enable` (E0BRE+E1BRE) / `disable`
+  / `freeze` (BRBCR.PAUSED). Spec:
+  `arch/specification/cpu-telemetry-qos.md` §3.
+- aarch64 TRBE (`narf_arch::aarch64::trbe`): Trace Buffer
+  Extension — Intel-PT analogue.
+  `ID_AA64DFR0_EL1.TraceBuffer` gate + `TRBLIMITR_EL1` /
+  `TRBPTR_EL1` / `TRBBASER_EL1` / `TRBIDR_EL1` programming via
+  raw `S3_0_C9_C11_*` encodings + `write_base(base, limit)` +
+  enable / disable. Spec:
+  `arch/specification/cpu-telemetry-qos.md` §4.
+- aarch64 MPAM (`narf_arch::aarch64::mpam`): Memory Partitioning
+  and Monitoring — RDT analogue.
+  `ID_AA64PFR0_EL1.MPAM` major + `ID_AA64PFR1_EL1.MPAM_frac`
+  minor decode, `MPAMIDR_EL1` PARTID/PMG ranges, `write_mpam0` /
+  `write_mpam1` packing PARTID_D + PARTID_I + PMG_D + PMG_I +
+  MPAMEN. Spec: `arch/specification/cpu-telemetry-qos.md` §5.
 - aarch64 SVE / SVE2 (`narf_arch::aarch64::sve`):
   `ID_AA64PFR0_EL1.SVE` + `ID_AA64ZFR0_EL1.SVEver` decode →
   `SveCaps { sve, sve2, sve21 }` (CPACR-safe; reads ID-group
@@ -543,8 +576,8 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **605/0/29** smokes;
-`--arch=aarch64` passes **304/0/10**. Skips are x86-specific PCIe
+`cargo xtask test --arch=x86_64` passes **607/0/29** smokes;
+`--arch=aarch64` passes **307/0/10**. Skips are x86-specific PCIe
 surfaces or live-device tests that skip cleanly when QEMU doesn't
 expose the device. See `STATUS.md` for the full tally and per-
 subsystem breakdown.

@@ -904,3 +904,63 @@ fn smoke_aarch_cache_caps() -> TestResult {
 }
 #[cfg(target_arch = "aarch64")]
 kernel_test_in!("arch/cache", smoke_aarch_cache_caps);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_rdt_caps() -> TestResult {
+    use crate::x86_64::rdt;
+    let c = rdt::caps();
+    // Sub-features must be subordinate to the master gates.
+    if c.l3_monitoring && !c.monitoring {
+        return TestResult::Fail("L3 monitoring without RDT-M");
+    }
+    if (c.l3_cat || c.l2_cat || c.mba) && !c.allocation {
+        return TestResult::Fail("CAT/MBA without RDT-A");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/rdt", smoke_rdt_caps);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_fred_supported_path() -> TestResult {
+    use crate::x86_64::fred;
+    let _ = fred::supported();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/fred", smoke_fred_supported_path);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_brbe_caps() -> TestResult {
+    use crate::aarch64::brbe;
+    let v = brbe::caps();
+    if v > 3 {
+        return TestResult::Fail("BRBE field > 3 (architectural max)");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/brbe", smoke_brbe_caps);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_trbe_supported_path() -> TestResult {
+    use crate::aarch64::trbe;
+    let _ = trbe::supported();
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/trbe", smoke_trbe_supported_path);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_mpam_caps() -> TestResult {
+    use crate::aarch64::mpam;
+    let c = mpam::caps();
+    // If MPAM is not present, all fields must be zero — which
+    // confirms the gate.
+    if !c.supported && (c.revision != 0 || c.max_partid != 0 || c.max_pmg != 0) {
+        return TestResult::Fail("MPAM caps non-zero with supported = false");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/mpam", smoke_mpam_caps);

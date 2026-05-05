@@ -18,8 +18,8 @@ asks for. Updated when observable kernel behaviour changes.
   delivers hardware LAPIC-timer IRQs, exits cleanly.
 - `cargo xtask run --arch=aarch64` boots, runs the full async demo
   using CNTPCT_EL0 as the clock, exits via ARM semihosting.
-- `cargo xtask test --arch=x86_64` passes **605/0/29** (pass / fail / skip).
-- `cargo xtask test --arch=aarch64` passes **304/0/10** (pass / fail / skip).
+- `cargo xtask test --arch=x86_64` passes **607/0/29** (pass / fail / skip).
+- `cargo xtask test --arch=aarch64` passes **307/0/10** (pass / fail / skip).
   Skips are x86_64-specific PCIe surfaces or live-device tests that
   skip cleanly when QEMU doesn't expose the device.
 - In-tree PCIe drivers running against real QEMU-emulated devices.
@@ -102,6 +102,11 @@ asks for. Updated when observable kernel behaviour changes.
 | x86_64 PMI binding | LVT-PC programming primitive at `LAPIC_BASE + 0x340` — `program_lvt_pc(vector, nmi, masked)` + `mask_lvt_pc` / `unmask_lvt_pc`. Wire-once API used by PMU / LBR / Intel-PT subsystems. Spec: `arch/specification/cpu-info-errata.md` §4. |
 | aarch64 CPU ident | MIDR_EL1 decode → `AarchIdent { implementer, variant, part, revision, raw }` + REVIDR_EL1 + implementer-name table (Arm / Apple / Ampere / Qualcomm / NVIDIA / …). Spec: `arch/specification/cpu-info-errata.md` §5.1. |
 | aarch64 cache geom | CTR_EL0 decode → `AarchCacheCaps { iline_bytes, dline_bytes, cwg_bytes }` (line-size-in-bytes = `4 << field`). Spec: `arch/specification/cpu-info-errata.md` §5.2. |
+| Intel RDT        | CPUID(7, 0).EBX[12/15] gates + CPUID(0x0F)/0x10) sub-feature decode → `RdtCaps { monitoring, allocation, l3_monitoring, l3_cat, l2_cat, mba, max_rmid, max_closid }`. `assoc(rmid, closid)` via IA32_PQR_ASSOC, `read_event` via QM_EVTSEL/CTR, `write_l3_mask` / `write_l2_mask` / `write_mba_throttle`. Spec: `arch/specification/cpu-telemetry-qos.md` §1. |
+| Intel FRED       | CPUID(7, 1).EAX[17] gate + IA32_FRED_RSP{0..3} / SSP{1..3} / STKLVLS / CONFIG MSR programming + CR4.FRED (bit 32) enable/disable + `write_handler_base(va)`. Spec: `arch/specification/cpu-telemetry-qos.md` §2. |
+| aarch64 BRBE     | `ID_AA64DFR0_EL1.BRBE` (bits[55:52]) decode + `BRBCR_EL1` / `BRBFCR_EL1` read/write via raw `S2_1_C9_C0_0/1` encodings + `enable` (E0BRE+E1BRE) / `disable` / `freeze` (PAUSED). Spec: `arch/specification/cpu-telemetry-qos.md` §3. |
+| aarch64 TRBE     | `ID_AA64DFR0_EL1.TraceBuffer` (bits[47:44]) gate + `TRBLIMITR_EL1` / `TRBPTR_EL1` / `TRBBASER_EL1` / `TRBIDR_EL1` access via raw `S3_0_C9_C11_*` + `write_base(base, limit)` + `enable`/`disable`. Spec: `arch/specification/cpu-telemetry-qos.md` §4. |
+| aarch64 MPAM     | `ID_AA64PFR0_EL1.MPAM` + `ID_AA64PFR1_EL1.MPAM_frac` + `MPAMIDR_EL1` decode → `MpamCaps { supported, revision, frac, max_partid, max_pmg }` + `write_mpam0` / `write_mpam1` (PARTID_D / PARTID_I / PMG_D / PMG_I + MPAMEN). Spec: `arch/specification/cpu-telemetry-qos.md` §5. |
 | iwlwifi          | Intel Wi-Fi 6 / 6E (AX200 / AX201 / AX210 / AX211). **Structural probe only** — PCI match table + spec doc. Operational register map (CSR/PRPH offsets, firmware loader, TFD/RBD descriptors, host-command opcodes) is not in any public Intel doc; further stages blocked on public register docs. See `drivers/net/specification/iwlwifi.md`. |
 | AHCI (ICH9/10)   | HBA bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT. |
 | xHCI USB host    | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT. |

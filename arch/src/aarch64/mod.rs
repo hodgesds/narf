@@ -1,12 +1,14 @@
 //! aarch64 arch backend.
 
 pub mod asm;
+pub mod brbe;
 pub mod bti;
 pub mod cache;
 pub mod cpu;
 pub mod cpuid;
 pub mod ident;
 pub mod mmio;
+pub mod mpam;
 pub mod mte;
 pub mod pac;
 pub mod psci;
@@ -14,6 +16,7 @@ pub mod ssbs;
 pub mod sve;
 pub mod sysreg;
 pub mod timer;
+pub mod trbe;
 
 pub use asm::{halt_forever, disable_interrupts, enable_interrupts, cas128, patch_word};
 pub use cpuid::Features;
