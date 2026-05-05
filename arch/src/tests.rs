@@ -707,3 +707,74 @@ fn smoke_ssbs_caps() -> TestResult {
 }
 #[cfg(target_arch = "aarch64")]
 kernel_test_in!("arch/ssbs", smoke_ssbs_caps);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_invlpgb_caps() -> TestResult {
+    use crate::x86_64::invlpgb;
+    let s = invlpgb::supported();
+    let count = invlpgb::count_max();
+    let asid  = invlpgb::asid_max();
+    if !s && (count != 0 || asid != 0) {
+        return TestResult::Fail("INVLPGB caps non-zero with supported = false");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/invlpgb", smoke_invlpgb_caps);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_rdpru_supported_path() -> TestResult {
+    use crate::x86_64::rdpru;
+    let _ = rdpru::supported();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/rdpru", smoke_rdpru_supported_path);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_movdir_caps_decode() -> TestResult {
+    use crate::x86_64::movdir;
+    let _ = movdir::cldemote_supported();
+    let _ = movdir::movdiri_supported();
+    let _ = movdir::movdir64b_supported();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/movdir", smoke_movdir_caps_decode);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_wrmsrns_supported_path() -> TestResult {
+    use crate::x86_64::wrmsrns;
+    let _ = wrmsrns::supported();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/wrmsrns", smoke_wrmsrns_supported_path);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_avx10_caps_decode() -> TestResult {
+    use crate::x86_64::avx10;
+    let c = avx10::caps();
+    if c.supported && !c.xmm {
+        return TestResult::Fail("AVX10 supported but XMM bit clear");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/avx10", smoke_avx10_caps_decode);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_sve_caps() -> TestResult {
+    use crate::aarch64::sve;
+    // ID-group registers only — safe regardless of CPACR.ZEN.
+    let c = sve::caps();
+    if c.sve21 && !c.sve2 {
+        return TestResult::Fail("SVE2.1 set without SVE2");
+    }
+    if c.sve2 && !c.sve {
+        return TestResult::Fail("SVE2 set without SVE");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/sve", smoke_sve_caps);

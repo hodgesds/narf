@@ -18,8 +18,8 @@ asks for. Updated when observable kernel behaviour changes.
   delivers hardware LAPIC-timer IRQs, exits cleanly.
 - `cargo xtask run --arch=aarch64` boots, runs the full async demo
   using CNTPCT_EL0 as the clock, exits via ARM semihosting.
-- `cargo xtask test --arch=x86_64` passes **595/0/29** (pass / fail / skip).
-- `cargo xtask test --arch=aarch64` passes **301/0/10** (pass / fail / skip).
+- `cargo xtask test --arch=x86_64` passes **600/0/29** (pass / fail / skip).
+- `cargo xtask test --arch=aarch64` passes **302/0/10** (pass / fail / skip).
   Skips are x86_64-specific PCIe surfaces or live-device tests that
   skip cleanly when QEMU doesn't expose the device.
 - In-tree PCIe drivers running against real QEMU-emulated devices.
@@ -90,6 +90,12 @@ asks for. Updated when observable kernel behaviour changes.
 | Intel LAM        | CPUID(7, 1).EAX[26] gate + CR3.LAM_U48 / LAM_U57 + CR4.LAM_SUP enable. Spec: `arch/specification/cpu-security.md` §4. |
 | Intel UINTR      | CPUID(7, 0).EDX[5] gate + `IA32_UINTR_HANDLER` / `PD` / `STACKADJUST` / `MISC` / `RR` / `TT` MSR programming + `senduipi` / `clui` / `stui` / `testui` instruction wrappers. Spec: `arch/specification/cpu-security.md` §5. |
 | Intel KeyLocker  | CPUID(7, 0).ECX[23] gate + CPUID(0x19, 0).EAX bitmap decode. Spec: `arch/specification/cpu-security.md` §6. |
+| AMD INVLPGB      | CPUID(0x80000008).EBX[3] gate + `count_max` / `asid_max` decode + raw `INVLPGB` (`0F 01 FE`) / `TLBSYNC` (`0F 01 FF`) wrappers + `invalidate_all_global` / `invalidate_asid(asid)` helpers. Spec: `arch/specification/cpu-perf-niche.md` §1. |
+| AMD RDPRU        | CPUID(0x80000008).EBX[4] gate + raw `RDPRU` (`0F 01 FD`) wrapper + `read_mperf` / `read_aperf` (RDPRU when supported, RDMSR fallback). Spec: `arch/specification/cpu-perf-niche.md` §2. |
+| CLDEMOTE / MOVDIR | CPUID(7, 0).ECX[25/27/28] gates + `cldemote` / `movdiri32` / `movdiri64` / `movdir64b` instruction wrappers for cache-demote hints + write-combining direct stores. Spec: `arch/specification/cpu-perf-niche.md` §3. |
+| WRMSRNS          | CPUID(7, 1).EAX[19] gate + raw `WRMSRNS` (`0F 01 C6`) wrapper + `write(msr, value)` convenience that picks WRMSRNS when available. Spec: `arch/specification/cpu-perf-niche.md` §4. |
+| AVX10            | CPUID(7, 1).EDX[19] gate + CPUID(0x24, 0) decode → `Avx10Caps { supported, version, xmm, ymm, zmm, converged_with_avx512 }`. Spec: `arch/specification/cpu-perf-niche.md` §5. |
+| aarch64 SVE / SVE2 | `ID_AA64PFR0_EL1.SVE` + `ID_AA64ZFR0_EL1.SVEver` decode → `SveCaps { sve, sve2, sve21 }` (CPACR-safe). `probe_max_vl_bits` / `set_vl_bits` / `read|write_zcr_el1` (require CPACR.ZEN open) using raw `S3_0_*` system-register encoding. Spec: `arch/specification/cpu-perf-niche.md` §6. |
 | iwlwifi          | Intel Wi-Fi 6 / 6E (AX200 / AX201 / AX210 / AX211). **Structural probe only** — PCI match table + spec doc. Operational register map (CSR/PRPH offsets, firmware loader, TFD/RBD descriptors, host-command opcodes) is not in any public Intel doc; further stages blocked on public register docs. See `drivers/net/specification/iwlwifi.md`. |
 | AHCI (ICH9/10)   | HBA bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT. |
 | xHCI USB host    | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT. |

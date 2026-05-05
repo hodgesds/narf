@@ -451,6 +451,40 @@ Live from boot through `cargo xtask run`:
   UMC, PCIe). Augments the legacy MCA decode in `mce` for
   Zen+ silicon. Spec:
   `arch/specification/modern-cpu.md` §4.
+- AMD INVLPGB (`narf_arch::x86_64::invlpgb`):
+  CPUID(0x80000008).EBX[3] gate. Raw `INVLPGB` (`0F 01 FE`) +
+  `TLBSYNC` (`0F 01 FF`) wrappers, `count_max` / `asid_max`
+  decode, plus `invalidate_all_global` / `invalidate_asid`
+  conveniences for the broadcast-TLB path on Zen3+. Spec:
+  `arch/specification/cpu-perf-niche.md` §1.
+- AMD RDPRU (`narf_arch::x86_64::rdpru`):
+  CPUID(0x80000008).EBX[4] gate. Raw `RDPRU` (`0F 01 FD`)
+  wrapper plus `read_mperf` / `read_aperf` that dispatch to
+  RDPRU when supported and fall through to RDMSR otherwise.
+  Spec: `arch/specification/cpu-perf-niche.md` §2.
+- CLDEMOTE / MOVDIRI / MOVDIR64B (`narf_arch::x86_64::movdir`):
+  CPUID(7, 0).ECX[25/27/28] gates + instruction wrappers for
+  cache-demote hints (NOP-safe on older silicon) and write-
+  combining direct stores (`movdiri32`, `movdiri64`, atomic
+  64-byte `movdir64b`). Spec:
+  `arch/specification/cpu-perf-niche.md` §3.
+- WRMSRNS (`narf_arch::x86_64::wrmsrns`): non-serialising MSR
+  write per Sapphire Rapids+. CPUID(7, 1).EAX[19] gate, raw
+  `0F 01 C6` wrapper, and a `write(msr, value)` helper that
+  picks WRMSRNS when supported and falls through to WRMSR
+  otherwise. Spec: `arch/specification/cpu-perf-niche.md` §4.
+- AVX10 (`narf_arch::x86_64::avx10`): CPUID(7, 1).EDX[19]
+  gate + CPUID(0x24, 0) decode → `Avx10Caps { supported,
+  version, xmm, ymm, zmm, converged_with_avx512 }` for the
+  unified AVX-512 / AVX2 ISA enumeration leaf. Spec:
+  `arch/specification/cpu-perf-niche.md` §5.
+- aarch64 SVE / SVE2 (`narf_arch::aarch64::sve`):
+  `ID_AA64PFR0_EL1.SVE` + `ID_AA64ZFR0_EL1.SVEver` decode →
+  `SveCaps { sve, sve2, sve21 }` (CPACR-safe; reads ID-group
+  registers only). `probe_max_vl_bits` / `set_vl_bits` /
+  `read|write_zcr_el1` use raw `S3_0_*` system-register
+  encodings and require `CPACR_EL1.ZEN` open. Spec:
+  `arch/specification/cpu-perf-niche.md` §6.
 - Intel HD Audio (HDA): clean-room driver for the AMD Ryzen /
   Phoenix and Radeon HD Audio Controllers — BAR0 mapping, GCTL
   reset, CORB/RIRB ring DMA, STATESTS codec walk, Get Parameter
@@ -474,8 +508,8 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **595/0/29** smokes;
-`--arch=aarch64` passes **301/0/10**. Skips are x86-specific PCIe
+`cargo xtask test --arch=x86_64` passes **600/0/29** smokes;
+`--arch=aarch64` passes **302/0/10**. Skips are x86-specific PCIe
 surfaces or live-device tests that skip cleanly when QEMU doesn't
 expose the device. See `STATUS.md` for the full tally and per-
 subsystem breakdown.

@@ -2,6 +2,7 @@
 
 pub mod acpi;
 pub mod asm;
+pub mod avx10;
 pub mod cet;
 pub mod confidential;
 pub mod cpu;
@@ -10,12 +11,14 @@ pub mod cpuid;
 pub mod cr;
 pub mod hfi;
 pub mod hypervisor;
+pub mod invlpgb;
 pub mod io_port;
 pub mod keylocker;
 pub mod lam;
 pub mod lbr;
 pub mod mce;
 pub mod microcode;
+pub mod movdir;
 pub mod msr;
 pub mod mtrr;
 pub mod pcid;
@@ -25,6 +28,7 @@ pub mod pks;
 pub mod pmu;
 pub mod probe;
 pub mod pt;
+pub mod rdpru;
 pub mod rtc;
 pub mod sgx;
 pub mod smca;
@@ -37,6 +41,7 @@ pub mod uintr;
 pub mod user_mode;
 pub mod vmx;
 pub mod waitpkg;
+pub mod wrmsrns;
 pub mod xsave;
 
 pub use asm::{halt_forever, disable_interrupts, enable_interrupts, cas128, patch_word};

@@ -9,6 +9,7 @@ pub mod mte;
 pub mod pac;
 pub mod psci;
 pub mod ssbs;
+pub mod sve;
 pub mod sysreg;
 pub mod timer;
 
