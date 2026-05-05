@@ -408,9 +408,12 @@ pub enum CapKind {
     // Audio
     AudioStream          = 0x00C0,
 
+    // Peripherals
+    I3cBus               = 0x00D0,
+
     // Firmware
-    Firmware             = 0x00D0,
-    FirmwareRegistry     = 0x00D1,
+    Firmware             = 0x00E0,
+    FirmwareRegistry     = 0x00E1,
 }
 
 pub trait CapType: 'static {
@@ -482,6 +485,7 @@ const KIND_NAMES: &[(&str, CapKind)] = &[
     ("Driver",              CapKind::Driver),
     ("FbScanout",           CapKind::FbScanout),
     ("AudioStream",         CapKind::AudioStream),
+    ("I3cBus",              CapKind::I3cBus),
     ("Firmware",            CapKind::Firmware),
     ("FirmwareRegistry",    CapKind::FirmwareRegistry),
 ];
