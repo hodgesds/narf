@@ -711,6 +711,18 @@ Live from boot through `cargo xtask run`:
   `ID_AA64MMFR3_EL1.SCTLRX` decode + SCTLR2_EL1
   (`S3_0_C1_C0_3`) read + write helpers. Spec:
   `arch/specification/cpu-atomics-mitigations.md` §6.
+- ACPI PPTT / IORT / DMAR / IVRS / SPCR (`narf_acpi`):
+  enumeration parsers for the IOMMU + topology + console
+  tables. PPTT yields `PpttCpu` (acpi_uid, package, thread,
+  leaf) + `PpttCache` (line, ways, sets, size, kind). IORT
+  yields `IortSmmuv3` + `IortIts`. DMAR yields `DmarDrhd`
+  (register base, segment, include-all-PCI) + an
+  INTR_REMAP-supported predicate. IVRS yields `IvrsIommu`
+  (base, segment, capability offset). SPCR yields `SpcrInfo`
+  (interface, GAS base, GSI, baud code, PCI device id). Each
+  table follows the existing idempotent / sticky-flag pattern
+  on top of `walk_xsdt`. Spec:
+  `acpi/specification/tables-iommu-topology.md`.
 - aarch64 SVE / SVE2 (`narf_arch::aarch64::sve`):
   `ID_AA64PFR0_EL1.SVE` + `ID_AA64ZFR0_EL1.SVEver` decode →
   `SveCaps { sve, sve2, sve21 }` (CPACR-safe; reads ID-group
@@ -741,8 +753,8 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **620/0/29** smokes;
-`--arch=aarch64` passes **325/0/10**. Skips are x86-specific PCIe
+`cargo xtask test --arch=x86_64` passes **625/0/29** smokes;
+`--arch=aarch64` passes **329/0/11**. Skips are x86-specific PCIe
 surfaces or live-device tests that skip cleanly when QEMU doesn't
 expose the device. See `STATUS.md` for the full tally and per-
 subsystem breakdown.

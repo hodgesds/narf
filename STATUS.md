@@ -18,8 +18,8 @@ asks for. Updated when observable kernel behaviour changes.
   delivers hardware LAPIC-timer IRQs, exits cleanly.
 - `cargo xtask run --arch=aarch64` boots, runs the full async demo
   using CNTPCT_EL0 as the clock, exits via ARM semihosting.
-- `cargo xtask test --arch=x86_64` passes **620/0/29** (pass / fail / skip).
-- `cargo xtask test --arch=aarch64` passes **325/0/10** (pass / fail / skip).
+- `cargo xtask test --arch=x86_64` passes **625/0/29** (pass / fail / skip).
+- `cargo xtask test --arch=aarch64` passes **329/0/11** (pass / fail / skip).
   Skips are x86_64-specific PCIe surfaces or live-device tests that
   skip cleanly when QEMU doesn't expose the device.
 - In-tree PCIe drivers running against real QEMU-emulated devices.
@@ -138,6 +138,11 @@ asks for. Updated when observable kernel behaviour changes.
 | aarch64 RCPC*    | `ID_AA64ISAR1_EL1.LRCPC` (bits[23:20]) decode + `rcpc_supported()` / `rcpc2_supported()` / `rcpc3_supported()`. Spec: `arch/specification/cpu-atomics-mitigations.md` §4. |
 | aarch64 PIE      | `ID_AA64MMFR3_EL1.S1PIE` + `S2PIE` decode → `PieCaps { s1pie, s2pie }` + PIR_EL1 (`S3_0_C10_C2_3`) / PIRE0_EL1 (`S3_0_C10_C2_2`) read+write helpers. Spec: `arch/specification/cpu-atomics-mitigations.md` §5. |
 | aarch64 SCTLR2   | `ID_AA64MMFR3_EL1.SCTLRX` decode + SCTLR2_EL1 (`S3_0_C1_C0_3`) read+write helpers. Spec: `arch/specification/cpu-atomics-mitigations.md` §6. |
+| ACPI PPTT        | Processor Properties Topology — Type 0 (Processor) → `PpttCpu { acpi_uid, package, thread, leaf }` + Type 1 (Cache) → `PpttCache { line_bytes, ways, sets, size_bytes, kind }`. `parse_pptt(rsdp)` + `copy_pptt_cpus` / `copy_pptt_caches`. Spec: `acpi/specification/tables-iommu-topology.md` §1. |
+| ACPI IORT        | IO Remap Table — Type 0 (ITS group) → `IortIts { its_id }` + Type 4 (SMMUv3) → `IortSmmuv3 { base, flags }`. `parse_iort(rsdp)` + `copy_iort_smmuv3` / `copy_iort_its`. Spec: `acpi/specification/tables-iommu-topology.md` §2. |
+| ACPI DMAR        | DMA Remap Reporting — DRHD enumeration → `DmarDrhd { register_base, segment, include_all_pci }` + `dmar_intr_remap_supported()`. Spec: `acpi/specification/tables-iommu-topology.md` §3. |
+| ACPI IVRS        | I/O Virtualization Reporting (AMD) — IVHD entries (types 0x10/0x11/0x40) → `IvrsIommu { base, pci_segment, capability_off }`. Spec: `acpi/specification/tables-iommu-topology.md` §4. |
+| ACPI SPCR        | Serial Port Console Redirection — interface type + GAS base + GSI + baud-code → `SpcrInfo`. Spec: `acpi/specification/tables-iommu-topology.md` §5. |
 | iwlwifi          | Intel Wi-Fi 6 / 6E (AX200 / AX201 / AX210 / AX211). **Structural probe only** — PCI match table + spec doc. Operational register map (CSR/PRPH offsets, firmware loader, TFD/RBD descriptors, host-command opcodes) is not in any public Intel doc; further stages blocked on public register docs. See `drivers/net/specification/iwlwifi.md`. |
 | AHCI (ICH9/10)   | HBA bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT. |
 | xHCI USB host    | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT. |

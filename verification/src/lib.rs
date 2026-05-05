@@ -2756,6 +2756,217 @@ fn smoke_acpi_pmtt_synthetic_dimm_entry() -> TestResult {
 }
 kernel_test!(smoke_acpi_pmtt_synthetic_dimm_entry);
 
+fn smoke_acpi_pptt_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    use narf_acpi::{PpttCpu, PpttCache, PpttCacheKind};
+    let mut buf: Vec<u8> = Vec::with_capacity(36 + 24 + 24);
+    // SDT header (signature + length placeholder + dummies = 36 B).
+    buf.extend_from_slice(b"PPTT");
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&[0u8; 28]);
+
+    // Type 0 (Processor): leaf + ACPI UID = 0x42, length = 20.
+    buf.push(0); buf.push(20); buf.extend_from_slice(&[0u8; 2]); // type / len / rsvd
+    buf.extend_from_slice(&0b1001u32.to_le_bytes());             // package + leaf
+    buf.extend_from_slice(&0u32.to_le_bytes());                  // parent
+    buf.extend_from_slice(&0x42u32.to_le_bytes());               // ACPI UID
+    buf.extend_from_slice(&0u32.to_le_bytes());                  // n_priv
+
+    // Type 1 (Cache): line=64, ways=8, sets=64, size=32K, kind=Data.
+    buf.push(1); buf.push(24); buf.extend_from_slice(&[0u8; 2]);
+    buf.extend_from_slice(&0u32.to_le_bytes());                  // flags
+    buf.extend_from_slice(&0u32.to_le_bytes());                  // next-level
+    buf.extend_from_slice(&32_768u32.to_le_bytes());             // size
+    buf.extend_from_slice(&64u32.to_le_bytes());                 // sets
+    buf.push(8);                                                 // assoc
+    buf.push((0b00) << 2);                                       // attrs: kind = Data
+    buf.extend_from_slice(&64u16.to_le_bytes());                 // line
+
+    let n = narf_acpi::__test_parse_pptt_body(&buf);
+    if n != 2 {
+        return TestResult::Fail("expected 2 nodes parsed");
+    }
+    let mut cpus = [PpttCpu::default(); 4];
+    let nc = narf_acpi::copy_pptt_cpus(&mut cpus);
+    if nc != 1 || cpus[0].acpi_uid != 0x42 || !cpus[0].leaf {
+        return TestResult::Fail("CPU node decode mismatch");
+    }
+    let mut caches = [PpttCache::default(); 4];
+    let nch = narf_acpi::copy_pptt_caches(&mut caches);
+    if nch != 1
+        || caches[0].line_bytes != 64
+        || caches[0].ways != 8
+        || caches[0].sets != 64
+        || caches[0].size_bytes != 32_768
+        || caches[0].kind != PpttCacheKind::Data
+    {
+        return TestResult::Fail("Cache node decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_pptt_synthetic_decode);
+
+fn smoke_acpi_iort_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    use narf_acpi::{IortSmmuv3, IortIts};
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"IORT");
+    buf.extend_from_slice(&[0u8; 32]);          // length placeholder + rsvd
+
+    // IORT header: 12 bytes after SDT_HEADER.
+    let n_nodes_off = buf.len();
+    buf.extend_from_slice(&2u32.to_le_bytes()); // n_nodes
+    let arr_off_pos = buf.len();
+    buf.extend_from_slice(&0u32.to_le_bytes()); // node-array offset (patched)
+    buf.extend_from_slice(&0u32.to_le_bytes()); // reserved
+
+    let arr_off = buf.len() as u32;
+
+    // ITS group node: type=0, length=24, 1 ID = 0xCAFE.
+    buf.push(0);                                 // type
+    buf.extend_from_slice(&24u16.to_le_bytes()); // length
+    buf.push(0);                                 // revision
+    buf.extend_from_slice(&0u32.to_le_bytes()); // identifier
+    buf.extend_from_slice(&0u32.to_le_bytes()); // n_id_mappings
+    buf.extend_from_slice(&0u32.to_le_bytes()); // off_id_mappings
+    buf.extend_from_slice(&1u32.to_le_bytes()); // n_its
+    buf.extend_from_slice(&0xCAFEu32.to_le_bytes()); // its id
+
+    // SMMUv3 node: type=4, length=36, base=0xDEAD_0000, flags=0xA5.
+    buf.push(4);
+    buf.extend_from_slice(&36u16.to_le_bytes());
+    buf.push(0);
+    buf.extend_from_slice(&0u32.to_le_bytes()); // identifier
+    buf.extend_from_slice(&0u32.to_le_bytes()); // n_id_mappings
+    buf.extend_from_slice(&0u32.to_le_bytes()); // off_id_mappings
+    buf.extend_from_slice(&0xDEAD_0000u64.to_le_bytes()); // base
+    buf.extend_from_slice(&0xA5u32.to_le_bytes());        // flags
+    buf.extend_from_slice(&[0u8; 8]);                     // pad to 36
+
+    // Patch array-offset.
+    buf[arr_off_pos..arr_off_pos + 4].copy_from_slice(&arr_off.to_le_bytes());
+    let _ = n_nodes_off;
+
+    let n = narf_acpi::__test_parse_iort_body(&buf);
+    if n != 2 {
+        return TestResult::Fail("expected 2 IORT nodes parsed");
+    }
+    let mut smmus = [IortSmmuv3::default(); 4];
+    let ns = narf_acpi::copy_iort_smmuv3(&mut smmus);
+    if ns != 1 || smmus[0].base != 0xDEAD_0000 || smmus[0].flags != 0xA5 {
+        return TestResult::Fail("IORT SMMUv3 decode mismatch");
+    }
+    let mut its = [IortIts::default(); 4];
+    let ni = narf_acpi::copy_iort_its(&mut its);
+    if ni != 1 || its[0].its_id != 0xCAFE {
+        return TestResult::Fail("IORT ITS decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_iort_synthetic_decode);
+
+fn smoke_acpi_dmar_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    use narf_acpi::DmarDrhd;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"DMAR");
+    buf.extend_from_slice(&[0u8; 32]);          // length + rsvd
+    buf.push(48);                                // host_addr_width
+    buf.push(1);                                 // flags: INTR_REMAP
+    buf.extend_from_slice(&[0u8; 10]);           // reserved
+
+    // DRHD: type=0, length=16, segment=0x55, base=0xFEED_F000.
+    buf.extend_from_slice(&0u16.to_le_bytes());  // type
+    buf.extend_from_slice(&16u16.to_le_bytes()); // length
+    buf.push(0);                                 // flags
+    buf.push(0);                                 // reserved
+    buf.extend_from_slice(&0x55u16.to_le_bytes());
+    buf.extend_from_slice(&0xFEED_F000u64.to_le_bytes());
+
+    let n = narf_acpi::__test_parse_dmar_body(&buf);
+    if n != 1 {
+        return TestResult::Fail("expected 1 DRHD parsed");
+    }
+    let mut drhds = [DmarDrhd::default(); 4];
+    let nd = narf_acpi::copy_dmar_drhds(&mut drhds);
+    if nd != 1 || drhds[0].register_base != 0xFEED_F000 || drhds[0].segment != 0x55 {
+        return TestResult::Fail("DRHD decode mismatch");
+    }
+    if !narf_acpi::dmar_intr_remap_supported() {
+        return TestResult::Fail("INTR_REMAP flag not surfaced");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_dmar_synthetic_decode);
+
+fn smoke_acpi_ivrs_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    use narf_acpi::IvrsIommu;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"IVRS");
+    buf.extend_from_slice(&[0u8; 32]);          // length + rsvd
+    buf.extend_from_slice(&0u32.to_le_bytes()); // IvInfo
+    buf.extend_from_slice(&[0u8; 8]);           // reserved
+
+    // IVHD: type=0x10, length=24, cap_off=0x40, base=0xBA5E_F000, segment=0xAB.
+    buf.push(0x10);
+    buf.push(0);                                 // flags
+    buf.extend_from_slice(&24u16.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes()); // device id
+    buf.extend_from_slice(&0x40u16.to_le_bytes());
+    buf.extend_from_slice(&0xBA5E_F000u64.to_le_bytes());
+    buf.extend_from_slice(&0xABu16.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes()); // iommu_info
+    buf.extend_from_slice(&0u32.to_le_bytes()); // pad
+
+    let n = narf_acpi::__test_parse_ivrs_body(&buf);
+    if n != 1 {
+        return TestResult::Fail("expected 1 IVHD parsed");
+    }
+    let mut iommus = [IvrsIommu::default(); 4];
+    let ni = narf_acpi::copy_ivrs_iommus(&mut iommus);
+    if ni != 1
+        || iommus[0].base != 0xBA5E_F000
+        || iommus[0].pci_segment != 0xAB
+        || iommus[0].capability_off != 0x40
+    {
+        return TestResult::Fail("IVHD decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_ivrs_synthetic_decode);
+
+fn smoke_acpi_spcr_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"SPCR");
+    buf.extend_from_slice(&[0u8; 32]);          // length + rsvd
+
+    // Body: 36 bytes minimum.
+    buf.push(0x03);                              // iface = ARM PL011
+    buf.extend_from_slice(&[0u8; 3]);            // reserved
+    buf.push(0x00);                              // GAS.AddressSpaceId = SystemMemory
+    buf.push(8);                                 // bit width
+    buf.push(0);                                 // bit offset
+    buf.push(1);                                 // access size
+    buf.extend_from_slice(&0x900_0000u64.to_le_bytes()); // GAS.Address
+    buf.push(0);                                 // InterruptType
+    buf.push(0);                                 // IRQ
+    buf.extend_from_slice(&33u32.to_le_bytes()); // GSI
+    buf.push(7);                                 // baud = 115200
+    buf.extend_from_slice(&[0u8; 5]);            // parity / stop / flow / term / lang
+    buf.extend_from_slice(&0xFFFFu16.to_le_bytes()); // PCI device id
+    buf.extend_from_slice(&[0u8; 6]);            // pad to 36
+
+    narf_acpi::__test_parse_spcr_body(&buf);
+    let info = narf_acpi::spcr_info().expect("SPCR not parsed");
+    if info.iface != 0x03 || info.base != 0x900_0000 || info.gsi != 33 || info.baud_code != 7 {
+        return TestResult::Fail("SPCR decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_spcr_synthetic_decode);
+
 fn smoke_acpi_srat_synthetic_memory_entry() -> TestResult {
     // Type-1 memory affinity entry: base 0x1_0000_0000, length
     // 0x1000_0000, proximity 1, enabled.

@@ -1623,3 +1623,661 @@ pub unsafe fn __parse_srat_body_for_test(body: &[u8]) -> u32 {
     SRAT_PARSED.store(true, Ordering::Release);
     count
 }
+
+// ───────────────────────────────────────────────────────────────────
+// PPTT — Processor Properties Topology Table.
+// Spec: `acpi/specification/tables-iommu-topology.md` §1.
+// ───────────────────────────────────────────────────────────────────
+
+pub const MAX_PPTT_CPUS: usize = 256;
+pub const MAX_PPTT_CACHES: usize = 256;
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct PpttCpu {
+    pub acpi_uid: u32,
+    pub package:  bool,
+    pub thread:   bool,
+    pub leaf:     bool,
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct PpttCache {
+    pub level:      u8,
+    pub line_bytes: u16,
+    pub ways:       u16,
+    pub sets:       u32,
+    pub size_bytes: u32,
+    pub kind:       PpttCacheKind,
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum PpttCacheKind {
+    #[default]
+    Unified,
+    Data,
+    Instruction,
+}
+
+struct PpttTables {
+    cpus:    [PpttCpu; MAX_PPTT_CPUS],
+    caches:  [PpttCache; MAX_PPTT_CACHES],
+    n_cpus:  usize,
+    n_caches:usize,
+}
+
+impl PpttTables {
+    const EMPTY: Self = Self {
+        cpus:    [PpttCpu { acpi_uid: 0, package: false, thread: false, leaf: false };
+                  MAX_PPTT_CPUS],
+        caches:  [PpttCache {
+                      level: 0, line_bytes: 0, ways: 0, sets: 0,
+                      size_bytes: 0, kind: PpttCacheKind::Unified
+                  }; MAX_PPTT_CACHES],
+        n_cpus:  0,
+        n_caches:0,
+    };
+}
+
+static PPTT_DATA:   IrqSafeSpinLock<PpttTables> = IrqSafeSpinLock::new(PpttTables::EMPTY);
+static PPTT_PARSED: AtomicBool = AtomicBool::new(false);
+
+/// Parse the PPTT body from `body[SDT_HEADER_SIZE..]` and populate
+/// `PPTT_DATA`. The body content shape lets us run the parser on a
+/// hand-crafted buffer for tests without touching firmware.
+fn parse_pptt_body(body: &[u8]) -> u32 {
+    let mut tables = PPTT_DATA.lock();
+    *tables = PpttTables::EMPTY;
+    let mut cur = SDT_HEADER_SIZE;
+    let mut count = 0u32;
+    while cur + 4 <= body.len() {
+        let kind = body[cur];
+        let len  = body[cur + 1] as usize;
+        if len < 4 || cur + len > body.len() { break; }
+        let entry = &body[cur..cur + len];
+
+        match kind {
+            0 if entry.len() >= 20 => {
+                let flags = u32::from_le_bytes([
+                    entry[4], entry[5], entry[6], entry[7],
+                ]);
+                let acpi_uid = u32::from_le_bytes([
+                    entry[12], entry[13], entry[14], entry[15],
+                ]);
+                if tables.n_cpus < MAX_PPTT_CPUS {
+                    let i = tables.n_cpus;
+                    tables.cpus[i] = PpttCpu {
+                        acpi_uid,
+                        package: flags & (1 << 0) != 0,
+                        thread:  flags & (1 << 2) != 0,
+                        leaf:    flags & (1 << 3) != 0,
+                    };
+                    tables.n_cpus = i + 1;
+                    count += 1;
+                }
+            }
+            1 if entry.len() >= 24 => {
+                let size = u32::from_le_bytes([
+                    entry[12], entry[13], entry[14], entry[15],
+                ]);
+                let sets = u32::from_le_bytes([
+                    entry[16], entry[17], entry[18], entry[19],
+                ]);
+                let assoc = entry[20] as u16;
+                let attrs = entry[21];
+                let line  = u16::from_le_bytes([entry[22], entry[23]]);
+                let kind = match (attrs >> 2) & 0x3 {
+                    1 => PpttCacheKind::Instruction,
+                    0 => PpttCacheKind::Data,
+                    _ => PpttCacheKind::Unified,
+                };
+                if tables.n_caches < MAX_PPTT_CACHES {
+                    let i = tables.n_caches;
+                    tables.caches[i] = PpttCache {
+                        level: 0, // depth-from-leaf TBD; v0.1 leaves 0
+                        line_bytes: line,
+                        ways: assoc,
+                        sets,
+                        size_bytes: size,
+                        kind,
+                    };
+                    tables.n_caches = i + 1;
+                    count += 1;
+                }
+            }
+            _ => {}
+        }
+        cur += len;
+    }
+    count
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → PPTT must also be identity-mapped.
+pub unsafe fn parse_pptt(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut pptt: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"PPTT" && pptt.is_none() {
+                pptt = Some(phys);
+            }
+        })?;
+    }
+    let pptt = pptt.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (pptt as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(pptt as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    let n = parse_pptt_body(body);
+    PPTT_PARSED.store(true, Ordering::Release);
+    Ok(n)
+}
+
+pub fn is_pptt_known() -> bool { PPTT_PARSED.load(Ordering::Acquire) }
+
+pub fn copy_pptt_cpus(out: &mut [PpttCpu]) -> usize {
+    let t = PPTT_DATA.lock();
+    let n = t.n_cpus.min(out.len());
+    out[..n].copy_from_slice(&t.cpus[..n]);
+    n
+}
+
+pub fn copy_pptt_caches(out: &mut [PpttCache]) -> usize {
+    let t = PPTT_DATA.lock();
+    let n = t.n_caches.min(out.len());
+    out[..n].copy_from_slice(&t.caches[..n]);
+    n
+}
+
+/// Test-only: parse a synthetic PPTT body without reading firmware.
+#[doc(hidden)]
+pub fn __test_parse_pptt_body(body: &[u8]) -> u32 {
+    let n = parse_pptt_body(body);
+    PPTT_PARSED.store(true, Ordering::Release);
+    n
+}
+
+// ───────────────────────────────────────────────────────────────────
+// IORT — IO Remap Table.
+// Spec: `acpi/specification/tables-iommu-topology.md` §2.
+// ───────────────────────────────────────────────────────────────────
+
+pub const MAX_IORT_SMMUS: usize = 8;
+pub const MAX_IORT_ITS:   usize = 8;
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct IortSmmuv3 {
+    pub base:  u64,
+    pub flags: u32,
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct IortIts {
+    pub its_id: u32,
+}
+
+struct IortTables {
+    smmus:   [IortSmmuv3; MAX_IORT_SMMUS],
+    its:     [IortIts;    MAX_IORT_ITS],
+    n_smmus: usize,
+    n_its:   usize,
+}
+
+impl IortTables {
+    const EMPTY: Self = Self {
+        smmus:   [IortSmmuv3 { base: 0, flags: 0 }; MAX_IORT_SMMUS],
+        its:     [IortIts { its_id: 0 };           MAX_IORT_ITS],
+        n_smmus: 0,
+        n_its:   0,
+    };
+}
+
+static IORT_DATA:   IrqSafeSpinLock<IortTables> = IrqSafeSpinLock::new(IortTables::EMPTY);
+static IORT_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_iort_body(body: &[u8]) -> u32 {
+    let mut tables = IORT_DATA.lock();
+    *tables = IortTables::EMPTY;
+
+    if body.len() < SDT_HEADER_SIZE + 12 { return 0; }
+    let n_nodes = u32::from_le_bytes([
+        body[SDT_HEADER_SIZE], body[SDT_HEADER_SIZE + 1],
+        body[SDT_HEADER_SIZE + 2], body[SDT_HEADER_SIZE + 3],
+    ]) as usize;
+    let arr_off = u32::from_le_bytes([
+        body[SDT_HEADER_SIZE + 4], body[SDT_HEADER_SIZE + 5],
+        body[SDT_HEADER_SIZE + 6], body[SDT_HEADER_SIZE + 7],
+    ]) as usize;
+
+    let mut cur = arr_off;
+    let mut count = 0u32;
+    for _ in 0..n_nodes {
+        if cur + 4 > body.len() { break; }
+        let kind = body[cur];
+        let len = u16::from_le_bytes([body[cur + 1], body[cur + 2]]) as usize;
+        if len < 4 || cur + len > body.len() { break; }
+        let entry = &body[cur..cur + len];
+
+        match kind {
+            0 if entry.len() >= 20 => {
+                // ITS group: header (16 B) + ITS-id count (4 B) + ids[]
+                let n = u32::from_le_bytes([
+                    entry[16], entry[17], entry[18], entry[19],
+                ]) as usize;
+                let mut off = 20;
+                for _ in 0..n {
+                    if off + 4 > entry.len() { break; }
+                    let id = u32::from_le_bytes([
+                        entry[off], entry[off + 1], entry[off + 2], entry[off + 3],
+                    ]);
+                    if tables.n_its < MAX_IORT_ITS {
+                        let i = tables.n_its;
+                        tables.its[i] = IortIts { its_id: id };
+                        tables.n_its = i + 1;
+                        count += 1;
+                    }
+                    off += 4;
+                }
+            }
+            4 if entry.len() >= 36 => {
+                // SMMUv3: header (16 B) + base@16..24 + flags@24..28
+                let base = u64::from_le_bytes([
+                    entry[16], entry[17], entry[18], entry[19],
+                    entry[20], entry[21], entry[22], entry[23],
+                ]);
+                let flags = u32::from_le_bytes([
+                    entry[24], entry[25], entry[26], entry[27],
+                ]);
+                if tables.n_smmus < MAX_IORT_SMMUS {
+                    let i = tables.n_smmus;
+                    tables.smmus[i] = IortSmmuv3 { base, flags };
+                    tables.n_smmus = i + 1;
+                    count += 1;
+                }
+            }
+            _ => {}
+        }
+        cur += len;
+    }
+    count
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → IORT must also be identity-mapped.
+pub unsafe fn parse_iort(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut iort: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"IORT" && iort.is_none() {
+                iort = Some(phys);
+            }
+        })?;
+    }
+    let iort = iort.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (iort as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 12 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(iort as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    let n = parse_iort_body(body);
+    IORT_PARSED.store(true, Ordering::Release);
+    Ok(n)
+}
+
+pub fn is_iort_known() -> bool { IORT_PARSED.load(Ordering::Acquire) }
+
+pub fn copy_iort_smmuv3(out: &mut [IortSmmuv3]) -> usize {
+    let t = IORT_DATA.lock();
+    let n = t.n_smmus.min(out.len());
+    out[..n].copy_from_slice(&t.smmus[..n]);
+    n
+}
+
+pub fn copy_iort_its(out: &mut [IortIts]) -> usize {
+    let t = IORT_DATA.lock();
+    let n = t.n_its.min(out.len());
+    out[..n].copy_from_slice(&t.its[..n]);
+    n
+}
+
+#[doc(hidden)]
+pub fn __test_parse_iort_body(body: &[u8]) -> u32 {
+    let n = parse_iort_body(body);
+    IORT_PARSED.store(true, Ordering::Release);
+    n
+}
+
+// ───────────────────────────────────────────────────────────────────
+// DMAR — DMA Remap Reporting.
+// Spec: `acpi/specification/tables-iommu-topology.md` §3.
+// ───────────────────────────────────────────────────────────────────
+
+pub const MAX_DMAR_DRHDS: usize = 8;
+
+const DMAR_FLAG_INTR_REMAP: u8 = 1 << 0;
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct DmarDrhd {
+    pub register_base:   u64,
+    pub segment:         u16,
+    pub include_all_pci: bool,
+}
+
+struct DmarTables {
+    drhds:    [DmarDrhd; MAX_DMAR_DRHDS],
+    n_drhds:  usize,
+    intr_rmp: bool,
+}
+
+impl DmarTables {
+    const EMPTY: Self = Self {
+        drhds:    [DmarDrhd { register_base: 0, segment: 0, include_all_pci: false };
+                   MAX_DMAR_DRHDS],
+        n_drhds:  0,
+        intr_rmp: false,
+    };
+}
+
+static DMAR_DATA:   IrqSafeSpinLock<DmarTables> = IrqSafeSpinLock::new(DmarTables::EMPTY);
+static DMAR_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_dmar_body(body: &[u8]) -> u32 {
+    let mut tables = DMAR_DATA.lock();
+    *tables = DmarTables::EMPTY;
+    if body.len() < SDT_HEADER_SIZE + 12 { return 0; }
+    tables.intr_rmp = body[SDT_HEADER_SIZE + 1] & DMAR_FLAG_INTR_REMAP != 0;
+    let mut cur = SDT_HEADER_SIZE + 12;
+    let mut count = 0u32;
+    while cur + 4 <= body.len() {
+        let kind = u16::from_le_bytes([body[cur], body[cur + 1]]);
+        let len  = u16::from_le_bytes([body[cur + 2], body[cur + 3]]) as usize;
+        if len < 4 || cur + len > body.len() { break; }
+        let entry = &body[cur..cur + len];
+
+        if kind == 0 && entry.len() >= 16 {
+            // DRHD: [4] flags, [5] reserved, [6..8] segment, [8..16] base
+            let flags = entry[4];
+            let segment = u16::from_le_bytes([entry[6], entry[7]]);
+            let base = u64::from_le_bytes([
+                entry[8],  entry[9],  entry[10], entry[11],
+                entry[12], entry[13], entry[14], entry[15],
+            ]);
+            if tables.n_drhds < MAX_DMAR_DRHDS {
+                let i = tables.n_drhds;
+                tables.drhds[i] = DmarDrhd {
+                    register_base: base,
+                    segment,
+                    include_all_pci: flags & 1 != 0,
+                };
+                tables.n_drhds = i + 1;
+                count += 1;
+            }
+        }
+        cur += len;
+    }
+    count
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → DMAR must also be identity-mapped.
+pub unsafe fn parse_dmar(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut dmar: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"DMAR" && dmar.is_none() {
+                dmar = Some(phys);
+            }
+        })?;
+    }
+    let dmar = dmar.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (dmar as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 12 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(dmar as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    let n = parse_dmar_body(body);
+    DMAR_PARSED.store(true, Ordering::Release);
+    Ok(n)
+}
+
+pub fn is_dmar_known() -> bool { DMAR_PARSED.load(Ordering::Acquire) }
+
+pub fn copy_dmar_drhds(out: &mut [DmarDrhd]) -> usize {
+    let t = DMAR_DATA.lock();
+    let n = t.n_drhds.min(out.len());
+    out[..n].copy_from_slice(&t.drhds[..n]);
+    n
+}
+
+pub fn dmar_intr_remap_supported() -> bool {
+    DMAR_DATA.lock().intr_rmp
+}
+
+#[doc(hidden)]
+pub fn __test_parse_dmar_body(body: &[u8]) -> u32 {
+    let n = parse_dmar_body(body);
+    DMAR_PARSED.store(true, Ordering::Release);
+    n
+}
+
+// ───────────────────────────────────────────────────────────────────
+// IVRS — I/O Virtualization Reporting.
+// Spec: `acpi/specification/tables-iommu-topology.md` §4.
+// ───────────────────────────────────────────────────────────────────
+
+pub const MAX_IVRS_IOMMUS: usize = 8;
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct IvrsIommu {
+    pub base:           u64,
+    pub pci_segment:    u16,
+    pub capability_off: u16,
+}
+
+struct IvrsTables {
+    iommus:   [IvrsIommu; MAX_IVRS_IOMMUS],
+    n_iommus: usize,
+}
+
+impl IvrsTables {
+    const EMPTY: Self = Self {
+        iommus:   [IvrsIommu { base: 0, pci_segment: 0, capability_off: 0 };
+                   MAX_IVRS_IOMMUS],
+        n_iommus: 0,
+    };
+}
+
+static IVRS_DATA:   IrqSafeSpinLock<IvrsTables> = IrqSafeSpinLock::new(IvrsTables::EMPTY);
+static IVRS_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_ivrs_body(body: &[u8]) -> u32 {
+    let mut tables = IVRS_DATA.lock();
+    *tables = IvrsTables::EMPTY;
+    // Header: SDT_HEADER (36) + IvInfo (4) + reserved (8) = 48
+    if body.len() < SDT_HEADER_SIZE + 12 { return 0; }
+    let mut cur = SDT_HEADER_SIZE + 12;
+    let mut count = 0u32;
+    while cur + 4 <= body.len() {
+        let kind = body[cur];
+        let _flags = body[cur + 1];
+        let len = u16::from_le_bytes([body[cur + 2], body[cur + 3]]) as usize;
+        if len < 4 || cur + len > body.len() { break; }
+        let entry = &body[cur..cur + len];
+
+        // IVHD types 0x10 / 0x11 / 0x40
+        if matches!(kind, 0x10 | 0x11 | 0x40) && entry.len() >= 24 {
+            // device_id at [4..6], cap_off at [6..8], base at [8..16],
+            // segment at [16..18]
+            let cap_off = u16::from_le_bytes([entry[6], entry[7]]);
+            let base = u64::from_le_bytes([
+                entry[8],  entry[9],  entry[10], entry[11],
+                entry[12], entry[13], entry[14], entry[15],
+            ]);
+            let segment = u16::from_le_bytes([entry[16], entry[17]]);
+            if tables.n_iommus < MAX_IVRS_IOMMUS {
+                let i = tables.n_iommus;
+                tables.iommus[i] = IvrsIommu {
+                    base, pci_segment: segment, capability_off: cap_off,
+                };
+                tables.n_iommus = i + 1;
+                count += 1;
+            }
+        }
+        cur += len;
+    }
+    count
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → IVRS must also be identity-mapped.
+pub unsafe fn parse_ivrs(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut ivrs: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"IVRS" && ivrs.is_none() {
+                ivrs = Some(phys);
+            }
+        })?;
+    }
+    let ivrs = ivrs.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (ivrs as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 12 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(ivrs as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    let n = parse_ivrs_body(body);
+    IVRS_PARSED.store(true, Ordering::Release);
+    Ok(n)
+}
+
+pub fn is_ivrs_known() -> bool { IVRS_PARSED.load(Ordering::Acquire) }
+
+pub fn copy_ivrs_iommus(out: &mut [IvrsIommu]) -> usize {
+    let t = IVRS_DATA.lock();
+    let n = t.n_iommus.min(out.len());
+    out[..n].copy_from_slice(&t.iommus[..n]);
+    n
+}
+
+#[doc(hidden)]
+pub fn __test_parse_ivrs_body(body: &[u8]) -> u32 {
+    let n = parse_ivrs_body(body);
+    IVRS_PARSED.store(true, Ordering::Release);
+    n
+}
+
+// ───────────────────────────────────────────────────────────────────
+// SPCR — Serial Port Console Redirection.
+// Spec: `acpi/specification/tables-iommu-topology.md` §5.
+// ───────────────────────────────────────────────────────────────────
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct SpcrInfo {
+    pub iface:         u8,
+    pub base:          u64,
+    pub addr_space_id: u8,
+    pub gsi:           u32,
+    pub baud_code:     u8,
+    pub pci_device_id: u16,
+}
+
+static SPCR_DATA:   IrqSafeSpinLock<SpcrInfo> = IrqSafeSpinLock::new(SpcrInfo {
+    iface: 0, base: 0, addr_space_id: 0, gsi: 0, baud_code: 0, pci_device_id: 0,
+});
+static SPCR_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_spcr_body(body: &[u8]) {
+    // SPCR rev 4 layout: SDT_HEADER (36) + InterfaceType (1) +
+    // Reserved (3) + GAS (12) + InterruptType (1) + IRQ (1) +
+    // GSI (4) + BaudRate (1) + Parity (1) + StopBits (1) +
+    // FlowControl (1) + TerminalType (1) + Language (1) +
+    // PciDeviceId (2) + …
+    if body.len() < SDT_HEADER_SIZE + 36 { return; }
+    let iface         = body[SDT_HEADER_SIZE];
+    let addr_space_id = body[SDT_HEADER_SIZE + 4];
+    let base = u64::from_le_bytes([
+        body[SDT_HEADER_SIZE + 8],  body[SDT_HEADER_SIZE + 9],
+        body[SDT_HEADER_SIZE + 10], body[SDT_HEADER_SIZE + 11],
+        body[SDT_HEADER_SIZE + 12], body[SDT_HEADER_SIZE + 13],
+        body[SDT_HEADER_SIZE + 14], body[SDT_HEADER_SIZE + 15],
+    ]);
+    let gsi = u32::from_le_bytes([
+        body[SDT_HEADER_SIZE + 18], body[SDT_HEADER_SIZE + 19],
+        body[SDT_HEADER_SIZE + 20], body[SDT_HEADER_SIZE + 21],
+    ]);
+    let baud_code     = body[SDT_HEADER_SIZE + 22];
+    let pci_device_id = u16::from_le_bytes([
+        body[SDT_HEADER_SIZE + 28], body[SDT_HEADER_SIZE + 29],
+    ]);
+    *SPCR_DATA.lock() = SpcrInfo {
+        iface, base, addr_space_id, gsi, baud_code, pci_device_id,
+    };
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → SPCR must also be identity-mapped.
+pub unsafe fn parse_spcr(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut spcr: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"SPCR" && spcr.is_none() {
+                spcr = Some(phys);
+            }
+        })?;
+    }
+    let spcr = spcr.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (spcr as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 36 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(spcr as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    parse_spcr_body(body);
+    SPCR_PARSED.store(true, Ordering::Release);
+    Ok(())
+}
+
+pub fn spcr_info() -> Option<SpcrInfo> {
+    if !SPCR_PARSED.load(Ordering::Acquire) { return None; }
+    Some(*SPCR_DATA.lock())
+}
+
+#[doc(hidden)]
+pub fn __test_parse_spcr_body(body: &[u8]) {
+    parse_spcr_body(body);
+    SPCR_PARSED.store(true, Ordering::Release);
+}
