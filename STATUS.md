@@ -18,8 +18,8 @@ asks for. Updated when observable kernel behaviour changes.
   delivers hardware LAPIC-timer IRQs, exits cleanly.
 - `cargo xtask run --arch=aarch64` boots, runs the full async demo
   using CNTPCT_EL0 as the clock, exits via ARM semihosting.
-- `cargo xtask test --arch=x86_64` passes **635/0/29** (pass / fail / skip).
-- `cargo xtask test --arch=aarch64` passes **339/0/11** (pass / fail / skip).
+- `cargo xtask test --arch=x86_64` passes **639/0/30** (pass / fail / skip).
+- `cargo xtask test --arch=aarch64` passes **344/0/11** (pass / fail / skip).
   Skips are x86_64-specific PCIe surfaces or live-device tests that
   skip cleanly when QEMU doesn't expose the device.
 - In-tree PCIe drivers running against real QEMU-emulated devices.
@@ -153,6 +153,11 @@ asks for. Updated when observable kernel behaviour changes.
 | ACPI WDDT        | Watchdog Description Table — `WddtInfo { timer_max_count, timer_min_count, period_us, status, capability, base }`. Spec: `acpi/specification/tables-arm-ras-power-pm.md` §3. |
 | ACPI LPIT        | Low Power Idle Table — Type 0 (Native C-State) → `LpitState { uid, trigger_addr, residency, latency, counter_addr, counter_freq }`. Spec: `acpi/specification/tables-arm-ras-power-pm.md` §4. |
 | ACPI NFIT        | NVDIMM Firmware Interface Table — Type 0 (SPA Range) → `NfitSpaRange { range_index, proximity, base, length, mem_attr }`. Spec: `acpi/specification/tables-arm-ras-power-pm.md` §5. |
+| ACPI ERST        | Error Record Serialization Table — 32-byte instruction-entry decode → `ErstInstruction { action, instruction, addr, value, mask }`. Spec: `acpi/specification/tables-ras-tpm-debug.md` §1. |
+| ACPI EINJ        | Error Injection Table — same instruction-entry shape as ERST → `EinjInstruction`. Spec: `acpi/specification/tables-ras-tpm-debug.md` §2. |
+| ACPI TPM2        | Trusted Platform Module 2.0 — `Tpm2Info { platform_class, control_area_addr, start_method }`. Spec: `acpi/specification/tables-ras-tpm-debug.md` §3. |
+| ACPI BGRT        | Boot Graphics Resource Table — `BgrtInfo { status, image_address, offset_x, offset_y }`. Spec: `acpi/specification/tables-ras-tpm-debug.md` §4. |
+| ACPI DBG2        | Debug Port Table 2 — DeviceInfo walk → `Dbg2Device { port_type, port_subtype, base_addr }`. Spec: `acpi/specification/tables-ras-tpm-debug.md` §5. |
 | iwlwifi          | Intel Wi-Fi 6 / 6E (AX200 / AX201 / AX210 / AX211). **Structural probe only** — PCI match table + spec doc. Operational register map (CSR/PRPH offsets, firmware loader, TFD/RBD descriptors, host-command opcodes) is not in any public Intel doc; further stages blocked on public register docs. See `drivers/net/specification/iwlwifi.md`. |
 | AHCI (ICH9/10)   | HBA bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT. |
 | xHCI USB host    | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT. |

@@ -3418,3 +3418,496 @@ pub fn __test_parse_nfit_body(body: &[u8]) -> u32 {
     NFIT_PARSED.store(true, Ordering::Release);
     n
 }
+
+// ───────────────────────────────────────────────────────────────────
+// ERST / EINJ — RAS instruction streams.
+// Spec: `acpi/specification/tables-ras-tpm-debug.md` §1 + §2.
+// ───────────────────────────────────────────────────────────────────
+
+pub const MAX_ERST_INSTRUCTIONS: usize = 64;
+pub const MAX_EINJ_INSTRUCTIONS: usize = 64;
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct ErstInstruction {
+    pub action:      u8,
+    pub instruction: u8,
+    pub addr:        u64,
+    pub value:       u64,
+    pub mask:        u64,
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct EinjInstruction {
+    pub action:      u8,
+    pub instruction: u8,
+    pub addr:        u64,
+    pub value:       u64,
+    pub mask:        u64,
+}
+
+struct ErstTables {
+    insns:   [ErstInstruction; MAX_ERST_INSTRUCTIONS],
+    n_insns: usize,
+}
+struct EinjTables {
+    insns:   [EinjInstruction; MAX_EINJ_INSTRUCTIONS],
+    n_insns: usize,
+}
+
+impl ErstTables {
+    const EMPTY: Self = Self {
+        insns:   [ErstInstruction { action: 0, instruction: 0, addr: 0, value: 0, mask: 0 };
+                  MAX_ERST_INSTRUCTIONS],
+        n_insns: 0,
+    };
+}
+impl EinjTables {
+    const EMPTY: Self = Self {
+        insns:   [EinjInstruction { action: 0, instruction: 0, addr: 0, value: 0, mask: 0 };
+                  MAX_EINJ_INSTRUCTIONS],
+        n_insns: 0,
+    };
+}
+
+static ERST_DATA:   IrqSafeSpinLock<ErstTables> = IrqSafeSpinLock::new(ErstTables::EMPTY);
+static ERST_PARSED: AtomicBool = AtomicBool::new(false);
+static EINJ_DATA:   IrqSafeSpinLock<EinjTables> = IrqSafeSpinLock::new(EinjTables::EMPTY);
+static EINJ_PARSED: AtomicBool = AtomicBool::new(false);
+
+/// Decode N 32-byte ERST/EINJ instruction entries starting at
+/// `entries`. Each entry layout (offsets within entry):
+///   0 action / 1 instruction / 2 flags / 3 reserved
+///   4..16 RegisterRegion GAS (Address @ +8..16)
+///   16..24 Value
+///   24..32 Mask
+fn decode_ras_insns<F: FnMut(u8, u8, u64, u64, u64)>(entries: &[u8], n: usize, mut emit: F) {
+    let mut cur = 0usize;
+    let mut left = n;
+    while left > 0 && cur + 32 <= entries.len() {
+        let action = entries[cur];
+        let instruction = entries[cur + 1];
+        let addr = u64::from_le_bytes([
+            entries[cur + 8],  entries[cur + 9],
+            entries[cur + 10], entries[cur + 11],
+            entries[cur + 12], entries[cur + 13],
+            entries[cur + 14], entries[cur + 15],
+        ]);
+        let value = u64::from_le_bytes([
+            entries[cur + 16], entries[cur + 17],
+            entries[cur + 18], entries[cur + 19],
+            entries[cur + 20], entries[cur + 21],
+            entries[cur + 22], entries[cur + 23],
+        ]);
+        let mask = u64::from_le_bytes([
+            entries[cur + 24], entries[cur + 25],
+            entries[cur + 26], entries[cur + 27],
+            entries[cur + 28], entries[cur + 29],
+            entries[cur + 30], entries[cur + 31],
+        ]);
+        emit(action, instruction, addr, value, mask);
+        cur += 32;
+        left -= 1;
+    }
+}
+
+fn parse_erst_body(body: &[u8]) -> u32 {
+    let mut tables = ERST_DATA.lock();
+    *tables = ErstTables::EMPTY;
+    if body.len() < SDT_HEADER_SIZE + 12 { return 0; }
+    let n = u32::from_le_bytes([
+        body[SDT_HEADER_SIZE + 8],  body[SDT_HEADER_SIZE + 9],
+        body[SDT_HEADER_SIZE + 10], body[SDT_HEADER_SIZE + 11],
+    ]) as usize;
+    let entries = &body[SDT_HEADER_SIZE + 12..];
+    let mut count = 0u32;
+    decode_ras_insns(entries, n, |action, instruction, addr, value, mask| {
+        if tables.n_insns < MAX_ERST_INSTRUCTIONS {
+            let i = tables.n_insns;
+            tables.insns[i] = ErstInstruction { action, instruction, addr, value, mask };
+            tables.n_insns = i + 1;
+            count += 1;
+        }
+    });
+    count
+}
+
+fn parse_einj_body(body: &[u8]) -> u32 {
+    let mut tables = EINJ_DATA.lock();
+    *tables = EinjTables::EMPTY;
+    if body.len() < SDT_HEADER_SIZE + 12 { return 0; }
+    let n = u32::from_le_bytes([
+        body[SDT_HEADER_SIZE + 8],  body[SDT_HEADER_SIZE + 9],
+        body[SDT_HEADER_SIZE + 10], body[SDT_HEADER_SIZE + 11],
+    ]) as usize;
+    let entries = &body[SDT_HEADER_SIZE + 12..];
+    let mut count = 0u32;
+    decode_ras_insns(entries, n, |action, instruction, addr, value, mask| {
+        if tables.n_insns < MAX_EINJ_INSTRUCTIONS {
+            let i = tables.n_insns;
+            tables.insns[i] = EinjInstruction { action, instruction, addr, value, mask };
+            tables.n_insns = i + 1;
+            count += 1;
+        }
+    });
+    count
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → ERST must also be identity-mapped.
+pub unsafe fn parse_erst(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut erst: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"ERST" && erst.is_none() {
+                erst = Some(phys);
+            }
+        })?;
+    }
+    let erst = erst.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (erst as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 12 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(erst as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    let n = parse_erst_body(body);
+    ERST_PARSED.store(true, Ordering::Release);
+    Ok(n)
+}
+
+/// # Safety
+/// As `parse_erst`.
+pub unsafe fn parse_einj(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut einj: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"EINJ" && einj.is_none() {
+                einj = Some(phys);
+            }
+        })?;
+    }
+    let einj = einj.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (einj as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 12 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(einj as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    let n = parse_einj_body(body);
+    EINJ_PARSED.store(true, Ordering::Release);
+    Ok(n)
+}
+
+pub fn is_erst_known() -> bool { ERST_PARSED.load(Ordering::Acquire) }
+pub fn is_einj_known() -> bool { EINJ_PARSED.load(Ordering::Acquire) }
+
+pub fn copy_erst_instructions(out: &mut [ErstInstruction]) -> usize {
+    let t = ERST_DATA.lock();
+    let n = t.n_insns.min(out.len());
+    out[..n].copy_from_slice(&t.insns[..n]);
+    n
+}
+
+pub fn copy_einj_instructions(out: &mut [EinjInstruction]) -> usize {
+    let t = EINJ_DATA.lock();
+    let n = t.n_insns.min(out.len());
+    out[..n].copy_from_slice(&t.insns[..n]);
+    n
+}
+
+#[doc(hidden)]
+pub fn __test_parse_erst_body(body: &[u8]) -> u32 {
+    let n = parse_erst_body(body);
+    ERST_PARSED.store(true, Ordering::Release);
+    n
+}
+
+#[doc(hidden)]
+pub fn __test_parse_einj_body(body: &[u8]) -> u32 {
+    let n = parse_einj_body(body);
+    EINJ_PARSED.store(true, Ordering::Release);
+    n
+}
+
+// ───────────────────────────────────────────────────────────────────
+// TPM2 — Trusted Platform Module 2.0 Table.
+// Spec: `acpi/specification/tables-ras-tpm-debug.md` §3.
+// ───────────────────────────────────────────────────────────────────
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct Tpm2Info {
+    pub platform_class:    u16,
+    pub control_area_addr: u64,
+    pub start_method:      u32,
+}
+
+static TPM2_DATA: IrqSafeSpinLock<Tpm2Info> = IrqSafeSpinLock::new(Tpm2Info {
+    platform_class: 0, control_area_addr: 0, start_method: 0,
+});
+static TPM2_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_tpm2_body(body: &[u8]) {
+    if body.len() < SDT_HEADER_SIZE + 16 { return; }
+    let off = SDT_HEADER_SIZE;
+    let platform_class = u16::from_le_bytes([body[off], body[off + 1]]);
+    let control_area_addr = u64::from_le_bytes([
+        body[off + 4], body[off + 5], body[off + 6], body[off + 7],
+        body[off + 8], body[off + 9], body[off + 10], body[off + 11],
+    ]);
+    let start_method = u32::from_le_bytes([
+        body[off + 12], body[off + 13], body[off + 14], body[off + 15],
+    ]);
+    *TPM2_DATA.lock() = Tpm2Info {
+        platform_class, control_area_addr, start_method,
+    };
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → TPM2 must also be identity-mapped.
+pub unsafe fn parse_tpm2(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut tpm2: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"TPM2" && tpm2.is_none() {
+                tpm2 = Some(phys);
+            }
+        })?;
+    }
+    let tpm2 = tpm2.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (tpm2 as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 16 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(tpm2 as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    parse_tpm2_body(body);
+    TPM2_PARSED.store(true, Ordering::Release);
+    Ok(())
+}
+
+pub fn tpm2_info() -> Option<Tpm2Info> {
+    if !TPM2_PARSED.load(Ordering::Acquire) { return None; }
+    Some(*TPM2_DATA.lock())
+}
+
+#[doc(hidden)]
+pub fn __test_parse_tpm2_body(body: &[u8]) {
+    parse_tpm2_body(body);
+    TPM2_PARSED.store(true, Ordering::Release);
+}
+
+// ───────────────────────────────────────────────────────────────────
+// BGRT — Boot Graphics Resource Table.
+// Spec: `acpi/specification/tables-ras-tpm-debug.md` §4.
+// ───────────────────────────────────────────────────────────────────
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct BgrtInfo {
+    pub status:        u8,
+    pub image_address: u64,
+    pub offset_x:      u32,
+    pub offset_y:      u32,
+}
+
+static BGRT_DATA: IrqSafeSpinLock<BgrtInfo> = IrqSafeSpinLock::new(BgrtInfo {
+    status: 0, image_address: 0, offset_x: 0, offset_y: 0,
+});
+static BGRT_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_bgrt_body(body: &[u8]) {
+    // Body offsets: Version (2) + Status (1) + ImageType (1) +
+    //               ImageAddress (8) + OffsetX (4) + OffsetY (4)
+    if body.len() < SDT_HEADER_SIZE + 20 { return; }
+    let off = SDT_HEADER_SIZE;
+    let status = body[off + 2];
+    let image_address = u64::from_le_bytes([
+        body[off + 4], body[off + 5], body[off + 6], body[off + 7],
+        body[off + 8], body[off + 9], body[off + 10], body[off + 11],
+    ]);
+    let offset_x = u32::from_le_bytes([
+        body[off + 12], body[off + 13], body[off + 14], body[off + 15],
+    ]);
+    let offset_y = u32::from_le_bytes([
+        body[off + 16], body[off + 17], body[off + 18], body[off + 19],
+    ]);
+    *BGRT_DATA.lock() = BgrtInfo {
+        status, image_address, offset_x, offset_y,
+    };
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → BGRT must also be identity-mapped.
+pub unsafe fn parse_bgrt(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut bgrt: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"BGRT" && bgrt.is_none() {
+                bgrt = Some(phys);
+            }
+        })?;
+    }
+    let bgrt = bgrt.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (bgrt as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 20 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(bgrt as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    parse_bgrt_body(body);
+    BGRT_PARSED.store(true, Ordering::Release);
+    Ok(())
+}
+
+pub fn bgrt_info() -> Option<BgrtInfo> {
+    if !BGRT_PARSED.load(Ordering::Acquire) { return None; }
+    Some(*BGRT_DATA.lock())
+}
+
+#[doc(hidden)]
+pub fn __test_parse_bgrt_body(body: &[u8]) {
+    parse_bgrt_body(body);
+    BGRT_PARSED.store(true, Ordering::Release);
+}
+
+// ───────────────────────────────────────────────────────────────────
+// DBG2 — Debug Port Table 2.
+// Spec: `acpi/specification/tables-ras-tpm-debug.md` §5.
+// ───────────────────────────────────────────────────────────────────
+
+pub const MAX_DBG2_DEVICES: usize = 8;
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct Dbg2Device {
+    pub port_type:    u16,
+    pub port_subtype: u16,
+    pub base_addr:    u64,
+}
+
+struct Dbg2Tables {
+    devs:    [Dbg2Device; MAX_DBG2_DEVICES],
+    n_devs:  usize,
+}
+
+impl Dbg2Tables {
+    const EMPTY: Self = Self {
+        devs:    [Dbg2Device { port_type: 0, port_subtype: 0, base_addr: 0 };
+                  MAX_DBG2_DEVICES],
+        n_devs:  0,
+    };
+}
+
+static DBG2_DATA:   IrqSafeSpinLock<Dbg2Tables> = IrqSafeSpinLock::new(Dbg2Tables::EMPTY);
+static DBG2_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_dbg2_body(body: &[u8]) -> u32 {
+    let mut tables = DBG2_DATA.lock();
+    *tables = Dbg2Tables::EMPTY;
+    if body.len() < SDT_HEADER_SIZE + 8 { return 0; }
+    let info_off = u32::from_le_bytes([
+        body[SDT_HEADER_SIZE], body[SDT_HEADER_SIZE + 1],
+        body[SDT_HEADER_SIZE + 2], body[SDT_HEADER_SIZE + 3],
+    ]) as usize;
+    let info_count = u32::from_le_bytes([
+        body[SDT_HEADER_SIZE + 4], body[SDT_HEADER_SIZE + 5],
+        body[SDT_HEADER_SIZE + 6], body[SDT_HEADER_SIZE + 7],
+    ]) as usize;
+    let mut cur = info_off;
+    let mut count = 0u32;
+    for _ in 0..info_count {
+        if cur + 22 > body.len() { break; }
+        let len = u16::from_le_bytes([body[cur + 1], body[cur + 2]]) as usize;
+        if len < 22 || cur + len > body.len() { break; }
+        let entry = &body[cur..cur + len];
+        // BaseAddrRegOffset @ entry[18..20] points to a GAS array.
+        let bar_off = u16::from_le_bytes([entry[18], entry[19]]) as usize;
+        let port_type = u16::from_le_bytes([entry[12], entry[13]]);
+        let port_subtype = u16::from_le_bytes([entry[14], entry[15]]);
+        // First GAS at bar_off; address @ bar_off + 4..bar_off + 12.
+        let base_addr = if bar_off + 12 <= entry.len() {
+            u64::from_le_bytes([
+                entry[bar_off + 4],  entry[bar_off + 5],
+                entry[bar_off + 6],  entry[bar_off + 7],
+                entry[bar_off + 8],  entry[bar_off + 9],
+                entry[bar_off + 10], entry[bar_off + 11],
+            ])
+        } else {
+            0
+        };
+        if tables.n_devs < MAX_DBG2_DEVICES {
+            let i = tables.n_devs;
+            tables.devs[i] = Dbg2Device { port_type, port_subtype, base_addr };
+            tables.n_devs = i + 1;
+            count += 1;
+        }
+        cur += len;
+    }
+    count
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → DBG2 must also be identity-mapped.
+pub unsafe fn parse_dbg2(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut dbg2: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"DBG2" && dbg2.is_none() {
+                dbg2 = Some(phys);
+            }
+        })?;
+    }
+    let dbg2 = dbg2.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (dbg2 as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 8 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(dbg2 as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    let n = parse_dbg2_body(body);
+    DBG2_PARSED.store(true, Ordering::Release);
+    Ok(n)
+}
+
+pub fn is_dbg2_known() -> bool { DBG2_PARSED.load(Ordering::Acquire) }
+
+pub fn copy_dbg2_devices(out: &mut [Dbg2Device]) -> usize {
+    let t = DBG2_DATA.lock();
+    let n = t.n_devs.min(out.len());
+    out[..n].copy_from_slice(&t.devs[..n]);
+    n
+}
+
+#[doc(hidden)]
+pub fn __test_parse_dbg2_body(body: &[u8]) -> u32 {
+    let n = parse_dbg2_body(body);
+    DBG2_PARSED.store(true, Ordering::Release);
+    n
+}

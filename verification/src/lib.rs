@@ -3339,6 +3339,189 @@ fn smoke_acpi_nfit_synthetic_decode() -> TestResult {
 }
 kernel_test!(smoke_acpi_nfit_synthetic_decode);
 
+fn smoke_acpi_erst_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    use narf_acpi::ErstInstruction;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"ERST");
+    buf.extend_from_slice(&[0u8; 32]);
+    buf.extend_from_slice(&0u32.to_le_bytes());           // SerializationHdrSize
+    buf.extend_from_slice(&0u32.to_le_bytes());           // Reserved
+    buf.extend_from_slice(&1u32.to_le_bytes());           // InstructionEntryCount
+
+    // 32-byte instruction: action=2, instruction=5, addr=0xCAFE_F000,
+    // value=0xDEAD, mask=0xFFFF.
+    buf.push(2); buf.push(5); buf.push(0); buf.push(0);    // action / inst / flags / rsvd
+    buf.extend_from_slice(&[0u8; 4]);                      // GAS hdr
+    buf.extend_from_slice(&0xCAFE_F000u64.to_le_bytes());  // addr
+    buf.extend_from_slice(&0xDEADu64.to_le_bytes());       // value
+    buf.extend_from_slice(&0xFFFFu64.to_le_bytes());       // mask
+
+    let n = narf_acpi::__test_parse_erst_body(&buf);
+    if n != 1 {
+        return TestResult::Fail("expected 1 ERST instruction parsed");
+    }
+    let mut ins = [ErstInstruction::default(); 4];
+    let ni = narf_acpi::copy_erst_instructions(&mut ins);
+    if ni != 1
+        || ins[0].action != 2 || ins[0].instruction != 5
+        || ins[0].addr != 0xCAFE_F000
+        || ins[0].value != 0xDEAD || ins[0].mask != 0xFFFF
+    {
+        return TestResult::Fail("ERST instruction decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_erst_synthetic_decode);
+
+fn smoke_acpi_einj_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    use narf_acpi::EinjInstruction;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"EINJ");
+    buf.extend_from_slice(&[0u8; 32]);
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&1u32.to_le_bytes());
+
+    buf.push(7); buf.push(3); buf.push(0); buf.push(0);
+    buf.extend_from_slice(&[0u8; 4]);
+    buf.extend_from_slice(&0xBA5E_0000u64.to_le_bytes());
+    buf.extend_from_slice(&0x42u64.to_le_bytes());
+    buf.extend_from_slice(&0xFFu64.to_le_bytes());
+
+    let n = narf_acpi::__test_parse_einj_body(&buf);
+    if n != 1 {
+        return TestResult::Fail("expected 1 EINJ instruction parsed");
+    }
+    let mut ins = [EinjInstruction::default(); 4];
+    let ni = narf_acpi::copy_einj_instructions(&mut ins);
+    if ni != 1
+        || ins[0].action != 7 || ins[0].instruction != 3
+        || ins[0].addr != 0xBA5E_0000
+        || ins[0].value != 0x42 || ins[0].mask != 0xFF
+    {
+        return TestResult::Fail("EINJ instruction decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_einj_synthetic_decode);
+
+fn smoke_acpi_tpm2_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"TPM2");
+    buf.extend_from_slice(&[0u8; 32]);
+    buf.extend_from_slice(&1u16.to_le_bytes());            // platform class = Server
+    buf.extend_from_slice(&0u16.to_le_bytes());            // reserved
+    buf.extend_from_slice(&0xFED4_0000u64.to_le_bytes());  // control area
+    buf.extend_from_slice(&7u32.to_le_bytes());            // start method = CRB
+
+    narf_acpi::__test_parse_tpm2_body(&buf);
+    let info = narf_acpi::tpm2_info().expect("TPM2 not parsed");
+    if info.platform_class != 1
+        || info.control_area_addr != 0xFED4_0000
+        || info.start_method != 7
+    {
+        return TestResult::Fail("TPM2 decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_tpm2_synthetic_decode);
+
+fn smoke_acpi_bgrt_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"BGRT");
+    buf.extend_from_slice(&[0u8; 32]);
+    buf.extend_from_slice(&1u16.to_le_bytes());            // version
+    buf.push(0b101);                                       // status: displayed + 90°
+    buf.push(0);                                           // image type
+    buf.extend_from_slice(&0x1A00_0000u64.to_le_bytes());  // image addr
+    buf.extend_from_slice(&100u32.to_le_bytes());          // off_x
+    buf.extend_from_slice(&200u32.to_le_bytes());          // off_y
+
+    narf_acpi::__test_parse_bgrt_body(&buf);
+    let info = narf_acpi::bgrt_info().expect("BGRT not parsed");
+    if info.status != 0b101
+        || info.image_address != 0x1A00_0000
+        || info.offset_x != 100 || info.offset_y != 200
+    {
+        return TestResult::Fail("BGRT decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_bgrt_synthetic_decode);
+
+fn smoke_acpi_dbg2_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    use narf_acpi::Dbg2Device;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"DBG2");
+    buf.extend_from_slice(&[0u8; 32]);
+
+    // DBG2 header: InfoOffset (4) + InfoCount (4).
+    let info_off_pos = buf.len();
+    buf.extend_from_slice(&0u32.to_le_bytes());            // info offset (patched)
+    buf.extend_from_slice(&1u32.to_le_bytes());            // info count
+
+    let info_off = (buf.len() - SDT_HEADER_SIZE_DBG2) as u32 + SDT_HEADER_SIZE_DBG2 as u32;
+    let info_off_actual = buf.len() as u32;
+
+    // Device-info entry. Layout (offsets within entry):
+    //   0    Revision
+    //   1..3 Length
+    //   3    RegisterCount
+    //   4..6 NamespaceStringLength
+    //   6..8 NamespaceStringOffset
+    //   8..10 OemDataLength
+    //   10..12 OemDataOffset
+    //   12..14 PortType
+    //   14..16 PortSubtype
+    //   16..18 Reserved
+    //   18..20 BaseAddrRegOffset
+    //   20..22 AddressSizeOffset
+    //   ... GAS array starting at BaseAddrRegOffset ...
+    let entry_start = buf.len();
+    buf.push(0);                                           // revision
+    buf.extend_from_slice(&34u16.to_le_bytes());           // length
+    buf.push(1);                                           // reg count
+    buf.extend_from_slice(&0u16.to_le_bytes());            // ns len
+    buf.extend_from_slice(&0u16.to_le_bytes());            // ns off
+    buf.extend_from_slice(&0u16.to_le_bytes());            // oem len
+    buf.extend_from_slice(&0u16.to_le_bytes());            // oem off
+    buf.extend_from_slice(&0x8000u16.to_le_bytes());       // port_type = serial
+    buf.extend_from_slice(&0x0000u16.to_le_bytes());       // port_subtype = full 16550
+    buf.extend_from_slice(&0u16.to_le_bytes());            // reserved
+    buf.extend_from_slice(&22u16.to_le_bytes());           // base addr reg offset = 22
+    buf.extend_from_slice(&0u16.to_le_bytes());            // addr size offset
+    // GAS at offset 22 (relative to entry start): 4 bytes hdr + 8 bytes addr.
+    buf.extend_from_slice(&[0u8; 4]);                      // GAS hdr
+    buf.extend_from_slice(&0x3F8u64.to_le_bytes());        // GAS.Address = 16550 base
+
+    // Patch InfoOffset.
+    let info_off_val = (info_off_actual) as u32;
+    buf[info_off_pos..info_off_pos + 4].copy_from_slice(&info_off_val.to_le_bytes());
+    let _ = (entry_start, info_off);
+
+    let n = narf_acpi::__test_parse_dbg2_body(&buf);
+    if n != 1 {
+        return TestResult::Fail("expected 1 DBG2 device parsed");
+    }
+    let mut devs = [Dbg2Device::default(); 4];
+    let nd = narf_acpi::copy_dbg2_devices(&mut devs);
+    if nd != 1
+        || devs[0].port_type != 0x8000
+        || devs[0].port_subtype != 0x0000
+        || devs[0].base_addr != 0x3F8
+    {
+        return TestResult::Fail("DBG2 device decode mismatch");
+    }
+    TestResult::Pass
+}
+const SDT_HEADER_SIZE_DBG2: usize = 36;
+kernel_test!(smoke_acpi_dbg2_synthetic_decode);
+
 fn smoke_acpi_srat_synthetic_memory_entry() -> TestResult {
     // Type-1 memory affinity entry: base 0x1_0000_0000, length
     // 0x1000_0000, proximity 1, enabled.

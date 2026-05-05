@@ -735,6 +735,18 @@ Live from boot through `cargo xtask run`:
   Memory Window). BERT yields `BertInfo { region_addr,
   region_length }` for the boot-error region. Spec:
   `acpi/specification/tables-ras-cxl-locality.md`.
+- ACPI ERST / EINJ / TPM2 / BGRT / DBG2 (`narf_acpi`):
+  RAS-injection + serialization + TPM2 + boot-graphics +
+  debug-port parsers. ERST and EINJ share the 32-byte
+  instruction-entry shape and surface
+  `ErstInstruction` / `EinjInstruction` (action + instruction
+  + addr + value + mask). TPM2 yields `Tpm2Info` (platform
+  class, control area address, start method). BGRT yields
+  `BgrtInfo` (displayed-status, image address, x/y offsets).
+  DBG2 walks the per-table DeviceInfo array and yields
+  `Dbg2Device` (port type, subtype, MMIO base from the first
+  GAS in the BAR array). Spec:
+  `acpi/specification/tables-ras-tpm-debug.md`.
 - ACPI AEST / SDEI / WDDT / LPIT / NFIT (`narf_acpi`):
   Arm-RAS, software-delegated-exception, watchdog,
   low-power-idle, and NVDIMM table parsers. AEST yields
@@ -778,8 +790,8 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **635/0/29** smokes;
-`--arch=aarch64` passes **339/0/11**. Skips are x86-specific PCIe
+`cargo xtask test --arch=x86_64` passes **639/0/30** smokes;
+`--arch=aarch64` passes **344/0/11**. Skips are x86-specific PCIe
 surfaces or live-device tests that skip cleanly when QEMU doesn't
 expose the device. See `STATUS.md` for the full tally and per-
 subsystem breakdown.
