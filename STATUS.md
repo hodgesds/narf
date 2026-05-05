@@ -18,8 +18,8 @@ asks for. Updated when observable kernel behaviour changes.
   delivers hardware LAPIC-timer IRQs, exits cleanly.
 - `cargo xtask run --arch=aarch64` boots, runs the full async demo
   using CNTPCT_EL0 as the clock, exits via ARM semihosting.
-- `cargo xtask test --arch=x86_64` passes **618/0/29** (pass / fail / skip).
-- `cargo xtask test --arch=aarch64` passes **321/0/10** (pass / fail / skip).
+- `cargo xtask test --arch=x86_64` passes **620/0/29** (pass / fail / skip).
+- `cargo xtask test --arch=aarch64` passes **325/0/10** (pass / fail / skip).
   Skips are x86_64-specific PCIe surfaces or live-device tests that
   skip cleanly when QEMU doesn't expose the device.
 - In-tree PCIe drivers running against real QEMU-emulated devices.
@@ -132,6 +132,12 @@ asks for. Updated when observable kernel behaviour changes.
 | aarch64 ECV      | `ID_AA64MMFR0_EL1.ECV` (bits[63:60]) decode + `supported()` + `cntpoff_supported()` predicates. Spec: `arch/specification/cpu-mem-encrypt-virt.md` §3. |
 | aarch64 NV2      | `ID_AA64MMFR2_EL1.NV` (bits[27:24]) decode + `supported()` (FEAT_NV) / `nv2_supported()` (FEAT_NV2) predicates. Spec: `arch/specification/cpu-mem-encrypt-virt.md` §4. |
 | aarch64 E0PD     | `ID_AA64MMFR2_EL1.E0PD` (bits[63:60]) decode + `enable_kernel_half()` / `disable_kernel_half()` flipping `TCR_EL1.E0PD1`. Spec: `arch/specification/cpu-mem-encrypt-virt.md` §5. |
+| Intel SLD        | CPUID(7, 0).EDX[5] gate + `IA32_CORE_CAPABILITIES` (`0xCF`) bit 5 + `IA32_TEST_CTRL` (`0x33`) read/write + `enable_ac()` / `disable()` for split-lock-detect AC mode. Spec: `arch/specification/cpu-atomics-mitigations.md` §1. |
+| Intel BUS_LOCK   | CPUID(7, 0).ECX[24] gate + IA32_DEBUGCTL (`0x1D9`) bit 2 enable / disable. Spec: `arch/specification/cpu-atomics-mitigations.md` §2. |
+| aarch64 LSE / LSE128 | `ID_AA64ISAR0_EL1.Atomic` (bits[23:20]) decode + `lse_supported()` / `lse128_supported()` predicates. Spec: `arch/specification/cpu-atomics-mitigations.md` §3. |
+| aarch64 RCPC*    | `ID_AA64ISAR1_EL1.LRCPC` (bits[23:20]) decode + `rcpc_supported()` / `rcpc2_supported()` / `rcpc3_supported()`. Spec: `arch/specification/cpu-atomics-mitigations.md` §4. |
+| aarch64 PIE      | `ID_AA64MMFR3_EL1.S1PIE` + `S2PIE` decode → `PieCaps { s1pie, s2pie }` + PIR_EL1 (`S3_0_C10_C2_3`) / PIRE0_EL1 (`S3_0_C10_C2_2`) read+write helpers. Spec: `arch/specification/cpu-atomics-mitigations.md` §5. |
+| aarch64 SCTLR2   | `ID_AA64MMFR3_EL1.SCTLRX` decode + SCTLR2_EL1 (`S3_0_C1_C0_3`) read+write helpers. Spec: `arch/specification/cpu-atomics-mitigations.md` §6. |
 | iwlwifi          | Intel Wi-Fi 6 / 6E (AX200 / AX201 / AX210 / AX211). **Structural probe only** — PCI match table + spec doc. Operational register map (CSR/PRPH offsets, firmware loader, TFD/RBD descriptors, host-command opcodes) is not in any public Intel doc; further stages blocked on public register docs. See `drivers/net/specification/iwlwifi.md`. |
 | AHCI (ICH9/10)   | HBA bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT. |
 | xHCI USB host    | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT. |

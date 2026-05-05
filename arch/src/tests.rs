@@ -1308,3 +1308,65 @@ fn smoke_e0pd_caps() -> TestResult {
 }
 #[cfg(target_arch = "aarch64")]
 kernel_test_in!("arch/e0pd", smoke_e0pd_caps);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_sld_supported_path() -> TestResult {
+    use crate::x86_64::sld;
+    let _ = sld::cpuid_gate();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/sld", smoke_sld_supported_path);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_buslock_supported_path() -> TestResult {
+    use crate::x86_64::buslock;
+    let _ = buslock::supported();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/buslock", smoke_buslock_supported_path);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_lse_caps() -> TestResult {
+    use crate::aarch64::lse;
+    // The Atomic field is a 4-bit value; ARM keeps reserving
+    // higher values for newer LSE revisions, so we just check
+    // monotonicity instead of an architectural max.
+    if lse::lse128_supported() && !lse::lse_supported() {
+        return TestResult::Fail("LSE128 set without LSE");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/lse", smoke_lse_caps);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_rcpc_caps() -> TestResult {
+    use crate::aarch64::lse;
+    // Same monotonicity rationale as `smoke_lse_caps`.
+    if lse::rcpc3_supported() && !lse::rcpc2_supported() {
+        return TestResult::Fail("RCPC3 without RCPC2");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/lse", smoke_rcpc_caps);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_pie_caps() -> TestResult {
+    use crate::aarch64::pie;
+    let _ = pie::caps();
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/pie", smoke_pie_caps);
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_sctlr2_supported_path() -> TestResult {
+    use crate::aarch64::sctlr2;
+    let _ = sctlr2::supported();
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch/sctlr2", smoke_sctlr2_supported_path);
