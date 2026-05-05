@@ -52,6 +52,9 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use alloc::boxed::Box;
+use async_trait::async_trait;
+use narf_tpm::{TpmDevice, TpmInfo, TpmError as HighLevelTpmError};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -350,6 +353,70 @@ impl Tpm {
         let n = u16::from_be_bytes([resp[10], resp[11]]) as usize;
         if 12 + n > resp.len() { return Err(TpmError::BadResponse); }
         Ok(resp[12..12 + n].to_vec())
+    }
+}
+
+#[async_trait]
+impl TpmDevice for Tpm {
+    fn get_info(&self) -> TpmInfo {
+        TpmInfo {
+            manufacturer: 0, // Should be read from hardware
+            version: 2,
+            spec_level: 159,
+        }
+    }
+
+    async fn submit_raw(&self, cmd: &[u8]) -> Result<Vec<u8>, HighLevelTpmError> {
+        self.submit(cmd).map_err(|e| match e {
+            TpmError::NotPresent => HighLevelTpmError::NotPresent,
+            TpmError::LocalityTimeout => HighLevelTpmError::LocalityTimeout,
+            TpmError::BusyTimeout => HighLevelTpmError::BusyTimeout,
+            TpmError::NoCommandBuffer => HighLevelTpmError::NoCommandBuffer,
+            TpmError::BadResponse => HighLevelTpmError::BadResponse,
+        })
+    }
+
+    async fn get_random(&self, bytes: u16) -> Result<Vec<u8>, HighLevelTpmError> {
+        self.tpm2_get_random(bytes).map_err(|_| HighLevelTpmError::HardwareError)
+    }
+
+    async fn extend_pcr(&self, pcr: u32, digest: &[u8]) -> Result<(), HighLevelTpmError> {
+        // TPM2_CC_PCR_Extend: tag=0x8001, cc=0x00000182, pcrIndex=u32, auth=0, count=1, alg=SHA256, digest
+        let mut req = Vec::new();
+        req.extend_from_slice(&0x8001u16.to_be_bytes());
+        req.extend_from_slice(&(10 + 4 + 4 + 4 + 2 + 32u32).to_be_bytes()); // size
+        req.extend_from_slice(&0x0000_0182u32.to_be_bytes());
+        req.extend_from_slice(&pcr.to_be_bytes());
+        // authArea (empty session)
+        req.extend_from_slice(&0u32.to_be_bytes());
+        // digestCount = 1
+        req.extend_from_slice(&1u32.to_be_bytes());
+        // alg = SHA256 (0x000B)
+        req.extend_from_slice(&0x000Bu16.to_be_bytes());
+        req.extend_from_slice(digest);
+        
+        let _resp = self.submit_raw(&req).await?;
+        Ok(())
+    }
+
+    async fn read_pcr(&self, pcr: u32) -> Result<Vec<u8>, HighLevelTpmError> {
+        // TPM2_CC_PCR_Read: tag=0x8001, cc=0x0000017E
+        let mut req = Vec::new();
+        req.extend_from_slice(&0x8001u16.to_be_bytes());
+        req.extend_from_slice(&20u32.to_be_bytes()); // header + pcrSelection
+        req.extend_from_slice(&0x0000_017Eu32.to_be_bytes());
+        // pcrSelection: count=1, alg=SHA256, bitmask
+        req.extend_from_slice(&1u32.to_be_bytes());
+        req.extend_from_slice(&0x000Bu16.to_be_bytes()); // SHA256
+        req.push(3); // size of bitmask
+        let mut mask = [0u8; 3];
+        if pcr < 24 { mask[(pcr / 8) as usize] |= 1 << (pcr % 8); }
+        req.extend_from_slice(&mask);
+
+        let resp = self.submit_raw(&req).await?;
+        if resp.len() < 30 { return Err(HighLevelTpmError::BadResponse); }
+        // The PCR value is at the end of the response for a single PCR read.
+        Ok(resp[resp.len()-32..].to_vec())
     }
 }
 

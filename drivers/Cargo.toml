@@ -14,10 +14,12 @@ path = "src/lib.rs"
 [dependencies]
 narf-lib          = { path = "../lib" }
 narf-capabilities = { path = "../capabilities" }
+narf-tpm          = { path = "../tpm" }
 narf-memory       = { path = "../memory" }
 narf-arch         = { path = "../arch" }
 narf-scheduler    = { path = "../scheduler" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
+async-trait       = "0.1"
 
 [lints]
 workspace = true
