@@ -25,5 +25,8 @@ narf-io           = { path = "../io" }
 narf-drivers      = { path = "../drivers" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 
+[features]
+kernel-test = []
+
 [lints]
 workspace = true

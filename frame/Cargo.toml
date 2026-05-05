@@ -26,6 +26,8 @@ narf-bus           = { path = "../bus" }
 narf-drivers-nvme    = { path = "../drivers/nvme" }
 narf-drivers-virtio  = { path = "../drivers/virtio" }
 narf-drivers-net     = { path = "../drivers/net" }
+narf-drivers-wireless = { path = "../drivers/wireless" }
+narf-drivers-i3c      = { path = "../drivers/i3c" }
 narf-drivers         = { path = "../drivers" }
 narf-drivers-storage = { path = "../drivers/storage" }
 narf-drivers-usb     = { path = "../drivers/usb" }
@@ -57,7 +59,16 @@ narf-verification  = { path = "../verification", optional = true }
 idt-selftest = []
 # Run the narf-verification kernel-test harness instead of the async demo.
 # Used by `cargo xtask test` — exits 0 if all tests pass, non-zero otherwise.
-kernel-test  = ["dep:narf-verification"]
+kernel-test  = [
+    "dep:narf-verification",
+    "narf-audio/kernel-test",
+    "narf-wireless/kernel-test",
+    "narf-drivers-wireless/kernel-test",
+    "narf-accel/kernel-test",
+    "narf-tpm/kernel-test",
+    "narf-i3c/kernel-test",
+    "narf-drivers-i3c/kernel-test",
+]
 # Chain into verification's opt-in user-mode smoke tests (round-trip,
 # yield_resume, poll_yield_exit, future yield_exit). These pass the
 # kernel through to subsequent tests without exiting.

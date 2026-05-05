@@ -464,6 +464,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-net",
+ "narf-scheduler",
 ]
 
 [[package]]
@@ -646,6 +647,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-drivers-i3c"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-drivers",
+ "narf-i3c",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-scheduler",
+]
+
+[[package]]
 name = "narf-drivers-net"
 version = "0.0.0"
 dependencies = [
@@ -762,9 +779,13 @@ dependencies = [
  "narf-drivers",
  "narf-interrupts",
  "narf-io",
+ "narf-ipc",
+ "narf-kernel-test",
  "narf-lib",
  "narf-memory",
  "narf-net",
+ "narf-scheduler",
+ "narf-time",
  "narf-wireless",
 ]
 
@@ -856,12 +877,14 @@ dependencies = [
  "narf-console",
  "narf-drivers",
  "narf-drivers-gpu",
+ "narf-drivers-i3c",
  "narf-drivers-net",
  "narf-drivers-nvme",
  "narf-drivers-platform",
  "narf-drivers-storage",
  "narf-drivers-usb",
  "narf-drivers-virtio",
+ "narf-drivers-wireless",
  "narf-fb",
  "narf-firmware",
  "narf-firmware-fdt",
@@ -919,6 +942,7 @@ dependencies = [
  "narf-io",
  "narf-kernel-test",
  "narf-lib",
+ "narf-scheduler",
 ]
 
 [[package]]
@@ -1113,6 +1137,7 @@ dependencies = [
  "narf-crypto",
  "narf-kernel-test",
  "narf-lib",
+ "narf-scheduler",
 ]
 
 [[package]]
@@ -1213,6 +1238,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-net",
+ "narf-scheduler",
 ]
 
 [[package]]
