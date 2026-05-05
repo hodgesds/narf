@@ -5356,3 +5356,443 @@ pub fn __test_parse_agdi_body(body: &[u8]) {
     parse_agdi_body(body);
     AGDI_PARSED.store(true, Ordering::Release);
 }
+
+// ───────────────────────────────────────────────────────────────────
+// BOOT — Simple Boot Flag Table.
+// Spec: `acpi/specification/tables-boot-dbgp-wpbt-msct-xenv.md` §1.
+// ───────────────────────────────────────────────────────────────────
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct BootInfo {
+    pub cmos_index: u8,
+}
+
+static BOOT_DATA: IrqSafeSpinLock<BootInfo> =
+    IrqSafeSpinLock::new(BootInfo { cmos_index: 0 });
+static BOOT_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_boot_body(body: &[u8]) {
+    if body.len() < SDT_HEADER_SIZE + 4 { return; }
+    *BOOT_DATA.lock() = BootInfo {
+        cmos_index: body[SDT_HEADER_SIZE],
+    };
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → BOOT must also be identity-mapped.
+pub unsafe fn parse_boot(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut boot: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"BOOT" && boot.is_none() {
+                boot = Some(phys);
+            }
+        })?;
+    }
+    let boot = boot.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (boot as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 4 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(boot as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    parse_boot_body(body);
+    BOOT_PARSED.store(true, Ordering::Release);
+    Ok(())
+}
+
+pub fn boot_info() -> Option<BootInfo> {
+    if !BOOT_PARSED.load(Ordering::Acquire) { return None; }
+    Some(*BOOT_DATA.lock())
+}
+
+#[doc(hidden)]
+pub fn __test_parse_boot_body(body: &[u8]) {
+    parse_boot_body(body);
+    BOOT_PARSED.store(true, Ordering::Release);
+}
+
+// ───────────────────────────────────────────────────────────────────
+// DBGP — Debug Port Table (legacy single-port).
+// Spec: `acpi/specification/tables-boot-dbgp-wpbt-msct-xenv.md` §2.
+// ───────────────────────────────────────────────────────────────────
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct DbgpInfo {
+    pub iface:         u8,
+    pub addr_space_id: u8,
+    pub base:          u64,
+}
+
+static DBGP_DATA: IrqSafeSpinLock<DbgpInfo> = IrqSafeSpinLock::new(DbgpInfo {
+    iface: 0, addr_space_id: 0, base: 0,
+});
+static DBGP_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_dbgp_body(body: &[u8]) {
+    // Body offsets: iface (1) + reserved (3) + GAS (12).
+    if body.len() < SDT_HEADER_SIZE + 16 { return; }
+    let off = SDT_HEADER_SIZE;
+    let iface = body[off];
+    let addr_space_id = body[off + 4];
+    let base = u64::from_le_bytes([
+        body[off + 8],  body[off + 9],
+        body[off + 10], body[off + 11],
+        body[off + 12], body[off + 13],
+        body[off + 14], body[off + 15],
+    ]);
+    *DBGP_DATA.lock() = DbgpInfo { iface, addr_space_id, base };
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → DBGP must also be identity-mapped.
+pub unsafe fn parse_dbgp(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut dbgp: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"DBGP" && dbgp.is_none() {
+                dbgp = Some(phys);
+            }
+        })?;
+    }
+    let dbgp = dbgp.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (dbgp as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 16 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(dbgp as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    parse_dbgp_body(body);
+    DBGP_PARSED.store(true, Ordering::Release);
+    Ok(())
+}
+
+pub fn dbgp_info() -> Option<DbgpInfo> {
+    if !DBGP_PARSED.load(Ordering::Acquire) { return None; }
+    Some(*DBGP_DATA.lock())
+}
+
+#[doc(hidden)]
+pub fn __test_parse_dbgp_body(body: &[u8]) {
+    parse_dbgp_body(body);
+    DBGP_PARSED.store(true, Ordering::Release);
+}
+
+// ───────────────────────────────────────────────────────────────────
+// WPBT — Windows Platform Binary Table.
+// Spec: `acpi/specification/tables-boot-dbgp-wpbt-msct-xenv.md` §3.
+// ───────────────────────────────────────────────────────────────────
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct WpbtInfo {
+    pub handoff_size: u32,
+    pub handoff_addr: u64,
+    pub layout_type:  u8,
+    pub content_type: u8,
+}
+
+static WPBT_DATA: IrqSafeSpinLock<WpbtInfo> = IrqSafeSpinLock::new(WpbtInfo {
+    handoff_size: 0, handoff_addr: 0, layout_type: 0, content_type: 0,
+});
+static WPBT_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_wpbt_body(body: &[u8]) {
+    // Body offsets: HandoffSize (4) + HandoffAddr (8) + LayoutType (1) +
+    //               ContentType (1) + ArgumentLength (2) + Argument (var).
+    if body.len() < SDT_HEADER_SIZE + 16 { return; }
+    let off = SDT_HEADER_SIZE;
+    let handoff_size = u32::from_le_bytes([
+        body[off],     body[off + 1], body[off + 2], body[off + 3],
+    ]);
+    let handoff_addr = u64::from_le_bytes([
+        body[off + 4],  body[off + 5],
+        body[off + 6],  body[off + 7],
+        body[off + 8],  body[off + 9],
+        body[off + 10], body[off + 11],
+    ]);
+    let layout_type = body[off + 12];
+    let content_type = body[off + 13];
+    *WPBT_DATA.lock() = WpbtInfo {
+        handoff_size, handoff_addr, layout_type, content_type,
+    };
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → WPBT must also be identity-mapped.
+pub unsafe fn parse_wpbt(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut wpbt: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"WPBT" && wpbt.is_none() {
+                wpbt = Some(phys);
+            }
+        })?;
+    }
+    let wpbt = wpbt.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (wpbt as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 16 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(wpbt as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    parse_wpbt_body(body);
+    WPBT_PARSED.store(true, Ordering::Release);
+    Ok(())
+}
+
+pub fn wpbt_info() -> Option<WpbtInfo> {
+    if !WPBT_PARSED.load(Ordering::Acquire) { return None; }
+    Some(*WPBT_DATA.lock())
+}
+
+#[doc(hidden)]
+pub fn __test_parse_wpbt_body(body: &[u8]) {
+    parse_wpbt_body(body);
+    WPBT_PARSED.store(true, Ordering::Release);
+}
+
+// ───────────────────────────────────────────────────────────────────
+// MSCT — Maximum System Characteristics Table.
+// Spec: `acpi/specification/tables-boot-dbgp-wpbt-msct-xenv.md` §4.
+// ───────────────────────────────────────────────────────────────────
+
+pub const MAX_MSCT_PDIS: usize = 16;
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct MsctInfo {
+    pub max_proximity_domains: u32,
+    pub max_clock_domains:     u32,
+    pub max_phys_addr_cap:     u64,
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct MsctPdis {
+    pub low_domain:            u16,
+    pub high_domain:           u16,
+    pub max_processor_capacity:u32,
+    pub max_memory_capacity:   u64,
+}
+
+struct MsctTables {
+    info:     MsctInfo,
+    pdis:     [MsctPdis; MAX_MSCT_PDIS],
+    n_pdis:   usize,
+}
+
+impl MsctTables {
+    const EMPTY: Self = Self {
+        info:     MsctInfo {
+                      max_proximity_domains: 0,
+                      max_clock_domains:     0,
+                      max_phys_addr_cap:     0,
+                  },
+        pdis:     [MsctPdis {
+                      low_domain: 0, high_domain: 0,
+                      max_processor_capacity: 0, max_memory_capacity: 0
+                  }; MAX_MSCT_PDIS],
+        n_pdis:   0,
+    };
+}
+
+static MSCT_DATA:   IrqSafeSpinLock<MsctTables> = IrqSafeSpinLock::new(MsctTables::EMPTY);
+static MSCT_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_msct_body(body: &[u8]) -> u32 {
+    let mut tables = MSCT_DATA.lock();
+    *tables = MsctTables::EMPTY;
+    // Header: ProximityDomainOffset (4) + MaxProximityDomains (4) +
+    //         MaxClockDomains (4) + MaxPhysAddrCap (8) = 20 bytes.
+    if body.len() < SDT_HEADER_SIZE + 20 { return 0; }
+    let off = SDT_HEADER_SIZE;
+    let pd_off = u32::from_le_bytes([
+        body[off], body[off + 1], body[off + 2], body[off + 3],
+    ]) as usize;
+    tables.info.max_proximity_domains = u32::from_le_bytes([
+        body[off + 4], body[off + 5], body[off + 6], body[off + 7],
+    ]);
+    tables.info.max_clock_domains = u32::from_le_bytes([
+        body[off + 8], body[off + 9], body[off + 10], body[off + 11],
+    ]);
+    tables.info.max_phys_addr_cap = u64::from_le_bytes([
+        body[off + 12], body[off + 13],
+        body[off + 14], body[off + 15],
+        body[off + 16], body[off + 17],
+        body[off + 18], body[off + 19],
+    ]);
+
+    let mut cur = pd_off;
+    let mut count = 0u32;
+    while cur + 18 <= body.len() {
+        let _rev = body[cur];
+        let len = body[cur + 1] as usize;
+        if len < 18 || cur + len > body.len() { break; }
+        let entry = &body[cur..cur + len];
+        let low_domain = u16::from_le_bytes([entry[2], entry[3]]);
+        let high_domain = u16::from_le_bytes([entry[4], entry[5]]);
+        let max_processor_capacity = u32::from_le_bytes([
+            entry[6], entry[7], entry[8], entry[9],
+        ]);
+        let max_memory_capacity = u64::from_le_bytes([
+            entry[10], entry[11], entry[12], entry[13],
+            entry[14], entry[15], entry[16], entry[17],
+        ]);
+        if tables.n_pdis < MAX_MSCT_PDIS {
+            let i = tables.n_pdis;
+            tables.pdis[i] = MsctPdis {
+                low_domain, high_domain,
+                max_processor_capacity, max_memory_capacity,
+            };
+            tables.n_pdis = i + 1;
+            count += 1;
+        }
+        cur += len;
+    }
+    count
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → MSCT must also be identity-mapped.
+pub unsafe fn parse_msct(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut msct: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"MSCT" && msct.is_none() {
+                msct = Some(phys);
+            }
+        })?;
+    }
+    let msct = msct.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (msct as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 20 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(msct as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    let n = parse_msct_body(body);
+    MSCT_PARSED.store(true, Ordering::Release);
+    Ok(n)
+}
+
+pub fn is_msct_known() -> bool { MSCT_PARSED.load(Ordering::Acquire) }
+
+pub fn msct_info() -> Option<MsctInfo> {
+    if !is_msct_known() { return None; }
+    Some(MSCT_DATA.lock().info)
+}
+
+pub fn copy_msct_pdis(out: &mut [MsctPdis]) -> usize {
+    let t = MSCT_DATA.lock();
+    let n = t.n_pdis.min(out.len());
+    out[..n].copy_from_slice(&t.pdis[..n]);
+    n
+}
+
+#[doc(hidden)]
+pub fn __test_parse_msct_body(body: &[u8]) -> u32 {
+    let n = parse_msct_body(body);
+    MSCT_PARSED.store(true, Ordering::Release);
+    n
+}
+
+// ───────────────────────────────────────────────────────────────────
+// XENV — Xen Environment Table.
+// Spec: `acpi/specification/tables-boot-dbgp-wpbt-msct-xenv.md` §5.
+// ───────────────────────────────────────────────────────────────────
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct XenvInfo {
+    pub grant_table_base: u64,
+    pub grant_table_size: u64,
+    pub event_vector:     u32,
+}
+
+static XENV_DATA: IrqSafeSpinLock<XenvInfo> = IrqSafeSpinLock::new(XenvInfo {
+    grant_table_base: 0, grant_table_size: 0, event_vector: 0,
+});
+static XENV_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_xenv_body(body: &[u8]) {
+    if body.len() < SDT_HEADER_SIZE + 24 { return; }
+    let off = SDT_HEADER_SIZE;
+    let grant_table_base = u64::from_le_bytes([
+        body[off],     body[off + 1], body[off + 2], body[off + 3],
+        body[off + 4], body[off + 5], body[off + 6], body[off + 7],
+    ]);
+    let grant_table_size = u64::from_le_bytes([
+        body[off + 8],  body[off + 9],
+        body[off + 10], body[off + 11],
+        body[off + 12], body[off + 13],
+        body[off + 14], body[off + 15],
+    ]);
+    let event_vector = u32::from_le_bytes([
+        body[off + 16], body[off + 17],
+        body[off + 18], body[off + 19],
+    ]);
+    *XENV_DATA.lock() = XenvInfo {
+        grant_table_base, grant_table_size, event_vector,
+    };
+}
+
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → XENV must also be identity-mapped.
+pub unsafe fn parse_xenv(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut xenv: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"XENV" && xenv.is_none() {
+                xenv = Some(phys);
+            }
+        })?;
+    }
+    let xenv = xenv.ok_or(AcpiError::NoSrat)?;
+    // SAFETY: caller assertion.
+    let total = unsafe {
+        (xenv as *const SdtHeader).read_unaligned().length as usize
+    };
+    if total < SDT_HEADER_SIZE + 24 { return Err(AcpiError::BadXsdtSignature); }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(xenv as *const u8, total) };
+    if checksum(body) != 0 { return Err(AcpiError::BadTableChecksum); }
+    parse_xenv_body(body);
+    XENV_PARSED.store(true, Ordering::Release);
+    Ok(())
+}
+
+pub fn xenv_info() -> Option<XenvInfo> {
+    if !XENV_PARSED.load(Ordering::Acquire) { return None; }
+    Some(*XENV_DATA.lock())
+}
+
+#[doc(hidden)]
+pub fn __test_parse_xenv_body(body: &[u8]) {
+    parse_xenv_body(body);
+    XENV_PARSED.store(true, Ordering::Release);
+}

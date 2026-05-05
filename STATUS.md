@@ -18,8 +18,8 @@ asks for. Updated when observable kernel behaviour changes.
   delivers hardware LAPIC-timer IRQs, exits cleanly.
 - `cargo xtask run --arch=aarch64` boots, runs the full async demo
   using CNTPCT_EL0 as the clock, exits via ARM semihosting.
-- `cargo xtask test --arch=x86_64` passes **653/0/31** (pass / fail / skip).
-- `cargo xtask test --arch=aarch64` passes **359/0/11** (pass / fail / skip).
+- `cargo xtask test --arch=x86_64` passes **659/0/30** (pass / fail / skip).
+- `cargo xtask test --arch=aarch64` passes **364/0/11** (pass / fail / skip).
   Skips are x86_64-specific PCIe surfaces or live-device tests that
   skip cleanly when QEMU doesn't expose the device.
 - In-tree PCIe drivers running against real QEMU-emulated devices.
@@ -173,6 +173,11 @@ asks for. Updated when observable kernel behaviour changes.
 | ACPI IBFT        | iSCSI Boot Firmware Table — Type 4 (Target) → `IbftTarget { ip[16], port, lun }`. Spec: `acpi/specification/tables-ec-audio-iscsi-csrt-agdi.md` §3. |
 | ACPI CSRT        | Core System Resource Table — per-Resource-Group decode → `CsrtGroup { vendor_id, device_id, revision }`. Spec: `acpi/specification/tables-ec-audio-iscsi-csrt-agdi.md` §4. |
 | ACPI AGDI        | Arm Generic Diagnostic Dump and Reset Interface — `AgdiInfo { use_smc, sdei_event_number, smc_id }`. Spec: `acpi/specification/tables-ec-audio-iscsi-csrt-agdi.md` §5. |
+| ACPI BOOT        | Simple Boot Flag — `BootInfo { cmos_index }`. Spec: `acpi/specification/tables-boot-dbgp-wpbt-msct-xenv.md` §1. |
+| ACPI DBGP        | Debug Port (legacy single-port sibling of DBG2) — `DbgpInfo { iface, addr_space_id, base }`. Spec: `acpi/specification/tables-boot-dbgp-wpbt-msct-xenv.md` §2. |
+| ACPI WPBT        | Windows Platform Binary Table — `WpbtInfo { handoff_size, handoff_addr, layout_type, content_type }`. Spec: `acpi/specification/tables-boot-dbgp-wpbt-msct-xenv.md` §3. |
+| ACPI MSCT        | Maximum System Characteristics — `MsctInfo { max_proximity_domains, max_clock_domains, max_phys_addr_cap }` + per-PDIS `MsctPdis { low_domain, high_domain, max_processor_capacity, max_memory_capacity }`. Spec: `acpi/specification/tables-boot-dbgp-wpbt-msct-xenv.md` §4. |
+| ACPI XENV        | Xen Environment — `XenvInfo { grant_table_base, grant_table_size, event_vector }`. Spec: `acpi/specification/tables-boot-dbgp-wpbt-msct-xenv.md` §5. |
 | iwlwifi          | Intel Wi-Fi 6 / 6E (AX200 / AX201 / AX210 / AX211). **Structural probe only** — PCI match table + spec doc. Operational register map (CSR/PRPH offsets, firmware loader, TFD/RBD descriptors, host-command opcodes) is not in any public Intel doc; further stages blocked on public register docs. See `drivers/net/specification/iwlwifi.md`. |
 | AHCI (ICH9/10)   | HBA bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT. |
 | xHCI USB host    | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT. |

@@ -3969,6 +3969,137 @@ fn smoke_acpi_agdi_synthetic_decode() -> TestResult {
 }
 kernel_test!(smoke_acpi_agdi_synthetic_decode);
 
+fn smoke_acpi_boot_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"BOOT");
+    buf.extend_from_slice(&[0u8; 32]);
+    buf.push(0x42);
+    buf.extend_from_slice(&[0u8; 3]);
+
+    narf_acpi::__test_parse_boot_body(&buf);
+    let info = narf_acpi::boot_info().expect("BOOT not parsed");
+    if info.cmos_index != 0x42 {
+        return TestResult::Fail("BOOT decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_boot_synthetic_decode);
+
+fn smoke_acpi_dbgp_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"DBGP");
+    buf.extend_from_slice(&[0u8; 32]);
+    buf.push(0x00);                                       // iface = full 16550
+    buf.extend_from_slice(&[0u8; 3]);                     // reserved
+    // GAS: AddressSpaceId @ 0, Address @ 4..12.
+    buf.push(1);                                          // SystemIO
+    buf.extend_from_slice(&[0u8; 3]);
+    buf.extend_from_slice(&0x3F8u64.to_le_bytes());
+
+    narf_acpi::__test_parse_dbgp_body(&buf);
+    let info = narf_acpi::dbgp_info().expect("DBGP not parsed");
+    if info.iface != 0 || info.addr_space_id != 1 || info.base != 0x3F8 {
+        return TestResult::Fail("DBGP decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_dbgp_synthetic_decode);
+
+fn smoke_acpi_wpbt_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"WPBT");
+    buf.extend_from_slice(&[0u8; 32]);
+    buf.extend_from_slice(&0x1234u32.to_le_bytes());      // size
+    buf.extend_from_slice(&0xCAFE_F0000000u64.to_le_bytes()); // addr
+    buf.push(1);                                          // layout = native EXE
+    buf.push(0);                                          // content type
+    buf.extend_from_slice(&0u16.to_le_bytes());           // arg length
+
+    narf_acpi::__test_parse_wpbt_body(&buf);
+    let info = narf_acpi::wpbt_info().expect("WPBT not parsed");
+    if info.handoff_size != 0x1234
+        || info.handoff_addr != 0xCAFE_F0000000
+        || info.layout_type != 1
+    {
+        return TestResult::Fail("WPBT decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_wpbt_synthetic_decode);
+
+fn smoke_acpi_msct_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    use narf_acpi::MsctPdis;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"MSCT");
+    buf.extend_from_slice(&[0u8; 32]);
+    let pd_off_pos = buf.len();
+    buf.extend_from_slice(&0u32.to_le_bytes());            // ProximityDomainOffset (patched)
+    buf.extend_from_slice(&3u32.to_le_bytes());            // MaxProximityDomains
+    buf.extend_from_slice(&1u32.to_le_bytes());            // MaxClockDomains
+    buf.extend_from_slice(&0x1_0000_0000_0000u64.to_le_bytes()); // MaxPhysAddrCap
+
+    let pd_off = buf.len() as u32;
+
+    // PDIS: Revision (1) + Length (1) + LowDomain (2) + HighDomain (2) +
+    //       MaxProcessorCapacity (4) + MaxMemoryCapacity (8) = 18 bytes.
+    buf.push(0);
+    buf.push(18);
+    buf.extend_from_slice(&0u16.to_le_bytes());            // low
+    buf.extend_from_slice(&3u16.to_le_bytes());            // high
+    buf.extend_from_slice(&64u32.to_le_bytes());           // max procs
+    buf.extend_from_slice(&0x10_0000_0000u64.to_le_bytes()); // max mem
+
+    buf[pd_off_pos..pd_off_pos + 4].copy_from_slice(&pd_off.to_le_bytes());
+
+    let n = narf_acpi::__test_parse_msct_body(&buf);
+    if n != 1 {
+        return TestResult::Fail("expected 1 MSCT PDIS parsed");
+    }
+    let info = narf_acpi::msct_info().expect("MSCT not parsed");
+    if info.max_proximity_domains != 3 || info.max_clock_domains != 1 {
+        return TestResult::Fail("MSCT header decode mismatch");
+    }
+    let mut pdis = [MsctPdis::default(); 4];
+    let np = narf_acpi::copy_msct_pdis(&mut pdis);
+    if np != 1
+        || pdis[0].low_domain != 0
+        || pdis[0].high_domain != 3
+        || pdis[0].max_processor_capacity != 64
+        || pdis[0].max_memory_capacity != 0x10_0000_0000
+    {
+        return TestResult::Fail("MSCT PDIS decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_msct_synthetic_decode);
+
+fn smoke_acpi_xenv_synthetic_decode() -> TestResult {
+    use alloc::vec::Vec;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"XENV");
+    buf.extend_from_slice(&[0u8; 32]);
+    buf.extend_from_slice(&0xDEAD_0000u64.to_le_bytes()); // grant table base
+    buf.extend_from_slice(&0x1000u64.to_le_bytes());      // grant table size
+    buf.extend_from_slice(&33u32.to_le_bytes());          // event vector
+    buf.push(0); buf.push(0);                             // polarity / mode
+    buf.extend_from_slice(&0u16.to_le_bytes());           // reserved
+
+    narf_acpi::__test_parse_xenv_body(&buf);
+    let info = narf_acpi::xenv_info().expect("XENV not parsed");
+    if info.grant_table_base != 0xDEAD_0000
+        || info.grant_table_size != 0x1000
+        || info.event_vector != 33
+    {
+        return TestResult::Fail("XENV decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test!(smoke_acpi_xenv_synthetic_decode);
+
 fn smoke_acpi_srat_synthetic_memory_entry() -> TestResult {
     // Type-1 memory affinity entry: base 0x1_0000_0000, length
     // 0x1000_0000, proximity 1, enabled.

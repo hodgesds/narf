@@ -735,6 +735,18 @@ Live from boot through `cargo xtask run`:
   Memory Window). BERT yields `BertInfo { region_addr,
   region_length }` for the boot-error region. Spec:
   `acpi/specification/tables-ras-cxl-locality.md`.
+- ACPI BOOT / DBGP / WPBT / MSCT / XENV (`narf_acpi`):
+  boot-flag + legacy-debug-port + Windows-platform-binary +
+  max-system-characteristics + Xen-environment parsers. BOOT
+  yields `BootInfo` (CMOS index for boot flag). DBGP yields
+  `DbgpInfo` (interface, GAS base) — the legacy single-port
+  sibling of DBG2. WPBT yields `WpbtInfo` (handoff size +
+  address, layout / content types) for the Windows platform-
+  binary handoff. MSCT yields `MsctInfo` (max proximity / clock
+  domains, max phys-addr cap) + per-PDIS `MsctPdis` (domain
+  range, max processors, max memory). XENV yields `XenvInfo`
+  (Xen grant-table base + size, event-channel SPI). Spec:
+  `acpi/specification/tables-boot-dbgp-wpbt-msct-xenv.md`.
 - ACPI ECDT / NHLT / IBFT / CSRT / AGDI (`narf_acpi`):
   embedded-controller, audio-link, iSCSI-boot, generic-resource,
   Arm-diagnostic parsers. ECDT yields `EcdtInfo` (control GAS,
@@ -826,8 +838,8 @@ interop with QEMU's user-mode net backend.
   filesystem skeleton (devfs + memfs), syscall surface (~230
   syscalls), tracing/observability/PMU sampling probes.
 
-`cargo xtask test --arch=x86_64` passes **653/0/31** smokes;
-`--arch=aarch64` passes **359/0/11**. Skips are x86-specific PCIe
+`cargo xtask test --arch=x86_64` passes **659/0/30** smokes;
+`--arch=aarch64` passes **364/0/11**. Skips are x86-specific PCIe
 surfaces or live-device tests that skip cleanly when QEMU doesn't
 expose the device. See `STATUS.md` for the full tally and per-
 subsystem breakdown.
