@@ -35,6 +35,7 @@ pub mod hda;
 pub mod acp6;
 
 mod hda_tests;
+mod tests;
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 

@@ -125,3 +125,51 @@ fn smoke_acp6_pci_match_registered() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("audio/acp6", smoke_acp6_pci_match_registered);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_hda_writer_submit_round_trip() -> TestResult {
+    // End-to-end PCM submit through AudioWriter → hda. Probes
+    // the device, opens an AudioWriter at the default playback
+    // format (S16LE / 48 kHz / stereo), and submits 1024 bytes.
+    use crate::{
+        bootstrap_writer, AudioFormat, AudioWriter, hda,
+    };
+    use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
+    use narf_bus::driver_match::__reset_for_test as bus_reset;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let has = devs.iter().any(|d|
+        matches!(&d.kind, BusKind::Pcie { .. })
+        && d.id.vendor == hda::HDA_INTEL_ICH9_VENDOR
+        && d.id.device == hda::HDA_INTEL_ICH9_DEVICE);
+    if !has { return TestResult::Skip("no intel-hda (ICH9)"); }
+
+    hda::__reset_for_test();
+    bus_reset();
+    hda::register_pci_driver();
+    let authority = bootstrap_registry_authority();
+    if probe_all_pci(&authority).is_err() {
+        return TestResult::Fail("probe_all_pci");
+    }
+
+    let cap = bootstrap_writer();
+    let writer = match AudioWriter::open(cap, AudioFormat::default_playback()) {
+        Ok(w)  => w,
+        Err(_) => return TestResult::Fail("AudioWriter::open"),
+    };
+
+    // 1024 bytes = 256 stereo S16 frames = ~5.3 ms @ 48 kHz.
+    let silence = [0u8; 1024];
+    let frames = match writer.submit(&silence) {
+        Ok(f)  => f,
+        Err(_) => return TestResult::Fail("submit returned error"),
+    };
+    if frames != 256 {
+        return TestResult::Fail("submit returned wrong frame count");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("audio/hda", smoke_hda_writer_submit_round_trip);
