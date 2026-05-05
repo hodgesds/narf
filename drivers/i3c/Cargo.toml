@@ -1,0 +1,22 @@
+[package]
+name = "narf-drivers-i3c"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+narf-lib          = { path = "../../lib" }
+narf-capabilities = { path = "../../capabilities" }
+narf-io           = { path = "../../io" }
+narf-i3c          = { path = "../../i3c" }
+narf-bus          = { path = "../../bus" }
+narf-drivers      = { path = "../" }
+narf-scheduler    = { path = "../../scheduler" }
+async-trait = "0.1"
+futures = { version = "0.3", default-features = false }
+narf-kernel-test = { path = "../../verification/kernel-test" }
+
+[features]
+kernel-test = []
+
+[lints]
+workspace = true
