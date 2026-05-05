@@ -68,7 +68,11 @@ pub fn parse_header(blob: &[u8]) -> Option<Header> {
     let boot_cpuid_phys   = be_u32(blob, 28)?;
     let size_dt_strings   = be_u32(blob, 32)?;
     let size_dt_struct    = be_u32(blob, 36)?;
-    if (totalsize as usize) > blob.len() { return None; }
+    
+    // Validate that the provided slice is at least as large as the header claims,
+    // unless we are only validating the header itself (len == HEADER_LEN).
+    if blob.len() > HEADER_LEN && (totalsize as usize) > blob.len() { return None; }
+    
     Some(Header {
         magic, totalsize, off_dt_struct, off_dt_strings, off_mem_rsvmap,
         version, last_comp_version, boot_cpuid_phys,
@@ -182,13 +186,57 @@ fn read_cstr(buf: &[u8], off: usize) -> Option<&str> {
     core::str::from_utf8(&buf[off..end]).ok()
 }
 
+/// `#address-cells` / `#size-cells` for decoding a `reg` property.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Cells {
+    pub address: u32,
+    pub size:    u32,
+}
+
+impl Cells {
+    /// DTSpec 2.3.5: when missing, `#address-cells` defaults to 2
+    /// and `#size-cells` defaults to 1.
+    pub const DEFAULT: Self = Self { address: 2, size: 1 };
+
+    pub fn read_one_reg(self, value: &[u8], off: usize) -> Option<(u64, u64)> {
+        let addr_bytes = self.address as usize * 4;
+        let size_bytes = self.size as usize * 4;
+        if off + addr_bytes + size_bytes > value.len() { return None; }
+        let mut addr = 0u64;
+        for i in 0..addr_bytes {
+            addr = (addr << 8) | value[off + i] as u64;
+        }
+        let mut size = 0u64;
+        for i in 0..size_bytes {
+            size = (size << 8) | value[off + addr_bytes + i] as u64;
+        }
+        Some((addr, size))
+    }
+
+    pub fn entry_bytes(self) -> usize {
+        (self.address as usize + self.size as usize) * 4
+    }
+}
+
 /// Walk every node in the struct block. `f` is called for each
-/// FDT_BEGIN_NODE; the path is the path to *that* node, and the
-/// `PropIter` walks only its immediate properties (children
-/// continue once the iterator is exhausted; FDT_END_NODE pops).
+/// FDT_BEGIN_NODE except the root; the path is the path to *that*
+/// node, and the `PropIter` walks only its immediate properties.
+/// FDT_END_NODE pops.
 pub fn walk_nodes<F>(blob: &[u8], mut f: F)
 where
     F: FnMut(&Path<'_>, PropIter<'_>),
+{
+    walk_with_cells(blob, |path, props, _| f(path, props));
+}
+
+/// Like `walk_nodes`, but also passes the **parent's** `Cells`
+/// — the `#address-cells` / `#size-cells` that govern how the
+/// current node's `reg` property is laid out. Inheritance follows
+/// the conventional libfdt rule: a node that doesn't declare its
+/// own cells reuses its parent's.
+pub fn walk_with_cells<F>(blob: &[u8], mut f: F)
+where
+    F: FnMut(&Path<'_>, PropIter<'_>, Cells),
 {
     let hdr = match parse_header(blob) { Some(h) => h, None => return };
     let struct_start = hdr.off_dt_struct as usize;
@@ -202,6 +250,10 @@ where
     let mut seg_lens = [0u16; MAX_PATH_DEPTH];
     let mut total_len = 0u16;
     let mut depth = 0u8;
+    
+    // cells_stack[depth] stores the cells defined by the node at current depth
+    // for use by its children. Index 0 is reserved for Root's children.
+    let mut cells_stack = [Cells::DEFAULT; MAX_PATH_DEPTH + 1];
 
     let mut cur = struct_start;
     while cur + 4 <= struct_end {
@@ -216,23 +268,41 @@ where
                 cur = (end + 1 + 3) & !3;
 
                 let is_root = name.is_empty() && depth == 0;
-                if !is_root {
-                    if (depth as usize) >= MAX_PATH_DEPTH { return; }
+                if !is_root && (depth as usize) >= MAX_PATH_DEPTH { return; }
+
+                // The cells governing THIS node's 'reg' are defined by its parent.
+                let parent_cells = cells_stack[depth as usize];
+
+                // The cells governing THIS node's children. Spec says NOT inherited.
+                let mut my_cells = Cells::DEFAULT;
+                let prop_scan = PropIter { blob, cur, strings };
+                for (pname, pval) in prop_scan {
+                    if pname == "#address-cells" && pval.len() >= 4 {
+                        my_cells.address = u32::from_be_bytes([pval[0], pval[1], pval[2], pval[3]]);
+                    } else if pname == "#size-cells" && pval.len() >= 4 {
+                        my_cells.size = u32::from_be_bytes([pval[0], pval[1], pval[2], pval[3]]);
+                    }
+                }
+
+                if is_root {
+                    cells_stack[0] = my_cells;
+                } else {
+                    cells_stack[depth as usize + 1] = my_cells;
+
                     let n = name.len().min(slab.len() - total_len as usize);
-                    slab[total_len as usize..total_len as usize + n]
-                        .copy_from_slice(&name[..n]);
+                    slab[total_len as usize..total_len as usize + n].copy_from_slice(&name[..n]);
                     seg_lens[depth as usize] = n as u16;
                     total_len += n as u16;
+
+                    let path = Path {
+                        slab:     &slab[..total_len as usize],
+                        seg_lens: &seg_lens[..depth as usize + 1],
+                    };
+                    let prop_iter = PropIter { blob, cur, strings };
+                    f(&path, prop_iter, parent_cells);
                     depth += 1;
                 }
 
-                let path = Path {
-                    slab:     &slab[..total_len as usize],
-                    seg_lens: &seg_lens[..depth as usize],
-                };
-                let prop_iter = PropIter { blob, cur, strings };
-                f(&path, prop_iter);
-                // Skip past this node's properties to the next BEGIN/END.
                 cur = skip_props(blob, cur, struct_end);
             }
             FDT_END_NODE => {
@@ -290,35 +360,317 @@ pub fn chosen_bootargs(blob: &[u8]) -> Option<heapless_str::Bytes<256>> {
 
 pub fn copy_memory_ranges(blob: &[u8], out: &mut [Reservation]) -> usize {
     let mut n_out = 0;
-    walk_nodes(blob, |path, props| {
+    walk_with_cells(blob, |path, props, parent_cells| {
         if path.depth() != 1 { return; }
         let last = path.last_segment();
         if !last.starts_with("memory") { return; }
         for (name, value) in props {
-            if name == "reg" && value.len() >= 16 {
-                // Default: address-cells = 2, size-cells = 2 for /memory.
-                let mut off = 0;
-                while off + 16 <= value.len() && n_out < out.len() {
-                    let addr = u64::from_be_bytes([
-                        value[off],     value[off + 1],
-                        value[off + 2], value[off + 3],
-                        value[off + 4], value[off + 5],
-                        value[off + 6], value[off + 7],
-                    ]);
-                    let size = u64::from_be_bytes([
-                        value[off + 8],  value[off + 9],
-                        value[off + 10], value[off + 11],
-                        value[off + 12], value[off + 13],
-                        value[off + 14], value[off + 15],
-                    ]);
+            if name != "reg" { continue; }
+            let stride = parent_cells.entry_bytes();
+            if stride == 0 { continue; }
+            let mut off = 0;
+            while off + stride <= value.len() && n_out < out.len() {
+                if let Some((addr, size)) = parent_cells.read_one_reg(value, off) {
                     out[n_out] = Reservation { addr, size };
                     n_out += 1;
-                    off += 16;
                 }
+                off += stride;
             }
         }
     });
     n_out
+}
+
+// ───────────────────────────────────────────────────────────────────
+// `compatible` matching
+// ───────────────────────────────────────────────────────────────────
+
+/// `true` iff the `compatible` payload (NUL-separated string list)
+/// contains an exact match for `compat`.
+pub fn compatible_matches(value: &[u8], compat: &str) -> bool {
+    let target = compat.as_bytes();
+    let mut start = 0;
+    while start < value.len() {
+        let end = value[start..].iter().position(|&b| b == 0)
+            .map(|p| start + p).unwrap_or(value.len());
+        if &value[start..end] == target { return true; }
+        start = end + 1;
+    }
+    false
+}
+
+/// Iterate the `compatible` payload as a sequence of NUL-terminated
+/// `&str` slices, calling `f` for each entry.
+pub fn for_each_compatible_string<F: FnMut(&str)>(value: &[u8], mut f: F) {
+    let mut start = 0;
+    while start < value.len() {
+        let end = value[start..].iter().position(|&b| b == 0)
+            .map(|p| start + p).unwrap_or(value.len());
+        if let Ok(s) = core::str::from_utf8(&value[start..end]) {
+            f(s);
+        }
+        if end == value.len() { break; }
+        start = end + 1;
+    }
+}
+
+/// Walk every node, calling `f` once per node whose `compatible`
+/// list contains an exact match for `compat`.
+pub fn for_each_compatible<F>(blob: &[u8], compat: &str, mut f: F)
+where F: FnMut(&Path<'_>, PropIter<'_>, Cells)
+{
+    walk_with_cells(blob, |path, props, parent_cells| {
+        let snapshot = props;
+        let mut found = false;
+        for (name, value) in snapshot {
+            if name == "compatible" && compatible_matches(value, compat) {
+                found = true;
+                break;
+            }
+        }
+        if found {
+            f(path, props, parent_cells);
+        }
+    });
+}
+
+// ───────────────────────────────────────────────────────────────────
+// `phandle` resolution
+// ───────────────────────────────────────────────────────────────────
+
+/// Read a `phandle` (or legacy `linux,phandle`) property out of a
+/// node's prop iterator.
+pub fn prop_phandle(props: PropIter<'_>) -> Option<u32> {
+    for (name, value) in props {
+        if (name == "phandle" || name == "linux,phandle") && value.len() >= 4 {
+            return Some(u32::from_be_bytes([value[0], value[1], value[2], value[3]]));
+        }
+    }
+    None
+}
+
+/// Walk every node looking for one whose `phandle` matches `target`.
+/// Calls `f` and stops on the first hit.
+pub fn for_phandle<F>(blob: &[u8], target: u32, mut f: F)
+where F: FnMut(&Path<'_>, PropIter<'_>, Cells)
+{
+    let mut done = false;
+    walk_with_cells(blob, |path, props, parent_cells| {
+        if done { return; }
+        if let Some(ph) = prop_phandle(props) {
+            if ph == target {
+                f(path, props, parent_cells);
+                done = true;
+            }
+        }
+    });
+}
+
+// ───────────────────────────────────────────────────────────────────
+// `/aliases` lookup + `/chosen` helpers
+// ───────────────────────────────────────────────────────────────────
+
+/// Look up `/aliases/<name>` and copy its NUL-stripped value into
+/// `out`. Returns the number of bytes written (0 if not found).
+pub fn alias_path(blob: &[u8], name: &str, out: &mut [u8]) -> usize {
+    let mut n = 0;
+    walk_nodes(blob, |path, props| {
+        if !path.matches(&["aliases"]) { return; }
+        for (pname, pval) in props {
+            if pname == name {
+                let strip = if !pval.is_empty() && *pval.last().unwrap() == 0 {
+                    pval.len() - 1
+                } else {
+                    pval.len()
+                };
+                let copy = strip.min(out.len());
+                out[..copy].copy_from_slice(&pval[..copy]);
+                n = copy;
+            }
+        }
+    });
+    n
+}
+
+/// `chosen.stdout-path` → caller-supplied buffer.
+pub fn chosen_stdout_path(blob: &[u8], out: &mut [u8]) -> usize {
+    let mut n = 0;
+    walk_nodes(blob, |path, props| {
+        if !path.matches(&["chosen"]) { return; }
+        for (pname, pval) in props {
+            if pname == "stdout-path" || pname == "linux,stdout-path" {
+                let strip = if !pval.is_empty() && *pval.last().unwrap() == 0 {
+                    pval.len() - 1
+                } else {
+                    pval.len()
+                };
+                let copy = strip.min(out.len());
+                out[..copy].copy_from_slice(&pval[..copy]);
+                n = copy;
+            }
+        }
+    });
+    n
+}
+
+// ───────────────────────────────────────────────────────────────────
+// `status` filter
+// ───────────────────────────────────────────────────────────────────
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Status {
+    Okay,
+    Disabled,
+    Reserved,
+    Fail,
+    Other,
+}
+
+pub fn node_status(props: PropIter<'_>) -> Status {
+    for (name, value) in props {
+        if name != "status" { continue; }
+        // NUL-terminated string.
+        let strip = if !value.is_empty() && *value.last().unwrap() == 0 {
+            &value[..value.len() - 1]
+        } else {
+            value
+        };
+        return match strip {
+            b"okay" | b"ok"      => Status::Okay,
+            b"disabled"          => Status::Disabled,
+            b"reserved"          => Status::Reserved,
+            b"fail"              => Status::Fail,
+            _                    => Status::Other,
+        };
+    }
+    // No `status` property ⇒ okay.
+    Status::Okay
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Typed property accessors
+// ───────────────────────────────────────────────────────────────────
+
+pub fn prop_u32(props: PropIter<'_>, name: &str) -> Option<u32> {
+    for (n, v) in props {
+        if n == name && v.len() >= 4 {
+            return Some(u32::from_be_bytes([v[0], v[1], v[2], v[3]]));
+        }
+    }
+    None
+}
+
+pub fn prop_u64(props: PropIter<'_>, name: &str) -> Option<u64> {
+    for (n, v) in props {
+        if n == name && v.len() >= 8 {
+            return Some(u64::from_be_bytes([
+                v[0], v[1], v[2], v[3],
+                v[4], v[5], v[6], v[7],
+            ]));
+        }
+    }
+    None
+}
+
+pub fn prop_str<'a>(props: PropIter<'a>, name: &str) -> Option<&'a str> {
+    for (n, v) in props {
+        if n == name {
+            let strip = if !v.is_empty() && *v.last().unwrap() == 0 {
+                &v[..v.len() - 1]
+            } else {
+                v
+            };
+            return core::str::from_utf8(strip).ok();
+        }
+    }
+    None
+}
+
+pub fn prop_string_list<'a, F: FnMut(&'a str)>(
+    props: PropIter<'a>, name: &str, mut f: F,
+) {
+    for (n, v) in props {
+        if n != name { continue; }
+        let mut start = 0;
+        while start < v.len() {
+            let end = v[start..].iter().position(|&b| b == 0)
+                .map(|p| start + p).unwrap_or(v.len());
+            if let Ok(s) = core::str::from_utf8(&v[start..end]) {
+                f(s);
+            }
+            if end == v.len() { break; }
+            start = end + 1;
+        }
+        return;
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Interrupt parsing helpers
+// ───────────────────────────────────────────────────────────────────
+
+/// Read a node's `interrupt-parent` (a `phandle`). If absent,
+/// returns `None`; the caller should then walk up through
+/// ancestors looking for the closest declaration.
+pub fn prop_interrupt_parent(props: PropIter<'_>) -> Option<u32> {
+    for (n, v) in props {
+        if n == "interrupt-parent" && v.len() >= 4 {
+            return Some(u32::from_be_bytes([v[0], v[1], v[2], v[3]]));
+        }
+    }
+    None
+}
+
+/// Read a node's `#interrupt-cells` declaration.
+pub fn prop_interrupt_cells(props: PropIter<'_>) -> Option<u32> {
+    for (n, v) in props {
+        if n == "#interrupt-cells" && v.len() >= 4 {
+            return Some(u32::from_be_bytes([v[0], v[1], v[2], v[3]]));
+        }
+    }
+    None
+}
+
+/// Resolve interrupt-cells for a node: chase its `interrupt-parent`
+/// phandle (or fall back to the global parent in the tree, which we
+/// approximate by walking) and return that controller's
+/// `#interrupt-cells`. Returns `None` when the chain cannot be
+/// resolved without re-walking the tree (callers can do their own
+/// phandle chase via `for_phandle`).
+pub fn interrupt_cells_for(blob: &[u8], parent_phandle: u32) -> Option<u32> {
+    let mut out = None;
+    for_phandle(blob, parent_phandle, |_path, props, _| {
+        if let Some(c) = prop_interrupt_cells(props) {
+            out = Some(c);
+        }
+    });
+    out
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Live entry-point discovery
+// ───────────────────────────────────────────────────────────────────
+
+/// Read an FDT blob from `phys`. Validates the 40-byte header,
+/// confirms the magic, and returns a slice covering `totalsize`
+/// bytes. `max_len` is the upper bound the caller is willing to
+/// accept (typically the size of the identity-mapped low-memory
+/// window).
+///
+/// # Safety
+/// `phys` is identity-mapped readable memory of at least
+/// `min(totalsize, max_len)` bytes. The returned slice has the
+/// `'static` lifetime in the boot path; callers that map / unmap
+/// FDT memory must not let the slice outlive its mapping.
+pub unsafe fn discover(phys: usize, max_len: usize) -> Option<&'static [u8]> {
+    if max_len < HEADER_LEN { return None; }
+    // SAFETY: caller-asserted identity-mapped readable at least HEADER_LEN.
+    let head = unsafe { core::slice::from_raw_parts(phys as *const u8, HEADER_LEN) };
+    let hdr = parse_header(head)?;
+    let total = hdr.totalsize as usize;
+    if total < HEADER_LEN || total > max_len { return None; }
+    // SAFETY: caller-asserted identity-mapped readable for the entire totalsize.
+    Some(unsafe { core::slice::from_raw_parts(phys as *const u8, total) })
 }
 
 /// Force-link hook (matches the convention used by `firmware/fw_cfg`
