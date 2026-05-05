@@ -4,10 +4,6 @@
 // `cargo xtask run   --arch=x86_64 [--release]`  — cross-build + QEMU boot
 // `cargo xtask test  --arch=aarch64`             — boot + run kernel tests
 // `cargo xtask image --arch=x86_64 --bootloader=limine` — bootable ISO
-//
-// Stage 1 lands `run` and `build` with the QEMU command line per arch.
-// `test` defers until `verification/` has its `#[kernel_test]` macro;
-// `image` defers until `boot/` is wired.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -28,16 +24,12 @@ enum Cmd {
     Build(BuildArgs),
     /// Cross-compile and boot under QEMU.
     Run(BuildArgs),
-    /// Cross-compile and run kernel tests under QEMU. (Stage 1: stub.)
+    /// Cross-compile and run kernel tests under QEMU.
     Test(BuildArgs),
-    /// Produce a bootable image. (Stage 1: stub.)
+    /// Produce a bootable image.
     Image(BuildArgs),
     /// Boot under QEMU with a graphical display + the user-mode
-    /// testbin running. Drives the userspace FB demo end-to-end:
-    /// the testbin opens a scanout, draws color bars + a centered
-    /// square, flushes, and sleeps a few seconds before exiting.
-    /// Defaults to --display=gtk; pass --display=sdl on macOS or
-    /// --display=none if you only want the serial trace.
+    /// testbin running.
     Demo(BuildArgs),
 }
 
@@ -51,23 +43,34 @@ struct BuildArgs {
     #[arg(long)]
     release: bool,
 
-    /// Crate to build. `narf-frame` is the kernel bin; `narf-lib` is a rlib
-    /// used for cross-target sanity checks.
+    /// Crate to build.
     #[arg(long, default_value = "narf-frame")]
     package: String,
 
     /// Forward-list of cargo features to enable. Comma-separated.
-    /// Example: `--features idt-selftest`.
     #[arg(long, default_value = "")]
     features: String,
 
-    /// QEMU display mode. `none` (default) is headless — what CI
-    /// uses. `gtk` / `sdl` / `cocoa` open a real window so the
-    /// kernel's framebuffer (bochs-display / virtio-gpu) is
-    /// actually visible. Use with `cargo xtask run --display gtk
-    /// --features user-mode-testbin` to see the testbin's FB demo.
+    /// QEMU display mode.
     #[arg(long, default_value = "none")]
     display: String,
+
+    /// Hardware profile to use for QEMU.
+    #[arg(long, value_enum, default_value_t = HwProfile::Full)]
+    hw_profile: HwProfile,
+}
+
+#[derive(Clone, Copy, ValueEnum, Default, Debug)]
+pub enum HwProfile {
+    /// All supported hardware enabled (Default).
+    #[default]
+    Full,
+    /// Barebones machine (Serial only).
+    Minimal,
+    /// Only VirtIO devices enabled.
+    VirtioOnly,
+    /// Only non-VirtIO/Legacy devices enabled.
+    LegacyOnly,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -82,13 +85,6 @@ impl Arch {
     fn triple(self) -> &'static str {
         match self {
             Arch::X86_64  => "x86_64-unknown-none",
-            // `aarch64-unknown-none-softfloat` trips a future-incompat
-            // warning in stdlib's NEON intrinsics (issue #134375 —
-            // `target_feature(enable = "neon")` on softfloat is
-            // unsound). `aarch64-unknown-none` is the plain variant
-            // that kernel ports conventionally target; we keep
-            // floating-point disabled by runtime convention
-            // (CPACR_EL1.FPEN left at its reset state).
             Arch::Aarch64 => "aarch64-unknown-none",
         }
     }
@@ -100,257 +96,155 @@ impl Arch {
         }
     }
 
-    fn qemu_args(self, kernel: &Path, display: &str) -> Vec<String> {
+    fn qemu_args(self, kernel: &Path, display: &str, profile: HwProfile) -> Vec<String> {
         let kernel = kernel.display().to_string();
         let display = display.to_string();
         match self {
-            // x86_64 via PVH direct-kernel load. `isa-debug-exit` lets the
-            // guest exit QEMU by writing to I/O port 0xF4 (status = value<<1 | 1).
-            // `-no-reboot` stops QEMU on triple-fault instead of infinite resets.
-            //
-            // NVMe attachment: an `nvme` device backed by a small raw
-            // image gives the kernel a real PCIe controller to drive
-            // (vendor 0x1b36, device 0x0010 — QEMU's standard NVMe
-            // ID). The image is created lazily by `nvme_image_path`
-            // before launch; a 1 MiB blank file is plenty for the
-            // admin-queue bring-up test and any future single-LBA
-            // round-trip smoke.
             Arch::X86_64 => {
-                let img = nvme_image_path()
-                    .display().to_string();
-                vec![
+                let mut args = vec![
                     "-machine".into(), "q35,hmat=on".into(),
                     "-cpu".into(),     "max".into(),
-                    // 2 logical CPUs so AP bring-up via INIT-SIPI-SIPI
-                    // exercises a real second core under QEMU q35.
                     "-smp".into(),     "16,sockets=2,cores=8".into(),
                     "-m".into(),       "256M".into(),
-                    // 2 NUMA nodes so QEMU emits an ACPI SRAT for
-                    // narf_acpi to parse. Each node owns one socket
-                    // (8 logical CPUs under the smp config above)
-                    // and 128 MiB of the total 256 MiB RAM. Going
-                    // wider stresses cross-CPU IRQ / lock paths —
-                    // exposed (and helped fix) the halt_until_irq
-                    // check-halt race that the virtio-blk-pci
-                    // async smokes hit reliably above smp=2.
                     "-numa".into(),    "node,nodeid=0,cpus=0-7,memdev=mem0,initiator=0".into(),
                     "-numa".into(),    "node,nodeid=1,cpus=8-15,memdev=mem1,initiator=1".into(),
                     "-object".into(),  "memory-backend-ram,id=mem0,size=128M".into(),
                     "-object".into(),  "memory-backend-ram,id=mem1,size=128M".into(),
-                    // HMAT lat/bw entries: same-node access fast,
-                    // cross-node 2x. The numbers are arbitrary but
-                    // distinguish the matrix axes so the parser sees
-                    // a non-trivial table.
-                    "-numa".into(),
-                    "hmat-lb,initiator=0,target=0,hierarchy=memory,data-type=access-latency,latency=10".into(),
-                    "-numa".into(),
-                    "hmat-lb,initiator=0,target=1,hierarchy=memory,data-type=access-latency,latency=20".into(),
-                    "-numa".into(),
-                    "hmat-lb,initiator=1,target=0,hierarchy=memory,data-type=access-latency,latency=20".into(),
-                    "-numa".into(),
-                    "hmat-lb,initiator=1,target=1,hierarchy=memory,data-type=access-latency,latency=10".into(),
-                    "-numa".into(),
-                    "hmat-lb,initiator=0,target=0,hierarchy=memory,data-type=access-bandwidth,bandwidth=10G".into(),
-                    "-numa".into(),
-                    "hmat-lb,initiator=0,target=1,hierarchy=memory,data-type=access-bandwidth,bandwidth=5G".into(),
-                    "-numa".into(),
-                    "hmat-lb,initiator=1,target=0,hierarchy=memory,data-type=access-bandwidth,bandwidth=5G".into(),
-                    "-numa".into(),
-                    "hmat-lb,initiator=1,target=1,hierarchy=memory,data-type=access-bandwidth,bandwidth=10G".into(),
+                    "-numa".into(),    "hmat-lb,initiator=0,target=0,hierarchy=memory,data-type=access-latency,latency=10".into(),
+                    "-numa".into(),    "hmat-lb,initiator=0,target=1,hierarchy=memory,data-type=access-latency,latency=20".into(),
+                    "-numa".into(),    "hmat-lb,initiator=1,target=0,hierarchy=memory,data-type=access-latency,latency=20".into(),
+                    "-numa".into(),    "hmat-lb,initiator=1,target=1,hierarchy=memory,data-type=access-latency,latency=10".into(),
+                    "-numa".into(),    "hmat-lb,initiator=0,target=0,hierarchy=memory,data-type=access-bandwidth,bandwidth=10G".into(),
+                    "-numa".into(),    "hmat-lb,initiator=0,target=1,hierarchy=memory,data-type=access-bandwidth,bandwidth=5G".into(),
+                    "-numa".into(),    "hmat-lb,initiator=1,target=0,hierarchy=memory,data-type=access-bandwidth,bandwidth=5G".into(),
+                    "-numa".into(),    "hmat-lb,initiator=1,target=1,hierarchy=memory,data-type=access-bandwidth,bandwidth=10G".into(),
                     "-serial".into(),  "stdio".into(),
                     "-display".into(), display.clone(),
                     "-no-reboot".into(),
                     "-device".into(),  "isa-debug-exit,iobase=0xf4,iosize=0x04".into(),
-                    "-drive".into(),
-                    format!("if=none,id=nvm0,format=raw,file={img}"),
-                    "-device".into(),  "nvme,drive=nvm0,serial=narf".into(),
-                    // virtio-blk-pci over a separate backing image
-                    // (QEMU refuses to share write locks across two
-                    // -drive entries). Modern transport (vendor
-                    // 0x1AF4, device 0x1041) is the default in
-                    // modern QEMU; the Stage-4 virtio-blk-pci driver
-                    // registers a probe for that ID via
-                    // narf_drivers_virtio::blk_pci::register_pci_driver().
-                    "-drive".into(),
-                    format!("if=none,id=vblk0,format=raw,file={}",
-                            virtio_blk_image_path().display()),
-                    "-device".into(),
-                    "virtio-blk-pci,drive=vblk0,disable-legacy=on,disable-modern=off".into(),
-                    // virtio-net-pci over the QEMU user-mode net
-                    // backend. The driver doesn't run a full TCP/IP
-                    // stack — the smoke verifies it can post a frame
-                    // onto the TX queue and the device's used ring
-                    // returns it.
-                    "-netdev".into(),  "user,id=n0".into(),
-                    "-device".into(),
-                    "virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off".into(),
-                    // e1000 NIC alongside virtio-net. Different
-                    // PCIe transport (no virtio caps), exercises the
-                    // generic BAR / MMIO surface end-to-end. Uses a
-                    // separate user-mode netdev so it doesn't share
-                    // an FD lock with virtio-net's backend.
-                    "-netdev".into(),  "user,id=n1".into(),
-                    "-device".into(),  "e1000,netdev=n1".into(),
-                    // virtio-rng-pci with /dev/urandom as the
-                    // backend. QEMU defers to the bound `-object
-                    // rng-*` for entropy.
-                    "-object".into(),
-                    "rng-random,id=rng0,filename=/dev/urandom".into(),
-                    "-device".into(),
-                    "virtio-rng-pci,rng=rng0,disable-legacy=on,disable-modern=off".into(),
-                    // SATA disk on the q35 ICH9 AHCI controller (no
-                    // explicit -device needed; QEMU q35 includes
-                    // ahci by default at 00:1f.2).
-                    "-drive".into(),
-                    format!("if=none,id=sata0,format=raw,file={}",
-                            ahci_image_path().display()),
-                    "-device".into(),  "ide-hd,drive=sata0,bus=ide.0".into(),
-                    // virtio-balloon: cooperative memory pressure
-                    // device. We don't use it for actual ballooning
-                    // yet — the driver's structural bring-up is the
-                    // smoke target.
-                    "-device".into(),
-                    "virtio-balloon-pci,disable-legacy=on,disable-modern=off".into(),
-                    // QEMU's xHCI USB host controller.
-                    "-device".into(),  "qemu-xhci,id=xhci0".into(),
-                    // virtio-input keyboard so the virtio-input
-                    // driver has a real device to probe. QEMU's
-                    // virtio-keyboard-pci synthesizes EV_KEY events
-                    // when the QEMU window receives keystrokes;
-                    // under `-display none` the device is silent
-                    // but the bring-up + queue setup still exercises.
-                    "-device".into(),
-                    "virtio-keyboard-pci,disable-legacy=on,disable-modern=off".into(),
-                    // bochs-display: linear-framebuffer device,
-                    // PCI vendor 0x1234 device 0x1111. BAR0 is the
-                    // framebuffer; BAR2 the VBE Dispi MMIO regs.
-                    // Using `-vga none -device bochs-display` avoids
-                    // a conflict with the default VGA device QEMU
-                    // q35 emits when no `-display` mode is forced.
-                    "-vga".into(),     "none".into(),
-                    "-device".into(),  "bochs-display".into(),
-                    // virtio-gpu (cross-arch). Coexists with
-                    // bochs-display on x86_64 — they're separate
-                    // PCI devices and the driver picks whichever
-                    // probes first to back the splash.
-                    "-device".into(),
-                    "virtio-gpu-pci,disable-legacy=on,disable-modern=off".into(),
-                    // virtio-sound-pci with the dummy audiodev — we
-                    // get the device-cfg + virtqueue surface to
-                    // probe against without needing the host to
-                    // actually play sound. Swap `none` for `pa,id=`
-                    // / `pipewire,id=` when interactively running
-                    // the kernel and you want audible output.
-                    "-audiodev".into(), "none,id=snd0".into(),
-                    "-device".into(),
-                    "virtio-sound-pci,audiodev=snd0,disable-legacy=on,disable-modern=off".into(),
-                    // Intel HDA controller (ICH9) with a duplex codec.
-                    "-device".into(),  "intel-hda".into(),
-                    "-device".into(),  "hda-duplex,audiodev=snd0".into(),
-                    "-kernel".into(),  kernel,
-                ]
+                ];
+
+                let virtio = matches!(profile, HwProfile::Full | HwProfile::VirtioOnly);
+                let legacy = matches!(profile, HwProfile::Full | HwProfile::LegacyOnly);
+
+                if legacy {
+                    args.extend_from_slice(&[
+                        "-drive".into(),  format!("if=none,id=nvm0,format=raw,file={}", nvme_image_path().display()),
+                        "-device".into(), "nvme,drive=nvm0,serial=narf".into(),
+                    ]);
+                    args.extend_from_slice(&[
+                        "-netdev".into(), "user,id=n1".into(),
+                        "-device".into(), "e1000,netdev=n1".into(),
+                    ]);
+                    args.extend_from_slice(&[
+                        "-drive".into(),  format!("if=none,id=sata0,format=raw,file={}", ahci_image_path().display()),
+                        "-device".into(), "ide-hd,drive=sata0,bus=ide.0".into(),
+                    ]);
+                    args.extend_from_slice(&["-device".into(), "qemu-xhci,id=xhci0".into()]);
+                    args.extend_from_slice(&["-vga".into(), "none".into(), "-device".into(), "bochs-display".into()]);
+                    args.extend_from_slice(&[
+                        "-audiodev".into(), "none,id=snd0".into(),
+                        "-device".into(),   "intel-hda".into(),
+                        "-device".into(),   "hda-duplex,audiodev=snd0".into(),
+                    ]);
+                }
+
+                if virtio {
+                    args.extend_from_slice(&[
+                        "-drive".into(),  format!("if=none,id=vblk0,format=raw,file={}", virtio_blk_image_path().display()),
+                        "-device".into(), "virtio-blk-pci,drive=vblk0,disable-legacy=on,disable-modern=off".into(),
+                    ]);
+                    args.extend_from_slice(&[
+                        "-netdev".into(), "user,id=n0".into(),
+                        "-device".into(), "virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off".into(),
+                    ]);
+                    args.extend_from_slice(&[
+                        "-object".into(), "rng-random,id=rng0,filename=/dev/urandom".into(),
+                        "-device".into(), "virtio-rng-pci,rng=rng0,disable-legacy=on,disable-modern=off".into(),
+                    ]);
+                    args.extend_from_slice(&["-device".into(), "virtio-balloon-pci,disable-legacy=on,disable-modern=off".into()]);
+                    args.extend_from_slice(&["-device".into(), "virtio-keyboard-pci,disable-legacy=on,disable-modern=off".into()]);
+                    args.extend_from_slice(&["-device".into(), "virtio-gpu-pci,disable-legacy=on,disable-modern=off".into()]);
+                    if !legacy {
+                        args.extend_from_slice(&["-audiodev".into(), "none,id=snd0".into()]);
+                    }
+                    args.extend_from_slice(&["-device".into(), "virtio-sound-pci,audiodev=snd0,disable-legacy=on,disable-modern=off".into()]);
+                }
+
+                args.push("-kernel".into());
+                args.push(kernel);
+                args
             },
-            // aarch64 virt machine with GICv3 (system-register interface
-            // at ICC_*_EL1). Default QEMU virt is GICv2 (MMIO); forcing
-            // GICv3 gives us parity with x86_64's x2APIC programming
-            // model (MSRs).
-            // `-semihosting` enables the SYS_EXIT path.
-            Arch::Aarch64 => vec![
-                // `mte=on` enables full MTE (level 2+): tag storage,
-                // accessible GCR_EL1/TFSR_EL1, SCTLR_EL1.ATA/TCF gates.
-                // Without this QEMU exposes only MTE level 1 (instruction
-                // support but no in-memory tag check).
-                // `highmem-ecam=off` forces the PCIe ECAM into the
-                // 0x3F00_0000 lowmem window. QEMU's default for newer
-                // virt machines is highmem (4 TiB+), which is outside
-                // the 1 GiB identity map our boot stub installs;
-                // forcing low keeps PCIe walks reachable until ioremap
-                // for >4 GiB lands.
-                "-machine".into(),  "virt,gic-version=3,mte=on,highmem-ecam=off".into(),
-                "-cpu".into(),      "max".into(),
-                // 2 logical CPUs so AP bring-up via PSCI CPU_ON
-                // exercises a real second core under QEMU virt.
-                "-smp".into(),      "2".into(),
-                "-m".into(),        "256M".into(),
-                "-serial".into(),   "stdio".into(),
-                "-display".into(),  display.clone(),
-                "-no-reboot".into(),
-                "-semihosting".into(),
-                // Attach an NVMe device on aarch64 too — same image as
-                // x86_64. Once DTB-driven PCIe walking finds it, the
-                // existing NVMe smokes naturally extend to aarch64.
-                "-drive".into(),
-                format!("if=none,id=nvm0,format=raw,file={}",
-                        nvme_image_path().display()),
-                "-device".into(),   "nvme,drive=nvm0,serial=narf".into(),
-                // virtio-blk-pci over a dedicated backing image (one
-                // -drive per file lets QEMU acquire its write lock).
-                "-drive".into(),
-                format!("if=none,id=vblk0,format=raw,file={}",
-                        virtio_blk_image_path().display()),
-                "-device".into(),
-                "virtio-blk-pci,drive=vblk0,disable-legacy=on,disable-modern=off".into(),
-                // virtio-net-pci on aarch64 too.
-                "-netdev".into(),  "user,id=n0".into(),
-                "-device".into(),
-                "virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off".into(),
-                // e1000 NIC alongside virtio-net.
-                "-netdev".into(),  "user,id=n1".into(),
-                "-device".into(),  "e1000,netdev=n1".into(),
-                "-object".into(),
-                "rng-random,id=rng0,filename=/dev/urandom".into(),
-                "-device".into(),
-                "virtio-rng-pci,rng=rng0,disable-legacy=on,disable-modern=off".into(),
-                "-device".into(),
-                "virtio-balloon-pci,disable-legacy=on,disable-modern=off".into(),
-                "-device".into(),
-                "qemu-xhci,id=xhci0".into(),
-                // virtio-input keyboard (cross-arch); see x86_64
-                // block above for rationale.
-                "-device".into(),
-                "virtio-keyboard-pci,disable-legacy=on,disable-modern=off".into(),
-                // virtio-gpu on aarch64. Its 16 MiB BAR is allocated
-                // above the boot identity map; the driver's BAR access
-                // goes through `narf_memory::ioremap` in `map_cap`,
-                // so high BARs work the same as low ones now.
-                "-device".into(),
-                "virtio-gpu-pci,disable-legacy=on,disable-modern=off".into(),
-                // virtio-sound-pci with the dummy audiodev — see
-                // x86_64 block for rationale.
-                "-audiodev".into(), "none,id=snd0".into(),
-                "-device".into(),
-                "virtio-sound-pci,audiodev=snd0,disable-legacy=on,disable-modern=off".into(),
-                // QEMU's `-kernel <elf>` path on aarch64 does not
-                // load a `-dtb` blob into RAM (the DTB-loading code
-                // path is gated on `is_linux=1`). Instead we
-                // force-load the dumped DTB at a fixed physical
-                // address (`DTB_LOAD_ADDR`) via `-device loader`,
-                // and the boot stub picks it up there.
-                "-device".into(),
-                format!("loader,file={},addr={:#x},force-raw=on",
-                        qemu_virt_dtb_path().display(), DTB_LOAD_ADDR),
-                "-kernel".into(),   kernel,
-            ],
+            Arch::Aarch64 => {
+                let mut args = vec![
+                    "-machine".into(),  "virt,gic-version=3,mte=on,highmem-ecam=off".into(),
+                    "-cpu".into(),      "max".into(),
+                    "-smp".into(),      "2".into(),
+                    "-m".into(),        "256M".into(),
+                    "-serial".into(),   "stdio".into(),
+                    "-display".into(),  display.clone(),
+                    "-no-reboot".into(),
+                    "-semihosting".into(),
+                ];
+
+                let virtio = matches!(profile, HwProfile::Full | HwProfile::VirtioOnly);
+                let legacy = matches!(profile, HwProfile::Full | HwProfile::LegacyOnly);
+
+                if legacy {
+                    args.extend_from_slice(&[
+                        "-drive".into(),
+                        format!("if=none,id=nvm0,format=raw,file={}",
+                                nvme_image_path().display()),
+                        "-device".into(),   "nvme,drive=nvm0,serial=narf".into(),
+                    ]);
+                    args.extend_from_slice(&[
+                        "-netdev".into(),  "user,id=n1".into(),
+                        "-device".into(),  "e1000,netdev=n1".into(),
+                    ]);
+                }
+
+                if virtio {
+                    args.extend_from_slice(&[
+                        "-drive".into(),
+                        format!("if=none,id=vblk0,format=raw,file={}",
+                                virtio_blk_image_path().display()),
+                        "-device".into(),
+                        "virtio-blk-pci,drive=vblk0,disable-legacy=on,disable-modern=off".into(),
+                    ]);
+                    args.extend_from_slice(&[
+                        "-netdev".into(),  "user,id=n0".into(),
+                        "-device".into(),
+                        "virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off".into(),
+                    ]);
+                    args.extend_from_slice(&[
+                        "-object".into(),
+                        "rng-random,id=rng0,filename=/dev/urandom".into(),
+                        "-device".into(),
+                        "virtio-rng-pci,rng=rng0,disable-legacy=on,disable-modern=off".into(),
+                    ]);
+                    args.extend_from_slice(&["-device".into(), "virtio-balloon-pci,disable-legacy=on,disable-modern=off".into()]);
+                    args.extend_from_slice(&["-device".into(), "virtio-keyboard-pci,disable-legacy=on,disable-modern=off".into()]);
+                    args.extend_from_slice(&["-device".into(), "virtio-gpu-pci,disable-legacy=on,disable-modern=off".into()]);
+                    args.extend_from_slice(&["-audiodev".into(), "none,id=snd0".into()]);
+                    args.extend_from_slice(&["-device".into(), "virtio-sound-pci,audiodev=snd0,disable-legacy=on,disable-modern=off".into()]);
+                }
+
+                args.extend_from_slice(&[
+                    "-device".into(),
+                    format!("loader,file={},addr={:#x},force-raw=on",
+                            qemu_virt_dtb_path().display(), DTB_LOAD_ADDR),
+                ]);
+
+                args.push("-kernel".into());
+                args.push(kernel);
+                args
+            }
         }
     }
 }
 
-/// Path to the NVMe-backing raw image that x86_64 QEMU attaches to
-/// the emulated NVMe controller. Created on demand at 1 MiB. Stored
-/// in `target/` so a `cargo clean` removes it; persists across runs
-/// to skip the write on subsequent boots.
-/// Physical address at which xtask force-loads the dumped DTB on
-/// aarch64. Must match the address `boot/aarch64/parse_raw` searches
-/// for the FDT magic. Picked to be high enough to be past the kernel
-/// image (kernel is loaded at 0x4008_0000 on virt; 0x4f00_0000 leaves
-/// ~240 MiB of head room). Must stay inside the `lo_L1[1]` 1 GiB
-/// Normal-mapped block (0x4000_0000..0x8000_0000).
 const DTB_LOAD_ADDR: u64 = 0x4F00_0000;
 
-/// Path to the cached QEMU `virt` DTB. Lazily generated by invoking
-/// `qemu-system-aarch64 -machine ...,dumpdtb=PATH` if missing. The
-/// machine line must mirror the `-machine` we pass at run time so
-/// the DTB describes the same hardware.
 fn qemu_virt_dtb_path() -> PathBuf {
     let root = workspace_root().unwrap_or_else(|_| PathBuf::from("."));
     let path = root.join("target").join("qemu-virt.dtb");
@@ -358,9 +252,6 @@ fn qemu_virt_dtb_path() -> PathBuf {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        // dumpdtb writes the DTB and exits without running. Mirror
-        // the machine line below so the dumped DTB matches the
-        // run-time topology.
         let _ = Command::new("qemu-system-aarch64")
             .arg("-machine")
             .arg(format!(
@@ -390,9 +281,6 @@ fn qemu_virt_dtb_path() -> PathBuf {
     path
 }
 
-/// Backing image for the q35 AHCI/SATA disk. Pre-seeds the first
-/// 512 bytes with a recognisable pattern so the AHCI READ DMA EXT
-/// smoke can verify the round trip.
 fn ahci_image_path() -> PathBuf {
     let root = workspace_root().unwrap_or_else(|_| PathBuf::from("."));
     let path = root.join("target").join("narf-sata.img");
@@ -409,8 +297,6 @@ fn ahci_image_path() -> PathBuf {
     path
 }
 
-/// Backing image for the QEMU virtio-blk-pci device. Same shape as
-/// the NVMe image but separate so QEMU's write lock doesn't trip.
 fn virtio_blk_image_path() -> PathBuf {
     let root = workspace_root().unwrap_or_else(|_| PathBuf::from("."));
     let path = root.join("target").join("narf-vblk.img");
@@ -418,9 +304,6 @@ fn virtio_blk_image_path() -> PathBuf {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        // 1 MiB image — same as the NVMe one. Pre-fill the first
-        // 512 bytes with a recognisable pattern so the
-        // virtio-blk-pci read smoke can verify the round trip.
         let mut buf = vec![0u8; 1024 * 1024];
         for i in 0..512usize {
             buf[i] = (i as u8).wrapping_mul(0x97);
@@ -437,16 +320,12 @@ fn nvme_image_path() -> PathBuf {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        // 1 MiB of zeros — small enough that the file isn't a
-        // commit-noise risk and large enough that QEMU NVMe accepts
-        // it as a non-empty namespace.
         let _ = std::fs::write(&path, vec![0u8; 1024 * 1024]);
     }
     path
 }
 
 fn workspace_root() -> Result<PathBuf> {
-    // CARGO_MANIFEST_DIR points at build/xtask; parent().parent() is the workspace.
     let manifest = std::env::var("CARGO_MANIFEST_DIR")
         .context("CARGO_MANIFEST_DIR not set — run via `cargo xtask`")?;
     let root = Path::new(&manifest)
@@ -462,11 +341,6 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
         .arg("build")
         .arg("-p").arg(&args.package)
         .arg("--target").arg(args.arch.triple())
-        // build-std scoped to the cross targets only. See .cargo/config.toml.
-        // `no-f16-f128` keeps compiler_builtins from pulling soft-float f128
-        // lowering paths that LLVM can't soften under `code-model=kernel`.
-        // `alloc` comes along because narf-frame registers a
-        // #[global_allocator] and uses `alloc::boxed::Box` for tasks.
         .arg("-Z").arg("build-std=core,compiler_builtins,alloc")
         .arg("-Z").arg("build-std-features=compiler-builtins-mem,compiler-builtins-no-f16-f128");
     if args.release { cmd.arg("--release"); }
@@ -479,9 +353,6 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
         bail!("cargo build failed with status {status}");
     }
 
-    // The artefact path convention — kernel crates produce a library; once
-    // `frame/` lands with a `[[bin]]` target, this function switches to
-    // returning the bin path.
     let profile = if args.release { "release" } else { "debug" };
     let out = root
         .join("target")
@@ -505,15 +376,13 @@ fn run_cmd(args: &BuildArgs) -> Result<()> {
 
     let qemu = args.arch.qemu_bin();
     let mut cmd = Command::new(qemu);
-    cmd.args(args.arch.qemu_args(&kernel, &args.display));
+    cmd.args(args.arch.qemu_args(&kernel, &args.display, args.hw_profile));
     
     println!("xtask: launching {} {}", qemu, kernel.display());
     
     let mut child = cmd.spawn()
         .with_context(|| format!("failed to spawn {qemu}"))?;
 
-    // Wait for up to 240 seconds by default. Override via
-    // `XTASK_QEMU_TIMEOUT_SECS=N` for diagnostics on a hang.
     let secs = std::env::var("XTASK_QEMU_TIMEOUT_SECS")
         .ok().and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(240);
@@ -536,9 +405,6 @@ fn main() -> Result<()> {
         Cmd::Build(args) => { cargo_build(&args, &workspace_root()?)?; Ok(()) }
         Cmd::Run(args)   => run_cmd(&args),
         Cmd::Test(mut args)  => {
-            // Run the verification/ harness: build with `kernel-test`
-            // feature on, boot under QEMU, map isa-debug-exit status
-            // to cargo test's "passed" / "failed" convention.
             if args.features.is_empty() {
                 args.features = "kernel-test".into();
             } else if !args.features.contains("kernel-test") {
@@ -552,9 +418,6 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Demo(mut args) => {
-            // Bundle: kernel-test + user-mode-testbin features so
-            // the testbin's FB demo runs, plus default the display
-            // to gtk so the result is actually visible.
             if args.features.is_empty() {
                 args.features = "kernel-test,user-mode-testbin".into();
             } else {
