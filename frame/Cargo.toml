@@ -42,6 +42,7 @@ narf-shmem           = { path = "../shmem" }
 narf-firmware        = { path = "../firmware" }
 narf-firmware-fw-cfg = { path = "../firmware/fw_cfg" }
 narf-firmware-smbios = { path = "../firmware/smbios" }
+narf-firmware-fdt    = { path = "../firmware/fdt" }
 narf-initramfs       = { path = "../initramfs" }
 narf-userspace     = { path = "../userspace" }
 narf-verification  = { path = "../verification", optional = true }

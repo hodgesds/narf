@@ -754,6 +754,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_firmware::register_initcalls();
             narf_firmware_fw_cfg::register_initcalls();
             narf_firmware_smbios::register_initcalls();
+            narf_firmware_fdt::register_initcalls();
             // Stage the trusted-loader authority so the
             // `sys_firmware_install` syscall can hot-install blobs
             // from a privileged userspace daemon. The Read half is

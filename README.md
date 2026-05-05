@@ -735,6 +735,19 @@ Live from boot through `cargo xtask run`:
   Memory Window). BERT yields `BertInfo { region_addr,
   region_length }` for the boot-error region. Spec:
   `acpi/specification/tables-ras-cxl-locality.md`.
+- FDT / DTB v17 (`narf_firmware_fdt`): pure-byte-slice
+  parser for the Devicetree-Specification-v0.4 / FDT-v17 blob.
+  Validates the 40-byte big-endian header (magic / totalsize /
+  off_dt_struct / off_dt_strings / off_mem_rsvmap / version /
+  size fields), decodes the memory-reserve map, and walks the
+  struct block via `walk_nodes(blob, |path, props| { … })`
+  with the FDT_BEGIN / END / PROP / NOP / END token state
+  machine. `Path` carries a depth-tracked stack of segment
+  lengths so `path.matches(&["cpus", "cpu@0"])` works against
+  `/cpus/cpu@0` without allocating. Convenience helpers
+  `chosen_bootargs(blob)`, `copy_memory_ranges(blob, …)`, and
+  `copy_reservations(blob, …)` ride on top. Spec:
+  `firmware/fdt/specification/spec.md`.
 - SMBIOS / DMI (`narf_firmware_smbios`): entry-point-
   agnostic structure-stream parser with **full SMBIOS 3.x
   type coverage** — every defined structure (Types 0..46

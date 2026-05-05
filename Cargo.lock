@@ -703,6 +703,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-firmware-fdt"
+version = "0.0.0"
+dependencies = [
+ "narf-kernel-test",
+ "narf-lib",
+]
+
+[[package]]
 name = "narf-firmware-fw-cfg"
 version = "0.0.0"
 dependencies = [
@@ -742,6 +750,7 @@ dependencies = [
  "narf-drivers-virtio",
  "narf-fb",
  "narf-firmware",
+ "narf-firmware-fdt",
  "narf-firmware-fw-cfg",
  "narf-firmware-smbios",
  "narf-graphics",

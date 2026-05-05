@@ -54,6 +54,7 @@ members = [
     "firmware",
     "firmware/fw_cfg",
     "firmware/smbios",
+    "firmware/fdt",
     "initramfs",
 ]
 # narf-testbin is built out-of-line by verification's build.rs
