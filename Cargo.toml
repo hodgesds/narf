@@ -57,6 +57,8 @@ members = [
     "init",
     "fb",
     "audio",
+    "bluetooth",
+    "usbpd",
     "pwm",
     "shmem",
     "compat/win",

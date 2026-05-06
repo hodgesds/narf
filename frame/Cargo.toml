@@ -41,6 +41,8 @@ narf-drivers-gpu     = { path = "../drivers/gpu" }
 narf-init            = { path = "../init" }
 narf-fb              = { path = "../fb" }
 narf-audio           = { path = "../audio" }
+narf-bluetooth       = { path = "../bluetooth" }
+narf-usbpd           = { path = "../usbpd" }
 narf-wireless        = { path = "../wireless" }
 narf-accel           = { path = "../accel" }
 narf-tpm             = { path = "../tpm" }
@@ -71,6 +73,8 @@ idt-selftest = []
 kernel-test  = [
     "dep:narf-verification",
     "narf-audio/kernel-test",
+    "narf-bluetooth/kernel-test",
+    "narf-usbpd/kernel-test",
     "narf-wireless/kernel-test",
     "narf-drivers-wireless/kernel-test",
     "narf-accel/kernel-test",

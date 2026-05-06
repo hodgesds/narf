@@ -1,0 +1,23 @@
+[package]
+name         = "narf-bluetooth"
+description  = "Bluetooth Host Controller Interface — clean-room from public Bluetooth SIG specs."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_bluetooth"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../lib" }
+narf-capabilities = { path = "../capabilities" }
+narf-kernel-test  = { path = "../verification/kernel-test" }
+
+[features]
+kernel-test = []
+
+[lints]
+workspace = true

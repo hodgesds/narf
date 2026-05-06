@@ -459,6 +459,10 @@ pub enum CapKind {
     // Firmware
     Firmware = 0x00E0,
     FirmwareRegistry = 0x00E1,
+
+    // Wireless / radios
+    Bluetooth = 0x00F0,
+    UsbPd = 0x00F1,
 }
 
 pub trait CapType: 'static {
@@ -541,6 +545,8 @@ const KIND_NAMES: &[(&str, CapKind)] = &[
     ("Pwm", CapKind::Pwm),
     ("Firmware", CapKind::Firmware),
     ("FirmwareRegistry", CapKind::FirmwareRegistry),
+    ("Bluetooth", CapKind::Bluetooth),
+    ("UsbPd", CapKind::UsbPd),
 ];
 
 // ── Badge ───────────────────────────────────────────────────────────

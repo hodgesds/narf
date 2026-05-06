@@ -10,6 +10,7 @@ use narf_net::Interface;
 
 pub mod caps;
 pub mod iface;
+pub mod mlme;
 pub mod reg;
 pub mod scan;
 
@@ -248,4 +249,125 @@ mod tests {
         }
     }
     kernel_test_in!("wireless", smoke_wireless_association_state);
+
+    fn smoke_mlme_frame_control_round_trip() -> TestResult {
+        use crate::mlme::{FrameControl, FrameType, MgmtSubtype};
+        let fc = FrameControl::mgmt(MgmtSubtype::ProbeRequest);
+        let raw = fc.encode();
+        // §9.2.4.1.3: type=0 (mgmt), subtype=4 (ProbeReq).
+        if (raw >> 2) & 0x3 != 0 {
+            return TestResult::Fail("Mgmt frame Type field drift");
+        }
+        if (raw >> 4) & 0xF != 4 {
+            return TestResult::Fail("ProbeRequest Subtype drift");
+        }
+        let back = FrameControl::decode(raw);
+        if back.frame_type != FrameType::Management
+            || back.subtype != MgmtSubtype::ProbeRequest as u8
+        {
+            return TestResult::Fail("Frame Control round-trip lost type/subtype");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("wireless/mlme", smoke_mlme_frame_control_round_trip);
+
+    fn smoke_mlme_mgmt_header_layout() -> TestResult {
+        use crate::mlme::{FrameControl, MgmtHeader, MgmtSubtype};
+        let h = MgmtHeader {
+            fc: FrameControl::mgmt(MgmtSubtype::Authentication),
+            duration: 0x0030,
+            addr1: [0x11; 6],
+            addr2: [0x22; 6],
+            addr3: [0x33; 6],
+            seq_ctrl: 0x0010,
+        };
+        let mut buf = Vec::new();
+        h.encode(&mut buf);
+        if buf.len() != 24 {
+            return TestResult::Fail("Mgmt header should be 24 bytes (no addr4)");
+        }
+        let back = match MgmtHeader::decode(&buf) {
+            Some(v) => v,
+            None => return TestResult::Fail("MgmtHeader::decode returned None"),
+        };
+        if back != h {
+            return TestResult::Fail("MgmtHeader round-trip mismatch");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("wireless/mlme", smoke_mlme_mgmt_header_layout);
+
+    fn smoke_mlme_ie_iter_and_write() -> TestResult {
+        use crate::mlme::{iter_ies, write_ie, ElementId};
+        let mut buf = Vec::new();
+        write_ie(&mut buf, ElementId::Ssid, b"narf");
+        write_ie(&mut buf, ElementId::SupportedRates, &[0x82, 0x84, 0x8B, 0x96]);
+        let ies: Vec<_> = iter_ies(&buf).collect();
+        if ies.len() != 2 {
+            return TestResult::Fail("expected 2 IEs back from iter");
+        }
+        if ies[0].id != ElementId::Ssid as u8 || ies[0].body != b"narf" {
+            return TestResult::Fail("SSID IE round-trip lost contents");
+        }
+        if ies[1].id != ElementId::SupportedRates as u8 || ies[1].body.len() != 4 {
+            return TestResult::Fail("SupportedRates IE round-trip mismatch");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("wireless/mlme", smoke_mlme_ie_iter_and_write);
+
+    fn smoke_mlme_probe_request_builder() -> TestResult {
+        use crate::mlme::{build_probe_request_body, iter_ies, ElementId};
+        let body = build_probe_request_body(b"narf", &[0x82, 0x84]);
+        let ies: Vec<_> = iter_ies(&body).collect();
+        if ies.len() != 2 {
+            return TestResult::Fail("ProbeReq body should hold 2 IEs");
+        }
+        if ies[0].id != ElementId::Ssid as u8 || ies[0].body != b"narf" {
+            return TestResult::Fail("ProbeReq SSID IE wrong");
+        }
+        if ies[1].id != ElementId::SupportedRates as u8 {
+            return TestResult::Fail("ProbeReq SupportedRates IE wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("wireless/mlme", smoke_mlme_probe_request_builder);
+
+    fn smoke_mlme_open_auth_request() -> TestResult {
+        use crate::mlme::{build_open_auth_request, AuthFields};
+        let body = build_open_auth_request();
+        let fields = match AuthFields::decode(&body) {
+            Some(f) => f,
+            None => return TestResult::Fail("AuthFields::decode returned None"),
+        };
+        if fields.algorithm != 0 {
+            return TestResult::Fail("Open System should use algorithm 0");
+        }
+        if fields.sequence != 1 {
+            return TestResult::Fail("Auth sequence should be 1 for the request");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("wireless/mlme", smoke_mlme_open_auth_request);
+
+    fn smoke_mlme_beacon_ssid_channel_extract() -> TestResult {
+        use crate::mlme::{beacon_ssid_channel, write_ie, ElementId};
+        // Build a synthetic beacon body: 12-byte fixed header (zeroed
+        // for the test), then SSID + DS Parameter Set IEs.
+        let mut body = alloc::vec![0u8; 12];
+        write_ie(&mut body, ElementId::Ssid, b"NarfNet");
+        write_ie(&mut body, ElementId::DsParameterSet, &[6]);
+        let (ssid, ch) = match beacon_ssid_channel(&body) {
+            Some(p) => p,
+            None => return TestResult::Fail("beacon_ssid_channel returned None"),
+        };
+        if ssid != b"NarfNet" {
+            return TestResult::Fail("Beacon SSID extraction wrong");
+        }
+        if ch != Some(6) {
+            return TestResult::Fail("Beacon DS channel extraction wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("wireless/mlme", smoke_mlme_beacon_ssid_channel_extract);
 }

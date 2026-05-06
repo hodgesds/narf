@@ -1,0 +1,409 @@
+//! Smoke tests for narf-usbpd.
+
+#![cfg(any(test, feature = "kernel-test"))]
+
+extern crate alloc;
+
+use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
+
+use narf_kernel_test::{kernel_test_in, TestResult};
+use narf_lib::sync::IrqSafeSpinLock;
+
+use crate::message::{
+    decode_message, encode_message, CtrlMsg, DataMsg, DataRole, FixedRdo, Header, PowerRole,
+    SourcePdo, SpecRev,
+};
+use crate::tcpc::{CcState, CcStatus, PortRole, Tcpc, TcpcError};
+use crate::tcpm::{SinkPort, SinkState, StepOutcome};
+
+// ── Header round-trip ──────────────────────────────────────────────
+
+fn smoke_header_round_trip() -> TestResult {
+    let h = Header::data(
+        DataMsg::Request,
+        DataRole::Ufp,
+        PowerRole::Sink,
+        SpecRev::R3_0,
+        4,
+        1,
+    );
+    let raw = h.encode();
+    let back = Header::decode(raw);
+    if back != h {
+        return TestResult::Fail("Header round-trip mismatch");
+    }
+    // Spec rev field at bits 6..7.
+    if (raw >> 6) & 0x3 != 0b10 {
+        return TestResult::Fail("SpecRev::R3_0 should encode to 0b10");
+    }
+    // Power role at bit 8 = 0 for Sink.
+    if (raw >> 8) & 0x1 != 0 {
+        return TestResult::Fail("PowerRole::Sink should encode bit 8 = 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("usbpd/message", smoke_header_round_trip);
+
+fn smoke_fixed_pdo_round_trip() -> TestResult {
+    // 5V / 3A — the canonical USB-PD baseline (§6.4.1.3.1).
+    let pdo = SourcePdo::Fixed {
+        voltage_mv: 5000,
+        max_current_ma: 3000,
+    };
+    let raw = pdo.encode();
+    // Type field = 00.
+    if (raw >> 30) & 0x3 != 0b00 {
+        return TestResult::Fail("Fixed PDO type-field drift");
+    }
+    let back = SourcePdo::decode(raw);
+    if back != pdo {
+        return TestResult::Fail("Fixed PDO round-trip mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("usbpd/message", smoke_fixed_pdo_round_trip);
+
+fn smoke_pps_pdo_round_trip() -> TestResult {
+    let pdo = SourcePdo::Augmented {
+        max_voltage_mv: 21000,
+        min_voltage_mv: 3300,
+        max_current_ma: 5000,
+    };
+    let raw = pdo.encode();
+    if (raw >> 30) & 0x3 != 0b11 {
+        return TestResult::Fail("Augmented PDO type-field drift");
+    }
+    let back = SourcePdo::decode(raw);
+    // PPS uses 100 mV / 50 mA quantisation; 3300 mV is exact, but
+    // 21000 mV is also exact (210 * 100). Currents use 50 mA steps:
+    // 5000 / 50 = 100 — fits.
+    if back != pdo {
+        return TestResult::Fail("PPS PDO round-trip mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("usbpd/message", smoke_pps_pdo_round_trip);
+
+fn smoke_fixed_rdo_round_trip() -> TestResult {
+    let rdo = FixedRdo {
+        object_position: 1,
+        op_current_ma: 3000,
+        max_op_current_ma: 3000,
+        give_back: false,
+        usb_comms: true,
+        no_usb_suspend: true,
+        cap_mismatch: false,
+    };
+    let raw = rdo.encode();
+    let back = FixedRdo::decode(raw);
+    if back != rdo {
+        return TestResult::Fail("Fixed RDO round-trip mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("usbpd/message", smoke_fixed_rdo_round_trip);
+
+fn smoke_message_codec_pack_layout() -> TestResult {
+    // Build a Source_Capabilities frame with a single Fixed 5V/3A PDO
+    // and verify the wire layout: 2-byte LE header followed by 4-byte
+    // LE PDO.
+    let h = Header::data(
+        DataMsg::SourceCapabilities,
+        DataRole::Dfp,
+        PowerRole::Source,
+        SpecRev::R3_0,
+        0,
+        1,
+    );
+    let pdo = SourcePdo::Fixed {
+        voltage_mv: 5000,
+        max_current_ma: 3000,
+    };
+    let frame = encode_message(h, &[pdo.encode()]);
+    if frame.len() != 6 {
+        return TestResult::Fail("Source_Cap frame should be 2 + 4 = 6 bytes");
+    }
+    let (back_h, back_pdos) = match decode_message(&frame) {
+        Some(p) => p,
+        None => return TestResult::Fail("decode_message returned None"),
+    };
+    if back_h != h {
+        return TestResult::Fail("decode header drift");
+    }
+    if back_pdos.len() != 1 || SourcePdo::decode(back_pdos[0]) != pdo {
+        return TestResult::Fail("decode PDO drift");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("usbpd/message", smoke_message_codec_pack_layout);
+
+// ── TCPC fake + sink state machine ─────────────────────────────────
+
+#[derive(Debug)]
+struct FakeTcpc {
+    role: IrqSafeSpinLock<PortRole>,
+    cc: IrqSafeSpinLock<CcStatus>,
+    tx: IrqSafeSpinLock<Vec<Vec<u8>>>,
+    rx: IrqSafeSpinLock<Vec<Vec<u8>>>,
+}
+
+impl FakeTcpc {
+    fn new() -> Self {
+        Self {
+            role: IrqSafeSpinLock::new(PortRole::Drp),
+            cc: IrqSafeSpinLock::new(CcStatus {
+                cc1: CcState::Open,
+                cc2: CcState::Open,
+            }),
+            tx: IrqSafeSpinLock::new(Vec::new()),
+            rx: IrqSafeSpinLock::new(Vec::new()),
+        }
+    }
+
+    fn set_cc(&self, cc1: CcState, cc2: CcState) {
+        *self.cc.lock() = CcStatus { cc1, cc2 };
+    }
+
+    fn enqueue_rx(&self, frame: Vec<u8>) {
+        self.rx.lock().push(frame);
+    }
+
+    fn sent_frames(&self) -> Vec<Vec<u8>> {
+        self.tx.lock().clone()
+    }
+}
+
+impl Tcpc for FakeTcpc {
+    fn name(&self) -> &'static str {
+        "fake-tcpc"
+    }
+
+    fn set_role(&self, r: PortRole) -> Result<(), TcpcError> {
+        *self.role.lock() = r;
+        Ok(())
+    }
+
+    fn cc_status(&self) -> Result<CcStatus, TcpcError> {
+        Ok(*self.cc.lock())
+    }
+
+    fn transmit(&self, msg: &[u8]) -> Result<(), TcpcError> {
+        self.tx.lock().push(msg.to_vec());
+        Ok(())
+    }
+
+    fn receive(&self) -> Result<Vec<u8>, TcpcError> {
+        let mut q = self.rx.lock();
+        if q.is_empty() {
+            return Err(TcpcError::NoMessage);
+        }
+        Ok(q.remove(0))
+    }
+}
+
+fn ctrl_frame(msg: CtrlMsg, message_id: u8) -> Vec<u8> {
+    let h = Header::control(
+        msg,
+        DataRole::Dfp,
+        PowerRole::Source,
+        SpecRev::R3_0,
+        message_id,
+    );
+    encode_message(h, &[])
+}
+
+fn source_caps_frame(pdos: &[SourcePdo], message_id: u8) -> Vec<u8> {
+    let h = Header::data(
+        DataMsg::SourceCapabilities,
+        DataRole::Dfp,
+        PowerRole::Source,
+        SpecRev::R3_0,
+        message_id,
+        pdos.len() as u8,
+    );
+    let objs: Vec<u32> = pdos.iter().map(|p| p.encode()).collect();
+    encode_message(h, &objs)
+}
+
+fn smoke_sink_state_machine_5v3a_contract() -> TestResult {
+    use crate::bootstrap_usbpd_authority;
+
+    let tcpc = Arc::new(FakeTcpc::new());
+    let port = Arc::new(SinkPort::new(tcpc.clone()));
+    let cap = bootstrap_usbpd_authority();
+
+    // 1. Unattached → AttachWait when CC1 sees Rp@3A.
+    tcpc.set_cc(CcState::Rp3A0, CcState::Open);
+    let _ = port.step(&cap).expect("unattached step");
+    if port.state() != SinkState::AttachWait {
+        return TestResult::Fail("did not advance to AttachWait");
+    }
+    // 2. AttachWait → Attached.
+    let _ = port.step(&cap).expect("attach-wait step");
+    if port.state() != SinkState::Attached {
+        return TestResult::Fail("did not advance to Attached");
+    }
+    // 3. Attached → Startup → Discovery → WaitCaps via empty steps.
+    let _ = port.step(&cap).unwrap(); // Attached → Startup
+    let _ = port.step(&cap).unwrap(); // Startup → Discovery
+    let _ = port.step(&cap).unwrap(); // Discovery → WaitCaps
+    if port.state() != SinkState::WaitCaps {
+        return TestResult::Fail("did not reach WaitCaps");
+    }
+    // 4. Source_Capabilities arrives.
+    let pdos = [SourcePdo::Fixed {
+        voltage_mv: 5000,
+        max_current_ma: 3000,
+    }];
+    tcpc.enqueue_rx(source_caps_frame(&pdos, 0));
+    let _ = port.step(&cap).unwrap(); // WaitCaps → EvaluateCaps
+    if port.state() != SinkState::EvaluateCaps {
+        return TestResult::Fail("WaitCaps did not advance on Source_Caps");
+    }
+    // 5. EvaluateCaps → SelectCapability (synchronous policy pick).
+    let _ = port.step(&cap).unwrap();
+    if port.state() != SinkState::SelectCapability {
+        return TestResult::Fail("EvaluateCaps did not advance");
+    }
+    // 6. SelectCapability emits the Request, advances to TransitionSink.
+    let _ = port.step(&cap).unwrap();
+    if port.state() != SinkState::TransitionSink {
+        return TestResult::Fail("SelectCapability did not transmit Request");
+    }
+    let sent = tcpc.sent_frames();
+    if sent.len() != 1 {
+        return TestResult::Fail("expected exactly one Request frame on the wire");
+    }
+    let (sent_h, sent_objs) = match decode_message(&sent[0]) {
+        Some(p) => p,
+        None => return TestResult::Fail("Request frame failed to decode"),
+    };
+    if DataMsg::from_u8(sent_h.msg_type) != Some(DataMsg::Request) {
+        return TestResult::Fail("Request msg-type drift");
+    }
+    let rdo = FixedRdo::decode(sent_objs[0]);
+    if rdo.object_position != 1 || rdo.op_current_ma != 3000 {
+        return TestResult::Fail("RDO did not select PDO #1 @ 3A");
+    }
+    // 7. Source replies Accept then PS_RDY.
+    tcpc.enqueue_rx(ctrl_frame(CtrlMsg::Accept, 1));
+    let _ = port.step(&cap).unwrap();
+    if port.state() != SinkState::TransitionSink {
+        return TestResult::Fail("Accept should keep us in TransitionSink");
+    }
+    tcpc.enqueue_rx(ctrl_frame(CtrlMsg::PsRdy, 2));
+    let outcome = port.step(&cap).unwrap();
+    let contract = match outcome {
+        StepOutcome::Ready { contract } => contract,
+        _ => return TestResult::Fail("PS_RDY did not produce a Ready outcome"),
+    };
+    if contract.voltage_mv != 5000 || contract.op_current_ma != 3000 {
+        return TestResult::Fail("Contract did not lock 5V/3A");
+    }
+    if port.state() != SinkState::Ready {
+        return TestResult::Fail("did not transition to Ready");
+    }
+    if port.contract() != Some(contract) {
+        return TestResult::Fail("contract() snapshot mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("usbpd/tcpm", smoke_sink_state_machine_5v3a_contract);
+
+fn smoke_sink_rejects_empty_source_caps() -> TestResult {
+    use crate::bootstrap_usbpd_authority;
+    use crate::tcpm::SinkError;
+
+    let tcpc = Arc::new(FakeTcpc::new());
+    let port = Arc::new(SinkPort::new(tcpc.clone()));
+    let cap = bootstrap_usbpd_authority();
+
+    tcpc.set_cc(CcState::Rp3A0, CcState::Open);
+    // Walk to WaitCaps.
+    let _ = port.step(&cap).unwrap(); // Unattached → AttachWait
+    let _ = port.step(&cap).unwrap(); // AttachWait → Attached
+    let _ = port.step(&cap).unwrap(); // Attached → Startup
+    let _ = port.step(&cap).unwrap(); // Startup → Discovery
+    let _ = port.step(&cap).unwrap(); // Discovery → WaitCaps
+
+    // Source advertises 0 PDOs. Build a Source_Capabilities header
+    // with num_data_objects = 0 (illegal but defensible to detect).
+    let frame = source_caps_frame(&[], 0);
+    tcpc.enqueue_rx(frame);
+    match port.step(&cap) {
+        // Empty caps means Source_Capabilities with num_data_objects=0,
+        // which we interpret as a protocol error and bounce back to
+        // Unattached. The state-machine test verifies that path.
+        Ok(_) => {
+            if port.state() == SinkState::Unattached {
+                return TestResult::Pass;
+            }
+            return TestResult::Fail("empty Source_Caps should drop to Unattached");
+        }
+        Err(SinkError::NoPdos) => return TestResult::Pass,
+        Err(_) => return TestResult::Fail("unexpected error variant"),
+    }
+}
+kernel_test_in!("usbpd/tcpm", smoke_sink_rejects_empty_source_caps);
+
+fn smoke_cap_revocation_blocks_step() -> TestResult {
+    use crate::bootstrap_usbpd_authority;
+    use crate::tcpm::SinkError;
+
+    let tcpc = Arc::new(FakeTcpc::new());
+    let port = Arc::new(SinkPort::new(tcpc));
+    let cap = bootstrap_usbpd_authority();
+    cap.revoke();
+    match port.step(&cap) {
+        Err(SinkError::AuthorityRevoked) => TestResult::Pass,
+        _ => TestResult::Fail("step accepted a revoked cap"),
+    }
+}
+kernel_test_in!("usbpd/tcpm", smoke_cap_revocation_blocks_step);
+
+fn smoke_cc_status_attached_logic() -> TestResult {
+    let s_open = CcStatus {
+        cc1: CcState::Open,
+        cc2: CcState::Open,
+    };
+    if s_open.attached() {
+        return TestResult::Fail("(Open, Open) should not be attached");
+    }
+    let s_ra_only = CcStatus {
+        cc1: CcState::Ra,
+        cc2: CcState::Open,
+    };
+    if s_ra_only.attached() {
+        return TestResult::Fail("(Ra, Open) is a powered cable, not an attached partner");
+    }
+    let s_rp = CcStatus {
+        cc1: CcState::Rp3A0,
+        cc2: CcState::Open,
+    };
+    if !s_rp.attached() {
+        return TestResult::Fail("(Rp3A0, Open) should report attached");
+    }
+    let _ = vec![1u8, 2]; // anchor alloc::vec import
+    TestResult::Pass
+}
+kernel_test_in!("usbpd/tcpc", smoke_cc_status_attached_logic);
+
+fn smoke_port_registry_round_trip() -> TestResult {
+    use crate::tcpm;
+    tcpm::__test_reset();
+    let tcpc = Arc::new(FakeTcpc::new());
+    let port = Arc::new(SinkPort::new(tcpc));
+    tcpm::register(port.clone());
+    let snap = tcpm::ports();
+    if snap.len() != 1 {
+        return TestResult::Fail("registry did not capture the port");
+    }
+    tcpm::__test_reset();
+    if !tcpm::ports().is_empty() {
+        return TestResult::Fail("__test_reset did not drain registry");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("usbpd/tcpm", smoke_port_registry_round_trip);

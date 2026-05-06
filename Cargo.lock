@@ -548,6 +548,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-bluetooth"
+version = "0.0.0"
+dependencies = [
+ "narf-capabilities",
+ "narf-kernel-test",
+ "narf-lib",
+]
+
+[[package]]
 name = "narf-boot"
 version = "0.0.0"
 dependencies = [
@@ -903,6 +912,7 @@ dependencies = [
  "narf-aml",
  "narf-arch",
  "narf-audio",
+ "narf-bluetooth",
  "narf-boot",
  "narf-bus",
  "narf-console",
@@ -943,6 +953,7 @@ dependencies = [
  "narf-spdm",
  "narf-time",
  "narf-tpm",
+ "narf-usbpd",
  "narf-user-runtime",
  "narf-userspace",
  "narf-verification",
@@ -1243,6 +1254,15 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-time",
+]
+
+[[package]]
+name = "narf-usbpd"
+version = "0.0.0"
+dependencies = [
+ "narf-capabilities",
+ "narf-kernel-test",
+ "narf-lib",
 ]
 
 [[package]]
