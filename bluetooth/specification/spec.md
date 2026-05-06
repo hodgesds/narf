@@ -47,6 +47,20 @@ Bluetooth subsystem source material was consulted at any point.**
   Connections pairing), §2.3.5.1 (pairing-method selection table 2.8),
   §2.2.5 (AES-CMAC), §2.2.6 (DHKey), §2.2.7 (f5 LTK derivation).
 
+### AVDTP / A2DP
+
+- **Audio/Video Distribution Transport Protocol Specification,
+  Version 1.3** — Bluetooth SIG. Public adopted document.
+  §8.4 (Signalling Message format), §8.5 (Signal Identifiers,
+  table 8.4), §8.6 (Service Capabilities), §8.20.1 (SEP TSEP
+  encoding), §8.20.6 (error codes table 8.27).
+- **Advanced Audio Distribution Profile (A2DP), Version 1.4** —
+  Bluetooth SIG. Public. §4.3 SBC media-codec capability layout
+  (sampling-frequency / channel-mode / block-length / subbands /
+  allocation-method bitmasks + 1-byte min/max bitpool).
+- **Bluetooth Assigned Numbers** — AVDTP signalling PSM 0x0019,
+  Audio/Video Distribution media-type and codec-type registry.
+
 ### RFCOMM
 
 - **Bluetooth Core Specification 5.3, Vol 3 Part B (RFCOMM)** —
@@ -109,6 +123,14 @@ Bluetooth subsystem source material was consulted at any point.**
   Information / Exchange MTU per ATT §3.4. Convenience builders
   `add_primary_service` / `add_characteristic` emit the canonical
   Vol 3 Part G declaration shape.
+- **AVDTP / A2DP** (`avdtp`): clean-room AVDTP signalling codec.
+  Header packing (transaction label, packet type, message type,
+  signal id), Stream End Point encode/decode (SEID + In-Use bit +
+  media type + TSEP), SBC Media Codec Capability blob (frequency /
+  channel-mode / block-length / subbands / allocation-method
+  bitmasks + bitpool range), and command builders for Discover /
+  Get Capabilities / Set Configuration / Open / Start / Suspend /
+  Close. PSM 0x0019 surfaced as a constant.
 - **RFCOMM** (`rfcomm`): wire-frame codec for SABM/UA/DM/DISC/UIH
   with both 1-byte and 2-byte EA-coded length indicators, FCS-8 over
   the spec-mandated coverage (header for control frames, address+

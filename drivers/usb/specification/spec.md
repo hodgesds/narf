@@ -24,6 +24,21 @@ All driver code is derived strictly from the references below.
   Version 1.11** — USB-IF. Public.
 - **HID Usage Tables, Version 1.5** — USB-IF.
 
+### USB Video Class 1.5
+
+- **Universal Serial Bus Device Class Definition for Video Devices,
+  Revision 1.5** (March 16, 2012) — USB-IF. Public.
+  §3.1 (class triple), §3.7 (VC class-specific descriptors:
+  HEADER, INPUT_TERMINAL camera, OUTPUT_TERMINAL, PROCESSING_UNIT,
+  EXTENSION_UNIT), §3.9.2.1 (VS INPUT_HEADER), Annex A (terminal
+  type codes).
+- **Universal Serial Bus Device Class Definition for Video Devices:
+  Uncompressed Payload, Revision 1.5** — USB-IF. Public. §3.1.1
+  (FORMAT_UNCOMPRESSED + Format-GUID byte order), §3.1.2
+  (FRAME_UNCOMPRESSED).
+- **Universal Serial Bus Device Class Definition for Video Devices:
+  Frame-Based Payload, Revision 1.5** — USB-IF. Public.
+
 ### USB Audio Class 1.0
 
 - **Universal Serial Bus Device Class Definition for Audio Devices,
@@ -47,6 +62,15 @@ All driver code is derived strictly from the references below.
   READ_CAPACITY(10), READ(10), WRITE(10) for single-block transfers.
 - **Hub** (`hub`): basic hub class enumeration so devices behind
   a hub are visible.
+- **UVC 1.5** (`uvc`): UVC descriptor parser. VC HEADER (bcdUVC,
+  clock frequency, controlled VS interfaces), INPUT_TERMINAL with
+  the camera-specific extension (objective focal length range,
+  controls bitmap), OUTPUT_TERMINAL, PROCESSING_UNIT, VS
+  INPUT_HEADER (with the per-format control bitmap list), VS
+  FORMAT_UNCOMPRESSED with 16-byte Format-GUIDs (YUY2, NV12), VS
+  FRAME_UNCOMPRESSED with both discrete and continuous frame-
+  interval forms, VS FORMAT_MJPEG. Pure descriptor decode — pairs
+  with a future isochronous/bulk video data path.
 - **UAC1** (`uac`): USB Audio Class 1.0 descriptor parser. AC
   HEADER, INPUT_TERMINAL, OUTPUT_TERMINAL, FEATURE_UNIT (per-channel
   control bitmaps), AS_GENERAL, Type-I FORMAT_TYPE (discrete sample-

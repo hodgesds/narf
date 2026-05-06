@@ -1379,3 +1379,166 @@ fn smoke_rfcomm_dlc_state_machine_open_then_send() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bluetooth/rfcomm", smoke_rfcomm_dlc_state_machine_open_then_send);
+
+// ── AVDTP / A2DP smokes ────────────────────────────────────────────
+
+fn smoke_avdtp_header_round_trip() -> TestResult {
+    use crate::avdtp::{Header, MSG_COMMAND, PKT_SINGLE, SID_DISCOVER};
+    let h = Header {
+        transaction: 5,
+        packet_type: PKT_SINGLE,
+        message_type: MSG_COMMAND,
+        signal_id: SID_DISCOVER,
+    };
+    let bytes = h.encode();
+    if bytes.len() != 2 {
+        return TestResult::Fail("header should be 2 bytes for SINGLE messages");
+    }
+    // byte 0: 0101 (txn=5) | 00 (PKT_SINGLE) | 00 (CMD) = 0x50
+    if bytes[0] != 0x50 {
+        return TestResult::Fail("header byte 0 packing wrong");
+    }
+    if bytes[1] != SID_DISCOVER {
+        return TestResult::Fail("header byte 1 should carry SID");
+    }
+    let back = Header::decode(&bytes).expect("decode");
+    if back != h {
+        return TestResult::Fail("header round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/avdtp", smoke_avdtp_header_round_trip);
+
+fn smoke_avdtp_discover_command_layout() -> TestResult {
+    use crate::avdtp::{discover_command, SID_DISCOVER};
+    let bytes = discover_command(3);
+    if bytes.len() != 2 {
+        return TestResult::Fail("discover command = header only");
+    }
+    if bytes[1] != SID_DISCOVER {
+        return TestResult::Fail("discover SID mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/avdtp", smoke_avdtp_discover_command_layout);
+
+fn smoke_avdtp_sep_round_trip() -> TestResult {
+    use crate::avdtp::{StreamEndPoint, MEDIA_AUDIO, SEP_TYPE_SINK};
+    let s = StreamEndPoint {
+        seid: 0x05,
+        in_use: false,
+        media_type: MEDIA_AUDIO,
+        tsep: SEP_TYPE_SINK,
+    };
+    let b = s.encode();
+    // byte 0: seid(0x05)<<2 = 0x14, in_use=0 → 0x14
+    if b[0] != 0x14 {
+        return TestResult::Fail("SEP byte 0 layout wrong");
+    }
+    // byte 1: media=0 (audio) | tsep<<3 = 0x08
+    if b[1] != 0x08 {
+        return TestResult::Fail("SEP byte 1 layout wrong (sink, audio)");
+    }
+    let back = StreamEndPoint::decode(&b).expect("decode");
+    if back != s {
+        return TestResult::Fail("SEP round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/avdtp", smoke_avdtp_sep_round_trip);
+
+fn smoke_avdtp_sbc_capability_round_trip() -> TestResult {
+    use crate::avdtp::{
+        SbcCapability, SBC_ALLOC_LOUDNESS, SBC_ALLOC_SNR, SBC_BLOCK_16, SBC_BLOCK_4,
+        SBC_BLOCK_8, SBC_CHAN_JOINT_STEREO, SBC_CHAN_STEREO, SBC_FREQ_44100, SBC_FREQ_48000,
+        SBC_SUBBANDS_8,
+    };
+    let cap = SbcCapability {
+        frequency: SBC_FREQ_44100 | SBC_FREQ_48000,
+        channel_mode: SBC_CHAN_STEREO | SBC_CHAN_JOINT_STEREO,
+        block_length: SBC_BLOCK_4 | SBC_BLOCK_8 | SBC_BLOCK_16,
+        subbands: SBC_SUBBANDS_8,
+        allocation: SBC_ALLOC_SNR | SBC_ALLOC_LOUDNESS,
+        min_bitpool: 2,
+        max_bitpool: 53,
+    };
+    let bytes = cap.encode();
+    if bytes.len() != 4 {
+        return TestResult::Fail("SBC capability blob = 4 bytes");
+    }
+    let back = SbcCapability::decode(&bytes).expect("decode");
+    if back != cap {
+        return TestResult::Fail("SBC capability round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/avdtp", smoke_avdtp_sbc_capability_round_trip);
+
+fn smoke_avdtp_sbc_media_codec_capability_descriptor() -> TestResult {
+    use crate::avdtp::{
+        sbc_media_codec_capability, SbcCapability, CAT_MEDIA_CODEC, CODEC_SBC, MEDIA_AUDIO,
+        SBC_ALLOC_LOUDNESS, SBC_BLOCK_16, SBC_CHAN_JOINT_STEREO, SBC_FREQ_44100, SBC_SUBBANDS_8,
+    };
+    let blob = sbc_media_codec_capability(
+        MEDIA_AUDIO,
+        SbcCapability {
+            frequency: SBC_FREQ_44100,
+            channel_mode: SBC_CHAN_JOINT_STEREO,
+            block_length: SBC_BLOCK_16,
+            subbands: SBC_SUBBANDS_8,
+            allocation: SBC_ALLOC_LOUDNESS,
+            min_bitpool: 2,
+            max_bitpool: 53,
+        },
+    );
+    if blob[0] != CAT_MEDIA_CODEC {
+        return TestResult::Fail("category byte should be MEDIA_CODEC (0x07)");
+    }
+    if blob[1] != 6 {
+        return TestResult::Fail("length should be 6 (media_type + codec_type + 4-byte SBC)");
+    }
+    if blob[3] != CODEC_SBC {
+        return TestResult::Fail("codec byte should be SBC (0x00)");
+    }
+    if blob.len() != 8 {
+        return TestResult::Fail("blob total length: 2 hdr + 2 type + 4 sbc = 8");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/avdtp", smoke_avdtp_sbc_media_codec_capability_descriptor);
+
+fn smoke_avdtp_set_configuration_command_layout() -> TestResult {
+    use crate::avdtp::{set_configuration_command, SID_SET_CONFIGURATION};
+    let bytes = set_configuration_command(2, 5, 9, &[0xAA, 0xBB]);
+    // byte 0: txn=2, SINGLE, CMD = 0x20
+    // byte 1: SID
+    // byte 2: ACP SEID = 5 << 2 = 0x14
+    // byte 3: INT SEID = 9 << 2 = 0x24
+    // byte 4..: capabilities
+    if bytes[0] != 0x20 {
+        return TestResult::Fail("header byte 0 wrong");
+    }
+    if bytes[1] != SID_SET_CONFIGURATION {
+        return TestResult::Fail("SID mismatch");
+    }
+    if bytes[2] != 0x14 {
+        return TestResult::Fail("ACP SEID encoding wrong");
+    }
+    if bytes[3] != 0x24 {
+        return TestResult::Fail("INT SEID encoding wrong");
+    }
+    if &bytes[4..] != &[0xAA, 0xBB] {
+        return TestResult::Fail("trailing capability blob lost");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/avdtp", smoke_avdtp_set_configuration_command_layout);
+
+fn smoke_avdtp_psm_assigned_number() -> TestResult {
+    use crate::avdtp::AVDTP_PSM;
+    if AVDTP_PSM != 0x0019 {
+        return TestResult::Fail("AVDTP PSM is 0x0019 per Assigned Numbers");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/avdtp", smoke_avdtp_psm_assigned_number);

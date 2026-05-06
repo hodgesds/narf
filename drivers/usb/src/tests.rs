@@ -639,3 +639,165 @@ fn smoke_uac_format_type_i_continuous_range() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/uac", smoke_uac_format_type_i_continuous_range);
+
+// ── UVC descriptor parser smokes ───────────────────────────────────
+
+fn smoke_uvc_class_triple_constants() -> TestResult {
+    use crate::uvc;
+    if uvc::USB_CLASS_VIDEO != 0x0E {
+        return TestResult::Fail("Video class code = 0x0E");
+    }
+    if uvc::USB_VIDEO_SUBCLASS_VIDEOSTREAMING != 0x02 {
+        return TestResult::Fail("VS subclass = 0x02");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_uvc_class_triple_constants);
+
+fn smoke_uvc_yuy2_guid_bytes() -> TestResult {
+    use crate::uvc::GUID_FORMAT_YUY2;
+    // The first four ASCII bytes of the GUID are "YUY2".
+    if &GUID_FORMAT_YUY2[..4] != b"YUY2" {
+        return TestResult::Fail("YUY2 GUID prefix should be ASCII 'YUY2'");
+    }
+    // The trailing fixed suffix is the FOURCC namespace.
+    if &GUID_FORMAT_YUY2[8..16] != &[0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71] {
+        return TestResult::Fail("YUY2 GUID trailer mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_uvc_yuy2_guid_bytes);
+
+fn smoke_uvc_vc_header_parses() -> TestResult {
+    use crate::uvc::VcHeader;
+    // bLength=13, CS_INTERFACE, VC_HEADER, bcdUVC=0x0150 (UVC 1.5),
+    // wTotalLength=0x80, dwClockFrequency=15_000_000 LE,
+    // bInCollection=1, baInterfaceNr[0]=2
+    let mut buf = alloc::vec![13, 0x24, 0x01, 0x50, 0x01, 0x80, 0x00];
+    buf.extend_from_slice(&15_000_000u32.to_le_bytes());
+    buf.push(1);
+    buf.push(2);
+    let h = VcHeader::parse(&buf).expect("parse");
+    if h.bcd_uvc != 0x0150 {
+        return TestResult::Fail("bcdUVC should decode to 0x0150");
+    }
+    if h.clock_frequency != 15_000_000 {
+        return TestResult::Fail("clock frequency mismatch");
+    }
+    if h.in_collection != alloc::vec![2u8] {
+        return TestResult::Fail("collection list mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_uvc_vc_header_parses);
+
+fn smoke_uvc_camera_input_terminal_carries_focal_length() -> TestResult {
+    use crate::uvc::{InputTerminal, ITT_CAMERA};
+    // bLength=18, CS_INTERFACE, INPUT_TERMINAL, bTerminalID=1,
+    // wTerminalType=0x0201 (Camera), bAssocTerminal=0, iTerminal=0,
+    // wObjectiveFocalLengthMin=10, Max=100, wOcularFocalLength=50,
+    // bControlSize=3, bmControls=0x00_0007 (auto-exposure mode + AE
+    // priority + exposure time absolute), trailing iTerminal handled
+    // implicitly by remaining bytes.
+    let mut buf = alloc::vec![18u8, 0x24, 0x02, 1, 0x01, 0x02, 0, 0];
+    buf.extend_from_slice(&10u16.to_le_bytes());
+    buf.extend_from_slice(&100u16.to_le_bytes());
+    buf.extend_from_slice(&50u16.to_le_bytes());
+    buf.push(3);
+    buf.push(0x07);
+    buf.push(0x00);
+    buf.push(0x00);
+    let t = InputTerminal::parse(&buf).expect("parse");
+    if t.terminal_type != ITT_CAMERA {
+        return TestResult::Fail("camera terminal type 0x0201 expected");
+    }
+    let cam = t.camera.expect("camera-specific block must populate");
+    if cam.objective_focal_length_min != 10 || cam.objective_focal_length_max != 100 {
+        return TestResult::Fail("focal length range mismatch");
+    }
+    if cam.controls != 0x07 {
+        return TestResult::Fail("camera controls bitmap mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_uvc_camera_input_terminal_carries_focal_length);
+
+fn smoke_uvc_format_uncompressed_yuy2() -> TestResult {
+    use crate::uvc::{FormatUncompressed, GUID_FORMAT_YUY2};
+    // 27 bytes: bLength=27, CS_INTERFACE, FORMAT_UNCOMPRESSED,
+    // bFormatIndex=1, bNumFrameDescriptors=2, GUID=YUY2, bBitsPerPixel=16,
+    // bDefaultFrameIndex=1, aspect 16:9, interlace 0, copy_protect 0
+    let mut buf = alloc::vec![27, 0x24, 0x04, 1, 2];
+    buf.extend_from_slice(&GUID_FORMAT_YUY2);
+    buf.push(16);
+    buf.push(1);
+    buf.push(16);
+    buf.push(9);
+    buf.push(0);
+    buf.push(0);
+    let f = FormatUncompressed::parse(&buf).expect("parse");
+    if f.guid != GUID_FORMAT_YUY2 {
+        return TestResult::Fail("GUID round-trip");
+    }
+    if f.bits_per_pixel != 16 {
+        return TestResult::Fail("YUY2 should declare 16 bpp");
+    }
+    if f.aspect_ratio_x != 16 || f.aspect_ratio_y != 9 {
+        return TestResult::Fail("aspect ratio mismatch");
+    }
+    if f.num_frame_descriptors != 2 {
+        return TestResult::Fail("num_frame_descriptors lost");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_uvc_format_uncompressed_yuy2);
+
+fn smoke_uvc_frame_uncompressed_1080p30() -> TestResult {
+    use crate::uvc::FrameUncompressed;
+    // bLength=30, CS_INTERFACE, FRAME_UNCOMPRESSED, bFrameIndex=1,
+    // capabilities=0, wWidth=1920, wHeight=1080, dwMin/MaxBitrate,
+    // dwMaxVideoFrameBufferSize, dwDefaultFrameInterval=333_333 (30 fps),
+    // bFrameIntervalType=1, dwFrameInterval[0]=333_333
+    let mut buf = alloc::vec![30u8, 0x24, 0x05, 1, 0];
+    buf.extend_from_slice(&1920u16.to_le_bytes());
+    buf.extend_from_slice(&1080u16.to_le_bytes());
+    buf.extend_from_slice(&100_000_000u32.to_le_bytes()); // min bitrate 100 Mbps
+    buf.extend_from_slice(&100_000_000u32.to_le_bytes()); // max bitrate
+    buf.extend_from_slice(&(1920u32 * 1080 * 2).to_le_bytes()); // YUY2 buffer
+    buf.extend_from_slice(&333_333u32.to_le_bytes()); // default interval
+    buf.push(1); // discrete, 1 entry
+    buf.extend_from_slice(&333_333u32.to_le_bytes());
+    let f = FrameUncompressed::parse(&buf).expect("parse");
+    if f.width != 1920 || f.height != 1080 {
+        return TestResult::Fail("1080p resolution lost");
+    }
+    if f.frame_intervals != alloc::vec![333_333u32] {
+        return TestResult::Fail("frame interval list mismatch");
+    }
+    let fps = FrameUncompressed::fps_from_interval(f.frame_intervals[0]);
+    if fps != 30 {
+        return TestResult::Fail("100 ns interval should convert to 30 fps");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_uvc_frame_uncompressed_1080p30);
+
+fn smoke_uvc_format_mjpeg_decodes_default_frame_index() -> TestResult {
+    use crate::uvc::FormatMjpeg;
+    // 11 bytes: bLength=11, CS_INTERFACE, FORMAT_MJPEG, bFormatIndex=2,
+    // bNumFrameDescriptors=3, bmFlags=0x01, bDefaultFrameIndex=2,
+    // aspect 4:3, interlace 0, copy_protect 0
+    let buf = [11u8, 0x24, 0x06, 2, 3, 0x01, 2, 4, 3, 0, 0];
+    let f = FormatMjpeg::parse(&buf).expect("parse");
+    if f.format_index != 2 {
+        return TestResult::Fail("format index lost");
+    }
+    if f.default_frame_index != 2 {
+        return TestResult::Fail("default frame index lost");
+    }
+    if f.aspect_ratio_x != 4 || f.aspect_ratio_y != 3 {
+        return TestResult::Fail("aspect ratio lost");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc", smoke_uvc_format_mjpeg_decodes_default_frame_index);

@@ -10,6 +10,7 @@ pub mod hid;
 pub mod hub;
 pub mod msc;
 pub mod uac;
+pub mod uvc;
 pub mod xhci;
 
 mod tests;

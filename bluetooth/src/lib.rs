@@ -31,6 +31,7 @@
 extern crate alloc;
 
 pub mod att;
+pub mod avdtp;
 pub mod controller;
 pub mod event;
 pub mod gatt;

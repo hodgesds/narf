@@ -19,6 +19,18 @@ All driver code is derived strictly from the references below.
   §2.2.14 Clock Control, §2.2.16 Software Reset, §2.2.18 Normal
   Interrupt Status, §3.6 reset sequence, §3.7 SD bus power on.
 
+### eMMC EXT_CSD
+
+- **JEDEC Standard JESD84-B51 — "Embedded Multi-Media Card (e•MMC)
+  Electrical Standard (5.1)"** — JEDEC. Public.
+  §6.6.4 (SWITCH command argument layout — Access:2 / Index:8 /
+  Value:8 / CmdSet:8). §6.6.5 (HS200 / HS400 timing flags).
+  §7.4 (EXT_CSD register, 512 bytes; field offsets in Table 39:
+  REV=192, CARD_TYPE=196, BUS_WIDTH=183, HS_TIMING=185,
+  PARTITION_CONFIG=179, BOOT_SIZE_MULT=226, RPMB_SIZE_MULT=168,
+  SEC_COUNT=212, PRE_EOL_INFO=267, DEVICE_LIFE_TIME_EST_TYP_A=268,
+  DEVICE_LIFE_TIME_EST_TYP_B=269).
+
 ### SD protocol (CSD / CID / responses)
 
 - **SD Physical Layer Simplified Specification, Version 8.00** —
@@ -39,6 +51,14 @@ All driver code is derived strictly from the references below.
   identification sequence (CMD0 / CMD8 / ACMD41 / CMD2 / CMD3 / CMD7
   / CMD16), single-block PIO `read_block` / `write_block` on top of
   CMD17 / CMD24, error reporting via NIS_ERROR + EIS.
+- **eMMC EXT_CSD** (`emmc`): clean-room JEDEC JESD84-B51 EXT_CSD
+  register decoder. Parses revision, CARD_TYPE flags (HS_26 /
+  HS_52 / HS200 / HS400 with 1V8 + 1V2 variants), bus width,
+  HS_TIMING, PARTITION_CONFIG (active boot partition + currently
+  accessed partition), BOOT/RPMB partition sizes (mult × 128 KiB),
+  user-area capacity from SEC_COUNT, PRE_EOL_INFO + per-area life-
+  time estimation. Builder for the SWITCH (CMD6) argument used to
+  rewrite individual EXT_CSD bytes (Access=Write Byte).
 - **SD protocol decoders** (`sd_proto`): pure parsers for R1, R6, R7
   responses; CID register (manufacturer + OEM + product name + serial
   + MDT); CSD register (both v1.0 and v2.0 capacity formulas + read /

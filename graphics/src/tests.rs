@@ -266,3 +266,123 @@ fn smoke_edid_parses_known_block() -> TestResult {
     }
 }
 kernel_test_in!("graphics", smoke_edid_parses_known_block);
+
+// ── DisplayPort AUX / DPCD smokes ──────────────────────────────────
+
+fn smoke_dp_aux_native_write_command_byte_layout() -> TestResult {
+    use crate::dp_aux::{build_native_write, AUX_CMD_NATIVE_WRITE};
+    let req = build_native_write(0x12345, &[0xDE, 0xAD]).expect("build");
+    // byte 0: cmd<<4 | (addr>>16)&0xF = 0x80 | 0x01 = 0x81
+    if req[0] != ((AUX_CMD_NATIVE_WRITE << 4) | 0x01) {
+        return TestResult::Fail("command byte should pack cmd nibble + addr[19:16]");
+    }
+    if req[1] != 0x23 || req[2] != 0x45 {
+        return TestResult::Fail("address LE bytes wrong");
+    }
+    if req[3] != 1 {
+        return TestResult::Fail("length field is len-1");
+    }
+    if &req[4..] != &[0xDE, 0xAD] {
+        return TestResult::Fail("write payload must follow length");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("graphics/dp-aux", smoke_dp_aux_native_write_command_byte_layout);
+
+fn smoke_dp_aux_native_read_request_layout() -> TestResult {
+    use crate::dp_aux::{build_native_read, AUX_CMD_NATIVE_READ};
+    let req = build_native_read(0x00000, 16).expect("build");
+    if req[0] != (AUX_CMD_NATIVE_READ << 4) {
+        return TestResult::Fail("native read cmd nibble = 0x9");
+    }
+    if req[3] != 15 {
+        return TestResult::Fail("16-byte read encodes length=15 (length-1)");
+    }
+    if req.len() != 4 {
+        return TestResult::Fail("native read = 4-byte request");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("graphics/dp-aux", smoke_dp_aux_native_read_request_layout);
+
+fn smoke_dp_aux_rejects_oversize_payload() -> TestResult {
+    use crate::dp_aux::{build_native_write, AuxError};
+    let bytes = [0u8; 17];
+    match build_native_write(0, &bytes) {
+        Err(AuxError::BadLength) => TestResult::Pass,
+        _ => TestResult::Fail(">16-byte payload must be rejected"),
+    }
+}
+kernel_test_in!("graphics/dp-aux", smoke_dp_aux_rejects_oversize_payload);
+
+fn smoke_dp_aux_rejects_oversize_address() -> TestResult {
+    use crate::dp_aux::{build_native_read, AuxError};
+    match build_native_read(0x10_0000, 1) {
+        Err(AuxError::BadAddress) => TestResult::Pass,
+        _ => TestResult::Fail("addr > 20 bits must be rejected"),
+    }
+}
+kernel_test_in!("graphics/dp-aux", smoke_dp_aux_rejects_oversize_address);
+
+fn smoke_dp_aux_reply_byte_decode() -> TestResult {
+    use crate::dp_aux::{parse_reply_byte, AUX_REPLY_ACK, AUX_REPLY_DEFER};
+    let (code, _) = parse_reply_byte(AUX_REPLY_ACK << 4);
+    if code != AUX_REPLY_ACK {
+        return TestResult::Fail("ACK reply nibble mismatch");
+    }
+    let (code, _) = parse_reply_byte(AUX_REPLY_DEFER << 4);
+    if code != AUX_REPLY_DEFER {
+        return TestResult::Fail("DEFER reply nibble mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("graphics/dp-aux", smoke_dp_aux_reply_byte_decode);
+
+fn smoke_dpcd_link_rate_constants() -> TestResult {
+    use crate::dp_aux::link_rate;
+    // DPCD encodes link rate as bw / 0.27 GHz → integer multipliers.
+    if link_rate::RBR != 0x06 {
+        return TestResult::Fail("RBR (1.62 Gbps) = 6");
+    }
+    if link_rate::HBR != 0x0A {
+        return TestResult::Fail("HBR (2.7 Gbps) = 10");
+    }
+    if link_rate::HBR2 != 0x14 {
+        return TestResult::Fail("HBR2 (5.4 Gbps) = 20");
+    }
+    if link_rate::HBR3 != 0x1E {
+        return TestResult::Fail("HBR3 (8.1 Gbps) = 30");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("graphics/dp-aux", smoke_dpcd_link_rate_constants);
+
+fn smoke_dpcd_lane_status_all_trained_helper() -> TestResult {
+    use crate::dp_aux::lane_status;
+    // For two lanes packed in one byte, "all done" means
+    // CR_DONE | CHANNEL_EQ_DONE | SYMBOL_LOCKED in each nibble.
+    let byte: u8 = (lane_status::CR_DONE | lane_status::CHANNEL_EQ_DONE | lane_status::SYMBOL_LOCKED)
+        | ((lane_status::CR_DONE | lane_status::CHANNEL_EQ_DONE | lane_status::SYMBOL_LOCKED) << 4);
+    if byte != lane_status::ALL_LANES_TRAINED {
+        return TestResult::Fail("ALL_LANES_TRAINED helper should match the packed mask");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("graphics/dp-aux", smoke_dpcd_lane_status_all_trained_helper);
+
+fn smoke_dp_aux_i2c_read_mot_for_edid_drain() -> TestResult {
+    use crate::dp_aux::{build_i2c_read_mot, AUX_CMD_I2C_READ_MOT};
+    // EDID DDC slave address is 0x50.
+    let req = build_i2c_read_mot(0x50, 16).expect("build");
+    if req[0] != (AUX_CMD_I2C_READ_MOT << 4) {
+        return TestResult::Fail("I2C-Read-MOT nibble = 0x5");
+    }
+    if req[2] != 0x50 {
+        return TestResult::Fail("EDID slave address goes in low byte of address");
+    }
+    if req[3] != 15 {
+        return TestResult::Fail("16-byte chunk encodes length-1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("graphics/dp-aux", smoke_dp_aux_i2c_read_mot_for_edid_drain);

@@ -420,3 +420,110 @@ fn smoke_sd_cid_decodes_manufacturer_and_date() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/storage/sd-proto", smoke_sd_cid_decodes_manufacturer_and_date);
+
+// ── eMMC EXT_CSD smokes ────────────────────────────────────────────
+
+fn smoke_emmc_ext_csd_size_constant() -> TestResult {
+    if crate::emmc::EXT_CSD_SIZE != 512 {
+        return TestResult::Fail("EXT_CSD register is 512 bytes per JESD84-B51 §7.4");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/emmc", smoke_emmc_ext_csd_size_constant);
+
+fn smoke_emmc_ext_csd_capacity_decode() -> TestResult {
+    use crate::emmc::{ExtCsd, EXT_CSD_REV, EXT_CSD_SEC_COUNT};
+    let mut buf = [0u8; 512];
+    buf[EXT_CSD_REV] = 8; // EXT_CSD revision 8 = JESD84-B51
+    // 64 GiB user partition = 134_217_728 sectors of 512 bytes.
+    let sectors: u32 = 134_217_728;
+    buf[EXT_CSD_SEC_COUNT..EXT_CSD_SEC_COUNT + 4].copy_from_slice(&sectors.to_le_bytes());
+    let ext = ExtCsd::parse(&buf).expect("parse");
+    if ext.user_capacity_bytes() != 64 * 1024 * 1024 * 1024 {
+        return TestResult::Fail("user capacity should decode to 64 GiB");
+    }
+    if ext.revision != 8 {
+        return TestResult::Fail("revision byte should round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/emmc", smoke_emmc_ext_csd_capacity_decode);
+
+fn smoke_emmc_ext_csd_supports_hs400() -> TestResult {
+    use crate::emmc::{ExtCsd, CARD_TYPE_HS400_1V8, EXT_CSD_CARD_TYPE};
+    let mut buf = [0u8; 512];
+    buf[EXT_CSD_CARD_TYPE] = CARD_TYPE_HS400_1V8;
+    let ext = ExtCsd::parse(&buf).expect("parse");
+    if !ext.supports_hs400() {
+        return TestResult::Fail("HS400 support flag missed");
+    }
+    if ext.supports_hs200() {
+        return TestResult::Fail("HS200 should not be claimed when only HS400 bit set");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/emmc", smoke_emmc_ext_csd_supports_hs400);
+
+fn smoke_emmc_ext_csd_partition_config_decode() -> TestResult {
+    use crate::emmc::{ExtCsd, EXT_CSD_PARTITION_CONFIG};
+    let mut buf = [0u8; 512];
+    // BOOT_PARTITION_ENABLE=1 (boot1), PARTITION_ACCESS=3 (RPMB).
+    buf[EXT_CSD_PARTITION_CONFIG] = (1 << 3) | 3;
+    let ext = ExtCsd::parse(&buf).expect("parse");
+    if ext.active_boot_partition() != Some(1) {
+        return TestResult::Fail("active boot partition should be 1");
+    }
+    if ext.current_partition_access() != 3 {
+        return TestResult::Fail("partition access should be RPMB (3)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/emmc", smoke_emmc_ext_csd_partition_config_decode);
+
+fn smoke_emmc_ext_csd_boot_and_rpmb_size_mult() -> TestResult {
+    use crate::emmc::{ExtCsd, EXT_CSD_BOOT_SIZE_MULT, EXT_CSD_RPMB_SIZE_MULT};
+    let mut buf = [0u8; 512];
+    buf[EXT_CSD_BOOT_SIZE_MULT] = 32; // 32 × 128 KiB = 4 MiB boot partition
+    buf[EXT_CSD_RPMB_SIZE_MULT] = 8; // 8 × 128 KiB = 1 MiB RPMB
+    let ext = ExtCsd::parse(&buf).expect("parse");
+    if ext.boot_partition_bytes() != 4 * 1024 * 1024 {
+        return TestResult::Fail("boot partition size formula: mult × 128 KiB");
+    }
+    if ext.rpmb_partition_bytes() != 1 * 1024 * 1024 {
+        return TestResult::Fail("RPMB partition size formula: mult × 128 KiB");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/emmc", smoke_emmc_ext_csd_boot_and_rpmb_size_mult);
+
+fn smoke_emmc_switch_argument_layout() -> TestResult {
+    use crate::emmc::{ExtCsd, EXT_CSD_HS_TIMING, HS_TIMING_HS200};
+    // SWITCH (CMD6) arg to set HS_TIMING=2 (HS200): Access=3, Index=185, Value=2.
+    let arg = ExtCsd::switch_argument(EXT_CSD_HS_TIMING as u8, HS_TIMING_HS200);
+    let access = (arg >> 24) & 0xFF;
+    let index = (arg >> 16) & 0xFF;
+    let value = (arg >> 8) & 0xFF;
+    if access != 3 {
+        return TestResult::Fail("Access field should be 3 (Write Byte)");
+    }
+    if index != EXT_CSD_HS_TIMING as u32 {
+        return TestResult::Fail("Index field should equal EXT_CSD offset");
+    }
+    if value != HS_TIMING_HS200 as u32 {
+        return TestResult::Fail("Value field should carry the new byte");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/emmc", smoke_emmc_switch_argument_layout);
+
+fn smoke_emmc_pre_eol_warning_decoded() -> TestResult {
+    use crate::emmc::{ExtCsd, EXT_CSD_PRE_EOL_INFO, PRE_EOL_WARNING};
+    let mut buf = [0u8; 512];
+    buf[EXT_CSD_PRE_EOL_INFO] = PRE_EOL_WARNING;
+    let ext = ExtCsd::parse(&buf).expect("parse");
+    if ext.pre_eol_info != PRE_EOL_WARNING {
+        return TestResult::Fail("PRE_EOL_INFO byte lost");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/emmc", smoke_emmc_pre_eol_warning_decoded);
