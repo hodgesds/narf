@@ -33,9 +33,11 @@ extern crate alloc;
 pub mod att;
 pub mod controller;
 pub mod event;
+pub mod gatt;
 pub mod hci;
 pub mod l2cap;
 pub mod opcode;
+pub mod smp;
 pub mod transport;
 
 mod tests;

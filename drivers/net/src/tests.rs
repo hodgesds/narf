@@ -230,3 +230,60 @@ fn smoke_igc_pci_match_table() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/igc", smoke_igc_pci_match_table);
+
+// ── atheros ───────────────────────────────────────────────────────
+
+fn smoke_atheros_pci_match_table() -> TestResult {
+    use crate::atheros;
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::{registered_pci_drivers, MatchKind};
+    __reset_for_test();
+    atheros::register_pci_driver();
+    let registered = registered_pci_drivers();
+    let want: &[u16] = &[
+        atheros::ATH_DEV_AR9285,
+        atheros::ATH_DEV_AR9287,
+        atheros::ATH_DEV_AR9280,
+    ];
+    for did in want.iter().copied() {
+        let found = registered.iter().any(|m| {
+            matches!(m.kind, MatchKind::VendorDevice {
+                vendor, device,
+            } if vendor == atheros::ATH_VENDOR_ATHEROS && device == did)
+        });
+        if !found {
+            return TestResult::Fail("atheros match entry missing");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/atheros", smoke_atheros_pci_match_table);
+
+fn smoke_atheros_reset_value_includes_cold_and_rtc() -> TestResult {
+    use crate::atheros::{mac_cold_reset_value, MAC_RESET_COLD_RESET, MAC_RESET_RTC_RESET};
+    let v = mac_cold_reset_value();
+    if v & MAC_RESET_COLD_RESET == 0 {
+        return TestResult::Fail("cold reset bit missing");
+    }
+    if v & MAC_RESET_RTC_RESET == 0 {
+        return TestResult::Fail("RTC reset bit missing");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/atheros", smoke_atheros_reset_value_includes_cold_and_rtc);
+
+fn smoke_atheros_default_intr_enable_includes_global() -> TestResult {
+    use crate::atheros::{default_intr_enable_value, INTR_GLOBAL, INTR_RXOK, INTR_TXOK};
+    let v = default_intr_enable_value();
+    if v & INTR_GLOBAL == 0 {
+        return TestResult::Fail("global IRQ enable bit missing");
+    }
+    if v & INTR_RXOK == 0 || v & INTR_TXOK == 0 {
+        return TestResult::Fail("RX-OK / TX-OK should be on by default");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/net/atheros",
+    smoke_atheros_default_intr_enable_includes_global
+);

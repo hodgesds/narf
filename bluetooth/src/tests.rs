@@ -394,6 +394,300 @@ kernel_test_in!(
     smoke_att_expects_response_classification
 );
 
+// ── SMP ────────────────────────────────────────────────────────────
+
+fn smoke_smp_pairing_feature_round_trip() -> TestResult {
+    use crate::smp::{
+        IoCapability, PairingFeatureExchange, Pdu, AUTH_BONDING, AUTH_SC, SMP_PAIRING_REQUEST,
+    };
+    let f = PairingFeatureExchange {
+        io_capability: IoCapability::DisplayYesNo as u8,
+        oob_data_flag: 0,
+        auth_req: AUTH_BONDING | AUTH_SC,
+        max_encryption_key_size: 16,
+        initiator_key_distribution: 0x07,
+        responder_key_distribution: 0x07,
+    };
+    let pdu = f.encode(SMP_PAIRING_REQUEST);
+    if pdu.code != SMP_PAIRING_REQUEST {
+        return TestResult::Fail("code mismatch");
+    }
+    let raw = pdu.encode();
+    let back_pdu = Pdu::decode(&raw).expect("decode");
+    let back = PairingFeatureExchange::decode(&back_pdu).expect("decode features");
+    if back != f {
+        return TestResult::Fail("Pairing feature round-trip drift");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/smp", smoke_smp_pairing_feature_round_trip);
+
+fn smoke_smp_pick_pairing_method_just_works() -> TestResult {
+    use crate::smp::{pick_pairing_method, IoCapability, PairingMethod};
+    // No MITM → always Just Works.
+    let m = pick_pairing_method(IoCapability::DisplayYesNo, IoCapability::KeyboardDisplay, false, true, false);
+    if m != PairingMethod::JustWorks {
+        return TestResult::Fail("no-MITM path should pick Just Works");
+    }
+    // NoInputNoOutput on either side, MITM requested → still Just Works.
+    let m = pick_pairing_method(
+        IoCapability::NoInputNoOutput,
+        IoCapability::KeyboardDisplay,
+        true,
+        true,
+        false,
+    );
+    if m != PairingMethod::JustWorks {
+        return TestResult::Fail("NoInputNoOutput must force Just Works");
+    }
+    // Two DisplayYesNo with MITM → Numeric Comparison.
+    let m = pick_pairing_method(
+        IoCapability::DisplayYesNo,
+        IoCapability::DisplayYesNo,
+        true,
+        true,
+        false,
+    );
+    if m != PairingMethod::NumericComparison {
+        return TestResult::Fail("DisplayYesNo+MITM should pick Numeric Comparison");
+    }
+    // OOB always wins.
+    let m = pick_pairing_method(
+        IoCapability::DisplayYesNo,
+        IoCapability::DisplayYesNo,
+        true,
+        true,
+        true,
+    );
+    if m != PairingMethod::OutOfBand {
+        return TestResult::Fail("OOB flag should override");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/smp", smoke_smp_pick_pairing_method_just_works);
+
+fn smoke_smp_initiator_just_works_walk() -> TestResult {
+    use crate::smp::{
+        Initiator, IoCapability, PairingError, PairingFeatureExchange, PairingState,
+        SmpCrypto, AUTH_BONDING, AUTH_SC, SMP_PAIRING_DHKEY_CHECK, SMP_PAIRING_PUBLIC_KEY,
+        SMP_PAIRING_RANDOM, SMP_PAIRING_REQUEST, SMP_PAIRING_RESPONSE,
+    };
+
+    /// Deterministic stub crypto — sufficient to exercise the state
+    /// machine. Production wires real P-256 + AES-CMAC.
+    struct StubCrypto;
+    impl SmpCrypto for StubCrypto {
+        fn p256_keygen(&self) -> ([u8; 32], [u8; 32], [u8; 32]) {
+            ([0x11; 32], [0x22; 32], [0x33; 32])
+        }
+        fn p256_dh(&self, _: &[u8; 32], _: &[u8; 32], _: &[u8; 32]) -> [u8; 32] {
+            [0x44; 32]
+        }
+        fn aes_cmac(&self, key: &[u8; 16], data: &[u8]) -> [u8; 16] {
+            // Deterministic XOR digest — tests only.
+            let mut out = [0u8; 16];
+            for (i, b) in key.iter().enumerate() {
+                out[i] ^= *b;
+            }
+            for (i, b) in data.iter().enumerate() {
+                out[i % 16] ^= *b;
+            }
+            out
+        }
+        fn rand128(&self) -> [u8; 16] {
+            [0x55; 16]
+        }
+    }
+
+    let mut init = Initiator::new(StubCrypto, [0u8; 7], [0u8; 7]);
+    let req = init.start();
+    if req.code != SMP_PAIRING_REQUEST || init.state != PairingState::SentRequest {
+        return TestResult::Fail("start() did not emit Pairing Request");
+    }
+
+    // Synthesise a Pairing Response: peer is also Just-Works capable.
+    let peer = PairingFeatureExchange {
+        io_capability: IoCapability::NoInputNoOutput as u8,
+        oob_data_flag: 0,
+        auth_req: AUTH_BONDING | AUTH_SC,
+        max_encryption_key_size: 16,
+        initiator_key_distribution: 0,
+        responder_key_distribution: 0,
+    }
+    .encode(SMP_PAIRING_RESPONSE);
+    let pk = init.feed(&peer).expect("feed rsp").expect("expect PK");
+    if pk.code != SMP_PAIRING_PUBLIC_KEY || init.state != PairingState::SentPublicKey {
+        return TestResult::Fail("response did not advance to PublicKey");
+    }
+    if pk.payload.len() != 64 {
+        return TestResult::Fail("public key payload not 64 bytes");
+    }
+
+    // Peer's public key.
+    let mut peer_pk = vec![0u8; 64];
+    for v in peer_pk.iter_mut().take(32) {
+        *v = 0x66;
+    }
+    for v in peer_pk.iter_mut().skip(32) {
+        *v = 0x77;
+    }
+    let peer_pk_smp = crate::smp::Pdu {
+        code: SMP_PAIRING_PUBLIC_KEY,
+        payload: peer_pk,
+    };
+    let after_pk = init.feed(&peer_pk_smp).expect("peer PK");
+    if !after_pk.is_none() || init.state != PairingState::WaitConfirm {
+        return TestResult::Fail("after peer PK we should be in WaitConfirm");
+    }
+
+    // Peer sends Pairing Random (Nb).
+    let peer_random = crate::smp::Pdu {
+        code: SMP_PAIRING_RANDOM,
+        payload: vec![0x88u8; 16],
+    };
+    let our_random = init
+        .feed(&peer_random)
+        .expect("nb")
+        .expect("should emit Na");
+    if our_random.code != SMP_PAIRING_RANDOM {
+        return TestResult::Fail("expected Pairing Random outbound");
+    }
+    if init.state != PairingState::SentRandom {
+        return TestResult::Fail("should be in SentRandom");
+    }
+    if init.ltk == [0u8; 16] {
+        return TestResult::Fail("LTK should be derived non-zero by f5");
+    }
+
+    // Peer sends DHKey Check; pairing completes.
+    let peer_check = crate::smp::Pdu {
+        code: SMP_PAIRING_DHKEY_CHECK,
+        payload: vec![0x99u8; 16],
+    };
+    let _ = init.feed(&peer_check).expect("dhkey check");
+    if init.state != PairingState::Done {
+        return TestResult::Fail("should be in Done after DHKey Check");
+    }
+
+    // Re-feeding a PDU after Done → Protocol error.
+    let extra = crate::smp::Pdu {
+        code: SMP_PAIRING_RANDOM,
+        payload: vec![0u8; 16],
+    };
+    match init.feed(&extra) {
+        Err(PairingError::Protocol) => {}
+        _ => return TestResult::Fail("post-Done feed should be Protocol error"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/smp", smoke_smp_initiator_just_works_walk);
+
+// ── GATT ───────────────────────────────────────────────────────────
+
+fn smoke_gatt_discover_primary_services_request() -> TestResult {
+    use crate::att::ATT_READ_BY_GROUP_TYPE_REQ;
+    use crate::gatt::{build_discover_primary_services, UUID_PRIMARY_SERVICE};
+    let pdu = build_discover_primary_services(0x0001, 0xFFFF);
+    if pdu.opcode != ATT_READ_BY_GROUP_TYPE_REQ {
+        return TestResult::Fail("opcode should be Read By Group Type");
+    }
+    if pdu.params.len() != 6 {
+        return TestResult::Fail("params should be 2+2+2 = 6 bytes");
+    }
+    let group_uuid = u16::from_le_bytes([pdu.params[4], pdu.params[5]]);
+    if group_uuid != UUID_PRIMARY_SERVICE {
+        return TestResult::Fail("group-type UUID should be 0x2800");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/gatt",
+    smoke_gatt_discover_primary_services_request
+);
+
+fn smoke_gatt_parse_primary_services_response() -> TestResult {
+    use crate::gatt::{parse_primary_services, Uuid, UUID_SERVICE_BATTERY, UUID_SERVICE_GAP};
+    // Two primary services, both 16-bit UUIDs, so unit = 6 bytes.
+    let mut rsp = vec![6u8];
+    // Service 1: GAP at handles 0x0001..=0x0007.
+    rsp.extend_from_slice(&0x0001u16.to_le_bytes());
+    rsp.extend_from_slice(&0x0007u16.to_le_bytes());
+    rsp.extend_from_slice(&UUID_SERVICE_GAP.to_le_bytes());
+    // Service 2: Battery at handles 0x0010..=0x0015.
+    rsp.extend_from_slice(&0x0010u16.to_le_bytes());
+    rsp.extend_from_slice(&0x0015u16.to_le_bytes());
+    rsp.extend_from_slice(&UUID_SERVICE_BATTERY.to_le_bytes());
+
+    let parsed = parse_primary_services(&rsp);
+    if parsed.len() != 2 {
+        return TestResult::Fail("expected 2 services parsed");
+    }
+    if parsed[0].start_handle != 0x0001 || parsed[0].end_handle != 0x0007 {
+        return TestResult::Fail("Service 1 handle range wrong");
+    }
+    if parsed[0].uuid != Uuid::U16(UUID_SERVICE_GAP) {
+        return TestResult::Fail("Service 1 UUID wrong");
+    }
+    if parsed[1].uuid != Uuid::U16(UUID_SERVICE_BATTERY) {
+        return TestResult::Fail("Service 2 UUID wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/gatt",
+    smoke_gatt_parse_primary_services_response
+);
+
+fn smoke_gatt_parse_characteristics_response() -> TestResult {
+    use crate::gatt::{parse_characteristics, Uuid, CHAR_PROP_NOTIFY, CHAR_PROP_READ};
+    // Per-tuple: 2-byte handle + (1 prop + 2 value-handle + 2 UUID) = 7 bytes.
+    let mut rsp = vec![7u8];
+    // Characteristic at decl=0x0011, props=READ|NOTIFY, value=0x0012, UUID=0x2A19 (Battery Level).
+    rsp.extend_from_slice(&0x0011u16.to_le_bytes());
+    rsp.push(CHAR_PROP_READ | CHAR_PROP_NOTIFY);
+    rsp.extend_from_slice(&0x0012u16.to_le_bytes());
+    rsp.extend_from_slice(&0x2A19u16.to_le_bytes());
+
+    let chars = parse_characteristics(&rsp);
+    if chars.len() != 1 {
+        return TestResult::Fail("expected 1 characteristic");
+    }
+    if chars[0].declaration_handle != 0x0011
+        || chars[0].value_handle != 0x0012
+        || chars[0].properties != (CHAR_PROP_READ | CHAR_PROP_NOTIFY)
+    {
+        return TestResult::Fail("Characteristic record fields wrong");
+    }
+    if chars[0].uuid != Uuid::U16(0x2A19) {
+        return TestResult::Fail("Battery Level UUID wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/gatt",
+    smoke_gatt_parse_characteristics_response
+);
+
+fn smoke_gatt_parse_descriptors_response() -> TestResult {
+    use crate::gatt::{parse_descriptors, Uuid, UUID_CCC_DESCRIPTOR};
+    // Format = 0x01 (16-bit), one descriptor at handle 0x0013 = CCCD.
+    let mut rsp = vec![0x01u8];
+    rsp.extend_from_slice(&0x0013u16.to_le_bytes());
+    rsp.extend_from_slice(&UUID_CCC_DESCRIPTOR.to_le_bytes());
+    let descs = parse_descriptors(&rsp);
+    if descs.len() != 1 {
+        return TestResult::Fail("expected 1 descriptor");
+    }
+    if descs[0].handle != 0x0013 {
+        return TestResult::Fail("descriptor handle wrong");
+    }
+    if descs[0].uuid != Uuid::U16(UUID_CCC_DESCRIPTOR) {
+        return TestResult::Fail("descriptor UUID wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/gatt", smoke_gatt_parse_descriptors_response);
+
 // ── L2CAP ──────────────────────────────────────────────────────────
 
 fn smoke_l2cap_bframe_round_trip() -> TestResult {

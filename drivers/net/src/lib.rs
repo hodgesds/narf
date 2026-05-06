@@ -30,6 +30,7 @@
 
 extern crate alloc;
 
+pub mod atheros;
 pub mod e1000;
 pub mod igc;
 pub mod iwlwifi;
@@ -83,6 +84,10 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "iwlwifi", || {
         iwlwifi::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "atheros", || {
+        atheros::register_pci_driver();
         InitResult::Ok
     });
 }

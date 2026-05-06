@@ -8,6 +8,19 @@ Clean-room implementations of TCPC chips that implement
 All driver code is derived strictly from public silicon datasheets.
 No GPL or Linux kernel source consulted.
 
+### TPS65987DDH (Texas Instruments)
+
+- **TPS65987DDH/TPS65987DDK Host Interface Technical Reference
+  Manual**, TI document SLVUBH2A.
+  <https://www.ti.com/lit/ug/slvubh2a/slvubh2a.pdf>
+  - §2 (host-interface model: register file + 4CC command channel).
+  - §3 (full register map — VID/DID/Mode/Type-C Status/Cmd1/Data1/
+    Active Contract PDO/RDO/RX-TX Source-Sink Caps).
+  - §4 (4CC command codes and payload semantics).
+- **TPS65987DDH datasheet**, TI document SLVSEX0F.
+  <https://www.ti.com/lit/ds/symlink/tps65987ddh.pdf>
+- USB Type-C 2.2 §4 (CC pin meanings the on-chip firmware enforces).
+
 ### FUSB302B (ON Semiconductor)
 
 - **FUSB302B Programmable USB Type-C Controller w/ PD** —

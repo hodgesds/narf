@@ -22,6 +22,13 @@ driver source material was consulted at any point.**
     PTK derivation, and the 4-Way Handshake state machine.
 - **IEEE Std 802.1X-2020** — Port-Based Network Access Control.
   §11.3 (EAPOL frame format) — drives the EAPOL header in `eapol.rs`.
+- **IEEE Std 802.11-2020 §12.4** — Simultaneous Authentication of
+  Equals (SAE / WPA3). §12.4.4 (Hash-to-Element), §12.4.5 (commit
+  + confirm exchange), §12.4.7.4 (frame layout), §12.4.8.6 (state
+  machine) — drives `sae.rs`. ECC group + MAC primitives are injected
+  through `EccGroup` and `MacPrimitive` traits so the protocol
+  state machine compiles without dragging in a bignum library;
+  production wires P-256 + HMAC-SHA256 from `narf-crypto`.
 
 ## 1. Purpose & scope
 

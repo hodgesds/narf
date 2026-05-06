@@ -30,6 +30,23 @@ Bluetooth subsystem source material was consulted at any point.**
   Attribute Protocol. §3.3 (PDU layout), §3.4 (opcodes), §3.4.1
   (error codes), §3.4.2 (Exchange MTU).
 
+### GATT
+
+- **Bluetooth Core Specification, version 5.3, Vol 3 Part G** —
+  Generic Attribute Profile. §3 (Service / Characteristic /
+  Descriptor model), §4.4 (discovery procedures), §3.3.1.1
+  (Characteristic Properties bit definitions).
+- **Bluetooth Assigned Numbers** — declaration UUIDs (0x2800
+  Primary Service, 0x2803 Characteristic, 0x2902 CCC Descriptor)
+  and well-known service UUIDs (0x180F Battery, 0x1812 HID, …).
+
+### SMP
+
+- **Bluetooth Core Specification, version 5.3, Vol 3 Part H** —
+  Security Manager Protocol. §3.3 (PDU layout), §2.3.5 (LE Secure
+  Connections pairing), §2.3.5.1 (pairing-method selection table 2.8),
+  §2.2.5 (AES-CMAC), §2.2.6 (DHKey), §2.2.7 (f5 LTK derivation).
+
 ### USB transport class
 
 - **USB Class Definitions for Wireless Controllers, Revision 1.0** —
@@ -51,6 +68,16 @@ Bluetooth subsystem source material was consulted at any point.**
 - **ATT** (`att`): full opcode constant set + error-code constants
   + PDU codec + builders/decoders for Exchange MTU, Read, Write,
   Handle Value Notification/Indication/Confirmation, Error Response.
+- **GATT** (`gatt`): Service / Characteristic / Descriptor record
+  types + well-known UUIDs + discovery-request builders and
+  response parsers (Read By Group Type for Primary Services, Read
+  By Type for Characteristics, Find Information for Descriptors).
+- **SMP** (`smp`): Pairing PDU codec, IO-Capability + AuthReq
+  bitfields, pairing-method selector (table 2.8), LE Secure
+  Connections **Just Works** initiator state machine
+  (Idle → SentRequest → SentPublicKey → WaitConfirm → SentRandom →
+  SentDhKeyCheck → Done). Crypto primitives injected through
+  `SmpCrypto` trait (P-256 keygen + DH, AES-CMAC, RNG).
 
 ### Out of scope (deliberate)
 - GATT, SMP, SDP, RFCOMM — sit on top of L2CAP+ATT and land in

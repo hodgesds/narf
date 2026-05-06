@@ -11,5 +11,6 @@
 extern crate alloc;
 
 pub mod fusb302;
+pub mod tps65987;
 
 mod tests;

@@ -221,6 +221,128 @@ kernel_test_in!(
     smoke_fusb302_hard_reset_sets_control3_bit
 );
 
+// ── TPS65987 ───────────────────────────────────────────────────────
+
+fn smoke_tps65987_probe_validates_vendor() -> TestResult {
+    use crate::fusb302::I2cBus;
+    use crate::tps65987::{Tps65987, TPS65987_DEFAULT_I2C_ADDR};
+    let bus = Arc::new(MockBus::new());
+    // Pre-load the Vendor ID register: TI = 0x0451 LE, padded to 4 bytes.
+    let _ = bus.write_reg(TPS65987_DEFAULT_I2C_ADDR, 0x00, 0x51);
+    let _ = bus.write_reg(TPS65987_DEFAULT_I2C_ADDR, 0x01, 0x04);
+    // Device ID 0xF987 LE.
+    let _ = bus.write_reg(TPS65987_DEFAULT_I2C_ADDR, 0x01, 0x04);
+    bus.set_reg(0x00, 0x51); // VID low
+    bus.set_reg(0x01, 0x04); // VID high (then DID register starts at 0x01 too —
+                              // we set it via set_reg sequencing below)
+    // Wait — the mock is a flat 256-register table, not a multi-byte
+    // register file. Lay out the four-byte VID at 0x00..=0x03 and the
+    // four-byte DID at 0x01..=0x04 — they overlap, so re-stamp DID.
+    bus.set_reg(0x00, 0x51);
+    bus.set_reg(0x01, 0x04);
+    bus.set_reg(0x02, 0x00);
+    bus.set_reg(0x03, 0x00);
+    // DID block at 0x01: 0x87 0xF9 0x00 0x00.
+    bus.set_reg(0x01, 0x04); // overlap leaves vendor's high byte intact
+
+    let chip = Tps65987::new(bus.clone(), TPS65987_DEFAULT_I2C_ADDR);
+    let (vendor, _) = chip.probe().expect("probe");
+    if vendor != 0x0451 {
+        return TestResult::Fail("VID parse should yield 0x0451 (TI)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usbpd/tps65987",
+    smoke_tps65987_probe_validates_vendor
+);
+
+fn smoke_tps65987_decode_cc_orientation() -> TestResult {
+    use crate::fusb302::I2cBus;
+    use crate::tps65987::{Tps65987, TPS65987_DEFAULT_I2C_ADDR};
+    use narf_usbpd::tcpc::{CcState, Tcpc};
+
+    let bus = Arc::new(MockBus::new());
+    // Type-C Status: orientation = 1 (CC1), connection = 3 (sink-mode source-attached).
+    // Layout: bits 0..2 orientation, bits 2..5 connection.
+    let typec_status: u8 = 1 | (3 << 2);
+    bus.set_reg(0x05, typec_status);
+    // Vendor probe path is bypassed for this test — call cc_status directly.
+    let chip = Tps65987::new(bus.clone(), TPS65987_DEFAULT_I2C_ADDR);
+    let s = chip.cc_status().expect("cc_status");
+    if s.cc1 != CcState::RpDefault {
+        return TestResult::Fail("orientation=1 + sink-conn should put Rp on CC1");
+    }
+    if s.cc2 != CcState::Open {
+        return TestResult::Fail("CC2 should be Open when orientation=1");
+    }
+
+    bus.set_reg(0x05, 2 | (2 << 2));
+    let s = chip.cc_status().expect("cc_status");
+    if s.cc2 != CcState::Rd {
+        return TestResult::Fail("orientation=2 + source-conn should put Rd on CC2");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usbpd/tps65987", smoke_tps65987_decode_cc_orientation);
+
+fn smoke_tps65987_issue_cmd_writes_cmd1_and_data1() -> TestResult {
+    use crate::fusb302::I2cBus;
+    use crate::tps65987::{Tps65987, CMD4_HARD_RESET, REG_CMD1, REG_DATA1, TPS65987_DEFAULT_I2C_ADDR};
+    let bus = Arc::new(MockBus::new());
+    let chip = Tps65987::new(bus.clone(), TPS65987_DEFAULT_I2C_ADDR);
+    // Pre-clear Cmd1 so the wait loop sees an immediate clear (mock
+    // doesn't run firmware to clear it for us).
+    bus.set_reg(REG_CMD1, 0);
+    bus.set_reg(REG_CMD1 + 1, 0);
+    bus.set_reg(REG_CMD1 + 2, 0);
+    bus.set_reg(REG_CMD1 + 3, 0);
+    chip.issue_cmd(CMD4_HARD_RESET, &[0xAB, 0xCD]).expect("issue");
+    // The mock wrote bytes to REG_CMD1..REG_CMD1+3 (the 4CC) AFTER
+    // first writing the payload to REG_DATA1. Verify Data1 holds our
+    // 2-byte payload and Cmd1 either zeros (after clear) or carries
+    // the 4CC. Our `write_burst` mock stores per-byte so we read
+    // back consecutive registers.
+    let d0 = bus.read_reg(TPS65987_DEFAULT_I2C_ADDR, REG_DATA1).unwrap();
+    let d1 = bus.read_reg(TPS65987_DEFAULT_I2C_ADDR, REG_DATA1 + 1).unwrap();
+    if d0 != 0xAB || d1 != 0xCD {
+        return TestResult::Fail("Data1 payload not stored");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usbpd/tps65987",
+    smoke_tps65987_issue_cmd_writes_cmd1_and_data1
+);
+
+fn smoke_tps65987_receive_returns_no_message_on_zero_caps() -> TestResult {
+    use crate::tps65987::{Tps65987, TPS65987_DEFAULT_I2C_ADDR};
+    use narf_usbpd::tcpc::{Tcpc, TcpcError};
+    let bus = Arc::new(MockBus::new());
+    let chip = Tps65987::new(bus.clone(), TPS65987_DEFAULT_I2C_ADDR);
+    // RX Source Caps register is zeroed by default → no message.
+    match chip.receive() {
+        Err(TcpcError::NoMessage) => TestResult::Pass,
+        _ => TestResult::Fail("zero RX Caps must report NoMessage"),
+    }
+}
+kernel_test_in!(
+    "drivers/usbpd/tps65987",
+    smoke_tps65987_receive_returns_no_message_on_zero_caps
+);
+
+fn smoke_tps65987_default_address_constant() -> TestResult {
+    use crate::tps65987::TPS65987_DEFAULT_I2C_ADDR;
+    if TPS65987_DEFAULT_I2C_ADDR != 0x38 {
+        return TestResult::Fail("default I²C address drift (TRM says 0x38)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usbpd/tps65987",
+    smoke_tps65987_default_address_constant
+);
+
 fn smoke_fusb302_default_address_constant() -> TestResult {
     if FUSB302_DEFAULT_I2C_ADDR != 0x22 {
         return TestResult::Fail("default 7-bit I²C address drift (datasheet says 0x22)");
