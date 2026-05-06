@@ -42,6 +42,7 @@ narf-init            = { path = "../init" }
 narf-fb              = { path = "../fb" }
 narf-audio           = { path = "../audio" }
 narf-bluetooth       = { path = "../bluetooth" }
+narf-edid            = { path = "../edid" }
 narf-usbpd           = { path = "../usbpd" }
 narf-drivers-usbpd   = { path = "../drivers/usbpd" }
 narf-wireless        = { path = "../wireless" }
@@ -75,6 +76,7 @@ kernel-test  = [
     "dep:narf-verification",
     "narf-audio/kernel-test",
     "narf-bluetooth/kernel-test",
+    "narf-edid/kernel-test",
     "narf-usbpd/kernel-test",
     "narf-drivers-usbpd/kernel-test",
     "narf-wireless/kernel-test",

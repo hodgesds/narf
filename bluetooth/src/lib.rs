@@ -34,6 +34,7 @@ pub mod att;
 pub mod controller;
 pub mod event;
 pub mod gatt;
+pub mod gatt_server;
 pub mod hci;
 pub mod l2cap;
 pub mod opcode;

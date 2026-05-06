@@ -22,6 +22,15 @@ driver source material was consulted at any point.**
     PTK derivation, and the 4-Way Handshake state machine.
 - **IEEE Std 802.1X-2020** — Port-Based Network Access Control.
   §11.3 (EAPOL frame format) — drives the EAPOL header in `eapol.rs`.
+- **IEEE Std 802.11-2020 §12.5.3** — CCMP (CTR-with-CBC-MAC). Drives
+  `ccmp.rs`: §12.5.3.2 (CCMP header), §12.5.3.3.3 (AAD construction),
+  §12.5.3.3.4 (nonce construction), §12.5.3.4.4 (replay window).
+  AES-CCM block primitive is injected through the `AesCcm` trait —
+  production wires AES-128-CCM from `narf-crypto`.
+- **IEEE Std 802.11-2020 §9.4.2.24** — RSN Information Element.
+  Drives `rsn.rs`: §9.4.2.24.1 (frame layout), §9.4.2.24.2 (cipher
+  suite OUI/type table), §9.4.2.24.3 (AKM types), §9.4.2.24.4 (RSN
+  Capabilities bits including MFP-required / MFP-capable / OCV).
 - **IEEE Std 802.11-2020 §12.4** — Simultaneous Authentication of
   Equals (SAE / WPA3). §12.4.4 (Hash-to-Element), §12.4.5 (commit
   + confirm exchange), §12.4.7.4 (frame layout), §12.4.8.6 (state

@@ -540,3 +540,129 @@ fn smoke_pci_cap_ext_walker() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("bus", smoke_pci_cap_ext_walker);
+
+// ── AER classifier + bit definitions ──────────────────────────────
+
+fn smoke_aer_classify_correctable_first() -> TestResult {
+    use crate::pci_cap_ext::{classify_aer, AerSeverity};
+    // Both corr + uncorr bits set → correctable wins because we
+    // prioritise the cheaper class (PCIe §6.2.7 — correctable
+    // events are always logged separately).
+    let s = classify_aer(0x0001_0000, 0x0001_0000, 0x0000_0001);
+    assert_eq!(s, Some(AerSeverity::Correctable));
+    TestResult::Pass
+}
+kernel_test_in!("bus/aer", smoke_aer_classify_correctable_first);
+
+fn smoke_aer_classify_fatal_when_severity_set() -> TestResult {
+    use crate::pci_cap_ext::{aer_uncorrectable, classify_aer, AerSeverity};
+    let bit = aer_uncorrectable::DLP;
+    // DLP set in status + severity → Fatal.
+    let s = classify_aer(bit, bit, 0);
+    assert_eq!(s, Some(AerSeverity::Fatal));
+    // DLP set in status but not severity → NonFatal.
+    let s = classify_aer(bit, 0, 0);
+    assert_eq!(s, Some(AerSeverity::NonFatal));
+    // No bits at all → None.
+    let s = classify_aer(0, 0, 0);
+    assert_eq!(s, None);
+    TestResult::Pass
+}
+kernel_test_in!("bus/aer", smoke_aer_classify_fatal_when_severity_set);
+
+fn smoke_aer_uncorrectable_bits_are_distinct() -> TestResult {
+    use crate::pci_cap_ext::aer_uncorrectable as u;
+    let bits = [
+        u::DLP,
+        u::SURPRISE_DOWN,
+        u::POISONED_TLP,
+        u::FLOW_CTRL_PROTO,
+        u::COMPLETION_TIMEOUT,
+        u::COMPLETER_ABORT,
+        u::UNEXPECTED_COMPLETION,
+        u::RECEIVER_OVERFLOW,
+        u::MALFORMED_TLP,
+        u::ECRC_ERROR,
+        u::UNSUPPORTED_REQUEST,
+        u::ACS_VIOLATION,
+        u::INTERNAL_ERROR,
+        u::MC_BLOCKED_TLP,
+        u::ATOMIC_OP_EGRESS_BLOCKED,
+        u::TLP_PREFIX_BLOCKED,
+    ];
+    // Every entry should be a single-bit constant and pairwise unique.
+    for b in &bits {
+        if b.count_ones() != 1 {
+            return TestResult::Fail("AER uncorrectable bit constants must be single-bit");
+        }
+    }
+    for (i, a) in bits.iter().enumerate() {
+        for b in bits.iter().skip(i + 1) {
+            if a == b {
+                return TestResult::Fail("duplicate AER uncorrectable bit constant");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/aer", smoke_aer_uncorrectable_bits_are_distinct);
+
+fn smoke_aer_correctable_bits_at_documented_positions() -> TestResult {
+    use crate::pci_cap_ext::aer_correctable as c;
+    // Spot-check the positions called out in PCIe §7.8.4.5 table.
+    if c::RECEIVER_ERROR != 1 << 0 {
+        return TestResult::Fail("Receiver Error must be bit 0");
+    }
+    if c::BAD_TLP != 1 << 6 {
+        return TestResult::Fail("Bad TLP must be bit 6");
+    }
+    if c::BAD_DLLP != 1 << 7 {
+        return TestResult::Fail("Bad DLLP must be bit 7");
+    }
+    if c::REPLAY_TIMER_TIMEOUT != 1 << 12 {
+        return TestResult::Fail("Replay Timer Timeout must be bit 12");
+    }
+    if c::HEADER_LOG_OVERFLOW != 1 << 15 {
+        return TestResult::Fail("Header Log Overflow must be bit 15");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/aer", smoke_aer_correctable_bits_at_documented_positions);
+
+fn smoke_aer_listener_dispatch_round_trip() -> TestResult {
+    use crate::addr::BusAddr;
+    use crate::pci_cap_ext::{
+        __clear_aer_listeners, aer_listener_count, dispatch_aer, register_aer_listener,
+        AerEvent, AerListener, AerSeverity,
+    };
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    __clear_aer_listeners();
+
+    struct Counter(AtomicU32);
+    impl AerListener for Counter {
+        fn on_aer(&self, _ev: AerEvent) {
+            self.0.fetch_add(1, Ordering::Release);
+        }
+    }
+    let c = Arc::new(Counter(AtomicU32::new(0)));
+    register_aer_listener(c.clone());
+    if aer_listener_count() != 1 {
+        return TestResult::Fail("listener count != 1");
+    }
+    dispatch_aer(AerEvent {
+        addr: BusAddr::Pcie(crate::addr::PcieAddr::new(0, 0, 0, 0)),
+        severity: AerSeverity::Correctable,
+        status_word: 0,
+    });
+    if c.0.load(Ordering::Acquire) != 1 {
+        return TestResult::Fail("listener should have fired once");
+    }
+    __clear_aer_listeners();
+    if aer_listener_count() != 0 {
+        return TestResult::Fail("__clear_aer_listeners did not drain");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/aer", smoke_aer_listener_dispatch_round_trip);

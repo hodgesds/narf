@@ -9,10 +9,12 @@ use narf_capabilities::{Cap, Grant, Read, Write};
 use narf_net::Interface;
 
 pub mod caps;
+pub mod ccmp;
 pub mod eapol;
 pub mod iface;
 pub mod mlme;
 pub mod reg;
+pub mod rsn;
 pub mod sae;
 pub mod scan;
 
@@ -752,6 +754,233 @@ mod tests {
         }
     }
     kernel_test_in!("wireless/sae", smoke_sae_invalid_group_rejected);
+
+    fn smoke_ccmp_header_round_trip() -> TestResult {
+        use crate::ccmp::{build_ccmp_header, decode_ccmp_header};
+        let pn: u64 = 0x0000_DECA_FBAD_BEEF;
+        let hdr = build_ccmp_header(pn, 1);
+        // ExtIV bit must be set in byte 3.
+        if hdr[3] & (1 << 5) == 0 {
+            return TestResult::Fail("ExtIV bit must be set in CCMP header byte 3");
+        }
+        // Reserved byte must be zero.
+        if hdr[2] != 0 {
+            return TestResult::Fail("CCMP header reserved byte must be 0");
+        }
+        let (back_pn, back_kid) = decode_ccmp_header(&hdr).expect("decode");
+        if back_pn != pn || back_kid != 1 {
+            return TestResult::Fail("CCMP header round-trip lost values");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("wireless/ccmp", smoke_ccmp_header_round_trip);
+
+    fn smoke_ccmp_decode_rejects_no_extiv() -> TestResult {
+        use crate::ccmp::{decode_ccmp_header, CcmpError};
+        // ExtIV clear → not CCMP.
+        let hdr = [0u8; 8];
+        match decode_ccmp_header(&hdr) {
+            Err(CcmpError::NotEncrypted) => TestResult::Pass,
+            _ => TestResult::Fail("missing ExtIV must surface NotEncrypted"),
+        }
+    }
+    kernel_test_in!("wireless/ccmp", smoke_ccmp_decode_rejects_no_extiv);
+
+    fn smoke_ccmp_nonce_layout() -> TestResult {
+        use crate::ccmp::{build_nonce, CCMP_NONCE_LEN};
+        let a2 = [0xAAu8, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let nonce = build_nonce(0x05, true, &a2, 0x123456);
+        if nonce.len() != CCMP_NONCE_LEN {
+            return TestResult::Fail("nonce length must be 13");
+        }
+        // Flags byte: priority lower nibble (5), mgmt bit set (4).
+        if nonce[0] != 0x05 | (1 << 4) {
+            return TestResult::Fail("nonce flags wrong");
+        }
+        // A2 in bytes 1..7.
+        if nonce[1..7] != a2 {
+            return TestResult::Fail("nonce should carry A2 at offset 1");
+        }
+        // PN big-endian in bytes 7..13. We sent 0x12_3456 — top
+        // bytes 0, low bytes 0x12, 0x34, 0x56.
+        if nonce[12] != 0x56 || nonce[11] != 0x34 || nonce[10] != 0x12 {
+            return TestResult::Fail("PN should be big-endian in nonce");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("wireless/ccmp", smoke_ccmp_nonce_layout);
+
+    fn smoke_ccmp_aad_mutes_volatile_fields() -> TestResult {
+        use crate::ccmp::build_aad;
+        // 24-byte data frame header. Set FC[1] bits 11/12/13 (Retry/PwrMgmt/MoreData)
+        // and Duration to non-zero — AAD must zero them.
+        let mut hdr = [0u8; 24];
+        hdr[0] = 0x08; // Type=Data subtype 0
+        hdr[1] = 0x38; // Retry|PwrMgmt|MoreData all set
+        hdr[2] = 0xFF; // Duration low
+        hdr[3] = 0xFF;
+        hdr[22] = 0x73; // SeqCtrl: FragNum=3 (low 4 bits), SeqNum bits should mute.
+        hdr[23] = 0x12;
+        let aad = build_aad(&hdr);
+        if aad.len() != 22 {
+            return TestResult::Fail("AAD without Addr4/QoS should be 22 bytes");
+        }
+        if aad[1] & 0x38 != 0 {
+            return TestResult::Fail("Retry/PwrMgmt/MoreData must be zeroed in AAD");
+        }
+        if aad[2] != 0 || aad[3] != 0 {
+            return TestResult::Fail("Duration must be zero in AAD");
+        }
+        if aad[20] & 0xF0 != 0 || aad[20] != 0x03 {
+            return TestResult::Fail("SeqCtrl FragNum should be preserved, SeqNum muted");
+        }
+        if aad[21] != 0 {
+            return TestResult::Fail("SeqNum high byte must be zero");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("wireless/ccmp", smoke_ccmp_aad_mutes_volatile_fields);
+
+    fn smoke_ccmp_replay_window_rejects_regression() -> TestResult {
+        use crate::ccmp::{CcmpError, ReplayWindow};
+        let mut w = ReplayWindow::default();
+        w.check(1).expect("first PN");
+        w.check(2).expect("PN 2");
+        match w.check(2) {
+            Err(CcmpError::Replay) => {}
+            _ => return TestResult::Fail("repeated PN should be rejected"),
+        }
+        match w.check(0) {
+            Err(CcmpError::Replay) => {}
+            _ => return TestResult::Fail("PN regression should be rejected"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "wireless/ccmp",
+        smoke_ccmp_replay_window_rejects_regression
+    );
+
+    /// Identity AES-CCM stub: encrypt = no-op + zero MIC; decrypt =
+    /// accept iff MIC is zero. Production wires AES-128-CCM from
+    /// narf-crypto.
+    struct StubCcm;
+    impl crate::ccmp::AesCcm for StubCcm {
+        fn encrypt(
+            &self,
+            _key: &[u8; 16],
+            _nonce: &[u8; crate::ccmp::CCMP_NONCE_LEN],
+            _aad: &[u8],
+            _plaintext: &mut [u8],
+        ) -> [u8; crate::ccmp::CCMP_MIC_LEN] {
+            [0u8; crate::ccmp::CCMP_MIC_LEN]
+        }
+        fn decrypt(
+            &self,
+            _key: &[u8; 16],
+            _nonce: &[u8; crate::ccmp::CCMP_NONCE_LEN],
+            _aad: &[u8],
+            _ciphertext: &mut [u8],
+            tag: &[u8; crate::ccmp::CCMP_MIC_LEN],
+        ) -> Result<(), crate::ccmp::CcmpError> {
+            if *tag == [0u8; crate::ccmp::CCMP_MIC_LEN] {
+                Ok(())
+            } else {
+                Err(crate::ccmp::CcmpError::AuthFailed)
+            }
+        }
+    }
+
+    fn smoke_ccmp_protect_unprotect_round_trip() -> TestResult {
+        use crate::ccmp::{protect, unprotect, ReplayWindow};
+        let key = [0x42u8; 16];
+        let mut hdr = [0u8; 24];
+        hdr[0] = 0x08;
+        hdr[10..16].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+        let plaintext = [0xDEu8, 0xAD, 0xBE, 0xEF];
+        let mut body = plaintext.to_vec();
+        let mut wire = protect(&StubCcm, &hdr, &key, 1, 0, 0, false, &mut body);
+        let mut replay = ReplayWindow::default();
+        let recovered = unprotect(&StubCcm, &hdr, &key, 0, false, &mut replay, &mut wire)
+            .expect("unprotect");
+        if recovered != plaintext {
+            return TestResult::Fail("CCMP round-trip lost plaintext");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("wireless/ccmp", smoke_ccmp_protect_unprotect_round_trip);
+
+    // ── RSN IE ─────────────────────────────────────────────────────
+    fn smoke_rsn_wpa2_psk_round_trip() -> TestResult {
+        use crate::rsn::{RsnIe, AKM_PSK, CIPHER_CCMP_128};
+        let ie = RsnIe::wpa2_psk_ccmp();
+        let body = ie.encode_body();
+        // Version = 1.
+        if u16::from_le_bytes([body[0], body[1]]) != 1 {
+            return TestResult::Fail("RSN version field");
+        }
+        let back = RsnIe::decode_body(&body).expect("decode");
+        if back.group_cipher.suite_type != CIPHER_CCMP_128 {
+            return TestResult::Fail("group cipher decode wrong");
+        }
+        if back.pairwise_ciphers.len() != 1
+            || back.pairwise_ciphers[0].suite_type != CIPHER_CCMP_128
+        {
+            return TestResult::Fail("pairwise cipher decode wrong");
+        }
+        if back.akms.len() != 1 || back.akms[0].suite_type != AKM_PSK {
+            return TestResult::Fail("AKM decode wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("wireless/rsn", smoke_rsn_wpa2_psk_round_trip);
+
+    fn smoke_rsn_wpa3_sae_carries_mfp() -> TestResult {
+        use crate::rsn::{
+            RsnIe, AKM_SAE, CIPHER_BIP_CMAC_128, RSN_CAP_MFP_CAPABLE, RSN_CAP_MFP_REQUIRED,
+        };
+        let ie = RsnIe::wpa3_sae_ccmp();
+        let body = ie.encode_body();
+        let back = RsnIe::decode_body(&body).expect("decode");
+        if back.akms[0].suite_type != AKM_SAE {
+            return TestResult::Fail("WPA3 must use SAE AKM");
+        }
+        if back.rsn_capabilities & (RSN_CAP_MFP_REQUIRED | RSN_CAP_MFP_CAPABLE)
+            != (RSN_CAP_MFP_REQUIRED | RSN_CAP_MFP_CAPABLE)
+        {
+            return TestResult::Fail("WPA3 must require + advertise MFP");
+        }
+        let gmc = match back.group_management_cipher {
+            Some(c) => c,
+            None => return TestResult::Fail("WPA3 must carry group-management cipher"),
+        };
+        if gmc.suite_type != CIPHER_BIP_CMAC_128 {
+            return TestResult::Fail("group-management cipher should be BIP-CMAC-128");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("wireless/rsn", smoke_rsn_wpa3_sae_carries_mfp);
+
+    fn smoke_rsn_negotiate_picks_strongest_overlap() -> TestResult {
+        use crate::rsn::{RsnIe, Suite, AKM_PSK, AKM_SAE, CIPHER_CCMP_128, CIPHER_GCMP_256};
+        let local = [
+            Suite::standard(CIPHER_GCMP_256),
+            Suite::standard(CIPHER_CCMP_128),
+        ];
+        let peer = [Suite::standard(CIPHER_CCMP_128)];
+        let pick = RsnIe::negotiate_pairwise(&local, &peer).expect("negotiate");
+        if pick.suite_type != CIPHER_CCMP_128 {
+            return TestResult::Fail("must pick the only common cipher");
+        }
+        let local_akm = [Suite::standard(AKM_SAE), Suite::standard(AKM_PSK)];
+        let peer_akm = [Suite::standard(AKM_SAE)];
+        let pick = RsnIe::negotiate_akm(&local_akm, &peer_akm).expect("akm");
+        if pick.suite_type != AKM_SAE {
+            return TestResult::Fail("must prefer SAE when supported");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("wireless/rsn", smoke_rsn_negotiate_picks_strongest_overlap);
 
     fn smoke_mlme_beacon_ssid_channel_extract() -> TestResult {
         use crate::mlme::{beacon_ssid_channel, write_ie, ElementId};

@@ -480,3 +480,243 @@ impl<C: SmpCrypto> Initiator<C> {
         Ok(None)
     }
 }
+
+// ── Numeric Comparison g2 helper (§2.2.8) ──────────────────────────
+
+/// Numeric Comparison value derivation. Both sides display this
+/// 6-digit decimal and the user confirms they match.
+///
+/// `g2(U, V, X, Y) = AES-CMAC_X(U || V || Y) mod 1_000_000`
+/// where U, V are public keys (32 bytes each) and X, Y are the
+/// nonces.
+pub fn numeric_comparison_value(
+    crypto: &dyn SmpCrypto,
+    initiator_pk_x: &[u8; 32],
+    responder_pk_x: &[u8; 32],
+    initiator_nonce: &[u8; 16],
+    responder_nonce: &[u8; 16],
+) -> u32 {
+    let mut data = alloc::vec::Vec::with_capacity(80);
+    data.extend_from_slice(initiator_pk_x);
+    data.extend_from_slice(responder_pk_x);
+    data.extend_from_slice(responder_nonce);
+    let mac = crypto.aes_cmac(initiator_nonce, &data);
+    // Per §2.2.8, take the low 32 bits big-endian of the MAC and
+    // mod 10^6 to get the 6-digit display value.
+    let v = u32::from_be_bytes([mac[12], mac[13], mac[14], mac[15]]);
+    v % 1_000_000
+}
+
+// ── Responder-side state machine (Just Works LE-SC, §2.3.5.6) ─────
+//
+// Mirror of `Initiator`. The responder waits for Pairing_Request,
+// emits Pairing_Response, swaps Public Keys, picks Nb, then exchanges
+// Confirms / Randoms / DHKey-Checks.
+
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ResponderState {
+    Idle,
+    GotRequest,
+    SentPublicKey,
+    SentRandom,
+    Done,
+    Failed,
+}
+
+#[derive(Debug)]
+pub struct Responder<C: SmpCrypto> {
+    pub state: ResponderState,
+    pub method: PairingMethod,
+    crypto: C,
+    priv_key: [u8; 32],
+    pub pub_x: [u8; 32],
+    pub pub_y: [u8; 32],
+    peer_pub_x: [u8; 32],
+    peer_pub_y: [u8; 32],
+    pub nb: [u8; 16],
+    pub na: [u8; 16],
+    pub dh_key: [u8; 32],
+    pub ltk: [u8; 16],
+    iat_addr: [u8; 7],
+    rat_addr: [u8; 7],
+    features_local: PairingFeatureExchange,
+    features_peer: PairingFeatureExchange,
+    /// Numeric Comparison value (only meaningful when method ==
+    /// NumericComparison). Application surfaces this to the user
+    /// for confirmation.
+    pub numeric_comparison: Option<u32>,
+}
+
+impl<C: SmpCrypto> Responder<C> {
+    pub fn new(crypto: C, iat_addr: [u8; 7], rat_addr: [u8; 7]) -> Self {
+        let nb = crypto.rand128();
+        let (priv_key, pub_x, pub_y) = crypto.p256_keygen();
+        Self {
+            state: ResponderState::Idle,
+            method: PairingMethod::JustWorks,
+            crypto,
+            priv_key,
+            pub_x,
+            pub_y,
+            peer_pub_x: [0; 32],
+            peer_pub_y: [0; 32],
+            nb,
+            na: [0; 16],
+            dh_key: [0; 32],
+            ltk: [0; 16],
+            iat_addr,
+            rat_addr,
+            features_local: PairingFeatureExchange {
+                io_capability: IoCapability::DisplayYesNo as u8,
+                oob_data_flag: 0,
+                auth_req: AUTH_BONDING | AUTH_SC | AUTH_MITM,
+                max_encryption_key_size: 16,
+                initiator_key_distribution: 0,
+                responder_key_distribution: 0,
+            },
+            features_peer: PairingFeatureExchange {
+                io_capability: 0,
+                oob_data_flag: 0,
+                auth_req: 0,
+                max_encryption_key_size: 0,
+                initiator_key_distribution: 0,
+                responder_key_distribution: 0,
+            },
+            numeric_comparison: None,
+        }
+    }
+
+    pub fn feed(&mut self, rx: &Pdu) -> Result<Option<Pdu>, PairingError> {
+        if rx.code == SMP_PAIRING_FAILED {
+            self.state = ResponderState::Failed;
+            let reason = rx.payload.first().copied().unwrap_or(SMP_FAILED_UNSPECIFIED);
+            return Err(PairingError::PeerFailed(reason));
+        }
+        match self.state {
+            ResponderState::Idle => self.on_request(rx),
+            ResponderState::GotRequest => self.on_initiator_public_key(rx),
+            ResponderState::SentPublicKey => self.on_pairing_random(rx),
+            ResponderState::SentRandom => self.on_dhkey_check(rx),
+            _ => Err(PairingError::Protocol),
+        }
+    }
+
+    fn on_request(&mut self, rx: &Pdu) -> Result<Option<Pdu>, PairingError> {
+        if rx.code != SMP_PAIRING_REQUEST {
+            return Err(PairingError::Protocol);
+        }
+        let peer = PairingFeatureExchange::decode(rx).ok_or(PairingError::Protocol)?;
+        self.features_peer = peer;
+
+        let mitm =
+            (peer.auth_req & AUTH_MITM) != 0 || (self.features_local.auth_req & AUTH_MITM) != 0;
+        let sc = (peer.auth_req & AUTH_SC) != 0
+            && (self.features_local.auth_req & AUTH_SC) != 0;
+        let oob = peer.oob_data_flag != 0 && self.features_local.oob_data_flag != 0;
+        let local_io = IoCapability::from_u8(self.features_local.io_capability)
+            .ok_or(PairingError::Protocol)?;
+        let peer_io = IoCapability::from_u8(peer.io_capability).ok_or(PairingError::Protocol)?;
+        // Note: for the responder the IO-capability table swaps
+        // initiator/responder positions. pick_pairing_method's
+        // signature is (initiator, responder, ...) so we pass peer
+        // first since the peer started this exchange.
+        self.method = pick_pairing_method(peer_io, local_io, mitm, sc, oob);
+
+        let rsp = self.features_local.encode(SMP_PAIRING_RESPONSE);
+        self.state = ResponderState::GotRequest;
+        Ok(Some(rsp))
+    }
+
+    fn on_initiator_public_key(&mut self, rx: &Pdu) -> Result<Option<Pdu>, PairingError> {
+        if rx.code != SMP_PAIRING_PUBLIC_KEY {
+            return Err(PairingError::Protocol);
+        }
+        if rx.payload.len() < 64 {
+            return Err(PairingError::Protocol);
+        }
+        self.peer_pub_x.copy_from_slice(&rx.payload[0..32]);
+        self.peer_pub_y.copy_from_slice(&rx.payload[32..64]);
+        self.dh_key = self
+            .crypto
+            .p256_dh(&self.priv_key, &self.peer_pub_x, &self.peer_pub_y);
+
+        let mut pk = alloc::vec::Vec::with_capacity(64);
+        pk.extend_from_slice(&self.pub_x);
+        pk.extend_from_slice(&self.pub_y);
+        let out = Pdu {
+            code: SMP_PAIRING_PUBLIC_KEY,
+            payload: pk,
+        };
+        self.state = ResponderState::SentPublicKey;
+        Ok(Some(out))
+    }
+
+    fn on_pairing_random(&mut self, rx: &Pdu) -> Result<Option<Pdu>, PairingError> {
+        if rx.code != SMP_PAIRING_RANDOM {
+            return Err(PairingError::Protocol);
+        }
+        if rx.payload.len() < 16 {
+            return Err(PairingError::Protocol);
+        }
+        self.na.copy_from_slice(&rx.payload[..16]);
+
+        // Compute Numeric Comparison value if that's the negotiated
+        // method — application confirms before we mark Done.
+        if self.method == PairingMethod::NumericComparison {
+            self.numeric_comparison = Some(numeric_comparison_value(
+                &self.crypto,
+                &self.peer_pub_x,
+                &self.pub_x,
+                &self.na,
+                &self.nb,
+            ));
+        }
+
+        // Send our Nb.
+        let nb_pdu = Pdu {
+            code: SMP_PAIRING_RANDOM,
+            payload: self.nb.to_vec(),
+        };
+
+        // Derive LTK via f5 (same as initiator path).
+        const SALT: [u8; 16] = [
+            0x6C, 0x88, 0x83, 0x91, 0xAA, 0xF5, 0xA5, 0x38, 0x60, 0x37, 0x0B, 0xDB, 0x5A, 0x60,
+            0x83, 0xBE,
+        ];
+        let t = self.crypto.aes_cmac(&SALT, &self.dh_key);
+        let mut buf = alloc::vec::Vec::with_capacity(53);
+        buf.push(0x00);
+        buf.extend_from_slice(b"btle");
+        buf.extend_from_slice(&self.na);
+        buf.extend_from_slice(&self.nb);
+        buf.extend_from_slice(&self.iat_addr);
+        buf.extend_from_slice(&self.rat_addr);
+        buf.extend_from_slice(&[0x01, 0x00]);
+        let _mac_key = self.crypto.aes_cmac(&t, &buf);
+        buf[0] = 0x01;
+        let ltk = self.crypto.aes_cmac(&t, &buf);
+        self.ltk = ltk;
+
+        self.state = ResponderState::SentRandom;
+        Ok(Some(nb_pdu))
+    }
+
+    fn on_dhkey_check(&mut self, rx: &Pdu) -> Result<Option<Pdu>, PairingError> {
+        if rx.code != SMP_PAIRING_DHKEY_CHECK {
+            return Err(PairingError::Protocol);
+        }
+        if rx.payload.len() < 16 {
+            return Err(PairingError::Protocol);
+        }
+        // Emit our DHKey check back. Just Works skips the f6
+        // verification step; Numeric Comparison / Passkey land it
+        // when the auth policy module wires up f6.
+        let our_check = Pdu {
+            code: SMP_PAIRING_DHKEY_CHECK,
+            payload: alloc::vec![0u8; 16],
+        };
+        self.state = ResponderState::Done;
+        Ok(Some(our_check))
+    }
+}

@@ -155,6 +155,76 @@ pub struct AerStatus {
     pub correctable_mask: u32,
 }
 
+// ── AER bit definitions (PCIe §7.8.4.2 / §7.8.4.5) ────────────────
+
+/// Uncorrectable Error Status / Mask / Severity bit definitions.
+/// Same bit positions across all three registers (§7.8.4.2..§7.8.4.4).
+pub mod aer_uncorrectable {
+    /// Data Link Protocol Error.
+    pub const DLP: u32 = 1 << 4;
+    /// Surprise Down Error (link).
+    pub const SURPRISE_DOWN: u32 = 1 << 5;
+    /// Poisoned TLP Received.
+    pub const POISONED_TLP: u32 = 1 << 12;
+    /// Flow Control Protocol Error.
+    pub const FLOW_CTRL_PROTO: u32 = 1 << 13;
+    /// Completion Timeout.
+    pub const COMPLETION_TIMEOUT: u32 = 1 << 14;
+    /// Completer Abort.
+    pub const COMPLETER_ABORT: u32 = 1 << 15;
+    /// Unexpected Completion.
+    pub const UNEXPECTED_COMPLETION: u32 = 1 << 16;
+    /// Receiver Overflow.
+    pub const RECEIVER_OVERFLOW: u32 = 1 << 17;
+    /// Malformed TLP.
+    pub const MALFORMED_TLP: u32 = 1 << 18;
+    /// ECRC Error.
+    pub const ECRC_ERROR: u32 = 1 << 19;
+    /// Unsupported Request Error.
+    pub const UNSUPPORTED_REQUEST: u32 = 1 << 20;
+    /// ACS Violation.
+    pub const ACS_VIOLATION: u32 = 1 << 21;
+    /// Uncorrectable Internal Error.
+    pub const INTERNAL_ERROR: u32 = 1 << 22;
+    /// MC Blocked TLP.
+    pub const MC_BLOCKED_TLP: u32 = 1 << 23;
+    /// AtomicOp Egress Blocked.
+    pub const ATOMIC_OP_EGRESS_BLOCKED: u32 = 1 << 24;
+    /// TLP Prefix Blocked Error.
+    pub const TLP_PREFIX_BLOCKED: u32 = 1 << 25;
+}
+
+/// Correctable Error Status / Mask bit definitions (§7.8.4.5/7.8.4.6).
+pub mod aer_correctable {
+    /// Receiver Error.
+    pub const RECEIVER_ERROR: u32 = 1 << 0;
+    /// Bad TLP.
+    pub const BAD_TLP: u32 = 1 << 6;
+    /// Bad DLLP.
+    pub const BAD_DLLP: u32 = 1 << 7;
+    /// REPLAY_NUM Rollover.
+    pub const REPLAY_NUM_ROLLOVER: u32 = 1 << 8;
+    /// Replay Timer Timeout.
+    pub const REPLAY_TIMER_TIMEOUT: u32 = 1 << 12;
+    /// Advisory Non-Fatal Error.
+    pub const ADVISORY_NON_FATAL: u32 = 1 << 13;
+    /// Corrected Internal Error.
+    pub const CORRECTED_INTERNAL: u32 = 1 << 14;
+    /// Header Log Overflow.
+    pub const HEADER_LOG_OVERFLOW: u32 = 1 << 15;
+}
+
+/// AER register offsets within the extended capability.
+pub mod aer_off {
+    pub const UNCORR_STATUS: u64 = 0x04;
+    pub const UNCORR_MASK: u64 = 0x08;
+    pub const UNCORR_SEVERITY: u64 = 0x0C;
+    pub const CORR_STATUS: u64 = 0x10;
+    pub const CORR_MASK: u64 = 0x14;
+    pub const CAPS_AND_CTRL: u64 = 0x18;
+    pub const HEADER_LOG: u64 = 0x1C;
+}
+
 /// Read the device's AER status if the AER extended cap exists.
 /// Returns `None` for devices without AER (e.g. QEMU NVMe by
 /// default).
@@ -296,6 +366,137 @@ pub fn classify_aer(
     } else {
         Some(AerSeverity::NonFatal)
     }
+}
+
+// ── AER mutating ops (status clear + mask program) ────────────────
+
+/// Errors mutating AER state.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AerWriteError {
+    AuthorityRevoked,
+    NotPcie,
+    NoAer,
+}
+
+impl From<CapError> for AerWriteError {
+    fn from(_: CapError) -> Self {
+        AerWriteError::AuthorityRevoked
+    }
+}
+
+/// Clear AER status bits by writing 1s to the `bits` mask
+/// (RW1C semantics per PCIe §7.8.4.2 / §7.8.4.5). Caller picks
+/// `correctable=true` to clear bits in CORR_STATUS, `false` for
+/// UNCORR_STATUS.
+///
+/// Cap-gated on `Cap<BusDeviceCap, narf_capabilities::Write>` since
+/// clearing sticky AER status is a privileged operation — only the
+/// AER consumer (the global error coordinator or the bound driver)
+/// should clear bits it has already observed.
+pub fn clear_aer_status(
+    cap: &Cap<BusDeviceCap, narf_capabilities::Write>,
+    device: &BusDevice,
+    correctable: bool,
+    bits: u32,
+) -> Result<(), AerWriteError> {
+    cap.check_live()?;
+    let cfg = match device.kind {
+        BusKind::Pcie { cfg_phys, .. } => cfg_phys,
+        BusKind::VirtioMmio { .. } => return Err(AerWriteError::NotPcie),
+    };
+    let read_cap: Cap<BusDeviceCap, Read> = cap
+        .derive::<Read>()
+        .map_err(|_| AerWriteError::AuthorityRevoked)?;
+    let hdr = match find_cap(&read_cap, device, id::AER)
+        .map_err(|_| AerWriteError::AuthorityRevoked)?
+    {
+        Some(h) => h,
+        None => return Err(AerWriteError::NoAer),
+    };
+    let off = if correctable {
+        aer_off::CORR_STATUS
+    } else {
+        aer_off::UNCORR_STATUS
+    };
+    // SAFETY: AER cap offset comes from the validated walker; cfg
+    // page is identity-mapped.
+    unsafe {
+        cfg_write32(cfg, hdr.offset + off, bits);
+    }
+    Ok(())
+}
+
+/// Program the AER mask register. Bits set = error class is
+/// suppressed (won't surface in Status). Common policy: leave
+/// Advisory Non-Fatal masked but keep everything else live.
+pub fn set_aer_mask(
+    cap: &Cap<BusDeviceCap, narf_capabilities::Write>,
+    device: &BusDevice,
+    correctable: bool,
+    mask: u32,
+) -> Result<(), AerWriteError> {
+    cap.check_live()?;
+    let cfg = match device.kind {
+        BusKind::Pcie { cfg_phys, .. } => cfg_phys,
+        BusKind::VirtioMmio { .. } => return Err(AerWriteError::NotPcie),
+    };
+    let read_cap: Cap<BusDeviceCap, Read> = cap
+        .derive::<Read>()
+        .map_err(|_| AerWriteError::AuthorityRevoked)?;
+    let hdr = match find_cap(&read_cap, device, id::AER)
+        .map_err(|_| AerWriteError::AuthorityRevoked)?
+    {
+        Some(h) => h,
+        None => return Err(AerWriteError::NoAer),
+    };
+    let off = if correctable {
+        aer_off::CORR_MASK
+    } else {
+        aer_off::UNCORR_MASK
+    };
+    // SAFETY: same as above.
+    unsafe {
+        cfg_write32(cfg, hdr.offset + off, mask);
+    }
+    Ok(())
+}
+
+/// Set the Uncorrectable Error Severity register. Bits set →
+/// classified as Fatal; bits clear → NonFatal. PCIe §7.8.4.4.
+pub fn set_aer_severity(
+    cap: &Cap<BusDeviceCap, narf_capabilities::Write>,
+    device: &BusDevice,
+    severity: u32,
+) -> Result<(), AerWriteError> {
+    cap.check_live()?;
+    let cfg = match device.kind {
+        BusKind::Pcie { cfg_phys, .. } => cfg_phys,
+        BusKind::VirtioMmio { .. } => return Err(AerWriteError::NotPcie),
+    };
+    let read_cap: Cap<BusDeviceCap, Read> = cap
+        .derive::<Read>()
+        .map_err(|_| AerWriteError::AuthorityRevoked)?;
+    let hdr = match find_cap(&read_cap, device, id::AER)
+        .map_err(|_| AerWriteError::AuthorityRevoked)?
+    {
+        Some(h) => h,
+        None => return Err(AerWriteError::NoAer),
+    };
+    // SAFETY: same as above.
+    unsafe {
+        cfg_write32(cfg, hdr.offset + aer_off::UNCORR_SEVERITY, severity);
+    }
+    Ok(())
+}
+
+#[inline]
+unsafe fn cfg_write32(cfg: PhysAddr, off: u64, value: u32) {
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: caller asserts the slot is writable + 4-byte aligned.
+    unsafe {
+        core::ptr::write_volatile((cfg.raw() + off) as *mut u32, value);
+    }
+    compiler_fence(Ordering::SeqCst);
 }
 
 // ── helpers ─────────────────────────────────────────────────────────

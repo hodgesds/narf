@@ -59,6 +59,7 @@ members = [
     "fb",
     "audio",
     "bluetooth",
+    "edid",
     "usbpd",
     "pwm",
     "shmem",

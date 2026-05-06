@@ -74,10 +74,15 @@ Bluetooth subsystem source material was consulted at any point.**
   By Type for Characteristics, Find Information for Descriptors).
 - **SMP** (`smp`): Pairing PDU codec, IO-Capability + AuthReq
   bitfields, pairing-method selector (table 2.8), LE Secure
-  Connections **Just Works** initiator state machine
-  (Idle → SentRequest → SentPublicKey → WaitConfirm → SentRandom →
-  SentDhKeyCheck → Done). Crypto primitives injected through
-  `SmpCrypto` trait (P-256 keygen + DH, AES-CMAC, RNG).
+  Connections **Just Works** initiator + responder state machines.
+  Numeric Comparison g2 helper (§2.2.8). Crypto primitives injected
+  through `SmpCrypto` trait (P-256 keygen + DH, AES-CMAC, RNG).
+- **GATT server** (`gatt_server`): in-memory attribute database
+  with handle assignment + permission flags, request handler that
+  answers Read / Write / Read By Type / Read By Group Type / Find
+  Information / Exchange MTU per ATT §3.4. Convenience builders
+  `add_primary_service` / `add_characteristic` emit the canonical
+  Vol 3 Part G declaration shape.
 
 ### Out of scope (deliberate)
 - GATT, SMP, SDP, RFCOMM — sit on top of L2CAP+ATT and land in

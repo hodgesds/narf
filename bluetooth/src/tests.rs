@@ -582,6 +582,289 @@ fn smoke_smp_initiator_just_works_walk() -> TestResult {
 }
 kernel_test_in!("bluetooth/smp", smoke_smp_initiator_just_works_walk);
 
+// ── SMP Numeric Comparison + Responder ─────────────────────────────
+
+fn smoke_smp_numeric_comparison_value_six_digits() -> TestResult {
+    use crate::smp::{numeric_comparison_value, SmpCrypto};
+    struct StubCrypto;
+    impl SmpCrypto for StubCrypto {
+        fn p256_keygen(&self) -> ([u8; 32], [u8; 32], [u8; 32]) {
+            ([0; 32], [0; 32], [0; 32])
+        }
+        fn p256_dh(&self, _: &[u8; 32], _: &[u8; 32], _: &[u8; 32]) -> [u8; 32] {
+            [0; 32]
+        }
+        fn aes_cmac(&self, key: &[u8; 16], data: &[u8]) -> [u8; 16] {
+            // Deterministic — first 4 bytes of a synthetic digest
+            // taken from the trailing data is what we'll mod.
+            let mut out = [0u8; 16];
+            for (i, b) in key.iter().enumerate() {
+                out[i] ^= *b;
+            }
+            for (i, b) in data.iter().enumerate() {
+                out[i % 16] ^= *b;
+            }
+            out
+        }
+        fn rand128(&self) -> [u8; 16] {
+            [0; 16]
+        }
+    }
+
+    let pk_a = [0xAAu8; 32];
+    let pk_b = [0xBBu8; 32];
+    let na = [0x11u8; 16];
+    let nb = [0x22u8; 16];
+    let v = numeric_comparison_value(&StubCrypto, &pk_a, &pk_b, &na, &nb);
+    if v >= 1_000_000 {
+        return TestResult::Fail("numeric comparison value should be 6 decimal digits");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/smp", smoke_smp_numeric_comparison_value_six_digits);
+
+fn smoke_smp_responder_full_walk() -> TestResult {
+    use crate::smp::{
+        IoCapability, PairingFeatureExchange, Pdu, Responder, ResponderState, SmpCrypto,
+        AUTH_BONDING, AUTH_SC, SMP_PAIRING_DHKEY_CHECK, SMP_PAIRING_PUBLIC_KEY,
+        SMP_PAIRING_RANDOM, SMP_PAIRING_REQUEST, SMP_PAIRING_RESPONSE,
+    };
+
+    struct StubCrypto;
+    impl SmpCrypto for StubCrypto {
+        fn p256_keygen(&self) -> ([u8; 32], [u8; 32], [u8; 32]) {
+            ([1; 32], [2; 32], [3; 32])
+        }
+        fn p256_dh(&self, _: &[u8; 32], _: &[u8; 32], _: &[u8; 32]) -> [u8; 32] {
+            [4; 32]
+        }
+        fn aes_cmac(&self, key: &[u8; 16], data: &[u8]) -> [u8; 16] {
+            let mut out = [0u8; 16];
+            for (i, b) in key.iter().enumerate() {
+                out[i] ^= *b;
+            }
+            for (i, b) in data.iter().enumerate() {
+                out[i % 16] ^= *b;
+            }
+            out
+        }
+        fn rand128(&self) -> [u8; 16] {
+            [0x55; 16]
+        }
+    }
+
+    let mut r = Responder::new(StubCrypto, [0u8; 7], [0u8; 7]);
+
+    // Initiator's Pairing Request.
+    let req = PairingFeatureExchange {
+        io_capability: IoCapability::NoInputNoOutput as u8,
+        oob_data_flag: 0,
+        auth_req: AUTH_BONDING | AUTH_SC,
+        max_encryption_key_size: 16,
+        initiator_key_distribution: 0,
+        responder_key_distribution: 0,
+    }
+    .encode(SMP_PAIRING_REQUEST);
+
+    let rsp = r.feed(&req).expect("rsp").expect("expected response");
+    if rsp.code != SMP_PAIRING_RESPONSE {
+        return TestResult::Fail("responder didn't emit Pairing Response");
+    }
+    if r.state != ResponderState::GotRequest {
+        return TestResult::Fail("state didn't advance to GotRequest");
+    }
+
+    // Initiator's Public Key (64 bytes).
+    let pk = Pdu {
+        code: SMP_PAIRING_PUBLIC_KEY,
+        payload: alloc::vec![0xAAu8; 64],
+    };
+    let our_pk = r.feed(&pk).expect("pk").expect("expect our PK");
+    if our_pk.code != SMP_PAIRING_PUBLIC_KEY {
+        return TestResult::Fail("responder didn't emit Public Key");
+    }
+    if r.state != ResponderState::SentPublicKey {
+        return TestResult::Fail("state didn't advance to SentPublicKey");
+    }
+
+    // Initiator's Pairing Random (Na).
+    let na = Pdu {
+        code: SMP_PAIRING_RANDOM,
+        payload: alloc::vec![0x77u8; 16],
+    };
+    let our_nb = r.feed(&na).expect("na").expect("expect our Nb");
+    if our_nb.code != SMP_PAIRING_RANDOM {
+        return TestResult::Fail("responder didn't emit Pairing Random");
+    }
+    if r.state != ResponderState::SentRandom {
+        return TestResult::Fail("state didn't advance to SentRandom");
+    }
+    if r.ltk == [0u8; 16] {
+        return TestResult::Fail("LTK should be derived non-zero");
+    }
+
+    // Initiator's DHKey Check.
+    let ea = Pdu {
+        code: SMP_PAIRING_DHKEY_CHECK,
+        payload: alloc::vec![0x99u8; 16],
+    };
+    let our_eb = r.feed(&ea).expect("ea").expect("expect our DHKey check");
+    if our_eb.code != SMP_PAIRING_DHKEY_CHECK {
+        return TestResult::Fail("responder didn't emit DHKey check");
+    }
+    if r.state != ResponderState::Done {
+        return TestResult::Fail("responder didn't reach Done");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/smp", smoke_smp_responder_full_walk);
+
+// ── GATT server ────────────────────────────────────────────────────
+
+fn smoke_gatt_server_handles_read_request() -> TestResult {
+    use crate::att::{ATT_READ_REQ, ATT_READ_RSP};
+    use crate::gatt::{Uuid, UUID_SERVICE_BATTERY};
+    use crate::gatt_server::{GattServer, Permissions};
+
+    let mut srv = GattServer::new();
+    let _svc = srv.db.add_primary_service(Uuid::U16(UUID_SERVICE_BATTERY));
+    let (_decl, val_h) = srv.db.add_characteristic(
+        Uuid::U16(0x2A19),
+        crate::gatt::CHAR_PROP_READ,
+        Permissions::read(),
+        alloc::vec![85], // battery level = 85%
+    );
+
+    let read = crate::att::Pdu {
+        opcode: ATT_READ_REQ,
+        params: val_h.to_le_bytes().to_vec(),
+    };
+    let rsp = srv.handle_request(&read);
+    if rsp.opcode != ATT_READ_RSP {
+        return TestResult::Fail("server should return Read Response");
+    }
+    if rsp.params != alloc::vec![85u8] {
+        return TestResult::Fail("read returned wrong battery value");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/gatt-server", smoke_gatt_server_handles_read_request);
+
+fn smoke_gatt_server_write_updates_value() -> TestResult {
+    use crate::att::{ATT_WRITE_REQ, ATT_WRITE_RSP};
+    use crate::gatt::Uuid;
+    use crate::gatt_server::{GattServer, Permissions};
+
+    let mut srv = GattServer::new();
+    let _svc = srv.db.add_primary_service(Uuid::U16(0x180A));
+    let (_, val_h) = srv.db.add_characteristic(
+        Uuid::U16(0x2A29),
+        crate::gatt::CHAR_PROP_READ | crate::gatt::CHAR_PROP_WRITE,
+        Permissions::read_write(),
+        alloc::vec![b'A'],
+    );
+
+    let mut write_params = val_h.to_le_bytes().to_vec();
+    write_params.extend_from_slice(b"narf");
+    let write = crate::att::Pdu {
+        opcode: ATT_WRITE_REQ,
+        params: write_params,
+    };
+    let rsp = srv.handle_request(&write);
+    if rsp.opcode != ATT_WRITE_RSP {
+        return TestResult::Fail("server should ACK with Write Response");
+    }
+    let attr = srv.db.attr_by_handle(val_h).expect("attr");
+    if attr.value != b"narf" {
+        return TestResult::Fail("server didn't store the new value");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/gatt-server", smoke_gatt_server_write_updates_value);
+
+fn smoke_gatt_server_read_by_group_type_lists_services() -> TestResult {
+    use crate::att::ATT_READ_BY_GROUP_TYPE_RSP;
+    use crate::gatt::{
+        build_discover_primary_services, parse_primary_services, Uuid, UUID_SERVICE_BATTERY,
+        UUID_SERVICE_GAP,
+    };
+    use crate::gatt_server::GattServer;
+
+    let mut srv = GattServer::new();
+    let _ = srv.db.add_primary_service(Uuid::U16(UUID_SERVICE_GAP));
+    let _ = srv.db.add_primary_service(Uuid::U16(UUID_SERVICE_BATTERY));
+
+    let req = build_discover_primary_services(0x0001, 0xFFFF);
+    let rsp = srv.handle_request(&req);
+    if rsp.opcode != ATT_READ_BY_GROUP_TYPE_RSP {
+        return TestResult::Fail("server should return Read By Group Type Rsp");
+    }
+    let svcs = parse_primary_services(&rsp.params);
+    if svcs.len() != 2 {
+        return TestResult::Fail("expected 2 services back");
+    }
+    let uuids: alloc::vec::Vec<_> = svcs.iter().map(|s| s.uuid).collect();
+    if !uuids.contains(&Uuid::U16(UUID_SERVICE_GAP))
+        || !uuids.contains(&Uuid::U16(UUID_SERVICE_BATTERY))
+    {
+        return TestResult::Fail("server didn't list both services");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/gatt-server",
+    smoke_gatt_server_read_by_group_type_lists_services
+);
+
+fn smoke_gatt_server_invalid_handle_errors() -> TestResult {
+    use crate::att::{
+        ATT_ECODE_INVALID_HANDLE, ATT_ERROR_RSP, ATT_READ_REQ,
+    };
+    use crate::gatt_server::GattServer;
+
+    let mut srv = GattServer::new();
+    let req = crate::att::Pdu {
+        opcode: ATT_READ_REQ,
+        params: alloc::vec![0xFF, 0xFF],
+    };
+    let rsp = srv.handle_request(&req);
+    if rsp.opcode != ATT_ERROR_RSP {
+        return TestResult::Fail("expected Error Response");
+    }
+    if rsp.params.last().copied() != Some(ATT_ECODE_INVALID_HANDLE) {
+        return TestResult::Fail("error code should be Invalid Handle");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/gatt-server",
+    smoke_gatt_server_invalid_handle_errors
+);
+
+fn smoke_gatt_server_exchange_mtu_caps_at_min_23() -> TestResult {
+    use crate::att::{ATT_EXCHANGE_MTU_REQ, ATT_EXCHANGE_MTU_RSP};
+    use crate::gatt_server::GattServer;
+
+    let mut srv = GattServer::new();
+    let req = crate::att::Pdu {
+        opcode: ATT_EXCHANGE_MTU_REQ,
+        params: 17u16.to_le_bytes().to_vec(),
+    };
+    let rsp = srv.handle_request(&req);
+    if rsp.opcode != ATT_EXCHANGE_MTU_RSP {
+        return TestResult::Fail("expected Exchange MTU Response");
+    }
+    let mtu = u16::from_le_bytes([rsp.params[0], rsp.params[1]]);
+    if mtu < 23 {
+        return TestResult::Fail("MTU must not drop below 23");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/gatt-server",
+    smoke_gatt_server_exchange_mtu_caps_at_min_23
+);
+
 // ── GATT ───────────────────────────────────────────────────────────
 
 fn smoke_gatt_discover_primary_services_request() -> TestResult {
