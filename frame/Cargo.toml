@@ -19,6 +19,7 @@ narf-arch          = { path = "../arch" }
 narf-memory        = { path = "../memory" }
 narf-boot          = { path = "../boot" }
 narf-console       = { path = "../console" }
+narf-crypto        = { path = "../crypto" }
 narf-time          = { path = "../time" }
 narf-scheduler     = { path = "../scheduler" }
 narf-interrupts    = { path = "../interrupts" }
@@ -44,14 +45,22 @@ narf-wireless        = { path = "../wireless" }
 narf-accel           = { path = "../accel" }
 narf-tpm             = { path = "../tpm" }
 narf-i3c             = { path = "../i3c" }
+narf-pwm             = { path = "../pwm" }
+narf-pmbus           = { path = "../pmbus" }
+narf-spdm            = { path = "../spdm" }
+narf-scmi            = { path = "../scmi" }
 narf-shmem           = { path = "../shmem" }
 narf-firmware        = { path = "../firmware" }
 narf-firmware-fw-cfg = { path = "../firmware/fw_cfg" }
 narf-firmware-smbios = { path = "../firmware/smbios" }
 narf-firmware-fdt    = { path = "../firmware/fdt" }
 narf-initramfs       = { path = "../initramfs" }
-narf-userspace     = { path = "../userspace" }
-narf-verification  = { path = "../verification", optional = true }
+narf-power           = { path = "../power" }
+narf-observability   = { path = "../observability" }
+narf-filesystem      = { path = "../filesystem" }
+narf-userspace       = { path = "../userspace" }
+narf-user-runtime    = { path = "../user-runtime" }
+narf-verification    = { path = "../verification", optional = true }
 
 [features]
 # Self-test: trigger a #UD at end-of-boot to prove the IDT dispatches.
@@ -68,6 +77,10 @@ kernel-test  = [
     "narf-tpm/kernel-test",
     "narf-i3c/kernel-test",
     "narf-drivers-i3c/kernel-test",
+    "narf-pwm/kernel-test",
+    "narf-pmbus/kernel-test",
+    "narf-spdm/kernel-test",
+    "narf-scmi/kernel-test",
 ]
 # Chain into verification's opt-in user-mode smoke tests (round-trip,
 # yield_resume, poll_yield_exit, future yield_exit). These pass the
