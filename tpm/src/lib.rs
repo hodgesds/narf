@@ -2,15 +2,15 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use async_trait::async_trait;
-use narf_capabilities::{CapType, CapKind};
+use narf_capabilities::{CapKind, CapType};
 
-pub mod types;
 pub mod commands;
+pub mod types;
 
-pub use types::{TpmError, PcrSet, PolicyHash};
+pub use types::{PcrSet, PolicyHash, TpmError};
 
 /// A specialized capability for TPM operations.
 #[derive(Debug)]
@@ -60,6 +60,23 @@ pub struct TpmInfo {
     pub spec_level: u32,
 }
 
+pub mod registry {
+    use super::*;
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+    use narf_lib::sync::IrqSafeSpinLock;
+
+    static REGISTRY: IrqSafeSpinLock<Vec<Arc<dyn TpmDevice>>> = IrqSafeSpinLock::new(Vec::new());
+
+    pub fn register(device: Arc<dyn TpmDevice>) {
+        REGISTRY.lock().push(device);
+    }
+
+    pub fn list() -> Vec<Arc<dyn TpmDevice>> {
+        REGISTRY.lock().clone()
+    }
+}
+
 /// Force-link hook.
 pub fn register_initcalls() {}
 
@@ -68,9 +85,9 @@ pub fn register_initcalls() {}
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests {
     use super::*;
-    use narf_kernel_test::{kernel_test_in, TestResult};
-    use core::sync::atomic::{AtomicU32, Ordering};
     use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use narf_kernel_test::{kernel_test_in, TestResult};
 
     struct MockTpm {
         pcr_extensions: AtomicU32,
@@ -78,14 +95,20 @@ mod tests {
 
     impl MockTpm {
         fn new() -> Self {
-            Self { pcr_extensions: AtomicU32::new(0) }
+            Self {
+                pcr_extensions: AtomicU32::new(0),
+            }
         }
     }
 
     #[async_trait]
     impl TpmDevice for MockTpm {
         fn get_info(&self) -> TpmInfo {
-            TpmInfo { manufacturer: 0x4D4F434B, version: 1, spec_level: 2 }
+            TpmInfo {
+                manufacturer: 0x4D4F434B,
+                version: 1,
+                spec_level: 2,
+            }
         }
 
         async fn submit_raw(&self, _cmd: &[u8]) -> Result<Vec<u8>, TpmError> {
@@ -121,8 +144,11 @@ mod tests {
         });
 
         narf_scheduler::run_until_empty();
-        if success.load(Ordering::SeqCst) == 1 { TestResult::Pass }
-        else { TestResult::Fail("get_random check failed") }
+        if success.load(Ordering::SeqCst) == 1 {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("get_random check failed")
+        }
     }
     kernel_test_in!("tpm", smoke_tpm_get_random);
 
@@ -131,19 +157,27 @@ mod tests {
         let mock = Arc::new(MockTpm::new());
         let m = mock.clone();
         narf_scheduler::spawn(async move {
-            m.extend_pcr(0, &[0u8; 32]).await.expect("extend_pcr failed");
+            m.extend_pcr(0, &[0u8; 32])
+                .await
+                .expect("extend_pcr failed");
         });
 
         narf_scheduler::run_until_empty();
-        if mock.pcr_extensions.load(Ordering::SeqCst) == 1 { TestResult::Pass }
-        else { TestResult::Fail("pcr extension check failed") }
+        if mock.pcr_extensions.load(Ordering::SeqCst) == 1 {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("pcr extension check failed")
+        }
     }
     kernel_test_in!("tpm", smoke_tpm_pcr_extension);
 
     fn smoke_tpm_cap_kind() -> TestResult {
         use narf_capabilities::CapType;
-        if matches!(TpmCapType::KIND, CapKind::Tpm) { TestResult::Pass }
-        else { TestResult::Fail("cap kind mismatch") }
+        if matches!(TpmCapType::KIND, CapKind::Tpm) {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("cap kind mismatch")
+        }
     }
     kernel_test_in!("tpm", smoke_tpm_cap_kind);
 }
