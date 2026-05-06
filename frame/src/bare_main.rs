@@ -1279,6 +1279,7 @@ fn run_async_demo() -> ! {
         );
     }
 
+    narf_scheduler::init();
     let _ = writeln!(console::Writer, "  scheduler: ready queue initialised");
 
     narf_scheduler::spawn(async {
