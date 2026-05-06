@@ -1620,17 +1620,87 @@ pub fn gpe1_block() -> Option<GpeBlockInfo> {
     *GPE1_BLOCK.lock()
 }
 
+/// Enable a GPE by number. Correctly identifies the block and
+/// offset within the enable register set.
+pub fn enable_gpe(gpe_num: u32) {
+    let (block, bit) = if let Some(b) = gpe0_block() {
+        if gpe_num >= b.base_gsi && gpe_num < b.base_gsi + (b.byte_count as u32 * 4) {
+            (Some(b), gpe_num - b.base_gsi)
+        } else {
+            (None, 0)
+        }
+    } else {
+        (None, 0)
+    };
+    let (block, bit) = if block.is_none() {
+        if let Some(b) = gpe1_block() {
+            if gpe_num >= b.base_gsi && gpe_num < b.base_gsi + (b.byte_count as u32 * 4) {
+                (Some(b), gpe_num - b.base_gsi)
+            } else {
+                (None, 0)
+            }
+        } else {
+            (block, bit)
+        }
+    } else {
+        (block, bit)
+    };
+
+    if let Some(b) = block {
+        let half = b.byte_count as u64 / 2;
+        let reg_idx = bit / 8;
+        let reg_bit = bit % 8;
+        let port = b.address + half + reg_idx as u64;
+        // SAFETY: part of the validated GPE block.
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let val = narf_arch::x86_64::io_port::inb(port as u16);
+            narf_arch::x86_64::io_port::outb(port as u16, val | (1 << reg_bit));
+        }
+    }
+}
+
 // ── ECDT (Embedded Controller Boot Resources Table) ──────────────────
 
 /// Descriptor for the ACPI Embedded Controller.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct EcdtInfo {
-    pub control_port: u16,
-    pub data_port: u16,
-    pub gpe_bit: u8,
+    pub control_addr: u64,
+    pub data_addr:    u64,
+    pub uid:          u32,
+    pub gpe_bit:      u8,
 }
 
-static ECDT_INFO: IrqSafeSpinLock<Option<EcdtInfo>> = IrqSafeSpinLock::new(None);
+static ECDT_DATA: IrqSafeSpinLock<EcdtInfo> = IrqSafeSpinLock::new(EcdtInfo {
+    control_addr: 0,
+    data_addr: 0,
+    uid: 0,
+    gpe_bit: 0,
+});
+static ECDT_PARSED: AtomicBool = AtomicBool::new(false);
+
+fn parse_ecdt_body(body: &[u8]) {
+    // SDT header (36) + EcControl GAS (12) + EcData GAS (12) +
+    // Uid (4) + GpeBitNumber (1) + EcId (variable).
+    if body.len() < SDT_HEADER_SIZE + 29 {
+        return;
+    }
+    let off = SDT_HEADER_SIZE;
+    // GAS.Address @ +4..12 of each GAS.
+    let control_addr = u64::from_le_bytes([
+        body[off + 4], body[off + 5], body[off + 6], body[off + 7],
+        body[off + 8], body[off + 9], body[off + 10], body[off + 11],
+    ]);
+    let data_addr = u64::from_le_bytes([
+        body[off + 16], body[off + 17], body[off + 18], body[off + 19],
+        body[off + 20], body[off + 21], body[off + 22], body[off + 23],
+    ]);
+    let uid = u32::from_le_bytes([
+        body[off + 24], body[off + 25], body[off + 26], body[off + 27],
+    ]);
+    let gpe_bit = body[off + 28];
+    *ECDT_DATA.lock() = EcdtInfo { control_addr, data_addr, uid, gpe_bit };
+}
 
 /// Discover the Embedded Controller via ECDT.
 pub unsafe fn parse_ecdt(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
@@ -1643,39 +1713,32 @@ pub unsafe fn parse_ecdt(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
             }
         })?;
     }
-    let ecdt_phys = match ecdt {
-        Some(p) => p,
-        None => return Ok(()),
-    };
+    let ecdt_phys = match ecdt { Some(p) => p, None => return Ok(()) };
 
     let total = unsafe { (ecdt_phys as *const SdtHeader).read_unaligned().length as usize };
-    if total < SDT_HEADER_SIZE + 12 + 12 + 4 + 1 {
+    if total < SDT_HEADER_SIZE + 29 {
         return Err(AcpiError::BadXsdtSignature);
     }
     let body = unsafe { core::slice::from_raw_parts(ecdt_phys as *const u8, total) };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
-
-    // EC_CONTROL GAS at +36, EC_DATA GAS at +48.
-    let control_port = u64::from_le_bytes([
-        body[40], body[41], body[42], body[43], body[44], body[45], body[46], body[47],
-    ]) as u16;
-    let data_port = u64::from_le_bytes([
-        body[52], body[53], body[54], body[55], body[56], body[57], body[58], body[59],
-    ]) as u16;
-    let gpe_bit = body[64];
-
-    *ECDT_INFO.lock() = Some(EcdtInfo {
-        control_port,
-        data_port,
-        gpe_bit,
-    });
+    parse_ecdt_body(body);
+    ECDT_PARSED.store(true, Ordering::Release);
     Ok(())
 }
 
 pub fn ecdt_info() -> Option<EcdtInfo> {
-    *ECDT_INFO.lock()
+    if !ECDT_PARSED.load(Ordering::Acquire) {
+        return None;
+    }
+    Some(*ECDT_DATA.lock())
+}
+
+#[doc(hidden)]
+pub fn __test_parse_ecdt_body(body: &[u8]) {
+    parse_ecdt_body(body);
+    ECDT_PARSED.store(true, Ordering::Release);
 }
 
 /// Raw SRAT entry kinds. Exposed for tests/diagnostics that want to
@@ -5482,114 +5545,6 @@ pub fn __test_parse_ras2_body(body: &[u8]) -> u32 {
     let n = parse_ras2_body(body);
     RAS2_PARSED.store(true, Ordering::Release);
     n
-}
-
-// ───────────────────────────────────────────────────────────────────
-// ECDT — Embedded Controller Boot Resources Table.
-// Spec: `acpi/specification/tables-ec-audio-iscsi-csrt-agdi.md` §1.
-// ───────────────────────────────────────────────────────────────────
-
-#[derive(Copy, Clone, Debug, Default)]
-pub struct EcdtInfo {
-    pub control_addr: u64,
-    pub data_addr: u64,
-    pub uid: u32,
-    pub gpe_bit: u8,
-}
-
-static ECDT_DATA: IrqSafeSpinLock<EcdtInfo> = IrqSafeSpinLock::new(EcdtInfo {
-    control_addr: 0,
-    data_addr: 0,
-    uid: 0,
-    gpe_bit: 0,
-});
-static ECDT_PARSED: AtomicBool = AtomicBool::new(false);
-
-fn parse_ecdt_body(body: &[u8]) {
-    // SDT header (36) + EcControl GAS (12) + EcData GAS (12) +
-    // Uid (4) + GpeBitNumber (1) + EcId (variable).
-    if body.len() < SDT_HEADER_SIZE + 29 {
-        return;
-    }
-    let off = SDT_HEADER_SIZE;
-    // GAS.Address @ +4..12 of each GAS.
-    let control_addr = u64::from_le_bytes([
-        body[off + 4],
-        body[off + 5],
-        body[off + 6],
-        body[off + 7],
-        body[off + 8],
-        body[off + 9],
-        body[off + 10],
-        body[off + 11],
-    ]);
-    let data_addr = u64::from_le_bytes([
-        body[off + 16],
-        body[off + 17],
-        body[off + 18],
-        body[off + 19],
-        body[off + 20],
-        body[off + 21],
-        body[off + 22],
-        body[off + 23],
-    ]);
-    let uid = u32::from_le_bytes([
-        body[off + 24],
-        body[off + 25],
-        body[off + 26],
-        body[off + 27],
-    ]);
-    let gpe_bit = body[off + 28];
-    *ECDT_DATA.lock() = EcdtInfo {
-        control_addr,
-        data_addr,
-        uid,
-        gpe_bit,
-    };
-}
-
-/// # Safety
-/// `rsdp_phys` must point at identity-mapped memory; the chain of
-/// XSDT → ECDT must also be identity-mapped.
-pub unsafe fn parse_ecdt(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
-    // SAFETY: caller assertion.
-    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
-    let mut ecdt: Option<u64> = None;
-    // SAFETY: caller assertion.
-    unsafe {
-        walk_xsdt(xsdt, |phys, hdr| {
-            if &hdr.signature == b"ECDT" && ecdt.is_none() {
-                ecdt = Some(phys);
-            }
-        })?;
-    }
-    let ecdt = ecdt.ok_or(AcpiError::NoSrat)?;
-    // SAFETY: caller assertion.
-    let total = unsafe { (ecdt as *const SdtHeader).read_unaligned().length as usize };
-    if total < SDT_HEADER_SIZE + 29 {
-        return Err(AcpiError::BadXsdtSignature);
-    }
-    // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(ecdt as *const u8, total) };
-    if checksum(body) != 0 {
-        return Err(AcpiError::BadTableChecksum);
-    }
-    parse_ecdt_body(body);
-    ECDT_PARSED.store(true, Ordering::Release);
-    Ok(())
-}
-
-pub fn ecdt_info() -> Option<EcdtInfo> {
-    if !ECDT_PARSED.load(Ordering::Acquire) {
-        return None;
-    }
-    Some(*ECDT_DATA.lock())
-}
-
-#[doc(hidden)]
-pub fn __test_parse_ecdt_body(body: &[u8]) {
-    parse_ecdt_body(body);
-    ECDT_PARSED.store(true, Ordering::Release);
 }
 
 // ───────────────────────────────────────────────────────────────────

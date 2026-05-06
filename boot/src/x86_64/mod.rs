@@ -90,6 +90,7 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
         dtb_phys: None,
         acpi_rsdp_phys: rsdp,
         initramfs,
+        framebuffer: None,
     })
 }
 

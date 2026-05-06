@@ -682,6 +682,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             }
                         }
                         // SAFETY: same RSDP, validated above.
+                        let _ = unsafe { narf_acpi::parse_ecdt(p) };
                         let _ = unsafe { narf_acpi::parse_gpe_blocks(p) };
                         let n = narf_aml::gpe::install_aml_handlers();
                         let _ = writeln!(
@@ -930,6 +931,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_input_driver::register_initcalls();
             narf_fb::register_initcalls();
             narf_audio::register_initcalls();
+            narf_power::register_initcalls();
             narf_wireless::register_initcalls();
             narf_accel::register_initcalls();
             narf_tpm::register_initcalls();

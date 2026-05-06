@@ -218,3 +218,14 @@ fn smoke_virtio_input_rel_delta_accumulates() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/input", smoke_virtio_input_rel_delta_accumulates);
+
+fn smoke_generic_fb_discovery() -> TestResult {
+    use narf_fb::last_picked_backend;
+    if let Some(name) = last_picked_backend() {
+        if name == "generic-fb" || name == "bochs-display" || name == "virtio-gpu" {
+            return TestResult::Pass;
+        }
+    }
+    TestResult::Skip("no framebuffer backend picked")
+}
+kernel_test_in!("drivers/graphics", smoke_generic_fb_discovery);

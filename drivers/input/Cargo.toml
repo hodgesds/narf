@@ -18,8 +18,13 @@ narf-arch           = { path = "../../arch" }
 narf-interrupts     = { path = "../../interrupts" }
 narf-drivers        = { path = "../../drivers" }
 narf-init           = { path = "../../init" }
+narf-i3c            = { path = "../../i3c" }
+narf-aml            = { path = "../../aml" }
+narf-fb             = { path = "../../fb" }
+narf-console        = { path = "../../console" }
 narf-drivers-virtio = { path = "../virtio" }
 narf-kernel-test    = { path = "../../verification/kernel-test" }
+async-trait         = "0.1"
 
 [lints]
 workspace = true

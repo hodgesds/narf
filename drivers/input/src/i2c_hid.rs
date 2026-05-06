@@ -6,15 +6,23 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use async_trait::async_trait;
-use narf_drivers::core::{Driver, DriverEnv, DriverError, DriverFuture};
+use core::fmt::Write;
+use narf_drivers::{Driver, DriverEnv, DriverFuture};
 use narf_i3c::{I3cBus, I3cError, I3cOp};
-use narf_input::{push_global, InputEvent, KeyCode, KeyEvent, PointerEvent};
 
 pub struct I2cHidDriver {
     bus: Arc<dyn I3cBus>,
     addr: u8,
     hid_desc_register: u16,
+}
+
+impl core::fmt::Debug for I2cHidDriver {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("I2cHidDriver")
+            .field("addr", &self.addr)
+            .field("hid_desc_register", &self.hid_desc_register)
+            .finish_non_exhaustive()
+    }
 }
 
 impl I2cHidDriver {
@@ -40,15 +48,27 @@ impl Driver for I2cHidDriver {
         Box::pin(async move {
             // 1. Read HID Descriptor.
             // 2. Initialise device.
-            Ok(())
         })
     }
 
     fn quiesce<'a>(&'a mut self) -> DriverFuture<'a> {
-        Box::pin(async move { Ok(()) })
+        Box::pin(async move {})
     }
 }
 
 pub fn register_initcalls() {
-    // Discovery via ACPI/DTB lands in Stage 5.
+    use narf_init::{InitResult, Stage};
+    narf_init::register(Stage::Device, "i2c-hid-probe", || {
+        if let Some(device) = narf_aml::find_device_by_hid("PNP0C50") {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  i2c-hid: found {} via AML, initialization deferred to Stage 5",
+                device.path
+            );
+            // In a real system, we'd find the parent I2C bus and bind.
+            InitResult::Ok
+        } else {
+            InitResult::NotPresent
+        }
+    });
 }

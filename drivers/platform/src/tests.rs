@@ -29,6 +29,17 @@ fn smoke_smbus_class_match_registered() -> TestResult {
 }
 kernel_test_in!("drivers/platform/smbus", smoke_smbus_class_match_registered);
 
+    fn smoke_acpi_ec_discovery() -> TestResult {
+    use crate::ec;
+    if ec::with_ec(|_| {}).is_some() {
+        TestResult::Pass
+    } else {
+        TestResult::Skip("ACPI EC not found (not a laptop config?)")
+    }
+    }
+    kernel_test_in!("drivers/platform/ec", smoke_acpi_ec_discovery);
+
+
 // ── TPM ────────────────────────────────────────────────────────────
 
 fn smoke_tpm_init_default() -> TestResult {

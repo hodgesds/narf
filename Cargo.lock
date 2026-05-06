@@ -488,6 +488,7 @@ dependencies = [
 name = "narf-acpi"
 version = "0.0.0"
 dependencies = [
+ "narf-arch",
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
@@ -723,15 +724,19 @@ name = "narf-drivers-platform"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "narf-acpi",
+ "narf-aml",
  "narf-arch",
  "narf-bus",
  "narf-capabilities",
+ "narf-console",
  "narf-drivers",
  "narf-init",
  "narf-io",
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-power",
  "narf-tpm",
 ]
 
@@ -1011,9 +1016,14 @@ dependencies = [
 name = "narf-input-driver"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
+ "narf-aml",
  "narf-arch",
+ "narf-console",
  "narf-drivers",
  "narf-drivers-virtio",
+ "narf-fb",
+ "narf-i3c",
  "narf-init",
  "narf-input",
  "narf-interrupts",
@@ -1115,6 +1125,8 @@ version = "0.0.0"
 dependencies = [
  "narf-arch",
  "narf-capabilities",
+ "narf-console",
+ "narf-init",
  "narf-kernel-test",
  "narf-lib",
  "narf-scheduler",

@@ -318,10 +318,10 @@ struct GenericScanout;
 
 impl FbScanout for GenericScanout {
     fn width(&self) -> u32 {
-        GENERIC_FB.lock().as_ref().map(|f| f.width()).unwrap_or(0)
+        GENERIC_FB.lock().as_ref().map(|f| f.width).unwrap_or(0)
     }
     fn height(&self) -> u32 {
-        GENERIC_FB.lock().as_ref().map(|f| f.height()).unwrap_or(0)
+        GENERIC_FB.lock().as_ref().map(|f| f.height).unwrap_or(0)
     }
     fn stride(&self) -> u32 {
         GENERIC_FB.lock().as_ref().map(|f| f.stride()).unwrap_or(0)

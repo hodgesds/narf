@@ -7,6 +7,7 @@ use crate::ec::with_ec;
 use alloc::sync::Arc;
 use narf_power::{register_source, PowerSource, PowerSourceType};
 
+#[derive(Debug)]
 pub struct AcpiBattery {
     id: u8,
 }

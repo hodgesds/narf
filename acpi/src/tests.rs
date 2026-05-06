@@ -1088,7 +1088,7 @@ fn smoke_acpi_ecdt_synthetic_decode() -> TestResult {
     buf.push(b'C');
     buf.push(0); // namespace string
 
-    crate::__test_parse_ecdt_body(&buf);
+    crate::parse_ecdt_body(&buf);
     let info = crate::ecdt_info().expect("ECDT not parsed");
     if info.control_addr != 0x62
         || info.data_addr != 0x66

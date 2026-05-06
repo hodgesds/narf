@@ -21,6 +21,10 @@ narf-drivers      = { path = "../" }
 narf-init         = { path = "../../init" }
 narf-tpm          = { path = "../../tpm" }
 narf-arch         = { path = "../../arch" }
+narf-acpi         = { path = "../../acpi" }
+narf-aml          = { path = "../../aml" }
+narf-power        = { path = "../../power" }
+narf-console      = { path = "../../console" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
 async-trait       = "0.1"
 

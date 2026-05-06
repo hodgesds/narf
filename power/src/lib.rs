@@ -74,11 +74,36 @@ pub fn list_sources() -> Vec<Arc<dyn PowerSource>> {
 }
 
 /// Force-link hook.
-pub fn register_initcalls() {}
+pub fn register_initcalls() {
+    use narf_init::{InitResult, Stage};
+    narf_init::register(Stage::Late, "power-monitor", || {
+        narf_scheduler::spawn(async move {
+            let _ = writeln!(narf_console::Writer, "  power-monitor: starting background telemetry...");
+            loop {
+                let sources = list_sources();
+                for src in sources {
+                    let pct = src.capacity_percent();
+                    let charging = if src.is_charging() { " (charging)" } else { "" };
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "  power: {} is at {}%{}",
+                        src.name(),
+                        pct,
+                        charging
+                    );
+                }
+                // Sleep for 30 seconds (assumed 1GHz clock for now).
+                narf_time::sleep_cycles(30_000_000_000).await;
+            }
+        });
+        InitResult::Ok
+    });
+}
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::fmt::Write;
 use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};

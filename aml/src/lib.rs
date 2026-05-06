@@ -251,6 +251,24 @@ pub fn for_each_device<F: FnMut(&AmlNode)>(mut f: F) {
     }
 }
 
+/// Find the first Device node whose `_HID` property matches `hid`.
+pub fn find_device_by_hid(hid: &str) -> Option<AmlNode> {
+    let g = NAMESPACE.lock();
+    for device in g.nodes.iter().filter(|n| n.kind == NodeKind::Device) {
+        // Look for _HID child of this device.
+        let mut hid_path = String::from(&device.path);
+        hid_path.push_str("._HID");
+        if let Some(hid_node) = g.nodes.iter().find(|n| n.path == hid_path) {
+            if let Some(NameValue::String(s)) = &hid_node.value {
+                if s == hid {
+                    return Some(device.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Walk the DSDT + every SSDT and build the namespace. Idempotent —
 /// repeated calls clear the table and rebuild.
 ///
