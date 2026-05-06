@@ -60,6 +60,7 @@ pub enum KeyAlg {
     AesGcm256 = 0x03,
     ChaCha20Poly1305 = 0x04,
     Hkdf = 0x05,
+    AesXts256 = 0x06,
 }
 
 /// Marker trait every algorithm tag implements; the constant lets the
@@ -104,6 +105,13 @@ impl KeyAlgorithm for ChaCha20Poly1305Alg {
 pub struct Hkdf;
 impl KeyAlgorithm for Hkdf {
     const ALG: KeyAlg = KeyAlg::Hkdf;
+}
+
+/// Type-level marker: AES-256-XTS for block-level encryption.
+#[derive(Copy, Clone, Debug)]
+pub struct AesXts256;
+impl KeyAlgorithm for AesXts256 {
+    const ALG: KeyAlg = KeyAlg::AesXts256;
 }
 
 /// Phantom-typed key handle. The actual key bytes live behind the cap
@@ -259,6 +267,54 @@ pub fn hkdf_expand(
     hk.expand(info, &mut out)
         .map_err(|_| CryptoError::InsufficientOutputBuffer)?;
     Ok(out)
+}
+
+// ── AES-256-XTS (Block encryption) ───────────────────────────────────
+
+/// AES-XTS-256 encryption. `key_bytes` must be 64 bytes (two 256-bit keys).
+/// `sector_id` is used as the tweak.
+pub fn aes_xts_256_encrypt(
+    cap: &Cap<Key<AesXts256>, Grant>,
+    key_bytes: &[u8; 64],
+    sector_id: u64,
+    data: &mut [u8],
+) -> Result<(), CryptoError> {
+    cap.check_live()?;
+
+    use aes::cipher::KeyInit;
+    use aes::Aes256;
+    use xts_mode::{get_tweak_default, Xts128};
+
+    let cipher_1 = Aes256::new_from_slice(&key_bytes[..32]).map_err(|_| CryptoError::BackendUnavailable)?;
+    let cipher_2 = Aes256::new_from_slice(&key_bytes[32..]).map_err(|_| CryptoError::BackendUnavailable)?;
+    let xts = Xts128::new(cipher_1, cipher_2);
+
+    xts.encrypt_area(data, 16, sector_id.into(), get_tweak_default);
+
+    Ok(())
+}
+
+/// AES-XTS-256 decryption. `key_bytes` must be 64 bytes (two 256-bit keys).
+/// `sector_id` is used as the tweak.
+pub fn aes_xts_256_decrypt(
+    cap: &Cap<Key<AesXts256>, Grant>,
+    key_bytes: &[u8; 64],
+    sector_id: u64,
+    data: &mut [u8],
+) -> Result<(), CryptoError> {
+    cap.check_live()?;
+
+    use aes::cipher::KeyInit;
+    use aes::Aes256;
+    use xts_mode::{get_tweak_default, Xts128};
+
+    let cipher_1 = Aes256::new_from_slice(&key_bytes[..32]).map_err(|_| CryptoError::BackendUnavailable)?;
+    let cipher_2 = Aes256::new_from_slice(&key_bytes[32..]).map_err(|_| CryptoError::BackendUnavailable)?;
+    let xts = Xts128::new(cipher_1, cipher_2);
+
+    xts.decrypt_area(data, 16, sector_id.into(), get_tweak_default);
+
+    Ok(())
 }
 
 // ── BLAKE3 (un-gated content hash) ───────────────────────────────────

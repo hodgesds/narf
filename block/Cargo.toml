@@ -13,7 +13,10 @@ narf-io = { path = "../io" }
 narf-ipc = { path = "../ipc" }
 narf-time = { path = "../time" }
 narf-tracing = { path = "../tracing" }
+narf-crypto  = { path = "../crypto" }
+narf-tpm     = { path = "../tpm" }
 narf-scheduler = { path = "../scheduler" }
+async-trait = "0.1"
 narf-kernel-test = { path = "../verification/kernel-test" }
 
 [lints]

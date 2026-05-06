@@ -50,6 +50,23 @@ pub async fn measure_phys(
     measure(pcr, label, slice).await
 }
 
+/// Measure an SPDM device's firmware and state.
+pub async fn measure_device(
+    pcr: u32,
+    label: &'static str,
+    device: &dyn narf_spdm::AttestationDevice,
+) -> Result<(), TpmError> {
+    let mut session = narf_spdm::SpdmSession::new(device);
+    if let Ok(_caps) = session.establish().await {
+        if let Ok(measurements) = session.collect_measurements().await {
+            for m in measurements {
+                measure(pcr, label, &m.data).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Returns a copy of the measurement log.
 pub fn get_log() -> Vec<Measurement> {
     unsafe { LOG.clone() }

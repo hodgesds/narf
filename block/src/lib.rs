@@ -30,6 +30,7 @@ extern crate alloc;
 pub mod deadline;
 pub mod mq;
 pub mod registry;
+pub mod encrypted;
 
 mod tests;
 

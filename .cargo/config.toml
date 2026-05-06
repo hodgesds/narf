@@ -39,17 +39,12 @@ rustflags = [
     "-C", "link-arg=-Tbuild/linker/x86_64.ld",
     "-C", "link-arg=--gc-sections",
     "-Z", "plt=no",
-    # curve25519-dalek auto-selects its `simd` backend on x86_64; that
-    # backend uses AVX2 intrinsics that LLVM cannot lower under
-    # `code-model=kernel` (SSE/AVX disabled), and codegen aborts with a
-    # SelectionDAG split error. Pin the `serial` backend — slower but
-    # correct, and Stage-3 cap-gated crypto is not on the IPC hot path.
+    # curve25519: same as poly1305.
     "--cfg", "curve25519_dalek_backend=\"serial\"",
-    # poly1305 builds an AVX2 backend on x86_64; LLVM crashes lowering
-    # those intrinsics under `code-model=kernel`. `poly1305_force_soft`
-    # picks the portable scalar implementation. Same rationale as
-    # curve25519: cap-gated AEAD is not on the IPC fast path in Stage 3.
+    # poly1305: same as curve25519.
     "--cfg", "poly1305_force_soft",
+    # aes: same as curve25519/poly1305.
+    "--cfg", "aes_force_soft",
 ]
 
 # ─── aarch64 kernel target ─────────────────────────────────────────

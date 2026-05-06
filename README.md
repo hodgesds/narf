@@ -239,12 +239,38 @@ Live from boot through `cargo xtask run`:
   match (any vendor), IO BAR4 capture, byte-data + word-data
   read/write transactions through the host-controller PIO
   registers.
-- TPM 2.0 (`narf_drivers_platform::tpm`): clean-room from the
-  TCG-published PC Client PTP (CRB interface) and TIS v1.21
-  (legacy memory-mapped) specs. Auto-detects which interface the
-  silicon exposes at `0xFED40000` (locality 0), exposes
-  `submit(cmd)` for callers that already speak the TPM2 wire
-  format, and a `tpm2_get_random(bytes)` convenience.
+- TPM 2.0 (`narf-tpm`): clean-room from the TCG-published PC
+  Client PTP (CRB interface) and TIS v1.21 (legacy
+  memory-mapped) specs. Auto-detects the interface at
+  `0xFED40000`, exposes `submit(cmd)` for raw wire-format
+  transactions, and supports Measured Boot PCR extension.
+- Measured Boot (`frame/src/measure`): hardware-anchored
+  TCB integrity. Automatically hashes the kernel, initramfs,
+  and boot-handoff data into TPM PCRs 0, 4, and 9.
+- SPDM 1.2 Device Attestation (`narf-spdm`): clean-room
+  Security Protocol and Data Model for peripheral verification.
+  Collects hardware measurements during boot and extends them
+  into PCR 10.
+- MediaTek MT7921 Wi-Fi 6 (`narf-drivers-wireless`): clean-room
+  driver bring-up on PCIe — BAR0 mapping, Wireless MCU reset
+  pulse, and structural integration with the capability-gated
+  802.11 wireless registry.
+- MIPI I3C Master Controller (`narf-drivers-i3c`): clean-room
+  NXP-style controller support — master initialization,
+  dynamic address assignment hooks, and async transfer state
+  machine with In-Band Interrupt (IBI) support.
+- PWM Control (`narf-pwm`): generic 1-32 channel controller
+  abstraction for fan and display-backlight management;
+  integrated with `PwmCap` capability-gated access.
+- SCMI Platform Management (`narf-scmi`): ARM System Control
+  and Management Interface for unified clock, power domain,
+  and performance state management.
+- PMBus Power Telemetry (`narf-pmbus`): ATX 3.x digital
+  sideband support for real-time voltage, current, and
+  thermal monitoring over I2C/SMBus.
+- Transparent Encrypted Storage (`narf-block::encrypted`):
+  AES-256-XTS volume encryption anchored in Measured Boot
+  PCRs via TPM 2.0 unsealing.
 - USB Hub class (`narf_drivers_usb::hub`): clean-room from the
   USB 2.0 Specification chapter 11. GET_DESCRIPTOR(Hub) + per-
   downstream-port SET_FEATURE(PORT_POWER) + GET_STATUS +

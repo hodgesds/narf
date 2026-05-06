@@ -13,6 +13,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "aes"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
+dependencies = [
+ "cfg-if",
+ "cipher",
+ "cpufeatures 0.2.17",
+]
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -119,6 +130,12 @@ checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
  "generic-array",
 ]
+
+[[package]]
+name = "byteorder"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
 name = "cc"
@@ -516,13 +533,16 @@ dependencies = [
 name = "narf-block"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "narf-capabilities",
+ "narf-crypto",
  "narf-io",
  "narf-ipc",
  "narf-kernel-test",
  "narf-lib",
  "narf-scheduler",
  "narf-time",
+ "narf-tpm",
  "narf-tracing",
 ]
 
@@ -589,6 +609,7 @@ dependencies = [
 name = "narf-crypto"
 version = "0.0.0"
 dependencies = [
+ "aes",
  "blake3",
  "chacha20poly1305",
  "ed25519-dalek",
@@ -601,6 +622,7 @@ dependencies = [
  "rand_chacha",
  "rand_core",
  "sha2",
+ "xts-mode",
  "zeroize",
 ]
 
@@ -1493,6 +1515,16 @@ dependencies = [
  "anyhow",
  "clap",
  "wait-timeout",
+]
+
+[[package]]
+name = "xts-mode"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09cbddb7545ca0b9ffa7bdc653e8743303e1712687a6918ced25f2cdbed42520"
+dependencies = [
+ "byteorder",
+ "cipher",
 ]
 
 [[package]]
