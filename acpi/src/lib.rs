@@ -1620,6 +1620,59 @@ pub fn gpe1_block() -> Option<GpeBlockInfo> {
     *GPE1_BLOCK.lock()
 }
 
+// ── ECDT (Embedded Controller Boot Resources Table) ──────────────────
+
+/// Descriptor for the ACPI Embedded Controller.
+#[derive(Copy, Clone, Debug)]
+pub struct EcdtInfo {
+    pub control_port: u16,
+    pub data_port:    u16,
+    pub gpe_bit:      u8,
+}
+
+static ECDT_INFO: IrqSafeSpinLock<Option<EcdtInfo>> = IrqSafeSpinLock::new(None);
+
+/// Discover the Embedded Controller via ECDT.
+pub unsafe fn parse_ecdt(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut ecdt: Option<u64> = None;
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"ECDT" {
+                ecdt = Some(phys);
+            }
+        })?;
+    }
+    let ecdt_phys = match ecdt { Some(p) => p, None => return Ok(()) };
+
+    let total = unsafe { (ecdt_phys as *const SdtHeader).read_unaligned().length as usize };
+    if total < SDT_HEADER_SIZE + 12 + 12 + 4 + 1 {
+        return Err(AcpiError::BadXsdtSignature);
+    }
+    let body = unsafe { core::slice::from_raw_parts(ecdt_phys as *const u8, total) };
+    if checksum(body) != 0 {
+        return Err(AcpiError::BadTableChecksum);
+    }
+
+    // EC_CONTROL GAS at +36, EC_DATA GAS at +48.
+    let control_port = u64::from_le_bytes([
+        body[40], body[41], body[42], body[43],
+        body[44], body[45], body[46], body[47],
+    ]) as u16;
+    let data_port = u64::from_le_bytes([
+        body[52], body[53], body[54], body[55],
+        body[56], body[57], body[58], body[59],
+    ]) as u16;
+    let gpe_bit = body[64];
+
+    *ECDT_INFO.lock() = Some(EcdtInfo { control_port, data_port, gpe_bit });
+    Ok(())
+}
+
+pub fn ecdt_info() -> Option<EcdtInfo> {
+    *ECDT_INFO.lock()
+}
+
 /// Raw SRAT entry kinds. Exposed for tests/diagnostics that want to
 /// validate decoding against synthetic blobs.
 #[derive(Copy, Clone, Debug)]

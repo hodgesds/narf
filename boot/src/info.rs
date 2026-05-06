@@ -73,10 +73,22 @@ pub struct BootInfo {
     ///
     /// `narf-initramfs` consumes this region during `Stage::Early`
     /// to populate its staging static; subsequent consumers
-    /// (`narf-firmware`'s scan, the userspace init-binary loader,
+    /// `narf-firmware`'s scan, the userspace init-binary loader,
     /// …) borrow `&'static Initramfs` from `narf_initramfs::staged()`.
     pub initramfs: Option<MemRegion>,
-}
+    /// Optional framebuffer parameters provided by the bootloader.
+    pub framebuffer: Option<FramebufferInfo>,
+    }
+
+    #[derive(Copy, Clone, Debug)]
+    pub struct FramebufferInfo {
+    pub addr: PhysAddr,
+    pub width: u32,
+    pub height: u32,
+    pub pitch: u32,
+    pub bpp: u8,
+    }
+
 
 /// Errors from `validate_boot_info`. Stage 1 raises `BadMagic` and
 /// `NoUsableRam`; the rest are scaffolding for later checks.

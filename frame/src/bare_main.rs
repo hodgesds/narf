@@ -498,6 +498,25 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 narf_memory::init_from_map(&regions, exclude);
             }
 
+            // Register the generic framebuffer if provided by the bootloader.
+            if let Some(fb_info) = info.framebuffer {
+                let fb = narf_graphics_driver::generic::GenericFb::new(
+                    fb_info.addr.raw(),
+                    fb_info.width,
+                    fb_info.height,
+                    fb_info.pitch,
+                    fb_info.bpp,
+                );
+                narf_fb::register_generic(fb);
+                let _ = writeln!(
+                    console::Writer,
+                    "  generic-fb: registered {}x{} at {:#x}",
+                    fb_info.width,
+                    fb_info.height,
+                    fb_info.addr.raw()
+                );
+            }
+
             let s = narf_memory::frame_stats();
             let _ = writeln!(
                 console::Writer,

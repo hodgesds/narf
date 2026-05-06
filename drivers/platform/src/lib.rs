@@ -12,6 +12,7 @@ extern crate alloc;
 
 pub mod smbus;
 pub mod tpm;
+pub mod ec;
 
 mod tests;
 
@@ -24,6 +25,10 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "tpm", || {
         tpm::try_init_default();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "acpi-ec", || {
+        ec::init();
         InitResult::Ok
     });
 }

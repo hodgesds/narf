@@ -301,6 +301,48 @@ impl FbScanout for AmdgpuScanout {
 static BOCHS: BochsScanout = BochsScanout;
 static VIRTIO_GPU: VirtioGpuScanout = VirtioGpuScanout;
 static AMDGPU: AmdgpuScanout = AmdgpuScanout;
+static GENERIC: GenericScanout = GenericScanout;
+
+/// Global registration for the bootloader-provided linear framebuffer.
+static GENERIC_FB: narf_lib::sync::IrqSafeSpinLock<Option<narf_graphics_driver::generic::GenericFb>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+pub fn register_generic(fb: narf_graphics_driver::generic::GenericFb) {
+    *GENERIC_FB.lock() = Some(fb);
+}
+
+/// Backend-agnostic scanout view for the boot-provided linear FB.
+#[derive(Debug)]
+struct GenericScanout;
+
+impl FbScanout for GenericScanout {
+    fn width(&self) -> u32 {
+        GENERIC_FB.lock().as_ref().map(|f| f.width()).unwrap_or(0)
+    }
+    fn height(&self) -> u32 {
+        GENERIC_FB.lock().as_ref().map(|f| f.height()).unwrap_or(0)
+    }
+    fn stride(&self) -> u32 {
+        GENERIC_FB.lock().as_ref().map(|f| f.stride()).unwrap_or(0)
+    }
+    fn format(&self) -> PixelFormat {
+        PixelFormat::XRGB8888
+    }
+    fn name(&self) -> &'static str {
+        "generic-fb"
+    }
+    fn flush(&self, _x: u32, _y: u32, _w: u32, _h: u32) {}
+    unsafe fn framebuffer(&self) -> Framebuffer {
+        GENERIC_FB
+            .lock()
+            .as_ref()
+            .map(|f| {
+                // SAFETY: register_generic caller asserts addr/size validity.
+                unsafe { f.framebuffer() }
+            })
+            .expect("generic-fb scanout selected without device")
+    }
+}
 
 /// Picker. Prefers a test scanout (when installed) for hermetic
 /// smokes; otherwise bochs (no command-queue tax) when its BAR is
@@ -342,6 +384,9 @@ pub fn select_active() -> Option<&'static dyn FbScanout> {
         if mode_ok {
             return Some(&AMDGPU);
         }
+    }
+    if GENERIC_FB.lock().is_some() {
+        return Some(&GENERIC);
     }
     if narf_graphics_driver::bochs::is_probed() {
         let reachable =
