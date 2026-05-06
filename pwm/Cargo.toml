@@ -1,0 +1,25 @@
+[package]
+name         = "narf-pwm"
+description  = "PWM subsystem. Clean-room PWM control model (duty cycle, frequency, capability-gated channels)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_pwm"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../lib" }
+narf-capabilities = { path = "../capabilities" }
+narf-scheduler    = { path = "../scheduler" }
+narf-kernel-test  = { path = "../verification/kernel-test" }
+async-trait       = "0.1"
+
+[features]
+kernel-test = []
+
+[lints]
+workspace = true
