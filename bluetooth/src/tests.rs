@@ -1804,3 +1804,152 @@ fn smoke_sdp_psm_assigned_number() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bluetooth/sdp", smoke_sdp_psm_assigned_number);
+
+// ── Bluetooth Mesh smokes ──────────────────────────────────────────
+
+fn smoke_mesh_network_header_round_trip() -> TestResult {
+    use crate::mesh::NetworkHeader;
+    let h = NetworkHeader {
+        ivi: 1,
+        nid: 0x42,
+        ctl: false,
+        ttl: 7,
+        seq: 0xCAFE_BE,
+        src: 0x1234,
+        dst: 0xFFFF,
+    };
+    let bytes = h.encode();
+    if bytes[0] != ((1 << 7) | 0x42) {
+        return TestResult::Fail("byte 0 should pack IVI<<7 | NID");
+    }
+    if bytes[1] != 7 {
+        return TestResult::Fail("CTL=0 + TTL=7 → byte 1 = 0x07");
+    }
+    let back = NetworkHeader::decode(&bytes).expect("decode");
+    if back != h {
+        return TestResult::Fail("network header round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/mesh", smoke_mesh_network_header_round_trip);
+
+fn smoke_mesh_seq_is_24bit_be() -> TestResult {
+    use crate::mesh::NetworkHeader;
+    let h = NetworkHeader {
+        seq: 0x123456,
+        ..Default::default()
+    };
+    let bytes = h.encode();
+    if bytes[2] != 0x12 || bytes[3] != 0x34 || bytes[4] != 0x56 {
+        return TestResult::Fail("SEQ should be 3 BE bytes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/mesh", smoke_mesh_seq_is_24bit_be);
+
+fn smoke_mesh_segmented_access_header_round_trip() -> TestResult {
+    use crate::mesh::SegmentedAccessHeader;
+    let h = SegmentedAccessHeader {
+        seg: true,
+        akf: true,
+        aid: 0x12,
+        szmic: false,
+        seq_zero: 0x1AB3,
+        seg_o: 5,
+        seg_n: 9,
+    };
+    let bytes = h.encode();
+    if bytes[0] & 0xC0 != 0xC0 {
+        return TestResult::Fail("SEG+AKF bits should be set");
+    }
+    let back = SegmentedAccessHeader::decode(&bytes).expect("decode");
+    if back != h {
+        return TestResult::Fail("segmented header round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/mesh", smoke_mesh_segmented_access_header_round_trip);
+
+fn smoke_mesh_access_opcode_one_byte() -> TestResult {
+    use crate::mesh::AccessOpcode;
+    let bytes = AccessOpcode::OneByte(0x42).encode();
+    if bytes != alloc::vec![0x42u8] {
+        return TestResult::Fail("1-byte opcode should encode as itself");
+    }
+    let (op, n) = AccessOpcode::decode(&bytes).expect("decode");
+    if op != AccessOpcode::OneByte(0x42) || n != 1 {
+        return TestResult::Fail("1-byte decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/mesh", smoke_mesh_access_opcode_one_byte);
+
+fn smoke_mesh_access_opcode_two_byte() -> TestResult {
+    use crate::mesh::AccessOpcode;
+    let v = 0x2C00; // Generic OnOff Set (Mesh Model spec)
+    let bytes = AccessOpcode::TwoByte(v).encode();
+    if bytes[0] & 0xC0 != 0x80 {
+        return TestResult::Fail("2-byte opcode top bits = 0b10");
+    }
+    let (op, n) = AccessOpcode::decode(&bytes).expect("decode");
+    if op != AccessOpcode::TwoByte(v) || n != 2 {
+        return TestResult::Fail("2-byte decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/mesh", smoke_mesh_access_opcode_two_byte);
+
+fn smoke_mesh_access_opcode_vendor_form_carries_company_id_le() -> TestResult {
+    use crate::mesh::AccessOpcode;
+    let bytes = AccessOpcode::Vendor {
+        op: 0x05,
+        company_id: 0x004C, // Apple
+    }
+    .encode();
+    if bytes[0] & 0xC0 != 0xC0 {
+        return TestResult::Fail("3-byte opcode top bits = 0b11");
+    }
+    if bytes[1] != 0x4C || bytes[2] != 0x00 {
+        return TestResult::Fail("Company ID is little-endian");
+    }
+    let (op, _) = AccessOpcode::decode(&bytes).expect("decode");
+    if op != (AccessOpcode::Vendor { op: 0x05, company_id: 0x004C }) {
+        return TestResult::Fail("vendor opcode round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/mesh",
+    smoke_mesh_access_opcode_vendor_form_carries_company_id_le
+);
+
+fn smoke_mesh_access_opcode_rejects_reserved() -> TestResult {
+    use crate::mesh::{AccessOpcode, MeshError};
+    match AccessOpcode::decode(&[0x00]) {
+        Err(MeshError::BadOpcode) => {}
+        _ => return TestResult::Fail("opcode 0x00 must be rejected"),
+    }
+    match AccessOpcode::decode(&[0x7F]) {
+        Err(MeshError::BadOpcode) => TestResult::Pass,
+        _ => TestResult::Fail("opcode 0x7F must be rejected"),
+    }
+}
+kernel_test_in!("bluetooth/mesh", smoke_mesh_access_opcode_rejects_reserved);
+
+fn smoke_mesh_composition_header_round_trip() -> TestResult {
+    use crate::mesh::CompositionHeader;
+    let h = CompositionHeader {
+        cid: 0x004C,
+        pid: 0x1234,
+        vid: 0x0001,
+        crpl: 32,
+        features: CompositionHeader::FEATURE_RELAY | CompositionHeader::FEATURE_PROXY,
+    };
+    let bytes = h.encode();
+    let back = CompositionHeader::decode(&bytes).expect("decode");
+    if back != h {
+        return TestResult::Fail("composition header round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/mesh", smoke_mesh_composition_header_round_trip);

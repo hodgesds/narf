@@ -739,3 +739,99 @@ fn smoke_tlb_shootdown_local_only() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory/tlb_shootdown", smoke_tlb_shootdown_local_only);
+
+// ── SPD5 decoder smokes ────────────────────────────────────────────
+
+extern crate alloc;
+
+fn build_spd5_image(fill: impl FnOnce(&mut [u8; 1024])) -> alloc::vec::Vec<u8> {
+    use crate::spd5::crc16_ccitt;
+    let mut buf = [0u8; 1024];
+    buf[2] = crate::spd5::DRAM_TYPE_DDR5;
+    fill(&mut buf);
+    let crc = crc16_ccitt(&buf[..1022]);
+    buf[1022..1024].copy_from_slice(&crc.to_le_bytes());
+    buf.to_vec()
+}
+
+fn smoke_spd5_size_constant() -> TestResult {
+    if crate::spd5::SPD5_SIZE != 1024 {
+        return TestResult::Fail("SPD5 EEPROM is 1024 bytes per JESD400-5");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/spd5", smoke_spd5_size_constant);
+
+fn smoke_spd5_crc16_known_vector() -> TestResult {
+    use crate::spd5::crc16_ccitt;
+    // CRC-16/CCITT (XMODEM) of "123456789" is 0x31C3.
+    let r = crc16_ccitt(b"123456789");
+    if r != 0x31C3 {
+        return TestResult::Fail("CRC-16/CCITT XMODEM test vector mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/spd5", smoke_spd5_crc16_known_vector);
+
+fn smoke_spd5_rejects_bad_crc() -> TestResult {
+    use crate::spd5::{Spd5, Spd5Error, DRAM_TYPE_DDR5};
+    let mut buf = [0u8; 1024];
+    buf[2] = DRAM_TYPE_DDR5;
+    // CRC bytes left at zero — won't match the real CRC of bytes 0..1021.
+    match Spd5::parse(&buf) {
+        Err(Spd5Error::BadCrc) => TestResult::Pass,
+        _ => TestResult::Fail("incorrect CRC must be rejected"),
+    }
+}
+kernel_test_in!("memory/spd5", smoke_spd5_rejects_bad_crc);
+
+fn smoke_spd5_rejects_unknown_dram_type() -> TestResult {
+    use crate::spd5::{crc16_ccitt, Spd5, Spd5Error};
+    let mut buf = [0u8; 1024];
+    buf[2] = 0xAB; // bogus dram-type byte
+    let crc = crc16_ccitt(&buf[..1022]);
+    buf[1022..1024].copy_from_slice(&crc.to_le_bytes());
+    match Spd5::parse(&buf) {
+        Err(Spd5Error::BadDramType(0xAB)) => TestResult::Pass,
+        _ => TestResult::Fail("non-DDR5/LPDDR5 must be rejected"),
+    }
+}
+kernel_test_in!("memory/spd5", smoke_spd5_rejects_unknown_dram_type);
+
+fn smoke_spd5_decodes_ddr5_4800_module() -> TestResult {
+    use crate::spd5::{Spd5, MODULE_TYPE_UDIMM};
+    // DDR5-4800 → tCKAVGmin = 1/(2400 MHz × 2) ≈ 416.7 ps.
+    // Use 416 ps so the data-rate calc returns an even number.
+    let buf = build_spd5_image(|b| {
+        b[0] = (1 << 4) | 1; // bytes_total=1 / bytes_used=1
+        b[1] = (1 << 4) | 0; // SPD rev 1.0
+        b[3] = MODULE_TYPE_UDIMM;
+        b[16..18].copy_from_slice(&416u16.to_le_bytes());
+        b[18..20].copy_from_slice(&625u16.to_le_bytes()); // tCKAVGmax (DDR5-3200)
+        b[20..22].copy_from_slice(&13_750u16.to_le_bytes()); // tAAmin
+        b[22..24].copy_from_slice(&13_750u16.to_le_bytes()); // tRCDmin
+        b[24..26].copy_from_slice(&13_750u16.to_le_bytes()); // tRPmin
+        b[26..28].copy_from_slice(&46_000u16.to_le_bytes()); // tRCmin
+        b[512] = 5; // JEP-106 bank #5
+        b[513] = 0xCD; // some manufacturer ID
+        b[516..524].copy_from_slice(b"NARF1234");
+    });
+    let s = Spd5::parse(&buf).expect("parse");
+    if s.module_type != MODULE_TYPE_UDIMM {
+        return TestResult::Fail("UDIMM module type lost");
+    }
+    if s.tckavg_min_ps != 416 {
+        return TestResult::Fail("tCKAVGmin should round-trip");
+    }
+    if s.data_rate_mt_per_s() != 2_000_000 / 416 {
+        return TestResult::Fail("data-rate calc wrong");
+    }
+    if s.module_part_number_str() != "NARF1234" {
+        return TestResult::Fail("module part number ASCII");
+    }
+    if s.manufacturer_bank != 5 || s.manufacturer_id != 0xCD {
+        return TestResult::Fail("JEP-106 bank/id should round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/spd5", smoke_spd5_decodes_ddr5_4800_module);

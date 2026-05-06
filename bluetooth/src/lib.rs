@@ -42,6 +42,7 @@ pub mod hogp;
 pub mod rfcomm;
 pub mod sdp;
 pub mod l2cap;
+pub mod mesh;
 pub mod opcode;
 pub mod smp;
 pub mod transport;

@@ -340,6 +340,32 @@ Cache stats are tracked (`tracing/`) so the magazine size can
 be tuned per-cache. The default heuristic above is the v1
 contract; the tunable knob is `SlabOpts::magazine`.
 
+## 8a. SPD5 sub-module (`spd5`)
+
+`spd5/` is a clean-room decoder for the JEDEC Serial Presence
+Detect EEPROM that DDR5 modules expose over the SMBus / I3C side-
+band. References (public-only):
+
+- **JEDEC Standard JESD400-5** — DDR5 SPD Annex L (SPD5 Hub Device
+  and SPD5 Memory Module Specifications). Public document.
+  §1.2.3 (1024-byte EEPROM map). §1.4 (manufacturer ID = JEP-106
+  bank + ID). §1.5 (timing fields stored as 16-bit little-endian
+  picosecond values). Annex C (CRC-16/CCITT-XMODEM trailer over
+  bytes 0..1021).
+- **JEDEC Standard JEP106BJ** — manufacturer's identification code
+  registry. Public.
+- **JEDEC JESD79-5B** — DDR5 SDRAM core spec. Public. Defines the
+  timing parameters whose minimum values the SPD5 region encodes
+  (tCKAVGmin / tAAmin / tRCDmin / tRPmin / tRCmin / tRFC1min /
+  tRFC2min / tRFCsbmin).
+
+Surfaced:
+- `Spd5::parse` — verifies CRC and decodes the SPD revision +
+  module type + manufacturer JEP-106 bank/id + module part number
+  + 6 picosecond timing minimums + 3 nanosecond refresh minimums.
+- `data_rate_mt_per_s` — turns tCKAVGmin into the bus data rate.
+- `crc16_ccitt` — the polynomial-0x1021 / init-0 / no-XOR variant.
+
 ## 9. ABI versioning
 
 `memory/` exports through SDK at `@v0`:

@@ -204,6 +204,27 @@ the host writes to the Write Mailbox and reads from the Read Mailbox.
 The MMIO bring-up and Status-bit polling live in the consumer driver
 (SPDM, CXL IDE).
 
+## 7b. PCIe IDE (Integrity & Data Encryption)
+
+`pci_ide/` is a clean-room codec for the IDE Extended Capability
+plus the IDE_KM key-management protocol. References (public-only):
+
+- **PCI Express Base Specification, Revision 6.0** — PCI-SIG.
+  §6.33 Integrity & Data Encryption (IDE) Extended Capability:
+  cap-id 0x0030, capability + control + per-stream register
+  blocks (Stream Capabilities / Control / Status — Stream Enable,
+  Aggregation, PCRC, Algorithm = AES-GCM-256 / AES-GMAC-256,
+  Selected, TC, Stream ID), per-RID association blocks for
+  Selective Streams. §6.33.4 IDE_KM message format carried over
+  DOE (vendor 0x0001, type 0x07): KEY_PROG / KP_ACK / K_SET_GO /
+  K_SET_STOP / K_GOSTOP_ACK / KEY_QUERY / K_QUERY_RESP, plus the
+  Stream Selector word (Stream ID + Sub-Stream PR/NPR + Key Set
+  A/B + Direction Rx/Tx).
+
+The codec is bus-agnostic — it produces the bytes the host writes
+into a DOE message body. The MMIO Stream-register read/write
+plumbing is the consumer driver's responsibility.
+
 ## 8. Open questions
 
 - ~~**ACPI interpreter**~~ **Resolved (v0.2): NARF will not execute

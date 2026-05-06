@@ -386,3 +386,114 @@ fn smoke_dp_aux_i2c_read_mot_for_edid_drain() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("graphics/dp-aux", smoke_dp_aux_i2c_read_mot_for_edid_drain);
+
+// ── DSC PPS smokes ─────────────────────────────────────────────────
+
+fn smoke_dsc_pps_size_constant() -> TestResult {
+    if crate::dsc::DSC_PPS_SIZE != 128 {
+        return TestResult::Fail("DSC PPS is 128 bytes per §3.4");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("graphics/dsc", smoke_dsc_pps_size_constant);
+
+fn smoke_dsc_pps_round_trip_4k_8bpc_at_8bpp() -> TestResult {
+    use crate::dsc::Pps;
+    let p = Pps {
+        dsc_version_major: 1,
+        dsc_version_minor: 2,
+        pps_identifier: 0,
+        bits_per_component: 8,
+        linebuf_depth: 9,
+        bits_per_pixel: 8 * 16, // 8.0 bpp encoded as 128
+        pic_height: 2160,
+        pic_width: 3840,
+        slice_height: 108,
+        slice_width: 1920,
+        chunk_size: 1920,
+        initial_xmit_delay: 512,
+        initial_dec_delay: 526,
+        initial_scale_value: 32,
+        scale_increment_interval: 113,
+        scale_decrement_interval: 1024,
+        first_line_bpg_offset: 12,
+        nfl_bpg_offset: 1024,
+        slice_bpg_offset: 1024,
+        initial_offset: 6144,
+        final_offset: 4336,
+        flatness_min_qp: 7,
+        flatness_max_qp: 16,
+        rc_model_size: 8192,
+        rc_buf_thresh: [
+            14, 28, 42, 56, 70, 84, 98, 105, 112, 119, 121, 123, 125, 126,
+        ],
+        rc_range_parameters: [
+            crate::dsc::pack_range_parameter(0, 4, 0),
+            crate::dsc::pack_range_parameter(0, 6, 0),
+            crate::dsc::pack_range_parameter(0, 8, 1),
+            crate::dsc::pack_range_parameter(2, 9, 1),
+            crate::dsc::pack_range_parameter(4, 9, 2),
+            crate::dsc::pack_range_parameter(6, 9, 2),
+            crate::dsc::pack_range_parameter(8, 9, 3),
+            crate::dsc::pack_range_parameter(8, 10, 3),
+            crate::dsc::pack_range_parameter(10, 11, 3),
+            crate::dsc::pack_range_parameter(10, 12, 4),
+            crate::dsc::pack_range_parameter(12, 14, 4),
+            crate::dsc::pack_range_parameter(12, 14, 6),
+            crate::dsc::pack_range_parameter(13, 15, 8),
+            crate::dsc::pack_range_parameter(15, 15, 12),
+            crate::dsc::pack_range_parameter(15, 16, 14),
+        ],
+    };
+    let buf = p.encode();
+    let back = Pps::parse(&buf).expect("parse");
+    if back != p {
+        return TestResult::Fail("PPS round-trip mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("graphics/dsc", smoke_dsc_pps_round_trip_4k_8bpc_at_8bpp);
+
+fn smoke_dsc_bpp_fractional_split() -> TestResult {
+    use crate::dsc::Pps;
+    let mut p = Pps::default();
+    p.dsc_version_major = 1;
+    p.bits_per_pixel = 8 * 16 + 5; // 8.3125 bpp
+    if p.bpp_integer_part() != 8 {
+        return TestResult::Fail("integer part = high 12 bits / 16");
+    }
+    if p.bpp_fractional_sixteenths() != 5 {
+        return TestResult::Fail("fractional part = low 4 bits");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("graphics/dsc", smoke_dsc_bpp_fractional_split);
+
+fn smoke_dsc_pack_range_parameter_layout() -> TestResult {
+    use crate::dsc::pack_range_parameter;
+    // bpg_offset = 4 → bits 15..11 = 4 << 11
+    // max_qp = 9 → bits 10..6 = 9 << 6
+    // min_qp = 2 → bits 5..0 = 2
+    let v = pack_range_parameter(4, 9, 2);
+    if (v >> 11) & 0x1F != 4 {
+        return TestResult::Fail("bpg_offset at bits 15..11");
+    }
+    if (v >> 6) & 0x1F != 9 {
+        return TestResult::Fail("max_qp at bits 10..6");
+    }
+    if v & 0x1F != 2 {
+        return TestResult::Fail("min_qp at bits 5..0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("graphics/dsc", smoke_dsc_pack_range_parameter_layout);
+
+fn smoke_dsc_pps_rejects_zero_version() -> TestResult {
+    use crate::dsc::{DscError, Pps};
+    let buf = [0u8; 128];
+    match Pps::parse(&buf) {
+        Err(DscError::BadVersion) => TestResult::Pass,
+        _ => TestResult::Fail("DSC version 0 must be rejected"),
+    }
+}
+kernel_test_in!("graphics/dsc", smoke_dsc_pps_rejects_zero_version);

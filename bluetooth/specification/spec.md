@@ -99,6 +99,18 @@ Bluetooth subsystem source material was consulted at any point.**
   v1.11** — referenced for the boot-protocol report layouts (§B.1
   keyboard, §B.2 mouse) reused on BLE.
 
+### Bluetooth Mesh
+
+- **Bluetooth Mesh Profile Specification, Version 1.1** (Sep 2023)
+  — Bluetooth SIG. Public adopted document. §3.4.2 Network PDU
+  layout (IVI/NID + obfuscated CTL/TTL/SEQ/SRC + encrypted
+  DST + Transport PDU). §3.5.2 Lower Transport: unsegmented
+  vs segmented Access PDU (SegN/SegO/SeqZero/SZMIC packing).
+  §3.7.3 Access-layer Opcode encoding (1 / 2 / 3-byte forms).
+- **Bluetooth Mesh Model Specification, Version 1.1** —
+  Bluetooth SIG. Public. §4.2.1.1 Composition Data Page 0
+  layout (CID/PID/VID/CRPL/Features bitmap + per-element list).
+
 ### SDP (Service Discovery Protocol)
 
 - **Bluetooth Core Specification 5.3, Vol 3 Part B (SDP)** —
@@ -147,6 +159,14 @@ Bluetooth subsystem source material was consulted at any point.**
   Information / Exchange MTU per ATT §3.4. Convenience builders
   `add_primary_service` / `add_characteristic` emit the canonical
   Vol 3 Part G declaration shape.
+- **Mesh** (`mesh`): clean-room Bluetooth Mesh codec. Network PDU
+  header (9 bytes — IVI/NID + CTL/TTL + 24-bit BE SEQ + SRC + DST),
+  Lower Transport segmented Access PDU header (4 bytes — SEG/AKF/AID
+  + SZMIC + 13-bit SeqZero + SegO + SegN packing), Access-layer
+  Opcode encoder/decoder for all three forms (1-byte 0x01..0x7E /
+  2-byte 0x80..0xBF / 3-byte vendor with LE Company ID), Composition
+  Data Page 0 header with feature-bit constants (Relay / Proxy /
+  Friend / Low Power).
 - **SDP** (`sdp`): clean-room Service Discovery Protocol codec.
   PDU header (5 bytes), DataElement TLV encoder/decoder (NIL,
   Unsigned Integer, UUID, Text, Boolean, Sequence with all three

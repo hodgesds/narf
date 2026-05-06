@@ -778,3 +778,118 @@ fn smoke_doe_discovery_entry_parse() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bus/doe", smoke_doe_discovery_entry_parse);
+
+// ── PCIe IDE smokes ────────────────────────────────────────────────
+
+fn smoke_ide_stream_selector_round_trip() -> TestResult {
+    use crate::pci_ide::StreamSelector;
+    let s = StreamSelector {
+        stream_id: 0x12,
+        sub_stream_npr: true,
+        key_set_b: false,
+        direction_tx: true,
+    };
+    let raw = s.encode();
+    if raw & 0xFF != 0x12 {
+        return TestResult::Fail("Stream ID lives in low 8 bits");
+    }
+    if raw & (1 << 8) == 0 {
+        return TestResult::Fail("sub_stream_npr at bit 8");
+    }
+    if raw & (1 << 10) == 0 {
+        return TestResult::Fail("direction_tx at bit 10");
+    }
+    let back = StreamSelector::decode(raw);
+    if back != s {
+        return TestResult::Fail("StreamSelector round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/ide", smoke_ide_stream_selector_round_trip);
+
+fn smoke_ide_key_prog_message_layout() -> TestResult {
+    use crate::pci_ide::{key_prog, StreamSelector, KM_OBJECT_KEY_PROG};
+    let key = [0u8; 32];
+    let iv = [0u8; 8];
+    let s = StreamSelector {
+        stream_id: 1,
+        ..Default::default()
+    };
+    let bytes = key_prog(s, &key, &iv);
+    if bytes[0] != KM_OBJECT_KEY_PROG {
+        return TestResult::Fail("Object ID byte must be KEY_PROG");
+    }
+    if bytes.len() != 4 + 32 + 8 {
+        return TestResult::Fail("KEY_PROG body = 4 hdr + 32 key + 8 IV");
+    }
+    if bytes[2] != 1 {
+        return TestResult::Fail("selector low byte should hold stream id");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/ide", smoke_ide_key_prog_message_layout);
+
+fn smoke_ide_kp_ack_status_field() -> TestResult {
+    use crate::pci_ide::{
+        kp_ack, parse, StreamSelector, KM_OBJECT_KP_ACK, KP_ACK_STATUS_INCORRECT_LENGTH,
+    };
+    let s = StreamSelector {
+        stream_id: 5,
+        ..Default::default()
+    };
+    let body = kp_ack(s, KP_ACK_STATUS_INCORRECT_LENGTH);
+    let (obj, back, tail) = parse(&body).expect("parse");
+    if obj != KM_OBJECT_KP_ACK {
+        return TestResult::Fail("Object ID round-trip");
+    }
+    if back != s {
+        return TestResult::Fail("selector round-trip");
+    }
+    if tail[0] != KP_ACK_STATUS_INCORRECT_LENGTH {
+        return TestResult::Fail("status byte missing");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/ide", smoke_ide_kp_ack_status_field);
+
+fn smoke_ide_set_go_set_stop_layout() -> TestResult {
+    use crate::pci_ide::{
+        k_set_go, k_set_stop, StreamSelector, KM_OBJECT_K_SET_GO, KM_OBJECT_K_SET_STOP,
+    };
+    let s = StreamSelector { stream_id: 3, ..Default::default() };
+    let go = k_set_go(s);
+    let stop = k_set_stop(s);
+    if go[0] != KM_OBJECT_K_SET_GO {
+        return TestResult::Fail("K_SET_GO opcode");
+    }
+    if stop[0] != KM_OBJECT_K_SET_STOP {
+        return TestResult::Fail("K_SET_STOP opcode");
+    }
+    if go.len() != 4 || stop.len() != 4 {
+        return TestResult::Fail("both messages = 4-byte body");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/ide", smoke_ide_set_go_set_stop_layout);
+
+fn smoke_ide_parse_rejects_unknown_object_id() -> TestResult {
+    use crate::pci_ide::{parse, IdeError};
+    let body = [0x42u8, 0, 0, 0];
+    match parse(&body) {
+        Err(IdeError::BadObjectId(0x42)) => TestResult::Pass,
+        _ => TestResult::Fail("unknown KM object id must be rejected"),
+    }
+}
+kernel_test_in!("bus/ide", smoke_ide_parse_rejects_unknown_object_id);
+
+fn smoke_ide_doe_type_constant() -> TestResult {
+    use crate::pci_ide::{DOE_TYPE_IDE_KM, DOE_VENDOR_PCISIG};
+    if DOE_TYPE_IDE_KM != 0x07 {
+        return TestResult::Fail("IDE_KM DOE type = 0x07 per §6.33.4");
+    }
+    if DOE_VENDOR_PCISIG != 0x0001 {
+        return TestResult::Fail("PCI-SIG vendor ID = 0x0001");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/ide", smoke_ide_doe_type_constant);

@@ -46,6 +46,7 @@ pub mod pci_cap;
 pub mod pci_cap_ext;
 pub mod pci_doe;
 pub mod pci_express;
+pub mod pci_ide;
 pub mod pcie;
 pub mod registry;
 
