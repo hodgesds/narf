@@ -19,6 +19,8 @@ narf-init         = { path = "../init" }
 narf-console      = { path = "../console" }
 narf-scheduler    = { path = "../scheduler" }
 narf-capabilities = { path = "../capabilities" }
+narf-acpi         = { path = "../acpi" }
+narf-aml          = { path = "../aml" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 
 [lints]

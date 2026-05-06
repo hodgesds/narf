@@ -167,6 +167,148 @@ fn smoke_power_suspend_phase_progression() -> TestResult {
 }
 kernel_test_in!("power", smoke_power_suspend_phase_progression);
 
+fn smoke_thermal_active_cooling_governor() -> TestResult {
+    use crate::bootstrap_thermal_authority;
+    use crate::thermal::{
+        init, install_active_cooling, record_temp, register_cooling_device, register_zone,
+        CoolingDevice, CoolingPolicy, StepPolicy, ThermalEvent,
+    };
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    init();
+
+    #[derive(Debug)]
+    struct RecordingFan(AtomicU8);
+    impl CoolingDevice for RecordingFan {
+        fn name(&self) -> &'static str {
+            "rec"
+        }
+        fn set_level(&self, level: u8) {
+            self.0.store(level, Ordering::SeqCst);
+        }
+    }
+
+    let cap = bootstrap_thermal_authority();
+    let fan = Arc::new(RecordingFan(AtomicU8::new(0)));
+    if register_cooling_device(&cap, fan.clone()).is_err() {
+        return TestResult::Fail("register_cooling_device rejected a live cap");
+    }
+
+    let zone = match register_zone(&cap, "TZ0", 70_000, 90_000) {
+        Ok(id) => id,
+        Err(_) => return TestResult::Fail("register_zone rejected a live cap"),
+    };
+
+    if install_active_cooling(&cap, StepPolicy).is_err() {
+        return TestResult::Fail("install_active_cooling rejected a live cap");
+    }
+
+    // Normal → no event (state stayed Normal). Drive a Warm crossing.
+    let _ = record_temp(zone, 75_000);
+    if fan.0.load(Ordering::SeqCst) != 128 {
+        return TestResult::Fail("Warm event did not drive fan to 128");
+    }
+
+    let _ = record_temp(zone, 95_000);
+    if fan.0.load(Ordering::SeqCst) != 255 {
+        return TestResult::Fail("Critical event did not drive fan to max");
+    }
+
+    let _ = record_temp(zone, 50_000);
+    if fan.0.load(Ordering::SeqCst) != 0 {
+        return TestResult::Fail("Normal event did not turn fan off");
+    }
+
+    // Verify the policy maps each variant correctly without going
+    // through the registry — covers the trait directly so a future
+    // policy swap can reuse it.
+    let p = StepPolicy;
+    if p.level_for(&ThermalEvent::Normal { zone, milli_c: 0 }) != 0
+        || p.level_for(&ThermalEvent::Warm { zone, milli_c: 0 }) != 128
+        || p.level_for(&ThermalEvent::Critical { zone, milli_c: 0 }) != 255
+    {
+        return TestResult::Fail("StepPolicy mapping wrong");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("power/thermal", smoke_thermal_active_cooling_governor);
+
+fn smoke_thermal_cap_revocation_blocks_install() -> TestResult {
+    use crate::bootstrap_thermal_authority;
+    use crate::thermal::{
+        init, install_active_cooling, register_cooling_device, CoolingDevice, StepPolicy,
+        ThermalError,
+    };
+    use alloc::sync::Arc;
+
+    init();
+
+    #[derive(Debug)]
+    struct Noop;
+    impl CoolingDevice for Noop {
+        fn name(&self) -> &'static str {
+            "noop"
+        }
+        fn set_level(&self, _: u8) {}
+    }
+
+    let cap = bootstrap_thermal_authority();
+    cap.revoke();
+
+    match register_cooling_device(&cap, Arc::new(Noop)) {
+        Err(ThermalError::AuthorityRevoked) => {}
+        _ => return TestResult::Fail("revoked cap was accepted by register_cooling_device"),
+    }
+    match install_active_cooling(&cap, StepPolicy) {
+        Err(ThermalError::AuthorityRevoked) => {}
+        _ => return TestResult::Fail("revoked cap was accepted by install_active_cooling"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power/thermal", smoke_thermal_cap_revocation_blocks_install);
+
+fn smoke_s3_parse_package_decodes_slp_typ() -> TestResult {
+    use crate::suspend;
+
+    // Build a synthetic `\_S3_` package body: PackageOp + PkgLength
+    // (one byte: 0x05 = 5 bytes total) + NumElements (4) + ByteOp 5
+    // + ByteOp 5 + ZeroOp + ZeroOp.
+    let body = [0x12u8, 0x07, 0x04, 0x0A, 0x05, 0x0A, 0x05, 0x00, 0x00];
+    let parsed = suspend::__test_parse_s3(&body);
+    let s = match parsed {
+        Some(s) => s,
+        None => return TestResult::Fail("parse_s3_package returned None on a well-formed pkg"),
+    };
+    if s.slp_typ_a != 5 || s.slp_typ_b != 5 {
+        return TestResult::Fail("SLP_TYP a/b decoded incorrectly");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power/suspend", smoke_s3_parse_package_decodes_slp_typ);
+
+fn smoke_s3_enter_refuses_without_arm() -> TestResult {
+    use crate::{suspend, Power};
+    use narf_capabilities::{Cap, Invoke};
+
+    suspend::__test_reset();
+    // No `_S3_` in the namespace under kernel-test; the function
+    // should refuse before ever touching the chipset. We exercise
+    // the code path; either NotImplemented (no _S3_) or
+    // NotImplemented (not armed) is acceptable here.
+    let cap: Cap<Power, Invoke> = Cap::bootstrap();
+    match suspend::s3_enter(&cap) {
+        Err(suspend::SuspendError::NotImplemented) => TestResult::Pass,
+        Err(suspend::SuspendError::AuthorityRevoked) => {
+            TestResult::Fail("live cap was rejected as revoked")
+        }
+        Err(_) => TestResult::Fail("unexpected error variant from s3_enter"),
+        Ok(_) => TestResult::Fail("s3_enter accepted a non-armed call"),
+    }
+}
+kernel_test_in!("power/suspend", smoke_s3_enter_refuses_without_arm);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_pstate_detect_mechanism() -> TestResult {
     use crate::pstate;

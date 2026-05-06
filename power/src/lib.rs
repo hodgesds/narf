@@ -46,7 +46,10 @@ pub mod rapl;
 mod tests;
 
 pub use suspend::{SuspendError, SuspendPhase};
-pub use thermal::{Thermal, ThermalError, ThermalEvent, ThermalState, ThermalZone};
+pub use thermal::{
+    CoolingDevice, CoolingPolicy, StepPolicy, Thermal, ThermalError, ThermalEvent, ThermalState,
+    ThermalZone,
+};
 
 // ── Power Source (Laptop Telemetry) ──────────────────────────────────
 

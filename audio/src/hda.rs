@@ -156,6 +156,32 @@ const PARAM_SUBORDINATE_NODE: u8 = 0x04;
 const PARAM_FUNCTION_GROUP: u8 = 0x05;
 #[allow(dead_code)]
 const PARAM_AUDIO_GROUP_CAPS: u8 = 0x08;
+/// Audio Widget Capabilities (§7.3.4.6). Bits 20..23 = widget type.
+const PARAM_AUDIO_WIDGET_CAPS: u8 = 0x09;
+/// Pin Capabilities (§7.3.4.9). Bit 4 = output capable.
+const PARAM_PIN_CAPS: u8 = 0x0C;
+/// Connection List Length (§7.3.4.11).
+const PARAM_CONN_LIST_LEN: u8 = 0x0E;
+
+// Widget types (HDA §7.3.4.6 Audio Widget Capabilities, bits 20..23).
+pub const WIDGET_TYPE_AUDIO_OUTPUT: u8 = 0x0;
+pub const WIDGET_TYPE_PIN_COMPLEX: u8 = 0x4;
+
+// Other useful verbs (§7.3.3).
+/// Set Converter Format. Payload: 16-bit format word (matches SD_FMT).
+const VERB_SET_CONVERTER_FORMAT: u32 = 0x2 << 16;
+/// Set Converter Stream/Channel. Payload bits: stream tag (4..7),
+/// channel (0..3).
+const VERB_SET_CONVERTER_STREAM: u32 = 0x706 << 8;
+/// Set Pin Widget Control. Payload bit 6 (out-enable), bit 7 (HP-amp).
+const VERB_SET_PIN_WIDGET_CONTROL: u32 = 0x707 << 8;
+/// Set Amp Gain/Mute. Payload encodes output(15)/input(14)/L(13)/R(12)
+/// + index (8..11) + mute (7) + gain (0..6).
+const VERB_SET_AMP_GAIN_MUTE: u32 = 0x3 << 16;
+/// Get Configuration Default (§7.3.3.31).
+const VERB_GET_CONFIG_DEFAULT: u32 = 0xF1C << 8;
+/// Get Connection List Entry (§7.3.3.2). Payload bits 0..7 = list index.
+const VERB_GET_CONNECTION_LIST_ENTRY: u32 = 0xF02 << 8;
 
 /// Encode a 32-bit codec command word: CAd (4) | NID (8) | Verb+Payload (20).
 #[inline]
@@ -712,6 +738,213 @@ impl IntelHda {
     /// `(input_streams, output_streams, bidir_streams)` from GCAP.
     pub fn stream_counts(&self) -> (u8, u8, u8) {
         (self.n_iss, self.n_oss, self.n_bss)
+    }
+
+    /// Walk the AFG and program the first speaker / line-out path.
+    ///
+    /// Algorithm (HDA §7.3):
+    /// 1. From the AFG node, enumerate subordinate widgets. For each
+    ///    Pin Complex (type 0x4), read its Configuration Default
+    ///    (verb 0xF1C). Bits 20..23 are the *default device*; we
+    ///    pick Speaker (1) first, then Line-Out (0), then Headphone
+    ///    (2) — the laptop convention. Skip pins whose connectivity
+    ///    nibble (bits 30..31) is "no physical connection".
+    /// 2. Read the chosen pin's Connection List (verb 0xF02 idx 0)
+    ///    to find the Audio Output Converter (type 0x0) feeding it.
+    ///    If the connection target is a mixer, recurse one hop.
+    /// 3. Program the converter:
+    ///    - Format = `FMT_48K_S16_STEREO` (matches stream descriptor).
+    ///    - Stream/Channel = `(1 << 4) | 0` (stream tag 1, channel 0).
+    /// 4. Unmute the converter's output amp (set 0xB000) and the
+    ///    pin's output amp (same). 0xB000 = output side + L+R + index 0
+    ///    + unmute + max gain.
+    /// 5. Enable pin output: VERB_SET_PIN_WIDGET_CONTROL = 0x40
+    ///    (out-enable).
+    ///
+    /// Returns the pair `(converter_nid, pin_nid)` on success.
+    ///
+    /// # Safety
+    /// Caller owns the BAR0 mapping. Idempotent — programming the
+    /// same path twice is a no-op at the codec level.
+    pub unsafe fn setup_default_output_path(&self) -> Result<(u8, u8), HdaError> {
+        let codec = self.codecs.first().ok_or(HdaError::NoCodecs)?;
+        let cad = codec.addr;
+        let afg = codec.afg_node_id.ok_or(HdaError::NoCodecs)?;
+
+        // Subordinate Node Count: bits 0..7 = first NID, bits 16..23 = count.
+        // SAFETY: caller-asserted exclusive ownership.
+        let sub = unsafe {
+            self.send_verb(make_verb(
+                cad,
+                afg,
+                VERB_GET_PARAMETER | PARAM_SUBORDINATE_NODE as u32,
+            ))?
+        };
+        let first_nid = (sub & 0xFF) as u8;
+        let count = ((sub >> 16) & 0xFF) as u8;
+
+        // First pass: rank pins by default-device preference.
+        let mut best_pin: Option<(u8, u8)> = None; // (nid, pref) — lower pref wins
+        for i in 0..count {
+            let nid = first_nid + i;
+            // SAFETY: same.
+            let caps = unsafe {
+                self.send_verb(make_verb(
+                    cad,
+                    nid,
+                    VERB_GET_PARAMETER | PARAM_AUDIO_WIDGET_CAPS as u32,
+                ))?
+            };
+            let wtype = ((caps >> 20) & 0xF) as u8;
+            if wtype != WIDGET_TYPE_PIN_COMPLEX {
+                continue;
+            }
+            // SAFETY: same.
+            let cfg = unsafe { self.send_verb(make_verb(cad, nid, VERB_GET_CONFIG_DEFAULT))? };
+            // bits 30..31 = port connectivity. 0=jack, 1=no conn, 2=fixed, 3=both.
+            let conn = (cfg >> 30) & 0x3;
+            if conn == 1 {
+                continue;
+            }
+            // bits 20..23 = default device.
+            let default_dev = ((cfg >> 20) & 0xF) as u8;
+            // bit 4 of pin caps = output capable.
+            // SAFETY: same.
+            let pin_caps = unsafe {
+                self.send_verb(make_verb(
+                    cad,
+                    nid,
+                    VERB_GET_PARAMETER | PARAM_PIN_CAPS as u8 as u32,
+                ))?
+            };
+            if pin_caps & (1 << 4) == 0 {
+                continue;
+            }
+            // Preference: 0=line out, 1=speaker, 2=headphone — our
+            // priority for laptop is speaker then line-out then HP.
+            let pref = match default_dev {
+                0x1 => 0u8, // Speaker
+                0x0 => 1u8, // Line Out
+                0x2 => 2u8, // HP Out
+                _ => continue,
+            };
+            match best_pin {
+                Some((_, p)) if p <= pref => {}
+                _ => best_pin = Some((nid, pref)),
+            }
+        }
+        let pin_nid = match best_pin {
+            Some((nid, _)) => nid,
+            None => return Err(HdaError::NoOutputStream),
+        };
+
+        // Find the converter that feeds this pin via its connection
+        // list. SAFETY: same.
+        let conn_len = unsafe {
+            self.send_verb(make_verb(
+                cad,
+                pin_nid,
+                VERB_GET_PARAMETER | PARAM_CONN_LIST_LEN as u32,
+            ))?
+        };
+        let n_conn = (conn_len & 0x7F) as u8;
+        if n_conn == 0 {
+            return Err(HdaError::NoOutputStream);
+        }
+        // Get connection list entry 0. The response packs four 8-bit
+        // entries (or two 16-bit entries when bit 7 of conn_len is
+        // set). For laptop codecs the first entry is almost always
+        // the AOC; we only walk one hop deeper if it's a mixer.
+        // SAFETY: same.
+        let entry = unsafe {
+            self.send_verb(make_verb(cad, pin_nid, VERB_GET_CONNECTION_LIST_ENTRY))?
+        };
+        let mut conv_nid = (entry & 0xFF) as u8;
+        // SAFETY: same.
+        let conv_caps = unsafe {
+            self.send_verb(make_verb(
+                cad,
+                conv_nid,
+                VERB_GET_PARAMETER | PARAM_AUDIO_WIDGET_CAPS as u32,
+            ))?
+        };
+        let conv_type = ((conv_caps >> 20) & 0xF) as u8;
+        if conv_type != WIDGET_TYPE_AUDIO_OUTPUT {
+            // One-hop recursion: assume entry is a mixer; pick its
+            // first input.
+            // SAFETY: same.
+            let inner = unsafe {
+                self.send_verb(make_verb(cad, conv_nid, VERB_GET_CONNECTION_LIST_ENTRY))?
+            };
+            conv_nid = (inner & 0xFF) as u8;
+            // SAFETY: same.
+            let inner_caps = unsafe {
+                self.send_verb(make_verb(
+                    cad,
+                    conv_nid,
+                    VERB_GET_PARAMETER | PARAM_AUDIO_WIDGET_CAPS as u32,
+                ))?
+            };
+            if ((inner_caps >> 20) & 0xF) as u8 != WIDGET_TYPE_AUDIO_OUTPUT {
+                return Err(HdaError::NoOutputStream);
+            }
+        }
+
+        // Program converter format. SAFETY: same.
+        unsafe {
+            self.send_verb(make_verb(
+                cad,
+                conv_nid,
+                VERB_SET_CONVERTER_FORMAT | FMT_48K_S16_STEREO as u32,
+            ))?;
+        }
+        // Stream tag 1, channel 0.
+        // SAFETY: same.
+        unsafe {
+            self.send_verb(make_verb(
+                cad,
+                conv_nid,
+                VERB_SET_CONVERTER_STREAM | (1 << 4),
+            ))?;
+        }
+        // Unmute output amp on the converter (apply to L+R, max gain).
+        // 0xB000 = output(15) | left(13) | right(12) | mute=0 | gain=0x7F.
+        // SAFETY: same.
+        unsafe {
+            self.send_verb(make_verb(cad, conv_nid, VERB_SET_AMP_GAIN_MUTE | 0xB07F))?;
+        }
+        // Unmute output amp on the pin.
+        // SAFETY: same.
+        unsafe {
+            self.send_verb(make_verb(cad, pin_nid, VERB_SET_AMP_GAIN_MUTE | 0xB07F))?;
+        }
+        // Enable pin output (bit 6 = OUT_EN, bit 7 = HP_AMP_EN — set
+        // both on a headphone pin so it drives.).
+        // SAFETY: same.
+        unsafe {
+            self.send_verb(make_verb(cad, pin_nid, VERB_SET_PIN_WIDGET_CONTROL | 0xC0))?;
+        }
+        Ok((conv_nid, pin_nid))
+    }
+
+    /// Convenience: set up the default output path, load a 1 kHz sine
+    /// test tone, and start the engine. Used by the platform "is
+    /// audio working?" probe.
+    ///
+    /// # Safety
+    /// Caller owns the BAR0 mapping.
+    pub unsafe fn play_test_tone(&self, freq_hz: u32) -> Result<(), HdaError> {
+        // SAFETY: caller-asserted exclusive ownership.
+        unsafe {
+            self.setup_default_output_path()?;
+        }
+        let _ = self.load_sine_test_tone(freq_hz);
+        // SAFETY: same.
+        let started = unsafe { self.start_output() };
+        if !started {
+            return Err(HdaError::CommandTimeout);
+        }
+        Ok(())
     }
 
     /// Slice over discovered codecs.

@@ -732,11 +732,15 @@ dependencies = [
  "narf-console",
  "narf-drivers",
  "narf-init",
+ "narf-interrupts",
  "narf-io",
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
  "narf-power",
+ "narf-pwm",
+ "narf-scheduler",
+ "narf-time",
  "narf-tpm",
 ]
 
@@ -1123,6 +1127,8 @@ dependencies = [
 name = "narf-power"
 version = "0.0.0"
 dependencies = [
+ "narf-acpi",
+ "narf-aml",
  "narf-arch",
  "narf-capabilities",
  "narf-console",

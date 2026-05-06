@@ -89,9 +89,22 @@ pub enum ThermalState {
 
 type Subscriber = Box<dyn Fn(&ThermalEvent) + Send + Sync + 'static>;
 
+/// A device that can reduce system temperature (Fan, Throttle, etc.).
+pub trait CoolingDevice: Send + Sync + core::fmt::Debug {
+    fn name(&self) -> &'static str;
+    /// Set the cooling level (0 = off, 255 = max).
+    fn set_level(&self, level: u8);
+}
+
 struct Registry {
     zones: Vec<ThermalZone>,
     subscribers: Vec<Subscriber>,
+    cooling_devices: Vec<alloc::sync::Arc<dyn CoolingDevice>>,
+    /// Active-cooling governor. When set, each thermal-event dispatch
+    /// computes a level via the policy and drives every cooling
+    /// device under the same lock that fired the event — no lock
+    /// reentry from a subscriber callback is required.
+    policy: Option<Box<dyn CoolingPolicy>>,
 }
 
 impl core::fmt::Debug for Registry {
@@ -99,6 +112,8 @@ impl core::fmt::Debug for Registry {
         f.debug_struct("Registry")
             .field("zones", &self.zones.len())
             .field("subscribers", &self.subscribers.len())
+            .field("cooling_devices", &self.cooling_devices.len())
+            .field("policy", &self.policy.is_some())
             .finish()
     }
 }
@@ -120,12 +135,37 @@ impl From<CapError> for ThermalError {
 }
 
 /// Initialise the thermal registry. Safe to call more than once —
-/// re-initialisation clears the zone + subscriber tables.
+/// re-initialisation clears the zone + subscriber tables and installs
+/// the default `StepPolicy` active-cooling governor.
 pub fn init() {
     *REG.lock() = Some(Registry {
         zones: Vec::new(),
         subscribers: Vec::new(),
+        cooling_devices: Vec::new(),
+        policy: Some(Box::new(StepPolicy)),
     });
+}
+
+/// Register a new cooling device.
+pub fn register_cooling_device(
+    cap: &Cap<Thermal, Grant>,
+    dev: alloc::sync::Arc<dyn CoolingDevice>,
+) -> Result<(), ThermalError> {
+    cap.invoke(NoopOp)?;
+    let mut r = REG.lock();
+    let reg = r.as_mut().ok_or(ThermalError::NotInitialised)?;
+    reg.cooling_devices.push(dev);
+    Ok(())
+}
+
+/// Set cooling level for all registered devices.
+pub fn set_cooling_level(level: u8) -> Result<(), ThermalError> {
+    let r = REG.lock();
+    let reg = r.as_ref().ok_or(ThermalError::NotInitialised)?;
+    for dev in &reg.cooling_devices {
+        dev.set_level(level);
+    }
+    Ok(())
 }
 
 /// Register a new zone. Returns its id.
@@ -187,6 +227,15 @@ pub fn record_temp(zone: u32, milli_c: i32) -> Result<ThermalState, ThermalError
         for cb in &reg.subscribers {
             cb(&event);
         }
+        // Drive the active-cooling governor inline. Walking
+        // `cooling_devices` under the lock we already hold avoids any
+        // reentrant-lock hazard a subscriber-based hook would create.
+        if let Some(policy) = reg.policy.as_ref() {
+            let level = policy.level_for(&event);
+            for dev in &reg.cooling_devices {
+                dev.set_level(level);
+            }
+        }
     }
 
     Ok(new_state)
@@ -212,4 +261,61 @@ pub fn zone_count() -> usize {
 #[doc(hidden)]
 pub fn __test_reset() {
     *REG.lock() = None;
+}
+
+// ── Active-cooling governor ─────────────────────────────────────────
+//
+// A thermal-event subscriber that drives `set_cooling_level` based on
+// the zone's hysteresis band. Spec §11.3 (passive cooling) leaves the
+// mapping policy-defined; this is the conservative default we want for
+// laptop bringup:
+//
+//   Normal   → 0   (fans off, save battery + audible noise)
+//   Warm     → 128 (~50% — quiet but moving air)
+//   Critical → 255 (max — preserve hardware)
+//
+// Drop-in replacements live behind `install_active_cooling`; once a
+// per-zone or per-device policy lands the default is one variant of
+// `CoolingPolicy`.
+
+/// Cooling policy: maps a `ThermalEvent` to a 0..=255 cooling level.
+pub trait CoolingPolicy: Send + Sync + 'static {
+    fn level_for(&self, event: &ThermalEvent) -> u8;
+}
+
+/// Three-step policy used as the boot default.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct StepPolicy;
+
+impl CoolingPolicy for StepPolicy {
+    fn level_for(&self, event: &ThermalEvent) -> u8 {
+        match event {
+            ThermalEvent::Normal { .. } => 0,
+            ThermalEvent::Warm { .. } => 128,
+            ThermalEvent::Critical { .. } => 255,
+        }
+    }
+}
+
+/// Install `policy` as the active-cooling governor. Every thermal
+/// state-crossing event runs the policy under the registry lock and
+/// drives every registered cooling device to the resulting level.
+/// Replaces any previously-installed policy.
+pub fn install_active_cooling<P: CoolingPolicy>(
+    cap: &Cap<Thermal, Grant>,
+    policy: P,
+) -> Result<(), ThermalError> {
+    cap.invoke(NoopOp)?;
+    let mut r = REG.lock();
+    let reg = r.as_mut().ok_or(ThermalError::NotInitialised)?;
+    reg.policy = Some(Box::new(policy));
+    Ok(())
+}
+
+/// Whether an active-cooling policy is installed.
+pub fn has_active_cooling() -> bool {
+    REG.lock()
+        .as_ref()
+        .map(|r| r.policy.is_some())
+        .unwrap_or(false)
 }

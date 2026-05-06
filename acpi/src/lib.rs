@@ -1660,6 +1660,265 @@ pub fn enable_gpe(gpe_num: u32) {
     }
 }
 
+// ── FADT power-management fields (SCI_INT, PM1, SMI_CMD) ───────────
+//
+// FADT body offsets — every field below is well-known per ACPI 6.5
+// §5.2.9, but for clarity:
+//   46:  SCI_INT          u16  — system control interrupt (8259 IRQ #)
+//   48:  SMI_CMD          u32  — IO port for ACPI mode enable/disable
+//   52:  ACPI_ENABLE      u8   — write to SMI_CMD to enter ACPI mode
+//   53:  ACPI_DISABLE     u8   — write to SMI_CMD to leave ACPI mode
+//   56:  PM1A_EVT_BLK     u32  — legacy 32-bit IO addr (status+enable)
+//   60:  PM1B_EVT_BLK     u32  — legacy 32-bit IO addr (optional)
+//   64:  PM1A_CNT_BLK     u32  — legacy 32-bit IO addr
+//   68:  PM1B_CNT_BLK     u32  — optional
+//   88:  PM1_EVT_LEN      u8   — byte length of each EVT block
+//   89:  PM1_CNT_LEN      u8   — byte length of each CNT block
+//   148: X_PM1A_EVT_BLK   GAS  (ACPI 2.0+)
+//   160: X_PM1B_EVT_BLK   GAS
+//   172: X_PM1A_CNT_BLK   GAS
+//   184: X_PM1B_CNT_BLK   GAS
+
+/// FADT power-management surface. Addresses are post-X_-fallback —
+/// when the extended GAS variant is non-zero we use it, else the
+/// legacy 32-bit field. `0` for any optional block (PM1B is rare on
+/// modern hardware).
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FadtPm {
+    pub sci_int: u16,
+    pub smi_cmd: u32,
+    pub acpi_enable: u8,
+    pub acpi_disable: u8,
+    pub pm1a_evt: u64,
+    pub pm1b_evt: u64,
+    pub pm1a_cnt: u64,
+    pub pm1b_cnt: u64,
+    pub pm1_evt_len: u8,
+    pub pm1_cnt_len: u8,
+}
+
+static FADT_PM: IrqSafeSpinLock<Option<FadtPm>> = IrqSafeSpinLock::new(None);
+
+/// Parse the FADT power-management surface. Idempotent; the parsed
+/// `FadtPm` is cached and returned on subsequent calls.
+///
+/// # Safety
+/// `rsdp_phys` must point at identity-mapped memory; the chain of
+/// XSDT → FADT pointers must also be identity-mapped.
+pub unsafe fn parse_fadt_pm(rsdp_phys: PhysAddr) -> Result<FadtPm, AcpiError> {
+    if let Some(cached) = *FADT_PM.lock() {
+        return Ok(cached);
+    }
+    // SAFETY: caller assertion.
+    let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
+    let mut fadt: Option<u64> = None;
+    // SAFETY: caller assertion.
+    unsafe {
+        walk_xsdt(xsdt, |phys, hdr| {
+            if &hdr.signature == b"FACP" && fadt.is_none() {
+                fadt = Some(phys);
+            }
+        })?;
+    }
+    let fadt = fadt.ok_or(AcpiError::NoSrat)?;
+
+    // SAFETY: caller assertion.
+    let total = unsafe { (fadt as *const SdtHeader).read_unaligned().length as usize };
+    if total < 90 {
+        return Err(AcpiError::BadXsdtSignature);
+    }
+    // SAFETY: caller assertion.
+    let body = unsafe { core::slice::from_raw_parts(fadt as *const u8, total) };
+    if checksum(body) != 0 {
+        return Err(AcpiError::BadTableChecksum);
+    }
+
+    let sci_int = u16::from_le_bytes([body[46], body[47]]);
+    let smi_cmd = u32::from_le_bytes([body[48], body[49], body[50], body[51]]);
+    let acpi_enable = body[52];
+    let acpi_disable = body[53];
+    let legacy_pm1a_evt = u32::from_le_bytes([body[56], body[57], body[58], body[59]]) as u64;
+    let legacy_pm1b_evt = u32::from_le_bytes([body[60], body[61], body[62], body[63]]) as u64;
+    let legacy_pm1a_cnt = u32::from_le_bytes([body[64], body[65], body[66], body[67]]) as u64;
+    let legacy_pm1b_cnt = u32::from_le_bytes([body[68], body[69], body[70], body[71]]) as u64;
+    let pm1_evt_len = body[88];
+    let pm1_cnt_len = body[89];
+
+    // Helper to extract address from a 12-byte GAS at offset `o`.
+    let gas_addr = |o: usize| -> u64 {
+        if total < o + 12 {
+            return 0;
+        }
+        u64::from_le_bytes([
+            body[o + 4],
+            body[o + 5],
+            body[o + 6],
+            body[o + 7],
+            body[o + 8],
+            body[o + 9],
+            body[o + 10],
+            body[o + 11],
+        ])
+    };
+    let x_pm1a_evt = gas_addr(148);
+    let x_pm1b_evt = gas_addr(160);
+    let x_pm1a_cnt = gas_addr(172);
+    let x_pm1b_cnt = gas_addr(184);
+
+    let pick = |x: u64, l: u64| if x != 0 { x } else { l };
+
+    let pm = FadtPm {
+        sci_int,
+        smi_cmd,
+        acpi_enable,
+        acpi_disable,
+        pm1a_evt: pick(x_pm1a_evt, legacy_pm1a_evt),
+        pm1b_evt: pick(x_pm1b_evt, legacy_pm1b_evt),
+        pm1a_cnt: pick(x_pm1a_cnt, legacy_pm1a_cnt),
+        pm1b_cnt: pick(x_pm1b_cnt, legacy_pm1b_cnt),
+        pm1_evt_len,
+        pm1_cnt_len,
+    };
+    *FADT_PM.lock() = Some(pm);
+    Ok(pm)
+}
+
+/// Last-parsed FADT power-management surface, if any.
+pub fn fadt_pm() -> Option<FadtPm> {
+    *FADT_PM.lock()
+}
+
+// ── PM1 status / control I/O helpers ────────────────────────────────
+//
+// PM1 status bits we care about (ACPI 6.5 §4.8.3.1.1):
+pub const PM1_STS_TMR:    u16 = 1 << 0;
+pub const PM1_STS_BM:     u16 = 1 << 4;
+pub const PM1_STS_GBL:    u16 = 1 << 5;
+pub const PM1_STS_PWRBTN: u16 = 1 << 8;
+pub const PM1_STS_SLPBTN: u16 = 1 << 9;
+pub const PM1_STS_RTC:    u16 = 1 << 10;
+pub const PM1_STS_WAK:    u16 = 1 << 15;
+
+/// Read the OR of PM1a and PM1b status registers. Status block lives
+/// in the first half of `pm1*_evt`.
+#[cfg(target_arch = "x86_64")]
+pub fn pm1_status_read() -> u16 {
+    let pm = match fadt_pm() {
+        Some(p) => p,
+        None => return 0,
+    };
+    let mut s = 0u16;
+    if pm.pm1a_evt != 0 {
+        // SAFETY: PM1A_EVT_BLK address from a checksummed FADT.
+        s |= unsafe { narf_arch::x86_64::io_port::inw(pm.pm1a_evt as u16) };
+    }
+    if pm.pm1b_evt != 0 {
+        // SAFETY: PM1B_EVT_BLK address from a checksummed FADT.
+        s |= unsafe { narf_arch::x86_64::io_port::inw(pm.pm1b_evt as u16) };
+    }
+    s
+}
+
+/// Clear PM1 status bits by writing 1s to both PM1a and PM1b status
+/// registers (W1C semantics per ACPI §4.8.3.1.1).
+#[cfg(target_arch = "x86_64")]
+pub fn pm1_status_clear(bits: u16) {
+    let pm = match fadt_pm() {
+        Some(p) => p,
+        None => return,
+    };
+    if pm.pm1a_evt != 0 {
+        // SAFETY: PM1A_EVT_BLK address from a checksummed FADT.
+        unsafe { narf_arch::x86_64::io_port::outw(pm.pm1a_evt as u16, bits) };
+    }
+    if pm.pm1b_evt != 0 {
+        // SAFETY: PM1B_EVT_BLK address from a checksummed FADT.
+        unsafe { narf_arch::x86_64::io_port::outw(pm.pm1b_evt as u16, bits) };
+    }
+}
+
+/// Write SLP_TYP and SLP_EN to PM1a/b control registers to enter the
+/// requested sleep state. `slp_typ` is the 3-bit value from `\_Sx_`,
+/// shifted to bits 10..12; SLP_EN is bit 13 (0x2000).
+///
+/// # Safety
+/// Caller must have already invoked `_PTS(slp_state)` and saved any
+/// state that won't survive the transition. Returns immediately on
+/// S1; never returns on S3/S4/S5 unless wake fires.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn pm1_enter_sleep(slp_typ_a: u8, slp_typ_b: u8) {
+    let pm = match fadt_pm() {
+        Some(p) => p,
+        None => return,
+    };
+    let val_a = ((slp_typ_a as u16 & 0x7) << 10) | 0x2000;
+    if pm.pm1a_cnt != 0 {
+        // SAFETY: PM1A_CNT_BLK address from a checksummed FADT;
+        // caller has prepared sleep state per ACPI §16.
+        unsafe { narf_arch::x86_64::io_port::outw(pm.pm1a_cnt as u16, val_a) };
+    }
+    if pm.pm1b_cnt != 0 {
+        let val_b = ((slp_typ_b as u16 & 0x7) << 10) | 0x2000;
+        // SAFETY: PM1B_CNT_BLK address from a checksummed FADT.
+        unsafe { narf_arch::x86_64::io_port::outw(pm.pm1b_cnt as u16, val_b) };
+    }
+}
+
+/// Write `acpi_enable` to `smi_cmd` to switch the platform from legacy
+/// (SMI-driven) to ACPI (SCI-driven) mode. No-op when SMI_CMD is 0
+/// (system already in ACPI mode, or hardware-reduced platform).
+#[cfg(target_arch = "x86_64")]
+pub fn acpi_enable() {
+    let pm = match fadt_pm() {
+        Some(p) => p,
+        None => return,
+    };
+    if pm.smi_cmd == 0 || pm.acpi_enable == 0 {
+        return;
+    }
+    // SAFETY: SMI_CMD port from a checksummed FADT.
+    unsafe { narf_arch::x86_64::io_port::outb(pm.smi_cmd as u16, pm.acpi_enable) };
+}
+
+// ── GPE status read / clear ─────────────────────────────────────────
+
+/// Read both halves (status + enable) of a GPE block. Returns
+/// `(status, enable)`; each `Vec` has `byte_count/2` bytes (status
+/// block is the lower half, enable the upper).
+#[cfg(target_arch = "x86_64")]
+pub fn gpe_block_status(b: GpeBlockInfo) -> alloc::vec::Vec<u8> {
+    let half = (b.byte_count / 2) as usize;
+    let mut out = alloc::vec![0u8; half];
+    for i in 0..half {
+        let port = (b.address + i as u64) as u16;
+        // SAFETY: GPE block address from a checksummed FADT.
+        out[i] = unsafe { narf_arch::x86_64::io_port::inb(port) };
+    }
+    out
+}
+
+/// Clear a single GPE status bit by writing 1 to its status-register
+/// position (W1C). No-op if `gpe_num` is outside both blocks.
+#[cfg(target_arch = "x86_64")]
+pub fn gpe_status_clear_bit(gpe_num: u32) {
+    let block = gpe0_block()
+        .filter(|b| gpe_num >= b.base_gsi && gpe_num < b.base_gsi + (b.byte_count as u32 * 4))
+        .or_else(|| {
+            gpe1_block().filter(|b| {
+                gpe_num >= b.base_gsi && gpe_num < b.base_gsi + (b.byte_count as u32 * 4)
+            })
+        });
+    if let Some(b) = block {
+        let bit = gpe_num - b.base_gsi;
+        let reg_idx = bit / 8;
+        let reg_bit = bit % 8;
+        let port = (b.address + reg_idx as u64) as u16;
+        // SAFETY: GPE block address from a checksummed FADT. W1C
+        // means writing other bits as 0 leaves them untouched.
+        unsafe { narf_arch::x86_64::io_port::outb(port, 1 << reg_bit) };
+    }
+}
+
 // ── ECDT (Embedded Controller Boot Resources Table) ──────────────────
 
 /// Descriptor for the ACPI Embedded Controller.

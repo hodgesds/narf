@@ -126,6 +126,25 @@ fn smoke_acp6_pci_match_registered() -> TestResult {
 }
 kernel_test_in!("audio/acp6", smoke_acp6_pci_match_registered);
 
+fn smoke_hda_codec_path_setup_widget_constants() -> TestResult {
+    // Structural: confirm the widget-type constants the codec walker
+    // matches against haven't drifted from the HDA spec encoding.
+    // Bit-encoding of widget type is bits 20..23 of
+    // PARAM_AUDIO_WIDGET_CAPS — the walker does
+    // `((caps >> 20) & 0xF) as u8`, and these constants must equal
+    // the spec's "Audio Output" / "Pin Complex" values.
+    use crate::hda;
+
+    if hda::WIDGET_TYPE_AUDIO_OUTPUT != 0x0 {
+        return TestResult::Fail("WIDGET_TYPE_AUDIO_OUTPUT drift");
+    }
+    if hda::WIDGET_TYPE_PIN_COMPLEX != 0x4 {
+        return TestResult::Fail("WIDGET_TYPE_PIN_COMPLEX drift");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("audio/hda", smoke_hda_codec_path_setup_widget_constants);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_hda_writer_submit_round_trip() -> TestResult {
     // End-to-end PCM submit through AudioWriter → hda. Probes

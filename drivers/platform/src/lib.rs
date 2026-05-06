@@ -15,6 +15,10 @@ pub mod tpm;
 pub mod ec;
 pub mod battery;
 pub mod thermal;
+pub mod fan;
+pub mod lid;
+pub mod buttons;
+pub mod backlight;
 
 mod tests;
 
@@ -39,6 +43,22 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "acpi-thermal", || {
         thermal::init();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "acpi-fan", || {
+        fan::init();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "acpi-lid", || {
+        lid::init();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "acpi-buttons", || {
+        buttons::init();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "acpi-backlight", || {
+        backlight::init();
         InitResult::Ok
     });
 }
