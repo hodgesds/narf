@@ -27,6 +27,8 @@
 
 extern crate alloc;
 
+pub mod mi;
+
 mod tests;
 
 use core::future::Future;

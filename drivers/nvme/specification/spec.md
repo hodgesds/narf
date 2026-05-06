@@ -62,6 +62,25 @@ multipath / fabrics (defer).
 
 Stage 4.
 
+## 7a. NVMe-MI sub-module
+
+`mi/` is a clean-room NVMe Management Interface codec. References
+(public-only):
+
+- **NVM Express Management Interface, Revision 1.2c** (NVM Express
+  Inc., 2023). §3 (Message Format), §3.1 (NVMe-MI Message Header /
+  NMH), §3.4 (Message Integrity Check / MIC, CRC-32 polynomial
+  0xEDB88320 reflected, init/xor 0xFFFFFFFF — same as Ethernet),
+  §5.1 Read NVMe-MI Data Structure (DTYPE table 124),
+  §5.6 Controller Health Status Poll, §5.8 NVM Subsystem Health
+  Status Poll.
+- **DMTF DSP0236 v1.3.1** — MCTP base. NVMe-MI travels as MCTP
+  message-type 0x04.
+
+The codec is bus-agnostic — the same bytes flow over MCTP-over-SMBus,
+MCTP-over-PCIe-VDM, or in-band tunneling via NVMe Admin opcodes. No
+GPL Linux source consulted.
+
 ## 8. Resolved decisions
 
 ### 8.1 Multi-queue policy (resolved)

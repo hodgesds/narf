@@ -339,3 +339,124 @@ fn smoke_nvme_params_typed_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvme", smoke_nvme_params_typed_round_trip);
+
+// ── NVMe-MI message framing smokes ─────────────────────────────────
+
+fn smoke_mi_nmh_round_trip() -> TestResult {
+    use crate::mi::{Nmh, NMIMT_MI_COMMAND, MET_OUT_OF_BAND};
+    let nmh = Nmh {
+        mctp_ic: true,
+        command_slot: false,
+        response: false,
+        nmimt: NMIMT_MI_COMMAND,
+        met: MET_OUT_OF_BAND,
+    };
+    let bytes = nmh.encode();
+    let back = Nmh::decode(&bytes);
+    if back != nmh {
+        return TestResult::Fail("NMH round-trip mismatch");
+    }
+    if bytes[0] & 0x80 == 0 {
+        return TestResult::Fail("MCTP IC bit should be at byte 0 bit 7");
+    }
+    if (bytes[1] >> 4) != NMIMT_MI_COMMAND {
+        return TestResult::Fail("NMIMT lives in byte 1 high nibble");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme/mi", smoke_mi_nmh_round_trip);
+
+fn smoke_mi_mic_crc32_matches_known_vector() -> TestResult {
+    use crate::mi::mic;
+    // CRC-32/Ethernet of "123456789" is 0xCBF43926 (well-known).
+    let r = mic(b"123456789");
+    if r != 0xCBF4_3926 {
+        return TestResult::Fail("CRC-32/Ethernet test vector mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme/mi", smoke_mi_mic_crc32_matches_known_vector);
+
+fn smoke_mi_build_and_decode_command_round_trip() -> TestResult {
+    use crate::mi::{
+        build_command, decode_message, read_data_structure, Nmh, DTYPE_CONTROLLER_LIST,
+        MI_OPCODE_READ_DATA_STRUCTURE, NMIMT_MI_COMMAND,
+    };
+    let nmh = Nmh {
+        mctp_ic: true,
+        nmimt: NMIMT_MI_COMMAND,
+        ..Default::default()
+    };
+    let body = read_data_structure(DTYPE_CONTROLLER_LIST, 0x0042);
+    let frame = build_command(nmh, &body);
+    // 4 (NMH) + 12 (opcode + 2 cdw header) + 4 (MIC) = 20 bytes.
+    if frame.len() != 20 {
+        return TestResult::Fail("expected 20-byte minimal NVMe-MI command");
+    }
+    let (back_nmh, back_body) = decode_message(&frame).expect("decode");
+    if back_nmh != nmh {
+        return TestResult::Fail("NMH decode mismatch");
+    }
+    if back_body.opcode != MI_OPCODE_READ_DATA_STRUCTURE {
+        return TestResult::Fail("opcode lost");
+    }
+    let dtype = (back_body.cdw0 & 0xFF) as u8;
+    let cid = (back_body.cdw0 >> 16) as u16;
+    if dtype != DTYPE_CONTROLLER_LIST {
+        return TestResult::Fail("DTYPE lives in CDW0[7:0]");
+    }
+    if cid != 0x0042 {
+        return TestResult::Fail("controller id lives in CDW0[31:16]");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme/mi", smoke_mi_build_and_decode_command_round_trip);
+
+fn smoke_mi_bad_mic_rejected() -> TestResult {
+    use crate::mi::{build_command, decode_message, read_data_structure, MiError, Nmh, NMIMT_MI_COMMAND};
+    let nmh = Nmh { mctp_ic: true, nmimt: NMIMT_MI_COMMAND, ..Default::default() };
+    let mut frame = build_command(nmh, &read_data_structure(0, 0));
+    let last = frame.len() - 1;
+    frame[last] = frame[last].wrapping_add(1);
+    match decode_message(&frame) {
+        Err(MiError::BadMic) => TestResult::Pass,
+        _ => TestResult::Fail("tampered MIC must be rejected"),
+    }
+}
+kernel_test_in!("drivers/nvme/mi", smoke_mi_bad_mic_rejected);
+
+fn smoke_mi_subsystem_health_status_poll_clear_bit() -> TestResult {
+    use crate::mi::{subsystem_health_status_poll, MI_OPCODE_NVM_SUBSYSTEM_HEALTH_STATUS_POLL};
+    let cmd = subsystem_health_status_poll(true);
+    if cmd.opcode != MI_OPCODE_NVM_SUBSYSTEM_HEALTH_STATUS_POLL {
+        return TestResult::Fail("opcode 0x01 expected");
+    }
+    if cmd.cdw1 & (1 << 31) == 0 {
+        return TestResult::Fail("Clear Status flag lives at CDW1 bit 31");
+    }
+    let cmd2 = subsystem_health_status_poll(false);
+    if cmd2.cdw1 != 0 {
+        return TestResult::Fail("CDW1 should be zero when Clear Status not requested");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme/mi", smoke_mi_subsystem_health_status_poll_clear_bit);
+
+fn smoke_mi_subsystem_health_parse() -> TestResult {
+    use crate::mi::SubsystemHealth;
+    // 8-byte response data: NSS=0x02 (CFS), warnings=0x10, temp=0x2A,
+    // pct_used=0x05, composite controller status (LE) = 0x0007.
+    let buf = [0x02u8, 0x10, 0x2A, 0x05, 0x07, 0x00, 0x00, 0x00];
+    let h = SubsystemHealth::parse(&buf).expect("parse");
+    if h.nss != 0x02 || h.smart_warnings != 0x10 {
+        return TestResult::Fail("NSS / warning byte mismatch");
+    }
+    if h.composite_temperature != 0x2A || h.percentage_used != 0x05 {
+        return TestResult::Fail("temperature / wear byte mismatch");
+    }
+    if h.composite_controller_status != 0x0007 {
+        return TestResult::Fail("CCS LE decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme/mi", smoke_mi_subsystem_health_parse);

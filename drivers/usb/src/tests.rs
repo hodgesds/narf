@@ -497,3 +497,145 @@ fn smoke_hid_modifier_only_transition() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/hid", smoke_hid_modifier_only_transition);
+
+// ── UAC1 descriptor parser smokes ──────────────────────────────────
+
+fn smoke_uac_class_triple_constants() -> TestResult {
+    use crate::uac;
+    if uac::USB_CLASS_AUDIO != 0x01 {
+        return TestResult::Fail("Audio class code = 0x01");
+    }
+    if uac::USB_AUDIO_SUBCLASS_AUDIOCONTROL != 0x01 {
+        return TestResult::Fail("AC subclass = 0x01");
+    }
+    if uac::USB_AUDIO_SUBCLASS_AUDIOSTREAMING != 0x02 {
+        return TestResult::Fail("AS subclass = 0x02");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uac", smoke_uac_class_triple_constants);
+
+fn smoke_uac_ac_header_decodes_collection() -> TestResult {
+    use crate::uac::AcHeader;
+    // bLength=10, CS_INTERFACE, HEADER, bcdADC=0x0100,
+    // wTotalLength=0x0040, bInCollection=2, [iface_a, iface_b]
+    let buf = [
+        10, 0x24, 0x01, 0x00, 0x01, 0x40, 0x00, 2, 0x01, 0x02,
+    ];
+    let h = AcHeader::parse(&buf).expect("parse");
+    if h.bcd_adc != 0x0100 {
+        return TestResult::Fail("bcdADC should decode to 0x0100");
+    }
+    if h.total_length != 0x40 {
+        return TestResult::Fail("wTotalLength mismatch");
+    }
+    if h.in_collection != alloc::vec![1u8, 2u8] {
+        return TestResult::Fail("collection list mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uac", smoke_uac_ac_header_decodes_collection);
+
+fn smoke_uac_input_terminal_microphone() -> TestResult {
+    use crate::uac::{InputTerminal, TERMINAL_MICROPHONE};
+    // 12 bytes: bLength=12, CS_INTERFACE, INPUT_TERMINAL,
+    // bTerminalID=1, wTerminalType=0x0201 (microphone),
+    // bAssocTerminal=0, bNrChannels=2, wChannelConfig=0x0003 (FL+FR),
+    // iChannelNames=0, iTerminal=0
+    let buf = [12, 0x24, 0x02, 1, 0x01, 0x02, 0, 2, 0x03, 0x00, 0, 0];
+    let t = InputTerminal::parse(&buf).expect("parse");
+    if t.terminal_type != TERMINAL_MICROPHONE {
+        return TestResult::Fail("microphone terminal type = 0x0201");
+    }
+    if t.nr_channels != 2 {
+        return TestResult::Fail("channel count mismatch");
+    }
+    if t.channel_config != 0x0003 {
+        return TestResult::Fail("channel config mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uac", smoke_uac_input_terminal_microphone);
+
+fn smoke_uac_output_terminal_speaker() -> TestResult {
+    use crate::uac::{OutputTerminal, TERMINAL_SPEAKER};
+    // 9 bytes: bLength=9, CS_INTERFACE, OUTPUT_TERMINAL,
+    // bTerminalID=2, wTerminalType=0x0301, bAssocTerminal=0,
+    // bSourceID=3, iTerminal=0
+    let buf = [9, 0x24, 0x03, 2, 0x01, 0x03, 0, 3, 0];
+    let t = OutputTerminal::parse(&buf).expect("parse");
+    if t.terminal_type != TERMINAL_SPEAKER {
+        return TestResult::Fail("speaker terminal type = 0x0301");
+    }
+    if t.source_id != 3 {
+        return TestResult::Fail("source id mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uac", smoke_uac_output_terminal_speaker);
+
+fn smoke_uac_feature_unit_decodes_per_channel_controls() -> TestResult {
+    use crate::uac::{FeatureUnit, FEATURE_MUTE, FEATURE_VOLUME};
+    // bLength=10, CS_INTERFACE, FEATURE_UNIT, bUnitID=4,
+    // bSourceID=1, bControlSize=1, master ctrl = MUTE|VOLUME,
+    // ch1 = VOLUME, ch2 = VOLUME, iFeature=0
+    let buf = [
+        10, 0x24, 0x06, 4, 1, 1,
+        (FEATURE_MUTE | FEATURE_VOLUME) as u8,
+        FEATURE_VOLUME as u8,
+        FEATURE_VOLUME as u8,
+        0,
+    ];
+    let f = FeatureUnit::parse(&buf).expect("parse");
+    if f.unit_id != 4 {
+        return TestResult::Fail("unit id mismatch");
+    }
+    if f.controls.len() != 3 {
+        return TestResult::Fail("expected master + 2 channel control bitmaps");
+    }
+    if f.controls[0] != (FEATURE_MUTE | FEATURE_VOLUME) {
+        return TestResult::Fail("master control bitmap mismatch");
+    }
+    if f.controls[1] != FEATURE_VOLUME {
+        return TestResult::Fail("ch1 control bitmap mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uac", smoke_uac_feature_unit_decodes_per_channel_controls);
+
+fn smoke_uac_format_type_i_pcm_44k_48k() -> TestResult {
+    use crate::uac::{FormatTypeI, FORMAT_TYPE_I};
+    // bLength=14, CS_INTERFACE, FORMAT_TYPE, bFormatType=1,
+    // bNrChannels=2, bSubframeSize=2, bBitResolution=16, bSamFreqType=2,
+    // tSamFreq[0] = 44100 (LE 24-bit), tSamFreq[1] = 48000
+    let mut buf = alloc::vec![14, 0x24, 0x02, FORMAT_TYPE_I, 2, 2, 16, 2];
+    buf.extend_from_slice(&[(44100u32 & 0xFF) as u8, ((44100u32 >> 8) & 0xFF) as u8, ((44100u32 >> 16) & 0xFF) as u8]);
+    buf.extend_from_slice(&[(48000u32 & 0xFF) as u8, ((48000u32 >> 8) & 0xFF) as u8, ((48000u32 >> 16) & 0xFF) as u8]);
+    let f = FormatTypeI::parse(&buf).expect("parse");
+    if f.nr_channels != 2 || f.subframe_size != 2 || f.bit_resolution != 16 {
+        return TestResult::Fail("format Type-I header mismatch");
+    }
+    if f.sample_rates != alloc::vec![44100u32, 48000u32] {
+        return TestResult::Fail("sample-rate list mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uac", smoke_uac_format_type_i_pcm_44k_48k);
+
+fn smoke_uac_format_type_i_continuous_range() -> TestResult {
+    use crate::uac::{FormatTypeI, FORMAT_TYPE_I};
+    // bSamFreqType=0 → continuous: 6 bytes = lower + upper LE 24-bit.
+    let mut buf = alloc::vec![14, 0x24, 0x02, FORMAT_TYPE_I, 2, 2, 16, 0];
+    // 8000 .. 96000
+    buf.extend_from_slice(&[(8000u32 & 0xFF) as u8, ((8000u32 >> 8) & 0xFF) as u8, 0]);
+    buf.extend_from_slice(&[(96000u32 & 0xFF) as u8, ((96000u32 >> 8) & 0xFF) as u8, ((96000u32 >> 16) & 0xFF) as u8]);
+    let f = FormatTypeI::parse(&buf).expect("parse");
+    if f.range_lower_hz != Some(8000) || f.range_upper_hz != Some(96000) {
+        return TestResult::Fail("continuous-range Hz decode wrong");
+    }
+    if !f.sample_rates.is_empty() {
+        return TestResult::Fail("continuous range should leave discrete list empty");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uac", smoke_uac_format_type_i_continuous_range);

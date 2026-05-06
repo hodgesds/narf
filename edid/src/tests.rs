@@ -371,3 +371,242 @@ fn smoke_cta_speaker_allocation_block() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("edid/cta861", smoke_cta_speaker_allocation_block);
+
+// ── HDMI CEC smokes ────────────────────────────────────────────────
+
+fn smoke_cec_header_byte_packs_initiator_and_destination() -> TestResult {
+    use crate::cec::{Frame, LogicalAddress, OPCODE_STANDBY};
+    let f = Frame::new(LogicalAddress::PlaybackDevice1.as_u8(), 0xF, OPCODE_STANDBY);
+    if f.header() != 0x4F {
+        return TestResult::Fail("header byte should be (init<<4) | dest");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("edid/cec", smoke_cec_header_byte_packs_initiator_and_destination);
+
+fn smoke_cec_polling_message_is_header_only() -> TestResult {
+    use crate::cec::Frame;
+    let f = Frame::polling(4);
+    let bytes = f.encode();
+    if bytes.len() != 1 {
+        return TestResult::Fail("polling message must be header-only");
+    }
+    let back = Frame::decode(&bytes).expect("decode polling");
+    if !back.is_polling() {
+        return TestResult::Fail("decode should preserve polling shape");
+    }
+    if back.initiator != 4 || back.destination != 4 {
+        return TestResult::Fail("polling pings the address you want to claim");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("edid/cec", smoke_cec_polling_message_is_header_only);
+
+fn smoke_cec_active_source_carries_phys_addr_be() -> TestResult {
+    use crate::cec::{active_source, Frame, OPCODE_ACTIVE_SOURCE, CEC_BROADCAST};
+    let f = active_source(4, 0x1234);
+    let bytes = f.encode();
+    // header (0x4F) | opcode (0x82) | phys hi | phys lo
+    if bytes.len() != 4 {
+        return TestResult::Fail("active source = 4 bytes");
+    }
+    if bytes[0] != 0x4F {
+        return TestResult::Fail("Active Source must broadcast → header low nibble = 0xF");
+    }
+    if bytes[1] != OPCODE_ACTIVE_SOURCE {
+        return TestResult::Fail("opcode mismatch");
+    }
+    if bytes[2] != 0x12 || bytes[3] != 0x34 {
+        return TestResult::Fail("phys-addr must be big-endian on the wire");
+    }
+    let back = Frame::decode(&bytes).expect("decode");
+    if back.destination != CEC_BROADCAST {
+        return TestResult::Fail("decoded destination != broadcast");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("edid/cec", smoke_cec_active_source_carries_phys_addr_be);
+
+fn smoke_cec_set_osd_name_truncates_to_14() -> TestResult {
+    use crate::cec::set_osd_name;
+    let f = set_osd_name(4, 0, "Long enough name to truncate");
+    if f.operands.len() != 14 {
+        return TestResult::Fail("Set OSD Name operands cap at 14 bytes (16 - header - opcode)");
+    }
+    if &f.operands[..14] != b"Long enough na" {
+        return TestResult::Fail("truncation should keep the prefix");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("edid/cec", smoke_cec_set_osd_name_truncates_to_14);
+
+fn smoke_cec_feature_abort_layout() -> TestResult {
+    use crate::cec::{feature_abort, OPCODE_FEATURE_ABORT};
+    let f = feature_abort(4, 0, 0x44, 0x00);
+    let bytes = f.encode();
+    if bytes[1] != OPCODE_FEATURE_ABORT {
+        return TestResult::Fail("opcode 0x00 expected");
+    }
+    if bytes[2] != 0x44 {
+        return TestResult::Fail("first operand is the rejected opcode");
+    }
+    if bytes[3] != 0x00 {
+        return TestResult::Fail("second operand is the reason byte");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("edid/cec", smoke_cec_feature_abort_layout);
+
+fn smoke_cec_report_physical_address_layout() -> TestResult {
+    use crate::cec::{report_physical_address, OPCODE_REPORT_PHYSICAL_ADDRESS, CEC_BROADCAST};
+    let f = report_physical_address(4, 0x2000, 4);
+    let bytes = f.encode();
+    if (bytes[0] & 0x0F) != CEC_BROADCAST {
+        return TestResult::Fail("Report Phys Addr must broadcast");
+    }
+    if bytes[1] != OPCODE_REPORT_PHYSICAL_ADDRESS {
+        return TestResult::Fail("opcode 0x84 expected");
+    }
+    if bytes[2] != 0x20 || bytes[3] != 0x00 {
+        return TestResult::Fail("phys addr operands wrong");
+    }
+    if bytes[4] != 4 {
+        return TestResult::Fail("device-type byte must be present");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("edid/cec", smoke_cec_report_physical_address_layout);
+
+fn smoke_cec_decode_rejects_oversize_frame() -> TestResult {
+    use crate::cec::{CecError, Frame};
+    let buf = [0u8; 17];
+    match Frame::decode(&buf) {
+        Err(CecError::TooLong) => TestResult::Pass,
+        _ => TestResult::Fail(">16 byte frame must be rejected"),
+    }
+}
+kernel_test_in!("edid/cec", smoke_cec_decode_rejects_oversize_frame);
+
+// ── DisplayID 2.0 smokes ───────────────────────────────────────────
+
+fn smoke_displayid_rejects_v1() -> TestResult {
+    use crate::displayid::{DisplayIdError, Section};
+    // version/revision byte = 0x12 (DisplayID 1.2) — must be rejected.
+    let buf = [0x12u8, 0, 2, 0, 0];
+    match Section::parse(&buf) {
+        Err(DisplayIdError::NotV2) => TestResult::Pass,
+        _ => TestResult::Fail("DisplayID 1.x must be rejected"),
+    }
+}
+kernel_test_in!("edid/displayid", smoke_displayid_rejects_v1);
+
+fn smoke_displayid_checksum_required() -> TestResult {
+    use crate::displayid::{compute_checksum, DisplayIdError, Section};
+    let mut buf = alloc::vec![0x20u8, 0, 2, 0]; // empty section
+    buf.push(compute_checksum(&buf));
+    buf[4] = buf[4].wrapping_add(1); // tamper
+    match Section::parse(&buf) {
+        Err(DisplayIdError::BadChecksum) => TestResult::Pass,
+        _ => TestResult::Fail("bad checksum must be rejected"),
+    }
+}
+kernel_test_in!("edid/displayid", smoke_displayid_checksum_required);
+
+fn smoke_displayid_type_vii_decodes_4k60() -> TestResult {
+    use crate::displayid::{compute_checksum, DataBlock, Section, DB_TYPE_VII_TIMING};
+    // Build a Type VII block carrying one 20-byte timing for
+    // 3840x2160@60Hz with 533.25 MHz pixel clock (CTA VIC 97).
+    //   pixel_clock = 533250 kHz → encoded = 533249 LE 24-bit
+    //   h_active = 3840 → encoded 3839
+    //   h_blank  = 560 → encoded 559
+    //   h_front_porch = 176, sync positive → high bit set
+    //   h_sync_width = 88 → encoded 87
+    //   v_active = 2160 → encoded 2159
+    //   v_blank = 90 → encoded 89
+    //   v_front_porch = 8 → encoded 7, sync positive
+    //   v_sync_width = 10 → encoded 9
+    let pix = 533_250u32 - 1;
+    let mut t = [0u8; 20];
+    t[0] = (pix & 0xFF) as u8;
+    t[1] = ((pix >> 8) & 0xFF) as u8;
+    t[2] = ((pix >> 16) & 0xFF) as u8;
+    t[3] = 0; // flags
+    let h_active = 3839u16;
+    t[4..6].copy_from_slice(&h_active.to_le_bytes());
+    let h_blank = 559u16;
+    t[6..8].copy_from_slice(&h_blank.to_le_bytes());
+    let h_fp = 175u16 | 0x8000;
+    t[8..10].copy_from_slice(&h_fp.to_le_bytes());
+    let h_sw = 87u16;
+    t[10..12].copy_from_slice(&h_sw.to_le_bytes());
+    let v_active = 2159u16;
+    t[12..14].copy_from_slice(&v_active.to_le_bytes());
+    let v_blank = 89u16;
+    t[14..16].copy_from_slice(&v_blank.to_le_bytes());
+    let v_fp = 7u16 | 0x8000;
+    t[16..18].copy_from_slice(&v_fp.to_le_bytes());
+    t[18] = 9;
+    t[19] = 0;
+
+    // Build the section: header (4) + DB header (3) + 20-byte payload + checksum.
+    let mut section = alloc::vec![0x20u8, 23, crate::displayid::USECASE_GENERIC_DISPLAY, 0];
+    section.push(DB_TYPE_VII_TIMING);
+    section.push(0); // revision
+    section.push(20); // length
+    section.extend_from_slice(&t);
+    section.push(compute_checksum(&section));
+
+    let s = Section::parse(&section).expect("parse");
+    let pref = s.preferred_type_vii().expect("Type VII present");
+    if pref.h_active != 3840 || pref.v_active != 2160 {
+        return TestResult::Fail("4K active size should round-trip");
+    }
+    if pref.pixel_clock_khz != 533_250 {
+        return TestResult::Fail("pixel clock should round-trip to 533_250");
+    }
+    if !pref.h_sync_positive || !pref.v_sync_positive {
+        return TestResult::Fail("sync polarity bits lost");
+    }
+    let r = pref.refresh_mhz();
+    if !(59_500..=60_500).contains(&r) {
+        return TestResult::Fail("refresh should be ~60 Hz");
+    }
+    // The data block should also surface as a TypeVIITiming variant.
+    let mut found_type_vii = false;
+    for b in &s.data_blocks {
+        if matches!(b, DataBlock::TypeVIITiming(_)) {
+            found_type_vii = true;
+        }
+    }
+    if !found_type_vii {
+        return TestResult::Fail("Type VII data block missing from collection");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("edid/displayid", smoke_displayid_type_vii_decodes_4k60);
+
+fn smoke_displayid_unknown_block_kept_opaque() -> TestResult {
+    use crate::displayid::{compute_checksum, DataBlock, Section};
+    // Container ID block (tag 0x0C) — we don't decode it yet. Should
+    // surface as Other { tag: 0x0C }.
+    let mut section = alloc::vec![0x20u8, 7, 0x02, 0]; // header
+    section.push(0x0C); // tag
+    section.push(0); // revision
+    section.push(4); // length
+    section.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+    section.push(compute_checksum(&section));
+    let s = Section::parse(&section).expect("parse");
+    if s.data_blocks.len() != 1 {
+        return TestResult::Fail("expected 1 data block");
+    }
+    match &s.data_blocks[0] {
+        DataBlock::Other { tag, payload, .. } => {
+            if *tag != 0x0C || payload != &[0xAA, 0xBB, 0xCC, 0xDD] {
+                return TestResult::Fail("opaque block payload mismatch");
+            }
+        }
+        _ => return TestResult::Fail("unknown tag should land in Other"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("edid/displayid", smoke_displayid_unknown_block_kept_opaque);
