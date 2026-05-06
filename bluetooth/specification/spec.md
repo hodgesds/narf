@@ -5,29 +5,56 @@ Clean-room implementation of the Bluetooth Host Controller Interface
 
 ## Sources (public only)
 
-- **Bluetooth Core Specification 5.3**, Volume 4 Part E (HCI Functional
-  Specification) — Bluetooth SIG, freely downloadable.
-- **Bluetooth Core Specification 5.3**, Volume 4 Part B (USB Transport
-  Layer) — Bluetooth SIG.
-- **USB Class Definitions for Wireless Controllers**, version 1.0, USB-IF
-  (defines class 0xE0, subclass 0x01, protocol 0x01 — "Bluetooth
-  Programming Interface").
+All code is derived from the references below. **No GPL / Linux
+Bluetooth subsystem source material was consulted at any point.**
 
-No GPL / Linux Bluetooth subsystem source material was consulted.
+### HCI
+
+- **Bluetooth Core Specification, version 5.3** — Bluetooth SIG.
+  Free download: <https://www.bluetooth.com/specifications/specs/core-specification-5-3/>
+  - **Vol 4 Part E** — HCI Functional Specification. §5.4 (packet
+    types), §7 (commands & events), §3 (general operation).
+  - **Vol 4 Part B** — USB Transport Layer. §2.1 (endpoint mapping),
+    §2.2 (packet-type indicator bytes).
+
+### L2CAP
+
+- **Bluetooth Core Specification, version 5.3, Vol 3 Part A** —
+  Logical Link Control and Adaptation Protocol. §2.1 (CID
+  assignments), §3.1 (B-frame layout), §4 (signalling commands),
+  §6.6 (segmentation / reassembly).
+
+### ATT
+
+- **Bluetooth Core Specification, version 5.3, Vol 3 Part F** —
+  Attribute Protocol. §3.3 (PDU layout), §3.4 (opcodes), §3.4.1
+  (error codes), §3.4.2 (Exchange MTU).
+
+### USB transport class
+
+- **USB Class Definitions for Wireless Controllers, Revision 1.0** —
+  USB-IF, August 2002.
+  Class 0xE0 (Wireless Controller), Subclass 0x01 (RF Controller),
+  Protocol 0x01 (Bluetooth Programming Interface).
 
 ## Scope
 
-Stage-1 (this crate's first cut):
-- HCI packet types: Command, ACL Data, Synchronous Data, Event.
-- Opcode/event-code enums for the Mandatory commands (Reset, Read
-  Local Version, Read BD_ADDR, Set Event Mask).
-- Sync layer over a generic `HciTransport` trait so a USB or UART
-  transport plugs in identically.
-- Controller bring-up state machine: Reset → Read Local Version →
-  Read BD_ADDR → Set Event Mask.
+### Landed today
+- **HCI** (`hci` / `opcode` / `event` / `transport` / `controller`):
+  packet codec, Mandatory + LE-basics opcodes, Command Complete /
+  Command Status decoders, transport trait + USB class triple, full
+  bring-up state machine (Reset → Read Local Version → Read BD_ADDR
+  → Read Buffer Size → Set Event Mask).
+- **L2CAP** (`l2cap`): CID constants, B-frame codec, ACL fragment
+  reassembler that handles the PB-flag rules from Vol 4 Part E §5.4.2,
+  signalling-command codec + iterator, dynamic CID allocator.
+- **ATT** (`att`): full opcode constant set + error-code constants
+  + PDU codec + builders/decoders for Exchange MTU, Read, Write,
+  Handle Value Notification/Indication/Confirmation, Error Response.
 
-Out of scope for Stage 1:
-- L2CAP, ATT, GATT, SMP, SDP — protocol layers above HCI.
+### Out of scope (deliberate)
+- GATT, SMP, SDP, RFCOMM — sit on top of L2CAP+ATT and land in
+  follow-on crates.
 - Specific controller quirks (vendor patches via VS_HCI commands).
 - Real USB transport hookup — lands once `narf-drivers-usb` exposes
   bulk/interrupt endpoints to non-class-driver consumers.

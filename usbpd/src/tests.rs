@@ -390,6 +390,202 @@ fn smoke_cc_status_attached_logic() -> TestResult {
 }
 kernel_test_in!("usbpd/tcpc", smoke_cc_status_attached_logic);
 
+// ── VDM + DisplayPort Alt Mode ──────────────────────────────────────
+
+fn smoke_vdm_header_round_trip() -> TestResult {
+    use crate::vdm::{CommandType, VdmCommand, VdmHeader, SVID_DISPLAYPORT};
+    let h = VdmHeader::structured(
+        SVID_DISPLAYPORT,
+        VdmCommand::DiscoverModes,
+        CommandType::Req,
+    );
+    let raw = h.encode();
+    // Top 16 bits must be the SVID.
+    if (raw >> 16) as u16 != SVID_DISPLAYPORT {
+        return TestResult::Fail("SVID not at MSBs of VDM header");
+    }
+    // Bit 15 = VDM Type = 1 (Structured).
+    if (raw >> 15) & 0x1 != 1 {
+        return TestResult::Fail("Structured VDM Type bit drift");
+    }
+    let back = VdmHeader::decode(raw);
+    if back != h {
+        return TestResult::Fail("VDM header round-trip mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("usbpd/vdm", smoke_vdm_header_round_trip);
+
+fn smoke_dp_status_vdo_round_trip() -> TestResult {
+    use crate::vdm::DpStatusVdo;
+    let s = DpStatusVdo {
+        port_connected: 0b10, // UFP_D connected
+        power_low: false,
+        enabled: true,
+        multi_function: true,
+        usb_configured: false,
+        exit_dp_mode: false,
+        hpd_state: true,
+        hpd_irq: false,
+    };
+    let raw = s.encode();
+    let back = DpStatusVdo::decode(raw);
+    if back != s {
+        return TestResult::Fail("DP_Status VDO round-trip mismatch");
+    }
+    if (raw >> 7) & 0x1 != 1 {
+        return TestResult::Fail("HPD State bit position drift");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("usbpd/vdm", smoke_dp_status_vdo_round_trip);
+
+fn smoke_dp_configure_vdo_round_trip() -> TestResult {
+    use crate::vdm::{DpConfigureVdo, DpPinAssignment};
+    let cfg = DpConfigureVdo::dfp_source(DpPinAssignment::D);
+    let raw = cfg.encode();
+    let back = DpConfigureVdo::decode(raw);
+    if back != cfg {
+        return TestResult::Fail("DP Configure VDO round-trip mismatch");
+    }
+    if back.dp_config != 1 {
+        return TestResult::Fail("DFP_D config code drift (want 1)");
+    }
+    if back.dfp_d_pin != DpPinAssignment::D as u8 {
+        return TestResult::Fail("Pin assignment D not set in DFP_D field");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("usbpd/vdm", smoke_dp_configure_vdo_round_trip);
+
+fn smoke_dp_alt_mode_discovery_full_walk() -> TestResult {
+    use crate::vdm::{
+        build_discover_identity_req, AltModeState, AltStepOutcome, CommandType, DpAltModeDriver,
+        DpCapabilitiesVdo, DpStatusVdo, VdmCommand, VdmHeader, SVID_DISPLAYPORT, SVID_PD,
+    };
+
+    let mut drv = DpAltModeDriver::new();
+    let kick = drv.start();
+    match kick {
+        AltStepOutcome::Transmit(v) if v == build_discover_identity_req() => {}
+        _ => return TestResult::Fail("start() should kick Discover Identity"),
+    }
+    if drv.state != AltModeState::DiscoveringIdentity {
+        return TestResult::Fail("state didn't move to DiscoveringIdentity");
+    }
+
+    // Identity ACK — single header, no VDOs needed for our walker.
+    let id_ack = alloc::vec![VdmHeader::structured(
+        SVID_PD,
+        VdmCommand::DiscoverIdentity,
+        CommandType::Ack
+    )
+    .encode()];
+    match drv.feed_response(&id_ack) {
+        AltStepOutcome::Transmit(_) => {}
+        _ => return TestResult::Fail("Identity ACK should kick Discover SVIDs"),
+    }
+    if drv.state != AltModeState::DiscoveringSvids {
+        return TestResult::Fail("state didn't move to DiscoveringSvids");
+    }
+
+    // SVIDs ACK — header + a VDO listing DisplayPort SVID in the high half.
+    let svid_pack = ((SVID_DISPLAYPORT as u32) << 16) | 0x0000;
+    let svids_ack = alloc::vec![
+        VdmHeader::structured(SVID_PD, VdmCommand::DiscoverSvids, CommandType::Ack).encode(),
+        svid_pack,
+    ];
+    match drv.feed_response(&svids_ack) {
+        AltStepOutcome::Transmit(_) => {}
+        _ => return TestResult::Fail("SVIDs ACK should kick Discover Modes"),
+    }
+    if drv.state != AltModeState::DiscoveringModes {
+        return TestResult::Fail("state didn't move to DiscoveringModes");
+    }
+
+    // Modes ACK — header + a Capabilities VDO advertising pin D for DFP_D.
+    let caps = (DpCapabilitiesVdo(0).0)
+        | 0x3 // both UFP_D + DFP_D capable
+        | (0x1 << 2) // HBR3 signalling
+        | ((1u32 << 3) << 8); // DFP_D pin assignment D
+    let modes_ack = alloc::vec![
+        VdmHeader::structured(SVID_DISPLAYPORT, VdmCommand::DiscoverModes, CommandType::Ack)
+            .encode(),
+        caps,
+    ];
+    match drv.feed_response(&modes_ack) {
+        AltStepOutcome::Transmit(_) => {}
+        _ => return TestResult::Fail("Modes ACK should kick EnterMode"),
+    }
+    if drv.state != AltModeState::EnteringMode {
+        return TestResult::Fail("state didn't move to EnteringMode");
+    }
+
+    // EnterMode ACK — header only.
+    let enter_ack = alloc::vec![VdmHeader::structured(
+        SVID_DISPLAYPORT,
+        VdmCommand::EnterMode,
+        CommandType::Ack
+    )
+    .encode()];
+    match drv.feed_response(&enter_ack) {
+        AltStepOutcome::Transmit(_) => {}
+        _ => return TestResult::Fail("EnterMode ACK should kick Configure"),
+    }
+    if drv.state != AltModeState::ConfiguringDp {
+        return TestResult::Fail("state didn't move to ConfiguringDp");
+    }
+
+    // Configure ACK arrives as Attention with the live DP_Status as
+    // a VDO (per VESA DP Alt 2.0).
+    let status = DpStatusVdo {
+        port_connected: 0b10,
+        power_low: false,
+        enabled: true,
+        multi_function: false,
+        usb_configured: false,
+        exit_dp_mode: false,
+        hpd_state: true,
+        hpd_irq: false,
+    };
+    let cfg_ack = alloc::vec![
+        VdmHeader::structured(SVID_DISPLAYPORT, VdmCommand::Attention, CommandType::Ack).encode(),
+        status.encode(),
+    ];
+    match drv.feed_response(&cfg_ack) {
+        AltStepOutcome::Active(_) => {}
+        _ => return TestResult::Fail("Configure ACK should produce Active outcome"),
+    }
+    if drv.state != AltModeState::Active {
+        return TestResult::Fail("state didn't move to Active");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("usbpd/vdm", smoke_dp_alt_mode_discovery_full_walk);
+
+fn smoke_dp_alt_mode_nak_aborts() -> TestResult {
+    use crate::vdm::{
+        AltModeState, AltStepOutcome, CommandType, DpAltModeDriver, VdmCommand, VdmHeader, SVID_PD,
+    };
+    let mut drv = DpAltModeDriver::new();
+    let _ = drv.start();
+    let nak = alloc::vec![VdmHeader::structured(
+        SVID_PD,
+        VdmCommand::DiscoverIdentity,
+        CommandType::Nak
+    )
+    .encode()];
+    match drv.feed_response(&nak) {
+        AltStepOutcome::Failed => {}
+        _ => return TestResult::Fail("NAK should fail discovery"),
+    }
+    if drv.state != AltModeState::Failed {
+        return TestResult::Fail("state didn't move to Failed on NAK");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("usbpd/vdm", smoke_dp_alt_mode_nak_aborts);
+
 fn smoke_port_registry_round_trip() -> TestResult {
     use crate::tcpm;
     tcpm::__test_reset();

@@ -789,6 +789,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-drivers-usbpd"
+version = "0.0.0"
+dependencies = [
+ "narf-capabilities",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-usbpd",
+]
+
+[[package]]
 name = "narf-drivers-virtio"
 version = "0.0.0"
 dependencies = [
@@ -925,6 +935,7 @@ dependencies = [
  "narf-drivers-platform",
  "narf-drivers-storage",
  "narf-drivers-usb",
+ "narf-drivers-usbpd",
  "narf-drivers-virtio",
  "narf-drivers-wireless",
  "narf-fb",

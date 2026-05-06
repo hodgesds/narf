@@ -43,6 +43,7 @@ narf-fb              = { path = "../fb" }
 narf-audio           = { path = "../audio" }
 narf-bluetooth       = { path = "../bluetooth" }
 narf-usbpd           = { path = "../usbpd" }
+narf-drivers-usbpd   = { path = "../drivers/usbpd" }
 narf-wireless        = { path = "../wireless" }
 narf-accel           = { path = "../accel" }
 narf-tpm             = { path = "../tpm" }
@@ -75,6 +76,7 @@ kernel-test  = [
     "narf-audio/kernel-test",
     "narf-bluetooth/kernel-test",
     "narf-usbpd/kernel-test",
+    "narf-drivers-usbpd/kernel-test",
     "narf-wireless/kernel-test",
     "narf-drivers-wireless/kernel-test",
     "narf-accel/kernel-test",

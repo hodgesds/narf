@@ -5,34 +5,54 @@ Type-C Port Manager (TCPM) sink-role state machine.
 
 ## Sources (public only)
 
-- **USB Power Delivery Specification, Revision 3.1, v1.8** (USB-IF)
-  — message framing, Power Data Object encoding, state-machine
-  prescriptions for source/sink/port partner negotiation.
-- **USB Type-C Cable and Connector Specification, Revision 2.2**
-  (USB-IF) — port roles, CC pin signalling, attach/detach detection.
-- **Universal Serial Bus Type-C Port Controller Interface Specification
-  (TCPCI), Revision 2.0** (USB-IF) — register-level interface a host
-  TCPM uses to talk to a TCPC chip (FUSB302, TPS6598x, et al).
+All code is derived strictly from the references below. **No GPL
+or Linux `drivers/usb/typec/` source material was consulted at any
+point.**
 
-No GPL / Linux `drivers/usb/typec/` source consulted.
+### USB-IF specs (download from <https://www.usb.org/document-library>)
+
+- **USB Power Delivery Specification, Revision 3.1, Version 1.8**
+  (USB-IF). §6.2.1 (message header), §6.4.1 (Power Data Objects),
+  §6.4.2 (Request Data Object), §6.4.4 (Vendor Defined Messages),
+  §8.3.3 (sink Policy Engine state machine).
+- **USB Type-C Cable and Connector Specification, Revision 2.2**
+  (USB-IF). §4 (CC pin meanings, Rd/Rp termination), §4.5 (port
+  attach/detach behaviour).
+- **USB Type-C Port Controller Interface Specification (TCPCI),
+  Revision 2.0** (USB-IF). §4 (TCPC register interface), §4.4
+  (CC sense + role programming).
+
+### VESA specs
+
+- **DisplayPort Alt Mode on USB Type-C Standard, Version 2.0**
+  (VESA). §4 (mode discovery sequence, SVID 0xFF01), §6.2
+  (DP_Status VDO), §6.3 (DP_Configure VDO), §6.5 (pin assignments
+  A..F).
 
 ## Scope
 
-Stage-1 (this crate's first cut):
-- PD message header (USB-PD §6.2.1) + extended header (§6.2.1.2).
-- Power Data Object (PDO) encoding — Fixed / Variable / Battery /
-  Augmented (§6.4.1).
-- Request Data Object (RDO) builder (§6.4.2).
-- TCPC interface trait — `set_role`, `cc_status`, `transmit`, `receive`.
-- TCPM sink-role state machine: Unattached → AttachWait → Attached →
-  SinkStartup → SinkDiscovery → SinkWaitCaps → SinkEvaluateCaps →
-  SinkSelectCapability → SinkTransitionSink → SinkReady (§8.3).
+### Landed today
+- **`message`** — Header encode/decode + CtrlMsg/DataMsg enums, Power
+  Data Object codec (Fixed/Variable/Battery/Augmented per §6.4.1)
+  and Request Data Object codec (§6.4.2).
+- **`tcpc`** — `Tcpc` trait: `set_role`, `cc_status`, `transmit`,
+  `receive`, `hard_reset`. CcState/PortRole enums.
+- **`tcpm`** — Sink-role policy-engine state machine
+  (Unattached → AttachWait → Attached → Startup → Discovery →
+  WaitCaps → EvaluateCaps → SelectCapability → TransitionSink →
+  Ready). Lands a `Contract { object_position, voltage_mv,
+  op_current_ma }` on PS_RDY.
+- **`vdm`** — VDM header codec (USB-PD §6.4.4), DiscoverIdentity /
+  DiscoverSVIDs / DiscoverModes / EnterMode / Attention builders.
+  DP_Capabilities / DP_Status / DP_Configure VDO codecs (VESA DP
+  Alt 2.0). `DpAltModeDriver` walks the full alt-mode discovery
+  sequence end-to-end and lands a working DP configuration.
 
-Out of scope for Stage 1:
+### Out of scope (deliberate)
 - Power Role Swap, Data Role Swap, VCONN Swap.
-- Alt-Mode (DisplayPort, Thunderbolt) discovery / configuration.
-- A real TCPC driver (FUSB302 / TPS6598x). The `Tcpc` trait is the
-  insertion point; an in-tree driver lands separately.
+- Thunderbolt Alt Mode (Intel-specific spec, not in this crate's
+  scope).
+- Concrete TCPC drivers — see `narf-drivers-usbpd` for FUSB302.
 
 ## Cap surface
 

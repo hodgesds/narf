@@ -6,6 +6,23 @@
 > `net/spec` with 802.11-specific control plane, capability-gated
 > scan/associate flows, and SoftMAC support.
 
+## 0. References (public-only)
+
+All protocol code is derived from the references below. **No GPL or
+Linux `net/wireless/`, `net/mac80211/`, or vendor `wireless/`
+driver source material was consulted at any point.**
+
+- **IEEE Std 802.11-2020** — Wireless LAN MAC and Physical Layer
+  specifications. IEEE Standards Association.
+  - §9 (Frame Formats) — drives `mlme.rs` (Frame Control,
+    management headers, IE/TLV layout).
+  - §12.4 (SAE) — WPA3 Simultaneous Authentication of Equals,
+    referenced for future EAPOL extensions.
+  - §12.7 (Keys and key distribution) — drives `eapol.rs` PRF,
+    PTK derivation, and the 4-Way Handshake state machine.
+- **IEEE Std 802.1X-2020** — Port-Based Network Access Control.
+  §11.3 (EAPOL frame format) — drives the EAPOL header in `eapol.rs`.
+
 ## 1. Purpose & scope
 
 **Owns:**

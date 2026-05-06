@@ -26,6 +26,7 @@ extern crate alloc;
 pub mod message;
 pub mod tcpc;
 pub mod tcpm;
+pub mod vdm;
 
 mod tests;
 

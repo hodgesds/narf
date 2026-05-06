@@ -9,6 +9,7 @@ use narf_capabilities::{Cap, Grant, Read, Write};
 use narf_net::Interface;
 
 pub mod caps;
+pub mod eapol;
 pub mod iface;
 pub mod mlme;
 pub mod reg;
@@ -349,6 +350,219 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("wireless/mlme", smoke_mlme_open_auth_request);
+
+    fn smoke_eapol_header_round_trip() -> TestResult {
+        use crate::eapol::{EapolHeader, EapolType, EAPOL_PROTOCOL_VERSION};
+        let h = EapolHeader {
+            version: EAPOL_PROTOCOL_VERSION,
+            packet_type: EapolType::EapolKey as u8,
+            body_length: 95,
+        };
+        let mut out = Vec::new();
+        h.encode(&mut out);
+        if out.len() != 4 {
+            return TestResult::Fail("EAPOL header should be 4 bytes");
+        }
+        // Body length is big-endian.
+        if u16::from_be_bytes([out[2], out[3]]) != 95 {
+            return TestResult::Fail("EAPOL body length not big-endian");
+        }
+        let back = EapolHeader::decode(&out).expect("decode");
+        if back != h {
+            return TestResult::Fail("EAPOL header round-trip mismatch");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("wireless/eapol", smoke_eapol_header_round_trip);
+
+    fn smoke_eapol_key_frame_round_trip() -> TestResult {
+        use crate::eapol::{
+            KeyFrame, KEY_DESCRIPTOR_RSN, KI_INSTALL, KI_KEY_ACK, KI_KEY_MIC,
+            KI_KEY_TYPE_PAIRWISE,
+        };
+        // 16-byte MIC (HMAC-SHA1 AKM) — typical WPA2-Personal.
+        let mut k = KeyFrame::empty(16);
+        k.descriptor_type = KEY_DESCRIPTOR_RSN;
+        k.key_information = KI_KEY_TYPE_PAIRWISE | KI_KEY_ACK | KI_KEY_MIC | KI_INSTALL | 0x02;
+        k.key_length = 16;
+        k.replay_counter = 0x0102_0304_0506_0708;
+        k.key_nonce = [0xAA; 32];
+        k.key_data = alloc::vec![0xDD, 0xEE, 0xFF];
+
+        let raw = k.encode();
+        let back = KeyFrame::decode(&raw, 16).expect("decode");
+        if back != k {
+            return TestResult::Fail("KeyFrame round-trip mismatch");
+        }
+        if !back.pairwise() || !back.key_ack() || !back.has_mic() || !back.install() {
+            return TestResult::Fail("Key Information bit flags lost");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("wireless/eapol", smoke_eapol_key_frame_round_trip);
+
+    fn smoke_eapol_into_eapol_wraps_header() -> TestResult {
+        use crate::eapol::{EapolHeader, EapolType, KeyFrame};
+        let k = KeyFrame::empty(16);
+        let body_len = k.encode().len();
+        let pdu = k.into_eapol();
+        if pdu.len() != 4 + body_len {
+            return TestResult::Fail("into_eapol did not prefix a 4-byte header");
+        }
+        let h = EapolHeader::decode(&pdu).expect("decode");
+        if h.packet_type != EapolType::EapolKey as u8 {
+            return TestResult::Fail("packet type should be EAPOL-Key");
+        }
+        if h.body_length as usize != body_len {
+            return TestResult::Fail("body_length mismatch");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("wireless/eapol", smoke_eapol_into_eapol_wraps_header);
+
+    /// Identity HMAC for testing the PRF / handshake plumbing — we
+    /// just want to verify the surface, not the cryptographic
+    /// strength. Production uses HMAC-SHA1 (AKM-1/2) or HMAC-SHA256
+    /// (AKM-3+) wired via narf-crypto.
+    struct StubHmac;
+    impl crate::eapol::HmacPrimitive for StubHmac {
+        fn out_len(&self) -> usize {
+            20
+        }
+        fn mac(&self, key: &[u8], data: &[u8]) -> Vec<u8> {
+            // Deterministic XOR digest for test purposes only.
+            let mut out = alloc::vec![0u8; 20];
+            for (i, b) in key.iter().enumerate() {
+                out[i % 20] ^= *b;
+            }
+            for (i, b) in data.iter().enumerate() {
+                out[i % 20] ^= b.rotate_left((i % 8) as u32);
+            }
+            out
+        }
+    }
+
+    fn smoke_eapol_prf_extends_to_requested_length() -> TestResult {
+        use crate::eapol::prf;
+        let key = [0x11u8; 32];
+        let label = b"Pairwise key expansion";
+        let context = [0x22u8; 76];
+        // 384 bits = 48 bytes; PRF runs for ceil(48/20) = 3 chunks.
+        let out = prf(&StubHmac, &key, label, &context, 384);
+        if out.len() != 48 {
+            return TestResult::Fail("PRF output length not 48 bytes");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("wireless/eapol", smoke_eapol_prf_extends_to_requested_length);
+
+    fn smoke_eapol_derive_ptk_splits_kck_kek_tk() -> TestResult {
+        use crate::eapol::derive_ptk;
+        let pmk = [0x33u8; 32];
+        let aa = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
+        let sa = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
+        let anonce = [0x55u8; 32];
+        let snonce = [0x66u8; 32];
+        let ptk = derive_ptk(&StubHmac, &pmk, &aa, &sa, &anonce, &snonce, 16);
+        if ptk.kck.len() != 16 || ptk.kek.len() != 16 || ptk.tk.len() != 16 {
+            return TestResult::Fail("PTK split lengths drifted");
+        }
+        // PTK is deterministic for given inputs — derive twice and
+        // confirm equality.
+        let ptk2 = derive_ptk(&StubHmac, &pmk, &aa, &sa, &anonce, &snonce, 16);
+        if ptk.kck != ptk2.kck || ptk.kek != ptk2.kek || ptk.tk != ptk2.tk {
+            return TestResult::Fail("PTK derivation not deterministic");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("wireless/eapol", smoke_eapol_derive_ptk_splits_kck_kek_tk);
+
+    fn smoke_eapol_supplicant_walks_4way_handshake() -> TestResult {
+        use crate::eapol::{
+            FourWayState, KeyFrame, Supplicant, KEY_DESCRIPTOR_RSN, KI_INSTALL, KI_KEY_ACK,
+            KI_KEY_MIC, KI_KEY_TYPE_PAIRWISE,
+        };
+        let aa = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
+        let sa = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
+        let snonce = [0x77u8; 32];
+        let mut sup = Supplicant::new(aa, sa, snonce);
+        let pmk = [0x44u8; 32];
+
+        // Build M1 — Authenticator → Supplicant.
+        let mut m1 = KeyFrame::empty(16);
+        m1.descriptor_type = KEY_DESCRIPTOR_RSN;
+        m1.key_information = KI_KEY_TYPE_PAIRWISE | KI_KEY_ACK | 0x02;
+        m1.replay_counter = 1;
+        m1.key_nonce = [0x88u8; 32];
+
+        let m2 = sup
+            .handle(&StubHmac, &pmk, 16, &m1)
+            .expect("handle M1")
+            .expect("M1 should produce M2");
+        if sup.state != FourWayState::WaitM3 {
+            return TestResult::Fail("supplicant did not advance to WaitM3");
+        }
+        if m2.replay_counter != 1 || !m2.has_mic() || m2.key_ack() {
+            return TestResult::Fail("M2 flags / counter wrong");
+        }
+        if sup.ptk.is_none() {
+            return TestResult::Fail("PTK should be derived after M1");
+        }
+
+        // M3: Authenticator confirms with Install + MIC + Secure.
+        let mut m3 = KeyFrame::empty(16);
+        m3.descriptor_type = KEY_DESCRIPTOR_RSN;
+        m3.key_information = KI_KEY_TYPE_PAIRWISE | KI_KEY_ACK | KI_KEY_MIC | KI_INSTALL | 0x02;
+        m3.replay_counter = 2;
+        m3.key_nonce = m1.key_nonce;
+
+        let m4 = sup
+            .handle(&StubHmac, &pmk, 16, &m3)
+            .expect("handle M3")
+            .expect("M3 should produce M4");
+        if sup.state != FourWayState::PtkDone {
+            return TestResult::Fail("supplicant did not reach PtkDone");
+        }
+        if m4.install() || !m4.has_mic() {
+            return TestResult::Fail("M4 flags wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "wireless/eapol",
+        smoke_eapol_supplicant_walks_4way_handshake
+    );
+
+    fn smoke_eapol_supplicant_rejects_replay_regression() -> TestResult {
+        use crate::eapol::{
+            FourWayError, KeyFrame, Supplicant, KEY_DESCRIPTOR_RSN, KI_INSTALL, KI_KEY_ACK,
+            KI_KEY_MIC, KI_KEY_TYPE_PAIRWISE,
+        };
+        let mut sup = Supplicant::new([0u8; 6], [0u8; 6], [0u8; 32]);
+        let pmk = [0u8; 32];
+        // M1 with replay=5.
+        let mut m1 = KeyFrame::empty(16);
+        m1.descriptor_type = KEY_DESCRIPTOR_RSN;
+        m1.key_information = KI_KEY_TYPE_PAIRWISE | KI_KEY_ACK | 0x02;
+        m1.replay_counter = 5;
+        let _ = sup
+            .handle(&StubHmac, &pmk, 16, &m1)
+            .expect("M1 should pass");
+        // M3 with replay=4 (regression) — must error.
+        let mut m3 = KeyFrame::empty(16);
+        m3.descriptor_type = KEY_DESCRIPTOR_RSN;
+        m3.key_information = KI_KEY_TYPE_PAIRWISE | KI_KEY_ACK | KI_KEY_MIC | KI_INSTALL | 0x02;
+        m3.replay_counter = 4;
+        m3.key_nonce = m1.key_nonce;
+        match sup.handle(&StubHmac, &pmk, 16, &m3) {
+            Err(FourWayError::ReplayRegression) => TestResult::Pass,
+            _ => TestResult::Fail("regression should be rejected"),
+        }
+    }
+    kernel_test_in!(
+        "wireless/eapol",
+        smoke_eapol_supplicant_rejects_replay_regression
+    );
 
     fn smoke_mlme_beacon_ssid_channel_extract() -> TestResult {
         use crate::mlme::{beacon_ssid_channel, write_ie, ElementId};

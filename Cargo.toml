@@ -49,6 +49,7 @@ members = [
     "drivers/gpu",
     "drivers/storage",
     "drivers/usb",
+    "drivers/usbpd",
     "drivers/input",
     "drivers/graphics",
     "drivers/platform",

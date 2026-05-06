@@ -1,0 +1,24 @@
+[package]
+name         = "narf-drivers-usbpd"
+description  = "USB-PD TCPC drivers (FUSB302). Clean-room from public silicon datasheets."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_usbpd"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../../lib" }
+narf-usbpd        = { path = "../../usbpd" }
+narf-capabilities = { path = "../../capabilities" }
+narf-kernel-test  = { path = "../../verification/kernel-test" }
+
+[features]
+kernel-test = []
+
+[lints]
+workspace = true
