@@ -10,10 +10,10 @@
 
 extern crate alloc;
 
+pub mod battery;
+pub mod ec;
 pub mod smbus;
 pub mod tpm;
-pub mod ec;
-pub mod battery;
 
 mod tests;
 

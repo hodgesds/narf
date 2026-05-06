@@ -117,6 +117,7 @@ impl BlockDeviceSync for EncryptedBlockDevice {
         // To be safe, we'll allocate a Vec for now (requires `alloc`).
         let mut encrypted = data.to_vec();
         self.crypt_buffer(true, lba, &mut encrypted)?;
-        self.inner.write(lba + DATA_OFFSET_LBAS, n_blocks, &encrypted)
+        self.inner
+            .write(lba + DATA_OFFSET_LBAS, n_blocks, &encrypted)
     }
 }

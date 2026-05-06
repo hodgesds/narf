@@ -304,8 +304,9 @@ static AMDGPU: AmdgpuScanout = AmdgpuScanout;
 static GENERIC: GenericScanout = GenericScanout;
 
 /// Global registration for the bootloader-provided linear framebuffer.
-static GENERIC_FB: narf_lib::sync::IrqSafeSpinLock<Option<narf_graphics_driver::generic::GenericFb>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
+static GENERIC_FB: narf_lib::sync::IrqSafeSpinLock<
+    Option<narf_graphics_driver::generic::GenericFb>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
 
 pub fn register_generic(fb: narf_graphics_driver::generic::GenericFb) {
     *GENERIC_FB.lock() = Some(fb);

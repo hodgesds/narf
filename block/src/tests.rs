@@ -101,8 +101,8 @@ kernel_test_in!("block", smoke_block_deadline_promotes_expired);
 fn smoke_block_encrypted_round_trip() -> TestResult {
     use crate::encrypted::EncryptedBlockDevice;
     use crate::registry::{BlockDeviceSync, BlockIoError};
-    use alloc::sync::Arc;
     use alloc::boxed::Box;
+    use alloc::sync::Arc;
     use async_trait::async_trait;
     use narf_lib::sync::IrqSafeSpinLock;
 
@@ -111,14 +111,18 @@ fn smoke_block_encrypted_round_trip() -> TestResult {
     }
 
     impl BlockDeviceSync for MemoryBlockDevice {
-        fn lba_size(&self) -> u32 { 512 }
-        fn capacity(&self) -> u64 { 1024 }
+        fn lba_size(&self) -> u32 {
+            512
+        }
+        fn capacity(&self) -> u64 {
+            1024
+        }
 
         fn read(&self, lba: u64, n_blocks: u16, out: &mut [u8]) -> Result<(), BlockIoError> {
             let offset = (lba * 512) as usize;
             let len = n_blocks as usize * 512;
             let data = self.data.lock();
-            out.copy_from_slice(&data[offset..offset+len]);
+            out.copy_from_slice(&data[offset..offset + len]);
             Ok(())
         }
 
@@ -126,25 +130,39 @@ fn smoke_block_encrypted_round_trip() -> TestResult {
             let offset = (lba * 512) as usize;
             let len = n_blocks as usize * 512;
             let mut inner_data = self.data.lock();
-            inner_data[offset..offset+len].copy_from_slice(data);
+            inner_data[offset..offset + len].copy_from_slice(data);
             Ok(())
         }
     }
 
     narf_scheduler::init();
-    let inner = Arc::new(MemoryBlockDevice { data: IrqSafeSpinLock::new(alloc::vec![0u8; 1024 * 512]) });
-    
+    let inner = Arc::new(MemoryBlockDevice {
+        data: IrqSafeSpinLock::new(alloc::vec![0u8; 1024 * 512]),
+    });
+
     // Mock TPM
     struct MockTpm;
     #[async_trait]
     impl narf_tpm::TpmDevice for MockTpm {
         fn get_info(&self) -> narf_tpm::TpmInfo {
-            narf_tpm::TpmInfo { manufacturer: 0, version: 2, spec_level: 0 }
+            narf_tpm::TpmInfo {
+                manufacturer: 0,
+                version: 2,
+                spec_level: 0,
+            }
         }
-        async fn submit_raw(&self, _cmd: &[u8]) -> Result<alloc::vec::Vec<u8>, narf_tpm::TpmError> { unimplemented!() }
-        async fn get_random(&self, _bytes: u16) -> Result<alloc::vec::Vec<u8>, narf_tpm::TpmError> { unimplemented!() }
-        async fn extend_pcr(&self, _pcr: u32, _digest: &[u8]) -> Result<(), narf_tpm::TpmError> { Ok(()) }
-        async fn read_pcr(&self, _pcr: u32) -> Result<alloc::vec::Vec<u8>, narf_tpm::TpmError> { unimplemented!() }
+        async fn submit_raw(&self, _cmd: &[u8]) -> Result<alloc::vec::Vec<u8>, narf_tpm::TpmError> {
+            unimplemented!()
+        }
+        async fn get_random(&self, _bytes: u16) -> Result<alloc::vec::Vec<u8>, narf_tpm::TpmError> {
+            unimplemented!()
+        }
+        async fn extend_pcr(&self, _pcr: u32, _digest: &[u8]) -> Result<(), narf_tpm::TpmError> {
+            Ok(())
+        }
+        async fn read_pcr(&self, _pcr: u32) -> Result<alloc::vec::Vec<u8>, narf_tpm::TpmError> {
+            unimplemented!()
+        }
     }
     let tpm = MockTpm;
 
@@ -152,14 +170,16 @@ fn smoke_block_encrypted_round_trip() -> TestResult {
     let s = success.clone();
 
     narf_scheduler::spawn(async move {
-        let enc = EncryptedBlockDevice::open(inner.clone(), &tpm).await.expect("open");
-        
+        let enc = EncryptedBlockDevice::open(inner.clone(), &tpm)
+            .await
+            .expect("open");
+
         let data = [0xAAu8; 512];
         enc.write(0, 1, &data).expect("write failed");
 
         // Verify data is encrypted in the underlying device.
         let raw_data = inner.data.lock();
-        let encrypted_sector = &raw_data[8 * 512 .. 9 * 512]; // Offset by 8
+        let encrypted_sector = &raw_data[8 * 512..9 * 512]; // Offset by 8
         if encrypted_sector.iter().all(|&b| b == 0xAA) {
             return; // Not encrypted!
         }
@@ -174,7 +194,10 @@ fn smoke_block_encrypted_round_trip() -> TestResult {
     });
 
     narf_scheduler::run_until_empty();
-    if success.load(core::sync::atomic::Ordering::SeqCst) { TestResult::Pass }
-    else { TestResult::Fail("round trip failed") }
+    if success.load(core::sync::atomic::Ordering::SeqCst) {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("round trip failed")
+    }
 }
 kernel_test_in!("block", smoke_block_encrypted_round_trip);

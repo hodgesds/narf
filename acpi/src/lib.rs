@@ -1626,8 +1626,8 @@ pub fn gpe1_block() -> Option<GpeBlockInfo> {
 #[derive(Copy, Clone, Debug)]
 pub struct EcdtInfo {
     pub control_port: u16,
-    pub data_port:    u16,
-    pub gpe_bit:      u8,
+    pub data_port: u16,
+    pub gpe_bit: u8,
 }
 
 static ECDT_INFO: IrqSafeSpinLock<Option<EcdtInfo>> = IrqSafeSpinLock::new(None);
@@ -1643,7 +1643,10 @@ pub unsafe fn parse_ecdt(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
             }
         })?;
     }
-    let ecdt_phys = match ecdt { Some(p) => p, None => return Ok(()) };
+    let ecdt_phys = match ecdt {
+        Some(p) => p,
+        None => return Ok(()),
+    };
 
     let total = unsafe { (ecdt_phys as *const SdtHeader).read_unaligned().length as usize };
     if total < SDT_HEADER_SIZE + 12 + 12 + 4 + 1 {
@@ -1656,16 +1659,18 @@ pub unsafe fn parse_ecdt(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
 
     // EC_CONTROL GAS at +36, EC_DATA GAS at +48.
     let control_port = u64::from_le_bytes([
-        body[40], body[41], body[42], body[43],
-        body[44], body[45], body[46], body[47],
+        body[40], body[41], body[42], body[43], body[44], body[45], body[46], body[47],
     ]) as u16;
     let data_port = u64::from_le_bytes([
-        body[52], body[53], body[54], body[55],
-        body[56], body[57], body[58], body[59],
+        body[52], body[53], body[54], body[55], body[56], body[57], body[58], body[59],
     ]) as u16;
     let gpe_bit = body[64];
 
-    *ECDT_INFO.lock() = Some(EcdtInfo { control_port, data_port, gpe_bit });
+    *ECDT_INFO.lock() = Some(EcdtInfo {
+        control_port,
+        data_port,
+        gpe_bit,
+    });
     Ok(())
 }
 

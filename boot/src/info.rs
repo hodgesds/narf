@@ -78,17 +78,16 @@ pub struct BootInfo {
     pub initramfs: Option<MemRegion>,
     /// Optional framebuffer parameters provided by the bootloader.
     pub framebuffer: Option<FramebufferInfo>,
-    }
+}
 
-    #[derive(Copy, Clone, Debug)]
-    pub struct FramebufferInfo {
+#[derive(Copy, Clone, Debug)]
+pub struct FramebufferInfo {
     pub addr: PhysAddr,
     pub width: u32,
     pub height: u32,
     pub pitch: u32,
     pub bpp: u8,
-    }
-
+}
 
 /// Errors from `validate_boot_info`. Stage 1 raises `BadMagic` and
 /// `NoUsableRam`; the rest are scaffolding for later checks.

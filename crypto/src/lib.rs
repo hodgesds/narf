@@ -285,8 +285,10 @@ pub fn aes_xts_256_encrypt(
     use aes::Aes256;
     use xts_mode::{get_tweak_default, Xts128};
 
-    let cipher_1 = Aes256::new_from_slice(&key_bytes[..32]).map_err(|_| CryptoError::BackendUnavailable)?;
-    let cipher_2 = Aes256::new_from_slice(&key_bytes[32..]).map_err(|_| CryptoError::BackendUnavailable)?;
+    let cipher_1 =
+        Aes256::new_from_slice(&key_bytes[..32]).map_err(|_| CryptoError::BackendUnavailable)?;
+    let cipher_2 =
+        Aes256::new_from_slice(&key_bytes[32..]).map_err(|_| CryptoError::BackendUnavailable)?;
     let xts = Xts128::new(cipher_1, cipher_2);
 
     xts.encrypt_area(data, 16, sector_id.into(), get_tweak_default);
@@ -308,8 +310,10 @@ pub fn aes_xts_256_decrypt(
     use aes::Aes256;
     use xts_mode::{get_tweak_default, Xts128};
 
-    let cipher_1 = Aes256::new_from_slice(&key_bytes[..32]).map_err(|_| CryptoError::BackendUnavailable)?;
-    let cipher_2 = Aes256::new_from_slice(&key_bytes[32..]).map_err(|_| CryptoError::BackendUnavailable)?;
+    let cipher_1 =
+        Aes256::new_from_slice(&key_bytes[..32]).map_err(|_| CryptoError::BackendUnavailable)?;
+    let cipher_2 =
+        Aes256::new_from_slice(&key_bytes[32..]).map_err(|_| CryptoError::BackendUnavailable)?;
     let xts = Xts128::new(cipher_1, cipher_2);
 
     xts.decrypt_area(data, 16, sector_id.into(), get_tweak_default);

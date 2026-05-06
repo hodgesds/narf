@@ -8,10 +8,13 @@ pub mod types;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use async_trait::async_trait;
+use messages::{
+    ErrorCode, GetCapabilitiesRequest, GetMeasurementsRequest, GetVersionRequest, ResponseCode,
+    SpdmHeader,
+};
 use narf_capabilities::{CapKind, CapType};
-use messages::{ErrorCode, ResponseCode, SpdmHeader, GetVersionRequest, GetCapabilitiesRequest, GetMeasurementsRequest};
 
-pub use types::{SpdmError, SpdmCaps, Measurement};
+pub use types::{Measurement, SpdmCaps, SpdmError};
 
 /// Capability type for SPDM attestation.
 #[derive(Copy, Clone, Debug)]
@@ -36,7 +39,10 @@ pub struct SpdmSession<'a> {
 
 impl<'a> SpdmSession<'a> {
     pub fn new(device: &'a dyn AttestationDevice) -> Self {
-        Self { device, version: 0x10 }
+        Self {
+            device,
+            version: 0x10,
+        }
     }
 
     /// Negotiates version, capabilities and algorithms.
@@ -45,8 +51,10 @@ impl<'a> SpdmSession<'a> {
         let req = GetVersionRequest::encode();
         let resp = self.device.send_receive(&req).await?;
         let hdr = SpdmHeader::decode(&resp).ok_or(SpdmError::Protocol)?;
-        if hdr.code != ResponseCode::Version as u8 { return Err(SpdmError::Protocol); }
-        
+        if hdr.code != ResponseCode::Version as u8 {
+            return Err(SpdmError::Protocol);
+        }
+
         // Extract version (simplified for Stage 4: assume 1.2 is supported)
         self.version = 0x12;
 
@@ -54,9 +62,13 @@ impl<'a> SpdmSession<'a> {
         let req = GetCapabilitiesRequest::encode(self.version);
         let resp = self.device.send_receive(&req).await?;
         let hdr = SpdmHeader::decode(&resp).ok_or(SpdmError::Protocol)?;
-        if hdr.code != ResponseCode::Capabilities as u8 { return Err(SpdmError::Protocol); }
+        if hdr.code != ResponseCode::Capabilities as u8 {
+            return Err(SpdmError::Protocol);
+        }
 
-        if resp.len() < 12 { return Err(SpdmError::Protocol); }
+        if resp.len() < 12 {
+            return Err(SpdmError::Protocol);
+        }
         let flags = u32::from_le_bytes([resp[8], resp[9], resp[10], resp[11]]);
 
         Ok(SpdmCaps {
@@ -73,7 +85,7 @@ impl<'a> SpdmSession<'a> {
             let req = GetMeasurementsRequest::encode(self.version, index);
             let resp = self.device.send_receive(&req).await?;
             let hdr = SpdmHeader::decode(&resp).ok_or(SpdmError::Protocol)?;
-            
+
             if hdr.code == ResponseCode::Measurements as u8 {
                 results.push(Measurement {
                     index,
@@ -91,10 +103,11 @@ impl<'a> SpdmSession<'a> {
 
 pub mod registry {
     use super::*;
-    use narf_lib::sync::IrqSafeSpinLock;
     use alloc::sync::Arc;
+    use narf_lib::sync::IrqSafeSpinLock;
 
-    static REGISTRY: IrqSafeSpinLock<Vec<Arc<dyn AttestationDevice>>> = IrqSafeSpinLock::new(Vec::new());
+    static REGISTRY: IrqSafeSpinLock<Vec<Arc<dyn AttestationDevice>>> =
+        IrqSafeSpinLock::new(Vec::new());
 
     pub fn register(device: Arc<dyn AttestationDevice>) {
         REGISTRY.lock().push(device);
@@ -123,28 +136,56 @@ mod tests {
         async fn send_receive(&self, request: &[u8]) -> Result<Vec<u8>, SpdmError> {
             let hdr = SpdmHeader::decode(request).ok_or(SpdmError::Protocol)?;
             let mut resp = Vec::new();
-            
+
             match hdr.code {
-                0x84 => { // GET_VERSION
-                    SpdmHeader { version: 0x10, code: 0x04, param1: 0, param2: 0 }.encode(&mut resp);
+                0x84 => {
+                    // GET_VERSION
+                    SpdmHeader {
+                        version: 0x10,
+                        code: 0x04,
+                        param1: 0,
+                        param2: 0,
+                    }
+                    .encode(&mut resp);
                     resp.push(0); // Reserved
                     resp.push(1); // EntryCount
                     resp.extend_from_slice(&0x0012u16.to_le_bytes()); // SPDM 1.2
                 }
-                0xE1 => { // GET_CAPABILITIES
-                    SpdmHeader { version: 0x12, code: 0x61, param1: 0, param2: 0 }.encode(&mut resp);
-                    resp.push(0); resp.push(0); // CTExponent, Reserved
+                0xE1 => {
+                    // GET_CAPABILITIES
+                    SpdmHeader {
+                        version: 0x12,
+                        code: 0x61,
+                        param1: 0,
+                        param2: 0,
+                    }
+                    .encode(&mut resp);
+                    resp.push(0);
+                    resp.push(0); // CTExponent, Reserved
                     resp.extend_from_slice(&0u16.to_le_bytes()); // Reserved
                     resp.extend_from_slice(&0x00000001u32.to_le_bytes()); // Flags
                 }
-                0xE5 => { // GET_MEASUREMENTS
+                0xE5 => {
+                    // GET_MEASUREMENTS
                     if hdr.param2 == 1 {
-                        SpdmHeader { version: 0x12, code: 0x65, param1: 0, param2: 0 }.encode(&mut resp);
+                        SpdmHeader {
+                            version: 0x12,
+                            code: 0x65,
+                            param1: 0,
+                            param2: 0,
+                        }
+                        .encode(&mut resp);
                         resp.push(1); // NumberOfBlocks
                         resp.extend_from_slice(&[0x20, 0, 0]); // Length 32 (u24)
                         resp.extend_from_slice(&[0xAA; 32]); // Dummy measurement
                     } else {
-                        SpdmHeader { version: 0x12, code: 0x7F, param1: 0x01, param2: 0 }.encode(&mut resp); // InvalidRequest
+                        SpdmHeader {
+                            version: 0x12,
+                            code: 0x7F,
+                            param1: 0x01,
+                            param2: 0,
+                        }
+                        .encode(&mut resp); // InvalidRequest
                     }
                 }
                 _ => return Err(SpdmError::Protocol),
@@ -163,7 +204,10 @@ mod tests {
             let mut session = SpdmSession::new(&mock);
             let caps = session.establish().await.expect("establish failed");
             if caps.version == 0x12 {
-                let measurements = session.collect_measurements().await.expect("collect failed");
+                let measurements = session
+                    .collect_measurements()
+                    .await
+                    .expect("collect failed");
                 if measurements.len() == 1 && measurements[0].data[0] == 0xAA {
                     s.store(true, core::sync::atomic::Ordering::SeqCst);
                 }
@@ -171,8 +215,11 @@ mod tests {
         });
 
         narf_scheduler::run_until_empty();
-        if success.load(core::sync::atomic::Ordering::SeqCst) { TestResult::Pass }
-        else { TestResult::Fail("SPDM session flow failed") }
+        if success.load(core::sync::atomic::Ordering::SeqCst) {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("SPDM session flow failed")
+        }
     }
     kernel_test_in!("spdm", smoke_spdm_session_flow);
 }

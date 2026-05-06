@@ -3,9 +3,9 @@
 //! Spec: ACPI 6.5 §10.2 (Control Method Batteries).
 //! Uses the ACPI Embedded Controller (EC) to query battery status.
 
-use alloc::sync::Arc;
-use narf_power::{PowerSource, PowerSourceType, register_source};
 use crate::ec::with_ec;
+use alloc::sync::Arc;
+use narf_power::{register_source, PowerSource, PowerSourceType};
 
 pub struct AcpiBattery {
     id: u8,
@@ -29,14 +29,16 @@ impl PowerSource for AcpiBattery {
             // Placeholder: every laptop has a different EC map.
             // In a real system, we'd look up the offset in the DSDT.
             ec.read_byte(0xE0).unwrap_or(100) // Mock offset
-        }).unwrap_or(100)
+        })
+        .unwrap_or(100)
     }
 
     fn is_charging(&self) -> bool {
         with_ec(|ec| {
             let status = ec.read_byte(0xE1).unwrap_or(0);
             (status & 0x01) != 0
-        }).unwrap_or(false)
+        })
+        .unwrap_or(false)
     }
 
     fn name(&self) -> &'static str {

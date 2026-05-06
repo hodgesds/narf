@@ -84,7 +84,10 @@ impl CapType for FreqHint {
 impl FreqHint {
     pub const MAX: FreqHint = FreqHint(3000);
     pub const MIN: FreqHint = FreqHint(800);
-    #[inline] pub const fn mhz(self) -> u32 { self.0 }
+    #[inline]
+    pub const fn mhz(self) -> u32 {
+        self.0
+    }
 }
 
 // ── C-state ─────────────────────────────────────────────────────────
@@ -120,8 +123,12 @@ pub fn register_cstate(cap: &Cap<Power, Grant>, state: CState) -> Result<(), Pow
     Ok(())
 }
 
-pub fn cstate_count() -> usize { CSTATES.lock().len() }
-pub fn cstates() -> Vec<CState> { CSTATES.lock().clone() }
+pub fn cstate_count() -> usize {
+    CSTATES.lock().len()
+}
+pub fn cstates() -> Vec<CState> {
+    CSTATES.lock().clone()
+}
 
 pub fn select_idle_state() -> Result<CState, PowerError> {
     let t = CSTATES.lock();
@@ -177,22 +184,36 @@ pub trait GovernorPolicy: Send + Sync + 'static {
 #[derive(Copy, Clone, Debug, Default)]
 pub struct Performance;
 impl GovernorPolicy for Performance {
-    fn name(&self) -> &'static str { "performance" }
-    fn select_freq(&self, _load_permille: u16) -> FreqHint { FreqHint::MAX }
+    fn name(&self) -> &'static str {
+        "performance"
+    }
+    fn select_freq(&self, _load_permille: u16) -> FreqHint {
+        FreqHint::MAX
+    }
 }
 
 #[derive(Copy, Clone, Debug, Default)]
 pub struct Powersave;
 impl GovernorPolicy for Powersave {
-    fn name(&self) -> &'static str { "powersave" }
-    fn select_freq(&self, _load_permille: u16) -> FreqHint { FreqHint::MIN }
+    fn name(&self) -> &'static str {
+        "powersave"
+    }
+    fn select_freq(&self, _load_permille: u16) -> FreqHint {
+        FreqHint::MIN
+    }
 }
 
 #[derive(Copy, Clone, Debug, Default)]
 pub struct OnDemand;
 impl GovernorPolicy for OnDemand {
-    fn name(&self) -> &'static str { "ondemand" }
+    fn name(&self) -> &'static str {
+        "ondemand"
+    }
     fn select_freq(&self, load_permille: u16) -> FreqHint {
-        if load_permille > 500 { FreqHint::MAX } else { FreqHint::MIN }
+        if load_permille > 500 {
+            FreqHint::MAX
+        } else {
+            FreqHint::MIN
+        }
     }
 }

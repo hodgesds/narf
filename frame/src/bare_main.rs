@@ -1041,16 +1041,28 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
 
                     // PCR 9: Initramfs.
                     if let Some(r) = info.and_then(|i| i.initramfs) {
-                        if let Err(e) = measure::measure_phys(9, "initramfs", r.start.raw(), r.len).await {
-                            let _ = writeln!(console::Writer, "  measured-boot: PCR 9 extend failed: {:?}", e);
+                        if let Err(e) =
+                            measure::measure_phys(9, "initramfs", r.start.raw(), r.len).await
+                        {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  measured-boot: PCR 9 extend failed: {:?}",
+                                e
+                            );
                         }
                     }
 
                     // PCR 10: Peripheral Firmware (SPDM).
                     let spdm_devices = narf_spdm::registry::list();
                     for device in spdm_devices {
-                        if let Err(e) = measure::measure_device(10, "spdm_device", device.as_ref()).await {
-                             let _ = writeln!(console::Writer, "  measured-boot: SPDM attestation failed: {:?}", e);
+                        if let Err(e) =
+                            measure::measure_device(10, "spdm_device", device.as_ref()).await
+                        {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  measured-boot: SPDM attestation failed: {:?}",
+                                e
+                            );
                         }
                     }
 

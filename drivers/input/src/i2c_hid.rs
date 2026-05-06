@@ -3,13 +3,13 @@
 //! Spec: "HID Over I2C Protocol Specification" (Microsoft).
 //! Supports touchpads and keyboards over I2C/I3C using the HID standard.
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use async_trait::async_trait;
-use narf_i3c::{I3cBus, I3cOp, I3cError};
-use narf_input::{InputEvent, KeyEvent, PointerEvent, KeyCode, push_global};
 use narf_drivers::core::{Driver, DriverEnv, DriverError, DriverFuture};
-use alloc::boxed::Box;
+use narf_i3c::{I3cBus, I3cError, I3cOp};
+use narf_input::{push_global, InputEvent, KeyCode, KeyEvent, PointerEvent};
 
 pub struct I2cHidDriver {
     bus: Arc<dyn I3cBus>,
@@ -19,7 +19,11 @@ pub struct I2cHidDriver {
 
 impl I2cHidDriver {
     pub fn new(bus: Arc<dyn I3cBus>, addr: u8, hid_desc_register: u16) -> Self {
-        Self { bus, addr, hid_desc_register }
+        Self {
+            bus,
+            addr,
+            hid_desc_register,
+        }
     }
 
     async fn read_report(&self) -> Result<Vec<u8>, I3cError> {
