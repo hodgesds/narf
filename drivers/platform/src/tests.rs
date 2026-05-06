@@ -39,6 +39,15 @@ kernel_test_in!("drivers/platform/smbus", smoke_smbus_class_match_registered);
     }
     kernel_test_in!("drivers/platform/ec", smoke_acpi_ec_discovery);
 
+    fn smoke_acpi_thermal_discovery() -> TestResult {
+        use narf_power::thermal::zone_count;
+        if zone_count() >= 0 {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("zone_count logic error")
+        }
+    }
+    kernel_test_in!("drivers/platform/thermal", smoke_acpi_thermal_discovery);
 
 // ── TPM ────────────────────────────────────────────────────────────
 

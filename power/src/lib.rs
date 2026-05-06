@@ -680,6 +680,11 @@ pub fn bootstrap_device_pm_authority() -> Cap<DevicePm, Grant> {
     Cap::<DevicePm, Grant>::bootstrap()
 }
 
+/// Mint a `Cap<Thermal, Grant>`. TCB-only entry path.
+pub fn bootstrap_thermal_authority() -> Cap<Thermal, Grant> {
+    Cap::<Thermal, Grant>::bootstrap()
+}
+
 /// Initialise the power subsystem. Idempotent — safe to call from a
 /// kernel test harness that may have already run once. Registers C0 +
 /// C1 against a freshly-minted Power authority and installs the

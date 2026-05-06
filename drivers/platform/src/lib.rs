@@ -10,10 +10,11 @@
 
 extern crate alloc;
 
-pub mod battery;
-pub mod ec;
 pub mod smbus;
 pub mod tpm;
+pub mod ec;
+pub mod battery;
+pub mod thermal;
 
 mod tests;
 
@@ -36,4 +37,9 @@ pub fn register_initcalls() {
         battery::init();
         InitResult::Ok
     });
+    narf_init::register(Stage::Subsys, "acpi-thermal", || {
+        thermal::init();
+        InitResult::Ok
+    });
 }
+

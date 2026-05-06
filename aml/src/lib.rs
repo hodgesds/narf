@@ -251,6 +251,14 @@ pub fn for_each_device<F: FnMut(&AmlNode)>(mut f: F) {
     }
 }
 
+/// Iterate every node of a specific kind, calling `f`.
+pub fn for_each_node_of_kind<F: FnMut(&AmlNode)>(kind: NodeKind, mut f: F) {
+    let g = NAMESPACE.lock();
+    for n in g.nodes.iter().filter(|n| n.kind == kind) {
+        f(n);
+    }
+}
+
 /// Find the first Device node whose `_HID` property matches `hid`.
 pub fn find_device_by_hid(hid: &str) -> Option<AmlNode> {
     let g = NAMESPACE.lock();
