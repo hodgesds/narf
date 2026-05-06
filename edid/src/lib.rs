@@ -37,6 +37,7 @@
 
 extern crate alloc;
 
+pub mod cta861;
 mod tests;
 
 use alloc::string::String;

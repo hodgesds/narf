@@ -190,3 +190,184 @@ fn smoke_edid_compute_checksum_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("edid", smoke_edid_compute_checksum_round_trip);
+
+// ── CTA-861 extension-block smokes ─────────────────────────────────
+
+fn make_cta_block(fill: impl FnOnce(&mut [u8; 128])) -> [u8; 128] {
+    let mut b = [0u8; 128];
+    b[0] = crate::cta861::CTA_TAG;
+    b[1] = 3; // revision
+    fill(&mut b);
+    b[127] = compute_checksum(&b);
+    b
+}
+
+fn smoke_cta_extension_tag_required() -> TestResult {
+    let mut b = [0u8; 128];
+    // wrong tag
+    b[0] = 0x40;
+    b[127] = compute_checksum(&b);
+    match crate::cta861::CtaExtension::parse(&b) {
+        Err(EdidError::BadHeader) => TestResult::Pass,
+        _ => TestResult::Fail("non-0x02 tag must be rejected"),
+    }
+}
+kernel_test_in!("edid/cta861", smoke_cta_extension_tag_required);
+
+fn smoke_cta_caps_decode() -> TestResult {
+    use crate::cta861::{CtaCaps, CtaExtension};
+    let b = make_cta_block(|b| {
+        b[2] = 4; // dtd_offset = 4 → empty DBC, no DTDs
+        b[3] = 0xC0 | 1; // UNDERSCAN | BASIC_AUDIO + 1 native DTD count
+    });
+    let ext = CtaExtension::parse(&b).expect("parse");
+    if !ext.caps.contains(CtaCaps::UNDERSCAN) {
+        return TestResult::Fail("UNDERSCAN flag should be set");
+    }
+    if !ext.caps.contains(CtaCaps::BASIC_AUDIO) {
+        return TestResult::Fail("BASIC_AUDIO flag should be set");
+    }
+    if ext.native_dtd_count != 1 {
+        return TestResult::Fail("native dtd count low nibble = 1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("edid/cta861", smoke_cta_caps_decode);
+
+fn smoke_cta_video_data_block_lists_vics() -> TestResult {
+    use crate::cta861::{CtaExtension, DataBlock};
+    // Place a VDB (tag 2) with three SVDs at offset 4. Header byte =
+    // (2<<5) | 3 = 0x43. SVDs: 16 (1080p60, native), 4 (720p60), 1 (640x480).
+    let b = make_cta_block(|b| {
+        b[2] = 8; // dtd_offset: 4 + (1 header + 3 payload) = 8
+        b[3] = 0;
+        b[4] = (2 << 5) | 3; // tag=2 (Video), len=3
+        b[5] = 0x80 | 16; // VIC 16 native
+        b[6] = 4;
+        b[7] = 1;
+    });
+    let ext = CtaExtension::parse(&b).expect("parse");
+    assert_eq!(ext.data_blocks.len(), 1);
+    match &ext.data_blocks[0] {
+        DataBlock::Video(svds) => {
+            if svds.len() != 3 {
+                return TestResult::Fail("expected 3 SVDs");
+            }
+            if svds[0].vic != 16 || !svds[0].native {
+                return TestResult::Fail("first SVD should be VIC 16, native");
+            }
+            if svds[1].vic != 4 || svds[1].native {
+                return TestResult::Fail("second SVD wrong");
+            }
+        }
+        _ => return TestResult::Fail("expected Video data block"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("edid/cta861", smoke_cta_video_data_block_lists_vics);
+
+fn smoke_cta_audio_data_block_decodes_lpcm() -> TestResult {
+    use crate::cta861::{CtaExtension, DataBlock};
+    // ADB (tag 1) with one 3-byte SAD: format=1 (LPCM), max_ch=2-1=1,
+    // sample rates bitmap = 0x07 (32/44.1/48 kHz), bit-depths = 0x01 (16-bit).
+    //   byte 0: (format << 3) | (chan-1) = (1<<3) | 1 = 0x09
+    let b = make_cta_block(|b| {
+        b[2] = 8; // dtd_offset = 4 + 1 header + 3 = 8
+        b[3] = 0;
+        b[4] = (1 << 5) | 3; // tag=1 (Audio), len=3
+        b[5] = 0x09;
+        b[6] = 0x07;
+        b[7] = 0x01;
+    });
+    let ext = CtaExtension::parse(&b).expect("parse");
+    match &ext.data_blocks[0] {
+        DataBlock::Audio(sads) => {
+            if sads.len() != 1 {
+                return TestResult::Fail("expected 1 SAD");
+            }
+            if sads[0].format != 1 {
+                return TestResult::Fail("LPCM format = 1");
+            }
+            if sads[0].max_channels != 2 {
+                return TestResult::Fail("max_channels = 2 (encoded as ch-1)");
+            }
+            if sads[0].sample_rates != 0x07 {
+                return TestResult::Fail("sample-rates bitmap should round-trip");
+            }
+        }
+        _ => return TestResult::Fail("expected Audio data block"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("edid/cta861", smoke_cta_audio_data_block_decodes_lpcm);
+
+fn smoke_cta_hdmi_vsdb_extracts_phys_addr() -> TestResult {
+    use crate::cta861::{CtaExtension, HDMI_LICENSING_OUI};
+    // VSDB (tag 3), payload: OUI=0x000C03 (LE: 03 0C 00) + phys_addr 0x1000.
+    let b = make_cta_block(|b| {
+        b[2] = 10; // dtd_offset = 4 + 1 header + 5 payload = 10
+        b[3] = 0;
+        b[4] = (3 << 5) | 5; // tag=3, len=5
+        b[5] = HDMI_LICENSING_OUI[0];
+        b[6] = HDMI_LICENSING_OUI[1];
+        b[7] = HDMI_LICENSING_OUI[2];
+        b[8] = 0x10; // phys addr hi
+        b[9] = 0x00; // phys addr lo
+    });
+    let ext = CtaExtension::parse(&b).expect("parse");
+    let v = ext.hdmi_vsdb().expect("HDMI VSDB present");
+    if v.cec_phys_addr != 0x1000 {
+        return TestResult::Fail("CEC phys addr should round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("edid/cta861", smoke_cta_hdmi_vsdb_extracts_phys_addr);
+
+fn smoke_cta_extended_tag_block() -> TestResult {
+    use crate::cta861::{CtaExtension, DataBlock};
+    // Extended-tag block (tag 7). Length 2 = ext-tag byte + 1 payload byte.
+    let b = make_cta_block(|b| {
+        b[2] = 7; // dtd_offset
+        b[3] = 0;
+        b[4] = (7 << 5) | 2; // tag=7, len=2
+        b[5] = 0x06; // extended tag = HDR Static Metadata Data Block
+        b[6] = 0xAA; // payload byte
+    });
+    let ext = CtaExtension::parse(&b).expect("parse");
+    match &ext.data_blocks[0] {
+        DataBlock::Extended { ext_tag, payload } => {
+            if *ext_tag != 0x06 {
+                return TestResult::Fail("extended tag byte mismatch");
+            }
+            if payload != &[0xAA] {
+                return TestResult::Fail("extended block payload mismatch");
+            }
+        }
+        _ => return TestResult::Fail("expected Extended data block"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("edid/cta861", smoke_cta_extended_tag_block);
+
+fn smoke_cta_speaker_allocation_block() -> TestResult {
+    use crate::cta861::{CtaExtension, DataBlock, SpeakerAllocation};
+    let b = make_cta_block(|b| {
+        b[2] = 8; // dtd_offset
+        b[3] = 0;
+        b[4] = (4 << 5) | 3; // tag=4 (Speaker), len=3
+        b[5] = SpeakerAllocation::FL_FR | SpeakerAllocation::LFE | SpeakerAllocation::FC;
+        b[6] = 0;
+        b[7] = 0;
+    });
+    let ext = CtaExtension::parse(&b).expect("parse");
+    match &ext.data_blocks[0] {
+        DataBlock::Speaker(s) => {
+            if s.0 & SpeakerAllocation::FC == 0 {
+                return TestResult::Fail("FC bit should be present");
+            }
+        }
+        _ => return TestResult::Fail("expected Speaker data block"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("edid/cta861", smoke_cta_speaker_allocation_block);

@@ -16,6 +16,7 @@
 extern crate alloc;
 
 pub mod ahci;
+pub mod sd_proto;
 pub mod sdhci;
 
 mod tests;

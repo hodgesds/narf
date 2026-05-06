@@ -285,3 +285,138 @@ fn smoke_sdhci_register_class_match() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/storage/sdhci", smoke_sdhci_register_class_match);
+
+// ── SD response/CSD/CID decoder smokes ─────────────────────────────
+
+fn smoke_sd_r1_status_error_mask() -> TestResult {
+    use crate::sd_proto::R1Status;
+    let s = R1Status { raw: R1Status::ERR_ILLEGAL_CMD | (5 << 9) | (1 << 8) };
+    if !s.has_error() {
+        return TestResult::Fail("ILLEGAL_CMD should be flagged");
+    }
+    if s.current_state() != 5 {
+        return TestResult::Fail("current_state extracts bits 12..9");
+    }
+    if !s.ready_for_data() {
+        return TestResult::Fail("ready_for_data is bit 8");
+    }
+    let clean = R1Status { raw: 1 << 8 };
+    if clean.has_error() {
+        return TestResult::Fail("clean status must not flag error");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/sd-proto", smoke_sd_r1_status_error_mask);
+
+fn smoke_sd_r6_splits_rca_and_status() -> TestResult {
+    use crate::sd_proto::R6;
+    let r = R6::parse(0xCAFE_1234);
+    if r.rca != 0xCAFE {
+        return TestResult::Fail("R6 RCA should be high 16 bits");
+    }
+    if r.status != 0x1234 {
+        return TestResult::Fail("R6 status should be low 16 bits");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/sd-proto", smoke_sd_r6_splits_rca_and_status);
+
+fn smoke_sd_r7_check_pattern() -> TestResult {
+    use crate::sd_proto::R7;
+    let r = R7::parse(0x0000_01AA);
+    if r.voltage != 1 {
+        return TestResult::Fail("voltage nibble at bits 11..8 should be 1");
+    }
+    if !r.matches_check(0xAA) {
+        return TestResult::Fail("check pattern 0xAA should match");
+    }
+    if r.matches_check(0x55) {
+        return TestResult::Fail("mismatched pattern shouldn't match");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/sd-proto", smoke_sd_r7_check_pattern);
+
+fn smoke_sd_csd_v2_extracts_capacity() -> TestResult {
+    use crate::sd_proto::Csd;
+    // Build a CSD v2.0 image where C_SIZE = 0x1DFFF (122879) →
+    // capacity = (122879+1) × 512 KiB = 60 GiB. Layout: structure
+    // bits at top of byte 0, C_SIZE at bits 69..48 (i.e. byte 7 lo
+    // 6 bits | byte 8 | byte 9 of the *logical* 15-byte CSD).
+    //
+    // The shifted convention: r[3] high byte = logical zero;
+    // logical bytes start at byte 1 of bytes[0..16].
+    let mut bytes = [0u8; 16];
+    bytes[1] = 0x40; // structure = 1 (CSD v2.0)
+    bytes[8] = 0x01; // bits[69..64] = top of c_size; this gives bit 16 of c_size
+    bytes[9] = 0xDF; // c_size middle
+    bytes[10] = 0xFF; // c_size low
+    let r = [
+        u32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
+        u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+        u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+        u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+    ];
+    let csd = Csd::parse_shifted(&r).expect("parse csd");
+    if csd.structure_version != 1 {
+        return TestResult::Fail("CSD structure should decode to v2.0");
+    }
+    if csd.read_block_len != 512 || csd.write_block_len != 512 {
+        return TestResult::Fail("CSD v2 fixes block lengths to 512");
+    }
+    let expected = (122_880u64) * 512 * 1024;
+    if csd.capacity_bytes != expected {
+        return TestResult::Fail("CSD v2 capacity formula mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/sd-proto", smoke_sd_csd_v2_extracts_capacity);
+
+fn smoke_sd_cid_decodes_manufacturer_and_date() -> TestResult {
+    use crate::sd_proto::Cid;
+    // Compose a logical CID (15 bytes after the CRC strip):
+    //   manufacturer 0x03 (SanDisk-equivalent), OEM "SD",
+    //   product name "narf!", revision 0x10, serial 0xDEADBEEF,
+    //   manufacture date: year-offset 0x18 (2024), month 0x09.
+    let mut logical = [0u8; 15];
+    logical[0] = 0x03;
+    logical[1] = b'S';
+    logical[2] = b'D';
+    logical[3..8].copy_from_slice(b"narf!");
+    logical[8] = 0x10;
+    logical[9..13].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
+    // MDT = year:8 | month:4 in top 12 bits of a 16-bit field at logical[13..15].
+    let mdt: u16 = (0x18u16 << 4) | 0x09;
+    logical[13..15].copy_from_slice(&mdt.to_be_bytes());
+
+    // Build the shifted [u32;4] the controller would deliver.
+    let mut bytes = [0u8; 16];
+    bytes[1..16].copy_from_slice(&logical);
+    let r = [
+        u32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
+        u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+        u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+        u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+    ];
+    let cid = Cid::parse_shifted(&r);
+    if cid.manufacturer_id != 0x03 {
+        return TestResult::Fail("manufacturer ID mismatch");
+    }
+    if cid.oem_id != [b'S', b'D'] {
+        return TestResult::Fail("OEM ID mismatch");
+    }
+    if cid.product_name != *b"narf!" {
+        return TestResult::Fail("product name mismatch");
+    }
+    if cid.product_revision != 0x10 {
+        return TestResult::Fail("product revision mismatch");
+    }
+    if cid.product_serial != 0xDEAD_BEEF {
+        return TestResult::Fail("serial number mismatch");
+    }
+    if cid.manufacture_year != 2024 || cid.manufacture_month != 9 {
+        return TestResult::Fail("MDT year/month decode wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/storage/sd-proto", smoke_sd_cid_decodes_manufacturer_and_date);

@@ -47,6 +47,32 @@ Bluetooth subsystem source material was consulted at any point.**
   Connections pairing), §2.3.5.1 (pairing-method selection table 2.8),
   §2.2.5 (AES-CMAC), §2.2.6 (DHKey), §2.2.7 (f5 LTK derivation).
 
+### RFCOMM
+
+- **Bluetooth Core Specification 5.3, Vol 3 Part B (RFCOMM)** —
+  Bluetooth SIG. §1 framing model, §2 multiplexer control, §5.1.1
+  address byte, §5.1.2 control byte (SABM/UA/DM/DISC/UIH + P/F),
+  §5.1.3 EA-coded length indicator, §5.1.4 FCS coverage, §5.4 DLCI
+  ↔ server-channel mapping.
+- **ETSI TS 07.10** — the underlying multiplexed-serial protocol that
+  RFCOMM adapts. Public ETSI document; only the byte layout is
+  consumed.
+
+### HOGP (HID over GATT)
+
+- **HID over GATT Profile Specification, version 1.0** — Bluetooth SIG.
+  Adopted profile; defines the HID Service (0x1812) shape: HID
+  Information (0x2A4A), Report Map (0x2A4B), HID Control Point
+  (0x2A4C), Report (0x2A4D) + Report Reference descriptor (0x2908),
+  Protocol Mode (0x2A4E), Boot Keyboard Input/Output Report (0x2A22 /
+  0x2A32), Boot Mouse Input Report (0x2A33).
+- **HID Service Specification, version 1.0** — Bluetooth SIG.
+  §3.1 HID Information field layout, §3.4 Protocol Mode values,
+  §3.6 Control Point command bytes, §3.7.1 Report Reference fields.
+- **USB-IF Device Class Definition for Human Interface Devices (HID),
+  v1.11** — referenced for the boot-protocol report layouts (§B.1
+  keyboard, §B.2 mouse) reused on BLE.
+
 ### USB transport class
 
 - **USB Class Definitions for Wireless Controllers, Revision 1.0** —
@@ -83,6 +109,19 @@ Bluetooth subsystem source material was consulted at any point.**
   Information / Exchange MTU per ATT §3.4. Convenience builders
   `add_primary_service` / `add_characteristic` emit the canonical
   Vol 3 Part G declaration shape.
+- **RFCOMM** (`rfcomm`): wire-frame codec for SABM/UA/DM/DISC/UIH
+  with both 1-byte and 2-byte EA-coded length indicators, FCS-8 over
+  the spec-mandated coverage (header for control frames, address+
+  control only for UIH), and a single-DLC initiator state machine
+  (Closed → Connecting → Open → Disconnecting). Server-channel ↔ DLCI
+  mapping kept as plain const values.
+- **HOGP** (`hogp`): HID-over-GATT profile builder. Composes the
+  mandatory HID Service layout (HID Information, Report Map, HID
+  Control Point + N Reports each with a Report Reference descriptor
+  and CCCD when notify is requested), plus the optional Protocol
+  Mode + Boot Keyboard / Boot Mouse Reports for hosts that fall back
+  to boot protocol. Boot-report encoders for the canonical 8-byte
+  keyboard and 3-byte mouse layouts.
 
 ### Out of scope (deliberate)
 - GATT, SMP, SDP, RFCOMM — sit on top of L2CAP+ATT and land in

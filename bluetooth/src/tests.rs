@@ -1126,3 +1126,256 @@ fn smoke_transport_registry_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bluetooth/transport", smoke_transport_registry_round_trip);
+
+// ── HOGP smokes ────────────────────────────────────────────────────
+
+fn smoke_hogp_hid_information_round_trip() -> TestResult {
+    use crate::hogp::{HidInformation, HID_INFO_FLAG_NORMALLY_CONNECTABLE};
+    let info = HidInformation {
+        bcd_hid: 0x0111,
+        country_code: 0,
+        flags: HID_INFO_FLAG_NORMALLY_CONNECTABLE,
+    };
+    let bytes = info.encode();
+    if bytes != [0x11, 0x01, 0x00, 0x02] {
+        return TestResult::Fail("HID Information LE encoding wrong");
+    }
+    let back = HidInformation::decode(&bytes);
+    if back != info {
+        return TestResult::Fail("HidInformation round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/hogp", smoke_hogp_hid_information_round_trip);
+
+fn smoke_hogp_report_reference_layout() -> TestResult {
+    use crate::hogp::{report_reference, ReportType};
+    let buf = report_reference(7, ReportType::Input);
+    if buf != [7, 1] {
+        return TestResult::Fail("Report Reference desc must be (id, type=1)");
+    }
+    let buf2 = report_reference(2, ReportType::Feature);
+    if buf2 != [2, 3] {
+        return TestResult::Fail("Feature report type byte should be 0x03");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/hogp", smoke_hogp_report_reference_layout);
+
+fn smoke_hogp_builder_minimal_layout() -> TestResult {
+    use crate::gatt::Uuid;
+    use crate::gatt_server::AttributeDatabase;
+    use crate::hogp::{HidInformation, HidServiceBuilder, UUID_HID_INFORMATION,
+        UUID_HID_CONTROL_POINT, UUID_REPORT_MAP};
+    let mut db = AttributeDatabase::new();
+    let info = HidInformation { bcd_hid: 0x0111, country_code: 0, flags: 0 };
+    let report_map: Vec<u8> = vec![0x05, 0x01, 0x09, 0x06, 0xC0]; // bogus stub bytes
+    let h = HidServiceBuilder::new(info, report_map.clone()).build(&mut db);
+    if h.service == 0 {
+        return TestResult::Fail("service handle should be assigned");
+    }
+    // Exactly four attrs: service decl, info char decl, info value,
+    // map decl, map value, ctrl decl, ctrl value = 7 total.
+    if db.attrs().len() != 7 {
+        return TestResult::Fail("minimal HID service should yield 7 attrs");
+    }
+    // info value handle should hold the encoded HidInformation.
+    let info_attr = db.attr_by_handle(h.hid_information_value).expect("info attr");
+    if info_attr.value != [0x11, 0x01, 0x00, 0x00] {
+        return TestResult::Fail("info value not encoded into attribute");
+    }
+    let _ = info_attr.uuid; // ensure read path compiles
+    let _ = Uuid::U16(UUID_HID_INFORMATION);
+    let _ = UUID_REPORT_MAP;
+    let _ = UUID_HID_CONTROL_POINT;
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/hogp", smoke_hogp_builder_minimal_layout);
+
+fn smoke_hogp_builder_input_report_has_cccd() -> TestResult {
+    use crate::gatt::CHAR_PROP_NOTIFY;
+    use crate::gatt::CHAR_PROP_READ;
+    use crate::gatt_server::AttributeDatabase;
+    use crate::hogp::{
+        HidInformation, HidServiceBuilder, ReportEntry, ReportType,
+        UUID_REPORT_REFERENCE,
+    };
+    let mut db = AttributeDatabase::new();
+    let h = HidServiceBuilder::new(HidInformation { bcd_hid: 0x0111, country_code: 0, flags: 0 }, vec![0xC0])
+        .add_report(ReportEntry {
+            report_id: 1,
+            report_type: ReportType::Input,
+            properties: CHAR_PROP_READ | CHAR_PROP_NOTIFY,
+            initial_value: vec![0; 8],
+        })
+        .build(&mut db);
+    if h.reports.len() != 1 {
+        return TestResult::Fail("expected 1 report");
+    }
+    let rep = &h.reports[0];
+    if rep.cccd.is_none() {
+        return TestResult::Fail("input report (notify) must have CCCD");
+    }
+    let rr = db.attr_by_handle(rep.report_reference).expect("rr attr");
+    if rr.value != vec![1u8, ReportType::Input as u8] {
+        return TestResult::Fail("Report Reference value mismatch");
+    }
+    let _ = UUID_REPORT_REFERENCE;
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/hogp", smoke_hogp_builder_input_report_has_cccd);
+
+fn smoke_hogp_boot_keyboard_report_round_trip() -> TestResult {
+    use crate::hogp::BootKeyboardReport;
+    // Modifier 0x02 (LShift), keycodes 0x04 ('a'), rest empty.
+    let r = BootKeyboardReport { modifiers: 0x02, keycodes: [0x04, 0, 0, 0, 0, 0] };
+    let bytes = r.encode();
+    if bytes[0] != 0x02 || bytes[1] != 0x00 || bytes[2] != 0x04 {
+        return TestResult::Fail("boot keyboard layout wrong");
+    }
+    if bytes.len() != 8 {
+        return TestResult::Fail("boot keyboard report must be 8 bytes");
+    }
+    let back = BootKeyboardReport::decode(&bytes);
+    if back != r {
+        return TestResult::Fail("boot keyboard round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/hogp", smoke_hogp_boot_keyboard_report_round_trip);
+
+fn smoke_hogp_boot_mouse_signed_displacement() -> TestResult {
+    use crate::hogp::BootMouseReport;
+    let r = BootMouseReport { buttons: 0x01, dx: -3, dy: 5 };
+    let bytes = r.encode();
+    // -3 as i8 -> 0xFD as u8
+    if bytes != [0x01, 0xFD, 0x05] {
+        return TestResult::Fail("boot mouse encode mismatch");
+    }
+    let back = BootMouseReport::decode(&bytes);
+    if back != r {
+        return TestResult::Fail("boot mouse round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/hogp", smoke_hogp_boot_mouse_signed_displacement);
+
+// ── RFCOMM smokes ──────────────────────────────────────────────────
+
+fn smoke_rfcomm_address_byte_round_trip() -> TestResult {
+    use crate::rfcomm::Frame;
+    let b = Frame::address_byte(7, true);
+    // EA(1) | CR(1) | DLCI=7 (<<2) → 0x01 | 0x02 | 0x1C = 0x1F
+    if b != 0x1F {
+        return TestResult::Fail("address byte encoding wrong");
+    }
+    let (dlci, cr) = Frame::parse_address(b);
+    if dlci != 7 || !cr {
+        return TestResult::Fail("address byte decode wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/rfcomm", smoke_rfcomm_address_byte_round_trip);
+
+fn smoke_rfcomm_sabm_round_trip() -> TestResult {
+    use crate::rfcomm::Frame;
+    let f = Frame::sabm(2, true);
+    let bytes = f.encode();
+    let (back, n) = Frame::decode(&bytes).expect("decode");
+    if n != bytes.len() {
+        return TestResult::Fail("decode should consume entire frame");
+    }
+    if back != f {
+        return TestResult::Fail("SABM frame round-trip mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/rfcomm", smoke_rfcomm_sabm_round_trip);
+
+fn smoke_rfcomm_uih_short_length_round_trip() -> TestResult {
+    use crate::rfcomm::Frame;
+    let info: Vec<u8> = (0..40u8).collect();
+    let f = Frame::uih(3, true, info.clone());
+    let bytes = f.encode();
+    let (back, _) = Frame::decode(&bytes).expect("decode");
+    if back.info != info {
+        return TestResult::Fail("UIH info round-trip mismatch");
+    }
+    if back.frame_type != crate::rfcomm::FRAME_UIH {
+        return TestResult::Fail("UIH frame type lost");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/rfcomm", smoke_rfcomm_uih_short_length_round_trip);
+
+fn smoke_rfcomm_uih_long_length_round_trip() -> TestResult {
+    use crate::rfcomm::Frame;
+    // Length > 127 → 2-byte length indicator.
+    let info: Vec<u8> = (0..200u16).map(|x| x as u8).collect();
+    let f = Frame::uih(5, true, info.clone());
+    let bytes = f.encode();
+    let (back, _) = Frame::decode(&bytes).expect("decode");
+    if back.info.len() != 200 {
+        return TestResult::Fail("long UIH length should round-trip");
+    }
+    if back.info != info {
+        return TestResult::Fail("UIH 2-byte-length info mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/rfcomm", smoke_rfcomm_uih_long_length_round_trip);
+
+fn smoke_rfcomm_bad_fcs_rejected() -> TestResult {
+    use crate::rfcomm::{Frame, RfcommError};
+    let mut bytes = Frame::sabm(1, true).encode();
+    let last = bytes.len() - 1;
+    bytes[last] = bytes[last].wrapping_add(1);
+    match Frame::decode(&bytes) {
+        Err(RfcommError::BadFcs) => TestResult::Pass,
+        _ => TestResult::Fail("tampered FCS must be rejected"),
+    }
+}
+kernel_test_in!("bluetooth/rfcomm", smoke_rfcomm_bad_fcs_rejected);
+
+fn smoke_rfcomm_dlc_state_machine_open_then_send() -> TestResult {
+    use crate::rfcomm::{Dlc, DlcState, Frame};
+    let mut dlc = Dlc::new(2);
+    let connect = dlc.connect();
+    if dlc.state != DlcState::Connecting {
+        return TestResult::Fail("connect should move to Connecting");
+    }
+    if connect.frame_type != crate::rfcomm::FRAME_SABM {
+        return TestResult::Fail("connect should emit SABM");
+    }
+
+    // Receive UA → Open.
+    let ua = Frame::ua(2, false);
+    dlc.feed(&ua);
+    if dlc.state != DlcState::Open {
+        return TestResult::Fail("UA should open the DLC");
+    }
+
+    // Send a UIH; receive a UIH echo.
+    let tx = dlc.send(alloc::vec![1, 2, 3]).expect("send open");
+    if tx.frame_type != crate::rfcomm::FRAME_UIH {
+        return TestResult::Fail("send should emit UIH");
+    }
+    let rx = Frame::uih(2, false, alloc::vec![9, 9, 9]);
+    let info = dlc.feed(&rx).expect("UIH info surfaced");
+    if info != alloc::vec![9, 9, 9] {
+        return TestResult::Fail("DLC.feed should expose UIH payload");
+    }
+
+    // Disconnect → DM/UA cycle.
+    let disc = dlc.disconnect();
+    if disc.frame_type != crate::rfcomm::FRAME_DISC {
+        return TestResult::Fail("disconnect should emit DISC");
+    }
+    let ua2 = Frame::ua(2, false);
+    dlc.feed(&ua2);
+    if dlc.state != DlcState::Closed {
+        return TestResult::Fail("UA after DISC should close");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/rfcomm", smoke_rfcomm_dlc_state_machine_open_then_send);
