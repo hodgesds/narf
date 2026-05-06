@@ -460,3 +460,150 @@ fn smoke_mi_subsystem_health_parse() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvme/mi", smoke_mi_subsystem_health_parse);
+
+// ── NVMe admin-command builder smokes ──────────────────────────────
+
+fn smoke_admin_sqe_cdw0_packs_opcode_and_cid() -> TestResult {
+    use crate::admin::{AdminSqe, OPC_IDENTIFY};
+    let mut sqe = AdminSqe::new(OPC_IDENTIFY);
+    sqe.cid = 0x1234;
+    let cdw0 = sqe.cdw0();
+    if (cdw0 & 0xFF) != OPC_IDENTIFY as u32 {
+        return TestResult::Fail("opcode lives in CDW0[7:0]");
+    }
+    if (cdw0 >> 16) != 0x1234 {
+        return TestResult::Fail("CID lives in CDW0[31:16]");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme/admin", smoke_admin_sqe_cdw0_packs_opcode_and_cid);
+
+fn smoke_admin_sqe_encode_is_64_bytes() -> TestResult {
+    use crate::admin::AdminSqe;
+    let sqe = AdminSqe::new(0x06);
+    let bytes = sqe.encode();
+    if bytes.len() != 64 {
+        return TestResult::Fail("SQE wire form is 64 bytes per Base 2.0c §3.3.3");
+    }
+    // CDW0 LE byte 0 should equal opcode 0x06.
+    if bytes[0] != 0x06 {
+        return TestResult::Fail("CDW0 LE byte 0 should carry opcode");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme/admin", smoke_admin_sqe_encode_is_64_bytes);
+
+fn smoke_admin_format_nvm_cdw10_layout() -> TestResult {
+    use crate::admin::{format_nvm, OPC_FORMAT_NVM, SES_CRYPTO_ERASE};
+    let sqe = format_nvm(7, 1, 0x03, SES_CRYPTO_ERASE);
+    if sqe.opcode != OPC_FORMAT_NVM {
+        return TestResult::Fail("opcode = 0x80 for Format NVM");
+    }
+    if sqe.nsid != 1 {
+        return TestResult::Fail("NSID lost");
+    }
+    // CDW10[3:0] = LBAF, CDW10[11:9] = SES.
+    if (sqe.cdw10 & 0x0F) != 0x03 {
+        return TestResult::Fail("LBAF should be in CDW10 low nibble");
+    }
+    if ((sqe.cdw10 >> 9) & 0x07) != SES_CRYPTO_ERASE as u32 {
+        return TestResult::Fail("SES should be at CDW10 bits 11..9");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme/admin", smoke_admin_format_nvm_cdw10_layout);
+
+fn smoke_admin_sanitize_block_erase_layout() -> TestResult {
+    use crate::admin::{sanitize, OPC_SANITIZE, SANACT_BLOCK_ERASE};
+    let sqe = sanitize(11, SANACT_BLOCK_ERASE, true, 0, false, 0xDEAD_BEEF);
+    if sqe.opcode != OPC_SANITIZE {
+        return TestResult::Fail("opcode = 0x84 for Sanitize");
+    }
+    if (sqe.cdw10 & 0x07) != SANACT_BLOCK_ERASE as u32 {
+        return TestResult::Fail("SANACT lives in CDW10[2:0]");
+    }
+    if (sqe.cdw10 & (1 << 3)) == 0 {
+        return TestResult::Fail("AUSE bit should be set");
+    }
+    if sqe.cdw11 != 0xDEAD_BEEF {
+        return TestResult::Fail("overwrite pattern goes in CDW11");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme/admin", smoke_admin_sanitize_block_erase_layout);
+
+fn smoke_admin_get_log_page_smart_layout() -> TestResult {
+    use crate::admin::{get_smart_log, LID_SMART_HEALTH, OPC_GET_LOG_PAGE};
+    let sqe = get_smart_log(2, 0xCAFE_F000_0000_0000);
+    if sqe.opcode != OPC_GET_LOG_PAGE {
+        return TestResult::Fail("opcode = 0x02 for Get Log Page");
+    }
+    if sqe.nsid != 0xFFFF_FFFF {
+        return TestResult::Fail("SMART log uses controller-wide NSID 0xFFFF_FFFF");
+    }
+    // CDW10[7:0] = LID, CDW10[31:16] = NUMDL.
+    if (sqe.cdw10 & 0xFF) != LID_SMART_HEALTH as u32 {
+        return TestResult::Fail("LID should be in CDW10 low byte");
+    }
+    if (sqe.cdw10 >> 16) != 127 {
+        return TestResult::Fail("NUMDL should encode 512-byte transfer (numd=127)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme/admin", smoke_admin_get_log_page_smart_layout);
+
+fn smoke_admin_set_features_number_of_queues() -> TestResult {
+    use crate::admin::{set_features_number_of_queues, FID_NUMBER_OF_QUEUES, OPC_SET_FEATURES};
+    let sqe = set_features_number_of_queues(0, 7, 5);
+    if sqe.opcode != OPC_SET_FEATURES {
+        return TestResult::Fail("opcode = 0x09 for Set Features");
+    }
+    if (sqe.cdw10 & 0xFF) != FID_NUMBER_OF_QUEUES as u32 {
+        return TestResult::Fail("FID = 0x07");
+    }
+    if (sqe.cdw11 & 0xFFFF) != 7 {
+        return TestResult::Fail("NSQR lives in CDW11[15:0]");
+    }
+    if (sqe.cdw11 >> 16) != 5 {
+        return TestResult::Fail("NCQR lives in CDW11[31:16]");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme/admin", smoke_admin_set_features_number_of_queues);
+
+fn smoke_admin_smart_log_round_trip() -> TestResult {
+    use crate::admin::{encode_smart_log, SmartLog};
+    let s = SmartLog {
+        critical_warning: 0x02,
+        composite_temperature_k: 313,
+        available_spare: 100,
+        available_spare_threshold: 10,
+        percentage_used: 5,
+        power_on_hours: 1234,
+        unsafe_shutdowns: 7,
+        media_errors: 0,
+    };
+    let buf = encode_smart_log(s);
+    let back = SmartLog::parse(&buf).expect("parse");
+    if back != s {
+        return TestResult::Fail("SMART log round-trip mismatch");
+    }
+    if back.composite_temperature_c() != 313 - 273 {
+        return TestResult::Fail("Kelvin → Celsius conversion wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme/admin", smoke_admin_smart_log_round_trip);
+
+fn smoke_admin_set_features_boot_partition_wp_layout() -> TestResult {
+    use crate::admin::{set_features_boot_partition_wp, FID_BOOT_PARTITION_WRITE_PROTECTION};
+    let sqe = set_features_boot_partition_wp(0, 1, 0x02);
+    if (sqe.cdw10 & 0xFF) != FID_BOOT_PARTITION_WRITE_PROTECTION as u32 {
+        return TestResult::Fail("FID = 0x1A for Boot Partition WP");
+    }
+    if (sqe.cdw11 & 0x07) != 0x02 {
+        return TestResult::Fail("BPWPS lives in CDW11[2:0]");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme/admin", smoke_admin_set_features_boot_partition_wp_layout);

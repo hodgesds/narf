@@ -398,6 +398,8 @@ pub fn register_initcalls() {
     });
 }
 
+pub mod rmi4;
+
 // Per-crate smoke tests register against `narf-kernel-test` and
 // land in the same `narf.tests` ELF section as the rest of the
 // suite.

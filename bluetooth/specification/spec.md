@@ -47,6 +47,18 @@ Bluetooth subsystem source material was consulted at any point.**
   Connections pairing), §2.3.5.1 (pairing-method selection table 2.8),
   §2.2.5 (AES-CMAC), §2.2.6 (DHKey), §2.2.7 (f5 LTK derivation).
 
+### HFP (Hands-Free Profile)
+
+- **Hands-Free Profile, Version 1.8** — Bluetooth SIG. Public adopted
+  profile. §4.2 (service-level connection establishment), §4.34 (BRSF
+  feature bit table), §4.4 (CIND / CMER indicator negotiation),
+  §4.6 (in-band ringtone), §4.13 (call list / CLCC), table 5.1 (HF +
+  AG feature bit columns).
+- **ITU-T Recommendation V.250** — public AT command syntax baseline
+  (lexer + line termination + basic / extended formats).
+- **3GPP TS 27.007** — public AT command set; HFP reuses CIND, CIEV,
+  CHUP and the +CME ERROR response shape verbatim.
+
 ### AVDTP / A2DP
 
 - **Audio/Video Distribution Transport Protocol Specification,
@@ -123,6 +135,13 @@ Bluetooth subsystem source material was consulted at any point.**
   Information / Exchange MTU per ATT §3.4. Convenience builders
   `add_primary_service` / `add_characteristic` emit the canonical
   Vol 3 Part G declaration shape.
+- **HFP** (`hfp`): clean-room AT command codec for HFP 1.8. AT line
+  tokenizer (basic / write `=` / read `?` / test `=?` forms), HF
+  command builders (BRSF, CIND test/read, CMER, CHLD test, CLCC,
+  ATA, AT+CHUP), AG response builders (BRSF response, OK, ERROR,
+  +CIEV unsolicited indicator, +BSIR, RING). HF + AG feature
+  bitmasks (codec negotiation, eSCO S4, enhanced VR, etc.). CSV
+  numeric parser for +CIND / +CIEV payloads.
 - **AVDTP / A2DP** (`avdtp`): clean-room AVDTP signalling codec.
   Header packing (transaction label, packet type, message type,
   signal id), Stream End Point encode/decode (SEID + In-Use bit +

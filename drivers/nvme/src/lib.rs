@@ -27,6 +27,7 @@
 
 extern crate alloc;
 
+pub mod admin;
 pub mod mi;
 
 mod tests;

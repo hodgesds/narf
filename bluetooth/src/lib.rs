@@ -37,6 +37,7 @@ pub mod event;
 pub mod gatt;
 pub mod gatt_server;
 pub mod hci;
+pub mod hfp;
 pub mod hogp;
 pub mod rfcomm;
 pub mod l2cap;

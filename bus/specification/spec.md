@@ -182,6 +182,28 @@ Hot-plug paths:
 | 3     | MSI-X allocation path; PCIe Native Hot Plug; IOMMU-group coordination with `io/`. |
 | 4     | Thunderbolt / PCIe switch awareness; ACPI notify integration; virtio-mmio runtime injection for VMs. |
 
+## 7a. PCIe DOE (Data Object Exchange)
+
+`pci_doe/` is a clean-room codec for the PCIe DOE Extended
+Capability. References (public-only):
+
+- **PCI Express Base Specification, Revision 6.0** — PCI-SIG.
+  §6.30 Data Object Exchange (DOE) Extended Capability: cap-id
+  0x002E, register layout (DOE Capabilities / Control / Status /
+  Write Mailbox / Read Mailbox), 2-DWORD object header (Vendor ID
+  in DWORD 0 low 16 bits, Data Object Type in DWORD 0 bits 23..16,
+  Length in DWORD 1 bits 17..0 with the special-case 0 = 2^18).
+- **PCI Express Base Specification, Revision 5.0** — first ratified
+  DOE; layout matches the 6.0 wording.
+- **DMTF DSP0274 SPDM** — defines the SPDM-over-DOE wrapper.
+- **PCI-SIG public Vendor ID list** — 0x0001 (PCI-SIG) is the
+  vendor used for the DOE Discovery protocol.
+
+The codec is bus-agnostic — it produces / consumes the DWORD stream
+the host writes to the Write Mailbox and reads from the Read Mailbox.
+The MMIO bring-up and Status-bit polling live in the consumer driver
+(SPDM, CXL IDE).
+
 ## 8. Open questions
 
 - ~~**ACPI interpreter**~~ **Resolved (v0.2): NARF will not execute

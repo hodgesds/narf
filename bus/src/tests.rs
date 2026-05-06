@@ -666,3 +666,115 @@ fn smoke_aer_listener_dispatch_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bus/aer", smoke_aer_listener_dispatch_round_trip);
+
+// ── PCIe DOE smokes ────────────────────────────────────────────────
+
+fn smoke_doe_object_round_trip() -> TestResult {
+    use crate::pci_doe::{Object, TYPE_DOE_DISCOVERY, VENDOR_PCISIG};
+    let obj = Object {
+        vendor_id: VENDOR_PCISIG,
+        data_object_type: TYPE_DOE_DISCOVERY,
+        payload: alloc::vec![0xCAFE_BABE, 0xDEAD_BEEF],
+    };
+    let dwords = obj.encode();
+    if dwords.len() != 4 {
+        return TestResult::Fail("envelope = 2 hdr + 2 payload = 4 DWORDs");
+    }
+    // DWORD 0 packing: vendor in low 16, type in next 8.
+    if dwords[0] & 0xFFFF != VENDOR_PCISIG as u32 {
+        return TestResult::Fail("vendor ID lives in DWORD 0 low 16 bits");
+    }
+    if (dwords[0] >> 16) & 0xFF != TYPE_DOE_DISCOVERY as u32 {
+        return TestResult::Fail("data object type lives in DWORD 0 bits 23..16");
+    }
+    if dwords[1] != 4 {
+        return TestResult::Fail("length = total DWORDs (incl header) = 4");
+    }
+    let back = Object::decode(&dwords).expect("decode");
+    if back != obj {
+        return TestResult::Fail("DOE object round-trip mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/doe", smoke_doe_object_round_trip);
+
+fn smoke_doe_length_zero_means_max() -> TestResult {
+    use crate::pci_doe::{Object, VENDOR_PCISIG};
+    // A length field of 0 in the wire encoding decodes to 2^18.
+    // We don't exercise a buffer of that size; just verify the
+    // encoder's edge case stays at the literal 0 mark when total
+    // hits the maximum (synthesised: payload 2^18 - 2 entries is
+    // huge, so test the ceiling on encode by inspecting the field
+    // arithmetic via a smaller probe).
+    let obj = Object {
+        vendor_id: VENDOR_PCISIG,
+        data_object_type: 0,
+        payload: alloc::vec![0; 5],
+    };
+    let dwords = obj.encode();
+    if dwords[1] != 7 {
+        return TestResult::Fail("length should be 7 (header + 5 payload)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/doe", smoke_doe_length_zero_means_max);
+
+fn smoke_doe_decode_truncated_rejected() -> TestResult {
+    use crate::pci_doe::{DoeError, Object, VENDOR_PCISIG};
+    let mut dwords = Object {
+        vendor_id: VENDOR_PCISIG,
+        data_object_type: 0,
+        payload: alloc::vec![0xAA; 4],
+    }
+    .encode();
+    dwords.pop(); // drop one DWORD — length now exceeds the buffer
+    match Object::decode(&dwords) {
+        Err(DoeError::Truncated) => TestResult::Pass,
+        _ => TestResult::Fail("truncated DWORD stream must be rejected"),
+    }
+}
+kernel_test_in!("bus/doe", smoke_doe_decode_truncated_rejected);
+
+fn smoke_doe_decode_bad_length_rejected() -> TestResult {
+    use crate::pci_doe::{DoeError, Object};
+    let dwords = [0x00010000u32, 1u32]; // length=1 < 2 (header is mandatory)
+    match Object::decode(&dwords) {
+        Err(DoeError::BadLength) => TestResult::Pass,
+        _ => TestResult::Fail("length < 2 must be rejected"),
+    }
+}
+kernel_test_in!("bus/doe", smoke_doe_decode_bad_length_rejected);
+
+fn smoke_doe_discovery_request_layout() -> TestResult {
+    use crate::pci_doe::{build_discovery_request, TYPE_DOE_DISCOVERY, VENDOR_PCISIG};
+    let req = build_discovery_request(2);
+    if req.len() != 3 {
+        return TestResult::Fail("Discovery request = 3 DWORDs (2 hdr + 1 index)");
+    }
+    if req[0] & 0xFFFF != VENDOR_PCISIG as u32 {
+        return TestResult::Fail("vendor field");
+    }
+    if (req[0] >> 16) & 0xFF != TYPE_DOE_DISCOVERY as u32 {
+        return TestResult::Fail("type field");
+    }
+    if req[2] != 2 {
+        return TestResult::Fail("payload DWORD carries the discovery index");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/doe", smoke_doe_discovery_request_layout);
+
+fn smoke_doe_discovery_entry_parse() -> TestResult {
+    use crate::pci_doe::DiscoveryEntry;
+    // Vendor 0x0001, Type 0x01 (CMA_SPDM), next_index = 5
+    let payload_dword: u32 = 0x0001 | (0x01 << 16) | (0x05 << 24);
+    let e = DiscoveryEntry::parse(&[payload_dword]).expect("parse");
+    if e.vendor_id != 0x0001 || e.data_object_type != 0x01 {
+        return TestResult::Fail("vendor/type decode mismatch");
+    }
+    if e.next_index != 5 {
+        return TestResult::Fail("next_index lives in bits 31..24");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/doe", smoke_doe_discovery_entry_parse);

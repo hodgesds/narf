@@ -1542,3 +1542,104 @@ fn smoke_avdtp_psm_assigned_number() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bluetooth/avdtp", smoke_avdtp_psm_assigned_number);
+
+// ── HFP AT-command codec smokes ────────────────────────────────────
+
+fn smoke_hfp_brsf_round_trip() -> TestResult {
+    use crate::hfp::{brsf_command, parse_at, AtForm, HF_FEAT_CODEC_NEGOTIATION, HF_FEAT_VOLUME_CONTROL};
+    let line = brsf_command(HF_FEAT_VOLUME_CONTROL | HF_FEAT_CODEC_NEGOTIATION);
+    let parsed = parse_at(&line).expect("parse");
+    if parsed.name != "+BRSF" {
+        return TestResult::Fail("BRSF command name mismatch");
+    }
+    if parsed.form != AtForm::Write {
+        return TestResult::Fail("BRSF should be a write-form (=)");
+    }
+    if parsed.params != "144" {
+        // 16 (volume) | 128 (codec) = 144
+        return TestResult::Fail("BRSF parameter should be the decimal feature bitmap");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/hfp", smoke_hfp_brsf_round_trip);
+
+fn smoke_hfp_cind_test_command() -> TestResult {
+    use crate::hfp::{cind_test_command, parse_at, AtForm};
+    let line = cind_test_command();
+    let parsed = parse_at(&line).expect("parse");
+    if parsed.name != "+CIND" || parsed.form != AtForm::Test {
+        return TestResult::Fail("CIND test form (=?) lost");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/hfp", smoke_hfp_cind_test_command);
+
+fn smoke_hfp_cind_read_command() -> TestResult {
+    use crate::hfp::{cind_read_command, parse_at, AtForm};
+    let line = cind_read_command();
+    let parsed = parse_at(&line).expect("parse");
+    if parsed.form != AtForm::Read {
+        return TestResult::Fail("CIND read form (?) lost");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/hfp", smoke_hfp_cind_read_command);
+
+fn smoke_hfp_basic_ata_command() -> TestResult {
+    use crate::hfp::{answer_command, parse_at, AtForm};
+    let line = answer_command();
+    let parsed = parse_at(&line).expect("parse");
+    if parsed.name != "A" {
+        return TestResult::Fail("ATA basic command name = 'A'");
+    }
+    if parsed.form != AtForm::Basic {
+        return TestResult::Fail("ATA is the basic form");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/hfp", smoke_hfp_basic_ata_command);
+
+fn smoke_hfp_rejects_non_at_line() -> TestResult {
+    use crate::hfp::{parse_at, HfpError};
+    match parse_at("HELLO\r") {
+        Err(HfpError::NotAtCommand) => TestResult::Pass,
+        _ => TestResult::Fail("non-AT line must be rejected"),
+    }
+}
+kernel_test_in!("bluetooth/hfp", smoke_hfp_rejects_non_at_line);
+
+fn smoke_hfp_ciev_unsolicited_format() -> TestResult {
+    use crate::hfp::ciev_unsolicited;
+    let s = ciev_unsolicited(2, 1);
+    if s != "\r\n+CIEV: 2,1\r\n" {
+        return TestResult::Fail("+CIEV unsolicited result formatting wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/hfp", smoke_hfp_ciev_unsolicited_format);
+
+fn smoke_hfp_csv_number_parser() -> TestResult {
+    use crate::hfp::parse_csv_numbers;
+    let v = parse_csv_numbers("1,0,1,0,0").expect("parse");
+    if v != alloc::vec![1u32, 0, 1, 0, 0] {
+        return TestResult::Fail("CSV decode mismatch");
+    }
+    let with_blanks = parse_csv_numbers("1,,5").expect("parse with blanks");
+    if with_blanks != alloc::vec![1u32, 0, 5] {
+        return TestResult::Fail("blank tokens should decode to 0 (HFP CIND convention)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/hfp", smoke_hfp_csv_number_parser);
+
+fn smoke_hfp_ok_and_error_responses() -> TestResult {
+    use crate::hfp::{error_response, ok_response};
+    if ok_response() != "\r\nOK\r\n" {
+        return TestResult::Fail("OK response framing wrong");
+    }
+    if error_response() != "\r\nERROR\r\n" {
+        return TestResult::Fail("ERROR response framing wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/hfp", smoke_hfp_ok_and_error_responses);

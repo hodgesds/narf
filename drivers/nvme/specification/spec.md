@@ -62,7 +62,30 @@ multipath / fabrics (defer).
 
 Stage 4.
 
-## 7a. NVMe-MI sub-module
+## 7a. Admin command builders (`admin`)
+
+`admin/` is a clean-room module producing 64-byte SQE byte arrays
+the driver feeds into the admin Submission Queue. References
+(public-only):
+
+- **NVM Express Base Specification, Revision 2.0c** (Oct 2022) —
+  NVM Express Inc. Public document. §3.3.3 (SQE layout, 64 bytes;
+  CDW0 packs opcode | fuse | psdt | cid). §5 Admin Command Set
+  table 27 (opcode list). §5.4 Format NVM (CDW10 carries LBAF in
+  bits 3..0 and SES in bits 11..9). §5.21 Sanitize (CDW10 bits 2..0
+  = SANACT, bit 3 = AUSE, bits 7..4 = OWPASS, bit 8 = OIPBP; CDW11
+  = overwrite pattern). §5.16 Get Log Page (CDW10[7:0]=LID,
+  CDW10[31:16]=NUMDL, CDW11[15:0]=NUMDU). §5.31 Set Features (CDW10
+  carries the FID; FID 0x07 Number of Queues encodes NSQR/NCQR in
+  CDW11; FID 0x1A Boot Partition Write Protection encodes BPID in
+  CDW11 bit 31 and BPWPS in CDW11[2:0]).
+- **NVM Command Set Specification, Revision 1.0c** — SMART/Health
+  log page (LID 0x02) byte layout used by the SmartLog decoder
+  (composite temperature in K at offset 1..3, percentage used at
+  offset 5, power-on hours at offset 128, unsafe shutdowns at offset
+  160, media errors at offset 176).
+
+## 7b. NVMe-MI sub-module
 
 `mi/` is a clean-room NVMe Management Interface codec. References
 (public-only):
