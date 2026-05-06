@@ -801,3 +801,128 @@ fn smoke_uvc_format_mjpeg_decodes_default_frame_index() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/usb/uvc", smoke_uvc_format_mjpeg_decodes_default_frame_index);
+
+// ── UVC stream payload header smokes ───────────────────────────────
+
+fn smoke_uvc_stream_header_round_trip_no_optional_fields() -> TestResult {
+    use crate::uvc_stream::PayloadHeader;
+    let h = PayloadHeader {
+        header_length: 0,
+        frame_id: true,
+        end_of_frame: true,
+        end_of_header: true,
+        ..Default::default()
+    };
+    let bytes = h.encode();
+    if bytes.len() != 2 {
+        return TestResult::Fail("Bare header = 2 bytes (length + BFH)");
+    }
+    if bytes[0] != 2 {
+        return TestResult::Fail("bHeaderLength should equal byte count");
+    }
+    let (back, off) = PayloadHeader::decode(&bytes).expect("decode");
+    if !back.frame_id || !back.end_of_frame || !back.end_of_header {
+        return TestResult::Fail("BFH flags should round-trip");
+    }
+    if off != 2 {
+        return TestResult::Fail("payload offset should equal header length");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc-stream", smoke_uvc_stream_header_round_trip_no_optional_fields);
+
+fn smoke_uvc_stream_header_with_pts() -> TestResult {
+    use crate::uvc_stream::PayloadHeader;
+    let h = PayloadHeader {
+        header_length: 0,
+        frame_id: false,
+        end_of_frame: false,
+        end_of_header: true,
+        pts: Some(0xCAFE_BEEF),
+        ..Default::default()
+    };
+    let bytes = h.encode();
+    if bytes.len() != 6 {
+        return TestResult::Fail("PTS-only header = 2 + 4 = 6 bytes");
+    }
+    if &bytes[2..6] != &0xCAFE_BEEFu32.to_le_bytes() {
+        return TestResult::Fail("PTS encoded LE");
+    }
+    let (back, _) = PayloadHeader::decode(&bytes).expect("decode");
+    if back.pts != Some(0xCAFE_BEEF) {
+        return TestResult::Fail("PTS round-trip");
+    }
+    if back.scr.is_some() {
+        return TestResult::Fail("SCR should not be present");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc-stream", smoke_uvc_stream_header_with_pts);
+
+fn smoke_uvc_stream_header_with_pts_and_scr() -> TestResult {
+    use crate::uvc_stream::PayloadHeader;
+    let h = PayloadHeader {
+        header_length: 0,
+        end_of_header: true,
+        pts: Some(0x0000_0001),
+        scr: Some((0x1234_5678, 0x07FF)),
+        ..Default::default()
+    };
+    let bytes = h.encode();
+    if bytes.len() != 2 + 4 + 6 {
+        return TestResult::Fail("PTS+SCR header = 12 bytes");
+    }
+    let (back, _) = PayloadHeader::decode(&bytes).expect("decode");
+    if back.pts != Some(0x0000_0001) {
+        return TestResult::Fail("PTS round-trip");
+    }
+    if back.scr != Some((0x1234_5678, 0x07FF)) {
+        return TestResult::Fail("SCR (sof, 11-bit clock) round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc-stream", smoke_uvc_stream_header_with_pts_and_scr);
+
+fn smoke_uvc_stream_reassembler_detects_frame_boundary() -> TestResult {
+    use crate::uvc_stream::{FrameReassembler, PayloadHeader};
+    let mut r = FrameReassembler::default();
+    let h0 = PayloadHeader {
+        frame_id: false,
+        end_of_header: true,
+        ..Default::default()
+    };
+    let s0 = r.feed(h0);
+    if !s0.new_frame {
+        return TestResult::Fail("first packet should mark new_frame");
+    }
+    // FID didn't flip — same frame.
+    let s1 = r.feed(h0);
+    if s1.new_frame {
+        return TestResult::Fail("same FID should not mark new frame");
+    }
+    // FID flipped.
+    let h1 = PayloadHeader {
+        frame_id: true,
+        end_of_header: true,
+        end_of_frame: true,
+        ..Default::default()
+    };
+    let s2 = r.feed(h1);
+    if !s2.new_frame {
+        return TestResult::Fail("FID flip should mark new frame");
+    }
+    if !s2.end_of_frame {
+        return TestResult::Fail("EOF flag should propagate");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uvc-stream", smoke_uvc_stream_reassembler_detects_frame_boundary);
+
+fn smoke_uvc_stream_rejects_short_buffer() -> TestResult {
+    use crate::uvc_stream::{PayloadHeader, UvcStreamError};
+    match PayloadHeader::decode(&[5u8]) {
+        Err(UvcStreamError::Short) => TestResult::Pass,
+        _ => TestResult::Fail("1-byte buffer must be rejected"),
+    }
+}
+kernel_test_in!("drivers/usb/uvc-stream", smoke_uvc_stream_rejects_short_buffer);

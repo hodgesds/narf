@@ -25,6 +25,8 @@
 
 extern crate alloc;
 
+pub mod smbios;
+
 mod tests;
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};

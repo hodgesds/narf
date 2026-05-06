@@ -398,6 +398,7 @@ pub fn register_initcalls() {
     });
 }
 
+pub mod goodix;
 pub mod rmi4;
 
 // Per-crate smoke tests register against `narf-kernel-test` and

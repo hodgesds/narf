@@ -213,3 +213,113 @@ fn smoke_rmi4_touchpad_report_rejects_short_buffer() -> TestResult {
     }
 }
 kernel_test_in!("input/rmi4", smoke_rmi4_touchpad_report_rejects_short_buffer);
+
+// ── Goodix GT911 smokes ────────────────────────────────────────────
+
+extern crate alloc;
+
+fn smoke_goodix_addresses_and_constants() -> TestResult {
+    use crate::goodix::{
+        I2C_ADDR_PRIMARY, I2C_ADDR_SECONDARY, MAX_TOUCH_POINTS, REG_POINT_BASE, REG_STATUS,
+    };
+    if I2C_ADDR_PRIMARY != 0x5D {
+        return TestResult::Fail("primary I²C addr = 0x5D");
+    }
+    if I2C_ADDR_SECONDARY != 0x14 {
+        return TestResult::Fail("secondary I²C addr = 0x14");
+    }
+    if MAX_TOUCH_POINTS != 5 {
+        return TestResult::Fail("GT911 reports up to 5 simultaneous touches");
+    }
+    if REG_STATUS != 0x814E {
+        return TestResult::Fail("status register = 0x814E");
+    }
+    if REG_POINT_BASE != 0x814F {
+        return TestResult::Fail("first point register = 0x814F");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("input/goodix", smoke_goodix_addresses_and_constants);
+
+fn smoke_goodix_coord_report_decodes_two_fingers() -> TestResult {
+    use crate::goodix::{CoordReport, STATUS_BUFFER_READY};
+    // Status byte: buffer-ready + 2 touches.
+    // Finger 0: track 0, x=400, y=240, size=10
+    // Finger 1: track 1, x=600, y=300, size=12
+    let mut buf = alloc::vec![STATUS_BUFFER_READY | 2];
+    buf.push(0); // track id
+    buf.extend_from_slice(&400u16.to_le_bytes());
+    buf.extend_from_slice(&240u16.to_le_bytes());
+    buf.extend_from_slice(&10u16.to_le_bytes());
+    buf.push(0); // reserved
+    buf.push(1); // track id
+    buf.extend_from_slice(&600u16.to_le_bytes());
+    buf.extend_from_slice(&300u16.to_le_bytes());
+    buf.extend_from_slice(&12u16.to_le_bytes());
+    buf.push(0);
+    let r = CoordReport::parse(&buf).expect("parse");
+    if !r.buffer_ready {
+        return TestResult::Fail("buffer-ready bit lost");
+    }
+    if r.points.len() != 2 {
+        return TestResult::Fail("expected 2 touch points");
+    }
+    if r.points[0].track_id != 0 || r.points[0].x != 400 || r.points[0].y != 240 {
+        return TestResult::Fail("finger 0 decode wrong");
+    }
+    if r.points[1].x != 600 {
+        return TestResult::Fail("finger 1 X decode wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("input/goodix", smoke_goodix_coord_report_decodes_two_fingers);
+
+fn smoke_goodix_coord_report_rejects_overflow() -> TestResult {
+    use crate::goodix::{CoordReport, GoodixError};
+    let buf = [0xFFu8; 64]; // status byte low nibble = 0xF (15) > 5
+    match CoordReport::parse(&buf) {
+        Err(GoodixError::BadCount) => TestResult::Pass,
+        _ => TestResult::Fail("touch count > 5 must be rejected"),
+    }
+}
+kernel_test_in!("input/goodix", smoke_goodix_coord_report_rejects_overflow);
+
+fn smoke_goodix_coord_report_zero_touches_buffer_ready() -> TestResult {
+    use crate::goodix::{CoordReport, STATUS_BUFFER_READY};
+    let buf = [STATUS_BUFFER_READY];
+    let r = CoordReport::parse(&buf).expect("parse");
+    if !r.buffer_ready {
+        return TestResult::Fail("buffer-ready flag lost");
+    }
+    if !r.points.is_empty() {
+        return TestResult::Fail("zero touches → empty point list");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("input/goodix", smoke_goodix_coord_report_zero_touches_buffer_ready);
+
+fn smoke_goodix_config_checksum_round_trip() -> TestResult {
+    use crate::goodix::{config_checksum_byte, verify_config};
+    let body = alloc::vec![0x42u8; 184];
+    let cs = config_checksum_byte(&body);
+    let mut full = body.clone();
+    full.push(cs);
+    if verify_config(&full).is_err() {
+        return TestResult::Fail("freshly-checksummed block must verify");
+    }
+    full[100] ^= 0xFF;
+    if verify_config(&full).is_ok() {
+        return TestResult::Fail("tampered block should fail to verify");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("input/goodix", smoke_goodix_config_checksum_round_trip);
+
+fn smoke_goodix_command_constants() -> TestResult {
+    use crate::goodix::{CMD_CALIBRATION, CMD_READ_COORD, CMD_SOFT_RESET};
+    if CMD_READ_COORD != 0 || CMD_SOFT_RESET != 0x02 || CMD_CALIBRATION != 0x04 {
+        return TestResult::Fail("command-register byte values per §4.1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("input/goodix", smoke_goodix_command_constants);

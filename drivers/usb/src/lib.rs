@@ -11,6 +11,7 @@ pub mod hub;
 pub mod msc;
 pub mod uac;
 pub mod uvc;
+pub mod uvc_stream;
 pub mod xhci;
 
 mod tests;

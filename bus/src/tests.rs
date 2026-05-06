@@ -893,3 +893,141 @@ fn smoke_ide_doe_type_constant() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bus/ide", smoke_ide_doe_type_constant);
+
+// ── CXL mailbox smokes ─────────────────────────────────────────────
+
+fn smoke_cxl_command_register_round_trip() -> TestResult {
+    use crate::cxl::{pack_command_register, unpack_command_register, OP_INFOSTAT_IDENTIFY};
+    let v = pack_command_register(OP_INFOSTAT_IDENTIFY, 1024);
+    let (op, len) = unpack_command_register(v);
+    if op != OP_INFOSTAT_IDENTIFY {
+        return TestResult::Fail("opcode lives in low 16 bits");
+    }
+    if len != 1024 {
+        return TestResult::Fail("input length lives in bits 36..16");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/cxl", smoke_cxl_command_register_round_trip);
+
+fn smoke_cxl_status_register_packs_return_code_at_bits_47_32() -> TestResult {
+    use crate::cxl::{pack_status_register, unpack_status_register, RC_INVALID_INPUT};
+    let v = pack_status_register(true, RC_INVALID_INPUT, 0xCAFE);
+    let (bg, rc, vendor) = unpack_status_register(v);
+    if !bg {
+        return TestResult::Fail("background-operation bit lost");
+    }
+    if rc != RC_INVALID_INPUT {
+        return TestResult::Fail("return code mismatch");
+    }
+    if vendor != 0xCAFE {
+        return TestResult::Fail("vendor extended status mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bus/cxl",
+    smoke_cxl_status_register_packs_return_code_at_bits_47_32
+);
+
+fn smoke_cxl_background_status_round_trip() -> TestResult {
+    use crate::cxl::BackgroundStatus;
+    let s = BackgroundStatus {
+        percentage: 42,
+        complete: true,
+        return_code: 0,
+        vendor_extended_status: 0,
+    };
+    let raw = s.pack();
+    let back = BackgroundStatus::unpack(raw);
+    if back != s {
+        return TestResult::Fail("BackgroundStatus round-trip");
+    }
+    if (raw & 0x7F) != 42 {
+        return TestResult::Fail("percentage at bits 6..0");
+    }
+    if (raw & (1 << 16)) == 0 {
+        return TestResult::Fail("complete bit at bit 16");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/cxl", smoke_cxl_background_status_round_trip);
+
+fn smoke_cxl_identify_response_decodes() -> TestResult {
+    use crate::cxl::IdentifyResponse;
+    let mut buf = alloc::vec![0u8; 40];
+    buf[0..16].copy_from_slice(b"narfdev v1.2.3\x00\x00");
+    buf[16] = 9; // log2 256-byte payload? — 8 means 256, 9 means 512
+    buf[17] = 0x03; // component type
+    buf[18..20].copy_from_slice(&0x1E98u16.to_le_bytes());
+    buf[20..22].copy_from_slice(&0x1234u16.to_le_bytes());
+    buf[26..34].copy_from_slice(&0xDEAD_BEEF_CAFE_BABEu64.to_le_bytes());
+    let id = IdentifyResponse::parse(&buf).expect("parse");
+    if &id.fw_revision[0..14] != b"narfdev v1.2.3" {
+        return TestResult::Fail("fw revision text");
+    }
+    if id.vid != 0x1E98 {
+        return TestResult::Fail("VID should round-trip");
+    }
+    if id.serial_number != 0xDEAD_BEEF_CAFE_BABE {
+        return TestResult::Fail("serial number should round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/cxl", smoke_cxl_identify_response_decodes);
+
+fn smoke_cxl_get_log_input_layout() -> TestResult {
+    use crate::cxl::get_log_input;
+    let uuid = [0xAAu8; 16];
+    let buf = get_log_input(&uuid, 0x40, 0x100);
+    if buf.len() != 24 {
+        return TestResult::Fail("Get Log input = 16 UUID + 4 offset + 4 length");
+    }
+    if &buf[0..16] != &uuid {
+        return TestResult::Fail("UUID prefix");
+    }
+    if &buf[16..20] != &0x40u32.to_le_bytes() {
+        return TestResult::Fail("offset is LE u32");
+    }
+    if &buf[20..24] != &0x100u32.to_le_bytes() {
+        return TestResult::Fail("length is LE u32");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/cxl", smoke_cxl_get_log_input_layout);
+
+fn smoke_cxl_health_info_decodes() -> TestResult {
+    use crate::cxl::HealthInfo;
+    let mut buf = alloc::vec![0u8; 18];
+    buf[0] = HealthInfo::HEALTH_PERFORMANCE_DEGRADED;
+    buf[3] = 25; // life used %
+    buf[4..6].copy_from_slice(&313u16.to_le_bytes()); // device temperature
+    buf[6..10].copy_from_slice(&7u32.to_le_bytes()); // dirty shutdown count
+    let h = HealthInfo::parse(&buf).expect("parse");
+    if h.health_status & HealthInfo::HEALTH_PERFORMANCE_DEGRADED == 0 {
+        return TestResult::Fail("performance-degraded flag should round-trip");
+    }
+    if h.life_used != 25 {
+        return TestResult::Fail("life used %");
+    }
+    if h.device_temperature != 313 {
+        return TestResult::Fail("device temperature");
+    }
+    if h.dirty_shutdown_count != 7 {
+        return TestResult::Fail("dirty shutdown count");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/cxl", smoke_cxl_health_info_decodes);
+
+fn smoke_cxl_dvsec_vendor_constant() -> TestResult {
+    use crate::cxl::{DVSEC_ID_COMPONENT_REGISTER_LOCATOR, DVSEC_VENDOR_CXL};
+    if DVSEC_VENDOR_CXL != 0x1E98 {
+        return TestResult::Fail("CXL DVSEC vendor = 0x1E98");
+    }
+    if DVSEC_ID_COMPONENT_REGISTER_LOCATOR != 0x0008 {
+        return TestResult::Fail("Component Register Locator DVSEC ID = 0x0008");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus/cxl", smoke_cxl_dvsec_vendor_constant);

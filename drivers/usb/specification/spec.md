@@ -39,6 +39,15 @@ All driver code is derived strictly from the references below.
 - **Universal Serial Bus Device Class Definition for Video Devices:
   Frame-Based Payload, Revision 1.5** — USB-IF. Public.
 
+### UVC payload header (1.5 §2.4.3.3)
+
+- **UVC 1.5 §2.4.3.3** "Video and Still Image Payload Headers" —
+  USB-IF. Public. Bit Field Header layout (FID toggle, EOF, PTS
+  flag, SCR flag, SI flag, Error, EOH).
+- **UVC 1.5 §2.4.3.4** "Source Clock Reference and Presentation
+  Time Stamp" — USB-IF. Public. PTS = LE 32-bit; SCR = LE 32-bit
+  SOF tick + 11-bit clock counter packed across 6 bytes.
+
 ### USB Audio Class 1.0
 
 - **Universal Serial Bus Device Class Definition for Audio Devices,
@@ -62,6 +71,13 @@ All driver code is derived strictly from the references below.
   READ_CAPACITY(10), READ(10), WRITE(10) for single-block transfers.
 - **Hub** (`hub`): basic hub class enumeration so devices behind
   a hub are visible.
+- **UVC stream** (`uvc_stream`): clean-room payload-header
+  encoder + decoder for the per-isoch-transaction UVC header
+  (bHeaderLength + Bit Field Header), with optional PTS (LE u32)
+  and SCR (LE u32 SOF tick + 11-bit clock counter) fields. A
+  `FrameReassembler` turns FID toggles into "new frame started" /
+  "end of frame" / "error" steps the host driver feeds into the
+  buffer manager.
 - **UVC 1.5** (`uvc`): UVC descriptor parser. VC HEADER (bcdUVC,
   clock frequency, controlled VS interfaces), INPUT_TERMINAL with
   the camera-specific extension (objective focal length range,

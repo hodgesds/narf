@@ -1476,3 +1476,122 @@ fn smoke_acpi_uefi_synthetic_decode() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("acpi/uefi", smoke_acpi_uefi_synthetic_decode);
+
+// ── SMBIOS / DMI smokes ────────────────────────────────────────────
+
+extern crate alloc;
+
+fn build_smbios_3_anchor(structure_table_addr: u64) -> [u8; 24] {
+    use crate::smbios::ANCHOR_SM3;
+    let mut buf = [0u8; 24];
+    buf[0..5].copy_from_slice(ANCHOR_SM3);
+    buf[6] = 24; // entry-point length
+    buf[7] = 3;  // major
+    buf[8] = 6;  // minor
+    buf[9] = 0;  // doc rev
+    buf[12..16].copy_from_slice(&0x1000u32.to_le_bytes());
+    buf[16..24].copy_from_slice(&structure_table_addr.to_le_bytes());
+    // Compute checksum at byte 5.
+    let mut sum: u32 = 0;
+    for (i, b) in buf.iter().enumerate() {
+        if i == 5 {
+            continue;
+        }
+        sum = sum.wrapping_add(*b as u32);
+    }
+    buf[5] = ((256 - (sum & 0xFF)) & 0xFF) as u8;
+    buf
+}
+
+fn smoke_smbios_64bit_entry_round_trip() -> TestResult {
+    use crate::smbios::EntryPoint64;
+    let buf = build_smbios_3_anchor(0xCAFE_BEEF_F000_0000);
+    let ep = EntryPoint64::parse(&buf).expect("parse");
+    if ep.major != 3 || ep.minor != 6 {
+        return TestResult::Fail("SMBIOS 3.6 version mismatch");
+    }
+    if ep.structure_table_address != 0xCAFE_BEEF_F000_0000 {
+        return TestResult::Fail("structure table address should round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi/smbios", smoke_smbios_64bit_entry_round_trip);
+
+fn smoke_smbios_anchor_must_match() -> TestResult {
+    use crate::smbios::{EntryPoint64, SmbiosError};
+    let mut buf = build_smbios_3_anchor(0);
+    buf[0] = b'X';
+    match EntryPoint64::parse(&buf) {
+        Err(SmbiosError::BadAnchor) => TestResult::Pass,
+        _ => TestResult::Fail("non-_SM3_ anchor must be rejected"),
+    }
+}
+kernel_test_in!("acpi/smbios", smoke_smbios_anchor_must_match);
+
+fn smoke_smbios_struct_iter_walks_two_structures() -> TestResult {
+    use crate::smbios::{StructIter, TYPE_BIOS_INFO, TYPE_END_OF_TABLE, TYPE_SYSTEM_INFO};
+    // Type 0 BIOS Info: header (4) + 4 fmt bytes + "vendor\0bios\0\0"
+    // Type 1 System Info: header (4) + 23 fmt bytes (UUID etc.) + "Acme\0\0"
+    // End-of-table marker: type 127, length 4, no strings.
+    let bios_strings = b"vendor\0bios\0\0";
+    let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    buf.push(TYPE_BIOS_INFO);
+    buf.push(8); // length: 4 hdr + 4 fmt
+    buf.extend_from_slice(&0x0001u16.to_le_bytes()); // handle
+    buf.extend_from_slice(&[1, 2, 0, 0]); // formatted (vendor idx=1, bios idx=2)
+    buf.extend_from_slice(bios_strings);
+    // System info
+    buf.push(TYPE_SYSTEM_INFO);
+    buf.push(27); // length: 4 hdr + 23 fmt
+    buf.extend_from_slice(&0x0002u16.to_le_bytes());
+    buf.extend_from_slice(&[1u8; 23]); // dummy formatted
+    buf.extend_from_slice(b"Acme\0\0");
+    // End-of-table
+    buf.push(TYPE_END_OF_TABLE);
+    buf.push(4);
+    buf.extend_from_slice(&0x0003u16.to_le_bytes());
+
+    let count = StructIter::new(&buf).count();
+    if count != 2 {
+        return TestResult::Fail("iterator should stop before end-of-table");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi/smbios", smoke_smbios_struct_iter_walks_two_structures);
+
+fn smoke_smbios_string_indexing_one_based() -> TestResult {
+    use crate::smbios::string_at;
+    let strings = alloc::vec![
+        alloc::string::String::from("Acme"),
+        alloc::string::String::from("Laptop"),
+    ];
+    if string_at(&strings, 0) != "" {
+        return TestResult::Fail("index 0 means 'no string'");
+    }
+    if string_at(&strings, 1) != "Acme" {
+        return TestResult::Fail("index 1 should be first string");
+    }
+    if string_at(&strings, 2) != "Laptop" {
+        return TestResult::Fail("index 2 should be second string");
+    }
+    if string_at(&strings, 5) != "" {
+        return TestResult::Fail("out-of-range index returns empty");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi/smbios", smoke_smbios_string_indexing_one_based);
+
+fn smoke_smbios_memory_device_type_constants() -> TestResult {
+    use crate::smbios::{MEM_TYPE_DDR4, MEM_TYPE_DDR5, MEM_TYPE_LPDDR5};
+    if MEM_TYPE_DDR4 != 0x1A {
+        return TestResult::Fail("DDR4 memory type byte = 0x1A");
+    }
+    if MEM_TYPE_DDR5 != 0x22 {
+        return TestResult::Fail("DDR5 memory type byte = 0x22");
+    }
+    if MEM_TYPE_LPDDR5 != 0x23 {
+        return TestResult::Fail("LPDDR5 memory type byte = 0x23");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("acpi/smbios", smoke_smbios_memory_device_type_constants);

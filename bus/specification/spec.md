@@ -182,6 +182,41 @@ Hot-plug paths:
 | 3     | MSI-X allocation path; PCIe Native Hot Plug; IOMMU-group coordination with `io/`. |
 | 4     | Thunderbolt / PCIe switch awareness; ACPI notify integration; virtio-mmio runtime injection for VMs. |
 
+## 6a. CXL Component Register Block + CCI mailbox
+
+`cxl/` is a clean-room codec for the CXL Component Register Block
+mailbox plus the Component Command Interface (CCI). References
+(public-only):
+
+- **Compute Express Link (CXL) Specification, Revision 3.1** — CXL
+  Consortium. Public document. §8.2.8 (Component Register Block:
+  RCRB / DVSEC for CXL 1.1+ devices, Memory-Mapped Component
+  Registers). §8.2.9.1 (Mailbox Capabilities + Control + Status
+  + Background Command Status registers, with Payload Size encoded
+  as a log2 byte count). §8.2.9.2 (Mailbox Command Format —
+  opcode | input length | command payload | return code | output
+  length | output payload). §8.2.9.5 Component Command Set table
+  8-44 (Identify, Background Operation Status, Get FW Info,
+  Get Timestamp / Set Timestamp, Health Info, Get Supported Logs,
+  Get Log).
+
+Surfaced:
+- `pack_command_register` / `unpack_command_register` for the
+  64-bit Command register (low 16 = opcode, bits 36..16 = 21-bit
+  input payload length).
+- `pack_status_register` / `unpack_status_register` for the
+  Background flag + return code + vendor-extended-status fields.
+- `BackgroundStatus` for the Background Command Status register
+  (percentage 0..100, complete bit, return code, vendor extended).
+- `IdentifyResponse::parse` covering FW revision / max msg size /
+  component type / VID/DID/SubsysVID/SubsysDID / 64-bit serial.
+- `get_log_input` builder (UUID + 4-byte offset + 4-byte length).
+- `HealthInfo::parse` covering Health/Media status bytes,
+  life-used %, device temperature, dirty-shutdown count, and
+  corrected volatile / persistent error counts.
+- DVSEC vendor 0x1E98 + Component Register Locator DVSEC ID 0x0008
+  surfaced as constants.
+
 ## 7a. PCIe DOE (Data Object Exchange)
 
 `pci_doe/` is a clean-room codec for the PCIe DOE Extended
