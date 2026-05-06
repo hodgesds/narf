@@ -55,9 +55,9 @@ pub enum MatchKind {
     /// PCIe base-class match. `class` is the high byte of the class
     /// triple (offset 0x0B); `mask` lets a driver match a class
     /// family (e.g. `class=0x01, mask=0xFF` = "all storage").
-    Class       { class: u8, mask: u8 },
+    Class { class: u8, mask: u8 },
     /// Match every device of a vendor. Lowest specificity.
-    Vendor      { vendor: u16 },
+    Vendor { vendor: u16 },
 }
 
 impl MatchKind {
@@ -65,11 +65,14 @@ impl MatchKind {
     pub fn matches(&self, device: &BusDevice) -> bool {
         // Match-based dispatch only makes sense for PCIe devices —
         // virtio-mmio uses its own discovery shape.
-        if !matches!(device.kind, BusKind::Pcie { .. }) { return false; }
+        if !matches!(device.kind, BusKind::Pcie { .. }) {
+            return false;
+        }
         match *self {
-            MatchKind::VendorDevice { vendor, device: dev } => {
-                device.id.vendor == vendor && device.id.device == dev
-            }
+            MatchKind::VendorDevice {
+                vendor,
+                device: dev,
+            } => device.id.vendor == vendor && device.id.device == dev,
             MatchKind::Class { class, mask } => {
                 let dev_class = ((device.id.class >> 16) & 0xFF) as u8;
                 (dev_class & mask) == (class & mask)
@@ -84,8 +87,8 @@ impl MatchKind {
     pub fn specificity(&self) -> u8 {
         match self {
             MatchKind::VendorDevice { .. } => 3,
-            MatchKind::Class        { .. } => 2,
-            MatchKind::Vendor       { .. } => 1,
+            MatchKind::Class { .. } => 2,
+            MatchKind::Vendor { .. } => 1,
         }
     }
 }
@@ -94,19 +97,17 @@ impl MatchKind {
 /// + a freshly-minted authority cap, and returns success / a typed
 /// error. The cap is owned by the probe — it can stash it in a
 /// static, hand it to a long-lived task, etc.
-pub type PciProbeFn = fn(
-    device: BusDevice,
-    cap:    Cap<BusDeviceCap, Write>,
-) -> Result<(), ProbeError>;
+pub type PciProbeFn =
+    fn(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), ProbeError>;
 
 /// One entry in the driver-match registry.
 #[derive(Copy, Clone)]
 pub struct PciMatch {
     /// Human-readable driver name. Used in diagnostics + as a
     /// duplicate-registration key.
-    pub name:  &'static str,
+    pub name: &'static str,
     /// Predicate against discovered devices.
-    pub kind:  MatchKind,
+    pub kind: MatchKind,
     /// Probe fn invoked when a matching device is discovered.
     pub probe: PciProbeFn,
 }
@@ -123,8 +124,7 @@ impl core::fmt::Debug for PciMatch {
 /// Backing store for registered drivers. Wave-3a single global
 /// list — registration is a boot-time event, so a `IrqSafeSpinLock`
 /// is fine.
-static REGISTRY: IrqSafeSpinLock<Vec<PciMatch>> =
-    IrqSafeSpinLock::new(Vec::new());
+static REGISTRY: IrqSafeSpinLock<Vec<PciMatch>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Register a driver with the match table. Idempotent on `name` —
 /// re-registering replaces the prior entry, so the test harness
@@ -146,7 +146,9 @@ pub fn registered() -> Vec<PciMatch> {
 }
 
 /// Number of registered drivers — handy for tests + diagnostics.
-pub fn count() -> usize { REGISTRY.lock().len() }
+pub fn count() -> usize {
+    REGISTRY.lock().len()
+}
 
 /// Walk every device in the bus registry, find the highest-specificity
 /// matching `PciMatch`, mint a `Cap<BusDeviceCap, Write>`, and invoke
@@ -161,7 +163,7 @@ pub fn probe_all(
 ) -> Result<u32, narf_capabilities::CapError> {
     authority.check_live()?;
     let drivers = registered();
-    let devs    = devices();
+    let devs = devices();
     let mut bound = 0u32;
 
     for d in &devs {
@@ -176,7 +178,9 @@ pub fn probe_all(
                 });
             }
         }
-        let Some(m) = best else { continue; };
+        let Some(m) = best else {
+            continue;
+        };
 
         // Mint the per-device cap. We're inside a TCB-trusted
         // entry point (probe_all itself is cap-gated), so calling
@@ -184,7 +188,10 @@ pub fn probe_all(
         // path.
         let (_handle, cap) = match claim_device_cap(authority, d.addr) {
             Ok(ok) => ok,
-            Err(e) => { let _ = e; continue; }
+            Err(e) => {
+                let _ = e;
+                continue;
+            }
         };
         match (m.probe)(*d, cap) {
             Ok(()) => bound += 1,

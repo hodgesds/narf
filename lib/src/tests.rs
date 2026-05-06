@@ -9,23 +9,34 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 fn smoke_typed_id_sanity() -> TestResult {
     use crate::id::{CpuId, DomainId, TaskId};
-    if CpuId::new(7).raw() != 7 { return TestResult::Fail("CpuId::raw mismatch"); }
-    if DomainId::FRAME.raw() != 0 { return TestResult::Fail("FRAME != 0"); }
-    if DomainId::SCRATCH.raw() != 15 { return TestResult::Fail("SCRATCH != 15"); }
-    if TaskId::new(0xDEAD).raw() != 0xDEAD { return TestResult::Fail("TaskId::raw mismatch"); }
+    if CpuId::new(7).raw() != 7 {
+        return TestResult::Fail("CpuId::raw mismatch");
+    }
+    if DomainId::FRAME.raw() != 0 {
+        return TestResult::Fail("FRAME != 0");
+    }
+    if DomainId::SCRATCH.raw() != 15 {
+        return TestResult::Fail("SCRATCH != 15");
+    }
+    if TaskId::new(0xDEAD).raw() != 0xDEAD {
+        return TestResult::Fail("TaskId::raw mismatch");
+    }
     TestResult::Pass
 }
 kernel_test_in!("lib", smoke_typed_id_sanity);
 
 fn smoke_spin_lock_cycle() -> TestResult {
-    use crate::sync::{SpinLock, IrqsEnabled};
+    use crate::sync::{IrqsEnabled, SpinLock};
     let l = SpinLock::new(0u32);
     {
         let mut g = l.lock(IrqsEnabled);
         *g = 42;
     }
-    if *l.lock(IrqsEnabled) == 42 { TestResult::Pass }
-    else { TestResult::Fail("SpinLock round-trip lost its value") }
+    if *l.lock(IrqsEnabled) == 42 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("SpinLock round-trip lost its value")
+    }
 }
 kernel_test_in!("lib", smoke_spin_lock_cycle);
 
@@ -36,7 +47,7 @@ fn smoke_bitmap_first_set() -> TestResult {
     b.set(70);
     match (b.first_set(), b.count_ones()) {
         (Some(5), 2) => TestResult::Pass,
-        _            => TestResult::Fail("Bitmap first_set/count_ones wrong"),
+        _ => TestResult::Fail("Bitmap first_set/count_ones wrong"),
     }
 }
 kernel_test_in!("lib", smoke_bitmap_first_set);
@@ -46,7 +57,11 @@ fn smoke_box_roundtrip() -> TestResult {
     use alloc::boxed::Box;
     let b: Box<[u32; 4]> = Box::new([1, 2, 3, 4]);
     let sum: u32 = b.iter().sum();
-    if sum == 10 { TestResult::Pass } else { TestResult::Fail("Box<[u32;4]> sum wrong") }
+    if sum == 10 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("Box<[u32;4]> sum wrong")
+    }
 }
 kernel_test_in!("lib", smoke_box_roundtrip);
 

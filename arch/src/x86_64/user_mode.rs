@@ -48,7 +48,7 @@ pub const IA32_FS_BASE: u32 = 0xC000_0100;
 /// nothing here validates that.
 #[inline]
 pub unsafe fn set_user_fs_base(fs_base: u64) {
-    let low  = fs_base as u32;
+    let low = fs_base as u32;
     let high = (fs_base >> 32) as u32;
     compiler_fence(Ordering::SeqCst);
     // SAFETY: IA32_FS_BASE is unconditional on x86_64-long-mode; the
@@ -88,7 +88,7 @@ pub const IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
 /// land on a mapped page; nothing here validates that.
 #[inline]
 pub unsafe fn set_user_gs_base(gs_base: u64) {
-    let low  = gs_base as u32;
+    let low = gs_base as u32;
     let high = (gs_base >> 32) as u32;
     compiler_fence(Ordering::SeqCst);
     // SAFETY: IA32_KERNEL_GS_BASE is unconditional on long-mode
@@ -112,19 +112,30 @@ pub unsafe fn set_user_gs_base(gs_base: u64) {
 #[derive(Copy, Clone, Debug, Default)]
 pub struct UserState {
     // GPRs in trap-frame order (matches narf_frame::x86_64::trap::TrapFrame).
-    pub r15: u64, pub r14: u64, pub r13: u64, pub r12: u64,
-    pub r11: u64, pub r10: u64, pub r9:  u64, pub r8:  u64,
-    pub rbp: u64, pub rdi: u64, pub rsi: u64, pub rdx: u64,
-    pub rcx: u64, pub rbx: u64, pub rax: u64,
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub r11: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
+    pub rbp: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rdx: u64,
+    pub rcx: u64,
+    pub rbx: u64,
+    pub rax: u64,
     /// User-mode RIP at the instruction the trap returns to.
-    pub rip:    u64,
+    pub rip: u64,
     /// User-mode RFLAGS at trap entry.
     pub rflags: u64,
     /// User-mode RSP.
-    pub rsp:    u64,
+    pub rsp: u64,
     /// `1` once the trap path has populated this snapshot, `0`
     /// otherwise. Useful for "first-run vs resume" branches.
-    pub valid:  u64,
+    pub valid: u64,
 }
 
 /// User-code segment selector (DPL=3). Matches the GDT layout in
@@ -146,14 +157,14 @@ pub const USER_RFLAGS: u64 = 0x0000_0202;
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct JmpBuf {
-    pub rbx: u64,  // offset 0
-    pub rbp: u64,  // offset 8
-    pub r12: u64,  // offset 16
-    pub r13: u64,  // offset 24
-    pub r14: u64,  // offset 32
-    pub r15: u64,  // offset 40
-    pub rsp: u64,  // offset 48
-    pub rip: u64,  // offset 56
+    pub rbx: u64, // offset 0
+    pub rbp: u64, // offset 8
+    pub r12: u64, // offset 16
+    pub r13: u64, // offset 24
+    pub r14: u64, // offset 32
+    pub r15: u64, // offset 40
+    pub rsp: u64, // offset 48
+    pub rip: u64, // offset 56
 }
 
 /// Save callee-saved registers + caller's RSP + caller's return

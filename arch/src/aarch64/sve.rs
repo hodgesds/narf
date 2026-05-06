@@ -9,8 +9,8 @@ use core::arch::asm;
 
 #[derive(Copy, Clone, Debug, Default)]
 pub struct SveCaps {
-    pub sve:   bool,
-    pub sve2:  bool,
+    pub sve: bool,
+    pub sve2: bool,
     pub sve21: bool,
 }
 
@@ -76,8 +76,8 @@ pub fn caps() -> SveCaps {
     let zfr0 = id_aa64zfr0();
     let svever = (zfr0 & 0xF) as u8;
     SveCaps {
-        sve:   true,
-        sve2:  svever >= 1,
+        sve: true,
+        sve2: svever >= 1,
         sve21: svever >= 2,
     }
 }
@@ -90,7 +90,9 @@ pub fn caps() -> SveCaps {
 /// SVE present per `caps().sve`; CPACR.ZEN open. Caller has
 /// pinned the CPU (the result is per-CPU).
 pub unsafe fn probe_max_vl_bits() -> u16 {
-    if !caps().sve { return 0; }
+    if !caps().sve {
+        return 0;
+    }
     // SAFETY: caller-asserted.
     unsafe {
         let prev = read_zcr_el1();

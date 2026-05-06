@@ -26,8 +26,8 @@ pub const PAGE_SIZE: usize = 4096;
 /// bytes).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PageKey {
-    pub fs_id:    u32,
-    pub inode:    u64,
+    pub fs_id: u32,
+    pub inode: u64,
     pub page_off: u64,
 }
 
@@ -36,11 +36,11 @@ pub struct PageKey {
 /// until writeback commits.
 #[derive(Clone, Debug)]
 pub struct Page {
-    pub data:    Arc<[u8; PAGE_SIZE]>,
-    pub dirty:   bool,
+    pub data: Arc<[u8; PAGE_SIZE]>,
+    pub dirty: bool,
     /// Monotonic generation — bumps on every write so stale readers
     /// can detect they've raced.
-    pub gen:     u64,
+    pub gen: u64,
 }
 
 impl Page {
@@ -48,7 +48,7 @@ impl Page {
         Self {
             data: Arc::new([0u8; PAGE_SIZE]),
             dirty: false,
-            gen:   0,
+            gen: 0,
         }
     }
 }
@@ -63,7 +63,9 @@ pub struct PageCache {
 
 impl PageCache {
     pub const fn new() -> Self {
-        Self { pages: IrqSafeSpinLock::new(BTreeMap::new()) }
+        Self {
+            pages: IrqSafeSpinLock::new(BTreeMap::new()),
+        }
     }
 
     /// Look up a page; returns `None` if not present.
@@ -105,11 +107,17 @@ impl PageCache {
     }
 
     /// Total resident pages.
-    pub fn len(&self) -> usize { self.pages.lock().len() }
+    pub fn len(&self) -> usize {
+        self.pages.lock().len()
+    }
 
-    pub fn is_empty(&self) -> bool { self.pages.lock().is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.pages.lock().is_empty()
+    }
 }
 
 impl Default for PageCache {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

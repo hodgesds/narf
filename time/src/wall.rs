@@ -44,8 +44,8 @@ impl CapType for WallClock {
 /// `timespec`/`libc::time_t` consumers.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct WallInstant {
-    pub secs:      i64,
-    pub nanos:     u32,
+    pub secs: i64,
+    pub nanos: u32,
 }
 
 impl WallInstant {
@@ -54,7 +54,7 @@ impl WallInstant {
     /// Construct from a total-nanoseconds scalar (positive only).
     #[inline]
     pub const fn from_nanos(total_ns: i128) -> Self {
-        let secs  = (total_ns / 1_000_000_000) as i64;
+        let secs = (total_ns / 1_000_000_000) as i64;
         let nanos = (total_ns.rem_euclid(1_000_000_000)) as u32;
         Self { secs, nanos }
     }
@@ -88,7 +88,7 @@ static WALL_OFFSET_NS: AtomicI64 = AtomicI64::new(0);
 /// holds the signed ns that still need to be folded in. On each
 /// `now_wall()` read the remaining delta is interpolated linearly
 /// over the time left.
-static SMEAR_END_CYCLES:         AtomicU64 = AtomicU64::new(0);
+static SMEAR_END_CYCLES: AtomicU64 = AtomicU64::new(0);
 static SMEAR_DELTA_NS_REMAINING: AtomicI64 = AtomicI64::new(0);
 
 /// Error variants for the wall-clock surface.
@@ -99,7 +99,9 @@ pub enum WallError {
 }
 
 impl From<CapError> for WallError {
-    fn from(_: CapError) -> Self { WallError::AuthorityRevoked }
+    fn from(_: CapError) -> Self {
+        WallError::AuthorityRevoked
+    }
 }
 
 /// Set the monotonic→wall offset directly. Use for initial sync after
@@ -124,12 +126,14 @@ pub fn set_wall_offset_uncapped(offset_ns: i64) {
 /// correction into the wall offset instead of stepping. Negative
 /// deltas smear backwards; zero is rejected because it's nonsense.
 pub fn begin_leap_smear(
-    cap:       &Cap<WallClock, Write>,
-    delta_ns:  i64,
+    cap: &Cap<WallClock, Write>,
+    delta_ns: i64,
     window_ns: u64,
 ) -> Result<(), WallError> {
     cap.invoke(NoopOp)?;
-    if window_ns == 0 { return Err(WallError::InvalidSmearWindow); }
+    if window_ns == 0 {
+        return Err(WallError::InvalidSmearWindow);
+    }
     let cpns = CYCLES_PER_NS.load(Ordering::Relaxed).max(1) as u64;
     let end_cycles = now_cycles().saturating_add(window_ns.saturating_mul(cpns));
     SMEAR_END_CYCLES.store(end_cycles, Ordering::Release);
@@ -153,9 +157,9 @@ pub fn monotonic_ns() -> u64 {
 /// returned timestamp by linearly interpolating the remaining delta
 /// over the remaining window.
 pub fn now_wall() -> WallInstant {
-    let end   = SMEAR_END_CYCLES.load(Ordering::Acquire);
+    let end = SMEAR_END_CYCLES.load(Ordering::Acquire);
     let delta = SMEAR_DELTA_NS_REMAINING.load(Ordering::Acquire);
-    let now   = now_cycles();
+    let now = now_cycles();
 
     let base_ns = monotonic_ns() as i128 + WALL_OFFSET_NS.load(Ordering::Acquire) as i128;
 
@@ -184,8 +188,8 @@ pub fn now_wall() -> WallInstant {
 /// Test helper: restore every wall-clock static to its default.
 #[doc(hidden)]
 pub fn __test_reset() {
-    WALL_OFFSET_NS.store(0,          Ordering::Release);
-    SMEAR_END_CYCLES.store(0,        Ordering::Release);
+    WALL_OFFSET_NS.store(0, Ordering::Release);
+    SMEAR_END_CYCLES.store(0, Ordering::Release);
     SMEAR_DELTA_NS_REMAINING.store(0, Ordering::Release);
-    CYCLES_PER_NS.store(1,           Ordering::Release);
+    CYCLES_PER_NS.store(1, Ordering::Release);
 }

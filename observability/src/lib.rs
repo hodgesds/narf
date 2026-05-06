@@ -47,9 +47,7 @@ pub use peek::{MetricSample, MetricValue, PeekError, Provider};
 
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-use narf_capabilities::{
-    Cap, CapError, CapKind, CapType, Grant, NoopOp, Read, Write,
-};
+use narf_capabilities::{Cap, CapError, CapKind, CapType, Grant, NoopOp, Read, Write};
 use narf_lib::id::DomainId;
 use narf_tracing::FlightRing;
 
@@ -242,26 +240,26 @@ pub fn enable_user_reads(cap: &Cap<Pmu, Write>) -> Result<(), ObsError> {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct ArchRegs {
-    pub rax:    u64,
-    pub rbx:    u64,
-    pub rcx:    u64,
-    pub rdx:    u64,
-    pub rsi:    u64,
-    pub rdi:    u64,
-    pub rbp:    u64,
-    pub rsp:    u64,
-    pub r8:     u64,
-    pub r9:     u64,
-    pub r10:    u64,
-    pub r11:    u64,
-    pub r12:    u64,
-    pub r13:    u64,
-    pub r14:    u64,
-    pub r15:    u64,
-    pub rip:    u64,
+    pub rax: u64,
+    pub rbx: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub rbp: u64,
+    pub rsp: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    pub rip: u64,
     pub rflags: u64,
-    pub cs:     u64,
-    pub ss:     u64,
+    pub cs: u64,
+    pub ss: u64,
 }
 
 /// aarch64 register state captured at fault time.
@@ -269,9 +267,9 @@ pub struct ArchRegs {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct ArchRegs {
-    pub x:      [u64; 31],
-    pub sp:     u64,
-    pub pc:     u64,
+    pub x: [u64; 31],
+    pub sp: u64,
+    pub pc: u64,
     pub pstate: u64,
 }
 
@@ -289,27 +287,27 @@ pub const CRASH_STACK_WORDS: usize = 128;
 #[derive(Copy, Clone)]
 pub struct CrashFrame {
     /// Architectural registers at fault.
-    pub registers:       ArchRegs,
+    pub registers: ArchRegs,
     /// Up to `CRASH_STACK_WORDS` words from the stack starting at the
     /// faulting SP / RSP. Reads past the end of valid stack are zero-
     /// filled — the dump consumer treats trailing zeros as truncation
     /// rather than data per spec §3.3 partial-dump rules.
-    pub stack:           [u64; CRASH_STACK_WORDS],
+    pub stack: [u64; CRASH_STACK_WORDS],
     /// Faulting instruction pointer (mirrors `registers.rip` /
     /// `registers.pc` for arch-agnostic consumers).
     pub instruction_ptr: u64,
     /// Domain that was active when the fault hit — drives the
     /// "Domain fault section" attribution in the core dump.
-    pub domain:          DomainId,
+    pub domain: DomainId,
 }
 
 impl Default for CrashFrame {
     fn default() -> Self {
         Self {
-            registers:       ArchRegs::default(),
-            stack:           [0; CRASH_STACK_WORDS],
+            registers: ArchRegs::default(),
+            stack: [0; CRASH_STACK_WORDS],
             instruction_ptr: 0,
-            domain:          DomainId::FRAME,
+            domain: DomainId::FRAME,
         }
     }
 }
@@ -318,7 +316,7 @@ impl core::fmt::Debug for CrashFrame {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("CrashFrame")
             .field("instruction_ptr", &self.instruction_ptr)
-            .field("domain",          &self.domain)
+            .field("domain", &self.domain)
             .finish_non_exhaustive()
     }
 }
@@ -335,10 +333,10 @@ impl core::fmt::Debug for CrashFrame {
 /// trap context.
 pub fn capture_crash_frame(regs: ArchRegs) -> CrashFrame {
     let mut frame = CrashFrame {
-        registers:       regs,
-        stack:           [0; CRASH_STACK_WORDS],
+        registers: regs,
+        stack: [0; CRASH_STACK_WORDS],
         instruction_ptr: 0,
-        domain:          DomainId::new(narf_arch_current_domain_raw()),
+        domain: DomainId::new(narf_arch_current_domain_raw()),
     };
 
     #[cfg(target_arch = "x86_64")]
@@ -420,11 +418,11 @@ pub const SNAPSHOT_CAPACITY: usize = 64;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ObservabilityEvent {
     /// PMU reading at a checkpoint.
-    Pmu        { cycles:       u64, instructions: u64 },
+    Pmu { cycles: u64, instructions: u64 },
     /// Capability invocation reached the dispatcher.
-    CapInvoke  { kind:         u64, generation:   u64 },
+    CapInvoke { kind: u64, generation: u64 },
     /// Panic crossed our hook.
-    Panic      { ip:           u64, domain:       u64 },
+    Panic { ip: u64, domain: u64 },
 }
 
 /// Snapshot returned by `take_snapshot` — a frozen view of up to
@@ -432,17 +430,21 @@ pub enum ObservabilityEvent {
 #[derive(Copy, Clone)]
 pub struct CoreSnapshot {
     entries: [ObservabilityEvent; SNAPSHOT_CAPACITY],
-    len:     usize,
+    len: usize,
 }
 
 impl CoreSnapshot {
     /// Number of valid entries. `entries[..len()]` are live; the rest
     /// are placeholder zero-tagged variants.
     #[inline]
-    pub fn len(&self) -> usize { self.len }
+    pub fn len(&self) -> usize {
+        self.len
+    }
 
     #[inline]
-    pub fn is_empty(&self) -> bool { self.len == 0 }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 
     /// Frozen slice of the most-recent-first entries.
     #[inline]
@@ -466,8 +468,8 @@ impl core::fmt::Debug for CoreSnapshot {
 // the freed-memory race is structural, but the guard keeps the API
 // future-proof.
 
-static PANIC_RING: AtomicPtr<FlightRing<ObservabilityEvent, SNAPSHOT_CAPACITY>>
-    = AtomicPtr::new(core::ptr::null_mut());
+static PANIC_RING: AtomicPtr<FlightRing<ObservabilityEvent, SNAPSHOT_CAPACITY>> =
+    AtomicPtr::new(core::ptr::null_mut());
 
 /// Tracks how many rings have been installed across a boot — used by
 /// tests to confirm the install happened without inspecting the
@@ -486,10 +488,7 @@ pub fn install_panic_snapshot(
     ring: &'static FlightRing<ObservabilityEvent, SNAPSHOT_CAPACITY>,
 ) -> Result<(), ObsError> {
     cap.invoke(NoopOp)?;
-    PANIC_RING.store(
-        ring as *const _ as *mut _,
-        Ordering::Release,
-    );
+    PANIC_RING.store(ring as *const _ as *mut _, Ordering::Release);
     INSTALL_COUNT.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
@@ -498,7 +497,9 @@ pub fn install_panic_snapshot(
 /// boot. Stage-2 tests use this; Stage-4 monitoring may surface it as
 /// a counter.
 #[inline]
-pub fn install_count() -> usize { INSTALL_COUNT.load(Ordering::Relaxed) }
+pub fn install_count() -> usize {
+    INSTALL_COUNT.load(Ordering::Relaxed)
+}
 
 /// Take a snapshot of the installed panic ring, if any.
 ///
@@ -508,20 +509,23 @@ pub fn install_count() -> usize { INSTALL_COUNT.load(Ordering::Relaxed) }
 /// (matching `FlightRing::snapshot`).
 pub fn take_snapshot() -> Option<CoreSnapshot> {
     let ptr = PANIC_RING.load(Ordering::Acquire);
-    if ptr.is_null() { return None; }
+    if ptr.is_null() {
+        return None;
+    }
 
     // SAFETY: Installation only accepts `&'static FlightRing`, so the
     // pointer is valid for the lifetime of the kernel. We hold no
     // exclusive access — `FlightRing::snapshot` takes `&self`.
-    let ring: &'static FlightRing<ObservabilityEvent, SNAPSHOT_CAPACITY>
-        = unsafe { &*ptr };
+    let ring: &'static FlightRing<ObservabilityEvent, SNAPSHOT_CAPACITY> = unsafe { &*ptr };
 
     // Placeholder fill: any unused tail stays zero-tagged but we never
     // expose it via `entries()`.
     let mut snap = CoreSnapshot {
-        entries: [ObservabilityEvent::Pmu { cycles: 0, instructions: 0 };
-                  SNAPSHOT_CAPACITY],
-        len:     0,
+        entries: [ObservabilityEvent::Pmu {
+            cycles: 0,
+            instructions: 0,
+        }; SNAPSHOT_CAPACITY],
+        len: 0,
     };
     let filled = ring.snapshot(&mut snap.entries);
     snap.len = filled;
@@ -550,9 +554,12 @@ pub fn sample_pmu(
     cap: &Cap<Pmu, Read>,
     ring: &FlightRing<ObservabilityEvent, SNAPSHOT_CAPACITY>,
 ) -> Result<(), ObsError> {
-    let cycles       = read_cycles(cap)?;
+    let cycles = read_cycles(cap)?;
     let instructions = read_instructions(cap).unwrap_or(0);
-    ring.record(ObservabilityEvent::Pmu { cycles, instructions });
+    ring.record(ObservabilityEvent::Pmu {
+        cycles,
+        instructions,
+    });
     Ok(())
 }
 
@@ -564,13 +571,13 @@ pub fn sample_pmu(
 /// `Send + Sync`, and the `&'static FlightRing` is trivially both).
 #[derive(Debug)]
 pub struct PmuProbeHandler {
-    cap:  Cap<Pmu, Read>,
+    cap: Cap<Pmu, Read>,
     ring: &'static FlightRing<ObservabilityEvent, SNAPSHOT_CAPACITY>,
 }
 
 impl PmuProbeHandler {
     pub const fn new(
-        cap:  Cap<Pmu, Read>,
+        cap: Cap<Pmu, Read>,
         ring: &'static FlightRing<ObservabilityEvent, SNAPSHOT_CAPACITY>,
     ) -> Self {
         Self { cap, ring }
@@ -596,15 +603,14 @@ impl narf_tracing::ProbeHandler for PmuProbeHandler {
 /// flight-recorder snapshot, when a recorder has been installed.
 #[derive(Copy, Clone, Debug)]
 pub struct CoreDump {
-    pub frame:    CrashFrame,
+    pub frame: CrashFrame,
     pub snapshot: Option<CoreSnapshot>,
 }
 
 /// Capture a Stage-3 core dump: CPU state + panic-ring snapshot.
 pub fn capture_core_dump(regs: ArchRegs) -> CoreDump {
     CoreDump {
-        frame:    capture_crash_frame(regs),
+        frame: capture_crash_frame(regs),
         snapshot: take_snapshot(),
     }
 }
-

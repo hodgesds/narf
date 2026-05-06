@@ -36,7 +36,7 @@
 
 use crate::x86_64::msr::{rdmsr, wrmsr};
 
-pub const MSR_IA32_MTRRCAP:       u32 = 0xFE;
+pub const MSR_IA32_MTRRCAP: u32 = 0xFE;
 pub const MSR_IA32_MTRR_DEF_TYPE: u32 = 0x2FF;
 const MSR_PHYSBASE_BASE: u32 = 0x200;
 const MSR_PHYSMASK_BASE: u32 = 0x201;
@@ -45,11 +45,11 @@ const MSR_PHYSMASK_BASE: u32 = 0x201;
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MemType {
-    Uncacheable     = 0,
-    WriteCombining  = 1,
-    WriteThrough    = 4,
-    WriteProtected  = 5,
-    WriteBack       = 6,
+    Uncacheable = 0,
+    WriteCombining = 1,
+    WriteThrough = 4,
+    WriteProtected = 5,
+    WriteBack = 6,
 }
 
 impl MemType {
@@ -71,9 +71,9 @@ pub struct MtrrCap {
     /// Number of variable-range registers (low byte).
     pub vcnt: u8,
     /// Fixed-range MTRRs supported.
-    pub fix:  bool,
+    pub fix: bool,
     /// Write-combining memory type supported.
-    pub wc:   bool,
+    pub wc: bool,
     /// SMRR present.
     pub smrr: bool,
 }
@@ -82,8 +82,8 @@ impl MtrrCap {
     pub fn decode(raw: u64) -> Self {
         Self {
             vcnt: (raw & 0xFF) as u8,
-            fix:  raw & (1 << 8)  != 0,
-            wc:   raw & (1 << 10) != 0,
+            fix: raw & (1 << 8) != 0,
+            wc: raw & (1 << 10) != 0,
             smrr: raw & (1 << 11) != 0,
         }
     }
@@ -94,17 +94,17 @@ impl MtrrCap {
 pub struct DefType {
     pub default: MemType,
     /// Fixed-range MTRRs enabled.
-    pub fe:      bool,
+    pub fe: bool,
     /// MTRRs globally enabled.
-    pub e:       bool,
+    pub e: bool,
 }
 
 impl DefType {
     pub fn decode(raw: u64) -> Self {
         Self {
             default: MemType::from_raw((raw & 0xFF) as u8).unwrap_or(MemType::Uncacheable),
-            fe:      raw & (1 << 10) != 0,
-            e:       raw & (1 << 11) != 0,
+            fe: raw & (1 << 10) != 0,
+            e: raw & (1 << 11) != 0,
         }
     }
 }
@@ -154,17 +154,14 @@ pub unsafe fn read_variable(idx: u8) -> (u64, u64) {
 /// # Safety
 /// CPL = 0; `idx < cap().vcnt`; the address window must be
 /// reasonable (claimed by the device behind the BAR).
-pub unsafe fn set_variable(
-    idx:        u8,
-    phys:       u64,
-    size_bytes: u64,
-    mem_type:   MemType,
-) {
-    if !size_bytes.is_power_of_two() { return; }
+pub unsafe fn set_variable(idx: u8, phys: u64, size_bytes: u64, mem_type: MemType) {
+    if !size_bytes.is_power_of_two() {
+        return;
+    }
     let mask_bits = !(size_bytes - 1) & 0x000F_FFFF_FFFF_F000;
     let physbase = (phys & 0x000F_FFFF_FFFF_F000) | (mem_type as u64);
-    let physmask = mask_bits | (1 << 11);  // V (valid) bit 11.
-    // SAFETY: caller-asserted.
+    let physmask = mask_bits | (1 << 11); // V (valid) bit 11.
+                                          // SAFETY: caller-asserted.
     unsafe {
         wrmsr(MSR_PHYSBASE_BASE + 2 * idx as u32, physbase);
         wrmsr(MSR_PHYSMASK_BASE + 2 * idx as u32, physmask);
@@ -181,7 +178,9 @@ pub unsafe fn find_free_slot() -> Option<u8> {
     for i in 0..cap.vcnt {
         // SAFETY: caller-asserted.
         let (_b, m) = unsafe { read_variable(i) };
-        if m & (1 << 11) == 0 { return Some(i); }
+        if m & (1 << 11) == 0 {
+            return Some(i);
+        }
     }
     None
 }
@@ -199,6 +198,8 @@ pub unsafe fn set_write_combining(phys: u64, size_bytes: u64) -> Option<u8> {
     // SAFETY: caller-asserted.
     let slot = unsafe { find_free_slot() }?;
     // SAFETY: same.
-    unsafe { set_variable(slot, phys, size_bytes, MemType::WriteCombining); }
+    unsafe {
+        set_variable(slot, phys, size_bytes, MemType::WriteCombining);
+    }
     Some(slot)
 }

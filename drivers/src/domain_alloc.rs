@@ -37,9 +37,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 
 #[cfg(target_arch = "x86_64")]
-use narf_memory::domain::{
-    domain_va_base, map_domain_private, DomainMapError,
-};
+use narf_memory::domain::{domain_va_base, map_domain_private, DomainMapError};
 #[cfg(target_arch = "x86_64")]
 use narf_memory::paging::PtFlags;
 #[cfg(target_arch = "x86_64")]
@@ -58,12 +56,12 @@ pub enum DomainAllocError {
 impl From<DomainMapError> for DomainAllocError {
     fn from(e: DomainMapError) -> Self {
         match e {
-            DomainMapError::BadDomain                  => DomainAllocError::BadDomain,
-            DomainMapError::AddressOutsideDomainRange  => DomainAllocError::OutOfRange,
-            DomainMapError::NoPml4Registered           => DomainAllocError::MapFailed,
-            DomainMapError::PdptNotInstalled           => DomainAllocError::MapFailed,
-            DomainMapError::FrameExhausted             => DomainAllocError::MapFailed,
-            DomainMapError::Map(_)                     => DomainAllocError::MapFailed,
+            DomainMapError::BadDomain => DomainAllocError::BadDomain,
+            DomainMapError::AddressOutsideDomainRange => DomainAllocError::OutOfRange,
+            DomainMapError::NoPml4Registered => DomainAllocError::MapFailed,
+            DomainMapError::PdptNotInstalled => DomainAllocError::MapFailed,
+            DomainMapError::FrameExhausted => DomainAllocError::MapFailed,
+            DomainMapError::Map(_) => DomainAllocError::MapFailed,
         }
     }
 }
@@ -78,29 +76,34 @@ const DOMAIN_HEAP_OFFSET: u64 = 0x10_0000; // 1 MiB
 const NUM_DOMAINS: usize = 16;
 
 #[cfg(target_arch = "x86_64")]
-static NEXT_VA: [AtomicU64; NUM_DOMAINS] = [
-    const { AtomicU64::new(0) }; NUM_DOMAINS
-];
+static NEXT_VA: [AtomicU64; NUM_DOMAINS] = [const { AtomicU64::new(0) }; NUM_DOMAINS];
 
 /// Per-domain free list of `(va_base, byte_len)` chunks released by
 /// `release`. Reused before the bump pointer advances. Not
 /// coalesced — see module doc.
 #[cfg(target_arch = "x86_64")]
-static FREE_LIST: [IrqSafeSpinLock<Vec<(u64, u64)>>; NUM_DOMAINS] = [
-    const { IrqSafeSpinLock::new(Vec::new()) }; NUM_DOMAINS
-];
+static FREE_LIST: [IrqSafeSpinLock<Vec<(u64, u64)>>; NUM_DOMAINS] =
+    [const { IrqSafeSpinLock::new(Vec::new()) }; NUM_DOMAINS];
 
 /// Number of bytes claimed in `domain`'s private heap so far.
 #[cfg(target_arch = "x86_64")]
 pub fn claimed_in_domain(domain: u8) -> u64 {
-    if (domain as usize) >= NUM_DOMAINS { return 0; }
+    if (domain as usize) >= NUM_DOMAINS {
+        return 0;
+    }
     let base = domain_va_base(domain).unwrap_or(0);
     let next = NEXT_VA[domain as usize].load(Ordering::Relaxed);
-    if next < base + DOMAIN_HEAP_OFFSET { 0 } else { next - (base + DOMAIN_HEAP_OFFSET) }
+    if next < base + DOMAIN_HEAP_OFFSET {
+        0
+    } else {
+        next - (base + DOMAIN_HEAP_OFFSET)
+    }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-pub fn claimed_in_domain(_domain: u8) -> u64 { 0 }
+pub fn claimed_in_domain(_domain: u8) -> u64 {
+    0
+}
 
 /// Claim a fresh private VA range in `domain`, mapping `len` bytes
 /// of MMIO starting at `pa`. Returns the base VA (4 KiB-aligned)
@@ -118,9 +121,9 @@ pub fn claimed_in_domain(_domain: u8) -> u64 { 0 }
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn claim_mmio_in_domain(
     domain: u8,
-    pa:     u64,
-    len:    usize,
-    flags:  PtFlags,
+    pa: u64,
+    len: usize,
+    flags: PtFlags,
 ) -> Result<u64, DomainAllocError> {
     if (domain as usize) >= NUM_DOMAINS {
         return Err(DomainAllocError::BadDomain);
@@ -134,7 +137,10 @@ pub unsafe fn claim_mmio_in_domain(
         let mut fl = FREE_LIST[domain as usize].lock();
         let mut hit: Option<usize> = None;
         for (i, &(_, l)) in fl.iter().enumerate() {
-            if l == bytes { hit = Some(i); break; }
+            if l == bytes {
+                hit = Some(i);
+                break;
+            }
         }
         if let Some(i) = hit {
             let (va, _) = fl.remove(i);
@@ -157,10 +163,12 @@ pub unsafe fn claim_mmio_in_domain(
     // Map each 4 KiB page.
     for i in 0..pages {
         let va = VirtAddr::new(va_base + (i as u64) * 4096);
-        let p  = PhysAddr::new(pa + (i as u64) * 4096);
+        let p = PhysAddr::new(pa + (i as u64) * 4096);
         // SAFETY: caller-asserted pa validity; va is freshly bumped
         // (no prior mapping at it); flags chosen by caller.
-        unsafe { map_domain_private(domain, va, p, flags)?; }
+        unsafe {
+            map_domain_private(domain, va, p, flags)?;
+        }
     }
     Ok(va_base)
 }
@@ -179,14 +187,14 @@ pub unsafe fn claim_mmio_in_domain(
 ///   (capability revocation is the typical sequencing tool here).
 /// - `va_base` and `len` must match the prior claim.
 #[cfg(target_arch = "x86_64")]
-pub unsafe fn release(domain: u8, va_base: u64, len: usize)
-    -> Result<(), DomainAllocError>
-{
+pub unsafe fn release(domain: u8, va_base: u64, len: usize) -> Result<(), DomainAllocError> {
     if (domain as usize) >= NUM_DOMAINS {
         return Err(DomainAllocError::BadDomain);
     }
     let pml4_phys = narf_arch::x86_64::pcid::get_domain_pml4(domain);
-    if pml4_phys == 0 { return Err(DomainAllocError::MapFailed); }
+    if pml4_phys == 0 {
+        return Err(DomainAllocError::MapFailed);
+    }
 
     let pages = (len + 0xFFF) >> 12;
     let bytes = (pages as u64) << 12;
@@ -222,9 +230,7 @@ pub unsafe fn release(domain: u8, va_base: u64, len: usize)
 
 /// `release` on non-x86_64 targets: reports unsupported.
 #[cfg(not(target_arch = "x86_64"))]
-pub unsafe fn release(_domain: u8, _va_base: u64, _len: usize)
-    -> Result<(), DomainAllocError>
-{
+pub unsafe fn release(_domain: u8, _va_base: u64, _len: usize) -> Result<(), DomainAllocError> {
     Err(DomainAllocError::UnsupportedArch)
 }
 
@@ -232,19 +238,23 @@ pub unsafe fn release(_domain: u8, _va_base: u64, _len: usize)
 /// Test helper.
 #[cfg(target_arch = "x86_64")]
 pub fn free_chunks_in_domain(domain: u8) -> usize {
-    if (domain as usize) >= NUM_DOMAINS { return 0; }
+    if (domain as usize) >= NUM_DOMAINS {
+        return 0;
+    }
     FREE_LIST[domain as usize].lock().len()
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-pub fn free_chunks_in_domain(_domain: u8) -> usize { 0 }
+pub fn free_chunks_in_domain(_domain: u8) -> usize {
+    0
+}
 
 #[cfg(not(target_arch = "x86_64"))]
 pub unsafe fn claim_mmio_in_domain(
     _domain: u8,
-    _pa:     u64,
-    _len:    usize,
-    _flags:  u64,
+    _pa: u64,
+    _len: usize,
+    _flags: u64,
 ) -> Result<u64, DomainAllocError> {
     Err(DomainAllocError::UnsupportedArch)
 }
@@ -254,14 +264,14 @@ pub unsafe fn claim_mmio_in_domain(
 /// hasn't been registered yet.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn claim_mmio_for_driver(
-    name:  &str,
-    pa:    u64,
-    len:   usize,
+    name: &str,
+    pa: u64,
+    len: usize,
     flags: PtFlags,
 ) -> Result<u64, DomainAllocError> {
     let domain = match crate::bound::domain_of(name) {
         Some(d) => d,
-        None    => return Err(DomainAllocError::BadDomain),
+        None => return Err(DomainAllocError::BadDomain),
     };
     // SAFETY: caller-asserted MMIO validity carries through.
     unsafe { claim_mmio_in_domain(domain, pa, len, flags) }

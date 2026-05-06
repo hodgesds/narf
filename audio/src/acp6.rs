@@ -44,9 +44,9 @@ use narf_capabilities::{Cap, Write};
 use narf_lib::sync::IrqSafeSpinLock;
 
 /// Advanced Micro Devices, Inc.
-pub const ACP_VENDOR:    u16 = 0x1022;
+pub const ACP_VENDOR: u16 = 0x1022;
 /// AMD Phoenix ACP6.0 Audio Coprocessor.
-pub const ACP_PHOENIX:   u16 = 0x15E2;
+pub const ACP_PHOENIX: u16 = 0x15E2;
 
 // ── BAR0 register-block offsets ────────────────────────────────────
 //
@@ -57,33 +57,33 @@ pub const ACP_PHOENIX:   u16 = 0x15E2;
 mod regs {
     /// `ACP_VERSION` — vendor / revision triple. Used as a
     /// presence test (`0xFFFFFFFF` ↔ device-gone / D3cold).
-    pub const ACP_VERSION:    u64 = 0x100;
-    pub const VERSION_GONE:   u32 = 0xFFFF_FFFF;
+    pub const ACP_VERSION: u64 = 0x100;
+    pub const VERSION_GONE: u32 = 0xFFFF_FFFF;
 
     /// `ACP_SOFT_RESET` — write the SOFT_RESET bit, poll
     /// `ACP_SOFT_RESET_DONE`.
     pub const ACP_SOFT_RESET: u64 = 0x104;
     /// `ACP_CONTROL` — bit 0 = ClkEn, bit 1 = Run.
-    pub const ACP_CONTROL:    u64 = 0x108;
+    pub const ACP_CONTROL: u64 = 0x108;
     /// `ACP_STATUS` — bit 0 = ACP_BUSY, bit 1 = READY.
-    pub const ACP_STATUS:     u64 = 0x10C;
+    pub const ACP_STATUS: u64 = 0x10C;
 
     /// `ACP_RI_ADDR` — phys base (low / high split).
     pub const ACP_RI_ADDR_LO: u64 = 0x130;
     pub const ACP_RI_ADDR_HI: u64 = 0x134;
     /// `ACP_RI_SIZE` — bytes.
-    pub const ACP_RI_SIZE:    u64 = 0x138;
+    pub const ACP_RI_SIZE: u64 = 0x138;
     /// `ACP_RI_KICK` — write 1 to start the DMA load.
-    pub const ACP_RI_KICK:    u64 = 0x13C;
+    pub const ACP_RI_KICK: u64 = 0x13C;
 
     /// `ACP_SOFT_RESET` bits.
     pub const RESET_REQUEST: u32 = 1 << 0;
-    pub const RESET_DONE:    u32 = 1 << 16;
+    pub const RESET_DONE: u32 = 1 << 16;
     /// `ACP_CONTROL` bits.
     pub const CONTROL_CLKEN: u32 = 1 << 0;
-    pub const CONTROL_RUN:   u32 = 1 << 1;
+    pub const CONTROL_RUN: u32 = 1 << 1;
     /// `ACP_STATUS` bits.
-    pub const STATUS_READY:  u32 = 1 << 1;
+    pub const STATUS_READY: u32 = 1 << 1;
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -103,7 +103,7 @@ pub enum AcpError {
 /// Decoded `ACP_VERSION` register.
 #[derive(Copy, Clone, Debug)]
 pub struct AcpVersion {
-    pub raw:   u32,
+    pub raw: u32,
     /// Major version field (high byte of bits[31:16]).
     pub major: u8,
     /// Minor version field (low byte of bits[15:0]).
@@ -114,7 +114,7 @@ pub struct AcpVersion {
 /// completed. Post-firmware: RI loaded, RUN bit set, PDM
 /// channels addressable.
 pub struct AcpDevice {
-    pub mmio:    MmioRegion,
+    pub mmio: MmioRegion,
     pub version: AcpVersion,
     pub fw_loaded: bool,
 }
@@ -122,7 +122,7 @@ pub struct AcpDevice {
 impl core::fmt::Debug for AcpDevice {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("AcpDevice")
-            .field("version",   &self.version)
+            .field("version", &self.version)
             .field("fw_loaded", &self.fw_loaded)
             .finish_non_exhaustive()
     }
@@ -136,11 +136,10 @@ impl AcpDevice {
     /// Caller owns BAR0 exclusively for the duration of probe.
     pub unsafe fn bring_up(
         device: &BusDevice,
-        _cap:   &Cap<BusDeviceCap, Write>,
+        _cap: &Cap<BusDeviceCap, Write>,
     ) -> Result<Self, AcpError> {
         // SAFETY: caller-authority over BAR0.
-        let mmio = unsafe { map_bar(device, 0) }
-            .map_err(|_| AcpError::BarMapFailed)?;
+        let mmio = unsafe { map_bar(device, 0) }.map_err(|_| AcpError::BarMapFailed)?;
 
         // Probe ACP_VERSION as a presence test.
         // SAFETY: identity-mapped MMIO.
@@ -156,23 +155,33 @@ impl AcpDevice {
         // notes: the bit at +16 latches `1` once reset settles;
         // the request bit self-clears.
         // SAFETY: same.
-        unsafe { mmio.write32(regs::ACP_SOFT_RESET, regs::RESET_REQUEST); }
+        unsafe {
+            mmio.write32(regs::ACP_SOFT_RESET, regs::RESET_REQUEST);
+        }
         let mut done = false;
         for _ in 0..1_000_000u32 {
             // SAFETY: same.
             let v = unsafe { mmio.read32(regs::ACP_SOFT_RESET) };
-            if v & regs::RESET_DONE != 0 { done = true; break; }
+            if v & regs::RESET_DONE != 0 {
+                done = true;
+                break;
+            }
             core::hint::spin_loop();
         }
-        if !done { return Err(AcpError::ResetTimeout); }
+        if !done {
+            return Err(AcpError::ResetTimeout);
+        }
 
         // Enable the ACP clock so RI DMA load can run; leave RUN
         // clear (set on firmware-load completion).
         // SAFETY: same.
-        unsafe { mmio.write32(regs::ACP_CONTROL, regs::CONTROL_CLKEN); }
+        unsafe {
+            mmio.write32(regs::ACP_CONTROL, regs::CONTROL_CLKEN);
+        }
 
         Ok(Self {
-            mmio, version,
+            mmio,
+            version,
             fw_loaded: false,
         })
     }
@@ -196,20 +205,15 @@ impl AcpDevice {
     /// alive until this function returns.
     pub unsafe fn load_firmware(
         &mut self,
-        fw_authority: &Cap<
-            narf_firmware::FirmwareRegistry, narf_capabilities::Read,
-        >,
+        fw_authority: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
     ) -> Result<(), AcpError> {
-        let cap = narf_firmware::open(
-            "amd/acp/sof-rn.ri", fw_authority,
-        ).map_err(|e| match e {
+        let cap = narf_firmware::open("amd/acp/sof-rn.ri", fw_authority).map_err(|e| match e {
             narf_firmware::FirmwareError::NotFound => AcpError::FirmwareMissing,
-            _                                     => AcpError::FirmwareLoadFailed,
+            _ => AcpError::FirmwareLoadFailed,
         })?;
-        let view = narf_firmware::view_of(&cap)
-            .map_err(|_| AcpError::FirmwareLoadFailed)?;
+        let view = narf_firmware::view_of(&cap).map_err(|_| AcpError::FirmwareLoadFailed)?;
         let phys = view.phys;
-        let len  = view.bytes.len() as u32;
+        let len = view.bytes.len() as u32;
         // SAFETY: BAR0 mapped, exclusive owner.
         unsafe {
             self.mmio.write32(regs::ACP_RI_ADDR_LO, phys as u32);
@@ -218,69 +222,83 @@ impl AcpDevice {
         }
         compiler_fence(Ordering::SeqCst);
         // SAFETY: same.
-        unsafe { self.mmio.write32(regs::ACP_RI_KICK, 1); }
+        unsafe {
+            self.mmio.write32(regs::ACP_RI_KICK, 1);
+        }
 
         // Wait for ACP_STATUS.READY.
         let mut ready = false;
         for _ in 0..10_000_000u32 {
             // SAFETY: same.
             let s = unsafe { self.mmio.read32(regs::ACP_STATUS) };
-            if s & regs::STATUS_READY != 0 { ready = true; break; }
+            if s & regs::STATUS_READY != 0 {
+                ready = true;
+                break;
+            }
             core::hint::spin_loop();
         }
-        if !ready { return Err(AcpError::FirmwareLoadFailed); }
+        if !ready {
+            return Err(AcpError::FirmwareLoadFailed);
+        }
 
         // Set RUN.
         // SAFETY: same.
         unsafe {
-            self.mmio.write32(regs::ACP_CONTROL,
-                regs::CONTROL_CLKEN | regs::CONTROL_RUN);
+            self.mmio
+                .write32(regs::ACP_CONTROL, regs::CONTROL_CLKEN | regs::CONTROL_RUN);
         }
 
         // Record the firmware-version coupling for observability.
-        narf_drivers::set_bound_firmware("acp6", narf_drivers::BoundFirmware {
-            blob_name: alloc::string::String::from("amd/acp/sof-rn.ri"),
-            sha256:    view.sha256,
-            signer:    view.signer,
-            version:   None,
-        });
+        narf_drivers::set_bound_firmware(
+            "acp6",
+            narf_drivers::BoundFirmware {
+                blob_name: alloc::string::String::from("amd/acp/sof-rn.ri"),
+                sha256: view.sha256,
+                signer: view.signer,
+                version: None,
+            },
+        );
 
         self.fw_loaded = true;
         Ok(())
     }
 
-    pub fn version(&self) -> AcpVersion { self.version }
-    pub fn is_ready(&self) -> bool { self.fw_loaded }
+    pub fn version(&self) -> AcpVersion {
+        self.version
+    }
+    pub fn is_ready(&self) -> bool {
+        self.fw_loaded
+    }
 }
 
 // ── Driver-match registration ───────────────────────────────────────
 
-static CONTROLLER: IrqSafeSpinLock<Option<AcpDevice>> =
-    IrqSafeSpinLock::new(None);
+static CONTROLLER: IrqSafeSpinLock<Option<AcpDevice>> = IrqSafeSpinLock::new(None);
 
-pub fn probe(
-    device: BusDevice,
-    cap:    Cap<BusDeviceCap, Write>,
-) -> Result<(), narf_bus::ProbeError> {
-    if CONTROLLER.lock().is_some() { return Ok(()); }
+pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
+    if CONTROLLER.lock().is_some() {
+        return Ok(());
+    }
     narf_bus::pci::set_command(
-        &cap, &device,
+        &cap,
+        &device,
         narf_bus::pci::cmd::MEM_SPACE
             | narf_bus::pci::cmd::BUS_MASTER
             | narf_bus::pci::cmd::INTX_DISABLE,
-    ).map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    )
+    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // SAFETY: caller-authority.
     let dev = match unsafe { AcpDevice::bring_up(&device, &cap) } {
-        Ok(d)  => d,
+        Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
     *CONTROLLER.lock() = Some(dev);
     narf_drivers::record_bound(narf_drivers::BoundDriver {
-        name:    alloc::string::String::from("acp6"),
-        kind:    narf_drivers::BoundKind::Audio,
+        name: alloc::string::String::from("acp6"),
+        kind: narf_drivers::BoundKind::Audio,
         pci_vid: Some(device.id.vendor),
         pci_did: Some(device.id.device),
-        domain:  narf_drivers::BoundKind::Audio.default_domain(),
+        domain: narf_drivers::BoundKind::Audio.default_domain(),
     });
     Ok(())
 }
@@ -289,13 +307,16 @@ pub fn register_pci_driver() {
     narf_bus::register_pci_driver(narf_bus::PciMatch {
         name: "acp6",
         kind: narf_bus::MatchKind::VendorDevice {
-            vendor: ACP_VENDOR, device: ACP_PHOENIX,
+            vendor: ACP_VENDOR,
+            device: ACP_PHOENIX,
         },
         probe,
     });
 }
 
-pub fn is_probed() -> bool { CONTROLLER.lock().is_some() }
+pub fn is_probed() -> bool {
+    CONTROLLER.lock().is_some()
+}
 
 pub fn with_controller<R>(f: impl FnOnce(&AcpDevice) -> R) -> Option<R> {
     CONTROLLER.lock().as_ref().map(f)

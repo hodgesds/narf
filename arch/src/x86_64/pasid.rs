@@ -24,7 +24,9 @@ const PASID_VALID: u64 = 1 << 31;
 pub fn supported() -> bool {
     // SAFETY: leaf 0 always defined.
     let max = unsafe { cpuid(0, 0).0 };
-    if max < 7 { return false; }
+    if max < 7 {
+        return false;
+    }
     // SAFETY: leaf 7 valid.
     let (_, _, ecx, _) = unsafe { cpuid(7, 0) };
     ecx & (1 << 2) != 0
@@ -46,7 +48,9 @@ pub unsafe fn read() -> u64 {
 pub unsafe fn write(pasid: u32) {
     let v = (pasid as u64 & 0xFFFFF) | PASID_VALID;
     // SAFETY: caller-asserted.
-    unsafe { wrmsr(MSR_IA32_PASID, v); }
+    unsafe {
+        wrmsr(MSR_IA32_PASID, v);
+    }
 }
 
 /// Clear the valid bit.
@@ -55,5 +59,7 @@ pub unsafe fn write(pasid: u32) {
 /// CPL = 0; PASID supported.
 pub unsafe fn invalidate() {
     // SAFETY: caller-asserted.
-    unsafe { wrmsr(MSR_IA32_PASID, 0); }
+    unsafe {
+        wrmsr(MSR_IA32_PASID, 0);
+    }
 }

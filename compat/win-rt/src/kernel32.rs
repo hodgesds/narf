@@ -24,7 +24,7 @@ pub struct Export {
     /// PE ABI (`extern "win64"` on x86_64, `extern "C"` on
     /// aarch64) without an ABI-changing fn-pointer cast — the
     /// loader patches the IAT slot with this address verbatim.
-    pub addr:   *const (),
+    pub addr: *const (),
 }
 
 // SAFETY: `addr` is a static function pointer; sharing it across
@@ -42,10 +42,10 @@ unsafe impl Sync for Export {}
 #[unsafe(no_mangle)]
 pub extern "win64" fn GetStdHandle(handle_id: i32) -> u64 {
     match handle_id {
-        stdhandle::STD_INPUT_HANDLE  => handle::STDIN,
+        stdhandle::STD_INPUT_HANDLE => handle::STDIN,
         stdhandle::STD_OUTPUT_HANDLE => handle::STDOUT,
-        stdhandle::STD_ERROR_HANDLE  => handle::STDERR,
-        _                            => stdhandle::INVALID_HANDLE_VALUE,
+        stdhandle::STD_ERROR_HANDLE => handle::STDERR,
+        _ => stdhandle::INVALID_HANDLE_VALUE,
     }
 }
 
@@ -53,10 +53,10 @@ pub extern "win64" fn GetStdHandle(handle_id: i32) -> u64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn GetStdHandle(handle_id: i32) -> u64 {
     match handle_id {
-        stdhandle::STD_INPUT_HANDLE  => handle::STDIN,
+        stdhandle::STD_INPUT_HANDLE => handle::STDIN,
         stdhandle::STD_OUTPUT_HANDLE => handle::STDOUT,
-        stdhandle::STD_ERROR_HANDLE  => handle::STDERR,
-        _                            => stdhandle::INVALID_HANDLE_VALUE,
+        stdhandle::STD_ERROR_HANDLE => handle::STDERR,
+        _ => stdhandle::INVALID_HANDLE_VALUE,
     }
 }
 
@@ -70,15 +70,15 @@ pub extern "C" fn GetStdHandle(handle_id: i32) -> u64 {
 #[cfg(target_arch = "x86_64")]
 #[unsafe(no_mangle)]
 pub unsafe extern "win64" fn WriteConsoleA(
-    h_console:    u64,
-    lp_buffer:    *const u8,
-    n_bytes:      u32,
-    written_out:  *mut u32,
-    _reserved:    u64,
+    h_console: u64,
+    lp_buffer: *const u8,
+    n_bytes: u32,
+    written_out: *mut u32,
+    _reserved: u64,
 ) -> i32 {
     let fd = match handle_to_fd(h_console) {
         Some(f) => f,
-        None    => return 0, // FALSE
+        None => return 0, // FALSE
     };
     if lp_buffer.is_null() {
         return 0;
@@ -91,7 +91,9 @@ pub unsafe extern "win64" fn WriteConsoleA(
     if !written_out.is_null() {
         // SAFETY: caller-supplied pointer; PE is responsible for
         // its validity under the Win32 contract.
-        unsafe { *written_out = n as u32; }
+        unsafe {
+            *written_out = n as u32;
+        }
     }
     1 // TRUE
 }
@@ -99,15 +101,15 @@ pub unsafe extern "win64" fn WriteConsoleA(
 #[cfg(target_arch = "aarch64")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn WriteConsoleA(
-    h_console:    u64,
-    lp_buffer:    *const u8,
-    n_bytes:      u32,
-    written_out:  *mut u32,
-    _reserved:    u64,
+    h_console: u64,
+    lp_buffer: *const u8,
+    n_bytes: u32,
+    written_out: *mut u32,
+    _reserved: u64,
 ) -> i32 {
     let fd = match handle_to_fd(h_console) {
         Some(f) => f,
-        None    => return 0,
+        None => return 0,
     };
     if lp_buffer.is_null() {
         return 0;
@@ -115,7 +117,9 @@ pub unsafe extern "C" fn WriteConsoleA(
     let slice = unsafe { core::slice::from_raw_parts(lp_buffer, n_bytes as usize) };
     let n = rt::write(fd, slice);
     if !written_out.is_null() {
-        unsafe { *written_out = n as u32; }
+        unsafe {
+            *written_out = n as u32;
+        }
     }
     1
 }
@@ -145,10 +149,10 @@ pub extern "C" fn ExitProcess(_code: u32) -> ! {
 /// for an unknown handle.
 fn handle_to_fd(h: u64) -> Option<u32> {
     match h {
-        handle::STDIN  => Some(0),
+        handle::STDIN => Some(0),
         handle::STDOUT => Some(1),
         handle::STDERR => Some(2),
-        _              => None,
+        _ => None,
     }
 }
 
@@ -159,7 +163,19 @@ fn handle_to_fd(h: u64) -> Option<u32> {
 /// runtime VA based on where the rt was mapped in the
 /// WinProcess AS.
 pub const EXPORTS: &[Export] = &[
-    Export { module: "kernel32.dll", symbol: "GetStdHandle",  addr: GetStdHandle  as *const () },
-    Export { module: "kernel32.dll", symbol: "WriteConsoleA", addr: WriteConsoleA as *const () },
-    Export { module: "kernel32.dll", symbol: "ExitProcess",   addr: ExitProcess   as *const () },
+    Export {
+        module: "kernel32.dll",
+        symbol: "GetStdHandle",
+        addr: GetStdHandle as *const (),
+    },
+    Export {
+        module: "kernel32.dll",
+        symbol: "WriteConsoleA",
+        addr: WriteConsoleA as *const (),
+    },
+    Export {
+        module: "kernel32.dll",
+        symbol: "ExitProcess",
+        addr: ExitProcess as *const (),
+    },
 ];

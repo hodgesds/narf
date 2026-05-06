@@ -32,13 +32,13 @@ extern crate alloc;
 
 pub mod e1000;
 pub mod igc;
-pub mod rtl8139;
+pub mod iwlwifi;
+pub mod ixgbe;
+pub mod mlx5;
+pub mod qcnfa765;
 pub mod r8169;
 pub mod rtl8125;
-pub mod qcnfa765;
-pub mod mlx5;
-pub mod ixgbe;
-pub mod iwlwifi;
+pub mod rtl8139;
 
 // Per-driver smoke tests register against `narf-kernel-test` and
 // land in the same `narf.tests` ELF section as the rest of the
@@ -112,13 +112,13 @@ impl NicModel {
     /// coverage lives in each driver's probe table.
     pub const fn primary_pci_id(self) -> (u16, u16) {
         match self {
-            NicModel::IntelE1000      => (0x8086, 0x100E),
-            NicModel::IntelIgb        => (0x8086, 0x10C9),
-            NicModel::IntelIxgbe      => (0x8086, 0x10B6),
-            NicModel::MellanoxMlx5    => (0x15B3, 0x1013),
-            NicModel::RealtekRtl8139  => (0x10EC, 0x8139),
-            NicModel::RealtekRtl8168  => (0x10EC, 0x8168),
-            NicModel::QcnfaQcnfa765   => (0x17CB, 0x1103),
+            NicModel::IntelE1000 => (0x8086, 0x100E),
+            NicModel::IntelIgb => (0x8086, 0x10C9),
+            NicModel::IntelIxgbe => (0x8086, 0x10B6),
+            NicModel::MellanoxMlx5 => (0x15B3, 0x1013),
+            NicModel::RealtekRtl8139 => (0x10EC, 0x8139),
+            NicModel::RealtekRtl8168 => (0x10EC, 0x8168),
+            NicModel::QcnfaQcnfa765 => (0x17CB, 0x1103),
         }
     }
 }
@@ -130,33 +130,38 @@ impl NicModel {
 pub struct NicCaps(pub u32);
 
 impl NicCaps {
-    pub const NONE:            NicCaps = NicCaps(0);
-    pub const TX_CSUM:         NicCaps = NicCaps(1 << 0);
-    pub const RX_CSUM:         NicCaps = NicCaps(1 << 1);
-    pub const TSO:             NicCaps = NicCaps(1 << 2);
-    pub const LRO:             NicCaps = NicCaps(1 << 3);
-    pub const RSS:             NicCaps = NicCaps(1 << 4);
-    pub const MULTICAST_HASH:  NicCaps = NicCaps(1 << 5);
-    pub const VLAN_TAGGING:    NicCaps = NicCaps(1 << 6);
-    pub const PROMISC:         NicCaps = NicCaps(1 << 7);
+    pub const NONE: NicCaps = NicCaps(0);
+    pub const TX_CSUM: NicCaps = NicCaps(1 << 0);
+    pub const RX_CSUM: NicCaps = NicCaps(1 << 1);
+    pub const TSO: NicCaps = NicCaps(1 << 2);
+    pub const LRO: NicCaps = NicCaps(1 << 3);
+    pub const RSS: NicCaps = NicCaps(1 << 4);
+    pub const MULTICAST_HASH: NicCaps = NicCaps(1 << 5);
+    pub const VLAN_TAGGING: NicCaps = NicCaps(1 << 6);
+    pub const PROMISC: NicCaps = NicCaps(1 << 7);
 
-    #[inline] pub const fn contains(self, o: NicCaps) -> bool { self.0 & o.0 == o.0 }
+    #[inline]
+    pub const fn contains(self, o: NicCaps) -> bool {
+        self.0 & o.0 == o.0
+    }
 }
 
 impl core::ops::BitOr for NicCaps {
     type Output = NicCaps;
-    fn bitor(self, rhs: NicCaps) -> Self { NicCaps(self.0 | rhs.0) }
+    fn bitor(self, rhs: NicCaps) -> Self {
+        NicCaps(self.0 | rhs.0)
+    }
 }
 
 /// A single RX/TX descriptor. Direction-agnostic — `dir` disambiguates.
 #[derive(Copy, Clone, Debug)]
 pub struct NicDescriptor {
-    pub dir:    narf_net::Direction,
+    pub dir: narf_net::Direction,
     pub buffer: u64, // physical address
-    pub len:    u32,
+    pub len: u32,
     /// Driver-specific completion bits mirrored here for generic
     /// completion-ring consumers.
-    pub flags:  u16,
+    pub flags: u16,
 }
 
 /// Per-chipset driver trait. `name` / `mac` / `mtu` / `link_up`

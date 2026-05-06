@@ -16,16 +16,16 @@
 //! producer-side `head` advance) replaces self-waking when SMP
 //! IPI plumbing for FB lands.
 
-use core::pin::Pin;
-use core::task::{Context, Poll};
 use core::future::Future;
+use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
+use core::task::{Context, Poll};
 
 use crate::{registry, FbWriter};
 
-static DRAIN_TICKS:    AtomicU64 = AtomicU64::new(0);
+static DRAIN_TICKS: AtomicU64 = AtomicU64::new(0);
 static DRAIN_EXECUTED: AtomicU64 = AtomicU64::new(0);
-static DRAIN_ERRORS:   AtomicU64 = AtomicU64::new(0);
+static DRAIN_ERRORS: AtomicU64 = AtomicU64::new(0);
 
 /// Snapshot the per-tick / per-call counters. Returns
 /// `(ticks, executed, errors)`.
@@ -42,8 +42,8 @@ pub fn stats() -> (u64, u64, u64) {
 pub fn drain_once(writer: &FbWriter) -> (u32, u32) {
     DRAIN_TICKS.fetch_add(1, Ordering::Relaxed);
     let (ok, err) = registry::drain_all(writer);
-    DRAIN_EXECUTED.fetch_add(ok  as u64, Ordering::Relaxed);
-    DRAIN_ERRORS.fetch_add(  err as u64, Ordering::Relaxed);
+    DRAIN_EXECUTED.fetch_add(ok as u64, Ordering::Relaxed);
+    DRAIN_ERRORS.fetch_add(err as u64, Ordering::Relaxed);
     (ok, err)
 }
 
@@ -63,7 +63,9 @@ impl core::fmt::Debug for DrainTask {
 }
 
 impl DrainTask {
-    pub fn new(writer: FbWriter) -> Self { Self { writer } }
+    pub fn new(writer: FbWriter) -> Self {
+        Self { writer }
+    }
 }
 
 impl Future for DrainTask {

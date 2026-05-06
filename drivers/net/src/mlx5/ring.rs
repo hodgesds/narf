@@ -28,8 +28,7 @@
 
 use super::cqe::{decode_cqe, is_hw_owned, CqeView, CQE_LEN};
 use super::wqe::{
-    build_ctrl_segment, build_data_seg_ptr, CqeRequest, SendOpcode,
-    CTRL_SEG_LEN, DATA_SEG_LEN,
+    build_ctrl_segment, build_data_seg_ptr, CqeRequest, SendOpcode, CTRL_SEG_LEN, DATA_SEG_LEN,
 };
 
 /// Stride of one SQ / RQ WQE in bytes.
@@ -45,11 +44,11 @@ pub const MAX_DATA_SEGS_PER_WQE: usize = (WQE_STRIDE - CTRL_SEG_LEN) / DATA_SEG_
 pub struct IoVec {
     /// Virtual address of the buffer (must be in a memory region
     /// covered by `l_key`).
-    pub va:    u64,
+    pub va: u64,
     /// L_KEY of the memory region this buffer lives in.
     pub l_key: u32,
     /// Buffer length in bytes.
-    pub len:   u32,
+    pub len: u32,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -92,16 +91,18 @@ pub fn cq_offset_of(consumer: u32, capacity: u32) -> usize {
 /// into an SQ slot. Returns the bytes; caller writes them at
 /// `sq_offset_of(wqe_idx)`.
 pub fn build_send_wqe(
-    qp_num:    u32,
-    wqe_idx:   u16,
-    opcode:    SendOpcode,
-    cqe_req:   CqeRequest,
-    iovecs:    &[IoVec],
+    qp_num: u32,
+    wqe_idx: u16,
+    opcode: SendOpcode,
+    cqe_req: CqeRequest,
+    iovecs: &[IoVec],
 ) -> Result<[u8; WQE_STRIDE], RingError> {
-    if iovecs.is_empty()
-        { return Err(RingError::NoSegments); }
-    if iovecs.len() > MAX_DATA_SEGS_PER_WQE
-        { return Err(RingError::TooManySegments); }
+    if iovecs.is_empty() {
+        return Err(RingError::NoSegments);
+    }
+    if iovecs.len() > MAX_DATA_SEGS_PER_WQE {
+        return Err(RingError::TooManySegments);
+    }
     // ds = total 16-byte chunks in the WQE = 1 (ctrl) + iovec count.
     let ds = (1 + iovecs.len()) as u8;
     let ctrl = build_ctrl_segment(opcode, qp_num, wqe_idx, ds, cqe_req, /* sig */ 0);
@@ -120,10 +121,12 @@ pub fn build_send_wqe(
 /// the inline-segment-count layout where byte 0x00..0x02 holds the
 /// number of segments (BE u16) and the data segments follow.
 pub fn build_recv_wqe(iovecs: &[IoVec]) -> Result<[u8; WQE_STRIDE], RingError> {
-    if iovecs.is_empty()
-        { return Err(RingError::NoSegments); }
-    if iovecs.len() > MAX_DATA_SEGS_PER_WQE
-        { return Err(RingError::TooManySegments); }
+    if iovecs.is_empty() {
+        return Err(RingError::NoSegments);
+    }
+    if iovecs.len() > MAX_DATA_SEGS_PER_WQE {
+        return Err(RingError::TooManySegments);
+    }
     let mut wqe = [0u8; WQE_STRIDE];
     wqe[0x00..0x02].copy_from_slice(&(iovecs.len() as u16).to_be_bytes());
     for (i, iov) in iovecs.iter().enumerate() {
@@ -138,17 +141,15 @@ pub fn build_recv_wqe(iovecs: &[IoVec]) -> Result<[u8; WQE_STRIDE], RingError> {
 /// Walk the CQ ring starting at `consumer` and return the first
 /// SW-owned CQE if any. Returns `(view, new_consumer)` so callers
 /// can advance their cursor; `None` means no completion ready.
-pub fn pop_completion(
-    cq_bytes: &[u8],
-    capacity: u32,
-    consumer: u32,
-) -> Option<(CqeView, u32)> {
+pub fn pop_completion(cq_bytes: &[u8], capacity: u32, consumer: u32) -> Option<(CqeView, u32)> {
     let off = cq_offset_of(consumer, capacity);
     if off + CQE_STRIDE > cq_bytes.len() {
         return None;
     }
     let mut cqe = [0u8; CQE_LEN];
     cqe.copy_from_slice(&cq_bytes[off..off + CQE_STRIDE]);
-    if is_hw_owned(&cqe) { return None; }
+    if is_hw_owned(&cqe) {
+        return None;
+    }
     Some((decode_cqe(&cqe), consumer.wrapping_add(1)))
 }

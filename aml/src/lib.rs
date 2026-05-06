@@ -71,7 +71,7 @@ impl Value {
     pub fn as_integer(&self) -> u64 {
         match self {
             Value::Integer(v) => *v,
-            Value::Buffer(b)  => {
+            Value::Buffer(b) => {
                 let mut v = 0u64;
                 for (i, byte) in b.iter().take(8).enumerate() {
                     v |= (*byte as u64) << (i * 8);
@@ -103,7 +103,9 @@ pub enum AmlError {
 }
 
 impl From<AcpiError> for AmlError {
-    fn from(e: AcpiError) -> Self { AmlError::Acpi(e) }
+    fn from(e: AcpiError) -> Self {
+        AmlError::Acpi(e)
+    }
 }
 
 /// Kind of an AML namespace node.
@@ -144,8 +146,8 @@ pub enum NameValue {
 /// — children/parent links are derivable by string scan.
 #[derive(Clone, Debug)]
 pub struct AmlNode {
-    pub path:  String,
-    pub kind:  NodeKind,
+    pub path: String,
+    pub kind: NodeKind,
     /// `Some` only when `kind == Name` and the body is a flat
     /// constant we managed to decode.
     pub value: Option<NameValue>,
@@ -165,17 +167,21 @@ struct Namespace {
     /// Method body offsets resolve cheaply. Each node's
     /// `method_body.0` is an offset into this Vec when the node
     /// was registered from `walk_aml_table`.
-    aml:   Vec<u8>,
+    aml: Vec<u8>,
 }
 
-pub(crate) static NAMESPACE: IrqSafeSpinLock<Namespace> =
-    IrqSafeSpinLock::new(Namespace { nodes: Vec::new(), aml: Vec::new() });
+pub(crate) static NAMESPACE: IrqSafeSpinLock<Namespace> = IrqSafeSpinLock::new(Namespace {
+    nodes: Vec::new(),
+    aml: Vec::new(),
+});
 
 /// Snapshot of a slice of the stored AML byte stream. Returns the
 /// number of bytes copied. Out of range → 0.
 pub fn copy_aml_bytes(offset: usize, out: &mut [u8]) -> usize {
     let g = NAMESPACE.lock();
-    if offset >= g.aml.len() { return 0; }
+    if offset >= g.aml.len() {
+        return 0;
+    }
     let n = (g.aml.len() - offset).min(out.len());
     out[..n].copy_from_slice(&g.aml[offset..offset + n]);
     n
@@ -202,7 +208,7 @@ pub fn node_count() -> usize {
 /// Snapshot of `node_count` and `device_count` taken once at boot,
 /// after the first `parse_namespace`. Tests can consult this even
 /// after later passes mutate the live namespace.
-static BOOT_NODE_COUNT:   core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static BOOT_NODE_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static BOOT_DEVICE_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Capture the current namespace counts as the boot-time snapshot.
@@ -211,8 +217,11 @@ static BOOT_DEVICE_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::At
 pub fn capture_boot_snapshot() {
     let g = NAMESPACE.lock();
     let n = g.nodes.len() as u32;
-    let d = g.nodes.iter()
-        .filter(|n| n.kind == NodeKind::Device).count() as u32;
+    let d = g
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Device)
+        .count() as u32;
     BOOT_NODE_COUNT.store(n, core::sync::atomic::Ordering::Release);
     BOOT_DEVICE_COUNT.store(d, core::sync::atomic::Ordering::Release);
 }
@@ -265,10 +274,12 @@ pub unsafe fn parse_namespace(rsdp_phys: PhysAddr) -> Result<u32, AmlError> {
     unsafe {
         let mut e: Result<(), AmlError> = Ok(());
         let _ = narf_acpi::walk_ssdts(rsdp_phys, |phys, _hdr| {
-            if e.is_err() { return; }
+            if e.is_err() {
+                return;
+            }
             // SAFETY: identity-mapped (covered by enclosing block).
             match walk_aml_table(phys, "\\") {
-                Ok(c)  => total += c,
+                Ok(c) => total += c,
                 Err(x) => e = Err(x),
             }
         })?;
@@ -283,10 +294,10 @@ pub unsafe fn parse_namespace(rsdp_phys: PhysAddr) -> Result<u32, AmlError> {
 /// so `method_body` offsets are stable references into that store.
 unsafe fn walk_aml_table(phys: u64, root_path: &str) -> Result<u32, AmlError> {
     // SAFETY: caller assertion.
-    let total = unsafe {
-        (phys as *const SdtHeader).read_unaligned().length as usize
-    };
-    if total <= 36 { return Ok(0); }
+    let total = unsafe { (phys as *const SdtHeader).read_unaligned().length as usize };
+    if total <= 36 {
+        return Ok(0);
+    }
     // SAFETY: caller assertion.
     let body = unsafe { core::slice::from_raw_parts(phys as *const u8, total) };
     let aml_slice = &body[36..];
@@ -308,37 +319,37 @@ unsafe fn walk_aml_table(phys: u64, root_path: &str) -> Result<u32, AmlError> {
 
 // ── AML decoder ─────────────────────────────────────────────────────
 
-const ZERO_OP: u8       = 0x00;
-const ONE_OP: u8        = 0x01;
-const NAME_OP: u8       = 0x08;
-const BYTE_PREFIX: u8   = 0x0A;
-const WORD_PREFIX: u8   = 0x0B;
-const DWORD_PREFIX: u8  = 0x0C;
+const ZERO_OP: u8 = 0x00;
+const ONE_OP: u8 = 0x01;
+const NAME_OP: u8 = 0x08;
+const BYTE_PREFIX: u8 = 0x0A;
+const WORD_PREFIX: u8 = 0x0B;
+const DWORD_PREFIX: u8 = 0x0C;
 const STRING_PREFIX: u8 = 0x0D;
-const QWORD_PREFIX: u8  = 0x0E;
-const SCOPE_OP: u8      = 0x10;
-const BUFFER_OP: u8     = 0x11;
-const PACKAGE_OP: u8    = 0x12;
-const VAR_PACKAGE_OP: u8= 0x13;
-const METHOD_OP: u8     = 0x14;
+const QWORD_PREFIX: u8 = 0x0E;
+const SCOPE_OP: u8 = 0x10;
+const BUFFER_OP: u8 = 0x11;
+const PACKAGE_OP: u8 = 0x12;
+const VAR_PACKAGE_OP: u8 = 0x13;
+const METHOD_OP: u8 = 0x14;
 const EXT_OP_PREFIX: u8 = 0x5B;
-const ROOT_CHAR: u8     = b'\\';
+const ROOT_CHAR: u8 = b'\\';
 const PARENT_PREFIX: u8 = b'^';
 const DUAL_NAME_PREFIX: u8 = 0x2E;
 const MULTI_NAME_PREFIX: u8 = 0x2F;
-const ONES_OP: u8       = 0xFF;
+const ONES_OP: u8 = 0xFF;
 
 // Extended opcodes (after 0x5B prefix).
-const EXT_MUTEX_OP: u8       = 0x01;
-const EXT_EVENT_OP: u8       = 0x02;
-const EXT_OP_REGION_OP: u8   = 0x80;
-const EXT_FIELD_OP: u8       = 0x81;
-const EXT_DEVICE_OP: u8      = 0x82;
-const EXT_PROCESSOR_OP: u8   = 0x83;
-const EXT_POWER_RES_OP: u8   = 0x84;
-const EXT_THERMAL_ZONE_OP: u8= 0x85;
+const EXT_MUTEX_OP: u8 = 0x01;
+const EXT_EVENT_OP: u8 = 0x02;
+const EXT_OP_REGION_OP: u8 = 0x80;
+const EXT_FIELD_OP: u8 = 0x81;
+const EXT_DEVICE_OP: u8 = 0x82;
+const EXT_PROCESSOR_OP: u8 = 0x83;
+const EXT_POWER_RES_OP: u8 = 0x84;
+const EXT_THERMAL_ZONE_OP: u8 = 0x85;
 const EXT_INDEX_FIELD_OP: u8 = 0x86;
-const EXT_BANK_FIELD_OP: u8  = 0x87;
+const EXT_BANK_FIELD_OP: u8 = 0x87;
 
 pub(crate) struct Parser<'a> {
     pub(crate) buf: &'a [u8],
@@ -346,9 +357,13 @@ pub(crate) struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    fn new(buf: &'a [u8]) -> Self { Self { buf, pos: 0 } }
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
 
-    pub(crate) fn peek(&self) -> Option<u8> { self.buf.get(self.pos).copied() }
+    pub(crate) fn peek(&self) -> Option<u8> {
+        self.buf.get(self.pos).copied()
+    }
 
     pub(crate) fn read_u8(&mut self) -> Result<u8, AmlError> {
         let b = self.buf.get(self.pos).copied().ok_or(AmlError::Truncated)?;
@@ -357,13 +372,17 @@ impl<'a> Parser<'a> {
     }
 
     pub(crate) fn skip(&mut self, n: usize) -> Result<(), AmlError> {
-        if self.pos + n > self.buf.len() { return Err(AmlError::Truncated); }
+        if self.pos + n > self.buf.len() {
+            return Err(AmlError::Truncated);
+        }
         self.pos += n;
         Ok(())
     }
 
     fn slice_n(&mut self, n: usize) -> Result<&'a [u8], AmlError> {
-        if self.pos + n > self.buf.len() { return Err(AmlError::Truncated); }
+        if self.pos + n > self.buf.len() {
+            return Err(AmlError::Truncated);
+        }
         let s = &self.buf[self.pos..self.pos + n];
         self.pos += n;
         Ok(s)
@@ -412,7 +431,11 @@ pub(crate) fn read_name_string(p: &mut Parser<'_>, parent: &str) -> Result<Strin
             up += 1;
         }
         // Build absolute prefix from parent, popping `up` segments.
-        let mut base = if parent.is_empty() { String::from("\\") } else { String::from(parent) };
+        let mut base = if parent.is_empty() {
+            String::from("\\")
+        } else {
+            String::from(parent)
+        };
         for _ in 0..up {
             // Drop one segment after the last '.'. If we hit root,
             // leave it as '\\'.
@@ -435,7 +458,9 @@ pub(crate) fn read_name_string(p: &mut Parser<'_>, parent: &str) -> Result<Strin
     } else if pfx == MULTI_NAME_PREFIX {
         consumed_pfx = 2;
         // Multi: 0x2F, count_u8.
-        if p.buf.len() < p.pos + 2 { return Err(AmlError::Truncated); }
+        if p.buf.len() < p.pos + 2 {
+            return Err(AmlError::Truncated);
+        }
         segs = p.buf[p.pos + 1] as usize;
     } else if pfx == 0 {
         // NullName: empty path.
@@ -463,8 +488,12 @@ pub(crate) fn read_name_string(p: &mut Parser<'_>, parent: &str) -> Result<Strin
         }
         // Strip trailing underscore padding.
         let mut end = 4;
-        while end > 0 && bytes[end - 1] == b'_' { end -= 1; }
-        if end == 0 { end = 1; } // keep at least one char
+        while end > 0 && bytes[end - 1] == b'_' {
+            end -= 1;
+        }
+        if end == 0 {
+            end = 1;
+        } // keep at least one char
         for c in &bytes[..end] {
             s.push(*c as char);
         }
@@ -476,7 +505,11 @@ pub(crate) fn read_name_string(p: &mut Parser<'_>, parent: &str) -> Result<Strin
 /// qualified absolute path. NullName → `parent`.
 pub(crate) fn full_path(name: String, parent: &str) -> String {
     if name.is_empty() {
-        if parent.is_empty() { String::from("\\") } else { String::from(parent) }
+        if parent.is_empty() {
+            String::from("\\")
+        } else {
+            String::from(parent)
+        }
     } else if name.starts_with('\\') {
         name
     } else if parent.is_empty() || parent == "\\" {
@@ -494,15 +527,25 @@ pub(crate) fn full_path(name: String, parent: &str) -> String {
 /// Try to decode a flat-constant value at the cursor. Returns the
 /// value + advances the parser past it. Anything we don't decode
 /// returns `Unparsed` and skips to `after_offset`.
-pub(crate) fn try_read_simple_value(p: &mut Parser<'_>, after_offset: usize)
-    -> Result<NameValue, AmlError>
-{
+pub(crate) fn try_read_simple_value(
+    p: &mut Parser<'_>,
+    after_offset: usize,
+) -> Result<NameValue, AmlError> {
     let start_pos = p.pos;
     let op = p.peek().ok_or(AmlError::Truncated)?;
     let val = match op {
-        ZERO_OP => { p.skip(1)?; NameValue::Integer(0) }
-        ONE_OP  => { p.skip(1)?; NameValue::Integer(1) }
-        ONES_OP => { p.skip(1)?; NameValue::Integer(u64::MAX) }
+        ZERO_OP => {
+            p.skip(1)?;
+            NameValue::Integer(0)
+        }
+        ONE_OP => {
+            p.skip(1)?;
+            NameValue::Integer(1)
+        }
+        ONES_OP => {
+            p.skip(1)?;
+            NameValue::Integer(u64::MAX)
+        }
         BYTE_PREFIX => {
             p.skip(1)?;
             let v = p.read_u8()?;
@@ -516,16 +559,13 @@ pub(crate) fn try_read_simple_value(p: &mut Parser<'_>, after_offset: usize)
         DWORD_PREFIX => {
             p.skip(1)?;
             let bytes = p.slice_n(4)?;
-            NameValue::Integer(u32::from_le_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3],
-            ]) as u64)
+            NameValue::Integer(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64)
         }
         QWORD_PREFIX => {
             p.skip(1)?;
             let bytes = p.slice_n(8)?;
             NameValue::Integer(u64::from_le_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3],
-                bytes[4], bytes[5], bytes[6], bytes[7],
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
             ]))
         }
         STRING_PREFIX => {
@@ -534,7 +574,9 @@ pub(crate) fn try_read_simple_value(p: &mut Parser<'_>, after_offset: usize)
             let mut s = String::new();
             loop {
                 let c = p.read_u8()?;
-                if c == 0 { break; }
+                if c == 0 {
+                    break;
+                }
                 s.push(c as char);
             }
             NameValue::String(s)
@@ -544,7 +586,10 @@ pub(crate) fn try_read_simple_value(p: &mut Parser<'_>, after_offset: usize)
             // for a future evaluator.
             let length = after_offset.saturating_sub(start_pos);
             p.pos = after_offset;
-            return Ok(NameValue::Unparsed { offset: start_pos, length });
+            return Ok(NameValue::Unparsed {
+                offset: start_pos,
+                length,
+            });
         }
     };
     // Snap to after_offset in case the body has trailing bytes
@@ -560,11 +605,11 @@ pub(crate) fn try_read_simple_value(p: &mut Parser<'_>, after_offset: usize)
 /// either a NamedObj (Scope/Device/Method/...) or a SimpleObj
 /// (we skip over those — they're not namespace-creating).
 fn parse_term_list(
-    p:        &mut Parser<'_>,
-    parent:   &str,
-    count:    &mut u32,
+    p: &mut Parser<'_>,
+    parent: &str,
+    count: &mut u32,
     end_offset: usize,
-    base:       usize,
+    base: usize,
 ) -> Result<(), AmlError> {
     // Soft-fail wrapper: BadNameSegment / Truncated mid-parse return
     // Ok(()) instead of propagating, so the boot-time DSDT walk
@@ -574,35 +619,35 @@ fn parse_term_list(
     // TermArgs inside OpRegion offsets, etc.); the caller's pkg-end
     // clamp re-anchors at the next named object.
     match parse_term_list_inner(p, parent, count, end_offset, base) {
-        Ok(())                          => Ok(()),
-        Err(AmlError::BadNameSegment)   => Ok(()),
-        Err(AmlError::Truncated)        => Ok(()),
-        Err(AmlError::BadPkgLength)     => Ok(()),
-        Err(AmlError::OutOfPkg)         => Ok(()),
-        Err(e)                          => Err(e),
+        Ok(()) => Ok(()),
+        Err(AmlError::BadNameSegment) => Ok(()),
+        Err(AmlError::Truncated) => Ok(()),
+        Err(AmlError::BadPkgLength) => Ok(()),
+        Err(AmlError::OutOfPkg) => Ok(()),
+        Err(e) => Err(e),
     }
 }
 
 fn parse_term_list_inner(
-    p:        &mut Parser<'_>,
-    parent:   &str,
-    count:    &mut u32,
+    p: &mut Parser<'_>,
+    parent: &str,
+    count: &mut u32,
     end_offset: usize,
-    base:       usize,
+    base: usize,
 ) -> Result<(), AmlError> {
     while p.pos < end_offset {
         let op = match p.peek() {
             Some(b) => b,
-            None    => return Ok(()),
+            None => return Ok(()),
         };
         match op {
             SCOPE_OP => {
                 p.skip(1)?;
                 let pkg_start = p.pos;
-                let pkg_len   = read_pkg_length(p)?;
-                let pkg_end   = pkg_start + pkg_len;
-                let name      = read_name_string(p, parent)?;
-                let path      = full_path(name, parent);
+                let pkg_len = read_pkg_length(p)?;
+                let pkg_end = pkg_start + pkg_len;
+                let name = read_name_string(p, parent)?;
+                let path = full_path(name, parent);
                 push_node(AmlNode {
                     path: path.clone(),
                     kind: NodeKind::Scope,
@@ -611,7 +656,9 @@ fn parse_term_list_inner(
                 });
                 *count += 1;
                 parse_term_list(p, &path, count, pkg_end, base)?;
-                if p.pos != pkg_end { p.pos = pkg_end; }
+                if p.pos != pkg_end {
+                    p.pos = pkg_end;
+                }
             }
             NAME_OP => {
                 p.skip(1)?;
@@ -632,7 +679,10 @@ fn parse_term_list_inner(
                     Err(_) => {
                         // Restore position; record Unparsed at this offset.
                         p.pos = pos_before;
-                        Some(NameValue::Unparsed { offset: pos_before, length: 0 })
+                        Some(NameValue::Unparsed {
+                            offset: pos_before,
+                            length: 0,
+                        })
                     }
                 };
                 push_node(AmlNode {
@@ -646,14 +696,14 @@ fn parse_term_list_inner(
             METHOD_OP => {
                 p.skip(1)?;
                 let pkg_start = p.pos;
-                let pkg_len   = read_pkg_length(p)?;
-                let pkg_end   = pkg_start + pkg_len;
-                let name      = read_name_string(p, parent)?;
-                let path      = full_path(name, parent);
+                let pkg_len = read_pkg_length(p)?;
+                let pkg_end = pkg_start + pkg_len;
+                let name = read_name_string(p, parent)?;
+                let path = full_path(name, parent);
                 // 1 byte MethodFlags follows the name.
-                let _flags    = p.read_u8()?;
-                let body_off  = base + p.pos;
-                let body_len  = pkg_end.saturating_sub(p.pos);
+                let _flags = p.read_u8()?;
+                let body_off = base + p.pos;
+                let body_len = pkg_end.saturating_sub(p.pos);
                 push_node(AmlNode {
                     path,
                     kind: NodeKind::Method,
@@ -669,10 +719,10 @@ fn parse_term_list_inner(
                 match next {
                     EXT_DEVICE_OP => {
                         let pkg_start = p.pos;
-                        let pkg_len   = read_pkg_length(p)?;
-                        let pkg_end   = pkg_start + pkg_len;
-                        let name      = read_name_string(p, parent)?;
-                        let path      = full_path(name, parent);
+                        let pkg_len = read_pkg_length(p)?;
+                        let pkg_end = pkg_start + pkg_len;
+                        let name = read_name_string(p, parent)?;
+                        let path = full_path(name, parent);
                         push_node(AmlNode {
                             path: path.clone(),
                             kind: NodeKind::Device,
@@ -681,14 +731,16 @@ fn parse_term_list_inner(
                         });
                         *count += 1;
                         parse_term_list(p, &path, count, pkg_end, base)?;
-                        if p.pos != pkg_end { p.pos = pkg_end; }
+                        if p.pos != pkg_end {
+                            p.pos = pkg_end;
+                        }
                     }
                     EXT_PROCESSOR_OP => {
                         let pkg_start = p.pos;
-                        let pkg_len   = read_pkg_length(p)?;
-                        let pkg_end   = pkg_start + pkg_len;
-                        let name      = read_name_string(p, parent)?;
-                        let path      = full_path(name, parent);
+                        let pkg_len = read_pkg_length(p)?;
+                        let pkg_end = pkg_start + pkg_len;
+                        let name = read_name_string(p, parent)?;
+                        let path = full_path(name, parent);
                         // ProcID(1) + PblkAddr(4) + PblkLen(1) = 6 bytes.
                         p.skip(6)?;
                         push_node(AmlNode {
@@ -699,14 +751,16 @@ fn parse_term_list_inner(
                         });
                         *count += 1;
                         parse_term_list(p, &path, count, pkg_end, base)?;
-                        if p.pos != pkg_end { p.pos = pkg_end; }
+                        if p.pos != pkg_end {
+                            p.pos = pkg_end;
+                        }
                     }
                     EXT_POWER_RES_OP => {
                         let pkg_start = p.pos;
-                        let pkg_len   = read_pkg_length(p)?;
-                        let pkg_end   = pkg_start + pkg_len;
-                        let name      = read_name_string(p, parent)?;
-                        let path      = full_path(name, parent);
+                        let pkg_len = read_pkg_length(p)?;
+                        let pkg_end = pkg_start + pkg_len;
+                        let name = read_name_string(p, parent)?;
+                        let path = full_path(name, parent);
                         // SystemLevel(1) + ResourceOrder(2) = 3 bytes.
                         p.skip(3)?;
                         push_node(AmlNode {
@@ -717,14 +771,16 @@ fn parse_term_list_inner(
                         });
                         *count += 1;
                         parse_term_list(p, &path, count, pkg_end, base)?;
-                        if p.pos != pkg_end { p.pos = pkg_end; }
+                        if p.pos != pkg_end {
+                            p.pos = pkg_end;
+                        }
                     }
                     EXT_THERMAL_ZONE_OP => {
                         let pkg_start = p.pos;
-                        let pkg_len   = read_pkg_length(p)?;
-                        let pkg_end   = pkg_start + pkg_len;
-                        let name      = read_name_string(p, parent)?;
-                        let path      = full_path(name, parent);
+                        let pkg_len = read_pkg_length(p)?;
+                        let pkg_end = pkg_start + pkg_len;
+                        let name = read_name_string(p, parent)?;
+                        let path = full_path(name, parent);
                         push_node(AmlNode {
                             path: path.clone(),
                             kind: NodeKind::ThermalZone,
@@ -733,7 +789,9 @@ fn parse_term_list_inner(
                         });
                         *count += 1;
                         parse_term_list(p, &path, count, pkg_end, base)?;
-                        if p.pos != pkg_end { p.pos = pkg_end; }
+                        if p.pos != pkg_end {
+                            p.pos = pkg_end;
+                        }
                     }
                     EXT_MUTEX_OP => {
                         let name = read_name_string(p, parent)?;
@@ -777,14 +835,14 @@ fn parse_term_list_inner(
                         // so the outer pkg_end clamp re-anchors (same as the
                         // original behaviour for non-literal regions).
                         match oregion::parse_op_region_after_name(p, path) {
-                            Ok(true)  => {} // parsed cleanly; continue loop
+                            Ok(true) => {} // parsed cleanly; continue loop
                             Ok(false) | Err(_) => return Ok(()),
                         }
                     }
                     EXT_FIELD_OP => {
                         let pkg_start = p.pos;
-                        let pkg_len   = read_pkg_length(p)?;
-                        let pkg_end   = pkg_start + pkg_len;
+                        let pkg_len = read_pkg_length(p)?;
+                        let pkg_end = pkg_start + pkg_len;
                         push_node(AmlNode {
                             path: full_path(String::new(), parent),
                             kind: NodeKind::Field,
@@ -798,8 +856,8 @@ fn parse_term_list_inner(
                     }
                     EXT_INDEX_FIELD_OP | EXT_BANK_FIELD_OP => {
                         let pkg_start = p.pos;
-                        let pkg_len   = read_pkg_length(p)?;
-                        let pkg_end   = pkg_start + pkg_len;
+                        let pkg_len = read_pkg_length(p)?;
+                        let pkg_end = pkg_start + pkg_len;
                         push_node(AmlNode {
                             path: full_path(String::new(), parent),
                             kind: NodeKind::Field,

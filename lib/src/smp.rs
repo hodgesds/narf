@@ -73,7 +73,9 @@ pub fn online_bitmap() -> u64 {
 
 /// `true` iff `logical_id` is online.
 pub fn is_online(logical_id: u32) -> bool {
-    if (logical_id as usize) >= MAX_CPUS { return false; }
+    if (logical_id as usize) >= MAX_CPUS {
+        return false;
+    }
     online_bitmap() & (1u64 << logical_id) != 0
 }
 
@@ -102,8 +104,8 @@ pub unsafe fn count_x86_64_cpus_via_cpuid() -> u32 {
     // under QEMU.
     let mut a: u32 = 0xB;
     let b: u64;
-    let mut c: u32 = 1;     // sub-leaf
-    // SAFETY: CPUID is always legal at CPL=0; we preserve rbx.
+    let mut c: u32 = 1; // sub-leaf
+                        // SAFETY: CPUID is always legal at CPL=0; we preserve rbx.
     unsafe {
         asm!(
             "push rbx",
@@ -120,7 +122,11 @@ pub unsafe fn count_x86_64_cpus_via_cpuid() -> u32 {
     let _ = a;
     let _ = c;
     let n = (b as u32) & 0xFFFF;
-    if n == 0 { 1 } else { n }
+    if n == 0 {
+        1
+    } else {
+        n
+    }
 }
 
 /// Walk an FDT blob counting `cpu@N` nodes under the `cpus` parent.
@@ -135,30 +141,28 @@ pub unsafe fn count_x86_64_cpus_via_cpuid() -> u32 {
 /// than UB — *provided* the pointer is at least readable.
 pub unsafe fn count_aarch64_cpus_in_dtb(dtb_phys: u64) -> u32 {
     const FDT_BEGIN_NODE: u32 = 0x1;
-    const FDT_END_NODE:   u32 = 0x2;
-    const FDT_PROP:       u32 = 0x3;
-    const FDT_NOP:        u32 = 0x4;
-    const FDT_END:        u32 = 0x9;
-    const FDT_MAGIC:      u32 = 0xd00d_feed;
+    const FDT_END_NODE: u32 = 0x2;
+    const FDT_PROP: u32 = 0x3;
+    const FDT_NOP: u32 = 0x4;
+    const FDT_END: u32 = 0x9;
+    const FDT_MAGIC: u32 = 0xd00d_feed;
 
-    if dtb_phys == 0 { return 0; }
+    if dtb_phys == 0 {
+        return 0;
+    }
     let base = dtb_phys as *const u8;
     // SAFETY: caller-asserted pointer; reads bounded to the FDT
     // header (40 bytes) before trusting offsets.
-    let header: [u8; 40] = unsafe {
-        core::ptr::read(base as *const [u8; 40])
-    };
-    let be32 = |b: &[u8]| -> u32 {
-        u32::from_be_bytes([b[0], b[1], b[2], b[3]])
-    };
-    if be32(&header[0..4]) != FDT_MAGIC { return 0; }
-    let off_dt_struct  = be32(&header[8..12]) as usize;
+    let header: [u8; 40] = unsafe { core::ptr::read(base as *const [u8; 40]) };
+    let be32 = |b: &[u8]| -> u32 { u32::from_be_bytes([b[0], b[1], b[2], b[3]]) };
+    if be32(&header[0..4]) != FDT_MAGIC {
+        return 0;
+    }
+    let off_dt_struct = be32(&header[8..12]) as usize;
     let size_dt_struct = be32(&header[36..40]) as usize;
 
     // SAFETY: caller's DTB blob covers off_struct + size_struct.
-    let s = unsafe {
-        core::slice::from_raw_parts(base.add(off_dt_struct), size_dt_struct)
-    };
+    let s = unsafe { core::slice::from_raw_parts(base.add(off_dt_struct), size_dt_struct) };
 
     let mut cursor = 0usize;
     let mut depth: i32 = 0;
@@ -172,7 +176,9 @@ pub unsafe fn count_aarch64_cpus_in_dtb(dtb_phys: u64) -> u32 {
             FDT_BEGIN_NODE => {
                 let name_start = cursor;
                 let mut end = name_start;
-                while end < s.len() && s[end] != 0 { end += 1; }
+                while end < s.len() && s[end] != 0 {
+                    end += 1;
+                }
                 let name = &s[name_start..end];
                 let nlen_with_nul = (end - name_start) + 1;
                 cursor = name_start + ((nlen_with_nul + 3) & !3);
@@ -186,21 +192,29 @@ pub unsafe fn count_aarch64_cpus_in_dtb(dtb_phys: u64) -> u32 {
                 }
             }
             FDT_PROP => {
-                if cursor + 8 > s.len() { break; }
+                if cursor + 8 > s.len() {
+                    break;
+                }
                 let plen = be32(&s[cursor..cursor + 4]) as usize;
                 cursor += 8;
                 let padded = (plen + 3) & !3;
-                if cursor + padded > s.len() { break; }
+                if cursor + padded > s.len() {
+                    break;
+                }
                 cursor += padded;
             }
             FDT_END_NODE => {
-                if in_cpus && depth == cpus_depth { in_cpus = false; }
+                if in_cpus && depth == cpus_depth {
+                    in_cpus = false;
+                }
                 depth -= 1;
-                if depth < 0 { break; }
+                if depth < 0 {
+                    break;
+                }
             }
-            FDT_NOP  => {}
-            FDT_END  => break,
-            _        => break,
+            FDT_NOP => {}
+            FDT_END => break,
+            _ => break,
         }
     }
     count

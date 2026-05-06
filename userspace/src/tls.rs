@@ -40,8 +40,9 @@
 
 use alloc::vec::Vec;
 
-use narf_memory::{AddressSpace, AddressSpaceError, FrameAllocError,
-                  PhysAddr, Region, RegionPerms, VirtAddr};
+use narf_memory::{
+    AddressSpace, AddressSpaceError, FrameAllocError, PhysAddr, Region, RegionPerms, VirtAddr,
+};
 
 use crate::ExecImage;
 
@@ -92,7 +93,9 @@ pub enum TlsError {
 }
 
 impl From<FrameAllocError> for TlsError {
-    fn from(e: FrameAllocError) -> Self { TlsError::Frames(e) }
+    fn from(e: FrameAllocError) -> Self {
+        TlsError::Frames(e)
+    }
 }
 
 /// Round `n` up to the next multiple of `align`. `align` must be a
@@ -143,8 +146,8 @@ pub unsafe fn stage_tls(
     // Round mem_size up to the template's required alignment so the
     // TCB sits at an aligned vaddr — relibc and gcc-emitted TLS
     // accessors assume `fs_base` is `template.align`-aligned.
-    let mem_size_aligned = align_up(template.mem_size, template.align)
-        .ok_or(TlsError::AlignOverflow)?;
+    let mem_size_aligned =
+        align_up(template.mem_size, template.align).ok_or(TlsError::AlignOverflow)?;
     let total_bytes = mem_size_aligned
         .checked_add(TCB_RESERVE)
         .ok_or(TlsError::AlignOverflow)?;
@@ -163,20 +166,24 @@ pub unsafe fn stage_tls(
         let p = f.start_address();
         // SAFETY: identity-mapped low 4 GiB; freshly allocated frame
         // is exclusively ours until we hand it to `map_region`.
-        unsafe { core::ptr::write_bytes(p.raw() as *mut u8, 0, 4096); }
+        unsafe {
+            core::ptr::write_bytes(p.raw() as *mut u8, 0, 4096);
+        }
         phys_list.push(p);
     }
 
     let region_base = TLS_REGION_BASE;
-    address_space.map_region(Region {
-        base:  VirtAddr::new(region_base),
-        len:   mapped_bytes,
-        // TLS block is read+write; the dynamic-TLS code in relibc /
-        // glibc patches the TCB at runtime, so we don't get away
-        // with read-only here even if the initial image were const.
-        perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys:  phys_list,
-    }).map_err(TlsError::Map)?;
+    address_space
+        .map_region(Region {
+            base: VirtAddr::new(region_base),
+            len: mapped_bytes,
+            // TLS block is read+write; the dynamic-TLS code in relibc /
+            // glibc patches the TCB at runtime, so we don't get away
+            // with read-only here even if the initial image were const.
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: phys_list,
+        })
+        .map_err(TlsError::Map)?;
 
     // SAFETY: AS came from `new_for_user`; map_region succeeded so
     // the regions list now includes our TLS span.
@@ -186,28 +193,29 @@ pub unsafe fn stage_tls(
     // fs_base sits at the TCB start; user-side TLS reads land at
     // negative offsets within the template region.
     let tls_image_base = region_base;
-    let fs_base        = tls_image_base + mem_size_aligned;
+    let fs_base = tls_image_base + mem_size_aligned;
 
     // Copy `file_size` bytes from the ELF into the TLS image area.
     // The remaining `mem_size - file_size` bytes (BSS-style tail)
     // are already zero from the per-page write_bytes above.
     let root = address_space.root;
-    let src  = &bytes[template.file_off as usize ..
-                      template.file_off as usize + template.file_size as usize];
+    let src = &bytes
+        [template.file_off as usize..template.file_off as usize + template.file_size as usize];
     for (i, &b) in src.iter().enumerate() {
         let vaddr = tls_image_base + i as u64;
-        let page  = vaddr & !0xFFFu64;
-        let off   = vaddr & 0xFFFu64;
+        let page = vaddr & !0xFFFu64;
+        let off = vaddr & 0xFFFu64;
         // SAFETY: we just mapped + materialised the TLS region;
         // every vaddr in `[region_base, region_base + mapped_bytes)`
         // resolves to a phys that's identity-mapped in the low 4
         // GiB of the kernel's view.
-        let phys = unsafe {
-            narf_memory::x86_64::paging::translate(root, VirtAddr::new(page))
-        }.ok_or(TlsError::Translate)?;
+        let phys = unsafe { narf_memory::x86_64::paging::translate(root, VirtAddr::new(page)) }
+            .ok_or(TlsError::Translate)?;
         // SAFETY: identity-mapped phys; exclusive ownership through
         // the duration of staging (no other CPU is in this AS yet).
-        unsafe { *((phys.as_u64() + off) as *mut u8) = b; }
+        unsafe {
+            *((phys.as_u64() + off) as *mut u8) = b;
+        }
     }
 
     // Write the TCB self-pointer at *(fs_base) = fs_base. relibc
@@ -216,13 +224,12 @@ pub unsafe fn stage_tls(
     // worse — silently land on the previous task's TCB.
     {
         let page = fs_base & !0xFFFu64;
-        let off  = fs_base & 0xFFFu64;
+        let off = fs_base & 0xFFFu64;
         // SAFETY: same reasoning as the image-copy loop above; the
         // TCB sits inside the just-mapped region by construction
         // (`fs_base + 8 <= region_base + mapped_bytes`).
-        let phys = unsafe {
-            narf_memory::x86_64::paging::translate(root, VirtAddr::new(page))
-        }.ok_or(TlsError::Translate)?;
+        let phys = unsafe { narf_memory::x86_64::paging::translate(root, VirtAddr::new(page)) }
+            .ok_or(TlsError::Translate)?;
         // The TCB self-pointer is 8 bytes; `fs_base` is `align`-
         // aligned (we rounded `mem_size` up to `align`, so the TCB
         // start is at least `align`-aligned, which the ELF parser
@@ -235,7 +242,9 @@ pub unsafe fn stage_tls(
         let value = fs_base;
         if off + 8 <= 4096 {
             // SAFETY: dst lies within a single mapped phys page.
-            unsafe { *((phys.as_u64() + off) as *mut u64) = value; }
+            unsafe {
+                *((phys.as_u64() + off) as *mut u64) = value;
+            }
         } else {
             // Slow path: byte-wise across the page boundary.
             for i in 0..8 {
@@ -243,12 +252,13 @@ pub unsafe fn stage_tls(
                 let p = v & !0xFFFu64;
                 let o = v & 0xFFFu64;
                 // SAFETY: both pages are mapped + materialised.
-                let ph = unsafe {
-                    narf_memory::x86_64::paging::translate(root, VirtAddr::new(p))
-                }.ok_or(TlsError::Translate)?;
+                let ph = unsafe { narf_memory::x86_64::paging::translate(root, VirtAddr::new(p)) }
+                    .ok_or(TlsError::Translate)?;
                 let byte = (value >> (i * 8)) as u8;
                 // SAFETY: identity-mapped, exclusive.
-                unsafe { *((ph.as_u64() + o) as *mut u8) = byte; }
+                unsafe {
+                    *((ph.as_u64() + o) as *mut u8) = byte;
+                }
             }
         }
     }

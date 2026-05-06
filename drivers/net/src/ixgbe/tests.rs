@@ -12,13 +12,9 @@
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use super::{
-    eeprom_decode, eerd_start, name_for,
-    AdvTxDesc, RxDesc,
-    ADVTXD_DCMD_DEXT, ADVTXD_DCMD_EOP, ADVTXD_DCMD_IFCS,
-    ADVTXD_DCMD_RS, ADVTXD_DTYP_DATA,
-    EERD_START,
-    IXGBE_DEV_82599EB, IXGBE_DEV_X540, IXGBE_DEV_X550, IXGBE_DEV_X550EM_X,
-    IXGBE_VENDOR,
+    eeprom_decode, eerd_start, name_for, AdvTxDesc, RxDesc, ADVTXD_DCMD_DEXT, ADVTXD_DCMD_EOP,
+    ADVTXD_DCMD_IFCS, ADVTXD_DCMD_RS, ADVTXD_DTYP_DATA, EERD_START, IXGBE_DEV_82599EB,
+    IXGBE_DEV_X540, IXGBE_DEV_X550, IXGBE_DEV_X550EM_X, IXGBE_VENDOR,
 };
 
 // ── Stage 1: PCI match table ───────────────────────────────────────
@@ -30,14 +26,17 @@ fn smoke_ixgbe_pci_match_table() -> TestResult {
     super::register_pci_driver();
     let registered = registered_pci_drivers();
     let want = [
-        IXGBE_DEV_82599EB, IXGBE_DEV_X540,
-        IXGBE_DEV_X550,    IXGBE_DEV_X550EM_X,
+        IXGBE_DEV_82599EB,
+        IXGBE_DEV_X540,
+        IXGBE_DEV_X550,
+        IXGBE_DEV_X550EM_X,
     ];
     for did in want {
-        let matched = registered.iter().any(|m|
+        let matched = registered.iter().any(|m| {
             matches!(m.kind, MatchKind::VendorDevice {
                 vendor: IXGBE_VENDOR, device,
-            } if device == did));
+            } if device == did)
+        });
         if !matched {
             return TestResult::Fail("ixgbe PCI match table missing a device id");
         }
@@ -89,9 +88,8 @@ kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_eeprom_decode_round_trip);
 
 fn smoke_ixgbe_advtxd_ctrl_word() -> TestResult {
     let cw = AdvTxDesc::ctrl_word(0x40);
-    let want_flags = ADVTXD_DTYP_DATA
-        | ADVTXD_DCMD_DEXT | ADVTXD_DCMD_RS
-        | ADVTXD_DCMD_IFCS | ADVTXD_DCMD_EOP;
+    let want_flags =
+        ADVTXD_DTYP_DATA | ADVTXD_DCMD_DEXT | ADVTXD_DCMD_RS | ADVTXD_DCMD_IFCS | ADVTXD_DCMD_EOP;
     if cw & want_flags != want_flags {
         return TestResult::Fail("ctrl_word missing required bits");
     }
@@ -124,8 +122,12 @@ fn smoke_ixgbe_rxdesc_layout() -> TestResult {
     }
     // Status byte at offset 12 (per datasheet §7.1.5 legacy).
     let d = RxDesc {
-        addr: 0, length: 0, csum: 0,
-        status: 0xAB, errors: 0, special: 0,
+        addr: 0,
+        length: 0,
+        csum: 0,
+        status: 0xAB,
+        errors: 0,
+        special: 0,
     };
     let p = (&d) as *const _ as *const u8;
     // SAFETY: structurally-sized read in-bounds.
@@ -141,25 +143,30 @@ kernel_test_in!("drivers/net/ixgbe", smoke_ixgbe_rxdesc_layout);
 
 fn smoke_ixgbe_live_bring_up() -> TestResult {
     use narf_bus::driver_match::__reset_for_test;
-    use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
-    let has = devs.iter().any(|d|
+    let has = devs.iter().any(|d| {
         matches!(&d.kind, BusKind::Pcie { .. })
-        && d.id.vendor == IXGBE_VENDOR
-        && (d.id.device == IXGBE_DEV_82599EB
-            || d.id.device == IXGBE_DEV_X540
-            || d.id.device == IXGBE_DEV_X550
-            || d.id.device == IXGBE_DEV_X550EM_X));
-    if !has { return TestResult::Skip("no ixgbe-class NIC"); }
+            && d.id.vendor == IXGBE_VENDOR
+            && (d.id.device == IXGBE_DEV_82599EB
+                || d.id.device == IXGBE_DEV_X540
+                || d.id.device == IXGBE_DEV_X550
+                || d.id.device == IXGBE_DEV_X550EM_X)
+    });
+    if !has {
+        return TestResult::Skip("no ixgbe-class NIC");
+    }
     __reset_for_test();
     super::register_pci_driver();
     let authority = bootstrap_registry_authority();
     if probe_all_pci(&authority).is_err() {
         return TestResult::Fail("probe_all_pci");
     }
-    if !super::is_probed() { return TestResult::Fail("ixgbe not probed"); }
+    if !super::is_probed() {
+        return TestResult::Fail("ixgbe not probed");
+    }
     let mac = super::with_controller(|c| c.mac).unwrap_or([0; 6]);
     if mac == [0; 6] || mac == [0xFF; 6] {
         return TestResult::Fail("MAC reads as all-zero or all-FF");

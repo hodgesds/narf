@@ -32,7 +32,9 @@ use crate::device::BusDevice;
 /// with the workspace registry.
 #[derive(Debug)]
 pub struct BusDeviceCap;
-impl CapType for BusDeviceCap { const KIND: CapKind = CapKind::BusDevice; }
+impl CapType for BusDeviceCap {
+    const KIND: CapKind = CapKind::BusDevice;
+}
 
 /// Cap-type marker for the bus-level registry authority. Held by the
 /// subsystem that's allowed to subscribe to hot-plug events, walk the
@@ -40,7 +42,9 @@ impl CapType for BusDeviceCap { const KIND: CapKind = CapKind::BusDevice; }
 /// domain. TCB-only mint path via `bootstrap_registry_authority`.
 #[derive(Debug)]
 pub struct BusRegistryCap;
-impl CapType for BusRegistryCap { const KIND: CapKind = CapKind::BusRegistry; }
+impl CapType for BusRegistryCap {
+    const KIND: CapKind = CapKind::BusRegistry;
+}
 
 /// Registry error surface. Today `NotFound` / `NotInitialised` are the
 /// boot-time-enumeration cases; `AuthorityRevoked` surfaces when the
@@ -53,7 +57,9 @@ pub enum ClaimError {
 }
 
 impl From<CapError> for ClaimError {
-    fn from(_: CapError) -> Self { ClaimError::AuthorityRevoked }
+    fn from(_: CapError) -> Self {
+        ClaimError::AuthorityRevoked
+    }
 }
 
 /// Handle returned by `claim_device`. Wave-2 placeholder — once
@@ -119,7 +125,9 @@ pub unsafe fn init(
         n
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    { 0 }
+    {
+        0
+    }
 }
 
 /// Iterate every discovered device.
@@ -154,7 +162,7 @@ pub fn claim_device(addr: BusAddr) -> Result<BusDeviceHandle, ClaimError> {
     let g = REGISTRY.lock();
     let list = match g.as_ref() {
         Some(v) => v,
-        None    => return Err(ClaimError::NotInitialised),
+        None => return Err(ClaimError::NotInitialised),
     };
     for d in list.iter() {
         if d.addr == addr {
@@ -173,7 +181,7 @@ pub fn claim_device(addr: BusAddr) -> Result<BusDeviceHandle, ClaimError> {
 /// it to gate `msix::enable_msix`.
 pub fn claim_device_cap(
     authority: &Cap<BusRegistryCap, Grant>,
-    addr:      BusAddr,
+    addr: BusAddr,
 ) -> Result<(BusDeviceHandle, Cap<BusDeviceCap, Write>), ClaimError> {
     authority.check_live()?;
     let handle = claim_device(addr)?;

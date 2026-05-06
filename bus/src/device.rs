@@ -19,13 +19,16 @@ use narf_memory::PhysAddr;
 pub struct DeviceId {
     pub vendor: u16,
     pub device: u16,
-    pub class:  u32,
+    pub class: u32,
 }
 
 impl fmt::Debug for DeviceId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "DeviceId({:04x}:{:04x}, class={:06x})",
-            self.vendor, self.device, self.class)
+        write!(
+            f,
+            "DeviceId({:04x}:{:04x}, class={:06x})",
+            self.vendor, self.device, self.class
+        )
     }
 }
 
@@ -38,19 +41,19 @@ pub enum BusKind {
     /// cfg-space accessor after `claim()` — the bus crate holds the
     /// only mapping today and simply exposes its base.
     Pcie {
-        addr:       PcieAddr,
+        addr: PcieAddr,
         /// Physical address of this function's 4-KiB cfg window.
-        cfg_phys:   PhysAddr,
+        cfg_phys: PhysAddr,
     },
     /// Memory-mapped virtio transport. `device_id` mirrors the value
     /// pulled from the VIRTIO_MMIO_DEVICE_ID register (0 = invalid /
     /// empty slot, reported here only when non-zero).
     VirtioMmio {
-        base:       PhysAddr,
+        base: PhysAddr,
         /// Size of the VIRTIO_MMIO register window (typically 0x200).
-        len:        u64,
+        len: u64,
         /// VIRTIO_MMIO device ID (DeviceId register, offset 0x08).
-        device_id:  u32,
+        device_id: u32,
     },
 }
 
@@ -62,7 +65,11 @@ impl fmt::Debug for BusKind {
                 .field("addr", addr)
                 .field("cfg_phys", cfg_phys)
                 .finish(),
-            BusKind::VirtioMmio { base, len, device_id } => f
+            BusKind::VirtioMmio {
+                base,
+                len,
+                device_id,
+            } => f
                 .debug_struct("VirtioMmio")
                 .field("base", base)
                 .field("len", len)
@@ -76,7 +83,7 @@ impl fmt::Debug for BusKind {
 #[derive(Copy, Clone)]
 pub struct BusDevice {
     pub addr: BusAddr,
-    pub id:   DeviceId,
+    pub id: DeviceId,
     pub kind: BusKind,
 }
 
@@ -84,7 +91,7 @@ impl fmt::Debug for BusDevice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BusDevice")
             .field("addr", &self.addr)
-            .field("id",   &self.id)
+            .field("id", &self.id)
             .field("kind", &self.kind)
             .finish()
     }

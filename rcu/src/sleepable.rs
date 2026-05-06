@@ -122,10 +122,10 @@ pub enum SyncOutcome {
 ///   `Drained` outcome.
 #[derive(Debug)]
 pub struct SleepableScope {
-    active:             AtomicUsize,
+    active: AtomicUsize,
     longest_pin_cycles: AtomicU64,
-    budget_cycles:      AtomicU64,
-    over_budget:        AtomicBool,
+    budget_cycles: AtomicU64,
+    over_budget: AtomicBool,
 }
 
 impl SleepableScope {
@@ -134,10 +134,10 @@ impl SleepableScope {
     /// `Timeout`. `u64::MAX` is "unbounded".
     pub const fn new() -> Self {
         Self {
-            active:             AtomicUsize::new(0),
+            active: AtomicUsize::new(0),
             longest_pin_cycles: AtomicU64::new(0),
-            budget_cycles:      AtomicU64::new(u64::MAX),
-            over_budget:        AtomicBool::new(false),
+            budget_cycles: AtomicU64::new(u64::MAX),
+            over_budget: AtomicBool::new(false),
         }
     }
 
@@ -190,15 +190,17 @@ impl SleepableScope {
         // on the scope.
         self.active.fetch_add(1, Ordering::AcqRel);
         Ok(SleepableGuard {
-            scope:    self,
-            entered:  Instant::now(),
+            scope: self,
+            entered: Instant::now(),
             _phantom: PhantomData,
         })
     }
 }
 
 impl Default for SleepableScope {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ── SleepableGuard ──────────────────────────────────────────────────
@@ -220,8 +222,8 @@ impl Default for SleepableScope {
 /// equivalent today.
 #[derive(Debug)]
 pub struct SleepableGuard<'s> {
-    scope:    &'s SleepableScope,
-    entered:  Instant,
+    scope: &'s SleepableScope,
+    entered: Instant,
     // Phantom only carries the scope lifetime; we deliberately do NOT
     // include a `*const ()` (which would be the standard !Send recipe)
     // because the Stage-3 scheduler bounds a spawned future on Send.
@@ -248,7 +250,10 @@ impl<'s> Drop for SleepableGuard<'s> {
         let mut prev = self.scope.longest_pin_cycles.load(Ordering::Relaxed);
         while held > prev {
             match self.scope.longest_pin_cycles.compare_exchange_weak(
-                prev, held, Ordering::AcqRel, Ordering::Relaxed,
+                prev,
+                held,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
             ) {
                 Ok(_) => break,
                 Err(p) => prev = p,
@@ -275,17 +280,14 @@ impl<'s> Drop for SleepableGuard<'s> {
 /// upgrade will park the future against an event slot bumped by guard
 /// drops; today the cost of re-polling is bounded by the executor's
 /// halt-on-no-progress backstop.
-pub fn sync_async<'s>(
-    scope: &'s SleepableScope,
-    deadline: Instant,
-) -> SleepableSync<'s> {
+pub fn sync_async<'s>(scope: &'s SleepableScope, deadline: Instant) -> SleepableSync<'s> {
     SleepableSync { scope, deadline }
 }
 
 /// Future returned by `sync_async`.
 #[derive(Debug)]
 pub struct SleepableSync<'s> {
-    scope:    &'s SleepableScope,
+    scope: &'s SleepableScope,
     deadline: Instant,
 }
 

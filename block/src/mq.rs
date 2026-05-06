@@ -52,23 +52,32 @@ pub struct MqDeadlineScheduler {
 impl MqDeadlineScheduler {
     /// Construct with `n` lanes. Panics on `n == 0 || n > MAX_LANES`.
     pub fn with_lanes(n: usize) -> Self {
-        assert!(n >= 1 && n <= MAX_LANES, "lane count must be in 1..=MAX_LANES");
+        assert!(
+            n >= 1 && n <= MAX_LANES,
+            "lane count must be in 1..=MAX_LANES"
+        );
         let mut lanes = Vec::with_capacity(n);
-        for _ in 0..n { lanes.push(DeadlineScheduler::new()); }
+        for _ in 0..n {
+            lanes.push(DeadlineScheduler::new());
+        }
         Self {
             lanes,
             cursor: AtomicUsize::new(0),
-            guard:  IrqSafeSpinLock::new(()),
+            guard: IrqSafeSpinLock::new(()),
         }
     }
 
     /// Number of configured lanes.
     #[inline]
-    pub fn lane_count(&self) -> usize { self.lanes.len() }
+    pub fn lane_count(&self) -> usize {
+        self.lanes.len()
+    }
 
     /// Borrow lane `i` — useful for lane-specific diagnostics and
     /// pending-count reads. Returns `None` for out-of-range ids.
-    pub fn lane(&self, i: usize) -> Option<&DeadlineScheduler> { self.lanes.get(i) }
+    pub fn lane(&self, i: usize) -> Option<&DeadlineScheduler> {
+        self.lanes.get(i)
+    }
 
     /// Queue a request on lane `i`. Returns the kernel tag minted by
     /// that lane's `DeadlineScheduler::enqueue`.
@@ -127,7 +136,9 @@ impl MqDeadlineScheduler {
             // style. Instead, check `len()` cheaply and only poke
             // lanes that are non-empty — `dequeue_next` itself
             // handles the expired-first precedence within the lane.
-            if lane.is_empty() { continue; }
+            if lane.is_empty() {
+                continue;
+            }
             if let Some(req) = lane.dequeue_next(now) {
                 return Some(req);
             }
@@ -138,5 +149,7 @@ impl MqDeadlineScheduler {
 
 impl Default for MqDeadlineScheduler {
     /// 4 lanes — a sensible default for small-core SMP test rigs.
-    fn default() -> Self { Self::with_lanes(4) }
+    fn default() -> Self {
+        Self::with_lanes(4)
+    }
 }

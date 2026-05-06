@@ -36,17 +36,23 @@ use crate::sketch::Histogram;
 pub struct Welford {
     pub count: u64,
     /// Running mean in cycles.
-    pub mean:  f64,
+    pub mean: f64,
     /// Running `M2 = Σ(x - μ)²`. Divide by `count - 1` for the
     /// sample variance; divide by `count` for the population variance.
-    pub m2:    f64,
-    pub min:   u64,
-    pub max:   u64,
+    pub m2: f64,
+    pub min: u64,
+    pub max: u64,
 }
 
 impl Welford {
     pub const fn new() -> Self {
-        Self { count: 0, mean: 0.0, m2: 0.0, min: u64::MAX, max: 0 }
+        Self {
+            count: 0,
+            mean: 0.0,
+            m2: 0.0,
+            min: u64::MAX,
+            max: 0,
+        }
     }
 
     /// Add a sample. `x` is typically a cycle count.
@@ -58,14 +64,22 @@ impl Welford {
         self.mean += delta / (self.count as f64);
         let delta2 = xf - self.mean;
         self.m2 += delta * delta2;
-        if x < self.min { self.min = x; }
-        if x > self.max { self.max = x; }
+        if x < self.min {
+            self.min = x;
+        }
+        if x > self.max {
+            self.max = x;
+        }
     }
 
     /// Sample variance (`M2 / (n - 1)`). Returns 0 when n < 2.
     #[inline]
     pub fn sample_variance(&self) -> f64 {
-        if self.count < 2 { 0.0 } else { self.m2 / ((self.count - 1) as f64) }
+        if self.count < 2 {
+            0.0
+        } else {
+            self.m2 / ((self.count - 1) as f64)
+        }
     }
 }
 
@@ -73,7 +87,7 @@ impl Welford {
 #[derive(Debug)]
 struct State {
     welford: Welford,
-    hist:    Histogram,
+    hist: Histogram,
 }
 
 /// Named function-timing accumulator. Construct as a `static`:
@@ -82,10 +96,10 @@ struct State {
 /// static LAT: FnTime = FnTime::new("fs::read");
 /// ```
 pub struct FnTime {
-    name:  &'static str,
+    name: &'static str,
     /// Cheap counter of live entries (enters without matching exits).
     /// Exposed for diagnostics; `ScopeGuard::drop` closes the balance.
-    live:  AtomicU64,
+    live: AtomicU64,
     state: IrqSafeSpinLock<State>,
 }
 
@@ -102,26 +116,34 @@ impl FnTime {
     pub const fn new(name: &'static str) -> Self {
         Self {
             name,
-            live:  AtomicU64::new(0),
+            live: AtomicU64::new(0),
             state: IrqSafeSpinLock::new(State {
                 welford: Welford::new(),
-                hist:    Histogram::new(),
+                hist: Histogram::new(),
             }),
         }
     }
 
     #[inline]
-    pub const fn name(&self) -> &'static str { self.name }
+    pub const fn name(&self) -> &'static str {
+        self.name
+    }
 
     /// Snapshot of the welford state for read-back (tests / observers).
-    pub fn welford(&self) -> Welford { self.state.lock().welford }
+    pub fn welford(&self) -> Welford {
+        self.state.lock().welford
+    }
 
     /// Borrow a histogram snapshot. Cloned to release the lock quickly.
-    pub fn histogram(&self) -> Histogram { self.state.lock().hist.clone() }
+    pub fn histogram(&self) -> Histogram {
+        self.state.lock().hist.clone()
+    }
 
     /// Number of scope guards currently live.
     #[inline]
-    pub fn live_scopes(&self) -> u64 { self.live.load(Ordering::Relaxed) }
+    pub fn live_scopes(&self) -> u64 {
+        self.live.load(Ordering::Relaxed)
+    }
 
     /// Record a directly-measured duration (when the caller already
     /// has a cycle delta from somewhere other than a `ScopeGuard`).
@@ -138,14 +160,17 @@ impl FnTime {
 #[derive(Debug)]
 pub struct ScopeGuard {
     target: &'static FnTime,
-    start:  Instant,
+    start: Instant,
 }
 
 impl ScopeGuard {
     #[inline]
     pub fn new(target: &'static FnTime) -> Self {
         target.live.fetch_add(1, Ordering::Relaxed);
-        Self { target, start: Instant::now() }
+        Self {
+            target,
+            start: Instant::now(),
+        }
     }
 }
 
@@ -159,4 +184,6 @@ impl Drop for ScopeGuard {
 
 /// Convenience: `let _g = scope(&LAT);` at a function's top.
 #[inline]
-pub fn scope(target: &'static FnTime) -> ScopeGuard { ScopeGuard::new(target) }
+pub fn scope(target: &'static FnTime) -> ScopeGuard {
+    ScopeGuard::new(target)
+}

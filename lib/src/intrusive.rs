@@ -18,14 +18,18 @@ use core::ptr::NonNull;
 /// Intrusive list link. Embed one of these in a `T` to let it live in a list.
 #[derive(Default)]
 pub struct ListLink<T> {
-    prev:    Cell<Option<NonNull<Node<T>>>>,
-    next:    Cell<Option<NonNull<Node<T>>>>,
+    prev: Cell<Option<NonNull<Node<T>>>>,
+    next: Cell<Option<NonNull<Node<T>>>>,
     _pinned: PhantomPinned,
 }
 
 impl<T> ListLink<T> {
     pub const fn new() -> Self {
-        Self { prev: Cell::new(None), next: Cell::new(None), _pinned: PhantomPinned }
+        Self {
+            prev: Cell::new(None),
+            next: Cell::new(None),
+            _pinned: PhantomPinned,
+        }
     }
 
     /// Is this link currently a member of some list?
@@ -52,12 +56,15 @@ impl<T> fmt::Debug for ListLink<T> {
 /// ```
 pub struct Node<T> {
     pub value: T,
-    pub link:  ListLink<T>,
+    pub link: ListLink<T>,
 }
 
 impl<T> Node<T> {
     pub const fn new(value: T) -> Self {
-        Self { value, link: ListLink::new() }
+        Self {
+            value,
+            link: ListLink::new(),
+        }
     }
 }
 
@@ -72,9 +79,9 @@ impl<T: fmt::Debug> fmt::Debug for Node<T> {
 /// `Send` follows `T: Send`; the list is `!Sync` — callers serialise access
 /// externally via whichever `SpinLock` / `Mutex` their subsystem uses.
 pub struct IntrusiveList<T> {
-    head:    Cell<Option<NonNull<Node<T>>>>,
-    tail:    Cell<Option<NonNull<Node<T>>>>,
-    len:     Cell<usize>,
+    head: Cell<Option<NonNull<Node<T>>>>,
+    tail: Cell<Option<NonNull<Node<T>>>>,
+    len: Cell<usize>,
     _marker: PhantomData<*mut T>,
 }
 
@@ -85,16 +92,20 @@ unsafe impl<T: Send> Send for IntrusiveList<T> {}
 impl<T> IntrusiveList<T> {
     pub const fn new() -> Self {
         Self {
-            head:    Cell::new(None),
-            tail:    Cell::new(None),
-            len:     Cell::new(0),
+            head: Cell::new(None),
+            tail: Cell::new(None),
+            len: Cell::new(0),
             _marker: PhantomData,
         }
     }
 
-    pub fn is_empty(&self) -> bool { self.head.get().is_none() }
+    pub fn is_empty(&self) -> bool {
+        self.head.get().is_none()
+    }
 
-    pub fn len(&self) -> usize { self.len.get() }
+    pub fn len(&self) -> usize {
+        self.len.get()
+    }
 
     /// Append a pinned node at the tail.
     pub fn push_back(&self, node: Pin<&mut Node<T>>) {
@@ -111,7 +122,9 @@ impl<T> IntrusiveList<T> {
             Some(tail) => {
                 // SAFETY: the caller holds the list (external sync); the tail
                 // node is still pinned and alive.
-                unsafe { tail.as_ref().link.next.set(Some(node_ptr)); }
+                unsafe {
+                    tail.as_ref().link.next.set(Some(node_ptr));
+                }
             }
             None => self.head.set(Some(node_ptr)),
         }
@@ -129,9 +142,9 @@ impl<T> IntrusiveList<T> {
         link.next.set(self.head.get());
 
         match self.head.get() {
-            Some(head) => {
-                unsafe { head.as_ref().link.prev.set(Some(node_ptr)); }
-            }
+            Some(head) => unsafe {
+                head.as_ref().link.prev.set(Some(node_ptr));
+            },
             None => self.tail.set(Some(node_ptr)),
         }
         self.head.set(Some(node_ptr));
@@ -149,8 +162,10 @@ impl<T> IntrusiveList<T> {
         link.next.set(None);
         self.head.set(next);
         match next {
-            Some(n) => unsafe { n.as_ref().link.prev.set(None); },
-            None    => self.tail.set(None),
+            Some(n) => unsafe {
+                n.as_ref().link.prev.set(None);
+            },
+            None => self.tail.set(None),
         }
         self.len.set(self.len.get() - 1);
         Some(node_ptr)
@@ -169,12 +184,16 @@ impl<T> IntrusiveList<T> {
         let prev = link.prev.get();
         let next = link.next.get();
         match prev {
-            Some(p) => unsafe { p.as_ref().link.next.set(next); },
-            None    => self.head.set(next),
+            Some(p) => unsafe {
+                p.as_ref().link.next.set(next);
+            },
+            None => self.head.set(next),
         }
         match next {
-            Some(n) => unsafe { n.as_ref().link.prev.set(prev); },
-            None    => self.tail.set(prev),
+            Some(n) => unsafe {
+                n.as_ref().link.prev.set(prev);
+            },
+            None => self.tail.set(prev),
         }
         link.prev.set(None);
         link.next.set(None);
@@ -183,12 +202,16 @@ impl<T> IntrusiveList<T> {
 }
 
 impl<T> Default for IntrusiveList<T> {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<T> fmt::Debug for IntrusiveList<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("IntrusiveList").field("len", &self.len()).finish()
+        f.debug_struct("IntrusiveList")
+            .field("len", &self.len())
+            .finish()
     }
 }
 
@@ -236,7 +259,9 @@ mod tests {
         list.push_back(c.as_mut());
         // SAFETY: b is linked into `list`.
         let b_ptr = NonNull::from(unsafe { b.as_mut().get_unchecked_mut() });
-        unsafe { list.unlink(b_ptr); }
+        unsafe {
+            list.unlink(b_ptr);
+        }
         assert_eq!(list.len(), 2);
         let h = list.pop_front().unwrap();
         assert_eq!(unsafe { h.as_ref().value }, 1);

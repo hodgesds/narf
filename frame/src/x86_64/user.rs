@@ -33,6 +33,5 @@
 #![allow(unused)]
 
 pub use narf_arch::x86_64::{
-    enter_user_mode, enter_user_mode_resume, longjmp, setjmp, JmpBuf,
-    UserState, USER_RFLAGS,
+    enter_user_mode, enter_user_mode_resume, longjmp, setjmp, JmpBuf, UserState, USER_RFLAGS,
 };

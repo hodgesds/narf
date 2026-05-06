@@ -49,9 +49,9 @@ pub struct SharedRing<T, const N: usize> {
     /// Producer-owned head index. Wraps freely; modular arithmetic
     /// against `N` masks to a slot. Kernel and user both observe
     /// release/acquire ordering on this field.
-    pub head:   AtomicU32,
+    pub head: AtomicU32,
     /// Consumer-owned tail index. Same wrap discipline as `head`.
-    pub tail:   AtomicU32,
+    pub tail: AtomicU32,
     /// Latches non-zero when either end declares EOF. The other
     /// half observes via `is_closed()` on its next op.
     pub closed: AtomicU32,
@@ -75,9 +75,9 @@ impl<T, const N: usize> core::fmt::Debug for SharedRing<T, N> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("SharedRing")
             .field("capacity", &N)
-            .field("head",     &self.head.load(Ordering::Relaxed))
-            .field("tail",     &self.tail.load(Ordering::Relaxed))
-            .field("closed",   &(self.closed.load(Ordering::Relaxed) != 0))
+            .field("head", &self.head.load(Ordering::Relaxed))
+            .field("tail", &self.tail.load(Ordering::Relaxed))
+            .field("closed", &(self.closed.load(Ordering::Relaxed) != 0))
             .finish_non_exhaustive()
     }
 }
@@ -91,7 +91,9 @@ impl<T, const N: usize> SharedRing<T, N> {
 
     /// Total byte size occupied by a `SharedRing<T, N>`. Useful for
     /// callers verifying the ring fits in their allocation budget.
-    pub const fn size_bytes() -> usize { core::mem::size_of::<Self>() }
+    pub const fn size_bytes() -> usize {
+        core::mem::size_of::<Self>()
+    }
 
     /// Initialise a fresh `SharedRing` in place at `ptr`. Zeros all
     /// header atomics; slot storage is left as uninitialised
@@ -123,14 +125,14 @@ impl<T, const N: usize> SharedRing<T, N> {
 /// active producer per ring (SPSC).
 #[derive(Debug)]
 pub struct SharedProducer<T, const N: usize> {
-    ring:    *mut SharedRing<T, N>,
-    _marker: PhantomData<*const ()>,  // !Send + !Sync by construction
+    ring: *mut SharedRing<T, N>,
+    _marker: PhantomData<*const ()>, // !Send + !Sync by construction
 }
 
 /// Consumer half — counterpart to `SharedProducer`.
 #[derive(Debug)]
 pub struct SharedConsumer<T, const N: usize> {
-    ring:    *mut SharedRing<T, N>,
+    ring: *mut SharedRing<T, N>,
     _marker: PhantomData<*const ()>,
 }
 
@@ -160,7 +162,10 @@ impl<T, const N: usize> SharedProducer<T, N> {
     /// - At most one `SharedProducer` may exist for a given ring at
     ///   a time — SPSC contract.
     pub unsafe fn from_raw(ring: *mut SharedRing<T, N>) -> Self {
-        Self { ring, _marker: PhantomData }
+        Self {
+            ring,
+            _marker: PhantomData,
+        }
     }
 
     /// Non-blocking enqueue.
@@ -193,7 +198,9 @@ impl<T, const N: usize> SharedProducer<T, N> {
     /// Mark the ring closed from the producer side. Idempotent.
     pub fn close(&mut self) {
         // SAFETY: `self.ring` is valid per `from_raw` contract.
-        unsafe { (*self.ring).closed.store(1, Ordering::Release); }
+        unsafe {
+            (*self.ring).closed.store(1, Ordering::Release);
+        }
     }
 }
 
@@ -213,7 +220,10 @@ impl<T, const N: usize> SharedConsumer<T, N> {
     /// # Safety
     /// Same SPSC contract as `SharedProducer::from_raw`.
     pub unsafe fn from_raw(ring: *mut SharedRing<T, N>) -> Self {
-        Self { ring, _marker: PhantomData }
+        Self {
+            ring,
+            _marker: PhantomData,
+        }
     }
 
     /// Non-blocking dequeue.
@@ -243,7 +253,9 @@ impl<T, const N: usize> SharedConsumer<T, N> {
     /// Mark the ring closed from the consumer side. Idempotent.
     pub fn close(&mut self) {
         // SAFETY: `self.ring` is valid per `from_raw` contract.
-        unsafe { (*self.ring).closed.store(1, Ordering::Release); }
+        unsafe {
+            (*self.ring).closed.store(1, Ordering::Release);
+        }
     }
 }
 

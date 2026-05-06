@@ -4,8 +4,8 @@
 //! tags. The `DomainPrimitive` trait on aarch64 manages the Tag Check
 //! Fault (TCF) mode and TBI/ATA configuration.
 
-use core::fmt;
 use crate::aarch64::sysreg;
+use core::fmt;
 
 /// Saved MTE state.
 ///
@@ -19,28 +19,37 @@ use crate::aarch64::sysreg;
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub struct SavedMteState {
     pub sctlr: u64,
-    pub gcr:   u64,
+    pub gcr: u64,
 }
 
 /// Per-domain access rights. On aarch64 MTE, "rights" are enforced via
 /// page-table AP bits for R/W vs RO, and tag-match for access-deny.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub struct DomainRights {
-    pub no_write:  bool,
+    pub no_write: bool,
     pub no_access: bool,
 }
 
 impl DomainRights {
-    pub const ALLOW_ALL: Self = Self { no_write: false, no_access: false };
-    pub const READ_ONLY: Self = Self { no_write: true,  no_access: false };
-    pub const DENY_ALL:  Self = Self { no_write: true,  no_access: true  };
+    pub const ALLOW_ALL: Self = Self {
+        no_write: false,
+        no_access: false,
+    };
+    pub const READ_ONLY: Self = Self {
+        no_write: true,
+        no_access: false,
+    };
+    pub const DENY_ALL: Self = Self {
+        no_write: true,
+        no_access: true,
+    };
 }
 
 impl fmt::Display for DomainRights {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match (self.no_access, self.no_write) {
-            (true,  _)     => f.write_str("deny"),
-            (false, true)  => f.write_str("r-"),
+            (true, _) => f.write_str("deny"),
+            (false, true) => f.write_str("r-"),
             (false, false) => f.write_str("rw"),
         }
     }
@@ -53,11 +62,11 @@ pub struct Mte;
 impl crate::DomainPrimitive for Mte {
     const BACKEND: crate::DomainBackend = crate::DomainBackend::Mte;
     type SavedState = SavedMteState;
-    type Rights     = DomainRights;
+    type Rights = DomainRights;
 
     const ALLOW_ALL: DomainRights = DomainRights::ALLOW_ALL;
     const READ_ONLY: DomainRights = DomainRights::READ_ONLY;
-    const DENY_ALL:  DomainRights = DomainRights::DENY_ALL;
+    const DENY_ALL: DomainRights = DomainRights::DENY_ALL;
 
     #[inline]
     unsafe fn save() -> Self::SavedState {
@@ -66,7 +75,7 @@ impl crate::DomainPrimitive for Mte {
         unsafe {
             SavedMteState {
                 sctlr: sysreg::read_sctlr_el1(),
-                gcr:   sysreg::read_gcr_el1(),
+                gcr: sysreg::read_gcr_el1(),
             }
         }
     }
@@ -93,8 +102,7 @@ impl crate::DomainPrimitive for Mte {
     }
 
     #[inline]
-    unsafe fn enter_domain(_kernel_domain: u8, _driver_domain: u8)
-        -> Self::SavedState {
+    unsafe fn enter_domain(_kernel_domain: u8, _driver_domain: u8) -> Self::SavedState {
         // Stage-2 scope: structural save only.
         //
         // A real MTE "enter scope" would flip SCTLR_EL1.TCF from
@@ -112,6 +120,8 @@ impl crate::DomainPrimitive for Mte {
     #[inline]
     unsafe fn exit_domain(saved: Self::SavedState) {
         // SAFETY: restore previous SCTLR_EL1.
-        unsafe { Self::restore(saved); }
+        unsafe {
+            Self::restore(saved);
+        }
     }
 }

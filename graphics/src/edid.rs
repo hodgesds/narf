@@ -64,9 +64,9 @@ impl<'a> fmt::Debug for Edid<'a> {
         let mfr = self.manufacturer();
         f.debug_struct("Edid")
             .field("manufacturer", &core::str::from_utf8(&mfr).unwrap_or("???"))
-            .field("product",      &self.product_code())
-            .field("week",         &self.manufacture_week())
-            .field("year",         &self.manufacture_year())
+            .field("product", &self.product_code())
+            .field("week", &self.manufacture_week())
+            .field("year", &self.manufacture_year())
             .finish()
     }
 }
@@ -82,21 +82,21 @@ pub struct DetailedTiming {
     /// units so consumers don't have to remember.
     pub pixel_clock_khz: u32,
     /// Active horizontal pixels.
-    pub h_active:   u16,
+    pub h_active: u16,
     /// Horizontal blanking pixels.
     pub h_blanking: u16,
     /// Active vertical lines.
-    pub v_active:   u16,
+    pub v_active: u16,
     /// Vertical blanking lines.
     pub v_blanking: u16,
     /// Horizontal front porch (pixels).
     pub h_sync_offset: u16,
     /// Horizontal sync pulse width (pixels).
-    pub h_sync_width:  u16,
+    pub h_sync_width: u16,
     /// Vertical front porch (lines).
     pub v_sync_offset: u16,
     /// Vertical sync pulse width (lines).
-    pub v_sync_width:  u16,
+    pub v_sync_width: u16,
 }
 
 impl DetailedTiming {
@@ -105,7 +105,9 @@ impl DetailedTiming {
     pub fn refresh_hz(self) -> u32 {
         let h_total = self.h_active as u32 + self.h_blanking as u32;
         let v_total = self.v_active as u32 + self.v_blanking as u32;
-        if h_total == 0 || v_total == 0 { return 0; }
+        if h_total == 0 || v_total == 0 {
+            return 0;
+        }
         // pixel_clock_khz = pixels per ms; we want Hz.
         // hz = (pixel_clock_khz * 1000) / (h_total * v_total)
         ((self.pixel_clock_khz as u64 * 1000) / (h_total as u64 * v_total as u64)) as u32
@@ -115,11 +117,17 @@ impl DetailedTiming {
 impl<'a> Edid<'a> {
     /// Parse + validate a 128-byte EDID block.
     pub fn parse(raw: &'a [u8]) -> Result<Self, EdidError> {
-        if raw.len() != 128 { return Err(EdidError::BadLength); }
-        if raw[..8] != EDID_HEADER { return Err(EdidError::BadHeader); }
+        if raw.len() != 128 {
+            return Err(EdidError::BadLength);
+        }
+        if raw[..8] != EDID_HEADER {
+            return Err(EdidError::BadHeader);
+        }
         // Checksum: bytes 0..128 sum to 0 (mod 256).
         let sum: u8 = raw.iter().fold(0u8, |a, &b| a.wrapping_add(b));
-        if sum != 0 { return Err(EdidError::BadChecksum); }
+        if sum != 0 {
+            return Err(EdidError::BadChecksum);
+        }
         Ok(Self { raw })
     }
 
@@ -128,8 +136,8 @@ impl<'a> Edid<'a> {
     pub fn manufacturer(&self) -> [u8; 3] {
         let raw = u16::from_be_bytes([self.raw[8], self.raw[9]]);
         let a = ((raw >> 10) & 0x1F) as u8 + b'A' - 1;
-        let b = ((raw >>  5) & 0x1F) as u8 + b'A' - 1;
-        let c = ((raw      ) & 0x1F) as u8 + b'A' - 1;
+        let b = ((raw >> 5) & 0x1F) as u8 + b'A' - 1;
+        let c = ((raw) & 0x1F) as u8 + b'A' - 1;
         [a, b, c]
     }
 
@@ -140,22 +148,28 @@ impl<'a> Edid<'a> {
 
     /// Vendor-assigned serial number (bytes 12-15, little-endian).
     pub fn serial_number(&self) -> u32 {
-        u32::from_le_bytes([
-            self.raw[12], self.raw[13], self.raw[14], self.raw[15],
-        ])
+        u32::from_le_bytes([self.raw[12], self.raw[13], self.raw[14], self.raw[15]])
     }
 
     /// Manufacture week (1..=53). Byte 16. `0xFF` means "model
     /// year encoding" rather than week — we surface the raw value.
-    pub fn manufacture_week(&self) -> u8 { self.raw[16] }
+    pub fn manufacture_week(&self) -> u8 {
+        self.raw[16]
+    }
 
     /// Manufacture year. Byte 17 + 1990.
-    pub fn manufacture_year(&self) -> u32 { 1990 + self.raw[17] as u32 }
+    pub fn manufacture_year(&self) -> u32 {
+        1990 + self.raw[17] as u32
+    }
 
     /// EDID structure version (byte 18).
-    pub fn version_major(&self) -> u8 { self.raw[18] }
+    pub fn version_major(&self) -> u8 {
+        self.raw[18]
+    }
     /// EDID structure revision (byte 19).
-    pub fn version_minor(&self) -> u8 { self.raw[19] }
+    pub fn version_minor(&self) -> u8 {
+        self.raw[19]
+    }
 
     /// First detailed-timing descriptor at `0x36`. By spec, the
     /// "preferred timing" — typically the panel's native mode.
@@ -168,24 +182,26 @@ impl<'a> Edid<'a> {
         let pixel_clock_khz = pixel_clock_10khz * 10;
         // Bytes 2..5: low 8 bits of h_active / h_blanking +
         // high 4-bit nibbles in byte 4.
-        let h_active   = ((d[4] as u16 & 0xF0) << 4) | d[2] as u16;
+        let h_active = ((d[4] as u16 & 0xF0) << 4) | d[2] as u16;
         let h_blanking = ((d[4] as u16 & 0x0F) << 8) | d[3] as u16;
         // Bytes 5..8: same shape for vertical.
-        let v_active   = ((d[7] as u16 & 0xF0) << 4) | d[5] as u16;
+        let v_active = ((d[7] as u16 & 0xF0) << 4) | d[5] as u16;
         let v_blanking = ((d[7] as u16 & 0x0F) << 8) | d[6] as u16;
         // Bytes 8..11: sync offset / width (h + v) packed.
-        let h_sync_offset = ((d[11] as u16 & 0xC0) << 2) | d[8]  as u16;
-        let h_sync_width  = ((d[11] as u16 & 0x30) << 4) | d[9]  as u16;
-        let v_sync_offset = ((d[11] as u16 & 0x0C) << 2)
-                          | ((d[10] as u16 & 0xF0) >> 4);
-        let v_sync_width  = ((d[11] as u16 & 0x03) << 4)
-                          | (d[10]  as u16 & 0x0F);
+        let h_sync_offset = ((d[11] as u16 & 0xC0) << 2) | d[8] as u16;
+        let h_sync_width = ((d[11] as u16 & 0x30) << 4) | d[9] as u16;
+        let v_sync_offset = ((d[11] as u16 & 0x0C) << 2) | ((d[10] as u16 & 0xF0) >> 4);
+        let v_sync_width = ((d[11] as u16 & 0x03) << 4) | (d[10] as u16 & 0x0F);
         Ok(DetailedTiming {
             pixel_clock_khz,
-            h_active, h_blanking,
-            v_active, v_blanking,
-            h_sync_offset, h_sync_width,
-            v_sync_offset, v_sync_width,
+            h_active,
+            h_blanking,
+            v_active,
+            v_blanking,
+            h_sync_offset,
+            h_sync_width,
+            v_sync_offset,
+            v_sync_width,
         })
     }
 

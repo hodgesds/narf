@@ -11,27 +11,27 @@
 #![deny(missing_debug_implementations)]
 #![allow(dead_code)]
 
-pub const FDT_MAGIC:        u32 = 0xD00D_FEED;
-pub const FDT_BEGIN_NODE:   u32 = 0x0000_0001;
-pub const FDT_END_NODE:     u32 = 0x0000_0002;
-pub const FDT_PROP:         u32 = 0x0000_0003;
-pub const FDT_NOP:          u32 = 0x0000_0004;
-pub const FDT_END:          u32 = 0x0000_0009;
+pub const FDT_MAGIC: u32 = 0xD00D_FEED;
+pub const FDT_BEGIN_NODE: u32 = 0x0000_0001;
+pub const FDT_END_NODE: u32 = 0x0000_0002;
+pub const FDT_PROP: u32 = 0x0000_0003;
+pub const FDT_NOP: u32 = 0x0000_0004;
+pub const FDT_END: u32 = 0x0000_0009;
 
 const HEADER_LEN: usize = 40;
 
 #[derive(Copy, Clone, Debug)]
 pub struct Header {
-    pub magic:             u32,
-    pub totalsize:         u32,
-    pub off_dt_struct:     u32,
-    pub off_dt_strings:    u32,
-    pub off_mem_rsvmap:    u32,
-    pub version:           u32,
+    pub magic: u32,
+    pub totalsize: u32,
+    pub off_dt_struct: u32,
+    pub off_dt_strings: u32,
+    pub off_mem_rsvmap: u32,
+    pub version: u32,
     pub last_comp_version: u32,
-    pub boot_cpuid_phys:   u32,
-    pub size_dt_strings:   u32,
-    pub size_dt_struct:    u32,
+    pub boot_cpuid_phys: u32,
+    pub size_dt_strings: u32,
+    pub size_dt_struct: u32,
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -43,54 +43,95 @@ pub struct Reservation {
 mod tests;
 
 fn be_u32(b: &[u8], off: usize) -> Option<u32> {
-    if off + 4 > b.len() { return None; }
-    Some(u32::from_be_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]]))
+    if off + 4 > b.len() {
+        return None;
+    }
+    Some(u32::from_be_bytes([
+        b[off],
+        b[off + 1],
+        b[off + 2],
+        b[off + 3],
+    ]))
 }
 
 fn be_u64(b: &[u8], off: usize) -> Option<u64> {
-    if off + 8 > b.len() { return None; }
+    if off + 8 > b.len() {
+        return None;
+    }
     Some(u64::from_be_bytes([
-        b[off],     b[off + 1], b[off + 2], b[off + 3],
-        b[off + 4], b[off + 5], b[off + 6], b[off + 7],
+        b[off],
+        b[off + 1],
+        b[off + 2],
+        b[off + 3],
+        b[off + 4],
+        b[off + 5],
+        b[off + 6],
+        b[off + 7],
     ]))
 }
 
 pub fn parse_header(blob: &[u8]) -> Option<Header> {
-    if blob.len() < HEADER_LEN { return None; }
+    if blob.len() < HEADER_LEN {
+        return None;
+    }
     let magic = be_u32(blob, 0)?;
-    if magic != FDT_MAGIC { return None; }
-    let totalsize         = be_u32(blob, 4)?;
-    let off_dt_struct     = be_u32(blob, 8)?;
-    let off_dt_strings    = be_u32(blob, 12)?;
-    let off_mem_rsvmap    = be_u32(blob, 16)?;
-    let version           = be_u32(blob, 20)?;
+    if magic != FDT_MAGIC {
+        return None;
+    }
+    let totalsize = be_u32(blob, 4)?;
+    let off_dt_struct = be_u32(blob, 8)?;
+    let off_dt_strings = be_u32(blob, 12)?;
+    let off_mem_rsvmap = be_u32(blob, 16)?;
+    let version = be_u32(blob, 20)?;
     let last_comp_version = be_u32(blob, 24)?;
-    let boot_cpuid_phys   = be_u32(blob, 28)?;
-    let size_dt_strings   = be_u32(blob, 32)?;
-    let size_dt_struct    = be_u32(blob, 36)?;
-    
+    let boot_cpuid_phys = be_u32(blob, 28)?;
+    let size_dt_strings = be_u32(blob, 32)?;
+    let size_dt_struct = be_u32(blob, 36)?;
+
     // Validate that the provided slice is at least as large as the header claims,
     // unless we are only validating the header itself (len == HEADER_LEN).
-    if blob.len() > HEADER_LEN && (totalsize as usize) > blob.len() { return None; }
-    
+    if blob.len() > HEADER_LEN && (totalsize as usize) > blob.len() {
+        return None;
+    }
+
     Some(Header {
-        magic, totalsize, off_dt_struct, off_dt_strings, off_mem_rsvmap,
-        version, last_comp_version, boot_cpuid_phys,
-        size_dt_strings, size_dt_struct,
+        magic,
+        totalsize,
+        off_dt_struct,
+        off_dt_strings,
+        off_mem_rsvmap,
+        version,
+        last_comp_version,
+        boot_cpuid_phys,
+        size_dt_strings,
+        size_dt_struct,
     })
 }
 
 /// Decode the memory-reserve map. Returns the number of
 /// non-terminator entries copied.
 pub fn copy_reservations(blob: &[u8], out: &mut [Reservation]) -> usize {
-    let hdr = match parse_header(blob) { Some(h) => h, None => return 0 };
+    let hdr = match parse_header(blob) {
+        Some(h) => h,
+        None => return 0,
+    };
     let mut cur = hdr.off_mem_rsvmap as usize;
     let mut n = 0;
     loop {
-        if cur + 16 > blob.len() { break; }
-        let addr = match be_u64(blob, cur)     { Some(v) => v, None => break };
-        let size = match be_u64(blob, cur + 8) { Some(v) => v, None => break };
-        if addr == 0 && size == 0 { break; }
+        if cur + 16 > blob.len() {
+            break;
+        }
+        let addr = match be_u64(blob, cur) {
+            Some(v) => v,
+            None => break,
+        };
+        let size = match be_u64(blob, cur + 8) {
+            Some(v) => v,
+            None => break,
+        };
+        if addr == 0 && size == 0 {
+            break;
+        }
         if n < out.len() {
             out[n] = Reservation { addr, size };
             n += 1;
@@ -112,16 +153,20 @@ pub const MAX_PATH_BYTES: usize = 256;
 
 #[derive(Copy, Clone, Debug)]
 pub struct Path<'a> {
-    pub(crate) slab:     &'a [u8],
+    pub(crate) slab: &'a [u8],
     pub(crate) seg_lens: &'a [u16],
 }
 
 impl<'a> Path<'a> {
-    pub fn depth(&self) -> u8 { self.seg_lens.len() as u8 }
+    pub fn depth(&self) -> u8 {
+        self.seg_lens.len() as u8
+    }
 
     pub fn last_segment(&self) -> &'a str {
         let depth = self.seg_lens.len();
-        if depth == 0 { return "/"; }
+        if depth == 0 {
+            return "/";
+        }
         let mut start = 0usize;
         for &len in &self.seg_lens[..depth - 1] {
             start += len as usize;
@@ -135,7 +180,9 @@ impl<'a> Path<'a> {
     /// `["cpus", "cpu@0"]` matches `/cpus/cpu@0`. The root
     /// (depth 0) only matches an empty `path`.
     pub fn matches(&self, path: &[&str]) -> bool {
-        if path.len() != self.seg_lens.len() { return false; }
+        if path.len() != self.seg_lens.len() {
+            return false;
+        }
         let mut off = 0usize;
         for (i, want) in path.iter().enumerate() {
             let len = self.seg_lens[i] as usize;
@@ -150,8 +197,8 @@ impl<'a> Path<'a> {
 
 #[derive(Copy, Clone, Debug)]
 pub struct PropIter<'a> {
-    blob:    &'a [u8],
-    cur:     usize,
+    blob: &'a [u8],
+    cur: usize,
     strings: &'a [u8],
 }
 
@@ -161,27 +208,34 @@ impl<'a> Iterator for PropIter<'a> {
         loop {
             let token = be_u32(self.blob, self.cur)?;
             match token {
-                FDT_NOP => { self.cur += 4; continue; }
+                FDT_NOP => {
+                    self.cur += 4;
+                    continue;
+                }
                 FDT_PROP => {
                     let len = be_u32(self.blob, self.cur + 4)? as usize;
                     let nameoff = be_u32(self.blob, self.cur + 8)? as usize;
                     let payload_start = self.cur + 12;
                     let payload_end = payload_start + len;
-                    if payload_end > self.blob.len() { return None; }
+                    if payload_end > self.blob.len() {
+                        return None;
+                    }
                     // Pad to 4 bytes.
                     let next = (payload_end + 3) & !3;
                     self.cur = next;
                     let name = read_cstr(self.strings, nameoff)?;
                     return Some((name, &self.blob[payload_start..payload_end]));
                 }
-                _ => return None,    // BEGIN/END handled by walker
+                _ => return None, // BEGIN/END handled by walker
             }
         }
     }
 }
 
 fn read_cstr(buf: &[u8], off: usize) -> Option<&str> {
-    if off >= buf.len() { return None; }
+    if off >= buf.len() {
+        return None;
+    }
     let end = buf[off..].iter().position(|&b| b == 0)? + off;
     core::str::from_utf8(&buf[off..end]).ok()
 }
@@ -190,18 +244,23 @@ fn read_cstr(buf: &[u8], off: usize) -> Option<&str> {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Cells {
     pub address: u32,
-    pub size:    u32,
+    pub size: u32,
 }
 
 impl Cells {
     /// DTSpec 2.3.5: when missing, `#address-cells` defaults to 2
     /// and `#size-cells` defaults to 1.
-    pub const DEFAULT: Self = Self { address: 2, size: 1 };
+    pub const DEFAULT: Self = Self {
+        address: 2,
+        size: 1,
+    };
 
     pub fn read_one_reg(self, value: &[u8], off: usize) -> Option<(u64, u64)> {
         let addr_bytes = self.address as usize * 4;
         let size_bytes = self.size as usize * 4;
-        if off + addr_bytes + size_bytes > value.len() { return None; }
+        if off + addr_bytes + size_bytes > value.len() {
+            return None;
+        }
         let mut addr = 0u64;
         for i in 0..addr_bytes {
             addr = (addr << 8) | value[off + i] as u64;
@@ -238,37 +297,49 @@ pub fn walk_with_cells<F>(blob: &[u8], mut f: F)
 where
     F: FnMut(&Path<'_>, PropIter<'_>, Cells),
 {
-    let hdr = match parse_header(blob) { Some(h) => h, None => return };
+    let hdr = match parse_header(blob) {
+        Some(h) => h,
+        None => return,
+    };
     let struct_start = hdr.off_dt_struct as usize;
     let struct_end = struct_start + hdr.size_dt_struct as usize;
     let strings_start = hdr.off_dt_strings as usize;
     let strings_end = strings_start + hdr.size_dt_strings as usize;
-    if struct_end > blob.len() || strings_end > blob.len() { return; }
+    if struct_end > blob.len() || strings_end > blob.len() {
+        return;
+    }
     let strings = &blob[strings_start..strings_end];
 
     let mut slab = [0u8; MAX_PATH_BYTES];
     let mut seg_lens = [0u16; MAX_PATH_DEPTH];
     let mut total_len = 0u16;
     let mut depth = 0u8;
-    
+
     // cells_stack[depth] stores the cells defined by the node at current depth
     // for use by its children. Index 0 is reserved for Root's children.
     let mut cells_stack = [Cells::DEFAULT; MAX_PATH_DEPTH + 1];
 
     let mut cur = struct_start;
     while cur + 4 <= struct_end {
-        let token = match be_u32(blob, cur) { Some(t) => t, None => return };
+        let token = match be_u32(blob, cur) {
+            Some(t) => t,
+            None => return,
+        };
         match token {
             FDT_BEGIN_NODE => {
                 cur += 4;
                 let name_start = cur;
                 let mut end = name_start;
-                while end < blob.len() && blob[end] != 0 { end += 1; }
+                while end < blob.len() && blob[end] != 0 {
+                    end += 1;
+                }
                 let name = &blob[name_start..end];
                 cur = (end + 1 + 3) & !3;
 
                 let is_root = name.is_empty() && depth == 0;
-                if !is_root && (depth as usize) >= MAX_PATH_DEPTH { return; }
+                if !is_root && (depth as usize) >= MAX_PATH_DEPTH {
+                    return;
+                }
 
                 // The cells governing THIS node's 'reg' are defined by its parent.
                 let parent_cells = cells_stack[depth as usize];
@@ -295,7 +366,7 @@ where
                     total_len += n as u16;
 
                     let path = Path {
-                        slab:     &slab[..total_len as usize],
+                        slab: &slab[..total_len as usize],
                         seg_lens: &seg_lens[..depth as usize + 1],
                     };
                     let prop_iter = PropIter { blob, cur, strings };
@@ -307,24 +378,34 @@ where
             }
             FDT_END_NODE => {
                 cur += 4;
-                if depth == 0 { continue; }
+                if depth == 0 {
+                    continue;
+                }
                 depth -= 1;
                 total_len -= seg_lens[depth as usize];
                 seg_lens[depth as usize] = 0;
             }
-            FDT_NOP => { cur += 4; }
+            FDT_NOP => {
+                cur += 4;
+            }
             FDT_END => break,
-            _ => return,    // bad token
+            _ => return, // bad token
         }
     }
 }
 
 fn skip_props(blob: &[u8], mut cur: usize, end: usize) -> usize {
     while cur + 4 <= end {
-        let token = match be_u32(blob, cur) { Some(t) => t, None => return cur };
+        let token = match be_u32(blob, cur) {
+            Some(t) => t,
+            None => return cur,
+        };
         match token {
             FDT_PROP => {
-                let len = match be_u32(blob, cur + 4) { Some(v) => v as usize, None => return cur };
+                let len = match be_u32(blob, cur + 4) {
+                    Some(v) => v as usize,
+                    None => return cur,
+                };
                 let payload_end = cur + 12 + len;
                 cur = (payload_end + 3) & !3;
             }
@@ -361,13 +442,21 @@ pub fn chosen_bootargs(blob: &[u8]) -> Option<heapless_str::Bytes<256>> {
 pub fn copy_memory_ranges(blob: &[u8], out: &mut [Reservation]) -> usize {
     let mut n_out = 0;
     walk_with_cells(blob, |path, props, parent_cells| {
-        if path.depth() != 1 { return; }
+        if path.depth() != 1 {
+            return;
+        }
         let last = path.last_segment();
-        if !last.starts_with("memory") { return; }
+        if !last.starts_with("memory") {
+            return;
+        }
         for (name, value) in props {
-            if name != "reg" { continue; }
+            if name != "reg" {
+                continue;
+            }
             let stride = parent_cells.entry_bytes();
-            if stride == 0 { continue; }
+            if stride == 0 {
+                continue;
+            }
             let mut off = 0;
             while off + stride <= value.len() && n_out < out.len() {
                 if let Some((addr, size)) = parent_cells.read_one_reg(value, off) {
@@ -391,9 +480,14 @@ pub fn compatible_matches(value: &[u8], compat: &str) -> bool {
     let target = compat.as_bytes();
     let mut start = 0;
     while start < value.len() {
-        let end = value[start..].iter().position(|&b| b == 0)
-            .map(|p| start + p).unwrap_or(value.len());
-        if &value[start..end] == target { return true; }
+        let end = value[start..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|p| start + p)
+            .unwrap_or(value.len());
+        if &value[start..end] == target {
+            return true;
+        }
         start = end + 1;
     }
     false
@@ -404,12 +498,17 @@ pub fn compatible_matches(value: &[u8], compat: &str) -> bool {
 pub fn for_each_compatible_string<F: FnMut(&str)>(value: &[u8], mut f: F) {
     let mut start = 0;
     while start < value.len() {
-        let end = value[start..].iter().position(|&b| b == 0)
-            .map(|p| start + p).unwrap_or(value.len());
+        let end = value[start..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|p| start + p)
+            .unwrap_or(value.len());
         if let Ok(s) = core::str::from_utf8(&value[start..end]) {
             f(s);
         }
-        if end == value.len() { break; }
+        if end == value.len() {
+            break;
+        }
         start = end + 1;
     }
 }
@@ -417,7 +516,8 @@ pub fn for_each_compatible_string<F: FnMut(&str)>(value: &[u8], mut f: F) {
 /// Walk every node, calling `f` once per node whose `compatible`
 /// list contains an exact match for `compat`.
 pub fn for_each_compatible<F>(blob: &[u8], compat: &str, mut f: F)
-where F: FnMut(&Path<'_>, PropIter<'_>, Cells)
+where
+    F: FnMut(&Path<'_>, PropIter<'_>, Cells),
 {
     walk_with_cells(blob, |path, props, parent_cells| {
         let snapshot = props;
@@ -452,11 +552,14 @@ pub fn prop_phandle(props: PropIter<'_>) -> Option<u32> {
 /// Walk every node looking for one whose `phandle` matches `target`.
 /// Calls `f` and stops on the first hit.
 pub fn for_phandle<F>(blob: &[u8], target: u32, mut f: F)
-where F: FnMut(&Path<'_>, PropIter<'_>, Cells)
+where
+    F: FnMut(&Path<'_>, PropIter<'_>, Cells),
 {
     let mut done = false;
     walk_with_cells(blob, |path, props, parent_cells| {
-        if done { return; }
+        if done {
+            return;
+        }
         if let Some(ph) = prop_phandle(props) {
             if ph == target {
                 f(path, props, parent_cells);
@@ -475,7 +578,9 @@ where F: FnMut(&Path<'_>, PropIter<'_>, Cells)
 pub fn alias_path(blob: &[u8], name: &str, out: &mut [u8]) -> usize {
     let mut n = 0;
     walk_nodes(blob, |path, props| {
-        if !path.matches(&["aliases"]) { return; }
+        if !path.matches(&["aliases"]) {
+            return;
+        }
         for (pname, pval) in props {
             if pname == name {
                 let strip = if !pval.is_empty() && *pval.last().unwrap() == 0 {
@@ -496,7 +601,9 @@ pub fn alias_path(blob: &[u8], name: &str, out: &mut [u8]) -> usize {
 pub fn chosen_stdout_path(blob: &[u8], out: &mut [u8]) -> usize {
     let mut n = 0;
     walk_nodes(blob, |path, props| {
-        if !path.matches(&["chosen"]) { return; }
+        if !path.matches(&["chosen"]) {
+            return;
+        }
         for (pname, pval) in props {
             if pname == "stdout-path" || pname == "linux,stdout-path" {
                 let strip = if !pval.is_empty() && *pval.last().unwrap() == 0 {
@@ -528,7 +635,9 @@ pub enum Status {
 
 pub fn node_status(props: PropIter<'_>) -> Status {
     for (name, value) in props {
-        if name != "status" { continue; }
+        if name != "status" {
+            continue;
+        }
         // NUL-terminated string.
         let strip = if !value.is_empty() && *value.last().unwrap() == 0 {
             &value[..value.len() - 1]
@@ -536,11 +645,11 @@ pub fn node_status(props: PropIter<'_>) -> Status {
             value
         };
         return match strip {
-            b"okay" | b"ok"      => Status::Okay,
-            b"disabled"          => Status::Disabled,
-            b"reserved"          => Status::Reserved,
-            b"fail"              => Status::Fail,
-            _                    => Status::Other,
+            b"okay" | b"ok" => Status::Okay,
+            b"disabled" => Status::Disabled,
+            b"reserved" => Status::Reserved,
+            b"fail" => Status::Fail,
+            _ => Status::Other,
         };
     }
     // No `status` property ⇒ okay.
@@ -564,8 +673,7 @@ pub fn prop_u64(props: PropIter<'_>, name: &str) -> Option<u64> {
     for (n, v) in props {
         if n == name && v.len() >= 8 {
             return Some(u64::from_be_bytes([
-                v[0], v[1], v[2], v[3],
-                v[4], v[5], v[6], v[7],
+                v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
             ]));
         }
     }
@@ -586,19 +694,24 @@ pub fn prop_str<'a>(props: PropIter<'a>, name: &str) -> Option<&'a str> {
     None
 }
 
-pub fn prop_string_list<'a, F: FnMut(&'a str)>(
-    props: PropIter<'a>, name: &str, mut f: F,
-) {
+pub fn prop_string_list<'a, F: FnMut(&'a str)>(props: PropIter<'a>, name: &str, mut f: F) {
     for (n, v) in props {
-        if n != name { continue; }
+        if n != name {
+            continue;
+        }
         let mut start = 0;
         while start < v.len() {
-            let end = v[start..].iter().position(|&b| b == 0)
-                .map(|p| start + p).unwrap_or(v.len());
+            let end = v[start..]
+                .iter()
+                .position(|&b| b == 0)
+                .map(|p| start + p)
+                .unwrap_or(v.len());
             if let Ok(s) = core::str::from_utf8(&v[start..end]) {
                 f(s);
             }
-            if end == v.len() { break; }
+            if end == v.len() {
+                break;
+            }
             start = end + 1;
         }
         return;
@@ -663,12 +776,16 @@ pub fn interrupt_cells_for(blob: &[u8], parent_phandle: u32) -> Option<u32> {
 /// `'static` lifetime in the boot path; callers that map / unmap
 /// FDT memory must not let the slice outlive its mapping.
 pub unsafe fn discover(phys: usize, max_len: usize) -> Option<&'static [u8]> {
-    if max_len < HEADER_LEN { return None; }
+    if max_len < HEADER_LEN {
+        return None;
+    }
     // SAFETY: caller-asserted identity-mapped readable at least HEADER_LEN.
     let head = unsafe { core::slice::from_raw_parts(phys as *const u8, HEADER_LEN) };
     let hdr = parse_header(head)?;
     let total = hdr.totalsize as usize;
-    if total < HEADER_LEN || total > max_len { return None; }
+    if total < HEADER_LEN || total > max_len {
+        return None;
+    }
     // SAFETY: caller-asserted identity-mapped readable for the entire totalsize.
     Some(unsafe { core::slice::from_raw_parts(phys as *const u8, total) })
 }
@@ -683,7 +800,7 @@ mod heapless_str {
     #[derive(Copy, Clone)]
     pub struct Bytes<const N: usize> {
         data: [u8; N],
-        len:  usize,
+        len: usize,
     }
 
     impl<const N: usize> core::fmt::Debug for Bytes<N> {
@@ -696,15 +813,26 @@ mod heapless_str {
     }
 
     impl<const N: usize> Bytes<N> {
-        pub const fn new() -> Self { Self { data: [0; N], len: 0 } }
-        pub const fn cap(&self) -> usize { N }
-        pub fn len(&self) -> usize { self.len }
+        pub const fn new() -> Self {
+            Self {
+                data: [0; N],
+                len: 0,
+            }
+        }
+        pub const fn cap(&self) -> usize {
+            N
+        }
+        pub fn len(&self) -> usize {
+            self.len
+        }
         pub fn extend(&mut self, src: &[u8]) {
             let n = src.len().min(N - self.len);
             self.data[self.len..self.len + n].copy_from_slice(&src[..n]);
             self.len += n;
         }
-        pub fn as_bytes(&self) -> &[u8] { &self.data[..self.len] }
+        pub fn as_bytes(&self) -> &[u8] {
+            &self.data[..self.len]
+        }
         pub fn as_str(&self) -> &str {
             core::str::from_utf8(self.as_bytes()).unwrap_or("")
         }

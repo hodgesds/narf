@@ -22,8 +22,7 @@ fn smoke_timer_irq_fires() -> TestResult {
     let before = crate::x86_64::apic::timer_ticks();
     // SAFETY: APIC init has run at boot; this programs the timer + STI.
     unsafe {
-        crate::x86_64::apic::start_timer(
-            crate::VECTOR_TIMER, 500_000);
+        crate::x86_64::apic::start_timer(crate::VECTOR_TIMER, 500_000);
         narf_arch::enable_interrupts();
     }
     // Busy-wait ~50M cycles.
@@ -37,8 +36,11 @@ fn smoke_timer_irq_fires() -> TestResult {
         crate::x86_64::apic::stop_timer();
     }
     let after = crate::x86_64::apic::timer_ticks();
-    if after > before { TestResult::Pass }
-    else { TestResult::Fail("LAPIC timer IRQ never fired") }
+    if after > before {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("LAPIC timer IRQ never fired")
+    }
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("interrupts", smoke_timer_irq_fires);
@@ -60,13 +62,29 @@ kernel_test_in!("interrupts", smoke_irq_dispatch_fire_count);
 
 fn smoke_vector_alloc_unique() -> TestResult {
     use crate::vector::{alloc, free, is_allocated};
-    let v0 = match alloc() { Ok(v) => v, Err(_) => return TestResult::Fail("alloc#0 failed") };
-    let v1 = match alloc() { Ok(v) => v, Err(_) => return TestResult::Fail("alloc#1 failed") };
-    if v0 == v1 { return TestResult::Fail("two allocs returned the same vector"); }
-    if !is_allocated(v0) || !is_allocated(v1) { return TestResult::Fail("alloc'd vector not marked"); }
-    if free(v0).is_err() { return TestResult::Fail("free returned error"); }
-    if free(v0).is_ok() { return TestResult::Fail("double-free silently accepted"); }
-    if free(v1).is_err() { return TestResult::Fail("free#1 returned error"); }
+    let v0 = match alloc() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("alloc#0 failed"),
+    };
+    let v1 = match alloc() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("alloc#1 failed"),
+    };
+    if v0 == v1 {
+        return TestResult::Fail("two allocs returned the same vector");
+    }
+    if !is_allocated(v0) || !is_allocated(v1) {
+        return TestResult::Fail("alloc'd vector not marked");
+    }
+    if free(v0).is_err() {
+        return TestResult::Fail("free returned error");
+    }
+    if free(v0).is_ok() {
+        return TestResult::Fail("double-free silently accepted");
+    }
+    if free(v1).is_err() {
+        return TestResult::Fail("free#1 returned error");
+    }
     TestResult::Pass
 }
 kernel_test_in!("interrupts", smoke_vector_alloc_unique);
@@ -81,9 +99,15 @@ fn smoke_wait_for_irq_resolves_after_on_irq() -> TestResult {
 
     // Hand-rolled noop-ish waker that flips a flag.
     static WOKEN: AtomicBool = AtomicBool::new(false);
-    fn noop_clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VTABLE) }
-    fn noop_wake(_: *const ()) { WOKEN.store(true, Ordering::Release); }
-    fn noop_wake_by_ref(_: *const ()) { WOKEN.store(true, Ordering::Release); }
+    fn noop_clone(p: *const ()) -> RawWaker {
+        RawWaker::new(p, &VTABLE)
+    }
+    fn noop_wake(_: *const ()) {
+        WOKEN.store(true, Ordering::Release);
+    }
+    fn noop_wake_by_ref(_: *const ()) {
+        WOKEN.store(true, Ordering::Release);
+    }
     fn noop_drop(_: *const ()) {}
     static VTABLE: RawWakerVTable =
         RawWakerVTable::new(noop_clone, noop_wake, noop_wake_by_ref, noop_drop);
@@ -108,7 +132,7 @@ fn smoke_wait_for_irq_resolves_after_on_irq() -> TestResult {
     // Second poll: IRQ fired → Ready.
     match pinned.as_mut().poll(&mut cx) {
         Poll::Ready(_) => TestResult::Pass,
-        Poll::Pending  => TestResult::Fail("wait_for_irq stayed Pending after IRQ"),
+        Poll::Pending => TestResult::Fail("wait_for_irq stayed Pending after IRQ"),
     }
 }
 kernel_test_in!("interrupts", smoke_wait_for_irq_resolves_after_on_irq);
@@ -119,8 +143,8 @@ fn smoke_tlb_shootdown_bridge_smp_fanout() -> TestResult {
     // `narf_memory::tlb_shootdown::shootdown` for a (tag, va) request
     // should advance every peer CPU's EVER_RECEIVED counter (the IPI
     // handler bumps it on every shootdown delivery).
-    use narf_memory::tlb_shootdown;
     use crate::x86_64::ipi;
+    use narf_memory::tlb_shootdown;
     if narf_lib::smp::cpu_count() <= 1 {
         return TestResult::Skip("UP boot — no peer CPUs to shoot");
     }
@@ -128,11 +152,13 @@ fn smoke_tlb_shootdown_bridge_smp_fanout() -> TestResult {
     let total = narf_lib::smp::cpu_count() as u32;
     let mut snap = [0u64; narf_lib::percpu::MAX_CPUS];
     for cpu in 0..total {
-        if cpu == self_cpu { continue; }
+        if cpu == self_cpu {
+            continue;
+        }
         snap[cpu as usize] = ipi::ever_received(cpu);
     }
     let req = tlb_shootdown::ShootdownRequest {
-        tag:  Some(1),
+        tag: Some(1),
         addr: Some(0xFFFF_FFFF_8000_0000),
         size: Some(4096),
     };
@@ -141,13 +167,17 @@ fn smoke_tlb_shootdown_bridge_smp_fanout() -> TestResult {
     loop {
         let mut all_advanced = true;
         for cpu in 0..total {
-            if cpu == self_cpu { continue; }
+            if cpu == self_cpu {
+                continue;
+            }
             if ipi::ever_received(cpu) <= snap[cpu as usize] {
                 all_advanced = false;
                 break;
             }
         }
-        if all_advanced { break; }
+        if all_advanced {
+            break;
+        }
         spins += 1;
         if spins > 10_000_000 {
             return TestResult::Fail("peer CPUs never received shootdown");

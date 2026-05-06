@@ -56,7 +56,7 @@ use core::fmt;
 
 use narf_capabilities::{Cap, CapError, CapKind, CapType, Grant, Rights, Write};
 use narf_io::DmaBuffer;
-use narf_ipc::{Consumer, Producer, channel};
+use narf_ipc::{channel, Consumer, Producer};
 use narf_lib::sync::IrqSafeSpinLock;
 
 // ── Ring depths ─────────────────────────────────────────────────────
@@ -99,22 +99,33 @@ impl Frame {
     #[inline]
     pub fn new(buf: DmaBuffer, len: u32) -> Self {
         let cap = buf.len() as u32;
-        Self { buf, len: if len > cap { cap } else { len } }
+        Self {
+            buf,
+            len: if len > cap { cap } else { len },
+        }
     }
 
     #[inline]
-    pub fn len(&self) -> u32 { self.len }
+    pub fn len(&self) -> u32 {
+        self.len
+    }
 
     #[inline]
-    pub fn is_empty(&self) -> bool { self.len == 0 }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 
     #[inline]
-    pub fn buf(&self) -> &DmaBuffer { &self.buf }
+    pub fn buf(&self) -> &DmaBuffer {
+        &self.buf
+    }
 
     /// Decompose into the underlying `DmaBuffer` + used length. The
     /// caller takes ownership of the buffer; the frame is consumed.
     #[inline]
-    pub fn into_parts(self) -> (DmaBuffer, u32) { (self.buf, self.len) }
+    pub fn into_parts(self) -> (DmaBuffer, u32) {
+        (self.buf, self.len)
+    }
 }
 
 // ── Direction ───────────────────────────────────────────────────────
@@ -138,7 +149,9 @@ pub enum Direction {
 ///   returned from `Registry::register`.
 #[derive(Debug)]
 pub struct NetIface;
-impl CapType for NetIface { const KIND: CapKind = CapKind::NetIface; }
+impl CapType for NetIface {
+    const KIND: CapKind = CapKind::NetIface;
+}
 
 // ── Interface trait ─────────────────────────────────────────────────
 
@@ -185,11 +198,13 @@ pub enum RegisterError {
 }
 
 impl From<CapError> for RegisterError {
-    fn from(_: CapError) -> Self { RegisterError::AuthorityRevoked }
+    fn from(_: CapError) -> Self {
+        RegisterError::AuthorityRevoked
+    }
 }
 
 struct Entry {
-    iface:  Box<dyn Interface>,
+    iface: Box<dyn Interface>,
     handle: Cap<NetIface, Write>,
 }
 
@@ -215,7 +230,9 @@ static REGISTRY: Registry = Registry {
 
 /// Reference the global registry.
 #[inline]
-pub fn registry() -> &'static Registry { &REGISTRY }
+pub fn registry() -> &'static Registry {
+    &REGISTRY
+}
 
 impl Registry {
     /// Register an interface. Cap-gated on a `Cap<NetIface, Grant>`
@@ -234,31 +251,46 @@ impl Registry {
             return Err(RegisterError::DuplicateName);
         }
         let handle: Cap<NetIface, Write> = Cap::<NetIface, Write>::bootstrap();
-        q.push(Entry { iface: Box::new(iface), handle });
+        q.push(Entry {
+            iface: Box::new(iface),
+            handle,
+        });
         Ok(handle)
     }
 
     /// Number of registered interfaces.
-    pub fn len(&self) -> usize { self.inner.lock().len() }
+    pub fn len(&self) -> usize {
+        self.inner.lock().len()
+    }
 
     /// `true` iff the registry holds zero interfaces.
-    pub fn is_empty(&self) -> bool { self.inner.lock().is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().is_empty()
+    }
 
     /// Run `f` against the named interface's `&dyn Interface`. Returns
     /// `None` if no interface matches. The lock is held across `f`, so
     /// `f` should be short — read fields, not block.
     pub fn with_interface<R, F>(&self, name: &str, f: F) -> Option<R>
-    where F: FnOnce(&dyn Interface) -> R {
+    where
+        F: FnOnce(&dyn Interface) -> R,
+    {
         let q = self.inner.lock();
-        q.iter().find(|e| e.iface.name() == name).map(|e| f(&*e.iface))
+        q.iter()
+            .find(|e| e.iface.name() == name)
+            .map(|e| f(&*e.iface))
     }
 
     /// Run `f` against the named entry's `Cap<NetIface, Write>` handle.
     /// Useful for tests and Stage-4 control-plane lookups.
     pub fn with_handle<R, F>(&self, name: &str, f: F) -> Option<R>
-    where F: FnOnce(&Cap<NetIface, Write>) -> R {
+    where
+        F: FnOnce(&Cap<NetIface, Write>) -> R,
+    {
         let q = self.inner.lock();
-        q.iter().find(|e| e.iface.name() == name).map(|e| f(&e.handle))
+        q.iter()
+            .find(|e| e.iface.name() == name)
+            .map(|e| f(&e.handle))
     }
 }
 
@@ -283,19 +315,19 @@ pub fn bootstrap_authority() -> Cap<NetIface, Grant> {
 /// and is `'static` — it doesn't borrow the registry.
 pub struct Loopback {
     name: &'static str,
-    mac:  [u8; 6],
-    mtu:  u32,
+    mac: [u8; 6],
+    mtu: u32,
     /// Producer the *caller* uses to submit tx frames.
-    tx:   IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
+    tx: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
     /// Consumer the *caller* uses to read rx frames.
-    rx:   IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
+    rx: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
 }
 
 impl fmt::Debug for Loopback {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Loopback")
             .field("name", &self.name)
-            .field("mtu",  &self.mtu)
+            .field("mtu", &self.mtu)
             .finish_non_exhaustive()
     }
 }
@@ -320,9 +352,13 @@ impl Loopback {
 /// task.
 fn build_loopback(
     name: &'static str,
-    mac:  [u8; 6],
-    mtu:  u32,
-) -> (Loopback, Consumer<Frame, TX_RING_N>, Producer<Frame, RX_RING_N>) {
+    mac: [u8; 6],
+    mtu: u32,
+) -> (
+    Loopback,
+    Consumer<Frame, TX_RING_N>,
+    Producer<Frame, RX_RING_N>,
+) {
     let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
     let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
     let lo = Loopback {
@@ -336,12 +372,24 @@ fn build_loopback(
 }
 
 impl Interface for Loopback {
-    fn name(&self) -> &str { self.name }
-    fn mac(&self)  -> [u8; 6] { self.mac }
-    fn mtu(&self)  -> u32 { self.mtu }
-    fn link_up(&self) -> bool { true }
-    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> { &self.rx }
-    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> { &self.tx }
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn mac(&self) -> [u8; 6] {
+        self.mac
+    }
+    fn mtu(&self) -> u32 {
+        self.mtu
+    }
+    fn link_up(&self) -> bool {
+        true
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        &self.rx
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        &self.tx
+    }
 }
 
 /// Register a loopback interface and spawn its forwarder task. The
@@ -416,21 +464,21 @@ pub mod virtio_net {
     #[allow(dead_code)] // rx/tx are placeholder slots for the Stage-4 binding.
     pub struct VirtioNet {
         name: &'static str,
-        mac:  [u8; 6],
-        mtu:  u32,
+        mac: [u8; 6],
+        mtu: u32,
         // The actual rings are populated at driver-start time. Until
         // then the lock holds `None`, and the trait accessors panic
         // (any caller in Stage 3 is a bug — `Loopback` is the only
         // functioning impl).
-        rx:   IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
-        tx:   IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
+        rx: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
+        tx: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
     }
 
     impl fmt::Debug for VirtioNet {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("VirtioNet")
                 .field("name", &self.name)
-                .field("mtu",  &self.mtu)
+                .field("mtu", &self.mtu)
                 .finish_non_exhaustive()
         }
     }
@@ -441,7 +489,9 @@ pub mod virtio_net {
         /// that reads MAC/MTU from config space and wires the queues.
         pub fn new(name: &'static str, mac: [u8; 6], mtu: u32) -> Self {
             Self {
-                name, mac, mtu,
+                name,
+                mac,
+                mtu,
                 rx: IrqSafeSpinLock::new(None),
                 tx: IrqSafeSpinLock::new(None),
             }
@@ -449,10 +499,18 @@ pub mod virtio_net {
     }
 
     impl Interface for VirtioNet {
-        fn name(&self) -> &str { self.name }
-        fn mac(&self)  -> [u8; 6] { self.mac }
-        fn mtu(&self)  -> u32 { self.mtu }
-        fn link_up(&self) -> bool { false } // Until Stage 4 binds the device.
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn mac(&self) -> [u8; 6] {
+            self.mac
+        }
+        fn mtu(&self) -> u32 {
+            self.mtu
+        }
+        fn link_up(&self) -> bool {
+            false
+        } // Until Stage 4 binds the device.
         fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
             unimplemented!("virtio-net rx_ring: Stage 4 binds drivers/virtio/")
         }
@@ -468,4 +526,6 @@ pub mod virtio_net {
 /// `Cap<NetIface, R>` without separately importing
 /// `narf_capabilities`. Stage 4 widens this to `Rx`/`Tx`/`Admin`
 /// per spec §3.1.
-pub fn rights_bits<R: Rights>() -> u32 { R::BITS }
+pub fn rights_bits<R: Rights>() -> u32 {
+    R::BITS
+}

@@ -21,6 +21,10 @@ pub fn caps() -> u8 {
     ((id_aa64mmfr2() >> 24) & 0xF) as u8
 }
 
-pub fn supported() -> bool { caps() >= 1 }
+pub fn supported() -> bool {
+    caps() >= 1
+}
 
-pub fn nv2_supported() -> bool { caps() >= 2 }
+pub fn nv2_supported() -> bool {
+    caps() >= 2
+}

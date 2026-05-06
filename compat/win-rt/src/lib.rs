@@ -42,15 +42,15 @@ pub use kernel32::EXPORTS as KERNEL32_EXPORTS;
 /// Standard handles. Returned from `GetStdHandle`.
 pub mod stdhandle {
     pub const INVALID_HANDLE_VALUE: u64 = u64::MAX;
-    pub const STD_INPUT_HANDLE:    i32 = -10;
-    pub const STD_OUTPUT_HANDLE:   i32 = -11;
-    pub const STD_ERROR_HANDLE:    i32 = -12;
+    pub const STD_INPUT_HANDLE: i32 = -10;
+    pub const STD_OUTPUT_HANDLE: i32 = -11;
+    pub const STD_ERROR_HANDLE: i32 = -12;
 }
 
 /// Sentinel handle values returned to PE callers — opaque
 /// integers that route to the right runtime stream.
 pub mod handle {
-    pub const STDIN:  u64 = 0x0000_0000_0000_0001;
+    pub const STDIN: u64 = 0x0000_0000_0000_0001;
     pub const STDOUT: u64 = 0x0000_0000_0000_0002;
     pub const STDERR: u64 = 0x0000_0000_0000_0003;
 }

@@ -39,17 +39,16 @@ world\0\0\0\
 TRAILER!!!\0\0\0\0";
 
 fn smoke_initramfs_staging_round_trip() -> TestResult {
-    use crate::{install, is_staged, staged, __reset_staged, Initramfs};
+    use crate::{__reset_staged, install, is_staged, staged, Initramfs};
     __reset_staged();
     if is_staged() {
         return TestResult::Fail("reset didn't clear staged FS");
     }
     let fs = match Initramfs::from_cpio("smoke-stage", SMOKE_INITRAMFS) {
-        Ok(f)  => f,
+        Ok(f) => f,
         Err(_) => return TestResult::Fail("CPIO parse rejected smoke archive"),
     };
-    let leaked: &'static Initramfs =
-        alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));
+    let leaked: &'static Initramfs = alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));
     install(leaked);
     if !is_staged() {
         return TestResult::Fail("install didn't take effect");
@@ -60,11 +59,10 @@ fn smoke_initramfs_staging_round_trip() -> TestResult {
     // First-install-wins idempotency: re-installing a different
     // FS doesn't replace the staged one.
     let fs2 = match Initramfs::from_cpio("alt", SMOKE_INITRAMFS) {
-        Ok(f)  => f,
+        Ok(f) => f,
         Err(_) => return TestResult::Fail("CPIO parse #2"),
     };
-    let leaked2: &'static Initramfs =
-        alloc::boxed::Box::leak(alloc::boxed::Box::new(fs2));
+    let leaked2: &'static Initramfs = alloc::boxed::Box::leak(alloc::boxed::Box::new(fs2));
     install(leaked2);
     // Both `Initramfs` values were parsed from the same archive,
     // so we can't distinguish them by entry data — just confirm
@@ -96,9 +94,9 @@ fn smoke_initramfs_pvh_module_parser() -> TestResult {
     let modlist_bytes = {
         let mut v = alloc::vec::Vec::with_capacity(32);
         v.extend_from_slice(&0xCAFE_F00D_u64.to_le_bytes()); // paddr
-        v.extend_from_slice(&0x1234_u64.to_le_bytes());      // size
+        v.extend_from_slice(&0x1234_u64.to_le_bytes()); // size
         v.extend_from_slice(&(cmdline.as_ptr() as u64).to_le_bytes()); // cmdline_paddr
-        v.extend_from_slice(&0u64.to_le_bytes());            // reserved
+        v.extend_from_slice(&0u64.to_le_bytes()); // reserved
         v.into_boxed_slice()
     };
     let modlist: &'static [u8] = alloc::boxed::Box::leak(modlist_bytes);
@@ -108,15 +106,15 @@ fn smoke_initramfs_pvh_module_parser() -> TestResult {
     // memmap_entries + reserved.
     let mut hdr_bytes = alloc::vec::Vec::with_capacity(56);
     hdr_bytes.extend_from_slice(&0x336e_c578u32.to_le_bytes()); // magic
-    hdr_bytes.extend_from_slice(&0u32.to_le_bytes());           // version
-    hdr_bytes.extend_from_slice(&0u32.to_le_bytes());           // flags
-    hdr_bytes.extend_from_slice(&1u32.to_le_bytes());           // nr_modules
+    hdr_bytes.extend_from_slice(&0u32.to_le_bytes()); // version
+    hdr_bytes.extend_from_slice(&0u32.to_le_bytes()); // flags
+    hdr_bytes.extend_from_slice(&1u32.to_le_bytes()); // nr_modules
     hdr_bytes.extend_from_slice(&(modlist.as_ptr() as u64).to_le_bytes()); // modlist
-    hdr_bytes.extend_from_slice(&0u64.to_le_bytes());           // cmdline
-    hdr_bytes.extend_from_slice(&0u64.to_le_bytes());           // rsdp
-    hdr_bytes.extend_from_slice(&0u64.to_le_bytes());           // memmap_paddr
-    hdr_bytes.extend_from_slice(&0u32.to_le_bytes());           // memmap_entries
-    hdr_bytes.extend_from_slice(&0u32.to_le_bytes());           // reserved
+    hdr_bytes.extend_from_slice(&0u64.to_le_bytes()); // cmdline
+    hdr_bytes.extend_from_slice(&0u64.to_le_bytes()); // rsdp
+    hdr_bytes.extend_from_slice(&0u64.to_le_bytes()); // memmap_paddr
+    hdr_bytes.extend_from_slice(&0u32.to_le_bytes()); // memmap_entries
+    hdr_bytes.extend_from_slice(&0u32.to_le_bytes()); // reserved
     let hdr: &'static [u8] = alloc::boxed::Box::leak(hdr_bytes.into_boxed_slice());
 
     // SAFETY: hdr points at a fully-initialized PVH struct;
@@ -142,8 +140,7 @@ fn smoke_initramfs_pvh_module_parser_no_match() -> TestResult {
     // Same shape as the prior smoke but with a non-matching
     // cmdline ("vmlinux"). The parser must return `None`.
     use narf_boot::x86_64::multiboot2::initramfs_module;
-    let cmdline: &'static [u8] =
-        alloc::boxed::Box::leak(b"vmlinux\0".to_vec().into_boxed_slice());
+    let cmdline: &'static [u8] = alloc::boxed::Box::leak(b"vmlinux\0".to_vec().into_boxed_slice());
     let modlist_bytes = {
         let mut v = alloc::vec::Vec::with_capacity(32);
         v.extend_from_slice(&0xDEAD_BEEF_u64.to_le_bytes());

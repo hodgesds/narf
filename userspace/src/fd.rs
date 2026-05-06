@@ -23,7 +23,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 /// Per-task fd table entry.
 #[derive(Clone)]
 pub struct FdEntry {
-    pub ops:    Arc<dyn FileOps>,
+    pub ops: Arc<dyn FileOps>,
     /// File-pointer offset into the underlying object. Updated on
     /// every `Read` / `Write` so they're position-tracking by
     /// default (POSIX semantics).
@@ -35,7 +35,7 @@ pub struct FdEntry {
     /// installed fd — including the dup'd half — so the historical
     /// "everything inherits across exec" Stage-4 behaviour holds
     /// until exec actually consults the bit.
-    pub flags:  u32,
+    pub flags: u32,
 }
 
 /// `FD_CLOEXEC` — bit 0 of `FdEntry::flags`. Mirrors POSIX. Kept
@@ -47,7 +47,7 @@ impl core::fmt::Debug for FdEntry {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("FdEntry")
             .field("offset", &self.offset)
-            .field("flags",  &self.flags)
+            .field("flags", &self.flags)
             .finish_non_exhaustive()
     }
 }
@@ -61,13 +61,17 @@ pub struct FdTable {
 }
 
 impl FdTable {
-    pub const fn new() -> Self { Self { slots: Vec::new() } }
+    pub const fn new() -> Self {
+        Self { slots: Vec::new() }
+    }
 
     /// Insert `entry` at the lowest free slot ≥ 3. Slots 0..=2 are
     /// reserved for stdio; install those via `set` directly.
     pub fn open(&mut self, entry: FdEntry) -> u32 {
         // Ensure stdio slots exist.
-        while self.slots.len() < 3 { self.slots.push(None); }
+        while self.slots.len() < 3 {
+            self.slots.push(None);
+        }
         for (i, s) in self.slots.iter_mut().enumerate().skip(3) {
             if s.is_none() {
                 *s = Some(entry);
@@ -82,7 +86,9 @@ impl FdTable {
     /// Place `entry` at a specific slot (typically used for stdio).
     pub fn set(&mut self, fd: u32, entry: FdEntry) {
         let i = fd as usize;
-        while self.slots.len() <= i { self.slots.push(None); }
+        while self.slots.len() <= i {
+            self.slots.push(None);
+        }
         self.slots[i] = Some(entry);
     }
 
@@ -90,7 +96,10 @@ impl FdTable {
     pub fn close(&mut self, fd: u32) -> bool {
         let i = fd as usize;
         match self.slots.get_mut(i) {
-            Some(slot @ Some(_)) => { *slot = None; true }
+            Some(slot @ Some(_)) => {
+                *slot = None;
+                true
+            }
             _ => false,
         }
     }
@@ -131,9 +140,30 @@ pub fn with_table<R>(task_id: u64, op: impl FnOnce(&mut FdTable) -> R) -> Option
         // kernel console. stdin reads return 0 (EOF) until a
         // real keyboard/serial backing lands.
         let console: Arc<dyn FileOps> = Arc::new(ConsoleFile);
-        t.set(0, FdEntry { ops: console.clone(), offset: 0, flags: 0 });
-        t.set(1, FdEntry { ops: console.clone(), offset: 0, flags: 0 });
-        t.set(2, FdEntry { ops: console,         offset: 0, flags: 0 });
+        t.set(
+            0,
+            FdEntry {
+                ops: console.clone(),
+                offset: 0,
+                flags: 0,
+            },
+        );
+        t.set(
+            1,
+            FdEntry {
+                ops: console.clone(),
+                offset: 0,
+                flags: 0,
+            },
+        );
+        t.set(
+            2,
+            FdEntry {
+                ops: console,
+                offset: 0,
+                flags: 0,
+            },
+        );
         t
     });
     Some(op(table))
@@ -154,7 +184,7 @@ impl core::fmt::Debug for ConsoleFile {
 
 impl FileOps for ConsoleFile {
     fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
-        Box::pin(async move { Ok(0) })  // EOF
+        Box::pin(async move { Ok(0) }) // EOF
     }
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
         let n = buf.len();
@@ -167,7 +197,12 @@ impl FileOps for ConsoleFile {
         Box::pin(async move { Ok(n) })
     }
     fn stat(&self) -> Stat {
-        Stat { size: 0, blocks: 0, mode: Mode::FILE_RW, mtime_cycles: 0 }
+        Stat {
+            size: 0,
+            blocks: 0,
+            mode: Mode::FILE_RW,
+            mtime_cycles: 0,
+        }
     }
 }
 

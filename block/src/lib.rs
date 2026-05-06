@@ -36,9 +36,8 @@ mod tests;
 pub use deadline::{DeadlineScheduler, Lane, STARVE_BOUND};
 pub use mq::{MqDeadlineScheduler, MAX_LANES};
 pub use registry::{
-    block_device_count, block_devices, find_block_device,
-    register_block_device, BlockDeviceSync, BlockIoError,
-    RegisteredBlockDevice,
+    block_device_count, block_devices, find_block_device, register_block_device, BlockDeviceSync,
+    BlockIoError, RegisteredBlockDevice,
 };
 
 use core::future::Future;
@@ -62,9 +61,9 @@ pub trait BlockDevice: Send + Sync {
     /// the completion.
     fn submit(&self, req: BlockRequest) -> impl Future<Output = BlockCompletion>;
     /// Ensure all previously-submitted writes are persistent on the media.
-    fn flush(&self)                     -> impl Future<Output = ()>;
+    fn flush(&self) -> impl Future<Output = ()>;
     /// Advise the device that a range of blocks is no longer needed.
-    fn discard(&self, range: LbaRange)  -> impl Future<Output = ()>;
+    fn discard(&self, range: LbaRange) -> impl Future<Output = ()>;
 
     /// Cancel an in-flight request by kernel-assigned tag.
     fn cancel(&self, tag: u64) -> impl Future<Output = CancelResult>;
@@ -98,17 +97,17 @@ pub enum CancelResult {
 #[derive(Debug)]
 pub struct BlockRequest {
     /// Operation type (Read, Write, etc.).
-    pub op:       BlockOp,
+    pub op: BlockOp,
     /// Logical block address to start at.
-    pub lba:      u64,
+    pub lba: u64,
     /// Number of blocks to transfer.
-    pub blocks:   u32,
+    pub blocks: u32,
     /// DMA buffer for the payload. Cap-gated; no copy in `block/`.
     /// Currently using `Read` as a placeholder; real rights are
     /// checked at the `BlockDevice::submit` invocation.
-    pub buffer:   Cap<DmaBuffer, Read>,
+    pub buffer: Cap<DmaBuffer, Read>,
     /// Quality-of-service hint for the scheduler.
-    pub qos:      QosHint,
+    pub qos: QosHint,
     /// Opaque cookie echoed back in the completion.
     pub user_tag: u64,
 }
@@ -134,11 +133,11 @@ pub enum QosHint {
 #[derive(Debug)]
 pub struct BlockCompletion {
     /// Kernel-assigned unique tag for this request.
-    pub tag:      u64,
+    pub tag: u64,
     /// Opaque cookie from the submission.
     pub user_tag: u64,
     /// Success or error code.
-    pub result:   Result<(), BlockError>,
+    pub result: Result<(), BlockError>,
 }
 
 /// Possible block I/O errors.
@@ -154,6 +153,6 @@ pub enum BlockError {
 /// A range of logical block addresses.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct LbaRange {
-    pub start:  u64,
+    pub start: u64,
     pub blocks: u64,
 }

@@ -20,8 +20,11 @@ fn smoke_scheduler_drives_future() -> TestResult {
     }
     crate::run_until_empty();
     // Three tasks × (1 + 10) = 33.
-    if COUNT.load(Ordering::Relaxed) == 33 { TestResult::Pass }
-    else { TestResult::Fail("scheduler didn't drive 3 tasks to completion") }
+    if COUNT.load(Ordering::Relaxed) == 33 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("scheduler didn't drive 3 tasks to completion")
+    }
 }
 kernel_test_in!("scheduler", smoke_scheduler_drives_future);
 
@@ -37,18 +40,22 @@ fn smoke_scheduler_respects_waker() -> TestResult {
     use core::task::{Context, Poll, Waker};
     use narf_lib::sync::IrqSafeSpinLock;
 
-    static POLLS:         AtomicUsize                     = AtomicUsize::new(0);
-    static PARKED_WAKER:  IrqSafeSpinLock<Option<Waker>>  = IrqSafeSpinLock::new(None);
+    static POLLS: AtomicUsize = AtomicUsize::new(0);
+    static PARKED_WAKER: IrqSafeSpinLock<Option<Waker>> = IrqSafeSpinLock::new(None);
 
-    struct Parked { ready: bool }
+    struct Parked {
+        ready: bool,
+    }
     impl Future for Parked {
         type Output = ();
         fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
             let this = self.get_mut();
             POLLS.fetch_add(1, Ordering::Relaxed);
-            if this.ready { return Poll::Ready(()); }
+            if this.ready {
+                return Poll::Ready(());
+            }
             *PARKED_WAKER.lock() = Some(cx.waker().clone());
-            this.ready = true;   // next poll (after being woken) completes
+            this.ready = true; // next poll (after being woken) completes
             Poll::Pending
         }
     }
@@ -64,14 +71,16 @@ fn smoke_scheduler_respects_waker() -> TestResult {
         // been re-polled many times by now; with per-task wakers it
         // must have been polled exactly once so far.
         crate::yield_now().await;
-        if let Some(w) = PARKED_WAKER.lock().take() { w.wake(); }
+        if let Some(w) = PARKED_WAKER.lock().take() {
+            w.wake();
+        }
     });
     crate::run_until_empty();
 
     match POLLS.load(Ordering::Relaxed) {
         2 => TestResult::Pass,
         n if n < 2 => TestResult::Fail("parked task never woke after wake()"),
-        _          => TestResult::Fail("parked task re-polled without a wake — waker gating broken"),
+        _ => TestResult::Fail("parked task re-polled without a wake — waker gating broken"),
     }
 }
 kernel_test_in!("scheduler", smoke_scheduler_respects_waker);
@@ -79,12 +88,12 @@ kernel_test_in!("scheduler", smoke_scheduler_respects_waker);
 fn smoke_scheduler_budget_cap_revokes_task() -> TestResult {
     // A Cap<CpuBudget, Spend>-attached task runs while the cap is live,
     // and is dropped by the scheduler once the cap is revoked.
+    use crate::{CpuBudget, ResourceBudget, TaskSpec};
     use core::future::Future;
     use core::pin::Pin;
     use core::sync::atomic::{AtomicUsize, Ordering};
     use core::task::{Context, Poll};
     use narf_capabilities::Cap;
-    use crate::{CpuBudget, ResourceBudget, TaskSpec};
 
     static RUNS: AtomicUsize = AtomicUsize::new(0);
 
@@ -112,7 +121,9 @@ fn smoke_scheduler_budget_cap_revokes_task() -> TestResult {
         TaskSpec::budgeted(ResourceBudget::unthrottled(), cap),
     );
     crate::spawn(async move {
-        for _ in 0..4 { crate::yield_now().await; }
+        for _ in 0..4 {
+            crate::yield_now().await;
+        }
         revoke_cap.revoke();
     });
 
@@ -144,8 +155,8 @@ fn smoke_scheduler_budget_accounts_cycles() -> TestResult {
     }
 
     let mut acct = BudgetAccount::new();
-    let budget   = ResourceBudget::fair_share(100_000, 1_000);
-    let over     = acct.charge(2_000, &budget);
+    let budget = ResourceBudget::fair_share(100_000, 1_000);
+    let over = acct.charge(2_000, &budget);
     if !over {
         return TestResult::Fail("charge exceeding burst_cycles should report over-budget");
     }
@@ -164,11 +175,8 @@ fn smoke_scheduler_budget_accounts_cycles() -> TestResult {
 kernel_test_in!("scheduler", smoke_scheduler_budget_accounts_cycles);
 
 fn smoke_scheduler_cpu_lifecycle_take_offline() -> TestResult {
+    use crate::{cpu_bring_up, cpu_online, cpu_take_offline, CpuId, CpuLifecycle, HotPlugError};
     use narf_capabilities::{Cap, Invoke};
-    use crate::{
-        cpu_bring_up, cpu_online, cpu_take_offline,
-        CpuId, CpuLifecycle, HotPlugError,
-    };
 
     crate::cpu_lifecycle::__test_reset_online_mask();
 
@@ -231,9 +239,9 @@ fn smoke_scheduler_donate_to_reorders_head() -> TestResult {
     // Called *before* run_until_empty, it swaps spawn-order so the
     // donee's first poll lands ahead of the task that was spawned
     // before it.
+    use crate::{donate_to, Task};
     use core::sync::atomic::{AtomicU32, Ordering};
     use narf_capabilities::{Cap, Invoke};
-    use crate::{donate_to, Task};
 
     static FIRST_TAG: AtomicU32 = AtomicU32::new(0);
     FIRST_TAG.store(0, Ordering::Relaxed);
@@ -262,7 +270,7 @@ fn smoke_scheduler_donate_to_reorders_head() -> TestResult {
     match FIRST_TAG.load(Ordering::Relaxed) {
         0xBBBB => TestResult::Pass,
         0xAAAA => TestResult::Fail("donee did not run ahead of the pre-spawned task"),
-        _      => TestResult::Fail("neither task ran"),
+        _ => TestResult::Fail("neither task ran"),
     }
 }
 kernel_test_in!("scheduler", smoke_scheduler_donate_to_reorders_head);
@@ -271,8 +279,8 @@ fn smoke_scheduler_current_task_id_during_poll() -> TestResult {
     // Before any spawn, current_task_id() is TaskId::NONE. Inside
     // a poll it matches the polling slot's id. Between rounds it
     // reverts to NONE.
-    use core::sync::atomic::{AtomicU64, Ordering};
     use crate::{current_task_id, TaskId};
+    use core::sync::atomic::{AtomicU64, Ordering};
 
     if current_task_id() != TaskId::NONE {
         return TestResult::Fail("current_task_id leaked across tests");
@@ -298,8 +306,8 @@ fn smoke_scheduler_current_task_id_during_poll() -> TestResult {
 kernel_test_in!("scheduler", smoke_scheduler_current_task_id_during_poll);
 
 fn smoke_scheduler_donate_to_rejects_revoked_cap() -> TestResult {
-    use narf_capabilities::{Cap, Invoke};
     use crate::{donate_to, DonateError, Task, TaskId};
+    use narf_capabilities::{Cap, Invoke};
 
     crate::init();
     let cap: Cap<Task, Invoke> = Cap::bootstrap();
@@ -316,8 +324,8 @@ fn smoke_scheduler_donate_to_rejects_revoked_cap() -> TestResult {
 kernel_test_in!("scheduler", smoke_scheduler_donate_to_rejects_revoked_cap);
 
 fn smoke_scheduler_donate_to_missing_target() -> TestResult {
-    use narf_capabilities::{Cap, Invoke};
     use crate::{donate_to, DonateError, Task, TaskId};
+    use narf_capabilities::{Cap, Invoke};
 
     crate::init();
     let cap: Cap<Task, Invoke> = Cap::bootstrap();

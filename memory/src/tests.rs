@@ -44,8 +44,8 @@ fn smoke_probe_catches_page_fault() -> TestResult {
     let caught = probe::disarm();
     match caught.vector {
         Some(14) => TestResult::Pass,
-        Some(_)  => TestResult::Fail("wrong vector caught (not #PF)"),
-        None     => TestResult::Fail("probe didn't catch the expected #PF"),
+        Some(_) => TestResult::Fail("wrong vector caught (not #PF)"),
+        None => TestResult::Fail("probe didn't catch the expected #PF"),
     }
 }
 #[cfg(target_arch = "x86_64")]
@@ -55,10 +55,10 @@ kernel_test_in!("memory", smoke_probe_catches_page_fault);
 fn smoke_nx_enforces_no_exec() -> TestResult {
     // Map a page NO_EXEC, attempt to execute from it, verify the
     // resulting #PF has the instruction-fetch bit (bit 4) set.
+    use crate::paging::{map_4kb, read_cr3, unmap_4kb, PtFlags};
+    use crate::{alloc_frame, free_frame, FrameAllocError, VirtAddr};
     use core::arch::asm;
     use narf_arch::x86_64::{probe, Features};
-    use crate::{alloc_frame, FrameAllocError, free_frame, VirtAddr};
-    use crate::paging::{map_4kb, unmap_4kb, read_cr3, PtFlags};
 
     // SAFETY: CPUID always legal.
     let feats = unsafe { Features::probe() };
@@ -69,8 +69,9 @@ fn smoke_nx_enforces_no_exec() -> TestResult {
     let pml4 = unsafe { read_cr3() };
     let frame = match alloc_frame() {
         Ok(f) => f,
-        Err(FrameAllocError::Uninitialised) =>
-            return TestResult::Skip("frame allocator not initialised"),
+        Err(FrameAllocError::Uninitialised) => {
+            return TestResult::Skip("frame allocator not initialised")
+        }
         Err(_) => return TestResult::Fail("alloc_frame failed"),
     };
     let virt = VirtAddr::new(0x3_0000_1000);
@@ -111,9 +112,9 @@ fn smoke_nx_enforces_no_exec() -> TestResult {
     free_frame(frame);
 
     match caught.vector {
-        None     => return TestResult::Fail("NX didn't fault on NO_EXEC jump"),
+        None => return TestResult::Fail("NX didn't fault on NO_EXEC jump"),
         Some(14) => {}
-        Some(_)  => return TestResult::Fail("wrong vector caught (not #PF)"),
+        Some(_) => return TestResult::Fail("wrong vector caught (not #PF)"),
     }
     if caught.error_code & (1 << 4) == 0 {
         return TestResult::Fail("fault caught but IF bit (4) not set — not NX");
@@ -125,10 +126,13 @@ kernel_test_in!("memory", smoke_nx_enforces_no_exec);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_pks_enforces_deny_all() -> TestResult {
+    use crate::paging::{map_4kb, read_cr3, unmap_4kb, PtFlags};
+    use crate::{alloc_frame, free_frame, FrameAllocError, VirtAddr};
     use core::arch::asm;
-    use narf_arch::x86_64::{probe, pks::{self, DomainRights}, Features};
-    use crate::{alloc_frame, FrameAllocError, free_frame, VirtAddr};
-    use crate::paging::{map_4kb, unmap_4kb, read_cr3, PtFlags};
+    use narf_arch::x86_64::{
+        pks::{self, DomainRights},
+        probe, Features,
+    };
 
     // SAFETY: CPUID always legal.
     let feats = unsafe { Features::probe() };
@@ -140,8 +144,9 @@ fn smoke_pks_enforces_deny_all() -> TestResult {
     let pml4 = unsafe { read_cr3() };
     let frame = match alloc_frame() {
         Ok(f) => f,
-        Err(FrameAllocError::Uninitialised) =>
-            return TestResult::Skip("frame allocator not initialised"),
+        Err(FrameAllocError::Uninitialised) => {
+            return TestResult::Skip("frame allocator not initialised")
+        }
         Err(_) => return TestResult::Fail("alloc_frame failed"),
     };
     let virt = VirtAddr::new(0x2_0000_1000);
@@ -156,7 +161,9 @@ fn smoke_pks_enforces_deny_all() -> TestResult {
 
     // SAFETY: CR4.PKS is 1.
     let saved_pkrs = unsafe { pks::save() };
-    unsafe { pks::set_rights(9, DomainRights::DENY_ALL); }
+    unsafe {
+        pks::set_rights(9, DomainRights::DENY_ALL);
+    }
 
     let recovery: u64;
     // SAFETY: LEA of a local label.
@@ -182,7 +189,9 @@ fn smoke_pks_enforces_deny_all() -> TestResult {
     let caught = probe::disarm();
 
     // SAFETY: pks::save earlier.
-    unsafe { pks::restore(saved_pkrs); }
+    unsafe {
+        pks::restore(saved_pkrs);
+    }
 
     let _ = unsafe { unmap_4kb(pml4, virt) };
     free_frame(frame);
@@ -207,7 +216,7 @@ fn smoke_pks_set_get_rights() -> TestResult {
     if !feats.pks {
         return TestResult::Skip("PKS not exposed by this CPU");
     }
-    use narf_arch::x86_64::pks::{save, restore, get_rights, set_rights, DomainRights};
+    use narf_arch::x86_64::pks::{get_rights, restore, save, set_rights, DomainRights};
     // SAFETY: feats.pks==true.
     let saved = unsafe { save() };
     unsafe {
@@ -216,7 +225,9 @@ fn smoke_pks_set_get_rights() -> TestResult {
     }
     let r3 = unsafe { get_rights(3) };
     let r7 = unsafe { get_rights(7) };
-    unsafe { restore(saved); }
+    unsafe {
+        restore(saved);
+    }
     if r3 != DomainRights::READ_ONLY {
         return TestResult::Fail("set_rights(3, READ_ONLY) didn't round-trip");
     }
@@ -230,8 +241,8 @@ kernel_test_in!("memory", smoke_pks_set_get_rights);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_pcid_cr3_roundtrip() -> TestResult {
-    use narf_arch::x86_64::pcid;
     use narf_arch::x86_64::cr;
+    use narf_arch::x86_64::pcid;
 
     if !pcid::is_active() {
         return TestResult::Skip("PCID enforcer not active (PKS-class CPU)");
@@ -245,7 +256,9 @@ fn smoke_pcid_cr3_roundtrip() -> TestResult {
     // SAFETY: CR3 read at CPL=0.
     let cr3_inside = unsafe { cr::read_cr3() };
     // SAFETY: matched scope.
-    unsafe { pcid::exit_domain(scope); }
+    unsafe {
+        pcid::exit_domain(scope);
+    }
     // SAFETY: CR3 read at CPL=0.
     let cr3_after = unsafe { cr::read_cr3() };
 
@@ -290,8 +303,8 @@ kernel_test_in!("memory", smoke_pcid_per_domain_pml4s_distinct);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_pcid_domain_private_slots_isolated() -> TestResult {
-    use narf_arch::x86_64::pcid;
     use crate::domain;
+    use narf_arch::x86_64::pcid;
 
     if !pcid::is_active() {
         return TestResult::Skip("PCID enforcer not active (PKS-class CPU)");
@@ -305,11 +318,13 @@ fn smoke_pcid_domain_private_slots_isolated() -> TestResult {
     }
     for inspector in 0u8..16 {
         for target in 0u8..16 {
-            if inspector == target { continue; }
+            if inspector == target {
+                continue;
+            }
             match domain::cross_domain_slot_present(inspector, target) {
-                Some(true)  => return TestResult::Fail("cross-domain slot leaked"),
+                Some(true) => return TestResult::Fail("cross-domain slot leaked"),
                 Some(false) => {}
-                None        => return TestResult::Fail("PML4 not registered"),
+                None => return TestResult::Fail("PML4 not registered"),
             }
         }
     }
@@ -325,7 +340,7 @@ fn smoke_pcid_domain_private_va_layout() -> TestResult {
     for d in 0u8..16 {
         let base = match domain::domain_va_base(d) {
             Some(b) => b,
-            None    => return TestResult::Fail("domain_va_base returned None for valid id"),
+            None => return TestResult::Fail("domain_va_base returned None for valid id"),
         };
         let expected = 0xFFFF_8000_0000_0000u64 + (d as u64) * (1u64 << 39);
         if base != expected {
@@ -370,9 +385,13 @@ fn smoke_pkrs_roundtrip() -> TestResult {
     // SAFETY: feats.pks==true.
     let saved = unsafe { rdmsr(IA32_PKRS) };
     let test_value = 0xFFFF_FFFF_u64;
-    unsafe { wrmsr(IA32_PKRS, test_value); }
+    unsafe {
+        wrmsr(IA32_PKRS, test_value);
+    }
     let got = unsafe { rdmsr(IA32_PKRS) };
-    unsafe { wrmsr(IA32_PKRS, saved); }
+    unsafe {
+        wrmsr(IA32_PKRS, saved);
+    }
     if got == test_value {
         TestResult::Pass
     } else {
@@ -389,8 +408,9 @@ fn smoke_map_preserves_pk_field() -> TestResult {
 
     let pml4 = match alloc_frame() {
         Ok(f) => f.start_address(),
-        Err(FrameAllocError::Uninitialised) =>
-            return TestResult::Skip("frame allocator not initialised"),
+        Err(FrameAllocError::Uninitialised) => {
+            return TestResult::Skip("frame allocator not initialised")
+        }
         Err(_) => return TestResult::Fail("alloc_frame failed"),
     };
     PageTable::zero_at(pml4.as_mut_ptr::<PageTable>());
@@ -404,7 +424,7 @@ fn smoke_map_preserves_pk_field() -> TestResult {
     }
     let got = match unsafe { flags_at(pml4, virt) } {
         Some(f) => f,
-        None    => return TestResult::Fail("flags_at returned None"),
+        None => return TestResult::Fail("flags_at returned None"),
     };
     if got.pk_of() != 5 {
         return TestResult::Fail("PK field lost through map_4kb");
@@ -423,13 +443,14 @@ kernel_test_in!("memory", smoke_map_preserves_pk_field);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_paging_map_translate_unmap() -> TestResult {
-    use crate::paging::{map_4kb, unmap_4kb, translate, PageTable, PtFlags};
+    use crate::paging::{map_4kb, translate, unmap_4kb, PageTable, PtFlags};
     use crate::{alloc_frame, FrameAllocError, PhysAddr, VirtAddr};
 
     let pml4 = match alloc_frame() {
         Ok(f) => f.start_address(),
-        Err(FrameAllocError::Uninitialised) =>
-            return TestResult::Skip("frame allocator not initialised"),
+        Err(FrameAllocError::Uninitialised) => {
+            return TestResult::Skip("frame allocator not initialised")
+        }
         Err(_) => return TestResult::Fail("alloc_frame failed"),
     };
     PageTable::zero_at(pml4.as_mut_ptr::<PageTable>());
@@ -482,11 +503,15 @@ kernel_test_in!("memory", smoke_frame_alloc_roundtrip);
 
 fn smoke_domain_primitive_trait() -> TestResult {
     // Trait-level dispatch through `arch::Domain::*`.
-    use narf_arch::{DomainPrimitive, DomainBackend};
+    use narf_arch::{DomainBackend, DomainPrimitive};
 
-    let expected = if cfg!(target_arch = "x86_64") { DomainBackend::Pks }
-                   else if cfg!(target_arch = "aarch64") { DomainBackend::Mte }
-                   else { return TestResult::Skip("unknown arch") };
+    let expected = if cfg!(target_arch = "x86_64") {
+        DomainBackend::Pks
+    } else if cfg!(target_arch = "aarch64") {
+        DomainBackend::Mte
+    } else {
+        return TestResult::Skip("unknown arch");
+    };
     if <narf_arch::Domain as DomainPrimitive>::BACKEND != expected {
         return TestResult::Fail("DomainPrimitive::BACKEND wrong");
     }
@@ -496,7 +521,7 @@ fn smoke_domain_primitive_trait() -> TestResult {
         // SAFETY: legal MRS/MSR sequence at EL1.
         unsafe {
             let saved0 = <narf_arch::Domain as DomainPrimitive>::save();
-            let inner  = <narf_arch::Domain as DomainPrimitive>::enter_domain(0, 9);
+            let inner = <narf_arch::Domain as DomainPrimitive>::enter_domain(0, 9);
             <narf_arch::Domain as DomainPrimitive>::exit_domain(inner);
             let saved1 = <narf_arch::Domain as DomainPrimitive>::save();
             if saved0 != saved1 {
@@ -534,21 +559,27 @@ kernel_test_in!("memory", smoke_domain_primitive_trait);
 #[cfg(target_arch = "x86_64")]
 fn smoke_domain_switch() -> TestResult {
     // End-to-end domain transition.
+    use crate::paging::{map_4kb, read_cr3, unmap_4kb, PtFlags};
+    use crate::{alloc_frame, free_frame, FrameAllocError, VirtAddr};
     use core::arch::asm;
-    use narf_arch::x86_64::{probe, pks::{self, SavedPkrs}, Features};
+    use narf_arch::x86_64::{
+        pks::{self, SavedPkrs},
+        probe, Features,
+    };
     use narf_lib::id::DomainId;
-    use crate::{alloc_frame, FrameAllocError, free_frame, VirtAddr};
-    use crate::paging::{map_4kb, unmap_4kb, read_cr3, PtFlags};
 
     // SAFETY: CPUID always legal.
     let feats = unsafe { Features::probe() };
-    if !feats.pks { return TestResult::Skip("PKS not exposed"); }
+    if !feats.pks {
+        return TestResult::Skip("PKS not exposed");
+    }
 
     let pml4 = unsafe { read_cr3() };
     let frame = match alloc_frame() {
         Ok(f) => f,
-        Err(FrameAllocError::Uninitialised) =>
-            return TestResult::Skip("frame allocator not initialised"),
+        Err(FrameAllocError::Uninitialised) => {
+            return TestResult::Skip("frame allocator not initialised")
+        }
         Err(_) => return TestResult::Fail("alloc_frame failed"),
     };
     let virt = VirtAddr::new(0x4_0000_1000);
@@ -556,10 +587,7 @@ fn smoke_domain_switch() -> TestResult {
     let driver_pk = DomainId::DRIVER_0.raw(); // 9
 
     // SAFETY: live PML4.
-    if unsafe {
-        map_4kb(pml4, virt, phys,
-                PtFlags::WRITABLE | PtFlags::pk(driver_pk))
-    }.is_err() {
+    if unsafe { map_4kb(pml4, virt, phys, PtFlags::WRITABLE | PtFlags::pk(driver_pk)) }.is_err() {
         free_frame(frame);
         return TestResult::Fail("map_4kb with PK=DRIVER_0 failed");
     }
@@ -575,10 +603,11 @@ fn smoke_domain_switch() -> TestResult {
              options(nostack));
     }
     // SAFETY: restore after the write.
-    unsafe { pks::exit_domain(scope1); }
+    unsafe {
+        pks::exit_domain(scope1);
+    }
 
-    let scope2 = unsafe { pks::enter_domain(DomainId::FRAME.raw(),
-                                             DomainId::DRIVER_1.raw()) };
+    let scope2 = unsafe { pks::enter_domain(DomainId::FRAME.raw(), DomainId::DRIVER_1.raw()) };
     let recovery: u64;
     // SAFETY: LEA of local label.
     unsafe {
@@ -600,17 +629,21 @@ fn smoke_domain_switch() -> TestResult {
     }
     let caught = probe::disarm();
     // SAFETY: restore PKRS.
-    unsafe { pks::exit_domain(scope2); }
+    unsafe {
+        pks::exit_domain(scope2);
+    }
 
     // SAFETY: restore of the previously-saved state.
-    unsafe { pks::restore(outermost_saved); }
+    unsafe {
+        pks::restore(outermost_saved);
+    }
     let _ = unsafe { unmap_4kb(pml4, virt) };
     free_frame(frame);
 
     match caught.vector {
         None => return TestResult::Fail("Step 3 write succeeded — domain enforcement failed"),
         Some(14) => {}
-        Some(_)  => return TestResult::Fail("wrong vector (not #PF)"),
+        Some(_) => return TestResult::Fail("wrong vector (not #PF)"),
     }
     if caught.error_code & (1 << 5) == 0 {
         return TestResult::Fail("#PF caught but PK bit (5) not set — not domain fault");
@@ -669,8 +702,12 @@ fn smoke_per_domain_root_register_lookup() -> TestResult {
     let phys = 0x4_0000u64;
     match per_domain_root::register_root(d, phys) {
         Ok(r) => {
-            if r.root_phys != phys { return TestResult::Fail("root_phys lost"); }
-            if r.domain != d { return TestResult::Fail("domain lost"); }
+            if r.root_phys != phys {
+                return TestResult::Fail("root_phys lost");
+            }
+            if r.domain != d {
+                return TestResult::Fail("domain lost");
+            }
         }
         Err(_) => return TestResult::Fail("register_root failed"),
     }
@@ -684,7 +721,10 @@ fn smoke_per_domain_root_register_lookup() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("memory/per_domain_root", smoke_per_domain_root_register_lookup);
+kernel_test_in!(
+    "memory/per_domain_root",
+    smoke_per_domain_root_register_lookup
+);
 
 fn smoke_tlb_shootdown_local_only() -> TestResult {
     use crate::tlb_shootdown;
@@ -699,4 +739,3 @@ fn smoke_tlb_shootdown_local_only() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory/tlb_shootdown", smoke_tlb_shootdown_local_only);
-

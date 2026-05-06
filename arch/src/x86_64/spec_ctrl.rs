@@ -31,23 +31,23 @@ use crate::x86_64::cpuid::cpuid;
 use crate::x86_64::msr::{rdmsr, wrmsr};
 
 pub const MSR_IA32_SPEC_CTRL: u32 = 0x48;
-pub const MSR_IA32_PRED_CMD:  u32 = 0x49;
+pub const MSR_IA32_PRED_CMD: u32 = 0x49;
 pub const MSR_IA32_FLUSH_CMD: u32 = 0x10B;
 
-pub const SPEC_CTRL_IBRS:  u64 = 1 << 0;
+pub const SPEC_CTRL_IBRS: u64 = 1 << 0;
 pub const SPEC_CTRL_STIBP: u64 = 1 << 1;
-pub const SPEC_CTRL_SSBD:  u64 = 1 << 2;
+pub const SPEC_CTRL_SSBD: u64 = 1 << 2;
 
-pub const PRED_CMD_IBPB:    u64 = 1 << 0;
-pub const FLUSH_CMD_L1D:    u64 = 1 << 0;
+pub const PRED_CMD_IBPB: u64 = 1 << 0;
+pub const FLUSH_CMD_L1D: u64 = 1 << 0;
 
 /// Bit-flag snapshot of available speculation-control features.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct SpecCtrlFeatures {
-    pub ibrs:        bool,
-    pub stibp:       bool,
-    pub ssbd:        bool,
-    pub l1d_flush:   bool,
+    pub ibrs: bool,
+    pub stibp: bool,
+    pub ssbd: bool,
+    pub l1d_flush: bool,
 }
 
 impl SpecCtrlFeatures {
@@ -56,9 +56,9 @@ impl SpecCtrlFeatures {
         // SAFETY: leaf 7 is always defined.
         let (_, _, _, edx) = unsafe { cpuid(7, 0) };
         Self {
-            ibrs:      edx & (1 << 26) != 0,
-            stibp:     edx & (1 << 27) != 0,
-            ssbd:      edx & (1 << 31) != 0,
+            ibrs: edx & (1 << 26) != 0,
+            stibp: edx & (1 << 27) != 0,
+            ssbd: edx & (1 << 31) != 0,
             l1d_flush: edx & (1 << 28) != 0,
         }
     }
@@ -71,17 +71,17 @@ pub fn features() -> SpecCtrlFeatures {
     let cached = FEATURES_RAW.load(Ordering::Acquire);
     if cached != 0xFF {
         return SpecCtrlFeatures {
-            ibrs:      cached & 1 != 0,
-            stibp:     cached & 2 != 0,
-            ssbd:      cached & 4 != 0,
+            ibrs: cached & 1 != 0,
+            stibp: cached & 2 != 0,
+            ssbd: cached & 4 != 0,
             l1d_flush: cached & 8 != 0,
         };
     }
     let f = SpecCtrlFeatures::probe();
-    let bits = (f.ibrs      as u8)
-             | ((f.stibp    as u8) << 1)
-             | ((f.ssbd     as u8) << 2)
-             | ((f.l1d_flush as u8) << 3);
+    let bits = (f.ibrs as u8)
+        | ((f.stibp as u8) << 1)
+        | ((f.ssbd as u8) << 2)
+        | ((f.l1d_flush as u8) << 3);
     FEATURES_RAW.store(bits, Ordering::Release);
     f
 }
@@ -91,7 +91,9 @@ pub fn features() -> SpecCtrlFeatures {
 /// # Safety
 /// CPL = 0.
 pub unsafe fn read() -> u64 {
-    if !features().ibrs && !features().stibp && !features().ssbd { return 0; }
+    if !features().ibrs && !features().stibp && !features().ssbd {
+        return 0;
+    }
     // SAFETY: caller-asserted CPL=0; CPUID gate satisfied.
     unsafe { rdmsr(MSR_IA32_SPEC_CTRL) }
 }
@@ -102,9 +104,13 @@ pub unsafe fn read() -> u64 {
 /// # Safety
 /// CPL = 0.
 pub unsafe fn write(bits: u64) {
-    if !features().ibrs && !features().stibp && !features().ssbd { return; }
+    if !features().ibrs && !features().stibp && !features().ssbd {
+        return;
+    }
     // SAFETY: caller-asserted.
-    unsafe { wrmsr(MSR_IA32_SPEC_CTRL, bits); }
+    unsafe {
+        wrmsr(MSR_IA32_SPEC_CTRL, bits);
+    }
 }
 
 /// Enable IBRS + STIBP + SSBD on this CPU (best-effort; only the
@@ -115,12 +121,20 @@ pub unsafe fn write(bits: u64) {
 pub unsafe fn enable_default_mitigations() {
     let f = features();
     let mut bits = 0u64;
-    if f.ibrs   { bits |= SPEC_CTRL_IBRS; }
-    if f.stibp  { bits |= SPEC_CTRL_STIBP; }
-    if f.ssbd   { bits |= SPEC_CTRL_SSBD; }
+    if f.ibrs {
+        bits |= SPEC_CTRL_IBRS;
+    }
+    if f.stibp {
+        bits |= SPEC_CTRL_STIBP;
+    }
+    if f.ssbd {
+        bits |= SPEC_CTRL_SSBD;
+    }
     if bits != 0 {
         // SAFETY: caller-asserted.
-        unsafe { write(bits); }
+        unsafe {
+            write(bits);
+        }
     }
 }
 
@@ -133,9 +147,13 @@ pub unsafe fn enable_default_mitigations() {
 /// # Safety
 /// CPL = 0.
 pub unsafe fn ibpb() {
-    if !features().ibrs { return; }  // IBPB shares the IBRS CPUID bit.
-    // SAFETY: caller-asserted.
-    unsafe { wrmsr(MSR_IA32_PRED_CMD, PRED_CMD_IBPB); }
+    if !features().ibrs {
+        return;
+    } // IBPB shares the IBRS CPUID bit.
+      // SAFETY: caller-asserted.
+    unsafe {
+        wrmsr(MSR_IA32_PRED_CMD, PRED_CMD_IBPB);
+    }
 }
 
 /// L1 data-cache flush. Used pre-VMENTER on hyperthreaded hosts
@@ -144,9 +162,13 @@ pub unsafe fn ibpb() {
 /// # Safety
 /// CPL = 0.
 pub unsafe fn l1d_flush() {
-    if !features().l1d_flush { return; }
+    if !features().l1d_flush {
+        return;
+    }
     // SAFETY: caller-asserted.
-    unsafe { wrmsr(MSR_IA32_FLUSH_CMD, FLUSH_CMD_L1D); }
+    unsafe {
+        wrmsr(MSR_IA32_FLUSH_CMD, FLUSH_CMD_L1D);
+    }
 }
 
 #[doc(hidden)]

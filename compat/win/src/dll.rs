@@ -94,11 +94,11 @@ use narf_memory::VirtAddr;
 /// A loaded module — main executable or DLL.
 #[derive(Debug)]
 pub struct WinModule {
-    pub name:    String,
-    pub base:    VirtAddr,
-    pub size:    u32,
-    pub is_dll:  bool,
-    pub entry:   Option<VirtAddr>,
+    pub name: String,
+    pub base: VirtAddr,
+    pub size: u32,
+    pub is_dll: bool,
+    pub entry: Option<VirtAddr>,
 }
 
 /// Per-process module index. Imports resolve against this table.
@@ -108,7 +108,11 @@ pub struct ModuleTable {
 }
 
 impl ModuleTable {
-    pub fn new() -> Self { Self { by_name: BTreeMap::new() } }
+    pub fn new() -> Self {
+        Self {
+            by_name: BTreeMap::new(),
+        }
+    }
 
     /// Look up a loaded module by its (lowercase ASCII) filename.
     pub fn get(&self, name: &str) -> Option<&WinModule> {
@@ -127,8 +131,12 @@ impl ModuleTable {
         self.by_name.insert(m.name.clone(), m);
     }
 
-    pub fn len(&self) -> usize { self.by_name.len() }
-    pub fn is_empty(&self) -> bool { self.by_name.is_empty() }
+    pub fn len(&self) -> usize {
+        self.by_name.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.by_name.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -140,11 +148,11 @@ mod tests {
     fn lookup_canonicalises_case() {
         let mut t = ModuleTable::new();
         t.insert(WinModule {
-            name:   "Kernel32.DLL".into(),
-            base:   VirtAddr::new(0x1000_0000),
-            size:   0x100,
+            name: "Kernel32.DLL".into(),
+            base: VirtAddr::new(0x1000_0000),
+            size: 0x100,
             is_dll: true,
-            entry:  None,
+            entry: None,
         });
         assert_eq!(t.len(), 1);
         // Inserts lowercase the key.

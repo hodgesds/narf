@@ -56,17 +56,25 @@ const N_CLASSES: usize = 9;
 
 /// Power-of-2 size that class `i` serves. `i = 0..N_CLASSES`.
 #[inline]
-const fn class_size(i: usize) -> usize { MIN_BLOCK << i }
+const fn class_size(i: usize) -> usize {
+    MIN_BLOCK << i
+}
 
 /// Pick the class for `size`. Returns `None` if size > largest class.
 #[inline]
 fn class_for(size: usize) -> Option<usize> {
-    if size == 0 { return Some(0); }
+    if size == 0 {
+        return Some(0);
+    }
     let s = core::cmp::max(size, MIN_BLOCK);
     // ceil(log2(s)) - log2(MIN_BLOCK).
     let log = (s.next_power_of_two().trailing_zeros() as usize)
         .saturating_sub(MIN_BLOCK.trailing_zeros() as usize);
-    if log < N_CLASSES { Some(log) } else { None }
+    if log < N_CLASSES {
+        Some(log)
+    } else {
+        None
+    }
 }
 
 #[repr(C)]
@@ -84,14 +92,14 @@ const MAG_SIZE: usize = 16;
 /// owning CPU can mutate without an atomic; cross-CPU access is
 /// forbidden by construction (the slab dispatcher consults
 /// `current_cpu()` before touching the cell).
-#[repr(align(64))]  // cache-line-pad to avoid false sharing
+#[repr(align(64))] // cache-line-pad to avoid false sharing
 struct Magazine {
     inner: UnsafeCell<MagazineInner>,
 }
 
 struct MagazineInner {
     stack: [Option<NonNull<FreeBlock>>; MAG_SIZE],
-    top:   usize,
+    top: usize,
 }
 
 impl Magazine {
@@ -99,7 +107,7 @@ impl Magazine {
         Self {
             inner: UnsafeCell::new(MagazineInner {
                 stack: [None; MAG_SIZE],
-                top:   0,
+                top: 0,
             }),
         }
     }
@@ -115,21 +123,21 @@ unsafe impl Sync for Magazine {}
 /// spin-lock; the magazine array gives each CPU a fast path that
 /// doesn't touch the lock until the magazine empties or fills.
 struct SizeClass {
-    head:        IrqSafeSpinLock<Option<NonNull<FreeBlock>>>,
+    head: IrqSafeSpinLock<Option<NonNull<FreeBlock>>>,
     /// Total blocks ever produced by this class (alloc-backed).
-    grown:       AtomicUsize,
+    grown: AtomicUsize,
     /// Currently-allocated block count.
-    in_use:      AtomicUsize,
+    in_use: AtomicUsize,
     /// Per-CPU magazines. Indexed by `current_cpu()`.
-    magazines:   [Magazine; MAX_CPUS],
+    magazines: [Magazine; MAX_CPUS],
 }
 
 impl SizeClass {
     const fn new() -> Self {
         Self {
-            head:      IrqSafeSpinLock::new(None),
-            grown:     AtomicUsize::new(0),
-            in_use:    AtomicUsize::new(0),
+            head: IrqSafeSpinLock::new(None),
+            grown: AtomicUsize::new(0),
+            in_use: AtomicUsize::new(0),
             magazines: [const { Magazine::new() }; MAX_CPUS],
         }
     }
@@ -141,9 +149,15 @@ impl SizeClass {
 unsafe impl Sync for SizeClass {}
 
 static CLASSES: [SizeClass; N_CLASSES] = [
-    SizeClass::new(), SizeClass::new(), SizeClass::new(),
-    SizeClass::new(), SizeClass::new(), SizeClass::new(),
-    SizeClass::new(), SizeClass::new(), SizeClass::new(),
+    SizeClass::new(),
+    SizeClass::new(),
+    SizeClass::new(),
+    SizeClass::new(),
+    SizeClass::new(),
+    SizeClass::new(),
+    SizeClass::new(),
+    SizeClass::new(),
+    SizeClass::new(),
 ];
 
 /// Allocations larger than the largest size class go straight to
@@ -162,7 +176,9 @@ pub enum SlabError {
 }
 
 impl From<crate::FrameAllocError> for SlabError {
-    fn from(_: crate::FrameAllocError) -> Self { SlabError::NoMemory }
+    fn from(_: crate::FrameAllocError) -> Self {
+        SlabError::NoMemory
+    }
 }
 
 /// Allocate `layout` bytes. Pointer is aligned to at least
@@ -172,13 +188,15 @@ impl From<crate::FrameAllocError> for SlabError {
 /// Returns `Err(SlabError::LayoutUnsupported)` when the alignment
 /// exceeds `PAGE_SIZE_USIZE`.
 pub fn alloc(layout: Layout) -> Result<NonNull<u8>, SlabError> {
-    if layout.align() > PAGE_SIZE_USIZE { return Err(SlabError::LayoutUnsupported); }
+    if layout.align() > PAGE_SIZE_USIZE {
+        return Err(SlabError::LayoutUnsupported);
+    }
 
     let need = layout.size().max(layout.align()).max(MIN_BLOCK);
     let class = class_for(need);
     match class {
         Some(c) => alloc_class(c),
-        None    => alloc_large(layout),
+        None => alloc_large(layout),
     }
 }
 
@@ -193,13 +211,13 @@ pub unsafe fn dealloc(ptr: NonNull<u8>, layout: Layout) {
     let need = layout.size().max(layout.align()).max(MIN_BLOCK);
     match class_for(need) {
         Some(c) => unsafe { dealloc_class(c, ptr) },
-        None    => unsafe { dealloc_large(ptr, layout) },
+        None => unsafe { dealloc_large(ptr, layout) },
     }
 }
 
 fn alloc_class(c: usize) -> Result<NonNull<u8>, SlabError> {
     let class = &CLASSES[c];
-    let cpu   = current_cpu();
+    let cpu = current_cpu();
 
     // FAST PATH: pop from the per-CPU magazine. No atomics, no
     // lock — only the active CPU touches its own magazine cell.
@@ -246,14 +264,13 @@ fn alloc_class(c: usize) -> Result<NonNull<u8>, SlabError> {
     let frame: PhysFrame = alloc_frame()?;
     let base = frame.start_address().raw() as *mut u8;
     let block_size = class_size(c);
-    let n_blocks   = PAGE_SIZE_USIZE / block_size;
+    let n_blocks = PAGE_SIZE_USIZE / block_size;
     let to_mag = (MAG_SIZE / 2).min(n_blocks - 1);
     // SAFETY: `base..base+PAGE_SIZE_USIZE` is a fresh identity-mapped
     // frame.
     unsafe {
         for i in 0..to_mag {
-            let blk = NonNull::new_unchecked(
-                base.add(i * block_size) as *mut FreeBlock);
+            let blk = NonNull::new_unchecked(base.add(i * block_size) as *mut FreeBlock);
             mag.stack[mag.top] = Some(blk);
             mag.top += 1;
         }
@@ -295,7 +312,9 @@ unsafe fn dealloc_class(c: usize, ptr: NonNull<u8>) {
         let mut blk = mag.stack[i].expect("magazine full");
         // SAFETY: blocks were originally allocated from this slab,
         // so overwriting `next` re-links them onto the central head.
-        unsafe { blk.as_mut().next = *g; }
+        unsafe {
+            blk.as_mut().next = *g;
+        }
         *g = Some(blk);
     }
     drop(g);
@@ -311,7 +330,9 @@ unsafe fn dealloc_class(c: usize, ptr: NonNull<u8>) {
 
 fn alloc_large(layout: Layout) -> Result<NonNull<u8>, SlabError> {
     let n_pages = (layout.size() + PAGE_SIZE_USIZE - 1) / PAGE_SIZE_USIZE;
-    if n_pages == 0 { return Err(SlabError::LayoutUnsupported); }
+    if n_pages == 0 {
+        return Err(SlabError::LayoutUnsupported);
+    }
     if n_pages > 1 {
         // Multi-page contiguous allocations need a buddy / region
         // allocator that we don't yet expose. Stage-5 follow-up.
@@ -335,24 +356,28 @@ unsafe fn dealloc_large(ptr: NonNull<u8>, _layout: Layout) {
 #[derive(Copy, Clone, Debug)]
 pub struct ClassStats {
     pub block_size: usize,
-    pub grown:      usize,
-    pub in_use:     usize,
+    pub grown: usize,
+    pub in_use: usize,
 }
 
 /// Snapshot of all size classes + the large-alloc counter.
 #[derive(Copy, Clone, Debug)]
 pub struct SlabStats {
-    pub classes:        [ClassStats; N_CLASSES],
-    pub large_in_use:   usize,
+    pub classes: [ClassStats; N_CLASSES],
+    pub large_in_use: usize,
 }
 
 pub fn stats() -> SlabStats {
-    let mut classes = [ClassStats { block_size: 0, grown: 0, in_use: 0 }; N_CLASSES];
+    let mut classes = [ClassStats {
+        block_size: 0,
+        grown: 0,
+        in_use: 0,
+    }; N_CLASSES];
     for (i, c) in CLASSES.iter().enumerate() {
         classes[i] = ClassStats {
             block_size: class_size(i),
-            grown:      c.grown.load(Ordering::Relaxed),
-            in_use:     c.in_use.load(Ordering::Relaxed),
+            grown: c.grown.load(Ordering::Relaxed),
+            in_use: c.in_use.load(Ordering::Relaxed),
         };
     }
     SlabStats {
@@ -362,8 +387,12 @@ pub fn stats() -> SlabStats {
 }
 
 /// Number of distinct size classes the allocator supports.
-pub const fn num_classes() -> usize { N_CLASSES }
+pub const fn num_classes() -> usize {
+    N_CLASSES
+}
 
 /// Largest size class's block size. Allocations strictly larger
 /// fall through to the page-frame buddy.
-pub const fn max_class_size() -> usize { class_size(N_CLASSES - 1) }
+pub const fn max_class_size() -> usize {
+    class_size(N_CLASSES - 1)
+}

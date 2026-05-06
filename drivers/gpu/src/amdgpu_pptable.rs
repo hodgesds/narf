@@ -59,8 +59,8 @@ pub enum PpTableError {
 /// Decoded PowerPlay table header + offset directory.
 #[derive(Copy, Clone)]
 pub struct PpTable {
-    pub structure_size:   u16,
-    pub format_revision:  u8,
+    pub structure_size: u16,
+    pub format_revision: u8,
     pub content_revision: u8,
     /// Stored BIOS-relative offsets, one per table. `0` means
     /// "not present on this chip".
@@ -82,22 +82,22 @@ impl fmt::Debug for PpTable {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(usize)]
 pub enum Subtable {
-    PlatformDescriptor       = 0,
-    OverdriveTable8          = 1,
-    OverdriveLimitsMax       = 2,
-    OverdriveLimitsMin       = 3,
-    FanTable                 = 4,
-    PowerTuneTable           = 5,
-    SocClockDependency       = 6,
-    MemClockDependency       = 7,
-    VdciClockDependency      = 8,
-    PcieClockDependency      = 9,
-    MvddVoltage              = 10,
-    VddciVoltage             = 11,
-    VddcVoltage              = 12,
-    PpmTable                 = 13,
-    SrambitTable             = 14,
-    HardLimitTable           = 15,
+    PlatformDescriptor = 0,
+    OverdriveTable8 = 1,
+    OverdriveLimitsMax = 2,
+    OverdriveLimitsMin = 3,
+    FanTable = 4,
+    PowerTuneTable = 5,
+    SocClockDependency = 6,
+    MemClockDependency = 7,
+    VdciClockDependency = 8,
+    PcieClockDependency = 9,
+    MvddVoltage = 10,
+    VddciVoltage = 11,
+    VddcVoltage = 12,
+    PpmTable = 13,
+    SrambitTable = 14,
+    HardLimitTable = 15,
 }
 
 impl PpTable {
@@ -106,9 +106,11 @@ impl PpTable {
     /// id per AtomBios.h).
     pub fn parse(raw: &[u8]) -> Result<Self, PpTableError> {
         // 4-byte common header + 16 × u32 offsets = 68 bytes minimum.
-        if raw.len() < 68 { return Err(PpTableError::Truncated); }
-        let structure_size   = u16::from_le_bytes([raw[0], raw[1]]);
-        let format_revision  = raw[2];
+        if raw.len() < 68 {
+            return Err(PpTableError::Truncated);
+        }
+        let structure_size = u16::from_le_bytes([raw[0], raw[1]]);
+        let format_revision = raw[2];
         let content_revision = raw[3];
         // V11.x is the Vega+ baseline; earlier (V8/V9) revisions
         // need a separate path.
@@ -118,12 +120,12 @@ impl PpTable {
         let mut offsets = [0u32; 16];
         for (i, slot) in offsets.iter_mut().enumerate() {
             let o = 4 + i * 4;
-            *slot = u32::from_le_bytes([
-                raw[o], raw[o + 1], raw[o + 2], raw[o + 3],
-            ]);
+            *slot = u32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]]);
         }
         Ok(Self {
-            structure_size, format_revision, content_revision,
+            structure_size,
+            format_revision,
+            content_revision,
             offsets,
         })
     }
@@ -132,7 +134,9 @@ impl PpTable {
     /// the chip doesn't carry that subtable.
     pub fn offset(&self, tbl: Subtable) -> Result<u32, PpTableError> {
         let o = self.offsets[tbl as usize];
-        if o == 0 { return Err(PpTableError::TableAbsent); }
+        if o == 0 {
+            return Err(PpTableError::TableAbsent);
+        }
         Ok(o)
     }
 

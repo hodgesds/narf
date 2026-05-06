@@ -38,7 +38,9 @@ pub enum GdbError {
 }
 
 impl From<CapError> for GdbError {
-    fn from(_: CapError) -> Self { GdbError::AuthorityRevoked }
+    fn from(_: CapError) -> Self {
+        GdbError::AuthorityRevoked
+    }
 }
 
 /// A decoded RSP command.
@@ -49,17 +51,17 @@ pub enum GdbCommand {
     /// `G <hex>` — write general-purpose registers.
     WriteRegs(Vec<u8>),
     /// `m addr,length` — read memory.
-    ReadMem   { addr: u64, len: u32 },
+    ReadMem { addr: u64, len: u32 },
     /// `M addr,length:hex` — write memory.
-    WriteMem  { addr: u64, bytes: Vec<u8> },
+    WriteMem { addr: u64, bytes: Vec<u8> },
     /// `c [addr]` — continue.
-    Continue  { addr: Option<u64> },
+    Continue { addr: Option<u64> },
     /// `s [addr]` — single-step.
-    Step      { addr: Option<u64> },
+    Step { addr: Option<u64> },
     /// `Z0 addr,kind` — insert software breakpoint.
-    InsertBp  { addr: u64, kind: u8 },
+    InsertBp { addr: u64, kind: u8 },
     /// `z0 addr,kind` — remove software breakpoint.
-    RemoveBp  { addr: u64, kind: u8 },
+    RemoveBp { addr: u64, kind: u8 },
     /// `?` — halt reason query.
     HaltReason,
     /// `qSupported:feature-list` — feature negotiation.
@@ -71,7 +73,7 @@ pub enum GdbCommand {
 /// checksum so callers never hand-wire the `#XX` footer.
 #[derive(Clone, Debug)]
 pub struct GdbPacket {
-    pub payload:  String,
+    pub payload: String,
     pub checksum: u8,
 }
 
@@ -79,14 +81,21 @@ impl GdbPacket {
     /// Frame `payload` into a packet with a valid `#XX` checksum.
     pub fn new(payload: &str) -> Self {
         let mut sum: u8 = 0;
-        for b in payload.as_bytes() { sum = sum.wrapping_add(*b); }
-        Self { payload: String::from(payload), checksum: sum }
+        for b in payload.as_bytes() {
+            sum = sum.wrapping_add(*b);
+        }
+        Self {
+            payload: String::from(payload),
+            checksum: sum,
+        }
     }
 
     /// Verify `self.checksum` matches `payload`'s byte-sum.
     pub fn checksum_valid(&self) -> bool {
         let mut sum: u8 = 0;
-        for b in self.payload.as_bytes() { sum = sum.wrapping_add(*b); }
+        for b in self.payload.as_bytes() {
+            sum = sum.wrapping_add(*b);
+        }
         sum == self.checksum
     }
 

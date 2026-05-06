@@ -33,7 +33,12 @@ pub use aarch64 as current;
 /// reserved for a future software-fault-isolation backend; not currently
 /// implemented.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum DomainBackend { Pks, Mte, Pcid, Sfi }
+pub enum DomainBackend {
+    Pks,
+    Mte,
+    Pcid,
+    Sfi,
+}
 
 /// The *static-shape* primitive picked at compile time from the target
 /// arch. On x86_64 this is `Pks`, on aarch64 it is `Mte`. Code that
@@ -64,18 +69,18 @@ pub const BACKEND: DomainBackend = DomainBackend::Mte;
 /// happens once during BSP boot before any AP is up; later reads only
 /// need to observe the post-init value, not synchronise with anything.
 mod effective {
-    use core::sync::atomic::{AtomicU8, Ordering};
     use super::DomainBackend;
+    use core::sync::atomic::{AtomicU8, Ordering};
 
     // 0xFF sentinel = "not yet set; fall back to compile-time BACKEND".
     static CELL: AtomicU8 = AtomicU8::new(0xFF);
 
     const fn encode(b: DomainBackend) -> u8 {
         match b {
-            DomainBackend::Pks  => 0,
-            DomainBackend::Mte  => 1,
+            DomainBackend::Pks => 0,
+            DomainBackend::Mte => 1,
             DomainBackend::Pcid => 2,
-            DomainBackend::Sfi  => 3,
+            DomainBackend::Sfi => 3,
         }
     }
     fn decode(v: u8) -> Option<DomainBackend> {
@@ -88,13 +93,19 @@ mod effective {
         })
     }
 
-    pub fn set(b: DomainBackend) { CELL.store(encode(b), Ordering::Relaxed) }
-    pub fn get() -> Option<DomainBackend> { decode(CELL.load(Ordering::Relaxed)) }
+    pub fn set(b: DomainBackend) {
+        CELL.store(encode(b), Ordering::Relaxed)
+    }
+    pub fn get() -> Option<DomainBackend> {
+        decode(CELL.load(Ordering::Relaxed))
+    }
 }
 
 /// Set the runtime-effective domain enforcer. Called once during BSP
 /// boot from `frame/main.rs` after CPUID + arch feature probing.
-pub fn set_effective_backend(b: DomainBackend) { effective::set(b) }
+pub fn set_effective_backend(b: DomainBackend) {
+    effective::set(b)
+}
 
 /// Read the runtime-effective domain enforcer. If `set_effective_backend`
 /// has not yet been called (very-early boot), falls back to the
@@ -127,7 +138,7 @@ pub trait DomainPrimitive {
     /// Read-only: writes fault, reads allowed.
     const READ_ONLY: Self::Rights;
     /// All-deny: any access faults.
-    const DENY_ALL:  Self::Rights;
+    const DENY_ALL: Self::Rights;
 
     /// Snapshot the current domain-rights state.
     ///
@@ -160,10 +171,7 @@ pub trait DomainPrimitive {
     ///
     /// # Safety
     /// Same as `save`. Both domain numbers must be in 0..=15.
-    unsafe fn enter_domain(
-        kernel_domain: u8,
-        driver_domain: u8,
-    ) -> Self::SavedState;
+    unsafe fn enter_domain(kernel_domain: u8, driver_domain: u8) -> Self::SavedState;
 
     /// Symmetric exit from a scope started by `enter_domain`.
     ///
@@ -181,7 +189,9 @@ pub type Domain = current::Mte;
 
 /// Spin-halt the current CPU forever. Used on panic and end-of-boot.
 #[inline(always)]
-pub fn halt_forever() -> ! { current::halt_forever() }
+pub fn halt_forever() -> ! {
+    current::halt_forever()
+}
 
 /// 128-bit atomic compare-and-swap.
 ///
@@ -205,7 +215,9 @@ pub unsafe fn cas128(ptr: *mut u128, old: u128, new: u128) -> Result<u128, u128>
 #[inline(always)]
 pub unsafe fn patch_word(addr: *mut u32, new: u32) {
     // SAFETY: delegated to the per-arch helper; contract above.
-    unsafe { current::patch_word(addr, new); }
+    unsafe {
+        current::patch_word(addr, new);
+    }
 }
 
 /// ID of the CPU currently executing this code. Stage-2 single-CPU
@@ -242,13 +254,17 @@ pub extern "Rust" fn narf_arch_current_domain() -> u8 {
 /// when IRQs are masked (HLT would otherwise deadlock). On aarch64 uses
 /// WFI, which wakes on IRQ regardless of mask state.
 #[inline(always)]
-pub fn halt_until_irq() { current::asm::halt_until_irq() }
+pub fn halt_until_irq() {
+    current::asm::halt_until_irq()
+}
 
 /// Whether IRQs are currently enabled on this CPU. Diagnostic only —
 /// don't gate logic on the result; that races with concurrent IRQ
 /// state changes.
 #[inline(always)]
-pub fn interrupts_enabled() -> bool { current::asm::interrupts_enabled() }
+pub fn interrupts_enabled() -> bool {
+    current::asm::interrupts_enabled()
+}
 
 /// Atomic enable-IRQs / halt / disable-IRQs primitive. Use from a
 /// `cli; while !cond { idle_halt_then_disable() } sti` loop to
@@ -263,7 +279,9 @@ pub fn interrupts_enabled() -> bool { current::asm::interrupts_enabled() }
 pub unsafe fn idle_halt_then_disable() {
     // SAFETY: forwarded — caller upholds the IRQs-disabled
     // precondition.
-    unsafe { current::asm::idle_halt_then_disable(); }
+    unsafe {
+        current::asm::idle_halt_then_disable();
+    }
 }
 
 /// End the kernel run with an exit code. Under QEMU this triggers a clean

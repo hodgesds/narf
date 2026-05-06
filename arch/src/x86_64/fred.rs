@@ -13,15 +13,15 @@ use crate::x86_64::cpuid::cpuid;
 use crate::x86_64::cr::{read_cr4, write_cr4};
 use crate::x86_64::msr::wrmsr;
 
-pub const MSR_IA32_FRED_RSP1:    u32 = 0x1CC;
-pub const MSR_IA32_FRED_RSP2:    u32 = 0x1CD;
-pub const MSR_IA32_FRED_RSP3:    u32 = 0x1CE;
+pub const MSR_IA32_FRED_RSP1: u32 = 0x1CC;
+pub const MSR_IA32_FRED_RSP2: u32 = 0x1CD;
+pub const MSR_IA32_FRED_RSP3: u32 = 0x1CE;
 pub const MSR_IA32_FRED_STKLVLS: u32 = 0x1CF;
-pub const MSR_IA32_FRED_RSP0:    u32 = 0x1D0;
-pub const MSR_IA32_FRED_SSP1:    u32 = 0x1D1;
-pub const MSR_IA32_FRED_SSP2:    u32 = 0x1D2;
-pub const MSR_IA32_FRED_SSP3:    u32 = 0x1D3;
-pub const MSR_IA32_FRED_CONFIG:  u32 = 0x1D4;
+pub const MSR_IA32_FRED_RSP0: u32 = 0x1D0;
+pub const MSR_IA32_FRED_SSP1: u32 = 0x1D1;
+pub const MSR_IA32_FRED_SSP2: u32 = 0x1D2;
+pub const MSR_IA32_FRED_SSP3: u32 = 0x1D3;
+pub const MSR_IA32_FRED_CONFIG: u32 = 0x1D4;
 
 /// CR4.FRED — bit 32. (CR4 is 64-bit on x86_64.)
 pub const CR4_FRED: u64 = 1 << 32;
@@ -30,7 +30,9 @@ pub const CR4_FRED: u64 = 1 << 32;
 pub fn supported() -> bool {
     // SAFETY: leaf 0 always defined.
     let max = unsafe { cpuid(0, 0).0 };
-    if max < 7 { return false; }
+    if max < 7 {
+        return false;
+    }
     // SAFETY: leaf 7 sub-leaf 1 valid.
     let (eax, _, _, _) = unsafe { cpuid(7, 1) };
     eax & (1 << 17) != 0
@@ -45,7 +47,9 @@ pub fn supported() -> bool {
 pub unsafe fn enable_cr4() {
     // SAFETY: caller-asserted.
     let v = unsafe { read_cr4() };
-    unsafe { write_cr4(v | CR4_FRED); }
+    unsafe {
+        write_cr4(v | CR4_FRED);
+    }
 }
 
 /// Clear CR4.FRED — fall back to IDT delivery.
@@ -55,7 +59,9 @@ pub unsafe fn enable_cr4() {
 pub unsafe fn disable_cr4() {
     // SAFETY: caller-asserted.
     let v = unsafe { read_cr4() };
-    unsafe { write_cr4(v & !CR4_FRED); }
+    unsafe {
+        write_cr4(v & !CR4_FRED);
+    }
 }
 
 /// Write the event-handler base into `IA32_FRED_CONFIG`. `va`
@@ -66,7 +72,9 @@ pub unsafe fn disable_cr4() {
 /// CPL = 0; FRED supported.
 pub unsafe fn write_handler_base(va: u64) {
     // SAFETY: caller-asserted.
-    unsafe { wrmsr(MSR_IA32_FRED_CONFIG, va); }
+    unsafe {
+        wrmsr(MSR_IA32_FRED_CONFIG, va);
+    }
 }
 
 /// Set `IA32_FRED_RSP0` — the kernel stack used on event entry
@@ -76,7 +84,9 @@ pub unsafe fn write_handler_base(va: u64) {
 /// CPL = 0; FRED supported.
 pub unsafe fn write_rsp0(rsp: u64) {
     // SAFETY: caller-asserted.
-    unsafe { wrmsr(MSR_IA32_FRED_RSP0, rsp); }
+    unsafe {
+        wrmsr(MSR_IA32_FRED_RSP0, rsp);
+    }
 }
 
 /// Set the per-vector stack-level lookup (`IA32_FRED_STKLVLS`).
@@ -85,5 +95,7 @@ pub unsafe fn write_rsp0(rsp: u64) {
 /// CPL = 0; FRED supported.
 pub unsafe fn write_stklvls(map: u64) {
     // SAFETY: caller-asserted.
-    unsafe { wrmsr(MSR_IA32_FRED_STKLVLS, map); }
+    unsafe {
+        wrmsr(MSR_IA32_FRED_STKLVLS, map);
+    }
 }

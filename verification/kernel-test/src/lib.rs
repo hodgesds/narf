@@ -27,12 +27,12 @@
 /// parallelised later.
 #[derive(Copy, Clone)]
 pub struct KernelTest {
-    pub name:      &'static str,
+    pub name: &'static str,
     /// Subsystem path, e.g. `"drivers/net/r8169"`. Used by the
     /// runner to group output and by selectors that want to run
     /// just one subsystem's tests.
     pub subsystem: &'static str,
-    pub run:       fn() -> TestResult,
+    pub run: fn() -> TestResult,
 }
 
 impl core::fmt::Debug for KernelTest {
@@ -54,13 +54,16 @@ pub enum TestResult {
 
 /// Summary returned by the runner.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Summary { AllOk, SomeFailed }
+pub enum Summary {
+    AllOk,
+    SomeFailed,
+}
 
 // ── test registration via an ELF section ───────────────────────────
 
 extern "Rust" {
     static __narf_tests_start: KernelTest;
-    static __narf_tests_end:   KernelTest;
+    static __narf_tests_end: KernelTest;
 }
 
 /// Return a slice over every registered test. Tests land in the
@@ -72,8 +75,8 @@ pub fn tests() -> &'static [KernelTest] {
     // zero or more `KernelTest` structs and nothing else (the
     // `kernel_test!` / `kernel_test_in!` macros are the only writers).
     let start = unsafe { &__narf_tests_start as *const KernelTest };
-    let end   = unsafe { &__narf_tests_end   as *const KernelTest };
-    let len   = (end as usize - start as usize) / core::mem::size_of::<KernelTest>();
+    let end = unsafe { &__narf_tests_end as *const KernelTest };
+    let len = (end as usize - start as usize) / core::mem::size_of::<KernelTest>();
     // SAFETY: `start` and `len` derived from the linker symbols.
     unsafe { core::slice::from_raw_parts(start, len) }
 }
@@ -87,9 +90,9 @@ macro_rules! kernel_test {
             #[used]
             #[link_section = "narf.tests"]
             static ENTRY: $crate::KernelTest = $crate::KernelTest {
-                name:      stringify!($name),
+                name: stringify!($name),
                 subsystem: "verification",
-                run:       $name,
+                run: $name,
             };
         };
     };
@@ -111,9 +114,9 @@ macro_rules! kernel_test_in {
             #[used]
             #[link_section = "narf.tests"]
             static ENTRY: $crate::KernelTest = $crate::KernelTest {
-                name:      stringify!($name),
+                name: stringify!($name),
                 subsystem: $subsystem,
-                run:       $name,
+                run: $name,
             };
         };
     };

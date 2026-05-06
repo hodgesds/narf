@@ -6,7 +6,7 @@ pub mod sgi;
 pub mod timer;
 
 pub use gic::init_bsp;
-pub use timer::{start_timer, stop_timer, on_timer_tick, timer_ticks};
+pub use timer::{on_timer_tick, start_timer, stop_timer, timer_ticks};
 
 /// aarch64 generic-timer PPI (private-peripheral IRQ). INTID 30 is the
 /// standard EL1 physical-timer entry across GICv2/GICv3 and QEMU virt.
@@ -20,5 +20,7 @@ pub const TIMER_PPI: u32 = 30;
 #[inline]
 pub unsafe fn eoi_for(iar: u64) {
     // SAFETY: trait delegated to arch.
-    unsafe { narf_arch::aarch64::sysreg::write_icc_eoir1_el1(iar); }
+    unsafe {
+        narf_arch::aarch64::sysreg::write_icc_eoir1_el1(iar);
+    }
 }

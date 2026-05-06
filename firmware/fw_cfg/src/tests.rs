@@ -9,17 +9,21 @@
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::{
-    decode_file_entry, find, is_present, read_directory, read_string,
-    FwCfgFile, FILE_ENTRY_SIZE, FILE_NAME_LEN, MAGIC,
+    decode_file_entry, find, is_present, read_directory, read_string, FwCfgFile, FILE_ENTRY_SIZE,
+    FILE_NAME_LEN, MAGIC,
 };
 
 // 1. Live presence — QEMU always exposes fw_cfg under `cargo xtask
 //    test`. Skip cleanly on bare-metal / non-QEMU runs.
 fn smoke_fw_cfg_signature_detected() -> TestResult {
-    if !is_present() { return TestResult::Skip("fw_cfg absent"); }
+    if !is_present() {
+        return TestResult::Skip("fw_cfg absent");
+    }
     // Re-probe to double-check the magic string sequence is stable
     // across calls (each probe re-selects FW_CFG_SIGNATURE).
-    if !is_present() { return TestResult::Fail("magic not stable"); }
+    if !is_present() {
+        return TestResult::Fail("magic not stable");
+    }
     TestResult::Pass
 }
 kernel_test_in!("firmware/fw_cfg", smoke_fw_cfg_signature_detected);
@@ -27,9 +31,11 @@ kernel_test_in!("firmware/fw_cfg", smoke_fw_cfg_signature_detected);
 // 2. Live directory parse — read FW_CFG_FILE_DIR and assert at least
 //    one canonical entry name decodes to printable ASCII.
 fn smoke_fw_cfg_file_directory_parses() -> TestResult {
-    if !is_present() { return TestResult::Skip("fw_cfg absent"); }
+    if !is_present() {
+        return TestResult::Skip("fw_cfg absent");
+    }
     let dir = match read_directory() {
-        Ok(d)  => d,
+        Ok(d) => d,
         Err(_) => return TestResult::Fail("read_directory errored"),
     };
     if dir.is_empty() {
@@ -58,7 +64,9 @@ kernel_test_in!("firmware/fw_cfg", smoke_fw_cfg_file_directory_parses);
 //    diagnosis (skip rather than fail). Reading it via `read_string`
 //    exercises select → stream-read → strip-NUL.
 fn smoke_fw_cfg_read_string_well_known() -> TestResult {
-    if !is_present() { return TestResult::Skip("fw_cfg absent"); }
+    if !is_present() {
+        return TestResult::Skip("fw_cfg absent");
+    }
     // Try a sequence of entries QEMU exposes by default; first hit
     // wins. We only need one to demonstrate the path works.
     for name in &["bootorder", "etc/boot-fail-wait", "etc/system-states"] {
@@ -94,8 +102,12 @@ fn smoke_fw_cfg_decode_synthetic_entry() -> TestResult {
     raw[8..8 + name.len()].copy_from_slice(name);
 
     let f: FwCfgFile = decode_file_entry(&raw);
-    if f.size != 0x0000_1234 { return TestResult::Fail("size decode"); }
-    if f.select != 0x0042   { return TestResult::Fail("select decode"); }
+    if f.size != 0x0000_1234 {
+        return TestResult::Fail("size decode");
+    }
+    if f.select != 0x0042 {
+        return TestResult::Fail("select decode");
+    }
     if f.name() != "etc/foo" {
         return TestResult::Fail("name decode");
     }

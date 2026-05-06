@@ -8,34 +8,36 @@
 use crate::x86_64::cpuid::cpuid;
 use crate::x86_64::msr::{rdmsr, wrmsr};
 
-pub const MSR_QM_EVTSEL:  u32 = 0xC8D;
-pub const MSR_QM_CTR:     u32 = 0xC8E;
-pub const MSR_PQR_ASSOC:  u32 = 0xC8F;
+pub const MSR_QM_EVTSEL: u32 = 0xC8D;
+pub const MSR_QM_CTR: u32 = 0xC8E;
+pub const MSR_PQR_ASSOC: u32 = 0xC8F;
 pub const MSR_L3_QOS_BASE: u32 = 0xC90;
 pub const MSR_L2_QOS_BASE: u32 = 0xD10;
-pub const MSR_MBA_BASE:    u32 = 0xD50;
+pub const MSR_MBA_BASE: u32 = 0xD50;
 
-pub const EVT_L3_OCCUPANCY:  u32 = 0x01;
-pub const EVT_TOTAL_MEM_BW:  u32 = 0x02;
-pub const EVT_LOCAL_MEM_BW:  u32 = 0x03;
+pub const EVT_L3_OCCUPANCY: u32 = 0x01;
+pub const EVT_TOTAL_MEM_BW: u32 = 0x02;
+pub const EVT_LOCAL_MEM_BW: u32 = 0x03;
 
 #[derive(Copy, Clone, Debug, Default)]
 pub struct RdtCaps {
-    pub monitoring:    bool,
-    pub allocation:    bool,
+    pub monitoring: bool,
+    pub allocation: bool,
     pub l3_monitoring: bool,
-    pub l3_cat:        bool,
-    pub l2_cat:        bool,
-    pub mba:           bool,
-    pub max_rmid:      u32,
-    pub max_closid:    u32,
+    pub l3_cat: bool,
+    pub l2_cat: bool,
+    pub mba: bool,
+    pub max_rmid: u32,
+    pub max_closid: u32,
 }
 
 pub fn caps() -> RdtCaps {
     let mut c = RdtCaps::default();
     // SAFETY: leaf 0 always defined.
     let max = unsafe { cpuid(0, 0).0 };
-    if max < 7 { return c; }
+    if max < 7 {
+        return c;
+    }
     // SAFETY: leaf 7 valid.
     let (_, ebx, _, _) = unsafe { cpuid(7, 0) };
     c.monitoring = ebx & (1 << 12) != 0;
@@ -54,7 +56,7 @@ pub fn caps() -> RdtCaps {
         let (_, ebx, _, _) = unsafe { cpuid(0x10, 0) };
         c.l3_cat = ebx & (1 << 1) != 0;
         c.l2_cat = ebx & (1 << 2) != 0;
-        c.mba    = ebx & (1 << 3) != 0;
+        c.mba = ebx & (1 << 3) != 0;
         if c.l3_cat {
             // SAFETY: gated.
             let (_, _, _, edx) = unsafe { cpuid(0x10, 1) };
@@ -71,7 +73,9 @@ pub fn caps() -> RdtCaps {
 pub unsafe fn assoc(rmid: u16, closid: u16) {
     let v = (rmid as u64) | ((closid as u64) << 32);
     // SAFETY: caller-asserted.
-    unsafe { wrmsr(MSR_PQR_ASSOC, v); }
+    unsafe {
+        wrmsr(MSR_PQR_ASSOC, v);
+    }
 }
 
 /// Read a monitoring event for `rmid`. Returns the
@@ -83,7 +87,9 @@ pub unsafe fn assoc(rmid: u16, closid: u16) {
 pub unsafe fn read_event(rmid: u16, evt_id: u32) -> u64 {
     let sel = (evt_id as u64) | ((rmid as u64) << 32);
     // SAFETY: caller-asserted.
-    unsafe { wrmsr(MSR_QM_EVTSEL, sel); }
+    unsafe {
+        wrmsr(MSR_QM_EVTSEL, sel);
+    }
     // SAFETY: caller-asserted.
     unsafe { rdmsr(MSR_QM_CTR) }
 }
@@ -94,7 +100,9 @@ pub unsafe fn read_event(rmid: u16, evt_id: u32) -> u64 {
 /// CPL = 0; L3-CAT supported.
 pub unsafe fn write_l3_mask(closid: u16, mask: u64) {
     // SAFETY: caller-asserted.
-    unsafe { wrmsr(MSR_L3_QOS_BASE + closid as u32, mask); }
+    unsafe {
+        wrmsr(MSR_L3_QOS_BASE + closid as u32, mask);
+    }
 }
 
 /// Same for L2.
@@ -103,7 +111,9 @@ pub unsafe fn write_l3_mask(closid: u16, mask: u64) {
 /// CPL = 0; L2-CAT supported.
 pub unsafe fn write_l2_mask(closid: u16, mask: u64) {
     // SAFETY: caller-asserted.
-    unsafe { wrmsr(MSR_L2_QOS_BASE + closid as u32, mask); }
+    unsafe {
+        wrmsr(MSR_L2_QOS_BASE + closid as u32, mask);
+    }
 }
 
 /// Write MBA throttle as a percentage (0..=100). Higher = more
@@ -113,5 +123,7 @@ pub unsafe fn write_l2_mask(closid: u16, mask: u64) {
 /// CPL = 0; MBA supported.
 pub unsafe fn write_mba_throttle(closid: u16, throttle_pct: u16) {
     // SAFETY: caller-asserted.
-    unsafe { wrmsr(MSR_MBA_BASE + closid as u32, throttle_pct as u64); }
+    unsafe {
+        wrmsr(MSR_MBA_BASE + closid as u32, throttle_pct as u64);
+    }
 }

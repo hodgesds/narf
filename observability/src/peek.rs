@@ -32,8 +32,8 @@ pub enum MetricValue {
 #[derive(Clone, Debug)]
 pub struct MetricSample {
     pub provider: String,
-    pub name:     String,
-    pub value:    MetricValue,
+    pub name: String,
+    pub value: MetricValue,
 }
 
 /// A provider exposes zero or more metrics on demand.
@@ -49,16 +49,22 @@ pub enum PeekError {
 }
 
 impl From<CapError> for PeekError {
-    fn from(_: CapError) -> Self { PeekError::AuthorityRevoked }
+    fn from(_: CapError) -> Self {
+        PeekError::AuthorityRevoked
+    }
 }
 
 type ProviderBox = alloc::boxed::Box<dyn Provider>;
 
-struct Registry { providers: Vec<ProviderBox> }
+struct Registry {
+    providers: Vec<ProviderBox>,
+}
 
 impl core::fmt::Debug for Registry {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Registry").field("providers", &self.providers.len()).finish()
+        f.debug_struct("Registry")
+            .field("providers", &self.providers.len())
+            .finish()
     }
 }
 
@@ -68,7 +74,9 @@ static REG: IrqSafeSpinLock<Option<Registry>> = IrqSafeSpinLock::new(None);
 /// kernel-internal code; the consumer of samples is cap-gated.
 pub fn register<P: Provider>(p: P) {
     let mut r = REG.lock();
-    let reg = r.get_or_insert_with(|| Registry { providers: Vec::new() });
+    let reg = r.get_or_insert_with(|| Registry {
+        providers: Vec::new(),
+    });
     reg.providers.push(alloc::boxed::Box::new(p));
 }
 
@@ -79,7 +87,10 @@ pub fn provider_count() -> usize {
 
 /// Sample every provider into `out`, cap-gated on
 /// `Cap<Diagnostics, Read>`. Replaces `out` with the fresh samples.
-pub fn sample_all(cap: &Cap<Diagnostics, Read>, out: &mut Vec<MetricSample>) -> Result<(), PeekError> {
+pub fn sample_all(
+    cap: &Cap<Diagnostics, Read>,
+    out: &mut Vec<MetricSample>,
+) -> Result<(), PeekError> {
     cap.invoke(NoopOp)?;
     out.clear();
     if let Some(ref r) = *REG.lock() {
@@ -93,4 +104,6 @@ pub fn sample_all(cap: &Cap<Diagnostics, Read>, out: &mut Vec<MetricSample>) -> 
 /// Test helper: wipe the registry so independent kernel_tests don't
 /// leak providers across boots.
 #[doc(hidden)]
-pub fn __test_reset() { *REG.lock() = None; }
+pub fn __test_reset() {
+    *REG.lock() = None;
+}

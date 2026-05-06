@@ -54,9 +54,9 @@ pub const SIG_MCFG: &[u8; 4] = b"MCFG";
 pub const SIG_FADT: &[u8; 4] = b"FACP";
 
 /// Where RSDP discovery starts looking when no override is set.
-const EBDA_PTR_PHYS:  u64 = 0x40E;
-const BIOS_AREA_LO:   u64 = 0xE_0000;
-const BIOS_AREA_HI:   u64 = 0xF_FFFF;
+const EBDA_PTR_PHYS: u64 = 0x40E;
+const BIOS_AREA_LO: u64 = 0xE_0000;
+const BIOS_AREA_HI: u64 = 0xF_FFFF;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AcpiError {
@@ -69,19 +69,19 @@ pub enum AcpiError {
 /// Decoded RSDP (revision 2.0 form — has `xsdt_address`).
 #[derive(Copy, Clone, Debug)]
 pub struct Rsdp {
-    pub revision:        u8,
-    pub oem_id:          [u8; 6],
-    pub rsdt_address:    u32,
-    pub xsdt_address:    u64,
+    pub revision: u8,
+    pub oem_id: [u8; 6],
+    pub rsdt_address: u32,
+    pub xsdt_address: u64,
 }
 
 /// Common SDT header (§5.2.6).
 #[derive(Copy, Clone, Debug)]
 pub struct SdtHeader {
     pub signature: [u8; 4],
-    pub length:    u32,
-    pub revision:  u8,
-    pub oem_id:    [u8; 6],
+    pub length: u32,
+    pub revision: u8,
+    pub oem_id: [u8; 6],
 }
 
 /// MADT entries we decode.
@@ -89,25 +89,38 @@ pub struct SdtHeader {
 pub enum MadtEntry {
     /// Local APIC: `(processor_uid, apic_id, flags)`. Bit 0 of
     /// `flags` = enabled.
-    LocalApic    { processor_uid: u8, apic_id: u8, flags: u32 },
+    LocalApic {
+        processor_uid: u8,
+        apic_id: u8,
+        flags: u32,
+    },
     /// IO APIC: `(id, address, gsi_base)`.
-    IoApic       { id: u8, address: u32, gsi_base: u32 },
+    IoApic { id: u8, address: u32, gsi_base: u32 },
     /// Interrupt Source Override: `(bus, source, gsi, flags)`.
-    IntOverride  { bus: u8, source: u8, gsi: u32, flags: u16 },
+    IntOverride {
+        bus: u8,
+        source: u8,
+        gsi: u32,
+        flags: u16,
+    },
     /// Local x2APIC: `(x2apic_id, flags, processor_uid)`.
-    LocalX2Apic  { x2apic_id: u32, flags: u32, processor_uid: u32 },
+    LocalX2Apic {
+        x2apic_id: u32,
+        flags: u32,
+        processor_uid: u32,
+    },
 }
 
 /// Aggregated table snapshot.
 #[derive(Debug, Default)]
 pub struct Tables {
     pub local_apic_base: Option<u64>,
-    pub local_apics:     Vec<MadtEntry>,
-    pub io_apics:        Vec<MadtEntry>,
-    pub overrides:       Vec<MadtEntry>,
-    pub hpet_base:       Option<u64>,
+    pub local_apics: Vec<MadtEntry>,
+    pub io_apics: Vec<MadtEntry>,
+    pub overrides: Vec<MadtEntry>,
+    pub hpet_base: Option<u64>,
     /// PCIe ECAM segments: `(base_phys, segment, start_bus, end_bus)`.
-    pub mcfg_segments:   Vec<(u64, u16, u8, u8)>,
+    pub mcfg_segments: Vec<(u64, u16, u8, u8)>,
     /// IA-PC boot flags from FADT (§5.2.9.3).
     pub iapc_boot_flags: Option<u16>,
 }
@@ -133,7 +146,9 @@ pub unsafe fn find_rsdp() -> Result<u64, AcpiError> {
     let over = RSDP_OVERRIDE.load(Ordering::Acquire);
     if over != 0 {
         // SAFETY: caller-asserted.
-        if unsafe { check_rsdp(over) } { return Ok(over); }
+        if unsafe { check_rsdp(over) } {
+            return Ok(over);
+        }
     }
     // EBDA pointer (segment, shifted left 4).
     // SAFETY: low-memory phys is identity-mapped.
@@ -157,7 +172,9 @@ unsafe fn scan_for_rsdp(lo: u64, hi: u64) -> Option<u64> {
     let mut p = lo & !0xF; // 16-byte aligned
     while p < hi {
         // SAFETY: low-memory range identity-mapped.
-        if unsafe { check_rsdp(p) } { return Some(p); }
+        if unsafe { check_rsdp(p) } {
+            return Some(p);
+        }
         p += 16;
     }
     None
@@ -167,19 +184,23 @@ unsafe fn check_rsdp(phys: u64) -> bool {
     // SAFETY: caller-asserted readable.
     let sig = unsafe {
         let mut s = [0u8; 8];
-        for i in 0..8 { s[i] = core::ptr::read_volatile((phys + i as u64) as *const u8); }
+        for i in 0..8 {
+            s[i] = core::ptr::read_volatile((phys + i as u64) as *const u8);
+        }
         s
     };
-    if &sig != RSDP_SIGNATURE { return false; }
+    if &sig != RSDP_SIGNATURE {
+        return false;
+    }
     // Verify the revision-1 (20-byte) checksum first.
     let mut sum: u8 = 0;
     // SAFETY: same.
     for i in 0..20 {
-        sum = sum.wrapping_add(
-            unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) }
-        );
+        sum = sum.wrapping_add(unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) });
     }
-    if sum != 0 { return false; }
+    if sum != 0 {
+        return false;
+    }
     // For revision >= 2, also verify the 36-byte checksum.
     // SAFETY: same.
     let rev = unsafe { core::ptr::read_volatile((phys + 15) as *const u8) };
@@ -187,11 +208,12 @@ unsafe fn check_rsdp(phys: u64) -> bool {
         let mut sum: u8 = 0;
         // SAFETY: same.
         for i in 0..36 {
-            sum = sum.wrapping_add(
-                unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) }
-            );
+            sum = sum
+                .wrapping_add(unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) });
         }
-        if sum != 0 { return false; }
+        if sum != 0 {
+            return false;
+        }
     }
     true
 }
@@ -213,15 +235,22 @@ pub unsafe fn decode_rsdp(phys: u64) -> Rsdp {
     let xsdt_address = if revision >= 2 {
         // SAFETY: same.
         unsafe { core::ptr::read_volatile((phys + 24) as *const u64) }
-    } else { 0 };
-    Rsdp { revision, oem_id, rsdt_address, xsdt_address }
+    } else {
+        0
+    };
+    Rsdp {
+        revision,
+        oem_id,
+        rsdt_address,
+        xsdt_address,
+    }
 }
 
 // ── SDT walk ────────────────────────────────────────────────────────
 
 unsafe fn read_sdt_header(phys: u64) -> SdtHeader {
     let mut signature = [0u8; 4];
-    let mut oem_id    = [0u8; 6];
+    let mut oem_id = [0u8; 6];
     // SAFETY: caller-asserted SDT phys.
     unsafe {
         for i in 0..4 {
@@ -232,19 +261,22 @@ unsafe fn read_sdt_header(phys: u64) -> SdtHeader {
         }
     }
     // SAFETY: same.
-    let length   = unsafe { core::ptr::read_volatile((phys + 4) as *const u32) };
+    let length = unsafe { core::ptr::read_volatile((phys + 4) as *const u32) };
     // SAFETY: same.
     let revision = unsafe { core::ptr::read_volatile((phys + 9) as *const u8) };
-    SdtHeader { signature, length, revision, oem_id }
+    SdtHeader {
+        signature,
+        length,
+        revision,
+        oem_id,
+    }
 }
 
 unsafe fn checksum_ok(phys: u64, length: u32) -> bool {
     let mut sum: u8 = 0;
     // SAFETY: caller-asserted readable + bounded.
     for i in 0..length as u64 {
-        sum = sum.wrapping_add(
-            unsafe { core::ptr::read_volatile((phys + i) as *const u8) }
-        );
+        sum = sum.wrapping_add(unsafe { core::ptr::read_volatile((phys + i) as *const u8) });
     }
     sum == 0
 }
@@ -257,21 +289,26 @@ unsafe fn checksum_ok(phys: u64, length: u32) -> bool {
 pub unsafe fn parse_xsdt(phys: u64) -> Result<Tables, AcpiError> {
     // SAFETY: caller-asserted.
     let h = unsafe { read_sdt_header(phys) };
-    if &h.signature != b"XSDT" { return Err(AcpiError::NoXsdt); }
+    if &h.signature != b"XSDT" {
+        return Err(AcpiError::NoXsdt);
+    }
     // SAFETY: same.
-    if !unsafe { checksum_ok(phys, h.length) } { return Err(AcpiError::BadChecksum); }
+    if !unsafe { checksum_ok(phys, h.length) } {
+        return Err(AcpiError::BadChecksum);
+    }
     let entries = (h.length as usize - 36) / 8;
     let mut t = Tables::default();
     for i in 0..entries {
         // SAFETY: same.
-        let sdt_phys = unsafe {
-            core::ptr::read_volatile((phys + 36 + (i * 8) as u64) as *const u64)
-        };
+        let sdt_phys =
+            unsafe { core::ptr::read_volatile((phys + 36 + (i * 8) as u64) as *const u64) };
         // SAFETY: caller-trusted XSDT entry.
         let sh = unsafe { read_sdt_header(sdt_phys) };
         // Bad checksum on a child table is non-fatal — skip it.
         // SAFETY: same.
-        if !unsafe { checksum_ok(sdt_phys, sh.length) } { continue; }
+        if !unsafe { checksum_ok(sdt_phys, sh.length) } {
+            continue;
+        }
         match &sh.signature {
             // SAFETY: parsed below.
             SIG_MADT => unsafe { parse_madt(sdt_phys, sh.length, &mut t) },
@@ -288,7 +325,9 @@ pub unsafe fn parse_xsdt(phys: u64) -> Result<Tables, AcpiError> {
 
 unsafe fn parse_madt(phys: u64, length: u32, t: &mut Tables) {
     // header (36) + local apic addr (4) + flags (4) + entries...
-    if length < 44 { return; }
+    if length < 44 {
+        return;
+    }
     // SAFETY: caller-asserted SDT phys.
     let lapic_addr = unsafe { core::ptr::read_volatile((phys + 36) as *const u32) };
     t.local_apic_base = Some(lapic_addr as u64);
@@ -297,53 +336,68 @@ unsafe fn parse_madt(phys: u64, length: u32, t: &mut Tables) {
         // SAFETY: same.
         let kind = unsafe { core::ptr::read_volatile((phys + off) as *const u8) };
         // SAFETY: same.
-        let len  = unsafe { core::ptr::read_volatile((phys + off + 1) as *const u8) } as u64;
-        if len < 2 { break; }
+        let len = unsafe { core::ptr::read_volatile((phys + off + 1) as *const u8) } as u64;
+        if len < 2 {
+            break;
+        }
         match kind {
             0 if len >= 8 => {
                 // Local APIC entry.
                 // SAFETY: same.
-                let pid   = unsafe { core::ptr::read_volatile((phys + off + 2) as *const u8) };
+                let pid = unsafe { core::ptr::read_volatile((phys + off + 2) as *const u8) };
                 // SAFETY: same.
-                let aid   = unsafe { core::ptr::read_volatile((phys + off + 3) as *const u8) };
+                let aid = unsafe { core::ptr::read_volatile((phys + off + 3) as *const u8) };
                 // SAFETY: same.
                 let flags = unsafe { core::ptr::read_volatile((phys + off + 4) as *const u32) };
                 t.local_apics.push(MadtEntry::LocalApic {
-                    processor_uid: pid, apic_id: aid, flags,
+                    processor_uid: pid,
+                    apic_id: aid,
+                    flags,
                 });
             }
             1 if len >= 12 => {
                 // IOAPIC entry.
                 // SAFETY: same.
-                let id    = unsafe { core::ptr::read_volatile((phys + off + 2) as *const u8) };
+                let id = unsafe { core::ptr::read_volatile((phys + off + 2) as *const u8) };
                 // SAFETY: same.
-                let addr  = unsafe { core::ptr::read_volatile((phys + off + 4) as *const u32) };
+                let addr = unsafe { core::ptr::read_volatile((phys + off + 4) as *const u32) };
                 // SAFETY: same.
-                let gsi   = unsafe { core::ptr::read_volatile((phys + off + 8) as *const u32) };
-                t.io_apics.push(MadtEntry::IoApic { id, address: addr, gsi_base: gsi });
+                let gsi = unsafe { core::ptr::read_volatile((phys + off + 8) as *const u32) };
+                t.io_apics.push(MadtEntry::IoApic {
+                    id,
+                    address: addr,
+                    gsi_base: gsi,
+                });
             }
             2 if len >= 10 => {
                 // Interrupt Source Override.
                 // SAFETY: same.
-                let bus    = unsafe { core::ptr::read_volatile((phys + off + 2) as *const u8) };
+                let bus = unsafe { core::ptr::read_volatile((phys + off + 2) as *const u8) };
                 // SAFETY: same.
                 let source = unsafe { core::ptr::read_volatile((phys + off + 3) as *const u8) };
                 // SAFETY: same.
-                let gsi    = unsafe { core::ptr::read_volatile((phys + off + 4) as *const u32) };
+                let gsi = unsafe { core::ptr::read_volatile((phys + off + 4) as *const u32) };
                 // SAFETY: same.
-                let flags  = unsafe { core::ptr::read_volatile((phys + off + 8) as *const u16) };
-                t.overrides.push(MadtEntry::IntOverride { bus, source, gsi, flags });
+                let flags = unsafe { core::ptr::read_volatile((phys + off + 8) as *const u16) };
+                t.overrides.push(MadtEntry::IntOverride {
+                    bus,
+                    source,
+                    gsi,
+                    flags,
+                });
             }
             9 if len >= 16 => {
                 // Local x2APIC entry.
                 // SAFETY: same.
-                let xid   = unsafe { core::ptr::read_volatile((phys + off + 4) as *const u32) };
+                let xid = unsafe { core::ptr::read_volatile((phys + off + 4) as *const u32) };
                 // SAFETY: same.
                 let flags = unsafe { core::ptr::read_volatile((phys + off + 8) as *const u32) };
                 // SAFETY: same.
-                let pid   = unsafe { core::ptr::read_volatile((phys + off + 12) as *const u32) };
+                let pid = unsafe { core::ptr::read_volatile((phys + off + 12) as *const u32) };
                 t.local_apics.push(MadtEntry::LocalX2Apic {
-                    x2apic_id: xid, flags, processor_uid: pid,
+                    x2apic_id: xid,
+                    flags,
+                    processor_uid: pid,
                 });
             }
             _ => {}
@@ -356,7 +410,9 @@ unsafe fn parse_madt(phys: u64, length: u32, t: &mut Tables) {
 
 unsafe fn parse_hpet(phys: u64, length: u32, t: &mut Tables) {
     // header (36) + event_timer_block_id (4) + base_address (12) + ...
-    if length < 56 { return; }
+    if length < 56 {
+        return;
+    }
     // The 64-bit base lives in the GAS at offset 44, address field
     // at +4 within the GAS.
     // SAFETY: caller-asserted.
@@ -368,17 +424,19 @@ unsafe fn parse_hpet(phys: u64, length: u32, t: &mut Tables) {
 
 unsafe fn parse_mcfg(phys: u64, length: u32, t: &mut Tables) {
     // header (36) + reserved (8) + per-segment entries (16 each).
-    if length < 44 { return; }
+    if length < 44 {
+        return;
+    }
     let mut off: u64 = 44;
     while (off as u32) + 16 <= length {
         // SAFETY: caller-asserted.
-        let base    = unsafe { core::ptr::read_volatile((phys + off) as *const u64) };
+        let base = unsafe { core::ptr::read_volatile((phys + off) as *const u64) };
         // SAFETY: same.
-        let seg     = unsafe { core::ptr::read_volatile((phys + off + 8) as *const u16) };
+        let seg = unsafe { core::ptr::read_volatile((phys + off + 8) as *const u16) };
         // SAFETY: same.
         let start_b = unsafe { core::ptr::read_volatile((phys + off + 10) as *const u8) };
         // SAFETY: same.
-        let end_b   = unsafe { core::ptr::read_volatile((phys + off + 11) as *const u8) };
+        let end_b = unsafe { core::ptr::read_volatile((phys + off + 11) as *const u8) };
         t.mcfg_segments.push((base, seg, start_b, end_b));
         off += 16;
     }
@@ -388,7 +446,9 @@ unsafe fn parse_mcfg(phys: u64, length: u32, t: &mut Tables) {
 
 unsafe fn parse_fadt(phys: u64, length: u32, t: &mut Tables) {
     // IA-PC Boot Architecture Flags at offset 109 (u16).
-    if length < 111 { return; }
+    if length < 111 {
+        return;
+    }
     // SAFETY: caller-asserted.
     let flags = unsafe { core::ptr::read_volatile((phys + 109) as *const u16) };
     t.iapc_boot_flags = Some(flags);

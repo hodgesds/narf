@@ -32,10 +32,10 @@ pub const MSR_X2APIC_ICR: u32 = 0x830;
 // ICR delivery / mode bits.
 const DELIVERY_INIT: u32 = 0b101 << 8;
 const DELIVERY_SIPI: u32 = 0b110 << 8;
-const LEVEL_ASSERT:  u32 = 1 << 14;
-const LEVEL_DEASSERT:u32 = 0;
+const LEVEL_ASSERT: u32 = 1 << 14;
+const LEVEL_DEASSERT: u32 = 0;
 const TRIGGER_LEVEL: u32 = 1 << 15;
-const PHYS_DEST:     u32 = 0;
+const PHYS_DEST: u32 = 0;
 
 /// Issue an INIT-IPI (assert) to `apic_id` via xAPIC MMIO.
 ///
@@ -44,10 +44,7 @@ const PHYS_DEST:     u32 = 0;
 pub unsafe fn xapic_init_assert(lapic_mmio: u64, apic_id: u32) {
     // SAFETY: caller-asserted.
     unsafe {
-        core::ptr::write_volatile(
-            (lapic_mmio + ICR_HI) as *mut u32,
-            (apic_id & 0xFF) << 24,
-        );
+        core::ptr::write_volatile((lapic_mmio + ICR_HI) as *mut u32, (apic_id & 0xFF) << 24);
         core::ptr::write_volatile(
             (lapic_mmio + ICR_LO) as *mut u32,
             DELIVERY_INIT | LEVEL_ASSERT | TRIGGER_LEVEL | PHYS_DEST,
@@ -62,10 +59,7 @@ pub unsafe fn xapic_init_assert(lapic_mmio: u64, apic_id: u32) {
 pub unsafe fn xapic_init_deassert(lapic_mmio: u64, apic_id: u32) {
     // SAFETY: caller-asserted.
     unsafe {
-        core::ptr::write_volatile(
-            (lapic_mmio + ICR_HI) as *mut u32,
-            (apic_id & 0xFF) << 24,
-        );
+        core::ptr::write_volatile((lapic_mmio + ICR_HI) as *mut u32, (apic_id & 0xFF) << 24);
         core::ptr::write_volatile(
             (lapic_mmio + ICR_LO) as *mut u32,
             DELIVERY_INIT | LEVEL_DEASSERT | TRIGGER_LEVEL | PHYS_DEST,
@@ -81,10 +75,7 @@ pub unsafe fn xapic_init_deassert(lapic_mmio: u64, apic_id: u32) {
 pub unsafe fn xapic_sipi(lapic_mmio: u64, apic_id: u32, vector: u8) {
     // SAFETY: caller-asserted.
     unsafe {
-        core::ptr::write_volatile(
-            (lapic_mmio + ICR_HI) as *mut u32,
-            (apic_id & 0xFF) << 24,
-        );
+        core::ptr::write_volatile((lapic_mmio + ICR_HI) as *mut u32, (apic_id & 0xFF) << 24);
         core::ptr::write_volatile(
             (lapic_mmio + ICR_LO) as *mut u32,
             DELIVERY_SIPI | LEVEL_ASSERT | PHYS_DEST | (vector as u32),
@@ -98,9 +89,11 @@ pub unsafe fn xapic_sipi(lapic_mmio: u64, apic_id: u32, vector: u8) {
 /// CPL = 0; x2APIC enabled.
 pub unsafe fn x2apic_init_assert(apic_id: u32) {
     let v = ((apic_id as u64) << 32)
-          | (DELIVERY_INIT | LEVEL_ASSERT | TRIGGER_LEVEL | PHYS_DEST) as u64;
+        | (DELIVERY_INIT | LEVEL_ASSERT | TRIGGER_LEVEL | PHYS_DEST) as u64;
     // SAFETY: caller-asserted.
-    unsafe { wrmsr(MSR_X2APIC_ICR, v); }
+    unsafe {
+        wrmsr(MSR_X2APIC_ICR, v);
+    }
 }
 
 /// x2APIC INIT deassert.
@@ -109,9 +102,11 @@ pub unsafe fn x2apic_init_assert(apic_id: u32) {
 /// CPL = 0; x2APIC enabled.
 pub unsafe fn x2apic_init_deassert(apic_id: u32) {
     let v = ((apic_id as u64) << 32)
-          | (DELIVERY_INIT | LEVEL_DEASSERT | TRIGGER_LEVEL | PHYS_DEST) as u64;
+        | (DELIVERY_INIT | LEVEL_DEASSERT | TRIGGER_LEVEL | PHYS_DEST) as u64;
     // SAFETY: caller-asserted.
-    unsafe { wrmsr(MSR_X2APIC_ICR, v); }
+    unsafe {
+        wrmsr(MSR_X2APIC_ICR, v);
+    }
 }
 
 /// x2APIC SIPI.
@@ -120,10 +115,12 @@ pub unsafe fn x2apic_init_deassert(apic_id: u32) {
 /// CPL = 0; x2APIC enabled.
 pub unsafe fn x2apic_sipi(apic_id: u32, vector: u8) {
     let v = ((apic_id as u64) << 32)
-          | (DELIVERY_SIPI | LEVEL_ASSERT | PHYS_DEST) as u64
-          | (vector as u64);
+        | (DELIVERY_SIPI | LEVEL_ASSERT | PHYS_DEST) as u64
+        | (vector as u64);
     // SAFETY: caller-asserted.
-    unsafe { wrmsr(MSR_X2APIC_ICR, v); }
+    unsafe {
+        wrmsr(MSR_X2APIC_ICR, v);
+    }
 }
 
 /// Extract the list of AP APIC ids from an ACPI MADT snapshot.
@@ -137,7 +134,9 @@ pub fn aps_from_madt(t: &acpi::Tables, bsp_apic_id: u32) -> Vec<u32> {
                     out.push(apic_id as u32);
                 }
             }
-            acpi::MadtEntry::LocalX2Apic { x2apic_id, flags, .. } => {
+            acpi::MadtEntry::LocalX2Apic {
+                x2apic_id, flags, ..
+            } => {
                 if flags & 1 != 0 && x2apic_id != bsp_apic_id {
                     out.push(x2apic_id);
                 }
@@ -162,7 +161,9 @@ pub fn mark_alive() {
     ALIVE_COUNT.fetch_add(1, Ordering::Release);
 }
 
-pub fn alive_count() -> u32 { ALIVE_COUNT.load(Ordering::Acquire) }
+pub fn alive_count() -> u32 {
+    ALIVE_COUNT.load(Ordering::Acquire)
+}
 
 /// Issue the INIT/SIPI/SIPI sequence to `apic_id`. Returns
 /// `started = false` if the AP didn't bump the alive counter
@@ -173,7 +174,7 @@ pub fn alive_count() -> u32 { ALIVE_COUNT.load(Ordering::Acquire) }
 /// trampoline at `trampoline_phys` is callable.
 pub unsafe fn start_ap_xapic(
     lapic_mmio: u64,
-    apic_id:    u32,
+    apic_id: u32,
     trampoline_phys: u64,
 ) -> ApBringUpResult {
     let baseline = alive_count();
@@ -182,21 +183,28 @@ pub unsafe fn start_ap_xapic(
     unsafe {
         xapic_init_assert(lapic_mmio, apic_id);
     }
-    busy_us(10_000);  // 10 ms
-    // SAFETY: same.
+    busy_us(10_000); // 10 ms
+                     // SAFETY: same.
     unsafe {
         xapic_init_deassert(lapic_mmio, apic_id);
     }
     busy_us(10_000);
     // SAFETY: same.
-    unsafe { xapic_sipi(lapic_mmio, apic_id, vector); }
+    unsafe {
+        xapic_sipi(lapic_mmio, apic_id, vector);
+    }
     busy_us(200);
     // SAFETY: same.
-    unsafe { xapic_sipi(lapic_mmio, apic_id, vector); }
+    unsafe {
+        xapic_sipi(lapic_mmio, apic_id, vector);
+    }
     // Wait up to ~100 ms for the AP to mark itself alive.
     let mut started = false;
     for _ in 0..100 {
-        if alive_count() > baseline { started = true; break; }
+        if alive_count() > baseline {
+            started = true;
+            break;
+        }
         busy_us(1_000);
     }
     ApBringUpResult { apic_id, started }
@@ -208,5 +216,7 @@ fn busy_us(us: u64) {
     // floor (TSC freq is at least 1 GHz on every CPU we care
     // about), so this `us` is at least real time.
     let cycles = us.saturating_mul(1_000);
-    for _ in 0..cycles { core::hint::spin_loop(); }
+    for _ in 0..cycles {
+        core::hint::spin_loop();
+    }
 }

@@ -82,7 +82,9 @@ pub struct HazardSlot {
 impl HazardSlot {
     /// Construct an idle slot.
     pub const fn new() -> Self {
-        Self { ptr: AtomicPtr::new(core::ptr::null_mut()) }
+        Self {
+            ptr: AtomicPtr::new(core::ptr::null_mut()),
+        }
     }
 
     /// Currently published pointer (test/diagnostic).
@@ -97,7 +99,9 @@ impl HazardSlot {
 }
 
 impl Default for HazardSlot {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // `HazardSlot` carries only an `AtomicPtr`; it's safe to share by
@@ -128,7 +132,7 @@ impl Default for HazardSlot {
 // Stage-4 should replace this with per-CPU sharded lists (see module
 // doc deferral list).
 
-const RETIRE_CAP:       usize = 256;
+const RETIRE_CAP: usize = 256;
 /// Inline-scan trigger threshold. Spec §3.6: reclamation cadence is the
 /// Stage-3 budget knob; 16 retires before a scan keeps test latency
 /// bounded without producing pathological writer overhead.
@@ -136,7 +140,7 @@ pub const RETIRE_THRESHOLD: usize = 16;
 
 #[derive(Copy, Clone)]
 struct RetireEntry {
-    ptr:     *mut (),
+    ptr: *mut (),
     dropper: Option<unsafe fn(*mut ())>,
 }
 
@@ -149,12 +153,12 @@ unsafe impl Sync for RetireEntry {}
 struct RetireList {
     /// Spinlock flag — 0 = idle, 1 = held. Single-CPU Stage-3 makes
     /// contention impossible; the flag keeps the SMP discipline correct.
-    busy:    AtomicUsize,
+    busy: AtomicUsize,
     /// Type-erased entry array. `UnsafeCell` because the lock guards
     /// access — we don't pay for an extra atomic on every slot read.
     entries: UnsafeCell<[RetireEntry; RETIRE_CAP]>,
     /// Number of valid entries in `entries`.
-    len:     UnsafeCell<usize>,
+    len: UnsafeCell<usize>,
     /// Retires silently dropped because the list was full. Surfaced via
     /// `HazardDomain::overflow_count`. Non-zero indicates a missing
     /// scheduled-pass tick (Stage-4 deferral) or a bug.
@@ -164,11 +168,14 @@ struct RetireList {
 impl RetireList {
     const fn new() -> Self {
         Self {
-            busy:     AtomicUsize::new(0),
-            entries:  UnsafeCell::new(
-                [RetireEntry { ptr: core::ptr::null_mut(), dropper: None }; RETIRE_CAP],
+            busy: AtomicUsize::new(0),
+            entries: UnsafeCell::new(
+                [RetireEntry {
+                    ptr: core::ptr::null_mut(),
+                    dropper: None,
+                }; RETIRE_CAP],
             ),
-            len:      UnsafeCell::new(0),
+            len: UnsafeCell::new(0),
             overflow: AtomicUsize::new(0),
         }
     }
@@ -217,7 +224,9 @@ impl<'a> RetireGuard<'a> {
     #[inline]
     fn set_len(&mut self, n: usize) {
         // SAFETY: the lock guards exclusive access.
-        unsafe { *self.list.len.get() = n; }
+        unsafe {
+            *self.list.len.get() = n;
+        }
     }
 }
 
@@ -228,7 +237,7 @@ impl<'a> RetireGuard<'a> {
 /// one per data structure); they don't share slots, so a scan on
 /// domain X doesn't observe domain Y's hazards.
 pub struct HazardDomain {
-    slots:  [HazardSlot; MAX_CPUS],
+    slots: [HazardSlot; MAX_CPUS],
     retire: RetireList,
 }
 
@@ -245,7 +254,7 @@ impl HazardDomain {
     /// Construct an empty domain. Slots are idle, retire list empty.
     pub const fn new() -> Self {
         Self {
-            slots:  [const { HazardSlot::new() }; MAX_CPUS],
+            slots: [const { HazardSlot::new() }; MAX_CPUS],
             retire: RetireList::new(),
         }
     }
@@ -297,8 +306,8 @@ impl HazardDomain {
     pub fn acquire<'a, T>(&'a self, p: &AtomicPtr<T>) -> Option<HazardGuard<'a, T>> {
         let raw = self.reader_acquire(p)?;
         Some(HazardGuard {
-            domain:   self,
-            ptr:      raw,
+            domain: self,
+            ptr: raw,
             _phantom: PhantomData,
         })
     }
@@ -340,9 +349,8 @@ impl HazardDomain {
         // pattern as `ptr`, cast back to `*mut T`. The wrapped
         // `drop_fn` is itself the caller's invariant — they assert it
         // is sound to call once no hazard slot holds the pointer.
-        let dropper: unsafe fn(*mut ()) = unsafe {
-            core::mem::transmute::<fn(*mut T), unsafe fn(*mut ())>(drop_fn)
-        };
+        let dropper: unsafe fn(*mut ()) =
+            unsafe { core::mem::transmute::<fn(*mut T), unsafe fn(*mut ())>(drop_fn) };
 
         let raw_ptr = ptr as *mut ();
         let mut should_scan = false;
@@ -350,7 +358,10 @@ impl HazardDomain {
             let mut g = self.retire.lock();
             let len = g.len();
             if len < RETIRE_CAP {
-                g.entries_mut()[len] = RetireEntry { ptr: raw_ptr, dropper: Some(dropper) };
+                g.entries_mut()[len] = RetireEntry {
+                    ptr: raw_ptr,
+                    dropper: Some(dropper),
+                };
                 g.set_len(len + 1);
                 if g.len() >= RETIRE_THRESHOLD {
                     should_scan = true;
@@ -405,10 +416,14 @@ impl HazardDomain {
                     // a hazard for `entry.ptr`, so it is sound to drop.
                     // The dropper was supplied by the caller of
                     // `retire`, who asserts soundness for that pointer.
-                    unsafe { f(entry.ptr); }
+                    unsafe {
+                        f(entry.ptr);
+                    }
                 }
             } else {
-                if write != read { entries[write] = entry; }
+                if write != read {
+                    entries[write] = entry;
+                }
                 write += 1;
             }
         }
@@ -430,7 +445,9 @@ impl HazardDomain {
 }
 
 impl Default for HazardDomain {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ── HazardGuard ─────────────────────────────────────────────────────
@@ -443,8 +460,8 @@ impl Default for HazardDomain {
 /// `Deref` exposes `&T`. The implementation is `unsafe` internally; the
 /// hazard-pointer contract is what makes it sound.
 pub struct HazardGuard<'a, T> {
-    domain:   &'a HazardDomain,
-    ptr:      *const T,
+    domain: &'a HazardDomain,
+    ptr: *const T,
     _phantom: PhantomData<&'a T>,
 }
 

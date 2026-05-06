@@ -40,13 +40,15 @@ kernel_test_in!("rcu", smoke_rcu_qsbr_pin_unpin);
 fn smoke_rcu_qsbr_reclaims() -> TestResult {
     // Deferred-drop round-trip: publish a value, swap it, sync, confirm
     // the displaced allocation's Drop ran.
-    use core::sync::atomic::{AtomicUsize, Ordering};
     use crate::{Atomic, Owned};
+    use core::sync::atomic::{AtomicUsize, Ordering};
 
     static DROPS: AtomicUsize = AtomicUsize::new(0);
     struct Canary;
     impl Drop for Canary {
-        fn drop(&mut self) { DROPS.fetch_add(1, Ordering::Relaxed); }
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     DROPS.store(0, Ordering::Relaxed);
@@ -122,7 +124,9 @@ fn smoke_rcu_epoch_defer_drop() -> TestResult {
     static DROPS: AtomicUsize = AtomicUsize::new(0);
     struct Canary;
     impl Drop for Canary {
-        fn drop(&mut self) { DROPS.fetch_add(1, Ordering::Relaxed); }
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     DROPS.store(0, Ordering::Relaxed);
@@ -147,7 +151,7 @@ fn smoke_rcu_sleepable_enter_exit() -> TestResult {
     }
     {
         let _g = match scope.enter(&cap) {
-            Ok(g)  => g,
+            Ok(g) => g,
             Err(_) => return TestResult::Fail("enter rejected a fresh cap"),
         };
         if scope.active() != 1 {
@@ -162,8 +166,8 @@ fn smoke_rcu_sleepable_enter_exit() -> TestResult {
 kernel_test_in!("rcu", smoke_rcu_sleepable_enter_exit);
 
 fn smoke_rcu_sleepable_revoked_cap_rejected() -> TestResult {
-    use narf_capabilities::CapError;
     use crate::sleepable::{SleepableReader, SleepableScope};
+    use narf_capabilities::CapError;
 
     let scope = SleepableScope::new();
     let cap = SleepableReader::bootstrap_cap();
@@ -180,7 +184,7 @@ fn smoke_rcu_sleepable_revoked_cap_rejected() -> TestResult {
     match scope.enter(&cap_copy) {
         Err(CapError::Revoked) => {}
         Err(_) => return TestResult::Fail("wrong error variant from revoked cap"),
-        Ok(_)  => return TestResult::Fail("enter accepted a revoked cap"),
+        Ok(_) => return TestResult::Fail("enter accepted a revoked cap"),
     }
     if scope.active() != 0 {
         return TestResult::Fail("rejected enter must not bump active");
@@ -196,14 +200,18 @@ fn smoke_rcu_hazard_publish_retire() -> TestResult {
     // acquires a guard; verifies the value; drops the guard. Publisher
     // then retires the pointer with a Drop-counting trampoline; one
     // scan() must reclaim it.
+    use crate::hazard::HazardDomain;
     use alloc::boxed::Box;
     use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-    use crate::hazard::HazardDomain;
 
     static DROPS: AtomicUsize = AtomicUsize::new(0);
-    struct Canary { v: u32 }
+    struct Canary {
+        v: u32,
+    }
     impl Drop for Canary {
-        fn drop(&mut self) { DROPS.fetch_add(1, Ordering::Relaxed); }
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     DROPS.store(0, Ordering::Relaxed);
@@ -215,7 +223,7 @@ fn smoke_rcu_hazard_publish_retire() -> TestResult {
     {
         let g = match domain.acquire(&cell) {
             Some(g) => g,
-            None    => return TestResult::Fail("acquire returned None on a non-null cell"),
+            None => return TestResult::Fail("acquire returned None on a non-null cell"),
         };
         if g.v != 0xdead_beef {
             return TestResult::Fail("hazard guard saw wrong value");
@@ -230,7 +238,9 @@ fn smoke_rcu_hazard_publish_retire() -> TestResult {
     fn drop_canary(p: *mut Canary) {
         // SAFETY: the test owns the pointer; retire's contract is that
         // we'll be invoked once no hazard slot names it.
-        unsafe { drop(Box::from_raw(p)); }
+        unsafe {
+            drop(Box::from_raw(p));
+        }
     }
     domain.retire(raw, drop_canary);
 
@@ -249,14 +259,16 @@ fn smoke_rcu_hazard_retired_but_held() -> TestResult {
     // Reader acquires the guard, THEN publisher retires the pointer.
     // scan() while the guard is live must NOT reclaim. Drop the guard,
     // scan() again — drop fires.
+    use crate::hazard::HazardDomain;
     use alloc::boxed::Box;
     use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-    use crate::hazard::HazardDomain;
 
     static DROPS: AtomicUsize = AtomicUsize::new(0);
     struct Canary;
     impl Drop for Canary {
-        fn drop(&mut self) { DROPS.fetch_add(1, Ordering::Relaxed); }
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     DROPS.store(0, Ordering::Relaxed);
@@ -267,12 +279,14 @@ fn smoke_rcu_hazard_retired_but_held() -> TestResult {
 
     let g = match domain.acquire(&cell) {
         Some(g) => g,
-        None    => return TestResult::Fail("acquire returned None on a non-null cell"),
+        None => return TestResult::Fail("acquire returned None on a non-null cell"),
     };
 
     fn drop_canary(p: *mut Canary) {
         // SAFETY: hazard discipline; we're not invoked while held.
-        unsafe { drop(Box::from_raw(p)); }
+        unsafe {
+            drop(Box::from_raw(p));
+        }
     }
     domain.retire(raw, drop_canary);
 
@@ -302,14 +316,16 @@ kernel_test_in!("rcu", smoke_rcu_hazard_retired_but_held);
 fn smoke_rcu_hazard_scan_frees_unheld() -> TestResult {
     // Bulk retire several pointers with no reader holding any of them.
     // One scan() must drain them all.
+    use crate::hazard::HazardDomain;
     use alloc::boxed::Box;
     use core::sync::atomic::{AtomicUsize, Ordering};
-    use crate::hazard::HazardDomain;
 
     static DROPS: AtomicUsize = AtomicUsize::new(0);
     struct Canary;
     impl Drop for Canary {
-        fn drop(&mut self) { DROPS.fetch_add(1, Ordering::Relaxed); }
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     DROPS.store(0, Ordering::Relaxed);
@@ -317,7 +333,9 @@ fn smoke_rcu_hazard_scan_frees_unheld() -> TestResult {
 
     fn drop_canary(p: *mut Canary) {
         // SAFETY: hazard discipline; the test never holds these.
-        unsafe { drop(Box::from_raw(p)); }
+        unsafe {
+            drop(Box::from_raw(p));
+        }
     }
 
     // Retire eight pointers — under the threshold so no inline scan
@@ -347,19 +365,25 @@ kernel_test_in!("rcu", smoke_rcu_hazard_scan_frees_unheld);
 // ── batched ────────────────────────────────────────────────────────
 
 fn smoke_rcu_batched_reclaim_drains() -> TestResult {
-    use core::sync::atomic::{AtomicU32, Ordering};
     use crate::BatchedReclaimer;
+    use core::sync::atomic::{AtomicU32, Ordering};
 
     static COUNT: AtomicU32 = AtomicU32::new(0);
     COUNT.store(0, Ordering::Relaxed);
 
     let r = BatchedReclaimer::new(0);
-    if r.pending() != 0 { return TestResult::Fail("fresh reclaimer has pending"); }
+    if r.pending() != 0 {
+        return TestResult::Fail("fresh reclaimer has pending");
+    }
 
     for _ in 0..10 {
-        let _full = r.submit(|| { COUNT.fetch_add(1, Ordering::Relaxed); });
+        let _full = r.submit(|| {
+            COUNT.fetch_add(1, Ordering::Relaxed);
+        });
     }
-    if r.pending() != 10 { return TestResult::Fail("submitted != pending"); }
+    if r.pending() != 10 {
+        return TestResult::Fail("submitted != pending");
+    }
     if COUNT.load(Ordering::Relaxed) != 0 {
         return TestResult::Fail("callback ran before flush");
     }
@@ -373,7 +397,7 @@ fn smoke_rcu_batched_reclaim_drains() -> TestResult {
     if r.total_submitted() != 10 || r.total_drained() != 10 {
         return TestResult::Fail("submit/drain totals off");
     }
-    r.pace(2, 500);   // hint-only, no observable side effect
+    r.pace(2, 500); // hint-only, no observable side effect
     TestResult::Pass
 }
 kernel_test_in!("rcu", smoke_rcu_batched_reclaim_drains);

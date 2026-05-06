@@ -15,7 +15,9 @@ pub const DEBUGCTL_BUS_LOCK_DETECT: u64 = 1 << 2;
 pub fn supported() -> bool {
     // SAFETY: leaf 0 always defined.
     let max = unsafe { cpuid(0, 0).0 };
-    if max < 7 { return false; }
+    if max < 7 {
+        return false;
+    }
     // SAFETY: leaf 7 valid.
     let (_, _, ecx, _) = unsafe { cpuid(7, 0) };
     ecx & (1 << 24) != 0
@@ -26,7 +28,9 @@ pub fn supported() -> bool {
 pub unsafe fn enable() {
     // SAFETY: caller-asserted.
     let v = unsafe { rdmsr(MSR_IA32_DEBUGCTL) } | DEBUGCTL_BUS_LOCK_DETECT;
-    unsafe { wrmsr(MSR_IA32_DEBUGCTL, v); }
+    unsafe {
+        wrmsr(MSR_IA32_DEBUGCTL, v);
+    }
 }
 
 /// # Safety
@@ -34,5 +38,7 @@ pub unsafe fn enable() {
 pub unsafe fn disable() {
     // SAFETY: caller-asserted.
     let v = unsafe { rdmsr(MSR_IA32_DEBUGCTL) } & !DEBUGCTL_BUS_LOCK_DETECT;
-    unsafe { wrmsr(MSR_IA32_DEBUGCTL, v); }
+    unsafe {
+        wrmsr(MSR_IA32_DEBUGCTL, v);
+    }
 }

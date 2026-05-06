@@ -9,11 +9,11 @@ use crate::x86_64::cpuid::cpuid;
 use crate::x86_64::msr::{rdmsr, wrmsr};
 
 pub const MSR_IA32_CORE_CAPABILITIES: u32 = 0xCF;
-pub const MSR_IA32_TEST_CTRL:         u32 = 0x33;
+pub const MSR_IA32_TEST_CTRL: u32 = 0x33;
 
 pub const TEST_CTRL_SLD_DISABLE_AC_GP: u64 = 1 << 29;
-pub const TEST_CTRL_SLD_AC_VOTE:       u64 = 1 << 30;
-pub const TEST_CTRL_SLD_DISABLE_AC:    u64 = 1 << 31;
+pub const TEST_CTRL_SLD_AC_VOTE: u64 = 1 << 30;
+pub const TEST_CTRL_SLD_DISABLE_AC: u64 = 1 << 31;
 
 const CORE_CAPS_SLD: u64 = 1 << 5;
 
@@ -25,7 +25,9 @@ const CORE_CAPS_SLD: u64 = 1 << 5;
 pub fn cpuid_gate() -> bool {
     // SAFETY: leaf 0 always defined.
     let max = unsafe { cpuid(0, 0).0 };
-    if max < 7 { return false; }
+    if max < 7 {
+        return false;
+    }
     // SAFETY: leaf 7 valid.
     let (_, _, _, edx) = unsafe { cpuid(7, 0) };
     edx & (1 << 5) != 0
@@ -34,7 +36,9 @@ pub fn cpuid_gate() -> bool {
 /// # Safety
 /// CPL = 0; CORE_CAPABILITIES advertised per `cpuid_gate()`.
 pub unsafe fn supported_unsafe() -> bool {
-    if !cpuid_gate() { return false; }
+    if !cpuid_gate() {
+        return false;
+    }
     // SAFETY: caller-asserted.
     let v = unsafe { rdmsr(MSR_IA32_CORE_CAPABILITIES) };
     v & CORE_CAPS_SLD != 0
@@ -49,7 +53,9 @@ pub unsafe fn read_test_ctrl() -> u64 {
 
 pub unsafe fn write_test_ctrl(v: u64) {
     // SAFETY: caller-asserted.
-    unsafe { wrmsr(MSR_IA32_TEST_CTRL, v); }
+    unsafe {
+        wrmsr(MSR_IA32_TEST_CTRL, v);
+    }
 }
 
 /// Enable split-lock detection in `#AC` mode (raise alignment-
@@ -62,8 +68,10 @@ pub unsafe fn enable_ac() {
     // SAFETY: caller-asserted.
     let mut v = unsafe { read_test_ctrl() };
     v &= !TEST_CTRL_SLD_DISABLE_AC;
-    v |=  TEST_CTRL_SLD_DISABLE_AC_GP;
-    unsafe { write_test_ctrl(v); }
+    v |= TEST_CTRL_SLD_DISABLE_AC_GP;
+    unsafe {
+        write_test_ctrl(v);
+    }
 }
 
 /// Disable detection.
@@ -73,5 +81,7 @@ pub unsafe fn enable_ac() {
 pub unsafe fn disable() {
     // SAFETY: caller-asserted.
     let v = unsafe { read_test_ctrl() } | TEST_CTRL_SLD_DISABLE_AC;
-    unsafe { write_test_ctrl(v); }
+    unsafe {
+        write_test_ctrl(v);
+    }
 }

@@ -17,7 +17,7 @@ use core::arch::asm;
 pub struct PacCaps {
     pub address_auth: bool,
     pub generic_auth: bool,
-    pub enhanced:     bool,
+    pub enhanced: bool,
 }
 
 /// Read `ID_AA64ISAR1_EL1`.
@@ -41,18 +41,18 @@ fn id_aa64isar2() -> u64 {
 
 pub fn caps() -> PacCaps {
     let isar1 = id_aa64isar1();
-    let apa = (isar1 >> 4)  & 0xF;
-    let api = (isar1 >> 8)  & 0xF;
+    let apa = (isar1 >> 4) & 0xF;
+    let api = (isar1 >> 8) & 0xF;
     let gpa = (isar1 >> 24) & 0xF;
     let gpi = (isar1 >> 28) & 0xF;
     let isar2 = id_aa64isar2();
     let apa3 = (isar2 >> 12) & 0xF;
-    let gpa3 = (isar2 >> 8)  & 0xF;
+    let gpa3 = (isar2 >> 8) & 0xF;
     PacCaps {
         address_auth: apa != 0 || api != 0 || apa3 != 0,
         generic_auth: gpa != 0 || gpi != 0 || gpa3 != 0,
         // FEAT_EPAC = APA / API >= 2.
-        enhanced:     apa >= 2 || api >= 2,
+        enhanced: apa >= 2 || api >= 2,
     }
 }
 
@@ -109,10 +109,18 @@ pub unsafe fn enable_keys(ia: bool, ib: bool, da: bool, db: bool) {
     unsafe {
         asm!("mrs {}, sctlr_el1", out(reg) sctlr, options(nomem, nostack));
     }
-    if ia { sctlr |= SCTLR_ENIA; }
-    if ib { sctlr |= SCTLR_ENIB; }
-    if da { sctlr |= SCTLR_ENDA; }
-    if db { sctlr |= SCTLR_ENDB; }
+    if ia {
+        sctlr |= SCTLR_ENIA;
+    }
+    if ib {
+        sctlr |= SCTLR_ENIB;
+    }
+    if da {
+        sctlr |= SCTLR_ENDA;
+    }
+    if db {
+        sctlr |= SCTLR_ENDB;
+    }
     // SAFETY: same.
     unsafe {
         asm!(

@@ -6,18 +6,25 @@
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 fn smoke_arch_backend() -> TestResult {
-    use crate::{BACKEND, DomainBackend};
-    let expected = if cfg!(target_arch = "x86_64") { DomainBackend::Pks }
-                   else if cfg!(target_arch = "aarch64") { DomainBackend::Mte }
-                   else { return TestResult::Skip("unknown arch"); };
-    if BACKEND == expected { TestResult::Pass }
-    else { TestResult::Fail("BACKEND constant mismatch") }
+    use crate::{DomainBackend, BACKEND};
+    let expected = if cfg!(target_arch = "x86_64") {
+        DomainBackend::Pks
+    } else if cfg!(target_arch = "aarch64") {
+        DomainBackend::Mte
+    } else {
+        return TestResult::Skip("unknown arch");
+    };
+    if BACKEND == expected {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("BACKEND constant mismatch")
+    }
 }
 kernel_test_in!("arch", smoke_arch_backend);
 
 fn smoke_arch_percpu_basic() -> TestResult {
-    use core::sync::atomic::{AtomicU64, Ordering};
     use crate::percpu::{current_cpu_id, ThisCpu, MAX_CPUS};
+    use core::sync::atomic::{AtomicU64, Ordering};
 
     crate::per_cpu! {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -294,11 +301,21 @@ fn smoke_rtc_read_now_plausible() -> TestResult {
     if t.year < 1990 || t.year > 2100 {
         return TestResult::Fail("RTC year implausible");
     }
-    if t.month == 0 || t.month > 12 { return TestResult::Fail("month"); }
-    if t.day   == 0 || t.day   > 31 { return TestResult::Fail("day");   }
-    if t.hour  > 23                 { return TestResult::Fail("hour");  }
-    if t.minute > 59                { return TestResult::Fail("min");   }
-    if t.second > 60                { return TestResult::Fail("sec");   }
+    if t.month == 0 || t.month > 12 {
+        return TestResult::Fail("month");
+    }
+    if t.day == 0 || t.day > 31 {
+        return TestResult::Fail("day");
+    }
+    if t.hour > 23 {
+        return TestResult::Fail("hour");
+    }
+    if t.minute > 59 {
+        return TestResult::Fail("min");
+    }
+    if t.second > 60 {
+        return TestResult::Fail("sec");
+    }
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
@@ -344,7 +361,7 @@ fn smoke_topology_caches_l1() -> TestResult {
     let l1 = caches.iter().flatten().find(|c| c.level == 1);
     let l1 = match l1 {
         Some(c) => c,
-        None    => return TestResult::Skip("no L1 cache info"),
+        None => return TestResult::Skip("no L1 cache info"),
     };
     if l1.line_size < 16 || l1.line_size > 256 {
         return TestResult::Fail("L1 line size implausible");
@@ -367,7 +384,7 @@ fn smoke_smp_aps_from_madt() -> TestResult {
     };
     // Treat APIC id 0 as the BSP for the QEMU default `-smp 1`
     // case; on real `-smp >1` the list grows.
-    let aps = smp::aps_from_madt(&t, /*bsp=*/0);
+    let aps = smp::aps_from_madt(&t, /*bsp=*/ 0);
     let _ = aps;
     TestResult::Pass
 }
@@ -413,11 +430,21 @@ fn smoke_pmu_event_encode() -> TestResult {
     let s = pmu::arch_event::instructions_retired(true, true);
     let v = s.encode();
     // event_select = 0xC0, umask = 0x00, OS+USR+ENABLE bits set.
-    if (v & 0xFF) != 0xC0          { return TestResult::Fail("event_select"); }
-    if ((v >> 8) & 0xFF) != 0x00   { return TestResult::Fail("umask"); }
-    if v & (1 << 16) == 0          { return TestResult::Fail("USR bit"); }
-    if v & (1 << 17) == 0          { return TestResult::Fail("OS bit"); }
-    if v & (1 << 22) == 0          { return TestResult::Fail("EN bit"); }
+    if (v & 0xFF) != 0xC0 {
+        return TestResult::Fail("event_select");
+    }
+    if ((v >> 8) & 0xFF) != 0x00 {
+        return TestResult::Fail("umask");
+    }
+    if v & (1 << 16) == 0 {
+        return TestResult::Fail("USR bit");
+    }
+    if v & (1 << 17) == 0 {
+        return TestResult::Fail("OS bit");
+    }
+    if v & (1 << 22) == 0 {
+        return TestResult::Fail("EN bit");
+    }
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
@@ -459,17 +486,29 @@ fn smoke_pt_topa_entry_encode() -> TestResult {
     use crate::x86_64::pt::topa_entry;
     // 4 KiB ring at phys 0x10_0000, not END, not INT.
     let e = topa_entry(0x10_0000, 12, false, false);
-    if e & 0xFFF != 0 { return TestResult::Fail("size field"); }
-    if e & (1 << 5) != 0 { return TestResult::Fail("END set"); }
-    if e & (1 << 4) != 0 { return TestResult::Fail("INT set"); }
+    if e & 0xFFF != 0 {
+        return TestResult::Fail("size field");
+    }
+    if e & (1 << 5) != 0 {
+        return TestResult::Fail("END set");
+    }
+    if e & (1 << 4) != 0 {
+        return TestResult::Fail("INT set");
+    }
     if e & 0xFFFF_FFFF_FFFF_F000 != 0x10_0000 {
         return TestResult::Fail("base lost");
     }
     // 16 KiB ring + END + INT.
     let e = topa_entry(0x20_0000, 14, true, true);
-    if e & 0x7 != 2 { return TestResult::Fail("16K size code"); }
-    if e & (1 << 4) == 0 { return TestResult::Fail("INT lost"); }
-    if e & (1 << 5) == 0 { return TestResult::Fail("END lost"); }
+    if e & 0x7 != 2 {
+        return TestResult::Fail("16K size code");
+    }
+    if e & (1 << 4) == 0 {
+        return TestResult::Fail("INT lost");
+    }
+    if e & (1 << 5) == 0 {
+        return TestResult::Fail("END lost");
+    }
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
@@ -496,7 +535,9 @@ fn smoke_pebs_supported_path() -> TestResult {
     // pure CPUID + MSR read).
     let a = pebs::supported();
     let b = pebs::supported();
-    if a != b { return TestResult::Fail("supported() racy"); }
+    if a != b {
+        return TestResult::Fail("supported() racy");
+    }
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
@@ -508,7 +549,7 @@ fn smoke_cpu_validate_baseline() -> TestResult {
     // SAFETY: kernel-test runs at CPL=0.
     let v = unsafe { cpu_validate::validate() };
     match cpu_validate::baseline_ok(&v) {
-        Ok(())   => TestResult::Pass,
+        Ok(()) => TestResult::Pass,
         Err(why) => {
             // Surface the *first* failed check via the test name —
             // log isn't easily threaded through TestResult, but a
@@ -528,9 +569,7 @@ kernel_test_in!("arch/cpu_validate", smoke_cpu_validate_baseline);
 fn smoke_vmx_caps_decode() -> TestResult {
     use crate::x86_64::vmx;
     let c = vmx::caps();
-    if c.supported && c.feature_locked && c.vmxon_outside_smx
-        && c.basic.vmcs_region_size == 0
-    {
+    if c.supported && c.feature_locked && c.vmxon_outside_smx && c.basic.vmcs_region_size == 0 {
         return TestResult::Fail("VMX advertised but vmcs_region_size = 0");
     }
     TestResult::Pass
@@ -569,11 +608,14 @@ fn smoke_confidential_detect() -> TestResult {
     // Any of the variants is acceptable — Bare is what every QEMU
     // smoke target reports today; running this same test inside a
     // TDX / SEV-SNP guest would surface those variants instead.
-    let _ = matches!(env, ConfidentialEnvironment::Bare
-                        | ConfidentialEnvironment::TdxGuest
-                        | ConfidentialEnvironment::SevGuest
-                        | ConfidentialEnvironment::SevEsGuest
-                        | ConfidentialEnvironment::SevSnpGuest);
+    let _ = matches!(
+        env,
+        ConfidentialEnvironment::Bare
+            | ConfidentialEnvironment::TdxGuest
+            | ConfidentialEnvironment::SevGuest
+            | ConfidentialEnvironment::SevEsGuest
+            | ConfidentialEnvironment::SevSnpGuest
+    );
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
@@ -635,10 +677,7 @@ fn smoke_smca_supported_path() -> TestResult {
     //   bits[31:16] = 0xBEEF = hardware_id
     //   bits[47:44] = 0x7    = mca_type → bits[47:32] = 0x7000
     let info = smca::SmcaBankInfo::decode(0x0000_7000_BEEF_0042);
-    if info.instance_id != 0x0042
-        || info.hardware_id != 0xBEEF
-        || info.mca_type != 0x07
-    {
+    if info.instance_id != 0x0042 || info.hardware_id != 0xBEEF || info.mca_type != 0x07 {
         return TestResult::Fail("SmcaBankInfo decode misaligned");
     }
     TestResult::Pass
@@ -713,7 +752,7 @@ fn smoke_invlpgb_caps() -> TestResult {
     use crate::x86_64::invlpgb;
     let s = invlpgb::supported();
     let count = invlpgb::count_max();
-    let asid  = invlpgb::asid_max();
+    let asid = invlpgb::asid_max();
     if !s && (count != 0 || asid != 0) {
         return TestResult::Fail("INVLPGB caps non-zero with supported = false");
     }
@@ -829,8 +868,13 @@ fn smoke_x86_errata_table_sorted() -> TestResult {
     fn vendor_key(v: &crate::x86_64::ident::Vendor) -> u32 {
         use crate::x86_64::ident::Vendor::*;
         match v {
-            Intel => 1, Amd => 2, Hygon => 3, Centaur => 4,
-            Via => 5, Zhaoxin => 6, Other(_) => 7,
+            Intel => 1,
+            Amd => 2,
+            Hygon => 3,
+            Centaur => 4,
+            Via => 5,
+            Zhaoxin => 6,
+            Other(_) => 7,
         }
     }
     let t = errata::table();
@@ -867,12 +911,16 @@ fn smoke_lvt_pc_program_helper() -> TestResult {
         return TestResult::Fail("mask bit not set after program");
     }
     // SAFETY: same buffer.
-    unsafe { pmi::unmask_lvt_pc(base); }
+    unsafe {
+        pmi::unmask_lvt_pc(base);
+    }
     if buf[0] & (1 << 16) != 0 {
         return TestResult::Fail("mask bit still set after unmask");
     }
     // SAFETY: same buffer.
-    unsafe { pmi::mask_lvt_pc(base); }
+    unsafe {
+        pmi::mask_lvt_pc(base);
+    }
     if buf[0] & (1 << 16) == 0 {
         return TestResult::Fail("mask bit cleared after re-mask");
     }
@@ -1084,8 +1132,8 @@ fn smoke_vtd_caps_decode() -> TestResult {
     //   cap.SAGAW bits[12:8] = 0b00100 (39-bit) → sagaw = 0x4
     //   cap.NFR (bits[47:40]) = 0x07 → 8 regs
     //   ecap.QI (bit 1) + IR (bit 3)
-    let ver  = 0x0000_0010u32;
-    let cap  = (0x4u64 << 8) | (0x7u64 << 40);
+    let ver = 0x0000_0010u32;
+    let cap = (0x4u64 << 8) | (0x7u64 << 40);
     let ecap = 0b1010u64;
     let c = vtd::decode_caps(ver, cap, ecap);
     if c.version_major != 1 || c.version_minor != 0 {
@@ -1109,7 +1157,7 @@ kernel_test_in!("arch/vtd", smoke_vtd_caps_decode);
 fn smoke_amd_vi_caps_decode() -> TestResult {
     use crate::x86_64::amd_vi;
     let ctrl = amd_vi::CTRL_IOMMUEN | amd_vi::CTRL_EVTLOGEN | amd_vi::CTRL_CMDBUFEN;
-    let efr  = amd_vi::EFR_PPRSUP   | amd_vi::EFR_GTSUP     | amd_vi::EFR_XTSUP;
+    let efr = amd_vi::EFR_PPRSUP | amd_vi::EFR_GTSUP | amd_vi::EFR_XTSUP;
     let c = amd_vi::decode_caps(ctrl, efr);
     if !c.iommu_enabled || !c.event_log_enabled || !c.command_buf_enabled {
         return TestResult::Fail("ctrl bits not decoded");
@@ -1137,7 +1185,7 @@ fn smoke_smmuv3_caps_decode() -> TestResult {
     // S1P + S2P, TTF = 0b11 (4K + 16K + 64K), QUEUE share = 0b11
     let idr0 = 0b11u32 | (0b11 << 10) | (0b11 << 12);
     let idr1 = 0x10u32; // SIDSIZE = 16
-    let idr5 = 0x5u32;  // OAS class = 5
+    let idr5 = 0x5u32; // OAS class = 5
     let c = smmuv3::decode_caps(idr0, idr1, idr5);
     if !c.s1p || !c.s2p {
         return TestResult::Fail("S1P/S2P decode mismatch");
@@ -1157,12 +1205,12 @@ kernel_test_in!("arch/smmuv3", smoke_smmuv3_caps_decode);
 fn smoke_irte_encode_decode() -> TestResult {
     use crate::x86_64::ir;
     let e = ir::Irte {
-        present:       true,
+        present: true,
         fault_disable: true,
-        dest_logical:  false,
-        vector:        0xA,
-        delivery_mode: 0b100,   // NMI
-        destination:   0x1234,
+        dest_logical: false,
+        vector: 0xA,
+        delivery_mode: 0b100, // NMI
+        destination: 0x1234,
     };
     let raw = ir::encode_irte(e);
     let back = ir::decode_irte(raw);
@@ -1251,10 +1299,8 @@ fn smoke_tme_supported_path() -> TestResult {
     let _ = tme::supported();
     // Pure-data decoder test: synthetic CAPABILITY value.
     //   AES_XTS_128 + AES_XTS_256, max_keyid_bits = 4, max_keys = 0x1F.
-    let raw = tme::TME_CAPS_AES_XTS_128
-            | tme::TME_CAPS_AES_XTS_256
-            | (4u64 << 32)
-            | (0x1Fu64 << 36);
+    let raw =
+        tme::TME_CAPS_AES_XTS_128 | tme::TME_CAPS_AES_XTS_256 | (4u64 << 32) | (0x1Fu64 << 36);
     let c = tme::decode_caps(raw);
     if !c.aes_xts_128 || c.aes_xts_128_integrity || !c.aes_xts_256 {
         return TestResult::Fail("AES_XTS bits decoded incorrectly");

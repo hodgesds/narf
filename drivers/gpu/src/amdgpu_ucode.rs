@@ -55,22 +55,22 @@ pub enum UcodeError {
 /// header (camelCase preserved as snake_case for Rust).
 #[derive(Copy, Clone)]
 pub struct UcodeHeader {
-    pub start_offset:     u32,
-    pub payload_size:     u32,
-    pub version:          u32,
-    pub feature_version:  u32,
-    pub jt_version:       u32,
-    pub jt_bytes:         u32,
-    pub image_bytes:      u32,
-    pub rtime_bytes:      u32,
+    pub start_offset: u32,
+    pub payload_size: u32,
+    pub version: u32,
+    pub feature_version: u32,
+    pub jt_version: u32,
+    pub jt_bytes: u32,
+    pub image_bytes: u32,
+    pub rtime_bytes: u32,
 }
 
 impl fmt::Debug for UcodeHeader {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("UcodeHeader")
-            .field("start_offset",    &self.start_offset)
-            .field("payload_size",    &self.payload_size)
-            .field("version",         &self.version)
+            .field("start_offset", &self.start_offset)
+            .field("payload_size", &self.payload_size)
+            .field("version", &self.version)
             .field("feature_version", &self.feature_version)
             .finish_non_exhaustive()
     }
@@ -80,23 +80,25 @@ impl fmt::Debug for UcodeHeader {
 /// `blob` is the raw bytes of the firmware file (the payload of
 /// a `narf-firmware::BlobView` after trailer-stripping).
 pub fn parse(blob: &[u8]) -> Result<UcodeHeader, UcodeError> {
-    if blob.len() < 256 { return Err(UcodeError::Truncated); }
+    if blob.len() < 256 {
+        return Err(UcodeError::Truncated);
+    }
     let magic = u32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]);
-    if magic != UCODE_MAGIC { return Err(UcodeError::BadMagic); }
+    if magic != UCODE_MAGIC {
+        return Err(UcodeError::BadMagic);
+    }
 
-    let read_u32 = |o: usize| u32::from_le_bytes([
-        blob[o], blob[o + 1], blob[o + 2], blob[o + 3],
-    ]);
+    let read_u32 = |o: usize| u32::from_le_bytes([blob[o], blob[o + 1], blob[o + 2], blob[o + 3]]);
     let header_start = 4; // magic is bytes [0..4); the common header
                           // starts at offset 4 per AMD's layout.
-    let start_offset    = read_u32(header_start);
-    let payload_size    = read_u32(header_start + 4);
-    let version         = read_u32(header_start + 8);
+    let start_offset = read_u32(header_start);
+    let payload_size = read_u32(header_start + 4);
+    let version = read_u32(header_start + 8);
     let feature_version = read_u32(header_start + 12);
-    let jt_version      = read_u32(header_start + 16);
-    let jt_bytes        = read_u32(header_start + 20);
-    let image_bytes     = read_u32(header_start + 24);
-    let rtime_bytes     = read_u32(header_start + 28);
+    let jt_version = read_u32(header_start + 16);
+    let jt_bytes = read_u32(header_start + 20);
+    let image_bytes = read_u32(header_start + 24);
+    let rtime_bytes = read_u32(header_start + 28);
 
     let end = (start_offset as u64) + (payload_size as u64);
     if end > blob.len() as u64 {
@@ -104,8 +106,14 @@ pub fn parse(blob: &[u8]) -> Result<UcodeHeader, UcodeError> {
     }
 
     Ok(UcodeHeader {
-        start_offset, payload_size, version, feature_version,
-        jt_version, jt_bytes, image_bytes, rtime_bytes,
+        start_offset,
+        payload_size,
+        version,
+        feature_version,
+        jt_version,
+        jt_bytes,
+        image_bytes,
+        rtime_bytes,
     })
 }
 
@@ -115,6 +123,6 @@ pub fn parse(blob: &[u8]) -> Result<UcodeHeader, UcodeError> {
 /// metadata) stays kernel-side.
 pub fn payload<'a>(blob: &'a [u8], header: &UcodeHeader) -> &'a [u8] {
     let start = header.start_offset as usize;
-    let len   = header.payload_size as usize;
+    let len = header.payload_size as usize;
     &blob[start..start + len]
 }

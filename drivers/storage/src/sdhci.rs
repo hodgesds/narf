@@ -53,29 +53,29 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 /// "Generic" SD Host Controller PCI class triple (08:05:01 —
 /// SDHCI). Matched as a class backstop.
-pub const SDHCI_PCI_CLASS:    u8 = 0x08;
+pub const SDHCI_PCI_CLASS: u8 = 0x08;
 pub const SDHCI_PCI_SUBCLASS: u8 = 0x05;
 
 /// Standard register offsets (SDHCI 3.00 §2).
-const REG_SDMA_ADDR:      u64 = 0x00;
-const REG_BLOCK_SIZE:     u64 = 0x04;
-const REG_BLOCK_COUNT:    u64 = 0x06;
-const REG_ARGUMENT:       u64 = 0x08;
-const REG_TRANSFER_MODE:  u64 = 0x0C;
-const REG_COMMAND:        u64 = 0x0E;
-const REG_RESPONSE_0:     u64 = 0x10;
-const REG_BUFFER_PORT:    u64 = 0x20;
-const REG_PRESENT_STATE:  u64 = 0x24;
+const REG_SDMA_ADDR: u64 = 0x00;
+const REG_BLOCK_SIZE: u64 = 0x04;
+const REG_BLOCK_COUNT: u64 = 0x06;
+const REG_ARGUMENT: u64 = 0x08;
+const REG_TRANSFER_MODE: u64 = 0x0C;
+const REG_COMMAND: u64 = 0x0E;
+const REG_RESPONSE_0: u64 = 0x10;
+const REG_BUFFER_PORT: u64 = 0x20;
+const REG_PRESENT_STATE: u64 = 0x24;
 const REG_HOST_CONTROL_1: u64 = 0x28;
-const REG_POWER_CONTROL:  u64 = 0x29;
-const REG_CLOCK_CONTROL:  u64 = 0x2C;
-const REG_TIMEOUT_CTRL:   u64 = 0x2E;
-const REG_SOFT_RESET:     u64 = 0x2F;
+const REG_POWER_CONTROL: u64 = 0x29;
+const REG_CLOCK_CONTROL: u64 = 0x2C;
+const REG_TIMEOUT_CTRL: u64 = 0x2E;
+const REG_SOFT_RESET: u64 = 0x2F;
 const REG_NORMAL_INT_STS: u64 = 0x30;
-const REG_ERROR_INT_STS:  u64 = 0x32;
-const REG_NORMAL_INT_EN:  u64 = 0x34;
-const REG_ERROR_INT_EN:   u64 = 0x36;
-const REG_CAPABILITIES:   u64 = 0x40;
+const REG_ERROR_INT_STS: u64 = 0x32;
+const REG_NORMAL_INT_EN: u64 = 0x34;
+const REG_ERROR_INT_EN: u64 = 0x36;
+const REG_CAPABILITIES: u64 = 0x40;
 
 // Software-reset bits (§2.2.16): write-1 self-clearing.
 const SRST_ALL: u8 = 1 << 0;
@@ -83,44 +83,44 @@ const SRST_CMD: u8 = 1 << 1;
 const SRST_DAT: u8 = 1 << 2;
 
 // Clock control bits (§2.2.14).
-const CLK_INTERNAL_EN: u16 = 1 << 0;  // Internal clock enable.
+const CLK_INTERNAL_EN: u16 = 1 << 0; // Internal clock enable.
 const CLK_INTERNAL_STABLE: u16 = 1 << 1;
-const CLK_SD_EN: u16 = 1 << 2;        // SD-clock to card output.
+const CLK_SD_EN: u16 = 1 << 2; // SD-clock to card output.
 
 // Power control bits (§2.2.10).
 const POWER_ON: u8 = 1 << 0;
-const POWER_3V3: u8 = 0b111 << 1;     // 3.3V
+const POWER_3V3: u8 = 0b111 << 1; // 3.3V
 
 // Present state bits (§2.2.9).
-const PSTATE_CMD_INHIBIT:     u32 = 1 << 0;
-const PSTATE_DAT_INHIBIT:     u32 = 1 << 1;
-const PSTATE_BUFFER_READ_EN:  u32 = 1 << 11;
+const PSTATE_CMD_INHIBIT: u32 = 1 << 0;
+const PSTATE_DAT_INHIBIT: u32 = 1 << 1;
+const PSTATE_BUFFER_READ_EN: u32 = 1 << 11;
 const PSTATE_BUFFER_WRITE_EN: u32 = 1 << 10;
-const PSTATE_CARD_INSERTED:   u32 = 1 << 16;
+const PSTATE_CARD_INSERTED: u32 = 1 << 16;
 
 // Normal interrupt status bits (§2.2.18).
-const NIS_CMD_COMPLETE:       u16 = 1 << 0;
-const NIS_TRANSFER_COMPLETE:  u16 = 1 << 1;
-const NIS_BUFFER_READ_READY:  u16 = 1 << 5;
+const NIS_CMD_COMPLETE: u16 = 1 << 0;
+const NIS_TRANSFER_COMPLETE: u16 = 1 << 1;
+const NIS_BUFFER_READ_READY: u16 = 1 << 5;
 const NIS_BUFFER_WRITE_READY: u16 = 1 << 4;
-const NIS_ERROR:              u16 = 1 << 15;
+const NIS_ERROR: u16 = 1 << 15;
 
 // Command response types (§2.2.6).
-const RESP_NONE: u16  = 0b00;
-const RESP_136:  u16  = 0b01;
-const RESP_48:   u16  = 0b10;
+const RESP_NONE: u16 = 0b00;
+const RESP_136: u16 = 0b01;
+const RESP_48: u16 = 0b10;
 const RESP_48_BUSY: u16 = 0b11;
 
 // Command flags (§2.2.6 cont).
-const CMD_CRC_EN:     u16 = 1 << 3;
-const CMD_INDEX_EN:   u16 = 1 << 4;
-const CMD_DATA_PRES:  u16 = 1 << 5;
+const CMD_CRC_EN: u16 = 1 << 3;
+const CMD_INDEX_EN: u16 = 1 << 4;
+const CMD_DATA_PRES: u16 = 1 << 5;
 
 // Transfer mode bits (§2.2.5).
 const TM_BLOCK_COUNT_EN: u16 = 1 << 1;
-const TM_AUTO_CMD12:     u16 = 1 << 2;
-const TM_DATA_DIR_READ:  u16 = 1 << 4;
-const TM_MULTI_BLOCK:    u16 = 1 << 5;
+const TM_AUTO_CMD12: u16 = 1 << 2;
+const TM_DATA_DIR_READ: u16 = 1 << 4;
+const TM_MULTI_BLOCK: u16 = 1 << 5;
 
 /// SD command index → encoded register write per §2.2.6.
 fn make_cmd(idx: u8, resp_kind: u16, has_data: bool) -> u16 {
@@ -128,12 +128,14 @@ fn make_cmd(idx: u8, resp_kind: u16, has_data: bool) -> u16 {
     // CRC + index check are required for most R1/R3/R6 paths; the
     // spec says they're enabled per response-type table 2-19.
     match resp_kind {
-        RESP_136     => v |= CMD_CRC_EN,
-        RESP_48      => v |= CMD_CRC_EN | CMD_INDEX_EN,
+        RESP_136 => v |= CMD_CRC_EN,
+        RESP_48 => v |= CMD_CRC_EN | CMD_INDEX_EN,
         RESP_48_BUSY => v |= CMD_CRC_EN | CMD_INDEX_EN,
         _ => {}
     }
-    if has_data { v |= CMD_DATA_PRES; }
+    if has_data {
+        v |= CMD_DATA_PRES;
+    }
     v
 }
 
@@ -159,15 +161,15 @@ pub enum SdhciError {
 #[derive(Copy, Clone, Debug)]
 pub struct SdCard {
     /// Card RCA (relative card address) negotiated via CMD3.
-    pub rca:  u16,
+    pub rca: u16,
     /// CID register read via CMD2 (response 136).
-    pub cid:  [u32; 4],
+    pub cid: [u32; 4],
     /// Response from CMD8 — non-zero implies SD spec ≥ 2.0 (the
     /// card supports CMD8 and matches our voltage check).
     pub if_cond_match: bool,
     /// CCS bit from ACMD41 — 1 = SDHC/SDXC (block-addressed),
     /// 0 = SDSC (byte-addressed).
-    pub ccs:  bool,
+    pub ccs: bool,
 }
 
 pub struct Sdhci {
@@ -192,25 +194,33 @@ impl Sdhci {
     /// Caller owns BAR0 exclusively for the duration of init.
     pub unsafe fn bring_up(
         device: &BusDevice,
-        _cap:   &Cap<BusDeviceCap, Write>,
+        _cap: &Cap<BusDeviceCap, Write>,
     ) -> Result<Self, SdhciError> {
         // SAFETY: caller-asserted.
-        let mmio = unsafe { map_bar(device, 0) }
-            .map_err(|_| SdhciError::BarMapFailed)?;
-        let me = Sdhci { mmio, card: IrqSafeSpinLock::new(None) };
+        let mmio = unsafe { map_bar(device, 0) }.map_err(|_| SdhciError::BarMapFailed)?;
+        let me = Sdhci {
+            mmio,
+            card: IrqSafeSpinLock::new(None),
+        };
 
         // 1. Software reset — Reset All (§3.6).
         // SAFETY: identity-mapped MMIO.
-        unsafe { me.mmio.write8(REG_SOFT_RESET, SRST_ALL); }
+        unsafe {
+            me.mmio.write8(REG_SOFT_RESET, SRST_ALL);
+        }
         for _ in 0..1_000_000u32 {
             // SAFETY: same.
             let v = unsafe { me.mmio.read8(REG_SOFT_RESET) };
-            if v & SRST_ALL == 0 { break; }
+            if v & SRST_ALL == 0 {
+                break;
+            }
             core::hint::spin_loop();
         }
         // SAFETY: same.
         let post = unsafe { me.mmio.read8(REG_SOFT_RESET) };
-        if post & SRST_ALL != 0 { return Err(SdhciError::ResetTimeout); }
+        if post & SRST_ALL != 0 {
+            return Err(SdhciError::ResetTimeout);
+        }
 
         // 2. Capabilities snapshot — informational only at this stage.
         // SAFETY: same.
@@ -220,7 +230,9 @@ impl Sdhci {
 
         // 3. Power-on at 3.3V.
         // SAFETY: same.
-        unsafe { me.mmio.write8(REG_POWER_CONTROL, POWER_3V3 | POWER_ON); }
+        unsafe {
+            me.mmio.write8(REG_POWER_CONTROL, POWER_3V3 | POWER_ON);
+        }
 
         // 4. Internal clock enable + supply 400 kHz init clock.
         //    Base clock comes from caps[15:8]; we use a divider that
@@ -230,28 +242,36 @@ impl Sdhci {
         let div = 0x80u16;
         let clk = ((div & 0xFF) << 8) | ((div >> 8) & 0x3) << 6 | CLK_INTERNAL_EN;
         // SAFETY: same.
-        unsafe { me.mmio.write16(REG_CLOCK_CONTROL, clk); }
+        unsafe {
+            me.mmio.write16(REG_CLOCK_CONTROL, clk);
+        }
         for _ in 0..1_000_000u32 {
             // SAFETY: same.
             let v = unsafe { me.mmio.read16(REG_CLOCK_CONTROL) };
-            if v & CLK_INTERNAL_STABLE != 0 { break; }
+            if v & CLK_INTERNAL_STABLE != 0 {
+                break;
+            }
             core::hint::spin_loop();
         }
         // SAFETY: same.
         let v = unsafe { me.mmio.read16(REG_CLOCK_CONTROL) };
         // SAFETY: same.
-        unsafe { me.mmio.write16(REG_CLOCK_CONTROL, v | CLK_SD_EN); }
+        unsafe {
+            me.mmio.write16(REG_CLOCK_CONTROL, v | CLK_SD_EN);
+        }
 
         // 5. Default DTOCV = 0xE (max timeout).
         // SAFETY: same.
-        unsafe { me.mmio.write8(REG_TIMEOUT_CTRL, 0x0E); }
+        unsafe {
+            me.mmio.write8(REG_TIMEOUT_CTRL, 0x0E);
+        }
 
         // 6. Enable normal + error interrupt status reporting (we
         //    poll, but the status bits only set when enabled).
         // SAFETY: same.
         unsafe {
             me.mmio.write16(REG_NORMAL_INT_EN, 0xFFFF);
-            me.mmio.write16(REG_ERROR_INT_EN,  0xFFFF);
+            me.mmio.write16(REG_ERROR_INT_EN, 0xFFFF);
         }
 
         // 7. Card-present check.
@@ -278,7 +298,9 @@ impl Sdhci {
             } else {
                 PSTATE_CMD_INHIBIT
             };
-            if p & mask == 0 { return Ok(()); }
+            if p & mask == 0 {
+                return Ok(());
+            }
             core::hint::spin_loop();
         }
         Err(SdhciError::CmdInhibitTimeout)
@@ -290,26 +312,26 @@ impl Sdhci {
     /// `read_response_136`).
     fn cmd(
         &self,
-        idx:        u8,
-        arg:        u32,
-        resp_kind:  u16,
-        has_data:   bool,
-        transfer:   u16,
+        idx: u8,
+        arg: u32,
+        resp_kind: u16,
+        has_data: bool,
+        transfer: u16,
         block_size: u16,
-        block_cnt:  u16,
+        block_cnt: u16,
     ) -> Result<u32, SdhciError> {
         self.wait_idle(has_data)?;
         // Clear status bits (write-1-clear).
         // SAFETY: identity-mapped MMIO.
         unsafe {
             self.mmio.write16(REG_NORMAL_INT_STS, 0xFFFF);
-            self.mmio.write16(REG_ERROR_INT_STS,  0xFFFF);
+            self.mmio.write16(REG_ERROR_INT_STS, 0xFFFF);
         }
         // Program block size / count first when there's data.
         if has_data {
             // SAFETY: same.
             unsafe {
-                self.mmio.write16(REG_BLOCK_SIZE,  block_size);
+                self.mmio.write16(REG_BLOCK_SIZE, block_size);
                 self.mmio.write16(REG_BLOCK_COUNT, block_cnt);
                 self.mmio.write16(REG_TRANSFER_MODE, transfer);
             }
@@ -317,7 +339,8 @@ impl Sdhci {
         // SAFETY: same.
         unsafe {
             self.mmio.write32(REG_ARGUMENT, arg);
-            self.mmio.write16(REG_COMMAND, make_cmd(idx, resp_kind, has_data));
+            self.mmio
+                .write16(REG_COMMAND, make_cmd(idx, resp_kind, has_data));
         }
         // Poll for command-complete (or error).
         let mut spins = 0u32;
@@ -329,14 +352,20 @@ impl Sdhci {
                 let eis = unsafe { self.mmio.read16(REG_ERROR_INT_STS) };
                 return Err(SdhciError::DeviceError(eis));
             }
-            if nis & NIS_CMD_COMPLETE != 0 { break; }
+            if nis & NIS_CMD_COMPLETE != 0 {
+                break;
+            }
             spins += 1;
-            if spins > 10_000_000 { return Err(SdhciError::CmdTimeout); }
+            if spins > 10_000_000 {
+                return Err(SdhciError::CmdTimeout);
+            }
             core::hint::spin_loop();
         }
         // Clear cmd-complete; preserve other bits for the data path.
         // SAFETY: same.
-        unsafe { self.mmio.write16(REG_NORMAL_INT_STS, NIS_CMD_COMPLETE); }
+        unsafe {
+            self.mmio.write16(REG_NORMAL_INT_STS, NIS_CMD_COMPLETE);
+        }
         // SAFETY: same.
         let r0 = unsafe { self.mmio.read32(REG_RESPONSE_0) };
         Ok(r0)
@@ -371,15 +400,21 @@ impl Sdhci {
 
         // ACMD41 (SD_SEND_OP_COND): repeat CMD55 + CMD41 until
         // the response's busy bit (bit 31) is set.
-        let mut acmd41_arg = 0x4000_0000u32;  // HCS=1 (host supports SDHC).
-        if if_cond_match { acmd41_arg |= 0x0030_0000; } // 3.3V window.
+        let mut acmd41_arg = 0x4000_0000u32; // HCS=1 (host supports SDHC).
+        if if_cond_match {
+            acmd41_arg |= 0x0030_0000;
+        } // 3.3V window.
         let mut ocr = 0u32;
         for _ in 0..1_000u32 {
             // CMD55 (APP_CMD).
             let _ = self.cmd(55, 0, RESP_48, false, 0, 0, 0)?;
             ocr = self.cmd(41, acmd41_arg, RESP_48, false, 0, 0, 0)?;
-            if ocr & 0x8000_0000 != 0 { break; }
-            for _ in 0..10_000 { core::hint::spin_loop(); }
+            if ocr & 0x8000_0000 != 0 {
+                break;
+            }
+            for _ in 0..10_000 {
+                core::hint::spin_loop();
+            }
         }
         if ocr & 0x8000_0000 == 0 {
             return Err(SdhciError::CmdTimeout);
@@ -402,7 +437,12 @@ impl Sdhci {
         // addressing but sending it is harmless.
         let _ = self.cmd(16, 512, RESP_48, false, 0, 0, 0)?;
 
-        Ok(SdCard { rca, cid, if_cond_match, ccs })
+        Ok(SdCard {
+            rca,
+            cid,
+            if_cond_match,
+            ccs,
+        })
     }
 
     /// Read a single 512-byte block via PIO. `lba` is the block
@@ -427,13 +467,19 @@ impl Sdhci {
                 let eis = unsafe { self.mmio.read16(REG_ERROR_INT_STS) };
                 return Err(SdhciError::DeviceError(eis));
             }
-            if nis & NIS_BUFFER_READ_READY != 0 { break; }
+            if nis & NIS_BUFFER_READ_READY != 0 {
+                break;
+            }
             spins += 1;
-            if spins > 10_000_000 { return Err(SdhciError::PioStall); }
+            if spins > 10_000_000 {
+                return Err(SdhciError::PioStall);
+            }
             core::hint::spin_loop();
         }
         // SAFETY: identity-mapped MMIO.
-        unsafe { self.mmio.write16(REG_NORMAL_INT_STS, NIS_BUFFER_READ_READY); }
+        unsafe {
+            self.mmio.write16(REG_NORMAL_INT_STS, NIS_BUFFER_READ_READY);
+        }
         for i in 0..128usize {
             // SAFETY: same.
             let w = unsafe { self.mmio.read32(REG_BUFFER_PORT) };
@@ -445,13 +491,19 @@ impl Sdhci {
         loop {
             // SAFETY: same.
             let nis = unsafe { self.mmio.read16(REG_NORMAL_INT_STS) };
-            if nis & NIS_TRANSFER_COMPLETE != 0 { break; }
+            if nis & NIS_TRANSFER_COMPLETE != 0 {
+                break;
+            }
             spins += 1;
-            if spins > 10_000_000 { return Err(SdhciError::PioStall); }
+            if spins > 10_000_000 {
+                return Err(SdhciError::PioStall);
+            }
             core::hint::spin_loop();
         }
         // SAFETY: same.
-        unsafe { self.mmio.write16(REG_NORMAL_INT_STS, NIS_TRANSFER_COMPLETE); }
+        unsafe {
+            self.mmio.write16(REG_NORMAL_INT_STS, NIS_TRANSFER_COMPLETE);
+        }
         Ok(())
     }
 
@@ -459,7 +511,7 @@ impl Sdhci {
     pub fn write_block(&self, lba: u32, data: &[u8; 512]) -> Result<(), SdhciError> {
         let card = self.card.lock().ok_or(SdhciError::NoCard)?;
         let arg = if card.ccs { lba } else { lba * 512 };
-        let _ = self.cmd(24, arg, RESP_48, true, /*tm*/0, 512, 1)?;
+        let _ = self.cmd(24, arg, RESP_48, true, /*tm*/ 0, 512, 1)?;
 
         // Wait for buffer-write-ready, push 128 u32 words.
         let mut spins = 0u32;
@@ -471,70 +523,88 @@ impl Sdhci {
                 let eis = unsafe { self.mmio.read16(REG_ERROR_INT_STS) };
                 return Err(SdhciError::DeviceError(eis));
             }
-            if nis & NIS_BUFFER_WRITE_READY != 0 { break; }
+            if nis & NIS_BUFFER_WRITE_READY != 0 {
+                break;
+            }
             spins += 1;
-            if spins > 10_000_000 { return Err(SdhciError::PioStall); }
+            if spins > 10_000_000 {
+                return Err(SdhciError::PioStall);
+            }
             core::hint::spin_loop();
         }
         // SAFETY: identity-mapped MMIO.
-        unsafe { self.mmio.write16(REG_NORMAL_INT_STS, NIS_BUFFER_WRITE_READY); }
+        unsafe {
+            self.mmio
+                .write16(REG_NORMAL_INT_STS, NIS_BUFFER_WRITE_READY);
+        }
         for i in 0..128usize {
             let bytes: [u8; 4] = [
-                data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3],
+                data[i * 4],
+                data[i * 4 + 1],
+                data[i * 4 + 2],
+                data[i * 4 + 3],
             ];
             let w = u32::from_le_bytes(bytes);
             // SAFETY: identity-mapped MMIO.
-            unsafe { self.mmio.write32(REG_BUFFER_PORT, w); }
+            unsafe {
+                self.mmio.write32(REG_BUFFER_PORT, w);
+            }
         }
         let mut spins = 0u32;
         loop {
             // SAFETY: same.
             let nis = unsafe { self.mmio.read16(REG_NORMAL_INT_STS) };
-            if nis & NIS_TRANSFER_COMPLETE != 0 { break; }
+            if nis & NIS_TRANSFER_COMPLETE != 0 {
+                break;
+            }
             spins += 1;
-            if spins > 10_000_000 { return Err(SdhciError::PioStall); }
+            if spins > 10_000_000 {
+                return Err(SdhciError::PioStall);
+            }
             core::hint::spin_loop();
         }
         // SAFETY: same.
-        unsafe { self.mmio.write16(REG_NORMAL_INT_STS, NIS_TRANSFER_COMPLETE); }
+        unsafe {
+            self.mmio.write16(REG_NORMAL_INT_STS, NIS_TRANSFER_COMPLETE);
+        }
         Ok(())
     }
 }
 
 // ── Driver-match registration ────────────────────────────────────────
 
-static CONTROLLER: IrqSafeSpinLock<Option<Sdhci>> =
-    IrqSafeSpinLock::new(None);
+static CONTROLLER: IrqSafeSpinLock<Option<Sdhci>> = IrqSafeSpinLock::new(None);
 
-pub fn probe(
-    device: BusDevice,
-    cap:    Cap<BusDeviceCap, Write>,
-) -> Result<(), narf_bus::ProbeError> {
+pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     // Class match catches all of class 0x08 (system peripheral).
     // Filter to subclass 0x05 (SD host controller) here.
     let subclass = ((device.id.class >> 8) & 0xFF) as u8;
     if subclass != SDHCI_PCI_SUBCLASS {
         return Err(narf_bus::ProbeError::BadDevice);
     }
-    if CONTROLLER.lock().is_some() { return Ok(()); }
+    if CONTROLLER.lock().is_some() {
+        return Ok(());
+    }
     narf_bus::pci::set_command(
-        &cap, &device,
+        &cap,
+        &device,
         narf_bus::pci::cmd::MEM_SPACE
             | narf_bus::pci::cmd::BUS_MASTER
             | narf_bus::pci::cmd::INTX_DISABLE,
-    ).map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    )
+    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // SAFETY: caller-authority over BAR0.
     let dev = match unsafe { Sdhci::bring_up(&device, &cap) } {
-        Ok(d)  => d,
+        Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
     *CONTROLLER.lock() = Some(dev);
     narf_drivers::record_bound(narf_drivers::BoundDriver {
-        name:    alloc::string::String::from("sd0"),
-        kind:    narf_drivers::BoundKind::Block,
+        name: alloc::string::String::from("sd0"),
+        kind: narf_drivers::BoundKind::Block,
         pci_vid: Some(device.id.vendor),
         pci_did: Some(device.id.device),
-        domain:  narf_drivers::BoundKind::Block.default_domain(),
+        domain: narf_drivers::BoundKind::Block.default_domain(),
     });
     Ok(())
 }
@@ -546,13 +616,16 @@ pub fn register_pci_driver() {
     narf_bus::register_pci_driver(narf_bus::PciMatch {
         name: "sdhci",
         kind: narf_bus::MatchKind::Class {
-            class: SDHCI_PCI_CLASS, mask: 0xFF,
+            class: SDHCI_PCI_CLASS,
+            mask: 0xFF,
         },
         probe,
     });
 }
 
-pub fn is_probed() -> bool { CONTROLLER.lock().is_some() }
+pub fn is_probed() -> bool {
+    CONTROLLER.lock().is_some()
+}
 
 pub fn with_controller<R>(f: impl FnOnce(&Sdhci) -> R) -> Option<R> {
     CONTROLLER.lock().as_ref().map(f)

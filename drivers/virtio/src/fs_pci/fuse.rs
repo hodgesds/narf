@@ -24,18 +24,18 @@
 #[repr(u32)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum FuseOpcode {
-    Lookup  = FUSE_LOOKUP,
+    Lookup = FUSE_LOOKUP,
     Getattr = FUSE_GETATTR,
-    Read    = FUSE_READ,
+    Read = FUSE_READ,
     Release = FUSE_RELEASE,
-    Init    = FUSE_INIT,
+    Init = FUSE_INIT,
 }
 
-pub const FUSE_LOOKUP:  u32 = 1;
+pub const FUSE_LOOKUP: u32 = 1;
 pub const FUSE_GETATTR: u32 = 3;
-pub const FUSE_READ:    u32 = 15;
+pub const FUSE_READ: u32 = 15;
 pub const FUSE_RELEASE: u32 = 18;
-pub const FUSE_INIT:    u32 = 26;
+pub const FUSE_INIT: u32 = 26;
 
 /// `fuse_in_header` size (FUSE wire docs).
 pub const FUSE_IN_HEADER_LEN: usize = 40;
@@ -51,30 +51,39 @@ pub const FUSE_READ_IN_LEN: usize = 40;
 pub const FUSE_ENTRY_OUT_LEN: usize = 16 + 88;
 
 /// FUSE wire-protocol version targeted by this driver.
-pub const FUSE_KERNEL_VERSION:        u32 = 7;
-pub const FUSE_KERNEL_MINOR_VERSION:  u32 = 27;
+pub const FUSE_KERNEL_VERSION: u32 = 7;
+pub const FUSE_KERNEL_MINOR_VERSION: u32 = 27;
 
 /// `fuse_out_header`. Echoed by the device for every request.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct FuseOutHeader {
-    pub len:    u32,
-    pub error:  i32,
+    pub len: u32,
+    pub error: i32,
     pub unique: u64,
 }
 
 impl FuseOutHeader {
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < FUSE_OUT_HEADER_LEN { return None; }
-        let r32 = |o: usize| u32::from_le_bytes([
-            bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3],
-        ]);
-        let r64 = |o: usize| u64::from_le_bytes([
-            bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3],
-            bytes[o + 4], bytes[o + 5], bytes[o + 6], bytes[o + 7],
-        ]);
+        if bytes.len() < FUSE_OUT_HEADER_LEN {
+            return None;
+        }
+        let r32 =
+            |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+        let r64 = |o: usize| {
+            u64::from_le_bytes([
+                bytes[o],
+                bytes[o + 1],
+                bytes[o + 2],
+                bytes[o + 3],
+                bytes[o + 4],
+                bytes[o + 5],
+                bytes[o + 6],
+                bytes[o + 7],
+            ])
+        };
         Some(Self {
-            len:    r32(0),
-            error:  r32(4) as i32,
+            len: r32(0),
+            error: r32(4) as i32,
             unique: r64(8),
         })
     }
@@ -83,10 +92,10 @@ impl FuseOutHeader {
 /// `fuse_init_in` payload: { u32 major; u32 minor; u32 max_readahead; u32 flags; }
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct FuseInitIn {
-    pub major:         u32,
-    pub minor:         u32,
+    pub major: u32,
+    pub minor: u32,
     pub max_readahead: u32,
-    pub flags:         u32,
+    pub flags: u32,
 }
 
 impl FuseInitIn {
@@ -105,36 +114,37 @@ impl FuseInitIn {
 /// past but discarded.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub struct FuseInitOut {
-    pub major:                u32,
-    pub minor:                u32,
-    pub max_readahead:        u32,
-    pub flags:                u32,
-    pub max_background:       u16,
+    pub major: u32,
+    pub minor: u32,
+    pub max_readahead: u32,
+    pub flags: u32,
+    pub max_background: u16,
     pub congestion_threshold: u16,
-    pub max_write:            u32,
-    pub time_gran:            u32,
-    pub max_pages:            u16,
-    pub padding:              u16,
+    pub max_write: u32,
+    pub time_gran: u32,
+    pub max_pages: u16,
+    pub padding: u16,
 }
 
 impl FuseInitOut {
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 32 { return None; }
+        if bytes.len() < 32 {
+            return None;
+        }
         let r16 = |o: usize| u16::from_le_bytes([bytes[o], bytes[o + 1]]);
-        let r32 = |o: usize| u32::from_le_bytes([
-            bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3],
-        ]);
+        let r32 =
+            |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
         Some(Self {
-            major:                r32(0),
-            minor:                r32(4),
-            max_readahead:        r32(8),
-            flags:                r32(12),
-            max_background:       r16(16),
+            major: r32(0),
+            minor: r32(4),
+            max_readahead: r32(8),
+            flags: r32(12),
+            max_background: r16(16),
             congestion_threshold: r16(18),
-            max_write:            r32(20),
-            time_gran:            if bytes.len() >= 28 { r32(24) } else { 0 },
-            max_pages:            if bytes.len() >= 30 { r16(28) } else { 0 },
-            padding:              if bytes.len() >= 32 { r16(30) } else { 0 },
+            max_write: r32(20),
+            time_gran: if bytes.len() >= 28 { r32(24) } else { 0 },
+            max_pages: if bytes.len() >= 30 { r16(28) } else { 0 },
+            padding: if bytes.len() >= 32 { r16(30) } else { 0 },
         })
     }
 }
@@ -142,13 +152,13 @@ impl FuseInitOut {
 /// `fuse_read_in` payload (40 B).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct FuseReadIn {
-    pub fh:         u64,
-    pub offset:     u64,
-    pub size:       u32,
+    pub fh: u64,
+    pub offset: u64,
+    pub size: u32,
     pub read_flags: u32,
     pub lock_owner: u64,
-    pub flags:      u32,
-    pub padding:    u32,
+    pub flags: u32,
+    pub padding: u32,
 }
 
 impl FuseReadIn {
@@ -169,18 +179,31 @@ impl FuseReadIn {
 /// pluck out `nodeid` (offset 0, u64) etc.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub struct FuseEntryOut {
-    pub nodeid:     u64,
+    pub nodeid: u64,
     pub generation: u64,
 }
 
 impl FuseEntryOut {
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 16 { return None; }
-        let r64 = |o: usize| u64::from_le_bytes([
-            bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3],
-            bytes[o + 4], bytes[o + 5], bytes[o + 6], bytes[o + 7],
-        ]);
-        Some(Self { nodeid: r64(0), generation: r64(8) })
+        if bytes.len() < 16 {
+            return None;
+        }
+        let r64 = |o: usize| {
+            u64::from_le_bytes([
+                bytes[o],
+                bytes[o + 1],
+                bytes[o + 2],
+                bytes[o + 3],
+                bytes[o + 4],
+                bytes[o + 5],
+                bytes[o + 6],
+                bytes[o + 7],
+            ])
+        };
+        Some(Self {
+            nodeid: r64(0),
+            generation: r64(8),
+        })
     }
 }
 
@@ -191,13 +214,13 @@ pub const FUSE_ROOT_ID: u64 = 1;
 /// `encode` / `decode` helpers convert to/from on-wire little-endian.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct FuseInHeader {
-    pub len:    u32,
+    pub len: u32,
     pub opcode: u32,
     pub unique: u64,
     pub nodeid: u64,
-    pub uid:    u32,
-    pub gid:    u32,
-    pub pid:    u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub pid: u32,
     pub padding: u32,
 }
 
@@ -214,8 +237,8 @@ impl FuseInHeader {
         payload_len: u32,
     ) -> Self {
         Self {
-            len:     FUSE_IN_HEADER_LEN as u32 + payload_len,
-            opcode:  opcode as u32,
+            len: FUSE_IN_HEADER_LEN as u32 + payload_len,
+            opcode: opcode as u32,
             unique,
             nodeid,
             uid,
@@ -242,22 +265,31 @@ impl FuseInHeader {
     /// Deserialize from a 40-byte little-endian slice. Returns `None`
     /// when the slice is too short.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < FUSE_IN_HEADER_LEN { return None; }
-        let r32 = |o: usize| u32::from_le_bytes([
-            bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3],
-        ]);
-        let r64 = |o: usize| u64::from_le_bytes([
-            bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3],
-            bytes[o + 4], bytes[o + 5], bytes[o + 6], bytes[o + 7],
-        ]);
+        if bytes.len() < FUSE_IN_HEADER_LEN {
+            return None;
+        }
+        let r32 =
+            |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+        let r64 = |o: usize| {
+            u64::from_le_bytes([
+                bytes[o],
+                bytes[o + 1],
+                bytes[o + 2],
+                bytes[o + 3],
+                bytes[o + 4],
+                bytes[o + 5],
+                bytes[o + 6],
+                bytes[o + 7],
+            ])
+        };
         Some(Self {
-            len:     r32(0),
-            opcode:  r32(4),
-            unique:  r64(8),
-            nodeid:  r64(16),
-            uid:     r32(24),
-            gid:     r32(28),
-            pid:     r32(32),
+            len: r32(0),
+            opcode: r32(4),
+            unique: r64(8),
+            nodeid: r64(16),
+            uid: r32(24),
+            gid: r32(28),
+            pid: r32(32),
             padding: r32(36),
         })
     }

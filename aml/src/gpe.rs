@@ -20,19 +20,19 @@ use crate::NodeKind;
 /// function pointer, or both. On `dispatch`, the native handler runs
 /// first (when present) followed by the AML method (when present).
 pub struct GpeHandler {
-    pub gpe_num:  u32,
+    pub gpe_num: u32,
     /// Fully-qualified AML path of the `_Lxx` or `_Exx` method, if any.
     pub aml_path: Option<String>,
     /// Native (kernel-side) handler function pointer, if any.
-    pub native:   Option<fn(u32)>,
+    pub native: Option<fn(u32)>,
 }
 
 impl core::fmt::Debug for GpeHandler {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("GpeHandler")
-            .field("gpe_num",  &self.gpe_num)
+            .field("gpe_num", &self.gpe_num)
             .field("aml_path", &self.aml_path)
-            .field("native",   &self.native.map(|_| "<fn>"))
+            .field("native", &self.native.map(|_| "<fn>"))
             .finish()
     }
 }
@@ -59,13 +59,15 @@ pub fn install_aml_handlers() -> u32 {
     let mut count = 0u32;
 
     for node in &nodes {
-        if node.kind != NodeKind::Method { continue; }
+        if node.kind != NodeKind::Method {
+            continue;
+        }
 
         // Must be under \\_GPE.
         let path = node.path.as_str();
         let suffix = match path.strip_prefix(GPE_PREFIX) {
             Some(s) => s,
-            None    => continue,
+            None => continue,
         };
 
         // Must be exactly one segment of 4 chars: `_L<h><h>` or `_E<h><h>`
@@ -78,14 +80,22 @@ pub fn install_aml_handlers() -> u32 {
         //   _L<H>     or  _E<H>     (3 chars — one hex digit, low nibble only)
         //
         // We require exactly the 4-char form to avoid false positives.
-        if suffix.contains('.') { continue; } // nested — not a direct _GPE child
+        if suffix.contains('.') {
+            continue;
+        } // nested — not a direct _GPE child
         let sb = suffix.as_bytes();
-        if sb.len() < 4 { continue; }
+        if sb.len() < 4 {
+            continue;
+        }
         // Take only the last 4 chars if the stripped name is longer
         // (shouldn't happen, but be safe).
         let seg = &sb[sb.len().saturating_sub(4)..];
-        if seg.len() < 4 { continue; }
-        if seg[0] != b'_' { continue; }
+        if seg.len() < 4 {
+            continue;
+        }
+        if seg[0] != b'_' {
+            continue;
+        }
         let trigger = seg[1];
         if trigger != b'L' && trigger != b'l' && trigger != b'E' && trigger != b'e' {
             continue;
@@ -95,11 +105,17 @@ pub fn install_aml_handlers() -> u32 {
             (c >= b'0' && c <= b'9') || (c >= b'a' && c <= b'f') || (c >= b'A' && c <= b'F')
         }
         fn hex_val(c: u8) -> u32 {
-            if c >= b'0' && c <= b'9' { (c - b'0') as u32 }
-            else if c >= b'a' && c <= b'f' { (c - b'a') as u32 + 10 }
-            else { (c - b'A') as u32 + 10 }
+            if c >= b'0' && c <= b'9' {
+                (c - b'0') as u32
+            } else if c >= b'a' && c <= b'f' {
+                (c - b'a') as u32 + 10
+            } else {
+                (c - b'A') as u32 + 10
+            }
         }
-        if !is_hex(seg[2]) || !is_hex(seg[3]) { continue; }
+        if !is_hex(seg[2]) || !is_hex(seg[3]) {
+            continue;
+        }
         let gpe_num = (hex_val(seg[2]) << 4) | hex_val(seg[3]);
 
         // Register / replace entry.
@@ -110,7 +126,7 @@ pub fn install_aml_handlers() -> u32 {
             g.push(GpeHandler {
                 gpe_num,
                 aml_path: Some(node.path.clone()),
-                native:   None,
+                native: None,
             });
             count += 1;
         }
@@ -130,7 +146,7 @@ pub fn register_native_handler(gpe_num: u32, handler: fn(u32)) {
         g.push(GpeHandler {
             gpe_num,
             aml_path: None,
-            native:   Some(handler),
+            native: Some(handler),
         });
     }
 }
@@ -145,7 +161,7 @@ pub fn dispatch(gpe_num: u32) {
         let g = HANDLERS.lock();
         match g.iter().find(|h| h.gpe_num == gpe_num) {
             Some(h) => (h.native, h.aml_path.clone()),
-            None    => return,
+            None => return,
         }
     };
 

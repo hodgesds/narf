@@ -31,17 +31,16 @@ pub const TIR_DISP_INDIRECT_RQT: u8 = 0x1;
 #[derive(Copy, Clone, Debug)]
 pub struct TirParams {
     /// `0x0` = direct (use `inline_rqn`); `0x1` = indirect (RQT).
-    pub disp_type:         u8,
+    pub disp_type: u8,
     /// RQ number (or RQT number when `disp_type` = indirect).
-    pub inline_rqn:        u32,
-    pub transport_domain:  u32,
+    pub inline_rqn: u32,
+    pub transport_domain: u32,
 }
 
 pub fn build_create_tir_input(p: TirParams) -> Vec<u8> {
     let mut out = alloc::vec![0u8; TIRC_LEN];
     out[TIRC_OFF_DISP_TYPE] = p.disp_type & 0x0F;
-    out[TIRC_OFF_INLINE_RQN..TIRC_OFF_INLINE_RQN + 4]
-        .copy_from_slice(&p.inline_rqn.to_be_bytes());
+    out[TIRC_OFF_INLINE_RQN..TIRC_OFF_INLINE_RQN + 4].copy_from_slice(&p.inline_rqn.to_be_bytes());
     out[TIRC_OFF_TRANSPORT_DOMAIN..TIRC_OFF_TRANSPORT_DOMAIN + 4]
         .copy_from_slice(&p.transport_domain.to_be_bytes());
     out
@@ -50,12 +49,12 @@ pub fn build_create_tir_input(p: TirParams) -> Vec<u8> {
 // ── TIS ────────────────────────────────────────────────────────────
 
 pub const TISC_LEN: usize = 256;
-pub const TISC_OFF_PRIO:    usize = 0x00;
+pub const TISC_OFF_PRIO: usize = 0x00;
 pub const TISC_OFF_TRANSPORT_DOMAIN: usize = 0x24;
 
 #[derive(Copy, Clone, Debug)]
 pub struct TisParams {
-    pub priority:         u8,
+    pub priority: u8,
     pub transport_domain: u32,
 }
 
@@ -74,12 +73,14 @@ pub const RQTC_OFF_RQT_ACTUAL_SIZE: usize = 0x14;
 pub const RQTC_OFF_RQ_LIST: usize = 0x20;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum RqtError { TooLarge }
+pub enum RqtError {
+    TooLarge,
+}
 
 #[derive(Clone, Debug)]
 pub struct RqtParams {
     /// log2 of the RQT capacity (HW supports up to 128).
-    pub max_size:    u32,
+    pub max_size: u32,
     /// Actual-size <= max_size. Per PRM bits[12:0].
     pub actual_size: u32,
 }
@@ -87,7 +88,9 @@ pub struct RqtParams {
 /// Build the CREATE_RQT input mailbox: 32-byte rqt context plus a
 /// 4-byte BE rqn entry per RQ in `rqs`.
 pub fn build_create_rqt_input(p: RqtParams, rqs: &[u32]) -> Result<Vec<u8>, RqtError> {
-    if rqs.len() > 128 { return Err(RqtError::TooLarge); }
+    if rqs.len() > 128 {
+        return Err(RqtError::TooLarge);
+    }
     let total = RQTC_OFF_RQ_LIST + rqs.len() * 4;
     let mut out = alloc::vec![0u8; total];
     out[RQTC_OFF_RQT_MAX_SIZE..RQTC_OFF_RQT_MAX_SIZE + 4]

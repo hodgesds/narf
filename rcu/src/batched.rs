@@ -33,35 +33,48 @@ type Cb = Box<dyn FnOnce() + Send + 'static>;
 /// A batch of pending reclamation callbacks.
 pub struct ReclaimBatch {
     callbacks: Vec<Cb>,
-    node_id:   u16,
+    node_id: u16,
 }
 
 impl core::fmt::Debug for ReclaimBatch {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ReclaimBatch")
             .field("callbacks", &self.callbacks.len())
-            .field("node_id",   &self.node_id)
+            .field("node_id", &self.node_id)
             .finish()
     }
 }
 
 impl ReclaimBatch {
     pub fn new(node_id: u16) -> Self {
-        Self { callbacks: Vec::with_capacity(BATCH_CAP), node_id }
+        Self {
+            callbacks: Vec::with_capacity(BATCH_CAP),
+            node_id,
+        }
     }
 
-    pub fn push(&mut self, cb: Cb) { self.callbacks.push(cb); }
+    pub fn push(&mut self, cb: Cb) {
+        self.callbacks.push(cb);
+    }
 
-    pub fn len(&self) -> usize { self.callbacks.len() }
+    pub fn len(&self) -> usize {
+        self.callbacks.len()
+    }
 
-    pub fn is_full(&self) -> bool { self.callbacks.len() >= BATCH_CAP }
+    pub fn is_full(&self) -> bool {
+        self.callbacks.len() >= BATCH_CAP
+    }
 
-    pub fn is_empty(&self) -> bool { self.callbacks.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.callbacks.is_empty()
+    }
 
     /// Run every callback and clear the batch.
     pub fn drain(&mut self) {
         let cbs = core::mem::take(&mut self.callbacks);
-        for cb in cbs { cb(); }
+        for cb in cbs {
+            cb();
+        }
     }
 }
 
@@ -74,10 +87,10 @@ pub struct BatchedReclaimer {
     total_submitted: AtomicU64,
     /// Total callbacks that have been drained (executed). `submitted
     /// - drained` is the currently-pending count.
-    total_drained:   AtomicU64,
+    total_drained: AtomicU64,
     /// Most-recent `pace()` hint for NUMA-aware draining. Stage-4
     /// records but doesn't yet act on it.
-    pace_hint_node:  AtomicU64,
+    pace_hint_node: AtomicU64,
 }
 
 impl BatchedReclaimer {
@@ -85,8 +98,8 @@ impl BatchedReclaimer {
         Self {
             active: IrqSafeSpinLock::new(ReclaimBatch::new(node_id)),
             total_submitted: AtomicU64::new(0),
-            total_drained:   AtomicU64::new(0),
-            pace_hint_node:  AtomicU64::new(0),
+            total_drained: AtomicU64::new(0),
+            pace_hint_node: AtomicU64::new(0),
         }
     }
 
@@ -117,10 +130,15 @@ impl BatchedReclaimer {
     }
 
     pub fn pending(&self) -> u64 {
-        self.total_submitted.load(Ordering::Relaxed)
+        self.total_submitted
+            .load(Ordering::Relaxed)
             .saturating_sub(self.total_drained.load(Ordering::Relaxed))
     }
 
-    pub fn total_submitted(&self) -> u64 { self.total_submitted.load(Ordering::Relaxed) }
-    pub fn total_drained(&self)   -> u64 { self.total_drained.load(Ordering::Relaxed) }
+    pub fn total_submitted(&self) -> u64 {
+        self.total_submitted.load(Ordering::Relaxed)
+    }
+    pub fn total_drained(&self) -> u64 {
+        self.total_drained.load(Ordering::Relaxed)
+    }
 }

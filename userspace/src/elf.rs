@@ -31,23 +31,23 @@ use crate::{DynEntry, ExecImage, ExecKind, Segment, SegmentFlags, TlsTemplate};
 
 // ── Wire constants (ELF spec) ───────────────────────────────────────
 
-const EI_MAG0:  usize = 0;
-const EI_MAG1:  usize = 1;
-const EI_MAG2:  usize = 2;
-const EI_MAG3:  usize = 3;
+const EI_MAG0: usize = 0;
+const EI_MAG1: usize = 1;
+const EI_MAG2: usize = 2;
+const EI_MAG3: usize = 3;
 const EI_CLASS: usize = 4;
-const EI_DATA:  usize = 5;
+const EI_DATA: usize = 5;
 
 const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 
 const ET_EXEC: u16 = 2;
-const ET_DYN:  u16 = 3;
+const ET_DYN: u16 = 3;
 
-const PT_LOAD:    u32 = 1;
+const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
-const PT_INTERP:  u32 = 3;
-const PT_TLS:     u32 = 7;
+const PT_INTERP: u32 = 3;
+const PT_TLS: u32 = 7;
 
 const PF_X: u32 = 1 << 0;
 const PF_W: u32 = 1 << 1;
@@ -85,7 +85,9 @@ pub enum ElfError {
 /// the caller fills those in before handing the image to the
 /// loader.
 pub fn parse(bytes: &[u8]) -> Result<ExecImage, ElfError> {
-    if bytes.len() < 64 { return Err(ElfError::TooShort); }
+    if bytes.len() < 64 {
+        return Err(ElfError::TooShort);
+    }
 
     // ELF header identification.
     if bytes[EI_MAG0] != 0x7F
@@ -95,20 +97,24 @@ pub fn parse(bytes: &[u8]) -> Result<ExecImage, ElfError> {
     {
         return Err(ElfError::BadMagic);
     }
-    if bytes[EI_CLASS] != ELFCLASS64  { return Err(ElfError::Not64Bit); }
-    if bytes[EI_DATA]  != ELFDATA2LSB { return Err(ElfError::NotLittleEndian); }
+    if bytes[EI_CLASS] != ELFCLASS64 {
+        return Err(ElfError::Not64Bit);
+    }
+    if bytes[EI_DATA] != ELFDATA2LSB {
+        return Err(ElfError::NotLittleEndian);
+    }
 
-    let e_type   = read_u16(bytes, 0x10);
+    let e_type = read_u16(bytes, 0x10);
     let kind = match e_type {
         ET_EXEC => ExecKind::Elf64Exec,
-        ET_DYN  => ExecKind::Elf64Dyn,
-        _       => return Err(ElfError::BadType),
+        ET_DYN => ExecKind::Elf64Dyn,
+        _ => return Err(ElfError::BadType),
     };
 
-    let e_entry    = read_u64(bytes, 0x18);
-    let e_phoff    = read_u64(bytes, 0x20);
+    let e_entry = read_u64(bytes, 0x18);
+    let e_phoff = read_u64(bytes, 0x20);
     let e_phentsize = read_u16(bytes, 0x36);
-    let e_phnum    = read_u16(bytes, 0x38);
+    let e_phnum = read_u16(bytes, 0x38);
 
     let phoff = e_phoff as usize;
     let entsize = e_phentsize as usize;
@@ -130,24 +136,30 @@ pub fn parse(bytes: &[u8]) -> Result<ExecImage, ElfError> {
 
     for i in 0..phnum {
         let off = phoff + i * entsize;
-        let p_type   = read_u32(bytes, off + 0x00);
-        let p_flags  = read_u32(bytes, off + 0x04);
+        let p_type = read_u32(bytes, off + 0x00);
+        let p_flags = read_u32(bytes, off + 0x04);
         let p_offset = read_u64(bytes, off + 0x08);
-        let p_vaddr  = read_u64(bytes, off + 0x10);
+        let p_vaddr = read_u64(bytes, off + 0x10);
         let p_filesz = read_u64(bytes, off + 0x20);
-        let p_memsz  = read_u64(bytes, off + 0x28);
+        let p_memsz = read_u64(bytes, off + 0x28);
 
         match p_type {
             PT_LOAD => {
                 let mut flags = SegmentFlags::default();
-                if p_flags & PF_R != 0 { flags = flags | SegmentFlags::READ;  }
-                if p_flags & PF_W != 0 { flags = flags | SegmentFlags::WRITE; }
-                if p_flags & PF_X != 0 { flags = flags | SegmentFlags::EXEC;  }
+                if p_flags & PF_R != 0 {
+                    flags = flags | SegmentFlags::READ;
+                }
+                if p_flags & PF_W != 0 {
+                    flags = flags | SegmentFlags::WRITE;
+                }
+                if p_flags & PF_X != 0 {
+                    flags = flags | SegmentFlags::EXEC;
+                }
                 segments.push(Segment {
-                    vaddr:     p_vaddr,
-                    file_off:  p_offset,
+                    vaddr: p_vaddr,
+                    file_off: p_offset,
                     file_size: p_filesz,
-                    mem_size:  p_memsz,
+                    mem_size: p_memsz,
                     flags,
                 });
             }
@@ -158,7 +170,8 @@ pub fn parse(bytes: &[u8]) -> Result<ExecImage, ElfError> {
                 // (which knows which DT_* it cares about) can match
                 // against a flat list rather than re-parsing.
                 let start = p_offset as usize;
-                let end = start.checked_add(p_filesz as usize)
+                let end = start
+                    .checked_add(p_filesz as usize)
                     .ok_or(ElfError::DynamicOutOfBounds)?;
                 if end > bytes.len() {
                     return Err(ElfError::DynamicOutOfBounds);
@@ -171,7 +184,9 @@ pub fn parse(bytes: &[u8]) -> Result<ExecImage, ElfError> {
                     let tag = read_i64(bytes, cur);
                     let val = read_u64(bytes, cur + 8);
                     cur += 16;
-                    if tag == 0 { break; } // DT_NULL terminator.
+                    if tag == 0 {
+                        break;
+                    } // DT_NULL terminator.
                     dynamic.push(DynEntry { tag, val });
                 }
             }
@@ -201,23 +216,26 @@ pub fn parse(bytes: &[u8]) -> Result<ExecImage, ElfError> {
                     return Err(ElfError::TlsOutOfBounds);
                 }
                 tls = Some(TlsTemplate {
-                    file_off:  p_offset,
+                    file_off: p_offset,
                     file_size: p_filesz,
-                    mem_size:  p_memsz,
+                    mem_size: p_memsz,
                     align,
-                    vaddr:     p_vaddr,
+                    vaddr: p_vaddr,
                 });
             }
             PT_INTERP => {
                 let start = p_offset as usize;
-                let end   = start.checked_add(p_filesz as usize)
+                let end = start
+                    .checked_add(p_filesz as usize)
                     .ok_or(ElfError::InterpOutOfBounds)?;
-                if end > bytes.len() { return Err(ElfError::InterpOutOfBounds); }
+                if end > bytes.len() {
+                    return Err(ElfError::InterpOutOfBounds);
+                }
                 // Trim trailing NUL.
                 let raw = &bytes[start..end];
                 let trimmed = match raw.iter().position(|&b| b == 0) {
                     Some(n) => &raw[..n],
-                    None    => raw,
+                    None => raw,
                 };
                 interp = core::str::from_utf8(trimmed).ok().map(String::from);
             }
@@ -234,7 +252,7 @@ pub fn parse(bytes: &[u8]) -> Result<ExecImage, ElfError> {
         tls,
         argv: Vec::new(),
         envp: Vec::new(),
-        aux:  Vec::new(),
+        aux: Vec::new(),
     })
 }
 
@@ -247,23 +265,33 @@ fn read_u16(bytes: &[u8], off: usize) -> u16 {
 
 #[inline]
 fn read_u32(bytes: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes([
-        bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3],
-    ])
+    u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
 }
 
 #[inline]
 fn read_u64(bytes: &[u8], off: usize) -> u64 {
     u64::from_le_bytes([
-        bytes[off    ], bytes[off + 1], bytes[off + 2], bytes[off + 3],
-        bytes[off + 4], bytes[off + 5], bytes[off + 6], bytes[off + 7],
+        bytes[off],
+        bytes[off + 1],
+        bytes[off + 2],
+        bytes[off + 3],
+        bytes[off + 4],
+        bytes[off + 5],
+        bytes[off + 6],
+        bytes[off + 7],
     ])
 }
 
 #[inline]
 fn read_i64(bytes: &[u8], off: usize) -> i64 {
     i64::from_le_bytes([
-        bytes[off    ], bytes[off + 1], bytes[off + 2], bytes[off + 3],
-        bytes[off + 4], bytes[off + 5], bytes[off + 6], bytes[off + 7],
+        bytes[off],
+        bytes[off + 1],
+        bytes[off + 2],
+        bytes[off + 3],
+        bytes[off + 4],
+        bytes[off + 5],
+        bytes[off + 6],
+        bytes[off + 7],
     ])
 }

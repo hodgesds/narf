@@ -42,21 +42,21 @@ pub const MSIX_CAP_ID: u8 = 0x11;
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub struct MsixVector {
     /// Index into the device's MSI-X table (0..N-1).
-    pub vector:  u16,
+    pub vector: u16,
     /// MSI address the device writes to raise the IRQ. Stage-3 stub
     /// value; Stage-4 populates with the real LAPIC / GIC-ITS address.
     pub address: u64,
     /// MSI data payload. Stage-3 stub; Stage-4 populates with the real
     /// vector number / EventID.
-    pub data:    u32,
+    pub data: u32,
 }
 
 impl fmt::Debug for MsixVector {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MsixVector")
-            .field("vector",  &self.vector)
+            .field("vector", &self.vector)
             .field("address", &format_args!("{:#x}", self.address))
-            .field("data",    &format_args!("{:#x}", self.data))
+            .field("data", &format_args!("{:#x}", self.data))
             .finish()
     }
 }
@@ -87,11 +87,15 @@ pub enum MsixError {
 }
 
 impl From<CapError> for MsixError {
-    fn from(_: CapError) -> Self { MsixError::AuthorityRevoked }
+    fn from(_: CapError) -> Self {
+        MsixError::AuthorityRevoked
+    }
 }
 
 impl From<BarError> for MsixError {
-    fn from(_: BarError) -> Self { MsixError::BarMapFailed }
+    fn from(_: BarError) -> Self {
+        MsixError::BarMapFailed
+    }
 }
 
 /// Snapshot of a device's MSI-X table after `enable_msix`. Holding
@@ -102,42 +106,52 @@ impl From<BarError> for MsixError {
 #[derive(Debug)]
 pub struct MsixTable {
     /// Index of the BAR that maps the MSI-X table.
-    bir:           u8,
+    bir: u8,
     /// Byte offset inside the BAR where the table begins.
-    table_offset:  u32,
+    table_offset: u32,
     /// Total entries in the table (N, per MSI-X Message Control bits 10..0).
-    size:          u16,
+    size: u16,
     /// Next free slot; reservations are monotonic within a table.
-    next_free:     u16,
+    next_free: u16,
     /// Snapshot of the PCIe function the caller claimed. Stored so
     /// vector programming knows which config window to hit.
-    cfg_phys:      PhysAddr,
+    cfg_phys: PhysAddr,
     /// BusDevice the table was discovered against. Stored so
     /// `program_vector` can call `map_bar` without making the caller
     /// thread the device through a second time.
-    device:        BusDevice,
+    device: BusDevice,
     /// Offset in cfg-space of the MSI-X capability header. Stage-4
     /// uses this in `enable` to flip the Message-Control "MSI-X
     /// enable" bit (bit 15 at cap_ptr + 2).
-    cap_offset:    u64,
+    cap_offset: u64,
 }
 
 impl MsixTable {
     /// BAR index the MSI-X table lives in.
     #[inline]
-    pub const fn bir(&self) -> u8 { self.bir }
+    pub const fn bir(&self) -> u8 {
+        self.bir
+    }
     /// Byte offset of the table relative to its BAR's base.
     #[inline]
-    pub const fn table_offset(&self) -> u32 { self.table_offset }
+    pub const fn table_offset(&self) -> u32 {
+        self.table_offset
+    }
     /// Total vector count in the table.
     #[inline]
-    pub const fn size(&self) -> u16 { self.size }
+    pub const fn size(&self) -> u16 {
+        self.size
+    }
     /// Remaining free vector slots.
     #[inline]
-    pub const fn free(&self) -> u16 { self.size - self.next_free }
+    pub const fn free(&self) -> u16 {
+        self.size - self.next_free
+    }
     /// Physical address of the owning function's cfg window.
     #[inline]
-    pub const fn cfg_phys(&self) -> PhysAddr { self.cfg_phys }
+    pub const fn cfg_phys(&self) -> PhysAddr {
+        self.cfg_phys
+    }
 
     /// Reserve the next free vector slot.
     ///
@@ -146,24 +160,28 @@ impl MsixTable {
     /// values — Stage-4 `interrupts/` will populate the real LAPIC /
     /// GIC-ITS doorbell address + payload at programming time.
     pub fn alloc_vector(&mut self) -> Option<MsixVector> {
-        if self.next_free >= self.size { return None; }
+        if self.next_free >= self.size {
+            return None;
+        }
         let v = self.next_free;
         self.next_free += 1;
         Some(MsixVector {
-            vector:  v,
+            vector: v,
             // Stage 3 placeholder: marks "unprogrammed" unambiguously.
             // Stage-4 will replace these with the LAPIC MSI address
             // (`0xfee0_0000 | ...`) or the GIC ITS doorbell as
             // appropriate.
             address: 0,
-            data:    0,
+            data: 0,
         })
     }
 
     /// Reserve `n` vectors in one shot. All-or-nothing: returns
     /// `Err(TableOverflow)` if the table can't fit them.
     pub fn alloc_block(&mut self, n: u16) -> Result<(), MsixError> {
-        if self.free() < n { return Err(MsixError::TableOverflow); }
+        if self.free() < n {
+            return Err(MsixError::TableOverflow);
+        }
         self.next_free += n;
         Ok(())
     }
@@ -209,7 +227,9 @@ impl MsixTable {
         target_apic_id: u32,
         irq_vector: u8,
     ) -> Result<MsixVector, MsixError> {
-        if vector_idx >= self.size { return Err(MsixError::VectorOutOfRange); }
+        if vector_idx >= self.size {
+            return Err(MsixError::VectorOutOfRange);
+        }
 
         // SAFETY: caller holds the device exclusively. map_bar
         // does the size-detection write/restore against cfg-space.
@@ -222,18 +242,20 @@ impl MsixTable {
         // LAPIC delivers directly so no analog is needed.
         #[cfg(target_arch = "aarch64")]
         {
-            let device_id = crate::pci::requester_id(&self.device)
-                .ok_or(MsixError::NotPcie)?;
-            let event_id  = irq_vector as u32;
-            let lpi       = narf_interrupts::aarch64::its::LPI_BASE
-                          + irq_vector as u32;
+            let device_id = crate::pci::requester_id(&self.device).ok_or(MsixError::NotPcie)?;
+            let event_id = irq_vector as u32;
+            let lpi = narf_interrupts::aarch64::its::LPI_BASE + irq_vector as u32;
             let collection = (target_apic_id & 0xFFFF) as u16;
             // SAFETY: ITS is initialised at boot; lpi is bounded by
             // its::NUM_LPIS.
             unsafe {
                 narf_interrupts::aarch64::its::map_event(
-                    device_id as u32, event_id, lpi, collection,
-                ).map_err(|_| MsixError::Unsupported)?;
+                    device_id as u32,
+                    event_id,
+                    lpi,
+                    collection,
+                )
+                .map_err(|_| MsixError::Unsupported)?;
             }
         }
 
@@ -249,16 +271,16 @@ impl MsixTable {
         // is u32-aligned and the table sits inside the BAR; map_bar
         // returned `region.len` as the BAR size.
         unsafe {
-            region.write32(entry_off,      msg_addr_lo);
-            region.write32(entry_off + 4,  msg_addr_hi);
-            region.write32(entry_off + 8,  msg_data);
+            region.write32(entry_off, msg_addr_lo);
+            region.write32(entry_off + 4, msg_addr_hi);
+            region.write32(entry_off + 8, msg_data);
             region.write32(entry_off + 12, vec_ctrl);
         }
 
         Ok(MsixVector {
-            vector:  vector_idx,
+            vector: vector_idx,
             address: msg_addr,
-            data:    msg_data,
+            data: msg_data,
         })
     }
 
@@ -279,17 +301,18 @@ impl MsixTable {
     /// or `alloc_block` against this table.
     pub unsafe fn program_vector_block(
         &mut self,
-        start_idx:      u16,
-        n_vectors:      u16,
+        start_idx: u16,
+        n_vectors: u16,
         target_apic_id: u32,
-        irq_base:       u8,
+        irq_base: u8,
     ) -> Result<alloc::vec::Vec<MsixVector>, MsixError> {
         if start_idx as u32 + n_vectors as u32 > self.size as u32 {
             return Err(MsixError::VectorOutOfRange);
         }
         let mut out = alloc::vec::Vec::with_capacity(n_vectors as usize);
         for i in 0..n_vectors {
-            let irq = irq_base.checked_add(i as u8)
+            let irq = irq_base
+                .checked_add(i as u8)
                 .ok_or(MsixError::VectorOutOfRange)?;
             // SAFETY: forwarded; per-vector_idx in range by check above.
             let v = unsafe { self.program_vector(start_idx + i, target_apic_id, irq) }?;
@@ -305,13 +328,17 @@ impl MsixTable {
     /// # Safety
     /// Caller owns the device exclusively; `idx < self.size`.
     pub unsafe fn mask_vector(&self, idx: u16) -> Result<(), MsixError> {
-        if idx >= self.size { return Err(MsixError::VectorOutOfRange); }
+        if idx >= self.size {
+            return Err(MsixError::VectorOutOfRange);
+        }
         // SAFETY: caller-owned device; map_bar reproducible.
         let region = unsafe { map_bar(&self.device, self.bir)? };
         let entry_off = self.table_offset as u64 + (idx as u64) * 16;
         // SAFETY: entry_off + 16 <= bar.size by spec (MsixTable was
         // built from the spec-mandated table size).
-        unsafe { region.write32(entry_off + 12, 1); }
+        unsafe {
+            region.write32(entry_off + 12, 1);
+        }
         Ok(())
     }
 
@@ -320,12 +347,16 @@ impl MsixTable {
     /// # Safety
     /// Same as `mask_vector`.
     pub unsafe fn unmask_vector(&self, idx: u16) -> Result<(), MsixError> {
-        if idx >= self.size { return Err(MsixError::VectorOutOfRange); }
+        if idx >= self.size {
+            return Err(MsixError::VectorOutOfRange);
+        }
         // SAFETY: caller-owned device.
         let region = unsafe { map_bar(&self.device, self.bir)? };
         let entry_off = self.table_offset as u64 + (idx as u64) * 16;
         // SAFETY: same.
-        unsafe { region.write32(entry_off + 12, 0); }
+        unsafe {
+            region.write32(entry_off + 12, 0);
+        }
         Ok(())
     }
 
@@ -344,7 +375,9 @@ impl MsixTable {
         let mc = unsafe { cfg_read16(self.cfg_phys, off) };
         // SAFETY: same window; setting bit 15 is the documented
         // global-enable.
-        unsafe { cfg_write16(self.cfg_phys, off, mc | (1 << 15)); }
+        unsafe {
+            cfg_write16(self.cfg_phys, off, mc | (1 << 15));
+        }
         Ok(())
     }
 
@@ -370,14 +403,14 @@ impl MsixTable {
 /// Cap-gated: `cap.check_live()` is the epoch gate per
 /// `capabilities/` §3–§4.
 pub fn enable_msix(
-    cap:    &Cap<BusDeviceCap, Write>,
+    cap: &Cap<BusDeviceCap, Write>,
     device: &BusDevice,
 ) -> Result<MsixTable, MsixError> {
     cap.check_live()?;
 
     let cfg_phys = match device.kind {
         BusKind::Pcie { cfg_phys, .. } => cfg_phys,
-        BusKind::VirtioMmio { .. }     => return Err(MsixError::NotPcie),
+        BusKind::VirtioMmio { .. } => return Err(MsixError::NotPcie),
     };
 
     // SAFETY: caller-checked cap; pci_cap::find_cap walks the
@@ -396,10 +429,10 @@ pub fn enable_msix(
     //   +8: Pending Bit Array (u32)
     // SAFETY: cap_ptr lives inside the 256-byte config window.
     let msg_ctrl = unsafe { cfg_read16(cfg_phys, cap_ptr + 2) };
-    let table    = unsafe { cfg_read32(cfg_phys, cap_ptr + 4) };
+    let table = unsafe { cfg_read32(cfg_phys, cap_ptr + 4) };
 
-    let size         = ((msg_ctrl & 0x07FF) as u16) + 1;
-    let bir          = (table & 0x7) as u8;
+    let size = ((msg_ctrl & 0x07FF) as u16) + 1;
+    let bir = (table & 0x7) as u8;
     let table_offset = table & !0x7;
     Ok(MsixTable {
         bir,
@@ -407,7 +440,7 @@ pub fn enable_msix(
         size,
         next_free: 0,
         cfg_phys,
-        device:     *device,
+        device: *device,
         cap_offset: cap_ptr,
     })
 }
@@ -422,17 +455,24 @@ pub fn __synth_msix_table(size: u16) -> MsixTable {
     use crate::device::{BusKind, DeviceId};
     let addr = PcieAddr::new(0, 0, 0, 0);
     MsixTable {
-        bir:          0,
+        bir: 0,
         table_offset: 0,
         size,
-        next_free:    0,
-        cfg_phys:     PhysAddr::new(0),
-        device:       BusDevice {
+        next_free: 0,
+        cfg_phys: PhysAddr::new(0),
+        device: BusDevice {
             addr: BusAddr::Pcie(addr),
-            id:   DeviceId { vendor: 0, device: 0, class: 0 },
-            kind: BusKind::Pcie { addr, cfg_phys: PhysAddr::new(0) },
+            id: DeviceId {
+                vendor: 0,
+                device: 0,
+                class: 0,
+            },
+            kind: BusKind::Pcie {
+                addr,
+                cfg_phys: PhysAddr::new(0),
+            },
         },
-        cap_offset:   0,
+        cap_offset: 0,
     }
 }
 
@@ -508,6 +548,8 @@ unsafe fn cfg_read32(cfg: PhysAddr, off: u64) -> u32 {
 unsafe fn cfg_write16(cfg: PhysAddr, off: u64, value: u16) {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: caller promises the slot is writable + aligned.
-    unsafe { core::ptr::write_volatile((cfg.raw() + off) as *mut u16, value); }
+    unsafe {
+        core::ptr::write_volatile((cfg.raw() + off) as *mut u16, value);
+    }
     compiler_fence(Ordering::SeqCst);
 }

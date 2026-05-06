@@ -30,19 +30,18 @@ use narf_io::{alloc_coherent, DmaBuffer};
 use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 
-use narf_input::{InputEvent, KeyCode, KeyEvent, Modifiers, push_global};
+use narf_input::{push_global, InputEvent, KeyCode, KeyEvent, Modifiers};
 
 use crate::pci::{
-    discover, enable_msix_queue, map_cap, VirtioCaps, VirtioPciError,
-    CC_DEVICE_FEATURE, CC_DEVICE_FEATURE_SELECT, CC_DEVICE_STATUS,
-    CC_DRIVER_FEATURE, CC_DRIVER_FEATURE_SELECT,
-    CC_QUEUE_DESC, CC_QUEUE_DEVICE, CC_QUEUE_DRIVER, CC_QUEUE_ENABLE,
-    CC_QUEUE_NOTIFY_OFF, CC_QUEUE_SELECT, CC_QUEUE_SIZE,
+    discover, enable_msix_queue, map_cap, VirtioCaps, VirtioPciError, CC_DEVICE_FEATURE,
+    CC_DEVICE_FEATURE_SELECT, CC_DEVICE_STATUS, CC_DRIVER_FEATURE, CC_DRIVER_FEATURE_SELECT,
+    CC_QUEUE_DESC, CC_QUEUE_DEVICE, CC_QUEUE_DRIVER, CC_QUEUE_ENABLE, CC_QUEUE_NOTIFY_OFF,
+    CC_QUEUE_SELECT, CC_QUEUE_SIZE,
 };
-use crate::queue::{Virtqueue, VirtqueueLayout, VirtqDesc, VIRTQ_DESC_F_WRITE};
+use crate::queue::{VirtqDesc, Virtqueue, VirtqueueLayout, VIRTQ_DESC_F_WRITE};
 use crate::{
-    VIRTIO_F_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER,
-    VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FEATURES_OK,
+    VIRTIO_F_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK,
+    VIRTIO_STATUS_FEATURES_OK,
 };
 
 pub const VIRTIO_INPUT_PCI_VENDOR: u16 = 0x1AF4;
@@ -70,19 +69,19 @@ struct Queues {
 
 #[doc(hidden)]
 pub struct VirtioInputPci {
-    notify:               crate::pci::VirtioRegion,
-    common:               crate::pci::VirtioRegion,
+    notify: crate::pci::VirtioRegion,
+    common: crate::pci::VirtioRegion,
     notify_off_multiplier: u32,
-    queues:               IrqSafeSpinLock<Option<Queues>>,
-    rx_buf:               DmaBuffer,
-    _status_buf:          DmaBuffer,
-    _q0_layout_buf:       DmaBuffer,
-    event_q_notify_off:   u16,
-    pub irq_vector:       Option<u8>,
-    msix:                 Option<narf_bus::MsixTable>,
-    pub ready:            bool,
-    rel_dx_acc:           core::sync::atomic::AtomicI32,
-    rel_dy_acc:           core::sync::atomic::AtomicI32,
+    queues: IrqSafeSpinLock<Option<Queues>>,
+    rx_buf: DmaBuffer,
+    _status_buf: DmaBuffer,
+    _q0_layout_buf: DmaBuffer,
+    event_q_notify_off: u16,
+    pub irq_vector: Option<u8>,
+    msix: Option<narf_bus::MsixTable>,
+    pub ready: bool,
+    rel_dx_acc: core::sync::atomic::AtomicI32,
+    rel_dy_acc: core::sync::atomic::AtomicI32,
 }
 
 impl core::fmt::Debug for VirtioInputPci {
@@ -98,7 +97,7 @@ impl VirtioInputPci {
     /// Caller owns the device exclusively.
     pub unsafe fn bring_up(
         device: &BusDevice,
-        _cap:   &Cap<BusDeviceCap, Write>,
+        _cap: &Cap<BusDeviceCap, Write>,
     ) -> Result<Self, VirtioPciError> {
         // SAFETY: bounded walk.
         let caps: VirtioCaps = unsafe { discover(device) }?;
@@ -113,8 +112,10 @@ impl VirtioInputPci {
         unsafe {
             common.write8(CC_DEVICE_STATUS, 0);
             common.write8(CC_DEVICE_STATUS, VIRTIO_STATUS_ACKNOWLEDGE as u8);
-            common.write8(CC_DEVICE_STATUS,
-                (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER) as u8);
+            common.write8(
+                CC_DEVICE_STATUS,
+                (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER) as u8,
+            );
         }
 
         // Feature negotiation: only VERSION_1.
@@ -138,9 +139,11 @@ impl VirtioInputPci {
             common.write32(CC_DRIVER_FEATURE, 0);
             common.write32(CC_DRIVER_FEATURE_SELECT, 1);
             common.write32(CC_DRIVER_FEATURE, 1u32 << (VIRTIO_F_VERSION_1 - 32));
-            common.write8(CC_DEVICE_STATUS,
-                (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER
-                 | VIRTIO_STATUS_FEATURES_OK) as u8);
+            common.write8(
+                CC_DEVICE_STATUS,
+                (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK)
+                    as u8,
+            );
         }
         // SAFETY: same.
         let post = unsafe { common.read8(CC_DEVICE_STATUS) };
@@ -154,20 +157,24 @@ impl VirtioInputPci {
             common.write16(CC_QUEUE_SELECT, 0);
             common.read16(CC_QUEUE_SIZE)
         };
-        if qmax_e == 0 { return Err(VirtioPciError::QueueTooSmall); }
+        if qmax_e == 0 {
+            return Err(VirtioPciError::QueueTooSmall);
+        }
         let mut qsize_e = NUM_RX.min(qmax_e);
         if !qsize_e.is_power_of_two() {
             qsize_e = 1u16 << (15 - qsize_e.leading_zeros() as u16);
         }
-        if qsize_e == 0 { qsize_e = 1; }
-        let q0_buf = alloc_coherent(4096, DomainId::DRIVER_0)
-            .map_err(|_| VirtioPciError::BarMapFailed)?;
+        if qsize_e == 0 {
+            qsize_e = 1;
+        }
+        let q0_buf =
+            alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
         let layout_e = VirtqueueLayout::new(qsize_e, q0_buf.phys_addr().raw())
             .ok_or(VirtioPciError::QueueTooSmall)?;
         // SAFETY: same.
         unsafe {
             common.write16(CC_QUEUE_SIZE, qsize_e);
-            common.write64_split(CC_QUEUE_DESC,   layout_e.desc_table);
+            common.write64_split(CC_QUEUE_DESC, layout_e.desc_table);
             common.write64_split(CC_QUEUE_DRIVER, layout_e.avail_ring);
             common.write64_split(CC_QUEUE_DEVICE, layout_e.used_ring);
             common.write16(crate::pci::CC_QUEUE_MSIX_VECTOR, 0xFFFF);
@@ -175,7 +182,9 @@ impl VirtioInputPci {
         // SAFETY: same.
         let event_q_notify_off = unsafe { common.read16(CC_QUEUE_NOTIFY_OFF) };
         // SAFETY: same.
-        unsafe { common.write16(CC_QUEUE_ENABLE, 1); }
+        unsafe {
+            common.write16(CC_QUEUE_ENABLE, 1);
+        }
 
         // ── statusQ (queue 1) ──
         // SAFETY: same.
@@ -191,7 +200,9 @@ impl VirtioInputPci {
             if !qsize_s.is_power_of_two() {
                 qsize_s = 1u16 << (15 - qsize_s.leading_zeros() as u16);
             }
-            if qsize_s == 0 { qsize_s = 1; }
+            if qsize_s == 0 {
+                qsize_s = 1;
+            }
             let q1_buf = alloc_coherent(4096, DomainId::DRIVER_0)
                 .map_err(|_| VirtioPciError::BarMapFailed)?;
             let layout_s = VirtqueueLayout::new(qsize_s, q1_buf.phys_addr().raw())
@@ -199,7 +210,7 @@ impl VirtioInputPci {
             // SAFETY: same.
             unsafe {
                 common.write16(CC_QUEUE_SIZE, qsize_s);
-                common.write64_split(CC_QUEUE_DESC,   layout_s.desc_table);
+                common.write64_split(CC_QUEUE_DESC, layout_s.desc_table);
                 common.write64_split(CC_QUEUE_DRIVER, layout_s.avail_ring);
                 common.write64_split(CC_QUEUE_DEVICE, layout_s.used_ring);
                 common.write16(crate::pci::CC_QUEUE_MSIX_VECTOR, 0xFFFF);
@@ -221,9 +232,13 @@ impl VirtioInputPci {
         // DRIVER_OK.
         // SAFETY: same.
         unsafe {
-            common.write8(CC_DEVICE_STATUS,
-                (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER
-                 | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK) as u8);
+            common.write8(
+                CC_DEVICE_STATUS,
+                (VIRTIO_STATUS_ACKNOWLEDGE
+                    | VIRTIO_STATUS_DRIVER
+                    | VIRTIO_STATUS_FEATURES_OK
+                    | VIRTIO_STATUS_DRIVER_OK) as u8,
+            );
         }
 
         // SAFETY: zero-initialised coherent DMA.
@@ -233,16 +248,16 @@ impl VirtioInputPci {
         // into NUM_RX × 8-byte chunks, post each as a device-writable
         // descriptor. The device drops events into these and posts
         // descriptor heads to the used ring.
-        let rx_buf = alloc_coherent(4096, DomainId::DRIVER_0)
-            .map_err(|_| VirtioPciError::BarMapFailed)?;
+        let rx_buf =
+            alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
         let rx_phys = rx_buf.phys_addr().raw();
         for i in 0..qsize_e {
             let off = i as u64 * EVENT_SIZE as u64;
             let descs = [VirtqDesc {
-                addr:  rx_phys + off,
-                len:   EVENT_SIZE as u32,
+                addr: rx_phys + off,
+                len: EVENT_SIZE as u32,
                 flags: VIRTQ_DESC_F_WRITE,
-                next:  0,
+                next: 0,
             }];
             let _ = event_q.add_buffer(&descs);
         }
@@ -250,17 +265,24 @@ impl VirtioInputPci {
         let off = (event_q_notify_off as u64) * (notify_off_multiplier as u64);
         core::sync::atomic::compiler_fence(Ordering::SeqCst);
         // SAFETY: identity-mapped notify region.
-        unsafe { notify.write16(off, 0); }
+        unsafe {
+            notify.write16(off, 0);
+        }
 
         Ok(Self {
-            notify, common,
+            notify,
+            common,
             notify_off_multiplier,
-            queues: IrqSafeSpinLock::new(Some(Queues { event_q, _status_q: status_q })),
+            queues: IrqSafeSpinLock::new(Some(Queues {
+                event_q,
+                _status_q: status_q,
+            })),
             rx_buf,
-            _status_buf:    q1_buf,
+            _status_buf: q1_buf,
             _q0_layout_buf: q0_buf,
             event_q_notify_off,
-            irq_vector: None, msix: None,
+            irq_vector: None,
+            msix: None,
             ready: true,
             rel_dx_acc: core::sync::atomic::AtomicI32::new(0),
             rel_dy_acc: core::sync::atomic::AtomicI32::new(0),
@@ -273,13 +295,13 @@ impl VirtioInputPci {
     /// Caller owns the device's BAR + cfg-space exclusively.
     pub unsafe fn enable_msix(
         &mut self,
-        cap:    &Cap<BusDeviceCap, Write>,
+        cap: &Cap<BusDeviceCap, Write>,
         device: &BusDevice,
     ) -> Result<u8, VirtioPciError> {
         // SAFETY: caller-asserted.
         let (v, table) = unsafe { enable_msix_queue(&self.common, cap, device, 0)? };
         self.irq_vector = Some(v);
-        self.msix       = Some(table);
+        self.msix = Some(table);
         Ok(v)
     }
 
@@ -287,8 +309,12 @@ impl VirtioInputPci {
     /// virtio-input EV_REL events bump these; cursor consumers
     /// poll-and-reset to convert into screen-space movement.
     pub fn take_rel_delta(&self) -> (i32, i32) {
-        let dx = self.rel_dx_acc.swap(0, core::sync::atomic::Ordering::AcqRel);
-        let dy = self.rel_dy_acc.swap(0, core::sync::atomic::Ordering::AcqRel);
+        let dx = self
+            .rel_dx_acc
+            .swap(0, core::sync::atomic::Ordering::AcqRel);
+        let dy = self
+            .rel_dy_acc
+            .swap(0, core::sync::atomic::Ordering::AcqRel);
         (dx, dy)
     }
 
@@ -301,21 +327,25 @@ impl VirtioInputPci {
     pub fn drain_events(&self) -> usize {
         let rx_phys = self.rx_buf.phys_addr().raw();
         let mut g = self.queues.lock();
-        let queues = match g.as_mut() { Some(q) => q, None => return 0 };
+        let queues = match g.as_mut() {
+            Some(q) => q,
+            None => return 0,
+        };
         let mut count = 0usize;
         loop {
             let elem = queues.event_q.poll_used();
-            let (head_u32, _len) = match elem { Some(x) => x, None => break };
+            let (head_u32, _len) = match elem {
+                Some(x) => x,
+                None => break,
+            };
             let head = head_u32 as u16;
             // Read the 8-byte event from the descriptor's slot. We
             // know the head index → byte offset.
             let off = (head as u64) * EVENT_SIZE as u64;
             // SAFETY: identity-mapped DMA, 8-byte aligned read.
-            let raw = unsafe {
-                core::ptr::read_volatile((rx_phys + off) as *const [u8; 8])
-            };
+            let raw = unsafe { core::ptr::read_volatile((rx_phys + off) as *const [u8; 8]) };
             let etype = u16::from_le_bytes([raw[0], raw[1]]);
-            let code  = u16::from_le_bytes([raw[2], raw[3]]);
+            let code = u16::from_le_bytes([raw[2], raw[3]]);
             let value = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
 
             if etype == EV_KEY {
@@ -324,35 +354,44 @@ impl VirtioInputPci {
                 // basic set. Values outside the known set go to Unknown.
                 let kc = decode_key_code(code);
                 let pressed = value != 0;
-                let ev = KeyEvent { code: kc, pressed, modifiers: Modifiers::EMPTY };
+                let ev = KeyEvent {
+                    code: kc,
+                    pressed,
+                    modifiers: Modifiers::EMPTY,
+                };
                 let _ = push_global(InputEvent::Key(ev));
                 count += 1;
             } else if etype == EV_REL {
                 // EV_REL { code: REL_X=0 / REL_Y=1, value: i32 delta }
                 let delta = value as i32;
                 match code {
-                    0 => { self.rel_dx_acc.fetch_add(delta, Ordering::Relaxed); }
-                    1 => { self.rel_dy_acc.fetch_add(delta, Ordering::Relaxed); }
+                    0 => {
+                        self.rel_dx_acc.fetch_add(delta, Ordering::Relaxed);
+                    }
+                    1 => {
+                        self.rel_dy_acc.fetch_add(delta, Ordering::Relaxed);
+                    }
                     _ => {} // wheel + others — future extension
                 }
             }
 
             // Re-post the slot as a fresh receive buffer.
             let descs = [VirtqDesc {
-                addr:  rx_phys + off,
-                len:   EVENT_SIZE as u32,
+                addr: rx_phys + off,
+                len: EVENT_SIZE as u32,
                 flags: VIRTQ_DESC_F_WRITE,
-                next:  0,
+                next: 0,
             }];
             queues.event_q.free_chain(head);
             let _ = queues.event_q.add_buffer(&descs);
         }
         if count > 0 {
-            let off = (self.event_q_notify_off as u64)
-                * (self.notify_off_multiplier as u64);
+            let off = (self.event_q_notify_off as u64) * (self.notify_off_multiplier as u64);
             core::sync::atomic::compiler_fence(Ordering::SeqCst);
             // SAFETY: identity-mapped notify region.
-            unsafe { self.notify.write16(off, 0); }
+            unsafe {
+                self.notify.write16(off, 0);
+            }
         }
         count
     }
@@ -368,44 +407,44 @@ fn decode_key_code(code: u16) -> KeyCode {
             // SAFETY: range covers Reserved..=ScrollLock by construction.
             unsafe { core::mem::transmute::<u16, KeyCode>(code) }
         }
-        97  => KeyCode::RightCtrl,
+        97 => KeyCode::RightCtrl,
         100 => KeyCode::RightAlt,
         103 => KeyCode::Up,
         105 => KeyCode::Left,
         106 => KeyCode::Right,
         108 => KeyCode::Down,
-        _   => KeyCode::Unknown,
+        _ => KeyCode::Unknown,
     }
 }
 
-static CONTROLLER: IrqSafeSpinLock<Option<VirtioInputPci>> =
-    IrqSafeSpinLock::new(None);
+static CONTROLLER: IrqSafeSpinLock<Option<VirtioInputPci>> = IrqSafeSpinLock::new(None);
 
-pub fn probe(
-    device: BusDevice,
-    cap:    Cap<BusDeviceCap, Write>,
-) -> Result<(), narf_bus::ProbeError> {
-    if CONTROLLER.lock().is_some() { return Ok(()); }
+pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
+    if CONTROLLER.lock().is_some() {
+        return Ok(());
+    }
     narf_bus::pci::set_command(
-        &cap, &device,
+        &cap,
+        &device,
         narf_bus::pci::cmd::MEM_SPACE
             | narf_bus::pci::cmd::BUS_MASTER
             | narf_bus::pci::cmd::INTX_DISABLE,
-    ).map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    )
+    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // SAFETY: caller-authority.
     let mut dev = match unsafe { VirtioInputPci::bring_up(&device, &cap) } {
-        Ok(d)  => d,
+        Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
     // SAFETY: same.
     let _ = unsafe { dev.enable_msix(&cap, &device) };
     *CONTROLLER.lock() = Some(dev);
     narf_drivers::record_bound(narf_drivers::BoundDriver {
-        name:    alloc::string::String::from("vinput0"),
-        kind:    narf_drivers::BoundKind::Input,
+        name: alloc::string::String::from("vinput0"),
+        kind: narf_drivers::BoundKind::Input,
         pci_vid: Some(VIRTIO_INPUT_PCI_VENDOR),
         pci_did: Some(VIRTIO_INPUT_PCI_DEVICE),
-        domain:  narf_drivers::BoundKind::Input.default_domain(),
+        domain: narf_drivers::BoundKind::Input.default_domain(),
     });
     Ok(())
 }
@@ -421,7 +460,9 @@ pub fn register_pci_driver() {
     });
 }
 
-pub fn is_probed() -> bool { CONTROLLER.lock().is_some() }
+pub fn is_probed() -> bool {
+    CONTROLLER.lock().is_some()
+}
 
 pub fn with_controller<R>(f: impl FnOnce(&VirtioInputPci) -> R) -> Option<R> {
     CONTROLLER.lock().as_ref().map(f)
@@ -436,8 +477,14 @@ pub fn feed_synthetic_events_for_test(events: &[(u16, u16, u32)]) -> usize {
         if etype == EV_KEY {
             let kc = decode_key_code(code);
             let pressed = value != 0;
-            let ev = KeyEvent { code: kc, pressed, modifiers: Modifiers::EMPTY };
-            if push_global(InputEvent::Key(ev)) { count += 1; }
+            let ev = KeyEvent {
+                code: kc,
+                pressed,
+                modifiers: Modifiers::EMPTY,
+            };
+            if push_global(InputEvent::Key(ev)) {
+                count += 1;
+            }
         }
     }
     count

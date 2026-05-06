@@ -32,8 +32,7 @@ mod tests;
 use core::future::Future;
 
 use narf_block::{
-    BlockCompletion, BlockDevice, BlockError, BlockFeature, BlockRequest,
-    CancelResult, LbaRange,
+    BlockCompletion, BlockDevice, BlockError, BlockFeature, BlockRequest, CancelResult, LbaRange,
 };
 use narf_bus::{enable_msix, map_bar, BusDevice, BusDeviceCap, MmioRegion, MsixTable};
 use narf_capabilities::{Cap, Write};
@@ -55,10 +54,15 @@ pub enum NvmeError {
     /// `narf_io::alloc_coherent` couldn't satisfy the queue DMA.
     OutOfDmaMemory,
     /// IDENTIFY CONTROLLER returned a non-zero NVMe status field.
-    IdentifyFailed { status: u16 },
+    IdentifyFailed {
+        status: u16,
+    },
     /// A submitted NVMe command (admin or I/O) returned a non-zero
     /// NVMe status field. `cmd` is the opcode that failed.
-    CommandFailed { cmd: u8, status: u16 },
+    CommandFailed {
+        cmd: u8,
+        status: u16,
+    },
     /// The completion queue phase tag never flipped within our poll.
     CompletionTimeout,
     /// `bring_up` hasn't run yet — admin queue isn't programmed.
@@ -79,23 +83,23 @@ pub enum NvmeError {
 #[repr(u64)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum NvmeRegister {
-    Cap    = 0x00,   // Controller Capabilities (64-bit)
-    Vs     = 0x08,   // Version
-    Intms  = 0x0C,   // Interrupt Mask Set
-    Intmc  = 0x10,   // Interrupt Mask Clear
-    Cc     = 0x14,   // Controller Config
-    Csts   = 0x1C,   // Controller Status
-    Aqa    = 0x24,   // Admin Queue Attributes
-    Asq    = 0x28,   // Admin Submission Queue Base Address (64-bit)
-    Acq    = 0x30,   // Admin Completion Queue Base Address (64-bit)
+    Cap = 0x00,   // Controller Capabilities (64-bit)
+    Vs = 0x08,    // Version
+    Intms = 0x0C, // Interrupt Mask Set
+    Intmc = 0x10, // Interrupt Mask Clear
+    Cc = 0x14,    // Controller Config
+    Csts = 0x1C,  // Controller Status
+    Aqa = 0x24,   // Admin Queue Attributes
+    Asq = 0x28,   // Admin Submission Queue Base Address (64-bit)
+    Acq = 0x30,   // Admin Completion Queue Base Address (64-bit)
 }
 
 const REG_CAP_LO: u64 = 0x00;
 const REG_CAP_HI: u64 = 0x04;
-const REG_VS:     u64 = 0x08;
-const REG_CC:     u64 = 0x14;
-const REG_CSTS:   u64 = 0x1C;
-const REG_AQA:    u64 = 0x24;
+const REG_VS: u64 = 0x08;
+const REG_CC: u64 = 0x14;
+const REG_CSTS: u64 = 0x1C;
+const REG_AQA: u64 = 0x24;
 const REG_ASQ_LO: u64 = 0x28;
 const REG_ASQ_HI: u64 = 0x2C;
 const REG_ACQ_LO: u64 = 0x30;
@@ -105,10 +109,10 @@ const REG_ACQ_HI: u64 = 0x34;
 const REG_DOORBELL_BASE: u64 = 0x1000;
 
 /// CC bits we set during bring-up.
-const CC_EN:        u32 = 1 << 0;
-const CC_CSS_NVM:   u32 = 0 << 4;
-const CC_MPS_4K:    u32 = 0 << 7;
-const CC_AMS_RR:    u32 = 0 << 11;
+const CC_EN: u32 = 1 << 0;
+const CC_CSS_NVM: u32 = 0 << 4;
+const CC_MPS_4K: u32 = 0 << 7;
+const CC_AMS_RR: u32 = 0 << 11;
 const CC_IOSQES_64: u32 = 6 << 16;
 const CC_IOCQES_16: u32 = 4 << 20;
 
@@ -120,13 +124,13 @@ const CSTS_CFS: u32 = 1 << 1;
 #[derive(Copy, Clone, Debug)]
 pub struct NvmeCaps {
     /// Maximum queue entries supported (CAP.MQES).
-    pub mqes:      u16,
+    pub mqes: u16,
     /// Doorbell-stride exponent (CAP.DSTRD).
-    pub dstrd:     u8,
+    pub dstrd: u8,
     /// Memory-page-size minimum (2^(12+MPSMIN)).
-    pub mpsmin:    u8,
+    pub mpsmin: u8,
     /// Memory-page-size maximum.
-    pub mpsmax:    u8,
+    pub mpsmax: u8,
 }
 
 impl NvmeCaps {
@@ -134,16 +138,18 @@ impl NvmeCaps {
     #[inline]
     pub const fn from_raw(r: u64) -> Self {
         Self {
-            mqes:    (r & 0xFFFF) as u16,
-            dstrd:   ((r >> 32) & 0xF) as u8,
-            mpsmin:  ((r >> 48) & 0xF) as u8,
-            mpsmax:  ((r >> 52) & 0xF) as u8,
+            mqes: (r & 0xFFFF) as u16,
+            dstrd: ((r >> 32) & 0xF) as u8,
+            mpsmin: ((r >> 48) & 0xF) as u8,
+            mpsmax: ((r >> 52) & 0xF) as u8,
         }
     }
 
     /// Required per-queue doorbell stride in bytes: `4 << DSTRD`.
     #[inline]
-    pub const fn doorbell_stride(&self) -> u64 { 4u64 << self.dstrd }
+    pub const fn doorbell_stride(&self) -> u64 {
+        4u64 << self.dstrd
+    }
 }
 
 // ── Opcodes (NVMe base spec §5 Admin + NVM Command Sets) ────────────
@@ -152,27 +158,27 @@ impl NvmeCaps {
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AdminOpcode {
-    DeleteSq            = 0x00,
-    CreateSq            = 0x01,
-    GetLogPage          = 0x02,
-    DeleteCq            = 0x04,
-    CreateCq            = 0x05,
-    Identify            = 0x06,
-    Abort               = 0x08,
-    SetFeatures         = 0x09,
-    GetFeatures         = 0x0A,
-    AsyncEventRequest   = 0x0C,
+    DeleteSq = 0x00,
+    CreateSq = 0x01,
+    GetLogPage = 0x02,
+    DeleteCq = 0x04,
+    CreateCq = 0x05,
+    Identify = 0x06,
+    Abort = 0x08,
+    SetFeatures = 0x09,
+    GetFeatures = 0x0A,
+    AsyncEventRequest = 0x0C,
 }
 
 #[non_exhaustive]
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum IoOpcode {
-    Flush       = 0x00,
-    Write       = 0x01,
-    Read        = 0x02,
+    Flush = 0x00,
+    Write = 0x01,
+    Read = 0x02,
     WriteZeroes = 0x08,
-    DatasetMgmt = 0x09,  // for TRIM
+    DatasetMgmt = 0x09, // for TRIM
 }
 
 // ── Submission Queue Entry (64 bytes) + Completion Queue Entry (16) ─
@@ -183,18 +189,18 @@ pub enum IoOpcode {
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct Sqe {
-    cdw0:   u32,    // opcode + fuse + cid
-    nsid:   u32,
-    _resv:  [u32; 2],
-    mptr:   u64,
-    prp1:   u64,
-    prp2:   u64,
-    cdw10:  u32,
-    cdw11:  u32,
-    cdw12:  u32,
-    cdw13:  u32,
-    cdw14:  u32,
-    cdw15:  u32,
+    cdw0: u32, // opcode + fuse + cid
+    nsid: u32,
+    _resv: [u32; 2],
+    mptr: u64,
+    prp1: u64,
+    prp2: u64,
+    cdw10: u32,
+    cdw11: u32,
+    cdw12: u32,
+    cdw13: u32,
+    cdw14: u32,
+    cdw15: u32,
 }
 
 const _: () = assert!(core::mem::size_of::<Sqe>() == 64);
@@ -202,9 +208,18 @@ const _: () = assert!(core::mem::size_of::<Sqe>() == 64);
 impl Sqe {
     const fn zero() -> Self {
         Self {
-            cdw0: 0, nsid: 0, _resv: [0, 0], mptr: 0,
-            prp1: 0, prp2: 0,
-            cdw10: 0, cdw11: 0, cdw12: 0, cdw13: 0, cdw14: 0, cdw15: 0,
+            cdw0: 0,
+            nsid: 0,
+            _resv: [0, 0],
+            mptr: 0,
+            prp1: 0,
+            prp2: 0,
+            cdw10: 0,
+            cdw11: 0,
+            cdw12: 0,
+            cdw13: 0,
+            cdw14: 0,
+            cdw15: 0,
         }
     }
 }
@@ -214,13 +229,13 @@ impl Sqe {
 #[derive(Copy, Clone, Debug)]
 struct Cqe {
     cmd_specific: u32,
-    _resv:        u32,
-    sq_head:      u16,
-    sq_id:        u16,
-    cid:          u16,
+    _resv: u32,
+    sq_head: u16,
+    sq_id: u16,
+    cid: u16,
     /// Bit 0 = phase tag; bits 1..15 = NVMe status field
     /// (`SCT << 8 | SC` plus `M` and `DNR` bits at the top).
-    status:       u16,
+    status: u16,
 }
 
 const _: () = assert!(core::mem::size_of::<Cqe>() == 16);
@@ -235,16 +250,16 @@ const ADMIN_Q_DEPTH: u16 = 4;
 
 /// I/O queue depth — same constraint (single 4 KiB DMA page each), in
 /// practice we keep it equal to the admin depth.
-const IO_Q_DEPTH:    u16 = 4;
+const IO_Q_DEPTH: u16 = 4;
 
 /// Default I/O queue id (NVMe reserves qid=0 for the admin queue;
 /// the first I/O queue is qid=1).
-const IO_QID:        u16 = 1;
+const IO_QID: u16 = 1;
 
 /// Hardcoded namespace id used for I/O. QEMU NVMe always exposes
 /// NSID=1 with the default settings; multi-namespace support is a
 /// follow-up.
-const DEFAULT_NSID:  u32 = 1;
+const DEFAULT_NSID: u32 = 1;
 
 /// NVMe controller handle.
 ///
@@ -257,33 +272,33 @@ const DEFAULT_NSID:  u32 = 1;
 ///   - **Live** (after `bring_up` completes): admin queue programmed,
 ///     IDENTIFY parsed.
 pub struct Controller {
-    pub bar0:     u64,
-    pub caps:     Option<NvmeCaps>,
+    pub bar0: u64,
+    pub caps: Option<NvmeCaps>,
     /// `Some` once the caller has handed us a real BusDevice;
     /// `bring_up` requires it.
-    device:       Option<BusDevice>,
+    device: Option<BusDevice>,
     /// Set after a successful `bring_up`. Holds the live admin-queue
     /// state so subsequent admin commands can reuse it.
-    admin:        Option<Queue>,
+    admin: Option<Queue>,
     /// Set after `create_io_queue` completes. Single I/O queue pair
     /// (qid=1) handles all read/write traffic — multi-queue lands
     /// once the executor is ready to schedule per-CPU completions.
-    io:           Option<Queue>,
+    io: Option<Queue>,
     /// Live BAR0 mapping post-bring-up. Stored so admin commands
     /// don't have to re-map (which writes to cfg-space).
-    bar0_region:  Option<MmioRegion>,
+    bar0_region: Option<MmioRegion>,
     /// Identify-controller response, copied out of the DMA buffer
     /// after the IDENTIFY admin command completes.
-    identify:     Option<IdentifyController>,
+    identify: Option<IdentifyController>,
     /// LBA size in bytes (typically 512 or 4096) — populated from
     /// IDENTIFY NAMESPACE during bring_up.
     pub lba_bytes: u32,
     /// Namespace capacity in LBAs (NSZE field of IDENTIFY NAMESPACE).
-    pub nsze:      u64,
+    pub nsze: u64,
     /// Live MSI-X table set up by `create_io_queue_msix`. The table
     /// stays alive (no `Drop` undoes the device-side enable) for the
     /// lifetime of the controller.
-    msix:          Option<MsixTable>,
+    msix: Option<MsixTable>,
     /// IDT vector allocated for I/O-queue completions, programmed
     /// into MSI-X table entry 0. Drivers `wait_for_irq(self.irq_vector
     /// .unwrap())` to await an I/O completion.
@@ -293,9 +308,9 @@ pub struct Controller {
 impl core::fmt::Debug for Controller {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Controller")
-            .field("bar0",     &format_args!("{:#x}", self.bar0))
-            .field("caps",     &self.caps)
-            .field("ready",    &self.admin.is_some())
+            .field("bar0", &format_args!("{:#x}", self.bar0))
+            .field("caps", &self.caps)
+            .field("ready", &self.admin.is_some())
             .field("identify", &self.identify)
             .finish()
     }
@@ -309,19 +324,19 @@ impl core::fmt::Debug for Controller {
 /// the controller.
 #[derive(Debug)]
 struct Queue {
-    sq_buf:     DmaBuffer,
-    cq_buf:     DmaBuffer,
-    qid:        u16,
-    depth:      u16,
-    sq_tail:    u16,
-    cq_head:    u16,
+    sq_buf: DmaBuffer,
+    cq_buf: DmaBuffer,
+    qid: u16,
+    depth: u16,
+    sq_tail: u16,
+    cq_head: u16,
     /// Phase tag we expect on the next CQ entry. Flips every time the
     /// CQ wraps.
-    cq_phase:   u16,
+    cq_phase: u16,
     /// Per-queue doorbell stride from CAP.DSTRD: `4 << DSTRD`.
-    db_stride:  u64,
+    db_stride: u64,
     /// Next command id to assign (monotonic, wraps at u16).
-    next_cid:   u16,
+    next_cid: u16,
 }
 
 impl Queue {
@@ -342,9 +357,7 @@ impl Queue {
     /// The DMA buffers `sq_buf` / `cq_buf` are still mapped and the
     /// controller is enabled. The caller owns the queue (no other
     /// task posting concurrently — Stage-3 single-threaded).
-    unsafe fn submit(&mut self, bar0: &MmioRegion, mut sqe: Sqe)
-        -> Result<Cqe, NvmeError>
-    {
+    unsafe fn submit(&mut self, bar0: &MmioRegion, mut sqe: Sqe) -> Result<Cqe, NvmeError> {
         let cid = self.next_cid;
         self.next_cid = self.next_cid.wrapping_add(1);
         // Preserve opcode (low 8 bits) + FUSE/PSDT (bits 8..15) and
@@ -352,18 +365,26 @@ impl Queue {
         sqe.cdw0 = (sqe.cdw0 & 0x0000_FFFF) | ((cid as u32) << 16);
 
         // SAFETY: queue is page-aligned; sq_tail < depth.
-        unsafe { write_sqe(&self.sq_buf, self.sq_tail, &sqe); }
+        unsafe {
+            write_sqe(&self.sq_buf, self.sq_tail, &sqe);
+        }
         self.sq_tail = (self.sq_tail + 1) % self.depth;
         // SAFETY: identity-mapped MMIO doorbell.
-        unsafe { bar0.write32(self.sq_db_off(), self.sq_tail as u32); }
+        unsafe {
+            bar0.write32(self.sq_db_off(), self.sq_tail as u32);
+        }
 
         // SAFETY: cq_buf is a live DMA page sized for self.depth CQEs.
         let cqe = unsafe { wait_cqe(&self.cq_buf, self.cq_head, self.cq_phase)? };
 
         self.cq_head = (self.cq_head + 1) % self.depth;
-        if self.cq_head == 0 { self.cq_phase ^= 1; }
+        if self.cq_head == 0 {
+            self.cq_phase ^= 1;
+        }
         // SAFETY: identity-mapped MMIO doorbell.
-        unsafe { bar0.write32(self.cq_db_off(), self.cq_head as u32); }
+        unsafe {
+            bar0.write32(self.cq_db_off(), self.cq_head as u32);
+        }
 
         let nvme_status = cqe.status >> 1;
         if nvme_status != 0 {
@@ -380,14 +401,14 @@ impl Queue {
 /// Layout per NVMe base spec §5.15.2.1.
 #[derive(Copy, Clone, Debug)]
 pub struct IdentifyController {
-    pub vid:    u16,
-    pub ssvid:  u16,
+    pub vid: u16,
+    pub ssvid: u16,
     /// Serial number, ASCII, 20 bytes, space-padded.
-    pub sn:     [u8; 20],
+    pub sn: [u8; 20],
     /// Model number, ASCII, 40 bytes, space-padded.
-    pub mn:     [u8; 40],
+    pub mn: [u8; 40],
     /// Firmware revision, ASCII, 8 bytes, space-padded.
-    pub fr:     [u8; 8],
+    pub fr: [u8; 8],
 }
 
 impl Controller {
@@ -420,20 +441,25 @@ impl Controller {
     }
 
     /// `true` once `bring_up` has completed.
-    pub fn is_ready(&self) -> bool { self.admin.is_some() }
+    pub fn is_ready(&self) -> bool {
+        self.admin.is_some()
+    }
 
     /// IDENTIFY CONTROLLER snapshot, populated by `bring_up`.
-    pub fn identify(&self) -> Option<&IdentifyController> { self.identify.as_ref() }
+    pub fn identify(&self) -> Option<&IdentifyController> {
+        self.identify.as_ref()
+    }
 
     /// Skeleton probe — returns `NotImplemented` when no `BusDevice`
     /// was supplied. Kept for backward compatibility with the
     /// pre-bring-up smoke; new callers go through `bring_up`.
-    pub fn probe(
-        &mut self,
-        _cap: &Cap<BusDeviceCap, Write>,
-    ) -> Result<(), NvmeError> {
-        if self.device.is_none() && self.bar0 == 0 { return Err(NvmeError::BadBar); }
-        if self.device.is_none() { return Err(NvmeError::NotImplemented); }
+    pub fn probe(&mut self, _cap: &Cap<BusDeviceCap, Write>) -> Result<(), NvmeError> {
+        if self.device.is_none() && self.bar0 == 0 {
+            return Err(NvmeError::BadBar);
+        }
+        if self.device.is_none() {
+            return Err(NvmeError::NotImplemented);
+        }
         Err(NvmeError::NotImplemented)
     }
 
@@ -449,10 +475,7 @@ impl Controller {
     /// 6. Wait CSTS.RDY = 1.
     /// 7. Issue IDENTIFY CONTROLLER, poll the CQ for completion,
     ///    parse the buffer.
-    pub fn bring_up(
-        &mut self,
-        cap: &Cap<BusDeviceCap, Write>,
-    ) -> Result<(), NvmeError> {
+    pub fn bring_up(&mut self, cap: &Cap<BusDeviceCap, Write>) -> Result<(), NvmeError> {
         let device = self.device.ok_or(NvmeError::BadBar)?;
 
         // ── 0. Flip on MEM_SPACE + BUS_MASTER in the cfg-space
@@ -464,16 +487,17 @@ impl Controller {
         // device doesn't try legacy IRQs in parallel with our
         // MSI-X programming.
         narf_bus::pci::set_command(
-            cap, &device,
+            cap,
+            &device,
             narf_bus::pci::cmd::MEM_SPACE
                 | narf_bus::pci::cmd::BUS_MASTER
                 | narf_bus::pci::cmd::INTX_DISABLE,
-        ).map_err(|_| NvmeError::BadBar)?;
+        )
+        .map_err(|_| NvmeError::BadBar)?;
 
         // ── 1. Map BAR0 + read CAP / VS ───────────────────────────
         // SAFETY: BSP, no other writer to this device's cfg window.
-        let bar0 = unsafe { map_bar(&device, 0) }
-            .map_err(|_| NvmeError::BadBar)?;
+        let bar0 = unsafe { map_bar(&device, 0) }.map_err(|_| NvmeError::BadBar)?;
         // SAFETY: BAR0 is identity-mapped MMIO; reads are 4-byte
         // aligned per the NVMe register layout.
         let cap_raw = unsafe {
@@ -485,7 +509,9 @@ impl Controller {
         // SAFETY: same window, aligned.
         let vs = unsafe { bar0.read32(REG_VS) };
         let major = (vs >> 16) as u16;
-        if major < 1 { return Err(NvmeError::UnsupportedVersion); }
+        if major < 1 {
+            return Err(NvmeError::UnsupportedVersion);
+        }
 
         self.bar0 = bar0.phys.raw();
         self.caps = Some(caps);
@@ -495,7 +521,9 @@ impl Controller {
         // SAFETY: CC is a normal RW register at a known offset.
         let cc = unsafe { bar0.read32(REG_CC) };
         // SAFETY: same window.
-        unsafe { bar0.write32(REG_CC, cc & !CC_EN); }
+        unsafe {
+            bar0.write32(REG_CC, cc & !CC_EN);
+        }
         // Poll CSTS.RDY = 0. CAP.TO is in 500ms units; QEMU NVMe is
         // ready almost instantly. We bound the wait at ~1M MMIO reads
         // (plenty of slack in QEMU; a real broken controller errors
@@ -516,13 +544,13 @@ impl Controller {
 
         // ── 4. Program AQA / ASQ / ACQ ────────────────────────────
         // AQA: bits[11:0] = ASQ size-1, bits[27:16] = ACQ size-1.
-        let aqa = ((ADMIN_Q_DEPTH as u32 - 1) & 0x0FFF)
-                | (((ADMIN_Q_DEPTH as u32 - 1) & 0x0FFF) << 16);
+        let aqa =
+            ((ADMIN_Q_DEPTH as u32 - 1) & 0x0FFF) | (((ADMIN_Q_DEPTH as u32 - 1) & 0x0FFF) << 16);
         // SAFETY: register writes against an identity-mapped MMIO
         // BAR while the controller is disabled — the documented
         // window for programming admin-queue base addresses.
         unsafe {
-            bar0.write32(REG_AQA,    aqa);
+            bar0.write32(REG_AQA, aqa);
             bar0.write32(REG_ASQ_LO, sq_phys as u32);
             bar0.write32(REG_ASQ_HI, (sq_phys >> 32) as u32);
             bar0.write32(REG_ACQ_LO, cq_phys as u32);
@@ -530,10 +558,11 @@ impl Controller {
         }
 
         // ── 5. Re-enable the controller ───────────────────────────
-        let cc = CC_EN | CC_CSS_NVM | CC_MPS_4K | CC_AMS_RR
-               | CC_IOSQES_64 | CC_IOCQES_16;
+        let cc = CC_EN | CC_CSS_NVM | CC_MPS_4K | CC_AMS_RR | CC_IOSQES_64 | CC_IOCQES_16;
         // SAFETY: same window.
-        unsafe { bar0.write32(REG_CC, cc); }
+        unsafe {
+            bar0.write32(REG_CC, cc);
+        }
 
         // ── 6. Wait for CSTS.RDY = 1 ──────────────────────────────
         wait_csts(&bar0, |s| (s & CSTS_RDY) != 0)?;
@@ -541,28 +570,29 @@ impl Controller {
         let mut admin = Queue {
             sq_buf,
             cq_buf,
-            qid:       0,
-            depth:     ADMIN_Q_DEPTH,
-            sq_tail:   0,
-            cq_head:   0,
-            cq_phase:  1,  // first valid CQE has phase = 1
+            qid: 0,
+            depth: ADMIN_Q_DEPTH,
+            sq_tail: 0,
+            cq_head: 0,
+            cq_phase: 1, // first valid CQE has phase = 1
             db_stride: caps.doorbell_stride(),
-            next_cid:  0,
+            next_cid: 0,
         };
 
         // ── 7. IDENTIFY CONTROLLER ────────────────────────────────
-        let id_buf = alloc_coherent(4096, DomainId::DRIVER_0)
-            .map_err(|_| NvmeError::OutOfDmaMemory)?;
+        let id_buf =
+            alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| NvmeError::OutOfDmaMemory)?;
         let mut sqe = Sqe::zero();
-        sqe.cdw0  = AdminOpcode::Identify as u32;
-        sqe.nsid  = 0;
-        sqe.prp1  = id_buf.phys_addr().raw();
-        sqe.cdw10 = 1;  // CNS = 1: Identify Controller
-        // SAFETY: queue is live; bar0 is identity-mapped MMIO.
+        sqe.cdw0 = AdminOpcode::Identify as u32;
+        sqe.nsid = 0;
+        sqe.prp1 = id_buf.phys_addr().raw();
+        sqe.cdw10 = 1; // CNS = 1: Identify Controller
+                       // SAFETY: queue is live; bar0 is identity-mapped MMIO.
         match unsafe { admin.submit(&bar0, sqe) } {
-            Ok(_)  => {}
-            Err(NvmeError::CommandFailed { status, .. })
-                   => return Err(NvmeError::IdentifyFailed { status }),
+            Ok(_) => {}
+            Err(NvmeError::CommandFailed { status, .. }) => {
+                return Err(NvmeError::IdentifyFailed { status })
+            }
             Err(e) => return Err(e),
         }
         // SAFETY: id_buf is a live, identity-mapped DMA page.
@@ -572,23 +602,23 @@ impl Controller {
         // ── 8. IDENTIFY NAMESPACE (NSID=1, CNS=0) ─────────────────
         // Pulls LBA size + namespace capacity. Required before we
         // can validate read/write LBA ranges or compute byte offsets.
-        let ns_buf = alloc_coherent(4096, DomainId::DRIVER_0)
-            .map_err(|_| NvmeError::OutOfDmaMemory)?;
+        let ns_buf =
+            alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| NvmeError::OutOfDmaMemory)?;
         let mut sqe = Sqe::zero();
-        sqe.cdw0  = AdminOpcode::Identify as u32;
-        sqe.nsid  = DEFAULT_NSID;
-        sqe.prp1  = ns_buf.phys_addr().raw();
-        sqe.cdw10 = 0;  // CNS = 0: Identify Namespace
-        // SAFETY: same queue + bar.
+        sqe.cdw0 = AdminOpcode::Identify as u32;
+        sqe.nsid = DEFAULT_NSID;
+        sqe.prp1 = ns_buf.phys_addr().raw();
+        sqe.cdw10 = 0; // CNS = 0: Identify Namespace
+                       // SAFETY: same queue + bar.
         let _ = unsafe { admin.submit(&bar0, sqe)? };
         // SAFETY: ns_buf is a live identity-mapped DMA page.
         let (nsze, lba_bytes) = unsafe { parse_identify_namespace(&ns_buf) };
         drop(ns_buf);
 
-        self.identify    = Some(id);
-        self.lba_bytes   = lba_bytes;
-        self.nsze        = nsze;
-        self.admin       = Some(admin);
+        self.identify = Some(id);
+        self.lba_bytes = lba_bytes;
+        self.nsze = nsze;
+        self.admin = Some(admin);
         self.bar0_region = Some(bar0);
         Ok(())
     }
@@ -601,7 +631,7 @@ impl Controller {
     /// new SQ/CQ phys addresses).
     pub fn create_io_queue(&mut self) -> Result<(), NvmeError> {
         let admin = self.admin.as_mut().ok_or(NvmeError::NotReady)?;
-        let bar0  = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
 
         // Allocate IOSQ + IOCQ DMA pages — same shape as admin.
         let sq_buf = alloc_coherent(64 * IO_Q_DEPTH as usize, DomainId::DRIVER_0)
@@ -618,36 +648,40 @@ impl Controller {
         //         enable) = 0 to suppress, bit 0 = PC (physically
         //         contiguous) = 1.
         let mut sqe = Sqe::zero();
-        sqe.cdw0  = AdminOpcode::CreateCq as u32;
-        sqe.prp1  = cq_phys;
+        sqe.cdw0 = AdminOpcode::CreateCq as u32;
+        sqe.prp1 = cq_phys;
         sqe.cdw10 = ((IO_Q_DEPTH as u32 - 1) << 16) | (IO_QID as u32);
-        sqe.cdw11 = 1;  // PC=1, IEN=0 (polling), IV=0
-        // SAFETY: queue + bar live; CQ buffer is fresh DMA.
-        unsafe { admin.submit(bar0, sqe)?; }
+        sqe.cdw11 = 1; // PC=1, IEN=0 (polling), IV=0
+                       // SAFETY: queue + bar live; CQ buffer is fresh DMA.
+        unsafe {
+            admin.submit(bar0, sqe)?;
+        }
 
         // Create I/O SQ (admin opcode 0x01).
         // CDW10: bits[31:16] = qsize-1, bits[15:0] = qid.
         // CDW11: bits[31:16] = CQID, bits[2:1] = QPRIO = 0 (urgent),
         //        bit 0 = PC = 1.
         let mut sqe = Sqe::zero();
-        sqe.cdw0  = AdminOpcode::CreateSq as u32;
-        sqe.prp1  = sq_phys;
+        sqe.cdw0 = AdminOpcode::CreateSq as u32;
+        sqe.prp1 = sq_phys;
         sqe.cdw10 = ((IO_Q_DEPTH as u32 - 1) << 16) | (IO_QID as u32);
         sqe.cdw11 = ((IO_QID as u32) << 16) | 1;
         // SAFETY: queue + bar live.
-        unsafe { admin.submit(bar0, sqe)?; }
+        unsafe {
+            admin.submit(bar0, sqe)?;
+        }
 
         // Stash the new IoQueue. Drop replaces any prior one.
         self.io = Some(Queue {
             sq_buf,
             cq_buf,
-            qid:       IO_QID,
-            depth:     IO_Q_DEPTH,
-            sq_tail:   0,
-            cq_head:   0,
-            cq_phase:  1,
+            qid: IO_QID,
+            depth: IO_Q_DEPTH,
+            sq_tail: 0,
+            cq_head: 0,
+            cq_phase: 1,
             db_stride: admin.db_stride,
-            next_cid:  0,
+            next_cid: 0,
         });
         Ok(())
     }
@@ -658,16 +692,12 @@ impl Controller {
     ///
     /// `n_blocks` is encoded zero-based on the wire (NLB = blocks-1);
     /// the function takes the human-readable count.
-    pub fn read_lba(&mut self, lba: u64, n_blocks: u16, buf: &DmaBuffer)
-        -> Result<(), NvmeError>
-    {
+    pub fn read_lba(&mut self, lba: u64, n_blocks: u16, buf: &DmaBuffer) -> Result<(), NvmeError> {
         self.nvm_io(IoOpcode::Read as u8, lba, n_blocks, buf)
     }
 
     /// Symmetric to `read_lba`: submit an NVM Write (`opcode = 0x01`).
-    pub fn write_lba(&mut self, lba: u64, n_blocks: u16, buf: &DmaBuffer)
-        -> Result<(), NvmeError>
-    {
+    pub fn write_lba(&mut self, lba: u64, n_blocks: u16, buf: &DmaBuffer) -> Result<(), NvmeError> {
         self.nvm_io(IoOpcode::Write as u8, lba, n_blocks, buf)
     }
 
@@ -688,12 +718,10 @@ impl Controller {
     ) -> Result<u8, NvmeError> {
         let device = self.device.ok_or(NvmeError::NotReady)?;
         // 1. Walk the cap list + sniff the MSI-X table size.
-        let mut msix = enable_msix(bus_dev_cap, &device)
-            .map_err(|_| NvmeError::Msix)?;
+        let mut msix = enable_msix(bus_dev_cap, &device).map_err(|_| NvmeError::Msix)?;
 
         // 2. Allocate IDT vector + MSI-X table slot 0.
-        let v = narf_interrupts::vector::alloc()
-            .map_err(|_| NvmeError::Msix)?;
+        let v = narf_interrupts::vector::alloc().map_err(|_| NvmeError::Msix)?;
         let _ = msix.alloc_vector().ok_or(NvmeError::Msix)?;
 
         // 3. Program MSI-X table entry 0 to deliver vector `v` to
@@ -702,13 +730,11 @@ impl Controller {
         // SAFETY: caller holds the BusDeviceCap; we own the MSI-X
         // table (no other writer); we issue this write before
         // enabling so the device can't fire stale data.
-        let _ = unsafe { msix.program_vector(0, 0, v) }
-            .map_err(|_| NvmeError::Msix)?;
+        let _ = unsafe { msix.program_vector(0, 0, v) }.map_err(|_| NvmeError::Msix)?;
 
         // 4. Flip the global MSI-X enable bit.
         // SAFETY: cfg-space write to a known cap-list offset.
-        let _ = unsafe { msix.enable() }
-            .map_err(|_| NvmeError::Msix)?;
+        let _ = unsafe { msix.enable() }.map_err(|_| NvmeError::Msix)?;
 
         self.msix = Some(msix);
         self.irq_vector = Some(v);
@@ -716,7 +742,7 @@ impl Controller {
         // 5. Allocate IOSQ + IOCQ DMA pages. Same shape as the
         //    polling create_io_queue, but with IEN=1 + IV=0 on the CQ.
         let admin = self.admin.as_mut().ok_or(NvmeError::NotReady)?;
-        let bar0  = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
         let sq_buf = alloc_coherent(64 * IO_Q_DEPTH as usize, DomainId::DRIVER_0)
             .map_err(|_| NvmeError::OutOfDmaMemory)?;
         let cq_buf = alloc_coherent(16 * IO_Q_DEPTH as usize, DomainId::DRIVER_0)
@@ -726,32 +752,36 @@ impl Controller {
 
         // Create I/O CQ: PC=1, IEN=1, IV=0.
         let mut sqe = Sqe::zero();
-        sqe.cdw0  = AdminOpcode::CreateCq as u32;
-        sqe.prp1  = cq_phys;
+        sqe.cdw0 = AdminOpcode::CreateCq as u32;
+        sqe.prp1 = cq_phys;
         sqe.cdw10 = ((IO_Q_DEPTH as u32 - 1) << 16) | (IO_QID as u32);
-        sqe.cdw11 = (0u32 << 16) | (1 << 1) | 1;  // IV=0, IEN=1, PC=1
-        // SAFETY: queue + bar live; CQ DMA fresh.
-        unsafe { admin.submit(bar0, sqe)?; }
+        sqe.cdw11 = (0u32 << 16) | (1 << 1) | 1; // IV=0, IEN=1, PC=1
+                                                 // SAFETY: queue + bar live; CQ DMA fresh.
+        unsafe {
+            admin.submit(bar0, sqe)?;
+        }
 
         // Create I/O SQ: PC=1, CQID=IO_QID, QPRIO=0.
         let mut sqe = Sqe::zero();
-        sqe.cdw0  = AdminOpcode::CreateSq as u32;
-        sqe.prp1  = sq_phys;
+        sqe.cdw0 = AdminOpcode::CreateSq as u32;
+        sqe.prp1 = sq_phys;
         sqe.cdw10 = ((IO_Q_DEPTH as u32 - 1) << 16) | (IO_QID as u32);
         sqe.cdw11 = ((IO_QID as u32) << 16) | 1;
         // SAFETY: queue + bar live.
-        unsafe { admin.submit(bar0, sqe)?; }
+        unsafe {
+            admin.submit(bar0, sqe)?;
+        }
 
         self.io = Some(Queue {
             sq_buf,
             cq_buf,
-            qid:       IO_QID,
-            depth:     IO_Q_DEPTH,
-            sq_tail:   0,
-            cq_head:   0,
-            cq_phase:  1,
+            qid: IO_QID,
+            depth: IO_Q_DEPTH,
+            sq_tail: 0,
+            cq_head: 0,
+            cq_phase: 1,
             db_stride: admin.db_stride,
-            next_cid:  0,
+            next_cid: 0,
         });
 
         Ok(v)
@@ -773,9 +803,11 @@ impl Controller {
         buf: &DmaBuffer,
     ) -> Result<(), NvmeError> {
         let v = self.irq_vector.ok_or(NvmeError::Msix)?;
-        let io   = self.io.as_mut().ok_or(NvmeError::NoIoQueue)?;
+        let io = self.io.as_mut().ok_or(NvmeError::NoIoQueue)?;
         let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
-        if n_blocks == 0 { return Ok(()); }
+        if n_blocks == 0 {
+            return Ok(());
+        }
         if self.nsze != 0 && lba.saturating_add(n_blocks as u64) > self.nsze {
             return Err(NvmeError::OutOfRange);
         }
@@ -783,9 +815,9 @@ impl Controller {
         let baseline = narf_interrupts::fire_count(v);
 
         let mut sqe = Sqe::zero();
-        sqe.cdw0  = opcode as u32;
-        sqe.nsid  = DEFAULT_NSID;
-        sqe.prp1  = buf.phys_addr().raw();
+        sqe.cdw0 = opcode as u32;
+        sqe.nsid = DEFAULT_NSID;
+        sqe.prp1 = buf.phys_addr().raw();
         sqe.cdw10 = (lba & 0xFFFF_FFFF) as u32;
         sqe.cdw11 = (lba >> 32) as u32;
         sqe.cdw12 = (n_blocks - 1) as u32;
@@ -795,10 +827,14 @@ impl Controller {
         io.next_cid = io.next_cid.wrapping_add(1);
         sqe.cdw0 = (sqe.cdw0 & 0x0000_FFFF) | ((cid as u32) << 16);
         // SAFETY: queue is page-aligned; sq_tail bounded.
-        unsafe { write_sqe(&io.sq_buf, io.sq_tail, &sqe); }
+        unsafe {
+            write_sqe(&io.sq_buf, io.sq_tail, &sqe);
+        }
         io.sq_tail = (io.sq_tail + 1) % io.depth;
         // SAFETY: identity-mapped MMIO doorbell.
-        unsafe { bar0.write32(io.sq_db_off(), io.sq_tail as u32); }
+        unsafe {
+            bar0.write32(io.sq_db_off(), io.sq_tail as u32);
+        }
 
         // Wait for MSI-X delivery — the dispatch table's fire_count
         // bumps from the ISR. As a defensive belt-and-braces check
@@ -807,12 +843,18 @@ impl Controller {
         // hot reset paths).
         let mut spins = 0u32;
         loop {
-            if narf_interrupts::fire_count(v) > baseline { break; }
+            if narf_interrupts::fire_count(v) > baseline {
+                break;
+            }
             // SAFETY: cq_buf is a live identity-mapped DMA page.
             let cqe = unsafe { peek_cqe(&io.cq_buf, io.cq_head) };
-            if (cqe.status & 1) == (io.cq_phase & 1) { break; }
+            if (cqe.status & 1) == (io.cq_phase & 1) {
+                break;
+            }
             spins += 1;
-            if spins > 10_000_000 { return Err(NvmeError::CompletionTimeout); }
+            if spins > 10_000_000 {
+                return Err(NvmeError::CompletionTimeout);
+            }
             core::hint::spin_loop();
         }
 
@@ -820,40 +862,53 @@ impl Controller {
         // SAFETY: same buffer.
         let cqe = unsafe { peek_cqe(&io.cq_buf, io.cq_head) };
         io.cq_head = (io.cq_head + 1) % io.depth;
-        if io.cq_head == 0 { io.cq_phase ^= 1; }
+        if io.cq_head == 0 {
+            io.cq_phase ^= 1;
+        }
         // SAFETY: identity-mapped MMIO doorbell.
-        unsafe { bar0.write32(io.cq_db_off(), io.cq_head as u32); }
+        unsafe {
+            bar0.write32(io.cq_db_off(), io.cq_head as u32);
+        }
 
         let nvme_status = cqe.status >> 1;
         if nvme_status != 0 {
-            return Err(NvmeError::CommandFailed { cmd: opcode, status: nvme_status });
+            return Err(NvmeError::CommandFailed {
+                cmd: opcode,
+                status: nvme_status,
+            });
         }
         Ok(())
     }
 
-    fn nvm_io(&mut self, opcode: u8, lba: u64, n_blocks: u16, buf: &DmaBuffer)
-        -> Result<(), NvmeError>
-    {
-        let io   = self.io.as_mut().ok_or(NvmeError::NoIoQueue)?;
+    fn nvm_io(
+        &mut self,
+        opcode: u8,
+        lba: u64,
+        n_blocks: u16,
+        buf: &DmaBuffer,
+    ) -> Result<(), NvmeError> {
+        let io = self.io.as_mut().ok_or(NvmeError::NoIoQueue)?;
         let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
-        if n_blocks == 0 { return Ok(()); }
+        if n_blocks == 0 {
+            return Ok(());
+        }
         // Range check against the namespace's reported capacity.
-        if self.nsze != 0
-            && lba.saturating_add(n_blocks as u64) > self.nsze
-        {
+        if self.nsze != 0 && lba.saturating_add(n_blocks as u64) > self.nsze {
             return Err(NvmeError::OutOfRange);
         }
         let mut sqe = Sqe::zero();
-        sqe.cdw0  = opcode as u32;
-        sqe.nsid  = DEFAULT_NSID;
-        sqe.prp1  = buf.phys_addr().raw();
+        sqe.cdw0 = opcode as u32;
+        sqe.nsid = DEFAULT_NSID;
+        sqe.prp1 = buf.phys_addr().raw();
         // CDW10/11 = SLBA (64-bit, little-endian split).
         sqe.cdw10 = (lba & 0xFFFF_FFFF) as u32;
         sqe.cdw11 = (lba >> 32) as u32;
         // CDW12 bits[15:0] = NLB-1; flags (LR/FUA/PRINFO) zero.
         sqe.cdw12 = (n_blocks - 1) as u32;
         // SAFETY: io queue + bar are live; buf is identity-mapped DMA.
-        unsafe { io.submit(bar0, sqe)?; }
+        unsafe {
+            io.submit(bar0, sqe)?;
+        }
         Ok(())
     }
 }
@@ -867,8 +922,12 @@ fn wait_csts<F: Fn(u32) -> bool>(bar: &MmioRegion, ok: F) -> Result<(), NvmeErro
     for _ in 0..1_000_000u32 {
         // SAFETY: identity-mapped MMIO, naturally aligned.
         let s = unsafe { bar.read32(REG_CSTS) };
-        if (s & CSTS_CFS) != 0 { return Err(NvmeError::ControllerFatal); }
-        if ok(s) { return Ok(()); }
+        if (s & CSTS_CFS) != 0 {
+            return Err(NvmeError::ControllerFatal);
+        }
+        if ok(s) {
+            return Ok(());
+        }
         core::hint::spin_loop();
     }
     Err(NvmeError::ControllerFailed)
@@ -883,7 +942,9 @@ unsafe fn write_sqe(buf: &DmaBuffer, index: u16, sqe: &Sqe) {
     let base = buf.phys_addr().raw() as *mut Sqe;
     // SAFETY: caller guarantees buf is page-aligned and large
     // enough; index is bounded.
-    unsafe { core::ptr::write_volatile(base.add(index as usize), *sqe); }
+    unsafe {
+        core::ptr::write_volatile(base.add(index as usize), *sqe);
+    }
 }
 
 /// Read the CQ entry at `index` without polling. Used by the
@@ -904,9 +965,7 @@ unsafe fn peek_cqe(buf: &DmaBuffer, index: u16) -> Cqe {
 /// # Safety
 /// `buf` must be a live coherent DMA buffer sized for
 /// `ADMIN_Q_DEPTH * 16` bytes; `index < ADMIN_Q_DEPTH`.
-unsafe fn wait_cqe(buf: &DmaBuffer, index: u16, expected_phase: u16)
-    -> Result<Cqe, NvmeError>
-{
+unsafe fn wait_cqe(buf: &DmaBuffer, index: u16, expected_phase: u16) -> Result<Cqe, NvmeError> {
     let base = buf.phys_addr().raw() as *const Cqe;
     for _ in 0..10_000_000u32 {
         // SAFETY: caller guarantees buf is page-aligned and large
@@ -941,11 +1000,11 @@ unsafe fn parse_identify(buf: &DmaBuffer) -> IdentifyController {
     let mut sn = [0u8; 20];
     let mut mn = [0u8; 40];
     let mut fr = [0u8; 8];
-    read_arr(4,   &mut sn);  // bytes 4..23   = SN
-    read_arr(24,  &mut mn);  // bytes 24..63  = MN
-    read_arr(64,  &mut fr);  // bytes 64..71  = FR
+    read_arr(4, &mut sn); // bytes 4..23   = SN
+    read_arr(24, &mut mn); // bytes 24..63  = MN
+    read_arr(64, &mut fr); // bytes 64..71  = FR
     IdentifyController {
-        vid:   read_u16(0),
+        vid: read_u16(0),
         ssvid: read_u16(2),
         sn,
         mn,
@@ -986,28 +1045,41 @@ unsafe fn parse_identify_namespace(buf: &DmaBuffer) -> (u64, u32) {
 pub struct NvmeBlockDevice(pub Controller);
 
 impl BlockDevice for NvmeBlockDevice {
-    fn logical_block_size(&self)  -> u32 { 512 }
-    fn physical_block_size(&self) -> u32 { 4096 }
-    fn capacity_blocks(&self)     -> u64 { 0 }
+    fn logical_block_size(&self) -> u32 {
+        512
+    }
+    fn physical_block_size(&self) -> u32 {
+        4096
+    }
+    fn capacity_blocks(&self) -> u64 {
+        0
+    }
     fn supports(&self, f: BlockFeature) -> bool {
-        matches!(f, BlockFeature::Flush | BlockFeature::WriteZeroes
-                  | BlockFeature::Discard | BlockFeature::Fua)
+        matches!(
+            f,
+            BlockFeature::Flush
+                | BlockFeature::WriteZeroes
+                | BlockFeature::Discard
+                | BlockFeature::Fua
+        )
     }
 
-    fn submit(&self, req: BlockRequest)
-        -> impl Future<Output = BlockCompletion>
-    {
+    fn submit(&self, req: BlockRequest) -> impl Future<Output = BlockCompletion> {
         async move {
             BlockCompletion {
-                tag:      0,
+                tag: 0,
                 user_tag: req.user_tag,
-                result:   Err(BlockError::DeviceRemoved),
+                result: Err(BlockError::DeviceRemoved),
             }
         }
     }
-    fn flush(&self)                    -> impl Future<Output = ()> { async {} }
-    fn discard(&self, _r: LbaRange)    -> impl Future<Output = ()> { async {} }
-    fn cancel(&self, _tag: u64)        -> impl Future<Output = CancelResult> {
+    fn flush(&self) -> impl Future<Output = ()> {
+        async {}
+    }
+    fn discard(&self, _r: LbaRange) -> impl Future<Output = ()> {
+        async {}
+    }
+    fn cancel(&self, _tag: u64) -> impl Future<Output = CancelResult> {
         async { CancelResult::NotFound }
     }
 }
@@ -1027,7 +1099,7 @@ pub const QEMU_NVME_DEVICE: u16 = 0x0010;
 /// xtask-level match update for each new SKU.
 pub const SAMSUNG_VENDOR: u16 = 0x144D;
 /// PM9A1 / PM9A3 / 980 PRO — the modern Samsung NVMe family.
-pub const SAMSUNG_PM9A1:  u16 = 0xA80A;
+pub const SAMSUNG_PM9A1: u16 = 0xA80A;
 /// 970 EVO / EVO Plus.
 pub const SAMSUNG_970EVO: u16 = 0xA808;
 /// 990 PRO.
@@ -1038,15 +1110,14 @@ pub const SAMSUNG_990PRO: u16 = 0xA80C;
 /// controllers whose vendor IDs we don't know ahead of time.
 pub const PCI_CLASS_STORAGE: u8 = 0x01;
 /// PCI subclass for NVM Express (§13.4 PCI Local Bus 3.0).
-pub const PCI_SUBCLASS_NVM:  u8 = 0x08;
+pub const PCI_SUBCLASS_NVM: u8 = 0x08;
 /// PCI prog-if for NVMe (vs. AHCI / SATA / etc).
-pub const PCI_PROGIF_NVME:   u8 = 0x02;
+pub const PCI_PROGIF_NVME: u8 = 0x02;
 
 /// Slot for the live controller produced by `probe`. Wave-3a
 /// single-instance — multi-controller support arrives with a real
 /// driver-handle table.
-static CONTROLLER: IrqSafeSpinLock<Option<Controller>> =
-    IrqSafeSpinLock::new(None);
+static CONTROLLER: IrqSafeSpinLock<Option<Controller>> = IrqSafeSpinLock::new(None);
 
 // ── BlockDeviceSync adapter (registry/lib.rs) ─────────────────────────
 
@@ -1064,9 +1135,12 @@ impl narf_block::BlockDeviceSync for NvmeBlockSync {
     fn capacity(&self) -> u64 {
         with_controller(|c| c.nsze).unwrap_or(0)
     }
-    fn read(&self, lba: u64, n_blocks: u16, out: &mut [u8])
-        -> Result<(), narf_block::BlockIoError>
-    {
+    fn read(
+        &self,
+        lba: u64,
+        n_blocks: u16,
+        out: &mut [u8],
+    ) -> Result<(), narf_block::BlockIoError> {
         let need = (n_blocks as usize) * 512;
         if out.len() < need {
             return Err(narf_block::BlockIoError::BufferTooSmall);
@@ -1088,16 +1162,12 @@ impl narf_block::BlockDeviceSync for NvmeBlockSync {
             .map_err(|_| narf_block::BlockIoError::DriverError)?;
         // SAFETY: identity-mapped DMA buffer.
         for i in 0..need {
-            out[i] = unsafe {
-                core::ptr::read_volatile((phys + i as u64) as *const u8)
-            };
+            out[i] = unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) };
         }
         let _ = buf;
         Ok(())
     }
-    fn write(&self, lba: u64, n_blocks: u16, data: &[u8])
-        -> Result<(), narf_block::BlockIoError>
-    {
+    fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), narf_block::BlockIoError> {
         let need = (n_blocks as usize) * 512;
         if data.len() < need {
             return Err(narf_block::BlockIoError::BufferTooSmall);
@@ -1139,7 +1209,7 @@ impl narf_block::BlockDeviceSync for NvmeBlockSync {
 /// hot-plug, this guard goes away.
 pub fn probe(
     device: narf_bus::BusDevice,
-    cap:    narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+    cap: narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
 ) -> Result<(), narf_bus::ProbeError> {
     // The class-match backstop catches every PCI mass-storage
     // device. Reject non-NVMe (subclass != 0x08 or prog_if !=
@@ -1148,19 +1218,19 @@ pub fn probe(
     // arrived via an explicit VendorDevice match (vid/did are
     // pre-validated): if class==0x00 the device didn't report a
     // standard class triple and we trust the explicit match.
-    let class    = ((device.id.class >> 16) & 0xFF) as u8;
-    let subclass = ((device.id.class >>  8) & 0xFF) as u8;
-    let prog_if  =  (device.id.class        & 0xFF) as u8;
-    if class == PCI_CLASS_STORAGE
-        && (subclass != PCI_SUBCLASS_NVM || prog_if != PCI_PROGIF_NVME)
-    {
+    let class = ((device.id.class >> 16) & 0xFF) as u8;
+    let subclass = ((device.id.class >> 8) & 0xFF) as u8;
+    let prog_if = (device.id.class & 0xFF) as u8;
+    if class == PCI_CLASS_STORAGE && (subclass != PCI_SUBCLASS_NVM || prog_if != PCI_PROGIF_NVME) {
         return Err(narf_bus::ProbeError::BadDevice);
     }
     if CONTROLLER.lock().is_some() {
         // Already brought up — make sure the param slot still has
         // something installed (test harness may have cleared it).
         if !PARAMS.is_installed() {
-            PARAMS.install(NvmeParams { log_level: LogLevel::Info });
+            PARAMS.install(NvmeParams {
+                log_level: LogLevel::Info,
+            });
         }
         return Ok(());
     }
@@ -1174,18 +1244,22 @@ pub fn probe(
     *CONTROLLER.lock() = Some(ctrl);
     // Install the typed parameter surface so observers + tuners can
     // reach the driver via `Cap<DriverHandle, Write>`.
-    PARAMS.install(NvmeParams { log_level: LogLevel::Info });
+    PARAMS.install(NvmeParams {
+        log_level: LogLevel::Info,
+    });
     // Register against the unified block-device registry so the
     // kernel can address NVMe uniformly with other storage drivers.
-    narf_block::register_block_device("nvme0",
-        alloc::sync::Arc::new(NvmeBlockSync) as alloc::sync::Arc<dyn narf_block::BlockDeviceSync>);
+    narf_block::register_block_device(
+        "nvme0",
+        alloc::sync::Arc::new(NvmeBlockSync) as alloc::sync::Arc<dyn narf_block::BlockDeviceSync>,
+    );
     // Record the bind in the framework's bound-driver inventory.
     narf_drivers::record_bound(narf_drivers::BoundDriver {
-        name:    alloc::string::String::from("nvme0"),
-        kind:    narf_drivers::BoundKind::Block,
+        name: alloc::string::String::from("nvme0"),
+        kind: narf_drivers::BoundKind::Block,
         pci_vid: Some(device.id.vendor),
         pci_did: Some(device.id.device),
-        domain:  narf_drivers::BoundKind::Block.default_domain(),
+        domain: narf_drivers::BoundKind::Block.default_domain(),
     });
     Ok(())
 }
@@ -1217,18 +1291,24 @@ pub fn with_controller<R>(f: impl FnOnce(&Controller) -> R) -> Option<R> {
 /// `Off / Error / Warn / Info / Debug` ladder. Persisted in
 /// `NvmeParams::log_level`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum LogLevel { Off, Error, Warn, Info, Debug }
+pub enum LogLevel {
+    Off,
+    Error,
+    Warn,
+    Info,
+    Debug,
+}
 
 /// Read-side snapshot. Cap-gated read returns a copy of these fields
 /// taken under the param slot's lock.
 #[derive(Copy, Clone, Debug)]
 pub struct NvmeSnapshot {
-    pub bar0:        u64,
-    pub lba_bytes:   u32,
-    pub nsze:        u64,
-    pub io_q_depth:  u16,
-    pub irq_vector:  Option<u8>,
-    pub log_level:   LogLevel,
+    pub bar0: u64,
+    pub lba_bytes: u32,
+    pub nsze: u64,
+    pub io_q_depth: u16,
+    pub irq_vector: Option<u8>,
+    pub log_level: LogLevel,
     pub identify_vid: u16,
 }
 
@@ -1250,7 +1330,7 @@ pub struct NvmeParams {
 
 impl narf_drivers::DriverParams for NvmeParams {
     type Snapshot = NvmeSnapshot;
-    type Update   = NvmeUpdate;
+    type Update = NvmeUpdate;
 
     fn snapshot(&self) -> NvmeSnapshot {
         // Pull controller-side fields from the live Controller, if
@@ -1274,22 +1354,24 @@ impl narf_drivers::DriverParams for NvmeParams {
             nsze,
             io_q_depth: IO_Q_DEPTH,
             irq_vector: irq,
-            log_level:  self.log_level,
+            log_level: self.log_level,
             identify_vid: vid,
         }
     }
 
     fn apply(&mut self, u: NvmeUpdate) -> Result<(), narf_drivers::ParamError> {
         match u {
-            NvmeUpdate::SetLogLevel(l) => { self.log_level = l; Ok(()) }
+            NvmeUpdate::SetLogLevel(l) => {
+                self.log_level = l;
+                Ok(())
+            }
         }
     }
 }
 
 /// Per-driver param slot. Drivers expose a `Cap<DriverHandle, Write>`-
 /// gated read/write surface through this static.
-pub static PARAMS: narf_drivers::ParamSlot<NvmeParams> =
-    narf_drivers::ParamSlot::new();
+pub static PARAMS: narf_drivers::ParamSlot<NvmeParams> = narf_drivers::ParamSlot::new();
 
 /// Register the NVMe driver with the bus-level match table. Trusted
 /// in-tree drivers call this from `frame::_start_rust` (or the
@@ -1304,16 +1386,17 @@ pub static PARAMS: narf_drivers::ParamSlot<NvmeParams> =
 ///   so only true NVMe (`01:08:02`) silicon gets driven.
 pub fn register_pci_driver() {
     let exact: &[(&'static str, u16, u16)] = &[
-        ("nvme-qemu",         QEMU_NVME_VENDOR, QEMU_NVME_DEVICE),
-        ("nvme-samsung-pm9a1", SAMSUNG_VENDOR,  SAMSUNG_PM9A1),
-        ("nvme-samsung-970",   SAMSUNG_VENDOR,  SAMSUNG_970EVO),
-        ("nvme-samsung-990",   SAMSUNG_VENDOR,  SAMSUNG_990PRO),
+        ("nvme-qemu", QEMU_NVME_VENDOR, QEMU_NVME_DEVICE),
+        ("nvme-samsung-pm9a1", SAMSUNG_VENDOR, SAMSUNG_PM9A1),
+        ("nvme-samsung-970", SAMSUNG_VENDOR, SAMSUNG_970EVO),
+        ("nvme-samsung-990", SAMSUNG_VENDOR, SAMSUNG_990PRO),
     ];
     for (name, v, d) in exact.iter().copied() {
         narf_bus::register_pci_driver(narf_bus::PciMatch {
             name,
             kind: narf_bus::MatchKind::VendorDevice {
-                vendor: v, device: d,
+                vendor: v,
+                device: d,
             },
             probe,
         });
@@ -1323,7 +1406,8 @@ pub fn register_pci_driver() {
     narf_bus::register_pci_driver(narf_bus::PciMatch {
         name: "nvme-class",
         kind: narf_bus::MatchKind::Class {
-            class: PCI_CLASS_STORAGE, mask: 0xFF,
+            class: PCI_CLASS_STORAGE,
+            mask: 0xFF,
         },
         probe,
     });

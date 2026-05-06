@@ -22,7 +22,7 @@ pub const fn word_count(bits: usize) -> usize {
 #[derive(Clone)]
 pub struct Bitmap<const N: usize>
 where
-    [(); word_count(N)]:,       // const generic arithmetic; requires generic_const_exprs
+    [(); word_count(N)]:, // const generic arithmetic; requires generic_const_exprs
 {
     words: [usize; word_count(N)],
 }
@@ -33,12 +33,16 @@ where
 {
     /// New empty bitmap (all bits clear).
     pub const fn new() -> Self {
-        Self { words: [0; word_count(N)] }
+        Self {
+            words: [0; word_count(N)],
+        }
     }
 
     /// New bitmap with all bits set.
     pub const fn new_full() -> Self {
-        let mut b = Self { words: [usize::MAX; word_count(N)] };
+        let mut b = Self {
+            words: [usize::MAX; word_count(N)],
+        };
         // Mask trailing bits above N in the final word.
         let tail_bits = N % WORD_BITS;
         if tail_bits != 0 && word_count(N) > 0 {
@@ -49,12 +53,16 @@ where
     }
 
     /// Capacity in bits.
-    pub const fn capacity() -> usize { N }
+    pub const fn capacity() -> usize {
+        N
+    }
 
     /// Test whether bit `i` is set. Returns `false` for out-of-range.
     #[inline]
     pub fn get(&self, i: usize) -> bool {
-        if i >= N { return false; }
+        if i >= N {
+            return false;
+        }
         let (w, b) = (i / WORD_BITS, i % WORD_BITS);
         (self.words[w] >> b) & 1 == 1
     }
@@ -63,7 +71,9 @@ where
     #[inline]
     pub fn set(&mut self, i: usize) {
         debug_assert!(i < N, "Bitmap::set index out of range");
-        if i >= N { return; }
+        if i >= N {
+            return;
+        }
         let (w, b) = (i / WORD_BITS, i % WORD_BITS);
         self.words[w] |= 1 << b;
     }
@@ -72,7 +82,9 @@ where
     #[inline]
     pub fn clear(&mut self, i: usize) {
         debug_assert!(i < N, "Bitmap::clear index out of range");
-        if i >= N { return; }
+        if i >= N {
+            return;
+        }
         let (w, b) = (i / WORD_BITS, i % WORD_BITS);
         self.words[w] &= !(1 << b);
     }
@@ -81,7 +93,9 @@ where
     #[inline]
     pub fn toggle(&mut self, i: usize) -> bool {
         debug_assert!(i < N, "Bitmap::toggle index out of range");
-        if i >= N { return false; }
+        if i >= N {
+            return false;
+        }
         let (w, b) = (i / WORD_BITS, i % WORD_BITS);
         let prev = (self.words[w] >> b) & 1 == 1;
         self.words[w] ^= 1 << b;
@@ -94,7 +108,9 @@ where
             if w != 0 {
                 let bit = w.trailing_zeros() as usize;
                 let idx = wi * WORD_BITS + bit;
-                if idx < N { return Some(idx); }
+                if idx < N {
+                    return Some(idx);
+                }
             }
         }
         None
@@ -106,7 +122,9 @@ where
             if w != usize::MAX {
                 let bit = (!w).trailing_zeros() as usize;
                 let idx = wi * WORD_BITS + bit;
-                if idx < N { return Some(idx); }
+                if idx < N {
+                    return Some(idx);
+                }
             }
         }
         None
@@ -122,7 +140,11 @@ where
     where
         [(); word_count(N)]:,
     {
-        IterSet { bitmap: self, word_idx: 0, word: self.words.first().copied().unwrap_or(0) }
+        IterSet {
+            bitmap: self,
+            word_idx: 0,
+            word: self.words.first().copied().unwrap_or(0),
+        }
     }
 }
 
@@ -130,7 +152,9 @@ impl<const N: usize> Default for Bitmap<N>
 where
     [(); word_count(N)]:,
 {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<const N: usize> fmt::Debug for Bitmap<N>
@@ -150,9 +174,9 @@ pub struct IterSet<'a, const N: usize>
 where
     [(); word_count(N)]:,
 {
-    bitmap:   &'a Bitmap<N>,
+    bitmap: &'a Bitmap<N>,
     word_idx: usize,
-    word:     usize,
+    word: usize,
 }
 
 impl<const N: usize> Iterator for IterSet<'_, N>
@@ -165,12 +189,18 @@ where
         loop {
             if self.word != 0 {
                 let bit = self.word.trailing_zeros() as usize;
-                self.word &= self.word - 1;                 // clear low bit
+                self.word &= self.word - 1; // clear low bit
                 let idx = self.word_idx * WORD_BITS + bit;
-                if idx < N { return Some(idx); } else { return None; }
+                if idx < N {
+                    return Some(idx);
+                } else {
+                    return None;
+                }
             }
             self.word_idx += 1;
-            if self.word_idx >= word_count(N) { return None; }
+            if self.word_idx >= word_count(N) {
+                return None;
+            }
             self.word = self.bitmap.words[self.word_idx];
         }
     }
@@ -200,8 +230,12 @@ mod tests {
     #[test]
     fn set_get_clear() {
         let mut b: Bitmap<128> = Bitmap::new();
-        b.set(0); b.set(64); b.set(127);
-        assert!(b.get(0)); assert!(b.get(64)); assert!(b.get(127));
+        b.set(0);
+        b.set(64);
+        b.set(127);
+        assert!(b.get(0));
+        assert!(b.get(64));
+        assert!(b.get(127));
         assert!(!b.get(1));
         assert_eq!(b.count_ones(), 3);
         assert_eq!(b.first_set(), Some(0));
@@ -212,7 +246,10 @@ mod tests {
     #[test]
     fn iter_set_yields_in_order() {
         let mut b: Bitmap<70> = Bitmap::new();
-        b.set(3); b.set(5); b.set(64); b.set(69);
+        b.set(3);
+        b.set(5);
+        b.set(64);
+        b.set(69);
         let v: heapless_vec::Vec = b.iter_set().collect();
         assert_eq!(v.as_slice(), &[3, 5, 64, 69]);
     }
@@ -220,8 +257,10 @@ mod tests {
     #[test]
     fn full_bitmap_wraps_trailing_bits() {
         let b: Bitmap<3> = Bitmap::new_full();
-        assert!(b.get(0)); assert!(b.get(1)); assert!(b.get(2));
-        assert!(!b.get(3));   // out of range
+        assert!(b.get(0));
+        assert!(b.get(1));
+        assert!(b.get(2));
+        assert!(!b.get(3)); // out of range
         assert_eq!(b.count_ones(), 3);
         assert_eq!(b.first_clear(), None);
     }
@@ -229,14 +268,26 @@ mod tests {
     /// Minimal in-module test Vec to avoid dragging in `alloc` for unit tests.
     /// (real callers use `alloc` or an intrusive iterator consumer.)
     mod heapless_vec {
-        pub struct Vec { buf: [usize; 16], len: usize }
+        pub struct Vec {
+            buf: [usize; 16],
+            len: usize,
+        }
         impl Vec {
-            pub fn as_slice(&self) -> &[usize] { &self.buf[..self.len] }
+            pub fn as_slice(&self) -> &[usize] {
+                &self.buf[..self.len]
+            }
         }
         impl FromIterator<usize> for Vec {
             fn from_iter<I: IntoIterator<Item = usize>>(iter: I) -> Self {
-                let mut v = Vec { buf: [0; 16], len: 0 };
-                for x in iter { assert!(v.len < 16); v.buf[v.len] = x; v.len += 1; }
+                let mut v = Vec {
+                    buf: [0; 16],
+                    len: 0,
+                };
+                for x in iter {
+                    assert!(v.len < 16);
+                    v.buf[v.len] = x;
+                    v.len += 1;
+                }
                 v
             }
         }

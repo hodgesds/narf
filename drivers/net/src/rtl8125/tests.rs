@@ -9,9 +9,8 @@
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use super::{
-    build_tx_desc, cr_reset_value, decode_mac, mac_is_invalid, name_for,
-    CR_RST, RING_LEN, RTL_DEV_8125, RTL_DEV_8125B, RTL_VENDOR,
-    TxDesc, TXD_EOR, TXD_FS, TXD_LS, TXD_OWN,
+    build_tx_desc, cr_reset_value, decode_mac, mac_is_invalid, name_for, TxDesc, CR_RST, RING_LEN,
+    RTL_DEV_8125, RTL_DEV_8125B, RTL_VENDOR, TXD_EOR, TXD_FS, TXD_LS, TXD_OWN,
 };
 
 // ── Stage 1: PCI match table ───────────────────────────────────────
@@ -23,10 +22,11 @@ fn smoke_rtl8125_pci_match_table() -> TestResult {
     super::register_pci_driver();
     let registered = registered_pci_drivers();
     for did in [RTL_DEV_8125, RTL_DEV_8125B] {
-        let matched = registered.iter().any(|m|
+        let matched = registered.iter().any(|m| {
             matches!(m.kind, MatchKind::VendorDevice {
                 vendor: RTL_VENDOR, device,
-            } if device == did));
+            } if device == did)
+        });
         if !matched {
             return TestResult::Fail("rtl8125 PCI match table missing a device id");
         }
@@ -36,9 +36,15 @@ fn smoke_rtl8125_pci_match_table() -> TestResult {
 kernel_test_in!("drivers/net/rtl8125", smoke_rtl8125_pci_match_table);
 
 fn smoke_rtl8125_name_for_known_ids() -> TestResult {
-    if name_for(RTL_DEV_8125)  != "rtl8125"  { return TestResult::Fail("rtl8125 name"); }
-    if name_for(RTL_DEV_8125B) != "rtl8125b" { return TestResult::Fail("rtl8125b name"); }
-    if name_for(0xFFFF)        != "rtl8125"  { return TestResult::Fail("default name"); }
+    if name_for(RTL_DEV_8125) != "rtl8125" {
+        return TestResult::Fail("rtl8125 name");
+    }
+    if name_for(RTL_DEV_8125B) != "rtl8125b" {
+        return TestResult::Fail("rtl8125b name");
+    }
+    if name_for(0xFFFF) != "rtl8125" {
+        return TestResult::Fail("default name");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/rtl8125", smoke_rtl8125_name_for_known_ids);
@@ -50,7 +56,7 @@ fn smoke_rtl8125_mac_decode_round_trip() -> TestResult {
     let raw = [0x52u8, 0x54, 0x00, 0xAB, 0xCD, 0xEF, 0xFF, 0xFF];
     let mac = match decode_mac(&raw) {
         Some(m) => m,
-        None    => return TestResult::Fail("decode_mac returned None on 8-byte input"),
+        None => return TestResult::Fail("decode_mac returned None on 8-byte input"),
     };
     if mac != [0x52, 0x54, 0x00, 0xAB, 0xCD, 0xEF] {
         return TestResult::Fail("MAC bytes did not match IDR0..5 input");
@@ -66,9 +72,13 @@ fn smoke_rtl8125_mac_decode_round_trip() -> TestResult {
 kernel_test_in!("drivers/net/rtl8125", smoke_rtl8125_mac_decode_round_trip);
 
 fn smoke_rtl8125_mac_invalid_sentinels() -> TestResult {
-    if !mac_is_invalid([0; 6])    { return TestResult::Fail("all-zero MAC not flagged"); }
-    if !mac_is_invalid([0xFF; 6]) { return TestResult::Fail("all-FF MAC not flagged"); }
-    if  mac_is_invalid([0, 0, 0, 0, 0, 1]) {
+    if !mac_is_invalid([0; 6]) {
+        return TestResult::Fail("all-zero MAC not flagged");
+    }
+    if !mac_is_invalid([0xFF; 6]) {
+        return TestResult::Fail("all-FF MAC not flagged");
+    }
+    if mac_is_invalid([0, 0, 0, 0, 0, 1]) {
         return TestResult::Fail("non-zero MAC false-flagged");
     }
     TestResult::Pass
@@ -79,8 +89,12 @@ fn smoke_rtl8125_cr_reset_bit() -> TestResult {
     // §2.4 places RST at bit 4. cr_reset_value() must produce exactly
     // that bit so the bring-up path's CR write doesn't accidentally
     // flip TE/RE in the same cycle.
-    if cr_reset_value() != CR_RST     { return TestResult::Fail("cr_reset_value != CR_RST"); }
-    if cr_reset_value() != 1 << 4     { return TestResult::Fail("CR_RST not at bit 4 per §2.4"); }
+    if cr_reset_value() != CR_RST {
+        return TestResult::Fail("cr_reset_value != CR_RST");
+    }
+    if cr_reset_value() != 1 << 4 {
+        return TestResult::Fail("CR_RST not at bit 4 per §2.4");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/net/rtl8125", smoke_rtl8125_cr_reset_bit);
@@ -88,7 +102,7 @@ kernel_test_in!("drivers/net/rtl8125", smoke_rtl8125_cr_reset_bit);
 // ── Stage 3: TX descriptor layout ──────────────────────────────────
 
 fn smoke_rtl8125_txdesc_layout() -> TestResult {
-    if core::mem::size_of::<TxDesc>()  != 16 {
+    if core::mem::size_of::<TxDesc>() != 16 {
         return TestResult::Fail("TxDesc not 16 bytes");
     }
     if core::mem::align_of::<TxDesc>() != 16 {
@@ -96,13 +110,16 @@ fn smoke_rtl8125_txdesc_layout() -> TestResult {
     }
     // Word ordering: flags_len at offset 0, vlan @ 4, addr_lo @ 8,
     // addr_hi @ 12. The chip DMAs the descriptor in this exact order.
-    let d = TxDesc { flags_len: 0x11223344, vlan: 0x55667788,
-                     addr_lo:   0x99AABBCC, addr_hi: 0xDDEEFF00 };
+    let d = TxDesc {
+        flags_len: 0x11223344,
+        vlan: 0x55667788,
+        addr_lo: 0x99AABBCC,
+        addr_hi: 0xDDEEFF00,
+    };
     let p = (&d) as *const _ as *const u32;
     // SAFETY: structurally-sized read in-bounds, repr(C) layout.
     let (w0, w1, w2, w3) = unsafe { (*p, *p.add(1), *p.add(2), *p.add(3)) };
-    if w0 != 0x11223344 || w1 != 0x55667788
-        || w2 != 0x99AABBCC || w3 != 0xDDEEFF00 {
+    if w0 != 0x11223344 || w1 != 0x55667788 || w2 != 0x99AABBCC || w3 != 0xDDEEFF00 {
         return TestResult::Fail("TxDesc word order mismatch");
     }
     TestResult::Pass
@@ -119,9 +136,15 @@ fn smoke_rtl8125_build_tx_desc_round_trip() -> TestResult {
     if d.flags_len & TXD_EOR != 0 {
         return TestResult::Fail("mid-ring slot wrongly carries EOR");
     }
-    if d.vlan    != 0           { return TestResult::Fail("vlan not zero"); }
-    if d.addr_lo != 0xCAFE_F00D  { return TestResult::Fail("addr_lo wrong"); }
-    if d.addr_hi != 0xDEAD_BEEF  { return TestResult::Fail("addr_hi wrong"); }
+    if d.vlan != 0 {
+        return TestResult::Fail("vlan not zero");
+    }
+    if d.addr_lo != 0xCAFE_F00D {
+        return TestResult::Fail("addr_lo wrong");
+    }
+    if d.addr_hi != 0xDEAD_BEEF {
+        return TestResult::Fail("addr_hi wrong");
+    }
 
     // Last slot: EOR must be set so the controller's internal pointer
     // wraps to slot 0.
@@ -137,7 +160,10 @@ fn smoke_rtl8125_build_tx_desc_round_trip() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/net/rtl8125", smoke_rtl8125_build_tx_desc_round_trip);
+kernel_test_in!(
+    "drivers/net/rtl8125",
+    smoke_rtl8125_build_tx_desc_round_trip
+);
 
 fn smoke_rtl8125_tx_desc_len_truncates() -> TestResult {
     // §3.1.1 frame-length field is 16 bits; values > 0xFFFF should

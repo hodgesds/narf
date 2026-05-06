@@ -48,18 +48,15 @@ pub mod params;
 
 mod tests;
 pub use bound::{
-    record as record_bound, set_firmware as set_bound_firmware,
-    firmware_of as bound_firmware_of,
-    firmware_snapshot as bound_firmware_snapshot,
-    snapshot as bound_drivers,
-    set_domain as set_driver_domain, domain_of as driver_domain,
+    domain_of as driver_domain, firmware_of as bound_firmware_of,
+    firmware_snapshot as bound_firmware_snapshot, record as record_bound,
+    set_domain as set_driver_domain, set_firmware as set_bound_firmware, snapshot as bound_drivers,
     BoundDriver, BoundFirmware, BoundKind,
 };
 #[cfg(target_arch = "x86_64")]
 pub use domain_alloc::claim_mmio_for_driver;
 pub use domain_alloc::{
-    claim_mmio_in_domain, claimed_in_domain, free_chunks_in_domain,
-    release as release_domain_mmio,
+    claim_mmio_in_domain, claimed_in_domain, free_chunks_in_domain, release as release_domain_mmio,
     DomainAllocError,
 };
 pub use params::{DriverParams, ParamError, ParamSlot};
@@ -85,7 +82,9 @@ use narf_lib::sync::IrqSafeSpinLock;
 ///   to prove authority over its own lifecycle.
 #[derive(Debug)]
 pub struct DriverHandle;
-impl CapType for DriverHandle { const KIND: CapKind = CapKind::Driver; }
+impl CapType for DriverHandle {
+    const KIND: CapKind = CapKind::Driver;
+}
 
 // ── Manifest ────────────────────────────────────────────────────────
 
@@ -105,7 +104,7 @@ pub enum DomainPolicy {
 /// value; the TOML-driven `#[driver(...)]` macro is Wave 3b.
 #[derive(Debug)]
 pub struct DriverManifest {
-    pub name:          &'static str,
+    pub name: &'static str,
     pub domain_policy: DomainPolicy,
     /// `CapKind`s the driver requires. `capabilities/` §3.1 defines
     /// the enum; a manifest naming any `CapKind` outside the enum is
@@ -125,7 +124,7 @@ pub struct DriverEnv<'a> {
     /// (registering IRQ receivers, claiming bus devices, etc.).
     pub self_cap: Cap<DriverHandle, Write>,
     /// Domain the driver runs in.
-    pub domain:   DomainId,
+    pub domain: DomainId,
     /// Reference to the driver's manifest (the registry owns it).
     pub manifest: &'a DriverManifest,
 }
@@ -191,7 +190,9 @@ pub enum RegistrationError {
 }
 
 impl From<CapError> for RegistrationError {
-    fn from(_: CapError) -> Self { RegistrationError::AuthorityRevoked }
+    fn from(_: CapError) -> Self {
+        RegistrationError::AuthorityRevoked
+    }
 }
 
 /// Per-entry lifecycle phase. The "is anyone inside start/quiesce
@@ -215,18 +216,18 @@ pub enum DriverPhase {
 /// An entry in the registry.
 struct Registered {
     manifest: &'static DriverManifest,
-    driver:   Box<dyn Driver>,
-    handle:   Cap<DriverHandle, Write>,
-    domain:   DomainId,
-    phase:    DriverPhase,
+    driver: Box<dyn Driver>,
+    handle: Cap<DriverHandle, Write>,
+    domain: DomainId,
+    phase: DriverPhase,
 }
 
 impl core::fmt::Debug for Registered {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Registered")
-            .field("name",   &self.manifest.name)
+            .field("name", &self.manifest.name)
             .field("domain", &self.domain)
-            .field("phase",  &self.phase)
+            .field("phase", &self.phase)
             .finish_non_exhaustive()
     }
 }
@@ -245,7 +246,9 @@ static REGISTRY: DriverRegistry = DriverRegistry {
 
 /// Reference the global registry.
 #[inline]
-pub fn registry() -> &'static DriverRegistry { &REGISTRY }
+pub fn registry() -> &'static DriverRegistry {
+    &REGISTRY
+}
 
 impl DriverRegistry {
     /// Register a driver. The `authority` cap is checked live; a
@@ -270,19 +273,21 @@ impl DriverRegistry {
         // with memory/'s domain manager. Held under the same lock as
         // the push to avoid a TOCTOU between count and insert.
         let domain = match manifest.domain_policy {
-            DomainPolicy::Shared    => DomainId::new(1),    // DRIVER_0 placeholder
+            DomainPolicy::Shared => DomainId::new(1), // DRIVER_0 placeholder
             DomainPolicy::Dedicated => {
-                let count = q.iter()
+                let count = q
+                    .iter()
                     .filter(|r| r.manifest.domain_policy == DomainPolicy::Dedicated)
                     .count();
                 // security-model/ §4.1 caps dedicated-domain drivers at 6.
-                if count >= 6 { return Err(RegistrationError::NoDomain); }
+                if count >= 6 {
+                    return Err(RegistrationError::NoDomain);
+                }
                 DomainId::new((1 + count) as u8)
             }
         };
 
-        let handle: Cap<DriverHandle, Write> =
-            Cap::<DriverHandle, Write>::bootstrap();
+        let handle: Cap<DriverHandle, Write> = Cap::<DriverHandle, Write>::bootstrap();
         q.push(Registered {
             manifest,
             driver: Box::new(driver),
@@ -294,10 +299,14 @@ impl DriverRegistry {
     }
 
     /// Number of registered drivers.
-    pub fn len(&self) -> usize { self.inner.lock().len() }
+    pub fn len(&self) -> usize {
+        self.inner.lock().len()
+    }
 
     /// `true` iff the registry is empty.
-    pub fn is_empty(&self) -> bool { self.inner.lock().is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().is_empty()
+    }
 
     /// Drive the named driver's `start` future to completion. The
     /// `DriverPhase::Starting` gate is exclusive: a concurrent `start_named`
@@ -310,16 +319,22 @@ impl DriverRegistry {
             let entry = q.iter_mut().find(|r| r.manifest.name == name).ok_or(())?;
             // Only Loaded → Starting is a fresh start. Any other phase
             // means someone else already claimed exclusivity.
-            if entry.phase != DriverPhase::Loaded { return Ok(()); }
+            if entry.phase != DriverPhase::Loaded {
+                return Ok(());
+            }
             entry.phase = DriverPhase::Starting;
             (
                 (&mut *entry.driver) as *mut dyn Driver,
-                (entry.handle, entry.domain, entry.manifest as &'static DriverManifest),
+                (
+                    entry.handle,
+                    entry.domain,
+                    entry.manifest as &'static DriverManifest,
+                ),
             )
         };
         let env = DriverEnv {
             self_cap: env_pieces.0,
-            domain:   env_pieces.1,
+            domain: env_pieces.1,
             manifest: env_pieces.2,
         };
         // SAFETY: the phase gate above is the exclusivity proof — no
@@ -331,7 +346,12 @@ impl DriverRegistry {
         driver.start(env).await;
         // Transition Starting → Started under the lock so a following
         // quiesce_named observes the new phase.
-        if let Some(e) = self.inner.lock().iter_mut().find(|r| r.manifest.name == name) {
+        if let Some(e) = self
+            .inner
+            .lock()
+            .iter_mut()
+            .find(|r| r.manifest.name == name)
+        {
             e.phase = DriverPhase::Started;
         }
         Ok(())
@@ -349,15 +369,22 @@ impl DriverRegistry {
             // where a driver was never started) is valid. Re-entry
             // or already-quiesced is a no-op.
             match entry.phase {
-                DriverPhase::Started | DriverPhase::Loaded => { entry.phase = DriverPhase::Quiescing; }
-                _                              => return Ok(()),
+                DriverPhase::Started | DriverPhase::Loaded => {
+                    entry.phase = DriverPhase::Quiescing;
+                }
+                _ => return Ok(()),
             }
             (&mut *entry.driver) as *mut dyn Driver
         };
         // SAFETY: same phase-gate exclusivity as start_named.
         let driver: &mut dyn Driver = unsafe { &mut *driver_ptr };
         driver.quiesce().await;
-        if let Some(e) = self.inner.lock().iter_mut().find(|r| r.manifest.name == name) {
+        if let Some(e) = self
+            .inner
+            .lock()
+            .iter_mut()
+            .find(|r| r.manifest.name == name)
+        {
             e.phase = DriverPhase::Quiesced;
         }
         Ok(())
@@ -393,19 +420,15 @@ impl DriverRegistry {
     /// Read-only accessor: run `f` against the named driver's phase +
     /// domain while holding the registry lock. Lets tests observe
     /// lifecycle state without exposing `&mut dyn Driver`.
-    pub fn with_entry<R>(
-        &self,
-        name: &str,
-        f: impl FnOnce(DriverStatus) -> R,
-    ) -> Option<R> {
+    pub fn with_entry<R>(&self, name: &str, f: impl FnOnce(DriverStatus) -> R) -> Option<R> {
         let q = self.inner.lock();
-        q.iter()
-            .find(|r| r.manifest.name == name)
-            .map(|r| f(DriverStatus {
-                phase:  r.phase,
+        q.iter().find(|r| r.manifest.name == name).map(|r| {
+            f(DriverStatus {
+                phase: r.phase,
                 domain: r.domain,
                 handle: r.handle,
-            }))
+            })
+        })
     }
 }
 
@@ -414,13 +437,12 @@ impl DriverRegistry {
 /// the fields are a consistent snapshot at that instant.
 #[derive(Copy, Clone, Debug)]
 pub struct DriverStatus {
-    pub phase:  DriverPhase,
+    pub phase: DriverPhase,
     pub domain: DomainId,
     pub handle: Cap<DriverHandle, Write>,
 }
 
 /// Public re-export of the lifecycle phase for observers.
-
 
 // ── NoopDriver ──────────────────────────────────────────────────────
 
@@ -429,14 +451,14 @@ pub struct DriverStatus {
 /// observe them without building a full side-channel.
 #[derive(Debug, Default)]
 pub struct NoopDriver {
-    pub starts:   core::sync::atomic::AtomicU32,
+    pub starts: core::sync::atomic::AtomicU32,
     pub quiesces: core::sync::atomic::AtomicU32,
 }
 
 impl NoopDriver {
     pub const fn new() -> Self {
         Self {
-            starts:   core::sync::atomic::AtomicU32::new(0),
+            starts: core::sync::atomic::AtomicU32::new(0),
             quiesces: core::sync::atomic::AtomicU32::new(0),
         }
     }
@@ -445,12 +467,14 @@ impl NoopDriver {
 impl Driver for NoopDriver {
     fn start<'a>(&'a mut self, _env: DriverEnv<'a>) -> DriverFuture<'a> {
         Box::pin(async move {
-            self.starts.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            self.starts
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         })
     }
     fn quiesce<'a>(&'a mut self) -> DriverFuture<'a> {
         Box::pin(async move {
-            self.quiesces.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            self.quiesces
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         })
     }
 }

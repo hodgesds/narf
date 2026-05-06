@@ -1,4 +1,4 @@
-use narf_capabilities::{CapType, CapKind};
+use narf_capabilities::{CapKind, CapType};
 
 #[derive(Debug)]
 pub struct WirelessIface;

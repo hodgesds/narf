@@ -35,7 +35,7 @@ pub mod sysreg;
 pub mod timer;
 pub mod trbe;
 
-pub use asm::{halt_forever, disable_interrupts, enable_interrupts, cas128, patch_word};
+pub use asm::{cas128, disable_interrupts, enable_interrupts, halt_forever, patch_word};
 pub use cpuid::Features;
 pub use mte::Mte;
 

@@ -36,7 +36,9 @@ struct PinnedCell {
 }
 
 impl PinnedCell {
-    const NEW: Self = Self { pinned: AtomicU64::new(u64::MAX) };
+    const NEW: Self = Self {
+        pinned: AtomicU64::new(u64::MAX),
+    };
 }
 
 static PINNED: [PinnedCell; MAX_CPUS] = [const { PinnedCell::NEW }; MAX_CPUS];
@@ -70,7 +72,9 @@ impl Drop for EpochGuard {
 pub fn pin() -> EpochGuard {
     let e = EPOCH.load(Ordering::Acquire);
     this_cpu().pinned.store(e, Ordering::Release);
-    EpochGuard { _not_send: PhantomData }
+    EpochGuard {
+        _not_send: PhantomData,
+    }
 }
 
 /// Advance the global epoch.
@@ -84,7 +88,9 @@ pub fn min_pinned() -> u64 {
     let mut min = u64::MAX;
     for c in PINNED.iter() {
         let v = c.pinned.load(Ordering::Acquire);
-        if v < min { min = v; }
+        if v < min {
+            min = v;
+        }
     }
     min
 }

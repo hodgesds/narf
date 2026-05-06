@@ -33,12 +33,12 @@ pub mod movdir;
 pub mod msr;
 pub mod mtrr;
 pub mod numa;
+pub mod pasid;
 pub mod pcid;
 pub mod pebs;
 pub mod pit;
 pub mod pks;
 pub mod pmi;
-pub mod pasid;
 pub mod pmu;
 pub mod probe;
 pub mod pt;
@@ -64,11 +64,11 @@ pub mod waitpkg;
 pub mod wrmsrns;
 pub mod xsave;
 
-pub use asm::{halt_forever, disable_interrupts, enable_interrupts, cas128, patch_word};
+pub use asm::{cas128, disable_interrupts, enable_interrupts, halt_forever, patch_word};
 pub use cpuid::Features;
 pub use user_mode::{
-    enter_user_mode, enter_user_mode_resume, longjmp, set_user_fs_base,
-    setjmp, JmpBuf, UserState, IA32_FS_BASE, USER_RFLAGS,
+    enter_user_mode, enter_user_mode_resume, longjmp, set_user_fs_base, setjmp, JmpBuf, UserState,
+    IA32_FS_BASE, USER_RFLAGS,
 };
 
 /// x86_64's concrete `DomainPrimitive` type. All methods forward to
@@ -84,11 +84,11 @@ impl crate::DomainPrimitive for Pks {
     // is opaque to callers; the impl tags meaning by reading
     // `pks::is_active()` at the same call site that produced it.
     type SavedState = pks::SavedPkrs;
-    type Rights     = pks::DomainRights;
+    type Rights = pks::DomainRights;
 
     const ALLOW_ALL: pks::DomainRights = pks::DomainRights::ALLOW_ALL;
     const READ_ONLY: pks::DomainRights = pks::DomainRights::READ_ONLY;
-    const DENY_ALL:  pks::DomainRights = pks::DomainRights::DENY_ALL;
+    const DENY_ALL: pks::DomainRights = pks::DomainRights::DENY_ALL;
 
     #[inline]
     unsafe fn save() -> Self::SavedState {
@@ -106,10 +106,14 @@ impl crate::DomainPrimitive for Pks {
     unsafe fn restore(s: Self::SavedState) {
         if pks::is_active() {
             // SAFETY: CR4.PKS is on.
-            unsafe { pks::restore(s); }
+            unsafe {
+                pks::restore(s);
+            }
         } else {
             // SAFETY: PCID path.
-            unsafe { pcid::restore(pcid::SavedPcid(s.0)); }
+            unsafe {
+                pcid::restore(pcid::SavedPcid(s.0));
+            }
         }
     }
 
@@ -123,7 +127,10 @@ impl crate::DomainPrimitive for Pks {
             let r = unsafe { pcid::get_rights(domain) };
             // pcid::DomainRights and pks::DomainRights are structurally
             // identical; round-trip via the bool fields.
-            pks::DomainRights { no_write: r.no_write, no_access: r.no_access }
+            pks::DomainRights {
+                no_write: r.no_write,
+                no_access: r.no_access,
+            }
         }
     }
 
@@ -131,14 +138,16 @@ impl crate::DomainPrimitive for Pks {
     unsafe fn set_rights(domain: u8, rights: Self::Rights) {
         if pks::is_active() {
             // SAFETY: CR4.PKS is on.
-            unsafe { pks::set_rights(domain, rights); }
+            unsafe {
+                pks::set_rights(domain, rights);
+            }
         } else {
             // SAFETY: trivial no-op.
             unsafe {
                 pcid::set_rights(
                     domain,
                     pcid::DomainRights {
-                        no_write:  rights.no_write,
+                        no_write: rights.no_write,
                         no_access: rights.no_access,
                     },
                 );
@@ -147,8 +156,7 @@ impl crate::DomainPrimitive for Pks {
     }
 
     #[inline]
-    unsafe fn enter_domain(kernel_domain: u8, driver_domain: u8)
-        -> Self::SavedState {
+    unsafe fn enter_domain(kernel_domain: u8, driver_domain: u8) -> Self::SavedState {
         if pks::is_active() {
             // SAFETY: CR4.PKS is on.
             unsafe { pks::enter_domain(kernel_domain, driver_domain) }
@@ -163,10 +171,14 @@ impl crate::DomainPrimitive for Pks {
     unsafe fn exit_domain(saved: Self::SavedState) {
         if pks::is_active() {
             // SAFETY: CR4.PKS is on.
-            unsafe { pks::exit_domain(saved); }
+            unsafe {
+                pks::exit_domain(saved);
+            }
         } else {
             // SAFETY: PCID path.
-            unsafe { pcid::exit_domain(pcid::SavedPcid(saved.0)); }
+            unsafe {
+                pcid::exit_domain(pcid::SavedPcid(saved.0));
+            }
         }
     }
 }
@@ -183,11 +195,11 @@ pub struct Pcid;
 impl crate::DomainPrimitive for Pcid {
     const BACKEND: crate::DomainBackend = crate::DomainBackend::Pcid;
     type SavedState = pcid::SavedPcid;
-    type Rights     = pcid::DomainRights;
+    type Rights = pcid::DomainRights;
 
     const ALLOW_ALL: pcid::DomainRights = pcid::DomainRights::ALLOW_ALL;
     const READ_ONLY: pcid::DomainRights = pcid::DomainRights::READ_ONLY;
-    const DENY_ALL:  pcid::DomainRights = pcid::DomainRights::DENY_ALL;
+    const DENY_ALL: pcid::DomainRights = pcid::DomainRights::DENY_ALL;
 
     #[inline]
     unsafe fn save() -> Self::SavedState {
@@ -198,7 +210,9 @@ impl crate::DomainPrimitive for Pcid {
     #[inline]
     unsafe fn restore(s: Self::SavedState) {
         // SAFETY: skeleton no-op.
-        unsafe { pcid::restore(s); }
+        unsafe {
+            pcid::restore(s);
+        }
     }
 
     #[inline]
@@ -210,12 +224,13 @@ impl crate::DomainPrimitive for Pcid {
     #[inline]
     unsafe fn set_rights(domain: u8, rights: Self::Rights) {
         // SAFETY: skeleton no-op.
-        unsafe { pcid::set_rights(domain, rights); }
+        unsafe {
+            pcid::set_rights(domain, rights);
+        }
     }
 
     #[inline]
-    unsafe fn enter_domain(kernel_domain: u8, driver_domain: u8)
-        -> Self::SavedState {
+    unsafe fn enter_domain(kernel_domain: u8, driver_domain: u8) -> Self::SavedState {
         // SAFETY: skeleton no-op.
         unsafe { pcid::enter_domain(kernel_domain, driver_domain) }
     }
@@ -223,7 +238,9 @@ impl crate::DomainPrimitive for Pcid {
     #[inline]
     unsafe fn exit_domain(saved: Self::SavedState) {
         // SAFETY: skeleton no-op.
-        unsafe { pcid::exit_domain(saved); }
+        unsafe {
+            pcid::exit_domain(saved);
+        }
     }
 }
 
@@ -241,6 +258,8 @@ impl crate::DomainPrimitive for Pcid {
 pub unsafe fn exit_qemu(code: u32) -> ! {
     // SAFETY: OUT to 0xF4 is benign if the device isn't attached, and
     // exits cleanly if it is. Either way we fall into halt_forever.
-    unsafe { io_port::outb(0xF4, code as u8); }
+    unsafe {
+        io_port::outb(0xF4, code as u8);
+    }
     halt_forever()
 }

@@ -7,15 +7,24 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 // ── SMBus ──────────────────────────────────────────────────────────
 
 fn smoke_smbus_class_match_registered() -> TestResult {
+    use crate::smbus;
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::{registered_pci_drivers, MatchKind};
-    use crate::smbus;
     __reset_for_test();
     smbus::register_pci_driver();
     let regs = registered_pci_drivers();
-    let has = regs.iter().any(|m|
-        matches!(m.kind, MatchKind::Class { class: 0x0C, mask: 0xFF }));
-    if !has { return TestResult::Fail("smbus class match missing"); }
+    let has = regs.iter().any(|m| {
+        matches!(
+            m.kind,
+            MatchKind::Class {
+                class: 0x0C,
+                mask: 0xFF
+            }
+        )
+    });
+    if !has {
+        return TestResult::Fail("smbus class match missing");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/platform/smbus", smoke_smbus_class_match_registered);

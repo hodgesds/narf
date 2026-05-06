@@ -3,39 +3,39 @@
 //! Based on the NXP I3C register map found in i.MX 93 and MCX N series.
 //! Clean-room implementation following the publicly documented register map.
 
-use alloc::sync::Arc;
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use async_trait::async_trait;
-use narf_bus::{BusDevice, BusDeviceCap, MmioRegion, map_bar};
-use narf_i3c::{I3cBus, I3cError, I3cOp, registry};
-use narf_drivers::{Driver, DriverEnv, DriverFuture};
-use narf_capabilities::{Cap, Write};
 use core::task::Waker;
+use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
+use narf_capabilities::{Cap, Write};
+use narf_drivers::{Driver, DriverEnv, DriverFuture};
+use narf_i3c::{registry, I3cBus, I3cError, I3cOp};
 use narf_lib::sync::IrqSafeSpinLock;
 
 // ── NXP I3C Register Offsets ───────────────────────────────────────
-const REG_MCTRL:      u64 = 0x00; // Main Control
-const REG_MSTATUS:    u64 = 0x04; // Main Status
-const REG_IBIRULES:   u64 = 0x08; // IBI Rules
-const REG_MINTSET:    u64 = 0x0C; // Interrupt Set
-const REG_MDATACTRL:  u64 = 0x20; // Data Control
-const REG_MWDATAB:    u64 = 0x24; // Write Data Byte
-const REG_MRDATAB:    u64 = 0x2C; // Read Data Byte
+const REG_MCTRL: u64 = 0x00; // Main Control
+const REG_MSTATUS: u64 = 0x04; // Main Status
+const REG_IBIRULES: u64 = 0x08; // IBI Rules
+const REG_MINTSET: u64 = 0x0C; // Interrupt Set
+const REG_MDATACTRL: u64 = 0x20; // Data Control
+const REG_MWDATAB: u64 = 0x24; // Write Data Byte
+const REG_MRDATAB: u64 = 0x2C; // Read Data Byte
 const REG_MWMSG_SADDR: u64 = 0x30; // Static Address
-const REG_MCONFIG:    u64 = 0x40; // Master Config
+const REG_MCONFIG: u64 = 0x40; // Master Config
 
 // ── Register Bits ──────────────────────────────────────────────────
 const MCTRL_REQUEST_NONE: u32 = 0x0;
 const MCTRL_REQUEST_START: u32 = 0x1;
-const MCTRL_TYPE_I3C:     u32 = 0x0 << 4;
-const MCTRL_TYPE_I2C:     u32 = 0x1 << 4;
+const MCTRL_TYPE_I3C: u32 = 0x0 << 4;
+const MCTRL_TYPE_I2C: u32 = 0x1 << 4;
 
 const MSTATUS_COMPLETE: u32 = 1 << 0;
-const MSTATUS_ERROR:    u32 = 1 << 1;
+const MSTATUS_ERROR: u32 = 1 << 1;
 
 pub fn probe(
     device: BusDevice,
-    _cap:     Cap<BusDeviceCap, Write>,
+    _cap: Cap<BusDeviceCap, Write>,
 ) -> Result<(), narf_bus::ProbeError> {
     // SAFETY: caller-authority over the device.
     let mmio = unsafe { map_bar(&device, 0) }.map_err(|_| narf_bus::ProbeError::BadDevice)?;
@@ -46,11 +46,11 @@ pub fn probe(
     });
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
-        name:    alloc::string::String::from("nxp-i3c"),
-        kind:    narf_drivers::BoundKind::Other,
+        name: alloc::string::String::from("nxp-i3c"),
+        kind: narf_drivers::BoundKind::Other,
         pci_vid: None,
         pci_did: None,
-        domain:  narf_drivers::BoundKind::Other.default_domain(),
+        domain: narf_drivers::BoundKind::Other.default_domain(),
     });
 
     registry::register(driver);
@@ -72,13 +72,17 @@ impl Driver for NxpI3c {
     fn start<'a>(&'a mut self, _env: DriverEnv<'a>) -> DriverFuture<'a> {
         Box::pin(async move {
             // Initialize the master.
-            unsafe { self.mmio.write32(REG_MCONFIG, 0x1); } // Basic enable
+            unsafe {
+                self.mmio.write32(REG_MCONFIG, 0x1);
+            } // Basic enable
         })
     }
 
     fn quiesce<'a>(&'a mut self) -> DriverFuture<'a> {
         Box::pin(async move {
-            unsafe { self.mmio.write32(REG_MCONFIG, 0x0); }
+            unsafe {
+                self.mmio.write32(REG_MCONFIG, 0x0);
+            }
         })
     }
 }
@@ -87,14 +91,18 @@ impl Driver for NxpI3c {
 impl I3cBus for NxpI3c {
     async fn transfer(&self, addr: u8, ops: &mut [I3cOp]) -> Result<(), I3cError> {
         // 1. Set the target address.
-        unsafe { self.mmio.write32(REG_MWMSG_SADDR, (addr as u32) << 1); }
+        unsafe {
+            self.mmio.write32(REG_MWMSG_SADDR, (addr as u32) << 1);
+        }
 
         for op in ops {
             match op {
                 I3cOp::Write(data) => {
                     for &byte in data.iter() {
                         // Wait for FIFO space... (simplified)
-                        unsafe { self.mmio.write32(REG_MWDATAB, byte as u32); }
+                        unsafe {
+                            self.mmio.write32(REG_MWDATAB, byte as u32);
+                        }
                     }
                 }
                 I3cOp::Read(buf) => {
@@ -107,13 +115,20 @@ impl I3cBus for NxpI3c {
         }
 
         // 2. Trigger the transfer.
-        unsafe { self.mmio.write32(REG_MCTRL, MCTRL_REQUEST_START | MCTRL_TYPE_I3C); }
+        unsafe {
+            self.mmio
+                .write32(REG_MCTRL, MCTRL_REQUEST_START | MCTRL_TYPE_I3C);
+        }
 
         // 3. Wait for completion.
         loop {
             let status = unsafe { self.mmio.read32(REG_MSTATUS) };
-            if (status & MSTATUS_COMPLETE) != 0 { break; }
-            if (status & MSTATUS_ERROR) != 0 { return Err(I3cError::HardwareError); }
+            if (status & MSTATUS_COMPLETE) != 0 {
+                break;
+            }
+            if (status & MSTATUS_ERROR) != 0 {
+                return Err(I3cError::HardwareError);
+            }
             narf_scheduler::yield_now().await;
         }
 

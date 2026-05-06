@@ -31,11 +31,11 @@ use crate::device::{BusDevice, BusKind};
 /// Standard cap IDs. Drivers can extend with their own constants;
 /// re-exported by `bus::pci_cap` for ergonomic match patterns.
 pub mod id {
-    pub const POWER_MGMT:    u8 = 0x01;
-    pub const MSI:           u8 = 0x05;
-    pub const VENDOR_SPEC:   u8 = 0x09;
-    pub const PCI_EXPRESS:   u8 = 0x10;
-    pub const MSI_X:         u8 = 0x11;
+    pub const POWER_MGMT: u8 = 0x01;
+    pub const MSI: u8 = 0x05;
+    pub const VENDOR_SPEC: u8 = 0x09;
+    pub const PCI_EXPRESS: u8 = 0x10;
+    pub const MSI_X: u8 = 0x11;
 }
 
 /// Cfg-space offset of the Status register (16-bit).
@@ -67,7 +67,9 @@ pub enum CapError {
 pub unsafe fn find_cap(device: &BusDevice, id: u8) -> Result<Option<u64>, CapError> {
     // SAFETY: caller-asserted; iter checks PCIe + status.
     for cap in unsafe { iter(device)? } {
-        if cap.id == id { return Ok(Some(cap.offset)); }
+        if cap.id == id {
+            return Ok(Some(cap.offset));
+        }
     }
     Ok(None)
 }
@@ -76,7 +78,7 @@ pub unsafe fn find_cap(device: &BusDevice, id: u8) -> Result<Option<u64>, CapErr
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct CapHeader {
     /// Cap ID — see `id::*` for known values.
-    pub id:     u8,
+    pub id: u8,
     /// Cfg-space offset of the cap header itself. Cap-specific data
     /// follows at `offset + 2`.
     pub offset: u64,
@@ -91,7 +93,7 @@ pub struct CapHeader {
 pub unsafe fn iter(device: &BusDevice) -> Result<CapIter, CapError> {
     let cfg = match device.kind {
         BusKind::Pcie { cfg_phys, .. } => cfg_phys,
-        BusKind::VirtioMmio { .. }     => return Err(CapError::NotPcie),
+        BusKind::VirtioMmio { .. } => return Err(CapError::NotPcie),
     };
     // SAFETY: cfg-space is identity-mapped MMIO; offset 0x06 is in
     // every type-0 / type-1 header.
@@ -101,13 +103,17 @@ pub unsafe fn iter(device: &BusDevice) -> Result<CapIter, CapError> {
     }
     // SAFETY: same window; offset 0x34 is the Capabilities Pointer.
     let head = unsafe { cfg_read8(cfg, CAP_POINTER_OFFSET) };
-    Ok(CapIter { cfg, next: (head as u64) & 0xFC, hops: 0 })
+    Ok(CapIter {
+        cfg,
+        next: (head as u64) & 0xFC,
+        hops: 0,
+    })
 }
 
 /// Iterator over cap-list entries — produced by `iter`.
 #[derive(Debug)]
 pub struct CapIter {
-    cfg:  PhysAddr,
+    cfg: PhysAddr,
     next: u64,
     hops: u32,
 }
@@ -115,11 +121,13 @@ pub struct CapIter {
 impl Iterator for CapIter {
     type Item = CapHeader;
     fn next(&mut self) -> Option<CapHeader> {
-        if self.next == 0 || self.hops >= MAX_HOPS { return None; }
+        if self.next == 0 || self.hops >= MAX_HOPS {
+            return None;
+        }
         // SAFETY: cfg-space is identity-mapped; `next` is < 0x100 by
         // mask + bound.
-        let id   = unsafe { cfg_read8(self.cfg, self.next)     };
-        let nxt  = unsafe { cfg_read8(self.cfg, self.next + 1) };
+        let id = unsafe { cfg_read8(self.cfg, self.next) };
+        let nxt = unsafe { cfg_read8(self.cfg, self.next + 1) };
         let here = self.next;
         self.next = (nxt as u64) & 0xFC;
         self.hops += 1;

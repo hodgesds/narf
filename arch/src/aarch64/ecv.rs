@@ -21,7 +21,11 @@ pub fn caps() -> u8 {
     ((id_aa64mmfr0() >> 60) & 0xF) as u8
 }
 
-pub fn supported() -> bool { caps() >= 1 }
+pub fn supported() -> bool {
+    caps() >= 1
+}
 
 /// `true` iff CNTPOFF support is present (ECV ≥ 2).
-pub fn cntpoff_supported() -> bool { caps() >= 2 }
+pub fn cntpoff_supported() -> bool {
+    caps() >= 2
+}

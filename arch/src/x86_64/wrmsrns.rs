@@ -17,7 +17,9 @@ use crate::x86_64::msr::wrmsr;
 pub fn supported() -> bool {
     // SAFETY: leaf 0 always defined.
     let max = unsafe { cpuid(0, 0).0 };
-    if max < 7 { return false; }
+    if max < 7 {
+        return false;
+    }
     // SAFETY: leaf 7 sub-leaf 1 valid.
     let (eax, _, _, _) = unsafe { cpuid(7, 1) };
     eax & (1 << 19) != 0
@@ -52,9 +54,13 @@ pub unsafe fn wrmsrns(msr: u32, value: u64) {
 pub unsafe fn write(msr: u32, value: u64) {
     if supported() {
         // SAFETY: gated.
-        unsafe { wrmsrns(msr, value); }
+        unsafe {
+            wrmsrns(msr, value);
+        }
     } else {
         // SAFETY: caller-asserted.
-        unsafe { wrmsr(msr, value); }
+        unsafe {
+            wrmsr(msr, value);
+        }
     }
 }

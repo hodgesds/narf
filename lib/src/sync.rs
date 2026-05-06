@@ -20,7 +20,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 mod private {
     pub trait Sealed {}
-    impl Sealed for super::IrqsEnabled  {}
+    impl Sealed for super::IrqsEnabled {}
     impl Sealed for super::IrqsDisabled {}
 }
 
@@ -36,7 +36,7 @@ pub struct IrqsEnabled;
 #[derive(Debug)]
 pub struct IrqsDisabled;
 
-impl IrqState for IrqsEnabled  {}
+impl IrqState for IrqsEnabled {}
 impl IrqState for IrqsDisabled {}
 
 // ──────────────────────────────────────────────────────────────────
@@ -48,7 +48,7 @@ impl IrqState for IrqsDisabled {}
 /// the same lock. Use `IrqSafeSpinLock` from IRQ-possible contexts.
 pub struct SpinLock<T: ?Sized> {
     locked: AtomicBool,
-    data:   UnsafeCell<T>,
+    data: UnsafeCell<T>,
 }
 
 // SAFETY: `SpinLock` serialises access to `T`; if `T: Send`, the lock is
@@ -60,11 +60,13 @@ impl<T> SpinLock<T> {
     pub const fn new(data: T) -> Self {
         Self {
             locked: AtomicBool::new(false),
-            data:   UnsafeCell::new(data),
+            data: UnsafeCell::new(data),
         }
     }
 
-    pub fn into_inner(self) -> T { self.data.into_inner() }
+    pub fn into_inner(self) -> T {
+        self.data.into_inner()
+    }
 }
 
 impl<T: ?Sized> SpinLock<T> {
@@ -82,7 +84,10 @@ impl<T: ?Sized> SpinLock<T> {
                 spin_loop();
             }
         }
-        SpinLockGuard { lock: self, _irq: IrqsEnabled }
+        SpinLockGuard {
+            lock: self,
+            _irq: IrqsEnabled,
+        }
     }
 
     /// Attempt to acquire without blocking; returns `None` on contention.
@@ -91,7 +96,10 @@ impl<T: ?Sized> SpinLock<T> {
         self.locked
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .ok()
-            .map(|_| SpinLockGuard { lock: self, _irq: IrqsEnabled })
+            .map(|_| SpinLockGuard {
+                lock: self,
+                _irq: IrqsEnabled,
+            })
     }
 }
 
@@ -172,10 +180,14 @@ unsafe impl<T: ?Sized + Send> Sync for IrqSafeSpinLock<T> {}
 
 impl<T> IrqSafeSpinLock<T> {
     pub const fn new(data: T) -> Self {
-        Self { inner: SpinLock::new(data) }
+        Self {
+            inner: SpinLock::new(data),
+        }
     }
 
-    pub fn into_inner(self) -> T { self.inner.into_inner() }
+    pub fn into_inner(self) -> T {
+        self.inner.into_inner()
+    }
 }
 
 impl<T: ?Sized> IrqSafeSpinLock<T> {
@@ -195,20 +207,24 @@ impl<T: ?Sized> IrqSafeSpinLock<T> {
                 spin_loop();
             }
         }
-        IrqSafeSpinLockGuard { lock: &self.inner, saved }
+        IrqSafeSpinLockGuard {
+            lock: &self.inner,
+            saved,
+        }
     }
 }
 
 /// Guard for [`IrqSafeSpinLock`]. Restores the caller's IRQ state on
 /// drop and releases the lock.
 pub struct IrqSafeSpinLockGuard<'a, T: ?Sized> {
-    lock:  &'a SpinLock<T>,
+    lock: &'a SpinLock<T>,
     saved: IrqSavedState,
 }
 
 impl<T: ?Sized> fmt::Debug for IrqSafeSpinLockGuard<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("IrqSafeSpinLockGuard").finish_non_exhaustive()
+        f.debug_struct("IrqSafeSpinLockGuard")
+            .finish_non_exhaustive()
     }
 }
 
@@ -235,7 +251,9 @@ impl<T: ?Sized> Drop for IrqSafeSpinLockGuard<'_, T> {
         self.lock.locked.store(false, Ordering::Release);
         // SAFETY: pairs with `irq_save_disable` from the matching lock
         // call; restoring the saved state is always sound.
-        unsafe { irq_restore(self.saved); }
+        unsafe {
+            irq_restore(self.saved);
+        }
     }
 }
 
@@ -276,7 +294,9 @@ unsafe fn irq_restore(saved: IrqSavedState) {
         // sti mutates IF — and don't claim `nomem`, since the
         // moment IF flips, an IRQ handler may run and observe
         // memory.
-        unsafe { core::arch::asm!("sti", options()); }
+        unsafe {
+            core::arch::asm!("sti", options());
+        }
     }
 }
 
@@ -306,13 +326,17 @@ unsafe fn irq_restore(saved: IrqSavedState) {
     // re-enabling FIQ/SError/D unintentionally.
     if saved.0 & (1u64 << 7) == 0 {
         // SAFETY: clear DAIF.I. PSTATE-mutating, IRQ may fire after.
-        unsafe { core::arch::asm!("msr DAIFClr, #0x2", options(nostack)); }
+        unsafe {
+            core::arch::asm!("msr DAIFClr, #0x2", options(nostack));
+        }
     }
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[inline(always)]
-unsafe fn irq_save_disable() -> IrqSavedState { IrqSavedState(0) }
+unsafe fn irq_save_disable() -> IrqSavedState {
+    IrqSavedState(0)
+}
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[inline(always)]
@@ -328,9 +352,9 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for IrqSafeSpinLock<T> {
 // Once / OnceLock — one-shot initialisation.
 // ──────────────────────────────────────────────────────────────────
 
-const ONCE_EMPTY:  u8 = 0;
-const ONCE_RUNNING:u8 = 1;
-const ONCE_DONE:   u8 = 2;
+const ONCE_EMPTY: u8 = 0;
+const ONCE_RUNNING: u8 = 1;
+const ONCE_DONE: u8 = 2;
 
 /// One-shot "has run" gate. For value storage use `OnceLock<T>`.
 pub struct Once {
@@ -338,22 +362,31 @@ pub struct Once {
 }
 
 impl Once {
-    pub const fn new() -> Self { Self { state: AtomicU8::new(ONCE_EMPTY) } }
+    pub const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(ONCE_EMPTY),
+        }
+    }
 
     /// Run `init` exactly once, the first time any caller reaches this call.
     /// Other callers spin until initialisation finishes.
     pub fn call_once<F: FnOnce()>(&self, init: F) {
         match self.state.compare_exchange(
-            ONCE_EMPTY, ONCE_RUNNING, Ordering::Acquire, Ordering::Acquire,
+            ONCE_EMPTY,
+            ONCE_RUNNING,
+            Ordering::Acquire,
+            Ordering::Acquire,
         ) {
             Ok(_) => {
                 init();
                 self.state.store(ONCE_DONE, Ordering::Release);
             }
             Err(ONCE_DONE) => {}
-            Err(_) => while self.state.load(Ordering::Acquire) != ONCE_DONE {
-                spin_loop();
-            },
+            Err(_) => {
+                while self.state.load(Ordering::Acquire) != ONCE_DONE {
+                    spin_loop();
+                }
+            }
         }
     }
 
@@ -364,7 +397,9 @@ impl Once {
 }
 
 impl Default for Once {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl fmt::Debug for Once {
@@ -384,7 +419,7 @@ pub struct OnceLock<T> {
 // SAFETY: `OnceLock` publishes `T` only through `Release`/`Acquire` on
 // `Once::state`; subsequent reads observe the initialised value.
 unsafe impl<T: Send + Sync> Sync for OnceLock<T> {}
-unsafe impl<T: Send>        Send for OnceLock<T> {}
+unsafe impl<T: Send> Send for OnceLock<T> {}
 
 impl<T> OnceLock<T> {
     pub const fn new() -> Self {
@@ -401,7 +436,9 @@ impl<T> OnceLock<T> {
             // SAFETY: we're inside the `call_once` winning branch, so this
             // is the sole writer; no reader can observe the cell until
             // `call_once` stores ONCE_DONE.
-            unsafe { (*self.data.get()).write(value.take().unwrap()); }
+            unsafe {
+                (*self.data.get()).write(value.take().unwrap());
+            }
         });
         match value {
             Some(v) => Err(v),
@@ -432,14 +469,18 @@ impl<T> OnceLock<T> {
 }
 
 impl<T> Default for OnceLock<T> {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<T> Drop for OnceLock<T> {
     fn drop(&mut self) {
         if self.once.is_completed() {
             // SAFETY: value is initialised and we are the sole owner.
-            unsafe { (*self.data.get()).assume_init_drop(); }
+            unsafe {
+                (*self.data.get()).assume_init_drop();
+            }
         }
     }
 }
@@ -448,7 +489,7 @@ impl<T: fmt::Debug> fmt::Debug for OnceLock<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.get() {
             Some(v) => f.debug_tuple("OnceLock").field(v).finish(),
-            None    => f.debug_struct("OnceLock").field("state", &"empty").finish(),
+            None => f.debug_struct("OnceLock").field("state", &"empty").finish(),
         }
     }
 }
@@ -490,7 +531,9 @@ mod tests {
         let o = Once::new();
         let n = AtomicUsize::new(0);
         for _ in 0..5 {
-            o.call_once(|| { n.fetch_add(1, Ordering::Relaxed); });
+            o.call_once(|| {
+                n.fetch_add(1, Ordering::Relaxed);
+            });
         }
         assert_eq!(n.load(Ordering::Relaxed), 1);
     }
@@ -508,6 +551,6 @@ mod tests {
     fn once_lock_get_or_init() {
         let c: OnceLock<u32> = OnceLock::new();
         assert_eq!(*c.get_or_init(|| 3), 3);
-        assert_eq!(*c.get_or_init(|| 4), 3);   // init not rerun
+        assert_eq!(*c.get_or_init(|| 4), 3); // init not rerun
     }
 }

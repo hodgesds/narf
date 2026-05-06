@@ -28,16 +28,21 @@ use crate::addr::{PhysAddr, VirtAddr};
 pub struct RegionPerms(pub u32);
 
 impl RegionPerms {
-    pub const EXEC:  RegionPerms = RegionPerms(1 << 0);
+    pub const EXEC: RegionPerms = RegionPerms(1 << 0);
     pub const WRITE: RegionPerms = RegionPerms(1 << 1);
-    pub const READ:  RegionPerms = RegionPerms(1 << 2);
+    pub const READ: RegionPerms = RegionPerms(1 << 2);
 
-    #[inline] pub const fn contains(self, o: RegionPerms) -> bool { self.0 & o.0 == o.0 }
+    #[inline]
+    pub const fn contains(self, o: RegionPerms) -> bool {
+        self.0 & o.0 == o.0
+    }
 }
 
 impl core::ops::BitOr for RegionPerms {
     type Output = RegionPerms;
-    fn bitor(self, rhs: RegionPerms) -> Self { RegionPerms(self.0 | rhs.0) }
+    fn bitor(self, rhs: RegionPerms) -> Self {
+        RegionPerms(self.0 | rhs.0)
+    }
 }
 
 /// A user-mode mapping. The virtual range is contiguous; the
@@ -49,12 +54,12 @@ impl core::ops::BitOr for RegionPerms {
 /// time the freelist had been touched between page allocations.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Region {
-    pub base:     VirtAddr,
-    pub len:      u64,
-    pub perms:    RegionPerms,
+    pub base: VirtAddr,
+    pub len: u64,
+    pub perms: RegionPerms,
     /// Per-page phys backing. Length must equal `len / 4096`; an
     /// empty Vec is a structural error rejected by `map_region`.
-    pub phys:     Vec<PhysAddr>,
+    pub phys: Vec<PhysAddr>,
 }
 
 /// Errors from the address-space surface.
@@ -82,7 +87,7 @@ pub struct AddressSpace {
     /// `new_table` primitive once it lands; `PhysAddr::new(0)`
     /// acts as "not-yet-initialised" sentinel.
     pub root: PhysAddr,
-    regions:  IrqSafeSpinLock<Vec<Region>>,
+    regions: IrqSafeSpinLock<Vec<Region>>,
 }
 
 impl AddressSpace {
@@ -90,7 +95,7 @@ impl AddressSpace {
     /// must assign `root` to a freshly-allocated page-table frame.
     pub const fn empty() -> Self {
         Self {
-            root:    PhysAddr::new(0),
+            root: PhysAddr::new(0),
             regions: IrqSafeSpinLock::new(Vec::new()),
         }
     }
@@ -112,7 +117,10 @@ impl AddressSpace {
         // SAFETY: contract documented on the function.
         let phys = unsafe { crate::x86_64::paging::new_user_pml4() }
             .map_err(|_| AddressSpaceError::OutOfRange)?;
-        Ok(Self { root: phys, regions: IrqSafeSpinLock::new(Vec::new()) })
+        Ok(Self {
+            root: phys,
+            regions: IrqSafeSpinLock::new(Vec::new()),
+        })
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -122,7 +130,10 @@ impl AddressSpace {
         // the kernel sits behind TTBR1 and is unaffected.
         let phys = unsafe { crate::aarch64::paging::new_user_ttbr0() }
             .map_err(|_| AddressSpaceError::OutOfRange)?;
-        Ok(Self { root: phys, regions: IrqSafeSpinLock::new(Vec::new()) })
+        Ok(Self {
+            root: phys,
+            regions: IrqSafeSpinLock::new(Vec::new()),
+        })
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -144,7 +155,10 @@ impl AddressSpace {
         if region.phys.len() as u64 != region.len >> 12 {
             return Err(AddressSpaceError::AlignmentMismatch);
         }
-        let end = region.base.as_u64().checked_add(region.len)
+        let end = region
+            .base
+            .as_u64()
+            .checked_add(region.len)
             .ok_or(AddressSpaceError::OutOfRange)?;
         let mut regions = self.regions.lock();
         for r in regions.iter() {
@@ -160,18 +174,24 @@ impl AddressSpace {
     /// Remove a region whose base address matches `base`.
     pub fn unmap_region(&self, base: VirtAddr) -> Result<Region, AddressSpaceError> {
         let mut regions = self.regions.lock();
-        let idx = regions.iter().position(|r| r.base == base)
+        let idx = regions
+            .iter()
+            .position(|r| r.base == base)
             .ok_or(AddressSpaceError::Unmapped)?;
         Ok(regions.swap_remove(idx))
     }
 
     /// Number of mapped regions.
     #[inline]
-    pub fn region_count(&self) -> usize { self.regions.lock().len() }
+    pub fn region_count(&self) -> usize {
+        self.regions.lock().len()
+    }
 
     /// Snapshot of the region list — returns an owned `Vec<Region>`
     /// so callers can iterate without holding the lock.
-    pub fn regions_snapshot(&self) -> Vec<Region> { self.regions.lock().clone() }
+    pub fn regions_snapshot(&self) -> Vec<Region> {
+        self.regions.lock().clone()
+    }
 
     /// Materialise all pending regions into actual page-table entries.
     /// On x86_64 walks each region's pages and calls `map_4kb` on the
@@ -186,12 +206,18 @@ impl AddressSpace {
     #[cfg(target_arch = "x86_64")]
     pub unsafe fn materialize(&self) -> Result<(), AddressSpaceError> {
         use crate::x86_64::paging::{map_4kb, MapError, PtFlags};
-        if self.root.as_u64() == 0 { return Err(AddressSpaceError::OutOfRange); }
+        if self.root.as_u64() == 0 {
+            return Err(AddressSpaceError::OutOfRange);
+        }
         let regions = self.regions.lock();
         for r in regions.iter() {
             let mut flags = PtFlags::USER;
-            if r.perms.contains(RegionPerms::WRITE) { flags = flags | PtFlags::WRITABLE; }
-            if !r.perms.contains(RegionPerms::EXEC) { flags = flags | PtFlags::NO_EXEC; }
+            if r.perms.contains(RegionPerms::WRITE) {
+                flags = flags | PtFlags::WRITABLE;
+            }
+            if !r.perms.contains(RegionPerms::EXEC) {
+                flags = flags | PtFlags::NO_EXEC;
+            }
 
             for (i, p) in r.phys.iter().enumerate() {
                 let v = crate::VirtAddr::new(r.base.as_u64() + ((i as u64) << 12));
@@ -201,8 +227,8 @@ impl AddressSpace {
                 // length-checked against `len/4096` at map_region.
                 match unsafe { map_4kb(self.root, v, *p, flags) } {
                     Ok(()) => {}
-                    Err(MapError::AlreadyMapped) => {}   // idempotent
-                    Err(_)                        => return Err(AddressSpaceError::NotImplemented),
+                    Err(MapError::AlreadyMapped) => {} // idempotent
+                    Err(_) => return Err(AddressSpaceError::NotImplemented),
                 }
             }
         }
@@ -212,7 +238,9 @@ impl AddressSpace {
     #[cfg(target_arch = "aarch64")]
     pub unsafe fn materialize(&self) -> Result<(), AddressSpaceError> {
         use crate::aarch64::paging::{map_4kb, MapError, PtFlags};
-        if self.root.as_u64() == 0 { return Err(AddressSpaceError::OutOfRange); }
+        if self.root.as_u64() == 0 {
+            return Err(AddressSpaceError::OutOfRange);
+        }
         let regions = self.regions.lock();
         for r in regions.iter() {
             // aarch64 perm translation:
@@ -250,9 +278,11 @@ impl AddressSpace {
     /// since the region table lives behind an interior lock.
     pub fn lookup(&self, vaddr: VirtAddr) -> Option<Region> {
         let a = vaddr.as_u64();
-        self.regions.lock().iter().find(|r| {
-            a >= r.base.as_u64() && a < r.base.as_u64() + r.len
-        }).cloned()
+        self.regions
+            .lock()
+            .iter()
+            .find(|r| a >= r.base.as_u64() && a < r.base.as_u64() + r.len)
+            .cloned()
     }
 
     /// Make this address-space the active one. On x86_64 issues a
@@ -278,7 +308,9 @@ impl AddressSpace {
             // kernel mapping. Interrupt state is the caller's
             // contract — the executor disables IRQs through the
             // existing `IrqSafeSpinLock` on the ready queue.
-            unsafe { crate::x86_64::paging::write_cr3(self.root); }
+            unsafe {
+                crate::x86_64::paging::write_cr3(self.root);
+            }
             return Ok(());
         }
         #[cfg(target_arch = "aarch64")]
@@ -304,5 +336,7 @@ impl AddressSpace {
 }
 
 impl Default for AddressSpace {
-    fn default() -> Self { Self::empty() }
+    fn default() -> Self {
+        Self::empty()
+    }
 }

@@ -21,12 +21,12 @@ use narf_ipc::shared_ring::{
     SharedConsumer, SharedProducer, SharedRing, TryRecvError, TrySendError,
 };
 
-use crate::{FbWriter, FbWriteError, Rect};
+use crate::{FbWriteError, FbWriter, Rect};
 
 /// Wire-stable draw-command tags.
-pub const TAG_FILL:  u32 = 1;
+pub const TAG_FILL: u32 = 1;
 pub const TAG_FLUSH: u32 = 2;
-pub const TAG_BLIT:  u32 = 3;
+pub const TAG_BLIT: u32 = 3;
 
 /// 48-byte wire-format command. `tag` selects which fields are
 /// meaningful; the consumer matches on it.
@@ -45,17 +45,17 @@ pub const TAG_BLIT:  u32 = 3;
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct DrawCmd {
-    pub tag:        u32,
-    pub _pad:       u32,
-    pub x:          u32,
-    pub y:          u32,
-    pub w:          u32,
-    pub h:          u32,
+    pub tag: u32,
+    pub _pad: u32,
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
     /// XRGB8888 pixel for FILL; ignored for FLUSH/BLIT.
-    pub pixel:      u32,
-    pub _pad2:      u32,
+    pub pixel: u32,
+    pub _pad2: u32,
     /// Shmem handle for BLIT; ignored for FILL/FLUSH.
-    pub buffer:     u64,
+    pub buffer: u64,
     /// Byte offset into the shmem buffer for BLIT.
     pub src_offset: u32,
     /// Bytes per row in the source buffer for BLIT.
@@ -65,14 +65,22 @@ pub struct DrawCmd {
 impl core::fmt::Debug for DrawCmd {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self.tag {
-            TAG_FILL  => write!(f, "Fill {{ rect: ({},{}, {}x{}), px: {:#010x} }}",
-                                   self.x, self.y, self.w, self.h, self.pixel),
-            TAG_FLUSH => write!(f, "Flush {{ rect: ({},{}, {}x{}) }}",
-                                   self.x, self.y, self.w, self.h),
-            TAG_BLIT  => write!(f, "Blit {{ rect: ({},{}, {}x{}), shmem: {}, off: {}, stride: {} }}",
-                                   self.x, self.y, self.w, self.h,
-                                   self.buffer, self.src_offset, self.src_stride),
-            _         => write!(f, "DrawCmd {{ unknown tag {:#x} }}", self.tag),
+            TAG_FILL => write!(
+                f,
+                "Fill {{ rect: ({},{}, {}x{}), px: {:#010x} }}",
+                self.x, self.y, self.w, self.h, self.pixel
+            ),
+            TAG_FLUSH => write!(
+                f,
+                "Flush {{ rect: ({},{}, {}x{}) }}",
+                self.x, self.y, self.w, self.h
+            ),
+            TAG_BLIT => write!(
+                f,
+                "Blit {{ rect: ({},{}, {}x{}), shmem: {}, off: {}, stride: {} }}",
+                self.x, self.y, self.w, self.h, self.buffer, self.src_offset, self.src_stride
+            ),
+            _ => write!(f, "DrawCmd {{ unknown tag {:#x} }}", self.tag),
         }
     }
 }
@@ -80,26 +88,47 @@ impl core::fmt::Debug for DrawCmd {
 impl DrawCmd {
     pub const fn fill(rect: Rect, pixel: u32) -> Self {
         Self {
-            tag: TAG_FILL, _pad: 0,
-            x: rect.x, y: rect.y, w: rect.w, h: rect.h,
-            pixel, _pad2: 0,
-            buffer: 0, src_offset: 0, src_stride: 0,
+            tag: TAG_FILL,
+            _pad: 0,
+            x: rect.x,
+            y: rect.y,
+            w: rect.w,
+            h: rect.h,
+            pixel,
+            _pad2: 0,
+            buffer: 0,
+            src_offset: 0,
+            src_stride: 0,
         }
     }
     pub const fn flush(rect: Rect) -> Self {
         Self {
-            tag: TAG_FLUSH, _pad: 0,
-            x: rect.x, y: rect.y, w: rect.w, h: rect.h,
-            pixel: 0, _pad2: 0,
-            buffer: 0, src_offset: 0, src_stride: 0,
+            tag: TAG_FLUSH,
+            _pad: 0,
+            x: rect.x,
+            y: rect.y,
+            w: rect.w,
+            h: rect.h,
+            pixel: 0,
+            _pad2: 0,
+            buffer: 0,
+            src_offset: 0,
+            src_stride: 0,
         }
     }
     pub const fn blit(rect: Rect, buffer: u64, src_offset: u32, src_stride: u32) -> Self {
         Self {
-            tag: TAG_BLIT, _pad: 0,
-            x: rect.x, y: rect.y, w: rect.w, h: rect.h,
-            pixel: 0, _pad2: 0,
-            buffer, src_offset, src_stride,
+            tag: TAG_BLIT,
+            _pad: 0,
+            x: rect.x,
+            y: rect.y,
+            w: rect.w,
+            h: rect.h,
+            pixel: 0,
+            _pad2: 0,
+            buffer,
+            src_offset,
+            src_stride,
         }
     }
 }
@@ -122,7 +151,9 @@ pub type DrawRing = SharedRing<DrawCmd, RING_DEPTH>;
 /// `size_of::<DrawRing>()` bytes, 8-byte aligned.
 pub unsafe fn init_in(ptr: *mut DrawRing) {
     // SAFETY: caller-asserted preconditions.
-    unsafe { DrawRing::init_in(ptr); }
+    unsafe {
+        DrawRing::init_in(ptr);
+    }
 }
 
 /// Construct producer + consumer halves over the same backing.
@@ -130,9 +161,12 @@ pub unsafe fn init_in(ptr: *mut DrawRing) {
 /// # Safety
 /// `ring` must have been `init_in`-initialised; only one
 /// producer + one consumer may exist per ring (SPSC contract).
-pub unsafe fn split(ring: *mut DrawRing)
-    -> (SharedProducer<DrawCmd, RING_DEPTH>, SharedConsumer<DrawCmd, RING_DEPTH>)
-{
+pub unsafe fn split(
+    ring: *mut DrawRing,
+) -> (
+    SharedProducer<DrawCmd, RING_DEPTH>,
+    SharedConsumer<DrawCmd, RING_DEPTH>,
+) {
     // SAFETY: caller asserts SPSC + initialised.
     let p = unsafe { SharedProducer::from_raw(ring) };
     let c = unsafe { SharedConsumer::from_raw(ring) };
@@ -147,25 +181,26 @@ pub unsafe fn split(ring: *mut DrawRing)
 /// Call from any kernel context that holds an exclusive borrow of
 /// `writer` (a kernel-resident task, the boot path, an IRQ-driven
 /// scheduler tick).
-pub fn drain(consumer: &mut SharedConsumer<DrawCmd, RING_DEPTH>,
-             writer:   &FbWriter)
-    -> (u32, u32)
-{
+pub fn drain(consumer: &mut SharedConsumer<DrawCmd, RING_DEPTH>, writer: &FbWriter) -> (u32, u32) {
     let mut executed = 0u32;
-    let mut errors   = 0u32;
+    let mut errors = 0u32;
     loop {
         match consumer.try_recv() {
             Ok(cmd) => {
                 let rect = Rect::new(cmd.x, cmd.y, cmd.w, cmd.h);
                 let res: Result<(), FbWriteError> = match cmd.tag {
-                    TAG_FILL  => writer.fill(rect, narf_graphics::Pixel32(cmd.pixel)),
+                    TAG_FILL => writer.fill(rect, narf_graphics::Pixel32(cmd.pixel)),
                     TAG_FLUSH => writer.flush(rect),
-                    TAG_BLIT  => writer.blit_from_shmem(
-                        rect, cmd.buffer, cmd.src_offset, cmd.src_stride,
-                    ),
-                    _         => Err(FbWriteError::OutOfBounds),
+                    TAG_BLIT => {
+                        writer.blit_from_shmem(rect, cmd.buffer, cmd.src_offset, cmd.src_stride)
+                    }
+                    _ => Err(FbWriteError::OutOfBounds),
                 };
-                if res.is_err() { errors += 1; } else { executed += 1; }
+                if res.is_err() {
+                    errors += 1;
+                } else {
+                    executed += 1;
+                }
             }
             Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
         }
@@ -175,9 +210,10 @@ pub fn drain(consumer: &mut SharedConsumer<DrawCmd, RING_DEPTH>,
 
 /// Helper for tests + producers that want to enqueue without
 /// caring about the SharedProducer plumbing.
-pub fn try_send(producer: &mut SharedProducer<DrawCmd, RING_DEPTH>, cmd: DrawCmd)
-    -> Result<(), TrySendError<DrawCmd>>
-{
+pub fn try_send(
+    producer: &mut SharedProducer<DrawCmd, RING_DEPTH>,
+    cmd: DrawCmd,
+) -> Result<(), TrySendError<DrawCmd>> {
     producer.try_send(cmd)
 }
 
@@ -186,5 +222,7 @@ pub fn try_send(producer: &mut SharedProducer<DrawCmd, RING_DEPTH>, cmd: DrawCmd
 /// userspace client.
 pub fn close(ring: *mut DrawRing) {
     // SAFETY: `closed` is at a fixed offset; safe to write any time.
-    unsafe { (*ring).closed.store(1, Ordering::Release); }
+    unsafe {
+        (*ring).closed.store(1, Ordering::Release);
+    }
 }

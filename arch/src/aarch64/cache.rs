@@ -11,7 +11,7 @@ use core::arch::asm;
 pub struct AarchCacheCaps {
     pub iline_bytes: u16,
     pub dline_bytes: u16,
-    pub cwg_bytes:   u16,
+    pub cwg_bytes: u16,
 }
 
 fn read_ctr_el0() -> u64 {
@@ -27,10 +27,10 @@ pub fn caps() -> AarchCacheCaps {
     let ctr = read_ctr_el0();
     let imin = (ctr & 0xF) as u16;
     let dmin = ((ctr >> 16) & 0xF) as u16;
-    let cwg  = ((ctr >> 24) & 0xF) as u16;
+    let cwg = ((ctr >> 24) & 0xF) as u16;
     AarchCacheCaps {
         iline_bytes: 4u16 << imin,
         dline_bytes: 4u16 << dmin,
-        cwg_bytes:   if cwg == 0 { 0 } else { 4u16 << cwg },
+        cwg_bytes: if cwg == 0 { 0 } else { 4u16 << cwg },
     }
 }

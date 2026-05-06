@@ -20,28 +20,35 @@ fn smoke_virtio_iommu_pci_match_table() -> TestResult {
     __reset_for_test();
     super::register_pci_driver();
     let registered = registered_pci_drivers();
-    let matched = registered.iter().any(|m|
-        matches!(m.kind, MatchKind::VendorDevice {
-            vendor: VIRTIO_IOMMU_PCI_VENDOR,
-            device: VIRTIO_IOMMU_PCI_DEVICE,
-        }));
+    let matched = registered.iter().any(|m| {
+        matches!(
+            m.kind,
+            MatchKind::VendorDevice {
+                vendor: VIRTIO_IOMMU_PCI_VENDOR,
+                device: VIRTIO_IOMMU_PCI_DEVICE,
+            }
+        )
+    });
     if !matched {
         return TestResult::Fail("virtio-iommu PCI match table missing 1AF4:1057");
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/virtio/iommu_pci", smoke_virtio_iommu_pci_match_table);
+kernel_test_in!(
+    "drivers/virtio/iommu_pci",
+    smoke_virtio_iommu_pci_match_table
+);
 
 fn smoke_virtio_iommu_pci_config_decode() -> TestResult {
     // Synthesised §5.16.4 wire image. Decode → re-encode must
     // reproduce the bytes verbatim.
     let cfg = IommuDeviceConfig {
-        page_size_mask:     0x0000_0000_0000_F000, // 4 KiB only
-        input_range_start:  0x0000_0000_0000_0000,
-        input_range_end:    0x0000_FFFF_FFFF_FFFF,
+        page_size_mask: 0x0000_0000_0000_F000, // 4 KiB only
+        input_range_start: 0x0000_0000_0000_0000,
+        input_range_end: 0x0000_FFFF_FFFF_FFFF,
         domain_range_start: 0,
-        domain_range_end:   0xFFFF,
-        probe_size:         64,
+        domain_range_end: 0xFFFF,
+        probe_size: 64,
     };
     let bytes = cfg.encode();
     if bytes.len() != IommuDeviceConfig::WIRE_SIZE {
@@ -49,7 +56,7 @@ fn smoke_virtio_iommu_pci_config_decode() -> TestResult {
     }
     let back = match IommuDeviceConfig::decode(&bytes) {
         Some(c) => c,
-        None    => return TestResult::Fail("decode returned None"),
+        None => return TestResult::Fail("decode returned None"),
     };
     if back != cfg {
         return TestResult::Fail("config round-trip mismatch");
@@ -64,31 +71,54 @@ fn smoke_virtio_iommu_pci_config_decode() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/virtio/iommu_pci", smoke_virtio_iommu_pci_config_decode);
+kernel_test_in!(
+    "drivers/virtio/iommu_pci",
+    smoke_virtio_iommu_pci_config_decode
+);
 
 // ── Stage 2: §5.16.6 request encode/decode round-trips ─────────────
 
 fn smoke_virtio_iommu_pci_opcode_values() -> TestResult {
     // §5.16.6 fixes the opcode numbers; pin them here.
-    if IommuOp::Attach as u8 != 1 { return TestResult::Fail("ATTACH != 1"); }
-    if IommuOp::Detach as u8 != 2 { return TestResult::Fail("DETACH != 2"); }
-    if IommuOp::Map    as u8 != 3 { return TestResult::Fail("MAP != 3"); }
-    if IommuOp::Unmap  as u8 != 4 { return TestResult::Fail("UNMAP != 4"); }
-    if IommuOp::Probe  as u8 != 5 { return TestResult::Fail("PROBE != 5"); }
+    if IommuOp::Attach as u8 != 1 {
+        return TestResult::Fail("ATTACH != 1");
+    }
+    if IommuOp::Detach as u8 != 2 {
+        return TestResult::Fail("DETACH != 2");
+    }
+    if IommuOp::Map as u8 != 3 {
+        return TestResult::Fail("MAP != 3");
+    }
+    if IommuOp::Unmap as u8 != 4 {
+        return TestResult::Fail("UNMAP != 4");
+    }
+    if IommuOp::Probe as u8 != 5 {
+        return TestResult::Fail("PROBE != 5");
+    }
     for v in [1u8, 2, 3, 4, 5] {
         match IommuOp::from_raw(v) {
             Some(op) if op as u8 == v => {}
             _ => return TestResult::Fail("from_raw round-trip failed"),
         }
     }
-    if IommuOp::from_raw(0).is_some() { return TestResult::Fail("from_raw(0) not None"); }
-    if IommuOp::from_raw(6).is_some() { return TestResult::Fail("from_raw(6) not None"); }
+    if IommuOp::from_raw(0).is_some() {
+        return TestResult::Fail("from_raw(0) not None");
+    }
+    if IommuOp::from_raw(6).is_some() {
+        return TestResult::Fail("from_raw(6) not None");
+    }
     TestResult::Pass
 }
-kernel_test_in!("drivers/virtio/iommu_pci", smoke_virtio_iommu_pci_opcode_values);
+kernel_test_in!(
+    "drivers/virtio/iommu_pci",
+    smoke_virtio_iommu_pci_opcode_values
+);
 
 fn smoke_virtio_iommu_pci_req_attach_roundtrip() -> TestResult {
-    let req = ReqAttach { domain: 0xDEAD_BEEF, endpoint: 0x1234_5678 };
+    let req = ReqAttach {
+        domain: 0xDEAD_BEEF,
+        endpoint: 0x1234_5678,
+    };
     let bytes = req.encode(0xA5A5_5A5A);
     if bytes.len() != ReqAttach::WIRE_SIZE {
         return TestResult::Fail("attach wire size");
@@ -98,7 +128,7 @@ fn smoke_virtio_iommu_pci_req_attach_roundtrip() -> TestResult {
     }
     let (h, back) = match ReqAttach::decode(&bytes) {
         Some(t) => t,
-        None    => return TestResult::Fail("attach decode None"),
+        None => return TestResult::Fail("attach decode None"),
     };
     if h.op != IommuOp::Attach || h.flags != 0xA5A5_5A5A {
         return TestResult::Fail("attach header round-trip");
@@ -108,10 +138,16 @@ fn smoke_virtio_iommu_pci_req_attach_roundtrip() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/virtio/iommu_pci", smoke_virtio_iommu_pci_req_attach_roundtrip);
+kernel_test_in!(
+    "drivers/virtio/iommu_pci",
+    smoke_virtio_iommu_pci_req_attach_roundtrip
+);
 
 fn smoke_virtio_iommu_pci_req_detach_roundtrip() -> TestResult {
-    let req = ReqDetach { domain: 0x0000_0042, endpoint: 0xCAFE_F00D };
+    let req = ReqDetach {
+        domain: 0x0000_0042,
+        endpoint: 0xCAFE_F00D,
+    };
     let bytes = req.encode(0);
     if bytes.len() != ReqDetach::WIRE_SIZE {
         return TestResult::Fail("detach wire size");
@@ -121,7 +157,7 @@ fn smoke_virtio_iommu_pci_req_detach_roundtrip() -> TestResult {
     }
     let (h, back) = match ReqDetach::decode(&bytes) {
         Some(t) => t,
-        None    => return TestResult::Fail("detach decode None"),
+        None => return TestResult::Fail("detach decode None"),
     };
     if h.op != IommuOp::Detach || h.flags != 0 {
         return TestResult::Fail("detach header round-trip");
@@ -130,21 +166,28 @@ fn smoke_virtio_iommu_pci_req_detach_roundtrip() -> TestResult {
         return TestResult::Fail("detach payload round-trip");
     }
     // Cross-op rejection: an Attach-encoded blob must not decode as Detach.
-    let attach_bytes = ReqAttach { domain: 1, endpoint: 2 }.encode(0);
+    let attach_bytes = ReqAttach {
+        domain: 1,
+        endpoint: 2,
+    }
+    .encode(0);
     if ReqDetach::decode(&attach_bytes).is_some() {
         return TestResult::Fail("detach decoded an attach blob");
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/virtio/iommu_pci", smoke_virtio_iommu_pci_req_detach_roundtrip);
+kernel_test_in!(
+    "drivers/virtio/iommu_pci",
+    smoke_virtio_iommu_pci_req_detach_roundtrip
+);
 
 fn smoke_virtio_iommu_pci_req_map_roundtrip() -> TestResult {
     let req = ReqMap {
-        domain:     7,
+        domain: 7,
         virt_start: 0x0000_1000_0000_0000,
-        virt_end:   0x0000_1000_0000_0FFF,
+        virt_end: 0x0000_1000_0000_0FFF,
         phys_start: 0x0000_0000_8000_0000,
-        map_flags:  0b0000_0111, // READ|WRITE|EXEC
+        map_flags: 0b0000_0111, // READ|WRITE|EXEC
     };
     let bytes = req.encode(0x1);
     if bytes.len() != ReqMap::WIRE_SIZE {
@@ -155,7 +198,7 @@ fn smoke_virtio_iommu_pci_req_map_roundtrip() -> TestResult {
     }
     let (h, back) = match ReqMap::decode(&bytes) {
         Some(t) => t,
-        None    => return TestResult::Fail("map decode None"),
+        None => return TestResult::Fail("map decode None"),
     };
     if h.op != IommuOp::Map || h.flags != 0x1 {
         return TestResult::Fail("map header round-trip");
@@ -170,13 +213,16 @@ fn smoke_virtio_iommu_pci_req_map_roundtrip() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/virtio/iommu_pci", smoke_virtio_iommu_pci_req_map_roundtrip);
+kernel_test_in!(
+    "drivers/virtio/iommu_pci",
+    smoke_virtio_iommu_pci_req_map_roundtrip
+);
 
 fn smoke_virtio_iommu_pci_req_unmap_roundtrip() -> TestResult {
     let req = ReqUnmap {
-        domain:     7,
+        domain: 7,
         virt_start: 0x0000_1000_0000_0000,
-        virt_end:   0x0000_1000_0000_0FFF,
+        virt_end: 0x0000_1000_0000_0FFF,
     };
     let bytes = req.encode(0);
     if bytes.len() != ReqUnmap::WIRE_SIZE {
@@ -187,7 +233,7 @@ fn smoke_virtio_iommu_pci_req_unmap_roundtrip() -> TestResult {
     }
     let (h, back) = match ReqUnmap::decode(&bytes) {
         Some(t) => t,
-        None    => return TestResult::Fail("unmap decode None"),
+        None => return TestResult::Fail("unmap decode None"),
     };
     if h.op != IommuOp::Unmap || h.flags != 0 {
         return TestResult::Fail("unmap header round-trip");
@@ -197,31 +243,48 @@ fn smoke_virtio_iommu_pci_req_unmap_roundtrip() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/virtio/iommu_pci", smoke_virtio_iommu_pci_req_unmap_roundtrip);
+kernel_test_in!(
+    "drivers/virtio/iommu_pci",
+    smoke_virtio_iommu_pci_req_unmap_roundtrip
+);
 
 fn smoke_virtio_iommu_pci_req_header_roundtrip() -> TestResult {
-    for op in [IommuOp::Attach, IommuOp::Detach, IommuOp::Map,
-               IommuOp::Unmap, IommuOp::Probe]
-    {
-        let h = ReqHeader { op, flags: 0xDEAD_BEEF };
+    for op in [
+        IommuOp::Attach,
+        IommuOp::Detach,
+        IommuOp::Map,
+        IommuOp::Unmap,
+        IommuOp::Probe,
+    ] {
+        let h = ReqHeader {
+            op,
+            flags: 0xDEAD_BEEF,
+        };
         let bytes = h.encode();
         if bytes.len() != ReqHeader::WIRE_SIZE {
             return TestResult::Fail("header wire size");
         }
-        if bytes[0] != op as u8 { return TestResult::Fail("header op byte"); }
+        if bytes[0] != op as u8 {
+            return TestResult::Fail("header op byte");
+        }
         // Reserved bytes 1..4 must be zero.
         if bytes[1] != 0 || bytes[2] != 0 || bytes[3] != 0 {
             return TestResult::Fail("header reserved nonzero");
         }
         let back = match ReqHeader::decode(&bytes) {
             Some(h) => h,
-            None    => return TestResult::Fail("header decode None"),
+            None => return TestResult::Fail("header decode None"),
         };
-        if back != h { return TestResult::Fail("header round-trip"); }
+        if back != h {
+            return TestResult::Fail("header round-trip");
+        }
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/virtio/iommu_pci", smoke_virtio_iommu_pci_req_header_roundtrip);
+kernel_test_in!(
+    "drivers/virtio/iommu_pci",
+    smoke_virtio_iommu_pci_req_header_roundtrip
+);
 
 fn smoke_virtio_iommu_pci_live_attach_map_unmap_detach() -> TestResult {
     use crate::iommu_pci;
@@ -230,19 +293,32 @@ fn smoke_virtio_iommu_pci_live_attach_map_unmap_detach() -> TestResult {
     }
     let r: Option<Result<(), ()>> = iommu_pci::with_controller(|c| {
         let s_attach = c.attach(1, 0).map_err(|_| ())?;
-        if s_attach != iommu_pci::STATUS_OK { return Err(()); }
-        let s_map = c.map(1, 0x1_0000, 0x1_0FFF, 0x1000_0000, 0).map_err(|_| ())?;
-        if s_map != iommu_pci::STATUS_OK { return Err(()); }
+        if s_attach != iommu_pci::STATUS_OK {
+            return Err(());
+        }
+        let s_map = c
+            .map(1, 0x1_0000, 0x1_0FFF, 0x1000_0000, 0)
+            .map_err(|_| ())?;
+        if s_map != iommu_pci::STATUS_OK {
+            return Err(());
+        }
         let s_unmap = c.unmap(1, 0x1_0000, 0x1_0FFF).map_err(|_| ())?;
-        if s_unmap != iommu_pci::STATUS_OK { return Err(()); }
+        if s_unmap != iommu_pci::STATUS_OK {
+            return Err(());
+        }
         let s_det = c.detach(1, 0).map_err(|_| ())?;
-        if s_det != iommu_pci::STATUS_OK { return Err(()); }
+        if s_det != iommu_pci::STATUS_OK {
+            return Err(());
+        }
         Ok(())
     });
     match r {
-        Some(Ok(()))  => TestResult::Pass,
-        Some(Err(_))  => TestResult::Fail("non-OK status from device"),
-        None          => TestResult::Skip("controller missing"),
+        Some(Ok(())) => TestResult::Pass,
+        Some(Err(_)) => TestResult::Fail("non-OK status from device"),
+        None => TestResult::Skip("controller missing"),
     }
 }
-kernel_test_in!("drivers/virtio/iommu_pci", smoke_virtio_iommu_pci_live_attach_map_unmap_detach);
+kernel_test_in!(
+    "drivers/virtio/iommu_pci",
+    smoke_virtio_iommu_pci_live_attach_map_unmap_detach
+);

@@ -28,7 +28,9 @@ pub fn set_apic_to_domain(cb: Cb) {
 /// implicit single-node fallback) if no mapping is installed.
 pub fn domain_for_apic_id(apic_id: u32) -> u8 {
     let p = APIC_TO_DOMAIN.load(Ordering::Acquire);
-    if p.is_null() { return 0; }
+    if p.is_null() {
+        return 0;
+    }
     // SAFETY: `p` was stored as a `Cb` function pointer via
     // `set_apic_to_domain`; the round-trip preserves provenance.
     let cb: Cb = unsafe { core::mem::transmute(p) };

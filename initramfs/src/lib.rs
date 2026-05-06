@@ -40,8 +40,7 @@ pub use narf_filesystem::{CpioError, Initramfs};
 // unstaging — initramfs is a boot artifact that lives until
 // kernel shutdown.
 
-static STAGED: IrqSafeSpinLock<Option<&'static Initramfs>>
-    = IrqSafeSpinLock::new(None);
+static STAGED: IrqSafeSpinLock<Option<&'static Initramfs>> = IrqSafeSpinLock::new(None);
 
 /// Stage a parsed initramfs for later consumers. Idempotent —
 /// first install wins.
@@ -82,19 +81,15 @@ pub fn __reset_staged() {
 /// newc archive of exactly `len` bytes. The bootloader contract
 /// guarantees both for the region it advertises in
 /// `BootInfo::initramfs`.
-pub unsafe fn stage_from_phys(
-    name: &'static str,
-    phys: u64,
-    len:  u64,
-) -> Result<(), CpioError> {
-    if len == 0 { return Ok(()); }
+pub unsafe fn stage_from_phys(name: &'static str, phys: u64, len: u64) -> Result<(), CpioError> {
+    if len == 0 {
+        return Ok(());
+    }
     // SAFETY: caller-asserted readability + identity mapping.
-    let archive: &'static [u8] = unsafe {
-        core::slice::from_raw_parts(phys as *const u8, len as usize)
-    };
+    let archive: &'static [u8] =
+        unsafe { core::slice::from_raw_parts(phys as *const u8, len as usize) };
     let fs = Initramfs::from_cpio(name, archive)?;
-    let leaked: &'static Initramfs =
-        alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));
+    let leaked: &'static Initramfs = alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));
     install(leaked);
     Ok(())
 }
@@ -120,7 +115,9 @@ pub fn mount_at_boot(
 /// `mount_at_boot` can hand the registry an owned value while
 /// preserving the canonical `'static` reference held by `STAGED`.
 #[derive(Debug)]
-struct MountProxy { fs: &'static Initramfs }
+struct MountProxy {
+    fs: &'static Initramfs,
+}
 
 impl narf_filesystem::FsInstance for MountProxy {
     fn root(&self) -> alloc::sync::Arc<dyn narf_filesystem::DirOps> {
@@ -139,13 +136,19 @@ impl narf_filesystem::FsInstance for MountProxy {
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
     narf_init::register(Stage::Early, "initramfs-stage", || {
-        if is_staged() { InitResult::Ok } else { InitResult::NotPresent }
+        if is_staged() {
+            InitResult::Ok
+        } else {
+            InitResult::NotPresent
+        }
     });
     narf_init::register(Stage::Late, "initramfs-mount-at-boot", || {
-        if !is_staged() { return InitResult::NotPresent; }
+        if !is_staged() {
+            return InitResult::NotPresent;
+        }
         let auth = narf_filesystem::bootstrap_mount_authority();
         match mount_at_boot(&auth) {
-            Ok(())  => InitResult::Ok,
+            Ok(()) => InitResult::Ok,
             Err(()) => InitResult::Error("mount_at_boot rejected"),
         }
     });

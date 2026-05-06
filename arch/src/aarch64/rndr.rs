@@ -24,7 +24,9 @@ pub fn supported() -> bool {
 /// Read `RNDR` (raw `S3_3_C2_C4_0`). Returns `None` on entropy
 /// starvation (`NZCV.C = 0`).
 pub fn try_rndr() -> Option<u64> {
-    if !supported() { return None; }
+    if !supported() {
+        return None;
+    }
     let v: u64;
     let ok: u64;
     // SAFETY: RNDR is unprivileged + side-effect-free; entropy
@@ -39,12 +41,18 @@ pub fn try_rndr() -> Option<u64> {
             options(nostack),
         );
     }
-    if ok == 1 { Some(v) } else { None }
+    if ok == 1 {
+        Some(v)
+    } else {
+        None
+    }
 }
 
 /// Read `RNDRRS` (raw `S3_3_C2_C4_1`) — reseed-grade entropy.
 pub fn try_rndrrs() -> Option<u64> {
-    if !supported() { return None; }
+    if !supported() {
+        return None;
+    }
     let v: u64;
     let ok: u64;
     // SAFETY: same as `try_rndr`.
@@ -57,5 +65,9 @@ pub fn try_rndrrs() -> Option<u64> {
             options(nostack),
         );
     }
-    if ok == 1 { Some(v) } else { None }
+    if ok == 1 {
+        Some(v)
+    } else {
+        None
+    }
 }

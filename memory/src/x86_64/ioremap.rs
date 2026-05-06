@@ -26,9 +26,7 @@ use alloc::vec::Vec;
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::paging::{
-    self, invlpg_global, map_4kb, read_cr3, unmap_4kb, MapError, PtFlags,
-};
+use crate::paging::{self, invlpg_global, map_4kb, read_cr3, unmap_4kb, MapError, PtFlags};
 use crate::vmalloc::{self, VmRange, VmallocError};
 use crate::{PhysAddr, VirtAddr};
 
@@ -36,11 +34,14 @@ use crate::{PhysAddr, VirtAddr};
 /// the same range return the same kernel VA — avoids leaking
 /// vmalloc ranges + PTE frames when test smokes re-probe the
 /// same hardware.
-static CACHE: IrqSafeSpinLock<Vec<IoMapping>> =
-    IrqSafeSpinLock::new(Vec::new());
+static CACHE: IrqSafeSpinLock<Vec<IoMapping>> = IrqSafeSpinLock::new(Vec::new());
 
 fn cache_lookup(phys: u64, len: u64) -> Option<IoMapping> {
-    CACHE.lock().iter().copied().find(|m| m.phys == phys && m.len == len)
+    CACHE
+        .lock()
+        .iter()
+        .copied()
+        .find(|m| m.phys == phys && m.len == len)
 }
 
 fn cache_insert(m: IoMapping) {
@@ -72,14 +73,16 @@ pub enum IoremapError {
 impl From<VmallocError> for IoremapError {
     fn from(e: VmallocError) -> Self {
         match e {
-            VmallocError::BadLen   => IoremapError::BadLen,
+            VmallocError::BadLen => IoremapError::BadLen,
             VmallocError::Exhausted => IoremapError::Exhausted,
         }
     }
 }
 
 impl From<MapError> for IoremapError {
-    fn from(e: MapError) -> Self { IoremapError::Map(e) }
+    fn from(e: MapError) -> Self {
+        IoremapError::Map(e)
+    }
 }
 
 /// Returned mapping handle. `virt` is dereferenceable for MMIO;
@@ -90,7 +93,7 @@ impl From<MapError> for IoremapError {
 pub struct IoMapping {
     pub phys: u64,
     pub virt: u64,
-    pub len:  u64,
+    pub len: u64,
 }
 
 /// Map a phys range into kernel virtual space. The phys + len
@@ -106,11 +109,13 @@ pub struct IoMapping {
 /// - The active page table must be writable (i.e. we're at CPL=0
 ///   on the BSP boot path or holding the appropriate cap to
 ///   mutate kernel mappings).
-pub unsafe fn ioremap(phys: u64, len: u64, _attrs: MmioAttrs)
-    -> Result<IoMapping, IoremapError>
-{
-    if phys & 0xFFF != 0 { return Err(IoremapError::BadAlign); }
-    if len  & 0xFFF != 0 || len == 0 { return Err(IoremapError::BadLen); }
+pub unsafe fn ioremap(phys: u64, len: u64, _attrs: MmioAttrs) -> Result<IoMapping, IoremapError> {
+    if phys & 0xFFF != 0 {
+        return Err(IoremapError::BadAlign);
+    }
+    if len & 0xFFF != 0 || len == 0 {
+        return Err(IoremapError::BadLen);
+    }
 
     // Cache hit? Return the prior mapping. Avoids the per-test-
     // re-probe leak that otherwise eats vmalloc + PT frames.
@@ -126,9 +131,9 @@ pub unsafe fn ioremap(phys: u64, len: u64, _attrs: MmioAttrs)
     // pages we did install so the address space stays clean.
     let pages = (len >> 12) as usize;
     for i in 0..pages {
-        let off  = (i as u64) * 4096;
-        let v    = VirtAddr::new(range.base + off);
-        let p    = PhysAddr::new(phys + off);
+        let off = (i as u64) * 4096;
+        let v = VirtAddr::new(range.base + off);
+        let p = PhysAddr::new(phys + off);
         // SAFETY: range.base + off is freshly-allocated VA (no
         // existing mapping); phys + off is per the caller's
         // exclusivity contract.
@@ -136,7 +141,7 @@ pub unsafe fn ioremap(phys: u64, len: u64, _attrs: MmioAttrs)
             // Roll back successful pages.
             for j in 0..i {
                 let off_j = (j as u64) * 4096;
-                let v_j   = VirtAddr::new(range.base + off_j);
+                let v_j = VirtAddr::new(range.base + off_j);
                 // SAFETY: we just installed this PTE.
                 let _ = unsafe { unmap_4kb(pml4_phys, v_j) };
             }
@@ -148,10 +153,16 @@ pub unsafe fn ioremap(phys: u64, len: u64, _attrs: MmioAttrs)
         // have a cached translation for an address that wasn't
         // mapped yet), so we use the cheaper local form.
         // SAFETY: INVLPG always legal at CPL=0.
-        unsafe { paging::invlpg(v); }
+        unsafe {
+            paging::invlpg(v);
+        }
     }
 
-    let m = IoMapping { phys, virt: range.base, len };
+    let m = IoMapping {
+        phys,
+        virt: range.base,
+        len,
+    };
     cache_insert(m);
     Ok(m)
 }
@@ -173,12 +184,17 @@ pub unsafe fn iounmap(m: IoMapping) {
     let pages = (m.len >> 12) as usize;
     for i in 0..pages {
         let off = (i as u64) * 4096;
-        let v   = VirtAddr::new(m.virt + off);
+        let v = VirtAddr::new(m.virt + off);
         // SAFETY: paired with ioremap's map_4kb.
         let _ = unsafe { unmap_4kb(pml4_phys, v) };
         // SAFETY: invlpg_global broadcasts via the installed
         // shootdown hook.
-        unsafe { invlpg_global(v); }
+        unsafe {
+            invlpg_global(v);
+        }
     }
-    vmalloc::free(VmRange { base: m.virt, len: m.len });
+    vmalloc::free(VmRange {
+        base: m.virt,
+        len: m.len,
+    });
 }

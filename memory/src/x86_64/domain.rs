@@ -50,10 +50,7 @@
 
 #![cfg(target_arch = "x86_64")]
 
-use crate::paging::{
-    PageTable, PageTableEntry, PtFlags,
-    map_4kb, MapError,
-};
+use crate::paging::{map_4kb, MapError, PageTable, PageTableEntry, PtFlags};
 use crate::{alloc_frame, FrameAllocError, PhysAddr, VirtAddr};
 
 use narf_arch::x86_64::pcid;
@@ -89,17 +86,23 @@ pub enum DomainMapError {
 }
 
 impl From<FrameAllocError> for DomainMapError {
-    fn from(_: FrameAllocError) -> Self { DomainMapError::FrameExhausted }
+    fn from(_: FrameAllocError) -> Self {
+        DomainMapError::FrameExhausted
+    }
 }
 
 impl From<MapError> for DomainMapError {
-    fn from(e: MapError) -> Self { DomainMapError::Map(e) }
+    fn from(e: MapError) -> Self {
+        DomainMapError::Map(e)
+    }
 }
 
 /// Compute the start of `domain`'s private VA range. Returns `None`
 /// for an out-of-range domain id.
 pub const fn domain_va_base(domain: u8) -> Option<u64> {
-    if domain >= NUM_DOMAINS { return None; }
+    if domain >= NUM_DOMAINS {
+        return None;
+    }
     // Sign-extend bit 47 to bits 63..=48 to keep the address canonical.
     // (PRIVATE_PML4_BASE + D) << 39, with bit 47 set (since 256 = bit 47).
     let slot = (PRIVATE_PML4_BASE as u64) + (domain as u64);
@@ -148,16 +151,13 @@ pub unsafe fn init_per_domain_pdpts() -> Result<u8, DomainMapError> {
 
         // Allocate + zero a fresh PDPT for this domain.
         let pdpt_frame = alloc_frame()?;
-        let pdpt_addr  = pdpt_frame.start_address();
+        let pdpt_addr = pdpt_frame.start_address();
         // The 4 KiB identity-map covers `pdpt_addr`, so the raw
         // pointer is valid for `PageTable`-sized writes.
         PageTable::zero_at(pdpt_addr.as_mut_ptr::<PageTable>());
 
         // Install the private PDPT in this domain's PML4 only.
-        let entry = PageTableEntry::new(
-            pdpt_addr,
-            PtFlags::PRESENT | PtFlags::WRITABLE,
-        );
+        let entry = PageTableEntry::new(pdpt_addr, PtFlags::PRESENT | PtFlags::WRITABLE);
         pml4.entries[slot_idx] = entry;
         installed += 1;
     }
@@ -179,16 +179,20 @@ pub unsafe fn init_per_domain_pdpts() -> Result<u8, DomainMapError> {
 ///   (Stage 1 boot PML4 covers the low 4 GiB).
 pub unsafe fn map_domain_private(
     domain: u8,
-    va:     VirtAddr,
-    pa:     PhysAddr,
-    flags:  PtFlags,
+    va: VirtAddr,
+    pa: PhysAddr,
+    flags: PtFlags,
 ) -> Result<(), DomainMapError> {
-    if domain >= NUM_DOMAINS { return Err(DomainMapError::BadDomain); }
+    if domain >= NUM_DOMAINS {
+        return Err(DomainMapError::BadDomain);
+    }
     if !va_in_domain_range(domain, va) {
         return Err(DomainMapError::AddressOutsideDomainRange);
     }
     let pml4_phys = pcid::get_domain_pml4(domain);
-    if pml4_phys == 0 { return Err(DomainMapError::NoPml4Registered); }
+    if pml4_phys == 0 {
+        return Err(DomainMapError::NoPml4Registered);
+    }
 
     // SAFETY: pml4_phys is identity-mapped; we just verified the VA
     // lies in this domain's slot, so the walk will hit the
@@ -203,7 +207,9 @@ pub unsafe fn map_domain_private(
     // PML4 at pml4_phys, which has the private PDPT installed for
     // this domain only, so any new PD/PT pages allocated below
     // inherit the privacy.
-    unsafe { map_4kb(PhysAddr::new(pml4_phys), va, pa, flags)?; }
+    unsafe {
+        map_4kb(PhysAddr::new(pml4_phys), va, pa, flags)?;
+    }
     Ok(())
 }
 
@@ -230,9 +236,13 @@ pub fn private_slot_status() -> [(u8, bool); NUM_DOMAINS as usize] {
 /// (the inspector's view should be `not present` for any other
 /// domain's slot).
 pub fn cross_domain_slot_present(inspector: u8, target_domain: u8) -> Option<bool> {
-    if inspector >= NUM_DOMAINS || target_domain >= NUM_DOMAINS { return None; }
+    if inspector >= NUM_DOMAINS || target_domain >= NUM_DOMAINS {
+        return None;
+    }
     let pml4_phys = pcid::get_domain_pml4(inspector);
-    if pml4_phys == 0 { return None; }
+    if pml4_phys == 0 {
+        return None;
+    }
     // SAFETY: pml4_phys identity-mapped; read-only.
     let pml4 = unsafe { &*(pml4_phys as *const PageTable) };
     Some(pml4.entries[PRIVATE_PML4_BASE + target_domain as usize].is_present())

@@ -17,13 +17,15 @@
 /// Panics in debug if the read runs off the end of the slice.
 pub fn read_bits_be(bytes: &[u8], bit_offset: usize, width: usize) -> u64 {
     debug_assert!(width <= 64, "width > 64");
-    debug_assert!(bit_offset + width <= bytes.len() * 8,
-                  "bit-field runs past end of slice");
+    debug_assert!(
+        bit_offset + width <= bytes.len() * 8,
+        "bit-field runs past end of slice"
+    );
     let mut acc: u64 = 0;
     for i in 0..width {
-        let bit_idx  = bit_offset + i;
+        let bit_idx = bit_offset + i;
         let byte_idx = bit_idx / 8;
-        let in_byte  = 7 - (bit_idx % 8);
+        let in_byte = 7 - (bit_idx % 8);
         let v = (bytes[byte_idx] >> in_byte) & 1;
         acc = (acc << 1) | (v as u64);
     }
@@ -33,24 +35,22 @@ pub fn read_bits_be(bytes: &[u8], bit_offset: usize, width: usize) -> u64 {
 /// Write the low `width` bits of `value` into `bytes` starting at
 /// `bit_offset`. MSB-first per byte. Panics in debug if the write
 /// runs off the slice or `value` overflows `width` bits.
-pub fn write_bits_be(
-    bytes:      &mut [u8],
-    bit_offset: usize,
-    width:      usize,
-    value:      u64,
-) {
+pub fn write_bits_be(bytes: &mut [u8], bit_offset: usize, width: usize, value: u64) {
     debug_assert!(width <= 64, "width > 64");
-    debug_assert!(bit_offset + width <= bytes.len() * 8,
-                  "bit-field runs past end of slice");
-    debug_assert!(width == 64 || value < (1u64 << width),
-                  "value overflows width bits");
+    debug_assert!(
+        bit_offset + width <= bytes.len() * 8,
+        "bit-field runs past end of slice"
+    );
+    debug_assert!(
+        width == 64 || value < (1u64 << width),
+        "value overflows width bits"
+    );
     for i in 0..width {
-        let bit_idx  = bit_offset + i;
+        let bit_idx = bit_offset + i;
         let byte_idx = bit_idx / 8;
-        let in_byte  = 7 - (bit_idx % 8);
+        let in_byte = 7 - (bit_idx % 8);
         // Bit `i` of value (MSB-first) → position `in_byte` of byte.
         let bit = ((value >> (width - 1 - i)) & 1) as u8;
-        bytes[byte_idx] = (bytes[byte_idx] & !(1 << in_byte))
-                        | (bit << in_byte);
+        bytes[byte_idx] = (bytes[byte_idx] & !(1 << in_byte)) | (bit << in_byte);
     }
 }

@@ -53,32 +53,34 @@ const MAX_PAGES_PER_HANDLE: usize = 256; // 1 MiB
 
 /// One live shared-memory region.
 pub struct Entry {
-    pub handle:  u64,
-    pub pid:     u64,
-    pub frames:  Vec<u64>,   // phys addrs, page-sized
-    pub len:     u64,
+    pub handle: u64,
+    pub pid: u64,
+    pub frames: Vec<u64>, // phys addrs, page-sized
+    pub len: u64,
 }
 
 impl core::fmt::Debug for Entry {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Entry")
             .field("handle", &self.handle)
-            .field("pid",    &self.pid)
-            .field("len",    &self.len)
+            .field("pid", &self.pid)
+            .field("len", &self.len)
             .field("frames", &self.frames.len())
             .finish_non_exhaustive()
     }
 }
 
-static REGISTRY:    IrqSafeSpinLock<Vec<Entry>> = IrqSafeSpinLock::new(Vec::new());
+static REGISTRY: IrqSafeSpinLock<Vec<Entry>> = IrqSafeSpinLock::new(Vec::new());
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 
 /// Allocate a fresh shared-memory region of `len` bytes (rounded
 /// up to a page). Returns the new handle id (>0).
 pub fn create(pid: u64, len: u64) -> Result<u64, ShmemError> {
-    if len == 0 { return Err(ShmemError::BadLen); }
+    if len == 0 {
+        return Err(ShmemError::BadLen);
+    }
     let len_pg = (len + PAGE - 1) & !(PAGE - 1);
-    let pages  = (len_pg / PAGE) as usize;
+    let pages = (len_pg / PAGE) as usize;
     if pages > MAX_PAGES_PER_HANDLE {
         return Err(ShmemError::BadLen);
     }
@@ -97,11 +99,18 @@ pub fn create(pid: u64, len: u64) -> Result<u64, ShmemError> {
         // Zero each frame so a fresh shmem doesn't surface stale
         // kernel data.
         // SAFETY: identity-mapped low-RAM frame; owned by us.
-        unsafe { core::ptr::write_bytes(phys as *mut u8, 0, PAGE as usize); }
+        unsafe {
+            core::ptr::write_bytes(phys as *mut u8, 0, PAGE as usize);
+        }
         frames.push(phys);
     }
     let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-    REGISTRY.lock().push(Entry { handle, pid, frames, len: len_pg });
+    REGISTRY.lock().push(Entry {
+        handle,
+        pid,
+        frames,
+        len: len_pg,
+    });
     Ok(handle)
 }
 
@@ -112,9 +121,11 @@ pub fn create(pid: u64, len: u64) -> Result<u64, ShmemError> {
 pub fn phys_at(handle: u64, byte_offset: u64) -> Option<u64> {
     let g = REGISTRY.lock();
     let e = g.iter().find(|e| e.handle == handle)?;
-    if byte_offset >= e.len { return None; }
+    if byte_offset >= e.len {
+        return None;
+    }
     let page_idx = (byte_offset / PAGE) as usize;
-    let intra    = byte_offset & (PAGE - 1);
+    let intra = byte_offset & (PAGE - 1);
     Some(e.frames[page_idx] + intra)
 }
 
@@ -125,7 +136,7 @@ pub fn phys_at(handle: u64, byte_offset: u64) -> Option<u64> {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SgEntry {
     pub phys: u64,
-    pub len:  u32,
+    pub len: u32,
 }
 
 /// Walk a `(handle, byte_offset, byte_len)` slice as scatter-
@@ -139,18 +150,16 @@ pub struct SgEntry {
 /// yields two entries:
 /// - `(frame0 + 100, 4096 - 100 = 3996)`
 /// - `(frame1, 7000 - 3996 = 3004)`
-pub fn sg_iter(
-    handle:      u64,
-    byte_offset: u64,
-    byte_len:    u64,
-) -> Option<SgIter> {
+pub fn sg_iter(handle: u64, byte_offset: u64, byte_len: u64) -> Option<SgIter> {
     let g = REGISTRY.lock();
     let e = g.iter().find(|e| e.handle == handle)?;
     let end = byte_offset.checked_add(byte_len)?;
-    if end > e.len { return None; }
+    if end > e.len {
+        return None;
+    }
     Some(SgIter {
-        frames:    e.frames.clone(),
-        cursor:    byte_offset,
+        frames: e.frames.clone(),
+        cursor: byte_offset,
         remaining: byte_len,
     })
 }
@@ -159,23 +168,28 @@ pub fn sg_iter(
 /// `SgEntry` per contiguous page-bounded run.
 #[derive(Debug)]
 pub struct SgIter {
-    frames:    Vec<u64>,
-    cursor:    u64,
+    frames: Vec<u64>,
+    cursor: u64,
     remaining: u64,
 }
 
 impl Iterator for SgIter {
     type Item = SgEntry;
     fn next(&mut self) -> Option<SgEntry> {
-        if self.remaining == 0 { return None; }
+        if self.remaining == 0 {
+            return None;
+        }
         let page_idx = (self.cursor / PAGE) as usize;
-        let intra    = self.cursor & (PAGE - 1);
-        let in_page  = PAGE - intra;
-        let take     = in_page.min(self.remaining);
-        let phys     = self.frames[page_idx] + intra;
-        self.cursor    += take;
+        let intra = self.cursor & (PAGE - 1);
+        let in_page = PAGE - intra;
+        let take = in_page.min(self.remaining);
+        let phys = self.frames[page_idx] + intra;
+        self.cursor += take;
         self.remaining -= take;
-        Some(SgEntry { phys, len: take as u32 })
+        Some(SgEntry {
+            phys,
+            len: take as u32,
+        })
     }
 }
 
@@ -189,12 +203,20 @@ pub fn frames_of(handle: u64) -> Option<Vec<PhysAddr>> {
 
 /// Total length (page-rounded) of the region.
 pub fn len_of(handle: u64) -> Option<u64> {
-    REGISTRY.lock().iter().find(|e| e.handle == handle).map(|e| e.len)
+    REGISTRY
+        .lock()
+        .iter()
+        .find(|e| e.handle == handle)
+        .map(|e| e.len)
 }
 
 /// Owner pid of the region.
 pub fn pid_of(handle: u64) -> Option<u64> {
-    REGISTRY.lock().iter().find(|e| e.handle == handle).map(|e| e.pid)
+    REGISTRY
+        .lock()
+        .iter()
+        .find(|e| e.handle == handle)
+        .map(|e| e.pid)
 }
 
 /// Tear down a region. The backing frames stay leaked until the
@@ -220,7 +242,9 @@ pub fn destroy_all_for_pid(pid: u64) -> u32 {
 }
 
 /// Number of live regions — for diagnostics + tests.
-pub fn count() -> usize { REGISTRY.lock().len() }
+pub fn count() -> usize {
+    REGISTRY.lock().len()
+}
 
 #[doc(hidden)]
 pub fn __reset_for_test() {
@@ -236,11 +260,11 @@ pub fn __reset_for_test() {
 pub fn syscall_vtable() -> &'static narf_userspace::handlers::ShmemSyscallVtable {
     use narf_userspace::handlers::ShmemSyscallVtable;
     static V: ShmemSyscallVtable = ShmemSyscallVtable {
-        create:  vt_create,
-        len_of:  vt_len_of,
-        frames:  vt_frames,
+        create: vt_create,
+        len_of: vt_len_of,
+        frames: vt_frames,
         destroy: vt_destroy,
-        pid_of:  vt_pid_of,
+        pid_of: vt_pid_of,
     };
     &V
 }
@@ -256,7 +280,7 @@ fn vt_len_of(handle: u64) -> u64 {
 fn vt_frames(handle: u64, out: &mut Vec<u64>) -> bool {
     let frames = match frames_of(handle) {
         Some(f) => f,
-        None    => return false,
+        None => return false,
     };
     out.clear();
     for p in frames {

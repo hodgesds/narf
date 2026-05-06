@@ -14,11 +14,15 @@ fn smoke_virtio_scsi_pci_match_table() -> TestResult {
     __reset_for_test();
     super::register_pci_driver();
     let registered = registered_pci_drivers();
-    let matched = registered.iter().any(|m|
-        matches!(m.kind, MatchKind::VendorDevice {
-            vendor: VIRTIO_SCSI_PCI_VENDOR,
-            device: VIRTIO_SCSI_PCI_DEVICE,
-        }));
+    let matched = registered.iter().any(|m| {
+        matches!(
+            m.kind,
+            MatchKind::VendorDevice {
+                vendor: VIRTIO_SCSI_PCI_VENDOR,
+                device: VIRTIO_SCSI_PCI_DEVICE,
+            }
+        )
+    });
     if !matched {
         return TestResult::Fail("virtio-scsi PCI match table missing 1AF4:1048");
     }
@@ -30,31 +34,49 @@ kernel_test_in!("drivers/virtio/scsi_pci", smoke_virtio_scsi_pci_match_table);
 
 fn smoke_virtio_scsi_pci_report_luns_roundtrip() -> TestResult {
     use super::wire::{
-        build_lun, build_report_luns_cdb, decode_cmd_resp, encode_cmd_req,
-        encode_tmf_req, CDB_SIZE, SENSE_SIZE, SCSI_OP_REPORT_LUNS,
-        VIRTIO_SCSI_S_OK, VIRTIO_SCSI_S_SIMPLE, VIRTIO_SCSI_T_TMF,
-        VIRTIO_SCSI_T_TMF_ABORT_TASK, VirtioScsiCmdResp,
+        build_lun, build_report_luns_cdb, decode_cmd_resp, encode_cmd_req, encode_tmf_req,
+        VirtioScsiCmdResp, CDB_SIZE, SCSI_OP_REPORT_LUNS, SENSE_SIZE, VIRTIO_SCSI_S_OK,
+        VIRTIO_SCSI_S_SIMPLE, VIRTIO_SCSI_T_TMF, VIRTIO_SCSI_T_TMF_ABORT_TASK,
     };
     // Encode a REPORT LUNS for target 0, LUN 0, allocation length 256.
     let cdb = build_report_luns_cdb(256);
-    if cdb[0] != SCSI_OP_REPORT_LUNS { return TestResult::Fail("REPORT LUNS opcode wrong"); }
-    if cdb[2] != 0 { return TestResult::Fail("SELECT REPORT must be 0"); }
+    if cdb[0] != SCSI_OP_REPORT_LUNS {
+        return TestResult::Fail("REPORT LUNS opcode wrong");
+    }
+    if cdb[2] != 0 {
+        return TestResult::Fail("SELECT REPORT must be 0");
+    }
     // alloc_len 256 = 0x00000100, big-endian at bytes 6..10.
     if cdb[6] != 0 || cdb[7] != 0 || cdb[8] != 0x01 || cdb[9] != 0x00 {
         return TestResult::Fail("alloc_len BE encoding wrong");
     }
     // CDB pads to CDB_SIZE.
-    if cdb.len() != CDB_SIZE { return TestResult::Fail("CDB pad size wrong"); }
+    if cdb.len() != CDB_SIZE {
+        return TestResult::Fail("CDB pad size wrong");
+    }
 
-    let req = encode_cmd_req(/*target*/ 0, /*lun*/ 0, /*id*/ 0xDEAD_BEEF,
-        VIRTIO_SCSI_S_SIMPLE, cdb);
+    let req = encode_cmd_req(
+        /*target*/ 0,
+        /*lun*/ 0,
+        /*id*/ 0xDEAD_BEEF,
+        VIRTIO_SCSI_S_SIMPLE,
+        cdb,
+    );
     let lun = req.lun;
-    if lun != build_lun(0, 0) { return TestResult::Fail("LUN field mismatch"); }
-    if lun[0] != 1 { return TestResult::Fail("virtio-scsi LUN[0] must be 1"); }
+    if lun != build_lun(0, 0) {
+        return TestResult::Fail("LUN field mismatch");
+    }
+    if lun[0] != 1 {
+        return TestResult::Fail("virtio-scsi LUN[0] must be 1");
+    }
     let id = req.id;
-    if id != 0xDEAD_BEEF { return TestResult::Fail("id round-trip failed"); }
+    if id != 0xDEAD_BEEF {
+        return TestResult::Fail("id round-trip failed");
+    }
     let ta = req.task_attr;
-    if ta != VIRTIO_SCSI_S_SIMPLE { return TestResult::Fail("task_attr lost"); }
+    if ta != VIRTIO_SCSI_S_SIMPLE {
+        return TestResult::Fail("task_attr lost");
+    }
 
     // Synthesize a successful response: status=GOOD (0), response=OK,
     // residual=0 (full alloc_len consumed by an empty LUN list).
@@ -67,8 +89,12 @@ fn smoke_virtio_scsi_pci_report_luns_roundtrip() -> TestResult {
         sense: [0u8; SENSE_SIZE],
     };
     let dec = decode_cmd_resp(&resp);
-    if dec.response != VIRTIO_SCSI_S_OK { return TestResult::Fail("response decode wrong"); }
-    if dec.status   != 0 { return TestResult::Fail("status decode wrong"); }
+    if dec.response != VIRTIO_SCSI_S_OK {
+        return TestResult::Fail("response decode wrong");
+    }
+    if dec.status != 0 {
+        return TestResult::Fail("status decode wrong");
+    }
     if dec.sense_len != 0 || dec.residual != 0 || dec.status_qualifier != 0 {
         return TestResult::Fail("zero-init resp decode mismatch");
     }
@@ -97,13 +123,22 @@ fn smoke_virtio_scsi_pci_report_luns_roundtrip() -> TestResult {
     let ty = tmf.r#type;
     let sub = tmf.subtype;
     let tid = tmf.id;
-    if ty != VIRTIO_SCSI_T_TMF { return TestResult::Fail("TMF type wrong"); }
-    if sub != VIRTIO_SCSI_T_TMF_ABORT_TASK { return TestResult::Fail("TMF subtype wrong"); }
-    if tid != 0xDEAD_BEEF { return TestResult::Fail("TMF id round-trip failed"); }
+    if ty != VIRTIO_SCSI_T_TMF {
+        return TestResult::Fail("TMF type wrong");
+    }
+    if sub != VIRTIO_SCSI_T_TMF_ABORT_TASK {
+        return TestResult::Fail("TMF subtype wrong");
+    }
+    if tid != 0xDEAD_BEEF {
+        return TestResult::Fail("TMF id round-trip failed");
+    }
 
     TestResult::Pass
 }
-kernel_test_in!("drivers/virtio/scsi_pci", smoke_virtio_scsi_pci_report_luns_roundtrip);
+kernel_test_in!(
+    "drivers/virtio/scsi_pci",
+    smoke_virtio_scsi_pci_report_luns_roundtrip
+);
 
 fn smoke_virtio_scsi_pci_live_report_luns() -> TestResult {
     use crate::scsi_pci;
@@ -118,8 +153,11 @@ fn smoke_virtio_scsi_pci_live_report_luns() -> TestResult {
             let _ = resp;
             TestResult::Pass
         }
-        Some(Err(_))  => TestResult::Fail("submit_cmd returned err"),
-        None          => TestResult::Skip("controller missing"),
+        Some(Err(_)) => TestResult::Fail("submit_cmd returned err"),
+        None => TestResult::Skip("controller missing"),
     }
 }
-kernel_test_in!("drivers/virtio/scsi_pci", smoke_virtio_scsi_pci_live_report_luns);
+kernel_test_in!(
+    "drivers/virtio/scsi_pci",
+    smoke_virtio_scsi_pci_live_report_luns
+);

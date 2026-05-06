@@ -43,26 +43,26 @@ const HANDOFF_VIRT: usize = 1;
 /// Static console state. A single global is fine — Stage 1 is BSP-only and
 /// we hold the write lock for the whole `write_str`.
 struct Console {
-    kind:     OnceLock<UartKind>,
-    handoff:  AtomicUsize,
-    base:     AtomicPtr<u8>,
-    lock:     IrqSafeSpinLock<()>,
+    kind: OnceLock<UartKind>,
+    handoff: AtomicUsize,
+    base: AtomicPtr<u8>,
+    lock: IrqSafeSpinLock<()>,
 }
 
 impl core::fmt::Debug for Console {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Console")
-            .field("kind",    &self.kind.get())
+            .field("kind", &self.kind.get())
             .field("handoff", &self.handoff.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
 }
 
 static CONSOLE: Console = Console {
-    kind:    OnceLock::new(),
+    kind: OnceLock::new(),
     handoff: AtomicUsize::new(HANDOFF_PHYS),
-    base:    AtomicPtr::new(core::ptr::null_mut()),
-    lock:    IrqSafeSpinLock::new(()),
+    base: AtomicPtr::new(core::ptr::null_mut()),
+    lock: IrqSafeSpinLock::new(()),
 };
 
 /// Called by `boot/` before the MMU is on.
@@ -81,17 +81,23 @@ pub fn early_init(base: PhysAddr, kind: UartKind) {
     // hardware. Kind mismatch panics (no valid reason to switch UARTs
     // mid-boot).
     if let Some(existing) = CONSOLE.kind.get() {
-        assert_eq!(*existing, kind,
-            "console::early_init: cannot switch UART kind mid-boot");
+        assert_eq!(
+            *existing, kind,
+            "console::early_init: cannot switch UART kind mid-boot"
+        );
     } else {
         let _ = CONSOLE.kind.set(kind);
     }
-    CONSOLE.base.store(base.as_mut_ptr::<u8>(), Ordering::Release);
+    CONSOLE
+        .base
+        .store(base.as_mut_ptr::<u8>(), Ordering::Release);
     CONSOLE.handoff.store(HANDOFF_PHYS, Ordering::Release);
 
     // SAFETY: the caller has supplied a real UART base; hardware
     // programming is idempotent on the 16550A / PL011.
-    unsafe { backend::init(base.raw() as usize, kind); }
+    unsafe {
+        backend::init(base.raw() as usize, kind);
+    }
 }
 
 /// Called by `memory/` inside the MMU-bring-up critical section. See
@@ -103,9 +109,13 @@ pub fn early_init(base: PhysAddr, kind: UartKind) {
 pub fn remap_to_virtual(virt: VirtAddr) {
     // §4 invariant: remap_to_virtual MUST NOT be called twice.
     let prev = CONSOLE.handoff.swap(HANDOFF_VIRT, Ordering::AcqRel);
-    assert_eq!(prev, HANDOFF_PHYS,
-        "console::remap_to_virtual called more than once");
-    CONSOLE.base.store(virt.as_mut_ptr::<u8>(), Ordering::Release);
+    assert_eq!(
+        prev, HANDOFF_PHYS,
+        "console::remap_to_virtual called more than once"
+    );
+    CONSOLE
+        .base
+        .store(virt.as_mut_ptr::<u8>(), Ordering::Release);
 }
 
 /// Write a string through the active backend. Blocks on a coarse lock to
@@ -115,13 +125,15 @@ pub fn write_str(s: &str) {
     let _g = CONSOLE.lock.lock();
     let kind = match CONSOLE.kind.get() {
         Some(k) => *k,
-        None    => return,              // pre-init; silently drop
+        None => return, // pre-init; silently drop
     };
     let base = CONSOLE.base.load(Ordering::Acquire) as usize;
     // SAFETY: `kind` + `base` were published via Release by `early_init`
     // or `remap_to_virtual`, and we hold the coarse lock; the backend
     // methods themselves uphold the compiler_fence discipline.
-    unsafe { backend::write_bytes(base, kind, s.as_bytes()); }
+    unsafe {
+        backend::write_bytes(base, kind, s.as_bytes());
+    }
 
     // Fan out to the framebuffer-console hook when installed.
     let h = FB_HOOK.load(Ordering::Acquire);

@@ -33,61 +33,71 @@ use narf_lib::sync::IrqSafeSpinLock;
 pub struct Thermal;
 
 impl CapType for Thermal {
-    const KIND: CapKind = CapKind::Governor;  // Re-use until a dedicated CapKind lands.
+    const KIND: CapKind = CapKind::Governor; // Re-use until a dedicated CapKind lands.
 }
 
 /// Thermal threshold crossing event.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ThermalEvent {
     /// Zone crossed into the warning band.
-    Warm       { zone: u32, milli_c: i32 },
+    Warm { zone: u32, milli_c: i32 },
     /// Zone crossed into the critical band — callers should throttle
     /// or park the affected device.
-    Critical   { zone: u32, milli_c: i32 },
+    Critical { zone: u32, milli_c: i32 },
     /// Zone returned under the warning band.
-    Normal     { zone: u32, milli_c: i32 },
+    Normal { zone: u32, milli_c: i32 },
 }
 
 /// One registered thermal zone. Temperatures are in millidegrees C.
 #[derive(Debug)]
 pub struct ThermalZone {
-    pub id:          u32,
-    pub name:        String,
-    pub warn_milli:  i32,
-    pub crit_milli:  i32,
-    temp_milli:      AtomicI32,
+    pub id: u32,
+    pub name: String,
+    pub warn_milli: i32,
+    pub crit_milli: i32,
+    temp_milli: AtomicI32,
 }
 
 impl ThermalZone {
     #[inline]
-    pub fn temp(&self) -> i32 { self.temp_milli.load(Ordering::Relaxed) }
+    pub fn temp(&self) -> i32 {
+        self.temp_milli.load(Ordering::Relaxed)
+    }
 
     /// Classify the current temperature against `warn_milli` and
     /// `crit_milli`. `Normal` is below `warn_milli`.
     #[inline]
     pub fn state(&self) -> ThermalState {
         let t = self.temp();
-        if t >= self.crit_milli { ThermalState::Critical }
-        else if t >= self.warn_milli { ThermalState::Warm }
-        else { ThermalState::Normal }
+        if t >= self.crit_milli {
+            ThermalState::Critical
+        } else if t >= self.warn_milli {
+            ThermalState::Warm
+        } else {
+            ThermalState::Normal
+        }
     }
 }
 
 /// Hysteresis band classifier.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum ThermalState { Normal, Warm, Critical }
+pub enum ThermalState {
+    Normal,
+    Warm,
+    Critical,
+}
 
 type Subscriber = Box<dyn Fn(&ThermalEvent) + Send + Sync + 'static>;
 
 struct Registry {
-    zones:       Vec<ThermalZone>,
+    zones: Vec<ThermalZone>,
     subscribers: Vec<Subscriber>,
 }
 
 impl core::fmt::Debug for Registry {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Registry")
-            .field("zones",       &self.zones.len())
+            .field("zones", &self.zones.len())
             .field("subscribers", &self.subscribers.len())
             .finish()
     }
@@ -104,18 +114,23 @@ pub enum ThermalError {
 }
 
 impl From<CapError> for ThermalError {
-    fn from(_: CapError) -> Self { ThermalError::AuthorityRevoked }
+    fn from(_: CapError) -> Self {
+        ThermalError::AuthorityRevoked
+    }
 }
 
 /// Initialise the thermal registry. Safe to call more than once —
 /// re-initialisation clears the zone + subscriber tables.
 pub fn init() {
-    *REG.lock() = Some(Registry { zones: Vec::new(), subscribers: Vec::new() });
+    *REG.lock() = Some(Registry {
+        zones: Vec::new(),
+        subscribers: Vec::new(),
+    });
 }
 
 /// Register a new zone. Returns its id.
 pub fn register_zone(
-    cap:  &Cap<Thermal, Grant>,
+    cap: &Cap<Thermal, Grant>,
     name: &str,
     warn_milli: i32,
     crit_milli: i32,
@@ -136,7 +151,9 @@ pub fn register_zone(
 
 /// Install a subscriber for thermal events.
 pub fn subscribe<F>(cap: &Cap<Thermal, Grant>, cb: F) -> Result<(), ThermalError>
-where F: Fn(&ThermalEvent) + Send + Sync + 'static {
+where
+    F: Fn(&ThermalEvent) + Send + Sync + 'static,
+{
     cap.invoke(NoopOp)?;
     let mut r = REG.lock();
     let reg = r.as_mut().ok_or(ThermalError::NotInitialised)?;
@@ -152,7 +169,10 @@ where F: Fn(&ThermalEvent) + Send + Sync + 'static {
 pub fn record_temp(zone: u32, milli_c: i32) -> Result<ThermalState, ThermalError> {
     let r = REG.lock();
     let reg = r.as_ref().ok_or(ThermalError::NotInitialised)?;
-    let z = reg.zones.get(zone as usize).ok_or(ThermalError::UnknownZone)?;
+    let z = reg
+        .zones
+        .get(zone as usize)
+        .ok_or(ThermalError::UnknownZone)?;
 
     let prev_state = z.state();
     z.temp_milli.store(milli_c, Ordering::Relaxed);
@@ -160,8 +180,8 @@ pub fn record_temp(zone: u32, milli_c: i32) -> Result<ThermalState, ThermalError
 
     if new_state != prev_state {
         let event = match new_state {
-            ThermalState::Normal   => ThermalEvent::Normal   { zone, milli_c },
-            ThermalState::Warm     => ThermalEvent::Warm     { zone, milli_c },
+            ThermalState::Normal => ThermalEvent::Normal { zone, milli_c },
+            ThermalState::Warm => ThermalEvent::Warm { zone, milli_c },
             ThermalState::Critical => ThermalEvent::Critical { zone, milli_c },
         };
         for cb in &reg.subscribers {
@@ -176,7 +196,10 @@ pub fn record_temp(zone: u32, milli_c: i32) -> Result<ThermalState, ThermalError
 pub fn read_temp(zone: u32) -> Result<i32, ThermalError> {
     let r = REG.lock();
     let reg = r.as_ref().ok_or(ThermalError::NotInitialised)?;
-    let z = reg.zones.get(zone as usize).ok_or(ThermalError::UnknownZone)?;
+    let z = reg
+        .zones
+        .get(zone as usize)
+        .ok_or(ThermalError::UnknownZone)?;
     Ok(z.temp())
 }
 
@@ -187,4 +210,6 @@ pub fn zone_count() -> usize {
 
 /// Test helper: reset registry to empty.
 #[doc(hidden)]
-pub fn __test_reset() { *REG.lock() = None; }
+pub fn __test_reset() {
+    *REG.lock() = None;
+}

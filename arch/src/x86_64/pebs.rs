@@ -15,21 +15,25 @@
 use crate::x86_64::cpuid::cpuid;
 use crate::x86_64::msr::{rdmsr, wrmsr};
 
-pub const MSR_IA32_DS_AREA:       u32 = 0x600;
-pub const MSR_PEBS_ENABLE:        u32 = 0x3F1;
-pub const MSR_PEBS_DATA_CFG:      u32 = 0x3F7;
-pub const MSR_IA32_MISC_ENABLE:   u32 = 0x1A0;
-const MISC_ENABLE_PEBS_UNAVAIL:   u64 = 1 << 12;
+pub const MSR_IA32_DS_AREA: u32 = 0x600;
+pub const MSR_PEBS_ENABLE: u32 = 0x3F1;
+pub const MSR_PEBS_DATA_CFG: u32 = 0x3F7;
+pub const MSR_IA32_MISC_ENABLE: u32 = 0x1A0;
+const MISC_ENABLE_PEBS_UNAVAIL: u64 = 1 << 12;
 
 /// `true` iff PEBS is plausibly available — PMU advertised at
 /// version >= 1 AND `IA32_MISC_ENABLE.PEBS_UNAVAILABLE` is clear.
 pub fn supported() -> bool {
     // SAFETY: leaf 0 always defined.
     let max = unsafe { cpuid(0, 0).0 };
-    if max < 0x0A { return false; }
+    if max < 0x0A {
+        return false;
+    }
     // SAFETY: leaf 0xA valid.
     let (eax, _, _, _) = unsafe { cpuid(0x0A, 0) };
-    if eax & 0xFF == 0 { return false; }
+    if eax & 0xFF == 0 {
+        return false;
+    }
     // SAFETY: caller is in CPL=0; MSR architectural since P4.
     let me = unsafe { rdmsr(MSR_IA32_MISC_ENABLE) };
     me & MISC_ENABLE_PEBS_UNAVAIL == 0
@@ -39,9 +43,9 @@ pub fn supported() -> bool {
 /// caller cares about.
 #[derive(Copy, Clone, Debug)]
 pub struct PebsBuffer {
-    pub base:                u64,
-    pub capacity_records:    u32,
-    pub record_size:         u32,
+    pub base: u64,
+    pub capacity_records: u32,
+    pub record_size: u32,
     pub interrupt_threshold: u64,
 }
 
@@ -86,7 +90,9 @@ pub unsafe fn install_ds(ds_area_phys: u64, pebs: PebsBuffer) {
         core::ptr::write_volatile((ds_area_phys + 0x38) as *mut u64, pebs.interrupt_threshold);
     }
     // SAFETY: caller-asserted.
-    unsafe { wrmsr(MSR_IA32_DS_AREA, ds_area_phys); }
+    unsafe {
+        wrmsr(MSR_IA32_DS_AREA, ds_area_phys);
+    }
 }
 
 /// Enable PEBS for the counters in `general_mask` (bit i = PMC i).
@@ -95,7 +101,9 @@ pub unsafe fn install_ds(ds_area_phys: u64, pebs: PebsBuffer) {
 /// CPL = 0; `install_ds` was called; PEBS supported.
 pub unsafe fn enable(general_mask: u32) {
     // SAFETY: caller-asserted.
-    unsafe { wrmsr(MSR_PEBS_ENABLE, general_mask as u64); }
+    unsafe {
+        wrmsr(MSR_PEBS_ENABLE, general_mask as u64);
+    }
 }
 
 /// Disable PEBS on every counter.
@@ -104,7 +112,9 @@ pub unsafe fn enable(general_mask: u32) {
 /// CPL = 0.
 pub unsafe fn disable() {
     // SAFETY: caller-asserted.
-    unsafe { wrmsr(MSR_PEBS_ENABLE, 0); }
+    unsafe {
+        wrmsr(MSR_PEBS_ENABLE, 0);
+    }
 }
 
 /// Current write index of the PEBS buffer (for diagnostics —

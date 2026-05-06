@@ -53,7 +53,9 @@ pub enum MsiError {
 }
 
 impl From<CapError> for MsiError {
-    fn from(_: CapError) -> Self { MsiError::AuthorityRevoked }
+    fn from(_: CapError) -> Self {
+        MsiError::AuthorityRevoked
+    }
 }
 
 /// MSI configuration after `enable_msi`. Holding this is the type-
@@ -61,27 +63,35 @@ impl From<CapError> for MsiError {
 #[derive(Debug)]
 pub struct MsiConfig {
     /// Cfg-space offset of the cap header.
-    cap_offset:    u64,
+    cap_offset: u64,
     /// `true` if the cap supports a 64-bit Message Address (most
     /// modern devices do).
-    is_64bit:      bool,
+    is_64bit: bool,
     /// `true` if the cap supports per-vector masking.
-    per_vec_mask:  bool,
+    per_vec_mask: bool,
     /// Multi-Message Capable — `log2(N)` vectors device wants.
     /// Actual N = 1 << mmc, range 1..=32.
-    mmc_log2:      u8,
+    mmc_log2: u8,
     /// Multi-Message Enable — what we asked for. Mirrors what's in
     /// the device's Message Control register.
-    mme_log2:      u8,
+    mme_log2: u8,
     /// Cfg-space window for the device.
-    cfg_phys:      PhysAddr,
+    cfg_phys: PhysAddr,
 }
 
 impl MsiConfig {
-    pub fn vectors_supported(&self) -> u16 { 1 << self.mmc_log2 }
-    pub fn vectors_enabled(&self)   -> u16 { 1 << self.mme_log2 }
-    pub fn is_64bit(&self)          -> bool { self.is_64bit }
-    pub fn per_vector_mask(&self)   -> bool { self.per_vec_mask }
+    pub fn vectors_supported(&self) -> u16 {
+        1 << self.mmc_log2
+    }
+    pub fn vectors_enabled(&self) -> u16 {
+        1 << self.mme_log2
+    }
+    pub fn is_64bit(&self) -> bool {
+        self.is_64bit
+    }
+    pub fn per_vector_mask(&self) -> bool {
+        self.per_vec_mask
+    }
 }
 
 /// Discover the MSI cap on `device` and reserve up to `n_vectors`
@@ -92,14 +102,14 @@ impl MsiConfig {
 ///
 /// Cap-gated.
 pub fn enable_msi(
-    cap:    &Cap<BusDeviceCap, Write>,
+    cap: &Cap<BusDeviceCap, Write>,
     device: &BusDevice,
     n_requested: u16,
 ) -> Result<MsiConfig, MsiError> {
     cap.check_live()?;
     let cfg_phys = match device.kind {
         BusKind::Pcie { cfg_phys, .. } => cfg_phys,
-        BusKind::VirtioMmio { .. }     => return Err(MsiError::NotPcie),
+        BusKind::VirtioMmio { .. } => return Err(MsiError::NotPcie),
     };
     // SAFETY: bounded cap-list walk.
     let cap_off = unsafe { pci_cap::find_cap(device, MSI_CAP_ID) }
@@ -108,9 +118,9 @@ pub fn enable_msi(
 
     // SAFETY: cap_off + 2 < 0x100 by spec.
     let msg_ctrl = unsafe { cfg_read16(cfg_phys, cap_off + 2) };
-    let mmc      = ((msg_ctrl >> 1) & 0x7) as u8;          // bits 3:1
-    let is_64bit = (msg_ctrl & (1 << 7))  != 0;
-    let per_vec  = (msg_ctrl & (1 << 8))  != 0;
+    let mmc = ((msg_ctrl >> 1) & 0x7) as u8; // bits 3:1
+    let is_64bit = (msg_ctrl & (1 << 7)) != 0;
+    let per_vec = (msg_ctrl & (1 << 8)) != 0;
 
     if n_requested == 0 || n_requested > (1u16 << mmc) {
         return Err(MsiError::TooManyVectors);
@@ -142,7 +152,7 @@ pub fn enable_msi(
 pub unsafe fn program_msi(
     cfg: &mut MsiConfig,
     target_apic_id: u32,
-    base_irq:        u8,
+    base_irq: u8,
 ) -> Result<u64, MsiError> {
     let (addr, data) = msi_message(target_apic_id, base_irq);
 
@@ -159,7 +169,9 @@ pub unsafe fn program_msi(
         } else {
             // 32-bit MSI: data sits at +8. The high address word
             // doesn't exist on this cap.
-            if addr_hi != 0 { return Err(MsiError::Unsupported); }
+            if addr_hi != 0 {
+                return Err(MsiError::Unsupported);
+            }
             cfg_write16(cfg.cfg_phys, cfg.cap_offset + 8, data as u16);
         }
     }
@@ -175,11 +187,11 @@ pub unsafe fn program_msi(
 pub unsafe fn enable(cfg: &MsiConfig) -> Result<(), MsiError> {
     // SAFETY: cap window.
     let mc = unsafe { cfg_read16(cfg.cfg_phys, cfg.cap_offset + 2) };
-    let new = (mc & !(0x7 << 4))
-        | ((cfg.mme_log2 as u16) << 4)
-        | 1; // Enable
-    // SAFETY: same.
-    unsafe { cfg_write16(cfg.cfg_phys, cfg.cap_offset + 2, new); }
+    let new = (mc & !(0x7 << 4)) | ((cfg.mme_log2 as u16) << 4) | 1; // Enable
+                                                                     // SAFETY: same.
+    unsafe {
+        cfg_write16(cfg.cfg_phys, cfg.cap_offset + 2, new);
+    }
     Ok(())
 }
 
@@ -203,7 +215,10 @@ fn msi_message(target: u32, base_irq: u8) -> (u64, u32) {
         )
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    { let _ = (target, base_irq); (0, 0) }
+    {
+        let _ = (target, base_irq);
+        (0, 0)
+    }
 }
 
 // ── helpers ─────────────────────────────────────────────────────────
@@ -221,7 +236,9 @@ unsafe fn cfg_read16(cfg: PhysAddr, off: u64) -> u16 {
 unsafe fn cfg_write16(cfg: PhysAddr, off: u64, value: u16) {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: caller asserts the slot is writable + 2-byte aligned.
-    unsafe { core::ptr::write_volatile((cfg.raw() + off) as *mut u16, value); }
+    unsafe {
+        core::ptr::write_volatile((cfg.raw() + off) as *mut u16, value);
+    }
     compiler_fence(Ordering::SeqCst);
 }
 
@@ -229,6 +246,8 @@ unsafe fn cfg_write16(cfg: PhysAddr, off: u64, value: u16) {
 unsafe fn cfg_write32(cfg: PhysAddr, off: u64, value: u32) {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: caller asserts the slot is writable + 4-byte aligned.
-    unsafe { core::ptr::write_volatile((cfg.raw() + off) as *mut u32, value); }
+    unsafe {
+        core::ptr::write_volatile((cfg.raw() + off) as *mut u32, value);
+    }
     compiler_fence(Ordering::SeqCst);
 }

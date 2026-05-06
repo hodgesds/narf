@@ -84,14 +84,14 @@ enum Arch {
 impl Arch {
     fn triple(self) -> &'static str {
         match self {
-            Arch::X86_64  => "x86_64-unknown-none",
+            Arch::X86_64 => "x86_64-unknown-none",
             Arch::Aarch64 => "aarch64-unknown-none",
         }
     }
 
     fn qemu_bin(self) -> &'static str {
         match self {
-            Arch::X86_64  => "qemu-system-x86_64",
+            Arch::X86_64 => "qemu-system-x86_64",
             Arch::Aarch64 => "qemu-system-aarch64",
         }
     }
@@ -129,60 +129,108 @@ impl Arch {
 
                 if legacy {
                     args.extend_from_slice(&[
-                        "-drive".into(),  format!("if=none,id=nvm0,format=raw,file={}", nvme_image_path().display()),
-                        "-device".into(), "nvme,drive=nvm0,serial=narf".into(),
+                        "-drive".into(),
+                        format!(
+                            "if=none,id=nvm0,format=raw,file={}",
+                            nvme_image_path().display()
+                        ),
+                        "-device".into(),
+                        "nvme,drive=nvm0,serial=narf".into(),
                     ]);
                     args.extend_from_slice(&[
-                        "-netdev".into(), "user,id=n1".into(),
-                        "-device".into(), "e1000,netdev=n1".into(),
+                        "-netdev".into(),
+                        "user,id=n1".into(),
+                        "-device".into(),
+                        "e1000,netdev=n1".into(),
                     ]);
                     args.extend_from_slice(&[
-                        "-drive".into(),  format!("if=none,id=sata0,format=raw,file={}", ahci_image_path().display()),
-                        "-device".into(), "ide-hd,drive=sata0,bus=ide.0".into(),
+                        "-drive".into(),
+                        format!(
+                            "if=none,id=sata0,format=raw,file={}",
+                            ahci_image_path().display()
+                        ),
+                        "-device".into(),
+                        "ide-hd,drive=sata0,bus=ide.0".into(),
                     ]);
                     args.extend_from_slice(&["-device".into(), "qemu-xhci,id=xhci0".into()]);
-                    args.extend_from_slice(&["-vga".into(), "none".into(), "-device".into(), "bochs-display".into()]);
                     args.extend_from_slice(&[
-                        "-audiodev".into(), "none,id=snd0".into(),
-                        "-device".into(),   "intel-hda".into(),
-                        "-device".into(),   "hda-duplex,audiodev=snd0".into(),
+                        "-vga".into(),
+                        "none".into(),
+                        "-device".into(),
+                        "bochs-display".into(),
+                    ]);
+                    args.extend_from_slice(&[
+                        "-audiodev".into(),
+                        "none,id=snd0".into(),
+                        "-device".into(),
+                        "intel-hda".into(),
+                        "-device".into(),
+                        "hda-duplex,audiodev=snd0".into(),
                     ]);
                 }
 
                 if virtio {
                     args.extend_from_slice(&[
-                        "-drive".into(),  format!("if=none,id=vblk0,format=raw,file={}", virtio_blk_image_path().display()),
-                        "-device".into(), "virtio-blk-pci,drive=vblk0,disable-legacy=on,disable-modern=off".into(),
+                        "-drive".into(),
+                        format!(
+                            "if=none,id=vblk0,format=raw,file={}",
+                            virtio_blk_image_path().display()
+                        ),
+                        "-device".into(),
+                        "virtio-blk-pci,drive=vblk0,disable-legacy=on,disable-modern=off".into(),
                     ]);
                     args.extend_from_slice(&[
-                        "-netdev".into(), "user,id=n0".into(),
-                        "-device".into(), "virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off".into(),
+                        "-netdev".into(),
+                        "user,id=n0".into(),
+                        "-device".into(),
+                        "virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off".into(),
                     ]);
                     args.extend_from_slice(&[
-                        "-object".into(), "rng-random,id=rng0,filename=/dev/urandom".into(),
-                        "-device".into(), "virtio-rng-pci,rng=rng0,disable-legacy=on,disable-modern=off".into(),
+                        "-object".into(),
+                        "rng-random,id=rng0,filename=/dev/urandom".into(),
+                        "-device".into(),
+                        "virtio-rng-pci,rng=rng0,disable-legacy=on,disable-modern=off".into(),
                     ]);
-                    args.extend_from_slice(&["-device".into(), "virtio-balloon-pci,disable-legacy=on,disable-modern=off".into()]);
-                    args.extend_from_slice(&["-device".into(), "virtio-keyboard-pci,disable-legacy=on,disable-modern=off".into()]);
-                    args.extend_from_slice(&["-device".into(), "virtio-gpu-pci,disable-legacy=on,disable-modern=off".into()]);
+                    args.extend_from_slice(&[
+                        "-device".into(),
+                        "virtio-balloon-pci,disable-legacy=on,disable-modern=off".into(),
+                    ]);
+                    args.extend_from_slice(&[
+                        "-device".into(),
+                        "virtio-keyboard-pci,disable-legacy=on,disable-modern=off".into(),
+                    ]);
+                    args.extend_from_slice(&[
+                        "-device".into(),
+                        "virtio-gpu-pci,disable-legacy=on,disable-modern=off".into(),
+                    ]);
                     if !legacy {
                         args.extend_from_slice(&["-audiodev".into(), "none,id=snd0".into()]);
                     }
-                    args.extend_from_slice(&["-device".into(), "virtio-sound-pci,audiodev=snd0,disable-legacy=on,disable-modern=off".into()]);
+                    args.extend_from_slice(&[
+                        "-device".into(),
+                        "virtio-sound-pci,audiodev=snd0,disable-legacy=on,disable-modern=off"
+                            .into(),
+                    ]);
                 }
 
                 args.push("-kernel".into());
                 args.push(kernel);
                 args
-            },
+            }
             Arch::Aarch64 => {
                 let mut args = vec![
-                    "-machine".into(),  "virt,gic-version=3,mte=on,highmem-ecam=off".into(),
-                    "-cpu".into(),      "max".into(),
-                    "-smp".into(),      "2".into(),
-                    "-m".into(),        "256M".into(),
-                    "-serial".into(),   "stdio".into(),
-                    "-display".into(),  display.clone(),
+                    "-machine".into(),
+                    "virt,gic-version=3,mte=on,highmem-ecam=off".into(),
+                    "-cpu".into(),
+                    "max".into(),
+                    "-smp".into(),
+                    "2".into(),
+                    "-m".into(),
+                    "256M".into(),
+                    "-serial".into(),
+                    "stdio".into(),
+                    "-display".into(),
+                    display.clone(),
                     "-no-reboot".into(),
                     "-semihosting".into(),
                 ];
@@ -193,26 +241,34 @@ impl Arch {
                 if legacy {
                     args.extend_from_slice(&[
                         "-drive".into(),
-                        format!("if=none,id=nvm0,format=raw,file={}",
-                                nvme_image_path().display()),
-                        "-device".into(),   "nvme,drive=nvm0,serial=narf".into(),
+                        format!(
+                            "if=none,id=nvm0,format=raw,file={}",
+                            nvme_image_path().display()
+                        ),
+                        "-device".into(),
+                        "nvme,drive=nvm0,serial=narf".into(),
                     ]);
                     args.extend_from_slice(&[
-                        "-netdev".into(),  "user,id=n1".into(),
-                        "-device".into(),  "e1000,netdev=n1".into(),
+                        "-netdev".into(),
+                        "user,id=n1".into(),
+                        "-device".into(),
+                        "e1000,netdev=n1".into(),
                     ]);
                 }
 
                 if virtio {
                     args.extend_from_slice(&[
                         "-drive".into(),
-                        format!("if=none,id=vblk0,format=raw,file={}",
-                                virtio_blk_image_path().display()),
+                        format!(
+                            "if=none,id=vblk0,format=raw,file={}",
+                            virtio_blk_image_path().display()
+                        ),
                         "-device".into(),
                         "virtio-blk-pci,drive=vblk0,disable-legacy=on,disable-modern=off".into(),
                     ]);
                     args.extend_from_slice(&[
-                        "-netdev".into(),  "user,id=n0".into(),
+                        "-netdev".into(),
+                        "user,id=n0".into(),
                         "-device".into(),
                         "virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off".into(),
                     ]);
@@ -222,17 +278,33 @@ impl Arch {
                         "-device".into(),
                         "virtio-rng-pci,rng=rng0,disable-legacy=on,disable-modern=off".into(),
                     ]);
-                    args.extend_from_slice(&["-device".into(), "virtio-balloon-pci,disable-legacy=on,disable-modern=off".into()]);
-                    args.extend_from_slice(&["-device".into(), "virtio-keyboard-pci,disable-legacy=on,disable-modern=off".into()]);
-                    args.extend_from_slice(&["-device".into(), "virtio-gpu-pci,disable-legacy=on,disable-modern=off".into()]);
+                    args.extend_from_slice(&[
+                        "-device".into(),
+                        "virtio-balloon-pci,disable-legacy=on,disable-modern=off".into(),
+                    ]);
+                    args.extend_from_slice(&[
+                        "-device".into(),
+                        "virtio-keyboard-pci,disable-legacy=on,disable-modern=off".into(),
+                    ]);
+                    args.extend_from_slice(&[
+                        "-device".into(),
+                        "virtio-gpu-pci,disable-legacy=on,disable-modern=off".into(),
+                    ]);
                     args.extend_from_slice(&["-audiodev".into(), "none,id=snd0".into()]);
-                    args.extend_from_slice(&["-device".into(), "virtio-sound-pci,audiodev=snd0,disable-legacy=on,disable-modern=off".into()]);
+                    args.extend_from_slice(&[
+                        "-device".into(),
+                        "virtio-sound-pci,audiodev=snd0,disable-legacy=on,disable-modern=off"
+                            .into(),
+                    ]);
                 }
 
                 args.extend_from_slice(&[
                     "-device".into(),
-                    format!("loader,file={},addr={:#x},force-raw=on",
-                            qemu_virt_dtb_path().display(), DTB_LOAD_ADDR),
+                    format!(
+                        "loader,file={},addr={:#x},force-raw=on",
+                        qemu_virt_dtb_path().display(),
+                        DTB_LOAD_ADDR
+                    ),
                 ]);
 
                 args.push("-kernel".into());
@@ -256,26 +328,43 @@ fn qemu_virt_dtb_path() -> PathBuf {
             .arg("-machine")
             .arg(format!(
                 "virt,gic-version=3,mte=on,highmem-ecam=off,dumpdtb={}",
-                path.display()))
-            .arg("-cpu").arg("max")
-            .arg("-smp").arg("2")
-            .arg("-m").arg("256M")
-            .arg("-display").arg("none")
+                path.display()
+            ))
+            .arg("-cpu")
+            .arg("max")
+            .arg("-smp")
+            .arg("2")
+            .arg("-m")
+            .arg("256M")
+            .arg("-display")
+            .arg("none")
             .arg("-no-reboot")
-            .arg("-drive").arg(format!(
+            .arg("-drive")
+            .arg(format!(
                 "if=none,id=nvm0,format=raw,file={}",
-                nvme_image_path().display()))
-            .arg("-device").arg("nvme,drive=nvm0,serial=narf")
-            .arg("-drive").arg(format!(
+                nvme_image_path().display()
+            ))
+            .arg("-device")
+            .arg("nvme,drive=nvm0,serial=narf")
+            .arg("-drive")
+            .arg(format!(
                 "if=none,id=vblk0,format=raw,file={}",
-                virtio_blk_image_path().display()))
-            .arg("-device").arg("virtio-blk-pci,drive=vblk0")
-            .arg("-netdev").arg("user,id=n0")
-            .arg("-device").arg("virtio-net-pci,netdev=n0")
-            .arg("-netdev").arg("user,id=n1")
-            .arg("-device").arg("e1000,netdev=n1")
-            .arg("-object").arg("rng-random,id=rng0,filename=/dev/urandom")
-            .arg("-device").arg("virtio-rng-pci,rng=rng0")
+                virtio_blk_image_path().display()
+            ))
+            .arg("-device")
+            .arg("virtio-blk-pci,drive=vblk0")
+            .arg("-netdev")
+            .arg("user,id=n0")
+            .arg("-device")
+            .arg("virtio-net-pci,netdev=n0")
+            .arg("-netdev")
+            .arg("user,id=n1")
+            .arg("-device")
+            .arg("e1000,netdev=n1")
+            .arg("-object")
+            .arg("rng-random,id=rng0,filename=/dev/urandom")
+            .arg("-device")
+            .arg("virtio-rng-pci,rng=rng0")
             .status();
     }
     path
@@ -329,8 +418,10 @@ fn workspace_root() -> Result<PathBuf> {
     let manifest = std::env::var("CARGO_MANIFEST_DIR")
         .context("CARGO_MANIFEST_DIR not set — run via `cargo xtask`")?;
     let root = Path::new(&manifest)
-        .parent().ok_or_else(|| anyhow!("manifest dir has no parent"))?
-        .parent().ok_or_else(|| anyhow!("manifest dir has no grandparent"))?
+        .parent()
+        .ok_or_else(|| anyhow!("manifest dir has no parent"))?
+        .parent()
+        .ok_or_else(|| anyhow!("manifest dir has no grandparent"))?
         .to_path_buf();
     Ok(root)
 }
@@ -339,11 +430,17 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
     let mut cmd = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
     cmd.current_dir(root)
         .arg("build")
-        .arg("-p").arg(&args.package)
-        .arg("--target").arg(args.arch.triple())
-        .arg("-Z").arg("build-std=core,compiler_builtins,alloc")
-        .arg("-Z").arg("build-std-features=compiler-builtins-mem,compiler-builtins-no-f16-f128");
-    if args.release { cmd.arg("--release"); }
+        .arg("-p")
+        .arg(&args.package)
+        .arg("--target")
+        .arg(args.arch.triple())
+        .arg("-Z")
+        .arg("build-std=core,compiler_builtins,alloc")
+        .arg("-Z")
+        .arg("build-std-features=compiler-builtins-mem,compiler-builtins-no-f16-f128");
+    if args.release {
+        cmd.arg("--release");
+    }
     if !args.features.is_empty() {
         cmd.arg("--features").arg(&args.features);
     }
@@ -354,10 +451,7 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
     }
 
     let profile = if args.release { "release" } else { "debug" };
-    let out = root
-        .join("target")
-        .join(args.arch.triple())
-        .join(profile);
+    let out = root.join("target").join(args.arch.triple()).join(profile);
     Ok(out)
 }
 
@@ -370,21 +464,25 @@ fn run_cmd(args: &BuildArgs) -> Result<()> {
 
     let kernel = out_dir.join(&args.package);
     if !kernel.exists() {
-        bail!("expected kernel binary at {} — did `cargo build` succeed?",
-              kernel.display());
+        bail!(
+            "expected kernel binary at {} — did `cargo build` succeed?",
+            kernel.display()
+        );
     }
 
     let qemu = args.arch.qemu_bin();
     let mut cmd = Command::new(qemu);
     cmd.args(args.arch.qemu_args(&kernel, &args.display, args.hw_profile));
-    
+
     println!("xtask: launching {} {}", qemu, kernel.display());
-    
-    let mut child = cmd.spawn()
+
+    let mut child = cmd
+        .spawn()
         .with_context(|| format!("failed to spawn {qemu}"))?;
 
     let secs = std::env::var("XTASK_QEMU_TIMEOUT_SECS")
-        .ok().and_then(|s| s.parse::<u64>().ok())
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(240);
     match child.wait_timeout(Duration::from_secs(secs))? {
         Some(status) => {
@@ -402,9 +500,12 @@ fn run_cmd(args: &BuildArgs) -> Result<()> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Build(args) => { cargo_build(&args, &workspace_root()?)?; Ok(()) }
-        Cmd::Run(args)   => run_cmd(&args),
-        Cmd::Test(mut args)  => {
+        Cmd::Build(args) => {
+            cargo_build(&args, &workspace_root()?)?;
+            Ok(())
+        }
+        Cmd::Run(args) => run_cmd(&args),
+        Cmd::Test(mut args) => {
             if args.features.is_empty() {
                 args.features = "kernel-test".into();
             } else if !args.features.contains("kernel-test") {
@@ -413,8 +514,10 @@ fn main() -> Result<()> {
             run_cmd(&args)
         }
         Cmd::Image(args) => {
-            eprintln!("xtask image: stub (arch={:?}); wires in with boot/ at Stage 1 Wave 1.",
-                args.arch.triple());
+            eprintln!(
+                "xtask image: stub (arch={:?}); wires in with boot/ at Stage 1 Wave 1.",
+                args.arch.triple()
+            );
             Ok(())
         }
         Cmd::Demo(mut args) => {

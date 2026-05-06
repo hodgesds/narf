@@ -47,15 +47,15 @@ pub enum BarKind {
 pub struct Bar {
     /// Slot index in the type-0 header (0..6). For a 64-bit BAR this
     /// names the *low* slot — the high slot is `idx + 1`.
-    pub idx:   u8,
-    pub kind:  BarKind,
+    pub idx: u8,
+    pub kind: BarKind,
     /// Physical base. Zero means the BAR is unprogrammed (e.g. firmware
     /// hasn't assigned a window) — drivers should treat that as "absent."
-    pub phys:  PhysAddr,
+    pub phys: PhysAddr,
     /// Size in bytes, derived from the size-detection write-read-restore
     /// cycle. Zero means the BAR is unimplemented (write of 0xFFFF_FFFF
     /// reads back as zero).
-    pub size:  u64,
+    pub size: u64,
 }
 
 /// BAR-decode error surface.
@@ -95,10 +95,12 @@ const BAR_IO_ADDR_MASK: u32 = 0xFFFF_FFFC;
 /// exclusively for the duration of this call (size detection writes to
 /// the BAR briefly and restores it). Concurrent BAR access is UB.
 pub unsafe fn read_bar(device: &BusDevice, idx: u8) -> Result<Bar, BarError> {
-    if idx >= NUM_BARS { return Err(BarError::OutOfRange); }
+    if idx >= NUM_BARS {
+        return Err(BarError::OutOfRange);
+    }
     let cfg_phys = match device.kind {
         BusKind::Pcie { cfg_phys, .. } => cfg_phys,
-        BusKind::VirtioMmio { .. }     => return Err(BarError::NotPcie),
+        BusKind::VirtioMmio { .. } => return Err(BarError::NotPcie),
     };
 
     let off = BAR0_OFFSET + (idx as u64) * 4;
@@ -117,8 +119,14 @@ pub unsafe fn read_bar(device: &BusDevice, idx: u8) -> Result<Bar, BarError> {
             v
         };
         let masked = size_low & BAR_IO_ADDR_MASK;
-        let size = if masked == 0 { 0 } else { ((!masked) as u64).wrapping_add(1) & 0xFFFF };
-        if size == 0 { return Err(BarError::Unimplemented); }
+        let size = if masked == 0 {
+            0
+        } else {
+            ((!masked) as u64).wrapping_add(1) & 0xFFFF
+        };
+        if size == 0 {
+            return Err(BarError::Unimplemented);
+        }
         return Ok(Bar {
             idx,
             kind: BarKind::Io,
@@ -141,7 +149,9 @@ pub unsafe fn read_bar(device: &BusDevice, idx: u8) -> Result<Bar, BarError> {
     };
 
     if is_64 {
-        if idx + 1 >= NUM_BARS { return Err(BarError::OutOfRange); }
+        if idx + 1 >= NUM_BARS {
+            return Err(BarError::OutOfRange);
+        }
         let off_hi = off + 4;
         // SAFETY: high slot is in the same 4-KiB cfg window.
         let original_hi = unsafe { cfg_read32(cfg_phys, off_hi) };
@@ -152,11 +162,11 @@ pub unsafe fn read_bar(device: &BusDevice, idx: u8) -> Result<Bar, BarError> {
             cfg_write32(cfg_phys, off_hi, original_hi);
             v
         };
-        let phys = ((original_hi as u64) << 32)
-            | ((original & BAR_MMIO_ADDR_MASK_32) as u64);
-        let size_combined = ((size_hi as u64) << 32)
-            | ((size_low & BAR_MMIO_ADDR_MASK_32) as u64);
-        if size_combined == 0 { return Err(BarError::Unimplemented); }
+        let phys = ((original_hi as u64) << 32) | ((original & BAR_MMIO_ADDR_MASK_32) as u64);
+        let size_combined = ((size_hi as u64) << 32) | ((size_low & BAR_MMIO_ADDR_MASK_32) as u64);
+        if size_combined == 0 {
+            return Err(BarError::Unimplemented);
+        }
         let size = (!size_combined).wrapping_add(1);
         return Ok(Bar {
             idx,
@@ -168,7 +178,9 @@ pub unsafe fn read_bar(device: &BusDevice, idx: u8) -> Result<Bar, BarError> {
 
     // 32-bit MMIO.
     let masked = size_low & BAR_MMIO_ADDR_MASK_32;
-    if masked == 0 { return Err(BarError::Unimplemented); }
+    if masked == 0 {
+        return Err(BarError::Unimplemented);
+    }
     let size = ((!masked) as u64).wrapping_add(1) & 0xFFFF_FFFF;
     Ok(Bar {
         idx,
@@ -198,7 +210,11 @@ pub unsafe fn map_bar(device: &BusDevice, idx: u8) -> Result<MmioRegion, BarErro
         // `read_bar` and use `outb/inb` directly.
         return Err(BarError::NotPcie);
     }
-    Ok(MmioRegion { phys: bar.phys, len: bar.size, kind: bar.kind })
+    Ok(MmioRegion {
+        phys: bar.phys,
+        len: bar.size,
+        kind: bar.kind,
+    })
 }
 
 /// A mapped MMIO region. Stage-3 representation: the physical base is
@@ -208,7 +224,7 @@ pub unsafe fn map_bar(device: &BusDevice, idx: u8) -> Result<MmioRegion, BarErro
 #[derive(Copy, Clone, Debug)]
 pub struct MmioRegion {
     pub phys: PhysAddr,
-    pub len:  u64,
+    pub len: u64,
     pub kind: BarKind,
 }
 
@@ -232,7 +248,9 @@ impl MmioRegion {
     #[inline]
     pub unsafe fn write8(&self, offset: u64, value: u8) {
         // SAFETY: caller-asserted in-range.
-        unsafe { narf_arch::mmio::write8(self.phys.raw() + offset, value); }
+        unsafe {
+            narf_arch::mmio::write8(self.phys.raw() + offset, value);
+        }
     }
 
     /// Read a naturally-aligned 16-bit MMIO word at `offset`.
@@ -255,7 +273,9 @@ impl MmioRegion {
     #[inline]
     pub unsafe fn write16(&self, offset: u64, value: u16) {
         // SAFETY: caller-asserted in-range, naturally-aligned.
-        unsafe { narf_arch::mmio::write16(self.phys.raw() + offset, value); }
+        unsafe {
+            narf_arch::mmio::write16(self.phys.raw() + offset, value);
+        }
     }
 
     /// Read a naturally-aligned 32-bit MMIO word at `offset`.
@@ -277,7 +297,9 @@ impl MmioRegion {
     #[inline]
     pub unsafe fn write32(&self, offset: u64, value: u32) {
         // SAFETY: caller-asserted in-range, naturally-aligned.
-        unsafe { narf_arch::mmio::write32(self.phys.raw() + offset, value); }
+        unsafe {
+            narf_arch::mmio::write32(self.phys.raw() + offset, value);
+        }
     }
 }
 
@@ -292,7 +314,9 @@ unsafe fn cfg_read32(cfg: PhysAddr, off: u64) -> u32 {
 #[inline]
 unsafe fn cfg_write32(cfg: PhysAddr, off: u64, value: u32) {
     // SAFETY: caller asserts the slot is writable.
-    unsafe { narf_arch::mmio::write32(cfg.raw() + off, value); }
+    unsafe {
+        narf_arch::mmio::write32(cfg.raw() + off, value);
+    }
 }
 
 // ── BAR self-assignment ─────────────────────────────────────────────
@@ -312,14 +336,14 @@ unsafe fn cfg_write32(cfg: PhysAddr, off: u64, value: u32) {
 use core::sync::atomic::AtomicU64;
 
 static MMIO_POOL_BASE: AtomicU64 = AtomicU64::new(0);
-static MMIO_POOL_END:  AtomicU64 = AtomicU64::new(0);
+static MMIO_POOL_END: AtomicU64 = AtomicU64::new(0);
 static MMIO_POOL_NEXT: AtomicU64 = AtomicU64::new(0);
 
 /// Initialise the PCIe-MMIO pool. Idempotent — re-init clobbers
 /// the previous range + cursor.
 pub fn init_mmio_pool(base: u64, len: u64) {
     MMIO_POOL_BASE.store(base, Ordering::Release);
-    MMIO_POOL_END .store(base + len, Ordering::Release);
+    MMIO_POOL_END.store(base + len, Ordering::Release);
     MMIO_POOL_NEXT.store(base, Ordering::Release);
 }
 
@@ -332,7 +356,9 @@ pub fn allocate_pci_mmio(size: u64, align: u64) -> Option<u64> {
         let cur = MMIO_POOL_NEXT.load(Ordering::Relaxed);
         let aligned = (cur + align - 1) & !(align - 1);
         let end = aligned.checked_add(size)?;
-        if end > MMIO_POOL_END.load(Ordering::Relaxed) { return None; }
+        if end > MMIO_POOL_END.load(Ordering::Relaxed) {
+            return None;
+        }
         if MMIO_POOL_NEXT
             .compare_exchange_weak(cur, end, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
@@ -359,9 +385,7 @@ pub enum AssignError {
 /// # Safety
 /// `device` must be PCIe with cfg space writable; caller owns
 /// the device exclusively for the duration of the call.
-pub unsafe fn assign_unprogrammed_bars(device: &BusDevice)
-    -> Result<u32, AssignError>
-{
+pub unsafe fn assign_unprogrammed_bars(device: &BusDevice) -> Result<u32, AssignError> {
     if MMIO_POOL_BASE.load(Ordering::Acquire) == 0 {
         return Ok(0); // Pool not initialised — assume firmware did it.
     }
@@ -374,12 +398,19 @@ pub unsafe fn assign_unprogrammed_bars(device: &BusDevice)
     while idx < NUM_BARS {
         // SAFETY: caller-asserted cfg-space ownership.
         let bar = match unsafe { read_bar(device, idx) } {
-            Ok(b)  => b,
-            Err(_) => { idx += 1; continue; } // unimplemented slot
+            Ok(b) => b,
+            Err(_) => {
+                idx += 1;
+                continue;
+            } // unimplemented slot
         };
         // Already programmed? Skip. (firmware path or earlier pass.)
         if bar.phys.raw() != 0 {
-            idx += if matches!(bar.kind, BarKind::Mmio64 { .. }) { 2 } else { 1 };
+            idx += if matches!(bar.kind, BarKind::Mmio64 { .. }) {
+                2
+            } else {
+                1
+            };
             continue;
         }
         match bar.kind {
@@ -387,7 +418,7 @@ pub unsafe fn assign_unprogrammed_bars(device: &BusDevice)
                 // Allocate + write low half.
                 let base = match allocate_pci_mmio(bar.size, bar.size) {
                     Some(p) => p,
-                    None    => return Err(AssignError::PoolExhausted),
+                    None => return Err(AssignError::PoolExhausted),
                 };
                 let off = BAR0_OFFSET + (idx as u64) * 4;
                 // SAFETY: cfg-space write at validated offset.
@@ -395,7 +426,11 @@ pub unsafe fn assign_unprogrammed_bars(device: &BusDevice)
                 let type_bits = original & 0x0F;
                 // SAFETY: same.
                 unsafe {
-                    cfg_write32(cfg_phys, off, (base as u32 & BAR_MMIO_ADDR_MASK_32) | type_bits);
+                    cfg_write32(
+                        cfg_phys,
+                        off,
+                        (base as u32 & BAR_MMIO_ADDR_MASK_32) | type_bits,
+                    );
                 }
                 assigned += 1;
                 idx += 1;
@@ -403,7 +438,7 @@ pub unsafe fn assign_unprogrammed_bars(device: &BusDevice)
             BarKind::Mmio64 { prefetchable: _ } => {
                 let base = match allocate_pci_mmio(bar.size, bar.size) {
                     Some(p) => p,
-                    None    => return Err(AssignError::PoolExhausted),
+                    None => return Err(AssignError::PoolExhausted),
                 };
                 let off_lo = BAR0_OFFSET + (idx as u64) * 4;
                 let off_hi = off_lo + 4;
@@ -411,8 +446,11 @@ pub unsafe fn assign_unprogrammed_bars(device: &BusDevice)
                 let orig_lo = unsafe { cfg_read32(cfg_phys, off_lo) };
                 let type_bits = orig_lo & 0x0F;
                 unsafe {
-                    cfg_write32(cfg_phys, off_lo,
-                        (base as u32 & BAR_MMIO_ADDR_MASK_32) | type_bits);
+                    cfg_write32(
+                        cfg_phys,
+                        off_lo,
+                        (base as u32 & BAR_MMIO_ADDR_MASK_32) | type_bits,
+                    );
                     cfg_write32(cfg_phys, off_hi, (base >> 32) as u32);
                 }
                 assigned += 1;
@@ -428,11 +466,13 @@ pub unsafe fn assign_unprogrammed_bars(device: &BusDevice)
         // Enable MEM_SPACE in the command register so the new BAR
         // window decodes.
         const COMMAND_OFFSET: u64 = 0x04;
-        const CMD_MEM_SPACE:  u32 = 1 << 1;
+        const CMD_MEM_SPACE: u32 = 1 << 1;
         // SAFETY: cfg-space access at validated offset.
         let cmd = unsafe { cfg_read32(cfg_phys, COMMAND_OFFSET) };
         // SAFETY: same.
-        unsafe { cfg_write32(cfg_phys, COMMAND_OFFSET, cmd | CMD_MEM_SPACE); }
+        unsafe {
+            cfg_write32(cfg_phys, COMMAND_OFFSET, cmd | CMD_MEM_SPACE);
+        }
     }
     Ok(assigned)
 }

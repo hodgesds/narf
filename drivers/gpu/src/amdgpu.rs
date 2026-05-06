@@ -75,9 +75,7 @@
 use core::sync::atomic::{compiler_fence, Ordering};
 
 use narf_driver_runtime::{
-    map_bar, BusDevice, BusDeviceCap, MmioRegion,
-    Cap, Write,
-    Lock as IrqSafeSpinLock,
+    map_bar, BusDevice, BusDeviceCap, Cap, Lock as IrqSafeSpinLock, MmioRegion, Write,
 };
 
 // ── Vendor + device ids ────────────────────────────────────────────
@@ -88,19 +86,19 @@ pub const AMD_VENDOR: u16 = 0x1002;
 /// Phoenix HawkPoint1 — the user's Ryzen 7 PRO 8840HS iGPU.
 pub const PHOENIX_HAWKPOINT1: u16 = 0x1900;
 /// Phoenix discrete sibling.
-pub const PHOENIX_DISCRETE:   u16 = 0x1681;
+pub const PHOENIX_DISCRETE: u16 = 0x1681;
 /// Strix Point.
-pub const STRIX_POINT:        u16 = 0x15BF;
+pub const STRIX_POINT: u16 = 0x15BF;
 /// Raphael.
-pub const RAPHAEL:            u16 = 0x164E;
+pub const RAPHAEL: u16 = 0x164E;
 /// Cezanne.
-pub const CEZANNE:            u16 = 0x13F9;
+pub const CEZANNE: u16 = 0x13F9;
 /// Renoir.
-pub const RENOIR:             u16 = 0x1638;
+pub const RENOIR: u16 = 0x1638;
 /// Navi 22 (Radeon RX 6700/6750 family).
-pub const NAVI22:             u16 = 0x73DF;
+pub const NAVI22: u16 = 0x73DF;
 /// Navi 31 (Radeon RX 7900 family).
-pub const NAVI31:             u16 = 0x744C;
+pub const NAVI31: u16 = 0x744C;
 
 /// PCI class triple for a VGA-compatible display controller. The
 /// class-match backstop catches all VGA cards; `probe` filters by
@@ -119,7 +117,7 @@ const PCI_CLASS_DISPLAY: u8 = 0x03;
 // Stage-2+ work.
 
 /// BAR index for the frame-buffer aperture (VRAM window).
-const BAR_FB:   u8 = 0;
+const BAR_FB: u8 = 0;
 /// BAR index for the register window.
 const BAR_REGS: u8 = 5;
 
@@ -134,14 +132,14 @@ const BAR_REGS: u8 = 5;
 /// register-bus address here, then access `MM_DATA`.
 const MM_INDEX: u64 = 0x0000;
 /// `MM_DATA` — register-window data port.
-const MM_DATA:  u64 = 0x0004;
+const MM_DATA: u64 = 0x0004;
 
 /// MC (Memory Controller) framebuffer-location registers in the
 /// register-bus address space. Read through MM_INDEX/MM_DATA to
 /// learn the visible-VRAM phys range. Same offsets across Vega +
 /// Navi families per the public AMD MC IP block docs.
 const MC_VM_FB_LOCATION_BASE: u32 = 0x0000_6B0F;
-const MC_VM_FB_LOCATION_TOP:  u32 = 0x0000_6B10;
+const MC_VM_FB_LOCATION_TOP: u32 = 0x0000_6B10;
 
 // ── PSP (Platform Security Processor) MP0 mailbox protocol ────────
 //
@@ -207,13 +205,15 @@ impl Family {
     pub fn mp0_base(self) -> Option<u32> {
         // Runtime override wins.
         let runtime = crate::amdgpu_offsets::offsets_of(self);
-        if let Some(base) = runtime.mp0_base { return Some(base); }
+        if let Some(base) = runtime.mp0_base {
+            return Some(base);
+        }
         // Compile-time fallback for documented families.
         match self {
-            Family::Vega   => Some(0x000B_0000),
-            Family::Navi1  => Some(0x000B_0000),
-            Family::Navi2  => None,
-            Family::Navi3  => None,
+            Family::Vega => Some(0x000B_0000),
+            Family::Navi1 => Some(0x000B_0000),
+            Family::Navi2 => None,
+            Family::Navi3 => None,
             Family::Renoir => None,
         }
     }
@@ -222,11 +222,11 @@ impl Family {
 /// What Stage-1 knows about a probed AMD GPU.
 #[derive(Copy, Clone, Debug)]
 pub struct ChipInfo {
-    pub vid:    u16,
-    pub did:    u16,
+    pub vid: u16,
+    pub did: u16,
     pub family: Family,
     /// Display-driver short name for diagnostics (e.g. "phoenix").
-    pub asic:   &'static str,
+    pub asic: &'static str,
     /// Canonical firmware-blob name the kernel firmware registry
     /// (`narf-firmware`) looks up at PSP/SMU bring-up. Stage-1
     /// records this on the bound-driver inventory but doesn't
@@ -236,19 +236,27 @@ pub struct ChipInfo {
 
 /// Look up family + asic + firmware name for a known PCI ID.
 fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
-    if vid != AMD_VENDOR { return None; }
+    if vid != AMD_VENDOR {
+        return None;
+    }
     let (family, asic, fw_name) = match did {
-        PHOENIX_HAWKPOINT1 => (Family::Navi3,  "phoenix",  "amdgpu/phoenix.bin"),
-        PHOENIX_DISCRETE   => (Family::Navi3,  "phoenix",  "amdgpu/phoenix.bin"),
-        STRIX_POINT        => (Family::Navi3,  "strix",    "amdgpu/strix.bin"),
-        RAPHAEL            => (Family::Navi3,  "raphael",  "amdgpu/raphael.bin"),
-        CEZANNE            => (Family::Renoir, "cezanne",  "amdgpu/cezanne.bin"),
-        RENOIR             => (Family::Renoir, "renoir",   "amdgpu/renoir.bin"),
-        NAVI22             => (Family::Navi2,  "navi22",   "amdgpu/navi22.bin"),
-        NAVI31             => (Family::Navi3,  "navi31",   "amdgpu/navi31.bin"),
-        _                  => return None,
+        PHOENIX_HAWKPOINT1 => (Family::Navi3, "phoenix", "amdgpu/phoenix.bin"),
+        PHOENIX_DISCRETE => (Family::Navi3, "phoenix", "amdgpu/phoenix.bin"),
+        STRIX_POINT => (Family::Navi3, "strix", "amdgpu/strix.bin"),
+        RAPHAEL => (Family::Navi3, "raphael", "amdgpu/raphael.bin"),
+        CEZANNE => (Family::Renoir, "cezanne", "amdgpu/cezanne.bin"),
+        RENOIR => (Family::Renoir, "renoir", "amdgpu/renoir.bin"),
+        NAVI22 => (Family::Navi2, "navi22", "amdgpu/navi22.bin"),
+        NAVI31 => (Family::Navi3, "navi31", "amdgpu/navi31.bin"),
+        _ => return None,
     };
-    Some(ChipInfo { vid, did, family, asic, fw_name })
+    Some(ChipInfo {
+        vid,
+        did,
+        family,
+        asic,
+        fw_name,
+    })
 }
 
 // ── Errors ─────────────────────────────────────────────────────────
@@ -283,7 +291,7 @@ pub struct VramInfo {
 /// Scanout mode the driver programs into DCN.
 #[derive(Copy, Clone, Debug)]
 pub struct Mode {
-    pub width:  u32,
+    pub width: u32,
     pub height: u32,
     pub stride: u32,
 }
@@ -292,20 +300,20 @@ pub struct Mode {
 /// identified, VRAM aperture sized. Post-firmware: PSP loaded,
 /// DCN bring-up + scanout registration possible.
 pub struct AmdGpu {
-    pub fb_bar:    MmioRegion,
-    pub regs:      MmioRegion,
-    pub chip:      ChipInfo,
+    pub fb_bar: MmioRegion,
+    pub regs: MmioRegion,
+    pub chip: ChipInfo,
     /// VRAM aperture read from the MC at probe time.
-    pub vram:      VramInfo,
+    pub vram: VramInfo,
     /// Currently-programmed mode, if `set_mode` has run.
-    pub mode:      Option<Mode>,
+    pub mode: Option<Mode>,
     pub fw_loaded: bool,
 }
 
 impl core::fmt::Debug for AmdGpu {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("AmdGpu")
-            .field("chip",      &self.chip)
+            .field("chip", &self.chip)
             .field("fw_loaded", &self.fw_loaded)
             .finish_non_exhaustive()
     }
@@ -320,15 +328,13 @@ impl AmdGpu {
     /// Caller owns BAR0 + BAR5 exclusively for the duration of probe.
     pub unsafe fn bring_up(
         device: &BusDevice,
-        _cap:   &Cap<BusDeviceCap, Write>,
+        _cap: &Cap<BusDeviceCap, Write>,
     ) -> Result<Self, AmdgpuError> {
         let chip = chip_info_for_pci_id(device.id.vendor, device.id.device)
             .ok_or(AmdgpuError::UnknownAsic)?;
         // SAFETY: caller-authority over BAR0 + BAR5.
-        let fb_bar = unsafe { map_bar(device, BAR_FB) }
-            .map_err(|_| AmdgpuError::BarMapFailed)?;
-        let regs = unsafe { map_bar(device, BAR_REGS) }
-            .map_err(|_| AmdgpuError::BarMapFailed)?;
+        let fb_bar = unsafe { map_bar(device, BAR_FB) }.map_err(|_| AmdgpuError::BarMapFailed)?;
+        let regs = unsafe { map_bar(device, BAR_REGS) }.map_err(|_| AmdgpuError::BarMapFailed)?;
 
         // Presence test: MM_INDEX is read/write; write a sentinel,
         // read it back, restore. A wedged controller reads
@@ -341,12 +347,16 @@ impl AmdGpu {
             return Err(AmdgpuError::DeviceGone);
         }
         // SAFETY: same.
-        unsafe { regs.write32(MM_INDEX, 0xCAFE_F00D); }
+        unsafe {
+            regs.write32(MM_INDEX, 0xCAFE_F00D);
+        }
         compiler_fence(Ordering::SeqCst);
         // SAFETY: same.
         let echo = unsafe { regs.read32(MM_INDEX) };
         // SAFETY: restore prior value.
-        unsafe { regs.write32(MM_INDEX, prev); }
+        unsafe {
+            regs.write32(MM_INDEX, prev);
+        }
         if echo != 0xCAFE_F00D {
             return Err(AmdgpuError::DeviceGone);
         }
@@ -361,15 +371,24 @@ impl AmdGpu {
         let vram = unsafe { read_vram_info(&regs) };
 
         Ok(Self {
-            fb_bar, regs, chip, vram,
+            fb_bar,
+            regs,
+            chip,
+            vram,
             mode: None,
             fw_loaded: false,
         })
     }
 
-    pub fn chip_info(&self) -> ChipInfo { self.chip }
-    pub fn vram_info(&self) -> VramInfo { self.vram }
-    pub fn is_ready(&self) -> bool { self.fw_loaded }
+    pub fn chip_info(&self) -> ChipInfo {
+        self.chip
+    }
+    pub fn vram_info(&self) -> VramInfo {
+        self.vram
+    }
+    pub fn is_ready(&self) -> bool {
+        self.fw_loaded
+    }
     pub fn current_mode(&self) -> Option<Mode> {
         // If `set_mode` has run, return what it programmed.
         // Otherwise, fall back to whatever the firmware left
@@ -377,7 +396,9 @@ impl AmdGpu {
         // typically programs DCN at the panel's preferred mode
         // and we can scan out without re-programming. This
         // mirrors Linux's `simpledrm` fallback.
-        if self.mode.is_some() { return self.mode; }
+        if self.mode.is_some() {
+            return self.mode;
+        }
         // SAFETY: BAR5 mapped, exclusive owner.
         unsafe { self.passive_mode() }
     }
@@ -404,9 +425,13 @@ impl AmdGpu {
 
         // SAFETY: caller-asserted exclusive ownership of BAR5.
         let h_total = unsafe { mm_read(&self.regs, OTG_H_TOTAL) };
-        if h_total == 0 || h_total == 0xFFFF_FFFF { return None; }
+        if h_total == 0 || h_total == 0xFFFF_FFFF {
+            return None;
+        }
         let v_total = unsafe { mm_read(&self.regs, OTG_V_TOTAL) };
-        if v_total == 0 || v_total == 0xFFFF_FFFF { return None; }
+        if v_total == 0 || v_total == 0xFFFF_FFFF {
+            return None;
+        }
         // SAFETY: same.
         let h_blank = unsafe { mm_read(&self.regs, OTG_H_BLANK_START_END) };
         let v_blank = unsafe { mm_read(&self.regs, OTG_V_BLANK_START_END) };
@@ -416,9 +441,9 @@ impl AmdGpu {
         let h_total_val = (h_total & 0xFFFF) + 1;
         let v_total_val = (v_total & 0xFFFF) + 1;
         let h_blank_start = h_blank & 0xFFFF;
-        let h_blank_end   = (h_blank >> 16) & 0xFFFF;
+        let h_blank_end = (h_blank >> 16) & 0xFFFF;
         let v_blank_start = v_blank & 0xFFFF;
-        let v_blank_end   = (v_blank >> 16) & 0xFFFF;
+        let v_blank_end = (v_blank >> 16) & 0xFFFF;
         // Active = total - blanking_width.
         let h_blank_w = h_blank_end.saturating_sub(h_blank_start);
         let v_blank_w = v_blank_end.saturating_sub(v_blank_start);
@@ -429,7 +454,7 @@ impl AmdGpu {
             return None;
         }
         Some(Mode {
-            width:  h_active,
+            width: h_active,
             height: v_active,
             // Linear scanout: stride = width (no row padding).
             stride: h_active,
@@ -459,20 +484,19 @@ impl AmdGpu {
     /// returns).
     pub unsafe fn load_firmware(
         &mut self,
-        fw_authority: &Cap<
-            narf_firmware::FirmwareRegistry, narf_capabilities::Read,
-        >,
+        fw_authority: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
     ) -> Result<(), AmdgpuError> {
-        let mp0_base = self.chip.family.mp0_base()
+        let mp0_base = self
+            .chip
+            .family
+            .mp0_base()
             .ok_or(AmdgpuError::FirmwareLoadFailed)?;
 
-        let cap = narf_firmware::open(self.chip.fw_name, fw_authority)
-            .map_err(|e| match e {
-                narf_firmware::FirmwareError::NotFound => AmdgpuError::FirmwareMissing,
-                _                                     => AmdgpuError::FirmwareLoadFailed,
-            })?;
-        let view = narf_firmware::view_of(&cap)
-            .map_err(|_| AmdgpuError::FirmwareLoadFailed)?;
+        let cap = narf_firmware::open(self.chip.fw_name, fw_authority).map_err(|e| match e {
+            narf_firmware::FirmwareError::NotFound => AmdgpuError::FirmwareMissing,
+            _ => AmdgpuError::FirmwareLoadFailed,
+        })?;
+        let view = narf_firmware::view_of(&cap).map_err(|_| AmdgpuError::FirmwareLoadFailed)?;
 
         let phys = view.phys;
         let size = view.bytes.len() as u32;
@@ -488,12 +512,18 @@ impl AmdGpu {
         // are valid register-bus addresses for this family.
         unsafe {
             mm_write(&self.regs, mp0_base + MP0_C2PMSG_64_REL, phys as u32);
-            mm_write(&self.regs, mp0_base + MP0_C2PMSG_67_REL, (phys >> 32) as u32);
+            mm_write(
+                &self.regs,
+                mp0_base + MP0_C2PMSG_67_REL,
+                (phys >> 32) as u32,
+            );
         }
         compiler_fence(Ordering::SeqCst);
         let cmd = PSP_CMD_LOAD_TA | (size << 8);
         // SAFETY: same.
-        unsafe { mm_write(&self.regs, mp0_base + MP0_C2PMSG_69_REL, cmd); }
+        unsafe {
+            mm_write(&self.regs, mp0_base + MP0_C2PMSG_69_REL, cmd);
+        }
 
         // Step 4-5: poll MP0_C2PMSG_64 for the done bit. PSP
         // typically responds within ~50 ms; bound the spin so a
@@ -502,7 +532,9 @@ impl AmdGpu {
         for _ in 0..10_000_000u32 {
             // SAFETY: same.
             last = unsafe { mm_read(&self.regs, mp0_base + MP0_C2PMSG_64_REL) };
-            if last & PSP_STATUS_DONE_BIT != 0 { break; }
+            if last & PSP_STATUS_DONE_BIT != 0 {
+                break;
+            }
             core::hint::spin_loop();
         }
         if last & PSP_STATUS_DONE_BIT == 0 {
@@ -515,12 +547,15 @@ impl AmdGpu {
         }
 
         // Step 6: record the version coupling.
-        narf_drivers::set_bound_firmware("amdgpu", narf_drivers::BoundFirmware {
-            blob_name: alloc::string::String::from(self.chip.fw_name),
-            sha256:    view.sha256,
-            signer:    view.signer,
-            version:   None,
-        });
+        narf_drivers::set_bound_firmware(
+            "amdgpu",
+            narf_drivers::BoundFirmware {
+                blob_name: alloc::string::String::from(self.chip.fw_name),
+                sha256: view.sha256,
+                signer: view.signer,
+                version: None,
+            },
+        );
         self.fw_loaded = true;
         Ok(())
     }
@@ -543,7 +578,9 @@ impl AmdGpu {
     /// # Safety
     /// Caller owns BAR0 + BAR5 exclusively.
     pub unsafe fn set_mode(&mut self, mode: Mode) -> Result<(), AmdgpuError> {
-        if !self.fw_loaded { return Err(AmdgpuError::FirmwareLoadFailed); }
+        if !self.fw_loaded {
+            return Err(AmdgpuError::FirmwareLoadFailed);
+        }
         // TODO(stage-3): DCN HUBP/OPP/OTG programming.
         //   1. Disable scanout (HUBP_BLANK = 1).
         //   2. Program HUBP_PRIMARY_SURFACE_ADDR = self.vram.base.
@@ -564,7 +601,9 @@ impl AmdGpu {
 /// of the read (MM_INDEX is a shared latch).
 unsafe fn mm_read(regs: &MmioRegion, addr: u32) -> u32 {
     // SAFETY: caller-asserted ownership.
-    unsafe { regs.write32(MM_INDEX, addr); }
+    unsafe {
+        regs.write32(MM_INDEX, addr);
+    }
     compiler_fence(Ordering::SeqCst);
     // SAFETY: same.
     unsafe { regs.read32(MM_DATA) }
@@ -576,10 +615,14 @@ unsafe fn mm_read(regs: &MmioRegion, addr: u32) -> u32 {
 /// Same as `mm_read`.
 unsafe fn mm_write(regs: &MmioRegion, addr: u32, value: u32) {
     // SAFETY: caller-asserted ownership.
-    unsafe { regs.write32(MM_INDEX, addr); }
+    unsafe {
+        regs.write32(MM_INDEX, addr);
+    }
     compiler_fence(Ordering::SeqCst);
     // SAFETY: same.
-    unsafe { regs.write32(MM_DATA, value); }
+    unsafe {
+        regs.write32(MM_DATA, value);
+    }
 }
 
 /// Read the visible-VRAM aperture from the MC IP block.
@@ -597,12 +640,12 @@ unsafe fn mm_write(regs: &MmioRegion, addr: u32, value: u32) {
 unsafe fn read_vram_info(regs: &MmioRegion) -> VramInfo {
     // SAFETY: caller-asserted ownership; MM_INDEX/MM_DATA pair.
     let base_field = unsafe { mm_read(regs, MC_VM_FB_LOCATION_BASE) };
-    let top_field  = unsafe { mm_read(regs, MC_VM_FB_LOCATION_TOP) };
+    let top_field = unsafe { mm_read(regs, MC_VM_FB_LOCATION_TOP) };
     // Bits[23:0] are the FB location; high bits are reserved.
     let base = (base_field as u64 & 0x00FF_FFFF) << 24;
-    let top  = (top_field  as u64 & 0x00FF_FFFF) << 24;
+    let top = (top_field as u64 & 0x00FF_FFFF) << 24;
     let size = if top >= base {
-        top - base + (1u64 << 24)   // top is inclusive, last 16 MiB unit
+        top - base + (1u64 << 24) // top is inclusive, last 16 MiB unit
     } else {
         0
     };
@@ -611,14 +654,12 @@ unsafe fn read_vram_info(regs: &MmioRegion) -> VramInfo {
 
 // ── Driver-match registration ───────────────────────────────────────
 
-static CONTROLLER: IrqSafeSpinLock<Option<AmdGpu>> =
-    IrqSafeSpinLock::new(None);
+static CONTROLLER: IrqSafeSpinLock<Option<AmdGpu>> = IrqSafeSpinLock::new(None);
 
-pub fn probe(
-    device: BusDevice,
-    cap:    Cap<BusDeviceCap, Write>,
-) -> Result<(), narf_bus::ProbeError> {
-    if CONTROLLER.lock().is_some() { return Ok(()); }
+pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
+    if CONTROLLER.lock().is_some() {
+        return Ok(());
+    }
     // The class-match backstop catches every PCI VGA controller;
     // reject non-AMD vendors so virtio-gpu / Bochs / Intel VGA
     // fall through to their own drivers.
@@ -626,23 +667,25 @@ pub fn probe(
         return Err(narf_bus::ProbeError::BadDevice);
     }
     narf_bus::pci::set_command(
-        &cap, &device,
+        &cap,
+        &device,
         narf_bus::pci::cmd::MEM_SPACE
             | narf_bus::pci::cmd::BUS_MASTER
             | narf_bus::pci::cmd::INTX_DISABLE,
-    ).map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    )
+    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // SAFETY: caller-authority.
     let dev = match unsafe { AmdGpu::bring_up(&device, &cap) } {
-        Ok(d)  => d,
+        Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
     *CONTROLLER.lock() = Some(dev);
     narf_drivers::record_bound(narf_drivers::BoundDriver {
-        name:    alloc::string::String::from("amdgpu"),
-        kind:    narf_drivers::BoundKind::Graphics,
+        name: alloc::string::String::from("amdgpu"),
+        kind: narf_drivers::BoundKind::Graphics,
         pci_vid: Some(device.id.vendor),
         pci_did: Some(device.id.device),
-        domain:  narf_drivers::BoundKind::Graphics.default_domain(),
+        domain: narf_drivers::BoundKind::Graphics.default_domain(),
     });
     Ok(())
 }
@@ -655,18 +698,19 @@ pub fn register_pci_driver() {
     let exact: &[(&'static str, u16, u16)] = &[
         ("amdgpu-phoenix", AMD_VENDOR, PHOENIX_HAWKPOINT1),
         ("amdgpu-phoenix-d", AMD_VENDOR, PHOENIX_DISCRETE),
-        ("amdgpu-strix",   AMD_VENDOR, STRIX_POINT),
+        ("amdgpu-strix", AMD_VENDOR, STRIX_POINT),
         ("amdgpu-raphael", AMD_VENDOR, RAPHAEL),
         ("amdgpu-cezanne", AMD_VENDOR, CEZANNE),
-        ("amdgpu-renoir",  AMD_VENDOR, RENOIR),
-        ("amdgpu-navi22",  AMD_VENDOR, NAVI22),
-        ("amdgpu-navi31",  AMD_VENDOR, NAVI31),
+        ("amdgpu-renoir", AMD_VENDOR, RENOIR),
+        ("amdgpu-navi22", AMD_VENDOR, NAVI22),
+        ("amdgpu-navi31", AMD_VENDOR, NAVI31),
     ];
     for (name, v, d) in exact.iter().copied() {
         narf_bus::register_pci_driver(narf_bus::PciMatch {
             name,
             kind: narf_bus::MatchKind::VendorDevice {
-                vendor: v, device: d,
+                vendor: v,
+                device: d,
             },
             probe,
         });
@@ -677,13 +721,16 @@ pub fn register_pci_driver() {
     narf_bus::register_pci_driver(narf_bus::PciMatch {
         name: "amdgpu-class",
         kind: narf_bus::MatchKind::Class {
-            class: PCI_CLASS_DISPLAY, mask: 0xFF,
+            class: PCI_CLASS_DISPLAY,
+            mask: 0xFF,
         },
         probe,
     });
 }
 
-pub fn is_probed() -> bool { CONTROLLER.lock().is_some() }
+pub fn is_probed() -> bool {
+    CONTROLLER.lock().is_some()
+}
 
 pub fn with_controller<R>(f: impl FnOnce(&AmdGpu) -> R) -> Option<R> {
     CONTROLLER.lock().as_ref().map(f)

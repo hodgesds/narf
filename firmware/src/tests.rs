@@ -4,11 +4,11 @@
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-use crate::{
-    bootstrap_authority, install, open, register_in_tree, snapshot,
-    source_for, view_of, BlobSource, FirmwareError, BLOB_TRAILER_MAGIC,
-};
 use crate::registry::__reset_for_test;
+use crate::{
+    bootstrap_authority, install, open, register_in_tree, snapshot, source_for, view_of,
+    BlobSource, FirmwareError, BLOB_TRAILER_MAGIC,
+};
 
 /// Build an unsigned firmware blob whose payload is the supplied
 /// bytes followed by the all-zero "unsigned" sentinel trailer.
@@ -45,7 +45,7 @@ fn smoke_firmware_trailer_decode_unsigned_blob() -> TestResult {
     use crate::signature;
     let blob = build_unsigned_blob(b"hello, firmware", Some("1.0.0"));
     let trailer = match signature::decode(&blob) {
-        Ok(t)  => t,
+        Ok(t) => t,
         Err(_) => return TestResult::Fail("decode rejected synthetic blob"),
     };
     if trailer.payload != b"hello, firmware" {
@@ -69,7 +69,7 @@ fn smoke_firmware_trailer_rejects_bad_magic() -> TestResult {
     blob[n - 1] ^= 0xFF;
     match signature::decode(&blob) {
         Err(FirmwareError::BadFormat) => TestResult::Pass,
-        Ok(_)  => TestResult::Fail("decode accepted corrupt magic"),
+        Ok(_) => TestResult::Fail("decode accepted corrupt magic"),
         Err(_) => TestResult::Fail("wrong error variant"),
     }
 }
@@ -88,11 +88,11 @@ fn smoke_firmware_install_and_open_unsigned() -> TestResult {
         return TestResult::Fail("install rejected");
     }
     let cap = match open("test/blob", &read) {
-        Ok(c)  => c,
+        Ok(c) => c,
         Err(_) => return TestResult::Fail("open after install"),
     };
     let view = match view_of(&cap) {
-        Ok(v)  => v,
+        Ok(v) => v,
         Err(_) => return TestResult::Fail("view through cap"),
     };
     if view.bytes.len() != payload.len() {
@@ -123,25 +123,32 @@ fn smoke_firmware_register_in_tree_lands_in_in_tree_tier() -> TestResult {
         return TestResult::Fail("source_for didn't report InTree");
     }
     let snap = snapshot();
-    if !snap.iter().any(|e| e.name == "vendor/in-tree-blob"
-        && e.source == BlobSource::InTree)
+    if !snap
+        .iter()
+        .any(|e| e.name == "vendor/in-tree-blob" && e.source == BlobSource::InTree)
     {
         return TestResult::Fail("snapshot missing in-tree entry");
     }
     TestResult::Pass
 }
-kernel_test_in!("firmware", smoke_firmware_register_in_tree_lands_in_in_tree_tier);
+kernel_test_in!(
+    "firmware",
+    smoke_firmware_register_in_tree_lands_in_in_tree_tier
+);
 
 fn smoke_firmware_open_unknown_blob_returns_not_found() -> TestResult {
     __reset_for_test();
     let (_w, read) = bootstrap_authority();
     match open("doesnt/exist", &read) {
         Err(FirmwareError::NotFound) => TestResult::Pass,
-        Ok(_)  => TestResult::Fail("open succeeded for absent blob"),
+        Ok(_) => TestResult::Fail("open succeeded for absent blob"),
         Err(_) => TestResult::Fail("wrong error variant"),
     }
 }
-kernel_test_in!("firmware", smoke_firmware_open_unknown_blob_returns_not_found);
+kernel_test_in!(
+    "firmware",
+    smoke_firmware_open_unknown_blob_returns_not_found
+);
 
 fn smoke_firmware_unsigned_rejected_when_feature_off() -> TestResult {
     if cfg!(feature = "firmware-allow-unsigned") {
@@ -152,11 +159,14 @@ fn smoke_firmware_unsigned_rejected_when_feature_off() -> TestResult {
     let (write, _r) = bootstrap_authority();
     match install("nope/x", &blob, &write) {
         Err(FirmwareError::UnsignedRejected) => TestResult::Pass,
-        Ok(_)  => TestResult::Fail("registry accepted unsigned blob in production build"),
+        Ok(_) => TestResult::Fail("registry accepted unsigned blob in production build"),
         Err(_) => TestResult::Fail("wrong error variant"),
     }
 }
-kernel_test_in!("firmware", smoke_firmware_unsigned_rejected_when_feature_off);
+kernel_test_in!(
+    "firmware",
+    smoke_firmware_unsigned_rejected_when_feature_off
+);
 
 fn smoke_firmware_initramfs_scan_registers_under_suffix() -> TestResult {
     // The scanner strips `firmware/` from each archive path and
@@ -175,22 +185,19 @@ fn smoke_firmware_initramfs_scan_registers_under_suffix() -> TestResult {
     // with arbitrary data, and the TRAILER!!! sentinel.
     let archive = make_cpio_newc(&[
         ("firmware/test/blob.bin", &blob_bytes),
-        ("etc/passwd",             b"root:x:0:0::/root:/bin/sh\n"),
+        ("etc/passwd", b"root:x:0:0::/root:/bin/sh\n"),
     ]);
     // Leak the archive to satisfy the `'static` lifetime
     // `Initramfs::from_cpio` requires; this is a smoke-test
     // allocation only.
-    let archive_static: &'static [u8] = alloc::boxed::Box::leak(
-        archive.into_boxed_slice());
-    let fs = match narf_filesystem::Initramfs::from_cpio(
-        "fw-smoke", archive_static)
-    {
-        Ok(f)  => f,
+    let archive_static: &'static [u8] = alloc::boxed::Box::leak(archive.into_boxed_slice());
+    let fs = match narf_filesystem::Initramfs::from_cpio("fw-smoke", archive_static) {
+        Ok(f) => f,
         Err(_) => return TestResult::Fail("CPIO parse"),
     };
     let (write, _r) = bootstrap_authority();
     let n = match scan_initramfs(&fs, &write) {
-        Ok(n)  => n,
+        Ok(n) => n,
         Err(_) => return TestResult::Fail("scan_initramfs"),
     };
     if n != 1 {
@@ -204,7 +211,10 @@ fn smoke_firmware_initramfs_scan_registers_under_suffix() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("firmware", smoke_firmware_initramfs_scan_registers_under_suffix);
+kernel_test_in!(
+    "firmware",
+    smoke_firmware_initramfs_scan_registers_under_suffix
+);
 
 fn smoke_firmware_priority_hot_install_overrides_in_tree() -> TestResult {
     // Spec §5: hot-install entries override initramfs which
@@ -216,7 +226,7 @@ fn smoke_firmware_priority_hot_install_overrides_in_tree() -> TestResult {
     }
     __reset_for_test();
     let in_tree = build_unsigned_blob(b"OLD: in-tree", None);
-    let hot     = build_unsigned_blob(b"NEW: hot install", None);
+    let hot = build_unsigned_blob(b"NEW: hot install", None);
     if register_in_tree("vendor/multi-tier", &in_tree).is_err() {
         return TestResult::Fail("register_in_tree");
     }
@@ -228,11 +238,11 @@ fn smoke_firmware_priority_hot_install_overrides_in_tree() -> TestResult {
         return TestResult::Fail("priority not honored — expected HotInstall");
     }
     let cap = match open("vendor/multi-tier", &read) {
-        Ok(c)  => c,
+        Ok(c) => c,
         Err(_) => return TestResult::Fail("open"),
     };
     let v = match view_of(&cap) {
-        Ok(v)  => v,
+        Ok(v) => v,
         Err(_) => return TestResult::Fail("view"),
     };
     if !v.bytes.starts_with(b"NEW") {
@@ -240,7 +250,10 @@ fn smoke_firmware_priority_hot_install_overrides_in_tree() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("firmware", smoke_firmware_priority_hot_install_overrides_in_tree);
+kernel_test_in!(
+    "firmware",
+    smoke_firmware_priority_hot_install_overrides_in_tree
+);
 
 fn smoke_firmware_sys_install_trusted_loader_round_trip() -> TestResult {
     // Exercises the sys_firmware_install kernel-side path:
@@ -261,19 +274,13 @@ fn smoke_firmware_sys_install_trusted_loader_round_trip() -> TestResult {
     install_trusted_loader_authority(write);
     let auth = match trusted_loader_authority() {
         Some(a) => a,
-        None    => return TestResult::Fail("trusted_loader_authority not stashed"),
+        None => return TestResult::Fail("trusted_loader_authority not stashed"),
     };
     let blob = build_unsigned_blob(b"sys_install round-trip", None);
     // SAFETY: blob is a kernel-owned heap allocation; ptr+len
     // describe a valid range for the duration of this call.
-    let r = unsafe {
-        crate::sys_install(
-            "test/sys-install/blob",
-            blob.as_ptr(),
-            blob.len(),
-            &auth,
-        )
-    };
+    let r =
+        unsafe { crate::sys_install("test/sys-install/blob", blob.as_ptr(), blob.len(), &auth) };
     match r {
         Ok(()) => {}
         Err(_) => return TestResult::Fail("sys_install rejected"),
@@ -283,11 +290,14 @@ fn smoke_firmware_sys_install_trusted_loader_round_trip() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("firmware", smoke_firmware_sys_install_trusted_loader_round_trip);
+kernel_test_in!(
+    "firmware",
+    smoke_firmware_sys_install_trusted_loader_round_trip
+);
 
 fn smoke_firmware_trusted_signer_registry_round_trip() -> TestResult {
-    use crate::{register_trusted_signer, trusted_signer_count};
     use crate::signature::__reset_trusted_signers;
+    use crate::{register_trusted_signer, trusted_signer_count};
     __reset_trusted_signers();
     if trusted_signer_count() != 0 {
         return TestResult::Fail("reset didn't clear trusted-signer list");
@@ -310,12 +320,15 @@ fn smoke_firmware_trusted_signer_registry_round_trip() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("firmware", smoke_firmware_trusted_signer_registry_round_trip);
+kernel_test_in!(
+    "firmware",
+    smoke_firmware_trusted_signer_registry_round_trip
+);
 
 fn smoke_firmware_loader_task_allowlist_round_trip() -> TestResult {
     use crate::{
-        add_trusted_firmware_loader_task, is_trusted_firmware_loader_task,
-        __reset_trusted_loader_tasks,
+        __reset_trusted_loader_tasks, add_trusted_firmware_loader_task,
+        is_trusted_firmware_loader_task,
     };
     __reset_trusted_loader_tasks();
     if is_trusted_firmware_loader_task(7) {
@@ -333,7 +346,9 @@ fn smoke_firmware_loader_task_allowlist_round_trip() -> TestResult {
     add_trusted_firmware_loader_task(7);
     let mut hits = 0;
     for pid in 0..16u64 {
-        if is_trusted_firmware_loader_task(pid) { hits += 1; }
+        if is_trusted_firmware_loader_task(pid) {
+            hits += 1;
+        }
     }
     if hits != 1 {
         return TestResult::Fail("re-add grew the list");
@@ -347,9 +362,10 @@ fn smoke_firmware_initramfs_staging_round_trip() -> TestResult {
     // `__reset_staged_initramfs` are now thin deprecated shims
     // around `narf-initramfs`; the smoke calls the canonical API
     // directly so the eventual shim removal is invisible.
-    use narf_initramfs::{install as install_initramfs,
-                         is_staged as initramfs_staged,
-                         __reset_staged as __reset_staged_initramfs};
+    use narf_initramfs::{
+        __reset_staged as __reset_staged_initramfs, install as install_initramfs,
+        is_staged as initramfs_staged,
+    };
     if !cfg!(feature = "firmware-allow-unsigned") {
         return TestResult::Skip("firmware-allow-unsigned off");
     }
@@ -359,15 +375,10 @@ fn smoke_firmware_initramfs_staging_round_trip() -> TestResult {
     }
     // Build + leak a synthetic CPIO with a single firmware blob.
     let payload = build_unsigned_blob(b"staged from initramfs", None);
-    let archive = make_cpio_newc(&[
-        ("firmware/staged/blob.bin", &payload),
-    ]);
-    let archive_static: &'static [u8] = alloc::boxed::Box::leak(
-        archive.into_boxed_slice());
-    let fs = match narf_filesystem::Initramfs::from_cpio(
-        "fw-staging-smoke", archive_static)
-    {
-        Ok(f)  => f,
+    let archive = make_cpio_newc(&[("firmware/staged/blob.bin", &payload)]);
+    let archive_static: &'static [u8] = alloc::boxed::Box::leak(archive.into_boxed_slice());
+    let fs = match narf_filesystem::Initramfs::from_cpio("fw-staging-smoke", archive_static) {
+        Ok(f) => f,
         Err(_) => return TestResult::Fail("CPIO parse"),
     };
     let fs_static: &'static narf_filesystem::Initramfs =
@@ -384,8 +395,8 @@ kernel_test_in!("firmware", smoke_firmware_initramfs_staging_round_trip);
 
 fn smoke_firmware_per_task_authority_grant_and_revoke() -> TestResult {
     use crate::{
-        firmware_authority_of, grant_firmware_authority, revoke_firmware_authority,
-        is_trusted_firmware_loader_task, __reset_trusted_loader_tasks,
+        __reset_trusted_loader_tasks, firmware_authority_of, grant_firmware_authority,
+        is_trusted_firmware_loader_task, revoke_firmware_authority,
     };
     __reset_trusted_loader_tasks();
 
@@ -415,7 +426,9 @@ fn smoke_firmware_per_task_authority_grant_and_revoke() -> TestResult {
     let _cap2 = grant_firmware_authority(42);
     let mut hits = 0;
     for pid in 0..64u64 {
-        if firmware_authority_of(pid).is_some() { hits += 1; }
+        if firmware_authority_of(pid).is_some() {
+            hits += 1;
+        }
     }
     if hits != 1 {
         return TestResult::Fail("re-grant grew the table");
@@ -437,7 +450,10 @@ fn smoke_firmware_per_task_authority_grant_and_revoke() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("firmware", smoke_firmware_per_task_authority_grant_and_revoke);
+kernel_test_in!(
+    "firmware",
+    smoke_firmware_per_task_authority_grant_and_revoke
+);
 
 /// Build a minimal CPIO newc archive — header + path + data — for
 /// each `(name, data)` plus the `TRAILER!!!` sentinel. Used by
@@ -450,25 +466,27 @@ fn make_cpio_newc(files: &[(&str, &[u8])]) -> alloc::vec::Vec<u8> {
         out.extend_from_slice(s.as_bytes());
     };
     let pad4 = |out: &mut alloc::vec::Vec<u8>| {
-        while out.len() % 4 != 0 { out.push(0); }
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
     };
     for (name, data) in files.iter().copied() {
         let name_bytes = name.as_bytes();
         let nlen = (name_bytes.len() + 1) as u32; // include NUL
         out.extend_from_slice(b"070701");
-        push_hex(&mut out, 0);                 // c_ino
-        push_hex(&mut out, 0o100644);          // c_mode (S_IFREG | 0644)
-        push_hex(&mut out, 0);                 // c_uid
-        push_hex(&mut out, 0);                 // c_gid
-        push_hex(&mut out, 1);                 // c_nlink
-        push_hex(&mut out, 0);                 // c_mtime
+        push_hex(&mut out, 0); // c_ino
+        push_hex(&mut out, 0o100644); // c_mode (S_IFREG | 0644)
+        push_hex(&mut out, 0); // c_uid
+        push_hex(&mut out, 0); // c_gid
+        push_hex(&mut out, 1); // c_nlink
+        push_hex(&mut out, 0); // c_mtime
         push_hex(&mut out, data.len() as u32); // c_filesize
-        push_hex(&mut out, 0);                 // c_devmajor
-        push_hex(&mut out, 0);                 // c_devminor
-        push_hex(&mut out, 0);                 // c_rdevmajor
-        push_hex(&mut out, 0);                 // c_rdevminor
-        push_hex(&mut out, nlen);              // c_namesize (incl NUL)
-        push_hex(&mut out, 0);                 // c_check
+        push_hex(&mut out, 0); // c_devmajor
+        push_hex(&mut out, 0); // c_devminor
+        push_hex(&mut out, 0); // c_rdevmajor
+        push_hex(&mut out, 0); // c_rdevminor
+        push_hex(&mut out, nlen); // c_namesize (incl NUL)
+        push_hex(&mut out, 0); // c_check
         out.extend_from_slice(name_bytes);
         out.push(0);
         pad4(&mut out);

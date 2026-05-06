@@ -62,36 +62,43 @@ pub enum RlcError {
 }
 
 impl From<UcodeError> for RlcError {
-    fn from(e: UcodeError) -> Self { RlcError::Header(e) }
+    fn from(e: UcodeError) -> Self {
+        RlcError::Header(e)
+    }
 }
 
 /// RLC-specific extension fields past the common header.
 #[derive(Copy, Clone)]
 pub struct RlcHeader {
     pub common: UcodeHeader,
-    pub saved_restored_list_srci_offset:    u32,
-    pub saved_restored_list_srci_size:      u32,
-    pub indirect_start_offset:              u32,
-    pub indirect_size:                      u32,
-    pub reg_space_list_size:                u32,
-    pub fw_atm_cached_jump_table_size:      u32,
-    pub saved_restored_list_gpm_offset:     u32,
-    pub saved_restored_list_gpm_size:       u32,
-    pub saved_restored_list_srlc_offset:    u32,
-    pub saved_restored_list_srlc_size:      u32,
-    pub saved_restored_list_srlg_offset:    u32,
-    pub saved_restored_list_srlg_size:      u32,
-    pub reg_list_indirect_size:             u32,
-    pub autoload_offset_table_offset:       u32,
-    pub autoload_offset_table_size:         u32,
+    pub saved_restored_list_srci_offset: u32,
+    pub saved_restored_list_srci_size: u32,
+    pub indirect_start_offset: u32,
+    pub indirect_size: u32,
+    pub reg_space_list_size: u32,
+    pub fw_atm_cached_jump_table_size: u32,
+    pub saved_restored_list_gpm_offset: u32,
+    pub saved_restored_list_gpm_size: u32,
+    pub saved_restored_list_srlc_offset: u32,
+    pub saved_restored_list_srlc_size: u32,
+    pub saved_restored_list_srlg_offset: u32,
+    pub saved_restored_list_srlg_size: u32,
+    pub reg_list_indirect_size: u32,
+    pub autoload_offset_table_offset: u32,
+    pub autoload_offset_table_size: u32,
 }
 
 impl fmt::Debug for RlcHeader {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RlcHeader")
-            .field("common",    &self.common)
-            .field("autoload",  &(self.autoload_offset_table_offset,
-                                  self.autoload_offset_table_size))
+            .field("common", &self.common)
+            .field(
+                "autoload",
+                &(
+                    self.autoload_offset_table_offset,
+                    self.autoload_offset_table_size,
+                ),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -100,16 +107,16 @@ impl fmt::Debug for RlcHeader {
 #[derive(Copy, Clone)]
 pub struct AutoloadEntry {
     pub firmware_id: u32,
-    pub offset:      u32,
-    pub size:        u32,
+    pub offset: u32,
+    pub size: u32,
 }
 
 impl fmt::Debug for AutoloadEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AutoloadEntry")
-            .field("fw_id",  &self.firmware_id)
+            .field("fw_id", &self.firmware_id)
             .field("offset", &self.offset)
-            .field("size",   &self.size)
+            .field("size", &self.size)
             .finish()
     }
 }
@@ -117,27 +124,27 @@ impl fmt::Debug for AutoloadEntry {
 /// Parse the common ucode header + the RLC extension fields.
 pub fn parse(blob: &[u8]) -> Result<RlcHeader, RlcError> {
     let common = crate::amdgpu_ucode::parse(blob)?;
-    if blob.len() < 0x60 { return Err(RlcError::Header(UcodeError::Truncated)); }
-    let read_u32 = |o: usize| u32::from_le_bytes([
-        blob[o], blob[o + 1], blob[o + 2], blob[o + 3],
-    ]);
+    if blob.len() < 0x60 {
+        return Err(RlcError::Header(UcodeError::Truncated));
+    }
+    let read_u32 = |o: usize| u32::from_le_bytes([blob[o], blob[o + 1], blob[o + 2], blob[o + 3]]);
     Ok(RlcHeader {
         common,
-        saved_restored_list_srci_offset:    read_u32(0x24),
-        saved_restored_list_srci_size:      read_u32(0x28),
-        indirect_start_offset:              read_u32(0x2C),
-        indirect_size:                      read_u32(0x30),
-        reg_space_list_size:                read_u32(0x34),
-        fw_atm_cached_jump_table_size:      read_u32(0x38),
-        saved_restored_list_gpm_offset:     read_u32(0x3C),
-        saved_restored_list_gpm_size:       read_u32(0x40),
-        saved_restored_list_srlc_offset:    read_u32(0x44),
-        saved_restored_list_srlc_size:      read_u32(0x48),
-        saved_restored_list_srlg_offset:    read_u32(0x4C),
-        saved_restored_list_srlg_size:      read_u32(0x50),
-        reg_list_indirect_size:             read_u32(0x54),
-        autoload_offset_table_offset:       read_u32(0x58),
-        autoload_offset_table_size:         read_u32(0x5C),
+        saved_restored_list_srci_offset: read_u32(0x24),
+        saved_restored_list_srci_size: read_u32(0x28),
+        indirect_start_offset: read_u32(0x2C),
+        indirect_size: read_u32(0x30),
+        reg_space_list_size: read_u32(0x34),
+        fw_atm_cached_jump_table_size: read_u32(0x38),
+        saved_restored_list_gpm_offset: read_u32(0x3C),
+        saved_restored_list_gpm_size: read_u32(0x40),
+        saved_restored_list_srlc_offset: read_u32(0x44),
+        saved_restored_list_srlc_size: read_u32(0x48),
+        saved_restored_list_srlg_offset: read_u32(0x4C),
+        saved_restored_list_srlg_size: read_u32(0x50),
+        reg_list_indirect_size: read_u32(0x54),
+        autoload_offset_table_offset: read_u32(0x58),
+        autoload_offset_table_size: read_u32(0x5C),
     })
 }
 
@@ -154,20 +161,19 @@ pub fn autoload_iter<'a>(
     header: &RlcHeader,
 ) -> Result<impl Iterator<Item = AutoloadEntry> + 'a, RlcError> {
     let off = header.autoload_offset_table_offset as usize;
-    let sz  = header.autoload_offset_table_size as usize;
+    let sz = header.autoload_offset_table_size as usize;
     if off == 0 || sz == 0 || off + sz > blob.len() {
         return Err(RlcError::AutoloadOutOfBounds);
     }
     let n = sz / 12;
     Ok((0..n).map(move |i| {
         let entry_off = off + i * 12;
-        let read_u32 = |o: usize| u32::from_le_bytes([
-            blob[o], blob[o + 1], blob[o + 2], blob[o + 3],
-        ]);
+        let read_u32 =
+            |o: usize| u32::from_le_bytes([blob[o], blob[o + 1], blob[o + 2], blob[o + 3]]);
         AutoloadEntry {
             firmware_id: read_u32(entry_off),
-            offset:      read_u32(entry_off + 4),
-            size:        read_u32(entry_off + 8),
+            offset: read_u32(entry_off + 4),
+            size: read_u32(entry_off + 8),
         }
     }))
 }
@@ -175,7 +181,9 @@ pub fn autoload_iter<'a>(
 /// Quick sanity check: blob's first 4 bytes are the standard
 /// `0x012345AB` ucode magic AND the common header parses.
 pub fn looks_like_rlc(blob: &[u8]) -> bool {
-    if blob.len() < 4 { return false; }
+    if blob.len() < 4 {
+        return false;
+    }
     let magic = u32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]);
     magic == UCODE_MAGIC && parse(blob).is_ok()
 }

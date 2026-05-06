@@ -34,17 +34,17 @@ impl Vendor {
 
 #[derive(Copy, Clone, Debug)]
 pub struct CpuId {
-    pub vendor:    Vendor,
-    pub family:    u16,
-    pub model:     u16,
-    pub stepping:  u8,
+    pub vendor: Vendor,
+    pub family: u16,
+    pub model: u16,
+    pub stepping: u8,
     pub signature: u32,
-    pub brand:     [u8; 48],
+    pub brand: [u8; 48],
 }
 
 fn write_le_u32(buf: &mut [u8], at: usize, v: u32) {
     let bytes = v.to_le_bytes();
-    buf[at..at+4].copy_from_slice(&bytes);
+    buf[at..at + 4].copy_from_slice(&bytes);
 }
 
 pub fn read() -> CpuId {
@@ -64,13 +64,13 @@ pub fn read() -> CpuId {
     } else {
         (0, 0, 0, 0)
     };
-    let stepping     = (sig & 0xF) as u8;
-    let base_model   = ((sig >> 4) & 0xF) as u16;
-    let base_family  = ((sig >> 8) & 0xF) as u16;
-    let ext_model    = ((sig >> 16) & 0xF) as u16;
-    let ext_family   = ((sig >> 20) & 0xFF) as u16;
+    let stepping = (sig & 0xF) as u8;
+    let base_model = ((sig >> 4) & 0xF) as u16;
+    let base_family = ((sig >> 8) & 0xF) as u16;
+    let ext_model = ((sig >> 16) & 0xF) as u16;
+    let ext_family = ((sig >> 20) & 0xFF) as u16;
     let family = base_family + if base_family == 0xF { ext_family } else { 0 };
-    let model  = if base_family >= 0x6 || base_family == 0xF {
+    let model = if base_family >= 0x6 || base_family == 0xF {
         base_model | (ext_model << 4)
     } else {
         base_model
@@ -81,25 +81,39 @@ pub fn read() -> CpuId {
     // SAFETY: leaf 0x8000_0000 always defined.
     let (max_ext, _, _, _) = unsafe { cpuid(0x8000_0000, 0) };
     if max_ext >= 0x8000_0004 {
-        for (i, leaf) in [0x8000_0002u32, 0x8000_0003, 0x8000_0004].iter().enumerate() {
+        for (i, leaf) in [0x8000_0002u32, 0x8000_0003, 0x8000_0004]
+            .iter()
+            .enumerate()
+        {
             // SAFETY: gated.
             let (a, b, c, d) = unsafe { cpuid(*leaf, 0) };
             let off = i * 16;
-            write_le_u32(&mut brand, off,      a);
-            write_le_u32(&mut brand, off + 4,  b);
-            write_le_u32(&mut brand, off + 8,  c);
+            write_le_u32(&mut brand, off, a);
+            write_le_u32(&mut brand, off + 4, b);
+            write_le_u32(&mut brand, off + 8, c);
             write_le_u32(&mut brand, off + 12, d);
         }
     }
 
-    CpuId { vendor, family, model, stepping, signature: sig, brand }
+    CpuId {
+        vendor,
+        family,
+        model,
+        stepping,
+        signature: sig,
+        brand,
+    }
 }
 
 /// Trim the brand string to its NUL-terminated, leading-space-stripped
 /// form. Returns an empty `&str` if no leaf-0x8000_0002 data was
 /// available.
 pub fn brand_str(c: &CpuId) -> &str {
-    let end = c.brand.iter().position(|&b| b == 0).unwrap_or(c.brand.len());
+    let end = c
+        .brand
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(c.brand.len());
     let mut start = 0;
     while start < end && c.brand[start] == b' ' {
         start += 1;

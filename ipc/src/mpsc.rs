@@ -42,9 +42,9 @@ pub enum MpscRecvError {
 }
 
 struct Inner<T> {
-    q:              IrqSafeSpinLock<VecDeque<T>>,
-    cap:            usize,
-    closed:         AtomicBool,
+    q: IrqSafeSpinLock<VecDeque<T>>,
+    cap: usize,
+    closed: AtomicBool,
     consumer_waker: IrqSafeSpinLock<Option<Waker>>,
     producer_waker: IrqSafeSpinLock<Option<Waker>>,
 }
@@ -52,7 +52,7 @@ struct Inner<T> {
 impl<T> core::fmt::Debug for Inner<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Inner")
-            .field("cap",    &self.cap)
+            .field("cap", &self.cap)
             .field("closed", &self.closed.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
@@ -144,7 +144,9 @@ impl<T> MpscConsumer<T> {
     }
 
     /// Pending item count. Best-effort snapshot.
-    pub fn pending(&self) -> usize { self.inner.q.lock().len() }
+    pub fn pending(&self) -> usize {
+        self.inner.q.lock().len()
+    }
 }
 
 /// Future returned by `MpscConsumer::recv`.
@@ -158,16 +160,16 @@ impl<'c, T: Send> Future for MpscRecvFuture<'c, T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.consumer.try_recv() {
-            Ok(Some(v))  => Poll::Ready(Ok(v)),
-            Err(e)       => Poll::Ready(Err(e)),
-            Ok(None)     => {
+            Ok(Some(v)) => Poll::Ready(Ok(v)),
+            Err(e) => Poll::Ready(Err(e)),
+            Ok(None) => {
                 *self.consumer.inner.consumer_waker.lock() = Some(cx.waker().clone());
                 // Re-check after installing the waker — producer may
                 // have posted between `try_recv` and the install.
                 match self.consumer.try_recv() {
                     Ok(Some(v)) => Poll::Ready(Ok(v)),
-                    Err(e)      => Poll::Ready(Err(e)),
-                    Ok(None)    => Poll::Pending,
+                    Err(e) => Poll::Ready(Err(e)),
+                    Ok(None) => Poll::Pending,
                 }
             }
         }
@@ -189,14 +191,20 @@ impl<T> Drop for MpscConsumer<T> {
 pub fn mpsc_channel<T>(cap: usize) -> (MpscProducer<T>, MpscConsumer<T>) {
     assert!(cap > 0, "mpsc_channel cap must be non-zero");
     let inner = Arc::new(Inner {
-        q:              IrqSafeSpinLock::new(VecDeque::with_capacity(cap)),
+        q: IrqSafeSpinLock::new(VecDeque::with_capacity(cap)),
         cap,
-        closed:         AtomicBool::new(false),
+        closed: AtomicBool::new(false),
         consumer_waker: IrqSafeSpinLock::new(None),
         producer_waker: IrqSafeSpinLock::new(None),
     });
     (
-        MpscProducer { inner: Arc::clone(&inner), _not_sync_hint: PhantomData },
-        MpscConsumer { inner, _not_sync: PhantomData },
+        MpscProducer {
+            inner: Arc::clone(&inner),
+            _not_sync_hint: PhantomData,
+        },
+        MpscConsumer {
+            inner,
+            _not_sync: PhantomData,
+        },
     )
 }

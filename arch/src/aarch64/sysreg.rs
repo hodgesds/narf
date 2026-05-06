@@ -328,8 +328,12 @@ pub unsafe fn tlb_flush_all() {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: TLBI VMALLE1 is legal at EL1.
     unsafe {
-        asm!("tlbi vmalle1", "dsb nsh", "isb",
-             options(nostack, preserves_flags));
+        asm!(
+            "tlbi vmalle1",
+            "dsb nsh",
+            "isb",
+            options(nostack, preserves_flags)
+        );
     }
     compiler_fence(Ordering::SeqCst);
 }
@@ -422,7 +426,11 @@ pub fn asid_bits() -> u8 {
     unsafe {
         asm!("mrs {}, id_aa64mmfr0_el1", out(reg) v, options(nomem, nostack));
     }
-    if (v >> 4) & 0xF == 2 { 16 } else { 8 }
+    if (v >> 4) & 0xF == 2 {
+        16
+    } else {
+        8
+    }
 }
 
 /// Read the current TTBR0_EL1 ASID field (bits[63:48]).
@@ -458,5 +466,3 @@ pub unsafe fn write_ttbr0_el1_with_asid(root_phys: u64, asid: u16) {
     }
     compiler_fence(Ordering::SeqCst);
 }
-
-

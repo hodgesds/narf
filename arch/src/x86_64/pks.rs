@@ -31,11 +31,15 @@ static PKS_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Mark CR4.PKS as live. Called from `frame/main.rs` after writing
 /// CR4. After this returns, `Pks::*` methods drive `IA32_PKRS`
 /// directly; before, they delegate to `pcid::*`.
-pub fn mark_active() { PKS_ACTIVE.store(true, Ordering::Release) }
+pub fn mark_active() {
+    PKS_ACTIVE.store(true, Ordering::Release)
+}
 
 /// True when CR4.PKS is enabled on the current CPU. Public so the
 /// `DomainPrimitive` impl in `mod.rs` can branch on it.
-pub fn is_active() -> bool { PKS_ACTIVE.load(Ordering::Acquire) }
+pub fn is_active() -> bool {
+    PKS_ACTIVE.load(Ordering::Acquire)
+}
 
 /// Saved PKRS value. `Copy` per `DomainPrimitive::SavedState`.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -54,18 +58,26 @@ pub struct DomainRights {
 }
 
 impl DomainRights {
-    pub const ALLOW_ALL: Self = Self { no_write: false, no_access: false };
-    pub const READ_ONLY: Self = Self { no_write: true,  no_access: false };
-    pub const DENY_ALL:  Self = Self { no_write: true,  no_access: true  };
+    pub const ALLOW_ALL: Self = Self {
+        no_write: false,
+        no_access: false,
+    };
+    pub const READ_ONLY: Self = Self {
+        no_write: true,
+        no_access: false,
+    };
+    pub const DENY_ALL: Self = Self {
+        no_write: true,
+        no_access: true,
+    };
 
     const fn encode(self) -> u64 {
-        (self.no_write  as u64)      |
-        ((self.no_access as u64) << 1)
+        (self.no_write as u64) | ((self.no_access as u64) << 1)
     }
 
     const fn decode(bits: u64) -> Self {
         Self {
-            no_write:  bits & 0b01 != 0,
+            no_write: bits & 0b01 != 0,
             no_access: bits & 0b10 != 0,
         }
     }
@@ -74,8 +86,8 @@ impl DomainRights {
 impl fmt::Display for DomainRights {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match (self.no_access, self.no_write) {
-            (true,  _)     => f.write_str("deny"),
-            (false, true)  => f.write_str("r-"),
+            (true, _) => f.write_str("deny"),
+            (false, true) => f.write_str("r-"),
             (false, false) => f.write_str("rw"),
         }
     }
@@ -99,7 +111,9 @@ pub unsafe fn save() -> SavedPkrs {
 pub unsafe fn restore(s: SavedPkrs) {
     // SAFETY: see save; also writing an arbitrary 32-bit bitmap to
     // the defined field of IA32_PKRS is always well-defined.
-    unsafe { wrmsr(IA32_PKRS, s.0); }
+    unsafe {
+        wrmsr(IA32_PKRS, s.0);
+    }
 }
 
 /// Get rights for a single domain.
@@ -126,11 +140,13 @@ pub unsafe fn get_rights(domain: u8) -> DomainRights {
 pub unsafe fn set_rights(domain: u8, rights: DomainRights) {
     debug_assert!(domain < 16, "domain must be in 0..=15");
     let shift = 2 * domain as u32;
-    let mask  = !(0b11u64 << shift);
+    let mask = !(0b11u64 << shift);
     // SAFETY: PKS is enabled.
     let current = unsafe { rdmsr(IA32_PKRS) };
     let next = (current & mask) | (rights.encode() << shift);
-    unsafe { wrmsr(IA32_PKRS, next); }
+    unsafe {
+        wrmsr(IA32_PKRS, next);
+    }
 }
 
 /// Enter a domain scope: save the current PKRS, then write a new
@@ -161,7 +177,9 @@ pub unsafe fn enter_domain(kernel_domain: u8, driver_domain: u8) -> SavedPkrs {
     new_pkrs &= !(0b11u64 << (2 * kernel_domain as u32));
     new_pkrs &= !(0b11u64 << (2 * driver_domain as u32));
     // SAFETY: see save.
-    unsafe { wrmsr(IA32_PKRS, new_pkrs); }
+    unsafe {
+        wrmsr(IA32_PKRS, new_pkrs);
+    }
     SavedPkrs(saved)
 }
 
@@ -170,5 +188,7 @@ pub unsafe fn enter_domain(kernel_domain: u8, driver_domain: u8) -> SavedPkrs {
 #[inline]
 pub unsafe fn exit_domain(saved: SavedPkrs) {
     // SAFETY: same as restore.
-    unsafe { restore(saved); }
+    unsafe {
+        restore(saved);
+    }
 }

@@ -9,8 +9,8 @@
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 fn smoke_acpi_pptt_synthetic_decode() -> TestResult {
+    use crate::{PpttCache, PpttCacheKind, PpttCpu};
     use alloc::vec::Vec;
-    use crate::{PpttCpu, PpttCache, PpttCacheKind};
     let mut buf: Vec<u8> = Vec::with_capacity(36 + 24 + 24);
     // SDT header (signature + length placeholder + dummies = 36 B).
     buf.extend_from_slice(b"PPTT");
@@ -18,21 +18,25 @@ fn smoke_acpi_pptt_synthetic_decode() -> TestResult {
     buf.extend_from_slice(&[0u8; 28]);
 
     // Type 0 (Processor): leaf + ACPI UID = 0x42, length = 20.
-    buf.push(0); buf.push(20); buf.extend_from_slice(&[0u8; 2]); // type / len / rsvd
-    buf.extend_from_slice(&0b1001u32.to_le_bytes());             // package + leaf
-    buf.extend_from_slice(&0u32.to_le_bytes());                  // parent
-    buf.extend_from_slice(&0x42u32.to_le_bytes());               // ACPI UID
-    buf.extend_from_slice(&0u32.to_le_bytes());                  // n_priv
+    buf.push(0);
+    buf.push(20);
+    buf.extend_from_slice(&[0u8; 2]); // type / len / rsvd
+    buf.extend_from_slice(&0b1001u32.to_le_bytes()); // package + leaf
+    buf.extend_from_slice(&0u32.to_le_bytes()); // parent
+    buf.extend_from_slice(&0x42u32.to_le_bytes()); // ACPI UID
+    buf.extend_from_slice(&0u32.to_le_bytes()); // n_priv
 
     // Type 1 (Cache): line=64, ways=8, sets=64, size=32K, kind=Data.
-    buf.push(1); buf.push(24); buf.extend_from_slice(&[0u8; 2]);
-    buf.extend_from_slice(&0u32.to_le_bytes());                  // flags
-    buf.extend_from_slice(&0u32.to_le_bytes());                  // next-level
-    buf.extend_from_slice(&32_768u32.to_le_bytes());             // size
-    buf.extend_from_slice(&64u32.to_le_bytes());                 // sets
-    buf.push(8);                                                 // assoc
-    buf.push((0b00) << 2);                                       // attrs: kind = Data
-    buf.extend_from_slice(&64u16.to_le_bytes());                 // line
+    buf.push(1);
+    buf.push(24);
+    buf.extend_from_slice(&[0u8; 2]);
+    buf.extend_from_slice(&0u32.to_le_bytes()); // flags
+    buf.extend_from_slice(&0u32.to_le_bytes()); // next-level
+    buf.extend_from_slice(&32_768u32.to_le_bytes()); // size
+    buf.extend_from_slice(&64u32.to_le_bytes()); // sets
+    buf.push(8); // assoc
+    buf.push((0b00) << 2); // attrs: kind = Data
+    buf.extend_from_slice(&64u16.to_le_bytes()); // line
 
     let n = crate::__test_parse_pptt_body(&buf);
     if n != 2 {
@@ -59,11 +63,11 @@ fn smoke_acpi_pptt_synthetic_decode() -> TestResult {
 kernel_test_in!("acpi/pptt", smoke_acpi_pptt_synthetic_decode);
 
 fn smoke_acpi_iort_synthetic_decode() -> TestResult {
+    use crate::{IortIts, IortSmmuv3};
     use alloc::vec::Vec;
-    use crate::{IortSmmuv3, IortIts};
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"IORT");
-    buf.extend_from_slice(&[0u8; 32]);          // length placeholder + rsvd
+    buf.extend_from_slice(&[0u8; 32]); // length placeholder + rsvd
 
     // IORT header: 12 bytes after SDT_HEADER.
     let n_nodes_off = buf.len();
@@ -75,9 +79,9 @@ fn smoke_acpi_iort_synthetic_decode() -> TestResult {
     let arr_off = buf.len() as u32;
 
     // ITS group node: type=0, length=24, 1 ID = 0xCAFE.
-    buf.push(0);                                 // type
+    buf.push(0); // type
     buf.extend_from_slice(&24u16.to_le_bytes()); // length
-    buf.push(0);                                 // revision
+    buf.push(0); // revision
     buf.extend_from_slice(&0u32.to_le_bytes()); // identifier
     buf.extend_from_slice(&0u32.to_le_bytes()); // n_id_mappings
     buf.extend_from_slice(&0u32.to_le_bytes()); // off_id_mappings
@@ -92,8 +96,8 @@ fn smoke_acpi_iort_synthetic_decode() -> TestResult {
     buf.extend_from_slice(&0u32.to_le_bytes()); // n_id_mappings
     buf.extend_from_slice(&0u32.to_le_bytes()); // off_id_mappings
     buf.extend_from_slice(&0xDEAD_0000u64.to_le_bytes()); // base
-    buf.extend_from_slice(&0xA5u32.to_le_bytes());        // flags
-    buf.extend_from_slice(&[0u8; 8]);                     // pad to 36
+    buf.extend_from_slice(&0xA5u32.to_le_bytes()); // flags
+    buf.extend_from_slice(&[0u8; 8]); // pad to 36
 
     // Patch array-offset.
     buf[arr_off_pos..arr_off_pos + 4].copy_from_slice(&arr_off.to_le_bytes());
@@ -118,20 +122,20 @@ fn smoke_acpi_iort_synthetic_decode() -> TestResult {
 kernel_test_in!("acpi/iort", smoke_acpi_iort_synthetic_decode);
 
 fn smoke_acpi_dmar_synthetic_decode() -> TestResult {
-    use alloc::vec::Vec;
     use crate::DmarDrhd;
+    use alloc::vec::Vec;
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"DMAR");
-    buf.extend_from_slice(&[0u8; 32]);          // length + rsvd
-    buf.push(48);                                // host_addr_width
-    buf.push(1);                                 // flags: INTR_REMAP
-    buf.extend_from_slice(&[0u8; 10]);           // reserved
+    buf.extend_from_slice(&[0u8; 32]); // length + rsvd
+    buf.push(48); // host_addr_width
+    buf.push(1); // flags: INTR_REMAP
+    buf.extend_from_slice(&[0u8; 10]); // reserved
 
     // DRHD: type=0, length=16, segment=0x55, base=0xFEED_F000.
-    buf.extend_from_slice(&0u16.to_le_bytes());  // type
+    buf.extend_from_slice(&0u16.to_le_bytes()); // type
     buf.extend_from_slice(&16u16.to_le_bytes()); // length
-    buf.push(0);                                 // flags
-    buf.push(0);                                 // reserved
+    buf.push(0); // flags
+    buf.push(0); // reserved
     buf.extend_from_slice(&0x55u16.to_le_bytes());
     buf.extend_from_slice(&0xFEED_F000u64.to_le_bytes());
 
@@ -152,17 +156,17 @@ fn smoke_acpi_dmar_synthetic_decode() -> TestResult {
 kernel_test_in!("acpi/dmar", smoke_acpi_dmar_synthetic_decode);
 
 fn smoke_acpi_ivrs_synthetic_decode() -> TestResult {
-    use alloc::vec::Vec;
     use crate::IvrsIommu;
+    use alloc::vec::Vec;
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"IVRS");
-    buf.extend_from_slice(&[0u8; 32]);          // length + rsvd
+    buf.extend_from_slice(&[0u8; 32]); // length + rsvd
     buf.extend_from_slice(&0u32.to_le_bytes()); // IvInfo
-    buf.extend_from_slice(&[0u8; 8]);           // reserved
+    buf.extend_from_slice(&[0u8; 8]); // reserved
 
     // IVHD: type=0x10, length=24, cap_off=0x40, base=0xBA5E_F000, segment=0xAB.
     buf.push(0x10);
-    buf.push(0);                                 // flags
+    buf.push(0); // flags
     buf.extend_from_slice(&24u16.to_le_bytes());
     buf.extend_from_slice(&0u16.to_le_bytes()); // device id
     buf.extend_from_slice(&0x40u16.to_le_bytes());
@@ -192,23 +196,23 @@ fn smoke_acpi_spcr_synthetic_decode() -> TestResult {
     use alloc::vec::Vec;
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"SPCR");
-    buf.extend_from_slice(&[0u8; 32]);          // length + rsvd
+    buf.extend_from_slice(&[0u8; 32]); // length + rsvd
 
     // Body: 36 bytes minimum.
-    buf.push(0x03);                              // iface = ARM PL011
-    buf.extend_from_slice(&[0u8; 3]);            // reserved
-    buf.push(0x00);                              // GAS.AddressSpaceId = SystemMemory
-    buf.push(8);                                 // bit width
-    buf.push(0);                                 // bit offset
-    buf.push(1);                                 // access size
+    buf.push(0x03); // iface = ARM PL011
+    buf.extend_from_slice(&[0u8; 3]); // reserved
+    buf.push(0x00); // GAS.AddressSpaceId = SystemMemory
+    buf.push(8); // bit width
+    buf.push(0); // bit offset
+    buf.push(1); // access size
     buf.extend_from_slice(&0x900_0000u64.to_le_bytes()); // GAS.Address
-    buf.push(0);                                 // InterruptType
-    buf.push(0);                                 // IRQ
+    buf.push(0); // InterruptType
+    buf.push(0); // IRQ
     buf.extend_from_slice(&33u32.to_le_bytes()); // GSI
-    buf.push(7);                                 // baud = 115200
-    buf.extend_from_slice(&[0u8; 5]);            // parity / stop / flow / term / lang
+    buf.push(7); // baud = 115200
+    buf.extend_from_slice(&[0u8; 5]); // parity / stop / flow / term / lang
     buf.extend_from_slice(&0xFFFFu16.to_le_bytes()); // PCI device id
-    buf.extend_from_slice(&[0u8; 6]);            // pad to 36
+    buf.extend_from_slice(&[0u8; 6]); // pad to 36
 
     crate::__test_parse_spcr_body(&buf);
     let info = crate::spcr_info().expect("SPCR not parsed");
@@ -220,42 +224,42 @@ fn smoke_acpi_spcr_synthetic_decode() -> TestResult {
 kernel_test_in!("acpi/spcr", smoke_acpi_spcr_synthetic_decode);
 
 fn smoke_acpi_hest_synthetic_decode() -> TestResult {
+    use crate::{HestGhesSource, HestMceSource};
     use alloc::vec::Vec;
-    use crate::{HestMceSource, HestGhesSource};
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"HEST");
-    buf.extend_from_slice(&[0u8; 32]);                    // length + rsvd
-    buf.extend_from_slice(&2u32.to_le_bytes());           // ErrorSourceCount
+    buf.extend_from_slice(&[0u8; 32]); // length + rsvd
+    buf.extend_from_slice(&2u32.to_le_bytes()); // ErrorSourceCount
 
     // Type 0 (Machine Check), length = 40 + 0 banks = 40.
     let mce_off = buf.len();
-    buf.extend_from_slice(&0u16.to_le_bytes());           // type
-    buf.extend_from_slice(&0xABCDu16.to_le_bytes());      // source id
-    buf.extend_from_slice(&0u16.to_le_bytes());           // reserved
-    buf.push(0);                                          // flags
-    buf.push(1);                                          // enabled
-    buf.extend_from_slice(&[0u8; 8]);                     // num_records + max_sect
+    buf.extend_from_slice(&0u16.to_le_bytes()); // type
+    buf.extend_from_slice(&0xABCDu16.to_le_bytes()); // source id
+    buf.extend_from_slice(&0u16.to_le_bytes()); // reserved
+    buf.push(0); // flags
+    buf.push(1); // enabled
+    buf.extend_from_slice(&[0u8; 8]); // num_records + max_sect
     buf.extend_from_slice(&0xDEAD_BEEFu64.to_le_bytes()); // global_capability
     buf.extend_from_slice(&0xCAFE_F00Du64.to_le_bytes()); // global_control
-    buf.push(0);                                          // num_hw_banks
-    buf.extend_from_slice(&[0u8; 7]);                     // reserved (40 bytes total so far)
+    buf.push(0); // num_hw_banks
+    buf.extend_from_slice(&[0u8; 7]); // reserved (40 bytes total so far)
     let _ = mce_off;
 
     // Type 9 (GHES), length = 92.
-    buf.extend_from_slice(&9u16.to_le_bytes());           // type
-    buf.extend_from_slice(&0x1234u16.to_le_bytes());      // source id
-    buf.extend_from_slice(&0u16.to_le_bytes());           // related src
-    buf.push(0);                                          // flags
-    buf.push(1);                                          // enabled
-    buf.extend_from_slice(&[0u8; 4]);                     // num_records (4 B)
-    buf.extend_from_slice(&7u32.to_le_bytes());           // max_sections_per_record (4 B)
-    buf.extend_from_slice(&[0u8; 8]);                     // max_raw_data + reserved fill
-    // GAS at offset 24..36 of GHES entry; address @ +28..36 within GAS:
-    buf.extend_from_slice(&[0u8; 4]);                     // GAS asid+bw+bo+as
+    buf.extend_from_slice(&9u16.to_le_bytes()); // type
+    buf.extend_from_slice(&0x1234u16.to_le_bytes()); // source id
+    buf.extend_from_slice(&0u16.to_le_bytes()); // related src
+    buf.push(0); // flags
+    buf.push(1); // enabled
+    buf.extend_from_slice(&[0u8; 4]); // num_records (4 B)
+    buf.extend_from_slice(&7u32.to_le_bytes()); // max_sections_per_record (4 B)
+    buf.extend_from_slice(&[0u8; 8]); // max_raw_data + reserved fill
+                                      // GAS at offset 24..36 of GHES entry; address @ +28..36 within GAS:
+    buf.extend_from_slice(&[0u8; 4]); // GAS asid+bw+bo+as
     buf.extend_from_slice(&0xCAFE_BABEu64.to_le_bytes()); // err status block addr
-    buf.extend_from_slice(&[0u8; 28 + 4]);                // notif (28) + ESBlock len (4)
-    // Total written so far for GHES = 40 + 4 + 8 + 4 + 8 + 28 + 4 = 96 (close to 92);
-    // pad/truncate to 92 by trimming if over.
+    buf.extend_from_slice(&[0u8; 28 + 4]); // notif (28) + ESBlock len (4)
+                                           // Total written so far for GHES = 40 + 4 + 8 + 4 + 8 + 28 + 4 = 96 (close to 92);
+                                           // pad/truncate to 92 by trimming if over.
     let cur = buf.len();
     let want = mce_off + 40 + 92;
     if cur > want {
@@ -270,7 +274,9 @@ fn smoke_acpi_hest_synthetic_decode() -> TestResult {
     }
     let mut mces = [HestMceSource::default(); 4];
     let nm = crate::copy_hest_mce(&mut mces);
-    if nm < 1 || mces[0].source_id != 0xABCD || !mces[0].enabled
+    if nm < 1
+        || mces[0].source_id != 0xABCD
+        || !mces[0].enabled
         || mces[0].global_capability != 0xDEAD_BEEF
         || mces[0].global_control != 0xCAFE_F00D
     {
@@ -285,13 +291,13 @@ fn smoke_acpi_hest_synthetic_decode() -> TestResult {
 kernel_test_in!("acpi/hest", smoke_acpi_hest_synthetic_decode);
 
 fn smoke_acpi_pcct_synthetic_decode() -> TestResult {
-    use alloc::vec::Vec;
     use crate::PcctChannel;
+    use alloc::vec::Vec;
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"PCCT");
-    buf.extend_from_slice(&[0u8; 32]);                    // length + rsvd
-    buf.extend_from_slice(&0u32.to_le_bytes());           // PCCT flags
-    buf.extend_from_slice(&[0u8; 8]);                     // reserved
+    buf.extend_from_slice(&[0u8; 32]); // length + rsvd
+    buf.extend_from_slice(&0u32.to_le_bytes()); // PCCT flags
+    buf.extend_from_slice(&[0u8; 8]); // reserved
 
     // Generic channel (type 0). Spec layout (offsets within entry):
     //   0..2   type+length
@@ -305,17 +311,18 @@ fn smoke_acpi_pcct_synthetic_decode() -> TestResult {
     //   56..60 max periodic
     //   60..62 min turnaround
     let entry_start = buf.len();
-    buf.push(0); buf.push(62);                            // type / length
-    buf.extend_from_slice(&[0u8; 6]);                     // reserved
+    buf.push(0);
+    buf.push(62); // type / length
+    buf.extend_from_slice(&[0u8; 6]); // reserved
     buf.extend_from_slice(&0xDEAD_0000u64.to_le_bytes()); // base
-    buf.extend_from_slice(&0x1000u64.to_le_bytes());      // length
-    buf.extend_from_slice(&[0u8; 4]);                     // GAS hdr
+    buf.extend_from_slice(&0x1000u64.to_le_bytes()); // length
+    buf.extend_from_slice(&[0u8; 4]); // GAS hdr
     buf.extend_from_slice(&0xBEEF_0000u64.to_le_bytes()); // GAS.Address
-    buf.extend_from_slice(&0u64.to_le_bytes());           // doorbell preserve
-    buf.extend_from_slice(&0xC0FFEEu64.to_le_bytes());    // doorbell write
-    buf.extend_from_slice(&50u32.to_le_bytes());          // nominal latency
-    buf.extend_from_slice(&0u32.to_le_bytes());           // max periodic
-    buf.extend_from_slice(&100u16.to_le_bytes());         // min turnaround
+    buf.extend_from_slice(&0u64.to_le_bytes()); // doorbell preserve
+    buf.extend_from_slice(&0xC0FFEEu64.to_le_bytes()); // doorbell write
+    buf.extend_from_slice(&50u32.to_le_bytes()); // nominal latency
+    buf.extend_from_slice(&0u32.to_le_bytes()); // max periodic
+    buf.extend_from_slice(&100u16.to_le_bytes()); // min turnaround
     debug_assert_eq!(buf.len() - entry_start, 62);
     let _ = entry_start;
 
@@ -344,11 +351,9 @@ fn smoke_acpi_slit_synthetic_decode() -> TestResult {
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"SLIT");
     buf.extend_from_slice(&[0u8; 32]);
-    buf.extend_from_slice(&3u64.to_le_bytes());           // 3 nodes
-    // 3x3 distance matrix.
-    buf.extend_from_slice(&[10, 20, 30,
-                             20, 10, 25,
-                             30, 25, 10]);
+    buf.extend_from_slice(&3u64.to_le_bytes()); // 3 nodes
+                                                // 3x3 distance matrix.
+    buf.extend_from_slice(&[10, 20, 30, 20, 10, 25, 30, 25, 10]);
 
     let n = crate::__test_parse_slit_body(&buf);
     if n != 3 {
@@ -368,31 +373,35 @@ fn smoke_acpi_slit_synthetic_decode() -> TestResult {
 kernel_test_in!("acpi/slit", smoke_acpi_slit_synthetic_decode);
 
 fn smoke_acpi_cedt_synthetic_decode() -> TestResult {
+    use crate::{CedtCfmws, CedtChbs};
     use alloc::vec::Vec;
-    use crate::{CedtChbs, CedtCfmws};
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"CEDT");
     buf.extend_from_slice(&[0u8; 32]);
 
     // CHBS: type=0, length=32.
-    buf.push(0); buf.push(0); buf.extend_from_slice(&32u16.to_le_bytes());
-    buf.extend_from_slice(&0x42u32.to_le_bytes());        // uid
-    buf.extend_from_slice(&1u32.to_le_bytes());           // cxl_ver = CXL 2.0
-    buf.extend_from_slice(&0u32.to_le_bytes());           // reserved
+    buf.push(0);
+    buf.push(0);
+    buf.extend_from_slice(&32u16.to_le_bytes());
+    buf.extend_from_slice(&0x42u32.to_le_bytes()); // uid
+    buf.extend_from_slice(&1u32.to_le_bytes()); // cxl_ver = CXL 2.0
+    buf.extend_from_slice(&0u32.to_le_bytes()); // reserved
     buf.extend_from_slice(&0xCD00_0000u64.to_le_bytes()); // base
-    buf.extend_from_slice(&0x10000u64.to_le_bytes());     // length
+    buf.extend_from_slice(&0x10000u64.to_le_bytes()); // length
 
     // CFMWS: type=1, length=36, 0 targets.
-    buf.push(1); buf.push(0); buf.extend_from_slice(&36u16.to_le_bytes());
-    buf.extend_from_slice(&0u32.to_le_bytes());           // reserved
-    buf.extend_from_slice(&0x800_0000u64.to_le_bytes());  // base hpa
+    buf.push(1);
+    buf.push(0);
+    buf.extend_from_slice(&36u16.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes()); // reserved
+    buf.extend_from_slice(&0x800_0000u64.to_le_bytes()); // base hpa
     buf.extend_from_slice(&0x1000_0000u64.to_le_bytes()); // window size
-    buf.push(0);                                          // encoded_iw
-    buf.push(0);                                          // interleave arith
-    buf.extend_from_slice(&0u16.to_le_bytes());           // reserved
-    buf.extend_from_slice(&0u32.to_le_bytes());           // hb iface type
-    buf.extend_from_slice(&0u16.to_le_bytes());           // restrictions
-    buf.extend_from_slice(&0u16.to_le_bytes());           // qtg id
+    buf.push(0); // encoded_iw
+    buf.push(0); // interleave arith
+    buf.extend_from_slice(&0u16.to_le_bytes()); // reserved
+    buf.extend_from_slice(&0u32.to_le_bytes()); // hb iface type
+    buf.extend_from_slice(&0u16.to_le_bytes()); // restrictions
+    buf.extend_from_slice(&0u16.to_le_bytes()); // qtg id
 
     let n = crate::__test_parse_cedt_body(&buf);
     if n != 2 {
@@ -417,7 +426,7 @@ fn smoke_acpi_bert_synthetic_decode() -> TestResult {
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"BERT");
     buf.extend_from_slice(&[0u8; 32]);
-    buf.extend_from_slice(&0x4000u32.to_le_bytes());      // region length
+    buf.extend_from_slice(&0x4000u32.to_le_bytes()); // region length
     buf.extend_from_slice(&0xFEED_F00D_0000_0000u64.to_le_bytes()); // region addr
 
     crate::__test_parse_bert_body(&buf);
@@ -430,8 +439,8 @@ fn smoke_acpi_bert_synthetic_decode() -> TestResult {
 kernel_test_in!("acpi/bert", smoke_acpi_bert_synthetic_decode);
 
 fn smoke_acpi_aest_synthetic_decode() -> TestResult {
-    use alloc::vec::Vec;
     use crate::AestNode;
+    use alloc::vec::Vec;
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"AEST");
     buf.extend_from_slice(&[0u8; 32]);
@@ -442,15 +451,15 @@ fn smoke_acpi_aest_synthetic_decode() -> TestResult {
     // Then per the v0.1 spec we surface NodeIfaceOffset at [12..16]
     // and read the iface block (Type @ off, Address @ off+4..off+12).
     let entry_start = buf.len();
-    buf.push(2);                                    // type = SMMU
-    buf.push(0);                                    // reserved
-    buf.extend_from_slice(&28u16.to_le_bytes());    // length = 28
-    buf.extend_from_slice(&[0u8; 4]);               // reserved
-    buf.extend_from_slice(&[0u8; 4]);               // NodeDataOffset
-    buf.extend_from_slice(&16u32.to_le_bytes());    // NodeIfaceOffset = 16
-    // Interface block at +16: Type (1 = MMIO) + 3 padding + Address (8 B).
-    buf.push(1);                                    // iface type
-    buf.extend_from_slice(&[0u8; 3]);               // padding
+    buf.push(2); // type = SMMU
+    buf.push(0); // reserved
+    buf.extend_from_slice(&28u16.to_le_bytes()); // length = 28
+    buf.extend_from_slice(&[0u8; 4]); // reserved
+    buf.extend_from_slice(&[0u8; 4]); // NodeDataOffset
+    buf.extend_from_slice(&16u32.to_le_bytes()); // NodeIfaceOffset = 16
+                                                 // Interface block at +16: Type (1 = MMIO) + 3 padding + Address (8 B).
+    buf.push(1); // iface type
+    buf.extend_from_slice(&[0u8; 3]); // padding
     buf.extend_from_slice(&0xCD_0000u64.to_le_bytes()); // base
     debug_assert_eq!(buf.len() - entry_start, 28);
     let _ = entry_start;
@@ -491,7 +500,7 @@ fn smoke_acpi_wddt_synthetic_decode() -> TestResult {
     // Counts + status + capability:
     buf.extend_from_slice(&0xFFFFu16.to_le_bytes()); // max
     buf.extend_from_slice(&0x0001u16.to_le_bytes()); // min
-    buf.extend_from_slice(&100u16.to_le_bytes());    // period_us
+    buf.extend_from_slice(&100u16.to_le_bytes()); // period_us
     buf.extend_from_slice(&0x0007u16.to_le_bytes()); // status
     buf.extend_from_slice(&0x0003u16.to_le_bytes()); // capability
 
@@ -511,26 +520,26 @@ fn smoke_acpi_wddt_synthetic_decode() -> TestResult {
 kernel_test_in!("acpi/wddt", smoke_acpi_wddt_synthetic_decode);
 
 fn smoke_acpi_lpit_synthetic_decode() -> TestResult {
-    use alloc::vec::Vec;
     use crate::LpitState;
+    use alloc::vec::Vec;
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"LPIT");
     buf.extend_from_slice(&[0u8; 32]);
 
     // Type 0 native-c-state subtable, length = 56.
-    buf.extend_from_slice(&0u32.to_le_bytes());          // type
-    buf.extend_from_slice(&56u32.to_le_bytes());         // length
-    buf.extend_from_slice(&7u32.to_le_bytes());          // UID = 7
-    buf.extend_from_slice(&[0u8; 4]);                    // reserved
-    // EntryTrigger GAS (12 B); address @ +4..12.
-    buf.extend_from_slice(&[0u8; 4]);                    // GAS hdr
+    buf.extend_from_slice(&0u32.to_le_bytes()); // type
+    buf.extend_from_slice(&56u32.to_le_bytes()); // length
+    buf.extend_from_slice(&7u32.to_le_bytes()); // UID = 7
+    buf.extend_from_slice(&[0u8; 4]); // reserved
+                                      // EntryTrigger GAS (12 B); address @ +4..12.
+    buf.extend_from_slice(&[0u8; 4]); // GAS hdr
     buf.extend_from_slice(&0xDEAD_0000u64.to_le_bytes()); // trigger addr
-    buf.extend_from_slice(&500u32.to_le_bytes());        // residency
-    buf.extend_from_slice(&50u32.to_le_bytes());         // latency
-    // ResidencyCounter GAS (12 B).
+    buf.extend_from_slice(&500u32.to_le_bytes()); // residency
+    buf.extend_from_slice(&50u32.to_le_bytes()); // latency
+                                                 // ResidencyCounter GAS (12 B).
     buf.extend_from_slice(&[0u8; 4]);
     buf.extend_from_slice(&0xBEEF_0000u64.to_le_bytes()); // counter addr
-    buf.extend_from_slice(&3_000_000u64.to_le_bytes());  // counter freq
+    buf.extend_from_slice(&3_000_000u64.to_le_bytes()); // counter freq
 
     let n = crate::__test_parse_lpit_body(&buf);
     if n != 1 {
@@ -553,24 +562,24 @@ fn smoke_acpi_lpit_synthetic_decode() -> TestResult {
 kernel_test_in!("acpi/lpit", smoke_acpi_lpit_synthetic_decode);
 
 fn smoke_acpi_nfit_synthetic_decode() -> TestResult {
-    use alloc::vec::Vec;
     use crate::NfitSpaRange;
+    use alloc::vec::Vec;
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"NFIT");
     buf.extend_from_slice(&[0u8; 32]);
-    buf.extend_from_slice(&[0u8; 4]);                    // reserved
+    buf.extend_from_slice(&[0u8; 4]); // reserved
 
     // SPA Range subtable (type 0, length 56).
-    buf.extend_from_slice(&0u16.to_le_bytes());          // type
-    buf.extend_from_slice(&56u16.to_le_bytes());         // length
-    buf.extend_from_slice(&0xAABBu16.to_le_bytes());     // range_index
-    buf.extend_from_slice(&0u16.to_le_bytes());          // flags
-    buf.extend_from_slice(&[0u8; 4]);                    // reserved
-    buf.extend_from_slice(&3u32.to_le_bytes());          // proximity = 3
-    buf.extend_from_slice(&[0u8; 16]);                   // GUID
+    buf.extend_from_slice(&0u16.to_le_bytes()); // type
+    buf.extend_from_slice(&56u16.to_le_bytes()); // length
+    buf.extend_from_slice(&0xAABBu16.to_le_bytes()); // range_index
+    buf.extend_from_slice(&0u16.to_le_bytes()); // flags
+    buf.extend_from_slice(&[0u8; 4]); // reserved
+    buf.extend_from_slice(&3u32.to_le_bytes()); // proximity = 3
+    buf.extend_from_slice(&[0u8; 16]); // GUID
     buf.extend_from_slice(&0xC000_0000u64.to_le_bytes()); // base
     buf.extend_from_slice(&0x4000_0000u64.to_le_bytes()); // length
-    buf.extend_from_slice(&0x55u64.to_le_bytes());       // mem_attr
+    buf.extend_from_slice(&0x55u64.to_le_bytes()); // mem_attr
 
     let n = crate::__test_parse_nfit_body(&buf);
     if n != 1 {
@@ -592,22 +601,25 @@ fn smoke_acpi_nfit_synthetic_decode() -> TestResult {
 kernel_test_in!("acpi/nfit", smoke_acpi_nfit_synthetic_decode);
 
 fn smoke_acpi_erst_synthetic_decode() -> TestResult {
-    use alloc::vec::Vec;
     use crate::ErstInstruction;
+    use alloc::vec::Vec;
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"ERST");
     buf.extend_from_slice(&[0u8; 32]);
-    buf.extend_from_slice(&0u32.to_le_bytes());           // SerializationHdrSize
-    buf.extend_from_slice(&0u32.to_le_bytes());           // Reserved
-    buf.extend_from_slice(&1u32.to_le_bytes());           // InstructionEntryCount
+    buf.extend_from_slice(&0u32.to_le_bytes()); // SerializationHdrSize
+    buf.extend_from_slice(&0u32.to_le_bytes()); // Reserved
+    buf.extend_from_slice(&1u32.to_le_bytes()); // InstructionEntryCount
 
     // 32-byte instruction: action=2, instruction=5, addr=0xCAFE_F000,
     // value=0xDEAD, mask=0xFFFF.
-    buf.push(2); buf.push(5); buf.push(0); buf.push(0);    // action / inst / flags / rsvd
-    buf.extend_from_slice(&[0u8; 4]);                      // GAS hdr
-    buf.extend_from_slice(&0xCAFE_F000u64.to_le_bytes());  // addr
-    buf.extend_from_slice(&0xDEADu64.to_le_bytes());       // value
-    buf.extend_from_slice(&0xFFFFu64.to_le_bytes());       // mask
+    buf.push(2);
+    buf.push(5);
+    buf.push(0);
+    buf.push(0); // action / inst / flags / rsvd
+    buf.extend_from_slice(&[0u8; 4]); // GAS hdr
+    buf.extend_from_slice(&0xCAFE_F000u64.to_le_bytes()); // addr
+    buf.extend_from_slice(&0xDEADu64.to_le_bytes()); // value
+    buf.extend_from_slice(&0xFFFFu64.to_le_bytes()); // mask
 
     let n = crate::__test_parse_erst_body(&buf);
     if n != 1 {
@@ -616,9 +628,11 @@ fn smoke_acpi_erst_synthetic_decode() -> TestResult {
     let mut ins = [ErstInstruction::default(); 4];
     let ni = crate::copy_erst_instructions(&mut ins);
     if ni != 1
-        || ins[0].action != 2 || ins[0].instruction != 5
+        || ins[0].action != 2
+        || ins[0].instruction != 5
         || ins[0].addr != 0xCAFE_F000
-        || ins[0].value != 0xDEAD || ins[0].mask != 0xFFFF
+        || ins[0].value != 0xDEAD
+        || ins[0].mask != 0xFFFF
     {
         return TestResult::Fail("ERST instruction decode mismatch");
     }
@@ -627,8 +641,8 @@ fn smoke_acpi_erst_synthetic_decode() -> TestResult {
 kernel_test_in!("acpi/erst", smoke_acpi_erst_synthetic_decode);
 
 fn smoke_acpi_einj_synthetic_decode() -> TestResult {
-    use alloc::vec::Vec;
     use crate::EinjInstruction;
+    use alloc::vec::Vec;
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"EINJ");
     buf.extend_from_slice(&[0u8; 32]);
@@ -636,7 +650,10 @@ fn smoke_acpi_einj_synthetic_decode() -> TestResult {
     buf.extend_from_slice(&0u32.to_le_bytes());
     buf.extend_from_slice(&1u32.to_le_bytes());
 
-    buf.push(7); buf.push(3); buf.push(0); buf.push(0);
+    buf.push(7);
+    buf.push(3);
+    buf.push(0);
+    buf.push(0);
     buf.extend_from_slice(&[0u8; 4]);
     buf.extend_from_slice(&0xBA5E_0000u64.to_le_bytes());
     buf.extend_from_slice(&0x42u64.to_le_bytes());
@@ -649,9 +666,11 @@ fn smoke_acpi_einj_synthetic_decode() -> TestResult {
     let mut ins = [EinjInstruction::default(); 4];
     let ni = crate::copy_einj_instructions(&mut ins);
     if ni != 1
-        || ins[0].action != 7 || ins[0].instruction != 3
+        || ins[0].action != 7
+        || ins[0].instruction != 3
         || ins[0].addr != 0xBA5E_0000
-        || ins[0].value != 0x42 || ins[0].mask != 0xFF
+        || ins[0].value != 0x42
+        || ins[0].mask != 0xFF
     {
         return TestResult::Fail("EINJ instruction decode mismatch");
     }
@@ -664,17 +683,14 @@ fn smoke_acpi_tpm2_synthetic_decode() -> TestResult {
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"TPM2");
     buf.extend_from_slice(&[0u8; 32]);
-    buf.extend_from_slice(&1u16.to_le_bytes());            // platform class = Server
-    buf.extend_from_slice(&0u16.to_le_bytes());            // reserved
-    buf.extend_from_slice(&0xFED4_0000u64.to_le_bytes());  // control area
-    buf.extend_from_slice(&7u32.to_le_bytes());            // start method = CRB
+    buf.extend_from_slice(&1u16.to_le_bytes()); // platform class = Server
+    buf.extend_from_slice(&0u16.to_le_bytes()); // reserved
+    buf.extend_from_slice(&0xFED4_0000u64.to_le_bytes()); // control area
+    buf.extend_from_slice(&7u32.to_le_bytes()); // start method = CRB
 
     crate::__test_parse_tpm2_body(&buf);
     let info = crate::tpm2_info().expect("TPM2 not parsed");
-    if info.platform_class != 1
-        || info.control_area_addr != 0xFED4_0000
-        || info.start_method != 7
-    {
+    if info.platform_class != 1 || info.control_area_addr != 0xFED4_0000 || info.start_method != 7 {
         return TestResult::Fail("TPM2 decode mismatch");
     }
     TestResult::Pass
@@ -686,18 +702,19 @@ fn smoke_acpi_bgrt_synthetic_decode() -> TestResult {
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"BGRT");
     buf.extend_from_slice(&[0u8; 32]);
-    buf.extend_from_slice(&1u16.to_le_bytes());            // version
-    buf.push(0b101);                                       // status: displayed + 90°
-    buf.push(0);                                           // image type
-    buf.extend_from_slice(&0x1A00_0000u64.to_le_bytes());  // image addr
-    buf.extend_from_slice(&100u32.to_le_bytes());          // off_x
-    buf.extend_from_slice(&200u32.to_le_bytes());          // off_y
+    buf.extend_from_slice(&1u16.to_le_bytes()); // version
+    buf.push(0b101); // status: displayed + 90°
+    buf.push(0); // image type
+    buf.extend_from_slice(&0x1A00_0000u64.to_le_bytes()); // image addr
+    buf.extend_from_slice(&100u32.to_le_bytes()); // off_x
+    buf.extend_from_slice(&200u32.to_le_bytes()); // off_y
 
     crate::__test_parse_bgrt_body(&buf);
     let info = crate::bgrt_info().expect("BGRT not parsed");
     if info.status != 0b101
         || info.image_address != 0x1A00_0000
-        || info.offset_x != 100 || info.offset_y != 200
+        || info.offset_x != 100
+        || info.offset_y != 200
     {
         return TestResult::Fail("BGRT decode mismatch");
     }
@@ -706,16 +723,16 @@ fn smoke_acpi_bgrt_synthetic_decode() -> TestResult {
 kernel_test_in!("acpi/bgrt", smoke_acpi_bgrt_synthetic_decode);
 
 fn smoke_acpi_dbg2_synthetic_decode() -> TestResult {
-    use alloc::vec::Vec;
     use crate::Dbg2Device;
+    use alloc::vec::Vec;
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"DBG2");
     buf.extend_from_slice(&[0u8; 32]);
 
     // DBG2 header: InfoOffset (4) + InfoCount (4).
     let info_off_pos = buf.len();
-    buf.extend_from_slice(&0u32.to_le_bytes());            // info offset (patched)
-    buf.extend_from_slice(&1u32.to_le_bytes());            // info count
+    buf.extend_from_slice(&0u32.to_le_bytes()); // info offset (patched)
+    buf.extend_from_slice(&1u32.to_le_bytes()); // info count
 
     let info_off = (buf.len() - SDT_HEADER_SIZE_DBG2) as u32 + SDT_HEADER_SIZE_DBG2 as u32;
     let info_off_actual = buf.len() as u32;
@@ -735,21 +752,21 @@ fn smoke_acpi_dbg2_synthetic_decode() -> TestResult {
     //   20..22 AddressSizeOffset
     //   ... GAS array starting at BaseAddrRegOffset ...
     let entry_start = buf.len();
-    buf.push(0);                                           // revision
-    buf.extend_from_slice(&34u16.to_le_bytes());           // length
-    buf.push(1);                                           // reg count
-    buf.extend_from_slice(&0u16.to_le_bytes());            // ns len
-    buf.extend_from_slice(&0u16.to_le_bytes());            // ns off
-    buf.extend_from_slice(&0u16.to_le_bytes());            // oem len
-    buf.extend_from_slice(&0u16.to_le_bytes());            // oem off
-    buf.extend_from_slice(&0x8000u16.to_le_bytes());       // port_type = serial
-    buf.extend_from_slice(&0x0000u16.to_le_bytes());       // port_subtype = full 16550
-    buf.extend_from_slice(&0u16.to_le_bytes());            // reserved
-    buf.extend_from_slice(&22u16.to_le_bytes());           // base addr reg offset = 22
-    buf.extend_from_slice(&0u16.to_le_bytes());            // addr size offset
-    // GAS at offset 22 (relative to entry start): 4 bytes hdr + 8 bytes addr.
-    buf.extend_from_slice(&[0u8; 4]);                      // GAS hdr
-    buf.extend_from_slice(&0x3F8u64.to_le_bytes());        // GAS.Address = 16550 base
+    buf.push(0); // revision
+    buf.extend_from_slice(&34u16.to_le_bytes()); // length
+    buf.push(1); // reg count
+    buf.extend_from_slice(&0u16.to_le_bytes()); // ns len
+    buf.extend_from_slice(&0u16.to_le_bytes()); // ns off
+    buf.extend_from_slice(&0u16.to_le_bytes()); // oem len
+    buf.extend_from_slice(&0u16.to_le_bytes()); // oem off
+    buf.extend_from_slice(&0x8000u16.to_le_bytes()); // port_type = serial
+    buf.extend_from_slice(&0x0000u16.to_le_bytes()); // port_subtype = full 16550
+    buf.extend_from_slice(&0u16.to_le_bytes()); // reserved
+    buf.extend_from_slice(&22u16.to_le_bytes()); // base addr reg offset = 22
+    buf.extend_from_slice(&0u16.to_le_bytes()); // addr size offset
+                                                // GAS at offset 22 (relative to entry start): 4 bytes hdr + 8 bytes addr.
+    buf.extend_from_slice(&[0u8; 4]); // GAS hdr
+    buf.extend_from_slice(&0x3F8u64.to_le_bytes()); // GAS.Address = 16550 base
 
     // Patch InfoOffset.
     let info_off_val = (info_off_actual) as u32;
@@ -779,14 +796,11 @@ fn smoke_acpi_wsmt_synthetic_decode() -> TestResult {
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"WSMT");
     buf.extend_from_slice(&[0u8; 32]);
-    buf.extend_from_slice(&0b101u32.to_le_bytes());        // bits 0 + 2
+    buf.extend_from_slice(&0b101u32.to_le_bytes()); // bits 0 + 2
 
     crate::__test_parse_wsmt_body(&buf);
     let info = crate::wsmt_info().expect("WSMT not parsed");
-    if !info.fixed_comm_buffers
-        || info.comm_buffer_nested_ptr
-        || !info.system_resource_protection
-    {
+    if !info.fixed_comm_buffers || info.comm_buffer_nested_ptr || !info.system_resource_protection {
         return TestResult::Fail("WSMT decode mismatch");
     }
     TestResult::Pass
@@ -814,14 +828,14 @@ fn smoke_acpi_hpet_synthetic_decode() -> TestResult {
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"HPET");
     buf.extend_from_slice(&[0u8; 32]);
-    buf.extend_from_slice(&0xCAFE_BABEu32.to_le_bytes());  // block id
-    // GAS: addr_space_id @ 0, address @ 4..12.
-    buf.push(0);                                           // SystemMemory
-    buf.extend_from_slice(&[0u8; 3]);                      // bw / bo / access
-    buf.extend_from_slice(&0xFED0_0000u64.to_le_bytes());  // base
-    buf.push(2);                                           // hpet_number
-    buf.extend_from_slice(&0x42u16.to_le_bytes());         // counter min
-    buf.push(0xAA);                                        // oem attrs
+    buf.extend_from_slice(&0xCAFE_BABEu32.to_le_bytes()); // block id
+                                                          // GAS: addr_space_id @ 0, address @ 4..12.
+    buf.push(0); // SystemMemory
+    buf.extend_from_slice(&[0u8; 3]); // bw / bo / access
+    buf.extend_from_slice(&0xFED0_0000u64.to_le_bytes()); // base
+    buf.push(2); // hpet_number
+    buf.extend_from_slice(&0x42u16.to_le_bytes()); // counter min
+    buf.push(0xAA); // oem attrs
 
     crate::__test_parse_hpet_body(&buf);
     let d = crate::hpet_desc().expect("HPET not parsed");
@@ -843,14 +857,14 @@ fn smoke_acpi_facs_synthetic_decode() -> TestResult {
     // with the FACS signature.
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"FACS");
-    buf.extend_from_slice(&64u32.to_le_bytes());           // length
-    buf.extend_from_slice(&0xDEAD_BEEFu32.to_le_bytes());  // hardware sig
-    buf.extend_from_slice(&0x10000u32.to_le_bytes());      // fw waking vec 32
-    buf.extend_from_slice(&0u32.to_le_bytes());            // global lock
-    buf.extend_from_slice(&0b11u32.to_le_bytes());         // flags
+    buf.extend_from_slice(&64u32.to_le_bytes()); // length
+    buf.extend_from_slice(&0xDEAD_BEEFu32.to_le_bytes()); // hardware sig
+    buf.extend_from_slice(&0x10000u32.to_le_bytes()); // fw waking vec 32
+    buf.extend_from_slice(&0u32.to_le_bytes()); // global lock
+    buf.extend_from_slice(&0b11u32.to_le_bytes()); // flags
     buf.extend_from_slice(&0xCAFE_F0000000u64.to_le_bytes()); // X fw waking vec
-    buf.push(2);                                           // version
-    buf.extend_from_slice(&[0u8; 31]);                     // reserved/pad to 64
+    buf.push(2); // version
+    buf.extend_from_slice(&[0u8; 31]); // reserved/pad to 64
 
     crate::__test_parse_facs_body(&buf);
     let info = crate::facs_info().expect("FACS not parsed");
@@ -867,29 +881,29 @@ fn smoke_acpi_facs_synthetic_decode() -> TestResult {
 kernel_test_in!("acpi/facs", smoke_acpi_facs_synthetic_decode);
 
 fn smoke_acpi_prmt_synthetic_decode() -> TestResult {
-    use alloc::vec::Vec;
     use crate::PrmtModule;
+    use alloc::vec::Vec;
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"PRMT");
     buf.extend_from_slice(&[0u8; 32]);
 
     // 16-byte PrmPlatformGuid + 4 B mod off + 4 B mod count.
-    buf.extend_from_slice(&[0u8; 16]);                     // platform guid
+    buf.extend_from_slice(&[0u8; 16]); // platform guid
     let mod_off_pos = buf.len();
-    buf.extend_from_slice(&0u32.to_le_bytes());            // mod off (patched)
-    buf.extend_from_slice(&1u32.to_le_bytes());            // mod count
+    buf.extend_from_slice(&0u32.to_le_bytes()); // mod off (patched)
+    buf.extend_from_slice(&1u32.to_le_bytes()); // mod count
 
     let mod_off_actual = buf.len() as u32;
 
     // Module entry, length = 36.
-    buf.extend_from_slice(&0u16.to_le_bytes());            // revision
-    buf.extend_from_slice(&36u16.to_le_bytes());           // length
-    buf.extend_from_slice(&[0u8; 16]);                     // module guid
-    buf.extend_from_slice(&3u16.to_le_bytes());            // major
-    buf.extend_from_slice(&7u16.to_le_bytes());            // minor
-    buf.extend_from_slice(&5u16.to_le_bytes());            // handler count
-    buf.extend_from_slice(&0u16.to_le_bytes());            // padding to 28
-    buf.extend_from_slice(&0xBEEF_0000u64.to_le_bytes());  // mmio range
+    buf.extend_from_slice(&0u16.to_le_bytes()); // revision
+    buf.extend_from_slice(&36u16.to_le_bytes()); // length
+    buf.extend_from_slice(&[0u8; 16]); // module guid
+    buf.extend_from_slice(&3u16.to_le_bytes()); // major
+    buf.extend_from_slice(&7u16.to_le_bytes()); // minor
+    buf.extend_from_slice(&5u16.to_le_bytes()); // handler count
+    buf.extend_from_slice(&0u16.to_le_bytes()); // padding to 28
+    buf.extend_from_slice(&0xBEEF_0000u64.to_le_bytes()); // mmio range
 
     // Patch mod offset.
     buf[mod_off_pos..mod_off_pos + 4].copy_from_slice(&mod_off_actual.to_le_bytes());
@@ -903,8 +917,8 @@ fn smoke_acpi_prmt_synthetic_decode() -> TestResult {
     if nm != 1
         || mods[0].major_revision != 3
         || mods[0].minor_revision != 7
-        || mods[0].handler_count  != 5
-        || mods[0].mmio_range     != 0xBEEF_0000
+        || mods[0].handler_count != 5
+        || mods[0].mmio_range != 0xBEEF_0000
     {
         return TestResult::Fail("PRMT module decode mismatch");
     }
@@ -917,15 +931,16 @@ fn smoke_acpi_ccel_synthetic_decode() -> TestResult {
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"CCEL");
     buf.extend_from_slice(&[0u8; 32]);
-    buf.push(0);                                          // cc_type = TDX
-    buf.push(2);                                          // cc_subtype
-    buf.extend_from_slice(&[0u8; 2]);                     // reserved
-    buf.extend_from_slice(&0x4000u64.to_le_bytes());      // log area min
+    buf.push(0); // cc_type = TDX
+    buf.push(2); // cc_subtype
+    buf.extend_from_slice(&[0u8; 2]); // reserved
+    buf.extend_from_slice(&0x4000u64.to_le_bytes()); // log area min
     buf.extend_from_slice(&0xC000_0000u64.to_le_bytes()); // log area phys
 
     crate::__test_parse_ccel_body(&buf);
     let info = crate::ccel_info().expect("CCEL not parsed");
-    if info.cc_type != 0 || info.cc_subtype != 2
+    if info.cc_type != 0
+        || info.cc_subtype != 2
         || info.log_area_min != 0x4000
         || info.log_area_phys != 0xC000_0000
     {
@@ -936,27 +951,27 @@ fn smoke_acpi_ccel_synthetic_decode() -> TestResult {
 kernel_test_in!("acpi/ccel", smoke_acpi_ccel_synthetic_decode);
 
 fn smoke_acpi_mpst_synthetic_decode() -> TestResult {
-    use alloc::vec::Vec;
     use crate::MpstNode;
+    use alloc::vec::Vec;
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"MPST");
     buf.extend_from_slice(&[0u8; 32]);
     // MPST header: PccId (1) + Reserved (3) + NodeCount (2) + Reserved (2)
     buf.push(0);
     buf.extend_from_slice(&[0u8; 3]);
-    buf.extend_from_slice(&1u16.to_le_bytes());           // 1 node
+    buf.extend_from_slice(&1u16.to_le_bytes()); // 1 node
     buf.extend_from_slice(&[0u8; 2]);
 
     // Node header: Flags + Rsvd + Id + Length + Base + LengthBytes +
     //              StateValueCount + PhysComponentCount = 32 bytes total.
-    buf.push(0b101);                                      // flags: enabled + hot-pluggable
-    buf.push(0);                                          // reserved
-    buf.extend_from_slice(&0x42u16.to_le_bytes());        // node id
-    buf.extend_from_slice(&32u32.to_le_bytes());          // length
-    buf.extend_from_slice(&0x1_0000u64.to_le_bytes());    // base
-    buf.extend_from_slice(&0x10_0000u64.to_le_bytes());   // length bytes
-    buf.extend_from_slice(&0u32.to_le_bytes());           // state count
-    buf.extend_from_slice(&0u32.to_le_bytes());           // phys count
+    buf.push(0b101); // flags: enabled + hot-pluggable
+    buf.push(0); // reserved
+    buf.extend_from_slice(&0x42u16.to_le_bytes()); // node id
+    buf.extend_from_slice(&32u32.to_le_bytes()); // length
+    buf.extend_from_slice(&0x1_0000u64.to_le_bytes()); // base
+    buf.extend_from_slice(&0x10_0000u64.to_le_bytes()); // length bytes
+    buf.extend_from_slice(&0u32.to_le_bytes()); // state count
+    buf.extend_from_slice(&0u32.to_le_bytes()); // phys count
 
     let n = crate::__test_parse_mpst_body(&buf);
     if n != 1 {
@@ -979,19 +994,19 @@ fn smoke_acpi_mpst_synthetic_decode() -> TestResult {
 kernel_test_in!("acpi/mpst", smoke_acpi_mpst_synthetic_decode);
 
 fn smoke_acpi_sdev_synthetic_decode() -> TestResult {
-    use alloc::vec::Vec;
     use crate::SdevPci;
+    use alloc::vec::Vec;
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"SDEV");
     buf.extend_from_slice(&[0u8; 32]);
 
     // PCI endpoint entry (type 1, length 16).
-    buf.push(1);                                          // type
-    buf.push(0);                                          // flags
-    buf.extend_from_slice(&16u16.to_le_bytes());          // length
-    buf.extend_from_slice(&0xABu16.to_le_bytes());        // segment
-    buf.extend_from_slice(&0x1234u16.to_le_bytes());      // start_bdf
-    buf.extend_from_slice(&[0u8; 8]);                     // remaining hdr fields
+    buf.push(1); // type
+    buf.push(0); // flags
+    buf.extend_from_slice(&16u16.to_le_bytes()); // length
+    buf.extend_from_slice(&0xABu16.to_le_bytes()); // segment
+    buf.extend_from_slice(&0x1234u16.to_le_bytes()); // start_bdf
+    buf.extend_from_slice(&[0u8; 8]); // remaining hdr fields
 
     let n = crate::__test_parse_sdev_body(&buf);
     if n != 1 {
@@ -1011,9 +1026,9 @@ fn smoke_acpi_sbst_synthetic_decode() -> TestResult {
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"SBST");
     buf.extend_from_slice(&[0u8; 32]);
-    buf.extend_from_slice(&5000u32.to_le_bytes());        // warning
-    buf.extend_from_slice(&2000u32.to_le_bytes());        // low
-    buf.extend_from_slice(&500u32.to_le_bytes());         // critical
+    buf.extend_from_slice(&5000u32.to_le_bytes()); // warning
+    buf.extend_from_slice(&2000u32.to_le_bytes()); // low
+    buf.extend_from_slice(&500u32.to_le_bytes()); // critical
 
     crate::__test_parse_sbst_body(&buf);
     let info = crate::sbst_info().expect("SBST not parsed");
@@ -1028,19 +1043,19 @@ fn smoke_acpi_sbst_synthetic_decode() -> TestResult {
 kernel_test_in!("acpi/sbst", smoke_acpi_sbst_synthetic_decode);
 
 fn smoke_acpi_ras2_synthetic_decode() -> TestResult {
-    use alloc::vec::Vec;
     use crate::Ras2Descriptor;
+    use alloc::vec::Vec;
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"RAS2");
     buf.extend_from_slice(&[0u8; 32]);
-    buf.extend_from_slice(&0u16.to_le_bytes());            // reserved
-    buf.extend_from_slice(&1u16.to_le_bytes());            // descriptor count
+    buf.extend_from_slice(&0u16.to_le_bytes()); // reserved
+    buf.extend_from_slice(&1u16.to_le_bytes()); // descriptor count
 
     // Descriptor (8 B): PccId + Reserved (2) + FeatureType + InstanceCount
-    buf.push(7);                                           // pcc_id
-    buf.extend_from_slice(&[0u8; 2]);                      // reserved
-    buf.push(0);                                           // feature_type = MemPatrolScrub
-    buf.extend_from_slice(&3u32.to_le_bytes());            // instance count
+    buf.push(7); // pcc_id
+    buf.extend_from_slice(&[0u8; 2]); // reserved
+    buf.push(0); // feature_type = MemPatrolScrub
+    buf.extend_from_slice(&3u32.to_le_bytes()); // instance count
 
     let n = crate::__test_parse_ras2_body(&buf);
     if n != 1 {
@@ -1048,10 +1063,7 @@ fn smoke_acpi_ras2_synthetic_decode() -> TestResult {
     }
     let mut descs = [Ras2Descriptor::default(); 4];
     let nd = crate::copy_ras2_descriptors(&mut descs);
-    if nd != 1
-        || descs[0].pcc_id != 7
-        || descs[0].feature_type != 0
-        || descs[0].instance_count != 3
+    if nd != 1 || descs[0].pcc_id != 7 || descs[0].feature_type != 0 || descs[0].instance_count != 3
     {
         return TestResult::Fail("RAS2 descriptor decode mismatch");
     }
@@ -1066,18 +1078,22 @@ fn smoke_acpi_ecdt_synthetic_decode() -> TestResult {
     buf.extend_from_slice(&[0u8; 32]);
     // EcControl GAS — addr @ +4..12.
     buf.extend_from_slice(&[0u8; 4]);
-    buf.extend_from_slice(&0x62u64.to_le_bytes());        // control = 0x62
-    // EcData GAS — addr @ +4..12.
+    buf.extend_from_slice(&0x62u64.to_le_bytes()); // control = 0x62
+                                                   // EcData GAS — addr @ +4..12.
     buf.extend_from_slice(&[0u8; 4]);
-    buf.extend_from_slice(&0x66u64.to_le_bytes());        // data = 0x66
-    buf.extend_from_slice(&0xABCDu32.to_le_bytes());      // uid
-    buf.push(9);                                          // gpe bit
-    buf.push(b'E'); buf.push(b'C'); buf.push(0);          // namespace string
+    buf.extend_from_slice(&0x66u64.to_le_bytes()); // data = 0x66
+    buf.extend_from_slice(&0xABCDu32.to_le_bytes()); // uid
+    buf.push(9); // gpe bit
+    buf.push(b'E');
+    buf.push(b'C');
+    buf.push(0); // namespace string
 
     crate::__test_parse_ecdt_body(&buf);
     let info = crate::ecdt_info().expect("ECDT not parsed");
-    if info.control_addr != 0x62 || info.data_addr != 0x66
-        || info.uid != 0xABCD || info.gpe_bit != 9
+    if info.control_addr != 0x62
+        || info.data_addr != 0x66
+        || info.uid != 0xABCD
+        || info.gpe_bit != 9
     {
         return TestResult::Fail("ECDT decode mismatch");
     }
@@ -1086,27 +1102,27 @@ fn smoke_acpi_ecdt_synthetic_decode() -> TestResult {
 kernel_test_in!("acpi/ecdt", smoke_acpi_ecdt_synthetic_decode);
 
 fn smoke_acpi_nhlt_synthetic_decode() -> TestResult {
-    use alloc::vec::Vec;
     use crate::NhltEndpoint;
+    use alloc::vec::Vec;
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"NHLT");
     buf.extend_from_slice(&[0u8; 32]);
-    buf.push(1);                                          // endpoint count
+    buf.push(1); // endpoint count
 
     // Endpoint: length (4) + linkType (1) + instanceId (1) +
     //           vendorId (2) + deviceId (2) + revisionId (2) +
     //           subsystemId (4) + deviceType (1) + direction (1) +
     //           virtualBusId (1) = 19 bytes minimum.
     buf.extend_from_slice(&19u32.to_le_bytes());
-    buf.push(2);                                          // link_type = PDM
-    buf.push(5);                                          // instance_id
-    buf.extend_from_slice(&0x8086u16.to_le_bytes());      // vendor
-    buf.extend_from_slice(&0x1234u16.to_le_bytes());      // device
-    buf.extend_from_slice(&0u16.to_le_bytes());           // revision
-    buf.extend_from_slice(&0u32.to_le_bytes());           // subsystem
-    buf.push(0);                                          // device type
-    buf.push(1);                                          // direction = capture
-    buf.push(0);                                          // virtual bus id
+    buf.push(2); // link_type = PDM
+    buf.push(5); // instance_id
+    buf.extend_from_slice(&0x8086u16.to_le_bytes()); // vendor
+    buf.extend_from_slice(&0x1234u16.to_le_bytes()); // device
+    buf.extend_from_slice(&0u16.to_le_bytes()); // revision
+    buf.extend_from_slice(&0u32.to_le_bytes()); // subsystem
+    buf.push(0); // device type
+    buf.push(1); // direction = capture
+    buf.push(0); // virtual bus id
 
     let n = crate::__test_parse_nhlt_body(&buf);
     if n != 1 {
@@ -1128,21 +1144,21 @@ fn smoke_acpi_nhlt_synthetic_decode() -> TestResult {
 kernel_test_in!("acpi/nhlt", smoke_acpi_nhlt_synthetic_decode);
 
 fn smoke_acpi_ibft_synthetic_decode() -> TestResult {
-    use alloc::vec::Vec;
     use crate::IbftTarget;
+    use alloc::vec::Vec;
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"IBFT");
     buf.extend_from_slice(&[0u8; 32]);
-    buf.extend_from_slice(&[0u8; 12]);                    // reserved
+    buf.extend_from_slice(&[0u8; 12]); // reserved
 
     // Target structure (id=4, len=32).
     buf.push(4);
-    buf.push(0);                                          // version
-    buf.extend_from_slice(&32u16.to_le_bytes());          // length
-    buf.push(0);                                          // index
-    buf.push(0);                                          // flags
-    // 16-byte IPv6-mapped target IP.
-    let ip = [0,0,0,0, 0,0,0,0, 0,0,0xFF,0xFF, 192,168,1,42];
+    buf.push(0); // version
+    buf.extend_from_slice(&32u16.to_le_bytes()); // length
+    buf.push(0); // index
+    buf.push(0); // flags
+                 // 16-byte IPv6-mapped target IP.
+    let ip = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 192, 168, 1, 42];
     buf.extend_from_slice(&ip);
     buf.extend_from_slice(&3260u16.to_le_bytes());
     buf.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
@@ -1164,8 +1180,8 @@ fn smoke_acpi_ibft_synthetic_decode() -> TestResult {
 kernel_test_in!("acpi/ibft", smoke_acpi_ibft_synthetic_decode);
 
 fn smoke_acpi_csrt_synthetic_decode() -> TestResult {
-    use alloc::vec::Vec;
     use crate::CsrtGroup;
+    use alloc::vec::Vec;
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"CSRT");
     buf.extend_from_slice(&[0u8; 32]);
@@ -1174,13 +1190,13 @@ fn smoke_acpi_csrt_synthetic_decode() -> TestResult {
     //                  device_id (2) + sub_device (2) + revision (2) +
     //                  reserved (2) + shared_info_len (4) = 24
     buf.extend_from_slice(&24u32.to_le_bytes());
-    buf.extend_from_slice(&0x8086u32.to_le_bytes());      // vendor
-    buf.extend_from_slice(&0u32.to_le_bytes());           // sub vendor
-    buf.extend_from_slice(&0xCAFEu16.to_le_bytes());      // device
-    buf.extend_from_slice(&0u16.to_le_bytes());           // sub device
-    buf.extend_from_slice(&3u16.to_le_bytes());           // revision
-    buf.extend_from_slice(&0u16.to_le_bytes());           // reserved
-    buf.extend_from_slice(&0u32.to_le_bytes());           // shared info len
+    buf.extend_from_slice(&0x8086u32.to_le_bytes()); // vendor
+    buf.extend_from_slice(&0u32.to_le_bytes()); // sub vendor
+    buf.extend_from_slice(&0xCAFEu16.to_le_bytes()); // device
+    buf.extend_from_slice(&0u16.to_le_bytes()); // sub device
+    buf.extend_from_slice(&3u16.to_le_bytes()); // revision
+    buf.extend_from_slice(&0u16.to_le_bytes()); // reserved
+    buf.extend_from_slice(&0u32.to_le_bytes()); // shared info len
 
     let n = crate::__test_parse_csrt_body(&buf);
     if n != 1 {
@@ -1191,7 +1207,7 @@ fn smoke_acpi_csrt_synthetic_decode() -> TestResult {
     if ng != 1
         || groups[0].vendor_id != 0x8086
         || groups[0].device_id != 0xCAFE
-        || groups[0].revision  != 3
+        || groups[0].revision != 3
     {
         return TestResult::Fail("CSRT group decode mismatch");
     }
@@ -1204,17 +1220,14 @@ fn smoke_acpi_agdi_synthetic_decode() -> TestResult {
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"AGDI");
     buf.extend_from_slice(&[0u8; 32]);
-    buf.push(1);                                          // flags: SMC
-    buf.extend_from_slice(&[0u8; 3]);                     // reserved
-    buf.extend_from_slice(&0x42u32.to_le_bytes());        // sdei event num
+    buf.push(1); // flags: SMC
+    buf.extend_from_slice(&[0u8; 3]); // reserved
+    buf.extend_from_slice(&0x42u32.to_le_bytes()); // sdei event num
     buf.extend_from_slice(&0x8400_FFFFu64.to_le_bytes()); // smc id
 
     crate::__test_parse_agdi_body(&buf);
     let info = crate::agdi_info().expect("AGDI not parsed");
-    if !info.use_smc
-        || info.sdei_event_number != 0x42
-        || info.smc_id != 0x8400_FFFF
-    {
+    if !info.use_smc || info.sdei_event_number != 0x42 || info.smc_id != 0x8400_FFFF {
         return TestResult::Fail("AGDI decode mismatch");
     }
     TestResult::Pass
@@ -1243,10 +1256,10 @@ fn smoke_acpi_dbgp_synthetic_decode() -> TestResult {
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"DBGP");
     buf.extend_from_slice(&[0u8; 32]);
-    buf.push(0x00);                                       // iface = full 16550
-    buf.extend_from_slice(&[0u8; 3]);                     // reserved
-    // GAS: AddressSpaceId @ 0, Address @ 4..12.
-    buf.push(1);                                          // SystemIO
+    buf.push(0x00); // iface = full 16550
+    buf.extend_from_slice(&[0u8; 3]); // reserved
+                                      // GAS: AddressSpaceId @ 0, Address @ 4..12.
+    buf.push(1); // SystemIO
     buf.extend_from_slice(&[0u8; 3]);
     buf.extend_from_slice(&0x3F8u64.to_le_bytes());
 
@@ -1264,17 +1277,15 @@ fn smoke_acpi_wpbt_synthetic_decode() -> TestResult {
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"WPBT");
     buf.extend_from_slice(&[0u8; 32]);
-    buf.extend_from_slice(&0x1234u32.to_le_bytes());      // size
+    buf.extend_from_slice(&0x1234u32.to_le_bytes()); // size
     buf.extend_from_slice(&0xCAFE_F0000000u64.to_le_bytes()); // addr
-    buf.push(1);                                          // layout = native EXE
-    buf.push(0);                                          // content type
-    buf.extend_from_slice(&0u16.to_le_bytes());           // arg length
+    buf.push(1); // layout = native EXE
+    buf.push(0); // content type
+    buf.extend_from_slice(&0u16.to_le_bytes()); // arg length
 
     crate::__test_parse_wpbt_body(&buf);
     let info = crate::wpbt_info().expect("WPBT not parsed");
-    if info.handoff_size != 0x1234
-        || info.handoff_addr != 0xCAFE_F0000000
-        || info.layout_type != 1
+    if info.handoff_size != 0x1234 || info.handoff_addr != 0xCAFE_F0000000 || info.layout_type != 1
     {
         return TestResult::Fail("WPBT decode mismatch");
     }
@@ -1283,15 +1294,15 @@ fn smoke_acpi_wpbt_synthetic_decode() -> TestResult {
 kernel_test_in!("acpi/wpbt", smoke_acpi_wpbt_synthetic_decode);
 
 fn smoke_acpi_msct_synthetic_decode() -> TestResult {
-    use alloc::vec::Vec;
     use crate::MsctPdis;
+    use alloc::vec::Vec;
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"MSCT");
     buf.extend_from_slice(&[0u8; 32]);
     let pd_off_pos = buf.len();
-    buf.extend_from_slice(&0u32.to_le_bytes());            // ProximityDomainOffset (patched)
-    buf.extend_from_slice(&3u32.to_le_bytes());            // MaxProximityDomains
-    buf.extend_from_slice(&1u32.to_le_bytes());            // MaxClockDomains
+    buf.extend_from_slice(&0u32.to_le_bytes()); // ProximityDomainOffset (patched)
+    buf.extend_from_slice(&3u32.to_le_bytes()); // MaxProximityDomains
+    buf.extend_from_slice(&1u32.to_le_bytes()); // MaxClockDomains
     buf.extend_from_slice(&0x1_0000_0000_0000u64.to_le_bytes()); // MaxPhysAddrCap
 
     let pd_off = buf.len() as u32;
@@ -1300,9 +1311,9 @@ fn smoke_acpi_msct_synthetic_decode() -> TestResult {
     //       MaxProcessorCapacity (4) + MaxMemoryCapacity (8) = 18 bytes.
     buf.push(0);
     buf.push(18);
-    buf.extend_from_slice(&0u16.to_le_bytes());            // low
-    buf.extend_from_slice(&3u16.to_le_bytes());            // high
-    buf.extend_from_slice(&64u32.to_le_bytes());           // max procs
+    buf.extend_from_slice(&0u16.to_le_bytes()); // low
+    buf.extend_from_slice(&3u16.to_le_bytes()); // high
+    buf.extend_from_slice(&64u32.to_le_bytes()); // max procs
     buf.extend_from_slice(&0x10_0000_0000u64.to_le_bytes()); // max mem
 
     buf[pd_off_pos..pd_off_pos + 4].copy_from_slice(&pd_off.to_le_bytes());
@@ -1335,10 +1346,11 @@ fn smoke_acpi_xenv_synthetic_decode() -> TestResult {
     buf.extend_from_slice(b"XENV");
     buf.extend_from_slice(&[0u8; 32]);
     buf.extend_from_slice(&0xDEAD_0000u64.to_le_bytes()); // grant table base
-    buf.extend_from_slice(&0x1000u64.to_le_bytes());      // grant table size
-    buf.extend_from_slice(&33u32.to_le_bytes());          // event vector
-    buf.push(0); buf.push(0);                             // polarity / mode
-    buf.extend_from_slice(&0u16.to_le_bytes());           // reserved
+    buf.extend_from_slice(&0x1000u64.to_le_bytes()); // grant table size
+    buf.extend_from_slice(&33u32.to_le_bytes()); // event vector
+    buf.push(0);
+    buf.push(0); // polarity / mode
+    buf.extend_from_slice(&0u16.to_le_bytes()); // reserved
 
     crate::__test_parse_xenv_body(&buf);
     let info = crate::xenv_info().expect("XENV not parsed");
@@ -1357,15 +1369,13 @@ fn smoke_acpi_tcpa_synthetic_decode() -> TestResult {
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"TCPA");
     buf.extend_from_slice(&[0u8; 32]);
-    buf.extend_from_slice(&0u16.to_le_bytes());           // platform class = Client
-    buf.extend_from_slice(&0x4000u32.to_le_bytes());      // log area min
+    buf.extend_from_slice(&0u16.to_le_bytes()); // platform class = Client
+    buf.extend_from_slice(&0x4000u32.to_le_bytes()); // log area min
     buf.extend_from_slice(&0xC100_0000u64.to_le_bytes()); // log area phys
 
     crate::__test_parse_tcpa_body(&buf);
     let info = crate::tcpa_info().expect("TCPA not parsed");
-    if info.platform_class != 0
-        || info.log_area_min != 0x4000
-        || info.log_area_phys != 0xC100_0000
+    if info.platform_class != 0 || info.log_area_min != 0x4000 || info.log_area_phys != 0xC100_0000
     {
         return TestResult::Fail("TCPA decode mismatch");
     }
@@ -1378,11 +1388,11 @@ fn smoke_acpi_mchi_synthetic_decode() -> TestResult {
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"MCHI");
     buf.extend_from_slice(&[0u8; 32]);
-    buf.push(1);                                          // KCS
-    buf.push(0x0F);                                       // protocols
-    buf.extend_from_slice(&[0u8; 6]);                     // reserved
+    buf.push(1); // KCS
+    buf.push(0x0F); // protocols
+    buf.extend_from_slice(&[0u8; 6]); // reserved
     buf.extend_from_slice(&0x1234_5678_9ABC_DEF0u64.to_le_bytes()); // identifier
-    // GAS at +16: hdr (4) + addr (8).
+                                                                    // GAS at +16: hdr (4) + addr (8).
     buf.extend_from_slice(&[0u8; 4]);
     buf.extend_from_slice(&0xCA_0000u64.to_le_bytes());
 
@@ -1400,8 +1410,8 @@ fn smoke_acpi_mchi_synthetic_decode() -> TestResult {
 kernel_test_in!("acpi/mchi", smoke_acpi_mchi_synthetic_decode);
 
 fn smoke_acpi_phat_synthetic_decode() -> TestResult {
-    use alloc::vec::Vec;
     use crate::PhatHealthRecord;
+    use alloc::vec::Vec;
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"PHAT");
     buf.extend_from_slice(&[0u8; 32]);
@@ -1409,10 +1419,12 @@ fn smoke_acpi_phat_synthetic_decode() -> TestResult {
     // Type 1 (Health), length 22.
     buf.extend_from_slice(&1u16.to_le_bytes());
     buf.extend_from_slice(&22u16.to_le_bytes());
-    buf.push(0);                                          // reserved
-    buf.push(3);                                          // am_healthy = healthy
-    let guid: [u8; 16] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11,
-                           0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99];
+    buf.push(0); // reserved
+    buf.push(3); // am_healthy = healthy
+    let guid: [u8; 16] = [
+        0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+        0x99,
+    ];
     buf.extend_from_slice(&guid);
 
     let n = crate::__test_parse_phat_body(&buf);
@@ -1433,7 +1445,7 @@ fn smoke_acpi_stao_synthetic_decode() -> TestResult {
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"STAO");
     buf.extend_from_slice(&[0u8; 32]);
-    buf.push(1);                                          // ignore UART
+    buf.push(1); // ignore UART
 
     crate::__test_parse_stao_body(&buf);
     let info = crate::stao_info().expect("StAO not parsed");
@@ -1449,8 +1461,10 @@ fn smoke_acpi_uefi_synthetic_decode() -> TestResult {
     let mut buf: Vec<u8> = Vec::new();
     buf.extend_from_slice(b"UEFI");
     buf.extend_from_slice(&[0u8; 32]);
-    let guid: [u8; 16] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
-                           0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10];
+    let guid: [u8; 16] = [
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32,
+        0x10,
+    ];
     buf.extend_from_slice(&guid);
     buf.extend_from_slice(&0x1Au16.to_le_bytes());
 

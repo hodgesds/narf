@@ -47,7 +47,7 @@ use core::fmt;
 /// The two ASCII bytes at PCI ROM offset 0/1.
 const ROM_SIGNATURE: [u8; 2] = [0xAA, 0x55];
 /// ASCII at offset 4 marking an AMD ATOMBIOS image.
-const ATOM_MARKER:   &[u8]   = b"ATOM";
+const ATOM_MARKER: &[u8] = b"ATOM";
 
 /// Offset of the 32-bit pointer to the master data table, per
 /// AtomBios.h `OFFSET_TO_POINTER_TO_ATOM_ROM_HEADER`.
@@ -100,9 +100,15 @@ impl<'a> Atombios<'a> {
     /// Parse the BIOS image: validate signatures, locate the
     /// master data table, decode its header.
     pub fn parse(image: &'a [u8]) -> Result<Self, AtomError> {
-        if image.len() < 0x50 { return Err(AtomError::Truncated); }
-        if image[0..2] != ROM_SIGNATURE { return Err(AtomError::NotPciRom); }
-        if &image[4..8] != ATOM_MARKER  { return Err(AtomError::NotAtombios); }
+        if image.len() < 0x50 {
+            return Err(AtomError::Truncated);
+        }
+        if image[0..2] != ROM_SIGNATURE {
+            return Err(AtomError::NotPciRom);
+        }
+        if &image[4..8] != ATOM_MARKER {
+            return Err(AtomError::NotAtombios);
+        }
         let data_off = u32::from_le_bytes([
             image[OFFSET_DATA_TABLE_PTR],
             image[OFFSET_DATA_TABLE_PTR + 1],
@@ -112,7 +118,9 @@ impl<'a> Atombios<'a> {
         let off = data_off as usize;
         // ATOM_COMMON_TABLE_HEADER is 4 bytes; we need at least
         // the header + one u16 entry.
-        if off + 6 > image.len() { return Err(AtomError::BadTablePointer); }
+        if off + 6 > image.len() {
+            return Err(AtomError::BadTablePointer);
+        }
         let struct_size = u16::from_le_bytes([image[off], image[off + 1]]) as usize;
         // Master table is `struct_size` bytes total. Subtract the
         // 4-byte header to get the array byte length, divide by 2
@@ -136,7 +144,9 @@ impl<'a> Atombios<'a> {
             (0u16, 0u32)
         } else {
             let coff = cmd_off as usize;
-            if coff + 6 > image.len() { return Err(AtomError::BadTablePointer); }
+            if coff + 6 > image.len() {
+                return Err(AtomError::BadTablePointer);
+            }
             let csz = u16::from_le_bytes([image[coff], image[coff + 1]]) as usize;
             if csz < 4 || coff + csz > image.len() {
                 return Err(AtomError::BadTablePointer);
@@ -146,13 +156,17 @@ impl<'a> Atombios<'a> {
 
         Ok(Self {
             image,
-            data_master_off: data_off, n_tables,
-            cmd_master_off: cmd_off_final, n_cmd_tables,
+            data_master_off: data_off,
+            n_tables,
+            cmd_master_off: cmd_off_final,
+            n_cmd_tables,
         })
     }
 
     /// Number of indexable data tables.
-    pub fn data_table_count(&self) -> u16 { self.n_tables }
+    pub fn data_table_count(&self) -> u16 {
+        self.n_tables
+    }
 
     /// Offset of `table_id`'s payload within the BIOS image, or
     /// `Err(UnknownTableId)` when the id is out of range. The
@@ -163,10 +177,10 @@ impl<'a> Atombios<'a> {
     /// `ATOM_DCN_INIT_DATA` (DCN initialization parameters);
     /// drivers usually start there.
     pub fn data_table_offset(&self, table_id: u16) -> Result<u32, AtomError> {
-        if table_id >= self.n_tables { return Err(AtomError::UnknownTableId); }
-        let off = self.data_master_off as usize
-            + 4
-            + (table_id as usize) * 2;
+        if table_id >= self.n_tables {
+            return Err(AtomError::UnknownTableId);
+        }
+        let off = self.data_master_off as usize + 4 + (table_id as usize) * 2;
         let p = u16::from_le_bytes([self.image[off], self.image[off + 1]]) as u32;
         if p == 0 || p as usize >= self.image.len() {
             return Err(AtomError::BadTablePointer);
@@ -179,9 +193,13 @@ impl<'a> Atombios<'a> {
     /// `usStructureSize` (first 2 bytes of the table).
     pub fn data_table<'b>(&'b self, table_id: u16) -> Result<&'a [u8], AtomError> {
         let off = self.data_table_offset(table_id)? as usize;
-        if off + 2 > self.image.len() { return Err(AtomError::BadTablePointer); }
+        if off + 2 > self.image.len() {
+            return Err(AtomError::BadTablePointer);
+        }
         let len = u16::from_le_bytes([self.image[off], self.image[off + 1]]) as usize;
-        if off + len > self.image.len() { return Err(AtomError::BadTablePointer); }
+        if off + len > self.image.len() {
+            return Err(AtomError::BadTablePointer);
+        }
         Ok(&self.image[off..off + len])
     }
 
@@ -189,16 +207,20 @@ impl<'a> Atombios<'a> {
 
     /// Number of indexable command tables. `0` when the BIOS
     /// image doesn't ship a command-table master directory.
-    pub fn cmd_table_count(&self) -> u16 { self.n_cmd_tables }
+    pub fn cmd_table_count(&self) -> u16 {
+        self.n_cmd_tables
+    }
 
     /// Offset of `table_id`'s command-table payload within the
     /// BIOS image. Symmetric to `data_table_offset`.
     pub fn cmd_table_offset(&self, table_id: u16) -> Result<u32, AtomError> {
-        if self.n_cmd_tables == 0 { return Err(AtomError::UnknownTableId); }
-        if table_id >= self.n_cmd_tables { return Err(AtomError::UnknownTableId); }
-        let off = self.cmd_master_off as usize
-            + 4
-            + (table_id as usize) * 2;
+        if self.n_cmd_tables == 0 {
+            return Err(AtomError::UnknownTableId);
+        }
+        if table_id >= self.n_cmd_tables {
+            return Err(AtomError::UnknownTableId);
+        }
+        let off = self.cmd_master_off as usize + 4 + (table_id as usize) * 2;
         let p = u16::from_le_bytes([self.image[off], self.image[off + 1]]) as u32;
         if p == 0 || p as usize >= self.image.len() {
             return Err(AtomError::BadTablePointer);
@@ -215,9 +237,13 @@ impl<'a> Atombios<'a> {
     /// bytecode in a future Stage-9+ interpreter.
     pub fn cmd_table<'b>(&'b self, table_id: u16) -> Result<&'a [u8], AtomError> {
         let off = self.cmd_table_offset(table_id)? as usize;
-        if off + 2 > self.image.len() { return Err(AtomError::BadTablePointer); }
+        if off + 2 > self.image.len() {
+            return Err(AtomError::BadTablePointer);
+        }
         let len = u16::from_le_bytes([self.image[off], self.image[off + 1]]) as usize;
-        if off + len > self.image.len() { return Err(AtomError::BadTablePointer); }
+        if off + len > self.image.len() {
+            return Err(AtomError::BadTablePointer);
+        }
         Ok(&self.image[off..off + len])
     }
 }

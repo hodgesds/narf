@@ -11,21 +11,34 @@ fn smoke_tracing_note_section_present() -> TestResult {
     // The .note.narf.probes section must be non-empty.
     let probes = crate::probes();
     if probes.is_empty() {
-        return TestResult::Fail(".note.narf.probes section empty — linker didn't keep the entries");
+        return TestResult::Fail(
+            ".note.narf.probes section empty — linker didn't keep the entries",
+        );
     }
 
     let mut saw_loaded = false;
     let mut saw_heartbeat = false;
     for p in probes {
-        if p.provider == "tracing" && p.name == "loaded"    { saw_loaded = true; }
-        if p.provider == "tracing" && p.name == "heartbeat" { saw_heartbeat = true; }
+        if p.provider == "tracing" && p.name == "loaded" {
+            saw_loaded = true;
+        }
+        if p.provider == "tracing" && p.name == "heartbeat" {
+            saw_heartbeat = true;
+        }
     }
-    if !saw_loaded    { return TestResult::Fail("tracing::loaded probe not in .note.narf.probes"); }
-    if !saw_heartbeat { return TestResult::Fail("tracing::heartbeat probe not in .note.narf.probes"); }
+    if !saw_loaded {
+        return TestResult::Fail("tracing::loaded probe not in .note.narf.probes");
+    }
+    if !saw_heartbeat {
+        return TestResult::Fail("tracing::heartbeat probe not in .note.narf.probes");
+    }
 
     for p in probes {
-        let expected = if p.args.is_empty() { 0 }
-                       else { (p.args.as_bytes().iter().filter(|&&b| b == b',').count() as u32) + 1 };
+        let expected = if p.args.is_empty() {
+            0
+        } else {
+            (p.args.as_bytes().iter().filter(|&&b| b == b',').count() as u32) + 1
+        };
         if p.argc != expected {
             return TestResult::Fail("probe argc / args mismatch");
         }
@@ -39,7 +52,9 @@ fn smoke_tracing_flight_ring_basic() -> TestResult {
     use crate::FlightRing;
     static RING: FlightRing<u32, 4> = FlightRing::new();
 
-    for i in 1u32..=6 { RING.record(i); }
+    for i in 1u32..=6 {
+        RING.record(i);
+    }
 
     if RING.total() != 6 {
         return TestResult::Fail("FlightRing.total wrong after 6 records");
@@ -55,7 +70,9 @@ fn smoke_tracing_flight_ring_basic() -> TestResult {
     }
     let mut present = [false; 7];
     for &v in &out {
-        if (v as usize) < present.len() { present[v as usize] = true; }
+        if (v as usize) < present.len() {
+            present[v as usize] = true;
+        }
     }
     for expected in [3u32, 4, 5, 6] {
         if !present[expected as usize] {
@@ -70,9 +87,9 @@ fn smoke_tracing_arm_disarm_cycle() -> TestResult {
     // Stage-3 arm/disarm exercises the cap gate plus the arch patch
     // path end-to-end. A 4-byte slot in a static mut stands in for
     // a real probe site's arming word.
+    use crate::{any_armed, arm, disarm, ProbeArming};
     use core::sync::atomic::{AtomicU32, Ordering};
     use narf_capabilities::{Cap, Grant};
-    use crate::{arm, disarm, any_armed, ProbeArming};
 
     static SLOT: AtomicU32 = AtomicU32::new(0x9090_9090); // nop sled
     let addr = SLOT.as_ptr() as *mut u32;
@@ -125,15 +142,15 @@ kernel_test_in!("tracing", smoke_tracing_arm_disarm_cycle);
 fn smoke_tracing_dispatch_fire_routes_handler() -> TestResult {
     // Register a handler for a fresh probe id, fire() → handler runs;
     // unregister → fire() is a no-op; revoked cap cannot register.
+    use crate::{
+        fire, handler_table, reserve_probe_id, ProbeArgs, ProbeHandler, ProbeHandlerInstall,
+        RegisterError,
+    };
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_capabilities::{Cap, Grant};
-    use crate::{
-        fire, handler_table, reserve_probe_id,
-        ProbeArgs, ProbeHandler, ProbeHandlerInstall, RegisterError,
-    };
 
     static HITS: AtomicU64 = AtomicU64::new(0);
-    static SUM:  AtomicU64 = AtomicU64::new(0);
+    static SUM: AtomicU64 = AtomicU64::new(0);
     HITS.store(0, Ordering::Relaxed);
     SUM.store(0, Ordering::Relaxed);
 
@@ -146,15 +163,16 @@ fn smoke_tracing_dispatch_fire_routes_handler() -> TestResult {
     }
 
     let pid = reserve_probe_id();
-    let cap: Cap<ProbeHandlerInstall, Grant> =
-        Cap::<ProbeHandlerInstall, Grant>::bootstrap();
+    let cap: Cap<ProbeHandlerInstall, Grant> = Cap::<ProbeHandlerInstall, Grant>::bootstrap();
 
     fire(pid, ProbeArgs::one(7));
     if HITS.load(Ordering::Relaxed) != 0 {
         return TestResult::Fail("fire() ran without a registered handler");
     }
 
-    handler_table().register(&cap, pid, Counter).expect("register");
+    handler_table()
+        .register(&cap, pid, Counter)
+        .expect("register");
     fire(pid, ProbeArgs::one(7));
     fire(pid, ProbeArgs::one(35));
     if HITS.load(Ordering::Relaxed) != 2 || SUM.load(Ordering::Relaxed) != 42 {
@@ -166,8 +184,7 @@ fn smoke_tracing_dispatch_fire_routes_handler() -> TestResult {
         _ => return TestResult::Fail("duplicate-id register accepted"),
     }
 
-    let revoked: Cap<ProbeHandlerInstall, Grant> =
-        Cap::<ProbeHandlerInstall, Grant>::bootstrap();
+    let revoked: Cap<ProbeHandlerInstall, Grant> = Cap::<ProbeHandlerInstall, Grant>::bootstrap();
     revoked.revoke();
     let pid2 = reserve_probe_id();
     match handler_table().register(&revoked, pid2, Counter) {
@@ -189,13 +206,23 @@ fn smoke_tracing_fntime_welford_accumulates() -> TestResult {
     // Direct record_cycles() path: deterministic (no clock noise).
     use crate::{FnTime, Welford};
     static LAT: FnTime = FnTime::new("test::welford");
-    for x in [1u64, 2, 3, 4, 5] { LAT.record_cycles(x); }
+    for x in [1u64, 2, 3, 4, 5] {
+        LAT.record_cycles(x);
+    }
     let w: Welford = LAT.welford();
-    if w.count != 5 { return TestResult::Fail("count != 5"); }
-    if w.min != 1 || w.max != 5 { return TestResult::Fail("min/max wrong"); }
-    if (w.mean - 3.0).abs() > 1e-9 { return TestResult::Fail("mean drifted"); }
+    if w.count != 5 {
+        return TestResult::Fail("count != 5");
+    }
+    if w.min != 1 || w.max != 5 {
+        return TestResult::Fail("min/max wrong");
+    }
+    if (w.mean - 3.0).abs() > 1e-9 {
+        return TestResult::Fail("mean drifted");
+    }
     let var = w.sample_variance();
-    if (var - 2.5).abs() > 1e-9 { return TestResult::Fail("sample variance off"); }
+    if (var - 2.5).abs() > 1e-9 {
+        return TestResult::Fail("sample variance off");
+    }
     TestResult::Pass
 }
 kernel_test_in!("tracing", smoke_tracing_fntime_welford_accumulates);
@@ -213,8 +240,12 @@ fn smoke_tracing_fntime_scope_records_cycles() -> TestResult {
         return TestResult::Fail("ScopeGuard drop didn't balance live_scopes");
     }
     let w = LAT.welford();
-    if w.count != before + 1 { return TestResult::Fail("scope did not add sample"); }
-    if w.max < 10_000 { return TestResult::Fail("scope sample shorter than busy-wait"); }
+    if w.count != before + 1 {
+        return TestResult::Fail("scope did not add sample");
+    }
+    if w.max < 10_000 {
+        return TestResult::Fail("scope sample shorter than busy-wait");
+    }
     TestResult::Pass
 }
 kernel_test_in!("tracing", smoke_tracing_fntime_scope_records_cycles);
@@ -224,7 +255,9 @@ fn smoke_tracing_histogram_quantile_bucket() -> TestResult {
     // of 1<<20 (bucket 21, lower = 1<<20).
     use crate::Histogram;
     let h = Histogram::new();
-    for _ in 0..10 { h.add(1000); }
+    for _ in 0..10 {
+        h.add(1000);
+    }
     if h.p50() != 512 {
         return TestResult::Fail("bucket lower bound for 1000 drifted from 512");
     }
@@ -235,14 +268,16 @@ fn smoke_tracing_histogram_quantile_bucket() -> TestResult {
     if h.p99() != 1u64 << 20 {
         return TestResult::Fail("outlier did not move p99 into its bucket");
     }
-    if h.count() != 11 { return TestResult::Fail("count mismatch"); }
+    if h.count() != 11 {
+        return TestResult::Fail("count mismatch");
+    }
     TestResult::Pass
 }
 kernel_test_in!("tracing", smoke_tracing_histogram_quantile_bucket);
 
 fn smoke_tracing_hwtrace_surface() -> TestResult {
-    use narf_capabilities::{Cap, Invoke};
     use crate::{hwtrace, HwTraceConfig, HwTraceError, HwTraceMarker, HwTraceStatus};
+    use narf_capabilities::{Cap, Invoke};
 
     let cap: Cap<HwTraceMarker, Invoke> = Cap::bootstrap();
     let cfg = HwTraceConfig::default();
@@ -251,7 +286,11 @@ fn smoke_tracing_hwtrace_surface() -> TestResult {
         Err(HwTraceError::NotImplemented) => {}
         _ => return TestResult::Fail("start should surface NotImplemented"),
     }
-    let bad = HwTraceConfig { buffer_phys: 0, buffer_size: 4096, ..Default::default() };
+    let bad = HwTraceConfig {
+        buffer_phys: 0,
+        buffer_size: 4096,
+        ..Default::default()
+    };
     if hwtrace::start(&cap, &bad) != Err(HwTraceError::InvalidBuffer) {
         return TestResult::Fail("invalid buffer pair not rejected");
     }

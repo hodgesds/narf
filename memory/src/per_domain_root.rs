@@ -31,8 +31,8 @@ pub enum AllocError {
 
 #[derive(Copy, Clone, Debug)]
 pub struct PerDomainRoot {
-    pub domain:     DomainId,
-    pub root_phys:  u64,
+    pub domain: DomainId,
+    pub root_phys: u64,
     pub generation: u64,
 }
 
@@ -55,7 +55,9 @@ pub fn init() {
     INITIALISED.store(1, Ordering::Release);
 }
 
-fn ready() -> bool { INITIALISED.load(Ordering::Acquire) != 0 }
+fn ready() -> bool {
+    INITIALISED.load(Ordering::Acquire) != 0
+}
 
 /// Register a previously-allocated root for `domain`. The caller
 /// has run `paging::new_user_pml4` (which already clones the
@@ -66,16 +68,21 @@ fn ready() -> bool { INITIALISED.load(Ordering::Acquire) != 0 }
 /// (which already consults that registry for PCID-based switching)
 /// stays consistent.
 pub fn register_root(domain: DomainId, root_phys: u64) -> Result<PerDomainRoot, AllocError> {
-    if !ready() { return Err(AllocError::NotInitialised); }
+    if !ready() {
+        return Err(AllocError::NotInitialised);
+    }
     let idx = domain.raw() as usize;
-    if idx >= N_DOMAINS { return Err(AllocError::OutOfMemory); }
+    if idx >= N_DOMAINS {
+        return Err(AllocError::OutOfMemory);
+    }
     let mut g = ROOTS.lock();
     if g[idx].root_phys != 0 {
         return Err(AllocError::AlreadyAllocated);
     }
     let tag = asid_alloc::alloc(domain);
     let r = PerDomainRoot {
-        domain, root_phys,
+        domain,
+        root_phys,
         generation: tag.generation,
     };
     g[idx] = r;
@@ -84,7 +91,9 @@ pub fn register_root(domain: DomainId, root_phys: u64) -> Result<PerDomainRoot, 
     #[cfg(target_arch = "x86_64")]
     {
         // SAFETY: domain.raw() < 16; root_phys is a valid 4 KiB frame.
-        unsafe { narf_arch::x86_64::pcid::set_domain_pml4(domain.raw(), root_phys); }
+        unsafe {
+            narf_arch::x86_64::pcid::set_domain_pml4(domain.raw(), root_phys);
+        }
     }
     Ok(r)
 }
@@ -93,9 +102,13 @@ pub fn register_root(domain: DomainId, root_phys: u64) -> Result<PerDomainRoot, 
 /// nothing was registered.
 pub fn lookup(domain: DomainId) -> Option<PerDomainRoot> {
     let idx = domain.raw() as usize;
-    if idx >= N_DOMAINS { return None; }
+    if idx >= N_DOMAINS {
+        return None;
+    }
     let g = ROOTS.lock();
-    if g[idx].root_phys == 0 { return None; }
+    if g[idx].root_phys == 0 {
+        return None;
+    }
     Some(g[idx])
 }
 
@@ -104,7 +117,9 @@ pub fn lookup(domain: DomainId) -> Option<PerDomainRoot> {
 /// the per-domain tag.
 pub fn unregister_root(domain: DomainId) {
     let idx = domain.raw() as usize;
-    if idx >= N_DOMAINS { return; }
+    if idx >= N_DOMAINS {
+        return;
+    }
     let mut g = ROOTS.lock();
     g[idx] = NONE_ROOT;
     asid_alloc::invalidate_tag(domain);
@@ -119,7 +134,9 @@ pub fn tag_for(domain: DomainId) -> DomainTag {
 #[doc(hidden)]
 pub fn __reset_for_test() {
     let mut g = ROOTS.lock();
-    for slot in g.iter_mut() { *slot = NONE_ROOT; }
+    for slot in g.iter_mut() {
+        *slot = NONE_ROOT;
+    }
     asid_alloc::__reset_for_test();
     INITIALISED.store(1, Ordering::Release);
 }
@@ -137,11 +154,11 @@ pub fn __reset_for_test() {
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn switch_to(root: &PerDomainRoot) {
     let tag = asid_alloc::pcid_for(root.domain);
-    let cr3 = (root.root_phys & 0xFFFF_FFFF_FFFF_F000)
-            | (tag as u64 & 0xFFF)
-            | (1u64 << 63);  // NOFLUSH
-    // SAFETY: caller-asserted.
-    unsafe { narf_arch::x86_64::cr::write_cr3(cr3); }
+    let cr3 = (root.root_phys & 0xFFFF_FFFF_FFFF_F000) | (tag as u64 & 0xFFF) | (1u64 << 63); // NOFLUSH
+                                                                                              // SAFETY: caller-asserted.
+    unsafe {
+        narf_arch::x86_64::cr::write_cr3(cr3);
+    }
 }
 
 /// aarch64 variant — TTBR0_EL1 carries (root_phys, ASID).

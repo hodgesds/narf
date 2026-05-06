@@ -85,7 +85,9 @@ pub fn pipe_pair() -> (Arc<PipeRead>, Arc<PipeWrite>) {
         reader_closed: AtomicBool::new(false),
     });
     (
-        Arc::new(PipeRead  { shared: shared.clone() }),
+        Arc::new(PipeRead {
+            shared: shared.clone(),
+        }),
         Arc::new(PipeWrite { shared }),
     )
 }

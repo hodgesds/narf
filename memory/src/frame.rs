@@ -50,8 +50,10 @@ impl PhysFrame {
     /// Wrap an already-aligned `PhysAddr`. Panics on misaligned input in
     /// debug; truncates in release (callers should use `containing`).
     pub const fn new(addr: PhysAddr) -> Self {
-        debug_assert!(addr.raw() & (PAGE_SIZE - 1) == 0,
-                      "PhysFrame::new requires a page-aligned PhysAddr");
+        debug_assert!(
+            addr.raw() & (PAGE_SIZE - 1) == 0,
+            "PhysFrame::new requires a page-aligned PhysAddr"
+        );
         Self(addr)
     }
 
@@ -62,11 +64,15 @@ impl PhysFrame {
 
     /// Starting physical address of this frame.
     #[inline]
-    pub const fn start_address(self) -> PhysAddr { self.0 }
+    pub const fn start_address(self) -> PhysAddr {
+        self.0
+    }
 
     /// Frame number (phys >> PAGE_SHIFT).
     #[inline]
-    pub const fn number(self) -> u64 { self.0.raw() >> PAGE_SHIFT }
+    pub const fn number(self) -> u64 {
+        self.0.raw() >> PAGE_SHIFT
+    }
 }
 
 impl fmt::Debug for PhysFrame {
@@ -89,33 +95,32 @@ pub enum FrameAllocError {
 /// frames whose physical addresses map to its proximity domain.
 #[derive(Debug)]
 pub struct FrameAllocator {
-    bins:            [Vec<PhysFrame>; MAX_NUMA_NODES],
-    initialised:     bool,
-    total_frames:    usize,
+    bins: [Vec<PhysFrame>; MAX_NUMA_NODES],
+    initialised: bool,
+    total_frames: usize,
     reserved_frames: usize,
     /// Set after `rebalance_to_topology` completes; alloc + free
     /// honour per-node bins from this point on. Pre-flag, every
     /// allocation comes out of bin 0.
-    numa_aware:      bool,
+    numa_aware: bool,
 }
 
 const NEW_VEC: Vec<PhysFrame> = Vec::new();
 
-static ALLOC: IrqSafeSpinLock<FrameAllocator> = IrqSafeSpinLock::new(
-    FrameAllocator {
-        bins:            [NEW_VEC; MAX_NUMA_NODES],
-        initialised:     false,
-        total_frames:    0,
-        reserved_frames: 0,
-        numa_aware:      false,
-    });
+static ALLOC: IrqSafeSpinLock<FrameAllocator> = IrqSafeSpinLock::new(FrameAllocator {
+    bins: [NEW_VEC; MAX_NUMA_NODES],
+    initialised: false,
+    total_frames: 0,
+    reserved_frames: 0,
+    numa_aware: false,
+});
 
 /// A subset of the bootloader memory map: just what the allocator needs.
 /// Consumers typically pass `BootInfo::memory_map` via `narf_boot`.
 #[derive(Copy, Clone, Debug)]
 pub struct UsableRegion {
     pub start: PhysAddr,
-    pub len:   u64,
+    pub len: u64,
 }
 
 /// Initialise the frame allocator from a slice of usable regions. `exclude`
@@ -139,14 +144,17 @@ pub unsafe fn init_from_map(usable: &[UsableRegion], exclude: &[(u64, u64)]) {
     let mut pageable = 0usize;
     for r in usable {
         let start = r.start.raw();
-        let end   = start + r.len;
+        let end = start + r.len;
         let first = (start + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        let last  = end & !(PAGE_SIZE - 1);
+        let last = end & !(PAGE_SIZE - 1);
         let mut a = first;
         while a + PAGE_SIZE <= last {
             total += 1;
-            if is_excluded(a, exclude) { reserved += 1; }
-            else                        { pageable += 1; }
+            if is_excluded(a, exclude) {
+                reserved += 1;
+            } else {
+                pageable += 1;
+            }
             a += PAGE_SIZE;
         }
     }
@@ -154,9 +162,9 @@ pub unsafe fn init_from_map(usable: &[UsableRegion], exclude: &[(u64, u64)]) {
     let mut bin0: Vec<PhysFrame> = Vec::with_capacity(pageable);
     for r in usable {
         let start = r.start.raw();
-        let end   = start + r.len;
+        let end = start + r.len;
         let first = (start + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        let last  = end & !(PAGE_SIZE - 1);
+        let last = end & !(PAGE_SIZE - 1);
         let mut a = first;
         while a + PAGE_SIZE <= last {
             if !is_excluded(a, exclude) {
@@ -168,10 +176,10 @@ pub unsafe fn init_from_map(usable: &[UsableRegion], exclude: &[(u64, u64)]) {
 
     let mut guard = ALLOC.lock();
     guard.bins[0] = bin0;
-    guard.initialised     = true;
-    guard.total_frames    = total;
+    guard.initialised = true;
+    guard.total_frames = total;
     guard.reserved_frames = reserved;
-    guard.numa_aware      = false;
+    guard.numa_aware = false;
 }
 
 fn is_excluded(addr: u64, exclude: &[(u64, u64)]) -> bool {
@@ -184,11 +192,12 @@ fn is_excluded(addr: u64, exclude: &[(u64, u64)]) -> bool {
 /// calls are no-ops.
 pub fn rebalance_to_topology() {
     let mut g = ALLOC.lock();
-    if g.numa_aware || !g.initialised { return; }
+    if g.numa_aware || !g.initialised {
+        return;
+    }
 
     // Drain bin 0 into a temporary, then redistribute.
-    let drained: Vec<PhysFrame> =
-        core::mem::replace(&mut g.bins[0], Vec::new());
+    let drained: Vec<PhysFrame> = core::mem::replace(&mut g.bins[0], Vec::new());
 
     for f in drained {
         let node = phys_to_node(f.start_address().raw());
@@ -209,7 +218,9 @@ pub fn alloc_frame() -> Result<PhysFrame, FrameAllocError> {
 /// other nodes when `node`'s bin is empty.
 pub fn alloc_frame_on(node: usize) -> Result<PhysFrame, FrameAllocError> {
     let mut g = ALLOC.lock();
-    if !g.initialised { return Err(FrameAllocError::Uninitialised); }
+    if !g.initialised {
+        return Err(FrameAllocError::Uninitialised);
+    }
 
     if !g.numa_aware {
         // Pre-rebalance: everything's in bin 0.
@@ -217,12 +228,16 @@ pub fn alloc_frame_on(node: usize) -> Result<PhysFrame, FrameAllocError> {
     }
 
     let preferred = node.min(MAX_NUMA_NODES - 1);
-    if let Some(f) = g.bins[preferred].pop() { return Ok(f); }
+    if let Some(f) = g.bins[preferred].pop() {
+        return Ok(f);
+    }
 
     // Fallback: round-robin from the next-highest node, wrapping.
     for offset in 1..MAX_NUMA_NODES {
         let i = (preferred + offset) % MAX_NUMA_NODES;
-        if let Some(f) = g.bins[i].pop() { return Ok(f); }
+        if let Some(f) = g.bins[i].pop() {
+            return Ok(f);
+        }
     }
     Err(FrameAllocError::Exhausted)
 }
@@ -231,9 +246,13 @@ pub fn alloc_frame_on(node: usize) -> Result<PhysFrame, FrameAllocError> {
 /// that don't care about locality.
 pub fn alloc_frame_anywhere() -> Result<PhysFrame, FrameAllocError> {
     let mut g = ALLOC.lock();
-    if !g.initialised { return Err(FrameAllocError::Uninitialised); }
+    if !g.initialised {
+        return Err(FrameAllocError::Uninitialised);
+    }
     for bin in g.bins.iter_mut() {
-        if let Some(f) = bin.pop() { return Ok(f); }
+        if let Some(f) = bin.pop() {
+            return Ok(f);
+        }
     }
     Err(FrameAllocError::Exhausted)
 }
@@ -243,7 +262,9 @@ pub fn alloc_frame_anywhere() -> Result<PhysFrame, FrameAllocError> {
 pub fn free_frame(f: PhysFrame) {
     let node = phys_to_node(f.start_address().raw());
     let mut g = ALLOC.lock();
-    if !g.initialised { return; }
+    if !g.initialised {
+        return;
+    }
     if g.numa_aware {
         g.bins[node].push(f);
     } else {
@@ -256,7 +277,7 @@ pub fn stats() -> FrameStats {
     let g = ALLOC.lock();
     let free: usize = g.bins.iter().map(|b| b.len()).sum();
     FrameStats {
-        total:    g.total_frames,
+        total: g.total_frames,
         free,
         reserved: g.reserved_frames,
     }
@@ -265,7 +286,9 @@ pub fn stats() -> FrameStats {
 /// Per-node free-frame count. Returns 0 when `node` is out of range
 /// or the allocator hasn't been initialised.
 pub fn node_free(node: usize) -> usize {
-    if node >= MAX_NUMA_NODES { return 0; }
+    if node >= MAX_NUMA_NODES {
+        return 0;
+    }
     let g = ALLOC.lock();
     g.bins[node].len()
 }
@@ -277,8 +300,8 @@ pub fn is_numa_aware() -> bool {
 
 #[derive(Copy, Clone, Debug)]
 pub struct FrameStats {
-    pub total:    usize,
-    pub free:     usize,
+    pub total: usize,
+    pub free: usize,
     pub reserved: usize,
 }
 
@@ -304,7 +327,11 @@ extern "Rust" {
 fn phys_to_node(addr: u64) -> usize {
     // SAFETY: narf-frame provides the `#[no_mangle]` definition.
     let n = unsafe { narf_phys_to_node(addr) } as usize;
-    if n < MAX_NUMA_NODES { n } else { 0 }
+    if n < MAX_NUMA_NODES {
+        n
+    } else {
+        0
+    }
 }
 
 #[inline]
@@ -312,5 +339,9 @@ fn current_cpu_node() -> usize {
     let cpu = narf_lib::percpu::current_cpu() as u32;
     // SAFETY: narf-frame provides the `#[no_mangle]` definition.
     let n = unsafe { narf_cpu_to_node(cpu) } as usize;
-    if n < MAX_NUMA_NODES { n } else { 0 }
+    if n < MAX_NUMA_NODES {
+        n
+    } else {
+        0
+    }
 }

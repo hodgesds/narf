@@ -4,15 +4,24 @@
 //! block-device trait implementation, feature negotiation skeleton,
 //! and request submission via virtqueue.
 
+use alloc::collections::BTreeMap;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
-use alloc::collections::BTreeMap;
 
-use narf_block::{BlockCompletion, BlockDevice, BlockFeature, BlockRequest, CancelResult, LbaRange, BlockError, BlockOp};
-use crate::{VirtioMmioDevice, queue::{Virtqueue, VirtqDesc, VIRTQ_DESC_F_WRITE, VirtqueueLayout}};
-use crate::{VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER, VIRTIO_STATUS_FEATURES_OK, VIRTIO_STATUS_DRIVER_OK, VIRTIO_F_VERSION_1};
-use narf_io::{DmaBuffer, alloc_coherent, GetPhysAddr};
+use crate::{
+    queue::{VirtqDesc, Virtqueue, VirtqueueLayout, VIRTQ_DESC_F_WRITE},
+    VirtioMmioDevice,
+};
+use crate::{
+    VIRTIO_F_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK,
+    VIRTIO_STATUS_FEATURES_OK,
+};
+use narf_block::{
+    BlockCompletion, BlockDevice, BlockError, BlockFeature, BlockOp, BlockRequest, CancelResult,
+    LbaRange,
+};
+use narf_io::{alloc_coherent, DmaBuffer, GetPhysAddr};
 use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -69,7 +78,10 @@ struct DmaPool {
 
 impl DmaPool {
     fn new(buf: DmaBuffer) -> Self {
-        Self { buf, free: narf_lib::bitmap::Bitmap::new_full() }
+        Self {
+            buf,
+            free: narf_lib::bitmap::Bitmap::new_full(),
+        }
     }
 
     fn alloc(&mut self) -> Option<usize> {
@@ -115,19 +127,29 @@ impl VirtioBlkDevice {
         // 1. Reset device.
         self.mmio.write_u32(VirtioMmioDevice::REG_STATUS, 0);
         // 2. Set ACKNOWLEDGE status bit.
-        self.mmio.write_u32(VirtioMmioDevice::REG_STATUS, VIRTIO_STATUS_ACKNOWLEDGE);
+        self.mmio
+            .write_u32(VirtioMmioDevice::REG_STATUS, VIRTIO_STATUS_ACKNOWLEDGE);
         // 3. Set DRIVER status bit.
-        self.mmio.write_u32(VirtioMmioDevice::REG_STATUS, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
+        self.mmio.write_u32(
+            VirtioMmioDevice::REG_STATUS,
+            VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER,
+        );
 
         // 4. Feature negotiation.
         let features = self.mmio.read_u32(VirtioMmioDevice::REG_DEVICE_FEATURES);
         if (features & (VIRTIO_F_VERSION_1 as u32)) == 0 {
             return Err(VirtioError::UnsupportedVersion);
         }
-        self.mmio.write_u32(VirtioMmioDevice::REG_DRIVER_FEATURES, VIRTIO_F_VERSION_1 as u32);
-        
+        self.mmio.write_u32(
+            VirtioMmioDevice::REG_DRIVER_FEATURES,
+            VIRTIO_F_VERSION_1 as u32,
+        );
+
         // 5. Set FEATURES_OK.
-        self.mmio.write_u32(VirtioMmioDevice::REG_STATUS, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK);
+        self.mmio.write_u32(
+            VirtioMmioDevice::REG_STATUS,
+            VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK,
+        );
         if (self.mmio.read_u32(VirtioMmioDevice::REG_STATUS) & VIRTIO_STATUS_FEATURES_OK) == 0 {
             return Err(VirtioError::DeviceRejectedFeatures);
         }
@@ -139,24 +161,49 @@ impl VirtioBlkDevice {
             return Err(VirtioError::NoQueues);
         }
         let queue_size = core::cmp::min(max_size as u16, 64);
-        self.mmio.write_u32(VirtioMmioDevice::REG_QUEUE_NUM, queue_size as u32);
+        self.mmio
+            .write_u32(VirtioMmioDevice::REG_QUEUE_NUM, queue_size as u32);
 
         let q_buf = alloc_coherent(4096, domain).map_err(|_| VirtioError::NoMemory)?;
         let q_ptr = q_buf.phys_addr().raw();
 
         let layout = VirtqueueLayout::new(queue_size, q_ptr).ok_or(VirtioError::QueueTooLarge)?;
 
-        self.mmio.write_u32(VirtioMmioDevice::REG_QUEUE_DESC_LOW, layout.desc_table as u32);
-        self.mmio.write_u32(VirtioMmioDevice::REG_QUEUE_DESC_HIGH, (layout.desc_table >> 32) as u32);
-        self.mmio.write_u32(VirtioMmioDevice::REG_QUEUE_DRIVER_LOW, layout.avail_ring as u32);
-        self.mmio.write_u32(VirtioMmioDevice::REG_QUEUE_DRIVER_HIGH, (layout.avail_ring >> 32) as u32);
-        self.mmio.write_u32(VirtioMmioDevice::REG_QUEUE_DEVICE_LOW, layout.used_ring as u32);
-        self.mmio.write_u32(VirtioMmioDevice::REG_QUEUE_DEVICE_HIGH, (layout.used_ring >> 32) as u32);
+        self.mmio.write_u32(
+            VirtioMmioDevice::REG_QUEUE_DESC_LOW,
+            layout.desc_table as u32,
+        );
+        self.mmio.write_u32(
+            VirtioMmioDevice::REG_QUEUE_DESC_HIGH,
+            (layout.desc_table >> 32) as u32,
+        );
+        self.mmio.write_u32(
+            VirtioMmioDevice::REG_QUEUE_DRIVER_LOW,
+            layout.avail_ring as u32,
+        );
+        self.mmio.write_u32(
+            VirtioMmioDevice::REG_QUEUE_DRIVER_HIGH,
+            (layout.avail_ring >> 32) as u32,
+        );
+        self.mmio.write_u32(
+            VirtioMmioDevice::REG_QUEUE_DEVICE_LOW,
+            layout.used_ring as u32,
+        );
+        self.mmio.write_u32(
+            VirtioMmioDevice::REG_QUEUE_DEVICE_HIGH,
+            (layout.used_ring >> 32) as u32,
+        );
 
         self.mmio.write_u32(VirtioMmioDevice::REG_QUEUE_READY, 1);
 
         // 7. Set DRIVER_OK.
-        self.mmio.write_u32(VirtioMmioDevice::REG_STATUS, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK);
+        self.mmio.write_u32(
+            VirtioMmioDevice::REG_STATUS,
+            VIRTIO_STATUS_ACKNOWLEDGE
+                | VIRTIO_STATUS_DRIVER
+                | VIRTIO_STATUS_FEATURES_OK
+                | VIRTIO_STATUS_DRIVER_OK,
+        );
 
         let p_buf = alloc_coherent(4096, domain).map_err(|_| VirtioError::NoMemory)?;
         self.pool = Some(DmaPool::new(p_buf));
@@ -172,11 +219,17 @@ impl VirtioBlkDevice {
     /// Poll for completions.
     pub fn poll(&self) {
         let mut inner_guard = self.inner.lock();
-        let inner = if let Some(ref mut i) = *inner_guard { i } else { return; };
+        let inner = if let Some(ref mut i) = *inner_guard {
+            i
+        } else {
+            return;
+        };
 
         while let Some((id, _len)) = inner.queue.poll_used() {
             if let Some(mut req) = inner.requests.remove(&(id as u16)) {
-                if let Some(ref mut pool) = unsafe { &mut *core::ptr::addr_of!(self.pool).cast_mut() } {
+                if let Some(ref mut pool) =
+                    unsafe { &mut *core::ptr::addr_of!(self.pool).cast_mut() }
+                {
                     pool.free(req.pool_idx);
                 }
 
@@ -190,18 +243,30 @@ impl VirtioBlkDevice {
 }
 
 impl BlockDevice for VirtioBlkDevice {
-    fn logical_block_size(&self) -> u32 { 512 }
-    fn physical_block_size(&self) -> u32 { 512 }
-    fn capacity_blocks(&self) -> u64 { 0 }
-    fn supports(&self, _feat: BlockFeature) -> bool { false }
+    fn logical_block_size(&self) -> u32 {
+        512
+    }
+    fn physical_block_size(&self) -> u32 {
+        512
+    }
+    fn capacity_blocks(&self) -> u64 {
+        0
+    }
+    fn supports(&self, _feat: BlockFeature) -> bool {
+        false
+    }
 
     fn submit(&self, req: BlockRequest) -> impl Future<Output = BlockCompletion> {
         let mut inner_guard = self.inner.lock();
-        let inner = if let Some(ref mut i) = *inner_guard { i } else {
+        let inner = if let Some(ref mut i) = *inner_guard {
+            i
+        } else {
             return BlkRequestFuture::error(req.user_tag, BlockError::DeviceRemoved);
         };
 
-        let pool_idx = if let Some(ref mut pool) = unsafe { &mut *core::ptr::addr_of!(self.pool).cast_mut() } {
+        let pool_idx = if let Some(ref mut pool) =
+            unsafe { &mut *core::ptr::addr_of!(self.pool).cast_mut() }
+        {
             if let Some(idx) = pool.alloc() {
                 idx
             } else {
@@ -224,7 +289,11 @@ impl BlockDevice for VirtioBlkDevice {
 
         unsafe {
             let h_ptr = pool.header_ptr(pool_idx);
-            *h_ptr = VirtioBlkHeader { type_tag, reserved: 0, sector: req.lba };
+            *h_ptr = VirtioBlkHeader {
+                type_tag,
+                reserved: 0,
+                sector: req.lba,
+            };
             let s_ptr = pool.status_ptr(pool_idx);
             *s_ptr = 0xFF; // Pending
         }
@@ -232,7 +301,9 @@ impl BlockDevice for VirtioBlkDevice {
         let buffer_phys = match req.buffer.invoke(GetPhysAddr) {
             Ok(p) => p.raw(),
             Err(_) => {
-                if let Some(ref mut pool) = unsafe { &mut *core::ptr::addr_of!(self.pool).cast_mut() } {
+                if let Some(ref mut pool) =
+                    unsafe { &mut *core::ptr::addr_of!(self.pool).cast_mut() }
+                {
                     pool.free(pool_idx);
                 }
                 return BlkRequestFuture::error(req.user_tag, BlockError::PermissionDenied);
@@ -240,9 +311,24 @@ impl BlockDevice for VirtioBlkDevice {
         };
 
         let mut descs = [
-            VirtqDesc { addr: header_phys, len: 16, flags: 0, next: 0 },
-            VirtqDesc { addr: buffer_phys, len: req.blocks * 512, flags: 0, next: 0 },
-            VirtqDesc { addr: status_phys, len: 1, flags: VIRTQ_DESC_F_WRITE, next: 0 },
+            VirtqDesc {
+                addr: header_phys,
+                len: 16,
+                flags: 0,
+                next: 0,
+            },
+            VirtqDesc {
+                addr: buffer_phys,
+                len: req.blocks * 512,
+                flags: 0,
+                next: 0,
+            },
+            VirtqDesc {
+                addr: status_phys,
+                len: 1,
+                flags: VIRTQ_DESC_F_WRITE,
+                next: 0,
+            },
         ];
 
         if req.op == BlockOp::Read {
@@ -250,11 +336,14 @@ impl BlockDevice for VirtioBlkDevice {
         }
 
         if let Some(id) = inner.queue.add_buffer(&descs) {
-            inner.requests.insert(id, InFlightRequest {
-                _user_tag: req.user_tag,
-                waker: None,
-                pool_idx,
-            });
+            inner.requests.insert(
+                id,
+                InFlightRequest {
+                    _user_tag: req.user_tag,
+                    waker: None,
+                    pool_idx,
+                },
+            );
 
             self.mmio.write_u32(VirtioMmioDevice::REG_QUEUE_NOTIFY, 0);
 
@@ -271,9 +360,15 @@ impl BlockDevice for VirtioBlkDevice {
         }
     }
 
-    fn flush(&self) -> impl Future<Output = ()> { core::future::pending() }
-    fn discard(&self, _range: LbaRange) -> impl Future<Output = ()> { core::future::pending() }
-    fn cancel(&self, _tag: u64) -> impl Future<Output = CancelResult> { core::future::pending() }
+    fn flush(&self) -> impl Future<Output = ()> {
+        core::future::pending()
+    }
+    fn discard(&self, _range: LbaRange) -> impl Future<Output = ()> {
+        core::future::pending()
+    }
+    fn cancel(&self, _tag: u64) -> impl Future<Output = CancelResult> {
+        core::future::pending()
+    }
 }
 
 struct BlkRequestFuture<'a> {
@@ -284,7 +379,11 @@ struct BlkRequestFuture<'a> {
 
 impl<'a> BlkRequestFuture<'a> {
     fn error(user_tag: u64, _err: BlockError) -> Self {
-        Self { device: None, head_id: None, user_tag }
+        Self {
+            device: None,
+            head_id: None,
+            user_tag,
+        }
     }
 }
 
@@ -294,12 +393,24 @@ impl<'a> Future for BlkRequestFuture<'a> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let (device, id) = match (self.device, self.head_id) {
             (Some(d), Some(id)) => (d, id),
-            _ => return Poll::Ready(BlockCompletion { tag: 0, user_tag: self.user_tag, result: Err(BlockError::DeviceRemoved) }),
+            _ => {
+                return Poll::Ready(BlockCompletion {
+                    tag: 0,
+                    user_tag: self.user_tag,
+                    result: Err(BlockError::DeviceRemoved),
+                })
+            }
         };
 
         let mut inner_guard = device.inner.lock();
-        let inner = if let Some(ref mut i) = *inner_guard { i } else {
-            return Poll::Ready(BlockCompletion { tag: 0, user_tag: self.user_tag, result: Err(BlockError::DeviceRemoved) });
+        let inner = if let Some(ref mut i) = *inner_guard {
+            i
+        } else {
+            return Poll::Ready(BlockCompletion {
+                tag: 0,
+                user_tag: self.user_tag,
+                result: Err(BlockError::DeviceRemoved),
+            });
         };
 
         if let Some(req) = inner.requests.get_mut(&id) {
@@ -319,9 +430,9 @@ impl<'a> Future for BlkRequestFuture<'a> {
 pub const VIRTIO_ID_BLOCK: u32 = 2;
 
 /// Request types for virtio-blk.
-pub const VIRTIO_BLK_T_IN:     u32 = 0;
-pub const VIRTIO_BLK_T_OUT:    u32 = 1;
-pub const VIRTIO_BLK_T_FLUSH:  u32 = 4;
+pub const VIRTIO_BLK_T_IN: u32 = 0;
+pub const VIRTIO_BLK_T_OUT: u32 = 1;
+pub const VIRTIO_BLK_T_FLUSH: u32 = 4;
 pub const VIRTIO_BLK_T_DISCARD: u32 = 11;
 
 /// Request header for virtio-blk.
@@ -333,10 +444,10 @@ pub struct VirtioBlkHeader {
     pub type_tag: u32,
     pub reserved: u32,
     /// Sector to read from or write to.
-    pub sector:   u64,
+    pub sector: u64,
 }
 
 /// Status byte for virtio-blk.
-pub const VIRTIO_BLK_S_OK:      u8 = 0;
-pub const VIRTIO_BLK_S_IOERR:   u8 = 1;
-pub const VIRTIO_BLK_S_UNSUPP:  u8 = 2;
+pub const VIRTIO_BLK_S_OK: u8 = 0;
+pub const VIRTIO_BLK_S_IOERR: u8 = 1;
+pub const VIRTIO_BLK_S_UNSUPP: u8 = 2;

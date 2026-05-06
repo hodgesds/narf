@@ -43,7 +43,7 @@ static CURSOR: AtomicU64 = AtomicU64::new(VMALLOC_BASE);
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct VmRange {
     pub base: u64,
-    pub len:  u64,
+    pub len: u64,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -60,16 +60,25 @@ pub enum VmallocError {
 /// dereferencing.
 pub fn alloc(len: u64) -> Result<VmRange, VmallocError> {
     let len_pg = (len + 0xFFF) & !0xFFFu64;
-    if len_pg == 0 { return Err(VmallocError::BadLen); }
+    if len_pg == 0 {
+        return Err(VmallocError::BadLen);
+    }
     // Bump-pointer atomic CAS so concurrent callers don't
     // overlap.
     loop {
         let cur = CURSOR.load(Ordering::Relaxed);
         let end = cur.checked_add(len_pg).ok_or(VmallocError::Exhausted)?;
-        if end > VMALLOC_LIMIT { return Err(VmallocError::Exhausted); }
+        if end > VMALLOC_LIMIT {
+            return Err(VmallocError::Exhausted);
+        }
         match CURSOR.compare_exchange_weak(cur, end, Ordering::AcqRel, Ordering::Relaxed) {
-            Ok(_)   => return Ok(VmRange { base: cur, len: len_pg }),
-            Err(_)  => continue,
+            Ok(_) => {
+                return Ok(VmRange {
+                    base: cur,
+                    len: len_pg,
+                })
+            }
+            Err(_) => continue,
         }
     }
 }

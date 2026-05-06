@@ -12,8 +12,8 @@ fn smoke_bus_enumerates_pcie() -> TestResult {
     // Walk QEMU q35's PCIe ECAM at its default base. q35 exposes a
     // PCI-Express host bridge at 00:00.0 plus any attached devices.
     // We expect at minimum the host bridge entry (vendor != 0xFFFF).
-    use crate::{devices, BusKind};
     use crate::x86_64::ECAM_DEFAULT_BASE;
+    use crate::{devices, BusKind};
     // SAFETY: ECAM_DEFAULT_BASE (0xb000_0000) is inside q35's
     // pcie-mmcfg region and below the 4-GiB identity map installed
     // by memory/mmu::init_mmu. No MMIO write happens during the walk.
@@ -23,10 +23,12 @@ fn smoke_bus_enumerates_pcie() -> TestResult {
     }
     // Host bridge must be the first entry (function 0 on bus 0, dev 0).
     let devs = devices();
-    let has_host_bridge = devs.iter().any(|d| matches!(
-        &d.kind,
-        BusKind::Pcie { addr, .. } if addr.bus == 0 && addr.device == 0 && addr.function == 0
-    ));
+    let has_host_bridge = devs.iter().any(|d| {
+        matches!(
+            &d.kind,
+            BusKind::Pcie { addr, .. } if addr.bus == 0 && addr.device == 0 && addr.function == 0
+        )
+    });
     if !has_host_bridge {
         return TestResult::Fail("00:00.0 host bridge not found in ECAM walk");
     }
@@ -46,23 +48,25 @@ fn smoke_bus_pcie_dtb_aarch64() -> TestResult {
     use crate::{devices, BusKind};
     use narf_memory::PhysAddr;
     // SAFETY: xtask loads the DTB at this address; identity-mapped.
-    let _ = unsafe {
-        crate::init(Some(PhysAddr::new(0x4F00_0000)))
-    };
+    let _ = unsafe { crate::init(Some(PhysAddr::new(0x4F00_0000))) };
     let devs = devices();
-    let n_pcie = devs.iter()
+    let n_pcie = devs
+        .iter()
         .filter(|d| matches!(&d.kind, BusKind::Pcie { .. }))
         .count();
     if n_pcie == 0 {
         return TestResult::Fail(
-            "DTB walk yielded no PCIe devices on aarch64 — host bridge missing");
+            "DTB walk yielded no PCIe devices on aarch64 — host bridge missing",
+        );
     }
     // QEMU virt's host bridge appears at 00:00.0 by convention.
-    let has_root = devs.iter().any(|d| matches!(
-        &d.kind,
-        BusKind::Pcie { addr, .. }
-            if addr.bus == 0 && addr.device == 0 && addr.function == 0
-    ));
+    let has_root = devs.iter().any(|d| {
+        matches!(
+            &d.kind,
+            BusKind::Pcie { addr, .. }
+                if addr.bus == 0 && addr.device == 0 && addr.function == 0
+        )
+    });
     if !has_root {
         return TestResult::Fail("no 00:00.0 PCIe host bridge entry on aarch64");
     }
@@ -116,8 +120,9 @@ fn smoke_bus_claim_device_not_found() -> TestResult {
     use narf_memory::PhysAddr;
     let bogus = BusAddr::Mmio(PhysAddr::new(0xdead_beef_0000));
     match claim_device(bogus) {
-        Err(crate::ClaimError::NotFound)
-        | Err(crate::ClaimError::NotInitialised) => TestResult::Pass,
+        Err(crate::ClaimError::NotFound) | Err(crate::ClaimError::NotInitialised) => {
+            TestResult::Pass
+        }
         Err(crate::ClaimError::AuthorityRevoked) => {
             TestResult::Fail("AuthorityRevoked on un-authorised path")
         }
@@ -132,15 +137,21 @@ fn smoke_bus_msix_alloc_vector() -> TestResult {
     // device having an MSI-X capability.
     use crate::msix::__synth_msix_table;
     let mut t = __synth_msix_table(4);
-    if t.size() != 4 { return TestResult::Fail("synthetic size mismatch"); }
-    if t.free() != 4 { return TestResult::Fail("initial free mismatch"); }
+    if t.size() != 4 {
+        return TestResult::Fail("synthetic size mismatch");
+    }
+    if t.free() != 4 {
+        return TestResult::Fail("initial free mismatch");
+    }
 
     let v0 = t.alloc_vector().expect("slot 0");
     let v1 = t.alloc_vector().expect("slot 1");
     if v0.vector != 0 || v1.vector != 1 {
         return TestResult::Fail("monotonic vector allocation broken");
     }
-    if t.free() != 2 { return TestResult::Fail("free count not decremented"); }
+    if t.free() != 2 {
+        return TestResult::Fail("free count not decremented");
+    }
 
     if t.alloc_block(2).is_err() {
         return TestResult::Fail("alloc_block(2) rejected a fitting reservation");
@@ -150,7 +161,7 @@ fn smoke_bus_msix_alloc_vector() -> TestResult {
     }
     match t.alloc_block(1) {
         Err(crate::MsixError::TableOverflow) => {}
-        Ok(_)  => return TestResult::Fail("alloc_block past capacity succeeded"),
+        Ok(_) => return TestResult::Fail("alloc_block past capacity succeeded"),
         Err(_) => return TestResult::Fail("wrong error on overflow"),
     }
     TestResult::Pass
@@ -173,7 +184,7 @@ fn smoke_bus_msix_program_vector_out_of_range() -> TestResult {
             let _ = e;
             TestResult::Fail("wrong error from program_vector(out-of-range)")
         }
-        Ok(_)  => TestResult::Fail("program_vector accepted out-of-range index"),
+        Ok(_) => TestResult::Fail("program_vector accepted out-of-range index"),
     }
 }
 kernel_test_in!("bus", smoke_bus_msix_program_vector_out_of_range);
@@ -182,13 +193,14 @@ kernel_test_in!("bus", smoke_bus_msix_program_vector_out_of_range);
 fn smoke_bus_bar_read_on_q35() -> TestResult {
     // Walk the q35 ECAM, find some device, and exercise read_bar
     // against BAR 0.
-    use crate::{devices, read_bar, BarError, BusKind};
     use crate::x86_64::ECAM_DEFAULT_BASE;
+    use crate::{devices, read_bar, BarError, BusKind};
     // SAFETY: ECAM is identity-mapped; idempotent re-init.
     let _ = unsafe { crate::init(ECAM_DEFAULT_BASE) };
 
     let devs = devices();
-    let pcie: alloc::vec::Vec<_> = devs.iter()
+    let pcie: alloc::vec::Vec<_> = devs
+        .iter()
         .filter(|d| matches!(d.kind, BusKind::Pcie { .. }))
         .collect();
     if pcie.is_empty() {
@@ -237,26 +249,27 @@ fn smoke_bus_msix_enable_on_virtio() -> TestResult {
     // virtio-mmio transports have no PCIe capability list. `enable_msix`
     // must reject them cleanly with `NotPcie`.
     use crate::{
-        bootstrap_registry_authority, claim_device_cap, devices, enable_msix,
-        BusKind, MsixError,
+        bootstrap_registry_authority, claim_device_cap, devices, enable_msix, BusKind, MsixError,
     };
     // SAFETY: aarch64 enumerator falls back to the QEMU virt slot layout.
     let _ = unsafe { crate::init(None) };
     let devs = devices();
-    let virtio = devs.iter().find(|d| matches!(d.kind, BusKind::VirtioMmio { .. }));
+    let virtio = devs
+        .iter()
+        .find(|d| matches!(d.kind, BusKind::VirtioMmio { .. }));
     let Some(dev) = virtio else {
         return TestResult::Skip("no virtio-mmio device in this flavour");
     };
 
     let authority = bootstrap_registry_authority();
     let (_handle, dev_cap) = match claim_device_cap(&authority, dev.addr) {
-        Ok(ok)  => ok,
-        Err(_)  => return TestResult::Fail("claim_device_cap on a live address failed"),
+        Ok(ok) => ok,
+        Err(_) => return TestResult::Fail("claim_device_cap on a live address failed"),
     };
     match enable_msix(&dev_cap, dev) {
         Err(MsixError::NotPcie) => TestResult::Pass,
         Err(_) => TestResult::Fail("wrong error on virtio-mmio"),
-        Ok(_)  => TestResult::Fail("enable_msix accepted a virtio-mmio device"),
+        Ok(_) => TestResult::Fail("enable_msix accepted a virtio-mmio device"),
     }
 }
 #[cfg(target_arch = "aarch64")]
@@ -265,17 +278,19 @@ kernel_test_in!("bus", smoke_bus_msix_enable_on_virtio);
 fn smoke_bus_hotplug_listener_roundtrip() -> TestResult {
     // Register a listener, dispatch an Attach + Detach, confirm the
     // listener's atomic advanced to 2.
-    use alloc::sync::Arc;
-    use core::sync::atomic::{AtomicUsize, Ordering};
     use crate::hotplug::__clear_listeners;
     use crate::{
         bootstrap_registry_authority, dispatch_event, register_listener, BusAddr, DeviceId,
         HotplugEvent, HotplugListener, PcieAddr,
     };
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicUsize, Ordering};
 
     __clear_listeners();
 
-    struct Counter { hits: AtomicUsize }
+    struct Counter {
+        hits: AtomicUsize,
+    }
     impl HotplugListener for Counter {
         fn on_event(&self, _ev: HotplugEvent) {
             self.hits.fetch_add(1, Ordering::Relaxed);
@@ -283,7 +298,9 @@ fn smoke_bus_hotplug_listener_roundtrip() -> TestResult {
     }
 
     let authority = bootstrap_registry_authority();
-    let counter = Arc::new(Counter { hits: AtomicUsize::new(0) });
+    let counter = Arc::new(Counter {
+        hits: AtomicUsize::new(0),
+    });
     if register_listener(&authority, counter.clone()).is_err() {
         return TestResult::Fail("register_listener rejected a live authority");
     }
@@ -291,7 +308,11 @@ fn smoke_bus_hotplug_listener_roundtrip() -> TestResult {
     let addr = BusAddr::Pcie(PcieAddr::new(0, 0, 1, 0));
     dispatch_event(HotplugEvent::Attach {
         addr,
-        device_id: DeviceId { vendor: 0x1af4, device: 0x1001, class: 0 },
+        device_id: DeviceId {
+            vendor: 0x1af4,
+            device: 0x1001,
+            class: 0,
+        },
     });
     dispatch_event(HotplugEvent::Detach { addr });
 
@@ -306,12 +327,12 @@ kernel_test_in!("bus", smoke_bus_hotplug_listener_roundtrip);
 fn smoke_bus_hotplug_revoked_authority() -> TestResult {
     // Revoking the authority before `register_listener` must fail with
     // AuthorityRevoked.
-    use alloc::sync::Arc;
     use crate::hotplug::__clear_listeners;
     use crate::{
         bootstrap_registry_authority, register_listener, HotplugError, HotplugEvent,
         HotplugListener,
     };
+    use alloc::sync::Arc;
 
     __clear_listeners();
 
@@ -359,10 +380,8 @@ fn smoke_bus_iommu_group_default() -> TestResult {
 kernel_test_in!("bus", smoke_bus_iommu_group_default);
 
 fn smoke_bus_acpi_notify_dispatch() -> TestResult {
+    use crate::acpi_notify::{self, AcpiNotify, NotifyEvent, NotifyKind};
     use core::sync::atomic::{AtomicU32, Ordering};
-    use crate::acpi_notify::{
-        self, AcpiNotify, NotifyEvent, NotifyKind,
-    };
     use narf_capabilities::{Cap, Grant};
 
     acpi_notify::__test_reset();
@@ -376,7 +395,9 @@ fn smoke_bus_acpi_notify_dispatch() -> TestResult {
         if matches!(ev.kind, NotifyKind::Thermal) {
             HITS.fetch_add(1, Ordering::Relaxed);
         }
-    }).is_err() {
+    })
+    .is_err()
+    {
         return TestResult::Fail("subscribe failed on live cap");
     }
 
@@ -412,17 +433,15 @@ kernel_test_in!("bus", smoke_bus_acpi_notify_dispatch);
 fn smoke_pci_command_bme_round_trip() -> TestResult {
     // Sets MEM_SPACE | BUS_MASTER on the QEMU NVMe device and reads
     // the command register back.
-    use crate::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
     use crate::pci::{cmd, read_command, set_command};
     use crate::x86_64::ECAM_DEFAULT_BASE;
+    use crate::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
     // SAFETY: ECAM identity-mapped; init idempotent.
     let _ = unsafe { crate::init(ECAM_DEFAULT_BASE) };
 
     let devs = devices();
     let nvme_dev = devs.iter().find(|d| {
-        matches!(d.kind, BusKind::Pcie { .. })
-            && d.id.vendor == 0x1B36
-            && d.id.device == 0x0010
+        matches!(d.kind, BusKind::Pcie { .. }) && d.id.vendor == 0x1B36 && d.id.device == 0x0010
     });
     let Some(dev) = nvme_dev.copied() else {
         return TestResult::Skip("no QEMU NVMe controller");
@@ -430,20 +449,20 @@ fn smoke_pci_command_bme_round_trip() -> TestResult {
 
     let authority = bootstrap_registry_authority();
     let (_h, cap) = match claim_device_cap(&authority, dev.addr) {
-        Ok(ok)  => ok,
-        Err(_)  => return TestResult::Fail("claim_device_cap failed"),
+        Ok(ok) => ok,
+        Err(_) => return TestResult::Fail("claim_device_cap failed"),
     };
 
     let bits = cmd::MEM_SPACE | cmd::BUS_MASTER;
     let new = match set_command(&cap, &dev, bits) {
-        Ok(v)  => v,
+        Ok(v) => v,
         Err(_) => return TestResult::Fail("set_command failed"),
     };
     if (new & bits) != bits {
         return TestResult::Fail("set_command did not OR the requested bits");
     }
     let readback = match read_command(&cap, &dev) {
-        Ok(v)  => v,
+        Ok(v) => v,
         Err(_) => return TestResult::Fail("read_command failed"),
     };
     if (readback & bits) != bits {
@@ -458,11 +477,16 @@ kernel_test_in!("bus", smoke_pci_command_bme_round_trip);
 fn smoke_pci_match_specificity() -> TestResult {
     // Specificity rules: VendorDevice > Class > Vendor.
     use crate::MatchKind;
-    let vd = MatchKind::VendorDevice { vendor: 0x1B36, device: 0x0010 };
-    let cls = MatchKind::Class { class: 0x01, mask: 0xFF };
-    let v   = MatchKind::Vendor { vendor: 0x1B36 };
-    if vd.specificity() <= cls.specificity()
-        || cls.specificity() <= v.specificity() {
+    let vd = MatchKind::VendorDevice {
+        vendor: 0x1B36,
+        device: 0x0010,
+    };
+    let cls = MatchKind::Class {
+        class: 0x01,
+        mask: 0xFF,
+    };
+    let v = MatchKind::Vendor { vendor: 0x1B36 };
+    if vd.specificity() <= cls.specificity() || cls.specificity() <= v.specificity() {
         return TestResult::Fail("specificity ordering broken");
     }
     TestResult::Pass
@@ -480,30 +504,37 @@ fn smoke_pci_cap_ext_walker() -> TestResult {
     // The PCIe extended cap list lives at offset 0x100. QEMU NVMe
     // generally doesn't expose AER, but the walker must terminate
     // cleanly on an empty list (header reads 0 or 0xFFFF_FFFF).
-    use crate::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
     use crate::pci_cap_ext::iter as ext_iter;
     use crate::x86_64::ECAM_DEFAULT_BASE;
+    use crate::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
     let _ = unsafe { crate::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
-    let nvme = devs.iter().find(|d|
-        matches!(&d.kind, BusKind::Pcie { .. })
-        && d.id.vendor == 0x1B36 && d.id.device == 0x0010);
-    let Some(d) = nvme.copied() else { return TestResult::Skip("no QEMU NVMe"); };
+    let nvme = devs.iter().find(|d| {
+        matches!(&d.kind, BusKind::Pcie { .. }) && d.id.vendor == 0x1B36 && d.id.device == 0x0010
+    });
+    let Some(d) = nvme.copied() else {
+        return TestResult::Skip("no QEMU NVMe");
+    };
     let authority = bootstrap_registry_authority();
     let (_h, cap) = match claim_device_cap(&authority, d.addr) {
         Ok(ok) => ok,
         Err(_) => return TestResult::Fail("claim"),
     };
     let read_cap = match cap.derive() {
-        Ok(c)  => c,
+        Ok(c) => c,
         Err(_) => return TestResult::Fail("derive"),
     };
     let it = match ext_iter(&read_cap, &d) {
-        Ok(i)  => i,
+        Ok(i) => i,
         Err(_) => return TestResult::Fail("ext iter"),
     };
     let mut count = 0;
-    for _ in it { count += 1; if count > 256 { return TestResult::Fail("walker did not terminate"); } }
+    for _ in it {
+        count += 1;
+        if count > 256 {
+            return TestResult::Fail("walker did not terminate");
+        }
+    }
     let _ = count;
     TestResult::Pass
 }

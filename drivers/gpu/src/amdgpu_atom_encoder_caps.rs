@@ -40,12 +40,12 @@ pub enum EncoderCapError {
 }
 
 /// Discriminator for a record TLV.
-pub const ATOM_RECORD_TYPE_HPD_INT_ID:           u8 = 0x01;
-pub const ATOM_RECORD_TYPE_I2C_ID:               u8 = 0x02;
-pub const ATOM_RECORD_TYPE_CONNECTOR_DEVICE:     u8 = 0x05;
-pub const ATOM_RECORD_TYPE_ENCODER_CAP:          u8 = 0x06;
-pub const ATOM_RECORD_TYPE_DP_CONN_CHANNEL_MAP:  u8 = 0x09;
-pub const ATOM_RECORD_TYPE_END:                  u8 = 0xFF;
+pub const ATOM_RECORD_TYPE_HPD_INT_ID: u8 = 0x01;
+pub const ATOM_RECORD_TYPE_I2C_ID: u8 = 0x02;
+pub const ATOM_RECORD_TYPE_CONNECTOR_DEVICE: u8 = 0x05;
+pub const ATOM_RECORD_TYPE_ENCODER_CAP: u8 = 0x06;
+pub const ATOM_RECORD_TYPE_DP_CONN_CHANNEL_MAP: u8 = 0x09;
+pub const ATOM_RECORD_TYPE_END: u8 = 0xFF;
 
 /// Decoded `ATOM_ENCODER_CAP_RECORD` payload. `usEncoderCap` is
 /// a 16-bit bitmap; we surface decoded booleans for the fields
@@ -56,19 +56,29 @@ pub struct EncoderCaps {
 }
 
 impl EncoderCaps {
-    pub fn supports_hbr2(self) -> bool { self.raw_caps & (1 << 0) != 0 }
-    pub fn supports_hbr3(self) -> bool { self.raw_caps & (1 << 1) != 0 }
-    pub fn supports_dp_8b10b_loopback(self) -> bool { self.raw_caps & (1 << 2) != 0 }
+    pub fn supports_hbr2(self) -> bool {
+        self.raw_caps & (1 << 0) != 0
+    }
+    pub fn supports_hbr3(self) -> bool {
+        self.raw_caps & (1 << 1) != 0
+    }
+    pub fn supports_dp_8b10b_loopback(self) -> bool {
+        self.raw_caps & (1 << 2) != 0
+    }
     /// 1 → encoder can drive 10-bit per channel HDR.
-    pub fn supports_10bpc(self) -> bool { self.raw_caps & (1 << 3) != 0 }
+    pub fn supports_10bpc(self) -> bool {
+        self.raw_caps & (1 << 3) != 0
+    }
     /// 1 → encoder supports YCbCr 4:2:0 sub-sampling.
-    pub fn supports_ycbcr420(self) -> bool { self.raw_caps & (1 << 4) != 0 }
+    pub fn supports_ycbcr420(self) -> bool {
+        self.raw_caps & (1 << 4) != 0
+    }
 }
 
 /// One TLV record from a path's record tail.
 #[derive(Copy, Clone)]
 pub struct Record<'a> {
-    pub kind:    u8,
+    pub kind: u8,
     pub payload: &'a [u8],
 }
 
@@ -76,7 +86,7 @@ impl<'a> fmt::Debug for Record<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Record")
             .field("kind", &self.kind)
-            .field("len",  &self.payload.len())
+            .field("len", &self.payload.len())
             .finish()
     }
 }
@@ -100,12 +110,20 @@ impl<'a> RecordIter<'a> {
 impl<'a> Iterator for RecordIter<'a> {
     type Item = Record<'a>;
     fn next(&mut self) -> Option<Record<'a>> {
-        if self.cursor + 2 > self.raw.len() { return None; }
+        if self.cursor + 2 > self.raw.len() {
+            return None;
+        }
         let kind = self.raw[self.cursor];
         let size = self.raw[self.cursor + 1] as usize;
-        if kind == ATOM_RECORD_TYPE_END { return None; }
-        if size < 2 { return None; }
-        if self.cursor + size > self.raw.len() { return None; }
+        if kind == ATOM_RECORD_TYPE_END {
+            return None;
+        }
+        if size < 2 {
+            return None;
+        }
+        if self.cursor + size > self.raw.len() {
+            return None;
+        }
         let payload = &self.raw[self.cursor + 2..self.cursor + size];
         self.cursor += size;
         Some(Record { kind, payload })
@@ -116,16 +134,16 @@ impl<'a> Iterator for RecordIter<'a> {
 /// the TLV header). The record carries `usEncoderCap` (u16) at
 /// offset 0; some revisions add a u8 caps_extension at offset 2.
 pub fn decode_encoder_caps(payload: &[u8]) -> Result<EncoderCaps, EncoderCapError> {
-    if payload.len() < 2 { return Err(EncoderCapError::Truncated); }
+    if payload.len() < 2 {
+        return Err(EncoderCapError::Truncated);
+    }
     let raw_caps = u16::from_le_bytes([payload[0], payload[1]]);
     Ok(EncoderCaps { raw_caps })
 }
 
 /// Find + decode the first `ATOM_ENCODER_CAP_RECORD` in `tail`.
 /// Returns `Ok(None)` when the path has no encoder-cap record.
-pub fn find_encoder_caps(tail: &[u8])
-    -> Result<Option<EncoderCaps>, EncoderCapError>
-{
+pub fn find_encoder_caps(tail: &[u8]) -> Result<Option<EncoderCaps>, EncoderCapError> {
     for r in RecordIter::new(tail) {
         if r.kind == ATOM_RECORD_TYPE_ENCODER_CAP {
             return Ok(Some(decode_encoder_caps(r.payload)?));

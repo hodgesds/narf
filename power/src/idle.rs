@@ -13,13 +13,13 @@ use narf_arch::x86_64::cpuid::cpuid;
 
 #[derive(Copy, Clone, Debug, Default)]
 pub struct MwaitCaps {
-    pub supported:       bool,
+    pub supported: bool,
     pub interrupt_break: bool,
     /// CPUID(5).EDX as-is — sub-state count nibbles per C-state.
-    pub sub_states:      u32,
+    pub sub_states: u32,
     /// Architectural C-states the CPU supports (capped at 8 for
     /// the C0..C7 nibble layout in CPUID(5).EDX).
-    pub max_cstate:      u8,
+    pub max_cstate: u8,
 }
 
 fn probe() -> MwaitCaps {
@@ -57,10 +57,10 @@ static SUPPORTED: AtomicU8 = AtomicU8::new(0);
 pub fn caps() -> MwaitCaps {
     if CAPS_RAW.load(Ordering::Acquire) != 0xFF {
         return MwaitCaps {
-            supported:       SUPPORTED.load(Ordering::Acquire) != 0,
+            supported: SUPPORTED.load(Ordering::Acquire) != 0,
             interrupt_break: CAPS_RAW.load(Ordering::Acquire) & 1 != 0,
-            sub_states:      0,  // Not cached; CPUID is fast enough.
-            max_cstate:      MAX_DEPTH.load(Ordering::Acquire),
+            sub_states: 0, // Not cached; CPUID is fast enough.
+            max_cstate: MAX_DEPTH.load(Ordering::Acquire),
         };
     }
     let c = probe();
@@ -75,13 +75,13 @@ pub fn caps() -> MwaitCaps {
 /// C6=0x40, C7=0x50).
 pub const fn encode_cstate(depth: u8) -> u32 {
     match depth {
-        0 => 0x00,                 // C0 (active) — won't be passed
-        1 => 0x00,                 // C1
-        2 => 0x10,                 // C2
-        3 => 0x20,                 // C3
-        4 => 0x30,                 // C4
-        6 => 0x40,                 // C6
-        7 => 0x50,                 // C7
+        0 => 0x00, // C0 (active) — won't be passed
+        1 => 0x00, // C1
+        2 => 0x10, // C2
+        3 => 0x20, // C3
+        4 => 0x30, // C4
+        6 => 0x40, // C6
+        7 => 0x50, // C7
         _ => 0x00,
     }
 }
@@ -95,7 +95,7 @@ pub unsafe fn mwait(depth: u8) {
     static IDLE_DUMMY: AtomicU8 = AtomicU8::new(0);
     let addr = IDLE_DUMMY.as_ptr() as u64;
     let hint = encode_cstate(depth);
-    let ext  = caps().interrupt_break as u32;
+    let ext = caps().interrupt_break as u32;
     // SAFETY: caller-asserted.
     unsafe {
         core::arch::asm!(
@@ -124,7 +124,9 @@ pub unsafe fn idle() {
     let c = caps();
     if c.supported && c.max_cstate > 0 {
         // SAFETY: caller-asserted; caps() validated.
-        unsafe { mwait(c.max_cstate); }
+        unsafe {
+            mwait(c.max_cstate);
+        }
     } else {
         // SAFETY: STI;HLT canonical idle pair.
         unsafe {

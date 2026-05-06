@@ -38,17 +38,24 @@ use crate::x86_64::io_port::{inb, outb};
 /// Input clock frequency in Hz.
 pub const PIT_INPUT_HZ: u32 = 1_193_182;
 
-const PIT_CH0:  u16 = 0x40;
-const PIT_CH2:  u16 = 0x42;
+const PIT_CH0: u16 = 0x40;
+const PIT_CH2: u16 = 0x42;
 const PIT_CTRL: u16 = 0x43;
 
 const PPI_PORT: u16 = 0x61;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Channel { Ch0 = 0, Ch2 = 2 }
+pub enum Channel {
+    Ch0 = 0,
+    Ch2 = 2,
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Mode { OneShot = 0, RateGenerator = 2, SquareWave = 3 }
+pub enum Mode {
+    OneShot = 0,
+    RateGenerator = 2,
+    SquareWave = 3,
+}
 
 fn ctrl_byte(ch: Channel, mode: Mode) -> u8 {
     // bits[7:6] = channel, bits[5:4] = access mode (0b11 = lo/hi
@@ -65,9 +72,12 @@ pub unsafe fn program(ch: Channel, mode: Mode, count: u16) {
     // SAFETY: caller-asserted.
     unsafe {
         outb(PIT_CTRL, ctrl_byte(ch, mode));
-        let port = match ch { Channel::Ch0 => PIT_CH0, Channel::Ch2 => PIT_CH2 };
+        let port = match ch {
+            Channel::Ch0 => PIT_CH0,
+            Channel::Ch2 => PIT_CH2,
+        };
         outb(port, (count & 0xFF) as u8);
-        outb(port, (count >> 8)   as u8);
+        outb(port, (count >> 8) as u8);
     }
 }
 
@@ -117,7 +127,9 @@ pub unsafe fn wait_ch2_done() -> bool {
     for _ in 0..100_000_000u32 {
         // SAFETY: caller-asserted.
         let v = unsafe { inb(PPI_PORT) };
-        if v & 0x20 != 0 { return true; }   // Bit 5 = TIMER 2 OUT.
+        if v & 0x20 != 0 {
+            return true;
+        } // Bit 5 = TIMER 2 OUT.
         core::hint::spin_loop();
     }
     false

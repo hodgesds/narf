@@ -35,14 +35,20 @@ static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 fn from_cpuid_15h() -> Option<u64> {
     // SAFETY: CPUID 0 is always defined.
     let max = unsafe { cpuid(0, 0).0 };
-    if max < 0x15 { return None; }
+    if max < 0x15 {
+        return None;
+    }
     // SAFETY: leaf 0x15 is defined when max >= 0x15.
     let (eax, ebx, ecx, _) = unsafe { cpuid(0x15, 0) };
-    if eax == 0 || ebx == 0 || ecx == 0 { return None; }
+    if eax == 0 || ebx == 0 || ecx == 0 {
+        return None;
+    }
     // tsc_hz = (numerator / denominator) * crystal_hz
     //         = ebx * ecx / eax (operate as u128 to avoid overflow).
     let tsc = (ebx as u128) * (ecx as u128) / (eax as u128);
-    if tsc == 0 || tsc > u64::MAX as u128 { return None; }
+    if tsc == 0 || tsc > u64::MAX as u128 {
+        return None;
+    }
     Some(tsc as u64)
 }
 
@@ -50,11 +56,15 @@ fn from_cpuid_15h() -> Option<u64> {
 fn from_cpuid_16h() -> Option<u64> {
     // SAFETY: same.
     let max = unsafe { cpuid(0, 0).0 };
-    if max < 0x16 { return None; }
+    if max < 0x16 {
+        return None;
+    }
     // SAFETY: leaf 0x16 defined when max >= 0x16.
     let (eax, _, _, _) = unsafe { cpuid(0x16, 0) };
     let mhz = eax & 0xFFFF;
-    if mhz == 0 { return None; }
+    if mhz == 0 {
+        return None;
+    }
     Some((mhz as u64) * 1_000_000)
 }
 
@@ -96,7 +106,9 @@ pub fn rdtsc() -> u64 {
 /// (older / virtualised CPUs).
 pub fn calibrate_via_cpuid() -> u64 {
     let cur = TSC_HZ.load(Ordering::Acquire);
-    if cur != 0 { return cur; }
+    if cur != 0 {
+        return cur;
+    }
     if let Some(hz) = from_cpuid_15h() {
         TSC_HZ.store(hz, Ordering::Release);
         return hz;
@@ -114,19 +126,27 @@ pub fn calibrate_via_cpuid() -> u64 {
 /// after a short busy-wait, reads TSC similarly, computes the
 /// ratio, and calls this with the resulting Hz.
 pub fn set_hz_via_hpet(hz: u64) {
-    if hz != 0 { TSC_HZ.store(hz, Ordering::Release); }
+    if hz != 0 {
+        TSC_HZ.store(hz, Ordering::Release);
+    }
 }
 
 /// Last cached TSC frequency in Hz. 0 means uncalibrated.
-pub fn frequency_hz() -> u64 { TSC_HZ.load(Ordering::Acquire) }
+pub fn frequency_hz() -> u64 {
+    TSC_HZ.load(Ordering::Acquire)
+}
 
 /// Convert TSC ticks to nanoseconds. 0 if uncalibrated.
 pub fn ticks_to_nanos(ticks: u64) -> u64 {
     let hz = frequency_hz();
-    if hz == 0 { return 0; }
+    if hz == 0 {
+        return 0;
+    }
     // ns = ticks * 1e9 / hz; widen to u128 to avoid overflow.
     ((ticks as u128) * 1_000_000_000 / hz as u128) as u64
 }
 
 #[doc(hidden)]
-pub fn __reset_for_test() { TSC_HZ.store(0, Ordering::Release); }
+pub fn __reset_for_test() {
+    TSC_HZ.store(0, Ordering::Release);
+}

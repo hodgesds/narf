@@ -25,10 +25,10 @@ pub fn caps() -> u8 {
     ((id_aa64pfr1() >> 44) & 0xF) as u8
 }
 
-const GCSCR_PCRSEL:  u64 = 1 << 0;
+const GCSCR_PCRSEL: u64 = 1 << 0;
 const GCSCR_RVCHKEN: u64 = 1 << 1;
-const GCSCR_EX:      u64 = 1 << 2;
-const GCSCR_STREN:   u64 = 1 << 3;
+const GCSCR_EX: u64 = 1 << 2;
+const GCSCR_STREN: u64 = 1 << 3;
 
 fn read_gcscr_el1() -> u64 {
     let v: u64;
@@ -79,8 +79,12 @@ fn write_gcscre0_el1(v: u64) {
 /// allocated + `GCSPR_EL1` programmed.
 pub unsafe fn enable_el1(rvcheck: bool, exception_push: bool) {
     let mut v = read_gcscr_el1() | GCSCR_PCRSEL | GCSCR_STREN;
-    if rvcheck        { v |= GCSCR_RVCHKEN; }
-    if exception_push { v |= GCSCR_EX; }
+    if rvcheck {
+        v |= GCSCR_RVCHKEN;
+    }
+    if exception_push {
+        v |= GCSCR_EX;
+    }
     write_gcscr_el1(v);
 }
 
@@ -91,7 +95,9 @@ pub unsafe fn enable_el1(rvcheck: bool, exception_push: bool) {
 /// for the current task.
 pub unsafe fn enable_el0(rvcheck: bool) {
     let mut v = read_gcscre0_el1() | GCSCR_PCRSEL | GCSCR_STREN;
-    if rvcheck { v |= GCSCR_RVCHKEN; }
+    if rvcheck {
+        v |= GCSCR_RVCHKEN;
+    }
     write_gcscre0_el1(v);
 }
 

@@ -36,10 +36,8 @@ pub use aarch64::{ioremap, mmu, paging};
 
 pub use addr::{PhysAddr, VirtAddr};
 pub use frame::{
-    alloc_frame, alloc_frame_anywhere, alloc_frame_on, free_frame,
-    init_from_map, is_numa_aware, node_free, rebalance_to_topology,
-    stats as frame_stats,
-    FrameAllocError, FrameStats, PhysFrame, UsableRegion,
-    MAX_NUMA_NODES as FRAME_MAX_NUMA_NODES, PAGE_SHIFT, PAGE_SIZE,
+    alloc_frame, alloc_frame_anywhere, alloc_frame_on, free_frame, init_from_map, is_numa_aware,
+    node_free, rebalance_to_topology, stats as frame_stats, FrameAllocError, FrameStats, PhysFrame,
+    UsableRegion, MAX_NUMA_NODES as FRAME_MAX_NUMA_NODES, PAGE_SHIFT, PAGE_SIZE,
 };
 pub use heap::BumpAllocator;

@@ -22,7 +22,9 @@ use crate::x86_64::cpuid::cpuid;
 pub fn supported() -> bool {
     // SAFETY: leaf 0 always defined.
     let max = unsafe { cpuid(0, 0).0 };
-    if max < 7 { return false; }
+    if max < 7 {
+        return false;
+    }
     // SAFETY: leaf 7 valid.
     let (_, _, ecx, _) = unsafe { cpuid(7, 0) };
     ecx & (1 << 23) != 0
@@ -36,12 +38,14 @@ pub fn supported() -> bool {
 /// | 2   | KL wide (KeyLocker wide-instruction subset)|
 /// | 3   | KL with hardware key support               |
 pub fn caps() -> u32 {
-    if !supported() { return 0; }
+    if !supported() {
+        return 0;
+    }
     // SAFETY: leaf 0x19 valid when bit 23 of CPUID(7).ECX is set.
     let (eax, _, _, _) = unsafe { cpuid(0x19, 0) };
     eax
 }
 
-pub const KL_AES_KLE:        u32 = 1 << 0;
-pub const KL_WIDE:           u32 = 1 << 2;
-pub const KL_HARDWARE_KEY:   u32 = 1 << 3;
+pub const KL_AES_KLE: u32 = 1 << 0;
+pub const KL_WIDE: u32 = 1 << 2;
+pub const KL_HARDWARE_KEY: u32 = 1 << 3;

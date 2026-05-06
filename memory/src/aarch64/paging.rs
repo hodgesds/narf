@@ -23,38 +23,43 @@ impl core::fmt::Debug for PageTableEntry {
 pub struct PtFlags(u64);
 
 impl PtFlags {
-    pub const VALID:        Self = Self(1 << 0);
+    pub const VALID: Self = Self(1 << 0);
     /// Bit 1 is 1 for Table (L0-L2) or Page (L3), 0 for Block (L1-L2).
-    pub const TYPE_TABLE:   Self = Self(1 << 1);
-    pub const TYPE_PAGE:    Self = Self(1 << 1);
+    pub const TYPE_TABLE: Self = Self(1 << 1);
+    pub const TYPE_PAGE: Self = Self(1 << 1);
 
     /// Access Permissions: 00=RW EL1, 01=RW EL1/EL0, 10=RO EL1, 11=RO EL1/EL0.
-    pub const AP_RW_EL1:    Self = Self(0b00 << 6);
-    pub const AP_RO_EL1:    Self = Self(0b10 << 6);
+    pub const AP_RW_EL1: Self = Self(0b00 << 6);
+    pub const AP_RO_EL1: Self = Self(0b10 << 6);
 
     /// Shareability: 10=Outer, 11=Inner.
-    pub const SH_INNER:     Self = Self(0b11 << 8);
+    pub const SH_INNER: Self = Self(0b11 << 8);
 
     /// Access Flag: must be 1 to avoid Access Flag faults.
-    pub const AF:           Self = Self(1 << 10);
+    pub const AF: Self = Self(1 << 10);
 
     /// MAIR attribute index (bits 4:2).
-    pub const ATTR_NORMAL:  Self = Self(0 << 2);  // Index 0 in MAIR
-    pub const ATTR_TAGGED:  Self = Self(1 << 2);  // Index 1 in MAIR
-    pub const ATTR_DEVICE:  Self = Self(2 << 2);  // Index 2 in MAIR
+    pub const ATTR_NORMAL: Self = Self(0 << 2); // Index 0 in MAIR
+    pub const ATTR_TAGGED: Self = Self(1 << 2); // Index 1 in MAIR
+    pub const ATTR_DEVICE: Self = Self(2 << 2); // Index 2 in MAIR
 
     /// Execute-never bits.
-    pub const UXN:          Self = Self(1 << 54);
-    pub const PXN:          Self = Self(1 << 53);
+    pub const UXN: Self = Self(1 << 54);
+    pub const PXN: Self = Self(1 << 53);
 
-    pub const EMPTY:        Self = Self(0);
+    pub const EMPTY: Self = Self(0);
 
-    #[inline] pub const fn bits(self) -> u64 { self.0 }
+    #[inline]
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
 }
 
 impl core::ops::BitOr for PtFlags {
     type Output = Self;
-    fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) }
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
 }
 
 impl PageTableEntry {
@@ -66,8 +71,12 @@ impl PageTableEntry {
         Self((addr.raw() & 0x0000_FFFF_FFFF_F000) | flags.bits())
     }
 
-    #[inline] pub const fn is_valid(self) -> bool { self.0 & 1 == 1 }
-    #[inline] pub const fn addr(self) -> PhysAddr {
+    #[inline]
+    pub const fn is_valid(self) -> bool {
+        self.0 & 1 == 1
+    }
+    #[inline]
+    pub const fn addr(self) -> PhysAddr {
         PhysAddr::new(self.0 & 0x0000_FFFF_FFFF_F000)
     }
 }
@@ -89,13 +98,17 @@ impl core::fmt::Debug for PageTable {
 
 impl PageTable {
     pub fn zero_at(ptr: *mut PageTable) {
-        unsafe { ptr::write_bytes(ptr.cast::<u8>(), 0, core::mem::size_of::<PageTable>()); }
+        unsafe {
+            ptr::write_bytes(ptr.cast::<u8>(), 0, core::mem::size_of::<PageTable>());
+        }
     }
 }
 
 /// Write a value to physical memory using identity-mapped access.
 pub unsafe fn write_identity<T>(phys: PhysAddr, value: T) {
-    unsafe { ptr::write_volatile(phys.raw() as *mut T, value); }
+    unsafe {
+        ptr::write_volatile(phys.raw() as *mut T, value);
+    }
 }
 
 use crate::VirtAddr;
@@ -228,7 +241,7 @@ pub enum MapError {
 /// output identity-mapped (standard NARF boot state).
 pub unsafe fn new_user_ttbr0() -> Result<PhysAddr, PageTableAllocError> {
     let frame = crate::frame::alloc_frame().map_err(|_| PageTableAllocError::NoFrame)?;
-    let phys  = frame.start_address();
+    let phys = frame.start_address();
     // SAFETY: frame is identity-mapped per the allocator's
     // contract; 4 KiB write is aligned.
     unsafe {
@@ -278,7 +291,7 @@ unsafe fn ensure_next_table(entry: &mut PageTableEntry) -> Result<PhysAddr, MapE
         return Ok(entry.addr());
     }
     let frame = crate::frame::alloc_frame().map_err(|_| MapError::NoFrame)?;
-    let next  = frame.start_address();
+    let next = frame.start_address();
     // Zero the new table.
     // SAFETY: identity-mapped frame.
     unsafe {
@@ -302,9 +315,15 @@ pub unsafe fn map_4kb(
     phys: PhysAddr,
     flags: PtFlags,
 ) -> Result<(), MapError> {
-    if !is_canonical(virt)     { return Err(MapError::NonCanonical); }
-    if virt.as_u64() & 0xFFF != 0 { return Err(MapError::UnalignedVirt); }
-    if phys.raw()    & 0xFFF != 0 { return Err(MapError::UnalignedPhys); }
+    if !is_canonical(virt) {
+        return Err(MapError::NonCanonical);
+    }
+    if virt.as_u64() & 0xFFF != 0 {
+        return Err(MapError::UnalignedVirt);
+    }
+    if phys.raw() & 0xFFF != 0 {
+        return Err(MapError::UnalignedPhys);
+    }
 
     let idx = WalkIndices::from_virt(virt);
 
@@ -325,8 +344,11 @@ pub unsafe fn map_4kb(
     // L3 entry for a 4 KiB page: valid + page (low bits = 0b11),
     // AF must be set to avoid Access Flag faults on first touch,
     // inner-shareable + normal memory attr.
-    let base = PtFlags::VALID | PtFlags::TYPE_PAGE
-             | PtFlags::AF | PtFlags::SH_INNER | PtFlags::ATTR_NORMAL;
+    let base = PtFlags::VALID
+        | PtFlags::TYPE_PAGE
+        | PtFlags::AF
+        | PtFlags::SH_INNER
+        | PtFlags::ATTR_NORMAL;
     l3.entries[idx.l3] = PageTableEntry::new(phys, base | flags);
     Ok(())
 }
@@ -339,21 +361,35 @@ pub unsafe fn translate(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {
     // callers hold this invariant.
     let l0 = unsafe { &*(root.raw() as *const PageTable) };
     let e = l0.entries[idx.l0];
-    if !e.is_valid() || (e.0 & 0b11) != 0b11 { return None; }
+    if !e.is_valid() || (e.0 & 0b11) != 0b11 {
+        return None;
+    }
 
     let l1 = unsafe { &*(e.addr().raw() as *const PageTable) };
     let e = l1.entries[idx.l1];
-    if !e.is_valid() { return None; }
-    if (e.0 & 0b11) != 0b11 { /* block at L1 — 1 GiB */ return None; }
+    if !e.is_valid() {
+        return None;
+    }
+    if (e.0 & 0b11) != 0b11 {
+        /* block at L1 — 1 GiB */
+        return None;
+    }
 
     let l2 = unsafe { &*(e.addr().raw() as *const PageTable) };
     let e = l2.entries[idx.l2];
-    if !e.is_valid() { return None; }
-    if (e.0 & 0b11) != 0b11 { /* block at L2 — 2 MiB */ return None; }
+    if !e.is_valid() {
+        return None;
+    }
+    if (e.0 & 0b11) != 0b11 {
+        /* block at L2 — 2 MiB */
+        return None;
+    }
 
     let l3 = unsafe { &*(e.addr().raw() as *const PageTable) };
     let e = l3.entries[idx.l3];
-    if !e.is_valid() { return None; }
+    if !e.is_valid() {
+        return None;
+    }
     Some(e.addr())
 }
 
@@ -363,19 +399,27 @@ pub unsafe fn flags_at(root: PhysAddr, virt: VirtAddr) -> Option<PtFlags> {
     let idx = WalkIndices::from_virt(virt);
     let l0 = unsafe { &*(root.raw() as *const PageTable) };
     let e = l0.entries[idx.l0];
-    if !e.is_valid() || (e.0 & 0b11) != 0b11 { return None; }
+    if !e.is_valid() || (e.0 & 0b11) != 0b11 {
+        return None;
+    }
 
     let l1 = unsafe { &*(e.addr().raw() as *const PageTable) };
     let e = l1.entries[idx.l1];
-    if !e.is_valid() || (e.0 & 0b11) != 0b11 { return None; }
+    if !e.is_valid() || (e.0 & 0b11) != 0b11 {
+        return None;
+    }
 
     let l2 = unsafe { &*(e.addr().raw() as *const PageTable) };
     let e = l2.entries[idx.l2];
-    if !e.is_valid() || (e.0 & 0b11) != 0b11 { return None; }
+    if !e.is_valid() || (e.0 & 0b11) != 0b11 {
+        return None;
+    }
 
     let l3 = unsafe { &*(e.addr().raw() as *const PageTable) };
     let e = l3.entries[idx.l3];
-    if !e.is_valid() { return None; }
+    if !e.is_valid() {
+        return None;
+    }
     // Strip the phys-addr bits; keep the flag bits.
     Some(PtFlags(e.0 & !0x0000_FFFF_FFFF_F000))
 }

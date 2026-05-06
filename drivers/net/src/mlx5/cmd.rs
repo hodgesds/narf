@@ -47,23 +47,23 @@
 pub const CQE_LEN: usize = 64;
 
 /// CQE field offsets.
-pub const CQE_OFF_TYPE:           usize = 0x00;
-pub const CQE_OFF_INPUT_LEN:      usize = 0x04;
-pub const CQE_OFF_INPUT_MB_H:     usize = 0x08;
-pub const CQE_OFF_INPUT_MB_L:     usize = 0x0C;
-pub const CQE_OFF_OPCODE:         usize = 0x10;
-pub const CQE_OFF_OP_MOD_HIGH:    usize = 0x12;
-pub const CQE_OFF_INPUT_MOD:      usize = 0x14;
-pub const CQE_OFF_INPUT_INLINE:   usize = 0x18;
-pub const CQE_OFF_STATUS:         usize = 0x20;
-pub const CQE_OFF_OUTPUT_MOD:     usize = 0x24;
-pub const CQE_OFF_OUTPUT_INLINE:  usize = 0x28;
-pub const CQE_OFF_OUTPUT_MB_H:    usize = 0x30;
-pub const CQE_OFF_OUTPUT_MB_L:    usize = 0x34;
-pub const CQE_OFF_OUTPUT_LEN:     usize = 0x38;
-pub const CQE_OFF_TOKEN:          usize = 0x3C;
-pub const CQE_OFF_SIGNATURE:      usize = 0x3D;
-pub const CQE_OFF_STATUS_OWN:     usize = 0x3F;
+pub const CQE_OFF_TYPE: usize = 0x00;
+pub const CQE_OFF_INPUT_LEN: usize = 0x04;
+pub const CQE_OFF_INPUT_MB_H: usize = 0x08;
+pub const CQE_OFF_INPUT_MB_L: usize = 0x0C;
+pub const CQE_OFF_OPCODE: usize = 0x10;
+pub const CQE_OFF_OP_MOD_HIGH: usize = 0x12;
+pub const CQE_OFF_INPUT_MOD: usize = 0x14;
+pub const CQE_OFF_INPUT_INLINE: usize = 0x18;
+pub const CQE_OFF_STATUS: usize = 0x20;
+pub const CQE_OFF_OUTPUT_MOD: usize = 0x24;
+pub const CQE_OFF_OUTPUT_INLINE: usize = 0x28;
+pub const CQE_OFF_OUTPUT_MB_H: usize = 0x30;
+pub const CQE_OFF_OUTPUT_MB_L: usize = 0x34;
+pub const CQE_OFF_OUTPUT_LEN: usize = 0x38;
+pub const CQE_OFF_TOKEN: usize = 0x3C;
+pub const CQE_OFF_SIGNATURE: usize = 0x3D;
+pub const CQE_OFF_STATUS_OWN: usize = 0x3F;
 
 /// CQE `type` field: mailbox transaction type.
 pub const CQE_TYPE_MAILBOX: u8 = 0x07;
@@ -83,78 +83,78 @@ pub enum CmdOp {
     /// `NOP` — no-op; firmware echoes the response with status 0.
     /// Opcode `0x101`. Useful as the very first command exchanged
     /// after bring-up to confirm the cmd-mailbox transport works.
-    Nop         = 0x101,
+    Nop = 0x101,
     /// `CREATE_EQ` — allocate an Event Queue. Opcode `0x301`. Input
     /// mailbox carries the 256-byte eqc + an 8-byte phys-addr list
     /// for the backing pages.
-    CreateEq    = 0x301,
+    CreateEq = 0x301,
     /// `CREATE_CQ` — allocate a Completion Queue. Opcode `0x400`.
     /// Input mailbox carries the 256-byte cqc + an 8-byte phys-addr
     /// list for the CQE buffer pages.
-    CreateCq    = 0x400,
+    CreateCq = 0x400,
     /// `ALLOC_PD` — allocate a Protection Domain. Opcode `0x800`.
     /// No input data; FW returns the assigned `pd` in
     /// `output_modifier` low 24 bits.
-    AllocPd     = 0x800,
+    AllocPd = 0x800,
     /// `ALLOC_UAR` — allocate a User Access Region page. Opcode
     /// `0x802`. No input data; FW returns the assigned `uar` page
     /// index in `output_modifier` low 24 bits.
-    AllocUar    = 0x802,
+    AllocUar = 0x802,
     /// `CREATE_QP` — create a Queue Pair in the RST state. Opcode
     /// `0x500`. Input mailbox: 512-byte qpc + phys-addr list.
-    CreateQp    = 0x500,
+    CreateQp = 0x500,
     /// `DESTROY_QP` — release a QP. Opcode `0x501`. Input modifier
     /// carries `qpn`.
-    DestroyQp   = 0x501,
+    DestroyQp = 0x501,
     /// `RST2INIT_QP` — RST → INIT state transition. Opcode `0x502`.
-    Rst2InitQp  = 0x502,
+    Rst2InitQp = 0x502,
     /// `INIT2RTR_QP` — INIT → RTR (Ready To Receive). Opcode `0x503`.
-    Init2RtrQp  = 0x503,
+    Init2RtrQp = 0x503,
     /// `RTR2RTS_QP` — RTR → RTS (Ready To Send). Opcode `0x504`.
-    Rtr2RtsQp   = 0x504,
+    Rtr2RtsQp = 0x504,
     /// `2RST_QP` — any state → RST. Opcode `0x50A`.
-    ToRstQp     = 0x50A,
+    ToRstQp = 0x50A,
     /// `QUERY_NIC_VPORT_CONTEXT` — read per-vport NIC state (MAC,
     /// MTU, mtu_cap). Opcode `0x754`.
-    QueryNicVportContext  = 0x754,
+    QueryNicVportContext = 0x754,
     /// `MODIFY_NIC_VPORT_CONTEXT` — write per-vport NIC state.
     /// Opcode `0x755`. Field-mask in `op_mod_high`.
     ModifyNicVportContext = 0x755,
     /// `CREATE_MKEY` — register a memory region. Opcode `0x200`.
     /// Returns mkey_index in low 24 bits of output_modifier;
     /// the full l_key/r_key wraps mkey_index plus a variant byte.
-    CreateMkey  = 0x200,
+    CreateMkey = 0x200,
     /// `DESTROY_MKEY` — release a memory region. Opcode `0x202`.
     DestroyMkey = 0x202,
     /// `CREATE_TIR` — Transport Interface Receive (RX). Opcode
     /// `0x900`. Binds an inline RQ (or RQT for RSS) to an output
     /// channel.
-    CreateTir   = 0x900,
+    CreateTir = 0x900,
     /// `DESTROY_TIR` — Opcode `0x902`.
-    DestroyTir  = 0x902,
+    DestroyTir = 0x902,
     /// `CREATE_TIS` — Transport Interface Send (TX). Opcode
     /// `0x912`.
-    CreateTis   = 0x912,
+    CreateTis = 0x912,
     /// `DESTROY_TIS` — Opcode `0x914`.
-    DestroyTis  = 0x914,
+    DestroyTis = 0x914,
     /// `CREATE_RQT` — Receive Queue Table for RSS. Opcode `0x916`.
-    CreateRqt   = 0x916,
+    CreateRqt = 0x916,
     /// `DESTROY_RQT` — Opcode `0x918`.
-    DestroyRqt  = 0x918,
+    DestroyRqt = 0x918,
     /// `CREATE_FLOW_TABLE` — Opcode `0x930`.
-    CreateFlowTable  = 0x930,
+    CreateFlowTable = 0x930,
     /// `DESTROY_FLOW_TABLE` — Opcode `0x931`.
     DestroyFlowTable = 0x931,
     /// `SET_FLOW_TABLE_ROOT` — Opcode `0x92F`.
     SetFlowTableRoot = 0x92F,
     /// `DESTROY_EQ` — Opcode `0x302`.
-    DestroyEq   = 0x302,
+    DestroyEq = 0x302,
     /// `DESTROY_CQ` — Opcode `0x401`.
-    DestroyCq   = 0x401,
+    DestroyCq = 0x401,
     /// `DEALLOC_PD` — Opcode `0x801`.
-    DeallocPd   = 0x801,
+    DeallocPd = 0x801,
     /// `DEALLOC_UAR` — Opcode `0x803`.
-    DeallocUar  = 0x803,
+    DeallocUar = 0x803,
 }
 
 /// Status codes the firmware writes into byte 0x20 of the CQE.
@@ -215,35 +215,35 @@ pub enum CmdError {
 /// Decoded inline portion of a CQE response.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct CmdResponse {
-    pub status:          CmdStatus,
-    pub syndrome:        u32,
+    pub status: CmdStatus,
+    pub syndrome: u32,
     pub output_modifier: u32,
-    pub inline_output:   [u8; 8],
-    pub token:           u8,
+    pub inline_output: [u8; 8],
+    pub token: u8,
 }
 
 /// Build an inline-mode CQE. The DMA-mailbox pointer fields are left
 /// zero; callers supplying long inputs/outputs use the (Stage-3)
 /// `build_cqe_with_mailboxes` variant.
 pub fn build_cqe_inline(
-    op:             CmdOp,
+    op: CmdOp,
     input_modifier: u32,
-    inline_input:   &[u8],
-    token:          u8,
+    inline_input: &[u8],
+    token: u8,
 ) -> Result<[u8; CQE_LEN], CmdError> {
-    if inline_input.len() > 8 { return Err(CmdError::InlineOverflow); }
+    if inline_input.len() > 8 {
+        return Err(CmdError::InlineOverflow);
+    }
     let mut cqe = [0u8; CQE_LEN];
     cqe[CQE_OFF_TYPE] = CQE_TYPE_MAILBOX;
     // No DMA mailboxes; input_length/output_length stay 0.
-    cqe[CQE_OFF_OPCODE..CQE_OFF_OPCODE + 2]
-        .copy_from_slice(&(op as u16).to_be_bytes());
-    cqe[CQE_OFF_INPUT_MOD..CQE_OFF_INPUT_MOD + 4]
-        .copy_from_slice(&input_modifier.to_be_bytes());
+    cqe[CQE_OFF_OPCODE..CQE_OFF_OPCODE + 2].copy_from_slice(&(op as u16).to_be_bytes());
+    cqe[CQE_OFF_INPUT_MOD..CQE_OFF_INPUT_MOD + 4].copy_from_slice(&input_modifier.to_be_bytes());
     cqe[CQE_OFF_INPUT_INLINE..CQE_OFF_INPUT_INLINE + inline_input.len()]
         .copy_from_slice(inline_input);
-    cqe[CQE_OFF_TOKEN]      = token;
+    cqe[CQE_OFF_TOKEN] = token;
     cqe[CQE_OFF_STATUS_OWN] = STATUS_OWN_BIT;
-    cqe[CQE_OFF_SIGNATURE]  = compute_signature(&cqe);
+    cqe[CQE_OFF_SIGNATURE] = compute_signature(&cqe);
     Ok(cqe)
 }
 
@@ -253,7 +253,9 @@ pub fn build_cqe_inline(
 pub fn compute_signature(cqe: &[u8; CQE_LEN]) -> u8 {
     let mut acc = 0u8;
     for (i, &b) in cqe.iter().enumerate() {
-        if i == CQE_OFF_SIGNATURE { continue; }
+        if i == CQE_OFF_SIGNATURE {
+            continue;
+        }
         acc ^= b;
     }
     acc
@@ -268,11 +270,15 @@ pub fn is_complete(cqe: &[u8; CQE_LEN]) -> bool {
 /// Decode the inline response portion of a completed CQE. Returns
 /// `Err(NotComplete)` if HW still owns the entry.
 pub fn decode_response(cqe: &[u8; CQE_LEN]) -> Result<CmdResponse, CmdError> {
-    if !is_complete(cqe) { return Err(CmdError::NotComplete); }
+    if !is_complete(cqe) {
+        return Err(CmdError::NotComplete);
+    }
     let ty = cqe[CQE_OFF_TYPE];
-    if ty != CQE_TYPE_MAILBOX { return Err(CmdError::BadType(ty)); }
+    if ty != CQE_TYPE_MAILBOX {
+        return Err(CmdError::BadType(ty));
+    }
     let raw_status = cqe[CQE_OFF_STATUS];
-    let status     = CmdStatus::from_raw(raw_status);
+    let status = CmdStatus::from_raw(raw_status);
     // syndrome is a 24-bit BE field at +0x21..+0x24.
     let syn = u32::from_be_bytes([
         0,
@@ -287,13 +293,13 @@ pub fn decode_response(cqe: &[u8; CQE_LEN]) -> Result<CmdResponse, CmdError> {
         cqe[CQE_OFF_OUTPUT_MOD + 3],
     ]);
     let mut inline_out = [0u8; 8];
-    inline_out.copy_from_slice(
-        &cqe[CQE_OFF_OUTPUT_INLINE .. CQE_OFF_OUTPUT_INLINE + 8]);
+    inline_out.copy_from_slice(&cqe[CQE_OFF_OUTPUT_INLINE..CQE_OFF_OUTPUT_INLINE + 8]);
     let resp = CmdResponse {
-        status, syndrome: syn,
+        status,
+        syndrome: syn,
         output_modifier: output_mod,
-        inline_output:   inline_out,
-        token:           cqe[CQE_OFF_TOKEN],
+        inline_output: inline_out,
+        token: cqe[CQE_OFF_TOKEN],
     };
     if !matches!(status, CmdStatus::Ok) {
         return Err(CmdError::FwStatus(status, syn));
@@ -306,12 +312,12 @@ pub fn decode_response(cqe: &[u8; CQE_LEN]) -> Result<CmdResponse, CmdError> {
 /// One mailbox block. PRM §3.5.3 fixes the size at 512 bytes with a
 /// 480-byte payload window followed by chain pointers + per-block
 /// metadata. Blocks chain through the next-pointer at offset 0x1F0.
-pub const MAILBOX_BLOCK_LEN:    usize = 512;
-pub const MAILBOX_PAYLOAD_LEN:  usize = 480;
-pub const MAILBOX_OFF_NEXT_H:   usize = 0x1F0;
-pub const MAILBOX_OFF_NEXT_L:   usize = 0x1F4;
+pub const MAILBOX_BLOCK_LEN: usize = 512;
+pub const MAILBOX_PAYLOAD_LEN: usize = 480;
+pub const MAILBOX_OFF_NEXT_H: usize = 0x1F0;
+pub const MAILBOX_OFF_NEXT_L: usize = 0x1F4;
 pub const MAILBOX_OFF_BLOCK_NUM: usize = 0x1FC;
-pub const MAILBOX_OFF_TOKEN:    usize = 0x1FE;
+pub const MAILBOX_OFF_TOKEN: usize = 0x1FE;
 pub const MAILBOX_OFF_SIGNATURE: usize = 0x1FF;
 
 /// Mailbox blocks must be 512-B-aligned in host phys; the low 9 bits
@@ -324,26 +330,25 @@ pub const MAILBOX_PHYS_ALIGN_MASK: u64 = !0x1FFu64;
 /// blocks (Stage 4); Stage 3 only sends commands whose input + output
 /// fit in 480 bytes each.
 pub fn build_mailbox_block(
-    payload:    &[u8],
-    block_num:  u16,
-    token:      u8,
-    next_phys:  u64,
+    payload: &[u8],
+    block_num: u16,
+    token: u8,
+    next_phys: u64,
 ) -> [u8; MAILBOX_BLOCK_LEN] {
     let mut b = [0u8; MAILBOX_BLOCK_LEN];
     let n = payload.len().min(MAILBOX_PAYLOAD_LEN);
     b[..n].copy_from_slice(&payload[..n]);
     let next_h = (next_phys >> 32) as u32;
     let next_l = (next_phys & 0xFFFF_FFFF) as u32;
-    b[MAILBOX_OFF_NEXT_H..MAILBOX_OFF_NEXT_H + 4]
-        .copy_from_slice(&next_h.to_be_bytes());
-    b[MAILBOX_OFF_NEXT_L..MAILBOX_OFF_NEXT_L + 4]
-        .copy_from_slice(&next_l.to_be_bytes());
-    b[MAILBOX_OFF_BLOCK_NUM..MAILBOX_OFF_BLOCK_NUM + 2]
-        .copy_from_slice(&block_num.to_be_bytes());
+    b[MAILBOX_OFF_NEXT_H..MAILBOX_OFF_NEXT_H + 4].copy_from_slice(&next_h.to_be_bytes());
+    b[MAILBOX_OFF_NEXT_L..MAILBOX_OFF_NEXT_L + 4].copy_from_slice(&next_l.to_be_bytes());
+    b[MAILBOX_OFF_BLOCK_NUM..MAILBOX_OFF_BLOCK_NUM + 2].copy_from_slice(&block_num.to_be_bytes());
     b[MAILBOX_OFF_TOKEN] = token;
     let mut sig = 0u8;
     for (i, &x) in b.iter().enumerate() {
-        if i == MAILBOX_OFF_SIGNATURE { continue; }
+        if i == MAILBOX_OFF_SIGNATURE {
+            continue;
+        }
         sig ^= x;
     }
     b[MAILBOX_OFF_SIGNATURE] = sig;
@@ -355,41 +360,37 @@ pub fn build_mailbox_block(
 /// masked off before encoding so callers passing a misaligned addr
 /// don't silently corrupt the cmdq.
 pub fn build_cqe_with_mailboxes(
-    op:              CmdOp,
-    input_modifier:  u32,
-    input_mb_phys:   u64,
-    input_len:       u32,
-    output_mb_phys:  u64,
-    output_len:      u32,
-    token:           u8,
+    op: CmdOp,
+    input_modifier: u32,
+    input_mb_phys: u64,
+    input_len: u32,
+    output_mb_phys: u64,
+    output_len: u32,
+    token: u8,
 ) -> [u8; CQE_LEN] {
     let mut cqe = [0u8; CQE_LEN];
     cqe[CQE_OFF_TYPE] = CQE_TYPE_MAILBOX;
 
-    cqe[CQE_OFF_INPUT_LEN..CQE_OFF_INPUT_LEN + 4]
-        .copy_from_slice(&input_len.to_be_bytes());
+    cqe[CQE_OFF_INPUT_LEN..CQE_OFF_INPUT_LEN + 4].copy_from_slice(&input_len.to_be_bytes());
     let in_aligned = input_mb_phys & MAILBOX_PHYS_ALIGN_MASK;
     cqe[CQE_OFF_INPUT_MB_H..CQE_OFF_INPUT_MB_H + 4]
         .copy_from_slice(&((in_aligned >> 32) as u32).to_be_bytes());
     cqe[CQE_OFF_INPUT_MB_L..CQE_OFF_INPUT_MB_L + 4]
-        .copy_from_slice(&((in_aligned as u32)).to_be_bytes());
+        .copy_from_slice(&(in_aligned as u32).to_be_bytes());
 
-    cqe[CQE_OFF_OPCODE..CQE_OFF_OPCODE + 2]
-        .copy_from_slice(&(op as u16).to_be_bytes());
-    cqe[CQE_OFF_INPUT_MOD..CQE_OFF_INPUT_MOD + 4]
-        .copy_from_slice(&input_modifier.to_be_bytes());
+    cqe[CQE_OFF_OPCODE..CQE_OFF_OPCODE + 2].copy_from_slice(&(op as u16).to_be_bytes());
+    cqe[CQE_OFF_INPUT_MOD..CQE_OFF_INPUT_MOD + 4].copy_from_slice(&input_modifier.to_be_bytes());
 
     let out_aligned = output_mb_phys & MAILBOX_PHYS_ALIGN_MASK;
     cqe[CQE_OFF_OUTPUT_MB_H..CQE_OFF_OUTPUT_MB_H + 4]
         .copy_from_slice(&((out_aligned >> 32) as u32).to_be_bytes());
     cqe[CQE_OFF_OUTPUT_MB_L..CQE_OFF_OUTPUT_MB_L + 4]
-        .copy_from_slice(&((out_aligned as u32)).to_be_bytes());
-    cqe[CQE_OFF_OUTPUT_LEN..CQE_OFF_OUTPUT_LEN + 4]
-        .copy_from_slice(&output_len.to_be_bytes());
+        .copy_from_slice(&(out_aligned as u32).to_be_bytes());
+    cqe[CQE_OFF_OUTPUT_LEN..CQE_OFF_OUTPUT_LEN + 4].copy_from_slice(&output_len.to_be_bytes());
 
-    cqe[CQE_OFF_TOKEN]      = token;
+    cqe[CQE_OFF_TOKEN] = token;
     cqe[CQE_OFF_STATUS_OWN] = STATUS_OWN_BIT;
-    cqe[CQE_OFF_SIGNATURE]  = compute_signature(&cqe);
+    cqe[CQE_OFF_SIGNATURE] = compute_signature(&cqe);
     cqe
 }
 
@@ -398,21 +399,19 @@ pub fn build_cqe_with_mailboxes(
 /// output payload. Used by smokes to drive the decoder against
 /// realistic CQE bytes without a live HCA.
 pub fn simulate_completion(
-    cqe:             &mut [u8; CQE_LEN],
-    raw_status:      u8,
-    syndrome:        u32,
+    cqe: &mut [u8; CQE_LEN],
+    raw_status: u8,
+    syndrome: u32,
     output_modifier: u32,
-    inline_output:   &[u8],
+    inline_output: &[u8],
 ) {
-    cqe[CQE_OFF_STATUS]    = raw_status;
+    cqe[CQE_OFF_STATUS] = raw_status;
     let syn_bytes = syndrome.to_be_bytes();
     cqe[CQE_OFF_STATUS + 1] = syn_bytes[1];
     cqe[CQE_OFF_STATUS + 2] = syn_bytes[2];
     cqe[CQE_OFF_STATUS + 3] = syn_bytes[3];
-    cqe[CQE_OFF_OUTPUT_MOD..CQE_OFF_OUTPUT_MOD + 4]
-        .copy_from_slice(&output_modifier.to_be_bytes());
+    cqe[CQE_OFF_OUTPUT_MOD..CQE_OFF_OUTPUT_MOD + 4].copy_from_slice(&output_modifier.to_be_bytes());
     let n = inline_output.len().min(8);
-    cqe[CQE_OFF_OUTPUT_INLINE..CQE_OFF_OUTPUT_INLINE + n]
-        .copy_from_slice(&inline_output[..n]);
+    cqe[CQE_OFF_OUTPUT_INLINE..CQE_OFF_OUTPUT_INLINE + n].copy_from_slice(&inline_output[..n]);
     cqe[CQE_OFF_STATUS_OWN] &= !STATUS_OWN_BIT;
 }

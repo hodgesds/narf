@@ -33,17 +33,17 @@
 #[repr(u8)]
 pub enum AuxCommand {
     /// Native AUX write — DPCD register configuration.
-    NativeWrite       = 0x8,
+    NativeWrite = 0x8,
     /// Native AUX read — DPCD register query.
-    NativeRead        = 0x9,
+    NativeRead = 0x9,
     /// I²C-over-AUX write (used for EDID-DDC).
-    I2cWrite          = 0x0,
+    I2cWrite = 0x0,
     /// I²C-over-AUX read.
-    I2cRead           = 0x1,
+    I2cRead = 0x1,
     /// I²C-over-AUX write with stop-on-completion (single transaction).
-    I2cWriteMot       = 0x4,
+    I2cWriteMot = 0x4,
     /// I²C-over-AUX read with stop-on-completion.
-    I2cReadMot        = 0x5,
+    I2cReadMot = 0x5,
 }
 
 /// Reply status nibble, in bits[7:4] of the response's byte 0.
@@ -51,11 +51,11 @@ pub enum AuxCommand {
 #[repr(u8)]
 pub enum AuxStatus {
     /// Native AUX or I²C transaction succeeded.
-    Ack    = 0x0,
+    Ack = 0x0,
     /// Native NACK — the sink rejected the address.
-    Nack   = 0x1,
+    Nack = 0x1,
     /// Native DEFER — sink wants the source to retry later.
-    Defer  = 0x2,
+    Defer = 0x2,
     /// I²C NACK — slave didn't acknowledge.
     I2cNack = 0x4,
     /// I²C DEFER.
@@ -80,9 +80,9 @@ pub enum AuxError {
 /// writes; the buffer for reads.
 #[derive(Debug)]
 pub struct AuxRequest<'a> {
-    pub cmd:     AuxCommand,
-    pub address: u32,           // 20-bit DPCD address; high bits ignored.
-    pub data:    &'a [u8],
+    pub cmd: AuxCommand,
+    pub address: u32, // 20-bit DPCD address; high bits ignored.
+    pub data: &'a [u8],
 }
 
 /// Decoded reply. `data` is empty for write replies; carries the
@@ -90,28 +90,36 @@ pub struct AuxRequest<'a> {
 #[derive(Debug)]
 pub struct AuxResponse<'a> {
     pub status: AuxStatus,
-    pub data:   &'a [u8],
+    pub data: &'a [u8],
 }
 
 /// Encode `req` into the wire 4 + N byte frame. `out` receives
 /// the frame; returns the number of bytes written.
-pub fn encode_request<'a>(
-    req: &AuxRequest<'a>,
-    out: &mut [u8],
-) -> Result<usize, AuxError> {
-    if req.data.len() > 16 { return Err(AuxError::TooLong); }
+pub fn encode_request<'a>(req: &AuxRequest<'a>, out: &mut [u8]) -> Result<usize, AuxError> {
+    if req.data.len() > 16 {
+        return Err(AuxError::TooLong);
+    }
     let n = req.data.len();
-    let total = 4 + if matches!(req.cmd, AuxCommand::NativeWrite
-                             | AuxCommand::I2cWrite
-                             | AuxCommand::I2cWriteMot) { n } else { 0 };
-    if out.len() < total { return Err(AuxError::TooLong); }
+    let total = 4 + if matches!(
+        req.cmd,
+        AuxCommand::NativeWrite | AuxCommand::I2cWrite | AuxCommand::I2cWriteMot
+    ) {
+        n
+    } else {
+        0
+    };
+    if out.len() < total {
+        return Err(AuxError::TooLong);
+    }
     let cmd = (req.cmd as u8) & 0x0F;
     out[0] = (cmd << 4) | ((req.address >> 16) as u8 & 0x0F);
     out[1] = (req.address >> 8) as u8;
     out[2] = req.address as u8;
     out[3] = if n == 0 { 0 } else { (n - 1) as u8 };
-    let writeback = matches!(req.cmd,
-        AuxCommand::NativeWrite | AuxCommand::I2cWrite | AuxCommand::I2cWriteMot);
+    let writeback = matches!(
+        req.cmd,
+        AuxCommand::NativeWrite | AuxCommand::I2cWrite | AuxCommand::I2cWriteMot
+    );
     if writeback {
         out[4..4 + n].copy_from_slice(req.data);
     }
@@ -126,7 +134,9 @@ pub fn decode_response<'a>(
     raw: &'a [u8],
     expected_data_len: usize,
 ) -> Result<AuxResponse<'a>, AuxError> {
-    if raw.is_empty() { return Err(AuxError::ShortReply); }
+    if raw.is_empty() {
+        return Err(AuxError::ShortReply);
+    }
     let status_nib = (raw[0] >> 4) & 0x0F;
     let status = match status_nib {
         0x0 => AuxStatus::Ack,
@@ -134,14 +144,17 @@ pub fn decode_response<'a>(
         0x2 => AuxStatus::Defer,
         0x4 => AuxStatus::I2cNack,
         0x8 => AuxStatus::I2cDefer,
-        _   => return Err(AuxError::UnknownStatus),
+        _ => return Err(AuxError::UnknownStatus),
     };
     let payload = &raw[1..];
     if payload.len() != expected_data_len {
         return Err(AuxError::ShortReply);
     }
     match status {
-        AuxStatus::Ack => Ok(AuxResponse { status, data: payload }),
+        AuxStatus::Ack => Ok(AuxResponse {
+            status,
+            data: payload,
+        }),
         AuxStatus::Nack | AuxStatus::I2cNack => Err(AuxError::Nacked),
         AuxStatus::Defer | AuxStatus::I2cDefer => Err(AuxError::Deferred),
     }
@@ -165,7 +178,9 @@ pub trait AuxChannel {
     /// Convenience wrapper around `transact`.
     fn dpcd_read(&mut self, addr: u32, buf: &mut [u8]) -> Result<(), AuxError> {
         let n = buf.len();
-        if n == 0 || n > 16 { return Err(AuxError::TooLong); }
+        if n == 0 || n > 16 {
+            return Err(AuxError::TooLong);
+        }
         let req = AuxRequest {
             cmd: AuxCommand::NativeRead,
             address: addr,
@@ -180,7 +195,9 @@ pub trait AuxChannel {
 
     /// Write the bytes in `value` to DPCD `addr` (NATIVE_WRITE).
     fn dpcd_write(&mut self, addr: u32, value: &[u8]) -> Result<(), AuxError> {
-        if value.is_empty() || value.len() > 16 { return Err(AuxError::TooLong); }
+        if value.is_empty() || value.len() > 16 {
+            return Err(AuxError::TooLong);
+        }
         let req = AuxRequest {
             cmd: AuxCommand::NativeWrite,
             address: addr,

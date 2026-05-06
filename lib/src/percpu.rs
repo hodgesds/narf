@@ -43,7 +43,9 @@ unsafe impl<T: Copy + Send + Sync> Sync for PerCpu<T> {}
 impl<T: Copy> PerCpu<T> {
     /// Construct with every cell initialised to `init`.
     pub const fn new(init: T) -> Self {
-        Self { cells: UnsafeCell::new([init; MAX_CPUS]) }
+        Self {
+            cells: UnsafeCell::new([init; MAX_CPUS]),
+        }
     }
 
     /// Reference to the calling CPU's cell.
@@ -88,11 +90,17 @@ fn narf_arch_cpu_id_hook() -> usize {
     // a pure read of a CPU-identifying register (Stage 2: returns 0).
     let id = unsafe { narf_arch_cpu_id() };
     debug_assert!(id < MAX_CPUS, "CPU id out of PerCpu range");
-    if id < MAX_CPUS { id } else { 0 }
+    if id < MAX_CPUS {
+        id
+    } else {
+        0
+    }
 }
 
 /// Public accessor for the active CPU's logical index. Crates that
 /// don't depend on narf-arch (memory's slab, drivers picking
 /// per-CPU storage) reach the live CPU id through here.
 #[inline]
-pub fn current_cpu() -> usize { narf_arch_cpu_id_hook() }
+pub fn current_cpu() -> usize {
+    narf_arch_cpu_id_hook()
+}

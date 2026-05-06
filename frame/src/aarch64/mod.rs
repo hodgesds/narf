@@ -28,5 +28,7 @@ pub unsafe fn init_traps() {
     let vbar = core::ptr::addr_of!(__narf_vector_table) as u64;
     // SAFETY: address is the linker-provided vector-table base; 2 KiB
     // aligned by the asm's `.align 11`.
-    unsafe { narf_arch::aarch64::sysreg::write_vbar_el1(vbar); }
+    unsafe {
+        narf_arch::aarch64::sysreg::write_vbar_el1(vbar);
+    }
 }

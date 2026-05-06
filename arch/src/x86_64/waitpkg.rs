@@ -18,7 +18,9 @@ pub const MSR_IA32_UMWAIT_CONTROL: u32 = 0x00E1;
 pub fn supported() -> bool {
     // SAFETY: leaf 0 always defined.
     let max = unsafe { cpuid(0, 0).0 };
-    if max < 7 { return false; }
+    if max < 7 {
+        return false;
+    }
     // SAFETY: leaf 7 valid.
     let (_, _, ecx, _) = unsafe { cpuid(7, 0) };
     ecx & (1 << 5) != 0
@@ -32,10 +34,11 @@ pub fn supported() -> bool {
 /// # Safety
 /// CPL = 0.
 pub unsafe fn set_max_wait_tsc(ticks: u32, allow_c02: bool) {
-    let v = ((ticks as u64) << 2 & 0xFFFF_FFFC)
-          | (if allow_c02 { 0 } else { 1 });
+    let v = ((ticks as u64) << 2 & 0xFFFF_FFFC) | (if allow_c02 { 0 } else { 1 });
     // SAFETY: caller-asserted.
-    unsafe { wrmsr(MSR_IA32_UMWAIT_CONTROL, v); }
+    unsafe {
+        wrmsr(MSR_IA32_UMWAIT_CONTROL, v);
+    }
 }
 
 /// Read `IA32_UMWAIT_CONTROL`.
@@ -91,7 +94,7 @@ pub unsafe fn umwait(deadline_tsc: u64, optimised: bool) -> bool {
             options(nostack, preserves_flags),
         );
     }
-    cf == 0  // CF = 0 → monitor fired; CF = 1 → timeout.
+    cf == 0 // CF = 0 → monitor fired; CF = 1 → timeout.
 }
 
 /// Pause for up to `deadline_tsc` without arming a monitor.

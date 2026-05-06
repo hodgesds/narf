@@ -21,9 +21,9 @@
 
 pub const EQE_LEN: usize = 64;
 
-pub const EQE_OFF_EVENT_TYPE:     usize = 0x01;
+pub const EQE_OFF_EVENT_TYPE: usize = 0x01;
 pub const EQE_OFF_EVENT_SUB_TYPE: usize = 0x03;
-pub const EQE_OFF_OWNER:          usize = 0x3F;
+pub const EQE_OFF_OWNER: usize = 0x3F;
 
 pub const EQE_OWNER_BIT: u8 = 1 << 0;
 
@@ -63,9 +63,9 @@ impl EventType {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct EqeView {
-    pub event_type:     EventType,
+    pub event_type: EventType,
     pub event_sub_type: u8,
-    pub owner:          bool,
+    pub owner: bool,
 }
 
 pub fn is_hw_owned(eqe: &[u8; EQE_LEN]) -> bool {
@@ -74,35 +74,31 @@ pub fn is_hw_owned(eqe: &[u8; EQE_LEN]) -> bool {
 
 pub fn decode_eqe(eqe: &[u8; EQE_LEN]) -> EqeView {
     EqeView {
-        event_type:     EventType::from_raw(eqe[EQE_OFF_EVENT_TYPE]),
+        event_type: EventType::from_raw(eqe[EQE_OFF_EVENT_TYPE]),
         event_sub_type: eqe[EQE_OFF_EVENT_SUB_TYPE],
-        owner:          (eqe[EQE_OFF_OWNER] & EQE_OWNER_BIT) != 0,
+        owner: (eqe[EQE_OFF_OWNER] & EQE_OWNER_BIT) != 0,
     }
 }
 
 /// Test-harness helper: write a synthetic completed EQE in place
 /// (clears the owner bit).
-pub fn simulate_event(
-    eqe:            &mut [u8; EQE_LEN],
-    event_type:     u8,
-    event_sub_type: u8,
-) {
-    eqe[EQE_OFF_EVENT_TYPE]     = event_type;
+pub fn simulate_event(eqe: &mut [u8; EQE_LEN], event_type: u8, event_sub_type: u8) {
+    eqe[EQE_OFF_EVENT_TYPE] = event_type;
     eqe[EQE_OFF_EVENT_SUB_TYPE] = event_sub_type;
     eqe[EQE_OFF_OWNER] &= !EQE_OWNER_BIT;
 }
 
 /// Walk the EQ ring at `consumer` and return the first SW-owned
 /// EQE if any. Mirrors `ring::pop_completion`.
-pub fn pop_event(
-    eq_bytes: &[u8],
-    capacity: u32,
-    consumer: u32,
-) -> Option<(EqeView, u32)> {
+pub fn pop_event(eq_bytes: &[u8], capacity: u32, consumer: u32) -> Option<(EqeView, u32)> {
     let off = ((consumer % capacity) as usize) * EQE_LEN;
-    if off + EQE_LEN > eq_bytes.len() { return None; }
+    if off + EQE_LEN > eq_bytes.len() {
+        return None;
+    }
     let mut buf = [0u8; EQE_LEN];
     buf.copy_from_slice(&eq_bytes[off..off + EQE_LEN]);
-    if is_hw_owned(&buf) { return None; }
+    if is_hw_owned(&buf) {
+        return None;
+    }
     Some((decode_eqe(&buf), consumer.wrapping_add(1)))
 }

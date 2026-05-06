@@ -32,21 +32,21 @@
 #![allow(dead_code)]
 
 /// PSCI function ids.
-pub const PSCI_VERSION:      u32 = 0x8400_0000;
-pub const PSCI_CPU_OFF:      u32 = 0x8400_0002;
-pub const PSCI_SYSTEM_OFF:   u32 = 0x8400_0008;
+pub const PSCI_VERSION: u32 = 0x8400_0000;
+pub const PSCI_CPU_OFF: u32 = 0x8400_0002;
+pub const PSCI_SYSTEM_OFF: u32 = 0x8400_0008;
 pub const PSCI_SYSTEM_RESET: u32 = 0x8400_0009;
 
 /// PSCI return codes (§5.2.2 Table 5).
-pub const PSCI_SUCCESS:        i32 = 0;
-pub const PSCI_NOT_SUPPORTED:  i32 = -1;
+pub const PSCI_SUCCESS: i32 = 0;
+pub const PSCI_NOT_SUPPORTED: i32 = -1;
 pub const PSCI_INVALID_PARAMS: i32 = -2;
-pub const PSCI_DENIED:         i32 = -3;
-pub const PSCI_ALREADY_ON:     i32 = -4;
-pub const PSCI_ON_PENDING:     i32 = -5;
-pub const PSCI_INTERNAL_FAIL:  i32 = -6;
-pub const PSCI_NOT_PRESENT:    i32 = -7;
-pub const PSCI_DISABLED:       i32 = -8;
+pub const PSCI_DENIED: i32 = -3;
+pub const PSCI_ALREADY_ON: i32 = -4;
+pub const PSCI_ON_PENDING: i32 = -5;
+pub const PSCI_INTERNAL_FAIL: i32 = -6;
+pub const PSCI_NOT_PRESENT: i32 = -7;
+pub const PSCI_DISABLED: i32 = -8;
 
 /// Issue an SMC32 call per SMCCC §5. Returns the four 32-bit
 /// result registers (X0..X3 truncated).
@@ -107,7 +107,10 @@ pub unsafe fn hvc(fn_id: u32, arg1: u64, arg2: u64, arg3: u64) -> [u64; 4] {
 /// SMC. NARF defaults to HVC (matches QEMU virt + KVM-hosted
 /// guests); a board boot path can call [`set_conduit`] to switch.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Conduit { Hvc, Smc }
+pub enum Conduit {
+    Hvc,
+    Smc,
+}
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
@@ -117,7 +120,13 @@ static CONDUIT: AtomicU8 = AtomicU8::new(0); // 0 = HVC, 1 = SMC.
 /// virt, KVM, Xen, Hyper-V; `Smc` suits bare-metal with a secure
 /// monitor.
 pub fn set_conduit(c: Conduit) {
-    CONDUIT.store(match c { Conduit::Hvc => 0, Conduit::Smc => 1 }, Ordering::Release);
+    CONDUIT.store(
+        match c {
+            Conduit::Hvc => 0,
+            Conduit::Smc => 1,
+        },
+        Ordering::Release,
+    );
 }
 
 #[inline]

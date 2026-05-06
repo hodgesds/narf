@@ -10,10 +10,10 @@ use core::arch::asm;
 #[derive(Copy, Clone, Debug)]
 pub struct AarchIdent {
     pub implementer: u8,
-    pub variant:     u8,
-    pub part:        u16,
-    pub revision:    u8,
-    pub raw:         u64,
+    pub variant: u8,
+    pub part: u16,
+    pub revision: u8,
+    pub raw: u64,
 }
 
 pub fn ident() -> AarchIdent {
@@ -24,9 +24,9 @@ pub fn ident() -> AarchIdent {
     }
     AarchIdent {
         implementer: ((raw >> 24) & 0xFF) as u8,
-        variant:     ((raw >> 20) & 0xF)  as u8,
-        part:        ((raw >> 4)  & 0xFFF) as u16,
-        revision:    (raw & 0xF) as u8,
+        variant: ((raw >> 20) & 0xF) as u8,
+        part: ((raw >> 4) & 0xFFF) as u16,
+        revision: (raw & 0xF) as u8,
         raw,
     }
 }
@@ -58,6 +58,6 @@ pub fn implementer_name(implementer: u8) -> &'static str {
         0x66 => "Faraday",
         0x69 => "Intel",
         0xC0 => "Ampere",
-        _    => "Unknown",
+        _ => "Unknown",
     }
 }

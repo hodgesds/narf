@@ -20,7 +20,9 @@ const MSR_APERF: u32 = 0x000000E8;
 pub fn supported() -> bool {
     // SAFETY: leaf 0x8000_0000 always defined.
     let max = unsafe { cpuid(0x8000_0000, 0).0 };
-    if max < 0x8000_0008 { return false; }
+    if max < 0x8000_0008 {
+        return false;
+    }
     // SAFETY: leaf 0x8000_0008 valid.
     let (_, ebx, _, _) = unsafe { cpuid(0x8000_0008, 0) };
     ebx & (1 << 4) != 0

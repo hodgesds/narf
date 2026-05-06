@@ -60,20 +60,20 @@ impl NotifyKind {
             0x80 => NotifyKind::PowerSource,
             0x81 => NotifyKind::BatteryInfo,
             0x82 => NotifyKind::Thermal,
-            c    => NotifyKind::Device(c),
+            c => NotifyKind::Device(c),
         }
     }
 
     pub const fn raw(&self) -> u8 {
         match self {
-            NotifyKind::BusCheck        => 0x00,
-            NotifyKind::DeviceCheck     => 0x01,
-            NotifyKind::DeviceWake      => 0x02,
-            NotifyKind::EjectRequest    => 0x03,
-            NotifyKind::PowerSource     => 0x80,
-            NotifyKind::BatteryInfo     => 0x81,
-            NotifyKind::Thermal         => 0x82,
-            NotifyKind::Device(c)       => *c,
+            NotifyKind::BusCheck => 0x00,
+            NotifyKind::DeviceCheck => 0x01,
+            NotifyKind::DeviceWake => 0x02,
+            NotifyKind::EjectRequest => 0x03,
+            NotifyKind::PowerSource => 0x80,
+            NotifyKind::BatteryInfo => 0x81,
+            NotifyKind::Thermal => 0x82,
+            NotifyKind::Device(c) => *c,
         }
     }
 }
@@ -82,7 +82,7 @@ impl NotifyKind {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct NotifyEvent {
     pub acpi_handle: u64,
-    pub kind:        NotifyKind,
+    pub kind: NotifyKind,
 }
 
 /// Errors from the ACPI notify surface.
@@ -93,16 +93,22 @@ pub enum NotifyError {
 }
 
 impl From<CapError> for NotifyError {
-    fn from(_: CapError) -> Self { NotifyError::AuthorityRevoked }
+    fn from(_: CapError) -> Self {
+        NotifyError::AuthorityRevoked
+    }
 }
 
 type Subscriber = Box<dyn Fn(&NotifyEvent) + Send + Sync + 'static>;
 
-struct Registry { subs: Vec<Subscriber> }
+struct Registry {
+    subs: Vec<Subscriber>,
+}
 
 impl core::fmt::Debug for Registry {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Registry").field("subs", &self.subs.len()).finish()
+        f.debug_struct("Registry")
+            .field("subs", &self.subs.len())
+            .finish()
     }
 }
 
@@ -116,7 +122,9 @@ pub fn init() {
 /// Install a notify subscriber. Cap-gated; called by each subsystem
 /// at boot after it has received its `Cap<AcpiNotify, Grant>`.
 pub fn subscribe<F>(cap: &Cap<AcpiNotify, Grant>, cb: F) -> Result<(), NotifyError>
-where F: Fn(&NotifyEvent) + Send + Sync + 'static {
+where
+    F: Fn(&NotifyEvent) + Send + Sync + 'static,
+{
     cap.invoke(NoopOp)?;
     let mut r = REG.lock();
     let reg = r.as_mut().ok_or(NotifyError::NotInitialised)?;
@@ -129,7 +137,9 @@ where F: Fn(&NotifyEvent) + Send + Sync + 'static {
 pub fn dispatch_notify(ev: NotifyEvent) -> Result<(), NotifyError> {
     let r = REG.lock();
     let reg = r.as_ref().ok_or(NotifyError::NotInitialised)?;
-    for cb in &reg.subs { cb(&ev); }
+    for cb in &reg.subs {
+        cb(&ev);
+    }
     Ok(())
 }
 
@@ -140,4 +150,6 @@ pub fn subscriber_count() -> usize {
 
 /// Test helper.
 #[doc(hidden)]
-pub fn __test_reset() { *REG.lock() = None; }
+pub fn __test_reset() {
+    *REG.lock() = None;
+}

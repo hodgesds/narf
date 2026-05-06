@@ -7,8 +7,8 @@
 
 use core::fmt::Write;
 
-use narf_console::Writer;
 use narf_arch::aarch64::sysreg;
+use narf_console::Writer;
 
 /// On-stack layout saved by `vec.S`'s `SAVE_ALL_GPRS` macro.
 /// The last push is `str x30, [sp, #-16]!`, which grows the stack
@@ -18,25 +18,40 @@ use narf_arch::aarch64::sysreg;
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct TrapFrame {
-    pub x30:   u64,
-    pub _pad:  u64,                  // forced by `str x30, [sp, #-16]!`
-    pub elr:   u64,                  // ELR_EL1 — return RIP
-    pub spsr:  u64,                  // SPSR_EL1 — return PSTATE + target EL
-    pub x0:   u64, pub x1:  u64,
-    pub x2:   u64, pub x3:  u64,
-    pub x4:   u64, pub x5:  u64,
-    pub x6:   u64, pub x7:  u64,
-    pub x8:   u64, pub x9:  u64,
-    pub x10:  u64, pub x11: u64,
-    pub x12:  u64, pub x13: u64,
-    pub x14:  u64, pub x15: u64,
-    pub x16:  u64, pub x17: u64,
-    pub x18:  u64, pub x19: u64,
-    pub x20:  u64, pub x21: u64,
-    pub x22:  u64, pub x23: u64,
-    pub x24:  u64, pub x25: u64,
-    pub x26:  u64, pub x27: u64,
-    pub x28:  u64, pub x29: u64,
+    pub x30: u64,
+    pub _pad: u64, // forced by `str x30, [sp, #-16]!`
+    pub elr: u64,  // ELR_EL1 — return RIP
+    pub spsr: u64, // SPSR_EL1 — return PSTATE + target EL
+    pub x0: u64,
+    pub x1: u64,
+    pub x2: u64,
+    pub x3: u64,
+    pub x4: u64,
+    pub x5: u64,
+    pub x6: u64,
+    pub x7: u64,
+    pub x8: u64,
+    pub x9: u64,
+    pub x10: u64,
+    pub x11: u64,
+    pub x12: u64,
+    pub x13: u64,
+    pub x14: u64,
+    pub x15: u64,
+    pub x16: u64,
+    pub x17: u64,
+    pub x18: u64,
+    pub x19: u64,
+    pub x20: u64,
+    pub x21: u64,
+    pub x22: u64,
+    pub x23: u64,
+    pub x24: u64,
+    pub x25: u64,
+    pub x26: u64,
+    pub x27: u64,
+    pub x28: u64,
+    pub x29: u64,
 }
 
 /// Called from `__narf_vec_irq` in `vec.S`. Reads the GIC's ICC_IAR1_EL1
@@ -79,7 +94,9 @@ pub extern "C" fn rust_aarch64_irq(_frame: &TrapFrame) {
     }
 
     // SAFETY: write the same IAR value we read to EOI.
-    unsafe { narf_interrupts::aarch64::eoi_for(iar); }
+    unsafe {
+        narf_interrupts::aarch64::eoi_for(iar);
+    }
 }
 
 /// Default generic-timer countdown in CNTPCT ticks. At QEMU virt's
@@ -90,7 +107,11 @@ pub const TIMER_TVAL_DEFAULT: u64 = 5_000_000;
 pub extern "C" fn rust_aarch64_sync(frame: &TrapFrame) -> ! {
     // SAFETY: MRS ESR_EL1 / FAR_EL1 / ELR_EL1 are always legal.
     let (esr, far, elr) = unsafe {
-        (sysreg::read_esr_el1(), sysreg::read_far_el1(), sysreg::read_elr_el1())
+        (
+            sysreg::read_esr_el1(),
+            sysreg::read_far_el1(),
+            sysreg::read_elr_el1(),
+        )
     };
     let _ = writeln!(Writer, "\n*** AARCH64 SYNCHRONOUS EXCEPTION ***");
     let _ = writeln!(Writer, "  ESR_EL1: {:#018x}", esr);
@@ -114,7 +135,7 @@ pub extern "C" fn rust_aarch64_sync(frame: &TrapFrame) -> ! {
 pub extern "C" fn rust_aarch64_sync_dispatch(frame: &mut TrapFrame) {
     // SAFETY: ESR_EL1 read at EL1 is always defined.
     let esr = unsafe { sysreg::read_esr_el1() };
-    let ec  = (esr >> 26) & 0x3F;
+    let ec = (esr >> 26) & 0x3F;
 
     const EC_SVC_AARCH64: u64 = 0b01_0101;
 
@@ -167,21 +188,27 @@ use narf_userspace::{SyscallArgs, SyscallReturn, TrapContext};
 /// aarch64 `TrapContext` wrapper around a live SVC-trap frame.
 struct Aarch64TrapContext<'a> {
     frame: &'a mut TrapFrame,
-    args:  SyscallArgs,
+    args: SyscallArgs,
 }
 
 impl<'a> Aarch64TrapContext<'a> {
     fn from_svc(frame: &'a mut TrapFrame) -> Self {
         let args = SyscallArgs {
-            arg0: frame.x0, arg1: frame.x1, arg2: frame.x2,
-            arg3: frame.x3, arg4: frame.x4, arg5: frame.x5,
+            arg0: frame.x0,
+            arg1: frame.x1,
+            arg2: frame.x2,
+            arg3: frame.x3,
+            arg4: frame.x4,
+            arg5: frame.x5,
         };
         Self { frame, args }
     }
 }
 
 impl<'a> TrapContext for Aarch64TrapContext<'a> {
-    fn args(&self) -> &SyscallArgs { &self.args }
+    fn args(&self) -> &SyscallArgs {
+        &self.args
+    }
 
     fn set_return(&mut self, ret: SyscallReturn) {
         self.frame.x0 = ret.value;

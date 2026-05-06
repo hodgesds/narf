@@ -24,8 +24,8 @@ pub const FS_CONFIG_LEN: usize = FS_TAG_LEN + 4;
 /// length of the tag; bytes past `tag_len` in `tag` are zero.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct FsConfig {
-    pub tag:                [u8; FS_TAG_LEN],
-    pub tag_len:            usize,
+    pub tag: [u8; FS_TAG_LEN],
+    pub tag_len: usize,
     pub num_request_queues: u32,
 }
 
@@ -39,7 +39,9 @@ impl FsConfig {
 /// Decode a 40-byte slice in the layout of §5.11.4. Returns `None`
 /// when the slice is too short.
 pub fn decode_device_config(bytes: &[u8]) -> Option<FsConfig> {
-    if bytes.len() < FS_CONFIG_LEN { return None; }
+    if bytes.len() < FS_CONFIG_LEN {
+        return None;
+    }
     let mut tag = [0u8; FS_TAG_LEN];
     tag.copy_from_slice(&bytes[..FS_TAG_LEN]);
     // NUL-trim: tag_len = position of first NUL, or FS_TAG_LEN if none.
@@ -50,5 +52,9 @@ pub fn decode_device_config(bytes: &[u8]) -> Option<FsConfig> {
         bytes[FS_TAG_LEN + 2],
         bytes[FS_TAG_LEN + 3],
     ]);
-    Some(FsConfig { tag, tag_len, num_request_queues: nrq })
+    Some(FsConfig {
+        tag,
+        tag_len,
+        num_request_queues: nrq,
+    })
 }

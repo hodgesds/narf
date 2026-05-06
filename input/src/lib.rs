@@ -77,73 +77,112 @@ macro_rules! bitflags_like {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum KeyCode {
-    Reserved   = 0,
-    Escape     = 1,
-    Key1       = 2, Key2 = 3, Key3 = 4, Key4 = 5, Key5 = 6,
-    Key6       = 7, Key7 = 8, Key8 = 9, Key9 = 10, Key0 = 11,
-    Minus      = 12,
-    Equal      = 13,
-    Backspace  = 14,
-    Tab        = 15,
-    Q = 16, W = 17, E = 18, R = 19, T = 20, Y = 21, U = 22, I = 23, O = 24, P = 25,
-    LeftBrace  = 26,
+    Reserved = 0,
+    Escape = 1,
+    Key1 = 2,
+    Key2 = 3,
+    Key3 = 4,
+    Key4 = 5,
+    Key5 = 6,
+    Key6 = 7,
+    Key7 = 8,
+    Key8 = 9,
+    Key9 = 10,
+    Key0 = 11,
+    Minus = 12,
+    Equal = 13,
+    Backspace = 14,
+    Tab = 15,
+    Q = 16,
+    W = 17,
+    E = 18,
+    R = 19,
+    T = 20,
+    Y = 21,
+    U = 22,
+    I = 23,
+    O = 24,
+    P = 25,
+    LeftBrace = 26,
     RightBrace = 27,
-    Enter      = 28,
-    LeftCtrl   = 29,
-    A = 30, S = 31, D = 32, F = 33, G = 34, H = 35, J = 36, K = 37, L = 38,
-    Semicolon  = 39,
+    Enter = 28,
+    LeftCtrl = 29,
+    A = 30,
+    S = 31,
+    D = 32,
+    F = 33,
+    G = 34,
+    H = 35,
+    J = 36,
+    K = 37,
+    L = 38,
+    Semicolon = 39,
     Apostrophe = 40,
-    Grave      = 41,
-    LeftShift  = 42,
-    Backslash  = 43,
-    Z = 44, X = 45, C = 46, V = 47, B = 48, N = 49, M = 50,
-    Comma      = 51,
-    Dot        = 52,
-    Slash      = 53,
+    Grave = 41,
+    LeftShift = 42,
+    Backslash = 43,
+    Z = 44,
+    X = 45,
+    C = 46,
+    V = 47,
+    B = 48,
+    N = 49,
+    M = 50,
+    Comma = 51,
+    Dot = 52,
+    Slash = 53,
     RightShift = 54,
     KpAsterisk = 55,
-    LeftAlt    = 56,
-    Space      = 57,
-    CapsLock   = 58,
-    F1 = 59, F2 = 60, F3 = 61, F4 = 62, F5 = 63,
-    F6 = 64, F7 = 65, F8 = 66, F9 = 67, F10 = 68,
-    NumLock    = 69,
+    LeftAlt = 56,
+    Space = 57,
+    CapsLock = 58,
+    F1 = 59,
+    F2 = 60,
+    F3 = 61,
+    F4 = 62,
+    F5 = 63,
+    F6 = 64,
+    F7 = 65,
+    F8 = 66,
+    F9 = 67,
+    F10 = 68,
+    NumLock = 69,
     ScrollLock = 70,
-    F11        = 87,
-    F12        = 88,
-    Kp7        = 71,
-    Kp8        = 72,
-    Kp9        = 73,
-    KpMinus    = 74,
-    Kp4        = 75,
-    Kp5        = 76,
-    Kp6        = 77,
-    KpPlus     = 78,
-    Kp1        = 79,
-    Kp2        = 80,
-    Kp3        = 81,
-    Kp0        = 82,
-    KpDot      = 83,
-    KpEnter    = 96,
-    KpSlash    = 98,
-    SysRq      = 99,
-    Home       = 102,
-    PageUp     = 104,
-    End        = 107,
-    PageDown   = 109,
-    Insert     = 110,
-    Delete     = 111,
-    Pause      = 119,
-    LeftMeta   = 125,
-    RightMeta  = 126,
-    Menu       = 127,
-    Up         = 103,
-    Down       = 108,
-    Left       = 105,
-    Right      = 106,
-    RightCtrl  = 97,
-    RightAlt   = 100,
-    Unknown    = 0xFFFF,
+    F11 = 87,
+    F12 = 88,
+    Kp7 = 71,
+    Kp8 = 72,
+    Kp9 = 73,
+    KpMinus = 74,
+    Kp4 = 75,
+    Kp5 = 76,
+    Kp6 = 77,
+    KpPlus = 78,
+    Kp1 = 79,
+    Kp2 = 80,
+    Kp3 = 81,
+    Kp0 = 82,
+    KpDot = 83,
+    KpEnter = 96,
+    KpSlash = 98,
+    SysRq = 99,
+    Home = 102,
+    PageUp = 104,
+    End = 107,
+    PageDown = 109,
+    Insert = 110,
+    Delete = 111,
+    Pause = 119,
+    LeftMeta = 125,
+    RightMeta = 126,
+    Menu = 127,
+    Up = 103,
+    Down = 108,
+    Left = 105,
+    Right = 106,
+    RightCtrl = 97,
+    RightAlt = 100,
+    Unknown = 0xFFFF,
 }
 
 impl KeyCode {
@@ -153,11 +192,17 @@ impl KeyCode {
     pub const fn is_modifier(self) -> bool {
         matches!(
             self,
-            KeyCode::LeftShift | KeyCode::RightShift |
-            KeyCode::LeftCtrl  | KeyCode::RightCtrl  |
-            KeyCode::LeftAlt   | KeyCode::RightAlt   |
-            KeyCode::LeftMeta  | KeyCode::RightMeta  |
-            KeyCode::CapsLock  | KeyCode::NumLock    | KeyCode::ScrollLock
+            KeyCode::LeftShift
+                | KeyCode::RightShift
+                | KeyCode::LeftCtrl
+                | KeyCode::RightCtrl
+                | KeyCode::LeftAlt
+                | KeyCode::RightAlt
+                | KeyCode::LeftMeta
+                | KeyCode::RightMeta
+                | KeyCode::CapsLock
+                | KeyCode::NumLock
+                | KeyCode::ScrollLock
         )
     }
 }
@@ -180,9 +225,9 @@ bitflags_like! {
 /// Single key state transition.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct KeyEvent {
-    pub code:      KeyCode,
+    pub code: KeyCode,
     /// `true` = press / hold-down begin; `false` = release.
-    pub pressed:   bool,
+    pub pressed: bool,
     /// Live modifier state at the moment the driver emitted the
     /// event (after applying this event's effect for modifier keys
     /// — e.g. press of LeftShift includes SHIFT).
@@ -194,8 +239,8 @@ pub struct KeyEvent {
 /// the relative form.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct PointerEvent {
-    pub dx:      i32,
-    pub dy:      i32,
+    pub dx: i32,
+    pub dy: i32,
     pub buttons: PointerButtons,
 }
 
@@ -227,10 +272,10 @@ pub enum InputEvent {
 /// oldest event and bumps `dropped`.
 #[derive(Debug)]
 pub struct EventRing {
-    inner:    IrqSafeSpinLock<VecDeque<InputEvent>>,
+    inner: IrqSafeSpinLock<VecDeque<InputEvent>>,
     capacity: usize,
-    pushed:   AtomicU64,
-    dropped:  AtomicU64,
+    pushed: AtomicU64,
+    dropped: AtomicU64,
 }
 
 impl EventRing {
@@ -239,16 +284,22 @@ impl EventRing {
     pub fn new(capacity: usize) -> Self {
         let cap = capacity.max(1);
         Self {
-            inner:    IrqSafeSpinLock::new(VecDeque::with_capacity(cap)),
+            inner: IrqSafeSpinLock::new(VecDeque::with_capacity(cap)),
             capacity: cap,
-            pushed:   AtomicU64::new(0),
-            dropped:  AtomicU64::new(0),
+            pushed: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
         }
     }
 
-    pub fn capacity(&self) -> usize { self.capacity }
-    pub fn pushed(&self)  -> u64 { self.pushed.load(Ordering::Relaxed) }
-    pub fn dropped(&self) -> u64 { self.dropped.load(Ordering::Relaxed) }
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+    pub fn pushed(&self) -> u64 {
+        self.pushed.load(Ordering::Relaxed)
+    }
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
 
     /// Push one event. Drops the oldest event if full and bumps
     /// `dropped`. Returns `true` if no drop happened.
@@ -271,9 +322,13 @@ impl EventRing {
     }
 
     /// Number of events queued right now.
-    pub fn len(&self) -> usize { self.inner.lock().len() }
+    pub fn len(&self) -> usize {
+        self.inner.lock().len()
+    }
 
-    pub fn is_empty(&self) -> bool { self.inner.lock().is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().is_empty()
+    }
 
     #[doc(hidden)]
     pub fn __reset_for_test(&self) {
@@ -286,8 +341,7 @@ impl EventRing {
 /// Process-wide input event ring. Drivers push, consumers pop.
 /// Bounded at 256 events — enough for keyboard burst latency, small
 /// enough that a runaway producer doesn't eat unbounded heap.
-static GLOBAL_RING: IrqSafeSpinLock<Option<EventRing>> =
-    IrqSafeSpinLock::new(None);
+static GLOBAL_RING: IrqSafeSpinLock<Option<EventRing>> = IrqSafeSpinLock::new(None);
 
 /// Initialise the global ring. Idempotent on repeat calls — the
 /// ring is reset rather than re-constructed so callers that hold
@@ -296,7 +350,7 @@ pub fn init_global_ring(capacity: usize) {
     let mut g = GLOBAL_RING.lock();
     match g.as_ref() {
         Some(r) => r.__reset_for_test(),
-        None    => *g = Some(EventRing::new(capacity)),
+        None => *g = Some(EventRing::new(capacity)),
     }
 }
 
@@ -304,7 +358,11 @@ pub fn init_global_ring(capacity: usize) {
 /// has not been called.
 pub fn push_global(ev: InputEvent) -> bool {
     let g = GLOBAL_RING.lock();
-    if let Some(r) = g.as_ref() { r.push(ev) } else { false }
+    if let Some(r) = g.as_ref() {
+        r.push(ev)
+    } else {
+        false
+    }
 }
 
 /// Pop from the global ring. `None` if empty or uninitialised.
@@ -314,7 +372,9 @@ pub fn pop_global() -> Option<InputEvent> {
 
 /// Snapshot of pushed/dropped counters, useful for smoke tests.
 pub fn global_counters() -> (u64, u64) {
-    GLOBAL_RING.lock().as_ref()
+    GLOBAL_RING
+        .lock()
+        .as_ref()
         .map(|r| (r.pushed(), r.dropped()))
         .unwrap_or((0, 0))
 }
@@ -322,7 +382,9 @@ pub fn global_counters() -> (u64, u64) {
 /// Test-only reset.
 #[doc(hidden)]
 pub fn __reset_global_ring_for_test() {
-    if let Some(r) = GLOBAL_RING.lock().as_ref() { r.__reset_for_test(); }
+    if let Some(r) = GLOBAL_RING.lock().as_ref() {
+        r.__reset_for_test();
+    }
 }
 
 /// Stage::Subsys initcall: install the global event ring before

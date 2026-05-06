@@ -51,7 +51,9 @@ mod tests;
 
 pub use affinity::{Affinity, CpuId, CpuSet};
 pub use budget::{BudgetAccount, CpuBudget, OverrunPolicy, ResourceBudget};
-pub use cpu_lifecycle::{cpu_bring_up, cpu_online, cpu_take_offline, online_count, CpuLifecycle, HotPlugError};
+pub use cpu_lifecycle::{
+    cpu_bring_up, cpu_online, cpu_take_offline, online_count, CpuLifecycle, HotPlugError,
+};
 pub use priority::{Priority, SchedClass, SmtSharePolicy};
 
 // re-export the Invoke rights marker for callers who need to type a
@@ -67,8 +69,8 @@ pub use narf_capabilities::Invoke;
 // exists (`narf-scheduler` → `narf-arch`); this just exposes it.
 #[cfg(target_arch = "x86_64")]
 pub use narf_arch::x86_64::{
-    enter_user_mode, enter_user_mode_resume, longjmp, set_user_fs_base,
-    setjmp, JmpBuf, UserState, USER_RFLAGS,
+    enter_user_mode, enter_user_mode_resume, longjmp, set_user_fs_base, setjmp, JmpBuf, UserState,
+    USER_RFLAGS,
 };
 
 // `halt_forever` is the right "I should never reach here" sink for
@@ -108,10 +110,8 @@ type BoxedTask = Pin<Box<dyn Future<Output = ()> + Send>>;
 /// caller's queue then attempts to steal one task from another CPU's
 /// queue. With single-CPU configurations only index 0 is exercised,
 /// matching pre-SMP behaviour byte-for-byte.
-const NEW_QUEUE: IrqSafeSpinLock<Option<VecDeque<TaskSlot>>> =
-    IrqSafeSpinLock::new(None);
-static READY: [IrqSafeSpinLock<Option<VecDeque<TaskSlot>>>;
-    narf_lib::percpu::MAX_CPUS] =
+const NEW_QUEUE: IrqSafeSpinLock<Option<VecDeque<TaskSlot>>> = IrqSafeSpinLock::new(None);
+static READY: [IrqSafeSpinLock<Option<VecDeque<TaskSlot>>>; narf_lib::percpu::MAX_CPUS] =
     [NEW_QUEUE; narf_lib::percpu::MAX_CPUS];
 
 /// Monotonic task identifier. Minted at `spawn` time. `0` is reserved
@@ -123,7 +123,9 @@ impl TaskId {
     pub const NONE: TaskId = TaskId(0);
 
     #[inline]
-    pub const fn raw(self) -> u64 { self.0 }
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
 }
 
 /// Cap-type marker for `Cap<Task, R>`. `Cap<Task, Invoke>` is the
@@ -184,11 +186,11 @@ struct TaskSlot {
     awake: Arc<AtomicBool>,
     /// Monotonic identifier stamped at spawn time so `donate_to` has
     /// a stable handle into the ready queue.
-    id:      TaskId,
+    id: TaskId,
     /// Stage-3 §3.3/§3.4 per-task metadata: affinity, CPU budget, the
     /// `Cap<CpuBudget, Spend>` that gates scheduling, and the running
     /// `BudgetAccount`.
-    spec:    TaskSpec,
+    spec: TaskSpec,
     account: BudgetAccount,
     /// Optional per-process address space (Stage 4). `None` for
     /// kernel-only tasks; `Some` for a user-mode task that shares
@@ -200,9 +202,9 @@ struct TaskSlot {
 impl core::fmt::Debug for TaskSlot {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("TaskSlot")
-            .field("id",      &self.id)
-            .field("awake",   &self.awake.load(Ordering::Relaxed))
-            .field("spec",    &self.spec)
+            .field("id", &self.id)
+            .field("awake", &self.awake.load(Ordering::Relaxed))
+            .field("spec", &self.spec)
             .field("account", &self.account)
             .finish_non_exhaustive()
     }
@@ -217,16 +219,16 @@ impl core::fmt::Debug for TaskSlot {
 /// the next round.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct TaskSpec {
-    pub affinity:   Affinity,
-    pub budget:     ResourceBudget,
+    pub affinity: Affinity,
+    pub budget: ResourceBudget,
     pub budget_cap: Option<Cap<CpuBudget, Spend>>,
     /// Scheduling class (Stage-4). Stage-3 executor ignores this;
     /// SMP dispatch consumes it once the deadline class lands.
-    pub class:      SchedClass,
+    pub class: SchedClass,
     /// Nice-style priority within `class`.
-    pub priority:   Priority,
+    pub priority: Priority,
     /// SMT-sibling co-scheduling preference.
-    pub smt:        SmtSharePolicy,
+    pub smt: SmtSharePolicy,
 }
 
 impl TaskSpec {
@@ -234,12 +236,12 @@ impl TaskSpec {
     /// Stage-2 `spawn` behaviour byte-for-byte in the executor.
     pub const fn unthrottled() -> Self {
         Self {
-            affinity:   Affinity::any(),
-            budget:     ResourceBudget::unthrottled(),
+            affinity: Affinity::any(),
+            budget: ResourceBudget::unthrottled(),
             budget_cap: None,
-            class:      SchedClass::Normal,
-            priority:   Priority::NORMAL,
-            smt:        SmtSharePolicy::Avoid,
+            class: SchedClass::Normal,
+            priority: Priority::NORMAL,
+            smt: SmtSharePolicy::Avoid,
         }
     }
 
@@ -247,29 +249,29 @@ impl TaskSpec {
     /// `check_live` the cap each round.
     pub const fn budgeted(budget: ResourceBudget, cap: Cap<CpuBudget, Spend>) -> Self {
         Self {
-            affinity:   Affinity::any(),
+            affinity: Affinity::any(),
             budget,
             budget_cap: Some(cap),
-            class:      SchedClass::Normal,
-            priority:   Priority::NORMAL,
-            smt:        SmtSharePolicy::Avoid,
+            class: SchedClass::Normal,
+            priority: Priority::NORMAL,
+            smt: SmtSharePolicy::Avoid,
         }
     }
 
     /// Shorthand: realtime task with an absolute cycle deadline.
     pub const fn realtime(deadline_cycles: u64) -> Self {
         Self {
-            affinity:   Affinity::any(),
-            budget:     ResourceBudget {
-                share_ppm:       1_000_000,
-                burst_cycles:    u64::MAX,
+            affinity: Affinity::any(),
+            budget: ResourceBudget {
+                share_ppm: 1_000_000,
+                burst_cycles: u64::MAX,
                 deadline_cycles: Some(deadline_cycles),
-                policy:          OverrunPolicy::Ignore,
+                policy: OverrunPolicy::Ignore,
             },
             budget_cap: None,
-            class:      SchedClass::RealTime,
-            priority:   Priority::HIGH,
-            smt:        SmtSharePolicy::Avoid,
+            class: SchedClass::RealTime,
+            priority: Priority::HIGH,
+            smt: SmtSharePolicy::Avoid,
         }
     }
 }
@@ -292,20 +294,24 @@ pub fn init() {
 fn target_cpu(spec: &TaskSpec) -> usize {
     if let Some(cpu) = spec.affinity.preferred {
         let id = cpu.0 as usize;
-        if id < narf_lib::percpu::MAX_CPUS
-            && narf_lib::smp::is_online(cpu.0)
-        {
+        if id < narf_lib::percpu::MAX_CPUS && narf_lib::smp::is_online(cpu.0) {
             return id;
         }
     }
     let here = narf_lib::percpu::current_cpu();
-    if here < narf_lib::percpu::MAX_CPUS { here } else { 0 }
+    if here < narf_lib::percpu::MAX_CPUS {
+        here
+    } else {
+        0
+    }
 }
 
 /// Push `slot` onto `cpu`'s ready queue. Panics if `init()` hasn't run.
 fn enqueue_on(cpu: usize, slot: TaskSlot) {
     let mut q = READY[cpu].lock();
-    q.as_mut().expect("scheduler: spawn before init").push_back(slot);
+    q.as_mut()
+        .expect("scheduler: spawn before init")
+        .push_back(slot);
 }
 
 /// Queue a new task on the ready queue. Requires `init()` to have run.
@@ -326,8 +332,8 @@ where
 {
     let id = TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed));
     let slot = TaskSlot {
-        task:    Box::pin(f),
-        awake:   Arc::new(AtomicBool::new(true)),
+        task: Box::pin(f),
+        awake: Arc::new(AtomicBool::new(true)),
         id,
         spec,
         addr_space: None,
@@ -359,8 +365,8 @@ where
 {
     let id = TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed));
     let slot = TaskSlot {
-        task:    Box::pin(f),
-        awake:   Arc::new(AtomicBool::new(true)),
+        task: Box::pin(f),
+        awake: Arc::new(AtomicBool::new(true)),
         id,
         spec,
         addr_space: Some(addr_space),
@@ -408,13 +414,14 @@ pub enum DonateError {
 /// state, restore callee's domain, branch directly into the callee)
 /// is Stage-4 work — this Stage-3 form is correct but not performant.
 pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateError> {
-    cap.check_live().map_err(|_| DonateError::AuthorityRevoked)?;
+    cap.check_live()
+        .map_err(|_| DonateError::AuthorityRevoked)?;
     let mut any_initialised = false;
     for q in READY.iter() {
         let mut g = q.lock();
         let ready = match g.as_mut() {
             Some(r) => r,
-            None    => continue,
+            None => continue,
         };
         any_initialised = true;
         if let Some(pos) = ready.iter().position(|s| s.id == target) {
@@ -430,7 +437,9 @@ pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateEr
             return Ok(());
         }
     }
-    if !any_initialised { return Err(DonateError::NotReady); }
+    if !any_initialised {
+        return Err(DonateError::NotReady);
+    }
     Err(DonateError::TargetNotFound)
 }
 
@@ -442,12 +451,8 @@ pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateEr
 // future is free to stash its waker (as IRQ-driven drivers will want
 // to) and have it outlive the original `TaskSlot` view.
 
-const TASK_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    clone_raw,
-    wake_raw,
-    wake_by_ref_raw,
-    drop_raw,
-);
+const TASK_VTABLE: RawWakerVTable =
+    RawWakerVTable::new(clone_raw, wake_raw, wake_by_ref_raw, drop_raw);
 
 unsafe fn clone_raw(data: *const ()) -> RawWaker {
     // Reconstitute, clone, restore the original — net +1 refcount.
@@ -471,12 +476,16 @@ unsafe fn wake_by_ref_raw(data: *const ()) {
     // the AtomicBool behind `data` is valid for the duration of this
     // call.
     let ptr = data as *const AtomicBool;
-    unsafe { (*ptr).store(true, Ordering::Release); }
+    unsafe {
+        (*ptr).store(true, Ordering::Release);
+    }
 }
 
 unsafe fn drop_raw(data: *const ()) {
     // SAFETY: reconstructing consumes the refcount owned by this waker.
-    unsafe { drop(Arc::<AtomicBool>::from_raw(data as *const AtomicBool)); }
+    unsafe {
+        drop(Arc::<AtomicBool>::from_raw(data as *const AtomicBool));
+    }
 }
 
 fn make_waker(flag: Arc<AtomicBool>) -> Waker {
@@ -512,7 +521,11 @@ fn make_waker(flag: Arc<AtomicBool>) -> Waker {
 /// returning once their spawned tasks complete.
 pub fn run_until_empty() {
     let cpu = narf_lib::percpu::current_cpu();
-    let cpu = if cpu < narf_lib::percpu::MAX_CPUS { cpu } else { 0 };
+    let cpu = if cpu < narf_lib::percpu::MAX_CPUS {
+        cpu
+    } else {
+        0
+    };
 
     loop {
         // Snapshot queue length. We'll visit each task at most once per
@@ -533,7 +546,7 @@ pub fn run_until_empty() {
                 let mut q = READY[cpu].lock();
                 match q.as_mut().unwrap().pop_front() {
                     Some(t) => t,
-                    None    => break,
+                    None => break,
                 }
             };
 
@@ -586,8 +599,10 @@ pub fn run_until_empty() {
             narf_rcu::report_quiescent();
 
             match poll_result {
-                Poll::Ready(()) => { ready_this_round += 1; /* drop slot */ }
-                Poll::Pending   => {
+                Poll::Ready(()) => {
+                    ready_this_round += 1; /* drop slot */
+                }
+                Poll::Pending => {
                     let mut q = READY[cpu].lock();
                     q.as_mut().unwrap().push_back(slot);
                 }
@@ -604,7 +619,9 @@ pub fn run_until_empty() {
             q.as_ref().map(|d| d.is_empty()).unwrap_or(true)
         };
         if local_empty {
-            if !try_steal_one(cpu) { return; }
+            if !try_steal_one(cpu) {
+                return;
+            }
             continue;
         }
 
@@ -628,7 +645,9 @@ pub fn run_until_empty() {
 /// No-op when `STEAL_ENABLED` is false (boot default). Callers in the
 /// idle path treat a `false` return as "nothing to do, return".
 fn try_steal_one(cpu: usize) -> bool {
-    if !STEAL_ENABLED.load(Ordering::Acquire) { return false; }
+    if !STEAL_ENABLED.load(Ordering::Acquire) {
+        return false;
+    }
     let max = narf_lib::percpu::MAX_CPUS;
     let my_node = narf_acpi::cpu_node(cpu as u32);
 
@@ -637,9 +656,15 @@ fn try_steal_one(cpu: usize) -> bool {
     if my_node.is_some() {
         for i in 1..max {
             let victim = (cpu + i) % max;
-            if victim == cpu { continue; }
-            if narf_acpi::cpu_node(victim as u32) != my_node { continue; }
-            if try_steal_from(victim, cpu) { return true; }
+            if victim == cpu {
+                continue;
+            }
+            if narf_acpi::cpu_node(victim as u32) != my_node {
+                continue;
+            }
+            if try_steal_from(victim, cpu) {
+                return true;
+            }
         }
     }
 
@@ -647,12 +672,16 @@ fn try_steal_one(cpu: usize) -> bool {
     // unknown). Round-robin starting at cpu+1.
     for i in 1..max {
         let victim = (cpu + i) % max;
-        if victim == cpu { continue; }
+        if victim == cpu {
+            continue;
+        }
         // Skip same-node victims — phase 1 already covered them.
         if my_node.is_some() && narf_acpi::cpu_node(victim as u32) == my_node {
             continue;
         }
-        if try_steal_from(victim, cpu) { return true; }
+        if try_steal_from(victim, cpu) {
+            return true;
+        }
     }
     false
 }
@@ -664,22 +693,27 @@ fn try_steal_from(victim: usize, cpu: usize) -> bool {
         let mut g = READY[victim].lock();
         let q = match g.as_mut() {
             Some(q) => q,
-            None    => return false,
+            None => return false,
         };
         // Linear scan for the first slot we're allowed to take.
         // Stealing a pinned task to the wrong CPU would defeat
         // the pin — respect `allowed`.
-        let pos = q.iter().position(|s|
-            s.spec.affinity.allowed.contains(crate::affinity::CpuId(cpu as u32))
-        );
+        let pos = q.iter().position(|s| {
+            s.spec
+                .affinity
+                .allowed
+                .contains(crate::affinity::CpuId(cpu as u32))
+        });
         match pos {
             Some(p) => q.remove(p),
-            None    => None,
+            None => None,
         }
     };
     if let Some(slot) = stolen {
         let mut g = READY[cpu].lock();
-        g.as_mut().expect("scheduler: steal before init").push_back(slot);
+        g.as_mut()
+            .expect("scheduler: steal before init")
+            .push_back(slot);
         return true;
     }
     false
@@ -713,14 +747,17 @@ pub fn run_forever() -> ! {
 /// `block_on`-equivalent `yield` point for cooperative tasks that just
 /// want to give the executor a chance to run peers.
 #[derive(Debug)]
-pub struct YieldNow { yielded: bool }
+pub struct YieldNow {
+    yielded: bool,
+}
 
 impl Future for YieldNow {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = self.get_mut();
-        if this.yielded { Poll::Ready(()) }
-        else {
+        if this.yielded {
+            Poll::Ready(())
+        } else {
             this.yielded = true;
             cx.waker().wake_by_ref();
             Poll::Pending
@@ -728,4 +765,6 @@ impl Future for YieldNow {
     }
 }
 
-pub fn yield_now() -> YieldNow { YieldNow { yielded: false } }
+pub fn yield_now() -> YieldNow {
+    YieldNow { yielded: false }
+}

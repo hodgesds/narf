@@ -48,24 +48,26 @@ pub enum OverrunPolicy {
 /// deadline (in `narf_time` cycles); `None` for non-realtime tasks.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ResourceBudget {
-    pub share_ppm:       u32,
-    pub burst_cycles:    u64,
+    pub share_ppm: u32,
+    pub burst_cycles: u64,
     pub deadline_cycles: Option<u64>,
-    pub policy:          OverrunPolicy,
+    pub policy: OverrunPolicy,
 }
 
 impl Default for ResourceBudget {
-    fn default() -> Self { Self::unthrottled() }
+    fn default() -> Self {
+        Self::unthrottled()
+    }
 }
 
 impl ResourceBudget {
     /// Unthrottled budget — the common case for kernel drivers.
     pub const fn unthrottled() -> Self {
         Self {
-            share_ppm:       1_000_000,
-            burst_cycles:    u64::MAX,
+            share_ppm: 1_000_000,
+            burst_cycles: u64::MAX,
             deadline_cycles: None,
-            policy:          OverrunPolicy::Ignore,
+            policy: OverrunPolicy::Ignore,
         }
     }
 
@@ -75,7 +77,7 @@ impl ResourceBudget {
             share_ppm,
             burst_cycles,
             deadline_cycles: None,
-            policy:          OverrunPolicy::Block,
+            policy: OverrunPolicy::Block,
         }
     }
 }
@@ -97,20 +99,24 @@ impl CapType for CpuBudget {
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct BudgetAccount {
     pub cycles_spent: u64,
-    pub overruns:     u64,
-    pub polls:        u64,
+    pub overruns: u64,
+    pub polls: u64,
 }
 
 impl BudgetAccount {
     pub const fn new() -> Self {
-        Self { cycles_spent: 0, overruns: 0, polls: 0 }
+        Self {
+            cycles_spent: 0,
+            overruns: 0,
+            polls: 0,
+        }
     }
 
     /// Charge `cycles` to this account against `budget`. Returns
     /// `true` if the charge crossed the burst allowance.
     #[inline]
     pub fn charge(&mut self, cycles: u64, budget: &ResourceBudget) -> bool {
-        self.polls        = self.polls.saturating_add(1);
+        self.polls = self.polls.saturating_add(1);
         self.cycles_spent = self.cycles_spent.saturating_add(cycles);
         let over = cycles > budget.burst_cycles;
         if over {

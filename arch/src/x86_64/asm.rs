@@ -11,7 +11,9 @@ pub unsafe fn disable_interrupts() {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: `CLI` is always valid at CPL=0 and has no operand side effects
     // beyond IF=0. The fence pair keeps loads/stores from migrating across.
-    unsafe { asm!("cli", options(nomem, nostack, preserves_flags)); }
+    unsafe {
+        asm!("cli", options(nomem, nostack, preserves_flags));
+    }
     compiler_fence(Ordering::SeqCst);
 }
 
@@ -20,7 +22,9 @@ pub unsafe fn disable_interrupts() {
 pub unsafe fn enable_interrupts() {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: `STI` sets IF=1. Caller-side invariant: IDT is installed.
-    unsafe { asm!("sti", options(nomem, nostack, preserves_flags)); }
+    unsafe {
+        asm!("sti", options(nomem, nostack, preserves_flags));
+    }
     compiler_fence(Ordering::SeqCst);
 }
 
@@ -30,7 +34,9 @@ pub unsafe fn enable_interrupts() {
 pub unsafe fn halt_once() {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: `HLT` at CPL=0 halts until the next interrupt / SMI / NMI.
-    unsafe { asm!("hlt", options(nomem, nostack, preserves_flags)); }
+    unsafe {
+        asm!("hlt", options(nomem, nostack, preserves_flags));
+    }
     compiler_fence(Ordering::SeqCst);
 }
 
@@ -71,7 +77,9 @@ pub fn interrupts_enabled() -> bool {
 pub fn halt_until_irq() {
     if interrupts_enabled() {
         // SAFETY: HLT at CPL=0 with IF=1 wakes on the next IRQ.
-        unsafe { halt_once(); }
+        unsafe {
+            halt_once();
+        }
     } else {
         core::hint::spin_loop();
     }
@@ -107,7 +115,9 @@ pub unsafe fn idle_halt_then_disable() {
     // SAFETY: caller-asserted IF=0 entering. sti; hlt; cli is
     // atomic on x86 — no IRQ delivers between sti and hlt; HLT
     // then wakes on the IRQ; cli leaves IF=0.
-    unsafe { core::arch::asm!("sti", "hlt", "cli", options()); }
+    unsafe {
+        core::arch::asm!("sti", "hlt", "cli", options());
+    }
 }
 
 /// Disable interrupts, then spin on `HLT` forever. Used for panic and Stage-1
@@ -119,7 +129,9 @@ pub fn halt_forever() -> ! {
     // of the kernel.
     unsafe {
         disable_interrupts();
-        loop { halt_once(); }
+        loop {
+            halt_once();
+        }
     }
 }
 
@@ -129,9 +141,9 @@ pub fn halt_forever() -> ! {
 /// `ptr` must be 16-byte aligned and point to valid, writable memory.
 #[inline(always)]
 pub unsafe fn cas128(ptr: *mut u128, old: u128, new: u128) -> Result<u128, u128> {
-    let old_low  = old as u64;
+    let old_low = old as u64;
     let old_high = (old >> 64) as u64;
-    let new_low  = new as u64;
+    let new_low = new as u64;
     let new_high = (new >> 64) as u64;
 
     let res_low: u64;
@@ -185,7 +197,9 @@ pub unsafe fn patch_word(addr: *mut u32, new: u32) {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: aligned 4-byte store is atomic on every x86_64 CPU NARF
     // targets. The caller asserts writable + executable + aligned.
-    unsafe { core::ptr::write_volatile(addr, new); }
+    unsafe {
+        core::ptr::write_volatile(addr, new);
+    }
     // Serialising instruction: CPUID with EAX=0 is the canonical
     // x86 post-self-modifying-code flush. Spec is clear that an
     // instruction-fetch of modified code without a serialising

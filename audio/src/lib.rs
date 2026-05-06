@@ -31,8 +31,8 @@
 
 extern crate alloc;
 
-pub mod hda;
 pub mod acp6;
+pub mod hda;
 
 mod hda_tests;
 mod tests;
@@ -59,7 +59,7 @@ pub enum SampleFormat {
 /// (5.1, 7.1) lands when the audio server / mixer arrives.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ChannelLayout {
-    Mono   = 1,
+    Mono = 1,
     Stereo = 2,
 }
 
@@ -69,8 +69,8 @@ pub enum ChannelLayout {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct AudioFormat {
     pub sample_rate_hz: u32,
-    pub format:         SampleFormat,
-    pub channels:       ChannelLayout,
+    pub format: SampleFormat,
+    pub channels: ChannelLayout,
 }
 
 impl AudioFormat {
@@ -80,8 +80,8 @@ impl AudioFormat {
     pub const fn default_playback() -> Self {
         Self {
             sample_rate_hz: 48_000,
-            format:         SampleFormat::S16Le,
-            channels:       ChannelLayout::Stereo,
+            format: SampleFormat::S16Le,
+            channels: ChannelLayout::Stereo,
         }
     }
 
@@ -145,8 +145,12 @@ impl AudioStream for VirtioSoundPlayback {
         fmt.format == SampleFormat::S16Le
             && (fmt.sample_rate_hz == 48_000 || fmt.sample_rate_hz == 44_100)
     }
-    fn name(&self) -> &'static str { "virtio-sound" }
-    fn is_playback(&self) -> bool { true }
+    fn name(&self) -> &'static str {
+        "virtio-sound"
+    }
+    fn is_playback(&self) -> bool {
+        true
+    }
 }
 
 static PLAYBACK: VirtioSoundPlayback = VirtioSoundPlayback;
@@ -174,8 +178,12 @@ impl AudioStream for IntelHdaPlayback {
             && fmt.sample_rate_hz == 48_000
             && fmt.channels == ChannelLayout::Stereo
     }
-    fn name(&self) -> &'static str { "intel-hda" }
-    fn is_playback(&self) -> bool { true }
+    fn name(&self) -> &'static str {
+        "intel-hda"
+    }
+    fn is_playback(&self) -> bool {
+        true
+    }
 }
 
 static HDA_PLAYBACK: IntelHdaPlayback = IntelHdaPlayback;
@@ -184,8 +192,12 @@ static HDA_PLAYBACK: IntelHdaPlayback = IntelHdaPlayback;
 /// it's probed (more flexibility today: 44.1 + 48 kHz, mono +
 /// stereo); fall through to Intel HDA on bare metal.
 pub fn select_active_playback() -> Option<&'static dyn AudioStream> {
-    if PLAYBACK.current_format().is_some() { return Some(&PLAYBACK); }
-    if HDA_PLAYBACK.current_format().is_some() { return Some(&HDA_PLAYBACK); }
+    if PLAYBACK.current_format().is_some() {
+        return Some(&PLAYBACK);
+    }
+    if HDA_PLAYBACK.current_format().is_some() {
+        return Some(&HDA_PLAYBACK);
+    }
     None
 }
 
@@ -204,7 +216,7 @@ pub enum AudioWriteError {
 #[derive(Debug)]
 pub struct AudioWriter {
     stream: &'static dyn AudioStream,
-    cap:    Cap<AudioStreamCap, Write>,
+    cap: Cap<AudioStreamCap, Write>,
     format: AudioFormat,
 }
 
@@ -220,14 +232,22 @@ impl AudioWriter {
         if !stream.supports(fmt) {
             return Err(AudioWriteError::UnsupportedFormat);
         }
-        Ok(Self { stream, cap, format: fmt })
+        Ok(Self {
+            stream,
+            cap,
+            format: fmt,
+        })
     }
 
     /// Currently negotiated format.
-    pub fn format(&self) -> AudioFormat { self.format }
+    pub fn format(&self) -> AudioFormat {
+        self.format
+    }
 
     /// Backend name — for diagnostics.
-    pub fn name(&self) -> &'static str { self.stream.name() }
+    pub fn name(&self) -> &'static str {
+        self.stream.name()
+    }
 
     /// Validate cap is still live.
     fn check_live(&self) -> Result<(), AudioWriteError> {
@@ -250,7 +270,7 @@ impl AudioWriter {
         }
         match self.stream.name() {
             "intel-hda" => self.submit_hda(pcm),
-            _           => self.submit_virtio_sound(pcm),
+            _ => self.submit_virtio_sound(pcm),
         }
     }
 
@@ -260,8 +280,8 @@ impl AudioWriter {
         // baseline only knows about S16LE @ 44.1/48 kHz; supports()
         // already gated on these.
         use narf_drivers_virtio::snd_pci::{
-            self, PcmParams, VIRTIO_SND_PCM_FMT_S16,
-            VIRTIO_SND_PCM_RATE_44100, VIRTIO_SND_PCM_RATE_48000,
+            self, PcmParams, VIRTIO_SND_PCM_FMT_S16, VIRTIO_SND_PCM_RATE_44100,
+            VIRTIO_SND_PCM_RATE_48000,
         };
         let rate_code = match self.format.sample_rate_hz {
             44_100 => VIRTIO_SND_PCM_RATE_44100,
@@ -277,12 +297,11 @@ impl AudioWriter {
         let params = PcmParams {
             buffer_bytes: 8192,
             period_bytes: 2048,
-            channels:     self.format.channels as u8,
-            format:       format_code,
-            rate:         rate_code,
+            channels: self.format.channels as u8,
+            format: format_code,
+            rate: rate_code,
         };
-        snd_pci::play_buffer(params, pcm)
-            .map_err(|_| AudioWriteError::StreamClosed)?;
+        snd_pci::play_buffer(params, pcm).map_err(|_| AudioWriteError::StreamClosed)?;
         Ok((pcm.len() / bpf) as u64)
     }
 
@@ -305,14 +324,14 @@ impl AudioWriter {
             let hi = pcm[i * 2 + 1];
             tmp.push(i16::from_le_bytes([lo, hi]));
         }
-        let loaded = hda::with_controller(|c| c.load_period(&tmp))
-            .ok_or(AudioWriteError::NoActiveStream)?;
+        let loaded =
+            hda::with_controller(|c| c.load_period(&tmp)).ok_or(AudioWriteError::NoActiveStream)?;
         // Kick the engine if it isn't already running. Idempotent
         // per HDA::start_output.
         let _started = hda::with_controller(|c|
             // SAFETY: singleton owns BAR0 for its lifetime.
-            unsafe { c.start_output() }
-        ).unwrap_or(false);
+            unsafe { c.start_output() })
+        .unwrap_or(false);
         Ok((loaded * 2 / bpf) as u64)
     }
 
@@ -329,8 +348,8 @@ impl AudioWriter {
     pub fn submit_shmem(
         &self,
         shmem_handle: u64,
-        byte_offset:  u64,
-        byte_len:     u64,
+        byte_offset: u64,
+        byte_len: u64,
     ) -> Result<u64, AudioWriteError> {
         self.check_live()?;
         let bpf = self.format.bytes_per_frame() as u64;
@@ -343,11 +362,11 @@ impl AudioWriter {
         if (byte_offset & 0xFFF) + byte_len > 4096 {
             return Err(AudioWriteError::UnsupportedFormat);
         }
-        let phys = narf_shmem::phys_at(shmem_handle, byte_offset)
-            .ok_or(AudioWriteError::StreamClosed)?;
+        let phys =
+            narf_shmem::phys_at(shmem_handle, byte_offset).ok_or(AudioWriteError::StreamClosed)?;
         use narf_drivers_virtio::snd_pci::{
-            self, PcmParams, VIRTIO_SND_PCM_FMT_S16,
-            VIRTIO_SND_PCM_RATE_44100, VIRTIO_SND_PCM_RATE_48000,
+            self, PcmParams, VIRTIO_SND_PCM_FMT_S16, VIRTIO_SND_PCM_RATE_44100,
+            VIRTIO_SND_PCM_RATE_48000,
         };
         let rate_code = match self.format.sample_rate_hz {
             44_100 => VIRTIO_SND_PCM_RATE_44100,
@@ -361,9 +380,9 @@ impl AudioWriter {
         let params = PcmParams {
             buffer_bytes: 8192,
             period_bytes: 2048,
-            channels:     self.format.channels as u8,
-            format:       format_code,
-            rate:         rate_code,
+            channels: self.format.channels as u8,
+            format: format_code,
+            rate: rate_code,
         };
         snd_pci::play_buffer_phys(params, phys, byte_len as u32)
             .map_err(|_| AudioWriteError::StreamClosed)?;
@@ -384,14 +403,16 @@ pub fn bootstrap_writer() -> Cap<AudioStreamCap, Write> {
 // ── Init wiring ─────────────────────────────────────────────────────
 
 static INIT_BACKEND_NAME: AtomicUsize = AtomicUsize::new(0);
-static INIT_BACKEND_LEN:  AtomicUsize = AtomicUsize::new(0);
+static INIT_BACKEND_LEN: AtomicUsize = AtomicUsize::new(0);
 
 /// Test helper: name of the playback backend the boot picker
 /// selected, or `None` if none was available at init time.
 pub fn last_picked_backend() -> Option<&'static str> {
     let p = INIT_BACKEND_NAME.load(Ordering::Acquire) as *const u8;
     let l = INIT_BACKEND_LEN.load(Ordering::Acquire);
-    if p.is_null() || l == 0 { return None; }
+    if p.is_null() || l == 0 {
+        return None;
+    }
     // SAFETY: published from a `&'static str`.
     unsafe {
         let slice = core::slice::from_raw_parts(p, l);
@@ -421,7 +442,7 @@ pub fn register_initcalls() {
     narf_init::register(Stage::Late, "audio-playback-picker", || {
         if let Some(s) = select_active_playback() {
             INIT_BACKEND_NAME.store(s.name().as_ptr() as usize, Ordering::Release);
-            INIT_BACKEND_LEN.store(s.name().len(),               Ordering::Release);
+            INIT_BACKEND_LEN.store(s.name().len(), Ordering::Release);
             InitResult::Ok
         } else {
             InitResult::NotPresent

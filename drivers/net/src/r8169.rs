@@ -55,17 +55,14 @@ use core::sync::atomic::{compiler_fence, Ordering};
 // `narf-driver-runtime` for the rationale + the cap-mediated
 // userspace plumbing roadmap.
 use narf_driver_runtime::{
-    map_bar, BusDevice, BusDeviceCap, MmioRegion,
-    Cap, Write,
-    alloc_coherent, DmaBuffer,
-    DomainId,
-    Lock as IrqSafeSpinLock,
+    alloc_coherent, map_bar, BusDevice, BusDeviceCap, Cap, DmaBuffer, DomainId,
+    Lock as IrqSafeSpinLock, MmioRegion, Write,
 };
 
 // ── PCI ids ─────────────────────────────────────────────────────────
 
 /// Vendor: Realtek Semiconductor Corp.
-pub const RTL_VENDOR:  u16 = 0x10EC;
+pub const RTL_VENDOR: u16 = 0x10EC;
 /// RTL8168/RTL8111 — the wired Gigabit family. Ships on most modern
 /// Realtek-equipped boards regardless of internal sub-revision; the
 /// PCI ID stays fixed across B/C/D/E/F/G/H/I sub-rev cuts.
@@ -73,24 +70,24 @@ pub const RTL_DEV_8168: u16 = 0x8168;
 
 // ── Register offsets ────────────────────────────────────────────────
 
-const REG_IDR0:    u64 = 0x00;
-const REG_TNPDS:   u64 = 0x20;
-const REG_CR:      u64 = 0x37;
-const REG_TPPOLL:  u64 = 0x38;
-const REG_IMR:     u64 = 0x3C;
-const REG_ISR:     u64 = 0x3E;
-const REG_TCR:     u64 = 0x40;
-const REG_RCR:     u64 = 0x44;
-const REG_9346CR:  u64 = 0x50;
+const REG_IDR0: u64 = 0x00;
+const REG_TNPDS: u64 = 0x20;
+const REG_CR: u64 = 0x37;
+const REG_TPPOLL: u64 = 0x38;
+const REG_IMR: u64 = 0x3C;
+const REG_ISR: u64 = 0x3E;
+const REG_TCR: u64 = 0x40;
+const REG_RCR: u64 = 0x44;
+const REG_9346CR: u64 = 0x50;
 const REG_PHYSTAT: u64 = 0x6C;
-const REG_RMS:     u64 = 0xDA;
+const REG_RMS: u64 = 0xDA;
 const REG_CPLUSCR: u64 = 0xE0;
-const REG_RDSAR:   u64 = 0xE4;
-const REG_MTPS:    u64 = 0xEC;
+const REG_RDSAR: u64 = 0xE4;
+const REG_MTPS: u64 = 0xEC;
 
 // CR bits.
-const CR_TE:  u8 = 1 << 2;
-const CR_RE:  u8 = 1 << 3;
+const CR_TE: u8 = 1 << 2;
+const CR_RE: u8 = 1 << 3;
 const CR_RST: u8 = 1 << 4;
 
 // TPPoll bits.
@@ -98,29 +95,29 @@ const TPPOLL_NPQ: u8 = 1 << 6;
 
 // 9346CR (config-write lock). Bits 7:6 = EEM. 00=normal, 11=config-
 // register write-enable.
-const EEM_NORMAL:        u8 = 0x00;
-const EEM_CONFIG_WRITE:  u8 = 0xC0;
+const EEM_NORMAL: u8 = 0x00;
+const EEM_CONFIG_WRITE: u8 = 0xC0;
 
 // RCR bits.
-const RCR_AAP:  u32 = 1 << 0;   // Accept All (promiscuous)
-const RCR_APM:  u32 = 1 << 1;   // Accept Physical Match
-const RCR_AM:   u32 = 1 << 2;   // Accept Multicast
-const RCR_AB:   u32 = 1 << 3;   // Accept Broadcast
-// MXDMA[10:8] = 0b111 = unlimited, RXFTH[15:13] = 0b111 = no threshold.
+const RCR_AAP: u32 = 1 << 0; // Accept All (promiscuous)
+const RCR_APM: u32 = 1 << 1; // Accept Physical Match
+const RCR_AM: u32 = 1 << 2; // Accept Multicast
+const RCR_AB: u32 = 1 << 3; // Accept Broadcast
+                            // MXDMA[10:8] = 0b111 = unlimited, RXFTH[15:13] = 0b111 = no threshold.
 const RCR_MXDMA_UNLIMITED: u32 = 0b111 << 8;
-const RCR_RXFTH_NONE:      u32 = 0b111 << 13;
+const RCR_RXFTH_NONE: u32 = 0b111 << 13;
 
 // TCR bits. MXDMA[10:8] = 0b111 = unlimited; IFG default = 0b011 at
 // bits 25:24 (96 ns at 1 Gbps — IEEE 802.3 minimum).
 const TCR_MXDMA_UNLIMITED: u32 = 0b111 << 8;
-const TCR_IFG_STD:         u32 = 0b11  << 24;
+const TCR_IFG_STD: u32 = 0b11 << 24;
 
 // ISR / IMR bits we actually wire.
-const INT_ROK:     u16 = 1 << 0;
-const INT_TOK:     u16 = 1 << 2;
+const INT_ROK: u16 = 1 << 0;
+const INT_TOK: u16 = 1 << 2;
 const INT_LINKCHG: u16 = 1 << 5;
-const INT_RDU:     u16 = 1 << 4;
-const INT_TDU:     u16 = 1 << 7;
+const INT_RDU: u16 = 1 << 4;
+const INT_TDU: u16 = 1 << 7;
 
 // PHYStatus bits.
 const PHYSTAT_LINKSTS: u8 = 1 << 1;
@@ -128,13 +125,13 @@ const PHYSTAT_LINKSTS: u8 = 1 << 1;
 // TX descriptor flags (word0 high bits).
 const TXD_OWN: u32 = 1 << 31;
 const TXD_EOR: u32 = 1 << 30;
-const TXD_FS:  u32 = 1 << 29;
-const TXD_LS:  u32 = 1 << 28;
+const TXD_FS: u32 = 1 << 29;
+const TXD_LS: u32 = 1 << 28;
 
 // RX descriptor flags (word0 high bits).
 const RXD_OWN: u32 = 1 << 31;
 const RXD_EOR: u32 = 1 << 30;
-const RXD_LS:  u32 = 1 << 28;
+const RXD_LS: u32 = 1 << 28;
 // Frame length lives in word0 bits[13:0] in the *status* layout
 // (after the NIC clears OWN). It overlaps the BufferSize field of the
 // command layout but is read after the NIC has flipped OWN to 0.
@@ -145,7 +142,7 @@ const RXD_LS:  u32 = 1 << 28;
 /// descriptors; 256 is plenty for a Stage-4 driver and lands a full
 /// ring (256 * 16 = 4096 bytes) inside one `alloc_coherent` page.
 pub const RING_LEN: usize = 256;
-const RING_BYTES:    usize = RING_LEN * 16;
+const RING_BYTES: usize = RING_LEN * 16;
 
 /// RX buffer size. 2 KiB matches what the RCR datasheet expects for
 /// non-jumbo traffic; the driver doesn't program any RX-buffer-size
@@ -188,9 +185,9 @@ struct Desc {
     /// + frame length in RX status), bits [13..0] are buffer size or
     /// frame length depending on direction.
     flags_len: u32,
-    vlan:      u32,
-    addr_lo:   u32,
-    addr_hi:   u32,
+    vlan: u32,
+    addr_lo: u32,
+    addr_hi: u32,
 }
 const _: () = assert!(core::mem::size_of::<Desc>() == 16);
 
@@ -199,20 +196,20 @@ const _: () = assert!(core::mem::size_of::<Desc>() == 16);
 /// A live RTL8168/RTL8111 Gigabit Ethernet controller. Holds the
 /// MMIO mapping, the descriptor rings, and the RX buffer pool.
 pub struct RtlNic {
-    mmio:       MmioRegion,
+    mmio: MmioRegion,
     /// TX descriptor ring DMA buffer (`RING_LEN * 16` bytes).
-    tx_ring:    DmaBuffer,
+    tx_ring: DmaBuffer,
     /// Driver-side TX producer cursor (next slot to fill).
-    tx_head:    IrqSafeSpinLock<u32>,
+    tx_head: IrqSafeSpinLock<u32>,
     /// RX descriptor ring DMA buffer (`RING_LEN * 16` bytes).
-    rx_ring:    DmaBuffer,
+    rx_ring: DmaBuffer,
     /// One DMA buffer per RX descriptor. Kept alive for the lifetime
     /// of the driver — descriptor `i` always points at `rx_pool[i]`.
-    rx_pool:    alloc::vec::Vec<DmaBuffer>,
+    rx_pool: alloc::vec::Vec<DmaBuffer>,
     /// Driver-side RX consumer cursor.
-    rx_head:    IrqSafeSpinLock<u32>,
+    rx_head: IrqSafeSpinLock<u32>,
     /// MAC address read from IDR0..5 at bring-up.
-    pub mac:    [u8; 6],
+    pub mac: [u8; 6],
     /// True when PHYStatus.LinkSts read 1 at bring-up. We don't yet
     /// re-poll on LinkChg interrupts.
     pub link_up: bool,
@@ -220,7 +217,7 @@ pub struct RtlNic {
     pub irq_vector: Option<u8>,
     /// Live MSI-X table — kept alive so the device's MSI-X enable
     /// stays sticky.
-    msix:       Option<narf_bus::MsixTable>,
+    msix: Option<narf_bus::MsixTable>,
 }
 
 impl core::fmt::Debug for RtlNic {
@@ -242,22 +239,25 @@ impl RtlNic {
     /// the duration of init.
     pub unsafe fn bring_up(
         device: &BusDevice,
-        _cap:   &Cap<BusDeviceCap, Write>,
+        _cap: &Cap<BusDeviceCap, Write>,
     ) -> Result<Self, NicError> {
         // RTL8168 lays its operational registers in BAR2 (MMIO);
         // BAR0 is the legacy I/O alias. We always take the MMIO BAR.
         // SAFETY: caller-asserted exclusive ownership.
-        let mmio = unsafe { map_bar(device, 2) }
-            .map_err(|_| NicError::BarMapFailed)?;
+        let mmio = unsafe { map_bar(device, 2) }.map_err(|_| NicError::BarMapFailed)?;
 
         // 1. Software reset. CR.RST self-clears once the chip has
         //    finished re-initialising the FIFOs + descriptor pointers
         //    (datasheet §2.3 Table 3).
         // SAFETY: identity-mapped MMIO.
-        unsafe { mmio.write8(REG_CR, CR_RST); }
+        unsafe {
+            mmio.write8(REG_CR, CR_RST);
+        }
         for _ in 0..1_000_000u32 {
             // SAFETY: same.
-            if unsafe { mmio.read8(REG_CR) } & CR_RST == 0 { break; }
+            if unsafe { mmio.read8(REG_CR) } & CR_RST == 0 {
+                break;
+            }
             core::hint::spin_loop();
         }
 
@@ -281,16 +281,14 @@ impl RtlNic {
         //    has every descriptor's OWN bit clear, i.e. owned by the
         //    host. The RX-side OWN bits get flipped to NIC-owned in
         //    step 5b.
-        let tx_ring = alloc_coherent(RING_BYTES, DomainId::DRIVER_0)
-            .map_err(|_| NicError::NoMemory)?;
-        let rx_ring = alloc_coherent(RING_BYTES, DomainId::DRIVER_0)
-            .map_err(|_| NicError::NoMemory)?;
-        let mut rx_pool: alloc::vec::Vec<DmaBuffer> =
-            alloc::vec::Vec::with_capacity(RING_LEN);
+        let tx_ring =
+            alloc_coherent(RING_BYTES, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?;
+        let rx_ring =
+            alloc_coherent(RING_BYTES, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?;
+        let mut rx_pool: alloc::vec::Vec<DmaBuffer> = alloc::vec::Vec::with_capacity(RING_LEN);
         for _ in 0..RING_LEN {
             rx_pool.push(
-                alloc_coherent(RX_BUF_LEN, DomainId::DRIVER_0)
-                    .map_err(|_| NicError::NoMemory)?,
+                alloc_coherent(RX_BUF_LEN, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?,
             );
         }
 
@@ -298,13 +296,17 @@ impl RtlNic {
         //    checksum offload — the upper layer doesn't yet consume
         //    these, and a clean zero is the predictable default.
         // SAFETY: identity-mapped.
-        unsafe { mmio.write16(REG_CPLUSCR, 0); }
+        unsafe {
+            mmio.write16(REG_CPLUSCR, 0);
+        }
 
         // 5. CR enables both TE + RE per §7 step 2. The datasheet
         //    states that TCR can only be configured once TE is set;
         //    same idiom for RCR + RE.
         // SAFETY: same.
-        unsafe { mmio.write8(REG_CR, CR_TE | CR_RE); }
+        unsafe {
+            mmio.write8(REG_CR, CR_TE | CR_RE);
+        }
 
         // 5a. Program TX descriptor ring base + TCR. The last
         //     descriptor's EOR bit is set lazily on first transmit —
@@ -315,7 +317,7 @@ impl RtlNic {
         // value; per §2.20 the spec splits it as low-32 at offset+0
         // and high-32 at offset+4.
         unsafe {
-            mmio.write32(REG_TNPDS,     tx_phys as u32);
+            mmio.write32(REG_TNPDS, tx_phys as u32);
             mmio.write32(REG_TNPDS + 4, (tx_phys >> 32) as u32);
             mmio.write32(REG_TCR, TCR_MXDMA_UNLIMITED | TCR_IFG_STD);
             mmio.write8(REG_MTPS, MTPS_DEFAULT);
@@ -329,22 +331,23 @@ impl RtlNic {
         for i in 0..RING_LEN {
             let buf_phys = rx_pool[i].phys_addr().raw();
             let mut flags = RXD_OWN | (RX_BUF_LEN as u32 & 0x3FFF);
-            if i == RING_LEN - 1 { flags |= RXD_EOR; }
+            if i == RING_LEN - 1 {
+                flags |= RXD_EOR;
+            }
             let d = Desc {
                 flags_len: flags,
-                vlan:      0,
-                addr_lo:   buf_phys as u32,
-                addr_hi:   (buf_phys >> 32) as u32,
+                vlan: 0,
+                addr_lo: buf_phys as u32,
+                addr_hi: (buf_phys >> 32) as u32,
             };
             // SAFETY: identity-mapped DMA ring page; i < RING_LEN.
             unsafe {
-                core::ptr::write_volatile(
-                    (rx_ring_phys + (i * 16) as u64) as *mut Desc, d);
+                core::ptr::write_volatile((rx_ring_phys + (i * 16) as u64) as *mut Desc, d);
             }
         }
         // SAFETY: identity-mapped MMIO.
         unsafe {
-            mmio.write32(REG_RDSAR,     rx_ring_phys as u32);
+            mmio.write32(REG_RDSAR, rx_ring_phys as u32);
             mmio.write32(REG_RDSAR + 4, (rx_ring_phys >> 32) as u32);
             mmio.write16(REG_RMS, RMS_DEFAULT);
         }
@@ -354,9 +357,10 @@ impl RtlNic {
         //     set to "unlimited" per §2.8 Table 8.
         // SAFETY: same.
         unsafe {
-            mmio.write32(REG_RCR,
-                RCR_APM | RCR_AM | RCR_AB
-                | RCR_MXDMA_UNLIMITED | RCR_RXFTH_NONE);
+            mmio.write32(
+                REG_RCR,
+                RCR_APM | RCR_AM | RCR_AB | RCR_MXDMA_UNLIMITED | RCR_RXFTH_NONE,
+            );
         }
 
         // 6. Mask all interrupts at IMR for now. MSI-X bring-up flips
@@ -383,7 +387,9 @@ impl RtlNic {
         //    leak through; we never enter that mode (we don't touch
         //    CONFIG[0..5]) but we make the lock explicit for clarity.
         // SAFETY: same.
-        unsafe { mmio.write8(REG_9346CR, EEM_NORMAL); }
+        unsafe {
+            mmio.write8(REG_9346CR, EEM_NORMAL);
+        }
 
         Ok(Self {
             mmio,
@@ -409,22 +415,18 @@ impl RtlNic {
     /// Caller owns the device's BAR + cfg windows exclusively.
     pub unsafe fn enable_msix(
         &mut self,
-        cap:    &Cap<BusDeviceCap, Write>,
+        cap: &Cap<BusDeviceCap, Write>,
         device: &BusDevice,
     ) -> Result<u8, NicError> {
-        let mut table = narf_bus::enable_msix(cap, device)
-            .map_err(|_| NicError::MsixSetup)?;
-        let v = narf_interrupts::vector::alloc()
-            .map_err(|_| NicError::MsixSetup)?;
+        let mut table = narf_bus::enable_msix(cap, device).map_err(|_| NicError::MsixSetup)?;
+        let v = narf_interrupts::vector::alloc().map_err(|_| NicError::MsixSetup)?;
         let _ = table.alloc_vector().ok_or(NicError::MsixSetup)?;
         // SAFETY: x2APIC is online by Stage-4 boot.
         let target_apic = unsafe { narf_interrupts::current_cpu_target_id() };
         // SAFETY: caller-authority over the device.
-        unsafe { table.program_vector(0, target_apic, v) }
-            .map_err(|_| NicError::MsixSetup)?;
+        unsafe { table.program_vector(0, target_apic, v) }.map_err(|_| NicError::MsixSetup)?;
         // SAFETY: same.
-        unsafe { table.enable() }
-            .map_err(|_| NicError::MsixSetup)?;
+        unsafe { table.enable() }.map_err(|_| NicError::MsixSetup)?;
 
         // Unmask the events we care about. Stage-4: TX completion
         // (TOK), RX arrival (ROK), link change (LinkChg). Descriptor-
@@ -432,11 +434,13 @@ impl RtlNic {
         // polled paths handle by bouncing off `TxRingFull` / empty
         // RX, so we don't need them yet.
         // SAFETY: identity-mapped MMIO.
-        unsafe { self.mmio.write16(REG_IMR,
-            INT_ROK | INT_TOK | INT_LINKCHG | INT_RDU | INT_TDU); }
+        unsafe {
+            self.mmio
+                .write16(REG_IMR, INT_ROK | INT_TOK | INT_LINKCHG | INT_RDU | INT_TDU);
+        }
 
         self.irq_vector = Some(v);
-        self.msix       = Some(table);
+        self.msix = Some(table);
         Ok(v)
     }
 
@@ -451,8 +455,7 @@ impl RtlNic {
         // Stage the frame into a per-call DMA scratch page. A real
         // driver pools these — Stage-4 cut keeps allocator pressure
         // explicit instead of hiding it.
-        let scratch = alloc_coherent(4096, DomainId::DRIVER_0)
-            .map_err(|_| NicError::NoMemory)?;
+        let scratch = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?;
         let phys = scratch.phys_addr().raw();
         // SAFETY: identity-mapped DMA page.
         unsafe {
@@ -470,9 +473,7 @@ impl RtlNic {
         // still set, the NIC hasn't drained the previous send — the
         // ring is full from the host's POV.
         // SAFETY: identity-mapped DMA ring; slot < RING_LEN.
-        let cur_flags = unsafe {
-            core::ptr::read_volatile(desc_addr as *const u32)
-        };
+        let cur_flags = unsafe { core::ptr::read_volatile(desc_addr as *const u32) };
         if cur_flags & TXD_OWN != 0 {
             return Err(NicError::TxRingFull);
         }
@@ -480,14 +481,15 @@ impl RtlNic {
         // Fill in the descriptor. FS+LS = single-segment packet.
         // EOR set on the very last slot in the ring so the NIC's
         // internal pointer wraps to slot 0.
-        let mut flags = TXD_OWN | TXD_FS | TXD_LS
-            | (frame.len() as u32 & 0xFFFF);
-        if slot == RING_LEN - 1 { flags |= TXD_EOR; }
+        let mut flags = TXD_OWN | TXD_FS | TXD_LS | (frame.len() as u32 & 0xFFFF);
+        if slot == RING_LEN - 1 {
+            flags |= TXD_EOR;
+        }
         let d = Desc {
             flags_len: flags,
-            vlan:      0,
-            addr_lo:   phys as u32,
-            addr_hi:   (phys >> 32) as u32,
+            vlan: 0,
+            addr_lo: phys as u32,
+            addr_hi: (phys >> 32) as u32,
         };
         // The NIC sees OWN=1 once we publish word0; the addr/len
         // fields must already be visible. Order: write addr/vlan/
@@ -495,12 +497,9 @@ impl RtlNic {
         // SAFETY: identity-mapped DMA ring.
         unsafe {
             // Write the buffer pointer + vlan first.
-            core::ptr::write_volatile(
-                (desc_addr + 4)  as *mut u32, d.vlan);
-            core::ptr::write_volatile(
-                (desc_addr + 8)  as *mut u32, d.addr_lo);
-            core::ptr::write_volatile(
-                (desc_addr + 12) as *mut u32, d.addr_hi);
+            core::ptr::write_volatile((desc_addr + 4) as *mut u32, d.vlan);
+            core::ptr::write_volatile((desc_addr + 8) as *mut u32, d.addr_lo);
+            core::ptr::write_volatile((desc_addr + 12) as *mut u32, d.addr_hi);
         }
         compiler_fence(Ordering::SeqCst);
         // SAFETY: same.
@@ -513,7 +512,9 @@ impl RtlNic {
         // queue has fresh work; it self-clears after the pending
         // packets drain.
         // SAFETY: identity-mapped MMIO.
-        unsafe { self.mmio.write8(REG_TPPOLL, TPPOLL_NPQ); }
+        unsafe {
+            self.mmio.write8(REG_TPPOLL, TPPOLL_NPQ);
+        }
 
         let next_head = (*head_g + 1) % (RING_LEN as u32);
         *head_g = next_head;
@@ -525,10 +526,10 @@ impl RtlNic {
         let mut spins = 0u32;
         loop {
             // SAFETY: identity-mapped DMA ring.
-            let f = unsafe {
-                core::ptr::read_volatile(desc_addr as *const u32)
-            };
-            if f & TXD_OWN == 0 { break; }
+            let f = unsafe { core::ptr::read_volatile(desc_addr as *const u32) };
+            if f & TXD_OWN == 0 {
+                break;
+            }
             spins += 1;
             if spins > 10_000_000 {
                 return Err(NicError::TxTimeout);
@@ -550,10 +551,10 @@ impl RtlNic {
         let desc_addr = ring_phys + (slot * 16) as u64;
 
         // SAFETY: identity-mapped DMA ring.
-        let flags_len = unsafe {
-            core::ptr::read_volatile(desc_addr as *const u32)
-        };
-        if flags_len & RXD_OWN != 0 { return None; }
+        let flags_len = unsafe { core::ptr::read_volatile(desc_addr as *const u32) };
+        if flags_len & RXD_OWN != 0 {
+            return None;
+        }
 
         // Status layout: bits[13:0] = received frame length (incl.
         // CRC unless RCR.SECRC strips it; Stage-4 leaves SECRC off
@@ -568,10 +569,7 @@ impl RtlNic {
             let copy_len = len.min(RX_BUF_LEN);
             // SAFETY: identity-mapped DMA buffer.
             for i in 0..copy_len {
-                out.push(unsafe {
-                    core::ptr::read_volatile(
-                        (buf_phys + i as u64) as *const u8)
-                });
+                out.push(unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) });
             }
         }
         // (For non-LS descriptors we still rearm + advance — the
@@ -580,12 +578,14 @@ impl RtlNic {
         // Rearm the descriptor: OWN=1, BufferSize=RX_BUF_LEN, EOR
         // preserved if this is the wrap slot.
         let mut new_flags = RXD_OWN | (RX_BUF_LEN as u32 & 0x3FFF);
-        if slot == RING_LEN - 1 { new_flags |= RXD_EOR; }
+        if slot == RING_LEN - 1 {
+            new_flags |= RXD_EOR;
+        }
         let d = Desc {
             flags_len: new_flags,
-            vlan:      0,
-            addr_lo:   buf_phys as u32,
-            addr_hi:   (buf_phys >> 32) as u32,
+            vlan: 0,
+            addr_lo: buf_phys as u32,
+            addr_hi: (buf_phys >> 32) as u32,
         };
         // SAFETY: same.
         unsafe {
@@ -610,7 +610,9 @@ impl RtlNic {
         let s = unsafe { self.mmio.read16(REG_ISR) };
         // Datasheet §2.6: write 1 to clear.
         // SAFETY: same.
-        unsafe { self.mmio.write16(REG_ISR, s); }
+        unsafe {
+            self.mmio.write16(REG_ISR, s);
+        }
         s
     }
 
@@ -642,8 +644,7 @@ impl RtlNic {
 
         // Stage frame + descriptor (same shape as polled `transmit`,
         // minus the OWN-clear spin at the end).
-        let scratch = alloc_coherent(4096, DomainId::DRIVER_0)
-            .map_err(|_| NicError::NoMemory)?;
+        let scratch = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?;
         let phys = scratch.phys_addr().raw();
         // SAFETY: identity-mapped DMA page.
         unsafe {
@@ -659,33 +660,33 @@ impl RtlNic {
             slot = (*head_g) as usize % RING_LEN;
             desc_addr = self.tx_ring.phys_addr().raw() + (slot * 16) as u64;
             // SAFETY: identity-mapped DMA ring.
-            let cur_flags = unsafe {
-                core::ptr::read_volatile(desc_addr as *const u32)
-            };
+            let cur_flags = unsafe { core::ptr::read_volatile(desc_addr as *const u32) };
             if cur_flags & TXD_OWN != 0 {
                 return Err(NicError::TxRingFull);
             }
-            let mut flags = TXD_OWN | TXD_FS | TXD_LS
-                | (frame.len() as u32 & 0xFFFF);
-            if slot == RING_LEN - 1 { flags |= TXD_EOR; }
+            let mut flags = TXD_OWN | TXD_FS | TXD_LS | (frame.len() as u32 & 0xFFFF);
+            if slot == RING_LEN - 1 {
+                flags |= TXD_EOR;
+            }
             // SAFETY: same.
             unsafe {
-                core::ptr::write_volatile(
-                    (desc_addr + 4)  as *mut u32, 0u32);
-                core::ptr::write_volatile(
-                    (desc_addr + 8)  as *mut u32, phys as u32);
-                core::ptr::write_volatile(
-                    (desc_addr + 12) as *mut u32, (phys >> 32) as u32);
+                core::ptr::write_volatile((desc_addr + 4) as *mut u32, 0u32);
+                core::ptr::write_volatile((desc_addr + 8) as *mut u32, phys as u32);
+                core::ptr::write_volatile((desc_addr + 12) as *mut u32, (phys >> 32) as u32);
             }
             compiler_fence(Ordering::SeqCst);
             // SAFETY: same.
-            unsafe { core::ptr::write_volatile(desc_addr as *mut u32, flags); }
+            unsafe {
+                core::ptr::write_volatile(desc_addr as *mut u32, flags);
+            }
             compiler_fence(Ordering::SeqCst);
             *head_g = (*head_g + 1) % (RING_LEN as u32);
         }
 
         // SAFETY: identity-mapped MMIO.
-        unsafe { self.mmio.write8(REG_TPPOLL, TPPOLL_NPQ); }
+        unsafe {
+            self.mmio.write8(REG_TPPOLL, TPPOLL_NPQ);
+        }
 
         // Wait for MSI-X. The chip raises TOK once the descriptor's
         // OWN clears; ack_isr() drains the latched event so the next
@@ -722,40 +723,40 @@ impl RtlNic {
 
 // ── Driver-match registration ────────────────────────────────────────
 
-static CONTROLLER: IrqSafeSpinLock<Option<RtlNic>> =
-    IrqSafeSpinLock::new(None);
+static CONTROLLER: IrqSafeSpinLock<Option<RtlNic>> = IrqSafeSpinLock::new(None);
 
 /// Probe entry — installed via `bus::register_pci_driver`. Idempotent:
 /// returns `Ok(())` when the controller is already brought up.
-pub fn probe(
-    device: BusDevice,
-    cap:    Cap<BusDeviceCap, Write>,
-) -> Result<(), narf_bus::ProbeError> {
-    if CONTROLLER.lock().is_some() { return Ok(()); }
+pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
+    if CONTROLLER.lock().is_some() {
+        return Ok(());
+    }
     // MEM_SPACE + BUS_MASTER are both required: the chip DMAs the
     // descriptor rings + frame buffers, and we map BAR2 as MMIO.
     // INTX_DISABLE silences the legacy line so MSI-X can take over
     // cleanly later.
     narf_bus::pci::set_command(
-        &cap, &device,
+        &cap,
+        &device,
         narf_bus::pci::cmd::MEM_SPACE
             | narf_bus::pci::cmd::BUS_MASTER
             | narf_bus::pci::cmd::INTX_DISABLE,
-    ).map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    )
+    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
 
     // SAFETY: caller-authority over the device for the duration of
     // bring_up.
     let dev = match unsafe { RtlNic::bring_up(&device, &cap) } {
-        Ok(d)  => d,
+        Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
     *CONTROLLER.lock() = Some(dev);
     narf_drivers::record_bound(narf_drivers::BoundDriver {
-        name:    alloc::string::String::from("r8169"),
-        kind:    narf_drivers::BoundKind::Net,
+        name: alloc::string::String::from("r8169"),
+        kind: narf_drivers::BoundKind::Net,
         pci_vid: Some(device.id.vendor),
         pci_did: Some(device.id.device),
-        domain:  narf_drivers::BoundKind::Net.default_domain(),
+        domain: narf_drivers::BoundKind::Net.default_domain(),
     });
     Ok(())
 }
@@ -767,14 +768,17 @@ pub fn register_pci_driver() {
     narf_bus::register_pci_driver(narf_bus::PciMatch {
         name: "r8169",
         kind: narf_bus::MatchKind::VendorDevice {
-            vendor: RTL_VENDOR, device: RTL_DEV_8168,
+            vendor: RTL_VENDOR,
+            device: RTL_DEV_8168,
         },
         probe,
     });
 }
 
 /// `true` once `probe` has installed a controller.
-pub fn is_probed() -> bool { CONTROLLER.lock().is_some() }
+pub fn is_probed() -> bool {
+    CONTROLLER.lock().is_some()
+}
 
 /// Test-side accessor: run `f` against the probed controller.
 pub fn with_controller<R>(f: impl FnOnce(&RtlNic) -> R) -> Option<R> {

@@ -13,9 +13,7 @@
 //! (audio's `submit(&Shmem, offset, len)`, fb's TAG_BLIT) without
 //! ever paying for a userspace mapping.
 
-use crate::{
-    syscall1, syscall2, SYS_SHMEM_CREATE, SYS_SHMEM_DESTROY, SYS_SHMEM_MAP,
-};
+use crate::{syscall1, syscall2, SYS_SHMEM_CREATE, SYS_SHMEM_DESTROY, SYS_SHMEM_MAP};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ShmemError {
@@ -31,8 +29,8 @@ pub enum ShmemError {
 #[derive(Debug)]
 pub struct Shmem {
     handle: u64,
-    base:   *mut u8,
-    len:    usize,
+    base: *mut u8,
+    len: usize,
 }
 
 unsafe impl Send for Shmem {}
@@ -60,17 +58,27 @@ impl Shmem {
         // the full mapping.
         let pages = (len + 4095) / 4096;
         let mapped_len = pages * 4096;
-        Ok(Self { handle, base: va as *mut u8, len: mapped_len })
+        Ok(Self {
+            handle,
+            base: va as *mut u8,
+            len: mapped_len,
+        })
     }
 
     /// Raw kernel handle. Only valid while `&self` is alive.
-    pub fn handle(&self) -> u64 { self.handle }
+    pub fn handle(&self) -> u64 {
+        self.handle
+    }
 
     /// Length of the mapping in bytes (page-rounded).
-    pub fn len(&self) -> usize { self.len }
+    pub fn len(&self) -> usize {
+        self.len
+    }
 
     /// Empty mappings can't exist — `Shmem::create(0)` errors.
-    pub fn is_empty(&self) -> bool { self.len == 0 }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 
     /// Mutable byte slice over the mapping.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {

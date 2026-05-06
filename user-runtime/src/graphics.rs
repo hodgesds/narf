@@ -26,12 +26,9 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::{
-    fb_connect, fb_disconnect, fb_flush_wait, fb_info, fb_ring_map,
-    FbInfo,
-};
+use crate::{fb_connect, fb_disconnect, fb_flush_wait, fb_info, fb_ring_map, FbInfo};
 
-const TAG_FILL:  u32 = 1;
+const TAG_FILL: u32 = 1;
 const TAG_FLUSH: u32 = 2;
 const RING_DEPTH: u32 = 16;
 const SLOT_BASE: usize = 64;
@@ -59,8 +56,8 @@ pub enum FbError {
 #[derive(Debug)]
 pub struct FbContext {
     handle: u64,
-    info:   FbInfo,
-    ring:   *mut u8,
+    info: FbInfo,
+    ring: *mut u8,
 }
 
 // `*mut u8` to a kernel-mapped ring page. The kernel guarantees the
@@ -88,7 +85,7 @@ impl FbContext {
         }
         // SAFETY: handle is live (we just got it).
         let info = match unsafe { fb_info(handle) } {
-            Ok(i)  => i,
+            Ok(i) => i,
             Err(_) => {
                 // SAFETY: handle is live; clean up.
                 let _ = unsafe { fb_disconnect(handle) };
@@ -108,22 +105,22 @@ impl FbContext {
     /// Geometry + format of the connected scanout. Cached at open;
     /// the kernel's view is stable for the connection's lifetime
     /// today (modesetting lands later).
-    pub fn info(&self) -> &FbInfo { &self.info }
+    pub fn info(&self) -> &FbInfo {
+        &self.info
+    }
 
     /// Raw kernel handle — for code that wants to call additional
     /// syscalls directly. The handle is only valid while `&self`
     /// is alive; storing it past Drop is undefined behaviour.
-    pub fn handle(&self) -> u64 { self.handle }
+    pub fn handle(&self) -> u64 {
+        self.handle
+    }
 
     /// Enqueue a fill: `(x, y, w, h)` in scanout pixels, `pixel` in
     /// the connection's format (XRGB8888 today). Returns
     /// `FbError::RingFull` if the producer ring has no free slot;
     /// the kernel-side drain task will eventually advance the tail.
-    pub fn fill(
-        &mut self,
-        x: u32, y: u32, w: u32, h: u32,
-        pixel: u32,
-    ) -> Result<(), FbError> {
+    pub fn fill(&mut self, x: u32, y: u32, w: u32, h: u32, pixel: u32) -> Result<(), FbError> {
         self.enqueue(TAG_FILL, x, y, w, h, pixel)
     }
 
@@ -132,10 +129,7 @@ impl FbContext {
     /// backends (bochs); on virtio-gpu it issues TRANSFER + FLUSH.
     /// Today the kernel ignores the rect and flushes the full
     /// scanout — a future damage-tracking pass will honour it.
-    pub fn flush(
-        &mut self,
-        x: u32, y: u32, w: u32, h: u32,
-    ) -> Result<(), FbError> {
+    pub fn flush(&mut self, x: u32, y: u32, w: u32, h: u32) -> Result<(), FbError> {
         // pixel field unused for flush; kept zero so it can't be
         // mis-read by an over-eager consumer.
         self.enqueue(TAG_FLUSH, x, y, w, h, 0)
@@ -153,7 +147,10 @@ impl FbContext {
     fn enqueue(
         &mut self,
         tag: u32,
-        x: u32, y: u32, w: u32, h: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
         pixel: u32,
     ) -> Result<(), FbError> {
         // SAFETY: ring is a 4 KiB kernel-mapped page; layout matches

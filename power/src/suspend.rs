@@ -29,15 +29,15 @@ use crate::Power;
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SuspendPhase {
-    Idle              = 0,
+    Idle = 0,
     FreezingUserspace = 1,
-    QuiescingDrivers  = 2,
-    SyncingCache      = 3,
-    SavingCpuState    = 4,
-    PlatformOff       = 5,
+    QuiescingDrivers = 2,
+    SyncingCache = 3,
+    SavingCpuState = 4,
+    PlatformOff = 5,
     RestoringCpuState = 6,
-    ResumingDrivers   = 7,
-    ThawingUserspace  = 8,
+    ResumingDrivers = 7,
+    ThawingUserspace = 8,
 }
 
 /// Errors from the suspend surface.
@@ -50,7 +50,9 @@ pub enum SuspendError {
 }
 
 impl From<CapError> for SuspendError {
-    fn from(_: CapError) -> Self { SuspendError::AuthorityRevoked }
+    fn from(_: CapError) -> Self {
+        SuspendError::AuthorityRevoked
+    }
 }
 
 /// Current phase. `u8`-backed atomic so subscribers can read it
@@ -69,10 +71,10 @@ pub fn suspend(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), Suspen
         PHASE.store(prev, Ordering::Release);
         return Err(SuspendError::AlreadySuspending);
     }
-    PHASE.store(SuspendPhase::QuiescingDrivers as u8,  Ordering::Release);
-    PHASE.store(SuspendPhase::SyncingCache as u8,      Ordering::Release);
-    PHASE.store(SuspendPhase::SavingCpuState as u8,    Ordering::Release);
-    PHASE.store(SuspendPhase::PlatformOff as u8,       Ordering::Release);
+    PHASE.store(SuspendPhase::QuiescingDrivers as u8, Ordering::Release);
+    PHASE.store(SuspendPhase::SyncingCache as u8, Ordering::Release);
+    PHASE.store(SuspendPhase::SavingCpuState as u8, Ordering::Release);
+    PHASE.store(SuspendPhase::PlatformOff as u8, Ordering::Release);
     // Real platform suspend would happen here and not return until
     // resume. We mirror a "ping-pong through the phases without
     // actually sleeping" behaviour so the shape exercises.
@@ -90,4 +92,6 @@ pub fn current_phase() -> SuspendPhase {
 
 /// Test helper.
 #[doc(hidden)]
-pub fn __test_reset() { PHASE.store(SuspendPhase::Idle as u8, Ordering::Release); }
+pub fn __test_reset() {
+    PHASE.store(SuspendPhase::Idle as u8, Ordering::Release);
+}

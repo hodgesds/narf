@@ -17,32 +17,27 @@ use crate::{Framebuffer, Pixel32};
 /// Bytes of the 8×12 arrow sprite. Each row is 8 bits, MSB = leftmost
 /// pixel. 1 = foreground, 0 = transparent.
 const ARROW_8X12: [u8; 12] = [
-    0b10000000,
-    0b11000000,
-    0b11100000,
-    0b11110000,
-    0b11111000,
-    0b11111100,
-    0b11111110,
-    0b11111100,
-    0b11011000,
-    0b10001100,
-    0b00000110,
-    0b00000110,
+    0b10000000, 0b11000000, 0b11100000, 0b11110000, 0b11111000, 0b11111100, 0b11111110, 0b11111100,
+    0b11011000, 0b10001100, 0b00000110, 0b00000110,
 ];
 
 #[derive(Copy, Clone, Debug)]
 pub struct Cursor {
-    pub x:        i32,
-    pub y:        i32,
-    pub fg:       Pixel32,
+    pub x: i32,
+    pub y: i32,
+    pub fg: Pixel32,
     /// For edge-detect tests: every blit bumps this counter.
     pub draw_count: u64,
 }
 
 impl Cursor {
     pub const fn new(x: i32, y: i32, fg: Pixel32) -> Self {
-        Self { x, y, fg, draw_count: 0 }
+        Self {
+            x,
+            y,
+            fg,
+            draw_count: 0,
+        }
     }
 
     /// Cursor sprite dimensions.
@@ -68,10 +63,14 @@ impl Cursor {
     pub fn draw_at(&mut self, fb: &mut Framebuffer) {
         for (row, byte) in ARROW_8X12.iter().enumerate() {
             for col in 0..8u32 {
-                if (byte >> (7 - col)) & 1 == 0 { continue; }
+                if (byte >> (7 - col)) & 1 == 0 {
+                    continue;
+                }
                 let px = self.x + col as i32;
                 let py = self.y + row as i32;
-                if px < 0 || py < 0 { continue; }
+                if px < 0 || py < 0 {
+                    continue;
+                }
                 fb.draw_pixel(px as u32, py as u32, self.fg);
             }
         }

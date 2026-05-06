@@ -25,11 +25,13 @@ impl CpuSet {
     /// Empty set — no CPU is permitted.
     pub const EMPTY: CpuSet = CpuSet(0);
     /// Every CPU permitted.
-    pub const ALL:   CpuSet = CpuSet(!0);
+    pub const ALL: CpuSet = CpuSet(!0);
 
     /// Single-CPU set.
     #[inline]
-    pub const fn single(cpu: CpuId) -> Self { CpuSet(1u64 << (cpu.0 & 0x3F)) }
+    pub const fn single(cpu: CpuId) -> Self {
+        CpuSet(1u64 << (cpu.0 & 0x3F))
+    }
 
     #[inline]
     pub const fn contains(&self, cpu: CpuId) -> bool {
@@ -37,14 +39,20 @@ impl CpuSet {
     }
 
     #[inline]
-    pub fn insert(&mut self, cpu: CpuId) { self.0 |= 1u64 << (cpu.0 & 0x3F); }
+    pub fn insert(&mut self, cpu: CpuId) {
+        self.0 |= 1u64 << (cpu.0 & 0x3F);
+    }
 
     #[inline]
-    pub const fn is_empty(&self) -> bool { self.0 == 0 }
+    pub const fn is_empty(&self) -> bool {
+        self.0 == 0
+    }
 
     /// Count of CPUs in the set.
     #[inline]
-    pub const fn len(&self) -> u32 { self.0.count_ones() }
+    pub const fn len(&self) -> u32 {
+        self.0.count_ones()
+    }
 }
 
 /// Affinity hint. `allowed` is a hard constraint (work-stealing
@@ -52,14 +60,17 @@ impl CpuSet {
 /// possible.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Affinity {
-    pub allowed:   CpuSet,
+    pub allowed: CpuSet,
     pub preferred: Option<CpuId>,
 }
 
 impl Affinity {
     /// Any CPU is OK.
     pub const fn any() -> Self {
-        Self { allowed: CpuSet::ALL, preferred: None }
+        Self {
+            allowed: CpuSet::ALL,
+            preferred: None,
+        }
     }
 
     /// Pin to a single CPU. Stage 4 enforces this through
@@ -67,10 +78,15 @@ impl Affinity {
     /// permissive and the cap gate will land with the spawn-site
     /// integration.
     pub const fn pinned(cpu: CpuId) -> Self {
-        Self { allowed: CpuSet::single(cpu), preferred: Some(cpu) }
+        Self {
+            allowed: CpuSet::single(cpu),
+            preferred: Some(cpu),
+        }
     }
 }
 
 impl Default for Affinity {
-    fn default() -> Self { Self::any() }
+    fn default() -> Self {
+        Self::any()
+    }
 }

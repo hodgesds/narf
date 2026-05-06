@@ -24,15 +24,15 @@ pub fn register_initcalls() {
     narf_init::register(Stage::Device, "i8042-kbd", || {
         // SAFETY: BSP boot context, no other agent driving 0x60/0x64.
         match unsafe { i8042::init() } {
-            Ok(())  => InitResult::Ok,
-            Err(_)  => InitResult::NotPresent,
+            Ok(()) => InitResult::Ok,
+            Err(_) => InitResult::NotPresent,
         }
     });
     narf_init::register(Stage::Device, "i8042-mouse", || {
         // SAFETY: BSP, post-keyboard-init.
         match unsafe { i8042_mouse::init() } {
-            Ok(())  => InitResult::Ok,
-            Err(_)  => InitResult::NotPresent,
+            Ok(()) => InitResult::Ok,
+            Err(_) => InitResult::NotPresent,
         }
     });
 }

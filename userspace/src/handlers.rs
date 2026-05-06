@@ -29,10 +29,7 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
 
-use crate::{
-    fd, RawFnHandler, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
-    TrapContext,
-};
+use crate::{fd, RawFnHandler, Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext};
 
 // ── Current-task lookup shim ───────────────────────────────────────
 //
@@ -42,8 +39,8 @@ use crate::{
 
 type TaskIdLookupFn = fn() -> u64;
 
-static TASK_LOOKUP: narf_lib::sync::IrqSafeSpinLock<Option<TaskIdLookupFn>>
-    = narf_lib::sync::IrqSafeSpinLock::new(None);
+static TASK_LOOKUP: narf_lib::sync::IrqSafeSpinLock<Option<TaskIdLookupFn>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// Install the function that returns the current task's raw id.
 /// Boot wires `|| scheduler::current_task_id().raw()` here.
@@ -67,7 +64,9 @@ fn current_task_id() -> u64 {
 fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
     use core::pin::Pin;
     fn raw_waker() -> RawWaker {
-        unsafe fn no_clone(_: *const ()) -> RawWaker { raw_waker() }
+        unsafe fn no_clone(_: *const ()) -> RawWaker {
+            raw_waker()
+        }
         unsafe fn no_op(_: *const ()) {}
         const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
         RawWaker::new(core::ptr::null(), &VTAB)
@@ -81,7 +80,7 @@ fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
     let pinned = unsafe { Pin::new_unchecked(&mut fut) };
     match pinned.poll(&mut ctx) {
         Poll::Ready(v) => Some(v),
-        Poll::Pending  => None,
+        Poll::Pending => None,
     }
 }
 
@@ -95,8 +94,8 @@ fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
 
 type AsLookupFn = fn() -> Option<Arc<AddressSpace>>;
 
-static AS_LOOKUP: narf_lib::sync::IrqSafeSpinLock<Option<AsLookupFn>>
-    = narf_lib::sync::IrqSafeSpinLock::new(None);
+static AS_LOOKUP: narf_lib::sync::IrqSafeSpinLock<Option<AsLookupFn>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// Install the function that resolves "what's the currently-
 /// polling task's address space?". The kernel boot code registers
@@ -132,7 +131,11 @@ pub fn active_user_as() -> Option<Arc<AddressSpace>> {
 pub fn exit_landing() -> Option<(u64, u64)> {
     let rip = EXIT_LANDING_RIP.load(Ordering::Acquire);
     let rsp = EXIT_LANDING_RSP.load(Ordering::Acquire);
-    if rip == 0 { None } else { Some((rip, rsp)) }
+    if rip == 0 {
+        None
+    } else {
+        Some((rip, rsp))
+    }
 }
 
 // ── Exit-landing registration ──────────────────────────────────────
@@ -170,7 +173,7 @@ pub fn clear_exit_landing() {
 // is `arg0..=arg5` ignored on entry; on success `value` =
 // config-page user vaddr.
 
-const ABI_BOOTSTRAP_MAGIC: u32 = 0x4E_41_52_46;  // "NARF" LE
+const ABI_BOOTSTRAP_MAGIC: u32 = 0x4E_41_52_46; // "NARF" LE
 const ABI_BOOTSTRAP_VERSION: u32 = 3;
 /// Ring depth for the kernel-only Arc<Ring> pair. Powers-of-two only.
 const BOOTSTRAP_RING_DEPTH: u64 = 64;
@@ -182,14 +185,14 @@ pub const BOOTSTRAP_SHARED_RING_DEPTH: usize = 16;
 
 #[repr(C)]
 struct BootstrapHeader {
-    magic:    u32,
-    version:  u32,
-    task_id:  u64,
+    magic: u32,
+    version: u32,
+    task_id: u64,
     /// Capslot ids the user runtime invokes against. They name
     /// the SQ producer / CQ consumer the kernel-side dispatcher
     /// is bound to.
-    sq_cap:   u64,
-    cq_cap:   u64,
+    sq_cap: u64,
+    cq_cap: u64,
     /// Ring depths the kernel chose for this task.
     sq_depth: u32,
     cq_depth: u32,
@@ -216,9 +219,8 @@ struct BootstrapHeader {
 
 use alloc::collections::BTreeMap;
 use narf_abi::{
-    completion_channel, submission_channel, Completion, CompletionDrain,
-    CompletionQueue, SharedRing, Submission, SubmissionDrain,
-    SubmissionQueue,
+    completion_channel, submission_channel, Completion, CompletionDrain, CompletionQueue,
+    SharedRing, Submission, SubmissionDrain, SubmissionQueue,
 };
 use narf_memory::PhysAddr;
 
@@ -226,7 +228,7 @@ use narf_memory::PhysAddr;
 /// Stored under the task id; SMP-safe via the outer lock.
 pub struct TaskRings {
     pub sq_drain: SubmissionDrain<64>,
-    pub cq_prod:  CompletionQueue<64>,
+    pub cq_prod: CompletionQueue<64>,
 }
 
 impl core::fmt::Debug for TaskRings {
@@ -240,7 +242,7 @@ impl core::fmt::Debug for TaskRings {
 /// before the user picks them up via cap (the cap slot id is just
 /// a stable opaque key Stage-4 callers exchange).
 pub struct UserRingEnds {
-    pub sq_prod:  SubmissionQueue<64>,
+    pub sq_prod: SubmissionQueue<64>,
     pub cq_drain: CompletionDrain<64>,
 }
 
@@ -267,17 +269,17 @@ pub struct SharedRingPair {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]  // fields read by the future dispatcher integration
+#[allow(dead_code)] // fields read by the future dispatcher integration
 struct PerTaskBootstrap {
-    kernel:     TaskRings,
-    user:       UserRingEnds,
-    shared:     Option<SharedRingPair>,
-    sq_cap_id:  u64,
-    cq_cap_id:  u64,
+    kernel: TaskRings,
+    user: UserRingEnds,
+    shared: Option<SharedRingPair>,
+    sq_cap_id: u64,
+    cq_cap_id: u64,
 }
 
-static BOOTSTRAP_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, PerTaskBootstrap>>>
-    = narf_lib::sync::IrqSafeSpinLock::new(None);
+static BOOTSTRAP_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, PerTaskBootstrap>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// Initialise the per-task bootstrap registry. Boot calls this
 /// once before any user task can issue `Syscall::Bootstrap`.
@@ -319,11 +321,17 @@ pub fn init_per_task_state() {
 
 /// Reset the registry — test hook; drops every per-task ring set.
 #[doc(hidden)]
-pub fn __test_bootstrap_reset() { *BOOTSTRAP_TABLE.lock() = None; }
+pub fn __test_bootstrap_reset() {
+    *BOOTSTRAP_TABLE.lock() = None;
+}
 
 /// Diagnostic: number of tasks that have called Bootstrap.
 pub fn bootstrap_live_count() -> usize {
-    BOOTSTRAP_TABLE.lock().as_ref().map(|m| m.len()).unwrap_or(0)
+    BOOTSTRAP_TABLE
+        .lock()
+        .as_ref()
+        .map(|m| m.len())
+        .unwrap_or(0)
 }
 
 /// Pull this task's user-side ring ends out of the registry,
@@ -341,17 +349,20 @@ pub fn take_user_ends(task: u64) -> Option<UserRingEnds> {
         let (_dead_sq, _drop_sq_drain) = submission_channel::<64>();
         let (_drop_cq_prod, _dead_cq) = completion_channel::<64>();
         UserRingEnds {
-            sq_prod:  _dead_sq,
+            sq_prod: _dead_sq,
             cq_drain: _dead_cq,
         }
     };
-    map.insert(task, PerTaskBootstrap {
-        kernel: entry.kernel,
-        user:   placeholder_user,
-        shared: entry.shared,
-        sq_cap_id: entry.sq_cap_id,
-        cq_cap_id: entry.cq_cap_id,
-    });
+    map.insert(
+        task,
+        PerTaskBootstrap {
+            kernel: entry.kernel,
+            user: placeholder_user,
+            shared: entry.shared,
+            sq_cap_id: entry.sq_cap_id,
+            cq_cap_id: entry.cq_cap_id,
+        },
+    );
     Some(entry.user)
 }
 
@@ -369,16 +380,19 @@ pub fn take_kernel_ends(task: u64) -> Option<TaskRings> {
         let (dead_cq_prod, _drop_cq_drain) = completion_channel::<64>();
         TaskRings {
             sq_drain: dead_sq_drain,
-            cq_prod:  dead_cq_prod,
+            cq_prod: dead_cq_prod,
         }
     };
-    map.insert(task, PerTaskBootstrap {
-        kernel: placeholder_kernel,
-        user:   entry.user,
-        shared: entry.shared,
-        sq_cap_id: entry.sq_cap_id,
-        cq_cap_id: entry.cq_cap_id,
-    });
+    map.insert(
+        task,
+        PerTaskBootstrap {
+            kernel: placeholder_kernel,
+            user: entry.user,
+            shared: entry.shared,
+            sq_cap_id: entry.sq_cap_id,
+            cq_cap_id: entry.cq_cap_id,
+        },
+    );
     Some(entry.kernel)
 }
 
@@ -399,7 +413,10 @@ static NEXT_CAP_ID: AtomicU64 = AtomicU64::new(0x4000_0000);
 fn sys_bootstrap(ctx: &mut dyn TrapContext) {
     let as_ref = match current_address_space() {
         Some(a) => a,
-        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
     };
     let task = current_task_id();
 
@@ -407,7 +424,10 @@ fn sys_bootstrap(ctx: &mut dyn TrapContext) {
     // (mmap-cursor-style — same scheme `sys_mmap` uses).
     let phys = match narf_memory::alloc_frame() {
         Ok(f) => f.start_address(),
-        Err(_) => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        Err(_) => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
     };
     // SAFETY: identity-mapped low 4 GiB; phys is page-aligned.
     unsafe {
@@ -415,15 +435,18 @@ fn sys_bootstrap(ctx: &mut dyn TrapContext) {
     }
     let user_vaddr = MMAP_CURSOR.fetch_add(0x1000, Ordering::Relaxed);
 
-    if as_ref.map_region(Region {
-        base:  VirtAddr::new(user_vaddr),
-        len:   0x1000,
-        // Stage-4 first cut: writable. Future revision flips the
-        // page to R-only after the kernel populates it; the user
-        // ring builders read from it but don't write.
-        perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys:  alloc::vec![phys],
-    }).is_err() {
+    if as_ref
+        .map_region(Region {
+            base: VirtAddr::new(user_vaddr),
+            len: 0x1000,
+            // Stage-4 first cut: writable. Future revision flips the
+            // page to R-only after the kernel populates it; the user
+            // ring builders read from it but don't write.
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![phys],
+        })
+        .is_err()
+    {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
@@ -447,20 +470,24 @@ fn sys_bootstrap(ctx: &mut dyn TrapContext) {
     // halves directly against the shared backing.
     let shared = match unsafe { mint_shared_ring_pair(&as_ref) } {
         Ok(s) => s,
-        Err(()) => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        Err(()) => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
     };
 
     let entry = PerTaskBootstrap {
         kernel: TaskRings { sq_drain, cq_prod },
-        user:   UserRingEnds { sq_prod, cq_drain },
+        user: UserRingEnds { sq_prod, cq_drain },
         shared: Some(shared),
-        sq_cap_id, cq_cap_id,
+        sq_cap_id,
+        cq_cap_id,
     };
     {
         let mut g = BOOTSTRAP_TABLE.lock();
         let map = match g.as_mut() {
             Some(m) => m,
-            None    => {
+            None => {
                 ctx.set_return(SyscallReturn::invalid_op());
                 return;
             }
@@ -474,17 +501,17 @@ fn sys_bootstrap(ctx: &mut dyn TrapContext) {
     // SAFETY: identity-mapped low 4 GiB; aligned u64 + u32 stores.
     unsafe {
         let header = phys.raw() as *mut BootstrapHeader;
-        (*header).magic    = ABI_BOOTSTRAP_MAGIC;
-        (*header).version  = ABI_BOOTSTRAP_VERSION;
-        (*header).task_id  = task;
-        (*header).sq_cap   = sq_cap_id;
-        (*header).cq_cap   = cq_cap_id;
+        (*header).magic = ABI_BOOTSTRAP_MAGIC;
+        (*header).version = ABI_BOOTSTRAP_VERSION;
+        (*header).task_id = task;
+        (*header).sq_cap = sq_cap_id;
+        (*header).cq_cap = cq_cap_id;
         (*header).sq_depth = BOOTSTRAP_RING_DEPTH as u32;
         (*header).cq_depth = BOOTSTRAP_RING_DEPTH as u32;
         (*header).shared_sq_vaddr = shared.sq_user_vaddr;
         (*header).shared_cq_vaddr = shared.cq_user_vaddr;
-        (*header).shared_depth    = BOOTSTRAP_SHARED_RING_DEPTH as u32;
-        (*header)._pad            = 0;
+        (*header).shared_depth = BOOTSTRAP_SHARED_RING_DEPTH as u32;
+        (*header)._pad = 0;
     }
 
     ctx.set_return(SyscallReturn::ok(user_vaddr));
@@ -514,20 +541,27 @@ unsafe fn mint_shared_ring_pair(
     let sq_vaddr = MMAP_CURSOR.fetch_add(0x1000, Ordering::Relaxed);
     let cq_vaddr = MMAP_CURSOR.fetch_add(0x1000, Ordering::Relaxed);
 
-    as_ref.map_region(Region {
-        base:  VirtAddr::new(sq_vaddr), len: 0x1000,
-        perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys:  alloc::vec![sq_phys],
-    }).map_err(|_| ())?;
-    as_ref.map_region(Region {
-        base:  VirtAddr::new(cq_vaddr), len: 0x1000,
-        perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys:  alloc::vec![cq_phys],
-    }).map_err(|_| ())?;
+    as_ref
+        .map_region(Region {
+            base: VirtAddr::new(sq_vaddr),
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![sq_phys],
+        })
+        .map_err(|_| ())?;
+    as_ref
+        .map_region(Region {
+            base: VirtAddr::new(cq_vaddr),
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![cq_phys],
+        })
+        .map_err(|_| ())?;
     unsafe { as_ref.materialize() }.map_err(|_| ())?;
 
     Ok(SharedRingPair {
-        sq_phys, cq_phys,
+        sq_phys,
+        cq_phys,
         sq_user_vaddr: sq_vaddr,
         cq_user_vaddr: cq_vaddr,
     })
@@ -552,9 +586,9 @@ fn sys_open(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let path_ptr = args.arg0 as *const u8;
     let path_len = args.arg1 as usize;
-    let mnt_ptr  = args.arg2 as *const u8;
-    let mnt_len  = args.arg3 as usize;
-    let flags    = args.arg4;
+    let mnt_ptr = args.arg2 as *const u8;
+    let mnt_len = args.arg3 as usize;
+    let flags = args.arg4;
     // user-runtime's `open` wrapper checks `r == !0u64` for failure
     // (the asm wrapper observes only the value register, not the
     // status word), so the kernel must mirror that sentinel rather
@@ -568,7 +602,10 @@ fn sys_open(ctx: &mut dyn TrapContext) {
     let path_bytes = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
     let path = match core::str::from_utf8(path_bytes) {
         Ok(s) => s,
-        Err(_) => { ctx.set_return(fail); return; }
+        Err(_) => {
+            ctx.set_return(fail);
+            return;
+        }
     };
 
     // Two shapes:
@@ -577,18 +614,23 @@ fn sys_open(ctx: &mut dyn TrapContext) {
     // - Explicit-mount: arg2/arg3 = (ptr, len). The path is relative.
     //   Useful when the caller already knows the mount.
     let ops = if mnt_len == 0 {
-        narf_filesystem::registry().resolve_absolute(path, |fs, rel| {
-            narf_filesystem::resolve(fs.root(), rel).ok()
-        }).flatten()
+        narf_filesystem::registry()
+            .resolve_absolute(path, |fs, rel| {
+                narf_filesystem::resolve(fs.root(), rel).ok()
+            })
+            .flatten()
     } else {
         let mnt_bytes = unsafe { core::slice::from_raw_parts(mnt_ptr, mnt_len) };
         let mount = match core::str::from_utf8(mnt_bytes) {
             Ok(s) => s,
-            Err(_) => { ctx.set_return(fail); return; }
+            Err(_) => {
+                ctx.set_return(fail);
+                return;
+            }
         };
-        narf_filesystem::registry().with_mount(mount, |fs| {
-            narf_filesystem::resolve(fs.root(), path).ok()
-        }).flatten()
+        narf_filesystem::registry()
+            .with_mount(mount, |fs| narf_filesystem::resolve(fs.root(), path).ok())
+            .flatten()
     };
 
     // O_CREAT path: when the lookup misses and the caller asked for
@@ -602,18 +644,31 @@ fn sys_open(ctx: &mut dyn TrapContext) {
                 .resolve_parent_absolute(path, |_fs, parent, leaf| parent.create(leaf))
             {
                 Some(Ok(o)) => o,
-                _ => { ctx.set_return(fail); return; }
+                _ => {
+                    ctx.set_return(fail);
+                    return;
+                }
             }
         }
-        None => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
 
     let task = current_task_id();
     let new_fd = match fd::with_table(task, |t| {
-        t.open(crate::fd::FdEntry { ops, offset: 0, flags: 0 })
+        t.open(crate::fd::FdEntry {
+            ops,
+            offset: 0,
+            flags: 0,
+        })
     }) {
         Some(n) => n,
-        None    => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     ctx.set_return(SyscallReturn::ok(new_fd as u64));
 }
@@ -644,7 +699,7 @@ fn sys_write(ctx: &mut dyn TrapContext) {
     let outcome = fd::with_table(task, |t| {
         let entry = match t.get_mut(fd) {
             Some(e) => e,
-            None    => return Err(()),
+            None => return Err(()),
         };
         let off = entry.offset;
         let written = poll_once(entry.ops.write(off, slice))
@@ -654,8 +709,8 @@ fn sys_write(ctx: &mut dyn TrapContext) {
         Ok(written)
     });
     match outcome {
-        Some(Ok(n))   => ctx.set_return(SyscallReturn::ok(n as u64)),
-        _             => ctx.set_return(SyscallReturn::invalid_op()),
+        Some(Ok(n)) => ctx.set_return(SyscallReturn::ok(n as u64)),
+        _ => ctx.set_return(SyscallReturn::invalid_op()),
     }
 }
 
@@ -678,7 +733,7 @@ fn sys_read(ctx: &mut dyn TrapContext) {
     let outcome = fd::with_table(task, |t| {
         let entry = match t.get_mut(fd) {
             Some(e) => e,
-            None    => return Err(()),
+            None => return Err(()),
         };
         let off = entry.offset;
         let read = poll_once(entry.ops.read(off, slice))
@@ -688,8 +743,8 @@ fn sys_read(ctx: &mut dyn TrapContext) {
         Ok(read)
     });
     match outcome {
-        Some(Ok(n))   => ctx.set_return(SyscallReturn::ok(n as u64)),
-        _             => ctx.set_return(SyscallReturn::invalid_op()),
+        Some(Ok(n)) => ctx.set_return(SyscallReturn::ok(n as u64)),
+        _ => ctx.set_return(SyscallReturn::invalid_op()),
     }
 }
 
@@ -713,15 +768,15 @@ fn sys_dup(ctx: &mut dyn TrapContext) {
         // Clone the Arc + reset offset; keep flags clear (fcntl/dup3
         // can stamp FD_CLOEXEC after).
         let clone = crate::fd::FdEntry {
-            ops:    entry.ops.clone(),
+            ops: entry.ops.clone(),
             offset: 0,
-            flags:  0,
+            flags: 0,
         };
         Some(t.open(clone))
     });
     match outcome {
         Some(Some(new_fd)) => ctx.set_return(SyscallReturn::ok(new_fd as u64)),
-        _                  => ctx.set_return(SyscallReturn::invalid_op()),
+        _ => ctx.set_return(SyscallReturn::invalid_op()),
     }
 }
 
@@ -745,9 +800,9 @@ fn sys_dup2(ctx: &mut dyn TrapContext) {
     let outcome = fd::with_table(task, |t| {
         let entry = t.get(oldfd)?;
         let clone = crate::fd::FdEntry {
-            ops:    entry.ops.clone(),
+            ops: entry.ops.clone(),
             offset: 0,
-            flags:  0,
+            flags: 0,
         };
         // Replace whatever sat at `newfd` (POSIX: silently close).
         t.set(newfd, clone);
@@ -755,7 +810,7 @@ fn sys_dup2(ctx: &mut dyn TrapContext) {
     });
     match outcome {
         Some(Some(())) => ctx.set_return(SyscallReturn::ok(newfd as u64)),
-        _              => ctx.set_return(SyscallReturn::invalid_op()),
+        _ => ctx.set_return(SyscallReturn::invalid_op()),
     }
 }
 
@@ -775,19 +830,19 @@ fn sys_dup3(ctx: &mut dyn TrapContext) {
     let outcome = fd::with_table(task, |t| {
         let entry = t.get(oldfd)?;
         let clone = crate::fd::FdEntry {
-            ops:    entry.ops.clone(),
+            ops: entry.ops.clone(),
             offset: 0,
             // O_CLOEXEC (Linux) is bit 0x80000 in `flags`; Stage-4
             // accepts the lower-bit shape (FD_CLOEXEC = 1) directly
             // since narf-libc's `dup3` already passes FD_CLOEXEC.
-            flags:  flags & crate::fd::FD_CLOEXEC,
+            flags: flags & crate::fd::FD_CLOEXEC,
         };
         t.set(newfd, clone);
         Some(())
     });
     match outcome {
         Some(Some(())) => ctx.set_return(SyscallReturn::ok(newfd as u64)),
-        _              => ctx.set_return(SyscallReturn::invalid_op()),
+        _ => ctx.set_return(SyscallReturn::invalid_op()),
     }
 }
 
@@ -798,7 +853,7 @@ const F_SETFL: u64 = 4;
 
 fn sys_fcntl(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let fd  = args.arg0 as u32;
+    let fd = args.arg0 as u32;
     let cmd = args.arg1;
     let arg = args.arg2;
     let task = current_task_id();
@@ -822,7 +877,7 @@ fn sys_fcntl(ctx: &mut dyn TrapContext) {
     });
     match outcome {
         Some(Some(r)) => ctx.set_return(r),
-        _             => ctx.set_return(SyscallReturn::invalid_op()),
+        _ => ctx.set_return(SyscallReturn::invalid_op()),
     }
 }
 
@@ -841,26 +896,26 @@ fn sys_fcntl(ctx: &mut dyn TrapContext) {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct StatBuf {
-    pub size:         u64,
-    pub blocks:       u64,
-    pub mode:         u32,
-    pub _pad:         u32,
+    pub size: u64,
+    pub blocks: u64,
+    pub mode: u32,
+    pub _pad: u32,
     pub mtime_cycles: u64,
 }
 
 impl StatBuf {
     fn from_stat(s: narf_filesystem::Stat) -> Self {
         let ftype_bits: u32 = match s.mode.file_type {
-            narf_filesystem::FileType::File    => 0o100000,
-            narf_filesystem::FileType::Dir     => 0o040000,
+            narf_filesystem::FileType::File => 0o100000,
+            narf_filesystem::FileType::Dir => 0o040000,
             narf_filesystem::FileType::Symlink => 0o120000,
             narf_filesystem::FileType::Special => 0o020000,
         };
         Self {
-            size:         s.size,
-            blocks:       s.blocks,
-            mode:         ftype_bits | (s.mode.perms as u32),
-            _pad:         0,
+            size: s.size,
+            blocks: s.blocks,
+            mode: ftype_bits | (s.mode.perms as u32),
+            _pad: 0,
             mtime_cycles: s.mtime_cycles,
         }
     }
@@ -870,7 +925,7 @@ fn sys_stat(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let path_ptr = args.arg0 as *const u8;
     let path_len = args.arg1 as usize;
-    let out_ptr  = args.arg2 as *mut StatBuf;
+    let out_ptr = args.arg2 as *mut StatBuf;
     // POSIX-shaped failure sentinel. The user-runtime asm wrapper
     // observes only the `value` register, so we mirror libc and
     // return -1 on failure to disambiguate from a 0-valued success.
@@ -885,19 +940,29 @@ fn sys_stat(ctx: &mut dyn TrapContext) {
     let path_bytes = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
     let path = match core::str::from_utf8(path_bytes) {
         Ok(s) => s,
-        Err(_) => { ctx.set_return(fail); return; }
+        Err(_) => {
+            ctx.set_return(fail);
+            return;
+        }
     };
-    let ops = narf_filesystem::registry().resolve_absolute(path, |fs, rel| {
-        narf_filesystem::resolve(fs.root(), rel).ok()
-    }).flatten();
+    let ops = narf_filesystem::registry()
+        .resolve_absolute(path, |fs, rel| {
+            narf_filesystem::resolve(fs.root(), rel).ok()
+        })
+        .flatten();
     let ops = match ops {
         Some(o) => o,
-        None    => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     let stat = StatBuf::from_stat(ops.stat());
     // SAFETY: caller supplied a writable user vaddr; if the address
     // is bad the user faults into its own handler, not ours.
-    unsafe { core::ptr::write_volatile(out_ptr, stat); }
+    unsafe {
+        core::ptr::write_volatile(out_ptr, stat);
+    }
     ctx.set_return(SyscallReturn::ok(0));
 }
 
@@ -917,10 +982,15 @@ fn sys_fstat(ctx: &mut dyn TrapContext) {
     });
     let stat = match stat {
         Some(Some(s)) => s,
-        _             => { ctx.set_return(fail); return; }
+        _ => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     // SAFETY: same contract as `sys_stat`.
-    unsafe { core::ptr::write_volatile(out_ptr, stat); }
+    unsafe {
+        core::ptr::write_volatile(out_ptr, stat);
+    }
     ctx.set_return(SyscallReturn::ok(0));
 }
 
@@ -932,8 +1002,8 @@ fn sys_fstat(ctx: &mut dyn TrapContext) {
 
 fn sys_ftruncate(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let fd   = args.arg0 as u32;
-    let len  = args.arg1;
+    let fd = args.arg0 as u32;
+    let len = args.arg1;
     let fail = SyscallReturn::ok((-1i64) as u64);
     let task = current_task_id();
     let outcome = fd::with_table(task, |t| {
@@ -942,7 +1012,7 @@ fn sys_ftruncate(ctx: &mut dyn TrapContext) {
     });
     match outcome {
         Some(Some(Ok(()))) => ctx.set_return(SyscallReturn::ok(0)),
-        _                  => ctx.set_return(fail),
+        _ => ctx.set_return(fail),
     }
 }
 
@@ -955,9 +1025,9 @@ fn sys_ftruncate(ctx: &mut dyn TrapContext) {
 
 fn sys_pread64(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let fd     = args.arg0 as u32;
-    let ptr    = args.arg1 as *mut u8;
-    let len    = args.arg2 as usize;
+    let fd = args.arg0 as u32;
+    let ptr = args.arg1 as *mut u8;
+    let len = args.arg2 as usize;
     let offset = args.arg3;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if ptr.is_null() {
@@ -981,15 +1051,15 @@ fn sys_pread64(ctx: &mut dyn TrapContext) {
     });
     match outcome {
         Some(Some(n)) => ctx.set_return(SyscallReturn::ok(n as u64)),
-        _             => ctx.set_return(fail),
+        _ => ctx.set_return(fail),
     }
 }
 
 fn sys_pwrite64(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let fd     = args.arg0 as u32;
-    let ptr    = args.arg1 as *const u8;
-    let len    = args.arg2 as usize;
+    let fd = args.arg0 as u32;
+    let ptr = args.arg1 as *const u8;
+    let len = args.arg2 as usize;
     let offset = args.arg3;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if ptr.is_null() {
@@ -1013,7 +1083,7 @@ fn sys_pwrite64(ctx: &mut dyn TrapContext) {
     });
     match outcome {
         Some(Some(n)) => ctx.set_return(SyscallReturn::ok(n as u64)),
-        _             => ctx.set_return(fail),
+        _ => ctx.set_return(fail),
     }
 }
 
@@ -1032,10 +1102,10 @@ const FALLOC_FL_ZERO_RANGE: u64 = 0x10;
 
 fn sys_fallocate(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let fd     = args.arg0 as u32;
-    let mode   = args.arg1;
+    let fd = args.arg0 as u32;
+    let mode = args.arg1;
     let offset = args.arg2;
-    let len    = args.arg3;
+    let len = args.arg3;
     let fail = SyscallReturn::ok((-1i64) as u64);
 
     if mode != 0 && mode != FALLOC_FL_ZERO_RANGE {
@@ -1066,7 +1136,9 @@ fn sys_fallocate(ctx: &mut dyn TrapContext) {
                 let n = poll_once(ops.write(cur, &chunk[..span]))
                     .and_then(|r| r.ok())
                     .unwrap_or(0);
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 cur += n as u64;
             }
         }
@@ -1074,7 +1146,7 @@ fn sys_fallocate(ctx: &mut dyn TrapContext) {
     });
     match outcome {
         Some(Some(true)) => ctx.set_return(SyscallReturn::ok(0)),
-        _                => ctx.set_return(fail),
+        _ => ctx.set_return(fail),
     }
 }
 
@@ -1093,12 +1165,12 @@ const CFR_USE_CUR: u64 = !0;
 
 fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let fd_in   = args.arg0 as u32;
-    let fd_out  = args.arg1 as u32;
-    let off_in  = args.arg2;
+    let fd_in = args.arg0 as u32;
+    let fd_out = args.arg1 as u32;
+    let off_in = args.arg2;
     let off_out = args.arg3;
-    let len     = args.arg4 as usize;
-    let flags   = args.arg5;
+    let len = args.arg4 as usize;
+    let flags = args.arg5;
     let fail = SyscallReturn::ok((-1i64) as u64);
 
     if flags != 0 {
@@ -1114,15 +1186,26 @@ fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
     // don't hold the fd table lock across the FsFuture polls.
     let task = current_task_id();
     let resolved = fd::with_table(task, |t| {
-        let in_e  = t.get(fd_in)?;
-        let in_off  = if off_in  == CFR_USE_CUR { in_e.offset } else { off_in };
+        let in_e = t.get(fd_in)?;
+        let in_off = if off_in == CFR_USE_CUR {
+            in_e.offset
+        } else {
+            off_in
+        };
         let out_e = t.get(fd_out)?;
-        let out_off = if off_out == CFR_USE_CUR { out_e.offset } else { off_out };
+        let out_off = if off_out == CFR_USE_CUR {
+            out_e.offset
+        } else {
+            off_out
+        };
         Some((in_e.ops.clone(), in_off, out_e.ops.clone(), out_off))
     });
     let (in_ops, mut cur_in, out_ops, mut cur_out) = match resolved {
         Some(Some(t)) => t,
-        _             => { ctx.set_return(fail); return; }
+        _ => {
+            ctx.set_return(fail);
+            return;
+        }
     };
 
     let mut chunk = [0u8; 4096];
@@ -1132,25 +1215,35 @@ fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
         let read_n = poll_once(in_ops.read(cur_in, &mut chunk[..span]))
             .and_then(|r| r.ok())
             .unwrap_or(0);
-        if read_n == 0 { break; }
+        if read_n == 0 {
+            break;
+        }
         let write_n = poll_once(out_ops.write(cur_out, &chunk[..read_n]))
             .and_then(|r| r.ok())
             .unwrap_or(0);
-        if write_n == 0 { break; }
-        copied  += write_n;
-        cur_in  += write_n as u64;
+        if write_n == 0 {
+            break;
+        }
+        copied += write_n;
+        cur_in += write_n as u64;
         cur_out += write_n as u64;
-        if write_n < read_n { break; }
+        if write_n < read_n {
+            break;
+        }
     }
 
     // Advance the per-fd cursors when the corresponding offset
     // arg was the "use cur" sentinel.
     let _ = fd::with_table(task, |t| {
         if off_in == CFR_USE_CUR {
-            if let Some(e) = t.get_mut(fd_in)  { e.offset = cur_in;  }
+            if let Some(e) = t.get_mut(fd_in) {
+                e.offset = cur_in;
+            }
         }
         if off_out == CFR_USE_CUR {
-            if let Some(e) = t.get_mut(fd_out) { e.offset = cur_out; }
+            if let Some(e) = t.get_mut(fd_out) {
+                e.offset = cur_out;
+            }
         }
         Some(())
     });
@@ -1167,8 +1260,8 @@ fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
 
 fn sys_truncate(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let ptr  = args.arg0 as *const u8;
-    let len  = args.arg1 as usize;
+    let ptr = args.arg0 as *const u8;
+    let len = args.arg1 as usize;
     let new_size = args.arg2;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if ptr.is_null() || len == 0 {
@@ -1179,16 +1272,21 @@ fn sys_truncate(ctx: &mut dyn TrapContext) {
     let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
     let path = match core::str::from_utf8(bytes) {
         Ok(s) => s,
-        Err(_) => { ctx.set_return(fail); return; }
+        Err(_) => {
+            ctx.set_return(fail);
+            return;
+        }
     };
-    let ops = narf_filesystem::registry().resolve_absolute(path, |fs, rel| {
-        narf_filesystem::resolve(fs.root(), rel).ok()
-    }).flatten();
+    let ops = narf_filesystem::registry()
+        .resolve_absolute(path, |fs, rel| {
+            narf_filesystem::resolve(fs.root(), rel).ok()
+        })
+        .flatten();
     match ops {
         Some(o) => match o.truncate(new_size) {
-            Ok(())  => ctx.set_return(SyscallReturn::ok(0)),
-            Err(_)  => ctx.set_return(fail),
-        }
+            Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
+            Err(_) => ctx.set_return(fail),
+        },
         None => ctx.set_return(fail),
     }
 }
@@ -1208,22 +1306,34 @@ fn sys_unlinkat(ctx: &mut dyn TrapContext) {
     let _dirfd = args.arg0;
     let path_ptr = args.arg1;
     let path_len = args.arg2;
-    let flags    = args.arg3;
+    let flags = args.arg3;
     struct Reshape<'a> {
         inner: &'a mut dyn TrapContext,
-        args:  SyscallArgs,
+        args: SyscallArgs,
     }
     impl<'a> TrapContext for Reshape<'a> {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.inner.set_return(r); }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.inner.set_return(r);
+        }
         fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
             self.inner.redirect_to_kernel(rip, rsp)
         }
     }
     let proxy_args = SyscallArgs {
-        arg0: path_ptr, arg1: path_len, arg2: 0, arg3: 0, arg4: 0, arg5: 0,
+        arg0: path_ptr,
+        arg1: path_len,
+        arg2: 0,
+        arg3: 0,
+        arg4: 0,
+        arg5: 0,
     };
-    let mut proxy = Reshape { inner: ctx, args: proxy_args };
+    let mut proxy = Reshape {
+        inner: ctx,
+        args: proxy_args,
+    };
     if (flags & AT_REMOVEDIR) != 0 {
         sys_rmdir(&mut proxy);
     } else {
@@ -1236,22 +1346,34 @@ fn sys_mkdirat(ctx: &mut dyn TrapContext) {
     let _dirfd = args.arg0;
     let path_ptr = args.arg1;
     let path_len = args.arg2;
-    let mode     = args.arg3;
+    let mode = args.arg3;
     struct Reshape<'a> {
         inner: &'a mut dyn TrapContext,
-        args:  SyscallArgs,
+        args: SyscallArgs,
     }
     impl<'a> TrapContext for Reshape<'a> {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.inner.set_return(r); }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.inner.set_return(r);
+        }
         fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
             self.inner.redirect_to_kernel(rip, rsp)
         }
     }
     let proxy_args = SyscallArgs {
-        arg0: path_ptr, arg1: path_len, arg2: mode, arg3: 0, arg4: 0, arg5: 0,
+        arg0: path_ptr,
+        arg1: path_len,
+        arg2: mode,
+        arg3: 0,
+        arg4: 0,
+        arg5: 0,
     };
-    let mut proxy = Reshape { inner: ctx, args: proxy_args };
+    let mut proxy = Reshape {
+        inner: ctx,
+        args: proxy_args,
+    };
     sys_mkdir(&mut proxy);
 }
 
@@ -1265,20 +1387,31 @@ fn sys_renameat(ctx: &mut dyn TrapContext) {
     let new_len = args.arg5;
     struct Reshape<'a> {
         inner: &'a mut dyn TrapContext,
-        args:  SyscallArgs,
+        args: SyscallArgs,
     }
     impl<'a> TrapContext for Reshape<'a> {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.inner.set_return(r); }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.inner.set_return(r);
+        }
         fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
             self.inner.redirect_to_kernel(rip, rsp)
         }
     }
     let proxy_args = SyscallArgs {
-        arg0: old_ptr, arg1: old_len, arg2: new_ptr, arg3: new_len,
-        arg4: 0, arg5: 0,
+        arg0: old_ptr,
+        arg1: old_len,
+        arg2: new_ptr,
+        arg3: new_len,
+        arg4: 0,
+        arg5: 0,
     };
-    let mut proxy = Reshape { inner: ctx, args: proxy_args };
+    let mut proxy = Reshape {
+        inner: ctx,
+        args: proxy_args,
+    };
     sys_rename(&mut proxy);
 }
 
@@ -1293,53 +1426,73 @@ fn sys_symlinkat(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let target_ptr = args.arg0;
     let target_len = args.arg1;
-    let _dirfd     = args.arg2;
-    let link_ptr   = args.arg3;
-    let link_len   = args.arg4;
+    let _dirfd = args.arg2;
+    let link_ptr = args.arg3;
+    let link_len = args.arg4;
     struct Reshape<'a> {
         inner: &'a mut dyn TrapContext,
-        args:  SyscallArgs,
+        args: SyscallArgs,
     }
     impl<'a> TrapContext for Reshape<'a> {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.inner.set_return(r); }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.inner.set_return(r);
+        }
         fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
             self.inner.redirect_to_kernel(rip, rsp)
         }
     }
     let proxy_args = SyscallArgs {
-        arg0: target_ptr, arg1: target_len,
-        arg2: link_ptr,   arg3: link_len,
-        arg4: 0, arg5: 0,
+        arg0: target_ptr,
+        arg1: target_len,
+        arg2: link_ptr,
+        arg3: link_len,
+        arg4: 0,
+        arg5: 0,
     };
-    let mut proxy = Reshape { inner: ctx, args: proxy_args };
+    let mut proxy = Reshape {
+        inner: ctx,
+        args: proxy_args,
+    };
     sys_symlink(&mut proxy);
 }
 
 fn sys_readlinkat(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let _dirfd   = args.arg0;
+    let _dirfd = args.arg0;
     let path_ptr = args.arg1;
     let path_len = args.arg2;
-    let buf_ptr  = args.arg3;
-    let buf_len  = args.arg4;
+    let buf_ptr = args.arg3;
+    let buf_len = args.arg4;
     struct Reshape<'a> {
         inner: &'a mut dyn TrapContext,
-        args:  SyscallArgs,
+        args: SyscallArgs,
     }
     impl<'a> TrapContext for Reshape<'a> {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.inner.set_return(r); }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.inner.set_return(r);
+        }
         fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
             self.inner.redirect_to_kernel(rip, rsp)
         }
     }
     let proxy_args = SyscallArgs {
-        arg0: path_ptr, arg1: path_len,
-        arg2: buf_ptr,  arg3: buf_len,
-        arg4: 0, arg5: 0,
+        arg0: path_ptr,
+        arg1: path_len,
+        arg2: buf_ptr,
+        arg3: buf_len,
+        arg4: 0,
+        arg5: 0,
     };
-    let mut proxy = Reshape { inner: ctx, args: proxy_args };
+    let mut proxy = Reshape {
+        inner: ctx,
+        args: proxy_args,
+    };
     sys_readlink(&mut proxy);
 }
 
@@ -1358,22 +1511,31 @@ fn sys_access_chmod_chown(ctx: &mut dyn TrapContext) {
     let path_len = args.arg1;
     struct Reshape<'a> {
         inner: &'a mut dyn TrapContext,
-        args:  SyscallArgs,
+        args: SyscallArgs,
     }
     impl<'a> TrapContext for Reshape<'a> {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.inner.set_return(r); }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.inner.set_return(r);
+        }
         fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
             self.inner.redirect_to_kernel(rip, rsp)
         }
     }
     let proxy_args = SyscallArgs {
-        arg0: 0,           // dirfd = AT_FDCWD (ignored anyway).
+        arg0: 0, // dirfd = AT_FDCWD (ignored anyway).
         arg1: path_ptr,
         arg2: path_len,
-        arg3: 0, arg4: 0, arg5: 0,
+        arg3: 0,
+        arg4: 0,
+        arg5: 0,
     };
-    let mut proxy = Reshape { inner: ctx, args: proxy_args };
+    let mut proxy = Reshape {
+        inner: ctx,
+        args: proxy_args,
+    };
     sys_fchmodat_or_fchownat(&mut proxy);
 }
 
@@ -1390,14 +1552,18 @@ fn sys_newfstatat(ctx: &mut dyn TrapContext) {
     let path_ptr = args.arg1;
     let path_len = args.arg2;
     let stat_out = args.arg3;
-    let _flags   = args.arg4;
+    let _flags = args.arg4;
     struct Reshape<'a> {
         inner: &'a mut dyn TrapContext,
-        args:  SyscallArgs,
+        args: SyscallArgs,
     }
     impl<'a> TrapContext for Reshape<'a> {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.inner.set_return(r); }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.inner.set_return(r);
+        }
         fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
             self.inner.redirect_to_kernel(rip, rsp)
         }
@@ -1406,9 +1572,14 @@ fn sys_newfstatat(ctx: &mut dyn TrapContext) {
         arg0: path_ptr,
         arg1: path_len,
         arg2: stat_out,
-        arg3: 0, arg4: 0, arg5: 0,
+        arg3: 0,
+        arg4: 0,
+        arg5: 0,
     };
-    let mut proxy = Reshape { inner: ctx, args: proxy_args };
+    let mut proxy = Reshape {
+        inner: ctx,
+        args: proxy_args,
+    };
     sys_stat(&mut proxy);
 }
 
@@ -1426,19 +1597,23 @@ fn sys_openat(ctx: &mut dyn TrapContext) {
     let _dirfd = args.arg0;
     let path_ptr = args.arg1;
     let path_len = args.arg2;
-    let flags    = args.arg3;
-    let _mode    = args.arg4;
+    let flags = args.arg3;
+    let _mode = args.arg4;
     // Reshape into a SYS_OPEN-compatible context: arg0 = path_ptr,
     // arg1 = path_len, arg2 = 0 (mount_ptr), arg3 = 0 (mount_len),
     // arg4 = flags. We can't construct a fresh TrapContext here —
     // we wrap in an inline struct that proxies the args.
     struct Reshape<'a> {
         inner: &'a mut dyn TrapContext,
-        args:  SyscallArgs,
+        args: SyscallArgs,
     }
     impl<'a> TrapContext for Reshape<'a> {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.inner.set_return(r); }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.inner.set_return(r);
+        }
         fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
             self.inner.redirect_to_kernel(rip, rsp)
         }
@@ -1451,7 +1626,10 @@ fn sys_openat(ctx: &mut dyn TrapContext) {
         arg4: flags,
         arg5: 0,
     };
-    let mut proxy = Reshape { inner: ctx, args: proxy_args };
+    let mut proxy = Reshape {
+        inner: ctx,
+        args: proxy_args,
+    };
     sys_open(&mut proxy);
 }
 
@@ -1466,8 +1644,8 @@ fn sys_openat(ctx: &mut dyn TrapContext) {
 fn sys_fchmodat_or_fchownat(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let _dirfd = args.arg0;
-    let ptr    = args.arg1 as *const u8;
-    let len    = args.arg2 as usize;
+    let ptr = args.arg1 as *const u8;
+    let len = args.arg2 as usize;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if ptr.is_null() || len == 0 {
         ctx.set_return(fail);
@@ -1477,7 +1655,10 @@ fn sys_fchmodat_or_fchownat(ctx: &mut dyn TrapContext) {
     let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
     let path = match core::str::from_utf8(bytes) {
         Ok(s) => s,
-        Err(_) => { ctx.set_return(fail); return; }
+        Err(_) => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     if !path.starts_with('/') {
         // Relative paths require dirfd resolution we don't have.
@@ -1485,9 +1666,12 @@ fn sys_fchmodat_or_fchownat(ctx: &mut dyn TrapContext) {
         return;
     }
     // Existence check: any FileOps lookup returning Some is enough.
-    let exists = narf_filesystem::registry().resolve_absolute(path, |fs, rel| {
-        narf_filesystem::resolve(fs.root(), rel).ok()
-    }).flatten().is_some();
+    let exists = narf_filesystem::registry()
+        .resolve_absolute(path, |fs, rel| {
+            narf_filesystem::resolve(fs.root(), rel).ok()
+        })
+        .flatten()
+        .is_some();
     if exists {
         ctx.set_return(SyscallReturn::ok(0));
     } else {
@@ -1526,20 +1710,24 @@ fn sys_memfd_create(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let _name_ptr = args.arg0;
     let _name_len = args.arg1;
-    let _flags    = args.arg2;
+    let _flags = args.arg2;
     let fail = SyscallReturn::ok((-1i64) as u64);
 
     let ops = narf_filesystem::new_anon_memfile();
     let task = current_task_id();
     let fd = fd::with_table(task, |t| {
-        t.open(crate::fd::FdEntry { ops, offset: 0, flags: 0 })
+        t.open(crate::fd::FdEntry {
+            ops,
+            offset: 0,
+            flags: 0,
+        })
     });
     // `with_table` returns `Option<u32>` (the fd or None on
     // exhaustion); the outer Option signals "no fd table for the
     // task". Both must be Some(Some(n)) for success.
     match fd {
         Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
-        None    => ctx.set_return(fail),
+        None => ctx.set_return(fail),
     }
 }
 
@@ -1579,23 +1767,28 @@ fn sys_pipe(ctx: &mut dyn TrapContext) {
     let fds = fd::with_table(task, |t| {
         let r = t.open(crate::fd::FdEntry {
             ops: rd as alloc::sync::Arc<dyn narf_filesystem::FileOps>,
-            offset: 0, flags: 0,
+            offset: 0,
+            flags: 0,
         });
         let w = t.open(crate::fd::FdEntry {
             ops: wr as alloc::sync::Arc<dyn narf_filesystem::FileOps>,
-            offset: 0, flags: 0,
+            offset: 0,
+            flags: 0,
         });
         (r, w)
     });
     let (r, w) = match fds {
         Some(p) => p,
-        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
     };
     // SAFETY: caller-supplied user vaddr; we write two i32s. The
     // kernel runs in the calling task's AS so the write resolves.
     unsafe {
-        core::ptr::write_volatile(out_ptr,             r as i32);
-        core::ptr::write_volatile(out_ptr.add(1),      w as i32);
+        core::ptr::write_volatile(out_ptr, r as i32);
+        core::ptr::write_volatile(out_ptr.add(1), w as i32);
     }
     ctx.set_return(SyscallReturn::ok(0));
 }
@@ -1613,34 +1806,43 @@ const O_CLOEXEC_BIT: u64 = 0x80000;
 fn sys_pipe2(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let out_ptr = args.arg0 as *mut i32;
-    let flags   = args.arg1;
+    let flags = args.arg1;
     if out_ptr.is_null() {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
     let want_cloexec = (flags & O_CLOEXEC_BIT) != 0;
-    let install_flags = if want_cloexec { crate::fd::FD_CLOEXEC } else { 0 };
+    let install_flags = if want_cloexec {
+        crate::fd::FD_CLOEXEC
+    } else {
+        0
+    };
 
     let (rd, wr) = crate::pipe::pipe_pair();
     let task = current_task_id();
     let fds = fd::with_table(task, |t| {
         let r = t.open(crate::fd::FdEntry {
             ops: rd as alloc::sync::Arc<dyn narf_filesystem::FileOps>,
-            offset: 0, flags: install_flags,
+            offset: 0,
+            flags: install_flags,
         });
         let w = t.open(crate::fd::FdEntry {
             ops: wr as alloc::sync::Arc<dyn narf_filesystem::FileOps>,
-            offset: 0, flags: install_flags,
+            offset: 0,
+            flags: install_flags,
         });
         (r, w)
     });
     let (r, w) = match fds {
         Some(p) => p,
-        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
     };
     // SAFETY: caller-supplied user vaddr; we write two i32s.
     unsafe {
-        core::ptr::write_volatile(out_ptr,        r as i32);
+        core::ptr::write_volatile(out_ptr, r as i32);
         core::ptr::write_volatile(out_ptr.add(1), w as i32);
     }
     ctx.set_return(SyscallReturn::ok(0));
@@ -1659,17 +1861,17 @@ const SEEK_END: u64 = 2;
 
 fn sys_lseek(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let fd     = args.arg0 as u32;
+    let fd = args.arg0 as u32;
     let offset = args.arg1 as i64;
     let whence = args.arg2;
-    let task   = current_task_id();
+    let task = current_task_id();
     let outcome = fd::with_table(task, |t| {
         let entry = t.get_mut(fd)?;
         let base = match whence {
             SEEK_SET => 0i64,
             SEEK_CUR => entry.offset as i64,
             SEEK_END => entry.ops.stat().size as i64,
-            _        => return Some(SyscallReturn::invalid_op()),
+            _ => return Some(SyscallReturn::invalid_op()),
         };
         let new_off = base.checked_add(offset)?;
         if new_off < 0 {
@@ -1680,7 +1882,7 @@ fn sys_lseek(ctx: &mut dyn TrapContext) {
     });
     match outcome {
         Some(Some(r)) => ctx.set_return(r),
-        _             => ctx.set_return(SyscallReturn::invalid_op()),
+        _ => ctx.set_return(SyscallReturn::invalid_op()),
     }
 }
 
@@ -1694,8 +1896,8 @@ fn sys_lseek(ctx: &mut dyn TrapContext) {
 
 fn sys_unlink(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let ptr  = args.arg0 as *const u8;
-    let len  = args.arg1 as usize;
+    let ptr = args.arg0 as *const u8;
+    let len = args.arg1 as usize;
     // POSIX-shaped failure sentinel. The kernel's syscall ABI carries
     // a separate `status` field but the user-runtime asm wrapper only
     // observes the `value` register; we mirror libc and return -1 on
@@ -1709,13 +1911,16 @@ fn sys_unlink(ctx: &mut dyn TrapContext) {
     let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
     let path = match core::str::from_utf8(bytes) {
         Ok(s) => s,
-        Err(_) => { ctx.set_return(fail); return; }
+        Err(_) => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     let outcome = narf_filesystem::registry()
         .resolve_parent_absolute(path, |_fs, parent, leaf| parent.unlink(leaf));
     match outcome {
         Some(Ok(())) => ctx.set_return(SyscallReturn::ok(0)),
-        _            => ctx.set_return(fail),
+        _ => ctx.set_return(fail),
     }
 }
 
@@ -1728,8 +1933,8 @@ fn sys_unlink(ctx: &mut dyn TrapContext) {
 
 fn sys_mkdir(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let ptr  = args.arg0 as *const u8;
-    let len  = args.arg1 as usize;
+    let ptr = args.arg0 as *const u8;
+    let len = args.arg1 as usize;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if ptr.is_null() || len == 0 {
         ctx.set_return(fail);
@@ -1739,20 +1944,23 @@ fn sys_mkdir(ctx: &mut dyn TrapContext) {
     let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
     let path = match core::str::from_utf8(bytes) {
         Ok(s) => s,
-        Err(_) => { ctx.set_return(fail); return; }
+        Err(_) => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     let outcome = narf_filesystem::registry()
         .resolve_parent_absolute(path, |_fs, parent, leaf| parent.mkdir(leaf));
     match outcome {
         Some(Ok(_)) => ctx.set_return(SyscallReturn::ok(0)),
-        _           => ctx.set_return(fail),
+        _ => ctx.set_return(fail),
     }
 }
 
 fn sys_rmdir(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let ptr  = args.arg0 as *const u8;
-    let len  = args.arg1 as usize;
+    let ptr = args.arg0 as *const u8;
+    let len = args.arg1 as usize;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if ptr.is_null() || len == 0 {
         ctx.set_return(fail);
@@ -1762,13 +1970,16 @@ fn sys_rmdir(ctx: &mut dyn TrapContext) {
     let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
     let path = match core::str::from_utf8(bytes) {
         Ok(s) => s,
-        Err(_) => { ctx.set_return(fail); return; }
+        Err(_) => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     let outcome = narf_filesystem::registry()
         .resolve_parent_absolute(path, |_fs, parent, leaf| parent.rmdir(leaf));
     match outcome {
         Some(Ok(())) => ctx.set_return(SyscallReturn::ok(0)),
-        _            => ctx.set_return(fail),
+        _ => ctx.set_return(fail),
     }
 }
 
@@ -1788,22 +1999,34 @@ fn sys_rename(ctx: &mut dyn TrapContext) {
     let new_bytes = unsafe { core::slice::from_raw_parts(new_ptr, new_len) };
     let old_path = match core::str::from_utf8(old_bytes) {
         Ok(s) => s,
-        Err(_) => { ctx.set_return(fail); return; }
+        Err(_) => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     let new_path = match core::str::from_utf8(new_bytes) {
         Ok(s) => s,
-        Err(_) => { ctx.set_return(fail); return; }
+        Err(_) => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     // Both paths must split into the same parent directory — cross-
     // directory rename isn't supported by the DirOps surface today
     // (would need a registry-aware version that locks both parents).
     let old_split = match old_path.rfind('/') {
         Some(i) => i,
-        None    => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     let new_split = match new_path.rfind('/') {
         Some(i) => i,
-        None    => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     if &old_path[..old_split] != &new_path[..new_split] {
         ctx.set_return(fail);
@@ -1816,7 +2039,7 @@ fn sys_rename(ctx: &mut dyn TrapContext) {
         });
     match outcome {
         Some(Ok(())) => ctx.set_return(SyscallReturn::ok(0)),
-        _            => ctx.set_return(fail),
+        _ => ctx.set_return(fail),
     }
 }
 
@@ -1834,8 +2057,8 @@ fn sys_readlink(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let path_ptr = args.arg0 as *const u8;
     let path_len = args.arg1 as usize;
-    let buf_ptr  = args.arg2 as *mut u8;
-    let buf_len  = args.arg3 as usize;
+    let buf_ptr = args.arg2 as *mut u8;
+    let buf_len = args.arg3 as usize;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if path_ptr.is_null() || path_len == 0 || buf_ptr.is_null() || buf_len == 0 {
         ctx.set_return(fail);
@@ -1846,7 +2069,10 @@ fn sys_readlink(ctx: &mut dyn TrapContext) {
     let path_bytes = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
     let path = match core::str::from_utf8(path_bytes) {
         Ok(s) => s,
-        Err(_) => { ctx.set_return(fail); return; }
+        Err(_) => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     // resolve_parent_absolute returns Option<Option<Arc<dyn FileOps>>>:
     // outer None = no mount covers the path, inner None = parent walk
@@ -1857,7 +2083,10 @@ fn sys_readlink(ctx: &mut dyn TrapContext) {
         .flatten();
     let file = match file {
         Some(f) => f,
-        None    => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     // Refuse non-symlinks — POSIX readlink returns EINVAL for those.
     let st = file.stat();
@@ -1872,7 +2101,10 @@ fn sys_readlink(ctx: &mut dyn TrapContext) {
     let mut staging = alloc::vec![0u8; len];
     let n = match poll_once(file.read(0, &mut staging)) {
         Some(Ok(n)) => n,
-        _           => { ctx.set_return(fail); return; }
+        _ => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     // Copy out volatile so the user's view is not subject to compiler
     // reordering across the syscall return.
@@ -1890,8 +2122,8 @@ fn sys_symlink(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let target_ptr = args.arg0 as *const u8;
     let target_len = args.arg1 as usize;
-    let link_ptr   = args.arg2 as *const u8;
-    let link_len   = args.arg3 as usize;
+    let link_ptr = args.arg2 as *const u8;
+    let link_len = args.arg3 as usize;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if target_ptr.is_null() || target_len == 0 || link_ptr.is_null() || link_len == 0 {
         ctx.set_return(fail);
@@ -1900,14 +2132,20 @@ fn sys_symlink(ctx: &mut dyn TrapContext) {
     // SAFETY: caller-supplied user pointers in the active AS, length-
     // bounded.
     let target_bytes = unsafe { core::slice::from_raw_parts(target_ptr, target_len) };
-    let link_bytes   = unsafe { core::slice::from_raw_parts(link_ptr,   link_len)   };
+    let link_bytes = unsafe { core::slice::from_raw_parts(link_ptr, link_len) };
     let target_str = match core::str::from_utf8(target_bytes) {
         Ok(s) => s,
-        Err(_) => { ctx.set_return(fail); return; }
+        Err(_) => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     let link_path = match core::str::from_utf8(link_bytes) {
         Ok(s) => s,
-        Err(_) => { ctx.set_return(fail); return; }
+        Err(_) => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     let outcome = narf_filesystem::registry()
         .resolve_parent_absolute(link_path, |_fs, parent, leaf| {
@@ -1915,7 +2153,7 @@ fn sys_symlink(ctx: &mut dyn TrapContext) {
         });
     match outcome {
         Some(Ok(_)) => ctx.set_return(SyscallReturn::ok(0)),
-        _           => ctx.set_return(fail),
+        _ => ctx.set_return(fail),
     }
 }
 
@@ -1943,11 +2181,11 @@ fn sys_symlink(ctx: &mut dyn TrapContext) {
 
 fn sys_listdir(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let path_ptr  = args.arg0 as *const u8;
-    let path_len  = args.arg1 as usize;
-    let cursor    = args.arg2 as usize;
-    let out_ptr   = args.arg3 as *mut u8;
-    let out_len   = args.arg4 as usize;
+    let path_ptr = args.arg0 as *const u8;
+    let path_len = args.arg1 as usize;
+    let cursor = args.arg2 as usize;
+    let out_ptr = args.arg3 as *mut u8;
+    let out_len = args.arg4 as usize;
     let fail = SyscallReturn::ok((-1i64) as u64);
 
     if path_ptr.is_null() || path_len == 0 || out_ptr.is_null() {
@@ -1963,31 +2201,39 @@ fn sys_listdir(ctx: &mut dyn TrapContext) {
     let path_bytes = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
     let path = match core::str::from_utf8(path_bytes) {
         Ok(s) => s,
-        Err(_) => { ctx.set_return(fail); return; }
+        Err(_) => {
+            ctx.set_return(fail);
+            return;
+        }
     };
 
     // Resolve to a DirOps. Empty path or root → use the FS root
     // directly; otherwise descend through `lookup_dir`.
-    let entries = narf_filesystem::registry().resolve_absolute(path, |fs, rel| {
-        let dir: alloc::sync::Arc<dyn narf_filesystem::DirOps> = if rel.is_empty() {
-            fs.root()
-        } else {
-            // Walk segment by segment so we follow `lookup_dir`.
-            let mut cur = fs.root();
-            for seg in rel.split('/').filter(|s| !s.is_empty()) {
-                cur = cur.lookup_dir(seg)?;
-            }
-            cur
-        };
-        // Bound the snapshot at usize::MAX entries — practically
-        // walks every entry, but `enumerate` already takes a `max`
-        // so the contract is in our hands.
-        Some(dir.enumerate(cursor, 1))
-    }).flatten();
+    let entries = narf_filesystem::registry()
+        .resolve_absolute(path, |fs, rel| {
+            let dir: alloc::sync::Arc<dyn narf_filesystem::DirOps> = if rel.is_empty() {
+                fs.root()
+            } else {
+                // Walk segment by segment so we follow `lookup_dir`.
+                let mut cur = fs.root();
+                for seg in rel.split('/').filter(|s| !s.is_empty()) {
+                    cur = cur.lookup_dir(seg)?;
+                }
+                cur
+            };
+            // Bound the snapshot at usize::MAX entries — practically
+            // walks every entry, but `enumerate` already takes a `max`
+            // so the contract is in our hands.
+            Some(dir.enumerate(cursor, 1))
+        })
+        .flatten();
 
     let entries = match entries {
         Some(v) => v,
-        None    => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     if entries.is_empty() {
         // End of directory.
@@ -2003,8 +2249,8 @@ fn sys_listdir(ctx: &mut dyn TrapContext) {
     }
     // Encode FileType to the wire ordinal: 0=File, 1=Dir, 2=Symlink, 3=Special.
     let ftype_wire: u32 = match ftype {
-        narf_filesystem::FileType::File    => 0,
-        narf_filesystem::FileType::Dir     => 1,
+        narf_filesystem::FileType::File => 0,
+        narf_filesystem::FileType::Dir => 1,
         narf_filesystem::FileType::Symlink => 2,
         narf_filesystem::FileType::Special => 3,
     };
@@ -2014,11 +2260,7 @@ fn sys_listdir(ctx: &mut dyn TrapContext) {
     unsafe {
         core::ptr::write_unaligned(out_ptr as *mut u32, name_bytes.len() as u32);
         core::ptr::write_unaligned(out_ptr.add(4) as *mut u32, ftype_wire);
-        core::ptr::copy_nonoverlapping(
-            name_bytes.as_ptr(),
-            out_ptr.add(8),
-            name_bytes.len(),
-        );
+        core::ptr::copy_nonoverlapping(name_bytes.as_ptr(), out_ptr.add(8), name_bytes.len());
     }
     ctx.set_return(SyscallReturn::ok(total as u64));
 }
@@ -2046,8 +2288,8 @@ fn sys_getdents64(ctx: &mut dyn TrapContext) {
     let path_ptr = args.arg0 as *const u8;
     let path_len = args.arg1 as usize;
     let mut cursor = args.arg2 as usize;
-    let out_ptr  = args.arg3 as *mut u8;
-    let out_len  = args.arg4 as usize;
+    let out_ptr = args.arg3 as *mut u8;
+    let out_len = args.arg4 as usize;
     let fail = SyscallReturn::ok((-1i64) as u64);
 
     if path_ptr.is_null() || path_len == 0 || out_ptr.is_null() || out_len < 32 {
@@ -2058,7 +2300,10 @@ fn sys_getdents64(ctx: &mut dyn TrapContext) {
     let path_bytes = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
     let path = match core::str::from_utf8(path_bytes) {
         Ok(s) => s,
-        Err(_) => { ctx.set_return(fail); return; }
+        Err(_) => {
+            ctx.set_return(fail);
+            return;
+        }
     };
 
     // Resolve to a DirOps once. We iterate by re-issuing
@@ -2066,32 +2311,39 @@ fn sys_getdents64(ctx: &mut dyn TrapContext) {
     // batch enumerator through the closure-typed registry walker,
     // and the per-call cost is bounded by the small fan-out of a
     // typical directory in our test FSes.
-    let dir = narf_filesystem::registry().resolve_absolute(path, |fs, rel| {
-        let dir: alloc::sync::Arc<dyn narf_filesystem::DirOps> = if rel.is_empty() {
-            fs.root()
-        } else {
-            let mut cur = fs.root();
-            for seg in rel.split('/').filter(|s| !s.is_empty()) {
-                cur = cur.lookup_dir(seg)?;
-            }
-            cur
-        };
-        Some(dir)
-    }).flatten();
+    let dir = narf_filesystem::registry()
+        .resolve_absolute(path, |fs, rel| {
+            let dir: alloc::sync::Arc<dyn narf_filesystem::DirOps> = if rel.is_empty() {
+                fs.root()
+            } else {
+                let mut cur = fs.root();
+                for seg in rel.split('/').filter(|s| !s.is_empty()) {
+                    cur = cur.lookup_dir(seg)?;
+                }
+                cur
+            };
+            Some(dir)
+        })
+        .flatten();
     let dir = match dir {
         Some(d) => d,
-        None    => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
 
     let mut written = 0usize;
     loop {
         let mut entries = dir.enumerate(cursor, 1);
-        if entries.is_empty() { break; }
+        if entries.is_empty() {
+            break;
+        }
         let (name, ftype) = entries.pop().unwrap();
         let name_bytes = name.as_bytes();
         // 19-byte fixed header + name + NUL, padded up to 8 bytes.
         let raw_len = 19 + name_bytes.len() + 1;
-        let reclen  = (raw_len + 7) & !7;
+        let reclen = (raw_len + 7) & !7;
         if written + reclen > out_len {
             // Record won't fit — stop here without advancing the
             // cursor for this entry. Linux returns whatever fit.
@@ -2099,8 +2351,8 @@ fn sys_getdents64(ctx: &mut dyn TrapContext) {
         }
         let next_cursor = cursor + 1;
         let dt = match ftype {
-            narf_filesystem::FileType::File    => 8,  // DT_REG
-            narf_filesystem::FileType::Dir     => 4,  // DT_DIR
+            narf_filesystem::FileType::File => 8,     // DT_REG
+            narf_filesystem::FileType::Dir => 4,      // DT_DIR
             narf_filesystem::FileType::Symlink => 10, // DT_LNK
             narf_filesystem::FileType::Special => 2,  // DT_CHR
         };
@@ -2111,8 +2363,8 @@ fn sys_getdents64(ctx: &mut dyn TrapContext) {
             core::ptr::write_unaligned(base as *mut u64, next_cursor as u64); // d_ino
             core::ptr::write_unaligned(base.add(8) as *mut u64, next_cursor as u64); // d_off
             core::ptr::write_unaligned(base.add(16) as *mut u16, reclen as u16); // d_reclen
-            core::ptr::write_volatile(base.add(18), dt);                         // d_type
-            // d_name follows at offset 19.
+            core::ptr::write_volatile(base.add(18), dt); // d_type
+                                                         // d_name follows at offset 19.
             for (i, &b) in name_bytes.iter().enumerate() {
                 core::ptr::write_volatile(base.add(19 + i), b);
             }
@@ -2152,15 +2404,18 @@ static MMAP_CURSOR: AtomicU64 = AtomicU64::new(0x0000_4080_0000_0000);
 
 fn sys_mmap(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let len  = ((args.arg1 as u64 + 0xFFF) & !0xFFFu64).max(0x1000);
+    let len = ((args.arg1 as u64 + 0xFFF) & !0xFFFu64).max(0x1000);
     let as_ref = match current_address_space() {
         Some(a) => a,
-        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
     };
 
     // Pick a fresh user virt by bumping the cursor.
     let pages = len >> 12;
-    let base  = MMAP_CURSOR.fetch_add(len, Ordering::Relaxed);
+    let base = MMAP_CURSOR.fetch_add(len, Ordering::Relaxed);
 
     // Allocate one frame per page and zero each. The freelist returns
     // frames out of order so we collect into a per-page scatter list.
@@ -2169,20 +2424,28 @@ fn sys_mmap(ctx: &mut dyn TrapContext) {
     for _ in 0..pages {
         let p = match narf_memory::alloc_frame() {
             Ok(f) => f.start_address(),
-            Err(_) => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+            Err(_) => {
+                ctx.set_return(SyscallReturn::invalid_op());
+                return;
+            }
         };
         // SAFETY: identity-mapped in low 4 GiB; phys is page-aligned.
-        unsafe { core::ptr::write_bytes(p.raw() as *mut u8, 0, 4096); }
+        unsafe {
+            core::ptr::write_bytes(p.raw() as *mut u8, 0, 4096);
+        }
         phys_list.push(p);
     }
 
     // Install + materialise.
-    if as_ref.map_region(Region {
-        base:  VirtAddr::new(base),
-        len,
-        perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys:  phys_list,
-    }).is_err() {
+    if as_ref
+        .map_region(Region {
+            base: VirtAddr::new(base),
+            len,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: phys_list,
+        })
+        .is_err()
+    {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
@@ -2219,9 +2482,9 @@ fn sys_mmap(ctx: &mut dyn TrapContext) {
 /// - `disconnect(handle) -> bool` — `true` on success.
 #[derive(Copy, Clone)]
 pub struct FbSyscallVtable {
-    pub connect:    fn(pid: u64, scanout_id: u64) -> u64,
-    pub info:       fn(handle: u64, out: &mut [u32; 6]) -> bool,
-    pub ring_map:   fn(handle: u64) -> u64,
+    pub connect: fn(pid: u64, scanout_id: u64) -> u64,
+    pub info: fn(handle: u64, out: &mut [u32; 6]) -> bool,
+    pub ring_map: fn(handle: u64) -> u64,
     pub flush_wait: fn(handle: u64) -> u64,
     pub disconnect: fn(handle: u64) -> bool,
 }
@@ -2248,7 +2511,9 @@ pub fn install_fb_syscall_vtable(v: &'static FbSyscallVtable) {
 #[doc(hidden)]
 pub fn __fb_vtable_for_test() -> Option<&'static FbSyscallVtable> {
     let p = FB_VTABLE.load(core::sync::atomic::Ordering::Acquire);
-    if p.is_null() { None } else {
+    if p.is_null() {
+        None
+    } else {
         // SAFETY: install_fb_syscall_vtable requires a 'static input.
         Some(unsafe { &*p })
     }
@@ -2256,7 +2521,9 @@ pub fn __fb_vtable_for_test() -> Option<&'static FbSyscallVtable> {
 
 fn fb_vtable() -> Option<&'static FbSyscallVtable> {
     let p = FB_VTABLE.load(core::sync::atomic::Ordering::Acquire);
-    if p.is_null() { None } else {
+    if p.is_null() {
+        None
+    } else {
         // SAFETY: install_fb_syscall_vtable requires a 'static input.
         Some(unsafe { &*p })
     }
@@ -2266,7 +2533,10 @@ fn sys_fb_connect(ctx: &mut dyn TrapContext) {
     let scanout_id = ctx.args().arg0;
     let v = match fb_vtable() {
         Some(v) => v,
-        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
     };
     let pid = current_task_id();
     let h = (v.connect)(pid, scanout_id);
@@ -2285,12 +2555,15 @@ fn sys_fb_connect(ctx: &mut dyn TrapContext) {
 }
 
 fn sys_fb_info(ctx: &mut dyn TrapContext) {
-    let args   = *ctx.args();
+    let args = *ctx.args();
     let handle = args.arg0;
     let user_p = args.arg1;
     let v = match fb_vtable() {
         Some(v) => v,
-        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
     };
     let mut out = [0u32; 6];
     if !(v.info)(handle, &mut out) {
@@ -2319,7 +2592,10 @@ fn sys_fb_ring_map(ctx: &mut dyn TrapContext) {
     let handle = ctx.args().arg0;
     let v = match fb_vtable() {
         Some(v) => v,
-        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
     };
     let phys = (v.ring_map)(handle);
     if phys == 0 {
@@ -2328,16 +2604,22 @@ fn sys_fb_ring_map(ctx: &mut dyn TrapContext) {
     }
     let as_ref = match current_address_space() {
         Some(a) => a,
-        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
     };
     let len = 4096u64;
     let base = MMAP_CURSOR.fetch_add(len, Ordering::Relaxed);
-    if as_ref.map_region(Region {
-        base:  VirtAddr::new(base),
-        len,
-        perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys:  alloc::vec![narf_memory::PhysAddr::new(phys)],
-    }).is_err() {
+    if as_ref
+        .map_region(Region {
+            base: VirtAddr::new(base),
+            len,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![narf_memory::PhysAddr::new(phys)],
+        })
+        .is_err()
+    {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
@@ -2352,7 +2634,10 @@ fn sys_fb_flush_wait(ctx: &mut dyn TrapContext) {
     let handle = ctx.args().arg0;
     let v = match fb_vtable() {
         Some(v) => v,
-        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
     };
     let drained = (v.flush_wait)(handle);
     ctx.set_return(SyscallReturn::ok(drained));
@@ -2362,7 +2647,10 @@ fn sys_fb_disconnect(ctx: &mut dyn TrapContext) {
     let handle = ctx.args().arg0;
     let v = match fb_vtable() {
         Some(v) => v,
-        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
     };
     if (v.disconnect)(handle) {
         // Pair with on_connect: when the last live handle goes
@@ -2427,11 +2715,11 @@ mod fb_console_owner {
 
 #[derive(Copy, Clone)]
 pub struct ShmemSyscallVtable {
-    pub create:  fn(pid: u64, len: u64) -> u64,
-    pub len_of:  fn(handle: u64) -> u64,
-    pub frames:  fn(handle: u64, out: &mut alloc::vec::Vec<u64>) -> bool,
+    pub create: fn(pid: u64, len: u64) -> u64,
+    pub len_of: fn(handle: u64) -> u64,
+    pub frames: fn(handle: u64, out: &mut alloc::vec::Vec<u64>) -> bool,
     pub destroy: fn(handle: u64) -> bool,
-    pub pid_of:  fn(handle: u64) -> u64,
+    pub pid_of: fn(handle: u64) -> u64,
 }
 
 impl core::fmt::Debug for ShmemSyscallVtable {
@@ -2452,7 +2740,9 @@ pub fn install_shmem_syscall_vtable(v: &'static ShmemSyscallVtable) {
 
 fn shmem_vtable() -> Option<&'static ShmemSyscallVtable> {
     let p = SHMEM_VTABLE.load(core::sync::atomic::Ordering::Acquire);
-    if p.is_null() { None } else {
+    if p.is_null() {
+        None
+    } else {
         // SAFETY: install_shmem_syscall_vtable requires a 'static input.
         Some(unsafe { &*p })
     }
@@ -2462,7 +2752,10 @@ fn sys_shmem_create(ctx: &mut dyn TrapContext) {
     let len = ctx.args().arg0;
     let v = match shmem_vtable() {
         Some(v) => v,
-        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
     };
     let pid = current_task_id();
     let h = (v.create)(pid, len);
@@ -2477,7 +2770,10 @@ fn sys_shmem_map(ctx: &mut dyn TrapContext) {
     let handle = ctx.args().arg0;
     let v = match shmem_vtable() {
         Some(v) => v,
-        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
     };
     // Cross-pid auth: the calling task must own this region. The
     // future cross-process sharing path adds an explicit grant /
@@ -2499,17 +2795,25 @@ fn sys_shmem_map(ctx: &mut dyn TrapContext) {
     }
     let as_ref = match current_address_space() {
         Some(a) => a,
-        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
     };
-    let phys_list: alloc::vec::Vec<narf_memory::PhysAddr> =
-        frames_raw.into_iter().map(narf_memory::PhysAddr::new).collect();
+    let phys_list: alloc::vec::Vec<narf_memory::PhysAddr> = frames_raw
+        .into_iter()
+        .map(narf_memory::PhysAddr::new)
+        .collect();
     let base = MMAP_CURSOR.fetch_add(len, Ordering::Relaxed);
-    if as_ref.map_region(Region {
-        base:  VirtAddr::new(base),
-        len,
-        perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys:  phys_list,
-    }).is_err() {
+    if as_ref
+        .map_region(Region {
+            base: VirtAddr::new(base),
+            len,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: phys_list,
+        })
+        .is_err()
+    {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
@@ -2524,7 +2828,10 @@ fn sys_shmem_destroy(ctx: &mut dyn TrapContext) {
     let handle = ctx.args().arg0;
     let v = match shmem_vtable() {
         Some(v) => v,
-        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
     };
     let pid = current_task_id();
     if (v.pid_of)(handle) != pid {
@@ -2565,15 +2872,15 @@ fn sys_firmware_install(ctx: &mut dyn TrapContext) {
     let pid = current_task_id();
     let auth = match narf_firmware::firmware_authority_of(pid) {
         Some(c) => c,
-        None    => {
+        None => {
             ctx.set_return(SyscallReturn::invalid_op());
             return;
         }
     };
 
     let args = *ctx.args();
-    let name_ptr  = args.arg0 as *const u8;
-    let name_len  = args.arg1 as usize;
+    let name_ptr = args.arg0 as *const u8;
+    let name_len = args.arg1 as usize;
     let bytes_ptr = args.arg2 as *const u8;
     let bytes_len = args.arg3 as usize;
     if name_ptr.is_null() || bytes_ptr.is_null() || name_len == 0 || bytes_len == 0 {
@@ -2597,7 +2904,7 @@ fn sys_firmware_install(ctx: &mut dyn TrapContext) {
     // registry isn't pinned to user memory.
     let name_bytes = unsafe { core::slice::from_raw_parts(name_ptr, name_len) };
     let name_str = match core::str::from_utf8(name_bytes) {
-        Ok(s)  => s,
+        Ok(s) => s,
         Err(_) => {
             ctx.set_return(SyscallReturn::invalid_op());
             return;
@@ -2608,20 +2915,18 @@ fn sys_firmware_install(ctx: &mut dyn TrapContext) {
     // is dropped from the registry but stays leaked. Acceptable
     // because firmware-install events are rare (vendor updates,
     // not per-frame).
-    let leaked: &'static str = alloc::boxed::Box::leak(
-        alloc::string::String::from(name_str).into_boxed_str());
+    let leaked: &'static str =
+        alloc::boxed::Box::leak(alloc::string::String::from(name_str).into_boxed_str());
 
     // SAFETY: `bytes_ptr` + `bytes_len` are user-mode addresses in
     // the calling task's AS; the trap didn't swap CR3. The kernel
     // path inside `firmware::sys_install` copies bytes into a
     // DMA-coherent page before returning, so the user pointer's
     // lifetime is bounded by this call.
-    let r = unsafe {
-        narf_firmware::sys_install(leaked, bytes_ptr, bytes_len, &auth)
-    };
+    let r = unsafe { narf_firmware::sys_install(leaked, bytes_ptr, bytes_len, &auth) };
     match r {
-        Ok(())  => ctx.set_return(SyscallReturn::ok(0)),
-        Err(_)  => ctx.set_return(SyscallReturn::invalid_op()),
+        Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
+        Err(_) => ctx.set_return(SyscallReturn::invalid_op()),
     }
 }
 
@@ -2631,11 +2936,14 @@ fn sys_munmap(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let as_ref = match current_address_space() {
         Some(a) => a,
-        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
     };
     let base = VirtAddr::new(args.arg0);
     match as_ref.unmap_region(base) {
-        Ok(_)  => ctx.set_return(SyscallReturn::ok(0)),
+        Ok(_) => ctx.set_return(SyscallReturn::ok(0)),
         Err(_) => ctx.set_return(SyscallReturn::invalid_op()),
     }
 }
@@ -2647,9 +2955,10 @@ fn sys_exit_task(ctx: &mut dyn TrapContext) {
     // exit hook is registered, save the user state, mark the
     // reason, and tail-call the hook — which longjmps back into
     // the polling routine.
-    if let (Some(uctx), Some(hook)) =
-        (crate::user_task::current_user_task(), crate::user_task::exit_hook())
-    {
+    if let (Some(uctx), Some(hook)) = (
+        crate::user_task::current_user_task(),
+        crate::user_task::exit_hook(),
+    ) {
         // SAFETY: uctx is valid for as long as the polling routine
         // (its caller, on the same CPU) holds it pinned. We're
         // about to never return.
@@ -2680,9 +2989,10 @@ fn sys_exit_task(ctx: &mut dyn TrapContext) {
 
 fn sys_yield(ctx: &mut dyn TrapContext) {
     // Polling-future path mirroring sys_exit_task.
-    if let (Some(uctx), Some(hook)) =
-        (crate::user_task::current_user_task(), crate::user_task::yield_hook())
-    {
+    if let (Some(uctx), Some(hook)) = (
+        crate::user_task::current_user_task(),
+        crate::user_task::yield_hook(),
+    ) {
         // SAFETY: same contract as sys_exit_task's hook path.
         unsafe {
             let uc = &*uctx;
@@ -2709,10 +3019,7 @@ fn sys_yield(ctx: &mut dyn TrapContext) {
 // real wake side-channel lands.
 
 fn sys_ring_kick(ctx: &mut dyn TrapContext) {
-    use narf_abi::{
-        FileOpArgs, FileOpKind, NarfStatus, OpCode, SharedConsumer,
-        SharedProducer,
-    };
+    use narf_abi::{FileOpArgs, FileOpKind, NarfStatus, OpCode, SharedConsumer, SharedProducer};
 
     type SqRing = SharedRing<Submission, BOOTSTRAP_SHARED_RING_DEPTH>;
     type CqRing = SharedRing<Completion, BOOTSTRAP_SHARED_RING_DEPTH>;
@@ -2720,7 +3027,10 @@ fn sys_ring_kick(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
     let pair = match shared_rings_for(task) {
         Some(p) => p,
-        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
     };
 
     // SAFETY: per-task BOOTSTRAP_TABLE owns the phys backings; only
@@ -2728,12 +3038,12 @@ fn sys_ring_kick(ctx: &mut dyn TrapContext) {
     // synchronously inside this task's syscall trap.
     let mut sq = unsafe {
         SharedConsumer::<Submission, BOOTSTRAP_SHARED_RING_DEPTH>::from_raw(
-            pair.sq_phys.raw() as *mut SqRing,
+            pair.sq_phys.raw() as *mut SqRing
         )
     };
     let mut cq = unsafe {
         SharedProducer::<Completion, BOOTSTRAP_SHARED_RING_DEPTH>::from_raw(
-            pair.cq_phys.raw() as *mut CqRing,
+            pair.cq_phys.raw() as *mut CqRing
         )
     };
 
@@ -2746,23 +3056,35 @@ fn sys_ring_kick(ctx: &mut dyn TrapContext) {
         let tag = sub.tag();
         let completion = match sub.op {
             OpCode::Noop => Completion::ok(tag),
-            OpCode::OpenFile | OpCode::Read | OpCode::Write
-                | OpCode::Close | OpCode::Mmap | OpCode::Munmap => {
+            OpCode::OpenFile
+            | OpCode::Read
+            | OpCode::Write
+            | OpCode::Close
+            | OpCode::Mmap
+            | OpCode::Munmap => {
                 let kind = match sub.op {
                     OpCode::OpenFile => FileOpKind::Open,
-                    OpCode::Read     => FileOpKind::Read,
-                    OpCode::Write    => FileOpKind::Write,
-                    OpCode::Close    => FileOpKind::Close,
-                    OpCode::Mmap     => FileOpKind::Mmap,
-                    OpCode::Munmap   => FileOpKind::Munmap,
+                    OpCode::Read => FileOpKind::Read,
+                    OpCode::Write => FileOpKind::Write,
+                    OpCode::Close => FileOpKind::Close,
+                    OpCode::Mmap => FileOpKind::Mmap,
+                    OpCode::Munmap => FileOpKind::Munmap,
                     _ => unreachable!(),
                 };
                 let args = FileOpArgs {
-                    a0: sub.inline[0], a1: sub.inline[1], a2: sub.inline[2],
-                    a3: sub.inline[3], a4: sub.inline[4], a5: sub.inline[5],
+                    a0: sub.inline[0],
+                    a1: sub.inline[1],
+                    a2: sub.inline[2],
+                    a3: sub.inline[3],
+                    a4: sub.inline[4],
+                    a5: sub.inline[5],
                 };
                 let r = abi_file_op_bridge(kind, &args);
-                let status = if r.status == 0 { NarfStatus::Ok } else { NarfStatus::InvalidOp };
+                let status = if r.status == 0 {
+                    NarfStatus::Ok
+                } else {
+                    NarfStatus::InvalidOp
+                };
                 let mut result = [0u64; 6];
                 result[0] = r.value;
                 Completion::with(tag, status, result)
@@ -2806,16 +3128,17 @@ fn sys_gettid(ctx: &mut dyn TrapContext) {
 // pgid = 0 in setpgid means "use the target's pid" per POSIX —
 // we resolve that in the handler.
 
-static PGID_TABLE:
-    narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>>
-    = narf_lib::sync::IrqSafeSpinLock::new(None);
+static PGID_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
 
 pub fn pgid_init() {
     *PGID_TABLE.lock() = Some(BTreeMap::new());
 }
 
 #[doc(hidden)]
-pub fn __test_pgid_reset() { *PGID_TABLE.lock() = None; }
+pub fn __test_pgid_reset() {
+    *PGID_TABLE.lock() = None;
+}
 
 fn read_pgid(target: u64) -> u64 {
     let g = PGID_TABLE.lock();
@@ -2832,15 +3155,18 @@ fn sys_getpgid(ctx: &mut dyn TrapContext) {
 
 fn sys_setpgid(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let pid    = args.arg0;
-    let pgid   = args.arg1;
+    let pid = args.arg0;
+    let pgid = args.arg1;
     let fail = SyscallReturn::ok((-1i64) as u64);
     let target = if pid == 0 { current_task_id() } else { pid };
-    let value  = if pgid == 0 { target } else { pgid };
+    let value = if pgid == 0 { target } else { pgid };
     let mut g = PGID_TABLE.lock();
     let m = match g.as_mut() {
         Some(m) => m,
-        None    => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     m.insert(target, value);
     ctx.set_return(SyscallReturn::ok(0));
@@ -2853,16 +3179,17 @@ fn sys_setpgid(ctx: &mut dyn TrapContext) {
 // state round-trips so init/job-control consumers see the
 // expected behaviour.
 
-static SID_TABLE:
-    narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>>
-    = narf_lib::sync::IrqSafeSpinLock::new(None);
+static SID_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
 
 pub fn sid_init() {
     *SID_TABLE.lock() = Some(BTreeMap::new());
 }
 
 #[doc(hidden)]
-pub fn __test_sid_reset() { *SID_TABLE.lock() = None; }
+pub fn __test_sid_reset() {
+    *SID_TABLE.lock() = None;
+}
 
 fn read_sid(target: u64) -> u64 {
     let g = SID_TABLE.lock();
@@ -2913,11 +3240,13 @@ fn sys_setsid(ctx: &mut dyn TrapContext) {
 // setuid/setgid see no change.
 
 #[derive(Copy, Clone, Default)]
-struct UidGid { uid: u32, gid: u32 }
+struct UidGid {
+    uid: u32,
+    gid: u32,
+}
 
-static UIDGID_TABLE:
-    narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, UidGid>>>
-    = narf_lib::sync::IrqSafeSpinLock::new(None);
+static UIDGID_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, UidGid>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// Initialise the per-task uid/gid registry. Call once at boot
 /// before any user task issues `setuid` / `getuid`.
@@ -2927,7 +3256,9 @@ pub fn uidgid_init() {
 
 /// Reset the registry — test hook.
 #[doc(hidden)]
-pub fn __test_uidgid_reset() { *UIDGID_TABLE.lock() = None; }
+pub fn __test_uidgid_reset() {
+    *UIDGID_TABLE.lock() = None;
+}
 
 fn read_uidgid(task: u64) -> UidGid {
     let g = UIDGID_TABLE.lock();
@@ -2938,7 +3269,9 @@ fn read_uidgid(task: u64) -> UidGid {
 
 fn write_uidgid<F: FnOnce(&mut UidGid)>(task: u64, f: F) -> bool {
     let mut g = UIDGID_TABLE.lock();
-    let Some(m) = g.as_mut() else { return false; };
+    let Some(m) = g.as_mut() else {
+        return false;
+    };
     let entry = m.entry(task).or_default();
     f(entry);
     true
@@ -2956,7 +3289,7 @@ fn sys_getgid(ctx: &mut dyn TrapContext) {
 
 fn sys_setuid(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
-    let uid  = ctx.args().arg0 as u32;
+    let uid = ctx.args().arg0 as u32;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if write_uidgid(task, |e| e.uid = uid) {
         ctx.set_return(SyscallReturn::ok(0));
@@ -2967,7 +3300,7 @@ fn sys_setuid(ctx: &mut dyn TrapContext) {
 
 fn sys_setgid(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
-    let gid  = ctx.args().arg0 as u32;
+    let gid = ctx.args().arg0 as u32;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if write_uidgid(task, |e| e.gid = gid) {
         ctx.set_return(SyscallReturn::ok(0));
@@ -3001,34 +3334,53 @@ const RLIMIT_COUNT: usize = 16;
 /// glibc layout the libc shim already exposes.
 #[repr(C)]
 #[derive(Copy, Clone, Default)]
-struct RLimitPair { cur: u64, max: u64 }
+struct RLimitPair {
+    cur: u64,
+    max: u64,
+}
 
 const RLIM_INFINITY: u64 = !0;
 
 fn default_rlimits() -> [RLimitPair; RLIMIT_COUNT] {
-    let mut t = [RLimitPair { cur: RLIM_INFINITY, max: RLIM_INFINITY }; RLIMIT_COUNT];
+    let mut t = [RLimitPair {
+        cur: RLIM_INFINITY,
+        max: RLIM_INFINITY,
+    }; RLIMIT_COUNT];
     // RLIMIT_STACK = 3.
-    t[3] = RLimitPair { cur: 8 * 1024 * 1024, max: RLIM_INFINITY };
+    t[3] = RLimitPair {
+        cur: 8 * 1024 * 1024,
+        max: RLIM_INFINITY,
+    };
     // RLIMIT_CORE = 4.
-    t[4] = RLimitPair { cur: 0,               max: RLIM_INFINITY };
+    t[4] = RLimitPair {
+        cur: 0,
+        max: RLIM_INFINITY,
+    };
     // RLIMIT_NOFILE = 7.
-    t[7] = RLimitPair { cur: 256,             max: 4096 };
+    t[7] = RLimitPair {
+        cur: 256,
+        max: 4096,
+    };
     t
 }
 
-static RLIMIT_TABLE:
-    narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, [RLimitPair; RLIMIT_COUNT]>>>
-    = narf_lib::sync::IrqSafeSpinLock::new(None);
+static RLIMIT_TABLE: narf_lib::sync::IrqSafeSpinLock<
+    Option<BTreeMap<u64, [RLimitPair; RLIMIT_COUNT]>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
 
 pub fn rlimit_init() {
     *RLIMIT_TABLE.lock() = Some(BTreeMap::new());
 }
 
 #[doc(hidden)]
-pub fn __test_rlimit_reset() { *RLIMIT_TABLE.lock() = None; }
+pub fn __test_rlimit_reset() {
+    *RLIMIT_TABLE.lock() = None;
+}
 
 fn read_rlimit(task: u64, resource: usize) -> Option<RLimitPair> {
-    if resource >= RLIMIT_COUNT { return None; }
+    if resource >= RLIMIT_COUNT {
+        return None;
+    }
     let g = RLIMIT_TABLE.lock();
     let m = g.as_ref()?;
     let row = m.get(&task).copied().unwrap_or_else(default_rlimits);
@@ -3036,9 +3388,13 @@ fn read_rlimit(task: u64, resource: usize) -> Option<RLimitPair> {
 }
 
 fn write_rlimit(task: u64, resource: usize, val: RLimitPair) -> bool {
-    if resource >= RLIMIT_COUNT { return false; }
+    if resource >= RLIMIT_COUNT {
+        return false;
+    }
     let mut g = RLIMIT_TABLE.lock();
-    let Some(m) = g.as_mut() else { return false; };
+    let Some(m) = g.as_mut() else {
+        return false;
+    };
     let row = m.entry(task).or_insert_with(default_rlimits);
     row[resource] = val;
     true
@@ -3047,7 +3403,7 @@ fn write_rlimit(task: u64, resource: usize, val: RLimitPair) -> bool {
 fn sys_getrlimit(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let resource = args.arg0 as usize;
-    let out_ptr  = args.arg1 as *mut u64;
+    let out_ptr = args.arg1 as *mut u64;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if out_ptr.is_null() {
         ctx.set_return(fail);
@@ -3056,12 +3412,15 @@ fn sys_getrlimit(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
     let pair = match read_rlimit(task, resource) {
         Some(p) => p,
-        None    => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     // SAFETY: caller-supplied writable user vaddr; we write two u64s.
     unsafe {
-        core::ptr::write_volatile(out_ptr,           pair.cur);
-        core::ptr::write_volatile(out_ptr.add(1),    pair.max);
+        core::ptr::write_volatile(out_ptr, pair.cur);
+        core::ptr::write_volatile(out_ptr.add(1), pair.max);
     }
     ctx.set_return(SyscallReturn::ok(0));
 }
@@ -3069,7 +3428,7 @@ fn sys_getrlimit(ctx: &mut dyn TrapContext) {
 fn sys_setrlimit(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let resource = args.arg0 as usize;
-    let in_ptr   = args.arg1 as *const u64;
+    let in_ptr = args.arg1 as *const u64;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if in_ptr.is_null() {
         ctx.set_return(fail);
@@ -3088,10 +3447,10 @@ fn sys_setrlimit(ctx: &mut dyn TrapContext) {
 
 fn sys_prlimit64(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let pid       = args.arg0;
-    let resource  = args.arg1 as usize;
-    let new_ptr   = args.arg2 as *const u64;
-    let old_ptr   = args.arg3 as *mut u64;
+    let pid = args.arg0;
+    let resource = args.arg1 as usize;
+    let new_ptr = args.arg2 as *const u64;
+    let old_ptr = args.arg3 as *mut u64;
     let fail = SyscallReturn::ok((-1i64) as u64);
     // pid = 0 means "self"; non-zero pids are routed to that task
     // unconditionally (no permission check today — capabilities
@@ -3120,7 +3479,7 @@ fn sys_prlimit64(ctx: &mut dyn TrapContext) {
     if !old_ptr.is_null() {
         // SAFETY: caller-supplied writable region.
         unsafe {
-            core::ptr::write_volatile(old_ptr,        prior.cur);
+            core::ptr::write_volatile(old_ptr, prior.cur);
             core::ptr::write_volatile(old_ptr.add(1), prior.max);
         }
     }
@@ -3135,41 +3494,42 @@ fn sys_prlimit64(ctx: &mut dyn TrapContext) {
 // as round-trip booleans). The 16-byte name limit matches Linux's
 // TASK_COMM_LEN.
 
-const PR_SET_NAME:           u64 = 15;
-const PR_GET_NAME:           u64 = 16;
-const PR_SET_DUMPABLE:       u64 = 4;
-const PR_GET_DUMPABLE:       u64 = 3;
-const PR_SET_NO_NEW_PRIVS:   u64 = 38;
-const PR_GET_NO_NEW_PRIVS:   u64 = 39;
-const TASK_COMM_LEN:         usize = 16;
+const PR_SET_NAME: u64 = 15;
+const PR_GET_NAME: u64 = 16;
+const PR_SET_DUMPABLE: u64 = 4;
+const PR_GET_DUMPABLE: u64 = 3;
+const PR_SET_NO_NEW_PRIVS: u64 = 38;
+const PR_GET_NO_NEW_PRIVS: u64 = 39;
+const TASK_COMM_LEN: usize = 16;
 
 #[derive(Copy, Clone)]
 struct PrctlState {
-    name:          [u8; TASK_COMM_LEN],
-    dumpable:      bool,
-    no_new_privs:  bool,
+    name: [u8; TASK_COMM_LEN],
+    dumpable: bool,
+    no_new_privs: bool,
 }
 
 impl Default for PrctlState {
     fn default() -> Self {
         Self {
-            name:         [0; TASK_COMM_LEN],
-            dumpable:     true,    // Linux default
+            name: [0; TASK_COMM_LEN],
+            dumpable: true, // Linux default
             no_new_privs: false,
         }
     }
 }
 
-static PRCTL_TABLE:
-    narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, PrctlState>>>
-    = narf_lib::sync::IrqSafeSpinLock::new(None);
+static PRCTL_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, PrctlState>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
 
 pub fn prctl_init() {
     *PRCTL_TABLE.lock() = Some(BTreeMap::new());
 }
 
 #[doc(hidden)]
-pub fn __test_prctl_reset() { *PRCTL_TABLE.lock() = None; }
+pub fn __test_prctl_reset() {
+    *PRCTL_TABLE.lock() = None;
+}
 
 fn read_prctl(task: u64) -> PrctlState {
     let g = PRCTL_TABLE.lock();
@@ -3180,7 +3540,9 @@ fn read_prctl(task: u64) -> PrctlState {
 
 fn modify_prctl<F: FnOnce(&mut PrctlState)>(task: u64, f: F) -> bool {
     let mut g = PRCTL_TABLE.lock();
-    let Some(m) = g.as_mut() else { return false; };
+    let Some(m) = g.as_mut() else {
+        return false;
+    };
     let entry = m.entry(task).or_default();
     f(entry);
     true
@@ -3188,7 +3550,7 @@ fn modify_prctl<F: FnOnce(&mut PrctlState)>(task: u64, f: F) -> bool {
 
 fn sys_prctl(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let op    = args.arg0;
+    let op = args.arg0;
     let arg_a = args.arg1;
     let _arg_b = args.arg2;
     let fail = SyscallReturn::ok((-1i64) as u64);
@@ -3210,7 +3572,9 @@ fn sys_prctl(ctx: &mut dyn TrapContext) {
             unsafe {
                 for i in 0..(TASK_COMM_LEN - 1) {
                     let b = core::ptr::read_volatile(ptr.add(i));
-                    if b == 0 { break; }
+                    if b == 0 {
+                        break;
+                    }
                     name[i] = b;
                 }
             }
@@ -3267,15 +3631,15 @@ fn sys_prctl(ctx: &mut dyn TrapContext) {
 // a coherent answer.
 
 const SCHED_OTHER: u64 = 0;
-const SCHED_FIFO:  u64 = 1;
-const SCHED_RR:    u64 = 2;
+const SCHED_FIFO: u64 = 1;
+const SCHED_RR: u64 = 2;
 const SCHED_BATCH: u64 = 3;
-const SCHED_IDLE:  u64 = 5;
+const SCHED_IDLE: u64 = 5;
 
 fn priority_max_for_policy(policy: u64) -> Option<i64> {
     match policy {
         SCHED_OTHER | SCHED_BATCH | SCHED_IDLE => Some(0),
-        SCHED_FIFO  | SCHED_RR                  => Some(99),
+        SCHED_FIFO | SCHED_RR => Some(99),
         _ => None,
     }
 }
@@ -3283,7 +3647,7 @@ fn priority_max_for_policy(policy: u64) -> Option<i64> {
 fn priority_min_for_policy(policy: u64) -> Option<i64> {
     match policy {
         SCHED_OTHER | SCHED_BATCH | SCHED_IDLE => Some(0),
-        SCHED_FIFO  | SCHED_RR                  => Some(1),
+        SCHED_FIFO | SCHED_RR => Some(1),
         _ => None,
     }
 }
@@ -3292,7 +3656,7 @@ fn sys_sched_get_priority_max(ctx: &mut dyn TrapContext) {
     let policy = ctx.args().arg0;
     match priority_max_for_policy(policy) {
         Some(p) => ctx.set_return(SyscallReturn::ok(p as u64)),
-        None    => ctx.set_return(SyscallReturn::ok((-1i64) as u64)),
+        None => ctx.set_return(SyscallReturn::ok((-1i64) as u64)),
     }
 }
 
@@ -3300,26 +3664,27 @@ fn sys_sched_get_priority_min(ctx: &mut dyn TrapContext) {
     let policy = ctx.args().arg0;
     match priority_min_for_policy(policy) {
         Some(p) => ctx.set_return(SyscallReturn::ok(p as u64)),
-        None    => ctx.set_return(SyscallReturn::ok((-1i64) as u64)),
+        None => ctx.set_return(SyscallReturn::ok((-1i64) as u64)),
     }
 }
 
 // Per-task sched_param slot. Single i32 (sched_priority).
-static SCHED_PARAM_TABLE:
-    narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, i32>>>
-    = narf_lib::sync::IrqSafeSpinLock::new(None);
+static SCHED_PARAM_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, i32>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
 
 pub fn sched_param_init() {
     *SCHED_PARAM_TABLE.lock() = Some(BTreeMap::new());
 }
 
 #[doc(hidden)]
-pub fn __test_sched_param_reset() { *SCHED_PARAM_TABLE.lock() = None; }
+pub fn __test_sched_param_reset() {
+    *SCHED_PARAM_TABLE.lock() = None;
+}
 
 fn sys_sched_getparam(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let pid  = args.arg0;
-    let out  = args.arg1 as *mut i32;
+    let pid = args.arg0;
+    let out = args.arg1 as *mut i32;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if out.is_null() {
         ctx.set_return(fail);
@@ -3327,18 +3692,18 @@ fn sys_sched_getparam(ctx: &mut dyn TrapContext) {
     }
     let task = if pid == 0 { current_task_id() } else { pid };
     let g = SCHED_PARAM_TABLE.lock();
-    let val = g.as_ref()
-        .and_then(|m| m.get(&task).copied())
-        .unwrap_or(0);
+    let val = g.as_ref().and_then(|m| m.get(&task).copied()).unwrap_or(0);
     // SAFETY: caller-supplied writable user vaddr; one i32.
-    unsafe { core::ptr::write_volatile(out, val); }
+    unsafe {
+        core::ptr::write_volatile(out, val);
+    }
     ctx.set_return(SyscallReturn::ok(0));
 }
 
 fn sys_sched_setparam(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let pid  = args.arg0;
-    let inp  = args.arg1 as *const i32;
+    let pid = args.arg0;
+    let inp = args.arg1 as *const i32;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if inp.is_null() {
         ctx.set_return(fail);
@@ -3350,7 +3715,10 @@ fn sys_sched_setparam(ctx: &mut dyn TrapContext) {
     let mut g = SCHED_PARAM_TABLE.lock();
     let m = match g.as_mut() {
         Some(m) => m,
-        None    => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     m.insert(task, val);
     ctx.set_return(SyscallReturn::ok(0));
@@ -3368,7 +3736,7 @@ fn sys_sched_getaffinity(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let _pid = args.arg0;
     let size = args.arg1 as usize;
-    let out  = args.arg2 as *mut u8;
+    let out = args.arg2 as *mut u8;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if out.is_null() || size == 0 {
         ctx.set_return(fail);
@@ -3381,9 +3749,9 @@ fn sys_sched_getaffinity(ctx: &mut dyn TrapContext) {
         ctx.set_return(fail);
         return;
     }
-    let bytes = size & !7;   // round to 8
-    // SAFETY: caller-supplied user vaddr; we write `bytes` bytes,
-    // first byte = 0x01 (CPU 0 set), rest zero.
+    let bytes = size & !7; // round to 8
+                           // SAFETY: caller-supplied user vaddr; we write `bytes` bytes,
+                           // first byte = 0x01 (CPU 0 set), rest zero.
     unsafe {
         core::ptr::write_volatile(out, 0x01);
         for i in 1..bytes {
@@ -3397,7 +3765,7 @@ fn sys_sched_setaffinity(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let _pid = args.arg0;
     let size = args.arg1 as usize;
-    let buf  = args.arg2 as *const u8;
+    let buf = args.arg2 as *const u8;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if buf.is_null() || size == 0 {
         ctx.set_return(fail);
@@ -3419,15 +3787,19 @@ fn sys_sched_setaffinity(ctx: &mut dyn TrapContext) {
 
 fn sys_getcpu(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let cpu_ptr  = args.arg0 as *mut u32;
+    let cpu_ptr = args.arg0 as *mut u32;
     let node_ptr = args.arg1 as *mut u32;
     // SAFETY: caller-supplied user vaddrs in the active AS; we
     // only write through them when they're non-null.
     if !cpu_ptr.is_null() {
-        unsafe { core::ptr::write_volatile(cpu_ptr, 0); }
+        unsafe {
+            core::ptr::write_volatile(cpu_ptr, 0);
+        }
     }
     if !node_ptr.is_null() {
-        unsafe { core::ptr::write_volatile(node_ptr, 0); }
+        unsafe {
+            core::ptr::write_volatile(node_ptr, 0);
+        }
     }
     ctx.set_return(SyscallReturn::ok(0));
 }
@@ -3441,16 +3813,17 @@ fn sys_getcpu(ctx: &mut dyn TrapContext) {
 // consumers care about — `umask(0o077)` followed by `umask(0o022)`
 // expects the second call to return the prior 0o077.
 
-static UMASK_TABLE:
-    narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>>
-    = narf_lib::sync::IrqSafeSpinLock::new(None);
+static UMASK_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
 
 pub fn umask_init() {
     *UMASK_TABLE.lock() = Some(BTreeMap::new());
 }
 
 #[doc(hidden)]
-pub fn __test_umask_reset() { *UMASK_TABLE.lock() = None; }
+pub fn __test_umask_reset() {
+    *UMASK_TABLE.lock() = None;
+}
 
 const UMASK_DEFAULT: u32 = 0o022;
 
@@ -3460,7 +3833,7 @@ fn sys_umask(ctx: &mut dyn TrapContext) {
     let mut g = UMASK_TABLE.lock();
     let m = match g.as_mut() {
         Some(m) => m,
-        None    => {
+        None => {
             // Treat lack of init as default-mask — return that
             // and accept the new mask going forward.
             ctx.set_return(SyscallReturn::ok(UMASK_DEFAULT as u64));
@@ -3483,27 +3856,28 @@ fn sys_umask(ctx: &mut dyn TrapContext) {
 
 const PRIO_PROCESS_VAL: i64 = 0;
 
-static NICE_TABLE:
-    narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, i32>>>
-    = narf_lib::sync::IrqSafeSpinLock::new(None);
+static NICE_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, i32>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
 
 pub fn nice_init() {
     *NICE_TABLE.lock() = Some(BTreeMap::new());
 }
 
 #[doc(hidden)]
-pub fn __test_nice_reset() { *NICE_TABLE.lock() = None; }
+pub fn __test_nice_reset() {
+    *NICE_TABLE.lock() = None;
+}
 
 fn read_nice(task: u64) -> i32 {
     let g = NICE_TABLE.lock();
-    g.as_ref()
-        .and_then(|m| m.get(&task).copied())
-        .unwrap_or(0)
+    g.as_ref().and_then(|m| m.get(&task).copied()).unwrap_or(0)
 }
 
 fn write_nice(task: u64, prio: i32) -> bool {
     let mut g = NICE_TABLE.lock();
-    let Some(m) = g.as_mut() else { return false; };
+    let Some(m) = g.as_mut() else {
+        return false;
+    };
     m.insert(task, prio);
     true
 }
@@ -3511,7 +3885,7 @@ fn write_nice(task: u64, prio: i32) -> bool {
 fn sys_getpriority(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let which = args.arg0 as i64;
-    let _who  = args.arg1;
+    let _who = args.arg1;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if which != PRIO_PROCESS_VAL {
         ctx.set_return(fail);
@@ -3530,8 +3904,8 @@ fn sys_getpriority(ctx: &mut dyn TrapContext) {
 fn sys_setpriority(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let which = args.arg0 as i64;
-    let _who  = args.arg1;
-    let prio  = args.arg2 as i64;
+    let _who = args.arg1;
+    let prio = args.arg2 as i64;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if which != PRIO_PROCESS_VAL || !(-20..=19).contains(&prio) {
         ctx.set_return(fail);
@@ -3570,10 +3944,10 @@ fn sys_times(ctx: &mut dyn TrapContext) {
         // SAFETY: caller-supplied user vaddr in the active AS;
         // we write four i64s. Bad pointer faults the user.
         unsafe {
-            core::ptr::write_volatile(out_ptr,        ticks); // utime
-            core::ptr::write_volatile(out_ptr.add(1), 0);     // stime
-            core::ptr::write_volatile(out_ptr.add(2), 0);     // cutime
-            core::ptr::write_volatile(out_ptr.add(3), 0);     // cstime
+            core::ptr::write_volatile(out_ptr, ticks); // utime
+            core::ptr::write_volatile(out_ptr.add(1), 0); // stime
+            core::ptr::write_volatile(out_ptr.add(2), 0); // cutime
+            core::ptr::write_volatile(out_ptr.add(3), 0); // cstime
         }
     }
     if ticks < 0 {
@@ -3591,27 +3965,27 @@ fn sys_times(ctx: &mut dyn TrapContext) {
 // the rest — same accounting story as sys_times. The two-field
 // timeval layout matches what glibc's <sys/time.h> exposes.
 
-const RUSAGE_TIMEVAL_FIELDS: usize = 4;       // ru_utime + ru_stime
-const RUSAGE_TAIL_FIELDS:    usize = 14;      // ru_maxrss .. ru_nivcsw
-const RUSAGE_TOTAL_I64S:     usize = RUSAGE_TIMEVAL_FIELDS + RUSAGE_TAIL_FIELDS;
+const RUSAGE_TIMEVAL_FIELDS: usize = 4; // ru_utime + ru_stime
+const RUSAGE_TAIL_FIELDS: usize = 14; // ru_maxrss .. ru_nivcsw
+const RUSAGE_TOTAL_I64S: usize = RUSAGE_TIMEVAL_FIELDS + RUSAGE_TAIL_FIELDS;
 
 fn sys_getrusage(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let _who = args.arg0 as i64;
-    let out  = args.arg1 as *mut i64;
+    let out = args.arg1 as *mut i64;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if out.is_null() {
         ctx.set_return(fail);
         return;
     }
     let ns: u64 = narf_scheduler::narf_time::monotonic_ns();
-    let utime_sec  = (ns / 1_000_000_000) as i64;
+    let utime_sec = (ns / 1_000_000_000) as i64;
     let utime_usec = ((ns % 1_000_000_000) / 1_000) as i64;
     // SAFETY: caller-supplied user vaddr in the active AS; we
     // write 18 i64s. Bad pointer faults the user.
     unsafe {
         // ru_utime
-        core::ptr::write_volatile(out,        utime_sec);
+        core::ptr::write_volatile(out, utime_sec);
         core::ptr::write_volatile(out.add(1), utime_usec);
         // ru_stime + 14 tail fields all zero.
         for i in 2..RUSAGE_TOTAL_I64S {
@@ -3632,9 +4006,8 @@ fn sys_getrusage(ctx: &mut dyn TrapContext) {
 
 const HOSTNAME_MAX: usize = 64;
 
-static HOSTNAME:
-    narf_lib::sync::IrqSafeSpinLock<alloc::string::String>
-    = narf_lib::sync::IrqSafeSpinLock::new(alloc::string::String::new());
+static HOSTNAME: narf_lib::sync::IrqSafeSpinLock<alloc::string::String> =
+    narf_lib::sync::IrqSafeSpinLock::new(alloc::string::String::new());
 
 /// Initialise the hostname slot to `"narf"`. Idempotent so the
 /// boot path can call this without coordination.
@@ -3655,8 +4028,8 @@ pub fn __test_hostname_reset() {
 
 fn sys_gethostname(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let buf  = args.arg0 as *mut u8;
-    let len  = args.arg1 as usize;
+    let buf = args.arg0 as *mut u8;
+    let len = args.arg1 as usize;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if buf.is_null() || len == 0 {
         ctx.set_return(fail);
@@ -3681,8 +4054,8 @@ fn sys_gethostname(ctx: &mut dyn TrapContext) {
 
 fn sys_sethostname(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let buf  = args.arg0 as *const u8;
-    let len  = args.arg1 as usize;
+    let buf = args.arg0 as *const u8;
+    let len = args.arg1 as usize;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if buf.is_null() || len == 0 || len > HOSTNAME_MAX {
         ctx.set_return(fail);
@@ -3692,7 +4065,10 @@ fn sys_sethostname(ctx: &mut dyn TrapContext) {
     let bytes = unsafe { core::slice::from_raw_parts(buf, len) };
     let s = match core::str::from_utf8(bytes) {
         Ok(s) => s,
-        Err(_) => { ctx.set_return(fail); return; }
+        Err(_) => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     let mut g = HOSTNAME.lock();
     g.clear();
@@ -3745,8 +4121,7 @@ fn sys_noop_ok(ctx: &mut dyn TrapContext) {
 /// Park-Miller minimal-standard LCG state. Initialised lazily on
 /// first call from `monotonic_ns()`. The value lives in an
 /// `AtomicU64` so a future SMP rework can keep the same shape.
-static GETRANDOM_STATE: core::sync::atomic::AtomicU64
-    = core::sync::atomic::AtomicU64::new(0);
+static GETRANDOM_STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 fn next_random_u32() -> u32 {
     use core::sync::atomic::Ordering;
@@ -3757,7 +4132,9 @@ fn next_random_u32() -> u32 {
         let ns = narf_scheduler::narf_time::monotonic_ns();
         let cy = narf_scheduler::narf_time::now_cycles();
         s = (ns ^ cy.wrapping_mul(0x9E37_79B9_7F4A_7C15)) & 0x7FFF_FFFF;
-        if s == 0 { s = 1; }
+        if s == 0 {
+            s = 1;
+        }
     }
     // x' = x * 48271 mod (2^31 - 1)
     s = (s.wrapping_mul(48271)) % 0x7FFF_FFFF;
@@ -3767,8 +4144,8 @@ fn next_random_u32() -> u32 {
 
 fn sys_getrandom(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let ptr  = args.arg0 as *mut u8;
-    let len  = args.arg1 as usize;
+    let ptr = args.arg0 as *mut u8;
+    let len = args.arg1 as usize;
     let _flags = args.arg2; // accepted-and-ignored
     let fail = SyscallReturn::ok((-1i64) as u64);
     if ptr.is_null() {
@@ -3789,8 +4166,8 @@ fn sys_getrandom(ctx: &mut dyn TrapContext) {
         let mut i = 0usize;
         while i + 4 <= len {
             let v = next_random_u32();
-            core::ptr::write_volatile(ptr.add(i)     , (v        & 0xFF) as u8);
-            core::ptr::write_volatile(ptr.add(i + 1), ((v >> 8)  & 0xFF) as u8);
+            core::ptr::write_volatile(ptr.add(i), (v & 0xFF) as u8);
+            core::ptr::write_volatile(ptr.add(i + 1), ((v >> 8) & 0xFF) as u8);
             core::ptr::write_volatile(ptr.add(i + 2), ((v >> 16) & 0xFF) as u8);
             core::ptr::write_volatile(ptr.add(i + 3), ((v >> 24) & 0xFF) as u8);
             i += 4;
@@ -3851,10 +4228,14 @@ pub mod sleep_pumps {
     pub type Pump = fn();
 
     static SLOTS: [AtomicUsize; MAX_PUMPS] = [
-        AtomicUsize::new(0), AtomicUsize::new(0),
-        AtomicUsize::new(0), AtomicUsize::new(0),
-        AtomicUsize::new(0), AtomicUsize::new(0),
-        AtomicUsize::new(0), AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
     ];
 
     /// Register a pump. Boot-only; idempotent on the same
@@ -3897,7 +4278,9 @@ pub mod sleep_pumps {
     /// pumps across runs.
     #[doc(hidden)]
     pub fn __reset_for_test() {
-        for slot in SLOTS.iter() { slot.store(0, Ordering::Release); }
+        for slot in SLOTS.iter() {
+            slot.store(0, Ordering::Release);
+        }
     }
 }
 
@@ -3916,9 +4299,8 @@ type Pump = fn();
 // Relative-path resolution + the `*at(2)` family land later;
 // today the kernel just records the string the user supplied.
 
-static CWD_TABLE:
-    narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, alloc::string::String>>>
-    = narf_lib::sync::IrqSafeSpinLock::new(None);
+static CWD_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, alloc::string::String>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// Initialise the per-task cwd registry. Boot calls this once
 /// before any user task can issue `Syscall::Chdir` / `Getcwd`.
@@ -3928,7 +4310,9 @@ pub fn cwd_init() {
 
 /// Reset the registry — test hook. Drops every per-task entry.
 #[doc(hidden)]
-pub fn __test_cwd_reset() { *CWD_TABLE.lock() = None; }
+pub fn __test_cwd_reset() {
+    *CWD_TABLE.lock() = None;
+}
 
 /// Diagnostic: peek the recorded cwd for `task`. Returns the
 /// default `"/"` if `task` has never called Chdir.
@@ -3941,8 +4325,8 @@ pub fn cwd_of(task: u64) -> alloc::string::String {
 
 fn sys_chdir(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let ptr  = args.arg0 as *const u8;
-    let len  = args.arg1 as usize;
+    let ptr = args.arg0 as *const u8;
+    let len = args.arg1 as usize;
     // See sys_stat for the failure-sentinel rationale: the user-
     // runtime asm wrapper observes only `value`, so success and
     // invalid_op both surface as rax=0 without this.
@@ -3957,7 +4341,10 @@ fn sys_chdir(ctx: &mut dyn TrapContext) {
     let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
     let path = match core::str::from_utf8(bytes) {
         Ok(s) => s,
-        Err(_) => { ctx.set_return(fail); return; }
+        Err(_) => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     // Stage-4 first cut: absolute paths only. Relative-path
     // resolution joins with the *at(2) family in a follow-up; we
@@ -3971,7 +4358,10 @@ fn sys_chdir(ctx: &mut dyn TrapContext) {
     let mut g = CWD_TABLE.lock();
     let map = match g.as_mut() {
         Some(m) => m,
-        None    => { ctx.set_return(fail); return; }
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
     };
     map.insert(task, alloc::string::String::from(path));
     ctx.set_return(SyscallReturn::ok(0));
@@ -3979,8 +4369,8 @@ fn sys_chdir(ctx: &mut dyn TrapContext) {
 
 fn sys_getcwd(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let buf  = args.arg0 as *mut u8;
-    let len  = args.arg1 as usize;
+    let buf = args.arg0 as *mut u8;
+    let len = args.arg1 as usize;
     if buf.is_null() || len == 0 {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -4028,8 +4418,8 @@ fn sys_getcwd(ctx: &mut dyn TrapContext) {
 /// with the brk arena.
 const BRK_DEFAULT_BASE: u64 = 0x0000_5000_0000_0000;
 
-static BRK_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>>
-    = narf_lib::sync::IrqSafeSpinLock::new(None);
+static BRK_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// Initialise the per-task brk registry. Boot calls this once before
 /// any user task can issue `Syscall::Brk`.
@@ -4039,7 +4429,9 @@ pub fn brk_init() {
 
 /// Reset the registry — test hook.
 #[doc(hidden)]
-pub fn __test_brk_reset() { *BRK_TABLE.lock() = None; }
+pub fn __test_brk_reset() {
+    *BRK_TABLE.lock() = None;
+}
 
 fn sys_brk(ctx: &mut dyn TrapContext) {
     let new_break = ctx.args().arg0;
@@ -4050,7 +4442,10 @@ fn sys_brk(ctx: &mut dyn TrapContext) {
         let mut g = BRK_TABLE.lock();
         let map = match g.as_mut() {
             Some(m) => m,
-            None    => { ctx.set_return(SyscallReturn::ok(0)); return; }
+            None => {
+                ctx.set_return(SyscallReturn::ok(0));
+                return;
+            }
         };
         *map.entry(task).or_insert(BRK_DEFAULT_BASE)
     };
@@ -4065,7 +4460,11 @@ fn sys_brk(ctx: &mut dyn TrapContext) {
     // Stage-4 follow-up to actually unmap shrunken pages so the phys
     // frames return to the allocator.
     if new_break < cur {
-        BRK_TABLE.lock().as_mut().expect("brk_init").insert(task, new_break);
+        BRK_TABLE
+            .lock()
+            .as_mut()
+            .expect("brk_init")
+            .insert(task, new_break);
         ctx.set_return(SyscallReturn::ok(new_break));
         return;
     }
@@ -4075,7 +4474,10 @@ fn sys_brk(ctx: &mut dyn TrapContext) {
     // back to `cur` (POSIX brk failure contract).
     let as_ref = match current_address_space() {
         Some(a) => a,
-        None    => { ctx.set_return(SyscallReturn::ok(cur)); return; }
+        None => {
+            ctx.set_return(SyscallReturn::ok(cur));
+            return;
+        }
     };
     let cur_aligned = (cur + 0xFFF) & !0xFFFu64;
     let new_aligned = (new_break + 0xFFF) & !0xFFFu64;
@@ -4089,13 +4491,18 @@ fn sys_brk(ctx: &mut dyn TrapContext) {
             }
         };
         // SAFETY: identity-mapped low 4 GiB; phys is page-aligned.
-        unsafe { core::ptr::write_bytes(phys.raw() as *mut u8, 0, 0x1000); }
-        if as_ref.map_region(Region {
-            base:  VirtAddr::new(va),
-            len:   0x1000,
-            perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys:  alloc::vec![phys],
-        }).is_err() {
+        unsafe {
+            core::ptr::write_bytes(phys.raw() as *mut u8, 0, 0x1000);
+        }
+        if as_ref
+            .map_region(Region {
+                base: VirtAddr::new(va),
+                len: 0x1000,
+                perms: RegionPerms::READ | RegionPerms::WRITE,
+                phys: alloc::vec![phys],
+            })
+            .is_err()
+        {
             ctx.set_return(SyscallReturn::ok(cur));
             return;
         }
@@ -4106,7 +4513,11 @@ fn sys_brk(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    BRK_TABLE.lock().as_mut().expect("brk_init").insert(task, new_break);
+    BRK_TABLE
+        .lock()
+        .as_mut()
+        .expect("brk_init")
+        .insert(task, new_break);
     ctx.set_return(SyscallReturn::ok(new_break));
 }
 
@@ -4129,13 +4540,13 @@ fn sys_brk(ctx: &mut dyn TrapContext) {
 // counter — which still satisfies the documented C99 "monotonic
 // non-decreasing" contract that `clock_gettime` consumers check.
 
-const CLOCK_REALTIME:  u64 = 0;
+const CLOCK_REALTIME: u64 = 0;
 const CLOCK_MONOTONIC: u64 = 1;
 
 fn sys_clock_gettime(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let id   = args.arg0;
-    let buf  = args.arg1;
+    let id = args.arg0;
+    let buf = args.arg1;
     if buf == 0 || buf & 0x7 != 0 {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -4169,8 +4580,8 @@ fn sys_clock_gettime(ctx: &mut dyn TrapContext) {
 /// the current monotonic. Other clock_ids return -1.
 fn sys_clock_settime(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let id   = args.arg0;
-    let ts   = args.arg1 as *const i64;
+    let id = args.arg0;
+    let ts = args.arg1 as *const i64;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if ts.is_null() || (ts as u64) & 0x7 != 0 {
         ctx.set_return(fail);
@@ -4182,7 +4593,7 @@ fn sys_clock_settime(ctx: &mut dyn TrapContext) {
         return;
     }
     // SAFETY: caller-supplied readable `timespec`.
-    let sec  = unsafe { core::ptr::read_volatile(ts) };
+    let sec = unsafe { core::ptr::read_volatile(ts) };
     let nsec = unsafe { core::ptr::read_volatile(ts.add(1)) };
     if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
         ctx.set_return(fail);
@@ -4211,38 +4622,40 @@ fn sys_clock_settime(ctx: &mut dyn TrapContext) {
 // per-task block mask (modified by `sigprocmask`). NSIG = 32 so
 // `1 << signum` is a u32-clean fit.
 
-static SIGNAL_PENDING:
-    narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>>
-    = narf_lib::sync::IrqSafeSpinLock::new(None);
+static SIGNAL_PENDING: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
 
-static SIGNAL_MASK:
-    narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>>
-    = narf_lib::sync::IrqSafeSpinLock::new(None);
+static SIGNAL_MASK: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// Initialise the per-task pending+mask registries. Pair with
 /// `sigaction_init` at boot.
 pub fn signal_init() {
     *SIGNAL_PENDING.lock() = Some(BTreeMap::new());
-    *SIGNAL_MASK.lock()    = Some(BTreeMap::new());
+    *SIGNAL_MASK.lock() = Some(BTreeMap::new());
 }
 
 /// Reset the registries — test hook. Drops every per-task entry.
 #[doc(hidden)]
 pub fn __test_signal_reset() {
     *SIGNAL_PENDING.lock() = None;
-    *SIGNAL_MASK.lock()    = None;
+    *SIGNAL_MASK.lock() = None;
 }
 
 /// Diagnostic: peek the pending bitmap for `task`.
 pub fn signal_pending_of(task: u64) -> u32 {
-    SIGNAL_PENDING.lock().as_ref()
+    SIGNAL_PENDING
+        .lock()
+        .as_ref()
         .and_then(|m| m.get(&task).copied())
         .unwrap_or(0)
 }
 
 /// Diagnostic: peek the block mask for `task`.
 pub fn signal_mask_of(task: u64) -> u32 {
-    SIGNAL_MASK.lock().as_ref()
+    SIGNAL_MASK
+        .lock()
+        .as_ref()
         .and_then(|m| m.get(&task).copied())
         .unwrap_or(0)
 }
@@ -4258,7 +4671,10 @@ fn sys_kill(ctx: &mut dyn TrapContext) {
     let mut g = SIGNAL_PENDING.lock();
     let map = match g.as_mut() {
         Some(m) => m,
-        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
     };
     let slot = map.entry(target).or_insert(0);
     *slot |= 1u32 << signum;
@@ -4285,8 +4701,8 @@ fn sys_kill(ctx: &mut dyn TrapContext) {
 // Anything else returns -1 with the libc shim setting
 // errno = ENOSYS.
 
-const FUTEX_WAIT:    u64 = 0;
-const FUTEX_WAKE:    u64 = 1;
+const FUTEX_WAIT: u64 = 0;
+const FUTEX_WAKE: u64 = 1;
 const FUTEX_PRIVATE: u64 = 0x80;
 const FUTEX_CLOCK_REALTIME: u64 = 0x100;
 const FUTEX_OP_MASK: u64 = !(FUTEX_PRIVATE | FUTEX_CLOCK_REALTIME);
@@ -4309,7 +4725,7 @@ fn sys_futex(ctx: &mut dyn TrapContext) {
 fn sys_tgkill(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let _tgid = args.arg0;
-    let tid   = args.arg1;
+    let tid = args.arg1;
     let signum = args.arg2 as u32;
     if signum >= 32 {
         ctx.set_return(SyscallReturn::invalid_op());
@@ -4318,34 +4734,40 @@ fn sys_tgkill(ctx: &mut dyn TrapContext) {
     let mut g = SIGNAL_PENDING.lock();
     let map = match g.as_mut() {
         Some(m) => m,
-        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
     };
     let slot = map.entry(tid).or_insert(0);
     *slot |= 1u32 << signum;
     ctx.set_return(SyscallReturn::ok(0));
 }
 
-const SIG_BLOCK:   u32 = 0;
+const SIG_BLOCK: u32 = 0;
 const SIG_UNBLOCK: u32 = 1;
 const SIG_SETMASK: u32 = 2;
 
 fn sys_sigprocmask(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let how  = args.arg0 as u32;
-    let set  = args.arg1 as u32;
+    let how = args.arg0 as u32;
+    let set = args.arg1 as u32;
     let task = current_task_id();
     let mut g = SIGNAL_MASK.lock();
     let map = match g.as_mut() {
         Some(m) => m,
-        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
     };
     let slot = map.entry(task).or_insert(0);
     let prior = *slot;
     *slot = match how {
-        SIG_BLOCK   => prior | set,
+        SIG_BLOCK => prior | set,
         SIG_UNBLOCK => prior & !set,
         SIG_SETMASK => set,
-        _           => {
+        _ => {
             ctx.set_return(SyscallReturn::invalid_op());
             return;
         }
@@ -4360,9 +4782,8 @@ fn sys_sigprocmask(ctx: &mut dyn TrapContext) {
 // a direct dep on this crate's signal internals.
 type SignalDeliveryHook = fn(&mut dyn TrapContext);
 
-static SIGNAL_DELIVERY_HOOK:
-    narf_lib::sync::IrqSafeSpinLock<Option<SignalDeliveryHook>>
-    = narf_lib::sync::IrqSafeSpinLock::new(None);
+static SIGNAL_DELIVERY_HOOK: narf_lib::sync::IrqSafeSpinLock<Option<SignalDeliveryHook>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// Install the function the arch trap path calls on every
 /// user-bound int-0x80 trap-return. `install_core_syscalls`
@@ -4382,7 +4803,9 @@ pub fn signal_delivery_hook() -> Option<SignalDeliveryHook> {
 /// itself to deliver. Fast path — when nothing's pending it
 /// takes a single lock + a single bitmap read and returns.
 pub fn default_signal_delivery(ctx: &mut dyn TrapContext) {
-    if !ctx.returning_to_user() { return; }
+    if !ctx.returning_to_user() {
+        return;
+    }
     let task = current_task_id();
     // Single lock acquire on the fast path: peek pending+mask
     // under one lock each, decide whether there's anything to
@@ -4396,16 +4819,23 @@ pub fn default_signal_delivery(ctx: &mut dyn TrapContext) {
             _ => return,
         }
     };
-    let mask = SIGNAL_MASK.lock().as_ref()
-        .and_then(|m| m.get(&task).copied()).unwrap_or(0);
+    let mask = SIGNAL_MASK
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&task).copied())
+        .unwrap_or(0);
     let deliverable = pending & !mask;
-    if deliverable == 0 { return; }
+    if deliverable == 0 {
+        return;
+    }
     let signum = deliverable.trailing_zeros();
     let handler = match sigaction_lookup(task, signum as usize) {
         Some(h) => h,
-        None    => return,
+        None => return,
     };
-    if !ctx.deliver_signal(handler, signum) { return; }
+    if !ctx.deliver_signal(handler, signum) {
+        return;
+    }
     // Clear only after the rewrite succeeded — a failed
     // delivery (e.g. arch returns false) should leave pending
     // alone so the next trap retries.
@@ -4438,10 +4868,10 @@ pub fn default_signal_delivery(ctx: &mut dyn TrapContext) {
 /// minimum set the synchronous-signal path can possibly raise.
 /// The full table is `[1..=31]`, but only these can come from
 /// CPU exceptions on x86_64 today.
-const SIGILL:  u32 = 4;
+const SIGILL: u32 = 4;
 const SIGTRAP: u32 = 5;
-const SIGBUS:  u32 = 7;
-const SIGFPE:  u32 = 8;
+const SIGBUS: u32 = 7;
+const SIGFPE: u32 = 8;
 const SIGSEGV: u32 = 11;
 
 /// Map an x86_64 CPU-exception vector to the POSIX signal a
@@ -4454,14 +4884,14 @@ const SIGSEGV: u32 = 11;
 /// SUSv5 `<signal.h>` for the signal-number table.
 pub fn vector_to_signum(vector: u64) -> Option<u32> {
     match vector {
-        0  => Some(SIGFPE),  // #DE divide-by-zero / div overflow
-        3  => Some(SIGTRAP), // #BP breakpoint
-        4  => Some(SIGFPE),  // #OF overflow
-        6  => Some(SIGILL),  // #UD undefined opcode
+        0 => Some(SIGFPE),   // #DE divide-by-zero / div overflow
+        3 => Some(SIGTRAP),  // #BP breakpoint
+        4 => Some(SIGFPE),   // #OF overflow
+        6 => Some(SIGILL),   // #UD undefined opcode
         13 => Some(SIGSEGV), // #GP general protection
         14 => Some(SIGSEGV), // #PF page fault
         17 => Some(SIGBUS),  // #AC alignment check
-        _  => None,
+        _ => None,
     }
 }
 
@@ -4475,9 +4905,8 @@ pub fn vector_to_signum(vector: u64) -> Option<u32> {
 /// existing panic / probe-catch path.
 type SyncSignalHook = fn(&mut dyn TrapContext, u64) -> bool;
 
-static SYNC_SIGNAL_HOOK:
-    narf_lib::sync::IrqSafeSpinLock<Option<SyncSignalHook>>
-    = narf_lib::sync::IrqSafeSpinLock::new(None);
+static SYNC_SIGNAL_HOOK: narf_lib::sync::IrqSafeSpinLock<Option<SyncSignalHook>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// Install the function the arch trap path calls on user-mode
 /// CPU exceptions. `install_core_syscalls` auto-installs
@@ -4506,12 +4935,12 @@ pub fn sync_signal_hook() -> Option<SyncSignalHook> {
 pub fn default_sync_signal_delivery(ctx: &mut dyn TrapContext, vector: u64) -> bool {
     let signum = match vector_to_signum(vector) {
         Some(s) => s,
-        None    => return false,
+        None => return false,
     };
     let task = current_task_id();
     let handler = match sigaction_lookup(task, signum as usize) {
         Some(h) => h,
-        None    => return false,
+        None => return false,
     };
     ctx.deliver_signal(handler, signum)
 }
@@ -4527,9 +4956,9 @@ pub fn default_sync_signal_delivery(ctx: &mut dyn TrapContext, vector: u64) -> b
 
 const NSIG: usize = 32;
 
-static SIGACTION_TABLE:
-    narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, [Option<u64>; NSIG]>>>
-    = narf_lib::sync::IrqSafeSpinLock::new(None);
+static SIGACTION_TABLE: narf_lib::sync::IrqSafeSpinLock<
+    Option<BTreeMap<u64, [Option<u64>; NSIG]>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// Initialise the per-task sigaction registry. Boot calls this once
 /// before any user task can issue `Syscall::Sigaction`.
@@ -4539,22 +4968,26 @@ pub fn sigaction_init() {
 
 /// Reset the registry — test hook.
 #[doc(hidden)]
-pub fn __test_sigaction_reset() { *SIGACTION_TABLE.lock() = None; }
+pub fn __test_sigaction_reset() {
+    *SIGACTION_TABLE.lock() = None;
+}
 
 /// Diagnostic: peek the recorded handler for `(task, signum)`.
 pub fn sigaction_lookup(task: u64, signum: usize) -> Option<u64> {
     let g = SIGACTION_TABLE.lock();
     let map = g.as_ref()?;
     let slots = map.get(&task)?;
-    if signum >= NSIG { return None; }
+    if signum >= NSIG {
+        return None;
+    }
     slots[signum]
 }
 
 fn sys_sigaction(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let signum     = args.arg0 as usize;
+    let signum = args.arg0 as usize;
     let new_handler = args.arg1;
-    let old_out    = args.arg2;
+    let old_out = args.arg2;
     if signum >= NSIG {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -4565,11 +4998,18 @@ fn sys_sigaction(ctx: &mut dyn TrapContext) {
         let mut g = SIGACTION_TABLE.lock();
         let map = match g.as_mut() {
             Some(m) => m,
-            None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+            None => {
+                ctx.set_return(SyscallReturn::invalid_op());
+                return;
+            }
         };
         let slots = map.entry(task).or_insert([None; NSIG]);
         let prior = slots[signum];
-        slots[signum] = if new_handler == 0 { None } else { Some(new_handler) };
+        slots[signum] = if new_handler == 0 {
+            None
+        } else {
+            Some(new_handler)
+        };
         prior
     };
 
@@ -4597,31 +5037,50 @@ pub fn abi_file_op_bridge(
     args: &narf_abi::FileOpArgs,
 ) -> narf_abi::FileOpReturn {
     let num: u32 = match kind {
-        narf_abi::FileOpKind::Open   => Syscall::OpenFile.raw(),
-        narf_abi::FileOpKind::Read   => Syscall::Read.raw(),
-        narf_abi::FileOpKind::Write  => Syscall::Write.raw(),
-        narf_abi::FileOpKind::Close  => Syscall::Close.raw(),
-        narf_abi::FileOpKind::Mmap   => Syscall::Mmap.raw(),
+        narf_abi::FileOpKind::Open => Syscall::OpenFile.raw(),
+        narf_abi::FileOpKind::Read => Syscall::Read.raw(),
+        narf_abi::FileOpKind::Write => Syscall::Write.raw(),
+        narf_abi::FileOpKind::Close => Syscall::Close.raw(),
+        narf_abi::FileOpKind::Mmap => Syscall::Mmap.raw(),
         narf_abi::FileOpKind::Munmap => Syscall::Munmap.raw(),
     };
     let sargs = crate::SyscallArgs {
-        arg0: args.a0, arg1: args.a1, arg2: args.a2,
-        arg3: args.a3, arg4: args.a4, arg5: args.a5,
+        arg0: args.a0,
+        arg1: args.a1,
+        arg2: args.a2,
+        arg3: args.a3,
+        arg4: args.a4,
+        arg5: args.a5,
     };
     // Plain entry only fires plain handlers; our file ops are
     // raw. Build a synthetic `TrapContext` whose
     // `redirect_to_kernel` returns false (so handlers that would
     // unwind fall back to `set_return`), then route through
     // `kernel_syscall_entry`.
-    struct BridgeCtx { args: crate::SyscallArgs, ret: crate::SyscallReturn }
-    impl crate::TrapContext for BridgeCtx {
-        fn args(&self) -> &crate::SyscallArgs { &self.args }
-        fn set_return(&mut self, r: crate::SyscallReturn) { self.ret = r; }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    struct BridgeCtx {
+        args: crate::SyscallArgs,
+        ret: crate::SyscallReturn,
     }
-    let mut ctx = BridgeCtx { args: sargs, ret: crate::SyscallReturn::invalid_op() };
+    impl crate::TrapContext for BridgeCtx {
+        fn args(&self) -> &crate::SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: crate::SyscallReturn) {
+            self.ret = r;
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
+    }
+    let mut ctx = BridgeCtx {
+        args: sargs,
+        ret: crate::SyscallReturn::invalid_op(),
+    };
     crate::kernel_syscall_entry(num, &mut ctx);
-    narf_abi::FileOpReturn { status: ctx.ret.status, value: ctx.ret.value }
+    narf_abi::FileOpReturn {
+        status: ctx.ret.status,
+        value: ctx.ret.value,
+    }
 }
 
 // ── Dispatcher spawn helper ────────────────────────────────────────
@@ -4650,121 +5109,244 @@ pub fn spawn_dispatcher_for(task_id: u64) -> Option<narf_scheduler::TaskId> {
 /// (e.g. a real file-descriptor-backed `Read`).
 pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Bootstrap, "bootstrap", RawFnHandler(sys_bootstrap));
-    table.install_raw(Syscall::OpenFile, "open",     RawFnHandler(sys_open));
-    table.install_raw(Syscall::Write,    "write",    RawFnHandler(sys_write));
-    table.install_raw(Syscall::Read,     "read",     RawFnHandler(sys_read));
-    table.install_raw(Syscall::Close,    "close",    RawFnHandler(sys_close));
-    table.install_raw(Syscall::Mmap,     "mmap",     RawFnHandler(sys_mmap));
-    table.install_raw(Syscall::Munmap,   "munmap",   RawFnHandler(sys_munmap));
-    table.install_raw(Syscall::FbConnect,    "fb_connect",     RawFnHandler(sys_fb_connect));
-    table.install_raw(Syscall::FbInfo,       "fb_info",        RawFnHandler(sys_fb_info));
-    table.install_raw(Syscall::FbRingMap,    "fb_ring_map",    RawFnHandler(sys_fb_ring_map));
-    table.install_raw(Syscall::FbFlushWait,  "fb_flush_wait",  RawFnHandler(sys_fb_flush_wait));
-    table.install_raw(Syscall::FbDisconnect, "fb_disconnect",  RawFnHandler(sys_fb_disconnect));
-    table.install_raw(Syscall::ShmemCreate,  "shmem_create",   RawFnHandler(sys_shmem_create));
-    table.install_raw(Syscall::ShmemMap,     "shmem_map",      RawFnHandler(sys_shmem_map));
-    table.install_raw(Syscall::ShmemDestroy, "shmem_destroy",  RawFnHandler(sys_shmem_destroy));
-    table.install_raw(Syscall::FirmwareInstall, "firmware_install",
-                      RawFnHandler(sys_firmware_install));
+    table.install_raw(Syscall::OpenFile, "open", RawFnHandler(sys_open));
+    table.install_raw(Syscall::Write, "write", RawFnHandler(sys_write));
+    table.install_raw(Syscall::Read, "read", RawFnHandler(sys_read));
+    table.install_raw(Syscall::Close, "close", RawFnHandler(sys_close));
+    table.install_raw(Syscall::Mmap, "mmap", RawFnHandler(sys_mmap));
+    table.install_raw(Syscall::Munmap, "munmap", RawFnHandler(sys_munmap));
+    table.install_raw(
+        Syscall::FbConnect,
+        "fb_connect",
+        RawFnHandler(sys_fb_connect),
+    );
+    table.install_raw(Syscall::FbInfo, "fb_info", RawFnHandler(sys_fb_info));
+    table.install_raw(
+        Syscall::FbRingMap,
+        "fb_ring_map",
+        RawFnHandler(sys_fb_ring_map),
+    );
+    table.install_raw(
+        Syscall::FbFlushWait,
+        "fb_flush_wait",
+        RawFnHandler(sys_fb_flush_wait),
+    );
+    table.install_raw(
+        Syscall::FbDisconnect,
+        "fb_disconnect",
+        RawFnHandler(sys_fb_disconnect),
+    );
+    table.install_raw(
+        Syscall::ShmemCreate,
+        "shmem_create",
+        RawFnHandler(sys_shmem_create),
+    );
+    table.install_raw(Syscall::ShmemMap, "shmem_map", RawFnHandler(sys_shmem_map));
+    table.install_raw(
+        Syscall::ShmemDestroy,
+        "shmem_destroy",
+        RawFnHandler(sys_shmem_destroy),
+    );
+    table.install_raw(
+        Syscall::FirmwareInstall,
+        "firmware_install",
+        RawFnHandler(sys_firmware_install),
+    );
     table.install_raw(Syscall::RingKick, "ringkick", RawFnHandler(sys_ring_kick));
-    table.install_raw(Syscall::GetPid,   "getpid",   RawFnHandler(sys_getpid));
-    table.install_raw(Syscall::GetPpid,  "getppid",  RawFnHandler(sys_getppid));
-    table.install_raw(Syscall::Gettid,   "gettid",   RawFnHandler(sys_gettid));
-    table.install_raw(Syscall::GetUid,   "getuid",   RawFnHandler(sys_getuid));
-    table.install_raw(Syscall::GetGid,   "getgid",   RawFnHandler(sys_getgid));
-    table.install_raw(Syscall::SetUid,   "setuid",   RawFnHandler(sys_setuid));
-    table.install_raw(Syscall::SetGid,   "setgid",   RawFnHandler(sys_setgid));
-    table.install_raw(Syscall::Getpgid,  "getpgid",  RawFnHandler(sys_getpgid));
-    table.install_raw(Syscall::Setpgid,  "setpgid",  RawFnHandler(sys_setpgid));
-    table.install_raw(Syscall::Getsid,   "getsid",   RawFnHandler(sys_getsid));
-    table.install_raw(Syscall::Setsid,   "setsid",   RawFnHandler(sys_setsid));
-    table.install_raw(Syscall::GetHostname, "gethostname", RawFnHandler(sys_gethostname));
-    table.install_raw(Syscall::SetHostname, "sethostname", RawFnHandler(sys_sethostname));
-    table.install_raw(Syscall::Getrlimit,   "getrlimit",   RawFnHandler(sys_getrlimit));
-    table.install_raw(Syscall::Setrlimit,   "setrlimit",   RawFnHandler(sys_setrlimit));
-    table.install_raw(Syscall::Prlimit64,   "prlimit64",   RawFnHandler(sys_prlimit64));
-    table.install_raw(Syscall::Umask,       "umask",       RawFnHandler(sys_umask));
-    table.install_raw(Syscall::Getcpu,      "getcpu",      RawFnHandler(sys_getcpu));
-    table.install_raw(Syscall::SchedGetaffinity, "sched_getaffinity",
-        RawFnHandler(sys_sched_getaffinity));
-    table.install_raw(Syscall::SchedSetaffinity, "sched_setaffinity",
-        RawFnHandler(sys_sched_setaffinity));
-    table.install_raw(Syscall::SchedGetPriorityMax, "sched_get_priority_max",
-        RawFnHandler(sys_sched_get_priority_max));
-    table.install_raw(Syscall::SchedGetPriorityMin, "sched_get_priority_min",
-        RawFnHandler(sys_sched_get_priority_min));
-    table.install_raw(Syscall::SchedGetparam, "sched_getparam",
-        RawFnHandler(sys_sched_getparam));
-    table.install_raw(Syscall::SchedSetparam, "sched_setparam",
-        RawFnHandler(sys_sched_setparam));
-    table.install_raw(Syscall::Prctl,       "prctl",       RawFnHandler(sys_prctl));
-    table.install_raw(Syscall::Getpriority, "getpriority", RawFnHandler(sys_getpriority));
-    table.install_raw(Syscall::Setpriority, "setpriority", RawFnHandler(sys_setpriority));
-    table.install_raw(Syscall::Times,       "times",       RawFnHandler(sys_times));
-    table.install_raw(Syscall::Getrusage,   "getrusage",   RawFnHandler(sys_getrusage));
-    table.install_raw(Syscall::ExitTask, "exit",     RawFnHandler(sys_exit_task));
-    table.install_raw(Syscall::Yield,    "yield",    RawFnHandler(sys_yield));
-    table.install_raw(Syscall::Sleep,    "sleep",    RawFnHandler(sys_sleep));
-    table.install_raw(Syscall::Brk,          "brk",           RawFnHandler(sys_brk));
-    table.install_raw(Syscall::ClockGetTime, "clock_gettime", RawFnHandler(sys_clock_gettime));
-    table.install_raw(Syscall::ClockSetTime, "clock_settime", RawFnHandler(sys_clock_settime));
-    table.install_raw(Syscall::Sigaction,    "sigaction",     RawFnHandler(sys_sigaction));
-    table.install_raw(Syscall::Kill,         "kill",          RawFnHandler(sys_kill));
-    table.install_raw(Syscall::Tgkill,       "tgkill",        RawFnHandler(sys_tgkill));
-    table.install_raw(Syscall::Futex,        "futex",         RawFnHandler(sys_futex));
-    table.install_raw(Syscall::Sigprocmask,  "sigprocmask",   RawFnHandler(sys_sigprocmask));
+    table.install_raw(Syscall::GetPid, "getpid", RawFnHandler(sys_getpid));
+    table.install_raw(Syscall::GetPpid, "getppid", RawFnHandler(sys_getppid));
+    table.install_raw(Syscall::Gettid, "gettid", RawFnHandler(sys_gettid));
+    table.install_raw(Syscall::GetUid, "getuid", RawFnHandler(sys_getuid));
+    table.install_raw(Syscall::GetGid, "getgid", RawFnHandler(sys_getgid));
+    table.install_raw(Syscall::SetUid, "setuid", RawFnHandler(sys_setuid));
+    table.install_raw(Syscall::SetGid, "setgid", RawFnHandler(sys_setgid));
+    table.install_raw(Syscall::Getpgid, "getpgid", RawFnHandler(sys_getpgid));
+    table.install_raw(Syscall::Setpgid, "setpgid", RawFnHandler(sys_setpgid));
+    table.install_raw(Syscall::Getsid, "getsid", RawFnHandler(sys_getsid));
+    table.install_raw(Syscall::Setsid, "setsid", RawFnHandler(sys_setsid));
+    table.install_raw(
+        Syscall::GetHostname,
+        "gethostname",
+        RawFnHandler(sys_gethostname),
+    );
+    table.install_raw(
+        Syscall::SetHostname,
+        "sethostname",
+        RawFnHandler(sys_sethostname),
+    );
+    table.install_raw(Syscall::Getrlimit, "getrlimit", RawFnHandler(sys_getrlimit));
+    table.install_raw(Syscall::Setrlimit, "setrlimit", RawFnHandler(sys_setrlimit));
+    table.install_raw(Syscall::Prlimit64, "prlimit64", RawFnHandler(sys_prlimit64));
+    table.install_raw(Syscall::Umask, "umask", RawFnHandler(sys_umask));
+    table.install_raw(Syscall::Getcpu, "getcpu", RawFnHandler(sys_getcpu));
+    table.install_raw(
+        Syscall::SchedGetaffinity,
+        "sched_getaffinity",
+        RawFnHandler(sys_sched_getaffinity),
+    );
+    table.install_raw(
+        Syscall::SchedSetaffinity,
+        "sched_setaffinity",
+        RawFnHandler(sys_sched_setaffinity),
+    );
+    table.install_raw(
+        Syscall::SchedGetPriorityMax,
+        "sched_get_priority_max",
+        RawFnHandler(sys_sched_get_priority_max),
+    );
+    table.install_raw(
+        Syscall::SchedGetPriorityMin,
+        "sched_get_priority_min",
+        RawFnHandler(sys_sched_get_priority_min),
+    );
+    table.install_raw(
+        Syscall::SchedGetparam,
+        "sched_getparam",
+        RawFnHandler(sys_sched_getparam),
+    );
+    table.install_raw(
+        Syscall::SchedSetparam,
+        "sched_setparam",
+        RawFnHandler(sys_sched_setparam),
+    );
+    table.install_raw(Syscall::Prctl, "prctl", RawFnHandler(sys_prctl));
+    table.install_raw(
+        Syscall::Getpriority,
+        "getpriority",
+        RawFnHandler(sys_getpriority),
+    );
+    table.install_raw(
+        Syscall::Setpriority,
+        "setpriority",
+        RawFnHandler(sys_setpriority),
+    );
+    table.install_raw(Syscall::Times, "times", RawFnHandler(sys_times));
+    table.install_raw(Syscall::Getrusage, "getrusage", RawFnHandler(sys_getrusage));
+    table.install_raw(Syscall::ExitTask, "exit", RawFnHandler(sys_exit_task));
+    table.install_raw(Syscall::Yield, "yield", RawFnHandler(sys_yield));
+    table.install_raw(Syscall::Sleep, "sleep", RawFnHandler(sys_sleep));
+    table.install_raw(Syscall::Brk, "brk", RawFnHandler(sys_brk));
+    table.install_raw(
+        Syscall::ClockGetTime,
+        "clock_gettime",
+        RawFnHandler(sys_clock_gettime),
+    );
+    table.install_raw(
+        Syscall::ClockSetTime,
+        "clock_settime",
+        RawFnHandler(sys_clock_settime),
+    );
+    table.install_raw(Syscall::Sigaction, "sigaction", RawFnHandler(sys_sigaction));
+    table.install_raw(Syscall::Kill, "kill", RawFnHandler(sys_kill));
+    table.install_raw(Syscall::Tgkill, "tgkill", RawFnHandler(sys_tgkill));
+    table.install_raw(Syscall::Futex, "futex", RawFnHandler(sys_futex));
+    table.install_raw(
+        Syscall::Sigprocmask,
+        "sigprocmask",
+        RawFnHandler(sys_sigprocmask),
+    );
 
     // Tier-2 fd-table breadth + path-resolution + pipe(2).
-    table.install_raw(Syscall::Dup,    "dup",    RawFnHandler(sys_dup));
-    table.install_raw(Syscall::Dup2,   "dup2",   RawFnHandler(sys_dup2));
-    table.install_raw(Syscall::Dup3,   "dup3",   RawFnHandler(sys_dup3));
-    table.install_raw(Syscall::Fcntl,  "fcntl",  RawFnHandler(sys_fcntl));
-    table.install_raw(Syscall::Stat,   "stat",   RawFnHandler(sys_stat));
-    table.install_raw(Syscall::Lstat,  "lstat",  RawFnHandler(sys_stat));
-    table.install_raw(Syscall::Fstat,  "fstat",  RawFnHandler(sys_fstat));
-    table.install_raw(Syscall::Pipe,   "pipe",   RawFnHandler(sys_pipe));
+    table.install_raw(Syscall::Dup, "dup", RawFnHandler(sys_dup));
+    table.install_raw(Syscall::Dup2, "dup2", RawFnHandler(sys_dup2));
+    table.install_raw(Syscall::Dup3, "dup3", RawFnHandler(sys_dup3));
+    table.install_raw(Syscall::Fcntl, "fcntl", RawFnHandler(sys_fcntl));
+    table.install_raw(Syscall::Stat, "stat", RawFnHandler(sys_stat));
+    table.install_raw(Syscall::Lstat, "lstat", RawFnHandler(sys_stat));
+    table.install_raw(Syscall::Fstat, "fstat", RawFnHandler(sys_fstat));
+    table.install_raw(Syscall::Pipe, "pipe", RawFnHandler(sys_pipe));
     table.install_raw(Syscall::Ftruncate, "ftruncate", RawFnHandler(sys_ftruncate));
-    table.install_raw(Syscall::Truncate,  "truncate",  RawFnHandler(sys_truncate));
-    table.install_raw(Syscall::Pread64,   "pread64",   RawFnHandler(sys_pread64));
-    table.install_raw(Syscall::Pwrite64,  "pwrite64",  RawFnHandler(sys_pwrite64));
-    table.install_raw(Syscall::Fsync,     "fsync",     RawFnHandler(sys_fsync));
+    table.install_raw(Syscall::Truncate, "truncate", RawFnHandler(sys_truncate));
+    table.install_raw(Syscall::Pread64, "pread64", RawFnHandler(sys_pread64));
+    table.install_raw(Syscall::Pwrite64, "pwrite64", RawFnHandler(sys_pwrite64));
+    table.install_raw(Syscall::Fsync, "fsync", RawFnHandler(sys_fsync));
     // Fdatasync shares fsync's body — both are structural no-ops.
     table.install_raw(Syscall::Fdatasync, "fdatasync", RawFnHandler(sys_fsync));
-    table.install_raw(Syscall::Pipe2,     "pipe2",     RawFnHandler(sys_pipe2));
+    table.install_raw(Syscall::Pipe2, "pipe2", RawFnHandler(sys_pipe2));
     table.install_raw(Syscall::Fallocate, "fallocate", RawFnHandler(sys_fallocate));
-    table.install_raw(Syscall::CopyFileRange, "copy_file_range",
-        RawFnHandler(sys_copy_file_range));
-    table.install_raw(Syscall::MemfdCreate, "memfd_create",
-        RawFnHandler(sys_memfd_create));
-    table.install_raw(Syscall::Fchmod, "fchmod", RawFnHandler(sys_fchmod_or_fchown));
-    table.install_raw(Syscall::Fchown, "fchown", RawFnHandler(sys_fchmod_or_fchown));
-    table.install_raw(Syscall::Fchmodat, "fchmodat", RawFnHandler(sys_fchmodat_or_fchownat));
-    table.install_raw(Syscall::Fchownat, "fchownat", RawFnHandler(sys_fchmodat_or_fchownat));
-    table.install_raw(Syscall::Faccessat, "faccessat", RawFnHandler(sys_fchmodat_or_fchownat));
-    table.install_raw(Syscall::Openat,    "openat",    RawFnHandler(sys_openat));
-    table.install_raw(Syscall::Newfstatat,"newfstatat",RawFnHandler(sys_newfstatat));
-    table.install_raw(Syscall::Unlinkat,  "unlinkat",  RawFnHandler(sys_unlinkat));
-    table.install_raw(Syscall::Mkdirat,   "mkdirat",   RawFnHandler(sys_mkdirat));
-    table.install_raw(Syscall::Renameat,  "renameat",  RawFnHandler(sys_renameat));
+    table.install_raw(
+        Syscall::CopyFileRange,
+        "copy_file_range",
+        RawFnHandler(sys_copy_file_range),
+    );
+    table.install_raw(
+        Syscall::MemfdCreate,
+        "memfd_create",
+        RawFnHandler(sys_memfd_create),
+    );
+    table.install_raw(
+        Syscall::Fchmod,
+        "fchmod",
+        RawFnHandler(sys_fchmod_or_fchown),
+    );
+    table.install_raw(
+        Syscall::Fchown,
+        "fchown",
+        RawFnHandler(sys_fchmod_or_fchown),
+    );
+    table.install_raw(
+        Syscall::Fchmodat,
+        "fchmodat",
+        RawFnHandler(sys_fchmodat_or_fchownat),
+    );
+    table.install_raw(
+        Syscall::Fchownat,
+        "fchownat",
+        RawFnHandler(sys_fchmodat_or_fchownat),
+    );
+    table.install_raw(
+        Syscall::Faccessat,
+        "faccessat",
+        RawFnHandler(sys_fchmodat_or_fchownat),
+    );
+    table.install_raw(Syscall::Openat, "openat", RawFnHandler(sys_openat));
+    table.install_raw(
+        Syscall::Newfstatat,
+        "newfstatat",
+        RawFnHandler(sys_newfstatat),
+    );
+    table.install_raw(Syscall::Unlinkat, "unlinkat", RawFnHandler(sys_unlinkat));
+    table.install_raw(Syscall::Mkdirat, "mkdirat", RawFnHandler(sys_mkdirat));
+    table.install_raw(Syscall::Renameat, "renameat", RawFnHandler(sys_renameat));
     table.install_raw(Syscall::Symlinkat, "symlinkat", RawFnHandler(sys_symlinkat));
-    table.install_raw(Syscall::Readlinkat,"readlinkat",RawFnHandler(sys_readlinkat));
-    table.install_raw(Syscall::Access, "access", RawFnHandler(sys_access_chmod_chown));
-    table.install_raw(Syscall::Chmod,  "chmod",  RawFnHandler(sys_access_chmod_chown));
-    table.install_raw(Syscall::Chown,  "chown",  RawFnHandler(sys_access_chmod_chown));
+    table.install_raw(
+        Syscall::Readlinkat,
+        "readlinkat",
+        RawFnHandler(sys_readlinkat),
+    );
+    table.install_raw(
+        Syscall::Access,
+        "access",
+        RawFnHandler(sys_access_chmod_chown),
+    );
+    table.install_raw(
+        Syscall::Chmod,
+        "chmod",
+        RawFnHandler(sys_access_chmod_chown),
+    );
+    table.install_raw(
+        Syscall::Chown,
+        "chown",
+        RawFnHandler(sys_access_chmod_chown),
+    );
 
     // Tier-2 cwd state + nanosleep wired into the table. Sleep
     // already replaced the noop_ok stub above.
-    table.install_raw(Syscall::Chdir,  "chdir",  RawFnHandler(sys_chdir));
+    table.install_raw(Syscall::Chdir, "chdir", RawFnHandler(sys_chdir));
     table.install_raw(Syscall::Getcwd, "getcwd", RawFnHandler(sys_getcwd));
-    table.install_raw(Syscall::Lseek,  "lseek",  RawFnHandler(sys_lseek));
+    table.install_raw(Syscall::Lseek, "lseek", RawFnHandler(sys_lseek));
     table.install_raw(Syscall::Unlink, "unlink", RawFnHandler(sys_unlink));
-    table.install_raw(Syscall::Mkdir,  "mkdir",  RawFnHandler(sys_mkdir));
-    table.install_raw(Syscall::Rmdir,  "rmdir",  RawFnHandler(sys_rmdir));
+    table.install_raw(Syscall::Mkdir, "mkdir", RawFnHandler(sys_mkdir));
+    table.install_raw(Syscall::Rmdir, "rmdir", RawFnHandler(sys_rmdir));
     table.install_raw(Syscall::Rename, "rename", RawFnHandler(sys_rename));
     table.install_raw(Syscall::Readlink, "readlink", RawFnHandler(sys_readlink));
-    table.install_raw(Syscall::Symlink,  "symlink",  RawFnHandler(sys_symlink));
+    table.install_raw(Syscall::Symlink, "symlink", RawFnHandler(sys_symlink));
     table.install_raw(Syscall::Listdir, "listdir", RawFnHandler(sys_listdir));
-    table.install_raw(Syscall::Getdents64, "getdents64", RawFnHandler(sys_getdents64));
+    table.install_raw(
+        Syscall::Getdents64,
+        "getdents64",
+        RawFnHandler(sys_getdents64),
+    );
 
     // Tier-3z entropy.
     table.install_raw(Syscall::GetRandom, "getrandom", RawFnHandler(sys_getrandom));

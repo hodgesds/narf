@@ -9,7 +9,9 @@ use core::sync::atomic::{compiler_fence, Ordering};
 pub unsafe fn disable_interrupts() {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: DAIFSET with I-bit (0x2) masks IRQs at EL1.
-    unsafe { asm!("msr daifset, #2", options(nomem, nostack, preserves_flags)); }
+    unsafe {
+        asm!("msr daifset, #2", options(nomem, nostack, preserves_flags));
+    }
     compiler_fence(Ordering::SeqCst);
 }
 
@@ -18,7 +20,9 @@ pub unsafe fn disable_interrupts() {
 pub unsafe fn enable_interrupts() {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: DAIFCLR with I-bit (0x2) unmasks IRQs.
-    unsafe { asm!("msr daifclr, #2", options(nomem, nostack, preserves_flags)); }
+    unsafe {
+        asm!("msr daifclr, #2", options(nomem, nostack, preserves_flags));
+    }
     compiler_fence(Ordering::SeqCst);
 }
 
@@ -27,7 +31,9 @@ pub unsafe fn enable_interrupts() {
 pub unsafe fn wfi_once() {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: WFI at EL1 stalls until the next IRQ or event.
-    unsafe { asm!("wfi", options(nomem, nostack, preserves_flags)); }
+    unsafe {
+        asm!("wfi", options(nomem, nostack, preserves_flags));
+    }
     compiler_fence(Ordering::SeqCst);
 }
 
@@ -37,7 +43,9 @@ pub fn halt_forever() -> ! {
     // SAFETY: masking and halting is always safe; we never return.
     unsafe {
         disable_interrupts();
-        loop { wfi_once(); }
+        loop {
+            wfi_once();
+        }
     }
 }
 
@@ -72,7 +80,9 @@ pub fn halt_until_irq() {
         // SAFETY: WFI at EL1 is always safe; it stalls the CPU until
         // a wake condition. With DAIF.I=0 and the GIC delivering the
         // generic-timer PPI, the wake fires on each IRQ.
-        unsafe { wfi_once(); }
+        unsafe {
+            wfi_once();
+        }
     } else {
         core::hint::spin_loop();
     }
@@ -95,12 +105,7 @@ pub unsafe fn idle_halt_then_disable() {
     // + remask sequence is atomic with respect to IRQ delivery on
     // aarch64.
     unsafe {
-        core::arch::asm!(
-            "msr DAIFClr, #0x2",
-            "wfi",
-            "msr DAIFSet, #0x2",
-            options(),
-        );
+        core::arch::asm!("msr DAIFClr, #0x2", "wfi", "msr DAIFSet, #0x2", options(),);
     }
 }
 
@@ -111,9 +116,9 @@ pub unsafe fn idle_halt_then_disable() {
 /// This implementation requires ARMv8.1-LSE support.
 #[inline(always)]
 pub unsafe fn cas128(ptr: *mut u128, old: u128, new: u128) -> Result<u128, u128> {
-    let old_low  = old as u64;
+    let old_low = old as u64;
     let old_high = (old >> 64) as u64;
-    let new_low  = new as u64;
+    let new_low = new as u64;
     let new_high = (new >> 64) as u64;
 
     let res_low: u64;
@@ -162,7 +167,9 @@ pub unsafe fn cas128(ptr: *mut u128, old: u128, new: u128) -> Result<u128, u128>
 pub unsafe fn patch_word(addr: *mut u32, new: u32) {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: aligned 4-byte store is atomic. Serialisation below.
-    unsafe { core::ptr::write_volatile(addr, new); }
+    unsafe {
+        core::ptr::write_volatile(addr, new);
+    }
     // Self-modifying-code flush per ARMv8 B2.3:
     //   DSB ISH        — drain the pending data write to the PoU
     //   IC IVAU, <addr> — invalidate the I-cache line holding the patch

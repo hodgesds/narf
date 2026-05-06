@@ -19,8 +19,8 @@ pub mod wall;
 
 mod tests;
 pub use wall::{
-    begin_leap_smear, monotonic_ns, now_wall, set_cycles_per_ns,
-    set_wall_offset, set_wall_offset_uncapped, WallClock, WallError, WallInstant,
+    begin_leap_smear, monotonic_ns, now_wall, set_cycles_per_ns, set_wall_offset,
+    set_wall_offset_uncapped, WallClock, WallError, WallInstant,
 };
 
 use core::future::Future;
@@ -35,10 +35,14 @@ pub struct Instant(u64);
 
 impl Instant {
     #[inline]
-    pub fn now() -> Self { Self(now_cycles()) }
+    pub fn now() -> Self {
+        Self(now_cycles())
+    }
 
     #[inline]
-    pub fn as_cycles(self) -> u64 { self.0 }
+    pub fn as_cycles(self) -> u64 {
+        self.0
+    }
 
     /// Saturating add: if `other` would overflow past u64::MAX we cap.
     #[inline]
@@ -90,18 +94,24 @@ pub fn now_cycles() -> u64 {
         v
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    { 0 }
+    {
+        0
+    }
 }
 
 /// Named alias for consumers who want the "raw" semantics explicitly —
 /// identical to `now_cycles` in Stage 1 (no virtualisation offset yet).
 #[inline]
-pub fn now_monotonic_raw() -> Instant { Instant::now() }
+pub fn now_monotonic_raw() -> Instant {
+    Instant::now()
+}
 
 /// Stage-1 "now_monotonic" is an alias for the raw form. A hypervisor
 /// offset subtraction lands with the Wave 2 time spec.
 #[inline]
-pub fn now_monotonic() -> Instant { Instant::now() }
+pub fn now_monotonic() -> Instant {
+    Instant::now()
+}
 
 /// Busy-wait for at least `cycles` TSC ticks by spin-polling the
 /// counter. Intended for short calibration-type waits; anything
@@ -126,7 +136,9 @@ pub struct SleepUntil {
 }
 
 impl SleepUntil {
-    pub fn new(deadline: Instant) -> Self { Self { deadline } }
+    pub fn new(deadline: Instant) -> Self {
+        Self { deadline }
+    }
 }
 
 impl Future for SleepUntil {

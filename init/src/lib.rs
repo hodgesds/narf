@@ -65,33 +65,39 @@ pub type InitFn = fn() -> InitResult;
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum Stage {
-    Early    = 0,
-    Core     = 1,
+    Early = 0,
+    Core = 1,
     PostCore = 2,
-    Arch     = 3,
-    Subsys   = 4,
-    Fs       = 5,
-    Device   = 6,
-    Late     = 7,
+    Arch = 3,
+    Subsys = 4,
+    Fs = 5,
+    Device = 6,
+    Late = 7,
 }
 
 impl Stage {
     /// Iteration order. Used by `run_all_through`.
     pub const ALL: [Stage; 8] = [
-        Stage::Early, Stage::Core, Stage::PostCore, Stage::Arch,
-        Stage::Subsys, Stage::Fs, Stage::Device, Stage::Late,
+        Stage::Early,
+        Stage::Core,
+        Stage::PostCore,
+        Stage::Arch,
+        Stage::Subsys,
+        Stage::Fs,
+        Stage::Device,
+        Stage::Late,
     ];
 
     pub const fn name(self) -> &'static str {
         match self {
-            Stage::Early    => "early",
-            Stage::Core     => "core",
+            Stage::Early => "early",
+            Stage::Core => "core",
             Stage::PostCore => "postcore",
-            Stage::Arch     => "arch",
-            Stage::Subsys   => "subsys",
-            Stage::Fs       => "fs",
-            Stage::Device   => "device",
-            Stage::Late     => "late",
+            Stage::Arch => "arch",
+            Stage::Subsys => "subsys",
+            Stage::Fs => "fs",
+            Stage::Device => "device",
+            Stage::Late => "late",
         }
     }
 }
@@ -100,15 +106,15 @@ impl Stage {
 #[derive(Copy, Clone)]
 pub struct Initcall {
     pub stage: Stage,
-    pub name:  &'static str,
-    pub func:  InitFn,
+    pub name: &'static str,
+    pub func: InitFn,
 }
 
 impl core::fmt::Debug for Initcall {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Initcall")
             .field("stage", &self.stage)
-            .field("name",  &self.name)
+            .field("name", &self.name)
             .finish_non_exhaustive()
     }
 }
@@ -117,18 +123,18 @@ impl core::fmt::Debug for Initcall {
 /// `__reset_for_test`.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct StageStats {
-    pub total:        u32,
-    pub ok:           u32,
-    pub not_present:  u32,
-    pub error:        u32,
+    pub total: u32,
+    pub ok: u32,
+    pub not_present: u32,
+    pub error: u32,
     /// Sum of `cycles_since` deltas across every initcall in the
     /// stage. Stays 0 when the cycle counter isn't available
     /// (fallback time backend).
     pub total_cycles: u64,
     /// Cycles spent in the slowest single initcall of this stage.
-    pub max_cycles:   u64,
+    pub max_cycles: u64,
     /// Name of the slowest single initcall, for diagnostics.
-    pub max_name:     &'static str,
+    pub max_name: &'static str,
 }
 
 /// Optional hook for emitting "init: stage X / call Y -> Z" lines.
@@ -156,12 +162,17 @@ fn log(line: &str) {
 /// can happen from any context (typically BSP boot).
 struct Registry {
     stages: [IrqSafeSpinLock<Vec<Initcall>>; 8],
-    stats:  IrqSafeSpinLock<[StageStats; 8]>,
+    stats: IrqSafeSpinLock<[StageStats; 8]>,
 }
 
 const EMPTY_STATS: StageStats = StageStats {
-    total: 0, ok: 0, not_present: 0, error: 0,
-    total_cycles: 0, max_cycles: 0, max_name: "",
+    total: 0,
+    ok: 0,
+    not_present: 0,
+    error: 0,
+    total_cycles: 0,
+    max_cycles: 0,
+    max_name: "",
 };
 
 static REGISTRY: Registry = Registry {
@@ -184,7 +195,9 @@ static REGISTRY: Registry = Registry {
 /// registration order.
 pub fn register(stage: Stage, name: &'static str, func: InitFn) {
     let i = stage as usize;
-    REGISTRY.stages[i].lock().push(Initcall { stage, name, func });
+    REGISTRY.stages[i]
+        .lock()
+        .push(Initcall { stage, name, func });
 }
 
 /// Run every initcall registered under `stage`. Each call's result
@@ -205,18 +218,23 @@ pub fn run_stage(stage: Stage) -> StageStats {
         stats.total_cycles = stats.total_cycles.saturating_add(dt);
         if dt > stats.max_cycles {
             stats.max_cycles = dt;
-            stats.max_name   = ic.name;
+            stats.max_name = ic.name;
         }
         match result {
-            InitResult::Ok         => stats.ok += 1,
+            InitResult::Ok => stats.ok += 1,
             InitResult::NotPresent => stats.not_present += 1,
             InitResult::Error(msg) => {
                 stats.error += 1;
                 let mut buf = [0u8; 256];
                 let mut w = TruncatingWriter::new(&mut buf);
                 use core::fmt::Write;
-                let _ = write!(&mut w, "init: {} / {} -> error: {}",
-                               stage.name(), ic.name, msg);
+                let _ = write!(
+                    &mut w,
+                    "init: {} / {} -> error: {}",
+                    stage.name(),
+                    ic.name,
+                    msg
+                );
                 log(w.as_str());
             }
         }
@@ -230,7 +248,9 @@ pub fn run_stage(stage: Stage) -> StageStats {
 pub fn run_all_through(last_stage: Stage) -> [StageStats; 8] {
     let mut out = [StageStats::default(); 8];
     for s in Stage::ALL {
-        if (s as u8) > (last_stage as u8) { break; }
+        if (s as u8) > (last_stage as u8) {
+            break;
+        }
         out[s as usize] = run_stage(s);
     }
     out
@@ -251,7 +271,9 @@ pub fn registered_count(stage: Stage) -> usize {
 /// Test-only reset.
 #[doc(hidden)]
 pub fn __reset_for_test() {
-    for v in REGISTRY.stages.iter() { v.lock().clear(); }
+    for v in REGISTRY.stages.iter() {
+        v.lock().clear();
+    }
     *REGISTRY.stats.lock() = [EMPTY_STATS; 8];
 }
 
@@ -262,17 +284,29 @@ pub fn __reset_for_test() {
 pub fn print_summary(w: &mut dyn core::fmt::Write) -> core::fmt::Result {
     use core::fmt::Write as _;
     writeln!(w, "  init summary:")?;
-    writeln!(w, "    stage       calls  ok  skip  err  total_cyc      slowest")?;
+    writeln!(
+        w,
+        "    stage       calls  ok  skip  err  total_cyc      slowest"
+    )?;
     for stage in Stage::ALL {
         let s = stats(stage);
-        if s.total == 0 { continue; }
+        if s.total == 0 {
+            continue;
+        }
         writeln!(
             w,
             "    {:8}    {:5}  {:>2}  {:>4}  {:>3}  {:>11}  {} ({} cyc)",
             stage.name(),
-            s.total, s.ok, s.not_present, s.error,
+            s.total,
+            s.ok,
+            s.not_present,
+            s.error,
             s.total_cycles,
-            if s.max_name.is_empty() { "-" } else { s.max_name },
+            if s.max_name.is_empty() {
+                "-"
+            } else {
+                s.max_name
+            },
             s.max_cycles,
         )?;
     }
@@ -287,7 +321,9 @@ struct TruncatingWriter<'a> {
 }
 
 impl<'a> TruncatingWriter<'a> {
-    fn new(buf: &'a mut [u8]) -> Self { Self { buf, len: 0 } }
+    fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, len: 0 }
+    }
     fn as_str(&self) -> &str {
         // SAFETY: we only ever push valid UTF-8 via fmt::Write, and
         // truncate at byte boundaries that are also char boundaries

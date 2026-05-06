@@ -25,15 +25,15 @@ use narf_arch::x86_64::msr::{rdmsr, wrmsr};
 const IA32_APIC_BASE: u32 = 0x0000_001B;
 
 /// Bit 11: APIC global enable. Set to enable the LAPIC.
-const APIC_BASE_EN:   u64 = 1 << 11;
+const APIC_BASE_EN: u64 = 1 << 11;
 /// Bit 10: x2APIC enable.
 const APIC_BASE_EXTD: u64 = 1 << 10;
 
-const APIC_EOI_MSR:        u32 = 0x0000_080B;
-const APIC_SIVR_MSR:       u32 = 0x0000_080F;
-const APIC_LVT_TIMER_MSR:  u32 = 0x0000_0832;
+const APIC_EOI_MSR: u32 = 0x0000_080B;
+const APIC_SIVR_MSR: u32 = 0x0000_080F;
+const APIC_LVT_TIMER_MSR: u32 = 0x0000_0832;
 const APIC_TIMER_INIT_MSR: u32 = 0x0000_0838;
-const APIC_TIMER_DIV_MSR:  u32 = 0x0000_083E;
+const APIC_TIMER_DIV_MSR: u32 = 0x0000_083E;
 
 /// SIVR bit 8: APIC software enable.
 const SIVR_ENABLE: u64 = 1 << 8;
@@ -42,7 +42,7 @@ const SIVR_ENABLE: u64 = 1 << 8;
 /// `10` = TSC-deadline.
 const LVT_TIMER_PERIODIC: u64 = 1 << 17;
 /// LVT bit 16: masked. Clear to unmask.
-const LVT_MASKED:         u64 = 1 << 16;
+const LVT_MASKED: u64 = 1 << 16;
 
 /// APIC timer divide values (documented SDM Vol 3 §10.5.4):
 ///   000 = /2, 001 = /4, 010 = /8, 011 = /16,
@@ -66,7 +66,9 @@ static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 pub unsafe fn init_bsp() {
     // SAFETY: caller confirmed x2APIC support via CPUID.
     let base = unsafe { rdmsr(IA32_APIC_BASE) };
-    unsafe { wrmsr(IA32_APIC_BASE, base | APIC_BASE_EN | APIC_BASE_EXTD); }
+    unsafe {
+        wrmsr(IA32_APIC_BASE, base | APIC_BASE_EN | APIC_BASE_EXTD);
+    }
 
     // Mask every IRQ on both 8259 PICs. This is the legacy-PIC
     // compatible way of saying "I don't want any interrupts from
@@ -84,7 +86,10 @@ pub unsafe fn init_bsp() {
     // stray interrupts. Bit 8 = software enable.
     // SAFETY: x2APIC is now live; writes to 0x800+ are valid.
     unsafe {
-        wrmsr(APIC_SIVR_MSR, SIVR_ENABLE | (super::super::VECTOR_SPURIOUS as u64));
+        wrmsr(
+            APIC_SIVR_MSR,
+            SIVR_ENABLE | (super::super::VECTOR_SPURIOUS as u64),
+        );
         // Mask the timer explicitly until `start_timer` is called.
         wrmsr(APIC_LVT_TIMER_MSR, LVT_MASKED);
     }
@@ -102,9 +107,10 @@ pub unsafe fn start_timer(timer_vector: u8, initial_count: u32) {
     // SAFETY: APIC is enabled by init_bsp.
     unsafe {
         wrmsr(APIC_TIMER_DIV_MSR, DIV_16);
-        wrmsr(APIC_LVT_TIMER_MSR,
-              LVT_TIMER_PERIODIC
-              | (timer_vector as u64));
+        wrmsr(
+            APIC_LVT_TIMER_MSR,
+            LVT_TIMER_PERIODIC | (timer_vector as u64),
+        );
         wrmsr(APIC_TIMER_INIT_MSR, initial_count as u64);
     }
 }
@@ -129,7 +135,9 @@ pub unsafe fn stop_timer() {
 pub unsafe fn eoi() {
     // SAFETY: APIC is initialised; EOI write has no side effect beyond
     // unblocking the same-or-lower-priority interrupts.
-    unsafe { wrmsr(APIC_EOI_MSR, 0); }
+    unsafe {
+        wrmsr(APIC_EOI_MSR, 0);
+    }
 }
 
 /// Self-IPI: send an interrupt to this CPU's own LAPIC at the given
@@ -141,7 +149,9 @@ pub unsafe fn eoi() {
 #[inline]
 pub unsafe fn self_ipi(vector: u8) {
     // SAFETY: MSR 0x83F is the x2APIC Self-IPI register.
-    unsafe { wrmsr(0x83F, vector as u64); }
+    unsafe {
+        wrmsr(0x83F, vector as u64);
+    }
 }
 
 /// x2APIC ICR MSR (0x830). Writing this sends an IPI; the high 32
@@ -158,7 +168,9 @@ const APIC_ICR_MSR: u32 = 0x0000_0830;
 #[inline]
 pub unsafe fn wrmsr_icr(icr: u64) {
     // SAFETY: caller upholds the x2APIC precondition.
-    unsafe { wrmsr(APIC_ICR_MSR, icr); }
+    unsafe {
+        wrmsr(APIC_ICR_MSR, icr);
+    }
 }
 
 /// Read this CPU's APIC ID via x2APIC MSR 0x802.
@@ -187,7 +199,9 @@ pub unsafe fn send_init_ipi(target_apic_id: u32) {
     // trigger=edge (bit 15 = 0), destination=physical (bit 11 = 0).
     let icr = dest | 0x0000_4500;
     // SAFETY: MSR 0x830 is x2APIC ICR.
-    unsafe { wrmsr(APIC_ICR_MSR, icr); }
+    unsafe {
+        wrmsr(APIC_ICR_MSR, icr);
+    }
 }
 
 /// Send a STARTUP IPI (SIPI) to the target APIC.
@@ -205,7 +219,9 @@ pub unsafe fn send_startup_ipi(target_apic_id: u32, vector_page: u8) {
     // SIPI (delivery mode 0b110 = 0x600) + vector (low 8 bits).
     let icr = dest | 0x0000_4600 | (vector_page as u64);
     // SAFETY: MSR 0x830 is x2APIC ICR.
-    unsafe { wrmsr(APIC_ICR_MSR, icr); }
+    unsafe {
+        wrmsr(APIC_ICR_MSR, icr);
+    }
 }
 
 /// Initialise *this* CPU's LAPIC in x2APIC mode (no PIC-mask, no
@@ -219,11 +235,16 @@ pub unsafe fn send_startup_ipi(target_apic_id: u32, vector_page: u8) {
 pub unsafe fn init_ap() {
     // SAFETY: x2APIC support is BSP-confirmed.
     let base = unsafe { rdmsr(IA32_APIC_BASE) };
-    unsafe { wrmsr(IA32_APIC_BASE, base | APIC_BASE_EN | APIC_BASE_EXTD); }
+    unsafe {
+        wrmsr(IA32_APIC_BASE, base | APIC_BASE_EN | APIC_BASE_EXTD);
+    }
     // Spurious vector + software enable.
     // SAFETY: x2APIC is now live on this CPU.
     unsafe {
-        wrmsr(APIC_SIVR_MSR, SIVR_ENABLE | (super::super::VECTOR_SPURIOUS as u64));
+        wrmsr(
+            APIC_SIVR_MSR,
+            SIVR_ENABLE | (super::super::VECTOR_SPURIOUS as u64),
+        );
         wrmsr(APIC_LVT_TIMER_MSR, LVT_MASKED);
     }
 }

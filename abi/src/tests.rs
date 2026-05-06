@@ -24,13 +24,13 @@ fn smoke_abi_submission_layout() -> TestResult {
     // Every OpCode discriminant must match the spec-pinned wire tag.
     // Adding a variant is fine; changing one of these is an ABI break.
     let opcode_pins: &[(crate::OpCode, u32)] = &[
-        (crate::OpCode::Noop,        0x0000),
-        (crate::OpCode::Cancel,      0x0001),
-        (crate::OpCode::RingSend,    0x0002),
-        (crate::OpCode::RingRecv,    0x0003),
-        (crate::OpCode::Yield,       0x0004),
+        (crate::OpCode::Noop, 0x0000),
+        (crate::OpCode::Cancel, 0x0001),
+        (crate::OpCode::RingSend, 0x0002),
+        (crate::OpCode::RingRecv, 0x0003),
+        (crate::OpCode::Yield, 0x0004),
         (crate::OpCode::DomainEnter, 0x0005),
-        (crate::OpCode::DomainExit,  0x0006),
+        (crate::OpCode::DomainExit, 0x0006),
     ];
     for &(op, wire) in opcode_pins {
         if op.as_u32() != wire {
@@ -52,14 +52,14 @@ fn smoke_abi_completion_layout() -> TestResult {
         return TestResult::Fail("Completion alignment drifted from 8");
     }
     let status_pins: &[(crate::NarfStatus, u32)] = &[
-        (crate::NarfStatus::Ok,              0x0000),
-        (crate::NarfStatus::Pending,         0x0001),
-        (crate::NarfStatus::Cancelled,       0x0002),
+        (crate::NarfStatus::Ok, 0x0000),
+        (crate::NarfStatus::Pending, 0x0001),
+        (crate::NarfStatus::Cancelled, 0x0002),
         (crate::NarfStatus::CancelRequested, 0x0003),
-        (crate::NarfStatus::CapRevoked,      0x0004),
-        (crate::NarfStatus::InvalidOp,       0x0005),
-        (crate::NarfStatus::Busy,            0x0006),
-        (crate::NarfStatus::Closed,          0x0007),
+        (crate::NarfStatus::CapRevoked, 0x0004),
+        (crate::NarfStatus::InvalidOp, 0x0005),
+        (crate::NarfStatus::Busy, 0x0006),
+        (crate::NarfStatus::Closed, 0x0007),
     ];
     for &(st, wire) in status_pins {
         if st.as_u32() != wire {
@@ -115,8 +115,10 @@ fn smoke_abi_ring_roundtrip() -> TestResult {
 kernel_test_in!("abi", smoke_abi_ring_roundtrip);
 
 fn smoke_abi_dispatcher_roundtrip() -> TestResult {
+    use crate::{
+        completion_channel, submission_channel, Dispatcher, NarfStatus, OpCode, Submission, Tag,
+    };
     use core::sync::atomic::{AtomicU8, Ordering};
-    use crate::{submission_channel, completion_channel, Dispatcher, Submission, Tag, NarfStatus, OpCode};
 
     static OUTCOME: AtomicU8 = AtomicU8::new(0);
 
@@ -179,11 +181,11 @@ fn smoke_abi_cancel_before_target_marks_cancelled() -> TestResult {
     // §3.1 protocol: a Cancel submitted *before* its target is drained
     // must complete the target with `Cancelled` (when CANCELLABLE is
     // set on the target). The cancel op itself always completes `Ok`.
-    use core::sync::atomic::{AtomicU8, Ordering};
     use crate::{
-        completion_channel, submission_channel, Dispatcher, NarfStatus,
-        Submission, SubmissionFlags, Tag,
+        completion_channel, submission_channel, Dispatcher, NarfStatus, Submission,
+        SubmissionFlags, Tag,
     };
+    use core::sync::atomic::{AtomicU8, Ordering};
 
     static OUTCOME: AtomicU8 = AtomicU8::new(0);
 
@@ -201,7 +203,10 @@ fn smoke_abi_cancel_before_target_marks_cancelled() -> TestResult {
         let canceller = Tag::new(0xC001);
 
         // 1. Submit the cancel first — dispatcher records the target.
-        sq_tx.send(Submission::cancel(canceller, target)).await.unwrap();
+        sq_tx
+            .send(Submission::cancel(canceller, target))
+            .await
+            .unwrap();
         let c1 = cq_rx.recv().await.unwrap();
         if c1.tag() != canceller || c1.status != NarfStatus::Ok {
             OUTCOME.store(2, Ordering::Relaxed);
@@ -236,11 +241,8 @@ kernel_test_in!("abi", smoke_abi_cancel_before_target_marks_cancelled);
 fn smoke_abi_cancel_non_cancellable_marks_request() -> TestResult {
     // §3.1: a target without CANCELLABLE completes with
     // `CancelRequested` so the caller knows the op ran to completion.
+    use crate::{completion_channel, submission_channel, Dispatcher, NarfStatus, Submission, Tag};
     use core::sync::atomic::{AtomicU8, Ordering};
-    use crate::{
-        completion_channel, submission_channel, Dispatcher, NarfStatus,
-        Submission, Tag,
-    };
 
     static OUTCOME: AtomicU8 = AtomicU8::new(0);
 
@@ -257,7 +259,10 @@ fn smoke_abi_cancel_non_cancellable_marks_request() -> TestResult {
         let target = Tag::new(0x8888);
         let canceller = Tag::new(0xC002);
 
-        sq_tx.send(Submission::cancel(canceller, target)).await.unwrap();
+        sq_tx
+            .send(Submission::cancel(canceller, target))
+            .await
+            .unwrap();
         let _ = cq_rx.recv().await.unwrap();
 
         // No CANCELLABLE flag on the target.
@@ -288,11 +293,10 @@ fn smoke_abi_dispatch_latency_accumulates() -> TestResult {
     // accumulator reports at least N samples. Welford's mean must be
     // non-zero (the measured elapsed cycle-count per dispatch is
     // non-zero on any real timer source).
-    use core::sync::atomic::{AtomicU8, Ordering};
     use crate::{
-        completion_channel, submission_channel, Dispatcher, Submission, Tag,
-        ABI_DISPATCH_LATENCY,
+        completion_channel, submission_channel, Dispatcher, Submission, Tag, ABI_DISPATCH_LATENCY,
     };
+    use core::sync::atomic::{AtomicU8, Ordering};
 
     static OUTCOME: AtomicU8 = AtomicU8::new(0);
 
@@ -309,7 +313,10 @@ fn smoke_abi_dispatch_latency_accumulates() -> TestResult {
 
     narf_scheduler::spawn(async move {
         for i in 0..3 {
-            sq_tx.send(Submission::noop(Tag::new(0xF00 + i))).await.unwrap();
+            sq_tx
+                .send(Submission::noop(Tag::new(0xF00 + i)))
+                .await
+                .unwrap();
             let _ = cq_rx.recv().await.unwrap();
         }
         OUTCOME.store(1, Ordering::Relaxed);
@@ -345,11 +352,11 @@ fn smoke_abi_linked_chain_cancels_forward() -> TestResult {
     // then Cancel(A), then C (LINKED, still same chain). The chain
     // registry flagged chain_id when Cancel(A) ran; C must short-
     // circuit with Cancelled even though it was never named directly.
-    use core::sync::atomic::{AtomicU8, Ordering};
     use crate::{
-        completion_channel, submission_channel, Dispatcher, NarfStatus,
-        Submission, SubmissionFlags, Tag,
+        completion_channel, submission_channel, Dispatcher, NarfStatus, Submission,
+        SubmissionFlags, Tag,
     };
+    use core::sync::atomic::{AtomicU8, Ordering};
 
     static OUTCOME: AtomicU8 = AtomicU8::new(0);
 
@@ -391,19 +398,23 @@ fn smoke_abi_linked_chain_cancels_forward() -> TestResult {
         // cancel (Ok), C (Cancelled).
         let ca = cq_rx.recv().await.unwrap();
         if ca.tag() != ta || ca.status != NarfStatus::Ok {
-            OUTCOME.store(2, Ordering::Relaxed); return;
+            OUTCOME.store(2, Ordering::Relaxed);
+            return;
         }
         let cb = cq_rx.recv().await.unwrap();
         if cb.tag() != tb || cb.status != NarfStatus::Ok {
-            OUTCOME.store(3, Ordering::Relaxed); return;
+            OUTCOME.store(3, Ordering::Relaxed);
+            return;
         }
         let ccan = cq_rx.recv().await.unwrap();
         if ccan.tag() != tcan || ccan.status != NarfStatus::Ok {
-            OUTCOME.store(4, Ordering::Relaxed); return;
+            OUTCOME.store(4, Ordering::Relaxed);
+            return;
         }
         let cc = cq_rx.recv().await.unwrap();
         if cc.tag() != tc || cc.status != NarfStatus::Cancelled {
-            OUTCOME.store(5, Ordering::Relaxed); return;
+            OUTCOME.store(5, Ordering::Relaxed);
+            return;
         }
 
         OUTCOME.store(1, Ordering::Relaxed);
@@ -427,11 +438,8 @@ fn smoke_abi_cancel_stale_tag_is_noop() -> TestResult {
     // §3.1: the cancel op is non-blocking and always succeeds even
     // when the target tag never shows up. A subsequent unrelated
     // submission must not inherit the cancel.
+    use crate::{completion_channel, submission_channel, Dispatcher, NarfStatus, Submission, Tag};
     use core::sync::atomic::{AtomicU8, Ordering};
-    use crate::{
-        completion_channel, submission_channel, Dispatcher, NarfStatus,
-        Submission, Tag,
-    };
 
     static OUTCOME: AtomicU8 = AtomicU8::new(0);
 
@@ -445,12 +453,15 @@ fn smoke_abi_cancel_stale_tag_is_noop() -> TestResult {
     });
 
     narf_scheduler::spawn(async move {
-        let stale  = Tag::new(0xDEAD);
-        let other  = Tag::new(0xAAAA);
+        let stale = Tag::new(0xDEAD);
+        let other = Tag::new(0xAAAA);
         let canceller = Tag::new(0xC003);
 
         // Cancel a tag the producer will never submit.
-        sq_tx.send(Submission::cancel(canceller, stale)).await.unwrap();
+        sq_tx
+            .send(Submission::cancel(canceller, stale))
+            .await
+            .unwrap();
         let c1 = cq_rx.recv().await.unwrap();
         if c1.status != NarfStatus::Ok {
             OUTCOME.store(2, Ordering::Relaxed);

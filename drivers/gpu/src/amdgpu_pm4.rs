@@ -49,11 +49,11 @@ pub enum Pm4Op {
     IndirectBuffer = 0x3F,
     /// Host writes `data` to the GPU-visible address `dst`. Used
     /// to publish completion fences.
-    WriteData      = 0x37,
+    WriteData = 0x37,
     /// GPU-side `wait_until((mmio_or_mem & mask) cmp ref)`.
-    WaitRegMem     = 0x3C,
+    WaitRegMem = 0x3C,
     /// No-op; pads a ring to 16-byte alignment without side effects.
-    Nop            = 0x10,
+    Nop = 0x10,
 }
 
 /// PM4 packet builder. Writes 32-bit words into `out`; returns
@@ -75,12 +75,18 @@ pub enum Pm4Error {
 }
 
 impl<'a> Pm4Builder<'a> {
-    pub fn new(out: &'a mut [u32]) -> Self { Self { out, pos: 0 } }
+    pub fn new(out: &'a mut [u32]) -> Self {
+        Self { out, pos: 0 }
+    }
 
-    pub fn bytes_written(&self) -> usize { self.pos * 4 }
+    pub fn bytes_written(&self) -> usize {
+        self.pos * 4
+    }
 
     fn push(&mut self, w: u32) -> Result<(), Pm4Error> {
-        if self.pos >= self.out.len() { return Err(Pm4Error::OutOfRoom); }
+        if self.pos >= self.out.len() {
+            return Err(Pm4Error::OutOfRoom);
+        }
         self.out[self.pos] = w;
         self.pos += 1;
         Ok(())
@@ -92,16 +98,16 @@ impl<'a> Pm4Builder<'a> {
             return Err(Pm4Error::BadCount);
         }
         let count_minus_one = (data_word_count as u32 - 1) & 0x3FFF;
-        Ok((PacketType::Type3 as u32) << 30
-            | count_minus_one << 16
-            | (opcode as u32) << 8)
+        Ok((PacketType::Type3 as u32) << 30 | count_minus_one << 16 | (opcode as u32) << 8)
     }
 
     /// Push a NOP padding packet of `n_words` (≥ 1).
     pub fn nop(&mut self, n_words: usize) -> Result<(), Pm4Error> {
         let hdr = Self::type3_header(Pm4Op::Nop, n_words)?;
         self.push(hdr)?;
-        for _ in 0..n_words { self.push(0)?; }
+        for _ in 0..n_words {
+            self.push(0)?;
+        }
         Ok(())
     }
 
@@ -112,17 +118,16 @@ impl<'a> Pm4Builder<'a> {
     /// Ring placement: 4 dwords (header + 3 data).
     pub fn indirect_buffer(
         &mut self,
-        ib_base:    u64,
+        ib_base: u64,
         ib_size_dw: u32,
-        vmid:       u8,
+        vmid: u8,
     ) -> Result<(), Pm4Error> {
         let hdr = Self::type3_header(Pm4Op::IndirectBuffer, 3)?;
         self.push(hdr)?;
         self.push(ib_base as u32)?;
         self.push((ib_base >> 32) as u32)?;
         // Spec: bits[19:0] = size in dwords; bits[27:24] = VMID.
-        self.push((ib_size_dw & 0x000F_FFFF)
-            | ((vmid as u32 & 0xF) << 24))?;
+        self.push((ib_size_dw & 0x000F_FFFF) | ((vmid as u32 & 0xF) << 24))?;
         Ok(())
     }
 
@@ -137,7 +142,7 @@ impl<'a> Pm4Builder<'a> {
         // Control word: `dst_sel = MEM (5)` + `wr_confirm = 1` so
         // the engine waits for the write to settle before
         // signaling the ring as drained. Per AMD GPUOpen docs.
-        const CTRL_DST_MEM:    u32 = 5 << 8;
+        const CTRL_DST_MEM: u32 = 5 << 8;
         const CTRL_WR_CONFIRM: u32 = 1 << 20;
         self.push(CTRL_DST_MEM | CTRL_WR_CONFIRM)?;
         self.push(dst_addr as u32)?;
@@ -153,15 +158,15 @@ impl<'a> Pm4Builder<'a> {
     /// Ring placement: 7 dwords (header + 6 data).
     pub fn wait_reg_mem_eq(
         &mut self,
-        mem_addr:  u64,
+        mem_addr: u64,
         reference: u32,
-        mask:      u32,
+        mask: u32,
     ) -> Result<(), Pm4Error> {
         let hdr = Self::type3_header(Pm4Op::WaitRegMem, 6)?;
         self.push(hdr)?;
         // info: `mem_space=1 (MEM), function=3 (>=)` per public PM4 docs.
         const INFO_MEM_SPACE: u32 = 1 << 4;
-        const INFO_FUNC_EQ:   u32 = 3;
+        const INFO_FUNC_EQ: u32 = 3;
         self.push(INFO_MEM_SPACE | INFO_FUNC_EQ)?;
         self.push(mem_addr as u32)?;
         self.push((mem_addr >> 32) as u32)?;

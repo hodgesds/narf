@@ -31,12 +31,12 @@ const KERNEL_OWNER: u32 = 1;
 
 /// Runtime state for a single AML Mutex object.
 pub struct MutexState {
-    pub path:       String,
+    pub path: String,
     pub sync_level: u8,
     /// 0 = free, KERNEL_OWNER = held.
-    pub locked:     AtomicU32,
+    pub locked: AtomicU32,
     /// Recursive lock count (same owner can re-enter).
-    pub owner:      AtomicU32,
+    pub owner: AtomicU32,
 }
 
 impl core::fmt::Debug for MutexState {
@@ -52,7 +52,7 @@ impl core::fmt::Debug for MutexState {
 
 /// Runtime state for a single AML Event object.
 pub struct EventState {
-    pub path:    String,
+    pub path: String,
     /// Signal count: 0 = not signaled, >0 = signaled (Wait consumes one).
     pub signaled: AtomicU32,
 }
@@ -71,7 +71,7 @@ impl core::fmt::Debug for EventState {
 pub type NotifyHandler = fn(target: &str, value: u64);
 
 struct NotifyEntry {
-    path:    String,
+    path: String,
     handler: NotifyHandler,
 }
 
@@ -85,9 +85,9 @@ impl core::fmt::Debug for NotifyEntry {
 
 // ── Global statics ────────────────────────────────────────────────────────────
 
-static MUTEXES:  IrqSafeSpinLock<Vec<MutexState>>  = IrqSafeSpinLock::new(Vec::new());
-static EVENTS:   IrqSafeSpinLock<Vec<EventState>>   = IrqSafeSpinLock::new(Vec::new());
-static HANDLERS: IrqSafeSpinLock<Vec<NotifyEntry>>  = IrqSafeSpinLock::new(Vec::new());
+static MUTEXES: IrqSafeSpinLock<Vec<MutexState>> = IrqSafeSpinLock::new(Vec::new());
+static EVENTS: IrqSafeSpinLock<Vec<EventState>> = IrqSafeSpinLock::new(Vec::new());
+static HANDLERS: IrqSafeSpinLock<Vec<NotifyEntry>> = IrqSafeSpinLock::new(Vec::new());
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
@@ -110,10 +110,10 @@ fn ensure_mutex(path: &str) -> Result<(), AmlError> {
     // Double-check (benign on single-CPU but good hygiene).
     if !g.iter().any(|m| m.path == path) {
         g.push(MutexState {
-            path:       String::from(path),
+            path: String::from(path),
             sync_level: 0,
-            locked:     AtomicU32::new(0),
-            owner:      AtomicU32::new(0),
+            locked: AtomicU32::new(0),
+            owner: AtomicU32::new(0),
         });
     }
     Ok(())
@@ -134,7 +134,7 @@ fn ensure_event(path: &str) -> Result<(), AmlError> {
     let mut g = EVENTS.lock();
     if !g.iter().any(|e| e.path == path) {
         g.push(EventState {
-            path:    String::from(path),
+            path: String::from(path),
             signaled: AtomicU32::new(0),
         });
     }
@@ -285,7 +285,7 @@ pub fn reset(path: &str) -> Result<(), AmlError> {
 pub fn register_notify_handler(target_path: &str, handler: NotifyHandler) {
     let mut g = HANDLERS.lock();
     g.push(NotifyEntry {
-        path:    String::from(target_path),
+        path: String::from(target_path),
         handler,
     });
 }

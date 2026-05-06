@@ -58,8 +58,7 @@ mod signature;
 mod tests;
 
 pub use signature::{
-    BLOB_TRAILER_MAGIC, BlobTrailer,
-    register_trusted_signer, trusted_signer_count,
+    register_trusted_signer, trusted_signer_count, BlobTrailer, BLOB_TRAILER_MAGIC,
 };
 
 /// Cap-type marker for a loaded firmware blob.
@@ -70,7 +69,9 @@ pub use signature::{
 /// DMA-coherent backing pages after an RCU grace period.
 #[derive(Debug)]
 pub struct FirmwareBlob;
-impl CapType for FirmwareBlob { const KIND: CapKind = CapKind::Firmware; }
+impl CapType for FirmwareBlob {
+    const KIND: CapKind = CapKind::Firmware;
+}
 
 /// Cap-type marker for the registry authority.
 ///
@@ -81,7 +82,9 @@ impl CapType for FirmwareBlob { const KIND: CapKind = CapKind::Firmware; }
 /// load daemon (Write) and the trusted-driver loader (Read).
 #[derive(Debug)]
 pub struct FirmwareRegistry;
-impl CapType for FirmwareRegistry { const KIND: CapKind = CapKind::FirmwareRegistry; }
+impl CapType for FirmwareRegistry {
+    const KIND: CapKind = CapKind::FirmwareRegistry;
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum FirmwareError {
@@ -108,7 +111,7 @@ pub enum FirmwareError {
 #[derive(Copy, Clone, Debug)]
 pub struct BlobView<'a> {
     /// Canonical name, e.g. "qcom/qcnfa765/amss.bin".
-    pub name:    &'static str,
+    pub name: &'static str,
     /// Vendor-supplied version string parsed from the blob trailer.
     /// `None` when the trailer carried no version metadata.
     pub version: Option<&'a str>,
@@ -116,28 +119,28 @@ pub struct BlobView<'a> {
     /// the signature trailer). Recorded in the bound-driver
     /// inventory so kernel snapshots correlate driver behaviour
     /// with firmware version.
-    pub sha256:  [u8; 32],
+    pub sha256: [u8; 32],
     /// Signer fingerprint (Ed25519 public-key hash). `None` when
     /// the blob was unsigned and the build accepts unsigned blobs.
-    pub signer:  Option<[u8; 32]>,
+    pub signer: Option<[u8; 32]>,
     /// The bytes themselves. Identity-mapped DMA-coherent memory
     /// on kernel-resident builds; on a future userspace-driver
     /// build this is the user-AS view of the same shared frame.
-    pub bytes:   &'a [u8],
+    pub bytes: &'a [u8],
     /// Phys address corresponding to `bytes`. Same on kernel
     /// builds; IOMMU-translated on userspace builds.
-    pub phys:    u64,
+    pub phys: u64,
 }
 
 /// One blob's identity for `snapshot()`. Used by observability +
 /// the bound-driver inventory.
 #[derive(Clone, Debug)]
 pub struct BlobIdentity {
-    pub name:    &'static str,
-    pub size:    usize,
-    pub sha256:  [u8; 32],
-    pub signer:  Option<[u8; 32]>,
-    pub source:  BlobSource,
+    pub name: &'static str,
+    pub size: usize,
+    pub sha256: [u8; 32],
+    pub signer: Option<[u8; 32]>,
+    pub source: BlobSource,
     pub version: Option<String>,
 }
 
@@ -183,9 +186,9 @@ pub fn open(
 /// existing caps pointing at the prior entry of this name continue
 /// to see the old bytes (RCU grace) until they're dropped.
 pub fn install(
-    name:  &'static str,
+    name: &'static str,
     bytes: &[u8],
-    auth:  &Cap<FirmwareRegistry, Write>,
+    auth: &Cap<FirmwareRegistry, Write>,
 ) -> Result<(), FirmwareError> {
     if auth.check_live().is_err() {
         return Err(FirmwareError::AuthorityRevoked);
@@ -215,9 +218,7 @@ pub fn is_populated() -> bool {
 /// Bootstrap the registry-authority caps. Returns `(write, read)`.
 /// Called once at boot by the trusted bootstrap path. `Read` is
 /// derived from `Write` via the standard cap-rights lattice.
-pub fn bootstrap_authority()
-    -> (Cap<FirmwareRegistry, Write>, Cap<FirmwareRegistry, Read>)
-{
+pub fn bootstrap_authority() -> (Cap<FirmwareRegistry, Write>, Cap<FirmwareRegistry, Read>) {
     let write: Cap<FirmwareRegistry, Write> = Cap::bootstrap();
     let read = write.derive().expect("Read derivation from Write");
     (write, read)
@@ -232,8 +233,8 @@ pub fn bootstrap_authority()
 /// In-kernel callers should NOT touch this static; they bootstrap
 /// their own cap pair via `bootstrap_authority()` and revoke at
 /// will. The static is for the syscall layer only.
-static TRUSTED_LOADER: IrqSafeSpinLock<Option<Cap<FirmwareRegistry, Write>>>
-    = IrqSafeSpinLock::new(None);
+static TRUSTED_LOADER: IrqSafeSpinLock<Option<Cap<FirmwareRegistry, Write>>> =
+    IrqSafeSpinLock::new(None);
 
 /// Install (idempotently) the trusted-loader authority used by the
 /// `sys_firmware_install` syscall. The first caller wins;
@@ -269,9 +270,8 @@ pub fn trusted_loader_authority() -> Option<Cap<FirmwareRegistry, Write>> {
 // (`grant_firmware_authority` / `firmware_authority_of`) replaces
 // them as call sites move over to cap-typed grants.
 
-static LOADER_AUTHORITIES:
-    IrqSafeSpinLock<alloc::vec::Vec<(u64, Cap<FirmwareRegistry, Write>)>>
-    = IrqSafeSpinLock::new(alloc::vec::Vec::new());
+static LOADER_AUTHORITIES: IrqSafeSpinLock<alloc::vec::Vec<(u64, Cap<FirmwareRegistry, Write>)>> =
+    IrqSafeSpinLock::new(alloc::vec::Vec::new());
 
 /// Grant `task_id` a fresh `Cap<FirmwareRegistry, Write>` minted
 /// from the trusted-loader authority. The trap handler for
@@ -298,10 +298,10 @@ pub fn grant_firmware_authority(task_id: u64) -> Cap<FirmwareRegistry, Write> {
 
 /// Borrow `task_id`'s firmware-registry authority cap. `None` if
 /// the task hasn't been granted one (or its grant was revoked).
-pub fn firmware_authority_of(task_id: u64)
-    -> Option<Cap<FirmwareRegistry, Write>>
-{
-    LOADER_AUTHORITIES.lock().iter()
+pub fn firmware_authority_of(task_id: u64) -> Option<Cap<FirmwareRegistry, Write>> {
+    LOADER_AUTHORITIES
+        .lock()
+        .iter()
         .find(|(t, _)| *t == task_id)
         .map(|(_, c)| c.clone())
 }
@@ -329,7 +329,9 @@ pub fn add_trusted_firmware_loader_task(task_id: u64) {
 
 /// `true` if `task_id` holds a live firmware-loader authority.
 pub fn is_trusted_firmware_loader_task(task_id: u64) -> bool {
-    LOADER_AUTHORITIES.lock().iter()
+    LOADER_AUTHORITIES
+        .lock()
+        .iter()
         .any(|(t, c)| *t == task_id && c.check_live().is_ok())
 }
 
@@ -345,10 +347,7 @@ pub fn __reset_trusted_loader_tasks() {
 ///
 /// Bypasses the cap gate (in-tree blobs are kernel-trusted by
 /// definition) but still runs signature verification.
-pub fn register_in_tree(
-    name:  &'static str,
-    bytes: &[u8],
-) -> Result<(), FirmwareError> {
+pub fn register_in_tree(name: &'static str, bytes: &[u8]) -> Result<(), FirmwareError> {
     registry::install_blob(name, bytes, BlobSource::InTree)
 }
 
@@ -363,10 +362,11 @@ pub fn register_in_tree(
 pub fn register_in_tree_bundle(blobs: &[(&'static str, &'static [u8])]) {
     for (name, bytes) in blobs {
         match register_in_tree(name, bytes) {
-            Ok(())  => {}
-            Err(e)  => panic!(
+            Ok(()) => {}
+            Err(e) => panic!(
                 "narf-firmware: in-tree blob {:?} rejected by registry: {:?}",
-                name, e),
+                name, e
+            ),
         }
     }
 }
@@ -390,14 +390,14 @@ pub fn register_initcalls() {
         // we pick up `firmware/*` entries; otherwise no-op.
         let fs = match narf_initramfs::staged() {
             Some(f) => f,
-            None    => return InitResult::NotPresent,
+            None => return InitResult::NotPresent,
         };
         let auth = match trusted_loader_authority() {
             Some(a) => a,
-            None    => return InitResult::Error("no trusted-loader authority"),
+            None => return InitResult::Error("no trusted-loader authority"),
         };
         match scan_initramfs(fs, &auth) {
-            Ok(_)  => InitResult::Ok,
+            Ok(_) => InitResult::Ok,
             Err(_) => InitResult::Error("scan_initramfs failed"),
         }
     });
@@ -441,7 +441,7 @@ pub fn __reset_staged_initramfs() {
 /// surfaces a warning (best-effort; one bad blob doesn't poison
 /// the rest) and decrements the count.
 pub fn scan_initramfs(
-    fs:   &narf_filesystem::Initramfs,
+    fs: &narf_filesystem::Initramfs,
     auth: &Cap<FirmwareRegistry, Write>,
 ) -> Result<usize, FirmwareError> {
     if auth.check_live().is_err() {
@@ -452,13 +452,15 @@ pub fn scan_initramfs(
         // Only entries under `firmware/`.
         let suffix = match name.strip_prefix("firmware/") {
             Some(s) => s,
-            None    => continue,
+            None => continue,
         };
         // Empty suffix or a directory-marker — skip.
-        if suffix.is_empty() { continue; }
+        if suffix.is_empty() {
+            continue;
+        }
         match registry::install_blob(suffix, bytes, BlobSource::Initramfs) {
-            Ok(())  => n_ok += 1,
-            Err(_)  => {
+            Ok(()) => n_ok += 1,
+            Err(_) => {
                 // Best-effort: skip bad blobs without aborting the
                 // rest of the walk. A future iteration may surface
                 // these via the observability layer.
@@ -478,10 +480,10 @@ pub fn scan_initramfs(
 /// is responsible for validating the user-mode pointer + length
 /// against the calling task's address space.
 pub unsafe fn sys_install(
-    name:      &'static str,
+    name: &'static str,
     bytes_ptr: *const u8,
     bytes_len: usize,
-    auth:      &Cap<FirmwareRegistry, Write>,
+    auth: &Cap<FirmwareRegistry, Write>,
 ) -> Result<(), FirmwareError> {
     if auth.check_live().is_err() {
         return Err(FirmwareError::AuthorityRevoked);
@@ -507,9 +509,7 @@ pub fn __seq_next() -> usize {
 
 /// Borrow a blob's view through a previously-issued cap. The view
 /// is valid until the cap is dropped or revoked.
-pub fn view_of<'a>(
-    cap: &'a Cap<FirmwareBlob, Read>,
-) -> Result<BlobView<'a>, FirmwareError> {
+pub fn view_of<'a>(cap: &'a Cap<FirmwareBlob, Read>) -> Result<BlobView<'a>, FirmwareError> {
     if cap.check_live().is_err() {
         return Err(FirmwareError::AuthorityRevoked);
     }

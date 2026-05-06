@@ -52,7 +52,9 @@ pub fn read_cntpct() -> u64 {
 /// subsequent calls.
 pub fn calibrate() -> u64 {
     let cur = FREQ_HZ.load(Ordering::Acquire);
-    if cur != 0 { return cur; }
+    if cur != 0 {
+        return cur;
+    }
     // SAFETY: read of CNTFRQ_EL0 always legal.
     let hz = unsafe { read_cntfrq() } as u64;
     if hz != 0 {
@@ -62,14 +64,20 @@ pub fn calibrate() -> u64 {
 }
 
 /// Cached frequency. 0 if uncalibrated.
-pub fn frequency_hz() -> u64 { FREQ_HZ.load(Ordering::Acquire) }
+pub fn frequency_hz() -> u64 {
+    FREQ_HZ.load(Ordering::Acquire)
+}
 
 /// Convert ticks → ns. 0 if uncalibrated.
 pub fn ticks_to_nanos(ticks: u64) -> u64 {
     let hz = frequency_hz();
-    if hz == 0 { return 0; }
+    if hz == 0 {
+        return 0;
+    }
     ((ticks as u128) * 1_000_000_000 / hz as u128) as u64
 }
 
 #[doc(hidden)]
-pub fn __reset_for_test() { FREQ_HZ.store(0, Ordering::Release); }
+pub fn __reset_for_test() {
+    FREQ_HZ.store(0, Ordering::Release);
+}

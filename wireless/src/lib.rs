@@ -2,19 +2,19 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use async_trait::async_trait;
+use narf_capabilities::{Cap, Grant, Read, Write};
 use narf_net::Interface;
-use narf_capabilities::{Cap, Read, Write, Grant};
 
 pub mod caps;
 pub mod iface;
-pub mod scan;
 pub mod reg;
+pub mod scan;
 
-pub use iface::{WirelessIface, WirelessIfaceInfo, WirelessError};
-pub use scan::{ScanRequest, ScanResult, BssInfo};
+pub use iface::{WirelessError, WirelessIface, WirelessIfaceInfo};
+pub use scan::{BssInfo, ScanRequest, ScanResult};
 
 /// Capability for wireless-specific operations.
 pub enum WirelessRight {
@@ -69,11 +69,12 @@ pub struct WirelessConfig {
 
 pub mod registry {
     use super::*;
-    use narf_lib::sync::IrqSafeSpinLock;
-    use alloc::vec::Vec;
     use alloc::sync::Arc;
+    use alloc::vec::Vec;
+    use narf_lib::sync::IrqSafeSpinLock;
 
-    static REGISTRY: IrqSafeSpinLock<Vec<Arc<dyn WirelessNetIface>>> = IrqSafeSpinLock::new(Vec::new());
+    static REGISTRY: IrqSafeSpinLock<Vec<Arc<dyn WirelessNetIface>>> =
+        IrqSafeSpinLock::new(Vec::new());
 
     pub fn register(iface: Arc<dyn WirelessNetIface>) {
         REGISTRY.lock().push(iface);
@@ -92,12 +93,12 @@ pub fn register_initcalls() {}
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests {
     use super::*;
-    use narf_kernel_test::{kernel_test_in, TestResult};
-    use narf_net::{Frame, RX_RING_N, TX_RING_N};
-    use narf_ipc::{Consumer, Producer};
-    use narf_lib::sync::IrqSafeSpinLock;
-    use core::sync::atomic::{AtomicBool, Ordering};
     use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use narf_ipc::{Consumer, Producer};
+    use narf_kernel_test::{kernel_test_in, TestResult};
+    use narf_lib::sync::IrqSafeSpinLock;
+    use narf_net::{Frame, RX_RING_N, TX_RING_N};
 
     struct MockWireless {
         is_scanning: AtomicBool,
@@ -118,12 +119,24 @@ mod tests {
     }
 
     impl Interface for MockWireless {
-        fn name(&self) -> &str { "wlan0" }
-        fn mac(&self) -> [u8; 6] { [0; 6] }
-        fn mtu(&self) -> u32 { 1500 }
-        fn link_up(&self) -> bool { true }
-        fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> { &self.rx }
-        fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> { &self.tx }
+        fn name(&self) -> &str {
+            "wlan0"
+        }
+        fn mac(&self) -> [u8; 6] {
+            [0; 6]
+        }
+        fn mtu(&self) -> u32 {
+            1500
+        }
+        fn link_up(&self) -> bool {
+            true
+        }
+        fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+            &self.rx
+        }
+        fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+            &self.tx
+        }
     }
 
     #[async_trait]
@@ -181,7 +194,13 @@ mod tests {
         let m1 = mock.clone();
         let s = success.clone();
         narf_scheduler::spawn(async move {
-            let res = m1.scan(ScanRequest { ssids: Vec::new(), channels: Vec::new(), active: true }).await;
+            let res = m1
+                .scan(ScanRequest {
+                    ssids: Vec::new(),
+                    channels: Vec::new(),
+                    active: true,
+                })
+                .await;
             if res.is_ok() && res.unwrap().len() == 1 {
                 s.store(true, Ordering::SeqCst);
             }
@@ -190,8 +209,11 @@ mod tests {
         // We can't easily test the "Busy" error here because spawn order is deterministic in this scheduler
         // and we only have one CPU. But we can verify the scan completes.
         narf_scheduler::run_until_empty();
-        if success.load(Ordering::SeqCst) { TestResult::Pass }
-        else { TestResult::Fail("scan failed") }
+        if success.load(Ordering::SeqCst) {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("scan failed")
+        }
     }
     kernel_test_in!("wireless", smoke_wireless_scan_busy_logic);
 
@@ -219,8 +241,11 @@ mod tests {
         });
 
         narf_scheduler::run_until_empty();
-        if success.load(Ordering::SeqCst) { TestResult::Pass }
-        else { TestResult::Fail("association state cycle failed") }
+        if success.load(Ordering::SeqCst) {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("association state cycle failed")
+        }
     }
     kernel_test_in!("wireless", smoke_wireless_association_state);
 }

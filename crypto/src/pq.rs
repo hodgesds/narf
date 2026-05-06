@@ -58,17 +58,21 @@ pub enum HybridMode {
 /// Runtime FIPS-mode flag. Stage-4 stays `false`; a future
 /// FIPS-enabled build flips this after primitives are validated.
 #[inline]
-pub const fn fips_mode() -> bool { false }
+pub const fn fips_mode() -> bool {
+    false
+}
 
 /// Is `alg` permitted in the current FIPS posture? Stage-4 returns
 /// `true` for every algorithm because `fips_mode()` is `false`; in
 /// a FIPS build this gates non-validated algorithms.
 #[inline]
 pub const fn fips_allowed(alg: PqAlg) -> bool {
-    if !fips_mode() { return true; }
+    if !fips_mode() {
+        return true;
+    }
     match alg {
-        PqAlg::MlKem768   => true,
-        PqAlg::MlDsa65    => true,
+        PqAlg::MlKem768 => true,
+        PqAlg::MlDsa65 => true,
         PqAlg::SphincsPlus => true,
     }
 }

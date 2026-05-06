@@ -13,9 +13,7 @@
 
 use alloc::boxed::Box;
 
-use narf_ipc::shared_ring::{
-    SharedConsumer, SharedProducer, TrySendError,
-};
+use narf_ipc::shared_ring::{SharedConsumer, SharedProducer, TrySendError};
 
 use crate::cmd_ring::{self, DrawCmd, DrawRing, RING_DEPTH};
 use crate::Rect;
@@ -40,16 +38,12 @@ impl FbClient {
     /// Enqueue a Fill command. Returns `Err(Full(_))` when the
     /// ring is at capacity; the caller is expected to retry after
     /// the consumer drains.
-    pub fn fill(&mut self, rect: Rect, pixel: u32)
-        -> Result<(), TrySendError<DrawCmd>>
-    {
+    pub fn fill(&mut self, rect: Rect, pixel: u32) -> Result<(), TrySendError<DrawCmd>> {
         self.producer.try_send(DrawCmd::fill(rect, pixel))
     }
 
     /// Enqueue a Flush.
-    pub fn flush(&mut self, rect: Rect)
-        -> Result<(), TrySendError<DrawCmd>>
-    {
+    pub fn flush(&mut self, rect: Rect) -> Result<(), TrySendError<DrawCmd>> {
         self.producer.try_send(DrawCmd::flush(rect))
     }
 }
@@ -61,20 +55,20 @@ impl FbClient {
 ///
 /// # Safety
 /// SPSC contract — only one producer + consumer per ring.
-pub unsafe fn allocate_singleton_ring()
-    -> (
-        Box<DrawRing>,
-        SharedProducer<DrawCmd, RING_DEPTH>,
-        SharedConsumer<DrawCmd, RING_DEPTH>,
-    )
-{
+pub unsafe fn allocate_singleton_ring() -> (
+    Box<DrawRing>,
+    SharedProducer<DrawCmd, RING_DEPTH>,
+    SharedConsumer<DrawCmd, RING_DEPTH>,
+) {
     // SAFETY: SharedRing is repr(C) of u32 atomics + a slot array;
     // zero-init is the canonical "fresh ring" state.
     let mut ring: Box<DrawRing> = Box::new(unsafe { core::mem::zeroed() });
     let ptr: *mut DrawRing = &mut *ring;
     // SAFETY: ptr points at a fresh, zero-initialised DrawRing
     // sized for SharedRing<DrawCmd, 16>.
-    unsafe { cmd_ring::init_in(ptr); }
+    unsafe {
+        cmd_ring::init_in(ptr);
+    }
     // SAFETY: SPSC invariant — caller asserts no other halves
     // exist for this ring.
     let (p, c) = unsafe { cmd_ring::split(ptr) };

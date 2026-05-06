@@ -9,22 +9,26 @@
 //! the lifecycle of in-flight requests and completion signaling back
 //! through the ring.
 
-use alloc::sync::Arc;
-use narf_ipc::{Producer, Consumer};
-use narf_block::{BlockRequest, BlockCompletion, BlockDevice};
 use crate::blk::VirtioBlkDevice;
+use alloc::sync::Arc;
+use narf_block::{BlockCompletion, BlockDevice, BlockRequest};
+use narf_ipc::{Consumer, Producer};
 
 /// A server task that bridges a Narf-Ring to a VirtIO block device.
 #[derive(Debug)]
 pub struct VirtioBlkServer<const N: usize> {
     device: Arc<VirtioBlkDevice>,
-    rx:     Consumer<BlockRequest, N>,
-    tx:     Producer<BlockCompletion, N>,
+    rx: Consumer<BlockRequest, N>,
+    tx: Producer<BlockCompletion, N>,
 }
 
 impl<const N: usize> VirtioBlkServer<N> {
     /// Create a new server.
-    pub fn new(device: Arc<VirtioBlkDevice>, rx: Consumer<BlockRequest, N>, tx: Producer<BlockCompletion, N>) -> Self {
+    pub fn new(
+        device: Arc<VirtioBlkDevice>,
+        rx: Consumer<BlockRequest, N>,
+        tx: Producer<BlockCompletion, N>,
+    ) -> Self {
         Self { device, rx, tx }
     }
 

@@ -40,18 +40,16 @@ pub trait BlockDeviceSync: Send + Sync {
     /// Total capacity in LBAs.
     fn capacity(&self) -> u64;
     /// Read `n_blocks` LBAs starting at `lba` into `out`.
-    fn read(&self, lba: u64, n_blocks: u16, out: &mut [u8])
-        -> Result<(), BlockIoError>;
+    fn read(&self, lba: u64, n_blocks: u16, out: &mut [u8]) -> Result<(), BlockIoError>;
     /// Write `n_blocks` LBAs starting at `lba` from `data`.
-    fn write(&self, lba: u64, n_blocks: u16, data: &[u8])
-        -> Result<(), BlockIoError>;
+    fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), BlockIoError>;
 }
 
 /// One registered block device.
 #[derive(Clone)]
 pub struct RegisteredBlockDevice {
     pub name: &'static str,
-    pub dev:  Arc<dyn BlockDeviceSync>,
+    pub dev: Arc<dyn BlockDeviceSync>,
 }
 
 impl core::fmt::Debug for RegisteredBlockDevice {
@@ -62,8 +60,7 @@ impl core::fmt::Debug for RegisteredBlockDevice {
     }
 }
 
-static REGISTRY: IrqSafeSpinLock<Vec<RegisteredBlockDevice>> =
-    IrqSafeSpinLock::new(Vec::new());
+static REGISTRY: IrqSafeSpinLock<Vec<RegisteredBlockDevice>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Register a block device. Idempotent on `name` — re-registering
 /// replaces the prior entry so a driver can re-bring-up itself
@@ -83,11 +80,17 @@ pub fn block_devices() -> Vec<RegisteredBlockDevice> {
 }
 
 /// Number of registered block devices.
-pub fn block_device_count() -> usize { REGISTRY.lock().len() }
+pub fn block_device_count() -> usize {
+    REGISTRY.lock().len()
+}
 
 /// Look up a device by name.
 pub fn find_block_device(name: &str) -> Option<Arc<dyn BlockDeviceSync>> {
-    REGISTRY.lock().iter().find(|e| e.name == name).map(|e| e.dev.clone())
+    REGISTRY
+        .lock()
+        .iter()
+        .find(|e| e.name == name)
+        .map(|e| e.dev.clone())
 }
 
 /// Test-only reset.

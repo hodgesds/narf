@@ -42,24 +42,24 @@
 use crate::dp_aux::{AuxChannel, AuxError};
 
 // DPCD register addresses we touch (DPCD §3.3).
-const DPCD_LINK_BW_SET:                 u32 = 0x0_0100;
-const DPCD_LANE_COUNT_SET:              u32 = 0x0_0101;
-const DPCD_TRAINING_PATTERN_SET:        u32 = 0x0_0102;
-const DPCD_TRAINING_LANE0_SET:          u32 = 0x0_0103;
-const DPCD_LANE0_1_STATUS:              u32 = 0x0_0202;
-const DPCD_LANE2_3_STATUS:              u32 = 0x0_0203;
-const DPCD_LANE_ALIGN_STATUS_UPDATED:   u32 = 0x0_0204;
+const DPCD_LINK_BW_SET: u32 = 0x0_0100;
+const DPCD_LANE_COUNT_SET: u32 = 0x0_0101;
+const DPCD_TRAINING_PATTERN_SET: u32 = 0x0_0102;
+const DPCD_TRAINING_LANE0_SET: u32 = 0x0_0103;
+const DPCD_LANE0_1_STATUS: u32 = 0x0_0202;
+const DPCD_LANE2_3_STATUS: u32 = 0x0_0203;
+const DPCD_LANE_ALIGN_STATUS_UPDATED: u32 = 0x0_0204;
 
 /// Training pattern slot values per DPCD `TRAINING_PATTERN_SET`.
 #[allow(dead_code)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TrainingPattern {
-    None  = 0,
-    Tps1  = 1,
-    Tps2  = 2,
-    Tps3  = 3,
-    Tps4  = 7,
+    None = 0,
+    Tps1 = 1,
+    Tps2 = 2,
+    Tps3 = 3,
+    Tps4 = 7,
 }
 
 /// Link-training state.
@@ -82,7 +82,7 @@ pub enum TrainingState {
 /// each lane has 4 swing levels (0..3) and 4 pre-emp levels.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct LaneTune {
-    pub swing:    u8,
+    pub swing: u8,
     pub pre_emph: u8,
 }
 
@@ -97,7 +97,7 @@ pub struct TrainingParams {
     pub link_bw_set: u8,
     /// Lane count: 1, 2, or 4. DPCD bits[4:0]. Bit 7 (enhanced
     /// framing) is OR'd in by the state machine.
-    pub lane_count:  u8,
+    pub lane_count: u8,
 }
 
 /// DP link-rate codes per DPCD §3.3.5. Ordered low → high so
@@ -107,9 +107,9 @@ pub struct TrainingParams {
 pub enum LinkRate {
     /// 1.62 Gbps per lane — RBR (Reduced Bit Rate). Mandatory
     /// floor; DP 1.0 baseline.
-    Rbr  = 0x06,
+    Rbr = 0x06,
     /// 2.7 Gbps — HBR.
-    Hbr  = 0x0A,
+    Hbr = 0x0A,
     /// 5.4 Gbps — HBR2.
     Hbr2 = 0x14,
     /// 8.1 Gbps — HBR3.
@@ -123,7 +123,7 @@ impl LinkRate {
             0x0A => Some(LinkRate::Hbr),
             0x14 => Some(LinkRate::Hbr2),
             0x1E => Some(LinkRate::Hbr3),
-            _    => None,
+            _ => None,
         }
     }
     /// One step lower on the fallback ladder. RBR has no lower
@@ -132,8 +132,8 @@ impl LinkRate {
         match self {
             LinkRate::Hbr3 => Some(LinkRate::Hbr2),
             LinkRate::Hbr2 => Some(LinkRate::Hbr),
-            LinkRate::Hbr  => Some(LinkRate::Rbr),
-            LinkRate::Rbr  => None,
+            LinkRate::Hbr => Some(LinkRate::Rbr),
+            LinkRate::Rbr => None,
         }
     }
 }
@@ -145,17 +145,25 @@ impl LinkRate {
 /// (caller programs DCN with these), or `Failed` after the full
 /// ladder bottoms out.
 pub fn run_with_fallback<A: AuxChannel>(
-    aux:        &mut A,
+    aux: &mut A,
     initial_bw: LinkRate,
     initial_lanes: u8,
-    delay_us:   impl Fn(u32) + Copy,
+    delay_us: impl Fn(u32) + Copy,
 ) -> Result<TrainingParams, AuxError> {
-    let mut bw    = initial_bw;
-    let mut lanes = match initial_lanes { 1 | 2 | 4 => initial_lanes, _ => return Ok(TrainingParams { link_bw_set: bw as u8, lane_count: 0 }) };
+    let mut bw = initial_bw;
+    let mut lanes = match initial_lanes {
+        1 | 2 | 4 => initial_lanes,
+        _ => {
+            return Ok(TrainingParams {
+                link_bw_set: bw as u8,
+                lane_count: 0,
+            })
+        }
+    };
     loop {
         let params = TrainingParams {
             link_bw_set: bw as u8,
-            lane_count:  lanes,
+            lane_count: lanes,
         };
         match run(aux, params, delay_us)? {
             TrainingState::Trained => return Ok(params),
@@ -174,7 +182,8 @@ pub fn run_with_fallback<A: AuxChannel>(
                 }
                 // Single lane at RBR has nowhere lower to go.
                 return Ok(TrainingParams {
-                    link_bw_set: 0, lane_count: 0,
+                    link_bw_set: 0,
+                    lane_count: 0,
                 });
             }
         }
@@ -192,8 +201,8 @@ pub fn run_with_fallback<A: AuxChannel>(
 /// adjustments. Stage-5 callers typically pass a busy-loop
 /// closure; later transport layers can wire timer-based sleeps.
 pub fn run<A: AuxChannel>(
-    aux:      &mut A,
-    params:   TrainingParams,
+    aux: &mut A,
+    params: TrainingParams,
     delay_us: impl Fn(u32),
 ) -> Result<TrainingState, AuxError> {
     // Step 1: program LINK_BW_SET + LANE_COUNT_SET. Bit 7 of
@@ -225,7 +234,9 @@ pub fn run<A: AuxChannel>(
         // reached CR yet, capped at 3 (MAX_LEVEL).
         for (i, t) in tunes.iter_mut().enumerate().take(n_lanes) {
             if !cr_done_lane(&status, i) {
-                if t.swing >= 3 { return Ok(TrainingState::Failed); }
+                if t.swing >= 3 {
+                    return Ok(TrainingState::Failed);
+                }
                 t.swing += 1;
             }
         }
@@ -246,7 +257,7 @@ pub fn run<A: AuxChannel>(
     for _ in 0..MAX_RETRIES_PER_PHASE {
         delay_us(400); // EQ phase settling: 400 µs per spec.
         let status = read_lane_status(aux)?;
-        let align  = aux_read_one(aux, DPCD_LANE_ALIGN_STATUS_UPDATED)?;
+        let align = aux_read_one(aux, DPCD_LANE_ALIGN_STATUS_UPDATED)?;
         if all_eq_done(&status, n_lanes) && (align & 1) != 0 {
             eq_state = TrainingState::Trained;
             break;
@@ -255,7 +266,9 @@ pub fn run<A: AuxChannel>(
         // reached symbol-lock.
         for (i, t) in tunes.iter_mut().enumerate().take(n_lanes) {
             if !eq_done_lane(&status, i) {
-                if t.pre_emph >= 3 { return Ok(TrainingState::Failed); }
+                if t.pre_emph >= 3 {
+                    return Ok(TrainingState::Failed);
+                }
                 t.pre_emph += 1;
             }
         }
@@ -270,9 +283,7 @@ pub fn run<A: AuxChannel>(
 
 /// Encode + write per-lane tune values. DPCD `TRAINING_LANE0_SET`
 /// is one byte per lane: bits[1:0] = swing, bits[4:3] = pre-emph.
-fn write_lane_tunes<A: AuxChannel>(aux: &mut A, tunes: &[LaneTune])
-    -> Result<(), AuxError>
-{
+fn write_lane_tunes<A: AuxChannel>(aux: &mut A, tunes: &[LaneTune]) -> Result<(), AuxError> {
     let mut bytes = [0u8; MAX_LANES];
     for (i, t) in tunes.iter().enumerate() {
         bytes[i] = (t.swing & 0x3)
@@ -306,7 +317,11 @@ fn aux_read_one<A: AuxChannel>(aux: &mut A, addr: u32) -> Result<u8, AuxError> {
 ///   bit 3: reserved
 fn lane_nibble(status: &[u8; 2], lane: usize) -> u8 {
     let byte = status[lane / 2];
-    if lane & 1 == 0 { byte & 0x0F } else { (byte >> 4) & 0x0F }
+    if lane & 1 == 0 {
+        byte & 0x0F
+    } else {
+        (byte >> 4) & 0x0F
+    }
 }
 
 fn cr_done_lane(status: &[u8; 2], lane: usize) -> bool {

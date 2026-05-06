@@ -57,31 +57,38 @@ pub const MAX_USER_COPY: usize = 4096;
 ///   future M2 hardening pass adds an RCU read-side critical
 ///   section around the region check + copy.
 pub unsafe fn copy_in(va: u64, dst: &mut [u8]) -> Result<(), UserPtrError> {
-    if dst.is_empty() { return Ok(()); }
+    if dst.is_empty() {
+        return Ok(());
+    }
     if dst.len() > MAX_USER_COPY {
         return Err(UserPtrError::Invalid);
     }
     if va == 0 {
         return Err(UserPtrError::Invalid);
     }
-    let end = va.checked_add(dst.len() as u64).ok_or(UserPtrError::Invalid)?;
+    let end = va
+        .checked_add(dst.len() as u64)
+        .ok_or(UserPtrError::Invalid)?;
     // Refuse anything in canonical-high-half (kernel) territory.
     if va >= 0xFFFF_8000_0000_0000 || end > 0xFFFF_8000_0000_0000 {
         return Err(UserPtrError::Invalid);
     }
 
-    let as_arc: Arc<AddressSpace> = narf_userspace::active_user_as()
-        .ok_or(UserPtrError::NoActiveAs)?;
+    let as_arc: Arc<AddressSpace> =
+        narf_userspace::active_user_as().ok_or(UserPtrError::NoActiveAs)?;
 
     // Find the region containing `va`. The buffer must fit inside
     // a single region; cross-region reads are refused at this
     // level. (A real M1 walker stitches them when needed.)
-    let region = as_arc.lookup(VirtAddr::new(va))
+    let region = as_arc
+        .lookup(VirtAddr::new(va))
         .ok_or(UserPtrError::Inaccessible)?;
     if !region.perms.contains(RegionPerms::READ) {
         return Err(UserPtrError::Inaccessible);
     }
-    let region_end = region.base.as_u64()
+    let region_end = region
+        .base
+        .as_u64()
         .checked_add(region.len)
         .ok_or(UserPtrError::Inaccessible)?;
     if end > region_end {
@@ -92,11 +99,7 @@ pub unsafe fn copy_in(va: u64, dst: &mut [u8]) -> Result<(), UserPtrError> {
     // documented on the function. Identity-mapped low-4-GiB or the
     // region's user mapping makes the read reach the backing pages.
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            va as *const u8,
-            dst.as_mut_ptr(),
-            dst.len(),
-        );
+        core::ptr::copy_nonoverlapping(va as *const u8, dst.as_mut_ptr(), dst.len());
     }
     Ok(())
 }

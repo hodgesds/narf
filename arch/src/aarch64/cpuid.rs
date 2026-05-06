@@ -49,7 +49,7 @@ impl Features {
         let isar1 = read_id_aa64isar1();
         f.pauth = ((isar1 >> 4) & 0xF) != 0 || ((isar1 >> 8) & 0xF) != 0;
 
-        f.generic_timer = true;  // ARMv8+ always provides CNTPCT/CNTFRQ.
+        f.generic_timer = true; // ARMv8+ always provides CNTPCT/CNTFRQ.
         f
     }
 }

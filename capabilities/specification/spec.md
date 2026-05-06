@@ -152,9 +152,13 @@ pub enum CapKind {
     Timer                = 0x0086,
     DevicePm             = 0x0087,    // per-device runtime PM — power/ §5
     Governor             = 0x0088,    // pluggable frequency governor — power/ §3.2
+    PmBus                = 0x0089,    // ATX 3.x telemetry — pmbus/
 
     // RCU
     SleepableReader      = 0x0090,
+
+    // SCMI
+    Scmi                 = 0x00B0,
 
     // Process / governance
     Process              = 0x00A0,

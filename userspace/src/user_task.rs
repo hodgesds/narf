@@ -44,7 +44,9 @@ pub use narf_scheduler::UserState;
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct UserState {
-    pub pc: u64, pub sp: u64, pub spsr: u64,
+    pub pc: u64,
+    pub sp: u64,
+    pub spsr: u64,
     pub x: [u64; 31],
 }
 
@@ -72,11 +74,11 @@ pub enum UserExit {
 /// Callers cast as appropriate.
 #[repr(C)]
 pub struct UserTaskCtx {
-    pub state:        UnsafeCell<UserState>,
+    pub state: UnsafeCell<UserState>,
     pub arch_jmp_buf: UnsafeCell<[u64; 8]>,
     /// Cell used by the trap handler to signal *why* it longjmp'd.
     /// Polling routine reads this after setjmp returns non-zero.
-    pub exit_reason:  UnsafeCell<u32>,
+    pub exit_reason: UnsafeCell<u32>,
 }
 
 // SAFETY: cells are accessed only from the polling routine and
@@ -90,9 +92,9 @@ impl UserTaskCtx {
     /// Construct a fresh context with all state zeroed.
     pub fn new() -> Self {
         Self {
-            state:        UnsafeCell::new(UserState::default()),
+            state: UnsafeCell::new(UserState::default()),
             arch_jmp_buf: UnsafeCell::new([0; 8]),
-            exit_reason:  UnsafeCell::new(0),
+            exit_reason: UnsafeCell::new(0),
         }
     }
 }
@@ -107,7 +109,7 @@ impl core::fmt::Debug for UserTaskCtx {
 // the polling routine reads. `0` is reserved for "not set" so a
 // stale slot can't masquerade as a real exit.
 pub const EXIT_REASON_YIELDED: u32 = 1;
-pub const EXIT_REASON_EXITED:  u32 = 2;
+pub const EXIT_REASON_EXITED: u32 = 2;
 
 /// Single-task slot the polling routine populates before transitioning
 /// to user mode. Trap handlers consult this to find the calling
@@ -134,7 +136,11 @@ pub fn clear_current() {
 /// `UserTaskCtx`, or `None` if no polling routine is in flight.
 pub fn current_user_task() -> Option<*mut UserTaskCtx> {
     let p = CURRENT.load(Ordering::Acquire);
-    if p.is_null() { None } else { Some(p) }
+    if p.is_null() {
+        None
+    } else {
+        Some(p)
+    }
 }
 
 // ── Polling-routine hooks ─────────────────────────────────────────
@@ -154,7 +160,7 @@ pub fn current_user_task() -> Option<*mut UserTaskCtx> {
 type ExitHook = unsafe fn(*mut UserTaskCtx) -> !;
 
 static YIELD_HOOK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
-static EXIT_HOOK:  AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+static EXIT_HOOK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Install the `Yield`-from-user-mode hook. Call once at boot per
 /// CPU's polling executor.
@@ -218,13 +224,21 @@ pub fn __test_clear_hooks() {
 #[inline]
 pub(crate) fn yield_hook() -> Option<ExitHook> {
     let p = YIELD_HOOK.load(Ordering::Acquire);
-    if p.is_null() { None } else { Some(unsafe { core::mem::transmute::<*mut (), ExitHook>(p) }) }
+    if p.is_null() {
+        None
+    } else {
+        Some(unsafe { core::mem::transmute::<*mut (), ExitHook>(p) })
+    }
 }
 
 #[inline]
 pub(crate) fn exit_hook() -> Option<ExitHook> {
     let p = EXIT_HOOK.load(Ordering::Acquire);
-    if p.is_null() { None } else { Some(unsafe { core::mem::transmute::<*mut (), ExitHook>(p) }) }
+    if p.is_null() {
+        None
+    } else {
+        Some(unsafe { core::mem::transmute::<*mut (), ExitHook>(p) })
+    }
 }
 
 // ── UserTaskFuture ────────────────────────────────────────────────
@@ -332,9 +346,9 @@ pub fn install_user_task_hooks() {}
 #[cfg(target_arch = "x86_64")]
 pub struct UserTaskFuture {
     process: crate::UserProcess,
-    ctx:     UserTaskCtx,
-    jmp:     UnsafeCell<JmpBuf>,
-    state:   TaskState,
+    ctx: UserTaskCtx,
+    jmp: UnsafeCell<JmpBuf>,
+    state: TaskState,
     /// Snapshot of the kernel's CR3 captured on the first poll so
     /// we can restore it on the return path. `None` until the first
     /// poll runs.
@@ -345,7 +359,7 @@ pub struct UserTaskFuture {
 impl core::fmt::Debug for UserTaskFuture {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("UserTaskFuture")
-            .field("pid",   &self.process.pid)
+            .field("pid", &self.process.pid)
             .field("state", &self.state)
             .finish_non_exhaustive()
     }
@@ -369,18 +383,22 @@ impl UserTaskFuture {
     pub fn new(process: crate::UserProcess) -> Self {
         Self {
             process,
-            ctx:       UserTaskCtx::new(),
-            jmp:       UnsafeCell::new(JmpBuf::default()),
-            state:     TaskState::Initial,
+            ctx: UserTaskCtx::new(),
+            jmp: UnsafeCell::new(JmpBuf::default()),
+            state: TaskState::Initial,
             saved_cr3: core::cell::Cell::new(None),
         }
     }
 
     /// Borrow the inner process — useful for inspection from tests.
-    pub fn process(&self) -> &crate::UserProcess { &self.process }
+    pub fn process(&self) -> &crate::UserProcess {
+        &self.process
+    }
 
     /// Inspect the current lifecycle stamp.
-    pub fn task_state(&self) -> TaskState { self.state }
+    pub fn task_state(&self) -> TaskState {
+        self.state
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -444,7 +462,9 @@ impl core::future::Future for UserTaskFuture {
             // CPL=0 long-mode; `fs_base` is a canonical user vaddr
             // (came from `stage_tls` which mapped a region in the
             // low-half user range).
-            unsafe { narf_scheduler::set_user_fs_base(fs_base); }
+            unsafe {
+                narf_scheduler::set_user_fs_base(fs_base);
+            }
         }
 
         // Interrupts off across the iretq. The trap handler
@@ -453,7 +473,9 @@ impl core::future::Future for UserTaskFuture {
         // timer → leaving IF=1 turns the next halt_until_irq into a
         // wedge" rationale captured in commit 401b073).
         // SAFETY: cli has no memory effect.
-        unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)); }
+        unsafe {
+            core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+        }
 
         // setjmp. On the initial call returns 0; the hooks longjmp
         // back here with a non-zero EXIT_REASON_*.
@@ -467,8 +489,8 @@ impl core::future::Future for UserTaskFuture {
             match this.state {
                 TaskState::Initial => {
                     this.state = TaskState::Running;
-                    let entry  = this.process.entry.0.as_u64();
-                    let rsp    = this.process.stack_top.as_u64();
+                    let entry = this.process.entry.0.as_u64();
+                    let rsp = this.process.stack_top.as_u64();
                     // SAFETY: the AS is activated and the user
                     // mappings cover entry + rsp by construction
                     // (load_user_process_with mapped them). Never
@@ -481,9 +503,7 @@ impl core::future::Future for UserTaskFuture {
                     // The AS is re-activated and the kernel state
                     // (TSS rsp0, GS) is still correct from the
                     // first entry.
-                    unsafe {
-                        narf_scheduler::enter_user_mode_resume(this.ctx.state.get())
-                    }
+                    unsafe { narf_scheduler::enter_user_mode_resume(this.ctx.state.get()) }
                 }
                 TaskState::Exited => unreachable!("guarded above"),
             }
@@ -541,17 +561,24 @@ impl core::future::Future for UserTaskFuture {
 /// save/restore primitives.
 #[cfg(not(target_arch = "x86_64"))]
 #[derive(Debug)]
-pub struct UserTaskFuture { _process: crate::UserProcess }
+pub struct UserTaskFuture {
+    _process: crate::UserProcess,
+}
 
 #[cfg(not(target_arch = "x86_64"))]
 impl UserTaskFuture {
-    pub fn new(process: crate::UserProcess) -> Self { Self { _process: process } }
+    pub fn new(process: crate::UserProcess) -> Self {
+        Self { _process: process }
+    }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
 impl core::future::Future for UserTaskFuture {
     type Output = ();
-    fn poll(self: core::pin::Pin<&mut Self>, _cx: &mut core::task::Context<'_>) -> core::task::Poll<()> {
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        _cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<()> {
         // aarch64 polling round-trip not yet implemented.
         core::task::Poll::Ready(())
     }

@@ -17,14 +17,14 @@ pub enum CacheKind {
 
 #[derive(Copy, Clone, Debug)]
 pub struct CacheLevel {
-    pub level:            u8,
-    pub kind:             CacheKind,
-    pub line_bytes:       u16,
-    pub partitions:       u16,
-    pub ways:             u16,
-    pub sets:             u32,
-    pub size_bytes:       u32,
-    pub fully_assoc:      bool,
+    pub level: u8,
+    pub kind: CacheKind,
+    pub line_bytes: u16,
+    pub partitions: u16,
+    pub ways: u16,
+    pub sets: u32,
+    pub size_bytes: u32,
+    pub fully_assoc: bool,
     pub apic_ids_sharing: u16,
 }
 
@@ -36,23 +36,24 @@ fn decode(eax: u32, ebx: u32, ecx: u32) -> Option<CacheLevel> {
         3 => CacheKind::Unified,
         _ => return None,
     };
-    let level      = ((eax >> 5) & 0x7) as u8;
-    let fully_assoc= eax & (1 << 9) != 0;
-    let sharing    = (((eax >> 14) & 0xFFF) + 1) as u16;
-    let line       = ((ebx & 0xFFF) + 1) as u16;
-    let parts      = (((ebx >> 12) & 0x3FF) + 1) as u16;
-    let ways       = (((ebx >> 22) & 0x3FF) + 1) as u16;
-    let sets       = ecx + 1;
-    let size       = (line as u32) * (parts as u32) * (ways as u32) * sets;
+    let level = ((eax >> 5) & 0x7) as u8;
+    let fully_assoc = eax & (1 << 9) != 0;
+    let sharing = (((eax >> 14) & 0xFFF) + 1) as u16;
+    let line = ((ebx & 0xFFF) + 1) as u16;
+    let parts = (((ebx >> 12) & 0x3FF) + 1) as u16;
+    let ways = (((ebx >> 22) & 0x3FF) + 1) as u16;
+    let sets = ecx + 1;
+    let size = (line as u32) * (parts as u32) * (ways as u32) * sets;
     Some(CacheLevel {
-        level, kind,
-        line_bytes:        line,
-        partitions:        parts,
+        level,
+        kind,
+        line_bytes: line,
+        partitions: parts,
         ways,
         sets,
-        size_bytes:        size,
+        size_bytes: size,
         fully_assoc,
-        apic_ids_sharing:  sharing,
+        apic_ids_sharing: sharing,
     })
 }
 
@@ -69,9 +70,11 @@ pub fn levels<F: FnMut(CacheLevel)>(mut f: F) {
         let (eax, ebx, ecx, _) = unsafe { cpuid(leaf, sub) };
         match decode(eax, ebx, ecx) {
             Some(c) => f(c),
-            None    => break,
+            None => break,
         }
         sub += 1;
-        if sub > 16 { break; }       // architectural soft cap
+        if sub > 16 {
+            break;
+        } // architectural soft cap
     }
 }

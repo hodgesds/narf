@@ -55,11 +55,9 @@ pub mod sleepable;
 mod tests;
 
 pub use batched::{BatchedReclaimer, ReclaimBatch, BATCH_CAP};
-pub use hazard::{HazardDomain, HazardGuard, HazardSlot, retire};
+pub use hazard::{retire, HazardDomain, HazardGuard, HazardSlot};
 pub use policy::ReclamationPolicy;
-pub use sleepable::{
-    SleepableGuard, SleepableReader, SleepableScope, SleepableSync, SyncOutcome,
-};
+pub use sleepable::{SleepableGuard, SleepableReader, SleepableScope, SleepableSync, SyncOutcome};
 
 use alloc::boxed::Box;
 use core::marker::PhantomData;
@@ -91,7 +89,9 @@ impl<T: Send + 'static> Owned<T> {
     /// Allocate a new `Owned<T>`. Currently backed by `Box`.
     pub fn new(value: T) -> Self {
         let boxed = Box::new(value);
-        Self { ptr: Box::into_raw(boxed) }
+        Self {
+            ptr: Box::into_raw(boxed),
+        }
     }
 
     /// Raw pointer — `Atomic<T>::store` consumes this.
@@ -108,7 +108,9 @@ impl<T: Send + 'static> Drop for Owned<T> {
         if !self.ptr.is_null() {
             // SAFETY: `ptr` was produced by `Box::into_raw`; we restore
             // the Box so its destructor runs.
-            unsafe { drop(Box::from_raw(self.ptr)); }
+            unsafe {
+                drop(Box::from_raw(self.ptr));
+            }
         }
     }
 }
@@ -118,7 +120,7 @@ impl<T: Send + 'static> Drop for Owned<T> {
 #[derive(Copy, Clone)]
 pub struct Shared<'g, T: 'static> {
     ptr: *const T,
-    _g:  PhantomData<&'g ()>,
+    _g: PhantomData<&'g ()>,
 }
 
 impl<'g, T> core::fmt::Debug for Shared<'g, T> {
@@ -131,18 +133,29 @@ impl<'g, T> core::fmt::Debug for Shared<'g, T> {
 
 impl<'g, T: 'static> Shared<'g, T> {
     /// Null shared pointer — the empty-cell reading.
-    pub fn null() -> Self { Self { ptr: core::ptr::null(), _g: PhantomData } }
+    pub fn null() -> Self {
+        Self {
+            ptr: core::ptr::null(),
+            _g: PhantomData,
+        }
+    }
 
     /// Whether the cell was empty.
-    pub fn is_null(&self) -> bool { self.ptr.is_null() }
+    pub fn is_null(&self) -> bool {
+        self.ptr.is_null()
+    }
 
     /// Safe dereference — lifetime tied to `'g`. Returns `None` for null.
     pub fn as_ref(&self) -> Option<&'g T> {
-        if self.ptr.is_null() { None }
+        if self.ptr.is_null() {
+            None
+        }
         // SAFETY: the reader holds a live `ReadGuard` for `'g`; any
         // `Owned<T>` whose publication we observed is retained by QSBR
         // at least until the guard reports quiescence (i.e. drops).
-        else { Some(unsafe { &*self.ptr }) }
+        else {
+            Some(unsafe { &*self.ptr })
+        }
     }
 }
 
@@ -161,18 +174,27 @@ impl<T: Send + 'static> core::fmt::Debug for Atomic<T> {
 
 impl<T: Send + 'static> Atomic<T> {
     /// Construct an empty cell.
-    pub const fn null() -> Self { Self { ptr: AtomicPtr::new(core::ptr::null_mut()) } }
+    pub const fn null() -> Self {
+        Self {
+            ptr: AtomicPtr::new(core::ptr::null_mut()),
+        }
+    }
 
     /// Construct with an initial value already published.
     pub fn new(value: T) -> Self {
-        Self { ptr: AtomicPtr::new(Box::into_raw(Box::new(value))) }
+        Self {
+            ptr: AtomicPtr::new(Box::into_raw(Box::new(value))),
+        }
     }
 
     /// Load the current pointer tied to a read guard's lifetime.
     /// Acquire ordering — ensures the pointed-to fields are visible.
     pub fn load<'g>(&self, _g: &'g ReadGuard) -> Shared<'g, T> {
         let p = self.ptr.load(Ordering::Acquire) as *const T;
-        Shared { ptr: p, _g: PhantomData }
+        Shared {
+            ptr: p,
+            _g: PhantomData,
+        }
     }
 
     /// Publish a new value, queueing the displaced one for deferred drop.
@@ -198,19 +220,29 @@ impl<T: Send + 'static> Atomic<T> {
     ) -> Result<Shared<'g, T>, (Owned<T>, Shared<'g, T>)> {
         let new_ptr = new.ptr;
         match self.ptr.compare_exchange(
-            expected.ptr as *mut T, new_ptr,
-            Ordering::AcqRel, Ordering::Acquire,
+            expected.ptr as *mut T,
+            new_ptr,
+            Ordering::AcqRel,
+            Ordering::Acquire,
         ) {
             Ok(old) => {
                 // Publication succeeded — forget the Owned (now owned
                 // by the cell) and defer-drop the displaced pointer.
                 core::mem::forget(new);
-                if !old.is_null() { enqueue_drop::<T>(old); }
-                Ok(Shared { ptr: new_ptr, _g: PhantomData })
+                if !old.is_null() {
+                    enqueue_drop::<T>(old);
+                }
+                Ok(Shared {
+                    ptr: new_ptr,
+                    _g: PhantomData,
+                })
             }
             Err(current) => Err((
                 new,
-                Shared { ptr: current as *const T, _g: PhantomData },
+                Shared {
+                    ptr: current as *const T,
+                    _g: PhantomData,
+                },
             )),
         }
     }
@@ -222,7 +254,9 @@ impl<T: Send + 'static> Drop for Atomic<T> {
         if !p.is_null() {
             // SAFETY: `p` came from `Box::into_raw` and nobody else
             // holds a `ReadGuard` tied to this cell (we're in Drop).
-            unsafe { drop(Box::from_raw(p)); }
+            unsafe {
+                drop(Box::from_raw(p));
+            }
         }
     }
 }
@@ -237,15 +271,22 @@ impl<T: Send + 'static> Drop for Atomic<T> {
 #[derive(Debug)]
 pub struct ReadGuard<'g> {
     _not_send: PhantomData<*const ()>,
-    _phantom:  PhantomData<&'g ()>,
+    _phantom: PhantomData<&'g ()>,
 }
 
 impl<'g> ReadGuard<'g> {
-    fn new() -> Self { Self { _not_send: PhantomData, _phantom: PhantomData } }
+    fn new() -> Self {
+        Self {
+            _not_send: PhantomData,
+            _phantom: PhantomData,
+        }
+    }
 }
 
 impl<'g> Drop for ReadGuard<'g> {
-    fn drop(&mut self) { qsbr::reader_unpin(); }
+    fn drop(&mut self) {
+        qsbr::reader_unpin();
+    }
 }
 
 /// Obtain a QSBR reader pin.
@@ -261,9 +302,7 @@ fn enqueue_drop<T: Send + 'static>(ptr: *mut T) {
     // that reclaims it. We erase `T` into a raw pointer plus a monomorphic
     // dropper fn so the queue itself is non-generic.
     // SAFETY: `ptr` was produced from `Box::into_raw::<T>`.
-    let dropper: unsafe fn(*mut ()) = |raw| unsafe {
-        drop(Box::from_raw(raw as *mut T))
-    };
+    let dropper: unsafe fn(*mut ()) = |raw| unsafe { drop(Box::from_raw(raw as *mut T)) };
     qsbr::defer_raw(ptr as *mut (), dropper);
 }
 
@@ -281,7 +320,9 @@ pub fn defer_drop<T: Send + 'static>(owned: Owned<T>, _g: &ReadGuard) {
 /// consumers running outside the scheduler may call it manually (used
 /// by the verification harness).
 #[inline]
-pub fn report_quiescent() { qsbr::report_quiescent(); }
+pub fn report_quiescent() {
+    qsbr::report_quiescent();
+}
 
 /// Declare that the current CPU is going idle (about to halt and
 /// stop polling). Resets the per-CPU `last_quiescent` to the
@@ -289,7 +330,9 @@ pub fn report_quiescent() { qsbr::report_quiescent(); }
 /// The CPU re-adopts the live epoch on its first
 /// `report_quiescent` after wake.
 #[inline]
-pub fn report_idle() { qsbr::report_idle(); }
+pub fn report_idle() {
+    qsbr::report_idle();
+}
 
 /// Wait one grace period and drain the resulting drop batch.
 ///

@@ -40,12 +40,7 @@ pub const IWL_DEV_AX201: u16 = 0x02F0;
 pub const IWL_DEV_AX210: u16 = 0x2725;
 pub const IWL_DEV_AX211: u16 = 0x51F0;
 
-const ALL_DEV_IDS: &[u16] = &[
-    IWL_DEV_AX200,
-    IWL_DEV_AX201,
-    IWL_DEV_AX210,
-    IWL_DEV_AX211,
-];
+const ALL_DEV_IDS: &[u16] = &[IWL_DEV_AX200, IWL_DEV_AX201, IWL_DEV_AX210, IWL_DEV_AX211];
 
 // ── Probe ──────────────────────────────────────────────────────────
 
@@ -57,14 +52,14 @@ const ALL_DEV_IDS: &[u16] = &[
 /// do without public docs.
 pub fn probe(
     device: BusDevice,
-    _cap:   Cap<BusDeviceCap, Write>,
+    _cap: Cap<BusDeviceCap, Write>,
 ) -> Result<(), narf_bus::ProbeError> {
     narf_drivers::record_bound(narf_drivers::BoundDriver {
-        name:    alloc::string::String::from(name_for(device.id.device)),
-        kind:    narf_drivers::BoundKind::Net,
+        name: alloc::string::String::from(name_for(device.id.device)),
+        kind: narf_drivers::BoundKind::Net,
         pci_vid: Some(device.id.vendor),
         pci_did: Some(device.id.device),
-        domain:  narf_drivers::BoundKind::Net.default_domain(),
+        domain: narf_drivers::BoundKind::Net.default_domain(),
     });
     // TODO(iwlwifi-public-docs): BAR0 map + CSR reset + firmware
     // image load are blocked on register-map docs that Intel does
@@ -79,7 +74,8 @@ pub fn register_pci_driver() {
         narf_bus::register_pci_driver(narf_bus::PciMatch {
             name: name_for(did),
             kind: narf_bus::MatchKind::VendorDevice {
-                vendor: IWL_VENDOR, device: did,
+                vendor: IWL_VENDOR,
+                device: did,
             },
             probe,
         });
@@ -92,6 +88,6 @@ fn name_for(did: u16) -> &'static str {
         IWL_DEV_AX201 => "iwlwifi-ax201",
         IWL_DEV_AX210 => "iwlwifi-ax210",
         IWL_DEV_AX211 => "iwlwifi-ax211",
-        _             => "iwlwifi",
+        _ => "iwlwifi",
     }
 }

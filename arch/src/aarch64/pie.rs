@@ -33,7 +33,7 @@ pub fn caps() -> PieCaps {
         //   bits[11:8] = S2PIE
         //   bits[15:12] = S1PIE
         s1pie: ((v >> 12) & 0xF) >= 1,
-        s2pie: ((v >> 8)  & 0xF) >= 1,
+        s2pie: ((v >> 8) & 0xF) >= 1,
     }
 }
 

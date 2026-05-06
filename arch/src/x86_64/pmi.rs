@@ -15,8 +15,8 @@ use core::ptr::{read_volatile, write_volatile};
 pub const LAPIC_LVT_PC_OFFSET: u32 = 0x340;
 
 const LVT_DELIVERY_FIXED: u32 = 0b000 << 8;
-const LVT_DELIVERY_NMI:   u32 = 0b100 << 8;
-const LVT_MASKED_BIT:     u32 = 1 << 16;
+const LVT_DELIVERY_NMI: u32 = 0b100 << 8;
+const LVT_MASKED_BIT: u32 = 1 << 16;
 
 unsafe fn lvt_addr(lapic_base: usize) -> *mut u32 {
     (lapic_base + LAPIC_LVT_PC_OFFSET as usize) as *mut u32
@@ -34,10 +34,16 @@ unsafe fn lvt_addr(lapic_base: usize) -> *mut u32 {
 #[inline]
 pub unsafe fn program_lvt_pc(lapic_base: usize, vector: u8, nmi: bool, masked: bool) {
     let mut v = vector as u32;
-    v |= if nmi    { LVT_DELIVERY_NMI } else { LVT_DELIVERY_FIXED };
-    v |= if masked { LVT_MASKED_BIT  } else { 0 };
+    v |= if nmi {
+        LVT_DELIVERY_NMI
+    } else {
+        LVT_DELIVERY_FIXED
+    };
+    v |= if masked { LVT_MASKED_BIT } else { 0 };
     // SAFETY: caller-asserted.
-    unsafe { write_volatile(lvt_addr(lapic_base), v); }
+    unsafe {
+        write_volatile(lvt_addr(lapic_base), v);
+    }
 }
 
 /// Mask the LVT-PC entry.
@@ -48,7 +54,9 @@ pub unsafe fn program_lvt_pc(lapic_base: usize, vector: u8, nmi: bool, masked: b
 pub unsafe fn mask_lvt_pc(lapic_base: usize) {
     // SAFETY: caller-asserted.
     let cur = unsafe { read_volatile(lvt_addr(lapic_base)) };
-    unsafe { write_volatile(lvt_addr(lapic_base), cur | LVT_MASKED_BIT); }
+    unsafe {
+        write_volatile(lvt_addr(lapic_base), cur | LVT_MASKED_BIT);
+    }
 }
 
 /// Unmask the LVT-PC entry.
@@ -60,5 +68,7 @@ pub unsafe fn mask_lvt_pc(lapic_base: usize) {
 pub unsafe fn unmask_lvt_pc(lapic_base: usize) {
     // SAFETY: caller-asserted.
     let cur = unsafe { read_volatile(lvt_addr(lapic_base)) };
-    unsafe { write_volatile(lvt_addr(lapic_base), cur & !LVT_MASKED_BIT); }
+    unsafe {
+        write_volatile(lvt_addr(lapic_base), cur & !LVT_MASKED_BIT);
+    }
 }

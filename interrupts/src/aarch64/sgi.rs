@@ -20,18 +20,17 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use narf_arch::aarch64::sysreg;
 
 /// IPI vector for "yield to scheduler / pick up new work."
-pub const SGI_RESCHED:        u8 = 0;
+pub const SGI_RESCHED: u8 = 0;
 /// IPI vector for "invalidate VA range" (TLB shootdown).
-pub const SGI_TLB_SHOOTDOWN:  u8 = 1;
+pub const SGI_TLB_SHOOTDOWN: u8 = 1;
 /// IPI vector for "panic — stop touching the serial port + halt."
-pub const SGI_PANIC_HALT:     u8 = 2;
+pub const SGI_PANIC_HALT: u8 = 2;
 
 /// Per-CPU "scheduler should look for work next time it polls"
 /// flag. Set by `default_resched_handler` on SGI_RESCHED receipt;
 /// cleared by the scheduler when it next runs.
 static NEEDS_RESCHED: [core::sync::atomic::AtomicBool; narf_lib::percpu::MAX_CPUS] =
-    [const { core::sync::atomic::AtomicBool::new(false) };
-     narf_lib::percpu::MAX_CPUS];
+    [const { core::sync::atomic::AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS];
 
 pub fn needs_resched(cpu: u32) -> bool {
     let i = (cpu as usize).min(narf_lib::percpu::MAX_CPUS - 1);
@@ -56,11 +55,15 @@ fn default_resched_handler() {
 fn default_panic_halt_handler() -> ! {
     // SAFETY: called from IRQ context on the receiving CPU; we
     // never want to leave halt, so masking IRQs is permanent here.
-    unsafe { narf_arch::disable_interrupts(); }
+    unsafe {
+        narf_arch::disable_interrupts();
+    }
     loop {
         // SAFETY: WFI in EL1 is always defined; with IRQs masked
         // we never wake.
-        unsafe { core::arch::asm!("wfi", options(nostack, preserves_flags)); }
+        unsafe {
+            core::arch::asm!("wfi", options(nostack, preserves_flags));
+        }
     }
 }
 
@@ -85,7 +88,9 @@ pub fn install_defaults() {
 /// down. The IPI handler on receiving CPUs masks IRQs + halts.
 pub unsafe fn broadcast_panic_halt() {
     // SAFETY: GICv3 sysreg interface up.
-    unsafe { broadcast_others(SGI_PANIC_HALT); }
+    unsafe {
+        broadcast_others(SGI_PANIC_HALT);
+    }
 }
 
 /// Per-(CPU, INTID) receive count. Drivers can sample to confirm
@@ -150,8 +155,8 @@ pub fn on_sgi(intid: u8) {
 pub unsafe fn send_to_cpu_aff(intid: u8, target_aff: u32) {
     let intid = (intid as u64) & 0xF;
     // Decompose target affinity bytes.
-    let aff0 = ((target_aff >> 0)  & 0xFF) as u64;
-    let aff1 = ((target_aff >> 8)  & 0xFF) as u64;
+    let aff0 = ((target_aff >> 0) & 0xFF) as u64;
+    let aff1 = ((target_aff >> 8) & 0xFF) as u64;
     let aff2 = ((target_aff >> 16) & 0xFF) as u64;
     let aff3 = ((target_aff >> 24) & 0xFF) as u64;
     // ICC_SGI1R_EL1: bit pattern per Arm IHI 0069H §11.7.
@@ -160,13 +165,11 @@ pub unsafe fn send_to_cpu_aff(intid: u8, target_aff: u32) {
     //   INTID (bits[27:24])
     //   Aff2 (bits[39:32])
     //   Aff3 (bits[55:48])
-    let val = (1u64 << aff0)
-        | (aff1   << 16)
-        | (intid  << 24)
-        | (aff2   << 32)
-        | (aff3   << 48);
+    let val = (1u64 << aff0) | (aff1 << 16) | (intid << 24) | (aff2 << 32) | (aff3 << 48);
     // SAFETY: caller-asserted GICv3 sysreg interface online.
-    unsafe { sysreg::write_icc_sgi1r_el1(val); }
+    unsafe {
+        sysreg::write_icc_sgi1r_el1(val);
+    }
 }
 
 /// Broadcast an SGI to all CPUs except the sender.
@@ -178,5 +181,7 @@ pub unsafe fn broadcast_others(intid: u8) {
     // IRM (bit 40) = 1 → all-but-self routing; affinity ignored.
     let val = (intid << 24) | (1u64 << 40);
     // SAFETY: see send_to_cpu_aff.
-    unsafe { sysreg::write_icc_sgi1r_el1(val); }
+    unsafe {
+        sysreg::write_icc_sgi1r_el1(val);
+    }
 }

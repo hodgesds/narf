@@ -36,7 +36,7 @@ pub struct Histogram {
     buckets: [AtomicU64; HISTOGRAM_BUCKETS],
     /// Saturating sample count; separately tracked so `quantile` can
     /// short-circuit the empty case without iterating buckets.
-    count:   AtomicU64,
+    count: AtomicU64,
 }
 
 impl Histogram {
@@ -45,7 +45,7 @@ impl Histogram {
         // Use array-repeat via `const {}` trick.
         Self {
             buckets: [const { AtomicU64::new(0) }; HISTOGRAM_BUCKETS],
-            count:   AtomicU64::new(0),
+            count: AtomicU64::new(0),
         }
     }
 
@@ -53,14 +53,22 @@ impl Histogram {
     /// `i >= 1`; bucket 0 is the `x == 0` special case.
     #[inline]
     pub const fn bucket_for(x: u64) -> usize {
-        if x == 0 { 0 } else { (64 - x.leading_zeros()) as usize }
+        if x == 0 {
+            0
+        } else {
+            (64 - x.leading_zeros()) as usize
+        }
     }
 
     /// Lower bound of bucket `i` (inclusive). `i == 0 → 0`,
     /// `i == 1 → 1`, `i == 2 → 2`, `i == 3 → 4`, …
     #[inline]
     pub const fn bucket_lower(i: usize) -> u64 {
-        match i { 0 => 0, 1 => 1, _ => 1u64 << (i - 1) }
+        match i {
+            0 => 0,
+            1 => 1,
+            _ => 1u64 << (i - 1),
+        }
     }
 
     /// Add a sample.
@@ -72,7 +80,9 @@ impl Histogram {
 
     /// Total sample count.
     #[inline]
-    pub fn count(&self) -> u64 { self.count.load(Ordering::Relaxed) }
+    pub fn count(&self) -> u64 {
+        self.count.load(Ordering::Relaxed)
+    }
 
     /// Estimate the `p`-th percentile, expressed in permille
     /// (parts per thousand, 0..=1000). Returns the **lower bound**
@@ -82,7 +92,9 @@ impl Histogram {
     /// target percentile at compile time anyway (p50 = 500, p99 = 990).
     pub fn quantile_permille(&self, p: u32) -> u64 {
         let total = self.count.load(Ordering::Relaxed);
-        if total == 0 { return 0; }
+        if total == 0 {
+            return 0;
+        }
         let p = p.min(1000) as u64;
         // target = ceil(total * p / 1000). Integer ceil = (a + b - 1) / b.
         let numer = total.saturating_mul(p);
@@ -100,13 +112,21 @@ impl Histogram {
 
     /// Shorthand: p50 / p90 / p99 / p999 in one line each.
     #[inline]
-    pub fn p50(&self) -> u64 { self.quantile_permille(500) }
+    pub fn p50(&self) -> u64 {
+        self.quantile_permille(500)
+    }
     #[inline]
-    pub fn p90(&self) -> u64 { self.quantile_permille(900) }
+    pub fn p90(&self) -> u64 {
+        self.quantile_permille(900)
+    }
     #[inline]
-    pub fn p99(&self) -> u64 { self.quantile_permille(990) }
+    pub fn p99(&self) -> u64 {
+        self.quantile_permille(990)
+    }
     #[inline]
-    pub fn p999(&self) -> u64 { self.quantile_permille(999) }
+    pub fn p999(&self) -> u64 {
+        self.quantile_permille(999)
+    }
 
     /// Snapshot into a plain-u64 array for external readers. Each
     /// bucket is loaded independently so the snapshot may tear across
@@ -128,7 +148,8 @@ impl Clone for Histogram {
         for (i, b) in self.buckets.iter().enumerate() {
             out.buckets[i].store(b.load(Ordering::Relaxed), Ordering::Relaxed);
         }
-        out.count.store(self.count.load(Ordering::Relaxed), Ordering::Relaxed);
+        out.count
+            .store(self.count.load(Ordering::Relaxed), Ordering::Relaxed);
         out
     }
 }

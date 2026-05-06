@@ -22,7 +22,7 @@
 
 #![cfg(target_arch = "x86_64")]
 
-use crate::paging::{PageTable, PageTableEntry, PtFlags, write_cr3, write_identity};
+use crate::paging::{write_cr3, write_identity, PageTable, PageTableEntry, PtFlags};
 use crate::{alloc_frame, FrameAllocError, PhysAddr};
 
 /// Errors from `init_mmu`. Stage-1 failure modes are limited to
@@ -36,7 +36,7 @@ pub enum MmuError {
 impl From<FrameAllocError> for MmuError {
     fn from(e: FrameAllocError) -> Self {
         match e {
-            FrameAllocError::Exhausted    => MmuError::FramesExhausted,
+            FrameAllocError::Exhausted => MmuError::FramesExhausted,
             FrameAllocError::Uninitialised => MmuError::AllocatorUninitialised,
         }
     }
@@ -76,12 +76,12 @@ pub const HIGHER_HALF_PDPT_INDEX: usize = 510;
 pub unsafe fn init_mmu() -> Result<PhysAddr, MmuError> {
     // Step 1: allocate and zero a PML4 + PDPT (for low identity) +
     // another PDPT for the high-half window.
-    let pml4_frame    = alloc_frame()?;
+    let pml4_frame = alloc_frame()?;
     let pdpt_lo_frame = alloc_frame()?;
     let pdpt_hi_frame = alloc_frame()?;
-    let pml4_addr     = pml4_frame.start_address();
-    let pdpt_lo_addr  = pdpt_lo_frame.start_address();
-    let pdpt_hi_addr  = pdpt_hi_frame.start_address();
+    let pml4_addr = pml4_frame.start_address();
+    let pdpt_lo_addr = pdpt_lo_frame.start_address();
+    let pdpt_hi_addr = pdpt_hi_frame.start_address();
 
     // These frames came from the allocator and are identity-mapped in
     // the boot.S page tables (the low 1 GiB huge page covers them),
@@ -100,22 +100,20 @@ pub unsafe fn init_mmu() -> Result<PhysAddr, MmuError> {
         let pml4_lo_entry = PageTableEntry::new(pdpt_lo_addr, flags_ptr);
         write_identity::<PageTableEntry>(pml4_addr, pml4_lo_entry);
         for gib in 0u64..=3 {
-            let phys  = PhysAddr::new(gib << 30);
+            let phys = PhysAddr::new(gib << 30);
             let entry = PageTableEntry::new(phys, flags_1gb);
-            let slot  = PhysAddr::new(pdpt_lo_addr.raw() + gib * 8);
+            let slot = PhysAddr::new(pdpt_lo_addr.raw() + gib * 8);
             write_identity::<PageTableEntry>(slot, entry);
         }
 
         // High-half PML4[511] + PDPT[510] → phys 0 (1 GiB huge page).
         // Virtual 0xFFFF_FFFF_8000_0000 + x maps to physical 0 + x.
         let pml4_hi_entry = PageTableEntry::new(pdpt_hi_addr, flags_ptr);
-        let pml4_hi_slot  = PhysAddr::new(
-            pml4_addr.raw() + (HIGHER_HALF_PML4_INDEX as u64) * 8);
+        let pml4_hi_slot = PhysAddr::new(pml4_addr.raw() + (HIGHER_HALF_PML4_INDEX as u64) * 8);
         write_identity::<PageTableEntry>(pml4_hi_slot, pml4_hi_entry);
 
         let hh_entry = PageTableEntry::new(PhysAddr::new(0), flags_1gb);
-        let hh_slot  = PhysAddr::new(
-            pdpt_hi_addr.raw() + (HIGHER_HALF_PDPT_INDEX as u64) * 8);
+        let hh_slot = PhysAddr::new(pdpt_hi_addr.raw() + (HIGHER_HALF_PDPT_INDEX as u64) * 8);
         write_identity::<PageTableEntry>(hh_slot, hh_entry);
     }
 
@@ -133,7 +131,9 @@ pub unsafe fn init_mmu() -> Result<PhysAddr, MmuError> {
     //
     // SAFETY: invariants above; caller supplied the single-CPU BSP
     // precondition.
-    unsafe { write_cr3(pml4_addr); }
+    unsafe {
+        write_cr3(pml4_addr);
+    }
 
     // Step 5: *caller* notifies the console with a post-switch
     // `remap_to_virtual(virt)`.

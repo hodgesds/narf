@@ -64,34 +64,43 @@ pub enum FwInfoError {
 /// 10 kHz units (the on-the-wire encoding); voltage is mV.
 #[derive(Copy, Clone)]
 pub struct FwInfoV3 {
-    pub structure_size:           u16,
-    pub format_revision:          u8,
-    pub content_revision:         u8,
-    pub firmware_revision:        u32,
-    pub default_engine_clock_10khz:  u32,
-    pub default_memory_clock_10khz:  u32,
-    pub spll_output_freq_10khz:      u32,
-    pub gpupll_output_freq_10khz:    u32,
-    pub max_pixel_clock_pll_10khz:   u32,
+    pub structure_size: u16,
+    pub format_revision: u8,
+    pub content_revision: u8,
+    pub firmware_revision: u32,
+    pub default_engine_clock_10khz: u32,
+    pub default_memory_clock_10khz: u32,
+    pub spll_output_freq_10khz: u32,
+    pub gpupll_output_freq_10khz: u32,
+    pub max_pixel_clock_pll_10khz: u32,
     pub default_disp_engine_clk_10khz: u32,
-    pub bootup_vddc_mv:               u16,
-    pub firmware_capability:          u16,
-    pub core_reference_clock_10khz:   u16,
+    pub bootup_vddc_mv: u16,
+    pub firmware_capability: u16,
+    pub core_reference_clock_10khz: u16,
     pub memory_reference_clock_10khz: u16,
     pub uniphy_dp_mode_ext_clk_10khz: u16,
-    pub memory_module_id:             u8,
-    pub cooling_solution_id:          u8,
+    pub memory_module_id: u8,
+    pub cooling_solution_id: u8,
 }
 
 impl fmt::Debug for FwInfoV3 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FwInfoV3")
-            .field("rev",                  &(self.format_revision, self.content_revision))
-            .field("firmware_revision",    &self.firmware_revision)
-            .field("default_engine_mhz",   &(self.default_engine_clock_10khz / 100))
-            .field("default_memory_mhz",   &(self.default_memory_clock_10khz / 100))
-            .field("max_pixel_clock_mhz",  &(self.max_pixel_clock_pll_10khz / 100))
-            .field("bootup_vddc_mv",       &self.bootup_vddc_mv)
+            .field("rev", &(self.format_revision, self.content_revision))
+            .field("firmware_revision", &self.firmware_revision)
+            .field(
+                "default_engine_mhz",
+                &(self.default_engine_clock_10khz / 100),
+            )
+            .field(
+                "default_memory_mhz",
+                &(self.default_memory_clock_10khz / 100),
+            )
+            .field(
+                "max_pixel_clock_mhz",
+                &(self.max_pixel_clock_pll_10khz / 100),
+            )
+            .field("bootup_vddc_mv", &self.bootup_vddc_mv)
             .finish_non_exhaustive()
     }
 }
@@ -99,9 +108,13 @@ impl fmt::Debug for FwInfoV3 {
 impl FwInfoV3 {
     /// Engine clock in MHz (lossy — the on-the-wire encoding is
     /// 10 kHz units, so this is `freq_10khz / 100`).
-    pub fn default_engine_mhz(&self) -> u32 { self.default_engine_clock_10khz / 100 }
+    pub fn default_engine_mhz(&self) -> u32 {
+        self.default_engine_clock_10khz / 100
+    }
     /// Memory clock in MHz.
-    pub fn default_memory_mhz(&self) -> u32 { self.default_memory_clock_10khz / 100 }
+    pub fn default_memory_mhz(&self) -> u32 {
+        self.default_memory_clock_10khz / 100
+    }
 }
 
 /// Decode a `ATOM_FIRMWARE_INFO_V3_x` table from raw bytes.
@@ -109,36 +122,36 @@ impl FwInfoV3 {
 /// Caller obtains the slice via `Atombios::data_table(table_id)`.
 /// `table_id` for FIRMWARE_INFO is `0x04` per AtomBios.h.
 pub fn parse(raw: &[u8]) -> Result<FwInfoV3, FwInfoError> {
-    if raw.len() < 0x5B { return Err(FwInfoError::Truncated); }
-    let structure_size   = u16::from_le_bytes([raw[0], raw[1]]);
-    let format_revision  = raw[2];
+    if raw.len() < 0x5B {
+        return Err(FwInfoError::Truncated);
+    }
+    let structure_size = u16::from_le_bytes([raw[0], raw[1]]);
+    let format_revision = raw[2];
     let content_revision = raw[3];
     if content_revision >> 4 != 3 {
         // We only ship V3.x decoding.
         return Err(FwInfoError::UnsupportedVersion(content_revision));
     }
-    let read_u32 = |o: usize| u32::from_le_bytes([
-        raw[o], raw[o + 1], raw[o + 2], raw[o + 3],
-    ]);
+    let read_u32 = |o: usize| u32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]]);
     let read_u16 = |o: usize| u16::from_le_bytes([raw[o], raw[o + 1]]);
 
     Ok(FwInfoV3 {
         structure_size,
         format_revision,
         content_revision,
-        firmware_revision:        read_u32(0x04),
-        default_engine_clock_10khz:  read_u32(0x08),
-        default_memory_clock_10khz:  read_u32(0x0C),
-        spll_output_freq_10khz:      read_u32(0x10),
-        gpupll_output_freq_10khz:    read_u32(0x14),
-        max_pixel_clock_pll_10khz:   read_u32(0x20),
+        firmware_revision: read_u32(0x04),
+        default_engine_clock_10khz: read_u32(0x08),
+        default_memory_clock_10khz: read_u32(0x0C),
+        spll_output_freq_10khz: read_u32(0x10),
+        gpupll_output_freq_10khz: read_u32(0x14),
+        max_pixel_clock_pll_10khz: read_u32(0x20),
         default_disp_engine_clk_10khz: read_u32(0x28),
-        bootup_vddc_mv:               read_u16(0x2E),
-        firmware_capability:          read_u16(0x51),
-        core_reference_clock_10khz:   read_u16(0x53),
+        bootup_vddc_mv: read_u16(0x2E),
+        firmware_capability: read_u16(0x51),
+        core_reference_clock_10khz: read_u16(0x53),
         memory_reference_clock_10khz: read_u16(0x55),
         uniphy_dp_mode_ext_clk_10khz: read_u16(0x57),
-        memory_module_id:             raw[0x59],
-        cooling_solution_id:          raw[0x5A],
+        memory_module_id: raw[0x59],
+        cooling_solution_id: raw[0x5A],
     })
 }

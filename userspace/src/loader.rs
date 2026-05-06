@@ -42,15 +42,23 @@ pub enum LoadError {
 }
 
 impl From<AddressSpaceError> for LoadError {
-    fn from(e: AddressSpaceError) -> Self { LoadError::AddressSpace(e) }
+    fn from(e: AddressSpaceError) -> Self {
+        LoadError::AddressSpace(e)
+    }
 }
 
 /// Convert `SegmentFlags` (ELF PF_*) into `RegionPerms`.
 fn perms_of(f: SegmentFlags) -> RegionPerms {
     let mut p = RegionPerms::default();
-    if f.contains(SegmentFlags::READ)  { p = p | RegionPerms::READ;  }
-    if f.contains(SegmentFlags::WRITE) { p = p | RegionPerms::WRITE; }
-    if f.contains(SegmentFlags::EXEC)  { p = p | RegionPerms::EXEC;  }
+    if f.contains(SegmentFlags::READ) {
+        p = p | RegionPerms::READ;
+    }
+    if f.contains(SegmentFlags::WRITE) {
+        p = p | RegionPerms::WRITE;
+    }
+    if f.contains(SegmentFlags::EXEC) {
+        p = p | RegionPerms::EXEC;
+    }
     p
 }
 
@@ -60,15 +68,19 @@ fn perms_of(f: SegmentFlags) -> RegionPerms {
 /// form is contiguous-frame mapping; the real loader with a
 /// scatter list lands when the arch paging primitives do.
 pub fn load_into<I>(
-    image:      &ExecImage,
+    image: &ExecImage,
     mut phys_pool: I,
     addr_space: &AddressSpace,
 ) -> Result<EntryPoint, LoadError>
 where
     I: Iterator<Item = PhysAddr>,
 {
-    if image.segments.is_empty() { return Err(LoadError::NoSegments); }
-    if image.entry == 0          { return Err(LoadError::BadEntry); }
+    if image.segments.is_empty() {
+        return Err(LoadError::NoSegments);
+    }
+    if image.entry == 0 {
+        return Err(LoadError::BadEntry);
+    }
 
     for seg in &image.segments {
         // Drain `pages` frames from the pool into a per-page scatter
@@ -76,15 +88,14 @@ where
         // order — collecting them per page is what makes multi-page
         // and multi-segment loads correct.
         let pages = (seg.mem_size + 0xFFF) >> 12;
-        let mut phys: alloc::vec::Vec<PhysAddr> =
-            alloc::vec::Vec::with_capacity(pages as usize);
+        let mut phys: alloc::vec::Vec<PhysAddr> = alloc::vec::Vec::with_capacity(pages as usize);
         for _ in 0..pages {
             phys.push(phys_pool.next().ok_or(LoadError::NoPhysFrames)?);
         }
 
         addr_space.map_region(Region {
-            base:  VirtAddr::new(seg.vaddr),
-            len:   (pages as u64) << 12,
+            base: VirtAddr::new(seg.vaddr),
+            len: (pages as u64) << 12,
             perms: perms_of(seg.flags),
             phys,
         })?;
@@ -133,7 +144,7 @@ pub enum LoadBytesError {
     /// means lookup failed (DT_STRTAB missing, `st_name == 0`, or
     /// the offset walked past any PT_LOAD segment).
     UnresolvedSymbol {
-        idx:  u32,
+        idx: u32,
         name: [u8; 32],
     },
     /// A symbol-resolved relocation referenced a sym_idx whose
@@ -144,10 +155,14 @@ pub enum LoadBytesError {
 }
 
 impl From<crate::ElfError> for LoadBytesError {
-    fn from(e: crate::ElfError) -> Self { LoadBytesError::Elf(e) }
+    fn from(e: crate::ElfError) -> Self {
+        LoadBytesError::Elf(e)
+    }
 }
 impl From<LoadError> for LoadBytesError {
-    fn from(e: LoadError) -> Self { LoadBytesError::Load(e) }
+    fn from(e: LoadError) -> Self {
+        LoadBytesError::Load(e)
+    }
 }
 
 /// Parse ELF `bytes`, allocate fresh frames for every `PT_LOAD`
@@ -165,13 +180,17 @@ impl From<LoadError> for LoadBytesError {
 /// Same identity-mapping + frame-allocator contract as
 /// [`load_elf_bytes`].
 pub unsafe fn load_elf_into_at(
-    bytes:      &[u8],
+    bytes: &[u8],
     addr_space: &AddressSpace,
     vaddr_bias: u64,
 ) -> Result<u64, LoadBytesError> {
     let image = crate::parse_elf(bytes)?;
-    if image.segments.is_empty() { return Err(LoadBytesError::Load(LoadError::NoSegments)); }
-    if image.entry == 0          { return Err(LoadBytesError::Load(LoadError::BadEntry)); }
+    if image.segments.is_empty() {
+        return Err(LoadBytesError::Load(LoadError::NoSegments));
+    }
+    if image.entry == 0 {
+        return Err(LoadBytesError::Load(LoadError::BadEntry));
+    }
 
     // Allocate all needed frames up front, chunk by chunk.
     let mut allocated: alloc::vec::Vec<PhysAddr> = alloc::vec::Vec::new();
@@ -199,16 +218,20 @@ pub unsafe fn load_elf_into_at(
     for seg in &image.segments {
         let pages = ((seg.mem_size + 0xFFF) >> 12) as usize;
         let end = cursor.checked_add(pages).ok_or(LoadBytesError::NoFrame)?;
-        if end > allocated.len() { return Err(LoadBytesError::NoFrame); }
+        if end > allocated.len() {
+            return Err(LoadBytesError::NoFrame);
+        }
         let phys: alloc::vec::Vec<PhysAddr> = allocated[cursor..end].to_vec();
         cursor = end;
 
-        addr_space.map_region(Region {
-            base:  VirtAddr::new(seg.vaddr.wrapping_add(vaddr_bias)),
-            len:   (pages as u64) << 12,
-            perms: perms_of(seg.flags),
-            phys,
-        }).map_err(|e| LoadBytesError::Load(LoadError::AddressSpace(e)))?;
+        addr_space
+            .map_region(Region {
+                base: VirtAddr::new(seg.vaddr.wrapping_add(vaddr_bias)),
+                len: (pages as u64) << 12,
+                perms: perms_of(seg.flags),
+                phys,
+            })
+            .map_err(|e| LoadBytesError::Load(LoadError::AddressSpace(e)))?;
     }
 
     // Copy segment data. The frames may not be physically contiguous
@@ -223,7 +246,8 @@ pub unsafe fn load_elf_into_at(
         cursor += pages;
 
         let start = seg.file_off as usize;
-        let end   = start.checked_add(seg.file_size as usize)
+        let end = start
+            .checked_add(seg.file_size as usize)
             .ok_or(LoadBytesError::ByteCopyOutOfBounds)?;
         if end > bytes.len() {
             return Err(LoadBytesError::ByteCopyOutOfBounds);
@@ -232,7 +256,9 @@ pub unsafe fn load_elf_into_at(
 
         let mut written: usize = 0;
         for &frame in frames.iter() {
-            if written >= src.len() { break; }
+            if written >= src.len() {
+                break;
+            }
             let chunk = core::cmp::min(4096, src.len() - written);
             // SAFETY: `frame` is an identity-mapped freshly-allocated
             // 4 KiB phys frame; chunk <= 4 KiB.
@@ -306,20 +332,22 @@ pub unsafe fn load_elf_bytes(
 // SYMTAB/STRTAB/STRSZ/RELACOUNT entries are kept here so the
 // follow-up symbol-resolution pass can pick them up without
 // re-deriving the wire numbers.
-const DT_PLTRELSZ:   i64 = 2;
+const DT_PLTRELSZ: i64 = 2;
 // DT_STRTAB drives symbol-name lookup for the unresolved-import
 // path: when an external symbol triggers `UnresolvedSymbol`, we
 // follow `st_name` into the string table so the error carries a
 // name (truncated to 32 bytes), not just an opaque sym_idx.
-const DT_STRTAB:     i64 = 5;
-const DT_SYMTAB:     i64 = 6;
-const DT_RELA:       i64 = 7;
-const DT_RELASZ:     i64 = 8;
-const DT_RELAENT:    i64 = 9;
-#[allow(dead_code)] const DT_STRSZ:  i64 = 10;
-const DT_PLTREL:     i64 = 20;
-const DT_JMPREL:     i64 = 23;
-#[allow(dead_code)] const DT_RELACOUNT: i64 = 0x6FFFFFF9;
+const DT_STRTAB: i64 = 5;
+const DT_SYMTAB: i64 = 6;
+const DT_RELA: i64 = 7;
+const DT_RELASZ: i64 = 8;
+const DT_RELAENT: i64 = 9;
+#[allow(dead_code)]
+const DT_STRSZ: i64 = 10;
+const DT_PLTREL: i64 = 20;
+const DT_JMPREL: i64 = 23;
+#[allow(dead_code)]
+const DT_RELACOUNT: i64 = 0x6FFFFFF9;
 
 /// `sizeof(Elf64_Sym)` per the ELF64 ABI:
 /// `{ st_name: u32, st_info: u8, st_other: u8, st_shndx: u16,
@@ -331,10 +359,10 @@ const ELF64_SYM_SIZE: u64 = 24;
 const SHN_UNDEF: u16 = 0;
 
 // x86_64 relocation type codes (low 32 bits of `r_info`).
-const R_X86_64_64:        u32 = 1;
-const R_X86_64_GLOB_DAT:  u32 = 6;
+const R_X86_64_64: u32 = 1;
+const R_X86_64_GLOB_DAT: u32 = 6;
 const R_X86_64_JUMP_SLOT: u32 = 7;
-const R_X86_64_RELATIVE:  u32 = 8;
+const R_X86_64_RELATIVE: u32 = 8;
 
 /// Lookup helper — return the value paired with the *first*
 /// occurrence of `tag` in `dynamic`. PT_DYNAMIC duplicates would
@@ -359,14 +387,22 @@ fn resolve_dt_pointer<'a>(
         // A DT_* pointer is in-bounds for a segment when it lies in
         // [vaddr, vaddr + file_size). file_size (not mem_size) is the
         // right ceiling because relocation tables are file-resident.
-        if dt_addr < seg.vaddr { continue; }
+        if dt_addr < seg.vaddr {
+            continue;
+        }
         let off_in_seg = dt_addr - seg.vaddr;
-        if off_in_seg >= seg.file_size { continue; }
+        if off_in_seg >= seg.file_size {
+            continue;
+        }
         let avail = seg.file_size - off_in_seg;
-        if avail < needed { return None; }
+        if avail < needed {
+            return None;
+        }
         let file_start = (seg.file_off + off_in_seg) as usize;
-        let file_end   = file_start.checked_add(needed as usize)?;
-        if file_end > bytes.len() { return None; }
+        let file_end = file_start.checked_add(needed as usize)?;
+        if file_end > bytes.len() {
+            return None;
+        }
         return Some(&bytes[file_start..file_end]);
     }
     None
@@ -375,8 +411,7 @@ fn resolve_dt_pointer<'a>(
 #[inline]
 fn read_u64_le(bytes: &[u8]) -> u64 {
     u64::from_le_bytes([
-        bytes[0], bytes[1], bytes[2], bytes[3],
-        bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
     ])
 }
 
@@ -388,10 +423,9 @@ fn read_u64_le(bytes: &[u8]) -> u64 {
 #[cfg(target_arch = "x86_64")]
 fn user_vaddr_to_kernel_ptr(addr_space: &AddressSpace, vaddr: u64) -> Option<*mut u8> {
     let page = vaddr & !0xFFFu64;
-    let off  = vaddr & 0xFFFu64;
-    let p = unsafe {
-        narf_memory::x86_64::paging::translate(addr_space.root, VirtAddr::new(page))
-    }?;
+    let off = vaddr & 0xFFFu64;
+    let p =
+        unsafe { narf_memory::x86_64::paging::translate(addr_space.root, VirtAddr::new(page)) }?;
     Some((p.as_u64() + off) as *mut u8)
 }
 
@@ -424,16 +458,19 @@ fn user_vaddr_to_kernel_ptr(_addr_space: &AddressSpace, _vaddr: u64) -> Option<*
 /// where sym_idx is sufficient. External symbol resolution needs
 /// `st_name → string table → host resolver` and lands later.
 fn resolve_symbol(
-    bytes:      &[u8],
-    image:      &ExecImage,
-    sym_idx:    u32,
+    bytes: &[u8],
+    image: &ExecImage,
+    sym_idx: u32,
     vaddr_bias: u64,
 ) -> Result<u64, LoadBytesError> {
-    let symtab_addr = dt_lookup(&image.dynamic, DT_SYMTAB)
-        .ok_or(LoadBytesError::SymtabOutOfBounds)?;
+    let symtab_addr =
+        dt_lookup(&image.dynamic, DT_SYMTAB).ok_or(LoadBytesError::SymtabOutOfBounds)?;
     let entry_addr = symtab_addr
-        .checked_add((sym_idx as u64).checked_mul(ELF64_SYM_SIZE)
-            .ok_or(LoadBytesError::SymtabOutOfBounds)?)
+        .checked_add(
+            (sym_idx as u64)
+                .checked_mul(ELF64_SYM_SIZE)
+                .ok_or(LoadBytesError::SymtabOutOfBounds)?,
+        )
         .ok_or(LoadBytesError::SymtabOutOfBounds)?;
     let slice = resolve_dt_pointer(bytes, image, entry_addr, ELF64_SYM_SIZE)
         .ok_or(LoadBytesError::SymtabOutOfBounds)?;
@@ -464,11 +501,7 @@ fn resolve_symbol(
 /// The fixed-size buffer keeps the loader path alloc-free; the
 /// 32-byte cap is sized for typical libc symbols (`printf`, `malloc`,
 /// `__libc_start_main`) and documented as truncating for longer ones.
-fn resolve_symbol_name(
-    bytes:   &[u8],
-    image:   &ExecImage,
-    sym_idx: u32,
-) -> [u8; 32] {
+fn resolve_symbol_name(bytes: &[u8], image: &ExecImage, sym_idx: u32) -> [u8; 32] {
     let empty = [0u8; 32];
 
     // Walk to the Elf64_Sym slot to read st_name. We mirror
@@ -476,31 +509,33 @@ fn resolve_symbol_name(
     // empty buffer — name lookup is best-effort.
     let symtab_addr = match dt_lookup(&image.dynamic, DT_SYMTAB) {
         Some(a) => a,
-        None    => return empty,
+        None => return empty,
     };
     let entry_addr = match (sym_idx as u64)
         .checked_mul(ELF64_SYM_SIZE)
         .and_then(|off| symtab_addr.checked_add(off))
     {
         Some(a) => a,
-        None    => return empty,
+        None => return empty,
     };
     let sym_slice = match resolve_dt_pointer(bytes, image, entry_addr, ELF64_SYM_SIZE) {
         Some(s) => s,
-        None    => return empty,
+        None => return empty,
     };
     let st_name = u32::from_le_bytes([sym_slice[0], sym_slice[1], sym_slice[2], sym_slice[3]]);
     // st_name == 0 → SysV "no name" convention; strtab[0] is the
     // canonical empty string and we treat it the same as missing.
-    if st_name == 0 { return empty; }
+    if st_name == 0 {
+        return empty;
+    }
 
     let strtab_addr = match dt_lookup(&image.dynamic, DT_STRTAB) {
         Some(a) => a,
-        None    => return empty,
+        None => return empty,
     };
     let name_addr = match strtab_addr.checked_add(st_name as u64) {
         Some(a) => a,
-        None    => return empty,
+        None => return empty,
     };
 
     // We don't know the symbol-name length up front, and
@@ -517,7 +552,9 @@ fn resolve_symbol_name(
                 // Stop on NUL: terminator is not part of the name,
                 // and the buffer's already pre-zeroed so the trailing
                 // bytes naturally NUL-pad.
-                if b == 0 { return out; }
+                if b == 0 {
+                    return out;
+                }
                 out[i] = b;
             }
             return out;
@@ -539,12 +576,14 @@ fn resolve_symbol_name(
 ///   (we write through `paging::translate`'s phys output cast to a
 ///   raw pointer).
 pub unsafe fn apply_relocations(
-    bytes:      &[u8],
-    image:      &ExecImage,
+    bytes: &[u8],
+    image: &ExecImage,
     addr_space: &AddressSpace,
     vaddr_bias: u64,
 ) -> Result<(), LoadBytesError> {
-    if image.dynamic.is_empty() { return Ok(()); }
+    if image.dynamic.is_empty() {
+        return Ok(());
+    }
 
     // DT_RELA — the .rela.dyn array.
     if let Some(rela_addr) = dt_lookup(&image.dynamic, DT_RELA) {
@@ -556,12 +595,21 @@ pub unsafe fn apply_relocations(
         // path). When absent we fall back to RELASZ/RELAENT.
         let count = if relaent != 0 { relasz / relaent } else { 0 };
         if count > 0 {
-            let needed = count.checked_mul(relaent).ok_or(LoadBytesError::RelaOutOfBounds)?;
-            let slice  = resolve_dt_pointer(bytes, image, rela_addr, needed)
+            let needed = count
+                .checked_mul(relaent)
+                .ok_or(LoadBytesError::RelaOutOfBounds)?;
+            let slice = resolve_dt_pointer(bytes, image, rela_addr, needed)
                 .ok_or(LoadBytesError::RelaOutOfBounds)?;
             unsafe {
-                process_rela_array(slice, count as usize, relaent as usize,
-                                   bytes, image, addr_space, vaddr_bias)?;
+                process_rela_array(
+                    slice,
+                    count as usize,
+                    relaent as usize,
+                    bytes,
+                    image,
+                    addr_space,
+                    vaddr_bias,
+                )?;
             }
         }
     }
@@ -573,15 +621,24 @@ pub unsafe fn apply_relocations(
         let pltrel = dt_lookup(&image.dynamic, DT_PLTREL).unwrap_or(0) as i64;
         if pltrel == DT_RELA {
             let pltrelsz = dt_lookup(&image.dynamic, DT_PLTRELSZ).unwrap_or(0);
-            let relaent  = dt_lookup(&image.dynamic, DT_RELAENT).unwrap_or(24);
+            let relaent = dt_lookup(&image.dynamic, DT_RELAENT).unwrap_or(24);
             let count = if relaent != 0 { pltrelsz / relaent } else { 0 };
             if count > 0 {
-                let needed = count.checked_mul(relaent).ok_or(LoadBytesError::RelaOutOfBounds)?;
-                let slice  = resolve_dt_pointer(bytes, image, jmprel_addr, needed)
+                let needed = count
+                    .checked_mul(relaent)
+                    .ok_or(LoadBytesError::RelaOutOfBounds)?;
+                let slice = resolve_dt_pointer(bytes, image, jmprel_addr, needed)
                     .ok_or(LoadBytesError::RelaOutOfBounds)?;
                 unsafe {
-                    process_rela_array(slice, count as usize, relaent as usize,
-                                       bytes, image, addr_space, vaddr_bias)?;
+                    process_rela_array(
+                        slice,
+                        count as usize,
+                        relaent as usize,
+                        bytes,
+                        image,
+                        addr_space,
+                        vaddr_bias,
+                    )?;
                 }
             }
         } else if pltrel != 0 {
@@ -597,26 +654,32 @@ pub unsafe fn apply_relocations(
 /// patch each one. Encapsulated so DT_RELA + DT_JMPREL can share
 /// the per-entry decoding without duplicating the loop.
 unsafe fn process_rela_array(
-    slice:      &[u8],
-    count:      usize,
-    entsize:    usize,
-    bytes:      &[u8],
-    image:      &ExecImage,
+    slice: &[u8],
+    count: usize,
+    entsize: usize,
+    bytes: &[u8],
+    image: &ExecImage,
     addr_space: &AddressSpace,
     vaddr_bias: u64,
 ) -> Result<(), LoadBytesError> {
-    if entsize < 24 { return Err(LoadBytesError::RelaOutOfBounds); }
-    if slice.len() < count.checked_mul(entsize).ok_or(LoadBytesError::RelaOutOfBounds)? {
+    if entsize < 24 {
+        return Err(LoadBytesError::RelaOutOfBounds);
+    }
+    if slice.len()
+        < count
+            .checked_mul(entsize)
+            .ok_or(LoadBytesError::RelaOutOfBounds)?
+    {
         return Err(LoadBytesError::RelaOutOfBounds);
     }
 
     for i in 0..count {
         let off = i * entsize;
-        let r_offset = read_u64_le(&slice[off       .. off + 8]);
-        let r_info   = read_u64_le(&slice[off + 8   .. off + 16]);
-        let r_addend = read_u64_le(&slice[off + 16  .. off + 24]) as i64;
+        let r_offset = read_u64_le(&slice[off..off + 8]);
+        let r_info = read_u64_le(&slice[off + 8..off + 16]);
+        let r_addend = read_u64_le(&slice[off + 16..off + 24]) as i64;
 
-        let rtype  = (r_info & 0xFFFF_FFFF) as u32;
+        let rtype = (r_info & 0xFFFF_FFFF) as u32;
         let sym_ix = (r_info >> 32) as u32;
 
         // Compute the value we'll write.
@@ -648,7 +711,9 @@ unsafe fn process_rela_array(
         // backing the user's mapped page; the slot is 8 bytes wide
         // and aligned by construction (linker emits 8-aligned r_offsets
         // for R_X86_64_64-class relocations).
-        unsafe { core::ptr::write_unaligned(dst as *mut u64, value); }
+        unsafe {
+            core::ptr::write_unaligned(dst as *mut u64, value);
+        }
     }
 
     Ok(())

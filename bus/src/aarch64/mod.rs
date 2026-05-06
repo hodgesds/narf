@@ -34,25 +34,25 @@ const FDT_MAGIC: u32 = 0xd00d_feed;
 
 // FDT token values (big-endian 4-byte cells in the structure block).
 const FDT_BEGIN_NODE: u32 = 0x1;
-const FDT_END_NODE:   u32 = 0x2;
-const FDT_PROP:       u32 = 0x3;
-const FDT_NOP:        u32 = 0x4;
-const FDT_END:        u32 = 0x9;
+const FDT_END_NODE: u32 = 0x2;
+const FDT_PROP: u32 = 0x3;
+const FDT_NOP: u32 = 0x4;
+const FDT_END: u32 = 0x9;
 
 /// FDT header (v17+). Only fields we actually consult are read.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 struct FdtHeader {
-    magic:             u32,
-    totalsize:         u32,
-    off_dt_struct:     u32,
-    off_dt_strings:    u32,
-    off_mem_rsvmap:    u32,
-    version:           u32,
+    magic: u32,
+    totalsize: u32,
+    off_dt_struct: u32,
+    off_dt_strings: u32,
+    off_mem_rsvmap: u32,
+    version: u32,
     last_comp_version: u32,
-    boot_cpuid_phys:   u32,
-    size_dt_strings:   u32,
-    size_dt_struct:    u32,
+    boot_cpuid_phys: u32,
+    size_dt_strings: u32,
+    size_dt_struct: u32,
 }
 
 // ── virtio-mmio MMIO layout ───────────────────────────────────────
@@ -87,7 +87,9 @@ pub unsafe fn enumerate(dtb: Option<PhysAddr>) -> Vec<BusDevice> {
             if let Some(hdr) = unsafe { read_header(base) } {
                 // SAFETY: `hdr` validated, base still live.
                 unsafe { walk_fdt(base, hdr, &mut out) };
-                if !out.is_empty() { return out; }
+                if !out.is_empty() {
+                    return out;
+                }
             }
         }
     }
@@ -97,9 +99,9 @@ pub unsafe fn enumerate(dtb: Option<PhysAddr>) -> Vec<BusDevice> {
     // same "trust QEMU defaults when FDT parsing isn't wired" fallback
     // `boot/src/aarch64/mod.rs` uses for the memory map. Removed when
     // `boot/` surfaces the DTB pointer through `BootInfo` end-to-end.
-    const VIRT_MMIO_BASE:   u64   = 0x0a00_0000;
-    const VIRT_MMIO_STRIDE: u64   = 0x200;
-    const VIRT_MMIO_COUNT:  u64   = 32;
+    const VIRT_MMIO_BASE: u64 = 0x0a00_0000;
+    const VIRT_MMIO_STRIDE: u64 = 0x200;
+    const VIRT_MMIO_COUNT: u64 = 32;
     for slot in 0..VIRT_MMIO_COUNT {
         let base_addr = VIRT_MMIO_BASE + slot * VIRT_MMIO_STRIDE;
         // SAFETY: virt-machine virtio-mmio region is identity-mapped.
@@ -130,8 +132,7 @@ pub unsafe fn enumerate(dtb: Option<PhysAddr>) -> Vec<BusDevice> {
 /// at `0x3F00_0000` and is 16 MiB wide (i.e. 16 buses). Used by a
 /// future DTB-driven ECAM enable path; bare reads abort today
 /// because the host bridge requires programming first.
-pub const VIRT_PCIE_ECAM_BASE: narf_memory::PhysAddr =
-    narf_memory::PhysAddr::new(0x3F00_0000);
+pub const VIRT_PCIE_ECAM_BASE: narf_memory::PhysAddr = narf_memory::PhysAddr::new(0x3F00_0000);
 
 /// PCIe bus count for QEMU `virt`. 16 MiB ECAM ÷ 1 MiB per bus.
 pub const VIRT_PCIE_NUM_BUSES: u16 = 16;
@@ -146,13 +147,10 @@ pub const VIRT_PCIE_NUM_BUSES: u16 = 16;
 /// `hdr.off_dt_struct + hdr.size_dt_struct` bytes plus the strings
 /// block.
 unsafe fn walk_fdt(base: *const u8, hdr: FdtHeader, out: &mut Vec<BusDevice>) {
-
     let struct_start = hdr.off_dt_struct as usize;
-    let struct_len   = hdr.size_dt_struct as usize;
+    let struct_len = hdr.size_dt_struct as usize;
     // SAFETY: bounds come from the header we just validated.
-    let struct_slice = unsafe {
-        core::slice::from_raw_parts(base.add(struct_start), struct_len)
-    };
+    let struct_slice = unsafe { core::slice::from_raw_parts(base.add(struct_start), struct_len) };
 
     // Minimum walk: we care only about the top-level virtio_mmio@...
     // nodes. On QEMU virt these all live directly under the root, so
@@ -169,7 +167,9 @@ unsafe fn walk_fdt(base: *const u8, hdr: FdtHeader, out: &mut Vec<BusDevice>) {
                 // following the token, padded to a 4-byte boundary.
                 let name_start = cursor;
                 let mut end = name_start;
-                while end < struct_slice.len() && struct_slice[end] != 0 { end += 1; }
+                while end < struct_slice.len() && struct_slice[end] != 0 {
+                    end += 1;
+                }
                 let name_bytes = &struct_slice[name_start..end];
                 let nlen_with_nul = (end - name_start) + 1;
                 cursor = name_start + ((nlen_with_nul + 3) & !3);
@@ -179,9 +179,9 @@ unsafe fn walk_fdt(base: *const u8, hdr: FdtHeader, out: &mut Vec<BusDevice>) {
                     // SAFETY: `struct_slice` is in-range of the FDT
                     // per the header we validated; `base` is still
                     // live; `hdr` was copied by value.
-                    if let Some((base_addr, len)) = unsafe {
-                        scan_reg_in_node(struct_slice, &mut cursor, hdr, base)
-                    } {
+                    if let Some((base_addr, len)) =
+                        unsafe { scan_reg_in_node(struct_slice, &mut cursor, hdr, base) }
+                    {
                         // cursor is now at END_NODE; account depth-wise.
                         depth += 1;
                         // SAFETY: probe does a volatile 4-byte read of
@@ -208,22 +208,21 @@ unsafe fn walk_fdt(base: *const u8, hdr: FdtHeader, out: &mut Vec<BusDevice>) {
                     // base is in the low-4-GiB identity-mapped
                     // window; higher addresses get logged + skipped.
                     // SAFETY: same FDT walk preconditions.
-                    if let Some((ecam_base, ecam_size)) = unsafe {
-                        scan_reg_in_node(struct_slice, &mut cursor, hdr, base)
-                    } {
+                    if let Some((ecam_base, ecam_size)) =
+                        unsafe { scan_reg_in_node(struct_slice, &mut cursor, hdr, base) }
+                    {
                         depth += 1;
                         if ecam_base < 0x1_0000_0000 && ecam_size > 0 {
                             // 1 MiB per bus per ECAM convention.
-                            let n_buses = (ecam_size / 0x10_0000)
-                                .min(crate::pcie::MAX_BUSES as u64) as u16;
+                            let n_buses =
+                                (ecam_size / 0x10_0000).min(crate::pcie::MAX_BUSES as u64) as u16;
                             // SAFETY: DTB asserts the ECAM region is
                             // mapped Device memory by the firmware /
                             // boot stub for low-4-GiB addresses; the
                             // walker only does aligned 4-byte reads
                             // and skips unpopulated slots.
                             let pcie = unsafe {
-                                crate::pcie::enumerate_n(
-                                    PhysAddr::new(ecam_base), n_buses)
+                                crate::pcie::enumerate_n(PhysAddr::new(ecam_base), n_buses)
                             };
                             out.extend(pcie);
                         }
@@ -236,17 +235,26 @@ unsafe fn walk_fdt(base: *const u8, hdr: FdtHeader, out: &mut Vec<BusDevice>) {
             }
             FDT_PROP => {
                 // property = len (be32), nameoff (be32), data, padded.
-                if cursor + 8 > struct_slice.len() { break; }
-                let plen  = be32(&struct_slice[cursor..cursor + 4]) as usize;
+                if cursor + 8 > struct_slice.len() {
+                    break;
+                }
+                let plen = be32(&struct_slice[cursor..cursor + 4]) as usize;
                 cursor += 8; // skip len + nameoff
                 let padded = (plen + 3) & !3;
-                if cursor + padded > struct_slice.len() { break; }
+                if cursor + padded > struct_slice.len() {
+                    break;
+                }
                 cursor += padded;
             }
-            FDT_END_NODE => { depth -= 1; if depth < 0 { break; } }
-            FDT_NOP      => {}
-            FDT_END      => break,
-            _            => break, // malformed — bail rather than loop
+            FDT_END_NODE => {
+                depth -= 1;
+                if depth < 0 {
+                    break;
+                }
+            }
+            FDT_NOP => {}
+            FDT_END => break,
+            _ => break, // malformed — bail rather than loop
         }
     }
 }
@@ -264,29 +272,28 @@ unsafe fn read_header(base: *const u8) -> Option<FdtHeader> {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: caller promises `base` points at readable memory for
     // the header's extent.
-    let raw: [u8; core::mem::size_of::<FdtHeader>()] = unsafe {
-        core::ptr::read(base as *const [u8; core::mem::size_of::<FdtHeader>()])
-    };
+    let raw: [u8; core::mem::size_of::<FdtHeader>()] =
+        unsafe { core::ptr::read(base as *const [u8; core::mem::size_of::<FdtHeader>()]) };
     compiler_fence(Ordering::SeqCst);
 
     // All header fields are big-endian u32.
-    let fetch = |off: usize| -> u32 {
-        be32(&raw[off..off + 4])
-    };
+    let fetch = |off: usize| -> u32 { be32(&raw[off..off + 4]) };
     let magic = fetch(0);
-    if magic != FDT_MAGIC { return None; }
+    if magic != FDT_MAGIC {
+        return None;
+    }
 
     Some(FdtHeader {
         magic,
-        totalsize:         fetch(4),
-        off_dt_struct:     fetch(8),
-        off_dt_strings:    fetch(12),
-        off_mem_rsvmap:    fetch(16),
-        version:           fetch(20),
+        totalsize: fetch(4),
+        off_dt_struct: fetch(8),
+        off_dt_strings: fetch(12),
+        off_mem_rsvmap: fetch(16),
+        version: fetch(20),
         last_comp_version: fetch(24),
-        boot_cpuid_phys:   fetch(28),
-        size_dt_strings:   fetch(32),
-        size_dt_struct:    fetch(36),
+        boot_cpuid_phys: fetch(28),
+        size_dt_strings: fetch(32),
+        size_dt_struct: fetch(36),
     })
 }
 
@@ -312,12 +319,16 @@ unsafe fn scan_reg_in_node(
         *cursor += 4;
         match tok {
             FDT_PROP => {
-                if *cursor + 8 > s.len() { break; }
-                let plen    = be32(&s[*cursor..*cursor + 4]) as usize;
+                if *cursor + 8 > s.len() {
+                    break;
+                }
+                let plen = be32(&s[*cursor..*cursor + 4]) as usize;
                 let nameoff = be32(&s[*cursor + 4..*cursor + 8]) as usize;
                 *cursor += 8;
                 let padded = (plen + 3) & !3;
-                if *cursor + padded > s.len() { break; }
+                if *cursor + padded > s.len() {
+                    break;
+                }
                 let data = &s[*cursor..*cursor + plen];
                 *cursor += padded;
 
@@ -326,10 +337,8 @@ unsafe fn scan_reg_in_node(
                 // remains within the FDT per the header.
                 let name = unsafe { fdt_string(base, &hdr, nameoff) };
                 if name == Some(b"reg") && found.is_none() && plen >= 16 {
-                    let addr = ((be32(&data[0..4]) as u64) << 32)
-                             | (be32(&data[4..8]) as u64);
-                    let size = ((be32(&data[8..12]) as u64) << 32)
-                             | (be32(&data[12..16]) as u64);
+                    let addr = ((be32(&data[0..4]) as u64) << 32) | (be32(&data[4..8]) as u64);
+                    let size = ((be32(&data[8..12]) as u64) << 32) | (be32(&data[12..16]) as u64);
                     found = Some((addr, size));
                 }
             }
@@ -339,13 +348,17 @@ unsafe fn scan_reg_in_node(
                 // matching END_NODE.
                 let name_start = *cursor;
                 let mut end = name_start;
-                while end < s.len() && s[end] != 0 { end += 1; }
+                while end < s.len() && s[end] != 0 {
+                    end += 1;
+                }
                 let nlen_with_nul = (end - name_start) + 1;
                 *cursor = name_start + ((nlen_with_nul + 3) & !3);
                 inner_depth += 1;
             }
             FDT_END_NODE => {
-                if inner_depth == 0 { return found; }
+                if inner_depth == 0 {
+                    return found;
+                }
                 inner_depth -= 1;
             }
             FDT_NOP | FDT_END => {}
@@ -358,7 +371,9 @@ unsafe fn scan_reg_in_node(
 /// Look up a string in the FDT strings block. Returns `None` on
 /// truncation (malformed FDT).
 unsafe fn fdt_string<'a>(base: *const u8, hdr: &FdtHeader, off: usize) -> Option<&'a [u8]> {
-    if off >= hdr.size_dt_strings as usize { return None; }
+    if off >= hdr.size_dt_strings as usize {
+        return None;
+    }
     let strings_base = hdr.off_dt_strings as usize + off;
     // SAFETY: caller promises `base` is live and the FDT was validated.
     let p = unsafe { base.add(strings_base) };
@@ -366,7 +381,9 @@ unsafe fn fdt_string<'a>(base: *const u8, hdr: &FdtHeader, off: usize) -> Option
     // Bounded scan against remaining strings block length.
     let max = (hdr.size_dt_strings as usize).saturating_sub(off);
     // SAFETY: bounded by `max`, which is <= size_dt_strings.
-    while n < max && unsafe { *p.add(n) } != 0 { n += 1; }
+    while n < max && unsafe { *p.add(n) } != 0 {
+        n += 1;
+    }
     // SAFETY: returning a slice into the FDT blob.
     Some(unsafe { core::slice::from_raw_parts(p, n) })
 }
@@ -399,30 +416,33 @@ unsafe fn probe_virtio_mmio(base_addr: u64, len: u64) -> Option<BusDevice> {
     // SAFETY: caller-asserted MMIO window.
     let magic = unsafe { core::ptr::read_volatile(base_ptr) };
     compiler_fence(Ordering::SeqCst);
-    if magic != VIRTIO_MMIO_MAGIC { return None; }
+    if magic != VIRTIO_MMIO_MAGIC {
+        return None;
+    }
 
     compiler_fence(Ordering::SeqCst);
     // SAFETY: same region, +0x08 is still inside the 0x200-byte window.
-    let device_id = unsafe {
-        core::ptr::read_volatile((base_addr + VIRTIO_MMIO_DEVICE_ID) as *const u32)
-    };
+    let device_id =
+        unsafe { core::ptr::read_volatile((base_addr + VIRTIO_MMIO_DEVICE_ID) as *const u32) };
     compiler_fence(Ordering::SeqCst);
-    if device_id == 0 { return None; } // empty slot
+    if device_id == 0 {
+        return None;
+    } // empty slot
 
     let phys = PhysAddr::new(base_addr);
     Some(BusDevice {
         addr: BusAddr::Mmio(phys),
-        id:   DeviceId {
+        id: DeviceId {
             // virtio-mmio doesn't expose PCI-style vendor/device; we
             // synthesise a recognisable pair so drivers can filter:
             // vendor = 'V' + 'I' = 0x5649 (Virtio spec reserves 0x1AF4
             // for the PCI transport, but MMIO is transport-distinct).
             vendor: 0x1AF4, // Red Hat / virtio — matches the PCI transport
             device: device_id as u16,
-            class:  0,
+            class: 0,
         },
         kind: BusKind::VirtioMmio {
-            base:      phys,
+            base: phys,
             len,
             device_id,
         },

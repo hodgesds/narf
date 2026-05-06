@@ -14,16 +14,15 @@ use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::pci::{
-    discover, map_cap, VirtioCaps, VirtioPciError, VirtioRegion,
-    CC_DEVICE_FEATURE, CC_DEVICE_FEATURE_SELECT, CC_DEVICE_STATUS,
-    CC_DRIVER_FEATURE, CC_DRIVER_FEATURE_SELECT,
-    CC_QUEUE_DESC, CC_QUEUE_DEVICE, CC_QUEUE_DRIVER, CC_QUEUE_ENABLE,
-    CC_QUEUE_NOTIFY_OFF, CC_QUEUE_SELECT, CC_QUEUE_SIZE,
+    discover, map_cap, VirtioCaps, VirtioPciError, VirtioRegion, CC_DEVICE_FEATURE,
+    CC_DEVICE_FEATURE_SELECT, CC_DEVICE_STATUS, CC_DRIVER_FEATURE, CC_DRIVER_FEATURE_SELECT,
+    CC_QUEUE_DESC, CC_QUEUE_DEVICE, CC_QUEUE_DRIVER, CC_QUEUE_ENABLE, CC_QUEUE_NOTIFY_OFF,
+    CC_QUEUE_SELECT, CC_QUEUE_SIZE,
 };
-use crate::queue::{Virtqueue, VirtqueueLayout, VirtqDesc, VIRTQ_DESC_F_WRITE};
+use crate::queue::{VirtqDesc, Virtqueue, VirtqueueLayout, VIRTQ_DESC_F_WRITE};
 use crate::{
-    VIRTIO_F_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER,
-    VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FEATURES_OK,
+    VIRTIO_F_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK,
+    VIRTIO_STATUS_FEATURES_OK,
 };
 
 pub const VIRTIO_RNG_PCI_VENDOR: u16 = 0x1AF4;
@@ -32,7 +31,7 @@ pub const VIRTIO_RNG_PCI_DEVICE: u16 = 0x1044;
 pub struct VirtioRngPci {
     notify: VirtioRegion,
     notify_off_multiplier: u32,
-    queue:  IrqSafeSpinLock<Option<Virtqueue>>,
+    queue: IrqSafeSpinLock<Option<Virtqueue>>,
     _q_buf: DmaBuffer,
     queue_notify_off: u16,
     pub ready: bool,
@@ -51,7 +50,7 @@ impl VirtioRngPci {
     /// Caller owns the device exclusively.
     pub unsafe fn bring_up(
         device: &BusDevice,
-        _cap:   &Cap<BusDeviceCap, Write>,
+        _cap: &Cap<BusDeviceCap, Write>,
     ) -> Result<Self, VirtioPciError> {
         // SAFETY: bounded walk.
         let caps: VirtioCaps = unsafe { discover(device) }?;
@@ -66,8 +65,10 @@ impl VirtioRngPci {
         unsafe {
             common.write8(CC_DEVICE_STATUS, 0);
             common.write8(CC_DEVICE_STATUS, VIRTIO_STATUS_ACKNOWLEDGE as u8);
-            common.write8(CC_DEVICE_STATUS,
-                (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER) as u8);
+            common.write8(
+                CC_DEVICE_STATUS,
+                (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER) as u8,
+            );
         }
 
         // Feature negotiation: only VERSION_1.
@@ -91,9 +92,11 @@ impl VirtioRngPci {
             common.write32(CC_DRIVER_FEATURE, 0);
             common.write32(CC_DRIVER_FEATURE_SELECT, 1);
             common.write32(CC_DRIVER_FEATURE, 1u32 << (VIRTIO_F_VERSION_1 - 32));
-            common.write8(CC_DEVICE_STATUS,
-                (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER
-                 | VIRTIO_STATUS_FEATURES_OK) as u8);
+            common.write8(
+                CC_DEVICE_STATUS,
+                (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK)
+                    as u8,
+            );
         }
         // SAFETY: same.
         let post = unsafe { common.read8(CC_DEVICE_STATUS) };
@@ -107,7 +110,9 @@ impl VirtioRngPci {
             common.write16(CC_QUEUE_SELECT, 0);
             common.read16(CC_QUEUE_SIZE)
         };
-        if qmax == 0 { return Err(VirtioPciError::QueueTooSmall); }
+        if qmax == 0 {
+            return Err(VirtioPciError::QueueTooSmall);
+        }
         // Use a small power-of-two depth ≤ qmax. virtio-rng often
         // exposes qmax = 1; we still want a sensible request buffer.
         let mut qsize = 4u16.min(qmax);
@@ -115,16 +120,18 @@ impl VirtioRngPci {
             // Round down to the largest power of 2 ≤ qsize.
             qsize = 1 << (15 - qsize.leading_zeros() as u16);
         }
-        if qsize == 0 { qsize = 1; }
+        if qsize == 0 {
+            qsize = 1;
+        }
 
-        let q_buf = alloc_coherent(4096, DomainId::DRIVER_0)
-            .map_err(|_| VirtioPciError::BarMapFailed)?;
+        let q_buf =
+            alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
         let layout = VirtqueueLayout::new(qsize, q_buf.phys_addr().raw())
             .ok_or(VirtioPciError::QueueTooSmall)?;
         // SAFETY: identity-mapped MMIO.
         unsafe {
             common.write16(CC_QUEUE_SIZE, qsize);
-            common.write64_split(CC_QUEUE_DESC,   layout.desc_table);
+            common.write64_split(CC_QUEUE_DESC, layout.desc_table);
             common.write64_split(CC_QUEUE_DRIVER, layout.avail_ring);
             common.write64_split(CC_QUEUE_DEVICE, layout.used_ring);
             // VIRTIO_MSI_NO_VECTOR — explicitly tell the device we
@@ -135,20 +142,27 @@ impl VirtioRngPci {
         // SAFETY: same.
         let queue_notify_off = unsafe { common.read16(CC_QUEUE_NOTIFY_OFF) };
         // SAFETY: same.
-        unsafe { common.write16(CC_QUEUE_ENABLE, 1); }
+        unsafe {
+            common.write16(CC_QUEUE_ENABLE, 1);
+        }
 
         // DRIVER_OK.
         // SAFETY: same.
         unsafe {
-            common.write8(CC_DEVICE_STATUS,
-                (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER
-                 | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK) as u8);
+            common.write8(
+                CC_DEVICE_STATUS,
+                (VIRTIO_STATUS_ACKNOWLEDGE
+                    | VIRTIO_STATUS_DRIVER
+                    | VIRTIO_STATUS_FEATURES_OK
+                    | VIRTIO_STATUS_DRIVER_OK) as u8,
+            );
         }
 
         // SAFETY: q_buf is zero-initialised coherent DMA.
         let queue = unsafe { Virtqueue::new(layout) };
         Ok(Self {
-            notify, notify_off_multiplier,
+            notify,
+            notify_off_multiplier,
             queue: IrqSafeSpinLock::new(Some(queue)),
             _q_buf: q_buf,
             queue_notify_off,
@@ -161,7 +175,10 @@ impl VirtioRngPci {
     /// has bumped used at all.
     pub fn diag_used_idx(&self) -> u16 {
         let g = self.queue.lock();
-        let q = match g.as_ref() { Some(q) => q, None => return 0xFFFF };
+        let q = match g.as_ref() {
+            Some(q) => q,
+            None => return 0xFFFF,
+        };
         q.used_idx_snapshot()
     }
 
@@ -169,10 +186,12 @@ impl VirtioRngPci {
     /// may write fewer bytes than requested; returns the actual
     /// count.
     pub fn read_bytes(&self, out: &mut [u8]) -> Result<usize, VirtioPciError> {
-        if out.is_empty() { return Ok(0); }
+        if out.is_empty() {
+            return Ok(0);
+        }
         let len = out.len().min(4096);
-        let buf = alloc_coherent(4096, DomainId::DRIVER_0)
-            .map_err(|_| VirtioPciError::BarMapFailed)?;
+        let buf =
+            alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
         let phys = buf.phys_addr().raw();
         // SAFETY: page-sized.
         unsafe {
@@ -180,19 +199,24 @@ impl VirtioRngPci {
                 core::ptr::write_volatile((phys + i as u64) as *mut u8, 0);
             }
         }
-        let descs = [
-            VirtqDesc { addr: phys, len: len as u32, flags: VIRTQ_DESC_F_WRITE, next: 0 },
-        ];
+        let descs = [VirtqDesc {
+            addr: phys,
+            len: len as u32,
+            flags: VIRTQ_DESC_F_WRITE,
+            next: 0,
+        }];
         let head = {
             let mut g = self.queue.lock();
             let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
-            q.add_buffer(&descs).ok_or(VirtioPciError::AddBufferFailed)?
+            q.add_buffer(&descs)
+                .ok_or(VirtioPciError::AddBufferFailed)?
         };
-        let off = (self.queue_notify_off as u64)
-            * (self.notify_off_multiplier as u64);
+        let off = (self.queue_notify_off as u64) * (self.notify_off_multiplier as u64);
         compiler_fence(Ordering::SeqCst);
         // SAFETY: identity-mapped notify region.
-        unsafe { self.notify.write16(off, 0); }
+        unsafe {
+            self.notify.write16(off, 0);
+        }
         let mut spins = 0u32;
         let used_len = loop {
             let elem = {
@@ -200,9 +224,15 @@ impl VirtioRngPci {
                 let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
                 q.poll_used()
             };
-            if let Some((id, l)) = elem { if id == head as u32 { break l as usize; } }
+            if let Some((id, l)) = elem {
+                if id == head as u32 {
+                    break l as usize;
+                }
+            }
             spins += 1;
-            if spins > 10_000_000 { return Err(VirtioPciError::CompletionTimeout); }
+            if spins > 10_000_000 {
+                return Err(VirtioPciError::CompletionTimeout);
+            }
             core::hint::spin_loop();
         };
         let n = used_len.min(len);
@@ -211,38 +241,40 @@ impl VirtioRngPci {
             out[i] = unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) };
         }
         let mut g = self.queue.lock();
-        if let Some(q) = g.as_mut() { q.free_chain(head); }
+        if let Some(q) = g.as_mut() {
+            q.free_chain(head);
+        }
         let _ = buf;
         Ok(n)
     }
 }
 
-static CONTROLLER: IrqSafeSpinLock<Option<VirtioRngPci>> =
-    IrqSafeSpinLock::new(None);
+static CONTROLLER: IrqSafeSpinLock<Option<VirtioRngPci>> = IrqSafeSpinLock::new(None);
 
-pub fn probe(
-    device: BusDevice,
-    cap:    Cap<BusDeviceCap, Write>,
-) -> Result<(), narf_bus::ProbeError> {
-    if CONTROLLER.lock().is_some() { return Ok(()); }
+pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
+    if CONTROLLER.lock().is_some() {
+        return Ok(());
+    }
     narf_bus::pci::set_command(
-        &cap, &device,
+        &cap,
+        &device,
         narf_bus::pci::cmd::MEM_SPACE
             | narf_bus::pci::cmd::BUS_MASTER
             | narf_bus::pci::cmd::INTX_DISABLE,
-    ).map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    )
+    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // SAFETY: caller-authority.
     let dev = match unsafe { VirtioRngPci::bring_up(&device, &cap) } {
-        Ok(d)  => d,
+        Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
     *CONTROLLER.lock() = Some(dev);
     narf_drivers::record_bound(narf_drivers::BoundDriver {
-        name:    alloc::string::String::from("vrng0"),
-        kind:    narf_drivers::BoundKind::Rng,
+        name: alloc::string::String::from("vrng0"),
+        kind: narf_drivers::BoundKind::Rng,
         pci_vid: Some(VIRTIO_RNG_PCI_VENDOR),
         pci_did: Some(VIRTIO_RNG_PCI_DEVICE),
-        domain:  narf_drivers::BoundKind::Rng.default_domain(),
+        domain: narf_drivers::BoundKind::Rng.default_domain(),
     });
     Ok(())
 }
@@ -258,7 +290,9 @@ pub fn register_pci_driver() {
     });
 }
 
-pub fn is_probed() -> bool { CONTROLLER.lock().is_some() }
+pub fn is_probed() -> bool {
+    CONTROLLER.lock().is_some()
+}
 
 pub fn with_controller<R>(f: impl FnOnce(&VirtioRngPci) -> R) -> Option<R> {
     CONTROLLER.lock().as_ref().map(f)

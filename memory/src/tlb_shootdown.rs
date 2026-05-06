@@ -15,7 +15,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ShootdownRequest {
     /// Tag (PCID / ASID). `None` = flush across all tags.
-    pub tag:  Option<u16>,
+    pub tag: Option<u16>,
     /// Single VA to invalidate. `None` = full per-tag flush.
     pub addr: Option<u64>,
     /// Range size in bytes (used when `addr` is set + range
@@ -25,13 +25,25 @@ pub struct ShootdownRequest {
 
 impl ShootdownRequest {
     pub const fn full() -> Self {
-        Self { tag: None, addr: None, size: None }
+        Self {
+            tag: None,
+            addr: None,
+            size: None,
+        }
     }
     pub const fn for_tag(tag: u16) -> Self {
-        Self { tag: Some(tag), addr: None, size: None }
+        Self {
+            tag: Some(tag),
+            addr: None,
+            size: None,
+        }
     }
     pub const fn for_va(tag: u16, va: u64) -> Self {
-        Self { tag: Some(tag), addr: Some(va), size: None }
+        Self {
+            tag: Some(tag),
+            addr: Some(va),
+            size: None,
+        }
     }
 }
 
@@ -98,15 +110,21 @@ fn apply_local(req: ShootdownRequest) {
     match (req.tag, req.addr) {
         (Some(t), Some(va)) => {
             // SAFETY: caller-asserted CPL=0.
-            unsafe { pcid::invpcid_addr(t, va); }
+            unsafe {
+                pcid::invpcid_addr(t, va);
+            }
         }
         (Some(t), None) => {
             // SAFETY: same.
-            unsafe { pcid::invpcid_single(t); }
+            unsafe {
+                pcid::invpcid_single(t);
+            }
         }
         (None, _) => {
             // SAFETY: same.
-            unsafe { pcid::invpcid_all_with_globals(); }
+            unsafe {
+                pcid::invpcid_all_with_globals();
+            }
         }
     }
 }
@@ -117,15 +135,21 @@ fn apply_local(req: ShootdownRequest) {
     match (req.tag, req.addr) {
         (Some(t), Some(va)) => {
             // SAFETY: kernel-test runs at EL1.
-            unsafe { sysreg::tlbi_va_asid_inner_shareable(t, va); }
+            unsafe {
+                sysreg::tlbi_va_asid_inner_shareable(t, va);
+            }
         }
         (Some(t), None) => {
             // SAFETY: same.
-            unsafe { sysreg::tlbi_asid_inner_shareable(t); }
+            unsafe {
+                sysreg::tlbi_asid_inner_shareable(t);
+            }
         }
         (None, _) => {
             // SAFETY: same.
-            unsafe { sysreg::tlb_flush_all(); }
+            unsafe {
+                sysreg::tlb_flush_all();
+            }
         }
     }
 }

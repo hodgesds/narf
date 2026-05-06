@@ -11,19 +11,25 @@ pub const VTD_IRTAR: usize = 0xB8;
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Irte {
-    pub present:       bool,
+    pub present: bool,
     pub fault_disable: bool,
-    pub dest_logical:  bool,
-    pub vector:        u8,
+    pub dest_logical: bool,
+    pub vector: u8,
     pub delivery_mode: u8,
-    pub destination:   u16,
+    pub destination: u16,
 }
 
 pub fn encode_irte(e: Irte) -> [u64; 2] {
     let mut q0: u64 = 0;
-    if e.present       { q0 |= 1 << 0; }
-    if e.fault_disable { q0 |= 1 << 1; }
-    if e.dest_logical  { q0 |= 1 << 2; }
+    if e.present {
+        q0 |= 1 << 0;
+    }
+    if e.fault_disable {
+        q0 |= 1 << 1;
+    }
+    if e.dest_logical {
+        q0 |= 1 << 2;
+    }
     q0 |= ((e.delivery_mode as u64) & 0x7) << 5;
     q0 |= ((e.vector as u64) & 0xF) << 12;
     q0 |= ((e.destination as u64) & 0xFFFF) << 32;
@@ -34,12 +40,12 @@ pub fn encode_irte(e: Irte) -> [u64; 2] {
 pub fn decode_irte(raw: [u64; 2]) -> Irte {
     let q0 = raw[0];
     Irte {
-        present:       q0 & (1 << 0) != 0,
+        present: q0 & (1 << 0) != 0,
         fault_disable: q0 & (1 << 1) != 0,
-        dest_logical:  q0 & (1 << 2) != 0,
+        dest_logical: q0 & (1 << 2) != 0,
         delivery_mode: ((q0 >> 5) & 0x7) as u8,
-        vector:        ((q0 >> 12) & 0xF) as u8,
-        destination:   ((q0 >> 32) & 0xFFFF) as u16,
+        vector: ((q0 >> 12) & 0xF) as u8,
+        destination: ((q0 >> 32) & 0xFFFF) as u16,
     }
 }
 
@@ -55,5 +61,7 @@ pub fn decode_irte(raw: [u64; 2]) -> Irte {
 pub unsafe fn write_irtar(reg_base: usize, table_pa: u64, log2_size: u8) {
     let v = (table_pa & !0xFFF) | ((log2_size as u64 - 1) & 0xF);
     // SAFETY: caller-asserted.
-    unsafe { write_volatile((reg_base + VTD_IRTAR) as *mut u64, v); }
+    unsafe {
+        write_volatile((reg_base + VTD_IRTAR) as *mut u64, v);
+    }
 }

@@ -23,29 +23,29 @@
 
 use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, Write};
-use narf_lib::sync::IrqSafeSpinLock;
 use narf_graphics::Framebuffer;
+use narf_lib::sync::IrqSafeSpinLock;
 
 pub const BOCHS_PCI_VENDOR: u16 = 0x1234;
 pub const BOCHS_PCI_DEVICE: u16 = 0x1111;
 
 const VBE_BASE: u64 = 0x500;
-const VBE_ID:           u64 = VBE_BASE + 0x00;
-const VBE_XRES:         u64 = VBE_BASE + 0x02;
-const VBE_YRES:         u64 = VBE_BASE + 0x04;
-const VBE_BPP:          u64 = VBE_BASE + 0x06;
-const VBE_ENABLE:       u64 = VBE_BASE + 0x08;
-const VBE_VIRT_WIDTH:   u64 = VBE_BASE + 0x0C;
-const VBE_VIRT_HEIGHT:  u64 = VBE_BASE + 0x0E;
+const VBE_ID: u64 = VBE_BASE + 0x00;
+const VBE_XRES: u64 = VBE_BASE + 0x02;
+const VBE_YRES: u64 = VBE_BASE + 0x04;
+const VBE_BPP: u64 = VBE_BASE + 0x06;
+const VBE_ENABLE: u64 = VBE_BASE + 0x08;
+const VBE_VIRT_WIDTH: u64 = VBE_BASE + 0x0C;
+const VBE_VIRT_HEIGHT: u64 = VBE_BASE + 0x0E;
 
 const VBE_ENABLE_BIT: u32 = 0x01;
-const VBE_LFB_BIT:    u32 = 0x40;
+const VBE_LFB_BIT: u32 = 0x40;
 
 /// Default mode requested at probe time. 1024×768×32 fits comfortably
 /// in the 16 MiB BAR0 (3 MB used) and is QEMU's bochs default.
-pub const DEFAULT_WIDTH:  u32 = 1024;
+pub const DEFAULT_WIDTH: u32 = 1024;
 pub const DEFAULT_HEIGHT: u32 = 768;
-pub const DEFAULT_BPP:    u16 = 32;
+pub const DEFAULT_BPP: u16 = 32;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BochsError {
@@ -55,12 +55,12 @@ pub enum BochsError {
 
 #[doc(hidden)]
 pub struct BochsDisplay {
-    pub width:  u32,
+    pub width: u32,
     pub height: u32,
     /// Phys + len of BAR0 (the linear framebuffer).
-    fb_region:  MmioRegion,
+    fb_region: MmioRegion,
     /// MMIO regs (BAR2). Held so its identity mapping isn't reclaimed.
-    _mmio:      MmioRegion,
+    _mmio: MmioRegion,
 }
 
 impl BochsDisplay {
@@ -68,10 +68,11 @@ impl BochsDisplay {
     /// map. Above 4 GiB, the framebuffer pointer would not resolve and
     /// callers should defer drawing until an ioremap surface lands.
     pub fn fb_reachable(&self) -> bool {
-        self.fb_region.phys.raw().saturating_add(self.fb_region.len)
-            <= 0x1_0000_0000
+        self.fb_region.phys.raw().saturating_add(self.fb_region.len) <= 0x1_0000_0000
     }
-    pub fn fb_phys(&self) -> u64 { self.fb_region.phys.raw() }
+    pub fn fb_phys(&self) -> u64 {
+        self.fb_region.phys.raw()
+    }
 }
 
 impl core::fmt::Debug for BochsDisplay {
@@ -90,14 +91,12 @@ impl BochsDisplay {
     /// + BAR2 (Stage-1 boot PML4 covers the low 4 GiB).
     pub unsafe fn bring_up(
         device: &BusDevice,
-        _cap:   &Cap<BusDeviceCap, Write>,
+        _cap: &Cap<BusDeviceCap, Write>,
     ) -> Result<Self, BochsError> {
         // SAFETY: caller-owned.
-        let fb_region = unsafe { map_bar(device, 0) }
-            .map_err(|_| BochsError::BarMapFailed)?;
+        let fb_region = unsafe { map_bar(device, 0) }.map_err(|_| BochsError::BarMapFailed)?;
         // SAFETY: caller-owned.
-        let mmio = unsafe { map_bar(device, 2) }
-            .map_err(|_| BochsError::BarMapFailed)?;
+        let mmio = unsafe { map_bar(device, 2) }.map_err(|_| BochsError::BarMapFailed)?;
 
         // Sanity check the VBE ID — the chip identifies itself in the
         // 0xB0C0..=0xB0C5 range.
@@ -111,20 +110,20 @@ impl BochsDisplay {
         // VBE Dispi registers are 16-bit at 2-byte-aligned offsets.
         // SAFETY: BAR2 mapped, valid offsets, exclusive owner.
         unsafe {
-            mmio.write16(VBE_ENABLE,      0);
-            mmio.write16(VBE_XRES,        DEFAULT_WIDTH  as u16);
-            mmio.write16(VBE_YRES,        DEFAULT_HEIGHT as u16);
-            mmio.write16(VBE_BPP,         DEFAULT_BPP);
-            mmio.write16(VBE_VIRT_WIDTH,  DEFAULT_WIDTH  as u16);
+            mmio.write16(VBE_ENABLE, 0);
+            mmio.write16(VBE_XRES, DEFAULT_WIDTH as u16);
+            mmio.write16(VBE_YRES, DEFAULT_HEIGHT as u16);
+            mmio.write16(VBE_BPP, DEFAULT_BPP);
+            mmio.write16(VBE_VIRT_WIDTH, DEFAULT_WIDTH as u16);
             mmio.write16(VBE_VIRT_HEIGHT, DEFAULT_HEIGHT as u16);
-            mmio.write16(VBE_ENABLE,      (VBE_ENABLE_BIT | VBE_LFB_BIT) as u16);
+            mmio.write16(VBE_ENABLE, (VBE_ENABLE_BIT | VBE_LFB_BIT) as u16);
         }
 
         Ok(Self {
-            width:  DEFAULT_WIDTH,
+            width: DEFAULT_WIDTH,
             height: DEFAULT_HEIGHT,
             fb_region,
-            _mmio:  mmio,
+            _mmio: mmio,
         })
     }
 
@@ -149,30 +148,30 @@ impl BochsDisplay {
     }
 }
 
-static CONTROLLER: IrqSafeSpinLock<Option<BochsDisplay>> =
-    IrqSafeSpinLock::new(None);
+static CONTROLLER: IrqSafeSpinLock<Option<BochsDisplay>> = IrqSafeSpinLock::new(None);
 
-pub fn probe(
-    device: BusDevice,
-    cap:    Cap<BusDeviceCap, Write>,
-) -> Result<(), narf_bus::ProbeError> {
-    if CONTROLLER.lock().is_some() { return Ok(()); }
+pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
+    if CONTROLLER.lock().is_some() {
+        return Ok(());
+    }
     narf_bus::pci::set_command(
-        &cap, &device,
+        &cap,
+        &device,
         narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::INTX_DISABLE,
-    ).map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    )
+    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // SAFETY: caller-authority.
     let dev = match unsafe { BochsDisplay::bring_up(&device, &cap) } {
-        Ok(d)  => d,
+        Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
     *CONTROLLER.lock() = Some(dev);
     narf_drivers::record_bound(narf_drivers::BoundDriver {
-        name:    alloc::string::String::from("bochs0"),
-        kind:    narf_drivers::BoundKind::Graphics,
+        name: alloc::string::String::from("bochs0"),
+        kind: narf_drivers::BoundKind::Graphics,
         pci_vid: Some(BOCHS_PCI_VENDOR),
         pci_did: Some(BOCHS_PCI_DEVICE),
-        domain:  narf_drivers::BoundKind::Graphics.default_domain(),
+        domain: narf_drivers::BoundKind::Graphics.default_domain(),
     });
     Ok(())
 }
@@ -188,7 +187,9 @@ pub fn register_pci_driver() {
     });
 }
 
-pub fn is_probed() -> bool { CONTROLLER.lock().is_some() }
+pub fn is_probed() -> bool {
+    CONTROLLER.lock().is_some()
+}
 
 pub fn with_controller<R>(f: impl FnOnce(&BochsDisplay) -> R) -> Option<R> {
     CONTROLLER.lock().as_ref().map(f)

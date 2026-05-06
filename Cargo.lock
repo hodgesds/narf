@@ -875,6 +875,7 @@ dependencies = [
  "narf-boot",
  "narf-bus",
  "narf-console",
+ "narf-crypto",
  "narf-drivers",
  "narf-drivers-gpu",
  "narf-drivers-i3c",
@@ -886,6 +887,7 @@ dependencies = [
  "narf-drivers-virtio",
  "narf-drivers-wireless",
  "narf-fb",
+ "narf-filesystem",
  "narf-firmware",
  "narf-firmware-fdt",
  "narf-firmware-fw-cfg",
@@ -900,10 +902,17 @@ dependencies = [
  "narf-interrupts",
  "narf-lib",
  "narf-memory",
+ "narf-observability",
+ "narf-pmbus",
+ "narf-power",
+ "narf-pwm",
  "narf-scheduler",
+ "narf-scmi",
  "narf-shmem",
+ "narf-spdm",
  "narf-time",
  "narf-tpm",
+ "narf-user-runtime",
  "narf-userspace",
  "narf-verification",
  "narf-wireless",
@@ -1068,6 +1077,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-pmbus"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "narf-capabilities",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-scheduler",
+]
+
+[[package]]
 name = "narf-power"
 version = "0.0.0"
 dependencies = [
@@ -1077,6 +1097,17 @@ dependencies = [
  "narf-lib",
  "narf-scheduler",
  "narf-time",
+]
+
+[[package]]
+name = "narf-pwm"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "narf-capabilities",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-scheduler",
 ]
 
 [[package]]
@@ -1105,6 +1136,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-scmi"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "narf-capabilities",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-scheduler",
+]
+
+[[package]]
 name = "narf-shmem"
 version = "0.0.0"
 dependencies = [
@@ -1115,6 +1157,18 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-userspace",
+]
+
+[[package]]
+name = "narf-spdm"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "narf-capabilities",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-scheduler",
+ "narf-tpm",
 ]
 
 [[package]]

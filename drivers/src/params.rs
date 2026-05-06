@@ -43,7 +43,9 @@ pub enum ParamError {
 }
 
 impl From<CapError> for ParamError {
-    fn from(_: CapError) -> Self { ParamError::AuthorityRevoked }
+    fn from(_: CapError) -> Self {
+        ParamError::AuthorityRevoked
+    }
 }
 
 /// A driver's typed parameter contract. Implementors define what
@@ -58,7 +60,7 @@ pub trait DriverParams: Send + Sync + 'static {
     /// Write-side request. An enum is the conventional shape — one
     /// variant per knob — so callers don't have to write every field
     /// when they only want to twiddle one.
-    type Update:   Copy + Send + Sync + 'static;
+    type Update: Copy + Send + Sync + 'static;
 
     /// Take a fresh snapshot. Called under the slot's lock.
     fn snapshot(&self) -> Self::Snapshot;
@@ -75,7 +77,7 @@ pub trait DriverParams: Send + Sync + 'static {
 /// `NAME.write(&cap, update)`.
 pub struct ParamSlot<T: DriverParams> {
     inner: IrqSafeSpinLock<Option<T>>,
-    _t:    PhantomData<fn() -> T>,
+    _t: PhantomData<fn() -> T>,
 }
 
 impl<T: DriverParams> ParamSlot<T> {
@@ -84,7 +86,7 @@ impl<T: DriverParams> ParamSlot<T> {
     pub const fn new() -> Self {
         Self {
             inner: IrqSafeSpinLock::new(None),
-            _t:    PhantomData,
+            _t: PhantomData,
         }
     }
 
@@ -99,10 +101,7 @@ impl<T: DriverParams> ParamSlot<T> {
     /// Holders of `Cap<DriverHandle, Write>` can call `derive::<Read>()`
     /// on it to obtain the read cap (the rights lattice asserts
     /// `Read ⊂ Write`).
-    pub fn read(
-        &self,
-        cap: &Cap<DriverHandle, Read>,
-    ) -> Result<T::Snapshot, ParamError> {
+    pub fn read(&self, cap: &Cap<DriverHandle, Read>) -> Result<T::Snapshot, ParamError> {
         cap.check_live()?;
         let g = self.inner.lock();
         let p = g.as_ref().ok_or(ParamError::NotInstalled)?;
@@ -116,7 +115,7 @@ impl<T: DriverParams> ParamSlot<T> {
     /// scheduler task.
     pub fn write(
         &self,
-        cap:    &Cap<DriverHandle, Write>,
+        cap: &Cap<DriverHandle, Write>,
         update: T::Update,
     ) -> Result<(), ParamError> {
         cap.check_live()?;
@@ -126,7 +125,9 @@ impl<T: DriverParams> ParamSlot<T> {
     }
 
     /// `true` once `install` has populated the slot.
-    pub fn is_installed(&self) -> bool { self.inner.lock().is_some() }
+    pub fn is_installed(&self) -> bool {
+        self.inner.lock().is_some()
+    }
 
     /// Drop the installed instance without any cap check. Test-only
     /// reset path that lets the kernel-test harness re-install the

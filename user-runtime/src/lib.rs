@@ -37,126 +37,126 @@ pub mod shmem;
 // development with relibc. If the kernel-side enum gains numbers,
 // add them here too.
 
-pub const SYS_SUBMIT:         u64 = 100;
-pub const SYS_BOOTSTRAP:      u64 = 101;
-pub const SYS_WAIT_COMPL:     u64 = 102;
-pub const SYS_EXIT_TASK:      u64 = 103;
-pub const SYS_YIELD:          u64 = 104;
-pub const SYS_SLEEP:          u64 = 105;
-pub const SYS_OPEN:           u64 = 110;
-pub const SYS_READ:           u64 = 111;
-pub const SYS_WRITE:          u64 = 112;
-pub const SYS_CLOSE:          u64 = 113;
+pub const SYS_SUBMIT: u64 = 100;
+pub const SYS_BOOTSTRAP: u64 = 101;
+pub const SYS_WAIT_COMPL: u64 = 102;
+pub const SYS_EXIT_TASK: u64 = 103;
+pub const SYS_YIELD: u64 = 104;
+pub const SYS_SLEEP: u64 = 105;
+pub const SYS_OPEN: u64 = 110;
+pub const SYS_READ: u64 = 111;
+pub const SYS_WRITE: u64 = 112;
+pub const SYS_CLOSE: u64 = 113;
 // Tier-2 fd-table breadth + path resolution + pipe (115..=117 reserved).
-pub const SYS_GETRANDOM:      u64 = 200;
-pub const SYS_READLINK:       u64 = 193;
-pub const SYS_SYMLINK:        u64 = 194;
-pub const SYS_LISTDIR:        u64 = 195;
-pub const SYS_GETDENTS64:     u64 = 196;
-pub const SYS_STAT:           u64 = 115;
-pub const SYS_LSTAT:          u64 = 133;
-pub const SYS_FSTAT:          u64 = 116;
-pub const SYS_PIPE:           u64 = 117;
-pub const SYS_MMAP:           u64 = 120;
-pub const SYS_MUNMAP:         u64 = 121;
-pub const SYS_FB_CONNECT:     u64 = 240;
-pub const SYS_FB_INFO:        u64 = 241;
-pub const SYS_FB_RING_MAP:    u64 = 242;
-pub const SYS_FB_FLUSH_WAIT:  u64 = 243;
-pub const SYS_FB_DISCONNECT:  u64 = 244;
-pub const SYS_SHMEM_CREATE:   u64 = 250;
-pub const SYS_SHMEM_MAP:      u64 = 251;
-pub const SYS_SHMEM_DESTROY:  u64 = 252;
-pub const SYS_RING_KICK:      u64 = 130;
-pub const SYS_GETPID:         u64 = 140;
-pub const SYS_GETPPID:        u64 = 141;
-pub const SYS_GETUID:         u64 = 142;
-pub const SYS_GETGID:         u64 = 143;
-pub const SYS_SETUID:         u64 = 144;
-pub const SYS_SETGID:         u64 = 145;
-pub const SYS_GETPGID:        u64 = 224;
-pub const SYS_SETPGID:        u64 = 225;
-pub const SYS_GETSID:         u64 = 226;
-pub const SYS_SETSID:         u64 = 227;
-pub const SYS_FTRUNCATE:      u64 = 118;
-pub const SYS_TRUNCATE:       u64 = 132;
-pub const SYS_PREAD64:        u64 = 119;
-pub const SYS_PWRITE64:       u64 = 122;
-pub const SYS_FSYNC:          u64 = 123;
-pub const SYS_FDATASYNC:      u64 = 124;
-pub const SYS_PIPE2:          u64 = 125;
-pub const SYS_FALLOCATE:      u64 = 126;
+pub const SYS_GETRANDOM: u64 = 200;
+pub const SYS_READLINK: u64 = 193;
+pub const SYS_SYMLINK: u64 = 194;
+pub const SYS_LISTDIR: u64 = 195;
+pub const SYS_GETDENTS64: u64 = 196;
+pub const SYS_STAT: u64 = 115;
+pub const SYS_LSTAT: u64 = 133;
+pub const SYS_FSTAT: u64 = 116;
+pub const SYS_PIPE: u64 = 117;
+pub const SYS_MMAP: u64 = 120;
+pub const SYS_MUNMAP: u64 = 121;
+pub const SYS_FB_CONNECT: u64 = 240;
+pub const SYS_FB_INFO: u64 = 241;
+pub const SYS_FB_RING_MAP: u64 = 242;
+pub const SYS_FB_FLUSH_WAIT: u64 = 243;
+pub const SYS_FB_DISCONNECT: u64 = 244;
+pub const SYS_SHMEM_CREATE: u64 = 250;
+pub const SYS_SHMEM_MAP: u64 = 251;
+pub const SYS_SHMEM_DESTROY: u64 = 252;
+pub const SYS_RING_KICK: u64 = 130;
+pub const SYS_GETPID: u64 = 140;
+pub const SYS_GETPPID: u64 = 141;
+pub const SYS_GETUID: u64 = 142;
+pub const SYS_GETGID: u64 = 143;
+pub const SYS_SETUID: u64 = 144;
+pub const SYS_SETGID: u64 = 145;
+pub const SYS_GETPGID: u64 = 224;
+pub const SYS_SETPGID: u64 = 225;
+pub const SYS_GETSID: u64 = 226;
+pub const SYS_SETSID: u64 = 227;
+pub const SYS_FTRUNCATE: u64 = 118;
+pub const SYS_TRUNCATE: u64 = 132;
+pub const SYS_PREAD64: u64 = 119;
+pub const SYS_PWRITE64: u64 = 122;
+pub const SYS_FSYNC: u64 = 123;
+pub const SYS_FDATASYNC: u64 = 124;
+pub const SYS_PIPE2: u64 = 125;
+pub const SYS_FALLOCATE: u64 = 126;
 pub const SYS_COPY_FILE_RANGE: u64 = 127;
-pub const SYS_MEMFD_CREATE:   u64 = 128;
-pub const SYS_FCHMOD:         u64 = 129;
-pub const SYS_FCHOWN:         u64 = 131;
-pub const SYS_FCHMODAT:       u64 = 134;
-pub const SYS_FCHOWNAT:       u64 = 135;
-pub const SYS_FACCESSAT:      u64 = 136;
-pub const SYS_OPENAT:         u64 = 137;
-pub const SYS_NEWFSTATAT:     u64 = 138;
-pub const SYS_UNLINKAT:       u64 = 139;
-pub const SYS_MKDIRAT:        u64 = 228;
-pub const SYS_RENAMEAT:       u64 = 229;
-pub const SYS_SYMLINKAT:      u64 = 230;
-pub const SYS_READLINKAT:     u64 = 231;
-pub const SYS_ACCESS:         u64 = 232;
-pub const SYS_CHMOD:          u64 = 233;
-pub const SYS_CHOWN:          u64 = 234;
-pub const SYS_GETHOSTNAME:    u64 = 146;
-pub const SYS_SETHOSTNAME:    u64 = 147;
-pub const SYS_GETRLIMIT:      u64 = 148;
-pub const SYS_SETRLIMIT:      u64 = 149;
-pub const SYS_PRLIMIT64:      u64 = 178;
-pub const SYS_UMASK:          u64 = 155;
-pub const SYS_GETPRIORITY:    u64 = 156;
-pub const SYS_GETCPU:         u64 = 165;
+pub const SYS_MEMFD_CREATE: u64 = 128;
+pub const SYS_FCHMOD: u64 = 129;
+pub const SYS_FCHOWN: u64 = 131;
+pub const SYS_FCHMODAT: u64 = 134;
+pub const SYS_FCHOWNAT: u64 = 135;
+pub const SYS_FACCESSAT: u64 = 136;
+pub const SYS_OPENAT: u64 = 137;
+pub const SYS_NEWFSTATAT: u64 = 138;
+pub const SYS_UNLINKAT: u64 = 139;
+pub const SYS_MKDIRAT: u64 = 228;
+pub const SYS_RENAMEAT: u64 = 229;
+pub const SYS_SYMLINKAT: u64 = 230;
+pub const SYS_READLINKAT: u64 = 231;
+pub const SYS_ACCESS: u64 = 232;
+pub const SYS_CHMOD: u64 = 233;
+pub const SYS_CHOWN: u64 = 234;
+pub const SYS_GETHOSTNAME: u64 = 146;
+pub const SYS_SETHOSTNAME: u64 = 147;
+pub const SYS_GETRLIMIT: u64 = 148;
+pub const SYS_SETRLIMIT: u64 = 149;
+pub const SYS_PRLIMIT64: u64 = 178;
+pub const SYS_UMASK: u64 = 155;
+pub const SYS_GETPRIORITY: u64 = 156;
+pub const SYS_GETCPU: u64 = 165;
 pub const SYS_SCHED_GETAFFINITY: u64 = 166;
 pub const SYS_SCHED_SETAFFINITY: u64 = 167;
 pub const SYS_SCHED_GET_PRIORITY_MAX: u64 = 220;
 pub const SYS_SCHED_GET_PRIORITY_MIN: u64 = 221;
-pub const SYS_SCHED_GETPARAM:    u64 = 222;
-pub const SYS_SCHED_SETPARAM:    u64 = 223;
-pub const SYS_GETTID:         u64 = 168;
-pub const SYS_PRCTL:          u64 = 169;
-pub const SYS_TGKILL:         u64 = 175;
-pub const SYS_FUTEX:          u64 = 177;
-pub const SYS_SETPRIORITY:    u64 = 157;
-pub const SYS_TIMES:          u64 = 158;
-pub const SYS_GETRUSAGE:      u64 = 159;
-pub const SYS_BRK:            u64 = 150;
-pub const SYS_CLOCK_GETTIME:  u64 = 151;
-pub const SYS_CLOCK_SETTIME:  u64 = 176;
-pub const SYS_SIGACTION:      u64 = 152;
-pub const SYS_KILL:           u64 = 153;
-pub const SYS_SIGPROCMASK:    u64 = 154;
+pub const SYS_SCHED_GETPARAM: u64 = 222;
+pub const SYS_SCHED_SETPARAM: u64 = 223;
+pub const SYS_GETTID: u64 = 168;
+pub const SYS_PRCTL: u64 = 169;
+pub const SYS_TGKILL: u64 = 175;
+pub const SYS_FUTEX: u64 = 177;
+pub const SYS_SETPRIORITY: u64 = 157;
+pub const SYS_TIMES: u64 = 158;
+pub const SYS_GETRUSAGE: u64 = 159;
+pub const SYS_BRK: u64 = 150;
+pub const SYS_CLOCK_GETTIME: u64 = 151;
+pub const SYS_CLOCK_SETTIME: u64 = 176;
+pub const SYS_SIGACTION: u64 = 152;
+pub const SYS_KILL: u64 = 153;
+pub const SYS_SIGPROCMASK: u64 = 154;
 // Dup family + fcntl (160..=163 reserved).
-pub const SYS_DUP:            u64 = 160;
-pub const SYS_DUP2:           u64 = 161;
-pub const SYS_DUP3:           u64 = 162;
-pub const SYS_FCNTL:          u64 = 163;
+pub const SYS_DUP: u64 = 160;
+pub const SYS_DUP2: u64 = 161;
+pub const SYS_DUP3: u64 = 162;
+pub const SYS_FCNTL: u64 = 163;
 // Cwd state (170/171).
-pub const SYS_CHDIR:          u64 = 170;
-pub const SYS_GETCWD:         u64 = 171;
+pub const SYS_CHDIR: u64 = 170;
+pub const SYS_GETCWD: u64 = 171;
 
-pub const SYS_LSEEK:          u64 = 164;
-pub const SYS_UNLINK:         u64 = 180;
-pub const SYS_MKDIR:          u64 = 190;
-pub const SYS_RMDIR:          u64 = 191;
-pub const SYS_RENAME:         u64 = 192;
+pub const SYS_LSEEK: u64 = 164;
+pub const SYS_UNLINK: u64 = 180;
+pub const SYS_MKDIR: u64 = 190;
+pub const SYS_RMDIR: u64 = 191;
+pub const SYS_RENAME: u64 = 192;
 
 /// `fcntl` command constants — match Linux numbering for the subset
 /// NARF supports today (FD_CLOEXEC + the file-flag query/set pair).
-pub const F_GETFD:    u32 = 1;
-pub const F_SETFD:    u32 = 2;
-pub const F_GETFL:    u32 = 3;
-pub const F_SETFL:    u32 = 4;
+pub const F_GETFD: u32 = 1;
+pub const F_SETFD: u32 = 2;
+pub const F_GETFL: u32 = 3;
+pub const F_SETFL: u32 = 4;
 /// `FD_CLOEXEC` flag bit — the only `flags` bit NARF currently
 /// stamps onto an fd entry.
 pub const FD_CLOEXEC: u32 = 1;
 
 /// `sigprocmask` how-flags — match POSIX.
-pub const SIG_BLOCK:   u32 = 0;
+pub const SIG_BLOCK: u32 = 0;
 pub const SIG_UNBLOCK: u32 = 1;
 pub const SIG_SETMASK: u32 = 2;
 
@@ -268,9 +268,7 @@ unsafe fn syscall4(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-unsafe fn syscall5(
-    num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64,
-) -> u64 {
+unsafe fn syscall5(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
     let mut rax = num;
     // SAFETY: r8 is the 5th-arg register (NARF mirrors Linux's
     // amd64 kernel convention; see `syscall3` for the RDX rationale).
@@ -289,9 +287,7 @@ unsafe fn syscall5(
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-unsafe fn syscall6(
-    num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64,
-) -> u64 {
+unsafe fn syscall6(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
     let mut rax = num;
     // SAFETY: r9 is the 6th-arg register per the kernel convention.
     unsafe {
@@ -395,9 +391,7 @@ unsafe fn syscall4(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn syscall5(
-    num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64,
-) -> u64 {
+unsafe fn syscall5(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
     let mut ret: u64;
     // SAFETY: see `syscall0`.
     unsafe {
@@ -414,9 +408,7 @@ unsafe fn syscall5(
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn syscall6(
-    num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64,
-) -> u64 {
+unsafe fn syscall6(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
     let mut ret: u64;
     // SAFETY: see `syscall0`.
     unsafe {
@@ -443,15 +435,21 @@ pub fn exit_task() -> ! {
     // SAFETY: SYS_EXIT_TASK takes no args and never returns on
     // success; on failure we spin (we have no console + no panic
     // handler in this crate).
-    unsafe { syscall0(SYS_EXIT_TASK); }
-    loop { core::hint::spin_loop(); }
+    unsafe {
+        syscall0(SYS_EXIT_TASK);
+    }
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 /// Yield the CPU; returns when rescheduled.
 #[inline]
 pub fn yield_now() {
     // SAFETY: SYS_YIELD takes no args and returns normally.
-    unsafe { syscall0(SYS_YIELD); }
+    unsafe {
+        syscall0(SYS_YIELD);
+    }
 }
 
 /// Calling task's monotonic id.
@@ -491,7 +489,11 @@ pub fn getgid() -> u64 {
 pub fn setuid(uid: u32) -> i32 {
     // SAFETY: SYS_SETUID takes one arg (uid).
     let r = unsafe { syscall1(SYS_SETUID, uid as u64) };
-    if r as i64 == -1 { -1 } else { 0 }
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `setgid(gid)` — update the calling task's gid; see [`setuid`].
@@ -499,7 +501,11 @@ pub fn setuid(uid: u32) -> i32 {
 pub fn setgid(gid: u32) -> i32 {
     // SAFETY: SYS_SETGID takes one arg (gid).
     let r = unsafe { syscall1(SYS_SETGID, gid as u64) };
-    if r as i64 == -1 { -1 } else { 0 }
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `getpgid(pid)` — POSIX process-group id query. `pid = 0` →
@@ -516,7 +522,11 @@ pub fn getpgid(pid: u64) -> u64 {
 pub fn setpgid(pid: u64, pgid: u64) -> i32 {
     // SAFETY: SYS_SETPGID signature: (pid, pgid).
     let r = unsafe { syscall2(SYS_SETPGID, pid, pgid) };
-    if r as i64 == -1 { -1 } else { 0 }
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `getsid(pid)` — POSIX session id query. `pid = 0` → self.
@@ -540,19 +550,27 @@ pub fn setsid() -> u64 {
 pub fn ftruncate(fd: u32, len: u64) -> i32 {
     // SAFETY: SYS_FTRUNCATE signature: (fd, len).
     let r = unsafe { syscall2(SYS_FTRUNCATE, fd as u64, len) };
-    if r as i64 == -1 { -1 } else { 0 }
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `truncate(path, len)` — path-based resize. Returns 0 on
 /// success, -1 on bad path / read-only FS.
 #[inline]
 pub fn truncate(path: &str, len: u64) -> i32 {
-    if path.is_empty() { return -1; }
+    if path.is_empty() {
+        return -1;
+    }
     // SAFETY: SYS_TRUNCATE signature: (path_ptr, path_len, len).
-    let r = unsafe {
-        syscall3(SYS_TRUNCATE, path.as_ptr() as u64, path.len() as u64, len)
-    };
-    if r as i64 == -1 { -1 } else { 0 }
+    let r = unsafe { syscall3(SYS_TRUNCATE, path.as_ptr() as u64, path.len() as u64, len) };
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `pread(fd, buf, offset)` — read at the explicit offset without
@@ -560,12 +578,16 @@ pub fn truncate(path: &str, len: u64) -> i32 {
 /// error.
 #[inline]
 pub fn pread(fd: u32, buf: &mut [u8], offset: u64) -> isize {
-    if buf.is_empty() { return 0; }
+    if buf.is_empty() {
+        return 0;
+    }
     // SAFETY: SYS_PREAD64 signature: (fd, buf_ptr, len, offset).
     let r = unsafe {
         syscall4(
-            SYS_PREAD64, fd as u64,
-            buf.as_mut_ptr() as u64, buf.len() as u64,
+            SYS_PREAD64,
+            fd as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
             offset,
         )
     };
@@ -575,12 +597,16 @@ pub fn pread(fd: u32, buf: &mut [u8], offset: u64) -> isize {
 /// `pwrite(fd, buf, offset)` — write at the explicit offset.
 #[inline]
 pub fn pwrite(fd: u32, buf: &[u8], offset: u64) -> isize {
-    if buf.is_empty() { return 0; }
+    if buf.is_empty() {
+        return 0;
+    }
     // SAFETY: SYS_PWRITE64 signature: (fd, buf_ptr, len, offset).
     let r = unsafe {
         syscall4(
-            SYS_PWRITE64, fd as u64,
-            buf.as_ptr() as u64, buf.len() as u64,
+            SYS_PWRITE64,
+            fd as u64,
+            buf.as_ptr() as u64,
+            buf.len() as u64,
             offset,
         )
     };
@@ -594,7 +620,11 @@ pub fn pwrite(fd: u32, buf: &[u8], offset: u64) -> isize {
 pub fn fsync(fd: u32) -> i32 {
     // SAFETY: SYS_FSYNC takes a single arg (fd).
     let r = unsafe { syscall1(SYS_FSYNC, fd as u64) };
-    if r as i64 == -1 { -1 } else { 0 }
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `fdatasync(fd)` — like [`fsync`] but only metadata-omitted.
@@ -603,7 +633,11 @@ pub fn fsync(fd: u32) -> i32 {
 pub fn fdatasync(fd: u32) -> i32 {
     // SAFETY: SYS_FDATASYNC takes a single arg (fd).
     let r = unsafe { syscall1(SYS_FDATASYNC, fd as u64) };
-    if r as i64 == -1 { -1 } else { 0 }
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `times(buf)` — write `[utime, stime, cutime, cstime]` (POSIX
@@ -622,10 +656,12 @@ pub fn times(buf: &mut [i64; 4]) -> i64 {
 #[inline]
 pub fn getrusage(who: i32, buf: &mut [i64; 18]) -> i32 {
     // SAFETY: SYS_GETRUSAGE signature: (who, out_ptr).
-    let r = unsafe {
-        syscall2(SYS_GETRUSAGE, who as u64, buf.as_mut_ptr() as u64)
-    };
-    if r as i64 == -1 { -1 } else { 0 }
+    let r = unsafe { syscall2(SYS_GETRUSAGE, who as u64, buf.as_mut_ptr() as u64) };
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `umask(new_mask)` — set the file-creation mask and return the
@@ -642,10 +678,12 @@ pub fn umask(new_mask: u32) -> u32 {
 #[inline]
 pub fn tgkill(tgid: i64, tid: u64, signum: u32) -> i32 {
     // SAFETY: SYS_TGKILL signature: (tgid, tid, signum).
-    let r = unsafe {
-        syscall3(SYS_TGKILL, tgid as u64, tid, signum as u64)
-    };
-    if r as i64 == -1 { -1 } else { 0 }
+    let r = unsafe { syscall3(SYS_TGKILL, tgid as u64, tid, signum as u64) };
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `futex(uaddr, op, val, timeout, uaddr2, val3)` — Linux futex(2).
@@ -653,21 +691,18 @@ pub fn tgkill(tgid: i64, tid: u64, signum: u32) -> i32 {
 /// (with optional FUTEX_PRIVATE and FUTEX_CLOCK_REALTIME bits);
 /// every other op returns -1.
 #[inline]
-pub fn futex(
-    uaddr:   *mut u32,
-    op:      u32,
-    val:     u32,
-    timeout: u64,
-    uaddr2:  u64,
-    val3:    u32,
-) -> i64 {
+pub fn futex(uaddr: *mut u32, op: u32, val: u32, timeout: u64, uaddr2: u64, val3: u32) -> i64 {
     // SAFETY: SYS_FUTEX signature mirrors Linux:
     //   (uaddr, op, val, timeout/uaddr2, uaddr2, val3).
     let r = unsafe {
         syscall6(
             SYS_FUTEX,
-            uaddr as u64, op as u64, val as u64,
-            timeout, uaddr2, val3 as u64,
+            uaddr as u64,
+            op as u64,
+            val as u64,
+            timeout,
+            uaddr2,
+            val3 as u64,
         )
     };
     r as i64
@@ -717,10 +752,12 @@ pub fn sched_get_priority_min(policy: u32) -> i32 {
 pub fn sched_getparam(pid: u64) -> i32 {
     let mut prio: i32 = 0;
     // SAFETY: SYS_SCHED_GETPARAM signature: (pid, out_ptr).
-    let r = unsafe {
-        syscall2(SYS_SCHED_GETPARAM, pid, &mut prio as *mut i32 as u64)
-    };
-    if r as i64 == -1 { -1 } else { prio }
+    let r = unsafe { syscall2(SYS_SCHED_GETPARAM, pid, &mut prio as *mut i32 as u64) };
+    if r as i64 == -1 {
+        -1
+    } else {
+        prio
+    }
 }
 
 /// `sched_setparam(pid, prio)` — set sched_priority.
@@ -728,10 +765,12 @@ pub fn sched_getparam(pid: u64) -> i32 {
 pub fn sched_setparam(pid: u64, prio: i32) -> i32 {
     let val: i32 = prio;
     // SAFETY: SYS_SCHED_SETPARAM signature: (pid, in_ptr).
-    let r = unsafe {
-        syscall2(SYS_SCHED_SETPARAM, pid, &val as *const i32 as u64)
-    };
-    if r as i64 == -1 { -1 } else { 0 }
+    let r = unsafe { syscall2(SYS_SCHED_SETPARAM, pid, &val as *const i32 as u64) };
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `sched_getaffinity(pid, mask)` — fill `mask` with the CPU
@@ -739,12 +778,16 @@ pub fn sched_setparam(pid: u64, prio: i32) -> i32 {
 /// written on success, -1 on bad input.
 #[inline]
 pub fn sched_getaffinity(pid: u32, mask: &mut [u8]) -> isize {
-    if mask.is_empty() { return -1; }
+    if mask.is_empty() {
+        return -1;
+    }
     // SAFETY: SYS_SCHED_GETAFFINITY signature: (pid, size, mask_ptr).
     let r = unsafe {
         syscall3(
             SYS_SCHED_GETAFFINITY,
-            pid as u64, mask.len() as u64, mask.as_mut_ptr() as u64,
+            pid as u64,
+            mask.len() as u64,
+            mask.as_mut_ptr() as u64,
         )
     };
     r as isize
@@ -755,15 +798,23 @@ pub fn sched_getaffinity(pid: u32, mask: &mut [u8]) -> isize {
 /// Returns 0 on success, -1 on bad input.
 #[inline]
 pub fn sched_setaffinity(pid: u32, mask: &[u8]) -> i32 {
-    if mask.is_empty() { return -1; }
+    if mask.is_empty() {
+        return -1;
+    }
     // SAFETY: SYS_SCHED_SETAFFINITY signature: (pid, size, mask_ptr).
     let r = unsafe {
         syscall3(
             SYS_SCHED_SETAFFINITY,
-            pid as u64, mask.len() as u64, mask.as_ptr() as u64,
+            pid as u64,
+            mask.len() as u64,
+            mask.as_ptr() as u64,
         )
     };
-    if r as i64 == -1 { -1 } else { 0 }
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `getcpu(*cpu, *node)` — write the current CPU id and NUMA
@@ -771,11 +822,15 @@ pub fn sched_setaffinity(pid: u32, mask: &[u8]) -> i32 {
 /// returns 0; NARF user mode is single-CPU so both write 0.
 #[inline]
 pub fn getcpu() -> (u32, u32) {
-    let mut cpu: u32  = !0;
+    let mut cpu: u32 = !0;
     let mut node: u32 = !0;
     // SAFETY: SYS_GETCPU signature: (cpu_ptr, node_ptr).
     let _ = unsafe {
-        syscall2(SYS_GETCPU, &mut cpu as *mut u32 as u64, &mut node as *mut u32 as u64)
+        syscall2(
+            SYS_GETCPU,
+            &mut cpu as *mut u32 as u64,
+            &mut node as *mut u32 as u64,
+        )
     };
     (cpu, node)
 }
@@ -788,7 +843,11 @@ pub fn getcpu() -> (u32, u32) {
 pub fn getpriority(which: u32, who: u32) -> i64 {
     // SAFETY: SYS_GETPRIORITY signature: (which, who).
     let r = unsafe { syscall2(SYS_GETPRIORITY, which as u64, who as u64) };
-    if r as i64 == -1 { -1 } else { (r as i64) - 20 }
+    if r as i64 == -1 {
+        -1
+    } else {
+        (r as i64) - 20
+    }
 }
 
 /// `setpriority(which, who, prio)` — record a new nice value
@@ -797,10 +856,12 @@ pub fn getpriority(which: u32, who: u32) -> i64 {
 #[inline]
 pub fn setpriority(which: u32, who: u32, prio: i32) -> i32 {
     // SAFETY: SYS_SETPRIORITY signature: (which, who, prio).
-    let r = unsafe {
-        syscall3(SYS_SETPRIORITY, which as u64, who as u64, prio as u64)
-    };
-    if r as i64 == -1 { -1 } else { 0 }
+    let r = unsafe { syscall3(SYS_SETPRIORITY, which as u64, who as u64, prio as u64) };
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `getrlimit(resource, out)` — read the calling task's
@@ -810,20 +871,24 @@ pub fn setpriority(which: u32, who: u32, prio: i32) -> i32 {
 #[inline]
 pub fn getrlimit(resource: u32, out: &mut [u64; 2]) -> i32 {
     // SAFETY: SYS_GETRLIMIT signature: (resource, out_ptr).
-    let r = unsafe {
-        syscall2(SYS_GETRLIMIT, resource as u64, out.as_mut_ptr() as u64)
-    };
-    if r as i64 == -1 { -1 } else { 0 }
+    let r = unsafe { syscall2(SYS_GETRLIMIT, resource as u64, out.as_mut_ptr() as u64) };
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `setrlimit(resource, val)` — record `val = [cur, max]`.
 #[inline]
 pub fn setrlimit(resource: u32, val: &[u64; 2]) -> i32 {
     // SAFETY: SYS_SETRLIMIT signature: (resource, in_ptr).
-    let r = unsafe {
-        syscall2(SYS_SETRLIMIT, resource as u64, val.as_ptr() as u64)
-    };
-    if r as i64 == -1 { -1 } else { 0 }
+    let r = unsafe { syscall2(SYS_SETRLIMIT, resource as u64, val.as_ptr() as u64) };
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `prlimit64(pid, resource, new, old)` — combined Linux get-and-
@@ -831,18 +896,20 @@ pub fn setrlimit(resource: u32, val: &[u64; 2]) -> i32 {
 /// Returns 0 on success, -1 on bad input.
 #[inline]
 pub fn prlimit64(
-    pid:      u64,
+    pid: u64,
     resource: u32,
-    new_val:  Option<&[u64; 2]>,
-    old_out:  Option<&mut [u64; 2]>,
+    new_val: Option<&[u64; 2]>,
+    old_out: Option<&mut [u64; 2]>,
 ) -> i32 {
     let new_ptr = new_val.map(|v| v.as_ptr() as u64).unwrap_or(0);
     let old_ptr = old_out.map(|v| v.as_mut_ptr() as u64).unwrap_or(0);
     // SAFETY: SYS_PRLIMIT64 signature: (pid, resource, new_ptr, old_ptr).
-    let r = unsafe {
-        syscall4(SYS_PRLIMIT64, pid, resource as u64, new_ptr, old_ptr)
-    };
-    if r as i64 == -1 { -1 } else { 0 }
+    let r = unsafe { syscall4(SYS_PRLIMIT64, pid, resource as u64, new_ptr, old_ptr) };
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `gethostname(buf)` — copy the kernel-wide hostname into `buf`,
@@ -850,23 +917,31 @@ pub fn prlimit64(
 /// success, -1 on `buf.len() < name_len + 1`.
 #[inline]
 pub fn gethostname(buf: &mut [u8]) -> i32 {
-    if buf.is_empty() { return -1; }
+    if buf.is_empty() {
+        return -1;
+    }
     // SAFETY: SYS_GETHOSTNAME signature: (buf_ptr, buf_len).
-    let r = unsafe {
-        syscall2(SYS_GETHOSTNAME, buf.as_mut_ptr() as u64, buf.len() as u64)
-    };
-    if r as i64 == -1 { -1 } else { r as i32 }
+    let r = unsafe { syscall2(SYS_GETHOSTNAME, buf.as_mut_ptr() as u64, buf.len() as u64) };
+    if r as i64 == -1 {
+        -1
+    } else {
+        r as i32
+    }
 }
 
 /// `sethostname(s)` — replace the kernel-wide hostname.
 #[inline]
 pub fn sethostname(s: &str) -> i32 {
-    if s.is_empty() { return -1; }
+    if s.is_empty() {
+        return -1;
+    }
     // SAFETY: SYS_SETHOSTNAME signature: (buf_ptr, buf_len).
-    let r = unsafe {
-        syscall2(SYS_SETHOSTNAME, s.as_ptr() as u64, s.len() as u64)
-    };
-    if r as i64 == -1 { -1 } else { 0 }
+    let r = unsafe { syscall2(SYS_SETHOSTNAME, s.as_ptr() as u64, s.len() as u64) };
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 // ── Memory ─────────────────────────────────────────────────────────
@@ -896,14 +971,14 @@ pub unsafe fn mmap(hint: usize, len: usize, flags: u32) -> *mut u8 {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct FbInfo {
-    pub width:        u32,
-    pub height:       u32,
+    pub width: u32,
+    pub height: u32,
     pub stride_bytes: u32,
     /// `1 = XRGB8888`. New formats add new tags; this is not a
     /// bitfield.
-    pub format:       u32,
-    pub scanout_id:   u32,
-    pub _resv:        u32,
+    pub format: u32,
+    pub scanout_id: u32,
+    pub _resv: u32,
 }
 
 /// Format tag returned in `FbInfo::format` for XRGB8888 scanouts.
@@ -930,10 +1005,12 @@ pub unsafe fn fb_info(handle: u64) -> Result<FbInfo, ()> {
     let mut out = FbInfo::default();
     // SAFETY: SYS_FB_INFO writes 6 u32s through the user pointer;
     // FbInfo is repr(C) and 24 bytes (u32 × 6).
-    let r = unsafe {
-        syscall2(SYS_FB_INFO, handle, &mut out as *mut FbInfo as u64)
-    };
-    if r == 0 { Ok(out) } else { Err(()) }
+    let r = unsafe { syscall2(SYS_FB_INFO, handle, &mut out as *mut FbInfo as u64) };
+    if r == 0 {
+        Ok(out)
+    } else {
+        Err(())
+    }
 }
 
 /// Map the connection's draw-ring into the caller's VA. Returns the
@@ -947,7 +1024,11 @@ pub unsafe fn fb_info(handle: u64) -> Result<FbInfo, ()> {
 pub unsafe fn fb_ring_map(handle: u64) -> *mut u8 {
     // SAFETY: SYS_FB_RING_MAP signature: arg0 handle.
     let r = unsafe { syscall1(SYS_FB_RING_MAP, handle) };
-    if r == 0 || r == !0u64 { core::ptr::null_mut() } else { r as *mut u8 }
+    if r == 0 || r == !0u64 {
+        core::ptr::null_mut()
+    } else {
+        r as *mut u8
+    }
 }
 
 /// Snapshot the cumulative drain count for `handle`. Today this is
@@ -973,7 +1054,11 @@ pub unsafe fn fb_flush_wait(handle: u64) -> u64 {
 pub unsafe fn fb_disconnect(handle: u64) -> Result<(), ()> {
     // SAFETY: SYS_FB_DISCONNECT signature: arg0 handle.
     let r = unsafe { syscall1(SYS_FB_DISCONNECT, handle) };
-    if r == 0 { Ok(()) } else { Err(()) }
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(())
+    }
 }
 
 /// Unmap a previously [`mmap`]-returned region. Returns Ok on
@@ -986,7 +1071,11 @@ pub unsafe fn fb_disconnect(handle: u64) -> Result<(), ()> {
 pub unsafe fn munmap(addr: *mut u8) -> Result<(), ()> {
     // SAFETY: SYS_MUNMAP signature: arg0 addr.
     let r = unsafe { syscall1(SYS_MUNMAP, addr as u64) };
-    if r == 0 { Ok(()) } else { Err(()) }
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(())
+    }
 }
 
 /// Query (`new_break == 0`) or resize the per-task heap break.
@@ -1009,10 +1098,12 @@ pub fn chdir(path: &str) -> i32 {
     // SAFETY: SYS_CHDIR signature: (path_ptr, path_len). Pointer
     // stays valid across the call because `&str` borrows outlive
     // the syscall.
-    let r = unsafe {
-        syscall2(SYS_CHDIR, path.as_ptr() as u64, path.len() as u64)
-    };
-    if r == 0 { 0 } else { -1 }
+    let r = unsafe { syscall2(SYS_CHDIR, path.as_ptr() as u64, path.len() as u64) };
+    if r == 0 {
+        0
+    } else {
+        -1
+    }
 }
 
 /// Read the calling task's current working directory into `buf`.
@@ -1026,13 +1117,15 @@ pub fn getcwd(buf: &mut [u8]) -> i32 {
     // writes ≤ buf.len() bytes (NUL-terminated) when buf is large
     // enough; otherwise returns InvalidOp and we don't trust the
     // buffer state.
-    let r = unsafe {
-        syscall2(SYS_GETCWD, buf.as_mut_ptr() as u64, buf.len() as u64)
-    };
+    let r = unsafe { syscall2(SYS_GETCWD, buf.as_mut_ptr() as u64, buf.len() as u64) };
     // The kernel returns the byte length on success; treat the
     // sentinel `!0u64` (InvalidOp's payload) as failure as well so
     // callers don't observe a 64-bit length when truncated.
-    if r == !0u64 { -1 } else { r as i32 }
+    if r == !0u64 {
+        -1
+    } else {
+        r as i32
+    }
 }
 
 // ── Sleep ──────────────────────────────────────────────────────────
@@ -1047,7 +1140,11 @@ pub fn getcwd(buf: &mut [u8]) -> i32 {
 pub fn nanosleep(ns: u64) -> i32 {
     // SAFETY: SYS_SLEEP signature: arg0 ns.
     let r = unsafe { syscall1(SYS_SLEEP, ns) };
-    if r == 0 { 0 } else { -1 }
+    if r == 0 {
+        0
+    } else {
+        -1
+    }
 }
 
 // ── VFS ────────────────────────────────────────────────────────────
@@ -1076,12 +1173,18 @@ pub fn open_flags(path: &str, mount: &str, flags: u64) -> Option<u32> {
     let r = unsafe {
         syscall5(
             SYS_OPEN,
-            path.as_ptr() as u64, path.len() as u64,
-            mount.as_ptr() as u64, mount.len() as u64,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            mount.as_ptr() as u64,
+            mount.len() as u64,
             flags,
         )
     };
-    if r == !0u64 { None } else { Some(r as u32) }
+    if r == !0u64 {
+        None
+    } else {
+        Some(r as u32)
+    }
 }
 
 /// Read up to `buf.len()` bytes from `fd` into `buf`. Returns the
@@ -1090,7 +1193,12 @@ pub fn open_flags(path: &str, mount: &str, flags: u64) -> Option<u32> {
 pub fn read(fd: u32, buf: &mut [u8]) -> usize {
     // SAFETY: SYS_READ signature: (fd, buf_ptr, buf_len).
     unsafe {
-        syscall3(SYS_READ, fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64) as usize
+        syscall3(
+            SYS_READ,
+            fd as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        ) as usize
     }
 }
 
@@ -1098,9 +1206,7 @@ pub fn read(fd: u32, buf: &mut [u8]) -> usize {
 #[inline]
 pub fn write(fd: u32, buf: &[u8]) -> usize {
     // SAFETY: SYS_WRITE signature: (fd, buf_ptr, buf_len).
-    unsafe {
-        syscall3(SYS_WRITE, fd as u64, buf.as_ptr() as u64, buf.len() as u64) as usize
-    }
+    unsafe { syscall3(SYS_WRITE, fd as u64, buf.as_ptr() as u64, buf.len() as u64) as usize }
 }
 
 /// Close `fd`. The kernel returns 0 on success.
@@ -1108,7 +1214,11 @@ pub fn write(fd: u32, buf: &[u8]) -> usize {
 pub fn close(fd: u32) -> Result<(), ()> {
     // SAFETY: SYS_CLOSE signature: (fd).
     let r = unsafe { syscall1(SYS_CLOSE, fd as u64) };
-    if r == 0 { Ok(()) } else { Err(()) }
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(())
+    }
 }
 
 /// Open `path` as an absolute path, with the kernel walking its
@@ -1130,7 +1240,11 @@ pub fn open_abs(path: &str) -> Option<u32> {
 pub fn dup(oldfd: u32) -> Option<u32> {
     // SAFETY: SYS_DUP signature: (oldfd).
     let r = unsafe { syscall1(SYS_DUP, oldfd as u64) };
-    if r == !0u64 { None } else { Some(r as u32) }
+    if r == !0u64 {
+        None
+    } else {
+        Some(r as u32)
+    }
 }
 
 /// `dup2(oldfd, newfd)` — install a clone at exactly `newfd`,
@@ -1139,7 +1253,11 @@ pub fn dup(oldfd: u32) -> Option<u32> {
 pub fn dup2(oldfd: u32, newfd: u32) -> Option<u32> {
     // SAFETY: SYS_DUP2 signature: (oldfd, newfd).
     let r = unsafe { syscall2(SYS_DUP2, oldfd as u64, newfd as u64) };
-    if r == !0u64 { None } else { Some(r as u32) }
+    if r == !0u64 {
+        None
+    } else {
+        Some(r as u32)
+    }
 }
 
 /// `dup3(oldfd, newfd, flags)` — like [`dup2`] but `flags` controls
@@ -1150,7 +1268,11 @@ pub fn dup3(oldfd: u32, newfd: u32, flags: u32) -> Option<u32> {
     // SAFETY: SYS_DUP3 signature: (oldfd, newfd, flags). RDX must be
     // declared inout per the ≥3-arg convention (commit b3c6517).
     let r = unsafe { syscall3(SYS_DUP3, oldfd as u64, newfd as u64, flags as u64) };
-    if r == !0u64 { None } else { Some(r as u32) }
+    if r == !0u64 {
+        None
+    } else {
+        Some(r as u32)
+    }
 }
 
 /// `fcntl(fd, cmd, arg)` — supports `F_GETFD` / `F_SETFD` /
@@ -1160,7 +1282,11 @@ pub fn dup3(oldfd: u32, newfd: u32, flags: u32) -> Option<u32> {
 pub fn fcntl(fd: u32, cmd: u32, arg: u64) -> i64 {
     // SAFETY: SYS_FCNTL signature: (fd, cmd, arg). 3 args → RDX inout.
     let r = unsafe { syscall3(SYS_FCNTL, fd as u64, cmd as u64, arg) };
-    if r == !0u64 { -1 } else { r as i64 }
+    if r == !0u64 {
+        -1
+    } else {
+        r as i64
+    }
 }
 
 // ── Stat / Fstat / Pipe ────────────────────────────────────────────
@@ -1173,10 +1299,10 @@ pub fn fcntl(fd: u32, cmd: u32, arg: u64) -> i64 {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct StatBuf {
-    pub size:         u64,
-    pub blocks:       u64,
-    pub mode:         u32,
-    pub _pad:         u32,
+    pub size: u64,
+    pub blocks: u64,
+    pub mode: u32,
+    pub _pad: u32,
     pub mtime_cycles: u64,
 }
 
@@ -1193,7 +1319,11 @@ pub fn stat(path: &str, out: &mut StatBuf) -> i32 {
             out as *mut StatBuf as u64,
         )
     };
-    if r == 0 { 0 } else { -1 }
+    if r == 0 {
+        0
+    } else {
+        -1
+    }
 }
 
 /// `lstat(path, &mut out)` — like [`stat`] but doesn't follow
@@ -1210,7 +1340,11 @@ pub fn lstat(path: &str, out: &mut StatBuf) -> i32 {
             out as *mut StatBuf as u64,
         )
     };
-    if r == 0 { 0 } else { -1 }
+    if r == 0 {
+        0
+    } else {
+        -1
+    }
 }
 
 /// `fstat(fd, &mut out)` — write the stat result for the open fd.
@@ -1218,10 +1352,12 @@ pub fn lstat(path: &str, out: &mut StatBuf) -> i32 {
 #[inline]
 pub fn fstat(fd: u32, out: &mut StatBuf) -> i32 {
     // SAFETY: SYS_FSTAT signature: (fd, out_ptr).
-    let r = unsafe {
-        syscall2(SYS_FSTAT, fd as u64, out as *mut StatBuf as u64)
-    };
-    if r == 0 { 0 } else { -1 }
+    let r = unsafe { syscall2(SYS_FSTAT, fd as u64, out as *mut StatBuf as u64) };
+    if r == 0 {
+        0
+    } else {
+        -1
+    }
 }
 
 /// `lseek(fd, offset, whence)` — update the per-fd offset and
@@ -1236,9 +1372,7 @@ pub fn lseek(fd: u32, offset: i64, whence: u32) -> i64 {
     // SAFETY: SYS_LSEEK signature: (fd, offset, whence). The asm
     // wrapper preserves the rdx clobber convention — see the
     // `inout("rdx") a2 => _` clause in `syscall3`.
-    let r = unsafe {
-        syscall3(SYS_LSEEK, fd as u64, offset as u64, whence as u64)
-    };
+    let r = unsafe { syscall3(SYS_LSEEK, fd as u64, offset as u64, whence as u64) };
     r as i64
 }
 
@@ -1251,10 +1385,12 @@ pub fn unlink(path: &str) -> i32 {
     // SAFETY: SYS_UNLINK signature: (path_ptr, path_len). Failure
     // sentinel is `-1` cast to u64 because the asm wrapper observes
     // only the value register, not the status.
-    let r = unsafe {
-        syscall2(SYS_UNLINK, path.as_ptr() as u64, path.len() as u64)
-    };
-    if r as i64 == -1 { -1 } else { 0 }
+    let r = unsafe { syscall2(SYS_UNLINK, path.as_ptr() as u64, path.len() as u64) };
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `mkdir(path, mode)` — create a directory. Returns 0 / -1.
@@ -1265,21 +1401,28 @@ pub fn mkdir(path: &str, mode: u32) -> i32 {
     let r = unsafe {
         syscall3(
             SYS_MKDIR,
-            path.as_ptr() as u64, path.len() as u64,
+            path.as_ptr() as u64,
+            path.len() as u64,
             mode as u64,
         )
     };
-    if r as i64 == -1 { -1 } else { 0 }
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `rmdir(path)` — remove an empty directory. Returns 0 / -1.
 #[inline]
 pub fn rmdir(path: &str) -> i32 {
     // SAFETY: SYS_RMDIR signature: (path_ptr, path_len).
-    let r = unsafe {
-        syscall2(SYS_RMDIR, path.as_ptr() as u64, path.len() as u64)
-    };
-    if r as i64 == -1 { -1 } else { 0 }
+    let r = unsafe { syscall2(SYS_RMDIR, path.as_ptr() as u64, path.len() as u64) };
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `rename(old, new)` — same-directory rename. Returns 0 / -1.
@@ -1291,11 +1434,17 @@ pub fn rename(old_path: &str, new_path: &str) -> i32 {
     let r = unsafe {
         syscall4(
             SYS_RENAME,
-            old_path.as_ptr() as u64, old_path.len() as u64,
-            new_path.as_ptr() as u64, new_path.len() as u64,
+            old_path.as_ptr() as u64,
+            old_path.len() as u64,
+            new_path.as_ptr() as u64,
+            new_path.len() as u64,
         )
     };
-    if r as i64 == -1 { -1 } else { 0 }
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `readlink(path, buf)` — read a symlink target. Backed by
@@ -1303,13 +1452,17 @@ pub fn rename(old_path: &str, new_path: &str) -> i32 {
 /// Returns the byte count copied on success, -1 on lookup failure.
 #[inline]
 pub fn readlink(path: &str, buf: &mut [u8]) -> isize {
-    if path.is_empty() || buf.is_empty() { return -1; }
+    if path.is_empty() || buf.is_empty() {
+        return -1;
+    }
     // SAFETY: SYS_READLINK signature: (path_ptr, path_len, buf_ptr, buf_len).
     let r = unsafe {
         syscall4(
             SYS_READLINK,
-            path.as_ptr() as u64, path.len() as u64,
-            buf.as_mut_ptr() as u64, buf.len() as u64,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
         )
     };
     r as isize
@@ -1320,17 +1473,25 @@ pub fn readlink(path: &str, buf: &mut [u8]) -> isize {
 /// Returns 0 on success, -1 on duplicate or unmounted parent.
 #[inline]
 pub fn symlink(target: &str, link: &str) -> i32 {
-    if target.is_empty() || link.is_empty() { return -1; }
+    if target.is_empty() || link.is_empty() {
+        return -1;
+    }
     // SAFETY: SYS_SYMLINK signature:
     //   (target_ptr, target_len, link_ptr, link_len).
     let r = unsafe {
         syscall4(
             SYS_SYMLINK,
-            target.as_ptr() as u64, target.len() as u64,
-            link.as_ptr() as u64, link.len() as u64,
+            target.as_ptr() as u64,
+            target.len() as u64,
+            link.as_ptr() as u64,
+            link.len() as u64,
         )
     };
-    if r as i64 == -1 { -1 } else { 0 }
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `getdents64(path, cursor, out)` — batched directory read.
@@ -1340,15 +1501,19 @@ pub fn symlink(target: &str, link: &str) -> i32 {
 /// Returns 0 on end-of-directory, -1 on error.
 #[inline]
 pub fn getdents64(path: &str, cursor: u64, out: &mut [u8]) -> isize {
-    if path.is_empty() || out.is_empty() { return -1; }
+    if path.is_empty() || out.is_empty() {
+        return -1;
+    }
     // SAFETY: SYS_GETDENTS64 signature: (path_ptr, path_len, cursor,
     // out_ptr, out_len).
     let r = unsafe {
         syscall5(
             SYS_GETDENTS64,
-            path.as_ptr() as u64, path.len() as u64,
+            path.as_ptr() as u64,
+            path.len() as u64,
             cursor,
-            out.as_mut_ptr() as u64, out.len() as u64,
+            out.as_mut_ptr() as u64,
+            out.len() as u64,
         )
     };
     r as isize
@@ -1364,7 +1529,9 @@ pub fn getdents64(path: &str, cursor: u64, out: &mut [u8]) -> isize {
 /// `file_type` values: 0=File, 1=Dir, 2=Symlink, 3=Special.
 #[inline]
 pub fn listdir(path: &str, cursor: u64, out: &mut [u8]) -> isize {
-    if path.is_empty() || out.is_empty() { return -1; }
+    if path.is_empty() || out.is_empty() {
+        return -1;
+    }
     // SAFETY: SYS_LISTDIR signature:
     //   (path_ptr, path_len, cursor, out_ptr, out_len).
     let r = unsafe {
@@ -1389,7 +1556,9 @@ pub fn listdir(path: &str, cursor: u64, out: &mut [u8]) -> isize {
 /// distinction at this seed quality).
 #[inline]
 pub fn getrandom(buf: &mut [u8], flags: u32) -> isize {
-    if buf.is_empty() { return 0; }
+    if buf.is_empty() {
+        return 0;
+    }
     // SAFETY: SYS_GETRANDOM signature: (buf_ptr, buf_len, flags).
     let r = unsafe {
         syscall3(
@@ -1426,7 +1595,11 @@ pub fn pipe() -> Option<(u32, u32)> {
 pub fn fchmod(fd: u32, mode: u32) -> i32 {
     // SAFETY: SYS_FCHMOD signature: (fd, mode).
     let r = unsafe { syscall2(SYS_FCHMOD, fd as u64, mode as u64) };
-    if r as i64 == -1 { -1 } else { 0 }
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `fchown(fd, uid, gid)` — fd-keyed owner setter. Same
@@ -1435,53 +1608,84 @@ pub fn fchmod(fd: u32, mode: u32) -> i32 {
 pub fn fchown(fd: u32, uid: u32, gid: u32) -> i32 {
     // SAFETY: SYS_FCHOWN signature: (fd, uid, gid).
     let r = unsafe { syscall3(SYS_FCHOWN, fd as u64, uid as u64, gid as u64) };
-    if r as i64 == -1 { -1 } else { 0 }
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `unlinkat(dirfd, path, flags)` — Linux *at variant. flags
 /// honoured: AT_REMOVEDIR (0x200) routes to rmdir.
 #[inline]
 pub fn unlinkat(dirfd: i32, path: &str, flags: i32) -> i32 {
-    if path.is_empty() { return -1; }
+    if path.is_empty() {
+        return -1;
+    }
     // SAFETY: SYS_UNLINKAT signature: (dirfd, path_ptr, path_len, flags).
     let r = unsafe {
         syscall4(
-            SYS_UNLINKAT, dirfd as u64,
-            path.as_ptr() as u64, path.len() as u64, flags as u64,
+            SYS_UNLINKAT,
+            dirfd as u64,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            flags as u64,
         )
     };
-    if r as i64 == -1 { -1 } else { 0 }
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `mkdirat(dirfd, path, mode)` — Linux *at variant.
 #[inline]
 pub fn mkdirat(dirfd: i32, path: &str, mode: u32) -> i32 {
-    if path.is_empty() { return -1; }
+    if path.is_empty() {
+        return -1;
+    }
     // SAFETY: SYS_MKDIRAT signature: (dirfd, path_ptr, path_len, mode).
     let r = unsafe {
         syscall4(
-            SYS_MKDIRAT, dirfd as u64,
-            path.as_ptr() as u64, path.len() as u64, mode as u64,
+            SYS_MKDIRAT,
+            dirfd as u64,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            mode as u64,
         )
     };
-    if r as i64 == -1 { -1 } else { 0 }
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `renameat(old_dirfd, old, new_dirfd, new)` — Linux *at variant.
 #[inline]
 pub fn renameat(old_dirfd: i32, old: &str, new_dirfd: i32, new: &str) -> i32 {
-    if old.is_empty() || new.is_empty() { return -1; }
+    if old.is_empty() || new.is_empty() {
+        return -1;
+    }
     // SAFETY: SYS_RENAMEAT signature: (old_dirfd, old_ptr, old_len,
     // new_dirfd, new_ptr, new_len).
     let r = unsafe {
         syscall6(
-            SYS_RENAMEAT, old_dirfd as u64,
-            old.as_ptr() as u64, old.len() as u64,
+            SYS_RENAMEAT,
+            old_dirfd as u64,
+            old.as_ptr() as u64,
+            old.len() as u64,
             new_dirfd as u64,
-            new.as_ptr() as u64, new.len() as u64,
+            new.as_ptr() as u64,
+            new.len() as u64,
         )
     };
-    if r as i64 == -1 { -1 } else { 0 }
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `access(path, mode)` — legacy POSIX accessibility check.
@@ -1490,16 +1694,23 @@ pub fn renameat(old_dirfd: i32, old: &str, new_dirfd: i32, new: &str) -> i32 {
 /// otherwise.
 #[inline]
 pub fn access(path: &str, mode: i32) -> i32 {
-    if path.is_empty() { return -1; }
+    if path.is_empty() {
+        return -1;
+    }
     // SAFETY: SYS_ACCESS signature: (path_ptr, path_len, mode).
     let r = unsafe {
         syscall3(
             SYS_ACCESS,
-            path.as_ptr() as u64, path.len() as u64,
+            path.as_ptr() as u64,
+            path.len() as u64,
             mode as u64,
         )
     };
-    if r as i64 == -1 { -1 } else { 0 }
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `chmod(path, mode)` — legacy POSIX mode set. Forwards to the
@@ -1507,16 +1718,23 @@ pub fn access(path: &str, mode: i32) -> i32 {
 /// Mode bits aren't enforced; we only verify the path resolves.
 #[inline]
 pub fn chmod(path: &str, mode: u32) -> i32 {
-    if path.is_empty() { return -1; }
+    if path.is_empty() {
+        return -1;
+    }
     // SAFETY: SYS_CHMOD signature: (path_ptr, path_len, mode).
     let r = unsafe {
         syscall3(
             SYS_CHMOD,
-            path.as_ptr() as u64, path.len() as u64,
+            path.as_ptr() as u64,
+            path.len() as u64,
             mode as u64,
         )
     };
-    if r as i64 == -1 { -1 } else { 0 }
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `chown(path, uid, gid)` — legacy POSIX owner set. Forwards
@@ -1525,16 +1743,24 @@ pub fn chmod(path: &str, mode: u32) -> i32 {
 /// resolves.
 #[inline]
 pub fn chown(path: &str, uid: u32, gid: u32) -> i32 {
-    if path.is_empty() { return -1; }
+    if path.is_empty() {
+        return -1;
+    }
     // SAFETY: SYS_CHOWN signature: (path_ptr, path_len, uid, gid).
     let r = unsafe {
         syscall4(
             SYS_CHOWN,
-            path.as_ptr() as u64, path.len() as u64,
-            uid as u64, gid as u64,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            uid as u64,
+            gid as u64,
         )
     };
-    if r as i64 == -1 { -1 } else { 0 }
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `symlinkat(target, dirfd, link)` — Linux *at variant of
@@ -1542,18 +1768,26 @@ pub fn chown(path: &str, uid: u32, gid: u32) -> i32 {
 /// 0 on success, -1 on failure.
 #[inline]
 pub fn symlinkat(target: &str, dirfd: i32, link: &str) -> i32 {
-    if target.is_empty() || link.is_empty() { return -1; }
+    if target.is_empty() || link.is_empty() {
+        return -1;
+    }
     // SAFETY: SYS_SYMLINKAT signature: (target_ptr, target_len, dirfd,
     // link_ptr, link_len).
     let r = unsafe {
         syscall5(
             SYS_SYMLINKAT,
-            target.as_ptr() as u64, target.len() as u64,
+            target.as_ptr() as u64,
+            target.len() as u64,
             dirfd as u64,
-            link.as_ptr() as u64, link.len() as u64,
+            link.as_ptr() as u64,
+            link.len() as u64,
         )
     };
-    if r as i64 == -1 { -1 } else { 0 }
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `readlinkat(dirfd, path, buf)` — Linux *at variant of
@@ -1561,14 +1795,19 @@ pub fn symlinkat(target: &str, dirfd: i32, link: &str) -> i32 {
 /// the byte count copied on success, -1 on lookup failure.
 #[inline]
 pub fn readlinkat(dirfd: i32, path: &str, buf: &mut [u8]) -> isize {
-    if path.is_empty() || buf.is_empty() { return -1; }
+    if path.is_empty() || buf.is_empty() {
+        return -1;
+    }
     // SAFETY: SYS_READLINKAT signature: (dirfd, path_ptr, path_len,
     // buf_ptr, buf_len).
     let r = unsafe {
         syscall5(
-            SYS_READLINKAT, dirfd as u64,
-            path.as_ptr() as u64, path.len() as u64,
-            buf.as_mut_ptr() as u64, buf.len() as u64,
+            SYS_READLINKAT,
+            dirfd as u64,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
         )
     };
     r as isize
@@ -1577,23 +1816,27 @@ pub fn readlinkat(dirfd: i32, path: &str, buf: &mut [u8]) -> isize {
 /// `fstatat(dirfd, path, stat_out, flags)` — Linux *at variant
 /// of stat. Returns 0 on success, -1 on failure.
 #[inline]
-pub fn fstatat(
-    dirfd: i32,
-    path:  &str,
-    out:   &mut StatBuf,
-    flags: i32,
-) -> i32 {
-    if path.is_empty() { return -1; }
+pub fn fstatat(dirfd: i32, path: &str, out: &mut StatBuf, flags: i32) -> i32 {
+    if path.is_empty() {
+        return -1;
+    }
     // SAFETY: SYS_NEWFSTATAT signature: (dirfd, path_ptr, path_len,
     // stat_out, flags).
     let r = unsafe {
         syscall5(
-            SYS_NEWFSTATAT, dirfd as u64,
-            path.as_ptr() as u64, path.len() as u64,
-            out as *mut StatBuf as u64, flags as u64,
+            SYS_NEWFSTATAT,
+            dirfd as u64,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            out as *mut StatBuf as u64,
+            flags as u64,
         )
     };
-    if r == 0 { 0 } else { -1 }
+    if r == 0 {
+        0
+    } else {
+        -1
+    }
 }
 
 /// `openat(dirfd, path, flags, mode)` — Linux *at variant of
@@ -1601,16 +1844,25 @@ pub fn fstatat(
 /// new fd on success or `None` on failure.
 #[inline]
 pub fn openat(dirfd: i32, path: &str, flags: u64, mode: u32) -> Option<u32> {
-    if path.is_empty() { return None; }
+    if path.is_empty() {
+        return None;
+    }
     // SAFETY: SYS_OPENAT signature: (dirfd, path_ptr, path_len, flags, mode).
     let r = unsafe {
         syscall5(
-            SYS_OPENAT, dirfd as u64,
-            path.as_ptr() as u64, path.len() as u64,
-            flags, mode as u64,
+            SYS_OPENAT,
+            dirfd as u64,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            flags,
+            mode as u64,
         )
     };
-    if r == !0u64 { None } else { Some(r as u32) }
+    if r == !0u64 {
+        None
+    } else {
+        Some(r as u32)
+    }
 }
 
 /// `faccessat(dirfd, path, mode, flags)` — Linux *at variant of
@@ -1618,47 +1870,75 @@ pub fn openat(dirfd: i32, path: &str, flags: u64, mode: u32) -> Option<u32> {
 /// path; mode is structural-only (no permission enforcement).
 #[inline]
 pub fn faccessat(dirfd: i32, path: &str, mode: u32, flags: i32) -> i32 {
-    if path.is_empty() { return -1; }
+    if path.is_empty() {
+        return -1;
+    }
     // SAFETY: SYS_FACCESSAT signature: (dirfd, path_ptr, path_len, mode, flags).
     let r = unsafe {
         syscall5(
-            SYS_FACCESSAT, dirfd as u64,
-            path.as_ptr() as u64, path.len() as u64,
-            mode as u64, flags as u64,
+            SYS_FACCESSAT,
+            dirfd as u64,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            mode as u64,
+            flags as u64,
         )
     };
-    if r as i64 == -1 { -1 } else { 0 }
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `fchmodat(dirfd, path, mode, flags)` — Linux *at variant.
 /// Path must be absolute; dirfd is ignored.
 #[inline]
 pub fn fchmodat(dirfd: i32, path: &str, mode: u32, flags: i32) -> i32 {
-    if path.is_empty() { return -1; }
+    if path.is_empty() {
+        return -1;
+    }
     // SAFETY: SYS_FCHMODAT signature: (dirfd, path_ptr, path_len, mode, flags).
     let r = unsafe {
         syscall5(
-            SYS_FCHMODAT, dirfd as u64,
-            path.as_ptr() as u64, path.len() as u64,
-            mode as u64, flags as u64,
+            SYS_FCHMODAT,
+            dirfd as u64,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            mode as u64,
+            flags as u64,
         )
     };
-    if r as i64 == -1 { -1 } else { 0 }
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `fchownat(dirfd, path, uid, gid, flags)` — Linux *at variant.
 #[inline]
 pub fn fchownat(dirfd: i32, path: &str, uid: u32, gid: u32, flags: i32) -> i32 {
-    if path.is_empty() { return -1; }
+    if path.is_empty() {
+        return -1;
+    }
     // SAFETY: SYS_FCHOWNAT signature: (dirfd, path_ptr, path_len, uid, gid, flags).
     let r = unsafe {
         syscall6(
-            SYS_FCHOWNAT, dirfd as u64,
-            path.as_ptr() as u64, path.len() as u64,
-            uid as u64, gid as u64, flags as u64,
+            SYS_FCHOWNAT,
+            dirfd as u64,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            uid as u64,
+            gid as u64,
+            flags as u64,
         )
     };
-    if r as i64 == -1 { -1 } else { 0 }
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `memfd_create(name, flags)` — create an anonymous in-memory
@@ -1669,10 +1949,16 @@ pub fn memfd_create(name: &str, flags: u32) -> i32 {
     let r = unsafe {
         syscall3(
             SYS_MEMFD_CREATE,
-            name.as_ptr() as u64, name.len() as u64, flags as u64,
+            name.as_ptr() as u64,
+            name.len() as u64,
+            flags as u64,
         )
     };
-    if r as i64 == -1 { -1 } else { r as i32 }
+    if r as i64 == -1 {
+        -1
+    } else {
+        r as i32
+    }
 }
 
 /// `copy_file_range(fd_in, fd_out, off_in, off_out, len, flags)` —
@@ -1682,20 +1968,24 @@ pub fn memfd_create(name: &str, flags: u32) -> i32 {
 /// flags must be 0.
 #[inline]
 pub fn copy_file_range(
-    fd_in:  u32,
+    fd_in: u32,
     fd_out: u32,
-    off_in:  u64,
+    off_in: u64,
     off_out: u64,
-    len:     usize,
-    flags:   u32,
+    len: usize,
+    flags: u32,
 ) -> isize {
     // SAFETY: SYS_COPY_FILE_RANGE signature:
     //   (fd_in, fd_out, off_in, off_out, len, flags).
     let r = unsafe {
         syscall6(
             SYS_COPY_FILE_RANGE,
-            fd_in as u64, fd_out as u64,
-            off_in, off_out, len as u64, flags as u64,
+            fd_in as u64,
+            fd_out as u64,
+            off_in,
+            off_out,
+            len as u64,
+            flags as u64,
         )
     };
     r as isize
@@ -1707,10 +1997,12 @@ pub fn copy_file_range(
 #[inline]
 pub fn fallocate(fd: u32, mode: u32, offset: u64, len: u64) -> i32 {
     // SAFETY: SYS_FALLOCATE signature: (fd, mode, offset, len).
-    let r = unsafe {
-        syscall4(SYS_FALLOCATE, fd as u64, mode as u64, offset, len)
-    };
-    if r as i64 == -1 { -1 } else { 0 }
+    let r = unsafe { syscall4(SYS_FALLOCATE, fd as u64, mode as u64, offset, len) };
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `pipe2(flags)` — pipe + atomic flag set. `O_CLOEXEC` (bit
@@ -1720,9 +2012,7 @@ pub fn fallocate(fd: u32, mode: u32, offset: u64, len: u64) -> i32 {
 pub fn pipe2(flags: u32) -> Option<(u32, u32)> {
     let mut fds: [i32; 2] = [-1, -1];
     // SAFETY: SYS_PIPE2 signature: (out_ptr, flags).
-    let r = unsafe {
-        syscall2(SYS_PIPE2, fds.as_mut_ptr() as u64, flags as u64)
-    };
+    let r = unsafe { syscall2(SYS_PIPE2, fds.as_mut_ptr() as u64, flags as u64) };
     if r != 0 || fds[0] < 0 || fds[1] < 0 {
         None
     } else {
@@ -1752,10 +2042,12 @@ pub fn clock_gettime(clock_id: u32) -> (i64, i64) {
 pub fn clock_settime(clock_id: u32, sec: i64, nsec: i64) -> i32 {
     let ts: [i64; 2] = [sec, nsec];
     // SAFETY: SYS_CLOCK_SETTIME signature: (clock_id, timespec_ptr).
-    let r = unsafe {
-        syscall2(SYS_CLOCK_SETTIME, clock_id as u64, ts.as_ptr() as u64)
-    };
-    if r as i64 == -1 { -1 } else { 0 }
+    let r = unsafe { syscall2(SYS_CLOCK_SETTIME, clock_id as u64, ts.as_ptr() as u64) };
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// Install or clear a signal handler. Returns the prior handler
@@ -1792,7 +2084,11 @@ pub unsafe fn sigaction(signum: u32, handler: usize) -> usize {
 pub fn kill(target_pid: u64, signum: u32) -> Result<(), ()> {
     // SAFETY: SYS_KILL signature: (target_pid, signum).
     let r = unsafe { syscall2(SYS_KILL, target_pid, signum as u64) };
-    if r == 0 { Ok(()) } else { Err(()) }
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(())
+    }
 }
 
 /// Update the calling task's signal-block mask and return the
@@ -1815,16 +2111,16 @@ pub fn sigprocmask(how: u32, set: u32) -> u32 {
 #[derive(Debug)]
 pub struct BootstrapHeader {
     /// "NARF" little-endian (`NARF_MAGIC`).
-    pub magic:    u32,
+    pub magic: u32,
     /// ABI version (`BOOTSTRAP_ABI_VERSION` today).
-    pub version:  u32,
+    pub version: u32,
     /// Calling task's monotonic id.
-    pub task_id:  u64,
+    pub task_id: u64,
     /// Capslot id naming the SQ producer the kernel-side dispatcher
     /// is bound to.
-    pub sq_cap:   u64,
+    pub sq_cap: u64,
     /// Capslot id naming the CQ consumer.
-    pub cq_cap:   u64,
+    pub cq_cap: u64,
     /// Kernel-only Arc<Ring> depth for the SQ.
     pub sq_depth: u32,
     /// Kernel-only Arc<Ring> depth for the CQ.

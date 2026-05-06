@@ -19,15 +19,15 @@ use alloc::vec::Vec;
 #[repr(u32)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TpmCc {
-    PcrExtend           = 0x0000_0182,
-    PcrRead             = 0x0000_017E,
-    GetRandom           = 0x0000_017B,
-    StartAuthSession    = 0x0000_0176,
-    FlushContext        = 0x0000_0165,
-    Startup             = 0x0000_0144,
-    Shutdown            = 0x0000_0145,
-    SelfTest            = 0x0000_0143,
-    GetCapability       = 0x0000_017A,
+    PcrExtend = 0x0000_0182,
+    PcrRead = 0x0000_017E,
+    GetRandom = 0x0000_017B,
+    StartAuthSession = 0x0000_0176,
+    FlushContext = 0x0000_0165,
+    Startup = 0x0000_0144,
+    Shutdown = 0x0000_0145,
+    SelfTest = 0x0000_0143,
+    GetCapability = 0x0000_017A,
 }
 
 /// TPM hash algorithm — only the widely-deployed subset.
@@ -46,15 +46,19 @@ pub enum TpmAlgHash {
 #[derive(Clone, Debug)]
 pub enum Tpm2Command {
     /// Extend `pcr_index` with a hash over `digest`.
-    PcrExtend    { pcr_index: u32, alg: TpmAlgHash, digest: Vec<u8> },
+    PcrExtend {
+        pcr_index: u32,
+        alg: TpmAlgHash,
+        digest: Vec<u8>,
+    },
     /// Read `pcr_index` with `alg`.
-    PcrRead      { pcr_index: u32, alg: TpmAlgHash },
+    PcrRead { pcr_index: u32, alg: TpmAlgHash },
     /// Read `bytes` of TPM-generated random data.
-    GetRandom    { bytes: u16 },
+    GetRandom { bytes: u16 },
     /// TPM self-test. `full` = full self-test vs incremental.
-    SelfTest     { full: bool },
+    SelfTest { full: bool },
     /// Start the TPM; `clear` = TPM2_SU_CLEAR vs STATE.
-    Startup      { clear: bool },
+    Startup { clear: bool },
 }
 
 /// TPM 2.0 response status.

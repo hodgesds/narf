@@ -42,7 +42,10 @@ fn build_blob(
 
     // Root open: BEGIN_NODE + empty name + 4-byte alignment.
     s.extend_from_slice(&fdt::FDT_BEGIN_NODE.to_be_bytes());
-    s.push(0); s.push(0); s.push(0); s.push(0);    // empty name (NUL + 3 pad)
+    s.push(0);
+    s.push(0);
+    s.push(0);
+    s.push(0); // empty name (NUL + 3 pad)
 
     for (pname, pval) in root_props {
         let off = intern(&mut strings, pname);
@@ -50,7 +53,9 @@ fn build_blob(
         s.extend_from_slice(&(pval.len() as u32).to_be_bytes());
         s.extend_from_slice(&off.to_be_bytes());
         s.extend_from_slice(pval);
-        while s.len() % 4 != 0 { s.push(0); }
+        while s.len() % 4 != 0 {
+            s.push(0);
+        }
     }
 
     for (node_name, props) in nodes {
@@ -58,7 +63,9 @@ fn build_blob(
         s.extend_from_slice(node_name.as_bytes());
         s.push(0);
         // pad to 4
-        while s.len() % 4 != 0 { s.push(0); }
+        while s.len() % 4 != 0 {
+            s.push(0);
+        }
 
         for (pname, pval) in *props {
             let off = intern(&mut strings, pname);
@@ -66,13 +73,15 @@ fn build_blob(
             s.extend_from_slice(&(pval.len() as u32).to_be_bytes());
             s.extend_from_slice(&off.to_be_bytes());
             s.extend_from_slice(pval);
-            while s.len() % 4 != 0 { s.push(0); }
+            while s.len() % 4 != 0 {
+                s.push(0);
+            }
         }
 
         s.extend_from_slice(&fdt::FDT_END_NODE.to_be_bytes());
     }
 
-    s.extend_from_slice(&fdt::FDT_END_NODE.to_be_bytes());   // close root
+    s.extend_from_slice(&fdt::FDT_END_NODE.to_be_bytes()); // close root
     s.extend_from_slice(&fdt::FDT_END.to_be_bytes());
 
     let struct_size = s.len() as u32;
@@ -89,10 +98,10 @@ fn build_blob(
 
     // 4) Layout.
     //   header (40) + rsvmap + struct + strings
-    let off_rsvmap  = 40u32;
-    let off_struct  = off_rsvmap + rsv.len() as u32;
+    let off_rsvmap = 40u32;
+    let off_struct = off_rsvmap + rsv.len() as u32;
     let off_strings = off_struct + struct_size;
-    let totalsize   = off_strings + strings_size;
+    let totalsize = off_strings + strings_size;
 
     let mut out: Vec<u8> = Vec::with_capacity(totalsize as usize);
     out.extend_from_slice(&fdt::FDT_MAGIC.to_be_bytes());
@@ -100,8 +109,8 @@ fn build_blob(
     out.extend_from_slice(&off_struct.to_be_bytes());
     out.extend_from_slice(&off_strings.to_be_bytes());
     out.extend_from_slice(&off_rsvmap.to_be_bytes());
-    out.extend_from_slice(&17u32.to_be_bytes());           // version
-    out.extend_from_slice(&16u32.to_be_bytes());           // last_comp_version
+    out.extend_from_slice(&17u32.to_be_bytes()); // version
+    out.extend_from_slice(&16u32.to_be_bytes()); // last_comp_version
     out.extend_from_slice(&boot_cpuid.to_be_bytes());
     out.extend_from_slice(&strings_size.to_be_bytes());
     out.extend_from_slice(&struct_size.to_be_bytes());
@@ -114,18 +123,24 @@ fn build_blob(
 fn smoke_fdt_header_round_trip() -> TestResult {
     let blob = build_blob(0, &[], &[], &[]);
     let hdr = fdt::parse_header(&blob).expect("header");
-    if hdr.magic != fdt::FDT_MAGIC { return TestResult::Fail("magic"); }
-    if hdr.version != 17 { return TestResult::Fail("version"); }
-    if hdr.boot_cpuid_phys != 0 { return TestResult::Fail("boot cpu"); }
-    if hdr.totalsize as usize != blob.len() { return TestResult::Fail("totalsize"); }
+    if hdr.magic != fdt::FDT_MAGIC {
+        return TestResult::Fail("magic");
+    }
+    if hdr.version != 17 {
+        return TestResult::Fail("version");
+    }
+    if hdr.boot_cpuid_phys != 0 {
+        return TestResult::Fail("boot cpu");
+    }
+    if hdr.totalsize as usize != blob.len() {
+        return TestResult::Fail("totalsize");
+    }
     TestResult::Pass
 }
 kernel_test_in!("firmware/fdt", smoke_fdt_header_round_trip);
 
 fn smoke_fdt_walk_minimal() -> TestResult {
-    let nodes = &[
-        ("memory@0", &[("device_type", b"memory\0" as &[u8])][..]),
-    ];
+    let nodes = &[("memory@0", &[("device_type", b"memory\0" as &[u8])][..])];
     let blob = build_blob(0, &[], &[], nodes);
     let mut saw = false;
     let mut prop_count = 0u32;
@@ -133,20 +148,24 @@ fn smoke_fdt_walk_minimal() -> TestResult {
         if path.matches(&["memory@0"]) {
             saw = true;
             for (name, _value) in props {
-                if name == "device_type" { prop_count += 1; }
+                if name == "device_type" {
+                    prop_count += 1;
+                }
             }
         }
     });
-    if !saw { return TestResult::Fail("memory@0 not visited"); }
-    if prop_count != 1 { return TestResult::Fail("device_type prop missing"); }
+    if !saw {
+        return TestResult::Fail("memory@0 not visited");
+    }
+    if prop_count != 1 {
+        return TestResult::Fail("device_type prop missing");
+    }
     TestResult::Pass
 }
 kernel_test_in!("firmware/fdt", smoke_fdt_walk_minimal);
 
 fn smoke_fdt_chosen_bootargs() -> TestResult {
-    let nodes = &[
-        ("chosen", &[("bootargs", b"console=ttyAMA0\0" as &[u8])][..]),
-    ];
+    let nodes = &[("chosen", &[("bootargs", b"console=ttyAMA0\0" as &[u8])][..])];
     let blob = build_blob(0, &[], &[], nodes);
     let bargs = fdt::chosen_bootargs(&blob).expect("bootargs");
     if bargs.as_str() != "console=ttyAMA0" {
@@ -161,18 +180,17 @@ fn smoke_fdt_memory_ranges() -> TestResult {
     let mut reg = Vec::new();
     reg.extend_from_slice(&0x4000_0000u64.to_be_bytes());
     reg.extend_from_slice(&0x1000_0000u32.to_be_bytes());
-    let nodes = &[
-        ("memory@40000000",
-         &[("device_type", b"memory\0" as &[u8]),
-           ("reg", reg.as_slice())][..]),
-    ];
+    let nodes = &[(
+        "memory@40000000",
+        &[
+            ("device_type", b"memory\0" as &[u8]),
+            ("reg", reg.as_slice()),
+        ][..],
+    )];
     let blob = build_blob(0, &[], &[], nodes);
     let mut out = [Reservation::default(); 4];
     let n = fdt::copy_memory_ranges(&blob, &mut out);
-    if n != 1
-        || out[0].addr != 0x4000_0000
-        || out[0].size != 0x1000_0000
-    {
+    if n != 1 || out[0].addr != 0x4000_0000 || out[0].size != 0x1000_0000 {
         return TestResult::Fail("memory range mismatch");
     }
     TestResult::Pass
@@ -180,12 +198,25 @@ fn smoke_fdt_memory_ranges() -> TestResult {
 kernel_test_in!("firmware/fdt", smoke_fdt_memory_ranges);
 
 fn smoke_fdt_reservations() -> TestResult {
-    let blob = build_blob(0, &[(0xC000_0000, 0x10_0000), (0xD000_0000, 0x40_0000)], &[], &[]);
+    let blob = build_blob(
+        0,
+        &[(0xC000_0000, 0x10_0000), (0xD000_0000, 0x40_0000)],
+        &[],
+        &[],
+    );
     let mut out = [Reservation::default(); 4];
     let n = fdt::copy_reservations(&blob, &mut out);
     if n != 2
-        || out[0] != (Reservation { addr: 0xC000_0000, size: 0x10_0000 })
-        || out[1] != (Reservation { addr: 0xD000_0000, size: 0x40_0000 })
+        || out[0]
+            != (Reservation {
+                addr: 0xC000_0000,
+                size: 0x10_0000,
+            })
+        || out[1]
+            != (Reservation {
+                addr: 0xD000_0000,
+                size: 0x40_0000,
+            })
     {
         return TestResult::Fail("reserve map mismatch");
     }
@@ -199,25 +230,24 @@ fn smoke_fdt_cells_inheritance() -> TestResult {
     let size_cells = 2u32.to_be_bytes();
     let root_props = &[
         ("#address-cells", &addr_cells[..]),
-        ("#size-cells",    &size_cells[..]),
+        ("#size-cells", &size_cells[..]),
     ];
 
     let mut reg = Vec::new();
     reg.extend_from_slice(&0x4000_0000u64.to_be_bytes());
     reg.extend_from_slice(&0x1000_0000u64.to_be_bytes());
 
-    let nodes = &[
-        ("memory@40000000",
-         &[("device_type", b"memory\0" as &[u8]),
-           ("reg", reg.as_slice())][..]),
-    ];
+    let nodes = &[(
+        "memory@40000000",
+        &[
+            ("device_type", b"memory\0" as &[u8]),
+            ("reg", reg.as_slice()),
+        ][..],
+    )];
     let blob = build_blob(0, &[], root_props, nodes);
     let mut out = [Reservation::default(); 2];
     let n = fdt::copy_memory_ranges(&blob, &mut out);
-    if n != 1
-        || out[0].addr != 0x4000_0000
-        || out[0].size != 0x1000_0000
-    {
+    if n != 1 || out[0].addr != 0x4000_0000 || out[0].size != 0x1000_0000 {
         return TestResult::Fail("explicit 2/2 cells decoding");
     }
     TestResult::Pass
@@ -227,33 +257,47 @@ kernel_test_in!("firmware/fdt", smoke_fdt_cells_inheritance);
 fn smoke_fdt_compatible_match() -> TestResult {
     let zero_reg = 0u128.to_be_bytes();
     let nodes = &[
-        ("uart@9000000",
-         &[("compatible", b"arm,pl011\0arm,primecell\0" as &[u8]),
-           ("reg", &zero_reg[..])][..]),
-        ("eth@a003000",
-         &[("compatible", b"virtio,mmio\0" as &[u8])][..]),
+        (
+            "uart@9000000",
+            &[
+                ("compatible", b"arm,pl011\0arm,primecell\0" as &[u8]),
+                ("reg", &zero_reg[..]),
+            ][..],
+        ),
+        (
+            "eth@a003000",
+            &[("compatible", b"virtio,mmio\0" as &[u8])][..],
+        ),
     ];
     let blob = build_blob(0, &[], &[], nodes);
     let mut hits = 0u32;
     fdt::for_each_compatible(&blob, "arm,pl011", |path, _props, _cells| {
-        if path.last_segment() == "uart@9000000" { hits += 1; }
+        if path.last_segment() == "uart@9000000" {
+            hits += 1;
+        }
     });
-    if hits != 1 { return TestResult::Fail("expected exactly 1 pl011 match"); }
+    if hits != 1 {
+        return TestResult::Fail("expected exactly 1 pl011 match");
+    }
     let mut other = 0u32;
     fdt::for_each_compatible(&blob, "nonexistent,bogus", |_p, _pr, _c| other += 1);
-    if other != 0 { return TestResult::Fail("bogus compat matched"); }
+    if other != 0 {
+        return TestResult::Fail("bogus compat matched");
+    }
     TestResult::Pass
 }
 kernel_test_in!("firmware/fdt", smoke_fdt_compatible_match);
 
 fn smoke_fdt_phandle_lookup() -> TestResult {
     let phandle_buf = 7u32.to_be_bytes();
-    let icells_buf  = 3u32.to_be_bytes();
-    let nodes = &[
-        ("intc@8000000",
-         &[("phandle", &phandle_buf[..]),
-           ("#interrupt-cells", &icells_buf[..])][..]),
-    ];
+    let icells_buf = 3u32.to_be_bytes();
+    let nodes = &[(
+        "intc@8000000",
+        &[
+            ("phandle", &phandle_buf[..]),
+            ("#interrupt-cells", &icells_buf[..]),
+        ][..],
+    )];
     let blob = build_blob(0, &[], &[], nodes);
     if fdt::interrupt_cells_for(&blob, 7) != Some(3) {
         return TestResult::Fail("interrupt-cells via phandle 7");
@@ -267,11 +311,14 @@ kernel_test_in!("firmware/fdt", smoke_fdt_phandle_lookup);
 
 fn smoke_fdt_aliases_and_stdout() -> TestResult {
     let nodes = &[
-        ("aliases",
-         &[("serial0", b"/uart@9000000\0" as &[u8])][..]),
-        ("chosen",
-         &[("stdout-path", b"/uart@9000000:115200\0" as &[u8]),
-           ("bootargs", b"console=ttyAMA0\0" as &[u8])][..]),
+        ("aliases", &[("serial0", b"/uart@9000000\0" as &[u8])][..]),
+        (
+            "chosen",
+            &[
+                ("stdout-path", b"/uart@9000000:115200\0" as &[u8]),
+                ("bootargs", b"console=ttyAMA0\0" as &[u8]),
+            ][..],
+        ),
     ];
     let blob = build_blob(0, &[], &[], nodes);
     let mut alias = [0u8; 32];
@@ -290,10 +337,8 @@ kernel_test_in!("firmware/fdt", smoke_fdt_aliases_and_stdout);
 
 fn smoke_fdt_status_filter() -> TestResult {
     let nodes = &[
-        ("eth@1",
-         &[("status", b"disabled\0" as &[u8])][..]),
-        ("eth@2",
-         &[("status", b"okay\0" as &[u8])][..]),
+        ("eth@1", &[("status", b"disabled\0" as &[u8])][..]),
+        ("eth@2", &[("status", b"okay\0" as &[u8])][..]),
         ("eth@3", &[][..]),
     ];
     let blob = build_blob(0, &[], &[], nodes);
@@ -304,13 +349,13 @@ fn smoke_fdt_status_filter() -> TestResult {
             "eth@1" => 0,
             "eth@2" => 1,
             "eth@3" => 2,
-            _       => return,
+            _ => return,
         };
         match st {
             fdt::Status::Disabled if idx == 0 => counts[0] += 1,
-            fdt::Status::Okay     if idx == 1 => counts[1] += 1,
+            fdt::Status::Okay if idx == 1 => counts[1] += 1,
             // No status property defaults to Okay.
-            fdt::Status::Okay     if idx == 2 => counts[2] += 1,
+            fdt::Status::Okay if idx == 2 => counts[2] += 1,
             _ => {}
         }
     });
@@ -326,20 +371,24 @@ fn smoke_fdt_typed_props() -> TestResult {
     u32_buf.extend_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
     let mut u64_buf = Vec::new();
     u64_buf.extend_from_slice(&0x1122_3344_5566_7788u64.to_be_bytes());
-    let nodes = &[
-        ("dev",
-         &[("freq",        u32_buf.as_slice()),
-           ("size",        u64_buf.as_slice()),
-           ("name",        b"hello\0" as &[u8]),
-           ("compatible",  b"a,one\0a,two\0a,three\0" as &[u8])][..]),
-    ];
+    let nodes = &[(
+        "dev",
+        &[
+            ("freq", u32_buf.as_slice()),
+            ("size", u64_buf.as_slice()),
+            ("name", b"hello\0" as &[u8]),
+            ("compatible", b"a,one\0a,two\0a,three\0" as &[u8]),
+        ][..],
+    )];
     let blob = build_blob(0, &[], &[], nodes);
     let mut saw_u32 = None;
     let mut saw_u64 = None;
     let mut saw_str = None;
     let mut compat_hits = 0u32;
     fdt::walk_nodes(&blob, |path, props| {
-        if path.last_segment() != "dev" { return; }
+        if path.last_segment() != "dev" {
+            return;
+        }
         saw_u32 = fdt::prop_u32(props, "freq");
         saw_u64 = fdt::prop_u64(props, "size");
         saw_str = fdt::prop_str(props, "name").map(|s| {
@@ -352,11 +401,19 @@ fn smoke_fdt_typed_props() -> TestResult {
         });
         fdt::prop_string_list(props, "compatible", |_s| compat_hits += 1);
     });
-    if saw_u32 != Some(0xDEAD_BEEF) { return TestResult::Fail("prop_u32"); }
-    if saw_u64 != Some(0x1122_3344_5566_7788) { return TestResult::Fail("prop_u64"); }
+    if saw_u32 != Some(0xDEAD_BEEF) {
+        return TestResult::Fail("prop_u32");
+    }
+    if saw_u64 != Some(0x1122_3344_5566_7788) {
+        return TestResult::Fail("prop_u64");
+    }
     let (buf, n) = saw_str.expect("prop_str");
-    if &buf[..n] != b"hello" { return TestResult::Fail("prop_str payload"); }
-    if compat_hits != 3 { return TestResult::Fail("compat string-list count"); }
+    if &buf[..n] != b"hello" {
+        return TestResult::Fail("prop_str payload");
+    }
+    if compat_hits != 3 {
+        return TestResult::Fail("compat string-list count");
+    }
     TestResult::Pass
 }
 kernel_test_in!("firmware/fdt", smoke_fdt_typed_props);
@@ -366,12 +423,10 @@ fn smoke_fdt_discover_round_trip() -> TestResult {
     // 'static slice back, parse the header again — round-trip check.
     let blob = build_blob(0, &[], &[], &[]);
     let phys = blob.as_ptr() as usize;
-    let max  = blob.len();
+    let max = blob.len();
     // SAFETY: blob outlives this call; pointer is to a Vec we own.
     let recovered = unsafe { fdt::discover(phys, max) }.expect("discover");
-    if recovered.len() != blob.len()
-        || recovered.as_ptr() != blob.as_ptr()
-    {
+    if recovered.len() != blob.len() || recovered.as_ptr() != blob.as_ptr() {
         return TestResult::Fail("discover did not return the same slice");
     }
     if fdt::parse_header(recovered).is_none() {

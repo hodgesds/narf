@@ -43,8 +43,10 @@ pub struct JobId(pub u64);
 
 pub struct ComputeJob {
     pub graph_blob: narf_capabilities::Cap<narf_io::DmaBuffer, narf_capabilities::Read>,
-    pub inputs: alloc::vec::Vec<narf_capabilities::Cap<narf_io::DmaBuffer, narf_capabilities::Read>>,
-    pub outputs: alloc::vec::Vec<narf_capabilities::Cap<narf_io::DmaBuffer, narf_capabilities::Write>>,
+    pub inputs:
+        alloc::vec::Vec<narf_capabilities::Cap<narf_io::DmaBuffer, narf_capabilities::Read>>,
+    pub outputs:
+        alloc::vec::Vec<narf_capabilities::Cap<narf_io::DmaBuffer, narf_capabilities::Write>>,
 }
 
 pub type AccelDevice = dyn crate::AccelDeviceTrait;

@@ -45,7 +45,7 @@ impl CapType for AdminCap {
 /// daemon spawn time against `StackInstall`).
 #[derive(Copy, Clone, Debug)]
 pub struct StackAttach {
-    pub iface:  Cap<NetIface, Write>,
+    pub iface: Cap<NetIface, Write>,
     pub daemon: Cap<StackDaemon, Invoke>,
 }
 
@@ -81,7 +81,11 @@ pub fn attach(
     req: &StackAttach,
     _iface_object: &dyn Interface,
 ) -> Result<StackAttachReply, AttachError> {
-    req.iface.check_live().map_err(|_| AttachError::IfaceCapRevoked)?;
-    req.daemon.check_live().map_err(|_| AttachError::DaemonCapRevoked)?;
+    req.iface
+        .check_live()
+        .map_err(|_| AttachError::IfaceCapRevoked)?;
+    req.daemon
+        .check_live()
+        .map_err(|_| AttachError::DaemonCapRevoked)?;
     Err(AttachError::NotImplemented)
 }

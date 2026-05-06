@@ -44,14 +44,18 @@ pub enum HotPlugError {
 }
 
 impl From<CapError> for HotPlugError {
-    fn from(_: CapError) -> Self { HotPlugError::AuthorityRevoked }
+    fn from(_: CapError) -> Self {
+        HotPlugError::AuthorityRevoked
+    }
 }
 
 /// Is `cpu` currently online?
 #[inline]
 pub fn cpu_online(cpu: CpuId) -> bool {
     let id = cpu.0;
-    if id >= 64 { return false; }
+    if id >= 64 {
+        return false;
+    }
     ONLINE_MASK.load(Ordering::Acquire) & (1u64 << id) != 0
 }
 
@@ -73,10 +77,16 @@ pub fn cpu_bring_up(
 ) -> Result<(), HotPlugError> {
     cap.invoke(NoopOp)?;
     let id = cpu.0;
-    if id >= 64 { return Err(HotPlugError::OutOfRange); }
+    if id >= 64 {
+        return Err(HotPlugError::OutOfRange);
+    }
     let bit = 1u64 << id;
     let prev = ONLINE_MASK.fetch_or(bit, Ordering::AcqRel);
-    if prev & bit != 0 { Err(HotPlugError::NoChange) } else { Ok(()) }
+    if prev & bit != 0 {
+        Err(HotPlugError::NoChange)
+    } else {
+        Ok(())
+    }
 }
 
 /// Take `cpu` offline. Cap-gated; idempotent on already-offline cores.
@@ -86,14 +96,22 @@ pub fn cpu_take_offline(
 ) -> Result<(), HotPlugError> {
     cap.invoke(NoopOp)?;
     let id = cpu.0;
-    if id >= 64 { return Err(HotPlugError::OutOfRange); }
+    if id >= 64 {
+        return Err(HotPlugError::OutOfRange);
+    }
     // CPU 0 is the bootstrap CPU — its offline path is a suspend
     // step, not a normal operation. Refuse outright in Stage-4 until
     // the suspend path is designed end-to-end.
-    if id == 0 { return Err(HotPlugError::OutOfRange); }
+    if id == 0 {
+        return Err(HotPlugError::OutOfRange);
+    }
     let bit = 1u64 << id;
     let prev = ONLINE_MASK.fetch_and(!bit, Ordering::AcqRel);
-    if prev & bit == 0 { Err(HotPlugError::NoChange) } else { Ok(()) }
+    if prev & bit == 0 {
+        Err(HotPlugError::NoChange)
+    } else {
+        Ok(())
+    }
 }
 
 /// Test helper: reset online-mask to boot state (CPU 0 only).

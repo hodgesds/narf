@@ -42,13 +42,13 @@ pub const HCA_CAP_OUT_LEN: usize = 0x1000;
 
 // ── Field offsets ──────────────────────────────────────────────────
 
-pub const HCA_CAP_OFF_VHCA_ID:        usize = 0x10;
+pub const HCA_CAP_OFF_VHCA_ID: usize = 0x10;
 pub const HCA_CAP_OFF_LOG_MAX_SRQ_SZ: usize = 0x40;
-pub const HCA_CAP_OFF_LOG_MAX_QP_SZ:  usize = 0x41;
-pub const HCA_CAP_OFF_LOG_MAX_CQ_SZ:  usize = 0x53;
-pub const HCA_CAP_OFF_LOG_MAX_EQ_SZ:  usize = 0x5B;
-pub const HCA_CAP_OFF_LOG_MAX_MKEY:   usize = 0x60;
-pub const HCA_CAP_OFF_LOG_MAX_PD:     usize = 0x68;
+pub const HCA_CAP_OFF_LOG_MAX_QP_SZ: usize = 0x41;
+pub const HCA_CAP_OFF_LOG_MAX_CQ_SZ: usize = 0x53;
+pub const HCA_CAP_OFF_LOG_MAX_EQ_SZ: usize = 0x5B;
+pub const HCA_CAP_OFF_LOG_MAX_MKEY: usize = 0x60;
+pub const HCA_CAP_OFF_LOG_MAX_PD: usize = 0x68;
 
 // Bit-packed fields (see Stage 6 — `bit_field.rs` does the math).
 //
@@ -56,22 +56,22 @@ pub const HCA_CAP_OFF_LOG_MAX_PD:     usize = 0x68;
 // the 32-bit BE word at byte offset 0x44 — i.e. bit positions
 // 0x44*8 + 27 .. 0x44*8 + 31. log_max_eq lives at low 4 bits of
 // byte 0x47.
-pub const HCA_CAP_BIT_LOG_MAX_QP:   usize = 0x44 * 8 + 27;
+pub const HCA_CAP_BIT_LOG_MAX_QP: usize = 0x44 * 8 + 27;
 pub const HCA_CAP_BIT_LOG_MAX_QP_W: usize = 5;
-pub const HCA_CAP_BIT_LOG_MAX_EQ:   usize = 0x47 * 8 + 28;
+pub const HCA_CAP_BIT_LOG_MAX_EQ: usize = 0x47 * 8 + 28;
 pub const HCA_CAP_BIT_LOG_MAX_EQ_W: usize = 4;
 
 // Ethernet-offload field offsets (relative to start of the cap
 // payload — the same 4-KiB structure shape, just different
 // well-known fields).
-pub const ETH_OFF_TX_CSUM:        usize = 0x10;
-pub const ETH_OFF_RX_CSUM:        usize = 0x11;
-pub const ETH_OFF_LSO:            usize = 0x12;
-pub const ETH_OFF_LRO:            usize = 0x13;
-pub const ETH_OFF_MAX_LSO_SIZE:   usize = 0x14;
-pub const ETH_OFF_RSS_IND_TBL:    usize = 0x18;
-pub const ETH_OFF_VLAN_INSERT:    usize = 0x19;
-pub const ETH_OFF_VLAN_STRIP:     usize = 0x1A;
+pub const ETH_OFF_TX_CSUM: usize = 0x10;
+pub const ETH_OFF_RX_CSUM: usize = 0x11;
+pub const ETH_OFF_LSO: usize = 0x12;
+pub const ETH_OFF_LRO: usize = 0x13;
+pub const ETH_OFF_MAX_LSO_SIZE: usize = 0x14;
+pub const ETH_OFF_RSS_IND_TBL: usize = 0x18;
+pub const ETH_OFF_VLAN_INSERT: usize = 0x19;
+pub const ETH_OFF_VLAN_STRIP: usize = 0x1A;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CapsDecodeError {
@@ -111,36 +111,56 @@ impl HcaGeneralCaps {
     }
 
     /// Max SRQ size as 2^N entries.
-    pub fn log_max_srq_sz(&self) -> u8 { self.bytes[HCA_CAP_OFF_LOG_MAX_SRQ_SZ] }
+    pub fn log_max_srq_sz(&self) -> u8 {
+        self.bytes[HCA_CAP_OFF_LOG_MAX_SRQ_SZ]
+    }
     /// Max QP size as 2^N WQEs.
-    pub fn log_max_qp_sz(&self)  -> u8 { self.bytes[HCA_CAP_OFF_LOG_MAX_QP_SZ] }
+    pub fn log_max_qp_sz(&self) -> u8 {
+        self.bytes[HCA_CAP_OFF_LOG_MAX_QP_SZ]
+    }
     /// Max CQ size as 2^N CQEs.
-    pub fn log_max_cq_sz(&self)  -> u8 { self.bytes[HCA_CAP_OFF_LOG_MAX_CQ_SZ] }
+    pub fn log_max_cq_sz(&self) -> u8 {
+        self.bytes[HCA_CAP_OFF_LOG_MAX_CQ_SZ]
+    }
     /// Max EQ size as 2^N entries.
-    pub fn log_max_eq_sz(&self)  -> u8 { self.bytes[HCA_CAP_OFF_LOG_MAX_EQ_SZ] }
+    pub fn log_max_eq_sz(&self) -> u8 {
+        self.bytes[HCA_CAP_OFF_LOG_MAX_EQ_SZ]
+    }
     /// Max number of memory keys, 2^N.
-    pub fn log_max_mkey(&self)   -> u8 { self.bytes[HCA_CAP_OFF_LOG_MAX_MKEY] }
+    pub fn log_max_mkey(&self) -> u8 {
+        self.bytes[HCA_CAP_OFF_LOG_MAX_MKEY]
+    }
     /// Max number of protection domains, 2^N.
-    pub fn log_max_pd(&self)     -> u8 { self.bytes[HCA_CAP_OFF_LOG_MAX_PD] }
+    pub fn log_max_pd(&self) -> u8 {
+        self.bytes[HCA_CAP_OFF_LOG_MAX_PD]
+    }
 
     /// Max number of QPs, 2^N. Bit-packed at the low 5 bits of byte
     /// 0x47 (within the 32-bit BE word starting at 0x44).
     pub fn log_max_qp(&self) -> u8 {
-        read_bits_be(&self.bytes,
-            HCA_CAP_BIT_LOG_MAX_QP, HCA_CAP_BIT_LOG_MAX_QP_W) as u8
+        read_bits_be(
+            &self.bytes,
+            HCA_CAP_BIT_LOG_MAX_QP,
+            HCA_CAP_BIT_LOG_MAX_QP_W,
+        ) as u8
     }
 
     /// Max number of EQs, 2^N. Bit-packed at the low 4 bits of byte
     /// 0x47 (within the 32-bit BE word starting at 0x44).
     pub fn log_max_eq(&self) -> u8 {
-        read_bits_be(&self.bytes,
-            HCA_CAP_BIT_LOG_MAX_EQ, HCA_CAP_BIT_LOG_MAX_EQ_W) as u8
+        read_bits_be(
+            &self.bytes,
+            HCA_CAP_BIT_LOG_MAX_EQ,
+            HCA_CAP_BIT_LOG_MAX_EQ_W,
+        ) as u8
     }
 
     /// Raw bytes — full 4-KiB payload. Stable so callers decoding
     /// fields beyond Stage-5's committed subset don't have to fork
     /// the decoder.
-    pub fn raw(&self) -> &[u8] { &self.bytes }
+    pub fn raw(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 // ── ETHERNET_OFFLOAD caps ──────────────────────────────────────────
@@ -161,13 +181,27 @@ impl EthernetOffloadCaps {
         Ok(Self { bytes })
     }
 
-    pub fn supports_tx_csum(&self)  -> bool { self.bytes[ETH_OFF_TX_CSUM] != 0 }
-    pub fn supports_rx_csum(&self)  -> bool { self.bytes[ETH_OFF_RX_CSUM] != 0 }
-    pub fn supports_lso(&self)      -> bool { self.bytes[ETH_OFF_LSO] != 0 }
-    pub fn supports_lro(&self)      -> bool { self.bytes[ETH_OFF_LRO] != 0 }
-    pub fn supports_rss(&self)      -> bool { self.bytes[ETH_OFF_RSS_IND_TBL] != 0 }
-    pub fn supports_vlan_insert(&self) -> bool { self.bytes[ETH_OFF_VLAN_INSERT] != 0 }
-    pub fn supports_vlan_strip(&self)  -> bool { self.bytes[ETH_OFF_VLAN_STRIP]  != 0 }
+    pub fn supports_tx_csum(&self) -> bool {
+        self.bytes[ETH_OFF_TX_CSUM] != 0
+    }
+    pub fn supports_rx_csum(&self) -> bool {
+        self.bytes[ETH_OFF_RX_CSUM] != 0
+    }
+    pub fn supports_lso(&self) -> bool {
+        self.bytes[ETH_OFF_LSO] != 0
+    }
+    pub fn supports_lro(&self) -> bool {
+        self.bytes[ETH_OFF_LRO] != 0
+    }
+    pub fn supports_rss(&self) -> bool {
+        self.bytes[ETH_OFF_RSS_IND_TBL] != 0
+    }
+    pub fn supports_vlan_insert(&self) -> bool {
+        self.bytes[ETH_OFF_VLAN_INSERT] != 0
+    }
+    pub fn supports_vlan_strip(&self) -> bool {
+        self.bytes[ETH_OFF_VLAN_STRIP] != 0
+    }
 
     /// Max LSO/TSO segment payload size, BE u32.
     pub fn max_lso_size(&self) -> u32 {
@@ -179,5 +213,7 @@ impl EthernetOffloadCaps {
         ])
     }
 
-    pub fn raw(&self) -> &[u8] { &self.bytes }
+    pub fn raw(&self) -> &[u8] {
+        &self.bytes
+    }
 }

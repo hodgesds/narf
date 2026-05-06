@@ -15,15 +15,13 @@ mod tests;
 
 use core::fmt;
 
-use narf_capabilities::{CapKind, CapType, Cap, CapOp, CapError};
-use narf_lib::id::DomainId;
-use narf_lib::sync::IrqSafeSpinLock;
-use narf_memory::{
-    alloc_frame, free_frame, FrameAllocError, PhysAddr, PhysFrame, PAGE_SIZE,
-};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use narf_capabilities::{Cap, CapError, CapKind, CapOp, CapType};
+use narf_lib::id::DomainId;
+use narf_lib::sync::IrqSafeSpinLock;
+use narf_memory::{alloc_frame, free_frame, FrameAllocError, PhysAddr, PhysFrame, PAGE_SIZE};
 
 // ── Operations ──────────────────────────────────────────────────────
 
@@ -72,16 +70,18 @@ pub enum IoError {
 impl fmt::Display for IoError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            IoError::NoMemory       => f.write_str("io: no contiguous DMA memory available"),
+            IoError::NoMemory => f.write_str("io: no contiguous DMA memory available"),
             IoError::DomainMismatch => f.write_str("io: buffer domain mismatch"),
-            IoError::OutOfIova      => f.write_str("io: no IOVA window available"),
-            IoError::NotMapped      => f.write_str("io: not mapped"),
+            IoError::OutOfIova => f.write_str("io: no IOVA window available"),
+            IoError::NotMapped => f.write_str("io: not mapped"),
         }
     }
 }
 
 impl From<FrameAllocError> for IoError {
-    fn from(_e: FrameAllocError) -> Self { IoError::NoMemory }
+    fn from(_e: FrameAllocError) -> Self {
+        IoError::NoMemory
+    }
 }
 
 // ── DmaBuffer ───────────────────────────────────────────────────────
@@ -93,19 +93,19 @@ pub enum Coherency {
 }
 
 pub struct DmaBuffer {
-    phys:      PhysAddr,
-    len:       usize,
-    domain:    DomainId,
+    phys: PhysAddr,
+    len: usize,
+    domain: DomainId,
     coherency: Coherency,
-    freed:     bool,
+    freed: bool,
 }
 
 impl fmt::Debug for DmaBuffer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DmaBuffer")
-            .field("phys",      &self.phys)
-            .field("len",       &self.len)
-            .field("domain",    &self.domain)
+            .field("phys", &self.phys)
+            .field("len", &self.len)
+            .field("domain", &self.domain)
             .field("coherency", &self.coherency)
             .finish_non_exhaustive()
     }
@@ -113,19 +113,29 @@ impl fmt::Debug for DmaBuffer {
 
 impl DmaBuffer {
     #[inline]
-    pub fn phys_addr(&self) -> PhysAddr { self.phys }
+    pub fn phys_addr(&self) -> PhysAddr {
+        self.phys
+    }
 
     #[inline]
-    pub fn len(&self) -> usize { self.len }
+    pub fn len(&self) -> usize {
+        self.len
+    }
 
     #[inline]
-    pub fn is_empty(&self) -> bool { self.len == 0 }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 
     #[inline]
-    pub fn domain(&self) -> DomainId { self.domain }
+    pub fn domain(&self) -> DomainId {
+        self.domain
+    }
 
     #[inline]
-    pub fn coherency(&self) -> Coherency { self.coherency }
+    pub fn coherency(&self) -> Coherency {
+        self.coherency
+    }
 }
 
 impl CapType for DmaBuffer {
@@ -177,13 +187,15 @@ fn alloc_with(len: usize, domain: DomainId, coherency: Coherency) -> Result<DmaB
     // SAFETY: `phys.raw()` is a freshly allocated page; identity-
     // mapped on x86_64 + the boot identity map on aarch64 (DMA
     // buffers must be reachable by the CPU on both arches).
-    unsafe { core::ptr::write_bytes(phys.raw() as *mut u8, 0, page); }
+    unsafe {
+        core::ptr::write_bytes(phys.raw() as *mut u8, 0, page);
+    }
     Ok(DmaBuffer {
         phys,
-        len:       page,
+        len: page,
         domain,
         coherency,
-        freed:     false,
+        freed: false,
     })
 }
 
@@ -203,10 +215,15 @@ impl fmt::Debug for IommuContext {
 
 impl IommuContext {
     pub const fn new(domain: DomainId) -> Self {
-        Self { domain, mappings: AtomicUsize::new(0) }
+        Self {
+            domain,
+            mappings: AtomicUsize::new(0),
+        }
     }
 
-    pub fn domain(&self) -> DomainId { self.domain }
+    pub fn domain(&self) -> DomainId {
+        self.domain
+    }
 
     pub fn mapping_count(&self) -> usize {
         self.mappings.load(Ordering::Relaxed)

@@ -11,12 +11,12 @@
 use super::UartKind;
 use narf_arch::aarch64::mmio::{read_u32, write_u32};
 
-const DR:    usize = 0x000;
-const FR:    usize = 0x018;
-const IBRD:  usize = 0x024;
-const FBRD:  usize = 0x028;
+const DR: usize = 0x000;
+const FR: usize = 0x018;
+const IBRD: usize = 0x024;
+const FBRD: usize = 0x028;
 const LCR_H: usize = 0x02C;
-const CR:    usize = 0x030;
+const CR: usize = 0x030;
 
 const FR_TXFF: u32 = 1 << 5;
 
@@ -28,12 +28,12 @@ pub unsafe fn init(base: usize, kind: UartKind) {
     debug_assert_eq!(kind, UartKind::Pl011);
     // SAFETY: PL011 programming sequence — disable, program divisors, enable.
     unsafe {
-        write_u32((base + CR)    as *mut u32, 0);           // disable UART
-        // 24 MHz / (16 * 115200) = 13.02; ibrd=13, fbrd = round(0.02*64) = 1.
-        write_u32((base + IBRD)  as *mut u32, 13);
-        write_u32((base + FBRD)  as *mut u32, 1);
-        write_u32((base + LCR_H) as *mut u32, (1 << 4) | (0b11 << 5));  // FIFO, 8 bits
-        write_u32((base + CR)    as *mut u32, (1 << 9) | (1 << 8) | 1); // RXE|TXE|UARTEN
+        write_u32((base + CR) as *mut u32, 0); // disable UART
+                                               // 24 MHz / (16 * 115200) = 13.02; ibrd=13, fbrd = round(0.02*64) = 1.
+        write_u32((base + IBRD) as *mut u32, 13);
+        write_u32((base + FBRD) as *mut u32, 1);
+        write_u32((base + LCR_H) as *mut u32, (1 << 4) | (0b11 << 5)); // FIFO, 8 bits
+        write_u32((base + CR) as *mut u32, (1 << 9) | (1 << 8) | 1); // RXE|TXE|UARTEN
     }
 }
 
@@ -51,7 +51,9 @@ pub unsafe fn write_bytes(base: usize, kind: UartKind, bytes: &[u8]) {
             }
             if b == b'\n' {
                 write_u32((base + DR) as *mut u32, b'\r' as u32);
-                while read_u32((base + FR) as *const u32) & FR_TXFF != 0 { core::hint::spin_loop(); }
+                while read_u32((base + FR) as *const u32) & FR_TXFF != 0 {
+                    core::hint::spin_loop();
+                }
                 write_u32((base + DR) as *mut u32, b'\n' as u32);
             } else {
                 write_u32((base + DR) as *mut u32, b as u32);

@@ -25,12 +25,14 @@ pub enum SchedClass {
 pub struct Priority(pub i8);
 
 impl Priority {
-    pub const HIGH:   Priority = Priority(-10);
+    pub const HIGH: Priority = Priority(-10);
     pub const NORMAL: Priority = Priority(0);
-    pub const LOW:    Priority = Priority(10);
+    pub const LOW: Priority = Priority(10);
 
     #[inline]
-    pub const fn raw(self) -> i8 { self.0 }
+    pub const fn raw(self) -> i8 {
+        self.0
+    }
 }
 
 /// SMT-sharing policy (spec §3.3). Stage-4 governor consults this

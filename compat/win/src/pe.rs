@@ -17,35 +17,35 @@ use alloc::vec::Vec;
 // ── format constants ──────────────────────────────────────────────
 
 const DOS_SIG: u16 = 0x5A4D; // 'MZ'
-const PE_SIG:  u32 = 0x0000_4550; // 'PE\0\0'
+const PE_SIG: u32 = 0x0000_4550; // 'PE\0\0'
 
 const OPT_MAGIC_PE32_PLUS: u16 = 0x20B;
-const OPT_MAGIC_PE32:      u16 = 0x10B;
+const OPT_MAGIC_PE32: u16 = 0x10B;
 
 const MACHINE_AMD64: u16 = 0x8664;
 const MACHINE_ARM64: u16 = 0xAA64;
 
 const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
-const SCN_MEM_WRITE:   u32 = 0x8000_0000;
+const SCN_MEM_WRITE: u32 = 0x8000_0000;
 
-const DIR_IMPORT:    usize = 1;
+const DIR_IMPORT: usize = 1;
 const DIR_BASERELOC: usize = 5;
 
 const IMAGE_REL_BASED_ABSOLUTE: u16 = 0;
-const IMAGE_REL_BASED_DIR64:    u16 = 10;
+const IMAGE_REL_BASED_DIR64: u16 = 10;
 
 // ── public types ──────────────────────────────────────────────────
 
 #[derive(Debug)]
 pub struct PeImage<'a> {
-    pub bytes:      &'a [u8],
-    pub machine:    Machine,
-    pub entry:      u64,
+    pub bytes: &'a [u8],
+    pub machine: Machine,
+    pub entry: u64,
     pub image_base: u64,
     pub size_of_image: u32,
-    pub sections:   Vec<Section>,
-    pub imports:    Vec<Import>,
-    pub relocs:     Vec<BaseReloc>,
+    pub sections: Vec<Section>,
+    pub imports: Vec<Import>,
+    pub relocs: Vec<BaseReloc>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -56,24 +56,24 @@ pub enum Machine {
 
 #[derive(Debug)]
 pub struct Section {
-    pub name:        [u8; 8],
-    pub virt_addr:   u32,
-    pub virt_size:   u32,
-    pub raw_offset:  u32,
-    pub raw_size:    u32,
+    pub name: [u8; 8],
+    pub virt_addr: u32,
+    pub virt_size: u32,
+    pub raw_offset: u32,
+    pub raw_size: u32,
     pub characteristics: u32,
 }
 
 #[derive(Debug)]
 pub struct Import {
-    pub module:  String,
-    pub symbol:  String,
+    pub module: String,
+    pub symbol: String,
     pub iat_rva: u32,
 }
 
 #[derive(Debug)]
 pub struct BaseReloc {
-    pub rva:  u32,
+    pub rva: u32,
     pub kind: BaseRelocKind,
 }
 
@@ -100,24 +100,25 @@ pub enum PeError {
 
 #[inline]
 fn read_u16(bytes: &[u8], off: usize) -> Result<u16, PeError> {
-    bytes.get(off..off + 2)
+    bytes
+        .get(off..off + 2)
         .map(|s| u16::from_le_bytes([s[0], s[1]]))
         .ok_or(PeError::TooSmall)
 }
 
 #[inline]
 fn read_u32(bytes: &[u8], off: usize) -> Result<u32, PeError> {
-    bytes.get(off..off + 4)
+    bytes
+        .get(off..off + 4)
         .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
         .ok_or(PeError::TooSmall)
 }
 
 #[inline]
 fn read_u64(bytes: &[u8], off: usize) -> Result<u64, PeError> {
-    bytes.get(off..off + 8)
-        .map(|s| u64::from_le_bytes([
-            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
-        ]))
+    bytes
+        .get(off..off + 8)
+        .map(|s| u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
         .ok_or(PeError::TooSmall)
 }
 
@@ -187,10 +188,10 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage<'_>, PeError> {
     let machine = match machine_raw {
         MACHINE_AMD64 => Machine::Amd64,
         MACHINE_ARM64 => Machine::Arm64,
-        _             => return Err(PeError::UnsupportedMachine),
+        _ => return Err(PeError::UnsupportedMachine),
     };
-    let num_sections   = read_u16(bytes, fh_off + 2)? as usize;
-    let opt_hdr_size   = read_u16(bytes, fh_off + 16)? as usize;
+    let num_sections = read_u16(bytes, fh_off + 2)? as usize;
+    let opt_hdr_size = read_u16(bytes, fh_off + 16)? as usize;
 
     // 3. Optional header — PE32+ only.
     let oh_off = fh_off + 20;
@@ -202,11 +203,11 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage<'_>, PeError> {
         return Err(PeError::UnsupportedOptionalHeader);
     }
 
-    let entry         = read_u32(bytes, oh_off + 0x10)? as u64;
-    let image_base    = read_u64(bytes, oh_off + 0x18)?;
+    let entry = read_u32(bytes, oh_off + 0x10)? as u64;
+    let image_base = read_u64(bytes, oh_off + 0x18)?;
     let size_of_image = read_u32(bytes, oh_off + 0x38)?;
-    let num_dirs      = read_u32(bytes, oh_off + 0x6C)? as usize;
-    let dir_off       = oh_off + 0x70;
+    let num_dirs = read_u32(bytes, oh_off + 0x6C)? as usize;
+    let dir_off = oh_off + 0x70;
 
     if num_dirs > 16 {
         // Spec maxes out at 16 standard directories; reject obvious
@@ -217,11 +218,17 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage<'_>, PeError> {
         return Err(PeError::TooSmall);
     }
     let read_dir = |idx: usize| -> Option<(u32, u32)> {
-        if idx >= num_dirs { return None; }
+        if idx >= num_dirs {
+            return None;
+        }
         let off = dir_off + idx * 8;
-        let rva  = read_u32(bytes, off).ok()?;
+        let rva = read_u32(bytes, off).ok()?;
         let size = read_u32(bytes, off + 4).ok()?;
-        if rva == 0 || size == 0 { None } else { Some((rva, size)) }
+        if rva == 0 || size == 0 {
+            None
+        } else {
+            Some((rva, size))
+        }
     };
 
     // 4. Section table.
@@ -234,27 +241,34 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage<'_>, PeError> {
         let s = sec_off + i * 40;
         let mut name = [0u8; 8];
         name.copy_from_slice(&bytes[s..s + 8]);
-        let virt_size  = read_u32(bytes, s + 8)?;
-        let virt_addr  = read_u32(bytes, s + 12)?;
-        let raw_size   = read_u32(bytes, s + 16)?;
+        let virt_size = read_u32(bytes, s + 8)?;
+        let virt_addr = read_u32(bytes, s + 12)?;
+        let raw_size = read_u32(bytes, s + 16)?;
         let raw_offset = read_u32(bytes, s + 20)?;
-        let chars      = read_u32(bytes, s + 36)?;
+        let chars = read_u32(bytes, s + 36)?;
 
         // W^X: see spec §4. Refuse the malware-fingerprint pattern.
         if (chars & SCN_MEM_WRITE) != 0 && (chars & SCN_MEM_EXECUTE) != 0 {
             return Err(PeError::WritableExecutableSection);
         }
         // Bounds: raw bytes must fit inside the file.
-        let raw_end = (raw_offset as usize).checked_add(raw_size as usize)
+        let raw_end = (raw_offset as usize)
+            .checked_add(raw_size as usize)
             .ok_or(PeError::BadSection)?;
         if raw_size != 0 && raw_end > bytes.len() {
             return Err(PeError::BadSection);
         }
         // Bounds: virt_addr + virt_size must not overflow.
-        virt_addr.checked_add(virt_size).ok_or(PeError::BadSection)?;
+        virt_addr
+            .checked_add(virt_size)
+            .ok_or(PeError::BadSection)?;
 
         sections.push(Section {
-            name, virt_addr, virt_size, raw_offset, raw_size,
+            name,
+            virt_addr,
+            virt_size,
+            raw_offset,
+            raw_size,
             characteristics: chars,
         });
     }
@@ -274,27 +288,29 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage<'_>, PeError> {
     };
 
     Ok(PeImage {
-        bytes, machine, entry, image_base, size_of_image,
-        sections, imports, relocs,
+        bytes,
+        machine,
+        entry,
+        image_base,
+        size_of_image,
+        sections,
+        imports,
+        relocs,
     })
 }
 
 // ── import directory ──────────────────────────────────────────────
 
-fn parse_imports(
-    bytes: &[u8],
-    sections: &[Section],
-    dir_rva: u32,
-) -> Result<Vec<Import>, PeError> {
+fn parse_imports(bytes: &[u8], sections: &[Section], dir_rva: u32) -> Result<Vec<Import>, PeError> {
     let mut out = Vec::new();
     let mut cursor = rva_to_file(sections, dir_rva).ok_or(PeError::BadImport)?;
     loop {
         if bytes.len() < cursor + 20 {
             return Err(PeError::BadImport);
         }
-        let ilt_rva    = read_u32(bytes, cursor)?;
-        let name_rva   = read_u32(bytes, cursor + 12)?;
-        let iat_rva    = read_u32(bytes, cursor + 16)?;
+        let ilt_rva = read_u32(bytes, cursor)?;
+        let name_rva = read_u32(bytes, cursor + 12)?;
+        let iat_rva = read_u32(bytes, cursor + 16)?;
         // All-zero descriptor terminates.
         if ilt_rva == 0 && name_rva == 0 && iat_rva == 0 {
             break;
@@ -341,8 +357,7 @@ fn parse_imports(
                 s
             } else {
                 let by_name_rva = (entry & 0x7FFF_FFFF) as u32;
-                let by_name_off = rva_to_file(sections, by_name_rva)
-                    .ok_or(PeError::BadImport)?;
+                let by_name_off = rva_to_file(sections, by_name_rva).ok_or(PeError::BadImport)?;
                 // IMAGE_IMPORT_BY_NAME = { Hint: u16; Name: cstring }.
                 read_cstr_lower(bytes, by_name_off + 2, PeError::BadImport)?
             };
@@ -369,7 +384,9 @@ fn parse_relocs(
 ) -> Result<Vec<BaseReloc>, PeError> {
     let mut out = Vec::new();
     let mut cursor = rva_to_file(_sections, dir_rva).ok_or(PeError::BadReloc)?;
-    let end = cursor.checked_add(dir_size as usize).ok_or(PeError::BadReloc)?;
+    let end = cursor
+        .checked_add(dir_size as usize)
+        .ok_or(PeError::BadReloc)?;
     if bytes.len() < end {
         return Err(PeError::BadReloc);
     }
@@ -377,7 +394,7 @@ fn parse_relocs(
         if cursor + 8 > end {
             return Err(PeError::BadReloc);
         }
-        let page_rva   = read_u32(bytes, cursor)?;
+        let page_rva = read_u32(bytes, cursor)?;
         let block_size = read_u32(bytes, cursor + 4)? as usize;
         if block_size < 8 || cursor + block_size > end {
             return Err(PeError::BadReloc);
@@ -393,7 +410,10 @@ fn parse_relocs(
                 }
                 IMAGE_REL_BASED_DIR64 => {
                     let rva = page_rva.checked_add(off).ok_or(PeError::BadReloc)?;
-                    out.push(BaseReloc { rva, kind: BaseRelocKind::Dir64 });
+                    out.push(BaseReloc {
+                        rva,
+                        kind: BaseRelocKind::Dir64,
+                    });
                 }
                 _ => {
                     // Spec lists ten more reloc kinds; none are emitted
@@ -414,8 +434,8 @@ fn parse_relocs(
 #[cfg(test)]
 mod tests {
     extern crate std;
-    use std::vec;
     use super::*;
+    use std::vec;
 
     /// Minimum-viable PE32+ AMD64 image. One `.text` section
     /// (R+X), one `.idata` (R only) holding the import dir + name
@@ -453,26 +473,21 @@ mod tests {
         // NumberOfRvaAndSizes @ +0x6C.
         buf[oh + 0x6C..oh + 0x70].copy_from_slice(&16u32.to_le_bytes());
         // DataDirectory[1] = Import: RVA 0x2000, size 0x60.
-        buf[oh + 0x70 + 1 * 8..oh + 0x70 + 1 * 8 + 4]
-            .copy_from_slice(&0x2000u32.to_le_bytes());
-        buf[oh + 0x70 + 1 * 8 + 4..oh + 0x70 + 1 * 8 + 8]
-            .copy_from_slice(&0x60u32.to_le_bytes());
+        buf[oh + 0x70 + 1 * 8..oh + 0x70 + 1 * 8 + 4].copy_from_slice(&0x2000u32.to_le_bytes());
+        buf[oh + 0x70 + 1 * 8 + 4..oh + 0x70 + 1 * 8 + 8].copy_from_slice(&0x60u32.to_le_bytes());
         // DataDirectory[5] = BaseReloc: RVA 0x2100, size 0x10.
-        buf[oh + 0x70 + 5 * 8..oh + 0x70 + 5 * 8 + 4]
-            .copy_from_slice(&0x2100u32.to_le_bytes());
-        buf[oh + 0x70 + 5 * 8 + 4..oh + 0x70 + 5 * 8 + 8]
-            .copy_from_slice(&0x10u32.to_le_bytes());
+        buf[oh + 0x70 + 5 * 8..oh + 0x70 + 5 * 8 + 4].copy_from_slice(&0x2100u32.to_le_bytes());
+        buf[oh + 0x70 + 5 * 8 + 4..oh + 0x70 + 5 * 8 + 8].copy_from_slice(&0x10u32.to_le_bytes());
 
         // Section table.
         let sec = oh + opt_size as usize; // 0x188
-        // .text — RVA 0x1000, size 0x100, raw at 0x400, R+X.
+                                          // .text — RVA 0x1000, size 0x100, raw at 0x400, R+X.
         buf[sec..sec + 5].copy_from_slice(b".text");
         buf[sec + 8..sec + 12].copy_from_slice(&0x100u32.to_le_bytes()); // virt_size
         buf[sec + 12..sec + 16].copy_from_slice(&0x1000u32.to_le_bytes()); // virt_addr
         buf[sec + 16..sec + 20].copy_from_slice(&0x100u32.to_le_bytes()); // raw_size
         buf[sec + 20..sec + 24].copy_from_slice(&0x400u32.to_le_bytes()); // raw_offset
-        buf[sec + 36..sec + 40]
-            .copy_from_slice(&(SCN_MEM_EXECUTE | 0x4000_0000).to_le_bytes());
+        buf[sec + 36..sec + 40].copy_from_slice(&(SCN_MEM_EXECUTE | 0x4000_0000).to_le_bytes());
         // .idata — RVA 0x2000, size 0x300, raw at 0x500, R only.
         let s2 = sec + 40;
         buf[s2..s2 + 6].copy_from_slice(b".idata");
@@ -488,7 +503,7 @@ mod tests {
         buf[iid..iid + 4].copy_from_slice(&0x2040u32.to_le_bytes()); // ILT
         buf[iid + 12..iid + 16].copy_from_slice(&0x2080u32.to_le_bytes()); // Name
         buf[iid + 16..iid + 20].copy_from_slice(&0x20A0u32.to_le_bytes()); // IAT
-        // IID #1: terminator (all zero — buf already zero).
+                                                                           // IID #1: terminator (all zero — buf already zero).
 
         // ILT @ file 0x540 (RVA 0x2040): one entry → IMAGE_IMPORT_BY_NAME @ 0x20C0.
         let ilt = 0x540;
@@ -548,13 +563,18 @@ mod tests {
 
     #[test]
     fn rejects_bad_dos_sig() {
-        let buf = make_min_pe(MACHINE_AMD64, |b| { b[0] = 0; b[1] = 0; });
+        let buf = make_min_pe(MACHINE_AMD64, |b| {
+            b[0] = 0;
+            b[1] = 0;
+        });
         assert_eq!(parse(&buf).unwrap_err(), PeError::BadDosSignature);
     }
 
     #[test]
     fn rejects_bad_pe_sig() {
-        let buf = make_min_pe(MACHINE_AMD64, |b| { b[0x80] = 0; });
+        let buf = make_min_pe(MACHINE_AMD64, |b| {
+            b[0x80] = 0;
+        });
         assert_eq!(parse(&buf).unwrap_err(), PeError::BadPeSignature);
     }
 

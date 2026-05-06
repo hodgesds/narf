@@ -24,9 +24,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::{
-    DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat,
-};
+use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat};
 
 /// `/dev/null` — read = EOF, write = discard.
 struct DevNull;
@@ -43,9 +41,12 @@ impl FileOps for DevNull {
 
     fn stat(&self) -> Stat {
         Stat {
-            size:         0,
-            blocks:       0,
-            mode:         Mode { file_type: FileType::Special, perms: 0o666 },
+            size: 0,
+            blocks: 0,
+            mode: Mode {
+                file_type: FileType::Special,
+                perms: 0o666,
+            },
             mtime_cycles: 0,
         }
     }
@@ -68,9 +69,10 @@ fn next_random_u32() -> u32 {
     let mut s = RANDOM_STATE.load(Ordering::Relaxed);
     if s == 0 {
         let cy = narf_time::now_cycles();
-        s = (cy ^ 0x9E37_79B9_7F4A_7C15).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
-            & 0x7FFF_FFFF;
-        if s == 0 { s = 1; }
+        s = (cy ^ 0x9E37_79B9_7F4A_7C15).wrapping_mul(0xC2B2_AE3D_27D4_EB4F) & 0x7FFF_FFFF;
+        if s == 0 {
+            s = 1;
+        }
     }
     s = (s.wrapping_mul(48271)) % 0x7FFF_FFFF;
     RANDOM_STATE.store(s, Ordering::Relaxed);
@@ -84,8 +86,8 @@ impl FileOps for DevRandom {
         let mut i = 0usize;
         while i + 4 <= len {
             let v = next_random_u32();
-            buf[i]     =  (v        & 0xFF) as u8;
-            buf[i + 1] = ((v >> 8)  & 0xFF) as u8;
+            buf[i] = (v & 0xFF) as u8;
+            buf[i + 1] = ((v >> 8) & 0xFF) as u8;
             buf[i + 2] = ((v >> 16) & 0xFF) as u8;
             buf[i + 3] = ((v >> 24) & 0xFF) as u8;
             i += 4;
@@ -109,9 +111,12 @@ impl FileOps for DevRandom {
 
     fn stat(&self) -> Stat {
         Stat {
-            size:         0,
-            blocks:       0,
-            mode:         Mode { file_type: FileType::Special, perms: 0o666 },
+            size: 0,
+            blocks: 0,
+            mode: Mode {
+                file_type: FileType::Special,
+                perms: 0o666,
+            },
             mtime_cycles: 0,
         }
     }
@@ -126,7 +131,9 @@ impl FileOps for DevZero {
         // Zero-fill happens here so the future body owns the slice
         // mutation; the async-block move keeps `buf` borrowed for
         // the future's lifetime.
-        for slot in buf.iter_mut() { *slot = 0; }
+        for slot in buf.iter_mut() {
+            *slot = 0;
+        }
         Box::pin(async move { Ok(len) })
     }
 
@@ -137,9 +144,12 @@ impl FileOps for DevZero {
 
     fn stat(&self) -> Stat {
         Stat {
-            size:         0,
-            blocks:       0,
-            mode:         Mode { file_type: FileType::Special, perms: 0o666 },
+            size: 0,
+            blocks: 0,
+            mode: Mode {
+                file_type: FileType::Special,
+                perms: 0o666,
+            },
             mtime_cycles: 0,
         }
     }
@@ -153,33 +163,46 @@ struct DevDir;
 impl DirOps for DevDir {
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         match name {
-            "null"    => Some(Arc::new(DevNull)   as Arc<dyn FileOps>),
-            "zero"    => Some(Arc::new(DevZero)   as Arc<dyn FileOps>),
-            "random"  => Some(Arc::new(DevRandom) as Arc<dyn FileOps>),
+            "null" => Some(Arc::new(DevNull) as Arc<dyn FileOps>),
+            "zero" => Some(Arc::new(DevZero) as Arc<dyn FileOps>),
+            "random" => Some(Arc::new(DevRandom) as Arc<dyn FileOps>),
             "urandom" => Some(Arc::new(DevRandom) as Arc<dyn FileOps>),
-            _         => None,
+            _ => None,
         }
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
         // Names are `&'static str` literals — fine for DirEntry.
         const ENTRIES: &[DirEntry] = &[
-            DirEntry { name: "null",    file_type: FileType::Special },
-            DirEntry { name: "zero",    file_type: FileType::Special },
-            DirEntry { name: "random",  file_type: FileType::Special },
-            DirEntry { name: "urandom", file_type: FileType::Special },
+            DirEntry {
+                name: "null",
+                file_type: FileType::Special,
+            },
+            DirEntry {
+                name: "zero",
+                file_type: FileType::Special,
+            },
+            DirEntry {
+                name: "random",
+                file_type: FileType::Special,
+            },
+            DirEntry {
+                name: "urandom",
+                file_type: FileType::Special,
+            },
         ];
         Box::new(ENTRIES.iter().copied())
     }
 
     fn enumerate(&self, cursor: usize, max: usize) -> Vec<(String, FileType)> {
         let entries = [
-            ("null",    FileType::Special),
-            ("zero",    FileType::Special),
-            ("random",  FileType::Special),
+            ("null", FileType::Special),
+            ("zero", FileType::Special),
+            ("random", FileType::Special),
             ("urandom", FileType::Special),
         ];
-        entries.iter()
+        entries
+            .iter()
             .skip(cursor)
             .take(max)
             .map(|(n, t)| ((*n).into(), *t))
@@ -196,17 +219,25 @@ pub struct DevFs {
 
 impl DevFs {
     pub fn new() -> Self {
-        Self { name: "devfs".into() }
+        Self {
+            name: "devfs".into(),
+        }
     }
 }
 
 impl Default for DevFs {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FsInstance for DevFs {
-    fn root(&self) -> Arc<dyn DirOps> { Arc::new(DevDir) }
-    fn name(&self) -> &str { &self.name }
+    fn root(&self) -> Arc<dyn DirOps> {
+        Arc::new(DevDir)
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 /// Boot helper: mount DevFs at `/dev` if no FS is already mounted

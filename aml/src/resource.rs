@@ -18,18 +18,48 @@ pub enum ResourceItem {
     /// Small DMA Descriptor (small tag type 5): channel mask (u8), flags (u8).
     Dma { mask: u8, flags: u8 },
     /// Small IO Port Descriptor (small tag type 8): info (u8), min, max, alignment, length.
-    Io { info: u8, min: u16, max: u16, alignment: u8, length: u8 },
+    Io {
+        info: u8,
+        min: u16,
+        max: u16,
+        alignment: u8,
+        length: u8,
+    },
     /// Small Fixed IO Port Descriptor (small tag type 9): base (u16), length (u8).
     FixedIo { base: u16, length: u8 },
     /// Large 32-bit Memory Range Descriptor (large tag 0x05): info, min, max, alignment, length.
-    Memory32 { info: u8, min: u32, max: u32, alignment: u32, length: u32 },
+    Memory32 {
+        info: u8,
+        min: u32,
+        max: u32,
+        alignment: u32,
+        length: u32,
+    },
     /// Large 32-bit Fixed Memory Range Descriptor (large tag 0x06): info, base, length.
     Memory32Fixed { info: u8, base: u32, length: u32 },
     /// Large 32-bit Address Space Descriptor (large tag 0x07): kind, flags, type-specific flags,
     /// granularity, min, max, translation, length.
-    AddressSpace32 { kind: u8, flags: u8, type_flags: u8, granularity: u32, min: u32, max: u32, translation: u32, length: u32 },
+    AddressSpace32 {
+        kind: u8,
+        flags: u8,
+        type_flags: u8,
+        granularity: u32,
+        min: u32,
+        max: u32,
+        translation: u32,
+        length: u32,
+    },
     /// Large 64-bit Address Space Descriptor (large tag 0x08): same fields but u64.
-    AddressSpace64 { kind: u8, flags: u8, type_flags: u8, granularity: u64, min: u64, max: u64, translation: u64, length: u64 },
+    AddressSpace64 {
+        kind: u8,
+        flags: u8,
+        type_flags: u8,
+        granularity: u64,
+        min: u64,
+        max: u64,
+        translation: u64,
+        length: u64,
+    },
     /// Large Extended Interrupt Descriptor (large tag 0x09): flags, GSI list.
     ExtendedIrq { flags: u8, gsis: Vec<u32> },
     /// EndTag — small tag 0x79. Emitted so callers can verify termination.
@@ -53,11 +83,11 @@ pub enum ResourceError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrtEntry {
     /// PCI device address: `(slot << 16) | function`. Typically function = 0xFFFF.
-    pub address:      u64,
+    pub address: u64,
     /// Interrupt pin: 0=INTA, 1=INTB, 2=INTC, 3=INTD.
-    pub pin:          u8,
+    pub pin: u8,
     /// Named interrupt source (e.g. "\\_SB.LNKB"). None when the source field was integer 0.
-    pub source:       Option<String>,
+    pub source: Option<String>,
     /// When source is None, this is the GSI directly. When source is Some, it is the
     /// source index within the named link device.
     pub source_index: u32,
@@ -113,46 +143,74 @@ pub fn decode_resource_template(buf: &[u8]) -> Result<Vec<ResourceItem>, Resourc
                 // IRQ Descriptor (type 4), payload 2 or 3 bytes
                 4 => {
                     if payload_len < 2 {
-                        items.push(ResourceItem::Unknown { tag, payload: payload.to_vec() });
+                        items.push(ResourceItem::Unknown {
+                            tag,
+                            payload: payload.to_vec(),
+                        });
                     } else {
                         let mask = u16::from_le_bytes([payload[0], payload[1]]);
-                        let flags = if payload_len >= 3 { Some(payload[2]) } else { None };
+                        let flags = if payload_len >= 3 {
+                            Some(payload[2])
+                        } else {
+                            None
+                        };
                         items.push(ResourceItem::Irq { mask, flags });
                     }
                 }
                 // DMA Descriptor (type 5), payload 2 bytes
                 5 => {
                     if payload_len < 2 {
-                        items.push(ResourceItem::Unknown { tag, payload: payload.to_vec() });
+                        items.push(ResourceItem::Unknown {
+                            tag,
+                            payload: payload.to_vec(),
+                        });
                     } else {
-                        items.push(ResourceItem::Dma { mask: payload[0], flags: payload[1] });
+                        items.push(ResourceItem::Dma {
+                            mask: payload[0],
+                            flags: payload[1],
+                        });
                     }
                 }
                 // IO Port Descriptor (type 8), payload 7 bytes
                 8 => {
                     if payload_len < 7 {
-                        items.push(ResourceItem::Unknown { tag, payload: payload.to_vec() });
+                        items.push(ResourceItem::Unknown {
+                            tag,
+                            payload: payload.to_vec(),
+                        });
                     } else {
                         let info = payload[0];
-                        let min  = u16::from_le_bytes([payload[1], payload[2]]);
-                        let max  = u16::from_le_bytes([payload[3], payload[4]]);
+                        let min = u16::from_le_bytes([payload[1], payload[2]]);
+                        let max = u16::from_le_bytes([payload[3], payload[4]]);
                         let alignment = payload[5];
-                        let length    = payload[6];
-                        items.push(ResourceItem::Io { info, min, max, alignment, length });
+                        let length = payload[6];
+                        items.push(ResourceItem::Io {
+                            info,
+                            min,
+                            max,
+                            alignment,
+                            length,
+                        });
                     }
                 }
                 // Fixed IO Port Descriptor (type 9), payload 3 bytes
                 9 => {
                     if payload_len < 3 {
-                        items.push(ResourceItem::Unknown { tag, payload: payload.to_vec() });
+                        items.push(ResourceItem::Unknown {
+                            tag,
+                            payload: payload.to_vec(),
+                        });
                     } else {
-                        let base   = u16::from_le_bytes([payload[0], payload[1]]);
+                        let base = u16::from_le_bytes([payload[0], payload[1]]);
                         let length = payload[2];
                         items.push(ResourceItem::FixedIo { base, length });
                     }
                 }
                 _ => {
-                    items.push(ResourceItem::Unknown { tag, payload: payload.to_vec() });
+                    items.push(ResourceItem::Unknown {
+                        tag,
+                        payload: payload.to_vec(),
+                    });
                 }
             }
         } else {
@@ -177,76 +235,192 @@ pub fn decode_resource_template(buf: &[u8]) -> Result<Vec<ResourceItem>, Resourc
                 // Large tag 0x05 = 32-bit Memory Range Descriptor, 17 bytes payload
                 0x05 => {
                     if payload_len < 17 {
-                        items.push(ResourceItem::Unknown { tag, payload: payload.to_vec() });
+                        items.push(ResourceItem::Unknown {
+                            tag,
+                            payload: payload.to_vec(),
+                        });
                     } else {
-                        let info      = payload[0];
-                        let min       = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
-                        let max       = u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]);
-                        let alignment = u32::from_le_bytes([payload[9], payload[10], payload[11], payload[12]]);
-                        let length    = u32::from_le_bytes([payload[13], payload[14], payload[15], payload[16]]);
-                        items.push(ResourceItem::Memory32 { info, min, max, alignment, length });
+                        let info = payload[0];
+                        let min =
+                            u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+                        let max =
+                            u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]);
+                        let alignment =
+                            u32::from_le_bytes([payload[9], payload[10], payload[11], payload[12]]);
+                        let length = u32::from_le_bytes([
+                            payload[13],
+                            payload[14],
+                            payload[15],
+                            payload[16],
+                        ]);
+                        items.push(ResourceItem::Memory32 {
+                            info,
+                            min,
+                            max,
+                            alignment,
+                            length,
+                        });
                     }
                 }
                 // Large tag 0x06 = 32-bit Fixed Memory Range Descriptor, 9 bytes payload
                 0x06 => {
                     if payload_len < 9 {
-                        items.push(ResourceItem::Unknown { tag, payload: payload.to_vec() });
+                        items.push(ResourceItem::Unknown {
+                            tag,
+                            payload: payload.to_vec(),
+                        });
                     } else {
-                        let info   = payload[0];
-                        let base   = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
-                        let length = u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]);
+                        let info = payload[0];
+                        let base =
+                            u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+                        let length =
+                            u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]);
                         items.push(ResourceItem::Memory32Fixed { info, base, length });
                     }
                 }
                 // Large tag 0x07 = 32-bit Address Space Descriptor, ≥26 bytes payload
                 0x07 => {
                     if payload_len < 26 {
-                        items.push(ResourceItem::Unknown { tag, payload: payload.to_vec() });
+                        items.push(ResourceItem::Unknown {
+                            tag,
+                            payload: payload.to_vec(),
+                        });
                     } else {
-                        let kind        = payload[0];
-                        let flags       = payload[1];
-                        let type_flags  = payload[2];
-                        let granularity = u32::from_le_bytes([payload[3], payload[4], payload[5], payload[6]]);
-                        let min         = u32::from_le_bytes([payload[7], payload[8], payload[9], payload[10]]);
-                        let max         = u32::from_le_bytes([payload[11], payload[12], payload[13], payload[14]]);
-                        let translation = u32::from_le_bytes([payload[15], payload[16], payload[17], payload[18]]);
-                        let length      = u32::from_le_bytes([payload[19], payload[20], payload[21], payload[22]]);
-                        items.push(ResourceItem::AddressSpace32 { kind, flags, type_flags, granularity, min, max, translation, length });
+                        let kind = payload[0];
+                        let flags = payload[1];
+                        let type_flags = payload[2];
+                        let granularity =
+                            u32::from_le_bytes([payload[3], payload[4], payload[5], payload[6]]);
+                        let min =
+                            u32::from_le_bytes([payload[7], payload[8], payload[9], payload[10]]);
+                        let max = u32::from_le_bytes([
+                            payload[11],
+                            payload[12],
+                            payload[13],
+                            payload[14],
+                        ]);
+                        let translation = u32::from_le_bytes([
+                            payload[15],
+                            payload[16],
+                            payload[17],
+                            payload[18],
+                        ]);
+                        let length = u32::from_le_bytes([
+                            payload[19],
+                            payload[20],
+                            payload[21],
+                            payload[22],
+                        ]);
+                        items.push(ResourceItem::AddressSpace32 {
+                            kind,
+                            flags,
+                            type_flags,
+                            granularity,
+                            min,
+                            max,
+                            translation,
+                            length,
+                        });
                     }
                 }
                 // Large tag 0x08 = 64-bit Address Space Descriptor, ≥43 bytes payload
                 0x08 => {
                     if payload_len < 43 {
-                        items.push(ResourceItem::Unknown { tag, payload: payload.to_vec() });
+                        items.push(ResourceItem::Unknown {
+                            tag,
+                            payload: payload.to_vec(),
+                        });
                     } else {
-                        let kind        = payload[0];
-                        let flags       = payload[1];
-                        let type_flags  = payload[2];
-                        let granularity = u64::from_le_bytes([payload[3], payload[4], payload[5], payload[6], payload[7], payload[8], payload[9], payload[10]]);
-                        let min         = u64::from_le_bytes([payload[11], payload[12], payload[13], payload[14], payload[15], payload[16], payload[17], payload[18]]);
-                        let max         = u64::from_le_bytes([payload[19], payload[20], payload[21], payload[22], payload[23], payload[24], payload[25], payload[26]]);
-                        let translation = u64::from_le_bytes([payload[27], payload[28], payload[29], payload[30], payload[31], payload[32], payload[33], payload[34]]);
-                        let length      = u64::from_le_bytes([payload[35], payload[36], payload[37], payload[38], payload[39], payload[40], payload[41], payload[42]]);
-                        items.push(ResourceItem::AddressSpace64 { kind, flags, type_flags, granularity, min, max, translation, length });
+                        let kind = payload[0];
+                        let flags = payload[1];
+                        let type_flags = payload[2];
+                        let granularity = u64::from_le_bytes([
+                            payload[3],
+                            payload[4],
+                            payload[5],
+                            payload[6],
+                            payload[7],
+                            payload[8],
+                            payload[9],
+                            payload[10],
+                        ]);
+                        let min = u64::from_le_bytes([
+                            payload[11],
+                            payload[12],
+                            payload[13],
+                            payload[14],
+                            payload[15],
+                            payload[16],
+                            payload[17],
+                            payload[18],
+                        ]);
+                        let max = u64::from_le_bytes([
+                            payload[19],
+                            payload[20],
+                            payload[21],
+                            payload[22],
+                            payload[23],
+                            payload[24],
+                            payload[25],
+                            payload[26],
+                        ]);
+                        let translation = u64::from_le_bytes([
+                            payload[27],
+                            payload[28],
+                            payload[29],
+                            payload[30],
+                            payload[31],
+                            payload[32],
+                            payload[33],
+                            payload[34],
+                        ]);
+                        let length = u64::from_le_bytes([
+                            payload[35],
+                            payload[36],
+                            payload[37],
+                            payload[38],
+                            payload[39],
+                            payload[40],
+                            payload[41],
+                            payload[42],
+                        ]);
+                        items.push(ResourceItem::AddressSpace64 {
+                            kind,
+                            flags,
+                            type_flags,
+                            granularity,
+                            min,
+                            max,
+                            translation,
+                            length,
+                        });
                     }
                 }
                 // Large tag 0x09 = Extended Interrupt Descriptor
                 // Payload: flags(1), count(1), count*4 bytes of GSIs, [ResourceSourceIndex + Source]
                 0x09 => {
                     if payload_len < 2 {
-                        items.push(ResourceItem::Unknown { tag, payload: payload.to_vec() });
+                        items.push(ResourceItem::Unknown {
+                            tag,
+                            payload: payload.to_vec(),
+                        });
                     } else {
                         let flags = payload[0];
                         let count = payload[1] as usize;
                         if payload_len < 2 + count * 4 {
-                            items.push(ResourceItem::Unknown { tag, payload: payload.to_vec() });
+                            items.push(ResourceItem::Unknown {
+                                tag,
+                                payload: payload.to_vec(),
+                            });
                         } else {
                             let mut gsis = Vec::with_capacity(count);
                             for i in 0..count {
                                 let off = 2 + i * 4;
                                 gsis.push(u32::from_le_bytes([
-                                    payload[off], payload[off + 1],
-                                    payload[off + 2], payload[off + 3],
+                                    payload[off],
+                                    payload[off + 1],
+                                    payload[off + 2],
+                                    payload[off + 3],
                                 ]));
                             }
                             items.push(ResourceItem::ExtendedIrq { flags, gsis });
@@ -254,7 +428,10 @@ pub fn decode_resource_template(buf: &[u8]) -> Result<Vec<ResourceItem>, Resourc
                     }
                 }
                 _ => {
-                    items.push(ResourceItem::Unknown { tag, payload: payload.to_vec() });
+                    items.push(ResourceItem::Unknown {
+                        tag,
+                        payload: payload.to_vec(),
+                    });
                 }
             }
         }
@@ -285,19 +462,24 @@ pub fn decode_prt(items: &[crate::Value]) -> Result<Vec<PrtEntry>, ResourceError
             return Err(ResourceError::Truncated);
         }
 
-        let address      = inner[0].as_integer();
-        let pin          = inner[1].as_integer() as u8;
+        let address = inner[0].as_integer();
+        let pin = inner[1].as_integer() as u8;
         let source_index = inner[3].as_integer() as u32;
 
         let source = match &inner[2] {
             crate::Value::Integer(0) => None,
-            crate::Value::String(s)  => Some(s.clone()),
+            crate::Value::String(s) => Some(s.clone()),
             // Any other integer (besides 0) or buffer: treat as no named source.
             crate::Value::Integer(_) => None,
-            _                        => None,
+            _ => None,
         };
 
-        entries.push(PrtEntry { address, pin, source, source_index });
+        entries.push(PrtEntry {
+            address,
+            pin,
+            source,
+            source_index,
+        });
     }
 
     Ok(entries)

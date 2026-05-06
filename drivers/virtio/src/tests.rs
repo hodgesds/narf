@@ -15,16 +15,17 @@ fn smoke_virtio_blk_pci_read_sector() -> TestResult {
     // driver via the bus match table, run probe_all_pci, then read
     // sector 0 and verify the pattern xtask wrote into the backing
     // image (`(i * 0x97) & 0xFF`).
-    use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
+    use crate::blk_pci;
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
-    use crate::blk_pci;
+    use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
-    let has_vblk = devs.iter().any(|d|
+    let has_vblk = devs.iter().any(|d| {
         matches!(&d.kind, BusKind::Pcie { .. })
-        && d.id.vendor == blk_pci::VIRTIO_BLK_PCI_VENDOR
-        && d.id.device == blk_pci::VIRTIO_BLK_PCI_DEVICE);
+            && d.id.vendor == blk_pci::VIRTIO_BLK_PCI_VENDOR
+            && d.id.device == blk_pci::VIRTIO_BLK_PCI_DEVICE
+    });
     if !has_vblk {
         return TestResult::Skip("no virtio-blk-pci device");
     }
@@ -55,17 +56,17 @@ fn smoke_virtio_blk_pci_read_sector() -> TestResult {
 kernel_test_in!("drivers/virtio/blk-pci", smoke_virtio_blk_pci_read_sector);
 
 fn smoke_virtio_blk_pci_write_then_read() -> TestResult {
-    use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
+    use crate::blk_pci;
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
-    use crate::blk_pci;
+    use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
-    if !devs.iter().any(|d|
+    if !devs.iter().any(|d| {
         matches!(&d.kind, BusKind::Pcie { .. })
-        && d.id.vendor == blk_pci::VIRTIO_BLK_PCI_VENDOR
-        && d.id.device == blk_pci::VIRTIO_BLK_PCI_DEVICE)
-    {
+            && d.id.vendor == blk_pci::VIRTIO_BLK_PCI_VENDOR
+            && d.id.device == blk_pci::VIRTIO_BLK_PCI_DEVICE
+    }) {
         return TestResult::Skip("no virtio-blk-pci device");
     }
     __reset_for_test();
@@ -75,35 +76,48 @@ fn smoke_virtio_blk_pci_write_then_read() -> TestResult {
         return TestResult::Fail("probe_all_pci failed");
     }
     let mut payload = [0u8; 512];
-    for i in 0..512usize { payload[i] = (i as u8).wrapping_mul(0x5B) ^ 0xC3; }
+    for i in 0..512usize {
+        payload[i] = (i as u8).wrapping_mul(0x5B) ^ 0xC3;
+    }
     let wrote = blk_pci::with_controller(|c| c.write_sector(4, &payload))
-        .map(|r| r.is_ok()).unwrap_or(false);
-    if !wrote { return TestResult::Fail("write_sector(4) failed"); }
+        .map(|r| r.is_ok())
+        .unwrap_or(false);
+    if !wrote {
+        return TestResult::Fail("write_sector(4) failed");
+    }
     let mut readback = [0u8; 512];
     let read_ok = blk_pci::with_controller(|c| c.read_sector(4, &mut readback))
-        .map(|r| r.is_ok()).unwrap_or(false);
-    if !read_ok { return TestResult::Fail("read_sector(4) failed"); }
+        .map(|r| r.is_ok())
+        .unwrap_or(false);
+    if !read_ok {
+        return TestResult::Fail("read_sector(4) failed");
+    }
     if readback != payload {
         return TestResult::Fail("write/read pattern mismatch");
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/virtio/blk-pci", smoke_virtio_blk_pci_write_then_read);
+kernel_test_in!(
+    "drivers/virtio/blk-pci",
+    smoke_virtio_blk_pci_write_then_read
+);
 
 fn smoke_virtio_blk_pci_irq_driven() -> TestResult {
-    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind, probe_all_pci};
+    use crate::blk_pci;
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
-    use crate::blk_pci;
+    use narf_bus::{
+        bootstrap_registry_authority, claim_device_cap, devices, probe_all_pci, BusKind,
+    };
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
-    let dev = match devs.iter().find(|d|
+    let dev = match devs.iter().find(|d| {
         matches!(&d.kind, BusKind::Pcie { .. })
-        && d.id.vendor == blk_pci::VIRTIO_BLK_PCI_VENDOR
-        && d.id.device == blk_pci::VIRTIO_BLK_PCI_DEVICE)
-    {
+            && d.id.vendor == blk_pci::VIRTIO_BLK_PCI_VENDOR
+            && d.id.device == blk_pci::VIRTIO_BLK_PCI_DEVICE
+    }) {
         Some(d) => *d,
-        None    => return TestResult::Skip("no virtio-blk-pci device"),
+        None => return TestResult::Skip("no virtio-blk-pci device"),
     };
     __reset_for_test();
     blk_pci::register_pci_driver();
@@ -116,25 +130,34 @@ fn smoke_virtio_blk_pci_irq_driven() -> TestResult {
         Err(_) => return TestResult::Fail("claim_device_cap"),
     };
     let v = match blk_pci::enable_msix_for_probed(&cap, &dev) {
-        Ok(v)  => v,
+        Ok(v) => v,
         Err(_) => return TestResult::Fail("enable_msix"),
     };
     // SAFETY: APIC initialised; OK to enable for the test.
-    unsafe { narf_arch::enable_interrupts(); }
+    unsafe {
+        narf_arch::enable_interrupts();
+    }
     let baseline = narf_interrupts::fire_count(v);
     let mut sector = [0u8; 512];
     let read_ok = blk_pci::with_controller(|c| c.read_sector_irq(0, &mut sector))
-        .map(|r| r.is_ok()).unwrap_or(false);
+        .map(|r| r.is_ok())
+        .unwrap_or(false);
     let mut spins = 0u32;
     let after = loop {
         let now = narf_interrupts::fire_count(v);
-        if now > baseline || spins > 1_000_000 { break now; }
+        if now > baseline || spins > 1_000_000 {
+            break now;
+        }
         spins += 1;
         core::hint::spin_loop();
     };
     // SAFETY: counterpart.
-    unsafe { narf_arch::disable_interrupts(); }
-    if !read_ok { return TestResult::Fail("read_sector_irq failed"); }
+    unsafe {
+        narf_arch::disable_interrupts();
+    }
+    if !read_ok {
+        return TestResult::Fail("read_sector_irq failed");
+    }
     for i in 0..512usize {
         let expected = (i as u8).wrapping_mul(0x97);
         if sector[i] != expected {
@@ -149,23 +172,25 @@ fn smoke_virtio_blk_pci_irq_driven() -> TestResult {
 kernel_test_in!("drivers/virtio/blk-pci", smoke_virtio_blk_pci_irq_driven);
 
 fn smoke_virtio_blk_pci_irq_async() -> TestResult {
-    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind, probe_all_pci};
-    use narf_bus::driver_match::__reset_for_test;
-    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use crate::blk_pci;
     use core::future::Future;
     use core::pin::Pin;
     use core::sync::atomic::{AtomicBool, Ordering};
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{
+        bootstrap_registry_authority, claim_device_cap, devices, probe_all_pci, BusKind,
+    };
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
-    let dev = match devs.iter().find(|d|
+    let dev = match devs.iter().find(|d| {
         matches!(&d.kind, BusKind::Pcie { .. })
-        && d.id.vendor == blk_pci::VIRTIO_BLK_PCI_VENDOR
-        && d.id.device == blk_pci::VIRTIO_BLK_PCI_DEVICE)
-    {
+            && d.id.vendor == blk_pci::VIRTIO_BLK_PCI_VENDOR
+            && d.id.device == blk_pci::VIRTIO_BLK_PCI_DEVICE
+    }) {
         Some(d) => *d,
-        None    => return TestResult::Skip("no virtio-blk-pci device"),
+        None => return TestResult::Skip("no virtio-blk-pci device"),
     };
     __reset_for_test();
     blk_pci::register_pci_driver();
@@ -178,16 +203,22 @@ fn smoke_virtio_blk_pci_irq_async() -> TestResult {
         Err(_) => return TestResult::Fail("claim_device_cap"),
     };
     let v = match blk_pci::enable_msix_for_probed(&cap, &dev) {
-        Ok(v)  => v,
+        Ok(v) => v,
         Err(_) => return TestResult::Fail("enable_msix"),
     };
     static WOKEN: AtomicBool = AtomicBool::new(false);
-    fn flag_clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VT) }
+    fn flag_clone(p: *const ()) -> RawWaker {
+        RawWaker::new(p, &VT)
+    }
     fn flag_wake(p: *const ()) {
         // SAFETY: p was constructed from `&WOKEN`; AtomicBool is 'static.
-        unsafe { (*(p as *const AtomicBool)).store(true, Ordering::Release); }
+        unsafe {
+            (*(p as *const AtomicBool)).store(true, Ordering::Release);
+        }
     }
-    fn flag_wake_by_ref(p: *const ()) { flag_wake(p); }
+    fn flag_wake_by_ref(p: *const ()) {
+        flag_wake(p);
+    }
     fn flag_drop(_: *const ()) {}
     static VT: RawWakerVTable =
         RawWakerVTable::new(flag_clone, flag_wake, flag_wake_by_ref, flag_drop);
@@ -197,19 +228,27 @@ fn smoke_virtio_blk_pci_irq_async() -> TestResult {
     let waker = unsafe { Waker::from_raw(raw) };
     let mut ctx = Context::from_waker(&waker);
     // SAFETY: enter the wait loop with IRQs DISABLED.
-    unsafe { narf_arch::disable_interrupts(); }
+    unsafe {
+        narf_arch::disable_interrupts();
+    }
     let baseline = narf_interrupts::fire_count(v);
     let mut fut = alloc::boxed::Box::pin(blk_pci::read_sector_irq_async(0));
     let mut polls = 0u32;
     let result = loop {
         match Pin::new(&mut fut).poll(&mut ctx) {
             Poll::Ready(r) => break Some(r),
-            Poll::Pending  => {
+            Poll::Pending => {
                 polls += 1;
-                if polls > 1000 { break None; }
-                if WOKEN.swap(false, Ordering::AcqRel) { continue; }
+                if polls > 1000 {
+                    break None;
+                }
+                if WOKEN.swap(false, Ordering::AcqRel) {
+                    continue;
+                }
                 // SAFETY: IRQs disabled by precondition.
-                unsafe { narf_arch::idle_halt_then_disable(); }
+                unsafe {
+                    narf_arch::idle_halt_then_disable();
+                }
             }
         }
     };
@@ -228,28 +267,30 @@ fn smoke_virtio_blk_pci_irq_async() -> TestResult {
             TestResult::Pass
         }
         Some(Err(_)) => TestResult::Fail("read_sector_irq_async returned Err"),
-        None         => TestResult::Fail("future never resolved within poll budget"),
+        None => TestResult::Fail("future never resolved within poll budget"),
     }
 }
 kernel_test_in!("drivers/virtio/blk-pci", smoke_virtio_blk_pci_irq_async);
 
 fn smoke_virtio_blk_pci_write_irq_async() -> TestResult {
-    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind, probe_all_pci};
-    use narf_bus::driver_match::__reset_for_test;
-    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use crate::blk_pci;
     use core::future::Future;
     use core::pin::Pin;
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use narf_bus::driver_match::__reset_for_test;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{
+        bootstrap_registry_authority, claim_device_cap, devices, probe_all_pci, BusKind,
+    };
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
-    let dev = match devs.iter().find(|d|
+    let dev = match devs.iter().find(|d| {
         matches!(&d.kind, BusKind::Pcie { .. })
-        && d.id.vendor == blk_pci::VIRTIO_BLK_PCI_VENDOR
-        && d.id.device == blk_pci::VIRTIO_BLK_PCI_DEVICE)
-    {
+            && d.id.vendor == blk_pci::VIRTIO_BLK_PCI_VENDOR
+            && d.id.device == blk_pci::VIRTIO_BLK_PCI_DEVICE
+    }) {
         Some(d) => *d,
-        None    => return TestResult::Skip("no virtio-blk-pci device"),
+        None => return TestResult::Skip("no virtio-blk-pci device"),
     };
     __reset_for_test();
     blk_pci::register_pci_driver();
@@ -266,12 +307,18 @@ fn smoke_virtio_blk_pci_write_irq_async() -> TestResult {
     }
     use core::sync::atomic::{AtomicBool, Ordering};
     static WOKEN: AtomicBool = AtomicBool::new(false);
-    fn flag_clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VT) }
+    fn flag_clone(p: *const ()) -> RawWaker {
+        RawWaker::new(p, &VT)
+    }
     fn flag_wake(p: *const ()) {
         // SAFETY: p was constructed from `&WOKEN`; AtomicBool is 'static.
-        unsafe { (*(p as *const AtomicBool)).store(true, Ordering::Release); }
+        unsafe {
+            (*(p as *const AtomicBool)).store(true, Ordering::Release);
+        }
     }
-    fn flag_wake_by_ref(p: *const ()) { flag_wake(p); }
+    fn flag_wake_by_ref(p: *const ()) {
+        flag_wake(p);
+    }
     fn flag_drop(_: *const ()) {}
     static VT: RawWakerVTable =
         RawWakerVTable::new(flag_clone, flag_wake, flag_wake_by_ref, flag_drop);
@@ -281,40 +328,52 @@ fn smoke_virtio_blk_pci_write_irq_async() -> TestResult {
     let waker = unsafe { Waker::from_raw(raw) };
     let mut ctx = Context::from_waker(&waker);
 
-    fn drive<F: Future>(fut: F, ctx: &mut Context<'_>, woken: &AtomicBool)
-        -> Option<F::Output>
-    {
+    fn drive<F: Future>(fut: F, ctx: &mut Context<'_>, woken: &AtomicBool) -> Option<F::Output> {
         let mut fut = alloc::boxed::Box::pin(fut);
         let mut polls = 0u32;
         loop {
             match Pin::new(&mut fut).poll(ctx) {
                 Poll::Ready(r) => return Some(r),
-                Poll::Pending  => {
+                Poll::Pending => {
                     polls += 1;
-                    if polls > 1000 { return None; }
-                    if woken.swap(false, Ordering::AcqRel) { continue; }
+                    if polls > 1000 {
+                        return None;
+                    }
+                    if woken.swap(false, Ordering::AcqRel) {
+                        continue;
+                    }
                     // SAFETY: IF=0 by precondition.
-                    unsafe { narf_arch::idle_halt_then_disable(); }
+                    unsafe {
+                        narf_arch::idle_halt_then_disable();
+                    }
                 }
             }
         }
     }
 
     let mut pattern = [0u8; 512];
-    for i in 0..512usize { pattern[i] = (i as u8).wrapping_add(0x37); }
+    for i in 0..512usize {
+        pattern[i] = (i as u8).wrapping_add(0x37);
+    }
     // SAFETY: IF=0 idle pattern.
-    unsafe { narf_arch::disable_interrupts(); }
-    let write_res = drive(blk_pci::write_sector_irq_async(1, pattern), &mut ctx, &WOKEN);
-    let read_res  = drive(blk_pci::read_sector_irq_async(1), &mut ctx, &WOKEN);
+    unsafe {
+        narf_arch::disable_interrupts();
+    }
+    let write_res = drive(
+        blk_pci::write_sector_irq_async(1, pattern),
+        &mut ctx,
+        &WOKEN,
+    );
+    let read_res = drive(blk_pci::read_sector_irq_async(1), &mut ctx, &WOKEN);
     match write_res {
-        Some(Ok(()))   => {}
-        Some(Err(_))   => return TestResult::Fail("write_sector_irq_async returned Err"),
-        None           => return TestResult::Fail("write future never resolved"),
+        Some(Ok(())) => {}
+        Some(Err(_)) => return TestResult::Fail("write_sector_irq_async returned Err"),
+        None => return TestResult::Fail("write future never resolved"),
     }
     let readback = match read_res {
-        Some(Ok(b))    => b,
-        Some(Err(_))   => return TestResult::Fail("read_sector_irq_async returned Err"),
-        None           => return TestResult::Fail("read future never resolved"),
+        Some(Ok(b)) => b,
+        Some(Err(_)) => return TestResult::Fail("read_sector_irq_async returned Err"),
+        None => return TestResult::Fail("read future never resolved"),
     };
     for i in 0..512usize {
         if readback[i] != pattern[i] {
@@ -323,21 +382,25 @@ fn smoke_virtio_blk_pci_write_irq_async() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/virtio/blk-pci", smoke_virtio_blk_pci_write_irq_async);
+kernel_test_in!(
+    "drivers/virtio/blk-pci",
+    smoke_virtio_blk_pci_write_irq_async
+);
 
 // ── virtio-net-pci ─────────────────────────────────────────────────
 
 fn smoke_virtio_net_pci_tx() -> TestResult {
-    use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
+    use crate::net_pci;
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
-    use crate::net_pci;
+    use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
-    let has_net = devs.iter().any(|d|
+    let has_net = devs.iter().any(|d| {
         matches!(&d.kind, BusKind::Pcie { .. })
-        && d.id.vendor == net_pci::VIRTIO_NET_PCI_VENDOR
-        && d.id.device == net_pci::VIRTIO_NET_PCI_DEVICE);
+            && d.id.vendor == net_pci::VIRTIO_NET_PCI_VENDOR
+            && d.id.device == net_pci::VIRTIO_NET_PCI_DEVICE
+    });
     if !has_net {
         return TestResult::Skip("no virtio-net-pci device");
     }
@@ -351,14 +414,17 @@ fn smoke_virtio_net_pci_tx() -> TestResult {
         return TestResult::Fail("virtio-net-pci not probed");
     }
     let mut frame = [0u8; 64];
-    for i in 14..64 { frame[i] = (i as u8).wrapping_mul(0x3D); }
+    for i in 14..64 {
+        frame[i] = (i as u8).wrapping_mul(0x3D);
+    }
     let tx_ok = net_pci::with_controller(|c| c.tx(&frame))
-        .map(|r| r.is_ok()).unwrap_or(false);
+        .map(|r| r.is_ok())
+        .unwrap_or(false);
     if !tx_ok {
         return TestResult::Fail("virtio-net-pci tx returned Err");
     }
-    let qsizes = net_pci::with_controller(|c|
-        (c.rx_queue_size(), c.tx_queue_size())).unwrap_or((0, 0));
+    let qsizes =
+        net_pci::with_controller(|c| (c.rx_queue_size(), c.tx_queue_size())).unwrap_or((0, 0));
     if qsizes.0 == 0 || qsizes.1 == 0 {
         return TestResult::Fail("queue sizes zero — bring-up failed");
     }
@@ -367,17 +433,20 @@ fn smoke_virtio_net_pci_tx() -> TestResult {
 kernel_test_in!("drivers/virtio/net-pci", smoke_virtio_net_pci_tx);
 
 fn smoke_virtio_net_pci_rx_arp() -> TestResult {
-    use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
+    use crate::net_pci;
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
-    use crate::net_pci;
+    use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
-    let has_net = devs.iter().any(|d|
+    let has_net = devs.iter().any(|d| {
         matches!(&d.kind, BusKind::Pcie { .. })
-        && d.id.vendor == net_pci::VIRTIO_NET_PCI_VENDOR
-        && d.id.device == net_pci::VIRTIO_NET_PCI_DEVICE);
-    if !has_net { return TestResult::Skip("no virtio-net-pci"); }
+            && d.id.vendor == net_pci::VIRTIO_NET_PCI_VENDOR
+            && d.id.device == net_pci::VIRTIO_NET_PCI_DEVICE
+    });
+    if !has_net {
+        return TestResult::Skip("no virtio-net-pci");
+    }
     __reset_for_test();
     net_pci::register_pci_driver();
     let authority = bootstrap_registry_authority();
@@ -385,19 +454,40 @@ fn smoke_virtio_net_pci_rx_arp() -> TestResult {
         return TestResult::Fail("probe_all_pci");
     }
     let mut frame = [0u8; 42];
-    for i in 0..6 { frame[i] = 0xFF; }
-    frame[6] = 0x52; frame[7] = 0x54; frame[8] = 0x00;
-    frame[9] = 0x12; frame[10] = 0x34; frame[11] = 0x57;
-    frame[12] = 0x08; frame[13] = 0x06;
-    frame[14] = 0x00; frame[15] = 0x01;
-    frame[16] = 0x08; frame[17] = 0x00;
-    frame[18] = 6; frame[19] = 4;
-    frame[20] = 0x00; frame[21] = 0x01;
-    for i in 0..6 { frame[22 + i] = frame[6 + i]; }
-    frame[28] = 10; frame[29] = 0; frame[30] = 2; frame[31] = 15;
-    frame[38] = 10; frame[39] = 0; frame[40] = 2; frame[41] = 2;
-    if net_pci::with_controller(|c| c.tx(&frame)).map(|r| r.is_ok())
-        .unwrap_or(false) == false
+    for i in 0..6 {
+        frame[i] = 0xFF;
+    }
+    frame[6] = 0x52;
+    frame[7] = 0x54;
+    frame[8] = 0x00;
+    frame[9] = 0x12;
+    frame[10] = 0x34;
+    frame[11] = 0x57;
+    frame[12] = 0x08;
+    frame[13] = 0x06;
+    frame[14] = 0x00;
+    frame[15] = 0x01;
+    frame[16] = 0x08;
+    frame[17] = 0x00;
+    frame[18] = 6;
+    frame[19] = 4;
+    frame[20] = 0x00;
+    frame[21] = 0x01;
+    for i in 0..6 {
+        frame[22 + i] = frame[6 + i];
+    }
+    frame[28] = 10;
+    frame[29] = 0;
+    frame[30] = 2;
+    frame[31] = 15;
+    frame[38] = 10;
+    frame[39] = 0;
+    frame[40] = 2;
+    frame[41] = 2;
+    if net_pci::with_controller(|c| c.tx(&frame))
+        .map(|r| r.is_ok())
+        .unwrap_or(false)
+        == false
     {
         return TestResult::Fail("virtio-net tx");
     }
@@ -405,7 +495,10 @@ fn smoke_virtio_net_pci_rx_arp() -> TestResult {
     let mut any = 0usize;
     for _ in 0..2_000_000u32 {
         let len = net_pci::with_controller(|c| c.rx(&mut rx_buf)).unwrap_or(0);
-        if len > 0 { any = len; break; }
+        if len > 0 {
+            any = len;
+            break;
+        }
         core::hint::spin_loop();
     }
     let _ = any;
@@ -416,17 +509,20 @@ kernel_test_in!("drivers/virtio/net-pci", smoke_virtio_net_pci_rx_arp);
 // ── virtio-rng-pci / virtio-snd-pci / virtio-balloon-pci ───────────
 
 fn smoke_virtio_rng_pci_probe() -> TestResult {
-    use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
+    use crate::rng_pci;
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
-    use crate::rng_pci;
+    use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
-    let has = devs.iter().any(|d|
+    let has = devs.iter().any(|d| {
         matches!(&d.kind, BusKind::Pcie { .. })
-        && d.id.vendor == rng_pci::VIRTIO_RNG_PCI_VENDOR
-        && d.id.device == rng_pci::VIRTIO_RNG_PCI_DEVICE);
-    if !has { return TestResult::Skip("no virtio-rng-pci"); }
+            && d.id.vendor == rng_pci::VIRTIO_RNG_PCI_VENDOR
+            && d.id.device == rng_pci::VIRTIO_RNG_PCI_DEVICE
+    });
+    if !has {
+        return TestResult::Skip("no virtio-rng-pci");
+    }
     __reset_for_test();
     rng_pci::register_pci_driver();
     let authority = bootstrap_registry_authority();
@@ -441,17 +537,20 @@ fn smoke_virtio_rng_pci_probe() -> TestResult {
 kernel_test_in!("drivers/virtio/rng-pci", smoke_virtio_rng_pci_probe);
 
 fn smoke_virtio_snd_pci_probe() -> TestResult {
-    use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
+    use crate::snd_pci;
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
-    use crate::snd_pci;
+    use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
-    let has = devs.iter().any(|d|
+    let has = devs.iter().any(|d| {
         matches!(&d.kind, BusKind::Pcie { .. })
-        && d.id.vendor == snd_pci::VIRTIO_SND_PCI_VENDOR
-        && d.id.device == snd_pci::VIRTIO_SND_PCI_DEVICE);
-    if !has { return TestResult::Skip("no virtio-snd-pci"); }
+            && d.id.vendor == snd_pci::VIRTIO_SND_PCI_VENDOR
+            && d.id.device == snd_pci::VIRTIO_SND_PCI_DEVICE
+    });
+    if !has {
+        return TestResult::Skip("no virtio-snd-pci");
+    }
     __reset_for_test();
     snd_pci::__reset_for_test();
     snd_pci::register_pci_driver();
@@ -470,17 +569,20 @@ fn smoke_virtio_snd_pci_probe() -> TestResult {
 kernel_test_in!("drivers/virtio/snd-pci", smoke_virtio_snd_pci_probe);
 
 fn smoke_virtio_balloon_pci_probe() -> TestResult {
-    use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
+    use crate::balloon_pci;
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
-    use crate::balloon_pci;
+    use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
-    let has = devs.iter().any(|d|
+    let has = devs.iter().any(|d| {
         matches!(&d.kind, BusKind::Pcie { .. })
-        && d.id.vendor == balloon_pci::VIRTIO_BALLOON_PCI_VENDOR
-        && d.id.device == balloon_pci::VIRTIO_BALLOON_PCI_DEVICE);
-    if !has { return TestResult::Skip("no virtio-balloon-pci"); }
+            && d.id.vendor == balloon_pci::VIRTIO_BALLOON_PCI_VENDOR
+            && d.id.device == balloon_pci::VIRTIO_BALLOON_PCI_DEVICE
+    });
+    if !has {
+        return TestResult::Skip("no virtio-balloon-pci");
+    }
     __reset_for_test();
     balloon_pci::register_pci_driver();
     let authority = bootstrap_registry_authority();
@@ -495,17 +597,20 @@ fn smoke_virtio_balloon_pci_probe() -> TestResult {
 kernel_test_in!("drivers/virtio/balloon-pci", smoke_virtio_balloon_pci_probe);
 
 fn smoke_virtio_balloon_pci_inflate_deflate() -> TestResult {
-    use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
+    use crate::balloon_pci;
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
-    use crate::balloon_pci;
+    use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
-    let has = devs.iter().any(|d|
+    let has = devs.iter().any(|d| {
         matches!(&d.kind, BusKind::Pcie { .. })
-        && d.id.vendor == balloon_pci::VIRTIO_BALLOON_PCI_VENDOR
-        && d.id.device == balloon_pci::VIRTIO_BALLOON_PCI_DEVICE);
-    if !has { return TestResult::Skip("no virtio-balloon-pci"); }
+            && d.id.vendor == balloon_pci::VIRTIO_BALLOON_PCI_VENDOR
+            && d.id.device == balloon_pci::VIRTIO_BALLOON_PCI_DEVICE
+    });
+    if !has {
+        return TestResult::Skip("no virtio-balloon-pci");
+    }
     __reset_for_test();
     balloon_pci::register_pci_driver();
     let authority = bootstrap_registry_authority();
@@ -516,7 +621,7 @@ fn smoke_virtio_balloon_pci_inflate_deflate() -> TestResult {
     // the inflate queue, then deflate it back. Polled completion;
     // succeeds iff the device acks both submissions.
     let buf = match narf_io::alloc_coherent(4096, narf_lib::id::DomainId::DRIVER_0) {
-        Ok(b)  => b,
+        Ok(b) => b,
         Err(_) => return TestResult::Fail("alloc_coherent"),
     };
     let pfn = (buf.phys_addr().raw() >> 12) as u32;
@@ -525,14 +630,17 @@ fn smoke_virtio_balloon_pci_inflate_deflate() -> TestResult {
     match r {
         Some(Ok(())) => {}
         Some(Err(_)) => return TestResult::Fail("inflate"),
-        None         => return TestResult::Fail("controller missing"),
+        None => return TestResult::Fail("controller missing"),
     }
     let r = balloon_pci::with_controller(|c| c.deflate(&pfns));
     match r {
         Some(Ok(())) => {}
         Some(Err(_)) => return TestResult::Fail("deflate"),
-        None         => return TestResult::Fail("controller missing"),
+        None => return TestResult::Fail("controller missing"),
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/virtio/balloon-pci", smoke_virtio_balloon_pci_inflate_deflate);
+kernel_test_in!(
+    "drivers/virtio/balloon-pci",
+    smoke_virtio_balloon_pci_inflate_deflate
+);

@@ -47,8 +47,8 @@ pub mod sketch;
 pub use hwtrace::{HwTraceConfig, HwTraceError, HwTraceMarker, HwTraceStatus};
 
 pub use dispatch::{
-    fire, reserve_probe_id, table as handler_table,
-    HandlerTable, ProbeArgs, ProbeHandler, ProbeHandlerInstall, RegisterError,
+    fire, reserve_probe_id, table as handler_table, HandlerTable, ProbeArgs, ProbeHandler,
+    ProbeHandlerInstall, RegisterError,
 };
 pub use fntime::{scope, FnTime, ScopeGuard, Welford};
 pub use sketch::{Histogram, HISTOGRAM_BUCKETS};
@@ -82,36 +82,36 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 pub struct ProbeSite {
     /// Provider namespace — `"ipc"`, `"mem"`, `"sched"`, ... (null-
     /// terminator NOT required; `provider_len` is the authoritative bound).
-    pub provider:     &'static str,
+    pub provider: &'static str,
     /// Probe name inside the provider — `"send"`, `"alloc"`, etc.
-    pub name:         &'static str,
+    pub name: &'static str,
     /// Source module path at the probe site. `module_path!()` at expansion.
-    pub module:       &'static str,
+    pub module: &'static str,
     /// Source file + line for diagnostics.
-    pub file:         &'static str,
-    pub line:         u32,
+    pub file: &'static str,
+    pub line: u32,
     /// Number of arguments passed to the `probe!` invocation.
-    pub argc:         u32,
+    pub argc: u32,
     /// Comma-separated argument Rust-type names (`"u32,u16,&str"` etc.).
     /// Stage-3 arming uses this to validate handler signatures.
-    pub args:         &'static str,
+    pub args: &'static str,
 }
 
 impl core::fmt::Debug for ProbeSite {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ProbeSite")
             .field("provider", &self.provider)
-            .field("name",     &self.name)
-            .field("module",   &self.module)
-            .field("line",     &self.line)
-            .field("argc",     &self.argc)
+            .field("name", &self.name)
+            .field("module", &self.module)
+            .field("line", &self.line)
+            .field("argc", &self.argc)
             .finish_non_exhaustive()
     }
 }
 
 extern "Rust" {
     static __narf_probes_start: ProbeSite;
-    static __narf_probes_end:   ProbeSite;
+    static __narf_probes_end: ProbeSite;
 }
 
 /// Return every `probe!`-registered site the linker collected.
@@ -125,9 +125,9 @@ pub fn probes() -> &'static [ProbeSite] {
     // is a `ProbeSite` (the `probe!` macro is the only writer).
     let start = unsafe { &__narf_probes_start as *const ProbeSite };
     // SAFETY: see the previous block — same linker-emitted symbol.
-    let end   = unsafe { &__narf_probes_end   as *const ProbeSite };
+    let end = unsafe { &__narf_probes_end as *const ProbeSite };
     let bytes = (end as usize).saturating_sub(start as usize);
-    let len   = bytes / core::mem::size_of::<ProbeSite>();
+    let len = bytes / core::mem::size_of::<ProbeSite>();
     // SAFETY: start/len derived from the linker-defined boundaries of
     // a contiguous region of `ProbeSite` entries.
     unsafe { core::slice::from_raw_parts(start, len) }
@@ -181,12 +181,12 @@ macro_rules! probe {
             #[link_section = ".note.narf.probes"]
             static SITE: $crate::ProbeSite = $crate::ProbeSite {
                 provider: stringify!($provider),
-                name:     stringify!($name),
-                module:   module_path!(),
-                file:     file!(),
-                line:     line!(),
-                argc:     $crate::__count_args($args),
-                args:     $args,
+                name: stringify!($name),
+                module: module_path!(),
+                file: file!(),
+                line: line!(),
+                argc: $crate::__count_args($args),
+                args: $args,
             };
         };
     }};
@@ -221,11 +221,15 @@ pub fn __nop_marker() {
 /// at const-time. Empty string → 0; otherwise commas + 1.
 pub const fn __count_args(s: &'static str) -> u32 {
     let bytes = s.as_bytes();
-    if bytes.is_empty() { return 0; }
+    if bytes.is_empty() {
+        return 0;
+    }
     let mut commas: u32 = 0;
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b',' { commas += 1; }
+        if bytes[i] == b',' {
+            commas += 1;
+        }
         i += 1;
     }
     commas + 1
@@ -261,27 +265,27 @@ impl<T: Copy + 'static> Event for T {}
 /// the history is lossy.
 pub struct FlightRing<T: Event, const N: usize> {
     /// Monotonic producer counter. `head % N` is the next write slot.
-    head:     AtomicU64,
+    head: AtomicU64,
     /// Number of records that overwrote live history.
-    overrun:  AtomicU64,
+    overrun: AtomicU64,
     /// Per-slot sequence. Producers bump `seq` to an odd value before
     /// the write, then to the next even value after. Consumers can
     /// detect torn reads by observing an odd `seq`.
-    seq:      [AtomicU64; N],
+    seq: [AtomicU64; N],
     /// Slot storage. `MaybeUninit` + `UnsafeCell` so (a) we don't
     /// need `T: Default` / a runtime `init` value to const-construct
     /// the array, and (b) writes don't require `&mut` (we only hand
     /// out `&FlightRing`). Consumers gate reads on `seq != 0`, so
     /// uninitialised slots are never observed as payload.
-    slots:    [UnsafeCell<MaybeUninit<T>>; N],
+    slots: [UnsafeCell<MaybeUninit<T>>; N],
 }
 
 impl<T: Event, const N: usize> core::fmt::Debug for FlightRing<T, N> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("FlightRing")
             .field("capacity", &N)
-            .field("head",     &self.head.load(Ordering::Relaxed))
-            .field("overrun",  &self.overrun.load(Ordering::Relaxed))
+            .field("head", &self.head.load(Ordering::Relaxed))
+            .field("overrun", &self.overrun.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
 }
@@ -301,17 +305,19 @@ impl<T: Event, const N: usize> FlightRing<T, N> {
     pub const fn new() -> Self {
         // Const-assert: N must be a non-zero power of two.
         // `N & (N - 1) == 0` and `N > 0`.
-        assert!(N > 0 && (N & (N - 1)) == 0,
-                "FlightRing capacity must be a non-zero power of two");
+        assert!(
+            N > 0 && (N & (N - 1)) == 0,
+            "FlightRing capacity must be a non-zero power of two"
+        );
         Self {
-            head:    AtomicU64::new(0),
+            head: AtomicU64::new(0),
             overrun: AtomicU64::new(0),
             // `const { … }` repeat-expressions side-step the
             // `T: Copy` requirement of plain `[expr; N]` — each cell
             // is separately const-evaluated. `AtomicU64::new` /
             // `UnsafeCell::new` / `MaybeUninit::uninit` are all const.
-            seq:     [const { AtomicU64::new(0) }; N],
-            slots:   [const { UnsafeCell::new(MaybeUninit::<T>::uninit()) }; N],
+            seq: [const { AtomicU64::new(0) }; N],
+            slots: [const { UnsafeCell::new(MaybeUninit::<T>::uninit()) }; N],
         }
     }
 
@@ -333,7 +339,7 @@ impl<T: Event, const N: usize> FlightRing<T, N> {
 
         // Publish protocol: bump seq to odd, write, bump to even.
         let prev = self.seq[idx].load(Ordering::Relaxed);
-        let odd  = prev.wrapping_add(1) | 1;
+        let odd = prev.wrapping_add(1) | 1;
         let even = odd.wrapping_add(1) & !1;
 
         self.seq[idx].store(odd, Ordering::Release);
@@ -350,11 +356,12 @@ impl<T: Event, const N: usize> FlightRing<T, N> {
         }
         self.seq[idx].store(even, Ordering::Release);
     }
-
 }
 
 impl<T: Event, const N: usize> Default for FlightRing<T, N> {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<T: Event, const N: usize> FlightRing<T, N> {
@@ -386,17 +393,19 @@ impl<T: Event, const N: usize> FlightRing<T, N> {
             let idx = (ticket as usize) & (N - 1);
 
             let s1 = self.seq[idx].load(Ordering::Acquire);
-            if s1 == 0 || s1 & 1 != 0 { continue; } // uninitialised or torn
-            // SAFETY: when `s1` is even and non-zero, the slot was
-            // fully written at least once and no producer is mid-write
-            // on it right now. The volatile read prevents the optimiser
-            // from hoisting it out of the seq fence pair. `assume_init`
-            // is valid because seq != 0 means a complete record landed.
-            let val = unsafe {
-                core::ptr::read_volatile(self.slots[idx].get()).assume_init()
-            };
+            if s1 == 0 || s1 & 1 != 0 {
+                continue;
+            } // uninitialised or torn
+              // SAFETY: when `s1` is even and non-zero, the slot was
+              // fully written at least once and no producer is mid-write
+              // on it right now. The volatile read prevents the optimiser
+              // from hoisting it out of the seq fence pair. `assume_init`
+              // is valid because seq != 0 means a complete record landed.
+            let val = unsafe { core::ptr::read_volatile(self.slots[idx].get()).assume_init() };
             let s2 = self.seq[idx].load(Ordering::Acquire);
-            if s1 != s2 { continue; }    // raced with a producer
+            if s1 != s2 {
+                continue;
+            } // raced with a producer
 
             out[filled] = val;
             filled += 1;
@@ -420,12 +429,16 @@ static GLOBAL_ARMED: AtomicUsize = AtomicUsize::new(0);
 
 /// Are any probes currently armed?
 #[inline]
-pub fn any_armed() -> bool { GLOBAL_ARMED.load(Ordering::Relaxed) != 0 }
+pub fn any_armed() -> bool {
+    GLOBAL_ARMED.load(Ordering::Relaxed) != 0
+}
 
 /// Cap-type marker for probe arming authority.
 #[derive(Debug)]
 pub struct ProbeArming;
-impl CapType for ProbeArming { const KIND: CapKind = CapKind::Probe; }
+impl CapType for ProbeArming {
+    const KIND: CapKind = CapKind::Probe;
+}
 
 /// Arm the 4-byte patch slot at `target` with `word`, bumping the
 /// global armed count. The slot must be 4-byte aligned and live in
@@ -441,7 +454,9 @@ pub unsafe fn arm(
 ) -> Result<(), CapError> {
     cap.check_live()?;
     // SAFETY: delegated to arch::patch_word per the caller's contract.
-    unsafe { narf_arch::patch_word(target, word); }
+    unsafe {
+        narf_arch::patch_word(target, word);
+    }
     GLOBAL_ARMED.fetch_add(1, Ordering::Release);
     Ok(())
 }
@@ -458,16 +473,22 @@ pub unsafe fn disarm(
 ) -> Result<(), CapError> {
     cap.check_live()?;
     // SAFETY: delegated to arch::patch_word.
-    unsafe { narf_arch::patch_word(target, original); }
+    unsafe {
+        narf_arch::patch_word(target, original);
+    }
     GLOBAL_ARMED.fetch_sub(1, Ordering::Release);
     Ok(())
 }
 
 /// Test-only bump / clear kept for back-compat with Stage-2 users.
 #[doc(hidden)]
-pub fn __test_bump_armed()   { GLOBAL_ARMED.fetch_add(1, Ordering::Relaxed); }
+pub fn __test_bump_armed() {
+    GLOBAL_ARMED.fetch_add(1, Ordering::Relaxed);
+}
 #[doc(hidden)]
-pub fn __test_clear_armed()  { GLOBAL_ARMED.store(0, Ordering::Relaxed); }
+pub fn __test_clear_armed() {
+    GLOBAL_ARMED.store(0, Ordering::Relaxed);
+}
 
 // ── Internal smoke probes ───────────────────────────────────────────
 //

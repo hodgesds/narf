@@ -32,10 +32,10 @@ fn id_aa64pfr1() -> u64 {
 #[derive(Copy, Clone, Debug, Default)]
 pub struct MpamCaps {
     pub supported: bool,
-    pub revision:  u8,
-    pub frac:      u8,
-    pub max_partid:u16,
-    pub max_pmg:   u8,
+    pub revision: u8,
+    pub frac: u8,
+    pub max_partid: u16,
+    pub max_pmg: u8,
 }
 
 pub fn caps() -> MpamCaps {
@@ -54,7 +54,7 @@ pub fn caps() -> MpamCaps {
         asm!("mrs {}, S3_0_C10_C4_4", out(reg) id, options(nomem, nostack));
     }
     let max_partid = (id & 0xFFFF) as u16;
-    let max_pmg    = ((id >> 32) & 0xFF) as u8;
+    let max_pmg = ((id >> 32) & 0xFF) as u8;
 
     MpamCaps {
         supported: true,
@@ -69,10 +69,12 @@ const MPAMEN: u64 = 1 << 63;
 
 fn pack(partid_d: u16, partid_i: u16, pmg_d: u8, pmg_i: u8, enable: bool) -> u64 {
     let mut v = (partid_d as u64)
-              | ((partid_i as u64) << 16)
-              | ((pmg_d as u64) << 32)
-              | ((pmg_i as u64) << 40);
-    if enable { v |= MPAMEN; }
+        | ((partid_i as u64) << 16)
+        | ((pmg_d as u64) << 32)
+        | ((pmg_i as u64) << 40);
+    if enable {
+        v |= MPAMEN;
+    }
     v
 }
 

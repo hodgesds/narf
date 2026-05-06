@@ -19,7 +19,9 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 // ── Rights ──────────────────────────────────────────────────────────
 
-mod sealed { pub trait Sealed {} }
+mod sealed {
+    pub trait Sealed {}
+}
 use sealed::Sealed;
 
 /// Runtime mirror of a type-level rights marker. `BITS` lands in the
@@ -67,25 +69,35 @@ pub struct Spend;
 #[derive(Copy, Clone, Debug)]
 pub struct Invoke;
 
-impl Sealed for Read   {}
-impl Sealed for Write  {}
-impl Sealed for Grant  {}
-impl Sealed for Spend  {}
+impl Sealed for Read {}
+impl Sealed for Write {}
+impl Sealed for Grant {}
+impl Sealed for Spend {}
 impl Sealed for Invoke {}
 
-impl Rights for Read   { const BITS: u32 = 0b0_0001; }
-impl Rights for Write  { const BITS: u32 = 0b0_0010; }
-impl Rights for Grant  { const BITS: u32 = 0b0_0100; }
-impl Rights for Spend  { const BITS: u32 = 0b0_1000; }
-impl Rights for Invoke { const BITS: u32 = 0b1_0000; }
+impl Rights for Read {
+    const BITS: u32 = 0b0_0001;
+}
+impl Rights for Write {
+    const BITS: u32 = 0b0_0010;
+}
+impl Rights for Grant {
+    const BITS: u32 = 0b0_0100;
+}
+impl Rights for Spend {
+    const BITS: u32 = 0b0_1000;
+}
+impl Rights for Invoke {
+    const BITS: u32 = 0b1_0000;
+}
 
 /// Authority to derive R2 from R.
 pub trait SubsetOf<R: Rights>: Rights {}
 
 impl<R: Rights> SubsetOf<R> for R {}
-impl SubsetOf<Grant> for Read   {}
-impl SubsetOf<Grant> for Write  {}
-impl SubsetOf<Grant> for Spend  {}
+impl SubsetOf<Grant> for Read {}
+impl SubsetOf<Grant> for Write {}
+impl SubsetOf<Grant> for Spend {}
 impl SubsetOf<Grant> for Invoke {}
 
 // Lattice rules. `SubsetOf<Y> for X` reads "X is a subset of Y, so
@@ -98,15 +110,15 @@ impl SubsetOf<Grant> for Invoke {}
 // Read ⊂ Write: a writer can always observe what it can change.
 // Lets `Cap<T, Write>` derive `Cap<T, Read>` for the read-only side
 // of typed APIs (drivers::ParamSlot, observability hooks).
-impl SubsetOf<Write>  for Read   {}
+impl SubsetOf<Write> for Read {}
 // Read ⊂ Invoke: an invoker can always observe the object it can
 // trigger. `Cap<Probe, Invoke>` (fire) → `Cap<Probe, Read>` (sample);
 // `Cap<Task, Invoke>` (donate) → `Cap<Task, Read>` (inspect the donee).
-impl SubsetOf<Invoke> for Read   {}
+impl SubsetOf<Invoke> for Read {}
 // Read ⊂ Spend: a holder of spend authority can observe the quota
 // it's debiting. `Cap<CpuBudget, Spend>` → `Cap<CpuBudget, Read>`
 // for budget-status readouts without giving up the debit cap.
-impl SubsetOf<Spend>  for Read   {}
+impl SubsetOf<Spend> for Read {}
 
 // ── CapSlot ─────────────────────────────────────────────────────────
 
@@ -118,22 +130,30 @@ pub struct CapSlot {
     /// EROS-style epoch snapshot taken at mint time.
     pub generation: u32,
     /// Index into the capability domain's object table.
-    pub index:      u32,
+    pub index: u32,
     /// Runtime mirror of `R: Rights` — what the type-level tag claimed.
-    pub rights:     u32,
+    pub rights: u32,
     /// Compact `CapKind as u32`; dispatch cross-checks against the
     /// callee's expected type.
-    pub type_tag:   u32,
+    pub type_tag: u32,
 }
 
 impl CapSlot {
     pub const EMPTY: CapSlot = CapSlot {
-        generation: 0, index: 0, rights: 0, type_tag: 0,
+        generation: 0,
+        index: 0,
+        rights: 0,
+        type_tag: 0,
     };
 
     #[inline]
     pub const fn new(generation: u32, index: u32, rights: u32, type_tag: u32) -> Self {
-        Self { generation, index, rights, type_tag }
+        Self {
+            generation,
+            index,
+            rights,
+            type_tag,
+        }
     }
 
     /// `true` iff every field is zero. An empty slot is never a live cap
@@ -159,10 +179,14 @@ impl CapSlot {
     ///
     /// # Safety
     /// `ptr` must be 16-byte aligned.
-    pub unsafe fn atomic_cas(ptr: *mut CapSlot, old: CapSlot, new: CapSlot) -> Result<CapSlot, CapSlot> {
+    pub unsafe fn atomic_cas(
+        ptr: *mut CapSlot,
+        old: CapSlot,
+        new: CapSlot,
+    ) -> Result<CapSlot, CapSlot> {
         let res = unsafe { narf_arch::cas128(ptr as *mut u128, old.as_u128(), new.as_u128()) };
         match res {
-            Ok(v)  => Ok(Self::from_u128(v)),
+            Ok(v) => Ok(Self::from_u128(v)),
             Err(v) => Err(Self::from_u128(v)),
         }
     }
@@ -179,13 +203,13 @@ impl CapSlot {
         // We don't know the current value, but we can use 0 and if it
         // fails, the Err(actual) gives us the atomic snapshot.
         match unsafe { narf_arch::cas128(p, 0, 0) } {
-            Ok(_)  => Self::EMPTY,
+            Ok(_) => Self::EMPTY,
             Err(v) => Self::from_u128(v),
         }
     }
 }
 
-const _: () = assert!(core::mem::size_of::<CapSlot>()  == 16);
+const _: () = assert!(core::mem::size_of::<CapSlot>() == 16);
 const _: () = assert!(core::mem::align_of::<CapSlot>() == 16);
 
 // ── Cap<T, R> ───────────────────────────────────────────────────────
@@ -197,8 +221,8 @@ const _: () = assert!(core::mem::align_of::<CapSlot>() == 16);
 /// validity via the epoch check.
 #[derive(Debug)]
 pub struct Cap<T, R: Rights> {
-    slot:   CapSlot,
-    _tag:   PhantomData<T>,
+    slot: CapSlot,
+    _tag: PhantomData<T>,
     _right: PhantomData<R>,
 }
 
@@ -211,13 +235,15 @@ impl<T, R: Rights> Cap<T, R> {
     pub const unsafe fn mint(slot: CapSlot) -> Self {
         Self {
             slot,
-            _tag:   PhantomData,
+            _tag: PhantomData,
             _right: PhantomData,
         }
     }
 
     #[inline]
-    pub const fn slot(&self) -> CapSlot { self.slot }
+    pub const fn slot(&self) -> CapSlot {
+        self.slot
+    }
 
     /// Authority check: returns `Ok(())` iff the object's current epoch
     /// matches the generation snapshot in this cap. If the object has
@@ -233,7 +259,9 @@ impl<T, R: Rights> Cap<T, R> {
     }
 
     #[inline]
-    pub fn is_live(&self) -> bool { self.check_live().is_ok() }
+    pub fn is_live(&self) -> bool {
+        self.check_live().is_ok()
+    }
 
     /// Invoke an operation. Wave 2 does the epoch gate; each `CapOp`
     /// supplies its own `execute` body.
@@ -271,7 +299,9 @@ impl<T: CapType, R: Rights> Cap<T, R> {
 // Manual impls to avoid T: Copy/Clone bounds.
 impl<T, R: Rights> Copy for Cap<T, R> {}
 impl<T, R: Rights> Clone for Cap<T, R> {
-    fn clone(&self) -> Self { *self }
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 
 unsafe impl<T, R: Rights> Send for Cap<T, R> {}
@@ -289,7 +319,9 @@ pub struct NoopOp;
 
 impl<T, R: Rights> CapOp<T, R> for NoopOp {
     type Output = ();
-    fn execute(self, _cap: &Cap<T, R>) -> Result<(), CapError> { Ok(()) }
+    fn execute(self, _cap: &Cap<T, R>) -> Result<(), CapError> {
+        Ok(())
+    }
 }
 
 // ── object_table ────────────────────────────────────────────────────
@@ -299,7 +331,7 @@ pub mod object_table {
 
     struct Entry {
         epoch: AtomicU32,
-        kind:  CapKind,
+        kind: CapKind,
     }
 
     static TABLE: IrqSafeSpinLock<Vec<Entry>> = IrqSafeSpinLock::new(Vec::new());
@@ -307,18 +339,23 @@ pub mod object_table {
     pub fn register(kind: CapKind) -> (u32, u32) {
         let mut t = TABLE.lock();
         let index = t.len() as u32;
-        t.push(Entry { epoch: AtomicU32::new(1), kind });
+        t.push(Entry {
+            epoch: AtomicU32::new(1),
+            kind,
+        });
         (index, 1)
     }
 
     pub fn current_epoch(index: u32) -> Option<u32> {
         let t = TABLE.lock();
-        t.get(index as usize).map(|e| e.epoch.load(Ordering::Acquire))
+        t.get(index as usize)
+            .map(|e| e.epoch.load(Ordering::Acquire))
     }
 
     pub fn bump_epoch(index: u32) -> Option<u32> {
         let t = TABLE.lock();
-        t.get(index as usize).map(|e| e.epoch.fetch_add(1, Ordering::AcqRel) + 1)
+        t.get(index as usize)
+            .map(|e| e.epoch.fetch_add(1, Ordering::AcqRel) + 1)
     }
 
     pub fn kind_at(index: u32) -> Option<CapKind> {
@@ -326,7 +363,9 @@ pub mod object_table {
         t.get(index as usize).map(|e| e.kind)
     }
 
-    pub fn len() -> usize { TABLE.lock().len() }
+    pub fn len() -> usize {
+        TABLE.lock().len()
+    }
 }
 
 // ── CapKind registry ────────────────────────────────────────────────
@@ -336,84 +375,90 @@ pub mod object_table {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CapKind {
     // Bus / device
-    BusDevice            = 0x0001,
-    BusDeviceP2pDma      = 0x0002,
-    BusReconfigureAcs    = 0x0003,
-    BusRegistry          = 0x0004,
+    BusDevice = 0x0001,
+    BusDeviceP2pDma = 0x0002,
+    BusReconfigureAcs = 0x0003,
+    BusRegistry = 0x0004,
 
     // Block / storage
-    BlockDevice          = 0x0010,
-    BlockDeviceBackend   = 0x0011,
-    BlockIoQueueOwn      = 0x0012,
-    Namespace            = 0x0013,
+    BlockDevice = 0x0010,
+    BlockDeviceBackend = 0x0011,
+    BlockIoQueueOwn = 0x0012,
+    Namespace = 0x0013,
 
     // Network
-    NetIface             = 0x0020,
-    StackInstall         = 0x0021,
+    NetIface = 0x0020,
+    StackInstall = 0x0021,
 
     // Filesystem
-    FileNode             = 0x0030,
-    DirNode              = 0x0031,
-    MountPoint           = 0x0032,
-    FsInstance           = 0x0033,
+    FileNode = 0x0030,
+    DirNode = 0x0031,
+    MountPoint = 0x0032,
+    FsInstance = 0x0033,
 
     // IPC / ABI
-    Ring                 = 0x0040,
-    RingPair             = 0x0041,
-    Endpoint             = 0x0042,
+    Ring = 0x0040,
+    RingPair = 0x0041,
+    Endpoint = 0x0042,
 
     // Memory / domain
-    Domain               = 0x0050,
-    DmaBuffer            = 0x0051,
-    SharedRegion         = 0x0052,
+    Domain = 0x0050,
+    DmaBuffer = 0x0051,
+    SharedRegion = 0x0052,
 
     // Tracing / observability
-    Probe                = 0x0060,
-    TraceRing            = 0x0061,
-    Recorder             = 0x0062,
-    Pmu                  = 0x0063,
-    HwCrypto             = 0x0064,
-    HwTrace              = 0x0065,
-    Debugger             = 0x0066,
-    Diagnostics          = 0x0067,
-    Watchpoint           = 0x0068,
+    Probe = 0x0060,
+    TraceRing = 0x0061,
+    Recorder = 0x0062,
+    Pmu = 0x0063,
+    HwCrypto = 0x0064,
+    HwTrace = 0x0065,
+    Debugger = 0x0066,
+    Diagnostics = 0x0067,
+    Watchpoint = 0x0068,
 
     // Crypto
-    Key                  = 0x0070,
-    KeyMgr               = 0x0071,
-    Rng                  = 0x0072,
-    Tpm                  = 0x0073,
+    Key = 0x0070,
+    KeyMgr = 0x0071,
+    Rng = 0x0072,
+    Tpm = 0x0073,
+    Spdm = 0x0074,
 
     // Scheduler / power / time
-    Task                 = 0x0080,
-    CpuAffinity          = 0x0081,
-    CpuLifecycle         = 0x0082,
-    CpuBudget            = 0x0083,
-    FreqHint             = 0x0084,
-    Power                = 0x0085,
-    Timer                = 0x0086,
-    DevicePm             = 0x0087,
-    Governor             = 0x0088,
+    Task = 0x0080,
+    CpuAffinity = 0x0081,
+    CpuLifecycle = 0x0082,
+    CpuBudget = 0x0083,
+    FreqHint = 0x0084,
+    Power = 0x0085,
+    Timer = 0x0086,
+    DevicePm = 0x0087,
+    Governor = 0x0088,
+    PmBus = 0x0089,
 
     // RCU
-    SleepableReader      = 0x0090,
+    SleepableReader = 0x0090,
+
+    // Platform Management
+    Scmi = 0x0091,
 
     // Process / governance
-    Process              = 0x00A0,
-    Driver               = 0x00A1,
+    Process = 0x00A0,
+    Driver = 0x00A1,
 
     // Display
-    FbScanout            = 0x00B0,
+    FbScanout = 0x00B0,
 
     // Audio
-    AudioStream          = 0x00C0,
+    AudioStream = 0x00C0,
 
     // Peripherals
-    I3cBus               = 0x00D0,
+    I3cBus = 0x00D0,
+    Pwm = 0x00D1,
 
     // Firmware
-    Firmware             = 0x00E0,
-    FirmwareRegistry     = 0x00E1,
+    Firmware = 0x00E0,
+    FirmwareRegistry = 0x00E1,
 }
 
 pub trait CapType: 'static {
@@ -425,69 +470,77 @@ pub struct UnknownKind;
 
 pub fn parse_kind(name: &str) -> Result<CapKind, UnknownKind> {
     for (k_name, k) in KIND_NAMES {
-        if *k_name == name { return Ok(*k); }
+        if *k_name == name {
+            return Ok(*k);
+        }
     }
     Err(UnknownKind)
 }
 
 pub fn kind_name(kind: CapKind) -> &'static str {
     for (name, k) in KIND_NAMES {
-        if *k == kind { return *name; }
+        if *k == kind {
+            return *name;
+        }
     }
     "Unknown"
 }
 
 const KIND_NAMES: &[(&str, CapKind)] = &[
-    ("BusDevice",           CapKind::BusDevice),
-    ("BusDeviceP2pDma",     CapKind::BusDeviceP2pDma),
-    ("BusReconfigureAcs",   CapKind::BusReconfigureAcs),
-    ("BusRegistry",         CapKind::BusRegistry),
-    ("BlockDevice",         CapKind::BlockDevice),
-    ("BlockDeviceBackend",  CapKind::BlockDeviceBackend),
-    ("BlockIoQueueOwn",     CapKind::BlockIoQueueOwn),
-    ("Namespace",           CapKind::Namespace),
-    ("NetIface",            CapKind::NetIface),
-    ("StackInstall",        CapKind::StackInstall),
-    ("FileNode",            CapKind::FileNode),
-    ("DirNode",             CapKind::DirNode),
-    ("MountPoint",          CapKind::MountPoint),
-    ("FsInstance",          CapKind::FsInstance),
-    ("Ring",                CapKind::Ring),
-    ("RingPair",            CapKind::RingPair),
-    ("Endpoint",            CapKind::Endpoint),
-    ("Domain",              CapKind::Domain),
-    ("DmaBuffer",           CapKind::DmaBuffer),
-    ("SharedRegion",        CapKind::SharedRegion),
-    ("Probe",               CapKind::Probe),
-    ("TraceRing",           CapKind::TraceRing),
-    ("Recorder",            CapKind::Recorder),
-    ("Pmu",                 CapKind::Pmu),
-    ("HwCrypto",            CapKind::HwCrypto),
-    ("HwTrace",             CapKind::HwTrace),
-    ("Debugger",            CapKind::Debugger),
-    ("Diagnostics",         CapKind::Diagnostics),
-    ("Watchpoint",          CapKind::Watchpoint),
-    ("Key",                 CapKind::Key),
-    ("KeyMgr",              CapKind::KeyMgr),
-    ("Rng",                 CapKind::Rng),
-    ("Tpm",                 CapKind::Tpm),
-    ("Task",                CapKind::Task),
-    ("CpuAffinity",         CapKind::CpuAffinity),
-    ("CpuLifecycle",        CapKind::CpuLifecycle),
-    ("CpuBudget",           CapKind::CpuBudget),
-    ("FreqHint",            CapKind::FreqHint),
-    ("Power",               CapKind::Power),
-    ("Timer",               CapKind::Timer),
-    ("DevicePm",            CapKind::DevicePm),
-    ("Governor",            CapKind::Governor),
-    ("SleepableReader",     CapKind::SleepableReader),
-    ("Process",             CapKind::Process),
-    ("Driver",              CapKind::Driver),
-    ("FbScanout",           CapKind::FbScanout),
-    ("AudioStream",         CapKind::AudioStream),
-    ("I3cBus",              CapKind::I3cBus),
-    ("Firmware",            CapKind::Firmware),
-    ("FirmwareRegistry",    CapKind::FirmwareRegistry),
+    ("BusDevice", CapKind::BusDevice),
+    ("BusDeviceP2pDma", CapKind::BusDeviceP2pDma),
+    ("BusReconfigureAcs", CapKind::BusReconfigureAcs),
+    ("BusRegistry", CapKind::BusRegistry),
+    ("BlockDevice", CapKind::BlockDevice),
+    ("BlockDeviceBackend", CapKind::BlockDeviceBackend),
+    ("BlockIoQueueOwn", CapKind::BlockIoQueueOwn),
+    ("Namespace", CapKind::Namespace),
+    ("NetIface", CapKind::NetIface),
+    ("StackInstall", CapKind::StackInstall),
+    ("FileNode", CapKind::FileNode),
+    ("DirNode", CapKind::DirNode),
+    ("MountPoint", CapKind::MountPoint),
+    ("FsInstance", CapKind::FsInstance),
+    ("Ring", CapKind::Ring),
+    ("RingPair", CapKind::RingPair),
+    ("Endpoint", CapKind::Endpoint),
+    ("Domain", CapKind::Domain),
+    ("DmaBuffer", CapKind::DmaBuffer),
+    ("SharedRegion", CapKind::SharedRegion),
+    ("Probe", CapKind::Probe),
+    ("TraceRing", CapKind::TraceRing),
+    ("Recorder", CapKind::Recorder),
+    ("Pmu", CapKind::Pmu),
+    ("HwCrypto", CapKind::HwCrypto),
+    ("HwTrace", CapKind::HwTrace),
+    ("Debugger", CapKind::Debugger),
+    ("Diagnostics", CapKind::Diagnostics),
+    ("Watchpoint", CapKind::Watchpoint),
+    ("Key", CapKind::Key),
+    ("KeyMgr", CapKind::KeyMgr),
+    ("Rng", CapKind::Rng),
+    ("Tpm", CapKind::Tpm),
+    ("Spdm", CapKind::Spdm),
+    ("Task", CapKind::Task),
+    ("CpuAffinity", CapKind::CpuAffinity),
+    ("CpuLifecycle", CapKind::CpuLifecycle),
+    ("CpuBudget", CapKind::CpuBudget),
+    ("FreqHint", CapKind::FreqHint),
+    ("Power", CapKind::Power),
+    ("Timer", CapKind::Timer),
+    ("DevicePm", CapKind::DevicePm),
+    ("Governor", CapKind::Governor),
+    ("PmBus", CapKind::PmBus),
+    ("SleepableReader", CapKind::SleepableReader),
+    ("Scmi", CapKind::Scmi),
+    ("Process", CapKind::Process),
+    ("Driver", CapKind::Driver),
+    ("FbScanout", CapKind::FbScanout),
+    ("AudioStream", CapKind::AudioStream),
+    ("I3cBus", CapKind::I3cBus),
+    ("Pwm", CapKind::Pwm),
+    ("Firmware", CapKind::Firmware),
+    ("FirmwareRegistry", CapKind::FirmwareRegistry),
 ];
 
 // ── Badge ───────────────────────────────────────────────────────────

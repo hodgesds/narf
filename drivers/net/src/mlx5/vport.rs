@@ -16,13 +16,15 @@
 extern crate alloc;
 use alloc::vec::Vec;
 
-pub const VPORT_CTX_LEN:           usize = 256;
-pub const VPORT_OFF_MTU:           usize = 0x24;
+pub const VPORT_CTX_LEN: usize = 256;
+pub const VPORT_OFF_MTU: usize = 0x24;
 pub const VPORT_OFF_PERMANENT_MAC: usize = 0xF4;
-pub const VPORT_OFF_CURRENT_MAC:   usize = 0xFA;
+pub const VPORT_OFF_CURRENT_MAC: usize = 0xFA;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum VportError { Truncated }
+pub enum VportError {
+    Truncated,
+}
 
 #[derive(Debug)]
 pub struct NicVportContext {
@@ -31,7 +33,9 @@ pub struct NicVportContext {
 
 impl NicVportContext {
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, VportError> {
-        if bytes.len() < VPORT_CTX_LEN { return Err(VportError::Truncated); }
+        if bytes.len() < VPORT_CTX_LEN {
+            return Err(VportError::Truncated);
+        }
         Ok(Self { bytes })
     }
 
@@ -46,19 +50,19 @@ impl NicVportContext {
 
     pub fn permanent_mac(&self) -> [u8; 6] {
         let mut mac = [0u8; 6];
-        mac.copy_from_slice(
-            &self.bytes[VPORT_OFF_PERMANENT_MAC..VPORT_OFF_PERMANENT_MAC + 6]);
+        mac.copy_from_slice(&self.bytes[VPORT_OFF_PERMANENT_MAC..VPORT_OFF_PERMANENT_MAC + 6]);
         mac
     }
 
     pub fn current_mac(&self) -> [u8; 6] {
         let mut mac = [0u8; 6];
-        mac.copy_from_slice(
-            &self.bytes[VPORT_OFF_CURRENT_MAC..VPORT_OFF_CURRENT_MAC + 6]);
+        mac.copy_from_slice(&self.bytes[VPORT_OFF_CURRENT_MAC..VPORT_OFF_CURRENT_MAC + 6]);
         mac
     }
 
-    pub fn raw(&self) -> &[u8] { &self.bytes }
+    pub fn raw(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 /// Build a 256-byte vport-context modification payload that sets
@@ -66,7 +70,6 @@ impl NicVportContext {
 /// which fields it consumes; Stage 12 always writes the MTU bit.
 pub fn build_set_mtu_payload(mtu: u32) -> Vec<u8> {
     let mut out = alloc::vec![0u8; VPORT_CTX_LEN];
-    out[VPORT_OFF_MTU..VPORT_OFF_MTU + 4]
-        .copy_from_slice(&mtu.to_be_bytes());
+    out[VPORT_OFF_MTU..VPORT_OFF_MTU + 4].copy_from_slice(&mtu.to_be_bytes());
     out
 }

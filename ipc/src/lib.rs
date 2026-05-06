@@ -41,8 +41,8 @@ pub use mpsc::{mpsc_channel, MpscConsumer, MpscProducer, MpscRecvError, MpscSend
 
 pub mod shared_ring;
 pub use shared_ring::{
-    SharedConsumer, SharedProducer, SharedRing,
-    TryRecvError as SharedTryRecvError, TrySendError as SharedTrySendError,
+    SharedConsumer, SharedProducer, SharedRing, TryRecvError as SharedTryRecvError,
+    TrySendError as SharedTrySendError,
 };
 
 mod tests;
@@ -103,9 +103,9 @@ impl<T, const N: usize> core::fmt::Debug for Ring<T, N> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Ring")
             .field("capacity", &N)
-            .field("head",     &self.head.0.load(Ordering::Relaxed))
-            .field("tail",     &self.tail.0.load(Ordering::Relaxed))
-            .field("closed",   &self.closed.load(Ordering::Relaxed))
+            .field("head", &self.head.0.load(Ordering::Relaxed))
+            .field("tail", &self.tail.0.load(Ordering::Relaxed))
+            .field("closed", &self.closed.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
 }
@@ -130,9 +130,9 @@ impl<T, const N: usize> Ring<T, N> {
         // Touch the guard so a non-pow2 N fails at compile time.
         let _ = Self::POW2_GUARD;
         Self {
-            head:           Align64(AtomicU64::new(0)),
-            tail:           Align64(AtomicU64::new(0)),
-            closed:         AtomicBool::new(false),
+            head: Align64(AtomicU64::new(0)),
+            tail: Align64(AtomicU64::new(0)),
+            closed: AtomicBool::new(false),
             producer_waker: SpinLock::new(None),
             consumer_waker: IrqSafeSpinLock::new(None),
             // SAFETY: MaybeUninit does not require initialisation.
@@ -175,8 +175,14 @@ impl<T, const N: usize> Drop for Ring<T, N> {
 pub fn channel<T: Send + 'static, const N: usize>() -> (Producer<T, N>, Consumer<T, N>) {
     let ring = Arc::new(Ring::<T, N>::new());
     (
-        Producer { ring: ring.clone(), _not_sync: PhantomData },
-        Consumer { ring,              _not_sync: PhantomData },
+        Producer {
+            ring: ring.clone(),
+            _not_sync: PhantomData,
+        },
+        Consumer {
+            ring,
+            _not_sync: PhantomData,
+        },
     )
 }
 
@@ -196,7 +202,9 @@ unsafe impl<T: Send + 'static, const N: usize> Send for Producer<T, N> {}
 
 impl<T: Send + 'static, const N: usize> core::fmt::Debug for Producer<T, N> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Producer").field("ring", &*self.ring).finish_non_exhaustive()
+        f.debug_struct("Producer")
+            .field("ring", &*self.ring)
+            .finish_non_exhaustive()
     }
 }
 
@@ -235,7 +243,10 @@ impl<T: Send + 'static, const N: usize> Producer<T, N> {
         // Release: pairs with the consumer's Acquire on `head`. Makes
         // the slot payload visible before the consumer observes the
         // new head.
-        self.ring.head.0.store(head.wrapping_add(1), Ordering::Release);
+        self.ring
+            .head
+            .0
+            .store(head.wrapping_add(1), Ordering::Release);
 
         // Wake the consumer if it registered one.
         if let Some(w) = self.ring.consumer_waker.lock().take() {
@@ -247,14 +258,19 @@ impl<T: Send + 'static, const N: usize> Producer<T, N> {
     /// Async send: awaits capacity on `Full`. Registers a waker the
     /// consumer calls when it advances the tail.
     pub fn send(&mut self, msg: T) -> SendFuture<'_, T, N> {
-        SendFuture { producer: self, slot: Some(msg) }
+        SendFuture {
+            producer: self,
+            slot: Some(msg),
+        }
     }
 }
 
 impl<T: Send + 'static, const N: usize> Drop for Producer<T, N> {
     fn drop(&mut self) {
         self.ring.closed.store(true, Ordering::Release);
-        if let Some(w) = self.ring.consumer_waker.lock().take() { w.wake(); }
+        if let Some(w) = self.ring.consumer_waker.lock().take() {
+            w.wake();
+        }
     }
 }
 
@@ -263,7 +279,7 @@ impl<T: Send + 'static, const N: usize> Drop for Producer<T, N> {
 #[derive(Debug)]
 pub struct SendFuture<'a, T: Send + 'static, const N: usize> {
     producer: &'a mut Producer<T, N>,
-    slot:     Option<T>,
+    slot: Option<T>,
 }
 
 // SendFuture only owns `&mut Producer` (a reference) and `Option<T>`
@@ -275,7 +291,10 @@ impl<'a, T: Send + 'static, const N: usize> Future for SendFuture<'a, T, N> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let msg = this.slot.take().expect("SendFuture polled after completion");
+        let msg = this
+            .slot
+            .take()
+            .expect("SendFuture polled after completion");
         match this.producer.try_send(msg) {
             Ok(()) => Poll::Ready(Ok(())),
             Err(TrySendError::Closed(m)) => Poll::Ready(Err(m)),
@@ -283,8 +302,7 @@ impl<'a, T: Send + 'static, const N: usize> Future for SendFuture<'a, T, N> {
                 // Register our waker, then re-check: the consumer may
                 // have drained between our try_send and the waker
                 // install (lost-wakeup avoidance).
-                *this.producer.ring.producer_waker.lock(IrqsEnabled) =
-                    Some(cx.waker().clone());
+                *this.producer.ring.producer_waker.lock(IrqsEnabled) = Some(cx.waker().clone());
                 match this.producer.try_send(m) {
                     Ok(()) => {
                         // Clear the waker — we no longer need a wake.
@@ -292,7 +310,7 @@ impl<'a, T: Send + 'static, const N: usize> Future for SendFuture<'a, T, N> {
                         Poll::Ready(Ok(()))
                     }
                     Err(TrySendError::Closed(m)) => Poll::Ready(Err(m)),
-                    Err(TrySendError::Full(m))   => {
+                    Err(TrySendError::Full(m)) => {
                         this.slot = Some(m);
                         Poll::Pending
                     }
@@ -314,7 +332,9 @@ unsafe impl<T: Send + 'static, const N: usize> Send for Consumer<T, N> {}
 
 impl<T: Send + 'static, const N: usize> core::fmt::Debug for Consumer<T, N> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Consumer").field("ring", &*self.ring).finish_non_exhaustive()
+        f.debug_struct("Consumer")
+            .field("ring", &*self.ring)
+            .finish_non_exhaustive()
     }
 }
 
@@ -351,7 +371,10 @@ impl<T: Send + 'static, const N: usize> Consumer<T, N> {
         // Release: pairs with the producer's Acquire on `tail`. Makes
         // the slot-freed fact visible before the producer observes the
         // new tail.
-        self.ring.tail.0.store(tail.wrapping_add(1), Ordering::Release);
+        self.ring
+            .tail
+            .0
+            .store(tail.wrapping_add(1), Ordering::Release);
 
         if let Some(w) = self.ring.producer_waker.lock(IrqsEnabled).take() {
             w.wake();
@@ -367,7 +390,9 @@ impl<T: Send + 'static, const N: usize> Consumer<T, N> {
 impl<T: Send + 'static, const N: usize> Drop for Consumer<T, N> {
     fn drop(&mut self) {
         self.ring.closed.store(true, Ordering::Release);
-        if let Some(w) = self.ring.producer_waker.lock(IrqsEnabled).take() { w.wake(); }
+        if let Some(w) = self.ring.producer_waker.lock(IrqsEnabled).take() {
+            w.wake();
+        }
     }
 }
 
@@ -386,17 +411,16 @@ impl<'a, T: Send + 'static, const N: usize> Future for RecvFuture<'a, T, N> {
         let this = self.get_mut();
         match this.consumer.try_recv() {
             Ok(Some(msg)) => Poll::Ready(Ok(msg)),
-            Err(e)        => Poll::Ready(Err(e)),
-            Ok(None)      => {
+            Err(e) => Poll::Ready(Err(e)),
+            Ok(None) => {
                 // Install waker and re-check for lost-wakeup avoidance.
-                *this.consumer.ring.consumer_waker.lock() =
-                    Some(cx.waker().clone());
+                *this.consumer.ring.consumer_waker.lock() = Some(cx.waker().clone());
                 match this.consumer.try_recv() {
                     Ok(Some(msg)) => {
                         *this.consumer.ring.consumer_waker.lock() = None;
                         Poll::Ready(Ok(msg))
                     }
-                    Err(e)   => Poll::Ready(Err(e)),
+                    Err(e) => Poll::Ready(Err(e)),
                     Ok(None) => Poll::Pending,
                 }
             }
@@ -411,5 +435,7 @@ mod retag {
     /// Wave-1 stub: passthrough. Lands a real impl once the MTE
     /// pointer-tagging surface exists in `arch::aarch64::mte`.
     #[inline(always)]
-    pub fn retag_on_publish<T>(msg: T) -> T { msg }
+    pub fn retag_on_publish<T>(msg: T) -> T {
+        msg
+    }
 }

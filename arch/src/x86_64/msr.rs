@@ -48,7 +48,7 @@ pub unsafe fn rdmsr(index: u32) -> u64 {
 ///   doesn't reorder loads/stores across the write (see arch/ §4).
 #[inline]
 pub unsafe fn wrmsr(index: u32, value: u64) {
-    let low  = value as u32;
+    let low = value as u32;
     let high = (value >> 32) as u32;
     compiler_fence(Ordering::SeqCst);
     // SAFETY: caller verified the MSR exists and that writing `value`

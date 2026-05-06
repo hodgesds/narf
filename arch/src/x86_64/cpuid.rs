@@ -45,15 +45,15 @@ pub unsafe fn cpuid(leaf: u32, sub: u32) -> (u32, u32, u32, u32) {
 /// in the same register.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct Features {
-    pub nx:       bool,   // leaf 80000001h EDX:20 — NX page bit
-    pub pku:      bool,   // leaf 7, sub 0 ECX:3  — user-mode protection keys
-    pub pks:      bool,   // leaf 7, sub 0 ECX:31 — supervisor protection keys
-    pub uipi:     bool,   // leaf 7, sub 0 EDX:13 — User Interrupts
+    pub nx: bool,            // leaf 80000001h EDX:20 — NX page bit
+    pub pku: bool,           // leaf 7, sub 0 ECX:3  — user-mode protection keys
+    pub pks: bool,           // leaf 7, sub 0 ECX:31 — supervisor protection keys
+    pub uipi: bool,          // leaf 7, sub 0 EDX:13 — User Interrupts
     pub invariant_tsc: bool, // leaf 80000007h EDX:8
-    pub rdseed:   bool,   // leaf 7, sub 0 EBX:18
-    pub rdrand:   bool,   // leaf 1 ECX:30
-    pub x2apic:   bool,   // leaf 1 ECX:21
-    pub apic:     bool,   // leaf 1 EDX:9
+    pub rdseed: bool,        // leaf 7, sub 0 EBX:18
+    pub rdrand: bool,        // leaf 1 ECX:30
+    pub x2apic: bool,        // leaf 1 ECX:21
+    pub apic: bool,          // leaf 1 EDX:9
 }
 
 impl Features {
@@ -70,14 +70,14 @@ impl Features {
         let (_, _, ecx1, edx1) = unsafe { cpuid(0x0000_0001, 0) };
         f.rdrand = ecx1 & (1 << 30) != 0;
         f.x2apic = ecx1 & (1 << 21) != 0;
-        f.apic   = edx1 & (1 <<  9) != 0;
+        f.apic = edx1 & (1 << 9) != 0;
 
         // Leaf 7, sub 0 — extended features.
         let (_, ebx7, ecx7, edx7) = unsafe { cpuid(0x0000_0007, 0) };
         f.rdseed = ebx7 & (1 << 18) != 0;
-        f.pku    = ecx7 & (1 <<  3) != 0;
-        f.pks    = ecx7 & (1 << 31) != 0;
-        f.uipi   = edx7 & (1 << 13) != 0;
+        f.pku = ecx7 & (1 << 3) != 0;
+        f.pks = ecx7 & (1 << 31) != 0;
+        f.uipi = edx7 & (1 << 13) != 0;
 
         // Leaf 80000001h EDX:20 = NX.
         let (_, _, _, edx_ext) = unsafe { cpuid(0x8000_0001, 0) };

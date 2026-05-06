@@ -22,24 +22,24 @@ use crate::{select_active, FbWriter};
 /// One live FB connection. The handle id is the public name; pid
 /// + scanout are kept for reverse-lookup on process exit.
 pub struct Entry {
-    pub handle:     u64,
-    pub pid:        u64,
+    pub handle: u64,
+    pub pid: u64,
     pub scanout_id: u32,
-    pub phys:       u64,
-    pub consumer:   SharedConsumer<DrawCmd, RING_DEPTH>,
+    pub phys: u64,
+    pub consumer: SharedConsumer<DrawCmd, RING_DEPTH>,
     /// Cumulative drain count for this handle. Updated by
     /// `drain_all`; observed by `flush_wait`.
-    pub drained:    u64,
+    pub drained: u64,
 }
 
 impl core::fmt::Debug for Entry {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Entry")
-            .field("handle",     &self.handle)
-            .field("pid",        &self.pid)
+            .field("handle", &self.handle)
+            .field("pid", &self.pid)
             .field("scanout_id", &self.scanout_id)
-            .field("phys",       &format_args!("{:#x}", self.phys))
-            .field("drained",    &self.drained)
+            .field("phys", &format_args!("{:#x}", self.phys))
+            .field("drained", &self.drained)
             .finish_non_exhaustive()
     }
 }
@@ -73,7 +73,7 @@ pub fn connect(pid: u64, scanout_id: u32) -> Result<u64, ConnectError> {
     }
 
     let frame = narf_memory::alloc_frame().map_err(|_| ConnectError::OutOfMemory)?;
-    let phys  = frame.start_address();
+    let phys = frame.start_address();
 
     let ring_ptr = phys.raw() as *mut DrawRing;
     // SAFETY: identity-mapped 4 KiB region; we own this freshly-
@@ -88,8 +88,12 @@ pub fn connect(pid: u64, scanout_id: u32) -> Result<u64, ConnectError> {
 
     let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
     REGISTRY.lock().push(Entry {
-        handle, pid, scanout_id, phys: phys.raw(),
-        consumer, drained: 0,
+        handle,
+        pid,
+        scanout_id,
+        phys: phys.raw(),
+        consumer,
+        drained: 0,
     });
     Ok(handle)
 }
@@ -109,26 +113,27 @@ pub fn info(handle: u64) -> Option<[u32; 6]> {
     };
     // stride is in bytes; XRGB8888 = 4 bytes per pixel.
     let stride_bytes = s.stride().checked_mul(4)?;
-    Some([
-        s.width(),
-        s.height(),
-        stride_bytes,
-        format_tag,
-        0,
-        0,
-    ])
+    Some([s.width(), s.height(), stride_bytes, format_tag, 0, 0])
 }
 
 /// Phys backing this handle's ring. The userspace syscall handler
 /// is responsible for installing it in the caller's VA.
 pub fn ring_phys(handle: u64) -> Option<u64> {
-    REGISTRY.lock().iter().find(|e| e.handle == handle).map(|e| e.phys)
+    REGISTRY
+        .lock()
+        .iter()
+        .find(|e| e.handle == handle)
+        .map(|e| e.phys)
 }
 
 /// Snapshot of the cumulative drain count for `handle`. Returns
 /// `None` on bad handle.
 pub fn drain_count(handle: u64) -> Option<u64> {
-    REGISTRY.lock().iter().find(|e| e.handle == handle).map(|e| e.drained)
+    REGISTRY
+        .lock()
+        .iter()
+        .find(|e| e.handle == handle)
+        .map(|e| e.drained)
 }
 
 /// Tear down a connection. Removes the entry, drops the consumer.
@@ -157,20 +162,22 @@ pub fn disconnect_all_for_pid(pid: u64) -> u32 {
 /// Walk every registered ring; drain each through the supplied
 /// FbWriter. Returns `(executed, errors)` summed across rings.
 pub fn drain_all(writer: &FbWriter) -> (u32, u32) {
-    let mut total_ok  = 0u32;
+    let mut total_ok = 0u32;
     let mut total_err = 0u32;
     let mut g = REGISTRY.lock();
     for e in g.iter_mut() {
         let (ok, err) = cmd_ring::drain(&mut e.consumer, writer);
         e.drained = e.drained.saturating_add(ok as u64);
-        total_ok  += ok;
+        total_ok += ok;
         total_err += err;
     }
     (total_ok, total_err)
 }
 
 /// Number of registered connections — for diagnostics + tests.
-pub fn count() -> usize { REGISTRY.lock().len() }
+pub fn count() -> usize {
+    REGISTRY.lock().len()
+}
 
 /// Test-only reset.
 #[doc(hidden)]
@@ -185,9 +192,9 @@ pub fn __reset_for_test() {
 pub fn syscall_vtable() -> &'static narf_userspace::handlers::FbSyscallVtable {
     use narf_userspace::handlers::FbSyscallVtable;
     static V: FbSyscallVtable = FbSyscallVtable {
-        connect:    fb_vt_connect,
-        info:       fb_vt_info,
-        ring_map:   fb_vt_ring_map,
+        connect: fb_vt_connect,
+        info: fb_vt_info,
+        ring_map: fb_vt_ring_map,
         flush_wait: fb_vt_flush_wait,
         disconnect: fb_vt_disconnect,
     };
@@ -195,17 +202,22 @@ pub fn syscall_vtable() -> &'static narf_userspace::handlers::FbSyscallVtable {
 }
 
 fn fb_vt_connect(pid: u64, scanout_id: u64) -> u64 {
-    if scanout_id > u32::MAX as u64 { return 0; }
+    if scanout_id > u32::MAX as u64 {
+        return 0;
+    }
     match connect(pid, scanout_id as u32) {
-        Ok(h)  => h,
+        Ok(h) => h,
         Err(_) => 0,
     }
 }
 
 fn fb_vt_info(handle: u64, out: &mut [u32; 6]) -> bool {
     match info(handle) {
-        Some(arr) => { *out = arr; true }
-        None      => false,
+        Some(arr) => {
+            *out = arr;
+            true
+        }
+        None => false,
     }
 }
 

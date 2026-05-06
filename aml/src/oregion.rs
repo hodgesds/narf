@@ -8,8 +8,8 @@ use alloc::vec::Vec;
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::{AmlError, NameValue, full_path};
-use crate::{Parser, read_pkg_length, read_name_string, try_read_simple_value};
+use crate::{full_path, AmlError, NameValue};
+use crate::{read_name_string, read_pkg_length, try_read_simple_value, Parser};
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -45,8 +45,8 @@ impl RegionSpace {
 /// computed expressions produce `offset=0, length=0` stubs.
 #[derive(Clone, Debug)]
 pub struct OpRegionInfo {
-    pub path:   String,
-    pub space:  RegionSpace,
+    pub path: String,
+    pub space: RegionSpace,
     pub offset: u64,
     pub length: u64,
 }
@@ -55,11 +55,11 @@ pub struct OpRegionInfo {
 #[derive(Clone, Debug)]
 pub struct FieldInfo {
     /// Absolute path to the field name.
-    pub path:        String,
+    pub path: String,
     /// Absolute path to the parent OpRegion.
     pub region_path: String,
-    pub bit_offset:  u64,
-    pub bit_length:  u64,
+    pub bit_offset: u64,
+    pub bit_length: u64,
     /// ACPI access-type: 0=AnyAcc 1=ByteAcc 2=WordAcc 3=DWordAcc 4=QWordAcc
     pub access_kind: u8,
 }
@@ -76,11 +76,9 @@ pub enum FieldAccessError {
 
 // ── Static storage ────────────────────────────────────────────────────────────
 
-static REGIONS: IrqSafeSpinLock<Vec<OpRegionInfo>> =
-    IrqSafeSpinLock::new(Vec::new());
+static REGIONS: IrqSafeSpinLock<Vec<OpRegionInfo>> = IrqSafeSpinLock::new(Vec::new());
 
-static FIELDS: IrqSafeSpinLock<Vec<FieldInfo>> =
-    IrqSafeSpinLock::new(Vec::new());
+static FIELDS: IrqSafeSpinLock<Vec<FieldInfo>> = IrqSafeSpinLock::new(Vec::new());
 
 // ── Registration ──────────────────────────────────────────────────────────────
 
@@ -109,13 +107,17 @@ pub fn field_for(path: &str) -> Option<FieldInfo> {
 /// Call `f` on every registered `OpRegionInfo`.
 pub fn for_each_region<F: FnMut(&OpRegionInfo)>(mut f: F) {
     let g = REGIONS.lock();
-    for r in g.iter() { f(r); }
+    for r in g.iter() {
+        f(r);
+    }
 }
 
 /// Call `f` on every registered `FieldInfo`.
 pub fn for_each_field<F: FnMut(&FieldInfo)>(mut f: F) {
     let g = FIELDS.lock();
-    for fi in g.iter() { f(fi); }
+    for fi in g.iter() {
+        f(fi);
+    }
 }
 
 // ── Hardware read helpers ─────────────────────────────────────────────────────
@@ -128,7 +130,7 @@ unsafe fn mmio_read(phys: u64, width_bytes: usize) -> u64 {
     // SAFETY: caller guarantees mapping.
     unsafe {
         match width_bytes {
-            1 => core::ptr::read_volatile(phys as *const u8)  as u64,
+            1 => core::ptr::read_volatile(phys as *const u8) as u64,
             2 => core::ptr::read_volatile(phys as *const u16) as u64,
             4 => core::ptr::read_volatile(phys as *const u32) as u64,
             8 => core::ptr::read_volatile(phys as *const u64),
@@ -186,7 +188,9 @@ unsafe fn io_in(port: u16, width_bytes: usize) -> u64 {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-unsafe fn io_in(_port: u16, _width_bytes: usize) -> u64 { 0 }
+unsafe fn io_in(_port: u16, _width_bytes: usize) -> u64 {
+    0
+}
 
 // ── PciConfig ECAM address resolution ────────────────────────────────────────
 
@@ -217,7 +221,7 @@ fn resolve_pci_config_addr(region: &OpRegionInfo) -> Option<u64> {
     // Walk the ancestor chain looking for Device nodes with _ADR / _BBN / _SEG.
     let mut adr_val: Option<u64> = None; // _ADR on the enclosing device
     let mut bbn_val: Option<u64> = None; // _BBN bus number
-    let mut seg_val: u64         = 0;    // _SEG segment, default 0
+    let mut seg_val: u64 = 0; // _SEG segment, default 0
 
     let mut current = String::from(parent_path);
     loop {
@@ -277,9 +281,9 @@ fn resolve_pci_config_addr(region: &OpRegionInfo) -> Option<u64> {
 
     let adr = adr_val?;
     // _BBN may be absent for bridges that inherit bus 0.
-    let bus    = bbn_val.unwrap_or(0) & 0xFF;
+    let bus = bbn_val.unwrap_or(0) & 0xFF;
     let device = (adr >> 16) & 0x1F;
-    let func   = adr & 0x7;
+    let func = adr & 0x7;
 
     // ECAM offset per PCIe spec: bus[27:20] | device[19:15] | func[14:12]
     let ecam_offset = (seg_val << 28) | (bus << 20) | (device << 15) | (func << 12);
@@ -337,12 +341,10 @@ pub fn read_field(path: &str) -> Result<u64, FieldAccessError> {
             // SAFETY: AML table asserted the port is valid.
             unsafe { io_in(phys_addr as u16, access_bytes) }
         }
-        RegionSpace::PciConfig => {
-            match resolve_pci_config_addr(&region) {
-                Some(addr) => unsafe { mmio_read(addr + byte_offset_in_region, access_bytes) },
-                None       => return Err(FieldAccessError::Unsupported),
-            }
-        }
+        RegionSpace::PciConfig => match resolve_pci_config_addr(&region) {
+            Some(addr) => unsafe { mmio_read(addr + byte_offset_in_region, access_bytes) },
+            None => return Err(FieldAccessError::Unsupported),
+        },
         _ => return Err(FieldAccessError::Unsupported),
     };
 
@@ -377,11 +379,11 @@ pub fn __reset_for_test() {
 /// Called from `lib.rs`'s `EXT_OP_REGION_OP` arm after the NameString is
 /// consumed and the path is known.
 pub(crate) fn parse_op_region_after_name(
-    p:    &mut Parser<'_>,
+    p: &mut Parser<'_>,
     path: String,
 ) -> Result<bool, AmlError> {
     let space_b = p.read_u8()?;
-    let space   = RegionSpace::from_u8(space_b);
+    let space = RegionSpace::from_u8(space_b);
 
     // Try to decode RegionOffset as a flat literal.
     let start_off = p.pos;
@@ -390,7 +392,12 @@ pub(crate) fn parse_op_region_after_name(
         Ok(NameValue::Integer(v)) => *v,
         _ => {
             // Complex TermArg — register stub and signal caller to bail.
-            register_region(OpRegionInfo { path, space, offset: 0, length: 0 });
+            register_region(OpRegionInfo {
+                path,
+                space,
+                offset: 0,
+                length: 0,
+            });
             return Ok(false);
         }
     };
@@ -402,12 +409,22 @@ pub(crate) fn parse_op_region_after_name(
         _ => {
             // Complex TermArg for length — register with known offset.
             let _ = start_off; // suppress warning
-            register_region(OpRegionInfo { path, space, offset, length: 0 });
+            register_region(OpRegionInfo {
+                path,
+                space,
+                offset,
+                length: 0,
+            });
             return Ok(false);
         }
     };
 
-    register_region(OpRegionInfo { path, space, offset, length });
+    register_region(OpRegionInfo {
+        path,
+        space,
+        offset,
+        length,
+    });
     Ok(true)
 }
 
@@ -417,8 +434,8 @@ pub(crate) fn parse_op_region_after_name(
 /// Format (ACPI 6.5 §20.2.5.2):
 ///   PkgLength  NameString(region)  FieldFlags(u8)  FieldList…
 pub(crate) fn parse_field_body(
-    p:       &mut Parser<'_>,
-    parent:  &str,
+    p: &mut Parser<'_>,
+    parent: &str,
     pkg_end: usize,
 ) -> Result<(), AmlError> {
     // Region name that this Field references.
@@ -427,7 +444,7 @@ pub(crate) fn parse_field_body(
 
     // FieldFlags: bits 0..=3 = access type, bit 4 = lock rule,
     //             bits 5..=6 = update rule.
-    let flags       = p.read_u8()?;
+    let flags = p.read_u8()?;
     let access_kind = flags & 0x0F;
 
     let mut bit_cursor: u64 = 0;
@@ -451,8 +468,12 @@ pub(crate) fn parse_field_body(
                 // Build the field's absolute path as parent + '.' + NameSeg
                 // (with trailing underscores stripped).
                 let mut seg_end = 4;
-                while seg_end > 0 && seg[seg_end - 1] == b'_' { seg_end -= 1; }
-                if seg_end == 0 { seg_end = 1; }
+                while seg_end > 0 && seg[seg_end - 1] == b'_' {
+                    seg_end -= 1;
+                }
+                if seg_end == 0 {
+                    seg_end = 1;
+                }
                 let seg_str: String = seg[..seg_end].iter().map(|&c| c as char).collect();
 
                 let field_path = if parent == "\\" {
@@ -467,10 +488,10 @@ pub(crate) fn parse_field_body(
                 };
 
                 register_field(FieldInfo {
-                    path:        field_path,
+                    path: field_path,
                     region_path: region_path.clone(),
-                    bit_offset:  bit_cursor,
-                    bit_length:  bit_len,
+                    bit_offset: bit_cursor,
+                    bit_length: bit_len,
                     access_kind,
                 });
                 bit_cursor += bit_len;
@@ -503,6 +524,8 @@ pub(crate) fn parse_field_body(
     }
 
     // Snap parser to pkg_end regardless.
-    if p.pos < pkg_end { p.pos = pkg_end; }
+    if p.pos < pkg_end {
+        p.pos = pkg_end;
+    }
     Ok(())
 }

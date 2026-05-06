@@ -93,13 +93,17 @@ const BRBCR_PAUSED: u64 = 1 << 7;
 pub unsafe fn enable() {
     // SAFETY: caller-asserted.
     let v = unsafe { read_brbcr_el1() } | BRBCR_E1BRE | BRBCR_E0BRE;
-    unsafe { write_brbcr_el1(v); }
+    unsafe {
+        write_brbcr_el1(v);
+    }
 }
 
 pub unsafe fn disable() {
     // SAFETY: caller-asserted.
     let v = unsafe { read_brbcr_el1() } & !(BRBCR_E1BRE | BRBCR_E0BRE);
-    unsafe { write_brbcr_el1(v); }
+    unsafe {
+        write_brbcr_el1(v);
+    }
 }
 
 /// Pause recording (`BRBCR.PAUSED`). Useful before draining
@@ -110,5 +114,7 @@ pub unsafe fn disable() {
 pub unsafe fn freeze() {
     // SAFETY: caller-asserted.
     let v = unsafe { read_brbcr_el1() } | BRBCR_PAUSED;
-    unsafe { write_brbcr_el1(v); }
+    unsafe {
+        write_brbcr_el1(v);
+    }
 }

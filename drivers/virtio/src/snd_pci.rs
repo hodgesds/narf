@@ -27,26 +27,25 @@ use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::pci::{
-    discover, map_cap, VirtioCaps, VirtioPciError, VirtioRegion,
-    CC_DEVICE_FEATURE, CC_DEVICE_FEATURE_SELECT, CC_DEVICE_STATUS,
-    CC_DRIVER_FEATURE, CC_DRIVER_FEATURE_SELECT,
-    CC_QUEUE_DESC, CC_QUEUE_DEVICE, CC_QUEUE_DRIVER, CC_QUEUE_ENABLE,
-    CC_QUEUE_NOTIFY_OFF, CC_QUEUE_SELECT, CC_QUEUE_SIZE,
+    discover, map_cap, VirtioCaps, VirtioPciError, VirtioRegion, CC_DEVICE_FEATURE,
+    CC_DEVICE_FEATURE_SELECT, CC_DEVICE_STATUS, CC_DRIVER_FEATURE, CC_DRIVER_FEATURE_SELECT,
+    CC_QUEUE_DESC, CC_QUEUE_DEVICE, CC_QUEUE_DRIVER, CC_QUEUE_ENABLE, CC_QUEUE_NOTIFY_OFF,
+    CC_QUEUE_SELECT, CC_QUEUE_SIZE,
 };
-use crate::queue::{Virtqueue, VirtqueueLayout, VirtqDesc, VIRTQ_DESC_F_WRITE};
+use crate::queue::{VirtqDesc, Virtqueue, VirtqueueLayout, VIRTQ_DESC_F_WRITE};
 use crate::{
-    VIRTIO_F_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER,
-    VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FEATURES_OK,
+    VIRTIO_F_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK,
+    VIRTIO_STATUS_FEATURES_OK,
 };
 
 // ── Spec constants (VirtIO 1.2 §5.14.6) ─────────────────────────────
 
 const VIRTIO_SND_R_PCM_SET_PARAMS: u32 = 0x0101;
-const VIRTIO_SND_R_PCM_PREPARE:    u32 = 0x0102;
-const VIRTIO_SND_R_PCM_RELEASE:    u32 = 0x0103;
-const VIRTIO_SND_R_PCM_START:      u32 = 0x0104;
+const VIRTIO_SND_R_PCM_PREPARE: u32 = 0x0102;
+const VIRTIO_SND_R_PCM_RELEASE: u32 = 0x0103;
+const VIRTIO_SND_R_PCM_START: u32 = 0x0104;
 #[allow(dead_code)]
-const VIRTIO_SND_R_PCM_STOP:       u32 = 0x0105;
+const VIRTIO_SND_R_PCM_STOP: u32 = 0x0105;
 
 const VIRTIO_SND_S_OK: u32 = 0x8000;
 
@@ -68,27 +67,27 @@ pub const VIRTIO_SND_PCI_DEVICE: u16 = 0x1059;
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(C)]
 pub struct VirtioSndConfig {
-    pub jacks:   u32,
+    pub jacks: u32,
     pub streams: u32,
-    pub chmaps:  u32,
+    pub chmaps: u32,
 }
 
 #[derive(Debug)]
 pub struct VirtioSoundPci {
     control_q: IrqSafeSpinLock<Option<Virtqueue>>,
-    event_q:   IrqSafeSpinLock<Option<Virtqueue>>,
-    tx_q:      IrqSafeSpinLock<Option<Virtqueue>>,
-    rx_q:      IrqSafeSpinLock<Option<Virtqueue>>,
+    event_q: IrqSafeSpinLock<Option<Virtqueue>>,
+    tx_q: IrqSafeSpinLock<Option<Virtqueue>>,
+    rx_q: IrqSafeSpinLock<Option<Virtqueue>>,
     _q_buf_control: DmaBuffer,
-    _q_buf_event:   DmaBuffer,
-    _q_buf_tx:      DmaBuffer,
-    _q_buf_rx:      DmaBuffer,
+    _q_buf_event: DmaBuffer,
+    _q_buf_tx: DmaBuffer,
+    _q_buf_rx: DmaBuffer,
     /// Notify region + per-queue notify offsets, captured at probe.
     /// Writing a 2-byte 0 to `notify.virt + notify_off_mul *
     /// queue_notify_off[i]` kicks queue `i`.
-    notify:                VirtioRegion,
+    notify: VirtioRegion,
     notify_off_multiplier: u32,
-    queue_notify_off:      [u16; 4],
+    queue_notify_off: [u16; 4],
     /// Scratch DMA region for synchronous control-vq round-trips.
     /// Big enough for `virtio_snd_pcm_set_params` (24 B) + the
     /// response (4 B); we lay them out at +0 and +64 so the
@@ -103,7 +102,7 @@ pub struct VirtioSoundPci {
     /// STARTED state. set_params + prepare + start are
     /// idempotent on first play; subsequent plays skip them.
     started: IrqSafeSpinLock<bool>,
-    pub cfg:   VirtioSndConfig,
+    pub cfg: VirtioSndConfig,
     pub ready: bool,
 }
 
@@ -112,7 +111,7 @@ impl VirtioSoundPci {
     /// Caller owns the device exclusively.
     pub unsafe fn bring_up(
         device: &BusDevice,
-        _cap:   &Cap<BusDeviceCap, Write>,
+        _cap: &Cap<BusDeviceCap, Write>,
     ) -> Result<Self, VirtioPciError> {
         // SAFETY: bounded walk.
         let caps: VirtioCaps = unsafe { discover(device) }?;
@@ -124,8 +123,10 @@ impl VirtioSoundPci {
         unsafe {
             common.write8(CC_DEVICE_STATUS, 0);
             common.write8(CC_DEVICE_STATUS, VIRTIO_STATUS_ACKNOWLEDGE as u8);
-            common.write8(CC_DEVICE_STATUS,
-                (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER) as u8);
+            common.write8(
+                CC_DEVICE_STATUS,
+                (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER) as u8,
+            );
         }
 
         // Feature negotiation: only VERSION_1 today.
@@ -149,9 +150,11 @@ impl VirtioSoundPci {
             common.write32(CC_DRIVER_FEATURE, 0);
             common.write32(CC_DRIVER_FEATURE_SELECT, 1);
             common.write32(CC_DRIVER_FEATURE, 1u32 << (VIRTIO_F_VERSION_1 - 32));
-            common.write8(CC_DEVICE_STATUS,
-                (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER
-                 | VIRTIO_STATUS_FEATURES_OK) as u8);
+            common.write8(
+                CC_DEVICE_STATUS,
+                (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK)
+                    as u8,
+            );
         }
         // SAFETY: same.
         let post = unsafe { common.read8(CC_DEVICE_STATUS) };
@@ -164,16 +167,18 @@ impl VirtioSoundPci {
         // `virtio_snd_config { u32 jacks, streams, chmaps }`.
         // device_cfg is optional in the spec, but every QEMU
         // virtio-sound advertises it.
-        let dev_cap = caps.device_cfg.as_ref()
+        let dev_cap = caps
+            .device_cfg
+            .as_ref()
             .ok_or(VirtioPciError::DeviceRejectedFeatures)?;
         // SAFETY: caller-owned device, identity-mapped MMIO.
         let dev_cfg = unsafe { map_cap(device, dev_cap) }?;
         // SAFETY: same.
         let cfg = unsafe {
             VirtioSndConfig {
-                jacks:   dev_cfg.read32(0),
+                jacks: dev_cfg.read32(0),
                 streams: dev_cfg.read32(4),
-                chmaps:  dev_cfg.read32(8),
+                chmaps: dev_cfg.read32(8),
             }
         };
 
@@ -196,7 +201,9 @@ impl VirtioSoundPci {
                 common.write16(CC_QUEUE_SELECT, idx);
                 common.read16(CC_QUEUE_SIZE)
             };
-            if qmax == 0 { return Err(VirtioPciError::QueueTooSmall); }
+            if qmax == 0 {
+                return Err(VirtioPciError::QueueTooSmall);
+            }
             let qsize = 4u16.min(qmax);
             let buf = alloc_coherent(4096, DomainId::DRIVER_0)
                 .map_err(|_| VirtioPciError::BarMapFailed)?;
@@ -205,7 +212,7 @@ impl VirtioSoundPci {
             // SAFETY: same.
             unsafe {
                 common.write16(CC_QUEUE_SIZE, qsize);
-                common.write64_split(CC_QUEUE_DESC,   layout.desc_table);
+                common.write64_split(CC_QUEUE_DESC, layout.desc_table);
                 common.write64_split(CC_QUEUE_DRIVER, layout.avail_ring);
                 common.write64_split(CC_QUEUE_DEVICE, layout.used_ring);
                 common.write16(crate::pci::CC_QUEUE_MSIX_VECTOR, 0xFFFF);
@@ -216,49 +223,55 @@ impl VirtioSoundPci {
             queue_notify_off[idx as usize] = off;
             Ok((layout, buf))
         };
-        let (ctrl_layout, ctrl_buf)  = setup_q(0)?;
+        let (ctrl_layout, ctrl_buf) = setup_q(0)?;
         let (event_layout, event_buf) = setup_q(1)?;
-        let (tx_layout, tx_buf)       = setup_q(2)?;
-        let (rx_layout, rx_buf)       = setup_q(3)?;
+        let (tx_layout, tx_buf) = setup_q(2)?;
+        let (rx_layout, rx_buf) = setup_q(3)?;
 
         // Scratch DMA buffers for ctrl + tx round-trips. Allocated
         // once at probe so submissions don't allocate on the hot
         // path.
-        let ctrl_scratch = alloc_coherent(4096, DomainId::DRIVER_0)
-            .map_err(|_| VirtioPciError::BarMapFailed)?;
-        let tx_scratch = alloc_coherent(4096, DomainId::DRIVER_0)
-            .map_err(|_| VirtioPciError::BarMapFailed)?;
+        let ctrl_scratch =
+            alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
+        let tx_scratch =
+            alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
 
         // DRIVER_OK.
         // SAFETY: same.
         unsafe {
-            common.write8(CC_DEVICE_STATUS,
-                (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER
-                 | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK) as u8);
+            common.write8(
+                CC_DEVICE_STATUS,
+                (VIRTIO_STATUS_ACKNOWLEDGE
+                    | VIRTIO_STATUS_DRIVER
+                    | VIRTIO_STATUS_FEATURES_OK
+                    | VIRTIO_STATUS_DRIVER_OK) as u8,
+            );
         }
 
         // SAFETY: Virtqueue::new wipes the layout regions; the
         // backing pages may be recycled (alloc_frame doesn't zero).
         let control_q = unsafe { Virtqueue::new(ctrl_layout) };
         // SAFETY: same.
-        let event_q   = unsafe { Virtqueue::new(event_layout) };
+        let event_q = unsafe { Virtqueue::new(event_layout) };
         // SAFETY: same.
-        let tx_q      = unsafe { Virtqueue::new(tx_layout) };
+        let tx_q = unsafe { Virtqueue::new(tx_layout) };
         // SAFETY: same.
-        let rx_q      = unsafe { Virtqueue::new(rx_layout) };
+        let rx_q = unsafe { Virtqueue::new(rx_layout) };
         Ok(Self {
             control_q: IrqSafeSpinLock::new(Some(control_q)),
-            event_q:   IrqSafeSpinLock::new(Some(event_q)),
-            tx_q:      IrqSafeSpinLock::new(Some(tx_q)),
-            rx_q:      IrqSafeSpinLock::new(Some(rx_q)),
+            event_q: IrqSafeSpinLock::new(Some(event_q)),
+            tx_q: IrqSafeSpinLock::new(Some(tx_q)),
+            rx_q: IrqSafeSpinLock::new(Some(rx_q)),
             _q_buf_control: ctrl_buf,
-            _q_buf_event:   event_buf,
-            _q_buf_tx:      tx_buf,
-            _q_buf_rx:      rx_buf,
-            notify, notify_off_multiplier, queue_notify_off,
+            _q_buf_event: event_buf,
+            _q_buf_tx: tx_buf,
+            _q_buf_rx: rx_buf,
+            notify,
+            notify_off_multiplier,
+            queue_notify_off,
             ctrl_buf: ctrl_scratch,
-            tx_buf:   tx_scratch,
-            started:  IrqSafeSpinLock::new(false),
+            tx_buf: tx_scratch,
+            started: IrqSafeSpinLock::new(false),
             cfg,
             ready: true,
         })
@@ -284,8 +297,18 @@ impl VirtioSoundPci {
             core::ptr::write_volatile(resp_phys as *mut u32, 0xFFFF_FFFF);
         }
         let descs = [
-            VirtqDesc { addr: req_phys,  len: req.len() as u32, flags: 0,                  next: 0 },
-            VirtqDesc { addr: resp_phys, len: 4,                flags: VIRTQ_DESC_F_WRITE, next: 0 },
+            VirtqDesc {
+                addr: req_phys,
+                len: req.len() as u32,
+                flags: 0,
+                next: 0,
+            },
+            VirtqDesc {
+                addr: resp_phys,
+                len: 4,
+                flags: VIRTQ_DESC_F_WRITE,
+                next: 0,
+            },
         ];
         let head = {
             let mut g = self.control_q.lock();
@@ -296,8 +319,7 @@ impl VirtioSoundPci {
         // SAFETY: identity-mapped notify region.
         unsafe {
             self.notify.write16(
-                self.notify_off_multiplier as u64
-                    * self.queue_notify_off[0] as u64,
+                self.notify_off_multiplier as u64 * self.queue_notify_off[0] as u64,
                 0,
             );
         }
@@ -316,7 +338,9 @@ impl VirtioSoundPci {
                     spins += 1;
                     if spins > 10_000_000 {
                         let mut g = self.control_q.lock();
-                        if let Some(q) = g.as_mut() { q.free_chain(head); }
+                        if let Some(q) = g.as_mut() {
+                            q.free_chain(head);
+                        }
                         return Err(VirtioPciError::QueueTooSmall);
                     }
                     core::hint::spin_loop();
@@ -326,18 +350,19 @@ impl VirtioSoundPci {
         // SAFETY: identity-mapped DMA.
         let status = unsafe { core::ptr::read_volatile(resp_phys as *const u32) };
         let mut g = self.control_q.lock();
-        if let Some(q) = g.as_mut() { q.free_chain(head); }
+        if let Some(q) = g.as_mut() {
+            q.free_chain(head);
+        }
         Ok(status)
     }
 
     /// Run SET_PARAMS + PREPARE + START on stream id 0 if not
     /// already started. Idempotent.
-    fn ensure_started(
-        &self,
-        params: PcmParams,
-    ) -> Result<(), VirtioPciError> {
+    fn ensure_started(&self, params: PcmParams) -> Result<(), VirtioPciError> {
         let mut started = self.started.lock();
-        if *started { return Ok(()); }
+        if *started {
+            return Ok(());
+        }
 
         // SET_PARAMS request: virtio_snd_pcm_set_params layout.
         //   +0  hdr.code (u32)        = VIRTIO_SND_R_PCM_SET_PARAMS
@@ -359,21 +384,27 @@ impl VirtioSoundPci {
         req[21] = params.format;
         req[22] = params.rate;
         let s = self.ctrl_request(&req)?;
-        if s != VIRTIO_SND_S_OK { return Err(VirtioPciError::DeviceRejectedFeatures); }
+        if s != VIRTIO_SND_S_OK {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
 
         // PREPARE: virtio_snd_pcm_hdr { code, stream_id }.
         let mut req = [0u8; 8];
         req[0..4].copy_from_slice(&VIRTIO_SND_R_PCM_PREPARE.to_le_bytes());
         req[4..8].copy_from_slice(&0u32.to_le_bytes());
         let s = self.ctrl_request(&req)?;
-        if s != VIRTIO_SND_S_OK { return Err(VirtioPciError::DeviceRejectedFeatures); }
+        if s != VIRTIO_SND_S_OK {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
 
         // START.
         let mut req = [0u8; 8];
         req[0..4].copy_from_slice(&VIRTIO_SND_R_PCM_START.to_le_bytes());
         req[4..8].copy_from_slice(&0u32.to_le_bytes());
         let s = self.ctrl_request(&req)?;
-        if s != VIRTIO_SND_S_OK { return Err(VirtioPciError::DeviceRejectedFeatures); }
+        if s != VIRTIO_SND_S_OK {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
 
         *started = true;
         Ok(())
@@ -389,9 +420,9 @@ impl VirtioSoundPci {
     /// Blocks until the device acks via the tx vq used ring.
     pub fn play_buffer_phys(
         &self,
-        params:      PcmParams,
+        params: PcmParams,
         payload_phys: u64,
-        payload_len:  u32,
+        payload_len: u32,
     ) -> Result<(), VirtioPciError> {
         if payload_len == 0 {
             return Err(VirtioPciError::QueueTooSmall);
@@ -406,22 +437,37 @@ impl VirtioSoundPci {
         // today; concurrency lands when AudioWriter grows a
         // submission ring.
         let base = self.tx_buf.phys_addr().raw();
-        let hdr_phys    = base;
+        let hdr_phys = base;
         let status_phys = base + 4088;
 
         // SAFETY: identity-mapped scratch DMA.
         unsafe {
             // virtio_snd_pcm_xfer { u32 stream_id, u32 padding }
-            core::ptr::write_volatile(hdr_phys      as *mut u32, 0u32);
-            core::ptr::write_volatile((hdr_phys+4)  as *mut u32, 0u32);
+            core::ptr::write_volatile(hdr_phys as *mut u32, 0u32);
+            core::ptr::write_volatile((hdr_phys + 4) as *mut u32, 0u32);
             // Pre-clear status to detect non-write-back.
-            core::ptr::write_volatile(status_phys     as *mut u32, 0xFFFF_FFFF);
-            core::ptr::write_volatile((status_phys+4) as *mut u32, 0u32);
+            core::ptr::write_volatile(status_phys as *mut u32, 0xFFFF_FFFF);
+            core::ptr::write_volatile((status_phys + 4) as *mut u32, 0u32);
         }
         let descs = [
-            VirtqDesc { addr: hdr_phys,     len: 8,           flags: 0,                  next: 0 },
-            VirtqDesc { addr: payload_phys, len: payload_len, flags: 0,                  next: 0 },
-            VirtqDesc { addr: status_phys,  len: 8,           flags: VIRTQ_DESC_F_WRITE, next: 0 },
+            VirtqDesc {
+                addr: hdr_phys,
+                len: 8,
+                flags: 0,
+                next: 0,
+            },
+            VirtqDesc {
+                addr: payload_phys,
+                len: payload_len,
+                flags: 0,
+                next: 0,
+            },
+            VirtqDesc {
+                addr: status_phys,
+                len: 8,
+                flags: VIRTQ_DESC_F_WRITE,
+                next: 0,
+            },
         ];
         let head = {
             let mut g = self.tx_q.lock();
@@ -432,8 +478,7 @@ impl VirtioSoundPci {
         // SAFETY: identity-mapped notify region.
         unsafe {
             self.notify.write16(
-                self.notify_off_multiplier as u64
-                    * self.queue_notify_off[2] as u64,
+                self.notify_off_multiplier as u64 * self.queue_notify_off[2] as u64,
                 2,
             );
         }
@@ -451,7 +496,9 @@ impl VirtioSoundPci {
                     spins += 1;
                     if spins > 10_000_000 {
                         let mut g = self.tx_q.lock();
-                        if let Some(q) = g.as_mut() { q.free_chain(head); }
+                        if let Some(q) = g.as_mut() {
+                            q.free_chain(head);
+                        }
                         return Err(VirtioPciError::QueueTooSmall);
                     }
                     core::hint::spin_loop();
@@ -461,7 +508,9 @@ impl VirtioSoundPci {
         // SAFETY: identity-mapped DMA.
         let status = unsafe { core::ptr::read_volatile(status_phys as *const u32) };
         let mut g = self.tx_q.lock();
-        if let Some(q) = g.as_mut() { q.free_chain(head); }
+        if let Some(q) = g.as_mut() {
+            q.free_chain(head);
+        }
         if status != VIRTIO_SND_S_OK {
             return Err(VirtioPciError::DeviceRejectedFeatures);
         }
@@ -473,11 +522,7 @@ impl VirtioSoundPci {
     /// forwards to `play_buffer_phys`. Bounded to 4032 bytes by
     /// the scratch layout — call `play_buffer_phys` directly with
     /// a `narf-shmem`-backed phys for arbitrary lengths.
-    pub fn play_buffer(
-        &self,
-        params: PcmParams,
-        pcm:    &[u8],
-    ) -> Result<(), VirtioPciError> {
+    pub fn play_buffer(&self, params: PcmParams, pcm: &[u8]) -> Result<(), VirtioPciError> {
         if pcm.len() > 4032 {
             return Err(VirtioPciError::QueueTooSmall);
         }
@@ -498,9 +543,9 @@ impl VirtioSoundPci {
 pub struct PcmParams {
     pub buffer_bytes: u32,
     pub period_bytes: u32,
-    pub channels:     u8,
-    pub format:       u8,
-    pub rate:         u8,
+    pub channels: u8,
+    pub format: u8,
+    pub rate: u8,
 }
 
 impl PcmParams {
@@ -510,39 +555,39 @@ impl PcmParams {
         Self {
             buffer_bytes: 8192,
             period_bytes: 2048,
-            channels:     2,
-            format:       VIRTIO_SND_PCM_FMT_S16,
-            rate:         VIRTIO_SND_PCM_RATE_48000,
+            channels: 2,
+            format: VIRTIO_SND_PCM_FMT_S16,
+            rate: VIRTIO_SND_PCM_RATE_48000,
         }
     }
 }
 
-static CONTROLLER: IrqSafeSpinLock<Option<VirtioSoundPci>> =
-    IrqSafeSpinLock::new(None);
+static CONTROLLER: IrqSafeSpinLock<Option<VirtioSoundPci>> = IrqSafeSpinLock::new(None);
 
-pub fn probe(
-    device: BusDevice,
-    cap:    Cap<BusDeviceCap, Write>,
-) -> Result<(), narf_bus::ProbeError> {
-    if CONTROLLER.lock().is_some() { return Ok(()); }
+pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
+    if CONTROLLER.lock().is_some() {
+        return Ok(());
+    }
     narf_bus::pci::set_command(
-        &cap, &device,
+        &cap,
+        &device,
         narf_bus::pci::cmd::MEM_SPACE
             | narf_bus::pci::cmd::BUS_MASTER
             | narf_bus::pci::cmd::INTX_DISABLE,
-    ).map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    )
+    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // SAFETY: caller-authority.
     let dev = match unsafe { VirtioSoundPci::bring_up(&device, &cap) } {
-        Ok(d)  => d,
+        Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
     *CONTROLLER.lock() = Some(dev);
     narf_drivers::record_bound(narf_drivers::BoundDriver {
-        name:    alloc::string::String::from("vsnd0"),
-        kind:    narf_drivers::BoundKind::Audio,
+        name: alloc::string::String::from("vsnd0"),
+        kind: narf_drivers::BoundKind::Audio,
         pci_vid: Some(VIRTIO_SND_PCI_VENDOR),
         pci_did: Some(VIRTIO_SND_PCI_DEVICE),
-        domain:  narf_drivers::BoundKind::Audio.default_domain(),
+        domain: narf_drivers::BoundKind::Audio.default_domain(),
     });
     Ok(())
 }
@@ -558,22 +603,23 @@ pub fn register_pci_driver() {
     });
 }
 
-pub fn is_probed() -> bool { CONTROLLER.lock().is_some() }
+pub fn is_probed() -> bool {
+    CONTROLLER.lock().is_some()
+}
 
 /// Topology snapshot — `(jacks, streams, chmaps)`. Returns `None`
 /// if the device hasn't probed.
 pub fn topology() -> Option<(u32, u32, u32)> {
-    CONTROLLER.lock().as_ref()
+    CONTROLLER
+        .lock()
+        .as_ref()
         .map(|c| (c.cfg.jacks, c.cfg.streams, c.cfg.chmaps))
 }
 
 /// Submit one PCM buffer through the probed virtio-sound device's
 /// stream 0. Blocks until the device acks. Slice-friendly; copies
 /// into the per-controller scratch.
-pub fn play_buffer(
-    params: PcmParams,
-    pcm:    &[u8],
-) -> Result<(), VirtioPciError> {
+pub fn play_buffer(params: PcmParams, pcm: &[u8]) -> Result<(), VirtioPciError> {
     let g = CONTROLLER.lock();
     let c = g.as_ref().ok_or(VirtioPciError::NoQueues)?;
     c.play_buffer(params, pcm)
@@ -585,9 +631,9 @@ pub fn play_buffer(
 /// is already in DMA-coherent memory — typically a `narf-shmem`
 /// region's `phys_at(handle, offset)`.
 pub fn play_buffer_phys(
-    params:       PcmParams,
+    params: PcmParams,
     payload_phys: u64,
-    payload_len:  u32,
+    payload_len: u32,
 ) -> Result<(), VirtioPciError> {
     let g = CONTROLLER.lock();
     let c = g.as_ref().ok_or(VirtioPciError::NoQueues)?;

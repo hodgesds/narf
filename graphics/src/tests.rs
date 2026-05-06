@@ -7,20 +7,32 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 fn smoke_graphics_pixel_format() -> TestResult {
     use crate::Pixel32;
-    if Pixel32::BLACK.raw()  != 0xFF00_0000 { return TestResult::Fail("BLACK"); }
-    if Pixel32::WHITE.raw()  != 0xFFFF_FFFF { return TestResult::Fail("WHITE"); }
-    if Pixel32::RED.raw()    != 0xFFFF_0000 { return TestResult::Fail("RED"); }
-    if Pixel32::GREEN.raw()  != 0xFF00_FF00 { return TestResult::Fail("GREEN"); }
-    if Pixel32::BLUE.raw()   != 0xFF00_00FF { return TestResult::Fail("BLUE"); }
+    if Pixel32::BLACK.raw() != 0xFF00_0000 {
+        return TestResult::Fail("BLACK");
+    }
+    if Pixel32::WHITE.raw() != 0xFFFF_FFFF {
+        return TestResult::Fail("WHITE");
+    }
+    if Pixel32::RED.raw() != 0xFFFF_0000 {
+        return TestResult::Fail("RED");
+    }
+    if Pixel32::GREEN.raw() != 0xFF00_FF00 {
+        return TestResult::Fail("GREEN");
+    }
+    if Pixel32::BLUE.raw() != 0xFF00_00FF {
+        return TestResult::Fail("BLUE");
+    }
     let p = Pixel32::rgb(0x12, 0x34, 0x56);
-    if p.raw() != 0xFF12_3456 { return TestResult::Fail("rgb pack"); }
+    if p.raw() != 0xFF12_3456 {
+        return TestResult::Fail("rgb pack");
+    }
     TestResult::Pass
 }
 kernel_test_in!("graphics", smoke_graphics_pixel_format);
 
 fn smoke_graphics_clear_and_fill_rect() -> TestResult {
-    use alloc::vec;
     use crate::{Framebuffer, Pixel32};
+    use alloc::vec;
     // Build a small in-memory framebuffer (8×4) backed by a heap Vec.
     let mut buf = vec![0u32; 32];
     let ptr = buf.as_mut_ptr();
@@ -36,7 +48,11 @@ fn smoke_graphics_clear_and_fill_rect() -> TestResult {
         for x in 0..8 {
             let p = buf[y * 8 + x];
             let inside = (2..6).contains(&x) && (1..3).contains(&y);
-            let want = if inside { Pixel32::RED.raw() } else { Pixel32::WHITE.raw() };
+            let want = if inside {
+                Pixel32::RED.raw()
+            } else {
+                Pixel32::WHITE.raw()
+            };
             if p != want {
                 return TestResult::Fail("fill_rect pixel mismatch");
             }
@@ -104,8 +120,8 @@ fn smoke_cursor_move_clamps_to_bounds() -> TestResult {
 kernel_test_in!("graphics", smoke_cursor_move_clamps_to_bounds);
 
 fn smoke_cursor_draw_at_paints_arrow_tip() -> TestResult {
-    use alloc::vec;
     use crate::{Cursor, Framebuffer, Pixel32};
+    use alloc::vec;
     // 16x16 in-memory FB. Cursor at (0,0) — top-left pixel of arrow
     // is bit 7 of the first sprite row (0b10000000), so pixel (0,0)
     // is FG.
@@ -135,19 +151,26 @@ fn smoke_splash_render_with_no_console_returns_false() -> TestResult {
     // Reset the global FB console so render() returns false.
     crate::console::__reset_for_test();
     let info = BootInfo {
-        arch: "x86_64", version: "test",
-        cpu_count: 1, numa_nodes: 1, bound_drivers: 0, backend: "pks",
+        arch: "x86_64",
+        version: "test",
+        cpu_count: 1,
+        numa_nodes: 1,
+        bound_drivers: 0,
+        backend: "pks",
     };
     if render_splash(&info) {
         return TestResult::Fail("render returned true with no console");
     }
     TestResult::Pass
 }
-kernel_test_in!("graphics", smoke_splash_render_with_no_console_returns_false);
+kernel_test_in!(
+    "graphics",
+    smoke_splash_render_with_no_console_returns_false
+);
 
 fn smoke_splash_render_with_console_paints() -> TestResult {
-    use alloc::vec;
     use crate::{render_splash, BootInfo, FbConsole, Framebuffer, Pixel32};
+    use alloc::vec;
     let mut buf = vec![0u32; 64 * 48];
     let ptr = buf.as_mut_ptr();
     // SAFETY: backing buffer outlives the borrow.
@@ -155,8 +178,12 @@ fn smoke_splash_render_with_console_paints() -> TestResult {
     let con = FbConsole::new(fb, Pixel32::WHITE, Pixel32::BLACK);
     crate::install_fb_console(con);
     let info = BootInfo {
-        arch: "x86_64", version: "0.0.0",
-        cpu_count: 2, numa_nodes: 1, bound_drivers: 8, backend: "pks",
+        arch: "x86_64",
+        version: "0.0.0",
+        cpu_count: 2,
+        numa_nodes: 1,
+        bound_drivers: 8,
+        backend: "pks",
     };
     let painted = render_splash(&info);
     // Cleanup.
@@ -205,7 +232,7 @@ fn smoke_edid_parses_known_block() -> TestResult {
     blob[127] = 0u8.wrapping_sub(s);
 
     let parsed = match Edid::parse(&blob) {
-        Ok(e)  => e,
+        Ok(e) => e,
         Err(_) => return TestResult::Fail("Edid::parse rejected synthetic block"),
     };
     if parsed.manufacturer() != *b"NRF" {
@@ -218,7 +245,7 @@ fn smoke_edid_parses_known_block() -> TestResult {
         return TestResult::Fail("manufacture_year mis-decoded");
     }
     let timing = match parsed.preferred_timing() {
-        Ok(t)  => t,
+        Ok(t) => t,
         Err(_) => return TestResult::Fail("preferred_timing rejected"),
     };
     if timing.h_active != 1920 || timing.v_active != 1080 {

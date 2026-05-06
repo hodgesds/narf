@@ -42,36 +42,36 @@ use narf_lib::sync::IrqSafeSpinLock;
 pub const SMBUS_VENDOR: u16 = 0x8086;
 
 /// QEMU q35 / real ICH9.
-pub const SMBUS_ICH9_DEV:  u16 = 0x2930;
+pub const SMBUS_ICH9_DEV: u16 = 0x2930;
 /// ICH10.
 pub const SMBUS_ICH10_DEV: u16 = 0x3A30;
 /// 5/6/7 series PCH (C200 / Cougar Point).
-pub const SMBUS_PCH_DEV:   u16 = 0x1C22;
+pub const SMBUS_PCH_DEV: u16 = 0x1C22;
 pub const SMBUS_PCH_DEV_2: u16 = 0x1E22;
 
 // PCI class triple matching SMBus controllers.
-pub const SMBUS_PCI_CLASS:    u8 = 0x0C;
+pub const SMBUS_PCI_CLASS: u8 = 0x0C;
 pub const SMBUS_PCI_SUBCLASS: u8 = 0x05;
 
 // ── Register offsets (BAR4 is IO; we read/write u8) ─────────────────
 
-const SMB_HST_STS:   u16 = 0x00;
-const SMB_HST_CNT:   u16 = 0x02;
-const SMB_HST_CMD:   u16 = 0x03;
+const SMB_HST_STS: u16 = 0x00;
+const SMB_HST_CNT: u16 = 0x02;
+const SMB_HST_CMD: u16 = 0x03;
 const SMB_XMIT_SLVA: u16 = 0x04;
-const SMB_HST_D0:    u16 = 0x05;
-const SMB_HST_D1:    u16 = 0x06;
+const SMB_HST_D0: u16 = 0x05;
+const SMB_HST_D1: u16 = 0x06;
 
 // HST_STS bits.
 const STS_HOST_BUSY: u8 = 1 << 0;
-const STS_INTR:      u8 = 1 << 1;
-const STS_DEV_ERR:   u8 = 1 << 2;
-const STS_BUS_ERR:   u8 = 1 << 3;
-const STS_FAILED:    u8 = 1 << 4;
-const STS_ALL_ERRS:  u8 = STS_DEV_ERR | STS_BUS_ERR | STS_FAILED;
+const STS_INTR: u8 = 1 << 1;
+const STS_DEV_ERR: u8 = 1 << 2;
+const STS_BUS_ERR: u8 = 1 << 3;
+const STS_FAILED: u8 = 1 << 4;
+const STS_ALL_ERRS: u8 = STS_DEV_ERR | STS_BUS_ERR | STS_FAILED;
 
 // HST_CNT bits.
-const CNT_START:     u8 = 1 << 6;
+const CNT_START: u8 = 1 << 6;
 const CNT_PROTO_BYTE_DATA: u8 = 0b010 << 2;
 const CNT_PROTO_WORD_DATA: u8 = 0b011 << 2;
 
@@ -100,7 +100,7 @@ impl Smbus {
     /// Caller owns BAR4 exclusively.
     pub unsafe fn bring_up(
         device: &BusDevice,
-        _cap:   &Cap<BusDeviceCap, Write>,
+        _cap: &Cap<BusDeviceCap, Write>,
     ) -> Result<Self, SmbusError> {
         // SMBus uses IO-space BARs (PIO on x86_64). The
         // `narf-bus::map_bar` path expects MMIO — for SMBus we
@@ -117,7 +117,9 @@ impl Smbus {
             if s & STS_HOST_BUSY == 0 {
                 // Clear any pending status (write-1-clear).
                 // SAFETY: same.
-                unsafe { pio_out8(self.io_base + SMB_HST_STS, 0xFF); }
+                unsafe {
+                    pio_out8(self.io_base + SMB_HST_STS, 0xFF);
+                }
                 return Ok(());
             }
             core::hint::spin_loop();
@@ -130,12 +132,20 @@ impl Smbus {
         for _ in 0..10_000_000u32 {
             // SAFETY: x86_64 PIO.
             let s = unsafe { pio_in8(self.io_base + SMB_HST_STS) };
-            if s & STS_BUS_ERR != 0 { return Err(SmbusError::BusError); }
-            if s & STS_DEV_ERR != 0 { return Err(SmbusError::DeviceError); }
-            if s & STS_FAILED  != 0 { return Err(SmbusError::Failed); }
-            if s & STS_INTR    != 0 {
+            if s & STS_BUS_ERR != 0 {
+                return Err(SmbusError::BusError);
+            }
+            if s & STS_DEV_ERR != 0 {
+                return Err(SmbusError::DeviceError);
+            }
+            if s & STS_FAILED != 0 {
+                return Err(SmbusError::Failed);
+            }
+            if s & STS_INTR != 0 {
                 // SAFETY: same — clear status.
-                unsafe { pio_out8(self.io_base + SMB_HST_STS, STS_INTR | STS_ALL_ERRS); }
+                unsafe {
+                    pio_out8(self.io_base + SMB_HST_STS, STS_INTR | STS_ALL_ERRS);
+                }
                 return Ok(());
             }
             core::hint::spin_loop();
@@ -163,9 +173,7 @@ impl Smbus {
     }
 
     /// Write one byte `value` at `cmd` on device `addr`.
-    pub fn write_byte_data(&self, addr: u8, cmd: u8, value: u8)
-        -> Result<(), SmbusError>
-    {
+    pub fn write_byte_data(&self, addr: u8, cmd: u8, value: u8) -> Result<(), SmbusError> {
         self.wait_idle()?;
         // SAFETY: x86_64 PIO.
         unsafe {
@@ -198,37 +206,36 @@ impl Smbus {
 
 // ── Driver-match registration ────────────────────────────────────────
 
-static CONTROLLER: IrqSafeSpinLock<Option<Smbus>> =
-    IrqSafeSpinLock::new(None);
+static CONTROLLER: IrqSafeSpinLock<Option<Smbus>> = IrqSafeSpinLock::new(None);
 
-pub fn probe(
-    device: BusDevice,
-    cap:    Cap<BusDeviceCap, Write>,
-) -> Result<(), narf_bus::ProbeError> {
+pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     // Class match catches all class-0x0C devices; verify subclass
     // is 0x05 (SMBus) before bringing up.
     let subclass = ((device.id.class >> 8) & 0xFF) as u8;
     if subclass != SMBUS_PCI_SUBCLASS {
         return Err(narf_bus::ProbeError::BadDevice);
     }
-    if CONTROLLER.lock().is_some() { return Ok(()); }
+    if CONTROLLER.lock().is_some() {
+        return Ok(());
+    }
     narf_bus::pci::set_command(
-        &cap, &device,
-        narf_bus::pci::cmd::IO_SPACE
-            | narf_bus::pci::cmd::INTX_DISABLE,
-    ).map_err(|_| narf_bus::ProbeError::BadDevice)?;
+        &cap,
+        &device,
+        narf_bus::pci::cmd::IO_SPACE | narf_bus::pci::cmd::INTX_DISABLE,
+    )
+    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // SAFETY: caller-authority.
     let dev = match unsafe { Smbus::bring_up(&device, &cap) } {
-        Ok(d)  => d,
+        Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
     *CONTROLLER.lock() = Some(dev);
     narf_drivers::record_bound(narf_drivers::BoundDriver {
-        name:    alloc::string::String::from("smbus"),
-        kind:    narf_drivers::BoundKind::Other,
+        name: alloc::string::String::from("smbus"),
+        kind: narf_drivers::BoundKind::Other,
         pci_vid: Some(device.id.vendor),
         pci_did: Some(device.id.device),
-        domain:  narf_drivers::BoundKind::Other.default_domain(),
+        domain: narf_drivers::BoundKind::Other.default_domain(),
     });
     Ok(())
 }
@@ -237,13 +244,16 @@ pub fn register_pci_driver() {
     narf_bus::register_pci_driver(narf_bus::PciMatch {
         name: "smbus-ich",
         kind: narf_bus::MatchKind::Class {
-            class: SMBUS_PCI_CLASS, mask: 0xFF,
+            class: SMBUS_PCI_CLASS,
+            mask: 0xFF,
         },
         probe,
     });
 }
 
-pub fn is_probed() -> bool { CONTROLLER.lock().is_some() }
+pub fn is_probed() -> bool {
+    CONTROLLER.lock().is_some()
+}
 
 pub fn with_controller<R>(f: impl FnOnce(&Smbus) -> R) -> Option<R> {
     CONTROLLER.lock().as_ref().map(f)
@@ -263,7 +273,9 @@ fn io_bar4(device: &BusDevice) -> Option<u16> {
     };
     // SAFETY: identity-mapped cfg space; offset 0x10 + 4*4 = 0x20.
     let raw = unsafe { core::ptr::read_volatile((cfg.raw() + 0x20) as *const u32) };
-    if raw & 1 == 0 { return None; }
+    if raw & 1 == 0 {
+        return None;
+    }
     Some((raw & 0xFFFC) as u16)
 }
 
@@ -286,6 +298,8 @@ unsafe fn pio_out8(port: u16, v: u8) {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-unsafe fn pio_in8(_port: u16) -> u8 { 0 }
+unsafe fn pio_in8(_port: u16) -> u8 {
+    0
+}
 #[cfg(not(target_arch = "x86_64"))]
 unsafe fn pio_out8(_port: u16, _v: u8) {}

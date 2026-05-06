@@ -9,10 +9,10 @@ use crate::x86_64::cpuid::cpuid;
 
 #[derive(Copy, Clone, Debug, Default)]
 pub struct CacheCaps {
-    pub clflush:    bool,
+    pub clflush: bool,
     pub clflushopt: bool,
-    pub clwb:       bool,
-    pub wbnoinvd:   bool,
+    pub clwb: bool,
+    pub wbnoinvd: bool,
     pub line_bytes: u16,
 }
 
@@ -23,14 +23,14 @@ pub fn caps() -> CacheCaps {
     if max >= 1 {
         // SAFETY: leaf 1 valid.
         let (_, ebx, _, edx) = unsafe { cpuid(1, 0) };
-        c.clflush    = edx & (1 << 19) != 0;
+        c.clflush = edx & (1 << 19) != 0;
         c.line_bytes = ((ebx >> 8) & 0xFF) as u16 * 8;
     }
     if max >= 7 {
         // SAFETY: leaf 7 valid.
         let (_, ebx, _, _) = unsafe { cpuid(7, 0) };
         c.clflushopt = ebx & (1 << 23) != 0;
-        c.clwb       = ebx & (1 << 24) != 0;
+        c.clwb = ebx & (1 << 24) != 0;
     }
     // SAFETY: leaf 0x8000_0000 always defined.
     let (max_ext, _, _, _) = unsafe { cpuid(0x8000_0000, 0) };
@@ -103,9 +103,6 @@ pub unsafe fn clwb(addr: *const u8) {
 pub unsafe fn wbnoinvd() {
     // SAFETY: caller-asserted; encoding `F3 0F 09`.
     unsafe {
-        core::arch::asm!(
-            ".byte 0xF3, 0x0F, 0x09",
-            options(nostack, preserves_flags),
-        );
+        core::arch::asm!(".byte 0xF3, 0x0F, 0x09", options(nostack, preserves_flags),);
     }
 }

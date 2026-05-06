@@ -13,48 +13,48 @@ use crate::{AmlError, AmlNode, NameValue, NodeKind, Value};
 
 // ── Opcode constants ─────────────────────────────────────────────────────────
 
-const ZERO_OP:         u8 = 0x00;
-const ONE_OP:          u8 = 0x01;
-const BYTE_PREFIX:     u8 = 0x0A;
-const WORD_PREFIX:     u8 = 0x0B;
-const DWORD_PREFIX:    u8 = 0x0C;
-const STRING_PREFIX:   u8 = 0x0D;
-const QWORD_PREFIX:    u8 = 0x0E;
-const BUFFER_OP:       u8 = 0x11;
-const PACKAGE_OP:      u8 = 0x12;
-const CONTINUE_OP:     u8 = 0x9F;
-const STORE_OP:        u8 = 0x70;
-const ADD_OP:          u8 = 0x72;
-const SUBTRACT_OP:     u8 = 0x74;
-const INCREMENT_OP:    u8 = 0x75;
-const DECREMENT_OP:    u8 = 0x76;
-const MULTIPLY_OP:     u8 = 0x77;
-const DIVIDE_OP:       u8 = 0x78;
-const SHIFT_LEFT_OP:   u8 = 0x79;
-const SHIFT_RIGHT_OP:  u8 = 0x7A;
-const AND_OP:          u8 = 0x7B;
-const NAND_OP:         u8 = 0x7C;
-const OR_OP:           u8 = 0x7D;
-const NOR_OP:          u8 = 0x7E;
-const XOR_OP:          u8 = 0x7F;
-const NOT_OP:          u8 = 0x80;
-const LAND_OP:         u8 = 0x90;
-const LOR_OP:          u8 = 0x91;
-const LNOT_OP:         u8 = 0x92;
-const LEQUAL_OP:       u8 = 0x93;
-const LGREATER_OP:     u8 = 0x94;
-const LLESS_OP:        u8 = 0x95;
-const IF_OP:           u8 = 0xA0;
-const ELSE_OP:         u8 = 0xA1;
-const WHILE_OP:        u8 = 0xA2;
-const NOOP_OP:         u8 = 0xA3;
-const RETURN_OP:       u8 = 0xA4;
-const BREAK_OP:        u8 = 0xA5;
+const ZERO_OP: u8 = 0x00;
+const ONE_OP: u8 = 0x01;
+const BYTE_PREFIX: u8 = 0x0A;
+const WORD_PREFIX: u8 = 0x0B;
+const DWORD_PREFIX: u8 = 0x0C;
+const STRING_PREFIX: u8 = 0x0D;
+const QWORD_PREFIX: u8 = 0x0E;
+const BUFFER_OP: u8 = 0x11;
+const PACKAGE_OP: u8 = 0x12;
+const CONTINUE_OP: u8 = 0x9F;
+const STORE_OP: u8 = 0x70;
+const ADD_OP: u8 = 0x72;
+const SUBTRACT_OP: u8 = 0x74;
+const INCREMENT_OP: u8 = 0x75;
+const DECREMENT_OP: u8 = 0x76;
+const MULTIPLY_OP: u8 = 0x77;
+const DIVIDE_OP: u8 = 0x78;
+const SHIFT_LEFT_OP: u8 = 0x79;
+const SHIFT_RIGHT_OP: u8 = 0x7A;
+const AND_OP: u8 = 0x7B;
+const NAND_OP: u8 = 0x7C;
+const OR_OP: u8 = 0x7D;
+const NOR_OP: u8 = 0x7E;
+const XOR_OP: u8 = 0x7F;
+const NOT_OP: u8 = 0x80;
+const LAND_OP: u8 = 0x90;
+const LOR_OP: u8 = 0x91;
+const LNOT_OP: u8 = 0x92;
+const LEQUAL_OP: u8 = 0x93;
+const LGREATER_OP: u8 = 0x94;
+const LLESS_OP: u8 = 0x95;
+const IF_OP: u8 = 0xA0;
+const ELSE_OP: u8 = 0xA1;
+const WHILE_OP: u8 = 0xA2;
+const NOOP_OP: u8 = 0xA3;
+const RETURN_OP: u8 = 0xA4;
+const BREAK_OP: u8 = 0xA5;
 
-const ROOT_CHAR:          u8 = b'\\';
-const PARENT_PREFIX:      u8 = b'^';
-const DUAL_NAME_PREFIX:   u8 = 0x2E;
-const MULTI_NAME_PREFIX:  u8 = 0x2F;
+const ROOT_CHAR: u8 = b'\\';
+const PARENT_PREFIX: u8 = b'^';
+const DUAL_NAME_PREFIX: u8 = 0x2E;
+const MULTI_NAME_PREFIX: u8 = 0x2F;
 
 const MAX_WHILE_ITERATIONS: u32 = 1_000_000;
 
@@ -75,7 +75,7 @@ enum Signal {
 
 struct EvalState {
     locals: [Value; 8],
-    args:   Vec<Value>,
+    args: Vec<Value>,
 }
 
 impl EvalState {
@@ -84,21 +84,32 @@ impl EvalState {
         // the array manually.
         Self {
             locals: [
-                Value::Integer(0), Value::Integer(0), Value::Integer(0),
-                Value::Integer(0), Value::Integer(0), Value::Integer(0),
-                Value::Integer(0), Value::Integer(0),
+                Value::Integer(0),
+                Value::Integer(0),
+                Value::Integer(0),
+                Value::Integer(0),
+                Value::Integer(0),
+                Value::Integer(0),
+                Value::Integer(0),
+                Value::Integer(0),
             ],
             args: args.to_vec(),
         }
     }
 
-    fn local(&self, idx: usize) -> Value { self.locals[idx].clone() }
+    fn local(&self, idx: usize) -> Value {
+        self.locals[idx].clone()
+    }
     fn arg(&self, idx: usize) -> Value {
         self.args.get(idx).cloned().unwrap_or(Value::Integer(0))
     }
-    fn set_local(&mut self, idx: usize, v: Value) { self.locals[idx] = v; }
+    fn set_local(&mut self, idx: usize, v: Value) {
+        self.locals[idx] = v;
+    }
     fn set_arg(&mut self, idx: usize, v: Value) {
-        if idx < self.args.len() { self.args[idx] = v; }
+        if idx < self.args.len() {
+            self.args[idx] = v;
+        }
         // Silently ignore out-of-range arg stores.
     }
 }
@@ -142,9 +153,9 @@ pub fn evaluate_method(path: &str, args: &[Value]) -> Result<Value, AmlError> {
 /// Walk a TermList bounded by `end` (exclusive index into `buf`).
 /// Returns when we hit `end`, `ReturnOp`, `BreakOp`, or `ContinueOp`.
 fn walk_term_list(
-    buf:   &[u8],
-    cur:   &mut usize,
-    end:   usize,
+    buf: &[u8],
+    cur: &mut usize,
+    end: usize,
     state: &mut EvalState,
 ) -> Result<Signal, AmlError> {
     while *cur < end {
@@ -159,9 +170,9 @@ fn walk_term_list(
 
 /// Evaluate the next single TermObj at `*cur`, advancing the cursor.
 fn eval_term(
-    buf:   &[u8],
-    cur:   &mut usize,
-    end:   usize,
+    buf: &[u8],
+    cur: &mut usize,
+    end: usize,
     state: &mut EvalState,
 ) -> Result<Signal, AmlError> {
     let op = next_u8(buf, cur)?;
@@ -502,17 +513,13 @@ fn eval_term(
 /// Evaluate the next TermArg at `*cur`, returning its Value.
 /// This is the recursive descent entry — it handles any opcode that
 /// produces a value.
-fn eval_term_arg(
-    buf:   &[u8],
-    cur:   &mut usize,
-    state: &mut EvalState,
-) -> Result<Value, AmlError> {
+fn eval_term_arg(buf: &[u8], cur: &mut usize, state: &mut EvalState) -> Result<Value, AmlError> {
     let op = next_u8(buf, cur)?;
     let v = match op {
         // Constants
         ZERO_OP => Value::Integer(0),
-        ONE_OP  => Value::Integer(1),
-        0xFF    => Value::Integer(u64::MAX), // OnesOp
+        ONE_OP => Value::Integer(1),
+        0xFF => Value::Integer(u64::MAX), // OnesOp
 
         BYTE_PREFIX => {
             let b = next_u8(buf, cur)?;
@@ -525,19 +532,25 @@ fn eval_term_arg(
         }
         DWORD_PREFIX => {
             let mut v = 0u64;
-            for i in 0..4u64 { v |= (next_u8(buf, cur)? as u64) << (i * 8); }
+            for i in 0..4u64 {
+                v |= (next_u8(buf, cur)? as u64) << (i * 8);
+            }
             Value::Integer(v)
         }
         QWORD_PREFIX => {
             let mut v = 0u64;
-            for i in 0..8u64 { v |= (next_u8(buf, cur)? as u64) << (i * 8); }
+            for i in 0..8u64 {
+                v |= (next_u8(buf, cur)? as u64) << (i * 8);
+            }
             Value::Integer(v)
         }
         STRING_PREFIX => {
             let mut s = String::new();
             loop {
                 let c = next_u8(buf, cur)?;
-                if c == 0 { break; }
+                if c == 0 {
+                    break;
+                }
                 s.push(c as char);
             }
             Value::String(s)
@@ -595,7 +608,7 @@ fn eval_term_arg(
         DIVIDE_OP => {
             let a = eval_term_arg(buf, cur, state)?.as_integer();
             let b = eval_term_arg(buf, cur, state)?.as_integer();
-            let rem  = if b == 0 { 0 } else { a % b };
+            let rem = if b == 0 { 0 } else { a % b };
             let quot = if b == 0 { 0 } else { a / b };
             write_target(buf, cur, Value::Integer(rem), state)?;
             let r = Value::Integer(quot);
@@ -706,15 +719,17 @@ fn eval_term_arg(
         // Buffer: BufferOp PkgLength SizeTermArg ByteList
         BUFFER_OP => {
             let pkg_start = *cur;
-            let pkg_len   = read_pkg_length(buf, cur)?;
-            let pkg_end   = pkg_start + pkg_len;
+            let pkg_len = read_pkg_length(buf, cur)?;
+            let pkg_end = pkg_start + pkg_len;
             // Size is a TermArg (may be any integer).
             let _size = eval_term_arg(buf, cur, state)?.as_integer();
             // Collect remaining bytes as the buffer payload.
             let data_len = pkg_end.saturating_sub(*cur);
             let mut data = Vec::with_capacity(data_len);
             for _ in 0..data_len {
-                if *cur >= buf.len() { break; }
+                if *cur >= buf.len() {
+                    break;
+                }
                 data.push(buf[*cur]);
                 *cur += 1;
             }
@@ -725,8 +740,8 @@ fn eval_term_arg(
         // Package: PackageOp PkgLength NumElements TermList
         PACKAGE_OP => {
             let pkg_start = *cur;
-            let pkg_len   = read_pkg_length(buf, cur)?;
-            let pkg_end   = pkg_start + pkg_len;
+            let pkg_len = read_pkg_length(buf, cur)?;
+            let pkg_end = pkg_start + pkg_len;
             let num_elems = next_u8(buf, cur)? as usize;
             let mut items = Vec::with_capacity(num_elems);
             // Evaluate up to num_elems TermArgs within pkg bounds.
@@ -741,8 +756,8 @@ fn eval_term_arg(
         // IfOp as TermArg (unusual but handle gracefully).
         IF_OP => {
             let pkg_start = *cur;
-            let pkg_len   = read_pkg_length(buf, cur)?;
-            let pkg_end   = pkg_start + pkg_len;
+            let pkg_len = read_pkg_length(buf, cur)?;
+            let pkg_end = pkg_start + pkg_len;
             let pred = eval_term_arg(buf, cur, state)?.as_integer();
             if pred != 0 {
                 // Return last value produced by body — walk and collect.
@@ -783,8 +798,8 @@ fn eval_term_arg(
             match crate::find_node(&name) {
                 Some(node) => match node.value {
                     Some(NameValue::Integer(v)) => Value::Integer(v),
-                    Some(NameValue::String(s))  => Value::String(s),
-                    _                           => Value::Integer(0),
+                    Some(NameValue::String(s)) => Value::String(s),
+                    _ => Value::Integer(0),
                 },
                 None => Value::Integer(0),
             }
@@ -793,7 +808,7 @@ fn eval_term_arg(
         // ── NotifyOp (0x86) as TermArg ────────────────────────────────────
         0x86 => {
             let target = read_name_string(buf, cur, "\\")?;
-            let value  = eval_term_arg(buf, cur, state)?.as_integer();
+            let value = eval_term_arg(buf, cur, state)?.as_integer();
             crate::sync::dispatch_notify(&target, value);
             Value::Integer(0)
         }
@@ -818,13 +833,13 @@ fn eval_term_arg(
                 // Returns Integer(0) = acquired, Integer(1) = timeout (ACPI spec).
                 0x23 => {
                     let name = read_name_string(buf, cur, "\\")?;
-                    let lo   = next_u8(buf, cur)? as u16;
-                    let hi   = next_u8(buf, cur)? as u16;
+                    let lo = next_u8(buf, cur)? as u16;
+                    let hi = next_u8(buf, cur)? as u16;
                     let timeout = lo | (hi << 8);
                     match crate::sync::acquire(&name, timeout) {
-                        Ok(true)  => Value::Integer(0), // acquired
+                        Ok(true) => Value::Integer(0),  // acquired
                         Ok(false) => Value::Integer(1), // timeout
-                        Err(_)    => Value::Integer(1),
+                        Err(_) => Value::Integer(1),
                     }
                 }
                 // SignalOp: 0x5B 0x24  SuperName
@@ -836,12 +851,12 @@ fn eval_term_arg(
                 // WaitOp: 0x5B 0x25  SuperName  TermArg(timeout)
                 // Returns Integer(0) = signaled, Integer(1) = timeout (ACPI spec).
                 0x25 => {
-                    let name    = read_name_string(buf, cur, "\\")?;
+                    let name = read_name_string(buf, cur, "\\")?;
                     let timeout = eval_term_arg(buf, cur, state)?.as_integer();
                     match crate::sync::wait(&name, timeout as u16) {
-                        Ok(true)  => Value::Integer(0), // signaled
+                        Ok(true) => Value::Integer(0),  // signaled
                         Ok(false) => Value::Integer(1), // timeout
-                        Err(_)    => Value::Integer(1),
+                        Err(_) => Value::Integer(1),
                     }
                 }
                 // ResetOp: 0x5B 0x26  SuperName
@@ -890,14 +905,19 @@ enum SuperNameRef {
 /// Read the current value of a SuperName at `*cur` and consume the
 /// SuperName specifier. Returns `(current_value, ref_for_write_back)`.
 fn read_super_name_value(
-    buf:   &[u8],
-    cur:   &mut usize,
+    buf: &[u8],
+    cur: &mut usize,
     state: &mut EvalState,
 ) -> Result<(Value, SuperNameRef), AmlError> {
-    if *cur >= buf.len() { return Err(AmlError::Truncated); }
+    if *cur >= buf.len() {
+        return Err(AmlError::Truncated);
+    }
     let b = buf[*cur];
     match b {
-        0x00 => { *cur += 1; Ok((Value::Integer(0), SuperNameRef::Null)) }
+        0x00 => {
+            *cur += 1;
+            Ok((Value::Integer(0), SuperNameRef::Null))
+        }
         0x60..=0x67 => {
             let idx = (b - 0x60) as usize;
             *cur += 1;
@@ -913,14 +933,17 @@ fn read_super_name_value(
             let val = match crate::find_node(&name) {
                 Some(node) => match node.value {
                     Some(NameValue::Integer(v)) => Value::Integer(v),
-                    Some(NameValue::String(s))  => Value::String(s),
-                    _                           => Value::Integer(0),
+                    Some(NameValue::String(s)) => Value::String(s),
+                    _ => Value::Integer(0),
                 },
                 None => Value::Integer(0),
             };
             Ok((val, SuperNameRef::Named(name)))
         }
-        _ => { *cur += 1; Ok((Value::Integer(0), SuperNameRef::Null)) }
+        _ => {
+            *cur += 1;
+            Ok((Value::Integer(0), SuperNameRef::Null))
+        }
     }
 }
 
@@ -928,9 +951,9 @@ fn read_super_name_value(
 fn write_super_name_back(name: SuperNameRef, value: Value, state: &mut EvalState) {
     match name {
         SuperNameRef::Local(i) => state.set_local(i, value),
-        SuperNameRef::Arg(i)   => state.set_arg(i, value),
+        SuperNameRef::Arg(i) => state.set_arg(i, value),
         SuperNameRef::Named(p) => update_node_value(&p, value),
-        SuperNameRef::Null     => {}
+        SuperNameRef::Null => {}
     }
 }
 
@@ -938,15 +961,19 @@ fn write_super_name_back(name: SuperNameRef, value: Value, state: &mut EvalState
 ///
 /// Target grammar: NullName (0x00) | LocalN | ArgN | NameString.
 fn write_target(
-    buf:   &[u8],
-    cur:   &mut usize,
+    buf: &[u8],
+    cur: &mut usize,
     value: Value,
     state: &mut EvalState,
 ) -> Result<(), AmlError> {
-    if *cur >= buf.len() { return Err(AmlError::Truncated); }
+    if *cur >= buf.len() {
+        return Err(AmlError::Truncated);
+    }
     let b = buf[*cur];
     match b {
-        0x00 => { *cur += 1; } // NullName — discard.
+        0x00 => {
+            *cur += 1;
+        } // NullName — discard.
         0x60..=0x67 => {
             *cur += 1;
             state.set_local((b - 0x60) as usize, value);
@@ -972,9 +999,15 @@ fn write_target(
 fn update_node_value(path: &str, value: Value) {
     let nv = match value {
         Value::Integer(v) => NameValue::Integer(v),
-        Value::String(s)  => NameValue::String(s),
-        Value::Buffer(b)  => NameValue::Unparsed { offset: 0, length: b.len() },
-        Value::Package(p) => NameValue::Unparsed { offset: 0, length: p.len() },
+        Value::String(s) => NameValue::String(s),
+        Value::Buffer(b) => NameValue::Unparsed {
+            offset: 0,
+            length: b.len(),
+        },
+        Value::Package(p) => NameValue::Unparsed {
+            offset: 0,
+            length: p.len(),
+        },
     };
     crate::update_name_value(path, nv);
 }
@@ -983,7 +1016,13 @@ fn update_node_value(path: &str, value: Value) {
 
 #[inline]
 fn next_u8(buf: &[u8], cur: &mut usize) -> Result<u8, AmlError> {
-    buf.get(*cur).copied().map(|b| { *cur += 1; b }).ok_or(AmlError::Truncated)
+    buf.get(*cur)
+        .copied()
+        .map(|b| {
+            *cur += 1;
+            b
+        })
+        .ok_or(AmlError::Truncated)
 }
 
 /// PkgLength: 1-4 bytes. Returns the total length (including the PkgLength
@@ -1007,8 +1046,10 @@ fn read_pkg_length(buf: &[u8], cur: &mut usize) -> Result<usize, AmlError> {
 /// dual/multi name prefix, or first char of a NameSeg).
 #[inline]
 fn is_name_lead(b: u8) -> bool {
-    matches!(b, ROOT_CHAR | PARENT_PREFIX | DUAL_NAME_PREFIX | MULTI_NAME_PREFIX)
-        || b.is_ascii_uppercase()
+    matches!(
+        b,
+        ROOT_CHAR | PARENT_PREFIX | DUAL_NAME_PREFIX | MULTI_NAME_PREFIX
+    ) || b.is_ascii_uppercase()
         || b == b'_'
 }
 
@@ -1049,7 +1090,9 @@ fn read_name_string(buf: &[u8], cur: &mut usize, parent: &str) -> Result<String,
     let (segs, consumed_pfx) = if pfx == DUAL_NAME_PREFIX {
         (2usize, 1usize)
     } else if pfx == MULTI_NAME_PREFIX {
-        if *cur + 1 >= buf.len() { return Err(AmlError::Truncated); }
+        if *cur + 1 >= buf.len() {
+            return Err(AmlError::Truncated);
+        }
         let count = buf[*cur + 1] as usize;
         (count, 2usize)
     } else if pfx == 0x00 {
@@ -1062,7 +1105,9 @@ fn read_name_string(buf: &[u8], cur: &mut usize, parent: &str) -> Result<String,
     *cur += consumed_pfx;
 
     for i in 0..segs {
-        if *cur + 4 > buf.len() { return Err(AmlError::Truncated); }
+        if *cur + 4 > buf.len() {
+            return Err(AmlError::Truncated);
+        }
         let bytes = &buf[*cur..*cur + 4];
         *cur += 4;
         let c0 = bytes[0];
@@ -1075,8 +1120,12 @@ fn read_name_string(buf: &[u8], cur: &mut usize, parent: &str) -> Result<String,
             s.push('.');
         }
         let mut end = 4;
-        while end > 0 && bytes[end - 1] == b'_' { end -= 1; }
-        if end == 0 { end = 1; }
+        while end > 0 && bytes[end - 1] == b'_' {
+            end -= 1;
+        }
+        if end == 0 {
+            end = 1;
+        }
         for c in &bytes[..end] {
             s.push(*c as char);
         }

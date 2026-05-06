@@ -51,8 +51,7 @@ static SLOTS: [Slot; NUM_VECTORS] = [const { Slot::new() }; NUM_VECTORS];
 /// *before* the waker fires, so handlers see a fully consistent
 /// `fire_count` snapshot. Cross-CPU IPI handlers (e.g. TLB shootdown)
 /// install themselves here.
-static HANDLERS: [AtomicUsize; NUM_VECTORS] =
-    [const { AtomicUsize::new(0) }; NUM_VECTORS];
+static HANDLERS: [AtomicUsize; NUM_VECTORS] = [const { AtomicUsize::new(0) }; NUM_VECTORS];
 
 pub type SyncHandler = fn();
 
@@ -89,7 +88,9 @@ pub fn on_irq(vector: u8) {
     }
 
     let waker = s.waker.lock().take();
-    if let Some(w) = waker { w.wake(); }
+    if let Some(w) = waker {
+        w.wake();
+    }
 }
 
 /// Snapshot of a vector's fire count. Tasks awaiting the IRQ compare

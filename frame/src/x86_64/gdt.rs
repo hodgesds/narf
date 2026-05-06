@@ -27,17 +27,17 @@ pub const KCODE_SEL: u16 = 0x08;
 /// Kernel-data selector.
 pub const KDATA_SEL: u16 = 0x10;
 /// TSS selector.
-const TSS_SEL:  u16 = 0x18;
+const TSS_SEL: u16 = 0x18;
 /// User-data selector (RPL = 3).
-pub const UDATA_SEL: u16 = 0x28 | 3;  // index 5, RPL=3 → 0x2B
+pub const UDATA_SEL: u16 = 0x28 | 3; // index 5, RPL=3 → 0x2B
 /// User-code selector (RPL = 3) — long-mode code at DPL=3.
-pub const UCODE_SEL: u16 = 0x30 | 3;  // index 6, RPL=3 → 0x33
+pub const UCODE_SEL: u16 = 0x30 | 3; // index 6, RPL=3 → 0x33
 
 /// IST slot assignments, STAGE1.md Wave 2 #7.
 pub const IST_NMI: u8 = 1;
-pub const IST_DF:  u8 = 2;
-pub const IST_MC:  u8 = 3;
-pub const IST_VC:  u8 = 4;
+pub const IST_DF: u8 = 2;
+pub const IST_MC: u8 = 3;
+pub const IST_VC: u8 = 4;
 
 /// Long-mode TSS (Intel SDM Vol 3 §7.7). Reserved / unused fields kept
 /// at the documented offsets. 104 bytes.
@@ -45,9 +45,11 @@ pub const IST_VC:  u8 = 4;
 #[derive(Copy, Clone)]
 struct Tss {
     _reserved0: u32,
-    rsp0: u64, rsp1: u64, rsp2: u64,
+    rsp0: u64,
+    rsp1: u64,
+    rsp2: u64,
     _reserved1: u64,
-    ist: [u64; 7],                       // ist[0] = IST1, ist[6] = IST7
+    ist: [u64; 7], // ist[0] = IST1, ist[6] = IST7
     _reserved2: u64,
     _reserved3: u16,
     io_map_base: u16,
@@ -87,12 +89,13 @@ const KERNEL_RSP0_BYTES: usize = 16 * 1024;
 #[repr(C, align(16))]
 struct KernelRsp0Stack([u8; KERNEL_RSP0_BYTES]);
 
-static mut KERNEL_RSP0_STACK: KernelRsp0Stack =
-    KernelRsp0Stack([0; KERNEL_RSP0_BYTES]);
+static mut KERNEL_RSP0_STACK: KernelRsp0Stack = KernelRsp0Stack([0; KERNEL_RSP0_BYTES]);
 
 static mut TSS: Tss = Tss {
     _reserved0: 0,
-    rsp0: 0, rsp1: 0, rsp2: 0,
+    rsp0: 0,
+    rsp1: 0,
+    rsp2: 0,
     _reserved1: 0,
     ist: [0; 7],
     _reserved2: 0,
@@ -110,7 +113,7 @@ static mut GDT: [u64; 7] = [0; 7];
 #[derive(Copy, Clone)]
 struct Pseudo {
     limit: u16,
-    base:  u64,
+    base: u64,
 }
 impl core::fmt::Debug for Pseudo {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -131,7 +134,8 @@ pub unsafe fn init() {
         let stacks_base = core::ptr::addr_of!(IST_STACKS) as *const u8;
         for i in 0..4 {
             let top = stacks_base.add((i + 1) * IST_STACK_BYTES) as u64;
-            core::ptr::addr_of_mut!(TSS).cast::<u8>()
+            core::ptr::addr_of_mut!(TSS)
+                .cast::<u8>()
                 .add(36 /* offset of ist[] within Tss */ + i * 8)
                 .cast::<u64>()
                 .write_unaligned(top);
@@ -160,8 +164,7 @@ pub unsafe fn init() {
     let tss_base = core::ptr::addr_of!(TSS) as u64;
     let tss_limit = (core::mem::size_of::<Tss>() - 1) as u64;
 
-    let tss_lo: u64 =
-        (tss_limit & 0xFFFF)
+    let tss_lo: u64 = (tss_limit & 0xFFFF)
         | ((tss_base & 0x00FF_FFFF) << 16)
         | (0x9 << 40)                     // type: available 64-bit TSS
         | (1 << 47)                       // P
@@ -177,19 +180,19 @@ pub unsafe fn init() {
     // SAFETY: single-threaded boot path, no prior readers.
     unsafe {
         let gdt = core::ptr::addr_of_mut!(GDT).cast::<u64>();
-        gdt.add(0).write(0);                          // null
-        gdt.add(1).write(0x00af_9a00_0000_ffff);      // kernel code  (0x08)
-        gdt.add(2).write(0x00cf_9200_0000_ffff);      // kernel data  (0x10)
-        gdt.add(3).write(tss_lo);                     // TSS lo       (0x18)
-        gdt.add(4).write(tss_hi);                     // TSS hi       (0x20)
-        gdt.add(5).write(0x00cf_f200_0000_ffff);      // user data    (0x28 | 3)
-        gdt.add(6).write(0x00af_fa00_0000_ffff);      // user code    (0x30 | 3)
+        gdt.add(0).write(0); // null
+        gdt.add(1).write(0x00af_9a00_0000_ffff); // kernel code  (0x08)
+        gdt.add(2).write(0x00cf_9200_0000_ffff); // kernel data  (0x10)
+        gdt.add(3).write(tss_lo); // TSS lo       (0x18)
+        gdt.add(4).write(tss_hi); // TSS hi       (0x20)
+        gdt.add(5).write(0x00cf_f200_0000_ffff); // user data    (0x28 | 3)
+        gdt.add(6).write(0x00af_fa00_0000_ffff); // user code    (0x30 | 3)
     }
 
     // ── LGDT ──
     let ptr = Pseudo {
         limit: (7 * 8 - 1) as u16,
-        base:  core::ptr::addr_of!(GDT) as u64,
+        base: core::ptr::addr_of!(GDT) as u64,
     };
     compiler_fence(Ordering::SeqCst);
     // SAFETY: LGDT with a valid 10-byte pseudo-descriptor.
@@ -248,7 +251,8 @@ pub unsafe fn set_kernel_rsp0(top: u64) {
     // entry. Using `write_unaligned` to match the `#[repr(packed)]`
     // Tss layout.
     unsafe {
-        core::ptr::addr_of_mut!(TSS).cast::<u8>()
+        core::ptr::addr_of_mut!(TSS)
+            .cast::<u8>()
             .add(4 /* offset of rsp0 */)
             .cast::<u64>()
             .write_unaligned(top);
@@ -275,7 +279,8 @@ pub fn kernel_rsp0() -> u64 {
     // convention + the atomic-write contract on the setter keep
     // tearing at bay.
     unsafe {
-        core::ptr::addr_of!(TSS).cast::<u8>()
+        core::ptr::addr_of!(TSS)
+            .cast::<u8>()
             .add(4)
             .cast::<u64>()
             .read_unaligned()

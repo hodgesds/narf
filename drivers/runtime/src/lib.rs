@@ -36,8 +36,10 @@
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(missing_debug_implementations)]
-#![cfg_attr(not(feature = "kernel"),
-    allow(dead_code, missing_debug_implementations))]
+#![cfg_attr(
+    not(feature = "kernel"),
+    allow(dead_code, missing_debug_implementations)
+)]
 
 #[cfg(all(feature = "kernel", feature = "userspace"))]
 compile_error!(
@@ -46,23 +48,19 @@ compile_error!(
 );
 
 #[cfg(not(any(feature = "kernel", feature = "userspace")))]
-compile_error!(
-    "narf-driver-runtime: enable one of `kernel` (default) or `userspace`."
-);
+compile_error!("narf-driver-runtime: enable one of `kernel` (default) or `userspace`.");
 
 // ── Kernel runtime ─────────────────────────────────────────────────
 
 #[cfg(feature = "kernel")]
 mod kernel_rt {
-    pub use narf_bus::{
-        map_bar, BusDevice, BusDeviceCap, MmioRegion,
-    };
     pub use narf_bus::pci;
-    pub use narf_io::{alloc_coherent, DmaBuffer};
+    pub use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
+    pub use narf_capabilities::{Cap, Write};
     pub use narf_interrupts::wait_for_irq;
+    pub use narf_io::{alloc_coherent, DmaBuffer};
     pub use narf_lib::id::DomainId;
     pub use narf_lib::sync::IrqSafeSpinLock as Lock;
-    pub use narf_capabilities::{Cap, Write};
 }
 
 #[cfg(feature = "kernel")]
@@ -87,7 +85,7 @@ mod user_rt {
     /// into the process AS via an IOMMU-backed cap window.
     #[derive(Debug, Clone, Copy)]
     pub struct MmioRegion {
-        _va:  *mut u8,
+        _va: *mut u8,
         _len: usize,
     }
     // SAFETY: the userspace impl will own the cap exclusively while
@@ -111,36 +109,32 @@ mod user_rt {
         /// # Safety
         /// `offset + 1 <= len`.
         pub unsafe fn write8(&self, offset: u64, value: u8) {
-            unsafe { core::ptr::write_volatile(self._va.add(offset as usize), value); }
+            unsafe {
+                core::ptr::write_volatile(self._va.add(offset as usize), value);
+            }
         }
         /// # Safety
         /// `offset + 2 <= len`, naturally aligned.
         pub unsafe fn read16(&self, offset: u64) -> u16 {
-            unsafe {
-                core::ptr::read_volatile(self._va.add(offset as usize) as *const u16)
-            }
+            unsafe { core::ptr::read_volatile(self._va.add(offset as usize) as *const u16) }
         }
         /// # Safety
         /// `offset + 2 <= len`, naturally aligned.
         pub unsafe fn write16(&self, offset: u64, value: u16) {
             unsafe {
-                core::ptr::write_volatile(
-                    self._va.add(offset as usize) as *mut u16, value);
+                core::ptr::write_volatile(self._va.add(offset as usize) as *mut u16, value);
             }
         }
         /// # Safety
         /// `offset + 4 <= len`, naturally aligned.
         pub unsafe fn read32(&self, offset: u64) -> u32 {
-            unsafe {
-                core::ptr::read_volatile(self._va.add(offset as usize) as *const u32)
-            }
+            unsafe { core::ptr::read_volatile(self._va.add(offset as usize) as *const u32) }
         }
         /// # Safety
         /// `offset + 4 <= len`, naturally aligned.
         pub unsafe fn write32(&self, offset: u64, value: u32) {
             unsafe {
-                core::ptr::write_volatile(
-                    self._va.add(offset as usize) as *mut u32, value);
+                core::ptr::write_volatile(self._va.add(offset as usize) as *mut u32, value);
             }
         }
     }
@@ -150,9 +144,9 @@ mod user_rt {
     /// IOMMU-mapped on the device side).
     #[derive(Debug)]
     pub struct DmaBuffer {
-        _va:   *mut u8,
+        _va: *mut u8,
         _phys: u64,
-        _len:  usize,
+        _len: usize,
     }
     // SAFETY: same single-owner discipline as MmioRegion.
     unsafe impl Send for DmaBuffer {}
@@ -162,51 +156,63 @@ mod user_rt {
     #[derive(Debug, Clone, Copy)]
     pub struct PhysAddr(pub u64);
     impl PhysAddr {
-        pub fn raw(self) -> u64 { self.0 }
+        pub fn raw(self) -> u64 {
+            self.0
+        }
     }
 
     impl DmaBuffer {
-        pub fn phys_addr(&self) -> PhysAddr { PhysAddr(self._phys) }
-        pub fn len(&self) -> usize { self._len }
-        pub fn is_empty(&self) -> bool { self._len == 0 }
+        pub fn phys_addr(&self) -> PhysAddr {
+            PhysAddr(self._phys)
+        }
+        pub fn len(&self) -> usize {
+            self._len
+        }
+        pub fn is_empty(&self) -> bool {
+            self._len == 0
+        }
     }
 
     /// Errors from `alloc_coherent`. Userspace impl returns these
     /// when the kernel cap-mint syscall fails.
     #[derive(Debug)]
-    pub enum DmaError { OutOfMemory, NoCap }
+    pub enum DmaError {
+        OutOfMemory,
+        NoCap,
+    }
 
     /// Allocate a DMA-coherent buffer. Stub — the userspace impl
     /// crates a `narf_user_driver_runtime::dma_alloc` syscall.
-    pub fn alloc_coherent(_size: usize, _domain: DomainId)
-        -> Result<DmaBuffer, DmaError>
-    {
+    pub fn alloc_coherent(_size: usize, _domain: DomainId) -> Result<DmaBuffer, DmaError> {
         // TODO: cap-mediated syscall in narf-user-driver-runtime.
         Err(DmaError::NoCap)
     }
 
     /// Cap-gated BAR mapping. Stub.
-    pub fn map_bar(_device: &BusDevice, _idx: u8)
-        -> Result<MmioRegion, MapBarError>
-    {
+    pub fn map_bar(_device: &BusDevice, _idx: u8) -> Result<MmioRegion, MapBarError> {
         Err(MapBarError::NoCap)
     }
 
     #[derive(Debug)]
-    pub enum MapBarError { NoCap, OutOfRange }
+    pub enum MapBarError {
+        NoCap,
+        OutOfRange,
+    }
 
     /// PCIe cfg-space writes — cap-gated. Stub for userspace; the
     /// kernel runtime forwards to `narf_bus::pci::*` directly.
     pub mod pci {
-        use super::BusDeviceCap;
         use super::super::{Cap, Write};
+        use super::BusDeviceCap;
         pub mod cmd {
-            pub const MEM_SPACE:    u16 = 1 << 1;
-            pub const BUS_MASTER:   u16 = 1 << 2;
+            pub const MEM_SPACE: u16 = 1 << 1;
+            pub const BUS_MASTER: u16 = 1 << 2;
             pub const INTX_DISABLE: u16 = 1 << 10;
         }
         #[derive(Debug)]
-        pub enum CfgError { NoCap }
+        pub enum CfgError {
+            NoCap,
+        }
         pub fn set_command(
             _cap: &Cap<BusDeviceCap, Write>,
             _device: &super::BusDevice,
@@ -220,17 +226,22 @@ mod user_rt {
     /// an IPC endpoint cap; the kernel signals it on IRQ delivery.
     /// Returned future resolves on the next signal.
     #[derive(Debug)]
-    pub struct IrqWaiter { _vec: u8 }
+    pub struct IrqWaiter {
+        _vec: u8,
+    }
     impl core::future::Future for IrqWaiter {
         type Output = ();
-        fn poll(self: core::pin::Pin<&mut Self>, _cx: &mut core::task::Context<'_>)
-            -> core::task::Poll<()>
-        {
+        fn poll(
+            self: core::pin::Pin<&mut Self>,
+            _cx: &mut core::task::Context<'_>,
+        ) -> core::task::Poll<()> {
             // TODO: poll the IPC endpoint via the user-side runtime.
             core::task::Poll::Pending
         }
     }
-    pub fn wait_for_irq(vec: u8) -> IrqWaiter { IrqWaiter { _vec: vec } }
+    pub fn wait_for_irq(vec: u8) -> IrqWaiter {
+        IrqWaiter { _vec: vec }
+    }
 
     /// Domain id — same shape as the kernel-side type, just
     /// re-exported here so driver source can name it without a
@@ -239,7 +250,9 @@ mod user_rt {
     pub struct DomainId(u8);
     impl DomainId {
         pub const DRIVER_0: DomainId = DomainId(8);
-        pub fn raw(self) -> u8 { self.0 }
+        pub fn raw(self) -> u8 {
+            self.0
+        }
     }
 
     /// Userspace doesn't run with IRQs disabled — a plain spin-
@@ -262,7 +275,8 @@ mod user_rt {
         }
         pub fn lock(&self) -> LockGuard<'_, T> {
             use core::sync::atomic::Ordering;
-            while self._busy
+            while self
+                ._busy
                 .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
                 .is_err()
             {
@@ -283,10 +297,14 @@ mod user_rt {
     }
     impl<'a, T> core::ops::Deref for LockGuard<'a, T> {
         type Target = T;
-        fn deref(&self) -> &T { self._data }
+        fn deref(&self) -> &T {
+            self._data
+        }
     }
     impl<'a, T> core::ops::DerefMut for LockGuard<'a, T> {
-        fn deref_mut(&mut self) -> &mut T { self._data }
+        fn deref_mut(&mut self) -> &mut T {
+            self._data
+        }
     }
     impl<'a, T> Drop for LockGuard<'a, T> {
         fn drop(&mut self) {
@@ -300,7 +318,10 @@ mod user_rt {
     /// cap handle here (kernel-issued reference into the user
     /// process's cap table).
     #[derive(Debug, Clone, Copy)]
-    pub struct Cap<T, R> { _t: PhantomData<T>, _r: PhantomData<R> }
+    pub struct Cap<T, R> {
+        _t: PhantomData<T>,
+        _r: PhantomData<R>,
+    }
     #[derive(Debug, Clone, Copy)]
     pub struct Write;
     #[derive(Debug, Clone, Copy)]
@@ -313,7 +334,7 @@ mod user_rt {
     pub struct BusDeviceId {
         pub vendor: u16,
         pub device: u16,
-        pub class:  u32,
+        pub class: u32,
     }
 }
 

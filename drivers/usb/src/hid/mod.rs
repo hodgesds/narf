@@ -36,8 +36,8 @@
 //!      keyboard can emit — letters, digits, modifiers, F1-F12,
 //!      navigation cluster, full numpad, GUI / Application keys.
 
-use crate::xhci::{self, Xhci, EndpointConfig, EndpointKind};
-use narf_input::{InputEvent, KeyCode, KeyEvent, Modifiers, push_global};
+use crate::xhci::{self, EndpointConfig, EndpointKind, Xhci};
+use narf_input::{push_global, InputEvent, KeyCode, KeyEvent, Modifiers};
 use narf_lib::sync::IrqSafeSpinLock;
 
 extern crate alloc;
@@ -49,25 +49,25 @@ pub use usage::usage_to_keycode;
 /// USB Interface Class for HID.
 pub const HID_INTERFACE_CLASS: u8 = 0x03;
 /// HID Subclass: 1 = Boot Interface (keyboard / mouse).
-pub const HID_SUBCLASS_BOOT:   u8 = 0x01;
+pub const HID_SUBCLASS_BOOT: u8 = 0x01;
 /// HID Boot Protocol: 1 = Keyboard, 2 = Mouse (§4.3).
-pub const HID_PROTOCOL_KBD:    u8 = 0x01;
+pub const HID_PROTOCOL_KBD: u8 = 0x01;
 
 // Class-specific request codes from §7.2.
 const HID_REQ_SET_PROTOCOL: u8 = 0x0B;
 /// Boot protocol value (vs. 1 = Report Protocol).
-const HID_BOOT_PROTOCOL:    u16 = 0;
+const HID_BOOT_PROTOCOL: u16 = 0;
 
 /// Modifier mask bits in byte 0 of the boot keyboard report.
 pub mod kbd_mod {
-    pub const LCTRL:  u8 = 1 << 0;
+    pub const LCTRL: u8 = 1 << 0;
     pub const LSHIFT: u8 = 1 << 1;
-    pub const LALT:   u8 = 1 << 2;
-    pub const LGUI:   u8 = 1 << 3;
-    pub const RCTRL:  u8 = 1 << 4;
+    pub const LALT: u8 = 1 << 2;
+    pub const LGUI: u8 = 1 << 3;
+    pub const RCTRL: u8 = 1 << 4;
     pub const RSHIFT: u8 = 1 << 5;
-    pub const RALT:   u8 = 1 << 6;
-    pub const RGUI:   u8 = 1 << 7;
+    pub const RALT: u8 = 1 << 6;
+    pub const RGUI: u8 = 1 << 7;
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -83,14 +83,16 @@ pub enum HidError {
 }
 
 impl From<xhci::XhciError> for HidError {
-    fn from(e: xhci::XhciError) -> Self { HidError::Xhci(e) }
+    fn from(e: xhci::XhciError) -> Self {
+        HidError::Xhci(e)
+    }
 }
 
 /// Decoded boot-keyboard report (§B.1).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct KbdReport {
     pub modifiers: u8,
-    pub keys:      [u8; 6],
+    pub keys: [u8; 6],
 }
 
 impl KbdReport {
@@ -113,9 +115,9 @@ impl KbdReport {
 /// `pump_once` (decoded → global input ring).
 #[derive(Debug)]
 pub struct BootKeyboard {
-    pub slot_id:    u8,
+    pub slot_id: u8,
     pub interrupt_in_ep: u8, // DCI of the interrupt-IN endpoint
-    pub interface_num:   u8,
+    pub interface_num: u8,
     /// Last report seen, used for press/release diffing in
     /// `pump_once`. Initialised to the all-zero report so the
     /// first non-empty poll fires presses for every key in it.
@@ -126,16 +128,16 @@ pub struct BootKeyboard {
 /// Boot Keyboard interface and its single interrupt-IN endpoint.
 /// Returns `(interface_num, ep_config)` for the caller to feed into
 /// `xhci::configure_endpoints`.
-pub fn find_boot_keyboard(
-    cfg: &[u8],
-) -> Result<(u8, EndpointConfig), HidError> {
+pub fn find_boot_keyboard(cfg: &[u8]) -> Result<(u8, EndpointConfig), HidError> {
     let mut i = 0usize;
     let mut in_match = false;
     let mut iface_num: u8 = 0;
     let mut int_in: Option<EndpointConfig> = None;
     while i + 2 <= cfg.len() {
         let len = cfg[i] as usize;
-        if len < 2 || i + len > cfg.len() { break; }
+        if len < 2 || i + len > cfg.len() {
+            break;
+        }
         let dtype = cfg[i + 1];
         match dtype {
             // Interface Descriptor (§9.6.5).
@@ -144,11 +146,12 @@ pub fn find_boot_keyboard(
             //   +6 bInterfaceSubClass
             //   +7 bInterfaceProtocol
             4 if len >= 9 => {
-                in_match =
-                    cfg[i + 5] == HID_INTERFACE_CLASS
+                in_match = cfg[i + 5] == HID_INTERFACE_CLASS
                     && cfg[i + 6] == HID_SUBCLASS_BOOT
                     && cfg[i + 7] == HID_PROTOCOL_KBD;
-                if in_match { iface_num = cfg[i + 2]; }
+                if in_match {
+                    iface_num = cfg[i + 2];
+                }
             }
             // Endpoint Descriptor (§9.6.6).
             //   +2 bEndpointAddress (bit 7 = IN)
@@ -156,10 +159,10 @@ pub fn find_boot_keyboard(
             //   +4..=5 wMaxPacketSize
             5 if len >= 7 && in_match && int_in.is_none() => {
                 let ep_addr = cfg[i + 2];
-                let attr    = cfg[i + 3];
-                let mps     = u16::from_le_bytes([cfg[i + 4], cfg[i + 5]]);
-                let xfer_t  = attr & 0x03;
-                let is_in   = ep_addr & 0x80 != 0;
+                let attr = cfg[i + 3];
+                let mps = u16::from_le_bytes([cfg[i + 4], cfg[i + 5]]);
+                let xfer_t = attr & 0x03;
+                let is_in = ep_addr & 0x80 != 0;
                 if xfer_t == 3 && is_in {
                     int_in = Some(EndpointConfig {
                         ep_addr,
@@ -174,7 +177,7 @@ pub fn find_boot_keyboard(
     }
     match int_in {
         Some(ep) => Ok((iface_num, ep)),
-        None     => Err(HidError::NoInterruptIn),
+        None => Err(HidError::NoInterruptIn),
     }
 }
 
@@ -183,9 +186,9 @@ impl BootKeyboard {
     /// xHCI slot. Issues `Set Protocol(Boot)` so subsequent
     /// `read_report` calls return the fixed 8-byte format.
     pub fn attach(
-        xhci_dev:        &Xhci,
-        slot_id:         u8,
-        interface_num:   u8,
+        xhci_dev: &Xhci,
+        slot_id: u8,
+        interface_num: u8,
         interrupt_in_ep: u8,
     ) -> Result<Self, HidError> {
         // Set Protocol class request (§7.2.6):
@@ -195,16 +198,20 @@ impl BootKeyboard {
         //   wIndex: interface number
         //   wLength: 0
         let mut nothing = [0u8; 0];
-        xhci_dev.control_in(
-            slot_id,
-            0x21,
-            HID_REQ_SET_PROTOCOL,
-            HID_BOOT_PROTOCOL,
-            interface_num as u16,
-            &mut nothing,
-        ).map_err(|_| HidError::SetProtocolFailed)?;
+        xhci_dev
+            .control_in(
+                slot_id,
+                0x21,
+                HID_REQ_SET_PROTOCOL,
+                HID_BOOT_PROTOCOL,
+                interface_num as u16,
+                &mut nothing,
+            )
+            .map_err(|_| HidError::SetProtocolFailed)?;
         Ok(BootKeyboard {
-            slot_id, interrupt_in_ep, interface_num,
+            slot_id,
+            interrupt_in_ep,
+            interface_num,
             last_report: KbdReport::default(),
         })
     }
@@ -215,8 +222,7 @@ impl BootKeyboard {
     /// state change.
     pub fn read_report(&self, xhci_dev: &Xhci) -> Result<KbdReport, HidError> {
         let mut buf = [0u8; 8];
-        let n = xhci_dev.bulk_in(
-            self.slot_id, self.interrupt_in_ep, &mut buf)?;
+        let n = xhci_dev.bulk_in(self.slot_id, self.interrupt_in_ep, &mut buf)?;
         if n < 8 {
             // Short report — pad zeroes (the device sends 8 even
             // when no keys are pressed; a short one means a bus
@@ -270,10 +276,18 @@ impl BootKeyboard {
 /// own Usage IDs); only the eight Ctrl/Shift/Alt/GUI live there.
 pub fn modifier_byte_to_modifiers(byte: u8) -> Modifiers {
     let mut m = Modifiers::from_bits_truncate(0);
-    if byte & (kbd_mod::LCTRL  | kbd_mod::RCTRL)  != 0 { m.insert(Modifiers::CTRL); }
-    if byte & (kbd_mod::LSHIFT | kbd_mod::RSHIFT) != 0 { m.insert(Modifiers::SHIFT); }
-    if byte & (kbd_mod::LALT   | kbd_mod::RALT)   != 0 { m.insert(Modifiers::ALT); }
-    if byte & (kbd_mod::LGUI   | kbd_mod::RGUI)   != 0 { m.insert(Modifiers::META); }
+    if byte & (kbd_mod::LCTRL | kbd_mod::RCTRL) != 0 {
+        m.insert(Modifiers::CTRL);
+    }
+    if byte & (kbd_mod::LSHIFT | kbd_mod::RSHIFT) != 0 {
+        m.insert(Modifiers::SHIFT);
+    }
+    if byte & (kbd_mod::LALT | kbd_mod::RALT) != 0 {
+        m.insert(Modifiers::ALT);
+    }
+    if byte & (kbd_mod::LGUI | kbd_mod::RGUI) != 0 {
+        m.insert(Modifiers::META);
+    }
     m
 }
 
@@ -287,21 +301,23 @@ fn translate_diff(prev: &KbdReport, cur: &KbdReport) -> usize {
     // Modifier-byte transitions: bit-by-bit. Each bit corresponds
     // to a dedicated KeyCode (LCtrl / LShift / LAlt / LGui / ...).
     let mod_pairs: &[(u8, KeyCode)] = &[
-        (kbd_mod::LCTRL,  KeyCode::LeftCtrl),
+        (kbd_mod::LCTRL, KeyCode::LeftCtrl),
         (kbd_mod::LSHIFT, KeyCode::LeftShift),
-        (kbd_mod::LALT,   KeyCode::LeftAlt),
-        (kbd_mod::LGUI,   KeyCode::LeftMeta),
-        (kbd_mod::RCTRL,  KeyCode::RightCtrl),
+        (kbd_mod::LALT, KeyCode::LeftAlt),
+        (kbd_mod::LGUI, KeyCode::LeftMeta),
+        (kbd_mod::RCTRL, KeyCode::RightCtrl),
         (kbd_mod::RSHIFT, KeyCode::RightShift),
-        (kbd_mod::RALT,   KeyCode::RightAlt),
-        (kbd_mod::RGUI,   KeyCode::RightMeta),
+        (kbd_mod::RALT, KeyCode::RightAlt),
+        (kbd_mod::RGUI, KeyCode::RightMeta),
     ];
     for &(bit, code) in mod_pairs {
         let was = prev.modifiers & bit != 0;
         let now = cur.modifiers & bit != 0;
         if was != now {
             push_global(InputEvent::Key(KeyEvent {
-                code, pressed: now, modifiers: cur_mods,
+                code,
+                pressed: now,
+                modifiers: cur_mods,
             }));
             emitted += 1;
         }
@@ -317,22 +333,30 @@ fn translate_diff(prev: &KbdReport, cur: &KbdReport) -> usize {
     if !is_rollover {
         // Releases: keys in prev that aren't in cur.
         for &k in &prev.keys {
-            if k == 0 || k == 0x01 { continue; }
+            if k == 0 || k == 0x01 {
+                continue;
+            }
             if !cur.keys.iter().any(|&c| c == k) {
                 let code = usage_to_keycode(k);
                 push_global(InputEvent::Key(KeyEvent {
-                    code, pressed: false, modifiers: cur_mods,
+                    code,
+                    pressed: false,
+                    modifiers: cur_mods,
                 }));
                 emitted += 1;
             }
         }
         // Presses: keys in cur that weren't in prev.
         for &k in &cur.keys {
-            if k == 0 || k == 0x01 { continue; }
+            if k == 0 || k == 0x01 {
+                continue;
+            }
             if !prev.keys.iter().any(|&p| p == k) {
                 let code = usage_to_keycode(k);
                 push_global(InputEvent::Key(KeyEvent {
-                    code, pressed: true, modifiers: cur_mods,
+                    code,
+                    pressed: true,
+                    modifiers: cur_mods,
                 }));
                 emitted += 1;
             }
@@ -346,8 +370,7 @@ fn translate_diff(prev: &KbdReport, cur: &KbdReport) -> usize {
 
 /// System-wide registry of attached HID boot keyboards. Populated
 /// by `enumerate_and_attach_keyboards`; consumed by `pump_all`.
-static KEYBOARDS: IrqSafeSpinLock<Vec<BootKeyboard>> =
-    IrqSafeSpinLock::new(Vec::new());
+static KEYBOARDS: IrqSafeSpinLock<Vec<BootKeyboard>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Walk every connected port on the supplied controller and try to
 /// bring up a HID Boot Keyboard on each one. The flow per port:
@@ -370,7 +393,9 @@ static KEYBOARDS: IrqSafeSpinLock<Vec<BootKeyboard>> =
 pub fn enumerate_and_attach_keyboards(xhci_dev: &Xhci) -> usize {
     let mut attached = 0usize;
     for (port, _portsc) in xhci_dev.connected_ports() {
-        if try_attach_port(xhci_dev, port).is_ok() { attached += 1; }
+        if try_attach_port(xhci_dev, port).is_ok() {
+            attached += 1;
+        }
     }
     attached
 }
@@ -379,24 +404,35 @@ fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
     xhci_dev.port_reset(port).map_err(HidError::Xhci)?;
     let speed = xhci_dev.port_speed(port).ok_or(HidError::NoInterruptIn)?;
     let slot_id = xhci_dev.enable_slot().map_err(HidError::Xhci)?;
-    xhci_dev.address_device(slot_id, port, speed).map_err(HidError::Xhci)?;
+    xhci_dev
+        .address_device(slot_id, port, speed)
+        .map_err(HidError::Xhci)?;
 
     // Read the 9-byte cfg header to discover wTotalLength.
     let mut head = [0u8; 9];
-    let n = xhci_dev.get_config_descriptor(slot_id, 0, &mut head)
+    let n = xhci_dev
+        .get_config_descriptor(slot_id, 0, &mut head)
         .map_err(HidError::Xhci)?;
-    if n < 9 { return Err(HidError::NotBootKeyboard); }
+    if n < 9 {
+        return Err(HidError::NotBootKeyboard);
+    }
     let total = u16::from_le_bytes([head[2], head[3]]) as usize;
-    if total < 9 || total > 4096 { return Err(HidError::NotBootKeyboard); }
+    if total < 9 || total > 4096 {
+        return Err(HidError::NotBootKeyboard);
+    }
 
     // Pull the full tree.
     let mut full = alloc::vec![0u8; total];
-    let n2 = xhci_dev.get_config_descriptor(slot_id, 0, &mut full)
+    let n2 = xhci_dev
+        .get_config_descriptor(slot_id, 0, &mut full)
         .map_err(HidError::Xhci)?;
-    if n2 < total { full.truncate(n2); }
+    if n2 < total {
+        full.truncate(n2);
+    }
 
     let (iface, ep) = find_boot_keyboard(&full)?;
-    xhci_dev.configure_endpoints(slot_id, &[ep])
+    xhci_dev
+        .configure_endpoints(slot_id, &[ep])
         .map_err(HidError::Xhci)?;
 
     let interrupt_in_ep = ep.ep_addr & 0x0F; // DCI computed from this on RX
@@ -407,7 +443,9 @@ fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
 }
 
 /// Number of keyboards currently bound.
-pub fn attached_keyboard_count() -> usize { KEYBOARDS.lock().len() }
+pub fn attached_keyboard_count() -> usize {
+    KEYBOARDS.lock().len()
+}
 
 /// Drain one report from each attached keyboard, translating to
 /// `KeyEvent`s on the global input ring. Returns total events
@@ -421,10 +459,14 @@ pub fn pump_all(xhci_dev: &Xhci) -> usize {
     let mut g = KEYBOARDS.lock();
     let mut total = 0usize;
     for kbd in g.iter_mut() {
-        if let Ok(n) = kbd.pump_once(xhci_dev) { total += n; }
+        if let Ok(n) = kbd.pump_once(xhci_dev) {
+            total += n;
+        }
     }
     total
 }
 
 #[doc(hidden)]
-pub fn __reset_keyboards_for_test() { KEYBOARDS.lock().clear(); }
+pub fn __reset_keyboards_for_test() {
+    KEYBOARDS.lock().clear();
+}

@@ -37,7 +37,7 @@
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
-use narf_driver_runtime::{DmaBuffer, MmioRegion, alloc_coherent, DomainId};
+use narf_driver_runtime::{alloc_coherent, DmaBuffer, DomainId, MmioRegion};
 
 /// Doorbell BAR (BAR2 on Vega/Navi). Each per-queue doorbell is
 /// 8 bytes wide; queue index N lives at offset `N * 8`.
@@ -55,14 +55,14 @@ const RING_BYTES: usize = RING_SIZE_DW * 4;
 #[derive(Debug)]
 pub struct Ring {
     /// DMA-coherent backing of the ring buffer.
-    backing:        DmaBuffer,
+    backing: DmaBuffer,
     /// Host-side write pointer in dwords. Advances as packets
     /// are appended; wraps at `RING_SIZE_DW`.
-    wptr_dw:        usize,
+    wptr_dw: usize,
     /// Per-queue doorbell offset within BAR2.
-    doorbell_off:   u64,
+    doorbell_off: u64,
     /// Queue index for diagnostics.
-    pub queue_idx:  u16,
+    pub queue_idx: u16,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -79,8 +79,8 @@ impl Ring {
     /// Allocate a fresh ring + compute its doorbell offset for
     /// the given queue index.
     pub fn new(queue_idx: u16) -> Result<Self, RingError> {
-        let backing = alloc_coherent(RING_BYTES, DomainId::DRIVER_0)
-            .map_err(|_| RingError::NoMemory)?;
+        let backing =
+            alloc_coherent(RING_BYTES, DomainId::DRIVER_0).map_err(|_| RingError::NoMemory)?;
         // Zero the ring so an unprogrammed engine reads NOPs
         // (PM4 TYPE0 with count 0 = a benign 1-dword no-op).
         let phys = backing.phys_addr().raw();
@@ -101,13 +101,19 @@ impl Ring {
     /// Phys address of the ring's first dword. Programmed into
     /// the GPU's CP_RB_BASE / SDMA_GFX_RB_BASE registers at GFX
     /// bring-up.
-    pub fn phys_addr(&self) -> u64 { self.backing.phys_addr().raw() }
+    pub fn phys_addr(&self) -> u64 {
+        self.backing.phys_addr().raw()
+    }
 
     /// Current host write-pointer (in dwords).
-    pub fn wptr(&self) -> usize { self.wptr_dw }
+    pub fn wptr(&self) -> usize {
+        self.wptr_dw
+    }
 
     /// Doorbell BAR2 byte offset for this queue.
-    pub fn doorbell_offset(&self) -> u64 { self.doorbell_off }
+    pub fn doorbell_offset(&self) -> u64 {
+        self.doorbell_off
+    }
 
     /// Append `packet` (already-formatted dwords) to the ring.
     /// Returns the new wptr in dwords.
@@ -129,7 +135,9 @@ impl Ring {
         // SAFETY: identity-mapped DMA page; bounds checked above.
         for (i, &w) in packet.iter().enumerate() {
             let off = ((self.wptr_dw + i) * 4) as u64;
-            unsafe { core::ptr::write_volatile((phys + off) as *mut u32, w); }
+            unsafe {
+                core::ptr::write_volatile((phys + off) as *mut u32, w);
+            }
         }
         compiler_fence(Ordering::SeqCst);
         self.wptr_dw += packet.len();

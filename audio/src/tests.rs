@@ -3,18 +3,18 @@
 //! Round-trip tests that require concrete hardware backends (virtio-snd-pci)
 //! live here or in the driver crates.
 
-use narf_kernel_test::{kernel_test_in, TestResult};
 use crate::{
-    bootstrap_writer, select_active_playback, AudioFormat, AudioWriter,
-    AudioWriteError, ChannelLayout, SampleFormat,
+    bootstrap_writer, select_active_playback, AudioFormat, AudioWriteError, AudioWriter,
+    ChannelLayout, SampleFormat,
 };
+use narf_kernel_test::{kernel_test_in, TestResult};
 
 fn smoke_audio_picker_no_backend_when_unprobed() -> TestResult {
     // Stage-4 audio init occurs at Subsys stage. If we reset the
     // match table and then pick, we should get None.
+    use crate::hda;
     use narf_bus::driver_match::__reset_for_test as bus_reset;
     use narf_drivers_virtio::snd_pci;
-    use crate::hda;
 
     snd_pci::__reset_for_test();
     hda::__reset_for_test();
@@ -36,18 +36,21 @@ kernel_test_in!("audio", smoke_audio_picker_no_backend_when_unprobed);
 #[cfg(target_arch = "x86_64")]
 fn smoke_virtio_snd_writer_submit_round_trip() -> TestResult {
     // End-to-end PCM submit through AudioWriter → snd_pci.
-    use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
     use narf_bus::driver_match::__reset_for_test as bus_reset;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
     use narf_drivers_virtio::snd_pci;
 
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
-    let has = devs.iter().any(|d|
+    let has = devs.iter().any(|d| {
         matches!(&d.kind, BusKind::Pcie { .. })
-        && d.id.vendor == snd_pci::VIRTIO_SND_PCI_VENDOR
-        && d.id.device == snd_pci::VIRTIO_SND_PCI_DEVICE);
-    if !has { return TestResult::Skip("no virtio-snd-pci"); }
+            && d.id.vendor == snd_pci::VIRTIO_SND_PCI_VENDOR
+            && d.id.device == snd_pci::VIRTIO_SND_PCI_DEVICE
+    });
+    if !has {
+        return TestResult::Skip("no virtio-snd-pci");
+    }
 
     snd_pci::__reset_for_test();
     bus_reset();
@@ -59,13 +62,13 @@ fn smoke_virtio_snd_writer_submit_round_trip() -> TestResult {
 
     let cap = bootstrap_writer();
     let writer = match AudioWriter::open(cap, AudioFormat::default_playback()) {
-        Ok(w)  => w,
+        Ok(w) => w,
         Err(_) => return TestResult::Fail("AudioWriter::open"),
     };
 
     let silence = [0u8; 1024];
     let frames = match writer.submit(&silence) {
-        Ok(f)  => f,
+        Ok(f) => f,
         Err(_) => return TestResult::Fail("submit returned error"),
     };
     if frames != 256 {
@@ -74,26 +77,32 @@ fn smoke_virtio_snd_writer_submit_round_trip() -> TestResult {
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("audio/virtio-snd", smoke_virtio_snd_writer_submit_round_trip);
+kernel_test_in!(
+    "audio/virtio-snd",
+    smoke_virtio_snd_writer_submit_round_trip
+);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_audio_submit_shmem_zero_copy() -> TestResult {
     // End-to-end zero-copy submit: allocate a Shmem region, fill
     // it with silence via the kernel-side phys_at, and submit
     // through AudioWriter::submit_shmem.
-    use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
     use narf_bus::driver_match::__reset_for_test as bus_reset;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
     use narf_drivers_virtio::snd_pci;
     use narf_shmem::{__reset_for_test as shmem_reset, create as shmem_create};
 
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
-    let has = devs.iter().any(|d|
+    let has = devs.iter().any(|d| {
         matches!(&d.kind, BusKind::Pcie { .. })
-        && d.id.vendor == snd_pci::VIRTIO_SND_PCI_VENDOR
-        && d.id.device == snd_pci::VIRTIO_SND_PCI_DEVICE);
-    if !has { return TestResult::Skip("no virtio-snd-pci"); }
+            && d.id.vendor == snd_pci::VIRTIO_SND_PCI_VENDOR
+            && d.id.device == snd_pci::VIRTIO_SND_PCI_DEVICE
+    });
+    if !has {
+        return TestResult::Skip("no virtio-snd-pci");
+    }
 
     snd_pci::__reset_for_test();
     shmem_reset();
@@ -127,12 +136,12 @@ kernel_test_in!("audio", smoke_audio_submit_shmem_zero_copy);
 fn smoke_audio_format_unsupported_rate_rejects() -> TestResult {
     let s = match select_active_playback() {
         Some(s) => s,
-        None    => return TestResult::Skip("no audio backend probed"),
+        None => return TestResult::Skip("no audio backend probed"),
     };
     let bad = AudioFormat {
         sample_rate_hz: 96_000,
-        format:         SampleFormat::S16Le,
-        channels:       ChannelLayout::Stereo,
+        format: SampleFormat::S16Le,
+        channels: ChannelLayout::Stereo,
     };
     if s.supports(bad) {
         return TestResult::Fail("96 kHz advertised but unsupported");

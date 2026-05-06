@@ -94,7 +94,7 @@ pub const fn usage_to_keycode(usage: u8) -> KeyCode {
         0x44 => KeyCode::F11,
         0x45 => KeyCode::F12,
 
-        0x46 => KeyCode::SysRq,       // PrintScreen
+        0x46 => KeyCode::SysRq, // PrintScreen
         0x47 => KeyCode::ScrollLock,
         0x48 => KeyCode::Pause,
         0x49 => KeyCode::Insert,
@@ -128,7 +128,7 @@ pub const fn usage_to_keycode(usage: u8) -> KeyCode {
 
         // 0x64 (non-US \) maps to Backslash on US layouts.
         0x64 => KeyCode::Backslash,
-        0x65 => KeyCode::Menu,        // Application / Compose
+        0x65 => KeyCode::Menu, // Application / Compose
 
         // 0xE0..=0xE7 are the modifier-byte equivalents — the boot
         // report already exposes them as the modifier mask, so no

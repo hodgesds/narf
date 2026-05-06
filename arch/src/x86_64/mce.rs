@@ -36,83 +36,83 @@
 use crate::x86_64::cpuid::cpuid;
 use crate::x86_64::msr::{rdmsr, wrmsr};
 
-pub const MSR_MCG_CAP:    u32 = 0x179;
+pub const MSR_MCG_CAP: u32 = 0x179;
 pub const MSR_MCG_STATUS: u32 = 0x17A;
 
-const MSR_MCi_CTL_BASE:    u32 = 0x400;
+const MSR_MCi_CTL_BASE: u32 = 0x400;
 const MSR_MCi_STATUS_BASE: u32 = 0x401;
-const MSR_MCi_ADDR_BASE:   u32 = 0x402;
-const MSR_MCi_MISC_BASE:   u32 = 0x403;
+const MSR_MCi_ADDR_BASE: u32 = 0x402;
+const MSR_MCi_MISC_BASE: u32 = 0x403;
 
 /// Decoded `MCG_CAP`. `count` is the number of MC banks; the
 /// other bits expose threshold / control hints.
 #[derive(Copy, Clone, Debug)]
 pub struct McgCap {
-    pub count:           u8,
-    pub mcg_ctl_p:       bool,
-    pub mcg_ext_p:       bool,
-    pub mcg_cmci_p:      bool,
-    pub mcg_tes_p:       bool,
-    pub mcg_ext_count:   u8,
-    pub mcg_lmce_p:      bool,
+    pub count: u8,
+    pub mcg_ctl_p: bool,
+    pub mcg_ext_p: bool,
+    pub mcg_cmci_p: bool,
+    pub mcg_tes_p: bool,
+    pub mcg_ext_count: u8,
+    pub mcg_lmce_p: bool,
 }
 
 impl McgCap {
     pub fn decode(raw: u64) -> Self {
         Self {
-            count:         (raw & 0xFF) as u8,
-            mcg_ctl_p:     raw & (1 << 8)  != 0,
-            mcg_ext_p:     raw & (1 << 9)  != 0,
-            mcg_cmci_p:    raw & (1 << 10) != 0,
-            mcg_tes_p:     raw & (1 << 11) != 0,
+            count: (raw & 0xFF) as u8,
+            mcg_ctl_p: raw & (1 << 8) != 0,
+            mcg_ext_p: raw & (1 << 9) != 0,
+            mcg_cmci_p: raw & (1 << 10) != 0,
+            mcg_tes_p: raw & (1 << 11) != 0,
             mcg_ext_count: ((raw >> 16) & 0xFF) as u8,
-            mcg_lmce_p:    raw & (1 << 27) != 0,
+            mcg_lmce_p: raw & (1 << 27) != 0,
         }
     }
 }
 
 /// MCG_STATUS bits.
-pub const MCG_STATUS_RIPV: u64 = 1 << 0;  // Restart-IP valid.
-pub const MCG_STATUS_EIPV: u64 = 1 << 1;  // Error-IP valid.
-pub const MCG_STATUS_MCIP: u64 = 1 << 2;  // MC in progress.
-pub const MCG_STATUS_LMCE: u64 = 1 << 3;  // Local MCE delivery.
+pub const MCG_STATUS_RIPV: u64 = 1 << 0; // Restart-IP valid.
+pub const MCG_STATUS_EIPV: u64 = 1 << 1; // Error-IP valid.
+pub const MCG_STATUS_MCIP: u64 = 1 << 2; // MC in progress.
+pub const MCG_STATUS_LMCE: u64 = 1 << 3; // Local MCE delivery.
 
 /// Decoded MCi_STATUS bits (SDM Vol 3 §16.3.2.2).
 #[derive(Copy, Clone, Debug)]
 pub struct MciStatus {
-    pub raw:        u64,
+    pub raw: u64,
     /// True if the status entry is valid (bit 63).
-    pub valid:      bool,
+    pub valid: bool,
     /// True if the bank logged a fatal/uncorrectable error (bit 61 = UC).
-    pub uc:         bool,
+    pub uc: bool,
     /// True if the error is the cause of an MCE (bit 60 = EN).
-    pub en:         bool,
+    pub en: bool,
     /// True if the error was successfully signalled to software (bit 59 = MISCV).
-    pub miscv:      bool,
+    pub miscv: bool,
     /// True if MCi_ADDR holds a valid address (bit 58 = ADDRV).
-    pub addrv:      bool,
+    pub addrv: bool,
     /// True if the bank state was corrected (bit 57 = PCC: processor-context corrupt).
-    pub pcc:        bool,
+    pub pcc: bool,
     /// MCA error code (bits[15:0]) — vendor-specific.
-    pub mca_code:   u16,
+    pub mca_code: u16,
     /// Model-specific error code (bits[31:16]).
     pub model_code: u16,
     /// Bit 62 = OVER (overflow).
-    pub overflow:   bool,
+    pub overflow: bool,
 }
 
 impl MciStatus {
     pub fn decode(raw: u64) -> Self {
         Self {
             raw,
-            valid:      raw & (1 << 63) != 0,
-            uc:         raw & (1 << 61) != 0,
-            en:         raw & (1 << 60) != 0,
-            miscv:      raw & (1 << 59) != 0,
-            addrv:      raw & (1 << 58) != 0,
-            pcc:        raw & (1 << 57) != 0,
-            overflow:   raw & (1 << 62) != 0,
-            mca_code:   (raw & 0xFFFF) as u16,
+            valid: raw & (1 << 63) != 0,
+            uc: raw & (1 << 61) != 0,
+            en: raw & (1 << 60) != 0,
+            miscv: raw & (1 << 59) != 0,
+            addrv: raw & (1 << 58) != 0,
+            pcc: raw & (1 << 57) != 0,
+            overflow: raw & (1 << 62) != 0,
+            mca_code: (raw & 0xFFFF) as u16,
             model_code: ((raw >> 16) & 0xFFFF) as u16,
         }
     }
@@ -174,7 +174,9 @@ pub unsafe fn mci_misc(i: u8) -> u64 {
 /// CPL = 0; clearing a bank that wasn't latched is benign.
 pub unsafe fn clear_mci_status(i: u8) {
     // SAFETY: caller-asserted.
-    unsafe { wrmsr(MSR_MCi_STATUS_BASE + 4 * i as u32, 0); }
+    unsafe {
+        wrmsr(MSR_MCi_STATUS_BASE + 4 * i as u32, 0);
+    }
 }
 
 /// Initialise MCA: enable every architectural bank by writing all-1s
@@ -188,9 +190,13 @@ pub unsafe fn init() {
     for i in 0..cap.count {
         // Enable every error in the bank.
         // SAFETY: CPL=0.
-        unsafe { wrmsr(MSR_MCi_CTL_BASE + 4 * i as u32, !0u64); }
+        unsafe {
+            wrmsr(MSR_MCi_CTL_BASE + 4 * i as u32, !0u64);
+        }
         // SAFETY: same.
-        unsafe { wrmsr(MSR_MCi_STATUS_BASE + 4 * i as u32, 0); }
+        unsafe {
+            wrmsr(MSR_MCi_STATUS_BASE + 4 * i as u32, 0);
+        }
     }
 }
 
@@ -198,7 +204,7 @@ pub unsafe fn init() {
 pub fn is_supported() -> bool {
     // SAFETY: CPUID leaf 1 always defined.
     let (_, _, _, edx) = unsafe { cpuid(1, 0) };
-    edx & (1 << 14) != 0  // MCA bit
+    edx & (1 << 14) != 0 // MCA bit
 }
 
 /// Snapshot of every populated bank — returned by the `#MC`
@@ -206,15 +212,15 @@ pub fn is_supported() -> bool {
 #[derive(Debug, Default)]
 pub struct McSnapshot {
     pub mcg_status: u64,
-    pub banks:      [Option<McBank>; 32],
+    pub banks: [Option<McBank>; 32],
 }
 
 #[derive(Copy, Clone, Debug)]
 pub struct McBank {
-    pub index:  u8,
+    pub index: u8,
     pub status: MciStatus,
-    pub addr:   Option<u64>,
-    pub misc:   Option<u64>,
+    pub addr: Option<u64>,
+    pub misc: Option<u64>,
 }
 
 /// Read every architectural bank, decoded.
@@ -232,12 +238,27 @@ pub unsafe fn snapshot() -> McSnapshot {
         // SAFETY: same.
         let raw = unsafe { mci_status(i as u8) };
         let st = MciStatus::decode(raw);
-        if !st.valid { continue; }
+        if !st.valid {
+            continue;
+        }
         // SAFETY: same.
-        let addr = if st.addrv { Some(unsafe { mci_addr(i as u8) }) } else { None };
+        let addr = if st.addrv {
+            Some(unsafe { mci_addr(i as u8) })
+        } else {
+            None
+        };
         // SAFETY: same.
-        let misc = if st.miscv { Some(unsafe { mci_misc(i as u8) }) } else { None };
-        s.banks[i] = Some(McBank { index: i as u8, status: st, addr, misc });
+        let misc = if st.miscv {
+            Some(unsafe { mci_misc(i as u8) })
+        } else {
+            None
+        };
+        s.banks[i] = Some(McBank {
+            index: i as u8,
+            status: st,
+            addr,
+            misc,
+        });
     }
     s
 }

@@ -16,27 +16,27 @@ use narf_arch::x86_64::msr::rdmsr;
 
 // ── MSR map ────────────────────────────────────────────────────────
 
-pub const MSR_RAPL_POWER_UNIT:    u32 = 0x606;
-pub const MSR_PKG_ENERGY_STATUS:  u32 = 0x611;
-pub const MSR_PP0_ENERGY_STATUS:  u32 = 0x639;
-pub const MSR_PP1_ENERGY_STATUS:  u32 = 0x641;
+pub const MSR_RAPL_POWER_UNIT: u32 = 0x606;
+pub const MSR_PKG_ENERGY_STATUS: u32 = 0x611;
+pub const MSR_PP0_ENERGY_STATUS: u32 = 0x639;
+pub const MSR_PP1_ENERGY_STATUS: u32 = 0x641;
 pub const MSR_DRAM_ENERGY_STATUS: u32 = 0x619;
-pub const MSR_PKG_POWER_INFO:     u32 = 0x614;
+pub const MSR_PKG_POWER_INFO: u32 = 0x614;
 
-pub const MSR_IA32_THERM_STATUS:        u32 = 0x19C;
+pub const MSR_IA32_THERM_STATUS: u32 = 0x19C;
 pub const MSR_IA32_PACKAGE_THERM_STATUS: u32 = 0x1B1;
-pub const MSR_TEMPERATURE_TARGET:        u32 = 0x1A2;
+pub const MSR_TEMPERATURE_TARGET: u32 = 0x1A2;
 
 /// Decoded `MSR_RAPL_POWER_UNIT` — converted to integer
 /// micro-units. e.g. `energy_uj_per_unit = 10^6 / 2^energy_units`.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct EnergyUnits {
-    pub power_uw_per_unit:  u64,
+    pub power_uw_per_unit: u64,
     pub energy_uj_per_unit: u64,
-    pub time_us_per_unit:   u64,
+    pub time_us_per_unit: u64,
     /// Raw `energy_units` exponent — handy for the
     /// `(raw * 1_000_000) >> exp` direct conversion path.
-    pub energy_exp:         u8,
+    pub energy_exp: u8,
 }
 
 /// `true` iff RAPL is reported by the host.
@@ -69,15 +69,27 @@ pub fn is_supported() -> bool {
 pub unsafe fn units() -> EnergyUnits {
     // SAFETY: caller-asserted.
     let raw = unsafe { rdmsr(MSR_RAPL_POWER_UNIT) };
-    let power_exp  = (raw & 0x0F) as u32;
-    let energy_exp = ((raw >> 8)  & 0x1F) as u32;
-    let time_exp   = ((raw >> 16) & 0x0F) as u32;
+    let power_exp = (raw & 0x0F) as u32;
+    let energy_exp = ((raw >> 8) & 0x1F) as u32;
+    let time_exp = ((raw >> 16) & 0x0F) as u32;
     EnergyUnits {
         // Watts = 1 / 2^power_exp; in µW = 10^6 / 2^p.
-        power_uw_per_unit:  if power_exp < 32 { 1_000_000u64 >> power_exp } else { 0 },
-        energy_uj_per_unit: if energy_exp < 32 { 1_000_000u64 >> energy_exp } else { 0 },
-        time_us_per_unit:   if time_exp < 32 { 1_000_000u64 >> time_exp } else { 0 },
-        energy_exp:         energy_exp as u8,
+        power_uw_per_unit: if power_exp < 32 {
+            1_000_000u64 >> power_exp
+        } else {
+            0
+        },
+        energy_uj_per_unit: if energy_exp < 32 {
+            1_000_000u64 >> energy_exp
+        } else {
+            0
+        },
+        time_us_per_unit: if time_exp < 32 {
+            1_000_000u64 >> time_exp
+        } else {
+            0
+        },
+        energy_exp: energy_exp as u8,
     }
 }
 
@@ -116,7 +128,9 @@ pub unsafe fn read_pp0_uj() -> u64 {
 pub unsafe fn read_pp1_uj() -> Option<u64> {
     // SAFETY: caller-asserted.
     let raw = unsafe { rdmsr(MSR_PP1_ENERGY_STATUS) };
-    if raw == 0 || raw == u64::MAX { return None; }
+    if raw == 0 || raw == u64::MAX {
+        return None;
+    }
     // SAFETY: same.
     Some(unsafe { read_energy_uj(MSR_PP1_ENERGY_STATUS) })
 }
@@ -129,7 +143,9 @@ pub unsafe fn read_pp1_uj() -> Option<u64> {
 pub unsafe fn read_dram_uj() -> Option<u64> {
     // SAFETY: caller-asserted.
     let raw = unsafe { rdmsr(MSR_DRAM_ENERGY_STATUS) };
-    if raw == 0 || raw == u64::MAX { return None; }
+    if raw == 0 || raw == u64::MAX {
+        return None;
+    }
     // SAFETY: same.
     Some(unsafe { read_energy_uj(MSR_DRAM_ENERGY_STATUS) })
 }
@@ -148,12 +164,16 @@ pub unsafe fn read_dram_uj() -> Option<u64> {
 pub unsafe fn read_temp_c() -> Option<u8> {
     // SAFETY: caller-asserted.
     let s = unsafe { rdmsr(MSR_IA32_THERM_STATUS) };
-    if s & (1 << 31) == 0 { return None; }
+    if s & (1 << 31) == 0 {
+        return None;
+    }
     let offset = ((s >> 16) & 0x7F) as u8;
     // SAFETY: same.
     let tj = unsafe { rdmsr(MSR_TEMPERATURE_TARGET) };
     let tjmax = ((tj >> 16) & 0xFF) as u8;
-    if tjmax == 0 { return None; }
+    if tjmax == 0 {
+        return None;
+    }
     Some(tjmax.saturating_sub(offset))
 }
 
@@ -165,11 +185,15 @@ pub unsafe fn read_temp_c() -> Option<u8> {
 pub unsafe fn read_pkg_temp_c() -> Option<u8> {
     // SAFETY: caller-asserted.
     let s = unsafe { rdmsr(MSR_IA32_PACKAGE_THERM_STATUS) };
-    if s & (1 << 31) == 0 { return None; }
+    if s & (1 << 31) == 0 {
+        return None;
+    }
     let offset = ((s >> 16) & 0x7F) as u8;
     // SAFETY: same.
     let tj = unsafe { rdmsr(MSR_TEMPERATURE_TARGET) };
     let tjmax = ((tj >> 16) & 0xFF) as u8;
-    if tjmax == 0 { return None; }
+    if tjmax == 0 {
+        return None;
+    }
     Some(tjmax.saturating_sub(offset))
 }

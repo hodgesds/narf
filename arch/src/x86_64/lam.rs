@@ -23,7 +23,9 @@ const CR4_LAM_SUP: u64 = 1 << 28;
 pub fn supported() -> bool {
     // SAFETY: leaf 0 always defined.
     let max = unsafe { cpuid(0, 0).0 };
-    if max < 7 { return false; }
+    if max < 7 {
+        return false;
+    }
     // SAFETY: leaf 7 sub-leaf 1 defined.
     let (eax, _, _, _) = unsafe { cpuid(7, 1) };
     eax & (1 << 26) != 0
@@ -74,7 +76,9 @@ pub unsafe fn enable_user_lam_u48() {
     let cur = unsafe { read_cr3() };
     let v = (cur & !CR3_LAM_U57) | CR3_LAM_U48;
     // SAFETY: same.
-    unsafe { write_cr3(v); }
+    unsafe {
+        write_cr3(v);
+    }
 }
 
 /// Enable user-mode LAM with 57-bit canonical form.
@@ -86,7 +90,9 @@ pub unsafe fn enable_user_lam_u57() {
     let cur = unsafe { read_cr3() };
     let v = (cur & !CR3_LAM_U48) | CR3_LAM_U57;
     // SAFETY: same.
-    unsafe { write_cr3(v); }
+    unsafe {
+        write_cr3(v);
+    }
 }
 
 /// Enable supervisor LAM (CR4.LAM_SUP).
@@ -97,7 +103,9 @@ pub unsafe fn enable_supervisor_lam() {
     // SAFETY: caller-asserted.
     let cur = unsafe { read_cr4() };
     // SAFETY: same.
-    unsafe { write_cr4(cur | CR4_LAM_SUP); }
+    unsafe {
+        write_cr4(cur | CR4_LAM_SUP);
+    }
 }
 
 /// Disable both LAM_U48 + LAM_U57 in CR3.
@@ -108,5 +116,7 @@ pub unsafe fn disable_user_lam() {
     // SAFETY: caller-asserted.
     let cur = unsafe { read_cr3() };
     // SAFETY: same.
-    unsafe { write_cr3(cur & !(CR3_LAM_U48 | CR3_LAM_U57)); }
+    unsafe {
+        write_cr3(cur & !(CR3_LAM_U48 | CR3_LAM_U57));
+    }
 }

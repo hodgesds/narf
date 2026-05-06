@@ -44,7 +44,7 @@ static USED: [AtomicU64; 4] = [
 #[inline]
 fn split(vector: u8) -> (usize, u64) {
     let word = (vector as usize) >> 6;
-    let bit  = 1u64 << (vector & 0x3F);
+    let bit = 1u64 << (vector & 0x3F);
     (word, bit)
 }
 
@@ -56,11 +56,12 @@ pub fn alloc() -> Result<u8, VectorError> {
         // Try to flip 0 → 1 atomically.
         let mut cur = USED[w].load(Ordering::Relaxed);
         loop {
-            if cur & bit != 0 { break; }
-            match USED[w].compare_exchange_weak(
-                cur, cur | bit, Ordering::AcqRel, Ordering::Relaxed,
-            ) {
-                Ok(_)   => return Ok(v),
+            if cur & bit != 0 {
+                break;
+            }
+            match USED[w].compare_exchange_weak(cur, cur | bit, Ordering::AcqRel, Ordering::Relaxed)
+            {
+                Ok(_) => return Ok(v),
                 Err(actual) => cur = actual,
             }
         }
@@ -73,7 +74,9 @@ pub fn alloc() -> Result<u8, VectorError> {
 /// vector; the reserved range is `[base, base + n)`. All-or-nothing
 /// — partial reservations are rolled back on failure.
 pub fn alloc_block(n: u8) -> Result<u8, VectorError> {
-    if n == 0 { return Err(VectorError::OutOfRange); }
+    if n == 0 {
+        return Err(VectorError::OutOfRange);
+    }
     let last_start = ALLOC_MAX.saturating_sub(n - 1);
     'outer: for base in ALLOC_BASE..=last_start {
         // Speculatively flip every bit in [base, base+n). If any
@@ -86,11 +89,19 @@ pub fn alloc_block(n: u8) -> Result<u8, VectorError> {
             let mut cur = USED[w].load(Ordering::Relaxed);
             let mut acquired = false;
             loop {
-                if cur & bit != 0 { break; }
+                if cur & bit != 0 {
+                    break;
+                }
                 match USED[w].compare_exchange_weak(
-                    cur, cur | bit, Ordering::AcqRel, Ordering::Relaxed,
+                    cur,
+                    cur | bit,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
                 ) {
-                    Ok(_)       => { acquired = true; break; }
+                    Ok(_) => {
+                        acquired = true;
+                        break;
+                    }
                     Err(actual) => cur = actual,
                 }
             }
@@ -117,7 +128,11 @@ pub fn free(vector: u8) -> Result<(), VectorError> {
     }
     let (w, bit) = split(vector);
     let prev = USED[w].fetch_and(!bit, Ordering::AcqRel);
-    if prev & bit == 0 { Err(VectorError::AlreadyFree) } else { Ok(()) }
+    if prev & bit == 0 {
+        Err(VectorError::AlreadyFree)
+    } else {
+        Ok(())
+    }
 }
 
 /// `true` if `vector` is currently allocated. Test-only helper; production

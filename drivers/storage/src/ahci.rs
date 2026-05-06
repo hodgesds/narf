@@ -54,16 +54,16 @@ const ABAR_BAR: u8 = 5;
 
 const HBA_CAP: u64 = 0x00;
 const HBA_GHC: u64 = 0x04;
-const HBA_PI:  u64 = 0x0C;
-const HBA_VS:  u64 = 0x10;
+const HBA_PI: u64 = 0x0C;
+const HBA_VS: u64 = 0x10;
 
 // GHC bits.
-const GHC_HR: u32 = 1 << 0;   // HBA Reset
-const GHC_AE: u32 = 1 << 31;  // AHCI Enable
+const GHC_HR: u32 = 1 << 0; // HBA Reset
+const GHC_AE: u32 = 1 << 31; // AHCI Enable
 
 // Per-port offsets.
 const PORT_BASE_OFF: u64 = 0x100;
-const PORT_STRIDE:   u64 = 0x80;
+const PORT_STRIDE: u64 = 0x80;
 
 const PORT_CMD: u64 = 0x18;
 const PORT_SIG: u64 = 0x24;
@@ -71,32 +71,34 @@ const PORT_SSTS: u64 = 0x28;
 const PORT_SERR: u64 = 0x30;
 
 // PORT_CMD bits.
-const CMD_ST:  u32 = 1 << 0;   // Start
-const CMD_FRE: u32 = 1 << 4;   // FIS Receive Enable
-const CMD_FR:  u32 = 1 << 14;  // FIS Receive Running
-const CMD_CR:  u32 = 1 << 15;  // Command List Running
+const CMD_ST: u32 = 1 << 0; // Start
+const CMD_FRE: u32 = 1 << 4; // FIS Receive Enable
+const CMD_FR: u32 = 1 << 14; // FIS Receive Running
+const CMD_CR: u32 = 1 << 15; // Command List Running
 
 /// Detected device class on a port (from PORT_SIG).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PortKind {
     None,
-    Sata,           // SIG = 0x00000101
-    Atapi,          // SIG = 0xEB140101
-    Semb,           // SIG = 0xC33C0101
-    Pmp,            // SIG = 0x96690101
+    Sata,  // SIG = 0x00000101
+    Atapi, // SIG = 0xEB140101
+    Semb,  // SIG = 0xC33C0101
+    Pmp,   // SIG = 0x96690101
     Unknown(u32),
 }
 
 impl PortKind {
     fn from_sig(sig: u32, ssts: u32) -> Self {
         // SSTS DET bits[3:0] = 3 means device present + comm OK.
-        if (ssts & 0x0F) != 3 { return PortKind::None; }
+        if (ssts & 0x0F) != 3 {
+            return PortKind::None;
+        }
         match sig {
             0x0000_0101 => PortKind::Sata,
             0xEB14_0101 => PortKind::Atapi,
             0xC33C_0101 => PortKind::Semb,
             0x9669_0101 => PortKind::Pmp,
-            other       => PortKind::Unknown(other),
+            other => PortKind::Unknown(other),
         }
     }
 }
@@ -105,7 +107,7 @@ impl PortKind {
 #[derive(Copy, Clone, Debug)]
 pub struct PortInfo {
     pub index: u8,
-    pub kind:  PortKind,
+    pub kind: PortKind,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -122,19 +124,19 @@ pub enum AhciError {
 /// port list. Per-port command-list / FIS-receive structures are
 /// allocated by `claim_port` (a follow-up).
 pub struct Ahci {
-    mmio:  MmioRegion,
-    pub cap:   u32,
-    pub vs:    u32,
-    pub pi:    u32,
+    mmio: MmioRegion,
+    pub cap: u32,
+    pub vs: u32,
+    pub pi: u32,
     pub ports: alloc::vec::Vec<PortInfo>,
 }
 
 impl core::fmt::Debug for Ahci {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Ahci")
-            .field("cap",   &format_args!("{:#x}", self.cap))
-            .field("vs",    &format_args!("{:#x}", self.vs))
-            .field("pi",    &format_args!("{:#x}", self.pi))
+            .field("cap", &format_args!("{:#x}", self.cap))
+            .field("vs", &format_args!("{:#x}", self.vs))
+            .field("pi", &format_args!("{:#x}", self.pi))
             .field("ports", &self.ports.len())
             .finish_non_exhaustive()
     }
@@ -148,61 +150,80 @@ impl Ahci {
     /// Caller owns the device's BAR5 exclusively.
     pub unsafe fn bring_up(
         device: &BusDevice,
-        _cap:   &Cap<BusDeviceCap, Write>,
+        _cap: &Cap<BusDeviceCap, Write>,
     ) -> Result<Self, AhciError> {
         // SAFETY: caller-authority.
-        let mmio = unsafe { map_bar(device, ABAR_BAR) }
-            .map_err(|_| AhciError::BarMapFailed)?;
+        let mmio = unsafe { map_bar(device, ABAR_BAR) }.map_err(|_| AhciError::BarMapFailed)?;
 
         // Force AHCI mode (some HBAs come up in legacy IDE mode).
         // SAFETY: identity-mapped MMIO.
         let ghc = unsafe { mmio.read32(HBA_GHC) };
         // SAFETY: same.
-        unsafe { mmio.write32(HBA_GHC, ghc | GHC_AE); }
+        unsafe {
+            mmio.write32(HBA_GHC, ghc | GHC_AE);
+        }
 
         // HBA Reset.
         // SAFETY: same.
-        unsafe { mmio.write32(HBA_GHC, GHC_AE | GHC_HR); }
+        unsafe {
+            mmio.write32(HBA_GHC, GHC_AE | GHC_HR);
+        }
         for _ in 0..1_000_000u32 {
             // SAFETY: same.
             let v = unsafe { mmio.read32(HBA_GHC) };
-            if v & GHC_HR == 0 { break; }
+            if v & GHC_HR == 0 {
+                break;
+            }
             core::hint::spin_loop();
         }
         // SAFETY: same.
         let ghc_after = unsafe { mmio.read32(HBA_GHC) };
-        if ghc_after & GHC_HR != 0 { return Err(AhciError::ResetTimeout); }
+        if ghc_after & GHC_HR != 0 {
+            return Err(AhciError::ResetTimeout);
+        }
         // Re-enable AHCI mode after the reset (HR clears AE on some
         // implementations).
         // SAFETY: same.
-        unsafe { mmio.write32(HBA_GHC, GHC_AE); }
+        unsafe {
+            mmio.write32(HBA_GHC, GHC_AE);
+        }
 
         // SAFETY: same.
         let cap = unsafe { mmio.read32(HBA_CAP) };
         // SAFETY: same.
-        let vs  = unsafe { mmio.read32(HBA_VS) };
+        let vs = unsafe { mmio.read32(HBA_VS) };
         // SAFETY: same.
-        let pi  = unsafe { mmio.read32(HBA_PI) };
+        let pi = unsafe { mmio.read32(HBA_PI) };
 
         // Enumerate ports.
         let mut ports = alloc::vec::Vec::new();
         for n in 0..32 {
-            if pi & (1u32 << n) == 0 { continue; }
+            if pi & (1u32 << n) == 0 {
+                continue;
+            }
             let off = PORT_BASE_OFF + (n as u64) * PORT_STRIDE;
             // SAFETY: same.
-            let sig  = unsafe { mmio.read32(off + PORT_SIG)  };
+            let sig = unsafe { mmio.read32(off + PORT_SIG) };
             // SAFETY: same.
             let ssts = unsafe { mmio.read32(off + PORT_SSTS) };
             // Clear SERR (write-1-to-clear).
             // SAFETY: same.
             let serr = unsafe { mmio.read32(off + PORT_SERR) };
             // SAFETY: same.
-            unsafe { mmio.write32(off + PORT_SERR, serr); }
+            unsafe {
+                mmio.write32(off + PORT_SERR, serr);
+            }
             let kind = PortKind::from_sig(sig, ssts);
             ports.push(PortInfo { index: n, kind });
         }
 
-        Ok(Self { mmio, cap, vs, pi, ports })
+        Ok(Self {
+            mmio,
+            cap,
+            vs,
+            pi,
+            ports,
+        })
     }
 
     /// Stop a port — clears PORT_CMD.ST + PORT_CMD.FRE and waits for
@@ -215,24 +236,34 @@ impl Ahci {
         // SAFETY: identity-mapped MMIO.
         let cmd = unsafe { self.mmio.read32(off + PORT_CMD) };
         // SAFETY: same.
-        unsafe { self.mmio.write32(off + PORT_CMD, cmd & !(CMD_ST | CMD_FRE)); }
+        unsafe {
+            self.mmio.write32(off + PORT_CMD, cmd & !(CMD_ST | CMD_FRE));
+        }
         for _ in 0..1_000_000u32 {
             // SAFETY: same.
             let v = unsafe { self.mmio.read32(off + PORT_CMD) };
-            if v & (CMD_FR | CMD_CR) == 0 { return Ok(()); }
+            if v & (CMD_FR | CMD_CR) == 0 {
+                return Ok(());
+            }
             core::hint::spin_loop();
         }
         Err(AhciError::PortIdleTimeout)
     }
 
     /// HBA's capability bitmap.
-    pub fn caps(&self) -> u32 { self.cap }
+    pub fn caps(&self) -> u32 {
+        self.cap
+    }
 
     /// AHCI version (BCD, e.g. 0x0001_0301 = v1.3.1).
-    pub fn version(&self) -> u32 { self.vs }
+    pub fn version(&self) -> u32 {
+        self.vs
+    }
 
     /// Implemented-port bitmap (PI register).
-    pub fn ports_implemented(&self) -> u32 { self.pi }
+    pub fn ports_implemented(&self) -> u32 {
+        self.pi
+    }
 
     /// Issue ATA `IDENTIFY DEVICE` (opcode 0xEC) on the given port,
     /// returning the 512-byte device-data block.
@@ -246,9 +277,7 @@ impl Ahci {
     /// # Safety
     /// Caller owns the HBA + the named port exclusively; `port_idx <
     /// 32` and the port's PortKind was Sata at probe.
-    pub unsafe fn identify_device(&self, port_idx: u8)
-        -> Result<[u8; 512], AhciError>
-    {
+    pub unsafe fn identify_device(&self, port_idx: u8) -> Result<[u8; 512], AhciError> {
         let off = PORT_BASE_OFF + (port_idx as u64) * PORT_STRIDE;
 
         // Stop the port if it's running.
@@ -260,20 +289,19 @@ impl Ahci {
         //   +0x400  Received FIS  (256 bytes)
         //   +0x500  Command Table (128 bytes — 64 cfis + 0 acmd + 16 PRDT0)
         //   +0x600  Data buffer   (512 bytes for IDENTIFY response)
-        let scratch = alloc_coherent(4096, DomainId::DRIVER_0)
-            .map_err(|_| AhciError::BarMapFailed)?;
+        let scratch =
+            alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| AhciError::BarMapFailed)?;
         let base = scratch.phys_addr().raw();
         let cmd_list = base + 0x000;
         let fis_recv = base + 0x400;
-        let cmd_tbl  = base + 0x500;
+        let cmd_tbl = base + 0x500;
         let data_buf = base + 0x600;
 
         // Zero the regions we touch.
         // SAFETY: identity-mapped DMA page.
         unsafe {
             for i in 0..(0x600 + 512) {
-                core::ptr::write_volatile(
-                    (base + i as u64) as *mut u8, 0);
+                core::ptr::write_volatile((base + i as u64) as *mut u8, 0);
             }
         }
 
@@ -288,8 +316,7 @@ impl Ahci {
         // RST=0, P=0. PRDT length = 1.
         // SAFETY: identity-mapped DMA.
         unsafe {
-            core::ptr::write_volatile(cmd_list as *mut u32,
-                (1u32 << 16) | 5);
+            core::ptr::write_volatile(cmd_list as *mut u32, (1u32 << 16) | 5);
             core::ptr::write_volatile((cmd_list + 4) as *mut u32, 0);
             core::ptr::write_volatile((cmd_list + 8) as *mut u64, cmd_tbl);
         }
@@ -336,24 +363,34 @@ impl Ahci {
         // SAFETY: same.
         let serr = unsafe { self.mmio.read32(off + PORT_SERR) };
         // SAFETY: same.
-        unsafe { self.mmio.write32(off + PORT_SERR, serr); }
+        unsafe {
+            self.mmio.write32(off + PORT_SERR, serr);
+        }
         // SAFETY: same.
-        unsafe { self.mmio.write32(off + 0x10, 0xFFFF_FFFF); }
+        unsafe {
+            self.mmio.write32(off + 0x10, 0xFFFF_FFFF);
+        }
 
         // Start the port (FRE first, then ST).
         // SAFETY: same.
         let cmd = unsafe { self.mmio.read32(off + PORT_CMD) };
         // SAFETY: same.
-        unsafe { self.mmio.write32(off + PORT_CMD, cmd | CMD_FRE); }
+        unsafe {
+            self.mmio.write32(off + PORT_CMD, cmd | CMD_FRE);
+        }
         // SAFETY: same.
         let cmd = unsafe { self.mmio.read32(off + PORT_CMD) };
         // SAFETY: same.
-        unsafe { self.mmio.write32(off + PORT_CMD, cmd | CMD_ST); }
+        unsafe {
+            self.mmio.write32(off + PORT_CMD, cmd | CMD_ST);
+        }
 
         // Issue command 0 by writing PORT_CI bit 0.
         compiler_fence(Ordering::SeqCst);
         // SAFETY: same.
-        unsafe { self.mmio.write32(off + 0x38, 1); }
+        unsafe {
+            self.mmio.write32(off + 0x38, 1);
+        }
 
         // Poll until CI bit clears.
         let mut ok = false;
@@ -362,10 +399,14 @@ impl Ahci {
             let ci = unsafe { self.mmio.read32(off + 0x38) };
             // SAFETY: same.
             let tfd = unsafe { self.mmio.read32(off + 0x20) };
-            if tfd & 0x01 != 0 {  // ERR
+            if tfd & 0x01 != 0 {
+                // ERR
                 return Err(AhciError::ResetTimeout);
             }
-            if ci & 1 == 0 { ok = true; break; }
+            if ci & 1 == 0 {
+                ok = true;
+                break;
+            }
             core::hint::spin_loop();
         }
         if !ok {
@@ -376,9 +417,7 @@ impl Ahci {
         let mut out = [0u8; 512];
         // SAFETY: identity-mapped DMA.
         for i in 0..512usize {
-            out[i] = unsafe {
-                core::ptr::read_volatile((data_buf + i as u64) as *const u8)
-            };
+            out[i] = unsafe { core::ptr::read_volatile((data_buf + i as u64) as *const u8) };
         }
         // Stop the port.
         // SAFETY: caller-asserted.
@@ -411,12 +450,11 @@ pub unsafe fn ahci_write_lba(
     // SAFETY: caller-asserted.
     let _ = unsafe { ahci.port_idle(port_idx) };
 
-    let scratch = alloc_coherent(4096, DomainId::DRIVER_0)
-        .map_err(|_| AhciError::BarMapFailed)?;
+    let scratch = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| AhciError::BarMapFailed)?;
     let base = scratch.phys_addr().raw();
     let cmd_list = base + 0x000;
     let fis_recv = base + 0x400;
-    let cmd_tbl  = base + 0x500;
+    let cmd_tbl = base + 0x500;
     let data_buf = base + 0x600;
     // Zero the cmd-list / FIS / cmd-table prefix; copy caller payload
     // into the data buffer.
@@ -426,16 +464,14 @@ pub unsafe fn ahci_write_lba(
             core::ptr::write_volatile((base + i as u64) as *mut u8, 0);
         }
         for i in 0..(n_sectors as usize) * 512 {
-            core::ptr::write_volatile(
-                (data_buf + i as u64) as *mut u8, data[i]);
+            core::ptr::write_volatile((data_buf + i as u64) as *mut u8, data[i]);
         }
     }
 
     // Cmd list slot 0: PRDT length = 1, CFL = 5, W bit = 1 (write).
     // SAFETY: identity-mapped DMA.
     unsafe {
-        core::ptr::write_volatile(cmd_list as *mut u32,
-            (1u32 << 16) | (1u32 << 6) | 5);  // bit 6 = W
+        core::ptr::write_volatile(cmd_list as *mut u32, (1u32 << 16) | (1u32 << 6) | 5); // bit 6 = W
         core::ptr::write_volatile((cmd_list + 4) as *mut u32, 0);
         core::ptr::write_volatile((cmd_list + 8) as *mut u64, cmd_tbl);
     }
@@ -447,12 +483,12 @@ pub unsafe fn ahci_write_lba(
         core::ptr::write_volatile((cmd_tbl + 1) as *mut u8, 0x80);
         core::ptr::write_volatile((cmd_tbl + 2) as *mut u8, 0x35);
         core::ptr::write_volatile((cmd_tbl + 3) as *mut u8, 0);
-        core::ptr::write_volatile((cmd_tbl + 4)  as *mut u8, (lba & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 5)  as *mut u8, ((lba >> 8)  & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 6)  as *mut u8, ((lba >> 16) & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 7)  as *mut u8, 0x40);
-        core::ptr::write_volatile((cmd_tbl + 8)  as *mut u8, ((lba >> 24) & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 9)  as *mut u8, ((lba >> 32) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 4) as *mut u8, (lba & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 5) as *mut u8, ((lba >> 8) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 6) as *mut u8, ((lba >> 16) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 7) as *mut u8, 0x40);
+        core::ptr::write_volatile((cmd_tbl + 8) as *mut u8, ((lba >> 24) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 9) as *mut u8, ((lba >> 32) & 0xFF) as u8);
         core::ptr::write_volatile((cmd_tbl + 10) as *mut u8, ((lba >> 40) & 0xFF) as u8);
         core::ptr::write_volatile((cmd_tbl + 12) as *mut u8, (n_sectors & 0xFF) as u8);
         core::ptr::write_volatile((cmd_tbl + 13) as *mut u8, ((n_sectors >> 8) & 0xFF) as u8);
@@ -483,19 +519,28 @@ pub unsafe fn ahci_write_lba(
 
     compiler_fence(Ordering::SeqCst);
     // SAFETY: same.
-    unsafe { ahci.mmio.write32(off + 0x38, 1); }
+    unsafe {
+        ahci.mmio.write32(off + 0x38, 1);
+    }
 
     let mut ok = false;
     for _ in 0..10_000_000u32 {
         // SAFETY: same.
-        let ci  = unsafe { ahci.mmio.read32(off + 0x38) };
+        let ci = unsafe { ahci.mmio.read32(off + 0x38) };
         // SAFETY: same.
         let tfd = unsafe { ahci.mmio.read32(off + 0x20) };
-        if tfd & 0x01 != 0 { return Err(AhciError::ResetTimeout); }
-        if ci & 1 == 0 { ok = true; break; }
+        if tfd & 0x01 != 0 {
+            return Err(AhciError::ResetTimeout);
+        }
+        if ci & 1 == 0 {
+            ok = true;
+            break;
+        }
         core::hint::spin_loop();
     }
-    if !ok { return Err(AhciError::ResetTimeout); }
+    if !ok {
+        return Err(AhciError::ResetTimeout);
+    }
     // SAFETY: caller-asserted.
     let _ = unsafe { ahci.port_idle(port_idx) };
     let _ = scratch;
@@ -517,7 +562,7 @@ pub unsafe fn ahci_read_lba(
     port_idx: u8,
     lba: u64,
     n_sectors: u16,
-    out:       &mut [u8],
+    out: &mut [u8],
 ) -> Result<(), AhciError> {
     if n_sectors == 0 || (n_sectors as usize) * 512 > 4096 {
         return Err(AhciError::BarMapFailed);
@@ -529,12 +574,11 @@ pub unsafe fn ahci_read_lba(
     // SAFETY: caller-asserted.
     let _ = unsafe { ahci.port_idle(port_idx) };
 
-    let scratch = alloc_coherent(4096, DomainId::DRIVER_0)
-        .map_err(|_| AhciError::BarMapFailed)?;
+    let scratch = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| AhciError::BarMapFailed)?;
     let base = scratch.phys_addr().raw();
     let cmd_list = base + 0x000;
     let fis_recv = base + 0x400;
-    let cmd_tbl  = base + 0x500;
+    let cmd_tbl = base + 0x500;
     let data_buf = base + 0x600;
     // SAFETY: identity-mapped DMA.
     unsafe {
@@ -574,12 +618,12 @@ pub unsafe fn ahci_read_lba(
         core::ptr::write_volatile((cmd_tbl + 1) as *mut u8, 0x80);
         core::ptr::write_volatile((cmd_tbl + 2) as *mut u8, 0x25);
         core::ptr::write_volatile((cmd_tbl + 3) as *mut u8, 0);
-        core::ptr::write_volatile((cmd_tbl + 4)  as *mut u8, (lba & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 5)  as *mut u8, ((lba >> 8)  & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 6)  as *mut u8, ((lba >> 16) & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 7)  as *mut u8, 0x40);
-        core::ptr::write_volatile((cmd_tbl + 8)  as *mut u8, ((lba >> 24) & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 9)  as *mut u8, ((lba >> 32) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 4) as *mut u8, (lba & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 5) as *mut u8, ((lba >> 8) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 6) as *mut u8, ((lba >> 16) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 7) as *mut u8, 0x40);
+        core::ptr::write_volatile((cmd_tbl + 8) as *mut u8, ((lba >> 24) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 9) as *mut u8, ((lba >> 32) & 0xFF) as u8);
         core::ptr::write_volatile((cmd_tbl + 10) as *mut u8, ((lba >> 40) & 0xFF) as u8);
         core::ptr::write_volatile((cmd_tbl + 12) as *mut u8, (n_sectors & 0xFF) as u8);
         core::ptr::write_volatile((cmd_tbl + 13) as *mut u8, ((n_sectors >> 8) & 0xFF) as u8);
@@ -601,7 +645,7 @@ pub unsafe fn ahci_read_lba(
         ahci.mmio.write32(off + 0x0C, (fis_recv >> 32) as u32);
         let serr = ahci.mmio.read32(off + PORT_SERR);
         ahci.mmio.write32(off + PORT_SERR, serr);
-        ahci.mmio.write32(off + 0x10, 0xFFFF_FFFF);  // clear PORT_IS
+        ahci.mmio.write32(off + 0x10, 0xFFFF_FFFF); // clear PORT_IS
         let cmd = ahci.mmio.read32(off + PORT_CMD);
         ahci.mmio.write32(off + PORT_CMD, cmd | CMD_FRE);
         let cmd = ahci.mmio.read32(off + PORT_CMD);
@@ -610,7 +654,9 @@ pub unsafe fn ahci_read_lba(
 
     compiler_fence(Ordering::SeqCst);
     // SAFETY: same.
-    unsafe { ahci.mmio.write32(off + 0x38, 1); }
+    unsafe {
+        ahci.mmio.write32(off + 0x38, 1);
+    }
 
     let mut ok = false;
     for _ in 0..10_000_000u32 {
@@ -618,17 +664,22 @@ pub unsafe fn ahci_read_lba(
         let ci = unsafe { ahci.mmio.read32(off + 0x38) };
         // SAFETY: same.
         let tfd = unsafe { ahci.mmio.read32(off + 0x20) };
-        if tfd & 0x01 != 0 { return Err(AhciError::ResetTimeout); }
-        if ci & 1 == 0 { ok = true; break; }
+        if tfd & 0x01 != 0 {
+            return Err(AhciError::ResetTimeout);
+        }
+        if ci & 1 == 0 {
+            ok = true;
+            break;
+        }
         core::hint::spin_loop();
     }
-    if !ok { return Err(AhciError::ResetTimeout); }
+    if !ok {
+        return Err(AhciError::ResetTimeout);
+    }
 
     // SAFETY: identity-mapped DMA.
     for i in 0..(n_sectors as usize) * 512 {
-        out[i] = unsafe {
-            core::ptr::read_volatile((data_buf + i as u64) as *const u8)
-        };
+        out[i] = unsafe { core::ptr::read_volatile((data_buf + i as u64) as *const u8) };
     }
     // SAFETY: caller-asserted.
     let _ = unsafe { ahci.port_idle(port_idx) };
@@ -652,21 +703,35 @@ pub unsafe fn ahci_read_lba(
 /// # Safety
 /// Same as `ahci_read_lba`. Caller asserts `tag < 32`.
 pub unsafe fn ahci_read_lba_ncq(
-    ahci:      &Ahci,
-    port_idx:  u8,
-    pmp:       u8,
-    tag:       u8,
-    lba:       u64,
+    ahci: &Ahci,
+    port_idx: u8,
+    pmp: u8,
+    tag: u8,
+    lba: u64,
     n_sectors: u16,
-    out:       &mut [u8],
+    out: &mut [u8],
 ) -> Result<(), AhciError> {
-    if tag >= 32 || n_sectors == 0 || (n_sectors as usize) * 512 > 4096
-        || out.len() < (n_sectors as usize) * 512 {
+    if tag >= 32
+        || n_sectors == 0
+        || (n_sectors as usize) * 512 > 4096
+        || out.len() < (n_sectors as usize) * 512
+    {
         return Err(AhciError::BarMapFailed);
     }
     // SAFETY: caller-asserted.
-    unsafe { ahci_lba_ncq(ahci, port_idx, pmp, tag, /*write=*/false,
-        lba, n_sectors, out, &[]) }
+    unsafe {
+        ahci_lba_ncq(
+            ahci,
+            port_idx,
+            pmp,
+            tag,
+            /*write=*/ false,
+            lba,
+            n_sectors,
+            out,
+            &[],
+        )
+    }
 }
 
 /// Issue ATA `WRITE FPDMA QUEUED` (NCQ, opcode 0x61). Mirror of
@@ -675,45 +740,50 @@ pub unsafe fn ahci_read_lba_ncq(
 /// # Safety
 /// Same as `ahci_write_lba`.
 pub unsafe fn ahci_write_lba_ncq(
-    ahci:      &Ahci,
-    port_idx:  u8,
-    pmp:       u8,
-    tag:       u8,
-    lba:       u64,
+    ahci: &Ahci,
+    port_idx: u8,
+    pmp: u8,
+    tag: u8,
+    lba: u64,
     n_sectors: u16,
-    data:      &[u8],
+    data: &[u8],
 ) -> Result<(), AhciError> {
-    if tag >= 32 || n_sectors == 0 || (n_sectors as usize) * 512 > 4096
-        || data.len() < (n_sectors as usize) * 512 {
+    if tag >= 32
+        || n_sectors == 0
+        || (n_sectors as usize) * 512 > 4096
+        || data.len() < (n_sectors as usize) * 512
+    {
         return Err(AhciError::BarMapFailed);
     }
     let mut sink = [0u8; 0];
     // SAFETY: caller-asserted.
-    unsafe { ahci_lba_ncq(ahci, port_idx, pmp, tag, /*write=*/true,
-        lba, n_sectors, &mut sink, data) }
+    unsafe {
+        ahci_lba_ncq(
+            ahci, port_idx, pmp, tag, /*write=*/ true, lba, n_sectors, &mut sink, data,
+        )
+    }
 }
 
 unsafe fn ahci_lba_ncq(
-    ahci:      &Ahci,
-    port_idx:  u8,
-    pmp:       u8,
-    tag:       u8,
-    write:     bool,
-    lba:       u64,
+    ahci: &Ahci,
+    port_idx: u8,
+    pmp: u8,
+    tag: u8,
+    write: bool,
+    lba: u64,
     n_sectors: u16,
-    out:       &mut [u8],
-    data_in:   &[u8],
+    out: &mut [u8],
+    data_in: &[u8],
 ) -> Result<(), AhciError> {
     let off = PORT_BASE_OFF + (port_idx as u64) * PORT_STRIDE;
     // SAFETY: caller-asserted.
     let _ = unsafe { ahci.port_idle(port_idx) };
 
-    let scratch = alloc_coherent(4096, DomainId::DRIVER_0)
-        .map_err(|_| AhciError::BarMapFailed)?;
+    let scratch = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| AhciError::BarMapFailed)?;
     let base = scratch.phys_addr().raw();
     let cmd_list = base + 0x000;
     let fis_recv = base + 0x400;
-    let cmd_tbl  = base + 0x500;
+    let cmd_tbl = base + 0x500;
     let data_buf = base + 0x600;
     // Zero scratch + (for writes) copy caller payload in.
     // SAFETY: identity-mapped DMA.
@@ -723,8 +793,7 @@ unsafe fn ahci_lba_ncq(
         }
         if write {
             for i in 0..(n_sectors as usize) * 512 {
-                core::ptr::write_volatile(
-                    (data_buf + i as u64) as *mut u8, data_in[i]);
+                core::ptr::write_volatile((data_buf + i as u64) as *mut u8, data_in[i]);
             }
         }
     }
@@ -738,8 +807,8 @@ unsafe fn ahci_lba_ncq(
     // SAFETY: identity-mapped DMA.
     unsafe {
         core::ptr::write_volatile(slot as *mut u32, header_w0);
-        core::ptr::write_volatile((slot + 4)  as *mut u32, 0);
-        core::ptr::write_volatile((slot + 8)  as *mut u64, cmd_tbl);
+        core::ptr::write_volatile((slot + 4) as *mut u32, 0);
+        core::ptr::write_volatile((slot + 8) as *mut u64, cmd_tbl);
     }
 
     // CFIS H2D (FIS type 0x27) for FPDMA QUEUED:
@@ -763,12 +832,12 @@ unsafe fn ahci_lba_ncq(
         core::ptr::write_volatile((cmd_tbl + 1) as *mut u8, 0x80 | (pmp & 0x0F));
         core::ptr::write_volatile((cmd_tbl + 2) as *mut u8, opcode);
         core::ptr::write_volatile((cmd_tbl + 3) as *mut u8, sec_lo);
-        core::ptr::write_volatile((cmd_tbl + 4)  as *mut u8, (lba & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 5)  as *mut u8, ((lba >> 8)  & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 6)  as *mut u8, ((lba >> 16) & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 7)  as *mut u8, 0x40);
-        core::ptr::write_volatile((cmd_tbl + 8)  as *mut u8, ((lba >> 24) & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 9)  as *mut u8, ((lba >> 32) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 4) as *mut u8, (lba & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 5) as *mut u8, ((lba >> 8) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 6) as *mut u8, ((lba >> 16) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 7) as *mut u8, 0x40);
+        core::ptr::write_volatile((cmd_tbl + 8) as *mut u8, ((lba >> 24) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 9) as *mut u8, ((lba >> 32) & 0xFF) as u8);
         core::ptr::write_volatile((cmd_tbl + 10) as *mut u8, ((lba >> 40) & 0xFF) as u8);
         core::ptr::write_volatile((cmd_tbl + 11) as *mut u8, sec_hi);
         core::ptr::write_volatile((cmd_tbl + 12) as *mut u8, tag << 3);
@@ -803,29 +872,34 @@ unsafe fn ahci_lba_ncq(
     let bit = 1u32 << tag;
     // SAFETY: same.
     unsafe {
-        ahci.mmio.write32(off + 0x34, bit);  // PORT_SACT
-        ahci.mmio.write32(off + 0x38, bit);  // PORT_CI
+        ahci.mmio.write32(off + 0x34, bit); // PORT_SACT
+        ahci.mmio.write32(off + 0x38, bit); // PORT_CI
     }
 
     let mut ok = false;
     for _ in 0..10_000_000u32 {
         // SAFETY: same.
-        let ci  = unsafe { ahci.mmio.read32(off + 0x38) };
+        let ci = unsafe { ahci.mmio.read32(off + 0x38) };
         // SAFETY: same.
         let tfd = unsafe { ahci.mmio.read32(off + 0x20) };
-        if tfd & 0x01 != 0 { return Err(AhciError::ResetTimeout); }
-        if ci & bit == 0 { ok = true; break; }
+        if tfd & 0x01 != 0 {
+            return Err(AhciError::ResetTimeout);
+        }
+        if ci & bit == 0 {
+            ok = true;
+            break;
+        }
         core::hint::spin_loop();
     }
-    if !ok { return Err(AhciError::ResetTimeout); }
+    if !ok {
+        return Err(AhciError::ResetTimeout);
+    }
 
     // For reads, copy back.
     if !write {
         // SAFETY: identity-mapped DMA.
         for i in 0..(n_sectors as usize) * 512 {
-            out[i] = unsafe {
-                core::ptr::read_volatile((data_buf + i as u64) as *const u8)
-            };
+            out[i] = unsafe { core::ptr::read_volatile((data_buf + i as u64) as *const u8) };
         }
     }
     // SAFETY: caller-asserted.
@@ -847,9 +921,9 @@ pub struct PmpTopology {
     /// Number of downstream ports advertised by the multiplier.
     pub num_ports: u8,
     /// Port-multiplier vendor id (GSCR[0] low half).
-    pub vendor:    u16,
+    pub vendor: u16,
     /// Port-multiplier product id (GSCR[0] high half).
-    pub product:   u16,
+    pub product: u16,
 }
 
 /// Discover the topology behind a PMP-attached port. Returns `None`
@@ -861,8 +935,14 @@ pub struct PmpTopology {
 /// `(num_ports = 0)` so callers can branch on PMP presence.
 pub fn discover_pmp_topology(ahci: &Ahci, port_idx: u8) -> Option<PmpTopology> {
     let info = ahci.ports.iter().find(|p| p.index == port_idx)?;
-    if info.kind != PortKind::Pmp { return None; }
-    Some(PmpTopology { num_ports: 0, vendor: 0, product: 0 })
+    if info.kind != PortKind::Pmp {
+        return None;
+    }
+    Some(PmpTopology {
+        num_ports: 0,
+        vendor: 0,
+        product: 0,
+    })
 }
 
 /// Decode the model-number string from an IDENTIFY DEVICE response.
@@ -871,7 +951,7 @@ pub fn discover_pmp_topology(ahci: &Ahci, port_idx: u8) -> Option<PmpTopology> {
 pub fn identify_model(id: &[u8; 512]) -> [u8; 40] {
     let mut out = [b' '; 40];
     for i in 0..20 {
-        out[i * 2]     = id[54 + i * 2 + 1];
+        out[i * 2] = id[54 + i * 2 + 1];
         out[i * 2 + 1] = id[54 + i * 2];
     }
     out
@@ -885,36 +965,47 @@ pub fn identify_model(id: &[u8; 512]) -> [u8; 40] {
 pub struct AhciBlockSync;
 
 impl narf_block::BlockDeviceSync for AhciBlockSync {
-    fn lba_size(&self) -> u32 { 512 }
+    fn lba_size(&self) -> u32 {
+        512
+    }
     fn capacity(&self) -> u64 {
         // Stage-4 stub. IDENTIFY DEVICE words 100..103 = total
         // user-addressable LBAs (48-bit); we don't cache that yet.
         0
     }
-    fn read(&self, lba: u64, n_blocks: u16, out: &mut [u8])
-        -> Result<(), narf_block::BlockIoError>
-    {
+    fn read(
+        &self,
+        lba: u64,
+        n_blocks: u16,
+        out: &mut [u8],
+    ) -> Result<(), narf_block::BlockIoError> {
         if (n_blocks as usize) * 512 > 4096 || out.len() < (n_blocks as usize) * 512 {
             return Err(narf_block::BlockIoError::BufferTooSmall);
         }
         let g = CONTROLLER.lock();
         let ahci = g.as_ref().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
-        let port = ahci.ports.iter()
-            .find(|p| p.kind == PortKind::Sata).map(|p| p.index).unwrap_or(0);
+        let port = ahci
+            .ports
+            .iter()
+            .find(|p| p.kind == PortKind::Sata)
+            .map(|p| p.index)
+            .unwrap_or(0);
         // SAFETY: caller-trusted single-thread access.
         unsafe { ahci_read_lba(ahci, port, lba, n_blocks, out) }
             .map_err(|_| narf_block::BlockIoError::DriverError)
     }
-    fn write(&self, lba: u64, n_blocks: u16, data: &[u8])
-        -> Result<(), narf_block::BlockIoError>
-    {
+    fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), narf_block::BlockIoError> {
         if (n_blocks as usize) * 512 > 4096 || data.len() < (n_blocks as usize) * 512 {
             return Err(narf_block::BlockIoError::BufferTooSmall);
         }
         let g = CONTROLLER.lock();
         let ahci = g.as_ref().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
-        let port = ahci.ports.iter()
-            .find(|p| p.kind == PortKind::Sata).map(|p| p.index).unwrap_or(0);
+        let port = ahci
+            .ports
+            .iter()
+            .find(|p| p.kind == PortKind::Sata)
+            .map(|p| p.index)
+            .unwrap_or(0);
         // SAFETY: same.
         unsafe { ahci_write_lba(ahci, port, lba, n_blocks, data) }
             .map_err(|_| narf_block::BlockIoError::DriverError)
@@ -923,36 +1014,37 @@ impl narf_block::BlockDeviceSync for AhciBlockSync {
 
 // ── Driver-match registration ────────────────────────────────────────
 
-static CONTROLLER: IrqSafeSpinLock<Option<Ahci>> =
-    IrqSafeSpinLock::new(None);
+static CONTROLLER: IrqSafeSpinLock<Option<Ahci>> = IrqSafeSpinLock::new(None);
 
-pub fn probe(
-    device: BusDevice,
-    cap:    Cap<BusDeviceCap, Write>,
-) -> Result<(), narf_bus::ProbeError> {
-    if CONTROLLER.lock().is_some() { return Ok(()); }
+pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
+    if CONTROLLER.lock().is_some() {
+        return Ok(());
+    }
     narf_bus::pci::set_command(
-        &cap, &device,
+        &cap,
+        &device,
         narf_bus::pci::cmd::MEM_SPACE
             | narf_bus::pci::cmd::BUS_MASTER
             | narf_bus::pci::cmd::INTX_DISABLE,
-    ).map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    )
+    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // SAFETY: caller-authority over the device's BAR.
     let dev = match unsafe { Ahci::bring_up(&device, &cap) } {
-        Ok(d)  => d,
+        Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
     *CONTROLLER.lock() = Some(dev);
     // Register against the unified block-device registry.
-    narf_block::register_block_device("sata0",
-        alloc::sync::Arc::new(AhciBlockSync)
-            as alloc::sync::Arc<dyn narf_block::BlockDeviceSync>);
+    narf_block::register_block_device(
+        "sata0",
+        alloc::sync::Arc::new(AhciBlockSync) as alloc::sync::Arc<dyn narf_block::BlockDeviceSync>,
+    );
     narf_drivers::record_bound(narf_drivers::BoundDriver {
-        name:    alloc::string::String::from("sata0"),
-        kind:    narf_drivers::BoundKind::Block,
+        name: alloc::string::String::from("sata0"),
+        kind: narf_drivers::BoundKind::Block,
         pci_vid: Some(device.id.vendor),
         pci_did: Some(device.id.device),
-        domain:  narf_drivers::BoundKind::Block.default_domain(),
+        domain: narf_drivers::BoundKind::Block.default_domain(),
     });
     Ok(())
 }
@@ -962,7 +1054,8 @@ pub fn register_pci_driver() {
         narf_bus::register_pci_driver(narf_bus::PciMatch {
             name: name_for(did),
             kind: narf_bus::MatchKind::VendorDevice {
-                vendor: AHCI_VENDOR, device: did,
+                vendor: AHCI_VENDOR,
+                device: did,
             },
             probe,
         });
@@ -971,13 +1064,15 @@ pub fn register_pci_driver() {
 
 fn name_for(did: u16) -> &'static str {
     match did {
-        AHCI_ICH9_DEV  => "ahci-ich9",
+        AHCI_ICH9_DEV => "ahci-ich9",
         AHCI_ICH10_DEV => "ahci-ich10",
-        _              => "ahci",
+        _ => "ahci",
     }
 }
 
-pub fn is_probed() -> bool { CONTROLLER.lock().is_some() }
+pub fn is_probed() -> bool {
+    CONTROLLER.lock().is_some()
+}
 
 pub fn with_controller<R>(f: impl FnOnce(&Ahci) -> R) -> Option<R> {
     CONTROLLER.lock().as_ref().map(f)

@@ -1,6 +1,6 @@
 //! aarch64 MMU bring-up and identity mapping.
 
-use crate::{PhysAddr};
+use crate::PhysAddr;
 
 /// Errors from `init_mmu`.
 #[derive(Copy, Clone, Debug)]

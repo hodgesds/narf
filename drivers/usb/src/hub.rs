@@ -53,32 +53,32 @@ pub const HUB_INTERFACE_CLASS: u8 = 0x09;
 pub const HUB_DESC_TYPE: u8 = 0x29;
 
 // `bmRequestType` discriminators.
-pub const RT_HOST_TO_DEV_CLASS_OTHER:  u8 = 0x23;
-pub const RT_DEV_TO_HOST_CLASS_OTHER:  u8 = 0xA3;
+pub const RT_HOST_TO_DEV_CLASS_OTHER: u8 = 0x23;
+pub const RT_DEV_TO_HOST_CLASS_OTHER: u8 = 0xA3;
 pub const RT_DEV_TO_HOST_CLASS_DEVICE: u8 = 0xA0;
 
 // `bRequest` values (§11.24.2).
-pub const REQ_GET_STATUS:    u8 = 0x00;
+pub const REQ_GET_STATUS: u8 = 0x00;
 pub const REQ_CLEAR_FEATURE: u8 = 0x01;
-pub const REQ_SET_FEATURE:   u8 = 0x03;
+pub const REQ_SET_FEATURE: u8 = 0x03;
 pub const REQ_GET_DESCRIPTOR: u8 = 0x06;
 
 // Port features (§11.24.2.7.2 Table 11-17).
-pub const PORT_CONNECTION:   u16 = 0;
-pub const PORT_ENABLE:       u16 = 1;
-pub const PORT_SUSPEND:      u16 = 2;
+pub const PORT_CONNECTION: u16 = 0;
+pub const PORT_ENABLE: u16 = 1;
+pub const PORT_SUSPEND: u16 = 2;
 pub const PORT_OVER_CURRENT: u16 = 3;
-pub const PORT_RESET:        u16 = 4;
-pub const PORT_POWER:        u16 = 8;
-pub const PORT_LOW_SPEED:    u16 = 9;
+pub const PORT_RESET: u16 = 4;
+pub const PORT_POWER: u16 = 8;
+pub const PORT_LOW_SPEED: u16 = 9;
 pub const C_PORT_CONNECTION: u16 = 16;
-pub const C_PORT_ENABLE:     u16 = 17;
-pub const C_PORT_RESET:      u16 = 20;
+pub const C_PORT_ENABLE: u16 = 17;
+pub const C_PORT_RESET: u16 = 20;
 
 // Port status word bits (§11.24.2.7.1 Table 11-15).
 pub const PSTAT_CONNECTION: u16 = 1 << 0;
-pub const PSTAT_ENABLE:     u16 = 1 << 1;
-pub const PSTAT_RESET:      u16 = 1 << 4;
+pub const PSTAT_ENABLE: u16 = 1 << 1;
+pub const PSTAT_RESET: u16 = 1 << 4;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum HubError {
@@ -89,7 +89,9 @@ pub enum HubError {
 }
 
 impl From<xhci::XhciError> for HubError {
-    fn from(e: xhci::XhciError) -> Self { HubError::Xhci(e) }
+    fn from(e: xhci::XhciError) -> Self {
+        HubError::Xhci(e)
+    }
 }
 
 /// Decoded hub descriptor (USB 2.0, 9 bytes — USB 3.x has an
@@ -108,12 +110,14 @@ pub struct HubDescriptor {
 
 impl HubDescriptor {
     pub fn decode(buf: &[u8]) -> Option<Self> {
-        if buf.len() < 9 || buf[1] != HUB_DESC_TYPE { return None; }
+        if buf.len() < 9 || buf[1] != HUB_DESC_TYPE {
+            return None;
+        }
         Some(Self {
-            num_ports:           buf[2],
-            characteristics:     u16::from_le_bytes([buf[3], buf[4]]),
-            poweron_time_2ms:    buf[5],
-            controller_current:  buf[6],
+            num_ports: buf[2],
+            characteristics: u16::from_le_bytes([buf[3], buf[4]]),
+            poweron_time_2ms: buf[5],
+            controller_current: buf[6],
         })
     }
 }
@@ -121,7 +125,7 @@ impl HubDescriptor {
 /// One bound hub.
 #[derive(Debug)]
 pub struct UsbHub {
-    pub slot_id:   u8,
+    pub slot_id: u8,
     pub iface_num: u8,
     pub descriptor: HubDescriptor,
 }
@@ -133,7 +137,9 @@ pub fn find_hub_interface(cfg: &[u8]) -> Option<u8> {
     let mut i = 0usize;
     while i + 2 <= cfg.len() {
         let len = cfg[i] as usize;
-        if len < 2 || i + len > cfg.len() { break; }
+        if len < 2 || i + len > cfg.len() {
+            break;
+        }
         let dtype = cfg[i + 1];
         if dtype == 4 && len >= 9 && cfg[i + 5] == HUB_INTERFACE_CLASS {
             return Some(cfg[i + 2]);
@@ -147,11 +153,7 @@ impl UsbHub {
     /// Bind to an already-addressed USB hub slot. Issues
     /// GET_DESCRIPTOR(Hub) so `descriptor` is populated, then
     /// powers on every downstream port.
-    pub fn attach(
-        xhci_dev: &Xhci,
-        slot_id:  u8,
-        iface_num: u8,
-    ) -> Result<Self, HubError> {
+    pub fn attach(xhci_dev: &Xhci, slot_id: u8, iface_num: u8) -> Result<Self, HubError> {
         // GET_DESCRIPTOR(Hub) — bmRequestType 0xA0, value
         // (HUB_DESC_TYPE << 8), index 0.
         let mut desc_buf = [0u8; 16];
@@ -163,9 +165,10 @@ impl UsbHub {
             0,
             &mut desc_buf,
         )?;
-        if n < 9 { return Err(HubError::BadDescriptor); }
-        let descriptor = HubDescriptor::decode(&desc_buf[..n])
-            .ok_or(HubError::BadDescriptor)?;
+        if n < 9 {
+            return Err(HubError::BadDescriptor);
+        }
+        let descriptor = HubDescriptor::decode(&desc_buf[..n]).ok_or(HubError::BadDescriptor)?;
 
         // Power on every downstream port via SET_FEATURE(PORT_POWER).
         let mut nothing = [0u8; 0];
@@ -180,7 +183,11 @@ impl UsbHub {
             );
         }
 
-        Ok(UsbHub { slot_id, iface_num, descriptor })
+        Ok(UsbHub {
+            slot_id,
+            iface_num,
+            descriptor,
+        })
     }
 
     /// Read the 4-byte port status word for `port` (1-indexed).
@@ -226,7 +233,9 @@ impl UsbHub {
                 );
                 return Ok(());
             }
-            for _ in 0..100_000 { core::hint::spin_loop(); }
+            for _ in 0..100_000 {
+                core::hint::spin_loop();
+            }
         }
         Err(HubError::PortResetTimeout)
     }

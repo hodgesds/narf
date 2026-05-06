@@ -83,7 +83,9 @@ pub unsafe fn write_base(base: u64, limit: u64) {
     }
     // SAFETY: caller-asserted. TRBLIMITR controls limit + enable.
     let prev = unsafe { read_trblimitr() } & 0xFFF; // preserve low control bits
-    unsafe { write_trblimitr((limit & !0xFFF) | prev); }
+    unsafe {
+        write_trblimitr((limit & !0xFFF) | prev);
+    }
 }
 
 const TRBLIMITR_E: u64 = 1 << 0;
@@ -95,11 +97,15 @@ const TRBLIMITR_E: u64 = 1 << 0;
 pub unsafe fn enable() {
     // SAFETY: caller-asserted.
     let v = unsafe { read_trblimitr() } | TRBLIMITR_E;
-    unsafe { write_trblimitr(v); }
+    unsafe {
+        write_trblimitr(v);
+    }
 }
 
 pub unsafe fn disable() {
     // SAFETY: caller-asserted.
     let v = unsafe { read_trblimitr() } & !TRBLIMITR_E;
-    unsafe { write_trblimitr(v); }
+    unsafe {
+        write_trblimitr(v);
+    }
 }

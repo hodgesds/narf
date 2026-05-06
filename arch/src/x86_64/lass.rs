@@ -20,7 +20,9 @@ pub const CR4_LASS: u64 = 1 << 27;
 pub fn supported() -> bool {
     // SAFETY: leaf 0 always defined.
     let max = unsafe { cpuid(0, 0).0 };
-    if max < 7 { return false; }
+    if max < 7 {
+        return false;
+    }
     // SAFETY: leaf 7 sub-leaf 1 valid.
     let (eax, _, _, _) = unsafe { cpuid(7, 1) };
     eax & (1 << 6) != 0
@@ -33,7 +35,9 @@ pub fn supported() -> bool {
 pub unsafe fn enable_cr4() {
     // SAFETY: caller-asserted.
     let v = unsafe { read_cr4() };
-    unsafe { write_cr4(v | CR4_LASS); }
+    unsafe {
+        write_cr4(v | CR4_LASS);
+    }
 }
 
 /// Clear CR4.LASS.
@@ -43,5 +47,7 @@ pub unsafe fn enable_cr4() {
 pub unsafe fn disable_cr4() {
     // SAFETY: caller-asserted.
     let v = unsafe { read_cr4() };
-    unsafe { write_cr4(v & !CR4_LASS); }
+    unsafe {
+        write_cr4(v & !CR4_LASS);
+    }
 }

@@ -36,12 +36,12 @@ pub mod aarch64;
 pub use aarch64 as current;
 
 /// Typical IRQ-vector assignments.
-pub const VECTOR_TIMER:         u8 = 32;
+pub const VECTOR_TIMER: u8 = 32;
 /// Cross-CPU TLB-shootdown IPI. Sender writes a target VA to a
 /// per-CPU shootdown slot then signals via x2APIC ICR all-but-self;
 /// the handler runs INVLPG and bumps an ack counter.
 pub const VECTOR_TLB_SHOOTDOWN: u8 = 0xF0;
-pub const VECTOR_SPURIOUS:      u8 = 0xFF;
+pub const VECTOR_SPURIOUS: u8 = 0xFF;
 
 /// Send end-of-interrupt to the LAPIC.
 ///
@@ -52,7 +52,9 @@ pub unsafe fn eoi() {
     // SAFETY: platform contract; x86_64 backend writes to the LAPIC EOI
     // register. Must be invoked exactly once per IRQ handler dispatch,
     // else the LAPIC will stall further interrupts on the same level.
-    unsafe { current::eoi(); }
+    unsafe {
+        current::eoi();
+    }
 }
 
 /// Stub: aarch64 GIC EOI lands with the GICv3 skeleton.
@@ -70,19 +72,25 @@ pub fn install_tlb_shootdown_bridge() {
 
 #[cfg(target_arch = "x86_64")]
 fn ipi_fanout_bridge(req: narf_memory::tlb_shootdown::ShootdownRequest) {
-    if narf_lib::smp::cpu_count() <= 1 { return; }
+    if narf_lib::smp::cpu_count() <= 1 {
+        return;
+    }
     match (req.tag, req.addr, req.size) {
         // Tag + VA + size: range shootdown the existing IPI infra
         // already supports. Convert size to page count (4 KiB pages).
         (Some(_tag), Some(va), Some(size)) => {
             let pages = (size + 0xFFF) / 0x1000;
             // SAFETY: x2APIC online post-boot; vector installed.
-            unsafe { x86_64::ipi::shoot_range(va, pages.max(1)); }
+            unsafe {
+                x86_64::ipi::shoot_range(va, pages.max(1));
+            }
         }
         // Tag + VA single-page.
         (Some(_tag), Some(va), None) => {
             // SAFETY: same.
-            unsafe { x86_64::ipi::shoot_va(va); }
+            unsafe {
+                x86_64::ipi::shoot_va(va);
+            }
         }
         // Tag-only (full per-tag flush) — coarsen to broadcast
         // VMALLE-equivalent. The existing IPI handler is VA-based,
@@ -120,10 +128,14 @@ fn ipi_fanout_bridge(req: narf_memory::tlb_shootdown::ShootdownRequest) {
 
 #[cfg(target_arch = "aarch64")]
 fn ipi_fanout_bridge(_req: narf_memory::tlb_shootdown::ShootdownRequest) {
-    if narf_lib::smp::cpu_count() <= 1 { return; }
+    if narf_lib::smp::cpu_count() <= 1 {
+        return;
+    }
     // SAFETY: GIC is up post-boot; SGI_TLB_SHOOTDOWN is the
     // reserved vector for this purpose.
-    unsafe { aarch64::sgi::broadcast_others(aarch64::sgi::SGI_TLB_SHOOTDOWN); }
+    unsafe {
+        aarch64::sgi::broadcast_others(aarch64::sgi::SGI_TLB_SHOOTDOWN);
+    }
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -150,4 +162,6 @@ pub unsafe fn current_cpu_target_id() -> u32 {
 
 #[cfg(not(target_arch = "x86_64"))]
 #[inline]
-pub unsafe fn current_cpu_target_id() -> u32 { 0 }
+pub unsafe fn current_cpu_target_id() -> u32 {
+    0
+}

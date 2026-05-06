@@ -24,7 +24,7 @@ pub const TAG_RESERVED: u16 = 0;
 
 #[derive(Copy, Clone, Debug, Default)]
 pub struct DomainTag {
-    pub tag:        u16,
+    pub tag: u16,
     /// Generation this tag was allocated in. The current
     /// `current_generation()` must match for the tag to be live.
     pub generation: u64,
@@ -39,17 +39,29 @@ fn max_tag_runtime() -> u16 {
         // narf-arch dependency would create a cycle; read directly.
         let v: u64;
         core::arch::asm!("mrs {}, id_aa64mmfr0_el1", out(reg) v, options(nomem, nostack));
-        if (v >> 4) & 0xF == 2 { 16u8 } else { 8u8 }
+        if (v >> 4) & 0xF == 2 {
+            16u8
+        } else {
+            8u8
+        }
     };
-    if bits == 16 { 0xFFFF } else { 0xFF }
+    if bits == 16 {
+        0xFFFF
+    } else {
+        0xFF
+    }
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 const MAX_TAG: u16 = 0xFF;
 
 /// Per-domain tag table. Initialised lazily.
-static TAGS: IrqSafeSpinLock<[DomainTag; N_DOMAINS]> =
-    IrqSafeSpinLock::new([DomainTag { tag: TAG_RESERVED, generation: 0 }; N_DOMAINS]);
+static TAGS: IrqSafeSpinLock<[DomainTag; N_DOMAINS]> = IrqSafeSpinLock::new(
+    [DomainTag {
+        tag: TAG_RESERVED,
+        generation: 0,
+    }; N_DOMAINS],
+);
 
 /// Monotonic generation counter. Bumps on rollover.
 static GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -63,7 +75,10 @@ pub fn allocator_init() {
     NEXT_TAG.store(1, Ordering::Release);
     let mut t = TAGS.lock();
     for slot in t.iter_mut() {
-        *slot = DomainTag { tag: TAG_RESERVED, generation: 0 };
+        *slot = DomainTag {
+            tag: TAG_RESERVED,
+            generation: 0,
+        };
     }
 }
 
@@ -73,13 +88,19 @@ pub fn current_generation() -> u64 {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn arch_max_tag() -> u16 { MAX_TAG }
+fn arch_max_tag() -> u16 {
+    MAX_TAG
+}
 
 #[cfg(target_arch = "aarch64")]
-fn arch_max_tag() -> u16 { max_tag_runtime() }
+fn arch_max_tag() -> u16 {
+    max_tag_runtime()
+}
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-fn arch_max_tag() -> u16 { MAX_TAG }
+fn arch_max_tag() -> u16 {
+    MAX_TAG
+}
 
 /// Allocate (or refresh) the tag for `domain`. Returns the
 /// `DomainTag` valid in the current generation.
@@ -87,7 +108,10 @@ pub fn alloc(domain: DomainId) -> DomainTag {
     let gen_now = current_generation();
     let idx = domain.raw() as usize;
     if idx >= N_DOMAINS {
-        return DomainTag { tag: TAG_RESERVED, generation: gen_now };
+        return DomainTag {
+            tag: TAG_RESERVED,
+            generation: gen_now,
+        };
     }
     {
         let g = TAGS.lock();
@@ -104,7 +128,10 @@ pub fn alloc(domain: DomainId) -> DomainTag {
         rollover_now();
         tag = NEXT_TAG.fetch_add(1, Ordering::AcqRel);
     }
-    let issued = DomainTag { tag, generation: current_generation() };
+    let issued = DomainTag {
+        tag,
+        generation: current_generation(),
+    };
     let mut g = TAGS.lock();
     g[idx] = issued;
     issued
@@ -115,21 +142,31 @@ pub fn alloc(domain: DomainId) -> DomainTag {
 /// unallocated.
 pub fn cached(domain: DomainId) -> Option<DomainTag> {
     let idx = domain.raw() as usize;
-    if idx >= N_DOMAINS { return None; }
+    if idx >= N_DOMAINS {
+        return None;
+    }
     let g = TAGS.lock();
     let cur = g[idx];
-    if cur.tag == TAG_RESERVED { return None; }
-    if cur.generation != current_generation() { return None; }
+    if cur.tag == TAG_RESERVED {
+        return None;
+    }
+    if cur.generation != current_generation() {
+        return None;
+    }
     Some(cur)
 }
 
 /// x86_64 alias.
 #[cfg(target_arch = "x86_64")]
-pub fn pcid_for(domain: DomainId) -> u16 { alloc(domain).tag }
+pub fn pcid_for(domain: DomainId) -> u16 {
+    alloc(domain).tag
+}
 
 /// aarch64 alias.
 #[cfg(target_arch = "aarch64")]
-pub fn asid_for(domain: DomainId) -> u16 { alloc(domain).tag }
+pub fn asid_for(domain: DomainId) -> u16 {
+    alloc(domain).tag
+}
 
 /// Force a rollover: every cached tag becomes stale, the global
 /// counter bumps, and a global TLB flush is requested. The actual
@@ -140,7 +177,10 @@ pub fn rollover_now() {
     NEXT_TAG.store(1, Ordering::Release);
     let mut g = TAGS.lock();
     for slot in g.iter_mut() {
-        *slot = DomainTag { tag: TAG_RESERVED, generation: 0 };
+        *slot = DomainTag {
+            tag: TAG_RESERVED,
+            generation: 0,
+        };
     }
 }
 
@@ -149,9 +189,14 @@ pub fn rollover_now() {
 /// has been torn down.
 pub fn invalidate_tag(domain: DomainId) {
     let idx = domain.raw() as usize;
-    if idx >= N_DOMAINS { return; }
+    if idx >= N_DOMAINS {
+        return;
+    }
     let mut g = TAGS.lock();
-    g[idx] = DomainTag { tag: TAG_RESERVED, generation: 0 };
+    g[idx] = DomainTag {
+        tag: TAG_RESERVED,
+        generation: 0,
+    };
 }
 
 #[doc(hidden)]

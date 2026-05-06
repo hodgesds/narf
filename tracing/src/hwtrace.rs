@@ -39,14 +39,14 @@ impl CapType for HwTraceMarker {
 pub struct HwTraceConfig {
     /// Physical ring-buffer backing the trace output. 0 = driver
     /// supplies its own.
-    pub buffer_phys:    u64,
-    pub buffer_size:    u64,
+    pub buffer_phys: u64,
+    pub buffer_size: u64,
     /// Trace this CPU only (`None` = every online CPU).
-    pub cpu_filter:     Option<u32>,
+    pub cpu_filter: Option<u32>,
     /// Record user-ring execution (CPL=3 / EL0).
-    pub trace_user:     bool,
+    pub trace_user: bool,
     /// Record kernel-ring execution (CPL=0 / EL1).
-    pub trace_kernel:   bool,
+    pub trace_kernel: bool,
     /// Record indirect branches.
     pub trace_indirect: bool,
     /// Record timestamp packets at `timestamp_period` cycles.
@@ -56,9 +56,12 @@ pub struct HwTraceConfig {
 impl Default for HwTraceConfig {
     fn default() -> Self {
         Self {
-            buffer_phys: 0, buffer_size: 0,
+            buffer_phys: 0,
+            buffer_size: 0,
             cpu_filter: None,
-            trace_user: true, trace_kernel: true, trace_indirect: true,
+            trace_user: true,
+            trace_kernel: true,
+            trace_indirect: true,
             timestamp_period: 1024,
         }
     }
@@ -82,15 +85,14 @@ pub enum HwTraceError {
 }
 
 impl From<CapError> for HwTraceError {
-    fn from(_: CapError) -> Self { HwTraceError::AuthorityRevoked }
+    fn from(_: CapError) -> Self {
+        HwTraceError::AuthorityRevoked
+    }
 }
 
 /// Start a new trace session. Returns `NotImplemented` until `arch/`
 /// exposes the Intel PT / CoreSight ETM programming primitives.
-pub fn start(
-    cap: &Cap<HwTraceMarker, Invoke>,
-    cfg: &HwTraceConfig,
-) -> Result<(), HwTraceError> {
+pub fn start(cap: &Cap<HwTraceMarker, Invoke>, cfg: &HwTraceConfig) -> Result<(), HwTraceError> {
     cap.invoke(NoopOp)?;
     if cfg.buffer_size != 0 && cfg.buffer_phys == 0 {
         return Err(HwTraceError::InvalidBuffer);

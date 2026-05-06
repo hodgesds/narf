@@ -89,15 +89,21 @@ pub trait FbScanout: Send + Sync + core::fmt::Debug {
 struct BochsScanout;
 
 impl FbScanout for BochsScanout {
-    fn width(&self)  -> u32 {
+    fn width(&self) -> u32 {
         narf_graphics_driver::bochs::with_controller(|d| d.width).unwrap_or(0)
     }
     fn height(&self) -> u32 {
         narf_graphics_driver::bochs::with_controller(|d| d.height).unwrap_or(0)
     }
-    fn stride(&self) -> u32 { self.width() }
-    fn format(&self) -> PixelFormat { PixelFormat::XRGB8888 }
-    fn name(&self)   -> &'static str { "bochs" }
+    fn stride(&self) -> u32 {
+        self.width()
+    }
+    fn format(&self) -> PixelFormat {
+        PixelFormat::XRGB8888
+    }
+    fn name(&self) -> &'static str {
+        "bochs"
+    }
     fn flush(&self, _x: u32, _y: u32, _w: u32, _h: u32) {
         // bochs is direct-MMIO — pixels appear as soon as they're
         // written. No host-side blit needed.
@@ -110,7 +116,8 @@ impl FbScanout for BochsScanout {
         narf_graphics_driver::bochs::with_controller(|d| {
             // SAFETY: same.
             unsafe { d.framebuffer() }
-        }).expect("bochs scanout selected without controller")
+        })
+        .expect("bochs scanout selected without controller")
     }
 }
 
@@ -130,35 +137,40 @@ use alloc::vec::Vec;
 
 #[derive(Debug)]
 struct TestScanoutInner {
-    width:  u32,
+    width: u32,
     height: u32,
     /// Heap pixel buffer. Aliased through `framebuffer()`'s
     /// raw-pointer view — caller-side write semantics handled by
     /// FbWriter's check_live + the smoke's exclusive scope.
-    buf:    Vec<u32>,
+    buf: Vec<u32>,
 }
 
 #[derive(Debug)]
 pub struct TestScanout(narf_lib::sync::IrqSafeSpinLock<TestScanoutInner>);
 
 impl FbScanout for TestScanout {
-    fn width(&self)  -> u32 { self.0.lock().width }
-    fn height(&self) -> u32 { self.0.lock().height }
-    fn stride(&self) -> u32 { self.width() }
-    fn format(&self) -> PixelFormat { PixelFormat::XRGB8888 }
-    fn name(&self)   -> &'static str { "test" }
+    fn width(&self) -> u32 {
+        self.0.lock().width
+    }
+    fn height(&self) -> u32 {
+        self.0.lock().height
+    }
+    fn stride(&self) -> u32 {
+        self.width()
+    }
+    fn format(&self) -> PixelFormat {
+        PixelFormat::XRGB8888
+    }
+    fn name(&self) -> &'static str {
+        "test"
+    }
     fn flush(&self, _x: u32, _y: u32, _w: u32, _h: u32) {}
     unsafe fn framebuffer(&self) -> Framebuffer {
         let g = self.0.lock();
         // SAFETY: Vec stays alive for the scanout's lifetime;
         // pointer is 4-byte aligned (Vec<u32>); caller's Cap +
         // FbWriter exclusivity gates concurrent writers.
-        unsafe {
-            Framebuffer::new(
-                g.buf.as_ptr() as *mut u32,
-                g.width, g.height, g.width,
-            )
-        }
+        unsafe { Framebuffer::new(g.buf.as_ptr() as *mut u32, g.width, g.height, g.width) }
     }
 }
 
@@ -175,9 +187,9 @@ static TEST_SCANOUT: narf_lib::sync::IrqSafeSpinLock<Option<TestScanout>> =
 /// returning.
 pub fn install_test_scanout(width: u32, height: u32) {
     let buf = alloc::vec![0u32; (width * height) as usize];
-    *TEST_SCANOUT.lock() = Some(TestScanout(
-        narf_lib::sync::IrqSafeSpinLock::new(TestScanoutInner { width, height, buf }),
-    ));
+    *TEST_SCANOUT.lock() = Some(TestScanout(narf_lib::sync::IrqSafeSpinLock::new(
+        TestScanoutInner { width, height, buf },
+    )));
 }
 
 pub fn clear_test_scanout() {
@@ -190,7 +202,9 @@ pub fn test_scanout_pixel(x: u32, y: u32) -> Option<Pixel32> {
     let g = TEST_SCANOUT.lock();
     let s = g.as_ref()?;
     let inner = s.0.lock();
-    if x >= inner.width || y >= inner.height { return None; }
+    if x >= inner.width || y >= inner.height {
+        return None;
+    }
     let p = inner.buf[(y * inner.width + x) as usize];
     Some(Pixel32(p))
 }
@@ -201,15 +215,21 @@ pub fn test_scanout_pixel(x: u32, y: u32) -> Option<Pixel32> {
 struct VirtioGpuScanout;
 
 impl FbScanout for VirtioGpuScanout {
-    fn width(&self)  -> u32 {
+    fn width(&self) -> u32 {
         narf_drivers_virtio::gpu_pci::with_controller(|d| d.mode.width).unwrap_or(0)
     }
     fn height(&self) -> u32 {
         narf_drivers_virtio::gpu_pci::with_controller(|d| d.mode.height).unwrap_or(0)
     }
-    fn stride(&self) -> u32 { self.width() }
-    fn format(&self) -> PixelFormat { PixelFormat::XRGB8888 }
-    fn name(&self)   -> &'static str { "virtio-gpu" }
+    fn stride(&self) -> u32 {
+        self.width()
+    }
+    fn format(&self) -> PixelFormat {
+        PixelFormat::XRGB8888
+    }
+    fn name(&self) -> &'static str {
+        "virtio-gpu"
+    }
     fn flush(&self, _x: u32, _y: u32, _w: u32, _h: u32) {
         // M0: flush always covers the full scanout. Per-rect flush
         // is a future TRANSFER_TO_HOST_2D + RESOURCE_FLUSH dance.
@@ -222,7 +242,8 @@ impl FbScanout for VirtioGpuScanout {
         narf_drivers_virtio::gpu_pci::with_controller(|d| {
             // SAFETY: caller holds Write cap.
             unsafe { d.framebuffer() }
-        }).expect("virtio-gpu scanout selected without controller")
+        })
+        .expect("virtio-gpu scanout selected without controller")
     }
 }
 
@@ -233,22 +254,29 @@ struct AmdgpuScanout;
 
 impl FbScanout for AmdgpuScanout {
     fn width(&self) -> u32 {
-        narf_drivers_gpu::amdgpu::with_controller(|d|
+        narf_drivers_gpu::amdgpu::with_controller(|d| {
             d.current_mode().map(|m| m.width).unwrap_or(0)
-        ).unwrap_or(0)
+        })
+        .unwrap_or(0)
     }
     fn height(&self) -> u32 {
-        narf_drivers_gpu::amdgpu::with_controller(|d|
+        narf_drivers_gpu::amdgpu::with_controller(|d| {
             d.current_mode().map(|m| m.height).unwrap_or(0)
-        ).unwrap_or(0)
+        })
+        .unwrap_or(0)
     }
     fn stride(&self) -> u32 {
-        narf_drivers_gpu::amdgpu::with_controller(|d|
+        narf_drivers_gpu::amdgpu::with_controller(|d| {
             d.current_mode().map(|m| m.stride).unwrap_or(0)
-        ).unwrap_or(0)
+        })
+        .unwrap_or(0)
     }
-    fn format(&self) -> PixelFormat { PixelFormat::XRGB8888 }
-    fn name(&self) -> &'static str { "amdgpu" }
+    fn format(&self) -> PixelFormat {
+        PixelFormat::XRGB8888
+    }
+    fn name(&self) -> &'static str {
+        "amdgpu"
+    }
     fn flush(&self, _x: u32, _y: u32, _w: u32, _h: u32) {
         // amdgpu is a direct-FB backend (CPU writes to VRAM via
         // the BAR0 MMIO mapping; the DCN scanout DMA's from VRAM
@@ -263,15 +291,16 @@ impl FbScanout for AmdgpuScanout {
             // scan out from `base`; the caller holds the FbScanout
             // cap that serializes writers. Stride is in pixels.
             unsafe { Framebuffer::new(base, mode.width, mode.height, mode.stride) }
-        }).expect("amdgpu scanout selected without controller")
+        })
+        .expect("amdgpu scanout selected without controller")
     }
 }
 
 // ── active-scanout picker ───────────────────────────────────────────
 
-static BOCHS:      BochsScanout      = BochsScanout;
-static VIRTIO_GPU: VirtioGpuScanout  = VirtioGpuScanout;
-static AMDGPU:     AmdgpuScanout     = AmdgpuScanout;
+static BOCHS: BochsScanout = BochsScanout;
+static VIRTIO_GPU: VirtioGpuScanout = VirtioGpuScanout;
+static AMDGPU: AmdgpuScanout = AmdgpuScanout;
 
 /// Picker. Prefers a test scanout (when installed) for hermetic
 /// smokes; otherwise bochs (no command-queue tax) when its BAR is
@@ -308,23 +337,21 @@ pub fn select_active() -> Option<&'static dyn FbScanout> {
     // The firmware-loaded gate (`is_ready`) is intentionally NOT
     // required: passive scanout is firmware-by-default.
     if narf_drivers_gpu::amdgpu::is_probed() {
-        let mode_ok = narf_drivers_gpu::amdgpu::with_controller(|d|
-            d.current_mode().is_some()
-        ).unwrap_or(false);
+        let mode_ok = narf_drivers_gpu::amdgpu::with_controller(|d| d.current_mode().is_some())
+            .unwrap_or(false);
         if mode_ok {
             return Some(&AMDGPU);
         }
     }
     if narf_graphics_driver::bochs::is_probed() {
-        let reachable = narf_graphics_driver::bochs::with_controller(|d| d.fb_reachable())
-            .unwrap_or(false);
+        let reachable =
+            narf_graphics_driver::bochs::with_controller(|d| d.fb_reachable()).unwrap_or(false);
         if reachable {
             return Some(&BOCHS);
         }
     }
     if narf_drivers_virtio::gpu_pci::is_probed() {
-        let ready = narf_drivers_virtio::gpu_pci::with_controller(|d| d.ready)
-            .unwrap_or(false);
+        let ready = narf_drivers_virtio::gpu_pci::with_controller(|d| d.ready).unwrap_or(false);
         if ready {
             return Some(&VIRTIO_GPU);
         }
@@ -361,7 +388,9 @@ pub struct Rect {
 }
 
 impl Rect {
-    pub const fn new(x: u32, y: u32, w: u32, h: u32) -> Self { Self { x, y, w, h } }
+    pub const fn new(x: u32, y: u32, w: u32, h: u32) -> Self {
+        Self { x, y, w, h }
+    }
     /// Clip this rect against the supplied bounds. Returns the
     /// intersection or `None` if the rects don't overlap.
     pub fn clip(self, fb_w: u32, fb_h: u32) -> Option<Self> {
@@ -370,7 +399,12 @@ impl Rect {
         }
         let x_end = self.x.saturating_add(self.w).min(fb_w);
         let y_end = self.y.saturating_add(self.h).min(fb_h);
-        Some(Self { x: self.x, y: self.y, w: x_end - self.x, h: y_end - self.y })
+        Some(Self {
+            x: self.x,
+            y: self.y,
+            w: x_end - self.x,
+            h: y_end - self.y,
+        })
     }
 }
 
@@ -389,7 +423,7 @@ pub struct FbWriter {
     /// Holding the cap by-value ensures the writer can only exist
     /// while the cap is live; cap revocation invalidates this
     /// writer at construction time (we re-check at every op).
-    cap:     Cap<FbScanoutCap, Write>,
+    cap: Cap<FbScanoutCap, Write>,
 }
 
 impl FbWriter {
@@ -400,13 +434,21 @@ impl FbWriter {
         Ok(Self { scanout, cap })
     }
 
-    pub fn width(&self)  -> u32 { self.scanout.width() }
-    pub fn height(&self) -> u32 { self.scanout.height() }
-    pub fn name(&self)   -> &'static str { self.scanout.name() }
+    pub fn width(&self) -> u32 {
+        self.scanout.width()
+    }
+    pub fn height(&self) -> u32 {
+        self.scanout.height()
+    }
+    pub fn name(&self) -> &'static str {
+        self.scanout.name()
+    }
 
     /// Validate cap is still live; returns `Err` if revoked.
     fn check_live(&self) -> Result<(), FbWriteError> {
-        self.cap.check_live().map_err(|_| FbWriteError::NoActiveScanout)
+        self.cap
+            .check_live()
+            .map_err(|_| FbWriteError::NoActiveScanout)
     }
 
     /// Fill a rectangle with `pixel`. Out-of-bounds rects are clipped;
@@ -414,7 +456,8 @@ impl FbWriter {
     /// no-op'ing — callers should detect this at the API boundary.
     pub fn fill(&self, rect: Rect, pixel: Pixel32) -> Result<(), FbWriteError> {
         self.check_live()?;
-        let clipped = rect.clip(self.scanout.width(), self.scanout.height())
+        let clipped = rect
+            .clip(self.scanout.width(), self.scanout.height())
             .ok_or(FbWriteError::OutOfBounds)?;
         // SAFETY: cap-checked above; FbWriter owns exclusive Write.
         let mut fb = unsafe { self.scanout.framebuffer() };
@@ -425,9 +468,11 @@ impl FbWriter {
     /// Push a rect to the host display (matters on virtio-gpu).
     pub fn flush(&self, rect: Rect) -> Result<(), FbWriteError> {
         self.check_live()?;
-        let clipped = rect.clip(self.scanout.width(), self.scanout.height())
+        let clipped = rect
+            .clip(self.scanout.width(), self.scanout.height())
             .ok_or(FbWriteError::OutOfBounds)?;
-        self.scanout.flush(clipped.x, clipped.y, clipped.w, clipped.h);
+        self.scanout
+            .flush(clipped.x, clipped.y, clipped.w, clipped.h);
         Ok(())
     }
 
@@ -439,16 +484,13 @@ impl FbWriter {
     /// Kernel-side primitive for callers that already have the
     /// pixels in a `&[Pixel32]`. Userspace producers go through
     /// `blit_from_shmem` via `TAG_BLIT` instead.
-    pub fn blit(
-        &self,
-        rect: Rect,
-        src:  &[Pixel32],
-    ) -> Result<(), FbWriteError> {
+    pub fn blit(&self, rect: Rect, src: &[Pixel32]) -> Result<(), FbWriteError> {
         self.check_live()?;
         if src.len() != (rect.w as usize) * (rect.h as usize) {
             return Err(FbWriteError::OutOfBounds);
         }
-        let clipped = rect.clip(self.scanout.width(), self.scanout.height())
+        let clipped = rect
+            .clip(self.scanout.width(), self.scanout.height())
             .ok_or(FbWriteError::OutOfBounds)?;
         // Offsets into `src` accounting for the clip. Clipping can
         // shrink the rect from any edge; preserve the unclipped
@@ -460,8 +502,7 @@ impl FbWriter {
         let mut fb = unsafe { self.scanout.framebuffer() };
         for row in 0..clipped.h {
             for col in 0..clipped.w {
-                let s = src[(dy + row as usize) * (rect.w as usize)
-                          + (dx + col as usize)];
+                let s = src[(dy + row as usize) * (rect.w as usize) + (dx + col as usize)];
                 fb.draw_pixel(clipped.x + col, clipped.y + row, s);
             }
         }
@@ -479,8 +520,8 @@ impl FbWriter {
     /// blit doesn't fault on a missing shmem byte.
     pub fn blit_from_shmem(
         &self,
-        rect:       Rect,
-        buffer:     u64,
+        rect: Rect,
+        buffer: u64,
         src_offset: u32,
         src_stride: u32,
     ) -> Result<(), FbWriteError> {
@@ -488,7 +529,8 @@ impl FbWriter {
         if src_stride < rect.w.saturating_mul(4) {
             return Err(FbWriteError::OutOfBounds);
         }
-        let clipped = rect.clip(self.scanout.width(), self.scanout.height())
+        let clipped = rect
+            .clip(self.scanout.width(), self.scanout.height())
             .ok_or(FbWriteError::OutOfBounds)?;
         let dx = (clipped.x - rect.x) as u32;
         let dy = (clipped.y - rect.y) as u32;
@@ -497,19 +539,16 @@ impl FbWriter {
         // lands on the scanout.
         let last_row = dy + clipped.h - 1;
         let last_col = dx + clipped.w - 1;
-        let last_off = src_offset as u64
-            + last_row as u64 * src_stride as u64
-            + last_col as u64 * 4
-            + 3;
+        let last_off =
+            src_offset as u64 + last_row as u64 * src_stride as u64 + last_col as u64 * 4 + 3;
         if narf_shmem::phys_at(buffer, last_off).is_none() {
             return Err(FbWriteError::OutOfBounds);
         }
         // SAFETY: cap-checked above; FbWriter owns exclusive Write.
         let mut fb = unsafe { self.scanout.framebuffer() };
         for row in 0..clipped.h {
-            let row_base = src_offset as u64
-                + (dy + row) as u64 * src_stride as u64
-                + dx as u64 * 4;
+            let row_base =
+                src_offset as u64 + (dy + row) as u64 * src_stride as u64 + dx as u64 * 4;
             for col in 0..clipped.w {
                 let off = row_base + col as u64 * 4;
                 // SAFETY: identity-mapped low-RAM frame; we
@@ -518,7 +557,7 @@ impl FbWriter {
                 // phys we own (kernel-allocated shmem frames).
                 let phys = match narf_shmem::phys_at(buffer, off) {
                     Some(p) => p,
-                    None    => return Err(FbWriteError::OutOfBounds),
+                    None => return Err(FbWriteError::OutOfBounds),
                 };
                 let pix = unsafe { core::ptr::read_volatile(phys as *const u32) };
                 fb.draw_pixel(clipped.x + col, clipped.y + row, Pixel32(pix));
@@ -533,18 +572,21 @@ impl FbWriter {
 /// stricter access mint a `Cap<FbScanoutCap, Read>`.
 #[derive(Copy, Clone, Debug)]
 pub struct ScanoutInfo {
-    pub width:  u32,
+    pub width: u32,
     pub height: u32,
     pub stride: u32,
     pub format: PixelFormat,
-    pub name:   &'static str,
+    pub name: &'static str,
 }
 
 pub fn info() -> Option<ScanoutInfo> {
     let s = select_active()?;
     Some(ScanoutInfo {
-        width: s.width(), height: s.height(), stride: s.stride(),
-        format: s.format(), name: s.name(),
+        width: s.width(),
+        height: s.height(),
+        stride: s.stride(),
+        format: s.format(),
+        name: s.name(),
     })
 }
 
@@ -594,18 +636,22 @@ fn fb_drain_pump() {
 /// the spawned drain future. Idempotent: only the first call
 /// stores; subsequent calls are silently dropped.
 fn init_pump_writer(writer: FbWriter) {
-    static DONE: core::sync::atomic::AtomicBool =
-        core::sync::atomic::AtomicBool::new(false);
+    static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
     if DONE
-        .compare_exchange(false, true,
+        .compare_exchange(
+            false,
+            true,
             core::sync::atomic::Ordering::AcqRel,
-            core::sync::atomic::Ordering::Acquire)
+            core::sync::atomic::Ordering::Acquire,
+        )
         .is_ok()
     {
         // SAFETY: first-and-only writer; no concurrent reader yet
         // (the pump can't fire before `register_initcalls`
         // completes Stage::Late).
-        unsafe { *PUMP_WRITER.0.get() = Some(writer); }
+        unsafe {
+            *PUMP_WRITER.0.get() = Some(writer);
+        }
     }
 }
 
@@ -638,7 +684,7 @@ pub fn register_initcalls() {
     narf_init::register(Stage::Late, "fb-scanout-picker", || {
         if let Some(s) = select_active() {
             INIT_BACKEND_NAME.store(s.name().as_ptr() as usize, Ordering::Release);
-            INIT_BACKEND_LEN.store(s.name().len(),               Ordering::Release);
+            INIT_BACKEND_LEN.store(s.name().len(), Ordering::Release);
             InitResult::Ok
         } else {
             InitResult::NotPresent
@@ -648,9 +694,9 @@ pub fn register_initcalls() {
         if select_active().is_none() {
             return InitResult::NotPresent;
         }
-        let cap    = bootstrap_writer();
+        let cap = bootstrap_writer();
         let writer = match FbWriter::new(cap) {
-            Ok(w)  => w,
+            Ok(w) => w,
             Err(_) => return InitResult::Error("FbWriter::new"),
         };
         // Cache a second writer for the synchronous drain pump
@@ -681,40 +727,42 @@ pub fn register_initcalls() {
         if select_active().is_none() {
             return InitResult::NotPresent;
         }
-        let cap    = bootstrap_writer();
+        let cap = bootstrap_writer();
         let writer = match FbWriter::new(cap) {
-            Ok(w)  => w,
+            Ok(w) => w,
             Err(_) => return InitResult::Error("FbWriter::new"),
         };
         // SAFETY: SPSC contract — local ring, locally-scoped halves.
-        let (_ring, producer, mut consumer) =
-            unsafe { client::allocate_singleton_ring() };
+        let (_ring, producer, mut consumer) = unsafe { client::allocate_singleton_ring() };
         let mut c = client::FbClient::new(producer);
         let mut total = 0u32;
         // Three fills + a flush so flush also crosses the wire.
-        let _ = c.fill(Rect::new(0,  0, 4, 4),
-                       Pixel32::rgb(0xC0, 0x10, 0x10).raw());
-        let _ = c.fill(Rect::new(8,  0, 4, 4),
-                       Pixel32::rgb(0x10, 0xC0, 0x10).raw());
-        let _ = c.fill(Rect::new(16, 0, 4, 4),
-                       Pixel32::rgb(0x10, 0x10, 0xC0).raw());
+        let _ = c.fill(Rect::new(0, 0, 4, 4), Pixel32::rgb(0xC0, 0x10, 0x10).raw());
+        let _ = c.fill(Rect::new(8, 0, 4, 4), Pixel32::rgb(0x10, 0xC0, 0x10).raw());
+        let _ = c.fill(Rect::new(16, 0, 4, 4), Pixel32::rgb(0x10, 0x10, 0xC0).raw());
         let _ = c.flush(Rect::new(0, 0, 24, 4));
         let (ok, err) = cmd_ring::drain(&mut consumer, &writer);
         total += ok;
         let _ = err;
-        if total >= 3 { InitResult::Ok } else { InitResult::Error("drain stalled") }
+        if total >= 3 {
+            InitResult::Ok
+        } else {
+            InitResult::Error("drain stalled")
+        }
     });
 }
 
 /// Test helper: record the picked backend name during init so
 /// smokes can assert without re-running the picker.
 static INIT_BACKEND_NAME: AtomicUsize = AtomicUsize::new(0);
-static INIT_BACKEND_LEN:  AtomicUsize = AtomicUsize::new(0);
+static INIT_BACKEND_LEN: AtomicUsize = AtomicUsize::new(0);
 
 pub fn last_picked_backend() -> Option<&'static str> {
     let p = INIT_BACKEND_NAME.load(Ordering::Acquire) as *const u8;
     let l = INIT_BACKEND_LEN.load(Ordering::Acquire);
-    if p.is_null() || l == 0 { return None; }
+    if p.is_null() || l == 0 {
+        return None;
+    }
     // SAFETY: the AtomicUsize pair was published from a `&'static str`
     // whose pointer + length stay valid for the kernel's lifetime.
     unsafe {

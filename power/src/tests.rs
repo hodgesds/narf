@@ -9,8 +9,8 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 fn smoke_power_cstate_register() -> TestResult {
     use crate::{
-        bootstrap_power_authority, cstate_count, init, register_cstate,
-        select_idle_state, CState, PowerError,
+        bootstrap_power_authority, cstate_count, init, register_cstate, select_idle_state, CState,
+        PowerError,
     };
 
     init();
@@ -33,7 +33,7 @@ fn smoke_power_cstate_register() -> TestResult {
     }
 
     let chosen = match select_idle_state() {
-        Ok(s)  => s,
+        Ok(s) => s,
         Err(_) => return TestResult::Fail("select_idle_state returned NoMatchingState"),
     };
     if chosen.exit_latency_us > 1_000 {
@@ -45,8 +45,8 @@ kernel_test_in!("power", smoke_power_cstate_register);
 
 fn smoke_power_governor_swap() -> TestResult {
     use crate::{
-        bootstrap_governor_authority, current_governor_name, init,
-        install_governor, OnDemand, Powersave, PowerError,
+        bootstrap_governor_authority, current_governor_name, init, install_governor, OnDemand,
+        PowerError, Powersave,
     };
 
     init();
@@ -70,7 +70,7 @@ fn smoke_power_governor_swap() -> TestResult {
     match install_governor(&cap, Powersave) {
         Err(PowerError::AuthorityRevoked) => {}
         Err(_) => return TestResult::Fail("revoked install returned wrong error variant"),
-        Ok(_)  => return TestResult::Fail("install_governor accepted a revoked cap"),
+        Ok(_) => return TestResult::Fail("install_governor accepted a revoked cap"),
     }
 
     if current_governor_name() != Some("ondemand") {
@@ -84,22 +84,22 @@ fn smoke_power_governor_swap() -> TestResult {
 kernel_test_in!("power", smoke_power_governor_swap);
 
 fn smoke_power_device_pm_lifecycle() -> TestResult {
+    use crate::{
+        bootstrap_device_pm_authority, register_device_pm, resume_device, suspend_device,
+        DeviceRuntimePm,
+    };
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
     use core::future::Future;
     use core::pin::Pin;
     use core::sync::atomic::{AtomicU32, Ordering};
-    use alloc::boxed::Box;
-    use alloc::sync::Arc;
-    use crate::{
-        bootstrap_device_pm_authority, register_device_pm, resume_device,
-        suspend_device, DeviceRuntimePm,
-    };
 
     let suspends = Arc::new(AtomicU32::new(0));
-    let resumes  = Arc::new(AtomicU32::new(0));
+    let resumes = Arc::new(AtomicU32::new(0));
 
     struct Counter {
         suspends: Arc<AtomicU32>,
-        resumes:  Arc<AtomicU32>,
+        resumes: Arc<AtomicU32>,
     }
     impl DeviceRuntimePm for Counter {
         fn suspend<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
@@ -117,9 +117,12 @@ fn smoke_power_device_pm_lifecycle() -> TestResult {
     }
 
     let cap = bootstrap_device_pm_authority();
-    let dev = Counter { suspends: suspends.clone(), resumes: resumes.clone() };
+    let dev = Counter {
+        suspends: suspends.clone(),
+        resumes: resumes.clone(),
+    };
     let handle = match register_device_pm(&cap, dev) {
-        Ok(h)  => h,
+        Ok(h) => h,
         Err(_) => return TestResult::Fail("register_device_pm rejected a live cap"),
     };
 
@@ -141,8 +144,8 @@ fn smoke_power_device_pm_lifecycle() -> TestResult {
 kernel_test_in!("power", smoke_power_device_pm_lifecycle);
 
 fn smoke_power_suspend_phase_progression() -> TestResult {
-    use narf_capabilities::{Cap, Invoke};
     use crate::{suspend, SuspendError, SuspendPhase};
+    use narf_capabilities::{Cap, Invoke};
 
     suspend::__test_reset();
     let cap: Cap<crate::Power, Invoke> = Cap::bootstrap();
@@ -190,10 +193,18 @@ fn smoke_idle_caps_and_encode() -> TestResult {
     use crate::idle;
     idle::__reset_for_test();
     let c = idle::caps();
-    if idle::encode_cstate(0) != 0    { return TestResult::Fail("C0 encode"); }
-    if idle::encode_cstate(1) != 0    { return TestResult::Fail("C1 encode"); }
-    if idle::encode_cstate(3) != 0x20 { return TestResult::Fail("C3 encode"); }
-    if idle::encode_cstate(6) != 0x40 { return TestResult::Fail("C6 encode"); }
+    if idle::encode_cstate(0) != 0 {
+        return TestResult::Fail("C0 encode");
+    }
+    if idle::encode_cstate(1) != 0 {
+        return TestResult::Fail("C1 encode");
+    }
+    if idle::encode_cstate(3) != 0x20 {
+        return TestResult::Fail("C3 encode");
+    }
+    if idle::encode_cstate(6) != 0x40 {
+        return TestResult::Fail("C6 encode");
+    }
     let _ = c;
     TestResult::Pass
 }

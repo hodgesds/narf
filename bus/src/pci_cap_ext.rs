@@ -29,18 +29,18 @@ use crate::registry::BusDeviceCap;
 
 /// Extended cap IDs.
 pub mod id {
-    pub const AER:        u16 = 0x0001;
-    pub const VC:         u16 = 0x0002;
-    pub const ACS:        u16 = 0x000D;
-    pub const ATS:        u16 = 0x000F;
-    pub const SR_IOV:     u16 = 0x0010;
-    pub const DPC:        u16 = 0x001D;
+    pub const AER: u16 = 0x0001;
+    pub const VC: u16 = 0x0002;
+    pub const ACS: u16 = 0x000D;
+    pub const ATS: u16 = 0x000F;
+    pub const SR_IOV: u16 = 0x0010;
+    pub const DPC: u16 = 0x001D;
 }
 
 /// Start of the extended cap list — fixed by spec.
 pub const EXT_CAP_BASE: u64 = 0x100;
 /// PCIe extended config space ends at 0x1000.
-const EXT_CAP_LIMIT: u64    = 0x1000;
+const EXT_CAP_LIMIT: u64 = 0x1000;
 /// Bound the walker against malformed devices.
 const MAX_HOPS: u32 = 256;
 
@@ -51,15 +51,17 @@ pub enum ExtCapError {
 }
 
 impl From<CapError> for ExtCapError {
-    fn from(_: CapError) -> Self { ExtCapError::AuthorityRevoked }
+    fn from(_: CapError) -> Self {
+        ExtCapError::AuthorityRevoked
+    }
 }
 
 /// Decoded extended-cap header.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ExtCapHeader {
-    pub id:      u16,
+    pub id: u16,
     pub version: u8,
-    pub offset:  u64,
+    pub offset: u64,
 }
 
 /// Iterate the extended cap list. ECAM / cfg-space access for offsets
@@ -69,32 +71,37 @@ pub struct ExtCapHeader {
 /// space cleanly returns an empty iterator.
 ///
 /// Cap-gated.
-pub fn iter(
-    cap:    &Cap<BusDeviceCap, Read>,
-    device: &BusDevice,
-) -> Result<ExtCapIter, ExtCapError> {
+pub fn iter(cap: &Cap<BusDeviceCap, Read>, device: &BusDevice) -> Result<ExtCapIter, ExtCapError> {
     cap.check_live()?;
     let cfg = match device.kind {
         BusKind::Pcie { cfg_phys, .. } => cfg_phys,
-        BusKind::VirtioMmio { .. }     => return Err(ExtCapError::NotPcie),
+        BusKind::VirtioMmio { .. } => return Err(ExtCapError::NotPcie),
     };
-    Ok(ExtCapIter { cfg, next: EXT_CAP_BASE, hops: 0 })
+    Ok(ExtCapIter {
+        cfg,
+        next: EXT_CAP_BASE,
+        hops: 0,
+    })
 }
 
 /// Find the first extended capability with the given ID.
 pub fn find_cap(
-    cap:    &Cap<BusDeviceCap, Read>,
+    cap: &Cap<BusDeviceCap, Read>,
     device: &BusDevice,
-    id:     u16,
+    id: u16,
 ) -> Result<Option<ExtCapHeader>, ExtCapError> {
     let it = iter(cap, device)?;
-    for hdr in it { if hdr.id == id { return Ok(Some(hdr)); } }
+    for hdr in it {
+        if hdr.id == id {
+            return Ok(Some(hdr));
+        }
+    }
     Ok(None)
 }
 
 #[derive(Debug)]
 pub struct ExtCapIter {
-    cfg:  PhysAddr,
+    cfg: PhysAddr,
     next: u64,
     hops: u32,
 }
@@ -103,9 +110,9 @@ impl Iterator for ExtCapIter {
     type Item = ExtCapHeader;
     fn next(&mut self) -> Option<ExtCapHeader> {
         if self.next == 0
-           || self.next < EXT_CAP_BASE
-           || self.next >= EXT_CAP_LIMIT
-           || self.hops >= MAX_HOPS
+            || self.next < EXT_CAP_BASE
+            || self.next >= EXT_CAP_LIMIT
+            || self.hops >= MAX_HOPS
         {
             return None;
         }
@@ -113,15 +120,21 @@ impl Iterator for ExtCapIter {
         // bounded `next` keeps us inside the 4 KiB cfg page.
         let hdr = unsafe { cfg_read32(self.cfg, self.next) };
         // All-zero or all-one header = end / unsupported.
-        if hdr == 0 || hdr == 0xFFFF_FFFF { return None; }
+        if hdr == 0 || hdr == 0xFFFF_FFFF {
+            return None;
+        }
 
-        let id      = (hdr & 0xFFFF) as u16;
+        let id = (hdr & 0xFFFF) as u16;
         let version = ((hdr >> 16) & 0xF) as u8;
-        let next    = ((hdr >> 20) & 0xFFF) as u64;
-        let here    = self.next;
-        self.next   = next;
-        self.hops  += 1;
-        Some(ExtCapHeader { id, version, offset: here })
+        let next = ((hdr >> 20) & 0xFFF) as u64;
+        let here = self.next;
+        self.next = next;
+        self.hops += 1;
+        Some(ExtCapHeader {
+            id,
+            version,
+            offset: here,
+        })
     }
 }
 
@@ -133,27 +146,29 @@ pub struct AerStatus {
     /// Uncorrectable Error Status (RW1C, sticky).
     pub uncorrectable_status: u32,
     /// Uncorrectable Error Mask. Bits set = errors suppressed.
-    pub uncorrectable_mask:   u32,
+    pub uncorrectable_mask: u32,
     /// Uncorrectable Error Severity. Bits set = treat as fatal.
     pub uncorrectable_severity: u32,
     /// Correctable Error Status (RW1C, sticky).
-    pub correctable_status:   u32,
+    pub correctable_status: u32,
     /// Correctable Error Mask. Bits set = errors suppressed.
-    pub correctable_mask:     u32,
+    pub correctable_mask: u32,
 }
 
 /// Read the device's AER status if the AER extended cap exists.
 /// Returns `None` for devices without AER (e.g. QEMU NVMe by
 /// default).
 pub fn read_aer(
-    cap:    &Cap<BusDeviceCap, Read>,
+    cap: &Cap<BusDeviceCap, Read>,
     device: &BusDevice,
 ) -> Result<Option<AerStatus>, ExtCapError> {
     let hdr = find_cap(cap, device, id::AER)?;
-    let Some(h) = hdr else { return Ok(None); };
+    let Some(h) = hdr else {
+        return Ok(None);
+    };
     let cfg = match device.kind {
         BusKind::Pcie { cfg_phys, .. } => cfg_phys,
-        BusKind::VirtioMmio { .. }     => return Err(ExtCapError::NotPcie),
+        BusKind::VirtioMmio { .. } => return Err(ExtCapError::NotPcie),
     };
     // AER register layout (PCIe §7.8.4):
     //   +0x04 Uncorrectable Status
@@ -164,11 +179,11 @@ pub fn read_aer(
     // SAFETY: 4 KiB cfg page; offsets stay in range.
     let s = unsafe {
         AerStatus {
-            uncorrectable_status:   cfg_read32(cfg, h.offset + 0x04),
-            uncorrectable_mask:     cfg_read32(cfg, h.offset + 0x08),
+            uncorrectable_status: cfg_read32(cfg, h.offset + 0x04),
+            uncorrectable_mask: cfg_read32(cfg, h.offset + 0x08),
             uncorrectable_severity: cfg_read32(cfg, h.offset + 0x0C),
-            correctable_status:     cfg_read32(cfg, h.offset + 0x10),
-            correctable_mask:       cfg_read32(cfg, h.offset + 0x14),
+            correctable_status: cfg_read32(cfg, h.offset + 0x10),
+            correctable_mask: cfg_read32(cfg, h.offset + 0x14),
         }
     };
     Ok(Some(s))
@@ -218,8 +233,8 @@ pub enum AerSeverity {
 /// classification derived from it.
 #[derive(Copy, Clone, Debug)]
 pub struct AerEvent {
-    pub addr:        BusAddr,
-    pub severity:    AerSeverity,
+    pub addr: BusAddr,
+    pub severity: AerSeverity,
     pub status_word: u32,
 }
 
@@ -265,7 +280,11 @@ pub fn __clear_aer_listeners() {
 
 /// Classify a raw AER status word + severity-mask pair into an
 /// `AerSeverity`. Returns `None` if no error bits are set.
-pub fn classify_aer(uncorr_status: u32, uncorr_severity: u32, corr_status: u32) -> Option<AerSeverity> {
+pub fn classify_aer(
+    uncorr_status: u32,
+    uncorr_severity: u32,
+    corr_status: u32,
+) -> Option<AerSeverity> {
     if corr_status != 0 {
         return Some(AerSeverity::Correctable);
     }

@@ -26,15 +26,15 @@ pub fn gicr_base(cpu_index: u32) -> usize {
 }
 
 // Distributor register offsets (SDM of GICv3: IHI0069H).
-const GICD_CTLR:     usize = 0x0000;
+const GICD_CTLR: usize = 0x0000;
 
 // Redistributor register offsets.
-const GICR_WAKER:        usize = 0x0014;
+const GICR_WAKER: usize = 0x0014;
 // SGI_base is at GICR_BASE + 0x1_0000.
-const GICR_SGI_OFF:          usize = 0x1_0000;
-const GICR_IGROUPR0_OFF:     usize = GICR_SGI_OFF + 0x0080;
-const GICR_ISENABLER0_OFF:   usize = GICR_SGI_OFF + 0x0100;
-const GICR_IPRIORITYR0_OFF:  usize = GICR_SGI_OFF + 0x0400;
+const GICR_SGI_OFF: usize = 0x1_0000;
+const GICR_IGROUPR0_OFF: usize = GICR_SGI_OFF + 0x0080;
+const GICR_ISENABLER0_OFF: usize = GICR_SGI_OFF + 0x0100;
+const GICR_IPRIORITYR0_OFF: usize = GICR_SGI_OFF + 0x0400;
 
 /// Initialise the BSP CPU's GICv3 view + enable Group 1 IRQs.
 ///
@@ -62,7 +62,9 @@ pub unsafe fn init_bsp() {
 /// - Interrupts must be disabled in DAIF at call time.
 pub unsafe fn init_ap(cpu_index: u32) {
     // SAFETY: caller-asserted per-CPU invariant.
-    unsafe { init_per_cpu(cpu_index); }
+    unsafe {
+        init_per_cpu(cpu_index);
+    }
 }
 
 /// Distributor-side init (CPU-shared). Only the BSP runs this.
@@ -80,11 +82,17 @@ unsafe fn init_distributor() {
 unsafe fn init_per_cpu(cpu_index: u32) {
     // ─── CPU interface (system registers) ───────────────────────
     // SAFETY: GICv3 presence verified by caller.
-    unsafe { sysreg::write_icc_sre_el1(1); }
+    unsafe {
+        sysreg::write_icc_sre_el1(1);
+    }
     // SAFETY: SRE set above.
-    unsafe { sysreg::write_icc_pmr_el1(0xFF); }
+    unsafe {
+        sysreg::write_icc_pmr_el1(0xFF);
+    }
     // SAFETY: SRE set above.
-    unsafe { sysreg::write_icc_igrpen1_el1(1); }
+    unsafe {
+        sysreg::write_icc_igrpen1_el1(1);
+    }
 
     // ─── Redistributor ────────────────────────────────────────
     let gicr = gicr_base(cpu_index);

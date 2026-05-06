@@ -47,14 +47,14 @@
 //!     changes only at boot.
 //!   * AP bring-up must call `enable_pcide` per CPU (CR4 is per-CPU).
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::fmt;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::cr;
 
 const PML4_MASK: u64 = 0x000F_FFFF_FFFF_F000; // bits 51..=12
 const PCID_MASK: u64 = 0x0000_0000_0000_0FFF; // bits 11..=0
-const NOFLUSH:   u64 = 1u64 << 63;
+const NOFLUSH: u64 = 1u64 << 63;
 
 const NUM_DOMAINS: usize = 16;
 
@@ -72,10 +72,22 @@ static BOOTSTRAP_PML4: AtomicU64 = AtomicU64::new(0);
 /// bootstrap." Populated lazily by `set_domain_pml4` once `memory/`
 /// can hand back cloned PML4s.
 static PER_DOMAIN_PML4: [AtomicU64; NUM_DOMAINS] = [
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
 ];
 
 /// Saved enforcer state — opaque CR3 snapshot.
@@ -89,21 +101,30 @@ pub struct SavedPcid(pub u64);
 /// the registry is empty, so rights are observed as ALLOW_ALL.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub struct DomainRights {
-    pub no_write:  bool,
+    pub no_write: bool,
     pub no_access: bool,
 }
 
 impl DomainRights {
-    pub const ALLOW_ALL: Self = Self { no_write: false, no_access: false };
-    pub const READ_ONLY: Self = Self { no_write: true,  no_access: false };
-    pub const DENY_ALL:  Self = Self { no_write: true,  no_access: true  };
+    pub const ALLOW_ALL: Self = Self {
+        no_write: false,
+        no_access: false,
+    };
+    pub const READ_ONLY: Self = Self {
+        no_write: true,
+        no_access: false,
+    };
+    pub const DENY_ALL: Self = Self {
+        no_write: true,
+        no_access: true,
+    };
 }
 
 impl fmt::Display for DomainRights {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match (self.no_access, self.no_write) {
-            (true,  _)     => f.write_str("deny"),
-            (false, true)  => f.write_str("r-"),
+            (true, _) => f.write_str("deny"),
+            (false, true) => f.write_str("r-"),
             (false, false) => f.write_str("rw"),
         }
     }
@@ -165,14 +186,20 @@ pub fn get_domain_pml4(domain: u8) -> u64 {
 
 /// True after `init()` has run. Tests and the Pks-delegation path
 /// consult this to decide whether the swap machinery is live.
-pub fn is_active() -> bool { ACTIVE.load(Ordering::Acquire) }
+pub fn is_active() -> bool {
+    ACTIVE.load(Ordering::Acquire)
+}
 
 /// Compute the CR3 value that points the current CPU at `domain`'s
 /// page tables with the matching PCID and the noflush bit set.
 fn cr3_for_domain(domain: u8) -> u64 {
     let pml4 = {
         let registered = PER_DOMAIN_PML4[domain as usize].load(Ordering::Relaxed);
-        if registered != 0 { registered } else { BOOTSTRAP_PML4.load(Ordering::Relaxed) }
+        if registered != 0 {
+            registered
+        } else {
+            BOOTSTRAP_PML4.load(Ordering::Relaxed)
+        }
     };
     let pcid = (domain as u64 + 1) & PCID_MASK;
     (pml4 & PML4_MASK) | pcid | NOFLUSH
@@ -185,7 +212,9 @@ fn cr3_for_domain(domain: u8) -> u64 {
 /// the saved value can be written back via `restore`.
 #[inline]
 pub unsafe fn save() -> SavedPcid {
-    if !is_active() { return SavedPcid(0); }
+    if !is_active() {
+        return SavedPcid(0);
+    }
     // SAFETY: CR3 read at CPL=0.
     SavedPcid(unsafe { cr::read_cr3() })
 }
@@ -199,10 +228,14 @@ pub unsafe fn save() -> SavedPcid {
 /// restore).
 #[inline]
 pub unsafe fn restore(s: SavedPcid) {
-    if !is_active() || s.0 == 0 { return; }
+    if !is_active() || s.0 == 0 {
+        return;
+    }
     // SAFETY: write back the snapshot CR3 with NOFLUSH set so the
     // outer domain's TLB does not get nuked.
-    unsafe { cr::write_cr3(s.0 | NOFLUSH); }
+    unsafe {
+        cr::write_cr3(s.0 | NOFLUSH);
+    }
 }
 
 /// Rights probe. Until per-domain PML4 divergence lands, every domain
@@ -235,12 +268,16 @@ pub unsafe fn set_rights(domain: u8, _rights: DomainRights) {
 pub unsafe fn enter_domain(kernel_domain: u8, driver_domain: u8) -> SavedPcid {
     debug_assert!((kernel_domain as usize) < NUM_DOMAINS);
     debug_assert!((driver_domain as usize) < NUM_DOMAINS);
-    if !is_active() { return SavedPcid(0); }
+    if !is_active() {
+        return SavedPcid(0);
+    }
     // SAFETY: CR3 read+write at CPL=0; PCIDE on; PML4 phys mapped.
     let saved = unsafe { cr::read_cr3() };
-    let next  = cr3_for_domain(driver_domain);
+    let next = cr3_for_domain(driver_domain);
     // SAFETY: see above; NOFLUSH set inside cr3_for_domain.
-    unsafe { cr::write_cr3(next); }
+    unsafe {
+        cr::write_cr3(next);
+    }
     SavedPcid(saved)
 }
 
@@ -251,9 +288,10 @@ pub unsafe fn enter_domain(kernel_domain: u8, driver_domain: u8) -> SavedPcid {
 #[inline]
 pub unsafe fn exit_domain(saved: SavedPcid) {
     // SAFETY: see restore.
-    unsafe { restore(saved); }
+    unsafe {
+        restore(saved);
+    }
 }
-
 
 // ── INVPCID instruction wrappers ───────────────────────────────────
 //
@@ -264,7 +302,10 @@ pub unsafe fn exit_domain(saved: SavedPcid) {
 // address in next 64 bits).
 
 #[repr(C, align(16))]
-struct InvpcidDescriptor { pcid: u64, addr: u64 }
+struct InvpcidDescriptor {
+    pcid: u64,
+    addr: u64,
+}
 
 #[inline]
 unsafe fn invpcid_raw(typ: u64, desc: &InvpcidDescriptor) {
@@ -285,9 +326,14 @@ unsafe fn invpcid_raw(typ: u64, desc: &InvpcidDescriptor) {
 /// CPL = 0; INVPCID supported.
 #[inline]
 pub unsafe fn invpcid_addr(pcid: u16, addr: u64) {
-    let d = InvpcidDescriptor { pcid: pcid as u64 & 0xFFF, addr };
+    let d = InvpcidDescriptor {
+        pcid: pcid as u64 & 0xFFF,
+        addr,
+    };
     // SAFETY: caller-asserted.
-    unsafe { invpcid_raw(0, &d); }
+    unsafe {
+        invpcid_raw(0, &d);
+    }
 }
 
 /// Type 1: invalidate every TLB entry tagged with `pcid` on this CPU.
@@ -296,9 +342,14 @@ pub unsafe fn invpcid_addr(pcid: u16, addr: u64) {
 /// CPL = 0; INVPCID supported.
 #[inline]
 pub unsafe fn invpcid_single(pcid: u16) {
-    let d = InvpcidDescriptor { pcid: pcid as u64 & 0xFFF, addr: 0 };
+    let d = InvpcidDescriptor {
+        pcid: pcid as u64 & 0xFFF,
+        addr: 0,
+    };
     // SAFETY: caller-asserted.
-    unsafe { invpcid_raw(1, &d); }
+    unsafe {
+        invpcid_raw(1, &d);
+    }
 }
 
 /// Type 2: invalidate every TLB entry on this CPU including globals.
@@ -309,7 +360,9 @@ pub unsafe fn invpcid_single(pcid: u16) {
 pub unsafe fn invpcid_all_with_globals() {
     let d = InvpcidDescriptor { pcid: 0, addr: 0 };
     // SAFETY: caller-asserted.
-    unsafe { invpcid_raw(2, &d); }
+    unsafe {
+        invpcid_raw(2, &d);
+    }
 }
 
 /// Type 3: invalidate every TLB entry on this CPU excluding globals.
@@ -320,7 +373,9 @@ pub unsafe fn invpcid_all_with_globals() {
 pub unsafe fn invpcid_all_without_globals() {
     let d = InvpcidDescriptor { pcid: 0, addr: 0 };
     // SAFETY: caller-asserted.
-    unsafe { invpcid_raw(3, &d); }
+    unsafe {
+        invpcid_raw(3, &d);
+    }
 }
 
 /// `true` iff the CPU supports the INVPCID instruction

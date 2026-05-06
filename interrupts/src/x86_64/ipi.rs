@@ -76,7 +76,7 @@ pub fn ever_received(cpu: u32) -> u64 {
 pub unsafe fn on_shootdown_irq() {
     let cpu = narf_lib::percpu::current_cpu();
     let i = cpu.min(MAX_CPUS - 1);
-    let va    = PENDING_VA[i].load(Ordering::Acquire);
+    let va = PENDING_VA[i].load(Ordering::Acquire);
     let pages = PENDING_PAGES[i].load(Ordering::Acquire);
     if va != 0 {
         let n = if pages == 0 { 1 } else { pages };
@@ -103,8 +103,7 @@ pub unsafe fn on_shootdown_irq() {
 /// "all excluding self" (bits 19..=18 = 0b11), trigger = edge,
 /// vector = `VECTOR_TLB_SHOOTDOWN`. Bit 14 (level=assert) is set
 /// for compatibility with older docs even though x2APIC ignores it.
-const ICR_BROADCAST_SHOOTDOWN: u64 =
-    0xC0 << 12               // dest shorthand = 0b11 (all-excluding-self) at bits[19:18]
+const ICR_BROADCAST_SHOOTDOWN: u64 = 0xC0 << 12               // dest shorthand = 0b11 (all-excluding-self) at bits[19:18]
     | (1 << 14)              // level = assert
     | (crate::VECTOR_TLB_SHOOTDOWN as u64); // vector
 
@@ -124,7 +123,9 @@ const ICR_BROADCAST_SHOOTDOWN: u64 =
 pub unsafe fn shoot_va(va: u64) {
     // Single-page broadcast: pages = 0 sentinel = "1 page" in handler.
     // SAFETY: see shoot_range.
-    unsafe { shoot_range(va, 1); }
+    unsafe {
+        shoot_range(va, 1);
+    }
 }
 
 /// Same shape as `shoot_va` but for a contiguous run of `pages`
@@ -134,16 +135,22 @@ pub unsafe fn shoot_va(va: u64) {
 /// # Safety
 /// Same preconditions as `shoot_va`.
 pub unsafe fn shoot_range(va: u64, pages: u64) {
-    if va == 0 || pages == 0 { return; }
+    if va == 0 || pages == 0 {
+        return;
+    }
     let total = narf_lib::smp::cpu_count() as u32;
-    if total <= 1 { return; }
+    if total <= 1 {
+        return;
+    }
 
     let self_cpu = narf_lib::percpu::current_cpu() as u32;
 
     // Snapshot every other CPU's ack counter and publish the target VA + range.
     let mut snap = [0u64; MAX_CPUS];
     for cpu in 0..total {
-        if cpu == self_cpu { continue; }
+        if cpu == self_cpu {
+            continue;
+        }
         let i = (cpu as usize).min(MAX_CPUS - 1);
         snap[i] = ACK_COUNT[i].load(Ordering::Acquire);
         PENDING_PAGES[i].store(pages, Ordering::Release);
@@ -153,12 +160,16 @@ pub unsafe fn shoot_range(va: u64, pages: u64) {
     // Send the IPI. WRMSR is a serialising instruction so prior
     // PENDING_VA stores are visible to the receivers.
     // SAFETY: caller-asserted x2APIC online.
-    unsafe { apic::wrmsr_icr(ICR_BROADCAST_SHOOTDOWN); }
+    unsafe {
+        apic::wrmsr_icr(ICR_BROADCAST_SHOOTDOWN);
+    }
 
     // Wait for every other online CPU to advance its ack counter.
     let mut spins: u32 = 0;
     for cpu in 0..total {
-        if cpu == self_cpu { continue; }
+        if cpu == self_cpu {
+            continue;
+        }
         let i = (cpu as usize).min(MAX_CPUS - 1);
         while ACK_COUNT[i].load(Ordering::Acquire) == snap[i] {
             // PAUSE hint to release the resource for the other
@@ -184,6 +195,8 @@ pub fn install() {
         // SAFETY: handler is invoked from the IRQ-dispatch path where
         // the trap stub already saved registers and ack'd the LAPIC
         // is the caller's responsibility — we EOI at the end.
-        unsafe { on_shootdown_irq(); }
+        unsafe {
+            on_shootdown_irq();
+        }
     });
 }

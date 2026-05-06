@@ -23,7 +23,9 @@ fn smoke_drivers_gpu_mode_and_family() -> TestResult {
     let mut list = ModeList::default();
     list.modes.push(Mode::FHD_60);
     list.modes.push(Mode::XGA_60);
-    if list.modes.len() != 2 { return TestResult::Fail("mode list len"); }
+    if list.modes.len() != 2 {
+        return TestResult::Fail("mode list len");
+    }
 
     // Family + submit kind discriminants distinct.
     if GpuFamily::VirtioGpu == GpuFamily::IntelI915 {
@@ -65,9 +67,9 @@ fn smoke_virtio_gpu_scanout_initialised() -> TestResult {
         return TestResult::Skip("virtio-gpu-pci not present");
     }
     match gpu_pci::with_controller(|d| d.ready) {
-        Some(true)  => TestResult::Pass,
+        Some(true) => TestResult::Pass,
         Some(false) => TestResult::Fail("virtio-gpu probed but scanout not ready"),
-        None        => TestResult::Skip("virtio-gpu-pci controller missing"),
+        None => TestResult::Skip("virtio-gpu-pci controller missing"),
     }
 }
 kernel_test_in!("drivers/gpu", smoke_virtio_gpu_scanout_initialised);
@@ -76,9 +78,9 @@ fn smoke_amdgpu_pci_matches_registered() -> TestResult {
     // Structural: register the amdgpu driver and assert every
     // explicit AMD VID/DID match plus the class-match backstop
     // are in the bus's table. Doesn't require live silicon.
+    use crate::amdgpu;
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::{registered_pci_drivers, MatchKind};
-    use crate::amdgpu;
     __reset_for_test();
     amdgpu::register_pci_driver();
     let regs = registered_pci_drivers();
@@ -93,18 +95,24 @@ fn smoke_amdgpu_pci_matches_registered() -> TestResult {
         (amdgpu::AMD_VENDOR, amdgpu::NAVI31),
     ];
     for (v, d) in want.iter().copied() {
-        let found = regs.iter().any(|m|
+        let found = regs.iter().any(|m| {
             matches!(m.kind, MatchKind::VendorDevice {
                 vendor, device,
-            } if vendor == v && device == d));
+            } if vendor == v && device == d)
+        });
         if !found {
             return TestResult::Fail("missing amdgpu VID/DID match");
         }
     }
-    let class_match = regs.iter().any(|m|
-        matches!(m.kind, MatchKind::Class {
-            class: 0x03, mask: 0xFF,
-        }));
+    let class_match = regs.iter().any(|m| {
+        matches!(
+            m.kind,
+            MatchKind::Class {
+                class: 0x03,
+                mask: 0xFF,
+            }
+        )
+    });
     if !class_match {
         return TestResult::Fail("amdgpu class-match backstop missing");
     }
@@ -119,7 +127,7 @@ fn smoke_amdgpu_family_table_documented_offsets() -> TestResult {
     // shipping a placeholder offset for an undocumented family
     // surfaces as a test failure.
     use crate::amdgpu::Family;
-    if Family::Vega.mp0_base()  != Some(0x000B_0000) {
+    if Family::Vega.mp0_base() != Some(0x000B_0000) {
         return TestResult::Fail("Vega MP0 base wrong");
     }
     if Family::Navi1.mp0_base() != Some(0x000B_0000) {
@@ -147,11 +155,12 @@ fn smoke_amdgpu_atombios_table_directory_round_trip() -> TestResult {
     // marker + master data table at a known offset + 3 indexable
     // tables with distinct payloads. Verify the parser locates
     // the master, decodes the count, and resolves each table id.
-    use crate::amdgpu_atombios::{Atombios, AtomError};
+    use crate::amdgpu_atombios::{AtomError, Atombios};
     let mut img = alloc::vec::Vec::new();
     img.resize(0x200, 0u8);
     // PCI ROM signature.
-    img[0] = 0xAA; img[1] = 0x55;
+    img[0] = 0xAA;
+    img[1] = 0x55;
     // "ATOM" marker at offset 4.
     img[4..8].copy_from_slice(b"ATOM");
     // Master data table at offset 0x100.
@@ -161,7 +170,7 @@ fn smoke_amdgpu_atombios_table_directory_round_trip() -> TestResult {
     img[0x100..0x102].copy_from_slice(&10u16.to_le_bytes());
     img[0x102] = 1; // ucTableFormatRevision
     img[0x103] = 1; // ucTableContentRevision
-    // Per-table offset array: ids 0/1/2 → 0x150, 0x160, 0x170.
+                    // Per-table offset array: ids 0/1/2 → 0x150, 0x160, 0x170.
     img[0x104..0x106].copy_from_slice(&0x150u16.to_le_bytes());
     img[0x106..0x108].copy_from_slice(&0x160u16.to_le_bytes());
     img[0x108..0x10A].copy_from_slice(&0x170u16.to_le_bytes());
@@ -171,20 +180,26 @@ fn smoke_amdgpu_atombios_table_directory_round_trip() -> TestResult {
     img[0x170..0x172].copy_from_slice(&16u16.to_le_bytes());
 
     let atom = match Atombios::parse(&img) {
-        Ok(a)  => a,
+        Ok(a) => a,
         Err(_) => return TestResult::Fail("ATOMBIOS parse rejected synthetic image"),
     };
     if atom.data_table_count() != 3 {
         return TestResult::Fail("data_table_count mis-decoded");
     }
-    if atom.data_table_offset(0) != Ok(0x150) { return TestResult::Fail("table 0 offset"); }
-    if atom.data_table_offset(1) != Ok(0x160) { return TestResult::Fail("table 1 offset"); }
-    if atom.data_table_offset(2) != Ok(0x170) { return TestResult::Fail("table 2 offset"); }
+    if atom.data_table_offset(0) != Ok(0x150) {
+        return TestResult::Fail("table 0 offset");
+    }
+    if atom.data_table_offset(1) != Ok(0x160) {
+        return TestResult::Fail("table 1 offset");
+    }
+    if atom.data_table_offset(2) != Ok(0x170) {
+        return TestResult::Fail("table 2 offset");
+    }
     if atom.data_table_offset(3) != Err(AtomError::UnknownTableId) {
         return TestResult::Fail("out-of-range id should fail");
     }
     let t = match atom.data_table(1) {
-        Ok(s)  => s,
+        Ok(s) => s,
         Err(_) => return TestResult::Fail("data_table(1) borrow"),
     };
     if t.len() != 12 {
@@ -204,7 +219,10 @@ fn smoke_amdgpu_atombios_table_directory_round_trip() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu", smoke_amdgpu_atombios_table_directory_round_trip);
+kernel_test_in!(
+    "drivers/gpu",
+    smoke_amdgpu_atombios_table_directory_round_trip
+);
 
 fn smoke_amdgpu_pm4_indirect_buffer_packet() -> TestResult {
     // INDIRECT_BUFFER is 4 dwords: header + ib_lo + ib_hi +
@@ -281,7 +299,7 @@ fn smoke_amdgpu_pm4_write_data_fence_packet() -> TestResult {
 kernel_test_in!("drivers/gpu", smoke_amdgpu_pm4_write_data_fence_packet);
 
 fn smoke_amdgpu_ring_submit_advances_wptr() -> TestResult {
-    use crate::amdgpu_ring::{Ring, RING_SIZE_DW, DOORBELL_STRIDE_BYTES};
+    use crate::amdgpu_ring::{Ring, DOORBELL_STRIDE_BYTES, RING_SIZE_DW};
     let mut ring = match Ring::new(7) {
         Ok(r) => r,
         Err(_) => return TestResult::Fail("Ring::new failed"),
@@ -298,7 +316,7 @@ fn smoke_amdgpu_ring_submit_advances_wptr() -> TestResult {
     let pkt = [0xDEAD_BEEFu32, 0x1234_5678, 0xAAAA_5555, 0x0000_0001];
     // SAFETY: smoke harness owns the ring exclusively.
     let new_wptr = match unsafe { ring.submit(&pkt) } {
-        Ok(w)  => w,
+        Ok(w) => w,
         Err(_) => return TestResult::Fail("submit rejected 4-dword packet"),
     };
     if new_wptr != 4 || ring.wptr() != 4 {
@@ -316,8 +334,7 @@ fn smoke_amdgpu_ring_submit_advances_wptr() -> TestResult {
 kernel_test_in!("drivers/gpu", smoke_amdgpu_ring_submit_advances_wptr);
 
 fn smoke_dp_aux_native_read_request_round_trip() -> TestResult {
-    use crate::dp_aux::{encode_request, decode_response,
-        AuxCommand, AuxRequest, AuxStatus};
+    use crate::dp_aux::{decode_response, encode_request, AuxCommand, AuxRequest, AuxStatus};
     let req = AuxRequest {
         cmd: AuxCommand::NativeRead,
         address: 0x0_2000, // DPCD_REV
@@ -325,7 +342,7 @@ fn smoke_dp_aux_native_read_request_round_trip() -> TestResult {
     };
     let mut wire = [0u8; 4];
     let n = match encode_request(&req, &mut wire) {
-        Ok(n)  => n,
+        Ok(n) => n,
         Err(_) => return TestResult::Fail("encode rejected NATIVE_READ"),
     };
     if n != 4 {
@@ -337,7 +354,7 @@ fn smoke_dp_aux_native_read_request_round_trip() -> TestResult {
     // Reply: 1 status byte + 1 data byte. ACK + data 0x14 (DP 1.4).
     let raw_reply = [0x00u8, 0x14];
     let resp = match decode_response(&raw_reply, 1) {
-        Ok(r)  => r,
+        Ok(r) => r,
         Err(_) => return TestResult::Fail("decode rejected ACK reply"),
     };
     if resp.status != AuxStatus::Ack {
@@ -365,7 +382,7 @@ fn smoke_dp_aux_native_write_encodes_payload() -> TestResult {
     };
     let mut wire = [0u8; 8];
     let n = match encode_request(&req, &mut wire) {
-        Ok(n)  => n,
+        Ok(n) => n,
         Err(_) => return TestResult::Fail("encode failed"),
     };
     if n != 8 {
@@ -403,9 +420,10 @@ fn smoke_amdgpu_atom_fwinfo_v3_round_trip() -> TestResult {
     // bootup VDDC = 950 mV
     t[0x2E..0x30].copy_from_slice(&950u16.to_le_bytes());
     // memory module id = 7, cooling solution id = 2
-    t[0x59] = 7; t[0x5A] = 2;
+    t[0x59] = 7;
+    t[0x5A] = 2;
     let info = match parse(&t) {
-        Ok(i)  => i,
+        Ok(i) => i,
         Err(_) => return TestResult::Fail("FwInfo parse rejected synthetic table"),
     };
     if info.format_revision != 4 || info.content_revision != 0x34 {
@@ -440,19 +458,19 @@ fn smoke_amdgpu_atom_fwinfo_v3_round_trip() -> TestResult {
 kernel_test_in!("drivers/gpu", smoke_amdgpu_atom_fwinfo_v3_round_trip);
 
 fn smoke_amdgpu_ucode_header_round_trip() -> TestResult {
-    use crate::amdgpu_ucode::{parse, payload, UCODE_MAGIC, UcodeError};
+    use crate::amdgpu_ucode::{parse, payload, UcodeError, UCODE_MAGIC};
     // Build a 1024-byte synthetic blob: 4-byte magic + 32-byte
     // common header at offset 4 + zero-fill to 256, then a
     // 768-byte fake payload starting at offset 256.
     let mut blob = alloc::vec::Vec::new();
     blob.resize(1024, 0u8);
     blob[0..4].copy_from_slice(&UCODE_MAGIC.to_le_bytes());
-    blob[4..8].copy_from_slice(&256u32.to_le_bytes());   // start_offset
-    blob[8..12].copy_from_slice(&768u32.to_le_bytes());  // payload_size
+    blob[4..8].copy_from_slice(&256u32.to_le_bytes()); // start_offset
+    blob[8..12].copy_from_slice(&768u32.to_le_bytes()); // payload_size
     blob[12..16].copy_from_slice(&0x0001_0203u32.to_le_bytes()); // version
-    blob[16..20].copy_from_slice(&0x0042u32.to_le_bytes());      // feature ver
+    blob[16..20].copy_from_slice(&0x0042u32.to_le_bytes()); // feature ver
     let hdr = match parse(&blob) {
-        Ok(h)  => h,
+        Ok(h) => h,
         Err(_) => return TestResult::Fail("ucode parse rejected synthetic blob"),
     };
     if hdr.start_offset != 256 || hdr.payload_size != 768 {
@@ -485,10 +503,7 @@ fn smoke_dp_link_training_completes_against_stub() -> TestResult {
     // Stub AUX channel that simulates a healthy 2-lane sink: CR
     // succeeds on the second poll (after one swing bump);
     // EQ succeeds on the third poll.
-    use crate::dp_aux::{
-        AuxChannel, AuxRequest, AuxResponse, AuxStatus, AuxError,
-        AuxCommand,
-    };
+    use crate::dp_aux::{AuxChannel, AuxCommand, AuxError, AuxRequest, AuxResponse, AuxStatus};
     use crate::dp_link_training::{run, TrainingParams, TrainingState};
 
     struct StubAux {
@@ -507,8 +522,11 @@ fn smoke_dp_link_training_completes_against_stub() -> TestResult {
             // 0x203, LANE_ALIGN_STATUS_UPDATED at 0x204.
             match req.cmd {
                 AuxCommand::NativeWrite => {
-                    reply_buf[0] = 0;   // ACK
-                    Ok(AuxResponse { status: AuxStatus::Ack, data: &reply_buf[1..1] })
+                    reply_buf[0] = 0; // ACK
+                    Ok(AuxResponse {
+                        status: AuxStatus::Ack,
+                        data: &reply_buf[1..1],
+                    })
                 }
                 AuxCommand::NativeRead => {
                     let v = match req.address {
@@ -516,16 +534,26 @@ fn smoke_dp_link_training_completes_against_stub() -> TestResult {
                             // Lane 0/1 nibbles. After 2 polls, CR_DONE
                             // + EQ_DONE + SYMBOL_LOCKED on both lanes.
                             self.cr_polls += 1;
-                            if self.cr_polls < 2 { 0x00 }
-                            else if self.eq_polls == 0 { 0x11 } // CR only
-                            else { 0x77 }                       // EQ done
+                            if self.cr_polls < 2 {
+                                0x00
+                            } else if self.eq_polls == 0 {
+                                0x11
+                            }
+                            // CR only
+                            else {
+                                0x77
+                            } // EQ done
                         }
                         0x0_0203 => 0x00, // lane 2/3 unused (2-lane link)
                         0x0_0204 => {
                             // INTERLANE_ALIGN_DONE bit 0; flips on
                             // after EQ symbols lock.
                             self.eq_polls += 1;
-                            if self.eq_polls < 2 { 0 } else { 1 }
+                            if self.eq_polls < 2 {
+                                0
+                            } else {
+                                1
+                            }
                         }
                         _ => 0,
                     };
@@ -540,8 +568,14 @@ fn smoke_dp_link_training_completes_against_stub() -> TestResult {
             }
         }
     }
-    let mut aux = StubAux { cr_polls: 0, eq_polls: 0 };
-    let params = TrainingParams { link_bw_set: 0x0A, lane_count: 2 };
+    let mut aux = StubAux {
+        cr_polls: 0,
+        eq_polls: 0,
+    };
+    let params = TrainingParams {
+        link_bw_set: 0x0A,
+        lane_count: 2,
+    };
     let result = match run(&mut aux, params, |_| {}) {
         Ok(s) => s,
         Err(_) => return TestResult::Fail("link training surfaced AUX error"),
@@ -569,7 +603,7 @@ fn smoke_amdgpu_pptable_v11_directory_round_trip() -> TestResult {
     // Subtable::SocClockDependency (idx 6) → 0x300
     t[28..32].copy_from_slice(&0x300u32.to_le_bytes());
     let pp = match PpTable::parse(&t) {
-        Ok(p)  => p,
+        Ok(p) => p,
         Err(_) => return TestResult::Fail("PpTable parse rejected V11.0"),
     };
     if pp.format_revision != 11 {
@@ -584,13 +618,19 @@ fn smoke_amdgpu_pptable_v11_directory_round_trip() -> TestResult {
     if pp.offset(Subtable::FanTable) != Ok(0x200) {
         return TestResult::Fail("FanTable offset");
     }
-    if !matches!(pp.offset(Subtable::OverdriveTable8), Err(PpTableError::TableAbsent)) {
+    if !matches!(
+        pp.offset(Subtable::OverdriveTable8),
+        Err(PpTableError::TableAbsent)
+    ) {
         return TestResult::Fail("absent subtable should fail");
     }
     // V8 rejected.
     let mut bad = t.clone();
     bad[2] = 8;
-    if !matches!(PpTable::parse(&bad), Err(PpTableError::UnsupportedVersion(_))) {
+    if !matches!(
+        PpTable::parse(&bad),
+        Err(PpTableError::UnsupportedVersion(_))
+    ) {
         return TestResult::Fail("V8 should reject");
     }
     TestResult::Pass
@@ -598,9 +638,7 @@ fn smoke_amdgpu_pptable_v11_directory_round_trip() -> TestResult {
 kernel_test_in!("drivers/gpu", smoke_amdgpu_pptable_v11_directory_round_trip);
 
 fn smoke_amdgpu_atom_displayobj_iter_paths() -> TestResult {
-    use crate::amdgpu_atom_displayobj::{
-        ConnectorKind, DisplayObjectTable, DisplayObjError,
-    };
+    use crate::amdgpu_atom_displayobj::{ConnectorKind, DisplayObjError, DisplayObjectTable};
     // Build a synthetic display-object table with 3 paths:
     //   path 0: DP connector (object id 0x13), instance 0
     //   path 1: HDMI-A (0x0C), instance 1
@@ -613,7 +651,7 @@ fn smoke_amdgpu_atom_displayobj_iter_paths() -> TestResult {
     t[3] = 0; // content_revision
     t[4..6].copy_from_slice(&0x0001u16.to_le_bytes()); // device_support bitmap
     t[6] = 3; // num_paths
-    // Paths start at 8.
+              // Paths start at 8.
     let paths = [
         (0x0001u16, (0x13u16 << 8) | 0u16, 0x1100u16), // DP
         (0x0002u16, (0x0Cu16 << 8) | 1u16, 0x1101u16), // HDMI-A
@@ -627,7 +665,7 @@ fn smoke_amdgpu_atom_displayobj_iter_paths() -> TestResult {
         t[off + 6..off + 8].copy_from_slice(&gpu.to_le_bytes());
     }
     let mut tbl = match DisplayObjectTable::parse(&t) {
-        Ok(p)  => p,
+        Ok(p) => p,
         Err(_) => return TestResult::Fail("displayobj parse rejected"),
     };
     if tbl.path_count() != 3 {
@@ -654,7 +692,10 @@ fn smoke_amdgpu_atom_displayobj_iter_paths() -> TestResult {
     // Bad version → rejected.
     let mut bad = t.clone();
     bad[2] = 0;
-    if !matches!(DisplayObjectTable::parse(&bad), Err(DisplayObjError::UnsupportedVersion(_))) {
+    if !matches!(
+        DisplayObjectTable::parse(&bad),
+        Err(DisplayObjError::UnsupportedVersion(_))
+    ) {
         return TestResult::Fail("version 0 should reject");
     }
     TestResult::Pass
@@ -664,9 +705,7 @@ kernel_test_in!("drivers/gpu", smoke_amdgpu_atom_displayobj_iter_paths);
 fn smoke_dp_edid_over_aux_round_trip() -> TestResult {
     // StubAux that returns canned EDID bytes for I2C reads at
     // address 0x50<<1 + read flag.
-    use crate::dp_aux::{
-        AuxChannel, AuxCommand, AuxError, AuxRequest, AuxResponse, AuxStatus,
-    };
+    use crate::dp_aux::{AuxChannel, AuxCommand, AuxError, AuxRequest, AuxResponse, AuxStatus};
     use crate::dp_edid::read_panel_edid;
 
     // Build a valid 128-byte EDID 1.4 block (minimal: header,
@@ -689,7 +728,10 @@ fn smoke_dp_edid_over_aux_round_trip() -> TestResult {
     let s: u8 = edid[..127].iter().fold(0u8, |a, &b| a.wrapping_add(b));
     edid[127] = 0u8.wrapping_sub(s);
 
-    struct StubAux { edid: [u8; 128], cursor: usize }
+    struct StubAux {
+        edid: [u8; 128],
+        cursor: usize,
+    }
     impl AuxChannel for StubAux {
         fn transact<'a>(
             &mut self,
@@ -702,7 +744,10 @@ fn smoke_dp_edid_over_aux_round_trip() -> TestResult {
                     // position the slave; reset the cursor.
                     self.cursor = 0;
                     reply_buf[0] = 0;
-                    Ok(AuxResponse { status: AuxStatus::Ack, data: &reply_buf[1..1] })
+                    Ok(AuxResponse {
+                        status: AuxStatus::Ack,
+                        data: &reply_buf[1..1],
+                    })
                 }
                 AuxCommand::I2cReadMot => {
                     // Return up to (reply_buf.len() - 1) bytes
@@ -725,7 +770,7 @@ fn smoke_dp_edid_over_aux_round_trip() -> TestResult {
     let mut aux = StubAux { edid, cursor: 0 };
     let mut buf = [0u8; 128];
     let parsed = match read_panel_edid(&mut aux, &mut buf) {
-        Ok(e)  => e,
+        Ok(e) => e,
         Err(_) => return TestResult::Fail("read_panel_edid rejected stub bytes"),
     };
     if parsed.manufacturer() != *b"AMD" {
@@ -745,8 +790,7 @@ kernel_test_in!("drivers/gpu", smoke_dp_edid_over_aux_round_trip);
 fn smoke_amdgpu_offsets_runtime_registry_overrides_compile_time() -> TestResult {
     use crate::amdgpu::Family;
     use crate::amdgpu_offsets::{
-        FamilyOffsets, register_family_offsets, offsets_of,
-        registered_count, __reset_for_test,
+        offsets_of, register_family_offsets, registered_count, FamilyOffsets, __reset_for_test,
     };
     __reset_for_test();
     if registered_count() != 0 {
@@ -760,16 +804,22 @@ fn smoke_amdgpu_offsets_runtime_registry_overrides_compile_time() -> TestResult 
         return TestResult::Fail("Navi3 should default None");
     }
     // Plug in Navi3 + override Vega.
-    register_family_offsets(Family::Navi3, FamilyOffsets {
-        mp0_base: Some(0x0010_0000),
-        dcn_hubp_base: Some(0x0040_0000),
-        dcn_otg_base:  Some(0x0050_0000),
-        ..FamilyOffsets::empty()
-    });
-    register_family_offsets(Family::Vega, FamilyOffsets {
-        mp0_base: Some(0x4242_4242),
-        ..FamilyOffsets::empty()
-    });
+    register_family_offsets(
+        Family::Navi3,
+        FamilyOffsets {
+            mp0_base: Some(0x0010_0000),
+            dcn_hubp_base: Some(0x0040_0000),
+            dcn_otg_base: Some(0x0050_0000),
+            ..FamilyOffsets::empty()
+        },
+    );
+    register_family_offsets(
+        Family::Vega,
+        FamilyOffsets {
+            mp0_base: Some(0x4242_4242),
+            ..FamilyOffsets::empty()
+        },
+    );
     // Runtime override takes precedence on Vega (compile-time
     // had Some(0x000B_0000)).
     if Family::Vega.mp0_base() != Some(0x4242_4242) {
@@ -788,19 +838,23 @@ fn smoke_amdgpu_offsets_runtime_registry_overrides_compile_time() -> TestResult 
     __reset_for_test();
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu", smoke_amdgpu_offsets_runtime_registry_overrides_compile_time);
+kernel_test_in!(
+    "drivers/gpu",
+    smoke_amdgpu_offsets_runtime_registry_overrides_compile_time
+);
 
 fn smoke_amdgpu_atom_dcn_init_data_round_trip() -> TestResult {
     use crate::amdgpu_atom_dcn::{parse, DcnInitError};
     let mut t = alloc::vec::Vec::new();
     t.resize(0x20, 0u8);
     t[0..2].copy_from_slice(&0x1Au16.to_le_bytes());
-    t[2] = 1; t[3] = 0;
-    t[0x04] = 4;  // max_disp_engines
-    t[0x05] = 2;  // max_active
-    t[0x06] = 6;  // max_ppll
-    t[0x07] = 1;  // core_ref_clk_source
-    // disp_clk_used = 600 MHz = 60_000 (10 kHz units)
+    t[2] = 1;
+    t[3] = 0;
+    t[0x04] = 4; // max_disp_engines
+    t[0x05] = 2; // max_active
+    t[0x06] = 6; // max_ppll
+    t[0x07] = 1; // core_ref_clk_source
+                 // disp_clk_used = 600 MHz = 60_000 (10 kHz units)
     t[0x08..0x0C].copy_from_slice(&60_000u32.to_le_bytes());
     // max_disp_clk = 1500 MHz
     t[0x0C..0x10].copy_from_slice(&150_000u32.to_le_bytes());
@@ -810,7 +864,7 @@ fn smoke_amdgpu_atom_dcn_init_data_round_trip() -> TestResult {
     t[0x14..0x18].copy_from_slice(&14_850u32.to_le_bytes());
     t[0x18] = 0; // XRGB8888
     let info = match parse(&t) {
-        Ok(i)  => i,
+        Ok(i) => i,
         Err(_) => return TestResult::Fail("parse rejected"),
     };
     if info.format_revision != 1 {
@@ -840,8 +894,8 @@ kernel_test_in!("drivers/gpu", smoke_amdgpu_atom_dcn_init_data_round_trip);
 
 fn smoke_amdgpu_displayobj_object_chain_walker() -> TestResult {
     use crate::amdgpu_atom_displayobj::{
-        DisplayObjectTable, ATOM_OBJECT_TYPE_ENCODER,
-        ATOM_OBJECT_TYPE_TRANSMITTER, ATOM_OBJECT_TYPE_CLOCK_SRC,
+        DisplayObjectTable, ATOM_OBJECT_TYPE_CLOCK_SRC, ATOM_OBJECT_TYPE_ENCODER,
+        ATOM_OBJECT_TYPE_TRANSMITTER,
     };
     // Path-with-chain layout: 8-byte header + 6 bytes of chain
     // (3 × u16 — encoder, transmitter, sentinel). One path,
@@ -850,7 +904,8 @@ fn smoke_amdgpu_displayobj_object_chain_walker() -> TestResult {
     t.resize(8 + 14, 0u8);
     // Header.
     t[0..2].copy_from_slice(&((8u16 + 14).to_le_bytes()));
-    t[2] = 1; t[3] = 0;
+    t[2] = 1;
+    t[3] = 0;
     t[4..6].copy_from_slice(&0u16.to_le_bytes());
     t[6] = 1;
     // Path 0 header (8 bytes):
@@ -858,16 +913,16 @@ fn smoke_amdgpu_displayobj_object_chain_walker() -> TestResult {
     t[off..off + 2].copy_from_slice(&0x0001u16.to_le_bytes()); // device_tag
     t[off + 2..off + 4].copy_from_slice(&14u16.to_le_bytes()); // path size
     t[off + 4..off + 6].copy_from_slice(&((0x13u16 << 8) | 0).to_le_bytes()); // DP/0
-    t[off + 6..off + 8].copy_from_slice(&0x1100u16.to_le_bytes());            // GPU obj
-    // Chain: encoder/0 (0x21<<8), transmitter/2 (0x22<<8 | 2), sentinel.
-    t[off + 8..off + 10].copy_from_slice(
-        &((ATOM_OBJECT_TYPE_ENCODER as u16) << 8 | 0u16).to_le_bytes());
-    t[off + 10..off + 12].copy_from_slice(
-        &((ATOM_OBJECT_TYPE_TRANSMITTER as u16) << 8 | 2u16).to_le_bytes());
+    t[off + 6..off + 8].copy_from_slice(&0x1100u16.to_le_bytes()); // GPU obj
+                                                                   // Chain: encoder/0 (0x21<<8), transmitter/2 (0x22<<8 | 2), sentinel.
+    t[off + 8..off + 10]
+        .copy_from_slice(&((ATOM_OBJECT_TYPE_ENCODER as u16) << 8 | 0u16).to_le_bytes());
+    t[off + 10..off + 12]
+        .copy_from_slice(&((ATOM_OBJECT_TYPE_TRANSMITTER as u16) << 8 | 2u16).to_le_bytes());
     t[off + 12..off + 14].copy_from_slice(&0u16.to_le_bytes());
 
     let mut tbl = match DisplayObjectTable::parse(&t) {
-        Ok(p)  => p,
+        Ok(p) => p,
         Err(_) => return TestResult::Fail("path parse"),
     };
     let _path = tbl.next().expect("first path");
@@ -898,24 +953,24 @@ fn smoke_amdgpu_pptable_fan_table_round_trip() -> TestResult {
     t[2] = 11;
     t[3] = 0;
     // Body.
-    t[4]  = 9;     // rev_id
-    t[5]  = 30;    // thyst
-    t[6..8].copy_from_slice(&3_000u16.to_le_bytes());   // t_min = 30.00 C
-    t[8..10].copy_from_slice(&6_000u16.to_le_bytes());  // t_med = 60.00 C
+    t[4] = 9; // rev_id
+    t[5] = 30; // thyst
+    t[6..8].copy_from_slice(&3_000u16.to_le_bytes()); // t_min = 30.00 C
+    t[8..10].copy_from_slice(&6_000u16.to_le_bytes()); // t_med = 60.00 C
     t[10..12].copy_from_slice(&8_000u16.to_le_bytes()); // t_high = 80.00 C
-    t[12..14].copy_from_slice(&50u16.to_le_bytes());     // pwm_min
-    t[14..16].copy_from_slice(&128u16.to_le_bytes());    // pwm_med
-    t[16..18].copy_from_slice(&200u16.to_le_bytes());    // pwm_high
+    t[12..14].copy_from_slice(&50u16.to_le_bytes()); // pwm_min
+    t[14..16].copy_from_slice(&128u16.to_le_bytes()); // pwm_med
+    t[16..18].copy_from_slice(&200u16.to_le_bytes()); // pwm_high
     t[18..20].copy_from_slice(&9_500u16.to_le_bytes()); // t_max = 95.00 C
-    t[20] = 1;     // fan_control_mode
-    t[21..23].copy_from_slice(&255u16.to_le_bytes());    // fan_pwm_max
-    t[31] = 80;    // target_temperature (whole C)
-    t[51] = 1;     // enable_zero_rpm
-    t[52] = 50;    // fan_stop_temperature (whole C)
-    t[53] = 60;    // fan_start_temperature (whole C)
+    t[20] = 1; // fan_control_mode
+    t[21..23].copy_from_slice(&255u16.to_le_bytes()); // fan_pwm_max
+    t[31] = 80; // target_temperature (whole C)
+    t[51] = 1; // enable_zero_rpm
+    t[52] = 50; // fan_stop_temperature (whole C)
+    t[53] = 60; // fan_start_temperature (whole C)
 
     let fan = match FanTable::parse(&t) {
-        Ok(f)  => f,
+        Ok(f) => f,
         Err(_) => return TestResult::Fail("FanTable parse rejected"),
     };
     if fan.rev_id != 9 {
@@ -936,7 +991,10 @@ fn smoke_amdgpu_pptable_fan_table_round_trip() -> TestResult {
     // rev_id 11 rejected.
     let mut bad = t.clone();
     bad[4] = 11;
-    if !matches!(FanTable::parse(&bad), Err(PpSubtableError::UnsupportedRevision(11))) {
+    if !matches!(
+        FanTable::parse(&bad),
+        Err(PpSubtableError::UnsupportedRevision(11))
+    ) {
         return TestResult::Fail("rev 11 should reject");
     }
     TestResult::Pass
@@ -951,15 +1009,15 @@ fn smoke_amdgpu_pptable_powertune_table_round_trip() -> TestResult {
     t[2] = 11;
     t[3] = 0;
     t[4] = 1; // rev_id
-    // TDP = 80 W = 640 (Q5.3).
+              // TDP = 80 W = 640 (Q5.3).
     t[5..7].copy_from_slice(&640u16.to_le_bytes());
-    t[7..9].copy_from_slice(&720u16.to_le_bytes());   // configurable_tdp = 90 W
+    t[7..9].copy_from_slice(&720u16.to_le_bytes()); // configurable_tdp = 90 W
     t[9..11].copy_from_slice(&20_480u16.to_le_bytes()); // tdc = 80 A in Q8.8
     t[21..23].copy_from_slice(&10_000u16.to_le_bytes()); // tj_max = 100.00 C
     t[27..29].copy_from_slice(&10_500u16.to_le_bytes()); // shutdown = 105.00 C
 
     let pt = match PowerTuneTable::parse(&t) {
-        Ok(p)  => p,
+        Ok(p) => p,
         Err(_) => return TestResult::Fail("PowerTuneTable parse rejected"),
     };
     if pt.tdp_watts() != 80 {
@@ -974,22 +1032,29 @@ fn smoke_amdgpu_pptable_powertune_table_round_trip() -> TestResult {
     // rev_id 6 rejected (>5).
     let mut bad = t.clone();
     bad[4] = 6;
-    if !matches!(PowerTuneTable::parse(&bad), Err(PpSubtableError::UnsupportedRevision(6))) {
+    if !matches!(
+        PowerTuneTable::parse(&bad),
+        Err(PpSubtableError::UnsupportedRevision(6))
+    ) {
         return TestResult::Fail("rev 6 should reject");
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu", smoke_amdgpu_pptable_powertune_table_round_trip);
+kernel_test_in!(
+    "drivers/gpu",
+    smoke_amdgpu_pptable_powertune_table_round_trip
+);
 
 fn smoke_amdgpu_atombios_command_table_directory() -> TestResult {
     // Symmetric to the data-table directory smoke from Stage 3
     // — but exercise the command-table path. Build an ATOMBIOS
     // image with both directories and verify each indexes its
     // own subtable list.
-    use crate::amdgpu_atombios::{Atombios, AtomError};
+    use crate::amdgpu_atombios::{AtomError, Atombios};
     let mut img = alloc::vec::Vec::new();
     img.resize(0x300, 0u8);
-    img[0] = 0xAA; img[1] = 0x55;
+    img[0] = 0xAA;
+    img[1] = 0x55;
     img[4..8].copy_from_slice(b"ATOM");
     // Data master @ 0x100, command master @ 0x200.
     img[0x4C..0x50].copy_from_slice(&0x100u32.to_le_bytes());
@@ -1006,7 +1071,7 @@ fn smoke_amdgpu_atombios_command_table_directory() -> TestResult {
     img[0x260..0x262].copy_from_slice(&20u16.to_le_bytes());
 
     let atom = match Atombios::parse(&img) {
-        Ok(a)  => a,
+        Ok(a) => a,
         Err(_) => return TestResult::Fail("ATOMBIOS parse"),
     };
     if atom.data_table_count() != 1 {
@@ -1025,7 +1090,7 @@ fn smoke_amdgpu_atombios_command_table_directory() -> TestResult {
         return TestResult::Fail("out-of-range cmd id should fail");
     }
     let cmd = match atom.cmd_table(0) {
-        Ok(s)  => s,
+        Ok(s) => s,
         Err(_) => return TestResult::Fail("cmd_table borrow"),
     };
     if cmd.len() != 16 {
@@ -1036,7 +1101,7 @@ fn smoke_amdgpu_atombios_command_table_directory() -> TestResult {
 kernel_test_in!("drivers/gpu", smoke_amdgpu_atombios_command_table_directory);
 
 fn smoke_amdgpu_rlc_header_and_autoload_round_trip() -> TestResult {
-    use crate::amdgpu_rlc::{parse, autoload_iter, looks_like_rlc};
+    use crate::amdgpu_rlc::{autoload_iter, looks_like_rlc, parse};
     use crate::amdgpu_ucode::UCODE_MAGIC;
     // Build a 1024-byte synthetic RLC blob:
     //   - 4-byte magic + common ucode header (version etc.)
@@ -1047,13 +1112,13 @@ fn smoke_amdgpu_rlc_header_and_autoload_round_trip() -> TestResult {
     let mut blob = alloc::vec::Vec::new();
     blob.resize(1024, 0u8);
     blob[0..4].copy_from_slice(&UCODE_MAGIC.to_le_bytes());
-    blob[4..8].copy_from_slice(&256u32.to_le_bytes());   // start_offset
-    blob[8..12].copy_from_slice(&512u32.to_le_bytes());  // payload_size
-    blob[12..16].copy_from_slice(&1u32.to_le_bytes());   // version
-    // RLC extension fields.
+    blob[4..8].copy_from_slice(&256u32.to_le_bytes()); // start_offset
+    blob[8..12].copy_from_slice(&512u32.to_le_bytes()); // payload_size
+    blob[12..16].copy_from_slice(&1u32.to_le_bytes()); // version
+                                                       // RLC extension fields.
     blob[0x58..0x5C].copy_from_slice(&0x100u32.to_le_bytes()); // autoload offset
-    blob[0x5C..0x60].copy_from_slice(&36u32.to_le_bytes());    // autoload size
-    // Autoload entries: 3 × 12 bytes.
+    blob[0x5C..0x60].copy_from_slice(&36u32.to_le_bytes()); // autoload size
+                                                            // Autoload entries: 3 × 12 bytes.
     let entries = [
         (0x10u32, 0x200u32, 8u32),
         (0x11u32, 0x208u32, 8u32),
@@ -1066,17 +1131,15 @@ fn smoke_amdgpu_rlc_header_and_autoload_round_trip() -> TestResult {
         blob[base + 8..base + 12].copy_from_slice(&sz.to_le_bytes());
     }
     let header = match parse(&blob) {
-        Ok(h)  => h,
+        Ok(h) => h,
         Err(_) => return TestResult::Fail("RLC parse"),
     };
-    if header.autoload_offset_table_offset != 0x100
-       || header.autoload_offset_table_size != 36
-    {
+    if header.autoload_offset_table_offset != 0x100 || header.autoload_offset_table_size != 36 {
         return TestResult::Fail("autoload table fields");
     }
     let walked: alloc::vec::Vec<_> = match autoload_iter(&blob, &header) {
-        Ok(it)  => it.collect(),
-        Err(_)  => return TestResult::Fail("autoload_iter"),
+        Ok(it) => it.collect(),
+        Err(_) => return TestResult::Fail("autoload_iter"),
     };
     if walked.len() != 3 {
         return TestResult::Fail("autoload entry count");
@@ -1096,7 +1159,10 @@ fn smoke_amdgpu_rlc_header_and_autoload_round_trip() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu", smoke_amdgpu_rlc_header_and_autoload_round_trip);
+kernel_test_in!(
+    "drivers/gpu",
+    smoke_amdgpu_rlc_header_and_autoload_round_trip
+);
 
 fn smoke_amdgpu_atom_gpio_pin_lut_round_trip() -> TestResult {
     use crate::amdgpu_atom_gpiopin::{GpioId, GpioPinLut};
@@ -1108,7 +1174,8 @@ fn smoke_amdgpu_atom_gpio_pin_lut_round_trip() -> TestResult {
     let mut t = alloc::vec::Vec::new();
     t.resize(4 + 4 * 8, 0u8);
     t[0..2].copy_from_slice(&((4u16 + 4 * 8).to_le_bytes()));
-    t[2] = 1; t[3] = 0;
+    t[2] = 1;
+    t[3] = 0;
     let pins = [
         (0x000Au16, 0u8, 1u8, 0x10u8, 0x01u8),
         (0x000Bu16, 0u8, 1u8, 0x11u8, 0x02u8),
@@ -1124,7 +1191,7 @@ fn smoke_amdgpu_atom_gpio_pin_lut_round_trip() -> TestResult {
         t[p + 5] = *mask;
     }
     let mut lut = match GpioPinLut::parse(&t) {
-        Ok(l)  => l,
+        Ok(l) => l,
         Err(_) => return TestResult::Fail("LUT parse rejected"),
     };
     if lut.pin_count() != 4 {
@@ -1151,9 +1218,8 @@ kernel_test_in!("drivers/gpu", smoke_amdgpu_atom_gpio_pin_lut_round_trip);
 
 fn smoke_amdgpu_encoder_caps_record_iter() -> TestResult {
     use crate::amdgpu_atom_encoder_caps::{
-        find_encoder_caps, RecordIter,
-        ATOM_RECORD_TYPE_HPD_INT_ID, ATOM_RECORD_TYPE_ENCODER_CAP,
-        ATOM_RECORD_TYPE_END,
+        find_encoder_caps, RecordIter, ATOM_RECORD_TYPE_ENCODER_CAP, ATOM_RECORD_TYPE_END,
+        ATOM_RECORD_TYPE_HPD_INT_ID,
     };
     // Build a TLV tail with three records:
     //   HPD_INT_ID (kind 1, len 4) — payload "AB"
@@ -1170,8 +1236,8 @@ fn smoke_amdgpu_encoder_caps_record_iter() -> TestResult {
     }
     let caps = match find_encoder_caps(&tail) {
         Ok(Some(c)) => c,
-        Ok(None)    => return TestResult::Fail("encoder caps record not found"),
-        Err(_)      => return TestResult::Fail("decode error"),
+        Ok(None) => return TestResult::Fail("encoder caps record not found"),
+        Err(_) => return TestResult::Fail("decode error"),
     };
     if !caps.supports_hbr2() || !caps.supports_hbr3() {
         return TestResult::Fail("HBR2/HBR3 bits");
@@ -1190,9 +1256,7 @@ fn smoke_dp_link_training_fallback_walks_ladder() -> TestResult {
     // StubAux that fails CR at HBR3 + HBR2 + HBR, succeeds at
     // RBR (1.62 Gbps). The fallback policy should walk down the
     // ladder and return Trained at the right link_bw_set.
-    use crate::dp_aux::{
-        AuxChannel, AuxCommand, AuxError, AuxRequest, AuxResponse, AuxStatus,
-    };
+    use crate::dp_aux::{AuxChannel, AuxCommand, AuxError, AuxRequest, AuxResponse, AuxStatus};
     use crate::dp_link_training::{run_with_fallback, LinkRate};
 
     struct StubAux {
@@ -1217,7 +1281,10 @@ fn smoke_dp_link_training_fallback_walks_ladder() -> TestResult {
                         self.eq_polls = 0;
                     }
                     reply_buf[0] = 0;
-                    Ok(AuxResponse { status: AuxStatus::Ack, data: &reply_buf[1..1] })
+                    Ok(AuxResponse {
+                        status: AuxStatus::Ack,
+                        data: &reply_buf[1..1],
+                    })
                 }
                 AuxCommand::NativeRead => {
                     let v = match req.address {
@@ -1228,9 +1295,15 @@ fn smoke_dp_link_training_fallback_walks_ladder() -> TestResult {
                             // CR loop exhausts retries.
                             self.cr_polls += 1;
                             if self.current_bw == LinkRate::Rbr as u8 {
-                                if self.cr_polls < 2 { 0x00 }
-                                else if self.eq_polls == 0 { 0x11 } // both lanes CR
-                                else { 0x77 }                       // EQ done
+                                if self.cr_polls < 2 {
+                                    0x00
+                                } else if self.eq_polls == 0 {
+                                    0x11
+                                }
+                                // both lanes CR
+                                else {
+                                    0x77
+                                } // EQ done
                             } else {
                                 0x00 // lanes never report CR_DONE → CR fails
                             }
@@ -1238,11 +1311,11 @@ fn smoke_dp_link_training_fallback_walks_ladder() -> TestResult {
                         0x0_0203 => 0x00,
                         0x0_0204 => {
                             self.eq_polls += 1;
-                            if self.current_bw == LinkRate::Rbr as u8
-                                && self.eq_polls >= 2
-                            {
+                            if self.current_bw == LinkRate::Rbr as u8 && self.eq_polls >= 2 {
                                 1
-                            } else { 0 }
+                            } else {
+                                0
+                            }
                         }
                         _ => 0,
                     };
@@ -1257,7 +1330,11 @@ fn smoke_dp_link_training_fallback_walks_ladder() -> TestResult {
             }
         }
     }
-    let mut aux = StubAux { current_bw: 0, cr_polls: 0, eq_polls: 0 };
+    let mut aux = StubAux {
+        current_bw: 0,
+        cr_polls: 0,
+        eq_polls: 0,
+    };
     let result = match run_with_fallback(&mut aux, LinkRate::Hbr3, 2, |_| {}) {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("fallback driver surfaced AUX error"),

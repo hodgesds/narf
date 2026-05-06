@@ -27,29 +27,29 @@ pub const PAGE: usize = 4096;
 // nothing M0 reads has moved.
 
 pub const PEB_INHERITED_ADDRESS_SPACE: usize = 0x000; // u8
-pub const PEB_BEING_DEBUGGED:          usize = 0x002; // u8
-pub const PEB_IMAGE_BASE_ADDRESS:      usize = 0x010; // u64
-pub const PEB_LDR:                     usize = 0x018; // u64 (PEB_LDR_DATA*)
-pub const PEB_PROCESS_PARAMETERS:      usize = 0x020; // u64 (RTL_USER_PROCESS_PARAMETERS*)
-pub const PEB_PROCESS_HEAP:            usize = 0x030; // u64 (HANDLE)
-pub const PEB_OS_MAJOR_VERSION:        usize = 0x118; // u32
-pub const PEB_OS_MINOR_VERSION:        usize = 0x11C; // u32
-pub const PEB_OS_BUILD_NUMBER:         usize = 0x120; // u16
+pub const PEB_BEING_DEBUGGED: usize = 0x002; // u8
+pub const PEB_IMAGE_BASE_ADDRESS: usize = 0x010; // u64
+pub const PEB_LDR: usize = 0x018; // u64 (PEB_LDR_DATA*)
+pub const PEB_PROCESS_PARAMETERS: usize = 0x020; // u64 (RTL_USER_PROCESS_PARAMETERS*)
+pub const PEB_PROCESS_HEAP: usize = 0x030; // u64 (HANDLE)
+pub const PEB_OS_MAJOR_VERSION: usize = 0x118; // u32
+pub const PEB_OS_MINOR_VERSION: usize = 0x11C; // u32
+pub const PEB_OS_BUILD_NUMBER: usize = 0x120; // u16
 
 // ── TEB field offsets (Win32 amd64 / ARM64) ──────────────────────
 //
 // The first 0x38 bytes are the NT_TIB; the PEB pointer is at 0x60.
 
 pub const TEB_TIB_EXCEPTION_LIST: usize = 0x000; // u64 (legacy SEH chain head)
-pub const TEB_TIB_STACK_BASE:     usize = 0x008; // u64 (HIGH address of user stack)
-pub const TEB_TIB_STACK_LIMIT:    usize = 0x010; // u64 (LOW address of user stack)
-pub const TEB_TIB_SUBSYSTEM_TIB:  usize = 0x018; // u64 (unused on NT)
-pub const TEB_TIB_FIBER_DATA:     usize = 0x020; // u64
-pub const TEB_TIB_USER_POINTER:   usize = 0x028; // u64
-pub const TEB_TIB_SELF:           usize = 0x030; // u64 (== &TEB)
-pub const TEB_CLIENT_ID_PROCESS:  usize = 0x040; // u64
-pub const TEB_CLIENT_ID_THREAD:   usize = 0x048; // u64
-pub const TEB_PEB:                usize = 0x060; // u64 (== &PEB)
+pub const TEB_TIB_STACK_BASE: usize = 0x008; // u64 (HIGH address of user stack)
+pub const TEB_TIB_STACK_LIMIT: usize = 0x010; // u64 (LOW address of user stack)
+pub const TEB_TIB_SUBSYSTEM_TIB: usize = 0x018; // u64 (unused on NT)
+pub const TEB_TIB_FIBER_DATA: usize = 0x020; // u64
+pub const TEB_TIB_USER_POINTER: usize = 0x028; // u64
+pub const TEB_TIB_SELF: usize = 0x030; // u64 (== &TEB)
+pub const TEB_CLIENT_ID_PROCESS: usize = 0x040; // u64
+pub const TEB_CLIENT_ID_THREAD: usize = 0x048; // u64
+pub const TEB_PEB: usize = 0x060; // u64 (== &PEB)
 
 // ── Default Win32 VAs ────────────────────────────────────────────
 //
@@ -61,10 +61,10 @@ pub const TEB_PEB:                usize = 0x060; // u64 (== &PEB)
 // M1 will randomise these — Windows ASLR puts both PEB and TEB at
 // per-process random VAs — but a fixed pair is fine for M0.
 
-pub const DEFAULT_PEB_VA:    u64 = 0x0000_7FFE_0000_0000;
-pub const DEFAULT_TEB_VA:    u64 = 0x0000_7FFD_F000_0000;
+pub const DEFAULT_PEB_VA: u64 = 0x0000_7FFE_0000_0000;
+pub const DEFAULT_TEB_VA: u64 = 0x0000_7FFD_F000_0000;
 pub const DEFAULT_STACK_TOP: u64 = 0x0000_7FFD_E000_0000; // high — RSP starts here
-pub const DEFAULT_STACK_LEN: u64 = 0x100_000;             // 1 MiB — Win32 default
+pub const DEFAULT_STACK_LEN: u64 = 0x100_000; // 1 MiB — Win32 default
 pub const DEFAULT_STACK_BASE: u64 = DEFAULT_STACK_TOP - DEFAULT_STACK_LEN;
 
 /// Bundle of VAs + identifiers the loader uses for a fresh
@@ -74,13 +74,13 @@ pub const DEFAULT_STACK_BASE: u64 = DEFAULT_STACK_TOP - DEFAULT_STACK_LEN;
 /// processes don't collide on `TEB.ClientId`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Layout {
-    pub peb_va:      u64,
-    pub teb_va:      u64,
-    pub image_base:  u64,
-    pub stack_base:  u64, // LOW address — TEB.NT_TIB.StackLimit
-    pub stack_top:   u64, // HIGH address — TEB.NT_TIB.StackBase
-    pub pid:         u64,
-    pub tid:         u64,
+    pub peb_va: u64,
+    pub teb_va: u64,
+    pub image_base: u64,
+    pub stack_base: u64, // LOW address — TEB.NT_TIB.StackLimit
+    pub stack_top: u64,  // HIGH address — TEB.NT_TIB.StackBase
+    pub pid: u64,
+    pub tid: u64,
     /// OS-version triple reported through `PEB.OSMajorVersion / -Minor / -Build`.
     /// PE binaries routinely gate on this — historically NT 6.1+ was
     /// the floor, modern toolchains assume Windows 10. The default
@@ -104,12 +104,20 @@ impl OsVersion {
     /// 19045 is a concrete late-Win10 build that satisfies version
     /// checks without claiming Win11 (which gates on a different
     /// `ProcessorFeatureSet` field we haven't filled in).
-    pub const WIN10_LATE: Self = Self { major: 10, minor: 0, build: 19045 };
+    pub const WIN10_LATE: Self = Self {
+        major: 10,
+        minor: 0,
+        build: 19045,
+    };
 
     /// NARF reports itself. PE binaries that gate on
     /// `OSMajorVersion >= 6` will refuse to load — fine for tests
     /// that want to confirm a binary actually walks `PEB.OSVersion`.
-    pub const NARF_HONEST: Self = Self { major: 0, minor: 0, build: 0 };
+    pub const NARF_HONEST: Self = Self {
+        major: 0,
+        minor: 0,
+        build: 0,
+    };
 }
 
 impl Layout {
@@ -121,11 +129,11 @@ impl Layout {
     /// tests that want to observe a binary's gate behaviour).
     pub const fn new(image_base: u64, pid: u64, tid: u64) -> Self {
         Self {
-            peb_va:     DEFAULT_PEB_VA,
-            teb_va:     DEFAULT_TEB_VA,
+            peb_va: DEFAULT_PEB_VA,
+            teb_va: DEFAULT_TEB_VA,
             image_base,
             stack_base: DEFAULT_STACK_BASE,
-            stack_top:  DEFAULT_STACK_TOP,
+            stack_top: DEFAULT_STACK_TOP,
             pid,
             tid,
             os_version: OsVersion::WIN10_LATE,
@@ -170,12 +178,12 @@ pub fn init_peb(peb: &mut [u8; PAGE], layout: Layout) {
 /// `mov rax, gs:[0x30]` to materialise its own TEB pointer), the
 /// ClientId pair, and the PEB pointer that sits at gs:[0x60].
 pub fn init_teb(teb: &mut [u8; PAGE], layout: Layout) {
-    put_u64(teb, TEB_TIB_STACK_BASE,    layout.stack_top);
-    put_u64(teb, TEB_TIB_STACK_LIMIT,   layout.stack_base);
-    put_u64(teb, TEB_TIB_SELF,          layout.teb_va);
+    put_u64(teb, TEB_TIB_STACK_BASE, layout.stack_top);
+    put_u64(teb, TEB_TIB_STACK_LIMIT, layout.stack_base);
+    put_u64(teb, TEB_TIB_SELF, layout.teb_va);
     put_u64(teb, TEB_CLIENT_ID_PROCESS, layout.pid);
-    put_u64(teb, TEB_CLIENT_ID_THREAD,  layout.tid);
-    put_u64(teb, TEB_PEB,               layout.peb_va);
+    put_u64(teb, TEB_CLIENT_ID_THREAD, layout.tid);
+    put_u64(teb, TEB_PEB, layout.peb_va);
 }
 
 #[cfg(test)]
@@ -195,13 +203,13 @@ mod tests {
 
     fn layout_for_test() -> Layout {
         Layout {
-            peb_va:     0x7FFE_0000,
-            teb_va:     0x7FFD_F000,
+            peb_va: 0x7FFE_0000,
+            teb_va: 0x7FFD_F000,
             image_base: 0x1_4000_0000,
             stack_base: 0x7FF7_0000,
-            stack_top:  0x7FF8_0000,
-            pid:        0xCAFE,
-            tid:        0xBABE,
+            stack_top: 0x7FF8_0000,
+            pid: 0xCAFE,
+            tid: 0xBABE,
             os_version: OsVersion::WIN10_LATE,
         }
     }
@@ -242,10 +250,10 @@ mod tests {
         // starts), StackLimit is the LOW address. Crossing these
         // would make __chkstk think the stack grows the wrong
         // direction.
-        let base  = read_u64(&teb, TEB_TIB_STACK_BASE);
+        let base = read_u64(&teb, TEB_TIB_STACK_BASE);
         let limit = read_u64(&teb, TEB_TIB_STACK_LIMIT);
         assert!(base > limit);
-        assert_eq!(base,  0x7FF8_0000);
+        assert_eq!(base, 0x7FF8_0000);
         assert_eq!(limit, 0x7FF7_0000);
     }
 
@@ -254,7 +262,7 @@ mod tests {
         let mut teb = [0u8; PAGE];
         init_teb(&mut teb, layout_for_test());
         assert_eq!(read_u64(&teb, TEB_CLIENT_ID_PROCESS), 0xCAFE);
-        assert_eq!(read_u64(&teb, TEB_CLIENT_ID_THREAD),  0xBABE);
+        assert_eq!(read_u64(&teb, TEB_CLIENT_ID_THREAD), 0xBABE);
     }
 
     #[test]

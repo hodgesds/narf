@@ -16,12 +16,12 @@ pub enum CacheKind {
 
 #[derive(Copy, Clone, Debug)]
 pub struct CacheLevel {
-    pub level:       u8,
-    pub kind:        CacheKind,
-    pub line_bytes:  u16,
-    pub ways:        u16,
-    pub sets:        u32,
-    pub size_bytes:  u32,
+    pub level: u8,
+    pub kind: CacheKind,
+    pub line_bytes: u16,
+    pub ways: u16,
+    pub sets: u32,
+    pub size_bytes: u32,
 }
 
 fn read_clidr() -> u64 {
@@ -56,21 +56,32 @@ unsafe fn select(level: u8, instr: bool) {
 }
 
 fn decode_ccsidr(level: u8, kind: CacheKind, ccsidr: u64) -> CacheLevel {
-    let line  = 4u16 << (ccsidr & 0x7);                          // bits[2:0] = log2(line / 4)
-    let ways  = (((ccsidr >> 3) & 0x3FF) + 1) as u16;            // bits[12:3] = ways - 1
-    let sets  = (((ccsidr >> 13) & 0x7FFF) + 1) as u32;          // bits[27:13] = sets - 1
-    let size  = (line as u32) * (ways as u32) * sets;
-    CacheLevel { level, kind, line_bytes: line, ways, sets, size_bytes: size }
+    let line = 4u16 << (ccsidr & 0x7); // bits[2:0] = log2(line / 4)
+    let ways = (((ccsidr >> 3) & 0x3FF) + 1) as u16; // bits[12:3] = ways - 1
+    let sets = (((ccsidr >> 13) & 0x7FFF) + 1) as u32; // bits[27:13] = sets - 1
+    let size = (line as u32) * (ways as u32) * sets;
+    CacheLevel {
+        level,
+        kind,
+        line_bytes: line,
+        ways,
+        sets,
+        size_bytes: size,
+    }
 }
 
 pub fn levels<F: FnMut(CacheLevel)>(mut f: F) {
     let clidr = read_clidr();
     for lvl in 1..=7u8 {
         let field = ((clidr >> (3 * (lvl as u64 - 1))) & 0x7) as u8;
-        if field == 0 { break; }
+        if field == 0 {
+            break;
+        }
         let mut emit = |kind: CacheKind, instr: bool| {
             // SAFETY: level + side selected per ARM ARM.
-            unsafe { select(lvl, instr); }
+            unsafe {
+                select(lvl, instr);
+            }
             let cc = read_ccsidr();
             f(decode_ccsidr(lvl, kind, cc));
         };

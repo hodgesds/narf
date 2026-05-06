@@ -23,15 +23,15 @@ use narf_lib::percpu::MAX_CPUS;
 #[derive(Debug)]
 struct ProbeCell {
     recovery: AtomicU64,
-    caught:   AtomicU32,
-    error:    AtomicU64,
+    caught: AtomicU32,
+    error: AtomicU64,
 }
 
 impl ProbeCell {
     const NEW: Self = Self {
         recovery: AtomicU64::new(0),
-        caught:   AtomicU32::new(0),
-        error:    AtomicU64::new(0),
+        caught: AtomicU32::new(0),
+        error: AtomicU64::new(0),
     };
 }
 
@@ -49,7 +49,7 @@ fn this_probe() -> &'static ProbeCell {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub struct Caught {
     /// 0 if nothing fired; otherwise the CPU-exception vector number.
-    pub vector:     Option<u32>,
+    pub vector: Option<u32>,
     /// The CPU-pushed error code for vectors that push one (8, 10-14,
     /// 17, 21, 29, 30). Meaningless otherwise.
     pub error_code: u64,
@@ -62,8 +62,8 @@ pub struct Caught {
 /// Clears any stale caught state from a prior arming.
 pub fn arm(recovery_rip: u64) {
     let cell = this_probe();
-    cell.caught  .store(0, Ordering::Release);
-    cell.error   .store(0, Ordering::Release);
+    cell.caught.store(0, Ordering::Release);
+    cell.error.store(0, Ordering::Release);
     cell.recovery.store(recovery_rip, Ordering::Release);
 }
 
@@ -72,7 +72,7 @@ pub fn disarm() -> Caught {
     let cell = this_probe();
     cell.recovery.store(0, Ordering::Release);
     let raw = cell.caught.swap(0, Ordering::AcqRel);
-    let err = cell.error .swap(0, Ordering::AcqRel);
+    let err = cell.error.swap(0, Ordering::AcqRel);
     Caught {
         vector: if raw == 0 { None } else { Some(raw - 1) },
         error_code: err,
@@ -92,7 +92,7 @@ pub fn consume(vector: u32, error_code: u64) -> u64 {
     let recovery = cell.recovery.swap(0, Ordering::AcqRel);
     if recovery != 0 {
         cell.caught.store(vector + 1, Ordering::Release);
-        cell.error .store(error_code, Ordering::Release);
+        cell.error.store(error_code, Ordering::Release);
     }
     recovery
 }

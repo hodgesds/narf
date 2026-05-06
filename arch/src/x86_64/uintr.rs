@@ -15,18 +15,20 @@
 use crate::x86_64::cpuid::cpuid;
 use crate::x86_64::msr::{rdmsr, wrmsr};
 
-pub const MSR_IA32_UINTR_RR:           u32 = 0x985;
-pub const MSR_IA32_UINTR_HANDLER:      u32 = 0x986;
-pub const MSR_IA32_UINTR_STACKADJUST:  u32 = 0x987;
-pub const MSR_IA32_UINTR_MISC:         u32 = 0x988;
-pub const MSR_IA32_UINTR_PD:           u32 = 0x989;
-pub const MSR_IA32_UINTR_TT:           u32 = 0x98A;
+pub const MSR_IA32_UINTR_RR: u32 = 0x985;
+pub const MSR_IA32_UINTR_HANDLER: u32 = 0x986;
+pub const MSR_IA32_UINTR_STACKADJUST: u32 = 0x987;
+pub const MSR_IA32_UINTR_MISC: u32 = 0x988;
+pub const MSR_IA32_UINTR_PD: u32 = 0x989;
+pub const MSR_IA32_UINTR_TT: u32 = 0x98A;
 
 /// `true` iff CPUID(7, 0).EDX[5] is set.
 pub fn supported() -> bool {
     // SAFETY: leaf 0 always defined.
     let max = unsafe { cpuid(0, 0).0 };
-    if max < 7 { return false; }
+    if max < 7 {
+        return false;
+    }
     // SAFETY: leaf 7 valid.
     let (_, _, _, edx) = unsafe { cpuid(7, 0) };
     edx & (1 << 5) != 0
@@ -39,7 +41,9 @@ pub fn supported() -> bool {
 /// the receiving task expects to enter on UI delivery.
 pub unsafe fn install_handler(handler_va: u64) {
     // SAFETY: caller-asserted.
-    unsafe { wrmsr(MSR_IA32_UINTR_HANDLER, handler_va); }
+    unsafe {
+        wrmsr(MSR_IA32_UINTR_HANDLER, handler_va);
+    }
 }
 
 /// Install the User Posted-Interrupt Descriptor table phys.
@@ -49,7 +53,9 @@ pub unsafe fn install_handler(handler_va: u64) {
 /// points to a valid UPID.
 pub unsafe fn install_pd(pd_phys: u64) {
     // SAFETY: caller-asserted.
-    unsafe { wrmsr(MSR_IA32_UINTR_PD, pd_phys); }
+    unsafe {
+        wrmsr(MSR_IA32_UINTR_PD, pd_phys);
+    }
 }
 
 /// Install the user-IRQ stack adjustment.
@@ -58,7 +64,9 @@ pub unsafe fn install_pd(pd_phys: u64) {
 /// CPL = 0; UINTR supported.
 pub unsafe fn install_stack_adjust(value: u64) {
     // SAFETY: caller-asserted.
-    unsafe { wrmsr(MSR_IA32_UINTR_STACKADJUST, value); }
+    unsafe {
+        wrmsr(MSR_IA32_UINTR_STACKADJUST, value);
+    }
 }
 
 /// Read `IA32_UINTR_MISC`. Bit 31 = "user-IRQ pending" hint;
@@ -77,7 +85,9 @@ pub unsafe fn read_misc() -> u64 {
 /// CPL = 0; UINTR supported.
 pub unsafe fn write_misc(v: u64) {
     // SAFETY: caller-asserted.
-    unsafe { wrmsr(MSR_IA32_UINTR_MISC, v); }
+    unsafe {
+        wrmsr(MSR_IA32_UINTR_MISC, v);
+    }
 }
 
 /// Send a user-IPI to the UPID at index `upid_index`. Userspace
@@ -104,7 +114,9 @@ pub unsafe fn senduipi(upid_index: u32) {
 /// UINTR-aware thread context.
 pub unsafe fn clui() {
     // SAFETY: caller-asserted.
-    unsafe { core::arch::asm!("clui", options(nostack, preserves_flags)); }
+    unsafe {
+        core::arch::asm!("clui", options(nostack, preserves_flags));
+    }
 }
 
 /// `stui` — set UIF.
@@ -113,7 +125,9 @@ pub unsafe fn clui() {
 /// Same as `clui`.
 pub unsafe fn stui() {
     // SAFETY: caller-asserted.
-    unsafe { core::arch::asm!("stui", options(nostack, preserves_flags)); }
+    unsafe {
+        core::arch::asm!("stui", options(nostack, preserves_flags));
+    }
 }
 
 /// `testui` — read UIF into CF.

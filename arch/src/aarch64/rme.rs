@@ -26,4 +26,6 @@ pub fn caps() -> u8 {
     ((id_aa64pfr0() >> 52) & 0xF) as u8
 }
 
-pub fn supported() -> bool { caps() != 0 }
+pub fn supported() -> bool {
+    caps() != 0
+}

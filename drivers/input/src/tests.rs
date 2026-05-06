@@ -10,8 +10,10 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 fn smoke_i8042_decode_a_keystroke() -> TestResult {
     // Synthetic scancode-set-1 byte stream for: press 'A', release 'A'.
     // Make code for KEY_A in set 1 = 0x1E. Release sets the 0x80 bit.
-    use narf_input::{__reset_global_ring_for_test, InputEvent, KeyCode, pop_global, init_global_ring};
     use crate::i8042;
+    use narf_input::{
+        InputEvent, KeyCode, __reset_global_ring_for_test, init_global_ring, pop_global,
+    };
 
     init_global_ring(8);
     __reset_global_ring_for_test();
@@ -30,8 +32,12 @@ fn smoke_i8042_decode_a_keystroke() -> TestResult {
         release,
         Some(InputEvent::Key(k)) if k.code == KeyCode::A && !k.pressed
     );
-    if !press_ok   { return TestResult::Fail("A press event missing or wrong"); }
-    if !release_ok { return TestResult::Fail("A release event missing or wrong"); }
+    if !press_ok {
+        return TestResult::Fail("A press event missing or wrong");
+    }
+    if !release_ok {
+        return TestResult::Fail("A release event missing or wrong");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/input", smoke_i8042_decode_a_keystroke);
@@ -39,8 +45,10 @@ kernel_test_in!("drivers/input", smoke_i8042_decode_a_keystroke);
 fn smoke_i8042_modifier_tracking() -> TestResult {
     // Press LeftShift (make 0x2A), press 'A' (make 0x1E), release both.
     // The 'A' press event should carry SHIFT in its modifier bitset.
-    use narf_input::{__reset_global_ring_for_test, InputEvent, KeyCode, Modifiers, pop_global, init_global_ring};
     use crate::i8042;
+    use narf_input::{
+        InputEvent, KeyCode, Modifiers, __reset_global_ring_for_test, init_global_ring, pop_global,
+    };
 
     init_global_ring(8);
     __reset_global_ring_for_test();
@@ -66,9 +74,10 @@ fn smoke_i8042_modifier_tracking() -> TestResult {
 kernel_test_in!("drivers/input", smoke_i8042_modifier_tracking);
 
 fn smoke_i8042_mouse_packet_decode() -> TestResult {
-    use narf_input::{__reset_global_ring_for_test, init_global_ring,
-                      InputEvent, PointerButtons, pop_global};
     use crate::i8042_mouse;
+    use narf_input::{
+        __reset_global_ring_for_test, init_global_ring, pop_global, InputEvent, PointerButtons,
+    };
     init_global_ring(8);
     __reset_global_ring_for_test();
     i8042_mouse::__reset_for_test();
@@ -99,9 +108,8 @@ fn smoke_i8042_mouse_packet_decode() -> TestResult {
 kernel_test_in!("drivers/input", smoke_i8042_mouse_packet_decode);
 
 fn smoke_i8042_mouse_signed_dx_decodes() -> TestResult {
-    use narf_input::{__reset_global_ring_for_test, init_global_ring,
-                      InputEvent, pop_global};
     use crate::i8042_mouse;
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_global, InputEvent};
     init_global_ring(8);
     __reset_global_ring_for_test();
     i8042_mouse::__reset_for_test();
@@ -125,8 +133,8 @@ fn smoke_i8042_mouse_signed_dx_decodes() -> TestResult {
 kernel_test_in!("drivers/input", smoke_i8042_mouse_signed_dx_decodes);
 
 fn smoke_i8042_mouse_drops_unsynced_byte() -> TestResult {
-    use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_global};
     use crate::i8042_mouse;
+    use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_global};
     init_global_ring(8);
     __reset_global_ring_for_test();
     i8042_mouse::__reset_for_test();
@@ -148,8 +156,10 @@ fn smoke_i8042_mouse_drops_unsynced_byte() -> TestResult {
 kernel_test_in!("drivers/input", smoke_i8042_mouse_drops_unsynced_byte);
 
 fn smoke_virtio_input_decode_synthetic() -> TestResult {
-    use narf_input::{__reset_global_ring_for_test, InputEvent, KeyCode, pop_global, init_global_ring};
     use narf_drivers_virtio::input_pci::feed_synthetic_events_for_test;
+    use narf_input::{
+        InputEvent, KeyCode, __reset_global_ring_for_test, init_global_ring, pop_global,
+    };
 
     init_global_ring(8);
     __reset_global_ring_for_test();
@@ -157,7 +167,9 @@ fn smoke_virtio_input_decode_synthetic() -> TestResult {
     // EV_KEY type=1, code=KEY_A=30, value=1 (press)
     // EV_KEY type=1, code=KEY_A=30, value=0 (release)
     let n = feed_synthetic_events_for_test(&[(1, 30, 1), (1, 30, 0)]);
-    if n != 2 { return TestResult::Fail("expected 2 synthetic events"); }
+    if n != 2 {
+        return TestResult::Fail("expected 2 synthetic events");
+    }
     let press = matches!(
         pop_global(),
         Some(InputEvent::Key(k)) if k.code == KeyCode::A && k.pressed
@@ -166,8 +178,12 @@ fn smoke_virtio_input_decode_synthetic() -> TestResult {
         pop_global(),
         Some(InputEvent::Key(k)) if k.code == KeyCode::A && !k.pressed
     );
-    if !press   { return TestResult::Fail("A press missing"); }
-    if !release { return TestResult::Fail("A release missing"); }
+    if !press {
+        return TestResult::Fail("A press missing");
+    }
+    if !release {
+        return TestResult::Fail("A release missing");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/input", smoke_virtio_input_decode_synthetic);

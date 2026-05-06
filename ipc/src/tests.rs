@@ -42,7 +42,9 @@ fn smoke_ipc_spsc_round_trip() -> TestResult {
     narf_scheduler::spawn(async move {
         loop {
             match rx.recv().await {
-                Ok(v)                       => { SUM.fetch_add(v, Ordering::Relaxed); }
+                Ok(v) => {
+                    SUM.fetch_add(v, Ordering::Relaxed);
+                }
                 Err(crate::RecvError::Closed) => break,
             }
         }
@@ -50,8 +52,11 @@ fn smoke_ipc_spsc_round_trip() -> TestResult {
 
     narf_scheduler::run_until_empty();
     // 1 + 2 + … + 8 = 36.
-    if SUM.load(Ordering::Relaxed) == 36 { TestResult::Pass }
-    else { TestResult::Fail("SPSC round-trip didn't deliver every message") }
+    if SUM.load(Ordering::Relaxed) == 36 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("SPSC round-trip didn't deliver every message")
+    }
 }
 kernel_test_in!("ipc", smoke_ipc_spsc_round_trip);
 
@@ -68,7 +73,9 @@ fn smoke_ipc_shared_ring_round_trip() -> TestResult {
         Ok(f) => f.start_address(),
         Err(_) => return TestResult::Fail("alloc_frame"),
     };
-    unsafe { core::ptr::write_bytes(frame.raw() as *mut u8, 0, 4096); }
+    unsafe {
+        core::ptr::write_bytes(frame.raw() as *mut u8, 0, 4096);
+    }
     let kernel_view = frame.raw() as *mut SharedRing<u64, 8>;
 
     // Verify the layout fits in 4 KiB.
@@ -77,7 +84,9 @@ fn smoke_ipc_shared_ring_round_trip() -> TestResult {
     }
 
     // Initialise.
-    unsafe { SharedRing::<u64, 8>::init_in(kernel_view); }
+    unsafe {
+        SharedRing::<u64, 8>::init_in(kernel_view);
+    }
 
     // Two distinct pointer values that resolve to the same backing
     // (here, both are the same kernel-identity vaddr; in real use
@@ -102,7 +111,7 @@ fn smoke_ipc_shared_ring_round_trip() -> TestResult {
     for expected in 0u64..8 {
         match cons.try_recv() {
             Ok(v) if v == expected => {}
-            Ok(_)  => return TestResult::Fail("recv out of order"),
+            Ok(_) => return TestResult::Fail("recv out of order"),
             Err(_) => return TestResult::Fail("recv failed early"),
         }
     }
@@ -130,9 +139,9 @@ fn smoke_ipc_spsc_try_send_full() -> TestResult {
     tx.try_send(20).expect("slot 1 free");
     match tx.try_send(30) {
         Err(crate::TrySendError::Full(30)) => TestResult::Pass,
-        Err(crate::TrySendError::Full(_))  => TestResult::Fail("Full returned wrong value"),
+        Err(crate::TrySendError::Full(_)) => TestResult::Fail("Full returned wrong value"),
         Err(crate::TrySendError::Closed(_)) => TestResult::Fail("unexpected Closed"),
-        Ok(())                              => TestResult::Fail("try_send accepted beyond capacity"),
+        Ok(()) => TestResult::Fail("try_send accepted beyond capacity"),
     }
 }
 kernel_test_in!("ipc", smoke_ipc_spsc_try_send_full);
@@ -142,7 +151,7 @@ fn smoke_ipc_spsc_close_eof() -> TestResult {
     // recv resolves to Closed. Also verifies the path where the drop's
     // wake fires against an already-parked RecvFuture.
     use core::sync::atomic::{AtomicU8, Ordering};
-    static OUTCOME: AtomicU8 = AtomicU8::new(0);       // 0=pending, 1=closed, 2=unexpected
+    static OUTCOME: AtomicU8 = AtomicU8::new(0); // 0=pending, 1=closed, 2=unexpected
 
     OUTCOME.store(0, Ordering::Relaxed);
     narf_scheduler::init();
@@ -152,8 +161,12 @@ fn smoke_ipc_spsc_close_eof() -> TestResult {
     // Consumer task: parks on recv, then observes Closed.
     narf_scheduler::spawn(async move {
         match rx.recv().await {
-            Err(crate::RecvError::Closed) => { OUTCOME.store(1, Ordering::Relaxed); }
-            _                             => { OUTCOME.store(2, Ordering::Relaxed); }
+            Err(crate::RecvError::Closed) => {
+                OUTCOME.store(1, Ordering::Relaxed);
+            }
+            _ => {
+                OUTCOME.store(2, Ordering::Relaxed);
+            }
         }
     });
 
@@ -174,7 +187,7 @@ kernel_test_in!("ipc", smoke_ipc_spsc_close_eof);
 
 fn smoke_ipc_spsc_drain_then_eof() -> TestResult {
     use core::sync::atomic::{AtomicU32, Ordering};
-    static COUNT:  AtomicU32 = AtomicU32::new(0);
+    static COUNT: AtomicU32 = AtomicU32::new(0);
     static CLOSED: AtomicU32 = AtomicU32::new(0);
 
     COUNT.store(0, Ordering::Relaxed);
@@ -190,8 +203,13 @@ fn smoke_ipc_spsc_drain_then_eof() -> TestResult {
     narf_scheduler::spawn(async move {
         loop {
             match rx.recv().await {
-                Ok(_)  => { COUNT.fetch_add(1, Ordering::Relaxed); }
-                Err(_) => { CLOSED.store(1, Ordering::Relaxed); break; }
+                Ok(_) => {
+                    COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    CLOSED.store(1, Ordering::Relaxed);
+                    break;
+                }
             }
         }
     });
@@ -212,19 +230,19 @@ kernel_test_in!("ipc", smoke_ipc_spsc_drain_then_eof);
 fn smoke_exit_gate_buffer_handoff() -> TestResult {
     use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
     use narf_capabilities::{Cap, Read};
-    use narf_io::{DmaBuffer, alloc_coherent};
+    use narf_io::{alloc_coherent, DmaBuffer};
     use narf_lib::id::DomainId;
     use narf_memory::PAGE_SIZE;
 
     /// 17-byte payload pattern. Non-trivial so a zeroed/untouched
     /// buffer doesn't accidentally match.
     const PATTERN: [u8; 17] = [
-        0xA5, 0x5A, 0x01, 0xFE, 0x42, 0x00, 0xFF, 0x10,
-        0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xAA,
+        0xA5, 0x5A, 0x01, 0xFE, 0x42, 0x00, 0xFF, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
+        0x90, 0xAA,
     ];
 
-    static OUTCOME:   AtomicU8    = AtomicU8::new(0);   // 0=pending, 1=ok, 2=bad
-    static READ_LEN:  AtomicUsize = AtomicUsize::new(0);
+    static OUTCOME: AtomicU8 = AtomicU8::new(0); // 0=pending, 1=ok, 2=bad
+    static READ_LEN: AtomicUsize = AtomicUsize::new(0);
 
     struct Handoff {
         buf: DmaBuffer,
@@ -281,7 +299,8 @@ fn smoke_exit_gate_buffer_handoff() -> TestResult {
             let src = buf.phys_addr().as_ptr::<u8>();
             for (i, expected) in PATTERN.iter().enumerate() {
                 if core::ptr::read_volatile(src.add(i)) != *expected {
-                    ok = false; break;
+                    ok = false;
+                    break;
                 }
             }
         }
@@ -319,7 +338,7 @@ fn smoke_exit_gate_revoked_cap_rejected() -> TestResult {
     // test racy — revisit the schedule when that lands.
     use core::sync::atomic::{AtomicU8, Ordering};
     use narf_capabilities::{Cap, Read};
-    use narf_io::{DmaBuffer, alloc_coherent};
+    use narf_io::{alloc_coherent, DmaBuffer};
     use narf_lib::id::DomainId;
 
     static OUTCOME: AtomicU8 = AtomicU8::new(0); // 0 pending, 1 properly-rejected, 2 slipped-through
@@ -335,13 +354,20 @@ fn smoke_exit_gate_revoked_cap_rejected() -> TestResult {
     narf_scheduler::init();
 
     narf_scheduler::spawn(async move {
-        let Ok(buf) = alloc_coherent(16, DomainId::DRIVER_0) else { return };
+        let Ok(buf) = alloc_coherent(16, DomainId::DRIVER_0) else {
+            return;
+        };
         let cap: Cap<DmaBuffer, Read> = Cap::<DmaBuffer, Read>::bootstrap();
-        let cap_clone = cap;                         // Cap is Copy
-        let _ = tx.send(Handoff { buf, cap: cap_clone }).await;
+        let cap_clone = cap; // Cap is Copy
+        let _ = tx
+            .send(Handoff {
+                buf,
+                cap: cap_clone,
+            })
+            .await;
         // Yield so the consumer picks up the send before we revoke.
         narf_scheduler::yield_now().await;
-        cap.revoke();                                // bumps the shared epoch
+        cap.revoke(); // bumps the shared epoch
     });
 
     narf_scheduler::spawn(async move {

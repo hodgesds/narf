@@ -61,8 +61,7 @@ use narf_ipc::{Consumer, Producer};
 // narf-ipc dep — adding one perturbs link-time test-registration
 // ordering in the verification harness.
 pub use narf_ipc::{
-    SharedConsumer, SharedProducer, SharedRing,
-    SharedTryRecvError, SharedTrySendError,
+    SharedConsumer, SharedProducer, SharedRing, SharedTryRecvError, SharedTrySendError,
 };
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_tracing::FnTime;
@@ -96,11 +95,11 @@ pub static ABI_CANCEL_CHECK_LATENCY: FnTime = FnTime::new("abi::cancel_check");
 /// arch-neutral here (abi/ can't depend on userspace).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum FileOpKind {
-    Open   = 110,
-    Read   = 111,
-    Write  = 112,
-    Close  = 113,
-    Mmap   = 120,
+    Open = 110,
+    Read = 111,
+    Write = 112,
+    Close = 113,
+    Mmap = 120,
     Munmap = 121,
 }
 
@@ -109,20 +108,23 @@ pub enum FileOpKind {
 /// can route between the two without knowing about either.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct FileOpArgs {
-    pub a0: u64, pub a1: u64, pub a2: u64,
-    pub a3: u64, pub a4: u64, pub a5: u64,
+    pub a0: u64,
+    pub a1: u64,
+    pub a2: u64,
+    pub a3: u64,
+    pub a4: u64,
+    pub a5: u64,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub struct FileOpReturn {
-    pub status: u32,  // 0 = Ok, 1 = InvalidOp, ... — mirrors NarfStatus.
-    pub value:  u64,
+    pub status: u32, // 0 = Ok, 1 = InvalidOp, ... — mirrors NarfStatus.
+    pub value: u64,
 }
 
 type FileOpBridge = fn(FileOpKind, &FileOpArgs) -> FileOpReturn;
 
-static FILE_OP_BRIDGE: IrqSafeSpinLock<Option<FileOpBridge>> =
-    IrqSafeSpinLock::new(None);
+static FILE_OP_BRIDGE: IrqSafeSpinLock<Option<FileOpBridge>> = IrqSafeSpinLock::new(None);
 
 /// Install the bridge that routes ring-submitted file ops into the
 /// kernel's regular syscall path. Boot calls this once with
@@ -135,7 +137,10 @@ fn dispatch_file_op(kind: FileOpKind, args: &FileOpArgs) -> FileOpReturn {
     let g = FILE_OP_BRIDGE.lock();
     match *g {
         Some(b) => b(kind, args),
-        None    => FileOpReturn { status: 1 /* InvalidOp */, value: 0 },
+        None => FileOpReturn {
+            status: 1, /* InvalidOp */
+            value: 0,
+        },
     }
 }
 
@@ -154,51 +159,53 @@ fn dispatch_file_op(kind: FileOpKind, args: &FileOpArgs) -> FileOpReturn {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum OpCode {
     /// No-op; exercises the round-trip path. Completes with `Ok`.
-    Noop         = 0x0000,
+    Noop = 0x0000,
 
     /// Cancel an outstanding submission by tag. Per spec §3.1, the
     /// cancel op itself always succeeds (`Ok`); the target either
     /// drains with `Cancelled`, `CancelRequested`, `Ok`, or an error.
-    Cancel       = 0x0001,
+    Cancel = 0x0001,
 
     /// Push a message into the named ring (the ring is in `caps[0]`).
-    RingSend     = 0x0002,
+    RingSend = 0x0002,
 
     /// Pop a message from the named ring (ring in `caps[0]`).
-    RingRecv     = 0x0003,
+    RingRecv = 0x0003,
 
     /// Cooperative yield: complete immediately but let the scheduler
     /// reorder the task behind peers. Useful as a fairness primitive
     /// from userland without a syscall trap.
-    Yield        = 0x0004,
+    Yield = 0x0004,
 
     /// Enter a protection domain named by `caps[0]` (a `Cap<Domain, _>`).
     /// Slow-path-only in the v0.2 spec; the fast-path form is a
     /// Wave-3+ compiler-assisted optimisation.
-    DomainEnter  = 0x0005,
+    DomainEnter = 0x0005,
 
     /// Exit the current protection domain; inverse of `DomainEnter`.
-    DomainExit   = 0x0006,
+    DomainExit = 0x0006,
 
     /// File ops mirror `narf_userspace::Syscall`'s file numbers.
     /// Inline operands match: `inline[0]=fd or path-ptr`,
     /// `inline[1]=path-len or buf-ptr`, etc. `Completion::result[0]`
     /// is the bytes-read/written or new fd, like `SyscallReturn::value`.
-    OpenFile     = 0x0010,
-    Read         = 0x0011,
-    Write        = 0x0012,
-    Close        = 0x0013,
+    OpenFile = 0x0010,
+    Read = 0x0011,
+    Write = 0x0012,
+    Close = 0x0013,
 
     /// Memory ops. `inline[0..3]` carry the args; `Completion::result[0]`
     /// is the mapped vaddr (Mmap) or 0 (Munmap).
-    Mmap         = 0x0014,
-    Munmap       = 0x0015,
+    Mmap = 0x0014,
+    Munmap = 0x0015,
 }
 
 impl OpCode {
     /// Raw u32 discriminant — useful for tracing / audit dumps.
     #[inline]
-    pub const fn as_u32(self) -> u32 { self as u32 }
+    pub const fn as_u32(self) -> u32 {
+        self as u32
+    }
 }
 
 // ── SubmissionFlags ─────────────────────────────────────────────────
@@ -224,23 +231,27 @@ impl SubmissionFlags {
 
     /// Next submission in the ring is part of the same chain; cancel
     /// cascades across the chain per spec §3.1 "Linked submissions".
-    pub const LINKED:      SubmissionFlags = SubmissionFlags(1 << 1);
+    pub const LINKED: SubmissionFlags = SubmissionFlags(1 << 1);
 
     /// Drain: operation waits until all earlier submissions have
     /// produced terminal completions before starting. Useful for
     /// fence-like barriers.
-    pub const DRAIN:       SubmissionFlags = SubmissionFlags(1 << 2);
+    pub const DRAIN: SubmissionFlags = SubmissionFlags(1 << 2);
 
     /// Raw u32 representation.
     #[inline]
-    pub const fn bits(self) -> u32 { self.0 }
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
 
     /// Construct from a raw u32. Unknown bits are preserved verbatim;
     /// subsystems are responsible for validating their own bits on
     /// drain. This mirrors `CapKind` — unknown-tag rejection lives at
     /// the dispatcher, not at the wire-decoder.
     #[inline]
-    pub const fn from_bits(bits: u32) -> Self { Self(bits) }
+    pub const fn from_bits(bits: u32) -> Self {
+        Self(bits)
+    }
 
     /// Test whether every bit in `other` is set in `self`.
     #[inline]
@@ -265,25 +276,33 @@ impl core::fmt::Debug for SubmissionFlags {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         // Print as `SubmissionFlags(0xNN | CANCELLABLE | LINKED)`. The
         // raw hex is the wire tag; names make the value human-readable.
-        f.debug_tuple("SubmissionFlags").field(&format_args!("{:#x}", self.0)).finish()
+        f.debug_tuple("SubmissionFlags")
+            .field(&format_args!("{:#x}", self.0))
+            .finish()
     }
 }
 
 impl core::ops::BitOr for SubmissionFlags {
     type Output = Self;
     #[inline]
-    fn bitor(self, rhs: Self) -> Self { self.union(rhs) }
+    fn bitor(self, rhs: Self) -> Self {
+        self.union(rhs)
+    }
 }
 
 impl core::ops::BitAnd for SubmissionFlags {
     type Output = Self;
     #[inline]
-    fn bitand(self, rhs: Self) -> Self { self.intersection(rhs) }
+    fn bitand(self, rhs: Self) -> Self {
+        self.intersection(rhs)
+    }
 }
 
 impl core::ops::BitOrAssign for SubmissionFlags {
     #[inline]
-    fn bitor_assign(&mut self, rhs: Self) { self.0 |= rhs.0; }
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
 }
 
 // ── NarfStatus ──────────────────────────────────────────────────────
@@ -300,39 +319,41 @@ impl core::ops::BitOrAssign for SubmissionFlags {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum NarfStatus {
     /// Operation completed successfully. `result` carries the payload.
-    Ok               = 0x0000,
+    Ok = 0x0000,
 
     /// Operation has not completed yet. Only valid on the in-kernel
     /// side — a user-visible completion never carries `Pending`.
-    Pending          = 0x0001,
+    Pending = 0x0001,
 
     /// Cancellation took effect. `result` MUST report durable side
     /// effects (spec §3.1 "Partial-completion disclosure").
-    Cancelled        = 0x0002,
+    Cancelled = 0x0002,
 
     /// Operation was observed cancellation but will keep running
     /// (fence / flush / commit). Caller awaits a later terminal
     /// completion.
-    CancelRequested  = 0x0003,
+    CancelRequested = 0x0003,
 
     /// Underlying cap was revoked between enqueue and dispatch.
     /// Authoritative — do NOT retry (spec §4).
-    CapRevoked       = 0x0004,
+    CapRevoked = 0x0004,
 
     /// OpCode was not recognised by the in-kernel dispatcher.
-    InvalidOp        = 0x0005,
+    InvalidOp = 0x0005,
 
     /// Target resource is busy — caller may retry.
-    Busy             = 0x0006,
+    Busy = 0x0006,
 
     /// Target ring / endpoint has been closed.
-    Closed           = 0x0007,
+    Closed = 0x0007,
 }
 
 impl NarfStatus {
     /// Raw u32 discriminant — wire tag.
     #[inline]
-    pub const fn as_u32(self) -> u32 { self as u32 }
+    pub const fn as_u32(self) -> u32 {
+        self as u32
+    }
 }
 
 // ── Tag ─────────────────────────────────────────────────────────────
@@ -349,11 +370,15 @@ pub struct Tag(pub u64);
 impl Tag {
     /// Construct a tag from its raw u64.
     #[inline]
-    pub const fn new(raw: u64) -> Self { Self(raw) }
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
 
     /// Raw u64 representation.
     #[inline]
-    pub const fn raw(self) -> u64 { self.0 }
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
 }
 
 // ── Submission ──────────────────────────────────────────────────────
@@ -384,13 +409,13 @@ impl Tag {
 pub struct Submission {
     /// Operation tag. `#[repr(u32)]` keeps this a plain 4-byte integer
     /// in the wire layout even though it is a Rust enum.
-    pub op:     OpCode,
+    pub op: OpCode,
     /// Flag bit-set — see `SubmissionFlags`.
-    pub flags:  SubmissionFlags,
+    pub flags: SubmissionFlags,
     /// Capabilities referenced by this op. Unused slots are `CapSlot::EMPTY`.
-    pub caps:   [CapSlot; 4],
+    pub caps: [CapSlot; 4],
     /// User-chosen correlation tag. Echoed in `Completion::tag`.
-    pub tag:    u64,
+    pub tag: u64,
     /// Six inline u64 operands. Subsystems document the meaning per op.
     pub inline: [u64; 6],
 }
@@ -406,10 +431,10 @@ impl Submission {
     #[inline]
     pub const fn noop(tag: Tag) -> Self {
         Self {
-            op:     OpCode::Noop,
-            flags:  SubmissionFlags::NONE,
-            caps:   [CapSlot::EMPTY; 4],
-            tag:    tag.raw(),
+            op: OpCode::Noop,
+            flags: SubmissionFlags::NONE,
+            caps: [CapSlot::EMPTY; 4],
+            tag: tag.raw(),
             inline: [0; 6],
         }
     }
@@ -436,15 +461,19 @@ impl Submission {
     /// on a non-cancel submission returns the inline[0] value as-is —
     /// this is a structural accessor, not a type check.
     #[inline]
-    pub const fn cancel_target(&self) -> Tag { Tag(self.inline[0]) }
+    pub const fn cancel_target(&self) -> Tag {
+        Tag(self.inline[0])
+    }
 
     /// Return the correlation tag as a `Tag`.
     #[inline]
-    pub const fn tag(&self) -> Tag { Tag(self.tag) }
+    pub const fn tag(&self) -> Tag {
+        Tag(self.tag)
+    }
 }
 
 // Wire-format pins — break if the layout silently drifts.
-const _: () = assert!(core::mem::size_of::<Submission>()  == 144);
+const _: () = assert!(core::mem::size_of::<Submission>() == 144);
 const _: () = assert!(core::mem::align_of::<Submission>() == 16);
 
 // ── Completion ──────────────────────────────────────────────────────
@@ -464,7 +493,7 @@ const _: () = assert!(core::mem::align_of::<Submission>() == 16);
 #[derive(Copy, Clone, Debug)]
 pub struct Completion {
     /// Echoed from the originating `Submission::tag`.
-    pub tag:    u64,
+    pub tag: u64,
     /// Completion status — see `NarfStatus`.
     pub status: NarfStatus,
     /// Six result words. Meaning is per-op; on `Cancelled`, reports
@@ -479,22 +508,32 @@ impl Completion {
     /// Construct an Ok completion for a given tag, empty result.
     #[inline]
     pub const fn ok(tag: Tag) -> Self {
-        Self { tag: tag.raw(), status: NarfStatus::Ok, result: [0; 6] }
+        Self {
+            tag: tag.raw(),
+            status: NarfStatus::Ok,
+            result: [0; 6],
+        }
     }
 
     /// Construct a completion with a given status and result.
     #[inline]
     pub const fn with(tag: Tag, status: NarfStatus, result: [u64; 6]) -> Self {
-        Self { tag: tag.raw(), status, result }
+        Self {
+            tag: tag.raw(),
+            status,
+            result,
+        }
     }
 
     /// Return the correlation tag as a `Tag`.
     #[inline]
-    pub const fn tag(&self) -> Tag { Tag(self.tag) }
+    pub const fn tag(&self) -> Tag {
+        Tag(self.tag)
+    }
 }
 
 // Wire-format pins — break if the layout silently drifts.
-const _: () = assert!(core::mem::size_of::<Completion>()  == 64);
+const _: () = assert!(core::mem::size_of::<Completion>() == 64);
 const _: () = assert!(core::mem::align_of::<Completion>() == 8);
 
 // ── Ring aliases ────────────────────────────────────────────────────
@@ -554,31 +593,31 @@ struct PendingCancels {
 #[derive(Debug)]
 struct CancelInner {
     /// Tags directly targeted by an `OpCode::Cancel`.
-    tags:           Vec<u64>,
+    tags: Vec<u64>,
     /// Chain ids whose members should propagate to `Cancelled` —
     /// spec §3.1 "Linked submissions" rule.
-    chains:         Vec<u32>,
+    chains: Vec<u32>,
     /// tag → chain_id map for the submissions that have been
     /// dispatched (or are being dispatched). Cancel propagation looks
     /// a target's tag up here to find its chain and then marks the
     /// whole chain.
-    chain_of:       Vec<(u64, u32)>,
+    chain_of: Vec<(u64, u32)>,
     /// Id assigned to the most recently seen chain. A new submission
     /// with `SubmissionFlags::LINKED` inherits this id; a submission
     /// without `LINKED` starts a fresh chain.
-    last_chain:     u32,
+    last_chain: u32,
     /// Monotonic chain-id allocator; starts at 1 so `last_chain == 0`
     /// unambiguously means "no chain seen yet".
-    next_chain:     u32,
+    next_chain: u32,
 }
 
 impl PendingCancels {
     const fn new() -> Self {
         Self {
             inner: IrqSafeSpinLock::new(CancelInner {
-                tags:       Vec::new(),
-                chains:     Vec::new(),
-                chain_of:   Vec::new(),
+                tags: Vec::new(),
+                chains: Vec::new(),
+                chain_of: Vec::new(),
                 last_chain: 0,
                 next_chain: 1,
             }),
@@ -651,15 +690,19 @@ impl PendingCancels {
 /// to the appropriate subsystems.
 #[derive(Debug)]
 pub struct Dispatcher<const N: usize> {
-    sq:      SubmissionDrain<N>,
-    cq:      CompletionQueue<N>,
+    sq: SubmissionDrain<N>,
+    cq: CompletionQueue<N>,
     pending: PendingCancels,
 }
 
 impl<const N: usize> Dispatcher<N> {
     /// Create a new dispatcher from a ring pair.
     pub const fn new(sq: SubmissionDrain<N>, cq: CompletionQueue<N>) -> Self {
-        Self { sq, cq, pending: PendingCancels::new() }
+        Self {
+            sq,
+            cq,
+            pending: PendingCancels::new(),
+        }
     }
 
     /// Run the dispatch loop. Never returns unless the submission ring
@@ -691,7 +734,7 @@ impl<const N: usize> Dispatcher<N> {
     /// Dispatch a single submission.
     async fn dispatch_one(&mut self, sub: Submission) -> Completion {
         let _g = narf_tracing::fntime::scope(&ABI_DISPATCH_LATENCY);
-        let tag   = sub.tag();
+        let tag = sub.tag();
         // Enter the sub into the chain registry; assigns a chain id
         // (fresh or inherited from LINKED) and records tag→chain so a
         // later `OpCode::Cancel` can propagate across the chain.
@@ -717,9 +760,7 @@ impl<const N: usize> Dispatcher<N> {
         }
 
         match sub.op {
-            OpCode::Noop => {
-                Completion::ok(tag)
-            }
+            OpCode::Noop => Completion::ok(tag),
 
             OpCode::Cancel => {
                 // §3.1: cancel always succeeds; the target's terminal
@@ -735,23 +776,35 @@ impl<const N: usize> Dispatcher<N> {
                 Completion::ok(tag)
             }
 
-            OpCode::OpenFile | OpCode::Read | OpCode::Write | OpCode::Close
-                | OpCode::Mmap | OpCode::Munmap => {
+            OpCode::OpenFile
+            | OpCode::Read
+            | OpCode::Write
+            | OpCode::Close
+            | OpCode::Mmap
+            | OpCode::Munmap => {
                 let kind = match sub.op {
                     OpCode::OpenFile => FileOpKind::Open,
-                    OpCode::Read     => FileOpKind::Read,
-                    OpCode::Write    => FileOpKind::Write,
-                    OpCode::Close    => FileOpKind::Close,
-                    OpCode::Mmap     => FileOpKind::Mmap,
-                    OpCode::Munmap   => FileOpKind::Munmap,
+                    OpCode::Read => FileOpKind::Read,
+                    OpCode::Write => FileOpKind::Write,
+                    OpCode::Close => FileOpKind::Close,
+                    OpCode::Mmap => FileOpKind::Mmap,
+                    OpCode::Munmap => FileOpKind::Munmap,
                     _ => unreachable!(),
                 };
                 let args = FileOpArgs {
-                    a0: sub.inline[0], a1: sub.inline[1], a2: sub.inline[2],
-                    a3: sub.inline[3], a4: sub.inline[4], a5: sub.inline[5],
+                    a0: sub.inline[0],
+                    a1: sub.inline[1],
+                    a2: sub.inline[2],
+                    a3: sub.inline[3],
+                    a4: sub.inline[4],
+                    a5: sub.inline[5],
                 };
                 let r = dispatch_file_op(kind, &args);
-                let status = if r.status == 0 { NarfStatus::Ok } else { NarfStatus::InvalidOp };
+                let status = if r.status == 0 {
+                    NarfStatus::Ok
+                } else {
+                    NarfStatus::InvalidOp
+                };
                 let mut result = [0u64; 6];
                 result[0] = r.value;
                 Completion::with(tag, status, result)

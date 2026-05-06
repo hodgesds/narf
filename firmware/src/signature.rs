@@ -52,24 +52,23 @@ pub const BLOB_TRAILER_MAGIC: [u8; 4] = *b"NRFW";
 #[derive(Debug)]
 pub struct BlobTrailer<'a> {
     /// Raw firmware payload — everything before the trailer.
-    pub payload:     &'a [u8],
+    pub payload: &'a [u8],
     /// Ed25519 signature over `sha256(payload)`. All-zero when the
     /// blob is unsigned (only accepted under `firmware-allow-unsigned`).
-    pub signature:   [u8; 64],
+    pub signature: [u8; 64],
     /// SHA-256 fingerprint of the signer's Ed25519 public key.
     /// All-zero on unsigned blobs.
-    pub signer:      [u8; 32],
+    pub signer: [u8; 32],
     /// Vendor-supplied version string parsed from the metadata
     /// blob, if present.
-    pub version:     Option<String>,
+    pub version: Option<String>,
 }
 
 impl<'a> BlobTrailer<'a> {
     /// `true` if both signature and signer are all-zero — the
     /// "unsigned" sentinel.
     pub fn is_unsigned(&self) -> bool {
-        self.signature.iter().all(|&b| b == 0)
-            && self.signer.iter().all(|&b| b == 0)
+        self.signature.iter().all(|&b| b == 0) && self.signer.iter().all(|&b| b == 0)
     }
 }
 
@@ -80,18 +79,22 @@ impl<'a> BlobTrailer<'a> {
 pub fn decode(blob: &[u8]) -> Result<BlobTrailer<'_>, FirmwareError> {
     // Minimum trailer = 64 (sig) + 32 (signer) + 4 (mlen) + 0 (md)
     // + 4 (magic) = 104 bytes.
-    if blob.len() < 104 { return Err(FirmwareError::BadFormat); }
+    if blob.len() < 104 {
+        return Err(FirmwareError::BadFormat);
+    }
 
     let n = blob.len();
     let magic = &blob[n - 4..];
-    if magic != BLOB_TRAILER_MAGIC { return Err(FirmwareError::BadFormat); }
+    if magic != BLOB_TRAILER_MAGIC {
+        return Err(FirmwareError::BadFormat);
+    }
 
-    let mlen = u32::from_le_bytes([
-        blob[n - 8], blob[n - 7], blob[n - 6], blob[n - 5],
-    ]) as usize;
+    let mlen = u32::from_le_bytes([blob[n - 8], blob[n - 7], blob[n - 6], blob[n - 5]]) as usize;
     // Bounds-check the metadata length.
     let trailer_size = 64 + 32 + 4 + mlen + 4;
-    if trailer_size > n { return Err(FirmwareError::BadFormat); }
+    if trailer_size > n {
+        return Err(FirmwareError::BadFormat);
+    }
 
     // Trailer layout (back from end):
     //   payload | sig(64) | signer(32) | metadata(mlen) | mlen(4) | magic(4)
@@ -115,13 +118,13 @@ pub fn decode(blob: &[u8]) -> Result<BlobTrailer<'_>, FirmwareError> {
     while i + 2 <= metadata.len() {
         let tag = metadata[i];
         let len = metadata[i + 1] as usize;
-        if i + 2 + len > metadata.len() { break; }
+        if i + 2 + len > metadata.len() {
+            break;
+        }
         let v = &metadata[i + 2..i + 2 + len];
         match tag {
             0x01 => {
-                version = core::str::from_utf8(v)
-                    .ok()
-                    .map(|s| s.into());
+                version = core::str::from_utf8(v).ok().map(|s| s.into());
             }
             _ => {}
         }
@@ -159,16 +162,14 @@ pub fn verify(trailer: &BlobTrailer<'_>) -> Result<(), FirmwareError> {
     }
     let pubkey = match trusted_signer_pubkey(&trailer.signer) {
         Some(k) => k,
-        None    => return Err(FirmwareError::SignatureInvalid),
+        None => return Err(FirmwareError::SignatureInvalid),
     };
     let key_cap = match verify_key_cap() {
         Some(c) => c,
-        None    => return Err(FirmwareError::SignatureInvalid),
+        None => return Err(FirmwareError::SignatureInvalid),
     };
     let digest = digest_of(trailer.payload);
-    match narf_crypto::ed25519_verify(
-        &key_cap, &pubkey, &digest, &trailer.signature,
-    ) {
+    match narf_crypto::ed25519_verify(&key_cap, &pubkey, &digest, &trailer.signature) {
         Ok(()) => Ok(()),
         Err(_) => Err(FirmwareError::SignatureInvalid),
     }
@@ -189,25 +190,26 @@ pub fn digest_of(bytes: &[u8]) -> [u8; 32] {
 /// algorithm tag, so swapping blake3 in here is invisible to
 /// anything outside the registry. Stage-7 may switch to SHA-256
 /// once that surface lands; consumers see `[u8; 32]` either way.
-pub fn sha256(bytes: &[u8]) -> [u8; 32] { digest_of(bytes) }
+pub fn sha256(bytes: &[u8]) -> [u8; 32] {
+    digest_of(bytes)
+}
 
 /// In-kernel trusted-signers list. Populated by
 /// `register_trusted_signer`. The trusted bootstrap stages the
 /// fingerprints+pubkeys at boot.
-static TRUSTED_SIGNERS: IrqSafeSpinLock<Vec<TrustedSigner>>
-    = IrqSafeSpinLock::new(Vec::new());
+static TRUSTED_SIGNERS: IrqSafeSpinLock<Vec<TrustedSigner>> = IrqSafeSpinLock::new(Vec::new());
 
 #[derive(Clone, Debug)]
 struct TrustedSigner {
     fingerprint: [u8; 32],
-    pubkey:      [u8; 32],
+    pubkey: [u8; 32],
 }
 
 /// Cap used by the Ed25519 verifier. Bootstrapped once on first
 /// signed-blob verification; signed-build production replaces this
 /// with a daemon-minted cap.
-static VERIFY_KEY_CAP: IrqSafeSpinLock<Option<Cap<Key<Ed25519Verify>, Read>>>
-    = IrqSafeSpinLock::new(None);
+static VERIFY_KEY_CAP: IrqSafeSpinLock<Option<Cap<Key<Ed25519Verify>, Read>>> =
+    IrqSafeSpinLock::new(None);
 
 fn verify_key_cap() -> Option<Cap<Key<Ed25519Verify>, Read>> {
     let mut g = VERIFY_KEY_CAP.lock();
@@ -231,7 +233,10 @@ pub fn register_trusted_signer(fingerprint: [u8; 32], pubkey: [u8; 32]) {
     if let Some(e) = g.iter_mut().find(|e| e.fingerprint == fingerprint) {
         e.pubkey = pubkey;
     } else {
-        g.push(TrustedSigner { fingerprint, pubkey });
+        g.push(TrustedSigner {
+            fingerprint,
+            pubkey,
+        });
     }
 }
 

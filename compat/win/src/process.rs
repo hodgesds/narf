@@ -27,12 +27,11 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use narf_capabilities::{Cap, CapKind, CapType, Invoke};
 #[allow(unused_imports)]
 use narf_capabilities as _;
+use narf_capabilities::{Cap, CapKind, CapType, Invoke};
 use narf_memory::{
-    alloc_frame, free_frame, AddressSpace, PhysAddr, PhysFrame, Region,
-    RegionPerms, VirtAddr,
+    alloc_frame, free_frame, AddressSpace, PhysAddr, PhysFrame, Region, RegionPerms, VirtAddr,
 };
 
 use crate::pe::{self, BaseRelocKind, PeError, PeImage, Section};
@@ -70,9 +69,13 @@ struct FrameGuard {
 }
 
 impl FrameGuard {
-    fn new() -> Self { Self { frames: Vec::new() } }
+    fn new() -> Self {
+        Self { frames: Vec::new() }
+    }
 
-    fn push(&mut self, p: PhysAddr) { self.frames.push(p); }
+    fn push(&mut self, p: PhysAddr) {
+        self.frames.push(p);
+    }
 
     /// Take ownership of the frames out of the guard so the caller
     /// can hand them to a Region. The guard becomes a no-op on
@@ -117,13 +120,13 @@ impl Drop for FrameGuard {
 #[derive(Debug)]
 pub struct WinProcess {
     pub address_space: Arc<AddressSpace>,
-    pub entry:         VirtAddr,
-    pub image_base:    u64,
+    pub entry: VirtAddr,
+    pub image_base: u64,
     pub size_of_image: u32,
-    pub peb_va:        VirtAddr,
-    pub teb_va:        VirtAddr,
-    pub stack_base:    VirtAddr,
-    pub stack_top:     VirtAddr,
+    pub peb_va: VirtAddr,
+    pub teb_va: VirtAddr,
+    pub stack_base: VirtAddr,
+    pub stack_top: VirtAddr,
 }
 
 impl CapType for WinProcess {
@@ -160,7 +163,9 @@ pub enum LoadError {
 }
 
 impl From<PeError> for LoadError {
-    fn from(e: PeError) -> Self { LoadError::Pe(e) }
+    fn from(e: PeError) -> Self {
+        LoadError::Pe(e)
+    }
 }
 
 /// Resolve an import to a user-mode VA in the WinProcess's address
@@ -181,10 +186,10 @@ pub type ImportResolver = fn(module: &str, symbol: &str) -> Option<u64>;
 /// if both `MEM_WRITE` and `MEM_EXECUTE` are set — defence in depth
 /// against a parser bug.
 pub fn perms_of(characteristics: u32) -> Result<RegionPerms, LoadError> {
-    const MEM_READ:    u32 = 0x4000_0000;
-    const MEM_WRITE:   u32 = 0x8000_0000;
+    const MEM_READ: u32 = 0x4000_0000;
+    const MEM_WRITE: u32 = 0x8000_0000;
     const MEM_EXECUTE: u32 = 0x2000_0000;
-    let w = characteristics & MEM_WRITE   != 0;
+    let w = characteristics & MEM_WRITE != 0;
     let x = characteristics & MEM_EXECUTE != 0;
     if w && x {
         return Err(LoadError::WritableExecutableSection);
@@ -194,8 +199,12 @@ pub fn perms_of(characteristics: u32) -> Result<RegionPerms, LoadError> {
     // emits a section with READ off).
     let _r = characteristics & MEM_READ != 0;
     let mut p = RegionPerms::READ;
-    if w { p = p | RegionPerms::WRITE; }
-    if x { p = p | RegionPerms::EXEC; }
+    if w {
+        p = p | RegionPerms::WRITE;
+    }
+    if x {
+        p = p | RegionPerms::EXEC;
+    }
     Ok(p)
 }
 
@@ -203,14 +212,14 @@ pub fn perms_of(characteristics: u32) -> Result<RegionPerms, LoadError> {
 /// using the supplied resolver. Returns `UnresolvedImport` on the
 /// first miss — silent stubs are out per spec §4.
 pub fn resolve_imports(
-    image:   &PeImage<'_>,
+    image: &PeImage<'_>,
     resolve: ImportResolver,
 ) -> Result<Vec<(u32, u64)>, LoadError> {
     let mut out = Vec::with_capacity(image.imports.len());
     for imp in &image.imports {
         match resolve(&imp.module, &imp.symbol) {
             Some(addr) => out.push((imp.iat_rva, addr)),
-            None       => return Err(LoadError::UnresolvedImport),
+            None => return Err(LoadError::UnresolvedImport),
         }
     }
     Ok(out)
@@ -225,23 +234,17 @@ pub fn resolve_imports(
 /// modified them — every reloc target is a u64 in some `PT_LOAD`-
 /// equivalent section, populated by the linker, that the loader
 /// will memcpy into a fresh frame before this fixup runs.
-pub fn compute_relocs(
-    image: &PeImage<'_>,
-    chosen_base: u64,
-) -> Result<Vec<(u32, u64)>, LoadError> {
+pub fn compute_relocs(image: &PeImage<'_>, chosen_base: u64) -> Result<Vec<(u32, u64)>, LoadError> {
     let delta = chosen_base.wrapping_sub(image.image_base);
     let mut out = Vec::with_capacity(image.relocs.len());
     for r in &image.relocs {
         match r.kind {
             BaseRelocKind::Dir64 => {
-                let off = rva_to_file(&image.sections, r.rva)
-                    .ok_or(LoadError::BadFixupRva)?;
+                let off = rva_to_file(&image.sections, r.rva).ok_or(LoadError::BadFixupRva)?;
                 if image.bytes.len() < off + 8 {
                     return Err(LoadError::BadFixupRva);
                 }
-                let existing = u64::from_le_bytes(
-                    image.bytes[off..off + 8].try_into().unwrap()
-                );
+                let existing = u64::from_le_bytes(image.bytes[off..off + 8].try_into().unwrap());
                 out.push((r.rva, existing.wrapping_add(delta)));
             }
         }
@@ -255,7 +258,9 @@ fn rva_to_file(sections: &[Section], rva: u32) -> Option<usize> {
         let end = s.virt_addr.checked_add(s.virt_size)?;
         if rva >= start && rva < end {
             let delta = rva - start;
-            if delta >= s.raw_size { return None; }
+            if delta >= s.raw_size {
+                return None;
+            }
             return Some(s.raw_offset as usize + delta as usize);
         }
     }
@@ -277,7 +282,7 @@ pub fn rva_to_phys<'a>(
         if rva >= start && rva < end {
             let delta = (rva - start) as usize;
             let page = delta >> 12;
-            let off  = delta & 0xFFF;
+            let off = delta & 0xFFF;
             return Some((*frames.get(page)?, off));
         }
     }
@@ -304,23 +309,22 @@ pub fn rva_to_phys<'a>(
 ///   is the existing `userspace::handlers::sys_exec`-style path,
 ///   which is what eventually invokes this).
 pub unsafe fn load_pe(
-    bytes:   &[u8],
+    bytes: &[u8],
     resolve: ImportResolver,
-    pid:     u64,
-    tid:     u64,
+    pid: u64,
+    tid: u64,
 ) -> Result<WinProcess, LoadError> {
     let image = pe::parse(bytes)?;
     let chosen_base = image.image_base;
 
     // SAFETY: kernel-mode contract documented above.
-    let address_space = unsafe { AddressSpace::new_for_user() }
-        .map_err(|_| LoadError::AddressSpace)?;
+    let address_space =
+        unsafe { AddressSpace::new_for_user() }.map_err(|_| LoadError::AddressSpace)?;
 
     // Materialize each section into freshly-allocated frames.
     // Frames go through a `FrameGuard` so an alloc failure mid-loop
     // releases the partial allocation rather than leaking it.
-    let mut section_frames: Vec<Vec<PhysAddr>> =
-        Vec::with_capacity(image.sections.len());
+    let mut section_frames: Vec<Vec<PhysAddr>> = Vec::with_capacity(image.sections.len());
     for s in &image.sections {
         let pages = ((s.virt_size as u64 + 0xFFF) >> 12) as usize;
         let mut guard = FrameGuard::new();
@@ -331,12 +335,14 @@ pub unsafe fn load_pe(
         // Zero every page so the virt_size > raw_size tail is BSS-zero.
         for &p in &guard.frames {
             // SAFETY: identity-mapped low-4-GiB frames.
-            unsafe { core::ptr::write_bytes(p.raw() as *mut u8, 0, 4096); }
+            unsafe {
+                core::ptr::write_bytes(p.raw() as *mut u8, 0, 4096);
+            }
         }
         // Copy raw_size bytes from the file blob into the frames,
         // page by page.
         if s.raw_size != 0 {
-            let raw_off  = s.raw_offset as usize;
+            let raw_off = s.raw_offset as usize;
             let raw_size = s.raw_size as usize;
             if bytes.len() < raw_off + raw_size {
                 return Err(LoadError::Pe(PeError::BadSection));
@@ -344,7 +350,9 @@ pub unsafe fn load_pe(
             let src = &bytes[raw_off..raw_off + raw_size];
             let mut written = 0;
             for &frame in &guard.frames {
-                if written >= src.len() { break; }
+                if written >= src.len() {
+                    break;
+                }
                 let chunk = core::cmp::min(4096, src.len() - written);
                 // SAFETY: identity-mapped freshly-allocated frame; chunk <= 4 KiB.
                 unsafe {
@@ -363,26 +371,28 @@ pub unsafe fn load_pe(
         let perms = perms_of(s.characteristics)?;
         let frames_committed = guard.commit();
         let frames_for_section = frames_committed.clone();
-        address_space.map_region(Region {
-            base:  VirtAddr::new(chosen_base.wrapping_add(s.virt_addr as u64)),
-            len:   (pages as u64) << 12,
-            perms,
-            phys:  frames_committed,
-        }).map_err(|_| {
-            // map_region failed: the AS doesn't own the frames yet,
-            // so we have to free them here.
-            for p in &frames_for_section {
-                free_frame(PhysFrame::new(*p));
-            }
-            LoadError::AddressSpace
-        })?;
+        address_space
+            .map_region(Region {
+                base: VirtAddr::new(chosen_base.wrapping_add(s.virt_addr as u64)),
+                len: (pages as u64) << 12,
+                perms,
+                phys: frames_committed,
+            })
+            .map_err(|_| {
+                // map_region failed: the AS doesn't own the frames yet,
+                // so we have to free them here.
+                for p in &frames_for_section {
+                    free_frame(PhysFrame::new(*p));
+                }
+                LoadError::AddressSpace
+            })?;
         section_frames.push(frames_for_section);
     }
 
     // Apply DIR64 relocs.
     for (rva, value) in compute_relocs(&image, chosen_base)? {
-        let (frame, off) = rva_to_phys(&image.sections, &section_frames, rva)
-            .ok_or(LoadError::BadFixupRva)?;
+        let (frame, off) =
+            rva_to_phys(&image.sections, &section_frames, rva).ok_or(LoadError::BadFixupRva)?;
         // Reloc must not straddle a page boundary — DIR64 is 8 bytes,
         // 8-byte-aligned in well-formed images, but a malicious image
         // can name an unaligned RVA. Refuse it.
@@ -407,8 +417,8 @@ pub unsafe fn load_pe(
     // mapped into this AS, but it can also forward to a real PE
     // DLL loaded via `dll::ModuleTable`.
     for (rva, addr) in resolve_imports(&image, resolve)? {
-        let (frame, off) = rva_to_phys(&image.sections, &section_frames, rva)
-            .ok_or(LoadError::BadFixupRva)?;
+        let (frame, off) =
+            rva_to_phys(&image.sections, &section_frames, rva).ok_or(LoadError::BadFixupRva)?;
         if off + 8 > 4096 {
             return Err(LoadError::BadFixupRva);
         }
@@ -422,8 +432,12 @@ pub unsafe fn load_pe(
     // Materialize the PEB + TEB. One frame each, mapped user-RW at
     // the layout-defined VAs. Population is byte-level to dodge
     // having to maintain full PEB / TEB Rust structs.
-    let peb_frame = alloc_frame().map_err(|_| LoadError::NoFrame)?.start_address();
-    let teb_frame = alloc_frame().map_err(|_| LoadError::NoFrame)?.start_address();
+    let peb_frame = alloc_frame()
+        .map_err(|_| LoadError::NoFrame)?
+        .start_address();
+    let teb_frame = alloc_frame()
+        .map_err(|_| LoadError::NoFrame)?
+        .start_address();
 
     // SAFETY: identity-mapped low-4-GiB frames; we just allocated
     // them so no concurrent reader exists.
@@ -439,18 +453,22 @@ pub unsafe fn load_pe(
         personality::init_teb(teb_page, layout);
     }
 
-    address_space.map_region(Region {
-        base:  VirtAddr::new(layout.peb_va),
-        len:   4096,
-        perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys:  alloc::vec![peb_frame],
-    }).map_err(|_| LoadError::AddressSpace)?;
-    address_space.map_region(Region {
-        base:  VirtAddr::new(layout.teb_va),
-        len:   4096,
-        perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys:  alloc::vec![teb_frame],
-    }).map_err(|_| LoadError::AddressSpace)?;
+    address_space
+        .map_region(Region {
+            base: VirtAddr::new(layout.peb_va),
+            len: 4096,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![peb_frame],
+        })
+        .map_err(|_| LoadError::AddressSpace)?;
+    address_space
+        .map_region(Region {
+            base: VirtAddr::new(layout.teb_va),
+            len: 4096,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![teb_frame],
+        })
+        .map_err(|_| LoadError::AddressSpace)?;
 
     // Allocate the user stack at the layout-pinned VAs. Win32's
     // documented default is 1 MiB; we honour it so any PE with
@@ -466,25 +484,29 @@ pub unsafe fn load_pe(
     for _ in 0..stack_pages {
         let f = alloc_frame().map_err(|_| LoadError::NoFrame)?;
         // SAFETY: identity-mapped fresh frame.
-        unsafe { core::ptr::write_bytes(f.start_address().raw() as *mut u8, 0, 4096); }
+        unsafe {
+            core::ptr::write_bytes(f.start_address().raw() as *mut u8, 0, 4096);
+        }
         stack_frames.push(f.start_address());
     }
-    address_space.map_region(Region {
-        base:  VirtAddr::new(layout.stack_base),
-        len:   layout.stack_top - layout.stack_base,
-        perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys:  stack_frames,
-    }).map_err(|_| LoadError::AddressSpace)?;
+    address_space
+        .map_region(Region {
+            base: VirtAddr::new(layout.stack_base),
+            len: layout.stack_top - layout.stack_base,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: stack_frames,
+        })
+        .map_err(|_| LoadError::AddressSpace)?;
 
     Ok(WinProcess {
         address_space: Arc::new(address_space),
-        entry:         VirtAddr::new(chosen_base.wrapping_add(image.entry)),
-        image_base:    chosen_base,
+        entry: VirtAddr::new(chosen_base.wrapping_add(image.entry)),
+        image_base: chosen_base,
         size_of_image: image.size_of_image,
-        peb_va:        VirtAddr::new(layout.peb_va),
-        teb_va:        VirtAddr::new(layout.teb_va),
-        stack_base:    VirtAddr::new(layout.stack_base),
-        stack_top:     VirtAddr::new(layout.stack_top),
+        peb_va: VirtAddr::new(layout.peb_va),
+        teb_va: VirtAddr::new(layout.teb_va),
+        stack_base: VirtAddr::new(layout.stack_base),
+        stack_top: VirtAddr::new(layout.stack_top),
     })
 }
 
@@ -503,27 +525,27 @@ impl WinProcess {
 #[cfg(test)]
 mod tests {
     extern crate std;
-    use std::vec;
     use super::*;
     use crate::pe::{BaseReloc, BaseRelocKind, Import, Machine, PeImage};
+    use std::vec;
 
     fn dummy_image<'a>(bytes: &'a [u8]) -> PeImage<'a> {
         PeImage {
             bytes,
-            machine:    Machine::Amd64,
-            entry:      0x1000,
+            machine: Machine::Amd64,
+            entry: 0x1000,
             image_base: 0x1_4000_0000,
             size_of_image: 0x3000,
-            sections:   vec![Section {
+            sections: vec![Section {
                 name: *b".text\0\0\0",
                 virt_addr: 0x1000,
                 virt_size: 0x100,
                 raw_offset: 0,
-                raw_size:   0x10,
+                raw_size: 0x10,
                 characteristics: 0x6000_0000, // R+X
             }],
-            imports:    vec![],
-            relocs:     vec![],
+            imports: vec![],
+            relocs: vec![],
         }
     }
 
@@ -540,8 +562,10 @@ mod tests {
         assert!(p.contains(RegionPerms::WRITE));
         assert!(!p.contains(RegionPerms::EXEC));
         // W+X — refused.
-        assert_eq!(perms_of(0xA000_0000).unwrap_err(),
-                   LoadError::WritableExecutableSection);
+        assert_eq!(
+            perms_of(0xA000_0000).unwrap_err(),
+            LoadError::WritableExecutableSection
+        );
     }
 
     #[test]
@@ -549,13 +573,15 @@ mod tests {
         let bytes = vec![0u8; 0x100];
         let mut img = dummy_image(&bytes);
         img.imports = vec![Import {
-            module:  "kernel32.dll".into(),
-            symbol:  "exitprocess".into(),
+            module: "kernel32.dll".into(),
+            symbol: "exitprocess".into(),
             iat_rva: 0x20A0,
         }];
         // Resolver returns the user-mode VA of ExitProcess in the
         // mapped compat-win-rt library.
-        fn r(_m: &str, _s: &str) -> Option<u64> { Some(0x7FFE_0000_1234) }
+        fn r(_m: &str, _s: &str) -> Option<u64> {
+            Some(0x7FFE_0000_1234)
+        }
         let v = resolve_imports(&img, r).unwrap();
         assert_eq!(v, vec![(0x20A0, 0x7FFE_0000_1234)]);
     }
@@ -565,13 +591,17 @@ mod tests {
         let bytes = vec![0u8; 0x100];
         let mut img = dummy_image(&bytes);
         img.imports = vec![Import {
-            module:  "kernel32.dll".into(),
-            symbol:  "createfilew".into(),
+            module: "kernel32.dll".into(),
+            symbol: "createfilew".into(),
             iat_rva: 0x20A0,
         }];
-        fn r(_m: &str, _s: &str) -> Option<u64> { None }
-        assert_eq!(resolve_imports(&img, r).unwrap_err(),
-                   LoadError::UnresolvedImport);
+        fn r(_m: &str, _s: &str) -> Option<u64> {
+            None
+        }
+        assert_eq!(
+            resolve_imports(&img, r).unwrap_err(),
+            LoadError::UnresolvedImport
+        );
     }
 
     #[test]
@@ -583,7 +613,10 @@ mod tests {
         let mut img = dummy_image(&bytes);
         img.sections[0].raw_size = 0x20;
         img.sections[0].virt_size = 0x20;
-        img.relocs = vec![BaseReloc { rva: 0x1008, kind: BaseRelocKind::Dir64 }];
+        img.relocs = vec![BaseReloc {
+            rva: 0x1008,
+            kind: BaseRelocKind::Dir64,
+        }];
         let v = compute_relocs(&img, img.image_base).unwrap();
         // Delta is zero, so value is preserved.
         assert_eq!(v, vec![(0x1008, 0x1_4000_2000)]);
@@ -596,7 +629,10 @@ mod tests {
         let mut img = dummy_image(&bytes);
         img.sections[0].raw_size = 0x20;
         img.sections[0].virt_size = 0x20;
-        img.relocs = vec![BaseReloc { rva: 0x1008, kind: BaseRelocKind::Dir64 }];
+        img.relocs = vec![BaseReloc {
+            rva: 0x1008,
+            kind: BaseRelocKind::Dir64,
+        }];
         // Choose a base 0x1_0000_0000 above the preferred — every
         // reloc target shifts by exactly that.
         let v = compute_relocs(&img, 0x2_4000_0000).unwrap();
@@ -607,9 +643,14 @@ mod tests {
     fn compute_relocs_rejects_bad_rva() {
         let bytes = vec![0u8; 0x20];
         let mut img = dummy_image(&bytes);
-        img.relocs = vec![BaseReloc { rva: 0x9000, kind: BaseRelocKind::Dir64 }];
-        assert_eq!(compute_relocs(&img, img.image_base).unwrap_err(),
-                   LoadError::BadFixupRva);
+        img.relocs = vec![BaseReloc {
+            rva: 0x9000,
+            kind: BaseRelocKind::Dir64,
+        }];
+        assert_eq!(
+            compute_relocs(&img, img.image_base).unwrap_err(),
+            LoadError::BadFixupRva
+        );
     }
 
     #[test]
@@ -617,9 +658,7 @@ mod tests {
         let bytes = vec![0u8; 0x20];
         let mut img = dummy_image(&bytes);
         img.sections[0].virt_size = 0x2000;
-        let frames = vec![
-            vec![PhysAddr::new(0x10_0000), PhysAddr::new(0x20_0000)],
-        ];
+        let frames = vec![vec![PhysAddr::new(0x10_0000), PhysAddr::new(0x20_0000)]];
         // RVA 0x1500: section 0, page 0, offset 0x500.
         let (frame, off) = rva_to_phys(&img.sections, &frames, 0x1500).unwrap();
         assert_eq!(frame.raw(), 0x10_0000);

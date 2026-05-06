@@ -55,24 +55,24 @@ pub struct FamilyOffsets {
     /// `mp0_base + 0x29C + N*4`).
     /// Source: AMD PPR §"Microcontroller Firmware Loading", per
     /// SoC.
-    pub mp0_base:        Option<u32>,
+    pub mp0_base: Option<u32>,
     /// DCN HUBP (Hub Pixel Pipe) block base — primary surface
     /// address / pitch / blanking control registers.
     /// Source: AMD PPR §"Display Core Next" register tables.
-    pub dcn_hubp_base:   Option<u32>,
+    pub dcn_hubp_base: Option<u32>,
     /// DCN OPP (Output Pixel Processor) block base — gamma
     /// passthrough, output-format control.
-    pub dcn_opp_base:    Option<u32>,
+    pub dcn_opp_base: Option<u32>,
     /// DCN OTG (Output Timing Generator) block base — H_TOTAL /
     /// V_TOTAL / sync-pulse timing registers.
-    pub dcn_otg_base:    Option<u32>,
+    pub dcn_otg_base: Option<u32>,
     /// DCN AUX block base — implements DP AUX transactions
     /// against the connected sink.
-    pub dcn_aux_base:    Option<u32>,
+    pub dcn_aux_base: Option<u32>,
     /// GFX (graphics core) ring-buffer base register. Programmed
     /// with the phys address of `Ring::phys_addr()` at engine
     /// bring-up.
-    pub gfx_rb_base:     Option<u32>,
+    pub gfx_rb_base: Option<u32>,
 }
 
 impl FamilyOffsets {
@@ -94,16 +94,16 @@ impl FamilyOffsets {
 /// `Family::mp0_base()`.
 const N_FAMILIES: usize = 5; // Vega / Renoir / Navi1 / Navi2 / Navi3
 
-static REGISTRY: IrqSafeSpinLock<[FamilyOffsets; N_FAMILIES]>
-    = IrqSafeSpinLock::new([FamilyOffsets::empty(); N_FAMILIES]);
+static REGISTRY: IrqSafeSpinLock<[FamilyOffsets; N_FAMILIES]> =
+    IrqSafeSpinLock::new([FamilyOffsets::empty(); N_FAMILIES]);
 
 fn family_index(f: Family) -> usize {
     match f {
-        Family::Vega   => 0,
+        Family::Vega => 0,
         Family::Renoir => 1,
-        Family::Navi1  => 2,
-        Family::Navi2  => 3,
-        Family::Navi3  => 4,
+        Family::Navi1 => 2,
+        Family::Navi2 => 3,
+        Family::Navi3 => 4,
     }
 }
 
@@ -128,11 +128,14 @@ pub fn offsets_of(family: Family) -> FamilyOffsets {
 pub fn registered_count() -> usize {
     let g = REGISTRY.lock();
     g.iter()
-        .filter(|o|
-            o.mp0_base.is_some() || o.dcn_hubp_base.is_some()
-            || o.dcn_opp_base.is_some() || o.dcn_otg_base.is_some()
-            || o.dcn_aux_base.is_some() || o.gfx_rb_base.is_some()
-        )
+        .filter(|o| {
+            o.mp0_base.is_some()
+                || o.dcn_hubp_base.is_some()
+                || o.dcn_opp_base.is_some()
+                || o.dcn_otg_base.is_some()
+                || o.dcn_aux_base.is_some()
+                || o.gfx_rb_base.is_some()
+        })
         .count()
 }
 

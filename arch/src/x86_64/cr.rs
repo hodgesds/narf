@@ -10,9 +10,9 @@ use core::sync::atomic::{compiler_fence, Ordering};
 
 /// CR4 bit: PKS (bit 24). Enables supervisor protection keys
 /// (IA32_PKRS-based domain rights).
-pub const CR4_PKS:   u64 = 1 << 24;
+pub const CR4_PKS: u64 = 1 << 24;
 /// CR4 bit: PKE (bit 22). Enables user-mode protection keys.
-pub const CR4_PKE:   u64 = 1 << 22;
+pub const CR4_PKE: u64 = 1 << 22;
 /// CR4 bit: PCIDE (bit 17). Enables Process-Context Identifiers; once set,
 /// CR3 carries a 12-bit PCID in bits 0..=11 and bit 63 of a CR3 write
 /// can preserve the previous PCID's TLB entries instead of flushing.

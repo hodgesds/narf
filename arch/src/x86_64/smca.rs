@@ -21,16 +21,18 @@ const BANK_STRIDE: u32 = 0x10;
 
 // Per-bank offsets within the SMCA register block.
 const REG_CONFIG: u32 = 0x2;
-const REG_IPID:   u32 = 0x3;
+const REG_IPID: u32 = 0x3;
 const REG_DESTAT: u32 = 0x7;
-const REG_SYND:   u32 = 0x6;
-const REG_MISC0:  u32 = 0x4;
+const REG_SYND: u32 = 0x6;
+const REG_MISC0: u32 = 0x4;
 
 /// `true` iff CPUID(0x80000007).EBX[3] is set (SMCA).
 pub fn supported() -> bool {
     // SAFETY: leaf 0x80000000 always defined.
     let max_ext = unsafe { cpuid(0x8000_0000, 0).0 };
-    if max_ext < 0x8000_0007 { return false; }
+    if max_ext < 0x8000_0007 {
+        return false;
+    }
     // SAFETY: extended leaf 0x8000_0007 valid.
     let (_, ebx, _, _) = unsafe { cpuid(0x8000_0007, 0) };
     ebx & (1 << 3) != 0
@@ -41,7 +43,7 @@ pub fn supported() -> bool {
 pub struct SmcaBankInfo {
     pub instance_id: u16,
     pub hardware_id: u16,
-    pub mca_type:    u8,
+    pub mca_type: u8,
 }
 
 impl SmcaBankInfo {
@@ -49,7 +51,7 @@ impl SmcaBankInfo {
         Self {
             instance_id: (raw & 0xFFFF) as u16,
             hardware_id: ((raw >> 16) & 0xFFFF) as u16,
-            mca_type:    ((raw >> 44) & 0xF)    as u8,
+            mca_type: ((raw >> 44) & 0xF) as u8,
         }
     }
 }
@@ -58,17 +60,17 @@ impl SmcaBankInfo {
 /// `MCi_IPID.McaType` field's encoding for Zen-family.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BankType {
-    Ls,    // Load-Store
-    If,    // Instruction Fetch
+    Ls, // Load-Store
+    If, // Instruction Fetch
     L2,
-    De,    // Decoder
-    Ex,    // Execution
+    De, // Decoder
+    Ex, // Execution
     Fp,
     L3,
     Mp5,
     Smu,
-    Pb,    // Parameter Block
-    Umc,   // Unified Memory Controller
+    Pb,  // Parameter Block
+    Umc, // Unified Memory Controller
     Pcie,
     Other(u8),
 }
@@ -76,10 +78,19 @@ pub enum BankType {
 impl BankType {
     pub fn from_raw(b: u8) -> Self {
         match b {
-            0  => Self::Ls,    1 => Self::If,   2 => Self::L2,   3 => Self::De,
-            5  => Self::Ex,    6 => Self::Fp,   7 => Self::L3,   8 => Self::Mp5,
-            9  => Self::Smu,  10 => Self::Pb,  11 => Self::Umc, 12 => Self::Pcie,
-            o  => Self::Other(o),
+            0 => Self::Ls,
+            1 => Self::If,
+            2 => Self::L2,
+            3 => Self::De,
+            5 => Self::Ex,
+            6 => Self::Fp,
+            7 => Self::L3,
+            8 => Self::Mp5,
+            9 => Self::Smu,
+            10 => Self::Pb,
+            11 => Self::Umc,
+            12 => Self::Pcie,
+            o => Self::Other(o),
         }
     }
 }

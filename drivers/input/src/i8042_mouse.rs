@@ -39,23 +39,23 @@
 use core::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 
 use narf_arch::x86_64::io_port::{inb, outb};
-use narf_input::{InputEvent, PointerButtons, PointerEvent, push_global};
+use narf_input::{push_global, InputEvent, PointerButtons, PointerEvent};
 
-use crate::i8042::{PS2_DATA, PS2_STATUS, PS2_CMD};
+use crate::i8042::{PS2_CMD, PS2_DATA, PS2_STATUS};
 
 const STATUS_OUTPUT_FULL: u8 = 1 << 0;
-const STATUS_INPUT_FULL:  u8 = 1 << 1;
+const STATUS_INPUT_FULL: u8 = 1 << 1;
 
-const CMD_ENABLE_AUX:    u8 = 0xA8;
-const CMD_READ_CONFIG:   u8 = 0x20;
-const CMD_WRITE_CONFIG:  u8 = 0x60;
-const CMD_WRITE_AUX:     u8 = 0xD4;
+const CMD_ENABLE_AUX: u8 = 0xA8;
+const CMD_READ_CONFIG: u8 = 0x20;
+const CMD_WRITE_CONFIG: u8 = 0x60;
+const CMD_WRITE_AUX: u8 = 0xD4;
 
-const CONF_KBD_IRQ:  u8 = 1 << 0;
-const CONF_AUX_IRQ:  u8 = 1 << 1;
-const CONF_AUX_DIS:  u8 = 1 << 5;
+const CONF_KBD_IRQ: u8 = 1 << 0;
+const CONF_AUX_IRQ: u8 = 1 << 1;
+const CONF_AUX_DIS: u8 = 1 << 5;
 
-const HOT_SPINS:  u32 = 10_000;
+const HOT_SPINS: u32 = 10_000;
 const COLD_SPINS: u32 = 2_000;
 
 #[derive(Debug)]
@@ -63,8 +63,8 @@ pub struct State {
     /// Bytes 0..=2 of the in-flight packet. `phase` tracks how many
     /// bytes we've collected (0, 1, 2). When phase reaches 3, we
     /// emit the PointerEvent + reset to 0.
-    pkt:        [AtomicU8; 3],
-    phase:      AtomicU8,
+    pkt: [AtomicU8; 3],
+    phase: AtomicU8,
     rel_dx_acc: AtomicI32,
     rel_dy_acc: AtomicI32,
     initialized: core::sync::atomic::AtomicBool,
@@ -73,7 +73,7 @@ pub struct State {
 impl State {
     pub const fn new() -> Self {
         Self {
-            pkt:   [AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0)],
+            pkt: [AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0)],
             phase: AtomicU8::new(0),
             rel_dx_acc: AtomicI32::new(0),
             rel_dy_acc: AtomicI32::new(0),
@@ -95,12 +95,16 @@ pub fn is_initialized() -> bool {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum InitError { Timeout }
+pub enum InitError {
+    Timeout,
+}
 
 fn wait_input_clear() -> Result<(), InitError> {
     for _ in 0..HOT_SPINS {
         // SAFETY: 0x64 status read.
-        if unsafe { inb(PS2_STATUS) } & STATUS_INPUT_FULL == 0 { return Ok(()); }
+        if unsafe { inb(PS2_STATUS) } & STATUS_INPUT_FULL == 0 {
+            return Ok(());
+        }
     }
     Err(InitError::Timeout)
 }
@@ -119,7 +123,9 @@ fn wait_output() -> Result<u8, InitError> {
 fn wait_input_clear_short() -> bool {
     for _ in 0..COLD_SPINS {
         // SAFETY: status read.
-        if unsafe { inb(PS2_STATUS) } & STATUS_INPUT_FULL == 0 { return true; }
+        if unsafe { inb(PS2_STATUS) } & STATUS_INPUT_FULL == 0 {
+            return true;
+        }
     }
     false
 }
@@ -145,45 +151,67 @@ fn wait_output_short() -> Option<u8> {
 /// ran (so the keyboard channel is configured). Concurrent agents
 /// driving 0x60/0x64 are forbidden.
 pub unsafe fn init() -> Result<(), InitError> {
-    if STATE.initialized.load(Ordering::Acquire) { return Ok(()); }
+    if STATE.initialized.load(Ordering::Acquire) {
+        return Ok(());
+    }
 
     // 1. Enable AUX channel.
     wait_input_clear()?;
     // SAFETY: 0x64 cmd.
-    unsafe { outb(PS2_CMD, CMD_ENABLE_AUX); }
+    unsafe {
+        outb(PS2_CMD, CMD_ENABLE_AUX);
+    }
 
     // 2. Update config: set AUX_IRQ, clear AUX_DIS.
     wait_input_clear()?;
-    unsafe { outb(PS2_CMD, CMD_READ_CONFIG); }
+    unsafe {
+        outb(PS2_CMD, CMD_READ_CONFIG);
+    }
     let mut conf = wait_output()?;
-    conf |=  CONF_AUX_IRQ;
+    conf |= CONF_AUX_IRQ;
     conf &= !CONF_AUX_DIS;
-    conf |=  CONF_KBD_IRQ; // keep KB IRQ as i8042::init left it
+    conf |= CONF_KBD_IRQ; // keep KB IRQ as i8042::init left it
     wait_input_clear()?;
-    unsafe { outb(PS2_CMD, CMD_WRITE_CONFIG); }
+    unsafe {
+        outb(PS2_CMD, CMD_WRITE_CONFIG);
+    }
     wait_input_clear()?;
-    unsafe { outb(PS2_DATA, conf); }
+    unsafe {
+        outb(PS2_DATA, conf);
+    }
 
     // 3. Reset (best-effort).
     let _ = wait_input_clear_short();
-    unsafe { outb(PS2_CMD, CMD_WRITE_AUX); }
+    unsafe {
+        outb(PS2_CMD, CMD_WRITE_AUX);
+    }
     let _ = wait_input_clear_short();
-    unsafe { outb(PS2_DATA, 0xFF); }
+    unsafe {
+        outb(PS2_DATA, 0xFF);
+    }
     let _ = wait_output_short(); // ACK
     let _ = wait_output_short(); // BAT (0xAA)
     let _ = wait_output_short(); // device id (0x00)
 
     // 4. Set defaults (0xF6) + enable data reporting (0xF4).
     let _ = wait_input_clear_short();
-    unsafe { outb(PS2_CMD, CMD_WRITE_AUX); }
+    unsafe {
+        outb(PS2_CMD, CMD_WRITE_AUX);
+    }
     let _ = wait_input_clear_short();
-    unsafe { outb(PS2_DATA, 0xF6); }
+    unsafe {
+        outb(PS2_DATA, 0xF6);
+    }
     let _ = wait_output_short();
 
     let _ = wait_input_clear_short();
-    unsafe { outb(PS2_CMD, CMD_WRITE_AUX); }
+    unsafe {
+        outb(PS2_CMD, CMD_WRITE_AUX);
+    }
     let _ = wait_input_clear_short();
-    unsafe { outb(PS2_DATA, 0xF4); }
+    unsafe {
+        outb(PS2_DATA, 0xF4);
+    }
     let _ = wait_output_short();
 
     STATE.initialized.store(true, Ordering::Release);
@@ -224,16 +252,20 @@ pub unsafe fn on_irq12() {
     let dy = -dy_raw;
 
     let mut buttons = PointerButtons::EMPTY;
-    if b0 & 0x01 != 0 { buttons.insert(PointerButtons::LEFT);   }
-    if b0 & 0x02 != 0 { buttons.insert(PointerButtons::RIGHT);  }
-    if b0 & 0x04 != 0 { buttons.insert(PointerButtons::MIDDLE); }
+    if b0 & 0x01 != 0 {
+        buttons.insert(PointerButtons::LEFT);
+    }
+    if b0 & 0x02 != 0 {
+        buttons.insert(PointerButtons::RIGHT);
+    }
+    if b0 & 0x04 != 0 {
+        buttons.insert(PointerButtons::MIDDLE);
+    }
 
     STATE.rel_dx_acc.fetch_add(dx, Ordering::Relaxed);
     STATE.rel_dy_acc.fetch_add(dy, Ordering::Relaxed);
 
-    let _ = push_global(InputEvent::Pointer(PointerEvent {
-        dx, dy, buttons,
-    }));
+    let _ = push_global(InputEvent::Pointer(PointerEvent { dx, dy, buttons }));
 }
 
 #[doc(hidden)]
@@ -248,7 +280,9 @@ pub fn __reset_for_test() {
 /// state machine, exactly like a real IRQ would.
 pub fn feed_byte_for_test(byte: u8) {
     let phase = STATE.phase.load(Ordering::Acquire);
-    if phase == 0 && (byte & 0x08) == 0 { return; }
+    if phase == 0 && (byte & 0x08) == 0 {
+        return;
+    }
     STATE.pkt[phase as usize].store(byte, Ordering::Release);
     let next = phase + 1;
     if next < 3 {
@@ -263,9 +297,15 @@ pub fn feed_byte_for_test(byte: u8) {
     let dy_raw = if b0 & 0x20 != 0 { b2 - 256 } else { b2 } as i32;
     let dy = -dy_raw;
     let mut buttons = PointerButtons::EMPTY;
-    if b0 & 0x01 != 0 { buttons.insert(PointerButtons::LEFT);   }
-    if b0 & 0x02 != 0 { buttons.insert(PointerButtons::RIGHT);  }
-    if b0 & 0x04 != 0 { buttons.insert(PointerButtons::MIDDLE); }
+    if b0 & 0x01 != 0 {
+        buttons.insert(PointerButtons::LEFT);
+    }
+    if b0 & 0x02 != 0 {
+        buttons.insert(PointerButtons::RIGHT);
+    }
+    if b0 & 0x04 != 0 {
+        buttons.insert(PointerButtons::MIDDLE);
+    }
     STATE.rel_dx_acc.fetch_add(dx, Ordering::Relaxed);
     STATE.rel_dy_acc.fetch_add(dy, Ordering::Relaxed);
     let _ = push_global(InputEvent::Pointer(PointerEvent { dx, dy, buttons }));

@@ -24,16 +24,17 @@
 extern crate alloc;
 use alloc::vec::Vec;
 
-use super::cmd::{
-    build_mailbox_block, MAILBOX_BLOCK_LEN, MAILBOX_PAYLOAD_LEN,
-};
+use super::cmd::{build_mailbox_block, MAILBOX_BLOCK_LEN, MAILBOX_PAYLOAD_LEN};
 
 /// Number of 512-byte blocks needed to carry `byte_len` bytes of
 /// payload. A zero-length payload still costs one block (CQEs that
 /// declare a non-inline mailbox always need at least the head).
 pub fn block_count_for(byte_len: usize) -> usize {
-    if byte_len == 0 { 1 }
-    else { (byte_len + MAILBOX_PAYLOAD_LEN - 1) / MAILBOX_PAYLOAD_LEN }
+    if byte_len == 0 {
+        1
+    } else {
+        (byte_len + MAILBOX_PAYLOAD_LEN - 1) / MAILBOX_PAYLOAD_LEN
+    }
 }
 
 /// Build a chain of populated mailbox blocks for an *input* payload.
@@ -42,16 +43,16 @@ pub fn block_count_for(byte_len: usize) -> usize {
 ///
 /// The number of phys addrs MUST equal `block_count_for(payload.len())`.
 pub fn write_input_chain(
-    payload:    &[u8],
+    payload: &[u8],
     block_phys: &[u64],
-    token:      u8,
+    token: u8,
 ) -> Vec<[u8; MAILBOX_BLOCK_LEN]> {
     let n = block_phys.len();
     debug_assert!(n >= 1);
     let mut out: Vec<[u8; MAILBOX_BLOCK_LEN]> = Vec::with_capacity(n);
     for i in 0..n {
-        let start  = i * MAILBOX_PAYLOAD_LEN;
-        let end    = (start + MAILBOX_PAYLOAD_LEN).min(payload.len());
+        let start = i * MAILBOX_PAYLOAD_LEN;
+        let end = (start + MAILBOX_PAYLOAD_LEN).min(payload.len());
         let chunk: &[u8] = if start < payload.len() {
             &payload[start..end]
         } else {
@@ -67,13 +68,12 @@ pub fn write_input_chain(
 /// Reassemble a contiguous output payload from a chain of blocks. The
 /// caller supplies `byte_len` (the firmware-declared output length)
 /// so we know exactly how many bytes are valid.
-pub fn read_output_chain(
-    blocks:   &[[u8; MAILBOX_BLOCK_LEN]],
-    byte_len: usize,
-) -> Vec<u8> {
+pub fn read_output_chain(blocks: &[[u8; MAILBOX_BLOCK_LEN]], byte_len: usize) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::with_capacity(byte_len);
     for block in blocks {
-        if out.len() >= byte_len { break; }
+        if out.len() >= byte_len {
+            break;
+        }
         let take = (byte_len - out.len()).min(MAILBOX_PAYLOAD_LEN);
         out.extend_from_slice(&block[..take]);
     }

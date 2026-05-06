@@ -51,10 +51,10 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use async_trait::async_trait;
-use narf_tpm::{TpmDevice, TpmInfo, TpmError as HighLevelTpmError};
+use narf_tpm::{TpmDevice, TpmError as HighLevelTpmError, TpmInfo};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -66,38 +66,38 @@ pub const TPM_BASE_LOCALITY_0: u64 = 0xFED4_0000;
 const REG_INTERFACE_ID: u64 = 0x30;
 
 // CRB control block (offsets relative to `TPM_BASE_LOCALITY_0`).
-const REG_LOC_CTRL:    u64 = 0x40 + 0x00;
-const REG_LOC_STS:     u64 = 0x40 + 0x04;
-const REG_CRB_CTRL_REQ:   u64 = 0x40 + 0x80;
-const REG_CRB_CTRL_STS:   u64 = 0x40 + 0x84;
+const REG_LOC_CTRL: u64 = 0x40 + 0x00;
+const REG_LOC_STS: u64 = 0x40 + 0x04;
+const REG_CRB_CTRL_REQ: u64 = 0x40 + 0x80;
+const REG_CRB_CTRL_STS: u64 = 0x40 + 0x84;
 const REG_CRB_CTRL_START: u64 = 0x40 + 0x8C;
 const REG_CRB_CMD_SIZE: u64 = 0x40 + 0x98;
-const REG_CRB_CMD_LO:   u64 = 0x40 + 0x9C;
-const REG_CRB_CMD_HI:   u64 = 0x40 + 0xA0;
+const REG_CRB_CMD_LO: u64 = 0x40 + 0x9C;
+const REG_CRB_CMD_HI: u64 = 0x40 + 0xA0;
 const REG_CRB_RSP_SIZE: u64 = 0x40 + 0xA4;
-const REG_CRB_RSP_LO:   u64 = 0x40 + 0xA8;
-const REG_CRB_RSP_HI:   u64 = 0x40 + 0xAC;
+const REG_CRB_RSP_LO: u64 = 0x40 + 0xA8;
+const REG_CRB_RSP_HI: u64 = 0x40 + 0xAC;
 
-const CTRL_REQ_CMD_READY:   u32 = 1 << 0;
-const CTRL_REQ_GO_IDLE:     u32 = 1 << 1;
-const CTRL_STS_TPM_IDLE:    u32 = 1 << 1;
-const CTRL_START_GO:        u32 = 1 << 0;
+const CTRL_REQ_CMD_READY: u32 = 1 << 0;
+const CTRL_REQ_GO_IDLE: u32 = 1 << 1;
+const CTRL_STS_TPM_IDLE: u32 = 1 << 1;
+const CTRL_START_GO: u32 = 1 << 0;
 
 const LOC_CTRL_REQ_ACCESS: u32 = 1 << 0;
-const LOC_STS_GRANTED:     u32 = 1 << 0;
+const LOC_STS_GRANTED: u32 = 1 << 0;
 
 // TIS register layout (TIS v1.21 §5.6).
-const REG_TIS_ACCESS:   u64 = 0x00;
-const REG_TIS_STS:      u64 = 0x18;
+const REG_TIS_ACCESS: u64 = 0x00;
+const REG_TIS_STS: u64 = 0x18;
 const REG_TIS_DATA_FIFO: u64 = 0x24;
-const REG_TIS_DID_VID:  u64 = 0xF00;
+const REG_TIS_DID_VID: u64 = 0xF00;
 
 const TIS_ACCESS_REQUEST_USE: u8 = 1 << 1;
-const TIS_ACCESS_ACTIVE:      u8 = 1 << 5;
-const TIS_STS_VALID:          u8 = 1 << 7;
-const TIS_STS_DATA_AVAIL:     u8 = 1 << 4;
-const TIS_STS_GO:             u8 = 1 << 5;
-const TIS_STS_EXPECT:         u8 = 1 << 3;
+const TIS_ACCESS_ACTIVE: u8 = 1 << 5;
+const TIS_STS_VALID: u8 = 1 << 7;
+const TIS_STS_DATA_AVAIL: u8 = 1 << 4;
+const TIS_STS_GO: u8 = 1 << 5;
+const TIS_STS_EXPECT: u8 = 1 << 3;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TpmKind {
@@ -117,8 +117,8 @@ pub enum TpmError {
 
 #[derive(Debug)]
 pub struct Tpm {
-    base:  u64,
-    kind:  TpmKind,
+    base: u64,
+    kind: TpmKind,
     /// CRB command-buffer phys (read from CRB_CMD_PA_*).
     cmd_phys: u64,
     /// CRB command buffer max size (CRB_CMD_SIZE).
@@ -147,14 +147,18 @@ impl Tpm {
                 return Err(TpmError::NotPresent);
             }
             return Ok(Self {
-                base, kind: TpmKind::Tis,
-                cmd_phys: 0, cmd_size: 0, rsp_phys: 0, rsp_size: 0,
+                base,
+                kind: TpmKind::Tis,
+                cmd_phys: 0,
+                cmd_size: 0,
+                rsp_phys: 0,
+                rsp_size: 0,
             });
         }
         let kind = match intf & 0xF {
             0x0 => TpmKind::Crb,
             0xF => TpmKind::Tis,
-            _   => TpmKind::Crb, // future variants — assume CRB.
+            _ => TpmKind::Crb, // future variants — assume CRB.
         };
         match kind {
             TpmKind::Crb => {
@@ -167,10 +171,15 @@ impl Tpm {
                 for _ in 0..1_000_000u32 {
                     // SAFETY: same.
                     let s = unsafe { read32(base + REG_LOC_STS) };
-                    if s & LOC_STS_GRANTED != 0 { granted = true; break; }
+                    if s & LOC_STS_GRANTED != 0 {
+                        granted = true;
+                        break;
+                    }
                     core::hint::spin_loop();
                 }
-                if !granted { return Err(TpmError::LocalityTimeout); }
+                if !granted {
+                    return Err(TpmError::LocalityTimeout);
+                }
                 // Read CRB command + response buffer phys + size.
                 // SAFETY: same.
                 let cmd_size = unsafe { read32(base + REG_CRB_CMD_SIZE) };
@@ -190,19 +199,31 @@ impl Tpm {
                     return Err(TpmError::NoCommandBuffer);
                 }
                 Ok(Self {
-                    base, kind: TpmKind::Crb,
-                    cmd_phys, cmd_size, rsp_phys, rsp_size,
+                    base,
+                    kind: TpmKind::Crb,
+                    cmd_phys,
+                    cmd_size,
+                    rsp_phys,
+                    rsp_size,
                 })
             }
             TpmKind::Tis => Ok(Self {
-                base, kind: TpmKind::Tis,
-                cmd_phys: 0, cmd_size: 0, rsp_phys: 0, rsp_size: 0,
+                base,
+                kind: TpmKind::Tis,
+                cmd_phys: 0,
+                cmd_size: 0,
+                rsp_phys: 0,
+                rsp_size: 0,
             }),
         }
     }
 
-    pub fn kind(&self) -> TpmKind { self.kind }
-    pub fn base(&self) -> u64     { self.base }
+    pub fn kind(&self) -> TpmKind {
+        self.kind
+    }
+    pub fn base(&self) -> u64 {
+        self.base
+    }
 
     /// Submit a TPM2 command (caller-encoded wire form starting
     /// with the 10-byte `TPM2_RC_HEADER`). Returns the response
@@ -228,33 +249,42 @@ impl Tpm {
         }
         // 1. Set CMD_READY.
         // SAFETY: identity-mapped MMIO window.
-        unsafe { write32(self.base + REG_CRB_CTRL_REQ, CTRL_REQ_CMD_READY); }
+        unsafe {
+            write32(self.base + REG_CRB_CTRL_REQ, CTRL_REQ_CMD_READY);
+        }
         // Wait until idle clears (TPM is in command-ready state).
         for _ in 0..1_000_000u32 {
             // SAFETY: same.
             let s = unsafe { read32(self.base + REG_CRB_CTRL_STS) };
-            if s & CTRL_STS_TPM_IDLE == 0 { break; }
+            if s & CTRL_STS_TPM_IDLE == 0 {
+                break;
+            }
             core::hint::spin_loop();
         }
         // 2. Write command into the command buffer.
         // SAFETY: command buffer phys was published by firmware/ACPI.
         unsafe {
             for (i, b) in cmd.iter().enumerate() {
-                core::ptr::write_volatile(
-                    (self.cmd_phys + i as u64) as *mut u8, *b);
+                core::ptr::write_volatile((self.cmd_phys + i as u64) as *mut u8, *b);
             }
         }
         // 3. Kick CRB_CTRL_START.GO.
         // SAFETY: same.
-        unsafe { write32(self.base + REG_CRB_CTRL_START, CTRL_START_GO); }
+        unsafe {
+            write32(self.base + REG_CRB_CTRL_START, CTRL_START_GO);
+        }
         // 4. Poll for start bit to self-clear (cmd complete).
         let mut spins = 0u32;
         loop {
             // SAFETY: same.
             let s = unsafe { read32(self.base + REG_CRB_CTRL_START) };
-            if s & CTRL_START_GO == 0 { break; }
+            if s & CTRL_START_GO == 0 {
+                break;
+            }
             spins += 1;
-            if spins > 50_000_000 { return Err(TpmError::BusyTimeout); }
+            if spins > 50_000_000 {
+                return Err(TpmError::BusyTimeout);
+            }
             core::hint::spin_loop();
         }
         // 5. Read response. The size lives in bytes [2..6] of the
@@ -263,8 +293,7 @@ impl Tpm {
         // SAFETY: identity-mapped DMA.
         unsafe {
             for i in 0..10 {
-                header[i] = core::ptr::read_volatile(
-                    (self.rsp_phys + i as u64) as *const u8);
+                header[i] = core::ptr::read_volatile((self.rsp_phys + i as u64) as *const u8);
             }
         }
         let resp_size = u32::from_be_bytes([header[2], header[3], header[4], header[5]]);
@@ -274,9 +303,7 @@ impl Tpm {
         let mut out = alloc::vec![0u8; resp_size as usize];
         // SAFETY: same.
         for i in 0..resp_size as usize {
-            out[i] = unsafe {
-                core::ptr::read_volatile((self.rsp_phys + i as u64) as *const u8)
-            };
+            out[i] = unsafe { core::ptr::read_volatile((self.rsp_phys + i as u64) as *const u8) };
         }
         Ok(out)
     }
@@ -284,11 +311,15 @@ impl Tpm {
     fn submit_tis(&self, cmd: &[u8]) -> Result<Vec<u8>, TpmError> {
         // 1. Request locality 0.
         // SAFETY: identity-mapped MMIO.
-        unsafe { write8(self.base + REG_TIS_ACCESS, TIS_ACCESS_REQUEST_USE); }
+        unsafe {
+            write8(self.base + REG_TIS_ACCESS, TIS_ACCESS_REQUEST_USE);
+        }
         for _ in 0..1_000_000u32 {
             // SAFETY: same.
             let a = unsafe { read8(self.base + REG_TIS_ACCESS) };
-            if a & TIS_ACCESS_ACTIVE != 0 { break; }
+            if a & TIS_ACCESS_ACTIVE != 0 {
+                break;
+            }
             core::hint::spin_loop();
         }
         // 2. Write command into the FIFO.
@@ -297,25 +328,33 @@ impl Tpm {
             for _ in 0..1_000_000u32 {
                 // SAFETY: same.
                 let s = unsafe { read8(self.base + REG_TIS_STS) };
-                if s & TIS_STS_EXPECT != 0 { break; }
+                if s & TIS_STS_EXPECT != 0 {
+                    break;
+                }
                 core::hint::spin_loop();
             }
             // SAFETY: same.
-            unsafe { write8(self.base + REG_TIS_DATA_FIFO, *b); }
+            unsafe {
+                write8(self.base + REG_TIS_DATA_FIFO, *b);
+            }
         }
         // 3. Issue STS.GO.
         // SAFETY: same.
-        unsafe { write8(self.base + REG_TIS_STS, TIS_STS_GO); }
+        unsafe {
+            write8(self.base + REG_TIS_STS, TIS_STS_GO);
+        }
         // 4. Wait for STS.DATA_AVAIL.
         let mut spins = 0u32;
         loop {
             // SAFETY: same.
             let s = unsafe { read8(self.base + REG_TIS_STS) };
-            if s & (TIS_STS_VALID | TIS_STS_DATA_AVAIL)
-                == (TIS_STS_VALID | TIS_STS_DATA_AVAIL)
-            { break; }
+            if s & (TIS_STS_VALID | TIS_STS_DATA_AVAIL) == (TIS_STS_VALID | TIS_STS_DATA_AVAIL) {
+                break;
+            }
             spins += 1;
-            if spins > 50_000_000 { return Err(TpmError::BusyTimeout); }
+            if spins > 50_000_000 {
+                return Err(TpmError::BusyTimeout);
+            }
             core::hint::spin_loop();
         }
         // 5. Drain FIFO until DATA_AVAIL clears.
@@ -323,11 +362,15 @@ impl Tpm {
         for _ in 0..0x4000u32 {
             // SAFETY: same.
             let s = unsafe { read8(self.base + REG_TIS_STS) };
-            if s & TIS_STS_DATA_AVAIL == 0 { break; }
+            if s & TIS_STS_DATA_AVAIL == 0 {
+                break;
+            }
             // SAFETY: same.
             let b = unsafe { read8(self.base + REG_TIS_DATA_FIFO) };
             out.push(b);
-            if out.len() > 0x1000 { return Err(TpmError::BadResponse); }
+            if out.len() > 0x1000 {
+                return Err(TpmError::BadResponse);
+            }
         }
         Ok(out)
     }
@@ -343,15 +386,19 @@ impl Tpm {
         //   bytesRequested: u16 BE
         let mut req = Vec::with_capacity(12);
         req.extend_from_slice(&0x8001u16.to_be_bytes()); // tag
-        req.extend_from_slice(&12u32.to_be_bytes());     // size
+        req.extend_from_slice(&12u32.to_be_bytes()); // size
         req.extend_from_slice(&0x0000_017Bu32.to_be_bytes()); // GetRandom
         req.extend_from_slice(&bytes.to_be_bytes());
         let resp = self.submit(&req)?;
-        if resp.len() < 12 { return Err(TpmError::BadResponse); }
+        if resp.len() < 12 {
+            return Err(TpmError::BadResponse);
+        }
         // resp[0..2] = tag, resp[2..6] = size, resp[6..10] = rc,
         // resp[10..12] = randomBytes.size, resp[12..] = data.
         let n = u16::from_be_bytes([resp[10], resp[11]]) as usize;
-        if 12 + n > resp.len() { return Err(TpmError::BadResponse); }
+        if 12 + n > resp.len() {
+            return Err(TpmError::BadResponse);
+        }
         Ok(resp[12..12 + n].to_vec())
     }
 }
@@ -377,7 +424,8 @@ impl TpmDevice for Tpm {
     }
 
     async fn get_random(&self, bytes: u16) -> Result<Vec<u8>, HighLevelTpmError> {
-        self.tpm2_get_random(bytes).map_err(|_| HighLevelTpmError::HardwareError)
+        self.tpm2_get_random(bytes)
+            .map_err(|_| HighLevelTpmError::HardwareError)
     }
 
     async fn extend_pcr(&self, pcr: u32, digest: &[u8]) -> Result<(), HighLevelTpmError> {
@@ -394,7 +442,7 @@ impl TpmDevice for Tpm {
         // alg = SHA256 (0x000B)
         req.extend_from_slice(&0x000Bu16.to_be_bytes());
         req.extend_from_slice(digest);
-        
+
         let _resp = self.submit_raw(&req).await?;
         Ok(())
     }
@@ -410,13 +458,17 @@ impl TpmDevice for Tpm {
         req.extend_from_slice(&0x000Bu16.to_be_bytes()); // SHA256
         req.push(3); // size of bitmask
         let mut mask = [0u8; 3];
-        if pcr < 24 { mask[(pcr / 8) as usize] |= 1 << (pcr % 8); }
+        if pcr < 24 {
+            mask[(pcr / 8) as usize] |= 1 << (pcr % 8);
+        }
         req.extend_from_slice(&mask);
 
         let resp = self.submit_raw(&req).await?;
-        if resp.len() < 30 { return Err(HighLevelTpmError::BadResponse); }
+        if resp.len() < 30 {
+            return Err(HighLevelTpmError::BadResponse);
+        }
         // The PCR value is at the end of the response for a single PCR read.
-        Ok(resp[resp.len()-32..].to_vec())
+        Ok(resp[resp.len() - 32..].to_vec())
     }
 }
 
@@ -428,8 +480,12 @@ static TPM: IrqSafeSpinLock<Option<Tpm>> = IrqSafeSpinLock::new(None);
 /// from the Stage::Subsys initcall — silently no-ops on hosts
 /// without a TPM.
 pub fn try_init_default() {
-    if !cfg!(target_arch = "x86_64") { return; }
-    if TPM.lock().is_some() { return; }
+    if !cfg!(target_arch = "x86_64") {
+        return;
+    }
+    if TPM.lock().is_some() {
+        return;
+    }
     // SAFETY: boot-time exclusive access; the locality-0 window
     // is identity-mapped on x86_64.
     if let Ok(dev) = unsafe { Tpm::probe(TPM_BASE_LOCALITY_0) } {
@@ -437,7 +493,9 @@ pub fn try_init_default() {
     }
 }
 
-pub fn is_present() -> bool { TPM.lock().is_some() }
+pub fn is_present() -> bool {
+    TPM.lock().is_some()
+}
 
 pub fn kind() -> Option<TpmKind> {
     TPM.lock().as_ref().map(|t| t.kind())
@@ -448,7 +506,9 @@ pub fn with_tpm<R>(f: impl FnOnce(&Tpm) -> R) -> Option<R> {
 }
 
 #[doc(hidden)]
-pub fn __reset_for_test() { *TPM.lock() = None; }
+pub fn __reset_for_test() {
+    *TPM.lock() = None;
+}
 
 // ── helpers ─────────────────────────────────────────────────────────
 
@@ -461,7 +521,9 @@ unsafe fn read32(phys: u64) -> u32 {
 #[cfg(target_arch = "x86_64")]
 unsafe fn write32(phys: u64, v: u32) {
     // SAFETY: caller-asserted identity-mapped MMIO.
-    unsafe { core::ptr::write_volatile(phys as *mut u32, v); }
+    unsafe {
+        core::ptr::write_volatile(phys as *mut u32, v);
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -473,14 +535,20 @@ unsafe fn read8(phys: u64) -> u8 {
 #[cfg(target_arch = "x86_64")]
 unsafe fn write8(phys: u64, v: u8) {
     // SAFETY: same.
-    unsafe { core::ptr::write_volatile(phys as *mut u8, v); }
+    unsafe {
+        core::ptr::write_volatile(phys as *mut u8, v);
+    }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-unsafe fn read32(_phys: u64) -> u32 { 0 }
+unsafe fn read32(_phys: u64) -> u32 {
+    0
+}
 #[cfg(not(target_arch = "x86_64"))]
 unsafe fn write32(_phys: u64, _v: u32) {}
 #[cfg(not(target_arch = "x86_64"))]
-unsafe fn read8(_phys: u64) -> u8 { 0 }
+unsafe fn read8(_phys: u64) -> u8 {
+    0
+}
 #[cfg(not(target_arch = "x86_64"))]
 unsafe fn write8(_phys: u64, _v: u8) {}

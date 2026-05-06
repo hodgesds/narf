@@ -21,7 +21,9 @@ pub const SPEC_CTRL_BHI_DIS_S: u64 = 1 << 10;
 pub fn bhi_no() -> bool {
     // SAFETY: leaf 0 always defined.
     let max = unsafe { cpuid(0, 0).0 };
-    if max < 7 { return false; }
+    if max < 7 {
+        return false;
+    }
     // SAFETY: leaf 7 sub-leaf 2 valid.
     let (_, _, _, edx) = unsafe { cpuid(7, 2) };
     edx & (1 << 4) != 0
@@ -35,7 +37,9 @@ pub fn bhi_no() -> bool {
 pub fn bhi_dis_s_supported() -> bool {
     // SAFETY: leaf 0 always defined.
     let max = unsafe { cpuid(0, 0).0 };
-    if max < 7 { return false; }
+    if max < 7 {
+        return false;
+    }
     // SAFETY: leaf 7 sub-leaf 0 valid.
     let (_, _, _, edx) = unsafe { cpuid(7, 0) };
     let spec_ctrl_msr = edx & (1 << 26) != 0; // IBRS / IBPB available implies SPEC_CTRL
@@ -51,7 +55,9 @@ pub fn bhi_dis_s_supported() -> bool {
 pub unsafe fn enable_bhi_dis_s() {
     // SAFETY: caller-asserted.
     let v = unsafe { rdmsr(MSR_IA32_SPEC_CTRL) };
-    unsafe { wrmsr(MSR_IA32_SPEC_CTRL, v | SPEC_CTRL_BHI_DIS_S); }
+    unsafe {
+        wrmsr(MSR_IA32_SPEC_CTRL, v | SPEC_CTRL_BHI_DIS_S);
+    }
 }
 
 /// Clear the bit.
@@ -61,5 +67,7 @@ pub unsafe fn enable_bhi_dis_s() {
 pub unsafe fn disable_bhi_dis_s() {
     // SAFETY: caller-asserted.
     let v = unsafe { rdmsr(MSR_IA32_SPEC_CTRL) };
-    unsafe { wrmsr(MSR_IA32_SPEC_CTRL, v & !SPEC_CTRL_BHI_DIS_S); }
+    unsafe {
+        wrmsr(MSR_IA32_SPEC_CTRL, v & !SPEC_CTRL_BHI_DIS_S);
+    }
 }

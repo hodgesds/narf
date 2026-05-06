@@ -35,7 +35,11 @@ pub const MSR_INTEL_BIOS_UPDT_TRIG: u32 = 0x79;
 pub const MSR_AMD_PATCH_LOADER: u32 = 0xC001_0020;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Vendor { Intel, Amd, Unknown }
+pub enum Vendor {
+    Intel,
+    Amd,
+    Unknown,
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum UcodeError {
@@ -58,7 +62,7 @@ pub fn vendor() -> Vendor {
     match &s {
         b"GenuineIntel" => Vendor::Intel,
         b"AuthenticAMD" => Vendor::Amd,
-        _               => Vendor::Unknown,
+        _ => Vendor::Unknown,
     }
 }
 
@@ -74,7 +78,9 @@ pub fn vendor() -> Vendor {
 pub unsafe fn read_revision() -> u32 {
     // Handshake: write 0 then issue CPUID(1).
     // SAFETY: caller-asserted CPL=0; MSR architecturally defined.
-    unsafe { wrmsr(MSR_BIOS_SIGN_ID, 0); }
+    unsafe {
+        wrmsr(MSR_BIOS_SIGN_ID, 0);
+    }
     // SAFETY: leaf 1 is always defined.
     let _ = unsafe { cpuid(1, 0) };
     // SAFETY: same.
@@ -96,7 +102,9 @@ pub unsafe fn read_revision() -> u32 {
 /// 1`). Wrong blobs corrupt the CPU's state — only ever feed
 /// vendor-signed bundles from `narf-firmware`.
 pub unsafe fn apply_intel(blob: &[u8]) -> Result<u32, UcodeError> {
-    if blob.len() < 48 { return Err(UcodeError::NoRevisionChange); }
+    if blob.len() < 48 {
+        return Err(UcodeError::NoRevisionChange);
+    }
     // SAFETY: caller-asserted.
     let _before = unsafe { read_revision() };
     // The "update data address" the SDM wants is the linear
@@ -105,7 +113,9 @@ pub unsafe fn apply_intel(blob: &[u8]) -> Result<u32, UcodeError> {
     // blob, that's just the kernel pointer.
     let addr = blob.as_ptr() as u64;
     // SAFETY: CPL=0 + valid Intel ucode header.
-    unsafe { wrmsr(MSR_INTEL_BIOS_UPDT_TRIG, addr); }
+    unsafe {
+        wrmsr(MSR_INTEL_BIOS_UPDT_TRIG, addr);
+    }
     // SAFETY: same.
     let after = unsafe { read_revision() };
     if after == _before {
@@ -123,12 +133,16 @@ pub unsafe fn apply_intel(blob: &[u8]) -> Result<u32, UcodeError> {
 /// # Safety
 /// Same as `apply_intel`; AMD blobs only.
 pub unsafe fn apply_amd(blob: &[u8]) -> Result<u32, UcodeError> {
-    if blob.is_empty() { return Err(UcodeError::NoRevisionChange); }
+    if blob.is_empty() {
+        return Err(UcodeError::NoRevisionChange);
+    }
     // SAFETY: caller-asserted.
     let before = unsafe { read_revision() };
     let addr = blob.as_ptr() as u64;
     // SAFETY: CPL=0 + valid AMD patch blob.
-    unsafe { wrmsr(MSR_AMD_PATCH_LOADER, addr); }
+    unsafe {
+        wrmsr(MSR_AMD_PATCH_LOADER, addr);
+    }
     // SAFETY: same.
     let after = unsafe { read_revision() };
     if after == before {
@@ -145,8 +159,8 @@ pub unsafe fn apply_amd(blob: &[u8]) -> Result<u32, UcodeError> {
 pub unsafe fn apply(blob: &[u8]) -> Result<u32, UcodeError> {
     // SAFETY: caller-asserted.
     match vendor() {
-        Vendor::Intel   => unsafe { apply_intel(blob) },
-        Vendor::Amd     => unsafe { apply_amd(blob) },
+        Vendor::Intel => unsafe { apply_intel(blob) },
+        Vendor::Amd => unsafe { apply_amd(blob) },
         Vendor::Unknown => Err(UcodeError::UnknownVendor),
     }
 }
@@ -157,33 +171,35 @@ pub unsafe fn apply(blob: &[u8]) -> Result<u32, UcodeError> {
 pub struct IntelUcodeHeader {
     pub header_version: u32,
     pub update_revision: u32,
-    pub date:           u32,
+    pub date: u32,
     pub processor_signature: u32,
-    pub checksum:       u32,
+    pub checksum: u32,
     pub loader_revision: u32,
     pub processor_flags: u32,
-    pub data_size:      u32,
-    pub total_size:     u32,
+    pub data_size: u32,
+    pub total_size: u32,
 }
 
 impl IntelUcodeHeader {
     pub fn decode(buf: &[u8]) -> Option<Self> {
-        if buf.len() < 48 { return None; }
-        let r32 = |o: usize| u32::from_le_bytes([
-            buf[o], buf[o + 1], buf[o + 2], buf[o + 3],
-        ]);
+        if buf.len() < 48 {
+            return None;
+        }
+        let r32 = |o: usize| u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
         let h = Self {
-            header_version:      r32(0),
-            update_revision:     r32(4),
-            date:                r32(8),
+            header_version: r32(0),
+            update_revision: r32(4),
+            date: r32(8),
             processor_signature: r32(12),
-            checksum:            r32(16),
-            loader_revision:     r32(20),
-            processor_flags:     r32(24),
-            data_size:           r32(28),
-            total_size:          r32(32),
+            checksum: r32(16),
+            loader_revision: r32(20),
+            processor_flags: r32(24),
+            data_size: r32(28),
+            total_size: r32(32),
         };
-        if h.header_version != 1 { return None; }
+        if h.header_version != 1 {
+            return None;
+        }
         Some(h)
     }
 }

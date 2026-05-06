@@ -21,8 +21,8 @@
 use core::arch::asm;
 use core::sync::atomic::{compiler_fence, Ordering};
 
-use narf_console::Writer;
 use core::fmt::Write;
+use narf_console::Writer;
 
 use narf_memory::alloc_frame;
 
@@ -38,21 +38,20 @@ const SIPI_VECTOR_PAGE: u8 = (TRAMPOLINE_PHYS >> 12) as u8;
 /// AP's kernel stack — the trampoline loads `rsp = AP_STACKS[id]`
 /// before calling into Rust.
 #[unsafe(no_mangle)]
-static mut AP_STACKS: [u64; narf_lib::percpu::MAX_CPUS] =
-    [0u64; narf_lib::percpu::MAX_CPUS];
+static mut AP_STACKS: [u64; narf_lib::percpu::MAX_CPUS] = [0u64; narf_lib::percpu::MAX_CPUS];
 
 /// AP stack pages — 4 KiB is sufficient for the WFI parking loop.
 const AP_STACK_PAGES: usize = 1;
 
 extern "C" {
     static _ap_trampoline_start: u8;
-    static _ap_trampoline_end:   u8;
+    static _ap_trampoline_end: u8;
     /// Patched parameters inside the trampoline (linker symbols
     /// pointing into `.text.ap_trampoline`).
-    static mut ap_param_cr3:        u64;
-    static mut ap_param_gdt_limit:  u16;
-    static mut ap_param_gdt_base:   u32;
-    static mut ap_param_stacks:     u64;
+    static mut ap_param_cr3: u64;
+    static mut ap_param_gdt_limit: u16;
+    static mut ap_param_gdt_base: u32;
+    static mut ap_param_stacks: u64;
     static mut ap_param_rust_entry: u64;
     static mut ap_param_gdt32_base: u32;
 }
@@ -66,7 +65,7 @@ extern "C" {
 unsafe fn install_trampoline() {
     // Source: kernel high-half virt of the trampoline.
     let src = core::ptr::addr_of!(_ap_trampoline_start) as *const u8;
-    let end = core::ptr::addr_of!(_ap_trampoline_end)   as *const u8;
+    let end = core::ptr::addr_of!(_ap_trampoline_end) as *const u8;
     // SAFETY: both symbols are within the same .text section so
     // pointer subtraction is sound.
     let len = unsafe { end.offset_from(src) } as usize;
@@ -76,16 +75,17 @@ unsafe fn install_trampoline() {
 
     // SAFETY: src/dst are well-formed and non-overlapping (src is
     // in the kernel high half, dst is at low phys 0x8000).
-    unsafe { core::ptr::copy_nonoverlapping(src, dst, len); }
+    unsafe {
+        core::ptr::copy_nonoverlapping(src, dst, len);
+    }
 
     // Patch the param block in the *runtime* trampoline at
     // TRAMPOLINE_PHYS. We compute (kernel symbol offset within
     // .text.ap_trampoline) once per param and apply the same offset
     // to the runtime copy.
     let trampoline_kernel_base = src as u64;
-    let phys_addr = |kern_sym: u64| -> u64 {
-        TRAMPOLINE_PHYS + (kern_sym - trampoline_kernel_base)
-    };
+    let phys_addr =
+        |kern_sym: u64| -> u64 { TRAMPOLINE_PHYS + (kern_sym - trampoline_kernel_base) };
 
     // SAFETY: writes target identity-mapped phys 0x8000+; the BSP's
     // 1 GiB identity mapping covers the trampoline page as RW.
@@ -113,8 +113,7 @@ unsafe fn install_trampoline() {
 
         // AP_STACKS array virt addr.
         let p_stk = phys_addr(core::ptr::addr_of!(ap_param_stacks) as u64);
-        (p_stk as *mut u64).write_unaligned(
-            core::ptr::addr_of!(AP_STACKS) as u64);
+        (p_stk as *mut u64).write_unaligned(core::ptr::addr_of!(AP_STACKS) as u64);
 
         // Rust entry pointer.
         let p_rs = phys_addr(core::ptr::addr_of!(ap_param_rust_entry) as u64);
@@ -141,18 +140,24 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
 
     // 1. Set IA32_TSC_AUX so current_cpu() returns logical_id.
     // SAFETY: per-CPU one-shot during bring-up.
-    unsafe { narf_arch::x86_64::cpu::set_current_cpu(id); }
+    unsafe {
+        narf_arch::x86_64::cpu::set_current_cpu(id);
+    }
 
     // 2. Load the BSP-built IDT register on this CPU.
     // SAFETY: BSP populated IDT during init_traps; per-CPU IDTR
     // load is required even when entries are shared.
-    unsafe { super::idt::load_idtr_ap(); }
+    unsafe {
+        super::idt::load_idtr_ap();
+    }
 
     // 3. Per-CPU LAPIC bring-up: enable x2APIC + spurious vector +
     //    mask the timer LVT until the scheduler asks for it.
     // SAFETY: x2APIC is BSP-confirmed via CPUID; this AP just turns
     // it on for itself.
-    unsafe { narf_interrupts::x86_64::apic::init_ap(); }
+    unsafe {
+        narf_interrupts::x86_64::apic::init_ap();
+    }
 
     // 3b. Match the BSP's domain-enforcer state on this AP. CR4 is
     //     per-CPU, so when the BSP picked the PCID backend at boot
@@ -165,7 +170,9 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
     //     mirror BSP. We enable both per the BSP's effective backend.
     if narf_arch::effective_backend() == narf_arch::DomainBackend::Pcid {
         // SAFETY: PCID is a baseline x86_64 feature; CR3 has PCID = 0.
-        unsafe { narf_arch::x86_64::pcid::enable_pcide(); }
+        unsafe {
+            narf_arch::x86_64::pcid::enable_pcide();
+        }
     } else if narf_arch::effective_backend() == narf_arch::DomainBackend::Pks {
         // Mirror CR4.PKS on this AP. CPUID gating already happened on
         // the BSP — if PKS is selected we know the silicon supports it.
@@ -179,13 +186,17 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
 
     // 4. Mark online — the BSP's start_aps() spins on this.
     // SAFETY: per-CPU bookkeeping.
-    unsafe { narf_lib::smp::mark_online(id); }
+    unsafe {
+        narf_lib::smp::mark_online(id);
+    }
 
     // 4b. Unmask IRQs so cross-CPU IPIs (TLB shootdown, RESCHED, …)
     //     can land on this AP. Without this, the AP halts in
     //     halt_until_irq's spin-loop fallback and never sees IPIs.
     // SAFETY: IDT is loaded, x2APIC is up, traps are wired.
-    unsafe { narf_arch::enable_interrupts(); }
+    unsafe {
+        narf_arch::enable_interrupts();
+    }
 
     // 5. Enter the per-CPU scheduler run loop. `run_forever` drains
     //    this CPU's ready queue, attempts to steal from siblings,
@@ -208,10 +219,15 @@ pub unsafe fn start_aps() -> u32 {
     }
 
     // SAFETY: BSP, post-paging.
-    unsafe { install_trampoline(); }
+    unsafe {
+        install_trampoline();
+    }
 
-    let _ = writeln!(Writer,
-        "  smp(x86): trampoline installed at {:#x}", TRAMPOLINE_PHYS);
+    let _ = writeln!(
+        Writer,
+        "  smp(x86): trampoline installed at {:#x}",
+        TRAMPOLINE_PHYS
+    );
 
     let mut started = 0u32;
     for logical in 1..total {
@@ -221,22 +237,24 @@ pub unsafe fn start_aps() -> u32 {
             match alloc_frame() {
                 Ok(f) => {
                     let base = f.start_address().raw();
-                    if stack_top == 0 { stack_top = base + 4096; }
+                    if stack_top == 0 {
+                        stack_top = base + 4096;
+                    }
                 }
                 Err(_) => {
-                    let _ = writeln!(Writer,
-                        "  smp(x86): AP {}: stack alloc failed", logical);
+                    let _ = writeln!(Writer, "  smp(x86): AP {}: stack alloc failed", logical);
                     continue;
                 }
             }
         }
-        if stack_top == 0 { continue; }
+        if stack_top == 0 {
+            continue;
+        }
 
         // SAFETY: AP_STACKS is in .data; the only writer is the BSP
         // during this start_aps call, before the AP runs.
         unsafe {
-            (*core::ptr::addr_of_mut!(AP_STACKS))[logical as usize] =
-                stack_top;
+            (*core::ptr::addr_of_mut!(AP_STACKS))[logical as usize] = stack_top;
         }
         compiler_fence(Ordering::SeqCst);
 
@@ -248,29 +266,25 @@ pub unsafe fn start_aps() -> u32 {
         unsafe {
             narf_interrupts::x86_64::apic::send_init_ipi(target);
         }
-        delay_us(10_000);            // 10 ms per Intel SDM §10.4.4.1
-        // SAFETY: same.
+        delay_us(10_000); // 10 ms per Intel SDM §10.4.4.1
+                          // SAFETY: same.
         unsafe {
-            narf_interrupts::x86_64::apic::send_startup_ipi(
-                target, SIPI_VECTOR_PAGE);
+            narf_interrupts::x86_64::apic::send_startup_ipi(target, SIPI_VECTOR_PAGE);
         }
-        delay_us(200);               // ≥200 µs between SIPIs
-        // SAFETY: same.
+        delay_us(200); // ≥200 µs between SIPIs
+                       // SAFETY: same.
         unsafe {
-            narf_interrupts::x86_64::apic::send_startup_ipi(
-                target, SIPI_VECTOR_PAGE);
+            narf_interrupts::x86_64::apic::send_startup_ipi(target, SIPI_VECTOR_PAGE);
         }
 
-        let _ = writeln!(Writer,
-            "  smp(x86): INIT-SIPI-SIPI to APIC {} sent", target);
+        let _ = writeln!(Writer, "  smp(x86): INIT-SIPI-SIPI to APIC {} sent", target);
 
         // Wait for AP to mark itself online.
         let mut spins = 0u32;
         while !narf_lib::smp::is_online(logical) {
             spins += 1;
             if spins > 50_000_000 {
-                let _ = writeln!(Writer,
-                    "  smp(x86): AP {} never reported online", logical);
+                let _ = writeln!(Writer, "  smp(x86): AP {} never reported online", logical);
                 break;
             }
             core::hint::spin_loop();

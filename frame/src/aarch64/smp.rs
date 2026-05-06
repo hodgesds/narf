@@ -15,13 +15,13 @@
 use core::arch::asm;
 use core::sync::atomic::{compiler_fence, Ordering};
 
-use narf_console::Writer;
 use core::fmt::Write;
+use narf_console::Writer;
 
 use narf_memory::alloc_frame;
 
 /// PSCI 1.0 function ids.
-const PSCI_CPU_ON_64:        u64 = 0xC400_0003;
+const PSCI_CPU_ON_64: u64 = 0xC400_0003;
 
 /// Per-AP stack size in bytes (4 KiB → one frame). Matches BSP's
 /// boot stack; kernel-test workloads fit in a single frame.
@@ -36,21 +36,21 @@ extern "C" {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PsciError {
-    NotSupported   = -1,
-    InvalidParams  = -2,
-    Denied         = -3,
-    AlreadyOn      = -4,
-    OnPending      = -5,
-    InternalFail   = -6,
-    NotPresent     = -7,
-    Disabled       = -8,
+    NotSupported = -1,
+    InvalidParams = -2,
+    Denied = -3,
+    AlreadyOn = -4,
+    OnPending = -5,
+    InternalFail = -6,
+    NotPresent = -7,
+    Disabled = -8,
     InvalidAddress = -9,
-    Unknown        = -100,
+    Unknown = -100,
 }
 
 fn map_psci_status(s: i64) -> Result<(), PsciError> {
     match s {
-         0 => Ok(()),
+        0 => Ok(()),
         -1 => Err(PsciError::NotSupported),
         -2 => Err(PsciError::InvalidParams),
         -3 => Err(PsciError::Denied),
@@ -60,7 +60,7 @@ fn map_psci_status(s: i64) -> Result<(), PsciError> {
         -7 => Err(PsciError::NotPresent),
         -8 => Err(PsciError::Disabled),
         -9 => Err(PsciError::InvalidAddress),
-         _ => Err(PsciError::Unknown),
+        _ => Err(PsciError::Unknown),
     }
 }
 
@@ -72,9 +72,7 @@ fn map_psci_status(s: i64) -> Result<(), PsciError> {
 /// # Safety
 /// HVC #0 traps to the secure firmware (or PSCI emulator). Caller
 /// must confirm the platform exposes PSCI via HVC (QEMU virt does).
-pub unsafe fn cpu_on(target_aff: u64, entry: u64, context: u64)
-    -> Result<(), PsciError>
-{
+pub unsafe fn cpu_on(target_aff: u64, entry: u64, context: u64) -> Result<(), PsciError> {
     let status: i64;
     // SAFETY: HVC at EL1 invokes EL2's PSCI handler. Args follow
     // PSCI 1.0 §5.1.4: x0=function id, x1=target, x2=entry, x3=context.
@@ -123,22 +121,24 @@ pub unsafe fn start_aps() -> u32 {
                 Ok(f) => {
                     let base = f.start_address().raw();
                     // Stack grows down; top = base + 4 KiB.
-                    if stack_top == 0 { stack_top = base + 4096; }
+                    if stack_top == 0 {
+                        stack_top = base + 4096;
+                    }
                 }
                 Err(_) => {
-                    let _ = writeln!(Writer,
-                        "  smp: AP {}: stack alloc failed", logical);
+                    let _ = writeln!(Writer, "  smp: AP {}: stack alloc failed", logical);
                     continue;
                 }
             }
         }
-        if stack_top == 0 { continue; }
+        if stack_top == 0 {
+            continue;
+        }
 
         // SAFETY: AP_STACKS is in .boot.data, the only writer is
         // the BSP during this start_aps call.
         unsafe {
-            (*core::ptr::addr_of_mut!(AP_STACKS))[logical as usize] =
-                stack_top;
+            (*core::ptr::addr_of_mut!(AP_STACKS))[logical as usize] = stack_top;
         }
         compiler_fence(Ordering::SeqCst);
 
@@ -155,16 +155,17 @@ pub unsafe fn start_aps() -> u32 {
         // SAFETY: PSCI HVC; arguments well-formed.
         match unsafe { cpu_on(target_aff, entry, logical as u64) } {
             Ok(()) => {
-                let _ = writeln!(Writer,
+                let _ = writeln!(
+                    Writer,
                     "  smp: PSCI CPU_ON aff={:#x} entry={:#x} ok",
-                    target_aff, entry);
+                    target_aff, entry
+                );
                 // Wait briefly for the AP to mark itself online.
                 let mut spins = 0u32;
                 while !narf_lib::smp::is_online(logical) {
                     spins += 1;
                     if spins > 10_000_000 {
-                        let _ = writeln!(Writer,
-                            "  smp: AP {} never reported online", logical);
+                        let _ = writeln!(Writer, "  smp: AP {} never reported online", logical);
                         break;
                     }
                     core::hint::spin_loop();
@@ -174,9 +175,11 @@ pub unsafe fn start_aps() -> u32 {
                 }
             }
             Err(e) => {
-                let _ = writeln!(Writer,
+                let _ = writeln!(
+                    Writer,
                     "  smp: PSCI CPU_ON aff={:#x} failed: {:?}",
-                    target_aff, e);
+                    target_aff, e
+                );
             }
         }
     }
@@ -193,7 +196,9 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
     let aff = narf_arch::aarch64::cpu::mpidr_aff();
     // SAFETY: per-CPU registration, called exactly once on this
     // CPU during bring-up.
-    unsafe { narf_arch::aarch64::cpu::set_current_cpu(aff, logical_id as u32); }
+    unsafe {
+        narf_arch::aarch64::cpu::set_current_cpu(aff, logical_id as u32);
+    }
 
     // 2. Install the EL1 vector table — APs share the BSP's table
     //    in .text but each CPU writes its own VBAR_EL1 to point at
@@ -204,13 +209,17 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
     let vbar = core::ptr::addr_of!(__narf_vector_table) as u64;
     // SAFETY: vector-table base is the linker-provided symbol, valid
     // for every CPU's EL1 view.
-    unsafe { narf_arch::aarch64::sysreg::write_vbar_el1(vbar); }
+    unsafe {
+        narf_arch::aarch64::sysreg::write_vbar_el1(vbar);
+    }
 
     // 3. Per-CPU GICv3 init: cpu interface + redistributor wake +
     //    timer-PPI enable.
     // SAFETY: distributor was already brought up by the BSP; this
     // CPU only touches its own redistributor + sysregs.
-    unsafe { narf_interrupts::aarch64::gic::init_ap(logical_id as u32); }
+    unsafe {
+        narf_interrupts::aarch64::gic::init_ap(logical_id as u32);
+    }
 
     // 3b. Install framework-default SGI handlers (PANIC_HALT,
     //     RESCHED). Drivers can override after.
@@ -218,15 +227,16 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
 
     // 4. Mark online — the BSP's start_aps() spins on this.
     // SAFETY: per-CPU bookkeeping.
-    unsafe { narf_lib::smp::mark_online(logical_id as u32); }
+    unsafe {
+        narf_lib::smp::mark_online(logical_id as u32);
+    }
 
     // 5. Start this CPU's generic timer + unmask DAIF for IRQ
     //    delivery. With the timer firing the AP-side trap path
     //    drives the per-CPU tick counter.
     // SAFETY: GIC + vector table installed.
     unsafe {
-        narf_interrupts::aarch64::timer::start_timer(
-            crate::aarch64::trap::TIMER_TVAL_DEFAULT);
+        narf_interrupts::aarch64::timer::start_timer(crate::aarch64::trap::TIMER_TVAL_DEFAULT);
         narf_arch::enable_interrupts();
     }
 

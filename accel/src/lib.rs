@@ -2,15 +2,15 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use async_trait::async_trait;
 use narf_capabilities::{Cap, Read, Write};
 use narf_io::DmaBuffer;
 
 pub mod device;
 
-pub use device::{AccelDevice, AccelInfo, AccelError, JobId, ComputeJob};
+pub use device::{AccelDevice, AccelError, AccelInfo, ComputeJob, JobId};
 
 /// Rights for accelerator capabilities.
 pub enum AccelRight {
@@ -41,11 +41,12 @@ pub trait AccelDeviceTrait: Send + Sync {
 
 pub mod registry {
     use super::*;
-    use narf_lib::sync::IrqSafeSpinLock;
-    use alloc::vec::Vec;
     use alloc::sync::Arc;
+    use alloc::vec::Vec;
+    use narf_lib::sync::IrqSafeSpinLock;
 
-    static REGISTRY: IrqSafeSpinLock<Vec<Arc<dyn AccelDeviceTrait>>> = IrqSafeSpinLock::new(Vec::new());
+    static REGISTRY: IrqSafeSpinLock<Vec<Arc<dyn AccelDeviceTrait>>> =
+        IrqSafeSpinLock::new(Vec::new());
 
     pub fn register(device: Arc<dyn AccelDeviceTrait>) {
         REGISTRY.lock().push(device);
@@ -64,11 +65,11 @@ pub fn register_initcalls() {}
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests {
     use super::*;
-    use narf_kernel_test::{kernel_test_in, TestResult};
-    use core::sync::atomic::{AtomicU64, Ordering};
-    use narf_lib::sync::IrqSafeSpinLock;
     use alloc::sync::Arc;
     use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_kernel_test::{kernel_test_in, TestResult};
+    use narf_lib::sync::IrqSafeSpinLock;
 
     struct MockAccel {
         next_job_id: AtomicU64,
@@ -136,16 +137,22 @@ mod tests {
         });
 
         narf_scheduler::run_until_empty();
-        if success.load(Ordering::SeqCst) == 1 { TestResult::Pass }
-        else { TestResult::Fail("submit-wait cycle failed") }
+        if success.load(Ordering::SeqCst) == 1 {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("submit-wait cycle failed")
+        }
     }
     kernel_test_in!("accel", smoke_accel_submit_wait_cycle);
 
     fn smoke_accel_info_integrity() -> TestResult {
         let mock = MockAccel::new();
         let info = mock.get_info();
-        if info.kind == device::AccelKind::Npu && info.memory_size > 0 { TestResult::Pass }
-        else { TestResult::Fail("info integrity check failed") }
+        if info.kind == device::AccelKind::Npu && info.memory_size > 0 {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("info integrity check failed")
+        }
     }
     kernel_test_in!("accel", smoke_accel_info_integrity);
 }

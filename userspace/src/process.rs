@@ -20,9 +20,8 @@ use alloc::sync::Arc;
 use narf_memory::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
 use crate::{
-    alloc_pid, interp, load_elf_bytes, loader::apply_relocations,
-    loader::load_elf_into_at, loader::LoadBytesError, AuxEntry,
-    EntryPoint, ProcessId,
+    alloc_pid, interp, load_elf_bytes, loader::apply_relocations, loader::load_elf_into_at,
+    loader::LoadBytesError, AuxEntry, EntryPoint, ProcessId,
 };
 
 /// Default user stack size: 16 KiB. Small enough to fit on boot
@@ -39,19 +38,19 @@ pub const DEFAULT_USER_STACK_BASE: u64 = 0x0000_7FFF_FFFC_0000;
 /// user process.
 #[derive(Debug)]
 pub struct UserProcess {
-    pub pid:          ProcessId,
+    pub pid: ProcessId,
     pub address_space: Arc<AddressSpace>,
-    pub entry:        EntryPoint,
+    pub entry: EntryPoint,
     /// Virtual address of the highest user-stack byte (RSP starts
     /// here). RSP grows downward into the mapped region.
-    pub stack_top:    VirtAddr,
+    pub stack_top: VirtAddr,
     /// Per-task TLS thread-pointer (FS base on x86_64). `Some` when
     /// the binary's PT_TLS template was staged; `None` when the
     /// binary has no thread-local storage. The polling future and
     /// the testbin runner write this into `IA32_FS_BASE` before
     /// each user-mode entry so `mov rax, fs:[N]` lands in the
     /// per-task TLS block.
-    pub fs_base:      Option<u64>,
+    pub fs_base: Option<u64>,
 }
 
 /// Errors from `load_user_process`.
@@ -72,11 +71,15 @@ pub enum ProcessLoadError {
 
 #[cfg(target_arch = "x86_64")]
 impl From<crate::tls::TlsError> for ProcessLoadError {
-    fn from(e: crate::tls::TlsError) -> Self { ProcessLoadError::Tls(e) }
+    fn from(e: crate::tls::TlsError) -> Self {
+        ProcessLoadError::Tls(e)
+    }
 }
 
 impl From<LoadBytesError> for ProcessLoadError {
-    fn from(e: LoadBytesError) -> Self { ProcessLoadError::Load(e) }
+    fn from(e: LoadBytesError) -> Self {
+        ProcessLoadError::Load(e)
+    }
 }
 
 /// Parse + load `bytes` into a fresh `UserProcess` with a mapped
@@ -108,9 +111,9 @@ pub unsafe fn load_user_process(bytes: &[u8]) -> Result<UserProcess, ProcessLoad
 /// 4 GiB + initialised frame allocator.
 pub unsafe fn load_user_process_with(
     bytes: &[u8],
-    argv:  &[&str],
-    envp:  &[&str],
-    aux:   &[AuxEntry],
+    argv: &[&str],
+    envp: &[&str],
+    aux: &[AuxEntry],
 ) -> Result<UserProcess, ProcessLoadError> {
     let (address_space, program_entry) = unsafe { load_elf_bytes(bytes) }?;
 
@@ -137,9 +140,8 @@ pub unsafe fn load_user_process_with(
 
     if let Some(name) = image.interp.as_deref() {
         if let Some(interp_bytes) = interp::lookup_interpreter(name) {
-            let interp_entry = unsafe {
-                load_elf_into_at(interp_bytes, &address_space, INTERP_BIAS)
-            }?;
+            let interp_entry =
+                unsafe { load_elf_into_at(interp_bytes, &address_space, INTERP_BIAS) }?;
             // SAFETY: AS already has its PML4 from `load_elf_bytes`;
             // we just appended interp regions and materialize is
             // idempotent for the program pages already installed.
@@ -150,12 +152,11 @@ pub unsafe fn load_user_process_with(
             // through the same relocation pass — the interpreter is
             // typically an ET_DYN object with its own .rela.dyn that
             // needs the INTERP_BIAS applied as the load offset.
-            let interp_image = crate::parse_elf(interp_bytes)
-                .map_err(|e| LoadBytesError::Elf(e))?;
+            let interp_image =
+                crate::parse_elf(interp_bytes).map_err(|e| LoadBytesError::Elf(e))?;
             if !interp_image.dynamic.is_empty() {
                 unsafe {
-                    apply_relocations(interp_bytes, &interp_image,
-                                      &address_space, INTERP_BIAS)
+                    apply_relocations(interp_bytes, &interp_image, &address_space, INTERP_BIAS)
                 }?;
             }
 
@@ -172,8 +173,7 @@ pub unsafe fn load_user_process_with(
     let mut stack_phys_list: alloc::vec::Vec<PhysAddr> =
         alloc::vec::Vec::with_capacity(pages as usize);
     for _ in 0..pages {
-        let f = narf_memory::alloc_frame()
-            .map_err(|_| ProcessLoadError::StackAllocFailed)?;
+        let f = narf_memory::alloc_frame().map_err(|_| ProcessLoadError::StackAllocFailed)?;
         let phys = f.start_address();
         // Zero the stack page.
         // SAFETY: identity-mapped in low 4 GiB.
@@ -183,20 +183,21 @@ pub unsafe fn load_user_process_with(
         stack_phys_list.push(phys);
     }
 
-    address_space.map_region(Region {
-        base:  VirtAddr::new(DEFAULT_USER_STACK_BASE),
-        len:   pages * 4096,
-        perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys:  stack_phys_list,
-    }).map_err(|_| ProcessLoadError::StackMapFailed)?;
+    address_space
+        .map_region(Region {
+            base: VirtAddr::new(DEFAULT_USER_STACK_BASE),
+            len: pages * 4096,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: stack_phys_list,
+        })
+        .map_err(|_| ProcessLoadError::StackMapFailed)?;
 
     // SAFETY: AS is from `load_elf_bytes` (hence `new_for_user`)
     // and stack region was just pushed.
-    unsafe { address_space.materialize() }
-        .map_err(|_| ProcessLoadError::StackMaterializeFailed)?;
+    unsafe { address_space.materialize() }.map_err(|_| ProcessLoadError::StackMaterializeFailed)?;
 
-    let stack_bytes  = pages * 4096;
-    let stack_top_v  = DEFAULT_USER_STACK_BASE + stack_bytes;
+    let stack_bytes = pages * 4096;
+    let stack_top_v = DEFAULT_USER_STACK_BASE + stack_bytes;
 
     // Build the final aux vector: caller-supplied entries take
     // precedence; we append interp-related defaults (AT_ENTRY,
@@ -211,7 +212,9 @@ pub unsafe fn load_user_process_with(
             AuxEntry::Base(INTERP_BIAS),
         ] {
             let tag = default.tag();
-            if !v.iter().any(|e| e.tag() == tag) { v.push(default); }
+            if !v.iter().any(|e| e.tag() == tag) {
+                v.push(default);
+            }
         }
         v
     } else {
@@ -223,8 +226,17 @@ pub unsafe fn load_user_process_with(
     let rsp = if argv.is_empty() && envp.is_empty() && final_aux.is_empty() {
         stack_top_v
     } else {
-        unsafe { init_sysv_stack(&address_space, stack_top_v, stack_bytes, argv, envp, &final_aux) }
-            .map_err(|_| ProcessLoadError::StackOverflow)?
+        unsafe {
+            init_sysv_stack(
+                &address_space,
+                stack_top_v,
+                stack_bytes,
+                argv,
+                envp,
+                &final_aux,
+            )
+        }
+        .map_err(|_| ProcessLoadError::StackOverflow)?
     };
 
     // PT_TLS staging: if the binary names a TLS template, allocate
@@ -246,10 +258,10 @@ pub unsafe fn load_user_process_with(
     let fs_base: Option<u64> = None;
 
     Ok(UserProcess {
-        pid:           alloc_pid(),
+        pid: alloc_pid(),
         address_space,
         entry,
-        stack_top:     VirtAddr::new(rsp),
+        stack_top: VirtAddr::new(rsp),
         fs_base,
     })
 }
@@ -303,7 +315,7 @@ pub enum SysVStackError {
 #[cfg(target_arch = "x86_64")]
 fn resolve_user_phys_byte(root: PhysAddr, vaddr: u64) -> Option<u64> {
     let page = vaddr & !0xFFFu64;
-    let off  = vaddr & 0xFFFu64;
+    let off = vaddr & 0xFFFu64;
     let p = unsafe { narf_memory::x86_64::paging::translate(root, VirtAddr::new(page)) }?;
     Some(p.as_u64() + off)
 }
@@ -331,12 +343,12 @@ fn resolve_user_phys_byte(_root: PhysAddr, _vaddr: u64) -> Option<u64> {
 /// - The low-4-GiB identity map must be live; this routine writes
 ///   through the kernel's identity view of each page's phys.
 pub unsafe fn init_sysv_stack(
-    address_space:     &AddressSpace,
-    stack_top_vaddr:   u64,
-    stack_bytes:       u64,
-    argv:              &[&str],
-    envp:              &[&str],
-    aux:               &[AuxEntry],
+    address_space: &AddressSpace,
+    stack_top_vaddr: u64,
+    stack_bytes: u64,
+    argv: &[&str],
+    envp: &[&str],
+    aux: &[AuxEntry],
 ) -> Result<u64, SysVStackError> {
     // 1. Compute total string bytes (each str + a NUL).
     let mut strings_bytes: u64 = 0;
@@ -367,7 +379,9 @@ pub unsafe fn init_sysv_stack(
     let final_pad = (16 - (tentative & 0xF)) & 0xF;
     let total = tentative + final_pad;
 
-    if total > stack_bytes { return Err(SysVStackError::Overflow); }
+    if total > stack_bytes {
+        return Err(SysVStackError::Overflow);
+    }
 
     let root = address_space.root;
 
@@ -376,14 +390,18 @@ pub unsafe fn init_sysv_stack(
     // physically contiguous, so we can't precompute a single base.
     let write_u8 = |vaddr: u64, byte: u8| -> Result<(), SysVStackError> {
         let phys = resolve_user_phys_byte(root, vaddr).ok_or(SysVStackError::Overflow)?;
-        unsafe { *(phys as *mut u8) = byte; }
+        unsafe {
+            *(phys as *mut u8) = byte;
+        }
         Ok(())
     };
     let write_u64 = |vaddr: u64, val: u64| -> Result<(), SysVStackError> {
         // u64 writes never cross a page boundary if vaddr is 8-aligned
         // (which all our targets are by construction).
         let phys = resolve_user_phys_byte(root, vaddr).ok_or(SysVStackError::Overflow)?;
-        unsafe { *(phys as *mut u64) = val; }
+        unsafe {
+            *(phys as *mut u64) = val;
+        }
         Ok(())
     };
 
@@ -392,7 +410,7 @@ pub unsafe fn init_sysv_stack(
     // Vecs; we'll spill the pointer arrays in step 2.
     let mut argv_ptrs = alloc::vec::Vec::with_capacity(argv.len());
     let mut envp_ptrs = alloc::vec::Vec::with_capacity(envp.len());
-    let mut cursor_vaddr  = stack_top_vaddr;
+    let mut cursor_vaddr = stack_top_vaddr;
     for s in argv.iter() {
         let len = s.len() as u64 + 1;
         cursor_vaddr -= len;
@@ -416,16 +434,24 @@ pub unsafe fn init_sysv_stack(
     // `total` bytes below the top. From there going up: argc,
     // argv*, envp*, aux*, then strings.
     let rsp_vaddr = stack_top_vaddr - total;
-    let mut wv    = rsp_vaddr;
+    let mut wv = rsp_vaddr;
 
     write_u64(wv, argv.len() as u64)?;
     wv += 8;
 
-    for &p in argv_ptrs.iter() { write_u64(wv, p)?; wv += 8; }
-    write_u64(wv, 0)?; wv += 8;  // argv NULL term.
+    for &p in argv_ptrs.iter() {
+        write_u64(wv, p)?;
+        wv += 8;
+    }
+    write_u64(wv, 0)?;
+    wv += 8; // argv NULL term.
 
-    for &p in envp_ptrs.iter() { write_u64(wv, p)?; wv += 8; }
-    write_u64(wv, 0)?; wv += 8;  // envp NULL term.
+    for &p in envp_ptrs.iter() {
+        write_u64(wv, p)?;
+        wv += 8;
+    }
+    write_u64(wv, 0)?;
+    wv += 8; // envp NULL term.
 
     for e in aux.iter() {
         let (key, val) = aux_pair(e);
@@ -433,8 +459,8 @@ pub unsafe fn init_sysv_stack(
         write_u64(wv + 8, val)?;
         wv += 16;
     }
-    write_u64(wv, 0)?;        // AT_NULL key
-    write_u64(wv + 8, 0)?;    // AT_NULL val
+    write_u64(wv, 0)?; // AT_NULL key
+    write_u64(wv + 8, 0)?; // AT_NULL val
 
     Ok(rsp_vaddr)
 }
@@ -442,17 +468,23 @@ pub unsafe fn init_sysv_stack(
 fn aux_pair(e: &AuxEntry) -> (u32, u64) {
     let key = e.tag();
     let val = match *e {
-        AuxEntry::Null         => 0,
-        AuxEntry::Entry(v)     => v,
-        AuxEntry::Phdr(v)      => v,
-        AuxEntry::PhEnt(v)     => v as u64,
-        AuxEntry::PhNum(v)     => v as u64,
-        AuxEntry::Base(v)      => v,
-        AuxEntry::ExecFn(v)    => v,
-        AuxEntry::Pagesz(v)    => v as u64,
-        AuxEntry::Hwcap(v)     => v,
-        AuxEntry::Random(v)    => v,
-        AuxEntry::Secure(b)    => if b { 1 } else { 0 },
+        AuxEntry::Null => 0,
+        AuxEntry::Entry(v) => v,
+        AuxEntry::Phdr(v) => v,
+        AuxEntry::PhEnt(v) => v as u64,
+        AuxEntry::PhNum(v) => v as u64,
+        AuxEntry::Base(v) => v,
+        AuxEntry::ExecFn(v) => v,
+        AuxEntry::Pagesz(v) => v as u64,
+        AuxEntry::Hwcap(v) => v,
+        AuxEntry::Random(v) => v,
+        AuxEntry::Secure(b) => {
+            if b {
+                1
+            } else {
+                0
+            }
+        }
     };
     (key, val)
 }

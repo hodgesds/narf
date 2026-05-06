@@ -68,8 +68,8 @@ pub mod page_cache;
 mod tests;
 pub use devfs::{mount_default as mount_devfs_default, DevFs};
 pub use fuse::{
-    FuseInHeader, FuseInitFlag, FuseInitIn, FuseInitOut, FuseOpcode,
-    FuseOutHeader, FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION,
+    FuseInHeader, FuseInitFlag, FuseInitIn, FuseInitOut, FuseOpcode, FuseOutHeader,
+    FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION,
 };
 pub use memfs::{new_anon_file as new_anon_memfile, MemFs};
 pub use page_cache::{Page, PageCache, PageKey, PAGE_SIZE};
@@ -92,19 +92,25 @@ use narf_lib::sync::IrqSafeSpinLock;
 /// `Grant` set). Maps to `CapKind::FileNode`.
 #[derive(Debug)]
 pub struct NodeRef;
-impl CapType for NodeRef { const KIND: CapKind = CapKind::FileNode; }
+impl CapType for NodeRef {
+    const KIND: CapKind = CapKind::FileNode;
+}
 
 /// Cap marker for a directory node. Maps to `CapKind::DirNode`.
 #[derive(Debug)]
 pub struct DirNodeRef;
-impl CapType for DirNodeRef { const KIND: CapKind = CapKind::DirNode; }
+impl CapType for DirNodeRef {
+    const KIND: CapKind = CapKind::DirNode;
+}
 
 /// Cap marker for a mount point. Maps to `CapKind::MountPoint`. The
 /// `Grant`-rights flavour is the registry authority; `Write`-rights
 /// flavours are returned per successful mount and authorise unmount.
 #[derive(Debug)]
 pub struct MountPoint;
-impl CapType for MountPoint { const KIND: CapKind = CapKind::MountPoint; }
+impl CapType for MountPoint {
+    const KIND: CapKind = CapKind::MountPoint;
+}
 
 /// Cap marker for a filesystem instance. Maps to `CapKind::FsInstance`.
 /// Stage 3 doesn't mint `Cap<FsInstanceMarker, _>` outside the registry
@@ -112,7 +118,9 @@ impl CapType for MountPoint { const KIND: CapKind = CapKind::MountPoint; }
 /// `FsInstance`-rooted `Cap<…, Attach>` per spec §3.5.
 #[derive(Debug)]
 pub struct FsInstanceMarker;
-impl CapType for FsInstanceMarker { const KIND: CapKind = CapKind::FsInstance; }
+impl CapType for FsInstanceMarker {
+    const KIND: CapKind = CapKind::FsInstance;
+}
 
 // ── Stat / FileType ─────────────────────────────────────────────────
 
@@ -133,9 +141,9 @@ pub enum FileType {
 /// from `narf_time::Instant::as_cycles`; wall-clock time is Stage 4.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Stat {
-    pub size:         u64,
-    pub blocks:       u64,
-    pub mode:         Mode,
+    pub size: u64,
+    pub blocks: u64,
+    pub mode: Mode,
     pub mtime_cycles: u64,
 }
 
@@ -145,13 +153,22 @@ pub struct Mode {
     pub file_type: FileType,
     /// Low 9 bits: rwxrwxrwx. Stage 3 ignores these on access — the
     /// cap on the open file is the real check.
-    pub perms:     u16,
+    pub perms: u16,
 }
 
 impl Mode {
-    pub const FILE_RO: Mode = Mode { file_type: FileType::File, perms: 0o444 };
-    pub const FILE_RW: Mode = Mode { file_type: FileType::File, perms: 0o666 };
-    pub const DIR_RO:  Mode = Mode { file_type: FileType::Dir,  perms: 0o555 };
+    pub const FILE_RO: Mode = Mode {
+        file_type: FileType::File,
+        perms: 0o444,
+    };
+    pub const FILE_RW: Mode = Mode {
+        file_type: FileType::File,
+        perms: 0o666,
+    };
+    pub const DIR_RO: Mode = Mode {
+        file_type: FileType::Dir,
+        perms: 0o555,
+    };
 }
 
 // ── Errors ─────────────────────────────────────────────────────────
@@ -176,7 +193,9 @@ impl From<CapError> for FsError {
     /// Spec §4: a revoked mount cap should refuse further access via
     /// that path. The distinction between `Revoked` and `RightsTooWeak`
     /// is preserved at the cap layer; FS callers only need "no".
-    fn from(_: CapError) -> Self { FsError::PermissionDenied }
+    fn from(_: CapError) -> Self {
+        FsError::PermissionDenied
+    }
 }
 
 // ── Async trait future alias ───────────────────────────────────────
@@ -197,7 +216,7 @@ pub type FsFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, FsError>> + Sen
 /// to an owned `String` once persistent FSes appear.
 #[derive(Copy, Clone, Debug)]
 pub struct DirEntry {
-    pub name:      &'static str,
+    pub name: &'static str,
     pub file_type: FileType,
 }
 
@@ -243,7 +262,9 @@ pub trait DirOps: Send + Sync {
     /// Stage 3 only has flat directories at the top level so the
     /// default returns `None`; the initramfs nests via `/`-in-name
     /// (CPIO encodes paths whole), not via subdirectory entries.
-    fn lookup_dir(&self, _name: &str) -> Option<Arc<dyn DirOps>> { None }
+    fn lookup_dir(&self, _name: &str) -> Option<Arc<dyn DirOps>> {
+        None
+    }
 
     /// Iterate this directory. Stage 3 returns a boxed iterator so the
     /// trait stays object-safe; an `impl Iterator` shape would force
@@ -260,9 +281,11 @@ pub trait DirOps: Send + Sync {
     ///
     /// Used by `sys_listdir` (kernel readdir surface). Cheap: a
     /// few dozen Strings per call at the typical scale.
-    fn enumerate(&self, cursor: usize, max: usize)
-        -> alloc::vec::Vec<(alloc::string::String, FileType)>
-    {
+    fn enumerate(
+        &self,
+        cursor: usize,
+        max: usize,
+    ) -> alloc::vec::Vec<(alloc::string::String, FileType)> {
         use alloc::string::ToString;
         self.iter()
             .skip(cursor)
@@ -316,7 +339,11 @@ pub trait DirOps: Send + Sync {
     /// `target` path. The target is stored verbatim — the FS does not
     /// validate it. Returns the new symlink as a `FileOps` whose
     /// `read` yields the target bytes. Default: `Unsupported`.
-    fn symlink(&self, _name: &str, _target: &str) -> Result<alloc::sync::Arc<dyn FileOps>, FsError> {
+    fn symlink(
+        &self,
+        _name: &str,
+        _target: &str,
+    ) -> Result<alloc::sync::Arc<dyn FileOps>, FsError> {
         Err(FsError::Unsupported)
     }
 
@@ -362,27 +389,34 @@ pub trait FsInstance: Send + Sync + 'static {
 /// Returns the file at the leaf. Stage 3 has no `lookup_dir` traffic
 /// because the initramfs is single-level — every CPIO entry is a leaf
 /// directly under the root.
-pub fn resolve(
-    root: Arc<dyn DirOps>,
-    path: &str,
-) -> Result<Arc<dyn FileOps>, FsError> {
-    if path.is_empty()                     { return Err(FsError::InvalidPath); }
-    if path.as_bytes()[0] == b'/'          { return Err(FsError::InvalidPath); }
+pub fn resolve(root: Arc<dyn DirOps>, path: &str) -> Result<Arc<dyn FileOps>, FsError> {
+    if path.is_empty() {
+        return Err(FsError::InvalidPath);
+    }
+    if path.as_bytes()[0] == b'/' {
+        return Err(FsError::InvalidPath);
+    }
 
     let mut current_dir = root;
     let mut last_component: Option<&str> = None;
 
     for segment in path.split('/') {
-        if segment.is_empty() { continue; }                 // tolerate //
-        if segment == ".."    { return Err(FsError::InvalidPath); }
-        if segment == "."     { continue; }                 // tolerate .
+        if segment.is_empty() {
+            continue;
+        } // tolerate //
+        if segment == ".." {
+            return Err(FsError::InvalidPath);
+        }
+        if segment == "." {
+            continue;
+        } // tolerate .
 
         // Hold the previous "leaf candidate" — if there's another
         // segment after it, it has to have been a directory.
         if let Some(prev) = last_component.take() {
             match current_dir.lookup_dir(prev) {
                 Some(d) => current_dir = d,
-                None    => return Err(FsError::NotFound),
+                None => return Err(FsError::NotFound),
             }
         }
         last_component = Some(segment);
@@ -399,8 +433,8 @@ pub fn resolve(
 /// Path is stored as `&'static str` for Stage-3 simplicity — every
 /// mount in the harness today is mount-once-at-boot.
 pub struct Mount {
-    pub path:   &'static str,
-    pub fs:     Arc<dyn FsInstance>,
+    pub path: &'static str,
+    pub fs: Arc<dyn FsInstance>,
     pub handle: Cap<MountPoint, Write>,
 }
 
@@ -408,7 +442,7 @@ impl fmt::Debug for Mount {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Mount")
             .field("path", &self.path)
-            .field("fs",   &self.fs.name())
+            .field("fs", &self.fs.name())
             .finish_non_exhaustive()
     }
 }
@@ -427,7 +461,9 @@ static REGISTRY: VfsRegistry = VfsRegistry {
 
 /// Reference the global VFS registry.
 #[inline]
-pub fn registry() -> &'static VfsRegistry { &REGISTRY }
+pub fn registry() -> &'static VfsRegistry {
+    &REGISTRY
+}
 
 /// Bootstrap the mount-authority cap. TCB-only path — the kernel
 /// calls this once at boot and hands the result to whatever subsystem
@@ -446,7 +482,7 @@ impl VfsRegistry {
         &self,
         authority: &Cap<MountPoint, Grant>,
         path: &'static str,
-        fs:   F,
+        fs: F,
     ) -> Result<Cap<MountPoint, Write>, FsError> {
         authority.check_live()?;
 
@@ -456,7 +492,11 @@ impl VfsRegistry {
         }
         let handle: Cap<MountPoint, Write> = Cap::<MountPoint, Write>::bootstrap();
         let arc: Arc<dyn FsInstance> = Arc::new(fs);
-        q.push(Mount { path, fs: arc, handle });
+        q.push(Mount {
+            path,
+            fs: arc,
+            handle,
+        });
         Ok(handle)
     }
 
@@ -466,15 +506,13 @@ impl VfsRegistry {
     /// the comparison guarantees the unmount and the handle-match are
     /// observed atomically — no two concurrent unmounts can race on
     /// the same slot.
-    pub fn unmount(
-        &self,
-        handle: &Cap<MountPoint, Write>,
-        path:   &str,
-    ) -> Result<(), FsError> {
+    pub fn unmount(&self, handle: &Cap<MountPoint, Write>, path: &str) -> Result<(), FsError> {
         handle.check_live()?;
 
         let mut q = self.inner.lock();
-        let pos = q.iter().position(|m| m.path == path)
+        let pos = q
+            .iter()
+            .position(|m| m.path == path)
             .ok_or(FsError::NotFound)?;
         // Stage 3 doesn't track in-flight ops against a mount, so we
         // pop the entry directly. Stage 4 needs a refcount drain
@@ -491,7 +529,9 @@ impl VfsRegistry {
     /// if no mount matches. The lock is held across `f`; `f` should be
     /// short.
     pub fn with_mount<R, F>(&self, path: &str, f: F) -> Option<R>
-    where F: FnOnce(&dyn FsInstance) -> R {
+    where
+        F: FnOnce(&dyn FsInstance) -> R,
+    {
         let q = self.inner.lock();
         q.iter().find(|m| m.path == path).map(|m| f(&*m.fs))
     }
@@ -506,7 +546,9 @@ impl VfsRegistry {
     ///   `/test/sub/bar` → `/test/sub` + `bar`
     ///   `/elsewhere`    → None
     pub fn resolve_absolute<R, F>(&self, abs: &str, f: F) -> Option<R>
-    where F: FnOnce(&dyn FsInstance, &str) -> R {
+    where
+        F: FnOnce(&dyn FsInstance, &str) -> R,
+    {
         if abs.is_empty() || abs.as_bytes()[0] != b'/' {
             return None;
         }
@@ -515,8 +557,7 @@ impl VfsRegistry {
         let mut best: Option<&Mount> = None;
         for m in q.iter() {
             if abs == m.path
-                || (abs.starts_with(m.path)
-                    && abs.as_bytes().get(m.path.len()) == Some(&b'/'))
+                || (abs.starts_with(m.path) && abs.as_bytes().get(m.path.len()) == Some(&b'/'))
             {
                 if best.map(|b| b.path.len()).unwrap_or(0) < m.path.len() {
                     best = Some(m);
@@ -544,7 +585,9 @@ impl VfsRegistry {
     /// segment and bails with `NotFound` if any intermediate is
     /// absent. Returns `None` when no mount covers `abs`.
     pub fn resolve_parent_absolute<R, F>(&self, abs: &str, f: F) -> Option<R>
-    where F: FnOnce(&dyn FsInstance, Arc<dyn DirOps>, &str) -> R {
+    where
+        F: FnOnce(&dyn FsInstance, Arc<dyn DirOps>, &str) -> R,
+    {
         if abs.is_empty() || abs.as_bytes()[0] != b'/' {
             return None;
         }
@@ -559,7 +602,11 @@ impl VfsRegistry {
         // == "/"). In that case we resolve against the root mount of
         // the leaf's mount; conceptually the parent is the mount
         // root itself.
-        let parent_path = if parent_path.is_empty() { "/" } else { parent_path };
+        let parent_path = if parent_path.is_empty() {
+            "/"
+        } else {
+            parent_path
+        };
         let q = self.inner.lock();
         // Match the longest mount prefix against `parent_path`.
         let mut best: Option<&Mount> = None;
@@ -591,10 +638,14 @@ impl VfsRegistry {
     }
 
     /// Number of mounts.
-    pub fn len(&self) -> usize { self.inner.lock().len() }
+    pub fn len(&self) -> usize {
+        self.inner.lock().len()
+    }
 
     /// `true` iff no FS is mounted.
-    pub fn is_empty(&self) -> bool { self.inner.lock().is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().is_empty()
+    }
 }
 
 // ── Initramfs (CPIO newc reader) ───────────────────────────────────
@@ -633,21 +684,21 @@ impl fmt::Debug for InitramfsEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("InitramfsEntry")
             .field("name", &self.name)
-            .field("len",  &self.data.len())
+            .field("len", &self.data.len())
             .finish_non_exhaustive()
     }
 }
 
 /// Read-only in-memory filesystem backed by a CPIO newc archive.
 pub struct Initramfs {
-    name:    &'static str,
+    name: &'static str,
     entries: Vec<InitramfsEntry>,
 }
 
 impl fmt::Debug for Initramfs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Initramfs")
-            .field("name",    &self.name)
+            .field("name", &self.name)
             .field("entries", &self.entries.len())
             .finish_non_exhaustive()
     }
@@ -676,7 +727,8 @@ impl Initramfs {
     /// External crates use this to scoop subtrees — e.g.
     /// `narf-firmware` walks `firmware/*` entries at boot.
     pub fn iter_files(&self) -> impl Iterator<Item = (&'static str, &'static [u8])> + '_ {
-        self.entries.iter()
+        self.entries
+            .iter()
             .filter(|e| (e.mode & 0o170000) == 0o100000) // S_IFREG
             .map(|e| (e.name, e.data))
     }
@@ -691,23 +743,29 @@ impl Initramfs {
 
         loop {
             // 110-byte fixed header.
-            if off + 110 > archive.len() { return Err(CpioError::Truncated); }
+            if off + 110 > archive.len() {
+                return Err(CpioError::Truncated);
+            }
             let hdr = &archive[off..off + 110];
-            if &hdr[..6] != b"070701" { return Err(CpioError::BadMagic); }
+            if &hdr[..6] != b"070701" {
+                return Err(CpioError::BadMagic);
+            }
 
             // Field offsets per CPIO newc layout:
             //   6:14  c_ino,    14:22 c_mode,  22:30 c_uid,    30:38 c_gid,
             //  38:46  c_nlink,  46:54 c_mtime, 54:62 c_filesize, 62:70 c_devmajor,
             //  70:78  c_devminor, 78:86 c_rdevmajor, 86:94 c_rdevminor,
             //  94:102 c_namesize, 102:110 c_check.
-            let mode     = parse_hex8(&hdr[14..22])?;
-            let mtime    = parse_hex8(&hdr[46..54])? as u64;
+            let mode = parse_hex8(&hdr[14..22])?;
+            let mtime = parse_hex8(&hdr[46..54])? as u64;
             let filesize = parse_hex8(&hdr[54..62])? as usize;
             let namesize = parse_hex8(&hdr[94..102])? as usize;
 
             off += 110;
 
-            if off + namesize > archive.len() { return Err(CpioError::Truncated); }
+            if off + namesize > archive.len() {
+                return Err(CpioError::Truncated);
+            }
             // Name includes the trailing NUL — drop it before UTF-8.
             let name_bytes = &archive[off..off + namesize - 1];
             let name_str = core::str::from_utf8(name_bytes).map_err(|_| CpioError::BadName)?;
@@ -724,7 +782,9 @@ impl Initramfs {
                 break;
             }
 
-            if off + filesize > archive.len() { return Err(CpioError::Truncated); }
+            if off + filesize > archive.len() {
+                return Err(CpioError::Truncated);
+            }
             let data = &archive[off..off + filesize];
 
             // Skip "." root entries — useful when produced by
@@ -749,14 +809,16 @@ impl Initramfs {
 
 /// Parse exactly 8 ASCII hex digits into a u32.
 fn parse_hex8(bytes: &[u8]) -> Result<u32, CpioError> {
-    if bytes.len() != 8 { return Err(CpioError::BadHex); }
+    if bytes.len() != 8 {
+        return Err(CpioError::BadHex);
+    }
     let mut acc = 0u32;
     for &b in bytes {
         let v = match b {
             b'0'..=b'9' => b - b'0',
             b'a'..=b'f' => b - b'a' + 10,
             b'A'..=b'F' => b - b'A' + 10,
-            _           => return Err(CpioError::BadHex),
+            _ => return Err(CpioError::BadHex),
         };
         acc = (acc << 4) | (v as u32);
     }
@@ -783,7 +845,9 @@ impl FsInstance for Initramfs {
             entries_len: self.entries.len(),
         })
     }
-    fn name(&self) -> &str { self.name }
+    fn name(&self) -> &str {
+        self.name
+    }
 }
 
 /// Thin handle exposing the initramfs as a `DirOps`. See the SAFETY
@@ -837,8 +901,8 @@ impl DirOps for InitramfsRoot {
             let canonical = canonical.strip_prefix('/').unwrap_or(canonical);
             if canonical == name {
                 return Some(Arc::new(InitramfsFile {
-                    data:  e.data,
-                    mode:  e.mode,
+                    data: e.data,
+                    mode: e.mode,
                     mtime: e.mtime,
                 }));
             }
@@ -851,7 +915,7 @@ impl DirOps for InitramfsRoot {
             let canonical = e.name.strip_prefix("./").unwrap_or(e.name);
             let canonical = canonical.strip_prefix('/').unwrap_or(canonical);
             DirEntry {
-                name:      canonical,
+                name: canonical,
                 file_type: if e.mode & 0o170000 == 0o040000 {
                     FileType::Dir
                 } else {
@@ -864,8 +928,8 @@ impl DirOps for InitramfsRoot {
 
 /// File handle into an initramfs entry.
 struct InitramfsFile {
-    data:  &'static [u8],
-    mode:  u32,
+    data: &'static [u8],
+    mode: u32,
     mtime: u64,
 }
 
@@ -896,9 +960,9 @@ impl FileOps for InitramfsFile {
 
     fn stat(&self) -> Stat {
         Stat {
-            size:         self.data.len() as u64,
-            blocks:       (self.data.len() as u64).div_ceil(512),
-            mode:         Mode {
+            size: self.data.len() as u64,
+            blocks: (self.data.len() as u64).div_ceil(512),
+            mode: Mode {
                 file_type: if self.mode & 0o170000 == 0o040000 {
                     FileType::Dir
                 } else {
@@ -937,7 +1001,9 @@ impl FsInstance for VirtiofsMount {
     fn root(&self) -> Arc<dyn DirOps> {
         Arc::new(VirtiofsRoot)
     }
-    fn name(&self) -> &str { self.name }
+    fn name(&self) -> &str {
+        self.name
+    }
 }
 
 #[derive(Debug)]

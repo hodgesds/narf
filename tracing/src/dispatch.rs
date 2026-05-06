@@ -58,21 +58,29 @@ pub struct ProbeArgs(pub [u64; 4]);
 
 impl ProbeArgs {
     #[inline]
-    pub const fn none() -> Self { Self([0; 4]) }
+    pub const fn none() -> Self {
+        Self([0; 4])
+    }
     #[inline]
-    pub const fn one(a: u64) -> Self { Self([a, 0, 0, 0]) }
+    pub const fn one(a: u64) -> Self {
+        Self([a, 0, 0, 0])
+    }
     #[inline]
-    pub const fn two(a: u64, b: u64) -> Self { Self([a, b, 0, 0]) }
+    pub const fn two(a: u64, b: u64) -> Self {
+        Self([a, b, 0, 0])
+    }
 }
 
 struct Entry {
     probe_id: u32,
-    handler:  Box<dyn ProbeHandler>,
+    handler: Box<dyn ProbeHandler>,
 }
 
 impl core::fmt::Debug for Entry {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Entry").field("probe_id", &self.probe_id).finish_non_exhaustive()
+        f.debug_struct("Entry")
+            .field("probe_id", &self.probe_id)
+            .finish_non_exhaustive()
     }
 }
 
@@ -90,7 +98,9 @@ static TABLE: HandlerTable = HandlerTable {
 };
 
 #[inline]
-pub fn table() -> &'static HandlerTable { &TABLE }
+pub fn table() -> &'static HandlerTable {
+    &TABLE
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RegisterError {
@@ -100,7 +110,9 @@ pub enum RegisterError {
 }
 
 impl From<CapError> for RegisterError {
-    fn from(_: CapError) -> Self { RegisterError::AuthorityRevoked }
+    fn from(_: CapError) -> Self {
+        RegisterError::AuthorityRevoked
+    }
 }
 
 impl HandlerTable {
@@ -119,12 +131,19 @@ impl HandlerTable {
         if q.len() >= MAX_HANDLERS {
             return Err(RegisterError::TableFull);
         }
-        q.push(Entry { probe_id, handler: Box::new(handler) });
+        q.push(Entry {
+            probe_id,
+            handler: Box::new(handler),
+        });
         Ok(())
     }
 
     /// Remove the handler for `probe_id` (no-op if not installed).
-    pub fn unregister(&self, cap: &Cap<ProbeHandlerInstall, Grant>, probe_id: u32) -> Result<(), CapError> {
+    pub fn unregister(
+        &self,
+        cap: &Cap<ProbeHandlerInstall, Grant>,
+        probe_id: u32,
+    ) -> Result<(), CapError> {
         cap.check_live()?;
         let mut q = self.inner.lock();
         q.retain(|e| e.probe_id != probe_id);
@@ -132,10 +151,14 @@ impl HandlerTable {
     }
 
     /// Handler count.
-    pub fn len(&self) -> usize { self.inner.lock().len() }
+    pub fn len(&self) -> usize {
+        self.inner.lock().len()
+    }
 
     /// `true` iff empty.
-    pub fn is_empty(&self) -> bool { self.inner.lock().is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().is_empty()
+    }
 }
 
 /// Fire a probe. No-op if no handler installed for `probe_id`.

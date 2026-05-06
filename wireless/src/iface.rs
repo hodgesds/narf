@@ -1,5 +1,5 @@
-use alloc::vec::Vec;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WirelessError {
@@ -13,7 +13,7 @@ pub enum WirelessError {
 
 pub struct WirelessIfaceInfo {
     pub base_name: String,
-    pub base_mac:  [u8; 6],
+    pub base_mac: [u8; 6],
     pub bands: Vec<WirelessBand>,
     pub modes: WirelessModes,
     pub hw_caps: HwCaps,

@@ -51,7 +51,7 @@ pub const VIRTIO_PCI_CAP_VENDOR: u8 = 0x09;
 pub enum CfgType {
     Common = 1,
     Notify = 2,
-    Isr    = 3,
+    Isr = 3,
     Device = 4,
     PciCfg = 5,
 }
@@ -73,11 +73,11 @@ impl CfgType {
 #[derive(Copy, Clone, Debug)]
 pub struct VirtioCap {
     pub cfg_type: CfgType,
-    pub bar:      u8,
+    pub bar: u8,
     /// Offset in the BAR.
-    pub offset:   u32,
+    pub offset: u32,
     /// Length of the region in the BAR.
-    pub length:   u32,
+    pub length: u32,
     /// Only valid for `CfgType::Notify`. The notify register address
     /// is `bar.start + offset + queue_notify_off * notify_off_multiplier`.
     pub notify_off_multiplier: u32,
@@ -120,13 +120,13 @@ pub unsafe fn discover(device: &BusDevice) -> Result<VirtioCaps, VirtioPciError>
     };
     let mut common = None;
     let mut notify = None;
-    let mut isr    = None;
-    let mut dev_c  = None;
+    let mut isr = None;
+    let mut dev_c = None;
     // SAFETY: bounded cap-list walk.
-    for hdr in unsafe { pci_cap::iter(device) }
-        .map_err(|_| VirtioPciError::NotPcie)?
-    {
-        if hdr.id != VIRTIO_PCI_CAP_VENDOR { continue; }
+    for hdr in unsafe { pci_cap::iter(device) }.map_err(|_| VirtioPciError::NotPcie)? {
+        if hdr.id != VIRTIO_PCI_CAP_VENDOR {
+            continue;
+        }
         // Vendor-specific cap layout (VirtIO 1.2 §4.1.4):
         //   +0  cap_vndr (u8) = 0x09
         //   +1  cap_next (u8)
@@ -140,36 +140,50 @@ pub unsafe fn discover(device: &BusDevice) -> Result<VirtioCaps, VirtioPciError>
         //   +16 notify_off_multiplier (u32) — Notify cap only
         // SAFETY: cfg-space identity-mapped; offsets stay below 0x100.
         let cfg_type = unsafe { cfg_read8(cfg, hdr.offset + 3) };
-        let bar      = unsafe { cfg_read8(cfg, hdr.offset + 4) };
-        let offset   = unsafe { cfg_read32(cfg, hdr.offset + 8) };
-        let length   = unsafe { cfg_read32(cfg, hdr.offset + 12) };
-        let multi    = if cfg_type == CfgType::Notify as u8 {
+        let bar = unsafe { cfg_read8(cfg, hdr.offset + 4) };
+        let offset = unsafe { cfg_read32(cfg, hdr.offset + 8) };
+        let length = unsafe { cfg_read32(cfg, hdr.offset + 12) };
+        let multi = if cfg_type == CfgType::Notify as u8 {
             // SAFETY: Notify cap is at least 20 bytes by spec.
             unsafe { cfg_read32(cfg, hdr.offset + 16) }
-        } else { 0 };
-        let Some(cfg_kind) = CfgType::from_raw(cfg_type) else { continue; };
-        let cap = VirtioCap { cfg_type: cfg_kind, bar, offset, length,
-            notify_off_multiplier: multi };
+        } else {
+            0
+        };
+        let Some(cfg_kind) = CfgType::from_raw(cfg_type) else {
+            continue;
+        };
+        let cap = VirtioCap {
+            cfg_type: cfg_kind,
+            bar,
+            offset,
+            length,
+            notify_off_multiplier: multi,
+        };
         match cfg_kind {
             CfgType::Common => common = Some(cap),
             CfgType::Notify => notify = Some(cap),
-            CfgType::Isr    => isr    = Some(cap),
-            CfgType::Device => dev_c  = Some(cap),
+            CfgType::Isr => isr = Some(cap),
+            CfgType::Device => dev_c = Some(cap),
             CfgType::PciCfg => {}
         }
     }
 
     let common = common.ok_or(VirtioPciError::NoCommonCfg)?;
     let notify = notify.ok_or(VirtioPciError::NoNotifyCfg)?;
-    Ok(VirtioCaps { common, notify, isr, device_cfg: dev_c })
+    Ok(VirtioCaps {
+        common,
+        notify,
+        isr,
+        device_cfg: dev_c,
+    })
 }
 
 /// Snapshot of the four caps a modern virtio-PCI driver needs.
 #[derive(Debug)]
 pub struct VirtioCaps {
-    pub common:     VirtioCap,
-    pub notify:     VirtioCap,
-    pub isr:        Option<VirtioCap>,
+    pub common: VirtioCap,
+    pub notify: VirtioCap,
+    pub isr: Option<VirtioCap>,
     pub device_cfg: Option<VirtioCap>,
 }
 
@@ -185,7 +199,7 @@ pub struct VirtioCaps {
 pub struct VirtioRegion {
     pub region: MmioRegion,
     /// Kernel virtual base of the mapped BAR.
-    pub virt:   u64,
+    pub virt: u64,
     pub offset: u64,
     pub length: u64,
 }
@@ -195,7 +209,9 @@ impl VirtioRegion {
     /// goes through `self.virt` so cross-arch / above-identity-map
     /// BARs work uniformly.
     #[inline]
-    fn addr(&self, off: u64) -> u64 { self.virt + self.offset + off }
+    fn addr(&self, off: u64) -> u64 {
+        self.virt + self.offset + off
+    }
 
     /// Read a 32-bit register at `off` bytes into the region.
     ///
@@ -214,7 +230,9 @@ impl VirtioRegion {
     #[inline]
     pub unsafe fn write32(&self, off: u64, v: u32) {
         // SAFETY: caller-bounded.
-        unsafe { narf_arch::mmio::write32(self.addr(off), v); }
+        unsafe {
+            narf_arch::mmio::write32(self.addr(off), v);
+        }
     }
 
     /// 64-bit register split into two 32-bit writes (LE).
@@ -240,7 +258,9 @@ impl VirtioRegion {
     #[inline]
     pub unsafe fn write16(&self, off: u64, v: u16) {
         // SAFETY: caller-bounded.
-        unsafe { narf_arch::mmio::write16(self.addr(off), v); }
+        unsafe {
+            narf_arch::mmio::write16(self.addr(off), v);
+        }
     }
 
     #[inline]
@@ -252,7 +272,9 @@ impl VirtioRegion {
     #[inline]
     pub unsafe fn write8(&self, off: u64, v: u8) {
         // SAFETY: caller-bounded.
-        unsafe { narf_arch::mmio::write8(self.addr(off), v); }
+        unsafe {
+            narf_arch::mmio::write8(self.addr(off), v);
+        }
     }
 }
 
@@ -267,19 +289,15 @@ impl VirtioRegion {
 /// # Safety
 /// Forwarded to `bus::map_bar` + `memory::ioremap`. Caller owns
 /// the device exclusively.
-pub unsafe fn map_cap(
-    device: &BusDevice,
-    cap:    &VirtioCap,
-) -> Result<VirtioRegion, VirtioPciError> {
+pub unsafe fn map_cap(device: &BusDevice, cap: &VirtioCap) -> Result<VirtioRegion, VirtioPciError> {
     // SAFETY: caller-asserted.
-    let region = unsafe { map_bar(device, cap.bar) }
-        .map_err(|_| VirtioPciError::BarMapFailed)?;
+    let region = unsafe { map_bar(device, cap.bar) }.map_err(|_| VirtioPciError::BarMapFailed)?;
     // ioremap covers the whole BAR (page-aligned both ends). The
     // cap's `offset` is added inside `VirtioRegion::addr` on every
     // access.
     let bar_phys_pg = region.phys.raw() & !0xFFFu64;
-    let bar_end     = (region.phys.raw() + region.len + 0xFFF) & !0xFFFu64;
-    let bar_len_pg  = bar_end - bar_phys_pg;
+    let bar_end = (region.phys.raw() + region.len + 0xFFF) & !0xFFFu64;
+    let bar_len_pg = bar_end - bar_phys_pg;
     // Reject zero-phys BARs — happens on aarch64 today because
     // QEMU virt + `-kernel` means no firmware assigned the BARs.
     // Until a kernel-side BAR allocator runs during PCIe
@@ -294,15 +312,18 @@ pub unsafe fn map_cap(
     // space using strongly-uncached attributes for MMIO.
     let mapping = unsafe {
         narf_memory::ioremap::ioremap(
-            bar_phys_pg, bar_len_pg, narf_memory::ioremap::MmioAttrs::Device,
+            bar_phys_pg,
+            bar_len_pg,
+            narf_memory::ioremap::MmioAttrs::Device,
         )
-    }.map_err(|_| VirtioPciError::BarMapFailed)?;
+    }
+    .map_err(|_| VirtioPciError::BarMapFailed)?;
     // virt aligns to the page boundary of the BAR; add back the
     // offset within the page.
     let intra_page = region.phys.raw() - bar_phys_pg;
     Ok(VirtioRegion {
         region,
-        virt:   mapping.virt + intra_page,
+        virt: mapping.virt + intra_page,
         offset: cap.offset as u64,
         length: cap.length as u64,
     })
@@ -311,21 +332,21 @@ pub unsafe fn map_cap(
 // ── Common Cfg register offsets ─────────────────────────────────────
 
 pub const CC_DEVICE_FEATURE_SELECT: u64 = 0x00;
-pub const CC_DEVICE_FEATURE:        u64 = 0x04;
+pub const CC_DEVICE_FEATURE: u64 = 0x04;
 pub const CC_DRIVER_FEATURE_SELECT: u64 = 0x08;
-pub const CC_DRIVER_FEATURE:        u64 = 0x0C;
-pub const CC_MSIX_CONFIG:           u64 = 0x10;
-pub const CC_NUM_QUEUES:            u64 = 0x12;
-pub const CC_DEVICE_STATUS:         u64 = 0x14;
-pub const CC_CONFIG_GENERATION:     u64 = 0x15;
-pub const CC_QUEUE_SELECT:          u64 = 0x16;
-pub const CC_QUEUE_SIZE:            u64 = 0x18;
-pub const CC_QUEUE_MSIX_VECTOR:     u64 = 0x1A;
-pub const CC_QUEUE_ENABLE:          u64 = 0x1C;
-pub const CC_QUEUE_NOTIFY_OFF:      u64 = 0x1E;
-pub const CC_QUEUE_DESC:            u64 = 0x20;
-pub const CC_QUEUE_DRIVER:          u64 = 0x28;
-pub const CC_QUEUE_DEVICE:          u64 = 0x30;
+pub const CC_DRIVER_FEATURE: u64 = 0x0C;
+pub const CC_MSIX_CONFIG: u64 = 0x10;
+pub const CC_NUM_QUEUES: u64 = 0x12;
+pub const CC_DEVICE_STATUS: u64 = 0x14;
+pub const CC_CONFIG_GENERATION: u64 = 0x15;
+pub const CC_QUEUE_SELECT: u64 = 0x16;
+pub const CC_QUEUE_SIZE: u64 = 0x18;
+pub const CC_QUEUE_MSIX_VECTOR: u64 = 0x1A;
+pub const CC_QUEUE_ENABLE: u64 = 0x1C;
+pub const CC_QUEUE_NOTIFY_OFF: u64 = 0x1E;
+pub const CC_QUEUE_DESC: u64 = 0x20;
+pub const CC_QUEUE_DRIVER: u64 = 0x28;
+pub const CC_QUEUE_DEVICE: u64 = 0x30;
 
 // ── MSI-X enablement (shared across virtio-PCI drivers) ────────────
 
@@ -339,23 +360,20 @@ pub const CC_QUEUE_DEVICE:          u64 = 0x30;
 /// Caller owns the device's BAR + cfg-space exclusively.
 pub unsafe fn enable_msix_queue(
     common: &VirtioRegion,
-    cap:    &narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+    cap: &narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
     device: &narf_bus::BusDevice,
-    q_idx:  u16,
+    q_idx: u16,
 ) -> Result<(u8, narf_bus::MsixTable), VirtioPciError> {
-    let mut table = narf_bus::msix::enable_msix(cap, device)
-        .map_err(|_| VirtioPciError::BarMapFailed)?;
-    let v = narf_interrupts::vector::alloc()
-        .map_err(|_| VirtioPciError::BarMapFailed)?;
+    let mut table =
+        narf_bus::msix::enable_msix(cap, device).map_err(|_| VirtioPciError::BarMapFailed)?;
+    let v = narf_interrupts::vector::alloc().map_err(|_| VirtioPciError::BarMapFailed)?;
     let _ = table.alloc_vector().ok_or(VirtioPciError::BarMapFailed)?;
     // SAFETY: x2APIC online for any post-init driver.
     let target_apic = unsafe { narf_interrupts::current_cpu_target_id() };
     // SAFETY: caller-asserted exclusive ownership.
-    unsafe { table.program_vector(0, target_apic, v) }
-        .map_err(|_| VirtioPciError::BarMapFailed)?;
+    unsafe { table.program_vector(0, target_apic, v) }.map_err(|_| VirtioPciError::BarMapFailed)?;
     // SAFETY: same.
-    unsafe { table.enable() }
-        .map_err(|_| VirtioPciError::BarMapFailed)?;
+    unsafe { table.enable() }.map_err(|_| VirtioPciError::BarMapFailed)?;
     // SAFETY: identity-mapped MMIO common-cfg region.
     unsafe {
         common.write16(CC_QUEUE_SELECT, q_idx);

@@ -36,16 +36,17 @@ extern crate alloc;
 pub mod suspend;
 pub mod thermal;
 
-#[cfg(target_arch = "x86_64")] pub mod pstate;
-#[cfg(target_arch = "x86_64")] pub mod idle;
-#[cfg(target_arch = "x86_64")] pub mod rapl;
+#[cfg(target_arch = "x86_64")]
+pub mod idle;
+#[cfg(target_arch = "x86_64")]
+pub mod pstate;
+#[cfg(target_arch = "x86_64")]
+pub mod rapl;
 
 mod tests;
 
 pub use suspend::{SuspendError, SuspendPhase};
-pub use thermal::{
-    ThermalEvent, ThermalError, ThermalState, ThermalZone, Thermal,
-};
+pub use thermal::{Thermal, ThermalError, ThermalEvent, ThermalState, ThermalZone};
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -78,7 +79,9 @@ pub enum PowerError {
 }
 
 impl From<CapError> for PowerError {
-    fn from(_: CapError) -> Self { PowerError::AuthorityRevoked }
+    fn from(_: CapError) -> Self {
+        PowerError::AuthorityRevoked
+    }
 }
 
 // ── Cap marker types ────────────────────────────────────────────────
@@ -88,17 +91,23 @@ impl From<CapError> for PowerError {
 /// et al for the receivers.
 #[derive(Copy, Clone, Debug)]
 pub struct Power;
-impl CapType for Power { const KIND: CapKind = CapKind::Power; }
+impl CapType for Power {
+    const KIND: CapKind = CapKind::Power;
+}
 
 /// Authority to install a DVFS governor.
 #[derive(Copy, Clone, Debug)]
 pub struct Governor;
-impl CapType for Governor { const KIND: CapKind = CapKind::Governor; }
+impl CapType for Governor {
+    const KIND: CapKind = CapKind::Governor;
+}
 
 /// Authority to register a per-driver runtime-PM handler.
 #[derive(Copy, Clone, Debug)]
 pub struct DevicePm;
-impl CapType for DevicePm { const KIND: CapKind = CapKind::DevicePm; }
+impl CapType for DevicePm {
+    const KIND: CapKind = CapKind::DevicePm;
+}
 
 // ── FreqHint ────────────────────────────────────────────────────────
 
@@ -108,7 +117,9 @@ impl CapType for DevicePm { const KIND: CapKind = CapKind::DevicePm; }
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct FreqHint(pub u32);
 
-impl CapType for FreqHint { const KIND: CapKind = CapKind::FreqHint; }
+impl CapType for FreqHint {
+    const KIND: CapKind = CapKind::FreqHint;
+}
 
 impl FreqHint {
     /// Stage-3 placeholder: the platform's "max" frequency. Real value
@@ -118,7 +129,9 @@ impl FreqHint {
     pub const MIN: FreqHint = FreqHint(800);
 
     #[inline]
-    pub const fn mhz(self) -> u32 { self.0 }
+    pub const fn mhz(self) -> u32 {
+        self.0
+    }
 }
 
 // ── C-state ─────────────────────────────────────────────────────────
@@ -163,10 +176,7 @@ static CSTATES: IrqSafeSpinLock<Vec<CState>> = IrqSafeSpinLock::new(Vec::new());
 /// Register a C-state with the global table. Cap-gated on
 /// `Cap<Power, Grant>`. Returns `Err(DuplicateCState)` if a state with
 /// the same `id` is already registered.
-pub fn register_cstate(
-    cap: &Cap<Power, Grant>,
-    state: CState,
-) -> Result<(), PowerError> {
+pub fn register_cstate(cap: &Cap<Power, Grant>, state: CState) -> Result<(), PowerError> {
     cap.check_live()?;
     let mut t = CSTATES.lock();
     if t.iter().any(|s| s.id == state.id) {
@@ -180,16 +190,21 @@ pub fn register_cstate(
 }
 
 /// Number of registered C-states. Mostly for tests.
-pub fn cstate_count() -> usize { CSTATES.lock().len() }
+pub fn cstate_count() -> usize {
+    CSTATES.lock().len()
+}
 
 /// Snapshot the registered C-state set. Returned vec is owned so the
 /// caller doesn't hold the lock across other power calls.
-pub fn cstates() -> Vec<CState> { CSTATES.lock().clone() }
+pub fn cstates() -> Vec<CState> {
+    CSTATES.lock().clone()
+}
 
 // ── Default C-state entries ─────────────────────────────────────────
 
 /// C0: running. Entry is a no-op — the CPU is by definition awake.
-fn cstate_c0_entry() { /* never parked here */ }
+fn cstate_c0_entry() { /* never parked here */
+}
 
 /// C1: shallow idle. On x86_64 this is `HLT`; on aarch64 `WFI`. The
 /// arch wrapper picks correctly based on `cfg`.
@@ -254,16 +269,24 @@ pub trait GovernorPolicy: Send + Sync + 'static {
 #[derive(Copy, Clone, Debug, Default)]
 pub struct Performance;
 impl GovernorPolicy for Performance {
-    fn name(&self) -> &'static str { "performance" }
-    fn select_freq(&self, _load_permille: u16) -> FreqHint { FreqHint::MAX }
+    fn name(&self) -> &'static str {
+        "performance"
+    }
+    fn select_freq(&self, _load_permille: u16) -> FreqHint {
+        FreqHint::MAX
+    }
 }
 
 /// Always picks `FreqHint::MIN`. Battery-life maximiser.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct Powersave;
 impl GovernorPolicy for Powersave {
-    fn name(&self) -> &'static str { "powersave" }
-    fn select_freq(&self, _load_permille: u16) -> FreqHint { FreqHint::MIN }
+    fn name(&self) -> &'static str {
+        "powersave"
+    }
+    fn select_freq(&self, _load_permille: u16) -> FreqHint {
+        FreqHint::MIN
+    }
 }
 
 /// Bare-minimum on-demand: max above 50% load, min otherwise. Real
@@ -273,9 +296,15 @@ impl GovernorPolicy for Powersave {
 #[derive(Copy, Clone, Debug, Default)]
 pub struct OnDemand;
 impl GovernorPolicy for OnDemand {
-    fn name(&self) -> &'static str { "ondemand" }
+    fn name(&self) -> &'static str {
+        "ondemand"
+    }
     fn select_freq(&self, load_permille: u16) -> FreqHint {
-        if load_permille > 500 { FreqHint::MAX } else { FreqHint::MIN }
+        if load_permille > 500 {
+            FreqHint::MAX
+        } else {
+            FreqHint::MIN
+        }
     }
 }
 
@@ -291,7 +320,9 @@ impl GovernorPolicy for OnDemand {
 #[derive(Copy, Clone, Debug, Default)]
 pub struct EnergyAware;
 impl GovernorPolicy for EnergyAware {
-    fn name(&self) -> &'static str { "energy-aware" }
+    fn name(&self) -> &'static str {
+        "energy-aware"
+    }
     fn select_freq(&self, load_permille: u16) -> FreqHint {
         // Three-band pick in [MIN, MAX]. Midpoint for moderate load
         // so p99 latency doesn't suffer; MAX reserved for genuine
@@ -312,8 +343,7 @@ impl GovernorPolicy for EnergyAware {
 // `Box<dyn GovernorPolicy>` slot. `IrqSafeSpinLock<Option<...>>` so
 // `init()` can install `Performance` and `install_governor` can swap it
 // without an extra allocation per query.
-static GOVERNOR: IrqSafeSpinLock<Option<Box<dyn GovernorPolicy>>> =
-    IrqSafeSpinLock::new(None);
+static GOVERNOR: IrqSafeSpinLock<Option<Box<dyn GovernorPolicy>>> = IrqSafeSpinLock::new(None);
 
 /// Install a governor. Cap-gated on `Cap<Governor, Grant>`. Replaces
 /// the previous active governor; the displaced `Box` is dropped.
@@ -356,15 +386,15 @@ pub fn select_freq(load_permille: u16) -> Result<FreqHint, PowerError> {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DState {
     /// Active: device is fully operational.
-    D0     = 0,
+    D0 = 0,
     /// Intermediate low-power state. Optional; many devices alias
     /// to D2 or D3Hot.
-    D1     = 1,
+    D1 = 1,
     /// Intermediate low-power state. Optional.
-    D2     = 2,
+    D2 = 2,
     /// Lowest active state; driver context preserved so resume to D0
     /// is fast (no re-init). Most drivers' "go idle" target.
-    D3Hot  = 3,
+    D3Hot = 3,
     /// Powered off; context lost. Resume implies full re-init (a
     /// fresh `Driver::start` after `Driver::reset`). Used for
     /// long-idle / battery-aware suspend.
@@ -408,7 +438,11 @@ pub trait DeviceRuntimePm: Send + 'static {
         &'a mut self,
         target: DState,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        if target.is_active() { self.resume() } else { self.suspend() }
+        if target.is_active() {
+            self.resume()
+        } else {
+            self.suspend()
+        }
     }
 }
 
@@ -417,7 +451,7 @@ struct PmEntry {
     /// caller's; we hold a snapshot so revocations also disable
     /// power-cycling for orphaned-but-not-removed devices.
     handle: Cap<DevicePm, Grant>,
-    dev:    Box<dyn DeviceRuntimePm>,
+    dev: Box<dyn DeviceRuntimePm>,
     suspended: AtomicBool,
 }
 
@@ -457,7 +491,9 @@ pub fn register_device_pm<D: DeviceRuntimePm>(
 pub struct DeviceHandle(usize);
 
 /// Number of registered runtime-PM devices.
-pub fn device_pm_count() -> usize { DEVICES.lock().len() }
+pub fn device_pm_count() -> usize {
+    DEVICES.lock().len()
+}
 
 /// Drive a single device through `suspend`. Re-checks the cap liveness
 /// before invoking the driver hook. The future is polled inline by the
@@ -554,11 +590,21 @@ pub fn init() {
     let power = bootstrap_power_authority();
     let _ = register_cstate(
         &power,
-        CState { id: 0, exit_latency_us: 0, power_draw_mw: 50_000, entry: cstate_c0_entry },
+        CState {
+            id: 0,
+            exit_latency_us: 0,
+            power_draw_mw: 50_000,
+            entry: cstate_c0_entry,
+        },
     );
     let _ = register_cstate(
         &power,
-        CState { id: 1, exit_latency_us: 1, power_draw_mw: 5_000, entry: cstate_c1_entry },
+        CState {
+            id: 1,
+            exit_latency_us: 1,
+            power_draw_mw: 5_000,
+            entry: cstate_c1_entry,
+        },
     );
 
     // Default governor: Performance. Mint a governor authority just

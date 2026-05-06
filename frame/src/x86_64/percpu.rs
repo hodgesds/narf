@@ -29,24 +29,24 @@ use narf_arch::x86_64::msr;
 pub struct PerCpu {
     /// Scratch slot the trap entry uses to save the user RSP while
     /// it switches to the kernel stack from `gs:kernel_stack_top`.
-    pub user_rsp_save:    AtomicU64,
+    pub user_rsp_save: AtomicU64,
     /// Top of the kernel stack for the currently-running task.
     /// Mirror of `TSS.rsp0` for the SYSCALL entry (which bypasses
     /// the TSS-triggered stack swap and has to look it up itself).
     pub kernel_stack_top: AtomicU64,
     /// Identity: which CPU this instance describes. BSP = 0.
-    pub cpu_id:           u32,
+    pub cpu_id: u32,
     /// Padding to 64-byte cache-line alignment.
-    _pad:                 [u32; 5],
+    _pad: [u32; 5],
 }
 
 impl PerCpu {
     pub const fn new(cpu_id: u32) -> Self {
         Self {
-            user_rsp_save:    AtomicU64::new(0),
+            user_rsp_save: AtomicU64::new(0),
             kernel_stack_top: AtomicU64::new(0),
             cpu_id,
-            _pad:             [0; 5],
+            _pad: [0; 5],
         }
     }
 }
@@ -56,8 +56,8 @@ impl PerCpu {
 static BSP_PERCPU: PerCpu = PerCpu::new(0);
 
 /// MSR numbers we program at init.
-const IA32_GS_BASE:         u32 = 0xC0000101;
-const IA32_KERNEL_GS_BASE:  u32 = 0xC0000102;
+const IA32_GS_BASE: u32 = 0xC0000101;
+const IA32_KERNEL_GS_BASE: u32 = 0xC0000102;
 
 /// Initialise per-CPU state for the BSP.
 ///
@@ -78,16 +78,15 @@ pub unsafe fn init_bsp() {
     let addr = core::ptr::addr_of!(BSP_PERCPU) as u64;
 
     // Mirror TSS.rsp0 into `PerCpu.kernel_stack_top`.
-    BSP_PERCPU.kernel_stack_top.store(
-        super::gdt::kernel_rsp0(),
-        Ordering::Release,
-    );
+    BSP_PERCPU
+        .kernel_stack_top
+        .store(super::gdt::kernel_rsp0(), Ordering::Release);
 
     // SAFETY: writing GS_BASE and KERNEL_GS_BASE at CPL=0 is a
     // documented operation. `msr::wrmsr` carries the
     // `compiler_fence(SeqCst)` pair from arch/ §4.
     unsafe {
-        msr::wrmsr(IA32_GS_BASE,        addr);
+        msr::wrmsr(IA32_GS_BASE, addr);
         msr::wrmsr(IA32_KERNEL_GS_BASE, 0);
     }
 }
@@ -116,7 +115,9 @@ pub fn current_kernel_gs_base() -> u64 {
 /// Only valid from CPL=0 in a non-preemptible section.
 pub unsafe fn set_kernel_gs_base(user_gs: u64) {
     // SAFETY: documented MSR write.
-    unsafe { msr::wrmsr(IA32_KERNEL_GS_BASE, user_gs); }
+    unsafe {
+        msr::wrmsr(IA32_KERNEL_GS_BASE, user_gs);
+    }
 }
 
 /// Address of the BSP's PerCpu struct — exposed for tests that

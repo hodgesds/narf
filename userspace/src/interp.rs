@@ -19,8 +19,8 @@ use alloc::collections::BTreeMap;
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-static REGISTRY: IrqSafeSpinLock<Option<BTreeMap<&'static str, &'static [u8]>>>
-    = IrqSafeSpinLock::new(None);
+static REGISTRY: IrqSafeSpinLock<Option<BTreeMap<&'static str, &'static [u8]>>> =
+    IrqSafeSpinLock::new(None);
 
 /// Register an interpreter ELF blob under `name`. A second call
 /// with the same `name` overwrites the prior entry — boot code is
@@ -42,4 +42,6 @@ pub fn lookup_interpreter(name: &str) -> Option<&'static [u8]> {
 /// doesn't leak state across cases. Production code never calls
 /// this.
 #[doc(hidden)]
-pub fn __test_clear_interpreters() { *REGISTRY.lock() = None; }
+pub fn __test_clear_interpreters() {
+    *REGISTRY.lock() = None;
+}

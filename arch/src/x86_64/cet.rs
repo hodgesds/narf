@@ -21,30 +21,32 @@
 use crate::x86_64::cpuid::cpuid;
 use crate::x86_64::msr::{rdmsr, wrmsr};
 
-pub const MSR_IA32_U_CET:                u32 = 0x6A0;
-pub const MSR_IA32_S_CET:                u32 = 0x6A2;
-pub const MSR_IA32_PL0_SSP:              u32 = 0x6A4;
-pub const MSR_IA32_PL3_SSP:              u32 = 0x6A7;
-pub const MSR_IA32_INTERRUPT_SSP_TABLE:  u32 = 0x6A8;
+pub const MSR_IA32_U_CET: u32 = 0x6A0;
+pub const MSR_IA32_S_CET: u32 = 0x6A2;
+pub const MSR_IA32_PL0_SSP: u32 = 0x6A4;
+pub const MSR_IA32_PL3_SSP: u32 = 0x6A7;
+pub const MSR_IA32_INTERRUPT_SSP_TABLE: u32 = 0x6A8;
 
-const SH_STK_EN:    u64 = 1 << 0;
-const WR_SHSTK_EN:  u64 = 1 << 1;
-const ENDBR_EN:     u64 = 1 << 2;
-const NO_TRACK_EN:  u64 = 1 << 4;
+const SH_STK_EN: u64 = 1 << 0;
+const WR_SHSTK_EN: u64 = 1 << 1;
+const ENDBR_EN: u64 = 1 << 2;
+const NO_TRACK_EN: u64 = 1 << 4;
 
 const CR4_CET: u64 = 1 << 23;
 
 #[derive(Copy, Clone, Debug, Default)]
 pub struct CetCaps {
     pub shadow_stack: bool,
-    pub ibt:          bool,
-    pub cr4_cet:      bool,
+    pub ibt: bool,
+    pub cr4_cet: bool,
 }
 
 pub fn caps() -> CetCaps {
     // SAFETY: leaf 0 always defined.
     let max = unsafe { cpuid(0, 0).0 };
-    if max < 7 { return CetCaps::default(); }
+    if max < 7 {
+        return CetCaps::default();
+    }
     // SAFETY: leaf 7 valid.
     let (_, _, ecx, edx) = unsafe { cpuid(7, 0) };
     // SAFETY: CR4 read at CPL=0 is always defined; the result
@@ -52,8 +54,8 @@ pub fn caps() -> CetCaps {
     let cr4 = read_cr4();
     CetCaps {
         shadow_stack: ecx & (1 << 7) != 0,
-        ibt:          edx & (1 << 20) != 0,
-        cr4_cet:      cr4 & CR4_CET != 0,
+        ibt: edx & (1 << 20) != 0,
+        cr4_cet: cr4 & CR4_CET != 0,
     }
 }
 
@@ -85,7 +87,9 @@ pub unsafe fn enable_cr4() {
     let cur = read_cr4();
     if cur & CR4_CET == 0 {
         // SAFETY: caller-asserted; reserved CR4 bits preserved.
-        unsafe { write_cr4(cur | CR4_CET); }
+        unsafe {
+            write_cr4(cur | CR4_CET);
+        }
     }
 }
 
@@ -96,10 +100,16 @@ pub unsafe fn enable_cr4() {
 /// CPL = 0; `enable_cr4` has been called.
 pub unsafe fn enable_supervisor(shadow_stack: bool, ibt: bool) {
     let mut v = 0u64;
-    if shadow_stack { v |= SH_STK_EN | WR_SHSTK_EN; }
-    if ibt          { v |= ENDBR_EN | NO_TRACK_EN; }
+    if shadow_stack {
+        v |= SH_STK_EN | WR_SHSTK_EN;
+    }
+    if ibt {
+        v |= ENDBR_EN | NO_TRACK_EN;
+    }
     // SAFETY: caller-asserted.
-    unsafe { wrmsr(MSR_IA32_S_CET, v); }
+    unsafe {
+        wrmsr(MSR_IA32_S_CET, v);
+    }
 }
 
 /// Configure user-side (CPL=3) CET. Same shape as supervisor.
@@ -108,10 +118,16 @@ pub unsafe fn enable_supervisor(shadow_stack: bool, ibt: bool) {
 /// CPL = 0; `enable_cr4` has been called.
 pub unsafe fn enable_user(shadow_stack: bool, ibt: bool) {
     let mut v = 0u64;
-    if shadow_stack { v |= SH_STK_EN | WR_SHSTK_EN; }
-    if ibt          { v |= ENDBR_EN | NO_TRACK_EN; }
+    if shadow_stack {
+        v |= SH_STK_EN | WR_SHSTK_EN;
+    }
+    if ibt {
+        v |= ENDBR_EN | NO_TRACK_EN;
+    }
     // SAFETY: caller-asserted.
-    unsafe { wrmsr(MSR_IA32_U_CET, v); }
+    unsafe {
+        wrmsr(MSR_IA32_U_CET, v);
+    }
 }
 
 /// Disable CET via CR4.CET clear (the `IA32_*_CET` MSRs are
@@ -123,7 +139,9 @@ pub unsafe fn disable_cr4() {
     let cur = read_cr4();
     if cur & CR4_CET != 0 {
         // SAFETY: caller-asserted.
-        unsafe { write_cr4(cur & !CR4_CET); }
+        unsafe {
+            write_cr4(cur & !CR4_CET);
+        }
     }
 }
 
@@ -143,5 +161,7 @@ pub unsafe fn read_pl0_ssp() -> u64 {
 /// (PTE-marked Shadow Stack via `Dirty=1, Writable=0`).
 pub unsafe fn write_pl0_ssp(addr: u64) {
     // SAFETY: caller-asserted.
-    unsafe { wrmsr(MSR_IA32_PL0_SSP, addr); }
+    unsafe {
+        wrmsr(MSR_IA32_PL0_SSP, addr);
+    }
 }

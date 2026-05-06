@@ -39,13 +39,10 @@ impl fmt::Debug for HotplugEvent {
         match self {
             HotplugEvent::Attach { addr, device_id } => f
                 .debug_struct("Attach")
-                .field("addr",       addr)
-                .field("device_id",  device_id)
-                .finish(),
-            HotplugEvent::Detach { addr } => f
-                .debug_struct("Detach")
                 .field("addr", addr)
+                .field("device_id", device_id)
                 .finish(),
+            HotplugEvent::Detach { addr } => f.debug_struct("Detach").field("addr", addr).finish(),
         }
     }
 }
@@ -65,7 +62,9 @@ pub enum HotplugError {
 }
 
 impl From<CapError> for HotplugError {
-    fn from(_: CapError) -> Self { HotplugError::AuthorityRevoked }
+    fn from(_: CapError) -> Self {
+        HotplugError::AuthorityRevoked
+    }
 }
 
 // The listener list is stored under the simplest primitive that
@@ -74,8 +73,7 @@ impl From<CapError> for HotplugError {
 // the same contention argument that justifies it in `net/` and
 // `drivers/` applies. Stage-4 moves this behind the `rcu/` reader path
 // so dispatch never blocks on a registration.
-static LISTENERS: IrqSafeSpinLock<Vec<Arc<dyn HotplugListener>>>
-    = IrqSafeSpinLock::new(Vec::new());
+static LISTENERS: IrqSafeSpinLock<Vec<Arc<dyn HotplugListener>>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Register a hot-plug listener.
 ///
@@ -86,7 +84,7 @@ static LISTENERS: IrqSafeSpinLock<Vec<Arc<dyn HotplugListener>>>
 /// of every device that appears on the bus.
 pub fn register_listener(
     authority: &Cap<BusRegistryCap, Grant>,
-    listener:  Arc<dyn HotplugListener>,
+    listener: Arc<dyn HotplugListener>,
 ) -> Result<(), HotplugError> {
     authority.check_live()?;
     LISTENERS.lock().push(listener);

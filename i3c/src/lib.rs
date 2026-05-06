@@ -2,14 +2,14 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use async_trait::async_trait;
-use narf_capabilities::{CapType, CapKind};
 use core::task::Waker;
+use narf_capabilities::{CapKind, CapType};
 
-pub mod types;
 pub mod registry;
+pub mod types;
 
 pub use types::{I3cError, I3cOp, IbiPayload};
 
@@ -54,9 +54,9 @@ pub fn register_initcalls() {}
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests {
     use super::*;
+    use alloc::sync::Arc;
     use narf_kernel_test::{kernel_test_in, TestResult};
     use narf_lib::sync::IrqSafeSpinLock;
-    use alloc::sync::Arc;
 
     struct MockI3c {
         transfers: IrqSafeSpinLock<Vec<u8>>,
@@ -70,7 +70,9 @@ mod tests {
                 match op {
                     I3cOp::Write(data) => self.transfers.lock().extend_from_slice(data),
                     I3cOp::Read(buf) => {
-                        for i in 0..buf.len() { buf[i] = 0x55; }
+                        for i in 0..buf.len() {
+                            buf[i] = 0x55;
+                        }
                     }
                 }
             }
@@ -83,7 +85,9 @@ mod tests {
 
     fn smoke_i3c_transfer() -> TestResult {
         narf_scheduler::init();
-        let mock = Arc::new(MockI3c { transfers: IrqSafeSpinLock::new(Vec::new()) });
+        let mock = Arc::new(MockI3c {
+            transfers: IrqSafeSpinLock::new(Vec::new()),
+        });
         let success = Arc::new(core::sync::atomic::AtomicU32::new(0));
 
         let m = mock.clone();
@@ -98,15 +102,21 @@ mod tests {
         });
 
         narf_scheduler::run_until_empty();
-        if success.load(core::sync::atomic::Ordering::SeqCst) == 1 { TestResult::Pass }
-        else { TestResult::Fail("transfer check failed") }
+        if success.load(core::sync::atomic::Ordering::SeqCst) == 1 {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("transfer check failed")
+        }
     }
     kernel_test_in!("i3c", smoke_i3c_transfer);
 
     fn smoke_i3c_cap_kind() -> TestResult {
         use narf_capabilities::CapType;
-        if matches!(I3cCapType::KIND, CapKind::I3cBus) { TestResult::Pass }
-        else { TestResult::Fail("cap kind mismatch") }
+        if matches!(I3cCapType::KIND, CapKind::I3cBus) {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("cap kind mismatch")
+        }
     }
     kernel_test_in!("i3c", smoke_i3c_cap_kind);
 }

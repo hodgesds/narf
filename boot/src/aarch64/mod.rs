@@ -20,7 +20,9 @@ pub const PL011_QEMU_VIRT: u64 = 0x0900_0000;
 pub const MAX_MEM_REGIONS: usize = 16;
 
 static mut MEMORY_MAP: [MemRegion; MAX_MEM_REGIONS] = [MemRegion {
-    start: PhysAddr::new(0), len: 0, kind: MemRegionKind::Reserved,
+    start: PhysAddr::new(0),
+    len: 0,
+    kind: MemRegionKind::Reserved,
 }; MAX_MEM_REGIONS];
 static mut MEMORY_MAP_LEN: usize = 0;
 
@@ -57,20 +59,19 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
     // this with the actual `/memory` node.
     let region = MemRegion {
         start: PhysAddr::new(0x4000_0000),
-        len:   0x0800_0000,           // 128 MiB
-        kind:  MemRegionKind::Usable,
+        len: 0x0800_0000, // 128 MiB
+        kind: MemRegionKind::Usable,
     };
     // SAFETY: single-threaded boot path writes to the static buffer.
     unsafe {
-        core::ptr::addr_of_mut!(MEMORY_MAP).cast::<MemRegion>().write(region);
+        core::ptr::addr_of_mut!(MEMORY_MAP)
+            .cast::<MemRegion>()
+            .write(region);
         core::ptr::addr_of_mut!(MEMORY_MAP_LEN).write(1);
     }
     // SAFETY: slice refers to the static we just wrote.
     let regions = unsafe {
-        core::slice::from_raw_parts(
-            core::ptr::addr_of!(MEMORY_MAP).cast::<MemRegion>(),
-            1,
-        )
+        core::slice::from_raw_parts(core::ptr::addr_of!(MEMORY_MAP).cast::<MemRegion>(), 1)
     };
 
     // Locate the DTB. The bootloader-provided pointer is the
@@ -98,14 +99,14 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
         // SAFETY: dtb_phys came from the scan above + identity-
         // mapped 256 MiB virt RAM range.
         Some(p) => unsafe { scan_initramfs_chosen(p.raw()) },
-        None    => None,
+        None => None,
     };
 
     Ok(BootInfo {
         memory_map: regions,
-        cmdline:    CMDLINE,
-        uart_phys:  PhysAddr::new(PL011_QEMU_VIRT),
-        uart_virt:  VirtAddr::new(PL011_QEMU_VIRT),  // pre-MMU identity
+        cmdline: CMDLINE,
+        uart_phys: PhysAddr::new(PL011_QEMU_VIRT),
+        uart_virt: VirtAddr::new(PL011_QEMU_VIRT), // pre-MMU identity
         dtb_phys,
         acpi_rsdp_phys: None,
         initramfs,
@@ -114,10 +115,10 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
 
 /// FDT structure-block tokens (Devicetree Specification §5.4.1).
 const FDT_BEGIN_NODE: u32 = 0x0000_0001;
-const FDT_END_NODE:   u32 = 0x0000_0002;
-const FDT_PROP:       u32 = 0x0000_0003;
-const FDT_NOP:        u32 = 0x0000_0004;
-const FDT_END:        u32 = 0x0000_0009;
+const FDT_END_NODE: u32 = 0x0000_0002;
+const FDT_PROP: u32 = 0x0000_0003;
+const FDT_NOP: u32 = 0x0000_0004;
+const FDT_END: u32 = 0x0000_0009;
 
 /// Find the `/chosen` node in the DTB at `dtb_phys`, read
 /// `linux,initrd-start` and `linux,initrd-end`, return the
@@ -133,14 +134,16 @@ unsafe fn scan_initramfs_chosen(dtb_phys: u64) -> Option<MemRegion> {
     let read_be32 = |off: u64| -> u32 {
         unsafe { core::ptr::read_volatile((dtb_phys + off) as *const u32) }.to_be()
     };
-    if read_be32(0) != 0xd00d_feed { return None; }
-    let off_dt_struct  = read_be32(8) as u64;
+    if read_be32(0) != 0xd00d_feed {
+        return None;
+    }
+    let off_dt_struct = read_be32(8) as u64;
     let off_dt_strings = read_be32(12) as u64;
     let size_dt_struct = read_be32(36) as u64;
 
     let strings_base = dtb_phys + off_dt_strings;
     let mut p = dtb_phys + off_dt_struct;
-    let end  = p + size_dt_struct;
+    let end = p + size_dt_struct;
 
     // Track whether we're inside `/chosen`. The DTB always starts
     // with a single root node (`""`); we walk the immediate
@@ -165,7 +168,9 @@ unsafe fn scan_initramfs_chosen(dtb_phys: u64) -> Option<MemRegion> {
                     // SAFETY: bounds-checked.
                     let b = unsafe { core::ptr::read_volatile(p as *const u8) };
                     p += 1;
-                    if b == 0 { break; }
+                    if b == 0 {
+                        break;
+                    }
                     len += 1;
                 }
                 // Round up to 4-byte boundary.
@@ -173,9 +178,7 @@ unsafe fn scan_initramfs_chosen(dtb_phys: u64) -> Option<MemRegion> {
                 let pad = (4 - (consumed & 3)) & 3;
                 p += pad;
                 // SAFETY: name spans `len` bytes from name_start.
-                let name = unsafe {
-                    core::slice::from_raw_parts(name_start as *const u8, len)
-                };
+                let name = unsafe { core::slice::from_raw_parts(name_start as *const u8, len) };
                 if depth == 2 && name.starts_with(b"chosen") {
                     in_chosen = true;
                     chosen_depth = depth;
@@ -189,11 +192,15 @@ unsafe fn scan_initramfs_chosen(dtb_phys: u64) -> Option<MemRegion> {
                 depth -= 1;
             }
             FDT_PROP => {
-                if p + 8 > end { return None; }
-                let plen   = read_be32(p - dtb_phys) as u64;
+                if p + 8 > end {
+                    return None;
+                }
+                let plen = read_be32(p - dtb_phys) as u64;
                 let nameoff = read_be32(p - dtb_phys + 4) as u64;
                 p += 8;
-                if p + plen > end { return None; }
+                if p + plen > end {
+                    return None;
+                }
                 if in_chosen {
                     // Read property name from strings block.
                     let mut nlen = 0;
@@ -201,17 +208,19 @@ unsafe fn scan_initramfs_chosen(dtb_phys: u64) -> Option<MemRegion> {
                         // SAFETY: strings block is bounded by
                         // size_dt_strings; cap at 64 for safety.
                         let b = unsafe {
-                            core::ptr::read_volatile(
-                                (strings_base + nameoff + nlen) as *const u8)
+                            core::ptr::read_volatile((strings_base + nameoff + nlen) as *const u8)
                         };
-                        if b == 0 { break; }
+                        if b == 0 {
+                            break;
+                        }
                         nlen += 1;
                     }
                     // SAFETY: name spans nlen bytes.
                     let name = unsafe {
                         core::slice::from_raw_parts(
                             (strings_base + nameoff) as *const u8,
-                            nlen as usize)
+                            nlen as usize,
+                        )
                     };
                     let val = if plen == 4 {
                         Some(read_be32(p - dtb_phys) as u64)
@@ -219,10 +228,15 @@ unsafe fn scan_initramfs_chosen(dtb_phys: u64) -> Option<MemRegion> {
                         let hi = read_be32(p - dtb_phys) as u64;
                         let lo = read_be32(p - dtb_phys + 4) as u64;
                         Some((hi << 32) | lo)
-                    } else { None };
+                    } else {
+                        None
+                    };
                     if let Some(v) = val {
-                        if name == b"linux,initrd-start" { start = Some(v); }
-                        else if name == b"linux,initrd-end" { end_addr = Some(v); }
+                        if name == b"linux,initrd-start" {
+                            start = Some(v);
+                        } else if name == b"linux,initrd-end" {
+                            end_addr = Some(v);
+                        }
                     }
                 }
                 p += plen;
@@ -239,8 +253,8 @@ unsafe fn scan_initramfs_chosen(dtb_phys: u64) -> Option<MemRegion> {
     match (start, end_addr) {
         (Some(s), Some(e)) if e > s => Some(MemRegion {
             start: PhysAddr::new(s),
-            len:   e - s,
-            kind:  MemRegionKind::Reserved,
+            len: e - s,
+            kind: MemRegionKind::Reserved,
         }),
         _ => None,
     }
@@ -264,20 +278,24 @@ unsafe fn scan_for_dtb() -> Option<PhysAddr> {
     const DTB_LOAD_ADDR: u64 = 0x4F00_0000;
     // SAFETY: address is inside the lo_L1[1] Normal-mapped block.
     let v = unsafe { core::ptr::read_volatile(DTB_LOAD_ADDR as *const u32) }.to_be();
-    if v == 0xd00d_feed { return Some(PhysAddr::new(DTB_LOAD_ADDR)); }
+    if v == 0xd00d_feed {
+        return Some(PhysAddr::new(DTB_LOAD_ADDR));
+    }
 
     // Fallback: scan low RAM in case some other loader placed the
     // DTB elsewhere. virt has 256 MiB by default; the DTB is
     // typically near the top of RAM. Scan the full window in
     // 4-byte strides — bounded.
-    const RAM_BASE: u64    = 0x4000_0000;
-    const SCAN_LIMIT: u64  = 256 * 1024 * 1024;
+    const RAM_BASE: u64 = 0x4000_0000;
+    const SCAN_LIMIT: u64 = 256 * 1024 * 1024;
     let mut p = RAM_BASE;
-    let end   = RAM_BASE + SCAN_LIMIT;
+    let end = RAM_BASE + SCAN_LIMIT;
     while p + 4 <= end {
         // SAFETY: identity-mapped RAM; 4-byte read is aligned.
         let v = unsafe { core::ptr::read_volatile(p as *const u32) }.to_be();
-        if v == 0xd00d_feed { return Some(PhysAddr::new(p)); }
+        if v == 0xd00d_feed {
+            return Some(PhysAddr::new(p));
+        }
         p += 4;
     }
     None

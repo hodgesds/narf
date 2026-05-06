@@ -22,25 +22,25 @@
 
 pub const CQE_LEN: usize = 64;
 
-pub const CQE_OFF_BYTE_COUNT:  usize = 0x14;
-pub const CQE_OFF_STATUS:      usize = 0x37;
+pub const CQE_OFF_BYTE_COUNT: usize = 0x14;
+pub const CQE_OFF_STATUS: usize = 0x37;
 pub const CQE_OFF_WQE_COUNTER: usize = 0x38;
-pub const CQE_OFF_SIGNATURE:   usize = 0x3B;
-pub const CQE_OFF_QP_OP_OWN:   usize = 0x3C;
+pub const CQE_OFF_SIGNATURE: usize = 0x3B;
+pub const CQE_OFF_QP_OP_OWN: usize = 0x3C;
 
-pub const CQE_OWNER_BIT:  u8 = 1 << 0;
+pub const CQE_OWNER_BIT: u8 = 1 << 0;
 pub const CQE_OPCODE_MASK: u8 = 0xF0;
 
 /// CQE opcodes as published in PRM §16.3.3 Table 102.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CqeOpcode {
-    Requester        = 0x0,
+    Requester = 0x0,
     ResponderRdmaWrite = 0x1,
-    ResponderSend    = 0x2,
-    Resize           = 0x5,
-    NoOp             = 0xE,
-    Error            = 0xF,
+    ResponderSend = 0x2,
+    Resize = 0x5,
+    NoOp = 0xE,
+    Error = 0xF,
 }
 
 impl CqeOpcode {
@@ -51,7 +51,7 @@ impl CqeOpcode {
             0x2 => CqeOpcode::ResponderSend,
             0x5 => CqeOpcode::Resize,
             0xE => CqeOpcode::NoOp,
-            _   => CqeOpcode::Error,
+            _ => CqeOpcode::Error,
         }
     }
 }
@@ -95,12 +95,12 @@ impl CqeStatus {
 /// Decoded view over a CQE.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct CqeView {
-    pub byte_count:  u32,
-    pub status:      CqeStatus,
+    pub byte_count: u32,
+    pub status: CqeStatus,
     pub wqe_counter: u16,
-    pub qp_num:      u32,
-    pub opcode:      CqeOpcode,
-    pub owner:       bool,
+    pub qp_num: u32,
+    pub opcode: CqeOpcode,
+    pub owner: bool,
 }
 
 /// True if HW still owns the CQE (firmware has not posted a
@@ -118,10 +118,7 @@ pub fn decode_cqe(cqe: &[u8; CQE_LEN]) -> CqeView {
         cqe[CQE_OFF_BYTE_COUNT + 3],
     ]);
     let status = CqeStatus::from_raw(cqe[CQE_OFF_STATUS]);
-    let wqe_counter = u16::from_be_bytes([
-        cqe[CQE_OFF_WQE_COUNTER],
-        cqe[CQE_OFF_WQE_COUNTER + 1],
-    ]);
+    let wqe_counter = u16::from_be_bytes([cqe[CQE_OFF_WQE_COUNTER], cqe[CQE_OFF_WQE_COUNTER + 1]]);
     let qp_op_own = u32::from_be_bytes([
         cqe[CQE_OFF_QP_OP_OWN],
         cqe[CQE_OFF_QP_OP_OWN + 1],
@@ -130,27 +127,29 @@ pub fn decode_cqe(cqe: &[u8; CQE_LEN]) -> CqeView {
     ]);
     let qp_num = (qp_op_own >> 8) & 0x00FF_FFFF;
     let opcode = CqeOpcode::from_raw(((qp_op_own >> 4) as u8) & 0x0F);
-    let owner  = (qp_op_own as u8 & CQE_OWNER_BIT) != 0;
-    CqeView { byte_count, status, wqe_counter, qp_num, opcode, owner }
+    let owner = (qp_op_own as u8 & CQE_OWNER_BIT) != 0;
+    CqeView {
+        byte_count,
+        status,
+        wqe_counter,
+        qp_num,
+        opcode,
+        owner,
+    }
 }
 
 /// Test-harness helper: write a synthetic completed CQE in place.
 pub fn simulate_completion(
-    cqe:         &mut [u8; CQE_LEN],
-    byte_count:  u32,
-    raw_status:  u8,
+    cqe: &mut [u8; CQE_LEN],
+    byte_count: u32,
+    raw_status: u8,
     wqe_counter: u16,
-    qp_num:      u32,
-    opcode:      CqeOpcode,
+    qp_num: u32,
+    opcode: CqeOpcode,
 ) {
-    cqe[CQE_OFF_BYTE_COUNT..CQE_OFF_BYTE_COUNT + 4]
-        .copy_from_slice(&byte_count.to_be_bytes());
+    cqe[CQE_OFF_BYTE_COUNT..CQE_OFF_BYTE_COUNT + 4].copy_from_slice(&byte_count.to_be_bytes());
     cqe[CQE_OFF_STATUS] = raw_status;
-    cqe[CQE_OFF_WQE_COUNTER..CQE_OFF_WQE_COUNTER + 2]
-        .copy_from_slice(&wqe_counter.to_be_bytes());
-    let qp_op_own =
-        ((qp_num & 0x00FF_FFFF) << 8)
-        | ((opcode as u32) << 4);  // owner bit is 0 (SW-owned / completed)
-    cqe[CQE_OFF_QP_OP_OWN..CQE_OFF_QP_OP_OWN + 4]
-        .copy_from_slice(&qp_op_own.to_be_bytes());
+    cqe[CQE_OFF_WQE_COUNTER..CQE_OFF_WQE_COUNTER + 2].copy_from_slice(&wqe_counter.to_be_bytes());
+    let qp_op_own = ((qp_num & 0x00FF_FFFF) << 8) | ((opcode as u32) << 4); // owner bit is 0 (SW-owned / completed)
+    cqe[CQE_OFF_QP_OP_OWN..CQE_OFF_QP_OP_OWN + 4].copy_from_slice(&qp_op_own.to_be_bytes());
 }

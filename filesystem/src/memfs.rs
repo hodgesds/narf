@@ -29,9 +29,7 @@ use core::fmt;
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::{
-    DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat,
-};
+use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat};
 
 /// In-memory file: a length-tracked byte buffer behind a lock.
 struct MemFile {
@@ -44,7 +42,9 @@ struct MemFile {
 /// anonymous fd can back a real `MemFile` without occupying a
 /// VFS path.
 pub fn new_anon_file() -> Arc<dyn FileOps> {
-    Arc::new(MemFile { bytes: IrqSafeSpinLock::new(Vec::new()) })
+    Arc::new(MemFile {
+        bytes: IrqSafeSpinLock::new(Vec::new()),
+    })
 }
 
 impl fmt::Debug for MemFile {
@@ -86,9 +86,9 @@ impl FileOps for MemFile {
     fn stat(&self) -> Stat {
         let g = self.bytes.lock();
         Stat {
-            size:         g.len() as u64,
-            blocks:       (g.len() as u64).div_ceil(512),
-            mode:         Mode::FILE_RW,
+            size: g.len() as u64,
+            blocks: (g.len() as u64).div_ceil(512),
+            mode: Mode::FILE_RW,
             mtime_cycles: 0,
         }
     }
@@ -141,9 +141,12 @@ impl FileOps for MemSymlink {
 
     fn stat(&self) -> Stat {
         Stat {
-            size:         self.target.len() as u64,
-            blocks:       1,
-            mode:         Mode { file_type: FileType::Symlink, perms: 0o777 },
+            size: self.target.len() as u64,
+            blocks: 1,
+            mode: Mode {
+                file_type: FileType::Symlink,
+                perms: 0o777,
+            },
             mtime_cycles: 0,
         }
     }
@@ -179,22 +182,22 @@ impl DirOps for MemDir {
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         let g = self.entries.lock();
         match g.get(name)? {
-            Entry::File(f)    => Some(Arc::clone(f) as Arc<dyn FileOps>),
+            Entry::File(f) => Some(Arc::clone(f) as Arc<dyn FileOps>),
             Entry::Symlink(s) => Some(Arc::clone(s) as Arc<dyn FileOps>),
-            Entry::Dir(_)     => None,
+            Entry::Dir(_) => None,
         }
     }
 
     fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
         let g = self.entries.lock();
         match g.get(name)? {
-            Entry::Dir(d)      => Some(Arc::clone(d) as Arc<dyn DirOps>),
-            Entry::File(_)     => None,
+            Entry::Dir(d) => Some(Arc::clone(d) as Arc<dyn DirOps>),
+            Entry::File(_) => None,
             // Symlinks are never auto-traversed: `readlink`-style
             // callers want the target bytes via `lookup`, not a
             // resolved DirOps. Path resolution that wants to follow
             // a symlink chain must do so explicitly.
-            Entry::Symlink(_)  => None,
+            Entry::Symlink(_) => None,
         }
     }
 
@@ -213,8 +216,8 @@ impl DirOps for MemDir {
             .take(max)
             .map(|(name, entry)| {
                 let ft = match entry {
-                    Entry::File(_)    => FileType::File,
-                    Entry::Dir(_)     => FileType::Dir,
+                    Entry::File(_) => FileType::File,
+                    Entry::Dir(_) => FileType::Dir,
                     Entry::Symlink(_) => FileType::Symlink,
                 };
                 (name.clone(), ft)
@@ -225,10 +228,9 @@ impl DirOps for MemDir {
     fn unlink(&self, name: &str) -> Result<(), FsError> {
         let mut g = self.entries.lock();
         match g.get(name) {
-            None                      => Err(FsError::NotFound),
-            Some(Entry::Dir(_))       => Err(FsError::InvalidPath),
-            Some(Entry::File(_))
-            | Some(Entry::Symlink(_)) => {
+            None => Err(FsError::NotFound),
+            Some(Entry::Dir(_)) => Err(FsError::InvalidPath),
+            Some(Entry::File(_)) | Some(Entry::Symlink(_)) => {
                 g.remove(name);
                 Ok(())
             }
@@ -262,10 +264,10 @@ impl DirOps for MemDir {
     fn rmdir(&self, name: &str) -> Result<(), FsError> {
         let mut g = self.entries.lock();
         match g.get(name) {
-            None                      => Err(FsError::NotFound),
-            Some(Entry::File(_))      => Err(FsError::InvalidPath),
-            Some(Entry::Symlink(_))   => Err(FsError::InvalidPath),
-            Some(Entry::Dir(d))       => {
+            None => Err(FsError::NotFound),
+            Some(Entry::File(_)) => Err(FsError::InvalidPath),
+            Some(Entry::Symlink(_)) => Err(FsError::InvalidPath),
+            Some(Entry::Dir(d)) => {
                 if !d.entries.lock().is_empty() {
                     return Err(FsError::Busy);
                 }
@@ -280,7 +282,9 @@ impl DirOps for MemDir {
         if g.contains_key(name) {
             return Err(FsError::Busy);
         }
-        let s = Arc::new(MemSymlink { target: target.to_string() });
+        let s = Arc::new(MemSymlink {
+            target: target.to_string(),
+        });
         g.insert(name.to_string(), Entry::Symlink(Arc::clone(&s)));
         Ok(s as Arc<dyn FileOps>)
     }
@@ -355,5 +359,7 @@ impl FsInstance for MemFs {
     fn root(&self) -> Arc<dyn DirOps> {
         Arc::clone(&self.root) as Arc<dyn DirOps>
     }
-    fn name(&self) -> &str { self.name }
+    fn name(&self) -> &str {
+        self.name
+    }
 }

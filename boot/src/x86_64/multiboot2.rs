@@ -42,24 +42,24 @@ pub const MAGIC: u32 = 0x336e_c578;
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct HvmStartInfo {
-    magic:          u32,
-    _version:       u32,
-    _flags:         u32,
-    _nr_modules:    u32,
-    _modlist:       u64,
-    _cmdline:       u64,
-    rsdp_paddr:     u64,
-    memmap_paddr:   u64,
+    magic: u32,
+    _version: u32,
+    _flags: u32,
+    _nr_modules: u32,
+    _modlist: u64,
+    _cmdline: u64,
+    rsdp_paddr: u64,
+    memmap_paddr: u64,
     memmap_entries: u32,
-    _reserved:      u32,
+    _reserved: u32,
 }
 
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct MemmapEntry {
-    addr:      u64,
-    size:      u64,
-    ty:        u32,
+    addr: u64,
+    size: u64,
+    ty: u32,
     _reserved: u32,
 }
 
@@ -83,8 +83,11 @@ pub unsafe fn is_hvm_start_info(payload: PhysAddr) -> bool {
 pub unsafe fn rsdp_phys(info_ptr: usize) -> Option<u64> {
     // SAFETY: caller-provided pointer to a valid PVH header.
     let hdr = unsafe { (info_ptr as *const HvmStartInfo).read_unaligned() };
-    if hdr.magic != MAGIC || hdr.rsdp_paddr == 0 { None }
-    else { Some(hdr.rsdp_paddr) }
+    if hdr.magic != MAGIC || hdr.rsdp_paddr == 0 {
+        None
+    } else {
+        Some(hdr.rsdp_paddr)
+    }
 }
 
 /// Walk the PVH `hvm_start_info` module-list and return the
@@ -118,14 +121,13 @@ pub unsafe fn initramfs_module(info_ptr: usize) -> Option<(u64, u64)> {
     }
     let n = hdr._nr_modules as usize;
     for i in 0..n {
-        let entry_ptr = hdr._modlist as usize
-            + i * core::mem::size_of::<HvmModlistEntry>();
+        let entry_ptr = hdr._modlist as usize + i * core::mem::size_of::<HvmModlistEntry>();
         // SAFETY: bootloader contract guarantees `n` valid
         // entries at `modlist_paddr`.
-        let e = unsafe {
-            (entry_ptr as *const HvmModlistEntry).read_unaligned()
-        };
-        if e.cmdline_paddr == 0 { continue; }
+        let e = unsafe { (entry_ptr as *const HvmModlistEntry).read_unaligned() };
+        if e.cmdline_paddr == 0 {
+            continue;
+        }
         // SAFETY: cmdline is a NUL-terminated ASCII string at
         // `cmdline_paddr` per the PVH spec. We bound the scan at
         // 256 bytes; "initramfs" fits in 9 + NUL.
@@ -149,7 +151,9 @@ unsafe fn read_cstr<'a>(phys: usize, max: usize) -> &'a [u8] {
     while len < max {
         // SAFETY: caller-asserted readability.
         let b = unsafe { ((phys + len) as *const u8).read_volatile() };
-        if b == 0 { break; }
+        if b == 0 {
+            break;
+        }
         len += 1;
     }
     // SAFETY: same readability contract; len ≤ max.
@@ -159,10 +163,10 @@ unsafe fn read_cstr<'a>(phys: usize, max: usize) -> &'a [u8] {
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct HvmModlistEntry {
-    paddr:         u64,
-    size:          u64,
+    paddr: u64,
+    size: u64,
     cmdline_paddr: u64,
-    _reserved:     u64,
+    _reserved: u64,
 }
 
 /// Walk the `hvm_start_info` at `info_ptr`, writing up to `out_cap` parsed
@@ -171,18 +175,14 @@ struct HvmModlistEntry {
 /// # Safety
 /// - `info_ptr` must point at a valid `hvm_start_info`.
 /// - `out` must be writable for `out_cap` `MemRegion` entries.
-pub unsafe fn parse_memory_map(
-    info_ptr: usize,
-    out:      *mut MemRegion,
-    out_cap:  usize,
-) -> usize {
+pub unsafe fn parse_memory_map(info_ptr: usize, out: *mut MemRegion, out_cap: usize) -> usize {
     // SAFETY: caller guarantees a valid hvm_start_info at info_ptr.
     let hdr = unsafe { (info_ptr as *const HvmStartInfo).read_unaligned() };
     if hdr.magic != MAGIC || out_cap == 0 {
         return 0;
     }
     let count = (hdr.memmap_entries as usize).min(out_cap);
-    let base  = hdr.memmap_paddr as usize;
+    let base = hdr.memmap_paddr as usize;
 
     for i in 0..count {
         let entry_ptr = base + i * core::mem::size_of::<MemmapEntry>();
@@ -199,7 +199,7 @@ pub unsafe fn parse_memory_map(
         unsafe {
             out.add(i).write(MemRegion {
                 start: PhysAddr::new(e.addr),
-                len:   e.size,
+                len: e.size,
                 kind,
             });
         }

@@ -56,7 +56,9 @@ pub enum PcieCapError {
 }
 
 impl From<CapError> for PcieCapError {
-    fn from(_: CapError) -> Self { PcieCapError::AuthorityRevoked }
+    fn from(_: CapError) -> Self {
+        PcieCapError::AuthorityRevoked
+    }
 }
 
 /// Decoded snapshot of the PCI Express capability registers we care
@@ -65,15 +67,15 @@ impl From<CapError> for PcieCapError {
 #[derive(Copy, Clone, Debug)]
 pub struct PcieStatus {
     /// `Device Capabilities` register (RO).
-    pub device_caps:    u32,
+    pub device_caps: u32,
     /// `Device Control` register (RW).
     pub device_control: u16,
     /// `Device Status` register (RW1C).
-    pub device_status:  u16,
+    pub device_status: u16,
     /// `Link Capabilities` register (RO).
-    pub link_caps:      u32,
+    pub link_caps: u32,
     /// `Link Status` register.
-    pub link_status:    u16,
+    pub link_status: u16,
 }
 
 impl PcieStatus {
@@ -96,7 +98,9 @@ impl PcieStatus {
 
     /// Negotiated link speed — Link Status bits[3:0]. 1 = 2.5 GT/s,
     /// 2 = 5.0 GT/s, 3 = 8 GT/s, 4 = 16 GT/s, 5 = 32 GT/s.
-    pub fn link_speed(&self) -> u8 { (self.link_status & 0xF) as u8 }
+    pub fn link_speed(&self) -> u8 {
+        (self.link_status & 0xF) as u8
+    }
 
     /// Negotiated link width — Link Status bits[9:4].
     pub fn link_width(&self) -> u8 {
@@ -108,7 +112,7 @@ impl PcieStatus {
 ///
 /// Cap-gated on `Cap<BusDeviceCap, Read>`.
 pub fn read_status(
-    cap:    &Cap<BusDeviceCap, Read>,
+    cap: &Cap<BusDeviceCap, Read>,
     device: &BusDevice,
 ) -> Result<PcieStatus, PcieCapError> {
     cap.check_live()?;
@@ -120,11 +124,11 @@ pub fn read_status(
     // SAFETY: off + 0x14 < 0x100 by spec; identity-mapped MMIO.
     Ok(unsafe {
         PcieStatus {
-            device_caps:    cfg_read32(cfg_phys, off + 0x4),
+            device_caps: cfg_read32(cfg_phys, off + 0x4),
             device_control: cfg_read16(cfg_phys, off + 0x8),
-            device_status:  cfg_read16(cfg_phys, off + 0xA),
-            link_caps:      cfg_read32(cfg_phys, off + 0xC),
-            link_status:    cfg_read16(cfg_phys, off + 0x12),
+            device_status: cfg_read16(cfg_phys, off + 0xA),
+            link_caps: cfg_read32(cfg_phys, off + 0xC),
+            link_status: cfg_read16(cfg_phys, off + 0x12),
         }
     })
 }
@@ -135,8 +139,8 @@ pub fn read_status(
 /// `or_bits` is OR'd in — pass `0` if all you want is the read-back.
 /// Returns the post-write Device Control value.
 pub fn set_device_control(
-    cap:     &Cap<BusDeviceCap, Write>,
-    device:  &BusDevice,
+    cap: &Cap<BusDeviceCap, Write>,
+    device: &BusDevice,
     or_bits: u16,
 ) -> Result<u16, PcieCapError> {
     cap.check_live()?;
@@ -149,7 +153,9 @@ pub fn set_device_control(
     let cur = unsafe { cfg_read16(cfg_phys, off + 0x8) };
     let new = cur | or_bits;
     // SAFETY: same window.
-    unsafe { cfg_write16(cfg_phys, off + 0x8, new); }
+    unsafe {
+        cfg_write16(cfg_phys, off + 0x8, new);
+    }
     Ok(new)
 }
 
@@ -169,7 +175,7 @@ pub fn set_device_control(
 /// device state; an `Invoke`-only cap split is a follow-up once the
 /// rights system grows the relevant lattice rule.
 pub fn function_level_reset(
-    cap:    &Cap<BusDeviceCap, Write>,
+    cap: &Cap<BusDeviceCap, Write>,
     device: &BusDevice,
 ) -> Result<(), PcieCapError> {
     cap.check_live()?;
@@ -178,7 +184,9 @@ pub fn function_level_reset(
     // Derive a Read cap for the snapshot read.
     let read_cap: Cap<BusDeviceCap, Read> = cap.derive()?;
     let snap = read_status(&read_cap, device)?;
-    if !snap.flr_supported() { return Err(PcieCapError::FlrUnsupported); }
+    if !snap.flr_supported() {
+        return Err(PcieCapError::FlrUnsupported);
+    }
 
     // 3. Set DevCtl.InitiateFLR (bit 15).
     let _ = set_device_control(cap, device, 1 << 15)?;
@@ -189,7 +197,7 @@ pub fn function_level_reset(
     // wall-clock is calibrated by `narf_time::Instant` in callers
     // that have it; this fallback is a coarse busy-wait.
     let start = narf_time::Instant::now();
-    let target_cycles = 200_000_000u64;  // ~200 ms at 1 GHz; over-budget by design
+    let target_cycles = 200_000_000u64; // ~200 ms at 1 GHz; over-budget by design
     while start.cycles_since(narf_time::Instant::now()) < target_cycles {
         // After the spec-mandated wait, a pingback read of Vendor ID
         // returning != 0xFFFF means the function is back. Polling
@@ -197,7 +205,9 @@ pub fn function_level_reset(
         let cfg_phys = pcie_cfg_phys(device)?;
         // SAFETY: identity-mapped MMIO; offset 0x00 = Vendor ID.
         let vid = unsafe { cfg_read16(cfg_phys, 0x00) };
-        if vid != 0xFFFF { return Ok(()); }
+        if vid != 0xFFFF {
+            return Ok(());
+        }
         core::hint::spin_loop();
     }
     Err(PcieCapError::FlrTimeout)
@@ -207,7 +217,7 @@ pub fn function_level_reset(
 fn pcie_cfg_phys(device: &BusDevice) -> Result<PhysAddr, PcieCapError> {
     match device.kind {
         BusKind::Pcie { cfg_phys, .. } => Ok(cfg_phys),
-        BusKind::VirtioMmio { .. }     => Err(PcieCapError::NotPcie),
+        BusKind::VirtioMmio { .. } => Err(PcieCapError::NotPcie),
     }
 }
 
@@ -235,6 +245,8 @@ unsafe fn cfg_read32(cfg: PhysAddr, off: u64) -> u32 {
 unsafe fn cfg_write16(cfg: PhysAddr, off: u64, value: u16) {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: caller asserts the slot is writable + aligned.
-    unsafe { core::ptr::write_volatile((cfg.raw() + off) as *mut u16, value); }
+    unsafe {
+        core::ptr::write_volatile((cfg.raw() + off) as *mut u16, value);
+    }
     compiler_fence(Ordering::SeqCst);
 }

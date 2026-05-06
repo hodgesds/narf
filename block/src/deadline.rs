@@ -40,7 +40,7 @@ impl Lane {
     pub fn of(op: BlockOp) -> Self {
         match op {
             BlockOp::Read => Lane::Read,
-            _             => Lane::Write,
+            _ => Lane::Write,
         }
     }
 }
@@ -51,7 +51,7 @@ impl Lane {
 /// if its lane isn't due.
 #[derive(Debug)]
 struct Entry {
-    req:      BlockRequest,
+    req: BlockRequest,
     deadline: u64,
 }
 
@@ -67,23 +67,23 @@ pub struct DeadlineScheduler {
 
 #[derive(Debug)]
 struct Inner {
-    read:               VecDeque<Entry>,
-    write:              VecDeque<Entry>,
-    consecutive_reads:  u32,
+    read: VecDeque<Entry>,
+    write: VecDeque<Entry>,
+    consecutive_reads: u32,
     /// Monotonic tag assigned to each enqueue; exposed by the
     /// scheduler because callers (test harness, the block/ backend)
     /// want to correlate dequeued requests with earlier submissions.
-    next_tag:           u64,
+    next_tag: u64,
 }
 
 impl DeadlineScheduler {
     pub const fn new() -> Self {
         Self {
             inner: IrqSafeSpinLock::new(Inner {
-                read:               VecDeque::new(),
-                write:              VecDeque::new(),
-                consecutive_reads:  0,
-                next_tag:           1,
+                read: VecDeque::new(),
+                write: VecDeque::new(),
+                consecutive_reads: 0,
+                next_tag: 1,
             }),
         }
     }
@@ -96,9 +96,12 @@ impl DeadlineScheduler {
         let tag = g.next_tag;
         g.next_tag = g.next_tag.saturating_add(1);
         let lane = Lane::of(req.op);
-        let entry = Entry { req, deadline: deadline_cycles };
+        let entry = Entry {
+            req,
+            deadline: deadline_cycles,
+        };
         match lane {
-            Lane::Read  => g.read.push_back(entry),
+            Lane::Read => g.read.push_back(entry),
             Lane::Write => g.write.push_back(entry),
         }
         tag
@@ -117,7 +120,7 @@ impl DeadlineScheduler {
         // Deadline-promotion: oldest-past-due first.
         if let Some(lane) = Self::find_expired_lane(&g, now_cycles) {
             let entry = match lane {
-                Lane::Read  => g.read.pop_front()?,
+                Lane::Read => g.read.pop_front()?,
                 Lane::Write => g.write.pop_front()?,
             };
             if lane == Lane::Read {
@@ -155,13 +158,19 @@ impl DeadlineScheduler {
     }
 
     /// `true` iff no requests are pending.
-    pub fn is_empty(&self) -> bool { self.len() == 0 }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 
     /// Count of pending reads.
-    pub fn reads_pending(&self) -> usize { self.inner.lock().read.len() }
+    pub fn reads_pending(&self) -> usize {
+        self.inner.lock().read.len()
+    }
 
     /// Count of pending writes.
-    pub fn writes_pending(&self) -> usize { self.inner.lock().write.len() }
+    pub fn writes_pending(&self) -> usize {
+        self.inner.lock().write.len()
+    }
 
     fn find_expired_lane(g: &Inner, now: u64) -> Option<Lane> {
         // Check head-of-line on each lane — deadlines land in FIFO
@@ -170,19 +179,25 @@ impl DeadlineScheduler {
         let rd_exp = g.read.front().map(|e| e.deadline <= now).unwrap_or(false);
         let wr_exp = g.write.front().map(|e| e.deadline <= now).unwrap_or(false);
         match (rd_exp, wr_exp) {
-            (true,  true)  => {
+            (true, true) => {
                 // Older head wins.
                 let rd = g.read.front().unwrap().deadline;
                 let wr = g.write.front().unwrap().deadline;
-                if rd <= wr { Some(Lane::Read) } else { Some(Lane::Write) }
+                if rd <= wr {
+                    Some(Lane::Read)
+                } else {
+                    Some(Lane::Write)
+                }
             }
-            (true,  false) => Some(Lane::Read),
-            (false, true)  => Some(Lane::Write),
-            _              => None,
+            (true, false) => Some(Lane::Read),
+            (false, true) => Some(Lane::Write),
+            _ => None,
         }
     }
 }
 
 impl Default for DeadlineScheduler {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

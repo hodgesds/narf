@@ -15,19 +15,27 @@ use crate::x86_64::cpuid::cpuid;
 fn ecx_7_0() -> u32 {
     // SAFETY: leaf 0 always defined.
     let max = unsafe { cpuid(0, 0).0 };
-    if max < 7 { return 0; }
+    if max < 7 {
+        return 0;
+    }
     // SAFETY: leaf 7 valid.
     unsafe { cpuid(7, 0).2 }
 }
 
 /// `true` iff CPUID(7, 0).ECX[25] is set.
-pub fn cldemote_supported() -> bool { ecx_7_0() & (1 << 25) != 0 }
+pub fn cldemote_supported() -> bool {
+    ecx_7_0() & (1 << 25) != 0
+}
 
 /// `true` iff CPUID(7, 0).ECX[27] is set.
-pub fn movdiri_supported() -> bool { ecx_7_0() & (1 << 27) != 0 }
+pub fn movdiri_supported() -> bool {
+    ecx_7_0() & (1 << 27) != 0
+}
 
 /// `true` iff CPUID(7, 0).ECX[28] is set.
-pub fn movdir64b_supported() -> bool { ecx_7_0() & (1 << 28) != 0 }
+pub fn movdir64b_supported() -> bool {
+    ecx_7_0() & (1 << 28) != 0
+}
 
 /// Demote the line containing `addr` toward LLC. Encodes as a
 /// hint — silent no-op on CPUs that don't recognise it, so this

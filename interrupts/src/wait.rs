@@ -35,7 +35,7 @@ pub fn wait_for_irq(vector: u8) -> WaitForIrq {
 /// Future returned by [`wait_for_irq`].
 #[derive(Debug)]
 pub struct WaitForIrq {
-    vector:   u8,
+    vector: u8,
     baseline: u64,
 }
 
@@ -44,7 +44,9 @@ impl Future for WaitForIrq {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u64> {
         let now = fire_count(self.vector);
-        if now > self.baseline { return Poll::Ready(now); }
+        if now > self.baseline {
+            return Poll::Ready(now);
+        }
         // Install the waker before the second read. If an IRQ fires
         // between the two reads, it'll either: (a) take the waker we
         // just installed and wake us — we'll be re-polled and the
@@ -53,7 +55,11 @@ impl Future for WaitForIrq {
         // count and we return Ready immediately.
         set_waker(self.vector, cx.waker().clone());
         let now = fire_count(self.vector);
-        if now > self.baseline { Poll::Ready(now) } else { Poll::Pending }
+        if now > self.baseline {
+            Poll::Ready(now)
+        } else {
+            Poll::Pending
+        }
     }
 }
 

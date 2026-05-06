@@ -144,14 +144,20 @@ mod tests {
     }
 
     #[test]
-    fn assert_tcb_passes_in_host_tests() { assert_tcb!(); }
+    fn assert_tcb_passes_in_host_tests() {
+        assert_tcb!();
+    }
 
     #[test]
     #[should_panic(expected = "bug in domain 0: forced")]
-    fn bug_on_triggers_with_domain_tag() { bug_on!(true, "forced"); }
+    fn bug_on_triggers_with_domain_tag() {
+        bug_on!(true, "forced");
+    }
 
     #[test]
-    fn bug_on_false_is_silent() { bug_on!(false, "should not fire"); }
+    fn bug_on_false_is_silent() {
+        bug_on!(false, "should not fire");
+    }
 
     #[test]
     #[should_panic(expected = "domain assertion failed: expected 1, observed 0")]

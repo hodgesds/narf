@@ -34,17 +34,17 @@
 use crate::x86_64::io_port::{inb, outb};
 
 const RTC_INDEX: u16 = 0x70;
-const RTC_DATA:  u16 = 0x71;
+const RTC_DATA: u16 = 0x71;
 
-const REG_SECONDS:  u8 = 0x00;
-const REG_MINUTES:  u8 = 0x02;
-const REG_HOURS:    u8 = 0x04;
-const REG_DAY:      u8 = 0x07;
-const REG_MONTH:    u8 = 0x08;
-const REG_YEAR:     u8 = 0x09;
+const REG_SECONDS: u8 = 0x00;
+const REG_MINUTES: u8 = 0x02;
+const REG_HOURS: u8 = 0x04;
+const REG_DAY: u8 = 0x07;
+const REG_MONTH: u8 = 0x08;
+const REG_YEAR: u8 = 0x09;
 const REG_STATUS_A: u8 = 0x0A;
 const REG_STATUS_B: u8 = 0x0B;
-const REG_CENTURY:  u8 = 0x32;
+const REG_CENTURY: u8 = 0x32;
 
 const STATUS_A_UIP: u8 = 1 << 7;
 const STATUS_B_24H: u8 = 1 << 1;
@@ -55,12 +55,12 @@ const STATUS_B_BIN: u8 = 1 << 2;
 /// platform exposes the 0x32 century byte).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct WallTime {
-    pub year:    u16,
-    pub month:   u8,
-    pub day:     u8,
-    pub hour:    u8,
-    pub minute:  u8,
-    pub second:  u8,
+    pub year: u16,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
 }
 
 unsafe fn read_index(idx: u8) -> u8 {
@@ -71,7 +71,9 @@ unsafe fn read_index(idx: u8) -> u8 {
     }
 }
 
-fn from_bcd(v: u8) -> u8 { (v >> 4) * 10 + (v & 0x0F) }
+fn from_bcd(v: u8) -> u8 {
+    (v >> 4) * 10 + (v & 0x0F)
+}
 
 /// Read the current wall-clock time from CMOS. Polls Status A
 /// until UIP clears, reads the field set, returns a decoded
@@ -85,40 +87,56 @@ pub unsafe fn read_now() -> WallTime {
     for _ in 0..1_000_000u32 {
         // SAFETY: caller-asserted.
         let s = unsafe { read_index(REG_STATUS_A) };
-        if s & STATUS_A_UIP == 0 { break; }
+        if s & STATUS_A_UIP == 0 {
+            break;
+        }
         core::hint::spin_loop();
     }
     // SAFETY: caller-asserted.
     let status_b = unsafe { read_index(REG_STATUS_B) };
-    let binary   = status_b & STATUS_B_BIN != 0;
-    let h24      = status_b & STATUS_B_24H != 0;
-    let conv     = |v: u8| -> u8 { if binary { v } else { from_bcd(v) } };
+    let binary = status_b & STATUS_B_BIN != 0;
+    let h24 = status_b & STATUS_B_24H != 0;
+    let conv = |v: u8| -> u8 {
+        if binary {
+            v
+        } else {
+            from_bcd(v)
+        }
+    };
 
     // SAFETY: same.
-    let mut sec  = unsafe { read_index(REG_SECONDS) };
+    let mut sec = unsafe { read_index(REG_SECONDS) };
     // SAFETY: same.
-    let mut min  = unsafe { read_index(REG_MINUTES) };
+    let mut min = unsafe { read_index(REG_MINUTES) };
     // SAFETY: same.
-    let mut hr   = unsafe { read_index(REG_HOURS) };
+    let mut hr = unsafe { read_index(REG_HOURS) };
     // SAFETY: same.
-    let mut dom  = unsafe { read_index(REG_DAY) };
+    let mut dom = unsafe { read_index(REG_DAY) };
     // SAFETY: same.
-    let mut mon  = unsafe { read_index(REG_MONTH) };
+    let mut mon = unsafe { read_index(REG_MONTH) };
     // SAFETY: same.
-    let mut yr   = unsafe { read_index(REG_YEAR) };
+    let mut yr = unsafe { read_index(REG_YEAR) };
     // SAFETY: same — century may not be wired (returns junk on
     // some chipsets; FADT century_index disambiguates).
-    let cent     = unsafe { read_index(REG_CENTURY) };
+    let cent = unsafe { read_index(REG_CENTURY) };
 
     // 12-hour format: bit 7 = PM. Convert before BCD decode.
     let pm = !h24 && (hr & 0x80 != 0);
     hr &= 0x7F;
 
-    sec = conv(sec); min = conv(min); hr = conv(hr);
-    dom = conv(dom); mon = conv(mon); yr  = conv(yr);
+    sec = conv(sec);
+    min = conv(min);
+    hr = conv(hr);
+    dom = conv(dom);
+    mon = conv(mon);
+    yr = conv(yr);
 
-    if pm && hr < 12 { hr += 12; }
-    if !pm && !h24 && hr == 12 { hr = 0; }
+    if pm && hr < 12 {
+        hr += 12;
+    }
+    if !pm && !h24 && hr == 12 {
+        hr = 0;
+    }
 
     let cent = conv(cent);
     let full_year: u16 = if cent >= 19 && cent <= 21 {
@@ -130,8 +148,12 @@ pub unsafe fn read_now() -> WallTime {
         2000u16 + yr as u16
     };
     WallTime {
-        year: full_year, month: mon, day: dom,
-        hour: hr, minute: min, second: sec,
+        year: full_year,
+        month: mon,
+        day: dom,
+        hour: hr,
+        minute: min,
+        second: sec,
     }
 }
 
@@ -142,9 +164,8 @@ pub fn to_unix_seconds(t: WallTime) -> i64 {
     fn is_leap(y: u16) -> bool {
         (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
     }
-    const DAYS_BEFORE_MONTH: [u32; 13] = [
-        0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334, 365,
-    ];
+    const DAYS_BEFORE_MONTH: [u32; 13] =
+        [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334, 365];
     let y = t.year as i64;
     // Days from epoch to start of year `y`.
     let mut days: i64 = 0;
@@ -152,7 +173,9 @@ pub fn to_unix_seconds(t: WallTime) -> i64 {
         days += if is_leap(yy) { 366 } else { 365 };
     }
     let mut mon_days = DAYS_BEFORE_MONTH[(t.month - 1).min(12) as usize] as i64;
-    if t.month > 2 && is_leap(t.year) { mon_days += 1; }
+    if t.month > 2 && is_leap(t.year) {
+        mon_days += 1;
+    }
     days += mon_days + (t.day as i64 - 1);
     let _ = y;
     days * 86_400 + t.hour as i64 * 3600 + t.minute as i64 * 60 + t.second as i64

@@ -25,24 +25,24 @@ use crate::{BlobIdentity, BlobSource, BlobView, FirmwareBlob, FirmwareError};
 #[derive(Debug)]
 pub struct Entry {
     /// Canonical name; used as the lookup key.
-    pub name:     &'static str,
+    pub name: &'static str,
     /// SHA-256 of the payload (everything before the trailer).
-    pub sha256:   [u8; 32],
+    pub sha256: [u8; 32],
     /// Ed25519 signer fingerprint; `None` on unsigned blobs.
-    pub signer:   Option<[u8; 32]>,
+    pub signer: Option<[u8; 32]>,
     /// Vendor-supplied version string, if present.
-    pub version:  Option<String>,
+    pub version: Option<String>,
     /// Source priority tier this entry was registered under.
-    pub source:   BlobSource,
+    pub source: BlobSource,
     /// Per-entry sequence number; caps issued against this entry
     /// stash this so a `view()` call can find the entry without
     /// the registry holding a strong slot index.
-    pub seq:      usize,
+    pub seq: usize,
     /// DMA-coherent backing for the payload bytes.
-    backing:      Arc<DmaBuffer>,
+    backing: Arc<DmaBuffer>,
     /// Length of the payload (smaller than `backing.len()` because
     /// the backing is page-aligned).
-    payload_len:  usize,
+    payload_len: usize,
 }
 
 /// One slot in the issued-cap → entry routing table. Keeps a
@@ -50,17 +50,17 @@ pub struct Entry {
 /// produce a slice even mid-revocation race.
 #[derive(Clone, Debug)]
 struct CapBinding {
-    seq:     usize,
-    name:    &'static str,
-    sha256:  [u8; 32],
-    signer:  Option<[u8; 32]>,
+    seq: usize,
+    name: &'static str,
+    sha256: [u8; 32],
+    signer: Option<[u8; 32]>,
     version: Option<String>,
     backing: Arc<DmaBuffer>,
     payload_len: usize,
 }
 
-static IN_TREE:     IrqSafeSpinLock<Vec<Entry>> = IrqSafeSpinLock::new(Vec::new());
-static INITRAMFS:   IrqSafeSpinLock<Vec<Entry>> = IrqSafeSpinLock::new(Vec::new());
+static IN_TREE: IrqSafeSpinLock<Vec<Entry>> = IrqSafeSpinLock::new(Vec::new());
+static INITRAMFS: IrqSafeSpinLock<Vec<Entry>> = IrqSafeSpinLock::new(Vec::new());
 static HOT_INSTALL: IrqSafeSpinLock<Vec<Entry>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Cap-binding routing table. Indexed by cap sequence number;
@@ -76,12 +76,12 @@ fn lookup(name: &str) -> Option<CapBinding> {
         let g = tier.lock();
         if let Some(e) = g.iter().find(|e| e.name == name) {
             return Some(CapBinding {
-                seq:         e.seq,
-                name:        e.name,
-                sha256:      e.sha256,
-                signer:      e.signer,
-                version:     e.version.clone(),
-                backing:     e.backing.clone(),
+                seq: e.seq,
+                name: e.name,
+                sha256: e.sha256,
+                signer: e.signer,
+                version: e.version.clone(),
+                backing: e.backing.clone(),
                 payload_len: e.payload_len,
             });
         }
@@ -91,9 +91,7 @@ fn lookup(name: &str) -> Option<CapBinding> {
 
 /// Mint a fresh `Cap<FirmwareBlob, Read>` for the named blob. The
 /// caller has already validated the registry-authority cap.
-pub(crate) fn open_blob(name: &str)
-    -> Result<Cap<FirmwareBlob, Read>, FirmwareError>
-{
+pub(crate) fn open_blob(name: &str) -> Result<Cap<FirmwareBlob, Read>, FirmwareError> {
     let binding = lookup(name).ok_or(FirmwareError::NotFound)?;
     // The cap minted via `Cap::bootstrap()` and routed through the
     // standard cap object table; the registry-side binding stays
@@ -124,7 +122,7 @@ pub(crate) fn view_for<'a>(
     let _ = cap; // not yet wired through the cap layer
     let g = BINDINGS.lock();
     let b = g.last().ok_or(FirmwareError::NotFound)?.clone();
-    let phys  = b.backing.phys_addr().raw();
+    let phys = b.backing.phys_addr().raw();
     // SAFETY: the backing is identity-mapped DMA-coherent memory;
     // the `payload_len` was set when the entry was installed and
     // is bounded by the backing buffer's length.
@@ -137,10 +135,10 @@ pub(crate) fn view_for<'a>(
     // `None`; richer surfacing lands once cap → binding routing
     // gets first-class support.
     Ok(BlobView {
-        name:    b.name,
+        name: b.name,
         version: None,
-        sha256:  b.sha256,
-        signer:  b.signer,
+        sha256: b.sha256,
+        signer: b.signer,
         bytes,
         phys,
     })
@@ -150,8 +148,8 @@ pub(crate) fn view_for<'a>(
 /// signature verification, allocate a DMA-coherent page, copy the
 /// payload in, register the entry.
 pub(crate) fn install_blob(
-    name:   &'static str,
-    bytes:  &[u8],
+    name: &'static str,
+    bytes: &[u8],
     source: BlobSource,
 ) -> Result<(), FirmwareError> {
     // 1. Decode + verify the trailer.
@@ -163,8 +161,8 @@ pub(crate) fn install_blob(
     //    that's the same DRIVER_0 domain everything else uses.
     let payload_len = trailer.payload.len();
     let pages = (payload_len + 4095) & !4095;
-    let backing = alloc_coherent(pages, DomainId::DRIVER_0)
-        .map_err(|_| FirmwareError::OutOfMemory)?;
+    let backing =
+        alloc_coherent(pages, DomainId::DRIVER_0).map_err(|_| FirmwareError::OutOfMemory)?;
 
     // 3. Copy payload in.
     let dst = backing.phys_addr().raw();
@@ -178,7 +176,11 @@ pub(crate) fn install_blob(
     }
 
     // 4. Build the entry.
-    let signer = if trailer.is_unsigned() { None } else { Some(trailer.signer) };
+    let signer = if trailer.is_unsigned() {
+        None
+    } else {
+        Some(trailer.signer)
+    };
     let entry = Entry {
         name,
         sha256: signature::sha256(trailer.payload),
@@ -193,8 +195,8 @@ pub(crate) fn install_blob(
     // 5. Push into the right tier. Replace any prior entry with
     //    the same name in this tier (re-installs are idempotent).
     let tier = match source {
-        BlobSource::InTree     => &IN_TREE,
-        BlobSource::Initramfs  => &INITRAMFS,
+        BlobSource::InTree => &IN_TREE,
+        BlobSource::Initramfs => &INITRAMFS,
         BlobSource::HotInstall => &HOT_INSTALL,
     };
     let mut g = tier.lock();
@@ -213,11 +215,11 @@ pub(crate) fn snapshot_all() -> Vec<BlobIdentity> {
         let g = tier.lock();
         for e in g.iter() {
             out.push(BlobIdentity {
-                name:    e.name,
-                size:    e.payload_len,
-                sha256:  e.sha256,
-                signer:  e.signer,
-                source:  src,
+                name: e.name,
+                size: e.payload_len,
+                sha256: e.sha256,
+                signer: e.signer,
+                source: src,
                 version: e.version.clone(),
             });
         }
@@ -240,9 +242,7 @@ pub(crate) fn source_for(name: &str) -> Option<BlobSource> {
 }
 
 pub(crate) fn has_any() -> bool {
-    !IN_TREE.lock().is_empty()
-        || !INITRAMFS.lock().is_empty()
-        || !HOT_INSTALL.lock().is_empty()
+    !IN_TREE.lock().is_empty() || !INITRAMFS.lock().is_empty() || !HOT_INSTALL.lock().is_empty()
 }
 
 #[doc(hidden)]

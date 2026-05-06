@@ -23,10 +23,10 @@ mod bare;
 // Re-export the per-arch modules at crate root so the existing
 // `crate::x86_64::…` / `crate::aarch64::…` paths inside the
 // kernel keep resolving after the `bare` wrapping.
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub use bare::x86_64;
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 pub use bare::aarch64;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub use bare::x86_64;
 
 #[cfg(not(target_os = "none"))]
 fn main() {

@@ -13,10 +13,9 @@
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use super::{
-    decode_device_config, FsConfig, FuseInHeader, FuseOpcode,
-    FS_TAG_LEN, FUSE_GETATTR, FUSE_INIT, FUSE_IN_HEADER_LEN,
-    FUSE_LOOKUP, FUSE_READ, FUSE_RELEASE,
-    VIRTIO_FS_PCI_DEVICE, VIRTIO_FS_PCI_VENDOR,
+    decode_device_config, FsConfig, FuseInHeader, FuseOpcode, FS_TAG_LEN, FUSE_GETATTR, FUSE_INIT,
+    FUSE_IN_HEADER_LEN, FUSE_LOOKUP, FUSE_READ, FUSE_RELEASE, VIRTIO_FS_PCI_DEVICE,
+    VIRTIO_FS_PCI_VENDOR,
 };
 
 // ── Stage 1: PCI match table ───────────────────────────────────────
@@ -27,10 +26,15 @@ fn smoke_virtio_fs_pci_match_table() -> TestResult {
     __reset_for_test();
     super::register_pci_driver();
     let registered = registered_pci_drivers();
-    let matched = registered.iter().any(|m|
-        matches!(m.kind, MatchKind::VendorDevice {
-            vendor: VIRTIO_FS_PCI_VENDOR, device: VIRTIO_FS_PCI_DEVICE,
-        }));
+    let matched = registered.iter().any(|m| {
+        matches!(
+            m.kind,
+            MatchKind::VendorDevice {
+                vendor: VIRTIO_FS_PCI_VENDOR,
+                device: VIRTIO_FS_PCI_DEVICE,
+            }
+        )
+    });
     if !matched {
         return TestResult::Fail("virtio-fs PCI match table missing 1AF4:105A");
     }
@@ -43,17 +47,22 @@ kernel_test_in!("drivers/virtio/fs_pci", smoke_virtio_fs_pci_match_table);
 fn smoke_virtio_fs_pci_config_decode() -> TestResult {
     // Build a 40-byte buffer: tag = "myfs\0\0...", num_request_queues = 4.
     let mut buf = [0u8; FS_TAG_LEN + 4];
-    buf[0] = b'm'; buf[1] = b'y'; buf[2] = b'f'; buf[3] = b's';
+    buf[0] = b'm';
+    buf[1] = b'y';
+    buf[2] = b'f';
+    buf[3] = b's';
     // num_request_queues = 4 (little-endian).
-    buf[FS_TAG_LEN]     = 0x04;
+    buf[FS_TAG_LEN] = 0x04;
     buf[FS_TAG_LEN + 1] = 0x00;
     buf[FS_TAG_LEN + 2] = 0x00;
     buf[FS_TAG_LEN + 3] = 0x00;
     let cfg: FsConfig = match decode_device_config(&buf) {
         Some(c) => c,
-        None    => return TestResult::Fail("decode returned None on 40-byte input"),
+        None => return TestResult::Fail("decode returned None on 40-byte input"),
     };
-    if cfg.tag_len != 4         { return TestResult::Fail("tag_len != 4"); }
+    if cfg.tag_len != 4 {
+        return TestResult::Fail("tag_len != 4");
+    }
     if cfg.tag_str() != Some("myfs") {
         return TestResult::Fail("tag_str round-trip mismatch");
     }
@@ -66,7 +75,7 @@ fn smoke_virtio_fs_pci_config_decode() -> TestResult {
     }
     // Full-width tag (no NUL) — tag_len = FS_TAG_LEN.
     let mut full = [b'A'; FS_TAG_LEN + 4];
-    full[FS_TAG_LEN]     = 0;
+    full[FS_TAG_LEN] = 0;
     full[FS_TAG_LEN + 1] = 0;
     full[FS_TAG_LEN + 2] = 0;
     full[FS_TAG_LEN + 3] = 0;
@@ -82,16 +91,36 @@ kernel_test_in!("drivers/virtio/fs_pci", smoke_virtio_fs_pci_config_decode);
 
 fn smoke_virtio_fs_pci_fuse_in_header_roundtrip() -> TestResult {
     // Numeric opcode values per the FUSE wire-protocol docs.
-    if FUSE_LOOKUP  != 1  { return TestResult::Fail("FUSE_LOOKUP  != 1"); }
-    if FUSE_GETATTR != 3  { return TestResult::Fail("FUSE_GETATTR != 3"); }
-    if FUSE_READ    != 15 { return TestResult::Fail("FUSE_READ    != 15"); }
-    if FUSE_RELEASE != 18 { return TestResult::Fail("FUSE_RELEASE != 18"); }
-    if FUSE_INIT    != 26 { return TestResult::Fail("FUSE_INIT    != 26"); }
-    if FuseOpcode::Lookup  as u32 != FUSE_LOOKUP  { return TestResult::Fail("Lookup enum"); }
-    if FuseOpcode::Getattr as u32 != FUSE_GETATTR { return TestResult::Fail("Getattr enum"); }
-    if FuseOpcode::Read    as u32 != FUSE_READ    { return TestResult::Fail("Read enum"); }
-    if FuseOpcode::Release as u32 != FUSE_RELEASE { return TestResult::Fail("Release enum"); }
-    if FuseOpcode::Init    as u32 != FUSE_INIT    { return TestResult::Fail("Init enum"); }
+    if FUSE_LOOKUP != 1 {
+        return TestResult::Fail("FUSE_LOOKUP  != 1");
+    }
+    if FUSE_GETATTR != 3 {
+        return TestResult::Fail("FUSE_GETATTR != 3");
+    }
+    if FUSE_READ != 15 {
+        return TestResult::Fail("FUSE_READ    != 15");
+    }
+    if FUSE_RELEASE != 18 {
+        return TestResult::Fail("FUSE_RELEASE != 18");
+    }
+    if FUSE_INIT != 26 {
+        return TestResult::Fail("FUSE_INIT    != 26");
+    }
+    if FuseOpcode::Lookup as u32 != FUSE_LOOKUP {
+        return TestResult::Fail("Lookup enum");
+    }
+    if FuseOpcode::Getattr as u32 != FUSE_GETATTR {
+        return TestResult::Fail("Getattr enum");
+    }
+    if FuseOpcode::Read as u32 != FUSE_READ {
+        return TestResult::Fail("Read enum");
+    }
+    if FuseOpcode::Release as u32 != FUSE_RELEASE {
+        return TestResult::Fail("Release enum");
+    }
+    if FuseOpcode::Init as u32 != FUSE_INIT {
+        return TestResult::Fail("Init enum");
+    }
 
     // Header length sanity.
     if FUSE_IN_HEADER_LEN != 40 {
@@ -121,14 +150,14 @@ fn smoke_virtio_fs_pci_fuse_in_header_roundtrip() -> TestResult {
         return TestResult::Fail("encoded opcode not at offset 4 LE");
     }
     if u64::from_le_bytes([
-        bytes[8], bytes[9], bytes[10], bytes[11],
-        bytes[12], bytes[13], bytes[14], bytes[15],
-    ]) != 0xDEAD_BEEF_CAFE_F00D {
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+    ]) != 0xDEAD_BEEF_CAFE_F00D
+    {
         return TestResult::Fail("encoded unique not at offset 8 LE");
     }
     let decoded = match FuseInHeader::decode(&bytes) {
         Some(d) => d,
-        None    => return TestResult::Fail("decode of 40-byte buf returned None"),
+        None => return TestResult::Fail("decode of 40-byte buf returned None"),
     };
     if decoded != h {
         return TestResult::Fail("encode/decode round-trip mismatch");
@@ -138,7 +167,10 @@ fn smoke_virtio_fs_pci_fuse_in_header_roundtrip() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/virtio/fs_pci", smoke_virtio_fs_pci_fuse_in_header_roundtrip);
+kernel_test_in!(
+    "drivers/virtio/fs_pci",
+    smoke_virtio_fs_pci_fuse_in_header_roundtrip
+);
 
 fn smoke_virtio_fs_pci_live_fuse_init() -> TestResult {
     use crate::fs_pci;
@@ -149,8 +181,7 @@ fn smoke_virtio_fs_pci_live_fuse_init() -> TestResult {
     // FUSE_INIT request: 40-byte header + 16-byte init body
     // (major u32, minor u32, max_readahead u32, flags u32) all LE.
     const INIT_BODY: usize = 16;
-    let hdr = FuseInHeader::new(
-        FuseOpcode::Init, 1, 0, 0, 0, 0, INIT_BODY as u32);
+    let hdr = FuseInHeader::new(FuseOpcode::Init, 1, 0, 0, 0, 0, INIT_BODY as u32);
     let mut req = alloc::vec![0u8; FUSE_IN_HEADER_LEN + INIT_BODY];
     req[..FUSE_IN_HEADER_LEN].copy_from_slice(&hdr.encode());
     let body_off = FUSE_IN_HEADER_LEN;
@@ -164,11 +195,13 @@ fn smoke_virtio_fs_pci_live_fuse_init() -> TestResult {
         Some(Ok(r)) => {
             // Response = fuse_out_header (16 bytes) + fuse_init_out.
             // Just verify we got at least a header back.
-            if r.len() < 16 { return TestResult::Fail("short FUSE_INIT response"); }
+            if r.len() < 16 {
+                return TestResult::Fail("short FUSE_INIT response");
+            }
             TestResult::Pass
         }
-        Some(Err(_))  => TestResult::Fail("submit_request failed"),
-        None          => TestResult::Skip("controller missing"),
+        Some(Err(_)) => TestResult::Fail("submit_request failed"),
+        None => TestResult::Skip("controller missing"),
     }
 }
 kernel_test_in!("drivers/virtio/fs_pci", smoke_virtio_fs_pci_live_fuse_init);

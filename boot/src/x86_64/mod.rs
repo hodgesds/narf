@@ -16,7 +16,9 @@ pub const MAX_MEM_REGIONS: usize = 64;
 /// Storage for the parsed memory map. Lives in `.bss`; populated once by
 /// `parse_raw`.
 static mut MEMORY_MAP: [MemRegion; MAX_MEM_REGIONS] = [MemRegion {
-    start: PhysAddr::new(0), len: 0, kind: MemRegionKind::Reserved,
+    start: PhysAddr::new(0),
+    len: 0,
+    kind: MemRegionKind::Reserved,
 }; MAX_MEM_REGIONS];
 static mut MEMORY_MAP_LEN: usize = 0;
 
@@ -52,25 +54,24 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
 
     // SAFETY: `count` is the return value from the parser; we write to the
     // accompanying `MEMORY_MAP_LEN` under single-threaded boot conditions.
-    unsafe { core::ptr::addr_of_mut!(MEMORY_MAP_LEN).write(count); }
+    unsafe {
+        core::ptr::addr_of_mut!(MEMORY_MAP_LEN).write(count);
+    }
 
     // Minimum Wave-1 validation: at least one Usable region with ≥ 1 MiB.
     // SAFETY: MEMORY_MAP[..count] was initialised by parse_memory_map.
     let regions = unsafe {
-        core::slice::from_raw_parts(
-            core::ptr::addr_of!(MEMORY_MAP).cast::<MemRegion>(),
-            count,
-        )
+        core::slice::from_raw_parts(core::ptr::addr_of!(MEMORY_MAP).cast::<MemRegion>(), count)
     };
-    let any_usable = regions.iter().any(|r|
-        r.kind == MemRegionKind::Usable && r.len >= 1024 * 1024);
+    let any_usable = regions
+        .iter()
+        .any(|r| r.kind == MemRegionKind::Usable && r.len >= 1024 * 1024);
     if !any_usable {
         return Err(BootError::NoUsableRam);
     }
 
     // SAFETY: PVH header validated above.
-    let rsdp = unsafe { multiboot2::rsdp_phys(raw.payload.raw() as usize) }
-        .map(PhysAddr::new);
+    let rsdp = unsafe { multiboot2::rsdp_phys(raw.payload.raw() as usize) }.map(PhysAddr::new);
 
     // Initramfs handoff: scan the multiboot2 module-list for a
     // module whose cmdline is `"initramfs"` (case-insensitive).
@@ -83,10 +84,10 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
 
     Ok(BootInfo {
         memory_map: regions,
-        cmdline:    CMDLINE,
-        uart_phys:  PhysAddr::new(UART_DEFAULT_PORT as u64),
-        uart_virt:  VirtAddr::new(UART_DEFAULT_PORT as u64),   // pre-MMU identity
-        dtb_phys:   None,
+        cmdline: CMDLINE,
+        uart_phys: PhysAddr::new(UART_DEFAULT_PORT as u64),
+        uart_virt: VirtAddr::new(UART_DEFAULT_PORT as u64), // pre-MMU identity
+        dtb_phys: None,
         acpi_rsdp_phys: rsdp,
         initramfs,
     })
@@ -99,17 +100,19 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
 /// when no matching module is present, when the bootloader didn't
 /// pass PVH magic, or when the info pointer is null.
 fn scan_initramfs_module(raw: &crate::RawBootInfo) -> Option<MemRegion> {
-    if raw.payload.raw() == 0 { return None; }
+    if raw.payload.raw() == 0 {
+        return None;
+    }
     // SAFETY: bootloader contract — `raw.payload` points at a
     // valid `hvm_start_info`; magic mismatch returns `None` from
     // the parser without dereferencing modlist memory.
-    let (start, size) = unsafe {
-        multiboot2::initramfs_module(raw.payload.raw() as usize)?
-    };
-    if size == 0 { return None; }
+    let (start, size) = unsafe { multiboot2::initramfs_module(raw.payload.raw() as usize)? };
+    if size == 0 {
+        return None;
+    }
     Some(MemRegion {
         start: PhysAddr::new(start),
-        len:   size,
-        kind:  MemRegionKind::Reserved,
+        len: size,
+        kind: MemRegionKind::Reserved,
     })
 }

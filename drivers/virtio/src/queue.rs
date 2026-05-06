@@ -10,14 +10,14 @@ use narf_memory::PAGE_SIZE;
 #[repr(C, align(16))]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct VirtqDesc {
-    pub addr:  u64,
-    pub len:   u32,
+    pub addr: u64,
+    pub len: u32,
     pub flags: u16,
-    pub next:  u16,
+    pub next: u16,
 }
 
-pub const VIRTQ_DESC_F_NEXT:     u16 = 1;
-pub const VIRTQ_DESC_F_WRITE:    u16 = 2;
+pub const VIRTQ_DESC_F_NEXT: u16 = 1;
+pub const VIRTQ_DESC_F_WRITE: u16 = 2;
 pub const VIRTQ_DESC_F_INDIRECT: u16 = 4;
 
 /// Used ring element.
@@ -25,7 +25,7 @@ pub const VIRTQ_DESC_F_INDIRECT: u16 = 4;
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct VirtqUsedElem {
-    pub id:  u32,
+    pub id: u32,
     pub len: u32,
 }
 
@@ -39,17 +39,19 @@ pub fn virtio_fence() {
 /// Handles base addresses and alignment per VirtIO 1.2 §3.2.1.
 #[derive(Copy, Clone, Debug)]
 pub struct VirtqueueLayout {
-    pub capacity:   u16,
+    pub capacity: u16,
     pub desc_table: u64,
     pub avail_ring: u64,
-    pub used_ring:  u64,
+    pub used_ring: u64,
 }
 
 impl VirtqueueLayout {
     /// Calculate the layout for a queue of `capacity` starting at `base`.
     /// Returns `None` if the layout exceeds `PAGE_SIZE`.
     pub fn new(capacity: u16, base: u64) -> Option<Self> {
-        if !capacity.is_power_of_two() { return None; }
+        if !capacity.is_power_of_two() {
+            return None;
+        }
 
         let desc_table = base;
         let desc_table_size = 16 * capacity as u64;
@@ -66,7 +68,12 @@ impl VirtqueueLayout {
             return None;
         }
 
-        Some(Self { capacity, desc_table, avail_ring, used_ring })
+        Some(Self {
+            capacity,
+            desc_table,
+            avail_ring,
+            used_ring,
+        })
     }
 }
 
@@ -81,7 +88,7 @@ pub struct Virtqueue {
 
     /// Free descriptors stack.
     free_head: Option<u16>,
-    num_free:  u16,
+    num_free: u16,
 }
 
 // SAFETY: Virtqueue owns its raw pointers (derived from layout) and
@@ -113,7 +120,9 @@ impl Virtqueue {
         let desc = layout.desc_table as *mut VirtqDesc;
         // Initialise free descriptors stack.
         for i in 0..(layout.capacity - 1) {
-            unsafe { (*desc.add(i as usize)).next = i + 1; }
+            unsafe {
+                (*desc.add(i as usize)).next = i + 1;
+            }
         }
 
         Self {
@@ -125,17 +134,29 @@ impl Virtqueue {
         }
     }
 
-    pub fn capacity(&self) -> u16 { self.layout.capacity }
+    pub fn capacity(&self) -> u16 {
+        self.layout.capacity
+    }
 
-    fn desc_table(&self) -> *mut VirtqDesc { self.layout.desc_table as *mut _ }
-    fn avail_base(&self) -> *mut u16 { self.layout.avail_ring as *mut _ }
-    fn used_base(&self)  -> *mut u16 { self.layout.used_ring as *mut _ }
+    fn desc_table(&self) -> *mut VirtqDesc {
+        self.layout.desc_table as *mut _
+    }
+    fn avail_base(&self) -> *mut u16 {
+        self.layout.avail_ring as *mut _
+    }
+    fn used_base(&self) -> *mut u16 {
+        self.layout.used_ring as *mut _
+    }
 
     fn alloc_desc(&mut self) -> Option<u16> {
         let id = self.free_head?;
         self.free_head = unsafe {
             let next = (*self.desc_table().add(id as usize)).next;
-            if self.num_free > 1 { Some(next) } else { None }
+            if self.num_free > 1 {
+                Some(next)
+            } else {
+                None
+            }
         };
         self.num_free -= 1;
         Some(id)
@@ -173,11 +194,15 @@ impl Virtqueue {
                 let next = self.alloc_desc().unwrap();
                 desc_val.flags |= VIRTQ_DESC_F_NEXT;
                 desc_val.next = next;
-                unsafe { *table.add(curr as usize) = desc_val; }
+                unsafe {
+                    *table.add(curr as usize) = desc_val;
+                }
                 curr = next;
             } else {
                 desc_val.flags &= !VIRTQ_DESC_F_NEXT;
-                unsafe { *table.add(curr as usize) = desc_val; }
+                unsafe {
+                    *table.add(curr as usize) = desc_val;
+                }
             }
         }
 
@@ -187,7 +212,7 @@ impl Virtqueue {
             let ring = self.avail_base().add(2);
             let slot = (self.avail_idx as usize) % (self.layout.capacity as usize);
             *ring.add(slot) = head;
-            
+
             virtio_fence();
             self.avail_idx = self.avail_idx.wrapping_add(1);
             *(self.avail_base().add(1)) = self.avail_idx;

@@ -66,7 +66,9 @@ pub trait TrapContext {
     /// # Safety
     /// `out` must point at a writable region of at least
     /// `UserState`-sized bytes for the calling arch.
-    unsafe fn save_user_state(&self, _out: *mut u8) -> bool { false }
+    unsafe fn save_user_state(&self, _out: *mut u8) -> bool {
+        false
+    }
 
     /// Rewrite the trap frame to deliver `handler_vaddr` with
     /// `signum` to user mode. Pushes a synthetic `[saved_rip,
@@ -78,7 +80,9 @@ pub trait TrapContext {
     /// Default: returns `false` — arches without a delivery
     /// implementation skip the rewrite, leaving the frame
     /// untouched. x86_64 overrides.
-    fn deliver_signal(&mut self, _handler_vaddr: u64, _signum: u32) -> bool { false }
+    fn deliver_signal(&mut self, _handler_vaddr: u64, _signum: u32) -> bool {
+        false
+    }
 
     /// Whether the trap is about to return to user mode. The
     /// signal-delivery hook only fires on user-bound returns;
@@ -87,7 +91,9 @@ pub trait TrapContext {
     /// signal frame onto a kernel stack. Default: `false`
     /// (treat as kernel-bound) so non-x86_64 arches without a
     /// CPL/EL accessor behave conservatively.
-    fn returning_to_user(&self) -> bool { false }
+    fn returning_to_user(&self) -> bool {
+        false
+    }
 }
 
 // ── Numbers ─────────────────────────────────────────────────────────
@@ -102,36 +108,36 @@ pub enum Syscall {
     /// Submit a single `abi::Submission` from inline registers.
     /// Equivalent to pushing it to the SQ ring; the implementation
     /// uses the per-task SQ under the hood.
-    Submit       = 100,
+    Submit = 100,
 
     /// Bootstrap: mint the per-task SQ+CQ and config-page caps.
-    Bootstrap    = 101,
+    Bootstrap = 101,
 
     /// Block until a new completion arrives on the per-task CQ.
-    WaitCompl    = 102,
+    WaitCompl = 102,
 
     /// Exit the current task. No completion is emitted; the
     /// scheduler drops the slot.
-    ExitTask     = 103,
+    ExitTask = 103,
 
     /// Yield the CPU. Returns when rescheduled.
-    Yield        = 104,
+    Yield = 104,
 
     /// Sleep for `arg0` nanoseconds.
-    Sleep        = 105,
+    Sleep = 105,
 
     /// Open a file by path (zero-terminated string pointer in
     /// arg0). Returns a file descriptor on the per-task CQ.
-    OpenFile     = 110,
+    OpenFile = 110,
 
     /// Read `arg1` bytes from file `arg0` into buffer at `arg2`.
-    Read         = 111,
+    Read = 111,
 
     /// Write `arg1` bytes to file `arg0` from buffer at `arg2`.
-    Write        = 112,
+    Write = 112,
 
     /// Close file `arg0`.
-    Close        = 113,
+    Close = 113,
 
     // ── Tier-2 fd-table breadth + VFS path resolution + pipe(2) ────
     //
@@ -139,25 +145,24 @@ pub enum Syscall {
     // fd surface that lands alongside `Open`'s absolute-path support.
     // Co-agent C uses disjoint numbers for cwd / signal / sleep work;
     // do not re-use these here without coordination.
-
     /// Stat by absolute path. `arg0 = path_ptr, arg1 = path_len,
     /// arg2 = stat_out_ptr`. Writes a NARF [`StatBuf`] (see
     /// `handlers::StatBuf`) to `*stat_out_ptr`. Returns 0 on success.
-    Stat         = 115,
+    Stat = 115,
 
     /// Stat by fd. `arg0 = fd, arg1 = stat_out_ptr`. Same shape as
     /// [`Stat`] otherwise.
-    Fstat        = 116,
+    Fstat = 116,
 
     /// `arg0 = path_ptr, arg1 = path_len, arg2 = stat_out_ptr`.
     /// Linux lstat(2): like stat but doesn't follow the final
     /// symlink. NARF has no symlinks; this aliases sys_stat.
-    Lstat        = 133,
+    Lstat = 133,
 
     /// Create a pipe pair. `arg0 = pipefd_out_ptr` — kernel writes
     /// two `i32`s (read fd, write fd) to that pointer. Returns 0
     /// on success.
-    Pipe         = 117,
+    Pipe = 117,
 
     /// `arg0 = fd`, `arg1 = len` (u64). Resize the underlying file
     /// to exactly `len` bytes — zero-fill on grow, truncate on
@@ -165,37 +170,37 @@ pub enum Syscall {
     /// Touches the file directly via `FileOps::truncate`; no fd
     /// offset state is altered (POSIX: ftruncate doesn't move the
     /// per-fd cursor).
-    Ftruncate    = 118,
+    Ftruncate = 118,
 
     /// `arg0 = path_ptr`, `arg1 = path_len`, `arg2 = len`. Path-
     /// based truncate (POSIX truncate(2)). Resolves the absolute
     /// path and calls `FileOps::truncate` directly — no fd table
     /// involvement. Returns 0 on success, -1 on bad path / read-
     /// only FS.
-    Truncate     = 132,
+    Truncate = 132,
 
     /// `arg0 = fd`, `arg1 = buf_ptr`, `arg2 = len`, `arg3 = offset`
     /// (u64). Read at the explicit offset without altering the
     /// per-fd cursor. Returns the byte count read on success
     /// (possibly short), -1 on bad fd / null buffer.
-    Pread64      = 119,
+    Pread64 = 119,
 
     /// `arg0 = fd`, `arg1 = buf_ptr`, `arg2 = len`, `arg3 = offset`
     /// (u64). Write at the explicit offset without altering the
     /// per-fd cursor. Returns the byte count written on success.
-    Pwrite64     = 122,
+    Pwrite64 = 122,
 
     /// `arg0 = fd`. Flush buffered writes for the file. NARF FSes
     /// are in-memory so this is a structural no-op that succeeds
     /// for any open fd, fails (-1) for an unknown fd. The entry
     /// exists so consumer code that error-checks fsync sees a sane
     /// return.
-    Fsync        = 123,
+    Fsync = 123,
 
     /// `arg0 = fd`. Like Fsync but only metadata-omitted. Mapped
     /// to the same handler — the FS surface has no metadata-only
     /// flush distinction.
-    Fdatasync    = 124,
+    Fdatasync = 124,
 
     /// `arg0 = fd`, `arg1 = mode`, `arg2 = offset`, `arg3 = len`
     /// (all u64). Linux fallocate(2): preallocate file space.
@@ -204,7 +209,7 @@ pub enum Syscall {
     /// ZERO_RANGE = 0x10 (zero the given range without changing
     /// size unless extending). Returns 0 on success, -1 on bad fd
     /// or read-only FS.
-    Fallocate    = 126,
+    Fallocate = 126,
 
     /// `arg0 = fd_in`, `arg1 = fd_out`, `arg2 = off_in` (u64,
     /// `!0` = use cur), `arg3 = off_out` (u64, `!0` = use cur),
@@ -222,77 +227,77 @@ pub enum Syscall {
     /// new fd on success, -1 on bad input or fd-table exhaustion.
     /// The name is recorded only for debug introspection (no
     /// directory entry), matching the spec.
-    MemfdCreate  = 128,
+    MemfdCreate = 128,
 
     /// `arg0 = fd`, `arg1 = mode`. fchmod(2). NARF doesn't
     /// enforce permission bits; the call succeeds on a known fd
     /// (-1 on closed fd). Round-trip is structural.
-    Fchmod       = 129,
+    Fchmod = 129,
 
     /// `arg0 = fd`, `arg1 = uid`, `arg2 = gid`. fchown(2). Same
     /// accept-and-record semantics as fchmod.
-    Fchown       = 131,
+    Fchown = 131,
 
     /// `arg0 = dirfd` (ignored — NARF has no directory-fd type),
     /// `arg1 = path_ptr`, `arg2 = path_len`, `arg3 = mode`,
     /// `arg4 = flags` (ignored). Linux fchmodat(2). The path
     /// must be absolute. Returns 0 on a reachable path, -1
     /// otherwise (consumer code error-checks the chmod return).
-    Fchmodat     = 134,
+    Fchmodat = 134,
 
     /// `arg0 = dirfd`, `arg1 = path_ptr`, `arg2 = path_len`,
     /// `arg3 = uid`, `arg4 = gid`, `arg5 = flags`. fchownat(2).
     /// Same path-must-be-absolute simplification as fchmodat.
-    Fchownat     = 135,
+    Fchownat = 135,
 
     /// `arg0 = dirfd`, `arg1 = path_ptr`, `arg2 = path_len`,
     /// `arg3 = mode`, `arg4 = flags`. Linux faccessat(2).
     /// dirfd ignored; path must be absolute. Routes to the same
     /// existence probe as SYS_OPEN (open + close).
-    Faccessat    = 136,
+    Faccessat = 136,
 
     /// `arg0 = dirfd`, `arg1 = path_ptr`, `arg2 = path_len`,
     /// `arg3 = flags`, `arg4 = mode`. Linux openat(2).
     /// dirfd ignored; path must be absolute. Returns the new fd
     /// or `!0u64` on failure (matching SYS_OPEN's convention so
     /// the user-runtime wrapper distinguishes consistently).
-    Openat       = 137,
+    Openat = 137,
 
     /// `arg0 = dirfd`, `arg1 = path_ptr`, `arg2 = path_len`,
     /// `arg3 = stat_out_ptr`, `arg4 = flags`. Linux newfstatat(2)
     /// / fstatat(2). dirfd ignored; path must be absolute. Routes
     /// to the same handler as SYS_STAT.
-    Newfstatat   = 138,
+    Newfstatat = 138,
 
     /// `arg0 = dirfd`, `arg1 = path_ptr`, `arg2 = path_len`,
     /// `arg3 = flags`. Linux unlinkat(2). dirfd ignored;
     /// AT_REMOVEDIR (0x200) flag routes to rmdir, otherwise to
     /// unlink. Returns 0 / -1.
-    Unlinkat     = 139,
+    Unlinkat = 139,
 
     /// `arg0 = dirfd`, `arg1 = path_ptr`, `arg2 = path_len`,
     /// `arg3 = mode`. Linux mkdirat(2). dirfd ignored; routes
     /// through SYS_MKDIR.
-    Mkdirat      = 228,
+    Mkdirat = 228,
 
     /// `arg0 = old_dirfd`, `arg1 = old_path_ptr`,
     /// `arg2 = old_path_len`, `arg3 = new_dirfd`,
     /// `arg4 = new_path_ptr`, `arg5 = new_path_len`. Linux
     /// renameat(2). Both dirfds ignored; both paths must be
     /// absolute.
-    Renameat     = 229,
+    Renameat = 229,
 
     /// `arg0 = target_ptr`, `arg1 = target_len`, `arg2 = dirfd`,
     /// `arg3 = link_ptr`, `arg4 = link_len`. Linux symlinkat(2).
     /// dirfd ignored; link path must be absolute. Forwards to
     /// the SYS_SYMLINK body.
-    Symlinkat    = 230,
+    Symlinkat = 230,
 
     /// `arg0 = dirfd`, `arg1 = path_ptr`, `arg2 = path_len`,
     /// `arg3 = buf_ptr`, `arg4 = buf_len`. Linux readlinkat(2).
     /// dirfd ignored; path must be absolute. Forwards to the
     /// SYS_READLINK body.
-    Readlinkat   = 231,
+    Readlinkat = 231,
 
     /// `arg0 = path_ptr`, `arg1 = path_len`, `arg2 = mode`. Linux
     /// access(2): legacy entry point that forwards to the
@@ -300,19 +305,19 @@ pub enum Syscall {
     /// absolute (NARF has no per-task cwd-relative resolution at
     /// the syscall layer). Returns 0 if the path resolves, -1
     /// otherwise.
-    Access       = 232,
+    Access = 232,
 
     /// `arg0 = path_ptr`, `arg1 = path_len`, `arg2 = mode`. Linux
     /// chmod(2): legacy entry point that forwards to the
     /// fchmodat body. Mode bits aren't enforced; we only verify
     /// the path resolves.
-    Chmod        = 233,
+    Chmod = 233,
 
     /// `arg0 = path_ptr`, `arg1 = path_len`, `arg2 = uid`,
     /// `arg3 = gid`. Linux chown(2): legacy entry point that
     /// forwards to the fchownat body. uid/gid aren't enforced;
     /// we only verify the path resolves.
-    Chown        = 234,
+    Chown = 234,
 
     /// `arg0 = pipefd_out_ptr`, `arg1 = flags`. Linux pipe2(2):
     /// pipe + atomic flag set. Honoured flag: O_CLOEXEC (bit
@@ -320,31 +325,31 @@ pub enum Syscall {
     /// time. O_NONBLOCK is accepted and ignored (NARF pipes have
     /// no blocking model worth toggling — read on an empty pipe
     /// already short-returns).
-    Pipe2        = 125,
+    Pipe2 = 125,
 
     /// Map memory: `arg0` addr hint, `arg1` length, `arg2` flags.
-    Mmap         = 120,
+    Mmap = 120,
 
     /// Unmap memory.
-    Munmap       = 121,
+    Munmap = 121,
 
     /// Open an FB connection to a scanout. `arg0` = scanout id (0
     /// for the active scanout). Returns a non-zero `FbHandleId` on
     /// success, 0 on failure (no backend / OOM / not authorised).
     /// Auto-closed on process exit.
-    FbConnect    = 240,
+    FbConnect = 240,
 
     /// Query the connected scanout's geometry + format. `arg0` =
     /// `FbHandleId`, `arg1` = userspace pointer to a 24-byte
     /// `FbInfo` (`{u32 width, height, stride, format, scanout_id, _resv}`).
     /// Returns 0 on success, !0 on bad handle / bad pointer.
-    FbInfo       = 241,
+    FbInfo = 241,
 
     /// Map the connection's draw-ring into the caller's VA. `arg0`
     /// = `FbHandleId`. Returns the user VA (4 KiB region) or 0 on
     /// failure. The mapping is RW; userspace constructs a
     /// `SharedProducer<DrawCmd>` over it.
-    FbRingMap    = 242,
+    FbRingMap = 242,
 
     /// Block (or report) until the kernel drain task has consumed
     /// at least one command past the caller's prior wait point.
@@ -352,7 +357,7 @@ pub enum Syscall {
     /// snapshot. Today this is non-blocking — it returns immediately
     /// — but the contract leaves room for vsync / backpressure
     /// blocking once the scheduler-aware drain lands.
-    FbFlushWait  = 243,
+    FbFlushWait = 243,
 
     /// Tear down a connection. `arg0` = `FbHandleId`. Frees the
     /// ring, removes the mapping, and reaps the kernel-side
@@ -366,14 +371,14 @@ pub enum Syscall {
     /// on success, 0 on OOM / oversize / no kernel support. The
     /// region is page-aligned, zero-filled, and owned by the
     /// calling process; auto-reaped on exit.
-    ShmemCreate  = 250,
+    ShmemCreate = 250,
 
     /// Map a shmem region into the caller's VA. `arg0` =
     /// `ShmemHandleId`. Returns the user VA (page-aligned) or 0 on
     /// failure (bad handle, foreign owner, OOM). The mapping is RW
     /// and contiguous in VA even though the backing frames are
     /// scattered.
-    ShmemMap     = 251,
+    ShmemMap = 251,
 
     /// Tear down a shmem region. `arg0` = `ShmemHandleId`. The
     /// userspace mapping stays installed for now (page-table
@@ -402,30 +407,30 @@ pub enum Syscall {
     /// Kick the kernel-side dispatcher to drain the calling task's
     /// shared SubmissionRing and post Completions to the shared
     /// CompletionRing. Returns the number of submissions processed.
-    RingKick     = 130,
+    RingKick = 130,
 
     /// Return the calling task's monotonic id. POSIX-shaped surface
     /// for relibc's `getpid()` / `gettid()` (we don't yet
     /// distinguish PID from TID — single-thread-per-process at
     /// Stage 4).
-    GetPid       = 140,
+    GetPid = 140,
     /// Return the calling task's parent id, or 0 if none. Stage 4
     /// stub: returns 0 unconditionally; real ppid lands once the
     /// scheduler tracks parentage.
-    GetPpid      = 141,
+    GetPpid = 141,
 
     /// POSIX-shaped uid/gid query. NARF's authority model is
     /// capabilities; the per-task uid/gid table is structural
     /// state only (no security implication). Default identity
     /// is (0, 0); `SetUid` / `SetGid` mutate it.
-    GetUid       = 142,
-    GetGid       = 143,
+    GetUid = 142,
+    GetGid = 143,
 
     /// Set the calling task's uid (`arg0`) / gid (`arg0`). Both
     /// always succeed and return 0; capabilities still gate every
     /// privileged operation.
-    SetUid       = 144,
-    SetGid       = 145,
+    SetUid = 144,
+    SetGid = 145,
 
     /// `arg0 = pid` (0 = self). Linux getpgid(2): return the
     /// process-group id of `pid`. NARF tracks pgids per-task in
@@ -433,47 +438,47 @@ pub enum Syscall {
     /// scheduling). Default pgid = pid (each task is its own
     /// group leader). Returns the pgid on success, -1 on
     /// unknown pid.
-    Getpgid      = 224,
+    Getpgid = 224,
 
     /// `arg0 = pid` (0 = self), `arg1 = pgid` (0 = use pid).
     /// Linux setpgid(2): record the new pgid for the target
     /// task. Always succeeds.
-    Setpgid      = 225,
+    Setpgid = 225,
 
     /// `arg0 = pid` (0 = self). POSIX getsid(2): return the
     /// session id of `pid`. NARF tracks sids per-task in a
     /// structural BTreeMap; default sid = pid.
-    Getsid       = 226,
+    Getsid = 226,
 
     /// No args. POSIX setsid(2): the calling task creates a new
     /// session with itself as the leader. Records sid = pid +
     /// pgid = pid in their respective tables; returns pid.
-    Setsid       = 227,
+    Setsid = 227,
 
     /// `arg0 = buf_ptr`, `arg1 = buf_len`. Copy the kernel-wide
     /// hostname (NUL-terminated UTF-8) into the user buffer.
     /// Returns the byte length excluding the NUL on success, -1 on
     /// `buf_len < name_len + 1`.
-    GetHostname  = 146,
+    GetHostname = 146,
 
     /// `arg0 = buf_ptr`, `arg1 = buf_len`. Replace the kernel-wide
     /// hostname with the supplied bytes. Stage-4 simplification:
     /// any task can set the hostname (no cap gate yet — landing
     /// alongside the cap-table integration). Returns 0 on success,
     /// -1 on rejection (length cap, malformed UTF-8).
-    SetHostname  = 147,
+    SetHostname = 147,
 
     /// `arg0 = resource` (POSIX RLIMIT_*), `arg1 = rlimit_out_ptr`.
     /// Write the current task's `rlimit { cur, max }` pair into the
     /// user buffer. Returns 0 on success, -1 on bad pointer / out-
     /// of-range resource. NARF tracks rlimits as structural state
     /// only — capabilities still gate every privileged operation.
-    Getrlimit    = 148,
+    Getrlimit = 148,
 
     /// `arg0 = resource`, `arg1 = rlimit_in_ptr`. Update the
     /// current task's `rlimit` for `resource`. Returns 0 on
     /// success, -1 on rejection.
-    Setrlimit    = 149,
+    Setrlimit = 149,
 
     /// `arg0 = pid` (0 = self), `arg1 = resource`,
     /// `arg2 = new_in_ptr`, `arg3 = old_out_ptr`. Linux
@@ -481,19 +486,19 @@ pub enum Syscall {
     /// write the [cur, max] pair. If `old` is non-null, return
     /// the prior value into it. Both null is a no-op-success.
     /// Returns 0 on success, -1 on bad pointer / out-of-range.
-    Prlimit64    = 178,
+    Prlimit64 = 178,
 
     /// `arg0 = which` (PRIO_PROCESS=0 only honoured), `arg1 = who`
     /// (0 = self). Returns the current task's nice value (-20..=19),
     /// shifted by +20 so the wire value is 0..=39 (matches Linux's
     /// pre-shift convention so user code can subtract 20 without
     /// caring about negatives crossing the wire). -1 on bad which.
-    Getpriority  = 156,
+    Getpriority = 156,
 
     /// `arg0 = which`, `arg1 = who`, `arg2 = prio` (-20..=19,
     /// already user-side). Stores the new nice value. Returns 0
     /// on success, -1 on bad which / out-of-range prio.
-    Setpriority  = 157,
+    Setpriority = 157,
 
     /// `arg0 = tms_out_ptr`. POSIX times(2): write the calling
     /// task's `struct tms { i64 utime, stime, cutime, cstime }`
@@ -503,14 +508,14 @@ pub enum Syscall {
     /// ticks, `stime` and child fields are zero — but the surface
     /// round-trips so `clock(3)` and `time(1)`-shaped consumers
     /// see a calibratable wall clock.
-    Times        = 158,
+    Times = 158,
 
     /// `arg0 = who` (RUSAGE_SELF=0; RUSAGE_CHILDREN=-1 returns
     /// zeroed struct), `arg1 = rusage_out_ptr`. Writes the
     /// glibc-shaped 16-i64 rusage struct: ru_utime.tv_sec /
     /// ru_utime.tv_usec from monotonic_ns, every other field
     /// zero. Returns 0 on success, -1 on bad pointer.
-    Getrusage    = 159,
+    Getrusage = 159,
 
     /// `arg0 = new_mask` (only the low 9 bits — POSIX 0o777). Sets
     /// the calling task's file-creation mask and returns the
@@ -519,13 +524,13 @@ pub enum Syscall {
     /// structural state — but the round-trip lets `umask(0o077)`
     /// followed by `umask(0o022)` see the prior value, which is
     /// what consumer init code expects.
-    Umask        = 155,
+    Umask = 155,
 
     /// `arg0 = cpu_out_ptr`, `arg1 = node_out_ptr`. Linux getcpu(2):
     /// write the calling CPU id + NUMA node id to the supplied
     /// out-pointers (each may be null). NARF user mode is
     /// single-CPU today — both return 0. Returns 0 on success.
-    Getcpu       = 165,
+    Getcpu = 165,
 
     /// `arg0 = pid` (0 = self), `arg1 = mask_size` (bytes),
     /// `arg2 = mask_out_ptr`. Linux sched_getaffinity(2): write
@@ -556,24 +561,24 @@ pub enum Syscall {
     /// Linux sched_getparam(2): write a single-field
     /// `struct sched_param { int sched_priority }` (POSIX).
     /// Returns 0 on success, -1 on bad pointer.
-    SchedGetparam       = 222,
+    SchedGetparam = 222,
 
     /// `arg0 = pid`, `arg1 = sched_param_in_ptr`. Read the
     /// `sched_priority` field, store on the task. Returns 0.
-    SchedSetparam       = 223,
+    SchedSetparam = 223,
 
     /// Linux gettid(2): return the calling thread's distinct kernel
     /// id (in multi-threaded processes pid identifies the process,
     /// tid identifies the thread). NARF is single-threaded per
     /// process, so gettid == getpid. Lands the surface so the
     /// libc shim's ABI is right for when threading arrives.
-    Gettid       = 168,
+    Gettid = 168,
 
     /// Linux tkill(2) / tgkill(2): like kill but targets a specific
     /// thread within a process group. NARF is single-threaded per
     /// process — tgkill aliases sys_kill. `arg0 = tgid` (-1 = any),
     /// `arg1 = tid`, `arg2 = signum`. Returns 0 on success.
-    Tgkill       = 175,
+    Tgkill = 175,
 
     /// Linux futex(2) minimal scaffold. `arg0 = uaddr_ptr`,
     /// `arg1 = op`, `arg2 = val`, `arg3 = timeout/uaddr2`,
@@ -588,7 +593,7 @@ pub enum Syscall {
     ///   - FUTEX_PRIVATE (0x80) and FUTEX_CLOCK_REALTIME (0x100)
     ///                     bits are accepted-and-ignored.
     /// Other ops return -1.
-    Futex        = 177,
+    Futex = 177,
 
     /// Linux prctl(2): per-task settings switchboard. `arg0 = op`,
     /// `arg1 = argA`, `arg2 = argB`. Honoured ops:
@@ -604,12 +609,12 @@ pub enum Syscall {
     ///   - PR_SET_NO_NEW_PRIVS (38) / PR_GET_NO_NEW_PRIVS (39):
     ///                        round-trip the boolean.
     /// Everything else returns -1.
-    Prctl        = 169,
+    Prctl = 169,
 
     /// Set or query the per-task heap break.
     /// `arg0 = 0` → return current break; `arg0 != 0` → resize.
     /// POSIX `brk(2)` semantics: failure returns the unchanged break.
-    Brk          = 150,
+    Brk = 150,
 
     /// Write monotonic time to the user buffer at `arg1` for clock id
     /// `arg0`. Buffer is `struct timespec { tv_sec: i64, tv_nsec: i64 }`.
@@ -630,7 +635,7 @@ pub enum Syscall {
     /// trap-return path of any subsequent int-0x80 from this
     /// task that observes a pending signal; see `Kill` /
     /// `Sigprocmask`. Returns 0.
-    Sigaction    = 152,
+    Sigaction = 152,
 
     /// Mark `signum` pending on the task identified by
     /// `arg0 = target_pid`. `arg1 = signum`. Returns 0; the
@@ -639,13 +644,13 @@ pub enum Syscall {
     /// gate (see `handlers::deliver_pending_signals`). Stage-4
     /// stub: any task can signal any other; cap-gating lands
     /// later.
-    Kill         = 153,
+    Kill = 153,
 
     /// Update the calling task's signal-block mask.
     /// `arg0 = how` (0 = BLOCK, 1 = UNBLOCK, 2 = SETMASK),
     /// `arg1 = set` (32-bit bitmap). Returns the **previous**
     /// mask in the syscall return value.
-    Sigprocmask  = 154,
+    Sigprocmask = 154,
 
     // ── Dup family + fcntl ────────────────────────────────────────
     //
@@ -653,36 +658,34 @@ pub enum Syscall {
     // libc programs reach for. POSIX `dup`/`dup2`/`dup3`/`fcntl`.
     // Numbers chosen above the signal block (152..=154) so signal
     // and dup work can land independently without renumbering.
-
     /// Duplicate `arg0 = oldfd` into the lowest free slot ≥ 3.
     /// Returns the new fd in the syscall return value.
-    Dup          = 160,
+    Dup = 160,
 
     /// Duplicate `arg0 = oldfd` to `arg1 = newfd`. Closes `newfd`
     /// first if it's open. Returns `newfd`.
-    Dup2         = 161,
+    Dup2 = 161,
 
     /// Like `Dup2` but `arg2 = flags` controls `FD_CLOEXEC` on the
     /// duplicate. `dup3(fd, fd, 0)` is an error (per Linux); use
     /// `Dup2` for the same-fd no-op.
-    Dup3         = 162,
+    Dup3 = 162,
 
     /// `arg0 = fd, arg1 = cmd, arg2 = arg`. Supported commands:
     /// F_GETFD / F_SETFD / F_GETFL / F_SETFL.
-    Fcntl        = 163,
+    Fcntl = 163,
 
     // ── Working-directory state ────────────────────────────────────
     //
     // Slots 170/171 sit above the dup family (160..=163) so the cwd
     // and fd-control surfaces evolve independently without colliding.
-
     /// Update the calling task's current working directory.
     /// `arg0 = path_ptr`, `arg1 = path_len`. Stage-4 first cut:
     /// absolute paths only (path must start with `/`); relative-
     /// path support lands alongside the `*at(2)` family. Path text
     /// is required to be valid UTF-8. Returns 0 on success,
     /// `InvalidOp` on malformed input.
-    Chdir        = 170,
+    Chdir = 170,
 
     /// Copy the calling task's current working directory into the
     /// caller's buffer. `arg0 = buf_ptr`, `arg1 = buf_len`. The
@@ -691,26 +694,25 @@ pub enum Syscall {
     /// `buf_len < cwd.len() + 1` the call returns `InvalidOp` —
     /// a real libc translates that to ERANGE; the syscall return
     /// shape doesn't yet carry an errno channel.
-    Getcwd       = 171,
+    Getcwd = 171,
 
     // ── Tier-2.5 fd extensions ─────────────────────────────────────
     //
     // Slots 164/180 reserved for `lseek(2)` and `unlink(2)`. Numbers
     // chosen to leave the dup family + cwd block contiguous and to
     // give unlink room for a follow-on `rename(2)` at 181.
-
     /// `arg0 = fd`, `arg1 = offset (i64)`, `arg2 = whence`
     /// (0 = SEEK_SET, 1 = SEEK_CUR, 2 = SEEK_END). Updates the
     /// per-fd offset and returns the new value as the syscall's
     /// `value`. `InvalidOp` on out-of-range fd or negative result.
-    Lseek        = 164,
+    Lseek = 164,
 
     /// `arg0 = path_ptr`, `arg1 = path_len`. Removes a file from the
     /// VFS via `DirOps::unlink` on the parent directory. Returns
     /// `value = 0` on success and `value = -1` on failure (the user-
     /// runtime asm wrapper observes only the value register, not the
     /// status word, so the value channel must distinguish).
-    Unlink       = 180,
+    Unlink = 180,
 
     // ── Tier-3b directory mutation ─────────────────────────────────
     //
@@ -719,21 +721,20 @@ pub enum Syscall {
     // parent `DirOps`. The default trait impls for FSes that don't
     // implement these return `Unsupported`; the handler then
     // surfaces `value = -1`. POSIX-shaped 0/-1 return convention.
-
     /// `arg0 = path_ptr`, `arg1 = path_len`, `arg2 = mode (ignored)`.
     /// Creates an empty subdirectory at the absolute path's leaf.
-    Mkdir        = 190,
+    Mkdir = 190,
 
     /// `arg0 = path_ptr`, `arg1 = path_len`. Removes an empty
     /// subdirectory.
-    Rmdir        = 191,
+    Rmdir = 191,
 
     /// `arg0 = old_path_ptr`, `arg1 = old_path_len`,
     /// `arg2 = new_path_ptr`, `arg3 = new_path_len`. Cross-
     /// directory rename is unsupported today; both paths must
     /// resolve to the same parent directory or the syscall returns
     /// failure.
-    Rename       = 192,
+    Rename = 192,
 
     /// `arg0 = path_ptr`, `arg1 = path_len`, `arg2 = buf_ptr`,
     /// `arg3 = buf_len`. Path-based symlink read / create over MemFs
@@ -742,14 +743,14 @@ pub enum Syscall {
     /// `buf_len` target-bytes into the caller's buffer. Returns the
     /// byte count on success; -1 if the path doesn't resolve, the
     /// entry isn't a symlink, or the user pointers are bad.
-    Readlink     = 193,
+    Readlink = 193,
 
     /// `arg0 = target_ptr`, `arg1 = target_len`, `arg2 = link_ptr`,
     /// `arg3 = link_len`. Path-based symlink read / create over MemFs
     /// symlink entries. Resolves `link_path`'s parent and inserts an
     /// `Entry::Symlink` whose target is the verbatim `target` string.
     /// Returns 0 on success, -1 on duplicate or bad input.
-    Symlink      = 194,
+    Symlink = 194,
 
     /// `arg0 = path_ptr`, `arg1 = path_len`, `arg2 = cursor` (entry
     /// index, 0-based), `arg3 = out_buf_ptr`, `arg4 = out_buf_len`.
@@ -763,7 +764,7 @@ pub enum Syscall {
     /// path lookup failure). The libc `<dirent.h>` shim drives
     /// this once per `readdir` call with a monotonically-increasing
     /// cursor; the kernel re-snapshots each call.
-    Listdir      = 195,
+    Listdir = 195,
 
     /// `arg0 = path_ptr`, `arg1 = path_len`, `arg2 = cursor`,
     /// `arg3 = out_buf_ptr`, `arg4 = out_buf_len`. Batched
@@ -772,13 +773,12 @@ pub enum Syscall {
     /// `{ d_ino: u64, d_off: u64, d_reclen: u16, d_type: u8, d_name }`.
     /// Each record is padded to 8-byte alignment. Returns the total
     /// bytes written on success, 0 on end-of-directory, -1 on error.
-    Getdents64   = 196,
+    Getdents64 = 196,
 
     // ── Tier-3z entropy ────────────────────────────────────────────
     //
     // Slot 200 sits above the directory-mutation block to leave room
     // for future fs syscalls (read-link, sync, fdatasync, ...).
-
     /// `arg0 = buf_ptr`, `arg1 = buf_len`, `arg2 = flags (ignored)`.
     /// Fill the user buffer with up-to `buf_len` random bytes.
     /// Returns the byte count actually written; -1 on bad pointer or
@@ -787,14 +787,15 @@ pub enum Syscall {
     /// cryptographically secure. The seed quality matches
     /// `crypto::per_task_rng()` so callers wanting real entropy
     /// must also gate on a future `arch::has_hw_entropy()` probe.
-    GetRandom    = 200,
-
+    GetRandom = 200,
 }
 
 impl Syscall {
     /// Raw wire number.
     #[inline]
-    pub const fn raw(self) -> u32 { self as u32 }
+    pub const fn raw(self) -> u32 {
+        self as u32
+    }
 
     /// Parse from a raw number.
     pub const fn from_raw(n: u32) -> Option<Self> {
@@ -903,7 +904,7 @@ impl Syscall {
             251 => Syscall::ShmemMap,
             252 => Syscall::ShmemDestroy,
             260 => Syscall::FirmwareInstall,
-            _   => return None,
+            _ => return None,
         })
     }
 }
@@ -915,8 +916,12 @@ impl Syscall {
 /// and is wide enough for aarch64 (x0..=x5).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct SyscallArgs {
-    pub arg0: u64, pub arg1: u64, pub arg2: u64,
-    pub arg3: u64, pub arg4: u64, pub arg5: u64,
+    pub arg0: u64,
+    pub arg1: u64,
+    pub arg2: u64,
+    pub arg3: u64,
+    pub arg4: u64,
+    pub arg5: u64,
 }
 
 /// Return value for a syscall. Mirrors `abi::NarfStatus` + one
@@ -933,18 +938,28 @@ pub struct SyscallArgs {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SyscallReturn {
     pub status: u32,
-    pub value:  u64,
+    pub value: u64,
 }
 
 impl SyscallReturn {
-    pub const OK:         u32 = 0;
+    pub const OK: u32 = 0;
     pub const INVALID_OP: u32 = 1;
 
     #[inline]
-    pub const fn ok(value: u64) -> Self { Self { status: Self::OK, value } }
+    pub const fn ok(value: u64) -> Self {
+        Self {
+            status: Self::OK,
+            value,
+        }
+    }
 
     #[inline]
-    pub const fn invalid_op() -> Self { Self { status: Self::INVALID_OP, value: 0 } }
+    pub const fn invalid_op() -> Self {
+        Self {
+            status: Self::INVALID_OP,
+            value: 0,
+        }
+    }
 }
 
 // ── Handler + table ─────────────────────────────────────────────────
@@ -973,15 +988,21 @@ pub trait RawSyscallHandler: Send + Sync + 'static {
 pub struct FnHandler<F: Fn(&SyscallArgs) -> SyscallReturn + Send + Sync + 'static>(pub F);
 
 impl<F> core::fmt::Debug for FnHandler<F>
-where F: Fn(&SyscallArgs) -> SyscallReturn + Send + Sync + 'static {
+where
+    F: Fn(&SyscallArgs) -> SyscallReturn + Send + Sync + 'static,
+{
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("FnHandler").finish_non_exhaustive()
     }
 }
 
 impl<F> SyscallHandler for FnHandler<F>
-where F: Fn(&SyscallArgs) -> SyscallReturn + Send + Sync + 'static {
-    fn invoke(&self, args: &SyscallArgs) -> SyscallReturn { (self.0)(args) }
+where
+    F: Fn(&SyscallArgs) -> SyscallReturn + Send + Sync + 'static,
+{
+    fn invoke(&self, args: &SyscallArgs) -> SyscallReturn {
+        (self.0)(args)
+    }
 }
 
 /// One table slot: the diagnostic name + zero/one handler of each
@@ -996,23 +1017,23 @@ where F: Fn(&SyscallArgs) -> SyscallReturn + Send + Sync + 'static {
 /// always encode `version=0` implicitly, so they keep dispatching
 /// to the v0 handler forever even after a v1 override is added.
 pub struct SyscallEntry {
-    pub number:      Syscall,
-    pub name:        &'static str,
-    pub handler:     Option<Box<dyn SyscallHandler>>,
+    pub number: Syscall,
+    pub name: &'static str,
+    pub handler: Option<Box<dyn SyscallHandler>>,
     pub raw_handler: Option<Box<dyn RawSyscallHandler>>,
     /// `(version, raw_handler)` pairs for non-zero versions. Probed
     /// before falling through to `raw_handler` / `handler`.
-    pub versioned:   Vec<(u8, Box<dyn RawSyscallHandler>)>,
+    pub versioned: Vec<(u8, Box<dyn RawSyscallHandler>)>,
 }
 
 impl core::fmt::Debug for SyscallEntry {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("SyscallEntry")
-            .field("number",      &self.number)
-            .field("name",        &self.name)
+            .field("number", &self.number)
+            .field("name", &self.name)
             .field("has_handler", &self.handler.is_some())
-            .field("has_raw",     &self.raw_handler.is_some())
-            .field("versions",    &self.versioned.len())
+            .field("has_raw", &self.raw_handler.is_some())
+            .field("versions", &self.versioned.len())
             .finish()
     }
 }
@@ -1033,9 +1054,9 @@ impl core::fmt::Debug for SyscallEntry {
 /// Bit shift for the version field in a raw syscall number.
 pub const SYS_VERSION_SHIFT: u32 = 24;
 /// Mask isolating the version field.
-pub const SYS_VERSION_MASK:  u32 = 0xFF00_0000;
+pub const SYS_VERSION_MASK: u32 = 0xFF00_0000;
 /// Mask isolating the canonical syscall number (low 24 bits).
-pub const SYS_NUMBER_MASK:   u32 = 0x00FF_FFFF;
+pub const SYS_NUMBER_MASK: u32 = 0x00FF_FFFF;
 
 /// Pull the version (0..=255) out of a raw syscall number.
 #[inline]
@@ -1045,7 +1066,9 @@ pub const fn syscall_version(raw: u32) -> u8 {
 
 /// Pull the canonical syscall number out of a raw syscall number.
 #[inline]
-pub const fn syscall_number(raw: u32) -> u32 { raw & SYS_NUMBER_MASK }
+pub const fn syscall_number(raw: u32) -> u32 {
+    raw & SYS_NUMBER_MASK
+}
 
 /// Pack a `(version, syscall)` pair into the wire-format u32.
 #[inline]
@@ -1061,14 +1084,21 @@ pub struct SyscallTable {
 }
 
 impl SyscallTable {
-    pub const fn new() -> Self { Self { entries: Vec::new() } }
+    pub const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
 
     /// Register a diagnostic name against a syscall number (no
     /// handler body). Useful when a subsystem wants the name to
     /// show up in tracing while implementation is pending.
     pub fn register(&mut self, n: Syscall, name: &'static str) {
         self.entries.push(SyscallEntry {
-            number: n, name, handler: None, raw_handler: None,
+            number: n,
+            name,
+            handler: None,
+            raw_handler: None,
             versioned: Vec::new(),
         });
     }
@@ -1078,9 +1108,17 @@ impl SyscallTable {
     /// take over stubs landed earlier. A raw handler registered
     /// separately still wins on dispatch.
     pub fn install<H: SyscallHandler + 'static>(
-        &mut self, n: Syscall, name: &'static str, handler: H,
+        &mut self,
+        n: Syscall,
+        name: &'static str,
+        handler: H,
     ) {
-        self.install_slot(n, name, Some(Box::new(handler) as Box<dyn SyscallHandler>), None);
+        self.install_slot(
+            n,
+            name,
+            Some(Box::new(handler) as Box<dyn SyscallHandler>),
+            None,
+        );
     }
 
     /// Register a raw handler for `n`. A raw handler receives the
@@ -1088,9 +1126,17 @@ impl SyscallTable {
     /// kernel) and is chosen over a plain handler when both are
     /// installed.
     pub fn install_raw<H: RawSyscallHandler + 'static>(
-        &mut self, n: Syscall, name: &'static str, handler: H,
+        &mut self,
+        n: Syscall,
+        name: &'static str,
+        handler: H,
     ) {
-        self.install_slot(n, name, None, Some(Box::new(handler) as Box<dyn RawSyscallHandler>));
+        self.install_slot(
+            n,
+            name,
+            None,
+            Some(Box::new(handler) as Box<dyn RawSyscallHandler>),
+        );
     }
 
     fn install_slot(
@@ -1098,15 +1144,22 @@ impl SyscallTable {
         n: Syscall,
         name: &'static str,
         plain: Option<Box<dyn SyscallHandler>>,
-        raw:   Option<Box<dyn RawSyscallHandler>>,
+        raw: Option<Box<dyn RawSyscallHandler>>,
     ) {
         if let Some(slot) = self.entries.iter_mut().find(|e| e.number == n) {
             slot.name = name;
-            if plain.is_some() { slot.handler     = plain; }
-            if raw.is_some()   { slot.raw_handler = raw; }
+            if plain.is_some() {
+                slot.handler = plain;
+            }
+            if raw.is_some() {
+                slot.raw_handler = raw;
+            }
         } else {
             self.entries.push(SyscallEntry {
-                number: n, name, handler: plain, raw_handler: raw,
+                number: n,
+                name,
+                handler: plain,
+                raw_handler: raw,
                 versioned: Vec::new(),
             });
         }
@@ -1122,7 +1175,10 @@ impl SyscallTable {
         version: u8,
         handler: H,
     ) {
-        assert!(version != 0, "version=0 is the canonical ABI; use install_raw");
+        assert!(
+            version != 0,
+            "version=0 is the canonical ABI; use install_raw"
+        );
         let boxed = Box::new(handler) as Box<dyn RawSyscallHandler>;
         let slot = if let Some(s) = self.entries.iter_mut().find(|e| e.number == n) {
             s
@@ -1145,13 +1201,17 @@ impl SyscallTable {
 
     /// Shorthand: install a closure as a plain handler.
     pub fn install_fn<F>(&mut self, n: Syscall, name: &'static str, f: F)
-    where F: Fn(&SyscallArgs) -> SyscallReturn + Send + Sync + 'static {
+    where
+        F: Fn(&SyscallArgs) -> SyscallReturn + Send + Sync + 'static,
+    {
         self.install(n, name, FnHandler(f));
     }
 
     /// Shorthand: install a closure as a raw handler.
     pub fn install_raw_fn<F>(&mut self, n: Syscall, name: &'static str, f: F)
-    where F: Fn(&mut dyn TrapContext) + Send + Sync + 'static {
+    where
+        F: Fn(&mut dyn TrapContext) + Send + Sync + 'static,
+    {
         self.install_raw(n, name, RawFnHandler(f));
     }
 
@@ -1189,12 +1249,7 @@ impl SyscallTable {
     /// This makes a v1 caller of an as-yet-unversioned syscall fall
     /// back to v0 transparently — the right answer when v0 is the
     /// canonical wire ABI.
-    pub fn dispatch_ctx_versioned(
-        &self,
-        n: Syscall,
-        version: u8,
-        ctx: &mut dyn TrapContext,
-    ) {
+    pub fn dispatch_ctx_versioned(&self, n: Syscall, version: u8, ctx: &mut dyn TrapContext) {
         if let Some(slot) = self.entries.iter().find(|e| e.number == n) {
             if version != 0 {
                 if let Some((_, h)) = slot.versioned.iter().find(|(v, _)| *v == version) {
@@ -1216,27 +1271,39 @@ impl SyscallTable {
         ctx.set_return(SyscallReturn::invalid_op());
     }
 
-    pub fn len(&self) -> usize { self.entries.len() }
-    pub fn is_empty(&self) -> bool { self.entries.is_empty() }
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 /// Closure-backed raw handler shim.
 pub struct RawFnHandler<F: Fn(&mut dyn TrapContext) + Send + Sync + 'static>(pub F);
 
 impl<F> core::fmt::Debug for RawFnHandler<F>
-where F: Fn(&mut dyn TrapContext) + Send + Sync + 'static {
+where
+    F: Fn(&mut dyn TrapContext) + Send + Sync + 'static,
+{
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("RawFnHandler").finish_non_exhaustive()
     }
 }
 
 impl<F> RawSyscallHandler for RawFnHandler<F>
-where F: Fn(&mut dyn TrapContext) + Send + Sync + 'static {
-    fn invoke(&self, ctx: &mut dyn TrapContext) { (self.0)(ctx); }
+where
+    F: Fn(&mut dyn TrapContext) + Send + Sync + 'static,
+{
+    fn invoke(&self, ctx: &mut dyn TrapContext) {
+        (self.0)(ctx);
+    }
 }
 
 impl Default for SyscallTable {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ── Global install + dispatch ───────────────────────────────────────
@@ -1288,7 +1355,9 @@ pub fn __test_clear_global() {
     if !prev.is_null() {
         // SAFETY: caller guarantees no dispatch is in flight against
         // `prev`; this is the test reset boundary.
-        unsafe { drop(Box::from_raw(prev)); }
+        unsafe {
+            drop(Box::from_raw(prev));
+        }
     }
 }
 
@@ -1314,13 +1383,19 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
     // number (low 24 bits). v0 callers encode 0 in the upper bits
     // implicitly, so pre-versioning binaries dispatch to v0 forever.
     let version = syscall_version(num);
-    let raw_n   = syscall_number(num);
+    let raw_n = syscall_number(num);
     let n = match Syscall::from_raw(raw_n) {
         Some(v) => v,
-        None    => { ctx.set_return(SyscallReturn::invalid_op()); return; }
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
     };
     let p = GLOBAL.load(Ordering::Acquire);
-    if p.is_null() { ctx.set_return(SyscallReturn::invalid_op()); return; }
+    if p.is_null() {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
     // SAFETY: `install_global` published `p` via `Box::into_raw`; the
     // pointer is valid for the lifetime of the kernel (or until
     // `__test_clear_global` runs at a test boundary, with no
@@ -1338,11 +1413,15 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
 pub fn kernel_syscall_entry_plain(num: u32, args: &SyscallArgs) -> SyscallReturn {
     let n = match Syscall::from_raw(num) {
         Some(v) => v,
-        None    => return SyscallReturn::invalid_op(),
+        None => return SyscallReturn::invalid_op(),
     };
     let p = GLOBAL.load(Ordering::Acquire);
-    if p.is_null() { return SyscallReturn::invalid_op(); }
+    if p.is_null() {
+        return SyscallReturn::invalid_op();
+    }
     // SAFETY: see `kernel_syscall_entry`.
     let table: &SyscallTable = unsafe { &*p };
-    table.dispatch(n, args).unwrap_or_else(SyscallReturn::invalid_op)
+    table
+        .dispatch(n, args)
+        .unwrap_or_else(SyscallReturn::invalid_op)
 }

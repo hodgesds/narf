@@ -18,14 +18,14 @@ fn id_aa64pfr1() -> u64 {
 
 #[derive(Copy, Clone, Debug, Default)]
 pub struct SmeCaps {
-    pub sme:  bool,
+    pub sme: bool,
     pub sme2: bool,
 }
 
 pub fn caps() -> SmeCaps {
     let f = (id_aa64pfr1() >> 24) & 0xF;
     SmeCaps {
-        sme:  f >= 1,
+        sme: f >= 1,
         sme2: f >= 2,
     }
 }
@@ -65,12 +65,16 @@ pub unsafe fn write_svcr(v: u64) {
 pub unsafe fn enter_streaming() {
     // SAFETY: caller-asserted.
     let v = unsafe { read_svcr() } | SVCR_SM;
-    unsafe { write_svcr(v); }
+    unsafe {
+        write_svcr(v);
+    }
 }
 
 pub unsafe fn leave_streaming() {
     let v = unsafe { read_svcr() } & !SVCR_SM;
-    unsafe { write_svcr(v); }
+    unsafe {
+        write_svcr(v);
+    }
 }
 
 /// Enable ZA tile storage (SVCR.ZA = 1).
@@ -79,12 +83,16 @@ pub unsafe fn leave_streaming() {
 /// EL1; SME supported; SMEN open.
 pub unsafe fn enable_za() {
     let v = unsafe { read_svcr() } | SVCR_ZA;
-    unsafe { write_svcr(v); }
+    unsafe {
+        write_svcr(v);
+    }
 }
 
 pub unsafe fn disable_za() {
     let v = unsafe { read_svcr() } & !SVCR_ZA;
-    unsafe { write_svcr(v); }
+    unsafe {
+        write_svcr(v);
+    }
 }
 
 /// Read `SMCR_EL1` (raw `S3_0_C1_C2_6`) — streaming-mode VL

@@ -63,22 +63,22 @@ define_typed_id!(
 // type so every subsystem has a single import path. These are declarations;
 // runtime enforcement (PKS / MTE enable) lands in Stage 2.
 impl DomainId {
-    pub const FRAME:       Self = Self::new(0);
-    pub const CAPS:        Self = Self::new(1);
-    pub const MEMORY_MGR:  Self = Self::new(2);
-    pub const SCHED:       Self = Self::new(3);
-    pub const IPC:         Self = Self::new(4);
-    pub const TRACER:      Self = Self::new(5);
-    pub const KEYS:        Self = Self::new(6);
-    pub const OBSERVE:     Self = Self::new(7);
+    pub const FRAME: Self = Self::new(0);
+    pub const CAPS: Self = Self::new(1);
+    pub const MEMORY_MGR: Self = Self::new(2);
+    pub const SCHED: Self = Self::new(3);
+    pub const IPC: Self = Self::new(4);
+    pub const TRACER: Self = Self::new(5);
+    pub const KEYS: Self = Self::new(6);
+    pub const OBSERVE: Self = Self::new(7);
     pub const USERSPACE_K: Self = Self::new(8);
-    pub const DRIVER_0:    Self = Self::new(9);
-    pub const DRIVER_1:    Self = Self::new(10);
-    pub const DRIVER_2:    Self = Self::new(11);
-    pub const DRIVER_3:    Self = Self::new(12);
-    pub const DRIVER_4:    Self = Self::new(13);
-    pub const DRIVER_5:    Self = Self::new(14);
-    pub const SCRATCH:     Self = Self::new(15);
+    pub const DRIVER_0: Self = Self::new(9);
+    pub const DRIVER_1: Self = Self::new(10);
+    pub const DRIVER_2: Self = Self::new(11);
+    pub const DRIVER_3: Self = Self::new(12);
+    pub const DRIVER_4: Self = Self::new(13);
+    pub const DRIVER_5: Self = Self::new(14);
+    pub const SCRATCH: Self = Self::new(15);
 }
 
 #[cfg(test)]
@@ -87,9 +87,9 @@ mod tests {
 
     #[test]
     fn typed_ids_are_transparent() {
-        assert_eq!(core::mem::size_of::<CpuId>(),   core::mem::size_of::<u16>());
+        assert_eq!(core::mem::size_of::<CpuId>(), core::mem::size_of::<u16>());
         assert_eq!(core::mem::size_of::<DomainId>(), core::mem::size_of::<u8>());
-        assert_eq!(core::mem::size_of::<TaskId>(),  core::mem::size_of::<u32>());
+        assert_eq!(core::mem::size_of::<TaskId>(), core::mem::size_of::<u32>());
     }
 
     #[test]

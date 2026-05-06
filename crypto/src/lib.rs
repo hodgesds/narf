@@ -25,8 +25,8 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(missing_debug_implementations)]
 
-pub mod tpm;
 pub mod pq;
+pub mod tpm;
 
 mod tests;
 
@@ -55,11 +55,11 @@ use narf_capabilities::{Cap, CapError, CapKind, CapType, Grant, Read};
 #[repr(u32)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum KeyAlg {
-    Ed25519Verify       = 0x01,
-    Ed25519Sign         = 0x02,
-    AesGcm256           = 0x03,
-    ChaCha20Poly1305    = 0x04,
-    Hkdf                = 0x05,
+    Ed25519Verify = 0x01,
+    Ed25519Sign = 0x02,
+    AesGcm256 = 0x03,
+    ChaCha20Poly1305 = 0x04,
+    Hkdf = 0x05,
 }
 
 /// Marker trait every algorithm tag implements; the constant lets the
@@ -72,29 +72,39 @@ pub trait KeyAlgorithm: 'static {
 /// Type-level marker: Ed25519 public-key verification.
 #[derive(Copy, Clone, Debug)]
 pub struct Ed25519Verify;
-impl KeyAlgorithm for Ed25519Verify { const ALG: KeyAlg = KeyAlg::Ed25519Verify; }
+impl KeyAlgorithm for Ed25519Verify {
+    const ALG: KeyAlg = KeyAlg::Ed25519Verify;
+}
 
 /// Type-level marker: Ed25519 secret-key signing. Stage 3 reserves the
 /// type; the actual sign path lands once the key-store is wired.
 #[derive(Copy, Clone, Debug)]
 pub struct Ed25519Sign;
-impl KeyAlgorithm for Ed25519Sign { const ALG: KeyAlg = KeyAlg::Ed25519Sign; }
+impl KeyAlgorithm for Ed25519Sign {
+    const ALG: KeyAlg = KeyAlg::Ed25519Sign;
+}
 
 /// Type-level marker: AES-256-GCM AEAD. Stage 3 type-only; primitive
 /// dispatch lands when AES-NI / ARMv8 AES are wired (Stage 4).
 #[derive(Copy, Clone, Debug)]
 pub struct AesGcm256;
-impl KeyAlgorithm for AesGcm256 { const ALG: KeyAlg = KeyAlg::AesGcm256; }
+impl KeyAlgorithm for AesGcm256 {
+    const ALG: KeyAlg = KeyAlg::AesGcm256;
+}
 
 /// Type-level marker: ChaCha20-Poly1305 AEAD.
 #[derive(Copy, Clone, Debug)]
 pub struct ChaCha20Poly1305Alg;
-impl KeyAlgorithm for ChaCha20Poly1305Alg { const ALG: KeyAlg = KeyAlg::ChaCha20Poly1305; }
+impl KeyAlgorithm for ChaCha20Poly1305Alg {
+    const ALG: KeyAlg = KeyAlg::ChaCha20Poly1305;
+}
 
 /// Type-level marker: HKDF-SHA-256 KDF (input-keying-material handle).
 #[derive(Copy, Clone, Debug)]
 pub struct Hkdf;
-impl KeyAlgorithm for Hkdf { const ALG: KeyAlg = KeyAlg::Hkdf; }
+impl KeyAlgorithm for Hkdf {
+    const ALG: KeyAlg = KeyAlg::Hkdf;
+}
 
 /// Phantom-typed key handle. The actual key bytes live behind the cap
 /// table in `DomainId::KEYS` (spec §5); this struct never carries
@@ -133,7 +143,9 @@ pub enum CryptoError {
 }
 
 impl From<CapError> for CryptoError {
-    fn from(_: CapError) -> Self { CryptoError::KeyUnavailable }
+    fn from(_: CapError) -> Self {
+        CryptoError::KeyUnavailable
+    }
 }
 
 // ── Ed25519 verify ───────────────────────────────────────────────────
@@ -157,10 +169,10 @@ pub fn ed25519_verify(
 
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
-    let vk = VerifyingKey::from_bytes(verifying_key)
-        .map_err(|_| CryptoError::InvalidSignature)?;
+    let vk = VerifyingKey::from_bytes(verifying_key).map_err(|_| CryptoError::InvalidSignature)?;
     let signature = Signature::from_bytes(sig);
-    vk.verify(msg, &signature).map_err(|_| CryptoError::InvalidSignature)
+    vk.verify(msg, &signature)
+        .map_err(|_| CryptoError::InvalidSignature)
 }
 
 // ── ChaCha20-Poly1305 AEAD ───────────────────────────────────────────
@@ -191,7 +203,8 @@ pub fn chacha20_seal(
     let key = AeadKey::from_slice(key_bytes);
     let cipher = ChaCha20Poly1305::new(key);
     let n = Nonce::from_slice(nonce);
-    cipher.encrypt_in_place(n, aad, plaintext)
+    cipher
+        .encrypt_in_place(n, aad, plaintext)
         .map_err(|_| CryptoError::AeadFailure)
 }
 
@@ -217,7 +230,8 @@ pub fn chacha20_open(
     let key = AeadKey::from_slice(key_bytes);
     let cipher = ChaCha20Poly1305::new(key);
     let n = Nonce::from_slice(nonce);
-    cipher.decrypt_in_place(n, aad, ciphertext)
+    cipher
+        .decrypt_in_place(n, aad, ciphertext)
         .map_err(|_| CryptoError::AeadFailure)
 }
 
@@ -242,7 +256,8 @@ pub fn hkdf_expand(
     // for SHA-256) — exceed that and we surface InsufficientOutputBuffer.
     let hk = HkdfImpl::<Sha256>::new(Some(salt), ikm);
     let mut out = alloc::vec![0u8; out_len];
-    hk.expand(info, &mut out).map_err(|_| CryptoError::InsufficientOutputBuffer)?;
+    hk.expand(info, &mut out)
+        .map_err(|_| CryptoError::InsufficientOutputBuffer)?;
     Ok(out)
 }
 
@@ -321,7 +336,9 @@ pub mod secure_ring {
         /// Stub constructor. Stage 4 replaces the body with the full
         /// handshake + AEAD-key-derivation path.
         pub const fn new() -> Self {
-            Self { _t: core::marker::PhantomData }
+            Self {
+                _t: core::marker::PhantomData,
+            }
         }
     }
 }

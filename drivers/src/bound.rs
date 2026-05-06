@@ -57,15 +57,15 @@ impl BoundKind {
     ///   * Other       → 15  (the catch-all bucket)
     pub const fn default_domain(self) -> u8 {
         match self {
-            BoundKind::Block    => 1,
-            BoundKind::Net      => 2,
-            BoundKind::UsbHost  => 3,
-            BoundKind::Rng      => 4,
-            BoundKind::Balloon  => 5,
-            BoundKind::Input    => 6,
+            BoundKind::Block => 1,
+            BoundKind::Net => 2,
+            BoundKind::UsbHost => 3,
+            BoundKind::Rng => 4,
+            BoundKind::Balloon => 5,
+            BoundKind::Input => 6,
             BoundKind::Graphics => 7,
-            BoundKind::Audio    => 8,
-            BoundKind::Other    => 15,
+            BoundKind::Audio => 8,
+            BoundKind::Other => 15,
         }
     }
 }
@@ -73,16 +73,16 @@ impl BoundKind {
 #[derive(Clone, Debug)]
 pub struct BoundDriver {
     /// Driver-side short name (e.g. "nvme0", "vblk0", "e1000-82540em").
-    pub name:     String,
-    pub kind:     BoundKind,
+    pub name: String,
+    pub kind: BoundKind,
     /// PCI vendor / device IDs the probe matched, when applicable.
     /// `None` for non-PCI drivers.
-    pub pci_vid:  Option<u16>,
-    pub pci_did:  Option<u16>,
+    pub pci_vid: Option<u16>,
+    pub pci_did: Option<u16>,
     /// Isolation domain assigned to this driver. Defaults to
     /// `kind.default_domain()` at registration; can be overridden
     /// via `set_domain` for explicit placement.
-    pub domain:   u8,
+    pub domain: u8,
 }
 
 /// Firmware-version coupling for a bound driver. Captured at the
@@ -95,15 +95,14 @@ pub struct BoundFirmware {
     /// Canonical name of the blob (e.g. "qcom/qcnfa765/amss.bin").
     pub blob_name: String,
     /// Digest of the firmware payload.
-    pub sha256:    [u8; 32],
+    pub sha256: [u8; 32],
     /// Signer fingerprint, when the blob was signed.
-    pub signer:    Option<[u8; 32]>,
+    pub signer: Option<[u8; 32]>,
     /// Vendor-supplied version string, when the trailer carried one.
-    pub version:   Option<String>,
+    pub version: Option<String>,
 }
 
-static BOUND: IrqSafeSpinLock<Vec<BoundDriver>> =
-    IrqSafeSpinLock::new(Vec::new());
+static BOUND: IrqSafeSpinLock<Vec<BoundDriver>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Record a successful bind. Idempotent on `name` — re-binding
 /// replaces the prior entry.
@@ -117,17 +116,21 @@ pub fn record(b: BoundDriver) {
 }
 
 /// Snapshot of currently-bound drivers.
-pub fn snapshot() -> Vec<BoundDriver> { BOUND.lock().clone() }
+pub fn snapshot() -> Vec<BoundDriver> {
+    BOUND.lock().clone()
+}
 
 /// Number of bound drivers.
-pub fn count() -> usize { BOUND.lock().len() }
+pub fn count() -> usize {
+    BOUND.lock().len()
+}
 
 /// Side table of firmware-version couplings, indexed by driver
 /// name. Set via `set_firmware`; queried via `firmware_of`. Kept
 /// out of `BoundDriver` so the existing struct-literal bind sites
 /// don't need an extra field.
-static BOUND_FIRMWARE: IrqSafeSpinLock<Vec<(String, BoundFirmware)>>
-    = IrqSafeSpinLock::new(Vec::new());
+static BOUND_FIRMWARE: IrqSafeSpinLock<Vec<(String, BoundFirmware)>> =
+    IrqSafeSpinLock::new(Vec::new());
 
 /// Record the firmware blob a driver loaded. Replaces any prior
 /// firmware entry on the same driver (re-loads pick up new
@@ -147,7 +150,9 @@ pub fn set_firmware(name: &str, fw: BoundFirmware) -> bool {
 
 /// Look up the firmware coupling recorded for `driver_name`, if any.
 pub fn firmware_of(driver_name: &str) -> Option<BoundFirmware> {
-    BOUND_FIRMWARE.lock().iter()
+    BOUND_FIRMWARE
+        .lock()
+        .iter()
         .find(|(n, _)| n == driver_name)
         .map(|(_, fw)| fw.clone())
 }
@@ -175,9 +180,15 @@ pub fn set_domain(name: &str, domain: u8) -> bool {
 
 /// Look up the assigned domain of a bound driver by name.
 pub fn domain_of(name: &str) -> Option<u8> {
-    BOUND.lock().iter().find(|e| e.name == name).map(|e| e.domain)
+    BOUND
+        .lock()
+        .iter()
+        .find(|e| e.name == name)
+        .map(|e| e.domain)
 }
 
 /// Test-only reset.
 #[doc(hidden)]
-pub fn __reset_for_test() { BOUND.lock().clear(); }
+pub fn __reset_for_test() {
+    BOUND.lock().clear();
+}

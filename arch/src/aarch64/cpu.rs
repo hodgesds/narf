@@ -20,8 +20,7 @@ pub const MAX_CPUS: usize = 64;
 /// `set_current_cpu(mpidr_aff(), 0)`. Subsequent APs register
 /// themselves on first entry.
 static MPIDR_TABLE: [AtomicU32; MAX_CPUS] = {
-    let mut t: [AtomicU32; MAX_CPUS] =
-        [const { AtomicU32::new(u32::MAX) }; MAX_CPUS];
+    let mut t: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(u32::MAX) }; MAX_CPUS];
     // SAFETY: const-init places sentinel u32::MAX everywhere; the
     // populator writes real affinity values during AP bring-up.
     t[0] = AtomicU32::new(0); // BSP slot — mapped post-init
@@ -39,7 +38,9 @@ pub fn current_cpu() -> u32 {
     // Linear scan — N is small (<= MAX_CPUS = 64) and the table
     // is read-mostly.
     for (i, slot) in MPIDR_TABLE.iter().enumerate() {
-        if slot.load(Ordering::Acquire) == aff { return i as u32; }
+        if slot.load(Ordering::Acquire) == aff {
+            return i as u32;
+        }
     }
     // BSP fallback — if the table hasn't been populated yet, all
     // executing CPUs are the BSP.
@@ -62,8 +63,8 @@ pub fn mpidr_aff() -> u32 {
             options(nomem, nostack, preserves_flags),
         );
     }
-    let aff0 = ((mpidr >> 0)  & 0xFF) as u32;
-    let aff1 = ((mpidr >> 8)  & 0xFF) as u32;
+    let aff0 = ((mpidr >> 0) & 0xFF) as u32;
+    let aff1 = ((mpidr >> 8) & 0xFF) as u32;
     let aff2 = ((mpidr >> 16) & 0xFF) as u32;
     let aff3 = ((mpidr >> 32) & 0xFF) as u32;
     (aff3 << 24) | (aff2 << 16) | (aff1 << 8) | aff0

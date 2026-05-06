@@ -14,16 +14,17 @@ use crate::x86_64::ident::{self, Vendor};
 
 #[derive(Copy, Clone, Debug)]
 pub struct Errata {
-    pub name:          &'static str,
-    pub vendor:        Vendor,
-    pub family:        u16,
-    pub model_lo:      u16,
-    pub model_hi:      u16,
+    pub name: &'static str,
+    pub vendor: Vendor,
+    pub family: u16,
+    pub model_lo: u16,
+    pub model_hi: u16,
     pub stepping_mask: u32,
-    pub apply:         unsafe fn(),
+    pub apply: unsafe fn(),
 }
 
-unsafe fn nop_workaround() { /* marker-only entry */ }
+unsafe fn nop_workaround() { /* marker-only entry */
+}
 
 /// Marker for Intel TSX-RTM disable (KBL027 / Skylake-X).
 ///
@@ -37,11 +38,15 @@ unsafe fn intel_disable_tsx_rtm() {
     const TSX_CTRL_MSR: u32 = 0x122;
     // SAFETY: leaf 7 sub-0 valid (Stage 1 boot validation).
     let (_, _, _, edx) = unsafe { cpuid(7, 0) };
-    if edx & (1 << 29) == 0 { return; }
+    if edx & (1 << 29) == 0 {
+        return;
+    }
     // bit 0 = RTM_DISABLE, bit 1 = TSX_CPUID_CLEAR
     // SAFETY: caller-asserted.
     let v = unsafe { rdmsr(TSX_CTRL_MSR) };
-    unsafe { wrmsr(TSX_CTRL_MSR, v | 0b11); }
+    unsafe {
+        wrmsr(TSX_CTRL_MSR, v | 0b11);
+    }
 }
 
 /// Marker for AMD Zen1 erratum 1474 — clamp DE_CFG[9].
@@ -53,7 +58,9 @@ unsafe fn amd_zen1_erratum_1474() {
     const MSR_DE_CFG: u32 = 0xC001_1029;
     // SAFETY: caller-asserted.
     let v = unsafe { rdmsr(MSR_DE_CFG) };
-    unsafe { wrmsr(MSR_DE_CFG, v | (1 << 9)); }
+    unsafe {
+        wrmsr(MSR_DE_CFG, v | (1 << 9));
+    }
 }
 
 /// Errata table. Entries are ordered (vendor, family, model_lo)
@@ -63,7 +70,8 @@ pub const TABLE: &[Errata] = &[
         name: "intel-tsx-rtm-disable",
         vendor: Vendor::Intel,
         family: 0x06,
-        model_lo: 0x55, model_hi: 0x55,    // Skylake-X / SKL-SP
+        model_lo: 0x55,
+        model_hi: 0x55, // Skylake-X / SKL-SP
         stepping_mask: 0xFFFF_FFFF,
         apply: intel_disable_tsx_rtm,
     },
@@ -71,14 +79,17 @@ pub const TABLE: &[Errata] = &[
         name: "amd-zen1-1474",
         vendor: Vendor::Amd,
         family: 0x17,
-        model_lo: 0x00, model_hi: 0x2F,
+        model_lo: 0x00,
+        model_hi: 0x2F,
         stepping_mask: 0xFFFF_FFFF,
         apply: amd_zen1_erratum_1474,
     },
     Errata {
         name: "marker-noop",
         vendor: Vendor::Other([0; 12]),
-        family: 0xFFFF, model_lo: 0xFFFF, model_hi: 0xFFFF,
+        family: 0xFFFF,
+        model_lo: 0xFFFF,
+        model_hi: 0xFFFF,
         stepping_mask: 0,
         apply: nop_workaround,
     },
@@ -97,11 +108,21 @@ pub fn table() -> &'static [Errata] {
 pub unsafe fn apply_for_current_cpu() {
     let me = ident::read();
     for e in TABLE {
-        if e.vendor != me.vendor { continue; }
-        if e.family != me.family { continue; }
-        if me.model < e.model_lo || me.model > e.model_hi { continue; }
-        if e.stepping_mask & (1u32 << me.stepping) == 0 { continue; }
+        if e.vendor != me.vendor {
+            continue;
+        }
+        if e.family != me.family {
+            continue;
+        }
+        if me.model < e.model_lo || me.model > e.model_hi {
+            continue;
+        }
+        if e.stepping_mask & (1u32 << me.stepping) == 0 {
+            continue;
+        }
         // SAFETY: caller-asserted; per-entry SAFETY notes apply.
-        unsafe { (e.apply)(); }
+        unsafe {
+            (e.apply)();
+        }
     }
 }

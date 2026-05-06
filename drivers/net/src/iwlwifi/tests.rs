@@ -7,9 +7,7 @@
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use super::{
-    register_pci_driver,
-    IWL_VENDOR,
-    IWL_DEV_AX200, IWL_DEV_AX201, IWL_DEV_AX210, IWL_DEV_AX211,
+    register_pci_driver, IWL_DEV_AX200, IWL_DEV_AX201, IWL_DEV_AX210, IWL_DEV_AX211, IWL_VENDOR,
 };
 
 fn smoke_iwlwifi_pci_match_table() -> TestResult {
@@ -18,14 +16,13 @@ fn smoke_iwlwifi_pci_match_table() -> TestResult {
     __reset_for_test();
     register_pci_driver();
     let registered = registered_pci_drivers();
-    let want = [
-        IWL_DEV_AX200, IWL_DEV_AX201, IWL_DEV_AX210, IWL_DEV_AX211,
-    ];
+    let want = [IWL_DEV_AX200, IWL_DEV_AX201, IWL_DEV_AX210, IWL_DEV_AX211];
     for did in want {
-        let matched = registered.iter().any(|m|
+        let matched = registered.iter().any(|m| {
             matches!(m.kind, MatchKind::VendorDevice {
                 vendor: IWL_VENDOR, device,
-            } if device == did));
+            } if device == did)
+        });
         if !matched {
             return TestResult::Fail("iwlwifi PCI match table missing a device id");
         }

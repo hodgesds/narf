@@ -46,11 +46,11 @@ static GLOBAL_EPOCH: AtomicU64 = AtomicU64::new(1);
 struct CpuCell {
     /// Number of live `ReadGuard`s pinning this CPU's epoch. A CPU is
     /// quiescent only when this is 0.
-    active_readers:  AtomicUsize,
+    active_readers: AtomicUsize,
     /// Latest global epoch this CPU has reported quiescence for.
-    last_quiescent:  AtomicU64,
+    last_quiescent: AtomicU64,
     /// Deferred-drop bucket — written only from this CPU.
-    bucket:          UnsafeCell<DeferBucket>,
+    bucket: UnsafeCell<DeferBucket>,
 }
 
 impl CpuCell {
@@ -62,7 +62,7 @@ impl CpuCell {
     const NEW: Self = Self {
         active_readers: AtomicUsize::new(0),
         last_quiescent: AtomicU64::new(u64::MAX),
-        bucket:         UnsafeCell::new(DeferBucket::new()),
+        bucket: UnsafeCell::new(DeferBucket::new()),
     };
 }
 
@@ -92,9 +92,9 @@ const DEFER_BUCKET_CAP: usize = 64;
 
 #[derive(Copy, Clone)]
 struct DeferEntry {
-    ptr:     *mut (),
+    ptr: *mut (),
     dropper: Option<unsafe fn(*mut ())>,
-    epoch:   u64,
+    epoch: u64,
 }
 
 // SAFETY: `DeferEntry` is a plain-old-data triple. The pointer's `T`
@@ -107,8 +107,8 @@ unsafe impl Send for DeferEntry {}
 unsafe impl Sync for DeferEntry {}
 
 struct DeferBucket {
-    len:      usize,
-    slots:    [DeferEntry; DEFER_BUCKET_CAP],
+    len: usize,
+    slots: [DeferEntry; DEFER_BUCKET_CAP],
     /// Drops silently discarded due to bucket overflow. Surfaced to the
     /// test harness + (eventually) `tracing/`.
     overflow: usize,
@@ -118,8 +118,11 @@ impl DeferBucket {
     const fn new() -> Self {
         Self {
             len: 0,
-            slots: [DeferEntry { ptr: core::ptr::null_mut(), dropper: None, epoch: 0 };
-                    DEFER_BUCKET_CAP],
+            slots: [DeferEntry {
+                ptr: core::ptr::null_mut(),
+                dropper: None,
+                epoch: 0,
+            }; DEFER_BUCKET_CAP],
             overflow: 0,
         }
     }
@@ -148,7 +151,7 @@ pub fn report_quiescent() {
     if cell.active_readers.load(Ordering::Acquire) != 0 {
         return;
     }
-    let now  = GLOBAL_EPOCH.load(Ordering::Acquire);
+    let now = GLOBAL_EPOCH.load(Ordering::Acquire);
     let prev = cell.last_quiescent.load(Ordering::Relaxed);
     // Either we're behind (`prev < now`, regular progress) or we started
     // at the sentinel `u64::MAX` ("inactive CPU") and are now active —
@@ -169,7 +172,9 @@ pub fn report_quiescent() {
 /// reporting.
 pub fn report_idle() {
     let cell = this_cpu();
-    if cell.active_readers.load(Ordering::Acquire) != 0 { return; }
+    if cell.active_readers.load(Ordering::Acquire) != 0 {
+        return;
+    }
     drain_local_bucket(cell);
     cell.last_quiescent.store(u64::MAX, Ordering::Release);
 }
@@ -178,7 +183,7 @@ pub fn report_idle() {
 
 pub(crate) fn defer_raw(ptr: *mut (), dropper: unsafe fn(*mut ())) {
     let epoch = GLOBAL_EPOCH.load(Ordering::Acquire);
-    let cell  = this_cpu();
+    let cell = this_cpu();
     // SAFETY: single-CPU Stage-2 means only this CPU accesses its own
     // bucket; Stage-3 preserves this invariant by keying off
     // `current_cpu_id()`. No other handler can interrupt with a
@@ -186,7 +191,11 @@ pub(crate) fn defer_raw(ptr: *mut (), dropper: unsafe fn(*mut ())) {
     // these functions (no `await`, no spinlock).
     let bucket = unsafe { &mut *cell.bucket.get() };
     if bucket.len < DEFER_BUCKET_CAP {
-        bucket.slots[bucket.len] = DeferEntry { ptr, dropper: Some(dropper), epoch };
+        bucket.slots[bucket.len] = DeferEntry {
+            ptr,
+            dropper: Some(dropper),
+            epoch,
+        };
         bucket.len += 1;
     } else {
         bucket.overflow += 1;
@@ -205,10 +214,14 @@ fn drain_local_bucket(cell: &CpuCell) {
                 // SAFETY: the pointer came from `Box::into_raw::<T>` via
                 // `enqueue_drop`, and the grace period has elapsed: no
                 // reader is viewing this allocation.
-                unsafe { f(entry.ptr); }
+                unsafe {
+                    f(entry.ptr);
+                }
             }
         } else {
-            if write != read { bucket.slots[write] = entry; }
+            if write != read {
+                bucket.slots[write] = entry;
+            }
             write += 1;
         }
     }
@@ -219,7 +232,9 @@ fn min_last_quiescent() -> u64 {
     let mut min = u64::MAX;
     for c in CPUS.iter() {
         let v = c.last_quiescent.load(Ordering::Acquire);
-        if v < min { min = v; }
+        if v < min {
+            min = v;
+        }
     }
     min
 }
@@ -235,12 +250,16 @@ pub fn sync_blocking() {
     let mut rounds = 0;
     loop {
         report_quiescent();
-        if all_cpus_past(target) { break; }
+        if all_cpus_past(target) {
+            break;
+        }
         rounds += 1;
         // Bounded-grace-period discipline per spec §3.3. In Stage-2
         // single-CPU this only fires if a caller forgot to drop a
         // guard — we refuse to deadlock.
-        if rounds > 8 { break; }
+        if rounds > 8 {
+            break;
+        }
     }
     // Drain every CPU's bucket. Stage-2 single-CPU so this is just us.
     drain_local_bucket(this_cpu());
@@ -262,14 +281,18 @@ fn all_cpus_past(target: u64) -> bool {
 /// `report_quiescent()` at some point.
 #[derive(Debug)]
 pub struct SyncFuture {
-    target:    u64,
+    target: u64,
     pollcount: u32,
     published: bool,
 }
 
 impl SyncFuture {
     pub(crate) fn new() -> Self {
-        Self { target: 0, pollcount: 0, published: false }
+        Self {
+            target: 0,
+            pollcount: 0,
+            published: false,
+        }
     }
 }
 

@@ -1,7 +1,7 @@
 use super::*;
-use narf_lib::sync::IrqSafeSpinLock;
-use alloc::vec::Vec;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
+use narf_lib::sync::IrqSafeSpinLock;
 
 static REGISTRY: IrqSafeSpinLock<Vec<Arc<dyn I3cBus>>> = IrqSafeSpinLock::new(Vec::new());
 

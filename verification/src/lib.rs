@@ -35,8 +35,8 @@ use narf_console::Writer;
 
 // Re-export the framework types so existing callers (and the
 // `kernel_test!` macro re-export below) keep working unchanged.
-pub use narf_kernel_test::{KernelTest, Summary, TestResult, tests};
 pub use narf_kernel_test::{kernel_test, kernel_test_in};
+pub use narf_kernel_test::{tests, KernelTest, Summary, TestResult};
 
 /// Run every registered test, print results to the console, return a
 /// summary. Intended to be called from the kernel's `_start_rust`
@@ -87,10 +87,17 @@ pub fn run_all() -> Summary {
             }
         }
     }
-    let _ = writeln!(Writer, "── summary: {} pass, {} fail, {} skip ──",
-        pass, fail, skip);
+    let _ = writeln!(
+        Writer,
+        "── summary: {} pass, {} fail, {} skip ──",
+        pass, fail, skip
+    );
 
-    if fail == 0 { Summary::AllOk } else { Summary::SomeFailed }
+    if fail == 0 {
+        Summary::AllOk
+    } else {
+        Summary::SomeFailed
+    }
 }
 
 /// Run only the tests whose subsystem matches `wanted`. Useful when
@@ -103,22 +110,34 @@ pub fn run_subsystem(wanted: &str) -> Summary {
     let mut fail = 0usize;
     let mut skip = 0usize;
     for t in tests() {
-        if t.subsystem != wanted { continue; }
+        if t.subsystem != wanted {
+            continue;
+        }
         match (t.run)() {
             TestResult::Pass => {
-                let _ = writeln!(Writer, "  [ OK ] {}", t.name); pass += 1;
+                let _ = writeln!(Writer, "  [ OK ] {}", t.name);
+                pass += 1;
             }
             TestResult::Fail(why) => {
-                let _ = writeln!(Writer, "  [FAIL] {}: {}", t.name, why); fail += 1;
+                let _ = writeln!(Writer, "  [FAIL] {}: {}", t.name, why);
+                fail += 1;
             }
             TestResult::Skip(why) => {
-                let _ = writeln!(Writer, "  [skip] {}: {}", t.name, why); skip += 1;
+                let _ = writeln!(Writer, "  [skip] {}: {}", t.name, why);
+                skip += 1;
             }
         }
     }
-    let _ = writeln!(Writer, "── summary: {} pass, {} fail, {} skip ──",
-        pass, fail, skip);
-    if fail == 0 { Summary::AllOk } else { Summary::SomeFailed }
+    let _ = writeln!(
+        Writer,
+        "── summary: {} pass, {} fail, {} skip ──",
+        pass, fail, skip
+    );
+    if fail == 0 {
+        Summary::AllOk
+    } else {
+        Summary::SomeFailed
+    }
 }
 
 /// Distinct subsystem names in registration order. Useful to
@@ -127,7 +146,9 @@ pub fn run_subsystem(wanted: &str) -> Summary {
 pub fn subsystems() -> alloc::vec::Vec<&'static str> {
     let mut out = alloc::vec::Vec::<&'static str>::new();
     for t in tests() {
-        if !out.contains(&t.subsystem) { out.push(t.subsystem); }
+        if !out.contains(&t.subsystem) {
+            out.push(t.subsystem);
+        }
     }
     out
 }
@@ -135,7 +156,7 @@ pub fn subsystems() -> alloc::vec::Vec<&'static str> {
 /// Run every test and immediately exit the kernel with the mapped code.
 pub fn run_all_and_exit() -> ! {
     let code = match run_all() {
-        Summary::AllOk      => 0,
+        Summary::AllOk => 0,
         Summary::SomeFailed => 1,
     };
     // SAFETY: exit_kernel is the only post-test action we're authorised
@@ -171,14 +192,18 @@ fn smoke_arch_mmio_round_trip() -> TestResult {
     let va = frame.start_address().raw();
     // 32-bit round trip.
     // SAFETY: identity-mapped frame; we own it.
-    unsafe { narf_arch::mmio::write32(va, 0xDEAD_BEEF); }
+    unsafe {
+        narf_arch::mmio::write32(va, 0xDEAD_BEEF);
+    }
     let r32 = unsafe { narf_arch::mmio::read32(va) };
     if r32 != 0xDEAD_BEEF {
         return TestResult::Fail("32-bit round trip mismatch");
     }
     // 16-bit at +4.
     // SAFETY: same.
-    unsafe { narf_arch::mmio::write16(va + 4, 0xCAFE); }
+    unsafe {
+        narf_arch::mmio::write16(va + 4, 0xCAFE);
+    }
     if unsafe { narf_arch::mmio::read16(va + 4) } != 0xCAFE {
         return TestResult::Fail("16-bit round trip mismatch");
     }
@@ -196,7 +221,9 @@ fn smoke_arch_mmio_round_trip() -> TestResult {
     // Width independence: a 32-bit write at +4 should overwrite the
     // 16-bit + two 8-bit values.
     // SAFETY: same.
-    unsafe { narf_arch::mmio::write32(va + 4, 0xFEED_FACE); }
+    unsafe {
+        narf_arch::mmio::write32(va + 4, 0xFEED_FACE);
+    }
     if unsafe { narf_arch::mmio::read32(va + 4) } != 0xFEED_FACE {
         return TestResult::Fail("32-bit overwrite of mixed widths");
     }
@@ -262,17 +289,24 @@ fn smoke_x86_64_tlb_shootdown_ipi() -> TestResult {
     // any address.
     use narf_interrupts::x86_64::ipi;
     use narf_lib::smp;
-    if !smp::is_online(1) { return TestResult::Skip("AP CPU 1 offline"); }
+    if !smp::is_online(1) {
+        return TestResult::Skip("AP CPU 1 offline");
+    }
 
     let before = ipi::ack_count(1);
     // SAFETY: x2APIC online (BSP init), VECTOR_TLB_SHOOTDOWN handler
     // installed at boot, AP 1 online.
-    unsafe { ipi::shoot_va(0xFFFF_FFFF_8000_0000); }
+    unsafe {
+        ipi::shoot_va(0xFFFF_FFFF_8000_0000);
+    }
     // shoot_va spins until AP acks; if it returned, the counter
     // already moved.
     let after = ipi::ack_count(1);
-    if after > before { TestResult::Pass }
-    else { TestResult::Fail("AP ack_count didn't advance") }
+    if after > before {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("AP ack_count didn't advance")
+    }
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_x86_64_tlb_shootdown_ipi);
@@ -283,12 +317,14 @@ fn smoke_x86_64_unmap_triggers_shootdown() -> TestResult {
     // path's invlpg_global call should fan out to AP 1 (and any other
     // online APs). The AP's ack counter should advance.
     use narf_arch::x86_64::pcid;
-    use narf_memory::{paging, PhysAddr, VirtAddr};
-    use narf_memory::frame::alloc_frame;
     use narf_interrupts::x86_64::ipi;
     use narf_lib::smp;
+    use narf_memory::frame::alloc_frame;
+    use narf_memory::{paging, PhysAddr, VirtAddr};
 
-    if !smp::is_online(1) { return TestResult::Skip("AP CPU 1 offline"); }
+    if !smp::is_online(1) {
+        return TestResult::Skip("AP CPU 1 offline");
+    }
 
     // Use the bootstrap PML4 (CR3) since QEMU's `-cpu max` runs the
     // PKS path and pcid::get_domain_pml4 returns 0 there. The
@@ -297,8 +333,11 @@ fn smoke_x86_64_unmap_triggers_shootdown() -> TestResult {
     let pml4_phys = unsafe { paging::read_cr3() };
     let _ = pcid::get_domain_pml4(0); // silence unused
 
-    let frame = match alloc_frame() { Ok(f) => f, Err(_) => return TestResult::Fail("alloc_frame failed") };
-    let phys  = frame.start_address();
+    let frame = match alloc_frame() {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("alloc_frame failed"),
+    };
+    let phys = frame.start_address();
     // Pick a VA in PML4 slot 256 + 5 (domain 5's range, but on PKS
     // path we use the bootstrap PML4 and the slot is empty, so we
     // own the whole walk). Far away from anything mapped.
@@ -307,7 +346,12 @@ fn smoke_x86_64_unmap_triggers_shootdown() -> TestResult {
     let before = ipi::ack_count(1);
     // SAFETY: pml4_phys identity-mapped; VA canonical & 4KiB-aligned.
     let map_ok = unsafe {
-        paging::map_4kb(pml4_phys, va, phys, paging::PtFlags::PRESENT | paging::PtFlags::WRITABLE)
+        paging::map_4kb(
+            pml4_phys,
+            va,
+            phys,
+            paging::PtFlags::PRESENT | paging::PtFlags::WRITABLE,
+        )
     };
     if map_ok.is_err() {
         return TestResult::Fail("map_4kb failed");
@@ -318,10 +362,14 @@ fn smoke_x86_64_unmap_triggers_shootdown() -> TestResult {
         return TestResult::Fail("unmap_4kb failed");
     }
     let after = ipi::ack_count(1);
-    let _ = phys; let _ = PhysAddr::new(0); // type imports kept
+    let _ = phys;
+    let _ = PhysAddr::new(0); // type imports kept
 
-    if after > before { TestResult::Pass }
-    else { TestResult::Fail("AP didn't ack the shootdown after unmap_4kb") }
+    if after > before {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("AP didn't ack the shootdown after unmap_4kb")
+    }
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_x86_64_unmap_triggers_shootdown);
@@ -340,10 +388,14 @@ fn smoke_x86_64_shoot_range_one_ipi() -> TestResult {
     // 1 — proof that N contiguous pages cost only one IPI.
     use narf_interrupts::x86_64::ipi;
     use narf_lib::smp;
-    if !smp::is_online(1) { return TestResult::Skip("AP CPU 1 offline"); }
+    if !smp::is_online(1) {
+        return TestResult::Skip("AP CPU 1 offline");
+    }
     let before = ipi::ack_count(1);
     // SAFETY: x2APIC online; IPI handler installed at boot.
-    unsafe { ipi::shoot_range(0xFFFF_FFFF_8000_0000, 8); }
+    unsafe {
+        ipi::shoot_range(0xFFFF_FFFF_8000_0000, 8);
+    }
     let after = ipi::ack_count(1);
     if after - before != 1 {
         return TestResult::Fail("8-page range cost more than 1 IPI");
@@ -597,7 +649,9 @@ fn smoke_virtio_mmio_probe() -> TestResult {
     let _n = unsafe { narf_bus::init(None) };
     let mut ok = 0usize;
     for d in devices() {
-        if !matches!(d.kind, BusKind::VirtioMmio { .. }) { continue; }
+        if !matches!(d.kind, BusKind::VirtioMmio { .. }) {
+            continue;
+        }
         // SAFETY: the bus registry published these entries after
         // confirming their MMIO regions are mapped and readable;
         // `probe` does a bounded u32 read.
@@ -613,7 +667,9 @@ fn smoke_virtio_mmio_probe() -> TestResult {
                 // MMIO slots before we see them, so a bus-registry
                 // entry that fails probe is a real anomaly — magic
                 // mismatch or unsupported version.
-                return TestResult::Fail("unexpected probe error on bus-registry virtio-mmio entry");
+                return TestResult::Fail(
+                    "unexpected probe error on bus-registry virtio-mmio entry",
+                );
             }
         }
     }
@@ -637,8 +693,8 @@ fn smoke_virtio_mmio_probe() -> TestResult {
     // x86_64 under QEMU q35 has no virtio-mmio transports (virtio
     // lives behind PCIe on that machine). Assert structural: the bus
     // registry, once walked, contains zero VirtioMmio entries.
-    use narf_bus::{devices, BusKind};
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{devices, BusKind};
     // SAFETY: ECAM_DEFAULT_BASE is inside q35's pcie-mmcfg region and
     // the walker performs read-only config-space probes.
     let _n = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
@@ -678,11 +734,10 @@ fn smoke_virtio_mmio_wrong_magic() -> TestResult {
             let _ = e;
             TestResult::Fail("wrong-magic probe returned the wrong error variant")
         }
-        Ok(_)  => TestResult::Fail("wrong-magic probe unexpectedly succeeded"),
+        Ok(_) => TestResult::Fail("wrong-magic probe unexpectedly succeeded"),
     }
 }
 kernel_test!(smoke_virtio_mmio_wrong_magic);
-
 
 // ── Stage-3 exit-gate integration ──────────────────────────────────
 //
@@ -708,12 +763,12 @@ kernel_test!(smoke_virtio_mmio_wrong_magic);
 // ── block ──
 
 fn smoke_block_device_trait() -> TestResult {
+    use narf_block::{BlockDevice, BlockOp, BlockRequest, QosHint};
+    use narf_capabilities::{Cap, Read, Rights};
     use narf_drivers_virtio::blk::VirtioBlkDevice;
     use narf_drivers_virtio::VirtioMmioDevice;
-    use narf_block::{BlockDevice, BlockRequest, BlockOp, QosHint};
     use narf_io::{alloc_coherent, register};
     use narf_lib::id::DomainId;
-    use narf_capabilities::{Cap, Read, Rights};
 
     narf_scheduler::init();
 
@@ -726,7 +781,7 @@ fn smoke_block_device_trait() -> TestResult {
     };
 
     let mut blk = VirtioBlkDevice::new(mmio_dev);
-    
+
     // 2. Initialise.
     if let Err(_) = unsafe { blk.init(DomainId::DRIVER_0) } {
         return TestResult::Fail("VirtioBlkDevice::init failed");
@@ -737,9 +792,14 @@ fn smoke_block_device_trait() -> TestResult {
         return TestResult::Fail("DMA alloc failed");
     };
     let index = register(buf);
-    let cap = unsafe { Cap::<narf_io::DmaBuffer, Read>::mint(
-        narf_capabilities::CapSlot::new(1, index, Read::BITS, narf_capabilities::CapKind::DmaBuffer as u32)
-    ) };
+    let cap = unsafe {
+        Cap::<narf_io::DmaBuffer, Read>::mint(narf_capabilities::CapSlot::new(
+            1,
+            index,
+            Read::BITS,
+            narf_capabilities::CapKind::DmaBuffer as u32,
+        ))
+    };
 
     let req = BlockRequest {
         op: BlockOp::Read,
@@ -751,7 +811,7 @@ fn smoke_block_device_trait() -> TestResult {
     };
 
     let _future = blk.submit(req);
-    
+
     // 4. Poll.
     blk.poll();
 
@@ -760,15 +820,15 @@ fn smoke_block_device_trait() -> TestResult {
 kernel_test!(smoke_block_device_trait);
 
 fn smoke_exit_gate_virtio_blk() -> TestResult {
-    use core::sync::atomic::{AtomicU8, Ordering};
     use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU8, Ordering};
+    use narf_block::{BlockCompletion, BlockOp, BlockRequest, QosHint};
+    use narf_capabilities::{Cap, Read, Rights};
     use narf_drivers_virtio::blk::VirtioBlkDevice;
     use narf_drivers_virtio::class_blk::VirtioBlkServer;
     use narf_drivers_virtio::VirtioMmioDevice;
-    use narf_block::{BlockRequest, BlockCompletion, BlockOp, QosHint};
     use narf_io::{alloc_coherent, register};
     use narf_lib::id::DomainId;
-    use narf_capabilities::{Cap, Read, Rights};
 
     static OUTCOME: AtomicU8 = AtomicU8::new(0);
 
@@ -779,10 +839,14 @@ fn smoke_exit_gate_virtio_blk() -> TestResult {
     let (compl_tx, mut compl_rx) = narf_ipc::channel::<BlockCompletion, 4>();
 
     let mmio = unsafe { VirtioMmioDevice::probe_raw(0) };
-    let Ok(mmio_dev) = mmio else { return TestResult::Pass; };
+    let Ok(mmio_dev) = mmio else {
+        return TestResult::Pass;
+    };
 
     let mut blk = VirtioBlkDevice::new(mmio_dev);
-    unsafe { blk.init(DomainId::DRIVER_0).unwrap(); }
+    unsafe {
+        blk.init(DomainId::DRIVER_0).unwrap();
+    }
     let blk = Arc::new(blk);
 
     let mut server = VirtioBlkServer::new(blk.clone(), req_rx, compl_tx);
@@ -794,11 +858,18 @@ fn smoke_exit_gate_virtio_blk() -> TestResult {
 
     // 3. Spawn "Consumer Domain" task.
     narf_scheduler::spawn(async move {
-        let Ok(buf) = alloc_coherent(512, DomainId::DRIVER_0) else { return; };
+        let Ok(buf) = alloc_coherent(512, DomainId::DRIVER_0) else {
+            return;
+        };
         let index = register(buf);
-        let cap = unsafe { Cap::<narf_io::DmaBuffer, Read>::mint(
-            narf_capabilities::CapSlot::new(1, index, Read::BITS, narf_capabilities::CapKind::DmaBuffer as u32)
-        ) };
+        let cap = unsafe {
+            Cap::<narf_io::DmaBuffer, Read>::mint(narf_capabilities::CapSlot::new(
+                1,
+                index,
+                Read::BITS,
+                narf_capabilities::CapKind::DmaBuffer as u32,
+            ))
+        };
 
         let req = BlockRequest {
             op: BlockOp::Read,
@@ -818,7 +889,7 @@ fn smoke_exit_gate_virtio_blk() -> TestResult {
                 OUTCOME.store(1, Ordering::Relaxed);
             }
         }
-        
+
         // Signal termination by dropping tx/rx.
         core::mem::drop(req_tx);
         core::mem::drop(compl_rx);
@@ -830,7 +901,9 @@ fn smoke_exit_gate_virtio_blk() -> TestResult {
         loop {
             blk_poll.poll();
             narf_scheduler::yield_now().await;
-            if OUTCOME.load(Ordering::Relaxed) != 0 { break; }
+            if OUTCOME.load(Ordering::Relaxed) != 0 {
+                break;
+            }
         }
     });
 
@@ -954,13 +1027,13 @@ fn smoke_rcu_sleepable_sync_drains() -> TestResult {
     // SCOPE/CAP avoid lifetime-juggling between the two spawned
     // futures (they need 'static or move-by-Arc; static is simpler).
     use core::sync::atomic::{AtomicU8, Ordering};
-    use narf_rcu::sleepable::{SleepableReader, SleepableScope, SyncOutcome, sync_async};
     use narf_capabilities::{Cap, Read};
+    use narf_rcu::sleepable::{sync_async, SleepableReader, SleepableScope, SyncOutcome};
 
-    static SCOPE:    SleepableScope             = SleepableScope::new();
-    static CAP_SET:  core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-    static mut CAP:  Option<Cap<SleepableReader, Read>> = None;
-    static OUTCOME:  AtomicU8 = AtomicU8::new(0);   // 0=pending, 1=drained, 2=timeout, 3=error
+    static SCOPE: SleepableScope = SleepableScope::new();
+    static CAP_SET: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    static mut CAP: Option<Cap<SleepableReader, Read>> = None;
+    static OUTCOME: AtomicU8 = AtomicU8::new(0); // 0=pending, 1=drained, 2=timeout, 3=error
 
     OUTCOME.store(0, Ordering::Relaxed);
     SCOPE.clear_over_budget();
@@ -979,7 +1052,9 @@ fn smoke_rcu_sleepable_sync_drains() -> TestResult {
         // SAFETY: CAP is set above on the same thread before spawn.
         let cap = unsafe { CAP.as_ref().unwrap() };
         let g = SCOPE.enter(cap).expect("enter must succeed");
-        for _ in 0..3 { narf_scheduler::yield_now().await; }
+        for _ in 0..3 {
+            narf_scheduler::yield_now().await;
+        }
         drop(g);
     });
 
@@ -987,8 +1062,8 @@ fn smoke_rcu_sleepable_sync_drains() -> TestResult {
     narf_scheduler::spawn(async move {
         let deadline = narf_time::Instant::now().plus_cycles(1_000_000_000);
         match sync_async(&SCOPE, deadline).await {
-            SyncOutcome::Drained   => OUTCOME.store(1, Ordering::Relaxed),
-            SyncOutcome::Timeout   => OUTCOME.store(2, Ordering::Relaxed),
+            SyncOutcome::Drained => OUTCOME.store(1, Ordering::Relaxed),
+            SyncOutcome::Timeout => OUTCOME.store(2, Ordering::Relaxed),
             SyncOutcome::Cancelled => OUTCOME.store(3, Ordering::Relaxed),
         }
     });
@@ -1013,19 +1088,21 @@ fn smoke_rcu_sleepable_timeout() -> TestResult {
     // guaranteed to fire before a typical yield round completes
     // even on the cooperative executor.
     use core::sync::atomic::{AtomicU8, Ordering};
-    use narf_rcu::sleepable::{SleepableReader, SleepableScope, SyncOutcome, sync_async};
     use narf_capabilities::{Cap, Read};
+    use narf_rcu::sleepable::{sync_async, SleepableReader, SleepableScope, SyncOutcome};
 
-    static SCOPE:    SleepableScope             = SleepableScope::new();
-    static mut CAP:  Option<Cap<SleepableReader, Read>> = None;
-    static OUTCOME:  AtomicU8 = AtomicU8::new(0);
-    static DONE:     core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    static SCOPE: SleepableScope = SleepableScope::new();
+    static mut CAP: Option<Cap<SleepableReader, Read>> = None;
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+    static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
     OUTCOME.store(0, Ordering::Relaxed);
     DONE.store(false, Ordering::Relaxed);
     SCOPE.clear_over_budget();
     // SAFETY: harness is single-threaded.
-    unsafe { CAP = Some(SleepableReader::bootstrap_cap()); }
+    unsafe {
+        CAP = Some(SleepableReader::bootstrap_cap());
+    }
 
     narf_scheduler::init();
 
@@ -1046,8 +1123,8 @@ fn smoke_rcu_sleepable_timeout() -> TestResult {
         let deadline = narf_time::Instant::now().plus_cycles(10_000);
         let outcome = sync_async(&SCOPE, deadline).await;
         match outcome {
-            SyncOutcome::Timeout   => OUTCOME.store(2, Ordering::Relaxed),
-            SyncOutcome::Drained   => OUTCOME.store(1, Ordering::Relaxed),
+            SyncOutcome::Timeout => OUTCOME.store(2, Ordering::Relaxed),
+            SyncOutcome::Drained => OUTCOME.store(1, Ordering::Relaxed),
             SyncOutcome::Cancelled => OUTCOME.store(3, Ordering::Relaxed),
         }
         // Release the holder so run_until_empty terminates.
@@ -1141,9 +1218,14 @@ kernel_test!(smoke_rcu_sleepable_timeout);
 fn make_block_request(op: narf_block::BlockOp, user_tag: u64) -> narf_block::BlockRequest {
     use narf_block::{BlockRequest, QosHint};
     use narf_capabilities::{Cap, CapSlot, Read, Rights};
-    let cap = unsafe { Cap::<narf_io::DmaBuffer, Read>::mint(
-        CapSlot::new(1, 0, Read::BITS, narf_capabilities::CapKind::DmaBuffer as u32)
-    )};
+    let cap = unsafe {
+        Cap::<narf_io::DmaBuffer, Read>::mint(CapSlot::new(
+            1,
+            0,
+            Read::BITS,
+            narf_capabilities::CapKind::DmaBuffer as u32,
+        ))
+    };
     BlockRequest {
         op,
         lba: 0,
@@ -1197,15 +1279,15 @@ fn smoke_pci_probe_all_dispatches_nvme() -> TestResult {
     // bus-level match table, run probe_all, and assert the NVMe
     // controller stashed itself in its own static after a
     // successful probe.
-    use narf_bus::{bootstrap_registry_authority, devices, BusKind, probe_all_pci};
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
     // SAFETY: ECAM identity-mapped; init idempotent.
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
-    let has_nvme = devs.iter().any(|d| matches!(
-        &d.kind, BusKind::Pcie { .. }
-    ) && d.id.vendor == 0x1B36 && d.id.device == 0x0010);
+    let has_nvme = devs.iter().any(|d| {
+        matches!(&d.kind, BusKind::Pcie { .. }) && d.id.vendor == 0x1B36 && d.id.device == 0x0010
+    });
     if !has_nvme {
         return TestResult::Skip("no QEMU NVMe controller");
     }
@@ -1221,14 +1303,24 @@ fn smoke_pci_probe_all_dispatches_nvme() -> TestResult {
     if regs.len() < 2 {
         return TestResult::Fail("nvme registered fewer than the expected entries");
     }
-    let has_qemu_vid = regs.iter().any(|m|
-        matches!(m.kind, narf_bus::MatchKind::VendorDevice {
-            vendor: 0x1B36, device: 0x0010,
-        }));
-    let has_class = regs.iter().any(|m|
-        matches!(m.kind, narf_bus::MatchKind::Class {
-            class: 0x01, mask: 0xFF,
-        }));
+    let has_qemu_vid = regs.iter().any(|m| {
+        matches!(
+            m.kind,
+            narf_bus::MatchKind::VendorDevice {
+                vendor: 0x1B36,
+                device: 0x0010,
+            }
+        )
+    });
+    let has_class = regs.iter().any(|m| {
+        matches!(
+            m.kind,
+            narf_bus::MatchKind::Class {
+                class: 0x01,
+                mask: 0xFF,
+            }
+        )
+    });
     if !has_qemu_vid {
         return TestResult::Fail("nvme missing QEMU VID/DID entry");
     }
@@ -1238,7 +1330,7 @@ fn smoke_pci_probe_all_dispatches_nvme() -> TestResult {
 
     let authority = bootstrap_registry_authority();
     let bound = match probe_all_pci(&authority) {
-        Ok(n)  => n,
+        Ok(n) => n,
         Err(_) => return TestResult::Fail("probe_all_pci returned AuthorityRevoked"),
     };
     if bound == 0 {
@@ -1250,7 +1342,8 @@ fn smoke_pci_probe_all_dispatches_nvme() -> TestResult {
     // Verify the probed controller has the IDENTIFY snapshot.
     let model_starts_with_qemu = narf_drivers_nvme::with_controller(|c| {
         c.identify().is_some_and(|id| &id.mn[..4] == b"QEMU")
-    }).unwrap_or(false);
+    })
+    .unwrap_or(false);
     if !model_starts_with_qemu {
         return TestResult::Fail("probe-loaded controller missing IDENTIFY MN=QEMU");
     }
@@ -1272,8 +1365,8 @@ fn smoke_syscall_versioning_dispatch() -> TestResult {
     // versions, and assert each handler set its own canary value.
     use core::sync::atomic::{AtomicU32, Ordering};
     use narf_userspace::{
-        syscall_pack, syscall_number, syscall_version, RawFnHandler,
-        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+        syscall_number, syscall_pack, syscall_version, RawFnHandler, Syscall, SyscallArgs,
+        SyscallReturn, SyscallTable, TrapContext,
     };
 
     static V0_SEEN: AtomicU32 = AtomicU32::new(0);
@@ -1282,16 +1375,28 @@ fn smoke_syscall_versioning_dispatch() -> TestResult {
     V1_SEEN.store(0, Ordering::Relaxed);
 
     let mut table = SyscallTable::new();
-    table.install_raw(Syscall::Yield, "yield-v0",
+    table.install_raw(
+        Syscall::Yield,
+        "yield-v0",
         RawFnHandler(|ctx: &mut dyn TrapContext| {
             V0_SEEN.fetch_add(1, Ordering::Relaxed);
-            ctx.set_return(SyscallReturn { value: 0xC0DE_0000, status: 0 });
-        }));
-    table.install_raw_versioned(Syscall::Yield, 1,
+            ctx.set_return(SyscallReturn {
+                value: 0xC0DE_0000,
+                status: 0,
+            });
+        }),
+    );
+    table.install_raw_versioned(
+        Syscall::Yield,
+        1,
         RawFnHandler(|ctx: &mut dyn TrapContext| {
             V1_SEEN.fetch_add(1, Ordering::Relaxed);
-            ctx.set_return(SyscallReturn { value: 0xC0DE_0001, status: 0 });
-        }));
+            ctx.set_return(SyscallReturn {
+                value: 0xC0DE_0001,
+                status: 0,
+            });
+        }),
+    );
 
     // Bit-packing helpers round-trip cleanly.
     let raw = syscall_pack(1, Syscall::Yield);
@@ -1303,13 +1408,25 @@ fn smoke_syscall_versioning_dispatch() -> TestResult {
     }
 
     // Manual ctx for dispatch.
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
-    impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
     }
-    let mut ctx0 = FakeCtx { args: SyscallArgs::default(), ret: None };
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
+            false
+        }
+    }
+    let mut ctx0 = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
     table.dispatch_ctx_versioned(Syscall::Yield, 0, &mut ctx0);
     if ctx0.ret.map(|r| r.value) != Some(0xC0DE_0000) {
         return TestResult::Fail("v0 dispatch did not return v0 sentinel");
@@ -1318,7 +1435,10 @@ fn smoke_syscall_versioning_dispatch() -> TestResult {
         return TestResult::Fail("v0 path did not invoke v0 handler exclusively");
     }
 
-    let mut ctx1 = FakeCtx { args: SyscallArgs::default(), ret: None };
+    let mut ctx1 = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
     table.dispatch_ctx_versioned(Syscall::Yield, 1, &mut ctx1);
     if ctx1.ret.map(|r| r.value) != Some(0xC0DE_0001) {
         return TestResult::Fail("v1 dispatch did not return v1 sentinel");
@@ -1329,7 +1449,10 @@ fn smoke_syscall_versioning_dispatch() -> TestResult {
 
     // Unknown version (v2) falls through to v0 — the documented
     // "if no override, use canonical" rule.
-    let mut ctx2 = FakeCtx { args: SyscallArgs::default(), ret: None };
+    let mut ctx2 = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
     table.dispatch_ctx_versioned(Syscall::Yield, 2, &mut ctx2);
     if ctx2.ret.map(|r| r.value) != Some(0xC0DE_0000) {
         return TestResult::Fail("v2 unknown did not fall through to v0");
@@ -1344,18 +1467,20 @@ fn smoke_pci_cap_walker_finds_msix() -> TestResult {
     // minimum MSI-X (0x11), Power Management (0x01), and PCI Express
     // (0x10). Walk it via the generic walker + assert MSI-X is
     // present.
-    use narf_bus::{devices, BusKind};
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{devices, BusKind};
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
-    let nvme = devs.iter().find(|d|
-        matches!(&d.kind, BusKind::Pcie { .. })
-        && d.id.vendor == 0x1B36 && d.id.device == 0x0010);
-    let Some(d) = nvme else { return TestResult::Skip("no QEMU NVMe"); };
+    let nvme = devs.iter().find(|d| {
+        matches!(&d.kind, BusKind::Pcie { .. }) && d.id.vendor == 0x1B36 && d.id.device == 0x0010
+    });
+    let Some(d) = nvme else {
+        return TestResult::Skip("no QEMU NVMe");
+    };
     // SAFETY: bounded walk on identity-mapped cfg-space.
     let off = match unsafe { narf_bus::pci_cap::find_cap(d, narf_bus::pci_cap::id::MSI_X) } {
         Ok(Some(o)) => o,
-        _           => return TestResult::Fail("MSI-X cap not found"),
+        _ => return TestResult::Fail("MSI-X cap not found"),
     };
     if off == 0 || off >= 0x100 {
         return TestResult::Fail("MSI-X cap offset out of range");
@@ -1363,7 +1488,7 @@ fn smoke_pci_cap_walker_finds_msix() -> TestResult {
     // PCI Express cap should also exist on a QEMU NVMe.
     match unsafe { narf_bus::pci_cap::find_cap(d, narf_bus::pci_cap::id::PCI_EXPRESS) } {
         Ok(Some(_)) => {}
-        _           => return TestResult::Fail("PCI Express cap not found"),
+        _ => return TestResult::Fail("PCI Express cap not found"),
     }
     TestResult::Pass
 }
@@ -1374,31 +1499,39 @@ kernel_test!(smoke_pci_cap_walker_finds_msix);
 fn smoke_pci_express_cap_link_status() -> TestResult {
     // Read the PCIe cap's link_status on QEMU NVMe and verify the
     // link-speed/width fields decode to non-zero values.
-    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
     use narf_bus::pci_express::read_status;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
-    let nvme = devs.iter().find(|d|
-        matches!(&d.kind, BusKind::Pcie { .. })
-        && d.id.vendor == 0x1B36 && d.id.device == 0x0010);
-    let Some(d) = nvme.copied() else { return TestResult::Skip("no QEMU NVMe"); };
+    let nvme = devs.iter().find(|d| {
+        matches!(&d.kind, BusKind::Pcie { .. }) && d.id.vendor == 0x1B36 && d.id.device == 0x0010
+    });
+    let Some(d) = nvme.copied() else {
+        return TestResult::Skip("no QEMU NVMe");
+    };
     let authority = bootstrap_registry_authority();
     let (_h, cap) = match claim_device_cap(&authority, d.addr) {
         Ok(ok) => ok,
         Err(_) => return TestResult::Fail("claim_device_cap"),
     };
     let read_cap = match cap.derive() {
-        Ok(c)  => c,
+        Ok(c) => c,
         Err(_) => return TestResult::Fail("derive read"),
     };
     let s = match read_status(&read_cap, &d) {
-        Ok(s)  => s,
+        Ok(s) => s,
         Err(_) => return TestResult::Fail("read_status"),
     };
-    if s.link_speed() == 0 { return TestResult::Fail("link speed 0"); }
-    if s.link_width() == 0 { return TestResult::Fail("link width 0"); }
-    if s.max_payload_supported() < 128 { return TestResult::Fail("max payload < 128"); }
+    if s.link_speed() == 0 {
+        return TestResult::Fail("link speed 0");
+    }
+    if s.link_width() == 0 {
+        return TestResult::Fail("link width 0");
+    }
+    if s.max_payload_supported() < 128 {
+        return TestResult::Fail("max payload < 128");
+    }
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
@@ -1408,7 +1541,7 @@ fn smoke_vector_alloc_block_contiguous() -> TestResult {
     // alloc_block(4) returns a contiguous run of 4 vectors.
     use narf_interrupts::vector::{alloc_block, free, is_allocated};
     let base = match alloc_block(4) {
-        Ok(b)  => b,
+        Ok(b) => b,
         Err(_) => return TestResult::Fail("alloc_block(4) failed"),
     };
     for i in 0..4 {
@@ -1432,44 +1565,52 @@ fn smoke_msix_program_block() -> TestResult {
     // the device fires multiple IRQs from a smoke (the driver isn't
     // running yet), but the structural path — alloc_block, walk the
     // cap, program 4 entries, enable — must succeed without faulting.
-    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
     use narf_bus::msix::enable_msix;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
     use narf_interrupts::vector;
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
-    let nvme = devs.iter().find(|d|
-        matches!(&d.kind, BusKind::Pcie { .. })
-        && d.id.vendor == 0x1B36 && d.id.device == 0x0010);
-    let Some(d) = nvme.copied() else { return TestResult::Skip("no QEMU NVMe"); };
+    let nvme = devs.iter().find(|d| {
+        matches!(&d.kind, BusKind::Pcie { .. }) && d.id.vendor == 0x1B36 && d.id.device == 0x0010
+    });
+    let Some(d) = nvme.copied() else {
+        return TestResult::Skip("no QEMU NVMe");
+    };
     let authority = bootstrap_registry_authority();
     let (_h, cap) = match claim_device_cap(&authority, d.addr) {
         Ok(ok) => ok,
         Err(_) => return TestResult::Fail("claim"),
     };
     let mut table = match enable_msix(&cap, &d) {
-        Ok(t)  => t,
+        Ok(t) => t,
         Err(_) => return TestResult::Fail("enable_msix"),
     };
-    if table.size() < 4 { return TestResult::Skip("table < 4"); }
+    if table.size() < 4 {
+        return TestResult::Skip("table < 4");
+    }
     if table.alloc_block(4).is_err() {
         return TestResult::Fail("alloc_block(4)");
     }
     let base = match vector::alloc_block(4) {
-        Ok(b)  => b,
+        Ok(b) => b,
         Err(_) => return TestResult::Fail("vector::alloc_block"),
     };
     // SAFETY: we own the device cap; cap-list walk + writes target
     // identity-mapped MMIO.
     let block = unsafe { table.program_vector_block(0, 4, 0, base) };
     let v = match block {
-        Ok(v)  => v,
+        Ok(v) => v,
         Err(_) => return TestResult::Fail("program_vector_block"),
     };
-    if v.len() != 4 { return TestResult::Fail("program_vector_block returned wrong count"); }
+    if v.len() != 4 {
+        return TestResult::Fail("program_vector_block returned wrong count");
+    }
     // Cleanup: release vectors. (Table allocation persists; OK,
     // re-running enable_msix discovers the same N.)
-    for i in 0..4 { let _ = vector::free(base + i); }
+    for i in 0..4 {
+        let _ = vector::free(base + i);
+    }
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
@@ -1496,7 +1637,6 @@ kernel_test!(smoke_msix_program_block);
 
 // AHCI smokes migrated to `drivers/storage/src/tests.rs`
 // (subsystem `drivers/storage/ahci`).
-
 #[cfg(target_arch = "x86_64")]
 fn smoke_block_registry_uniform_read() -> TestResult {
     // Walk narf_block::block_devices() and read sector 0 from each.
@@ -1538,9 +1678,8 @@ fn smoke_net_ipv4_checksum() -> TestResult {
     //                            0xc0 0xa8 0x00 0xc7
     // Expected checksum: 0xb861.
     let header = [
-        0x45, 0x00, 0x00, 0x73, 0x00, 0x00, 0x40, 0x00,
-        0x40, 0x11, 0x00, 0x00, 0xc0, 0xa8, 0x00, 0x01,
-        0xc0, 0xa8, 0x00, 0xc7,
+        0x45, 0x00, 0x00, 0x73, 0x00, 0x00, 0x40, 0x00, 0x40, 0x11, 0x00, 0x00, 0xc0, 0xa8, 0x00,
+        0x01, 0xc0, 0xa8, 0x00, 0xc7,
     ];
     let cs = ip_checksum(&header);
     if cs != 0xb861 {
@@ -1561,7 +1700,8 @@ fn smoke_net_icmp_echo_builder() -> TestResult {
         [10, 0, 2, 2],
         0x1234,
         0x0001,
-    ).unwrap_or(0);
+    )
+    .unwrap_or(0);
     if n != ETH_HDR_LEN + IPV4_HDR_LEN + 8 {
         return TestResult::Fail("icmp echo len wrong");
     }
@@ -1596,14 +1736,19 @@ fn smoke_net_e1000_arp_round_trip() -> TestResult {
     // network driver.
     use narf_drivers_net::e1000;
     use narf_net::pkt::*;
-    if !e1000::is_probed() { return TestResult::Skip("e1000 not probed"); }
+    if !e1000::is_probed() {
+        return TestResult::Skip("e1000 not probed");
+    }
     let mac = e1000::with_controller(|c| c.mac).unwrap_or([0; 6]);
     let mut frame = [0u8; 64];
-    let n = build_arp_request(&mut frame, mac, [10, 0, 2, 15], [10, 0, 2, 2])
-        .unwrap_or(0);
-    if n == 0 { return TestResult::Fail("build_arp_request"); }
-    if e1000::with_controller(|c| c.tx(&frame[..n])).map(|r| r.is_ok())
-        .unwrap_or(false) == false
+    let n = build_arp_request(&mut frame, mac, [10, 0, 2, 15], [10, 0, 2, 2]).unwrap_or(0);
+    if n == 0 {
+        return TestResult::Fail("build_arp_request");
+    }
+    if e1000::with_controller(|c| c.tx(&frame[..n]))
+        .map(|r| r.is_ok())
+        .unwrap_or(false)
+        == false
     {
         return TestResult::Fail("e1000 tx of ARP request");
     }
@@ -1646,7 +1791,7 @@ fn smoke_bound_drivers_inventory() -> TestResult {
     }
     // Block-class drivers should outnumber RNG-class drivers.
     let n_block = bound.iter().filter(|b| b.kind == BoundKind::Block).count();
-    let n_rng   = bound.iter().filter(|b| b.kind == BoundKind::Rng).count();
+    let n_rng = bound.iter().filter(|b| b.kind == BoundKind::Rng).count();
     if n_block <= n_rng {
         return TestResult::Fail("expected more Block drivers than Rng");
     }
@@ -1666,7 +1811,7 @@ fn smoke_slab_alloc_free_round_trip() -> TestResult {
         let block_size = 16usize << c;
         let layout = Layout::from_size_align(block_size, 16).unwrap();
         let p1 = match slab::alloc(layout) {
-            Ok(p)  => p,
+            Ok(p) => p,
             Err(_) => return TestResult::Fail("class alloc#1 failed"),
         };
         // SAFETY: pointer just allocated; class block_size bytes valid.
@@ -1676,10 +1821,12 @@ fn smoke_slab_alloc_free_round_trip() -> TestResult {
             }
         }
         // SAFETY: same layout we allocated with.
-        unsafe { slab::dealloc(p1, layout); }
+        unsafe {
+            slab::dealloc(p1, layout);
+        }
 
         let p2 = match slab::alloc(layout) {
-            Ok(p)  => p,
+            Ok(p) => p,
             Err(_) => return TestResult::Fail("class alloc#2 failed"),
         };
         // The slab pushes onto the head of the free list, so the
@@ -1697,7 +1844,9 @@ fn smoke_slab_alloc_free_round_trip() -> TestResult {
             }
         }
         // SAFETY: same layout.
-        unsafe { slab::dealloc(p2, layout); }
+        unsafe {
+            slab::dealloc(p2, layout);
+        }
     }
     TestResult::Pass
 }
@@ -1714,7 +1863,7 @@ fn smoke_slab_class_picker() -> TestResult {
         let block_size = 16usize << c;
         let layout = Layout::from_size_align(block_size, 16).unwrap();
         let p = match slab::alloc(layout) {
-            Ok(p)  => p,
+            Ok(p) => p,
             Err(_) => return TestResult::Fail("alloc failed"),
         };
         ptrs.push((layout, p));
@@ -1728,7 +1877,9 @@ fn smoke_slab_class_picker() -> TestResult {
     }
     for (layout, p) in ptrs {
         // SAFETY: just allocated with this layout.
-        unsafe { slab::dealloc(p, layout); }
+        unsafe {
+            slab::dealloc(p, layout);
+        }
     }
     TestResult::Pass
 }
@@ -1748,7 +1899,9 @@ fn smoke_slab_stats_advance() -> TestResult {
         return TestResult::Fail("in_use didn't advance on alloc");
     }
     // SAFETY: just allocated.
-    unsafe { slab::dealloc(p, layout); }
+    unsafe {
+        slab::dealloc(p, layout);
+    }
     let after_free = slab::stats().classes[class_idx].in_use;
     if after_free != before {
         return TestResult::Fail("in_use didn't return to baseline on free");
@@ -1781,7 +1934,9 @@ fn smoke_slab_magazine_hot_path() -> TestResult {
     }
     for p in ptrs {
         // SAFETY: just allocated.
-        unsafe { slab::dealloc(p, layout); }
+        unsafe {
+            slab::dealloc(p, layout);
+        }
     }
 
     // After the round-trip, in_use is back at baseline.
@@ -1792,7 +1947,8 @@ fn smoke_slab_magazine_hot_path() -> TestResult {
     // grown advanced at most by ceil(n / blocks_per_page) — for
     // 64-byte blocks in 4 KiB pages = 64 per page = exactly 1 page.
     let grew = stats1.classes[class_idx].grown - grown_before;
-    if grew > 256 {  // sanity bound; well above 64-block expectation.
+    if grew > 256 {
+        // sanity bound; well above 64-block expectation.
         return TestResult::Fail("magazine path didn't amortise grow");
     }
     TestResult::Pass
@@ -1868,13 +2024,17 @@ fn smoke_smp_mark_online_offline() -> TestResult {
     // already be set, so test against an unused slot.
     const TEST_SLOT: u32 = 63;
     let initial = smp::is_online(TEST_SLOT);
-    if initial { smp::mark_offline(TEST_SLOT); }
+    if initial {
+        smp::mark_offline(TEST_SLOT);
+    }
     if smp::is_online(TEST_SLOT) {
         return TestResult::Fail("offline didn't clear initial state");
     }
     // SAFETY: not actually running on CPU TEST_SLOT; this is a
     // bookkeeping surface test, not real bring-up.
-    unsafe { smp::mark_online(TEST_SLOT); }
+    unsafe {
+        smp::mark_online(TEST_SLOT);
+    }
     if !smp::is_online(TEST_SLOT) {
         return TestResult::Fail("mark_online didn't set bit");
     }
@@ -1939,17 +2099,23 @@ fn smoke_smp_aarch64_sgi_to_ap() -> TestResult {
     // Send an SGI to the AP + verify its receive counter advances.
     use narf_interrupts::aarch64::sgi;
     use narf_lib::smp;
-    if !smp::is_online(1) { return TestResult::Skip("AP CPU 1 offline"); }
+    if !smp::is_online(1) {
+        return TestResult::Skip("AP CPU 1 offline");
+    }
 
-    let intid: u8 = 7;  // an unused vector slot
+    let intid: u8 = 7; // an unused vector slot
     let before = sgi::rx_count(1, intid);
     // SAFETY: GICv3 sysreg interface up post-init_bsp; target
     // affinity 1 = AP 1 on QEMU virt's flat affinity layout.
-    unsafe { sgi::send_to_cpu_aff(intid, 1); }
+    unsafe {
+        sgi::send_to_cpu_aff(intid, 1);
+    }
     // Poll briefly for the AP to receive + handle.
     let start = narf_time::Instant::now();
     while narf_time::Instant::now().cycles_since(start) < 5_000_000 {
-        if sgi::rx_count(1, intid) > before { return TestResult::Pass; }
+        if sgi::rx_count(1, intid) > before {
+            return TestResult::Pass;
+        }
         core::hint::spin_loop();
     }
     TestResult::Fail("AP didn't receive SGI within window")
@@ -1967,12 +2133,14 @@ fn smoke_smp_aarch64_cross_cpu_visibility() -> TestResult {
     use narf_interrupts::aarch64::sgi;
     use narf_lib::smp;
 
-    if !smp::is_online(1) { return TestResult::Skip("AP CPU 1 offline"); }
+    if !smp::is_online(1) {
+        return TestResult::Skip("AP CPU 1 offline");
+    }
 
-    static SEED:   AtomicU64 = AtomicU64::new(0);
+    static SEED: AtomicU64 = AtomicU64::new(0);
     static RESULT: AtomicU64 = AtomicU64::new(0);
-    const MAGIC:   u64       = 0xDEAD_BEEF_F00D_CAFE;
-    const INTID:   u8        = 5;
+    const MAGIC: u64 = 0xDEAD_BEEF_F00D_CAFE;
+    const INTID: u8 = 5;
 
     fn ap_handler() {
         let s = SEED.load(Ordering::Acquire);
@@ -1985,7 +2153,9 @@ fn smoke_smp_aarch64_cross_cpu_visibility() -> TestResult {
     RESULT.store(0, Ordering::Release);
 
     // SAFETY: GICv3 is up; AP is online with handlers installed.
-    unsafe { sgi::send_to_cpu_aff(INTID, 1); }
+    unsafe {
+        sgi::send_to_cpu_aff(INTID, 1);
+    }
 
     let start = narf_time::Instant::now();
     while narf_time::Instant::now().cycles_since(start) < 5_000_000 {
@@ -2013,13 +2183,17 @@ fn smoke_smp_aarch64_resched_flag() -> TestResult {
     // bring-up).
     use narf_interrupts::aarch64::sgi;
     use narf_lib::smp;
-    if !smp::is_online(1) { return TestResult::Skip("AP CPU 1 offline"); }
+    if !smp::is_online(1) {
+        return TestResult::Skip("AP CPU 1 offline");
+    }
     sgi::clear_resched(1);
     if sgi::needs_resched(1) {
         return TestResult::Fail("clear_resched didn't clear");
     }
     // SAFETY: GICv3 sysreg up.
-    unsafe { sgi::send_to_cpu_aff(sgi::SGI_RESCHED, 1); }
+    unsafe {
+        sgi::send_to_cpu_aff(sgi::SGI_RESCHED, 1);
+    }
     let start = narf_time::Instant::now();
     while narf_time::Instant::now().cycles_since(start) < 5_000_000 {
         if sgi::needs_resched(1) {
@@ -2094,7 +2268,7 @@ fn smoke_acpi_srat_topology_present() -> TestResult {
     // tables, so re-parse from the cached RSDP first.
     let rsdp = match narf_acpi::cached_rsdp() {
         Some(p) => p,
-        None    => return TestResult::Fail("no boot-time RSDP cached"),
+        None => return TestResult::Fail("no boot-time RSDP cached"),
     };
     // SAFETY: cached RSDP was already validated at boot.
     let _ = unsafe { narf_acpi::parse_srat(rsdp) };
@@ -2120,7 +2294,7 @@ fn smoke_acpi_srat_memory_node_lookup() -> TestResult {
     // to a non-zero node.
     let rsdp = match narf_acpi::cached_rsdp() {
         Some(p) => p,
-        None    => return TestResult::Fail("no boot-time RSDP cached"),
+        None => return TestResult::Fail("no boot-time RSDP cached"),
     };
     // SAFETY: cached RSDP was already validated at boot.
     let _ = unsafe { narf_acpi::parse_srat(rsdp) };
@@ -2152,18 +2326,20 @@ fn smoke_acpi_srat_synthetic_lapic_entry() -> TestResult {
     // for APIC id 7, proximity domain 3, enabled flag set.
     narf_acpi::__reset_for_test();
     let entry: [u8; 16] = [
-        0,    // type = 0
-        16,   // length
-        3,    // PD low byte
-        7,    // APIC id
-        1, 0, 0, 0,   // flags = enabled
-        0,    // local SAPIC EID
-        0, 0, 0,      // PD high (24 bits)
-        0, 0, 0, 0,   // clock domain
+        0,  // type = 0
+        16, // length
+        3,  // PD low byte
+        7,  // APIC id
+        1, 0, 0, 0, // flags = enabled
+        0, // local SAPIC EID
+        0, 0, 0, // PD high (24 bits)
+        0, 0, 0, 0, // clock domain
     ];
     // SAFETY: synthetic body for the test-only entry-point.
     let n = unsafe { narf_acpi::__parse_srat_body_for_test(&entry) };
-    if n != 1 { return TestResult::Fail("expected 1 entry"); }
+    if n != 1 {
+        return TestResult::Fail("expected 1 entry");
+    }
     if narf_acpi::cpu_node(7) != Some(3) {
         return TestResult::Fail("CPU 7 should map to node 3");
     }
@@ -2180,7 +2356,7 @@ fn smoke_acpi_madt_topology_present() -> TestResult {
     // and expose the LAPIC base.
     let rsdp = match narf_acpi::cached_rsdp() {
         Some(p) => p,
-        None    => return TestResult::Fail("no boot-time RSDP cached"),
+        None => return TestResult::Fail("no boot-time RSDP cached"),
     };
     // SAFETY: cached RSDP, validated at boot.
     let _ = unsafe { narf_acpi::parse_madt(rsdp) };
@@ -2211,13 +2387,13 @@ fn smoke_acpi_mcfg_ecam_base() -> TestResult {
     // same address that the bus walker successfully used.
     let rsdp = match narf_acpi::cached_rsdp() {
         Some(p) => p,
-        None    => return TestResult::Fail("no boot-time RSDP cached"),
+        None => return TestResult::Fail("no boot-time RSDP cached"),
     };
     // SAFETY: cached RSDP, validated at boot.
     let _ = unsafe { narf_acpi::parse_mcfg(rsdp) };
     let base = match narf_acpi::mcfg_ecam_base() {
         Some(b) => b,
-        None    => return TestResult::Fail("MCFG didn't report a base"),
+        None => return TestResult::Fail("MCFG didn't report a base"),
     };
     if base != 0xB000_0000 {
         return TestResult::Fail("unexpected MCFG ECAM base");
@@ -2254,10 +2430,10 @@ fn smoke_aml_synthetic_scope_and_name() -> TestResult {
 
     let mut body: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     body.push(0x10); // ScopeOp
-    // We'll patch PkgLength after building the body.
+                     // We'll patch PkgLength after building the body.
     let pkg_len_pos = body.len();
     body.push(0); // placeholder
-    // NameString: \X___ (root + 1 seg, name "X" padded to 4 chars).
+                  // NameString: \X___ (root + 1 seg, name "X" padded to 4 chars).
     body.push(b'\\');
     body.extend_from_slice(b"X___");
     // Body inside scope: Name(_HID, DWord 0x12345678)
@@ -2274,14 +2450,16 @@ fn smoke_aml_synthetic_scope_and_name() -> TestResult {
 
     let n = match narf_aml::__parse_body_for_test(&body, "\\") {
         Ok(n) => n,
-        Err(e) => return TestResult::Fail(match e {
-            narf_aml::AmlError::Truncated   => "truncated",
-            narf_aml::AmlError::BadPkgLength=> "bad pkglen",
-            narf_aml::AmlError::OutOfPkg    => "out of pkg",
-            narf_aml::AmlError::Acpi(_)     => "acpi err",
-            narf_aml::AmlError::BadNameSegment => "bad nameseg",
-            narf_aml::AmlError::NoDsdt      => "no dsdt",
-        }),
+        Err(e) => {
+            return TestResult::Fail(match e {
+                narf_aml::AmlError::Truncated => "truncated",
+                narf_aml::AmlError::BadPkgLength => "bad pkglen",
+                narf_aml::AmlError::OutOfPkg => "out of pkg",
+                narf_aml::AmlError::Acpi(_) => "acpi err",
+                narf_aml::AmlError::BadNameSegment => "bad nameseg",
+                narf_aml::AmlError::NoDsdt => "no dsdt",
+            })
+        }
     };
     if n != 2 {
         return TestResult::Fail("expected 2 nodes (Scope + Name)");
@@ -2289,7 +2467,7 @@ fn smoke_aml_synthetic_scope_and_name() -> TestResult {
 
     let scope = match narf_aml::find_node("\\X") {
         Some(s) => s,
-        None    => return TestResult::Fail("Scope \\X missing"),
+        None => return TestResult::Fail("Scope \\X missing"),
     };
     if scope.kind != narf_aml::NodeKind::Scope {
         return TestResult::Fail("Scope kind wrong");
@@ -2297,7 +2475,7 @@ fn smoke_aml_synthetic_scope_and_name() -> TestResult {
 
     let hid = match narf_aml::find_node("\\X._HID") {
         Some(n) => n,
-        None    => return TestResult::Fail("\\X._HID missing"),
+        None => return TestResult::Fail("\\X._HID missing"),
     };
     match hid.value {
         Some(narf_aml::NameValue::Integer(v)) if v == 0x12345678 => {}
@@ -2335,7 +2513,7 @@ fn smoke_aml_synthetic_method_skipped() -> TestResult {
     }
     let m = match narf_aml::find_node("\\Y") {
         Some(m) => m,
-        None    => return TestResult::Fail("Method \\Y missing"),
+        None => return TestResult::Fail("Method \\Y missing"),
     };
     if m.kind != narf_aml::NodeKind::Method {
         return TestResult::Fail("kind wasn't Method");
@@ -2363,11 +2541,11 @@ fn build_eval_method_blob(name4: &[u8; 4], flags: u8, body: &[u8]) -> alloc::vec
     //                 + 1 (flags) + body.len().
     let pkg_total = 1 + 1 + 4 + 1 + body.len();
     let mut blob = alloc::vec::Vec::new();
-    blob.push(0x14);               // MethodOp
-    blob.push(pkg_total as u8);    // single-byte PkgLength (must fit in 6 bits)
-    blob.push(b'\\');              // root char
+    blob.push(0x14); // MethodOp
+    blob.push(pkg_total as u8); // single-byte PkgLength (must fit in 6 bits)
+    blob.push(b'\\'); // root char
     blob.extend_from_slice(name4); // 4-byte NameSeg
-    blob.push(flags);              // MethodFlags
+    blob.push(flags); // MethodFlags
     blob.extend_from_slice(body);
     blob
 }
@@ -2375,11 +2553,11 @@ fn build_eval_method_blob(name4: &[u8; 4], flags: u8, body: &[u8]) -> alloc::vec
 fn smoke_aml_eval_add() -> TestResult {
     // Method(\EV1_, 0) { Return(Add(2, 3, Local0)) } → 5
     let body: &[u8] = &[
-        0xA4,       // ReturnOp
-        0x72,       // AddOp
+        0xA4, // ReturnOp
+        0x72, // AddOp
         0x0A, 0x02, // BytePrefix 2
         0x0A, 0x03, // BytePrefix 3
-        0x60,       // Local0 (target)
+        0x60, // Local0 (target)
     ];
     let blob = build_eval_method_blob(b"EV1_", 0, body);
     if narf_aml::__parse_body_for_test(&blob, "\\").is_err() {
@@ -2397,15 +2575,20 @@ fn smoke_aml_eval_if_lequal() -> TestResult {
     // Method(\EV2_, 0) { Store(0x10, Local0); If(LEqual(Local0, 0x10)) { Return(One) } Return(Zero) } → 1
     let if_body: &[u8] = &[0xA4, 0x01]; // ReturnOp OneOp
     let pred: &[u8] = &[0x93, 0x60, 0x0A, 0x10]; // LEqual(Local0, 0x10)
-    // PkgLength for If: 1 (PkgLength byte) + pred.len() + if_body.len()
+                                                 // PkgLength for If: 1 (PkgLength byte) + pred.len() + if_body.len()
     let if_pkg_total = 1 + pred.len() + if_body.len();
 
     let mut body: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-    body.push(0x70); body.push(0x0A); body.push(0x10); body.push(0x60); // Store(0x10, Local0)
-    body.push(0xA0); body.push(if_pkg_total as u8);   // IfOp PkgLength
-    body.extend_from_slice(pred);   // predicate
+    body.push(0x70);
+    body.push(0x0A);
+    body.push(0x10);
+    body.push(0x60); // Store(0x10, Local0)
+    body.push(0xA0);
+    body.push(if_pkg_total as u8); // IfOp PkgLength
+    body.extend_from_slice(pred); // predicate
     body.extend_from_slice(if_body); // then-body
-    body.push(0xA4); body.push(0x00); // Return(Zero)
+    body.push(0xA4);
+    body.push(0x00); // Return(Zero)
 
     let blob = build_eval_method_blob(b"EV2_", 0, &body);
     if narf_aml::__parse_body_for_test(&blob, "\\").is_err() {
@@ -2423,15 +2606,19 @@ fn smoke_aml_eval_while_increment() -> TestResult {
     // Method(\EV3_, 0) { Store(0, Local0); While(LLess(Local0, 5)) { Increment(Local0) } Return(Local0) } → 5
     let while_body: &[u8] = &[0x75, 0x60]; // IncrementOp Local0
     let pred: &[u8] = &[0x95, 0x60, 0x0A, 0x05]; // LLess(Local0, 5)
-    // PkgLength for While: 1 (PkgLength byte) + pred.len() + while_body.len()
+                                                 // PkgLength for While: 1 (PkgLength byte) + pred.len() + while_body.len()
     let while_pkg_total = 1 + pred.len() + while_body.len();
 
     let mut body: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-    body.push(0x70); body.push(0x00); body.push(0x60); // Store(0, Local0)
-    body.push(0xA2); body.push(while_pkg_total as u8);  // WhileOp PkgLength
+    body.push(0x70);
+    body.push(0x00);
+    body.push(0x60); // Store(0, Local0)
+    body.push(0xA2);
+    body.push(while_pkg_total as u8); // WhileOp PkgLength
     body.extend_from_slice(pred);
     body.extend_from_slice(while_body);
-    body.push(0xA4); body.push(0x60); // Return(Local0)
+    body.push(0xA4);
+    body.push(0x60); // Return(Local0)
 
     let blob = build_eval_method_blob(b"EV3_", 0, &body);
     if narf_aml::__parse_body_for_test(&blob, "\\").is_err() {
@@ -2448,11 +2635,11 @@ kernel_test!(smoke_aml_eval_while_increment);
 fn smoke_aml_eval_multiply_arg() -> TestResult {
     // Method(\EV4_, 1) { Return(Multiply(Arg0, 7, Local0)) } called with [6] → 42
     let body: &[u8] = &[
-        0xA4,       // ReturnOp
-        0x77,       // MultiplyOp
-        0x68,       // Arg0
+        0xA4, // ReturnOp
+        0x77, // MultiplyOp
+        0x68, // Arg0
         0x0A, 0x07, // BytePrefix 7
-        0x60,       // Local0 (target)
+        0x60, // Local0 (target)
     ];
     let blob = build_eval_method_blob(b"EV4_", 1, body);
     if narf_aml::__parse_body_for_test(&blob, "\\").is_err() {
@@ -2497,7 +2684,7 @@ fn smoke_frame_alloc_on_node_returns_local() -> TestResult {
     }
     let rsdp = match narf_acpi::cached_rsdp() {
         Some(p) => p,
-        None    => return TestResult::Fail("no boot-time RSDP cached"),
+        None => return TestResult::Fail("no boot-time RSDP cached"),
     };
     // SAFETY: cached RSDP, validated at boot.
     let _ = unsafe { narf_acpi::parse_srat(rsdp) };
@@ -2513,7 +2700,7 @@ fn smoke_frame_alloc_on_node_returns_local() -> TestResult {
         match observed {
             Some(n) if n == node => continue,
             Some(_) => return TestResult::Fail("alloc_frame_on returned wrong-node frame"),
-            None    => return TestResult::Fail("frame address not in any SRAT range"),
+            None => return TestResult::Fail("frame address not in any SRAT range"),
         }
     }
     TestResult::Pass
@@ -2535,7 +2722,7 @@ fn smoke_frame_free_routes_to_owning_node() -> TestResult {
     }
     let rsdp = match narf_acpi::cached_rsdp() {
         Some(p) => p,
-        None    => return TestResult::Fail("no boot-time RSDP cached"),
+        None => return TestResult::Fail("no boot-time RSDP cached"),
     };
     // SAFETY: cached RSDP, validated at boot.
     let _ = unsafe { narf_acpi::parse_srat(rsdp) };
@@ -2566,19 +2753,15 @@ fn smoke_acpi_hmat_latency_lookup() -> TestResult {
     // returns sane values for both axes.
     let rsdp = match narf_acpi::cached_rsdp() {
         Some(p) => p,
-        None    => return TestResult::Fail("no boot-time RSDP cached"),
+        None => return TestResult::Fail("no boot-time RSDP cached"),
     };
     // SAFETY: cached RSDP, validated at boot.
     let _ = unsafe { narf_acpi::parse_hmat(rsdp) };
     if !narf_acpi::is_hmat_known() {
         return TestResult::Fail("HMAT not parsed");
     }
-    let same = narf_acpi::hmat_value(
-        narf_acpi::HmatLatBwKind::AccessLatency, 0, 0, 0,
-    );
-    let cross = narf_acpi::hmat_value(
-        narf_acpi::HmatLatBwKind::AccessLatency, 0, 0, 1,
-    );
+    let same = narf_acpi::hmat_value(narf_acpi::HmatLatBwKind::AccessLatency, 0, 0, 0);
+    let cross = narf_acpi::hmat_value(narf_acpi::HmatLatBwKind::AccessLatency, 0, 0, 1);
     let (same, cross) = match (same, cross) {
         (Some(s), Some(c)) => (s, c),
         _ => return TestResult::Fail("HMAT didn't return both lookups"),
@@ -2595,7 +2778,7 @@ kernel_test!(smoke_acpi_hmat_latency_lookup);
 fn smoke_acpi_hmat_mem_attrs_present() -> TestResult {
     let rsdp = match narf_acpi::cached_rsdp() {
         Some(p) => p,
-        None    => return TestResult::Fail("no boot-time RSDP cached"),
+        None => return TestResult::Fail("no boot-time RSDP cached"),
     };
     // SAFETY: cached RSDP, validated at boot.
     let _ = unsafe { narf_acpi::parse_hmat(rsdp) };
@@ -2637,16 +2820,16 @@ fn smoke_acpi_pmtt_synthetic_dimm_entry() -> TestResult {
     // Socket header is 12 bytes; memory ctrl 12 bytes; each DIMM 12 bytes.
     // Total socket length = 12 + 12 + 12 + 12 = 48.
     let socket_start = buf.len();
-    buf.push(0);  // type=Socket
-    buf.push(0);  // reserved
+    buf.push(0); // type=Socket
+    buf.push(0); // reserved
     buf.extend_from_slice(&48u16.to_le_bytes()); // length
-    buf.extend_from_slice(&0u16.to_le_bytes());  // flags
-    buf.extend_from_slice(&0u16.to_le_bytes());  // reserved
-    buf.extend_from_slice(&7u16.to_le_bytes());  // socket id = 7
-    buf.extend_from_slice(&0u16.to_le_bytes());  // reserved
+    buf.extend_from_slice(&0u16.to_le_bytes()); // flags
+    buf.extend_from_slice(&0u16.to_le_bytes()); // reserved
+    buf.extend_from_slice(&7u16.to_le_bytes()); // socket id = 7
+    buf.extend_from_slice(&0u16.to_le_bytes()); // reserved
 
     // Memory controller (length = 12 + 2*12 = 36).
-    buf.push(1);  // type=MemCtrl
+    buf.push(1); // type=MemCtrl
     buf.push(0);
     buf.extend_from_slice(&36u16.to_le_bytes());
     buf.extend_from_slice(&0u16.to_le_bytes());
@@ -2689,8 +2872,8 @@ fn smoke_acpi_pmtt_synthetic_dimm_entry() -> TestResult {
     xsdt.extend_from_slice(b"XSDT");
     let xlen_pos = xsdt.len();
     xsdt.extend_from_slice(&0u32.to_le_bytes());
-    xsdt.push(1);  // revision
-    xsdt.push(0);  // checksum
+    xsdt.push(1); // revision
+    xsdt.push(0); // checksum
     xsdt.extend_from_slice(b"NARFCO");
     xsdt.extend_from_slice(b"NARFTBL_");
     xsdt.extend_from_slice(&0u32.to_le_bytes());
@@ -2720,10 +2903,10 @@ fn smoke_acpi_pmtt_synthetic_dimm_entry() -> TestResult {
             let _ = (buf, xsdt, rsdp);
             return TestResult::Fail(match e {
                 narf_acpi::AcpiError::BadRsdpSignature => "bad rsdp sig",
-                narf_acpi::AcpiError::BadRsdpChecksum  => "bad rsdp cksum",
-                narf_acpi::AcpiError::NoXsdt           => "no xsdt",
+                narf_acpi::AcpiError::BadRsdpChecksum => "bad rsdp cksum",
+                narf_acpi::AcpiError::NoXsdt => "no xsdt",
                 narf_acpi::AcpiError::BadXsdtSignature => "bad xsdt sig",
-                narf_acpi::AcpiError::NoSrat           => "no pmtt",
+                narf_acpi::AcpiError::NoSrat => "no pmtt",
                 narf_acpi::AcpiError::BadTableChecksum => "bad table cksum",
             });
         }
@@ -2756,22 +2939,22 @@ fn smoke_acpi_pmtt_synthetic_dimm_entry() -> TestResult {
 }
 kernel_test!(smoke_acpi_pmtt_synthetic_dimm_entry);
 
-
-
 fn smoke_acpi_srat_synthetic_memory_entry() -> TestResult {
     // Type-1 memory affinity entry: base 0x1_0000_0000, length
     // 0x1000_0000, proximity 1, enabled.
     narf_acpi::__reset_for_test();
     let mut entry = [0u8; 40];
-    entry[0] = 1;            // type
-    entry[1] = 40;           // length
-    entry[2..6].copy_from_slice(&1u32.to_le_bytes());        // proximity
+    entry[0] = 1; // type
+    entry[1] = 40; // length
+    entry[2..6].copy_from_slice(&1u32.to_le_bytes()); // proximity
     entry[8..16].copy_from_slice(&0x1_0000_0000u64.to_le_bytes());
     entry[16..24].copy_from_slice(&0x1000_0000u64.to_le_bytes());
-    entry[28..32].copy_from_slice(&1u32.to_le_bytes());      // flags=enabled
-    // SAFETY: test-only entry point.
+    entry[28..32].copy_from_slice(&1u32.to_le_bytes()); // flags=enabled
+                                                        // SAFETY: test-only entry point.
     let n = unsafe { narf_acpi::__parse_srat_body_for_test(&entry) };
-    if n != 1 { return TestResult::Fail("expected 1 entry"); }
+    if n != 1 {
+        return TestResult::Fail("expected 1 entry");
+    }
     if narf_acpi::memory_node(0x1_0000_1000) != Some(1) {
         return TestResult::Fail("addr inside range should map to node 1");
     }
@@ -2798,14 +2981,20 @@ fn smoke_scheduler_per_cpu_pin_to_bsp() -> TestResult {
         affinity: Affinity::pinned(CpuId(0)),
         ..TaskSpec::unthrottled()
     };
-    let _ = spawn_with_spec(async {
-        RAN.store(1, Ordering::Relaxed);
-    }, spec);
+    let _ = spawn_with_spec(
+        async {
+            RAN.store(1, Ordering::Relaxed);
+        },
+        spec,
+    );
 
     narf_scheduler::run_until_empty();
 
-    if RAN.load(Ordering::Relaxed) == 1 { TestResult::Pass }
-    else { TestResult::Fail("BSP-pinned task didn't run") }
+    if RAN.load(Ordering::Relaxed) == 1 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("BSP-pinned task didn't run")
+    }
 }
 kernel_test!(smoke_scheduler_per_cpu_pin_to_bsp);
 
@@ -2833,9 +3022,12 @@ fn smoke_scheduler_numa_steal_prefers_same_node() -> TestResult {
             affinity: Affinity::pinned(CpuId(cpu)),
             ..TaskSpec::unthrottled()
         };
-        let _ = spawn_with_spec(async {
-            DONE.fetch_add(1, Ordering::Relaxed);
-        }, spec);
+        let _ = spawn_with_spec(
+            async {
+                DONE.fetch_add(1, Ordering::Relaxed);
+            },
+            spec,
+        );
     }
 
     narf_scheduler::run_until_empty();
@@ -2896,18 +3088,19 @@ fn smoke_memory_address_space_materialize() -> TestResult {
     // aarch64 TTBR0 starts empty, so any low-half canonical VA is
     // safe — use the same one for portability.
     let vbase = 0x0000_0080_0000_0000u64; // 512 GiB
-    // Allocate a real phys frame to back it.
+                                          // Allocate a real phys frame to back it.
     let target = match narf_memory::alloc_frame() {
         Ok(f) => f.start_address(),
         Err(_) => return TestResult::Skip("frame allocator drained"),
     };
 
     a.map_region(Region {
-        base:  VirtAddr::new(vbase),
-        len:   0x1000,
+        base: VirtAddr::new(vbase),
+        len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys:  alloc::vec![target],
-    }).expect("map region");
+        phys: alloc::vec![target],
+    })
+    .expect("map region");
 
     if unsafe { a.materialize() }.is_err() {
         return TestResult::Fail("materialize failed on fresh user root");
@@ -2919,17 +3112,20 @@ fn smoke_memory_address_space_materialize() -> TestResult {
         use narf_memory::x86_64::paging::{self, PtFlags};
         let got = unsafe { paging::translate(a.root, VirtAddr::new(vbase)) };
         match got {
-            Some(phys) => if phys != target {
-                return TestResult::Fail("translate returned wrong phys");
-            },
+            Some(phys) => {
+                if phys != target {
+                    return TestResult::Fail("translate returned wrong phys");
+                }
+            }
             None => return TestResult::Fail("translate found no mapping post-materialize"),
         }
         let flags = unsafe { paging::flags_at(a.root, VirtAddr::new(vbase)) };
         match flags {
-            Some(f) if f.contains(PtFlags::PRESENT)
-                   && f.contains(PtFlags::WRITABLE)
-                   && f.contains(PtFlags::USER)
-                   && f.contains(PtFlags::NO_EXEC) => {}
+            Some(f)
+                if f.contains(PtFlags::PRESENT)
+                    && f.contains(PtFlags::WRITABLE)
+                    && f.contains(PtFlags::USER)
+                    && f.contains(PtFlags::NO_EXEC) => {}
             _ => return TestResult::Fail("x86_64 PTE missing expected flags"),
         }
     }
@@ -2938,9 +3134,11 @@ fn smoke_memory_address_space_materialize() -> TestResult {
         use narf_memory::aarch64::paging::{self, PtFlags};
         let got = unsafe { paging::translate(a.root, VirtAddr::new(vbase)) };
         match got {
-            Some(phys) => if phys != target {
-                return TestResult::Fail("translate returned wrong phys");
-            },
+            Some(phys) => {
+                if phys != target {
+                    return TestResult::Fail("translate returned wrong phys");
+                }
+            }
             None => return TestResult::Fail("translate found no mapping post-materialize"),
         }
         // Expect VALID + AF + UXN (non-exec default) + TYPE_PAGE.
@@ -2948,9 +3146,15 @@ fn smoke_memory_address_space_materialize() -> TestResult {
         match flags {
             Some(f) => {
                 let v = f.bits();
-                if v & 1 != 1 { return TestResult::Fail("aarch64 PTE not VALID"); }
-                if v & (1 << 10) == 0 { return TestResult::Fail("aarch64 PTE missing AF"); }
-                if v & (1 << 54) == 0 { return TestResult::Fail("aarch64 PTE missing UXN for non-exec region"); }
+                if v & 1 != 1 {
+                    return TestResult::Fail("aarch64 PTE not VALID");
+                }
+                if v & (1 << 10) == 0 {
+                    return TestResult::Fail("aarch64 PTE missing AF");
+                }
+                if v & (1 << 54) == 0 {
+                    return TestResult::Fail("aarch64 PTE missing UXN for non-exec region");
+                }
             }
             None => return TestResult::Fail("aarch64 flags_at returned None"),
         }
@@ -2981,15 +3185,20 @@ fn smoke_scheduler_spawn_user_carries_address_space() -> TestResult {
     let mut a = unsafe { AddressSpace::new_for_user() }.expect("alloc user AS");
     a.map_region(Region {
         base: VirtAddr::new(0x4000),
-        len:  0x1000,
+        len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::EXEC,
-        phys:  alloc::vec![PhysAddr::new(0x2_0000)],
-    }).expect("map");
+        phys: alloc::vec![PhysAddr::new(0x2_0000)],
+    })
+    .expect("map");
     let arc_a = Arc::new(a);
 
-    let tid = spawn_user(async {
-        RAN.fetch_add(1, Ordering::Relaxed);
-    }, TaskSpec::unthrottled(), Arc::clone(&arc_a));
+    let tid = spawn_user(
+        async {
+            RAN.fetch_add(1, Ordering::Relaxed);
+        },
+        TaskSpec::unthrottled(),
+        Arc::clone(&arc_a),
+    );
 
     // Before running, `address_space_of` finds our AS.
     match address_space_of(tid) {
@@ -3028,20 +3237,28 @@ fn smoke_ipc_mpsc_multi_producer_roundtrip() -> TestResult {
 
     // Three producer tasks + one consumer.
     narf_scheduler::spawn(async move {
-        for i in 0..4 { tx.try_send(0xA000 + i).unwrap(); }
+        for i in 0..4 {
+            tx.try_send(0xA000 + i).unwrap();
+        }
     });
     narf_scheduler::spawn(async move {
-        for i in 0..4 { tx2.try_send(0xB000 + i).unwrap(); }
+        for i in 0..4 {
+            tx2.try_send(0xB000 + i).unwrap();
+        }
     });
     narf_scheduler::spawn(async move {
-        for i in 0..4 { tx3.try_send(0xC000 + i).unwrap(); }
+        for i in 0..4 {
+            tx3.try_send(0xC000 + i).unwrap();
+        }
     });
 
     narf_scheduler::spawn(async move {
         let mut rx = rx;
         for _ in 0..12 {
             match rx.recv().await {
-                Ok(_v) => { DRAINED.fetch_add(1, Ordering::Relaxed); }
+                Ok(_v) => {
+                    DRAINED.fetch_add(1, Ordering::Relaxed);
+                }
                 Err(MpscRecvError::Closed) => break,
             }
         }
@@ -3076,7 +3293,9 @@ fn smoke_ipc_mpsc_closed_surfaces() -> TestResult {
         Err(MpscSendError::Closed(4)) => {}
         _ => return TestResult::Fail("dropped consumer did not surface Closed"),
     }
-    if !tx.is_closed() { return TestResult::Fail("is_closed lies"); }
+    if !tx.is_closed() {
+        return TestResult::Fail("is_closed lies");
+    }
 
     // Consumer-side Closed: use a fresh pair, drop sender explicitly.
     let (tx2, rx2) = mpsc_channel::<u8>(2);
@@ -3089,7 +3308,11 @@ fn smoke_ipc_mpsc_closed_surfaces() -> TestResult {
         // returns Ok(None) here, not Closed. That matches the impl
         // — we don't track producer count separately.
         Ok(None) => {}
-        _ => return TestResult::Fail("empty channel without producer-count tracking should surface Ok(None)"),
+        _ => {
+            return TestResult::Fail(
+                "empty channel without producer-count tracking should surface Ok(None)",
+            )
+        }
     }
     TestResult::Pass
 }
@@ -3099,31 +3322,51 @@ fn smoke_memory_address_space_region_table() -> TestResult {
     use narf_memory::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
 
     let mut a = AddressSpace::empty();
-    if a.region_count() != 0 { return TestResult::Fail("fresh AS has regions"); }
+    if a.region_count() != 0 {
+        return TestResult::Fail("fresh AS has regions");
+    }
 
     let rx = RegionPerms::READ | RegionPerms::EXEC;
-    let r1 = Region { base: VirtAddr::new(0x4000), len: 0x1000, perms: rx,
-                      phys: alloc::vec![PhysAddr::new(0x10_0000)] };
-    if a.map_region(r1).is_err() { return TestResult::Fail("first map failed"); }
+    let r1 = Region {
+        base: VirtAddr::new(0x4000),
+        len: 0x1000,
+        perms: rx,
+        phys: alloc::vec![PhysAddr::new(0x10_0000)],
+    };
+    if a.map_region(r1).is_err() {
+        return TestResult::Fail("first map failed");
+    }
 
     // Non-overlapping second region is fine.
-    let r2 = Region { base: VirtAddr::new(0x5000), len: 0x2000, perms: rx,
-                      phys: alloc::vec![PhysAddr::new(0x11_0000),
-                                        PhysAddr::new(0x11_1000)] };
-    if a.map_region(r2).is_err() { return TestResult::Fail("second non-overlap map failed"); }
+    let r2 = Region {
+        base: VirtAddr::new(0x5000),
+        len: 0x2000,
+        perms: rx,
+        phys: alloc::vec![PhysAddr::new(0x11_0000), PhysAddr::new(0x11_1000)],
+    };
+    if a.map_region(r2).is_err() {
+        return TestResult::Fail("second non-overlap map failed");
+    }
 
     // Overlap is rejected.
-    let r_over = Region { base: VirtAddr::new(0x6000), len: 0x2000, perms: rx,
-                          phys: alloc::vec![PhysAddr::new(0x12_0000),
-                                            PhysAddr::new(0x12_1000)] };
+    let r_over = Region {
+        base: VirtAddr::new(0x6000),
+        len: 0x2000,
+        perms: rx,
+        phys: alloc::vec![PhysAddr::new(0x12_0000), PhysAddr::new(0x12_1000)],
+    };
     match a.map_region(r_over) {
         Err(AddressSpaceError::Overlap) => {}
         _ => return TestResult::Fail("overlap should be rejected"),
     }
 
     // Unaligned base is rejected.
-    let r_unaligned = Region { base: VirtAddr::new(0x4123), len: 0x1000, perms: rx,
-                               phys: alloc::vec![PhysAddr::new(0x13_0000)] };
+    let r_unaligned = Region {
+        base: VirtAddr::new(0x4123),
+        len: 0x1000,
+        perms: rx,
+        phys: alloc::vec![PhysAddr::new(0x13_0000)],
+    };
     match a.map_region(r_unaligned) {
         Err(AddressSpaceError::AlignmentMismatch) => {}
         _ => return TestResult::Fail("unaligned base should be rejected"),
@@ -3165,17 +3408,16 @@ fn smoke_abi_dispatcher_serves_file_ops() -> TestResult {
     use alloc::boxed::Box;
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicU8, Ordering};
-    use narf_abi::{Dispatcher, Submission, OpCode, Tag, NarfStatus};
+    use narf_abi::{Dispatcher, NarfStatus, OpCode, Submission, Tag};
     use narf_capabilities::{Cap, Grant};
     use narf_filesystem::{
-        bootstrap_mount_authority, registry, DirEntry, DirOps, FileOps,
-        FsFuture, FsInstance, MountPoint, Stat,
+        bootstrap_mount_authority, registry, DirEntry, DirOps, FileOps, FsFuture, FsInstance,
+        MountPoint, Stat,
     };
     use narf_memory::AddressSpace;
     use narf_userspace::{
-        abi_file_op_bridge, install_address_space_lookup, install_core_syscalls,
-        install_global, install_task_id_lookup, syscall::__test_clear_global,
-        SyscallTable,
+        abi_file_op_bridge, install_address_space_lookup, install_core_syscalls, install_global,
+        install_task_id_lookup, syscall::__test_clear_global, SyscallTable,
     };
 
     static FILE_BYTES: &[u8] = b"VFS-via-ABI";
@@ -3184,7 +3426,9 @@ fn smoke_abi_dispatcher_serves_file_ops() -> TestResult {
         fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
             alloc::boxed::Box::pin(async move {
                 let off = offset as usize;
-                if off >= FILE_BYTES.len() { return Ok(0); }
+                if off >= FILE_BYTES.len() {
+                    return Ok(0);
+                }
                 let n = core::cmp::min(buf.len(), FILE_BYTES.len() - off);
                 buf[..n].copy_from_slice(&FILE_BYTES[off..off + n]);
                 Ok(n)
@@ -3195,15 +3439,22 @@ fn smoke_abi_dispatcher_serves_file_ops() -> TestResult {
             alloc::boxed::Box::pin(async move { Ok(n) })
         }
         fn stat(&self) -> Stat {
-            Stat { size: FILE_BYTES.len() as u64, blocks: 1,
-                   mode: narf_filesystem::Mode::FILE_RO,
-                   mtime_cycles: 0 }
+            Stat {
+                size: FILE_BYTES.len() as u64,
+                blocks: 1,
+                mode: narf_filesystem::Mode::FILE_RO,
+                mtime_cycles: 0,
+            }
         }
     }
     struct StubDir;
     impl DirOps for StubDir {
         fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
-            if name == "f" { Some(Arc::new(StubFile)) } else { None }
+            if name == "f" {
+                Some(Arc::new(StubFile))
+            } else {
+                None
+            }
         }
         fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
             Box::new(core::iter::empty())
@@ -3211,18 +3462,26 @@ fn smoke_abi_dispatcher_serves_file_ops() -> TestResult {
     }
     struct StubFs;
     impl FsInstance for StubFs {
-        fn root(&self) -> Arc<dyn DirOps> { Arc::new(StubDir) }
-        fn name(&self) -> &str { "stub_abi" }
+        fn root(&self) -> Arc<dyn DirOps> {
+            Arc::new(StubDir)
+        }
+        fn name(&self) -> &str {
+            "stub_abi"
+        }
     }
 
     let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
     let _ = registry().mount(&auth, "/test_abi", StubFs);
 
-    static USER_AS_ABI: narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>>
-        = narf_lib::sync::IrqSafeSpinLock::new(None);
-    fn as_lookup() -> Option<Arc<AddressSpace>> { USER_AS_ABI.lock().clone() }
+    static USER_AS_ABI: narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>> =
+        narf_lib::sync::IrqSafeSpinLock::new(None);
+    fn as_lookup() -> Option<Arc<AddressSpace>> {
+        USER_AS_ABI.lock().clone()
+    }
     static FAKE_TASK: u64 = 0xABBA;
-    fn task_lookup() -> u64 { FAKE_TASK }
+    fn task_lookup() -> u64 {
+        FAKE_TASK
+    }
 
     let addr_space = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
@@ -3242,22 +3501,33 @@ fn smoke_abi_dispatcher_serves_file_ops() -> TestResult {
     install_global(t);
 
     // Direct Bootstrap call (test runs in kernel context).
-    use narf_userspace::{kernel_syscall_entry, Syscall, SyscallArgs,
-                         SyscallReturn, TrapContext};
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
-    impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    use narf_userspace::{kernel_syscall_entry, Syscall, SyscallArgs, SyscallReturn, TrapContext};
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
     }
-    let mut ctx = FakeCtx { args: SyscallArgs::default(), ret: None };
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
+    }
+    let mut ctx = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
     kernel_syscall_entry(Syscall::Bootstrap.raw(), &mut ctx);
     if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
         return TestResult::Fail("Bootstrap returned non-Ok");
     }
 
     let kernel_ends = narf_userspace::take_kernel_ends(FAKE_TASK).expect("ke");
-    let user_ends   = narf_userspace::take_user_ends(FAKE_TASK).expect("ue");
+    let user_ends = narf_userspace::take_user_ends(FAKE_TASK).expect("ue");
 
     static OUTCOME: AtomicU8 = AtomicU8::new(0);
     OUTCOME.store(0, Ordering::Relaxed);
@@ -3265,7 +3535,7 @@ fn smoke_abi_dispatcher_serves_file_ops() -> TestResult {
     // Stable-static buffers for the path/mount/data so the user
     // task can hand pointers across awaits without lifetime
     // complications.
-    static PATH:  &[u8] = b"f";
+    static PATH: &[u8] = b"f";
     static MOUNT: &[u8] = b"/test_abi";
     static mut READ_BUF: [u8; 16] = [0u8; 16];
 
@@ -3289,7 +3559,8 @@ fn smoke_abi_dispatcher_serves_file_ops() -> TestResult {
         let comp = cq.recv().await.unwrap();
         if comp.status != NarfStatus::Ok || comp.result[0] != 3 {
             OUTCOME.store(2, Ordering::Relaxed);
-            core::mem::drop(sq); core::mem::drop(cq);
+            core::mem::drop(sq);
+            core::mem::drop(cq);
             return;
         }
         let fd = comp.result[0];
@@ -3304,7 +3575,8 @@ fn smoke_abi_dispatcher_serves_file_ops() -> TestResult {
         let comp = cq.recv().await.unwrap();
         if comp.status != NarfStatus::Ok {
             OUTCOME.store(3, Ordering::Relaxed);
-            core::mem::drop(sq); core::mem::drop(cq);
+            core::mem::drop(sq);
+            core::mem::drop(cq);
             return;
         }
         let n = comp.result[0] as usize;
@@ -3314,7 +3586,8 @@ fn smoke_abi_dispatcher_serves_file_ops() -> TestResult {
         } else {
             OUTCOME.store(4, Ordering::Relaxed);
         }
-        core::mem::drop(sq); core::mem::drop(cq);
+        core::mem::drop(sq);
+        core::mem::drop(cq);
     });
 
     narf_scheduler::run_until_empty();
@@ -3343,19 +3616,22 @@ fn smoke_abi_dispatcher_serves_mmap() -> TestResult {
     // `result[0]`. Then `OpCode::Munmap` that base → expect `Ok`.
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicU8, Ordering};
-    use narf_abi::{Dispatcher, Submission, OpCode, Tag, NarfStatus};
+    use narf_abi::{Dispatcher, NarfStatus, OpCode, Submission, Tag};
     use narf_memory::AddressSpace;
     use narf_userspace::{
-        abi_file_op_bridge, install_address_space_lookup, install_core_syscalls,
-        install_global, install_task_id_lookup, syscall::__test_clear_global,
-        SyscallTable,
+        abi_file_op_bridge, install_address_space_lookup, install_core_syscalls, install_global,
+        install_task_id_lookup, syscall::__test_clear_global, SyscallTable,
     };
 
-    static USER_AS_MMAP: narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>>
-        = narf_lib::sync::IrqSafeSpinLock::new(None);
-    fn as_lookup() -> Option<Arc<AddressSpace>> { USER_AS_MMAP.lock().clone() }
+    static USER_AS_MMAP: narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>> =
+        narf_lib::sync::IrqSafeSpinLock::new(None);
+    fn as_lookup() -> Option<Arc<AddressSpace>> {
+        USER_AS_MMAP.lock().clone()
+    }
     static FAKE_TASK: u64 = 0xACAC;
-    fn task_lookup() -> u64 { FAKE_TASK }
+    fn task_lookup() -> u64 {
+        FAKE_TASK
+    }
 
     let addr_space = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
@@ -3374,22 +3650,33 @@ fn smoke_abi_dispatcher_serves_mmap() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
-    use narf_userspace::{kernel_syscall_entry, Syscall, SyscallArgs,
-                         SyscallReturn, TrapContext};
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
-    impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    use narf_userspace::{kernel_syscall_entry, Syscall, SyscallArgs, SyscallReturn, TrapContext};
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
     }
-    let mut ctx = FakeCtx { args: SyscallArgs::default(), ret: None };
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
+    }
+    let mut ctx = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
     kernel_syscall_entry(Syscall::Bootstrap.raw(), &mut ctx);
     if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
         return TestResult::Fail("Bootstrap returned non-Ok");
     }
 
     let kernel_ends = narf_userspace::take_kernel_ends(FAKE_TASK).expect("ke");
-    let user_ends   = narf_userspace::take_user_ends(FAKE_TASK).expect("ue");
+    let user_ends = narf_userspace::take_user_ends(FAKE_TASK).expect("ue");
 
     static OUTCOME: AtomicU8 = AtomicU8::new(0);
     OUTCOME.store(0, Ordering::Relaxed);
@@ -3413,7 +3700,8 @@ fn smoke_abi_dispatcher_serves_mmap() -> TestResult {
         let comp = cq.recv().await.unwrap();
         if comp.status != NarfStatus::Ok || comp.result[0] == 0 {
             OUTCOME.store(2, Ordering::Relaxed);
-            core::mem::drop(sq); core::mem::drop(cq);
+            core::mem::drop(sq);
+            core::mem::drop(cq);
             return;
         }
         let base = comp.result[0];
@@ -3426,11 +3714,13 @@ fn smoke_abi_dispatcher_serves_mmap() -> TestResult {
         let comp = cq.recv().await.unwrap();
         if comp.status != NarfStatus::Ok {
             OUTCOME.store(3, Ordering::Relaxed);
-            core::mem::drop(sq); core::mem::drop(cq);
+            core::mem::drop(sq);
+            core::mem::drop(cq);
             return;
         }
         OUTCOME.store(1, Ordering::Relaxed);
-        core::mem::drop(sq); core::mem::drop(cq);
+        core::mem::drop(sq);
+        core::mem::drop(cq);
     });
 
     narf_scheduler::run_until_empty();
@@ -3459,20 +3749,24 @@ fn smoke_userspace_spawn_dispatcher_for_helper() -> TestResult {
     // user-side ends and observing the completion.
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicU8, Ordering};
-    use narf_abi::{Submission, Tag, NarfStatus};
+    use narf_abi::{NarfStatus, Submission, Tag};
     use narf_memory::AddressSpace;
     use narf_userspace::{
         install_address_space_lookup, install_core_syscalls, install_global,
         install_task_id_lookup, kernel_syscall_entry, spawn_dispatcher_for,
-        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn,
-        SyscallTable, TrapContext,
+        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext,
     };
 
-    static USER_AS_SDF: narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>>
-        = narf_lib::sync::IrqSafeSpinLock::new(None);
-    fn as_lookup() -> Option<Arc<AddressSpace>> { USER_AS_SDF.lock().clone() }
+    static USER_AS_SDF: narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>> =
+        narf_lib::sync::IrqSafeSpinLock::new(None);
+    fn as_lookup() -> Option<Arc<AddressSpace>> {
+        USER_AS_SDF.lock().clone()
+    }
     static FAKE_TASK: u64 = 0xDEAD;
-    fn task_lookup() -> u64 { FAKE_TASK }
+    fn task_lookup() -> u64 {
+        FAKE_TASK
+    }
 
     let addr_space = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
@@ -3490,13 +3784,25 @@ fn smoke_userspace_spawn_dispatcher_for_helper() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
-    impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
     }
-    let mut ctx = FakeCtx { args: SyscallArgs::default(), ret: None };
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
+    }
+    let mut ctx = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
     kernel_syscall_entry(Syscall::Bootstrap.raw(), &mut ctx);
     if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
         return TestResult::Fail("Bootstrap returned non-Ok");
@@ -3532,7 +3838,8 @@ fn smoke_userspace_spawn_dispatcher_for_helper() -> TestResult {
         } else {
             OUTCOME.store(2, Ordering::Relaxed);
         }
-        core::mem::drop(sq); core::mem::drop(cq);
+        core::mem::drop(sq);
+        core::mem::drop(cq);
     });
 
     narf_scheduler::run_until_empty();
@@ -3560,22 +3867,25 @@ fn smoke_userspace_shared_ring_kick_round_trip() -> TestResult {
     // reading the Completion back from the shared CQ.
     use alloc::sync::Arc;
     use narf_abi::{
-        NarfStatus, OpCode, SharedConsumer, SharedProducer, SharedRing,
-        Submission, Tag,
+        NarfStatus, OpCode, SharedConsumer, SharedProducer, SharedRing, Submission, Tag,
     };
     use narf_memory::AddressSpace;
     use narf_userspace::{
         install_address_space_lookup, install_core_syscalls, install_global,
         install_task_id_lookup, kernel_syscall_entry, shared_rings_for,
-        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn,
-        SyscallTable, TrapContext, BOOTSTRAP_SHARED_RING_DEPTH,
+        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext, BOOTSTRAP_SHARED_RING_DEPTH,
     };
 
-    static USER_AS_SR: narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>>
-        = narf_lib::sync::IrqSafeSpinLock::new(None);
-    fn as_lookup() -> Option<Arc<AddressSpace>> { USER_AS_SR.lock().clone() }
+    static USER_AS_SR: narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>> =
+        narf_lib::sync::IrqSafeSpinLock::new(None);
+    fn as_lookup() -> Option<Arc<AddressSpace>> {
+        USER_AS_SR.lock().clone()
+    }
     static FAKE_TASK: u64 = 0xBABE;
-    fn task_lookup() -> u64 { FAKE_TASK }
+    fn task_lookup() -> u64 {
+        FAKE_TASK
+    }
 
     let addr_space = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
@@ -3593,20 +3903,32 @@ fn smoke_userspace_shared_ring_kick_round_trip() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
-    impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
     }
-    let mut ctx = FakeCtx { args: SyscallArgs::default(), ret: None };
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
+    }
+    let mut ctx = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
     kernel_syscall_entry(Syscall::Bootstrap.raw(), &mut ctx);
     if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
         return TestResult::Fail("Bootstrap returned non-Ok");
     }
     let pair = match shared_rings_for(FAKE_TASK) {
         Some(p) => p,
-        None    => return TestResult::Fail("shared_rings_for None"),
+        None => return TestResult::Fail("shared_rings_for None"),
     };
 
     type SqRing = SharedRing<Submission, BOOTSTRAP_SHARED_RING_DEPTH>;
@@ -3615,7 +3937,7 @@ fn smoke_userspace_shared_ring_kick_round_trip() -> TestResult {
 
     let mut sq_prod = unsafe {
         SharedProducer::<Submission, BOOTSTRAP_SHARED_RING_DEPTH>::from_raw(
-            pair.sq_phys.raw() as *mut SqRing,
+            pair.sq_phys.raw() as *mut SqRing
         )
     };
     let mut sub = Submission::noop(Tag::new(0xFEED));
@@ -3624,7 +3946,10 @@ fn smoke_userspace_shared_ring_kick_round_trip() -> TestResult {
         return TestResult::Fail("shared SQ try_send");
     }
 
-    let mut ctx = FakeCtx { args: SyscallArgs::default(), ret: None };
+    let mut ctx = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
     kernel_syscall_entry(Syscall::RingKick.raw(), &mut ctx);
     let processed = match ctx.ret {
         Some(r) if r.status == SyscallReturn::OK => r.value,
@@ -3636,15 +3961,19 @@ fn smoke_userspace_shared_ring_kick_round_trip() -> TestResult {
 
     let mut cq_cons = unsafe {
         SharedConsumer::<CqRing, BOOTSTRAP_SHARED_RING_DEPTH>::from_raw(
-            pair.cq_phys.raw() as *mut CqRingT,
+            pair.cq_phys.raw() as *mut CqRingT
         )
     };
     let comp = match cq_cons.try_recv() {
         Ok(c) => c,
         Err(_) => return TestResult::Fail("shared CQ try_recv"),
     };
-    if comp.tag != 0xFEED { return TestResult::Fail("comp tag mismatch"); }
-    if comp.status != NarfStatus::Ok { return TestResult::Fail("comp status not Ok"); }
+    if comp.tag != 0xFEED {
+        return TestResult::Fail("comp tag mismatch");
+    }
+    if comp.status != NarfStatus::Ok {
+        return TestResult::Fail("comp status not Ok");
+    }
 
     *USER_AS_SR.lock() = None;
     narf_userspace::fd::__test_reset();
@@ -3663,19 +3992,23 @@ fn smoke_userspace_bootstrap_rings_round_trip() -> TestResult {
     // (which the test takes via `take_user_ends`).
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicU8, Ordering};
-    use narf_abi::{Dispatcher, Submission, Tag, NarfStatus};
+    use narf_abi::{Dispatcher, NarfStatus, Submission, Tag};
     use narf_memory::AddressSpace;
     use narf_userspace::{
         install_address_space_lookup, install_core_syscalls, install_global,
-        install_task_id_lookup, kernel_syscall_entry, syscall::__test_clear_global,
-        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+        install_task_id_lookup, kernel_syscall_entry, syscall::__test_clear_global, Syscall,
+        SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
     };
 
-    static USER_AS_RT: narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>>
-        = narf_lib::sync::IrqSafeSpinLock::new(None);
-    fn rt_as_lookup() -> Option<Arc<AddressSpace>> { USER_AS_RT.lock().clone() }
+    static USER_AS_RT: narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>> =
+        narf_lib::sync::IrqSafeSpinLock::new(None);
+    fn rt_as_lookup() -> Option<Arc<AddressSpace>> {
+        USER_AS_RT.lock().clone()
+    }
     static FAKE_TASK: u64 = 0xBEEF;
-    fn rt_task_lookup() -> u64 { FAKE_TASK }
+    fn rt_task_lookup() -> u64 {
+        FAKE_TASK
+    }
 
     let addr_space = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
@@ -3692,13 +4025,25 @@ fn smoke_userspace_bootstrap_rings_round_trip() -> TestResult {
     install_global(t);
 
     // Fire Bootstrap.
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
-    impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
     }
-    let mut ctx = FakeCtx { args: SyscallArgs::default(), ret: None };
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
+    }
+    let mut ctx = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
     kernel_syscall_entry(Syscall::Bootstrap.raw(), &mut ctx);
     if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
         *USER_AS_RT.lock() = None;
@@ -3781,17 +4126,20 @@ fn smoke_userspace_bootstrap_returns_config_page() -> TestResult {
     use narf_memory::{x86_64::paging, AddressSpace, VirtAddr};
     use narf_userspace::{
         install_address_space_lookup, install_core_syscalls, install_global,
-        install_task_id_lookup, kernel_syscall_entry,
-        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn,
-        SyscallTable, TrapContext,
+        install_task_id_lookup, kernel_syscall_entry, syscall::__test_clear_global, Syscall,
+        SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
     };
 
-    static USER_AS_BS: narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>>
-        = narf_lib::sync::IrqSafeSpinLock::new(None);
-    fn as_lookup() -> Option<Arc<AddressSpace>> { USER_AS_BS.lock().clone() }
+    static USER_AS_BS: narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>> =
+        narf_lib::sync::IrqSafeSpinLock::new(None);
+    fn as_lookup() -> Option<Arc<AddressSpace>> {
+        USER_AS_BS.lock().clone()
+    }
 
     static FAKE_TASK: AtomicU64 = AtomicU64::new(0xCAFE);
-    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    fn task_lookup() -> u64 {
+        FAKE_TASK.load(Ordering::Relaxed)
+    }
 
     let addr_space = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
@@ -3807,13 +4155,25 @@ fn smoke_userspace_bootstrap_returns_config_page() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
-    impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
     }
-    let mut ctx = FakeCtx { args: SyscallArgs::default(), ret: None };
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
+    }
+    let mut ctx = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
     kernel_syscall_entry(Syscall::Bootstrap.raw(), &mut ctx);
 
     let user_vaddr = match ctx.ret {
@@ -3845,11 +4205,17 @@ fn smoke_userspace_bootstrap_returns_config_page() -> TestResult {
     // every field so silent ABI drift breaks here.
     #[repr(C)]
     struct Hdr {
-        magic: u32, version: u32, task_id: u64,
-        sq_cap: u64, cq_cap: u64,
-        sq_depth: u32, cq_depth: u32,
-        shared_sq_vaddr: u64, shared_cq_vaddr: u64,
-        shared_depth: u32, _pad: u32,
+        magic: u32,
+        version: u32,
+        task_id: u64,
+        sq_cap: u64,
+        cq_cap: u64,
+        sq_depth: u32,
+        cq_depth: u32,
+        shared_sq_vaddr: u64,
+        shared_cq_vaddr: u64,
+        shared_depth: u32,
+        _pad: u32,
     }
     let hdr = unsafe { core::ptr::read_volatile(phys.raw() as *const Hdr) };
 
@@ -3878,8 +4244,10 @@ fn smoke_userspace_bootstrap_returns_config_page() -> TestResult {
         __test_clear_global();
         return TestResult::Fail("ring depths not 64");
     }
-    if hdr.shared_sq_vaddr == 0 || hdr.shared_cq_vaddr == 0
-        || hdr.shared_sq_vaddr == hdr.shared_cq_vaddr {
+    if hdr.shared_sq_vaddr == 0
+        || hdr.shared_cq_vaddr == 0
+        || hdr.shared_sq_vaddr == hdr.shared_cq_vaddr
+    {
         *USER_AS_BS.lock() = None;
         __test_clear_global();
         return TestResult::Fail("shared SQ/CQ vaddrs unset or collide");
@@ -3926,19 +4294,22 @@ fn smoke_userspace_brk_grows_heap() -> TestResult {
     use narf_memory::{x86_64::paging, AddressSpace, VirtAddr};
     use narf_userspace::{
         install_address_space_lookup, install_core_syscalls, install_global,
-        install_task_id_lookup, kernel_syscall_entry,
-        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn,
-        SyscallTable, TrapContext,
+        install_task_id_lookup, kernel_syscall_entry, syscall::__test_clear_global, Syscall,
+        SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
     };
 
-    static USER_AS_BRK: narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>>
-        = narf_lib::sync::IrqSafeSpinLock::new(None);
-    fn as_lookup() -> Option<Arc<AddressSpace>> { USER_AS_BRK.lock().clone() }
+    static USER_AS_BRK: narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>> =
+        narf_lib::sync::IrqSafeSpinLock::new(None);
+    fn as_lookup() -> Option<Arc<AddressSpace>> {
+        USER_AS_BRK.lock().clone()
+    }
 
     // Distinct task id from sibling smokes so stale per-task state
     // from a prior round can't poison this run.
     static FAKE_TASK: AtomicU64 = AtomicU64::new(0xB12C);
-    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    fn task_lookup() -> u64 {
+        FAKE_TASK.load(Ordering::Relaxed)
+    }
 
     let addr_space = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
@@ -3954,15 +4325,27 @@ fn smoke_userspace_brk_grows_heap() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     // Query the initial break.
-    let mut ctx = FakeCtx { args: SyscallArgs::default(), ret: None };
+    let mut ctx = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
     kernel_syscall_entry(Syscall::Brk.raw(), &mut ctx);
     let initial = match ctx.ret {
         Some(r) if r.status == SyscallReturn::OK => r.value,
@@ -3983,7 +4366,10 @@ fn smoke_userspace_brk_grows_heap() -> TestResult {
     // Grow by one page.
     let target = initial + 0x1000;
     let mut ctx = FakeCtx {
-        args: SyscallArgs { arg0: target, ..SyscallArgs::default() },
+        args: SyscallArgs {
+            arg0: target,
+            ..SyscallArgs::default()
+        },
         ret: None,
     };
     kernel_syscall_entry(Syscall::Brk.raw(), &mut ctx);
@@ -4014,7 +4400,10 @@ fn smoke_userspace_brk_grows_heap() -> TestResult {
     }
 
     // Querying again returns the new break.
-    let mut ctx = FakeCtx { args: SyscallArgs::default(), ret: None };
+    let mut ctx = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
     kernel_syscall_entry(Syscall::Brk.raw(), &mut ctx);
     let after = match ctx.ret {
         Some(r) if r.status == SyscallReturn::OK => r.value,
@@ -4051,13 +4440,15 @@ fn smoke_userspace_clock_gettime_writes_timespec() -> TestResult {
     // arg1 at a kernel-stack-resident `[i64; 2]` and read back.
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_userspace::{
-        install_core_syscalls, install_global, install_task_id_lookup,
-        kernel_syscall_entry, syscall::__test_clear_global, Syscall,
-        SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+        install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
+        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext,
     };
 
     static FAKE_TASK: AtomicU64 = AtomicU64::new(0xC10C);
-    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    fn task_lookup() -> u64 {
+        FAKE_TASK.load(Ordering::Relaxed)
+    }
     install_task_id_lookup(task_lookup);
 
     __test_clear_global();
@@ -4065,11 +4456,20 @@ fn smoke_userspace_clock_gettime_writes_timespec() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
     let mut ts: [i64; 2] = [-1, -1];
     let mut ctx = FakeCtx {
@@ -4104,14 +4504,15 @@ fn smoke_userspace_sigaction_records_handler() -> TestResult {
     // another and confirm the prior is reported.
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_userspace::{
-        install_core_syscalls, install_global, install_task_id_lookup,
-        kernel_syscall_entry, sigaction_lookup,
-        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn,
+        install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
+        sigaction_lookup, syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn,
         SyscallTable, TrapContext,
     };
 
     static FAKE_TASK: AtomicU64 = AtomicU64::new(0x51C0);
-    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    fn task_lookup() -> u64 {
+        FAKE_TASK.load(Ordering::Relaxed)
+    }
     install_task_id_lookup(task_lookup);
 
     narf_userspace::sigaction_init();
@@ -4120,17 +4521,26 @@ fn smoke_userspace_sigaction_records_handler() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     let mut old: u64 = 0xAAAA_AAAA_AAAA_AAAA;
     let mut ctx = FakeCtx {
         args: SyscallArgs {
-            arg0: 15,                                   // SIGTERM
+            arg0: 15, // SIGTERM
             arg1: 0xDEADBEEF,
             arg2: &mut old as *mut u64 as u64,
             ..SyscallArgs::default()
@@ -4192,14 +4602,15 @@ fn smoke_userspace_signal_delivery() -> TestResult {
     // called with the registered handler vaddr + signum.
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_userspace::{
-        default_signal_delivery, install_core_syscalls, install_global,
-        install_task_id_lookup, kernel_syscall_entry, signal_init,
-        signal_pending_of, syscall::__test_clear_global, Syscall,
-        SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+        default_signal_delivery, install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, signal_init, signal_pending_of, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
     };
 
     static FAKE_TASK: AtomicU64 = AtomicU64::new(0xD157);
-    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    fn task_lookup() -> u64 {
+        FAKE_TASK.load(Ordering::Relaxed)
+    }
     install_task_id_lookup(task_lookup);
 
     narf_userspace::handlers::__test_sigaction_reset();
@@ -4216,16 +4627,24 @@ fn smoke_userspace_signal_delivery() -> TestResult {
     // so the hook's fast-path check passes; deliver_signal records
     // the (handler, signum) pair the hook chose.
     struct FakeCtx {
-        args:           SyscallArgs,
-        ret:            Option<SyscallReturn>,
-        delivered:      Option<(u64, u32)>,
-        going_to_user:  bool,
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+        delivered: Option<(u64, u32)>,
+        going_to_user: bool,
     }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
-        fn returning_to_user(&self) -> bool { self.going_to_user }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
+        fn returning_to_user(&self) -> bool {
+            self.going_to_user
+        }
         fn deliver_signal(&mut self, h: u64, s: u32) -> bool {
             self.delivered = Some((h, s));
             true
@@ -4241,8 +4660,8 @@ fn smoke_userspace_signal_delivery() -> TestResult {
             arg2: &mut old as *mut u64 as u64,
             ..SyscallArgs::default()
         },
-        ret:           None,
-        delivered:     None,
+        ret: None,
+        delivered: None,
         going_to_user: false,
     };
     kernel_syscall_entry(Syscall::Sigaction.raw(), &mut ctx);
@@ -4261,8 +4680,8 @@ fn smoke_userspace_signal_delivery() -> TestResult {
             arg1: 10,
             ..SyscallArgs::default()
         },
-        ret:           None,
-        delivered:     None,
+        ret: None,
+        delivered: None,
         going_to_user: false,
     };
     kernel_syscall_entry(Syscall::Kill.raw(), &mut ctx);
@@ -4284,9 +4703,9 @@ fn smoke_userspace_signal_delivery() -> TestResult {
     // and call our FakeCtx::deliver_signal — which records the
     // pair we expect.
     let mut ctx = FakeCtx {
-        args:          SyscallArgs::default(),
-        ret:           None,
-        delivered:     None,
+        args: SyscallArgs::default(),
+        ret: None,
+        delivered: None,
         going_to_user: true,
     };
     default_signal_delivery(&mut ctx);
@@ -4299,7 +4718,11 @@ fn smoke_userspace_signal_delivery() -> TestResult {
 
     match delivered {
         Some((handler, signum)) if handler == 0xDEAD_BEEF && signum == 10 => {}
-        _ => return TestResult::Fail("delivery hook did not invoke deliver_signal with the registered handler"),
+        _ => {
+            return TestResult::Fail(
+                "delivery hook did not invoke deliver_signal with the registered handler",
+            )
+        }
     }
     if pending_after & (1 << 10) != 0 {
         return TestResult::Fail("delivery did not clear the pending bit");
@@ -4317,14 +4740,15 @@ fn smoke_userspace_chdir_getcwd_round_trip() -> TestResult {
     // the handler bodies.
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_userspace::{
-        cwd_of, install_core_syscalls, install_global,
-        install_task_id_lookup, kernel_syscall_entry,
-        syscall::__test_clear_global, Syscall, SyscallArgs,
-        SyscallReturn, SyscallTable, TrapContext,
+        cwd_of, install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn,
+        SyscallTable, TrapContext,
     };
 
     static FAKE_TASK: AtomicU64 = AtomicU64::new(0xCDD0);
-    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    fn task_lookup() -> u64 {
+        FAKE_TASK.load(Ordering::Relaxed)
+    }
     install_task_id_lookup(task_lookup);
 
     narf_userspace::handlers::__test_cwd_reset();
@@ -4334,11 +4758,20 @@ fn smoke_userspace_chdir_getcwd_round_trip() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     // Default cwd should be `/` even before any Chdir call.
@@ -4418,10 +4851,18 @@ fn smoke_userspace_chdir_getcwd_round_trip() -> TestResult {
     __test_clear_global();
     narf_userspace::handlers::__test_cwd_reset();
 
-    if !len_ok      { return TestResult::Fail("Getcwd did not return length 4"); }
-    if !bytes_ok    { return TestResult::Fail("Getcwd buffer did not match `/foo\\0`"); }
-    if !small_invalid { return TestResult::Fail("Getcwd with too-small buf did not surface InvalidOp"); }
-    if !rel_rejected { return TestResult::Fail("Chdir(relative) did not surface -1 sentinel"); }
+    if !len_ok {
+        return TestResult::Fail("Getcwd did not return length 4");
+    }
+    if !bytes_ok {
+        return TestResult::Fail("Getcwd buffer did not match `/foo\\0`");
+    }
+    if !small_invalid {
+        return TestResult::Fail("Getcwd with too-small buf did not surface InvalidOp");
+    }
+    if !rel_rejected {
+        return TestResult::Fail("Chdir(relative) did not surface -1 sentinel");
+    }
     TestResult::Pass
 }
 kernel_test!(smoke_userspace_chdir_getcwd_round_trip);
@@ -4432,9 +4873,8 @@ fn smoke_userspace_sleep_advances_time() -> TestResult {
     // (see `sys_sleep`'s docstring) so we measure a real wall-time
     // advance, not a scheduler-driven sleep.
     use narf_userspace::{
-        install_core_syscalls, install_global,
-        kernel_syscall_entry, syscall::__test_clear_global, Syscall,
-        SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+        install_core_syscalls, install_global, kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
     };
 
     __test_clear_global();
@@ -4442,18 +4882,30 @@ fn smoke_userspace_sleep_advances_time() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     const TARGET_NS: u64 = 50_000_000; // 50 ms
 
     let before = narf_scheduler::narf_time::monotonic_ns();
     let mut ctx = FakeCtx {
-        args: SyscallArgs { arg0: TARGET_NS, ..SyscallArgs::default() },
+        args: SyscallArgs {
+            arg0: TARGET_NS,
+            ..SyscallArgs::default()
+        },
         ret: None,
     };
     kernel_syscall_entry(Syscall::Sleep.raw(), &mut ctx);
@@ -4480,14 +4932,15 @@ fn smoke_userspace_synchronous_signal_delivery() -> TestResult {
     // x86_64 trap dispatcher takes for user-mode CPU exceptions.
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_userspace::{
-        default_sync_signal_delivery, install_core_syscalls,
-        install_global, install_task_id_lookup, kernel_syscall_entry,
-        syscall::__test_clear_global, Syscall, SyscallArgs,
-        SyscallReturn, SyscallTable, TrapContext,
+        default_sync_signal_delivery, install_core_syscalls, install_global,
+        install_task_id_lookup, kernel_syscall_entry, syscall::__test_clear_global, Syscall,
+        SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
     };
 
     static FAKE_TASK: AtomicU64 = AtomicU64::new(0x5E64);
-    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    fn task_lookup() -> u64 {
+        FAKE_TASK.load(Ordering::Relaxed)
+    }
     install_task_id_lookup(task_lookup);
 
     narf_userspace::handlers::__test_sigaction_reset();
@@ -4498,14 +4951,20 @@ fn smoke_userspace_synchronous_signal_delivery() -> TestResult {
     install_global(t);
 
     struct FakeCtx {
-        args:      SyscallArgs,
-        ret:       Option<SyscallReturn>,
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
         delivered: Option<(u64, u32)>,
     }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
         fn deliver_signal(&mut self, h: u64, s: u32) -> bool {
             self.delivered = Some((h, s));
             true
@@ -4535,8 +4994,8 @@ fn smoke_userspace_synchronous_signal_delivery() -> TestResult {
     // should map vector→SIGSEGV (=11), look up handler 0xC0DE_F00D,
     // and call FakeCtx::deliver_signal with that pair.
     let mut ctx = FakeCtx {
-        args:      SyscallArgs::default(),
-        ret:       None,
+        args: SyscallArgs::default(),
+        ret: None,
         delivered: None,
     };
     let rewrote = default_sync_signal_delivery(&mut ctx, 14);
@@ -4545,8 +5004,8 @@ fn smoke_userspace_synchronous_signal_delivery() -> TestResult {
     // Mapping-less vector should return false without touching
     // deliver_signal.
     let mut ctx2 = FakeCtx {
-        args:      SyscallArgs::default(),
-        ret:       None,
+        args: SyscallArgs::default(),
+        ret: None,
         delivered: None,
     };
     let rewrote_unknown = default_sync_signal_delivery(&mut ctx2, 1);
@@ -4560,7 +5019,11 @@ fn smoke_userspace_synchronous_signal_delivery() -> TestResult {
     }
     match delivered {
         Some((handler, signum)) if handler == 0xC0DE_F00D && signum == 11 => {}
-        _ => return TestResult::Fail("sync hook did not invoke deliver_signal with the registered handler"),
+        _ => {
+            return TestResult::Fail(
+                "sync hook did not invoke deliver_signal with the registered handler",
+            )
+        }
     }
     if rewrote_unknown {
         return TestResult::Fail("sync hook reported rewrite for an unmappable vector");
@@ -4581,8 +5044,8 @@ fn smoke_filesystem_resolve_absolute_picks_longest_prefix() -> TestResult {
     use alloc::sync::Arc;
     use narf_capabilities::{Cap, Grant};
     use narf_filesystem::{
-        bootstrap_mount_authority, registry, DirEntry, DirOps, FileOps,
-        FsFuture, FsInstance, MountPoint, Stat,
+        bootstrap_mount_authority, registry, DirEntry, DirOps, FileOps, FsFuture, FsInstance,
+        MountPoint, Stat,
     };
 
     struct OuterFs;
@@ -4597,9 +5060,12 @@ fn smoke_filesystem_resolve_absolute_picks_longest_prefix() -> TestResult {
             alloc::boxed::Box::pin(async { Ok(0) })
         }
         fn stat(&self) -> Stat {
-            Stat { size: 0, blocks: 0,
-                   mode: narf_filesystem::Mode::FILE_RO,
-                   mtime_cycles: 0 }
+            Stat {
+                size: 0,
+                blocks: 0,
+                mode: narf_filesystem::Mode::FILE_RO,
+                mtime_cycles: 0,
+            }
         }
     }
     impl DirOps for DummyDir {
@@ -4611,16 +5077,24 @@ fn smoke_filesystem_resolve_absolute_picks_longest_prefix() -> TestResult {
         }
     }
     impl FsInstance for OuterFs {
-        fn root(&self) -> Arc<dyn DirOps> { Arc::new(DummyDir) }
-        fn name(&self) -> &str { "outer" }
+        fn root(&self) -> Arc<dyn DirOps> {
+            Arc::new(DummyDir)
+        }
+        fn name(&self) -> &str {
+            "outer"
+        }
     }
     impl FsInstance for InnerFs {
-        fn root(&self) -> Arc<dyn DirOps> { Arc::new(DummyDir) }
-        fn name(&self) -> &str { "inner" }
+        fn root(&self) -> Arc<dyn DirOps> {
+            Arc::new(DummyDir)
+        }
+        fn name(&self) -> &str {
+            "inner"
+        }
     }
 
     let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
-    if registry().mount(&auth, "/test_pa",     OuterFs).is_err() {
+    if registry().mount(&auth, "/test_pa", OuterFs).is_err() {
         return TestResult::Fail("outer mount failed");
     }
     if registry().mount(&auth, "/test_pa/sub", InnerFs).is_err() {
@@ -4646,7 +5120,10 @@ fn smoke_filesystem_resolve_absolute_picks_longest_prefix() -> TestResult {
     }
 
     // Unmounted prefix → None.
-    if registry().resolve_absolute("/elsewhere/z", |_, _| ()).is_some() {
+    if registry()
+        .resolve_absolute("/elsewhere/z", |_, _| ())
+        .is_some()
+    {
         return TestResult::Fail("non-existent prefix should not resolve");
     }
     // Empty path → None.
@@ -4663,9 +5140,7 @@ fn smoke_filesystem_memfs_unlink_round_trip() -> TestResult {
     // resolve_parent_absolute → unlink should succeed; the second
     // should hit NotFound (file already gone).
     use narf_capabilities::{Cap, Grant};
-    use narf_filesystem::{
-        bootstrap_mount_authority, registry, FsError, MemFs, MountPoint,
-    };
+    use narf_filesystem::{bootstrap_mount_authority, registry, FsError, MemFs, MountPoint};
 
     let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
     let fs = MemFs::with_seeds("test-unlink", &[("doomed", b"x")]);
@@ -4684,10 +5159,9 @@ fn smoke_filesystem_memfs_unlink_round_trip() -> TestResult {
     }
 
     // First unlink: success.
-    let r1 = registry().resolve_parent_absolute(
-        "/test_unlink/doomed",
-        |_fs, parent, leaf| parent.unlink(leaf),
-    );
+    let r1 = registry().resolve_parent_absolute("/test_unlink/doomed", |_fs, parent, leaf| {
+        parent.unlink(leaf)
+    });
     if !matches!(r1, Some(Ok(()))) {
         return TestResult::Fail("first unlink should succeed");
     }
@@ -4701,10 +5175,9 @@ fn smoke_filesystem_memfs_unlink_round_trip() -> TestResult {
     }
 
     // Second unlink: NotFound.
-    let r2 = registry().resolve_parent_absolute(
-        "/test_unlink/doomed",
-        |_fs, parent, leaf| parent.unlink(leaf),
-    );
+    let r2 = registry().resolve_parent_absolute("/test_unlink/doomed", |_fs, parent, leaf| {
+        parent.unlink(leaf)
+    });
     if !matches!(r2, Some(Err(FsError::NotFound))) {
         return TestResult::Fail("second unlink should report NotFound");
     }
@@ -4723,13 +5196,13 @@ fn smoke_userspace_open_routes_through_vfs() -> TestResult {
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_capabilities::{Cap, Grant};
     use narf_filesystem::{
-        bootstrap_mount_authority, registry, DirEntry, DirOps, FileOps,
-        FsFuture, FsInstance, MountPoint, Stat,
+        bootstrap_mount_authority, registry, DirEntry, DirOps, FileOps, FsFuture, FsInstance,
+        MountPoint, Stat,
     };
     use narf_userspace::{
-        fd, install_core_syscalls, install_global, install_task_id_lookup,
-        kernel_syscall_entry, syscall::__test_clear_global,
-        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+        fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
+        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext,
     };
 
     // ── Tiny FS: one file `hello` returning fixed bytes. ──────────
@@ -4739,7 +5212,9 @@ fn smoke_userspace_open_routes_through_vfs() -> TestResult {
         fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
             alloc::boxed::Box::pin(async move {
                 let off = offset as usize;
-                if off >= FILE_BYTES.len() { return Ok(0); }
+                if off >= FILE_BYTES.len() {
+                    return Ok(0);
+                }
                 let n = core::cmp::min(buf.len(), FILE_BYTES.len() - off);
                 buf[..n].copy_from_slice(&FILE_BYTES[off..off + n]);
                 Ok(n)
@@ -4750,15 +5225,22 @@ fn smoke_userspace_open_routes_through_vfs() -> TestResult {
             alloc::boxed::Box::pin(async move { Ok(n) })
         }
         fn stat(&self) -> Stat {
-            Stat { size: FILE_BYTES.len() as u64, blocks: 1,
-                   mode: narf_filesystem::Mode::FILE_RO,
-                   mtime_cycles: 0 }
+            Stat {
+                size: FILE_BYTES.len() as u64,
+                blocks: 1,
+                mode: narf_filesystem::Mode::FILE_RO,
+                mtime_cycles: 0,
+            }
         }
     }
     struct StubDir;
     impl DirOps for StubDir {
         fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
-            if name == "hello" { Some(Arc::new(StubFile)) } else { None }
+            if name == "hello" {
+                Some(Arc::new(StubFile))
+            } else {
+                None
+            }
         }
         fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
             Box::new(core::iter::empty())
@@ -4766,8 +5248,12 @@ fn smoke_userspace_open_routes_through_vfs() -> TestResult {
     }
     struct StubFs;
     impl FsInstance for StubFs {
-        fn root(&self) -> Arc<dyn DirOps> { Arc::new(StubDir) }
-        fn name(&self) -> &str { "stub" }
+        fn root(&self) -> Arc<dyn DirOps> {
+            Arc::new(StubDir)
+        }
+        fn name(&self) -> &str {
+            "stub"
+        }
     }
 
     // ── Mount the stub FS at "/test". ─────────────────────────────
@@ -4781,7 +5267,9 @@ fn smoke_userspace_open_routes_through_vfs() -> TestResult {
     fd::init();
 
     static FAKE_TASK: AtomicU64 = AtomicU64::new(99);
-    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    fn task_lookup() -> u64 {
+        FAKE_TASK.load(Ordering::Relaxed)
+    }
     install_task_id_lookup(task_lookup);
 
     __test_clear_global();
@@ -4790,18 +5278,29 @@ fn smoke_userspace_open_routes_through_vfs() -> TestResult {
     install_global(t);
 
     // ── Fire Open via kernel_syscall_entry. ───────────────────────
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
     let path = b"hello";
     let mount = b"/test";
     let mut ctx = FakeCtx {
         args: SyscallArgs {
-            arg0: path.as_ptr() as u64,  arg1: path.len() as u64,
-            arg2: mount.as_ptr() as u64, arg3: mount.len() as u64,
+            arg0: path.as_ptr() as u64,
+            arg1: path.len() as u64,
+            arg2: mount.as_ptr() as u64,
+            arg3: mount.len() as u64,
             ..Default::default()
         },
         ret: None,
@@ -4853,13 +5352,11 @@ fn smoke_userspace_symlink_create_and_readlink_round_trip() -> TestResult {
     // bytes exactly.
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_capabilities::{Cap, Grant};
-    use narf_filesystem::{
-        bootstrap_mount_authority, registry, MemFs, MountPoint,
-    };
+    use narf_filesystem::{bootstrap_mount_authority, registry, MemFs, MountPoint};
     use narf_userspace::{
-        fd, install_core_syscalls, install_global, install_task_id_lookup,
-        kernel_syscall_entry, syscall::__test_clear_global,
-        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+        fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
+        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext,
     };
 
     __test_clear_global();
@@ -4874,27 +5371,40 @@ fn smoke_userspace_symlink_create_and_readlink_round_trip() -> TestResult {
     };
 
     static FAKE_TASK: AtomicU64 = AtomicU64::new(99);
-    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    fn task_lookup() -> u64 {
+        FAKE_TASK.load(Ordering::Relaxed)
+    }
     install_task_id_lookup(task_lookup);
 
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
     install_global(t);
 
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     // ── SYS_SYMLINK: target=/sl-test/target, link=/sl-test/sl ────
     let target = b"/sl-test/target";
-    let link   = b"/sl-test/sl";
+    let link = b"/sl-test/sl";
     let mut ctx = FakeCtx {
         args: SyscallArgs {
-            arg0: target.as_ptr() as u64, arg1: target.len() as u64,
-            arg2: link.as_ptr()   as u64, arg3: link.len()   as u64,
+            arg0: target.as_ptr() as u64,
+            arg1: target.len() as u64,
+            arg2: link.as_ptr() as u64,
+            arg3: link.len() as u64,
             ..Default::default()
         },
         ret: None,
@@ -4915,8 +5425,10 @@ fn smoke_userspace_symlink_create_and_readlink_round_trip() -> TestResult {
     let path = b"/sl-test/sl";
     let mut rctx = FakeCtx {
         args: SyscallArgs {
-            arg0: path.as_ptr()        as u64, arg1: path.len() as u64,
-            arg2: buf.as_mut_ptr()     as u64, arg3: buf.len()  as u64,
+            arg0: path.as_ptr() as u64,
+            arg1: path.len() as u64,
+            arg2: buf.as_mut_ptr() as u64,
+            arg3: buf.len() as u64,
             ..Default::default()
         },
         ret: None,
@@ -4958,13 +5470,11 @@ fn smoke_userspace_readlink_on_non_symlink_fails() -> TestResult {
     // because `regular` isn't FileType::Symlink — POSIX EINVAL.
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_capabilities::{Cap, Grant};
-    use narf_filesystem::{
-        bootstrap_mount_authority, registry, MemFs, MountPoint,
-    };
+    use narf_filesystem::{bootstrap_mount_authority, registry, MemFs, MountPoint};
     use narf_userspace::{
-        fd, install_core_syscalls, install_global, install_task_id_lookup,
-        kernel_syscall_entry, syscall::__test_clear_global,
-        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+        fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
+        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext,
     };
 
     __test_clear_global();
@@ -4979,26 +5489,39 @@ fn smoke_userspace_readlink_on_non_symlink_fails() -> TestResult {
     };
 
     static FAKE_TASK: AtomicU64 = AtomicU64::new(99);
-    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    fn task_lookup() -> u64 {
+        FAKE_TASK.load(Ordering::Relaxed)
+    }
     install_task_id_lookup(task_lookup);
 
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
     install_global(t);
 
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     let path = b"/sl-fail/regular";
     let mut buf = [0u8; 32];
     let mut rctx = FakeCtx {
         args: SyscallArgs {
-            arg0: path.as_ptr()    as u64, arg1: path.len() as u64,
-            arg2: buf.as_mut_ptr() as u64, arg3: buf.len()  as u64,
+            arg0: path.as_ptr() as u64,
+            arg1: path.len() as u64,
+            arg2: buf.as_mut_ptr() as u64,
+            arg3: buf.len() as u64,
             ..Default::default()
         },
         ret: None,
@@ -5032,9 +5555,9 @@ fn smoke_userspace_read_write_routes_through_fd_table() -> TestResult {
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_filesystem::{FileOps, FsFuture, Stat};
     use narf_userspace::{
-        fd, install_core_syscalls, install_global, install_task_id_lookup,
-        kernel_syscall_entry, syscall::__test_clear_global,
-        FdEntry, Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+        fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
+        syscall::__test_clear_global, FdEntry, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext,
     };
 
     // Backing FileOps that records writes in a static + serves
@@ -5059,15 +5582,20 @@ fn smoke_userspace_read_write_routes_through_fd_table() -> TestResult {
             })
         }
         fn stat(&self) -> Stat {
-            Stat { size: 0, blocks: 0,
-                   mode: narf_filesystem::Mode::FILE_RW,
-                   mtime_cycles: 0 }
+            Stat {
+                size: 0,
+                blocks: 0,
+                mode: narf_filesystem::Mode::FILE_RW,
+                mtime_cycles: 0,
+            }
         }
     }
 
     // Pretend "task 7" is running.
     static FAKE_TASK: AtomicU64 = AtomicU64::new(7);
-    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    fn task_lookup() -> u64 {
+        FAKE_TASK.load(Ordering::Relaxed)
+    }
 
     fd::__test_reset();
     fd::init();
@@ -5075,8 +5603,13 @@ fn smoke_userspace_read_write_routes_through_fd_table() -> TestResult {
 
     // Open one fd in task 7's table.
     let fd_n = fd::with_table(7, |t| {
-        t.open(FdEntry { ops: Arc::new(CountingFile), offset: 0, flags: 0 })
-    }).expect("with_table");
+        t.open(FdEntry {
+            ops: Arc::new(CountingFile),
+            offset: 0,
+            flags: 0,
+        })
+    })
+    .expect("with_table");
     if fd_n != 3 {
         return TestResult::Fail("expected first user fd to be 3");
     }
@@ -5087,18 +5620,29 @@ fn smoke_userspace_read_write_routes_through_fd_table() -> TestResult {
     install_global(t);
 
     // Synthetic TrapContext for direct kernel-side dispatch.
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     // Read 16 bytes — handler should poll the future and update offset.
     let mut buf = [0u8; 16];
     let mut ctx = FakeCtx {
         args: SyscallArgs {
-            arg0: fd_n as u64, arg1: buf.as_mut_ptr() as u64, arg2: 16,
+            arg0: fd_n as u64,
+            arg1: buf.as_mut_ptr() as u64,
+            arg2: 16,
             ..Default::default()
         },
         ret: None,
@@ -5123,7 +5667,9 @@ fn smoke_userspace_read_write_routes_through_fd_table() -> TestResult {
     let payload = [0xABu8; 8];
     let mut ctx2 = FakeCtx {
         args: SyscallArgs {
-            arg0: fd_n as u64, arg1: payload.as_ptr() as u64, arg2: 8,
+            arg0: fd_n as u64,
+            arg1: payload.as_ptr() as u64,
+            arg2: 8,
             ..Default::default()
         },
         ret: None,
@@ -5143,7 +5689,10 @@ fn smoke_userspace_read_write_routes_through_fd_table() -> TestResult {
 
     // Close.
     let mut ctx3 = FakeCtx {
-        args: SyscallArgs { arg0: fd_n as u64, ..Default::default() },
+        args: SyscallArgs {
+            arg0: fd_n as u64,
+            ..Default::default()
+        },
         ret: None,
     };
     kernel_syscall_entry(Syscall::Close.raw(), &mut ctx3);
@@ -5154,7 +5703,9 @@ fn smoke_userspace_read_write_routes_through_fd_table() -> TestResult {
     let mut buf2 = [0u8; 4];
     let mut ctx4 = FakeCtx {
         args: SyscallArgs {
-            arg0: fd_n as u64, arg1: buf2.as_mut_ptr() as u64, arg2: 4,
+            arg0: fd_n as u64,
+            arg1: buf2.as_mut_ptr() as u64,
+            arg2: 4,
             ..Default::default()
         },
         ret: None,
@@ -5184,9 +5735,9 @@ fn smoke_userspace_dup_clones_fd() -> TestResult {
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_filesystem::{FileOps, FsFuture, Stat};
     use narf_userspace::{
-        fd, install_core_syscalls, install_global, install_task_id_lookup,
-        kernel_syscall_entry, syscall::__test_clear_global,
-        FdEntry, Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+        fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
+        syscall::__test_clear_global, FdEntry, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext,
     };
 
     // FileOps that returns a fixed byte on every read; counters in
@@ -5197,7 +5748,9 @@ fn smoke_userspace_dup_clones_fd() -> TestResult {
     impl FileOps for StubFile {
         fn read<'a>(&'a self, _o: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
             READ_HITS.fetch_add(1, Ordering::Relaxed);
-            for b in buf.iter_mut() { *b = 0x5A; }
+            for b in buf.iter_mut() {
+                *b = 0x5A;
+            }
             alloc::boxed::Box::pin(async move { Ok(buf.len()) })
         }
         fn write<'a>(&'a self, _o: u64, b: &'a [u8]) -> FsFuture<'a, usize> {
@@ -5205,14 +5758,19 @@ fn smoke_userspace_dup_clones_fd() -> TestResult {
             alloc::boxed::Box::pin(async move { Ok(n) })
         }
         fn stat(&self) -> Stat {
-            Stat { size: 0, blocks: 0,
-                   mode: narf_filesystem::Mode::FILE_RW,
-                   mtime_cycles: 0 }
+            Stat {
+                size: 0,
+                blocks: 0,
+                mode: narf_filesystem::Mode::FILE_RW,
+                mtime_cycles: 0,
+            }
         }
     }
 
     static FAKE_TASK: AtomicU64 = AtomicU64::new(0xD0);
-    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    fn task_lookup() -> u64 {
+        FAKE_TASK.load(Ordering::Relaxed)
+    }
 
     fd::__test_reset();
     fd::init();
@@ -5220,8 +5778,13 @@ fn smoke_userspace_dup_clones_fd() -> TestResult {
 
     let task = FAKE_TASK.load(Ordering::Relaxed);
     let original = fd::with_table(task, |t| {
-        t.open(FdEntry { ops: Arc::new(StubFile), offset: 0, flags: 0 })
-    }).expect("with_table");
+        t.open(FdEntry {
+            ops: Arc::new(StubFile),
+            offset: 0,
+            flags: 0,
+        })
+    })
+    .expect("with_table");
     if original != 3 {
         return TestResult::Fail("expected first user fd to be 3");
     }
@@ -5231,16 +5794,28 @@ fn smoke_userspace_dup_clones_fd() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     // Dup fd 3 → expect fd 4 (next free slot ≥ 3).
     let mut dctx = FakeCtx {
-        args: SyscallArgs { arg0: original as u64, ..Default::default() },
+        args: SyscallArgs {
+            arg0: original as u64,
+            ..Default::default()
+        },
         ret: None,
     };
     kernel_syscall_entry(Syscall::Dup.raw(), &mut dctx);
@@ -5277,7 +5852,10 @@ fn smoke_userspace_dup_clones_fd() -> TestResult {
     // Close both — second close on the same backing should still
     // succeed because each fd holds its own Arc clone.
     let mut c1 = FakeCtx {
-        args: SyscallArgs { arg0: dup_fd as u64, ..Default::default() },
+        args: SyscallArgs {
+            arg0: dup_fd as u64,
+            ..Default::default()
+        },
         ret: None,
     };
     kernel_syscall_entry(Syscall::Close.raw(), &mut c1);
@@ -5285,7 +5863,10 @@ fn smoke_userspace_dup_clones_fd() -> TestResult {
         return TestResult::Fail("Close on dup'd fd failed");
     }
     let mut c2 = FakeCtx {
-        args: SyscallArgs { arg0: original as u64, ..Default::default() },
+        args: SyscallArgs {
+            arg0: original as u64,
+            ..Default::default()
+        },
         ret: None,
     };
     kernel_syscall_entry(Syscall::Close.raw(), &mut c2);
@@ -5306,9 +5887,8 @@ fn smoke_userspace_fcntl_flags_round_trip() -> TestResult {
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_filesystem::{FileOps, FsFuture, Stat};
     use narf_userspace::{
-        fd, install_core_syscalls, install_global, install_task_id_lookup,
-        kernel_syscall_entry, syscall::__test_clear_global,
-        FdEntry, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
+        syscall::__test_clear_global, FdEntry, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
         TrapContext, FD_CLOEXEC,
     };
 
@@ -5322,33 +5902,52 @@ fn smoke_userspace_fcntl_flags_round_trip() -> TestResult {
             alloc::boxed::Box::pin(async move { Ok(n) })
         }
         fn stat(&self) -> Stat {
-            Stat { size: 0, blocks: 0,
-                   mode: narf_filesystem::Mode::FILE_RW,
-                   mtime_cycles: 0 }
+            Stat {
+                size: 0,
+                blocks: 0,
+                mode: narf_filesystem::Mode::FILE_RW,
+                mtime_cycles: 0,
+            }
         }
     }
 
     static FAKE_TASK: AtomicU64 = AtomicU64::new(0xD1);
-    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    fn task_lookup() -> u64 {
+        FAKE_TASK.load(Ordering::Relaxed)
+    }
 
     fd::__test_reset();
     fd::init();
     install_task_id_lookup(task_lookup);
     let task = FAKE_TASK.load(Ordering::Relaxed);
     let target = fd::with_table(task, |t| {
-        t.open(FdEntry { ops: Arc::new(Sink), offset: 0, flags: 0 })
-    }).expect("with_table");
+        t.open(FdEntry {
+            ops: Arc::new(Sink),
+            offset: 0,
+            flags: 0,
+        })
+    })
+    .expect("with_table");
 
     __test_clear_global();
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
     install_global(t);
 
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     // F_SETFD(FD_CLOEXEC).
@@ -5356,7 +5955,9 @@ fn smoke_userspace_fcntl_flags_round_trip() -> TestResult {
     const F_SETFD: u64 = 2;
     let mut s_ctx = FakeCtx {
         args: SyscallArgs {
-            arg0: target as u64, arg1: F_SETFD, arg2: FD_CLOEXEC as u64,
+            arg0: target as u64,
+            arg1: F_SETFD,
+            arg2: FD_CLOEXEC as u64,
             ..Default::default()
         },
         ret: None,
@@ -5369,14 +5970,15 @@ fn smoke_userspace_fcntl_flags_round_trip() -> TestResult {
     // F_GETFD should now return FD_CLOEXEC.
     let mut g_ctx = FakeCtx {
         args: SyscallArgs {
-            arg0: target as u64, arg1: F_GETFD, ..Default::default()
+            arg0: target as u64,
+            arg1: F_GETFD,
+            ..Default::default()
         },
         ret: None,
     };
     kernel_syscall_entry(Syscall::Fcntl.raw(), &mut g_ctx);
     match g_ctx.ret {
-        Some(r) if r.status == SyscallReturn::OK
-                && r.value == FD_CLOEXEC as u64 => {}
+        Some(r) if r.status == SyscallReturn::OK && r.value == FD_CLOEXEC as u64 => {}
         _ => return TestResult::Fail("F_GETFD did not round-trip FD_CLOEXEC"),
     }
 
@@ -5394,13 +5996,13 @@ fn smoke_userspace_stat_returns_size() -> TestResult {
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_capabilities::{Cap, Grant};
     use narf_filesystem::{
-        bootstrap_mount_authority, registry, DirEntry, DirOps, FileOps,
-        FsFuture, FsInstance, MountPoint, Stat,
+        bootstrap_mount_authority, registry, DirEntry, DirOps, FileOps, FsFuture, FsInstance,
+        MountPoint, Stat,
     };
     use narf_userspace::{
-        fd, install_core_syscalls, install_global, install_task_id_lookup,
-        kernel_syscall_entry, syscall::__test_clear_global, StatBuf,
-        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+        fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
+        syscall::__test_clear_global, StatBuf, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext,
     };
 
     static FILE_BYTES: &[u8] = b"STAT-PROBE-12345"; // 16 bytes
@@ -5414,15 +6016,22 @@ fn smoke_userspace_stat_returns_size() -> TestResult {
             Box::pin(async move { Ok(n) })
         }
         fn stat(&self) -> Stat {
-            Stat { size: FILE_BYTES.len() as u64, blocks: 1,
-                   mode: narf_filesystem::Mode::FILE_RO,
-                   mtime_cycles: 0xC0FFEE }
+            Stat {
+                size: FILE_BYTES.len() as u64,
+                blocks: 1,
+                mode: narf_filesystem::Mode::FILE_RO,
+                mtime_cycles: 0xC0FFEE,
+            }
         }
     }
     struct StubDir;
     impl DirOps for StubDir {
         fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
-            if name == "stat-target" { Some(Arc::new(StubFile)) } else { None }
+            if name == "stat-target" {
+                Some(Arc::new(StubFile))
+            } else {
+                None
+            }
         }
         fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
             Box::new(core::iter::empty())
@@ -5430,8 +6039,12 @@ fn smoke_userspace_stat_returns_size() -> TestResult {
     }
     struct StubFs;
     impl FsInstance for StubFs {
-        fn root(&self) -> Arc<dyn DirOps> { Arc::new(StubDir) }
-        fn name(&self) -> &str { "stat-stub" }
+        fn root(&self) -> Arc<dyn DirOps> {
+            Arc::new(StubDir)
+        }
+        fn name(&self) -> &str {
+            "stat-stub"
+        }
     }
 
     let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
@@ -5443,7 +6056,9 @@ fn smoke_userspace_stat_returns_size() -> TestResult {
     fd::__test_reset();
     fd::init();
     static FAKE_TASK: AtomicU64 = AtomicU64::new(0xD2);
-    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    fn task_lookup() -> u64 {
+        FAKE_TASK.load(Ordering::Relaxed)
+    }
     install_task_id_lookup(task_lookup);
 
     __test_clear_global();
@@ -5451,18 +6066,28 @@ fn smoke_userspace_stat_returns_size() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     let mut out = StatBuf::default();
     let path = b"/stat-test/stat-target";
     let mut sctx = FakeCtx {
         args: SyscallArgs {
-            arg0: path.as_ptr() as u64, arg1: path.len() as u64,
+            arg0: path.as_ptr() as u64,
+            arg1: path.len() as u64,
             arg2: &mut out as *mut StatBuf as u64,
             ..Default::default()
         },
@@ -5494,13 +6119,15 @@ kernel_test!(smoke_userspace_stat_returns_size);
 fn smoke_userspace_pipe_round_trip() -> TestResult {
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_userspace::{
-        fd, install_core_syscalls, install_global, install_task_id_lookup,
-        kernel_syscall_entry, syscall::__test_clear_global,
-        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+        fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
+        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext,
     };
 
     static FAKE_TASK: AtomicU64 = AtomicU64::new(0xD3);
-    fn task_lookup() -> u64 { FAKE_TASK.load(Ordering::Relaxed) }
+    fn task_lookup() -> u64 {
+        FAKE_TASK.load(Ordering::Relaxed)
+    }
 
     fd::__test_reset();
     fd::init();
@@ -5511,17 +6138,29 @@ fn smoke_userspace_pipe_round_trip() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     // pipe(out) — kernel writes [read_fd, write_fd] to `out`.
     let mut fds: [i32; 2] = [-1, -1];
     let mut pctx = FakeCtx {
-        args: SyscallArgs { arg0: fds.as_mut_ptr() as u64, ..Default::default() },
+        args: SyscallArgs {
+            arg0: fds.as_mut_ptr() as u64,
+            ..Default::default()
+        },
         ret: None,
     };
     kernel_syscall_entry(Syscall::Pipe.raw(), &mut pctx);
@@ -5531,15 +6170,17 @@ fn smoke_userspace_pipe_round_trip() -> TestResult {
     if fds[0] < 3 || fds[1] < 3 || fds[0] == fds[1] {
         return TestResult::Fail("Pipe returned bad fd pair");
     }
-    let read_fd  = fds[0] as u32;
+    let read_fd = fds[0] as u32;
     let write_fd = fds[1] as u32;
 
     // Write 4 bytes to the writer.
     let payload = b"PIPE";
     let mut wctx = FakeCtx {
         args: SyscallArgs {
-            arg0: write_fd as u64, arg1: payload.as_ptr() as u64,
-            arg2: payload.len() as u64, ..Default::default()
+            arg0: write_fd as u64,
+            arg1: payload.as_ptr() as u64,
+            arg2: payload.len() as u64,
+            ..Default::default()
         },
         ret: None,
     };
@@ -5552,8 +6193,10 @@ fn smoke_userspace_pipe_round_trip() -> TestResult {
     let mut buf = [0u8; 4];
     let mut rctx = FakeCtx {
         args: SyscallArgs {
-            arg0: read_fd as u64, arg1: buf.as_mut_ptr() as u64,
-            arg2: buf.len() as u64, ..Default::default()
+            arg0: read_fd as u64,
+            arg1: buf.as_mut_ptr() as u64,
+            arg2: buf.len() as u64,
+            ..Default::default()
         },
         ret: None,
     };
@@ -5588,9 +6231,12 @@ fn smoke_userspace_fd_table_roundtrip() -> TestResult {
             alloc::boxed::Box::pin(async move { Ok(buf.len()) })
         }
         fn stat(&self) -> Stat {
-            Stat { size: 0, blocks: 0,
-                   mode: narf_filesystem::Mode::FILE_RO,
-                   mtime_cycles: 0 }
+            Stat {
+                size: 0,
+                blocks: 0,
+                mode: narf_filesystem::Mode::FILE_RO,
+                mtime_cycles: 0,
+            }
         }
     }
 
@@ -5602,7 +6248,11 @@ fn smoke_userspace_fd_table_roundtrip() -> TestResult {
 
     // Open in task A: first user fd is 3 (slots 0..=2 reserved).
     let fd_a = fd::with_table(task_a, |t| {
-        t.open(FdEntry { ops: Arc::new(FixedFile), offset: 0, flags: 0 })
+        t.open(FdEntry {
+            ops: Arc::new(FixedFile),
+            offset: 0,
+            flags: 0,
+        })
     });
     if fd_a != Some(3) {
         return TestResult::Fail("first user fd should be 3");
@@ -5610,7 +6260,11 @@ fn smoke_userspace_fd_table_roundtrip() -> TestResult {
 
     // Independent task B starts with a fresh table.
     let fd_b = fd::with_table(task_b, |t| {
-        t.open(FdEntry { ops: Arc::new(FixedFile), offset: 0, flags: 0 })
+        t.open(FdEntry {
+            ops: Arc::new(FixedFile),
+            offset: 0,
+            flags: 0,
+        })
     });
     if fd_b != Some(3) {
         return TestResult::Fail("task B should also get fd 3");
@@ -5621,7 +6275,9 @@ fn smoke_userspace_fd_table_roundtrip() -> TestResult {
 
     // Mutating offset via get_mut.
     fd::with_table(task_a, |t| {
-        if let Some(e) = t.get_mut(3) { e.offset += 100; }
+        if let Some(e) = t.get_mut(3) {
+            e.offset += 100;
+        }
     });
     let off_a = fd::with_table(task_a, |t| t.get(3).map(|e| e.offset)).flatten();
     if off_a != Some(100) {
@@ -5638,7 +6294,11 @@ fn smoke_userspace_fd_table_roundtrip() -> TestResult {
         return TestResult::Fail("close should report true on live fd");
     }
     let reused = fd::with_table(task_a, |t| {
-        t.open(FdEntry { ops: Arc::new(FixedFile), offset: 0, flags: 0 })
+        t.open(FdEntry {
+            ops: Arc::new(FixedFile),
+            offset: 0,
+            flags: 0,
+        })
     });
     if reused != Some(3) {
         return TestResult::Fail("close + open should reuse slot 3");
@@ -5665,9 +6325,14 @@ fn smoke_userspace_install_core_syscalls_fills_table() -> TestResult {
     install_core_syscalls(&mut t);
 
     let slots = [
-        Syscall::Write, Syscall::Read, Syscall::Close,
-        Syscall::Mmap,  Syscall::Munmap,
-        Syscall::ExitTask, Syscall::Yield, Syscall::Sleep,
+        Syscall::Write,
+        Syscall::Read,
+        Syscall::Close,
+        Syscall::Mmap,
+        Syscall::Munmap,
+        Syscall::ExitTask,
+        Syscall::Yield,
+        Syscall::Sleep,
     ];
     for s in slots {
         if t.name_of(s).is_none() {
@@ -5689,9 +6354,7 @@ fn smoke_userspace_load_user_process_builds_runnable_image() -> TestResult {
     // a mapped user stack at DEFAULT_USER_STACK_BASE.
     use narf_memory::x86_64::paging;
     use narf_memory::VirtAddr;
-    use narf_userspace::{
-        load_user_process, DEFAULT_USER_STACK_BASE, DEFAULT_USER_STACK_BYTES,
-    };
+    use narf_userspace::{load_user_process, DEFAULT_USER_STACK_BASE, DEFAULT_USER_STACK_BYTES};
 
     let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(64 + 56 + 0x1000);
     bytes.extend_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
@@ -5740,7 +6403,10 @@ fn smoke_userspace_load_user_process_builds_runnable_image() -> TestResult {
 
     // Code segment PTE installed.
     let code_phys = unsafe {
-        paging::translate(proc.address_space.root, VirtAddr::new(0x0000_0080_0000_1000))
+        paging::translate(
+            proc.address_space.root,
+            VirtAddr::new(0x0000_0080_0000_1000),
+        )
     };
     if code_phys.is_none() {
         return TestResult::Fail("code segment not materialized");
@@ -5748,7 +6414,10 @@ fn smoke_userspace_load_user_process_builds_runnable_image() -> TestResult {
 
     // Stack PTE installed — check the first page.
     let stack_phys = unsafe {
-        paging::translate(proc.address_space.root, VirtAddr::new(DEFAULT_USER_STACK_BASE))
+        paging::translate(
+            proc.address_space.root,
+            VirtAddr::new(DEFAULT_USER_STACK_BASE),
+        )
     };
     if stack_phys.is_none() {
         return TestResult::Fail("stack region not materialized");
@@ -5767,8 +6436,7 @@ fn smoke_userspace_load_user_process_with_argv() -> TestResult {
     use narf_memory::x86_64::paging;
     use narf_memory::VirtAddr;
     use narf_userspace::{
-        load_user_process_with, AuxEntry, DEFAULT_USER_STACK_BASE,
-        DEFAULT_USER_STACK_BYTES,
+        load_user_process_with, AuxEntry, DEFAULT_USER_STACK_BASE, DEFAULT_USER_STACK_BYTES,
     };
 
     let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(64 + 56 + 0x1000);
@@ -5798,15 +6466,15 @@ fn smoke_userspace_load_user_process_with_argv() -> TestResult {
 
     let argv = ["one", "two"];
     let envp = ["A=1"];
-    let aux  = [AuxEntry::Pagesz(4096)];
+    let aux = [AuxEntry::Pagesz(4096)];
 
     let proc = match unsafe { load_user_process_with(&bytes, &argv, &envp, &aux) } {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("load_user_process_with failed"),
     };
 
-    let stack_top  = DEFAULT_USER_STACK_BASE + DEFAULT_USER_STACK_BYTES;
-    let new_rsp    = proc.stack_top.as_u64();
+    let stack_top = DEFAULT_USER_STACK_BASE + DEFAULT_USER_STACK_BYTES;
+    let new_rsp = proc.stack_top.as_u64();
     if new_rsp >= stack_top || new_rsp < DEFAULT_USER_STACK_BASE {
         return TestResult::Fail("rsp not inside stack region");
     }
@@ -5818,15 +6486,18 @@ fn smoke_userspace_load_user_process_with_argv() -> TestResult {
     // user-vaddr offset within the page (translate itself returns
     // page-aligned phys).
     let read_u64 = |vaddr: u64| -> Option<u64> {
-        let p = unsafe { paging::translate(proc.address_space.root, VirtAddr::new(vaddr & !0xFFF)) }?;
+        let p =
+            unsafe { paging::translate(proc.address_space.root, VirtAddr::new(vaddr & !0xFFF)) }?;
         Some(unsafe { *((p.as_u64() | (vaddr & 0xFFF)) as *const u64) })
     };
     let argc = match read_u64(new_rsp) {
         Some(v) => v,
-        None    => return TestResult::Fail("rsp not materialised"),
+        None => return TestResult::Fail("rsp not materialised"),
     };
     if argc != 2 {
-        if argc == 0 { return TestResult::Fail("argc reads back as 0"); }
+        if argc == 0 {
+            return TestResult::Fail("argc reads back as 0");
+        }
         return TestResult::Fail("argc not 2 (non-zero)");
     }
     let argv0 = read_u64(new_rsp + 8).unwrap();
@@ -5837,18 +6508,26 @@ fn smoke_userspace_load_user_process_with_argv() -> TestResult {
     }
     // Resolve argv[0] / argv[1] via the same translate path.
     let resolve = |v: u64, want: &str| -> bool {
-        let p = match unsafe { paging::translate(proc.address_space.root, VirtAddr::new(v & !0xFFF)) } {
+        let p = match unsafe {
+            paging::translate(proc.address_space.root, VirtAddr::new(v & !0xFFF))
+        } {
             Some(p) => p.as_u64() | (v & 0xFFF),
-            None    => return false,
+            None => return false,
         };
         let want_b = want.as_bytes();
         for i in 0..want_b.len() {
-            if unsafe { *((p + i as u64) as *const u8) } != want_b[i] { return false; }
+            if unsafe { *((p + i as u64) as *const u8) } != want_b[i] {
+                return false;
+            }
         }
         unsafe { *((p + want_b.len() as u64) as *const u8) == 0 }
     };
-    if !resolve(argv0, "one") { return TestResult::Fail("argv[0] != \"one\""); }
-    if !resolve(argv1, "two") { return TestResult::Fail("argv[1] != \"two\""); }
+    if !resolve(argv0, "one") {
+        return TestResult::Fail("argv[0] != \"one\"");
+    }
+    if !resolve(argv1, "two") {
+        return TestResult::Fail("argv[1] != \"two\"");
+    }
 
     TestResult::Pass
 }
@@ -5877,16 +6556,15 @@ fn smoke_userspace_load_user_process_with_interp() -> TestResult {
     use narf_memory::x86_64::paging;
     use narf_memory::VirtAddr;
     use narf_userspace::{
-        interp::__test_clear_interpreters,
-        load_user_process_with, register_interpreter,
+        interp::__test_clear_interpreters, load_user_process_with, register_interpreter,
     };
 
-    const INTERP_BIAS:    u64 = 0x0000_4000_0000_0000;
-    const PROG_CODE_VA:   u64 = 0x0000_0080_0000_1000;
-    const PROG_DATA_VA:   u64 = 0x0000_0080_0000_2000;
-    const PROG_ENTRY:     u64 = 0x0000_0080_0000_1111;
+    const INTERP_BIAS: u64 = 0x0000_4000_0000_0000;
+    const PROG_CODE_VA: u64 = 0x0000_0080_0000_1000;
+    const PROG_DATA_VA: u64 = 0x0000_0080_0000_2000;
+    const PROG_ENTRY: u64 = 0x0000_0080_0000_1111;
     const INTERP_CODE_VA: u64 = 0x0000_0000_0000_1000;
-    const INTERP_ENTRY:   u64 = 0x0000_0000_0000_1234;
+    const INTERP_ENTRY: u64 = 0x0000_0000_0000_1234;
 
     // Build a 3-phdr program ELF. Phdr 0 = PT_INTERP naming the
     // string at offset 64+3*56=232; phdrs 1 & 2 = PT_LOAD code/data
@@ -5901,12 +6579,12 @@ fn smoke_userspace_load_user_process_with_interp() -> TestResult {
         b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
         b[0x18..0x20].copy_from_slice(&PROG_ENTRY.to_le_bytes());
         b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
-        b[0x28..0x30].copy_from_slice(&0u64.to_le_bytes());  // e_shoff
-        b[0x30..0x34].copy_from_slice(&0u32.to_le_bytes());  // e_flags
+        b[0x28..0x30].copy_from_slice(&0u64.to_le_bytes()); // e_shoff
+        b[0x30..0x34].copy_from_slice(&0u32.to_le_bytes()); // e_flags
         b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
         b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
-        b[0x38..0x3A].copy_from_slice(&3u16.to_le_bytes());  // e_phnum
-        // Phdr 0 — PT_INTERP pointing at the "ld-narf\0" string.
+        b[0x38..0x3A].copy_from_slice(&3u16.to_le_bytes()); // e_phnum
+                                                            // Phdr 0 — PT_INTERP pointing at the "ld-narf\0" string.
         let interp_str = b"ld-narf\0";
         let interp_off = 64 + 3 * 56;
         b[interp_off..interp_off + interp_str.len()].copy_from_slice(interp_str);
@@ -5996,18 +6674,19 @@ fn smoke_userspace_load_user_process_with_interp() -> TestResult {
     }
 
     // Both program and interpreter pages must be materialised.
-    if unsafe { paging::translate(proc.address_space.root, VirtAddr::new(PROG_CODE_VA)) }
-        .is_none()
+    if unsafe { paging::translate(proc.address_space.root, VirtAddr::new(PROG_CODE_VA)) }.is_none()
     {
         return TestResult::Fail("program code not materialised");
     }
-    if unsafe { paging::translate(proc.address_space.root, VirtAddr::new(PROG_DATA_VA)) }
-        .is_none()
+    if unsafe { paging::translate(proc.address_space.root, VirtAddr::new(PROG_DATA_VA)) }.is_none()
     {
         return TestResult::Fail("program data not materialised");
     }
     if unsafe {
-        paging::translate(proc.address_space.root, VirtAddr::new(INTERP_CODE_VA + INTERP_BIAS))
+        paging::translate(
+            proc.address_space.root,
+            VirtAddr::new(INTERP_CODE_VA + INTERP_BIAS),
+        )
     }
     .is_none()
     {
@@ -6017,32 +6696,39 @@ fn smoke_userspace_load_user_process_with_interp() -> TestResult {
     // Walk the aux vector on the stack: argc=0, argv NULL, envp
     // NULL, then aux pairs. Match by AT_* tag.
     let read_u64 = |vaddr: u64| -> Option<u64> {
-        let p = unsafe { paging::translate(proc.address_space.root, VirtAddr::new(vaddr & !0xFFF)) }?;
+        let p =
+            unsafe { paging::translate(proc.address_space.root, VirtAddr::new(vaddr & !0xFFF)) }?;
         Some(unsafe { *((p.as_u64() | (vaddr & 0xFFF)) as *const u64) })
     };
     let rsp = proc.stack_top.as_u64();
     let argc = read_u64(rsp).unwrap_or(0xDEAD);
-    if argc != 0 { return TestResult::Fail("argc should be 0 in this test"); }
+    if argc != 0 {
+        return TestResult::Fail("argc should be 0 in this test");
+    }
     let argv_null = read_u64(rsp + 8).unwrap_or(0xDEAD);
-    if argv_null != 0 { return TestResult::Fail("argv NULL terminator missing"); }
+    if argv_null != 0 {
+        return TestResult::Fail("argv NULL terminator missing");
+    }
     let envp_null = read_u64(rsp + 16).unwrap_or(0xDEAD);
-    if envp_null != 0 { return TestResult::Fail("envp NULL terminator missing"); }
+    if envp_null != 0 {
+        return TestResult::Fail("envp NULL terminator missing");
+    }
 
     // Aux pairs start at rsp+24. Walk until AT_NULL (key=0); we
     // expect to find AT_PAGESZ(6), AT_ENTRY(9), AT_BASE(7).
     let mut at_pagesz: Option<u64> = None;
-    let mut at_entry:  Option<u64> = None;
-    let mut at_base:   Option<u64> = None;
+    let mut at_entry: Option<u64> = None;
+    let mut at_base: Option<u64> = None;
     let mut p = rsp + 24;
     for _ in 0..16 {
         let key = read_u64(p).unwrap_or(0xDEAD);
         let val = read_u64(p + 8).unwrap_or(0xDEAD);
         match key {
-            0  => break,
-            6  => at_pagesz = Some(val),
-            9  => at_entry  = Some(val),
-            7  => at_base   = Some(val),
-            _  => {}
+            0 => break,
+            6 => at_pagesz = Some(val),
+            9 => at_entry = Some(val),
+            7 => at_base = Some(val),
+            _ => {}
         }
         p += 16;
     }
@@ -6069,11 +6755,11 @@ fn smoke_userspace_parse_pt_tls() -> TestResult {
     // exact field values. Parse-only — load/staging is a follow-up.
     use narf_userspace::{parse_elf, ElfError};
 
-    const TLS_FILE_OFF:  u64 = 0x2000;
+    const TLS_FILE_OFF: u64 = 0x2000;
     const TLS_FILE_SIZE: u64 = 0x40;
-    const TLS_MEM_SIZE:  u64 = 0x80; // 0x40 BSS-zero past file image
-    const TLS_ALIGN:     u64 = 16;
-    const TLS_VADDR:     u64 = 0x0000_0080_0000_3000;
+    const TLS_MEM_SIZE: u64 = 0x80; // 0x40 BSS-zero past file image
+    const TLS_ALIGN: u64 = 16;
+    const TLS_VADDR: u64 = 0x0000_0080_0000_3000;
 
     fn write_one_tls() -> alloc::vec::Vec<u8> {
         const FSIZE: usize = 0x3000;
@@ -6089,7 +6775,7 @@ fn smoke_userspace_parse_pt_tls() -> TestResult {
         b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());
         b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
         b[0x38..0x3A].copy_from_slice(&2u16.to_le_bytes()); // 2 phdrs
-        // Phdr 0 — PT_LOAD code (RX) at file off 0x1000.
+                                                            // Phdr 0 — PT_LOAD code (RX) at file off 0x1000.
         let mut ph = 64usize;
         b[ph + 0x00..ph + 0x04].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
         b[ph + 0x04..ph + 0x08].copy_from_slice(&5u32.to_le_bytes()); // PF_R|PF_X
@@ -6119,13 +6805,23 @@ fn smoke_userspace_parse_pt_tls() -> TestResult {
     };
     let tls = match image.tls {
         Some(t) => t,
-        None    => return TestResult::Fail("image.tls should be Some for PT_TLS ELF"),
+        None => return TestResult::Fail("image.tls should be Some for PT_TLS ELF"),
     };
-    if tls.file_off  != TLS_FILE_OFF  { return TestResult::Fail("tls.file_off mismatch");  }
-    if tls.file_size != TLS_FILE_SIZE { return TestResult::Fail("tls.file_size mismatch"); }
-    if tls.mem_size  != TLS_MEM_SIZE  { return TestResult::Fail("tls.mem_size mismatch");  }
-    if tls.align     != TLS_ALIGN     { return TestResult::Fail("tls.align mismatch");     }
-    if tls.vaddr     != TLS_VADDR     { return TestResult::Fail("tls.vaddr mismatch");     }
+    if tls.file_off != TLS_FILE_OFF {
+        return TestResult::Fail("tls.file_off mismatch");
+    }
+    if tls.file_size != TLS_FILE_SIZE {
+        return TestResult::Fail("tls.file_size mismatch");
+    }
+    if tls.mem_size != TLS_MEM_SIZE {
+        return TestResult::Fail("tls.mem_size mismatch");
+    }
+    if tls.align != TLS_ALIGN {
+        return TestResult::Fail("tls.align mismatch");
+    }
+    if tls.vaddr != TLS_VADDR {
+        return TestResult::Fail("tls.vaddr mismatch");
+    }
 
     // Negative path: a second PT_TLS must be rejected. Cheaper to
     // build a fresh 3-phdr image inline than to try patching the
@@ -6178,7 +6874,7 @@ fn smoke_userspace_parse_pt_tls() -> TestResult {
     match parse_elf(&write_two_tls()) {
         Err(ElfError::MultiplePtTls) => TestResult::Pass,
         Err(_) => TestResult::Fail("two PT_TLS produced wrong error variant"),
-        Ok(_)  => TestResult::Fail("two PT_TLS should have been rejected"),
+        Ok(_) => TestResult::Fail("two PT_TLS should have been rejected"),
     }
 }
 kernel_test!(smoke_userspace_parse_pt_tls);
@@ -6197,17 +6893,17 @@ fn smoke_userspace_apply_relative_relocations() -> TestResult {
     use narf_memory::VirtAddr;
     use narf_userspace::load_user_process_with;
 
-    const SEG_VA:   u64 = 0x0000_0080_0000_1000;
+    const SEG_VA: u64 = 0x0000_0080_0000_1000;
     const SEG_FOFF: u64 = 0x1000;
     // r_offset inside the segment (byte 0x80 from base — well clear
     // of both the rela array and the dynamic array we lay out below).
     const RELOC_OFF_IN_SEG: u64 = 0x80;
-    const RELOC_VA:  u64 = SEG_VA + RELOC_OFF_IN_SEG;
-    const ADDEND:    u64 = 0x12345678;
+    const RELOC_VA: u64 = SEG_VA + RELOC_OFF_IN_SEG;
+    const ADDEND: u64 = 0x12345678;
     // Where the rela entry lives inside the segment (file + vaddr).
     const RELA_OFF_IN_SEG: u64 = 0x100;
     // Where the dynamic array lives inside the segment.
-    const DYN_OFF_IN_SEG:  u64 = 0x200;
+    const DYN_OFF_IN_SEG: u64 = 0x200;
 
     fn build() -> alloc::vec::Vec<u8> {
         // Total file size: 0x2000 — first 0x1000 = ELF header + phdrs
@@ -6216,49 +6912,49 @@ fn smoke_userspace_apply_relative_relocations() -> TestResult {
         let mut b = alloc::vec![0u8; FSIZE];
         // ELF header.
         b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        b[0x10..0x12].copy_from_slice(&2u16.to_le_bytes());     // ET_EXEC
-        b[0x12..0x14].copy_from_slice(&0x3Eu16.to_le_bytes());  // EM_X86_64
-        b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());     // EV_CURRENT
+        b[0x10..0x12].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        b[0x12..0x14].copy_from_slice(&0x3Eu16.to_le_bytes()); // EM_X86_64
+        b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes()); // EV_CURRENT
         b[0x18..0x20].copy_from_slice(&(SEG_VA + 0x111).to_le_bytes()); // entry inside seg
-        b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes());    // e_phoff
-        b[0x28..0x30].copy_from_slice(&0u64.to_le_bytes());     // e_shoff
-        b[0x30..0x34].copy_from_slice(&0u32.to_le_bytes());     // e_flags
-        b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());    // e_ehsize
-        b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());    // e_phentsize
-        b[0x38..0x3A].copy_from_slice(&2u16.to_le_bytes());     // e_phnum
-        // Phdr 0 — PT_LOAD covering the page at file_off 0x1000 →
-        // vaddr SEG_VA, with R+W perms (so the relocation can patch
-        // the slot — kernel writes through identity-map so PF_W is
-        // for completeness only).
+        b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        b[0x28..0x30].copy_from_slice(&0u64.to_le_bytes()); // e_shoff
+        b[0x30..0x34].copy_from_slice(&0u32.to_le_bytes()); // e_flags
+        b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        b[0x38..0x3A].copy_from_slice(&2u16.to_le_bytes()); // e_phnum
+                                                            // Phdr 0 — PT_LOAD covering the page at file_off 0x1000 →
+                                                            // vaddr SEG_VA, with R+W perms (so the relocation can patch
+                                                            // the slot — kernel writes through identity-map so PF_W is
+                                                            // for completeness only).
         let mut ph = 64usize;
-        b[ph + 0x00..ph + 0x04].copy_from_slice(&1u32.to_le_bytes());   // PT_LOAD
-        b[ph + 0x04..ph + 0x08].copy_from_slice(&6u32.to_le_bytes());   // PF_R|PF_W
+        b[ph + 0x00..ph + 0x04].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        b[ph + 0x04..ph + 0x08].copy_from_slice(&6u32.to_le_bytes()); // PF_R|PF_W
         b[ph + 0x08..ph + 0x10].copy_from_slice(&SEG_FOFF.to_le_bytes());
         b[ph + 0x10..ph + 0x18].copy_from_slice(&SEG_VA.to_le_bytes());
         b[ph + 0x18..ph + 0x20].copy_from_slice(&SEG_VA.to_le_bytes());
         b[ph + 0x20..ph + 0x28].copy_from_slice(&0x1000u64.to_le_bytes()); // filesz
         b[ph + 0x28..ph + 0x30].copy_from_slice(&0x1000u64.to_le_bytes()); // memsz
         b[ph + 0x30..ph + 0x38].copy_from_slice(&0x1000u64.to_le_bytes()); // align
-        // Phdr 1 — PT_DYNAMIC. Its file region is the dynamic array
-        // we lay down at DYN_OFF_IN_SEG (5 × 16 bytes = 80).
+                                                                           // Phdr 1 — PT_DYNAMIC. Its file region is the dynamic array
+                                                                           // we lay down at DYN_OFF_IN_SEG (5 × 16 bytes = 80).
         ph = 64 + 56;
         let dyn_foff = SEG_FOFF + DYN_OFF_IN_SEG;
-        let dyn_va   = SEG_VA  + DYN_OFF_IN_SEG;
-        b[ph + 0x00..ph + 0x04].copy_from_slice(&2u32.to_le_bytes());   // PT_DYNAMIC
-        b[ph + 0x04..ph + 0x08].copy_from_slice(&4u32.to_le_bytes());   // PF_R
+        let dyn_va = SEG_VA + DYN_OFF_IN_SEG;
+        b[ph + 0x00..ph + 0x04].copy_from_slice(&2u32.to_le_bytes()); // PT_DYNAMIC
+        b[ph + 0x04..ph + 0x08].copy_from_slice(&4u32.to_le_bytes()); // PF_R
         b[ph + 0x08..ph + 0x10].copy_from_slice(&dyn_foff.to_le_bytes());
         b[ph + 0x10..ph + 0x18].copy_from_slice(&dyn_va.to_le_bytes());
         b[ph + 0x18..ph + 0x20].copy_from_slice(&dyn_va.to_le_bytes());
-        b[ph + 0x20..ph + 0x28].copy_from_slice(&80u64.to_le_bytes());  // 5 × 16
+        b[ph + 0x20..ph + 0x28].copy_from_slice(&80u64.to_le_bytes()); // 5 × 16
         b[ph + 0x28..ph + 0x30].copy_from_slice(&80u64.to_le_bytes());
         b[ph + 0x30..ph + 0x38].copy_from_slice(&8u64.to_le_bytes());
 
         // Lay out the Elf64_Rela entry at SEG_FOFF + RELA_OFF_IN_SEG.
         // r_offset = RELOC_VA, r_info = (sym=0 << 32) | type=8, addend=ADDEND.
         let rela_foff = (SEG_FOFF + RELA_OFF_IN_SEG) as usize;
-        b[rela_foff       .. rela_foff + 8 ].copy_from_slice(&RELOC_VA.to_le_bytes());
-        b[rela_foff + 8   .. rela_foff + 16].copy_from_slice(&8u64.to_le_bytes());
-        b[rela_foff + 16  .. rela_foff + 24].copy_from_slice(&ADDEND.to_le_bytes());
+        b[rela_foff..rela_foff + 8].copy_from_slice(&RELOC_VA.to_le_bytes());
+        b[rela_foff + 8..rela_foff + 16].copy_from_slice(&8u64.to_le_bytes());
+        b[rela_foff + 16..rela_foff + 24].copy_from_slice(&ADDEND.to_le_bytes());
 
         // Lay out the dynamic array. Tags use the standard DT_* wire
         // numbers — DT_RELA=7, DT_RELASZ=8, DT_RELAENT=9, DT_RELACOUNT=
@@ -6267,24 +6963,24 @@ fn smoke_userspace_apply_relative_relocations() -> TestResult {
         let dyn_foff_us = dyn_foff as usize;
         let mut p = dyn_foff_us;
         // DT_RELA = rela array vaddr.
-        b[p       .. p + 8 ].copy_from_slice(&7i64.to_le_bytes());
-        b[p + 8   .. p + 16].copy_from_slice(&rela_va.to_le_bytes());
+        b[p..p + 8].copy_from_slice(&7i64.to_le_bytes());
+        b[p + 8..p + 16].copy_from_slice(&rela_va.to_le_bytes());
         p += 16;
         // DT_RELASZ = 24.
-        b[p       .. p + 8 ].copy_from_slice(&8i64.to_le_bytes());
-        b[p + 8   .. p + 16].copy_from_slice(&24u64.to_le_bytes());
+        b[p..p + 8].copy_from_slice(&8i64.to_le_bytes());
+        b[p + 8..p + 16].copy_from_slice(&24u64.to_le_bytes());
         p += 16;
         // DT_RELAENT = 24.
-        b[p       .. p + 8 ].copy_from_slice(&9i64.to_le_bytes());
-        b[p + 8   .. p + 16].copy_from_slice(&24u64.to_le_bytes());
+        b[p..p + 8].copy_from_slice(&9i64.to_le_bytes());
+        b[p + 8..p + 16].copy_from_slice(&24u64.to_le_bytes());
         p += 16;
         // DT_RELACOUNT = 1.
-        b[p       .. p + 8 ].copy_from_slice(&0x6FFFFFF9i64.to_le_bytes());
-        b[p + 8   .. p + 16].copy_from_slice(&1u64.to_le_bytes());
+        b[p..p + 8].copy_from_slice(&0x6FFFFFF9i64.to_le_bytes());
+        b[p + 8..p + 16].copy_from_slice(&1u64.to_le_bytes());
         p += 16;
         // DT_NULL terminator.
-        b[p       .. p + 8 ].copy_from_slice(&0i64.to_le_bytes());
-        b[p + 8   .. p + 16].copy_from_slice(&0u64.to_le_bytes());
+        b[p..p + 8].copy_from_slice(&0i64.to_le_bytes());
+        b[p + 8..p + 16].copy_from_slice(&0u64.to_le_bytes());
 
         b
     }
@@ -6298,12 +6994,13 @@ fn smoke_userspace_apply_relative_relocations() -> TestResult {
     // Read back the slot through the AS — same translate-and-cast
     // pattern the other smokes use.
     let read_u64 = |vaddr: u64| -> Option<u64> {
-        let p = unsafe { paging::translate(proc.address_space.root, VirtAddr::new(vaddr & !0xFFF)) }?;
+        let p =
+            unsafe { paging::translate(proc.address_space.root, VirtAddr::new(vaddr & !0xFFF)) }?;
         Some(unsafe { *((p.as_u64() | (vaddr & 0xFFF)) as *const u64) })
     };
     let got = match read_u64(RELOC_VA) {
         Some(v) => v,
-        None    => return TestResult::Fail("relocation site not materialised"),
+        None => return TestResult::Fail("relocation site not materialised"),
     };
     if got != ADDEND {
         return TestResult::Fail("R_X86_64_RELATIVE didn't write the addend");
@@ -6325,33 +7022,33 @@ fn smoke_userspace_apply_symbol_relocations() -> TestResult {
     use narf_memory::VirtAddr;
     use narf_userspace::load_user_process_with;
 
-    const SEG_VA:   u64 = 0x0000_0080_0000_1000;
+    const SEG_VA: u64 = 0x0000_0080_0000_1000;
     const SEG_FOFF: u64 = 0x1000;
     const RELOC_OFF_IN_SEG: u64 = 0x80;
     const RELOC_VA: u64 = SEG_VA + RELOC_OFF_IN_SEG;
     const SYM_VALUE: u64 = SEG_VA + 0x100;
-    const ADDEND:    u64 = 0x42;
+    const ADDEND: u64 = 0x42;
     const RELA_OFF_IN_SEG: u64 = 0x180;
     const SYMTAB_OFF_IN_SEG: u64 = 0x1C0;
-    const DYN_OFF_IN_SEG:    u64 = 0x300;
+    const DYN_OFF_IN_SEG: u64 = 0x300;
 
     fn build() -> alloc::vec::Vec<u8> {
         const FSIZE: usize = 0x2000;
         let mut b = alloc::vec![0u8; FSIZE];
         b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        b[0x10..0x12].copy_from_slice(&2u16.to_le_bytes());     // ET_EXEC
-        b[0x12..0x14].copy_from_slice(&0x3Eu16.to_le_bytes());  // EM_X86_64
-        b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());     // EV_CURRENT
+        b[0x10..0x12].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        b[0x12..0x14].copy_from_slice(&0x3Eu16.to_le_bytes()); // EM_X86_64
+        b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes()); // EV_CURRENT
         b[0x18..0x20].copy_from_slice(&(SEG_VA + 0x111).to_le_bytes());
-        b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes());    // e_phoff
-        b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());    // e_ehsize
-        b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());    // e_phentsize
-        b[0x38..0x3A].copy_from_slice(&2u16.to_le_bytes());     // e_phnum
+        b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        b[0x38..0x3A].copy_from_slice(&2u16.to_le_bytes()); // e_phnum
 
         // Phdr 0: PT_LOAD covering the page.
         let mut ph = 64usize;
-        b[ph + 0x00..ph + 0x04].copy_from_slice(&1u32.to_le_bytes());   // PT_LOAD
-        b[ph + 0x04..ph + 0x08].copy_from_slice(&6u32.to_le_bytes());   // PF_R|PF_W
+        b[ph + 0x00..ph + 0x04].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        b[ph + 0x04..ph + 0x08].copy_from_slice(&6u32.to_le_bytes()); // PF_R|PF_W
         b[ph + 0x08..ph + 0x10].copy_from_slice(&SEG_FOFF.to_le_bytes());
         b[ph + 0x10..ph + 0x18].copy_from_slice(&SEG_VA.to_le_bytes());
         b[ph + 0x18..ph + 0x20].copy_from_slice(&SEG_VA.to_le_bytes());
@@ -6362,9 +7059,9 @@ fn smoke_userspace_apply_symbol_relocations() -> TestResult {
         // Phdr 1: PT_DYNAMIC. 5 dynamic entries × 16 = 80 bytes.
         ph = 64 + 56;
         let dyn_foff = SEG_FOFF + DYN_OFF_IN_SEG;
-        let dyn_va   = SEG_VA   + DYN_OFF_IN_SEG;
-        b[ph + 0x00..ph + 0x04].copy_from_slice(&2u32.to_le_bytes());   // PT_DYNAMIC
-        b[ph + 0x04..ph + 0x08].copy_from_slice(&4u32.to_le_bytes());   // PF_R
+        let dyn_va = SEG_VA + DYN_OFF_IN_SEG;
+        b[ph + 0x00..ph + 0x04].copy_from_slice(&2u32.to_le_bytes()); // PT_DYNAMIC
+        b[ph + 0x04..ph + 0x08].copy_from_slice(&4u32.to_le_bytes()); // PF_R
         b[ph + 0x08..ph + 0x10].copy_from_slice(&dyn_foff.to_le_bytes());
         b[ph + 0x10..ph + 0x18].copy_from_slice(&dyn_va.to_le_bytes());
         b[ph + 0x18..ph + 0x20].copy_from_slice(&dyn_va.to_le_bytes());
@@ -6376,9 +7073,9 @@ fn smoke_userspace_apply_symbol_relocations() -> TestResult {
         // r_info = (sym_idx 1 << 32) | type R_X86_64_64 (1).
         let rela_foff = (SEG_FOFF + RELA_OFF_IN_SEG) as usize;
         let r_info: u64 = (1u64 << 32) | 1u64;
-        b[rela_foff       .. rela_foff + 8 ].copy_from_slice(&RELOC_VA.to_le_bytes());
-        b[rela_foff + 8   .. rela_foff + 16].copy_from_slice(&r_info.to_le_bytes());
-        b[rela_foff + 16  .. rela_foff + 24].copy_from_slice(&ADDEND.to_le_bytes());
+        b[rela_foff..rela_foff + 8].copy_from_slice(&RELOC_VA.to_le_bytes());
+        b[rela_foff + 8..rela_foff + 16].copy_from_slice(&r_info.to_le_bytes());
+        b[rela_foff + 16..rela_foff + 24].copy_from_slice(&ADDEND.to_le_bytes());
 
         // Symbol table @ SYMTAB_OFF_IN_SEG. Two 24-byte entries.
         // Entry 0: all-zero (the canonical STN_UNDEF placeholder).
@@ -6387,36 +7084,36 @@ fn smoke_userspace_apply_symbol_relocations() -> TestResult {
         // Entry 0 is already zeroed by the vec init.
         let s1 = sym_foff + 24;
         // st_name(4) | st_info(1) | st_other(1) | st_shndx(2) | st_value(8) | st_size(8).
-        b[s1 + 0 .. s1 + 4 ].copy_from_slice(&0u32.to_le_bytes());      // st_name
-        b[s1 + 4]            = 0;                                       // st_info
-        b[s1 + 5]            = 0;                                       // st_other
-        b[s1 + 6 .. s1 + 8 ].copy_from_slice(&1u16.to_le_bytes());      // st_shndx (defined)
-        b[s1 + 8 .. s1 + 16].copy_from_slice(&SYM_VALUE.to_le_bytes()); // st_value
-        b[s1 + 16.. s1 + 24].copy_from_slice(&0u64.to_le_bytes());      // st_size
+        b[s1 + 0..s1 + 4].copy_from_slice(&0u32.to_le_bytes()); // st_name
+        b[s1 + 4] = 0; // st_info
+        b[s1 + 5] = 0; // st_other
+        b[s1 + 6..s1 + 8].copy_from_slice(&1u16.to_le_bytes()); // st_shndx (defined)
+        b[s1 + 8..s1 + 16].copy_from_slice(&SYM_VALUE.to_le_bytes()); // st_value
+        b[s1 + 16..s1 + 24].copy_from_slice(&0u64.to_le_bytes()); // st_size
 
         // Dynamic array.
-        let rela_va    = SEG_VA + RELA_OFF_IN_SEG;
-        let symtab_va  = SEG_VA + SYMTAB_OFF_IN_SEG;
+        let rela_va = SEG_VA + RELA_OFF_IN_SEG;
+        let symtab_va = SEG_VA + SYMTAB_OFF_IN_SEG;
         let mut p = dyn_foff as usize;
         // DT_RELA = 7.
-        b[p .. p + 8].copy_from_slice(&7i64.to_le_bytes());
-        b[p + 8 .. p + 16].copy_from_slice(&rela_va.to_le_bytes());
+        b[p..p + 8].copy_from_slice(&7i64.to_le_bytes());
+        b[p + 8..p + 16].copy_from_slice(&rela_va.to_le_bytes());
         p += 16;
         // DT_RELASZ = 8 → 24 bytes (one entry).
-        b[p .. p + 8].copy_from_slice(&8i64.to_le_bytes());
-        b[p + 8 .. p + 16].copy_from_slice(&24u64.to_le_bytes());
+        b[p..p + 8].copy_from_slice(&8i64.to_le_bytes());
+        b[p + 8..p + 16].copy_from_slice(&24u64.to_le_bytes());
         p += 16;
         // DT_RELAENT = 9 → 24.
-        b[p .. p + 8].copy_from_slice(&9i64.to_le_bytes());
-        b[p + 8 .. p + 16].copy_from_slice(&24u64.to_le_bytes());
+        b[p..p + 8].copy_from_slice(&9i64.to_le_bytes());
+        b[p + 8..p + 16].copy_from_slice(&24u64.to_le_bytes());
         p += 16;
         // DT_SYMTAB = 6 → symtab_va.
-        b[p .. p + 8].copy_from_slice(&6i64.to_le_bytes());
-        b[p + 8 .. p + 16].copy_from_slice(&symtab_va.to_le_bytes());
+        b[p..p + 8].copy_from_slice(&6i64.to_le_bytes());
+        b[p + 8..p + 16].copy_from_slice(&symtab_va.to_le_bytes());
         p += 16;
         // DT_NULL.
-        b[p .. p + 8].copy_from_slice(&0i64.to_le_bytes());
-        b[p + 8 .. p + 16].copy_from_slice(&0u64.to_le_bytes());
+        b[p..p + 8].copy_from_slice(&0i64.to_le_bytes());
+        b[p + 8..p + 16].copy_from_slice(&0u64.to_le_bytes());
 
         b
     }
@@ -6428,12 +7125,13 @@ fn smoke_userspace_apply_symbol_relocations() -> TestResult {
     };
 
     let read_u64 = |vaddr: u64| -> Option<u64> {
-        let p = unsafe { paging::translate(proc.address_space.root, VirtAddr::new(vaddr & !0xFFF)) }?;
+        let p =
+            unsafe { paging::translate(proc.address_space.root, VirtAddr::new(vaddr & !0xFFF)) }?;
         Some(unsafe { *((p.as_u64() | (vaddr & 0xFFF)) as *const u64) })
     };
     let got = match read_u64(RELOC_VA) {
         Some(v) => v,
-        None    => return TestResult::Fail("relocation site not materialised"),
+        None => return TestResult::Fail("relocation site not materialised"),
     };
     if got != SYM_VALUE.wrapping_add(ADDEND) {
         return TestResult::Fail("R_X86_64_64 didn't write S+A");
@@ -6453,13 +7151,13 @@ fn smoke_userspace_unresolved_symbol_errors() -> TestResult {
     // the dedicated `_carries_name` smoke covers the populated path.
     use narf_userspace::{load_user_process_with, LoadBytesError, ProcessLoadError};
 
-    const SEG_VA:   u64 = 0x0000_0080_0000_1000;
+    const SEG_VA: u64 = 0x0000_0080_0000_1000;
     const SEG_FOFF: u64 = 0x1000;
-    const RELOC_OFF_IN_SEG:  u64 = 0x80;
-    const RELOC_VA:          u64 = SEG_VA + RELOC_OFF_IN_SEG;
-    const RELA_OFF_IN_SEG:   u64 = 0x180;
+    const RELOC_OFF_IN_SEG: u64 = 0x80;
+    const RELOC_VA: u64 = SEG_VA + RELOC_OFF_IN_SEG;
+    const RELA_OFF_IN_SEG: u64 = 0x180;
     const SYMTAB_OFF_IN_SEG: u64 = 0x1C0;
-    const DYN_OFF_IN_SEG:    u64 = 0x300;
+    const DYN_OFF_IN_SEG: u64 = 0x300;
 
     fn build() -> alloc::vec::Vec<u8> {
         const FSIZE: usize = 0x2000;
@@ -6486,7 +7184,7 @@ fn smoke_userspace_unresolved_symbol_errors() -> TestResult {
 
         ph = 64 + 56;
         let dyn_foff = SEG_FOFF + DYN_OFF_IN_SEG;
-        let dyn_va   = SEG_VA   + DYN_OFF_IN_SEG;
+        let dyn_va = SEG_VA + DYN_OFF_IN_SEG;
         b[ph + 0x00..ph + 0x04].copy_from_slice(&2u32.to_le_bytes());
         b[ph + 0x04..ph + 0x08].copy_from_slice(&4u32.to_le_bytes());
         b[ph + 0x08..ph + 0x10].copy_from_slice(&dyn_foff.to_le_bytes());
@@ -6498,32 +7196,32 @@ fn smoke_userspace_unresolved_symbol_errors() -> TestResult {
 
         let rela_foff = (SEG_FOFF + RELA_OFF_IN_SEG) as usize;
         let r_info: u64 = (1u64 << 32) | 1u64;
-        b[rela_foff       .. rela_foff + 8 ].copy_from_slice(&RELOC_VA.to_le_bytes());
-        b[rela_foff + 8   .. rela_foff + 16].copy_from_slice(&r_info.to_le_bytes());
-        b[rela_foff + 16  .. rela_foff + 24].copy_from_slice(&0u64.to_le_bytes());
+        b[rela_foff..rela_foff + 8].copy_from_slice(&RELOC_VA.to_le_bytes());
+        b[rela_foff + 8..rela_foff + 16].copy_from_slice(&r_info.to_le_bytes());
+        b[rela_foff + 16..rela_foff + 24].copy_from_slice(&0u64.to_le_bytes());
 
         // Symbol table — entry 1 is an undefined symbol (st_value=0,
         // st_shndx=SHN_UNDEF=0). The vec is already zero, so leave
         // both entries at their zero defaults.
         let _sym_foff = (SEG_FOFF + SYMTAB_OFF_IN_SEG) as usize;
 
-        let rela_va   = SEG_VA + RELA_OFF_IN_SEG;
+        let rela_va = SEG_VA + RELA_OFF_IN_SEG;
         let symtab_va = SEG_VA + SYMTAB_OFF_IN_SEG;
         let mut p = dyn_foff as usize;
-        b[p .. p + 8].copy_from_slice(&7i64.to_le_bytes());
-        b[p + 8 .. p + 16].copy_from_slice(&rela_va.to_le_bytes());
+        b[p..p + 8].copy_from_slice(&7i64.to_le_bytes());
+        b[p + 8..p + 16].copy_from_slice(&rela_va.to_le_bytes());
         p += 16;
-        b[p .. p + 8].copy_from_slice(&8i64.to_le_bytes());
-        b[p + 8 .. p + 16].copy_from_slice(&24u64.to_le_bytes());
+        b[p..p + 8].copy_from_slice(&8i64.to_le_bytes());
+        b[p + 8..p + 16].copy_from_slice(&24u64.to_le_bytes());
         p += 16;
-        b[p .. p + 8].copy_from_slice(&9i64.to_le_bytes());
-        b[p + 8 .. p + 16].copy_from_slice(&24u64.to_le_bytes());
+        b[p..p + 8].copy_from_slice(&9i64.to_le_bytes());
+        b[p + 8..p + 16].copy_from_slice(&24u64.to_le_bytes());
         p += 16;
-        b[p .. p + 8].copy_from_slice(&6i64.to_le_bytes());
-        b[p + 8 .. p + 16].copy_from_slice(&symtab_va.to_le_bytes());
+        b[p..p + 8].copy_from_slice(&6i64.to_le_bytes());
+        b[p + 8..p + 16].copy_from_slice(&symtab_va.to_le_bytes());
         p += 16;
-        b[p .. p + 8].copy_from_slice(&0i64.to_le_bytes());
-        b[p + 8 .. p + 16].copy_from_slice(&0u64.to_le_bytes());
+        b[p..p + 8].copy_from_slice(&0i64.to_le_bytes());
+        b[p + 8..p + 16].copy_from_slice(&0u64.to_le_bytes());
 
         b
     }
@@ -6539,7 +7237,7 @@ fn smoke_userspace_unresolved_symbol_errors() -> TestResult {
             }
         }
         Err(_) => TestResult::Fail("expected UnresolvedSymbol{idx:1,..}, got different error"),
-        Ok(_)  => TestResult::Fail("expected UnresolvedSymbol error, got Ok"),
+        Ok(_) => TestResult::Fail("expected UnresolvedSymbol error, got Ok"),
     }
 }
 #[cfg(target_arch = "x86_64")]
@@ -6552,29 +7250,29 @@ kernel_test!(smoke_userspace_unresolved_symbol_errors);
 /// constructed bytes.
 #[cfg(target_arch = "x86_64")]
 fn build_unresolved_named_elf(strtab: &[u8]) -> alloc::vec::Vec<u8> {
-    const SEG_VA:   u64 = 0x0000_0080_0000_1000;
+    const SEG_VA: u64 = 0x0000_0080_0000_1000;
     const SEG_FOFF: u64 = 0x1000;
-    const RELOC_OFF_IN_SEG:  u64 = 0x80;
-    const RELA_OFF_IN_SEG:   u64 = 0x180;
+    const RELOC_OFF_IN_SEG: u64 = 0x80;
+    const RELA_OFF_IN_SEG: u64 = 0x180;
     const SYMTAB_OFF_IN_SEG: u64 = 0x1C0;
     const STRTAB_OFF_IN_SEG: u64 = 0x240;
-    const DYN_OFF_IN_SEG:    u64 = 0x300;
+    const DYN_OFF_IN_SEG: u64 = 0x300;
 
     const FSIZE: usize = 0x2000;
     let mut b = alloc::vec![0u8; FSIZE];
     b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-    b[0x10..0x12].copy_from_slice(&2u16.to_le_bytes());     // ET_EXEC
-    b[0x12..0x14].copy_from_slice(&0x3Eu16.to_le_bytes());  // EM_X86_64
-    b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());     // EV_CURRENT
+    b[0x10..0x12].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+    b[0x12..0x14].copy_from_slice(&0x3Eu16.to_le_bytes()); // EM_X86_64
+    b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes()); // EV_CURRENT
     b[0x18..0x20].copy_from_slice(&(SEG_VA + 0x111).to_le_bytes());
-    b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes());    // e_phoff
-    b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());    // e_ehsize
-    b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());    // e_phentsize
-    b[0x38..0x3A].copy_from_slice(&2u16.to_le_bytes());     // e_phnum
+    b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+    b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+    b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+    b[0x38..0x3A].copy_from_slice(&2u16.to_le_bytes()); // e_phnum
 
     let mut ph = 64usize;
-    b[ph + 0x00..ph + 0x04].copy_from_slice(&1u32.to_le_bytes());   // PT_LOAD
-    b[ph + 0x04..ph + 0x08].copy_from_slice(&6u32.to_le_bytes());   // PF_R|PF_W
+    b[ph + 0x00..ph + 0x04].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    b[ph + 0x04..ph + 0x08].copy_from_slice(&6u32.to_le_bytes()); // PF_R|PF_W
     b[ph + 0x08..ph + 0x10].copy_from_slice(&SEG_FOFF.to_le_bytes());
     b[ph + 0x10..ph + 0x18].copy_from_slice(&SEG_VA.to_le_bytes());
     b[ph + 0x18..ph + 0x20].copy_from_slice(&SEG_VA.to_le_bytes());
@@ -6584,12 +7282,12 @@ fn build_unresolved_named_elf(strtab: &[u8]) -> alloc::vec::Vec<u8> {
 
     ph = 64 + 56;
     let dyn_foff = SEG_FOFF + DYN_OFF_IN_SEG;
-    let dyn_va   = SEG_VA   + DYN_OFF_IN_SEG;
+    let dyn_va = SEG_VA + DYN_OFF_IN_SEG;
     // Six 16-byte entries: DT_RELA, DT_RELASZ, DT_RELAENT, DT_SYMTAB,
     // DT_STRTAB, DT_NULL → 96 bytes.
     let dyn_size: u64 = 96;
-    b[ph + 0x00..ph + 0x04].copy_from_slice(&2u32.to_le_bytes());   // PT_DYNAMIC
-    b[ph + 0x04..ph + 0x08].copy_from_slice(&4u32.to_le_bytes());   // PF_R
+    b[ph + 0x00..ph + 0x04].copy_from_slice(&2u32.to_le_bytes()); // PT_DYNAMIC
+    b[ph + 0x04..ph + 0x08].copy_from_slice(&4u32.to_le_bytes()); // PF_R
     b[ph + 0x08..ph + 0x10].copy_from_slice(&dyn_foff.to_le_bytes());
     b[ph + 0x10..ph + 0x18].copy_from_slice(&dyn_va.to_le_bytes());
     b[ph + 0x18..ph + 0x20].copy_from_slice(&dyn_va.to_le_bytes());
@@ -6600,46 +7298,46 @@ fn build_unresolved_named_elf(strtab: &[u8]) -> alloc::vec::Vec<u8> {
     let reloc_va = SEG_VA + RELOC_OFF_IN_SEG;
     let rela_foff = (SEG_FOFF + RELA_OFF_IN_SEG) as usize;
     let r_info: u64 = (1u64 << 32) | 1u64; // sym_idx=1, R_X86_64_64
-    b[rela_foff       .. rela_foff + 8 ].copy_from_slice(&reloc_va.to_le_bytes());
-    b[rela_foff + 8   .. rela_foff + 16].copy_from_slice(&r_info.to_le_bytes());
-    b[rela_foff + 16  .. rela_foff + 24].copy_from_slice(&0u64.to_le_bytes());
+    b[rela_foff..rela_foff + 8].copy_from_slice(&reloc_va.to_le_bytes());
+    b[rela_foff + 8..rela_foff + 16].copy_from_slice(&r_info.to_le_bytes());
+    b[rela_foff + 16..rela_foff + 24].copy_from_slice(&0u64.to_le_bytes());
 
     // Symbol table: entry 0 is the canonical zero placeholder; entry 1
     // is undefined (st_value=0, st_shndx=0) but with st_name=1 — the
     // loader must follow that into DT_STRTAB.
     let sym_foff = (SEG_FOFF + SYMTAB_OFF_IN_SEG) as usize;
     let s1 = sym_foff + 24;
-    b[s1 + 0 .. s1 + 4 ].copy_from_slice(&1u32.to_le_bytes()); // st_name
-    // st_info, st_other, st_shndx, st_value, st_size all stay zero.
+    b[s1 + 0..s1 + 4].copy_from_slice(&1u32.to_le_bytes()); // st_name
+                                                            // st_info, st_other, st_shndx, st_value, st_size all stay zero.
 
     // String table: caller-supplied content. Convention: leading NUL
     // followed by NUL-terminated names. Caller provides the whole
     // blob already.
     let strtab_foff = (SEG_FOFF + STRTAB_OFF_IN_SEG) as usize;
-    b[strtab_foff .. strtab_foff + strtab.len()].copy_from_slice(strtab);
+    b[strtab_foff..strtab_foff + strtab.len()].copy_from_slice(strtab);
 
     // Dynamic array.
-    let rela_va    = SEG_VA + RELA_OFF_IN_SEG;
-    let symtab_va  = SEG_VA + SYMTAB_OFF_IN_SEG;
-    let strtab_va  = SEG_VA + STRTAB_OFF_IN_SEG;
+    let rela_va = SEG_VA + RELA_OFF_IN_SEG;
+    let symtab_va = SEG_VA + SYMTAB_OFF_IN_SEG;
+    let strtab_va = SEG_VA + STRTAB_OFF_IN_SEG;
     let mut p = dyn_foff as usize;
-    b[p .. p + 8].copy_from_slice(&7i64.to_le_bytes()); // DT_RELA
-    b[p + 8 .. p + 16].copy_from_slice(&rela_va.to_le_bytes());
+    b[p..p + 8].copy_from_slice(&7i64.to_le_bytes()); // DT_RELA
+    b[p + 8..p + 16].copy_from_slice(&rela_va.to_le_bytes());
     p += 16;
-    b[p .. p + 8].copy_from_slice(&8i64.to_le_bytes()); // DT_RELASZ
-    b[p + 8 .. p + 16].copy_from_slice(&24u64.to_le_bytes());
+    b[p..p + 8].copy_from_slice(&8i64.to_le_bytes()); // DT_RELASZ
+    b[p + 8..p + 16].copy_from_slice(&24u64.to_le_bytes());
     p += 16;
-    b[p .. p + 8].copy_from_slice(&9i64.to_le_bytes()); // DT_RELAENT
-    b[p + 8 .. p + 16].copy_from_slice(&24u64.to_le_bytes());
+    b[p..p + 8].copy_from_slice(&9i64.to_le_bytes()); // DT_RELAENT
+    b[p + 8..p + 16].copy_from_slice(&24u64.to_le_bytes());
     p += 16;
-    b[p .. p + 8].copy_from_slice(&6i64.to_le_bytes()); // DT_SYMTAB
-    b[p + 8 .. p + 16].copy_from_slice(&symtab_va.to_le_bytes());
+    b[p..p + 8].copy_from_slice(&6i64.to_le_bytes()); // DT_SYMTAB
+    b[p + 8..p + 16].copy_from_slice(&symtab_va.to_le_bytes());
     p += 16;
-    b[p .. p + 8].copy_from_slice(&5i64.to_le_bytes()); // DT_STRTAB
-    b[p + 8 .. p + 16].copy_from_slice(&strtab_va.to_le_bytes());
+    b[p..p + 8].copy_from_slice(&5i64.to_le_bytes()); // DT_STRTAB
+    b[p + 8..p + 16].copy_from_slice(&strtab_va.to_le_bytes());
     p += 16;
-    b[p .. p + 8].copy_from_slice(&0i64.to_le_bytes()); // DT_NULL
-    b[p + 8 .. p + 16].copy_from_slice(&0u64.to_le_bytes());
+    b[p..p + 8].copy_from_slice(&0i64.to_le_bytes()); // DT_NULL
+    b[p + 8..p + 16].copy_from_slice(&0u64.to_le_bytes());
 
     b
 }
@@ -6652,7 +7350,7 @@ fn smoke_userspace_unresolved_symbol_carries_name() -> TestResult {
     use narf_userspace::{load_user_process_with, LoadBytesError, ProcessLoadError};
 
     let strtab = b"\0printf\0exit\0";
-    let bytes  = build_unresolved_named_elf(strtab);
+    let bytes = build_unresolved_named_elf(strtab);
     match unsafe { load_user_process_with(&bytes, &[], &[], &[]) } {
         Err(ProcessLoadError::Load(LoadBytesError::UnresolvedSymbol { idx: 1, name })) => {
             if &name[..6] != b"printf" {
@@ -6664,7 +7362,7 @@ fn smoke_userspace_unresolved_symbol_carries_name() -> TestResult {
             TestResult::Pass
         }
         Err(_) => TestResult::Fail("expected UnresolvedSymbol{idx:1,..}, got different error"),
-        Ok(_)  => TestResult::Fail("expected UnresolvedSymbol error, got Ok"),
+        Ok(_) => TestResult::Fail("expected UnresolvedSymbol error, got Ok"),
     }
 }
 #[cfg(target_arch = "x86_64")]
@@ -6701,7 +7399,7 @@ fn smoke_userspace_unresolved_symbol_name_truncates() -> TestResult {
             TestResult::Pass
         }
         Err(_) => TestResult::Fail("expected UnresolvedSymbol{idx:1,..}, got different error"),
-        Ok(_)  => TestResult::Fail("expected UnresolvedSymbol error, got Ok"),
+        Ok(_) => TestResult::Fail("expected UnresolvedSymbol error, got Ok"),
     }
 }
 #[cfg(target_arch = "x86_64")]
@@ -6717,8 +7415,8 @@ fn smoke_userspace_init_sysv_stack_layout() -> TestResult {
     // The helper walks the AS per page via translate, so the test
     // builds a real one-page user mapping rather than a fake
     // contiguous slab.
-    use narf_userspace::{init_sysv_stack, AuxEntry};
     use narf_memory::{x86_64::paging, AddressSpace, Region, RegionPerms, VirtAddr};
+    use narf_userspace::{init_sysv_stack, AuxEntry};
 
     let mut as_ = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
@@ -6728,17 +7426,23 @@ fn smoke_userspace_init_sysv_stack_layout() -> TestResult {
         Ok(f) => f.start_address(),
         Err(_) => return TestResult::Fail("alloc_frame"),
     };
-    unsafe { core::ptr::write_bytes(frame.raw() as *mut u8, 0, 4096); }
+    unsafe {
+        core::ptr::write_bytes(frame.raw() as *mut u8, 0, 4096);
+    }
 
     // PML4[1]; PML4[0] is the kernel's identity-map (1 GiB huge
     // pages), where map_4kb can't carve a 4K mapping.
     let user_base: u64 = 0x0000_0080_0000_0000;
     let stack_top = user_base + 4096;
-    if as_.map_region(Region {
-        base: VirtAddr::new(user_base), len: 4096,
-        perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![frame],
-    }).is_err() {
+    if as_
+        .map_region(Region {
+            base: VirtAddr::new(user_base),
+            len: 4096,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![frame],
+        })
+        .is_err()
+    {
         return TestResult::Fail("map_region");
     }
     if unsafe { as_.materialize() }.is_err() {
@@ -6747,13 +7451,8 @@ fn smoke_userspace_init_sysv_stack_layout() -> TestResult {
 
     let argv = ["argv0", "alpha"];
     let envp = ["KEY=val"];
-    let aux  = [
-        AuxEntry::Pagesz(4096),
-        AuxEntry::Random(0x1234_5678),
-    ];
-    let rsp_v = match unsafe {
-        init_sysv_stack(&as_, stack_top, 4096, &argv, &envp, &aux)
-    } {
+    let aux = [AuxEntry::Pagesz(4096), AuxEntry::Random(0x1234_5678)];
+    let rsp_v = match unsafe { init_sysv_stack(&as_, stack_top, 4096, &argv, &envp, &aux) } {
         Ok(v) => v,
         Err(_) => return TestResult::Fail("init_sysv_stack overflowed unexpectedly"),
     };
@@ -6772,12 +7471,18 @@ fn smoke_userspace_init_sysv_stack_layout() -> TestResult {
         unsafe { *(p as *const u64) }
     };
 
-    if read_u64(rsp_v) != 2 { return TestResult::Fail("argc != 2"); }
+    if read_u64(rsp_v) != 2 {
+        return TestResult::Fail("argc != 2");
+    }
     let argv_p0 = read_u64(rsp_v + 8);
     let argv_p1 = read_u64(rsp_v + 16);
-    if read_u64(rsp_v + 24) != 0 { return TestResult::Fail("argv NULL term"); }
+    if read_u64(rsp_v + 24) != 0 {
+        return TestResult::Fail("argv NULL term");
+    }
     let envp_p0 = read_u64(rsp_v + 32);
-    if read_u64(rsp_v + 40) != 0 { return TestResult::Fail("envp NULL term"); }
+    if read_u64(rsp_v + 40) != 0 {
+        return TestResult::Fail("envp NULL term");
+    }
     if read_u64(rsp_v + 48) != 6 || read_u64(rsp_v + 56) != 4096 {
         return TestResult::Fail("aux[0] (PAGESZ)");
     }
@@ -6789,20 +7494,30 @@ fn smoke_userspace_init_sysv_stack_layout() -> TestResult {
     }
 
     let check_str = |user_p: u64, expected: &str| -> bool {
-        if user_p < user_base || user_p >= stack_top { return false; }
+        if user_p < user_base || user_p >= stack_top {
+            return false;
+        }
         let kp = match unsafe { paging::translate(as_.root, VirtAddr::new(user_p & !0xFFF)) } {
             Some(p) => p.as_u64() | (user_p & 0xFFF),
-            None    => return false,
+            None => return false,
         };
         let ebytes = expected.as_bytes();
         for i in 0..ebytes.len() {
-            if unsafe { *((kp + i as u64) as *const u8) } != ebytes[i] { return false; }
+            if unsafe { *((kp + i as u64) as *const u8) } != ebytes[i] {
+                return false;
+            }
         }
         unsafe { *((kp + ebytes.len() as u64) as *const u8) == 0 }
     };
-    if !check_str(argv_p0, "argv0") { return TestResult::Fail("argv[0]"); }
-    if !check_str(argv_p1, "alpha") { return TestResult::Fail("argv[1]"); }
-    if !check_str(envp_p0, "KEY=val") { return TestResult::Fail("envp[0]"); }
+    if !check_str(argv_p0, "argv0") {
+        return TestResult::Fail("argv[0]");
+    }
+    if !check_str(argv_p1, "alpha") {
+        return TestResult::Fail("argv[1]");
+    }
+    if !check_str(envp_p0, "KEY=val") {
+        return TestResult::Fail("envp[0]");
+    }
 
     TestResult::Pass
 }
@@ -6826,30 +7541,30 @@ fn smoke_userspace_load_elf_bytes_end_to_end() -> TestResult {
     let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(64 + 56 + 0x1000);
     // e_ident
     bytes.extend_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-    bytes.extend_from_slice(&2u16.to_le_bytes());   // e_type = ET_EXEC
+    bytes.extend_from_slice(&2u16.to_le_bytes()); // e_type = ET_EXEC
     bytes.extend_from_slice(&0x3Eu16.to_le_bytes()); // e_machine
-    bytes.extend_from_slice(&1u32.to_le_bytes());   // e_version
-    // Entry = 0x0000_0080_0000_1111 (some user vaddr inside PML4[1]).
+    bytes.extend_from_slice(&1u32.to_le_bytes()); // e_version
+                                                  // Entry = 0x0000_0080_0000_1111 (some user vaddr inside PML4[1]).
     bytes.extend_from_slice(&0x0000_0080_0000_1111u64.to_le_bytes());
-    bytes.extend_from_slice(&64u64.to_le_bytes());  // e_phoff
-    bytes.extend_from_slice(&0u64.to_le_bytes());   // e_shoff
-    bytes.extend_from_slice(&0u32.to_le_bytes());   // e_flags
-    bytes.extend_from_slice(&64u16.to_le_bytes());  // e_ehsize
-    bytes.extend_from_slice(&56u16.to_le_bytes());  // e_phentsize
-    bytes.extend_from_slice(&1u16.to_le_bytes());   // e_phnum
-    bytes.extend_from_slice(&0u16.to_le_bytes());   // e_shentsize
-    bytes.extend_from_slice(&0u16.to_le_bytes());   // e_shnum
-    bytes.extend_from_slice(&0u16.to_le_bytes());   // e_shstrndx
-    // Program header — R|X 1-page segment.
-    bytes.extend_from_slice(&1u32.to_le_bytes());            // p_type = PT_LOAD
-    bytes.extend_from_slice(&5u32.to_le_bytes());            // p_flags = R|X
-    bytes.extend_from_slice(&(64u64 + 56).to_le_bytes());    // p_offset = past PHDR
+    bytes.extend_from_slice(&64u64.to_le_bytes()); // e_phoff
+    bytes.extend_from_slice(&0u64.to_le_bytes()); // e_shoff
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // e_flags
+    bytes.extend_from_slice(&64u16.to_le_bytes()); // e_ehsize
+    bytes.extend_from_slice(&56u16.to_le_bytes()); // e_phentsize
+    bytes.extend_from_slice(&1u16.to_le_bytes()); // e_phnum
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // e_shentsize
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // e_shnum
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // e_shstrndx
+                                                  // Program header — R|X 1-page segment.
+    bytes.extend_from_slice(&1u32.to_le_bytes()); // p_type = PT_LOAD
+    bytes.extend_from_slice(&5u32.to_le_bytes()); // p_flags = R|X
+    bytes.extend_from_slice(&(64u64 + 56).to_le_bytes()); // p_offset = past PHDR
     bytes.extend_from_slice(&0x0000_0080_0000_1000u64.to_le_bytes()); // p_vaddr
     bytes.extend_from_slice(&0x0000_0080_0000_1000u64.to_le_bytes()); // p_paddr
-    bytes.extend_from_slice(&0x1000u64.to_le_bytes());       // p_filesz
-    bytes.extend_from_slice(&0x1000u64.to_le_bytes());       // p_memsz
-    bytes.extend_from_slice(&0x1000u64.to_le_bytes());       // p_align
-    // 4 KiB of payload. First 7 bytes distinct so we can verify.
+    bytes.extend_from_slice(&0x1000u64.to_le_bytes()); // p_filesz
+    bytes.extend_from_slice(&0x1000u64.to_le_bytes()); // p_memsz
+    bytes.extend_from_slice(&0x1000u64.to_le_bytes()); // p_align
+                                                       // 4 KiB of payload. First 7 bytes distinct so we can verify.
     bytes.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x42, 0x69, 0x01]);
     bytes.resize(64 + 56 + 0x1000, 0);
 
@@ -6867,14 +7582,13 @@ fn smoke_userspace_load_elf_bytes_end_to_end() -> TestResult {
 
     // Walk the AS PML4 to find the PTE for the segment base, then
     // read back the first 7 bytes via the phys address.
-    let phys = match unsafe { paging::translate(as_arc.root, VirtAddr::new(0x0000_0080_0000_1000)) } {
+    let phys = match unsafe { paging::translate(as_arc.root, VirtAddr::new(0x0000_0080_0000_1000)) }
+    {
         Some(p) => p,
-        None    => return TestResult::Fail("translate found no mapping for segment base"),
+        None => return TestResult::Fail("translate found no mapping for segment base"),
     };
     // Read back via identity map.
-    let payload: [u8; 7] = unsafe {
-        core::ptr::read_volatile(phys.raw() as *const [u8; 7])
-    };
+    let payload: [u8; 7] = unsafe { core::ptr::read_volatile(phys.raw() as *const [u8; 7]) };
     if payload != [0xDE, 0xAD, 0xBE, 0xEF, 0x42, 0x69, 0x01] {
         return TestResult::Fail("segment payload bytes did not land in the mapped frame");
     }
@@ -6916,45 +7630,45 @@ fn smoke_userspace_load_multi_segment() -> TestResult {
 
     let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(total);
     bytes.extend_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-    bytes.extend_from_slice(&2u16.to_le_bytes());            // e_type = ET_EXEC
-    bytes.extend_from_slice(&0x3Eu16.to_le_bytes());         // e_machine
-    bytes.extend_from_slice(&1u32.to_le_bytes());            // e_version
+    bytes.extend_from_slice(&2u16.to_le_bytes()); // e_type = ET_EXEC
+    bytes.extend_from_slice(&0x3Eu16.to_le_bytes()); // e_machine
+    bytes.extend_from_slice(&1u32.to_le_bytes()); // e_version
     bytes.extend_from_slice(&(TEXT_VADDR + 0x111).to_le_bytes()); // entry
-    bytes.extend_from_slice(&phoff.to_le_bytes());           // e_phoff
-    bytes.extend_from_slice(&0u64.to_le_bytes());            // e_shoff
-    bytes.extend_from_slice(&0u32.to_le_bytes());            // e_flags
-    bytes.extend_from_slice(&64u16.to_le_bytes());           // e_ehsize
-    bytes.extend_from_slice(&56u16.to_le_bytes());           // e_phentsize
-    bytes.extend_from_slice(&2u16.to_le_bytes());            // e_phnum
-    bytes.extend_from_slice(&0u16.to_le_bytes());            // e_shentsize
-    bytes.extend_from_slice(&0u16.to_le_bytes());            // e_shnum
-    bytes.extend_from_slice(&0u16.to_le_bytes());            // e_shstrndx
-    // .text PT_LOAD — R|X
-    bytes.extend_from_slice(&1u32.to_le_bytes());            // p_type
-    bytes.extend_from_slice(&5u32.to_le_bytes());            // p_flags = R|X
-    bytes.extend_from_slice(&text_off.to_le_bytes());        // p_offset
-    bytes.extend_from_slice(&TEXT_VADDR.to_le_bytes());      // p_vaddr
-    bytes.extend_from_slice(&TEXT_VADDR.to_le_bytes());      // p_paddr
-    bytes.extend_from_slice(&TEXT_FILESZ.to_le_bytes());     // p_filesz
-    bytes.extend_from_slice(&TEXT_FILESZ.to_le_bytes());     // p_memsz
-    bytes.extend_from_slice(&0x1000u64.to_le_bytes());       // p_align
-    // .data PT_LOAD — R|W
-    bytes.extend_from_slice(&1u32.to_le_bytes());            // p_type
-    bytes.extend_from_slice(&6u32.to_le_bytes());            // p_flags = R|W
-    bytes.extend_from_slice(&data_off.to_le_bytes());        // p_offset
-    bytes.extend_from_slice(&DATA_VADDR.to_le_bytes());      // p_vaddr
-    bytes.extend_from_slice(&DATA_VADDR.to_le_bytes());      // p_paddr
-    bytes.extend_from_slice(&DATA_FILESZ.to_le_bytes());     // p_filesz
-    bytes.extend_from_slice(&DATA_FILESZ.to_le_bytes());     // p_memsz
-    bytes.extend_from_slice(&0x1000u64.to_le_bytes());       // p_align
-    // Pad to file size, then plant per-page sentinel bytes so we can
-    // read them back through the AS to confirm the right phys was used
-    // per page.
+    bytes.extend_from_slice(&phoff.to_le_bytes()); // e_phoff
+    bytes.extend_from_slice(&0u64.to_le_bytes()); // e_shoff
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // e_flags
+    bytes.extend_from_slice(&64u16.to_le_bytes()); // e_ehsize
+    bytes.extend_from_slice(&56u16.to_le_bytes()); // e_phentsize
+    bytes.extend_from_slice(&2u16.to_le_bytes()); // e_phnum
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // e_shentsize
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // e_shnum
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // e_shstrndx
+                                                  // .text PT_LOAD — R|X
+    bytes.extend_from_slice(&1u32.to_le_bytes()); // p_type
+    bytes.extend_from_slice(&5u32.to_le_bytes()); // p_flags = R|X
+    bytes.extend_from_slice(&text_off.to_le_bytes()); // p_offset
+    bytes.extend_from_slice(&TEXT_VADDR.to_le_bytes()); // p_vaddr
+    bytes.extend_from_slice(&TEXT_VADDR.to_le_bytes()); // p_paddr
+    bytes.extend_from_slice(&TEXT_FILESZ.to_le_bytes()); // p_filesz
+    bytes.extend_from_slice(&TEXT_FILESZ.to_le_bytes()); // p_memsz
+    bytes.extend_from_slice(&0x1000u64.to_le_bytes()); // p_align
+                                                       // .data PT_LOAD — R|W
+    bytes.extend_from_slice(&1u32.to_le_bytes()); // p_type
+    bytes.extend_from_slice(&6u32.to_le_bytes()); // p_flags = R|W
+    bytes.extend_from_slice(&data_off.to_le_bytes()); // p_offset
+    bytes.extend_from_slice(&DATA_VADDR.to_le_bytes()); // p_vaddr
+    bytes.extend_from_slice(&DATA_VADDR.to_le_bytes()); // p_paddr
+    bytes.extend_from_slice(&DATA_FILESZ.to_le_bytes()); // p_filesz
+    bytes.extend_from_slice(&DATA_FILESZ.to_le_bytes()); // p_memsz
+    bytes.extend_from_slice(&0x1000u64.to_le_bytes()); // p_align
+                                                       // Pad to file size, then plant per-page sentinel bytes so we can
+                                                       // read them back through the AS to confirm the right phys was used
+                                                       // per page.
     bytes.resize(total, 0);
-    bytes[text_off as usize]            = 0x11;  // .text page 0 byte 0
-    bytes[text_off as usize + 0x1000]   = 0x12;  // .text page 1 byte 0
-    bytes[data_off as usize]            = 0x21;  // .data page 0 byte 0
-    bytes[data_off as usize + 0x1000]   = 0x22;  // .data page 1 byte 0
+    bytes[text_off as usize] = 0x11; // .text page 0 byte 0
+    bytes[text_off as usize + 0x1000] = 0x12; // .text page 1 byte 0
+    bytes[data_off as usize] = 0x21; // .data page 0 byte 0
+    bytes[data_off as usize + 0x1000] = 0x22; // .data page 1 byte 0
 
     let proc = match unsafe { load_user_process_with(&bytes, &[], &[], &[]) } {
         Ok(p) => p,
@@ -6969,15 +7683,15 @@ fn smoke_userspace_load_multi_segment() -> TestResult {
     // any prior allocations stir the freelist) is not the page-1
     // allocation.
     let checks: [(u64, u8); 4] = [
-        (TEXT_VADDR,           0x11),
-        (TEXT_VADDR + 0x1000,  0x12),
-        (DATA_VADDR,           0x21),
-        (DATA_VADDR + 0x1000,  0x22),
+        (TEXT_VADDR, 0x11),
+        (TEXT_VADDR + 0x1000, 0x12),
+        (DATA_VADDR, 0x21),
+        (DATA_VADDR + 0x1000, 0x22),
     ];
     for &(va, want) in checks.iter() {
         let phys = match unsafe { paging::translate(root, VirtAddr::new(va)) } {
             Some(p) => p,
-            None    => return TestResult::Fail("translate returned None for a mapped page"),
+            None => return TestResult::Fail("translate returned None for a mapped page"),
         };
         let got: u8 = unsafe { core::ptr::read_volatile(phys.raw() as *const u8) };
         if got != want {
@@ -6991,10 +7705,11 @@ fn smoke_userspace_load_multi_segment() -> TestResult {
     // multi-page R+W segment is independently mapped — not aliased.
     let data_p1_phys = unsafe { paging::translate(root, VirtAddr::new(DATA_VADDR + 0x1000)) }
         .expect("data page 1 mapped");
-    unsafe { core::ptr::write_volatile(data_p1_phys.raw() as *mut u32, 0xCAFEBABE); }
+    unsafe {
+        core::ptr::write_volatile(data_p1_phys.raw() as *mut u32, 0xCAFEBABE);
+    }
     let echo: u32 = unsafe {
-        let p = paging::translate(root, VirtAddr::new(DATA_VADDR + 0x1000))
-            .expect("re-translate");
+        let p = paging::translate(root, VirtAddr::new(DATA_VADDR + 0x1000)).expect("re-translate");
         core::ptr::read_volatile(p.raw() as *const u32)
     };
     if echo != 0xCAFEBABE {
@@ -7008,9 +7723,7 @@ kernel_test!(smoke_userspace_load_multi_segment);
 
 fn smoke_userspace_loader_into_address_space() -> TestResult {
     use narf_memory::{AddressSpace, PhysAddr, RegionPerms, VirtAddr};
-    use narf_userspace::{
-        load_into, ExecImage, ExecKind, LoadError, Segment, SegmentFlags,
-    };
+    use narf_userspace::{load_into, ExecImage, ExecKind, LoadError, Segment, SegmentFlags};
 
     // Empty image must refuse.
     let empty = ExecImage::empty(ExecKind::Elf64Exec);
@@ -7027,10 +7740,18 @@ fn smoke_userspace_loader_into_address_space() -> TestResult {
     let mut img = ExecImage::empty(ExecKind::Elf64Exec);
     img.entry = 0x4000;
     img.segments.push(Segment {
-        vaddr: 0x4000, file_off: 0, file_size: 0x1000, mem_size: 0x2000, flags: rx,
+        vaddr: 0x4000,
+        file_off: 0,
+        file_size: 0x1000,
+        mem_size: 0x2000,
+        flags: rx,
     });
     img.segments.push(Segment {
-        vaddr: 0x7000, file_off: 0x1000, file_size: 0x800, mem_size: 0x1000, flags: rw,
+        vaddr: 0x7000,
+        file_off: 0x1000,
+        file_size: 0x800,
+        mem_size: 0x1000,
+        flags: rw,
     });
 
     // Pool: 2 pages for segment 1 + 1 page for segment 2 = 3 frames.
@@ -7093,28 +7814,28 @@ fn smoke_userspace_parse_minimal_elf64() -> TestResult {
     // e_ident: 7F 'E' 'L' 'F', class 2 (64-bit), data 1 (LSB),
     // version 1, OS/ABI 0, abi-version 0, 7 bytes pad.
     bytes.extend_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-    bytes.extend_from_slice(&2u16.to_le_bytes());          // e_type = ET_EXEC
-    bytes.extend_from_slice(&0x3Eu16.to_le_bytes());       // e_machine = EM_X86_64 (ignored here)
-    bytes.extend_from_slice(&1u32.to_le_bytes());          // e_version
-    bytes.extend_from_slice(&0x401000u64.to_le_bytes());   // e_entry
-    bytes.extend_from_slice(&64u64.to_le_bytes());         // e_phoff
-    bytes.extend_from_slice(&0u64.to_le_bytes());          // e_shoff
-    bytes.extend_from_slice(&0u32.to_le_bytes());          // e_flags
-    bytes.extend_from_slice(&64u16.to_le_bytes());         // e_ehsize
-    bytes.extend_from_slice(&56u16.to_le_bytes());         // e_phentsize
-    bytes.extend_from_slice(&1u16.to_le_bytes());          // e_phnum
-    bytes.extend_from_slice(&0u16.to_le_bytes());          // e_shentsize
-    bytes.extend_from_slice(&0u16.to_le_bytes());          // e_shnum
-    bytes.extend_from_slice(&0u16.to_le_bytes());          // e_shstrndx
-    // Program header: PT_LOAD, flags=PF_R|PF_X (5).
-    bytes.extend_from_slice(&1u32.to_le_bytes());          // p_type = PT_LOAD
-    bytes.extend_from_slice(&5u32.to_le_bytes());          // p_flags = R|X
-    bytes.extend_from_slice(&0u64.to_le_bytes());          // p_offset
-    bytes.extend_from_slice(&0x400000u64.to_le_bytes());   // p_vaddr
-    bytes.extend_from_slice(&0x400000u64.to_le_bytes());   // p_paddr
-    bytes.extend_from_slice(&0x1000u64.to_le_bytes());     // p_filesz
-    bytes.extend_from_slice(&0x1000u64.to_le_bytes());     // p_memsz
-    bytes.extend_from_slice(&0x1000u64.to_le_bytes());     // p_align
+    bytes.extend_from_slice(&2u16.to_le_bytes()); // e_type = ET_EXEC
+    bytes.extend_from_slice(&0x3Eu16.to_le_bytes()); // e_machine = EM_X86_64 (ignored here)
+    bytes.extend_from_slice(&1u32.to_le_bytes()); // e_version
+    bytes.extend_from_slice(&0x401000u64.to_le_bytes()); // e_entry
+    bytes.extend_from_slice(&64u64.to_le_bytes()); // e_phoff
+    bytes.extend_from_slice(&0u64.to_le_bytes()); // e_shoff
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // e_flags
+    bytes.extend_from_slice(&64u16.to_le_bytes()); // e_ehsize
+    bytes.extend_from_slice(&56u16.to_le_bytes()); // e_phentsize
+    bytes.extend_from_slice(&1u16.to_le_bytes()); // e_phnum
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // e_shentsize
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // e_shnum
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // e_shstrndx
+                                                  // Program header: PT_LOAD, flags=PF_R|PF_X (5).
+    bytes.extend_from_slice(&1u32.to_le_bytes()); // p_type = PT_LOAD
+    bytes.extend_from_slice(&5u32.to_le_bytes()); // p_flags = R|X
+    bytes.extend_from_slice(&0u64.to_le_bytes()); // p_offset
+    bytes.extend_from_slice(&0x400000u64.to_le_bytes()); // p_vaddr
+    bytes.extend_from_slice(&0x400000u64.to_le_bytes()); // p_paddr
+    bytes.extend_from_slice(&0x1000u64.to_le_bytes()); // p_filesz
+    bytes.extend_from_slice(&0x1000u64.to_le_bytes()); // p_memsz
+    bytes.extend_from_slice(&0x1000u64.to_le_bytes()); // p_align
 
     let image = match parse_elf(&bytes) {
         Ok(i) => i,
@@ -7146,13 +7867,13 @@ fn smoke_userspace_parse_minimal_elf64() -> TestResult {
         _ => return TestResult::Fail("short slice should surface TooShort"),
     }
     let mut bad = bytes.clone();
-    bad[0] = 0;  // wreck ELF magic
+    bad[0] = 0; // wreck ELF magic
     match parse_elf(&bad) {
         Err(ElfError::BadMagic) => {}
         _ => return TestResult::Fail("bad magic should surface BadMagic"),
     }
     let mut bad32 = bytes.clone();
-    bad32[4] = 1;  // ELFCLASS32
+    bad32[4] = 1; // ELFCLASS32
     match parse_elf(&bad32) {
         Err(ElfError::Not64Bit) => {}
         _ => return TestResult::Fail("32-bit ELF should be rejected"),
@@ -7176,9 +7897,11 @@ fn smoke_userspace_syscall_table_roundtrip() -> TestResult {
     }
 
     let mut t = SyscallTable::new();
-    t.register(Syscall::Submit,    "submit");
+    t.register(Syscall::Submit, "submit");
     t.register(Syscall::Bootstrap, "bootstrap");
-    if t.len() != 2 { return TestResult::Fail("register did not grow table"); }
+    if t.len() != 2 {
+        return TestResult::Fail("register did not grow table");
+    }
     if t.name_of(Syscall::Submit) != Some("submit") {
         return TestResult::Fail("name_of mismatch");
     }
@@ -7198,7 +7921,10 @@ fn smoke_frame_x86_64_gdt_user_descriptors() -> TestResult {
     use core::arch::asm;
 
     #[repr(C, packed)]
-    struct GdtPtr { limit: u16, base: u64 }
+    struct GdtPtr {
+        limit: u16,
+        base: u64,
+    }
     let mut ptr = GdtPtr { limit: 0, base: 0 };
     unsafe {
         asm!("sgdt [{p}]", p = in(reg) &mut ptr,
@@ -7208,9 +7934,8 @@ fn smoke_frame_x86_64_gdt_user_descriptors() -> TestResult {
 
     // Index 5 = byte offset 0x28 → user data.
     // Index 6 = byte offset 0x30 → user code.
-    let read_access = |idx: u64| -> u8 {
-        unsafe { core::ptr::read_volatile((base + idx * 8 + 5) as *const u8) }
-    };
+    let read_access =
+        |idx: u64| -> u8 { unsafe { core::ptr::read_volatile((base + idx * 8 + 5) as *const u8) } };
 
     let udata_access = read_access(5);
     if udata_access & 0xE0 != 0xE0 {
@@ -7255,7 +7980,10 @@ fn smoke_frame_x86_64_idt_vector_128_dpl3() -> TestResult {
     use core::arch::asm;
 
     #[repr(C, packed)]
-    struct IdtPtr { limit: u16, base: u64 }
+    struct IdtPtr {
+        limit: u16,
+        base: u64,
+    }
     let mut ptr = IdtPtr { limit: 0, base: 0 };
     unsafe {
         asm!(
@@ -7299,7 +8027,7 @@ fn smoke_frame_x86_64_tss_rsp0_and_gs_base() -> TestResult {
     use core::arch::asm;
     use narf_arch::x86_64::msr;
 
-    const IA32_GS_BASE:        u32 = 0xC0000101;
+    const IA32_GS_BASE: u32 = 0xC0000101;
     const IA32_KERNEL_GS_BASE: u32 = 0xC0000102;
 
     // Confirm the task register still points at the TSS selector
@@ -7336,10 +8064,14 @@ fn smoke_frame_x86_64_tss_rsp0_and_gs_base() -> TestResult {
     }
     let kgs_mid = unsafe { msr::rdmsr(IA32_KERNEL_GS_BASE) };
     if kgs_mid != 0xDEAD_BEEF_CAFE_F00D {
-        unsafe { msr::wrmsr(IA32_KERNEL_GS_BASE, 0); }
+        unsafe {
+            msr::wrmsr(IA32_KERNEL_GS_BASE, 0);
+        }
         return TestResult::Fail("IA32_KERNEL_GS_BASE did not round-trip");
     }
-    unsafe { msr::wrmsr(IA32_KERNEL_GS_BASE, 0); }
+    unsafe {
+        msr::wrmsr(IA32_KERNEL_GS_BASE, 0);
+    }
 
     // Read `gs:[8]` — the `kernel_stack_top` slot in PerCpu. It
     // mirrors TSS.rsp0, so it should be non-zero.
@@ -7370,8 +8102,8 @@ fn smoke_frame_x86_64_int80_dispatches_through_global() -> TestResult {
     use core::arch::asm;
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_userspace::{
-        install_global, syscall::__test_clear_global, Syscall, SyscallArgs,
-        SyscallReturn, SyscallTable,
+        install_global, syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn,
+        SyscallTable,
     };
 
     static SEEN: AtomicU64 = AtomicU64::new(0);
@@ -7426,8 +8158,8 @@ fn smoke_frame_aarch64_svc_dispatches_through_global() -> TestResult {
     use core::arch::asm;
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_userspace::{
-        install_global, syscall::__test_clear_global, Syscall, SyscallArgs,
-        SyscallReturn, SyscallTable,
+        install_global, syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn,
+        SyscallTable,
     };
 
     static SEEN: AtomicU64 = AtomicU64::new(0);
@@ -7484,8 +8216,8 @@ fn smoke_userspace_syscall_dispatch_via_global() -> TestResult {
     // to it. Unregistered numbers return invalid_op.
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_userspace::{
-        install_global, kernel_syscall_entry_plain, syscall::__test_clear_global,
-        Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        install_global, kernel_syscall_entry_plain, syscall::__test_clear_global, Syscall,
+        SyscallArgs, SyscallReturn, SyscallTable,
     };
 
     __test_clear_global();
@@ -7501,7 +8233,10 @@ fn smoke_userspace_syscall_dispatch_via_global() -> TestResult {
     install_global(table);
 
     // Happy path.
-    let args = SyscallArgs { arg0: 0x41, ..SyscallArgs::default() };
+    let args = SyscallArgs {
+        arg0: 0x41,
+        ..SyscallArgs::default()
+    };
     let r = kernel_syscall_entry_plain(Syscall::Yield.raw(), &args);
     if r != SyscallReturn::ok(0x42) {
         __test_clear_global();
@@ -7550,9 +8285,14 @@ kernel_test!(smoke_userspace_syscall_dispatch_via_global);
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 struct UserModeJmpBuf {
-    rbx: u64, rbp: u64,
-    r12: u64, r13: u64, r14: u64, r15: u64,
-    rsp: u64, rip: u64,
+    rbx: u64,
+    rbp: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+    rsp: u64,
+    rip: u64,
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
@@ -7600,11 +8340,11 @@ unsafe extern "C" fn user_mode_enter(rip: u64, rsp: u64) -> ! {
     // User-code sel = 0x33, user-data sel = 0x2B.
     core::arch::naked_asm!(
         "swapgs",
-        "push 0x2B",              // SS
-        "push rsi",               // RSP (arg2)
-        "push 0x202",             // RFLAGS (IF=1)
-        "push 0x33",               // CS
-        "push rdi",               // RIP (arg1)
+        "push 0x2B",  // SS
+        "push rsi",   // RSP (arg2)
+        "push 0x202", // RFLAGS (IF=1)
+        "push 0x33",  // CS
+        "push rdi",   // RIP (arg1)
         "iretq",
     );
 }
@@ -7616,11 +8356,24 @@ unsafe extern "C" fn user_mode_enter(rip: u64, rsp: u64) -> ! {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 struct UserState {
-    r15: u64, r14: u64, r13: u64, r12: u64,
-    r11: u64, r10: u64, r9:  u64, r8:  u64,
-    rbp: u64, rdi: u64, rsi: u64, rdx: u64,
-    rcx: u64, rbx: u64, rax: u64,
-    rip: u64, rflags: u64, rsp: u64,
+    r15: u64,
+    r14: u64,
+    r13: u64,
+    r12: u64,
+    r11: u64,
+    r10: u64,
+    r9: u64,
+    r8: u64,
+    rbp: u64,
+    rdi: u64,
+    rsi: u64,
+    rdx: u64,
+    rcx: u64,
+    rbx: u64,
+    rax: u64,
+    rip: u64,
+    rflags: u64,
+    rsp: u64,
     valid: u64,
 }
 
@@ -7628,11 +8381,11 @@ struct UserState {
 #[unsafe(naked)]
 unsafe extern "C" fn user_mode_resume(_state: *const UserState) -> ! {
     core::arch::naked_asm!(
-        "push 0x2B",                       // SS
-        "push qword ptr [rdi + 8*17]",     // user RSP
-        "push qword ptr [rdi + 8*16]",     // RFLAGS
-        "push 0x33",                       // CS
-        "push qword ptr [rdi + 8*15]",     // RIP
+        "push 0x2B",                   // SS
+        "push qword ptr [rdi + 8*17]", // user RSP
+        "push qword ptr [rdi + 8*16]", // RFLAGS
+        "push 0x33",                   // CS
+        "push qword ptr [rdi + 8*15]", // RIP
         "mov r15, [rdi + 8*0]",
         "mov r14, [rdi + 8*1]",
         "mov r13, [rdi + 8*2]",
@@ -7667,14 +8420,21 @@ fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
     use narf_userspace::{
-        install_global, syscall::__test_clear_global,
-        RawSyscallHandler, Syscall, SyscallTable, TrapContext,
+        install_global, syscall::__test_clear_global, RawSyscallHandler, Syscall, SyscallTable,
+        TrapContext,
     };
 
     static SEEN_MAGIC: AtomicU64 = AtomicU64::new(0);
     static SAVED_CR3: AtomicU64 = AtomicU64::new(0);
     static mut JMP: UserModeJmpBuf = UserModeJmpBuf {
-        rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, rsp: 0, rip: 0,
+        rbx: 0,
+        rbp: 0,
+        r12: 0,
+        r13: 0,
+        r14: 0,
+        r15: 0,
+        rsp: 0,
+        rip: 0,
     };
 
     // Naked trampoline — `redirect_to_kernel`'s rip lands here.
@@ -7696,10 +8456,8 @@ fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
             SEEN_MAGIC.store(ctx.args().arg0, Ordering::Release);
             // Any RSP is OK — the trampoline overwrites RSP before
             // any stack use.
-            let _ = ctx.redirect_to_kernel(
-                resume_trampoline as usize as u64,
-                0xFFFF_FFFF_FFFF_FFF0,
-            );
+            let _ =
+                ctx.redirect_to_kernel(resume_trampoline as usize as u64, 0xFFFF_FFFF_FFFF_FFF0);
         }
     }
 
@@ -7756,7 +8514,7 @@ fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
         Err(_) => return TestResult::Fail("new_for_user failed"),
     };
 
-    const CODE_VADDR:  u64 = 0x0000_0080_0000_0000;
+    const CODE_VADDR: u64 = 0x0000_0080_0000_0000;
     const STACK_VADDR: u64 = 0x0000_0080_0000_1000;
 
     let code_frame = match narf_memory::alloc_frame() {
@@ -7769,16 +8527,22 @@ fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
     };
 
     // Map code R|W|X|USER, stack R|W|USER.
-    addr_space.map_region(Region {
-        base: VirtAddr::new(CODE_VADDR), len: 0x1000,
-        perms: RegionPerms::READ | RegionPerms::EXEC | RegionPerms::WRITE,
-        phys: alloc::vec![code_frame],
-    }).ok();
-    addr_space.map_region(Region {
-        base: VirtAddr::new(STACK_VADDR), len: 0x1000,
-        perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![stack_frame],
-    }).ok();
+    addr_space
+        .map_region(Region {
+            base: VirtAddr::new(CODE_VADDR),
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::EXEC | RegionPerms::WRITE,
+            phys: alloc::vec![code_frame],
+        })
+        .ok();
+    addr_space
+        .map_region(Region {
+            base: VirtAddr::new(STACK_VADDR),
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![stack_frame],
+        })
+        .ok();
 
     // Hand-assembled user program (21 bytes):
     //   mov rax, 105           ; Syscall::Sleep.raw()
@@ -7786,10 +8550,8 @@ fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
     //   int 0x80
     //   jmp $
     let code_bytes: [u8; 21] = [
-        0x48, 0xC7, 0xC0, 0x69, 0x00, 0x00, 0x00,
-        0x48, 0xBF, 0x0D, 0xF0, 0xDD, 0xE0, 0xFE, 0x0F, 0xDC, 0xBA,
-        0xCD, 0x80,
-        0xEB, 0xFE,
+        0x48, 0xC7, 0xC0, 0x69, 0x00, 0x00, 0x00, 0x48, 0xBF, 0x0D, 0xF0, 0xDD, 0xE0, 0xFE, 0x0F,
+        0xDC, 0xBA, 0xCD, 0x80, 0xEB, 0xFE,
     ];
     unsafe {
         core::ptr::copy_nonoverlapping(
@@ -7807,7 +8569,9 @@ fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
     }
 
     // Interrupts off across the transition.
-    unsafe { core::arch::asm!("cli"); }
+    unsafe {
+        core::arch::asm!("cli");
+    }
 
     let stack_top = STACK_VADDR + 0x1000;
     unsafe { user_mode_enter(CODE_VADDR, stack_top) }
@@ -7830,19 +8594,42 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
     use narf_userspace::{
-        install_global, syscall::__test_clear_global,
-        RawSyscallHandler, Syscall, SyscallTable, TrapContext,
+        install_global, syscall::__test_clear_global, RawSyscallHandler, Syscall, SyscallTable,
+        TrapContext,
     };
 
     static SEEN_MAGIC: AtomicU64 = AtomicU64::new(0);
     static SAVED_CR3: AtomicU64 = AtomicU64::new(0);
     static mut SAVED_USER: UserState = UserState {
-        r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
-        rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0,
-        rip: 0, rflags: 0, rsp: 0, valid: 0,
+        r15: 0,
+        r14: 0,
+        r13: 0,
+        r12: 0,
+        r11: 0,
+        r10: 0,
+        r9: 0,
+        r8: 0,
+        rbp: 0,
+        rdi: 0,
+        rsi: 0,
+        rdx: 0,
+        rcx: 0,
+        rbx: 0,
+        rax: 0,
+        rip: 0,
+        rflags: 0,
+        rsp: 0,
+        valid: 0,
     };
     static mut JMP: UserModeJmpBuf = UserModeJmpBuf {
-        rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, rsp: 0, rip: 0,
+        rbx: 0,
+        rbp: 0,
+        r12: 0,
+        r13: 0,
+        r14: 0,
+        r15: 0,
+        rsp: 0,
+        rip: 0,
     };
     // Tiny kernel stack for the resume trampoline — `user_mode_resume`
     // pushes a 5-qword iretq frame, which a 256-byte stack absorbs
@@ -7869,10 +8656,7 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
                 let p = core::ptr::addr_of_mut!(RESUME_STACK) as *mut u64;
                 p.add(32) as u64
             };
-            let _ = ctx.redirect_to_kernel(
-                resume_landing as usize as u64,
-                stack_top,
-            );
+            let _ = ctx.redirect_to_kernel(resume_landing as usize as u64, stack_top);
         }
     }
 
@@ -7882,10 +8666,8 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
     impl RawSyscallHandler for UnwindHandler {
         fn invoke(&self, ctx: &mut dyn TrapContext) {
             SEEN_MAGIC.store(ctx.args().arg0, Ordering::Release);
-            let _ = ctx.redirect_to_kernel(
-                resume_trampoline as usize as u64,
-                0xFFFF_FFFF_FFFF_FFF0,
-            );
+            let _ =
+                ctx.redirect_to_kernel(resume_trampoline as usize as u64, 0xFFFF_FFFF_FFFF_FFF0);
         }
     }
 
@@ -7960,7 +8742,7 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
         Err(_) => return TestResult::Fail("new_for_user"),
     };
 
-    const CODE_VADDR:  u64 = 0x0000_0080_0000_0000;
+    const CODE_VADDR: u64 = 0x0000_0080_0000_0000;
     const STACK_VADDR: u64 = 0x0000_0080_0000_1000;
 
     let code_frame = match narf_memory::alloc_frame() {
@@ -7972,16 +8754,22 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
         Err(_) => return TestResult::Fail("alloc stack"),
     };
 
-    addr_space.map_region(Region {
-        base: VirtAddr::new(CODE_VADDR), len: 0x1000,
-        perms: RegionPerms::READ | RegionPerms::EXEC | RegionPerms::WRITE,
-        phys: alloc::vec![code_frame],
-    }).ok();
-    addr_space.map_region(Region {
-        base: VirtAddr::new(STACK_VADDR), len: 0x1000,
-        perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![stack_frame],
-    }).ok();
+    addr_space
+        .map_region(Region {
+            base: VirtAddr::new(CODE_VADDR),
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::EXEC | RegionPerms::WRITE,
+            phys: alloc::vec![code_frame],
+        })
+        .ok();
+    addr_space
+        .map_region(Region {
+            base: VirtAddr::new(STACK_VADDR),
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![stack_frame],
+        })
+        .ok();
 
     // Hand-assembled user program (40 bytes):
     //   mov rax, 104           ; Syscall::Yield
@@ -7991,12 +8779,13 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
     //   int 0x80               ; (handler captures magic + longjmps)
     //   jmp $
     let code_bytes: [u8; 30] = [
-        0x48, 0xC7, 0xC0, 0x68, 0x00, 0x00, 0x00,                                   // mov rax, 104
-        0xCD, 0x80,                                                                 // int 0x80
-        0x48, 0xC7, 0xC0, 0x69, 0x00, 0x00, 0x00,                                   // mov rax, 105
-        0x48, 0xBF, 0xEF, 0xBE, 0xAD, 0xDE, 0xBE, 0xBA, 0xFE, 0xCA,                 // movabs rdi, 0xCAFEBABEDEADBEEF
-        0xCD, 0x80,                                                                 // int 0x80
-        0xEB, 0xFE,                                                                 // jmp $
+        0x48, 0xC7, 0xC0, 0x68, 0x00, 0x00, 0x00, // mov rax, 104
+        0xCD, 0x80, // int 0x80
+        0x48, 0xC7, 0xC0, 0x69, 0x00, 0x00, 0x00, // mov rax, 105
+        0x48, 0xBF, 0xEF, 0xBE, 0xAD, 0xDE, 0xBE, 0xBA, 0xFE,
+        0xCA, // movabs rdi, 0xCAFEBABEDEADBEEF
+        0xCD, 0x80, // int 0x80
+        0xEB, 0xFE, // jmp $
     ];
     unsafe {
         core::ptr::copy_nonoverlapping(
@@ -8013,7 +8802,9 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
         return TestResult::Fail("activate");
     }
 
-    unsafe { core::arch::asm!("cli"); }
+    unsafe {
+        core::arch::asm!("cli");
+    }
 
     let stack_top = STACK_VADDR + 0x1000;
     unsafe { user_mode_enter(CODE_VADDR, stack_top) }
@@ -8034,15 +8825,22 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
     use narf_userspace::{
-        clear_current_user_task, install_current_user_task, install_exit_hook,
-        install_global, install_yield_hook, syscall::__test_clear_global,
-        SyscallTable, UserTaskCtx, EXIT_REASON_EXITED, EXIT_REASON_YIELDED,
+        clear_current_user_task, install_current_user_task, install_exit_hook, install_global,
+        install_yield_hook, syscall::__test_clear_global, SyscallTable, UserTaskCtx,
+        EXIT_REASON_EXITED, EXIT_REASON_YIELDED,
     };
 
     static SAVED_CR3: AtomicU64 = AtomicU64::new(0);
     static OBSERVED_REASONS: AtomicU64 = AtomicU64::new(0);
     static mut JMP: UserModeJmpBuf = UserModeJmpBuf {
-        rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, rsp: 0, rip: 0,
+        rbx: 0,
+        rbp: 0,
+        r12: 0,
+        r13: 0,
+        r14: 0,
+        r15: 0,
+        rsp: 0,
+        rip: 0,
     };
 
     // Hooks: save_user_state already ran in the syscall handler.
@@ -8093,7 +8891,7 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
         Ok(a) => a,
         Err(_) => return TestResult::Fail("new_for_user"),
     };
-    const CODE_VADDR:  u64 = 0x0000_0080_0000_0000;
+    const CODE_VADDR: u64 = 0x0000_0080_0000_0000;
     const STACK_VADDR: u64 = 0x0000_0080_0000_1000;
     let code_frame = match narf_memory::alloc_frame() {
         Ok(f) => f.start_address(),
@@ -8103,26 +8901,34 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
         Ok(f) => f.start_address(),
         Err(_) => return TestResult::Fail("alloc stack"),
     };
-    addr_space.map_region(Region {
-        base: VirtAddr::new(CODE_VADDR), len: 0x1000,
-        perms: RegionPerms::READ | RegionPerms::EXEC | RegionPerms::WRITE,
-        phys: alloc::vec![code_frame],
-    }).ok();
-    addr_space.map_region(Region {
-        base: VirtAddr::new(STACK_VADDR), len: 0x1000,
-        perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![stack_frame],
-    }).ok();
+    addr_space
+        .map_region(Region {
+            base: VirtAddr::new(CODE_VADDR),
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::EXEC | RegionPerms::WRITE,
+            phys: alloc::vec![code_frame],
+        })
+        .ok();
+    addr_space
+        .map_region(Region {
+            base: VirtAddr::new(STACK_VADDR),
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![stack_frame],
+        })
+        .ok();
     let code_bytes: [u8; 20] = [
-        0x48, 0xC7, 0xC0, 0x68, 0x00, 0x00, 0x00,    // mov rax, 104 (Yield)
-        0xCD, 0x80,                                   // int 0x80
-        0x48, 0xC7, 0xC0, 0x67, 0x00, 0x00, 0x00,    // mov rax, 103 (ExitTask)
-        0xCD, 0x80,                                   // int 0x80
-        0xEB, 0xFE,                                   // jmp $
+        0x48, 0xC7, 0xC0, 0x68, 0x00, 0x00, 0x00, // mov rax, 104 (Yield)
+        0xCD, 0x80, // int 0x80
+        0x48, 0xC7, 0xC0, 0x67, 0x00, 0x00, 0x00, // mov rax, 103 (ExitTask)
+        0xCD, 0x80, // int 0x80
+        0xEB, 0xFE, // jmp $
     ];
     unsafe {
         core::ptr::copy_nonoverlapping(
-            code_bytes.as_ptr(), code_frame.raw() as *mut u8, code_bytes.len(),
+            code_bytes.as_ptr(),
+            code_frame.raw() as *mut u8,
+            code_bytes.len(),
         );
     }
     if unsafe { addr_space.materialize() }.is_err() {
@@ -8138,7 +8944,9 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
     let mut uctx = UserTaskCtx::new();
     install_current_user_task(&mut uctx as *mut _);
 
-    unsafe { core::arch::asm!("cli"); }
+    unsafe {
+        core::arch::asm!("cli");
+    }
     let stack_top = STACK_VADDR + 0x1000;
     let saved = unsafe { user_mode_setjmp(core::ptr::addr_of_mut!(JMP)) };
 
@@ -8203,8 +9011,7 @@ fn smoke_userspace_user_task_future_yield_exit() -> TestResult {
     use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
     use narf_userspace::{
         install_core_syscalls, install_global, install_user_task_hooks,
-        syscall::__test_clear_global, SyscallTable, UserProcess,
-        UserTaskFuture,
+        syscall::__test_clear_global, SyscallTable, UserProcess, UserTaskFuture,
     };
 
     static SAVED_CR3: AtomicU64 = AtomicU64::new(0);
@@ -8233,7 +9040,7 @@ fn smoke_userspace_user_task_future_yield_exit() -> TestResult {
         Ok(a) => a,
         Err(_) => return TestResult::Fail("new_for_user"),
     };
-    const CODE_VADDR:  u64 = 0x0000_0080_0000_0000;
+    const CODE_VADDR: u64 = 0x0000_0080_0000_0000;
     const STACK_VADDR: u64 = 0x0000_0080_0000_1000;
     let code_frame = match narf_memory::alloc_frame() {
         Ok(f) => f.start_address(),
@@ -8243,28 +9050,36 @@ fn smoke_userspace_user_task_future_yield_exit() -> TestResult {
         Ok(f) => f.start_address(),
         Err(_) => return TestResult::Fail("alloc stack"),
     };
-    addr_space.map_region(Region {
-        base: VirtAddr::new(CODE_VADDR), len: 0x1000,
-        perms: RegionPerms::READ | RegionPerms::EXEC | RegionPerms::WRITE,
-        phys: alloc::vec![code_frame],
-    }).ok();
-    addr_space.map_region(Region {
-        base: VirtAddr::new(STACK_VADDR), len: 0x1000,
-        perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![stack_frame],
-    }).ok();
+    addr_space
+        .map_region(Region {
+            base: VirtAddr::new(CODE_VADDR),
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::EXEC | RegionPerms::WRITE,
+            phys: alloc::vec![code_frame],
+        })
+        .ok();
+    addr_space
+        .map_region(Region {
+            base: VirtAddr::new(STACK_VADDR),
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![stack_frame],
+        })
+        .ok();
     // mov rax, 104 ; int 0x80 ; mov rax, 103 ; int 0x80 ; jmp $
     // First int 0x80 goes Yielded → re-poll → second int 0x80 Exited.
     let code_bytes: [u8; 20] = [
-        0x48, 0xC7, 0xC0, 0x68, 0x00, 0x00, 0x00,    // mov rax, 104 (Yield)
-        0xCD, 0x80,                                   // int 0x80
-        0x48, 0xC7, 0xC0, 0x67, 0x00, 0x00, 0x00,    // mov rax, 103 (ExitTask)
-        0xCD, 0x80,                                   // int 0x80
-        0xEB, 0xFE,                                   // jmp $
+        0x48, 0xC7, 0xC0, 0x68, 0x00, 0x00, 0x00, // mov rax, 104 (Yield)
+        0xCD, 0x80, // int 0x80
+        0x48, 0xC7, 0xC0, 0x67, 0x00, 0x00, 0x00, // mov rax, 103 (ExitTask)
+        0xCD, 0x80, // int 0x80
+        0xEB, 0xFE, // jmp $
     ];
     unsafe {
         core::ptr::copy_nonoverlapping(
-            code_bytes.as_ptr(), code_frame.raw() as *mut u8, code_bytes.len(),
+            code_bytes.as_ptr(),
+            code_frame.raw() as *mut u8,
+            code_bytes.len(),
         );
     }
     if unsafe { addr_space.materialize() }.is_err() {
@@ -8273,11 +9088,11 @@ fn smoke_userspace_user_task_future_yield_exit() -> TestResult {
 
     let stack_top = STACK_VADDR + 0x1000;
     let proc = UserProcess {
-        pid:           narf_userspace::alloc_pid(),
+        pid: narf_userspace::alloc_pid(),
         address_space: Arc::new(addr_space),
-        entry:         narf_userspace::EntryPoint(VirtAddr::new(CODE_VADDR)),
-        stack_top:     VirtAddr::new(stack_top),
-        fs_base:       None,
+        entry: narf_userspace::EntryPoint(VirtAddr::new(CODE_VADDR)),
+        stack_top: VirtAddr::new(stack_top),
+        fs_base: None,
     };
     let address_space_clone = proc.address_space.clone();
 
@@ -8362,8 +9177,8 @@ fn smoke_userspace_tls_round_trip() -> TestResult {
     use core::arch::naked_asm;
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_userspace::{
-        install_global, syscall::__test_clear_global,
-        RawSyscallHandler, Syscall, SyscallTable, TrapContext,
+        install_global, syscall::__test_clear_global, RawSyscallHandler, Syscall, SyscallTable,
+        TrapContext,
     };
 
     // The user code emits two syscalls:
@@ -8373,16 +9188,39 @@ fn smoke_userspace_tls_round_trip() -> TestResult {
     //   2. mov rdi, fs:[-32] ; mov rax, 105 (Sleep) ; int 0x80
     //      → captures the first qword of the file image (= 0xABABAB…),
     //        kernel longjmps back to the test.
-    static SEEN_TP:        AtomicU64 = AtomicU64::new(0);
+    static SEEN_TP: AtomicU64 = AtomicU64::new(0);
     static SEEN_FILEIMAGE: AtomicU64 = AtomicU64::new(0);
-    static SAVED_CR3:      AtomicU64 = AtomicU64::new(0);
+    static SAVED_CR3: AtomicU64 = AtomicU64::new(0);
     static mut SAVED_USER: UserState = UserState {
-        r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
-        rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0,
-        rip: 0, rflags: 0, rsp: 0, valid: 0,
+        r15: 0,
+        r14: 0,
+        r13: 0,
+        r12: 0,
+        r11: 0,
+        r10: 0,
+        r9: 0,
+        r8: 0,
+        rbp: 0,
+        rdi: 0,
+        rsi: 0,
+        rdx: 0,
+        rcx: 0,
+        rbx: 0,
+        rax: 0,
+        rip: 0,
+        rflags: 0,
+        rsp: 0,
+        valid: 0,
     };
     static mut JMP: UserModeJmpBuf = UserModeJmpBuf {
-        rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, rsp: 0, rip: 0,
+        rbx: 0,
+        rbp: 0,
+        r12: 0,
+        r13: 0,
+        r14: 0,
+        r15: 0,
+        rsp: 0,
+        rip: 0,
     };
     #[repr(C, align(16))]
     struct ResumeStack([u64; 32]);
@@ -8405,10 +9243,7 @@ fn smoke_userspace_tls_round_trip() -> TestResult {
                 let p = core::ptr::addr_of_mut!(RESUME_STACK) as *mut u64;
                 p.add(32) as u64
             };
-            let _ = ctx.redirect_to_kernel(
-                resume_landing as usize as u64,
-                stack_top,
-            );
+            let _ = ctx.redirect_to_kernel(resume_landing as usize as u64, stack_top);
         }
     }
 
@@ -8418,10 +9253,8 @@ fn smoke_userspace_tls_round_trip() -> TestResult {
     impl RawSyscallHandler for CaptureFileHandler {
         fn invoke(&self, ctx: &mut dyn TrapContext) {
             SEEN_FILEIMAGE.store(ctx.args().arg0, Ordering::Release);
-            let _ = ctx.redirect_to_kernel(
-                resume_trampoline as usize as u64,
-                0xFFFF_FFFF_FFFF_FFF0,
-            );
+            let _ =
+                ctx.redirect_to_kernel(resume_trampoline as usize as u64, 0xFFFF_FFFF_FFFF_FFF0);
         }
     }
 
@@ -8479,22 +9312,22 @@ fn smoke_userspace_tls_round_trip() -> TestResult {
     // user-mode access through it #PFs even with a USER=1 leaf. The
     // testbin's linker script lands at the same PML4 slot (one page
     // higher) for the same reason.
-    const ELF_LEN:       usize = 4096;
-    const LOAD_VADDR:    u64   = 0x0000_0080_0000_0000;
-    const CODE_OFF:      usize = 0x100;
-    const TLS_FILE_OFF:  usize = 0x200;
-    const TLS_FILE_SIZE: u64   = 32;
-    const TLS_MEM_SIZE:  u64   = 32;
-    const TLS_ALIGN:     u64   = 8;
+    const ELF_LEN: usize = 4096;
+    const LOAD_VADDR: u64 = 0x0000_0080_0000_0000;
+    const CODE_OFF: usize = 0x100;
+    const TLS_FILE_OFF: usize = 0x200;
+    const TLS_FILE_SIZE: u64 = 32;
+    const TLS_MEM_SIZE: u64 = 32;
+    const TLS_ALIGN: u64 = 8;
 
     let mut elf = alloc::vec![0u8; ELF_LEN];
 
     // ── ELF header ───────────────────────────────────────────────
     elf[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
-    elf[4]  = 2;          // EI_CLASS = ELFCLASS64
-    elf[5]  = 1;          // EI_DATA  = ELFDATA2LSB
-    elf[6]  = 1;          // EI_VERSION = EV_CURRENT
-    // e_type = ET_EXEC (2)
+    elf[4] = 2; // EI_CLASS = ELFCLASS64
+    elf[5] = 1; // EI_DATA  = ELFDATA2LSB
+    elf[6] = 1; // EI_VERSION = EV_CURRENT
+                // e_type = ET_EXEC (2)
     elf[0x10..0x12].copy_from_slice(&2u16.to_le_bytes());
     // e_machine = EM_X86_64 (62)
     elf[0x12..0x14].copy_from_slice(&62u16.to_le_bytes());
@@ -8508,31 +9341,31 @@ fn smoke_userspace_tls_round_trip() -> TestResult {
     elf[0x28..0x30].copy_from_slice(&0u64.to_le_bytes());
     // e_flags = 0; e_ehsize = 64; e_phentsize = 56; e_phnum = 2;
     // e_shentsize = 0; e_shnum = 0; e_shstrndx = 0.
-    elf[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());     // e_ehsize
-    elf[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());     // e_phentsize
-    elf[0x38..0x3A].copy_from_slice(&2u16.to_le_bytes());      // e_phnum
+    elf[0x34..0x36].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+    elf[0x36..0x38].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+    elf[0x38..0x3A].copy_from_slice(&2u16.to_le_bytes()); // e_phnum
 
     // ── Program header 0 — PT_LOAD ──────────────────────────────
     let ph0 = 64;
-    elf[ph0      ..ph0 +  4].copy_from_slice(&1u32.to_le_bytes());            // p_type = PT_LOAD
-    elf[ph0 +  4 ..ph0 +  8].copy_from_slice(&7u32.to_le_bytes());            // p_flags = R+W+X
-    elf[ph0 +  8 ..ph0 + 16].copy_from_slice(&0u64.to_le_bytes());            // p_offset
-    elf[ph0 + 16 ..ph0 + 24].copy_from_slice(&LOAD_VADDR.to_le_bytes());      // p_vaddr
-    elf[ph0 + 24 ..ph0 + 32].copy_from_slice(&LOAD_VADDR.to_le_bytes());      // p_paddr
-    elf[ph0 + 32 ..ph0 + 40].copy_from_slice(&(ELF_LEN as u64).to_le_bytes());// p_filesz
-    elf[ph0 + 40 ..ph0 + 48].copy_from_slice(&(ELF_LEN as u64).to_le_bytes());// p_memsz
-    elf[ph0 + 48 ..ph0 + 56].copy_from_slice(&0x1000u64.to_le_bytes());       // p_align
+    elf[ph0..ph0 + 4].copy_from_slice(&1u32.to_le_bytes()); // p_type = PT_LOAD
+    elf[ph0 + 4..ph0 + 8].copy_from_slice(&7u32.to_le_bytes()); // p_flags = R+W+X
+    elf[ph0 + 8..ph0 + 16].copy_from_slice(&0u64.to_le_bytes()); // p_offset
+    elf[ph0 + 16..ph0 + 24].copy_from_slice(&LOAD_VADDR.to_le_bytes()); // p_vaddr
+    elf[ph0 + 24..ph0 + 32].copy_from_slice(&LOAD_VADDR.to_le_bytes()); // p_paddr
+    elf[ph0 + 32..ph0 + 40].copy_from_slice(&(ELF_LEN as u64).to_le_bytes()); // p_filesz
+    elf[ph0 + 40..ph0 + 48].copy_from_slice(&(ELF_LEN as u64).to_le_bytes()); // p_memsz
+    elf[ph0 + 48..ph0 + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
 
     // ── Program header 1 — PT_TLS ───────────────────────────────
     let ph1 = 64 + 56;
-    elf[ph1      ..ph1 +  4].copy_from_slice(&7u32.to_le_bytes());            // p_type = PT_TLS
-    elf[ph1 +  4 ..ph1 +  8].copy_from_slice(&4u32.to_le_bytes());            // p_flags = R
-    elf[ph1 +  8 ..ph1 + 16].copy_from_slice(&(TLS_FILE_OFF as u64).to_le_bytes()); // p_offset
-    elf[ph1 + 16 ..ph1 + 24].copy_from_slice(&(LOAD_VADDR + TLS_FILE_OFF as u64).to_le_bytes()); // p_vaddr (link-time)
-    elf[ph1 + 24 ..ph1 + 32].copy_from_slice(&(LOAD_VADDR + TLS_FILE_OFF as u64).to_le_bytes()); // p_paddr
-    elf[ph1 + 32 ..ph1 + 40].copy_from_slice(&TLS_FILE_SIZE.to_le_bytes());   // p_filesz
-    elf[ph1 + 40 ..ph1 + 48].copy_from_slice(&TLS_MEM_SIZE.to_le_bytes());    // p_memsz
-    elf[ph1 + 48 ..ph1 + 56].copy_from_slice(&TLS_ALIGN.to_le_bytes());       // p_align
+    elf[ph1..ph1 + 4].copy_from_slice(&7u32.to_le_bytes()); // p_type = PT_TLS
+    elf[ph1 + 4..ph1 + 8].copy_from_slice(&4u32.to_le_bytes()); // p_flags = R
+    elf[ph1 + 8..ph1 + 16].copy_from_slice(&(TLS_FILE_OFF as u64).to_le_bytes()); // p_offset
+    elf[ph1 + 16..ph1 + 24].copy_from_slice(&(LOAD_VADDR + TLS_FILE_OFF as u64).to_le_bytes()); // p_vaddr (link-time)
+    elf[ph1 + 24..ph1 + 32].copy_from_slice(&(LOAD_VADDR + TLS_FILE_OFF as u64).to_le_bytes()); // p_paddr
+    elf[ph1 + 32..ph1 + 40].copy_from_slice(&TLS_FILE_SIZE.to_le_bytes()); // p_filesz
+    elf[ph1 + 40..ph1 + 48].copy_from_slice(&TLS_MEM_SIZE.to_le_bytes()); // p_memsz
+    elf[ph1 + 48..ph1 + 56].copy_from_slice(&TLS_ALIGN.to_le_bytes()); // p_align
 
     // ── TLS file image — 32 bytes of 0xAB sentinel ──────────────
     for i in 0..TLS_FILE_SIZE as usize {
@@ -8551,34 +9384,32 @@ fn smoke_userspace_tls_round_trip() -> TestResult {
     //   CD 80                         int 0x80
     //   EB FE                         jmp $
     let code: [u8; 38] = [
-        0x64, 0x48, 0x8B, 0x3C, 0x25, 0x00, 0x00, 0x00, 0x00,    // mov rdi, fs:[0]
-        0x48, 0xC7, 0xC0, 0x68, 0x00, 0x00, 0x00,                // mov rax, 104
-        0xCD, 0x80,                                              // int 0x80
-        0x64, 0x48, 0x8B, 0x3C, 0x25, 0xE0, 0xFF, 0xFF, 0xFF,    // mov rdi, fs:[-32]
-        0x48, 0xC7, 0xC0, 0x69, 0x00, 0x00, 0x00,                // mov rax, 105
-        0xCD, 0x80,                                              // int 0x80
-        0xEB, 0xFE,                                              // jmp $ (unreached)
+        0x64, 0x48, 0x8B, 0x3C, 0x25, 0x00, 0x00, 0x00, 0x00, // mov rdi, fs:[0]
+        0x48, 0xC7, 0xC0, 0x68, 0x00, 0x00, 0x00, // mov rax, 104
+        0xCD, 0x80, // int 0x80
+        0x64, 0x48, 0x8B, 0x3C, 0x25, 0xE0, 0xFF, 0xFF, 0xFF, // mov rdi, fs:[-32]
+        0x48, 0xC7, 0xC0, 0x69, 0x00, 0x00, 0x00, // mov rax, 105
+        0xCD, 0x80, // int 0x80
+        0xEB, 0xFE, // jmp $ (unreached)
     ];
     elf[CODE_OFF..CODE_OFF + code.len()].copy_from_slice(&code);
 
     // ── Drive the loader + verify the integration site ──────────
-    let proc = match unsafe {
-        narf_userspace::load_user_process_with(&elf[..], &[], &[], &[])
-    } {
+    let proc = match unsafe { narf_userspace::load_user_process_with(&elf[..], &[], &[], &[]) } {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("load_user_process_with"),
     };
 
     let fs_base = match proc.fs_base {
         Some(v) => v,
-        None    => return TestResult::Fail("fs_base not set on PT_TLS binary"),
+        None => return TestResult::Fail("fs_base not set on PT_TLS binary"),
     };
 
     // Install the two syscall handlers *after* the loader runs so
     // it (which uses the global table for nothing) doesn't matter
     // either way; what matters is the table is set before iretq.
     let mut t = SyscallTable::new();
-    t.install_raw(Syscall::Yield, "tls-tp",   CaptureTpHandler);
+    t.install_raw(Syscall::Yield, "tls-tp", CaptureTpHandler);
     t.install_raw(Syscall::Sleep, "tls-file", CaptureFileHandler);
     install_global(t);
 
@@ -8603,7 +9434,7 @@ fn smoke_userspace_tls_round_trip() -> TestResult {
             core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
         }
         __test_clear_global();
-        let tp   = SEEN_TP.load(Ordering::Acquire);
+        let tp = SEEN_TP.load(Ordering::Acquire);
         let file = SEEN_FILEIMAGE.load(Ordering::Acquire);
         if tp != fs_base {
             return TestResult::Fail("fs:[0] != fs_base (TCB self-pointer wrong)");
@@ -8621,11 +9452,15 @@ fn smoke_userspace_tls_round_trip() -> TestResult {
     if proc.address_space.activate().is_err() {
         return TestResult::Fail("activate");
     }
-    unsafe { narf_scheduler::set_user_fs_base(fs_base); }
-    unsafe { core::arch::asm!("cli"); }
+    unsafe {
+        narf_scheduler::set_user_fs_base(fs_base);
+    }
+    unsafe {
+        core::arch::asm!("cli");
+    }
 
     let entry = proc.entry.0.as_u64();
-    let rsp   = proc.stack_top.as_u64();
+    let rsp = proc.stack_top.as_u64();
     unsafe { user_mode_enter(entry, rsp) }
 }
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
@@ -8651,13 +9486,20 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
     use core::arch::naked_asm;
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_userspace::{
-        clear_exit_landing, install_address_space_lookup, install_core_syscalls,
-        install_global, load_user_process_with, set_exit_landing,
-        syscall::__test_clear_global, AuxEntry, SyscallTable,
+        clear_exit_landing, install_address_space_lookup, install_core_syscalls, install_global,
+        load_user_process_with, set_exit_landing, syscall::__test_clear_global, AuxEntry,
+        SyscallTable,
     };
 
     static mut JMP2: UserModeJmpBuf = UserModeJmpBuf {
-        rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, rsp: 0, rip: 0,
+        rbx: 0,
+        rbp: 0,
+        r12: 0,
+        r13: 0,
+        r14: 0,
+        r15: 0,
+        rsp: 0,
+        rip: 0,
     };
     static SAVED_CR3_2: AtomicU64 = AtomicU64::new(0);
 
@@ -8718,8 +9560,8 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
         use alloc::sync::Arc;
         use narf_capabilities::{Cap, Grant};
         use narf_filesystem::{
-            bootstrap_mount_authority, registry, DirEntry, DirOps, FileOps,
-            FsFuture, FsInstance, MountPoint, Stat,
+            bootstrap_mount_authority, registry, DirEntry, DirOps, FileOps, FsFuture, FsInstance,
+            MountPoint, Stat,
         };
         static FILE_BYTES: &[u8] = b"hello-fs";
         struct StubFile;
@@ -8727,7 +9569,9 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
             fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
                 Box::pin(async move {
                     let off = offset as usize;
-                    if off >= FILE_BYTES.len() { return Ok(0); }
+                    if off >= FILE_BYTES.len() {
+                        return Ok(0);
+                    }
                     let n = core::cmp::min(buf.len(), FILE_BYTES.len() - off);
                     buf[..n].copy_from_slice(&FILE_BYTES[off..off + n]);
                     Ok(n)
@@ -8738,15 +9582,22 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
                 Box::pin(async move { Ok(n) })
             }
             fn stat(&self) -> Stat {
-                Stat { size: FILE_BYTES.len() as u64, blocks: 1,
-                       mode: narf_filesystem::Mode::FILE_RO,
-                       mtime_cycles: 0 }
+                Stat {
+                    size: FILE_BYTES.len() as u64,
+                    blocks: 1,
+                    mode: narf_filesystem::Mode::FILE_RO,
+                    mtime_cycles: 0,
+                }
             }
         }
         struct StubDir;
         impl DirOps for StubDir {
             fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
-                if name == "f" { Some(Arc::new(StubFile)) } else { None }
+                if name == "f" {
+                    Some(Arc::new(StubFile))
+                } else {
+                    None
+                }
             }
             fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
                 Box::new(core::iter::empty())
@@ -8754,8 +9605,12 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
         }
         struct StubFs;
         impl FsInstance for StubFs {
-            fn root(&self) -> Arc<dyn DirOps> { Arc::new(StubDir) }
-            fn name(&self) -> &str { "testbin_stub" }
+            fn root(&self) -> Arc<dyn DirOps> {
+                Arc::new(StubDir)
+            }
+            fn name(&self) -> &str {
+                "testbin_stub"
+            }
         }
         let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
         let _ = registry().mount(&auth, "/testbin", StubFs);
@@ -8767,12 +9622,8 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
     // FB syscall vtable: the boot path's Stage::Subsys initcall
     // installs this; the test runner doesn't invoke initcalls so
     // we wire the vtable here directly.
-    narf_userspace::handlers::install_fb_syscall_vtable(
-        narf_fb::registry::syscall_vtable(),
-    );
-    narf_userspace::handlers::install_shmem_syscall_vtable(
-        narf_shmem::syscall_vtable(),
-    );
+    narf_userspace::handlers::install_fb_syscall_vtable(narf_fb::registry::syscall_vtable());
+    narf_userspace::handlers::install_shmem_syscall_vtable(narf_shmem::syscall_vtable());
 
     // Snapshot CR3 for restore post-unwind.
     let original_cr3: u64;
@@ -8823,8 +9674,7 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
             let cap = narf_fb::bootstrap_writer();
             if let Ok(fb_writer) = narf_fb::FbWriter::new(cap) {
                 let (ok_n, _err_n) = narf_fb::drain_once(&fb_writer);
-                let _ = writeln!(w,
-                    "  fb: post-testbin drain executed {} cmd(s)", ok_n);
+                let _ = writeln!(w, "  fb: post-testbin drain executed {} cmd(s)", ok_n);
             }
         }
         let _ = writeln!(w, "  [ OK ] smoke_frame_x86_64_run_narf_testbin");
@@ -8841,7 +9691,7 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
     // CPL=3 and verify [rsp]=argc, argv[0]="narf-testbin".
     let argv = ["narf-testbin", "argA"];
     let envp: [&str; 0] = [];
-    let aux  = [AuxEntry::Pagesz(4096)];
+    let aux = [AuxEntry::Pagesz(4096)];
     let proc = match unsafe { load_user_process_with(NARF_TESTBIN_ELF, &argv, &envp, &aux) } {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("load_user_process_with failed on narf-testbin"),
@@ -8855,7 +9705,9 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
         return TestResult::Fail("activate failed");
     }
 
-    unsafe { core::arch::asm!("cli"); }
+    unsafe {
+        core::arch::asm!("cli");
+    }
     unsafe { user_mode_enter(proc.entry.0.as_u64(), proc.stack_top.as_u64()) }
 }
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-testbin"))]
@@ -8871,21 +9723,27 @@ kernel_test!(smoke_frame_x86_64_run_narf_testbin);
 // the validate's `main`.
 
 #[cfg(all(target_arch = "x86_64", feature = "narf-libc-validate"))]
-const NARF_LIBC_VALIDATE_ELF: &[u8] =
-    include_bytes!(env!("NARF_LIBC_VALIDATE_ELF_X86_64"));
+const NARF_LIBC_VALIDATE_ELF: &[u8] = include_bytes!(env!("NARF_LIBC_VALIDATE_ELF_X86_64"));
 
 #[cfg(all(target_arch = "x86_64", feature = "narf-libc-validate"))]
 fn smoke_frame_x86_64_run_narf_libc_validate() -> TestResult {
     use core::arch::naked_asm;
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_userspace::{
-        clear_exit_landing, install_address_space_lookup, install_core_syscalls,
-        install_global, load_user_process_with, set_exit_landing,
-        syscall::__test_clear_global, AuxEntry, SyscallTable,
+        clear_exit_landing, install_address_space_lookup, install_core_syscalls, install_global,
+        load_user_process_with, set_exit_landing, syscall::__test_clear_global, AuxEntry,
+        SyscallTable,
     };
 
     static mut JMP3: UserModeJmpBuf = UserModeJmpBuf {
-        rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, rsp: 0, rip: 0,
+        rbx: 0,
+        rbp: 0,
+        r12: 0,
+        r13: 0,
+        r14: 0,
+        r15: 0,
+        rsp: 0,
+        rip: 0,
     };
     static SAVED_CR3_3: AtomicU64 = AtomicU64::new(0);
 
@@ -9007,24 +9865,21 @@ fn smoke_frame_x86_64_run_narf_libc_validate() -> TestResult {
     match narf_filesystem::registry().mount(
         &auth_v,
         "/tmp",
-        narf_filesystem::MemFs::with_seeds(
-            "validate-tmp",
-            &[("removable", b"bye")],
-        ),
+        narf_filesystem::MemFs::with_seeds("validate-tmp", &[("removable", b"bye")]),
     ) {
         Ok(_) => {}
         Err(narf_filesystem::FsError::Busy) => {
             // Re-seed the existing mount so the probe finds the file.
-            let _ = narf_filesystem::registry().resolve_parent_absolute(
-                "/tmp/removable",
-                |_fs, parent, _leaf| parent.create("removable"),
-            );
+            let _ = narf_filesystem::registry()
+                .resolve_parent_absolute("/tmp/removable", |_fs, parent, _leaf| {
+                    parent.create("removable")
+                });
         }
         Err(e) => {
             return TestResult::Fail(match e {
                 narf_filesystem::FsError::PermissionDenied => "tmp mount: perm",
-                narf_filesystem::FsError::ReadOnly         => "tmp mount: ro",
-                _                                          => "tmp mount: other",
+                narf_filesystem::FsError::ReadOnly => "tmp mount: ro",
+                _ => "tmp mount: other",
             });
         }
     }
@@ -9090,10 +9945,8 @@ fn smoke_frame_x86_64_run_narf_libc_validate() -> TestResult {
     }
     let argv = ["narf-libc-validate"];
     let envp: [&str; 0] = [];
-    let aux  = [AuxEntry::Pagesz(4096)];
-    let proc = match unsafe {
-        load_user_process_with(NARF_LIBC_VALIDATE_ELF, &argv, &envp, &aux)
-    } {
+    let aux = [AuxEntry::Pagesz(4096)];
+    let proc = match unsafe { load_user_process_with(NARF_LIBC_VALIDATE_ELF, &argv, &envp, &aux) } {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("load_user_process_with failed on narf-libc-validate"),
     };
@@ -9104,7 +9957,9 @@ fn smoke_frame_x86_64_run_narf_libc_validate() -> TestResult {
         return TestResult::Fail("activate failed");
     }
 
-    unsafe { core::arch::asm!("cli"); }
+    unsafe {
+        core::arch::asm!("cli");
+    }
     unsafe { user_mode_enter(proc.entry.0.as_u64(), proc.stack_top.as_u64()) }
 }
 #[cfg(all(target_arch = "x86_64", feature = "narf-libc-validate"))]
@@ -9118,8 +9973,8 @@ fn smoke_userspace_raw_handler_dispatch() -> TestResult {
     // live trap frame.
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_userspace::{
-        install_global, syscall::__test_clear_global,
-        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+        install_global, syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn,
+        SyscallTable, TrapContext,
     };
 
     __test_clear_global();
@@ -9136,13 +9991,17 @@ fn smoke_userspace_raw_handler_dispatch() -> TestResult {
     // Synthetic TrapContext — not a live trap, just exercising the
     // dispatch path.
     struct FakeCtx {
-        args:    SyscallArgs,
-        ret:     Option<SyscallReturn>,
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
         redirect_attempts: u32,
     }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
         fn redirect_to_kernel(&mut self, _rip: u64, _rsp: u64) -> bool {
             self.redirect_attempts += 1;
             true
@@ -9150,7 +10009,10 @@ fn smoke_userspace_raw_handler_dispatch() -> TestResult {
     }
 
     let mut ctx = FakeCtx {
-        args: SyscallArgs { arg0: 5, ..Default::default() },
+        args: SyscallArgs {
+            arg0: 5,
+            ..Default::default()
+        },
         ret: None,
         redirect_attempts: 0,
     };
@@ -9173,7 +10035,11 @@ fn smoke_userspace_raw_handler_dispatch() -> TestResult {
         ctx.set_return(SyscallReturn::ok(222));
     });
     install_global(t2);
-    let mut ctx2 = FakeCtx { args: SyscallArgs::default(), ret: None, redirect_attempts: 0 };
+    let mut ctx2 = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+        redirect_attempts: 0,
+    };
     narf_userspace::kernel_syscall_entry(Syscall::Sleep.raw(), &mut ctx2);
     if ctx2.ret != Some(SyscallReturn::ok(222)) {
         __test_clear_global();
@@ -9216,7 +10082,11 @@ fn smoke_userspace_process_id_and_aux() -> TestResult {
     let mut img = ExecImage::empty(ExecKind::Elf64Dyn);
     img.entry = 0x4000;
     img.segments.push(Segment {
-        vaddr: 0x4000, file_off: 0, file_size: 0x1000, mem_size: 0x1000, flags: rx,
+        vaddr: 0x4000,
+        file_off: 0,
+        file_size: 0x1000,
+        mem_size: 0x1000,
+        flags: rx,
     });
     if img.entry != 0x4000 || img.segments.len() != 1 {
         return TestResult::Fail("ExecImage assembly broke");
@@ -9273,12 +10143,14 @@ fn smoke_obs_peek_provider_registration() -> TestResult {
 
     struct TestProvider;
     impl Provider for TestProvider {
-        fn name(&self) -> &'static str { "test" }
+        fn name(&self) -> &'static str {
+            "test"
+        }
         fn sample(&self, out: &mut Vec<MetricSample>) {
             out.push(MetricSample {
                 provider: alloc::string::String::from("test"),
-                name:     alloc::string::String::from("counter"),
-                value:    MetricValue::U64(42),
+                name: alloc::string::String::from("counter"),
+                value: MetricValue::U64(42),
             });
         }
     }
@@ -9305,9 +10177,7 @@ kernel_test!(smoke_obs_peek_provider_registration);
 
 fn smoke_time_wall_offset_and_leap_smear() -> TestResult {
     use narf_capabilities::{Cap, Write};
-    use narf_time::{
-        begin_leap_smear, now_wall, set_wall_offset, wall, WallClock, WallError,
-    };
+    use narf_time::{begin_leap_smear, now_wall, set_wall_offset, wall, WallClock, WallError};
 
     wall::__test_reset();
 
@@ -9363,12 +10233,14 @@ fn smoke_power_thermal_zone_transitions() -> TestResult {
     };
     if thermal::subscribe(&cap, |ev| {
         let code = match ev {
-            ThermalEvent::Normal   { .. } => 1,
-            ThermalEvent::Warm     { .. } => 2,
+            ThermalEvent::Normal { .. } => 1,
+            ThermalEvent::Warm { .. } => 2,
             ThermalEvent::Critical { .. } => 3,
         };
         LAST.store(code, Ordering::Relaxed);
-    }).is_err() {
+    })
+    .is_err()
+    {
         return TestResult::Fail("subscribe failed");
     }
 
@@ -9440,7 +10312,9 @@ fn smoke_block_mq_round_robins_across_lanes() -> TestResult {
     s.enqueue_on(0, make_block_request(BlockOp::Read, 0x0A), u64::MAX);
     s.enqueue_on(1, make_block_request(BlockOp::Read, 0x1B), u64::MAX);
     s.enqueue_on(2, make_block_request(BlockOp::Read, 0x2C), u64::MAX);
-    if s.len() != 3 { return TestResult::Fail("multi-queue len mismatch"); }
+    if s.len() != 3 {
+        return TestResult::Fail("multi-queue len mismatch");
+    }
 
     let first = s.dequeue_next(0).expect("pending").user_tag;
     let second = s.dequeue_next(0).expect("pending").user_tag;
@@ -9462,7 +10336,10 @@ fn smoke_block_deadline_tags_are_monotonic() -> TestResult {
 
     let s = DeadlineScheduler::new();
     let t1 = s.enqueue(make_block_request(BlockOp::Read, 0), u64::MAX);
-    let t2 = s.enqueue(make_block_request(BlockOp::Write { fua: false }, 1), u64::MAX);
+    let t2 = s.enqueue(
+        make_block_request(BlockOp::Write { fua: false }, 1),
+        u64::MAX,
+    );
     let t3 = s.enqueue(make_block_request(BlockOp::Read, 2), u64::MAX);
     if !(t1 < t2 && t2 < t3) {
         return TestResult::Fail("enqueue tags not monotonically assigned");
@@ -9475,15 +10352,24 @@ fn smoke_block_deadline_tags_are_monotonic() -> TestResult {
 kernel_test!(smoke_block_deadline_tags_are_monotonic);
 
 fn smoke_userspace_getrandom_fills_buffer() -> TestResult {
-    use narf_userspace::{install_core_syscalls, install_global,
-                         kernel_syscall_entry, syscall::__test_clear_global,
-                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
-                         TrapContext};
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    use narf_userspace::{
+        install_core_syscalls, install_global, kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     __test_clear_global();
@@ -9508,7 +10394,9 @@ fn smoke_userspace_getrandom_fills_buffer() -> TestResult {
         Some(r) if r.status == SyscallReturn::OK => r.value,
         _ => return TestResult::Fail("getrandom did not return OK"),
     };
-    if n != 16 { return TestResult::Fail("getrandom byte-count != 16"); }
+    if n != 16 {
+        return TestResult::Fail("getrandom byte-count != 16");
+    }
     if buf.iter().all(|&b| b == 0) {
         return TestResult::Fail("getrandom buffer is all zeros");
     }
@@ -9557,16 +10445,25 @@ fn smoke_userspace_listdir_walks_memfs() -> TestResult {
     // by one; the kernel re-snapshots each invocation. End-of-
     // directory surfaces as `value = 0`.
     use narf_filesystem as fs;
-    use narf_userspace::{install_core_syscalls, install_global,
-                         kernel_syscall_entry, syscall::__test_clear_global,
-                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
-                         TrapContext};
+    use narf_userspace::{
+        install_core_syscalls, install_global, kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
 
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     __test_clear_global();
@@ -9587,11 +10484,20 @@ fn smoke_userspace_listdir_walks_memfs() -> TestResult {
     );
 
     fn one_call(path: &str, cursor: u64, out: &mut [u8]) -> Option<SyscallReturn> {
-        struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+        struct FakeCtx {
+            args: SyscallArgs,
+            ret: Option<SyscallReturn>,
+        }
         impl TrapContext for FakeCtx {
-            fn args(&self) -> &SyscallArgs { &self.args }
-            fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-            fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+            fn args(&self) -> &SyscallArgs {
+                &self.args
+            }
+            fn set_return(&mut self, r: SyscallReturn) {
+                self.ret = Some(r);
+            }
+            fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+                false
+            }
         }
         let mut ctx = FakeCtx {
             args: SyscallArgs {
@@ -9609,10 +10515,14 @@ fn smoke_userspace_listdir_walks_memfs() -> TestResult {
     }
 
     fn parse(out: &[u8], n: usize) -> Option<(alloc::string::String, u32)> {
-        if n < 8 { return None; }
+        if n < 8 {
+            return None;
+        }
         let name_len = u32::from_le_bytes(out[0..4].try_into().ok()?) as usize;
-        let ftype    = u32::from_le_bytes(out[4..8].try_into().ok()?);
-        if 8 + name_len > n { return None; }
+        let ftype = u32::from_le_bytes(out[4..8].try_into().ok()?);
+        if 8 + name_len > n {
+            return None;
+        }
         let name = core::str::from_utf8(&out[8..8 + name_len]).ok()?.into();
         Some((name, ftype))
     }
@@ -9639,9 +10549,11 @@ fn smoke_userspace_listdir_walks_memfs() -> TestResult {
         }
         let (name, ft) = match parse(&buf, n) {
             Some(p) => p,
-            None    => return TestResult::Fail("listdir wire-decode failed"),
+            None => return TestResult::Fail("listdir wire-decode failed"),
         };
-        if ft != 0 { types_ok = false; }   // 0 = File
+        if ft != 0 {
+            types_ok = false;
+        } // 0 = File
         names.push(name);
     }
 
@@ -9663,16 +10575,25 @@ fn smoke_userspace_clock_gettime_distinguishes_clocks() -> TestResult {
     //   0 = CLOCK_REALTIME  (wall via time::now_wall)
     //   1 = CLOCK_MONOTONIC (monotonic_ns)
     //   anything else → InvalidOp.
-    use narf_userspace::{install_core_syscalls, install_global,
-                         kernel_syscall_entry, syscall::__test_clear_global,
-                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
-                         TrapContext};
+    use narf_userspace::{
+        install_core_syscalls, install_global, kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
 
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     __test_clear_global();
@@ -9685,7 +10606,11 @@ fn smoke_userspace_clock_gettime_distinguishes_clocks() -> TestResult {
 
     // CLOCK_MONOTONIC: read twice, expect non-decreasing.
     let mut ctx = FakeCtx {
-        args: SyscallArgs { arg0: 1, arg1: buf_addr, ..SyscallArgs::default() },
+        args: SyscallArgs {
+            arg0: 1,
+            arg1: buf_addr,
+            ..SyscallArgs::default()
+        },
         ret: None,
     };
     kernel_syscall_entry(Syscall::ClockGetTime.raw(), &mut ctx);
@@ -9695,7 +10620,11 @@ fn smoke_userspace_clock_gettime_distinguishes_clocks() -> TestResult {
     }
 
     let mut ctx = FakeCtx {
-        args: SyscallArgs { arg0: 1, arg1: buf_addr, ..SyscallArgs::default() },
+        args: SyscallArgs {
+            arg0: 1,
+            arg1: buf_addr,
+            ..SyscallArgs::default()
+        },
         ret: None,
     };
     kernel_syscall_entry(Syscall::ClockGetTime.raw(), &mut ctx);
@@ -9706,7 +10635,11 @@ fn smoke_userspace_clock_gettime_distinguishes_clocks() -> TestResult {
 
     // CLOCK_REALTIME: must succeed and produce a non-negative time.
     let mut ctx = FakeCtx {
-        args: SyscallArgs { arg0: 0, arg1: buf_addr, ..SyscallArgs::default() },
+        args: SyscallArgs {
+            arg0: 0,
+            arg1: buf_addr,
+            ..SyscallArgs::default()
+        },
         ret: None,
     };
     kernel_syscall_entry(Syscall::ClockGetTime.raw(), &mut ctx);
@@ -9719,7 +10652,11 @@ fn smoke_userspace_clock_gettime_distinguishes_clocks() -> TestResult {
 
     // Bogus clock id rejected with InvalidOp status.
     let mut ctx = FakeCtx {
-        args: SyscallArgs { arg0: 99, arg1: buf_addr, ..SyscallArgs::default() },
+        args: SyscallArgs {
+            arg0: 99,
+            arg1: buf_addr,
+            ..SyscallArgs::default()
+        },
         ret: None,
     };
     kernel_syscall_entry(Syscall::ClockGetTime.raw(), &mut ctx);
@@ -9737,16 +10674,25 @@ fn smoke_userspace_clock_gettime_distinguishes_clocks() -> TestResult {
 kernel_test!(smoke_userspace_clock_gettime_distinguishes_clocks);
 
 fn smoke_userspace_setuid_setgid_round_trip() -> TestResult {
-    use narf_userspace::{install_core_syscalls, install_global,
-                         kernel_syscall_entry, syscall::__test_clear_global,
-                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
-                         TrapContext, uidgid_init};
+    use narf_userspace::{
+        install_core_syscalls, install_global, kernel_syscall_entry, syscall::__test_clear_global,
+        uidgid_init, Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
 
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     __test_clear_global();
@@ -9757,7 +10703,10 @@ fn smoke_userspace_setuid_setgid_round_trip() -> TestResult {
 
     fn call(s: Syscall, arg0: u64) -> Option<SyscallReturn> {
         let mut ctx = FakeCtx {
-            args: SyscallArgs { arg0, ..SyscallArgs::default() },
+            args: SyscallArgs {
+                arg0,
+                ..SyscallArgs::default()
+            },
             ret: None,
         };
         kernel_syscall_entry(s.raw(), &mut ctx);
@@ -9794,17 +10743,26 @@ fn smoke_userspace_setuid_setgid_round_trip() -> TestResult {
 kernel_test!(smoke_userspace_setuid_setgid_round_trip);
 
 fn smoke_userspace_hostname_round_trip() -> TestResult {
-    use narf_userspace::{install_core_syscalls, install_global,
-                         hostname_init, kernel_syscall_entry,
-                         syscall::__test_clear_global,
-                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
-                         TrapContext};
+    use narf_userspace::{
+        hostname_init, install_core_syscalls, install_global, kernel_syscall_entry,
+        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext,
+    };
 
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     __test_clear_global();
@@ -9826,8 +10784,7 @@ fn smoke_userspace_hostname_round_trip() -> TestResult {
     };
     kernel_syscall_entry(Syscall::GetHostname.raw(), &mut ctx);
     let n = match ctx.ret {
-        Some(r) if r.status == SyscallReturn::OK
-                && r.value != (-1i64) as u64 => r.value as usize,
+        Some(r) if r.status == SyscallReturn::OK && r.value != (-1i64) as u64 => r.value as usize,
         _ => return TestResult::Fail("gethostname did not return OK with len"),
     };
     if n != 4 || &buf[..4] != b"narf" || buf[4] != 0 {
@@ -9896,19 +10853,17 @@ kernel_test!(smoke_userspace_hostname_round_trip);
 fn smoke_userspace_ftruncate_grows_and_shrinks_memfile() -> TestResult {
     use core::pin::Pin;
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-    use narf_filesystem::{
-        bootstrap_mount_authority, registry, MemFs,
-    };
+    use narf_filesystem::{bootstrap_mount_authority, registry, MemFs};
 
     // Inline single-shot future poller — MemFs reads/writes are
     // immediately ready, so we don't need a real executor here.
     fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
         fn raw_waker() -> RawWaker {
-            unsafe fn no_clone(_: *const ()) -> RawWaker { raw_waker() }
+            unsafe fn no_clone(_: *const ()) -> RawWaker {
+                raw_waker()
+            }
             unsafe fn no_op(_: *const ()) {}
-            const VTAB: RawWakerVTable = RawWakerVTable::new(
-                no_clone, no_op, no_op, no_op,
-            );
+            const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
             RawWaker::new(core::ptr::null(), &VTAB)
         }
         let waker = unsafe { Waker::from_raw(raw_waker()) };
@@ -9917,23 +10872,27 @@ fn smoke_userspace_ftruncate_grows_and_shrinks_memfile() -> TestResult {
         let pinned = unsafe { Pin::new_unchecked(&mut fut) };
         match pinned.poll(&mut cx) {
             Poll::Ready(v) => Some(v),
-            Poll::Pending  => None,
+            Poll::Pending => None,
         }
     }
 
     // Mount a fresh MemFs with a seeded 6-byte file. Ftruncate
     // grows it to 16, shrinks to 3, then reads to verify each.
     let auth = bootstrap_mount_authority();
-    let _ = registry().mount(&auth, "/trunc", MemFs::with_seeds(
-        "trunc-test", &[("f", b"abcdef")],
-    ));
+    let _ = registry().mount(
+        &auth,
+        "/trunc",
+        MemFs::with_seeds("trunc-test", &[("f", b"abcdef")]),
+    );
 
-    let ops = registry().resolve_absolute("/trunc/f", |fs, rel| {
-        narf_filesystem::resolve(fs.root(), rel).ok()
-    }).flatten();
+    let ops = registry()
+        .resolve_absolute("/trunc/f", |fs, rel| {
+            narf_filesystem::resolve(fs.root(), rel).ok()
+        })
+        .flatten();
     let ops = match ops {
         Some(o) => o,
-        None    => return TestResult::Fail("resolve /trunc/f failed"),
+        None => return TestResult::Fail("resolve /trunc/f failed"),
     };
 
     // Initial size = 6.
@@ -9979,18 +10938,25 @@ fn smoke_userspace_ftruncate_grows_and_shrinks_memfile() -> TestResult {
 kernel_test!(smoke_userspace_ftruncate_grows_and_shrinks_memfile);
 
 fn smoke_userspace_pread_pwrite_dont_move_cursor() -> TestResult {
-    use narf_filesystem::{
-        bootstrap_mount_authority, registry, MemFs,
+    use narf_filesystem::{bootstrap_mount_authority, registry, MemFs};
+    use narf_userspace::{
+        install_core_syscalls, install_global, kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
     };
-    use narf_userspace::{install_core_syscalls, install_global,
-                         kernel_syscall_entry, syscall::__test_clear_global,
-                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
-                         TrapContext};
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     __test_clear_global();
@@ -10001,9 +10967,11 @@ fn smoke_userspace_pread_pwrite_dont_move_cursor() -> TestResult {
     narf_userspace::fd::init();
 
     let auth = bootstrap_mount_authority();
-    let _ = registry().mount(&auth, "/pio", MemFs::with_seeds(
-        "pio-test", &[("f", b"abcdefghij")],
-    ));
+    let _ = registry().mount(
+        &auth,
+        "/pio",
+        MemFs::with_seeds("pio-test", &[("f", b"abcdefghij")]),
+    );
 
     // Open the file via SYS_OPEN.
     let path = "/pio/f";
@@ -10011,7 +10979,10 @@ fn smoke_userspace_pread_pwrite_dont_move_cursor() -> TestResult {
         args: SyscallArgs {
             arg0: path.as_ptr() as u64,
             arg1: path.len() as u64,
-            arg2: 0, arg3: 0, arg4: 0, arg5: 0,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
         },
         ret: None,
     };
@@ -10110,17 +11081,15 @@ kernel_test!(smoke_userspace_pread_pwrite_dont_move_cursor);
 fn smoke_filesystem_devfs_null_zero() -> TestResult {
     use core::pin::Pin;
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-    use narf_filesystem::{
-        bootstrap_mount_authority, registry, DevFs,
-    };
+    use narf_filesystem::{bootstrap_mount_authority, registry, DevFs};
 
     fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
         fn raw_waker() -> RawWaker {
-            unsafe fn no_clone(_: *const ()) -> RawWaker { raw_waker() }
+            unsafe fn no_clone(_: *const ()) -> RawWaker {
+                raw_waker()
+            }
             unsafe fn no_op(_: *const ()) {}
-            const VTAB: RawWakerVTable = RawWakerVTable::new(
-                no_clone, no_op, no_op, no_op,
-            );
+            const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
             RawWaker::new(core::ptr::null(), &VTAB)
         }
         let waker = unsafe { Waker::from_raw(raw_waker()) };
@@ -10128,7 +11097,7 @@ fn smoke_filesystem_devfs_null_zero() -> TestResult {
         let pinned = unsafe { Pin::new_unchecked(&mut fut) };
         match pinned.poll(&mut cx) {
             Poll::Ready(v) => Some(v),
-            Poll::Pending  => None,
+            Poll::Pending => None,
         }
     }
 
@@ -10136,12 +11105,14 @@ fn smoke_filesystem_devfs_null_zero() -> TestResult {
     let _ = registry().mount(&auth, "/dev", DevFs::new());
 
     // /dev/null: read returns 0; write returns the requested length.
-    let null_ops = registry().resolve_absolute("/dev/null", |fs, rel| {
-        narf_filesystem::resolve(fs.root(), rel).ok()
-    }).flatten();
+    let null_ops = registry()
+        .resolve_absolute("/dev/null", |fs, rel| {
+            narf_filesystem::resolve(fs.root(), rel).ok()
+        })
+        .flatten();
     let null_ops = match null_ops {
         Some(o) => o,
-        None    => return TestResult::Fail("resolve /dev/null failed"),
+        None => return TestResult::Fail("resolve /dev/null failed"),
     };
     let mut buf = [0xAAu8; 8];
     let r = poll_once(null_ops.read(0, &mut buf));
@@ -10155,12 +11126,14 @@ fn smoke_filesystem_devfs_null_zero() -> TestResult {
     }
 
     // /dev/zero: read fills with zeros + returns the requested length.
-    let zero_ops = registry().resolve_absolute("/dev/zero", |fs, rel| {
-        narf_filesystem::resolve(fs.root(), rel).ok()
-    }).flatten();
+    let zero_ops = registry()
+        .resolve_absolute("/dev/zero", |fs, rel| {
+            narf_filesystem::resolve(fs.root(), rel).ok()
+        })
+        .flatten();
     let zero_ops = match zero_ops {
         Some(o) => o,
-        None    => return TestResult::Fail("resolve /dev/zero failed"),
+        None => return TestResult::Fail("resolve /dev/zero failed"),
     };
     let mut zbuf = [0xFFu8; 16];
     let r = poll_once(zero_ops.read(0, &mut zbuf));
@@ -10187,17 +11160,15 @@ kernel_test!(smoke_filesystem_devfs_null_zero);
 fn smoke_filesystem_devfs_random_urandom() -> TestResult {
     use core::pin::Pin;
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-    use narf_filesystem::{
-        bootstrap_mount_authority, registry, DevFs,
-    };
+    use narf_filesystem::{bootstrap_mount_authority, registry, DevFs};
 
     fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
         fn raw_waker() -> RawWaker {
-            unsafe fn no_clone(_: *const ()) -> RawWaker { raw_waker() }
+            unsafe fn no_clone(_: *const ()) -> RawWaker {
+                raw_waker()
+            }
             unsafe fn no_op(_: *const ()) {}
-            const VTAB: RawWakerVTable = RawWakerVTable::new(
-                no_clone, no_op, no_op, no_op,
-            );
+            const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
             RawWaker::new(core::ptr::null(), &VTAB)
         }
         let waker = unsafe { Waker::from_raw(raw_waker()) };
@@ -10205,7 +11176,7 @@ fn smoke_filesystem_devfs_random_urandom() -> TestResult {
         let pinned = unsafe { Pin::new_unchecked(&mut fut) };
         match pinned.poll(&mut cx) {
             Poll::Ready(v) => Some(v),
-            Poll::Pending  => None,
+            Poll::Pending => None,
         }
     }
 
@@ -10215,12 +11186,14 @@ fn smoke_filesystem_devfs_random_urandom() -> TestResult {
     // Each of /dev/random and /dev/urandom must (a) succeed reading
     // 16 bytes and (b) produce a not-all-zero buffer.
     for path in ["/dev/random", "/dev/urandom"] {
-        let ops = registry().resolve_absolute(path, |fs, rel| {
-            narf_filesystem::resolve(fs.root(), rel).ok()
-        }).flatten();
+        let ops = registry()
+            .resolve_absolute(path, |fs, rel| {
+                narf_filesystem::resolve(fs.root(), rel).ok()
+            })
+            .flatten();
         let ops = match ops {
             Some(o) => o,
-            None    => return TestResult::Fail("resolve dev rng failed"),
+            None => return TestResult::Fail("resolve dev rng failed"),
         };
         let mut buf = [0u8; 16];
         let r = poll_once(ops.read(0, &mut buf));
@@ -10246,9 +11219,11 @@ fn smoke_filesystem_devfs_mount_default_idempotent() -> TestResult {
 
     // /dev is reachable: resolve_absolute against /dev/null finds
     // a DirOps lookup hit.
-    let ops = registry().resolve_absolute("/dev/null", |fs, rel| {
-        narf_filesystem::resolve(fs.root(), rel).ok()
-    }).flatten();
+    let ops = registry()
+        .resolve_absolute("/dev/null", |fs, rel| {
+            narf_filesystem::resolve(fs.root(), rel).ok()
+        })
+        .flatten();
     if ops.is_none() {
         return TestResult::Fail("mount_default did not mount /dev");
     }
@@ -10257,17 +11232,26 @@ fn smoke_filesystem_devfs_mount_default_idempotent() -> TestResult {
 kernel_test!(smoke_filesystem_devfs_mount_default_idempotent);
 
 fn smoke_userspace_rlimit_round_trip() -> TestResult {
-    use narf_userspace::{install_core_syscalls, install_global,
-                         kernel_syscall_entry, rlimit_init,
-                         syscall::__test_clear_global,
-                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
-                         TrapContext};
+    use narf_userspace::{
+        install_core_syscalls, install_global, kernel_syscall_entry, rlimit_init,
+        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext,
+    };
 
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     __test_clear_global();
@@ -10362,16 +11346,25 @@ fn smoke_userspace_rlimit_round_trip() -> TestResult {
 kernel_test!(smoke_userspace_rlimit_round_trip);
 
 fn smoke_userspace_priority_round_trip() -> TestResult {
-    use narf_userspace::{install_core_syscalls, install_global,
-                         kernel_syscall_entry, nice_init,
-                         syscall::__test_clear_global,
-                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
-                         TrapContext};
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    use narf_userspace::{
+        install_core_syscalls, install_global, kernel_syscall_entry, nice_init,
+        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext,
+    };
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     __test_clear_global();
@@ -10383,7 +11376,12 @@ fn smoke_userspace_priority_round_trip() -> TestResult {
 
     fn call(s: Syscall, arg0: u64, arg1: u64, arg2: u64) -> Option<SyscallReturn> {
         let mut ctx = FakeCtx {
-            args: SyscallArgs { arg0, arg1, arg2, ..SyscallArgs::default() },
+            args: SyscallArgs {
+                arg0,
+                arg1,
+                arg2,
+                ..SyscallArgs::default()
+            },
             ret: None,
         };
         kernel_syscall_entry(s.raw(), &mut ctx);
@@ -10391,7 +11389,9 @@ fn smoke_userspace_priority_round_trip() -> TestResult {
     }
 
     // Default nice = 0 → wire value 20 (0 + 20 shift).
-    let r = call(Syscall::Getpriority, 0, 0, 0).map(|r| r.value).unwrap_or(!0);
+    let r = call(Syscall::Getpriority, 0, 0, 0)
+        .map(|r| r.value)
+        .unwrap_or(!0);
     if r != 20 {
         return TestResult::Fail("default nice wire value not 20");
     }
@@ -10403,7 +11403,9 @@ fn smoke_userspace_priority_round_trip() -> TestResult {
     }
 
     // Re-read: wire value = 25 (5 + 20).
-    let r = call(Syscall::Getpriority, 0, 0, 0).map(|r| r.value).unwrap_or(!0);
+    let r = call(Syscall::Getpriority, 0, 0, 0)
+        .map(|r| r.value)
+        .unwrap_or(!0);
     if r != 25 {
         return TestResult::Fail("setpriority did not stick");
     }
@@ -10435,15 +11437,24 @@ fn smoke_userspace_priority_round_trip() -> TestResult {
 kernel_test!(smoke_userspace_priority_round_trip);
 
 fn smoke_userspace_times_writes_tms_struct() -> TestResult {
-    use narf_userspace::{install_core_syscalls, install_global,
-                         kernel_syscall_entry, syscall::__test_clear_global,
-                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
-                         TrapContext};
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    use narf_userspace::{
+        install_core_syscalls, install_global, kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     __test_clear_global();
@@ -10453,7 +11464,10 @@ fn smoke_userspace_times_writes_tms_struct() -> TestResult {
 
     let mut buf = [0i64; 4];
     let mut ctx = FakeCtx {
-        args: SyscallArgs { arg0: buf.as_mut_ptr() as u64, ..SyscallArgs::default() },
+        args: SyscallArgs {
+            arg0: buf.as_mut_ptr() as u64,
+            ..SyscallArgs::default()
+        },
         ret: None,
     };
     kernel_syscall_entry(Syscall::Times.raw(), &mut ctx);
@@ -10476,15 +11490,24 @@ fn smoke_userspace_times_writes_tms_struct() -> TestResult {
 kernel_test!(smoke_userspace_times_writes_tms_struct);
 
 fn smoke_userspace_getrusage_writes_18_i64s() -> TestResult {
-    use narf_userspace::{install_core_syscalls, install_global,
-                         kernel_syscall_entry, syscall::__test_clear_global,
-                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
-                         TrapContext};
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    use narf_userspace::{
+        install_core_syscalls, install_global, kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     __test_clear_global();
@@ -10494,7 +11517,11 @@ fn smoke_userspace_getrusage_writes_18_i64s() -> TestResult {
 
     let mut buf = [0xFEi64; 18];
     let mut ctx = FakeCtx {
-        args: SyscallArgs { arg0: 0, arg1: buf.as_mut_ptr() as u64, ..SyscallArgs::default() },
+        args: SyscallArgs {
+            arg0: 0,
+            arg1: buf.as_mut_ptr() as u64,
+            ..SyscallArgs::default()
+        },
         ret: None,
     };
     kernel_syscall_entry(Syscall::Getrusage.raw(), &mut ctx);
@@ -10514,7 +11541,11 @@ fn smoke_userspace_getrusage_writes_18_i64s() -> TestResult {
 
     // Null pointer rejected.
     let mut ctx = FakeCtx {
-        args: SyscallArgs { arg0: 0, arg1: 0, ..SyscallArgs::default() },
+        args: SyscallArgs {
+            arg0: 0,
+            arg1: 0,
+            ..SyscallArgs::default()
+        },
         ret: None,
     };
     kernel_syscall_entry(Syscall::Getrusage.raw(), &mut ctx);
@@ -10532,16 +11563,24 @@ fn smoke_userspace_getrusage_writes_18_i64s() -> TestResult {
 kernel_test!(smoke_userspace_getrusage_writes_18_i64s);
 
 fn smoke_userspace_umask_round_trip() -> TestResult {
-    use narf_userspace::{install_core_syscalls, install_global,
-                         kernel_syscall_entry, syscall::__test_clear_global,
-                         umask_init,
-                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
-                         TrapContext};
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    use narf_userspace::{
+        install_core_syscalls, install_global, kernel_syscall_entry, syscall::__test_clear_global,
+        umask_init, Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     __test_clear_global();
@@ -10553,7 +11592,10 @@ fn smoke_userspace_umask_round_trip() -> TestResult {
 
     fn call(arg0: u64) -> u64 {
         let mut ctx = FakeCtx {
-            args: SyscallArgs { arg0, ..SyscallArgs::default() },
+            args: SyscallArgs {
+                arg0,
+                ..SyscallArgs::default()
+            },
             ret: None,
         };
         kernel_syscall_entry(Syscall::Umask.raw(), &mut ctx);
@@ -10584,15 +11626,24 @@ fn smoke_userspace_umask_round_trip() -> TestResult {
 kernel_test!(smoke_userspace_umask_round_trip);
 
 fn smoke_userspace_getcpu_returns_zero() -> TestResult {
-    use narf_userspace::{install_core_syscalls, install_global,
-                         kernel_syscall_entry, syscall::__test_clear_global,
-                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
-                         TrapContext};
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    use narf_userspace::{
+        install_core_syscalls, install_global, kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     __test_clear_global();
@@ -10600,11 +11651,11 @@ fn smoke_userspace_getcpu_returns_zero() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
-    let mut cpu: u32  = 99;
+    let mut cpu: u32 = 99;
     let mut node: u32 = 99;
     let mut ctx = FakeCtx {
         args: SyscallArgs {
-            arg0: &mut cpu  as *mut u32 as u64,
+            arg0: &mut cpu as *mut u32 as u64,
             arg1: &mut node as *mut u32 as u64,
             ..SyscallArgs::default()
         },
@@ -10620,7 +11671,11 @@ fn smoke_userspace_getcpu_returns_zero() -> TestResult {
 
     // Null pointers tolerated.
     let mut ctx = FakeCtx {
-        args: SyscallArgs { arg0: 0, arg1: 0, ..SyscallArgs::default() },
+        args: SyscallArgs {
+            arg0: 0,
+            arg1: 0,
+            ..SyscallArgs::default()
+        },
         ret: None,
     };
     kernel_syscall_entry(Syscall::Getcpu.raw(), &mut ctx);
@@ -10634,15 +11689,24 @@ fn smoke_userspace_getcpu_returns_zero() -> TestResult {
 kernel_test!(smoke_userspace_getcpu_returns_zero);
 
 fn smoke_userspace_sched_affinity_round_trip() -> TestResult {
-    use narf_userspace::{install_core_syscalls, install_global,
-                         kernel_syscall_entry, syscall::__test_clear_global,
-                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
-                         TrapContext};
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    use narf_userspace::{
+        install_core_syscalls, install_global, kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     __test_clear_global();
@@ -10718,16 +11782,25 @@ fn smoke_userspace_sched_affinity_round_trip() -> TestResult {
 kernel_test!(smoke_userspace_sched_affinity_round_trip);
 
 fn smoke_userspace_prctl_name_round_trip() -> TestResult {
-    use narf_userspace::{install_core_syscalls, install_global,
-                         kernel_syscall_entry, prctl_init,
-                         syscall::__test_clear_global,
-                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
-                         TrapContext};
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    use narf_userspace::{
+        install_core_syscalls, install_global, kernel_syscall_entry, prctl_init,
+        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext,
+    };
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     __test_clear_global();
@@ -10739,7 +11812,11 @@ fn smoke_userspace_prctl_name_round_trip() -> TestResult {
 
     fn call(op: u64, a: u64) -> Option<SyscallReturn> {
         let mut ctx = FakeCtx {
-            args: SyscallArgs { arg0: op, arg1: a, ..SyscallArgs::default() },
+            args: SyscallArgs {
+                arg0: op,
+                arg1: a,
+                ..SyscallArgs::default()
+            },
             ret: None,
         };
         kernel_syscall_entry(Syscall::Prctl.raw(), &mut ctx);
@@ -10763,7 +11840,7 @@ fn smoke_userspace_prctl_name_round_trip() -> TestResult {
     }
 
     // PR_SET_DUMPABLE / PR_GET_DUMPABLE round-trip.
-    let _ = call(4, 0);   // set dumpable = false
+    let _ = call(4, 0); // set dumpable = false
     let r = call(3, 0).map(|r| r.value).unwrap_or(!0);
     if r != 0 {
         return TestResult::Fail("PR_SET_DUMPABLE(false) did not stick");
@@ -10793,17 +11870,15 @@ kernel_test!(smoke_userspace_prctl_name_round_trip);
 fn smoke_userspace_fallocate_extends_and_zero_ranges_memfile() -> TestResult {
     use core::pin::Pin;
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-    use narf_filesystem::{
-        bootstrap_mount_authority, registry, MemFs,
-    };
+    use narf_filesystem::{bootstrap_mount_authority, registry, MemFs};
 
     fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
         fn raw_waker() -> RawWaker {
-            unsafe fn no_clone(_: *const ()) -> RawWaker { raw_waker() }
+            unsafe fn no_clone(_: *const ()) -> RawWaker {
+                raw_waker()
+            }
             unsafe fn no_op(_: *const ()) {}
-            const VTAB: RawWakerVTable = RawWakerVTable::new(
-                no_clone, no_op, no_op, no_op,
-            );
+            const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
             RawWaker::new(core::ptr::null(), &VTAB)
         }
         let waker = unsafe { Waker::from_raw(raw_waker()) };
@@ -10811,20 +11886,27 @@ fn smoke_userspace_fallocate_extends_and_zero_ranges_memfile() -> TestResult {
         let pinned = unsafe { Pin::new_unchecked(&mut fut) };
         match pinned.poll(&mut cx) {
             Poll::Ready(v) => Some(v),
-            Poll::Pending  => None,
+            Poll::Pending => None,
         }
     }
 
     let auth = bootstrap_mount_authority();
-    let _ = registry().mount(&auth, "/falloc", MemFs::with_seeds(
-        "falloc-test", &[("f", b"abcdefghij")],   // 10 bytes
-    ));
-    let ops = registry().resolve_absolute("/falloc/f", |fs, rel| {
-        narf_filesystem::resolve(fs.root(), rel).ok()
-    }).flatten();
+    let _ = registry().mount(
+        &auth,
+        "/falloc",
+        MemFs::with_seeds(
+            "falloc-test",
+            &[("f", b"abcdefghij")], // 10 bytes
+        ),
+    );
+    let ops = registry()
+        .resolve_absolute("/falloc/f", |fs, rel| {
+            narf_filesystem::resolve(fs.root(), rel).ok()
+        })
+        .flatten();
     let ops = match ops {
         Some(o) => o,
-        None    => return TestResult::Fail("resolve /falloc/f failed"),
+        None => return TestResult::Fail("resolve /falloc/f failed"),
     };
 
     // Direct trait round-trip — the syscall path adds nothing
@@ -10868,18 +11950,25 @@ fn smoke_userspace_fallocate_extends_and_zero_ranges_memfile() -> TestResult {
 kernel_test!(smoke_userspace_fallocate_extends_and_zero_ranges_memfile);
 
 fn smoke_userspace_copy_file_range_round_trip() -> TestResult {
-    use narf_filesystem::{
-        bootstrap_mount_authority, registry, MemFs,
+    use narf_filesystem::{bootstrap_mount_authority, registry, MemFs};
+    use narf_userspace::{
+        install_core_syscalls, install_global, kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
     };
-    use narf_userspace::{install_core_syscalls, install_global,
-                         kernel_syscall_entry, syscall::__test_clear_global,
-                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
-                         TrapContext};
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     __test_clear_global();
@@ -10890,17 +11979,27 @@ fn smoke_userspace_copy_file_range_round_trip() -> TestResult {
     narf_userspace::fd::init();
 
     let auth = bootstrap_mount_authority();
-    let _ = registry().mount(&auth, "/cfr", MemFs::with_seeds(
-        "cfr-test",
-        &[("src", b"abcdefghij"), ("dst", b"")],
-    ));
+    let _ = registry().mount(
+        &auth,
+        "/cfr",
+        MemFs::with_seeds("cfr-test", &[("src", b"abcdefghij"), ("dst", b"")]),
+    );
 
     fn open(path: &str) -> Option<u32> {
-        struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+        struct FakeCtx {
+            args: SyscallArgs,
+            ret: Option<SyscallReturn>,
+        }
         impl TrapContext for FakeCtx {
-            fn args(&self) -> &SyscallArgs { &self.args }
-            fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-            fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+            fn args(&self) -> &SyscallArgs {
+                &self.args
+            }
+            fn set_return(&mut self, r: SyscallReturn) {
+                self.ret = Some(r);
+            }
+            fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+                false
+            }
         }
         let mut ctx = FakeCtx {
             args: SyscallArgs {
@@ -10917,8 +12016,14 @@ fn smoke_userspace_copy_file_range_round_trip() -> TestResult {
         }
     }
 
-    let fd_in  = match open("/cfr/src") { Some(f) => f, None => return TestResult::Fail("open src failed") };
-    let fd_out = match open("/cfr/dst") { Some(f) => f, None => return TestResult::Fail("open dst failed") };
+    let fd_in = match open("/cfr/src") {
+        Some(f) => f,
+        None => return TestResult::Fail("open src failed"),
+    };
+    let fd_out = match open("/cfr/dst") {
+        Some(f) => f,
+        None => return TestResult::Fail("open dst failed"),
+    };
 
     // Copy 5 bytes from src@0 → dst@0. !0 sentinel means "use cur",
     // explicit 0 means "start at 0 without moving the cursor".
@@ -10964,7 +12069,9 @@ fn smoke_userspace_copy_file_range_round_trip() -> TestResult {
         args: SyscallArgs {
             arg0: fd_in as u64,
             arg1: fd_out as u64,
-            arg2: 0, arg3: 0, arg4: 1,
+            arg2: 0,
+            arg3: 0,
+            arg4: 1,
             arg5: 1,
         },
         ret: None,
@@ -10985,15 +12092,24 @@ fn smoke_userspace_copy_file_range_round_trip() -> TestResult {
 kernel_test!(smoke_userspace_copy_file_range_round_trip);
 
 fn smoke_userspace_clock_settime_pushes_wall_offset() -> TestResult {
-    use narf_userspace::{install_core_syscalls, install_global,
-                         kernel_syscall_entry, syscall::__test_clear_global,
-                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
-                         TrapContext};
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    use narf_userspace::{
+        install_core_syscalls, install_global, kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     __test_clear_global();
@@ -11008,7 +12124,7 @@ fn smoke_userspace_clock_settime_pushes_wall_offset() -> TestResult {
     let ts: [i64; 2] = [target_sec, target_nsec];
     let mut ctx = FakeCtx {
         args: SyscallArgs {
-            arg0: 0,                            // CLOCK_REALTIME
+            arg0: 0, // CLOCK_REALTIME
             arg1: ts.as_ptr() as u64,
             ..SyscallArgs::default()
         },
@@ -11058,7 +12174,7 @@ fn smoke_userspace_clock_settime_pushes_wall_offset() -> TestResult {
     // behaviour. (Re-setting REALTIME to (current monotonic) leaves
     // offset = 0.)
     let cur_mono: u64 = narf_scheduler::narf_time::monotonic_ns();
-    let cur_sec  = (cur_mono / 1_000_000_000) as i64;
+    let cur_sec = (cur_mono / 1_000_000_000) as i64;
     let cur_nsec = (cur_mono % 1_000_000_000) as i64;
     let reset_ts: [i64; 2] = [cur_sec, cur_nsec];
     let mut ctx = FakeCtx {
@@ -11077,15 +12193,24 @@ fn smoke_userspace_clock_settime_pushes_wall_offset() -> TestResult {
 kernel_test!(smoke_userspace_clock_settime_pushes_wall_offset);
 
 fn smoke_userspace_futex_wait_and_wake_no_op() -> TestResult {
-    use narf_userspace::{install_core_syscalls, install_global,
-                         kernel_syscall_entry, syscall::__test_clear_global,
-                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
-                         TrapContext};
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    use narf_userspace::{
+        install_core_syscalls, install_global, kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     __test_clear_global();
@@ -11096,7 +12221,12 @@ fn smoke_userspace_futex_wait_and_wake_no_op() -> TestResult {
     fn call(op: u64) -> Option<SyscallReturn> {
         let mut ctx = FakeCtx {
             args: SyscallArgs {
-                arg0: 0, arg1: op, arg2: 0, arg3: 0, arg4: 0, arg5: 0,
+                arg0: 0,
+                arg1: op,
+                arg2: 0,
+                arg3: 0,
+                arg4: 0,
+                arg5: 0,
             },
             ret: None,
         };
@@ -11132,15 +12262,24 @@ fn smoke_userspace_futex_wait_and_wake_no_op() -> TestResult {
 kernel_test!(smoke_userspace_futex_wait_and_wake_no_op);
 
 fn smoke_userspace_memfd_create_returns_writable_fd() -> TestResult {
-    use narf_userspace::{install_core_syscalls, install_global,
-                         kernel_syscall_entry, syscall::__test_clear_global,
-                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
-                         TrapContext};
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    use narf_userspace::{
+        install_core_syscalls, install_global, kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     __test_clear_global();
@@ -11161,8 +12300,7 @@ fn smoke_userspace_memfd_create_returns_writable_fd() -> TestResult {
     };
     kernel_syscall_entry(Syscall::MemfdCreate.raw(), &mut ctx);
     let fd = match ctx.ret {
-        Some(r) if r.status == SyscallReturn::OK
-                && r.value != (-1i64) as u64 => r.value as u32,
+        Some(r) if r.status == SyscallReturn::OK && r.value != (-1i64) as u64 => r.value as u32,
         _ => return TestResult::Fail("memfd_create did not return a fd"),
     };
 
@@ -11185,7 +12323,9 @@ fn smoke_userspace_memfd_create_returns_writable_fd() -> TestResult {
     // Seek back to 0 then read.
     let mut ctx = FakeCtx {
         args: SyscallArgs {
-            arg0: fd as u64, arg1: 0, arg2: 0,
+            arg0: fd as u64,
+            arg1: 0,
+            arg2: 0,
             ..SyscallArgs::default()
         },
         ret: None,
@@ -11215,18 +12355,25 @@ fn smoke_userspace_memfd_create_returns_writable_fd() -> TestResult {
 kernel_test!(smoke_userspace_memfd_create_returns_writable_fd);
 
 fn smoke_userspace_getdents64_writes_linux_records() -> TestResult {
-    use narf_filesystem::{
-        bootstrap_mount_authority, registry, MemFs,
+    use narf_filesystem::{bootstrap_mount_authority, registry, MemFs};
+    use narf_userspace::{
+        install_core_syscalls, install_global, kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
     };
-    use narf_userspace::{install_core_syscalls, install_global,
-                         kernel_syscall_entry, syscall::__test_clear_global,
-                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
-                         TrapContext};
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     __test_clear_global();
@@ -11235,9 +12382,14 @@ fn smoke_userspace_getdents64_writes_linux_records() -> TestResult {
     install_global(t);
 
     let auth = bootstrap_mount_authority();
-    let _ = registry().mount(&auth, "/gd", MemFs::with_seeds(
-        "gd-test", &[("alpha", b"a"), ("beta", b"b"), ("gamma", b"c")],
-    ));
+    let _ = registry().mount(
+        &auth,
+        "/gd",
+        MemFs::with_seeds(
+            "gd-test",
+            &[("alpha", b"a"), ("beta", b"b"), ("gamma", b"c")],
+        ),
+    );
 
     let mut buf = [0u8; 256];
     let path = "/gd";
@@ -11265,15 +12417,17 @@ fn smoke_userspace_getdents64_writes_linux_records() -> TestResult {
     let mut names: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
     let mut pos = 0usize;
     while pos + 19 <= written {
-        let reclen = u16::from_le_bytes(buf[pos+16..pos+18].try_into().unwrap()) as usize;
-        if reclen < 20 || pos + reclen > written { break; }
+        let reclen = u16::from_le_bytes(buf[pos + 16..pos + 18].try_into().unwrap()) as usize;
+        if reclen < 20 || pos + reclen > written {
+            break;
+        }
         // d_name at offset 19, NUL-terminated.
         let name_start = pos + 19;
         let mut nlen = 0usize;
         while name_start + nlen < pos + reclen && buf[name_start + nlen] != 0 {
             nlen += 1;
         }
-        let name = core::str::from_utf8(&buf[name_start..name_start+nlen]).unwrap();
+        let name = core::str::from_utf8(&buf[name_start..name_start + nlen]).unwrap();
         names.push(name.into());
         pos += reclen;
     }
@@ -11291,16 +12445,25 @@ fn smoke_userspace_getdents64_writes_linux_records() -> TestResult {
 kernel_test!(smoke_userspace_getdents64_writes_linux_records);
 
 fn smoke_userspace_init_per_task_state_is_idempotent() -> TestResult {
-    use narf_userspace::{init_per_task_state, install_core_syscalls,
-                         install_global, kernel_syscall_entry,
-                         syscall::__test_clear_global,
-                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
-                         TrapContext};
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    use narf_userspace::{
+        init_per_task_state, install_core_syscalls, install_global, kernel_syscall_entry,
+        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext,
+    };
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     __test_clear_global();
@@ -11353,7 +12516,10 @@ fn smoke_userspace_init_per_task_state_is_idempotent() -> TestResult {
 
     // umask returns 0o022 default.
     let mut ctx = FakeCtx {
-        args: SyscallArgs { arg0: 0o077, ..SyscallArgs::default() },
+        args: SyscallArgs {
+            arg0: 0o077,
+            ..SyscallArgs::default()
+        },
         ret: None,
     };
     kernel_syscall_entry(Syscall::Umask.raw(), &mut ctx);
@@ -11373,16 +12539,25 @@ fn smoke_userspace_init_per_task_state_is_idempotent() -> TestResult {
 kernel_test!(smoke_userspace_init_per_task_state_is_idempotent);
 
 fn smoke_userspace_sched_priority_bounds_and_param() -> TestResult {
-    use narf_userspace::{init_per_task_state, install_core_syscalls,
-                         install_global, kernel_syscall_entry,
-                         syscall::__test_clear_global,
-                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
-                         TrapContext};
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    use narf_userspace::{
+        init_per_task_state, install_core_syscalls, install_global, kernel_syscall_entry,
+        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext,
+    };
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     __test_clear_global();
@@ -11394,7 +12569,11 @@ fn smoke_userspace_sched_priority_bounds_and_param() -> TestResult {
 
     fn call(s: Syscall, arg0: u64, arg1: u64) -> Option<SyscallReturn> {
         let mut ctx = FakeCtx {
-            args: SyscallArgs { arg0, arg1, ..SyscallArgs::default() },
+            args: SyscallArgs {
+                arg0,
+                arg1,
+                ..SyscallArgs::default()
+            },
             ret: None,
         };
         kernel_syscall_entry(s.raw(), &mut ctx);
@@ -11402,18 +12581,27 @@ fn smoke_userspace_sched_priority_bounds_and_param() -> TestResult {
     }
 
     // Bounds: SCHED_OTHER → (0, 0); SCHED_FIFO/RR → (1, 99); bad → -1.
-    let max_other = call(Syscall::SchedGetPriorityMax, 0, 0).map(|r| r.value as i64).unwrap_or(99);
-    let min_other = call(Syscall::SchedGetPriorityMin, 0, 0).map(|r| r.value as i64).unwrap_or(99);
+    let max_other = call(Syscall::SchedGetPriorityMax, 0, 0)
+        .map(|r| r.value as i64)
+        .unwrap_or(99);
+    let min_other = call(Syscall::SchedGetPriorityMin, 0, 0)
+        .map(|r| r.value as i64)
+        .unwrap_or(99);
     if max_other != 0 || min_other != 0 {
         return TestResult::Fail("SCHED_OTHER bounds not (0,0)");
     }
-    let max_rr = call(Syscall::SchedGetPriorityMax, 2, 0).map(|r| r.value as i64).unwrap_or(99);
-    let min_rr = call(Syscall::SchedGetPriorityMin, 2, 0).map(|r| r.value as i64).unwrap_or(99);
+    let max_rr = call(Syscall::SchedGetPriorityMax, 2, 0)
+        .map(|r| r.value as i64)
+        .unwrap_or(99);
+    let min_rr = call(Syscall::SchedGetPriorityMin, 2, 0)
+        .map(|r| r.value as i64)
+        .unwrap_or(99);
     if max_rr != 99 || min_rr != 1 {
         return TestResult::Fail("SCHED_RR bounds not (1, 99)");
     }
     let bad = call(Syscall::SchedGetPriorityMax, 99, 0)
-        .map(|r| r.value).unwrap_or(0);
+        .map(|r| r.value)
+        .unwrap_or(0);
     if bad != (-1i64) as u64 {
         return TestResult::Fail("bad policy not rejected");
     }
@@ -11439,16 +12627,25 @@ fn smoke_userspace_sched_priority_bounds_and_param() -> TestResult {
 kernel_test!(smoke_userspace_sched_priority_bounds_and_param);
 
 fn smoke_userspace_pgid_round_trip() -> TestResult {
-    use narf_userspace::{init_per_task_state, install_core_syscalls,
-                         install_global, kernel_syscall_entry,
-                         syscall::__test_clear_global,
-                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
-                         TrapContext};
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    use narf_userspace::{
+        init_per_task_state, install_core_syscalls, install_global, kernel_syscall_entry,
+        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext,
+    };
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     __test_clear_global();
@@ -11460,7 +12657,11 @@ fn smoke_userspace_pgid_round_trip() -> TestResult {
 
     fn call(s: Syscall, arg0: u64, arg1: u64) -> Option<SyscallReturn> {
         let mut ctx = FakeCtx {
-            args: SyscallArgs { arg0, arg1, ..SyscallArgs::default() },
+            args: SyscallArgs {
+                arg0,
+                arg1,
+                ..SyscallArgs::default()
+            },
             ret: None,
         };
         kernel_syscall_entry(s.raw(), &mut ctx);
@@ -11497,16 +12698,25 @@ fn smoke_userspace_pgid_round_trip() -> TestResult {
 kernel_test!(smoke_userspace_pgid_round_trip);
 
 fn smoke_userspace_setsid_makes_session_leader() -> TestResult {
-    use narf_userspace::{init_per_task_state, install_core_syscalls,
-                         install_global, kernel_syscall_entry,
-                         syscall::__test_clear_global,
-                         Syscall, SyscallArgs, SyscallReturn, SyscallTable,
-                         TrapContext};
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    use narf_userspace::{
+        init_per_task_state, install_core_syscalls, install_global, kernel_syscall_entry,
+        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext,
+    };
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
     }
 
     __test_clear_global();
@@ -11519,7 +12729,10 @@ fn smoke_userspace_setsid_makes_session_leader() -> TestResult {
 
     fn call(s: Syscall, arg0: u64) -> Option<SyscallReturn> {
         let mut ctx = FakeCtx {
-            args: SyscallArgs { arg0, ..SyscallArgs::default() },
+            args: SyscallArgs {
+                arg0,
+                ..SyscallArgs::default()
+            },
             ret: None,
         };
         kernel_syscall_entry(s.raw(), &mut ctx);
@@ -11540,7 +12753,11 @@ fn smoke_userspace_setsid_makes_session_leader() -> TestResult {
     // Pre-stomp pgid to a distinct value, then setsid resets both.
     let _ = {
         let mut ctx = FakeCtx {
-            args: SyscallArgs { arg0: 0, arg1: 12345, ..SyscallArgs::default() },
+            args: SyscallArgs {
+                arg0: 0,
+                arg1: 12345,
+                ..SyscallArgs::default()
+            },
             ret: None,
         };
         kernel_syscall_entry(Syscall::Setpgid.raw(), &mut ctx);
@@ -11571,17 +12788,17 @@ kernel_test!(smoke_userspace_setsid_makes_session_leader);
 fn smoke_aml_resource_irq_io_endtag() -> TestResult {
     // IRQ descriptor (mask 0x0010 = IRQ4) + IO Port + EndTag
     let buf: &[u8] = &[
-        0x22, 0x10, 0x00,                          // small IRQ: type=4, len=2; mask=0x0010
+        0x22, 0x10, 0x00, // small IRQ: type=4, len=2; mask=0x0010
         0x47, 0x01, 0x00, 0x03, 0x00, 0x03, 0x01, 0x08, // IO port: type=8, len=7
-        0x79, 0x00,                                // EndTag
+        0x79, 0x00, // EndTag
     ];
     let items = match narf_aml::resource::decode_resource_template(buf) {
         Ok(v) => v,
         Err(e) => {
             let _ = match e {
                 narf_aml::resource::ResourceError::Truncated => "truncated",
-                narf_aml::resource::ResourceError::BadTag    => "bad tag",
-                narf_aml::resource::ResourceError::NoEndTag  => "no end tag",
+                narf_aml::resource::ResourceError::BadTag => "bad tag",
+                narf_aml::resource::ResourceError::NoEndTag => "no end tag",
             };
             return TestResult::Fail("decode_resource_template failed");
         }
@@ -11591,18 +12808,38 @@ fn smoke_aml_resource_irq_io_endtag() -> TestResult {
     }
     match &items[0] {
         narf_aml::resource::ResourceItem::Irq { mask, flags } => {
-            if *mask != 0x0010 { return TestResult::Fail("IRQ mask wrong"); }
-            if *flags != None   { return TestResult::Fail("IRQ flags should be None"); }
+            if *mask != 0x0010 {
+                return TestResult::Fail("IRQ mask wrong");
+            }
+            if *flags != None {
+                return TestResult::Fail("IRQ flags should be None");
+            }
         }
         _ => return TestResult::Fail("item[0] not Irq"),
     }
     match &items[1] {
-        narf_aml::resource::ResourceItem::Io { info, min, max, alignment, length } => {
-            if *info != 0x01    { return TestResult::Fail("IO info wrong"); }
-            if *min != 0x0300   { return TestResult::Fail("IO min wrong"); }
-            if *max != 0x0300   { return TestResult::Fail("IO max wrong"); }
-            if *alignment != 1  { return TestResult::Fail("IO alignment wrong"); }
-            if *length != 8     { return TestResult::Fail("IO length wrong"); }
+        narf_aml::resource::ResourceItem::Io {
+            info,
+            min,
+            max,
+            alignment,
+            length,
+        } => {
+            if *info != 0x01 {
+                return TestResult::Fail("IO info wrong");
+            }
+            if *min != 0x0300 {
+                return TestResult::Fail("IO min wrong");
+            }
+            if *max != 0x0300 {
+                return TestResult::Fail("IO max wrong");
+            }
+            if *alignment != 1 {
+                return TestResult::Fail("IO alignment wrong");
+            }
+            if *length != 8 {
+                return TestResult::Fail("IO length wrong");
+            }
         }
         _ => return TestResult::Fail("item[1] not Io"),
     }
@@ -11617,11 +12854,11 @@ kernel_test!(smoke_aml_resource_irq_io_endtag);
 fn smoke_aml_resource_memory32fixed_large_tag() -> TestResult {
     // Large tag 0x86 (Memory32Fixed), length=9, then EndTag
     let buf: &[u8] = &[
-        0x86, 0x09, 0x00,               // large tag 0x86, payload length = 9
-        0x00,                           // info = 0
-        0x00, 0x00, 0x00, 0xFE,         // base = 0xFE000000
-        0x00, 0x00, 0x10, 0x00,         // length = 0x00100000
-        0x79, 0x00,                     // EndTag
+        0x86, 0x09, 0x00, // large tag 0x86, payload length = 9
+        0x00, // info = 0
+        0x00, 0x00, 0x00, 0xFE, // base = 0xFE000000
+        0x00, 0x00, 0x10, 0x00, // length = 0x00100000
+        0x79, 0x00, // EndTag
     ];
     let items = match narf_aml::resource::decode_resource_template(buf) {
         Ok(v) => v,
@@ -11632,9 +12869,15 @@ fn smoke_aml_resource_memory32fixed_large_tag() -> TestResult {
     }
     match &items[0] {
         narf_aml::resource::ResourceItem::Memory32Fixed { info, base, length } => {
-            if *info != 0              { return TestResult::Fail("Memory32Fixed info wrong"); }
-            if *base != 0xFE00_0000   { return TestResult::Fail("Memory32Fixed base wrong"); }
-            if *length != 0x0010_0000 { return TestResult::Fail("Memory32Fixed length wrong"); }
+            if *info != 0 {
+                return TestResult::Fail("Memory32Fixed info wrong");
+            }
+            if *base != 0xFE00_0000 {
+                return TestResult::Fail("Memory32Fixed base wrong");
+            }
+            if *length != 0x0010_0000 {
+                return TestResult::Fail("Memory32Fixed length wrong");
+            }
         }
         _ => return TestResult::Fail("item[0] not Memory32Fixed"),
     }
@@ -11651,13 +12894,13 @@ fn smoke_aml_prt_decode() -> TestResult {
     let entries_raw = alloc::vec![
         Value::Package(alloc::vec![
             Value::Integer(0x0001_FFFF),
-            Value::Integer(0),                      // INTA
-            Value::Integer(0),                      // no source name
-            Value::Integer(16),                     // GSI 16
+            Value::Integer(0),  // INTA
+            Value::Integer(0),  // no source name
+            Value::Integer(16), // GSI 16
         ]),
         Value::Package(alloc::vec![
             Value::Integer(0x0002_FFFF),
-            Value::Integer(1),                      // INTB
+            Value::Integer(1), // INTB
             Value::String(alloc::string::String::from("\\_SB.LNKB")),
             Value::Integer(0),
         ]),
@@ -11666,22 +12909,38 @@ fn smoke_aml_prt_decode() -> TestResult {
         Ok(v) => v,
         Err(_) => return TestResult::Fail("decode_prt failed"),
     };
-    if prt.len() != 2 { return TestResult::Fail("expected 2 PrtEntry"); }
+    if prt.len() != 2 {
+        return TestResult::Fail("expected 2 PrtEntry");
+    }
 
     let e0 = &prt[0];
-    if e0.address != 0x0001_FFFF { return TestResult::Fail("e0 address wrong"); }
-    if e0.pin != 0               { return TestResult::Fail("e0 pin wrong"); }
-    if e0.source != None         { return TestResult::Fail("e0 source should be None"); }
-    if e0.source_index != 16     { return TestResult::Fail("e0 source_index wrong"); }
+    if e0.address != 0x0001_FFFF {
+        return TestResult::Fail("e0 address wrong");
+    }
+    if e0.pin != 0 {
+        return TestResult::Fail("e0 pin wrong");
+    }
+    if e0.source != None {
+        return TestResult::Fail("e0 source should be None");
+    }
+    if e0.source_index != 16 {
+        return TestResult::Fail("e0 source_index wrong");
+    }
 
     let e1 = &prt[1];
-    if e1.address != 0x0002_FFFF { return TestResult::Fail("e1 address wrong"); }
-    if e1.pin != 1               { return TestResult::Fail("e1 pin wrong"); }
+    if e1.address != 0x0002_FFFF {
+        return TestResult::Fail("e1 address wrong");
+    }
+    if e1.pin != 1 {
+        return TestResult::Fail("e1 pin wrong");
+    }
     match &e1.source {
         Some(s) if s == "\\_SB.LNKB" => {}
         _ => return TestResult::Fail("e1 source wrong"),
     }
-    if e1.source_index != 0 { return TestResult::Fail("e1 source_index wrong"); }
+    if e1.source_index != 0 {
+        return TestResult::Fail("e1 source_index wrong");
+    }
 
     TestResult::Pass
 }
@@ -11714,10 +12973,10 @@ fn smoke_aml_oregion_sysmem_dword_field() -> TestResult {
     // OpRegion(RGN0, SystemMemory, addr, 8)
     body.push(0x5B); // EXT_OP_PREFIX
     body.push(0x80); // EXT_OP_REGION_OP
-    // NameSeg RGN0 (4 bytes, no prefix — relative to parent \)
+                     // NameSeg RGN0 (4 bytes, no prefix — relative to parent \)
     body.extend_from_slice(b"RGN0");
     body.push(0x00); // RegionSpace = SystemMemory
-    // RegionOffset: QWordPrefix + 8-byte address
+                     // RegionOffset: QWordPrefix + 8-byte address
     body.push(0x0E);
     body.extend_from_slice(&addr.to_le_bytes());
     // RegionLen: BytePrefix + 8
@@ -11750,14 +13009,18 @@ fn smoke_aml_oregion_sysmem_dword_field() -> TestResult {
                 TestResult::Fail("\\F0 value mismatch (expected 0xDEADBEEF)")
             }
         }
-        Err(narf_aml::oregion::FieldAccessError::NoField) =>
-            TestResult::Fail("\\F0 not registered"),
-        Err(narf_aml::oregion::FieldAccessError::NoRegion) =>
-            TestResult::Fail("\\RGN0 not registered"),
-        Err(narf_aml::oregion::FieldAccessError::TooWide) =>
-            TestResult::Fail("read_field reported TooWide"),
-        Err(narf_aml::oregion::FieldAccessError::Unsupported) =>
-            TestResult::Fail("read_field returned Unsupported for SystemMemory"),
+        Err(narf_aml::oregion::FieldAccessError::NoField) => {
+            TestResult::Fail("\\F0 not registered")
+        }
+        Err(narf_aml::oregion::FieldAccessError::NoRegion) => {
+            TestResult::Fail("\\RGN0 not registered")
+        }
+        Err(narf_aml::oregion::FieldAccessError::TooWide) => {
+            TestResult::Fail("read_field reported TooWide")
+        }
+        Err(narf_aml::oregion::FieldAccessError::Unsupported) => {
+            TestResult::Fail("read_field returned Unsupported for SystemMemory")
+        }
     }
 }
 kernel_test!(smoke_aml_oregion_sysmem_dword_field);
@@ -11813,14 +13076,16 @@ fn smoke_aml_oregion_bit_fields() -> TestResult {
         (_, Ok(0), _) => TestResult::Fail("\\F1 bit=0 from 0xFF buffer"),
         (_, _, Ok(0)) => TestResult::Fail("\\F2 bit=0 from 0xFF buffer"),
         (Ok(1), Ok(1), Ok(1)) => TestResult::Pass,
-        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
-            match e {
-                narf_aml::oregion::FieldAccessError::NoField  => TestResult::Fail("field not registered"),
-                narf_aml::oregion::FieldAccessError::NoRegion => TestResult::Fail("region not registered"),
-                narf_aml::oregion::FieldAccessError::TooWide  => TestResult::Fail("field TooWide"),
-                narf_aml::oregion::FieldAccessError::Unsupported => TestResult::Fail("Unsupported"),
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => match e {
+            narf_aml::oregion::FieldAccessError::NoField => {
+                TestResult::Fail("field not registered")
             }
-        }
+            narf_aml::oregion::FieldAccessError::NoRegion => {
+                TestResult::Fail("region not registered")
+            }
+            narf_aml::oregion::FieldAccessError::TooWide => TestResult::Fail("field TooWide"),
+            narf_aml::oregion::FieldAccessError::Unsupported => TestResult::Fail("Unsupported"),
+        },
         _ => TestResult::Fail("unexpected field value (not 0 or 1)"),
     }
 }
@@ -11831,7 +13096,9 @@ fn smoke_aml_oregion_boot_regions_present() -> TestResult {
     // After parse_namespace at boot, QEMU's DSDT declares several
     // PNP0C02 / EC OpRegions. Verify that at least one was captured.
     let mut count = 0usize;
-    narf_aml::oregion::for_each_region(|_| { count += 1; });
+    narf_aml::oregion::for_each_region(|_| {
+        count += 1;
+    });
     if count > 0 {
         TestResult::Pass
     } else {
@@ -11937,7 +13204,7 @@ fn smoke_aml_oregion_pci_config_resolves() -> TestResult {
     // ── Verify region registration ────────────────────────────────────
     let rgn = match narf_aml::oregion::region_for("\\PCIT.RGNT") {
         Some(r) => r,
-        None    => return TestResult::Fail("RGNT not registered"),
+        None => return TestResult::Fail("RGNT not registered"),
     };
     if rgn.space != narf_aml::oregion::RegionSpace::PciConfig {
         return TestResult::Fail("RGNT space is not PciConfig");
@@ -11959,18 +13226,19 @@ fn smoke_aml_oregion_pci_config_resolves() -> TestResult {
         Ok(_) => TestResult::Pass,
         // When the ECAM base was available the resolver should have
         // produced an address; Unsupported in that case is a bug.
-        Err(narf_aml::oregion::FieldAccessError::Unsupported) if ecam_present =>
-            TestResult::Fail("read_field returned Unsupported despite ECAM base being known"),
+        Err(narf_aml::oregion::FieldAccessError::Unsupported) if ecam_present => {
+            TestResult::Fail("read_field returned Unsupported despite ECAM base being known")
+        }
         // When there is no ECAM base (e.g. aarch64 QEMU without MCFG),
         // Unsupported is the correct graceful fallback.
-        Err(narf_aml::oregion::FieldAccessError::Unsupported) =>
-            TestResult::Pass,
-        Err(narf_aml::oregion::FieldAccessError::NoField) =>
-            TestResult::Fail("B0RT field not registered"),
-        Err(narf_aml::oregion::FieldAccessError::NoRegion) =>
-            TestResult::Fail("RGNT region missing"),
-        Err(narf_aml::oregion::FieldAccessError::TooWide) =>
-            TestResult::Fail("B0RT TooWide"),
+        Err(narf_aml::oregion::FieldAccessError::Unsupported) => TestResult::Pass,
+        Err(narf_aml::oregion::FieldAccessError::NoField) => {
+            TestResult::Fail("B0RT field not registered")
+        }
+        Err(narf_aml::oregion::FieldAccessError::NoRegion) => {
+            TestResult::Fail("RGNT region missing")
+        }
+        Err(narf_aml::oregion::FieldAccessError::TooWide) => TestResult::Fail("B0RT TooWide"),
     }
 }
 kernel_test!(smoke_aml_oregion_pci_config_resolves);
@@ -11999,29 +13267,33 @@ fn smoke_aml_sync_mutex_acquire_release() -> TestResult {
     // -- Mutex(\SM1_, 0) declaration --
     // EXT_OP_PREFIX EXT_MUTEX_OP NameString SyncFlags
     let mut blob: Vec<u8> = Vec::new();
-    blob.push(0x5B);                      // EXT_OP_PREFIX
-    blob.push(0x01);                      // EXT_MUTEX_OP
+    blob.push(0x5B); // EXT_OP_PREFIX
+    blob.push(0x01); // EXT_MUTEX_OP
     blob.extend_from_slice(&name_seg_root(b"SM1_")); // \SM1_
-    blob.push(0x00);                      // SyncFlags
+    blob.push(0x00); // SyncFlags
 
     // -- Method(\SM2_, 0) body --
     // AcquireOp \SM1_ 0xFFFF
     let mut body: Vec<u8> = Vec::new();
-    body.push(0x5B); body.push(0x23);    // AcquireOp
+    body.push(0x5B);
+    body.push(0x23); // AcquireOp
     body.extend_from_slice(&name_seg_root(b"SM1_")); // \SM1_
-    body.push(0xFF); body.push(0xFF);    // timeout = 0xFFFF
-    // ReleaseOp \SM1_
-    body.push(0x5B); body.push(0x27);    // ReleaseOp
+    body.push(0xFF);
+    body.push(0xFF); // timeout = 0xFFFF
+                     // ReleaseOp \SM1_
+    body.push(0x5B);
+    body.push(0x27); // ReleaseOp
     body.extend_from_slice(&name_seg_root(b"SM1_")); // \SM1_
-    // Return(One)
-    body.push(0xA4); body.push(0x01);    // ReturnOp OneOp
+                                                     // Return(One)
+    body.push(0xA4);
+    body.push(0x01); // ReturnOp OneOp
 
     // pkg_total = 1(pkglen) + 1(root) + 4(seg) + 1(flags) + body.len()
     let pkg_total = 1 + 1 + 4 + 1 + body.len();
-    blob.push(0x14);                         // MethodOp
-    blob.push(pkg_total as u8);              // single-byte PkgLength
+    blob.push(0x14); // MethodOp
+    blob.push(pkg_total as u8); // single-byte PkgLength
     blob.extend_from_slice(&name_seg_root(b"SM2_")); // \SM2_
-    blob.push(0x00);                         // MethodFlags
+    blob.push(0x00); // MethodFlags
     blob.extend_from_slice(&body);
 
     if narf_aml::__parse_body_for_test(&blob, "\\").is_err() {
@@ -12048,14 +13320,19 @@ fn smoke_aml_sync_stall_sleep_no_trap() -> TestResult {
 
     // StallOp BytePrefix 10
     let mut body: Vec<u8> = Vec::new();
-    body.push(0x5B); body.push(0x21);   // StallOp
-    body.push(0x0A); body.push(10);     // BytePrefix 10
-    // SleepOp BytePrefix 1
-    body.push(0x5B); body.push(0x22);   // SleepOp
-    body.push(0x0A); body.push(1);      // BytePrefix 1
-    // Return(0x42)
-    body.push(0xA4);                    // ReturnOp
-    body.push(0x0A); body.push(0x42);   // BytePrefix 0x42
+    body.push(0x5B);
+    body.push(0x21); // StallOp
+    body.push(0x0A);
+    body.push(10); // BytePrefix 10
+                   // SleepOp BytePrefix 1
+    body.push(0x5B);
+    body.push(0x22); // SleepOp
+    body.push(0x0A);
+    body.push(1); // BytePrefix 1
+                  // Return(0x42)
+    body.push(0xA4); // ReturnOp
+    body.push(0x0A);
+    body.push(0x42); // BytePrefix 0x42
 
     let pkg_total = 1 + 1 + 4 + 1 + body.len();
     let mut blob: Vec<u8> = Vec::new();
@@ -12095,17 +13372,19 @@ fn smoke_aml_sync_notify_dispatch() -> TestResult {
 
     // Declare Name(\TGT_, 0) so \TGT exists in the namespace.
     let mut blob: Vec<u8> = Vec::new();
-    blob.push(0x08);                          // NameOp
+    blob.push(0x08); // NameOp
     blob.extend_from_slice(&name_seg_root(b"TGT_")); // \TGT_
-    blob.push(0x00);                          // ZeroOp (value = 0)
+    blob.push(0x00); // ZeroOp (value = 0)
 
     // Method(\SM4_, 0) { Notify(\TGT_, 5); Return(One) }
     // NotifyOp \TGT_ BytePrefix 5 → 0x86 0x5C TGT_ 0x0A 0x05
     let mut body: Vec<u8> = Vec::new();
-    body.push(0x86);                          // NotifyOp
+    body.push(0x86); // NotifyOp
     body.extend_from_slice(&name_seg_root(b"TGT_")); // \TGT_
-    body.push(0x0A); body.push(5);           // BytePrefix 5
-    body.push(0xA4); body.push(0x01);        // Return(One)
+    body.push(0x0A);
+    body.push(5); // BytePrefix 5
+    body.push(0xA4);
+    body.push(0x01); // Return(One)
 
     let pkg_total = 1 + 1 + 4 + 1 + body.len();
     blob.push(0x14);
@@ -12121,7 +13400,7 @@ fn smoke_aml_sync_notify_dispatch() -> TestResult {
     NOTIFY_VAL.store(0, Ordering::Relaxed);
     match narf_aml::eval::evaluate_method("\\SM4", &[]) {
         Err(_) => return TestResult::Fail("evaluate_method \\SM4 failed"),
-        Ok(_)  => {}
+        Ok(_) => {}
     }
     if NOTIFY_VAL.load(Ordering::Relaxed) == 5 {
         TestResult::Pass
@@ -12141,24 +13420,30 @@ fn smoke_aml_sync_event_signal_wait() -> TestResult {
 
     // -- Event(\SM5_) declaration --
     let mut blob: Vec<u8> = Vec::new();
-    blob.push(0x5B);                          // EXT_OP_PREFIX
-    blob.push(0x02);                          // EXT_EVENT_OP
+    blob.push(0x5B); // EXT_OP_PREFIX
+    blob.push(0x02); // EXT_EVENT_OP
     blob.extend_from_slice(&name_seg_root(b"SM5_")); // \SM5_
 
     // -- Method(\SM6_, 0) body --
     // Reset(\SM5_): 0x5B 0x26 \SM5_
     let mut body: Vec<u8> = Vec::new();
-    body.push(0x5B); body.push(0x26);        // ResetOp
+    body.push(0x5B);
+    body.push(0x26); // ResetOp
     body.extend_from_slice(&name_seg_root(b"SM5_")); // \SM5_
-    // Signal(\SM5_): 0x5B 0x24 \SM5_
-    body.push(0x5B); body.push(0x24);        // SignalOp
+                                                     // Signal(\SM5_): 0x5B 0x24 \SM5_
+    body.push(0x5B);
+    body.push(0x24); // SignalOp
     body.extend_from_slice(&name_seg_root(b"SM5_")); // \SM5_
-    // Wait(\SM5_, 0xFFFF): 0x5B 0x25 \SM5_ WordPrefix 0xFFFF
-    body.push(0x5B); body.push(0x25);        // WaitOp
+                                                     // Wait(\SM5_, 0xFFFF): 0x5B 0x25 \SM5_ WordPrefix 0xFFFF
+    body.push(0x5B);
+    body.push(0x25); // WaitOp
     body.extend_from_slice(&name_seg_root(b"SM5_")); // \SM5_
-    body.push(0x0B); body.push(0xFF); body.push(0xFF); // WordPrefix 0xFFFF
-    // Return(One): 0xA4 0x01
-    body.push(0xA4); body.push(0x01);
+    body.push(0x0B);
+    body.push(0xFF);
+    body.push(0xFF); // WordPrefix 0xFFFF
+                     // Return(One): 0xA4 0x01
+    body.push(0xA4);
+    body.push(0x01);
 
     let pkg_total = 1 + 1 + 4 + 1 + body.len();
     blob.push(0x14);
@@ -12200,11 +13485,12 @@ fn smoke_aml_gpe_install_aml_handlers() -> TestResult {
     //   pkg_total = 1(PkgLen) + 4(name) + 1(flags) + 2(body) = 8
     let method_l01: Vec<u8> = {
         let mut v = Vec::new();
-        v.push(0x14);           // MethodOp
-        v.push(8u8);            // PkgLength (single-byte: covers rest of method)
+        v.push(0x14); // MethodOp
+        v.push(8u8); // PkgLength (single-byte: covers rest of method)
         v.extend_from_slice(b"_L01"); // relative NameSeg
-        v.push(0x00);           // MethodFlags: 0 args
-        v.push(0xA4); v.push(0x01); // Return(One)
+        v.push(0x00); // MethodFlags: 0 args
+        v.push(0xA4);
+        v.push(0x01); // Return(One)
         v
     };
 
@@ -12212,11 +13498,12 @@ fn smoke_aml_gpe_install_aml_handlers() -> TestResult {
     //   pkg_total = 1(PkgLen) + 4(name) + 1(flags) + 2(body) = 8
     let method_e0f: Vec<u8> = {
         let mut v = Vec::new();
-        v.push(0x14);           // MethodOp
-        v.push(8u8);            // PkgLength
+        v.push(0x14); // MethodOp
+        v.push(8u8); // PkgLength
         v.extend_from_slice(b"_E0F"); // relative NameSeg
-        v.push(0x00);           // MethodFlags
-        v.push(0xA4); v.push(0x00); // Return(Zero)
+        v.push(0x00); // MethodFlags
+        v.push(0xA4);
+        v.push(0x00); // Return(Zero)
         v
     };
 
@@ -12224,10 +13511,10 @@ fn smoke_aml_gpe_install_aml_handlers() -> TestResult {
     //   NameString = 0x5C(ROOT) + "_GPE" = 5 bytes
     //   scope body = method_l01 (9 bytes) + method_e0f (9 bytes) = 18 bytes
     //   pkg_total = 1(PkgLen) + 5(name) + 18(methods) = 24 bytes
-    blob.push(0x10);            // ScopeOp
+    blob.push(0x10); // ScopeOp
     let pkg_len_pos = blob.len();
-    blob.push(0u8);             // PkgLength placeholder
-    blob.push(b'\\');           // ROOT_CHAR
+    blob.push(0u8); // PkgLength placeholder
+    blob.push(b'\\'); // ROOT_CHAR
     blob.extend_from_slice(b"_GPE"); // NameSeg
     blob.extend_from_slice(&method_l01);
     blob.extend_from_slice(&method_e0f);
@@ -12259,7 +13546,9 @@ fn smoke_aml_gpe_dispatch_native() -> TestResult {
 
     fn handler(gpe: u32) {
         // Only count our specific GPE to avoid interference.
-        if gpe == 99 { HITS.fetch_add(1, Ordering::Relaxed); }
+        if gpe == 99 {
+            HITS.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     narf_aml::gpe::register_native_handler(99, handler);
@@ -12297,9 +13586,10 @@ fn smoke_aml_gpe_dispatch_aml() -> TestResult {
     // ── build blob ────────────────────────────────────────────────
     // Declare Name(\TGN_, 0) so \TGN exists in the namespace.
     let mut blob: Vec<u8> = Vec::new();
-    blob.push(0x08);            // NameOp
-    blob.push(b'\\'); blob.extend_from_slice(b"TGN_"); // \TGN_
-    blob.push(0x00);            // ZeroOp
+    blob.push(0x08); // NameOp
+    blob.push(b'\\');
+    blob.extend_from_slice(b"TGN_"); // \TGN_
+    blob.push(0x00); // ZeroOp
 
     // Scope(\\_GPE) { Method(_L05, 0) { Notify(\TGN_, 0xAB); Return(One) } }
     // Method body: Notify(\TGN_, 0xAB) + Return(One)
@@ -12309,30 +13599,34 @@ fn smoke_aml_gpe_dispatch_aml() -> TestResult {
     // pkg_total for method = 1(PkgLen) + 4(name "_L05") + 1(flags) + 10(body) = 16
     let method_body: Vec<u8> = {
         let mut v = Vec::new();
-        v.push(0x86);           // NotifyOp
-        v.push(b'\\'); v.extend_from_slice(b"TGN_"); // \TGN_
-        v.push(0x0A); v.push(0xABu8); // BytePrefix 0xAB
-        v.push(0xA4); v.push(0x01); // Return(One)
+        v.push(0x86); // NotifyOp
+        v.push(b'\\');
+        v.extend_from_slice(b"TGN_"); // \TGN_
+        v.push(0x0A);
+        v.push(0xABu8); // BytePrefix 0xAB
+        v.push(0xA4);
+        v.push(0x01); // Return(One)
         v
     };
     let method_l05: Vec<u8> = {
         let mut v = Vec::new();
-        v.push(0x14);           // MethodOp
-        // pkg_total = 1(PkgLen) + 4("_L05") + 1(flags) + method_body.len()
+        v.push(0x14); // MethodOp
+                      // pkg_total = 1(PkgLen) + 4("_L05") + 1(flags) + method_body.len()
         let pkg_total: u8 = (1 + 4 + 1 + method_body.len()) as u8;
         v.push(pkg_total);
         v.extend_from_slice(b"_L05"); // relative NameSeg
-        v.push(0x00);           // MethodFlags
+        v.push(0x00); // MethodFlags
         v.extend_from_slice(&method_body);
         v
     };
 
     // Scope(\\_GPE) { method_l05 }
     // pkg_total = 1(PkgLen) + 5(\\_GPE) + method_l05.len()
-    blob.push(0x10);            // ScopeOp
+    blob.push(0x10); // ScopeOp
     let pkg_len_pos = blob.len();
-    blob.push(0u8);             // PkgLength placeholder
-    blob.push(b'\\'); blob.extend_from_slice(b"_GPE");
+    blob.push(0u8); // PkgLength placeholder
+    blob.push(b'\\');
+    blob.extend_from_slice(b"_GPE");
     blob.extend_from_slice(&method_l05);
     let pkg_total = blob.len() - pkg_len_pos;
     blob[pkg_len_pos] = pkg_total as u8;
@@ -12425,37 +13719,47 @@ fn smoke_aml_prt_evaluation_round_trip() -> TestResult {
     // inner Package(4) { 0x0001FFFF, 0, 0, 16 }
     let inner1: alloc::vec::Vec<u8> = {
         let mut v = alloc::vec::Vec::new();
-        v.push(0x12);                       // PackageOp
-        v.push(0x0B);                       // PkgLen = 11
-        v.push(0x04);                       // NumElements = 4
-        // DWord 0x0001FFFF
-        v.push(0x0C); v.push(0xFF); v.push(0xFF); v.push(0x01); v.push(0x00);
-        v.push(0x00);                       // ZeroOp (0)
-        v.push(0x00);                       // ZeroOp (0)
-        v.push(0x0A); v.push(0x10);         // BytePrefix 16
+        v.push(0x12); // PackageOp
+        v.push(0x0B); // PkgLen = 11
+        v.push(0x04); // NumElements = 4
+                      // DWord 0x0001FFFF
+        v.push(0x0C);
+        v.push(0xFF);
+        v.push(0xFF);
+        v.push(0x01);
+        v.push(0x00);
+        v.push(0x00); // ZeroOp (0)
+        v.push(0x00); // ZeroOp (0)
+        v.push(0x0A);
+        v.push(0x10); // BytePrefix 16
         v
     };
 
     // inner Package(4) { 0x0002FFFF, 1, 0, 17 }
     let inner2: alloc::vec::Vec<u8> = {
         let mut v = alloc::vec::Vec::new();
-        v.push(0x12);                       // PackageOp
-        v.push(0x0B);                       // PkgLen = 11
-        v.push(0x04);                       // NumElements = 4
-        // DWord 0x0002FFFF
-        v.push(0x0C); v.push(0xFF); v.push(0xFF); v.push(0x02); v.push(0x00);
-        v.push(0x01);                       // OneOp (1)
-        v.push(0x00);                       // ZeroOp (0)
-        v.push(0x0A); v.push(0x11);         // BytePrefix 17
+        v.push(0x12); // PackageOp
+        v.push(0x0B); // PkgLen = 11
+        v.push(0x04); // NumElements = 4
+                      // DWord 0x0002FFFF
+        v.push(0x0C);
+        v.push(0xFF);
+        v.push(0xFF);
+        v.push(0x02);
+        v.push(0x00);
+        v.push(0x01); // OneOp (1)
+        v.push(0x00); // ZeroOp (0)
+        v.push(0x0A);
+        v.push(0x11); // BytePrefix 17
         v
     };
 
     // outer Package(2) { inner1, inner2 }
     let outer_pkg: alloc::vec::Vec<u8> = {
         let mut v = alloc::vec::Vec::new();
-        v.push(0x12);                       // PackageOp
-        v.push(0x1A);                       // PkgLen = 26
-        v.push(0x02);                       // NumElements = 2
+        v.push(0x12); // PackageOp
+        v.push(0x1A); // PkgLen = 26
+        v.push(0x02); // NumElements = 2
         v.extend_from_slice(&inner1);
         v.extend_from_slice(&inner2);
         v
@@ -12464,7 +13768,7 @@ fn smoke_aml_prt_evaluation_round_trip() -> TestResult {
     // Return(outer_pkg)
     let return_stmt: alloc::vec::Vec<u8> = {
         let mut v = alloc::vec::Vec::new();
-        v.push(0xA4);                       // ReturnOp
+        v.push(0xA4); // ReturnOp
         v.extend_from_slice(&outer_pkg);
         v
     };
@@ -12472,10 +13776,10 @@ fn smoke_aml_prt_evaluation_round_trip() -> TestResult {
     // Method(_PRT, 0) { return_stmt }
     let method: alloc::vec::Vec<u8> = {
         let mut v = alloc::vec::Vec::new();
-        v.push(0x14);                       // MethodOp
-        v.push(0x22);                       // PkgLen = 34
-        v.extend_from_slice(b"_PRT");       // NameSeg (relative)
-        v.push(0x00);                       // MethodFlags
+        v.push(0x14); // MethodOp
+        v.push(0x22); // PkgLen = 34
+        v.extend_from_slice(b"_PRT"); // NameSeg (relative)
+        v.push(0x00); // MethodFlags
         v.extend_from_slice(&return_stmt);
         v
     };
@@ -12483,9 +13787,10 @@ fn smoke_aml_prt_evaluation_round_trip() -> TestResult {
     // Device(PT01) { method }
     let device: alloc::vec::Vec<u8> = {
         let mut v = alloc::vec::Vec::new();
-        v.push(0x5B); v.push(0x82);         // DeviceOp
-        v.push(0x28);                       // PkgLen = 40
-        v.extend_from_slice(b"PT01");       // NameSeg
+        v.push(0x5B);
+        v.push(0x82); // DeviceOp
+        v.push(0x28); // PkgLen = 40
+        v.extend_from_slice(b"PT01"); // NameSeg
         v.extend_from_slice(&method);
         v
     };
@@ -12493,10 +13798,10 @@ fn smoke_aml_prt_evaluation_round_trip() -> TestResult {
     // Scope(\_T1) { device } — name: root char + "_T1_"
     let blob: alloc::vec::Vec<u8> = {
         let mut v = alloc::vec::Vec::new();
-        v.push(0x10);                       // ScopeOp
-        v.push(0x30);                       // PkgLen = 48
-        v.push(b'\\');                      // root char
-        v.extend_from_slice(b"_T1_");       // NameSeg (strips to _T1)
+        v.push(0x10); // ScopeOp
+        v.push(0x30); // PkgLen = 48
+        v.push(b'\\'); // root char
+        v.extend_from_slice(b"_T1_"); // NameSeg (strips to _T1)
         v.extend_from_slice(&device);
         v
     };
@@ -12577,17 +13882,18 @@ fn smoke_aml_crs_evaluation_round_trip() -> TestResult {
 
     // Resource template bytes: IRQ(mask=0x0010) + IO port + EndTag
     let res_bytes: [u8; 13] = [
-        0x22, 0x10, 0x00,                               // small IRQ descriptor, mask=0x0010
+        0x22, 0x10, 0x00, // small IRQ descriptor, mask=0x0010
         0x47, 0x01, 0x00, 0x03, 0x00, 0x03, 0x01, 0x08, // IO Port descriptor
-        0x79, 0x00,                                     // EndTag
+        0x79, 0x00, // EndTag
     ];
 
     // Buffer(13) { res_bytes }
     let buffer: alloc::vec::Vec<u8> = {
         let mut v = alloc::vec::Vec::new();
-        v.push(0x11);                       // BufferOp
-        v.push(0x10);                       // PkgLen = 16
-        v.push(0x0A); v.push(0x0D);         // BytePrefix 13 (size TermArg)
+        v.push(0x11); // BufferOp
+        v.push(0x10); // PkgLen = 16
+        v.push(0x0A);
+        v.push(0x0D); // BytePrefix 13 (size TermArg)
         v.extend_from_slice(&res_bytes);
         v
     };
@@ -12595,7 +13901,7 @@ fn smoke_aml_crs_evaluation_round_trip() -> TestResult {
     // Return(buffer)
     let return_stmt: alloc::vec::Vec<u8> = {
         let mut v = alloc::vec::Vec::new();
-        v.push(0xA4);                       // ReturnOp
+        v.push(0xA4); // ReturnOp
         v.extend_from_slice(&buffer);
         v
     };
@@ -12603,10 +13909,10 @@ fn smoke_aml_crs_evaluation_round_trip() -> TestResult {
     // Method(_CRS, 0) { return_stmt }
     let method: alloc::vec::Vec<u8> = {
         let mut v = alloc::vec::Vec::new();
-        v.push(0x14);                       // MethodOp
-        v.push(0x18);                       // PkgLen = 24
-        v.extend_from_slice(b"_CRS");       // NameSeg
-        v.push(0x00);                       // MethodFlags
+        v.push(0x14); // MethodOp
+        v.push(0x18); // PkgLen = 24
+        v.extend_from_slice(b"_CRS"); // NameSeg
+        v.push(0x00); // MethodFlags
         v.extend_from_slice(&return_stmt);
         v
     };
@@ -12614,9 +13920,10 @@ fn smoke_aml_crs_evaluation_round_trip() -> TestResult {
     // Device(CS01) { method }
     let device: alloc::vec::Vec<u8> = {
         let mut v = alloc::vec::Vec::new();
-        v.push(0x5B); v.push(0x82);         // DeviceOp
-        v.push(0x1E);                       // PkgLen = 30
-        v.extend_from_slice(b"CS01");       // NameSeg
+        v.push(0x5B);
+        v.push(0x82); // DeviceOp
+        v.push(0x1E); // PkgLen = 30
+        v.extend_from_slice(b"CS01"); // NameSeg
         v.extend_from_slice(&method);
         v
     };
@@ -12624,10 +13931,10 @@ fn smoke_aml_crs_evaluation_round_trip() -> TestResult {
     // Scope(\_T2) { device }
     let blob: alloc::vec::Vec<u8> = {
         let mut v = alloc::vec::Vec::new();
-        v.push(0x10);                       // ScopeOp
-        v.push(0x26);                       // PkgLen = 38
-        v.push(b'\\');                      // root char
-        v.extend_from_slice(b"_T2_");       // NameSeg (strips to _T2)
+        v.push(0x10); // ScopeOp
+        v.push(0x26); // PkgLen = 38
+        v.push(b'\\'); // root char
+        v.extend_from_slice(b"_T2_"); // NameSeg (strips to _T2)
         v.extend_from_slice(&device);
         v
     };
@@ -12668,7 +13975,7 @@ fn smoke_aml_prt_method_not_found() -> TestResult {
 
     match narf_aml::prt_crs::evaluate_prt_for("\\NOPE") {
         Err(narf_aml::prt_crs::BridgeError::MethodNotFound) => TestResult::Pass,
-        Ok(_)  => TestResult::Fail("prt_not_found: expected MethodNotFound, got Ok"),
+        Ok(_) => TestResult::Fail("prt_not_found: expected MethodNotFound, got Ok"),
         Err(_) => TestResult::Fail("prt_not_found: expected MethodNotFound, got different Err"),
     }
 }
@@ -12693,12 +14000,12 @@ kernel_test!(smoke_drivers_reset_default_is_noop);
 
 fn smoke_hotplug_default_dispatcher_round_trip() -> TestResult {
     use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU32, Ordering};
     use narf_bus::hotplug::{
-        __clear_listeners, dispatch_event, install_default_dispatcher,
-        listener_count, HotplugEvent, HotplugListener,
+        __clear_listeners, dispatch_event, install_default_dispatcher, listener_count,
+        HotplugEvent, HotplugListener,
     };
     use narf_bus::{BusAddr, DeviceId, PcieAddr};
-    use core::sync::atomic::{AtomicU32, Ordering};
 
     __clear_listeners();
     if listener_count() != 0 {
@@ -12714,8 +14021,12 @@ fn smoke_hotplug_default_dispatcher_round_trip() -> TestResult {
     impl HotplugListener for Tally {
         fn on_event(&self, ev: HotplugEvent) {
             match ev {
-                HotplugEvent::Attach { .. } => { ATTACHES.fetch_add(1, Ordering::Relaxed); }
-                HotplugEvent::Detach { .. } => { DETACHES.fetch_add(1, Ordering::Relaxed); }
+                HotplugEvent::Attach { .. } => {
+                    ATTACHES.fetch_add(1, Ordering::Relaxed);
+                }
+                HotplugEvent::Detach { .. } => {
+                    DETACHES.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -12729,11 +14040,20 @@ fn smoke_hotplug_default_dispatcher_round_trip() -> TestResult {
 
     let baseline_a = ATTACHES.load(Ordering::Relaxed);
     let baseline_d = DETACHES.load(Ordering::Relaxed);
-    let addr = BusAddr::Pcie(PcieAddr { segment: 0, bus: 0, device: 31, function: 0 });
+    let addr = BusAddr::Pcie(PcieAddr {
+        segment: 0,
+        bus: 0,
+        device: 31,
+        function: 0,
+    });
 
     dispatch_event(HotplugEvent::Attach {
         addr,
-        device_id: DeviceId { vendor: 0x1234, device: 0x5678, class: 0 },
+        device_id: DeviceId {
+            vendor: 0x1234,
+            device: 0x5678,
+            class: 0,
+        },
     });
     dispatch_event(HotplugEvent::Detach { addr });
 
@@ -12773,12 +14093,24 @@ kernel_test!(smoke_aer_classifier_severity);
 fn smoke_power_dstate_classification() -> TestResult {
     use narf_power::DState;
 
-    if !DState::D0.is_active()    { return TestResult::Fail("D0.is_active"); }
-    if  DState::D3Hot.is_active() { return TestResult::Fail("D3Hot shouldn't be active"); }
-    if  DState::D3Cold.is_active(){ return TestResult::Fail("D3Cold shouldn't be active"); }
-    if !DState::D0.preserves_context()    { return TestResult::Fail("D0 must preserve"); }
-    if !DState::D3Hot.preserves_context() { return TestResult::Fail("D3Hot must preserve"); }
-    if  DState::D3Cold.preserves_context(){ return TestResult::Fail("D3Cold should NOT preserve"); }
+    if !DState::D0.is_active() {
+        return TestResult::Fail("D0.is_active");
+    }
+    if DState::D3Hot.is_active() {
+        return TestResult::Fail("D3Hot shouldn't be active");
+    }
+    if DState::D3Cold.is_active() {
+        return TestResult::Fail("D3Cold shouldn't be active");
+    }
+    if !DState::D0.preserves_context() {
+        return TestResult::Fail("D0 must preserve");
+    }
+    if !DState::D3Hot.preserves_context() {
+        return TestResult::Fail("D3Hot must preserve");
+    }
+    if DState::D3Cold.preserves_context() {
+        return TestResult::Fail("D3Cold should NOT preserve");
+    }
     if !DState::D1.preserves_context() || !DState::D2.preserves_context() {
         return TestResult::Fail("intermediate states preserve context");
     }
@@ -12813,19 +14145,19 @@ fn build_synthetic_pe(machine: u16) -> alloc::vec::Vec<u8> {
     buf[fh..fh + 2].copy_from_slice(&machine.to_le_bytes());
     buf[fh + 2..fh + 4].copy_from_slice(&2u16.to_le_bytes()); // 2 sections
     buf[fh + 16..fh + 18].copy_from_slice(&0xF0u16.to_le_bytes()); // opt-hdr size
-    // Optional header.
+                                                                   // Optional header.
     let oh = fh + 20; // 0x98
     buf[oh..oh + 2].copy_from_slice(&0x20Bu16.to_le_bytes()); // PE32+
     buf[oh + 0x10..oh + 0x14].copy_from_slice(&0x1000u32.to_le_bytes()); // entry
     buf[oh + 0x18..oh + 0x20].copy_from_slice(&0x1_4000_0000u64.to_le_bytes()); // image base
     buf[oh + 0x38..oh + 0x3C].copy_from_slice(&0x3000u32.to_le_bytes()); // size of image
     buf[oh + 0x6C..oh + 0x70].copy_from_slice(&16u32.to_le_bytes()); // num dirs
-    // DataDirectory[1] = Import: RVA 0x2000, size 0x60.
+                                                                     // DataDirectory[1] = Import: RVA 0x2000, size 0x60.
     buf[oh + 0x70 + 8..oh + 0x70 + 12].copy_from_slice(&0x2000u32.to_le_bytes());
     buf[oh + 0x70 + 12..oh + 0x70 + 16].copy_from_slice(&0x60u32.to_le_bytes());
     // DataDirectory[5] = BaseReloc: RVA 0x2100, size 0x10.
-    buf[oh + 0x70 + 5*8..oh + 0x70 + 5*8 + 4].copy_from_slice(&0x2100u32.to_le_bytes());
-    buf[oh + 0x70 + 5*8 + 4..oh + 0x70 + 5*8 + 8].copy_from_slice(&0x10u32.to_le_bytes());
+    buf[oh + 0x70 + 5 * 8..oh + 0x70 + 5 * 8 + 4].copy_from_slice(&0x2100u32.to_le_bytes());
+    buf[oh + 0x70 + 5 * 8 + 4..oh + 0x70 + 5 * 8 + 8].copy_from_slice(&0x10u32.to_le_bytes());
 
     // Section table (.text at 0x188, .idata at 0x1B0).
     let sec = oh + 0xF0; // 0x188
@@ -12875,8 +14207,7 @@ fn smoke_compat_win_load_pe_pipeline() -> TestResult {
     // VA points into the mapped compat-win-rt system DLL; for the
     // smoke we just need any non-zero VA to exercise IAT patching.
     fn resolver(module: &str, symbol: &str) -> Option<u64> {
-        if module.eq_ignore_ascii_case("kernel32.dll")
-           && symbol.eq_ignore_ascii_case("exitprocess")
+        if module.eq_ignore_ascii_case("kernel32.dll") && symbol.eq_ignore_ascii_case("exitprocess")
         {
             Some(0x7FFE_0000_2000) // synthetic compat-win-rt VA
         } else {
@@ -12887,8 +14218,10 @@ fn smoke_compat_win_load_pe_pipeline() -> TestResult {
     // SAFETY: the kernel test harness runs with the low-4-GiB
     // identity map and frame allocator initialised — both contracts
     // load_pe documents.
-    let proc = match unsafe { load_pe(&bytes, resolver, /*pid=*/ 0xCAFE, /*tid=*/ 0xBABE) } {
-        Ok(p)  => p,
+    let proc = match unsafe {
+        load_pe(&bytes, resolver, /*pid=*/ 0xCAFE, /*tid=*/ 0xBABE)
+    } {
+        Ok(p) => p,
         Err(_) => return TestResult::Fail("compat-win: load_pe failed"),
     };
 
@@ -12920,11 +14253,12 @@ fn smoke_compat_win_load_pe_pipeline() -> TestResult {
         return TestResult::Fail("compat-win: expected 5 mapped regions");
     }
     // Stack range matches the Layout default and is mapped R+W.
-    let stack_region = regions.iter()
+    let stack_region = regions
+        .iter()
         .find(|r| r.base.as_u64() == proc.stack_base.as_u64());
     let stack_region = match stack_region {
         Some(r) => r,
-        None    => return TestResult::Fail("compat-win: stack region missing"),
+        None => return TestResult::Fail("compat-win: stack region missing"),
     };
     if stack_region.len != (proc.stack_top.as_u64() - proc.stack_base.as_u64()) {
         return TestResult::Fail("compat-win: stack region size mismatch");
@@ -12938,10 +14272,18 @@ fn smoke_compat_win_load_pe_pipeline() -> TestResult {
     let mut saw_teb = false;
     for r in &regions {
         let b = r.base.as_u64();
-        if b == section_base_text  { saw_text  = true; }
-        if b == section_base_idata { saw_idata = true; }
-        if b == narf_compat_win::personality::DEFAULT_PEB_VA { saw_peb = true; }
-        if b == narf_compat_win::personality::DEFAULT_TEB_VA { saw_teb = true; }
+        if b == section_base_text {
+            saw_text = true;
+        }
+        if b == section_base_idata {
+            saw_idata = true;
+        }
+        if b == narf_compat_win::personality::DEFAULT_PEB_VA {
+            saw_peb = true;
+        }
+        if b == narf_compat_win::personality::DEFAULT_TEB_VA {
+            saw_teb = true;
+        }
     }
     if !(saw_text && saw_idata && saw_peb && saw_teb) {
         return TestResult::Fail("compat-win: expected regions missing");
@@ -12967,13 +14309,9 @@ fn smoke_firmware_install_syscall_round_trip() -> TestResult {
     if !cfg!(feature = "firmware-allow-unsigned") {
         return TestResult::Skip("firmware-allow-unsigned off — registry rejects unsigned");
     }
-    use narf_firmware::{
-        bootstrap_authority, source_for,
-        BlobSource, BLOB_TRAILER_MAGIC,
-    };
+    use narf_firmware::{bootstrap_authority, source_for, BlobSource, BLOB_TRAILER_MAGIC};
     use narf_userspace::{
-        install_core_syscalls, Syscall, SyscallArgs, SyscallReturn,
-        SyscallTable, TrapContext,
+        install_core_syscalls, Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
     };
 
     // Reset both halves of the registry: the blob storage and
@@ -12994,8 +14332,8 @@ fn smoke_firmware_install_syscall_round_trip() -> TestResult {
     // `firmware-allow-unsigned` build feature.
     let mut blob = alloc::vec::Vec::with_capacity(256);
     blob.extend_from_slice(b"syscall e2e payload");
-    blob.extend_from_slice(&[0u8; 64]);          // signature
-    blob.extend_from_slice(&[0u8; 32]);          // signer
+    blob.extend_from_slice(&[0u8; 64]); // signature
+    blob.extend_from_slice(&[0u8; 32]); // signer
     blob.extend_from_slice(&0u32.to_le_bytes()); // mlen=0
     blob.extend_from_slice(&BLOB_TRAILER_MAGIC); // 'NRFW'
 
@@ -13006,11 +14344,20 @@ fn smoke_firmware_install_syscall_round_trip() -> TestResult {
     install_core_syscalls(&mut table);
 
     // Fake TrapContext.
-    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
     impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs { &self.args }
-        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
-        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
+            false
+        }
     }
     let mut ctx = FakeCtx {
         args: SyscallArgs {
@@ -13026,7 +14373,7 @@ fn smoke_firmware_install_syscall_round_trip() -> TestResult {
 
     let r = match ctx.ret {
         Some(r) => r,
-        None    => return TestResult::Fail("handler set no return value"),
+        None => return TestResult::Fail("handler set no return value"),
     };
     if r.value != 0 {
         return TestResult::Fail("FirmwareInstall returned non-zero");

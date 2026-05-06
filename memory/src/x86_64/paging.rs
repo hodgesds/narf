@@ -28,21 +28,21 @@ pub struct PageTableEntry(u64);
 pub struct PtFlags(u64);
 
 impl PtFlags {
-    pub const PRESENT:   Self = Self(1 <<  0);
-    pub const WRITABLE:  Self = Self(1 <<  1);
-    pub const USER:      Self = Self(1 <<  2);
-    pub const WRITE_THROUGH: Self = Self(1 <<  3);
-    pub const NO_CACHE:  Self = Self(1 <<  4);
-    pub const ACCESSED:  Self = Self(1 <<  5);
-    pub const DIRTY:     Self = Self(1 <<  6);
+    pub const PRESENT: Self = Self(1 << 0);
+    pub const WRITABLE: Self = Self(1 << 1);
+    pub const USER: Self = Self(1 << 2);
+    pub const WRITE_THROUGH: Self = Self(1 << 3);
+    pub const NO_CACHE: Self = Self(1 << 4);
+    pub const ACCESSED: Self = Self(1 << 5);
+    pub const DIRTY: Self = Self(1 << 6);
     /// On a PDPT / PD entry: "this is a huge page, not a pointer to the
     /// next-level table." On x86_64 a PS=1 PDPT entry maps 1 GiB; a
     /// PS=1 PD entry maps 2 MiB. Never set in a PML4 entry.
-    pub const HUGE_PAGE: Self = Self(1 <<  7);
-    pub const GLOBAL:    Self = Self(1 <<  8);
+    pub const HUGE_PAGE: Self = Self(1 << 7);
+    pub const GLOBAL: Self = Self(1 << 8);
     /// Execute-disable bit (IA32_EFER.NXE must be set for this to be
     /// interpreted; without NXE the bit is reserved-zero).
-    pub const NO_EXEC:   Self = Self(1 << 63);
+    pub const NO_EXEC: Self = Self(1 << 63);
 
     /// Protection-key mask. Bits 59..=62 in a PTE hold the PK field
     /// (4 bits, 16 possible domains). See SDM Vol 3 §4.6.2.
@@ -50,8 +50,12 @@ impl PtFlags {
 
     pub const EMPTY: Self = Self(0);
 
-    #[inline] pub const fn bits(self) -> u64 { self.0 }
-    #[inline] pub const fn contains(self, other: Self) -> bool {
+    #[inline]
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+    #[inline]
+    pub const fn contains(self, other: Self) -> bool {
         (self.0 & other.0) == other.0
     }
 
@@ -72,11 +76,15 @@ impl PtFlags {
 
 impl core::ops::BitOr for PtFlags {
     type Output = Self;
-    fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) }
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
 }
 
 impl core::ops::BitOrAssign for PtFlags {
-    fn bitor_assign(&mut self, rhs: Self) { self.0 |= rhs.0 }
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0
+    }
 }
 
 impl PageTableEntry {
@@ -89,15 +97,25 @@ impl PageTableEntry {
         Self((addr.raw() & 0x000f_ffff_ffff_f000) | flags.bits())
     }
 
-    #[inline] pub const fn is_present(self) -> bool { self.0 & 1 == 1 }
-    #[inline] pub const fn flags(self) -> PtFlags { PtFlags(self.0 & 0xfff0_0000_0000_0fff) }
+    #[inline]
+    pub const fn is_present(self) -> bool {
+        self.0 & 1 == 1
+    }
+    #[inline]
+    pub const fn flags(self) -> PtFlags {
+        PtFlags(self.0 & 0xfff0_0000_0000_0fff)
+    }
 
     /// Physical address of the mapped page / next-level table.
-    #[inline] pub const fn addr(self) -> PhysAddr {
+    #[inline]
+    pub const fn addr(self) -> PhysAddr {
         PhysAddr::new(self.0 & 0x000f_ffff_ffff_f000)
     }
 
-    #[inline] pub const fn raw(self) -> u64 { self.0 }
+    #[inline]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
 }
 
 impl fmt::Debug for PageTableEntry {
@@ -119,7 +137,9 @@ impl PageTable {
     pub fn zero_at(ptr: *mut PageTable) {
         // SAFETY: caller guarantees `ptr` references at least
         // `size_of::<PageTable>()` writable, properly-aligned bytes.
-        unsafe { ptr::write_bytes(ptr.cast::<u8>(), 0, core::mem::size_of::<PageTable>()); }
+        unsafe {
+            ptr::write_bytes(ptr.cast::<u8>(), 0, core::mem::size_of::<PageTable>());
+        }
     }
 }
 
@@ -168,12 +188,9 @@ pub unsafe fn new_user_pml4() -> Result<PhysAddr, PageTableAllocError> {
 ///
 /// # Safety
 /// Same as `new_user_pml4`.
-pub unsafe fn new_user_pml4_on(node: usize)
-    -> Result<PhysAddr, PageTableAllocError>
-{
-    let frame = crate::frame::alloc_frame_on(node)
-        .map_err(|_| PageTableAllocError::NoFrame)?;
-    let phys  = frame.start_address();
+pub unsafe fn new_user_pml4_on(node: usize) -> Result<PhysAddr, PageTableAllocError> {
+    let frame = crate::frame::alloc_frame_on(node).map_err(|_| PageTableAllocError::NoFrame)?;
+    let phys = frame.start_address();
 
     // Read the currently-active PML4.
     // SAFETY: `read_cr3` is a single privileged read — legal at CPL=0.
@@ -185,7 +202,7 @@ pub unsafe fn new_user_pml4_on(node: usize)
     unsafe {
         ptr::copy_nonoverlapping(
             cur_pml4.raw() as *const u8,
-            phys.raw()     as *mut u8,
+            phys.raw() as *mut u8,
             core::mem::size_of::<PageTable>(),
         );
     }
@@ -202,7 +219,9 @@ pub unsafe fn new_user_pml4_on(node: usize)
 /// - The write must respect the target's alignment.
 pub unsafe fn write_identity<T>(phys: PhysAddr, value: T) {
     // SAFETY: per caller contract.
-    unsafe { ptr::write_volatile(phys.raw() as *mut T, value); }
+    unsafe {
+        ptr::write_volatile(phys.raw() as *mut T, value);
+    }
 }
 
 /// Read the currently-active PML4 physical address from CR3.
@@ -263,8 +282,7 @@ pub unsafe fn write_cr3(pml4_phys: PhysAddr) {
 ///
 /// Stored as `AtomicUsize` rather than `Option<fn>` so it can be
 /// initialised in a `static` and updated atomically without a lock.
-static SHOOTDOWN_HOOK: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+static SHOOTDOWN_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Hook signature: takes the VA whose mapping just changed and
 /// arranges for every other CPU's TLB to invalidate it.
@@ -286,7 +304,9 @@ pub fn set_shootdown_hook(hook: TlbShootdownHook) {
 /// Same as `invlpg`.
 pub unsafe fn invlpg_global(virt: VirtAddr) {
     // SAFETY: caller upholds invlpg's contract.
-    unsafe { invlpg(virt); }
+    unsafe {
+        invlpg(virt);
+    }
     let h = SHOOTDOWN_HOOK.load(core::sync::atomic::Ordering::Acquire);
     if h != 0 {
         // SAFETY: stored as `TlbShootdownHook as usize`.
@@ -316,12 +336,16 @@ pub fn set_range_shootdown_hook(hook: TlbShootdownRangeHook) {
 /// Each page in `[va_base, va_base + pages*4096)` must have
 /// satisfied `invlpg`'s safety contract.
 pub unsafe fn invlpg_global_range(va_base: VirtAddr, pages: u64) {
-    if pages == 0 { return; }
+    if pages == 0 {
+        return;
+    }
     // Local INVLPG over each page.
     for k in 0..pages {
         let v = VirtAddr::new(va_base.raw() + k * 4096);
         // SAFETY: per the function contract.
-        unsafe { invlpg(v); }
+        unsafe {
+            invlpg(v);
+        }
     }
     // Prefer the range hook for one-IPI broadcast; fall back to per-page.
     let rh = RANGE_SHOOTDOWN_HOOK.load(core::sync::atomic::Ordering::Acquire);
@@ -392,8 +416,8 @@ pub enum MapError {
 pub struct WalkIndices {
     pub pml4: usize,
     pub pdpt: usize,
-    pub pd:   usize,
-    pub pt:   usize,
+    pub pd: usize,
+    pub pt: usize,
 }
 
 impl WalkIndices {
@@ -402,8 +426,8 @@ impl WalkIndices {
         Self {
             pml4: ((raw >> 39) & 0x1FF) as usize,
             pdpt: ((raw >> 30) & 0x1FF) as usize,
-            pd:   ((raw >> 21) & 0x1FF) as usize,
-            pt:   ((raw >> 12) & 0x1FF) as usize,
+            pd: ((raw >> 21) & 0x1FF) as usize,
+            pt: ((raw >> 12) & 0x1FF) as usize,
         }
     }
 }
@@ -436,9 +460,15 @@ pub unsafe fn map_4kb(
     phys: PhysAddr,
     flags: PtFlags,
 ) -> Result<(), MapError> {
-    if !is_canonical(virt) { return Err(MapError::NonCanonical); }
-    if virt.raw() & 0xFFF != 0 { return Err(MapError::UnalignedVirt); }
-    if phys.raw() & 0xFFF != 0 { return Err(MapError::UnalignedPhys); }
+    if !is_canonical(virt) {
+        return Err(MapError::NonCanonical);
+    }
+    if virt.raw() & 0xFFF != 0 {
+        return Err(MapError::UnalignedVirt);
+    }
+    if phys.raw() & 0xFFF != 0 {
+        return Err(MapError::UnalignedPhys);
+    }
 
     let idx = WalkIndices::from_virt(virt);
     // Intermediate tables need `USER` whenever the leaf does — the
@@ -453,9 +483,7 @@ pub unsafe fn map_4kb(
 
     // SAFETY: caller guarantees pml4_phys is identity-reachable.
     let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
-    let pdpt_phys = unsafe {
-        ensure_next_table(&mut pml4.entries[idx.pml4], base_flags)?
-    };
+    let pdpt_phys = unsafe { ensure_next_table(&mut pml4.entries[idx.pml4], base_flags)? };
 
     // SAFETY: pdpt_phys came either from an existing mapping we
     // validated, or from a freshly-allocated frame (identity-mapped).
@@ -463,17 +491,13 @@ pub unsafe fn map_4kb(
     if pdpt.entries[idx.pdpt].flags().contains(PtFlags::HUGE_PAGE) {
         return Err(MapError::EncounteredHugePage);
     }
-    let pd_phys = unsafe {
-        ensure_next_table(&mut pdpt.entries[idx.pdpt], base_flags)?
-    };
+    let pd_phys = unsafe { ensure_next_table(&mut pdpt.entries[idx.pdpt], base_flags)? };
 
     let pd = unsafe { &mut *pd_phys.as_mut_ptr::<PageTable>() };
     if pd.entries[idx.pd].flags().contains(PtFlags::HUGE_PAGE) {
         return Err(MapError::EncounteredHugePage);
     }
-    let pt_phys = unsafe {
-        ensure_next_table(&mut pd.entries[idx.pd], base_flags)?
-    };
+    let pt_phys = unsafe { ensure_next_table(&mut pd.entries[idx.pd], base_flags)? };
 
     let pt = unsafe { &mut *pt_phys.as_mut_ptr::<PageTable>() };
     if pt.entries[idx.pt].is_present() {
@@ -485,7 +509,9 @@ pub unsafe fn map_4kb(
     // no entry to invalidate. Remap/unmap call sites broadcast via
     // `invlpg_global`.
     // SAFETY: INVLPG is always safe.
-    unsafe { invlpg(virt); }
+    unsafe {
+        invlpg(virt);
+    }
 
     Ok(())
 }
@@ -495,43 +521,54 @@ pub unsafe fn map_4kb(
 ///
 /// # Safety
 /// Same identity-mapping precondition as `map_4kb`.
-pub unsafe fn unmap_4kb(
-    pml4_phys: PhysAddr,
-    virt: VirtAddr,
-) -> Result<PhysAddr, MapError> {
-    if !is_canonical(virt) { return Err(MapError::NonCanonical); }
-    if virt.raw() & 0xFFF != 0 { return Err(MapError::UnalignedVirt); }
+pub unsafe fn unmap_4kb(pml4_phys: PhysAddr, virt: VirtAddr) -> Result<PhysAddr, MapError> {
+    if !is_canonical(virt) {
+        return Err(MapError::NonCanonical);
+    }
+    if virt.raw() & 0xFFF != 0 {
+        return Err(MapError::UnalignedVirt);
+    }
 
     let idx = WalkIndices::from_virt(virt);
     // SAFETY: caller promises identity reachability.
     let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
     let e = pml4.entries[idx.pml4];
-    if !e.is_present() { return Err(MapError::AlreadyMapped); }
+    if !e.is_present() {
+        return Err(MapError::AlreadyMapped);
+    }
     let pdpt = unsafe { &mut *e.addr().as_mut_ptr::<PageTable>() };
 
     let e = pdpt.entries[idx.pdpt];
-    if !e.is_present() { return Err(MapError::AlreadyMapped); }
+    if !e.is_present() {
+        return Err(MapError::AlreadyMapped);
+    }
     if e.flags().contains(PtFlags::HUGE_PAGE) {
         return Err(MapError::EncounteredHugePage);
     }
     let pd = unsafe { &mut *e.addr().as_mut_ptr::<PageTable>() };
 
     let e = pd.entries[idx.pd];
-    if !e.is_present() { return Err(MapError::AlreadyMapped); }
+    if !e.is_present() {
+        return Err(MapError::AlreadyMapped);
+    }
     if e.flags().contains(PtFlags::HUGE_PAGE) {
         return Err(MapError::EncounteredHugePage);
     }
     let pt = unsafe { &mut *e.addr().as_mut_ptr::<PageTable>() };
 
     let removed = pt.entries[idx.pt];
-    if !removed.is_present() { return Err(MapError::AlreadyMapped); }
+    if !removed.is_present() {
+        return Err(MapError::AlreadyMapped);
+    }
     pt.entries[idx.pt] = PageTableEntry::EMPTY;
 
     // Unmap is the canonical "stale-TLB" case: peer CPUs may have
     // cached the prior PA. Use the cross-CPU invalidator so any
     // installed shootdown hook fires.
     // SAFETY: INVLPG always safe; hook call is gated by atomic load.
-    unsafe { invlpg_global(virt); }
+    unsafe {
+        invlpg_global(virt);
+    }
 
     Ok(removed.addr())
 }
@@ -544,22 +581,36 @@ pub unsafe fn unmap_4kb(
 /// # Safety
 /// `pml4_phys` must be identity-reachable (same as `map_4kb`).
 pub unsafe fn flags_at(pml4_phys: PhysAddr, virt: VirtAddr) -> Option<PtFlags> {
-    if !is_canonical(virt) { return None; }
+    if !is_canonical(virt) {
+        return None;
+    }
     let idx = WalkIndices::from_virt(virt);
     let pml4 = unsafe { &*pml4_phys.as_ptr::<PageTable>() };
     let e = pml4.entries[idx.pml4];
-    if !e.is_present() { return None; }
+    if !e.is_present() {
+        return None;
+    }
     let pdpt = unsafe { &*e.addr().as_ptr::<PageTable>() };
     let e = pdpt.entries[idx.pdpt];
-    if !e.is_present() { return None; }
-    if e.flags().contains(PtFlags::HUGE_PAGE) { return None; }
+    if !e.is_present() {
+        return None;
+    }
+    if e.flags().contains(PtFlags::HUGE_PAGE) {
+        return None;
+    }
     let pd = unsafe { &*e.addr().as_ptr::<PageTable>() };
     let e = pd.entries[idx.pd];
-    if !e.is_present() { return None; }
-    if e.flags().contains(PtFlags::HUGE_PAGE) { return None; }
+    if !e.is_present() {
+        return None;
+    }
+    if e.flags().contains(PtFlags::HUGE_PAGE) {
+        return None;
+    }
     let pt = unsafe { &*e.addr().as_ptr::<PageTable>() };
     let e = pt.entries[idx.pt];
-    if !e.is_present() { return None; }
+    if !e.is_present() {
+        return None;
+    }
     Some(e.flags())
 }
 
@@ -572,27 +623,38 @@ pub unsafe fn flags_at(pml4_phys: PhysAddr, virt: VirtAddr) -> Option<PtFlags> {
 ///
 /// # Safety
 /// `pml4_phys` must be identity-reachable (same as `map_4kb`).
-pub unsafe fn translate(
-    pml4_phys: PhysAddr,
-    virt: VirtAddr,
-) -> Option<PhysAddr> {
-    if !is_canonical(virt) { return None; }
+pub unsafe fn translate(pml4_phys: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {
+    if !is_canonical(virt) {
+        return None;
+    }
     let idx = WalkIndices::from_virt(virt);
     let pml4 = unsafe { &*pml4_phys.as_ptr::<PageTable>() };
     let e = pml4.entries[idx.pml4];
-    if !e.is_present() { return None; }
+    if !e.is_present() {
+        return None;
+    }
     let pdpt = unsafe { &*e.addr().as_ptr::<PageTable>() };
     let e = pdpt.entries[idx.pdpt];
-    if !e.is_present() { return None; }
-    if e.flags().contains(PtFlags::HUGE_PAGE) { return Some(e.addr()); }  // 1 GiB
+    if !e.is_present() {
+        return None;
+    }
+    if e.flags().contains(PtFlags::HUGE_PAGE) {
+        return Some(e.addr());
+    } // 1 GiB
     let pd = unsafe { &*e.addr().as_ptr::<PageTable>() };
     let e = pd.entries[idx.pd];
-    if !e.is_present() { return None; }
-    if e.flags().contains(PtFlags::HUGE_PAGE) { return Some(e.addr()); }  // 2 MiB
+    if !e.is_present() {
+        return None;
+    }
+    if e.flags().contains(PtFlags::HUGE_PAGE) {
+        return Some(e.addr());
+    } // 2 MiB
     let pt = unsafe { &*e.addr().as_ptr::<PageTable>() };
     let e = pt.entries[idx.pt];
-    if !e.is_present() { return None; }
-    Some(e.addr())                                                         // 4 KiB
+    if !e.is_present() {
+        return None;
+    }
+    Some(e.addr()) // 4 KiB
 }
 
 /// Ensure the entry at `slot` references a present, non-huge

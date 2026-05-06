@@ -31,9 +31,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 use alloc::vec::Vec;
 
 use cmd::{
-    build_cqe_inline, build_cqe_with_mailboxes, decode_response,
-    is_complete, CmdError, CmdOp, CmdResponse, CQE_LEN,
-    CQE_OFF_STATUS_OWN, MAILBOX_BLOCK_LEN, STATUS_OWN_BIT,
+    build_cqe_inline, build_cqe_with_mailboxes, decode_response, is_complete, CmdError, CmdOp,
+    CmdResponse, CQE_LEN, CQE_OFF_STATUS_OWN, MAILBOX_BLOCK_LEN, STATUS_OWN_BIT,
 };
 
 // Smokes live in the driver directory, not the shared tests.rs.
@@ -43,9 +42,9 @@ pub mod bit_field;
 pub mod caps;
 pub mod cmd;
 pub mod cq;
+pub mod cqe;
 pub mod eq;
 pub mod eqe;
-pub mod cqe;
 pub mod mailbox;
 pub mod mkey;
 pub mod qp;
@@ -60,23 +59,28 @@ pub mod wqe;
 pub const MLX5_VENDOR: u16 = 0x15B3;
 
 /// ConnectX-4.
-pub const MLX5_DEV_CX4:       u16 = 0x1011;
+pub const MLX5_DEV_CX4: u16 = 0x1011;
 /// ConnectX-4 Lx.
-pub const MLX5_DEV_CX4_LX:    u16 = 0x1013;
+pub const MLX5_DEV_CX4_LX: u16 = 0x1013;
 /// ConnectX-4 Lx Virtual Function.
 pub const MLX5_DEV_CX4_LX_VF: u16 = 0x1015;
 /// ConnectX-5.
-pub const MLX5_DEV_CX5:       u16 = 0x1017;
+pub const MLX5_DEV_CX5: u16 = 0x1017;
 /// ConnectX-5 Ex.
-pub const MLX5_DEV_CX5_EX:    u16 = 0x1019;
+pub const MLX5_DEV_CX5_EX: u16 = 0x1019;
 /// ConnectX-6.
-pub const MLX5_DEV_CX6:       u16 = 0x101B;
+pub const MLX5_DEV_CX6: u16 = 0x101B;
 /// ConnectX-6 Dx.
-pub const MLX5_DEV_CX6_DX:    u16 = 0x101D;
+pub const MLX5_DEV_CX6_DX: u16 = 0x101D;
 
 const ALL_DEV_IDS: &[u16] = &[
-    MLX5_DEV_CX4, MLX5_DEV_CX4_LX, MLX5_DEV_CX4_LX_VF,
-    MLX5_DEV_CX5, MLX5_DEV_CX5_EX, MLX5_DEV_CX6, MLX5_DEV_CX6_DX,
+    MLX5_DEV_CX4,
+    MLX5_DEV_CX4_LX,
+    MLX5_DEV_CX4_LX_VF,
+    MLX5_DEV_CX5,
+    MLX5_DEV_CX5_EX,
+    MLX5_DEV_CX6,
+    MLX5_DEV_CX6_DX,
 ];
 
 // ── Init-segment register offsets (BAR0) ───────────────────────────
@@ -84,16 +88,16 @@ const ALL_DEV_IDS: &[u16] = &[
 // All multi-byte fields are big-endian per PRM §1.4. The decoder
 // byte-swaps on read.
 
-const ISEG_FW_REV_MAJOR:    usize = 0x0000;
-const ISEG_FW_REV_MINOR:    usize = 0x0002;
-const ISEG_FW_REV_SUB:      usize = 0x0004;
-const ISEG_CMD_IFACE_REV:   usize = 0x0006;
-const ISEG_CMDQ_ADDR_HIGH:  usize = 0x0010;
+const ISEG_FW_REV_MAJOR: usize = 0x0000;
+const ISEG_FW_REV_MINOR: usize = 0x0002;
+const ISEG_FW_REV_SUB: usize = 0x0004;
+const ISEG_CMD_IFACE_REV: usize = 0x0006;
+const ISEG_CMDQ_ADDR_HIGH: usize = 0x0010;
 const ISEG_CMDQ_ADDR_LO_SZ: usize = 0x0014;
-const ISEG_CMD_DBELL:       usize = 0x0018;
-const ISEG_HEALTH_BUF:      usize = 0x001C;
-const ISEG_HEALTH_BUF_LEN:  usize = 64;
-const ISEG_INITIALIZING:    usize = 0x0FFC;
+const ISEG_CMD_DBELL: usize = 0x0018;
+const ISEG_HEALTH_BUF: usize = 0x001C;
+const ISEG_HEALTH_BUF_LEN: usize = 64;
+const ISEG_INITIALIZING: usize = 0x0FFC;
 
 /// Total length of the init segment we decode against.
 pub const INIT_SEGMENT_LEN: usize = 0x1000;
@@ -125,27 +129,27 @@ const CMD_POLL_LIMIT: u32 = 50_000_000;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u16)]
 pub enum HcaCapGroup {
-    GeneralDevice  = 0x0,
+    GeneralDevice = 0x0,
     EthernetOffload = 0x1,
-    Atomic          = 0x3,
-    Roce            = 0x4,
-    IpoibOffloads   = 0x5,
+    Atomic = 0x3,
+    Roce = 0x4,
+    IpoibOffloads = 0x5,
 }
 
 // ── Decoded init-segment ───────────────────────────────────────────
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct InitSegment {
-    pub fw_rev_major:      u16,
-    pub fw_rev_minor:      u16,
-    pub fw_rev_subminor:   u16,
+    pub fw_rev_major: u16,
+    pub fw_rev_minor: u16,
+    pub fw_rev_subminor: u16,
     pub cmd_interface_rev: u16,
-    pub cmdq_addr:         u64,
-    pub cmdq_log_size:     u8,
-    pub cmd_dbell_vector:  u32,
+    pub cmdq_addr: u64,
+    pub cmdq_log_size: u8,
+    pub cmd_dbell_vector: u32,
     /// Raw 64-byte health buffer; parsed in a later stage.
-    pub health_buffer:     [u8; ISEG_HEALTH_BUF_LEN],
-    pub initializing:      bool,
+    pub health_buffer: [u8; ISEG_HEALTH_BUF_LEN],
+    pub initializing: bool,
 }
 
 #[inline]
@@ -155,36 +159,33 @@ fn be16(raw: &[u8; INIT_SEGMENT_LEN], off: usize) -> u16 {
 
 #[inline]
 fn be32(raw: &[u8; INIT_SEGMENT_LEN], off: usize) -> u32 {
-    u32::from_be_bytes([
-        raw[off], raw[off + 1], raw[off + 2], raw[off + 3],
-    ])
+    u32::from_be_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]])
 }
 
 /// Decode a 4-KiB snapshot of BAR0 into the structured init segment.
 /// All field accesses are byte-indexed so this is callable from a
 /// smoke harness without any MMIO mapping.
 pub fn decode_init_segment(raw: &[u8; INIT_SEGMENT_LEN]) -> InitSegment {
-    let cmdq_high   = be32(raw, ISEG_CMDQ_ADDR_HIGH) as u64;
+    let cmdq_high = be32(raw, ISEG_CMDQ_ADDR_HIGH) as u64;
     let cmdq_low_sz = be32(raw, ISEG_CMDQ_ADDR_LO_SZ);
     // Low 4 bits = log2(#commands); upper 28 bits = address bits
     // [31:4] of the cmd queue base. The full 64-bit phys is
     // (high << 32) | (low_sz & ~0xF).
-    let cmdq_addr      = (cmdq_high << 32) | (cmdq_low_sz as u64 & !0xFu64);
-    let cmdq_log_size  = (cmdq_low_sz & 0xF) as u8;
-    let cmd_dbell_vec  = be32(raw, ISEG_CMD_DBELL);
-    let initializing   = (be32(raw, ISEG_INITIALIZING) & INITIALIZING_BIT) != 0;
+    let cmdq_addr = (cmdq_high << 32) | (cmdq_low_sz as u64 & !0xFu64);
+    let cmdq_log_size = (cmdq_low_sz & 0xF) as u8;
+    let cmd_dbell_vec = be32(raw, ISEG_CMD_DBELL);
+    let initializing = (be32(raw, ISEG_INITIALIZING) & INITIALIZING_BIT) != 0;
     let mut health = [0u8; ISEG_HEALTH_BUF_LEN];
-    health.copy_from_slice(
-        &raw[ISEG_HEALTH_BUF .. ISEG_HEALTH_BUF + ISEG_HEALTH_BUF_LEN]);
+    health.copy_from_slice(&raw[ISEG_HEALTH_BUF..ISEG_HEALTH_BUF + ISEG_HEALTH_BUF_LEN]);
     InitSegment {
-        fw_rev_major:      be16(raw, ISEG_FW_REV_MAJOR),
-        fw_rev_minor:      be16(raw, ISEG_FW_REV_MINOR),
-        fw_rev_subminor:   be16(raw, ISEG_FW_REV_SUB),
+        fw_rev_major: be16(raw, ISEG_FW_REV_MAJOR),
+        fw_rev_minor: be16(raw, ISEG_FW_REV_MINOR),
+        fw_rev_subminor: be16(raw, ISEG_FW_REV_SUB),
         cmd_interface_rev: be16(raw, ISEG_CMD_IFACE_REV),
         cmdq_addr,
         cmdq_log_size,
-        cmd_dbell_vector:  cmd_dbell_vec,
-        health_buffer:     health,
+        cmd_dbell_vector: cmd_dbell_vec,
+        health_buffer: health,
         initializing,
     }
 }
@@ -238,10 +239,10 @@ pub enum Mlx5Error {
 /// cursor used by Stage-15 `poll_eq`.
 pub struct LiveEq {
     pub eq_number: u32,
-    pages:         Vec<DmaBuffer>,
-    pub params:    eq::EqParams,
+    pages: Vec<DmaBuffer>,
+    pub params: eq::EqParams,
     /// Next-to-read EQE index (Stage 15).
-    pub consumer:  u32,
+    pub consumer: u32,
 }
 
 /// Stage 8 + 11: live-CQ bookkeeping. Same shape as `LiveEq` but
@@ -249,10 +250,10 @@ pub struct LiveEq {
 /// used by Stage-11 `poll_cq`.
 pub struct LiveCq {
     pub cq_number: u32,
-    pages:         Vec<DmaBuffer>,
-    pub params:    cq::CqParams,
+    pages: Vec<DmaBuffer>,
+    pub params: cq::CqParams,
     /// Next-to-read CQE index (mod cq_capacity).
-    pub consumer:  u32,
+    pub consumer: u32,
 }
 
 /// Stage 9 + 11: live-QP bookkeeping. Holds the FW-assigned
@@ -261,21 +262,21 @@ pub struct LiveCq {
 /// `post_send` / `post_recv` (Stage 11).
 pub struct LiveQp {
     pub qp_number: u32,
-    pages:         Vec<DmaBuffer>,
-    pub params:    qp::QpParams,
-    pub state:     qp::QpState,
+    pages: Vec<DmaBuffer>,
+    pub params: qp::QpParams,
+    pub state: qp::QpState,
     /// Next-to-write SQ index (mod sq_capacity).
-    pub sq_tail:   u32,
+    pub sq_tail: u32,
     /// Next-to-write RQ index (mod rq_capacity).
-    pub rq_tail:   u32,
+    pub rq_tail: u32,
 }
 
 impl fmt::Debug for LiveQp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LiveQp")
             .field("qp_number", &self.qp_number)
-            .field("state",     &self.state)
-            .field("params",    &self.params)
+            .field("state", &self.state)
+            .field("params", &self.params)
             .finish_non_exhaustive()
     }
 }
@@ -284,7 +285,7 @@ impl fmt::Debug for LiveCq {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LiveCq")
             .field("cq_number", &self.cq_number)
-            .field("params",    &self.params)
+            .field("params", &self.params)
             .finish_non_exhaustive()
     }
 }
@@ -293,18 +294,18 @@ impl fmt::Debug for LiveEq {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LiveEq")
             .field("eq_number", &self.eq_number)
-            .field("params",    &self.params)
+            .field("params", &self.params)
             .finish_non_exhaustive()
     }
 }
 
 pub struct Mlx5Hca {
-    mmio:    MmioRegion,
+    mmio: MmioRegion,
     segment: InitSegment,
     /// Stage 3: 4-KiB DMA-coherent backing for the command queue.
     /// One slot used (log_size = 0); kept resident for the life of
     /// the device.
-    cmdq:    DmaBuffer,
+    cmdq: DmaBuffer,
     /// Per-command polling cursor — token rotates so each issued CQE
     /// gets a unique tag, useful for diagnostics.
     next_token: IrqSafeSpinLock<u8>,
@@ -334,8 +335,8 @@ pub struct Mlx5Hca {
 
 #[derive(Copy, Clone, Debug, Default)]
 pub struct NicCachedState {
-    pub mac:     [u8; 6],
-    pub mtu:     u32,
+    pub mac: [u8; 6],
+    pub mtu: u32,
     pub link_up: bool,
 }
 
@@ -345,11 +346,16 @@ const UAR_BASE_DEFAULT: u64 = 0x100000;
 impl fmt::Debug for Mlx5Hca {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Mlx5Hca")
-            .field("fw",           &(self.segment.fw_rev_major,
-                                     self.segment.fw_rev_minor,
-                                     self.segment.fw_rev_subminor))
-            .field("cmd_iface",    &self.segment.cmd_interface_rev)
-            .field("cmdq_log_sz",  &self.segment.cmdq_log_size)
+            .field(
+                "fw",
+                &(
+                    self.segment.fw_rev_major,
+                    self.segment.fw_rev_minor,
+                    self.segment.fw_rev_subminor,
+                ),
+            )
+            .field("cmd_iface", &self.segment.cmd_interface_rev)
+            .field("cmdq_log_sz", &self.segment.cmdq_log_size)
             .finish_non_exhaustive()
     }
 }
@@ -373,11 +379,10 @@ impl Mlx5Hca {
     /// init.
     pub unsafe fn bring_up(
         device: &BusDevice,
-        _cap:   &Cap<BusDeviceCap, Write>,
+        _cap: &Cap<BusDeviceCap, Write>,
     ) -> Result<Self, Mlx5Error> {
         // SAFETY: caller-authority over the device.
-        let mmio = unsafe { map_bar(device, 0) }
-            .map_err(|_| Mlx5Error::BarMapFailed)?;
+        let mmio = unsafe { map_bar(device, 0) }.map_err(|_| Mlx5Error::BarMapFailed)?;
 
         // Poll the initializing register at 0x0FFC until bit 31
         // clears. Two-second worst case per PRM §1.6.
@@ -387,9 +392,13 @@ impl Mlx5Hca {
             let v = unsafe { mmio.read32(ISEG_INITIALIZING as u64) };
             // Register is BE on the wire; read32 returns LE-host
             // bytes, so swap.
-            if (v.swap_bytes() & INITIALIZING_BIT) == 0 { break; }
+            if (v.swap_bytes() & INITIALIZING_BIT) == 0 {
+                break;
+            }
             spins += 1;
-            if spins > INIT_POLL_LIMIT { return Err(Mlx5Error::InitTimeout); }
+            if spins > INIT_POLL_LIMIT {
+                return Err(Mlx5Error::InitTimeout);
+            }
             core::hint::spin_loop();
         }
 
@@ -438,15 +447,16 @@ impl Mlx5Hca {
     }
 
     /// Stage 12: snapshot of the cached NIC state.
-    pub fn nic_state(&self) -> NicCachedState { *self.nic_state.lock() }
+    pub fn nic_state(&self) -> NicCachedState {
+        *self.nic_state.lock()
+    }
 
     /// Stage 4 self-check: post a single NOP through the live cmdq
     /// transport. Records the result on the driver so callers can
     /// query it later via `nop_selftest()`. Idempotent — each call
     /// re-runs the NOP and overwrites the stored result.
     pub fn run_nop_selftest(&mut self) -> Result<(), Mlx5Error> {
-        let r = self.issue_command_inline(CmdOp::Nop, 0, &[])
-                    .map(|_| ());
+        let r = self.issue_command_inline(CmdOp::Nop, 0, &[]).map(|_| ());
         self.nop_selftest = Some(r);
         r
     }
@@ -463,9 +473,9 @@ impl Mlx5Hca {
     /// and any other small synchronous command.
     pub fn issue_command_inline(
         &self,
-        op:             CmdOp,
+        op: CmdOp,
         input_modifier: u32,
-        inline_input:   &[u8],
+        inline_input: &[u8],
     ) -> Result<CmdResponse, Mlx5Error> {
         let token = {
             let mut tok = self.next_token.lock();
@@ -482,8 +492,7 @@ impl Mlx5Hca {
         // this driver.
         unsafe {
             for (i, &b) in cqe.iter().enumerate() {
-                core::ptr::write_volatile(
-                    (slot_phys + i as u64) as *mut u8, b);
+                core::ptr::write_volatile((slot_phys + i as u64) as *mut u8, b);
             }
         }
         compiler_fence(Ordering::SeqCst);
@@ -498,9 +507,13 @@ impl Mlx5Hca {
         loop {
             // SAFETY: identity-mapped DMA.
             let v = unsafe { core::ptr::read_volatile(own_phys as *const u8) };
-            if v & STATUS_OWN_BIT == 0 { break; }
+            if v & STATUS_OWN_BIT == 0 {
+                break;
+            }
             spins += 1;
-            if spins > CMD_POLL_LIMIT { return Err(Mlx5Error::CmdTimeout); }
+            if spins > CMD_POLL_LIMIT {
+                return Err(Mlx5Error::CmdTimeout);
+            }
             core::hint::spin_loop();
         }
 
@@ -509,8 +522,7 @@ impl Mlx5Hca {
         // SAFETY: identity-mapped DMA.
         unsafe {
             for i in 0..CQE_LEN {
-                completed[i] = core::ptr::read_volatile(
-                    (slot_phys + i as u64) as *const u8);
+                completed[i] = core::ptr::read_volatile((slot_phys + i as u64) as *const u8);
             }
         }
         // Sanity check + decode.
@@ -523,13 +535,15 @@ impl Mlx5Hca {
     pub fn ring_cmd_doorbell(&self, slot_mask: u32) {
         // SAFETY: identity-mapped MMIO.
         unsafe {
-            self.mmio.write32(ISEG_CMD_DBELL as u64,
-                              slot_mask.swap_bytes());
+            self.mmio
+                .write32(ISEG_CMD_DBELL as u64, slot_mask.swap_bytes());
         }
     }
 
     /// Phys address of the cmdq DMA backing (Stage 3+).
-    pub fn cmdq_phys(&self) -> u64 { self.cmdq.phys_addr().raw() }
+    pub fn cmdq_phys(&self) -> u64 {
+        self.cmdq.phys_addr().raw()
+    }
 
     /// Stage 4: issue a command with DMA-mailbox input and output.
     /// Allocates an N-block input chain + an M-block output chain,
@@ -541,10 +555,10 @@ impl Mlx5Hca {
     /// many bytes — extra block storage is left zero).
     pub fn issue_command_with_mailboxes(
         &self,
-        op:             CmdOp,
+        op: CmdOp,
         input_modifier: u32,
-        input:          &[u8],
-        output_len:     usize,
+        input: &[u8],
+        output_len: usize,
     ) -> Result<Vec<u8>, Mlx5Error> {
         let token = {
             let mut tok = self.next_token.lock();
@@ -552,28 +566,24 @@ impl Mlx5Hca {
             *tok = tok.wrapping_add(1);
             v
         };
-        let n_in  = mailbox::block_count_for(input.len());
+        let n_in = mailbox::block_count_for(input.len());
         let n_out = mailbox::block_count_for(output_len);
 
         // Allocate per-block DMA pages (one block per page is
         // wasteful but simplifies alignment + safety; mailbox blocks
         // must be 512-B aligned and a fresh page is page-aligned).
-        let mut in_blocks:  Vec<DmaBuffer> = Vec::with_capacity(n_in);
+        let mut in_blocks: Vec<DmaBuffer> = Vec::with_capacity(n_in);
         let mut out_blocks: Vec<DmaBuffer> = Vec::with_capacity(n_out);
         for _ in 0..n_in {
-            in_blocks.push(
-                alloc_coherent(4096, DomainId::DRIVER_0)
-                    .map_err(|_| Mlx5Error::CmdqAlloc)?);
+            in_blocks
+                .push(alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| Mlx5Error::CmdqAlloc)?);
         }
         for _ in 0..n_out {
-            out_blocks.push(
-                alloc_coherent(4096, DomainId::DRIVER_0)
-                    .map_err(|_| Mlx5Error::CmdqAlloc)?);
+            out_blocks
+                .push(alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| Mlx5Error::CmdqAlloc)?);
         }
-        let in_phys: Vec<u64> = in_blocks.iter()
-            .map(|b| b.phys_addr().raw()).collect();
-        let out_phys: Vec<u64> = out_blocks.iter()
-            .map(|b| b.phys_addr().raw()).collect();
+        let in_phys: Vec<u64> = in_blocks.iter().map(|b| b.phys_addr().raw()).collect();
+        let out_phys: Vec<u64> = out_blocks.iter().map(|b| b.phys_addr().raw()).collect();
 
         // Populate input mailbox blocks.
         let in_data = mailbox::write_input_chain(input, &in_phys, token);
@@ -582,8 +592,7 @@ impl Mlx5Hca {
             // SAFETY: identity-mapped DMA; driver-owned buffer.
             unsafe {
                 for (i, &b) in block.iter().enumerate() {
-                    core::ptr::write_volatile(
-                        (phys + i as u64) as *mut u8, b);
+                    core::ptr::write_volatile((phys + i as u64) as *mut u8, b);
                 }
             }
         }
@@ -594,8 +603,7 @@ impl Mlx5Hca {
             // SAFETY: identity-mapped DMA; driver-owned buffer.
             unsafe {
                 for i in 0..MAILBOX_BLOCK_LEN {
-                    core::ptr::write_volatile(
-                        (phys + i as u64) as *mut u8, 0);
+                    core::ptr::write_volatile((phys + i as u64) as *mut u8, 0);
                 }
             }
         }
@@ -610,29 +618,29 @@ impl Mlx5Hca {
             // SAFETY: identity-mapped DMA; offsets within block.
             unsafe {
                 for (j, &b) in h.to_be_bytes().iter().enumerate() {
-                    core::ptr::write_volatile(
-                        (phys + 0x1F0 + j as u64) as *mut u8, b);
+                    core::ptr::write_volatile((phys + 0x1F0 + j as u64) as *mut u8, b);
                 }
                 for (j, &b) in l.to_be_bytes().iter().enumerate() {
-                    core::ptr::write_volatile(
-                        (phys + 0x1F4 + j as u64) as *mut u8, b);
+                    core::ptr::write_volatile((phys + 0x1F4 + j as u64) as *mut u8, b);
                 }
             }
         }
 
         // Build + post the CQE.
         let cqe = build_cqe_with_mailboxes(
-            op, input_modifier,
-            in_phys[0],  input.len() as u32,
-            out_phys[0], output_len as u32,
+            op,
+            input_modifier,
+            in_phys[0],
+            input.len() as u32,
+            out_phys[0],
+            output_len as u32,
             token,
         );
         let slot_phys = self.cmdq.phys_addr().raw();
         // SAFETY: identity-mapped DMA cmdq, exclusively owned.
         unsafe {
             for (i, &b) in cqe.iter().enumerate() {
-                core::ptr::write_volatile(
-                    (slot_phys + i as u64) as *mut u8, b);
+                core::ptr::write_volatile((slot_phys + i as u64) as *mut u8, b);
             }
         }
         compiler_fence(Ordering::SeqCst);
@@ -644,9 +652,13 @@ impl Mlx5Hca {
         loop {
             // SAFETY: identity-mapped DMA.
             let v = unsafe { core::ptr::read_volatile(own_phys as *const u8) };
-            if v & STATUS_OWN_BIT == 0 { break; }
+            if v & STATUS_OWN_BIT == 0 {
+                break;
+            }
             spins += 1;
-            if spins > CMD_POLL_LIMIT { return Err(Mlx5Error::CmdTimeout); }
+            if spins > CMD_POLL_LIMIT {
+                return Err(Mlx5Error::CmdTimeout);
+            }
             core::hint::spin_loop();
         }
 
@@ -656,24 +668,21 @@ impl Mlx5Hca {
         // SAFETY: identity-mapped DMA.
         unsafe {
             for i in 0..CQE_LEN {
-                completed[i] = core::ptr::read_volatile(
-                    (slot_phys + i as u64) as *const u8);
+                completed[i] = core::ptr::read_volatile((slot_phys + i as u64) as *const u8);
             }
         }
         debug_assert!(is_complete(&completed));
         let _resp = decode_response(&completed).map_err(Mlx5Error::CmdFailed)?;
 
         // Read output blocks back into a contiguous Vec.
-        let mut blocks: Vec<[u8; MAILBOX_BLOCK_LEN]> =
-            Vec::with_capacity(n_out);
+        let mut blocks: Vec<[u8; MAILBOX_BLOCK_LEN]> = Vec::with_capacity(n_out);
         for dma in out_blocks.iter() {
             let phys = dma.phys_addr().raw();
             let mut block = [0u8; MAILBOX_BLOCK_LEN];
             // SAFETY: identity-mapped DMA.
             unsafe {
                 for i in 0..MAILBOX_BLOCK_LEN {
-                    block[i] = core::ptr::read_volatile(
-                        (phys + i as u64) as *const u8);
+                    block[i] = core::ptr::read_volatile((phys + i as u64) as *const u8);
                 }
             }
             blocks.push(block);
@@ -689,9 +698,9 @@ impl Mlx5Hca {
     /// `output_modifier` field of the inline response).
     pub fn issue_command_with_input_mailbox(
         &self,
-        op:             CmdOp,
+        op: CmdOp,
         input_modifier: u32,
-        input:          &[u8],
+        input: &[u8],
     ) -> Result<CmdResponse, Mlx5Error> {
         let token = {
             let mut tok = self.next_token.lock();
@@ -702,36 +711,35 @@ impl Mlx5Hca {
         let n_in = mailbox::block_count_for(input.len());
         let mut in_blocks: Vec<DmaBuffer> = Vec::with_capacity(n_in);
         for _ in 0..n_in {
-            in_blocks.push(
-                alloc_coherent(4096, DomainId::DRIVER_0)
-                    .map_err(|_| Mlx5Error::CmdqAlloc)?);
+            in_blocks
+                .push(alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| Mlx5Error::CmdqAlloc)?);
         }
-        let in_phys: Vec<u64> = in_blocks.iter()
-            .map(|b| b.phys_addr().raw()).collect();
+        let in_phys: Vec<u64> = in_blocks.iter().map(|b| b.phys_addr().raw()).collect();
         let in_data = mailbox::write_input_chain(input, &in_phys, token);
         for (block, dma) in in_data.iter().zip(in_blocks.iter()) {
             let phys = dma.phys_addr().raw();
             // SAFETY: identity-mapped DMA; driver-owned buffer.
             unsafe {
                 for (i, &b) in block.iter().enumerate() {
-                    core::ptr::write_volatile(
-                        (phys + i as u64) as *mut u8, b);
+                    core::ptr::write_volatile((phys + i as u64) as *mut u8, b);
                 }
             }
         }
         // Build the CQE: input mailbox set, output mailbox = 0, len = 0.
         let cqe = build_cqe_with_mailboxes(
-            op, input_modifier,
-            in_phys[0], input.len() as u32,
-            /* output_mb_phys */ 0, /* output_len */ 0,
+            op,
+            input_modifier,
+            in_phys[0],
+            input.len() as u32,
+            /* output_mb_phys */ 0,
+            /* output_len */ 0,
             token,
         );
         let slot_phys = self.cmdq.phys_addr().raw();
         // SAFETY: identity-mapped cmdq DMA.
         unsafe {
             for (i, &b) in cqe.iter().enumerate() {
-                core::ptr::write_volatile(
-                    (slot_phys + i as u64) as *mut u8, b);
+                core::ptr::write_volatile((slot_phys + i as u64) as *mut u8, b);
             }
         }
         compiler_fence(Ordering::SeqCst);
@@ -742,9 +750,13 @@ impl Mlx5Hca {
         loop {
             // SAFETY: identity-mapped DMA.
             let v = unsafe { core::ptr::read_volatile(own_phys as *const u8) };
-            if v & STATUS_OWN_BIT == 0 { break; }
+            if v & STATUS_OWN_BIT == 0 {
+                break;
+            }
             spins += 1;
-            if spins > CMD_POLL_LIMIT { return Err(Mlx5Error::CmdTimeout); }
+            if spins > CMD_POLL_LIMIT {
+                return Err(Mlx5Error::CmdTimeout);
+            }
             core::hint::spin_loop();
         }
 
@@ -752,8 +764,7 @@ impl Mlx5Hca {
         // SAFETY: identity-mapped DMA.
         unsafe {
             for i in 0..CQE_LEN {
-                completed[i] = core::ptr::read_volatile(
-                    (slot_phys + i as u64) as *const u8);
+                completed[i] = core::ptr::read_volatile((slot_phys + i as u64) as *const u8);
             }
         }
         debug_assert!(is_complete(&completed));
@@ -766,23 +777,14 @@ impl Mlx5Hca {
     /// the firmware-assigned `eq_number` from the inline response.
     /// The backing pages + recorded eq_number live on the driver's
     /// `eqs` registry so they're not dropped while the EQ is live.
-    pub fn create_eq(
-        &self,
-        params:     eq::EqParams,
-        page_count: usize,
-    ) -> Result<u32, Mlx5Error> {
+    pub fn create_eq(&self, params: eq::EqParams, page_count: usize) -> Result<u32, Mlx5Error> {
         let mut pages: Vec<DmaBuffer> = Vec::with_capacity(page_count);
         for _ in 0..page_count {
-            pages.push(
-                alloc_coherent(4096, DomainId::DRIVER_0)
-                    .map_err(|_| Mlx5Error::CmdqAlloc)?);
+            pages.push(alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| Mlx5Error::CmdqAlloc)?);
         }
-        let phys: Vec<u64> = pages.iter()
-            .map(|p| p.phys_addr().raw()).collect();
-        let payload = eq::build_create_eq_input(params, &phys)
-            .map_err(Mlx5Error::EqBuild)?;
-        let resp = self.issue_command_with_input_mailbox(
-            CmdOp::CreateEq, 0, &payload)?;
+        let phys: Vec<u64> = pages.iter().map(|p| p.phys_addr().raw()).collect();
+        let payload = eq::build_create_eq_input(params, &phys).map_err(Mlx5Error::EqBuild)?;
+        let resp = self.issue_command_with_input_mailbox(CmdOp::CreateEq, 0, &payload)?;
         // PRM: eq_number rides in the low 24 bits of output_modifier.
         let eq_number = resp.output_modifier & 0x00FF_FFFF;
         self.eqs.lock().push(LiveEq {
@@ -796,11 +798,10 @@ impl Mlx5Hca {
 
     /// Stage 15: pop one async event off `eq_number`. Returns
     /// `Ok(None)` if HW still owns the next slot.
-    pub fn poll_eq(&self, eq_number: u32)
-        -> Result<Option<eqe::EqeView>, Mlx5Error>
-    {
+    pub fn poll_eq(&self, eq_number: u32) -> Result<Option<eqe::EqeView>, Mlx5Error> {
         let mut eqs = self.eqs.lock();
-        let e = eqs.iter_mut()
+        let e = eqs
+            .iter_mut()
             .find(|e| e.eq_number == eq_number)
             .ok_or(Mlx5Error::UnknownQp)?;
         let cap = 1u32 << e.params.log_eq_size;
@@ -810,11 +811,12 @@ impl Mlx5Hca {
         // SAFETY: identity-mapped DMA.
         unsafe {
             for i in 0..eqe::EQE_LEN {
-                bytes[i] = core::ptr::read_volatile(
-                    (phys + off as u64 + i as u64) as *const u8);
+                bytes[i] = core::ptr::read_volatile((phys + off as u64 + i as u64) as *const u8);
             }
         }
-        if eqe::is_hw_owned(&bytes) { return Ok(None); }
+        if eqe::is_hw_owned(&bytes) {
+            return Ok(None);
+        }
         let view = eqe::decode_eqe(&bytes);
         e.consumer = e.consumer.wrapping_add(1);
         Ok(Some(view))
@@ -825,8 +827,7 @@ impl Mlx5Hca {
     /// interrupts. PRM-documented value packs eq_number in the
     /// high byte and the consumer index low 24 bits.
     pub fn arm_eq(&self, uar_page: u32, eq_number: u32, consumer: u32) {
-        let val = ((eq_number & 0xFF) << 24)
-                | (consumer & 0x00FF_FFFF);
+        let val = ((eq_number & 0xFF) << 24) | (consumer & 0x00FF_FFFF);
         self.uar_write32(uar_page, 0x40, val);
     }
 
@@ -835,15 +836,18 @@ impl Mlx5Hca {
     /// is the offset within the 4-KiB UAR page. Used by EQ arming
     /// + WQ tail bumps.
     pub fn uar_write32(&self, uar_page: u32, byte_offset: u32, value: u32) {
-        let abs = self.uar_base + (uar_page as u64) * 4096
-                 + byte_offset as u64;
+        let abs = self.uar_base + (uar_page as u64) * 4096 + byte_offset as u64;
         // SAFETY: identity-mapped MMIO; caller asserts uar_page is
         // owned.
-        unsafe { self.mmio.write32(abs, value.swap_bytes()); }
+        unsafe {
+            self.mmio.write32(abs, value.swap_bytes());
+        }
     }
 
     /// Number of currently-allocated EQs.
-    pub fn eq_count(&self) -> usize { self.eqs.lock().len() }
+    pub fn eq_count(&self) -> usize {
+        self.eqs.lock().len()
+    }
 
     /// Stage 8: live `ALLOC_UAR`. No input data; FW returns the
     /// assigned UAR-page index in `output_modifier` low 24 bits.
@@ -871,23 +875,14 @@ impl Mlx5Hca {
     /// input-mailbox transport, and returns the FW-assigned
     /// `cq_number` (low 24 bits of `output_modifier`). The CQ is
     /// bound to `params.c_eqn` for async events.
-    pub fn create_cq(
-        &self,
-        params:     cq::CqParams,
-        page_count: usize,
-    ) -> Result<u32, Mlx5Error> {
+    pub fn create_cq(&self, params: cq::CqParams, page_count: usize) -> Result<u32, Mlx5Error> {
         let mut pages: Vec<DmaBuffer> = Vec::with_capacity(page_count);
         for _ in 0..page_count {
-            pages.push(
-                alloc_coherent(4096, DomainId::DRIVER_0)
-                    .map_err(|_| Mlx5Error::CmdqAlloc)?);
+            pages.push(alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| Mlx5Error::CmdqAlloc)?);
         }
-        let phys: Vec<u64> = pages.iter()
-            .map(|p| p.phys_addr().raw()).collect();
-        let payload = cq::build_create_cq_input(params, &phys)
-            .map_err(Mlx5Error::CqBuild)?;
-        let resp = self.issue_command_with_input_mailbox(
-            CmdOp::CreateCq, 0, &payload)?;
+        let phys: Vec<u64> = pages.iter().map(|p| p.phys_addr().raw()).collect();
+        let payload = cq::build_create_cq_input(params, &phys).map_err(Mlx5Error::CqBuild)?;
+        let resp = self.issue_command_with_input_mailbox(CmdOp::CreateCq, 0, &payload)?;
         let cq_number = resp.output_modifier & 0x00FF_FFFF;
         self.cqs.lock().push(LiveCq {
             cq_number,
@@ -899,13 +894,21 @@ impl Mlx5Hca {
     }
 
     /// Number of currently-allocated CQs.
-    pub fn cq_count(&self)  -> usize { self.cqs.lock().len() }
+    pub fn cq_count(&self) -> usize {
+        self.cqs.lock().len()
+    }
     /// Number of currently-allocated UARs.
-    pub fn uar_count(&self) -> usize { self.uars.lock().len() }
+    pub fn uar_count(&self) -> usize {
+        self.uars.lock().len()
+    }
     /// Number of currently-allocated PDs.
-    pub fn pd_count(&self)  -> usize { self.pds.lock().len() }
+    pub fn pd_count(&self) -> usize {
+        self.pds.lock().len()
+    }
     /// Number of currently-allocated QPs.
-    pub fn qp_count(&self)  -> usize { self.qps.lock().len() }
+    pub fn qp_count(&self) -> usize {
+        self.qps.lock().len()
+    }
 
     /// Stage 9: live `CREATE_QP`. Allocates `page_count` 4-KiB DMA
     /// pages for the QP buffers (SQ + RQ + doorbell), builds the
@@ -913,29 +916,20 @@ impl Mlx5Hca {
     /// the input-mailbox transport, and returns the FW-assigned
     /// `qp_number` (low 24 bits of `output_modifier`). The newly
     /// created QP starts in the RST state.
-    pub fn create_qp(
-        &self,
-        params:     qp::QpParams,
-        page_count: usize,
-    ) -> Result<u32, Mlx5Error> {
+    pub fn create_qp(&self, params: qp::QpParams, page_count: usize) -> Result<u32, Mlx5Error> {
         let mut pages: Vec<DmaBuffer> = Vec::with_capacity(page_count);
         for _ in 0..page_count {
-            pages.push(
-                alloc_coherent(4096, DomainId::DRIVER_0)
-                    .map_err(|_| Mlx5Error::CmdqAlloc)?);
+            pages.push(alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| Mlx5Error::CmdqAlloc)?);
         }
-        let phys: Vec<u64> = pages.iter()
-            .map(|p| p.phys_addr().raw()).collect();
-        let payload = qp::build_create_qp_input(params, &phys)
-            .map_err(Mlx5Error::QpBuild)?;
-        let resp = self.issue_command_with_input_mailbox(
-            CmdOp::CreateQp, 0, &payload)?;
+        let phys: Vec<u64> = pages.iter().map(|p| p.phys_addr().raw()).collect();
+        let payload = qp::build_create_qp_input(params, &phys).map_err(Mlx5Error::QpBuild)?;
+        let resp = self.issue_command_with_input_mailbox(CmdOp::CreateQp, 0, &payload)?;
         let qp_number = resp.output_modifier & 0x00FF_FFFF;
         self.qps.lock().push(LiveQp {
             qp_number,
             pages,
             params,
-            state:   qp::QpState::Rst,
+            state: qp::QpState::Rst,
             sq_tail: 0,
             rq_tail: 0,
         });
@@ -946,29 +940,24 @@ impl Mlx5Hca {
     /// state-machine transitions. Each transition maps to a distinct
     /// PRM-documented opcode; `qp_number` rides in `input_modifier`.
     /// On success, the driver's `LiveQp.state` is updated.
-    pub fn modify_qp(
-        &self,
-        qp_number:  u32,
-        transition: qp::QpTransition,
-    ) -> Result<(), Mlx5Error> {
+    pub fn modify_qp(&self, qp_number: u32, transition: qp::QpTransition) -> Result<(), Mlx5Error> {
         let opcode = match transition {
-            qp::QpTransition::ToRst       => CmdOp::ToRstQp,
-            qp::QpTransition::RstToInit   => CmdOp::Rst2InitQp,
-            qp::QpTransition::InitToRtr   => CmdOp::Init2RtrQp,
-            qp::QpTransition::RtrToRts    => CmdOp::Rtr2RtsQp,
+            qp::QpTransition::ToRst => CmdOp::ToRstQp,
+            qp::QpTransition::RstToInit => CmdOp::Rst2InitQp,
+            qp::QpTransition::InitToRtr => CmdOp::Init2RtrQp,
+            qp::QpTransition::RtrToRts => CmdOp::Rtr2RtsQp,
         };
         // Stage-9 minimal MODIFY_QP: zero-input. Real callers will
         // need to populate the qpc-update mailbox in Stage 10 to
         // hand FW path/MTU/PSN fields; for the state-machine plumbing
         // a zero-input modify is enough to validate the transport.
-        let _resp = self.issue_command_inline(
-            opcode, qp_number & 0x00FF_FFFF, &[])?;
+        let _resp = self.issue_command_inline(opcode, qp_number & 0x00FF_FFFF, &[])?;
         // Update the driver-side state mirror.
         let new_state = match transition {
-            qp::QpTransition::ToRst     => qp::QpState::Rst,
+            qp::QpTransition::ToRst => qp::QpState::Rst,
             qp::QpTransition::RstToInit => qp::QpState::Init,
             qp::QpTransition::InitToRtr => qp::QpState::Rtr,
-            qp::QpTransition::RtrToRts  => qp::QpState::Rts,
+            qp::QpTransition::RtrToRts => qp::QpState::Rts,
         };
         let mut qps = self.qps.lock();
         if let Some(q) = qps.iter_mut().find(|q| q.qp_number == qp_number) {
@@ -980,7 +969,9 @@ impl Mlx5Hca {
     /// Look up the driver-side state mirror for a QP. Returns `None`
     /// if the qp_number doesn't match any tracked QP.
     pub fn qp_state(&self, qp_number: u32) -> Option<qp::QpState> {
-        self.qps.lock().iter()
+        self.qps
+            .lock()
+            .iter()
             .find(|q| q.qp_number == qp_number)
             .map(|q| q.state)
     }
@@ -993,19 +984,19 @@ impl Mlx5Hca {
     pub fn post_send(
         &self,
         qp_number: u32,
-        opcode:    wqe::SendOpcode,
-        cqe_req:   wqe::CqeRequest,
-        iovecs:    &[ring::IoVec],
+        opcode: wqe::SendOpcode,
+        cqe_req: wqe::CqeRequest,
+        iovecs: &[ring::IoVec],
     ) -> Result<u32, Mlx5Error> {
         let mut qps = self.qps.lock();
-        let q = qps.iter_mut()
+        let q = qps
+            .iter_mut()
             .find(|q| q.qp_number == qp_number)
             .ok_or(Mlx5Error::UnknownQp)?;
         let sq_capacity = 1u32 << q.params.log_sq_size;
         let wqe_idx = q.sq_tail % sq_capacity;
-        let wqe_bytes = ring::build_send_wqe(
-            qp_number, wqe_idx as u16, opcode, cqe_req, iovecs)
-                .map_err(Mlx5Error::RingBuild)?;
+        let wqe_bytes = ring::build_send_wqe(qp_number, wqe_idx as u16, opcode, cqe_req, iovecs)
+            .map_err(Mlx5Error::RingBuild)?;
         // SQ starts at offset 0 of the QP buffer.
         let sq_phys = q.pages[0].phys_addr().raw();
         let dst = sq_phys + ring::sq_offset_of(wqe_idx) as u64;
@@ -1027,19 +1018,15 @@ impl Mlx5Hca {
     /// Stage 11: post a RECV onto the QP's RQ. Builds the recv-WQE
     /// from `iovecs`, copies it into the RQ slot, advances the tail,
     /// and bumps the RQ doorbell record. Returns the wqe_idx posted.
-    pub fn post_recv(
-        &self,
-        qp_number: u32,
-        iovecs:    &[ring::IoVec],
-    ) -> Result<u32, Mlx5Error> {
+    pub fn post_recv(&self, qp_number: u32, iovecs: &[ring::IoVec]) -> Result<u32, Mlx5Error> {
         let mut qps = self.qps.lock();
-        let q = qps.iter_mut()
+        let q = qps
+            .iter_mut()
             .find(|q| q.qp_number == qp_number)
             .ok_or(Mlx5Error::UnknownQp)?;
         let rq_capacity = 1u32 << q.params.log_rq_size;
         let wqe_idx = q.rq_tail % rq_capacity;
-        let wqe_bytes = ring::build_recv_wqe(iovecs)
-                .map_err(Mlx5Error::RingBuild)?;
+        let wqe_bytes = ring::build_recv_wqe(iovecs).map_err(Mlx5Error::RingBuild)?;
         // RQ region starts after the SQ.
         let qp_phys = q.pages[0].phys_addr().raw();
         let rq_base = qp_phys + ring::sq_size_bytes(q.params.log_sq_size) as u64;
@@ -1059,11 +1046,10 @@ impl Mlx5Hca {
     /// Walks the CQ buffer at the consumer cursor, returns the
     /// decoded `CqeView` if HW has handed it back, and advances the
     /// cursor on the live LiveCq record.
-    pub fn poll_cq(&self, cq_number: u32)
-        -> Result<Option<cqe::CqeView>, Mlx5Error>
-    {
+    pub fn poll_cq(&self, cq_number: u32) -> Result<Option<cqe::CqeView>, Mlx5Error> {
         let mut cqs = self.cqs.lock();
-        let c = cqs.iter_mut()
+        let c = cqs
+            .iter_mut()
             .find(|c| c.cq_number == cq_number)
             .ok_or(Mlx5Error::UnknownCq)?;
         let cq_capacity = 1u32 << c.params.log_cq_size;
@@ -1073,8 +1059,7 @@ impl Mlx5Hca {
         // SAFETY: identity-mapped DMA.
         unsafe {
             for i in 0..cqe::CQE_LEN {
-                bytes[i] = core::ptr::read_volatile(
-                    (cq_phys + off as u64 + i as u64) as *const u8);
+                bytes[i] = core::ptr::read_volatile((cq_phys + off as u64 + i as u64) as *const u8);
             }
         }
         if cqe::is_hw_owned(&bytes) {
@@ -1089,40 +1074,35 @@ impl Mlx5Hca {
     /// LiveQp record from the registry — the DMA backing drops
     /// when the LiveQp is freed.
     pub fn destroy_qp(&self, qp_number: u32) -> Result<(), Mlx5Error> {
-        let _resp = self.issue_command_inline(
-            CmdOp::DestroyQp, qp_number & 0x00FF_FFFF, &[])?;
+        let _resp = self.issue_command_inline(CmdOp::DestroyQp, qp_number & 0x00FF_FFFF, &[])?;
         self.qps.lock().retain(|q| q.qp_number != qp_number);
         Ok(())
     }
 
     /// Stage 16: destroy a CQ.
     pub fn destroy_cq(&self, cq_number: u32) -> Result<(), Mlx5Error> {
-        let _resp = self.issue_command_inline(
-            CmdOp::DestroyCq, cq_number & 0x00FF_FFFF, &[])?;
+        let _resp = self.issue_command_inline(CmdOp::DestroyCq, cq_number & 0x00FF_FFFF, &[])?;
         self.cqs.lock().retain(|c| c.cq_number != cq_number);
         Ok(())
     }
 
     /// Stage 16: destroy an EQ.
     pub fn destroy_eq(&self, eq_number: u32) -> Result<(), Mlx5Error> {
-        let _resp = self.issue_command_inline(
-            CmdOp::DestroyEq, eq_number & 0x00FF_FFFF, &[])?;
+        let _resp = self.issue_command_inline(CmdOp::DestroyEq, eq_number & 0x00FF_FFFF, &[])?;
         self.eqs.lock().retain(|e| e.eq_number != eq_number);
         Ok(())
     }
 
     /// Stage 16: release a UAR page back to firmware.
     pub fn dealloc_uar(&self, uar_page: u32) -> Result<(), Mlx5Error> {
-        let _resp = self.issue_command_inline(
-            CmdOp::DeallocUar, uar_page & 0x00FF_FFFF, &[])?;
+        let _resp = self.issue_command_inline(CmdOp::DeallocUar, uar_page & 0x00FF_FFFF, &[])?;
         self.uars.lock().retain(|&u| u != uar_page);
         Ok(())
     }
 
     /// Stage 16: release a PD back to firmware.
     pub fn dealloc_pd(&self, pd: u32) -> Result<(), Mlx5Error> {
-        let _resp = self.issue_command_inline(
-            CmdOp::DeallocPd, pd & 0x00FF_FFFF, &[])?;
+        let _resp = self.issue_command_inline(CmdOp::DeallocPd, pd & 0x00FF_FFFF, &[])?;
         self.pds.lock().retain(|&p| p != pd);
         Ok(())
     }
@@ -1134,62 +1114,68 @@ impl Mlx5Hca {
     pub fn teardown_all(&self) -> Result<(), Mlx5Error> {
         let mut last_err: Result<(), Mlx5Error> = Ok(());
         let qpns: Vec<u32> = self.qps.lock().iter().map(|q| q.qp_number).collect();
-        for qpn in qpns { if let Err(e) = self.destroy_qp(qpn)  { last_err = Err(e); } }
+        for qpn in qpns {
+            if let Err(e) = self.destroy_qp(qpn) {
+                last_err = Err(e);
+            }
+        }
         let cqns: Vec<u32> = self.cqs.lock().iter().map(|c| c.cq_number).collect();
-        for cqn in cqns { if let Err(e) = self.destroy_cq(cqn)  { last_err = Err(e); } }
+        for cqn in cqns {
+            if let Err(e) = self.destroy_cq(cqn) {
+                last_err = Err(e);
+            }
+        }
         let eqns: Vec<u32> = self.eqs.lock().iter().map(|e| e.eq_number).collect();
-        for eqn in eqns { if let Err(e) = self.destroy_eq(eqn)  { last_err = Err(e); } }
-        let pds: Vec<u32>  = self.pds.lock().clone();
-        for pd  in pds  { if let Err(e) = self.dealloc_pd(pd)   { last_err = Err(e); } }
+        for eqn in eqns {
+            if let Err(e) = self.destroy_eq(eqn) {
+                last_err = Err(e);
+            }
+        }
+        let pds: Vec<u32> = self.pds.lock().clone();
+        for pd in pds {
+            if let Err(e) = self.dealloc_pd(pd) {
+                last_err = Err(e);
+            }
+        }
         let uars: Vec<u32> = self.uars.lock().clone();
-        for u   in uars { if let Err(e) = self.dealloc_uar(u)   { last_err = Err(e); } }
+        for u in uars {
+            if let Err(e) = self.dealloc_uar(u) {
+                last_err = Err(e);
+            }
+        }
         last_err
     }
 
     /// Stage 14: create a TIR (RX endpoint). Returns the
     /// FW-assigned `tirn`.
-    pub fn create_tir(&self, params: steering::TirParams)
-        -> Result<u32, Mlx5Error>
-    {
+    pub fn create_tir(&self, params: steering::TirParams) -> Result<u32, Mlx5Error> {
         let payload = steering::build_create_tir_input(params);
-        let resp = self.issue_command_with_input_mailbox(
-            CmdOp::CreateTir, 0, &payload)?;
+        let resp = self.issue_command_with_input_mailbox(CmdOp::CreateTir, 0, &payload)?;
         Ok(resp.output_modifier & 0x00FF_FFFF)
     }
 
     /// Stage 14: create a TIS (TX endpoint). Returns the
     /// FW-assigned `tisn`.
-    pub fn create_tis(&self, params: steering::TisParams)
-        -> Result<u32, Mlx5Error>
-    {
+    pub fn create_tis(&self, params: steering::TisParams) -> Result<u32, Mlx5Error> {
         let payload = steering::build_create_tis_input(params);
-        let resp = self.issue_command_with_input_mailbox(
-            CmdOp::CreateTis, 0, &payload)?;
+        let resp = self.issue_command_with_input_mailbox(CmdOp::CreateTis, 0, &payload)?;
         Ok(resp.output_modifier & 0x00FF_FFFF)
     }
 
     /// Stage 14: create an RQT (RX queue table for RSS). Returns
     /// the FW-assigned `rqtn`.
-    pub fn create_rqt(&self, params: steering::RqtParams, rqs: &[u32])
-        -> Result<u32, Mlx5Error>
-    {
-        let payload = steering::build_create_rqt_input(params, rqs)
-            .map_err(Mlx5Error::RqtBuild)?;
-        let resp = self.issue_command_with_input_mailbox(
-            CmdOp::CreateRqt, 0, &payload)?;
+    pub fn create_rqt(&self, params: steering::RqtParams, rqs: &[u32]) -> Result<u32, Mlx5Error> {
+        let payload = steering::build_create_rqt_input(params, rqs).map_err(Mlx5Error::RqtBuild)?;
+        let resp = self.issue_command_with_input_mailbox(CmdOp::CreateRqt, 0, &payload)?;
         Ok(resp.output_modifier & 0x00FF_FFFF)
     }
 
     /// Stage 13: register a memory region. Returns the L_KEY for
     /// use in WQE pointer-data segments. The DMA pages remain
     /// owned by the caller.
-    pub fn create_mkey(&self, params: mkey::MkeyParams, pages: &[u64])
-        -> Result<u32, Mlx5Error>
-    {
-        let payload = mkey::build_create_mkey_input(params, pages)
-            .map_err(Mlx5Error::MkeyBuild)?;
-        let resp = self.issue_command_with_input_mailbox(
-            CmdOp::CreateMkey, 0, &payload)?;
+    pub fn create_mkey(&self, params: mkey::MkeyParams, pages: &[u64]) -> Result<u32, Mlx5Error> {
+        let payload = mkey::build_create_mkey_input(params, pages).map_err(Mlx5Error::MkeyBuild)?;
+        let resp = self.issue_command_with_input_mailbox(CmdOp::CreateMkey, 0, &payload)?;
         let mkey_index = resp.output_modifier & 0x00FF_FFFF;
         Ok(mkey::lkey_for(mkey_index))
     }
@@ -1200,20 +1186,19 @@ impl Mlx5Hca {
     /// paths).
     pub fn destroy_mkey(&self, l_key: u32) -> Result<(), Mlx5Error> {
         let mkey_index = l_key >> 8;
-        let _resp = self.issue_command_inline(
-            CmdOp::DestroyMkey, mkey_index & 0x00FF_FFFF, &[])?;
+        let _resp = self.issue_command_inline(CmdOp::DestroyMkey, mkey_index & 0x00FF_FFFF, &[])?;
         Ok(())
     }
 
     /// Stage 12: read the per-vport NIC context — MAC + MTU.
-    pub fn query_nic_vport_context(&self)
-        -> Result<vport::NicVportContext, Mlx5Error>
-    {
+    pub fn query_nic_vport_context(&self) -> Result<vport::NicVportContext, Mlx5Error> {
         let bytes = self.issue_command_with_mailboxes(
-            CmdOp::QueryNicVportContext, 0, &[],
-            vport::VPORT_CTX_LEN)?;
-        vport::NicVportContext::from_bytes(bytes)
-            .map_err(|_| Mlx5Error::VportDecode)
+            CmdOp::QueryNicVportContext,
+            0,
+            &[],
+            vport::VPORT_CTX_LEN,
+        )?;
+        vport::NicVportContext::from_bytes(bytes).map_err(|_| Mlx5Error::VportDecode)
     }
 
     /// Stage 12: write the vport's MTU.
@@ -1221,7 +1206,10 @@ impl Mlx5Hca {
         let payload = vport::build_set_mtu_payload(mtu);
         // op_mod_high bit 0 = "modify MTU"; rides as input_modifier.
         let _resp = self.issue_command_with_input_mailbox(
-            CmdOp::ModifyNicVportContext, /* op_mod */ 1, &payload)?;
+            CmdOp::ModifyNicVportContext,
+            /* op_mod */ 1,
+            &payload,
+        )?;
         Ok(())
     }
 
@@ -1229,12 +1217,7 @@ impl Mlx5Hca {
     /// 0x800 is the documented PRM SQ-doorbell offset within a UAR
     /// page; the value carries the wqe_idx of the next-to-post WQE
     /// + the qp_num. PRM §11.4.4.
-    pub fn ring_sq_doorbell(
-        &self,
-        uar_page:  u32,
-        qp_number: u32,
-        wqe_idx:   u16,
-    ) {
+    pub fn ring_sq_doorbell(&self, uar_page: u32, qp_number: u32, wqe_idx: u16) {
         // Doorbell value: bits[31:8] = qp_num, bits[7:0] = wqe_idx
         // low byte. Some HCAs use a 16-bit wqe_idx — Stage 10 stays
         // with the documented 8-bit form for SEND.
@@ -1245,10 +1228,7 @@ impl Mlx5Hca {
     /// Stage 5: typed wrapper around QUERY_HCA_CAP(GeneralDevice).
     /// Returns the decoded view; callers needing fields beyond the
     /// Stage-5 subset go through `caps::HcaGeneralCaps::raw()`.
-    pub fn query_general_caps(
-        &self,
-        current: bool,
-    ) -> Result<caps::HcaGeneralCaps, Mlx5Error> {
+    pub fn query_general_caps(&self, current: bool) -> Result<caps::HcaGeneralCaps, Mlx5Error> {
         let bytes = self.query_hca_cap(HcaCapGroup::GeneralDevice, current)?;
         caps::HcaGeneralCaps::from_bytes(bytes)
             .map_err(|_| Mlx5Error::CmdFailed(CmdError::NotComplete))
@@ -1267,15 +1247,10 @@ impl Mlx5Hca {
     /// Stage 4: issue `QUERY_HCA_CAP` for a chosen capability group
     /// and return the raw response bytes. Decoding the structured
     /// fields lands in Stage 5.
-    pub fn query_hca_cap(
-        &self,
-        group:   HcaCapGroup,
-        current: bool,
-    ) -> Result<Vec<u8>, Mlx5Error> {
+    pub fn query_hca_cap(&self, group: HcaCapGroup, current: bool) -> Result<Vec<u8>, Mlx5Error> {
         // Op modifier per PRM §15.2.1: bits [15:1] = cap group, bit
         // [0] = 0 (max) / 1 (current).
-        let op_mod_high  = (group as u16) << 1
-                         | if current { 1 } else { 0 };
+        let op_mod_high = (group as u16) << 1 | if current { 1 } else { 0 };
         // The op_mod field rides in the upper 16 bits of the
         // input_modifier slot for QUERY_HCA_CAP — different
         // commands position op_mod differently, but for QUERY_HCA_CAP
@@ -1287,24 +1262,36 @@ impl Mlx5Hca {
         // Stage-5 trim to what's actually meaningful.
         const HCA_CAP_OUTPUT_LEN: usize = 0x1000;
         self.issue_command_with_mailboxes(
-            CmdOp::QueryHcaCap, input_modifier,
-            &[], HCA_CAP_OUTPUT_LEN,
+            CmdOp::QueryHcaCap,
+            input_modifier,
+            &[],
+            HCA_CAP_OUTPUT_LEN,
         )
     }
 
     pub fn fw_rev(&self) -> (u16, u16, u16) {
-        (self.segment.fw_rev_major,
-         self.segment.fw_rev_minor,
-         self.segment.fw_rev_subminor)
+        (
+            self.segment.fw_rev_major,
+            self.segment.fw_rev_minor,
+            self.segment.fw_rev_subminor,
+        )
     }
 
-    pub fn cmd_interface_rev(&self) -> u16 { self.segment.cmd_interface_rev }
+    pub fn cmd_interface_rev(&self) -> u16 {
+        self.segment.cmd_interface_rev
+    }
 
-    pub fn cmdq_addr(&self) -> u64 { self.segment.cmdq_addr }
+    pub fn cmdq_addr(&self) -> u64 {
+        self.segment.cmdq_addr
+    }
 
-    pub fn cmdq_log_size(&self) -> u8 { self.segment.cmdq_log_size }
+    pub fn cmdq_log_size(&self) -> u8 {
+        self.segment.cmdq_log_size
+    }
 
-    pub fn segment(&self) -> &InitSegment { &self.segment }
+    pub fn segment(&self) -> &InitSegment {
+        &self.segment
+    }
 
     /// Read a raw 4-byte field from BAR0 (BE on wire). Used by
     /// later-stage code; exposed here so smokes can prod the live
@@ -1325,14 +1312,10 @@ impl Mlx5Hca {
 /// `cmdq_phys` MUST be ≥ 4-KiB aligned (the low 12 bits are reserved
 /// in the register and discarded — page-aligned DMA satisfies that).
 /// `log_size` is packed into the low 4 bits of the low register.
-pub(crate) fn program_cmdq_registers(
-    mmio:      &MmioRegion,
-    cmdq_phys: u64,
-    log_size:  u8,
-) {
+pub(crate) fn program_cmdq_registers(mmio: &MmioRegion, cmdq_phys: u64, log_size: u8) {
     let high = (cmdq_phys >> 32) as u32;
     let low_aligned = (cmdq_phys as u32) & 0xFFFF_F000;
-    let low_sz  = low_aligned | ((log_size as u32) & 0xF);
+    let low_sz = low_aligned | ((log_size as u32) & 0xF);
     // SAFETY: identity-mapped MMIO; offsets bounded; caller has
     // exclusive ownership of the device.
     unsafe {
@@ -1343,23 +1326,23 @@ pub(crate) fn program_cmdq_registers(
 
 // ── Driver-match registration ──────────────────────────────────────
 
-static CONTROLLER: IrqSafeSpinLock<Option<Mlx5Hca>> =
-    IrqSafeSpinLock::new(None);
+static CONTROLLER: IrqSafeSpinLock<Option<Mlx5Hca>> = IrqSafeSpinLock::new(None);
 
-pub fn probe(
-    device: BusDevice,
-    cap:    Cap<BusDeviceCap, Write>,
-) -> Result<(), narf_bus::ProbeError> {
-    if CONTROLLER.lock().is_some() { return Ok(()); }
+pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
+    if CONTROLLER.lock().is_some() {
+        return Ok(());
+    }
     narf_bus::pci::set_command(
-        &cap, &device,
+        &cap,
+        &device,
         narf_bus::pci::cmd::MEM_SPACE
             | narf_bus::pci::cmd::BUS_MASTER
             | narf_bus::pci::cmd::INTX_DISABLE,
-    ).map_err(|_| narf_bus::ProbeError::BadDevice)?;
+    )
+    .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // SAFETY: caller-authority over device.
     let mut dev = match unsafe { Mlx5Hca::bring_up(&device, &cap) } {
-        Ok(d)  => d,
+        Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
     // Stage 4: post a NOP through the live cmdq transport to verify
@@ -1370,11 +1353,11 @@ pub fn probe(
     let _ = dev.run_nop_selftest();
     *CONTROLLER.lock() = Some(dev);
     narf_drivers::record_bound(narf_drivers::BoundDriver {
-        name:    alloc::string::String::from(name_for(device.id.device)),
-        kind:    narf_drivers::BoundKind::Net,
+        name: alloc::string::String::from(name_for(device.id.device)),
+        kind: narf_drivers::BoundKind::Net,
         pci_vid: Some(device.id.vendor),
         pci_did: Some(device.id.device),
-        domain:  narf_drivers::BoundKind::Net.default_domain(),
+        domain: narf_drivers::BoundKind::Net.default_domain(),
     });
     Ok(())
 }
@@ -1387,7 +1370,8 @@ pub fn register_pci_driver() {
         narf_bus::register_pci_driver(narf_bus::PciMatch {
             name: name_for(did),
             kind: narf_bus::MatchKind::VendorDevice {
-                vendor: MLX5_VENDOR, device: did,
+                vendor: MLX5_VENDOR,
+                device: did,
             },
             probe,
         });
@@ -1396,18 +1380,20 @@ pub fn register_pci_driver() {
 
 fn name_for(did: u16) -> &'static str {
     match did {
-        MLX5_DEV_CX4       => "mlx5-cx4",
-        MLX5_DEV_CX4_LX    => "mlx5-cx4-lx",
+        MLX5_DEV_CX4 => "mlx5-cx4",
+        MLX5_DEV_CX4_LX => "mlx5-cx4-lx",
         MLX5_DEV_CX4_LX_VF => "mlx5-cx4-lx-vf",
-        MLX5_DEV_CX5       => "mlx5-cx5",
-        MLX5_DEV_CX5_EX    => "mlx5-cx5-ex",
-        MLX5_DEV_CX6       => "mlx5-cx6",
-        MLX5_DEV_CX6_DX    => "mlx5-cx6-dx",
-        _                  => "mlx5",
+        MLX5_DEV_CX5 => "mlx5-cx5",
+        MLX5_DEV_CX5_EX => "mlx5-cx5-ex",
+        MLX5_DEV_CX6 => "mlx5-cx6",
+        MLX5_DEV_CX6_DX => "mlx5-cx6-dx",
+        _ => "mlx5",
     }
 }
 
-pub fn is_probed() -> bool { CONTROLLER.lock().is_some() }
+pub fn is_probed() -> bool {
+    CONTROLLER.lock().is_some()
+}
 
 pub fn with_controller<R>(f: impl FnOnce(&Mlx5Hca) -> R) -> Option<R> {
     CONTROLLER.lock().as_ref().map(f)
@@ -1416,11 +1402,30 @@ pub fn with_controller<R>(f: impl FnOnce(&Mlx5Hca) -> R) -> Option<R> {
 // ── Stage 12: HwNic trait impl ─────────────────────────────────────
 
 impl crate::HwNic for Mlx5Hca {
-    fn name(&self) -> &'static str { "mlx5" }
-    fn mac(&self) -> [u8; 6]       { self.nic_state().mac }
-    fn mtu(&self) -> u32           { let m = self.nic_state().mtu; if m == 0 { 1500 } else { m } }
-    fn link_up(&self) -> bool      { self.nic_state().link_up }
-    fn model(&self) -> crate::NicModel { crate::NicModel::MellanoxMlx5 }
-    fn caps(&self) -> crate::NicCaps   { crate::NicCaps::NONE }
-    fn ring_capacity(&self) -> usize { 1 << 8 }
+    fn name(&self) -> &'static str {
+        "mlx5"
+    }
+    fn mac(&self) -> [u8; 6] {
+        self.nic_state().mac
+    }
+    fn mtu(&self) -> u32 {
+        let m = self.nic_state().mtu;
+        if m == 0 {
+            1500
+        } else {
+            m
+        }
+    }
+    fn link_up(&self) -> bool {
+        self.nic_state().link_up
+    }
+    fn model(&self) -> crate::NicModel {
+        crate::NicModel::MellanoxMlx5
+    }
+    fn caps(&self) -> crate::NicCaps {
+        crate::NicCaps::NONE
+    }
+    fn ring_capacity(&self) -> usize {
+        1 << 8
+    }
 }

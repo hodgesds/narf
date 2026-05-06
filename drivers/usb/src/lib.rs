@@ -6,10 +6,10 @@
 
 extern crate alloc;
 
-pub mod xhci;
-pub mod msc;
 pub mod hid;
 pub mod hub;
+pub mod msc;
+pub mod xhci;
 
 mod tests;
 
@@ -24,17 +24,26 @@ pub fn register_initcalls() {
     // (probed by the bus walker once `register_pci_driver` runs) is
     // up by the time this fires. If no xHCI is present, skip.
     narf_init::register(Stage::Device, "usb-hid-keyboard", || {
-        if !xhci::is_probed() { return InitResult::NotPresent; }
-        let attached = xhci::with_controller(|c|
-            hid::enumerate_and_attach_keyboards(c)
-        ).unwrap_or(0);
-        if attached == 0 { InitResult::NotPresent } else { InitResult::Ok }
+        if !xhci::is_probed() {
+            return InitResult::NotPresent;
+        }
+        let attached =
+            xhci::with_controller(|c| hid::enumerate_and_attach_keyboards(c)).unwrap_or(0);
+        if attached == 0 {
+            InitResult::NotPresent
+        } else {
+            InitResult::Ok
+        }
     });
     narf_init::register(Stage::Device, "usb-mass-storage", || {
-        if !xhci::is_probed() { return InitResult::NotPresent; }
-        let attached = xhci::with_controller(|c|
-            msc::enumerate_and_attach_msc(c)
-        ).unwrap_or(0);
-        if attached == 0 { InitResult::NotPresent } else { InitResult::Ok }
+        if !xhci::is_probed() {
+            return InitResult::NotPresent;
+        }
+        let attached = xhci::with_controller(|c| msc::enumerate_and_attach_msc(c)).unwrap_or(0);
+        if attached == 0 {
+            InitResult::NotPresent
+        } else {
+            InitResult::Ok
+        }
     });
 }

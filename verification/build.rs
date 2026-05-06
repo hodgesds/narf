@@ -109,8 +109,10 @@ fn build_arch(
     let status = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
         .arg("build")
         .arg("--release")
-        .arg("--target").arg(triple)
-        .arg("--target-dir").arg(target_dir)
+        .arg("--target")
+        .arg(triple)
+        .arg("--target-dir")
+        .arg(target_dir)
         .arg("-Zbuild-std=core")
         .arg("-Zbuild-std-features=")
         .current_dir(testbin_dir)
@@ -123,10 +125,11 @@ fn build_arch(
         panic!("narf-testbin {triple} build failed with {status}");
     }
 
-    let bin = target_dir
-        .join(triple)
-        .join("release")
-        .join(bin_name);
-    assert!(bin.exists(), "{bin_name} output missing for {triple}: {}", bin.display());
+    let bin = target_dir.join(triple).join("release").join(bin_name);
+    assert!(
+        bin.exists(),
+        "{bin_name} output missing for {triple}: {}",
+        bin.display()
+    );
     println!("cargo:rustc-env={}={}", env_var, bin.display());
 }

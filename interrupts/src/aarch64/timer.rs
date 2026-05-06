@@ -35,7 +35,9 @@ pub unsafe fn start_timer(tval_ticks: u64) {
 #[inline]
 pub unsafe fn rearm_timer(tval_ticks: u64) {
     // SAFETY: see `start_timer`.
-    unsafe { sysreg::write_cntp_tval_el0(tval_ticks); }
+    unsafe {
+        sysreg::write_cntp_tval_el0(tval_ticks);
+    }
 }
 
 /// Mask + disable the timer. Used on shutdown.
@@ -45,7 +47,7 @@ pub unsafe fn rearm_timer(tval_ticks: u64) {
 pub unsafe fn stop_timer() {
     // SAFETY: writes to CNTP_CTL_EL0 are always legal.
     unsafe {
-        sysreg::write_cntp_ctl_el0(1 << 1);  // IMASK = 1
+        sysreg::write_cntp_ctl_el0(1 << 1); // IMASK = 1
     }
 }
 

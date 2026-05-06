@@ -18,7 +18,9 @@ impl PcrSet {
     pub const NONE: Self = Self(0);
 
     pub fn contains(self, pcr: u32) -> bool {
-        if pcr >= 32 { return false; }
+        if pcr >= 32 {
+            return false;
+        }
         (self.0 & (1 << pcr)) != 0
     }
 }

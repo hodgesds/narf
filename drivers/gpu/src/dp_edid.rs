@@ -21,9 +21,7 @@
 //! Each chunk is one `transact` round-trip; the helper batches
 //! them into a single 128-byte read.
 
-use crate::dp_aux::{
-    AuxChannel, AuxCommand, AuxError, AuxRequest,
-};
+use crate::dp_aux::{AuxChannel, AuxCommand, AuxError, AuxRequest};
 
 /// Standard DDC/CI EDID slave address (left-shifted by 1 to
 /// match the AUX wire format).
@@ -42,7 +40,9 @@ pub enum EdidReadError {
 }
 
 impl From<AuxError> for EdidReadError {
-    fn from(e: AuxError) -> Self { EdidReadError::Aux(e) }
+    fn from(e: AuxError) -> Self {
+        EdidReadError::Aux(e)
+    }
 }
 
 /// Read a panel's 128-byte base EDID block over DP AUX, then
@@ -55,7 +55,8 @@ pub fn read_panel_edid<'a, A: AuxChannel>(
 ) -> Result<narf_graphics::edid::Edid<'a>, EdidReadError> {
     if out.len() < 128 {
         return Err(EdidReadError::Parse(
-            narf_graphics::edid::EdidError::BadLength));
+            narf_graphics::edid::EdidError::BadLength,
+        ));
     }
     // Step 1: write the EDID offset (0) to the slave.
     let offset = [0u8];
@@ -83,6 +84,5 @@ pub fn read_panel_edid<'a, A: AuxChannel>(
     }
 
     // Step 3: hand off to the cross-vendor parser.
-    narf_graphics::edid::Edid::parse(&out[..128])
-        .map_err(EdidReadError::Parse)
+    narf_graphics::edid::Edid::parse(&out[..128]).map_err(EdidReadError::Parse)
 }

@@ -29,15 +29,15 @@ pub const COMMAND_OFFSET: u64 = 0x04;
 pub mod cmd {
     /// I/O Space Enable. Required before reads/writes to I/O-space
     /// BARs are routed to the device.
-    pub const IO_SPACE:    u16 = 1 << 0;
+    pub const IO_SPACE: u16 = 1 << 0;
     /// Memory Space Enable. Required before reads/writes to MMIO BARs
     /// are routed to the device. Most drivers want this on.
-    pub const MEM_SPACE:   u16 = 1 << 1;
+    pub const MEM_SPACE: u16 = 1 << 1;
     /// Bus Master Enable. Required for the device to issue any DMA
     /// (write its completion queue, fetch from a submission queue,
     /// or write an MSI message). All drivers that touch DMA need
     /// this set.
-    pub const BUS_MASTER:  u16 = 1 << 2;
+    pub const BUS_MASTER: u16 = 1 << 2;
     /// Disable INTx legacy interrupt assertion. Recommended on when
     /// using MSI / MSI-X exclusively.
     pub const INTX_DISABLE: u16 = 1 << 10;
@@ -53,16 +53,15 @@ pub enum PciError {
 }
 
 impl From<narf_capabilities::CapError> for PciError {
-    fn from(_: narf_capabilities::CapError) -> Self { PciError::AuthorityRevoked }
+    fn from(_: narf_capabilities::CapError) -> Self {
+        PciError::AuthorityRevoked
+    }
 }
 
 /// Read the device's current Command-register value.
 ///
 /// Cap-gated; the cap's epoch is checked.
-pub fn read_command(
-    cap:    &Cap<BusDeviceCap, Write>,
-    device: &BusDevice,
-) -> Result<u16, PciError> {
+pub fn read_command(cap: &Cap<BusDeviceCap, Write>, device: &BusDevice) -> Result<u16, PciError> {
     cap.check_live()?;
     let cfg = pcie_cfg_phys(device)?;
     // SAFETY: cfg-space is identity-mapped for the lifetime of the
@@ -78,9 +77,9 @@ pub fn read_command(
 /// writer — the Stage-3 single-threaded contract holds (only one
 /// driver claims a given device).
 pub fn set_command(
-    cap:    &Cap<BusDeviceCap, Write>,
+    cap: &Cap<BusDeviceCap, Write>,
     device: &BusDevice,
-    bits:   u16,
+    bits: u16,
 ) -> Result<u16, PciError> {
     cap.check_live()?;
     let cfg = pcie_cfg_phys(device)?;
@@ -88,16 +87,18 @@ pub fn set_command(
     let old = unsafe { cfg_read16(cfg, COMMAND_OFFSET) };
     let new = old | bits;
     // SAFETY: same window; caller owns the device exclusively.
-    unsafe { cfg_write16(cfg, COMMAND_OFFSET, new); }
+    unsafe {
+        cfg_write16(cfg, COMMAND_OFFSET, new);
+    }
     Ok(new)
 }
 
 /// Mask `bits` out of the device's Command register, leaving every
 /// other bit unchanged.
 pub fn clear_command(
-    cap:    &Cap<BusDeviceCap, Write>,
+    cap: &Cap<BusDeviceCap, Write>,
     device: &BusDevice,
-    bits:   u16,
+    bits: u16,
 ) -> Result<u16, PciError> {
     cap.check_live()?;
     let cfg = pcie_cfg_phys(device)?;
@@ -105,7 +106,9 @@ pub fn clear_command(
     let old = unsafe { cfg_read16(cfg, COMMAND_OFFSET) };
     let new = old & !bits;
     // SAFETY: same window; caller owns the device.
-    unsafe { cfg_write16(cfg, COMMAND_OFFSET, new); }
+    unsafe {
+        cfg_write16(cfg, COMMAND_OFFSET, new);
+    }
     Ok(new)
 }
 
@@ -113,7 +116,7 @@ pub fn clear_command(
 fn pcie_cfg_phys(device: &BusDevice) -> Result<PhysAddr, PciError> {
     match device.kind {
         BusKind::Pcie { cfg_phys, .. } => Ok(cfg_phys),
-        BusKind::VirtioMmio { .. }     => Err(PciError::NotPcie),
+        BusKind::VirtioMmio { .. } => Err(PciError::NotPcie),
     }
 }
 
@@ -130,7 +133,9 @@ unsafe fn cfg_read16(cfg: PhysAddr, off: u64) -> u16 {
 unsafe fn cfg_write16(cfg: PhysAddr, off: u64, value: u16) {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: caller asserts the slot is writable + 2-byte aligned.
-    unsafe { core::ptr::write_volatile((cfg.raw() + off) as *mut u16, value); }
+    unsafe {
+        core::ptr::write_volatile((cfg.raw() + off) as *mut u16, value);
+    }
     compiler_fence(Ordering::SeqCst);
 }
 
@@ -143,11 +148,9 @@ unsafe fn cfg_write16(cfg: PhysAddr, off: u64, value: u16) {
 #[inline]
 pub fn requester_id(device: &BusDevice) -> Option<u16> {
     match device.kind {
-        BusKind::Pcie { addr, .. } => Some(
-            ((addr.bus as u16) << 8)
-            | ((addr.device as u16) << 3)
-            | (addr.function as u16)
-        ),
+        BusKind::Pcie { addr, .. } => {
+            Some(((addr.bus as u16) << 8) | ((addr.device as u16) << 3) | (addr.function as u16))
+        }
         BusKind::VirtioMmio { .. } => None,
     }
 }

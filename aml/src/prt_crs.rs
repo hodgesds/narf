@@ -9,9 +9,11 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::{AmlError, NodeKind, Value, find_node};
 use crate::eval::evaluate_method;
-use crate::resource::{decode_prt, decode_resource_template, PrtEntry, ResourceError, ResourceItem};
+use crate::resource::{
+    decode_prt, decode_resource_template, PrtEntry, ResourceError, ResourceItem,
+};
+use crate::{find_node, AmlError, NodeKind, Value};
 
 /// Errors from the _PRT / _CRS bridge.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,11 +30,15 @@ pub enum BridgeError {
 }
 
 impl From<AmlError> for BridgeError {
-    fn from(e: AmlError) -> Self { BridgeError::Eval(e) }
+    fn from(e: AmlError) -> Self {
+        BridgeError::Eval(e)
+    }
 }
 
 impl From<ResourceError> for BridgeError {
-    fn from(e: ResourceError) -> Self { BridgeError::Decode(e) }
+    fn from(e: ResourceError) -> Self {
+        BridgeError::Decode(e)
+    }
 }
 
 /// Evaluate `<device_path>._PRT` and decode the result into a

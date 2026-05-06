@@ -53,8 +53,8 @@ pub const FILE_NAME_LEN: usize = 56;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct FwCfgFile {
-    pub size:     u32,
-    pub select:   u16,
+    pub size: u32,
+    pub select: u16,
     pub name_len: u8,
     pub name_buf: [u8; FILE_NAME_LEN],
 }
@@ -86,12 +86,15 @@ pub enum FwCfgError {
 #[inline]
 pub fn select(key: u16) {
     // SAFETY: writing to a fixed PIO port with no memory effect.
-    unsafe { outw(SELECTOR_PORT, key); }
+    unsafe {
+        outw(SELECTOR_PORT, key);
+    }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
 #[inline]
-pub fn select(_key: u16) { /* aarch64 MMIO TODO */ }
+pub fn select(_key: u16) { /* aarch64 MMIO TODO */
+}
 
 /// Stream-read `buf.len()` bytes from the data port. Spec §2: each
 /// `inb` returns the next byte for the currently-selected key.
@@ -104,20 +107,25 @@ pub fn read_bytes(buf: &mut [u8]) {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-pub fn read_bytes(_buf: &mut [u8]) { /* aarch64 MMIO TODO */ }
+pub fn read_bytes(_buf: &mut [u8]) { /* aarch64 MMIO TODO */
+}
 
 // ── presence + directory ───────────────────────────────────────────
 
 /// `true` if writing `FW_CFG_SIGNATURE` and reading 4 bytes returns
 /// the `MAGIC`. Spec §4.
 pub fn is_present() -> bool {
-    #[cfg(target_arch = "x86_64")] {
+    #[cfg(target_arch = "x86_64")]
+    {
         select(FW_CFG_SIGNATURE);
         let mut sig = [0u8; 4];
         read_bytes(&mut sig);
         sig == MAGIC
     }
-    #[cfg(not(target_arch = "x86_64"))] { false }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
 }
 
 /// Decode a single 64-byte directory entry per spec §4.
@@ -125,19 +133,29 @@ pub fn is_present() -> bool {
 /// All numeric fields are big-endian; `name` is NUL-terminated ASCII
 /// inside the 56-byte field.
 pub fn decode_file_entry(raw: &[u8; FILE_ENTRY_SIZE]) -> FwCfgFile {
-    let size   = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    let size = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
     let select = u16::from_be_bytes([raw[4], raw[5]]);
     // raw[6..8] is the reserved u16; ignore.
     let mut name_buf = [0u8; FILE_NAME_LEN];
     name_buf.copy_from_slice(&raw[8..64]);
-    let name_len = name_buf.iter().position(|&c| c == 0).unwrap_or(FILE_NAME_LEN) as u8;
-    FwCfgFile { size, select, name_len, name_buf }
+    let name_len = name_buf
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(FILE_NAME_LEN) as u8;
+    FwCfgFile {
+        size,
+        select,
+        name_len,
+        name_buf,
+    }
 }
 
 /// Read the file directory at `FW_CFG_FILE_DIR`. Spec §4: u32 BE entry
 /// count, then N × 64-byte entries.
 pub fn read_directory() -> Result<Vec<FwCfgFile>, FwCfgError> {
-    if !is_present() { return Err(FwCfgError::NotPresent); }
+    if !is_present() {
+        return Err(FwCfgError::NotPresent);
+    }
     select(FW_CFG_FILE_DIR);
     let mut count_buf = [0u8; 4];
     read_bytes(&mut count_buf);
@@ -181,7 +199,9 @@ pub fn read_string(name: &str) -> Option<String> {
     let mut buf = vec![0u8; f.size as usize];
     let n = read(&f, &mut buf);
     buf.truncate(n);
-    if buf.last() == Some(&0) { buf.pop(); }
+    if buf.last() == Some(&0) {
+        buf.pop();
+    }
     String::from_utf8(buf).ok()
 }
 
@@ -196,15 +216,23 @@ pub fn register_initcalls() {
     narf_init::register(Stage::Subsys, "fw_cfg-probe", || {
         let p = is_present();
         *PRESENT.lock() = Some(p);
-        if p { InitResult::Ok } else { InitResult::NotPresent }
+        if p {
+            InitResult::Ok
+        } else {
+            InitResult::NotPresent
+        }
     });
 }
 
 /// Cached probe outcome. `None` until `register_initcalls`'s
 /// `Subsys` slot has run.
-pub fn cached_present() -> Option<bool> { *PRESENT.lock() }
+pub fn cached_present() -> Option<bool> {
+    *PRESENT.lock()
+}
 
 #[doc(hidden)]
-pub fn __reset_for_test() { *PRESENT.lock() = None; }
+pub fn __reset_for_test() {
+    *PRESENT.lock() = None;
+}
 
 mod tests;

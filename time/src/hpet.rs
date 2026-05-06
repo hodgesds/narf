@@ -56,10 +56,10 @@ use narf_lib::sync::IrqSafeSpinLock;
 /// [`set_base_phys`].
 pub const HPET_DEFAULT_BASE: u64 = 0xFED0_0000;
 
-const REG_CAP_ID:    u64 = 0x000;
-const REG_GEN_CONF:  u64 = 0x010;
-const REG_INT_STS:   u64 = 0x020;
-const REG_MAIN_CNT:  u64 = 0x0F0;
+const REG_CAP_ID: u64 = 0x000;
+const REG_GEN_CONF: u64 = 0x010;
+const REG_INT_STS: u64 = 0x020;
+const REG_MAIN_CNT: u64 = 0x0F0;
 const REG_TIMER_BASE: u64 = 0x100;
 const REG_TIMER_STRIDE: u64 = 0x20;
 
@@ -78,20 +78,22 @@ pub enum HpetError {
 
 #[derive(Copy, Clone, Debug)]
 pub struct HpetCaps {
-    pub rev_id:           u8,
+    pub rev_id: u8,
     /// Number of comparators (NUM_TIM_CAP + 1).
-    pub num_comparators:  u8,
-    pub counter_64bit:    bool,
+    pub num_comparators: u8,
+    pub counter_64bit: bool,
     pub legacy_route_cap: bool,
-    pub vendor_id:        u16,
+    pub vendor_id: u16,
     /// Tick period in femtoseconds.
-    pub clk_period_fs:    u32,
+    pub clk_period_fs: u32,
 }
 
 impl HpetCaps {
     /// Tick frequency in Hz.
     pub fn frequency_hz(&self) -> u64 {
-        if self.clk_period_fs == 0 { return 0; }
+        if self.clk_period_fs == 0 {
+            return 0;
+        }
         FEMTOS_PER_SEC / self.clk_period_fs as u64
     }
 }
@@ -99,7 +101,7 @@ impl HpetCaps {
 #[derive(Debug)]
 pub struct Hpet {
     base_phys: u64,
-    caps:      HpetCaps,
+    caps: HpetCaps,
 }
 
 impl Hpet {
@@ -124,12 +126,12 @@ impl Hpet {
             return Err(HpetError::BadFrequency);
         }
         let caps = HpetCaps {
-            rev_id:           (cap & 0xFF) as u8,
-            num_comparators:  (((cap >> 8) & 0x1F) + 1) as u8,
-            counter_64bit:    (cap >> 13) & 1 != 0,
+            rev_id: (cap & 0xFF) as u8,
+            num_comparators: (((cap >> 8) & 0x1F) + 1) as u8,
+            counter_64bit: (cap >> 13) & 1 != 0,
             legacy_route_cap: (cap >> 15) & 1 != 0,
-            vendor_id:        ((cap >> 16) & 0xFFFF) as u16,
-            clk_period_fs:    clk,
+            vendor_id: ((cap >> 16) & 0xFFFF) as u16,
+            clk_period_fs: clk,
         };
         Ok(Self { base_phys, caps })
     }
@@ -142,7 +144,9 @@ impl Hpet {
         // SAFETY: identity-mapped MMIO.
         let g = unsafe { read_u64(self.base_phys + REG_GEN_CONF) };
         // SAFETY: same.
-        unsafe { write_u64(self.base_phys + REG_GEN_CONF, g | GEN_CONF_ENABLE_CNF); }
+        unsafe {
+            write_u64(self.base_phys + REG_GEN_CONF, g | GEN_CONF_ENABLE_CNF);
+        }
     }
 
     /// Disable the main counter.
@@ -153,7 +157,9 @@ impl Hpet {
         // SAFETY: identity-mapped MMIO.
         let g = unsafe { read_u64(self.base_phys + REG_GEN_CONF) };
         // SAFETY: same.
-        unsafe { write_u64(self.base_phys + REG_GEN_CONF, g & !GEN_CONF_ENABLE_CNF); }
+        unsafe {
+            write_u64(self.base_phys + REG_GEN_CONF, g & !GEN_CONF_ENABLE_CNF);
+        }
     }
 
     /// Snapshot of the main counter (free-running ticks).
@@ -165,8 +171,12 @@ impl Hpet {
         unsafe { read_u64(self.base_phys + REG_MAIN_CNT) }
     }
 
-    pub fn caps(&self) -> HpetCaps { self.caps }
-    pub fn base_phys(&self) -> u64 { self.base_phys }
+    pub fn caps(&self) -> HpetCaps {
+        self.caps
+    }
+    pub fn base_phys(&self) -> u64 {
+        self.base_phys
+    }
 }
 
 // ── Singleton + raw reads ──────────────────────────────────────────
@@ -180,13 +190,17 @@ unsafe fn read_u64(phys: u64) -> u64 {
 #[cfg(target_arch = "x86_64")]
 unsafe fn write_u64(phys: u64, v: u64) {
     // SAFETY: caller-asserted identity-mapped MMIO.
-    unsafe { core::ptr::write_volatile(phys as *mut u64, v); }
+    unsafe {
+        core::ptr::write_volatile(phys as *mut u64, v);
+    }
 }
 
 // On non-x86_64, HPET doesn't exist (Generic Timer fills the role).
 // Stub the helpers so the module compiles cross-arch.
 #[cfg(not(target_arch = "x86_64"))]
-unsafe fn read_u64(_phys: u64) -> u64 { 0 }
+unsafe fn read_u64(_phys: u64) -> u64 {
+    0
+}
 
 #[cfg(not(target_arch = "x86_64"))]
 unsafe fn write_u64(_phys: u64, _v: u64) {}
@@ -217,7 +231,9 @@ pub unsafe fn init() -> Result<(), HpetError> {
     // SAFETY: caller-asserted boot-time exclusivity.
     let dev = unsafe { Hpet::probe(base) }?;
     // SAFETY: caller asserted single-threaded.
-    unsafe { dev.enable(); }
+    unsafe {
+        dev.enable();
+    }
     *HPET.lock() = Some(dev);
     Ok(())
 }
@@ -246,7 +262,9 @@ pub fn caps() -> Option<HpetCaps> {
 }
 
 /// `true` iff HPET probe succeeded.
-pub fn is_present() -> bool { HPET.lock().is_some() }
+pub fn is_present() -> bool {
+    HPET.lock().is_some()
+}
 
 /// Convert a HPET tick delta to nanoseconds. Returns 0 if HPET
 /// isn't initialised or the period is degenerate.

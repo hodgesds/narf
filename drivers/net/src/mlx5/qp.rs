@@ -38,22 +38,22 @@ use alloc::vec::Vec;
 
 use super::bit_field::{read_bits_be, write_bits_be};
 
-pub const QPC_LEN:           usize = 512;
-pub const QPC_PA_LIST_OFF:   usize = 512;
-pub const QPC_PA_ENTRY_LEN:  usize = 8;
+pub const QPC_LEN: usize = 512;
+pub const QPC_PA_LIST_OFF: usize = 512;
+pub const QPC_PA_ENTRY_LEN: usize = 8;
 
-pub const QPC_OFF_STATE_TYPE:    usize = 0x00;
+pub const QPC_OFF_STATE_TYPE: usize = 0x00;
 pub const QPC_OFF_LOG_PAGE_SIZE: usize = 0x2C;
 
-pub const QPC_BIT_PD:        usize = 0x10 * 8;
-pub const QPC_BIT_PD_W:      usize = 24;
-pub const QPC_BIT_CQN_SND:   usize = 0x18 * 8;
+pub const QPC_BIT_PD: usize = 0x10 * 8;
+pub const QPC_BIT_PD_W: usize = 24;
+pub const QPC_BIT_CQN_SND: usize = 0x18 * 8;
 pub const QPC_BIT_CQN_SND_W: usize = 24;
-pub const QPC_BIT_CQN_RCV:   usize = 0x20 * 8;
+pub const QPC_BIT_CQN_RCV: usize = 0x20 * 8;
 pub const QPC_BIT_CQN_RCV_W: usize = 24;
-pub const QPC_BIT_LOG_SQ_SIZE:   usize = 0x29 * 8 + 3;
+pub const QPC_BIT_LOG_SQ_SIZE: usize = 0x29 * 8 + 3;
 pub const QPC_BIT_LOG_SQ_SIZE_W: usize = 5;
-pub const QPC_BIT_LOG_RQ_SIZE:   usize = 0x2B * 8 + 3;
+pub const QPC_BIT_LOG_RQ_SIZE: usize = 0x2B * 8 + 3;
 pub const QPC_BIT_LOG_RQ_SIZE_W: usize = 5;
 
 /// QP service types (qpc state-byte low nibble).
@@ -61,30 +61,30 @@ pub const QPC_BIT_LOG_RQ_SIZE_W: usize = 5;
 #[repr(u8)]
 pub enum QpType {
     /// Reliable Connection.
-    Rc           = 0x0,
+    Rc = 0x0,
     /// Unreliable Connection.
-    Uc           = 0x1,
+    Uc = 0x1,
     /// Unreliable Datagram.
-    Ud           = 0x2,
+    Ud = 0x2,
     /// XRC (eXtended Reliable Connection).
-    Xrc          = 0x3,
+    Xrc = 0x3,
     /// Dynamically Connected Transport.
-    Dct          = 0x6,
+    Dct = 0x6,
     /// Raw Ethernet — used by NIC fast-path TX/RX.
-    RawEthernet  = 0x9,
+    RawEthernet = 0x9,
 }
 
 /// QP state, encoded in the high nibble of qpc byte 0x00.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum QpState {
-    Rst   = 0x0,
-    Init  = 0x1,
-    Rtr   = 0x2,
-    Rts   = 0x3,
-    Sqer  = 0x4,
-    Sqd   = 0x5,
-    Err   = 0x6,
+    Rst = 0x0,
+    Init = 0x1,
+    Rtr = 0x2,
+    Rts = 0x3,
+    Sqer = 0x4,
+    Sqd = 0x5,
+    Err = 0x6,
     Sqdrng = 0x7,
 }
 
@@ -117,56 +117,79 @@ pub enum QpError {
 
 #[derive(Copy, Clone, Debug)]
 pub struct QpParams {
-    pub qp_type:        QpType,
+    pub qp_type: QpType,
     /// Protection-domain number.
-    pub pd:             u32,
+    pub pd: u32,
     /// Send CQ number.
-    pub cqn_snd:        u32,
+    pub cqn_snd: u32,
     /// Receive CQ number.
-    pub cqn_rcv:        u32,
+    pub cqn_rcv: u32,
     /// log2 of the SQ depth (in WQEs).
-    pub log_sq_size:    u8,
+    pub log_sq_size: u8,
     /// log2 of the RQ depth.
-    pub log_rq_size:    u8,
-    pub log_page_size:  u8,
+    pub log_rq_size: u8,
+    pub log_page_size: u8,
     /// UAR page bound to this QP for SQ/RQ doorbells. Stage 11
     /// uses this directly when posting work; the qpc encoding for
     /// uar_page lands in a later stage.
-    pub uar_page:       u32,
+    pub uar_page: u32,
 }
 
 /// Build the CREATE_QP input mailbox payload — 512-byte qpc + an
 /// 8-byte BE phys-addr list. Stage-7-style transport feeds this
 /// through `issue_command_with_input_mailbox`.
-pub fn build_create_qp_input(
-    params: QpParams,
-    pages:  &[u64],
-) -> Result<Vec<u8>, QpError> {
-    if pages.is_empty()                { return Err(QpError::NoPages); }
-    if params.log_sq_size >= (1 << 5)  { return Err(QpError::BadLogSqSize); }
-    if params.log_rq_size >= (1 << 5)  { return Err(QpError::BadLogRqSize); }
-    if params.pd      >= (1 << 24)     { return Err(QpError::BadPd); }
-    if params.cqn_snd >= (1 << 24)     { return Err(QpError::BadCqn); }
-    if params.cqn_rcv >= (1 << 24)     { return Err(QpError::BadCqn); }
+pub fn build_create_qp_input(params: QpParams, pages: &[u64]) -> Result<Vec<u8>, QpError> {
+    if pages.is_empty() {
+        return Err(QpError::NoPages);
+    }
+    if params.log_sq_size >= (1 << 5) {
+        return Err(QpError::BadLogSqSize);
+    }
+    if params.log_rq_size >= (1 << 5) {
+        return Err(QpError::BadLogRqSize);
+    }
+    if params.pd >= (1 << 24) {
+        return Err(QpError::BadPd);
+    }
+    if params.cqn_snd >= (1 << 24) {
+        return Err(QpError::BadCqn);
+    }
+    if params.cqn_rcv >= (1 << 24) {
+        return Err(QpError::BadCqn);
+    }
 
     let total = QPC_PA_LIST_OFF + pages.len() * QPC_PA_ENTRY_LEN;
     let mut out = alloc::vec![0u8; total];
 
     // state | qp_type — both in byte 0x00. State starts at RST (0x0)
     // so we just write the qp_type into the low nibble.
-    out[QPC_OFF_STATE_TYPE] =
-        (QpState::Rst as u8) << 4 | (params.qp_type as u8 & 0x0F);
+    out[QPC_OFF_STATE_TYPE] = (QpState::Rst as u8) << 4 | (params.qp_type as u8 & 0x0F);
 
-    write_bits_be(&mut out, QPC_BIT_PD, QPC_BIT_PD_W,
-                  params.pd as u64);
-    write_bits_be(&mut out, QPC_BIT_CQN_SND, QPC_BIT_CQN_SND_W,
-                  params.cqn_snd as u64);
-    write_bits_be(&mut out, QPC_BIT_CQN_RCV, QPC_BIT_CQN_RCV_W,
-                  params.cqn_rcv as u64);
-    write_bits_be(&mut out, QPC_BIT_LOG_SQ_SIZE, QPC_BIT_LOG_SQ_SIZE_W,
-                  params.log_sq_size as u64);
-    write_bits_be(&mut out, QPC_BIT_LOG_RQ_SIZE, QPC_BIT_LOG_RQ_SIZE_W,
-                  params.log_rq_size as u64);
+    write_bits_be(&mut out, QPC_BIT_PD, QPC_BIT_PD_W, params.pd as u64);
+    write_bits_be(
+        &mut out,
+        QPC_BIT_CQN_SND,
+        QPC_BIT_CQN_SND_W,
+        params.cqn_snd as u64,
+    );
+    write_bits_be(
+        &mut out,
+        QPC_BIT_CQN_RCV,
+        QPC_BIT_CQN_RCV_W,
+        params.cqn_rcv as u64,
+    );
+    write_bits_be(
+        &mut out,
+        QPC_BIT_LOG_SQ_SIZE,
+        QPC_BIT_LOG_SQ_SIZE_W,
+        params.log_sq_size as u64,
+    );
+    write_bits_be(
+        &mut out,
+        QPC_BIT_LOG_RQ_SIZE,
+        QPC_BIT_LOG_RQ_SIZE_W,
+        params.log_rq_size as u64,
+    );
     out[QPC_OFF_LOG_PAGE_SIZE] = params.log_page_size;
 
     for (i, &pa) in pages.iter().enumerate() {
@@ -188,7 +211,7 @@ pub fn decode_qp_state(qpc: &[u8]) -> QpState {
         0x5 => QpState::Sqd,
         0x6 => QpState::Err,
         0x7 => QpState::Sqdrng,
-        _   => QpState::Err,
+        _ => QpState::Err,
     }
 }
 
@@ -201,7 +224,7 @@ pub fn decode_qp_type(qpc: &[u8]) -> Option<QpType> {
         0x3 => Some(QpType::Xrc),
         0x6 => Some(QpType::Dct),
         0x9 => Some(QpType::RawEthernet),
-        _   => None,
+        _ => None,
     }
 }
 
@@ -209,18 +232,13 @@ pub fn decode_qp_type(qpc: &[u8]) -> Option<QpType> {
 /// Stage-9 round-trip smoke.
 pub fn decode_create_qp_input(bytes: &[u8]) -> QpParams {
     QpParams {
-        qp_type:        decode_qp_type(bytes).unwrap_or(QpType::Rc),
-        pd:             read_bits_be(bytes, QPC_BIT_PD,
-                                     QPC_BIT_PD_W) as u32,
-        cqn_snd:        read_bits_be(bytes, QPC_BIT_CQN_SND,
-                                     QPC_BIT_CQN_SND_W) as u32,
-        cqn_rcv:        read_bits_be(bytes, QPC_BIT_CQN_RCV,
-                                     QPC_BIT_CQN_RCV_W) as u32,
-        log_sq_size:    read_bits_be(bytes, QPC_BIT_LOG_SQ_SIZE,
-                                     QPC_BIT_LOG_SQ_SIZE_W) as u8,
-        log_rq_size:    read_bits_be(bytes, QPC_BIT_LOG_RQ_SIZE,
-                                     QPC_BIT_LOG_RQ_SIZE_W) as u8,
-        log_page_size:  bytes[QPC_OFF_LOG_PAGE_SIZE],
-        uar_page:       0,
+        qp_type: decode_qp_type(bytes).unwrap_or(QpType::Rc),
+        pd: read_bits_be(bytes, QPC_BIT_PD, QPC_BIT_PD_W) as u32,
+        cqn_snd: read_bits_be(bytes, QPC_BIT_CQN_SND, QPC_BIT_CQN_SND_W) as u32,
+        cqn_rcv: read_bits_be(bytes, QPC_BIT_CQN_RCV, QPC_BIT_CQN_RCV_W) as u32,
+        log_sq_size: read_bits_be(bytes, QPC_BIT_LOG_SQ_SIZE, QPC_BIT_LOG_SQ_SIZE_W) as u8,
+        log_rq_size: read_bits_be(bytes, QPC_BIT_LOG_RQ_SIZE, QPC_BIT_LOG_RQ_SIZE_W) as u8,
+        log_page_size: bytes[QPC_OFF_LOG_PAGE_SIZE],
+        uar_page: 0,
     }
 }

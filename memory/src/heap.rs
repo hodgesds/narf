@@ -48,7 +48,7 @@ impl core::fmt::Debug for BumpAllocator {
 unsafe impl GlobalAlloc for BumpAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let align = layout.align().max(1);
-        let size  = layout.size();
+        let size = layout.size();
 
         // Lock-free bump: CAS on a `(offset)` atomic. Align up, add size,
         // reject if we'd overrun the arena.
@@ -76,7 +76,11 @@ unsafe impl GlobalAlloc for BumpAllocator {
 }
 
 /// Snapshot of arena usage for diagnostics.
-pub fn used_bytes() -> usize { OFFSET.load(Ordering::Relaxed) }
+pub fn used_bytes() -> usize {
+    OFFSET.load(Ordering::Relaxed)
+}
 
 /// Total capacity.
-pub const fn capacity_bytes() -> usize { HEAP_CAPACITY }
+pub const fn capacity_bytes() -> usize {
+    HEAP_CAPACITY
+}

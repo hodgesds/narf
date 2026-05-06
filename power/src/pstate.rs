@@ -15,17 +15,17 @@ use narf_arch::x86_64::msr::{rdmsr, wrmsr};
 
 // ── MSR map ────────────────────────────────────────────────────────
 
-pub const MSR_IA32_PERF_STATUS:  u32 = 0x198;
-pub const MSR_IA32_PERF_CTL:     u32 = 0x199;
+pub const MSR_IA32_PERF_STATUS: u32 = 0x198;
+pub const MSR_IA32_PERF_CTL: u32 = 0x199;
 
-pub const MSR_IA32_PM_ENABLE:        u32 = 0x770;
+pub const MSR_IA32_PM_ENABLE: u32 = 0x770;
 pub const MSR_IA32_HWP_CAPABILITIES: u32 = 0x771;
-pub const MSR_IA32_HWP_REQUEST:      u32 = 0x774;
-pub const MSR_IA32_HWP_STATUS:       u32 = 0x777;
+pub const MSR_IA32_HWP_REQUEST: u32 = 0x774;
+pub const MSR_IA32_HWP_STATUS: u32 = 0x777;
 
-pub const MSR_AMD_PSTATE_LIMIT:  u32 = 0xC001_0061;
+pub const MSR_AMD_PSTATE_LIMIT: u32 = 0xC001_0061;
 pub const MSR_AMD_PSTATE_STATUS: u32 = 0xC001_0063;
-pub const MSR_AMD_PSTATE_DEF_0:  u32 = 0xC001_0064;
+pub const MSR_AMD_PSTATE_DEF_0: u32 = 0xC001_0064;
 
 // ── Detection ──────────────────────────────────────────────────────
 
@@ -33,7 +33,12 @@ pub const MSR_AMD_PSTATE_DEF_0:  u32 = 0xC001_0064;
 /// won't drive frequency scaling and leaves whatever firmware
 /// programmed in place.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Mechanism { Hwp, SpeedStep, AmdLegacy, None }
+pub enum Mechanism {
+    Hwp,
+    SpeedStep,
+    AmdLegacy,
+    None,
+}
 
 static MECHANISM_RAW: AtomicU8 = AtomicU8::new(0xFF);
 
@@ -54,7 +59,9 @@ fn vendor_amd() -> bool {
 fn hwp_supported() -> bool {
     // SAFETY: leaf 6 is defined when CPUID max >= 6.
     let (max, _, _, _) = unsafe { cpuid(0, 0) };
-    if max < 6 { return false; }
+    if max < 6 {
+        return false;
+    }
     let (eax, _, _, _) = unsafe { cpuid(6, 0) };
     eax & (1 << 7) != 0
 }
@@ -69,7 +76,9 @@ fn amd_pstate_supported() -> bool {
     // CPUID(0x8000_0007).EDX[7] = HwPstate.
     // SAFETY: extended leaves; check max via 0x8000_0000 first.
     let (max, _, _, _) = unsafe { cpuid(0x8000_0000, 0) };
-    if max < 0x8000_0007 { return false; }
+    if max < 0x8000_0007 {
+        return false;
+    }
     let (_, _, _, edx) = unsafe { cpuid(0x8000_0007, 0) };
     edx & (1 << 7) != 0
 }
@@ -87,18 +96,27 @@ pub fn detect() -> Mechanism {
         };
     }
     let m = if vendor_intel() {
-        if hwp_supported() { Mechanism::Hwp }
-        else if eist_supported() { Mechanism::SpeedStep }
-        else { Mechanism::None }
+        if hwp_supported() {
+            Mechanism::Hwp
+        } else if eist_supported() {
+            Mechanism::SpeedStep
+        } else {
+            Mechanism::None
+        }
     } else if vendor_amd() {
-        if amd_pstate_supported() { Mechanism::AmdLegacy }
-        else { Mechanism::None }
+        if amd_pstate_supported() {
+            Mechanism::AmdLegacy
+        } else {
+            Mechanism::None
+        }
     } else {
         Mechanism::None
     };
     let bits = match m {
-        Mechanism::Hwp => 1, Mechanism::SpeedStep => 2,
-        Mechanism::AmdLegacy => 3, Mechanism::None => 0,
+        Mechanism::Hwp => 1,
+        Mechanism::SpeedStep => 2,
+        Mechanism::AmdLegacy => 3,
+        Mechanism::None => 0,
     };
     MECHANISM_RAW.store(bits, Ordering::Release);
     m
@@ -108,10 +126,10 @@ pub fn detect() -> Mechanism {
 
 #[derive(Copy, Clone, Debug)]
 pub struct HwpCaps {
-    pub max_perf:        u8,
+    pub max_perf: u8,
     pub guaranteed_perf: u8,
-    pub efficient_perf:  u8,
-    pub min_perf:        u8,
+    pub efficient_perf: u8,
+    pub min_perf: u8,
 }
 
 /// Read `IA32_HWP_CAPABILITIES`. Layout (per SDM §14.4.4):
@@ -126,10 +144,10 @@ pub unsafe fn hwp_capabilities() -> HwpCaps {
     // SAFETY: caller-asserted.
     let v = unsafe { rdmsr(MSR_IA32_HWP_CAPABILITIES) };
     HwpCaps {
-        max_perf:        (v & 0xFF) as u8,
-        guaranteed_perf: ((v >> 8)  & 0xFF) as u8,
-        efficient_perf:  ((v >> 16) & 0xFF) as u8,
-        min_perf:        ((v >> 24) & 0xFF) as u8,
+        max_perf: (v & 0xFF) as u8,
+        guaranteed_perf: ((v >> 8) & 0xFF) as u8,
+        efficient_perf: ((v >> 16) & 0xFF) as u8,
+        min_perf: ((v >> 24) & 0xFF) as u8,
     }
 }
 
@@ -140,7 +158,9 @@ pub unsafe fn hwp_capabilities() -> HwpCaps {
 /// CPL = 0; HWP supported.
 pub unsafe fn hwp_enable() {
     // SAFETY: caller-asserted.
-    unsafe { wrmsr(MSR_IA32_PM_ENABLE, 1); }
+    unsafe {
+        wrmsr(MSR_IA32_PM_ENABLE, 1);
+    }
 }
 
 /// Program `IA32_HWP_REQUEST` for this CPU.
@@ -154,12 +174,11 @@ pub unsafe fn hwp_enable() {
 /// # Safety
 /// CPL = 0; HWP enabled.
 pub unsafe fn hwp_set(min: u8, max: u8, desired: u8, epp: u8) {
-    let v = (min as u64)
-          | ((max as u64) << 8)
-          | ((desired as u64) << 16)
-          | ((epp as u64) << 24);
+    let v = (min as u64) | ((max as u64) << 8) | ((desired as u64) << 16) | ((epp as u64) << 24);
     // SAFETY: caller-asserted.
-    unsafe { wrmsr(MSR_IA32_HWP_REQUEST, v); }
+    unsafe {
+        wrmsr(MSR_IA32_HWP_REQUEST, v);
+    }
 }
 
 /// Read `IA32_HWP_STATUS` for diagnostics.
@@ -181,10 +200,10 @@ pub unsafe fn hwp_status() -> u64 {
 /// CPL = 0.
 pub unsafe fn current_status() -> u64 {
     match detect() {
-        Mechanism::Hwp        => unsafe { rdmsr(MSR_IA32_HWP_STATUS) },
-        Mechanism::SpeedStep  => unsafe { rdmsr(MSR_IA32_PERF_STATUS) },
-        Mechanism::AmdLegacy  => unsafe { rdmsr(MSR_AMD_PSTATE_STATUS) },
-        Mechanism::None       => 0,
+        Mechanism::Hwp => unsafe { rdmsr(MSR_IA32_HWP_STATUS) },
+        Mechanism::SpeedStep => unsafe { rdmsr(MSR_IA32_PERF_STATUS) },
+        Mechanism::AmdLegacy => unsafe { rdmsr(MSR_AMD_PSTATE_STATUS) },
+        Mechanism::None => 0,
     }
 }
 
@@ -200,12 +219,16 @@ pub unsafe fn legacy_set(id: u16) {
     match detect() {
         Mechanism::SpeedStep => {
             // SAFETY: caller-asserted.
-            unsafe { wrmsr(MSR_IA32_PERF_CTL, id as u64); }
+            unsafe {
+                wrmsr(MSR_IA32_PERF_CTL, id as u64);
+            }
         }
         Mechanism::AmdLegacy => {
             // SAFETY: caller-asserted; AMD wants the low 3 bits
             // as a P-state index (0..7, 0 = P0 highest).
-            unsafe { wrmsr(MSR_AMD_PSTATE_LIMIT, (id & 0x7) as u64); }
+            unsafe {
+                wrmsr(MSR_AMD_PSTATE_LIMIT, (id & 0x7) as u64);
+            }
         }
         _ => {}
     }
@@ -221,15 +244,22 @@ pub unsafe fn init() {
     match detect() {
         Mechanism::Hwp => {
             // SAFETY: caller-asserted.
-            unsafe { hwp_enable(); }
+            unsafe {
+                hwp_enable();
+            }
             // SAFETY: same.
             let caps = unsafe { hwp_capabilities() };
             // SAFETY: same.
             unsafe {
-                hwp_set(caps.min_perf, caps.max_perf, /*desired*/0, /*EPP*/ 0x80);
+                hwp_set(
+                    caps.min_perf,
+                    caps.max_perf,
+                    /*desired*/ 0,
+                    /*EPP*/ 0x80,
+                );
             }
         }
-        _ => {}  // No-op for SpeedStep / AmdLegacy / None.
+        _ => {} // No-op for SpeedStep / AmdLegacy / None.
     }
 }
 

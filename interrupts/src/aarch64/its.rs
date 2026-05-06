@@ -43,21 +43,21 @@ use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::{alloc_frame, PAGE_SIZE};
 
 /// QEMU virt GICv3 ITS frame base.
-const ITS_BASE:  usize = 0x0808_0000;
+const ITS_BASE: usize = 0x0808_0000;
 /// QEMU virt GICv3 redistributor base for CPU 0.
 const GICR_BASE: usize = 0x080A_0000;
 
-const GITS_CTLR:    usize = ITS_BASE + 0x0000;
+const GITS_CTLR: usize = ITS_BASE + 0x0000;
 #[allow(dead_code)]
-const GITS_TYPER:   usize = ITS_BASE + 0x0008;
-const GITS_CBASER:  usize = ITS_BASE + 0x0080;
+const GITS_TYPER: usize = ITS_BASE + 0x0008;
+const GITS_CBASER: usize = ITS_BASE + 0x0080;
 const GITS_CWRITER: usize = ITS_BASE + 0x0088;
-const GITS_CREADR:  usize = ITS_BASE + 0x0090;
-const GITS_BASER0:  usize = ITS_BASE + 0x0100;
+const GITS_CREADR: usize = ITS_BASE + 0x0090;
+const GITS_BASER0: usize = ITS_BASE + 0x0100;
 /// Doorbell — the physical address devices write to deliver MSI.
 const GITS_TRANSLATER: usize = ITS_BASE + 0x10040;
 
-const GICR_CTLR:      usize = GICR_BASE + 0x0000;
+const GICR_CTLR: usize = GICR_BASE + 0x0000;
 const GICR_PROPBASER: usize = GICR_BASE + 0x0070;
 const GICR_PENDBASER: usize = GICR_BASE + 0x0078;
 
@@ -96,13 +96,17 @@ pub enum ItsError {
 }
 
 impl From<narf_memory::FrameAllocError> for ItsError {
-    fn from(_: narf_memory::FrameAllocError) -> Self { ItsError::NoMemory }
+    fn from(_: narf_memory::FrameAllocError) -> Self {
+        ItsError::NoMemory
+    }
 }
 
 /// ITS doorbell physical address. Devices write 32 bits to this
 /// address; the low 32 bits of the data become the EventID.
 #[inline]
-pub const fn doorbell_pa() -> u64 { GITS_TRANSLATER as u64 }
+pub const fn doorbell_pa() -> u64 {
+    GITS_TRANSLATER as u64
+}
 
 /// Bring up the ITS on the BSP. Idempotent; subsequent calls return
 /// `Ok(())` without redoing the work.
@@ -115,21 +119,23 @@ pub const fn doorbell_pa() -> u64 { GITS_TRANSLATER as u64 }
 /// - QEMU virt is the only tested platform; non-QEMU GICv3+ITS
 ///   may not match these MMIO bases.
 pub unsafe fn init_bsp() -> Result<(), ItsError> {
-    if INIT_DONE.load(Ordering::Acquire) { return Ok(()); }
+    if INIT_DONE.load(Ordering::Acquire) {
+        return Ok(());
+    }
 
     // ── 1. Allocate backing pages ─────────────────────────────────
     // Each is a fresh frame (zero-filled by the allocator's contract).
     let device_tab = alloc_frame()?.start_address().raw();
-    let coll_tab   = alloc_frame()?.start_address().raw();
-    let cmdq       = alloc_frame()?.start_address().raw();
-    let prop_tab   = alloc_frame()?.start_address().raw();
+    let coll_tab = alloc_frame()?.start_address().raw();
+    let cmdq = alloc_frame()?.start_address().raw();
+    let prop_tab = alloc_frame()?.start_address().raw();
     // GICR_PENDBASER must point at a 64 KiB-aligned region per the
     // architecture, but QEMU is permissive and the pending bits for
     // 256 LPIs fit in 32 bytes. Two contiguous frames give us 8 KiB
     // — enough for up to 65536 LPIs even though we only provision
     // 256 — which dodges the alignment edge case.
-    let pend_tab   = alloc_frame()?.start_address().raw();
-    let _pend_2nd  = alloc_frame()?.start_address().raw();
+    let pend_tab = alloc_frame()?.start_address().raw();
+    let _pend_2nd = alloc_frame()?.start_address().raw();
     // The architectural page size for GIC tables is 4 KiB; alloc_frame
     // returns 4 KiB frames so this matches by construction.
     debug_assert_eq!(PAGE_SIZE, 4096);
@@ -151,22 +157,20 @@ pub unsafe fn init_bsp() -> Result<(), ItsError> {
     // SAFETY: identity-mapped MMIO read.
     let baser0_old = unsafe { read_u64(GITS_BASER0) };
     let entry_size_dev = baser0_old & (0x1F << 48);
-    let baser0 = (1u64 << 63)
-        | entry_size_dev
-        | (device_tab & 0x000F_FFFF_FFFF_F000)
-        | 0; // size = 1 page
-    // SAFETY: device table page is fresh & zeroed.
-    unsafe { write_u64(GITS_BASER0, baser0); }
+    let baser0 = (1u64 << 63) | entry_size_dev | (device_tab & 0x000F_FFFF_FFFF_F000) | 0; // size = 1 page
+                                                                                           // SAFETY: device table page is fresh & zeroed.
+    unsafe {
+        write_u64(GITS_BASER0, baser0);
+    }
 
     // SAFETY: identity-mapped MMIO read.
     let baser1_old = unsafe { read_u64(GITS_BASER0 + 8) };
     let entry_size_coll = baser1_old & (0x1F << 48);
-    let baser1 = (1u64 << 63)
-        | entry_size_coll
-        | (coll_tab & 0x000F_FFFF_FFFF_F000)
-        | 0;
+    let baser1 = (1u64 << 63) | entry_size_coll | (coll_tab & 0x000F_FFFF_FFFF_F000) | 0;
     // SAFETY: collection table page is fresh & zeroed.
-    unsafe { write_u64(GITS_BASER0 + 8, baser1); }
+    unsafe {
+        write_u64(GITS_BASER0 + 8, baser1);
+    }
 
     // ── 3. Program GITS_CBASER = command queue ────────────────────
     // GITS_CBASER layout (§11.9.3):
@@ -176,21 +180,25 @@ pub unsafe fn init_bsp() -> Result<(), ItsError> {
     //
     // One 4 KiB page = 128 × 32-byte ITS commands. Plenty for boot
     // + Stage-3 driver count.
-    let cbaser = (1u64 << 63)
-        | (cmdq & 0x000F_FFFF_FFFF_F000)
-        | 0;
+    let cbaser = (1u64 << 63) | (cmdq & 0x000F_FFFF_FFFF_F000) | 0;
     // SAFETY: command-queue page is fresh & zeroed.
-    unsafe { write_u64(GITS_CBASER, cbaser); }
+    unsafe {
+        write_u64(GITS_CBASER, cbaser);
+    }
     // Reset CWRITER to 0; CREADR is RO and follows.
     // SAFETY: identity-mapped MMIO.
-    unsafe { write_u64(GITS_CWRITER, 0); }
+    unsafe {
+        write_u64(GITS_CWRITER, 0);
+    }
 
     // ── 4. Enable the ITS ─────────────────────────────────────────
     // GITS_CTLR: bit 0 = Enabled. Bit 31 = Quiescent (set when no
     // commands are in flight); we don't poll it on init because we
     // started fresh.
     // SAFETY: identity-mapped MMIO.
-    unsafe { write_u32(GITS_CTLR as *mut u32, 1); }
+    unsafe {
+        write_u32(GITS_CTLR as *mut u32, 1);
+    }
 
     // ── 5. Program GICR_PROPBASER + GICR_PENDBASER ────────────────
     //
@@ -203,17 +211,20 @@ pub unsafe fn init_bsp() -> Result<(), ItsError> {
     // (gives up to 16384 INTIDs total). Stage-3 doesn't push the
     // upper bound; pick 14 to keep the math simple.
     let id_bits = 14u64;
-    let propbaser = (prop_tab & 0x000F_FFFF_FFFF_F000)
-        | (id_bits - 1);
+    let propbaser = (prop_tab & 0x000F_FFFF_FFFF_F000) | (id_bits - 1);
     // SAFETY: identity-mapped MMIO; redistributor was woken up by
     // gic::init_bsp.
-    unsafe { write_u64(GICR_PROPBASER, propbaser); }
+    unsafe {
+        write_u64(GICR_PROPBASER, propbaser);
+    }
 
     // GICR_PENDBASER:
     //   bits 51:12 = base PA[51:12]
     let pendbaser = pend_tab & 0x000F_FFFF_FFFF_F000;
     // SAFETY: same redistributor.
-    unsafe { write_u64(GICR_PENDBASER, pendbaser); }
+    unsafe {
+        write_u64(GICR_PENDBASER, pendbaser);
+    }
 
     // GICR_CTLR.EnableLPIs (bit 0).
     // SAFETY: identity-mapped MMIO.
@@ -228,7 +239,9 @@ pub unsafe fn init_bsp() -> Result<(), ItsError> {
     // Without this the ITS doesn't know where to deliver LPIs even
     // after MAPTI runs.
     // SAFETY: ITS is enabled, command queue is programmed.
-    unsafe { map_collection(0, 0)?; }
+    unsafe {
+        map_collection(0, 0)?;
+    }
 
     Ok(())
 }
@@ -243,11 +256,13 @@ pub unsafe fn init_bsp() -> Result<(), ItsError> {
 /// range; `lpi_intid >= LPI_BASE`.
 pub unsafe fn map_event(
     device_id: u32,
-    event_id:  u32,
+    event_id: u32,
     lpi_intid: u32,
     collection: u16,
 ) -> Result<(), ItsError> {
-    if !INIT_DONE.load(Ordering::Acquire) { return Err(ItsError::NotInitialised); }
+    if !INIT_DONE.load(Ordering::Acquire) {
+        return Err(ItsError::NotInitialised);
+    }
 
     // MAPD command (§5.13.5): cmd[0] bits 7:0 = 0x08, cmd[0] bits
     // 63:32 = DeviceID, cmd[2] bit 63 = Valid, cmd[2] bits 7:0 =
@@ -258,7 +273,9 @@ pub unsafe fn map_event(
     mapd[0] = 0x08 | ((device_id as u64) << 32);
     mapd[2] = 1u64 << 63;
     // SAFETY: command bytes are well-formed; submit handles MMIO.
-    unsafe { submit_command(&mapd)?; }
+    unsafe {
+        submit_command(&mapd)?;
+    }
 
     // MAPTI command (§5.13.13): cmd[0] bits 7:0 = 0x0A, cmd[0] bits
     // 63:32 = DeviceID, cmd[1] bits 31:0 = EventID, cmd[1] bits
@@ -268,7 +285,9 @@ pub unsafe fn map_event(
     mapti[1] = (event_id as u64) | ((lpi_intid as u64) << 32);
     mapti[2] = collection as u64;
     // SAFETY: command bytes are well-formed.
-    unsafe { submit_command(&mapti)?; }
+    unsafe {
+        submit_command(&mapti)?;
+    }
     Ok(())
 }
 
@@ -279,9 +298,7 @@ unsafe fn map_collection(collection: u16, rd_index: u16) -> Result<(), ItsError>
     // ICID, cmd[2] bits 50:16 = RDbase, cmd[2] bit 63 = Valid.
     let mut mapc = [0u64; 4];
     mapc[0] = 0x09;
-    mapc[2] = (collection as u64)
-        | ((rd_index as u64) << 16)
-        | (1u64 << 63);
+    mapc[2] = (collection as u64) | ((rd_index as u64) << 16) | (1u64 << 63);
     // SAFETY: caller asserts ITS is configured (called from init_bsp).
     unsafe { submit_command(&mapc) }
 }
@@ -309,10 +326,10 @@ unsafe fn submit_command(cmd: &[u64; 4]) -> Result<(), ItsError> {
     // SAFETY: identity-mapped DRAM page allocated by init_bsp.
     unsafe {
         compiler_fence(Ordering::SeqCst);
-        core::ptr::write_volatile(entry,         cmd[0]);
-        core::ptr::write_volatile(entry.add(1),  cmd[1]);
-        core::ptr::write_volatile(entry.add(2),  cmd[2]);
-        core::ptr::write_volatile(entry.add(3),  cmd[3]);
+        core::ptr::write_volatile(entry, cmd[0]);
+        core::ptr::write_volatile(entry.add(1), cmd[1]);
+        core::ptr::write_volatile(entry.add(2), cmd[2]);
+        core::ptr::write_volatile(entry.add(3), cmd[3]);
         compiler_fence(Ordering::SeqCst);
     }
 
@@ -321,7 +338,9 @@ unsafe fn submit_command(cmd: &[u64; 4]) -> Result<(), ItsError> {
 
     // Bump CWRITER. ITS picks up the new commands.
     // SAFETY: identity-mapped MMIO.
-    unsafe { write_u64(GITS_CWRITER, new_tail); }
+    unsafe {
+        write_u64(GITS_CWRITER, new_tail);
+    }
 
     // Poll CREADR until it catches up. ITS may pause if it hits a
     // Stalled state, but for our well-formed commands QEMU drains
@@ -331,7 +350,9 @@ unsafe fn submit_command(cmd: &[u64; 4]) -> Result<(), ItsError> {
         let cr = unsafe { read_u64(GITS_CREADR) };
         // Note: GITS_CREADR low bit = Stalled. Mask it off for the
         // catch-up compare.
-        if (cr & !1) == new_tail { return Ok(()); }
+        if (cr & !1) == new_tail {
+            return Ok(());
+        }
         core::hint::spin_loop();
     }
     Err(ItsError::CmdTimeout)
@@ -352,16 +373,18 @@ unsafe fn read_u64(addr: usize) -> u64 {
 unsafe fn write_u64(addr: usize, value: u64) {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: caller asserts the slot is writable + 8-byte aligned.
-    unsafe { core::ptr::write_volatile(addr as *mut u64, value); }
+    unsafe {
+        core::ptr::write_volatile(addr as *mut u64, value);
+    }
     compiler_fence(Ordering::SeqCst);
 }
 
 impl fmt::Display for ItsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ItsError::NoMemory       => f.write_str("ITS: out of frames during init"),
-            ItsError::InitTimeout    => f.write_str("ITS: register did not settle"),
-            ItsError::CmdTimeout     => f.write_str("ITS: command queue stalled"),
+            ItsError::NoMemory => f.write_str("ITS: out of frames during init"),
+            ItsError::InitTimeout => f.write_str("ITS: register did not settle"),
+            ItsError::CmdTimeout => f.write_str("ITS: command queue stalled"),
             ItsError::NotInitialised => f.write_str("ITS: init_bsp not called"),
         }
     }

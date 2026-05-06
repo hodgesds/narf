@@ -14,9 +14,14 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 fn make_block_request(op: crate::BlockOp, user_tag: u64) -> crate::BlockRequest {
     use crate::{BlockRequest, QosHint};
     use narf_capabilities::{Cap, CapSlot, Read, Rights};
-    let cap = unsafe { Cap::<narf_io::DmaBuffer, Read>::mint(
-        CapSlot::new(1, 0, Read::BITS, narf_capabilities::CapKind::DmaBuffer as u32)
-    )};
+    let cap = unsafe {
+        Cap::<narf_io::DmaBuffer, Read>::mint(CapSlot::new(
+            1,
+            0,
+            Read::BITS,
+            narf_capabilities::CapKind::DmaBuffer as u32,
+        ))
+    };
     BlockRequest {
         op,
         lba: 0,
@@ -33,15 +38,21 @@ fn smoke_block_deadline_prefers_reads() -> TestResult {
     let s = DeadlineScheduler::new();
     let far_future = u64::MAX / 2;
 
-    s.enqueue(make_block_request(BlockOp::Write { fua: false }, 0x100), far_future);
+    s.enqueue(
+        make_block_request(BlockOp::Write { fua: false }, 0x100),
+        far_future,
+    );
     for i in 0..(STARVE_BOUND + 2) {
-        s.enqueue(make_block_request(BlockOp::Read, 0x200 + i as u64), far_future);
+        s.enqueue(
+            make_block_request(BlockOp::Read, 0x200 + i as u64),
+            far_future,
+        );
     }
 
     for i in 0..STARVE_BOUND {
         let req = match s.dequeue_next(0) {
             Some(r) => r,
-            None    => return TestResult::Fail("scheduler underflowed"),
+            None => return TestResult::Fail("scheduler underflowed"),
         };
         if req.op != BlockOp::Read {
             return TestResult::Fail("read lane starved before STARVE_BOUND");
@@ -69,8 +80,8 @@ fn smoke_block_deadline_promotes_expired() -> TestResult {
     use crate::{BlockOp, DeadlineScheduler};
 
     let s = DeadlineScheduler::new();
-    s.enqueue(make_block_request(BlockOp::Read, 0x10),                   1_000);
-    s.enqueue(make_block_request(BlockOp::Write { fua: false }, 0x20),   500);
+    s.enqueue(make_block_request(BlockOp::Read, 0x10), 1_000);
+    s.enqueue(make_block_request(BlockOp::Write { fua: false }, 0x20), 500);
 
     let req = s.dequeue_next(750).expect("pending");
     if !matches!(req.op, BlockOp::Write { .. }) || req.user_tag != 0x20 {
