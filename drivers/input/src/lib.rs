@@ -14,6 +14,7 @@ extern crate alloc;
 pub mod i8042;
 #[cfg(target_arch = "x86_64")]
 pub mod i8042_mouse;
+pub mod i2c_hid;
 
 /// Stage::Device initcalls for this driver crate. i8042 init is
 /// best-effort — a missing PS/2 controller (USB-only systems,
@@ -34,6 +35,10 @@ pub fn register_initcalls() {
             Ok(()) => InitResult::Ok,
             Err(_) => InitResult::NotPresent,
         }
+    });
+    narf_init::register(Stage::Device, "i2c-hid", || {
+        i2c_hid::register_initcalls();
+        InitResult::Ok
     });
 }
 
