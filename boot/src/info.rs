@@ -6,8 +6,8 @@ use narf_memory::{PhysAddr, VirtAddr};
 #[derive(Copy, Clone, Debug)]
 pub struct MemRegion {
     pub start: PhysAddr,
-    pub len:   u64,
-    pub kind:  MemRegionKind,
+    pub len: u64,
+    pub kind: MemRegionKind,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -36,29 +36,29 @@ pub enum MemRegionKind {
 pub struct RawBootInfo {
     /// Magic number the bootloader placed in a register (multiboot2:
     /// `0x36d76289`; FDT: magic of the DTB header).
-    pub magic:   u64,
+    pub magic: u64,
     /// Pointer to the boot-information structure (multiboot2 info) or to
     /// the DTB (aarch64 U-Boot).
     pub payload: PhysAddr,
 }
 
 /// Validated boot info. Held by `frame/init_bsp` for the duration of boot.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BootInfo {
     pub memory_map: &'static [MemRegion],
-    pub cmdline:    &'static str,
+    pub cmdline: &'static str,
     /// Physical base of the UART. On x86_64 this is an I/O port number
     /// (0x3F8 by default); on aarch64 it's an MMIO address.
-    pub uart_phys:  PhysAddr,
+    pub uart_phys: PhysAddr,
     /// Virtual base to be programmed by `memory/` into `console::remap_to_virtual`.
     /// Stage 1 mirrors it from `uart_phys` (kernel is identity-mapped for the
     /// UART pre-MMU); Wave 2's MMU bring-up replaces this with the real
     /// kernel-virtual mapping.
-    pub uart_virt:  VirtAddr,
+    pub uart_virt: VirtAddr,
     /// Physical address of the device tree blob (aarch64) or 0 on
     /// x86_64. Subsystems that need DTB-described topology (PCIe host
     /// bridge, etc.) walk this directly.
-    pub dtb_phys:   Option<PhysAddr>,
+    pub dtb_phys: Option<PhysAddr>,
     /// Physical address of the ACPI RSDP, when the bootloader supplied
     /// one (PVH `hvm_start_info.rsdp_paddr`, multiboot2 ACPI tag, or a
     /// legacy EBDA scan). `None` on aarch64 / non-ACPI platforms.
