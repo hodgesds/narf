@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+pub mod handshake;
 pub mod messages;
 pub mod types;
 
@@ -222,4 +223,125 @@ mod tests {
         }
     }
     kernel_test_in!("spdm", smoke_spdm_session_flow);
+
+    // ── Handshake-codec smokes ────────────────────────────────────
+
+    fn smoke_spdm_get_version_pins_to_v10() -> TestResult {
+        use crate::handshake::{build_get_version, REQ_GET_VERSION, SPDM_VERSION_10};
+        let bytes = build_get_version();
+        if bytes.len() != 4 {
+            return TestResult::Fail("GET_VERSION = 4-byte header");
+        }
+        if bytes[0] != SPDM_VERSION_10 {
+            return TestResult::Fail("GET_VERSION must be sent at SPDM 1.0 per §10.4");
+        }
+        if bytes[1] != REQ_GET_VERSION {
+            return TestResult::Fail("opcode mismatch");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("spdm/handshake", smoke_spdm_get_version_pins_to_v10);
+
+    fn smoke_spdm_version_response_round_trip() -> TestResult {
+        use crate::handshake::{build_version_response, parse_version_response};
+        let versions = [0x0010u16, 0x0011, 0x0012, 0x0013];
+        let bytes = build_version_response(&versions);
+        let parsed = parse_version_response(&bytes).expect("parse");
+        if parsed != versions {
+            return TestResult::Fail("VERSION list round-trip");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("spdm/handshake", smoke_spdm_version_response_round_trip);
+
+    fn smoke_spdm_get_capabilities_v12_includes_size_fields() -> TestResult {
+        use crate::handshake::{build_get_capabilities, SPDM_VERSION_12};
+        let req = build_get_capabilities(SPDM_VERSION_12, 0x0A, 0xCAFE_BEEF);
+        // 4 hdr + 8 (resv + ct + resv + flags) + 8 (transfer-size + max-msg) = 20.
+        if req.len() != 20 {
+            return TestResult::Fail("SPDM 1.2 GET_CAPABILITIES = 20 bytes");
+        }
+        let flags = u32::from_le_bytes([req[8], req[9], req[10], req[11]]);
+        if flags != 0xCAFE_BEEF {
+            return TestResult::Fail("flags should round-trip");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "spdm/handshake",
+        smoke_spdm_get_capabilities_v12_includes_size_fields
+    );
+
+    fn smoke_spdm_negotiate_algorithms_length_field_self_consistent() -> TestResult {
+        use crate::handshake::{
+            build_negotiate_algorithms, ASYM_ECDSA_P384, HASH_SHA_384, REQ_NEGOTIATE_ALGORITHMS,
+            SPDM_VERSION_12,
+        };
+        let req = build_negotiate_algorithms(SPDM_VERSION_12, 1, ASYM_ECDSA_P384, HASH_SHA_384);
+        if req[1] != REQ_NEGOTIATE_ALGORITHMS {
+            return TestResult::Fail("opcode mismatch");
+        }
+        let length = u16::from_le_bytes([req[4], req[5]]);
+        if length as usize != req.len() {
+            return TestResult::Fail("length field must equal byte count");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "spdm/handshake",
+        smoke_spdm_negotiate_algorithms_length_field_self_consistent
+    );
+
+    fn smoke_spdm_get_certificate_layout() -> TestResult {
+        use crate::handshake::{build_get_certificate, REQ_GET_CERTIFICATE, SPDM_VERSION_12};
+        let req = build_get_certificate(SPDM_VERSION_12, 1, 0x40, 0x80);
+        if req[1] != REQ_GET_CERTIFICATE {
+            return TestResult::Fail("opcode mismatch");
+        }
+        if req[2] != 1 {
+            return TestResult::Fail("slot id lives in Param1");
+        }
+        let offset = u16::from_le_bytes([req[4], req[5]]);
+        let length = u16::from_le_bytes([req[6], req[7]]);
+        if offset != 0x40 || length != 0x80 {
+            return TestResult::Fail("offset/length operands wrong");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("spdm/handshake", smoke_spdm_get_certificate_layout);
+
+    fn smoke_spdm_certificate_response_parses() -> TestResult {
+        use crate::handshake::{parse_certificate_response, RSP_CERTIFICATE, SPDM_VERSION_12};
+        let mut buf = alloc::vec![SPDM_VERSION_12, RSP_CERTIFICATE, 0x02, 0];
+        let portion: alloc::vec::Vec<u8> = (0..32u8).collect();
+        buf.extend_from_slice(&(portion.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&0x100u16.to_le_bytes()); // remainder
+        buf.extend_from_slice(&portion);
+        let (slot, plen, rem, body) = parse_certificate_response(&buf).expect("parse");
+        if slot != 0x02 || plen != 32 || rem != 0x100 || body != portion {
+            return TestResult::Fail("CERTIFICATE response decode");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("spdm/handshake", smoke_spdm_certificate_response_parses);
+
+    fn smoke_spdm_challenge_carries_nonce() -> TestResult {
+        use crate::handshake::{build_challenge, REQ_CHALLENGE, SPDM_VERSION_12};
+        let nonce = [0x42u8; 32];
+        let req = build_challenge(SPDM_VERSION_12, 0, 1, &nonce);
+        if req.len() != 36 {
+            return TestResult::Fail("CHALLENGE = 4 hdr + 32 nonce");
+        }
+        if req[1] != REQ_CHALLENGE {
+            return TestResult::Fail("opcode mismatch");
+        }
+        if &req[4..36] != &nonce {
+            return TestResult::Fail("nonce should follow header");
+        }
+        if req[3] != 1 {
+            return TestResult::Fail("measurement summary type lives in Param2");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("spdm/handshake", smoke_spdm_challenge_carries_nonce);
 }

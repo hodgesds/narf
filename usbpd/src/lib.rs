@@ -24,6 +24,7 @@
 extern crate alloc;
 
 pub mod message;
+pub mod sop_prime;
 pub mod tcpc;
 pub mod tcpm;
 pub mod vdm;

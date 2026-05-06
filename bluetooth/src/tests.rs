@@ -1643,3 +1643,164 @@ fn smoke_hfp_ok_and_error_responses() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bluetooth/hfp", smoke_hfp_ok_and_error_responses);
+
+// ── SDP smokes ─────────────────────────────────────────────────────
+
+fn smoke_sdp_pdu_header_round_trip() -> TestResult {
+    use crate::sdp::{PduHeader, PDU_SERVICE_SEARCH_REQUEST};
+    let h = PduHeader {
+        pdu_id: PDU_SERVICE_SEARCH_REQUEST,
+        transaction_id: 0xCAFE,
+        parameter_length: 0x1234,
+    };
+    let bytes = h.encode();
+    if bytes.len() != 5 {
+        return TestResult::Fail("PDU header is 5 bytes");
+    }
+    if bytes[0] != PDU_SERVICE_SEARCH_REQUEST {
+        return TestResult::Fail("PDU ID byte 0");
+    }
+    if bytes[1] != 0xCA || bytes[2] != 0xFE {
+        return TestResult::Fail("transaction ID is big-endian");
+    }
+    if bytes[3] != 0x12 || bytes[4] != 0x34 {
+        return TestResult::Fail("parameter length is big-endian");
+    }
+    let back = PduHeader::decode(&bytes).expect("decode");
+    if back != h {
+        return TestResult::Fail("PDU header round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/sdp", smoke_sdp_pdu_header_round_trip);
+
+fn smoke_sdp_de_header_packing() -> TestResult {
+    use crate::sdp::{de_header, DE_TYPE_UINT};
+    // type 1 (uint) + size index 2 (4 bytes) → (1<<3) | 2 = 0x0A
+    if de_header(DE_TYPE_UINT, 2) != 0x0A {
+        return TestResult::Fail("DE header packing wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/sdp", smoke_sdp_de_header_packing);
+
+fn smoke_sdp_encode_uint_widths() -> TestResult {
+    use crate::sdp::{encode_uint, DE_TYPE_UINT};
+    // 16-bit uint 0xCAFE.
+    let mut out = alloc::vec::Vec::new();
+    encode_uint(&mut out, 2, 0xCAFE);
+    if out != alloc::vec![(DE_TYPE_UINT << 3) | 1, 0xCA, 0xFE] {
+        return TestResult::Fail("16-bit uint encoding");
+    }
+    // 32-bit uint 0xDEAD_BEEF.
+    let mut out = alloc::vec::Vec::new();
+    encode_uint(&mut out, 4, 0xDEAD_BEEF);
+    if out != alloc::vec![(DE_TYPE_UINT << 3) | 2, 0xDE, 0xAD, 0xBE, 0xEF] {
+        return TestResult::Fail("32-bit uint encoding");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/sdp", smoke_sdp_encode_uint_widths);
+
+fn smoke_sdp_encode_uuid_16bit() -> TestResult {
+    use crate::sdp::{encode_uuid, DE_TYPE_UUID};
+    let mut out = alloc::vec::Vec::new();
+    encode_uuid(&mut out, &[0x11, 0x05]); // OBEX File Transfer
+    if out != alloc::vec![(DE_TYPE_UUID << 3) | 1, 0x11, 0x05] {
+        return TestResult::Fail("UUID-16 encoding");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/sdp", smoke_sdp_encode_uuid_16bit);
+
+fn smoke_sdp_encode_text_uses_size_index_5() -> TestResult {
+    use crate::sdp::{decode_element, encode_text, DE_TYPE_TEXT};
+    let mut out = alloc::vec::Vec::new();
+    encode_text(&mut out, "narf");
+    // header byte | 1-byte length | "narf"
+    if out[0] != (DE_TYPE_TEXT << 3) | 5 {
+        return TestResult::Fail("Text uses size-index 5");
+    }
+    if out[1] != 4 {
+        return TestResult::Fail("size byte should = string length");
+    }
+    let (ty, payload, consumed) = decode_element(&out).expect("decode");
+    if ty != DE_TYPE_TEXT {
+        return TestResult::Fail("decode type mismatch");
+    }
+    if payload != b"narf" {
+        return TestResult::Fail("decode payload mismatch");
+    }
+    if consumed != out.len() {
+        return TestResult::Fail("consumed should equal element length");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/sdp", smoke_sdp_encode_text_uses_size_index_5);
+
+fn smoke_sdp_encode_sequence_carries_children() -> TestResult {
+    use crate::sdp::{decode_element, encode_sequence, encode_uuid, DE_TYPE_SEQUENCE};
+    let mut child = alloc::vec::Vec::new();
+    encode_uuid(&mut child, &[0x11, 0x05]);
+    encode_uuid(&mut child, &[0x11, 0x06]);
+    let mut out = alloc::vec::Vec::new();
+    encode_sequence(&mut out, 5, &child);
+    let (ty, payload, _) = decode_element(&out).expect("decode");
+    if ty != DE_TYPE_SEQUENCE {
+        return TestResult::Fail("type should be Sequence");
+    }
+    if payload != child {
+        return TestResult::Fail("sequence payload should equal children");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/sdp", smoke_sdp_encode_sequence_carries_children);
+
+fn smoke_sdp_service_search_request_envelope() -> TestResult {
+    use crate::sdp::{
+        build_service_search_request, decode_element, PduHeader, DE_TYPE_SEQUENCE,
+        PDU_SERVICE_SEARCH_REQUEST,
+    };
+    let req = build_service_search_request(0x0001, &[&[0x11, 0x05]], 0xFFFF);
+    let h = PduHeader::decode(&req).expect("decode header");
+    if h.pdu_id != PDU_SERVICE_SEARCH_REQUEST {
+        return TestResult::Fail("PDU ID should be SERVICE_SEARCH_REQUEST");
+    }
+    if h.transaction_id != 0x0001 {
+        return TestResult::Fail("transaction ID");
+    }
+    // Body starts at byte 5 with a Sequence DataElement.
+    let (ty, _, _) = decode_element(&req[5..]).expect("decode body");
+    if ty != DE_TYPE_SEQUENCE {
+        return TestResult::Fail("first body element should be the UUID Sequence");
+    }
+    // Last byte must be the continuation-state size (0).
+    if *req.last().unwrap() != 0 {
+        return TestResult::Fail("continuation state size byte missing");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/sdp", smoke_sdp_service_search_request_envelope);
+
+fn smoke_sdp_service_attribute_request_record_handle() -> TestResult {
+    use crate::sdp::{build_service_attribute_request, PduHeader, PDU_SERVICE_ATTRIBUTE_REQUEST};
+    let req = build_service_attribute_request(0x0002, 0xCAFE_BEEF, 0x100, &[0x0001, 0x0004], false);
+    let h = PduHeader::decode(&req).expect("decode");
+    if h.pdu_id != PDU_SERVICE_ATTRIBUTE_REQUEST {
+        return TestResult::Fail("opcode mismatch");
+    }
+    // First 4 bytes after the header are the record handle, big-endian.
+    if &req[5..9] != &[0xCA, 0xFE, 0xBE, 0xEF] {
+        return TestResult::Fail("record handle should be big-endian");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/sdp", smoke_sdp_service_attribute_request_record_handle);
+
+fn smoke_sdp_psm_assigned_number() -> TestResult {
+    if crate::sdp::SDP_PSM != 0x0001 {
+        return TestResult::Fail("SDP PSM = 0x0001 per Assigned Numbers");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/sdp", smoke_sdp_psm_assigned_number);

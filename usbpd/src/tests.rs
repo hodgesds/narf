@@ -603,3 +603,137 @@ fn smoke_port_registry_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("usbpd/tcpm", smoke_port_registry_round_trip);
+
+// ── SOP'/SOP'' cable VDM smokes ────────────────────────────────────
+
+fn smoke_sop_prime_target_constants() -> TestResult {
+    use crate::sop_prime::{
+        SOP_TARGET_CABLE_PLUG_FAR, SOP_TARGET_CABLE_PLUG_NEAR, SOP_TARGET_PORT_PARTNER,
+    };
+    if SOP_TARGET_PORT_PARTNER != 0 {
+        return TestResult::Fail("SOP target = 0");
+    }
+    if SOP_TARGET_CABLE_PLUG_NEAR != 1 {
+        return TestResult::Fail("SOP' target = 1");
+    }
+    if SOP_TARGET_CABLE_PLUG_FAR != 2 {
+        return TestResult::Fail("SOP'' target = 2");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("usbpd/sop-prime", smoke_sop_prime_target_constants);
+
+fn smoke_sop_prime_id_header_round_trip() -> TestResult {
+    use crate::sop_prime::{
+        IdHeaderVdo, CABLE_PLUG_TYPE_PASSIVE_CABLE, CONNECTOR_PLUG,
+    };
+    let v = IdHeaderVdo {
+        usb_host_capable: false,
+        usb_device_capable: false,
+        ufp_product_type: CABLE_PLUG_TYPE_PASSIVE_CABLE,
+        modal_operation: false,
+        dfp_product_type: 0,
+        connector_type: CONNECTOR_PLUG,
+        vendor_id: 0x05AC, // Apple as a known test VID
+    };
+    let raw = v.encode();
+    let back = IdHeaderVdo::decode(raw);
+    if back != v {
+        return TestResult::Fail("ID Header VDO round-trip");
+    }
+    if (raw & 0xFFFF) != 0x05AC {
+        return TestResult::Fail("VID lives in low 16 bits");
+    }
+    if (raw >> 27) & 0x07 != CABLE_PLUG_TYPE_PASSIVE_CABLE as u32 {
+        return TestResult::Fail("UFP product type at bits 29..27");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("usbpd/sop-prime", smoke_sop_prime_id_header_round_trip);
+
+fn smoke_sop_prime_passive_cable_vdo_round_trip() -> TestResult {
+    use crate::sop_prime::{
+        PassiveCableVdo, USB_SS_SIGNALING_GEN2, VBUS_CURRENT_5A,
+    };
+    let v = PassiveCableVdo {
+        hw_version: 1,
+        firmware_version: 2,
+        vdo_version: 1,
+        plug_type: 0x02,
+        epr_mode_capable: true,
+        cable_latency: 4,
+        cable_termination: 1,
+        max_vbus_voltage: 1,
+        vbus_current: VBUS_CURRENT_5A,
+        usb_ss_signaling: USB_SS_SIGNALING_GEN2,
+    };
+    let raw = v.encode();
+    let back = PassiveCableVdo::decode(raw);
+    if back != v {
+        return TestResult::Fail("Passive Cable VDO round-trip");
+    }
+    if (raw & 0x07) != USB_SS_SIGNALING_GEN2 as u32 {
+        return TestResult::Fail("USB SS signaling lives in low 3 bits");
+    }
+    if (raw & (1 << 16)) == 0 {
+        return TestResult::Fail("EPR Mode bit position");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("usbpd/sop-prime", smoke_sop_prime_passive_cable_vdo_round_trip);
+
+fn smoke_sop_prime_active_cable_vdo1_round_trip() -> TestResult {
+    use crate::sop_prime::{ActiveCableVdo1, USB_SS_SIGNALING_GEN3};
+    let v = ActiveCableVdo1 {
+        hw_version: 0,
+        firmware_version: 0,
+        vdo_version: 1,
+        plug_type: 0x02,
+        epr_mode_capable: false,
+        cable_latency: 7,
+        cable_termination: 1,
+        max_vbus_voltage: 2,
+        sbu_supported: true,
+        sbu_type: 1,
+        vbus_current: 2,
+        vbus_through_cable: true,
+        sop_double_prime_supported: true,
+        usb_ss_signaling: USB_SS_SIGNALING_GEN3,
+    };
+    let raw = v.encode();
+    let back = ActiveCableVdo1::decode(raw);
+    if back != v {
+        return TestResult::Fail("Active Cable VDO1 round-trip");
+    }
+    if (raw & (1 << 3)) == 0 {
+        return TestResult::Fail("SOP'' supported bit = 1<<3");
+    }
+    if (raw & (1 << 4)) == 0 {
+        return TestResult::Fail("VBUS through cable bit = 1<<4");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("usbpd/sop-prime", smoke_sop_prime_active_cable_vdo1_round_trip);
+
+fn smoke_sop_prime_discover_identity_request() -> TestResult {
+    use crate::sop_prime::{discover_identity_request_objects, SOP_TARGET_CABLE_PLUG_NEAR};
+    let objs = discover_identity_request_objects(SOP_TARGET_CABLE_PLUG_NEAR);
+    if objs.len() != 1 {
+        return TestResult::Fail("Discover Identity request = 1 DWORD (header only)");
+    }
+    let h = objs[0];
+    // SVID=0xFF00 in upper 16 bits.
+    if (h >> 16) != 0xFF00 {
+        return TestResult::Fail("Standard SVID 0xFF00 not at top 16 bits");
+    }
+    // VDM Type bit 15 set (structured).
+    if h & (1 << 15) == 0 {
+        return TestResult::Fail("Structured VDM bit not set");
+    }
+    // Command field (low 5 bits) = 1 (Discover Identity).
+    if h & 0x1F != 1 {
+        return TestResult::Fail("Discover Identity command code = 1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("usbpd/sop-prime", smoke_sop_prime_discover_identity_request);

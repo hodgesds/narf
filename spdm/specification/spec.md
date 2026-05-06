@@ -52,3 +52,30 @@ these are extended into PCR 17 or 18.
 - `narf-capabilities`: For `Spdm` CapKind.
 - `narf-tpm`: For measurement extension.
 - `narf-scheduler`: For async execution.
+
+## 7. Sources (public only)
+
+All code in this crate is derived strictly from the references below.
+**No GPL Linux source consulted.**
+
+- **DMTF DSP0274 "Security Protocol and Data Model (SPDM)
+  Specification, Version 1.3"** (Apr 2023). Public DMTF document.
+  §10.3 (Message Header layout — SPDMVersion / RequestResponseCode
+  / Param1 / Param2). §10.4 (GET_VERSION / VERSION). §10.5
+  (GET_CAPABILITIES / CAPABILITIES — added DataTransferSize +
+  MaxSPDMmsgSize fields in 1.2). §10.6 (NEGOTIATE_ALGORITHMS /
+  ALGORITHMS — Base Asym + Hash bitmasks). §10.7 (GET_DIGESTS /
+  DIGESTS). §10.8 (GET_CERTIFICATE / CERTIFICATE — slot id +
+  offset + length operands). §10.9 (CHALLENGE / CHALLENGE_AUTH —
+  32-byte nonce, measurement-summary-hash type byte).
+- **DMTF DSP0274 v1.2** — referenced for the original Param1
+  encoding before 1.3 added new fields.
+
+## 8. Handshake submodule (`handshake`)
+
+`handshake/` is a clean-room codec for the message framing of GET_*
+requests and their responses. The crate's existing `messages/`
+module already covered GET_VERSION + GET_CAPABILITIES +
+GET_MEASUREMENTS (the minimum the v0.x driver used). `handshake/`
+fills in the remaining mandatory commands and surfaces the version
++ capability + algorithm constants the responder negotiates against.

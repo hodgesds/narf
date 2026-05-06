@@ -99,6 +99,18 @@ Bluetooth subsystem source material was consulted at any point.**
   v1.11** — referenced for the boot-protocol report layouts (§B.1
   keyboard, §B.2 mouse) reused on BLE.
 
+### SDP (Service Discovery Protocol)
+
+- **Bluetooth Core Specification 5.3, Vol 3 Part B (SDP)** —
+  Bluetooth SIG. §3 service-record / attribute model, §4 PDU
+  formats (PDU Header, ServiceSearchRequest, ServiceAttributeRequest,
+  ServiceSearchAttributeRequest), §5.1 DataElement TLV encoding
+  (Type Descriptor in high 5 bits, Size Index in low 3).
+- **Bluetooth Assigned Numbers** — SDP Service-Class UUIDs and
+  Universal Attribute IDs (ServiceClassIDList = 0x0001,
+  ProtocolDescriptorList = 0x0004, BluetoothProfileDescriptorList
+  = 0x0009, ServiceName = 0x0100). PSM = 0x0001.
+
 ### USB transport class
 
 - **USB Class Definitions for Wireless Controllers, Revision 1.0** —
@@ -135,6 +147,13 @@ Bluetooth subsystem source material was consulted at any point.**
   Information / Exchange MTU per ATT §3.4. Convenience builders
   `add_primary_service` / `add_characteristic` emit the canonical
   Vol 3 Part G declaration shape.
+- **SDP** (`sdp`): clean-room Service Discovery Protocol codec.
+  PDU header (5 bytes), DataElement TLV encoder/decoder (NIL,
+  Unsigned Integer, UUID, Text, Boolean, Sequence with all three
+  variable-size-index forms), Universal Attribute ID constants
+  (ServiceClassIDList, ProtocolDescriptorList, ServiceName, etc.),
+  Service Search Request + Service Attribute Request builders.
+  PSM 0x0001 surfaced as a constant.
 - **HFP** (`hfp`): clean-room AT command codec for HFP 1.8. AT line
   tokenizer (basic / write `=` / read `?` / test `=?` forms), HF
   command builders (BRSF, CIND test/read, CMER, CHLD test, CLCC,

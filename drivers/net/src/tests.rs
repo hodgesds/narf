@@ -287,3 +287,100 @@ kernel_test_in!(
     "drivers/net/atheros",
     smoke_atheros_default_intr_enable_includes_global
 );
+
+// ── Realtek PHY / RX descriptor smokes ─────────────────────────────
+
+fn smoke_rtl_phyar_read_request_layout() -> TestResult {
+    use crate::rtl_phy::{phyar_data, phyar_done, phyar_read_request, PHYAR_FLAG};
+    let req = phyar_read_request(0x02);
+    if req & PHYAR_FLAG != 0 {
+        return TestResult::Fail("Read request must clear the Flag bit");
+    }
+    if (req >> 16) & 0x1F != 0x02 {
+        return TestResult::Fail("register address lives in bits 20..16");
+    }
+    // Simulate a chip readback: data 0xCAFE, Flag cleared.
+    let readback = phyar_read_request(0x02) | 0xCAFE;
+    if !phyar_done(readback) {
+        return TestResult::Fail("Flag should be 0 on completed read");
+    }
+    if phyar_data(readback) != 0xCAFE {
+        return TestResult::Fail("data field decode wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/rtl-phy", smoke_rtl_phyar_read_request_layout);
+
+fn smoke_rtl_phyar_write_request_layout() -> TestResult {
+    use crate::rtl_phy::{phyar_write_request, PHYAR_FLAG};
+    let req = phyar_write_request(0x00, 0x9000);
+    if req & PHYAR_FLAG == 0 {
+        return TestResult::Fail("write request must set the Flag bit");
+    }
+    if req & 0xFFFF != 0x9000 {
+        return TestResult::Fail("data lives in low 16 bits");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/rtl-phy", smoke_rtl_phyar_write_request_layout);
+
+fn smoke_rtl_rx_desc_prepare_sets_own_and_eor() -> TestResult {
+    use crate::rtl_phy::{prepare_rx_desc, RING_LEN, RXD_EOR, RXD_OWN};
+    let last = prepare_rx_desc(RING_LEN - 1, 0xCAFE_F000, 0x600);
+    if last.flags_len & RXD_OWN == 0 {
+        return TestResult::Fail("OWN bit should be set on a chip-owned RX descriptor");
+    }
+    if last.flags_len & RXD_EOR == 0 {
+        return TestResult::Fail("EOR should be set on the last slot");
+    }
+    if last.flags_len & 0x3FFF != 0x600 {
+        return TestResult::Fail("buffer size should round-trip in low 14 bits");
+    }
+    let mid = prepare_rx_desc(0, 0x1000, 0x600);
+    if mid.flags_len & RXD_EOR != 0 {
+        return TestResult::Fail("non-last slot must not carry EOR");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/rtl-phy", smoke_rtl_rx_desc_prepare_sets_own_and_eor);
+
+fn smoke_rtl_rx_status_decodes_chip_returned_descriptor() -> TestResult {
+    use crate::rtl_phy::{RxStatus, RXD_FS, RXD_LS, RXD_PAM};
+    // Chip returned a 1500-byte unicast frame: FS|LS|PAM, length=1500.
+    let word0 = RXD_FS | RXD_LS | RXD_PAM | 1500u32;
+    let s = RxStatus::parse(word0);
+    if s.length != 1500 {
+        return TestResult::Fail("length decode wrong");
+    }
+    if !s.fs || !s.ls || !s.physical_match {
+        return TestResult::Fail("status flags lost");
+    }
+    if s.error || s.multicast || s.broadcast {
+        return TestResult::Fail("non-set status bits should be false");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/rtl-phy", smoke_rtl_rx_status_decodes_chip_returned_descriptor);
+
+fn smoke_rtl_mii_constants() -> TestResult {
+    use crate::rtl_phy::{
+        BMCR_AUTONEG_EN, BMCR_FULL_DUPLEX, BMCR_RESET, BMSR_LINK_UP, MII_BMCR, MII_BMSR,
+    };
+    if MII_BMCR != 0x00 || MII_BMSR != 0x01 {
+        return TestResult::Fail("MII Clause 22 register addresses fixed");
+    }
+    if BMCR_RESET != 0x8000 {
+        return TestResult::Fail("BMCR reset bit at 1<<15");
+    }
+    if BMCR_AUTONEG_EN != 0x1000 {
+        return TestResult::Fail("BMCR autoneg-en at 1<<12");
+    }
+    if BMCR_FULL_DUPLEX != 0x0100 {
+        return TestResult::Fail("BMCR full-duplex at 1<<8");
+    }
+    if BMSR_LINK_UP != 0x0004 {
+        return TestResult::Fail("BMSR link-up at 1<<2");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/net/rtl-phy", smoke_rtl_mii_constants);

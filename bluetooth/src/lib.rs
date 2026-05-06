@@ -40,6 +40,7 @@ pub mod hci;
 pub mod hfp;
 pub mod hogp;
 pub mod rfcomm;
+pub mod sdp;
 pub mod l2cap;
 pub mod opcode;
 pub mod smp;

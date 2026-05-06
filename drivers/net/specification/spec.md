@@ -115,6 +115,32 @@ support both. For fast-path (`dispatch = Polled`), only the
 DMA-buffer-cap form is supported (consumer is expected to
 manage its own pool).
 
+## 8a. Realtek PHY / RX descriptor sub-module (`rtl_phy`)
+
+References (public-only):
+- **Realtek "RTL8125 Series 2.5 Gigabit Ethernet Controller —
+  Registers Datasheet" Rev. 1.0** — Realtek. Public document.
+  §2.10 PHYAR PHY Access Register layout (Flag bit 31; register
+  address bits 26..21 with 5 valid bits for Clause 22; data bits
+  15..0). §3.1.2 Receive Descriptor Format (16 bytes, OWN/EOR/FS/
+  LS/MAR/PAM/BAR/RES/length packing).
+- **Realtek "RTL8111B/RTL8168B Integrated Gigabit Ethernet
+  Controller — Registers Datasheet" Rev. 1.0** (Jan 2006) — Realtek.
+  Public. The "B" PHYAR + RX descriptor layouts that the RTL8125
+  inherits unchanged.
+- **IEEE 802.3 Clause 22** — public MII MDIO frame format. PHYAR
+  is the MMIO-shaped wrapper around Clause 22 reads/writes.
+
+Surfaced:
+- `phyar_read_request` / `phyar_write_request` / `phyar_data` /
+  `phyar_done` for the MMIO offset 0x60 register.
+- `prepare_rx_desc` (host → chip) and `RxStatus::parse` (chip →
+  host) for the 16-byte RX descriptor.
+- MII Clause 22 register addresses (BMCR / BMSR / PHYSID1/2 /
+  ADVERTISE / LPA / GBCR / GBSR) and the BMCR/BMSR bit constants
+  for reset / autoneg / link-up / speed-100 / speed-1000 / full-
+  duplex.
+
 ## 9. ABI versioning
 
 Per-driver crates export the `BusDevice` match table; the

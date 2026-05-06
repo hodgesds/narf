@@ -47,6 +47,22 @@ point.**
   DP_Capabilities / DP_Status / DP_Configure VDO codecs (VESA DP
   Alt 2.0). `DpAltModeDriver` walks the full alt-mode discovery
   sequence end-to-end and lands a working DP configuration.
+- **`sop_prime`** — clean-room SOP' / SOP'' cable-VDM codec.
+  Per USB-PD 3.1 §6.2.1.1.6 the Message Target field of the SOP
+  packet header chooses between SOP / SOP' (near plug) / SOP''
+  (far plug); §6.4.4.3.1 describes the ID Header VDO + Cable Plug
+  product types and §6.4.4.3.1.4–5 cover the Passive / Active
+  Cable VDO byte layouts. This module surfaces:
+  - Target enum + product-type constants (Passive Cable / Active
+    Cable / VPD).
+  - `IdHeaderVdo` round-trip (USB host/device flags, UFP/DFP
+    product types, modal operation, connector type, vendor id).
+  - `PassiveCableVdo` + `ActiveCableVdo1` round-trips for cable
+    interrogation responses (latency, termination, max VBUS,
+    VBUS current, USB-SS signalling Gen1/Gen2/Gen3, SOP''
+    support flag, VBUS-through-cable flag).
+  - `discover_identity_request_objects` builder for the 1-DWORD
+    Discover Identity request that targets a cable plug.
 
 ### Out of scope (deliberate)
 - Power Role Swap, Data Role Swap, VCONN Swap.
