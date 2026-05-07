@@ -1953,3 +1953,109 @@ fn smoke_mesh_composition_header_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bluetooth/mesh", smoke_mesh_composition_header_round_trip);
+
+// ── GAP advertising-data smokes ────────────────────────────────────
+
+fn smoke_gap_record_iterator_walks_two_records() -> TestResult {
+    use crate::gap::{AdIter, AD_COMPLETE_LOCAL_NAME, AD_FLAGS};
+    // Record 1: Flags = 0x06 (LE General Discoverable + BR/EDR not supported)
+    // Record 2: Complete Local Name = "narf"
+    let buf = [
+        2u8, AD_FLAGS, 0x06,
+        5, AD_COMPLETE_LOCAL_NAME, b'n', b'a', b'r', b'f',
+    ];
+    let recs: alloc::vec::Vec<_> = AdIter::new(&buf).collect::<Result<_, _>>().expect("walk");
+    if recs.len() != 2 {
+        return TestResult::Fail("expected 2 records");
+    }
+    if recs[0].ad_type != AD_FLAGS || recs[0].payload != [0x06] {
+        return TestResult::Fail("flags record decode wrong");
+    }
+    if recs[1].ad_type != AD_COMPLETE_LOCAL_NAME || recs[1].payload != b"narf" {
+        return TestResult::Fail("name record decode wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/gap", smoke_gap_record_iterator_walks_two_records);
+
+fn smoke_gap_iterator_stops_on_zero_length() -> TestResult {
+    use crate::gap::{AdIter, AD_FLAGS};
+    let buf = [2u8, AD_FLAGS, 0x06, 0, 0, 0, 0];
+    let count = AdIter::new(&buf).count();
+    if count != 1 {
+        return TestResult::Fail("zero-length record terminates iteration");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/gap", smoke_gap_iterator_stops_on_zero_length);
+
+fn smoke_gap_truncated_record_surfaces_error() -> TestResult {
+    use crate::gap::{AdIter, GapError, AD_COMPLETE_LOCAL_NAME};
+    let buf = [10u8, AD_COMPLETE_LOCAL_NAME, b'a', b'b']; // claims length 10, only 2 follow
+    match AdIter::new(&buf).next() {
+        Some(Err(GapError::Truncated)) => TestResult::Pass,
+        _ => TestResult::Fail("truncated record must error"),
+    }
+}
+kernel_test_in!("bluetooth/gap", smoke_gap_truncated_record_surfaces_error);
+
+fn smoke_gap_builder_round_trip_with_decoders() -> TestResult {
+    use crate::gap::{
+        append_complete_local_name, append_flags, append_manufacturer_data, append_tx_power,
+        flags, local_name, manufacturer_data, tx_power, FLAGS_BR_EDR_NOT_SUPPORTED,
+        FLAGS_LE_GENERAL_DISCOVERABLE,
+    };
+    let mut buf = alloc::vec::Vec::new();
+    append_flags(&mut buf, FLAGS_LE_GENERAL_DISCOVERABLE | FLAGS_BR_EDR_NOT_SUPPORTED);
+    append_complete_local_name(&mut buf, "narf");
+    append_tx_power(&mut buf, -7);
+    append_manufacturer_data(&mut buf, 0x004C, &[1, 2, 3]);
+
+    if flags(&buf) != Some(FLAGS_LE_GENERAL_DISCOVERABLE | FLAGS_BR_EDR_NOT_SUPPORTED) {
+        return TestResult::Fail("flags decode mismatch");
+    }
+    if local_name(&buf).as_deref() != Some("narf") {
+        return TestResult::Fail("local-name decode mismatch");
+    }
+    if tx_power(&buf) != Some(-7) {
+        return TestResult::Fail("tx-power decode mismatch");
+    }
+    let (cid, payload) = manufacturer_data(&buf).expect("manufacturer data present");
+    if cid != 0x004C {
+        return TestResult::Fail("Company ID lives at low 2 bytes");
+    }
+    if payload != [1, 2, 3] {
+        return TestResult::Fail("vendor payload tail mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/gap", smoke_gap_builder_round_trip_with_decoders);
+
+fn smoke_gap_service_uuid_list_round_trip() -> TestResult {
+    use crate::gap::{append_service_uuid_list_16, service_uuids_16};
+    let mut buf = alloc::vec::Vec::new();
+    append_service_uuid_list_16(&mut buf, true, &[0x1812, 0x180F, 0x180A]);
+    let uuids = service_uuids_16(&buf);
+    if uuids != alloc::vec![0x1812u16, 0x180F, 0x180A] {
+        return TestResult::Fail("service UUID list round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/gap", smoke_gap_service_uuid_list_round_trip);
+
+fn smoke_gap_record_length_byte_covers_type_plus_payload() -> TestResult {
+    use crate::gap::{append_record, AD_FLAGS};
+    let mut buf = alloc::vec::Vec::new();
+    append_record(&mut buf, AD_FLAGS, &[0x06]);
+    if buf[0] != 2 {
+        return TestResult::Fail("length byte = 1 (type) + 1 (payload) = 2");
+    }
+    if buf[1] != AD_FLAGS {
+        return TestResult::Fail("AD type byte 1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bluetooth/gap",
+    smoke_gap_record_length_byte_covers_type_plus_payload
+);

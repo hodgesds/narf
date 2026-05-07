@@ -497,3 +497,88 @@ fn smoke_dsc_pps_rejects_zero_version() -> TestResult {
     }
 }
 kernel_test_in!("graphics/dsc", smoke_dsc_pps_rejects_zero_version);
+
+// ── PSR / Adaptive-Sync DPCD smokes ────────────────────────────────
+
+fn smoke_dp_psr_dpcd_addresses() -> TestResult {
+    use crate::dp_psr::{DPCD_PSR_CONFIGURATION, DPCD_PSR_STATUS, DPCD_PSR_SUPPORT};
+    if DPCD_PSR_SUPPORT != 0x70 {
+        return TestResult::Fail("PSR_SUPPORT lives at 0x070");
+    }
+    if DPCD_PSR_CONFIGURATION != 0x170 {
+        return TestResult::Fail("PSR_CONFIGURATION lives at 0x170");
+    }
+    if DPCD_PSR_STATUS != 0x2007 {
+        return TestResult::Fail("PSR_STATUS lives at 0x2007");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("graphics/dp-psr", smoke_dp_psr_dpcd_addresses);
+
+fn smoke_dp_psr_caps_decode_setup_time() -> TestResult {
+    use crate::dp_psr::PsrCaps;
+    // Setup time index = 4 (110 µs), deep-sleep on exit = 1.
+    let b = (4u8 << 5) | 0x10;
+    let c = PsrCaps::decode(b);
+    if c.setup_time_index != 4 {
+        return TestResult::Fail("setup time index field at bits 7..5");
+    }
+    if !c.deep_sleep_on_exit {
+        return TestResult::Fail("deep-sleep bit lost");
+    }
+    if c.setup_time() != 110 {
+        return TestResult::Fail("setup-time index 4 = 110 µs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("graphics/dp-psr", smoke_dp_psr_caps_decode_setup_time);
+
+fn smoke_dp_psr_state_constants() -> TestResult {
+    use crate::dp_psr::{
+        PSR_STATE_ACTIVE_NO_FRAME, PSR_STATE_INACTIVE, PSR_STATE_INTERNAL_ERROR,
+    };
+    if PSR_STATE_INACTIVE != 0 {
+        return TestResult::Fail("PSR state 0 = inactive");
+    }
+    if PSR_STATE_ACTIVE_NO_FRAME != 3 {
+        return TestResult::Fail("PSR state 3 = active no frame");
+    }
+    if PSR_STATE_INTERNAL_ERROR != 7 {
+        return TestResult::Fail("PSR state 7 = internal error");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("graphics/dp-psr", smoke_dp_psr_state_constants);
+
+fn smoke_dp_psr2_caps_constants() -> TestResult {
+    use crate::dp_psr::{DPCD_PSR2_CAPS, PSR2_CAP_SU, PSR2_CAP_SU_GRANULARITY_REQUIRED};
+    if DPCD_PSR2_CAPS != 0x2030 {
+        return TestResult::Fail("PSR2_CAPS lives at 0x2030 per eDP 1.5");
+    }
+    if PSR2_CAP_SU != 1 {
+        return TestResult::Fail("Selective Update bit at bit 0");
+    }
+    if PSR2_CAP_SU_GRANULARITY_REQUIRED != 2 {
+        return TestResult::Fail("granularity-required at bit 1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("graphics/dp-psr", smoke_dp_psr2_caps_constants);
+
+fn smoke_dp_adaptive_sync_dpcd() -> TestResult {
+    use crate::dp_psr::{
+        ADAPTIVE_SYNC_CAP_SUPPORT, DPCD_ADAPTIVE_SYNC_CAPABILITY,
+        DPCD_DOWN_STREAM_PORT_PRESENT_MSA_TIMING_PAR_IGNORED,
+    };
+    if DPCD_DOWN_STREAM_PORT_PRESENT_MSA_TIMING_PAR_IGNORED != 0x40 {
+        return TestResult::Fail("MSA-VSYNC-IGNORE bit at DPCD 0x05[6]");
+    }
+    if DPCD_ADAPTIVE_SYNC_CAPABILITY != 0x7001 {
+        return TestResult::Fail("Adaptive-Sync capability lives at 0x7001");
+    }
+    if ADAPTIVE_SYNC_CAP_SUPPORT != 1 {
+        return TestResult::Fail("support bit at bit 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("graphics/dp-psr", smoke_dp_adaptive_sync_dpcd);

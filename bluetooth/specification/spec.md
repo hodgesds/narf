@@ -99,6 +99,18 @@ Bluetooth subsystem source material was consulted at any point.**
   v1.11** — referenced for the boot-protocol report layouts (§B.1
   keyboard, §B.2 mouse) reused on BLE.
 
+### GAP advertising data
+
+- **Bluetooth Core Specification Supplement, Part A — Data Types
+  Specification, Version 11** — Bluetooth SIG. Public adopted
+  document. §1.3 (advertising data record format: length /
+  AD type / payload).
+- **Bluetooth Assigned Numbers — Generic Access Profile** —
+  Bluetooth SIG. Public registry of AD type codes (Flags = 0x01,
+  Service UUID lists 16/32/128 bit, Local Name, Tx Power,
+  Manufacturer Specific Data = 0xFF, Service Data, Appearance,
+  URI, …).
+
 ### Bluetooth Mesh
 
 - **Bluetooth Mesh Profile Specification, Version 1.1** (Sep 2023)
@@ -159,6 +171,14 @@ Bluetooth subsystem source material was consulted at any point.**
   Information / Exchange MTU per ATT §3.4. Convenience builders
   `add_primary_service` / `add_characteristic` emit the canonical
   Vol 3 Part G declaration shape.
+- **GAP** (`gap`): clean-room advertising-data record codec.
+  AdIter walks the standard length+type+payload layout (with
+  zero-length-as-terminator handling), append_record + builders for
+  Flags / Complete Local Name / Tx Power / Manufacturer Specific
+  Data / 16-bit Service UUID list / Service Data, decoders for the
+  same plus convenience helpers (find by AD type, local_name,
+  flags, tx_power, manufacturer_data, service_uuids_16). AD type +
+  flags-byte constants per Assigned Numbers.
 - **Mesh** (`mesh`): clean-room Bluetooth Mesh codec. Network PDU
   header (9 bytes — IVI/NID + CTL/TTL + 24-bit BE SEQ + SRC + DST),
   Lower Transport segmented Access PDU header (4 bytes — SEG/AKF/AID

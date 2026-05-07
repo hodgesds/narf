@@ -84,3 +84,25 @@ The kernel validates that `pcr_index` is included in the capability's `PcrSet` b
 
 - **Consumes**: `drivers/`, `capabilities/`, `crypto/`, `lib/`.
 - **Provides to**: Bootloader, Encrypted Storage, Identity Daemons.
+
+## 8. Sources (public only) for the `tpm2` codec sub-module
+
+`tpm2/` is a clean-room codec for the TPM 2.0 wire format that the
+`commands/` module composes against. References (public-only):
+
+- **TCG TPM Library Specification, Family 2.0, Level 00, Revision
+  1.59** (Nov 2019) — Trusted Computing Group. Public.
+  Part 1 §11.4 TPM_ST tag values, §17 Boot/Startup commands,
+  §18.5 session authorization area.
+  Part 2 §6 Constants — TPM_CC command codes, TPM_ALG_ID hash IDs,
+  TPM_CAP capability identifiers, TPM_RC return codes.
+  Part 3 §9 TPM2_Startup, §16 TPM2_GetRandom, §22 TPM2_PCR_Read /
+  TPM2_PCR_Extend, §30 TPM2_GetCapability.
+
+**No GPL Linux source consulted.** Surfaced:
+- `Header::encode` / `Header::decode` (10-byte BE tag + size + code).
+- `begin_command` + `finalise` for incremental command builders.
+- Specific commands: `startup`, `shutdown`, `get_random`,
+  `get_capability`, `pcr_read`.
+- `parse_get_random_response` for the 2-byte BE length + bytes form.
+- TPM_ST / TPM_CC / TPM_SU / TPM_ALG_ID / TPM_CAP / TPM_RC constants.

@@ -34,6 +34,7 @@ pub mod att;
 pub mod avdtp;
 pub mod controller;
 pub mod event;
+pub mod gap;
 pub mod gatt;
 pub mod gatt_server;
 pub mod hci;

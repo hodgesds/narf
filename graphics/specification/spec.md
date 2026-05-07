@@ -15,6 +15,19 @@ All code is derived strictly from the references below.
 See `edid/specification/spec.md` — this crate's `edid.rs` is a thin
 adapter that calls into the dedicated EDID parser.
 
+### PSR / Adaptive-Sync DPCD registers
+
+- **VESA DisplayPort Standard, Version 1.4a** — VESA. Public.
+  §3.6 (eDP-specific DPCD block at 0x700..0x7FF), §3.6.6 (PSR
+  DPCD register block: PSR_SUPPORT 0x70, PSR_VERSION 0x71,
+  PSR_CAPS 0x72, PSR_CONFIGURATION 0x170, PSR_STATUS 0x2007,
+  PSR_ERROR_STATUS 0x2008).
+- **VESA Embedded DisplayPort (eDP) Standard, Version 1.5** —
+  VESA. Public. §3.6.10 PSR2_CAPS at DPCD 0x2030.
+- **VESA Adaptive-Sync over DisplayPort** — VESA TID. Public.
+  Adaptive-Sync DPCD addresses (0x07000 version, 0x07001 capability)
+  + the MSA-VSYNC-IGNORE bit at DPCD 0x05[6].
+
 ### DSC (Display Stream Compression)
 
 - **VESA Display Stream Compression (DSC) Standard, Version 1.2a**

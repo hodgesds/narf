@@ -201,3 +201,133 @@ fn smoke_block_encrypted_round_trip() -> TestResult {
     }
 }
 kernel_test_in!("block", smoke_block_encrypted_round_trip);
+
+// ── SCSI codec smokes ──────────────────────────────────────────────
+
+extern crate alloc;
+
+fn smoke_scsi_inquiry_cdb_layout() -> TestResult {
+    use crate::scsi::{inquiry, OP_INQUIRY};
+    let cdb = inquiry(false, 0, 36);
+    if cdb[0] != OP_INQUIRY {
+        return TestResult::Fail("INQUIRY opcode = 0x12");
+    }
+    if cdb[3] != 0 || cdb[4] != 36 {
+        return TestResult::Fail("alloc length stored as 16-bit BE");
+    }
+    let evpd = inquiry(true, 0x80, 256);
+    if evpd[1] & 1 == 0 {
+        return TestResult::Fail("EVPD flag at bit 0 of byte 1");
+    }
+    if evpd[2] != 0x80 {
+        return TestResult::Fail("page code at byte 2");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("block/scsi", smoke_scsi_inquiry_cdb_layout);
+
+fn smoke_scsi_inquiry_response_decode_disk() -> TestResult {
+    use crate::scsi::{InquiryData, PDT_DIRECT_ACCESS_BLOCK};
+    let mut buf = alloc::vec![0u8; 36];
+    buf[0] = PDT_DIRECT_ACCESS_BLOCK; // qualifier 0, type 0
+    buf[1] = 0x80; // RMB
+    buf[4] = 31; // additional length
+    buf[8..16].copy_from_slice(b"NARF    ");
+    buf[16..32].copy_from_slice(b"FlashDrive      ");
+    buf[32..36].copy_from_slice(b"1.0 ");
+    let i = InquiryData::parse(&buf).expect("parse");
+    if i.peripheral_device_type != PDT_DIRECT_ACCESS_BLOCK {
+        return TestResult::Fail("device type mismatch");
+    }
+    if !i.removable_medium {
+        return TestResult::Fail("RMB bit lost");
+    }
+    if i.vendor_id != "NARF" {
+        return TestResult::Fail("vendor ID with trailing-space trim");
+    }
+    if i.product_id != "FlashDrive" {
+        return TestResult::Fail("product ID with trailing-space trim");
+    }
+    if i.product_revision != "1.0" {
+        return TestResult::Fail("product revision");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("block/scsi", smoke_scsi_inquiry_response_decode_disk);
+
+fn smoke_scsi_read_capacity_10_round_trip() -> TestResult {
+    use crate::scsi::{parse_read_capacity_10, read_capacity_10, OP_READ_CAPACITY_10};
+    let cdb = read_capacity_10();
+    if cdb[0] != OP_READ_CAPACITY_10 {
+        return TestResult::Fail("READ CAPACITY(10) opcode = 0x25");
+    }
+    // 1 TiB at 512-byte sectors = 2_147_483_648 sectors → last LBA 2_147_483_647.
+    let mut resp = [0u8; 8];
+    resp[0..4].copy_from_slice(&0x7FFF_FFFFu32.to_be_bytes());
+    resp[4..8].copy_from_slice(&512u32.to_be_bytes());
+    let (lba, bs) = parse_read_capacity_10(&resp).expect("parse");
+    if lba != 0x7FFF_FFFF {
+        return TestResult::Fail("last LBA decode");
+    }
+    if bs != 512 {
+        return TestResult::Fail("block size decode");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("block/scsi", smoke_scsi_read_capacity_10_round_trip);
+
+fn smoke_scsi_read_10_carries_lba_and_length() -> TestResult {
+    use crate::scsi::{read_10, OP_READ_10};
+    let cdb = read_10(0xCAFE_BEEF, 0x40, true);
+    if cdb[0] != OP_READ_10 {
+        return TestResult::Fail("READ(10) opcode = 0x28");
+    }
+    if cdb[1] & (1 << 3) == 0 {
+        return TestResult::Fail("FUA bit at byte 1 bit 3");
+    }
+    if &cdb[2..6] != &[0xCA, 0xFE, 0xBE, 0xEF] {
+        return TestResult::Fail("LBA stored big-endian");
+    }
+    if &cdb[7..9] != &[0x00, 0x40] {
+        return TestResult::Fail("transfer length stored big-endian");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("block/scsi", smoke_scsi_read_10_carries_lba_and_length);
+
+fn smoke_scsi_fixed_sense_round_trip() -> TestResult {
+    use crate::scsi::{FixedSense, SENSE_KEY_NOT_READY};
+    let mut buf = alloc::vec![0u8; 18];
+    buf[0] = 0xF0; // Valid + current
+    buf[2] = SENSE_KEY_NOT_READY;
+    buf[3..7].copy_from_slice(&0x0000_2000u32.to_be_bytes());
+    buf[12] = 0x04; // ASC = LOGICAL UNIT NOT READY
+    buf[13] = 0x03; // ASCQ = MANUAL INTERVENTION REQUIRED
+    let s = FixedSense::parse(&buf).expect("parse");
+    if !s.valid(buf[0]) {
+        return TestResult::Fail("Valid bit at byte 0 bit 7");
+    }
+    if s.sense_key != SENSE_KEY_NOT_READY {
+        return TestResult::Fail("sense key low nibble of byte 2");
+    }
+    if s.information != 0x0000_2000 {
+        return TestResult::Fail("information bytes are 4 BE bytes");
+    }
+    if s.additional_sense_code != 0x04 {
+        return TestResult::Fail("ASC at byte 12");
+    }
+    if s.additional_sense_code_qualifier != 0x03 {
+        return TestResult::Fail("ASCQ at byte 13");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("block/scsi", smoke_scsi_fixed_sense_round_trip);
+
+fn smoke_scsi_status_constants() -> TestResult {
+    use crate::scsi::{STATUS_BUSY, STATUS_CHECK_CONDITION, STATUS_GOOD};
+    if STATUS_GOOD != 0x00 || STATUS_CHECK_CONDITION != 0x02 || STATUS_BUSY != 0x08 {
+        return TestResult::Fail("SAM-5 status byte values");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("block/scsi", smoke_scsi_status_constants);

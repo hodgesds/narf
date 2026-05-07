@@ -179,6 +179,7 @@ impl Framebuffer {
 pub mod console;
 pub mod cursor;
 pub mod dp_aux;
+pub mod dp_psr;
 pub mod dsc;
 pub mod edid;
 pub mod font8x8;
