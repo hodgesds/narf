@@ -1,5 +1,6 @@
 //! virtio-gpu command builders / decoders. Pure-data — no MMIO,
 //! no DMA. Wire format from VirtIO 1.2 §5.7.6 (control commands).
+//!   <https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html>
 //!
 //! Every command starts with `virtio_gpu_ctrl_hdr` (24 bytes, §5.7.6.7):
 //!   u32 type, u32 flags, u64 fence_id, u32 ctx_id, u32 padding.

@@ -1,6 +1,7 @@
 //! ACPI Thermal Zone driver — clean-room.
 //!
 //! Spec: ACPI 6.5 §11 (Thermal Management).
+//!   <https://uefi.org/specs/ACPI/>
 //! Discovers ThermalZone objects in AML, registers them with `narf-power`,
 //! and drives the periodic temperature poll.
 

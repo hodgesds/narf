@@ -3,6 +3,8 @@
 //! Reference: **"Universal Serial Bus Specification Revision 2.0"
 //! Chapter 11** ("Hub Specification"), USB-IF (free PDF, usb.org).
 //! Section numbers below (`§11.x`) refer to that chapter.
+//!   <https://www.usb.org/document-library/usb-20-specification>
+//!   <https://www.usb.org/document-library/usb-32-revision-11-june-2022>
 //!
 //! ## Protocol shape
 //!

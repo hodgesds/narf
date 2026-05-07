@@ -10,6 +10,7 @@
 //!   used by modern TPMs and QEMU's `swtpm` backend.
 //! - **"Trusted Platform Module Library Part 3: Commands"** rev
 //!   1.59 — TPM2_GetRandom, TPM2_GetCapability, etc.
+//!   <https://trustedcomputinggroup.org/resource/tpm-library-specification/>
 //!
 //! ## Memory map
 //!

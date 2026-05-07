@@ -1,4 +1,5 @@
 //! virtio-vsock over modern virtio-PCI transport (VirtIO 1.2 §5.10).
+//!   <https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html>
 //!
 //! Stage 1: PCI match (1AF4:1053) + virtio cfg cap discovery + decode
 //! of the §5.10.4 device-specific config (`guest_cid: u64 LE`).

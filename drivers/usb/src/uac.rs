@@ -3,8 +3,10 @@
 //! References (public-only):
 //! - "Universal Serial Bus Device Class Definition for Audio Devices"
 //!   Release 1.0, March 18, 1998. Public document, usb.org.
+//!   <https://www.usb.org/document-library/audio-class-document-10>
 //! - "Universal Serial Bus Device Class Definition for Audio Data
 //!   Formats" Release 1.0, March 18, 1998. Public, usb.org.
+//!   <https://www.usb.org/document-library/audio-class-document-10>
 //! - "Universal Serial Bus Specification" 2.0, §9 (standard
 //!   descriptors). Public, usb.org.
 //!

@@ -5,8 +5,10 @@
 //! - "Device Class Definition for Human Interface Devices (HID)"
 //!   Version 1.11, 27 June 2001. Public document, usb.org. Section
 //!   numbers below (`§7.x`) refer to that spec.
+//!   <https://www.usb.org/document-library/device-class-definition-hid-111>
 //! - "Universal Serial Bus HID Usage Tables" 1.4 — for the keyboard
 //!   usage page values (page 0x07).
+//!   <https://www.usb.org/document-library/device-class-definition-hid-111>
 //!
 //! ## Scope
 //!

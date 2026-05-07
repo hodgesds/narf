@@ -3,6 +3,7 @@
 //! Spec: Bluetooth Core Specification 5.3 Vol 3 Part F (ATT) +
 //! Vol 3 Part G (GATT). Public Bluetooth SIG documents. No GPL
 //! Linux source consulted.
+//!   <https://www.bluetooth.com/specifications/specs/core-specification/>
 //!
 //! The server holds a flat ordered list of *attributes*. Each
 //! attribute has a 16-bit handle (assigned in insertion order

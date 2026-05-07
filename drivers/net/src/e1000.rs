@@ -6,6 +6,8 @@
 //! Ethernet Controller Datasheet" (8257x). The two families share
 //! enough register layout that one driver covers both with a small
 //! probe-time discriminator.
+//!   <https://www.intel.com/content/www/us/en/sdm.html>
+//!   <https://www.intel.com/content/dam/doc/manual/8254x-software-developers-manual.pdf>
 //!
 //! Stage-4 cut: bring up the device far enough to read the MAC
 //! address from the Receive Address Registers (RAL/RAH), program a

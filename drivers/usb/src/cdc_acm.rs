@@ -7,6 +7,7 @@
 //!   (`SET_LINE_CODING`), §6.3.11 (`GET_LINE_CODING`), §6.3.12
 //!   (`SET_CONTROL_LINE_STATE`), §6.5.4 (`SerialState`
 //!   notification).
+//!   <https://www.usb.org/document-library/class-definitions-communication-devices-12>
 //! - **USB Specification 2.0** §9.3 (USB device requests; SETUP
 //!   packet layout). Public.
 //!

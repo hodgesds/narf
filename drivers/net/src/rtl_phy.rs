@@ -14,6 +14,7 @@
 //!   inherits unchanged.
 //! - IEEE 802.3 Clause 22 — public MII MDIO frame format. PHYAR is
 //!   Realtek's MMIO-shaped wrapper around a Clause 22 transaction.
+//!   <https://standards.ieee.org/ieee/802.3/7071/>
 //!
 //! No GPL Linux source consulted.
 //!

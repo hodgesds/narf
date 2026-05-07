@@ -5,11 +5,14 @@
 //!   §CEC 6 (Signal Form / framing), §CEC 7 (Physical / Logical
 //!   address allocation), §CEC 9 (Message Descriptions and Encodings),
 //!   §CEC Tables 7..14 (opcode constants).
+//!   <https://www.hdmi.org/spec/index>
 //! - CEC v1.3a — public Annex (operand encodings, OSD name, vendor
 //!   command, deck/play, system audio messages).
+//!   <https://www.hdmi.org/spec/index>
 //! - CTA-861-G §A — Source Physical Address mapping (the 4-nibble
 //!   value carried in the HDMI VSDB; this module reads it from the
 //!   `cta861::HdmiVsdb`).
+//!   <https://standards.cta.tech/>
 //!
 //! No GPL Linux source consulted.
 //!

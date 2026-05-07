@@ -5,9 +5,11 @@
 //!   §2 Section structure, §3.4 Data Block header, §4 Product
 //!   Identification, §4.4 Type VII Detailed Timing Data Block,
 //!   Annex A (data-block tag codes).
+//!   <https://vesa.org/vesa-standards/>
 //! - VESA E-EDID 1.4 — base block carries `extension_count` at offset
 //!   126; each subsequent 128-byte block has tag 0x70 if it is a
 //!   DisplayID extension block.
+//!   <https://vesa.org/vesa-standards/>
 //!
 //! No GPL Linux source consulted.
 //!

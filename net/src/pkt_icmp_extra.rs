@@ -6,13 +6,17 @@
 //!   — deprecated by RFC 6633 but still emitted by some hosts), Time
 //!   Exceeded (type 11), Parameter Problem (type 12), Redirect
 //!   (type 5).
+//!   <https://datatracker.ietf.org/doc/html/rfc792>
 //! - RFC 1191 — Path MTU Discovery — surfaces the "next-hop MTU"
 //!   that lives in the bottom 16 bits of the unused header field of
 //!   a fragmentation-needed Destination Unreachable.
+//!   <https://datatracker.ietf.org/doc/html/rfc1191>
 //! - RFC 3376 — Internet Group Management Protocol, Version 3
 //!   (B. Cain et al, Oct 2002). §4 Membership Query (type 0x11) +
 //!   §4.2 Membership Report (type 0x22 with Group Records).
+//!   <https://datatracker.ietf.org/doc/html/rfc3376>
 //! - RFC 1071 — Internet checksum reused for ICMP/IGMP.
+//!   <https://datatracker.ietf.org/doc/html/rfc1071>
 //!
 //! No GPL Linux source consulted.
 //!

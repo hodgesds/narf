@@ -1,4 +1,5 @@
 //! virtio-iommu over modern virtio-PCI transport (VirtIO 1.2 §5.16).
+//!   <https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html>
 //!
 //! Stage 1: PCI match (1AF4:1057) + virtio cfg cap discovery + decode
 //! of the device-specific config (§5.16.4).

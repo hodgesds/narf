@@ -4,10 +4,12 @@
 //! - RFC 1350 — The TFTP Protocol (Revision 2) (K. Sollins, July
 //!   1992). §5 Packet Formats. Opcodes RRQ (1), WRQ (2), DATA (3),
 //!   ACK (4), ERROR (5).
+//!   <https://datatracker.ietf.org/doc/html/rfc1350>
 //! - RFC 2347 — TFTP Option Extension (G. Malkin & A. Harkin, May
 //!   1998). OACK (opcode 6) packets carry server-acknowledged
 //!   options (e.g. blksize, timeout, tsize, windowsize from
 //!   RFCs 2348 / 2349 / 7440).
+//!   <https://datatracker.ietf.org/doc/html/rfc2347>
 //!
 //! No GPL Linux source consulted.
 //!

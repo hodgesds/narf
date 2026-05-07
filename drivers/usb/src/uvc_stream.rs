@@ -8,9 +8,11 @@
 //!   Table 2-12 (Bit Field Header layout).
 //!   §2.4.3.4 Source Clock Reference and Presentation Time Stamp
 //!   (PTS / SCR optional fields).
+//!   <https://www.usb.org/document-library/video-class-v15-document-set>
 //! - UVC 1.5 Frame-Based Payload Specification (companion public
 //!   document) — referenced for the payload-header convention reused
 //!   on H.264 / VP8 / Frame-Based formats.
+//!   <https://www.usb.org/document-library/video-class-v15-document-set>
 //!
 //! No GPL Linux source consulted.
 //!

@@ -6,6 +6,7 @@
 //! Bus (xHCI)" Revision 1.2, May 2019. Public document. Section
 //! references throughout this file (e.g. `§5.4.5`) point at that
 //! spec. No GPL Linux source consulted.
+//!   <https://www.intel.com/content/www/us/en/products/docs/io/universal-serial-bus/extensible-host-controler-interface-usb-xhci.html>
 //!
 //! ## Targets
 //!

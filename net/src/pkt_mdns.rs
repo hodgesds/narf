@@ -6,13 +6,16 @@
 //!   §10.2 (cache-flush bit — top bit of CLASS in answers / authorities
 //!   / additionals). §18.12 (Unicast Response — top bit of QCLASS in
 //!   questions). §6 (Probing + Conflict Resolution PROBE/announcing).
+//!   <https://datatracker.ietf.org/doc/html/rfc6762>
 //! - RFC 6763 — DNS-Based Service Discovery (S. Cheshire & M.
 //!   Krochmal, Feb 2013). §4 (service-type browsing via PTR queries
 //!   for `_service._proto.local`). §6 (TXT records: key=value pairs
 //!   each prefixed by 1-byte length, packed inside one or more
 //!   character-strings inside the RDATA).
+//!   <https://datatracker.ietf.org/doc/html/rfc6763>
 //! - RFC 1035 — referenced for the underlying header / question / RR
 //!   format (the `pkt_dns` module already covers this).
+//!   <https://datatracker.ietf.org/doc/html/rfc1035>
 //!
 //! No GPL Linux source consulted.
 

@@ -1,4 +1,5 @@
 //! virtio-PCI modern transport (VirtIO 1.2 §4.1).
+//!   <https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html>
 //!
 //! The modern transport places its register surface in BAR-mapped
 //! MMIO instead of the cfg-space-resident layout the legacy

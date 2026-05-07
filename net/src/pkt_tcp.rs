@@ -4,12 +4,16 @@
 //! - RFC 9293 — Transmission Control Protocol (W. Eddy, Aug 2022).
 //!   §3.1 Header Format. §3.2 Terminology — control flags FIN/SYN/
 //!   RST/PSH/ACK/URG/ECE/CWR. §3.7.2 Connection state machine.
+//!   <https://datatracker.ietf.org/doc/html/rfc9293>
 //! - RFC 1071 — Computing the Internet Checksum. The 16-bit ones-
 //!   complement sum we reuse for the TCP pseudo-header.
+//!   <https://datatracker.ietf.org/doc/html/rfc1071>
 //! - RFC 7323 — TCP Extensions for High Performance (Window Scale
 //!   option kind 3, Timestamps option kind 8).
+//!   <https://datatracker.ietf.org/doc/html/rfc7323>
 //! - RFC 2018 — TCP Selective Acknowledgment Options (kind 4 SACK
 //!   permitted; kind 5 SACK).
+//!   <https://datatracker.ietf.org/doc/html/rfc2018>
 //!
 //! No GPL Linux source consulted.
 //!

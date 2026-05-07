@@ -5,6 +5,7 @@
 //! simpler of the two SIG-published UART transports — every
 //! packet is prefixed by a single packet-indicator byte and
 //! shares the same wire body as the USB transport.
+//!   <https://www.bluetooth.com/specifications/specs/core-specification/>
 //!
 //! No GPL Linux source consulted.
 //!

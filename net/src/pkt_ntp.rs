@@ -6,8 +6,10 @@
 //!   header). §7.5 (Packet Header Format — bit layout). §6 (NTP
 //!   timestamp format: 64-bit field, 32-bit seconds since the NTP
 //!   prime epoch + 32-bit fractional second).
+//!   <https://datatracker.ietf.org/doc/html/rfc5905>
 //! - RFC 868 — Time Protocol — kept in mind for the historical
 //!   1900-01-01 NTP prime epoch.
+//!   <https://datatracker.ietf.org/doc/html/rfc868>
 //!
 //! No GPL Linux source consulted.
 //!

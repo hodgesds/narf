@@ -2,6 +2,7 @@
 //!
 //! Spec: Bluetooth Core Specification 5.3 Vol 3 Part A. Public
 //! Bluetooth SIG document. No GPL Linux source consulted.
+//!   <https://www.bluetooth.com/specifications/specs/core-specification/>
 //!
 //! L2CAP sits between HCI ACL data and every higher-layer protocol
 //! (ATT for BLE, RFCOMM/SDP for BR/EDR, SMP for pairing). It carries

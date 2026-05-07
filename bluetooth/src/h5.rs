@@ -6,6 +6,7 @@
 //! is wrapped in a 4-byte header + optional CRC, then SLIP-
 //! escaped between framing octets so the host can recover from
 //! a missed byte.
+//!   <https://www.bluetooth.com/specifications/specs/core-specification/>
 //!
 //! No GPL Linux source consulted.
 //!

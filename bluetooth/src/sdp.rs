@@ -13,6 +13,7 @@
 //!   = 0x0009, ServiceName = 0x0100).
 //! - Bluetooth Core 5.3 Vol 4 Part E — for L2CAP context: SDP runs on
 //!   the dedicated L2CAP signalling PSM 0x0001.
+//!   <https://www.bluetooth.com/specifications/specs/core-specification/>
 //!
 //! No GPL Linux source consulted.
 //!

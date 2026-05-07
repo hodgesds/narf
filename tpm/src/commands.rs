@@ -2,6 +2,7 @@
 //!
 //! Based on TCG TPM 2.0 Library Specification, Part 3: Commands.
 //! Clean-room implementation following the wire format (§5.6).
+//!   <https://trustedcomputinggroup.org/resource/tpm-library-specification/>
 
 use crate::types::TpmError;
 use alloc::vec::Vec;

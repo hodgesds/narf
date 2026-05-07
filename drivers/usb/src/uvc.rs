@@ -3,11 +3,14 @@
 //! References (public-only):
 //! - "USB Device Class Definition for Video Devices, Revision 1.5"
 //!   (March 16, 2012) — USB-IF. Public document.
+//!   <https://www.usb.org/document-library/video-class-v15-document-set>
 //! - "USB Device Class Definition for Video Devices: Frame-based
 //!   Payload, Revision 1.5" — USB-IF. Public.
+//!   <https://www.usb.org/document-library/video-class-v15-document-set>
 //! - "USB Device Class Definition for Video Devices: Uncompressed
 //!   Payload, Revision 1.5" — USB-IF. Public. §3.1.1 declares the
 //!   Format-GUID layout for YUV2 / NV12.
+//!   <https://www.usb.org/document-library/video-class-v15-document-set>
 //!
 //! No GPL Linux source consulted.
 //!

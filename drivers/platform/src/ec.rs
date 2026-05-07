@@ -1,6 +1,7 @@
 //! ACPI Embedded Controller (EC) driver — clean-room.
 //!
 //! Spec: ACPI 6.5 §12.3 (Embedded Controller Interface).
+//!   <https://uefi.org/specs/ACPI/>
 //! The EC is the gatekeeper for laptop-specific hardware: battery, AC,
 //! thermal zones, and FN keys.
 //!

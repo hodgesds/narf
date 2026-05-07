@@ -1,6 +1,7 @@
 //! ACPI Control Method Battery driver — clean-room.
 //!
 //! Spec: ACPI 6.5 §10.2 (Control Method Batteries).
+//!   <https://uefi.org/specs/ACPI/>
 //! Uses the ACPI Embedded Controller (EC) to query battery status.
 
 use crate::ec::with_ec;

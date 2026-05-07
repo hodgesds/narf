@@ -1,10 +1,12 @@
 //! FUSE wire-format builders for FUSE-on-virtio (virtio-fs §5.11.5).
+//!   <https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html>
 //!
 //! Source: public FUSE wire-protocol documentation
 //! (`Documentation/filesystems/fuse.rst`-style content). The kernel
 //! uapi numeric values (`FUSE_*` opcodes, the `fuse_in_header`
 //! layout) are interface contract, not implementation, so they're
 //! free to re-state here.
+//!   <https://www.kernel.org/doc/html/latest/filesystems/fuse.html>
 //!
 //! `fuse_in_header` (40 bytes, all little-endian on virtio):
 //!   * 0  u32 len      — total request length, including this header

@@ -3,8 +3,11 @@
 //! References (public-only):
 //! - RFC 1035 — Domain Names — Implementation and Specification
 //!   (P. Mockapetris, Nov 1987). §4 Messages.
+//!   <https://datatracker.ietf.org/doc/html/rfc1035>
 //! - RFC 3596 — DNS Extensions to Support IP Version 6 (AAAA, type 28).
+//!   <https://datatracker.ietf.org/doc/html/rfc3596>
 //! - RFC 6891 — Extension Mechanisms for DNS (EDNS(0), OPT pseudo-RR).
+//!   <https://datatracker.ietf.org/doc/html/rfc6891>
 //!
 //! No GPL Linux source consulted.
 //!

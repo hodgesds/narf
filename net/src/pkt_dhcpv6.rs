@@ -6,8 +6,10 @@
 //!   Messages between Clients and Servers (4-byte client/server
 //!   header). §9.1 Relay Agent Messages (34-byte Relay-forw / Relay-
 //!   repl header). §21 Options.
+//!   <https://datatracker.ietf.org/doc/html/rfc8415>
 //! - RFC 3315 — DHCPv6 (kept for the original IA_NA / IA_TA layouts
 //!   that 8415 inherits unchanged).
+//!   <https://datatracker.ietf.org/doc/html/rfc3315>
 //!
 //! No GPL Linux source consulted.
 //!

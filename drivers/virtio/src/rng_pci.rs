@@ -1,4 +1,5 @@
 //! virtio-rng over modern virtio-PCI transport (VirtIO 1.2 §5.4).
+//!   <https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html>
 //!
 //! Modern virtio-rng's PCI device id is `0x1040 + 4 = 0x1044`.
 //! Single virtqueue. Driver puts a device-writable descriptor on

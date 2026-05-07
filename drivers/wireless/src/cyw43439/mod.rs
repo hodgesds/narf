@@ -18,9 +18,11 @@
 //! - **SD Specifications, Part E1: SDIO Simplified Specification
 //!   v3.00** — the SD Association's public spec for CMD52 / CMD53
 //!   and the F0 CCCR layout.
+//!   <https://www.sdcard.org/downloads/pls/>
 //! - **Bluetooth Core 5.x HCI** — the BT side rides standard HCI
 //!   framing through the same chip; we already have
 //!   `narf-bluetooth`.
+//!   <https://www.bluetooth.com/specifications/specs/core-specification/>
 //!
 //! The IOCTL/IOVAR command numbering used inside the firmware blob
 //! is not in the datasheet, but is mirrored by two

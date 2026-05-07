@@ -4,6 +4,7 @@
 //! transactions". The AUX channel is the side-band that lets the
 //! source query / configure the sink (panel EDID over native AUX,
 //! HPD events, link training command/response, …).
+//!   <https://vesa.org/vesa-standards/>
 //!
 //! ## Frame format
 //!

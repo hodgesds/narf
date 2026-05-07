@@ -4,6 +4,7 @@
 //! Firmware Upgrade, Version 1.1** (USB-IF, 5 August 2004).
 //! Public, usb.org. §3 (descriptor layout), §4 (state machine),
 //! §5 (class-specific requests), §6.1 (status block).
+//!   <https://www.usb.org/document-library/device-firmware-upgrade-11-new>
 //!
 //! No GPL Linux source consulted.
 //!

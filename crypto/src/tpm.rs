@@ -5,6 +5,7 @@
 //! (TPM Interface Specification) or CRB transport, event-log
 //! parsing, and PCR-extend coordination with `boot/`'s measured-boot
 //! chain.
+//!   <https://trustedcomputinggroup.org/resource/tpm-library-specification/>
 //!
 //! Landed here: command/response opcode tables and the
 //! `Tpm2Command` enum covering PCR_Extend / PCR_Read / GetRandom —

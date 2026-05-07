@@ -7,11 +7,14 @@
 //!   framing — NTH16 + NDP16 + datagrams), §3.3 (NTB-32),
 //!   §6.2.1 (`GET_NTB_PARAMETERS`), §7.1 (NCM Functional
 //!   Descriptor).
+//!   <https://www.usb.org/document-library/class-definitions-communication-devices-12>
 //! - **USB CDC 1.2** §5.2.3 (functional descriptor common
 //!   header). Public.
+//!   <https://www.usb.org/document-library/class-definitions-communication-devices-12>
 //! - **USB ECM 1.2** §5.4 (Ethernet Networking Functional
 //!   Descriptor — NCM reuses the MAC-address ASCII string slot).
 //!   Public.
+//!   <https://www.usb.org/document-library/class-definitions-communication-devices-12>
 //!
 //! No GPL Linux source consulted.
 //!

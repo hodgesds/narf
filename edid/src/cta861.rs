@@ -8,11 +8,14 @@
 //!   SAD format), §7.5.3 (Speaker Allocation Data Block),
 //!   §7.5.4 (Vendor Specific Data Block / VSDB),
 //!   §7.5.6 (Extended Tag Code Data Blocks).
+//!   <https://standards.cta.tech/>
 //! - HDMI Specification 1.4b §8.3.2 — HDMI VSDB IEEE OUI 0x000C03 and
 //!   the byte layout that follows the OUI inside a CTA VSDB.
+//!   <https://www.hdmi.org/spec/index>
 //! - VESA E-EDID 1.4 — base block carries `extension_count` at offset
 //!   126; each subsequent 128-byte block has tag 0x02 if it is a CTA
 //!   extension.
+//!   <https://vesa.org/vesa-standards/>
 //!
 //! No GPL Linux source consulted.
 //!

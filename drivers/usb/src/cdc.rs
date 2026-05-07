@@ -6,6 +6,7 @@
 //!   1.2, Errata 1** (USB-IF, November 2010 / errata July 2012).
 //!   Public document, usb.org. §3 architecture, §5.2 functional
 //!   descriptors, §5.3 interface descriptors.
+//!   <https://www.usb.org/document-library/class-definitions-communication-devices-12>
 //! - **USB Specification 2.0** §9 (standard descriptors). Public.
 //!
 //! No GPL Linux source consulted.

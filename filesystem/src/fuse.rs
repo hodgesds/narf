@@ -5,6 +5,7 @@
 //! request/response virtqueue. The kernel acts as a FUSE *client*
 //! — it builds requests, submits them through the virtqueue, and
 //! parses responses back into `narf_filesystem` types.
+//!   <https://www.kernel.org/doc/html/latest/filesystems/fuse.html>
 //!
 //! This module pins the opcode table + the struct shapes that the
 //! Stage-4 virtiofs driver will serialize/deserialize. No actual

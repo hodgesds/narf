@@ -4,6 +4,7 @@
 //! Training Sequence". Public document. Implements the
 //! source-side state machine that drives a sink through clock
 //! recovery (CR) + channel equalization (EQ).
+//!   <https://vesa.org/vesa-standards/>
 //!
 //! ## State machine
 //!

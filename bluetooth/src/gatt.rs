@@ -2,6 +2,7 @@
 //!
 //! Spec: Bluetooth Core Specification 5.3 Vol 3 Part G. Public
 //! Bluetooth SIG document. No GPL Linux source consulted.
+//!   <https://www.bluetooth.com/specifications/specs/core-specification/>
 //!
 //! GATT models a server's attribute database as a hierarchy:
 //!

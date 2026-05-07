@@ -1,4 +1,5 @@
 //! virtio-net over modern virtio-PCI transport (VirtIO 1.2 §5.1).
+//!   <https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html>
 //!
 //! Modern virtio-net's PCI device id is `0x1000 + 0x40 + 0x01`
 //! = 0x1041 (`0x1040 + virtio_id`, virtio_id 1 = net).

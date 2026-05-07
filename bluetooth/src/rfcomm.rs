@@ -5,6 +5,7 @@
 //!   §1 framing, §2 Multiplexer Control, §5.2 frame format,
 //!   §5.3 frame-type codes, §5.1.1 address byte, §5.1.2 control
 //!   byte, §5.1.3 length indicator, §5.1.4 FCS.
+//!   <https://www.bluetooth.com/specifications/specs/core-specification/>
 //! - ETSI TS 07.10 — the underlying multiplexed-serial protocol that
 //!   RFCOMM adapts. Public ETSI document; only the byte layout is
 //!   referenced here.

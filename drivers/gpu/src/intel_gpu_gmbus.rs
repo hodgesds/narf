@@ -24,6 +24,7 @@
 //! "read N bytes from slave 0x50" transaction (the standard E-EDID
 //! DDC read). The actual MMIO write + STATUS poll lives in the
 //! Stage-3 driver core when it lands.
+//!   <https://vesa.org/vesa-standards/>
 
 use core::convert::TryFrom;
 

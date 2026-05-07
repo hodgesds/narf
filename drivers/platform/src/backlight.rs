@@ -1,6 +1,7 @@
 //! ACPI Display Backlight driver — clean-room.
 //!
 //! Spec: ACPI 6.5 §B.6 (Output Device-specific methods, video extensions).
+//!   <https://uefi.org/specs/ACPI/>
 //!
 //! Three methods on each video-output device:
 //! - `_BCL` — *Brightness Control Levels*. Returns a `Package` of

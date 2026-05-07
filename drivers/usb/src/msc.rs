@@ -5,9 +5,11 @@
 //! - "Universal Serial Bus Mass Storage Class Bulk-Only Transport"
 //!   Revision 1.0, 31 September 1999. Public document, usb.org.
 //!   Section numbers below (`§3.x`) refer to this spec.
+//!   <https://www.usb.org/document-library/mass-storage-bulk-only-10>
 //! - "SCSI Block Commands - 3 (SBC-3)" — for the embedded SCSI
 //!   command opcodes (`READ(10)` / `WRITE(10)` / `INQUIRY` /
 //!   `READ CAPACITY(10)`).
+//!   <https://www.t10.org/drafts.htm#SCSI3_SBC>
 //!
 //! ## Protocol shape (§3 BOT)
 //!

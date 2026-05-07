@@ -1,4 +1,5 @@
 //! virtio-console over modern virtio-PCI transport (VirtIO 1.2 §5.3).
+//!   <https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html>
 //!
 //! Modern PCI device id = `0x1040 + virtio_device_id`; virtio-console
 //! is type 3, so the modern id is `0x1043`. The legacy id `0x1003`

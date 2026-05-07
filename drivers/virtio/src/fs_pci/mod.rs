@@ -1,4 +1,5 @@
 //! virtio-fs over modern virtio-PCI transport (VirtIO 1.2 §5.11).
+//!   <https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html>
 //!
 //! Modern virtio-fs PCI device id: `0x1040 + 26 = 0x105A` (§4.1.2,
 //! virtio device type 26).
@@ -6,6 +7,7 @@
 //! Live surface: §5.11.4 device-cfg decode + bring-up of hiprioq
 //! (queue 0) + first request queue (queue 1) + FUSE-on-virtio
 //! request submission. The FUSE wire format itself is in `fuse.rs`.
+//!   <https://www.kernel.org/doc/html/latest/filesystems/fuse.html>
 
 pub mod config;
 pub mod fuse;

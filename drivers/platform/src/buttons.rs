@@ -2,6 +2,7 @@
 //!
 //! Two delivery paths per ACPI 6.5 §4.8.3.1 (Fixed Hardware) and
 //! §9.5 (Control-Method Power/Sleep Buttons):
+//!   <https://uefi.org/specs/ACPI/>
 //!
 //! - **Fixed hardware** — PWRBTN_STS / SLPBTN_STS bits in the PM1
 //!   status register fire on press; the SCI dispatcher in `ec.rs`

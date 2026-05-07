@@ -5,12 +5,16 @@
 //!   1997). §2 (BOOTP-derived header layout: op/htype/hlen/hops/xid/
 //!   secs/flags/ciaddr/yiaddr/siaddr/giaddr/chaddr/sname/file).
 //!   §3.1 protocol summary, §4.1 client/server message types.
+//!   <https://datatracker.ietf.org/doc/html/rfc2131>
 //! - RFC 2132 — DHCP Options and BOOTP Vendor Extensions
 //!   (S. Alexander & R. Droms, Mar 1997). All numbered options.
+//!   <https://datatracker.ietf.org/doc/html/rfc2132>
 //! - RFC 951 — BOOTP base (the 236-byte fixed payload + 64-byte
 //!   sname + 128-byte file → total 240 bytes before options).
+//!   <https://datatracker.ietf.org/doc/html/rfc951>
 //! - RFC 1497 — magic cookie 0x63 0x82 0x53 0x63 prefixing the
 //!   options area.
+//!   <https://datatracker.ietf.org/doc/html/rfc1497>
 //!
 //! No GPL Linux source consulted.
 //!

@@ -3,6 +3,9 @@
 //! Clean-room implementations of standardised platform devices
 //! whose specs are public (Intel ICH SMBus, TPM 2.0). Each driver
 //! lives in its own module + registers via Stage::Subsys initcalls.
+//!
+//! - ACPI: <https://uefi.org/specs/ACPI/>
+//! - TPM 2.0: <https://trustedcomputinggroup.org/resource/tpm-library-specification/>
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]

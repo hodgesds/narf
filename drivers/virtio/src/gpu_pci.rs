@@ -1,4 +1,5 @@
 //! virtio-gpu over modern virtio-PCI transport (VirtIO 1.2 §5.7).
+//!   <https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html>
 //!
 //! Modern virtio-gpu PCI device id: `0x1040 + 16 = 0x1050`. Two
 //! virtqueues:

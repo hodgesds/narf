@@ -12,6 +12,7 @@
 //!   subbands / allocation method bitmasks).
 //! - Bluetooth Core 5.3 Vol 3 Part A — L2CAP. AVDTP messages travel
 //!   over a dedicated L2CAP channel (PSM 0x0019).
+//!   <https://www.bluetooth.com/specifications/specs/core-specification/>
 //!
 //! No GPL Linux source consulted.
 //!

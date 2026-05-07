@@ -1,5 +1,6 @@
 //! virtio-scsi wire format — pure-data encode/decode (VirtIO 1.2
 //! §5.6.6).
+//!   <https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html>
 //!
 //! Default sizes from §5.6.4: `cdb_size = 32`, `sense_size = 96`
 //! unless renegotiated via the device-config write path. Stage 2 hard-

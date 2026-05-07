@@ -2,6 +2,7 @@
 //!
 //! Spec: Bluetooth Core Specification 5.3 Vol 3 Part H. Public
 //! Bluetooth SIG document. No GPL Linux source consulted.
+//!   <https://www.bluetooth.com/specifications/specs/core-specification/>
 //!
 //! SMP runs on L2CAP fixed CID 0x0006 (LE) / 0x0007 (BR/EDR Cross-
 //! Transport Key Derivation). It owns the pairing handshake that

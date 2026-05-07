@@ -7,11 +7,14 @@
 //!   forms when nibble = 13 / 14). §4 Message Transmission. §5
 //!   Request/Response Semantics. §12.1 Message Codes (request
 //!   methods 0.01..0.04 and response codes class.detail).
+//!   <https://datatracker.ietf.org/doc/html/rfc7252>
 //! - RFC 7959 — CoAP Block-Wise Transfers (mentioned for the Block1
 //!   / Block2 / Size1 / Size2 option numbers; the codec here doesn't
 //!   tie to block semantics).
+//!   <https://datatracker.ietf.org/doc/html/rfc7959>
 //! - RFC 8323 — CoAP over TCP / TLS / WebSockets (the byte format
 //!   in this module is the UDP form; TCP layer adds a length prefix).
+//!   <https://datatracker.ietf.org/doc/html/rfc8323>
 //!
 //! No GPL Linux source consulted.
 //!

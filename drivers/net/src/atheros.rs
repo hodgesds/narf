@@ -9,6 +9,7 @@
 //!   the USB-side register layout for the AR9170, used in early
 //!   "Otus" reference dongles.
 //! - **IEEE Std 802.11-2020** — frame layout the MAC speaks.
+//!   <https://standards.ieee.org/ieee/802.11/7028/>
 //!
 //! No GPL Linux `drivers/net/wireless/ath/` or vendor SDK source
 //! consulted. The protocol-layer code (frame builders, MLME state)

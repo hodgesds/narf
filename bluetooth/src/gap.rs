@@ -13,6 +13,7 @@
 //!   Interval Range = 0x12, Service Data 16-bit UUID = 0x16, Public
 //!   Target Address = 0x17, Appearance = 0x19, Manufacturer Specific
 //!   Data = 0xFF).
+//!   <https://www.bluetooth.com/specifications/specs/core-specification/>
 //!
 //! No GPL Linux source consulted.
 //!

@@ -1,4 +1,5 @@
 //! virtio-balloon over modern virtio-PCI transport (VirtIO 1.2 §5.5).
+//!   <https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html>
 //!
 //! Modern virtio-balloon's PCI device id is `0x1040 + 5 = 0x1045`.
 //! Two virtqueues:

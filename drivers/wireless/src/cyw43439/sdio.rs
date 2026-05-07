@@ -8,6 +8,7 @@
 //!   v3.00** (public, SD Association). Defines CMD52 (single-byte
 //!   I/O) and CMD53 (multi-byte / block I/O) plus the F0 Common
 //!   Card Information (CCCR) register layout the chip honours.
+//!   <https://www.sdcard.org/downloads/pls/>
 //!
 //! This module provides the codec-only pieces: argument-word
 //! packing for CMD52 / CMD53 and the symbolic addresses of the F0

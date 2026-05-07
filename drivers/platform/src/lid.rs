@@ -1,6 +1,7 @@
 //! ACPI Lid Switch driver — clean-room.
 //!
 //! Spec: ACPI 6.5 §9.4.1 (Control-Method Lid Device, `_HID = "PNP0C0D"`).
+//!   <https://uefi.org/specs/ACPI/>
 //!
 //! The lid is a binary "open/closed" switch. Its state is queried via
 //! the device's `_LID` method (returns 0 for closed, 1 for open).

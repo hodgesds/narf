@@ -6,6 +6,7 @@
 //!   0x8100 for the Customer VLAN tag and 0x88A8 for the
 //!   Service VLAN tag / S-tag — "QinQ"). §9.6.2 TCI layout
 //!   (PCP / DEI / VID).
+//!   <https://standards.ieee.org/ieee/802.1Q/6844/>
 //! - **IEEE 802.1AB-2016** — Station and Media Access Control
 //!   Connectivity Discovery (LLDP). §8.1 (LLDP EtherType 0x88CC).
 //!   §8.4 (TLV format — 7-bit Type + 9-bit Length packed in
@@ -13,6 +14,7 @@
 //!   Port ID, Time-To-Live; End-of-LLDPDU sentinel). §8.5.5–9
 //!   (optional TLVs: System Name, System Description, Port
 //!   Description, System Capabilities, Management Address).
+//!   <https://standards.ieee.org/ieee/802.3/7071/>
 //!
 //! No GPL Linux source consulted.
 //!

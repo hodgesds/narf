@@ -5,18 +5,22 @@
 //!   (S. Deering & R. Hinden, July 2017). §3 IPv6 Header Format.
 //!   §4.4 Routing / Hop-by-Hop / Fragment / Destination Options
 //!   extension headers (we surface the Next Header chain only).
+//!   <https://datatracker.ietf.org/doc/html/rfc8200>
 //! - RFC 4443 — Internet Control Message Protocol (ICMPv6) for the
 //!   IPv6 Specification. §2.1 Message General Format. §3 Error
 //!   Messages. §4 Informational Messages (Echo Request / Reply).
+//!   <https://datatracker.ietf.org/doc/html/rfc4443>
 //! - RFC 4861 — Neighbor Discovery for IP version 6.
 //!   §4.1 Router Solicitation, §4.2 Router Advertisement,
 //!   §4.3 Neighbor Solicitation, §4.4 Neighbor Advertisement,
 //!   §4.5 Redirect. §4.6 Option Formats — Source / Target Link-Layer
 //!   Address (types 1 / 2), Prefix Information (3), Redirect Header
 //!   (4), MTU (5).
+//!   <https://datatracker.ietf.org/doc/html/rfc4861>
 //! - RFC 1071 — Internet checksum mechanism reused for the IPv6
 //!   pseudo-header (40 bytes: src 16 + dst 16 + length 4 + zero 3
 //!   + next-header 1, see RFC 8200 §8.1).
+//!   <https://datatracker.ietf.org/doc/html/rfc1071>
 //!
 //! No GPL Linux source consulted.
 

@@ -2,6 +2,7 @@
 //!
 //! Spec: Bluetooth Core Specification 5.3 Vol 3 Part F. Public
 //! Bluetooth SIG document. No GPL Linux source consulted.
+//!   <https://www.bluetooth.com/specifications/specs/core-specification/>
 //!
 //! ATT carries attribute reads/writes between client and server over
 //! L2CAP fixed CID 0x0004 (BLE) — every BLE GATT operation is one or

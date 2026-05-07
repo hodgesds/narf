@@ -1,4 +1,5 @@
 //! virtio-fs device-specific config (VirtIO 1.2 §5.11.4).
+//!   <https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html>
 //!
 //! Layout (little-endian):
 //!   * offset 0  : `tag[36]: u8` — UTF-8 mount tag, NUL-padded.

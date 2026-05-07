@@ -3,8 +3,10 @@
 //! Spec sources (public only):
 //! - Bluetooth Core Specification 5.3, Vol 4 Part E (HCI Functional
 //!   Specification) — Bluetooth SIG.
+//!   <https://www.bluetooth.com/specifications/specs/core-specification/>
 //! - Bluetooth Core Specification 5.3, Vol 4 Part B (USB Transport
 //!   Layer) — Bluetooth SIG.
+//!   <https://www.bluetooth.com/specifications/specs/core-specification/>
 //! - USB Class Definitions for Wireless Controllers v1.0, USB-IF
 //!   (class 0xE0, subclass 0x01, protocol 0x01).
 //!

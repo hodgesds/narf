@@ -1,6 +1,7 @@
 //! narf-drivers-virtio — Virtqueue (Split Virtqueue) implementation.
 //!
 //! Spec: VirtIO 1.2 §3.2.1 "Split Virtqueues".
+//!   <https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html>
 
 use core::sync::atomic::{compiler_fence, Ordering};
 use narf_memory::PAGE_SIZE;

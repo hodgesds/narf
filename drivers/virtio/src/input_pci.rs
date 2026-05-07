@@ -1,4 +1,5 @@
 //! virtio-input over modern virtio-PCI transport (VirtIO 1.2 §5.8).
+//!   <https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html>
 //!
 //! Modern virtio-input PCI device id: `0x1040 + 18 = 0x1052`.
 //! Two virtqueues:

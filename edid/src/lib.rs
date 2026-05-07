@@ -2,7 +2,9 @@
 //!
 //! References (public-only):
 //! - VESA Enhanced EDID Standard, Release A Revision 2 (Sep 2006).
+//!   <https://vesa.org/vesa-standards/>
 //! - VESA DDC Standard 1.0 (the I²C transport).
+//!   <https://vesa.org/vesa-standards/>
 //! - Microsoft PNP ID registry (manufacturer 3-char codes).
 //!
 //! No GPL Linux source consulted.

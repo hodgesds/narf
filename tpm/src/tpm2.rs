@@ -9,6 +9,7 @@
 //!   sessions; §10.5 TPMU_HA hash unions.
 //!   Part 3 §9 (TPM2_Startup), §16 (TPM2_GetRandom), §22 (TPM2_PCR_Read,
 //!   TPM2_PCR_Extend), §30 (TPM2_GetCapability).
+//!   <https://trustedcomputinggroup.org/resource/tpm-library-specification/>
 //!
 //! No GPL Linux source consulted.
 //!

@@ -1,4 +1,5 @@
 //! virtio-sound over modern virtio-PCI transport (VirtIO 1.2 §5.14).
+//!   <https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html>
 //!
 //! Modern virtio-sound's PCI device id is `0x1040 + 25 = 0x1059`.
 //! Four virtqueues:

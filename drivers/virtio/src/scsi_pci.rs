@@ -1,4 +1,5 @@
 //! virtio-scsi over modern virtio-PCI transport (VirtIO 1.2 §5.6).
+//!   <https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html>
 //!
 //! Modern transitional virtio-scsi PCI device id: `0x1040 + 8 = 0x1048`.
 //!

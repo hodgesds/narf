@@ -1,6 +1,7 @@
 //! Cooling-device drivers — ACPI Fan + PWM Fan.
 //!
 //! Spec: ACPI 6.5 §11.3 (Fan Device, _HID `PNP0C0B`).
+//!   <https://uefi.org/specs/ACPI/>
 //!
 //! Two driver shapes live here:
 //!

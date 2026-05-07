@@ -11,9 +11,11 @@
 //!   §3.3.10 ERROR (9), §3.3.11 COOKIE ECHO (10), §3.3.12 COOKIE
 //!   ACK (11), §3.3.13 ECNE / CWR (12 / 13), §3.3.14 SHUTDOWN
 //!   COMPLETE (14), §3.3.20 PAD (132).
+//!   <https://datatracker.ietf.org/doc/html/rfc9260>
 //! - RFC 3309 — SCTP Checksum (CRC32C, polynomial 0x1EDC6F41). The
 //!   computation runs over the whole packet (common header + all
 //!   chunks) with the checksum field zeroed.
+//!   <https://datatracker.ietf.org/doc/html/rfc3309>
 //!
 //! No GPL Linux source consulted.
 //!

@@ -4,6 +4,7 @@
 //!
 //! Reference: VESA DisplayPort 1.4a §2.7.6 (I²C-over-AUX) +
 //! VESA E-EDID 1.4 §3.
+//!   <https://vesa.org/vesa-standards/>
 //!
 //! ## Wire shape
 //!
