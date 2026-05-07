@@ -414,3 +414,58 @@ arbitration rule remains 1:1 at the kernel boundary.
 ## 10. Open questions
 
 (none — all v0.1 questions resolved in §8)
+
+## 11. L4 codecs (`pkt_udp`, `pkt_tcp`, `pkt_ipv6`, `pkt_dns`)
+
+The `net/` crate ships clean-room codecs for the wire-format layers
+above Ethernet/ARP/IPv4/ICMP that `pkt.rs` already covered.
+References (public-only, all IETF documents):
+
+### UDP (`pkt_udp`)
+- **RFC 768** — User Datagram Protocol (J. Postel, Aug 1980).
+- **RFC 1071** — Computing the Internet Checksum (mechanism reused
+  for the UDP pseudo-header sum).
+- Surfaced: `UdpHeader::encode/decode`, `ipv4_pseudo_checksum`,
+  `build_ipv4`, `verify_ipv4` (with the RFC 768 "0 = disabled,
+  computed-0 → 0xFFFF" rule).
+
+### TCP (`pkt_tcp`)
+- **RFC 9293** — Transmission Control Protocol (W. Eddy, Aug 2022).
+  §3.1 Header Format. §3.2 Control flags FIN/SYN/RST/PSH/ACK/URG/
+  ECE/CWR.
+- **RFC 7323** — TCP Extensions for High Performance — Window Scale
+  (kind 3) + Timestamps (kind 8).
+- **RFC 2018** — TCP Selective Acknowledgement Options (kind 4
+  SACK Permitted, kind 5 SACK).
+- Surfaced: `TcpHeader::encode/decode`, `iter_options` returning
+  `TcpOption::{Mss, WindowScale, SackPermitted, Timestamps,
+  Other}`, `ipv4_pseudo_checksum` + `verify_ipv4`, `build_syn` /
+  `build_rst` builders. Flag-bit constants `FLAG_FIN..FLAG_CWR`.
+
+### IPv6 + ICMPv6 ND (`pkt_ipv6`)
+- **RFC 8200** — IPv6 base specification. §3 fixed header, §8.1
+  pseudo-header for upper-layer checksums.
+- **RFC 4443** — ICMPv6. §2.1 message general format, §3 error
+  messages, §4 echo request/reply.
+- **RFC 4861** — Neighbor Discovery for IPv6. §4.1–4.5 message
+  layouts (Router Solicitation / Advertisement, Neighbor
+  Solicitation / Advertisement, Redirect). §4.6 option formats
+  (Source / Target Link-Layer Address, Prefix Information, MTU).
+- Surfaced: `Ipv6Header::encode/decode`, `pseudo_checksum`,
+  `Icmpv6Header`, ND option iterator + appender, message builders
+  for RS / NS / NA (with R/S/O flags) / RA (with M/O flags +
+  CurHopLimit + Router Lifetime + Reachable / Retrans timers).
+
+### DNS (`pkt_dns`)
+- **RFC 1035** — Domain Names — Implementation and Specification
+  (P. Mockapetris, Nov 1987). §4 messages, §4.1.4 name
+  compression (length-prefixed labels + 0xC0xx 14-bit pointer).
+- **RFC 3596** — DNS Extensions to Support IPv6 (TYPE_AAAA = 28).
+- **RFC 6891** — EDNS(0) (TYPE_OPT = 41).
+- Surfaced: `DnsHeader::encode/decode` with opcode + rcode +
+  flag-bit accessors, `encode_name` / `decode_name` (with hop-
+  capped pointer-chasing), `Question` + `ResourceRecord`
+  encode/decode, `build_a_query` convenience, opcode + rcode +
+  RR type + class constants.
+
+**No GPL Linux source consulted.**

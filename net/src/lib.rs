@@ -45,6 +45,10 @@
 extern crate alloc;
 
 pub mod pkt;
+pub mod pkt_dns;
+pub mod pkt_ipv6;
+pub mod pkt_tcp;
+pub mod pkt_udp;
 pub mod stack;
 pub use stack::{AdminCap, AttachError, StackAttach, StackAttachReply, StackDaemon};
 
