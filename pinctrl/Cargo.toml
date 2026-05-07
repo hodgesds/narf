@@ -1,0 +1,21 @@
+[package]
+name         = "narf-pinctrl"
+description  = "Transport-neutral pin-mux + GPIO + SPMI/PMIC codecs. Clean-room from public MIPI SPMI, DesignWare APB GPIO, and Qualcomm PMIC peripheral docs."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_pinctrl"
+path = "src/lib.rs"
+
+[dependencies]
+narf-kernel-test  = { path = "../verification/kernel-test" }
+
+[features]
+kernel-test = []
+
+[lints]
+workspace = true

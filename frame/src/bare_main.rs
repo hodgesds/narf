@@ -20,6 +20,7 @@ extern crate alloc;
 extern crate narf_bluetooth as _;
 extern crate narf_edid as _;
 extern crate narf_hid as _;
+extern crate narf_pinctrl as _;
 
 use core::fmt::Write;
 use core::panic::PanicInfo;

@@ -44,6 +44,7 @@ narf-audio           = { path = "../audio" }
 narf-bluetooth       = { path = "../bluetooth" }
 narf-edid            = { path = "../edid" }
 narf-hid             = { path = "../hid" }
+narf-pinctrl         = { path = "../pinctrl" }
 narf-usbpd           = { path = "../usbpd" }
 narf-drivers-usbpd   = { path = "../drivers/usbpd" }
 narf-wireless        = { path = "../wireless" }
@@ -79,6 +80,7 @@ kernel-test  = [
     "narf-bluetooth/kernel-test",
     "narf-edid/kernel-test",
     "narf-hid/kernel-test",
+    "narf-pinctrl/kernel-test",
     "narf-usbpd/kernel-test",
     "narf-drivers-usbpd/kernel-test",
     "narf-wireless/kernel-test",

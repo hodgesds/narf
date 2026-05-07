@@ -63,6 +63,7 @@ members = [
     "hid",
     "usbpd",
     "pwm",
+    "pinctrl",
     "shmem",
     "compat/win",
     "compat/win-rt",
