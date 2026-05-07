@@ -2943,3 +2943,149 @@ fn smoke_wireguard_anti_replay_window() -> TestResult {
 }
 
 kernel_test_in!("net/wireguard", smoke_wireguard_anti_replay_window);
+
+
+
+// ── QUIC + HTTP/3 ─────────────────────────────────────────────────
+
+
+
+fn smoke_quic_varint_round_trip() -> TestResult {
+
+    use crate::quic::{varint_decode, varint_encode};
+
+    let cases = [0u64, 1, 63, 64, 16_383, 16_384, 1_073_741_823, 1_073_741_824, 4_611_686_018_427_387_903];
+
+    for v in cases {
+
+        let enc = varint_encode(v);
+
+        let (d, n) = varint_decode(&enc).expect("decode");
+
+        if d != v || n != enc.len() {
+
+            return TestResult::Fail("varint round-trip");
+
+        }
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("net/quic", smoke_quic_varint_round_trip);
+
+
+
+fn smoke_quic_varint_uses_minimum_encoding() -> TestResult {
+
+    use crate::quic::varint_encode;
+
+    if varint_encode(0).len() != 1 || varint_encode(63).len() != 1 {
+
+        return TestResult::Fail("<=63 must be 1 byte");
+
+    }
+
+    if varint_encode(64).len() != 2 || varint_encode(16383).len() != 2 {
+
+        return TestResult::Fail("14-bit form must be 2 bytes");
+
+    }
+
+    if varint_encode(16384).len() != 4 {
+
+        return TestResult::Fail("30-bit form must be 4 bytes");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("net/quic", smoke_quic_varint_uses_minimum_encoding);
+
+
+
+fn smoke_quic_long_header_decodes() -> TestResult {
+
+    use crate::quic::{decode_long_header, first_byte_long, LongPacketType};
+
+    let mut buf = alloc::vec::Vec::new();
+
+    buf.push(first_byte_long(LongPacketType::Initial, 0b0011)); // PNL = 4
+
+    buf.extend_from_slice(&0x0000_0001u32.to_be_bytes()); // version
+
+    buf.push(8); // dcid len
+
+    buf.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+
+    buf.push(0); // scid len
+
+    let (h, _) = decode_long_header(&buf).expect("decode");
+
+    if h.packet_type != LongPacketType::Initial { return TestResult::Fail("ptype"); }
+
+    if h.version != 1 { return TestResult::Fail("version"); }
+
+    if h.dest_cid.len() != 8 || h.dest_cid[0] != 1 { return TestResult::Fail("dcid"); }
+
+    if !h.src_cid.is_empty() { return TestResult::Fail("scid"); }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("net/quic", smoke_quic_long_header_decodes);
+
+
+
+fn smoke_quic_connection_close_frame() -> TestResult {
+
+    use crate::quic::{build_connection_close, FrameType, varint_decode};
+
+    let f = build_connection_close(0x100, 0, b"test");
+
+    if f[0] != FrameType::ConnectionCloseQuic as u8 { return TestResult::Fail("type byte"); }
+
+    let (code, n) = varint_decode(&f[1..]).expect("code");
+
+    if code != 0x100 { return TestResult::Fail("error code"); }
+
+    let (frame_type, n2) = varint_decode(&f[1 + n..]).expect("frame_type");
+
+    if frame_type != 0 { return TestResult::Fail("frame_type"); }
+
+    let (rlen, _) = varint_decode(&f[1 + n + n2..]).expect("reason");
+
+    if rlen != 4 { return TestResult::Fail("reason length"); }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("net/quic", smoke_quic_connection_close_frame);
+
+
+
+fn smoke_h3_frame_round_trip() -> TestResult {
+
+    use crate::quic::{build_h3_frame, decode_h3_frame, H3FrameType};
+
+    let payload = b"hello";
+
+    let buf = build_h3_frame(H3FrameType::Data as u64, payload);
+
+    let (ty, body) = decode_h3_frame(&buf).expect("decode");
+
+    if ty != H3FrameType::Data as u64 { return TestResult::Fail("type"); }
+
+    if body != payload { return TestResult::Fail("body"); }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("net/h3", smoke_h3_frame_round_trip);

@@ -64,6 +64,7 @@ pub mod pkt_tftp;
 pub mod pkt_udp;
 pub mod stack;
 pub mod stun;
+pub mod quic;
 pub mod tls;
 pub mod wireguard;
 pub mod ws;
