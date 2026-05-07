@@ -229,3 +229,161 @@ fn smoke_generic_fb_discovery() -> TestResult {
     TestResult::Skip("no framebuffer backend picked")
 }
 kernel_test_in!("drivers/graphics", smoke_generic_fb_discovery);
+
+
+
+// ── WBDI / MS OS 2.0 Descriptor recogniser ────────────────────────
+
+
+
+fn smoke_wbdi_set_header_decode() -> TestResult {
+
+    use crate::wbdi::{desc_type, SetHeader};
+
+    let mut buf = [0u8; 10];
+
+    buf[0..2].copy_from_slice(&10u16.to_le_bytes());
+
+    buf[2..4].copy_from_slice(&desc_type::SET_HEADER_DESCRIPTOR.to_le_bytes());
+
+    buf[4..8].copy_from_slice(&0x0603_0000u32.to_le_bytes()); // NTDDI_WIN8_1
+
+    buf[8..10].copy_from_slice(&30u16.to_le_bytes()); // total = 10 + 20 (one CompatibleID)
+
+    let h = SetHeader::decode(&buf).expect("hdr");
+
+    if h.total_length != 30 || h.windows_version != 0x0603_0000 {
+
+        return TestResult::Fail("header decode");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("drivers/input/wbdi", smoke_wbdi_set_header_decode);
+
+
+
+fn smoke_wbdi_recogniser_accepts_winusb_wbdi() -> TestResult {
+
+    use crate::wbdi::{desc_type, is_wbdi, COMPATIBLE_ID_WINUSB, SUB_COMPATIBLE_ID_WBDI};
+
+    let mut blob = alloc::vec::Vec::new();
+
+    // SetHeader (10 bytes)
+
+    blob.extend_from_slice(&10u16.to_le_bytes());
+
+    blob.extend_from_slice(&desc_type::SET_HEADER_DESCRIPTOR.to_le_bytes());
+
+    blob.extend_from_slice(&0x0603_0000u32.to_le_bytes());
+
+    blob.extend_from_slice(&30u16.to_le_bytes());
+
+    // CompatibleID feature (20 bytes)
+
+    blob.extend_from_slice(&20u16.to_le_bytes());
+
+    blob.extend_from_slice(&desc_type::FEATURE_COMPATIBLE_ID.to_le_bytes());
+
+    blob.extend_from_slice(COMPATIBLE_ID_WINUSB);
+
+    blob.extend_from_slice(SUB_COMPATIBLE_ID_WBDI);
+
+    if !is_wbdi(&blob) {
+
+        return TestResult::Fail("WBDI compatible-id should match");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("drivers/input/wbdi", smoke_wbdi_recogniser_accepts_winusb_wbdi);
+
+
+
+fn smoke_wbdi_find_interface_in_vendor_class_config() -> TestResult {
+
+    use crate::wbdi::{desc_type, find_wbdi_interface, COMPATIBLE_ID_WINUSB, SUB_COMPATIBLE_ID_WBDI};
+
+    // OS desc set: WBDI.
+
+    let mut ms = alloc::vec::Vec::new();
+
+    ms.extend_from_slice(&10u16.to_le_bytes());
+
+    ms.extend_from_slice(&desc_type::SET_HEADER_DESCRIPTOR.to_le_bytes());
+
+    ms.extend_from_slice(&0x0603_0000u32.to_le_bytes());
+
+    ms.extend_from_slice(&30u16.to_le_bytes());
+
+    ms.extend_from_slice(&20u16.to_le_bytes());
+
+    ms.extend_from_slice(&desc_type::FEATURE_COMPATIBLE_ID.to_le_bytes());
+
+    ms.extend_from_slice(COMPATIBLE_ID_WINUSB);
+
+    ms.extend_from_slice(SUB_COMPATIBLE_ID_WBDI);
+
+    // USB cfg: vendor-class iface 5.
+
+    let cfg: [u8; 18] = [
+
+        9, 2, 18, 0, 1, 1, 0, 0xA0, 0,
+
+        9, 4, 5, 0, 1, 0xFF, 0xFF, 0xFF, 0, // 9-byte interface descriptor
+
+    ];
+
+    match find_wbdi_interface(&cfg, &ms) {
+
+        Some(5) => TestResult::Pass,
+
+        _ => TestResult::Fail("interface number wrong"),
+
+    }
+
+}
+
+kernel_test_in!("drivers/input/wbdi", smoke_wbdi_find_interface_in_vendor_class_config);
+
+
+
+fn smoke_wbdi_recogniser_rejects_non_wbdi() -> TestResult {
+
+    use crate::wbdi::{desc_type, is_wbdi};
+
+    let mut blob = alloc::vec::Vec::new();
+
+    blob.extend_from_slice(&10u16.to_le_bytes());
+
+    blob.extend_from_slice(&desc_type::SET_HEADER_DESCRIPTOR.to_le_bytes());
+
+    blob.extend_from_slice(&0x0603_0000u32.to_le_bytes());
+
+    blob.extend_from_slice(&30u16.to_le_bytes());
+
+    blob.extend_from_slice(&20u16.to_le_bytes());
+
+    blob.extend_from_slice(&desc_type::FEATURE_COMPATIBLE_ID.to_le_bytes());
+
+    blob.extend_from_slice(b"WINUSB\0\0");
+
+    blob.extend_from_slice(b"OTHER\0\0\0");
+
+    if is_wbdi(&blob) {
+
+        return TestResult::Fail("sub-id mismatch must reject");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("drivers/input/wbdi", smoke_wbdi_recogniser_rejects_non_wbdi);
