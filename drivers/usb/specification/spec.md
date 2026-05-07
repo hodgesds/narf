@@ -71,6 +71,17 @@ All driver code is derived strictly from the references below.
   (USB-IF, February 2007). Public. §5.4 (Ethernet Networking
   Functional Descriptor), §6.2 (class-specific requests).
 
+### USB DFU (Device Firmware Upgrade)
+
+- **USB Device Class Specification for Device Firmware Upgrade,
+  Version 1.1** (USB-IF, 5 August 2004). Public, usb.org. §3.1
+  (class triple — class 0xFE, subclass 0x01, protocol 0x01/0x02
+  for runtime / DFU mode), §4.1.3 (DFU Functional Descriptor —
+  bmAttributes / wDetachTimeOut / wTransferSize / bcdDFUVersion),
+  §4.1.4 + §6.1.2 (state machine + status block layout), §5
+  (class-specific requests: DETACH, DNLOAD, UPLOAD, GETSTATUS,
+  CLRSTATUS, GETSTATE, ABORT).
+
 ### USB Audio Class 1.0
 
 - **Universal Serial Bus Device Class Definition for Audio Devices,
@@ -125,6 +136,13 @@ All driver code is derived strictly from the references below.
   stop bits), `SET_LINE_CODING` / `GET_LINE_CODING` /
   `SET_CONTROL_LINE_STATE` setup-packet builders, `SerialState`
   notification decoder, ACM functional-descriptor capability bits.
+- **DFU** (`dfu`): USB Device Firmware Upgrade 1.1 codec.
+  Class triple constants for runtime + DFU modes, DFU Functional
+  Descriptor parser (handles both 7-byte DFU-1.0 and 9-byte
+  DFU-1.1 forms), all 7 class-specific SETUP-packet builders
+  (DETACH / DNLOAD / UPLOAD / GETSTATUS / CLRSTATUS / GETSTATE /
+  ABORT), 6-byte status-block decoder + DfuState (11 variants)
+  / DfuStatusCode (16 variants) enums.
 - **CDC-NCM** (`cdc_ncm`): Network Control Model 1.0 codec for
   USB-Ethernet. NTB-16 framing — NTH16 (signature, header length,
   sequence, block length, NDP index) + NDP16 (datagram-pointer

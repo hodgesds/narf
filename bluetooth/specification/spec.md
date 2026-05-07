@@ -16,6 +16,11 @@ Bluetooth subsystem source material was consulted at any point.**
     types), §7 (commands & events), §3 (general operation).
   - **Vol 4 Part B** — USB Transport Layer. §2.1 (endpoint mapping),
     §2.2 (packet-type indicator bytes).
+  - **Vol 4 Part A** — UART Transport Layer (H4). §2 (packet-type
+    indicator + body framing). Used by `h4`.
+  - **Vol 4 Part D** — Three-Wire UART Transport Layer (H5). §3
+    (4-byte link header + payload), §4 (SLIP escape), §5 (link
+    establishment), §6 (CRC-CCITT). Used by `h5`.
 
 ### L2CAP
 

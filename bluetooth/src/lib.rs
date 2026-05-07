@@ -37,6 +37,8 @@ pub mod event;
 pub mod gap;
 pub mod gatt;
 pub mod gatt_server;
+pub mod h4;
+pub mod h5;
 pub mod hci;
 pub mod hfp;
 pub mod hogp;
