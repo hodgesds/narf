@@ -186,11 +186,16 @@ fn smoke_backlight_snap_chooses_nearest_ladder_step() -> TestResult {
     if panel.snap(0) != 0 {
         return TestResult::Fail("snap(0) != 0");
     }
-    if panel.snap(13) != 0 {
-        return TestResult::Fail("snap(13) should round down to 0");
+    // `snap` chooses the nearest ladder step by absolute distance.
+    // For levels [0, 25, 50, 75, 100]:
+    //   snap(12) → 0  (12 ≤ 12.5 midpoint)
+    //   snap(13) → 25 (distance 12 < 13)
+    //   snap(63) → 75 (distance 12 < 13)
+    if panel.snap(12) != 0 {
+        return TestResult::Fail("snap(12) should round down to 0");
     }
-    if panel.snap(14) != 25 {
-        return TestResult::Fail("snap(14) should round up to 25");
+    if panel.snap(13) != 25 {
+        return TestResult::Fail("snap(13) should round up to 25 (nearest)");
     }
     if panel.snap(63) != 75 {
         return TestResult::Fail("snap(63) should round up to 75");
