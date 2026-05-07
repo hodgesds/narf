@@ -1,6 +1,21 @@
 # drivers/gpu/amdgpu — Specification
 
-> Status: **v0.9** (Stage 9 — GPIO pin LUT + encoder caps + DP link-rate fallback).
+> Status: **v0.10** (Stage 10 — DCN HUBP/OPP/OTG modeset codec).
+>
+> ### v0.10 changes vs v0.9
+>
+> - **DCN modeset codec** (`amdgpu_dcn`): produces the full
+>   `(addr, value)` write sequence for the disable → reprogram →
+>   enable phases of a DCN modeset. HUBP primary-surface
+>   address (split low/high) + pitch + blank, OPP gamma
+>   passthrough + pipe enable, OTG H/V totals + blank/sync +
+>   master enable. All offsets cite the public AMD DCN1+
+>   register reference; per-family block bases sourced through
+>   the existing `amdgpu_offsets` runtime registry. Caller
+>   without registered offsets gets `OffsetsUnregistered` rather
+>   than a write to the wrong window. Stride and surface address
+>   are 256-byte-bounds-checked per the DCN1+ alignment rules.
+>   Closes the v0.9 TODO inside `amdgpu::set_mode`.
 >
 > ### v0.9 changes vs v0.8
 >

@@ -117,6 +117,7 @@ pub mod amdgpu_atom_encoder_caps;
 pub mod amdgpu_atom_fwinfo;
 pub mod amdgpu_atom_gpiopin;
 pub mod amdgpu_atombios;
+pub mod amdgpu_dcn;
 pub mod amdgpu_offsets;
 pub mod amdgpu_pm4;
 pub mod amdgpu_pptable;
@@ -127,6 +128,12 @@ pub mod amdgpu_ucode;
 pub mod dp_aux;
 pub mod dp_edid;
 pub mod dp_link_training;
+pub mod intel_gpu;
+pub mod intel_gpu_ddi;
+pub mod intel_gpu_gmbus;
+pub mod intel_gpu_gtt;
+pub mod intel_gpu_pipes;
+pub mod intel_gpu_pll;
 
 mod tests;
 
@@ -136,6 +143,10 @@ pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
     narf_init::register(Stage::Subsys, "amdgpu-pci", || {
         amdgpu::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "intel-gpu-pci", || {
+        intel_gpu::register_pci_driver();
         InitResult::Ok
     });
 }

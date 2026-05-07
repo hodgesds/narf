@@ -24,5 +24,8 @@ narf-firmware        = { path = "../../firmware" }
 narf-bus             = { path = "../../bus" }
 narf-init            = { path = "../../init" }
 
+[features]
+kernel-test = []
+
 [lints]
 workspace = true
