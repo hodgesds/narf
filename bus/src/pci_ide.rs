@@ -7,8 +7,10 @@
 //!   Selective IDE and Link IDE Stream register blocks. §6.33.4
 //!   IDE Key Management (IDE_KM) message format carried over DOE
 //!   (vendor 0x0001, type 0x07).
+//!   <https://pcisig.com/specifications>
 //! - DSP0277 "Component Measurement and Authentication (CMA)" —
 //!   referenced for the SPDM-protected channel that wraps IDE_KM.
+//!   <https://www.dmtf.org/dsp/DSP0274>
 //! - PCI-SIG public Vendor ID list — 0x0001 = PCI-SIG.
 //!
 //! No GPL Linux source consulted.

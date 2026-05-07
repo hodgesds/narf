@@ -39,9 +39,10 @@ fn smoke_nvme_samsung_pci_matches() -> TestResult {
     let class_match = regs.iter().any(|m| {
         matches!(
             m.kind,
-            MatchKind::Class {
+            MatchKind::ClassFull {
                 class: 0x01,
-                mask: 0xFF,
+                subclass: 0x08,
+                prog_if: 0x02,
             }
         )
     });

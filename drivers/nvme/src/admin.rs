@@ -8,8 +8,10 @@
 //!   §5.21 (Sanitize, opcode 0x84, CDW10/11), §5.27 (Get Log Page,
 //!   opcode 0x02), §5.31 (Set Features, opcode 0x09; FID 0x1A is
 //!   "Boot Partition Write Protection Configuration").
+//!   <https://nvmexpress.org/specifications/>
 //! - "NVM Command Set Specification, Revision 1.0c" — for SMART /
 //!   Health log page (LID 0x02) byte layout.
+//!   <https://nvmexpress.org/specifications/>
 //!
 //! No GPL Linux source consulted.
 //!

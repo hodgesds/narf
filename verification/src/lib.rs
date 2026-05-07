@@ -1315,9 +1315,10 @@ fn smoke_pci_probe_all_dispatches_nvme() -> TestResult {
     let has_class = regs.iter().any(|m| {
         matches!(
             m.kind,
-            narf_bus::MatchKind::Class {
+            narf_bus::MatchKind::ClassFull {
                 class: 0x01,
-                mask: 0xFF,
+                subclass: 0x08,
+                prog_if: 0x02,
             }
         )
     });

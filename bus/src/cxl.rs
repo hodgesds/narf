@@ -3,6 +3,7 @@
 //! References (public-only):
 //! - "Compute Express Link (CXL) Specification, Revision 3.1" — CXL
 //!   Consortium. Public document.
+//!   <https://computeexpresslink.org/cxl-specification/>
 //!   §8.2.8 (Component Register Block layout — RCRB / DVSEC for CXL
 //!   1.1+ devices, Memory-Mapped Component Registers).
 //!   §8.2.9.1 (Mailbox Capabilities + Control + Status registers).
@@ -15,6 +16,7 @@
 //!     Get Supported Logs, Get Log).
 //! - DSP0276 "MCTP over PCIe Vendor Defined Messages" — referenced
 //!   for the MCTP+CXL message-binding, not consumed here.
+//!   <https://www.dmtf.org/standards/pmci>
 //!
 //! No GPL Linux source consulted.
 //!

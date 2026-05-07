@@ -3,6 +3,7 @@
 //! Spec: `drivers/nvme/specification/spec.md` + NVMe base spec rev 1.4
 //! §3 (registers) and §5 (admin command set). Stage-4 cut now does the
 //! whole admin-queue bring-up against a real PCIe NVMe controller:
+//!   <https://nvmexpress.org/specifications/>
 //!
 //! - Map BAR0 via `bus::map_bar`.
 //! - Decode `CAP` (queue depth, doorbell stride, MPSMIN/MAX) and `VS`
@@ -1404,13 +1405,19 @@ pub fn register_pci_driver() {
             probe,
         });
     }
-    // Class-match backstop. `probe` checks subclass + prog_if so
-    // we don't accidentally claim SATA / virtio-blk controllers.
+    // Class-match backstop pinned to NVMe's exact class triple
+    // (01:08:02). Switching from MatchKind::Class — which matches
+    // every PCI mass-storage device and forces probe to gate on
+    // subclass+prog_if — to MatchKind::ClassFull so virtio-blk +
+    // AHCI silicon never even reaches our probe fn (and the boot
+    // probe-trace doesn't surface spurious BadDevice rejections
+    // from those non-NVMe storage devices).
     narf_bus::register_pci_driver(narf_bus::PciMatch {
         name: "nvme-class",
-        kind: narf_bus::MatchKind::Class {
+        kind: narf_bus::MatchKind::ClassFull {
             class: PCI_CLASS_STORAGE,
-            mask: 0xFF,
+            subclass: PCI_SUBCLASS_NVM,
+            prog_if: PCI_PROGIF_NVME,
         },
         probe,
     });

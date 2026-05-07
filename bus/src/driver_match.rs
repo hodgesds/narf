@@ -56,6 +56,19 @@ pub enum MatchKind {
     /// triple (offset 0x0B); `mask` lets a driver match a class
     /// family (e.g. `class=0x01, mask=0xFF` = "all storage").
     Class { class: u8, mask: u8 },
+    /// PCIe full class-triple match — `(class, subclass, prog_if)`
+    /// pinned exactly. More specific than `Class` because virtio-blk
+    /// (01:00:00), AHCI (01:06:01), and NVMe (01:08:02) all share
+    /// `class == 0x01` but have to be distinguished by the lower
+    /// bytes. Drivers that previously had to filter inside `probe`
+    /// can use this to filter at match time, so the probe-trace
+    /// no longer logs spurious `BadDevice` errors for devices the
+    /// driver was never going to claim.
+    ClassFull {
+        class: u8,
+        subclass: u8,
+        prog_if: u8,
+    },
     /// Match every device of a vendor. Lowest specificity.
     Vendor { vendor: u16 },
 }
@@ -77,6 +90,16 @@ impl MatchKind {
                 let dev_class = ((device.id.class >> 16) & 0xFF) as u8;
                 (dev_class & mask) == (class & mask)
             }
+            MatchKind::ClassFull {
+                class,
+                subclass,
+                prog_if,
+            } => {
+                let dev_class = ((device.id.class >> 16) & 0xFF) as u8;
+                let dev_subclass = ((device.id.class >> 8) & 0xFF) as u8;
+                let dev_prog_if = (device.id.class & 0xFF) as u8;
+                dev_class == class && dev_subclass == subclass && dev_prog_if == prog_if
+            }
             MatchKind::Vendor { vendor } => device.id.vendor == vendor,
         }
     }
@@ -87,8 +110,10 @@ impl MatchKind {
     pub fn specificity(&self) -> u8 {
         match self {
             MatchKind::VendorDevice { .. } => 3,
-            MatchKind::Class { .. } => 2,
-            MatchKind::Vendor { .. } => 1,
+            // Full class triple beats base-class-only.
+            MatchKind::ClassFull { .. } => 2,
+            MatchKind::Class { .. } => 1,
+            MatchKind::Vendor { .. } => 0,
         }
     }
 }

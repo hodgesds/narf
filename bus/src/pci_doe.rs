@@ -3,11 +3,14 @@
 //! References (public-only):
 //! - "PCI Express Base Specification, Revision 6.0" — PCI-SIG.
 //!   §6.30 Data Object Exchange (DOE) Extended Capability.
+//!   <https://pcisig.com/specifications>
 //! - "PCI Express Base Specification, Revision 5.0" — first to
 //!   ratify DOE; layout matches the 6.0 wording.
+//!   <https://pcisig.com/specifications>
 //! - DMTF DSP0274 "Security Protocol and Data Model (SPDM)" §A —
 //!   defines the SPDM-over-DOE wrapper that runs on top of this
 //!   transport.
+//!   <https://www.dmtf.org/dsp/DSP0274>
 //! - PCI-SIG public registries (Vendor ID list) — Vendor ID 0x0001
 //!   is reserved as "PCI-SIG" for the DOE Discovery protocol.
 //!

@@ -6,9 +6,11 @@
 //!   §3.4 (Message Integrity Check / MIC, CRC-32), §5.0 (Command
 //!   Set), §5.1 (Read NVMe-MI Data Structure), §5.6 (Health Status
 //!   Poll), §5.8 (Subsystem Health Status Poll).
+//!   <https://nvmexpress.org/specifications/>
 //! - DSP0236 "Management Component Transport Protocol (MCTP) Base"
 //!   v1.3.1 — DMTF, public. NVMe-MI travels as MCTP message-type
 //!   0x04 (NVMe Management).
+//!   <https://www.dmtf.org/dsp/DSP0235>
 //!
 //! No GPL Linux source consulted.
 //!
