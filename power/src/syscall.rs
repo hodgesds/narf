@@ -241,11 +241,73 @@ impl Governor {
 
 pub use narf_abi::{CpuOpArgs, CpuOpKind, CpuOpReturn};
 
-/// `NarfStatus::Ok` discriminant — duplicated here so we don't
-/// take a dependency on `narf-abi`'s internal enum layout.
+/// `NarfStatus` discriminants — kept in sync with the enum in
+/// `narf-abi`. Duplicated rather than `as u32`-cast so we don't
+/// transitively depend on the enum layout.
 const STATUS_OK: u32 = 0;
-const STATUS_INVALID_OP: u32 = 1;
-const STATUS_FORBIDDEN: u32 = 4;
+const STATUS_INVALID_OP: u32 = 5;
+const STATUS_FORBIDDEN: u32 = 8;
+const STATUS_UNSUPPORTED: u32 = 9;
+
+// ── Capability probes (overridable for deterministic tests) ──────
+//
+// On QEMU TCG the host typically lacks HWP / CPPC / RAPL, so the
+// live probes report "no DVFS" and write paths return Unsupported.
+// Tests inject a synthetic mechanism via `__set_caps_for_test` to
+// exercise the Ok path independent of the host CPU.
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PowerCaps {
+    /// `true` when at least one DVFS mechanism (HWP / CPPC / EIST /
+    /// AMD legacy / PSCI cpufreq) is present.
+    pub has_dvfs: bool,
+    /// `true` when RAPL energy counters are accessible.
+    pub has_rapl: bool,
+}
+
+static CAPS_OVERRIDE: narf_lib::sync::IrqSafeSpinLock<Option<PowerCaps>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+fn detect_caps() -> PowerCaps {
+    if let Some(o) = *CAPS_OVERRIDE.lock() {
+        return o;
+    }
+    detect_caps_live()
+}
+
+#[cfg(target_arch = "x86_64")]
+fn detect_caps_live() -> PowerCaps {
+    use crate::pstate::Mechanism;
+    PowerCaps {
+        has_dvfs: !matches!(crate::pstate::detect(), Mechanism::None),
+        has_rapl: crate::rapl::is_supported(),
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn detect_caps_live() -> PowerCaps {
+    // ARM cpufreq is exposed through PSCI / SCMI on real hardware;
+    // the kernel doesn't yet probe either at boot, so the honest
+    // answer for now is "no DVFS." Tests that need the Ok path
+    // override.
+    PowerCaps {
+        has_dvfs: false,
+        has_rapl: false,
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn detect_caps_live() -> PowerCaps {
+    PowerCaps {
+        has_dvfs: false,
+        has_rapl: false,
+    }
+}
+
+#[doc(hidden)]
+pub fn __set_caps_for_test(caps: Option<PowerCaps>) {
+    *CAPS_OVERRIDE.lock() = caps;
+}
 
 /// Kernel-side bridge handler for ring-issued CPU power ops.
 /// Resolves cpu_id, applies the current-CPU policy (non-TCB only
@@ -296,6 +358,9 @@ pub fn handle(kind: CpuOpKind, args: &CpuOpArgs, current_cpu: u64) -> CpuOpRetur
                 Some(d) => d,
                 None => return CpuOpReturn { status: STATUS_INVALID_OP, result: [0; 6] },
             };
+            if !detect_caps().has_rapl {
+                return unsupported();
+            }
             let uj = read_rapl_energy_uj(cpu, domain);
             let mut result = [0u64; 6];
             result[0] = uj;
@@ -321,6 +386,9 @@ pub fn handle(kind: CpuOpKind, args: &CpuOpArgs, current_cpu: u64) -> CpuOpRetur
                 Some(c) => c,
                 None => return forbidden(),
             };
+            if !detect_caps().has_dvfs {
+                return unsupported();
+            }
             let min_khz = args.a1 as u32;
             let max_khz = args.a2 as u32;
             let (applied_min, applied_max) = apply_freq_range(cpu, min_khz, max_khz);
@@ -334,6 +402,9 @@ pub fn handle(kind: CpuOpKind, args: &CpuOpArgs, current_cpu: u64) -> CpuOpRetur
                 Some(c) => c,
                 None => return forbidden(),
             };
+            if !detect_caps().has_dvfs {
+                return unsupported();
+            }
             apply_epp(cpu, args.a1 as u8);
             CpuOpReturn { status: STATUS_OK, result: [0; 6] }
         }
@@ -346,6 +417,9 @@ pub fn handle(kind: CpuOpKind, args: &CpuOpArgs, current_cpu: u64) -> CpuOpRetur
                 Some(g) => g,
                 None => return CpuOpReturn { status: STATUS_INVALID_OP, result: [0; 6] },
             };
+            if !detect_caps().has_dvfs {
+                return unsupported();
+            }
             apply_governor(cpu, gov);
             CpuOpReturn { status: STATUS_OK, result: [0; 6] }
         }
@@ -356,6 +430,9 @@ pub fn handle(kind: CpuOpKind, args: &CpuOpArgs, current_cpu: u64) -> CpuOpRetur
                 Some(d) => d,
                 None => return CpuOpReturn { status: STATUS_INVALID_OP, result: [0; 6] },
             };
+            if !detect_caps().has_rapl {
+                return unsupported();
+            }
             let window_ms = args.a1 as u32;
             let energy_mj = args.a2 as u32;
             apply_energy_budget(domain, window_ms, energy_mj);
@@ -366,9 +443,19 @@ pub fn handle(kind: CpuOpKind, args: &CpuOpArgs, current_cpu: u64) -> CpuOpRetur
                 Some(d) => d,
                 None => return CpuOpReturn { status: STATUS_INVALID_OP, result: [0; 6] },
             };
+            if !detect_caps().has_rapl {
+                return unsupported();
+            }
             clear_energy_budget(domain);
             CpuOpReturn { status: STATUS_OK, result: [0; 6] }
         }
+    }
+}
+
+fn unsupported() -> CpuOpReturn {
+    CpuOpReturn {
+        status: STATUS_UNSUPPORTED,
+        result: [0; 6],
     }
 }
 

@@ -446,6 +446,17 @@ pub enum NarfStatus {
 
     /// Target ring / endpoint has been closed.
     Closed = 0x0007,
+
+    /// Caller's cap doesn't permit the requested action (e.g. a
+    /// non-TCB attempt to address a CPU other than its own).
+    Forbidden = 0x0008,
+
+    /// The hardware doesn't expose the knob the request is asking
+    /// to turn (e.g. CpuSetEpp on a CPU with no HWP / CPPC, or
+    /// CpuSetEnergyBudget on a system with no RAPL). Distinct from
+    /// `InvalidOp` (which means the OpCode itself is unknown) —
+    /// the syscall is well-formed, the silicon just can't do it.
+    Unsupported = 0x0009,
 }
 
 impl NarfStatus {
@@ -944,6 +955,9 @@ impl<const N: usize> Dispatcher<N> {
                 let r = dispatch_cpu_op(kind, &args);
                 let status = match r.status {
                     0 => NarfStatus::Ok,
+                    5 => NarfStatus::InvalidOp,
+                    8 => NarfStatus::Forbidden,
+                    9 => NarfStatus::Unsupported,
                     _ => NarfStatus::InvalidOp,
                 };
                 Completion::with(tag, status, r.result)

@@ -708,7 +708,7 @@ fn smoke_syscall_perf_state_rejects_other_cpu_for_non_tcb() -> TestResult {
 
     let r = handle(CpuOpKind::PerfState, &a, 0);
 
-    if r.status != 4 /* Forbidden */ {
+    if r.status != 8 /* Forbidden */ {
 
         return TestResult::Fail("cpu 7 from cpu 0 must be Forbidden");
 
@@ -778,74 +778,154 @@ kernel_test_in!("power/syscall", smoke_syscall_latency_hint_register_and_release
 
 
 
-fn smoke_syscall_set_freq_range_echoes_request_for_current_cpu() -> TestResult {
-
-    use crate::syscall::{handle, CpuOpArgs};
-
+fn smoke_syscall_set_freq_range_returns_unsupported_without_dvfs() -> TestResult {
+    use crate::syscall::{__set_caps_for_test, handle, CpuOpArgs, PowerCaps};
     use narf_abi::CpuOpKind;
-
+    __set_caps_for_test(Some(PowerCaps { has_dvfs: false, has_rapl: false }));
     let mut a = CpuOpArgs::default();
-
     a.a0 = 0;
-
     a.a1 = 800_000;
-
     a.a2 = 4_000_000;
-
     let r = handle(CpuOpKind::SetFreqRange, &a, 0);
-
-    if r.status != 0 || r.result[0] != 800_000 || r.result[1] != 4_000_000 {
-
-        return TestResult::Fail("echo");
-
+    __set_caps_for_test(None);
+    if r.status != 9 /* Unsupported */ {
+        return TestResult::Fail("no DVFS must return Unsupported");
     }
-
     TestResult::Pass
-
 }
+kernel_test_in!(
+    "power/syscall",
+    smoke_syscall_set_freq_range_returns_unsupported_without_dvfs
+);
 
-kernel_test_in!("power/syscall", smoke_syscall_set_freq_range_echoes_request_for_current_cpu);
-
-
-
-fn smoke_syscall_energy_budget_install_and_clear() -> TestResult {
-
-    use crate::syscall::{__reset_energy_budgets_for_test, current_energy_budget, handle, CpuOpArgs, RaplDomain};
-
+fn smoke_syscall_set_freq_range_echoes_request_when_dvfs_present() -> TestResult {
+    use crate::syscall::{__set_caps_for_test, handle, CpuOpArgs, PowerCaps};
     use narf_abi::CpuOpKind;
-
-    __reset_energy_budgets_for_test();
-
+    __set_caps_for_test(Some(PowerCaps { has_dvfs: true, has_rapl: false }));
     let mut a = CpuOpArgs::default();
-
-    a.a0 = RaplDomain::Package as u64;
-
-    a.a1 = 1000;
-
-    a.a2 = 5000;
-
-    handle(CpuOpKind::SetEnergyBudget, &a, 0);
-
-    if current_energy_budget(RaplDomain::Package) != Some((1000, 5000)) {
-
-        return TestResult::Fail("install");
-
+    a.a0 = 0;
+    a.a1 = 800_000;
+    a.a2 = 4_000_000;
+    let r = handle(CpuOpKind::SetFreqRange, &a, 0);
+    __set_caps_for_test(None);
+    if r.status != 0 || r.result[0] != 800_000 || r.result[1] != 4_000_000 {
+        return TestResult::Fail("with DVFS the request must echo Ok");
     }
-
-    let mut c = CpuOpArgs::default();
-
-    c.a0 = RaplDomain::Package as u64;
-
-    handle(CpuOpKind::ClearEnergyBudget, &c, 0);
-
-    if current_energy_budget(RaplDomain::Package).is_some() {
-
-        return TestResult::Fail("clear");
-
-    }
-
     TestResult::Pass
-
 }
+kernel_test_in!(
+    "power/syscall",
+    smoke_syscall_set_freq_range_echoes_request_when_dvfs_present
+);
 
-kernel_test_in!("power/syscall", smoke_syscall_energy_budget_install_and_clear);
+fn smoke_syscall_set_epp_returns_unsupported_without_dvfs() -> TestResult {
+    use crate::syscall::{__set_caps_for_test, handle, CpuOpArgs, PowerCaps};
+    use narf_abi::CpuOpKind;
+    __set_caps_for_test(Some(PowerCaps { has_dvfs: false, has_rapl: false }));
+    let mut a = CpuOpArgs::default();
+    a.a0 = 0;
+    a.a1 = 0x40;
+    let r = handle(CpuOpKind::SetEpp, &a, 0);
+    __set_caps_for_test(None);
+    if r.status != 9 {
+        return TestResult::Fail("SetEpp without DVFS must be Unsupported");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "power/syscall",
+    smoke_syscall_set_epp_returns_unsupported_without_dvfs
+);
+
+fn smoke_syscall_set_governor_returns_unsupported_without_dvfs() -> TestResult {
+    use crate::syscall::{__set_caps_for_test, handle, CpuOpArgs, Governor, PowerCaps};
+    use narf_abi::CpuOpKind;
+    __set_caps_for_test(Some(PowerCaps { has_dvfs: false, has_rapl: false }));
+    let mut a = CpuOpArgs::default();
+    a.a0 = 0;
+    a.a1 = Governor::Powersave as u64;
+    let r = handle(CpuOpKind::SetGovernor, &a, 0);
+    __set_caps_for_test(None);
+    if r.status != 9 {
+        return TestResult::Fail("SetGovernor without DVFS must be Unsupported");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "power/syscall",
+    smoke_syscall_set_governor_returns_unsupported_without_dvfs
+);
+
+fn smoke_syscall_energy_budget_returns_unsupported_without_rapl() -> TestResult {
+    use crate::syscall::{__set_caps_for_test, handle, CpuOpArgs, PowerCaps, RaplDomain};
+    use narf_abi::CpuOpKind;
+    __set_caps_for_test(Some(PowerCaps { has_dvfs: false, has_rapl: false }));
+    let mut a = CpuOpArgs::default();
+    a.a0 = RaplDomain::Package as u64;
+    a.a1 = 1000;
+    a.a2 = 5000;
+    let r = handle(CpuOpKind::SetEnergyBudget, &a, 0);
+    __set_caps_for_test(None);
+    if r.status != 9 {
+        return TestResult::Fail("budget without RAPL must be Unsupported");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "power/syscall",
+    smoke_syscall_energy_budget_returns_unsupported_without_rapl
+);
+
+fn smoke_syscall_energy_budget_install_and_clear_with_rapl() -> TestResult {
+    use crate::syscall::{
+        __reset_energy_budgets_for_test, __set_caps_for_test, current_energy_budget, handle,
+        CpuOpArgs, PowerCaps, RaplDomain,
+    };
+    use narf_abi::CpuOpKind;
+    __reset_energy_budgets_for_test();
+    __set_caps_for_test(Some(PowerCaps { has_dvfs: false, has_rapl: true }));
+    let mut a = CpuOpArgs::default();
+    a.a0 = RaplDomain::Package as u64;
+    a.a1 = 1000;
+    a.a2 = 5000;
+    let r = handle(CpuOpKind::SetEnergyBudget, &a, 0);
+    if r.status != 0 {
+        __set_caps_for_test(None);
+        return TestResult::Fail("install");
+    }
+    if current_energy_budget(RaplDomain::Package) != Some((1000, 5000)) {
+        __set_caps_for_test(None);
+        return TestResult::Fail("install state");
+    }
+    let mut c = CpuOpArgs::default();
+    c.a0 = RaplDomain::Package as u64;
+    handle(CpuOpKind::ClearEnergyBudget, &c, 0);
+    __set_caps_for_test(None);
+    if current_energy_budget(RaplDomain::Package).is_some() {
+        return TestResult::Fail("clear");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "power/syscall",
+    smoke_syscall_energy_budget_install_and_clear_with_rapl
+);
+
+fn smoke_syscall_rapl_energy_returns_unsupported_without_rapl() -> TestResult {
+    use crate::syscall::{__set_caps_for_test, handle, CpuOpArgs, PowerCaps, RaplDomain};
+    use narf_abi::CpuOpKind;
+    __set_caps_for_test(Some(PowerCaps { has_dvfs: false, has_rapl: false }));
+    let mut a = CpuOpArgs::default();
+    a.a0 = 0;
+    a.a1 = RaplDomain::Package as u64;
+    let r = handle(CpuOpKind::RaplEnergy, &a, 0);
+    __set_caps_for_test(None);
+    if r.status != 9 {
+        return TestResult::Fail("RaplEnergy without RAPL must be Unsupported");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "power/syscall",
+    smoke_syscall_rapl_energy_returns_unsupported_without_rapl
+);
