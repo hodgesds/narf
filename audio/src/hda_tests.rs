@@ -193,3 +193,205 @@ fn smoke_hda_writer_submit_round_trip() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("audio/hda", smoke_hda_writer_submit_round_trip);
+
+
+
+// ── HDA codec walker (transport-neutral) ──────────────────────────
+
+
+
+fn smoke_hda_codec_enumerates_output_path_via_mock_verb_table() -> TestResult {
+
+    use crate::hda_codec::{enumerate, find_output_path, make_verb, param, verb, WidgetType};
+
+    use alloc::vec;
+
+
+
+    // Synthetic codec: addr 0, AFG NID 1, three widgets:
+
+    //   NID 2: PinComplex (Speaker), connections=[3]
+
+    //   NID 3: AudioMixer, connections=[4]
+
+    //   NID 4: AudioOutput
+
+    let mut table = alloc::collections::BTreeMap::<u32, u32>::new();
+
+    let addr = 0u8;
+
+    // Vendor 0x10EC (Realtek), Device 0x0287.
+
+    table.insert(make_verb(addr, 0, verb::GET_PARAMETER | param::VENDOR_ID), 0x0287_10EC);
+
+    table.insert(make_verb(addr, 0, verb::GET_PARAMETER | param::REVISION_ID), 0x0010_0001);
+
+    // Root subordinate node count: first FG = 1, count = 1.
+
+    table.insert(make_verb(addr, 0, verb::GET_PARAMETER | param::SUBORDINATE_NODE_COUNT), 0x0001_0001);
+
+    // FG type = 1 (Audio Function Group).
+
+    table.insert(make_verb(addr, 1, verb::GET_PARAMETER | param::FUNCTION_GROUP_TYPE), 0x0000_0001);
+
+    // AFG subordinate: first widget = 2, count = 3.
+
+    table.insert(make_verb(addr, 1, verb::GET_PARAMETER | param::SUBORDINATE_NODE_COUNT), 0x0003_0002);
+
+    // Widget 2: PinComplex, has conn list, has out amp.
+
+    //   bits[23:20] = 4 (Pin), bit 8 = 1 (conn list), bit 2 = 1 (out amp), bit 0 = 1 (stereo)
+
+    table.insert(make_verb(addr, 2, verb::GET_PARAMETER | param::AUDIO_WIDGET_CAPS), 0x0040_0105);
+
+    table.insert(make_verb(addr, 2, verb::GET_PARAMETER | param::CONNECTION_LIST_LENGTH), 0x0000_0001);
+
+    table.insert(make_verb(addr, 2, verb::GET_CONNECTION_LIST_ENTRY | 0), 0x0000_0003);
+
+    table.insert(make_verb(addr, 2, verb::GET_PARAMETER | param::PIN_CAPS), 0x0000_0010); // out-capable
+
+    // pin_config_default: default_device=1 (Speaker), connectivity=2 (fixed)
+
+    table.insert(make_verb(addr, 2, verb::GET_CONFIG_DEFAULT), (2u32 << 30) | (1u32 << 20));
+
+    table.insert(make_verb(addr, 2, verb::GET_PARAMETER | param::OUTPUT_AMP_CAPS), 0x8002_0F00);
+
+    // Widget 3: AudioMixer (type 2), conn list, out amp
+
+    table.insert(make_verb(addr, 3, verb::GET_PARAMETER | param::AUDIO_WIDGET_CAPS), 0x0020_0105);
+
+    table.insert(make_verb(addr, 3, verb::GET_PARAMETER | param::CONNECTION_LIST_LENGTH), 0x0000_0001);
+
+    table.insert(make_verb(addr, 3, verb::GET_CONNECTION_LIST_ENTRY | 0), 0x0000_0004);
+
+    table.insert(make_verb(addr, 3, verb::GET_PARAMETER | param::OUTPUT_AMP_CAPS), 0x8002_0F00);
+
+    // Widget 4: AudioOutput (type 0), no conn list, out amp
+
+    table.insert(make_verb(addr, 4, verb::GET_PARAMETER | param::AUDIO_WIDGET_CAPS), 0x0000_0005);
+
+    table.insert(make_verb(addr, 4, verb::GET_PARAMETER | param::OUTPUT_AMP_CAPS), 0x8002_0F00);
+
+
+
+    let resolver = |v: u32| *table.get(&v).unwrap_or(&0);
+
+    let codec = enumerate(addr, resolver);
+
+    if codec.vendor_id != 0x10EC || codec.device_id != 0x0287 {
+
+        return TestResult::Fail("vendor / device id mis-decoded");
+
+    }
+
+    if codec.afg_nid != 1 {
+
+        return TestResult::Fail("AFG NID should be 1");
+
+    }
+
+    if codec.widgets.len() != 3 {
+
+        return TestResult::Fail("widget count");
+
+    }
+
+    let pin = codec.widget(2).expect("pin");
+
+    if pin.ty() != WidgetType::PinComplex {
+
+        return TestResult::Fail("NID 2 should be PinComplex");
+
+    }
+
+    if pin.connections != vec![3u8] {
+
+        return TestResult::Fail("pin connections");
+
+    }
+
+    if pin.pin_config.expect("cfg").default_device != 0x1 {
+
+        return TestResult::Fail("speaker default device lost");
+
+    }
+
+    let path = find_output_path(&codec).expect("output path");
+
+    if path.pin_nid != 2 || path.converter_nid != 4 {
+
+        return TestResult::Fail("output path endpoints wrong");
+
+    }
+
+    if path.chain != vec![3u8] {
+
+        return TestResult::Fail("output path should traverse mixer NID 3");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("audio/hda-codec", smoke_hda_codec_enumerates_output_path_via_mock_verb_table);
+
+
+
+fn smoke_hda_codec_pin_config_default_decoder() -> TestResult {
+
+    use crate::hda_codec::PinConfigDefault;
+
+    // Speaker: default_device=1, connectivity=2 (fixed), color=0xC (lime — default)
+
+    let raw = (2u32 << 30) | (1u32 << 20);
+
+    let p = PinConfigDefault::decode(raw);
+
+    if !p.is_speaker() || !p.is_output_role() || p.is_input_role() {
+
+        return TestResult::Fail("speaker classification wrong");
+
+    }
+
+    // Mic In: default_device=0xA, connectivity=0 (jack)
+
+    let raw = 0xAu32 << 20;
+
+    let p = PinConfigDefault::decode(raw);
+
+    if !p.is_microphone() || !p.is_input_role() || p.is_output_role() {
+
+        return TestResult::Fail("mic classification wrong");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("audio/hda-codec", smoke_hda_codec_pin_config_default_decoder);
+
+
+
+fn smoke_hda_codec_amp_caps_round_trip() -> TestResult {
+
+    use crate::hda_codec::AmpCaps;
+
+    // offset=0, num_steps=2, step_size=15 (0.25 dB units), mute capable
+
+    let raw = (1u32 << 31) | (15u32 << 16) | (2u32 << 8);
+
+    let a = AmpCaps::decode(raw);
+
+    if a.num_steps != 2 || a.step_size != 15 || !a.mute_capable {
+
+        return TestResult::Fail("AmpCaps decode wrong");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("audio/hda-codec", smoke_hda_codec_amp_caps_round_trip);

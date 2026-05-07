@@ -33,6 +33,7 @@ extern crate alloc;
 
 pub mod acp6;
 pub mod hda;
+pub mod hda_codec;
 
 mod hda_tests;
 mod tests;
