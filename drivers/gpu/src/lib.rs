@@ -134,6 +134,12 @@ pub mod intel_gpu_gmbus;
 pub mod intel_gpu_gtt;
 pub mod intel_gpu_pipes;
 pub mod intel_gpu_pll;
+pub mod nvidia_gpu;
+pub mod nvidia_gpu_disp;
+pub mod nvidia_gpu_falcon;
+pub mod nvidia_gpu_fifo;
+pub mod nvidia_gpu_gsp;
+pub mod nvidia_gpu_pmc;
 
 mod tests;
 
@@ -147,6 +153,10 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "intel-gpu-pci", || {
         intel_gpu::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "nvidia-gpu-pci", || {
+        nvidia_gpu::register_pci_driver();
         InitResult::Ok
     });
 }
