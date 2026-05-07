@@ -101,6 +101,16 @@ All driver code is derived strictly from the references below.
   setup, device enumeration.
 - **HID** (`hid`): Boot keyboard report decoder, modifier+keycode
   state tracking, usage-table mapping for alphanumeric input.
+- **HID Boot Mouse** (`hid::mouse`): HID 1.11 §B.2 boot-mouse report
+  decoder (3-byte: button mask + signed dx/dy), Set-Protocol(Boot)
+  attach via xHCI control-IN, descriptor-walker that locates the
+  HID/Boot/Mouse interface (class 0x03 / sub 0x01 / proto 0x02) and
+  its interrupt-IN endpoint, diff-on-button-or-delta translator that
+  emits `narf_input::PointerEvent`s onto the global ring. Held
+  buttons with zero motion are silent (auto-repeat is a userspace
+  concern). Wheel byte (extra report byte some mice send in boot
+  mode) is accepted on the wire but discarded — vertical/horizontal
+  wheel + multi-touch land with the Report-Descriptor parser.
 - **MSC** (`msc`): Bulk-Only Transport CBW/CSW codec, INQUIRY,
   READ_CAPACITY(10), READ(10), WRITE(10) for single-block transfers.
 - **Hub** (`hub`): basic hub class enumeration so devices behind

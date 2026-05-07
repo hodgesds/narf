@@ -54,9 +54,11 @@ pub const HID_SUBCLASS_BOOT: u8 = 0x01;
 pub const HID_PROTOCOL_KBD: u8 = 0x01;
 
 // Class-specific request codes from §7.2.
-const HID_REQ_SET_PROTOCOL: u8 = 0x0B;
+pub(crate) const HID_REQ_SET_PROTOCOL: u8 = 0x0B;
 /// Boot protocol value (vs. 1 = Report Protocol).
-const HID_BOOT_PROTOCOL: u16 = 0;
+pub(crate) const HID_BOOT_PROTOCOL: u16 = 0;
+
+pub mod mouse;
 
 /// Modifier mask bits in byte 0 of the boot keyboard report.
 pub mod kbd_mod {

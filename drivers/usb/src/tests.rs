@@ -926,3 +926,140 @@ fn smoke_uvc_stream_rejects_short_buffer() -> TestResult {
     }
 }
 kernel_test_in!("drivers/usb/uvc-stream", smoke_uvc_stream_rejects_short_buffer);
+
+// ── HID Boot Mouse — descriptor parser + diff ──────────────────────
+
+fn smoke_hid_boot_mouse_parse() -> TestResult {
+    use crate::hid::mouse;
+    use crate::xhci::EndpointKind;
+
+    // Same shape as the keyboard cfg blob, but bInterfaceProtocol = 2
+    // (mouse) and the interrupt-IN endpoint sized for the 3-byte
+    // boot report.
+    let cfg: [u8; 25] = [
+        // CONFIG: 9, 2, wTotalLen=25, numIface=1, cfgVal=1, iCfg=0,
+        // bmAttr=0xA0, MaxPwr=0
+        9, 2, 25, 0, 1, 1, 0, 0xA0, 0,
+        // INTERFACE: 9, 4, iface=0, alt=0, numEP=1,
+        // class=0x03 (HID), sub=0x01 (Boot), proto=0x02 (Mouse), iIface=0
+        9, 4, 0, 0, 1, 0x03, 0x01, 0x02, 0,
+        // ENDPOINT: 7, 5, addr=0x82 (IN ep2), attr=0x03 (interrupt),
+        // wMaxPacketSize=4, bInterval=10
+        7, 5, 0x82, 0x03, 4, 0x00, 10,
+    ];
+    let (iface, ep) = match mouse::find_boot_mouse(&cfg) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("find_boot_mouse rejected HID blob"),
+    };
+    if iface != 0
+        || ep.kind != EndpointKind::InterruptIn
+        || ep.ep_addr != 0x82
+        || ep.max_packet != 4
+    {
+        return TestResult::Fail("HID mouse endpoint mis-decoded");
+    }
+    // Decode a 3-byte report: left button + (-2, +5).
+    let r = mouse::MouseReport::from_bytes(&[mouse::btn::LEFT, (-2i8) as u8, 5]);
+    if r.buttons != mouse::btn::LEFT || r.dx != -2 || r.dy != 5 {
+        return TestResult::Fail("MouseReport::from_bytes mis-decoded");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/hid", smoke_hid_boot_mouse_parse);
+
+fn smoke_hid_boot_mouse_translate_diff() -> TestResult {
+    use crate::hid::mouse::{self, BootMouse, MouseReport};
+    use narf_input::{
+        init_global_ring, pop_global, InputEvent, PointerButtons, __reset_global_ring_for_test,
+    };
+
+    init_global_ring(64);
+    __reset_global_ring_for_test();
+    let mut m = BootMouse {
+        slot_id: 1,
+        interrupt_in_ep: 3,
+        interface_num: 0,
+        last_buttons: 0,
+    };
+
+    // Idle report → no event.
+    if m.translate_report(MouseReport::default()) != 0 {
+        return TestResult::Fail("idle report should not emit");
+    }
+
+    // Movement only → one PointerEvent with no buttons.
+    let n = m.translate_report(MouseReport {
+        buttons: 0,
+        dx: 7,
+        dy: -3,
+    });
+    if n != 1 {
+        return TestResult::Fail("movement should emit one event");
+    }
+    match pop_global() {
+        Some(InputEvent::Pointer(p)) => {
+            if p.dx != 7 || p.dy != -3 || p.buttons != PointerButtons::EMPTY {
+                return TestResult::Fail("movement event shape wrong");
+            }
+        }
+        _ => return TestResult::Fail("expected Pointer event for movement"),
+    }
+
+    // Button press only → one event, buttons=LEFT.
+    let n = m.translate_report(MouseReport {
+        buttons: mouse::btn::LEFT,
+        dx: 0,
+        dy: 0,
+    });
+    if n != 1 {
+        return TestResult::Fail("button press should emit");
+    }
+    match pop_global() {
+        Some(InputEvent::Pointer(p)) => {
+            if !(p.buttons.contains(PointerButtons::LEFT) && p.dx == 0 && p.dy == 0) {
+                return TestResult::Fail("press event shape wrong");
+            }
+        }
+        _ => return TestResult::Fail("expected Pointer event for press"),
+    }
+
+    // Same buttons + zero delta → no event (held).
+    if m.translate_report(MouseReport {
+        buttons: mouse::btn::LEFT,
+        dx: 0,
+        dy: 0,
+    }) != 0
+    {
+        return TestResult::Fail("held button + no delta must be silent");
+    }
+
+    // Release → one event, buttons cleared.
+    let n = m.translate_report(MouseReport::default());
+    if n != 1 {
+        return TestResult::Fail("button release should emit");
+    }
+    match pop_global() {
+        Some(InputEvent::Pointer(p)) => {
+            if p.buttons != PointerButtons::EMPTY {
+                return TestResult::Fail("release event must clear buttons");
+            }
+        }
+        _ => return TestResult::Fail("expected Pointer event for release"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/hid", smoke_hid_boot_mouse_translate_diff);
+
+fn smoke_hid_boot_mouse_button_mask() -> TestResult {
+    use crate::hid::mouse;
+    use narf_input::PointerButtons;
+    let m = mouse::button_byte_to_buttons(mouse::btn::LEFT | mouse::btn::MIDDLE);
+    if !(m.contains(PointerButtons::LEFT)
+        && m.contains(PointerButtons::MIDDLE)
+        && !m.contains(PointerButtons::RIGHT))
+    {
+        return TestResult::Fail("button byte → buttons mapping wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/hid", smoke_hid_boot_mouse_button_mask);
