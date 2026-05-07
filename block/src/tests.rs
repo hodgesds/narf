@@ -337,3 +337,177 @@ fn smoke_scsi_status_constants() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("block/scsi", smoke_scsi_status_constants);
+
+
+
+// ── TCG OPAL ──────────────────────────────────────────────────────
+
+
+
+fn smoke_opal_compacket_header_round_trip() -> TestResult {
+
+    use crate::opal::ComPacketHeader;
+
+    let h = ComPacketHeader {
+
+        com_id: 0x07FE,
+
+        com_id_ext: 0,
+
+        outstanding_data: 0,
+
+        min_transfer: 0,
+
+        length: 64,
+
+    };
+
+    let buf = h.encode();
+
+    let r = ComPacketHeader::decode(&buf).expect("decode");
+
+    if r != h {
+
+        return TestResult::Fail("ComPacket round-trip");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("block/opal", smoke_opal_compacket_header_round_trip);
+
+
+
+fn smoke_opal_atom_round_trip() -> TestResult {
+
+    use crate::opal::{decode_atom, encode_short_atom, encode_tiny_uint};
+
+    // Tiny: 0..=63 single byte.
+
+    let t = encode_tiny_uint(42);
+
+    let tiny_buf = [t];
+
+    let (payload, n) = decode_atom(&tiny_buf).expect("tiny");
+
+    if n != 1 || payload[0] != 42 {
+
+        return TestResult::Fail("tiny atom decode");
+
+    }
+
+    // Short: 5 bytes of payload.
+
+    let s = encode_short_atom(b"hello", false, true);
+
+    let (p2, n2) = decode_atom(&s).expect("short");
+
+    if p2 != b"hello" || n2 != s.len() {
+
+        return TestResult::Fail("short atom decode");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("block/opal", smoke_opal_atom_round_trip);
+
+
+
+fn smoke_opal_level0_discovery_walks_features() -> TestResult {
+
+    use crate::opal::{feature, parse_level0_discovery};
+
+    // Build a synthetic Level 0 Discovery response with two
+
+    // feature descriptors: TPer (4 bytes body) + Opal v2 (16 bytes).
+
+    let mut buf = alloc::vec::Vec::new();
+
+    // Body length covers feature descriptors only (header is
+
+    // 48 bytes; body starts at offset 48 of the buffer).
+
+    let body_len = 4 + 4 + 4 + 16;
+
+    let total = 48 + body_len;
+
+    let param_len = (total - 4) as u32;
+
+    buf.extend_from_slice(&param_len.to_be_bytes());
+
+    buf.extend_from_slice(&0x10000u32.to_be_bytes());
+
+    buf.extend_from_slice(&[0u8; 40]);
+
+    // TPer feature: code 0x0001, version 1, length 4.
+
+    buf.extend_from_slice(&feature::TPER.to_be_bytes());
+
+    buf.push(1 << 4);
+
+    buf.push(4);
+
+    buf.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+
+    // Opal v2 feature: code 0x0203, version 1, length 16.
+
+    buf.extend_from_slice(&feature::OPAL_V2.to_be_bytes());
+
+    buf.push(1 << 4);
+
+    buf.push(16);
+
+    buf.extend_from_slice(&[0u8; 16]);
+
+    let (h, descs) = parse_level0_discovery(&buf).expect("parse");
+
+    if h.parameter_length != param_len { return TestResult::Fail("length"); }
+
+    if descs.len() != 2 { return TestResult::Fail("feature count"); }
+
+    if descs[0].feature_code != feature::TPER || descs[0].data.len() != 4 {
+
+        return TestResult::Fail("TPer descriptor");
+
+    }
+
+    if descs[1].feature_code != feature::OPAL_V2 || descs[1].data.len() != 16 {
+
+        return TestResult::Fail("Opal v2 descriptor");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("block/opal", smoke_opal_level0_discovery_walks_features);
+
+
+
+fn smoke_opal_token_constants() -> TestResult {
+
+    use crate::opal::token;
+
+    if token::CALL != 0xF8 || token::END_OF_DATA != 0xF9 || token::END_OF_SESSION != 0xFA {
+
+        return TestResult::Fail("method-call tokens");
+
+    }
+
+    if token::START_LIST != 0xF0 || token::END_LIST != 0xF1 {
+
+        return TestResult::Fail("list tokens");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("block/opal", smoke_opal_token_constants);

@@ -30,6 +30,7 @@ extern crate alloc;
 pub mod deadline;
 pub mod encrypted;
 pub mod mq;
+pub mod opal;
 pub mod registry;
 pub mod scsi;
 
