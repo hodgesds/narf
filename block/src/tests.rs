@@ -178,9 +178,15 @@ fn smoke_block_encrypted_round_trip() -> TestResult {
         enc.write(0, 1, &data).expect("write failed");
 
         // Verify data is encrypted in the underlying device.
-        let raw_data = inner.data.lock();
-        let encrypted_sector = &raw_data[8 * 512..9 * 512]; // Offset by 8
-        if encrypted_sector.iter().all(|&b| b == 0xAA) {
+        // Scope the lock so it's released before `enc.read` below
+        // re-enters `inner.data.lock()` — non-recursive spinlock
+        // would otherwise deadlock here.
+        let plaintext_passthrough = {
+            let raw_data = inner.data.lock();
+            let encrypted_sector = &raw_data[8 * 512..9 * 512]; // Offset by 8
+            encrypted_sector.iter().all(|&b| b == 0xAA)
+        };
+        if plaintext_passthrough {
             return; // Not encrypted!
         }
 
