@@ -160,3 +160,48 @@ fn smoke_crypto_pq_fips_gate() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("crypto", smoke_crypto_pq_fips_gate);
+
+
+
+// ── Hardware-accelerated crypto ───────────────────────────────────
+
+
+
+fn smoke_crypto_accel_features_probe_runs() -> TestResult {
+
+    use crate::accel::Features;
+
+    let _ = Features::probe();
+
+    // Boolean values; we don't assert specific results — varies by host.
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("crypto/accel", smoke_crypto_accel_features_probe_runs);
+
+
+
+fn smoke_crypto_accel_features_struct_default() -> TestResult {
+    use crate::accel::Features;
+    // Default is "no acceleration"; on a real probe at least one
+    // bit will usually flip true on x86_64 / aarch64 production
+    // hardware. We can't assert that without environment
+    // dependence, so just check the default + Copy/Eq surface.
+    let d = Features::default();
+    if d.aes || d.sha2 || d.sha1 || d.pmull || d.crc32 {
+        return TestResult::Fail("default Features should be all-false");
+    }
+    let p = Features::probe();
+    let _ = (p == d, p.aes, p.sha2);
+    TestResult::Pass
+}
+kernel_test_in!("crypto/accel", smoke_crypto_accel_features_struct_default);
+// Live `aes_round_forward` execution requires CR4.OSFXSR /
+// OSXMMEXCPT to be set so AESENC's XMM access doesn't trap. The
+// kernel boot path doesn't always get there before tests run,
+// and a smoke test that toggles CR4 would mask real CR4 bugs.
+// Vector validation against a software reference lives in the
+// future `crypto::aes` module that owns the key schedule + has
+// tested SSE-state setup.
