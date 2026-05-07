@@ -46,7 +46,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -147,6 +147,17 @@ pub fn set_log_hook(h: LogHook) {
     LOG_HOOK.store(h as usize, Ordering::Release);
 }
 
+/// When set, `run_stage` emits a per-initcall trace through the
+/// `LogHook`: one "<stage> / <name> ..." line before each call
+/// and one "<stage> / <name> -> ok|not-present|error: <msg>"
+/// line after. Off by default — verbose tracing is for hang
+/// diagnosis only.
+static VERBOSE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_verbose_log(on: bool) {
+    VERBOSE.store(on, Ordering::Release);
+}
+
 fn log(line: &str) {
     let h = LOG_HOOK.load(Ordering::Acquire);
     if h != 0 {
@@ -211,6 +222,19 @@ pub fn run_stage(stage: Stage) -> StageStats {
     let calls = REGISTRY.stages[i].lock().clone();
     let mut stats = StageStats::default();
     for ic in &calls {
+        // Pre-call breadcrumb. Fires only when a verbose log hook
+        // is installed (see `set_verbose_log`). Lets bring-up
+        // diagnose hangs by surfacing the *last* initcall name
+        // before silence — without this, `run_stage` looks
+        // monolithic from the outside.
+        if VERBOSE.load(Ordering::Acquire) {
+            let mut buf = [0u8; 256];
+            let mut w = TruncatingWriter::new(&mut buf);
+            use core::fmt::Write;
+            let _ = write!(&mut w, "init: {} / {} ...", stage.name(), ic.name);
+            log(w.as_str());
+        }
+
         stats.total += 1;
         let t0 = narf_time::now_cycles();
         let result = (ic.func)();
@@ -221,8 +245,31 @@ pub fn run_stage(stage: Stage) -> StageStats {
             stats.max_name = ic.name;
         }
         match result {
-            InitResult::Ok => stats.ok += 1,
-            InitResult::NotPresent => stats.not_present += 1,
+            InitResult::Ok => {
+                stats.ok += 1;
+                if VERBOSE.load(Ordering::Acquire) {
+                    let mut buf = [0u8; 256];
+                    let mut w = TruncatingWriter::new(&mut buf);
+                    use core::fmt::Write;
+                    let _ = write!(&mut w, "init: {} / {} -> ok", stage.name(), ic.name);
+                    log(w.as_str());
+                }
+            }
+            InitResult::NotPresent => {
+                stats.not_present += 1;
+                if VERBOSE.load(Ordering::Acquire) {
+                    let mut buf = [0u8; 256];
+                    let mut w = TruncatingWriter::new(&mut buf);
+                    use core::fmt::Write;
+                    let _ = write!(
+                        &mut w,
+                        "init: {} / {} -> not-present",
+                        stage.name(),
+                        ic.name
+                    );
+                    log(w.as_str());
+                }
+            }
             InitResult::Error(msg) => {
                 stats.error += 1;
                 let mut buf = [0u8; 256];

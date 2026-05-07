@@ -917,6 +917,17 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             //           PCIe devices), best-effort PS/2 init.
             //   Late:   FB console install, virtio-gpu splash,
             //           end-of-boot panel.
+            // Verbose initcall trace — emits "init: <stage>/<name>
+            // ..." before each call and "-> ok|not-present|error"
+            // after. Diagnoses kernel hangs that swallow all
+            // output by surfacing the *last* initcall name
+            // before silence.
+            fn _init_log(line: &str) {
+                let _ = writeln!(console::Writer, "  {}", line);
+            }
+            narf_init::set_log_hook(_init_log);
+            narf_init::set_verbose_log(true);
+
             narf_input::register_initcalls();
             narf_drivers_nvme::register_initcalls();
             narf_drivers_virtio::register_initcalls();
