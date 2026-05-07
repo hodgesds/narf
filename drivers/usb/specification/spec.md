@@ -48,6 +48,29 @@ All driver code is derived strictly from the references below.
   Time Stamp" — USB-IF. Public. PTS = LE 32-bit; SCR = LE 32-bit
   SOF tick + 11-bit clock counter packed across 6 bytes.
 
+### USB CDC (Communications Device Class)
+
+- **USB Class Definitions for Communications Devices, Revision 1.2,
+  Errata 1** (USB-IF, November 2010 / errata July 2012). Public.
+  Common chapters: §3 (CDC architecture overview), §5.2 (Functional
+  Descriptors — Header / Union / Country Selection), §5.3 (Class-
+  specific interface descriptors), §6.2 (Common class-specific
+  requests).
+- **USB CDC Subclass Specification for PSTN Devices, Revision 1.2**
+  (USB-IF, February 2007). Public. §3.6.2.1 (ACM Functional
+  Descriptor + bmCapabilities), §6.3.1 (`SEND_ENCAPSULATED_COMMAND`),
+  §6.3.10 (`SET_LINE_CODING`), §6.3.11 (`GET_LINE_CODING`), §6.3.12
+  (`SET_CONTROL_LINE_STATE`), §6.5.4 (`SerialState` notification).
+- **USB Network Control Model (NCM) Specification, Revision 1.0
+  with Errata and Adopters Agreement** (USB-IF, September 2010 /
+  errata March 2014). Public. §3.2 (NTB-16 framing — NTH16 + NDP16
+  + datagrams), §3.3 (NTB-32 framing), §6.2.1
+  (`GET_NTB_PARAMETERS`), §6.2.4 (`GET_NTB_INPUT_SIZE`), §6.2.5
+  (`SET_NTB_INPUT_SIZE`), §7 (NCM Functional Descriptor).
+- **USB Ethernet Control Model (ECM) Specification, Revision 1.2**
+  (USB-IF, February 2007). Public. §5.4 (Ethernet Networking
+  Functional Descriptor), §6.2 (class-specific requests).
+
 ### USB Audio Class 1.0
 
 - **Universal Serial Bus Device Class Definition for Audio Devices,
@@ -93,6 +116,23 @@ All driver code is derived strictly from the references below.
   rate list and continuous-range form). Class triple constants for
   bus probing. Pure descriptor decode — pairs with a future
   isochronous-endpoint scheduler in `xhci` to ship audio data.
+- **CDC** (`cdc`): shared CDC functional-descriptor parser
+  (Header / Union / Country / ACM / NCM / ECM subtypes), CDC-Comm
+  + CDC-Data class-triple constants. Used by the per-subclass
+  drivers below.
+- **CDC-ACM** (`cdc_acm`): Abstract Control Model (USB serial)
+  codec. `LineCoding` builder/parser (baud + data bits + parity +
+  stop bits), `SET_LINE_CODING` / `GET_LINE_CODING` /
+  `SET_CONTROL_LINE_STATE` setup-packet builders, `SerialState`
+  notification decoder, ACM functional-descriptor capability bits.
+- **CDC-NCM** (`cdc_ncm`): Network Control Model 1.0 codec for
+  USB-Ethernet. NTB-16 framing — NTH16 (signature, header length,
+  sequence, block length, NDP index) + NDP16 (datagram-pointer
+  table with per-datagram offset + length entries). Encoder
+  packs N Ethernet datagrams into a single NTB; decoder validates
+  signatures + bounds and yields a borrow per datagram.
+  `NCM_NTB_PARAMETERS_STRUCTURE` decoder for the device-reported
+  size limits.
 
 ### Out of scope (deferred)
 - UAC2 / UAC3 (newer protocol byte; descriptor layouts differ).

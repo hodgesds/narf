@@ -6,6 +6,9 @@
 
 extern crate alloc;
 
+pub mod cdc;
+pub mod cdc_acm;
+pub mod cdc_ncm;
 pub mod hid;
 pub mod hub;
 pub mod msc;
