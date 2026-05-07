@@ -17,6 +17,7 @@ extern crate alloc;
 // link, and the linker's `KEEP(*(narf.tests))` would never see the
 // crate's test entries. (Crates that the kernel actually uses by
 // name pick themselves up — these are the test-only ones.)
+extern crate narf_bluetooth as _;
 extern crate narf_edid as _;
 extern crate narf_hid as _;
 

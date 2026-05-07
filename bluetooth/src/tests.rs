@@ -2059,3 +2059,114 @@ kernel_test_in!(
     "bluetooth/gap",
     smoke_gap_record_length_byte_covers_type_plus_payload
 );
+
+// ── HID Profile (Classic BT) ──────────────────────────────────────
+
+fn smoke_hidp_handshake_packet_round_trip() -> TestResult {
+    use crate::hid_profile::{build_handshake, decode_header, handshake, TransactionType};
+    let buf = build_handshake(handshake::SUCCESSFUL);
+    if buf.len() != 1 {
+        return TestResult::Fail("handshake should be 1 byte");
+    }
+    let h = decode_header(&buf).expect("header");
+    if h.transaction != TransactionType::Handshake || h.parameter != handshake::SUCCESSFUL {
+        return TestResult::Fail("handshake decode wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/hid", smoke_hidp_handshake_packet_round_trip);
+
+fn smoke_hidp_get_report_with_size_field() -> TestResult {
+    use crate::hid_profile::{build_get_report, ReportType};
+    let buf = build_get_report(ReportType::Input, Some(0x05), Some(0x40));
+    if buf.len() != 4 {
+        return TestResult::Fail("GET_REPORT with size = 1 hdr + 1 id + 2 size = 4 bytes");
+    }
+    if buf[0] >> 4 != 0x4 {
+        return TestResult::Fail("transaction byte wrong");
+    }
+    if buf[0] & 0x08 == 0 {
+        return TestResult::Fail("size flag should be set");
+    }
+    if buf[1] != 0x05 {
+        return TestResult::Fail("report id missing");
+    }
+    let sz = u16::from_le_bytes([buf[2], buf[3]]);
+    if sz != 0x40 {
+        return TestResult::Fail("size hint mis-encoded");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/hid", smoke_hidp_get_report_with_size_field);
+
+fn smoke_hidp_data_input_round_trip() -> TestResult {
+    use crate::hid_profile::{build_data, parse_input_data, ReportType};
+    let payload = [0x01u8, 0x02, 0x03];
+    let buf = build_data(ReportType::Input, &payload);
+    let body = parse_input_data(&buf).expect("input data");
+    if body != payload {
+        return TestResult::Fail("DATA(Input) round-trip failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/hid", smoke_hidp_data_input_round_trip);
+
+fn smoke_hidp_psm_constants_match_spec() -> TestResult {
+    use crate::hid_profile::{PSM_HID_CONTROL, PSM_HID_INTERRUPT};
+    if PSM_HID_CONTROL != 0x0011 || PSM_HID_INTERRUPT != 0x0013 {
+        return TestResult::Fail("HID PSMs wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/hid", smoke_hidp_psm_constants_match_spec);
+
+// ── USB HCI transport ─────────────────────────────────────────────
+
+fn smoke_btusb_recogniser_accepts_class_triple() -> TestResult {
+    use crate::usb_transport::is_bluetooth_hci;
+    let cfg: [u8; 25] = [
+        9, 2, 25, 0, 1, 1, 0, 0xA0, 0,
+        9, 4, 0, 0, 1, 0xE0, 0x01, 0x01, 0,
+        7, 5, 0x81, 0x03, 16, 0, 1,
+    ];
+    if !is_bluetooth_hci(&cfg) {
+        return TestResult::Fail("class 0xE0/0x01/0x01 should match");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/usb-transport", smoke_btusb_recogniser_accepts_class_triple);
+
+fn smoke_btusb_find_endpoints_returns_event_acl() -> TestResult {
+    use crate::usb_transport::find_endpoints;
+    // CONFIG + INTERFACE(HCI) + INT-IN(0x81) + BULK-OUT(0x02) + BULK-IN(0x82)
+    let cfg: [u8; 39] = [
+        9, 2, 39, 0, 1, 1, 0, 0xA0, 0,
+        9, 4, 0, 0, 3, 0xE0, 0x01, 0x01, 0,
+        7, 5, 0x81, 0x03, 16, 0, 1,
+        7, 5, 0x02, 0x02, 64, 0, 0,
+        7, 5, 0x82, 0x02, 64, 0, 0,
+    ];
+    let eps = find_endpoints(&cfg).expect("find");
+    if eps.event_ep != Some(0x81) || eps.acl_in_ep != Some(0x82) || eps.acl_out_ep != Some(0x02) {
+        return TestResult::Fail("endpoint addresses wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/usb-transport", smoke_btusb_find_endpoints_returns_event_acl);
+
+fn smoke_btusb_hci_command_setup_packet_shape() -> TestResult {
+    use crate::usb_transport::{build_hci_command, hci_command_setup, is_hci_command_setup};
+    let cmd = build_hci_command(0x0C03, &[]); // HCI_Reset
+    if cmd != [0x03, 0x0C, 0x00] {
+        return TestResult::Fail("HCI_Reset wire form wrong");
+    }
+    let setup = hci_command_setup(0, cmd.len() as u16);
+    if !is_hci_command_setup(&setup) {
+        return TestResult::Fail("setup recogniser rejected its own packet");
+    }
+    if setup[0] != 0x20 || setup[1] != 0x00 || setup[6] != 3 || setup[7] != 0 {
+        return TestResult::Fail("setup packet shape wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bluetooth/usb-transport", smoke_btusb_hci_command_setup_packet_shape);

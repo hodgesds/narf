@@ -29,6 +29,23 @@ Bluetooth subsystem source material was consulted at any point.**
   assignments), §3.1 (B-frame layout), §4 (signalling commands),
   §6.6 (segmentation / reassembly).
 
+### HID Profile (Classic BT, distinct from HOGP)
+
+- **Bluetooth SIG, "Human Interface Device (HID) Profile
+  Specification"**, Version 1.0, 22 May 2003.
+  <https://www.bluetooth.com/specifications/specs/human-interface-device-profile-1-0/>
+  - §5.2 — L2CAP fixed PSMs (Control 0x0011, Interrupt 0x0013).
+  - §7.4 — HIDP transactions (HANDSHAKE, HID_CONTROL, GET/SET_REPORT,
+    DATA, etc.).
+
+### USB HCI transport
+
+- **USB Class Definitions for Wireless Controllers**, v1.0,
+  USB-IF, 2007. Class triple `0xE0 / 0x01 / 0x01`.
+  <https://www.usb.org/document-library/usb-class-definitions-wireless-controllers-10>
+- **Bluetooth Core 5.4 Vol 4 Part B** — endpoint roles + Setup
+  packet shape for HCI Commands.
+
 ### ATT
 
 - **Bluetooth Core Specification, version 5.3, Vol 3 Part F** —

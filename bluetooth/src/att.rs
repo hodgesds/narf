@@ -117,16 +117,14 @@ impl Pdu {
     /// `true` if this opcode expects a response from the peer
     /// (§3.3.2). Commands and notifications do not.
     pub fn expects_response(&self) -> bool {
-        // Bit 6 of the opcode is the "Command Flag" — set means no
-        // response expected. Bit 7 is "Authentication Signature"; we
-        // strip it before checking.
-        let core = self.opcode & 0xBF;
-        // Notifications/indications have explicit no-response or
-        // separate confirmation handling.
-        !matches!(
-            core,
-            ATT_WRITE_CMD | ATT_HANDLE_VALUE_NTF | ATT_HANDLE_VALUE_CFM
-        ) && core & 0x40 == 0
+        // Bit 7 of the opcode is the "Authentication Signature"
+        // flag — strip it before classifying. Bit 6 is the
+        // "Command Flag" — when set, no response is expected.
+        let core = self.opcode & 0x7F;
+        if core & 0x40 != 0 {
+            return false;
+        }
+        !matches!(core, ATT_HANDLE_VALUE_NTF | ATT_HANDLE_VALUE_CFM)
     }
 }
 

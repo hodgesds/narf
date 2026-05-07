@@ -117,7 +117,11 @@ impl H5Header {
         let len = self.payload_len & 0x0FFF;
         let b1 = (ptype & 0x0F) | ((len & 0x000F) << 4) as u8;
         let b2 = ((len >> 4) & 0xFF) as u8;
-        let cks = ((!(b0 as u16 + b1 as u16 + b2 as u16) + 1) & 0xFF) as u8;
+        // Per Bluetooth Core Vol 4 Part D §8.3 the three header
+        // bytes plus this checksum must sum to 0xFF (byte
+        // arithmetic). Two's complement ((~x)+1) would make the
+        // sum 0, not 0xFF — we want one's complement.
+        let cks = !(b0.wrapping_add(b1).wrapping_add(b2));
         [b0, b1, b2, cks]
     }
 
