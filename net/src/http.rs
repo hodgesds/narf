@@ -249,6 +249,14 @@ pub fn iter_chunks<'a>(
             Err(_) => return Some(Err(HttpError::BadChunkSize)),
         };
         pos = i + 2;
+        if size == 0 {
+            // last-chunk per RFC 9112 §7.1 is `0CRLF` only — no
+            // CRLF on (empty) chunk-data. Trailers (if any) and
+            // the final body-terminator CRLF are the caller's
+            // problem.
+            done = true;
+            return Some(Ok(Chunk { data: &buf[pos..pos] }));
+        }
         if pos + size + 2 > buf.len() {
             return Some(Err(HttpError::Short));
         }
@@ -257,9 +265,6 @@ pub fn iter_chunks<'a>(
             return Some(Err(HttpError::BadChunkTerminator));
         }
         pos += size + 2;
-        if size == 0 {
-            done = true;
-        }
         Some(Ok(Chunk { data }))
     })
 }
