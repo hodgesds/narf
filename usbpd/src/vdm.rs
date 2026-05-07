@@ -3,8 +3,10 @@
 //! Specs:
 //! - USB Power Delivery 3.1 §6.4.4 (Vendor Defined Message). Public
 //!   USB-IF document.
+//!   <https://www.usb.org/document-library/usb-power-delivery>
 //! - VESA DisplayPort Alt Mode on USB Type-C Standard, Version 2.0.
 //!   Public VESA document.
+//!   <https://vesa.org/vesa-standards/>
 //!
 //! No GPL Linux `drivers/usb/typec/altmodes/` source consulted.
 //!

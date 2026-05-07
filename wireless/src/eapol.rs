@@ -2,9 +2,12 @@
 //!
 //! Specs:
 //! - IEEE Std 802.1X-2020 §11 (EAPOL frame format).
+//!   <https://standards.ieee.org/ieee/802.1X/7345/>
 //! - IEEE Std 802.11-2020 §12.7 (Keys and key distribution).
+//!   <https://standards.ieee.org/ieee/802.11/7028/>
 //! - IEEE Std 802.11-2020 §12.4 (SAE — for WPA3, scaffolded but the
 //!   actual ECC math lives in narf-crypto when it grows that surface).
+//!   <https://standards.ieee.org/ieee/802.11/7028/>
 //!
 //! Public IEEE standards. No GPL Linux `net/wireless/` source consulted.
 //!

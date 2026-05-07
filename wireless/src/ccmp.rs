@@ -1,6 +1,7 @@
 //! AES-CCMP — CTR-with-CBC-MAC frame encryption (clean-room).
 //!
 //! Spec: IEEE Std 802.11-2020 §12.5.3 (CCMP). Public IEEE document.
+//!   <https://standards.ieee.org/ieee/802.11/7028/>
 //! No GPL Linux source consulted.
 //!
 //! CCMP is the WPA2 (and WPA3-Personal-Compatibility) data-frame
@@ -8,6 +9,7 @@
 //! frame body and an 8-byte MIC at the tail. The cipher's block
 //! primitive is AES-128 in CCM mode (RFC 3610) with the 802.11-
 //! specific nonce + AAD construction this module owns.
+//!   <https://datatracker.ietf.org/doc/html/rfc3610>
 //!
 //! ## CCMP header layout (§12.5.3.2)
 //!

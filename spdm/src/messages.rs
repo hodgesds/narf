@@ -2,6 +2,7 @@
 //!
 //! Based on DSP0274: Security Protocol and Data Model (SPDM) Specification.
 //! Clean-room implementation following the wire format.
+//!   <https://www.dmtf.org/dsp/DSP0274>
 
 use alloc::vec::Vec;
 

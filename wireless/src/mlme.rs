@@ -2,6 +2,7 @@
 //!
 //! Spec: IEEE Std 802.11-2020, §9 (Frame Formats). Public IEEE
 //! standard. No GPL Linux `net/mac80211/` source consulted.
+//!   <https://standards.ieee.org/ieee/802.11/7028/>
 //!
 //! Today's surface is the parser/builder for the management frames a
 //! station emits/consumes during association: Beacon, Probe Request /

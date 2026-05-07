@@ -4,6 +4,7 @@
 //! every Standard message and a 32-bit extended header that prefixes
 //! Extended messages. Each message body carries 0..=7 Data Objects
 //! (32-bit, little-endian on the wire).
+//!   <https://www.usb.org/document-library/usb-power-delivery>
 //!
 //! Header layout (§6.2.1.1):
 //!

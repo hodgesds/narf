@@ -4,6 +4,9 @@
 //! sequence. We implement the linear path needed to land a fixed
 //! 5V contract from a connected source — extensions (PR/DR swap,
 //! PPS) come later.
+//!   <https://www.usb.org/document-library/usb-power-delivery>
+//!   <https://www.usb.org/document-library/usb-type-c-cable-and-connector-specification-revision-22>
+//!   <https://www.usb.org/document-library/usb-type-c-port-controller-interface-specification-revision-20>
 //!
 //! Phase order:
 //!

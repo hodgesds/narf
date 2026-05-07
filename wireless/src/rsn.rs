@@ -1,6 +1,7 @@
 //! RSN (Robust Security Network) Information Element (clean-room).
 //!
 //! Spec: IEEE Std 802.11-2020 §9.4.2.24. Public IEEE document.
+//!   <https://standards.ieee.org/ieee/802.11/7028/>
 //! No GPL Linux source consulted.
 //!
 //! The RSN IE is what STA and AP exchange in their Beacon /

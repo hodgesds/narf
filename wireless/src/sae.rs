@@ -2,6 +2,7 @@
 //!
 //! Spec: IEEE 802.11-2020 §12.4 (SAE). Public IEEE document. No
 //! GPL Linux source consulted.
+//!   <https://standards.ieee.org/ieee/802.11/7028/>
 //!
 //! SAE replaces the WPA2 4-Way Handshake's reliance on a shared
 //! pre-shared key with a Diffie-Hellman exchange that is

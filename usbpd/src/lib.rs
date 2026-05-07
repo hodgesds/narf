@@ -2,8 +2,11 @@
 //!
 //! Spec sources (public only):
 //! - USB Power Delivery Specification 3.1 v1.8 (USB-IF).
+//!   <https://www.usb.org/document-library/usb-power-delivery>
 //! - USB Type-C Cable and Connector Specification 2.2 (USB-IF).
+//!   <https://www.usb.org/document-library/usb-type-c-cable-and-connector-specification-revision-22>
 //! - USB Type-C Port Controller Interface Specification 2.0 (USB-IF).
+//!   <https://www.usb.org/document-library/usb-type-c-port-controller-interface-specification-revision-20>
 //!
 //! No GPL / Linux source consulted.
 //!

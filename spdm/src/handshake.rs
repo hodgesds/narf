@@ -7,6 +7,7 @@
 //!   §10.6 NEGOTIATE_ALGORITHMS / ALGORITHMS, §10.7 GET_DIGESTS /
 //!   DIGESTS, §10.8 GET_CERTIFICATE / CERTIFICATE, §10.9 CHALLENGE /
 //!   CHALLENGE_AUTH.
+//!   <https://www.dmtf.org/dsp/DSP0274>
 //!
 //! No GPL Linux source consulted.
 //!
