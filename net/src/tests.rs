@@ -2799,3 +2799,147 @@ fn smoke_tftp_decode_rejects_unknown_opcode() -> TestResult {
     }
 }
 kernel_test_in!("net/tftp", smoke_tftp_decode_rejects_unknown_opcode);
+
+
+
+// ── WireGuard codec ───────────────────────────────────────────────
+
+
+
+fn smoke_wireguard_handshake_initiation_round_trip() -> TestResult {
+
+    use crate::wireguard::{build_handshake_initiation, decode_handshake_initiation, HANDSHAKE_INITIATION_LEN};
+
+    let eph = [0xAAu8; 32];
+
+    let stat = [0xBBu8; 48];
+
+    let ts = [0xCCu8; 28];
+
+    let mac1 = [0xDDu8; 16];
+
+    let mac2 = [0x00u8; 16];
+
+    let buf = build_handshake_initiation(0xCAFEBABE, &eph, &stat, &ts, &mac1, &mac2);
+
+    if buf.len() != HANDSHAKE_INITIATION_LEN {
+
+        return TestResult::Fail("length");
+
+    }
+
+    let h = decode_handshake_initiation(&buf).expect("decode");
+
+    if h.sender_index != 0xCAFEBABE { return TestResult::Fail("sender"); }
+
+    if h.unencrypted_ephemeral != &eph { return TestResult::Fail("eph"); }
+
+    if h.encrypted_static != &stat { return TestResult::Fail("static"); }
+
+    if h.mac1 != &mac1 { return TestResult::Fail("mac1"); }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("net/wireguard", smoke_wireguard_handshake_initiation_round_trip);
+
+
+
+fn smoke_wireguard_handshake_response_round_trip() -> TestResult {
+
+    use crate::wireguard::{build_handshake_response, decode_handshake_response};
+
+    let eph = [0xEEu8; 32];
+
+    let aead = [0xFFu8; 16];
+
+    let mac1 = [0x11u8; 16];
+
+    let mac2 = [0x00u8; 16];
+
+    let buf = build_handshake_response(0xAA, 0xBB, &eph, &aead, &mac1, &mac2);
+
+    let h = decode_handshake_response(&buf).expect("decode");
+
+    if h.sender_index != 0xAA || h.receiver_index != 0xBB {
+
+        return TestResult::Fail("indices");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("net/wireguard", smoke_wireguard_handshake_response_round_trip);
+
+
+
+fn smoke_wireguard_transport_header_round_trip() -> TestResult {
+
+    use crate::wireguard::{build_transport_header, decode_transport_header};
+
+    let h = build_transport_header(0x12345678, 0xDEADBEEF_CAFEBABE);
+
+    let dec = decode_transport_header(&h).expect("decode");
+
+    if dec.receiver_index != 0x12345678 { return TestResult::Fail("receiver"); }
+
+    if dec.counter != 0xDEADBEEF_CAFEBABE { return TestResult::Fail("counter"); }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("net/wireguard", smoke_wireguard_transport_header_round_trip);
+
+
+
+fn smoke_wireguard_decode_rejects_nonzero_reserved() -> TestResult {
+
+    use crate::wireguard::{decode_handshake_initiation, WgError, HANDSHAKE_INITIATION_LEN};
+
+    let mut buf = alloc::vec![0u8; HANDSHAKE_INITIATION_LEN];
+
+    buf[0] = 1;
+
+    buf[2] = 0xAA; // reserved byte tampered
+
+    match decode_handshake_initiation(&buf) {
+
+        Err(WgError::NonZeroReserved) => TestResult::Pass,
+
+        _ => TestResult::Fail("reserved must be zero"),
+
+    }
+
+}
+
+kernel_test_in!("net/wireguard", smoke_wireguard_decode_rejects_nonzero_reserved);
+
+
+
+fn smoke_wireguard_anti_replay_window() -> TestResult {
+
+    use crate::wireguard::AntiReplay;
+
+    let mut ar = AntiReplay::default();
+
+    if !ar.check_and_update(1) { return TestResult::Fail("first packet"); }
+
+    if ar.check_and_update(1) { return TestResult::Fail("replay"); }
+
+    if !ar.check_and_update(5) { return TestResult::Fail("jump"); }
+
+    if !ar.check_and_update(2) { return TestResult::Fail("out-of-order ok"); }
+
+    if ar.check_and_update(2) { return TestResult::Fail("out-of-order replay"); }
+
+    if ar.check_and_update(0) { return TestResult::Fail("counter 0 reserved"); }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("net/wireguard", smoke_wireguard_anti_replay_window);

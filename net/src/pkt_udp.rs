@@ -2,8 +2,10 @@
 //!
 //! References (public-only):
 //! - RFC 768 — User Datagram Protocol (J. Postel, Aug 1980).
+//!   <https://datatracker.ietf.org/doc/html/rfc768>
 //! - RFC 1071 — Computing the Internet Checksum (mechanism reused
 //!   here against the UDP pseudo-header). Public IETF documents.
+//!   <https://datatracker.ietf.org/doc/html/rfc1071>
 //!
 //! No GPL Linux source consulted.
 //!

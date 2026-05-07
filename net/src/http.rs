@@ -4,8 +4,10 @@
 //! - RFC 9112 — HTTP/1.1 (R. Fielding et al, June 2022). §3 Message
 //!   Format. §4 Request Line. §5 Status Line. §6 Field Lines.
 //!   §7 Transfer Codings (chunked, §7.1).
+//!   <https://datatracker.ietf.org/doc/html/rfc9112>
 //! - RFC 9110 — HTTP Semantics — referenced for method + status
 //!   class enumeration; we keep the codec syntactic.
+//!   <https://datatracker.ietf.org/doc/html/rfc9110>
 //!
 //! No GPL Linux source consulted.
 //!

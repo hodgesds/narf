@@ -7,6 +7,7 @@
 //!   WINDOW_UPDATE, CONTINUATION). §3.4 (Connection Preface —
 //!   24-byte client magic). §6.5 (SETTINGS parameters).
 //!   §7 (Error Codes).
+//!   <https://datatracker.ietf.org/doc/html/rfc9113>
 //!
 //! No GPL Linux source consulted.
 //!

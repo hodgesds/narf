@@ -6,8 +6,10 @@
 //!   integer with 7-bit per-byte continuation encoding), §3.1
 //!   CONNECT Packet, §3.2 CONNACK, §3.3 PUBLISH, §3.8 SUBSCRIBE,
 //!   §3.13 PINGREQ / PINGRESP, §3.14 DISCONNECT, §3.15 AUTH.
+//!   <https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html>
 //! - "MQTT Version 3.1.1" — OASIS Standard, 29 October 2014. Public.
 //!   Referenced for the protocol-name "MQTT" + level=4 vs v5 level=5.
+//!   <https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html>
 //!
 //! No GPL Linux source consulted.
 //!

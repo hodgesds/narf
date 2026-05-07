@@ -7,8 +7,10 @@
 //!   MESSAGE-INTEGRITY-SHA256, ERROR-CODE, REALM, NONCE, USERHASH,
 //!   SOFTWARE, ALTERNATE-SERVER, FINGERPRINT, XOR-MAPPED-ADDRESS,
 //!   PASSWORD-ALGORITHMS, etc.). §14 STUN Method Numbering.
+//!   <https://datatracker.ietf.org/doc/html/rfc8489>
 //! - RFC 5780 — NAT Behavior Discovery extensions (referenced for
 //!   the older method numbering still used in some classic clients).
+//!   <https://datatracker.ietf.org/doc/html/rfc5780>
 //!
 //! No GPL Linux source consulted.
 //!

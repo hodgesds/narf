@@ -65,6 +65,7 @@ pub mod pkt_udp;
 pub mod stack;
 pub mod stun;
 pub mod tls;
+pub mod wireguard;
 pub mod ws;
 pub use stack::{AdminCap, AttachError, StackAttach, StackAttachReply, StackDaemon};
 

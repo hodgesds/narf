@@ -7,6 +7,7 @@
 //!   §5.3 (Client-to-Server Masking — 4-byte masking key XORed with
 //!   payload). §5.5 (Control Frames — Close / Ping / Pong with
 //!   payloads ≤ 125 bytes). §7.4 (Status Codes).
+//!   <https://datatracker.ietf.org/doc/html/rfc6455>
 //!
 //! No GPL Linux source consulted.
 //!
