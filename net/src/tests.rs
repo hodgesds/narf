@@ -732,3 +732,565 @@ fn smoke_dns_compression_loop_rejected() -> TestResult {
     }
 }
 kernel_test_in!("net/dns", smoke_dns_compression_loop_rejected);
+
+// ── DHCPv4 codec smokes ────────────────────────────────────────────
+
+fn smoke_dhcp_header_round_trip() -> TestResult {
+    use crate::pkt_dhcp::{DhcpHeader, FLAG_BROADCAST, HTYPE_ETHERNET, OP_BOOT_REQUEST};
+    let mut chaddr = [0u8; 16];
+    chaddr[..6].copy_from_slice(&[0x02, 0x42, 0xCA, 0xFE, 0xBE, 0xEF]);
+    let h = DhcpHeader {
+        op: OP_BOOT_REQUEST,
+        htype: HTYPE_ETHERNET,
+        hlen: 6,
+        hops: 0,
+        xid: 0xCAFE_BEEF,
+        secs: 0,
+        flags: FLAG_BROADCAST,
+        ciaddr: [0; 4],
+        yiaddr: [0; 4],
+        siaddr: [0; 4],
+        giaddr: [0; 4],
+        chaddr,
+    };
+    let mut buf = alloc::vec::Vec::new();
+    h.encode_into(&mut buf);
+    if buf.len() != 240 {
+        return TestResult::Fail("DHCP header = 240 bytes incl. magic cookie");
+    }
+    let back = DhcpHeader::decode(&buf).expect("decode");
+    if back != h {
+        return TestResult::Fail("header round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/dhcp", smoke_dhcp_header_round_trip);
+
+fn smoke_dhcp_decode_rejects_bad_magic() -> TestResult {
+    use crate::pkt_dhcp::{DhcpError, DhcpHeader};
+    let mut buf = [0u8; 240];
+    // No magic cookie at offset 236.
+    match DhcpHeader::decode(&buf) {
+        Err(DhcpError::BadMagic) => {}
+        _ => return TestResult::Fail("missing magic cookie must error"),
+    }
+    // Wrong cookie.
+    buf[236..240].copy_from_slice(&[0x99, 0x99, 0x99, 0x99]);
+    match DhcpHeader::decode(&buf) {
+        Err(DhcpError::BadMagic) => TestResult::Pass,
+        _ => TestResult::Fail("wrong cookie must error"),
+    }
+}
+kernel_test_in!("net/dhcp", smoke_dhcp_decode_rejects_bad_magic);
+
+fn smoke_dhcp_options_iterator_skips_pad_and_stops_on_end() -> TestResult {
+    use crate::pkt_dhcp::{iter_options, OPT_DHCP_MESSAGE_TYPE, OPT_END, OPT_PAD};
+    let buf = [
+        OPT_PAD,
+        OPT_PAD,
+        OPT_DHCP_MESSAGE_TYPE,
+        1,
+        3,
+        OPT_END,
+        0xFF,
+        0xFF, // garbage past END
+    ];
+    let recs: alloc::vec::Vec<_> = iter_options(&buf).collect();
+    if recs.len() != 1 {
+        return TestResult::Fail("only one option before END");
+    }
+    if recs[0].tag != OPT_DHCP_MESSAGE_TYPE || recs[0].data != [3] {
+        return TestResult::Fail("DHCP Message Type round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/dhcp", smoke_dhcp_options_iterator_skips_pad_and_stops_on_end);
+
+fn smoke_dhcp_build_discover_carries_required_options() -> TestResult {
+    use crate::pkt_dhcp::{
+        build_discover, iter_options, DhcpHeader, DHCPDISCOVER, DHCP_HDR_LEN,
+        OPT_CLIENT_IDENTIFIER, OPT_DHCP_MESSAGE_TYPE, OPT_PARAMETER_REQUEST_LIST,
+    };
+    let mac = [0x02, 0x42, 0xCA, 0xFE, 0xBE, 0xEF];
+    let pkt = build_discover(0x1234_5678, mac);
+    let h = DhcpHeader::decode(&pkt).expect("header");
+    if h.xid != 0x1234_5678 {
+        return TestResult::Fail("xid round-trip");
+    }
+    if h.flags & 0x8000 == 0 {
+        return TestResult::Fail("BROADCAST flag should be set");
+    }
+    let mut saw_msg = false;
+    let mut saw_cid = false;
+    let mut saw_prl = false;
+    for opt in iter_options(&pkt[DHCP_HDR_LEN..]) {
+        match opt.tag {
+            OPT_DHCP_MESSAGE_TYPE => {
+                if opt.data != [DHCPDISCOVER] {
+                    return TestResult::Fail("Message Type must be DHCPDISCOVER");
+                }
+                saw_msg = true;
+            }
+            OPT_CLIENT_IDENTIFIER => {
+                if opt.data.len() != 7 || opt.data[0] != 1 {
+                    return TestResult::Fail("Client ID must be hardware-type prefixed");
+                }
+                if &opt.data[1..7] != &mac {
+                    return TestResult::Fail("Client ID MAC mismatch");
+                }
+                saw_cid = true;
+            }
+            OPT_PARAMETER_REQUEST_LIST => saw_prl = true,
+            _ => {}
+        }
+    }
+    if !(saw_msg && saw_cid && saw_prl) {
+        return TestResult::Fail("missing required option");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/dhcp", smoke_dhcp_build_discover_carries_required_options);
+
+fn smoke_dhcp_build_request_carries_server_id_and_requested_ip() -> TestResult {
+    use crate::pkt_dhcp::{
+        build_request, iter_options, DHCP_HDR_LEN, OPT_REQUESTED_IP, OPT_SERVER_IDENTIFIER,
+    };
+    let pkt = build_request(0x9A, [0; 6], [10, 0, 0, 42], [10, 0, 0, 1]);
+    let mut requested = None;
+    let mut server = None;
+    for opt in iter_options(&pkt[DHCP_HDR_LEN..]) {
+        match opt.tag {
+            OPT_REQUESTED_IP => requested = Some(opt.data.to_vec()),
+            OPT_SERVER_IDENTIFIER => server = Some(opt.data.to_vec()),
+            _ => {}
+        }
+    }
+    if requested.as_deref() != Some(&[10u8, 0, 0, 42][..]) {
+        return TestResult::Fail("Requested IP option missing/incorrect");
+    }
+    if server.as_deref() != Some(&[10u8, 0, 0, 1][..]) {
+        return TestResult::Fail("Server Identifier option missing/incorrect");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/dhcp",
+    smoke_dhcp_build_request_carries_server_id_and_requested_ip
+);
+
+fn smoke_dhcp_message_type_constants() -> TestResult {
+    use crate::pkt_dhcp::{DHCPACK, DHCPDISCOVER, DHCPNAK, DHCPOFFER, DHCPREQUEST};
+    if DHCPDISCOVER != 1 || DHCPOFFER != 2 || DHCPREQUEST != 3 || DHCPACK != 5 || DHCPNAK != 6 {
+        return TestResult::Fail("RFC 2132 §9.6 message-type values");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/dhcp", smoke_dhcp_message_type_constants);
+
+// ── TLS 1.3 framing smokes ─────────────────────────────────────────
+
+fn smoke_tls_record_round_trip() -> TestResult {
+    use crate::tls::{Record, CONTENT_TYPE_HANDSHAKE, RECORD_HDR_LEN, TLS_VERSION_TLS_1_2};
+    let payload = [0xDEu8, 0xAD, 0xBE, 0xEF];
+    let rec = Record {
+        content_type: CONTENT_TYPE_HANDSHAKE,
+        legacy_version: TLS_VERSION_TLS_1_2,
+        fragment: &payload,
+    };
+    let mut out = alloc::vec::Vec::new();
+    rec.encode(&mut out);
+    if out.len() != RECORD_HDR_LEN + payload.len() {
+        return TestResult::Fail("encoded length");
+    }
+    let (back, n) = Record::decode(&out).expect("decode");
+    if n != out.len() {
+        return TestResult::Fail("decode should consume entire record");
+    }
+    if back != rec {
+        return TestResult::Fail("record round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tls", smoke_tls_record_round_trip);
+
+fn smoke_tls_record_rejects_oversize_length() -> TestResult {
+    use crate::tls::{Record, TlsError, MAX_CIPHERTEXT_LEN};
+    // Forge a header claiming a length one byte over the ceiling.
+    let too_big = (MAX_CIPHERTEXT_LEN + 1) as u16;
+    let mut buf = alloc::vec::Vec::with_capacity(5);
+    buf.push(0x17);
+    buf.extend_from_slice(&0x0303u16.to_be_bytes());
+    buf.extend_from_slice(&too_big.to_be_bytes());
+    match Record::decode(&buf) {
+        Err(TlsError::RecordTooLong) => TestResult::Pass,
+        _ => TestResult::Fail("oversize record must be rejected"),
+    }
+}
+kernel_test_in!("net/tls", smoke_tls_record_rejects_oversize_length);
+
+fn smoke_tls_handshake_message_round_trip() -> TestResult {
+    use crate::tls::{HandshakeMessage, HANDSHAKE_HDR_LEN, HS_CLIENT_HELLO};
+    let body = alloc::vec![0x42u8; 100];
+    let m = HandshakeMessage {
+        msg_type: HS_CLIENT_HELLO,
+        body: &body,
+    };
+    let mut out = alloc::vec::Vec::new();
+    m.encode(&mut out);
+    if out.len() != HANDSHAKE_HDR_LEN + body.len() {
+        return TestResult::Fail("handshake header is 4 bytes");
+    }
+    if out[1] != 0 || out[2] != 0 || out[3] != 100 {
+        return TestResult::Fail("length is 24-bit big-endian");
+    }
+    let (back, _) = HandshakeMessage::decode(&out).expect("decode");
+    if back != m {
+        return TestResult::Fail("handshake round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tls", smoke_tls_handshake_message_round_trip);
+
+fn smoke_tls_record_for_handshake_uses_legacy_version() -> TestResult {
+    use crate::tls::{
+        record_for_handshake, HandshakeMessage, Record, CONTENT_TYPE_HANDSHAKE, HS_SERVER_HELLO,
+        TLS_VERSION_TLS_1_2,
+    };
+    let body = [0u8; 16];
+    let m = HandshakeMessage {
+        msg_type: HS_SERVER_HELLO,
+        body: &body,
+    };
+    let bytes = record_for_handshake(&m);
+    let (rec, _) = Record::decode(&bytes).expect("decode");
+    if rec.content_type != CONTENT_TYPE_HANDSHAKE {
+        return TestResult::Fail("ContentType = handshake");
+    }
+    if rec.legacy_version != TLS_VERSION_TLS_1_2 {
+        return TestResult::Fail("RFC 8446: legacy_record_version = 0x0303");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/tls",
+    smoke_tls_record_for_handshake_uses_legacy_version
+);
+
+fn smoke_tls_alert_round_trip() -> TestResult {
+    use crate::tls::{Alert, ALERT_CLOSE_NOTIFY, ALERT_LEVEL_WARNING};
+    let a = Alert {
+        level: ALERT_LEVEL_WARNING,
+        description: ALERT_CLOSE_NOTIFY,
+    };
+    let bytes = a.encode();
+    let back = Alert::decode(&bytes).expect("decode");
+    if back != a {
+        return TestResult::Fail("alert round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tls", smoke_tls_alert_round_trip);
+
+fn smoke_tls_record_for_alert_layout() -> TestResult {
+    use crate::tls::{
+        record_for_alert, Alert, Record, ALERT_HANDSHAKE_FAILURE, ALERT_LEVEL_FATAL,
+        CONTENT_TYPE_ALERT,
+    };
+    let bytes = record_for_alert(Alert {
+        level: ALERT_LEVEL_FATAL,
+        description: ALERT_HANDSHAKE_FAILURE,
+    });
+    let (rec, _) = Record::decode(&bytes).expect("decode");
+    if rec.content_type != CONTENT_TYPE_ALERT {
+        return TestResult::Fail("ContentType = alert");
+    }
+    if rec.fragment != [ALERT_LEVEL_FATAL, ALERT_HANDSHAKE_FAILURE] {
+        return TestResult::Fail("alert payload mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tls", smoke_tls_record_for_alert_layout);
+
+fn smoke_tls_extension_constants() -> TestResult {
+    use crate::tls::{
+        EXT_KEY_SHARE, EXT_PRE_SHARED_KEY, EXT_SERVER_NAME, EXT_SUPPORTED_VERSIONS,
+    };
+    if EXT_SERVER_NAME != 0 {
+        return TestResult::Fail("server_name = 0");
+    }
+    if EXT_PRE_SHARED_KEY != 41 {
+        return TestResult::Fail("pre_shared_key = 41");
+    }
+    if EXT_SUPPORTED_VERSIONS != 43 {
+        return TestResult::Fail("supported_versions = 43");
+    }
+    if EXT_KEY_SHARE != 51 {
+        return TestResult::Fail("key_share = 51");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tls", smoke_tls_extension_constants);
+
+// ── HTTP/1.1 framing smokes ────────────────────────────────────────
+
+fn smoke_http_request_line_round_trip() -> TestResult {
+    use crate::http::RequestLine;
+    let r = RequestLine {
+        method: alloc::string::String::from("GET"),
+        target: alloc::string::String::from("/index.html"),
+        version: alloc::string::String::from("HTTP/1.1"),
+    };
+    let mut out = alloc::vec::Vec::new();
+    r.encode(&mut out);
+    if &out[..] != b"GET /index.html HTTP/1.1\r\n" {
+        return TestResult::Fail("request-line wire form");
+    }
+    let (back, used) = RequestLine::decode(&out).expect("decode");
+    if used != out.len() {
+        return TestResult::Fail("decode should consume CRLF");
+    }
+    if back != r {
+        return TestResult::Fail("request-line round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/http", smoke_http_request_line_round_trip);
+
+fn smoke_http_status_line_round_trip() -> TestResult {
+    use crate::http::StatusLine;
+    let s = StatusLine {
+        version: alloc::string::String::from("HTTP/1.1"),
+        status_code: 404,
+        reason: alloc::string::String::from("Not Found"),
+    };
+    let mut out = alloc::vec::Vec::new();
+    s.encode(&mut out);
+    if &out[..] != b"HTTP/1.1 404 Not Found\r\n" {
+        return TestResult::Fail("status-line wire form");
+    }
+    let (back, _) = StatusLine::decode(&out).expect("decode");
+    if back != s {
+        return TestResult::Fail("status-line round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/http", smoke_http_status_line_round_trip);
+
+fn smoke_http_headers_round_trip() -> TestResult {
+    use crate::http::{append_end_of_headers, append_field, parse_headers};
+    let mut out = alloc::vec::Vec::new();
+    append_field(&mut out, "Host", "example.com");
+    append_field(&mut out, "Content-Length", "5");
+    append_field(&mut out, "Connection", "close");
+    append_end_of_headers(&mut out);
+    let (fields, used) = parse_headers(&out).expect("parse");
+    if used != out.len() {
+        return TestResult::Fail("parse should consume the empty terminator line");
+    }
+    if fields.len() != 3 {
+        return TestResult::Fail("expected 3 fields");
+    }
+    if fields[0].name != "Host" || fields[0].value != "example.com" {
+        return TestResult::Fail("Host field round-trip");
+    }
+    if fields[1].name != "Content-Length" || fields[1].value != "5" {
+        return TestResult::Fail("Content-Length field round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/http", smoke_http_headers_round_trip);
+
+fn smoke_http_headers_handle_obs_fold_whitespace() -> TestResult {
+    use crate::http::parse_headers;
+    let buf = b"X-Trim:    value-with-leading-and-trailing-ows   \r\n\r\n";
+    let (fields, _) = parse_headers(buf).expect("parse");
+    if fields[0].value != "value-with-leading-and-trailing-ows" {
+        return TestResult::Fail("OWS around field-value should be trimmed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/http", smoke_http_headers_handle_obs_fold_whitespace);
+
+fn smoke_http_headers_reject_missing_colon() -> TestResult {
+    use crate::http::{parse_headers, HttpError};
+    let buf = b"BogusLineWithoutColon\r\n\r\n";
+    match parse_headers(buf) {
+        Err(HttpError::BadFieldLine) => TestResult::Pass,
+        _ => TestResult::Fail("missing-colon line must error"),
+    }
+}
+kernel_test_in!("net/http", smoke_http_headers_reject_missing_colon);
+
+fn smoke_http_chunked_round_trip() -> TestResult {
+    use crate::http::{encode_chunk, iter_chunks};
+    let mut out = alloc::vec::Vec::new();
+    encode_chunk(&mut out, b"hello ");
+    encode_chunk(&mut out, b"world");
+    encode_chunk(&mut out, &[]); // terminator
+    let chunks: alloc::vec::Vec<_> = iter_chunks(&out).collect::<Result<_, _>>().expect("decode");
+    if chunks.len() != 3 {
+        return TestResult::Fail("expected 3 chunks (incl. terminator)");
+    }
+    if chunks[0].data != b"hello " {
+        return TestResult::Fail("first chunk data");
+    }
+    if chunks[1].data != b"world" {
+        return TestResult::Fail("second chunk data");
+    }
+    if !chunks[2].data.is_empty() {
+        return TestResult::Fail("terminator must be empty");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/http", smoke_http_chunked_round_trip);
+
+fn smoke_http_chunked_strips_chunk_ext() -> TestResult {
+    use crate::http::iter_chunks;
+    // 5 bytes of data, with a chunk-ext that should be ignored.
+    let buf = b"5;ext=value\r\nhello\r\n0\r\n";
+    let chunks: alloc::vec::Vec<_> =
+        iter_chunks(buf).collect::<Result<_, _>>().expect("decode");
+    if chunks[0].data != b"hello" {
+        return TestResult::Fail("chunk-ext was not stripped");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/http", smoke_http_chunked_strips_chunk_ext);
+
+// ── mDNS / DNS-SD smokes ───────────────────────────────────────────
+
+fn smoke_mdns_multicast_addresses() -> TestResult {
+    use crate::pkt_mdns::{MDNS_IPV4_GROUP, MDNS_IPV6_GROUP, MDNS_PORT};
+    if MDNS_PORT != 5353 {
+        return TestResult::Fail("mDNS UDP port = 5353");
+    }
+    if MDNS_IPV4_GROUP != [224, 0, 0, 251] {
+        return TestResult::Fail("IPv4 group = 224.0.0.251");
+    }
+    if MDNS_IPV6_GROUP[0] != 0xFF || MDNS_IPV6_GROUP[15] != 0xFB {
+        return TestResult::Fail("IPv6 group = FF02::FB");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/mdns", smoke_mdns_multicast_addresses);
+
+fn smoke_mdns_class_helpers_split_and_recombine() -> TestResult {
+    use crate::pkt_mdns::{
+        class_with_cache_flush, class_without_cache_flush, qclass_with_unicast_response,
+        qclass_without_unicast_bit,
+    };
+    let cls = class_with_cache_flush(1);
+    if cls & 0x8000 == 0 {
+        return TestResult::Fail("cache-flush bit at top of CLASS");
+    }
+    if class_without_cache_flush(cls) != 1 {
+        return TestResult::Fail("strip cache-flush bit");
+    }
+    let qcls = qclass_with_unicast_response(1);
+    if qcls & 0x8000 == 0 {
+        return TestResult::Fail("unicast-response bit at top of QCLASS");
+    }
+    if qclass_without_unicast_bit(qcls) != 1 {
+        return TestResult::Fail("strip unicast bit");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/mdns", smoke_mdns_class_helpers_split_and_recombine);
+
+fn smoke_mdns_browse_name_format() -> TestResult {
+    use crate::pkt_mdns::{service_browse_name, services_meta_name};
+    if services_meta_name() != "_services._dns-sd._udp.local" {
+        return TestResult::Fail("services meta-query name (RFC 6763 §9)");
+    }
+    let n = service_browse_name("_http", "_tcp");
+    if n != "_http._tcp.local" {
+        return TestResult::Fail("service browsing name");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/mdns", smoke_mdns_browse_name_format);
+
+fn smoke_mdns_query_response_headers() -> TestResult {
+    use crate::pkt_mdns::{query_header, response_header};
+    use crate::pkt_dns::{FLAG_AA, FLAG_QR};
+    let q = query_header(2);
+    if q.id != 0 {
+        return TestResult::Fail("mDNS query ID = 0");
+    }
+    if q.flags & FLAG_QR != 0 {
+        return TestResult::Fail("query has QR=0");
+    }
+    if q.qdcount != 2 {
+        return TestResult::Fail("qdcount round-trip");
+    }
+    let r = response_header(3, 1);
+    if r.flags & FLAG_QR == 0 {
+        return TestResult::Fail("response has QR=1");
+    }
+    if r.flags & FLAG_AA == 0 {
+        return TestResult::Fail("response has AA=1 per RFC 6762");
+    }
+    if r.ancount != 3 || r.arcount != 1 {
+        return TestResult::Fail("counts round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/mdns", smoke_mdns_query_response_headers);
+
+fn smoke_mdns_txt_rdata_round_trip() -> TestResult {
+    use crate::pkt_mdns::{build_txt_rdata, parse_txt_rdata};
+    let rdata = build_txt_rdata(&["path=/api", "version=1.0", "secure"]);
+    let parsed = parse_txt_rdata(&rdata);
+    if parsed.len() != 3 {
+        return TestResult::Fail("expected 3 TXT entries");
+    }
+    if parsed[0] != "path=/api" {
+        return TestResult::Fail("TXT entry 0");
+    }
+    if parsed[2] != "secure" {
+        return TestResult::Fail("flag-style entry without =");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/mdns", smoke_mdns_txt_rdata_round_trip);
+
+fn smoke_mdns_txt_empty_emits_zero_length_string() -> TestResult {
+    use crate::pkt_mdns::{build_txt_rdata, parse_txt_rdata};
+    let rdata = build_txt_rdata(&[]);
+    if rdata != [0u8] {
+        return TestResult::Fail("empty TXT must be a single zero-length string");
+    }
+    let parsed = parse_txt_rdata(&rdata);
+    if !parsed.is_empty() {
+        return TestResult::Fail("zero-length string parses to empty list");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/mdns", smoke_mdns_txt_empty_emits_zero_length_string);
+
+fn smoke_mdns_srv_round_trip() -> TestResult {
+    use crate::pkt_mdns::SrvRecord;
+    let s = SrvRecord {
+        priority: 10,
+        weight: 60,
+        port: 8080,
+        target: alloc::string::String::from("server.local"),
+    };
+    let rdata = s.encode();
+    if rdata[0] != 0 || rdata[1] != 10 || rdata[2] != 0 || rdata[3] != 60 {
+        return TestResult::Fail("SRV priority/weight big-endian");
+    }
+    if rdata[4] != 0x1F || rdata[5] != 0x90 {
+        return TestResult::Fail("SRV port BE");
+    }
+    // Wrap in a synthetic message with a fake DNS header so decode can
+    // resolve the (uncompressed) target.
+    let mut msg: alloc::vec::Vec<u8> = alloc::vec![0u8; 12];
+    msg.extend_from_slice(&rdata);
+    let back = SrvRecord::decode(&msg, 12, rdata.len()).expect("decode");
+    if back != s {
+        return TestResult::Fail("SRV round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/mdns", smoke_mdns_srv_round_trip);

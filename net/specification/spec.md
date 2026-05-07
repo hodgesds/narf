@@ -469,3 +469,65 @@ References (public-only, all IETF documents):
   RR type + class constants.
 
 **No GPL Linux source consulted.**
+
+## 12. App-layer codecs (`pkt_dhcp`, `tls`, `http`, `pkt_mdns`)
+
+The networking axis cycle continued past raw L4 codecs into the
+app-layer protocols a usable kernel network stack needs the moment
+its Ethernet driver brings up a link. References (public-only):
+
+### DHCPv4 (`pkt_dhcp`)
+- **RFC 2131** — Dynamic Host Configuration Protocol (R. Droms,
+  Mar 1997). §2 BOOTP-derived 240-byte fixed header.
+- **RFC 2132** — DHCP Options and BOOTP Vendor Extensions
+  (S. Alexander & R. Droms, Mar 1997). All numbered options.
+- **RFC 951 / 1497** — BOOTP base + 0x63825363 magic cookie.
+- Surfaced: `DhcpHeader::encode_into`/`decode`, options iterator
+  + builders, message-type constants
+  (DISCOVER/OFFER/REQUEST/DECLINE/ACK/NAK/RELEASE/INFORM), and
+  `build_discover` / `build_request` convenience.
+
+### TLS 1.3 record-layer (`tls`)
+- **RFC 8446** — TLS 1.3 (E. Rescorla, Aug 2018). §5.1 Record
+  Layer (5-byte TLSPlaintext header — type / legacy_record_version
+  / length). §4 Handshake Protocol (1-byte msg_type + 24-bit BE
+  length). §6 Alert Protocol (level + description). §B.1–B.4
+  ContentType / HandshakeType / AlertDescription / ExtensionType
+  enumerations.
+- Surfaced: `Record::encode/decode` with the (1<<14)+256 ciphertext
+  ceiling, `HandshakeMessage::encode/decode` with 24-bit BE length,
+  `Alert::encode/decode`, `record_for_handshake` /
+  `record_for_alert` builders that pin the spec-required
+  legacy_record_version = 0x0303 invariant. Constants for
+  ContentType / HandshakeType / AlertDescription / common
+  ExtensionType values (server_name = 0, supported_versions = 43,
+  key_share = 51, etc.). **No crypto** — codec-only.
+
+### HTTP/1.1 framing (`http`)
+- **RFC 9112** — HTTP/1.1 (R. Fielding et al, June 2022). §3
+  Message Format. §4 Request Line. §5 Status Line. §6 Field Lines.
+  §7.1 Chunked Transfer Coding.
+- Surfaced: `RequestLine::encode/decode`, `StatusLine::encode/
+  decode`, `parse_headers` + `append_field` + `append_end_of_headers`
+  with OWS trimming, `iter_chunks` / `encode_chunk` for chunked
+  bodies including chunk-ext stripping, terminating zero-length
+  chunk handling.
+
+### mDNS / DNS-SD (`pkt_mdns`)
+- **RFC 6762** — Multicast DNS (S. Cheshire & M. Krochmal, Feb
+  2013). §5 transport (UDP port 5353, IPv4 224.0.0.251 / IPv6
+  FF02::FB). §10.2 cache-flush bit at top of CLASS in answers.
+  §18.12 unicast-response bit at top of QCLASS in questions.
+- **RFC 6763** — DNS-Based Service Discovery. §4 service-type
+  browsing via PTR queries for `_service._proto.local`. §6 TXT
+  records: 1-byte-length-prefixed key=value strings.
+- **RFC 2782** — DNS SRV records (priority + weight + port +
+  target).
+- Surfaced: multicast address constants, class-helper functions
+  for the cache-flush + unicast-response top bits, query/response
+  header builders that pin the mDNS conventions (id=0, AA=1 on
+  responses), TXT RDATA build + parse, `SrvRecord` encode/decode
+  on top of the existing DNS name codec, `services_meta_name`
+  + `service_browse_name` helpers.
+
+**No GPL Linux source consulted.**
