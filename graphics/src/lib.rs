@@ -181,6 +181,7 @@ pub mod cursor;
 pub mod dp_aux;
 pub mod dp_psr;
 pub mod dsc;
+pub mod dsi;
 pub mod edid;
 pub mod font8x8;
 pub mod splash;
