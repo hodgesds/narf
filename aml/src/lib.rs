@@ -244,17 +244,41 @@ pub fn find_node(path: &str) -> Option<AmlNode> {
 }
 
 /// Iterate every Device node, calling `f` with its path.
+///
+/// `f` is called with the lock **released** — taking a snapshot
+/// up-front lets the closure freely call other namespace APIs
+/// (`find_node`, `evaluate_method`, etc.) that re-acquire
+/// `NAMESPACE.lock()`. Without this, drivers like `acpi-fan` that
+/// look up `<device>._HID` for every iterated device deadlock on
+/// the non-recursive spinlock.
 pub fn for_each_device<F: FnMut(&AmlNode)>(mut f: F) {
-    let g = NAMESPACE.lock();
-    for n in g.nodes.iter().filter(|n| n.kind == NodeKind::Device) {
+    let snapshot: alloc::vec::Vec<AmlNode> = {
+        let g = NAMESPACE.lock();
+        g.nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Device)
+            .cloned()
+            .collect()
+    };
+    for n in &snapshot {
         f(n);
     }
 }
 
 /// Iterate every node of a specific kind, calling `f`.
+///
+/// Same lock-released-during-callback contract as
+/// [`for_each_device`].
 pub fn for_each_node_of_kind<F: FnMut(&AmlNode)>(kind: NodeKind, mut f: F) {
-    let g = NAMESPACE.lock();
-    for n in g.nodes.iter().filter(|n| n.kind == kind) {
+    let snapshot: alloc::vec::Vec<AmlNode> = {
+        let g = NAMESPACE.lock();
+        g.nodes
+            .iter()
+            .filter(|n| n.kind == kind)
+            .cloned()
+            .collect()
+    };
+    for n in &snapshot {
         f(n);
     }
 }
