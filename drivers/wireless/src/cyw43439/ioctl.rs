@@ -232,7 +232,7 @@ pub mod tests {
         // SET_VAR with a 12-byte payload should produce a frame with
         //   HW (4) + SW (8) + BCDC (16) + payload (12) = 40 bytes,
         // already 4-byte aligned, no padding.
-        let payload = b"country\x00US\x00\x00\x00";
+        let payload: &[u8] = b"country\x00US\x00\x00";
         let frame = build_request(1, 0xBEEF, 0, Direction::Set, WLC_SET_VAR, payload);
         if frame.len() != HW_HEADER_LEN + SW_HEADER_LEN + BCDC_HEADER_LEN + payload.len() {
             return TestResult::Fail("frame length wrong");
