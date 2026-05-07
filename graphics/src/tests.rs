@@ -786,3 +786,161 @@ fn smoke_dsi_crc16_ccitt_known_vector() -> TestResult {
 }
 
 kernel_test_in!("graphics/dsi", smoke_dsi_crc16_ccitt_known_vector);
+
+
+
+// ── MIPI CSI-2 packet codec ───────────────────────────────────────
+
+
+
+fn smoke_csi2_short_packet_round_trip() -> TestResult {
+
+    use crate::csi2::{build_short, decode_short, dt};
+
+    let buf = build_short(2, dt::FRAME_START, 0x1234);
+
+    let p = decode_short(&buf).expect("decode");
+
+    if p.virtual_channel != 2 || p.data_type != dt::FRAME_START || p.data != 0x1234 {
+
+        return TestResult::Fail("short round-trip");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("graphics/csi2", smoke_csi2_short_packet_round_trip);
+
+
+
+fn smoke_csi2_long_packet_payload_round_trip() -> TestResult {
+
+    use crate::csi2::{build_long, decode_long_payload, dt};
+
+    let payload: [u8; 8] = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80];
+
+    let buf = build_long(0, dt::RAW10, &payload);
+
+    let (h, body) = decode_long_payload(&buf).expect("decode");
+
+    if h.data_type != dt::RAW10 || h.word_count != 8 {
+
+        return TestResult::Fail("long header");
+
+    }
+
+    if body != payload {
+
+        return TestResult::Fail("payload");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("graphics/csi2", smoke_csi2_long_packet_payload_round_trip);
+
+
+
+fn smoke_csi2_long_packet_crc_detects_corruption() -> TestResult {
+
+    use crate::csi2::{build_long, decode_long_payload, dt, CsiError};
+
+    let mut buf = build_long(0, dt::RAW8, &[0xAA, 0xBB, 0xCC, 0xDD]);
+
+    buf[5] ^= 0x10;
+
+    match decode_long_payload(&buf) {
+
+        Err(CsiError::BadCrc) => TestResult::Pass,
+
+        _ => TestResult::Fail("CRC must reject corruption"),
+
+    }
+
+}
+
+kernel_test_in!("graphics/csi2", smoke_csi2_long_packet_crc_detects_corruption);
+
+
+
+fn smoke_csi2_reassembler_tracks_frame_boundaries() -> TestResult {
+
+    use crate::csi2::{build_short, decode_short, dt, Reassembler, StreamEvent};
+
+    let mut r = Reassembler::new();
+
+    let fs = decode_short(&build_short(0, dt::FRAME_START, 7)).expect("fs");
+
+    if !matches!(r.feed_short(fs), StreamEvent::FrameBegan { frame: 7 }) {
+
+        return TestResult::Fail("FS");
+
+    }
+
+    if !r.in_frame {
+
+        return TestResult::Fail("in_frame");
+
+    }
+
+    let ls = decode_short(&build_short(0, dt::LINE_START, 100)).expect("ls");
+
+    if !matches!(r.feed_short(ls), StreamEvent::LineBegan { line: 100 }) {
+
+        return TestResult::Fail("LS");
+
+    }
+
+    let fe = decode_short(&build_short(0, dt::FRAME_END, 7)).expect("fe");
+
+    if !matches!(r.feed_short(fe), StreamEvent::FrameEnded { frame: 7 }) {
+
+        return TestResult::Fail("FE");
+
+    }
+
+    if r.in_frame {
+
+        return TestResult::Fail("frame should end");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("graphics/csi2", smoke_csi2_reassembler_tracks_frame_boundaries);
+
+
+
+fn smoke_csi2_data_type_constants() -> TestResult {
+
+    use crate::csi2::{dt, is_sync_short};
+
+    if !is_sync_short(dt::FRAME_START)
+
+        || !is_sync_short(dt::LINE_END)
+
+        || is_sync_short(dt::RAW10)
+
+    {
+
+        return TestResult::Fail("sync classifier");
+
+    }
+
+    if dt::RAW10 != 0x2B || dt::YUV422_8 != 0x1E || dt::RGB888 != 0x24 {
+
+        return TestResult::Fail("data type values");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("graphics/csi2", smoke_csi2_data_type_constants);

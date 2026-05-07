@@ -179,6 +179,7 @@ impl Framebuffer {
 pub mod console;
 pub mod cursor;
 pub mod dp_aux;
+pub mod csi2;
 pub mod dp_psr;
 pub mod dsc;
 pub mod dsi;
