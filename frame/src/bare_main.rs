@@ -927,6 +927,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             }
             narf_init::set_log_hook(_init_log);
             narf_init::set_verbose_log(true);
+            // Per-driver probe trace — same shape as init-log but
+            // for the bus walker's per-device dispatch. Surfaces a
+            // hung probe by name + (vendor:device) before silence.
+            narf_bus::set_probe_log_hook(_init_log);
+            narf_bus::set_probe_log(true);
 
             narf_input::register_initcalls();
             narf_drivers_nvme::register_initcalls();

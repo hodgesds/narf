@@ -193,12 +193,101 @@ pub fn probe_all(
                 continue;
             }
         };
-        match (m.probe)(*d, cap) {
+        // Per-device probe trace through the optional `LogHook`.
+        // Off by default; the kernel-test runner / bring-up
+        // path enables it via `set_probe_log` to localise hangs
+        // inside an individual driver's probe.
+        let _name = m.name;
+        let _vid = d.id.vendor;
+        let _did = d.id.device;
+        if PROBE_LOG.load(core::sync::atomic::Ordering::Acquire) {
+            probe_log(_name, _vid, _did, /*pre=*/ true, None);
+        }
+        let result = (m.probe)(*d, cap);
+        if PROBE_LOG.load(core::sync::atomic::Ordering::Acquire) {
+            let err_dbg: Option<ProbeError> = result.err();
+            probe_log(_name, _vid, _did, /*pre=*/ false, err_dbg);
+        }
+        match result {
             Ok(()) => bound += 1,
             Err(e) => log_probe_failure(m, d, e),
         }
     }
     Ok(bound)
+}
+
+// ── Per-probe trace (verbose-mode boot diagnostic) ───────────────
+
+use core::sync::atomic::AtomicBool;
+
+/// Optional log hook for emitting "probe: <name> [VVVV:DDDD] ..."
+/// breadcrumbs. Wired up by the bring-up path (frame::bare_main)
+/// when verbose tracing is on.
+pub type ProbeLogHook = fn(&str);
+static PROBE_LOG_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static PROBE_LOG: AtomicBool = AtomicBool::new(false);
+
+pub fn set_probe_log_hook(h: ProbeLogHook) {
+    PROBE_LOG_HOOK.store(h as usize, core::sync::atomic::Ordering::Release);
+}
+
+pub fn set_probe_log(on: bool) {
+    PROBE_LOG.store(on, core::sync::atomic::Ordering::Release);
+}
+
+fn probe_log(name: &str, vid: u16, did: u16, pre: bool, err: Option<ProbeError>) {
+    let h = PROBE_LOG_HOOK.load(core::sync::atomic::Ordering::Acquire);
+    if h == 0 {
+        return;
+    }
+    // SAFETY: `h` was stored as `ProbeLogHook as usize` via
+    // `set_probe_log_hook`.
+    let f: ProbeLogHook = unsafe { core::mem::transmute(h) };
+    let mut buf = [0u8; 256];
+    let mut w = TruncatingWriter::new(&mut buf);
+    use core::fmt::Write;
+    if pre {
+        let _ = write!(&mut w, "probe: {} [{:04x}:{:04x}] ...", name, vid, did);
+    } else {
+        match err {
+            None => {
+                let _ = write!(&mut w, "probe: {} [{:04x}:{:04x}] -> ok", name, vid, did);
+            }
+            Some(e) => {
+                let _ = write!(
+                    &mut w,
+                    "probe: {} [{:04x}:{:04x}] -> err: {:?}",
+                    name, vid, did, e
+                );
+            }
+        }
+    }
+    f(w.as_str());
+}
+
+struct TruncatingWriter<'a> {
+    buf: &'a mut [u8],
+    cur: usize,
+}
+impl<'a> TruncatingWriter<'a> {
+    fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, cur: 0 }
+    }
+    fn as_str(&self) -> &str {
+        // SAFETY: `cur` only advances over written ASCII via
+        // `write_str`, which performs UTF-8 validation.
+        unsafe { core::str::from_utf8_unchecked(&self.buf[..self.cur]) }
+    }
+}
+impl<'a> core::fmt::Write for TruncatingWriter<'a> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let bytes = s.as_bytes();
+        let room = self.buf.len().saturating_sub(self.cur);
+        let n = room.min(bytes.len());
+        self.buf[self.cur..self.cur + n].copy_from_slice(&bytes[..n]);
+        self.cur += n;
+        Ok(())
+    }
 }
 
 /// Probe-failure observability hook. Wave-3a stub: drops the
