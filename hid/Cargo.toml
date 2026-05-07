@@ -1,0 +1,21 @@
+[package]
+name         = "narf-hid"
+description  = "Transport-neutral HID 1.11 report-descriptor + report-value codec. Clean-room from public usb.org HID 1.11 + USB-IF HID Usage Tables 1.4."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_hid"
+path = "src/lib.rs"
+
+[dependencies]
+narf-kernel-test  = { path = "../verification/kernel-test" }
+
+[features]
+kernel-test = []
+
+[lints]
+workspace = true

@@ -515,8 +515,9 @@ kernel_test_in!("edid/displayid", smoke_displayid_checksum_required);
 fn smoke_displayid_type_vii_decodes_4k60() -> TestResult {
     use crate::displayid::{compute_checksum, DataBlock, Section, DB_TYPE_VII_TIMING};
     // Build a Type VII block carrying one 20-byte timing for
-    // 3840x2160@60Hz with 533.25 MHz pixel clock (CTA VIC 97).
-    //   pixel_clock = 533250 kHz → encoded = 533249 LE 24-bit
+    // 3840x2160@60Hz RGB with 594.00 MHz pixel clock (CTA-861 VIC
+    // 97). Per VIC 97: 4400 × 2250 × 60 = 594,000,000 Hz.
+    //   pixel_clock = 594_000 kHz → encoded = 593_999 LE 24-bit
     //   h_active = 3840 → encoded 3839
     //   h_blank  = 560 → encoded 559
     //   h_front_porch = 176, sync positive → high bit set
@@ -525,7 +526,7 @@ fn smoke_displayid_type_vii_decodes_4k60() -> TestResult {
     //   v_blank = 90 → encoded 89
     //   v_front_porch = 8 → encoded 7, sync positive
     //   v_sync_width = 10 → encoded 9
-    let pix = 533_250u32 - 1;
+    let pix = 594_000u32 - 1;
     let mut t = [0u8; 20];
     t[0] = (pix & 0xFF) as u8;
     t[1] = ((pix >> 8) & 0xFF) as u8;
@@ -561,8 +562,8 @@ fn smoke_displayid_type_vii_decodes_4k60() -> TestResult {
     if pref.h_active != 3840 || pref.v_active != 2160 {
         return TestResult::Fail("4K active size should round-trip");
     }
-    if pref.pixel_clock_khz != 533_250 {
-        return TestResult::Fail("pixel clock should round-trip to 533_250");
+    if pref.pixel_clock_khz != 594_000 {
+        return TestResult::Fail("pixel clock should round-trip to 594_000");
     }
     if !pref.h_sync_positive || !pref.v_sync_positive {
         return TestResult::Fail("sync polarity bits lost");

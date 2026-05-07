@@ -11,6 +11,15 @@
 
 extern crate alloc;
 
+// Force-link crates whose only public surface is kernel tests
+// registered via `#[link_section = "narf.tests"]`. Without an
+// explicit `extern crate`, rustc would not pull the rlib into the
+// link, and the linker's `KEEP(*(narf.tests))` would never see the
+// crate's test entries. (Crates that the kernel actually uses by
+// name pick themselves up — these are the test-only ones.)
+extern crate narf_edid as _;
+extern crate narf_hid as _;
+
 use core::fmt::Write;
 use core::panic::PanicInfo;
 

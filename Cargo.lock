@@ -954,6 +954,7 @@ dependencies = [
  "narf-firmware-smbios",
  "narf-graphics",
  "narf-graphics-driver",
+ "narf-hid",
  "narf-i3c",
  "narf-init",
  "narf-initramfs",
@@ -999,6 +1000,13 @@ dependencies = [
  "narf-init",
  "narf-lib",
  "narf-memory",
+]
+
+[[package]]
+name = "narf-hid"
+version = "0.0.0"
+dependencies = [
+ "narf-kernel-test",
 ]
 
 [[package]]
