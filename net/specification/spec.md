@@ -592,3 +592,65 @@ multicast layers a kernel network stack also needs.
   installed checksum.
 
 **No GPL Linux source consulted.**
+
+## 14. HTTP/2, STUN, MQTT v5, VLAN+LLDP codecs
+
+The networking-axis cycle continued past the time-sync / streaming
+layer into modern app-layer + L2 protocols a kernel network stack
+needs to peer with on real wire.
+
+### HTTP/2 (`http2`)
+- **RFC 9113** — HTTP/2 (M. Thomson & C. Benfield, June 2022).
+  §3.4 Connection Preface. §4.1 Frame Format (9-byte header:
+  24-bit length + 8-bit type + 8-bit flags + reserved bit + 31-bit
+  stream id). §6 Frame Definitions. §6.5.2 SETTINGS parameters.
+  §7 Error Codes.
+- Surfaced: `FrameHeader::encode/decode` (with the R-bit masking
+  invariant), `build_frame` generic, SETTINGS payload encoder/
+  parser, `build_window_update` / `build_rst_stream` / `build_ping`
+  (with ACK flag) / `build_goaway`. Full frame-type + flag-bit +
+  SETTINGS-parameter + error-code constant set, plus the 24-byte
+  CLIENT_PREFACE.
+
+### STUN (`stun`)
+- **RFC 8489** — Session Traversal Utilities for NAT (M. Petit-
+  Huguenin et al, Feb 2020). §5 Message Structure (20-byte fixed
+  header with magic cookie 0x2112A442 + 96-bit transaction id).
+  §6 Base Attributes. §14 Method Numbering.
+- Surfaced: `message_type` / `parse_message_type` covering the
+  interleaved method+class bit packing, `StunHeader::encode/decode`
+  (with magic-cookie verification), TLV iterator + builder with
+  4-byte attribute alignment per §6, XOR-MAPPED-ADDRESS encode/
+  decode (XORing port and IPv4 address with the magic cookie),
+  ERROR-CODE encode/decode (3-bit class + 8-bit number split),
+  `build_binding_request` convenience.
+
+### MQTT v5 (`mqtt`)
+- **OASIS MQTT v5.0 Standard** (7 March 2019). Public.
+  §2.1 Fixed Header. §2.1.4 Remaining Length VarInt (1-4 bytes,
+  7-bit per byte continuation). §3.1 CONNECT Packet (Protocol
+  Name "MQTT" + level 5 + Connect Flags + Keep Alive +
+  Properties + Client ID payload). §3.3 PUBLISH. §3.13 PINGREQ.
+  §3.14 DISCONNECT.
+- Surfaced: VarInt encode/decode (with 4-byte cap rejection),
+  `FixedHeader::encode/decode`, MQTT UTF-8-string append/decode,
+  `build_connect_v5`, `build_publish_v5` (DUP/QoS/retain in fixed-
+  header flags), `build_pingreq`, `build_disconnect_v5`. Full
+  packet-type + connect-flag + reason-code + property-id constants.
+
+### VLAN 802.1Q + LLDP 802.1AB (`pkt_l2`)
+- **IEEE 802.1Q-2018** — Bridges and Bridged Networks. §9.6 TPID
+  values 0x8100 (C-VLAN) + 0x88A8 (S-VLAN, "QinQ"). §9.6.2 TCI
+  layout (PCP + DEI + VID).
+- **IEEE 802.1AB-2016** — LLDP. §8.1 EtherType 0x88CC + nearest-
+  bridge multicast MAC 01:80:C2:00:00:0E. §8.4 TLV format
+  (7-bit Type + 9-bit Length packed into 2 bytes BE). §8.5
+  mandatory + optional TLVs (Chassis ID / Port ID / TTL /
+  System Name / System Capabilities / Management Address /
+  End-of-LLDPDU sentinel).
+- Surfaced: `VlanTag::encode/decode`, `iter_tlvs` over an LLDPDU,
+  `append_tlv` + builders for Chassis ID / Port ID / TTL /
+  System Capabilities / End-of-LLDPDU, `parse_ttl`, full subtype +
+  capability-bit constant set.
+
+**No GPL Linux source consulted.**

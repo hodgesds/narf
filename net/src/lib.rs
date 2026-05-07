@@ -45,17 +45,21 @@
 extern crate alloc;
 
 pub mod http;
+pub mod http2;
+pub mod mqtt;
 pub mod pkt;
 pub mod pkt_dhcp;
 pub mod pkt_dhcpv6;
 pub mod pkt_dns;
 pub mod pkt_icmp_extra;
 pub mod pkt_ipv6;
+pub mod pkt_l2;
 pub mod pkt_mdns;
 pub mod pkt_ntp;
 pub mod pkt_tcp;
 pub mod pkt_udp;
 pub mod stack;
+pub mod stun;
 pub mod tls;
 pub mod ws;
 pub use stack::{AdminCap, AttachError, StackAttach, StackAttachReply, StackDaemon};

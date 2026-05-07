@@ -1792,3 +1792,532 @@ fn smoke_igmpv3_report_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net/icmp-extra", smoke_igmpv3_report_round_trip);
+
+// ── HTTP/2 framing smokes ──────────────────────────────────────────
+
+fn smoke_http2_client_preface_constant() -> TestResult {
+    use crate::http2::CLIENT_PREFACE;
+    if CLIENT_PREFACE != b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" {
+        return TestResult::Fail("client preface bytes per RFC 9113 §3.4");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/http2", smoke_http2_client_preface_constant);
+
+fn smoke_http2_frame_header_round_trip() -> TestResult {
+    use crate::http2::{FrameHeader, FLAG_END_HEADERS, FT_HEADERS, FRAME_HEADER_LEN};
+    let h = FrameHeader {
+        length: 0x12_3456,
+        frame_type: FT_HEADERS,
+        flags: FLAG_END_HEADERS,
+        stream_id: 0x12_3456_78,
+    };
+    let bytes = h.encode();
+    if bytes.len() != FRAME_HEADER_LEN {
+        return TestResult::Fail("frame header = 9 bytes");
+    }
+    if bytes[3] != FT_HEADERS {
+        return TestResult::Fail("frame-type byte 3");
+    }
+    let back = FrameHeader::decode(&bytes).expect("decode");
+    if back != h {
+        return TestResult::Fail("frame header round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/http2", smoke_http2_frame_header_round_trip);
+
+fn smoke_http2_stream_id_high_bit_masked() -> TestResult {
+    use crate::http2::FrameHeader;
+    let h = FrameHeader {
+        length: 0,
+        frame_type: 0,
+        flags: 0,
+        stream_id: 0xFFFF_FFFF,
+    };
+    let bytes = h.encode();
+    // Top bit on the wire must be 0 (R reserved bit).
+    if bytes[5] & 0x80 != 0 {
+        return TestResult::Fail("R bit must be 0");
+    }
+    let back = FrameHeader::decode(&bytes).expect("decode");
+    if back.stream_id != 0x7FFF_FFFF {
+        return TestResult::Fail("stream id capped at 31 bits");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/http2", smoke_http2_stream_id_high_bit_masked);
+
+fn smoke_http2_settings_payload_round_trip() -> TestResult {
+    use crate::http2::{
+        build_settings_payload, parse_settings_payload, SETTINGS_INITIAL_WINDOW_SIZE,
+        SETTINGS_MAX_CONCURRENT_STREAMS,
+    };
+    let pairs: alloc::vec::Vec<(u16, u32)> = alloc::vec![
+        (SETTINGS_MAX_CONCURRENT_STREAMS, 100),
+        (SETTINGS_INITIAL_WINDOW_SIZE, 65535),
+    ];
+    let bytes = build_settings_payload(&pairs);
+    if bytes.len() != 12 {
+        return TestResult::Fail("each setting is 6 bytes");
+    }
+    let back = parse_settings_payload(&bytes).expect("parse");
+    if back != pairs {
+        return TestResult::Fail("settings payload round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/http2", smoke_http2_settings_payload_round_trip);
+
+fn smoke_http2_settings_payload_rejects_misaligned_buffer() -> TestResult {
+    use crate::http2::{parse_settings_payload, Http2Error};
+    let bytes = [0u8; 7];
+    match parse_settings_payload(&bytes) {
+        Err(Http2Error::BadLength) => TestResult::Pass,
+        _ => TestResult::Fail("non-multiple-of-6 must be rejected"),
+    }
+}
+kernel_test_in!(
+    "net/http2",
+    smoke_http2_settings_payload_rejects_misaligned_buffer
+);
+
+fn smoke_http2_window_update_layout() -> TestResult {
+    use crate::http2::{build_window_update, FT_WINDOW_UPDATE};
+    let pkt = build_window_update(3, 65535);
+    if pkt[3] != FT_WINDOW_UPDATE {
+        return TestResult::Fail("frame type byte");
+    }
+    if u32::from_be_bytes([pkt[9], pkt[10], pkt[11], pkt[12]]) != 65535 {
+        return TestResult::Fail("increment in payload");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/http2", smoke_http2_window_update_layout);
+
+fn smoke_http2_goaway_carries_last_stream_and_error() -> TestResult {
+    use crate::http2::{build_goaway, ERROR_PROTOCOL_ERROR, FT_GOAWAY};
+    let pkt = build_goaway(7, ERROR_PROTOCOL_ERROR, b"why");
+    if pkt[3] != FT_GOAWAY {
+        return TestResult::Fail("opcode");
+    }
+    if u32::from_be_bytes([pkt[9], pkt[10], pkt[11], pkt[12]]) != 7 {
+        return TestResult::Fail("last stream id at bytes 9..12");
+    }
+    if u32::from_be_bytes([pkt[13], pkt[14], pkt[15], pkt[16]]) != ERROR_PROTOCOL_ERROR {
+        return TestResult::Fail("error code at bytes 13..16");
+    }
+    if &pkt[17..] != b"why" {
+        return TestResult::Fail("debug data tail");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/http2", smoke_http2_goaway_carries_last_stream_and_error);
+
+fn smoke_http2_ping_ack_flag() -> TestResult {
+    use crate::http2::{build_ping, FLAG_ACK, FT_PING};
+    let pkt = build_ping(true, [0; 8]);
+    if pkt[3] != FT_PING {
+        return TestResult::Fail("opcode");
+    }
+    if pkt[4] & FLAG_ACK == 0 {
+        return TestResult::Fail("ACK flag should be set on PING reply");
+    }
+    let pkt2 = build_ping(false, [0; 8]);
+    if pkt2[4] & FLAG_ACK != 0 {
+        return TestResult::Fail("non-ACK PING should have flags=0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/http2", smoke_http2_ping_ack_flag);
+
+// ── STUN smokes ────────────────────────────────────────────────────
+
+fn smoke_stun_message_type_round_trip() -> TestResult {
+    use crate::stun::{
+        message_type, parse_message_type, CLASS_ERROR_RESPONSE, CLASS_REQUEST, METHOD_BINDING,
+    };
+    let mt = message_type(METHOD_BINDING, CLASS_REQUEST);
+    let (m, c) = parse_message_type(mt);
+    if m != METHOD_BINDING || c != CLASS_REQUEST {
+        return TestResult::Fail("Binding Request packing");
+    }
+    let mt2 = message_type(METHOD_BINDING, CLASS_ERROR_RESPONSE);
+    if mt2 == mt {
+        return TestResult::Fail("class field should differ for error response");
+    }
+    let (m2, c2) = parse_message_type(mt2);
+    if m2 != METHOD_BINDING || c2 != CLASS_ERROR_RESPONSE {
+        return TestResult::Fail("Binding error-response decode");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/stun", smoke_stun_message_type_round_trip);
+
+fn smoke_stun_header_carries_magic_cookie() -> TestResult {
+    use crate::stun::{StunHeader, CLASS_REQUEST, MAGIC_COOKIE, METHOD_BINDING, STUN_HDR_LEN};
+    let h = StunHeader {
+        method: METHOD_BINDING,
+        class: CLASS_REQUEST,
+        message_length: 0,
+        transaction_id: [0u8; 12],
+    };
+    let bytes = h.encode();
+    if bytes.len() != STUN_HDR_LEN {
+        return TestResult::Fail("STUN header = 20 bytes");
+    }
+    let cookie = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    if cookie != MAGIC_COOKIE {
+        return TestResult::Fail("magic cookie at offset 4..8");
+    }
+    let back = StunHeader::decode(&bytes).expect("decode");
+    if back != h {
+        return TestResult::Fail("STUN header round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/stun", smoke_stun_header_carries_magic_cookie);
+
+fn smoke_stun_decode_rejects_bad_cookie() -> TestResult {
+    use crate::stun::{StunError, StunHeader};
+    let mut buf = [0u8; 20];
+    buf[4..8].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
+    match StunHeader::decode(&buf) {
+        Err(StunError::BadCookie) => TestResult::Pass,
+        _ => TestResult::Fail("non-magic cookie must error"),
+    }
+}
+kernel_test_in!("net/stun", smoke_stun_decode_rejects_bad_cookie);
+
+fn smoke_stun_xor_mapped_ipv4_round_trip() -> TestResult {
+    use crate::stun::{decode_xor_mapped_ipv4, encode_xor_mapped_ipv4};
+    let tid = [0u8; 12];
+    let body = encode_xor_mapped_ipv4(&tid, 41234, [192, 168, 1, 42]);
+    let (port, ip) = decode_xor_mapped_ipv4(&tid, &body).expect("decode");
+    if port != 41234 || ip != [192, 168, 1, 42] {
+        return TestResult::Fail("XOR-MAPPED-ADDRESS round-trip");
+    }
+    // Encoded body should NOT contain the cleartext port/ip bytes.
+    let cleartext_port = 41234u16.to_be_bytes();
+    if body[2] == cleartext_port[0] && body[3] == cleartext_port[1] {
+        return TestResult::Fail("port should be XORed with magic-cookie high half");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/stun", smoke_stun_xor_mapped_ipv4_round_trip);
+
+fn smoke_stun_attribute_iterator_handles_padding() -> TestResult {
+    use crate::stun::{append_attribute, iter_attributes, ATTR_SOFTWARE};
+    let mut out = alloc::vec::Vec::new();
+    // 7-byte software string forces 1 byte of padding.
+    append_attribute(&mut out, ATTR_SOFTWARE, b"narf/v1");
+    if out.len() != 4 + 8 {
+        return TestResult::Fail("attribute should pad to 4-byte boundary");
+    }
+    let recs: alloc::vec::Vec<_> = iter_attributes(&out).collect::<Result<_, _>>().expect("walk");
+    if recs.len() != 1 {
+        return TestResult::Fail("expected 1 attribute");
+    }
+    if recs[0].typ != ATTR_SOFTWARE || recs[0].data != b"narf/v1" {
+        return TestResult::Fail("attribute round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/stun", smoke_stun_attribute_iterator_handles_padding);
+
+fn smoke_stun_error_code_attribute_round_trip() -> TestResult {
+    use crate::stun::{decode_error_code, encode_error_code};
+    let body = encode_error_code(401, "Unauthorized");
+    let (code, reason) = decode_error_code(&body).expect("decode");
+    if code != 401 {
+        return TestResult::Fail("error code round-trip");
+    }
+    if reason != "Unauthorized" {
+        return TestResult::Fail("reason round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/stun", smoke_stun_error_code_attribute_round_trip);
+
+fn smoke_stun_binding_request_with_software() -> TestResult {
+    use crate::stun::{
+        build_binding_request, iter_attributes, parse_message_type, ATTR_SOFTWARE, CLASS_REQUEST,
+        METHOD_BINDING, STUN_HDR_LEN,
+    };
+    let pkt = build_binding_request([0xCC; 12], Some("narf-stun"));
+    let mt = u16::from_be_bytes([pkt[0], pkt[1]]);
+    let (method, class) = parse_message_type(mt);
+    if method != METHOD_BINDING || class != CLASS_REQUEST {
+        return TestResult::Fail("Binding Request method/class");
+    }
+    let body_len = u16::from_be_bytes([pkt[2], pkt[3]]) as usize;
+    let body = &pkt[STUN_HDR_LEN..STUN_HDR_LEN + body_len];
+    let recs: alloc::vec::Vec<_> = iter_attributes(body).collect::<Result<_, _>>().expect("walk");
+    if !recs.iter().any(|r| r.typ == ATTR_SOFTWARE && r.data == b"narf-stun") {
+        return TestResult::Fail("SOFTWARE attribute should be present");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/stun", smoke_stun_binding_request_with_software);
+
+// ── MQTT v5 framing smokes ─────────────────────────────────────────
+
+fn smoke_mqtt_var_int_round_trip() -> TestResult {
+    use crate::mqtt::{decode_var_int, encode_var_int};
+    // Test boundary values: 0, 127 (single byte), 128 (two bytes),
+    // 16383 (two-byte max), 16384 (three bytes), 2_097_151 (three-byte max),
+    // 268_435_455 (four-byte max).
+    for v in [0u32, 127, 128, 16_383, 16_384, 2_097_151, 268_435_455] {
+        let mut out = alloc::vec::Vec::new();
+        encode_var_int(&mut out, v);
+        let (back, _) = decode_var_int(&out).expect("decode");
+        if back != v {
+            return TestResult::Fail("VarInt round-trip");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/mqtt", smoke_mqtt_var_int_round_trip);
+
+fn smoke_mqtt_var_int_rejects_5_byte_overflow() -> TestResult {
+    use crate::mqtt::{decode_var_int, MqttError};
+    let buf = [0xFFu8, 0xFF, 0xFF, 0xFF, 0xFF];
+    match decode_var_int(&buf) {
+        Err(MqttError::BadVarInt) => TestResult::Pass,
+        _ => TestResult::Fail("> 4-byte VarInt must be rejected"),
+    }
+}
+kernel_test_in!("net/mqtt", smoke_mqtt_var_int_rejects_5_byte_overflow);
+
+fn smoke_mqtt_fixed_header_round_trip() -> TestResult {
+    use crate::mqtt::{FixedHeader, PT_PUBLISH};
+    let h = FixedHeader {
+        packet_type: PT_PUBLISH,
+        flags: 0b0011, // QoS 1 + retain
+        remaining_length: 200,
+    };
+    let mut out = alloc::vec::Vec::new();
+    h.encode(&mut out);
+    let (back, used) = FixedHeader::decode(&out).expect("decode");
+    if back != h {
+        return TestResult::Fail("fixed header round-trip");
+    }
+    if used != out.len() {
+        return TestResult::Fail("decode should consume entire header");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/mqtt", smoke_mqtt_fixed_header_round_trip);
+
+fn smoke_mqtt_utf8_string_round_trip() -> TestResult {
+    use crate::mqtt::{append_utf8_string, decode_utf8_string};
+    let mut out = alloc::vec::Vec::new();
+    append_utf8_string(&mut out, "narf-client");
+    let (s, n) = decode_utf8_string(&out, 0).expect("decode");
+    if s != "narf-client" {
+        return TestResult::Fail("UTF-8 string round-trip");
+    }
+    if n != out.len() {
+        return TestResult::Fail("decode should consume length + body");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/mqtt", smoke_mqtt_utf8_string_round_trip);
+
+fn smoke_mqtt_connect_v5_layout() -> TestResult {
+    use crate::mqtt::{
+        build_connect_v5, decode_utf8_string, FixedHeader, CONNECT_CLEAN_START, PT_CONNECT,
+    };
+    let pkt = build_connect_v5(CONNECT_CLEAN_START, 60, "narf-test");
+    let (h, hdr_len) = FixedHeader::decode(&pkt).expect("decode header");
+    if h.packet_type != PT_CONNECT {
+        return TestResult::Fail("CONNECT packet type");
+    }
+    // First UTF-8 string in the variable header should be "MQTT".
+    let (proto, _) = decode_utf8_string(&pkt, hdr_len).expect("proto name");
+    if proto != "MQTT" {
+        return TestResult::Fail("Protocol Name = MQTT");
+    }
+    // Protocol Level lives at hdr_len + 6 (2-byte length + 4-byte body).
+    if pkt[hdr_len + 6] != 5 {
+        return TestResult::Fail("Protocol Level = 5 for MQTT v5");
+    }
+    if pkt[hdr_len + 7] & CONNECT_CLEAN_START == 0 {
+        return TestResult::Fail("CLEAN_START flag should be set");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/mqtt", smoke_mqtt_connect_v5_layout);
+
+fn smoke_mqtt_publish_qos_flags_in_fixed_header() -> TestResult {
+    use crate::mqtt::{build_publish_v5, FixedHeader, PT_PUBLISH};
+    let pkt = build_publish_v5(false, 2, true, "topic/a", Some(0xCAFE), b"hello");
+    let (h, _) = FixedHeader::decode(&pkt).expect("decode");
+    if h.packet_type != PT_PUBLISH {
+        return TestResult::Fail("PUBLISH packet type");
+    }
+    if (h.flags >> 1) & 0x03 != 2 {
+        return TestResult::Fail("QoS at flags bits 2..1");
+    }
+    if h.flags & 0x01 == 0 {
+        return TestResult::Fail("retain flag at bit 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/mqtt", smoke_mqtt_publish_qos_flags_in_fixed_header);
+
+fn smoke_mqtt_pingreq_is_two_bytes() -> TestResult {
+    use crate::mqtt::{build_pingreq, PT_PINGREQ};
+    let pkt = build_pingreq();
+    if pkt.len() != 2 {
+        return TestResult::Fail("PINGREQ = 2 bytes");
+    }
+    if (pkt[0] >> 4) != PT_PINGREQ {
+        return TestResult::Fail("packet type byte 0");
+    }
+    if pkt[1] != 0 {
+        return TestResult::Fail("Remaining Length = 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/mqtt", smoke_mqtt_pingreq_is_two_bytes);
+
+// ── VLAN + LLDP smokes ─────────────────────────────────────────────
+
+fn smoke_vlan_tag_round_trip() -> TestResult {
+    use crate::pkt_l2::{VlanTag, TPID_C_VLAN, TPID_S_VLAN};
+    let v = VlanTag {
+        tpid: TPID_C_VLAN,
+        pcp: 5,
+        dei: true,
+        vid: 100,
+    };
+    let bytes = v.encode();
+    let back = VlanTag::decode(&bytes).expect("decode");
+    if back != v {
+        return TestResult::Fail("VLAN tag round-trip");
+    }
+    if TPID_C_VLAN != 0x8100 || TPID_S_VLAN != 0x88A8 {
+        return TestResult::Fail("VLAN TPIDs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/l2/vlan", smoke_vlan_tag_round_trip);
+
+fn smoke_vlan_tci_bit_layout() -> TestResult {
+    use crate::pkt_l2::VlanTag;
+    let v = VlanTag {
+        tpid: 0x8100,
+        pcp: 7,
+        dei: false,
+        vid: 4094,
+    };
+    let bytes = v.encode();
+    let tci = u16::from_be_bytes([bytes[2], bytes[3]]);
+    if (tci >> 13) != 7 {
+        return TestResult::Fail("PCP at bits 15..13");
+    }
+    if (tci >> 12) & 1 != 0 {
+        return TestResult::Fail("DEI bit should be 0");
+    }
+    if (tci & 0x0FFF) != 4094 {
+        return TestResult::Fail("VID in low 12 bits");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/l2/vlan", smoke_vlan_tci_bit_layout);
+
+fn smoke_lldp_tlv_round_trip() -> TestResult {
+    use crate::pkt_l2::{
+        append_chassis_id, append_end_of_lldpdu, append_port_id, append_ttl, iter_tlvs,
+        parse_ttl, CHASSIS_ID_MAC_ADDRESS, PORT_ID_INTERFACE_NAME, TLV_CHASSIS_ID, TLV_PORT_ID,
+        TLV_TTL,
+    };
+    let mut out = alloc::vec::Vec::new();
+    append_chassis_id(&mut out, CHASSIS_ID_MAC_ADDRESS, &[0x02, 0x42, 0xCA, 0xFE, 0xBE, 0xEF]);
+    append_port_id(&mut out, PORT_ID_INTERFACE_NAME, b"eth0");
+    append_ttl(&mut out, 120);
+    append_end_of_lldpdu(&mut out);
+
+    let recs: alloc::vec::Vec<_> = iter_tlvs(&out).collect::<Result<_, _>>().expect("walk");
+    if recs.len() != 3 {
+        return TestResult::Fail("expected 3 TLVs (terminator stops iter)");
+    }
+    if recs[0].typ != TLV_CHASSIS_ID || recs[0].data[0] != CHASSIS_ID_MAC_ADDRESS {
+        return TestResult::Fail("Chassis ID round-trip");
+    }
+    if recs[1].typ != TLV_PORT_ID || &recs[1].data[1..] != b"eth0" {
+        return TestResult::Fail("Port ID round-trip");
+    }
+    if recs[2].typ != TLV_TTL {
+        return TestResult::Fail("TTL TLV type");
+    }
+    if parse_ttl(recs[2].data).expect("parse TTL") != 120 {
+        return TestResult::Fail("TTL value");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/l2/lldp", smoke_lldp_tlv_round_trip);
+
+fn smoke_lldp_tlv_header_packing() -> TestResult {
+    use crate::pkt_l2::{append_tlv, TLV_SYSTEM_NAME};
+    let mut out = alloc::vec::Vec::new();
+    append_tlv(&mut out, TLV_SYSTEM_NAME, b"narf");
+    let header = u16::from_be_bytes([out[0], out[1]]);
+    if (header >> 9) != TLV_SYSTEM_NAME as u16 {
+        return TestResult::Fail("Type at bits 15..9");
+    }
+    if (header & 0x01FF) != 4 {
+        return TestResult::Fail("Length at bits 8..0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/l2/lldp", smoke_lldp_tlv_header_packing);
+
+fn smoke_lldp_system_capabilities_layout() -> TestResult {
+    use crate::pkt_l2::{
+        append_system_capabilities, iter_tlvs, CAP_MAC_BRIDGE, CAP_ROUTER, TLV_SYSTEM_CAPABILITIES,
+    };
+    let mut out = alloc::vec::Vec::new();
+    append_system_capabilities(&mut out, CAP_MAC_BRIDGE | CAP_ROUTER, CAP_MAC_BRIDGE);
+    let recs: alloc::vec::Vec<_> = iter_tlvs(&out).collect::<Result<_, _>>().expect("walk");
+    if recs[0].typ != TLV_SYSTEM_CAPABILITIES {
+        return TestResult::Fail("System Capabilities TLV type");
+    }
+    let caps = u16::from_be_bytes([recs[0].data[0], recs[0].data[1]]);
+    let enabled = u16::from_be_bytes([recs[0].data[2], recs[0].data[3]]);
+    if caps != (CAP_MAC_BRIDGE | CAP_ROUTER) {
+        return TestResult::Fail("capabilities round-trip");
+    }
+    if enabled != CAP_MAC_BRIDGE {
+        return TestResult::Fail("enabled subset round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/l2/lldp", smoke_lldp_system_capabilities_layout);
+
+fn smoke_lldp_truncated_tlv_rejected() -> TestResult {
+    use crate::pkt_l2::{iter_tlvs, LldpError};
+    // Header claims 5-byte body, but only 2 bytes follow.
+    let buf = [(2u16 << 9 | 5).to_be_bytes()[0], (2u16 << 9 | 5).to_be_bytes()[1], 0, 0];
+    let mut errs = 0;
+    for r in iter_tlvs(&buf) {
+        if matches!(r, Err(LldpError::Truncated)) {
+            errs += 1;
+        }
+    }
+    if errs != 1 {
+        return TestResult::Fail("truncated TLV must surface as error");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/l2/lldp", smoke_lldp_truncated_tlv_rejected);
+
+fn smoke_lldp_dest_mac_constant() -> TestResult {
+    use crate::pkt_l2::LLDP_DEST_MAC_NEAREST_BRIDGE;
+    if LLDP_DEST_MAC_NEAREST_BRIDGE != [0x01, 0x80, 0xC2, 0x00, 0x00, 0x0E] {
+        return TestResult::Fail("LLDP nearest-bridge multicast MAC");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/l2/lldp", smoke_lldp_dest_mac_constant);
