@@ -531,3 +531,64 @@ its Ethernet driver brings up a link. References (public-only):
   + `service_browse_name` helpers.
 
 **No GPL Linux source consulted.**
+
+## 13. NTP, WebSocket, DHCPv6, ICMP-extra + IGMPv3 codecs
+
+The networking axis cycle continued past app-layer protocols into
+the time-sync, real-time-streaming, IPv6-config, and IPv4-error /
+multicast layers a kernel network stack also needs.
+
+### NTPv4 (`pkt_ntp`)
+- **RFC 5905** — Network Time Protocol Version 4 (D. Mills et al,
+  June 2010). §6 NTP timestamp format. §7.3 Packet Header Variables.
+  §7.5 Packet Header Format.
+- **RFC 868** — referenced for the historical 1900-01-01 NTP prime
+  epoch.
+- Surfaced: `NtpHeader::encode/decode` (LI/VN/Mode byte packing,
+  signed Poll + Precision, BE 16.16 short-fixed-point Root Delay /
+  Root Dispersion, 4-byte Reference ID, four 64-bit timestamps).
+  `unix_to_ntp` / `ntp_to_unix` with the 2_208_988_800-second epoch
+  offset. `client_request` SNTP-style builder.
+
+### WebSocket (`ws`)
+- **RFC 6455** — The WebSocket Protocol (I. Fette & A. Melnikov,
+  Dec 2011). §5.2 base framing (FIN + RSV1-3 + 4-bit opcode + MASK
+  + 7-bit / 16-bit / 64-bit length encodings). §5.3 client → server
+  masking (4-byte key XOR). §5.5 control-frame ≤ 125 bytes
+  invariant. §7.4 status codes.
+- Surfaced: `Frame::encode/decode` covering the full length ladder,
+  client masking unwound on decode, opcode + close-status
+  constants, builders (`text_frame` / `binary_frame` /
+  `close_frame` / `ping_frame` / `pong_frame`), control-frame size
+  enforcement.
+
+### DHCPv6 (`pkt_dhcpv6`)
+- **RFC 8415** — DHCPv6 (T. Mrugalski et al, Nov 2018). §8 Message
+  Formats. §9 Client/Server message header (4 bytes — msg-type +
+  24-bit transaction-id). §9.1 Relay Agent header (34 bytes). §21
+  Options. §11 DUID format.
+- **RFC 3315** — original DHCPv6 layouts that 8415 inherits.
+- Surfaced: `DhcpV6Header::encode/decode`, `RelayHeader::encode/
+  decode`, full message-type constant set
+  (SOLICIT/ADVERTISE/REQUEST/CONFIRM/RENEW/REBIND/REPLY/RELEASE/
+  DECLINE/RECONFIGURE/INFORMATION_REQUEST/RELAY_FORW/RELAY_REPL),
+  selected option codes (CLIENTID, SERVERID, IA_NA/IA_TA/IA_PD,
+  IAADDR, ORO, ELAPSED_TIME, RAPID_COMMIT, DNS_SERVERS,
+  DOMAIN_LIST, …), DUID-LL builder, ORO + Rapid Commit + Elapsed
+  Time appenders, `build_solicit` convenience.
+
+### ICMPv4 errors + IGMPv3 (`pkt_icmp_extra`)
+- **RFC 792** — Internet Control Message Protocol (J. Postel, Sep
+  1981). Type 3/4/5/11/12 messages.
+- **RFC 1191** — Path MTU Discovery (next-hop MTU at low 16 bits of
+  rest-of-header on a Fragmentation-Needed Destination Unreachable).
+- **RFC 3376** — IGMPv3 (B. Cain et al, Oct 2002). §4.1 Membership
+  Query, §4.2 Membership Report, §4.2.4 Group Record format.
+- Surfaced: ICMP error builders (Destination Unreachable with
+  `build_fragmentation_needed`, Time Exceeded, Redirect),
+  `IcmpError::decode` with checksum verification, IGMP type
+  constants, IGMPv3 Membership Query decoder, `GroupRecord`
+  encode/decode, `build_v3_report` Membership Report builder with
+  installed checksum.
+
+**No GPL Linux source consulted.**

@@ -1294,3 +1294,501 @@ fn smoke_mdns_srv_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net/mdns", smoke_mdns_srv_round_trip);
+
+// ── NTPv4 codec smokes ─────────────────────────────────────────────
+
+fn smoke_ntp_header_round_trip() -> TestResult {
+    use crate::pkt_ntp::{
+        NtpHeader, LI_NO_WARNING, MODE_CLIENT, NTP_HDR_LEN, NTP_VERSION_4, STRATUM_PRIMARY,
+    };
+    let h = NtpHeader {
+        leap_indicator: LI_NO_WARNING,
+        version: NTP_VERSION_4,
+        mode: MODE_CLIENT,
+        stratum: STRATUM_PRIMARY,
+        poll: 6,
+        precision: -20,
+        root_delay: 0x0001_0000,
+        root_dispersion: 0x0002_0000,
+        reference_id: *b"GPS\0",
+        reference_timestamp: 0xCAFE_BEEF_DEAD_BEEF,
+        origin_timestamp: 0x1111,
+        receive_timestamp: 0x2222,
+        transmit_timestamp: 0x3333,
+    };
+    let bytes = h.encode();
+    if bytes.len() != NTP_HDR_LEN {
+        return TestResult::Fail("NTP header = 48 bytes");
+    }
+    let back = NtpHeader::decode(&bytes).expect("decode");
+    if back != h {
+        return TestResult::Fail("NTP header round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/ntp", smoke_ntp_header_round_trip);
+
+fn smoke_ntp_li_vn_mode_byte_packing() -> TestResult {
+    use crate::pkt_ntp::NtpHeader;
+    let mut h = NtpHeader::default();
+    h.leap_indicator = 3; // alarm
+    h.version = 4;
+    h.mode = 3; // client
+    let bytes = h.encode();
+    // Expected: (3 << 6) | (4 << 3) | 3 = 0xC0 | 0x20 | 3 = 0xE3
+    if bytes[0] != 0xE3 {
+        return TestResult::Fail("LI/VN/Mode byte 0 packing wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/ntp", smoke_ntp_li_vn_mode_byte_packing);
+
+fn smoke_ntp_short_fixed_point_round_trip() -> TestResult {
+    use crate::pkt_ntp::{short_from_secs_frac, short_to_secs_frac};
+    let raw = short_from_secs_frac(2, 0x8000);
+    let (secs, frac) = short_to_secs_frac(raw);
+    if secs != 2 || frac != 0x8000 {
+        return TestResult::Fail("short fixed-point round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/ntp", smoke_ntp_short_fixed_point_round_trip);
+
+fn smoke_ntp_unix_epoch_offset_round_trip() -> TestResult {
+    use crate::pkt_ntp::{ntp_to_unix, unix_to_ntp, NTP_UNIX_EPOCH_OFFSET_SECS};
+    if NTP_UNIX_EPOCH_OFFSET_SECS != 2_208_988_800 {
+        return TestResult::Fail("NTP epoch offset = 2_208_988_800 seconds");
+    }
+    let ntp = unix_to_ntp(1_700_000_000, 0xCAFE_BABE);
+    let (unix, frac) = ntp_to_unix(ntp).expect("after epoch");
+    if unix != 1_700_000_000 || frac != 0xCAFE_BABE {
+        return TestResult::Fail("unix↔NTP round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/ntp", smoke_ntp_unix_epoch_offset_round_trip);
+
+fn smoke_ntp_client_request_layout() -> TestResult {
+    use crate::pkt_ntp::{client_request, MODE_CLIENT, NTP_VERSION_4};
+    let h = client_request(0x1234_5678_9ABC_DEF0);
+    if h.mode != MODE_CLIENT {
+        return TestResult::Fail("client request mode = 3");
+    }
+    if h.version != NTP_VERSION_4 {
+        return TestResult::Fail("VN = 4");
+    }
+    if h.transmit_timestamp != 0x1234_5678_9ABC_DEF0 {
+        return TestResult::Fail("transmit timestamp should round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/ntp", smoke_ntp_client_request_layout);
+
+// ── WebSocket framing smokes ───────────────────────────────────────
+
+fn smoke_ws_short_text_frame_round_trip() -> TestResult {
+    use crate::ws::{text_frame, Frame, OP_TEXT};
+    let f = text_frame("hello", true);
+    let bytes = f.encode().expect("encode");
+    if bytes.len() != 2 + 5 {
+        return TestResult::Fail("Short unmasked text frame: 2 hdr + 5 payload");
+    }
+    if bytes[0] != 0x80 | OP_TEXT {
+        return TestResult::Fail("byte 0 should be FIN | OP_TEXT");
+    }
+    if bytes[1] != 5 {
+        return TestResult::Fail("length field should be 5");
+    }
+    let (back, n) = Frame::decode(&bytes).expect("decode");
+    if n != bytes.len() {
+        return TestResult::Fail("decode should consume full frame");
+    }
+    if back.payload != b"hello" {
+        return TestResult::Fail("payload round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/ws", smoke_ws_short_text_frame_round_trip);
+
+fn smoke_ws_extended_length_16bit() -> TestResult {
+    use crate::ws::{binary_frame, Frame};
+    let payload = alloc::vec![0xAAu8; 200];
+    let f = binary_frame(payload.clone(), true);
+    let bytes = f.encode().expect("encode");
+    if bytes[1] != 126 {
+        return TestResult::Fail("length-126 marker for 16-bit length");
+    }
+    if u16::from_be_bytes([bytes[2], bytes[3]]) != 200 {
+        return TestResult::Fail("extended 16-bit length");
+    }
+    let (back, _) = Frame::decode(&bytes).expect("decode");
+    if back.payload != payload {
+        return TestResult::Fail("200-byte payload round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/ws", smoke_ws_extended_length_16bit);
+
+fn smoke_ws_extended_length_64bit() -> TestResult {
+    use crate::ws::{binary_frame, Frame};
+    let payload = alloc::vec![0xBBu8; 70_000];
+    let f = binary_frame(payload.clone(), true);
+    let bytes = f.encode().expect("encode");
+    if bytes[1] != 127 {
+        return TestResult::Fail("length-127 marker for 64-bit length");
+    }
+    let (back, _) = Frame::decode(&bytes).expect("decode");
+    if back.payload.len() != 70_000 {
+        return TestResult::Fail("70 000-byte payload round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/ws", smoke_ws_extended_length_64bit);
+
+fn smoke_ws_client_masking_unwinds_on_decode() -> TestResult {
+    use crate::ws::{Frame, OP_TEXT};
+    // Construct a masked client frame manually.
+    let key = [0x12u8, 0x34, 0x56, 0x78];
+    let mut f = Frame {
+        fin: true,
+        rsv1: false,
+        rsv2: false,
+        rsv3: false,
+        opcode: OP_TEXT,
+        mask: Some(key),
+        payload: b"hello".to_vec(),
+    };
+    let bytes = f.encode().expect("encode");
+    if bytes[1] & 0x80 == 0 {
+        return TestResult::Fail("MASK bit should be set");
+    }
+    // Encoded payload should differ from cleartext "hello".
+    let payload_off = 2 + 4;
+    if &bytes[payload_off..payload_off + 5] == b"hello" {
+        return TestResult::Fail("masked payload must not be in cleartext");
+    }
+    f.payload = b"hello".to_vec();
+    let (back, _) = Frame::decode(&bytes).expect("decode");
+    if back.payload != b"hello" {
+        return TestResult::Fail("decode should unwind the mask");
+    }
+    if back.mask != Some(key) {
+        return TestResult::Fail("masking key should round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/ws", smoke_ws_client_masking_unwinds_on_decode);
+
+fn smoke_ws_close_frame_status_round_trip() -> TestResult {
+    use crate::ws::{close_frame, Frame, STATUS_NORMAL_CLOSURE};
+    let f = close_frame(STATUS_NORMAL_CLOSURE, "bye");
+    let bytes = f.encode().expect("encode");
+    let (back, _) = Frame::decode(&bytes).expect("decode");
+    if back.opcode != crate::ws::OP_CLOSE {
+        return TestResult::Fail("opcode should be CLOSE");
+    }
+    let code = u16::from_be_bytes([back.payload[0], back.payload[1]]);
+    if code != STATUS_NORMAL_CLOSURE {
+        return TestResult::Fail("close-frame status code");
+    }
+    if &back.payload[2..] != b"bye" {
+        return TestResult::Fail("close-frame reason");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/ws", smoke_ws_close_frame_status_round_trip);
+
+fn smoke_ws_control_frame_too_long_rejected() -> TestResult {
+    use crate::ws::{ping_frame, WsError};
+    let payload = alloc::vec![0u8; 200];
+    let f = ping_frame(payload);
+    match f.encode() {
+        Err(WsError::ControlFrameTooLong) => TestResult::Pass,
+        _ => TestResult::Fail("control frame > 125 bytes must be rejected"),
+    }
+}
+kernel_test_in!("net/ws", smoke_ws_control_frame_too_long_rejected);
+
+fn smoke_ws_opcode_constants() -> TestResult {
+    use crate::ws::{OP_BINARY, OP_CLOSE, OP_CONTINUATION, OP_PING, OP_PONG, OP_TEXT};
+    if OP_CONTINUATION != 0 || OP_TEXT != 1 || OP_BINARY != 2 {
+        return TestResult::Fail("data-frame opcode values");
+    }
+    if OP_CLOSE != 8 || OP_PING != 9 || OP_PONG != 10 {
+        return TestResult::Fail("control-frame opcode values");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/ws", smoke_ws_opcode_constants);
+
+// ── DHCPv6 codec smokes ────────────────────────────────────────────
+
+fn smoke_dhcpv6_header_round_trip() -> TestResult {
+    use crate::pkt_dhcpv6::{DhcpV6Header, MT_SOLICIT};
+    let h = DhcpV6Header {
+        msg_type: MT_SOLICIT,
+        transaction_id: 0x12_3456,
+    };
+    let bytes = h.encode();
+    if bytes[0] != MT_SOLICIT {
+        return TestResult::Fail("msg-type byte 0");
+    }
+    if bytes[1] != 0x12 || bytes[2] != 0x34 || bytes[3] != 0x56 {
+        return TestResult::Fail("24-bit transaction-id BE");
+    }
+    let back = DhcpV6Header::decode(&bytes).expect("decode");
+    if back != h {
+        return TestResult::Fail("header round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/dhcpv6", smoke_dhcpv6_header_round_trip);
+
+fn smoke_dhcpv6_relay_header_round_trip() -> TestResult {
+    use crate::pkt_dhcpv6::{RelayHeader, MT_RELAY_FORW, RELAY_HDR_LEN};
+    let h = RelayHeader {
+        msg_type: MT_RELAY_FORW,
+        hop_count: 1,
+        link_address: [0x20, 0x01, 0xDB, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        peer_address: [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    };
+    let bytes = h.encode();
+    if bytes.len() != RELAY_HDR_LEN {
+        return TestResult::Fail("Relay header = 34 bytes");
+    }
+    let back = RelayHeader::decode(&bytes).expect("decode");
+    if back != h {
+        return TestResult::Fail("Relay header round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/dhcpv6", smoke_dhcpv6_relay_header_round_trip);
+
+fn smoke_dhcpv6_options_iter() -> TestResult {
+    use crate::pkt_dhcpv6::{
+        append_elapsed_time, append_option, append_rapid_commit, iter_options, OPT_DNS_SERVERS,
+        OPT_ELAPSED_TIME, OPT_RAPID_COMMIT,
+    };
+    let mut out = alloc::vec::Vec::new();
+    append_elapsed_time(&mut out, 250);
+    append_option(&mut out, OPT_DNS_SERVERS, &[0x20, 0x01]);
+    append_rapid_commit(&mut out);
+    let recs: alloc::vec::Vec<_> = iter_options(&out).collect::<Result<_, _>>().expect("walk");
+    if recs.len() != 3 {
+        return TestResult::Fail("expected 3 options");
+    }
+    if recs[0].code != OPT_ELAPSED_TIME || recs[0].data != [0, 250] {
+        return TestResult::Fail("Elapsed Time round-trip");
+    }
+    if recs[2].code != OPT_RAPID_COMMIT || !recs[2].data.is_empty() {
+        return TestResult::Fail("Rapid Commit must be a 0-byte option");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/dhcpv6", smoke_dhcpv6_options_iter);
+
+fn smoke_dhcpv6_clientid_duid_ll() -> TestResult {
+    use crate::pkt_dhcpv6::{
+        append_clientid_duid_ll, iter_options, DUID_TYPE_LL, OPT_CLIENTID,
+    };
+    let mut out = alloc::vec::Vec::new();
+    let mac = [0x02u8, 0x42, 0xCA, 0xFE, 0xBE, 0xEF];
+    append_clientid_duid_ll(&mut out, 1, &mac);
+    let opt = iter_options(&out).next().unwrap().expect("decode");
+    if opt.code != OPT_CLIENTID {
+        return TestResult::Fail("Client ID option code = 1");
+    }
+    let duid_type = u16::from_be_bytes([opt.data[0], opt.data[1]]);
+    if duid_type != DUID_TYPE_LL {
+        return TestResult::Fail("DUID type = 3 (LL)");
+    }
+    if &opt.data[4..10] != &mac {
+        return TestResult::Fail("MAC at end of DUID-LL");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/dhcpv6", smoke_dhcpv6_clientid_duid_ll);
+
+fn smoke_dhcpv6_solicit_layout() -> TestResult {
+    use crate::pkt_dhcpv6::{
+        build_solicit, iter_options, DhcpV6Header, MT_SOLICIT, OPT_CLIENTID, OPT_ELAPSED_TIME,
+        OPT_ORO,
+    };
+    let pkt = build_solicit(
+        0x12_3456,
+        [0x02, 0x42, 0xCA, 0xFE, 0xBE, 0xEF],
+        &[crate::pkt_dhcpv6::OPT_DNS_SERVERS, crate::pkt_dhcpv6::OPT_DOMAIN_LIST],
+    );
+    let h = DhcpV6Header::decode(&pkt).expect("header");
+    if h.msg_type != MT_SOLICIT {
+        return TestResult::Fail("SOLICIT");
+    }
+    if h.transaction_id != 0x12_3456 {
+        return TestResult::Fail("transaction id round-trip");
+    }
+    let mut saw_client = false;
+    let mut saw_elapsed = false;
+    let mut saw_oro = false;
+    for opt in iter_options(&pkt[4..]) {
+        let opt = opt.expect("parse");
+        match opt.code {
+            OPT_CLIENTID => saw_client = true,
+            OPT_ELAPSED_TIME => saw_elapsed = true,
+            OPT_ORO => saw_oro = true,
+            _ => {}
+        }
+    }
+    if !(saw_client && saw_elapsed && saw_oro) {
+        return TestResult::Fail("missing required option");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/dhcpv6", smoke_dhcpv6_solicit_layout);
+
+fn smoke_dhcpv6_status_codes() -> TestResult {
+    use crate::pkt_dhcpv6::{
+        STATUS_NOT_ON_LINK, STATUS_NO_ADDRS_AVAIL, STATUS_SUCCESS, STATUS_USE_MULTICAST,
+    };
+    if STATUS_SUCCESS != 0 || STATUS_NO_ADDRS_AVAIL != 2 || STATUS_NOT_ON_LINK != 4 || STATUS_USE_MULTICAST != 5 {
+        return TestResult::Fail("status code values per §21.13");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/dhcpv6", smoke_dhcpv6_status_codes);
+
+// ── ICMP error / IGMPv3 smokes ─────────────────────────────────────
+
+fn smoke_icmp_fragmentation_needed_round_trip() -> TestResult {
+    use crate::pkt_icmp_extra::{
+        build_fragmentation_needed, IcmpError, DUR_FRAGMENTATION_NEEDED, ICMP_DEST_UNREACHABLE,
+    };
+    let original = [0u8; 28]; // synthetic IP header + 8 bytes
+    let pkt = build_fragmentation_needed(1500, &original);
+    let (h, body) = IcmpError::decode(&pkt).expect("decode (checksum should verify)");
+    if h.typ != ICMP_DEST_UNREACHABLE || h.code != DUR_FRAGMENTATION_NEEDED {
+        return TestResult::Fail("Type 3 Code 4");
+    }
+    // Bottom 16 bits of rest_of_header carry the next-hop MTU (RFC 1191).
+    if (h.rest_of_header & 0xFFFF) as u16 != 1500 {
+        return TestResult::Fail("next-hop MTU at bits 15..0 of rest-of-header");
+    }
+    if body.len() != original.len() {
+        return TestResult::Fail("original-packet head should follow header");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/icmp-extra",
+    smoke_icmp_fragmentation_needed_round_trip
+);
+
+fn smoke_icmp_time_exceeded_layout() -> TestResult {
+    use crate::pkt_icmp_extra::{
+        build_time_exceeded, IcmpError, ICMP_TIME_EXCEEDED, TE_TTL_EXCEEDED_IN_TRANSIT,
+    };
+    let pkt = build_time_exceeded(TE_TTL_EXCEEDED_IN_TRANSIT, &[0u8; 28]);
+    let (h, _) = IcmpError::decode(&pkt).expect("decode");
+    if h.typ != ICMP_TIME_EXCEEDED || h.code != TE_TTL_EXCEEDED_IN_TRANSIT {
+        return TestResult::Fail("Type 11 Code 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/icmp-extra", smoke_icmp_time_exceeded_layout);
+
+fn smoke_icmp_redirect_carries_gateway() -> TestResult {
+    use crate::pkt_icmp_extra::{build_redirect, IcmpError, ICMP_REDIRECT, REDIRECT_HOST};
+    let pkt = build_redirect(REDIRECT_HOST, [10, 0, 0, 1], &[0u8; 28]);
+    let (h, _) = IcmpError::decode(&pkt).expect("decode");
+    if h.typ != ICMP_REDIRECT {
+        return TestResult::Fail("Type 5");
+    }
+    if h.rest_of_header != 0x0A_00_00_01 {
+        return TestResult::Fail("gateway packed into rest-of-header");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/icmp-extra", smoke_icmp_redirect_carries_gateway);
+
+fn smoke_icmp_decode_rejects_bad_checksum() -> TestResult {
+    use crate::pkt_icmp_extra::{
+        build_fragmentation_needed, IcmpError, IcmpExtraError,
+    };
+    let mut pkt = build_fragmentation_needed(1280, &[0u8; 28]);
+    pkt[10] ^= 0xFF;
+    match IcmpError::decode(&pkt) {
+        Err(IcmpExtraError::BadChecksum) => TestResult::Pass,
+        _ => TestResult::Fail("tampered ICMP must fail checksum verify"),
+    }
+}
+kernel_test_in!("net/icmp-extra", smoke_icmp_decode_rejects_bad_checksum);
+
+fn smoke_igmpv3_membership_query_decode() -> TestResult {
+    use crate::pkt_icmp_extra::{IgmpV3Query, IGMP_MEMBERSHIP_QUERY};
+    let mut buf = alloc::vec![IGMP_MEMBERSHIP_QUERY, 0x64, 0, 0]; // type, max_resp, checksum (untested)
+    buf.extend_from_slice(&[224, 0, 0, 1]); // group address
+    buf.push(0x02); // QRV=2, S=0
+    buf.push(0x12); // QQIC
+    buf.extend_from_slice(&3u16.to_be_bytes()); // number-of-sources = 3
+    let q = IgmpV3Query::decode(&buf).expect("decode");
+    if q.max_resp_code != 0x64 {
+        return TestResult::Fail("max-resp-code byte 1");
+    }
+    if q.group_address != [224, 0, 0, 1] {
+        return TestResult::Fail("group address bytes 4..8");
+    }
+    if q.flags & 0x07 != 2 {
+        return TestResult::Fail("QRV at low 3 bits of byte 8");
+    }
+    if q.number_of_sources != 3 {
+        return TestResult::Fail("source count BE u16");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/icmp-extra", smoke_igmpv3_membership_query_decode);
+
+fn smoke_igmpv3_group_record_round_trip() -> TestResult {
+    use crate::pkt_icmp_extra::{GroupRecord, IGMP_RECORD_MODE_IS_INCLUDE};
+    let r = GroupRecord {
+        record_type: IGMP_RECORD_MODE_IS_INCLUDE,
+        multicast_address: [239, 255, 255, 250], // SSDP
+        source_addresses: alloc::vec![[10u8, 0, 0, 1], [10, 0, 0, 2]],
+        auxiliary_data: alloc::vec::Vec::new(),
+    };
+    let mut buf = alloc::vec::Vec::new();
+    r.encode(&mut buf);
+    let (back, used) = GroupRecord::decode(&buf).expect("decode");
+    if used != buf.len() {
+        return TestResult::Fail("GroupRecord decode should consume full block");
+    }
+    if back != r {
+        return TestResult::Fail("GroupRecord round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/icmp-extra", smoke_igmpv3_group_record_round_trip);
+
+fn smoke_igmpv3_report_round_trip() -> TestResult {
+    use crate::pkt_icmp_extra::{
+        build_v3_report, GroupRecord, IGMP_RECORD_CHANGE_TO_EXCLUDE, IGMP_V3_MEMBERSHIP_REPORT,
+    };
+    let r = GroupRecord {
+        record_type: IGMP_RECORD_CHANGE_TO_EXCLUDE,
+        multicast_address: [224, 0, 0, 251],
+        source_addresses: alloc::vec::Vec::new(),
+        auxiliary_data: alloc::vec::Vec::new(),
+    };
+    let pkt = build_v3_report(&[r]);
+    if pkt[0] != IGMP_V3_MEMBERSHIP_REPORT {
+        return TestResult::Fail("Type byte 0x22");
+    }
+    let n_records = u16::from_be_bytes([pkt[6], pkt[7]]);
+    if n_records != 1 {
+        return TestResult::Fail("number-of-group-records BE u16 at bytes 6..8");
+    }
+    // Checksum should bring the buffer to zero ones-complement sum.
+    if crate::pkt::ip_checksum(&pkt) != 0 {
+        return TestResult::Fail("checksum should be installed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/icmp-extra", smoke_igmpv3_report_round_trip);
