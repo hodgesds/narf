@@ -90,6 +90,7 @@ pub mod descriptor;
 pub mod pen;
 pub mod ptp;
 pub mod report;
+pub mod sensor;
 pub mod usage;
 
 pub use descriptor::{

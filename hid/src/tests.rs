@@ -831,3 +831,179 @@ fn smoke_pen_detect_rejects_non_pen_descriptor() -> TestResult {
 }
 
 kernel_test_in!("hid/pen", smoke_pen_detect_rejects_non_pen_descriptor);
+
+
+
+// ── HID Sensor Collections ────────────────────────────────────────
+
+
+
+/// Synthetic accelerometer descriptor: page 0x20 / usage 0x73, with
+
+/// 16-bit X/Y/Z fields under report ID 1.
+
+const ACCEL_DESCRIPTOR: &[u8] = &[
+
+    0x05, 0x20, // Usage Page (Sensors)
+
+    0x09, 0x73, // Usage (Motion: Accelerometer 3D)
+
+    0xA1, 0x01, // Collection (Application)
+
+    0x85, 0x01, //   Report ID (1)
+
+    0x05, 0x20, //   Usage Page (Sensors) - same
+
+    0x0A, 0x53, 0x04, // Usage (Acceleration X) — 2-byte form
+
+    0x16, 0x00, 0x80, // Logical Min -32768
+
+    0x26, 0xFF, 0x7F, // Logical Max 32767
+
+    0x75, 0x10, 0x95, 0x01, //   Size 16, Count 1
+
+    0x81, 0x02, //   Input (Data,Var,Abs)
+
+    0x0A, 0x54, 0x04, // Usage (Acceleration Y)
+
+    0x81, 0x02,
+
+    0x0A, 0x55, 0x04, // Usage (Acceleration Z)
+
+    0x81, 0x02,
+
+    0xC0,       // End Collection
+
+];
+
+
+
+fn smoke_sensor_detects_accelerometer() -> TestResult {
+
+    use crate::sensor::{detect, SensorKind};
+
+    let d = parse(ACCEL_DESCRIPTOR).expect("parse");
+
+    let p = detect(&d).expect("detect");
+
+    if p.kind != SensorKind::Accelerometer3D {
+
+        return TestResult::Fail("sensor kind");
+
+    }
+
+    if p.axes.len() != 3 || p.input_report_id != 1 {
+
+        return TestResult::Fail("axes / report id");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("hid/sensor", smoke_sensor_detects_accelerometer);
+
+
+
+fn smoke_sensor_decode_xyz_signed() -> TestResult {
+
+    use crate::sensor::{decode_input, detect};
+
+    let d = parse(ACCEL_DESCRIPTOR).expect("parse");
+
+    let p = detect(&d).expect("detect");
+
+    // X = +1000, Y = -500, Z = +9806 (1g).
+
+    let report = [
+
+        1,
+
+        0xE8, 0x03,        // X = 1000
+
+        0x0C, 0xFE,        // Y = -500
+
+        0x4E, 0x26,        // Z = 9806
+
+    ];
+
+    let s = decode_input(&p, &report).expect("decode");
+
+    if s.values != [1000, -500, 9806] {
+
+        return TestResult::Fail("axis values wrong");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("hid/sensor", smoke_sensor_decode_xyz_signed);
+
+
+
+/// Ambient-light descriptor: single 32-bit Illuminance field.
+
+const ALS_DESCRIPTOR: &[u8] = &[
+
+    0x05, 0x20, // Sensors
+
+    0x09, 0x41, // Light: Ambient Light
+
+    0xA1, 0x01,
+
+    0x85, 0x02, //   Report ID 2
+
+    0x0A, 0xD1, 0x04, // Illuminance (lux)
+
+    0x17, 0x00, 0x00, 0x00, 0x00, // Logical Min 0 (4-byte form)
+
+    0x27, 0xFF, 0xFF, 0xFF, 0x7F, // Logical Max 0x7FFFFFFF
+
+    0x75, 0x20, 0x95, 0x01, //   Size 32, Count 1
+
+    0x81, 0x02,
+
+    0xC0,
+
+];
+
+
+
+fn smoke_sensor_detects_ambient_light() -> TestResult {
+
+    use crate::sensor::{decode_input, detect, SensorKind};
+
+    let d = parse(ALS_DESCRIPTOR).expect("parse");
+
+    let p = detect(&d).expect("detect");
+
+    if p.kind != SensorKind::AmbientLight {
+
+        return TestResult::Fail("sensor kind");
+
+    }
+
+    if p.axes.len() != 1 || p.input_report_id != 2 {
+
+        return TestResult::Fail("axes");
+
+    }
+
+    let report = [2u8, 0xE8, 0x03, 0x00, 0x00]; // 1000 lux
+
+    let s = decode_input(&p, &report).expect("decode");
+
+    if s.values != [1000] {
+
+        return TestResult::Fail("value");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("hid/sensor", smoke_sensor_detects_ambient_light);
