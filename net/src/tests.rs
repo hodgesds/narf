@@ -281,18 +281,14 @@ kernel_test_in!("net/udp", smoke_udp_bad_checksum_rejected);
 
 fn smoke_udp_zero_checksum_transmitted_as_ffff() -> TestResult {
     use crate::pkt_udp::ipv4_pseudo_checksum;
-    // Hand-craft a datagram whose ones-complement sum hits 0.
-    // Actually we just verify the helper substitutes 0xFFFF when its
-    // raw computation would produce 0.
-    let payload = [0u8, 0, 0, 0, 0, 0, 0, 0]; // header zeroed
+    // Hand-craft a datagram whose 16-bit one's-complement sum lands
+    // on `0xFFFF` exactly — `!0xFFFF == 0`, so the helper hits its
+    // "substitute 0xFFFF" path. Pseudo-header contributes
+    // proto(17) + length(8) = 25; payload's first u16 = 0xFFE6
+    // makes the total 0xFFFF.
+    let payload = [0xFFu8, 0xE6, 0, 0, 0, 0, 0, 0];
     let v = ipv4_pseudo_checksum([0; 4], [0; 4], &payload);
     if v != 0xFFFF {
-        // It's possible our specific input produced a non-zero
-        // checksum; that's fine for this driver's contract — but we
-        // must never emit 0 if the helper was given input meant to.
-        // The function only substitutes when ip_checksum returns 0,
-        // so as long as we test with a synthetic zero input we get
-        // the substitution path.
         return TestResult::Fail("0 checksum should be transmitted as 0xFFFF");
     }
     TestResult::Pass
