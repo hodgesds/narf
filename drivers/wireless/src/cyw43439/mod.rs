@@ -1,99 +1,119 @@
-//! Infineon CYW43439 / CYW4343W Wi-Fi + Bluetooth combo —
-//! clean-room driver skeleton.
+//! Infineon (Cypress) CYW43439 Wi-Fi 4 + Bluetooth 5 combo —
+//! clean-room driver.
 //!
 //! Spec: `drivers/wireless/specification/cyw43439.md`.
 //!
 //! ## Why this part is the bright spot
 //!
-//! Unlike the iwlwifi / mt76xx / brcmfmac flagship parts, CYW43439's
+//! Unlike the iwlwifi / mt76xx / brcmfmac flagships, CYW43439's
 //! host interface is **fully publicly documented** by Infineon:
 //!
-//! - **CYW43439 datasheet, Rev. 03** (88-page public PDF) — covers
-//!   pinout, gSPI/SDIO host interface electrical and protocol, the
-//!   F1/F2 backplane access primitives, and the chip-RAM upload
-//!   procedure.
+//! - **CYW43439 datasheet, Rev. 03 (88-page public PDF)** —
+//!   pinout, gSPI/SDIO host-interface electrical and protocol, the
+//!   F0/F1/F2 SDIO function model, the backplane access primitives
+//!   (§6.5), and the chip-RAM upload procedure (§6.6).
 //! - **AN232689 — Wi-Fi Software User Guide** — Infineon public
-//!   application note. Documents the higher-level firmware command
-//!   conventions a host driver speaks across gSPI.
+//!   application note, documents the IOCTL/IOVAR conventions a host
+//!   driver speaks across the link.
+//! - **SD Specifications, Part E1: SDIO Simplified Specification
+//!   v3.00** — the SD Association's public spec for CMD52 / CMD53
+//!   and the F0 CCCR layout.
 //! - **Bluetooth Core 5.x HCI** — the BT side rides standard HCI
-//!   framing through the same chip; we already have `narf-bluetooth`.
+//!   framing through the same chip; we already have
+//!   `narf-bluetooth`.
 //!
 //! The IOCTL/IOVAR command numbering used inside the firmware blob
-//! is *not* in the datasheet, but it is mirrored by two
-//! permissively-licensed reference drivers that were written from
-//! public docs and explicitly avoid GPL Linux derivation:
+//! is not in the datasheet, but is mirrored by two
+//! permissively-licensed reference drivers explicitly written from
+//! public docs and avoiding GPL Linux derivation:
 //!
-//! - **`soypat/cyw43439`** (MIT) — Go reference driver, intended as
-//!   a clean-room starting point.
+//! - **`soypat/cyw43439`** (MIT) — Go reference driver.
 //! - **Embassy `cyw43`** (Apache-2.0 / MIT) — Rust async driver in
 //!   wide use on Raspberry Pi Pico W (CYW43439 over PIO+SPI).
 //!
 //! Consuming the *interface conventions* documented in those repos
-//! is clean-room compatible; we do not copy code or comments
-//! verbatim. **No GPL Linux `brcmfmac` source consulted.**
+//! is clean-room compatible. **No GPL `brcmfmac` / `bcmdhd` source
+//! consulted.**
 //!
-//! ## Stage-1 scope (this commit)
+//! ## Stage progression
 //!
-//! - Module + spec doc presence so the audit trail is in place.
-//! - Constants for the public part-number / firmware-name strings
-//!   we'll need once the SPI / SDIO transport land.
-//! - Backplane register-window names + hand-off opcodes from the
-//!   datasheet (no field-by-field decoding yet).
-//!
-//! Future stages:
-//!   - SDIO + gSPI transport bring-up (`F0/F1/F2` function model).
-//!   - Backplane window paging via `BACKPLANE_ADDR`.
-//!   - Firmware (`43439A0.bin`) + NVRAM (`43439A0.txt`) upload via
-//!     the chip-RAM staging documented in the datasheet §6.
-//!   - IOCTL / IOVAR command codec — pulled from the soypat / cyw43
-//!     references with each command annotated with its public-doc
-//!     justification before it lands.
+//! - **Stage 1 (landed)** — module + spec presence, public part-
+//!   number / firmware-name constants, SDIO function-model
+//!   constants.
+//! - **Stage 2 (this commit)** — transport-codec layer:
+//!   - [`gspi`] — 32-bit gSPI command-word codec (datasheet §6.4).
+//!   - [`sdio`] — CMD52 / CMD53 argument-word codec + F0/F1
+//!     register addresses (SDIO Simplified Spec + datasheet §6.5).
+//!   - [`backplane`] — F1 window paging codec (datasheet §6.5).
+//!   - [`transport`] — the [`Transport`](transport::Transport) trait
+//!     gSPI / SDIO host adapters implement.
+//! - **Stage 3 (future)** — chip-RAM firmware staging: load
+//!   `43439A0.bin` to the SOC-RAM core, push `43439A0.txt` NVRAM,
+//!   deassert WLAN_ARM reset.
+//! - **Stage 4 (future)** — IOCTL / IOVAR codec, with each command
+//!   number annotated by its public-doc justification before it
+//!   lands.
 
 #![allow(dead_code)]
 
 extern crate alloc;
 
-// ── Hardware identification ────────────────────────────────────────
+pub mod backplane;
+pub mod gspi;
+pub mod sdio;
+pub mod transport;
 
-/// 16-bit JEDEC manufacturer code that the CYW43439 reports through
-/// the SDIO CIS / SPI device-id query.
+pub use transport::{Function, Transport, TransportError};
+
+// ── Hardware identification (public datasheet cover sheet) ─────────
+
+/// Vendor as reported on Infineon's public collateral.
 pub const CYW43439_VENDOR_NAME: &str = "Infineon (Cypress)";
+/// The Infineon part number this driver covers.
 pub const CYW43439_PART_NUMBER: &str = "CYW43439";
 
-/// Firmware blob filenames as Infineon ships them (FCC fileset).
+/// Firmware blob filenames as Infineon ships them in the FCC
+/// fileset. The blobs themselves are vendor-distributed binaries
+/// the boot path supplies through the firmware-cap surface.
 pub const FIRMWARE_FILENAME: &str = "43439A0.bin";
 pub const NVRAM_FILENAME: &str = "43439A0.txt";
 pub const CLM_BLOB_FILENAME: &str = "43439A0_clm.bin";
 
-// ── SDIO / gSPI top-level constants (from the public datasheet) ───
-
-/// The CYW43439 exposes three SDIO functions per CYW43439 §3.1.
-/// Function 0 is the standard SDIO control window; F1 reaches the
-/// backplane; F2 is the WLAN bulk-data path.
-pub const SDIO_FUNC_CONTROL: u8 = 0;
-pub const SDIO_FUNC_BACKPLANE: u8 = 1;
-pub const SDIO_FUNC_WLAN: u8 = 2;
-
-/// gSPI register at offset 0x00 — bus control (per datasheet §6.4).
-/// gSPI is a single-function variant of the SDIO interface for hosts
-/// with no SDIO controller (the Pico W use-case).
-pub const GSPI_BUS_CONTROL: u32 = 0x0000;
-
-// ── Backplane core ids (datasheet §6.5) ───────────────────────────
-
-/// Backplane core id for the WLAN ARM core ("WLAN_ARM" / D11).
-pub const CORE_WLAN_ARM: u16 = 0x829;
-/// Backplane core id for the SOC-RAM core (chip RAM where firmware
-/// is staged before reset).
-pub const CORE_SOC_RAM: u16 = 0x80E;
-
-// ── Stub probe entry ──────────────────────────────────────────────
-
-/// Stage-1 probe: the chip is on a bus we don't currently enumerate
-/// (gSPI on a microcontroller pin set, or SDIO on a Raspberry Pi).
-/// This stub records the part identifier so a future SDIO/gSPI
-/// transport crate can claim it.
+/// Stage-1 register stub — kept so existing call-sites (e.g. the
+/// wireless crate's `register_initcalls`) link cleanly. The chip
+/// is not exposed on PCI; the eventual integration hooks into the
+/// gSPI / SDIO transport adapters described in [`transport`].
 pub fn register() {
-    // Nothing to register on x86_64 yet — the eventual consumer is
-    // the aarch64 / RP2040 Pico-W bring-up path.
+    // Intentional no-op for now: the bus through which the chip is
+    // reached (gSPI on a microcontroller pin set, or SDIO on a
+    // Raspberry Pi) is not part of the PCI dispatch table. Once the
+    // SDIO host-controller interface lands, this will register a
+    // CYW43439 SDIO match instead.
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+pub mod tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn smoke_firmware_filenames_present() -> TestResult {
+        // Cheap sanity check: the public FCC fileset always uses
+        // these three names. Regressions here typically mean
+        // someone patched the constants without updating the
+        // loader expectations.
+        if !FIRMWARE_FILENAME.ends_with(".bin") {
+            return TestResult::Fail("firmware filename should end .bin");
+        }
+        if !NVRAM_FILENAME.ends_with(".txt") {
+            return TestResult::Fail("NVRAM filename should end .txt");
+        }
+        if !CLM_BLOB_FILENAME.ends_with(".bin") {
+            return TestResult::Fail("CLM filename should end .bin");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/cyw43439",
+        smoke_firmware_filenames_present
+    );
 }
