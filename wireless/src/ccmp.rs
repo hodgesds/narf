@@ -171,9 +171,11 @@ pub fn build_aad(mac_header: &[u8]) -> Vec<u8> {
     let fc_hi_masked = fc_hi & !(0x38);
     out.push(fc_lo);
     out.push(fc_hi_masked);
-    // Duration: zero (§12.5.3.3.3 step 2).
-    out.push(0);
-    out.push(0);
+    // Per IEEE 802.11-2020 §12.5.3.3.3, AAD construction skips
+    // the Duration/ID field — it goes straight from FC to A1.
+    // (Earlier versions of this driver inserted two zero bytes
+    // for Duration; that produced a 24-byte AAD that wouldn't
+    // round-trip with any conformant peer.)
     // Address1, 2, 3 — copied as-is.
     out.extend_from_slice(&mac_header[4..22]);
     // SeqCtrl: keep FragNum (low 4 bits of byte 22), zero SeqNum (rest).
