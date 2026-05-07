@@ -467,3 +467,133 @@ fn smoke_watchdog_sp805_lock_magic_and_load() -> TestResult {
 }
 
 kernel_test_in!("power/watchdog", smoke_watchdog_sp805_lock_magic_and_load);
+
+
+
+// ── PSCI ──────────────────────────────────────────────────────────
+
+
+
+fn smoke_psci_function_ids_match_spec() -> TestResult {
+
+    use crate::psci::fn_id;
+
+    if fn_id::PSCI_VERSION != 0x84000000
+
+        || fn_id::CPU_OFF != 0x84000002
+
+        || fn_id::CPU_ON_64 != 0xC4000003
+
+        || fn_id::SYSTEM_OFF != 0x84000008
+
+        || fn_id::SYSTEM_RESET != 0x84000009
+
+    {
+
+        return TestResult::Fail("PSCI function IDs wrong");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("power/psci", smoke_psci_function_ids_match_spec);
+
+
+
+fn smoke_psci_power_state_encoding() -> TestResult {
+
+    use crate::psci::encode_power_state;
+
+    let s = encode_power_state(0x42, true, 1);
+
+    if s & 0xFFFF != 0x42 { return TestResult::Fail("state id"); }
+
+    if s & (1 << 16) == 0 { return TestResult::Fail("power-down"); }
+
+    if (s >> 24) & 0x7 != 1 { return TestResult::Fail("affinity"); }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("power/psci", smoke_psci_power_state_encoding);
+
+
+
+fn smoke_psci_status_decode() -> TestResult {
+
+    use crate::psci::Status;
+
+    if Status::from_i32(0) != Status::Success { return TestResult::Fail("0"); }
+
+    if Status::from_i32(-4) != Status::AlreadyOn { return TestResult::Fail("-4"); }
+
+    if Status::from_i32(-9) != Status::InvalidAddress { return TestResult::Fail("-9"); }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("power/psci", smoke_psci_status_decode);
+
+
+
+// ── AMD CPPC ──────────────────────────────────────────────────────
+
+
+
+#[cfg(target_arch = "x86_64")]
+
+fn smoke_cppc_request_round_trip() -> TestResult {
+
+    use crate::cppc::{epp, Request};
+
+    let r = Request::build(50, 200, 150, epp::BALANCED_PERFORMANCE);
+
+    if r.min_perf() != 50 || r.max_perf() != 200 || r.desired_perf() != 150 {
+
+        return TestResult::Fail("perf fields");
+
+    }
+
+    if r.energy_performance_preference() != epp::BALANCED_PERFORMANCE {
+
+        return TestResult::Fail("EPP");
+
+    }
+
+    TestResult::Pass
+
+}
+
+#[cfg(target_arch = "x86_64")]
+
+kernel_test_in!("power/cppc", smoke_cppc_request_round_trip);
+
+
+
+#[cfg(target_arch = "x86_64")]
+
+fn smoke_cppc_cap1_field_layout() -> TestResult {
+
+    use crate::cppc::Cap1;
+
+    let c = Cap1(0x12_34_56_78);
+
+    if c.lowest_perf() != 0x78 || c.lowest_nonlinear_perf() != 0x56
+
+        || c.nominal_perf() != 0x34 || c.highest_perf() != 0x12 {
+
+        return TestResult::Fail("Cap1 fields");
+
+    }
+
+    TestResult::Pass
+
+}
+
+#[cfg(target_arch = "x86_64")]
+
+kernel_test_in!("power/cppc", smoke_cppc_cap1_field_layout);

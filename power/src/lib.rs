@@ -33,9 +33,13 @@
 
 extern crate alloc;
 
+pub mod psci;
 pub mod suspend;
 pub mod thermal;
 pub mod watchdog;
+
+#[cfg(target_arch = "x86_64")]
+pub mod cppc;
 
 #[cfg(target_arch = "x86_64")]
 pub mod idle;
