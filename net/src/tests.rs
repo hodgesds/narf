@@ -2321,3 +2321,485 @@ fn smoke_lldp_dest_mac_constant() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net/l2/lldp", smoke_lldp_dest_mac_constant);
+
+// ── CoAP smokes ────────────────────────────────────────────────────
+
+fn smoke_coap_header_round_trip() -> TestResult {
+    use crate::pkt_coap::{Header, METHOD_GET, TYPE_CONFIRMABLE};
+    let h = Header {
+        version: 1,
+        typ: TYPE_CONFIRMABLE,
+        code: METHOD_GET,
+        message_id: 0xABCD,
+        token: alloc::vec![0xCAu8, 0xFE, 0xBE],
+    };
+    let mut buf = alloc::vec::Vec::new();
+    h.encode_into(&mut buf);
+    let (back, used) = Header::decode(&buf).expect("decode");
+    if used != buf.len() {
+        return TestResult::Fail("decode should consume header + token");
+    }
+    if back != h {
+        return TestResult::Fail("header round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/coap", smoke_coap_header_round_trip);
+
+fn smoke_coap_decode_rejects_bad_version() -> TestResult {
+    use crate::pkt_coap::{CoapError, Header};
+    let buf = [0xC0u8, 0, 0, 0]; // version field = 3
+    match Header::decode(&buf) {
+        Err(CoapError::BadVersion(3)) => TestResult::Pass,
+        _ => TestResult::Fail("non-1 version must be rejected"),
+    }
+}
+kernel_test_in!("net/coap", smoke_coap_decode_rejects_bad_version);
+
+fn smoke_coap_decode_rejects_long_token_length() -> TestResult {
+    use crate::pkt_coap::{CoapError, Header};
+    let buf = [0x49u8, 0, 0, 0]; // version 1, type 0, TKL = 9
+    match Header::decode(&buf) {
+        Err(CoapError::BadTokenLength(9)) => TestResult::Pass,
+        _ => TestResult::Fail("TKL > 8 must be rejected"),
+    }
+}
+kernel_test_in!("net/coap", smoke_coap_decode_rejects_long_token_length);
+
+fn smoke_coap_option_delta_extension_13() -> TestResult {
+    use crate::pkt_coap::{append_option, parse_options_and_payload, CoapOption};
+    let mut out = alloc::vec::Vec::new();
+    let mut last = 0u32;
+    // Option number 17 — uses delta extension form (13 ≤ delta < 269).
+    append_option(
+        &mut out,
+        &mut last,
+        &CoapOption {
+            number: 17,
+            value: alloc::vec![0xAA],
+        },
+    );
+    if (out[0] >> 4) != 13 {
+        return TestResult::Fail("delta nibble = 13 for delta 13..268");
+    }
+    if out[1] != (17 - 13) as u8 {
+        return TestResult::Fail("extended delta byte");
+    }
+    let (opts, _, _) = parse_options_and_payload(&out).expect("parse");
+    if opts.len() != 1 || opts[0].number != 17 || opts[0].value != [0xAA] {
+        return TestResult::Fail("extended-delta option round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/coap", smoke_coap_option_delta_extension_13);
+
+fn smoke_coap_option_delta_extension_14() -> TestResult {
+    use crate::pkt_coap::{append_option, parse_options_and_payload, CoapOption};
+    let mut out = alloc::vec::Vec::new();
+    let mut last = 0u32;
+    // Option number 1000 — uses delta extension form 14 (BE u16).
+    append_option(
+        &mut out,
+        &mut last,
+        &CoapOption {
+            number: 1000,
+            value: alloc::vec::Vec::new(),
+        },
+    );
+    if (out[0] >> 4) != 14 {
+        return TestResult::Fail("delta nibble = 14 for delta ≥ 269");
+    }
+    let (opts, _, _) = parse_options_and_payload(&out).expect("parse");
+    if opts[0].number != 1000 {
+        return TestResult::Fail("16-bit-extended delta round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/coap", smoke_coap_option_delta_extension_14);
+
+fn smoke_coap_payload_marker_terminates_options() -> TestResult {
+    use crate::pkt_coap::{
+        build_message, parse_options_and_payload, CoapOption, Header, METHOD_POST, OPT_URI_PATH,
+        TYPE_NON_CONFIRMABLE,
+    };
+    let header = Header {
+        version: 1,
+        typ: TYPE_NON_CONFIRMABLE,
+        code: METHOD_POST,
+        message_id: 0,
+        token: alloc::vec::Vec::new(),
+    };
+    let opts = alloc::vec![CoapOption {
+        number: OPT_URI_PATH,
+        value: b"sensor".to_vec(),
+    }];
+    let pkt = build_message(&header, &opts, Some(b"42"));
+    // Decode: skip 4-byte header, parse options + payload from byte 4.
+    let (parsed_opts, payload, _) = parse_options_and_payload(&pkt[4..]).expect("parse");
+    if parsed_opts.len() != 1 || parsed_opts[0].number != OPT_URI_PATH {
+        return TestResult::Fail("Uri-Path option");
+    }
+    if payload != b"42" {
+        return TestResult::Fail("payload after 0xFF marker");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/coap", smoke_coap_payload_marker_terminates_options);
+
+fn smoke_coap_response_code_split() -> TestResult {
+    use crate::pkt_coap::{split_code, CODE_CONTENT, CODE_NOT_FOUND};
+    let (c, d) = split_code(CODE_CONTENT);
+    if c != 2 || d != 5 {
+        return TestResult::Fail("2.05 splits into class=2, detail=5");
+    }
+    let (c, d) = split_code(CODE_NOT_FOUND);
+    if c != 4 || d != 4 {
+        return TestResult::Fail("4.04 splits into class=4, detail=4");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/coap", smoke_coap_response_code_split);
+
+fn smoke_coap_get_well_known_core() -> TestResult {
+    use crate::pkt_coap::{build_get_request, parse_options_and_payload, OPT_URI_PATH};
+    let pkt = build_get_request(0x1234, &[0xAA], &[".well-known", "core"]);
+    let (opts, _, _) = parse_options_and_payload(&pkt[4 + 1..]).expect("parse"); // skip hdr + 1-byte token
+    if opts.len() != 2 {
+        return TestResult::Fail("expected two Uri-Path options");
+    }
+    if opts[0].number != OPT_URI_PATH || opts[0].value != b".well-known" {
+        return TestResult::Fail("first Uri-Path");
+    }
+    if opts[1].value != b"core" {
+        return TestResult::Fail("second Uri-Path");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/coap", smoke_coap_get_well_known_core);
+
+// ── GRE smokes ─────────────────────────────────────────────────────
+
+fn smoke_gre_minimal_header_round_trip() -> TestResult {
+    use crate::pkt_gre::GreHeader;
+    let h = GreHeader {
+        flags_version: 0,
+        protocol_type: 0x0800,
+        checksum: None,
+        key: None,
+        sequence: None,
+    };
+    let mut buf = alloc::vec::Vec::new();
+    h.encode(&mut buf);
+    if buf.len() != 4 {
+        return TestResult::Fail("Minimal GRE header = 4 bytes");
+    }
+    if u16::from_be_bytes([buf[2], buf[3]]) != 0x0800 {
+        return TestResult::Fail("protocol type = IPv4");
+    }
+    let (back, used) = GreHeader::decode(&buf).expect("decode");
+    if used != buf.len() {
+        return TestResult::Fail("decode should consume header");
+    }
+    if back != h {
+        return TestResult::Fail("header round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/gre", smoke_gre_minimal_header_round_trip);
+
+fn smoke_gre_with_key_and_sequence() -> TestResult {
+    use crate::pkt_gre::{GreHeader, FLAG_KEY, FLAG_SEQUENCE};
+    let h = GreHeader {
+        flags_version: FLAG_KEY | FLAG_SEQUENCE,
+        protocol_type: 0x86DD,
+        checksum: None,
+        key: Some(0x1234_5678),
+        sequence: Some(7),
+    };
+    let mut buf = alloc::vec::Vec::new();
+    h.encode(&mut buf);
+    // 4 hdr + 4 key + 4 seq = 12 bytes.
+    if buf.len() != 12 {
+        return TestResult::Fail("4 hdr + 4 key + 4 seq = 12 bytes");
+    }
+    let (back, _) = GreHeader::decode(&buf).expect("decode");
+    if back.key != Some(0x1234_5678) || back.sequence != Some(7) {
+        return TestResult::Fail("key / sequence round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/gre", smoke_gre_with_key_and_sequence);
+
+fn smoke_gre_decode_rejects_non_zero_version() -> TestResult {
+    use crate::pkt_gre::{GreError, GreHeader};
+    let buf = [0u8, 1, 0, 0]; // version field = 1
+    match GreHeader::decode(&buf) {
+        Err(GreError::BadVersion(1)) => TestResult::Pass,
+        _ => TestResult::Fail("non-zero version must be rejected"),
+    }
+}
+kernel_test_in!("net/gre", smoke_gre_decode_rejects_non_zero_version);
+
+fn smoke_gre_build_with_checksum_round_trip() -> TestResult {
+    use crate::pkt_gre::{build, verify};
+    let pkt = build(0x0800, None, None, b"payload-bytes", true);
+    verify(&pkt).expect("checksum should verify");
+    TestResult::Pass
+}
+kernel_test_in!("net/gre", smoke_gre_build_with_checksum_round_trip);
+
+fn smoke_gre_bad_checksum_rejected() -> TestResult {
+    use crate::pkt_gre::{build, verify, GreError};
+    let mut pkt = build(0x0800, None, None, b"payload-bytes", true);
+    let last = pkt.len() - 1;
+    pkt[last] ^= 0xFF;
+    match verify(&pkt) {
+        Err(GreError::BadChecksum) => TestResult::Pass,
+        _ => TestResult::Fail("tampered packet must fail verify"),
+    }
+}
+kernel_test_in!("net/gre", smoke_gre_bad_checksum_rejected);
+
+// ── SCTP smokes ────────────────────────────────────────────────────
+
+fn smoke_sctp_common_header_round_trip() -> TestResult {
+    use crate::pkt_sctp::{CommonHeader, COMMON_HDR_LEN};
+    let h = CommonHeader {
+        src_port: 8443,
+        dst_port: 80,
+        verification_tag: 0xCAFE_BABE,
+        checksum: 0xDEAD_BEEF,
+    };
+    let bytes = h.encode();
+    if bytes.len() != COMMON_HDR_LEN {
+        return TestResult::Fail("SCTP common header = 12 bytes");
+    }
+    let back = CommonHeader::decode(&bytes).expect("decode");
+    if back != h {
+        return TestResult::Fail("common header round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/sctp", smoke_sctp_common_header_round_trip);
+
+fn smoke_sctp_crc32c_known_vector() -> TestResult {
+    use crate::pkt_sctp::crc32c;
+    // CRC-32/CASTAGNOLI of "123456789" is 0xE3069283.
+    let r = crc32c(b"123456789");
+    if r != 0xE306_9283 {
+        return TestResult::Fail("CRC-32C test vector mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/sctp", smoke_sctp_crc32c_known_vector);
+
+fn smoke_sctp_chunk_iterator_and_alignment() -> TestResult {
+    use crate::pkt_sctp::{append_chunk, iter_chunks, CHUNK_HEARTBEAT};
+    let mut chunks = alloc::vec::Vec::new();
+    // Heartbeat with 3-byte body should pad to 4-byte boundary.
+    append_chunk(&mut chunks, CHUNK_HEARTBEAT, 0, &[1, 2, 3]);
+    if chunks.len() != 8 {
+        return TestResult::Fail("chunk should pad to 4-byte boundary");
+    }
+    let recs: alloc::vec::Vec<_> = iter_chunks(&chunks)
+        .collect::<Result<_, _>>()
+        .expect("walk");
+    if recs.len() != 1 {
+        return TestResult::Fail("expected 1 chunk");
+    }
+    if recs[0].typ != CHUNK_HEARTBEAT {
+        return TestResult::Fail("chunk type round-trip");
+    }
+    if recs[0].length != 7 {
+        return TestResult::Fail("chunk length excludes padding");
+    }
+    if recs[0].value != [1, 2, 3] {
+        return TestResult::Fail("chunk value");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/sctp", smoke_sctp_chunk_iterator_and_alignment);
+
+fn smoke_sctp_data_chunk_value_layout() -> TestResult {
+    use crate::pkt_sctp::build_data_value;
+    let v = build_data_value(0xCAFE_BABE, 5, 7, 0x0000_0026, b"hi");
+    if v.len() != 12 + 2 {
+        return TestResult::Fail("DATA value = 12 hdr + payload");
+    }
+    if u32::from_be_bytes([v[0], v[1], v[2], v[3]]) != 0xCAFE_BABE {
+        return TestResult::Fail("TSN BE");
+    }
+    if u16::from_be_bytes([v[4], v[5]]) != 5 {
+        return TestResult::Fail("Stream ID");
+    }
+    if u32::from_be_bytes([v[8], v[9], v[10], v[11]]) != 0x0000_0026 {
+        return TestResult::Fail("Payload Protocol ID");
+    }
+    if &v[12..] != b"hi" {
+        return TestResult::Fail("user data tail");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/sctp", smoke_sctp_data_chunk_value_layout);
+
+fn smoke_sctp_packet_checksum_round_trip() -> TestResult {
+    use crate::pkt_sctp::{
+        append_chunk, build_packet, verify_packet, CommonHeader, CHUNK_HEARTBEAT,
+    };
+    let mut chunks = alloc::vec::Vec::new();
+    append_chunk(&mut chunks, CHUNK_HEARTBEAT, 0, &[1, 2, 3]);
+    let pkt = build_packet(
+        CommonHeader {
+            src_port: 1,
+            dst_port: 2,
+            verification_tag: 0,
+            checksum: 0,
+        },
+        &chunks,
+    );
+    verify_packet(&pkt).expect("CRC32C should verify");
+    TestResult::Pass
+}
+kernel_test_in!("net/sctp", smoke_sctp_packet_checksum_round_trip);
+
+fn smoke_sctp_tampered_packet_rejected() -> TestResult {
+    use crate::pkt_sctp::{
+        append_chunk, build_packet, verify_packet, CommonHeader, SctpError, CHUNK_DATA,
+    };
+    let mut chunks = alloc::vec::Vec::new();
+    append_chunk(&mut chunks, CHUNK_DATA, 0, &[0u8; 16]);
+    let mut pkt = build_packet(
+        CommonHeader {
+            src_port: 0,
+            dst_port: 0,
+            verification_tag: 0,
+            checksum: 0,
+        },
+        &chunks,
+    );
+    pkt[20] ^= 0xFF;
+    match verify_packet(&pkt) {
+        Err(SctpError::BadChecksum) => TestResult::Pass,
+        _ => TestResult::Fail("tampered packet should fail CRC32C verify"),
+    }
+}
+kernel_test_in!("net/sctp", smoke_sctp_tampered_packet_rejected);
+
+// ── TFTP smokes ────────────────────────────────────────────────────
+
+fn smoke_tftp_rrq_round_trip() -> TestResult {
+    use crate::pkt_tftp::{Packet, MODE_OCTET, OP_RRQ};
+    let p = Packet::Request {
+        opcode: OP_RRQ,
+        filename: alloc::string::String::from("kernel.elf"),
+        mode: alloc::string::String::from(MODE_OCTET),
+        options: alloc::vec::Vec::new(),
+    };
+    let bytes = p.encode();
+    if u16::from_be_bytes([bytes[0], bytes[1]]) != OP_RRQ {
+        return TestResult::Fail("RRQ opcode = 1");
+    }
+    let back = Packet::decode(&bytes).expect("decode");
+    if back != p {
+        return TestResult::Fail("RRQ round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tftp", smoke_tftp_rrq_round_trip);
+
+fn smoke_tftp_rrq_with_options() -> TestResult {
+    use crate::pkt_tftp::{Packet, MODE_OCTET, OP_RRQ};
+    let p = Packet::Request {
+        opcode: OP_RRQ,
+        filename: alloc::string::String::from("img"),
+        mode: alloc::string::String::from(MODE_OCTET),
+        options: alloc::vec![
+            (alloc::string::String::from("blksize"), alloc::string::String::from("1428")),
+            (alloc::string::String::from("tsize"), alloc::string::String::from("0")),
+        ],
+    };
+    let bytes = p.encode();
+    let back = Packet::decode(&bytes).expect("decode");
+    if back != p {
+        return TestResult::Fail("RRQ with options round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tftp", smoke_tftp_rrq_with_options);
+
+fn smoke_tftp_data_packet_round_trip() -> TestResult {
+    use crate::pkt_tftp::{Packet, OP_DATA};
+    let p = Packet::Data {
+        block: 7,
+        data: alloc::vec![0xCAu8; 256],
+    };
+    let bytes = p.encode();
+    if u16::from_be_bytes([bytes[0], bytes[1]]) != OP_DATA {
+        return TestResult::Fail("DATA opcode = 3");
+    }
+    if u16::from_be_bytes([bytes[2], bytes[3]]) != 7 {
+        return TestResult::Fail("block field BE u16");
+    }
+    let back = Packet::decode(&bytes).expect("decode");
+    if back != p {
+        return TestResult::Fail("DATA round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tftp", smoke_tftp_data_packet_round_trip);
+
+fn smoke_tftp_ack_packet_round_trip() -> TestResult {
+    use crate::pkt_tftp::Packet;
+    let bytes = Packet::Ack { block: 0 }.encode();
+    if bytes.len() != 4 {
+        return TestResult::Fail("ACK = 4 bytes");
+    }
+    let back = Packet::decode(&bytes).expect("decode");
+    if back != (Packet::Ack { block: 0 }) {
+        return TestResult::Fail("ACK round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tftp", smoke_tftp_ack_packet_round_trip);
+
+fn smoke_tftp_error_packet_round_trip() -> TestResult {
+    use crate::pkt_tftp::{Packet, ERROR_FILE_NOT_FOUND};
+    let p = Packet::Error {
+        code: ERROR_FILE_NOT_FOUND,
+        message: alloc::string::String::from("not here"),
+    };
+    let bytes = p.encode();
+    let back = Packet::decode(&bytes).expect("decode");
+    if back != p {
+        return TestResult::Fail("ERROR round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tftp", smoke_tftp_error_packet_round_trip);
+
+fn smoke_tftp_oack_options_round_trip() -> TestResult {
+    use crate::pkt_tftp::Packet;
+    let p = Packet::OAck {
+        options: alloc::vec![(
+            alloc::string::String::from("blksize"),
+            alloc::string::String::from("1428"),
+        )],
+    };
+    let bytes = p.encode();
+    let back = Packet::decode(&bytes).expect("decode");
+    if back != p {
+        return TestResult::Fail("OACK round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tftp", smoke_tftp_oack_options_round_trip);
+
+fn smoke_tftp_decode_rejects_unknown_opcode() -> TestResult {
+    use crate::pkt_tftp::{Packet, TftpError};
+    let buf = [0u8, 99, 0, 0];
+    match Packet::decode(&buf) {
+        Err(TftpError::BadOpcode(99)) => TestResult::Pass,
+        _ => TestResult::Fail("non-1..6 opcode must be rejected"),
+    }
+}
+kernel_test_in!("net/tftp", smoke_tftp_decode_rejects_unknown_opcode);

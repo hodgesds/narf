@@ -654,3 +654,60 @@ needs to peer with on real wire.
   capability-bit constant set.
 
 **No GPL Linux source consulted.**
+
+## 15. CoAP, GRE, SCTP, TFTP codecs
+
+The networking-axis cycle continued past app-layer + L2 into IoT,
+tunneling, multi-stream transport, and netboot protocols.
+
+### CoAP (`pkt_coap`)
+- **RFC 7252** — The Constrained Application Protocol (Z. Shelby et
+  al, June 2014). §3 message format. §3.1 option format with
+  Delta + Length nibbles + 13 / 14 / 15 extended forms. §5.10
+  registered options. §12.1 message codes (request methods +
+  response codes class.detail).
+- Surfaced: `Header::encode_into/decode` (with version + TKL +
+  bad-token-length rejection), `append_option` + `parse_options_and_payload`
+  with the 13 / 14 / 15 nibble extension form, payload-marker
+  handling, response-code split, `build_get_request` for the
+  `.well-known/core` browsing convention.
+
+### GRE (`pkt_gre`)
+- **RFC 2784** — Generic Routing Encapsulation (D. Farinacci et al,
+  March 2000). §2.1 4-byte fixed header (flags + version + protocol
+  type) + optional 16-bit checksum + 16-bit reserved.
+- **RFC 2890** — Key and Sequence Number Extensions to GRE (G.
+  Dommety, September 2000). K and S flags adding optional 32-bit
+  Key + 32-bit Sequence Number.
+- Surfaced: `GreHeader::encode/decode`, `build` builder with
+  optional Checksum / Key / Sequence + automatic CRC-style
+  ip-checksum installation, `verify` for received packets, full
+  flag-bit + helper accessor set.
+
+### SCTP (`pkt_sctp`)
+- **RFC 9260** — Stream Control Transmission Protocol (R. Stewart
+  et al, June 2022). §3.1 12-byte common header. §3.2 chunk header
+  format. §3.3 chunk types (INIT/INIT-ACK/COOKIE-ECHO/COOKIE-ACK/
+  DATA/SACK/HEARTBEAT/HEARTBEAT-ACK/ABORT/SHUTDOWN/ERROR/PAD).
+- **RFC 3309** — SCTP Checksum (CRC-32C / Castagnoli, polynomial
+  0x1EDC6F41, transmitted in *little-endian* byte order on the
+  wire).
+- Surfaced: `CommonHeader::encode/decode`, `iter_chunks` walking
+  with 4-byte alignment padding, `append_chunk` builder,
+  `build_data_value` for the §3.3.1 DATA chunk body (TSN +
+  Stream ID + Sequence + PPID + user data), `crc32c` standalone
+  and `compute_checksum` / `build_packet` / `verify_packet`
+  end-to-end with the LE-on-wire SCTP convention.
+
+### TFTP (`pkt_tftp`)
+- **RFC 1350** — The TFTP Protocol Revision 2 (K. Sollins, July
+  1992). §5 packet formats. Opcodes RRQ / WRQ / DATA / ACK / ERROR.
+- **RFC 2347** — TFTP Option Extension (G. Malkin & A. Harkin, May
+  1998). OACK packet (opcode 6) carrying the server-acknowledged
+  options.
+- Surfaced: `Packet` enum encode/decode covering RRQ / WRQ / DATA /
+  ACK / ERROR / OACK including options on requests + OACK,
+  full mode + error-code constant set, NUL-terminated string codec
+  with unterminated-buffer rejection.
+
+**No GPL Linux source consulted.**
