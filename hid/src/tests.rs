@@ -591,3 +591,243 @@ fn smoke_ptp_detect_rejects_non_touchpad() -> TestResult {
 }
 kernel_test_in!("hid/ptp", smoke_ptp_detect_rejects_non_touchpad);
 
+
+
+
+// ── HID Pen profile ───────────────────────────────────────────────
+
+
+
+/// Synthetic Pen descriptor. One Pen Application Collection, Report
+
+/// ID 5: tip / barrel / invert / eraser / in-range (5 bits + 3 pad)
+
+/// + X/Y (16-bit each) + Pressure (16) + X-Tilt/Y-Tilt (8-bit signed)
+
+/// + Twist (16).
+
+const PEN_DESCRIPTOR: &[u8] = &[
+
+    0x05, 0x0D, // Digitizer page
+
+    0x09, 0x02, // Usage (Pen)
+
+    0xA1, 0x01, // Collection (Application)
+
+    0x85, 0x05, //   Report ID (5)
+
+    0x09, 0x20, //   Usage (Stylus)
+
+    0xA1, 0x00, //   Collection (Physical)
+
+    0x09, 0x42, //     Tip Switch
+
+    0x09, 0x44, //     Barrel Switch
+
+    0x09, 0x3C, //     Invert
+
+    0x09, 0x45, //     Eraser
+
+    0x09, 0x32, //     In Range
+
+    0x15, 0x00, 0x25, 0x01,
+
+    0x75, 0x01, 0x95, 0x05,
+
+    0x81, 0x02, //     Input (Data,Var,Abs)
+
+    0x75, 0x03, 0x95, 0x01,
+
+    0x81, 0x03, //     Input (Const,Var) — padding
+
+    0x05, 0x01, //     Generic Desktop
+
+    0x09, 0x30, //     Usage (X)
+
+    0x26, 0xFF, 0x7F, // Logical Max 0x7FFF
+
+    0x75, 0x10, 0x95, 0x01,
+
+    0x81, 0x02,
+
+    0x09, 0x31, //     Usage (Y)
+
+    0x81, 0x02,
+
+    0x05, 0x0D, //     Digitizer
+
+    0x09, 0x30, //     Tip Pressure
+
+    0x26, 0xFF, 0x0F, // Logical Max 4095
+
+    0x75, 0x10, 0x95, 0x01,
+
+    0x81, 0x02,
+
+    0x09, 0x3D, //     X-Tilt
+
+    0x15, 0x80, 0x25, 0x7F, // signed -128..127
+
+    0x75, 0x08, 0x95, 0x01,
+
+    0x81, 0x02,
+
+    0x09, 0x3E, //     Y-Tilt
+
+    0x81, 0x02,
+
+    0x09, 0x41, //     Twist
+
+    0x15, 0x00, 0x26, 0x67, 0x01, // 0..359
+
+    0x75, 0x10, 0x95, 0x01,
+
+    0x81, 0x02,
+
+    0xC0,       //   End Collection
+
+    0xC0,       // End Collection
+
+];
+
+
+
+fn smoke_pen_detect_finds_minimum_field_set() -> TestResult {
+
+    use crate::pen::detect;
+
+    let d = parse(PEN_DESCRIPTOR).expect("parse");
+
+    let p = match detect(&d) {
+
+        Some(p) => p,
+
+        None => return TestResult::Fail("pen detect rejected valid descriptor"),
+
+    };
+
+    if p.input_report_id != 5 {
+
+        return TestResult::Fail("report id");
+
+    }
+
+    if p.fields.tip_pressure.is_none()
+
+        || p.fields.x_tilt.is_none()
+
+        || p.fields.twist.is_none()
+
+        || p.fields.barrel_switch.is_none()
+
+    {
+
+        return TestResult::Fail("missing optional field");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("hid/pen", smoke_pen_detect_finds_minimum_field_set);
+
+
+
+fn smoke_pen_decode_input_round_trip() -> TestResult {
+
+    use crate::pen::{decode_input, detect};
+
+    let d = parse(PEN_DESCRIPTOR).expect("parse");
+
+    let p = detect(&d).expect("detect");
+
+    // Construct a report:
+
+    //   tip=1, barrel=0, invert=0, eraser=0, in-range=1, pad=000
+
+    //   X=0x1234, Y=0x5678, Pressure=0x0F00, X-Tilt=-30, Y-Tilt=+45, Twist=180
+
+    let report = [
+
+        5, // Report ID
+
+        0b0001_0001, // tip + in-range, others clear
+
+        0x34, 0x12, // X
+
+        0x78, 0x56, // Y
+
+        0x00, 0x0F, // Pressure
+
+        (-30i8) as u8, // X-Tilt
+
+        45,            // Y-Tilt
+
+        180, 0,        // Twist (LE)
+
+    ];
+
+    let pen = match decode_input(&p, &report) {
+
+        Ok(d) => d,
+
+        Err(_) => return TestResult::Fail("decode_input failed"),
+
+    };
+
+    if !(pen.tip && pen.in_range && !pen.eraser && !pen.invert && !pen.barrel_button) {
+
+        return TestResult::Fail("button state wrong");
+
+    }
+
+    if pen.x != 0x1234 || pen.y != 0x5678 {
+
+        return TestResult::Fail("X/Y wrong");
+
+    }
+
+    if pen.pressure != Some(0x0F00) {
+
+        return TestResult::Fail("pressure wrong");
+
+    }
+
+    if pen.x_tilt_deg != Some(-30) || pen.y_tilt_deg != Some(45) {
+
+        return TestResult::Fail("tilt wrong");
+
+    }
+
+    if pen.twist != Some(180) {
+
+        return TestResult::Fail("twist wrong");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("hid/pen", smoke_pen_decode_input_round_trip);
+
+
+
+fn smoke_pen_detect_rejects_non_pen_descriptor() -> TestResult {
+
+    use crate::pen::detect;
+
+    let d = parse(PTP_DESCRIPTOR).expect("parse");
+
+    if detect(&d).is_some() {
+
+        return TestResult::Fail("PTP must not be detected as Pen");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("hid/pen", smoke_pen_detect_rejects_non_pen_descriptor);

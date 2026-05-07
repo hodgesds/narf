@@ -87,6 +87,7 @@ macro_rules! bitflags_local {
 }
 
 pub mod descriptor;
+pub mod pen;
 pub mod ptp;
 pub mod report;
 pub mod usage;
