@@ -597,3 +597,255 @@ fn smoke_cppc_cap1_field_layout() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 
 kernel_test_in!("power/cppc", smoke_cppc_cap1_field_layout);
+
+
+
+// ── CPU power syscall bridge ──────────────────────────────────────
+
+
+
+fn smoke_syscall_resolve_cpu_id_current_sentinel() -> TestResult {
+
+    use crate::syscall::{resolve_cpu_id, CPU_ID_CURRENT};
+
+    if resolve_cpu_id(CPU_ID_CURRENT, false, 3) != Some(3) {
+
+        return TestResult::Fail("current sentinel");
+
+    }
+
+    if resolve_cpu_id(3, false, 3) != Some(3) {
+
+        return TestResult::Fail("matching cpu");
+
+    }
+
+    if resolve_cpu_id(7, false, 3).is_some() {
+
+        return TestResult::Fail("other cpu must be denied for non-TCB");
+
+    }
+
+    if resolve_cpu_id(7, true, 3) != Some(7) {
+
+        return TestResult::Fail("TCB must allow other cpu");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("power/syscall", smoke_syscall_resolve_cpu_id_current_sentinel);
+
+
+
+fn smoke_syscall_perf_state_pack_round_trip() -> TestResult {
+
+    use crate::syscall::{pack_perf_state, unpack_perf_state, PerfState};
+
+    let s = PerfState {
+
+        delivered_perf: 200,
+
+        epp: 0x40,
+
+        c_state: 1,
+
+        aperf: 0x1234_5678,
+
+        mperf: 0x2345_6789,
+
+        tsc:   0x3456_789A,
+
+    };
+
+    let r = unpack_perf_state(pack_perf_state(s));
+
+    if r != s { return TestResult::Fail("perf state round-trip"); }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("power/syscall", smoke_syscall_perf_state_pack_round_trip);
+
+
+
+fn smoke_syscall_topology_returns_at_least_one_cpu() -> TestResult {
+
+    use crate::syscall::{handle, CpuOpArgs};
+
+    use narf_abi::CpuOpKind;
+
+    let r = handle(CpuOpKind::Topology, &CpuOpArgs::default(), 0);
+
+    if r.status != 0 || r.result[0] == 0 {
+
+        return TestResult::Fail("topology must report at least 1 cpu");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("power/syscall", smoke_syscall_topology_returns_at_least_one_cpu);
+
+
+
+fn smoke_syscall_perf_state_rejects_other_cpu_for_non_tcb() -> TestResult {
+
+    use crate::syscall::{handle, CpuOpArgs};
+
+    use narf_abi::CpuOpKind;
+
+    // Caller is on cpu 0 but asks for cpu 7.
+
+    let mut a = CpuOpArgs::default();
+
+    a.a0 = 7;
+
+    let r = handle(CpuOpKind::PerfState, &a, 0);
+
+    if r.status != 4 /* Forbidden */ {
+
+        return TestResult::Fail("cpu 7 from cpu 0 must be Forbidden");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("power/syscall", smoke_syscall_perf_state_rejects_other_cpu_for_non_tcb);
+
+
+
+fn smoke_syscall_latency_hint_register_and_release() -> TestResult {
+
+    use crate::syscall::{__reset_latency_hints_for_test, current_latency_floor_us, handle, CpuOpArgs};
+
+    use narf_abi::CpuOpKind;
+
+    __reset_latency_hints_for_test();
+
+    let mut a = CpuOpArgs::default();
+
+    a.a0 = 50;
+
+    let r = handle(CpuOpKind::LatencyHint, &a, 0);
+
+    if r.status != 0 { return TestResult::Fail("register"); }
+
+    let token = r.result[0];
+
+    if current_latency_floor_us() != Some(50) {
+
+        return TestResult::Fail("floor not 50");
+
+    }
+
+    let mut b = CpuOpArgs::default();
+
+    b.a0 = 200;
+
+    let _ = handle(CpuOpKind::LatencyHint, &b, 0);
+
+    if current_latency_floor_us() != Some(50) {
+
+        return TestResult::Fail("floor must stay at strictest");
+
+    }
+
+    let mut rel = CpuOpArgs::default();
+
+    rel.a0 = token;
+
+    handle(CpuOpKind::LatencyRelease, &rel, 0);
+
+    if current_latency_floor_us() != Some(200) {
+
+        return TestResult::Fail("floor must rise after release");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("power/syscall", smoke_syscall_latency_hint_register_and_release);
+
+
+
+fn smoke_syscall_set_freq_range_echoes_request_for_current_cpu() -> TestResult {
+
+    use crate::syscall::{handle, CpuOpArgs};
+
+    use narf_abi::CpuOpKind;
+
+    let mut a = CpuOpArgs::default();
+
+    a.a0 = 0;
+
+    a.a1 = 800_000;
+
+    a.a2 = 4_000_000;
+
+    let r = handle(CpuOpKind::SetFreqRange, &a, 0);
+
+    if r.status != 0 || r.result[0] != 800_000 || r.result[1] != 4_000_000 {
+
+        return TestResult::Fail("echo");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("power/syscall", smoke_syscall_set_freq_range_echoes_request_for_current_cpu);
+
+
+
+fn smoke_syscall_energy_budget_install_and_clear() -> TestResult {
+
+    use crate::syscall::{__reset_energy_budgets_for_test, current_energy_budget, handle, CpuOpArgs, RaplDomain};
+
+    use narf_abi::CpuOpKind;
+
+    __reset_energy_budgets_for_test();
+
+    let mut a = CpuOpArgs::default();
+
+    a.a0 = RaplDomain::Package as u64;
+
+    a.a1 = 1000;
+
+    a.a2 = 5000;
+
+    handle(CpuOpKind::SetEnergyBudget, &a, 0);
+
+    if current_energy_budget(RaplDomain::Package) != Some((1000, 5000)) {
+
+        return TestResult::Fail("install");
+
+    }
+
+    let mut c = CpuOpArgs::default();
+
+    c.a0 = RaplDomain::Package as u64;
+
+    handle(CpuOpKind::ClearEnergyBudget, &c, 0);
+
+    if current_energy_budget(RaplDomain::Package).is_some() {
+
+        return TestResult::Fail("clear");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("power/syscall", smoke_syscall_energy_budget_install_and_clear);

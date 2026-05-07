@@ -1181,6 +1181,7 @@ dependencies = [
 name = "narf-power"
 version = "0.0.0"
 dependencies = [
+ "narf-abi",
  "narf-acpi",
  "narf-aml",
  "narf-arch",

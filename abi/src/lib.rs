@@ -144,6 +144,65 @@ fn dispatch_file_op(kind: FileOpKind, args: &FileOpArgs) -> FileOpReturn {
     }
 }
 
+// ── CPU-power op bridge ────────────────────────────────────────────
+//
+// Same shape as the file-op bridge: kernel installs a callback at
+// boot, the dispatcher routes every `OpCode::Cpu*` / `Rapl*` here.
+// The kernel-side handler lives in `narf_power::syscall::handle`
+// and applies the cap + current-CPU policy before forwarding to
+// the relevant `power` module.
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CpuOpKind {
+    Topology = 0x20,
+    PerfState = 0x21,
+    RaplEnergy = 0x22,
+    LatencyHint = 0x30,
+    LatencyRelease = 0x31,
+    SetFreqRange = 0x40,
+    SetEpp = 0x41,
+    SetGovernor = 0x42,
+    SetEnergyBudget = 0x50,
+    ClearEnergyBudget = 0x51,
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct CpuOpArgs {
+    pub a0: u64,
+    pub a1: u64,
+    pub a2: u64,
+    pub a3: u64,
+    pub a4: u64,
+    pub a5: u64,
+}
+
+/// Bridge return — `status` mirrors `NarfStatus`; `result` is the
+/// 6-slot payload that travels in the Completion's `result[]`.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CpuOpReturn {
+    pub status: u32,
+    pub result: [u64; 6],
+}
+
+type CpuOpBridge = fn(CpuOpKind, &CpuOpArgs) -> CpuOpReturn;
+
+static CPU_OP_BRIDGE: IrqSafeSpinLock<Option<CpuOpBridge>> = IrqSafeSpinLock::new(None);
+
+pub fn install_cpu_op_bridge(bridge: CpuOpBridge) {
+    *CPU_OP_BRIDGE.lock() = Some(bridge);
+}
+
+fn dispatch_cpu_op(kind: CpuOpKind, args: &CpuOpArgs) -> CpuOpReturn {
+    let g = CPU_OP_BRIDGE.lock();
+    match *g {
+        Some(b) => b(kind, args),
+        None => CpuOpReturn {
+            status: 1, /* InvalidOp */
+            result: [0; 6],
+        },
+    }
+}
+
 // ── OpCode ──────────────────────────────────────────────────────────
 //
 // `#[repr(u32)]` with explicit discriminants: the wire tag is the byte
@@ -198,6 +257,47 @@ pub enum OpCode {
     /// is the mapped vaddr (Mmap) or 0 (Munmap).
     Mmap = 0x0014,
     Munmap = 0x0015,
+
+    // ── CPU power-management ops (`narf_power::syscall`) ─────────
+    //
+    // Phase 1 (Tier 0 read-only):
+    //   `inline[0]` = cpu_id (or `CPU_ID_CURRENT = u64::MAX`).
+    //   On success, `result[]` carries the decoded payload.
+    /// Read system topology. `result[0]` = cpu count;
+    /// `result[1]` = package count; further details delivered out
+    /// of band via the topology-bridge user buffer (caller-supplied
+    /// in `inline[1..3]` — base pointer + capacity).
+    CpuTopology = 0x0020,
+    /// Snapshot of one CPU's perf state. See
+    /// `narf_power::syscall::pack_perf_state` for the result layout.
+    CpuPerfState = 0x0021,
+    /// Read RAPL energy counter for `inline[1]` = RaplDomain.
+    /// `result[0]` = joules × 1e6 (microjoules).
+    RaplEnergy = 0x0022,
+
+    // Phase 2 (Tier 1 latency hints):
+    /// Register a max-idle-latency hint. `inline[0]` = max idle
+    /// microseconds. `result[0]` = `LatencyToken`.
+    CpuIdleLatencyHint = 0x0030,
+    /// Release a previously-issued LatencyToken. `inline[0]` =
+    /// token id.
+    CpuIdleRelease = 0x0031,
+
+    // Phase 3 (Tier 2 frequency control):
+    /// `inline[0]` = cpu_id; `inline[1]` = min KHz; `inline[2]` = max KHz.
+    CpuSetFreqRange = 0x0040,
+    /// `inline[0]` = cpu_id; `inline[1]` = EPP (low byte 0..=255).
+    CpuSetEpp = 0x0041,
+    /// `inline[0]` = cpu_id; `inline[1]` = `Governor` discriminant.
+    CpuSetGovernor = 0x0042,
+
+    // Phase 4 (Tier 3 energy budget):
+    /// `inline[0]` = RaplDomain; `inline[1]` = power-cap window
+    /// in milliseconds; `inline[2]` = energy budget per window in
+    /// joules × 1000.
+    CpuSetEnergyBudget = 0x0050,
+    /// Release any energy budget the caller installed.
+    CpuClearEnergyBudget = 0x0051,
 }
 
 impl OpCode {
@@ -808,6 +908,45 @@ impl<const N: usize> Dispatcher<N> {
                 let mut result = [0u64; 6];
                 result[0] = r.value;
                 Completion::with(tag, status, result)
+            }
+
+            OpCode::CpuTopology
+            | OpCode::CpuPerfState
+            | OpCode::RaplEnergy
+            | OpCode::CpuIdleLatencyHint
+            | OpCode::CpuIdleRelease
+            | OpCode::CpuSetFreqRange
+            | OpCode::CpuSetEpp
+            | OpCode::CpuSetGovernor
+            | OpCode::CpuSetEnergyBudget
+            | OpCode::CpuClearEnergyBudget => {
+                let kind = match sub.op {
+                    OpCode::CpuTopology => CpuOpKind::Topology,
+                    OpCode::CpuPerfState => CpuOpKind::PerfState,
+                    OpCode::RaplEnergy => CpuOpKind::RaplEnergy,
+                    OpCode::CpuIdleLatencyHint => CpuOpKind::LatencyHint,
+                    OpCode::CpuIdleRelease => CpuOpKind::LatencyRelease,
+                    OpCode::CpuSetFreqRange => CpuOpKind::SetFreqRange,
+                    OpCode::CpuSetEpp => CpuOpKind::SetEpp,
+                    OpCode::CpuSetGovernor => CpuOpKind::SetGovernor,
+                    OpCode::CpuSetEnergyBudget => CpuOpKind::SetEnergyBudget,
+                    OpCode::CpuClearEnergyBudget => CpuOpKind::ClearEnergyBudget,
+                    _ => unreachable!(),
+                };
+                let args = CpuOpArgs {
+                    a0: sub.inline[0],
+                    a1: sub.inline[1],
+                    a2: sub.inline[2],
+                    a3: sub.inline[3],
+                    a4: sub.inline[4],
+                    a5: sub.inline[5],
+                };
+                let r = dispatch_cpu_op(kind, &args);
+                let status = match r.status {
+                    0 => NarfStatus::Ok,
+                    _ => NarfStatus::InvalidOp,
+                };
+                Completion::with(tag, status, r.result)
             }
 
             _ => {

@@ -463,6 +463,12 @@ pub enum CapKind {
     // Wireless / radios
     Bluetooth = 0x00F0,
     UsbPd = 0x00F1,
+
+    // Read-only CPU power / energy telemetry. Distinct from `Pmu`
+    // (HW perf counters) — this covers CPPC/HWP delivered-perf,
+    // RAPL energy joules, and C-state residency. Granted broadly
+    // since it can't change anything.
+    CpuTelemetry = 0x00F2,
 }
 
 pub trait CapType: 'static {
@@ -547,6 +553,7 @@ const KIND_NAMES: &[(&str, CapKind)] = &[
     ("FirmwareRegistry", CapKind::FirmwareRegistry),
     ("Bluetooth", CapKind::Bluetooth),
     ("UsbPd", CapKind::UsbPd),
+    ("CpuTelemetry", CapKind::CpuTelemetry),
 ];
 
 // ── Badge ───────────────────────────────────────────────────────────
