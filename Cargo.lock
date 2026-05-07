@@ -847,6 +847,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-efi"
+version = "0.0.0"
+dependencies = [
+ "narf-kernel-test",
+]
+
+[[package]]
 name = "narf-fb"
 version = "0.0.0"
 dependencies = [
@@ -946,6 +953,7 @@ dependencies = [
  "narf-drivers-virtio",
  "narf-drivers-wireless",
  "narf-edid",
+ "narf-efi",
  "narf-fb",
  "narf-filesystem",
  "narf-firmware",

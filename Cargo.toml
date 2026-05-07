@@ -60,6 +60,7 @@ members = [
     "audio",
     "bluetooth",
     "edid",
+    "efi",
     "hid",
     "usbpd",
     "pwm",

@@ -19,6 +19,7 @@ extern crate alloc;
 // name pick themselves up — these are the test-only ones.)
 extern crate narf_bluetooth as _;
 extern crate narf_edid as _;
+extern crate narf_efi as _;
 extern crate narf_hid as _;
 extern crate narf_pinctrl as _;
 
