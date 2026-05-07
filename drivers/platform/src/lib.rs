@@ -12,11 +12,21 @@ extern crate alloc;
 
 pub mod smbus;
 pub mod tpm;
+/// EC uses x86 I/O ports (`narf_arch::x86_64::io_port`); not present
+/// on aarch64 platforms, where the embedded controller is reached
+/// through SoC-specific MMIO instead.
+#[cfg(target_arch = "x86_64")]
 pub mod ec;
+/// Battery / lid / buttons all consume the EC's platform-event
+/// feed. On aarch64 the equivalent path goes through SoC-specific
+/// PMIC drivers (not yet ported) — gate these on x86_64 too.
+#[cfg(target_arch = "x86_64")]
 pub mod battery;
 pub mod thermal;
 pub mod fan;
+#[cfg(target_arch = "x86_64")]
 pub mod lid;
+#[cfg(target_arch = "x86_64")]
 pub mod buttons;
 pub mod backlight;
 
@@ -33,10 +43,12 @@ pub fn register_initcalls() {
         tpm::try_init_default();
         InitResult::Ok
     });
+    #[cfg(target_arch = "x86_64")]
     narf_init::register(Stage::Subsys, "acpi-ec", || {
         ec::init();
         InitResult::Ok
     });
+    #[cfg(target_arch = "x86_64")]
     narf_init::register(Stage::Subsys, "acpi-battery", || {
         battery::init();
         InitResult::Ok
@@ -49,10 +61,12 @@ pub fn register_initcalls() {
         fan::init();
         InitResult::Ok
     });
+    #[cfg(target_arch = "x86_64")]
     narf_init::register(Stage::Subsys, "acpi-lid", || {
         lid::init();
         InitResult::Ok
     });
+    #[cfg(target_arch = "x86_64")]
     narf_init::register(Stage::Subsys, "acpi-buttons", || {
         buttons::init();
         InitResult::Ok
