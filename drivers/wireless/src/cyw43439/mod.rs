@@ -59,10 +59,19 @@
 extern crate alloc;
 
 pub mod backplane;
+pub mod chipclk;
+pub mod core;
+pub mod events;
+pub mod firmware;
 pub mod gspi;
+pub mod ioctl;
+pub mod iovar;
 pub mod sdio;
+pub mod sdpcm;
 pub mod transport;
 
+pub use firmware::{build_nvram_blob, FirmwareLoader, LoadError, LoadStep};
+pub use ioctl::{build_request, parse_response, Direction, ParseError, Response};
 pub use transport::{Function, Transport, TransportError};
 
 // ── Hardware identification (public datasheet cover sheet) ─────────
