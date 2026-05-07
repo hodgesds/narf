@@ -822,3 +822,229 @@ fn smoke_fb_userspace_chain_against_real_backend() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("fb", smoke_fb_userspace_chain_against_real_backend);
+
+
+
+// ── UEFI GOP / VBE handoff decoders ───────────────────────────────
+
+
+
+fn smoke_gop_mode_information_decodes_36_byte_block() -> TestResult {
+
+    use crate::gop::{ModeInformation, PixelFormat};
+
+    let mut buf = [0u8; 36];
+
+    buf[0..4].copy_from_slice(&0u32.to_le_bytes()); // version
+
+    buf[4..8].copy_from_slice(&1920u32.to_le_bytes());
+
+    buf[8..12].copy_from_slice(&1080u32.to_le_bytes());
+
+    buf[12..16].copy_from_slice(&0u32.to_le_bytes()); // RGB
+
+    buf[32..36].copy_from_slice(&1920u32.to_le_bytes()); // pps
+
+    let m = match ModeInformation::decode(&buf) {
+
+        Ok(m) => m,
+
+        Err(_) => return TestResult::Fail("decode"),
+
+    };
+
+    if m.horizontal_resolution != 1920 || m.vertical_resolution != 1080 {
+
+        return TestResult::Fail("resolution");
+
+    }
+
+    if m.pixel_format != PixelFormat::RgbReserved8 {
+
+        return TestResult::Fail("pixel format");
+
+    }
+
+    if m.bytes_per_pixel() != 4 || m.stride_bytes() != 1920 * 4 {
+
+        return TestResult::Fail("bpp/stride");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("fb/gop", smoke_gop_mode_information_decodes_36_byte_block);
+
+
+
+fn smoke_gop_protocol_mode_to_framebuffer() -> TestResult {
+
+    use crate::gop::{ModeInformation, PixelBitmask, PixelFormat, ProtocolMode};
+
+    let mode = ModeInformation {
+
+        version: 0,
+
+        horizontal_resolution: 1024,
+
+        vertical_resolution: 768,
+
+        pixel_format: PixelFormat::BgrReserved8,
+
+        pixel_information: PixelBitmask::default(),
+
+        pixels_per_scan_line: 1024,
+
+    };
+
+    let pm = ProtocolMode {
+
+        framebuffer_base: 0xFD00_0000,
+
+        framebuffer_size: 1024 * 768 * 4,
+
+        mode,
+
+    };
+
+    let fb = pm.to_framebuffer().expect("fb");
+
+    if fb.base != 0xFD00_0000 || fb.width != 1024 || fb.stride_bytes != 4096 {
+
+        return TestResult::Fail("framebuffer fields");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("fb/gop", smoke_gop_protocol_mode_to_framebuffer);
+
+
+
+fn smoke_gop_blt_only_rejected() -> TestResult {
+
+    use crate::gop::{ModeInformation, PixelBitmask, PixelFormat, ProtocolMode};
+
+    let mode = ModeInformation {
+
+        version: 0,
+
+        horizontal_resolution: 1024,
+
+        vertical_resolution: 768,
+
+        pixel_format: PixelFormat::BltOnly,
+
+        pixel_information: PixelBitmask::default(),
+
+        pixels_per_scan_line: 1024,
+
+    };
+
+    let pm = ProtocolMode {
+
+        framebuffer_base: 0x1000_0000,
+
+        framebuffer_size: 0,
+
+        mode,
+
+    };
+
+    if pm.to_framebuffer().is_ok() {
+
+        return TestResult::Fail("BltOnly should not produce a framebuffer");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("fb/gop", smoke_gop_blt_only_rejected);
+
+
+
+fn smoke_vbe_mode_info_block_to_framebuffer() -> TestResult {
+
+    use crate::vbe::{mode_attr, MemoryModel, ModeInfoBlock, VbeError};
+
+    let mut buf = [0u8; 0x32];
+
+    let attr = mode_attr::HW_SUPPORTED
+
+        | mode_attr::COLOR
+
+        | mode_attr::GRAPHICS
+
+        | mode_attr::LFB_AVAILABLE;
+
+    buf[0x00..0x02].copy_from_slice(&attr.to_le_bytes());
+
+    buf[0x10..0x12].copy_from_slice(&(800u16 * 4).to_le_bytes());
+
+    buf[0x12..0x14].copy_from_slice(&800u16.to_le_bytes());
+
+    buf[0x14..0x16].copy_from_slice(&600u16.to_le_bytes());
+
+    buf[0x19] = 32; // bpp
+
+    buf[0x1B] = 0x06; // DirectColor
+
+    buf[0x1F] = 8; buf[0x20] = 16; // R
+
+    buf[0x21] = 8; buf[0x22] = 8;  // G
+
+    buf[0x23] = 8; buf[0x24] = 0;  // B
+
+    buf[0x25] = 8; buf[0x26] = 24; // X
+
+    buf[0x28..0x2C].copy_from_slice(&0xE000_0000u32.to_le_bytes());
+
+    let m = ModeInfoBlock::decode(&buf).expect("decode");
+
+    if m.memory_model != MemoryModel::DirectColor {
+
+        return TestResult::Fail("memory model");
+
+    }
+
+    let fb = m.to_framebuffer().expect("to_fb");
+
+    if fb.base != 0xE000_0000 || fb.width != 800 || fb.stride_bytes != 800 * 4 {
+
+        return TestResult::Fail("fb shape");
+
+    }
+
+    if fb.pixel_information.red != (0xFF << 16) {
+
+        return TestResult::Fail("red mask");
+
+    }
+
+    // Without LFB bit, must error.
+
+    let mut buf2 = buf;
+
+    let attr2 = attr & !mode_attr::LFB_AVAILABLE;
+
+    buf2[0x00..0x02].copy_from_slice(&attr2.to_le_bytes());
+
+    let m2 = ModeInfoBlock::decode(&buf2).expect("decode2");
+
+    match m2.to_framebuffer() {
+
+        Err(VbeError::NoLinearFramebuffer) => TestResult::Pass,
+
+        _ => TestResult::Fail("missing LFB should error"),
+
+    }
+
+}
+
+kernel_test_in!("fb/vbe", smoke_vbe_mode_info_block_to_framebuffer);

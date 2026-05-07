@@ -35,7 +35,9 @@ extern crate alloc;
 pub mod client;
 pub mod cmd_ring;
 pub mod drain_task;
+pub mod gop;
 pub mod registry;
+pub mod vbe;
 
 mod tests;
 pub use client::{allocate_singleton_ring, FbClient};
