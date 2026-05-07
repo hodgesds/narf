@@ -34,6 +34,8 @@ extern crate alloc;
 pub mod acp6;
 pub mod hda;
 pub mod hda_codec;
+pub mod i2s;
+pub mod wm8960;
 
 mod hda_tests;
 mod tests;

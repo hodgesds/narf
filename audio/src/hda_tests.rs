@@ -395,3 +395,83 @@ fn smoke_hda_codec_amp_caps_round_trip() -> TestResult {
 }
 
 kernel_test_in!("audio/hda-codec", smoke_hda_codec_amp_caps_round_trip);
+
+
+
+// ── I2S + WM8960 codecs ───────────────────────────────────────────
+
+
+
+fn smoke_i2s_bit_clock_math() -> TestResult {
+
+    use crate::i2s::I2sFormat;
+
+    let f = I2sFormat::cd_quality_stereo();
+
+    // 44_100 × 2 × 16 = 1_411_200 Hz.
+
+    if f.bit_clock_hz() != 1_411_200 {
+
+        return TestResult::Fail("BCLK math");
+
+    }
+
+    if f.master_clock_hz(256) != 44_100 * 256 {
+
+        return TestResult::Fail("MCLK math");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("audio/i2s", smoke_i2s_bit_clock_math);
+
+
+
+fn smoke_wm8960_register_write_round_trip() -> TestResult {
+
+    use crate::wm8960::{pack_register_write, regs, unpack_register_write};
+
+    let buf = pack_register_write(regs::AUDIO_INTERFACE, 0x142);
+
+    let (reg, data) = unpack_register_write(buf);
+
+    if reg != regs::AUDIO_INTERFACE || data != 0x142 {
+
+        return TestResult::Fail("register write round-trip");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("audio/wm8960", smoke_wm8960_register_write_round_trip);
+
+
+
+fn smoke_wm8960_init_sequence_starts_with_reset() -> TestResult {
+
+    use crate::wm8960::{build_init_sequence_i2s_master_16bit, regs};
+
+    let seq = build_init_sequence_i2s_master_16bit();
+
+    if seq.is_empty() || seq[0].0 != regs::RESET {
+
+        return TestResult::Fail("first write must be RESET");
+
+    }
+
+    if !seq.iter().any(|(r, _)| *r == regs::AUDIO_INTERFACE) {
+
+        return TestResult::Fail("audio-interface programming missing");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("audio/wm8960", smoke_wm8960_init_sequence_starts_with_reset);
