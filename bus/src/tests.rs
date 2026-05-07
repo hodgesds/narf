@@ -1031,3 +1031,85 @@ fn smoke_cxl_dvsec_vendor_constant() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bus/cxl", smoke_cxl_dvsec_vendor_constant);
+
+
+
+// ── PCIe AER ──────────────────────────────────────────────────────
+
+
+
+fn smoke_aer_ext_cap_header_decode() -> TestResult {
+
+    use crate::pcie_aer::{ExtCapHeader, AER_CAP_ID};
+
+    let raw = (AER_CAP_ID as u32) | (2u32 << 16) | (0x180u32 << 20);
+
+    let h = ExtCapHeader::decode(raw);
+
+    if !h.is_aer() || h.cap_version != 2 || h.next_ptr != 0x180 {
+
+        return TestResult::Fail("AER ext-cap header decode");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("bus/pcie-aer", smoke_aer_ext_cap_header_decode);
+
+
+
+fn smoke_aer_classify_uncorrectable() -> TestResult {
+
+    use crate::pcie_aer::{classify_uncorrectable, ue, UeSeverity};
+
+    if classify_uncorrectable(0, ue::DEFAULT_SEVERE) != UeSeverity::None {
+
+        return TestResult::Fail("empty status");
+
+    }
+
+    let cur = ue::COMPLETION_TIMEOUT;
+
+    if classify_uncorrectable(cur, ue::DEFAULT_SEVERE) != UeSeverity::NonFatal {
+
+        return TestResult::Fail("completion timeout default = non-fatal");
+
+    }
+
+    let cur = ue::MALFORMED_TLP;
+
+    if classify_uncorrectable(cur, ue::DEFAULT_SEVERE) != UeSeverity::Severe {
+
+        return TestResult::Fail("malformed TLP default = severe");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("bus/pcie-aer", smoke_aer_classify_uncorrectable);
+
+
+
+fn smoke_aer_header_log_decodes_le() -> TestResult {
+
+    use crate::pcie_aer::HeaderLog;
+
+    let raw = [0x78, 0x56, 0x34, 0x12, 0xEF, 0xBE, 0xAD, 0xDE, 0, 0, 0, 0, 0, 0, 0, 0];
+
+    let h = HeaderLog::decode(&raw);
+
+    if h.0[0] != 0x12345678 || h.0[1] != 0xDEADBEEF {
+
+        return TestResult::Fail("LE header-log decode");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("bus/pcie-aer", smoke_aer_header_log_decodes_le);
