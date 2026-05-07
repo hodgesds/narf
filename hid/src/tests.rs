@@ -7,6 +7,7 @@ extern crate alloc;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::descriptor::{parse, FieldFlags, FieldKind};
+use crate::ptp::{decode_input, detect, mode, build_mode_feature_report};
 use crate::report::{array_active_usages, extract, pack};
 use crate::usage::{digitizer, generic_desktop, keyboard};
 
@@ -383,3 +384,210 @@ fn smoke_hid_descriptor_parses_ptp_finger() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("hid", smoke_hid_descriptor_parses_ptp_finger);
+
+// ── PTP profile detection + report decode ─────────────────────────
+
+/// Synthetic but spec-shaped PTP descriptor: 2 fingers + Contact
+/// Count + Scan Time + Button 1, with a Configuration TLC carrying
+/// a Device Mode Feature item.
+const PTP_DESCRIPTOR: &[u8] = &[
+    // ── Touch Pad Application Collection (Input report ID 1) ────
+    0x05, 0x0D,             // Usage Page (Digitizer)
+    0x09, 0x05,             // Usage (Touch Pad)
+    0xA1, 0x01,             //   Collection (Application)
+    0x85, 0x01,             //     Report ID (1)
+    // Finger 0
+    0x09, 0x22,             //     Usage (Finger)
+    0xA1, 0x02,             //     Collection (Logical)
+    0x05, 0x0D,             //       Usage Page (Digitizer)
+    0x09, 0x42,             //       Usage (Tip Switch)
+    0x15, 0x00, 0x25, 0x01, //       Logical 0..1
+    0x75, 0x01, 0x95, 0x01, //       Size 1, Count 1
+    0x81, 0x02,             //       Input (Data,Var,Abs)
+    0x09, 0x51,             //       Usage (Contact ID)
+    0x25, 0x07,             //       Logical Max 7
+    0x75, 0x03, 0x95, 0x01, //       Size 3, Count 1
+    0x81, 0x02,             //       Input
+    0x75, 0x04, 0x95, 0x01, //       Size 4, Count 1 (padding)
+    0x81, 0x03,             //       Input (Const)
+    0x05, 0x01,             //       Usage Page (Generic Desktop)
+    0x09, 0x30,             //       Usage (X)
+    0x26, 0xFF, 0x7F,       //       Logical Max 0x7FFF
+    0x75, 0x10, 0x95, 0x01, //       Size 16, Count 1
+    0x81, 0x02,             //       Input
+    0x09, 0x31,             //       Usage (Y)
+    0x81, 0x02,             //       Input
+    0xC0,                   //     End Collection (Finger 0)
+    // Finger 1
+    0x05, 0x0D,             //     Usage Page (Digitizer)
+    0x09, 0x22,             //     Usage (Finger)
+    0xA1, 0x02,             //     Collection (Logical)
+    0x09, 0x42,             //       Usage (Tip Switch)
+    0x15, 0x00, 0x25, 0x01, //       Logical 0..1
+    0x75, 0x01, 0x95, 0x01, //       Size 1, Count 1
+    0x81, 0x02,             //       Input
+    0x09, 0x51,             //       Usage (Contact ID)
+    0x25, 0x07,             //       Logical Max 7
+    0x75, 0x03, 0x95, 0x01, //       Size 3, Count 1
+    0x81, 0x02,             //       Input
+    0x75, 0x04, 0x95, 0x01, //       Size 4 padding
+    0x81, 0x03,             //       Input (Const)
+    0x05, 0x01,             //       Usage Page (Generic Desktop)
+    0x09, 0x30,             //       Usage (X)
+    0x26, 0xFF, 0x7F,       //       Logical Max 0x7FFF
+    0x75, 0x10, 0x95, 0x01, //       Size 16, Count 1
+    0x81, 0x02,             //       Input
+    0x09, 0x31,             //       Usage (Y)
+    0x81, 0x02,             //       Input
+    0xC0,                   //     End Collection (Finger 1)
+    // Contact Count + Scan Time + Button 1 + padding
+    0x05, 0x0D,             //     Usage Page (Digitizer)
+    0x09, 0x54,             //     Usage (Contact Count)
+    0x25, 0x05,             //     Logical Max 5
+    0x75, 0x08, 0x95, 0x01, //     Size 8, Count 1
+    0x81, 0x02,             //     Input
+    0x09, 0x56,             //     Usage (Scan Time)
+    0x27, 0xFF, 0xFF, 0x00, 0x00, // Logical Max 0xFFFF (4-byte form)
+    0x75, 0x10, 0x95, 0x01, //     Size 16, Count 1
+    0x81, 0x02,             //     Input
+    0x05, 0x09,             //     Usage Page (Button)
+    0x09, 0x01,             //     Usage (Button 1)
+    0x15, 0x00, 0x25, 0x01, //     Logical 0..1
+    0x75, 0x01, 0x95, 0x01, //     Size 1, Count 1
+    0x81, 0x02,             //     Input
+    0x75, 0x07, 0x95, 0x01, //     Size 7 padding
+    0x81, 0x03,             //     Input (Const)
+    0xC0,                   //   End Collection (Touch Pad)
+    // ── Configuration TLC (Feature report ID 3) ─────────────────
+    0x05, 0x0D,             // Usage Page (Digitizer)
+    0x09, 0x0E,             // Usage (Configuration)
+    0xA1, 0x01,             // Collection (Application)
+    0x85, 0x03,             //   Report ID (3)
+    0x09, 0x22,             //   Usage (Finger)
+    0xA1, 0x02,             //   Collection (Logical)
+    0x09, 0x60,             //     Usage (Device Mode)
+    0x15, 0x00, 0x25, 0x0A, //     Logical 0..10
+    0x75, 0x08, 0x95, 0x01, //     Size 8, Count 1
+    0xB1, 0x02,             //     Feature (Data,Var,Abs)
+    0xC0,                   //   End Collection
+    0xC0,                   // End Collection
+];
+
+fn smoke_ptp_detect_basic_shape() -> TestResult {
+    let d = parse(PTP_DESCRIPTOR).expect("parse");
+    let p = match detect(&d) {
+        Some(p) => p,
+        None => return TestResult::Fail("PTP detect rejected a valid descriptor"),
+    };
+    if p.input_report_id != 1 {
+        return TestResult::Fail("input report id should be 1");
+    }
+    if p.contacts.len() != 2 {
+        return TestResult::Fail("expected 2 contacts (Finger collections)");
+    }
+    if p.contact_count.is_none() {
+        return TestResult::Fail("Contact Count must be detected");
+    }
+    if p.scan_time.is_none() {
+        return TestResult::Fail("Scan Time must be detected");
+    }
+    if p.button1.is_none() {
+        return TestResult::Fail("Button 1 must be detected");
+    }
+    if p.config_report_id != Some(3) {
+        return TestResult::Fail("Configuration TLC report id should be 3");
+    }
+    if p.device_mode_feature.is_none() {
+        return TestResult::Fail("Device Mode feature must be detected");
+    }
+    if p.contacts_max != 2 {
+        return TestResult::Fail("contacts_max wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("hid/ptp", smoke_ptp_detect_basic_shape);
+
+fn smoke_ptp_decode_one_active_contact() -> TestResult {
+    let d = parse(PTP_DESCRIPTOR).expect("parse");
+    let p = detect(&d).expect("detect");
+
+    // Finger 0: tip=1, cid=3, X=0x1234, Y=0x5678
+    // Finger 1: tip=0, cid=0, X=0, Y=0
+    // Contact Count=1, Scan Time=0xABCD, Button 1 = pressed.
+    let report = [
+        0x01, // Report ID 1
+        0b0000_0111, // tip=1, cid=011, pad=0000
+        0x34, 0x12, // X = 0x1234
+        0x78, 0x56, // Y = 0x5678
+        0x00, // Finger 1: tip=0, cid=0, pad=0
+        0x00, 0x00, // Finger 1 X
+        0x00, 0x00, // Finger 1 Y
+        0x01,       // Contact Count = 1
+        0xCD, 0xAB, // Scan Time = 0xABCD
+        0x01,       // Button 1 = 1, pad 7 bits = 0
+    ];
+    let r = match decode_input(&p, &report) {
+        Ok(r) => r,
+        Err(_) => return TestResult::Fail("decode_input failed"),
+    };
+    if r.contact_count != 1 {
+        return TestResult::Fail("contact_count != 1");
+    }
+    if r.scan_time != 0xABCD {
+        return TestResult::Fail("scan_time != 0xABCD");
+    }
+    if !r.button1 {
+        return TestResult::Fail("button1 should be pressed");
+    }
+    if r.contacts.len() != 2 {
+        return TestResult::Fail("contacts vec length wrong");
+    }
+    let c0 = &r.contacts[0];
+    if !(c0.tip_switch && c0.contact_id == 3 && c0.x == 0x1234 && c0.y == 0x5678) {
+        return TestResult::Fail("contact 0 wrong");
+    }
+    let c1 = &r.contacts[1];
+    if c1.tip_switch || c1.contact_id != 0 || c1.x != 0 || c1.y != 0 {
+        return TestResult::Fail("contact 1 should be all zero");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("hid/ptp", smoke_ptp_decode_one_active_contact);
+
+fn smoke_ptp_build_mode_feature_multi_touch() -> TestResult {
+    let d = parse(PTP_DESCRIPTOR).expect("parse");
+    let p = detect(&d).expect("detect");
+    let buf = match build_mode_feature_report(&p, mode::MULTI_TOUCH) {
+        Some(b) => b,
+        None => return TestResult::Fail("build_mode_feature_report returned None"),
+    };
+    if buf.len() != 2 {
+        return TestResult::Fail("Feature report should be report-id + 1 byte");
+    }
+    if buf[0] != 3 {
+        return TestResult::Fail("Feature report id wrong");
+    }
+    if buf[1] != mode::MULTI_TOUCH {
+        return TestResult::Fail("Mode byte wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("hid/ptp", smoke_ptp_build_mode_feature_multi_touch);
+
+fn smoke_ptp_detect_rejects_non_touchpad() -> TestResult {
+    // A boot-keyboard descriptor must not be detected as PTP.
+    let blob: [u8; 63] = [
+        0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00,
+        0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x95, 0x01, 0x75, 0x08, 0x81, 0x01,
+        0x95, 0x05, 0x75, 0x01, 0x05, 0x08, 0x19, 0x01, 0x29, 0x05, 0x91, 0x02, 0x95, 0x01,
+        0x75, 0x03, 0x91, 0x01, 0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x25, 0x65, 0x05, 0x07,
+        0x19, 0x00, 0x29, 0x65, 0x81, 0x00, 0xC0,
+    ];
+    let d = parse(&blob).expect("parse");
+    if detect(&d).is_some() {
+        return TestResult::Fail("boot keyboard must not be detected as PTP");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("hid/ptp", smoke_ptp_detect_rejects_non_touchpad);
+

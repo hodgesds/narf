@@ -41,6 +41,9 @@ pub mod digitizer {
     pub const PEN: u16 = 0x02;
     pub const TOUCH_SCREEN: u16 = 0x04;
     pub const TOUCH_PAD: u16 = 0x05;
+    /// Configuration TLC top-level usage — used by the Microsoft
+    /// Precision Touchpad Configuration collection for Device Mode.
+    pub const CONFIGURATION: u16 = 0x0E;
     pub const FINGER: u16 = 0x22;
     pub const TIP_PRESSURE: u16 = 0x30;
     pub const IN_RANGE: u16 = 0x32;

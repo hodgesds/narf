@@ -30,6 +30,41 @@ Transport-neutral HID 1.11 codec.
 
 No GPL / Linux source consulted.
 
+## Profile decoders
+
+### Precision Touchpad (`ptp`)
+
+Sources:
+
+- **HID Usage Tables 1.4 §16** — Digitizer page (`Touch Pad` 0x05,
+  `Configuration` 0x0E, `Finger` 0x22, `Tip Switch` 0x42, `Contact
+  ID` 0x51, `Contact Count` 0x54, `Scan Time` 0x56, `Device Mode`
+  0x60, etc.).
+- **"Windows Precision Touchpad Implementation Guide"**, Microsoft
+  public technical documentation. Defines the Required HID
+  Top-Level Collections, Configuration TLC, Device Mode semantics
+  (0 = Mouse, 1 = Single Input, 3 = Multi-touch).
+- **HID 1.11 §6.2.2** — descriptor structure.
+
+Surface:
+
+- `ptp::detect(&ReportDescriptor) -> Option<PtpProfile>` — probes
+  for a Touch Pad Application Collection with at least one Tip
+  Switch, Contact Count, and (optionally) a Configuration TLC
+  carrying Device Mode. Per-contact disambiguation: each Tip
+  Switch field starts a new contact; subsequent per-contact fields
+  bind to it until the next Tip Switch.
+- `ptp::decode_input(&PtpProfile, &[u8]) -> Result<DecodedReport>`
+  — strips the leading Report ID byte, extracts every per-contact
+  field plus Contact Count / Scan Time / Button 1.
+- `ptp::build_mode_feature_report(&PtpProfile, mode) -> Vec<u8>` —
+  produces the Set-Feature wire bytes for putting the touchpad
+  into Multi-touch mode (`mode::MULTI_TOUCH = 3`).
+
+Out of scope: hover (no Tip Switch but In Range), pen tablets, and
+the Capabilities feature report — none are required for booting +
+using a laptop touchpad in Windows-compliant multi-touch mode.
+
 ## Surface
 
 - `descriptor::parse(blob) -> ReportDescriptor` — walks a report
