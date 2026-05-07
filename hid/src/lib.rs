@@ -3,11 +3,13 @@
 //! ## Sources (public only)
 //!
 //! - "Device Class Definition for Human Interface Devices (HID)"
-//!   Version 1.11, 27 June 2001 — usb.org. §6.2.2 (Report
+//!   Version 1.11, 27 June 2001 — USB-IF. §6.2.2 (Report
 //!   Descriptor), §5.3 (Generic Item Format), §6.2.2.7 (Global Items)
 //!   define the wire format we decode here.
+//!   <https://www.usb.org/document-library/device-class-definition-hid-111>
 //! - "USB HID Usage Tables", Version 1.4, 28 May 2020 — USB-IF. The
 //!   `usage` submodule pulls page + ID constants from this table.
+//!   <https://usb.org/document-library/hid-usage-tables-14>
 //!
 //! Linux source not consulted.
 //!

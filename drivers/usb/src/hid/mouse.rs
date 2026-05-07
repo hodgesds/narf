@@ -1,8 +1,9 @@
 //! USB HID — Boot Mouse (HID 1.11 §B.2) — clean-room.
 //!
 //! Spec: "Device Class Definition for Human Interface Devices (HID)"
-//! Version 1.11, 27 June 2001, Appendix B.2 ("Mouse"). The Boot
-//! Protocol mouse report is exactly 3 bytes:
+//! Version 1.11, 27 June 2001, Appendix B.2 ("Mouse").
+//! <https://www.usb.org/document-library/device-class-definition-hid-111>
+//! The Boot Protocol mouse report is exactly 3 bytes:
 //!
 //! ```text
 //!   byte 0 : button mask (bit 0 = button 1 / left,

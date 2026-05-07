@@ -1050,6 +1050,261 @@ fn smoke_hid_boot_mouse_translate_diff() -> TestResult {
 }
 kernel_test_in!("drivers/usb/hid", smoke_hid_boot_mouse_translate_diff);
 
+// ── EHCI / OHCI / UHCI codec smokes ───────────────────────────────
+
+fn smoke_ehci_capability_block_decodes() -> TestResult {
+    use crate::ehci::{synth_cap_block, CapabilityRegs, HccParams, HcsParams};
+    // 6 ports, ppc=1, no PPC routing rules, 0 companion controllers,
+    // version 1.0; 64-bit cap, programmable framelist, EECP at 0x68.
+    let hcs = HcsParams(0x0000_0016); // n_ports=6, ppc bit set
+    let hcc = HccParams(0x0000_6803); // 64-bit + progframelist + EECP=0x68
+    let blob = synth_cap_block(0x20, 0x0100, hcs, hcc);
+    let cap = CapabilityRegs::decode(&blob).expect("decode");
+    if cap.cap_length != 0x20 || cap.hci_version != 0x0100 {
+        return TestResult::Fail("cap header wrong");
+    }
+    if cap.hcs_params.n_ports() != 6 || !cap.hcs_params.ppc() {
+        return TestResult::Fail("HCSPARAMS wrong");
+    }
+    if !cap.hcc_params.addr64()
+        || !cap.hcc_params.programmable_framelist()
+        || cap.hcc_params.eecp() != 0x68
+    {
+        return TestResult::Fail("HCCPARAMS wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/ehci", smoke_ehci_capability_block_decodes);
+
+fn smoke_ehci_qtd_pack_unpack_round_trip() -> TestResult {
+    use crate::ehci::{qtd_status, Qtd, QtdPid};
+    let q = Qtd {
+        next: 0x1000_2000,
+        next_terminate: false,
+        alt_next: 0,
+        alt_next_terminate: true,
+        status: qtd_status::ACTIVE,
+        pid: QtdPid::In,
+        err_count: 3,
+        page_index: 0,
+        ioc: true,
+        total_bytes: 64,
+        data_toggle: true,
+        buffer_pages: [0xAAAA_0000, 0xBBBB_0000, 0, 0, 0],
+    };
+    let packed = q.pack();
+    let r = Qtd::unpack(&packed);
+    if r != q {
+        return TestResult::Fail("Qtd round-trip failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/ehci", smoke_ehci_qtd_pack_unpack_round_trip);
+
+fn smoke_ehci_qh_endpoint_info_round_trip() -> TestResult {
+    use crate::ehci::{QhEndpointInfo, Speed};
+    let info = QhEndpointInfo {
+        device_addr: 0x05,
+        inactivate: false,
+        endpoint: 1,
+        speed: Speed::High,
+        data_toggle_ctrl: false,
+        head_of_list: true,
+        max_packet: 512,
+        control_ep: false,
+        nak_count_reload: 4,
+    };
+    let v = info.pack();
+    let r = QhEndpointInfo::unpack(v);
+    if r != info {
+        return TestResult::Fail("QhEndpointInfo round-trip failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/ehci", smoke_ehci_qh_endpoint_info_round_trip);
+
+fn smoke_ehci_qtd_halt_reason_decoded() -> TestResult {
+    use crate::ehci::{qtd_halt_reason, qtd_status};
+    if qtd_halt_reason(qtd_status::ACTIVE).is_some() {
+        return TestResult::Fail("active qtd shouldn't have a halt reason");
+    }
+    let reason = qtd_halt_reason(qtd_status::HALTED | qtd_status::DATA_BUFFER_ERROR);
+    if reason != Some("data buffer error") {
+        return TestResult::Fail("halt reason mis-decoded");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/ehci", smoke_ehci_qtd_halt_reason_decoded);
+
+fn smoke_ehci_portsc_low_speed_release_to_companion() -> TestResult {
+    use crate::ehci::PortSc;
+    // Line status K-state means a low-speed device just connected
+    // and the EHCI driver should hand off to the companion.
+    let p = PortSc(PortSc::CURRENT_CONNECT_STATUS | (0b01 << 10));
+    if !p.is_low_speed_at_reset() {
+        return TestResult::Fail("low-speed line state not detected");
+    }
+    let q = PortSc(PortSc::CURRENT_CONNECT_STATUS | (0b10 << 10));
+    if q.is_low_speed_at_reset() {
+        return TestResult::Fail("J-state mis-classified as low-speed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/ehci", smoke_ehci_portsc_low_speed_release_to_companion);
+
+// ── OHCI ──────────────────────────────────────────────────────────
+
+fn smoke_ohci_hccontrol_state_round_trip() -> TestResult {
+    use crate::ohci::{HcControl, Hcfs};
+    let c = HcControl(0).with_hcfs(Hcfs::Operational);
+    if c.hcfs() != Hcfs::Operational {
+        return TestResult::Fail("HCFS round-trip failed");
+    }
+    let c = c.with_hcfs(Hcfs::Suspend);
+    if c.hcfs() != Hcfs::Suspend {
+        return TestResult::Fail("HCFS suspend round-trip failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/ohci", smoke_ohci_hccontrol_state_round_trip);
+
+fn smoke_ohci_ed_round_trip() -> TestResult {
+    use crate::ohci::{Ed, EdDir, EdSpeed};
+    let e = Ed {
+        fa: 5,
+        en: 2,
+        dir: EdDir::In,
+        speed: EdSpeed::Full,
+        skip: false,
+        format_iso: false,
+        max_packet: 64,
+        tail_pointer: 0x1000_0000,
+        head_pointer: 0x2000_0000,
+        head_halted: true,
+        head_toggle_carry: false,
+        next_ed: 0x3000_0000,
+    };
+    let r = Ed::unpack(&e.pack());
+    if r != e {
+        return TestResult::Fail("Ed round-trip failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/ohci", smoke_ohci_ed_round_trip);
+
+fn smoke_ohci_general_td_completion_code_decodes() -> TestResult {
+    use crate::ohci::{CompletionCode, GeneralTd, TdPid};
+    let t = GeneralTd {
+        buffer_rounding: true,
+        pid: TdPid::Setup,
+        delay_interrupt: 7,
+        data_toggle: 0b10,
+        error_count: 0,
+        condition_code: CompletionCode::Stall,
+        current_buffer_pointer: 0x4000_0000,
+        next_td: 0x5000_0010,
+        buffer_end: 0x4000_0040,
+    };
+    let r = GeneralTd::unpack(&t.pack());
+    if r != t {
+        return TestResult::Fail("GeneralTd round-trip failed");
+    }
+    if r.condition_code != CompletionCode::Stall {
+        return TestResult::Fail("Stall completion code lost");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/ohci", smoke_ohci_general_td_completion_code_decodes);
+
+fn smoke_ohci_hcca_status_extracted() -> TestResult {
+    use crate::ohci::{hcca, read_hcca_status, HCCA_SIZE};
+    let mut blob = alloc::vec![0u8; HCCA_SIZE];
+    blob[hcca::FRAME_NUMBER_OFFSET] = 0x34;
+    blob[hcca::FRAME_NUMBER_OFFSET + 1] = 0x12;
+    let done = 0xCAFE_C0D0u32;
+    blob[hcca::DONE_HEAD_OFFSET..hcca::DONE_HEAD_OFFSET + 4]
+        .copy_from_slice(&done.to_le_bytes());
+    let (frame, dh) = read_hcca_status(&blob).expect("read");
+    if frame != 0x1234 || dh != (done & 0xFFFF_FFF0) {
+        return TestResult::Fail("HCCA status decoded wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/ohci", smoke_ohci_hcca_status_extracted);
+
+// ── UHCI ──────────────────────────────────────────────────────────
+
+fn smoke_uhci_frame_list_pointer_flags() -> TestResult {
+    use crate::uhci::FrameListPtr;
+    let p = FrameListPtr::make(0xDEAD_BEE0, true);
+    if !p.is_qh() || p.terminate() || p.ptr() != 0xDEAD_BEE0 {
+        return TestResult::Fail("QH frame-list pointer mis-encoded");
+    }
+    let t = FrameListPtr::make_terminate();
+    if !t.terminate() {
+        return TestResult::Fail("terminate pointer should set bit 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uhci", smoke_uhci_frame_list_pointer_flags);
+
+fn smoke_uhci_td_round_trip() -> TestResult {
+    use crate::uhci::{td_status, FrameListPtr, Td, TdPid};
+    let t = Td {
+        link: FrameListPtr::make(0x1000_0000, true),
+        actual_length: 0x12,
+        status: td_status::ACTIVE,
+        interrupt_on_completion: true,
+        iso: false,
+        low_speed: true,
+        error_count: 3,
+        short_packet_detect: true,
+        pid: TdPid::Setup,
+        device_addr: 0x12,
+        endpoint: 4,
+        data_toggle: true,
+        max_len: 7,
+        buffer: 0xCAFE_BABE,
+    };
+    let r = Td::unpack(&t.pack());
+    if r != t {
+        return TestResult::Fail("UHCI Td round-trip failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uhci", smoke_uhci_td_round_trip);
+
+fn smoke_uhci_qh_round_trip() -> TestResult {
+    use crate::uhci::{FrameListPtr, Qh};
+    let q = Qh {
+        link: FrameListPtr::make(0xAABB_CCD0, true),
+        element: FrameListPtr::make_terminate(),
+    };
+    let r = Qh::unpack(&q.pack());
+    if r != q {
+        return TestResult::Fail("UHCI Qh round-trip failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uhci", smoke_uhci_qh_round_trip);
+
+fn smoke_uhci_frame_list_full_population() -> TestResult {
+    use crate::uhci::{make_frame_list_pointing_to, FrameListPtr};
+    let list = make_frame_list_pointing_to(0xCAFE_C0D0);
+    if list.len() != 1024 {
+        return TestResult::Fail("Frame list must have 1024 entries");
+    }
+    let p = FrameListPtr(list[0]);
+    if p.ptr() != 0xCAFE_C0D0 || !p.is_qh() || p.terminate() {
+        return TestResult::Fail("Frame list entry shape wrong");
+    }
+    if list.iter().any(|&v| v != list[0]) {
+        return TestResult::Fail("Frame list should be uniform");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/usb/uhci", smoke_uhci_frame_list_full_population);
+
 fn smoke_hid_boot_mouse_button_mask() -> TestResult {
     use crate::hid::mouse;
     use narf_input::PointerButtons;

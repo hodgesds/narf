@@ -5,6 +5,22 @@
 All driver code is derived strictly from the references below.
 **No GPL Linux source consulted.**
 
+### EHCI host controller (USB 2.0)
+- "Enhanced Host Controller Interface Specification for Universal
+  Serial Bus", Revision 1.0, March 12, 2002 (Intel).
+  <https://www.intel.com/content/dam/www/public/us/en/documents/technical-specifications/ehci-specification-for-usb.pdf>
+
+### OHCI host controller (USB 1.1)
+- "OpenHCI — Open Host Controller Interface Specification for USB",
+  Release 1.0a, September 14, 1999 (Compaq / Microsoft / National
+  Semiconductor).
+  <https://composter.com.ua/documents/ohci_specification.pdf>
+
+### UHCI host controller (USB 1.1)
+- "Universal Host Controller Interface (UHCI) Design Guide",
+  Revision 1.1, March 1996 (Intel).
+  <https://ftp.netbsd.org/pub/NetBSD/misc/blymn/uhci11d.pdf>
+
 ### xHCI host controller
 
 - **eXtensible Host Controller Interface for Universal Serial Bus
@@ -101,7 +117,8 @@ All driver code is derived strictly from the references below.
   setup, device enumeration.
 - **HID** (`hid`): Boot keyboard report decoder, modifier+keycode
   state tracking, usage-table mapping for alphanumeric input.
-- **HID Boot Mouse** (`hid::mouse`): HID 1.11 §B.2 boot-mouse report
+- **HID Boot Mouse** (`hid::mouse`): HID 1.11 §B.2 boot-mouse report.
+  <https://www.usb.org/document-library/device-class-definition-hid-111>
   decoder (3-byte: button mask + signed dx/dy), Set-Protocol(Boot)
   attach via xHCI control-IN, descriptor-walker that locates the
   HID/Boot/Mouse interface (class 0x03 / sub 0x01 / proto 0x02) and

@@ -6,6 +6,7 @@ Transport-neutral HID 1.11 codec.
 
 - **HID 1.11** — *Device Class Definition for Human Interface
   Devices*, Version 1.11, 27 June 2001 (USB-IF / usb.org).
+  https://www.usb.org/document-library/device-class-definition-hid-111
   - §5.3 — Generic Item Format (short / long item layout, prefix
     byte encoding).
   - §6.2.2 — Report Descriptor.
@@ -25,6 +26,7 @@ Transport-neutral HID 1.11 codec.
 - **HID Usage Tables 1.4** — *USB HID Usage Tables*, 28 May 2020
   (USB-IF). Page + usage constants (§4 Generic Desktop, §10
   Keyboard/Keypad, §12 Button, §15 Consumer, §16 Digitizer).
+  https://usb.org/document-library/hid-usage-tables-14
 - **HID 1.11 Appendix B.1** — Boot Keyboard reference descriptor,
   used as a fixture in tests/.
 
@@ -44,6 +46,8 @@ Sources:
   public technical documentation. Defines the Required HID
   Top-Level Collections, Configuration TLC, Device Mode semantics
   (0 = Mouse, 1 = Single Input, 3 = Multi-touch).
+  https://learn.microsoft.com/en-us/windows-hardware/design/component-guidelines/windows-precision-touchpad-required-hid-top-level-collections
+  https://learn.microsoft.com/en-us/windows-hardware/design/component-guidelines/touchpad-windows-precision-touchpad-collection
 - **HID 1.11 §6.2.2** — descriptor structure.
 
 Surface:

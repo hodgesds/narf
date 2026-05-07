@@ -6,11 +6,14 @@
 //!   the usages this profile keys on: Touch Pad (0x05), Finger
 //!   (0x22), Tip Switch (0x42), Contact ID (0x51), Contact Count
 //!   (0x54), Scan Time (0x56), Device Mode (0x60).
+//!   <https://usb.org/document-library/hid-usage-tables-14>
 //! - **"Windows Precision Touchpad Implementation Guide"** —
 //!   Microsoft public technical documentation. Defines the
 //!   Required HID Top-Level Collections, Device Mode feature
 //!   semantics (0 = Mouse mode legacy, 3 = Multi-touch reporting
 //!   mode), and the per-contact field set every PTP must expose.
+//!   <https://learn.microsoft.com/en-us/windows-hardware/design/component-guidelines/windows-precision-touchpad-required-hid-top-level-collections>
+//!   <https://learn.microsoft.com/en-us/windows-hardware/design/component-guidelines/touchpad-windows-precision-touchpad-collection>
 //! - **HID 1.11 §6.2.2** — descriptor parsing (already in
 //!   [`crate::descriptor`]). Boot mouse / boot keyboard fixtures
 //!   are not consulted here.
