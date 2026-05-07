@@ -9,6 +9,17 @@
 //!   come from the device's PCI configuration header, which the
 //!   chip exposes regardless of firmware state.
 //!
+//! ## 2026 audit notes
+//!
+//! Qualcomm hosts the WCN685x firmware tree at
+//! `git.codelinaro.org/clo/ath-firmware/ath11k-firmware` — signed
+//! firmware blobs only, no register / WMI documentation. The WMI
+//! command-set TLV definitions live in the Linux GPL-2.0 `ath11k`
+//! / `ath12k` source trees and are off-limits for clean-room
+//! consumption. Until Qualcomm publishes a programming guide,
+//! this driver must stop at the BHI (primary-boot-loader) presence
+//! check described below.
+//!
 //! No GPL Linux ath11k / ath12k / mhi-bus source consulted.
 //!
 //! ## Why presence-only

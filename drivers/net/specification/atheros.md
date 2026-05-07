@@ -15,9 +15,28 @@ non-public document was consulted.**
 - **AR9170 USB 802.11n Reference Design** — Atheros, public USB
   vendor/device pairs and high-level register-block layout for the
   USB-attached part.
+- **carl9170fw** — `chunkeey/carl9170fw` on GitHub. Atheros released
+  the AR9170 firmware under GPL-2.0 *with documentation* of the
+  host ↔ firmware command interface (SH-2 build instructions,
+  vendor-command tables, register comments). The firmware
+  repository is GPL but the **document comments** describing the
+  vendor-command framing of the AR9170 USB host transport are
+  clean-room compatible to consume. Together with the public USB
+  descriptors this makes AR9170 USB the one fully-buildable
+  Atheros target.
+  <https://github.com/chunkeey/carl9170fw>
 - **IEEE Std 802.11-2020** — frame layout the MAC speaks. Protocol-
   layer code lives in `narf-wireless`; this driver is the silicon
   bring-up.
+
+### Documents we explicitly do *not* consume
+
+- The "AR93xx ART2 Reference Guide" and "AR9300 EEPROM
+  configuration" PDFs that surface on Scribd and GitHub mirrors are
+  **leaked NDA documents**. They are not safe to use. The AR9300-
+  family driver scope therefore stops at the PCI ID match table.
+- The Linux `ath9k` / `ath10k` / `ath11k` source trees are GPL-2.0
+  and are not consulted.
 
 ## Scope
 

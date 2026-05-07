@@ -410,3 +410,28 @@ impl AmdGpu {
   register, which wins? Today the picker prefers the most-
   recently-registered backend; an explicit precedence rule
   ("amdgpu > bochs > virtio-gpu in QEMU passthrough") may help.
+
+## 10. 2026 web-search audit — public reference URLs
+
+A targeted web search confirmed the AMD GPU family is the most
+clean-room-friendly modern GPU surface. Concrete URLs the driver
+already cites or should cite:
+
+- **AMD GPUOpen "GPU architecture programming documentation"** —
+  the canonical hub linking each generation's ISA reference and
+  per-block register reference PDFs.
+  <https://gpuopen.com/amd-gpu-architecture-programming-documentation/>
+- **RDNA 4 ISA reference** (Feb 2024).
+  <https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna4-instruction-set-architecture.pdf>
+- **RDNA 3 ISA reference** (Feb 2023).
+  <https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna3-shader-instruction-set-architecture-feb-2023_0.pdf>
+- **ROCm "GPU architecture documentation"** — bundles per-
+  generation docs, useful for compute-side context.
+  <https://rocm.docs.amd.com/en/latest/conceptual/gpu-arch.html>
+
+Practical implication: full RDNA 2 / 3 / 4 register-level driver
+work is feasible from public material. The only blocker remains
+the **PSP / SMU firmware blob**, which is loaded as opaque ucode —
+the loading protocol is documented but the internal command set is
+not. The narf driver can stage the blob through the documented
+loader, which is what we do today.

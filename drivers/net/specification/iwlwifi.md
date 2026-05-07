@@ -133,6 +133,26 @@ Two avenues are explicitly **not** taken here:
 
 - Intel "Wi-Fi 6 (Gig+) AX200" product brief (public PDF).
 - Intel "Wi-Fi 6E AX210" product brief (public PDF).
-- Intel ARK SKU pages (AX200 / AX201 / AX210 / AX211).
+- Intel ARK SKU pages (AX200 / AX201 / AX210 / AX211 / BE200).
 - IEEE Std 802.11-2020 (open standard).
 - PCI Express Base Specification — capability-header layout.
+
+## 9. 2026 web-search audit — confirmation of the wall
+
+A targeted web search re-ran in 2026 to look for any new public
+material covering the AX2xx / BE200 register set or firmware
+command interface returned **nothing past the marketing briefs
+already cited above**. Specifically:
+
+- Intel does **not** publish a register manual, an NVM section
+  format spec, a CSR/UREG bitfield table, or an MVM ucode ABI
+  document for any part in the AX family.
+- The `iwlwifi/linux-firmware` repository at git.kernel.org
+  ships only signed binary blobs.
+- The Fuchsia / Zircon `third_party/iwlwifi` port reads the
+  command interface from the upstream **GPL-2.0** Linux source,
+  so it is not a clean-room reference.
+
+→ Confirmation that the v0.1 verdict still stands: PCI ID match
+plumbing is the only stage that can land without consulting GPL
+sources or signing an Intel NDA. The driver remains stub-only.
