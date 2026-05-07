@@ -1961,6 +1961,7 @@ fn parse_ecdt_body(body: &[u8]) {
     ]);
     let gpe_bit = body[off + 28];
     *ECDT_DATA.lock() = EcdtInfo { control_addr, data_addr, uid, gpe_bit };
+    ECDT_PARSED.store(true, Ordering::Release);
 }
 
 /// Discover the Embedded Controller via ECDT.
@@ -1984,8 +1985,8 @@ pub unsafe fn parse_ecdt(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
+    // `parse_ecdt_body` already sets `ECDT_PARSED`.
     parse_ecdt_body(body);
-    ECDT_PARSED.store(true, Ordering::Release);
     Ok(())
 }
 
