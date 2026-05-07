@@ -371,3 +371,99 @@ fn smoke_rapl_unit_decode() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("power/rapl", smoke_rapl_unit_decode);
+
+
+
+// ── Watchdog codec smokes ─────────────────────────────────────────
+
+
+
+fn smoke_watchdog_itco_initial_seconds_clamp() -> TestResult {
+
+    use crate::watchdog::itco::compose_initial_seconds;
+
+    if compose_initial_seconds(1) < 4 {
+
+        return TestResult::Fail("min clamp");
+
+    }
+
+    if compose_initial_seconds(10_000) != 0x3FF {
+
+        return TestResult::Fail("max clamp");
+
+    }
+
+    // 30 s → 30_000 / 600 = 50 ticks.
+
+    if compose_initial_seconds(30) != 50 {
+
+        return TestResult::Fail("tick conversion");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("power/watchdog", smoke_watchdog_itco_initial_seconds_clamp);
+
+
+
+fn smoke_watchdog_sp5100_count_pass_through() -> TestResult {
+
+    use crate::watchdog::sp5100::{compose_count_seconds, CONTROL_ENABLE, CONTROL_TRIGGER};
+
+    if compose_count_seconds(60) != 60 {
+
+        return TestResult::Fail("1 Hz pass-through");
+
+    }
+
+    if CONTROL_ENABLE != 1 || CONTROL_TRIGGER != (1 << 6) {
+
+        return TestResult::Fail("control bits wrong");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("power/watchdog", smoke_watchdog_sp5100_count_pass_through);
+
+
+
+fn smoke_watchdog_sp805_lock_magic_and_load() -> TestResult {
+
+    use crate::watchdog::sp805::{compose_load_seconds, LOCK_LOCK, LOCK_UNLOCK};
+
+    // Spec-defined unlock magic.
+
+    if LOCK_UNLOCK != 0x1ACC_E551 {
+
+        return TestResult::Fail("unlock magic");
+
+    }
+
+    if LOCK_LOCK != 0 {
+
+        return TestResult::Fail("lock magic");
+
+    }
+
+    // 30 s @ 24 MHz / 2 = 12 MHz tick.
+
+    let want = 30u32 * (24_000_000 / 2);
+
+    if compose_load_seconds(30, 24_000_000) != want {
+
+        return TestResult::Fail("load value math wrong");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("power/watchdog", smoke_watchdog_sp805_lock_magic_and_load);
