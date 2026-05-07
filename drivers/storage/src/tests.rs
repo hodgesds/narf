@@ -527,3 +527,209 @@ fn smoke_emmc_pre_eol_warning_decoded() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/storage/emmc", smoke_emmc_pre_eol_warning_decoded);
+
+
+
+// ── UFS / UFSHCI 3.0 ──────────────────────────────────────────────
+
+
+
+fn smoke_ufs_utrd_round_trip() -> TestResult {
+
+    use crate::ufs::{CommandType, DataDir, OcsStatus, Utrd};
+
+    let u = Utrd {
+
+        command_type: CommandType::Scsi,
+
+        data_dir: DataDir::DeviceToHost,
+
+        interrupt: true,
+
+        crypto: false,
+
+        cci: 0,
+
+        ocs: OcsStatus::Success,
+
+        ucd_phys: 0x0000_C0DE_FACE_F000u64,
+
+        response_offset_bytes: 128,
+
+        response_length_bytes: 64,
+
+        prdt_offset_bytes: 256,
+
+        prdt_entry_count: 4,
+
+    };
+
+    let r = Utrd::unpack(&u.pack());
+
+    if r != u {
+
+        return TestResult::Fail("UTRD round-trip failed");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("drivers/storage/ufs", smoke_ufs_utrd_round_trip);
+
+
+
+fn smoke_ufs_command_upiu_layout() -> TestResult {
+
+    use crate::ufs::{build_command_upiu, cmd_flags, UpiuHeader, UpiuType};
+
+    // SCSI READ(10): opcode 0x28, lba=0x100, length=4 blocks.
+
+    let cdb = [0x28, 0, 0x00, 0x00, 0x01, 0x00, 0, 0, 4, 0];
+
+    let buf = build_command_upiu(0, 0x42, cmd_flags::READ, 0x800, &cdb);
+
+    if buf.len() != 32 {
+
+        return TestResult::Fail("Command UPIU should be 32 bytes");
+
+    }
+
+    let mut hdr = [0u8; 12];
+
+    hdr.copy_from_slice(&buf[..12]);
+
+    let h = UpiuHeader::unpack(&hdr).expect("hdr");
+
+    if h.kind != UpiuType::Command || h.task_tag != 0x42 || h.flags != cmd_flags::READ {
+
+        return TestResult::Fail("command header decoded wrong");
+
+    }
+
+    let edl = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
+
+    if edl != 0x800 {
+
+        return TestResult::Fail("Expected Data Length lost");
+
+    }
+
+    if &buf[16..16 + cdb.len()] != cdb {
+
+        return TestResult::Fail("CDB lost");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("drivers/storage/ufs", smoke_ufs_command_upiu_layout);
+
+
+
+fn smoke_ufs_response_upiu_decode() -> TestResult {
+
+    use crate::ufs::{decode_response_upiu, UpiuHeader, UpiuType};
+
+    let hdr = UpiuHeader {
+
+        kind: UpiuType::Response,
+
+        flags: 0,
+
+        lun: 0,
+
+        task_tag: 0x42,
+
+        iid_cmd_set_type: 0,
+
+        query_function: 0,
+
+        response: 0,
+
+        status: 0x02, // Check Condition
+
+        total_ehs_length: 0,
+
+        device_information: 0,
+
+        data_segment_length: 8,
+
+    };
+
+    let mut buf = alloc::vec::Vec::new();
+
+    buf.extend_from_slice(&hdr.pack());
+
+    buf.extend_from_slice(&0x12345678u32.to_be_bytes()); // residual
+
+    buf.extend_from_slice(&[0xF0, 0x00, 0x05, 0x00, 0, 0, 0x0A, 0]);
+
+    let (h, residual, sense) = match decode_response_upiu(&buf) {
+
+        Some(t) => t,
+
+        None => return TestResult::Fail("decode_response_upiu failed"),
+
+    };
+
+    if h.task_tag != 0x42 || h.status != 0x02 {
+
+        return TestResult::Fail("response header decoded wrong");
+
+    }
+
+    if residual != 0x12345678 {
+
+        return TestResult::Fail("residual lost");
+
+    }
+
+    if sense.len() != 8 {
+
+        return TestResult::Fail("sense data length wrong");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("drivers/storage/ufs", smoke_ufs_response_upiu_decode);
+
+
+
+fn smoke_ufs_prdt_byte_count_zero_based() -> TestResult {
+
+    use crate::ufs::PrdtEntry;
+
+    let e = PrdtEntry {
+
+        data_addr: 0x0000_DEAD_BEEF_0000,
+
+        byte_count: 4096,
+
+    };
+
+    let r = PrdtEntry::unpack(&e.pack());
+
+    if r.byte_count != 4096 {
+
+        return TestResult::Fail("PRDT round-trip byte count failed");
+
+    }
+
+    if r.data_addr != 0x0000_DEAD_BEEF_0000 {
+
+        return TestResult::Fail("PRDT data addr lost");
+
+    }
+
+    TestResult::Pass
+
+}
+
+kernel_test_in!("drivers/storage/ufs", smoke_ufs_prdt_byte_count_zero_based);

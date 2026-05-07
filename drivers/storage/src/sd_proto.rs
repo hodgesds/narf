@@ -4,9 +4,11 @@
 //! - SD Physical Layer Simplified Specification v8.00 (SD Association,
 //!   free PDF on sdcard.org). §4.9 R1/R3/R6/R7 response formats.
 //!   §5.1 OCR layout. §5.2 CID layout. §5.3 CSD v1.0 + v2.0 layouts.
+//!   <https://www.sdcard.org/downloads/pls/>
 //! - SD Host Controller Simplified Specification v3.00 — referenced
 //!   only for response register layout (response shifted right by 8
 //!   bits; the CRC7 + end bit are dropped by hardware).
+//!   <https://www.sdcard.org/downloads/pls/>
 //!
 //! No GPL Linux source consulted.
 //!

@@ -4,6 +4,7 @@
 //! - JEDEC Standard JESD84-B51 — "Embedded Multi-Media Card (e•MMC)
 //!   Electrical Standard (5.1)". Public document. §7.4 (EXT_CSD
 //!   register: 512 bytes, indexed by byte offset).
+//!   <https://www.jedec.org/standards-documents/docs/jesd84-b51>
 //! - JESD84-B51 §7.3 — `BUS_WIDTH` setting via CMD6 (SWITCH).
 //! - JESD84-B51 §6.6.5 — High-Speed timings (HS200, HS400) and the
 //!   `HS_TIMING` byte's encoding.

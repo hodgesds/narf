@@ -19,6 +19,7 @@ pub mod ahci;
 pub mod emmc;
 pub mod sd_proto;
 pub mod sdhci;
+pub mod ufs;
 
 mod tests;
 

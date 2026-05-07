@@ -41,6 +41,15 @@ All driver code is derived strictly from the references below.
   (C_SIZE × 2^(C_SIZE_MULT+2) × 2^READ_BL_LEN). §5.3.3 CSD v2.0
   capacity formula ((C_SIZE+1) × 512 KiB).
 
+### UFS / UFSHCI 3.0
+
+- **JEDEC JESD223D — Universal Flash Storage Host Controller
+  Interface (UFSHCI)**, Version 3.0, January 2018.
+  <https://www.jedec.org/standards-documents/docs/jesd223d>
+- **JEDEC JESD220D — Universal Flash Storage (UFS)**, Version 3.1,
+  March 2020.
+  <https://www.jedec.org/standards-documents/docs/jesd220d>
+
 ## Scope
 
 ### Landed

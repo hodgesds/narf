@@ -6,6 +6,7 @@
 //! Layer Simplified Specification (also free) covers the protocol
 //! sequence (CMD0 / CMD8 / ACMD41 / CMD2 / CMD3 / CMD7 / CMD17 /
 //! CMD24).
+//!   <https://www.sdcard.org/downloads/pls/>
 //!
 //! ## Layout
 //!
