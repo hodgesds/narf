@@ -31,6 +31,7 @@ pub mod deadline;
 pub mod encrypted;
 pub mod mq;
 pub mod opal;
+pub mod ram;
 pub mod registry;
 pub mod scsi;
 
@@ -62,14 +63,14 @@ pub trait BlockDevice: Send + Sync {
 
     /// Submit a block I/O request. Returns a future that resolves to
     /// the completion.
-    fn submit(&self, req: BlockRequest) -> impl Future<Output = BlockCompletion>;
+    fn submit(&self, req: BlockRequest) -> impl Future<Output = BlockCompletion> + Send;
     /// Ensure all previously-submitted writes are persistent on the media.
-    fn flush(&self) -> impl Future<Output = ()>;
+    fn flush(&self) -> impl Future<Output = ()> + Send;
     /// Advise the device that a range of blocks is no longer needed.
-    fn discard(&self, range: LbaRange) -> impl Future<Output = ()>;
+    fn discard(&self, range: LbaRange) -> impl Future<Output = ()> + Send;
 
     /// Cancel an in-flight request by kernel-assigned tag.
-    fn cancel(&self, tag: u64) -> impl Future<Output = CancelResult>;
+    fn cancel(&self, tag: u64) -> impl Future<Output = CancelResult> + Send;
 }
 
 /// Optional block device features.

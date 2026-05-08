@@ -75,6 +75,7 @@ pub use memfs::{new_anon_file as new_anon_memfile, MemFs};
 pub use page_cache::{Page, PageCache, PageKey, PAGE_SIZE};
 
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
@@ -169,6 +170,10 @@ impl Mode {
         file_type: FileType::Dir,
         perms: 0o555,
     };
+    pub const DIR_RW: Mode = Mode {
+        file_type: FileType::Dir,
+        perms: 0o777,
+    };
 }
 
 // ── Errors ─────────────────────────────────────────────────────────
@@ -183,6 +188,7 @@ pub enum FsError {
     InvalidPath,
     Busy,
     ReadOnly,
+    NoSpace,
     /// The backing FS doesn't implement this op (e.g. virtiofs skeleton
     /// pre-Stage-4).
     Unsupported,
@@ -240,12 +246,15 @@ pub trait FileOps: Send + Sync {
     /// cheaply.
     fn stat(&self) -> Stat;
 
+    /// Asynchronous stat — required for disk-backed or remote FS.
+    fn stat_async<'a>(&'a self) -> FsFuture<'a, Stat> {
+        Box::pin(async move { Ok(self.stat()) })
+    }
+
     /// Resize the file to exactly `len` bytes. Growing zero-fills;
-    /// shrinking truncates. Default: `Unsupported` so read-only
-    /// filesystems (initramfs) reject without per-impl boilerplate.
-    /// Mutable filesystems (`MemFs::MemFile`) override.
-    fn truncate(&self, _len: u64) -> Result<(), FsError> {
-        Err(FsError::Unsupported)
+    /// shrinking truncates.
+    fn truncate<'a>(&'a self, _len: u64) -> FsFuture<'a, ()> {
+        Box::pin(async move { Err(FsError::Unsupported) })
     }
 }
 
@@ -294,66 +303,53 @@ pub trait DirOps: Send + Sync {
             .collect()
     }
 
+    /// Resolve a single name component asynchronously.
+    fn lookup_async<'a>(&'a self, _name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move { Err(FsError::Unsupported) })
+    }
+
+    /// Look up a child as a directory asynchronously.
+    fn lookup_dir_async<'a>(&'a self, _name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
+        Box::pin(async move { Err(FsError::Unsupported) })
+    }
+
+    /// Snapshot entries asynchronously.
+    fn enumerate_async<'a>(&'a self, _cursor: usize, _max: usize) -> FsFuture<'a, alloc::vec::Vec<(alloc::string::String, FileType)>> {
+        Box::pin(async move { Err(FsError::Unsupported) })
+    }
+
     // ── Stage-4 r/w surface ──────────────────────────────────────
-    //
-    // These mutators carry a default returning `Unsupported` so the
-    // existing read-only FSes (initramfs, virtiofs skeleton) keep
-    // compiling without per-impl boilerplate. Mutable FSes
-    // (`MemFs`) override the relevant slots.
-    //
-    // Sync return type is intentional: today's mutable FS is
-    // in-memory + lock-protected, so an async surface would just box
-    // up a ready future. The async-variant lands alongside the
-    // first persistent r/w FS.
 
     /// Remove the file entry named `name` from this directory.
-    /// Returns `NotFound` if the entry is absent, `Unsupported` on
-    /// read-only FSes, `InvalidPath` if `name` denotes a directory
-    /// (use `rmdir` for those).
-    fn unlink(&self, _name: &str) -> Result<(), FsError> {
-        Err(FsError::Unsupported)
+    fn unlink<'a>(&'a self, _name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move { Err(FsError::Unsupported) })
     }
 
-    /// Create a new empty file named `name` and return a handle. The
-    /// returned handle's `write` may immediately back-populate the
-    /// file. Returns `Busy` if the name already exists.
-    fn create(&self, _name: &str) -> Result<Arc<dyn FileOps>, FsError> {
-        Err(FsError::Unsupported)
+    /// Create a new empty file named `name` and return a handle.
+    fn create<'a>(&'a self, _name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move { Err(FsError::Unsupported) })
     }
 
-    /// Create a new empty subdirectory named `name`. Returns the new
-    /// directory's handle on success; `Busy` if the name already
-    /// exists. Default: `Unsupported` — flat-dir FSes (the current
-    /// MemFs) override only when they grow real hierarchy.
-    fn mkdir(&self, _name: &str) -> Result<Arc<dyn DirOps>, FsError> {
-        Err(FsError::Unsupported)
+    /// Create a new empty subdirectory named `name`.
+    fn mkdir<'a>(&'a self, _name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
+        Box::pin(async move { Err(FsError::Unsupported) })
     }
 
-    /// Remove the empty subdirectory named `name`. Returns
-    /// `NotFound` if absent, `Busy` if the directory has entries.
-    fn rmdir(&self, _name: &str) -> Result<(), FsError> {
-        Err(FsError::Unsupported)
+    /// Remove the empty subdirectory named `name`.
+    fn rmdir<'a>(&'a self, _name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move { Err(FsError::Unsupported) })
     }
 
     /// Create a symlink entry named `name` pointing at the textual
-    /// `target` path. The target is stored verbatim — the FS does not
-    /// validate it. Returns the new symlink as a `FileOps` whose
-    /// `read` yields the target bytes. Default: `Unsupported`.
-    fn symlink(
-        &self,
-        _name: &str,
-        _target: &str,
-    ) -> Result<alloc::sync::Arc<dyn FileOps>, FsError> {
-        Err(FsError::Unsupported)
+    /// `target` path.
+    fn symlink<'a>(&'a self, _name: &'a str, _target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move { Err(FsError::Unsupported) })
     }
 
     /// Rename the entry `old_name` to `new_name` within this
-    /// directory. Returns `NotFound` if `old_name` is absent;
-    /// `Busy` if `new_name` already exists (no clobber). Cross-
-    /// directory rename is a Stage-4+ operation; today's contract is
-    /// strictly within-directory.
-    fn rename(&self, _old_name: &str, _new_name: &str) -> Result<(), FsError> {
-        Err(FsError::Unsupported)
+    /// directory.
+    fn rename<'a>(&'a self, _old_name: &'a str, _new_name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move { Err(FsError::Unsupported) })
     }
 }
 
@@ -424,6 +420,36 @@ pub fn resolve(root: Arc<dyn DirOps>, path: &str) -> Result<Arc<dyn FileOps>, Fs
 
     let leaf = last_component.ok_or(FsError::InvalidPath)?;
     current_dir.lookup(leaf).ok_or(FsError::NotFound)
+}
+
+/// Resolve a relative path asynchronously.
+pub fn resolve_async<'a>(root: Arc<dyn DirOps>, path: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+    Box::pin(async move {
+        if path.is_empty() {
+            return Err(FsError::InvalidPath);
+        }
+        if path.as_bytes()[0] == b'/' {
+            return Err(FsError::InvalidPath);
+        }
+
+        let mut current_dir = root;
+        let mut components: Vec<&str> = path.split('/').filter(|s| !s.is_empty() && *s != ".").collect();
+        
+        if components.is_empty() {
+             return Err(FsError::InvalidPath);
+        }
+
+        let last = components.pop().unwrap();
+
+        for segment in components {
+            if segment == ".." {
+                return Err(FsError::InvalidPath);
+            }
+            current_dir = current_dir.lookup_dir_async(segment).await?;
+        }
+
+        current_dir.lookup_async(last).await
+    })
 }
 
 // ── Mount + VfsRegistry ────────────────────────────────────────────
@@ -910,6 +936,30 @@ impl DirOps for InitramfsRoot {
         None
     }
 
+    fn lookup_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move {
+            self.lookup(name).ok_or(FsError::NotFound)
+        })
+    }
+
+    fn lookup_dir_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
+        Box::pin(async move {
+            // Initramfs in Stage 3 is flat; every entry is a leaf.
+            // If we find an entry that matches and looks like a dir,
+            // we could return it? But CPIO newc usually stores dirs
+            // explicitly.
+            for e in self.entries().iter() {
+                let canonical = e.name.strip_prefix("./").unwrap_or(e.name);
+                let canonical = canonical.strip_prefix('/').unwrap_or(canonical);
+                if canonical == name && (e.mode & 0o170000 == 0o040000) {
+                     // We don't have nested DirOps for Initramfs yet.
+                     return Err(FsError::Unsupported);
+                }
+            }
+            Err(FsError::NotFound)
+        })
+    }
+
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
         Box::new(self.entries().iter().map(|e| {
             let canonical = e.name.strip_prefix("./").unwrap_or(e.name);
@@ -923,6 +973,21 @@ impl DirOps for InitramfsRoot {
                 },
             }
         }))
+    }
+
+    fn enumerate(&self, cursor: usize, max: usize) -> Vec<(String, FileType)> {
+        use alloc::string::ToString;
+        self.iter()
+            .skip(cursor)
+            .take(max)
+            .map(|de| (de.name.to_string(), de.file_type))
+            .collect()
+    }
+
+    fn enumerate_async<'a>(&'a self, cursor: usize, max: usize) -> FsFuture<'a, Vec<(String, FileType)>> {
+        Box::pin(async move {
+            Ok(self.enumerate(cursor, max))
+        })
     }
 }
 
@@ -975,7 +1040,13 @@ impl FileOps for InitramfsFile {
     }
 }
 
-// ── Virtiofs skeleton ──────────────────────────────────────────────
+pub fn register_initcalls() {
+    use narf_init::{InitResult, Stage};
+    narf_init::register(Stage::Fs, "devfs-mount", || {
+        mount_devfs_default();
+        InitResult::Ok
+    });
+}
 
 /// Stage 3 placeholder for a virtiofs mount. Stage 4 wires the DAX
 /// shared-region protocol (FUSE-over-virtio plus a host-shared
@@ -1011,11 +1082,32 @@ struct VirtiofsRoot;
 
 impl DirOps for VirtiofsRoot {
     fn lookup(&self, _name: &str) -> Option<Arc<dyn FileOps>> {
-        // Stage 4 wires this to the FUSE LOOKUP op over virtqueue.
         unimplemented!("virtiofs lookup — Stage 4 wires FUSE/DAX")
+    }
+
+    fn lookup_async<'a>(&'a self, _name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move {
+            unimplemented!("virtiofs lookup_async — Stage 4 wires FUSE/DAX")
+        })
+    }
+
+    fn lookup_dir_async<'a>(&'a self, _name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
+        Box::pin(async move {
+            unimplemented!("virtiofs lookup_dir_async — Stage 4 wires FUSE/DAX")
+        })
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
         unimplemented!("virtiofs iter — Stage 4 wires FUSE READDIR")
+    }
+
+    fn enumerate(&self, _cursor: usize, _max: usize) -> Vec<(String, FileType)> {
+        unimplemented!("virtiofs enumerate — Stage 4 wires FUSE READDIR")
+    }
+
+    fn enumerate_async<'a>(&'a self, _cursor: usize, _max: usize) -> FsFuture<'a, Vec<(String, FileType)>> {
+        Box::pin(async move {
+            unimplemented!("virtiofs enumerate_async — Stage 4 wires FUSE READDIR")
+        })
     }
 }

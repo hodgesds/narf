@@ -171,6 +171,19 @@ impl DirOps for DevDir {
         }
     }
 
+    fn lookup_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move {
+            self.lookup(name).ok_or(FsError::NotFound)
+        })
+    }
+
+    fn lookup_dir_async<'a>(&'a self, _name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
+        Box::pin(async move {
+            // DevFs root has no subdirectories.
+            Err(FsError::NotFound)
+        })
+    }
+
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
         // Names are `&'static str` literals — fine for DirEntry.
         const ENTRIES: &[DirEntry] = &[
@@ -207,6 +220,12 @@ impl DirOps for DevDir {
             .take(max)
             .map(|(n, t)| ((*n).into(), *t))
             .collect()
+    }
+
+    fn enumerate_async<'a>(&'a self, cursor: usize, max: usize) -> FsFuture<'a, Vec<(String, FileType)>> {
+        Box::pin(async move {
+            Ok(self.enumerate(cursor, max))
+        })
     }
 }
 

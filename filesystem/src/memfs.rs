@@ -93,15 +93,17 @@ impl FileOps for MemFile {
         }
     }
 
-    fn truncate(&self, len: u64) -> Result<(), FsError> {
-        // Cap at usize::MAX so a 64-bit pathologically large `len`
-        // doesn't underflow into a tiny resize on 32-bit hosts. NARF
-        // user mode is 64-bit on every supported target, but Stage-5
-        // host-side test runners may differ.
-        let new_len = len as usize;
-        let mut g = self.bytes.lock();
-        g.resize(new_len, 0);
-        Ok(())
+    fn truncate<'a>(&'a self, len: u64) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            // Cap at usize::MAX so a 64-bit pathologically large `len`
+            // doesn't underflow into a tiny resize on 32-bit hosts. NARF
+            // user mode is 64-bit on every supported target, but Stage-5
+            // host-side test runners may differ.
+            let new_len = len as usize;
+            let mut g = self.bytes.lock();
+            g.resize(new_len, 0);
+            Ok(())
+        })
     }
 }
 
@@ -188,6 +190,12 @@ impl DirOps for MemDir {
         }
     }
 
+    fn lookup_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move {
+            self.lookup(name).ok_or(FsError::NotFound)
+        })
+    }
+
     fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
         let g = self.entries.lock();
         match g.get(name)? {
@@ -199,6 +207,12 @@ impl DirOps for MemDir {
             // a symlink chain must do so explicitly.
             Entry::Symlink(_) => None,
         }
+    }
+
+    fn lookup_dir_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
+        Box::pin(async move {
+            self.lookup_dir(name).ok_or(FsError::NotFound)
+        })
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
@@ -225,81 +239,99 @@ impl DirOps for MemDir {
             .collect()
     }
 
-    fn unlink(&self, name: &str) -> Result<(), FsError> {
-        let mut g = self.entries.lock();
-        match g.get(name) {
-            None => Err(FsError::NotFound),
-            Some(Entry::Dir(_)) => Err(FsError::InvalidPath),
-            Some(Entry::File(_)) | Some(Entry::Symlink(_)) => {
-                g.remove(name);
-                Ok(())
-            }
-        }
+    fn enumerate_async<'a>(&'a self, cursor: usize, max: usize) -> FsFuture<'a, Vec<(String, FileType)>> {
+        Box::pin(async move {
+            Ok(self.enumerate(cursor, max))
+        })
     }
 
-    fn create(&self, name: &str) -> Result<Arc<dyn FileOps>, FsError> {
-        let mut g = self.entries.lock();
-        if g.contains_key(name) {
-            return Err(FsError::Busy);
-        }
-        let f = Arc::new(MemFile {
-            bytes: IrqSafeSpinLock::new(Vec::new()),
-        });
-        g.insert(name.to_string(), Entry::File(Arc::clone(&f)));
-        Ok(f as Arc<dyn FileOps>)
-    }
-
-    fn mkdir(&self, name: &str) -> Result<Arc<dyn DirOps>, FsError> {
-        let mut g = self.entries.lock();
-        if g.contains_key(name) {
-            return Err(FsError::Busy);
-        }
-        let d = Arc::new(MemDir {
-            entries: IrqSafeSpinLock::new(BTreeMap::new()),
-        });
-        g.insert(name.to_string(), Entry::Dir(Arc::clone(&d)));
-        Ok(d as Arc<dyn DirOps>)
-    }
-
-    fn rmdir(&self, name: &str) -> Result<(), FsError> {
-        let mut g = self.entries.lock();
-        match g.get(name) {
-            None => Err(FsError::NotFound),
-            Some(Entry::File(_)) => Err(FsError::InvalidPath),
-            Some(Entry::Symlink(_)) => Err(FsError::InvalidPath),
-            Some(Entry::Dir(d)) => {
-                if !d.entries.lock().is_empty() {
-                    return Err(FsError::Busy);
+    fn unlink<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let mut g = self.entries.lock();
+            match g.get(name) {
+                None => Err(FsError::NotFound),
+                Some(Entry::Dir(_)) => Err(FsError::InvalidPath),
+                Some(Entry::File(_)) | Some(Entry::Symlink(_)) => {
+                    g.remove(name);
+                    Ok(())
                 }
-                g.remove(name);
-                Ok(())
             }
-        }
+        })
     }
 
-    fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn FileOps>, FsError> {
-        let mut g = self.entries.lock();
-        if g.contains_key(name) {
-            return Err(FsError::Busy);
-        }
-        let s = Arc::new(MemSymlink {
-            target: target.to_string(),
-        });
-        g.insert(name.to_string(), Entry::Symlink(Arc::clone(&s)));
-        Ok(s as Arc<dyn FileOps>)
+    fn create<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move {
+            let mut g = self.entries.lock();
+            if g.contains_key(name) {
+                return Err(FsError::Busy);
+            }
+            let f = Arc::new(MemFile {
+                bytes: IrqSafeSpinLock::new(Vec::new()),
+            });
+            g.insert(name.to_string(), Entry::File(Arc::clone(&f)));
+            Ok(f as Arc<dyn FileOps>)
+        })
     }
 
-    fn rename(&self, old_name: &str, new_name: &str) -> Result<(), FsError> {
-        let mut g = self.entries.lock();
-        if !g.contains_key(old_name) {
-            return Err(FsError::NotFound);
-        }
-        if g.contains_key(new_name) {
-            return Err(FsError::Busy);
-        }
-        let entry = g.remove(old_name).unwrap();
-        g.insert(new_name.to_string(), entry);
-        Ok(())
+    fn mkdir<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
+        Box::pin(async move {
+            let mut g = self.entries.lock();
+            if g.contains_key(name) {
+                return Err(FsError::Busy);
+            }
+            let d = Arc::new(MemDir {
+                entries: IrqSafeSpinLock::new(BTreeMap::new()),
+            });
+            g.insert(name.to_string(), Entry::Dir(Arc::clone(&d)));
+            Ok(d as Arc<dyn DirOps>)
+        })
+    }
+
+    fn rmdir<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let mut g = self.entries.lock();
+            match g.get(name) {
+                None => Err(FsError::NotFound),
+                Some(Entry::File(_)) => Err(FsError::InvalidPath),
+                Some(Entry::Symlink(_)) => Err(FsError::InvalidPath),
+                Some(Entry::Dir(d)) => {
+                    if !d.entries.lock().is_empty() {
+                        return Err(FsError::Busy);
+                    }
+                    g.remove(name);
+                    Ok(())
+                }
+            }
+        })
+    }
+
+    fn symlink<'a>(&'a self, name: &'a str, target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move {
+            let mut g = self.entries.lock();
+            if g.contains_key(name) {
+                return Err(FsError::Busy);
+            }
+            let s = Arc::new(MemSymlink {
+                target: target.to_string(),
+            });
+            g.insert(name.to_string(), Entry::Symlink(Arc::clone(&s)));
+            Ok(s as Arc<dyn FileOps>)
+        })
+    }
+
+    fn rename<'a>(&'a self, old_name: &'a str, new_name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let mut g = self.entries.lock();
+            if !g.contains_key(old_name) {
+                return Err(FsError::NotFound);
+            }
+            if g.contains_key(new_name) {
+                return Err(FsError::Busy);
+            }
+            let entry = g.remove(old_name).unwrap();
+            g.insert(new_name.to_string(), entry);
+            Ok(())
+        })
     }
 }
 
