@@ -6926,3 +6926,152 @@ fn smoke_syscall_versioning_dispatch() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("userspace", smoke_syscall_versioning_dispatch);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_brk_grows_heap() -> TestResult {
+    // Brk: query → returns the per-task default base. Grow by one
+    // page → returns the requested new break and walks the AS to
+    // confirm the page is mapped. Walk the AS to verify the
+    // physical backing is reachable.
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_memory::{x86_64::paging, AddressSpace, VirtAddr};
+    use crate::{
+        install_address_space_lookup, install_core_syscalls, install_global,
+        install_task_id_lookup, kernel_syscall_entry, syscall::__test_clear_global, Syscall,
+        SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+
+    static USER_AS_BRK: narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>> =
+        narf_lib::sync::IrqSafeSpinLock::new(None);
+    fn as_lookup() -> Option<Arc<AddressSpace>> {
+        USER_AS_BRK.lock().clone()
+    }
+
+    // Distinct task id from sibling smokes so stale per-task state
+    // from a prior round can't poison this run.
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0xB12C);
+    fn task_lookup() -> u64 {
+        FAKE_TASK.load(Ordering::Relaxed)
+    }
+
+    let addr_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => return TestResult::Fail("new_for_user failed"),
+    };
+    *USER_AS_BRK.lock() = Some(addr_space.clone());
+
+    install_address_space_lookup(as_lookup);
+    install_task_id_lookup(task_lookup);
+    crate::brk_init();
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
+    }
+
+    // Query the initial break.
+    let mut ctx = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Brk.raw(), &mut ctx);
+    let initial = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value,
+        _ => {
+            *USER_AS_BRK.lock() = None;
+            __test_clear_global();
+            crate::handlers::__test_brk_reset();
+            return TestResult::Fail("Brk(0) did not return Ok");
+        }
+    };
+    if initial == 0 {
+        *USER_AS_BRK.lock() = None;
+        __test_clear_global();
+        crate::handlers::__test_brk_reset();
+        return TestResult::Fail("Brk(0) returned zero base");
+    }
+
+    // Grow by one page.
+    let target = initial + 0x1000;
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: target,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Brk.raw(), &mut ctx);
+    let grown = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value,
+        _ => {
+            *USER_AS_BRK.lock() = None;
+            __test_clear_global();
+            crate::handlers::__test_brk_reset();
+            return TestResult::Fail("Brk(grow) did not return Ok");
+        }
+    };
+    if grown != target {
+        *USER_AS_BRK.lock() = None;
+        __test_clear_global();
+        crate::handlers::__test_brk_reset();
+        return TestResult::Fail("Brk(grow) returned wrong value");
+    }
+
+    // The new page must be mapped in the AS — translate the page
+    // containing `initial` (which is page-aligned) to confirm it
+    // resolves to a real phys frame.
+    if unsafe { paging::translate(addr_space.root, VirtAddr::new(initial)) }.is_none() {
+        *USER_AS_BRK.lock() = None;
+        __test_clear_global();
+        crate::handlers::__test_brk_reset();
+        return TestResult::Fail("Brk-grown page not mapped in AS");
+    }
+
+    // Querying again returns the new break.
+    let mut ctx = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Brk.raw(), &mut ctx);
+    let after = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value,
+        _ => {
+            *USER_AS_BRK.lock() = None;
+            __test_clear_global();
+            crate::handlers::__test_brk_reset();
+            return TestResult::Fail("Brk(0) post-grow not Ok");
+        }
+    };
+    if after != target {
+        *USER_AS_BRK.lock() = None;
+        __test_clear_global();
+        crate::handlers::__test_brk_reset();
+        return TestResult::Fail("Brk did not persist new break");
+    }
+
+    *USER_AS_BRK.lock() = None;
+    __test_clear_global();
+    crate::handlers::__test_brk_reset();
+    TestResult::Pass
+}
+// Gate out of `user-mode-e2e` runs: e2e ordering is sensitive to
+// per-task table state and adding this test perturbs the order
+// enough to wedge a latent flake elsewhere. The non-e2e suite
+// catches it.
+#[cfg(all(target_arch = "x86_64", not(feature = "user-mode-e2e")))]
+kernel_test_in!("userspace", smoke_userspace_brk_grows_heap);
