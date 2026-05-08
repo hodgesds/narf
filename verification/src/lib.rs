@@ -2251,148 +2251,20 @@ fn smoke_smp_x86_64_cpuid_count() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_smp_x86_64_cpuid_count);
 
-#[cfg(target_arch = "x86_64")]
-fn smoke_acpi_srat_topology_present() -> TestResult {
-    // The xtask QEMU config publishes 2 NUMA nodes via `-numa
-    // node,...,memdev=memN`, so SRAT must be present and decode
-    // CPU+memory affinity. Synthetic-body tests scrub the shared
-    // tables, so re-parse from the cached RSDP first.
-    let rsdp = match narf_acpi::cached_rsdp() {
-        Some(p) => p,
-        None => return TestResult::Fail("no boot-time RSDP cached"),
-    };
-    // SAFETY: cached RSDP was already validated at boot.
-    let _ = unsafe { narf_acpi::parse_srat(rsdp) };
-    if !narf_acpi::is_topology_known() {
-        return TestResult::Fail("SRAT not parsed at boot");
-    }
-    if narf_acpi::node_count() < 2 {
-        return TestResult::Fail("expected >=2 NUMA nodes");
-    }
-    if narf_acpi::cpu_node(0).is_none() {
-        return TestResult::Fail("BSP missing from SRAT");
-    }
-    TestResult::Pass
-}
-#[cfg(target_arch = "x86_64")]
-kernel_test!(smoke_acpi_srat_topology_present);
+// `smoke_acpi_srat_topology_present` migrated to acpi/src/tests.rs (subsystem `"acpi"`).
 
-#[cfg(target_arch = "x86_64")]
-fn smoke_acpi_srat_memory_node_lookup() -> TestResult {
-    // QEMU splits 256 MiB across two memdevs; the first chunk
-    // starts at the legacy low-RAM base and the second above it.
-    // Check that *something* in the second-half address space maps
-    // to a non-zero node.
-    let rsdp = match narf_acpi::cached_rsdp() {
-        Some(p) => p,
-        None => return TestResult::Fail("no boot-time RSDP cached"),
-    };
-    // SAFETY: cached RSDP was already validated at boot.
-    let _ = unsafe { narf_acpi::parse_srat(rsdp) };
-    if !narf_acpi::is_topology_known() {
-        return TestResult::Fail("SRAT not parsed at boot");
-    }
-    let mut buf = [narf_acpi::MemRange::default(); narf_acpi::MAX_NUMA_RANGES];
-    let n = narf_acpi::copy_memory_ranges(&mut buf);
-    if n == 0 {
-        return TestResult::Fail("no memory ranges from SRAT");
-    }
-    // Pick any enabled range and confirm memory_node round-trips.
-    for r in &buf[..n] {
-        if r.enabled && r.length > 0 {
-            let mid = r.base + r.length / 2;
-            match narf_acpi::memory_node(mid) {
-                Some(n) if n == r.node => return TestResult::Pass,
-                _ => continue,
-            }
-        }
-    }
-    TestResult::Fail("memory_node didn't round-trip any SRAT range")
-}
-#[cfg(target_arch = "x86_64")]
-kernel_test!(smoke_acpi_srat_memory_node_lookup);
 
-fn smoke_acpi_srat_synthetic_lapic_entry() -> TestResult {
-    // Feed a synthetic SRAT body: one Type-0 LAPIC affinity entry
-    // for APIC id 7, proximity domain 3, enabled flag set.
-    narf_acpi::__reset_for_test();
-    let entry: [u8; 16] = [
-        0,  // type = 0
-        16, // length
-        3,  // PD low byte
-        7,  // APIC id
-        1, 0, 0, 0, // flags = enabled
-        0, // local SAPIC EID
-        0, 0, 0, // PD high (24 bits)
-        0, 0, 0, 0, // clock domain
-    ];
-    // SAFETY: synthetic body for the test-only entry-point.
-    let n = unsafe { narf_acpi::__parse_srat_body_for_test(&entry) };
-    if n != 1 {
-        return TestResult::Fail("expected 1 entry");
-    }
-    if narf_acpi::cpu_node(7) != Some(3) {
-        return TestResult::Fail("CPU 7 should map to node 3");
-    }
-    if narf_acpi::cpu_node(0).is_some() {
-        return TestResult::Fail("CPU 0 should be unmapped");
-    }
-    TestResult::Pass
-}
-kernel_test!(smoke_acpi_srat_synthetic_lapic_entry);
+// `smoke_acpi_srat_memory_node_lookup` migrated to acpi/src/tests.rs (subsystem `"acpi"`).
 
-#[cfg(target_arch = "x86_64")]
-fn smoke_acpi_madt_topology_present() -> TestResult {
-    // The xtask QEMU config has 2 CPUs; MADT must enumerate both
-    // and expose the LAPIC base.
-    let rsdp = match narf_acpi::cached_rsdp() {
-        Some(p) => p,
-        None => return TestResult::Fail("no boot-time RSDP cached"),
-    };
-    // SAFETY: cached RSDP, validated at boot.
-    let _ = unsafe { narf_acpi::parse_madt(rsdp) };
-    if !narf_acpi::is_madt_known() {
-        return TestResult::Fail("MADT not parsed");
-    }
-    if narf_acpi::cpu_count_from_madt() < 2 {
-        return TestResult::Fail("expected >= 2 CPUs from MADT");
-    }
-    if narf_acpi::lapic_base().is_none() {
-        return TestResult::Fail("LAPIC base missing from MADT");
-    }
-    if narf_acpi::apic_id_at(0).is_none() {
-        return TestResult::Fail("first APIC id missing");
-    }
-    let mut io = [narf_acpi::IoApic::default(); narf_acpi::MAX_IOAPICS];
-    if narf_acpi::copy_ioapics(&mut io) == 0 {
-        return TestResult::Fail("MADT advertised no IOAPIC");
-    }
-    TestResult::Pass
-}
-#[cfg(target_arch = "x86_64")]
-kernel_test!(smoke_acpi_madt_topology_present);
 
-#[cfg(target_arch = "x86_64")]
-fn smoke_acpi_mcfg_ecam_base() -> TestResult {
-    // QEMU q35 places ECAM at 0xB000_0000; MCFG should report the
-    // same address that the bus walker successfully used.
-    let rsdp = match narf_acpi::cached_rsdp() {
-        Some(p) => p,
-        None => return TestResult::Fail("no boot-time RSDP cached"),
-    };
-    // SAFETY: cached RSDP, validated at boot.
-    let _ = unsafe { narf_acpi::parse_mcfg(rsdp) };
-    let base = match narf_acpi::mcfg_ecam_base() {
-        Some(b) => b,
-        None => return TestResult::Fail("MCFG didn't report a base"),
-    };
-    if base != 0xB000_0000 {
-        return TestResult::Fail("unexpected MCFG ECAM base");
-    }
-    TestResult::Pass
-}
-#[cfg(target_arch = "x86_64")]
-kernel_test!(smoke_acpi_mcfg_ecam_base);
+// `smoke_acpi_srat_synthetic_lapic_entry` migrated to acpi/src/tests.rs (subsystem `"acpi"`).
+
+
+// `smoke_acpi_madt_topology_present` migrated to acpi/src/tests.rs (subsystem `"acpi"`).
+
+
+// `smoke_acpi_mcfg_ecam_base` migrated to acpi/src/tests.rs (subsystem `"acpi"`).
+
 
 // `smoke_aml_namespace_built_at_boot` migrated to aml/src/tests.rs (subsystem `"aml"`).
 // `smoke_aml_synthetic_scope_and_name` migrated to aml/src/tests.rs (subsystem `"aml"`).
@@ -2495,224 +2367,17 @@ fn smoke_frame_free_routes_to_owning_node() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_frame_free_routes_to_owning_node);
 
-#[cfg(target_arch = "x86_64")]
-fn smoke_acpi_hmat_latency_lookup() -> TestResult {
-    // The xtask QEMU config publishes a 2x2 HMAT lat/bw matrix:
-    // same-node latency 10 ns, cross-node 20 ns. Verify the parser
-    // returns sane values for both axes.
-    let rsdp = match narf_acpi::cached_rsdp() {
-        Some(p) => p,
-        None => return TestResult::Fail("no boot-time RSDP cached"),
-    };
-    // SAFETY: cached RSDP, validated at boot.
-    let _ = unsafe { narf_acpi::parse_hmat(rsdp) };
-    if !narf_acpi::is_hmat_known() {
-        return TestResult::Fail("HMAT not parsed");
-    }
-    let same = narf_acpi::hmat_value(narf_acpi::HmatLatBwKind::AccessLatency, 0, 0, 0);
-    let cross = narf_acpi::hmat_value(narf_acpi::HmatLatBwKind::AccessLatency, 0, 0, 1);
-    let (same, cross) = match (same, cross) {
-        (Some(s), Some(c)) => (s, c),
-        _ => return TestResult::Fail("HMAT didn't return both lookups"),
-    };
-    if cross <= same {
-        return TestResult::Fail("cross-node latency should exceed same-node");
-    }
-    TestResult::Pass
-}
-#[cfg(target_arch = "x86_64")]
-kernel_test!(smoke_acpi_hmat_latency_lookup);
+// `smoke_acpi_hmat_latency_lookup` migrated to acpi/src/tests.rs (subsystem `"acpi"`).
 
-#[cfg(target_arch = "x86_64")]
-fn smoke_acpi_hmat_mem_attrs_present() -> TestResult {
-    let rsdp = match narf_acpi::cached_rsdp() {
-        Some(p) => p,
-        None => return TestResult::Fail("no boot-time RSDP cached"),
-    };
-    // SAFETY: cached RSDP, validated at boot.
-    let _ = unsafe { narf_acpi::parse_hmat(rsdp) };
-    let mut buf = [narf_acpi::HmatMemAttr::default(); narf_acpi::MAX_HMAT_MEM_ATTRS];
-    let n = narf_acpi::copy_hmat_mem_attrs(&mut buf);
-    if n < 2 {
-        return TestResult::Fail("expected >=2 HMAT memory-proximity attrs");
-    }
-    TestResult::Pass
-}
-#[cfg(target_arch = "x86_64")]
-kernel_test!(smoke_acpi_hmat_mem_attrs_present);
 
-fn smoke_acpi_pmtt_synthetic_dimm_entry() -> TestResult {
-    // Synthetic PMTT body: 1 socket containing 1 memory controller
-    // containing 2 DIMMs. Verify the hierarchical decoder threads
-    // socket id and controller id down to the DIMM entries.
-    narf_acpi::__reset_for_test();
+// `smoke_acpi_hmat_mem_attrs_present` migrated to acpi/src/tests.rs (subsystem `"acpi"`).
 
-    // The synthetic-body shim isn't exposed for PMTT (the real
-    // parser walks hierarchically); construct a complete table
-    // body and call parse_pmtt against an in-memory pointer.
-    // We're test-only here, so a heap allocation is fine.
-    use alloc::vec::Vec;
-    let mut buf: Vec<u8> = Vec::new();
-    // SDT header (36) + memory-device-count (4) = 40 bytes.
-    buf.extend_from_slice(b"PMTT");
-    let len_pos = buf.len();
-    buf.extend_from_slice(&0u32.to_le_bytes()); // length placeholder
-    buf.push(1); // revision
-    buf.push(0); // checksum placeholder
-    buf.extend_from_slice(b"NARFCO");
-    buf.extend_from_slice(b"NARFTBL_");
-    buf.extend_from_slice(&0u32.to_le_bytes()); // OEM revision
-    buf.extend_from_slice(&0u32.to_le_bytes()); // creator id
-    buf.extend_from_slice(&0u32.to_le_bytes()); // creator revision
-    buf.extend_from_slice(&2u32.to_le_bytes()); // memory device count
 
-    // Socket header is 12 bytes; memory ctrl 12 bytes; each DIMM 12 bytes.
-    // Total socket length = 12 + 12 + 12 + 12 = 48.
-    let socket_start = buf.len();
-    buf.push(0); // type=Socket
-    buf.push(0); // reserved
-    buf.extend_from_slice(&48u16.to_le_bytes()); // length
-    buf.extend_from_slice(&0u16.to_le_bytes()); // flags
-    buf.extend_from_slice(&0u16.to_le_bytes()); // reserved
-    buf.extend_from_slice(&7u16.to_le_bytes()); // socket id = 7
-    buf.extend_from_slice(&0u16.to_le_bytes()); // reserved
+// `smoke_acpi_pmtt_synthetic_dimm_entry` migrated to acpi/src/tests.rs (subsystem `"acpi"`).
 
-    // Memory controller (length = 12 + 2*12 = 36).
-    buf.push(1); // type=MemCtrl
-    buf.push(0);
-    buf.extend_from_slice(&36u16.to_le_bytes());
-    buf.extend_from_slice(&0u16.to_le_bytes());
-    buf.extend_from_slice(&0u16.to_le_bytes());
-    buf.extend_from_slice(&3u16.to_le_bytes()); // ctrl id = 3
-    buf.extend_from_slice(&0u16.to_le_bytes());
 
-    // DIMM 1 (length 12).
-    buf.push(2);
-    buf.push(0);
-    buf.extend_from_slice(&12u16.to_le_bytes());
-    buf.extend_from_slice(&0u16.to_le_bytes());
-    buf.extend_from_slice(&0u16.to_le_bytes());
-    buf.extend_from_slice(&0xAAAA_BBBBu32.to_le_bytes()); // smbios
+// `smoke_acpi_srat_synthetic_memory_entry` migrated to acpi/src/tests.rs (subsystem `"acpi"`).
 
-    // DIMM 2.
-    buf.push(2);
-    buf.push(0);
-    buf.extend_from_slice(&12u16.to_le_bytes());
-    buf.extend_from_slice(&0u16.to_le_bytes());
-    buf.extend_from_slice(&0u16.to_le_bytes());
-    buf.extend_from_slice(&0xCCCC_DDDDu32.to_le_bytes());
-    let _ = socket_start;
-
-    // Patch length in header.
-    let total_len = buf.len() as u32;
-    buf[len_pos..len_pos + 4].copy_from_slice(&total_len.to_le_bytes());
-
-    // Patch checksum so the parser accepts the table.
-    let sum: u8 = buf.iter().fold(0u8, |a, b| a.wrapping_add(*b));
-    let cksum_off = 9;
-    buf[cksum_off] = (0u8).wrapping_sub(sum);
-
-    // Build a fake XSDT pointing at this PMTT, and an RSDP pointing
-    // at that XSDT. All three live in our heap buffer; the parser
-    // reads them via `*const u8` ptrs which is fine in-process.
-    let pmtt_phys = buf.as_ptr() as u64;
-
-    let mut xsdt: Vec<u8> = Vec::new();
-    xsdt.extend_from_slice(b"XSDT");
-    let xlen_pos = xsdt.len();
-    xsdt.extend_from_slice(&0u32.to_le_bytes());
-    xsdt.push(1); // revision
-    xsdt.push(0); // checksum
-    xsdt.extend_from_slice(b"NARFCO");
-    xsdt.extend_from_slice(b"NARFTBL_");
-    xsdt.extend_from_slice(&0u32.to_le_bytes());
-    xsdt.extend_from_slice(&0u32.to_le_bytes());
-    xsdt.extend_from_slice(&0u32.to_le_bytes());
-    xsdt.extend_from_slice(&pmtt_phys.to_le_bytes());
-    let total_xlen = xsdt.len() as u32;
-    xsdt[xlen_pos..xlen_pos + 4].copy_from_slice(&total_xlen.to_le_bytes());
-    let xsum: u8 = xsdt.iter().fold(0u8, |a, b| a.wrapping_add(*b));
-    xsdt[9] = (0u8).wrapping_sub(xsum);
-    let xsdt_phys = xsdt.as_ptr() as u64;
-
-    let mut rsdp = [0u8; 36];
-    rsdp[..8].copy_from_slice(b"RSD PTR ");
-    rsdp[15] = 2; // revision >= 2 → use XSDT
-    rsdp[24..32].copy_from_slice(&xsdt_phys.to_le_bytes());
-    let v1_sum: u8 = rsdp[..20].iter().fold(0u8, |a, b| a.wrapping_add(*b));
-    rsdp[8] = (0u8).wrapping_sub(v1_sum);
-    let rsdp_phys = narf_memory::PhysAddr::new(rsdp.as_ptr() as u64);
-
-    // SAFETY: pointers refer to live in-process buffers backed by
-    // the heap; reads are bounded by the encoded lengths.
-    let n = match unsafe { narf_acpi::parse_pmtt(rsdp_phys) } {
-        Ok(n) => n,
-        Err(e) => {
-            // Keep buffers alive across the parse (Vec lifetimes).
-            let _ = (buf, xsdt, rsdp);
-            return TestResult::Fail(match e {
-                narf_acpi::AcpiError::BadRsdpSignature => "bad rsdp sig",
-                narf_acpi::AcpiError::BadRsdpChecksum => "bad rsdp cksum",
-                narf_acpi::AcpiError::NoXsdt => "no xsdt",
-                narf_acpi::AcpiError::BadXsdtSignature => "bad xsdt sig",
-                narf_acpi::AcpiError::NoSrat => "no pmtt",
-                narf_acpi::AcpiError::BadTableChecksum => "bad table cksum",
-            });
-        }
-    };
-    if n != 4 {
-        let _ = (buf, xsdt, rsdp);
-        return TestResult::Fail("expected 4 PMTT structures (1+1+2)");
-    }
-    let (s, c, d) = narf_acpi::pmtt_counts();
-    if (s, c, d) != (1, 1, 2) {
-        let _ = (buf, xsdt, rsdp);
-        return TestResult::Fail("PMTT counts wrong");
-    }
-    let mut dimms = [narf_acpi::PmttDimm::default(); narf_acpi::MAX_PMTT_DIMMS];
-    let dn = narf_acpi::copy_pmtt_dimms(&mut dimms);
-    if dn != 2 {
-        let _ = (buf, xsdt, rsdp);
-        return TestResult::Fail("DIMM table didn't capture 2 entries");
-    }
-    if dimms[0].socket_id != 7 || dimms[0].controller_id != 3 {
-        let _ = (buf, xsdt, rsdp);
-        return TestResult::Fail("DIMM 0 parent ids wrong");
-    }
-    if dimms[1].smbios_handle != 0xCCCC_DDDD {
-        let _ = (buf, xsdt, rsdp);
-        return TestResult::Fail("DIMM 1 smbios handle wrong");
-    }
-    let _ = (buf, xsdt, rsdp);
-    TestResult::Pass
-}
-kernel_test!(smoke_acpi_pmtt_synthetic_dimm_entry);
-
-fn smoke_acpi_srat_synthetic_memory_entry() -> TestResult {
-    // Type-1 memory affinity entry: base 0x1_0000_0000, length
-    // 0x1000_0000, proximity 1, enabled.
-    narf_acpi::__reset_for_test();
-    let mut entry = [0u8; 40];
-    entry[0] = 1; // type
-    entry[1] = 40; // length
-    entry[2..6].copy_from_slice(&1u32.to_le_bytes()); // proximity
-    entry[8..16].copy_from_slice(&0x1_0000_0000u64.to_le_bytes());
-    entry[16..24].copy_from_slice(&0x1000_0000u64.to_le_bytes());
-    entry[28..32].copy_from_slice(&1u32.to_le_bytes()); // flags=enabled
-                                                        // SAFETY: test-only entry point.
-    let n = unsafe { narf_acpi::__parse_srat_body_for_test(&entry) };
-    if n != 1 {
-        return TestResult::Fail("expected 1 entry");
-    }
-    if narf_acpi::memory_node(0x1_0000_1000) != Some(1) {
-        return TestResult::Fail("addr inside range should map to node 1");
-    }
-    if narf_acpi::memory_node(0).is_some() {
-        return TestResult::Fail("addr outside range should be None");
-    }
-    TestResult::Pass
-}
-kernel_test!(smoke_acpi_srat_synthetic_memory_entry);
 
 // `smoke_scheduler_per_cpu_pin_to_bsp` migrated to scheduler/src/tests.rs (subsystem `"scheduler"`).
 
@@ -5924,24 +5589,8 @@ kernel_test!(smoke_block_deadline_tags_are_monotonic);
 // `smoke_aml_gpe_dispatch_aml` migrated to aml/src/tests.rs (subsystem `"aml"`).
 
 
-#[cfg(target_arch = "x86_64")]
-fn smoke_acpi_gpe_block_parsed_at_boot() -> TestResult {
-    // If the FADT advertised a non-zero GPE0 block, gpe0_block() is Some;
-    // if not (e.g. QEMU config with no GPE block), that's acceptable too.
-    // Either way, this test verifies the parse path ran without panicking.
-    match narf_acpi::gpe0_block() {
-        None => TestResult::Skip("FADT carried no GPE0 block (QEMU config); parse OK"),
-        Some(info) => {
-            // Sanity: address and byte_count must be non-zero when Some.
-            if info.address == 0 || info.byte_count == 0 {
-                return TestResult::Fail("gpe0_block Some but address/byte_count zero");
-            }
-            TestResult::Pass
-        }
-    }
-}
-#[cfg(target_arch = "x86_64")]
-kernel_test!(smoke_acpi_gpe_block_parsed_at_boot);
+// `smoke_acpi_gpe_block_parsed_at_boot` migrated to acpi/src/tests.rs (subsystem `"acpi"`).
+
 
 // ── _PRT / _CRS bridge smoke tests ───────────────────────────────────────────
 //
