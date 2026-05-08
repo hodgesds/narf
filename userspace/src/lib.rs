@@ -48,6 +48,8 @@ pub mod syscall;
 pub mod tls;
 pub mod user_task;
 
+mod tests;
+
 pub use interp::{lookup_interpreter, register_interpreter};
 
 pub use fd::{FdEntry, FdTable, FD_CLOEXEC};
