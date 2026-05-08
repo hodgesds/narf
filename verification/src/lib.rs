@@ -764,10 +764,10 @@ kernel_test!(smoke_virtio_mmio_wrong_magic);
 
 fn smoke_block_device_trait() -> TestResult {
     use narf_block::{BlockDevice, BlockOp, BlockRequest, QosHint};
-    use narf_capabilities::{Cap, Read, Rights};
+    use narf_capabilities::Read;
     use narf_drivers_virtio::blk::VirtioBlkDevice;
     use narf_drivers_virtio::VirtioMmioDevice;
-    use narf_io::{alloc_coherent, register};
+    use narf_io::{alloc_coherent, register_with_cap};
     use narf_lib::id::DomainId;
 
     narf_scheduler::init();
@@ -791,15 +791,10 @@ fn smoke_block_device_trait() -> TestResult {
     let Ok(buf) = alloc_coherent(512, DomainId::DRIVER_0) else {
         return TestResult::Fail("DMA alloc failed");
     };
-    let index = register(buf);
-    let cap = unsafe {
-        Cap::<narf_io::DmaBuffer, Read>::mint(narf_capabilities::CapSlot::new(
-            1,
-            index,
-            Read::BITS,
-            narf_capabilities::CapKind::DmaBuffer as u32,
-        ))
-    };
+    let cap_w = register_with_cap(buf);
+    let cap: narf_capabilities::Cap<narf_io::DmaBuffer, Read> = cap_w
+        .derive::<Read>()
+        .expect("derive Read from Write");
 
     let req = BlockRequest {
         op: BlockOp::Read,
@@ -823,11 +818,11 @@ fn smoke_exit_gate_virtio_blk() -> TestResult {
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicU8, Ordering};
     use narf_block::{BlockCompletion, BlockOp, BlockRequest, QosHint};
-    use narf_capabilities::{Cap, Read, Rights};
+    use narf_capabilities::Read;
     use narf_drivers_virtio::blk::VirtioBlkDevice;
     use narf_drivers_virtio::class_blk::VirtioBlkServer;
     use narf_drivers_virtio::VirtioMmioDevice;
-    use narf_io::{alloc_coherent, register};
+    use narf_io::{alloc_coherent, register_with_cap};
     use narf_lib::id::DomainId;
 
     static OUTCOME: AtomicU8 = AtomicU8::new(0);
@@ -861,15 +856,10 @@ fn smoke_exit_gate_virtio_blk() -> TestResult {
         let Ok(buf) = alloc_coherent(512, DomainId::DRIVER_0) else {
             return;
         };
-        let index = register(buf);
-        let cap = unsafe {
-            Cap::<narf_io::DmaBuffer, Read>::mint(narf_capabilities::CapSlot::new(
-                1,
-                index,
-                Read::BITS,
-                narf_capabilities::CapKind::DmaBuffer as u32,
-            ))
-        };
+        let cap_w = register_with_cap(buf);
+        let cap: narf_capabilities::Cap<narf_io::DmaBuffer, Read> = cap_w
+            .derive::<Read>()
+            .expect("derive Read from Write");
 
         let req = BlockRequest {
             op: BlockOp::Read,
@@ -5137,6 +5127,26 @@ fn smoke_filesystem_resolve_absolute_picks_longest_prefix() -> TestResult {
 kernel_test!(smoke_filesystem_resolve_absolute_picks_longest_prefix);
 
 fn smoke_filesystem_memfs_unlink_round_trip() -> TestResult {
+    fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
+        use core::pin::Pin;
+        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        fn raw_waker() -> RawWaker {
+            unsafe fn no_clone(_: *const ()) -> RawWaker {
+                raw_waker()
+            }
+            unsafe fn no_op(_: *const ()) {}
+            const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
+            RawWaker::new(core::ptr::null(), &VTAB)
+        }
+        let waker = unsafe { Waker::from_raw(raw_waker()) };
+        let mut cx = Context::from_waker(&waker);
+        let pinned = unsafe { Pin::new_unchecked(&mut fut) };
+        match pinned.poll(&mut cx) {
+            Poll::Ready(v) => Some(v),
+            Poll::Pending => None,
+        }
+    }
+
     // Mount a MemFs at /test_unlink seeded with one file. The first
     // resolve_parent_absolute → unlink should succeed; the second
     // should hit NotFound (file already gone).
@@ -5161,9 +5171,9 @@ fn smoke_filesystem_memfs_unlink_round_trip() -> TestResult {
 
     // First unlink: success.
     let r1 = registry().resolve_parent_absolute("/test_unlink/doomed", |_fs, parent, leaf| {
-        parent.unlink(leaf)
+        poll_once(parent.unlink(leaf))
     });
-    if !matches!(r1, Some(Ok(()))) {
+    if !matches!(r1, Some(Some(Ok(())))) {
         return TestResult::Fail("first unlink should succeed");
     }
 
@@ -5177,9 +5187,9 @@ fn smoke_filesystem_memfs_unlink_round_trip() -> TestResult {
 
     // Second unlink: NotFound.
     let r2 = registry().resolve_parent_absolute("/test_unlink/doomed", |_fs, parent, leaf| {
-        parent.unlink(leaf)
+        poll_once(parent.unlink(leaf))
     });
-    if !matches!(r2, Some(Err(FsError::NotFound))) {
+    if !matches!(r2, Some(Some(Err(FsError::NotFound)))) {
         return TestResult::Fail("second unlink should report NotFound");
     }
 
@@ -9475,6 +9485,18 @@ const NARF_TESTBIN_ELF: &[u8] = include_bytes!(env!("NARF_TESTBIN_ELF_X86_64"));
 #[cfg(all(target_arch = "aarch64", feature = "user-mode-testbin"))]
 const NARF_TESTBIN_ELF: &[u8] = include_bytes!(env!("NARF_TESTBIN_ELF_AARCH64"));
 
+#[cfg(all(target_arch = "x86_64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+pub const NARF_INIT_ELF: &[u8] = include_bytes!(env!("NARF_INIT_ELF_X86_64"));
+
+#[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+pub const NARF_INIT_ELF: &[u8] = include_bytes!(env!("NARF_INIT_ELF_AARCH64"));
+
+#[cfg(all(target_arch = "x86_64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+pub const NARF_SHELL_ELF: &[u8] = include_bytes!(env!("NARF_SHELL_ELF_X86_64"));
+
+#[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+pub const NARF_SHELL_ELF: &[u8] = include_bytes!(env!("NARF_SHELL_ELF_AARCH64"));
+
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-testbin"))]
 fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
     // Load the real Rust no_std binary `narf-testbin` into a fresh
@@ -10902,7 +10924,7 @@ fn smoke_userspace_ftruncate_grows_and_shrinks_memfile() -> TestResult {
     }
 
     // Grow to 16. The new tail is zero-filled per POSIX.
-    if ops.truncate(16).is_err() {
+    if poll_once(ops.truncate(16)).and_then(|r| r.ok()).is_none() {
         return TestResult::Fail("truncate grow failed");
     }
     if ops.stat().size != 16 {
@@ -10919,7 +10941,7 @@ fn smoke_userspace_ftruncate_grows_and_shrinks_memfile() -> TestResult {
 
     // Shrink to 3. Re-stat must report 3 bytes; read confirms tail
     // is gone.
-    if ops.truncate(3).is_err() {
+    if poll_once(ops.truncate(3)).and_then(|r| r.ok()).is_none() {
         return TestResult::Fail("truncate shrink failed");
     }
     if ops.stat().size != 3 {
@@ -11913,7 +11935,7 @@ fn smoke_userspace_fallocate_extends_and_zero_ranges_memfile() -> TestResult {
     // Direct trait round-trip — the syscall path adds nothing
     // beyond fd-table indirection and the smoke for that already
     // exists in the ftruncate test.
-    if ops.truncate(20).is_err() {
+    if poll_once(ops.truncate(20)).and_then(|r| r.ok()).is_none() {
         return TestResult::Fail("baseline truncate failed");
     }
     if ops.stat().size != 20 {
