@@ -176,6 +176,53 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         }
     }
 
+    // COW write-fault recovery (user-mode only). When a fork()'d
+    // process writes a shared, write-protected page for the first
+    // time, #PF lands here with the present + write + user bits
+    // set in the error code. We resolve via the active user AS:
+    //   - cow_split_on_write allocates a private frame, memcpys
+    //     the shared bytes, dec_refs the old frame, restores
+    //     WRITE on the region.
+    //   - remap_page rewrites the live PTE so the next user-mode
+    //     instruction succeeds.
+    // On any failure we fall through to the panic path so the
+    // existing diagnostic still fires on genuine bugs.
+    if frame.vector == 14 && (frame.cs & 3) == 3 {
+        // PF error code (Intel SDM Vol. 3 §4.7):
+        //   bit 0 (P): set if fault was a present-page violation
+        //   bit 1 (W): set if write
+        //   bit 2 (U): set if CPL=3
+        const PF_P: u64 = 1 << 0;
+        const PF_W: u64 = 1 << 1;
+        const PF_U: u64 = 1 << 2;
+        let ec = frame.error_code;
+        if (ec & (PF_P | PF_W | PF_U)) == (PF_P | PF_W | PF_U) {
+            let cr2: u64;
+            // SAFETY: reading CR2 at CPL=0 is always defined.
+            unsafe {
+                core::arch::asm!("mov {v}, cr2", v = out(reg) cr2,
+                    options(nostack, preserves_flags));
+            }
+            if let Some(as_arc) = narf_userspace::active_user_as() {
+                let v = narf_memory::VirtAddr::new(cr2);
+                // SAFETY: low-4-GiB identity map is live, frame
+                // allocator + COW refcount table are
+                // initialised at boot. AS is the active user AS
+                // by construction (we just probed CPL=3).
+                let split_ok = unsafe { as_arc.cow_split_on_write(v) }.is_ok();
+                if split_ok {
+                    // SAFETY: same identity-map argument; the
+                    // region was just touched by cow_split_on_write
+                    // so it definitely exists.
+                    let remap_ok = unsafe { as_arc.remap_page(v) }.is_ok();
+                    if remap_ok {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     // Recoverable-probe path. `consume` is atomic: a second fault
     // inside the handler can't double-claim the recovery.
     let recovery = narf_arch::x86_64::probe::consume(frame.vector as u32, frame.error_code);

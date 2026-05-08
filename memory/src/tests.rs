@@ -1315,3 +1315,96 @@ fn smoke_memory_clone_for_fork_shares_frames_then_splits() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory", smoke_memory_clone_for_fork_shares_frames_then_splits);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_remap_page_picks_up_perms_and_phys() -> TestResult {
+    // After cow_split_on_write rewrites a region's per-page phys
+    // entry + restores WRITE on the region, remap_page must walk
+    // the live page table and re-install the PTE with the new
+    // values. Verify the walked-and-re-mapped page actually
+    // resolves (via paging::translate) to the new phys.
+    use crate::address_space::{AddressSpace, Region, RegionPerms};
+    use crate::frame::cow;
+    use crate::x86_64::paging::translate;
+    use crate::VirtAddr;
+
+    cow::__test_clear();
+    let mut a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("AddressSpace::new_for_user not available"),
+    };
+    let f1 = match crate::frame::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => return TestResult::Fail("alloc_frame f1"),
+    };
+    const VADDR: u64 = 0x0000_0080_0000_5000;
+    if a
+        .map_region(Region {
+            base: VirtAddr::new(VADDR),
+            len: 4096,
+            perms: RegionPerms::READ,
+            phys: alloc::vec![f1],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("map_region");
+    }
+    if unsafe { a.materialize() }.is_err() {
+        return TestResult::Fail("materialize");
+    }
+
+    // Confirm the initial PTE points at f1.
+    let initial = unsafe { translate(a.root, VirtAddr::new(VADDR)) };
+    if initial != Some(f1) {
+        return TestResult::Fail("initial PTE doesn't translate to f1");
+    }
+
+    // Swap the region's per-page phys entry to a fresh frame +
+    // give the region WRITE — mimicking what cow_split_on_write
+    // does. Then remap_page should walk and re-install the PTE.
+    let f2 = match crate::frame::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => return TestResult::Fail("alloc_frame f2"),
+    };
+    {
+        // Touch the region table directly through a synthetic
+        // post-split mutation. Production callers invoke
+        // cow_split_on_write which performs the same edit
+        // through its own lock-acquire path.
+        let lookup_before = a.lookup(VirtAddr::new(VADDR)).expect("region present");
+        if lookup_before.phys[0] != f1 {
+            return TestResult::Fail("pre-edit region.phys[0] mismatch");
+        }
+        // We don't have a direct mutator; cow_split_on_write
+        // covers this in its own test. Here we round-trip via
+        // unmap_region + map_region.
+        a.unmap_region(VirtAddr::new(VADDR));
+        if a
+            .map_region(Region {
+                base: VirtAddr::new(VADDR),
+                len: 4096,
+                perms: RegionPerms::READ | RegionPerms::WRITE,
+                phys: alloc::vec![f2],
+            })
+            .is_err()
+        {
+            return TestResult::Fail("re-map_region");
+        }
+    }
+
+    // remap_page picks up the new phys + flags.
+    if unsafe { a.remap_page(VirtAddr::new(VADDR)) }.is_err() {
+        return TestResult::Fail("remap_page");
+    }
+    let after = unsafe { translate(a.root, VirtAddr::new(VADDR)) };
+    if after != Some(f2) {
+        return TestResult::Fail("post-remap PTE doesn't translate to f2");
+    }
+
+    crate::frame::free_frame(crate::frame::PhysFrame::new(f1));
+    crate::frame::free_frame(crate::frame::PhysFrame::new(f2));
+    cow::__test_clear();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_remap_page_picks_up_perms_and_phys);

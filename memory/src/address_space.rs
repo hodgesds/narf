@@ -355,14 +355,12 @@ impl AddressSpace {
     /// already had refcount 1 (sole owner — no split needed,
     /// just regain WRITE).
     ///
-    /// FIXME(pf-handler-integration): the actual #PF handler in
-    /// `frame/src/x86_64/trap.rs` doesn't yet route user-mode
-    /// write-to-RO faults to this routine. Until that lands the
-    /// COW pages stay RO at the page-table level and the first
-    /// write triggers the kernel's panic path. Today this routine
-    /// is exercised only by the unit tests below; production
-    /// fork() callers see the AS-clone + RO marking, not the
-    /// split-on-write semantics.
+    /// The x86_64 #PF handler in `frame/src/x86_64/trap.rs` calls
+    /// this routine on user-mode write-to-RO faults (P+W+U bits
+    /// set in the error code), then calls [`Self::remap_page`] to
+    /// install the new PTE; production fork() callers therefore
+    /// observe true split-on-write semantics. Aarch64 page-fault
+    /// integration lands alongside the EL0 ↔ EL1 trap pipeline.
     ///
     /// # Safety
     /// - The low-4-GiB identity map must be live (used to memcpy
@@ -411,6 +409,62 @@ impl AddressSpace {
         g[region_idx].phys[page_idx] = new_phys;
         g[region_idx].perms = g[region_idx].perms | RegionPerms::WRITE;
         Ok(())
+    }
+
+    /// Re-install the PTE for the page containing `vaddr` to
+    /// reflect the region's current `phys[i]` + `perms`. Used by
+    /// the page-fault handler after `cow_split_on_write` has
+    /// repointed the per-page phys entry and restored WRITE — the
+    /// PTE in the live page table still says RO until we walk it.
+    ///
+    /// Implementation: unmap the page (so map_4kb's "AlreadyMapped"
+    /// guard doesn't reject), then map it again with the
+    /// post-split phys + flags.
+    ///
+    /// # Safety
+    /// - `self.root` must be a valid PML4 (per `new_for_user`).
+    /// - The caller must serialise this against any concurrent
+    ///   mutation of the same region.
+    #[cfg(target_arch = "x86_64")]
+    pub unsafe fn remap_page(&self, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
+        use crate::x86_64::paging::{map_4kb, unmap_4kb, MapError, PtFlags};
+        if self.root.as_u64() == 0 {
+            return Err(AddressSpaceError::OutOfRange);
+        }
+        let page_va = VirtAddr::new(vaddr.as_u64() & !0xFFF);
+        let g = self.regions.lock();
+        let v = page_va.as_u64();
+        let region = g
+            .iter()
+            .find(|r| {
+                let base = r.base.as_u64();
+                v >= base && v < base + r.len
+            })
+            .ok_or(AddressSpaceError::Unmapped)?;
+        let page_idx = ((v - region.base.as_u64()) >> 12) as usize;
+        let phys = region.phys[page_idx];
+
+        let mut flags = PtFlags::USER;
+        if region.perms.contains(RegionPerms::WRITE) {
+            flags = flags | PtFlags::WRITABLE;
+        }
+        if !region.perms.contains(RegionPerms::EXEC) {
+            flags = flags | PtFlags::NO_EXEC;
+        }
+
+        // SAFETY: root is a valid PML4; the page we're touching
+        // sits inside `region` per the lookup above.
+        let _ = unsafe { unmap_4kb(self.root, page_va) };
+        match unsafe { map_4kb(self.root, page_va, phys, flags) } {
+            Ok(()) => Ok(()),
+            Err(MapError::AlreadyMapped) => Ok(()),
+            Err(_) => Err(AddressSpaceError::NotImplemented),
+        }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    pub unsafe fn remap_page(&self, _vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
+        Err(AddressSpaceError::NotImplemented)
     }
 
     /// Find the region covering `vaddr`, if any. Returns a copy
