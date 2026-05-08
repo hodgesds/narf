@@ -3089,3 +3089,63 @@ fn smoke_h3_frame_round_trip() -> TestResult {
 }
 
 kernel_test_in!("net/h3", smoke_h3_frame_round_trip);
+
+// ── relocated from verification (subsystem 'net') ──
+
+fn smoke_net_ipv4_checksum() -> TestResult {
+    use crate::pkt::ip_checksum;
+    // RFC 1071 example: header = 0x45 0x00 0x00 0x73 0x00 0x00
+    //                            0x40 0x00 0x40 0x11 0x00 0x00
+    //                            0xc0 0xa8 0x00 0x01
+    //                            0xc0 0xa8 0x00 0xc7
+    // Expected checksum: 0xb861.
+    let header = [
+        0x45, 0x00, 0x00, 0x73, 0x00, 0x00, 0x40, 0x00, 0x40, 0x11, 0x00, 0x00, 0xc0, 0xa8, 0x00,
+        0x01, 0xc0, 0xa8, 0x00, 0xc7,
+    ];
+    let cs = ip_checksum(&header);
+    if cs != 0xb861 {
+        return TestResult::Fail("ip_checksum mismatch with RFC 1071 example");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net", smoke_net_ipv4_checksum);
+
+fn smoke_net_icmp_echo_builder() -> TestResult {
+    use crate::pkt::*;
+    let mut buf = [0u8; 64];
+    let n = build_icmp_echo_request(
+        &mut buf,
+        [0x52, 0x54, 0x00, 0x12, 0x34, 0x56],
+        [0x52, 0x55, 0x0A, 0x00, 0x02, 0x02],
+        [10, 0, 2, 15],
+        [10, 0, 2, 2],
+        0x1234,
+        0x0001,
+    )
+    .unwrap_or(0);
+    if n != ETH_HDR_LEN + IPV4_HDR_LEN + 8 {
+        return TestResult::Fail("icmp echo len wrong");
+    }
+    // Re-parse.
+    let (eth, body) = parse_eth_header(&buf[..n]).expect("eth");
+    if eth.ethertype != ETHERTYPE_IPV4 {
+        return TestResult::Fail("ethertype != IPv4");
+    }
+    let (ip, payload) = parse_ipv4(body).expect("ipv4");
+    if ip.protocol != IP_PROTO_ICMP {
+        return TestResult::Fail("ip proto != ICMP");
+    }
+    if ip.dst_ip != [10, 0, 2, 2] {
+        return TestResult::Fail("ip dst");
+    }
+    let (icmp, _) = parse_icmp_echo(payload).expect("icmp");
+    if icmp.kind != ICMP_ECHO_REQUEST {
+        return TestResult::Fail("icmp kind != echo request");
+    }
+    if icmp.identifier != 0x1234 || icmp.seq != 0x0001 {
+        return TestResult::Fail("icmp id/seq");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net", smoke_net_icmp_echo_builder);

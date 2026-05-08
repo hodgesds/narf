@@ -1398,6 +1398,7 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-scheduler",
+ "narf-time",
 ]
 
 [[package]]

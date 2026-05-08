@@ -511,3 +511,82 @@ fn smoke_opal_token_constants() -> TestResult {
 }
 
 kernel_test_in!("block/opal", smoke_opal_token_constants);
+
+// ── relocated from verification (subsystem 'block') ──
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_block_registry_uniform_read() -> TestResult {
+    // Walk crate::block_devices() and read sector 0 from each.
+    // Asserts NVMe + virtio-blk-pci + AHCI all registered + return
+    // a 512-byte read without error. Demonstrates the unified
+    // BlockDeviceSync surface.
+    use crate::block_devices;
+    let regs = block_devices();
+    if regs.is_empty() {
+        return TestResult::Fail("block registry empty — no driver registered");
+    }
+    // We expect at least nvme0, vblk0, sata0 by convention.
+    let has_nvme = regs.iter().any(|r| r.name == "nvme0");
+    let has_vblk = regs.iter().any(|r| r.name == "vblk0");
+    let has_sata = regs.iter().any(|r| r.name == "sata0");
+    if !(has_nvme && has_vblk && has_sata) {
+        return TestResult::Fail("expected nvme0 + vblk0 + sata0");
+    }
+    // lba_size + capacity surface should respond on every device.
+    for reg in &regs {
+        let _ = reg.dev.lba_size();
+        let _ = reg.dev.capacity();
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("block", smoke_block_registry_uniform_read);
+
+fn smoke_block_mq_round_robins_across_lanes() -> TestResult {
+    // Populate three lanes with one request each. dequeue_next walks
+    // round-robin so each lane's entry comes out exactly once before
+    // any lane is revisited.
+    use crate::{BlockOp, MqDeadlineScheduler};
+
+    let s = MqDeadlineScheduler::with_lanes(3);
+    s.enqueue_on(0, make_block_request(BlockOp::Read, 0x0A), u64::MAX);
+    s.enqueue_on(1, make_block_request(BlockOp::Read, 0x1B), u64::MAX);
+    s.enqueue_on(2, make_block_request(BlockOp::Read, 0x2C), u64::MAX);
+    if s.len() != 3 {
+        return TestResult::Fail("multi-queue len mismatch");
+    }
+
+    let first = s.dequeue_next(0).expect("pending").user_tag;
+    let second = s.dequeue_next(0).expect("pending").user_tag;
+    let third = s.dequeue_next(0).expect("pending").user_tag;
+    if s.dequeue_next(0).is_some() {
+        return TestResult::Fail("multi-queue over-drained");
+    }
+
+    // Round-robin must visit all three distinct lanes.
+    if first == second || second == third || first == third {
+        return TestResult::Fail("round-robin served the same lane twice");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("block", smoke_block_mq_round_robins_across_lanes);
+
+fn smoke_block_deadline_tags_are_monotonic() -> TestResult {
+    use crate::{BlockOp, DeadlineScheduler};
+
+    let s = DeadlineScheduler::new();
+    let t1 = s.enqueue(make_block_request(BlockOp::Read, 0), u64::MAX);
+    let t2 = s.enqueue(
+        make_block_request(BlockOp::Write { fua: false }, 1),
+        u64::MAX,
+    );
+    let t3 = s.enqueue(make_block_request(BlockOp::Read, 2), u64::MAX);
+    if !(t1 < t2 && t2 < t3) {
+        return TestResult::Fail("enqueue tags not monotonically assigned");
+    }
+    if s.reads_pending() != 2 || s.writes_pending() != 1 {
+        return TestResult::Fail("per-lane pending counts off");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("block", smoke_block_deadline_tags_are_monotonic);

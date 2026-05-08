@@ -97,3 +97,25 @@ fn smoke_lib_bug_on_false_is_silent() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("lib", smoke_lib_bug_on_false_is_silent);
+
+// ── relocated from verification (subsystem 'lib') ──
+
+fn smoke_percpu_storage_isolation() -> TestResult {
+    // PerCpu<T: Copy> — verify the BSP cell is reachable + iter()
+    // yields MAX_CPUS entries. Mutation requires T's interior
+    // mutability (e.g. T = AtomicU32 once PerCpu drops the Copy
+    // bound, or T = u32 wrapped in a UnsafeCell-bearing newtype);
+    // for this smoke the structural surface is what matters.
+    use crate::percpu::PerCpu;
+    static SEED: PerCpu<u32> = PerCpu::new(0x4242);
+    let v = *SEED.this_cpu();
+    if v != 0x4242 {
+        return TestResult::Fail("PerCpu init didn't propagate to BSP cell");
+    }
+    let n = SEED.iter().count();
+    if n != crate::percpu::MAX_CPUS {
+        return TestResult::Fail("PerCpu iter() count mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("lib", smoke_percpu_storage_isolation);

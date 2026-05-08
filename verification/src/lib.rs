@@ -29,6 +29,19 @@
 
 extern crate alloc;
 
+// Force-link crates that contribute tests via the `narf.tests` link
+// section but whose public surface is not otherwise referenced from
+// this mega-lib. Without a load-bearing reference the rlib linker
+// drops the crate's compilation unit, taking its kernel-test
+// `static ENTRY` writers with it. `extern crate` plus a `#[used]`
+// static touching a real symbol from the crate is the minimum
+// needed to keep the unit alive.
+extern crate narf_observability;
+#[used]
+static __FORCE_LINK_OBS: fn() -> usize = || {
+    narf_observability::install_count()
+};
+
 use core::fmt::Write;
 
 use narf_console::Writer;
@@ -1628,96 +1641,19 @@ kernel_test!(smoke_msix_program_block);
 
 // AHCI smokes migrated to `drivers/storage/src/tests.rs`
 // (subsystem `drivers/storage/ahci`).
-#[cfg(target_arch = "x86_64")]
-fn smoke_block_registry_uniform_read() -> TestResult {
-    // Walk narf_block::block_devices() and read sector 0 from each.
-    // Asserts NVMe + virtio-blk-pci + AHCI all registered + return
-    // a 512-byte read without error. Demonstrates the unified
-    // BlockDeviceSync surface.
-    use narf_block::block_devices;
-    let regs = block_devices();
-    if regs.is_empty() {
-        return TestResult::Fail("block registry empty — no driver registered");
-    }
-    // We expect at least nvme0, vblk0, sata0 by convention.
-    let has_nvme = regs.iter().any(|r| r.name == "nvme0");
-    let has_vblk = regs.iter().any(|r| r.name == "vblk0");
-    let has_sata = regs.iter().any(|r| r.name == "sata0");
-    if !(has_nvme && has_vblk && has_sata) {
-        return TestResult::Fail("expected nvme0 + vblk0 + sata0");
-    }
-    // lba_size + capacity surface should respond on every device.
-    for reg in &regs {
-        let _ = reg.dev.lba_size();
-        let _ = reg.dev.capacity();
-    }
-    TestResult::Pass
-}
-#[cfg(target_arch = "x86_64")]
-kernel_test!(smoke_block_registry_uniform_read);
+// `smoke_block_registry_uniform_read` migrated to block/src/tests.rs (subsystem `"block"`).
+
 
 // xhci/msc/hid smokes migrated to `drivers/usb/src/tests.rs`
 // (subsystems `drivers/usb/xhci`, `drivers/usb/msc`, `drivers/usb/hid`).
 
 // `smoke_net_arp_request_builder` migrated to net/src/tests.rs (subsystem `"net"`).
 
-fn smoke_net_ipv4_checksum() -> TestResult {
-    use narf_net::pkt::ip_checksum;
-    // RFC 1071 example: header = 0x45 0x00 0x00 0x73 0x00 0x00
-    //                            0x40 0x00 0x40 0x11 0x00 0x00
-    //                            0xc0 0xa8 0x00 0x01
-    //                            0xc0 0xa8 0x00 0xc7
-    // Expected checksum: 0xb861.
-    let header = [
-        0x45, 0x00, 0x00, 0x73, 0x00, 0x00, 0x40, 0x00, 0x40, 0x11, 0x00, 0x00, 0xc0, 0xa8, 0x00,
-        0x01, 0xc0, 0xa8, 0x00, 0xc7,
-    ];
-    let cs = ip_checksum(&header);
-    if cs != 0xb861 {
-        return TestResult::Fail("ip_checksum mismatch with RFC 1071 example");
-    }
-    TestResult::Pass
-}
-kernel_test!(smoke_net_ipv4_checksum);
+// `smoke_net_ipv4_checksum` migrated to net/src/tests.rs (subsystem `"net"`).
 
-fn smoke_net_icmp_echo_builder() -> TestResult {
-    use narf_net::pkt::*;
-    let mut buf = [0u8; 64];
-    let n = build_icmp_echo_request(
-        &mut buf,
-        [0x52, 0x54, 0x00, 0x12, 0x34, 0x56],
-        [0x52, 0x55, 0x0A, 0x00, 0x02, 0x02],
-        [10, 0, 2, 15],
-        [10, 0, 2, 2],
-        0x1234,
-        0x0001,
-    )
-    .unwrap_or(0);
-    if n != ETH_HDR_LEN + IPV4_HDR_LEN + 8 {
-        return TestResult::Fail("icmp echo len wrong");
-    }
-    // Re-parse.
-    let (eth, body) = parse_eth_header(&buf[..n]).expect("eth");
-    if eth.ethertype != ETHERTYPE_IPV4 {
-        return TestResult::Fail("ethertype != IPv4");
-    }
-    let (ip, payload) = parse_ipv4(body).expect("ipv4");
-    if ip.protocol != IP_PROTO_ICMP {
-        return TestResult::Fail("ip proto != ICMP");
-    }
-    if ip.dst_ip != [10, 0, 2, 2] {
-        return TestResult::Fail("ip dst");
-    }
-    let (icmp, _) = parse_icmp_echo(payload).expect("icmp");
-    if icmp.kind != ICMP_ECHO_REQUEST {
-        return TestResult::Fail("icmp kind != echo request");
-    }
-    if icmp.identifier != 0x1234 || icmp.seq != 0x0001 {
-        return TestResult::Fail("icmp id/seq");
-    }
-    TestResult::Pass
-}
-kernel_test!(smoke_net_icmp_echo_builder);
+
+// `smoke_net_icmp_echo_builder` migrated to net/src/tests.rs (subsystem `"net"`).
+
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_net_e1000_arp_round_trip() -> TestResult {
@@ -1764,6 +1700,7 @@ fn smoke_net_e1000_arp_round_trip() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_net_e1000_arp_round_trip);
 
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_bound_drivers_inventory() -> TestResult {
     // After boot-time probe_all_pci, the bound-driver inventory
@@ -1791,160 +1728,17 @@ fn smoke_bound_drivers_inventory() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_bound_drivers_inventory);
 
-fn smoke_slab_alloc_free_round_trip() -> TestResult {
-    // Allocate one block from each size class, write a sentinel,
-    // free, re-allocate the same class, verify the new pointer
-    // can be written to (i.e. re-use works without corrupting the
-    // free list).
-    use core::alloc::Layout;
-    use narf_memory::slab;
-    for c in 0..slab::num_classes() {
-        let block_size = 16usize << c;
-        let layout = Layout::from_size_align(block_size, 16).unwrap();
-        let p1 = match slab::alloc(layout) {
-            Ok(p) => p,
-            Err(_) => return TestResult::Fail("class alloc#1 failed"),
-        };
-        // SAFETY: pointer just allocated; class block_size bytes valid.
-        unsafe {
-            for i in 0..block_size {
-                core::ptr::write_volatile(p1.as_ptr().add(i), 0xAA);
-            }
-        }
-        // SAFETY: same layout we allocated with.
-        unsafe {
-            slab::dealloc(p1, layout);
-        }
+// `smoke_slab_alloc_free_round_trip` migrated to memory/src/tests.rs (subsystem `"memory"`).
 
-        let p2 = match slab::alloc(layout) {
-            Ok(p) => p,
-            Err(_) => return TestResult::Fail("class alloc#2 failed"),
-        };
-        // The slab pushes onto the head of the free list, so the
-        // most recently freed block is the next one popped — `p2 == p1`
-        // in the single-thread case.
-        if p2 != p1 {
-            // Not strictly required (a multi-block-grown class may
-            // hand back a different block first); just ensure we
-            // can write without faulting.
-        }
-        // SAFETY: pointer just allocated.
-        unsafe {
-            for i in 0..block_size {
-                core::ptr::write_volatile(p2.as_ptr().add(i), 0x55);
-            }
-        }
-        // SAFETY: same layout.
-        unsafe {
-            slab::dealloc(p2, layout);
-        }
-    }
-    TestResult::Pass
-}
-kernel_test!(smoke_slab_alloc_free_round_trip);
 
-fn smoke_slab_class_picker() -> TestResult {
-    // Verify every class gets distinct backing blocks (no
-    // accidental aliasing across classes) by allocating one of
-    // each + asserting all pointers are unique.
-    use core::alloc::Layout;
-    use narf_memory::slab;
-    let mut ptrs = alloc::vec::Vec::with_capacity(slab::num_classes());
-    for c in 0..slab::num_classes() {
-        let block_size = 16usize << c;
-        let layout = Layout::from_size_align(block_size, 16).unwrap();
-        let p = match slab::alloc(layout) {
-            Ok(p) => p,
-            Err(_) => return TestResult::Fail("alloc failed"),
-        };
-        ptrs.push((layout, p));
-    }
-    for i in 0..ptrs.len() {
-        for j in (i + 1)..ptrs.len() {
-            if ptrs[i].1 == ptrs[j].1 {
-                return TestResult::Fail("two classes returned the same pointer");
-            }
-        }
-    }
-    for (layout, p) in ptrs {
-        // SAFETY: just allocated with this layout.
-        unsafe {
-            slab::dealloc(p, layout);
-        }
-    }
-    TestResult::Pass
-}
-kernel_test!(smoke_slab_class_picker);
+// `smoke_slab_class_picker` migrated to memory/src/tests.rs (subsystem `"memory"`).
 
-fn smoke_slab_stats_advance() -> TestResult {
-    // After an alloc, the relevant class's `in_use` advances; after
-    // free it returns to baseline.
-    use core::alloc::Layout;
-    use narf_memory::slab;
-    let layout = Layout::from_size_align(64, 16).unwrap();
-    let class_idx = 2; // 64 = 16 << 2
-    let before = slab::stats().classes[class_idx].in_use;
-    let p = slab::alloc(layout).expect("alloc");
-    let after_alloc = slab::stats().classes[class_idx].in_use;
-    if after_alloc != before + 1 {
-        return TestResult::Fail("in_use didn't advance on alloc");
-    }
-    // SAFETY: just allocated.
-    unsafe {
-        slab::dealloc(p, layout);
-    }
-    let after_free = slab::stats().classes[class_idx].in_use;
-    if after_free != before {
-        return TestResult::Fail("in_use didn't return to baseline on free");
-    }
-    TestResult::Pass
-}
-kernel_test!(smoke_slab_stats_advance);
 
-fn smoke_slab_magazine_hot_path() -> TestResult {
-    // After 2*MAG_SIZE alloc/free pairs of the same size, the
-    // magazine should absorb every alloc — i.e. the central free
-    // list `grown` counter only advances once (the initial frame
-    // grow), not on every alloc. This is the headline property of
-    // the per-CPU magazine path.
-    use core::alloc::Layout;
-    use narf_memory::slab;
-    let layout = Layout::from_size_align(64, 16).unwrap();
-    let class_idx = 2; // 64 = 16 << 2
+// `smoke_slab_stats_advance` migrated to memory/src/tests.rs (subsystem `"memory"`).
 
-    let stats0 = slab::stats();
-    let grown_before = stats0.classes[class_idx].grown;
 
-    // Burn through 2x the magazine capacity to amortise the initial
-    // page grow + force a magazine refill cycle.
-    let n = 64usize; // > MAG_SIZE (16) on either side.
-    let mut ptrs = alloc::vec::Vec::with_capacity(n);
-    for _ in 0..n {
-        let p = slab::alloc(layout).expect("alloc");
-        ptrs.push(p);
-    }
-    for p in ptrs {
-        // SAFETY: just allocated.
-        unsafe {
-            slab::dealloc(p, layout);
-        }
-    }
+// `smoke_slab_magazine_hot_path` migrated to memory/src/tests.rs (subsystem `"memory"`).
 
-    // After the round-trip, in_use is back at baseline.
-    let stats1 = slab::stats();
-    if stats1.classes[class_idx].in_use != stats0.classes[class_idx].in_use {
-        return TestResult::Fail("in_use didn't return to baseline");
-    }
-    // grown advanced at most by ceil(n / blocks_per_page) — for
-    // 64-byte blocks in 4 KiB pages = 64 per page = exactly 1 page.
-    let grew = stats1.classes[class_idx].grown - grown_before;
-    if grew > 256 {
-        // sanity bound; well above 64-block expectation.
-        return TestResult::Fail("magazine path didn't amortise grow");
-    }
-    TestResult::Pass
-}
-kernel_test!(smoke_slab_magazine_hot_path);
 
 fn smoke_percpu_current_id() -> TestResult {
     // Single-CPU today — current_cpu_id() must return 0 on the BSP.
@@ -1956,25 +1750,8 @@ fn smoke_percpu_current_id() -> TestResult {
 }
 kernel_test!(smoke_percpu_current_id);
 
-fn smoke_percpu_storage_isolation() -> TestResult {
-    // PerCpu<T: Copy> — verify the BSP cell is reachable + iter()
-    // yields MAX_CPUS entries. Mutation requires T's interior
-    // mutability (e.g. T = AtomicU32 once PerCpu drops the Copy
-    // bound, or T = u32 wrapped in a UnsafeCell-bearing newtype);
-    // for this smoke the structural surface is what matters.
-    use narf_lib::percpu::PerCpu;
-    static SEED: PerCpu<u32> = PerCpu::new(0x4242);
-    let v = *SEED.this_cpu();
-    if v != 0x4242 {
-        return TestResult::Fail("PerCpu init didn't propagate to BSP cell");
-    }
-    let n = SEED.iter().count();
-    if n != narf_lib::percpu::MAX_CPUS {
-        return TestResult::Fail("PerCpu iter() count mismatch");
-    }
-    TestResult::Pass
-}
-kernel_test!(smoke_percpu_storage_isolation);
+// `smoke_percpu_storage_isolation` migrated to lib/src/tests.rs (subsystem `"lib"`).
+
 
 #[cfg(target_arch = "aarch64")]
 fn smoke_aarch64_mpidr_aff_present() -> TestResult {
@@ -2415,6 +2192,7 @@ fn smoke_drivers_net_nic_model_ids() -> TestResult {
     TestResult::Pass
 }
 kernel_test!(smoke_drivers_net_nic_model_ids);
+
 
 fn smoke_memory_address_space_materialize() -> TestResult {
     // Full flow: new_for_user allocates a fresh root, map_region
@@ -5231,261 +5009,32 @@ kernel_test!(smoke_frame_x86_64_run_narf_libc_validate);
 // `smoke_userspace_process_id_and_aux` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
 
-fn smoke_obs_gdb_packet_checksum() -> TestResult {
-    use narf_observability::gdb::GdbPacket;
+// `smoke_obs_gdb_packet_checksum` migrated to observability/src/tests.rs (subsystem `"observability"`).
 
-    let p = GdbPacket::new("OK");
-    if !p.checksum_valid() {
-        return TestResult::Fail("freshly-built packet has wrong checksum");
-    }
-    let wire = p.to_wire();
-    if !wire.starts_with("$OK#") {
-        return TestResult::Fail("wire format incorrect prefix");
-    }
-    // $OK#9a on a correctly-summed packet.
-    let mut tampered = p.clone();
-    tampered.checksum = tampered.checksum.wrapping_add(1);
-    if tampered.checksum_valid() {
-        return TestResult::Fail("tampered checksum accepted");
-    }
-    TestResult::Pass
-}
-kernel_test!(smoke_obs_gdb_packet_checksum);
 
-fn smoke_obs_gdb_attach_not_implemented() -> TestResult {
-    use narf_capabilities::{Cap, Invoke};
-    use narf_observability::{gdb, Debugger, GdbError};
 
-    let cap: Cap<Debugger, Invoke> = Cap::bootstrap();
-    match gdb::attach(&cap) {
-        Err(GdbError::NotImplemented) => {}
-        _ => return TestResult::Fail("attach should return NotImplemented pending arch backend"),
-    }
-    cap.revoke();
-    match gdb::attach(&cap) {
-        Err(GdbError::AuthorityRevoked) => {}
-        _ => return TestResult::Fail("revoked debugger cap not rejected"),
-    }
-    TestResult::Pass
-}
-kernel_test!(smoke_obs_gdb_attach_not_implemented);
+// `smoke_obs_gdb_attach_not_implemented` migrated to observability/src/tests.rs (subsystem `"observability"`).
 
-fn smoke_obs_peek_provider_registration() -> TestResult {
-    use alloc::vec::Vec;
-    use narf_capabilities::{Cap, Read};
-    use narf_observability::{peek, Diagnostics, MetricSample, MetricValue, Provider};
 
-    peek::__test_reset();
 
-    struct TestProvider;
-    impl Provider for TestProvider {
-        fn name(&self) -> &'static str {
-            "test"
-        }
-        fn sample(&self, out: &mut Vec<MetricSample>) {
-            out.push(MetricSample {
-                provider: alloc::string::String::from("test"),
-                name: alloc::string::String::from("counter"),
-                value: MetricValue::U64(42),
-            });
-        }
-    }
+// `smoke_obs_peek_provider_registration` migrated to observability/src/tests.rs (subsystem `"observability"`).
 
-    peek::register(TestProvider);
-    if peek::provider_count() != 1 {
-        peek::__test_reset();
-        return TestResult::Fail("provider did not register");
-    }
-    let cap: Cap<Diagnostics, Read> = Cap::bootstrap();
-    let mut out = Vec::new();
-    if peek::sample_all(&cap, &mut out).is_err() {
-        peek::__test_reset();
-        return TestResult::Fail("sample_all failed on a live cap");
-    }
-    if out.len() != 1 || out[0].value != MetricValue::U64(42) {
-        peek::__test_reset();
-        return TestResult::Fail("sample_all did not return test provider data");
-    }
-    peek::__test_reset();
-    TestResult::Pass
-}
-kernel_test!(smoke_obs_peek_provider_registration);
 
-fn smoke_time_wall_offset_and_leap_smear() -> TestResult {
-    use narf_capabilities::{Cap, Write};
-    use narf_time::{begin_leap_smear, now_wall, set_wall_offset, wall, WallClock, WallError};
 
-    wall::__test_reset();
+// `smoke_time_wall_offset_and_leap_smear` migrated to time/src/tests.rs (subsystem `"time"`).
 
-    let cap: Cap<WallClock, Write> = Cap::bootstrap();
 
-    // Setting an offset of 1_000_000_000 ns (1s) must show up in now_wall().
-    if set_wall_offset(&cap, 1_000_000_000).is_err() {
-        return TestResult::Fail("set_wall_offset failed on a live cap");
-    }
-    let t0 = now_wall();
-    if t0.secs < 1 {
-        return TestResult::Fail("wall offset did not take effect");
-    }
+// `smoke_power_thermal_zone_transitions` migrated to power/src/tests.rs (subsystem `"power"`).
 
-    // Zero-window leap smear must be rejected structurally.
-    match begin_leap_smear(&cap, 1_000, 0) {
-        Err(WallError::InvalidSmearWindow) => {}
-        _ => return TestResult::Fail("zero-window leap smear accepted"),
-    }
 
-    // A normal smear (500 ns window, 10 ns delta) must succeed.
-    if begin_leap_smear(&cap, 10, 500).is_err() {
-        return TestResult::Fail("legitimate leap smear rejected");
-    }
+// `smoke_power_energy_aware_governor` migrated to power/src/tests.rs (subsystem `"power"`).
 
-    // Revocation blocks further writes.
-    cap.revoke();
-    match set_wall_offset(&cap, 0) {
-        Err(WallError::AuthorityRevoked) => {}
-        _ => return TestResult::Fail("revoked wall-clock cap accepted"),
-    }
 
-    wall::__test_reset();
-    TestResult::Pass
-}
-kernel_test!(smoke_time_wall_offset_and_leap_smear);
+// `smoke_block_mq_round_robins_across_lanes` migrated to block/src/tests.rs (subsystem `"block"`).
 
-fn smoke_power_thermal_zone_transitions() -> TestResult {
-    use core::sync::atomic::{AtomicU8, Ordering};
-    use narf_capabilities::{Cap, Grant};
-    use narf_power::{thermal, Thermal, ThermalEvent, ThermalState};
 
-    thermal::__test_reset();
-    thermal::init();
+// `smoke_block_deadline_tags_are_monotonic` migrated to block/src/tests.rs (subsystem `"block"`).
 
-    static LAST: AtomicU8 = AtomicU8::new(0);
-    LAST.store(0, Ordering::Relaxed);
-
-    let cap: Cap<Thermal, Grant> = Cap::bootstrap();
-    let id = match thermal::register_zone(&cap, "cpu0", 70_000, 95_000) {
-        Ok(id) => id,
-        Err(_) => return TestResult::Fail("register_zone failed"),
-    };
-    if thermal::subscribe(&cap, |ev| {
-        let code = match ev {
-            ThermalEvent::Normal { .. } => 1,
-            ThermalEvent::Warm { .. } => 2,
-            ThermalEvent::Critical { .. } => 3,
-        };
-        LAST.store(code, Ordering::Relaxed);
-    })
-    .is_err()
-    {
-        return TestResult::Fail("subscribe failed");
-    }
-
-    // 50_000 milli_C → still Normal, no event (Normal → Normal).
-    if thermal::record_temp(id, 50_000).unwrap() != ThermalState::Normal {
-        return TestResult::Fail("50C classified wrong");
-    }
-    if LAST.load(Ordering::Relaxed) != 0 {
-        return TestResult::Fail("no event should fire Normal→Normal");
-    }
-    // 75_000 → Warm; event fires.
-    if thermal::record_temp(id, 75_000).unwrap() != ThermalState::Warm {
-        return TestResult::Fail("75C classified wrong");
-    }
-    if LAST.load(Ordering::Relaxed) != 2 {
-        return TestResult::Fail("Warm event did not fire");
-    }
-    // 96_000 → Critical; event fires.
-    if thermal::record_temp(id, 96_000).unwrap() != ThermalState::Critical {
-        return TestResult::Fail("96C classified wrong");
-    }
-    if LAST.load(Ordering::Relaxed) != 3 {
-        return TestResult::Fail("Critical event did not fire");
-    }
-    // Back to 40_000 → Normal again; event fires.
-    if thermal::record_temp(id, 40_000).unwrap() != ThermalState::Normal {
-        return TestResult::Fail("40C classified wrong");
-    }
-    if LAST.load(Ordering::Relaxed) != 1 {
-        return TestResult::Fail("Normal return event did not fire");
-    }
-
-    thermal::__test_reset();
-    TestResult::Pass
-}
-kernel_test!(smoke_power_thermal_zone_transitions);
-
-fn smoke_power_energy_aware_governor() -> TestResult {
-    use narf_power::{EnergyAware, FreqHint, GovernorPolicy};
-
-    let g = EnergyAware;
-    if g.name() != "energy-aware" {
-        return TestResult::Fail("EnergyAware governor name wrong");
-    }
-    // Idle band: 50/1000 load → MIN.
-    if g.select_freq(50) != FreqHint::MIN {
-        return TestResult::Fail("idle-band not MIN");
-    }
-    // Moderate band: 400/1000 load → midpoint (between MIN and MAX).
-    let mid = g.select_freq(400);
-    if mid == FreqHint::MIN || mid == FreqHint::MAX {
-        return TestResult::Fail("moderate-band should pick a midpoint");
-    }
-    // Heavy band: 800/1000 load → MAX.
-    if g.select_freq(800) != FreqHint::MAX {
-        return TestResult::Fail("heavy-band not MAX");
-    }
-    TestResult::Pass
-}
-kernel_test!(smoke_power_energy_aware_governor);
-
-fn smoke_block_mq_round_robins_across_lanes() -> TestResult {
-    // Populate three lanes with one request each. dequeue_next walks
-    // round-robin so each lane's entry comes out exactly once before
-    // any lane is revisited.
-    use narf_block::{BlockOp, MqDeadlineScheduler};
-
-    let s = MqDeadlineScheduler::with_lanes(3);
-    s.enqueue_on(0, make_block_request(BlockOp::Read, 0x0A), u64::MAX);
-    s.enqueue_on(1, make_block_request(BlockOp::Read, 0x1B), u64::MAX);
-    s.enqueue_on(2, make_block_request(BlockOp::Read, 0x2C), u64::MAX);
-    if s.len() != 3 {
-        return TestResult::Fail("multi-queue len mismatch");
-    }
-
-    let first = s.dequeue_next(0).expect("pending").user_tag;
-    let second = s.dequeue_next(0).expect("pending").user_tag;
-    let third = s.dequeue_next(0).expect("pending").user_tag;
-    if s.dequeue_next(0).is_some() {
-        return TestResult::Fail("multi-queue over-drained");
-    }
-
-    // Round-robin must visit all three distinct lanes.
-    if first == second || second == third || first == third {
-        return TestResult::Fail("round-robin served the same lane twice");
-    }
-    TestResult::Pass
-}
-kernel_test!(smoke_block_mq_round_robins_across_lanes);
-
-fn smoke_block_deadline_tags_are_monotonic() -> TestResult {
-    use narf_block::{BlockOp, DeadlineScheduler};
-
-    let s = DeadlineScheduler::new();
-    let t1 = s.enqueue(make_block_request(BlockOp::Read, 0), u64::MAX);
-    let t2 = s.enqueue(
-        make_block_request(BlockOp::Write { fua: false }, 1),
-        u64::MAX,
-    );
-    let t3 = s.enqueue(make_block_request(BlockOp::Read, 2), u64::MAX);
-    if !(t1 < t2 && t2 < t3) {
-        return TestResult::Fail("enqueue tags not monotonically assigned");
-    }
-    if s.reads_pending() != 2 || s.writes_pending() != 1 {
-        return TestResult::Fail("per-lane pending counts off");
-    }
-    TestResult::Pass
-}
-kernel_test!(smoke_block_deadline_tags_are_monotonic);
 
 // `smoke_userspace_getrandom_fills_buffer` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
@@ -5713,33 +5262,8 @@ fn smoke_aer_classifier_severity() -> TestResult {
 }
 kernel_test!(smoke_aer_classifier_severity);
 
-fn smoke_power_dstate_classification() -> TestResult {
-    use narf_power::DState;
+// `smoke_power_dstate_classification` migrated to power/src/tests.rs (subsystem `"power"`).
 
-    if !DState::D0.is_active() {
-        return TestResult::Fail("D0.is_active");
-    }
-    if DState::D3Hot.is_active() {
-        return TestResult::Fail("D3Hot shouldn't be active");
-    }
-    if DState::D3Cold.is_active() {
-        return TestResult::Fail("D3Cold shouldn't be active");
-    }
-    if !DState::D0.preserves_context() {
-        return TestResult::Fail("D0 must preserve");
-    }
-    if !DState::D3Hot.preserves_context() {
-        return TestResult::Fail("D3Hot must preserve");
-    }
-    if DState::D3Cold.preserves_context() {
-        return TestResult::Fail("D3Cold should NOT preserve");
-    }
-    if !DState::D1.preserves_context() || !DState::D2.preserves_context() {
-        return TestResult::Fail("intermediate states preserve context");
-    }
-    TestResult::Pass
-}
-kernel_test!(smoke_power_dstate_classification);
 // ── compat/win — PE32+ loader smoke ────────────────────────────────
 //
 // Exercises the Win32-on-NARF loader pipeline end-to-end: parse a
