@@ -6,17 +6,23 @@
 //! traces back to one of the public references below; per-file
 //! headers cite the specific ECMA-119 section.
 //!
-//! References (entire crate):
+//! References (entire crate). Every source below is **freely
+//! available** — no paywall, no signup, no NDA required to read or
+//! redistribute:
+//!
 //! - ECMA-119 (3rd edition, December 2017) — "Volume and File
-//!   Structure of CDROM for Information Interchange". This is the
-//!   normative source; the standard is freely published.
+//!   Structure of CDROM for Information Interchange". The
+//!   normative source. ECMA publishes all its standards as
+//!   gratis-downloadable PDFs:
 //!   <https://www.ecma-international.org/publications-and-standards/standards/ecma-119/>
-//! - ISO/IEC 9660 — the same text republished by ISO.
+//! - ISO/IEC 9660 — the same text republished by ISO. (Note: the
+//!   ISO-branded copy is paywalled; we cite the ECMA edition above
+//!   which is the identical text and is gratis.)
 //! - OSDev Wiki, "ISO 9660" — narrative algorithmic description
-//!   (no code copied).
+//!   (no code copied). Wiki content is CC-BY-SA 4.0:
 //!   <https://wiki.osdev.org/ISO_9660>
 //! - Specs/research notes vendored in `specification/` and
-//!   `research/`.
+//!   `research/` (this repository, project license).
 //!
 //! Read-only by design: ISO 9660 is the on-disc CD/DVD layout —
 //! authoring tools (mkisofs, xorriso) build images offline. All

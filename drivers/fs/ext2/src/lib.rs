@@ -6,16 +6,23 @@
 //! number, and algorithm trace back to one of the public references
 //! below. Per-file headers cite the specific section consulted.
 //!
-//! References (entire crate):
+//! References (entire crate). Every source below is **freely
+//! available** — no paywall, no signup, no NDA required to read or
+//! redistribute:
+//!
 //! - Card, Ts'o, Tweedie. _Design and Implementation of the Second
-//!   Extended Filesystem_, the original design paper.
+//!   Extended Filesystem_, the original 1994 design paper. Hosted
+//!   gratis on Theodore Ts'o's MIT page:
 //!   <https://web.mit.edu/tytso/www/linux/ext2intro.html>
 //! - Rusling, _The Second Extended File System: Internal Layout_,
-//!   kernelnewbies.org wiki.
-//! - OSDev Wiki, "Ext2": <https://wiki.osdev.org/Ext2>
-//! - IBM developerWorks, "Anatomy of the Linux file system" — general
-//!   principles only.
-//! - Specs/research notes vendored in `specification/` and `research/`.
+//!   originally on kernelnewbies.org wiki (CC-BY-SA).
+//! - OSDev Wiki, "Ext2" — algorithmic narrative only (no code
+//!   reproductions). Wiki content is CC-BY-SA 4.0:
+//!   <https://wiki.osdev.org/Ext2>
+//! - IBM developerWorks, "Anatomy of the Linux file system" —
+//!   general principles only; freely readable.
+//! - Specs/research notes vendored in `specification/` and
+//!   `research/` (this repository, project license).
 
 #![no_std]
 

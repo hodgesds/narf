@@ -7,15 +7,30 @@
 //! references below. Per-file headers cite the specific Tanenbaum
 //! chapter / page or MINIX manual section.
 //!
-//! References (entire crate):
-//! - Tanenbaum, A. S. *Operating Systems: Design and Implementation*
-//!   (Prentice Hall, 1987, 1st ed., Ch. 5 "Files"; 3rd ed. 2006, Ch. 4).
-//! - Tanenbaum, A. S. & Bos, H. *Modern Operating Systems* (Pearson,
-//!   2014, 4th ed., §4.6 "Case Study: MINIX 3 Filesystem").
-//! - MINIX 3 Reference Manual + on-disk format documentation,
-//!   <https://www.minix3.org/>.
-//! - OSDev wiki, "MINIX File System" — algorithmic descriptions only.
-//! - Specs/research notes vendored in `specification/` and `research/`.
+//! References (entire crate). Free-availability status is called
+//! out per source — some are textbooks (paid), others are gratis:
+//!
+//! - **Free / gratis:** MINIX 3 Reference Manual + on-disk format
+//!   documentation, hosted on <https://www.minix3.org/>. The MINIX
+//!   project publishes its docs under permissive terms, no signup.
+//!   This is the load-bearing reference for the V3 layout — every
+//!   field offset and magic value in this crate can be traced to
+//!   it directly.
+//! - **Free / gratis:** OSDev Wiki, "MINIX File System" —
+//!   algorithmic descriptions only. CC-BY-SA 4.0; gratis to read.
+//! - **Free / gratis:** Specs/research notes vendored in
+//!   `specification/` and `research/` (this repository, project
+//!   license).
+//! - **Paid / NOT free:** Tanenbaum, A. S. *Operating Systems:
+//!   Design and Implementation* (Prentice Hall, 1987, 1st ed., Ch.
+//!   5 "Files"; 3rd ed. 2006, Ch. 4) and *Modern Operating Systems*
+//!   (Pearson, 2014, 4th ed., §4.6). These textbooks describe the
+//!   on-disk layout in narrative form; they were used for cross-
+//!   validation but are NOT required to read or rebuild this crate
+//!   — every layout decision can be traced to the MINIX 3 docs +
+//!   OSDev wiki references above. Cited because they were
+//!   consulted; not relied upon as the sole source for any
+//!   field.
 //!
 //! Read-only first cut. Writes / symlinks / the bitmap allocator are
 //! deferred — see TODO comments in `volume.rs` and `node.rs`.

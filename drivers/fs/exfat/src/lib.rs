@@ -7,12 +7,17 @@
 //! algorithmic step traces back to one of the public references
 //! below. Per-file headers cite the specific spec section consulted.
 //!
-//! References (entire crate):
+//! References (entire crate). Every source below is **freely
+//! available** — no paywall, no signup, no NDA required to read or
+//! redistribute:
+//!
 //! - "exFAT file system specification" — Microsoft Corporation,
-//!   published 2019. The single normative source.
-//!   <https://learn.microsoft.com/en-us/windows/win32/fileio/exfat-specification>
+//!   published 2019. The single normative source. Hosted on
+//!   Microsoft Learn (publicly readable, no Microsoft account
+//!   needed): <https://learn.microsoft.com/en-us/windows/win32/fileio/exfat-specification>
 //! - OSDev Wiki, "exFAT" — algorithmic narrative only (no code
-//!   reproductions). <https://wiki.osdev.org/ExFAT>
+//!   reproductions). Wiki content is CC-BY-SA 4.0:
+//!   <https://wiki.osdev.org/ExFAT>
 //!
 //! Background only (not load-bearing for any code in this crate):
 //! - Microsoft 2019 announcement opening the exFAT specification and

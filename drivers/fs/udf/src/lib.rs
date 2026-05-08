@@ -8,19 +8,28 @@
 //! back to one of the public references below; per-file headers
 //! cite the specific ECMA-167 / OSTA UDF section.
 //!
-//! References (entire crate):
+//! References (entire crate). Every source below is **freely
+//! available** — no paywall, no signup, no NDA required to read or
+//! redistribute:
+//!
 //! - ECMA-167 (3rd edition, June 1997) — "Volume and File Structure
 //!   of Read-Only and Write-Once and Rewritable Media using
 //!   Non-Sequential Recording for Information Interchange". Base
-//!   normative spec; freely published.
+//!   normative spec. ECMA publishes all its standards as
+//!   gratis-downloadable PDFs:
 //!   <https://ecma-international.org/publications-and-standards/standards/ecma-167/>
 //! - OSTA UDF 2.60 — "Universal Disk Format Specification".
-//!   Disc-format profile layered on top of ECMA-167.
-//!   <https://www.osta.org/specs/index.htm>
+//!   Disc-format profile layered on top of ECMA-167. Originally
+//!   hosted at <https://www.osta.org/specs/index.htm> (the OSTA
+//!   site has been intermittently unreachable; an archived copy is
+//!   permanently mirrored at the Internet Archive:
+//!   <https://web.archive.org/web/https://www.osta.org/specs/pdf/udf260.pdf>).
+//!   The UDF spec was always published gratis by OSTA.
 //! - ECMA-119 (ISO 9660) for the Bridge format context — already
-//!   implemented in `drivers/fs/iso9660`.
+//!   implemented in `drivers/fs/iso9660`. Same gratis ECMA
+//!   publication channel.
 //! - Specs/research notes vendored in `specification/` and
-//!   `research/`.
+//!   `research/` (this repository, BSD-3 / project license).
 //!
 //! Read-only by design: optical UDF media (DVD-Video, BD-ROM) is
 //! authored offline; the in-kernel write surface for rewritable UDF
