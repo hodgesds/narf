@@ -73,6 +73,11 @@ members = [
     "firmware/smbios",
     "firmware/fdt",
     "initramfs",
+    "drivers/fs/fat",
+    "drivers/fs/iso9660",
+    "drivers/fs/9p",
+    "userspace/init",
+    "userspace/shell",
 ]
 # narf-testbin is built out-of-line by verification's build.rs
 # because it needs a distinct linker script and release profile.

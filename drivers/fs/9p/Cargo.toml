@@ -1,0 +1,27 @@
+[package]
+name         = "narf-drivers-fs-9p"
+description  = "Clean room 9P2000 protocol implementation. Stage 4 scope."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_fs_9p"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../../../lib" }
+narf-arch         = { path = "../../../arch" }
+narf-drivers      = { path = "../../" }
+narf-driver-runtime = { path = "../../runtime" }
+narf-capabilities = { path = "../../../capabilities" }
+narf-memory       = { path = "../../../memory" }
+narf-filesystem   = { path = "../../../filesystem" }
+narf-io           = { path = "../../../io" }
+narf-kernel-test  = { path = "../../../verification/kernel-test" }
+async-trait       = "0.1"
+
+[lints]
+workspace = true
