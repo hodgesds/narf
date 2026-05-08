@@ -39,21 +39,83 @@ impl<R: narf_capabilities::Rights> CapOp<DmaBuffer, R> for GetPhysAddr {
 }
 
 // ── Registry ────────────────────────────────────────────────────────
+//
+// The registry is the cap → buffer indirection that makes
+// `BlockRequest::buffer: Cap<DmaBuffer, _>` actually mean "this
+// is the buffer to DMA against". A device's `submit()` does:
+//
+//   let buf = narf_io::resolve(req.buffer.slot().index)?;
+//   // …copy into / out of buf.as_slice()…
+//
+// `register_with_cap(buf)` reserves an object-table slot for the
+// buffer and returns a `Cap<DmaBuffer, Write>` whose `slot.index`
+// is the registry index. The registry holds the only `Arc` to the
+// buffer until either `unregister(cap)` is called explicitly or
+// the cap is revoked (`cap.revoke()` bumps the epoch, which
+// strictly invalidates all outstanding caps but does not free
+// the registry slot — call `unregister` for that). Drop the cap
+// without calling `unregister` and the buffer leaks; the API is
+// explicit on this point because BlockRequest sometimes outlives
+// the cap that authorised it (the device's queue still holds the
+// completion in flight).
 
 static REGISTRY: IrqSafeSpinLock<Vec<Option<Arc<DmaBuffer>>>> = IrqSafeSpinLock::new(Vec::new());
 
-/// Register a DmaBuffer and return its assigned index.
-pub fn register(buf: DmaBuffer) -> u32 {
+/// Register `buf` in the cap → buffer registry and mint a
+/// `Cap<DmaBuffer, Write>` that points at it. The cap's
+/// `slot.index` is the registry slot, so devices can `resolve()`
+/// back to the buffer from a `BlockRequest::buffer` field.
+pub fn register_with_cap(mut buf: DmaBuffer) -> Cap<DmaBuffer, narf_capabilities::Write> {
+    let (index, _gen) = narf_capabilities::object_table::register(CapKind::DmaBuffer);
+    buf.slot_index = Some(index);
     let mut r = REGISTRY.lock();
-    let index = r.len() as u32;
-    r.push(Some(Arc::new(buf)));
-    index
+    if (index as usize) >= r.len() {
+        r.resize(index as usize + 1, None);
+    }
+    r[index as usize] = Some(Arc::new(buf));
+    drop(r);
+    let slot = narf_capabilities::CapSlot::new(
+        narf_capabilities::object_table::current_epoch(index).unwrap_or(1),
+        index,
+        <narf_capabilities::Write as narf_capabilities::Rights>::BITS,
+        CapKind::DmaBuffer as u32,
+    );
+    // SAFETY: the slot we just synthesised is consistent with the
+    // entry we wrote into REGISTRY a moment ago — same index, live
+    // epoch, DmaBuffer kind. `Cap::mint` only requires that the
+    // slot describe an authority the caller actually holds.
+    unsafe { Cap::mint(slot) }
 }
 
-/// Resolve a capability index to a DmaBuffer.
+/// Revoke the cap and free the registry slot. After this call
+/// every other cap referencing the same slot fails `check_live()`.
+/// The buffer's frame is freed when the last `Arc<DmaBuffer>` ref
+/// drops (typically immediately if no in-flight `resolve()` Arc is
+/// held).
+pub fn unregister<R: narf_capabilities::Rights>(cap: Cap<DmaBuffer, R>) {
+    let index = cap.slot().index;
+    let _ = narf_capabilities::object_table::bump_epoch(index);
+    let mut r = REGISTRY.lock();
+    if let Some(slot) = r.get_mut(index as usize) {
+        *slot = None;
+    }
+}
+
+/// Resolve a capability slot index to the underlying DmaBuffer.
+/// Returns `None` if the index never existed or has been
+/// `unregister`-ed.
 pub fn resolve(index: u32) -> Option<Arc<DmaBuffer>> {
     let r = REGISTRY.lock();
     r.get(index as usize).and_then(|o| o.clone())
+}
+
+/// Cap-gated resolve: returns `None` if the cap is revoked, the
+/// registry slot is empty, or the slot index is out of range.
+pub fn resolve_cap<R: narf_capabilities::Rights>(
+    cap: &Cap<DmaBuffer, R>,
+) -> Option<Arc<DmaBuffer>> {
+    cap.check_live().ok()?;
+    resolve(cap.slot().index)
 }
 
 // ── Errors ──────────────────────────────────────────────────────────
@@ -98,6 +160,12 @@ pub struct DmaBuffer {
     domain: DomainId,
     coherency: Coherency,
     freed: bool,
+    /// Object-table slot index assigned by [`register_with_cap`].
+    /// `None` until the buffer is registered. The `(slot_index,
+    /// epoch)` pair is what a `Cap<DmaBuffer, _>` stores in its
+    /// `slot` field — that's how a device's `submit()` can resolve
+    /// the cap back to *this* buffer's `PhysAddr` + length.
+    slot_index: Option<u32>,
 }
 
 impl fmt::Debug for DmaBuffer {
@@ -135,6 +203,62 @@ impl DmaBuffer {
     #[inline]
     pub fn coherency(&self) -> Coherency {
         self.coherency
+    }
+
+    /// Borrow the buffer's contents as bytes. Identity-mapped
+    /// physical memory backs the slice — see `alloc_with` for the
+    /// safety argument that the mapping is live.
+    ///
+    /// # Safety contract
+    /// The slice's lifetime is tied to `&self`; the buffer's frame
+    /// is freed in `Drop` so no caller can outlive the backing
+    /// memory.
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: `phys.raw()` is the start of a frame allocated by
+        // `alloc_frame()` and identity-mapped on both supported
+        // arches (the boot identity map covers the low 4 GiB on
+        // x86_64 and the FDT-described RAM on aarch64). `len` is
+        // the buffer's true length and `&self` keeps the buffer
+        // alive across this borrow.
+        unsafe { core::slice::from_raw_parts(self.phys.raw() as *const u8, self.len) }
+    }
+
+    /// Mutable byte view. Same identity-map argument as
+    /// [`Self::as_slice`].
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: see `as_slice` — the unique-mut borrow comes from
+        // `&mut self`, so no aliasing is possible.
+        unsafe { core::slice::from_raw_parts_mut(self.phys.raw() as *mut u8, self.len) }
+    }
+
+    /// Read this buffer's object-table slot index, if it has been
+    /// registered via [`register_with_cap`]. Devices use this to
+    /// resolve a `BlockRequest::buffer` cap back to the buffer.
+    #[inline]
+    pub fn slot_index(&self) -> Option<u32> {
+        self.slot_index
+    }
+
+    /// Raw byte pointer into the identity-mapped buffer region.
+    /// Lifted to `&self` (not `&mut self`) because a `DmaBuffer`
+    /// is normally accessed through an `Arc` from the registry —
+    /// the device may DMA-write into it while a CPU-side observer
+    /// only holds a shared reference.
+    ///
+    /// # Safety
+    /// Callers must serialise CPU-side mutation against any
+    /// concurrent device access. The cooperative single-CPU
+    /// executor makes this trivial — copy in / out without
+    /// yielding mid-borrow.
+    #[inline]
+    pub fn as_ptr(&self) -> *const u8 {
+        self.phys.raw() as *const u8
+    }
+
+    /// See [`Self::as_ptr`].
+    #[inline]
+    pub fn as_mut_ptr(&self) -> *mut u8 {
+        self.phys.raw() as *mut u8
     }
 }
 
@@ -196,6 +320,7 @@ fn alloc_with(len: usize, domain: DomainId, coherency: Coherency) -> Result<DmaB
         domain,
         coherency,
         freed: false,
+        slot_index: None,
     })
 }
 

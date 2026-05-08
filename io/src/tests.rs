@@ -160,3 +160,46 @@ fn smoke_ioremap_direct_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("io", smoke_ioremap_direct_round_trip);
+
+fn smoke_io_register_with_cap_resolves() -> TestResult {
+    // Round-trip: alloc a buffer, register it with the cap-table,
+    // confirm the returned cap resolves back to the same physical
+    // address, then unregister and confirm the cap is dead.
+    use crate::{alloc_coherent, register_with_cap, resolve_cap, unregister};
+    use narf_capabilities::CapError;
+    use narf_lib::id::DomainId;
+
+    let buf = match alloc_coherent(256, DomainId::DRIVER_0) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Skip("frame allocator unavailable"),
+    };
+    let phys = buf.phys_addr().raw();
+    let cap = register_with_cap(buf);
+
+    if !cap.is_live() {
+        return TestResult::Fail("cap not live after register_with_cap");
+    }
+
+    let resolved = match resolve_cap(&cap) {
+        Some(b) => b,
+        None => return TestResult::Fail("resolve_cap returned None"),
+    };
+    if resolved.phys_addr().raw() != phys {
+        return TestResult::Fail("resolve_cap returned wrong buffer");
+    }
+    if resolved.slot_index() != Some(cap.slot().index) {
+        return TestResult::Fail("buffer slot_index doesn't match cap slot");
+    }
+
+    // Drop the resolved Arc so unregister can free the buffer.
+    drop(resolved);
+    let cap_copy = cap;
+    unregister(cap);
+    match cap_copy.check_live() {
+        Err(CapError::Revoked) => {}
+        Ok(_) => return TestResult::Fail("cap still live after unregister"),
+        Err(_) => return TestResult::Fail("cap reported wrong error"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("io", smoke_io_register_with_cap_resolves);
