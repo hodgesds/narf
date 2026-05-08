@@ -34,6 +34,7 @@ narf-drivers-storage = { path = "../drivers/storage" }
 narf-drivers-usb     = { path = "../drivers/usb" }
 narf-drivers-platform = { path = "../drivers/platform" }
 narf-drivers-fs-fat   = { path = "../drivers/fs/fat" }
+narf-drivers-fs-minix = { path = "../drivers/fs/minix" }
 narf-drivers-fs-iso9660 = { path = "../drivers/fs/iso9660" }
 narf-input           = { path = "../input" }
 narf-input-driver    = { path = "../drivers/input" }

@@ -19,6 +19,7 @@ extern crate alloc;
 // name pick themselves up — these are the test-only ones.)
 extern crate narf_bluetooth as _;
 extern crate narf_drivers_fs_fat as _;
+extern crate narf_drivers_fs_minix as _;
 extern crate narf_drivers_fs_iso9660 as _;
 extern crate narf_edid as _;
 extern crate narf_efi as _;
