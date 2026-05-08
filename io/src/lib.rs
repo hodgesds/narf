@@ -214,21 +214,20 @@ impl DmaBuffer {
     /// is freed in `Drop` so no caller can outlive the backing
     /// memory.
     pub fn as_slice(&self) -> &[u8] {
-        // SAFETY: `phys.raw()` is the start of a frame allocated by
-        // `alloc_frame()` and identity-mapped on both supported
-        // arches (the boot identity map covers the low 4 GiB on
-        // x86_64 and the FDT-described RAM on aarch64). `len` is
-        // the buffer's true length and `&self` keeps the buffer
-        // alive across this borrow.
-        unsafe { core::slice::from_raw_parts(self.phys.raw() as *const u8, self.len) }
+        // SAFETY: `kernel_ptr` resolves through the kernel's
+        // identity map (x86_64) or TTBR1 high-half RAM window
+        // (aarch64), so the slice stays valid across user-task
+        // TTBR0/CR3 swaps. `len` is the buffer's true length and
+        // `&self` keeps the buffer alive across this borrow.
+        unsafe { core::slice::from_raw_parts(self.phys.kernel_ptr::<u8>(), self.len) }
     }
 
-    /// Mutable byte view. Same identity-map argument as
+    /// Mutable byte view. Same kernel-mapping argument as
     /// [`Self::as_slice`].
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         // SAFETY: see `as_slice` — the unique-mut borrow comes from
         // `&mut self`, so no aliasing is possible.
-        unsafe { core::slice::from_raw_parts_mut(self.phys.raw() as *mut u8, self.len) }
+        unsafe { core::slice::from_raw_parts_mut(self.phys.kernel_mut_ptr::<u8>(), self.len) }
     }
 
     /// Read this buffer's object-table slot index, if it has been
@@ -239,11 +238,13 @@ impl DmaBuffer {
         self.slot_index
     }
 
-    /// Raw byte pointer into the identity-mapped buffer region.
+    /// Raw byte pointer into the kernel-mapped buffer region.
     /// Lifted to `&self` (not `&mut self`) because a `DmaBuffer`
     /// is normally accessed through an `Arc` from the registry —
     /// the device may DMA-write into it while a CPU-side observer
-    /// only holds a shared reference.
+    /// only holds a shared reference. Resolves through the kernel
+    /// identity map (x86_64) or TTBR1 high-half (aarch64), so the
+    /// pointer stays valid across user-task page-table swaps.
     ///
     /// # Safety
     /// Callers must serialise CPU-side mutation against any
@@ -252,13 +253,13 @@ impl DmaBuffer {
     /// yielding mid-borrow.
     #[inline]
     pub fn as_ptr(&self) -> *const u8 {
-        self.phys.raw() as *const u8
+        self.phys.kernel_ptr::<u8>()
     }
 
     /// See [`Self::as_ptr`].
     #[inline]
     pub fn as_mut_ptr(&self) -> *mut u8 {
-        self.phys.raw() as *mut u8
+        self.phys.kernel_mut_ptr::<u8>()
     }
 }
 
@@ -308,11 +309,13 @@ fn alloc_with(len: usize, domain: DomainId, coherency: Coherency) -> Result<DmaB
     // (NVMe identify VID mismatch, virtio control-vq wedge, etc.)
     // depending on which test ran before.
     //
-    // SAFETY: `phys.raw()` is a freshly allocated page; identity-
-    // mapped on x86_64 + the boot identity map on aarch64 (DMA
-    // buffers must be reachable by the CPU on both arches).
+    // SAFETY: `phys` is a freshly allocated page; the kernel
+    // accesses it through the per-arch kernel mapping
+    // (`kernel_mut_ptr`) — identity on x86_64, TTBR1 high-half on
+    // aarch64 — so the write stays valid even when the calling
+    // thread is in a user-task TTBR0/CR3 context.
     unsafe {
-        core::ptr::write_bytes(phys.raw() as *mut u8, 0, page);
+        core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, page);
     }
     Ok(DmaBuffer {
         phys,

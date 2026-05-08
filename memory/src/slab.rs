@@ -262,12 +262,14 @@ fn alloc_class(c: usize) -> Result<NonNull<u8>, SlabError> {
     // push half into the magazine + the rest onto central, return
     // the last block in the page.
     let frame: PhysFrame = alloc_frame()?;
-    let base = frame.start_address().raw() as *mut u8;
+    let base = frame.start_address().kernel_mut_ptr::<u8>();
     let block_size = class_size(c);
     let n_blocks = PAGE_SIZE_USIZE / block_size;
     let to_mag = (MAG_SIZE / 2).min(n_blocks - 1);
-    // SAFETY: `base..base+PAGE_SIZE_USIZE` is a fresh identity-mapped
-    // frame.
+    // SAFETY: `base..base+PAGE_SIZE_USIZE` is a fresh frame
+    // accessed via the per-arch kernel mapping (identity on
+    // x86_64, TTBR1 high-half on aarch64) so the write stays
+    // valid across user-task page-table swaps.
     unsafe {
         for i in 0..to_mag {
             let blk = NonNull::new_unchecked(base.add(i * block_size) as *mut FreeBlock);
@@ -340,8 +342,9 @@ fn alloc_large(layout: Layout) -> Result<NonNull<u8>, SlabError> {
     }
     let frame = alloc_frame()?;
     LARGE_IN_USE.fetch_add(1, Ordering::Relaxed);
-    let p = frame.start_address().raw() as *mut u8;
-    // SAFETY: `p` is identity-mapped + page-aligned.
+    let p = frame.start_address().kernel_mut_ptr::<u8>();
+    // SAFETY: `p` is reachable through the per-arch kernel
+    // mapping + page-aligned.
     Ok(unsafe { NonNull::new_unchecked(p) })
 }
 

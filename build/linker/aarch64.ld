@@ -70,6 +70,23 @@ SECTIONS
 
     __kernel_end = . - KERNEL_VIRT_BASE;
 
+    /* Aliased high-VA view of the boot stack. The boot stack
+     * itself lives in `.boot.data` at low-VA so boot.S's
+     * pre-MMU `adrp` + `:lo12:` setup keeps working (adrp can't
+     * reach high-VA from a pre-MMU low PC). Once the MMU is on
+     * and `_start_rust_entry` has branched to high-VA, any code
+     * that swaps TTBR0 (e.g. `AddressSpace::activate()`) must
+     * not be running on a low-VA stack — the low-half mapping
+     * disappears with the swap. We expose `stack_top_virt` so
+     * `_start_rust_entry` can install a high-VA SP that lives
+     * inside TTBR1's mapping of the same physical bytes.
+     *
+     * `stack_top` is a LOW-VA absolute address (the linker
+     * placed `.boot.data` at PA 0x40081000+). OR-ing in
+     * `KERNEL_VIRT_BASE` produces the matching VA in TTBR1's
+     * 1 GiB block at L0[511]/L1[1]. */
+    PROVIDE(stack_top_virt = stack_top + KERNEL_VIRT_BASE);
+
     /DISCARD/ : {
         *(.eh_frame*)
         *(.note.gnu.build-id)

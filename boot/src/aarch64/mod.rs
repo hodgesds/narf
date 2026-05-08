@@ -106,7 +106,13 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
         memory_map: regions,
         cmdline: CMDLINE,
         uart_phys: PhysAddr::new(PL011_QEMU_VIRT),
-        uart_virt: VirtAddr::new(PL011_QEMU_VIRT), // pre-MMU identity
+        // High-VA alias: TTBR1's hi_L1[0] (installed by boot.S)
+        // maps PA 0x00000000-0x40000000 → VA 0xFFFFFF80_00000000
+        // -0xFFFFFF80_40000000 as Device memory. After the boot
+        // identity TTBR0 is swapped for a user task's private
+        // root, the kernel keeps reaching the UART through this
+        // high-VA window.
+        uart_virt: VirtAddr::new(0xFFFF_FF80_0000_0000 | PL011_QEMU_VIRT),
         dtb_phys,
         acpi_rsdp_phys: None,
         initramfs,

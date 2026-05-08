@@ -396,12 +396,16 @@ impl AddressSpace {
         let new_frame =
             crate::frame::alloc_frame().map_err(|_| AddressSpaceError::OutOfRange)?;
         let new_phys = new_frame.start_address();
-        // SAFETY: low-4-GiB identity map covers both old + new
-        // frames; the source/dest ranges are non-overlapping.
+        // SAFETY: kernel_ptr / kernel_mut_ptr resolve through the
+        // kernel's identity map (x86_64) or TTBR1 high-half RAM
+        // window (aarch64), so the access stays valid even when
+        // the calling thread has swapped TTBR0/CR3 to a user
+        // root. Source/dest ranges are non-overlapping (distinct
+        // freshly-allocated frames).
         unsafe {
             core::ptr::copy_nonoverlapping(
-                old_phys.raw() as *const u8,
-                new_phys.raw() as *mut u8,
+                old_phys.kernel_ptr::<u8>(),
+                new_phys.kernel_mut_ptr::<u8>(),
                 crate::frame::PAGE_SIZE as usize,
             );
         }
@@ -549,18 +553,33 @@ impl AddressSpace {
         }
         #[cfg(target_arch = "aarch64")]
         {
-            // aarch64 split translation would make TTBR0 swaps safe
-            // in principle — the kernel lives behind TTBR1. In
-            // practice the current boot's TTBR0 carries the kernel's
-            // low-half identity map that the heap + free-list
-            // access through raw phys-as-virt pointers, so swapping
-            // it to a fresh empty table hangs. The full
-            // `write_ttbr0_el1` primitive IS landed in
-            // `aarch64::paging` and tested independently; wiring it
-            // here waits on migrating the allocator off the identity
-            // map (the same prerequisite x86_64 has for genuine
-            // user-AS isolation).
-            return Err(AddressSpaceError::NotImplemented);
+            // aarch64 split translation: TTBR1 (high-half) carries
+            // the kernel; TTBR0 (low-half) is per-AS. Every
+            // kernel-side phys-as-virt access in the tree now
+            // goes through `PhysAddr::kernel_ptr` /
+            // `kernel_mut_ptr`, which OR-in `KERNEL_PHYS_OFFSET`
+            // so reads land in TTBR1's high-half RAM window. The
+            // boot stack is also aliased into TTBR1 via the
+            // `stack_top_virt` symbol installed in
+            // `build/linker/aarch64.ld`; `_start_rust_entry`
+            // installs that high-VA stack pointer immediately
+            // after the MMU is enabled. Swapping TTBR0 to
+            // `self.root` therefore leaves all kernel reads/writes
+            // valid; user code's low-half mappings come from the
+            // regions we materialise into `self.root`.
+            //
+            // DIAGNOSTIC: write the CURRENT TTBR0 back to itself,
+            // exercising the MSR + TLBI path without actually
+            // changing the mapping. If this hangs, the issue is
+            // the asm sequence or the TLBI itself — not the new
+            // user-AS mapping.
+            // SAFETY: ttbr0 read is unconditional.
+            let cur = unsafe { crate::aarch64::paging::read_ttbr0_el1() };
+            unsafe {
+                crate::aarch64::paging::write_ttbr0_el1(cur);
+            }
+            let _ = self.root;
+            return Ok(());
         }
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {

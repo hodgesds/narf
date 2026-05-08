@@ -36,6 +36,25 @@ pub mod aarch64;
 pub use aarch64::{ioremap, mmu, paging};
 
 pub use addr::{PhysAddr, VirtAddr};
+
+/// Per-arch offset that maps a physical RAM address to its
+/// **kernel** virtual address. The kernel uses this to access
+/// page-table memory + DMA buffers + the COW memcpy path through
+/// the kernel's TTBR1 / high-half mapping, so accesses stay
+/// valid across user-task TTBR0 swaps.
+///
+/// - x86_64: `0` — the kernel runs with a low-4-GiB identity map
+///   in CR3 and every per-domain PML4 clones it; phys IS the
+///   kernel virt for low RAM.
+/// - aarch64: `0xFFFF_FF80_0000_0000` — matches `KERNEL_VIRT_BASE`
+///   from `build/linker/aarch64.ld` and the TTBR1 high-half RAM
+///   mapping that `boot.S` installs at L0[511]/L1[1].
+#[cfg(target_arch = "x86_64")]
+pub const KERNEL_PHYS_OFFSET: u64 = 0;
+#[cfg(target_arch = "aarch64")]
+pub const KERNEL_PHYS_OFFSET: u64 = 0xFFFF_FF80_0000_0000;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub const KERNEL_PHYS_OFFSET: u64 = 0;
 pub use frame::{
     alloc_frame, alloc_frame_anywhere, alloc_frame_on, free_frame, init_from_map, is_numa_aware,
     node_free, rebalance_to_topology, stats as frame_stats, FrameAllocError, FrameStats, PhysFrame,

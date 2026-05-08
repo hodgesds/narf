@@ -43,6 +43,57 @@ impl PhysAddr {
     pub fn as_ptr<T>(self) -> *const T {
         self.0 as *const T
     }
+
+    /// Cast to a raw pointer reachable from the **kernel** address
+    /// space — i.e. via TTBR1 on aarch64, the boot identity map on
+    /// x86_64. Use this (not [`Self::as_mut_ptr`]) for kernel-side
+    /// access to physical RAM (page-table walks, frame allocator
+    /// output, COW memcpys) so the access stays valid even after a
+    /// user task swaps TTBR0 to its private root.
+    ///
+    /// On x86_64 this is the same as `as_mut_ptr` — the kernel is
+    /// linked high-half but the boot CR3 carries a low-4-GiB
+    /// identity map and every per-domain PML4 clones it.
+    ///
+    /// On aarch64 this offsets by `KERNEL_PHYS_OFFSET` so the
+    /// pointer lands in TTBR1's high-half RAM window
+    /// (`KERNEL_VIRT_BASE` from `build/linker/aarch64.ld`,
+    /// `0xFFFF_FF80_0000_0000`). The boot.S TTBR1 setup maps the
+    /// 1 GiB block at PA `0x4000_0000` into VA
+    /// `0xFFFF_FF80_4000_0000` — the same VA you'd get by OR'ing
+    /// the offset into the PA.
+    #[inline]
+    pub fn kernel_mut_ptr<T>(self) -> *mut T {
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.0 as *mut T
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            (self.0 | crate::KERNEL_PHYS_OFFSET) as *mut T
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            self.0 as *mut T
+        }
+    }
+
+    /// Const-pointer counterpart to [`Self::kernel_mut_ptr`].
+    #[inline]
+    pub fn kernel_ptr<T>(self) -> *const T {
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.0 as *const T
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            (self.0 | crate::KERNEL_PHYS_OFFSET) as *const T
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            self.0 as *const T
+        }
+    }
 }
 
 impl VirtAddr {

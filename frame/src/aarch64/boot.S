@@ -108,6 +108,19 @@ _start:
     movk x1, #0x4000, lsl #16
     str  x1, [x0, #(1 * 8)]
 
+    /* hi_L1[0] = 0x0000_0000 (Device, virt 0xFFFFFF80_00000000).
+     *
+     * Covers the low-PA MMIO devices (PL011 UART at PA 0x09000000,
+     * GIC at PA 0x08000000, etc. on QEMU virt) so kernel-side
+     * console writes + interrupt-controller pokes survive a
+     * TTBR0 swap to a private user address space. Without this,
+     * the moment a user task `activate()`s its empty TTBR0 the
+     * next `writeln!(console::Writer, ...)` page-faults.
+     *
+     * 0x401 = valid block, AttrIndx=0 (Device, per MAIR_EL1). */
+    mov  x1, #0x401
+    str  x1, [x0, #(0 * 8)]
+
     dsb sy
 
     /* MAIR_EL1: Attr0 = Device nGnRE (0x04), Attr1 = Normal WB (0xFF).
@@ -162,7 +175,15 @@ _start:
     br   x0
 
 _start_rust_entry:
-    ldr  x0, =stack_top
+    /* Switch to the high-VA stack alias. The pre-MMU bring-up
+     * above used the low-VA `stack_top` (set via `adrp` at line
+     * 46-48); after the MMU is up + we've branched into the
+     * high-half via `br x0`, kernel code must run on a stack
+     * that lives inside TTBR1's mapping. `stack_top_virt` is
+     * defined in `build/linker/aarch64.ld` as `stack_top +
+     * KERNEL_VIRT_BASE` and resolves to a high-VA address
+     * pointing at the same physical bytes as the boot stack. */
+    ldr  x0, =stack_top_virt
     mov  sp, x0
 
     mov x0, #0xfeed
@@ -188,4 +209,5 @@ l1_hi:
 .align 4
 stack_bottom:
     .skip 4096 * 16
+.global stack_top
 stack_top:

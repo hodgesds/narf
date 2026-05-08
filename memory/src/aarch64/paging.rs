@@ -107,7 +107,7 @@ impl PageTable {
 /// Write a value to physical memory using identity-mapped access.
 pub unsafe fn write_identity<T>(phys: PhysAddr, value: T) {
     unsafe {
-        ptr::write_volatile(phys.raw() as *mut T, value);
+        ptr::write_volatile(phys.kernel_mut_ptr::<T>(), value);
     }
 }
 
@@ -174,12 +174,16 @@ pub unsafe fn write_ttbr0_el1(root: PhysAddr) {
     // SAFETY: `MSR TTBR0_EL1, xN` at EL1 is the architected way to
     // swap the low-half translation root; the ASID field in bits
     // [63:48] stays zero (single-ASID mode for Stage-4 structural).
+    // Use the cheaper local `tlbi vmalle1` (current EL, NOT
+    // inner-shareable broadcast) — every CPU executes its own
+    // activate() before polling, so per-CPU TLB scoping suffices
+    // and avoids the cross-core synchronisation cost.
     unsafe {
         asm!(
             "msr ttbr0_el1, {addr}",
-            "dsb ish",
-            "tlbi vmalle1is",
-            "dsb ish",
+            "dsb nsh",
+            "tlbi vmalle1",
+            "dsb nsh",
             "isb",
             addr = in(reg) root.raw(),
             options(nostack, preserves_flags),
@@ -245,7 +249,7 @@ pub unsafe fn new_user_ttbr0() -> Result<PhysAddr, PageTableAllocError> {
     // SAFETY: frame is identity-mapped per the allocator's
     // contract; 4 KiB write is aligned.
     unsafe {
-        ptr::write_bytes(phys.raw() as *mut u8, 0, core::mem::size_of::<PageTable>());
+        ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, core::mem::size_of::<PageTable>());
     }
     Ok(phys)
 }
@@ -295,7 +299,7 @@ unsafe fn ensure_next_table(entry: &mut PageTableEntry) -> Result<PhysAddr, MapE
     // Zero the new table.
     // SAFETY: identity-mapped frame.
     unsafe {
-        ptr::write_bytes(next.raw() as *mut u8, 0, core::mem::size_of::<PageTable>());
+        ptr::write_bytes(next.kernel_mut_ptr::<u8>(), 0, core::mem::size_of::<PageTable>());
     }
     // Table descriptor: low bits 0b11 = valid + table.
     *entry = PageTableEntry(next.raw() | 0b11);
@@ -328,16 +332,16 @@ pub unsafe fn map_4kb(
     let idx = WalkIndices::from_virt(virt);
 
     // SAFETY: `root` is identity-mapped per caller contract.
-    let l0 = unsafe { &mut *(root.raw() as *mut PageTable) };
+    let l0 = unsafe { &mut *(root.kernel_mut_ptr::<PageTable>()) };
     let l1_phys = unsafe { ensure_next_table(&mut l0.entries[idx.l0])? };
 
-    let l1 = unsafe { &mut *(l1_phys.raw() as *mut PageTable) };
+    let l1 = unsafe { &mut *(l1_phys.kernel_mut_ptr::<PageTable>()) };
     let l2_phys = unsafe { ensure_next_table(&mut l1.entries[idx.l1])? };
 
-    let l2 = unsafe { &mut *(l2_phys.raw() as *mut PageTable) };
+    let l2 = unsafe { &mut *(l2_phys.kernel_mut_ptr::<PageTable>()) };
     let l3_phys = unsafe { ensure_next_table(&mut l2.entries[idx.l2])? };
 
-    let l3 = unsafe { &mut *(l3_phys.raw() as *mut PageTable) };
+    let l3 = unsafe { &mut *(l3_phys.kernel_mut_ptr::<PageTable>()) };
     if l3.entries[idx.l3].is_valid() {
         return Err(MapError::AlreadyMapped);
     }
@@ -371,22 +375,22 @@ pub unsafe fn unmap_4kb(root: PhysAddr, virt: VirtAddr) -> Result<PhysAddr, MapE
     }
     let idx = WalkIndices::from_virt(virt);
     // SAFETY: `root` is identity-mapped per caller contract.
-    let l0 = unsafe { &mut *(root.raw() as *mut PageTable) };
+    let l0 = unsafe { &mut *(root.kernel_mut_ptr::<PageTable>()) };
     let e = l0.entries[idx.l0];
     if !e.is_valid() || (e.0 & 0b11) != 0b11 {
         return Err(MapError::AlreadyMapped);
     }
-    let l1 = unsafe { &mut *(e.addr().raw() as *mut PageTable) };
+    let l1 = unsafe { &mut *(e.addr().kernel_mut_ptr::<PageTable>()) };
     let e = l1.entries[idx.l1];
     if !e.is_valid() || (e.0 & 0b11) != 0b11 {
         return Err(MapError::AlreadyMapped);
     }
-    let l2 = unsafe { &mut *(e.addr().raw() as *mut PageTable) };
+    let l2 = unsafe { &mut *(e.addr().kernel_mut_ptr::<PageTable>()) };
     let e = l2.entries[idx.l2];
     if !e.is_valid() || (e.0 & 0b11) != 0b11 {
         return Err(MapError::AlreadyMapped);
     }
-    let l3 = unsafe { &mut *(e.addr().raw() as *mut PageTable) };
+    let l3 = unsafe { &mut *(e.addr().kernel_mut_ptr::<PageTable>()) };
     let leaf = l3.entries[idx.l3];
     if !leaf.is_valid() {
         return Err(MapError::AlreadyMapped);
@@ -417,13 +421,13 @@ pub unsafe fn translate(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {
     let idx = WalkIndices::from_virt(virt);
     // SAFETY: root must be identity-mapped per caller contract;
     // callers hold this invariant.
-    let l0 = unsafe { &*(root.raw() as *const PageTable) };
+    let l0 = unsafe { &*(root.kernel_ptr::<PageTable>()) };
     let e = l0.entries[idx.l0];
     if !e.is_valid() || (e.0 & 0b11) != 0b11 {
         return None;
     }
 
-    let l1 = unsafe { &*(e.addr().raw() as *const PageTable) };
+    let l1 = unsafe { &*(e.addr().kernel_ptr::<PageTable>()) };
     let e = l1.entries[idx.l1];
     if !e.is_valid() {
         return None;
@@ -433,7 +437,7 @@ pub unsafe fn translate(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {
         return None;
     }
 
-    let l2 = unsafe { &*(e.addr().raw() as *const PageTable) };
+    let l2 = unsafe { &*(e.addr().kernel_ptr::<PageTable>()) };
     let e = l2.entries[idx.l2];
     if !e.is_valid() {
         return None;
@@ -443,7 +447,7 @@ pub unsafe fn translate(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {
         return None;
     }
 
-    let l3 = unsafe { &*(e.addr().raw() as *const PageTable) };
+    let l3 = unsafe { &*(e.addr().kernel_ptr::<PageTable>()) };
     let e = l3.entries[idx.l3];
     if !e.is_valid() {
         return None;
@@ -455,25 +459,25 @@ pub unsafe fn translate(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {
 /// `None` if unmapped.
 pub unsafe fn flags_at(root: PhysAddr, virt: VirtAddr) -> Option<PtFlags> {
     let idx = WalkIndices::from_virt(virt);
-    let l0 = unsafe { &*(root.raw() as *const PageTable) };
+    let l0 = unsafe { &*(root.kernel_ptr::<PageTable>()) };
     let e = l0.entries[idx.l0];
     if !e.is_valid() || (e.0 & 0b11) != 0b11 {
         return None;
     }
 
-    let l1 = unsafe { &*(e.addr().raw() as *const PageTable) };
+    let l1 = unsafe { &*(e.addr().kernel_ptr::<PageTable>()) };
     let e = l1.entries[idx.l1];
     if !e.is_valid() || (e.0 & 0b11) != 0b11 {
         return None;
     }
 
-    let l2 = unsafe { &*(e.addr().raw() as *const PageTable) };
+    let l2 = unsafe { &*(e.addr().kernel_ptr::<PageTable>()) };
     let e = l2.entries[idx.l2];
     if !e.is_valid() || (e.0 & 0b11) != 0b11 {
         return None;
     }
 
-    let l3 = unsafe { &*(e.addr().raw() as *const PageTable) };
+    let l3 = unsafe { &*(e.addr().kernel_ptr::<PageTable>()) };
     let e = l3.entries[idx.l3];
     if !e.is_valid() {
         return None;
