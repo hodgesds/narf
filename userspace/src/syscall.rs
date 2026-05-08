@@ -603,6 +603,34 @@ pub enum Syscall {
     /// already supports them.
     Clone = 56,
 
+    /// Linux fork(2) — duplicate-process counterpart to `Clone`.
+    /// Where `Clone` shares the parent's `Arc<AddressSpace>` so a new
+    /// task runs alongside in the same memory map (POSIX threads),
+    /// `Fork` walks the parent's regions, allocates fresh physical
+    /// frames for each, copies the parent's bytes through the
+    /// low-4-GiB identity map, and produces an entirely independent
+    /// address space for the child. POSIX semantics: child sees `0`
+    /// in the return register, parent sees the child's tid.
+    ///
+    /// Inheritance per POSIX:
+    ///   - address space  : copied (independent on either side)
+    ///   - fd table       : copied (entries share underlying file
+    ///                      Arcs via Arc::clone)
+    ///   - cwd / brk / sigaction / signal_mask / uid+gid /
+    ///     pgid / sid    : copied
+    ///   - pending signals: reset (POSIX)
+    ///
+    /// No flags / no clone3-shaped surface — just a bare fork. The
+    /// child trap-frame's RAX is rewritten to `0` before its first
+    /// poll re-enters user mode (see `sys_fork` doc-comment for the
+    /// pre-seeded UserState mechanism).
+    ///
+    /// FIXME(cow): non-COW first cut. The eventual hook lives in
+    /// `narf_memory::region::cow_split_on_write` (not yet written);
+    /// until then we eagerly memcpy every page. Acceptable on Stage-4
+    /// processes; expensive on large brk heaps.
+    Fork = 57,
+
     /// Linux tkill(2) / tgkill(2): like kill but targets a specific
     /// thread within a process group. NARF is single-threaded per
     /// process — tgkill aliases sys_kill. `arg0 = tgid` (-1 = any),
@@ -894,6 +922,7 @@ impl Syscall {
             222 => Syscall::SchedGetparam,
             223 => Syscall::SchedSetparam,
             56 => Syscall::Clone,
+            57 => Syscall::Fork,
             168 => Syscall::Gettid,
             169 => Syscall::Prctl,
             175 => Syscall::Tgkill,

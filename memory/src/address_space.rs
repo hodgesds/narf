@@ -274,6 +274,81 @@ impl AddressSpace {
         Err(AddressSpaceError::NotImplemented)
     }
 
+    /// Duplicate this address space for a `fork(2)`-style child.
+    /// Allocates a fresh root page table (via `new_for_user`) and,
+    /// for every region, allocates new physical frames and `memcpy`s
+    /// the parent's bytes through the low-4-GiB identity map. The
+    /// returned address space owns its own frames — mutations on
+    /// either side do NOT propagate.
+    ///
+    /// FIXME(cow): non-COW first cut. A real copy-on-write fork
+    /// would share frames via a per-frame refcount and split on the
+    /// first user-mode write fault. The eventual hook lives in
+    /// `narf_memory::region::cow_split_on_write` (not yet written);
+    /// until then we eagerly memcpy. Acceptable on small Stage-4
+    /// processes; expensive on large `brk` heaps.
+    ///
+    /// # Safety
+    /// - The low-4-GiB identity map must be live (the same Stage-4
+    ///   contract `materialize` rides on); the byte-copy walks each
+    ///   region's parent + child frames through identity-mapped
+    ///   raw pointers.
+    /// - The frame allocator must be initialised.
+    /// - Caller must `materialize()` the returned AS before
+    ///   activating it; this routine does NOT walk page tables.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    pub unsafe fn clone_for_fork(&self) -> Result<Self, AddressSpaceError> {
+        // SAFETY: caller's contract — paging is live.
+        let child = unsafe { Self::new_for_user() }?;
+
+        let parent_regions = self.regions.lock().clone();
+
+        let mut child_regions: Vec<Region> = Vec::with_capacity(parent_regions.len());
+
+        for r in parent_regions.iter() {
+            let pages = r.phys.len();
+            let mut child_phys: Vec<PhysAddr> = Vec::with_capacity(pages);
+            for &parent_phys in r.phys.iter() {
+                let f = crate::frame::alloc_frame().map_err(|_| AddressSpaceError::OutOfRange)?;
+                let cphys = f.start_address();
+                // SAFETY: low-4-GiB identity map covers both parent
+                // and child phys frames; each is a 4 KiB page
+                // contiguous in physical memory; the source/dest
+                // ranges are non-overlapping (distinct frames the
+                // allocator just handed us).
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        parent_phys.raw() as *const u8,
+                        cphys.raw() as *mut u8,
+                        crate::frame::PAGE_SIZE as usize,
+                    );
+                }
+                child_phys.push(cphys);
+            }
+            child_regions.push(Region {
+                base: r.base,
+                len: r.len,
+                perms: r.perms,
+                phys: child_phys,
+            });
+        }
+
+        // Push the regions into the child AS via map_region so the
+        // overlap / alignment / phys-len invariants are re-checked
+        // for free. The parent is well-formed by construction so
+        // these never trip on a healthy parent.
+        for r in child_regions.into_iter() {
+            child.map_region(r)?;
+        }
+
+        Ok(child)
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub unsafe fn clone_for_fork(&self) -> Result<Self, AddressSpaceError> {
+        Err(AddressSpaceError::NotImplemented)
+    }
+
     /// Find the region covering `vaddr`, if any. Returns a copy
     /// since the region table lives behind an interior lock.
     pub fn lookup(&self, vaddr: VirtAddr) -> Option<Region> {

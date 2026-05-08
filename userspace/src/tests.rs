@@ -7075,3 +7075,213 @@ fn smoke_userspace_brk_grows_heap() -> TestResult {
 // catches it.
 #[cfg(all(target_arch = "x86_64", not(feature = "user-mode-e2e")))]
 kernel_test_in!("userspace", smoke_userspace_brk_grows_heap);
+
+// ── fork(2) smokes ─────────────────────────────────────────────────
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_fork_distinct_address_space() -> TestResult {
+    // Dispatches Syscall::Fork (57) against a synthetic parent AS,
+    // confirms the spawned child is on the scheduler with a
+    // DIFFERENT Arc<AddressSpace> than the parent (the whole
+    // point — fork must duplicate, not share). Counterpart to
+    // smoke_userspace_clone_shares_address_space. Also verifies
+    // the parent's region's bytes were copied into independent
+    // child frames.
+    use narf_memory::{Region, RegionPerms, VirtAddr};
+
+    crate::syscall::__test_clear_global();
+    narf_scheduler::init();
+
+    let mut parent_as_inner = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Fail("AddressSpace::new_for_user"),
+    };
+    let frame = match narf_memory::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => return TestResult::Fail("alloc_frame parent region"),
+    };
+    const SENTINEL_VADDR: u64 = 0x0000_0080_0000_0000;
+    if parent_as_inner
+        .map_region(Region {
+            base: VirtAddr::new(SENTINEL_VADDR),
+            len: 4096,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![frame],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("map parent sentinel region");
+    }
+    if unsafe { parent_as_inner.materialize() }.is_err() {
+        return TestResult::Fail("materialize parent");
+    }
+    // Stamp a sentinel; clone_for_fork must memcpy this into the
+    // child's fresh frame.
+    // SAFETY: identity-mapped, single-task ownership.
+    unsafe {
+        *(frame.raw() as *mut u32) = 0xCAFEBABE;
+    }
+
+    let parent_as = Arc::new(parent_as_inner);
+    *PARENT_AS.lock() = Some(parent_as.clone());
+    install_address_space_lookup(lookup_parent_as);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let mut ctx = StubCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
+    kernel_syscall_entry(57, &mut ctx);
+
+    let ret = match ctx.ret {
+        Some(r) => r,
+        None => return TestResult::Fail("no return set"),
+    };
+    if ret.status != SyscallReturn::OK {
+        return TestResult::Fail("fork returned non-OK status");
+    }
+    if ret.value == 0 {
+        return TestResult::Fail("fork returned tid=0");
+    }
+    let child_tid = narf_scheduler::TaskId(ret.value);
+    let child_as = match narf_scheduler::address_space_of(child_tid) {
+        Some(a) => a,
+        None => return TestResult::Fail("child has no AS attached"),
+    };
+    if Arc::ptr_eq(&child_as, &parent_as) {
+        return TestResult::Fail("child AS is the parent AS — fork must duplicate, not share");
+    }
+
+    let parent_region = match parent_as.lookup(VirtAddr::new(SENTINEL_VADDR)) {
+        Some(r) => r,
+        None => return TestResult::Fail("parent region missing"),
+    };
+    let child_region = match child_as.lookup(VirtAddr::new(SENTINEL_VADDR)) {
+        Some(r) => r,
+        None => return TestResult::Fail("child region missing — fork didn't copy"),
+    };
+    if parent_region.phys[0] == child_region.phys[0] {
+        return TestResult::Fail("child shares parent's physical frame — must be independent");
+    }
+
+    // Verify the child's frame got the parent's bytes copied in.
+    // SAFETY: identity-mapped.
+    let child_word = unsafe { *(child_region.phys[0].raw() as *const u32) };
+    if child_word != 0xCAFEBABE {
+        return TestResult::Fail("child frame did not inherit parent's bytes");
+    }
+
+    // Mutate the child's frame and confirm the parent's is
+    // unchanged (proves true independence).
+    unsafe {
+        *(child_region.phys[0].raw() as *mut u32) = 0xDEADBEEF;
+    }
+    let parent_word = unsafe { *(parent_region.phys[0].raw() as *const u32) };
+    if parent_word != 0xCAFEBABE {
+        return TestResult::Fail("mutating child frame leaked into parent");
+    }
+
+    *PARENT_AS.lock() = None;
+    crate::syscall::__test_clear_global();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_userspace_fork_distinct_address_space);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_fork_inherits_fd_table() -> TestResult {
+    // After fork, the child's fd table is a per-entry copy of the
+    // parent's at fork time. fd::with_table lazily creates a table
+    // pre-populated with stdio; touching the parent here
+    // materialises it for fd::fork to copy.
+    use crate::fd;
+
+    crate::syscall::__test_clear_global();
+    narf_scheduler::init();
+    fd::init();
+
+    let parent_as = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => return TestResult::Fail("AddressSpace::new_for_user"),
+    };
+    *PARENT_AS.lock() = Some(parent_as.clone());
+    install_address_space_lookup(lookup_parent_as);
+
+    let parent_tid = 0xA11CEu64;
+    let parent_count: usize = fd::with_table(parent_tid, |t| {
+        (0..16).filter(|&i| t.get(i).is_some()).count()
+    })
+    .unwrap_or(0);
+    if parent_count < 3 {
+        return TestResult::Fail("parent table missing default stdio");
+    }
+
+    let child_tid = 0xB0BBu64;
+    let copied = fd::fork(parent_tid, child_tid);
+    if copied < 3 {
+        return TestResult::Fail("fork did not copy at least the 3 stdio fds");
+    }
+
+    let child_count: usize = fd::with_table(child_tid, |t| {
+        (0..16).filter(|&i| t.get(i).is_some()).count()
+    })
+    .unwrap_or(0);
+    if child_count != parent_count {
+        return TestResult::Fail("child fd count differs from parent at fork time");
+    }
+
+    // Closing a parent fd must NOT touch the child's table — the
+    // tables are independent post-fork.
+    fd::with_table(parent_tid, |t| t.close(0));
+    let child_post: usize = fd::with_table(child_tid, |t| {
+        (0..16).filter(|&i| t.get(i).is_some()).count()
+    })
+    .unwrap_or(0);
+    if child_post != parent_count {
+        return TestResult::Fail("closing parent fd leaked into child");
+    }
+
+    fd::detach(parent_tid);
+    fd::detach(child_tid);
+    *PARENT_AS.lock() = None;
+    crate::syscall::__test_clear_global();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_userspace_fork_inherits_fd_table);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_fork_rejects_without_address_space() -> TestResult {
+    // Defence-in-depth: with no AS lookup installed, fork must
+    // return InvalidOp rather than panic / spawn a bogus task.
+    crate::syscall::__test_clear_global();
+    narf_scheduler::init();
+    *PARENT_AS.lock() = None;
+    install_address_space_lookup(lookup_parent_as); // returns None
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let mut ctx = StubCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
+    kernel_syscall_entry(57, &mut ctx);
+
+    let ret = match ctx.ret {
+        Some(r) => r,
+        None => return TestResult::Fail("no return set"),
+    };
+    if ret.status == SyscallReturn::OK {
+        return TestResult::Fail("fork without AS lookup should not succeed");
+    }
+
+    crate::syscall::__test_clear_global();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_userspace_fork_rejects_without_address_space);

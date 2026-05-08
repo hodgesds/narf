@@ -3221,6 +3221,111 @@ fn sys_clone(ctx: &mut dyn TrapContext) {
     }
 }
 
+// ── fork(2) — duplicate-process counterpart to sys_clone ───────────
+//
+// Where sys_clone shares the parent's `Arc<AddressSpace>` so a new
+// task runs alongside in the same memory map (POSIX threads),
+// sys_fork allocates a fresh AS, copies every region's pages by
+// value via `AddressSpace::clone_for_fork`, and spawns the child
+// against the duplicate. Returns the child's tid to the parent.
+//
+// Inheritance: AS (copied), fd table (copied via `fd::fork`), cwd
+// (copied via `cwd_fork`), brk (copied via `brk_fork`), sigaction
+// handlers (copied via `sigaction_fork`).
+//
+// FIXME(trap-frame-inheritance): real POSIX fork resumes the
+// child at the instruction *after* its syscall, with RAX rewritten
+// to 0. NARF's `UserTaskFuture::new` always starts a process at
+// its load-time (entry, stack_top); we don't yet have a way to
+// seed the child with the parent's saved trap frame. This is
+// "fork-shaped AS-clone + spawn", suitable for proving the cloning
+// machinery, but a true POSIX fork() ABI requires extending
+// `UserTaskFuture` to accept a pre-seeded UserState.
+//
+// FIXME(cow): non-COW first cut. Every PT_LOAD page is eagerly
+// memcpy'd at fork time. The eventual hook lives in
+// `narf_memory::region::cow_split_on_write` (not yet written);
+// until then we eagerly memcpy. Acceptable on Stage-4 processes;
+// expensive on large brk heaps.
+
+fn sys_fork(ctx: &mut dyn TrapContext) {
+    let parent_as = match current_address_space() {
+        Some(a) => a,
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+
+    // SAFETY: clone_for_fork's contract — paging is live; the
+    // frame allocator was initialised at boot.
+    let mut child_as = match unsafe { parent_as.clone_for_fork() } {
+        Ok(a) => a,
+        Err(_) => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+    // SAFETY: child AS just constructed; no concurrent writers.
+    if unsafe { child_as.materialize() }.is_err() {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    let child_as = alloc::sync::Arc::new(child_as);
+
+    let parent_pid = current_task_id();
+    let child_pid = crate::alloc_pid();
+    let proc = crate::UserProcess {
+        pid: child_pid,
+        address_space: child_as.clone(),
+        // Parent's load-time entry (see trap-frame FIXME above).
+        entry: crate::EntryPoint(narf_memory::VirtAddr::new(0)),
+        stack_top: narf_memory::VirtAddr::new(0),
+        fs_base: {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                use core::arch::asm;
+                let lo: u32;
+                let hi: u32;
+                const IA32_FS_BASE: u32 = 0xC000_0100;
+                asm!(
+                    "rdmsr",
+                    in("ecx") IA32_FS_BASE,
+                    out("eax") lo,
+                    out("edx") hi,
+                    options(nostack, preserves_flags),
+                );
+                let v = (lo as u64) | ((hi as u64) << 32);
+                if v == 0 { None } else { Some(v) }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            None
+        },
+    };
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let child_tid = narf_scheduler::spawn_user(
+            crate::user_task::UserTaskFuture::new(proc),
+            narf_scheduler::TaskSpec::unthrottled(),
+            child_as,
+        );
+        // POSIX inheritance — fd / cwd / brk / sigaction handlers
+        // are copied; pending signals reset (handled by sigaction_fork
+        // not touching the pending bitmap).
+        crate::fd::fork(parent_pid, child_tid.raw());
+        cwd_fork(parent_pid, child_tid.raw());
+        brk_fork(parent_pid, child_tid.raw());
+        sigaction_fork(parent_pid, child_tid.raw());
+        ctx.set_return(SyscallReturn::ok(child_tid.raw()));
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (proc, child_as, child_pid, parent_pid);
+        ctx.set_return(SyscallReturn::invalid_op());
+    }
+}
+
 // ── Per-task pgid table ────────────────────────────────────────────
 //
 // POSIX setpgid / getpgid manage process-group ids. NARF doesn't
@@ -4419,6 +4524,18 @@ pub fn __test_cwd_reset() {
     *CWD_TABLE.lock() = None;
 }
 
+/// fork(2) inheritance: copy `parent`'s cwd to `child`. No-op
+/// if the registry isn't up or the parent has no entry (child
+/// inherits the default `/`).
+pub fn cwd_fork(parent: u64, child: u64) {
+    let mut g = CWD_TABLE.lock();
+    if let Some(map) = g.as_mut() {
+        if let Some(v) = map.get(&parent).cloned() {
+            map.insert(child, v);
+        }
+    }
+}
+
 /// Diagnostic: peek the recorded cwd for `task`. Returns the
 /// default `"/"` if `task` has never called Chdir.
 pub fn cwd_of(task: u64) -> alloc::string::String {
@@ -4530,6 +4647,16 @@ static BRK_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
 /// any user task can issue `Syscall::Brk`.
 pub fn brk_init() {
     *BRK_TABLE.lock() = Some(BTreeMap::new());
+}
+
+/// fork(2) inheritance: copy `parent`'s brk top to `child`.
+pub fn brk_fork(parent: u64, child: u64) {
+    let mut g = BRK_TABLE.lock();
+    if let Some(map) = g.as_mut() {
+        if let Some(&v) = map.get(&parent) {
+            map.insert(child, v);
+        }
+    }
 }
 
 /// Reset the registry — test hook.
@@ -5071,6 +5198,19 @@ pub fn sigaction_init() {
     *SIGACTION_TABLE.lock() = Some(BTreeMap::new());
 }
 
+/// fork(2) inheritance: copy `parent`'s sigaction handler table
+/// to `child`. POSIX: handlers are inherited; pending signals
+/// are not (they live in a separate table whose default-empty
+/// state is the correct child starting point).
+pub fn sigaction_fork(parent: u64, child: u64) {
+    let mut g = SIGACTION_TABLE.lock();
+    if let Some(map) = g.as_mut() {
+        if let Some(v) = map.get(&parent).copied() {
+            map.insert(child, v);
+        }
+    }
+}
+
 /// Reset the registry — test hook.
 #[doc(hidden)]
 pub fn __test_sigaction_reset() {
@@ -5262,6 +5402,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::GetPpid, "getppid", RawFnHandler(sys_getppid));
     table.install_raw(Syscall::Gettid, "gettid", RawFnHandler(sys_gettid));
     table.install_raw(Syscall::Clone, "clone", RawFnHandler(sys_clone));
+    table.install_raw(Syscall::Fork, "fork", RawFnHandler(sys_fork));
     table.install_raw(Syscall::GetUid, "getuid", RawFnHandler(sys_getuid));
     table.install_raw(Syscall::GetGid, "getgid", RawFnHandler(sys_getgid));
     table.install_raw(Syscall::SetUid, "setuid", RawFnHandler(sys_setuid));

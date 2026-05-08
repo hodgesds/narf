@@ -206,6 +206,36 @@ impl FileOps for ConsoleFile {
     }
 }
 
+/// Duplicate every fd entry from `parent` into a fresh table for
+/// `child`. POSIX fork(2): the child inherits an independent copy
+/// of the descriptor table whose entries reference the same
+/// underlying open-file objects (Arc::clone on the inner `FileOps`
+/// trait object — refcount up, no extra `Box::new`). Per-fd `flags`
+/// and `offset` snapshot at fork time.
+///
+/// Idempotent only if the child table doesn't already exist; if it
+/// does, the existing table is overwritten with the parent's
+/// snapshot — fork is the entry point that should hit this, and a
+/// child's table cannot pre-exist its own creation.
+///
+/// Returns the number of fds copied.
+pub fn fork(parent: u64, child: u64) -> usize {
+    let mut g = TABLES.lock();
+    let map = match g.as_mut() {
+        Some(m) => m,
+        None => return 0,
+    };
+    let parent_slots: Vec<Option<FdEntry>> = map
+        .get(&parent)
+        .map(|t| t.slots.clone())
+        .unwrap_or_default();
+    let copied = parent_slots.iter().filter(|s| s.is_some()).count();
+    let mut child_table = FdTable::new();
+    child_table.slots = parent_slots;
+    map.insert(child, child_table);
+    copied
+}
+
 /// Drop the entire fd table for `task_id`. Call on task exit so
 /// the FileOps `Arc`s can release.
 pub fn detach(task_id: u64) {
