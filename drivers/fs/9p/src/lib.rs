@@ -25,20 +25,12 @@
 
 extern crate alloc;
 
+pub mod loopback;
 pub mod message;
 pub mod node;
 pub mod session;
 pub mod volume;
 
-// NOTE: `loopback.rs` and `tests.rs` are partial work from a
-// background agent that left the crate's protocol surface
-// half-refactored — its files reference a `Transport` trait /
-// `WireRead` / `WireWrite` / `frame_message` / `NinepVolume` API
-// that doesn't exist yet in message.rs / session.rs / volume.rs
-// (which still expose the older `P9Transport` / `P9FileSystem`
-// shape). Both files are kept on disk as a starting point for a
-// future pass to reconcile, but they are NOT registered as
-// modules so the crate continues to build. See
-// drivers/fs/9p/src/{loopback,tests}.rs.
+mod tests;
 
 pub use message::{MsgType, Qid};

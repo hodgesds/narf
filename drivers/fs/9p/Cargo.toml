@@ -18,6 +18,7 @@ narf-drivers      = { path = "../../" }
 narf-driver-runtime = { path = "../../runtime" }
 narf-capabilities = { path = "../../../capabilities" }
 narf-memory       = { path = "../../../memory" }
+narf-block        = { path = "../../../block" }
 narf-filesystem   = { path = "../../../filesystem" }
 narf-io           = { path = "../../../io" }
 narf-kernel-test  = { path = "../../../verification/kernel-test" }

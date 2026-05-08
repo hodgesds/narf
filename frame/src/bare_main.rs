@@ -22,6 +22,7 @@ extern crate narf_drivers_fs_ext2 as _;
 extern crate narf_drivers_fs_fat as _;
 extern crate narf_drivers_fs_minix as _;
 extern crate narf_drivers_fs_iso9660 as _;
+extern crate narf_drivers_fs_9p as _;
 extern crate narf_edid as _;
 extern crate narf_efi as _;
 extern crate narf_hid as _;

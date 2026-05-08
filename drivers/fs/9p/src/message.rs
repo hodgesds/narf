@@ -1,8 +1,60 @@
-//! 9P Message types and serialization.
+//! 9P2000 wire format codec.
+//!
+//! Pure-function encoder / decoder for every T-message and R-message
+//! the driver exchanges. The protocol's normative layout is defined
+//! in:
+//! - `intro(5)` — frame format, qid, tag/fid conventions.
+//! - `version(5)` — Tversion / Rversion bodies, NOTAG.
+//! - `attach(5)` — Tattach / Rattach, NOFID.
+//! - `walk(5)` — Twalk / Rwalk; component name validation rules.
+//! - `open(5)` — Topen / Ropen; mode bits.
+//! - `read(5)` / `write(5)` — Tread / Rread / Twrite / Rwrite.
+//! - `clunk(5)` / `remove(5)` — Tclunk / Rclunk, Tremove / Rremove.
+//! - `stat(5)` — Tstat / Rstat; the variable-length stat structure.
+//! - `error(5)` — Rerror.
+//! See <https://9fans.github.io/plan9port/man/man9/>.
+//!
+//! No GPL/LGPL 9P implementation source was consulted while writing
+//! this file — algorithms are derived strictly from the man pages.
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
+/// Frame header size: `size[4] type[1] tag[2]` = 7 bytes (intro(5)).
+pub const HEADER_SIZE: usize = 7;
+
+/// "no fid" sentinel returned by Tattach when there is no auth fid
+/// (attach(5)).
+pub const NOFID: u32 = 0xFFFF_FFFF;
+
+/// "no tag" sentinel for Tversion (version(5)). Real T-messages MUST
+/// use a tag distinct from NOTAG.
+pub const NOTAG: u16 = 0xFFFF;
+
+/// Decoder / encoder error surface. Surfaces wire-format violations
+/// (truncated frame, length-prefix overflow, unknown message type).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DecodeError {
+    /// Buffer ended before the requested field could be read.
+    ShortBuffer,
+    /// Length-prefixed string overflowed `u16::MAX` bytes (stat(5)
+    /// caps strings at this length implicitly through the size[2]
+    /// prefix).
+    StringTooLong,
+    /// Encoder ran out of room in the destination buffer.
+    OutOfRoom,
+    /// Header `type[1]` byte did not name a known T- or R-message.
+    UnknownMsgType,
+    /// More than 16 walk-name components in a single Twalk
+    /// (walk(5) §"the maximum number of names in a single walk is
+    /// 16").
+    TooManyWalkNames,
+    /// `validate_walk_name` rejected: component empty or contained
+    /// `/`.
+    InvalidWalkName,
+}
+
+/// 9P message-type tag byte (intro(5)).
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MsgType {
@@ -22,33 +74,96 @@ pub enum MsgType {
     Twstat   = 126, Rwstat   = 127,
 }
 
-impl From<u8> for MsgType {
-    fn from(val: u8) -> Self {
-        unsafe { core::mem::transmute(val) }
+impl MsgType {
+    pub fn from_u8(b: u8) -> Result<Self, DecodeError> {
+        match b {
+            100 => Ok(MsgType::Tversion),
+            101 => Ok(MsgType::Rversion),
+            102 => Ok(MsgType::Tauth),
+            103 => Ok(MsgType::Rauth),
+            104 => Ok(MsgType::Tattach),
+            105 => Ok(MsgType::Rattach),
+            106 => Ok(MsgType::Terror),
+            107 => Ok(MsgType::Rerror),
+            108 => Ok(MsgType::Tflush),
+            109 => Ok(MsgType::Rflush),
+            110 => Ok(MsgType::Twalk),
+            111 => Ok(MsgType::Rwalk),
+            112 => Ok(MsgType::Topen),
+            113 => Ok(MsgType::Ropen),
+            114 => Ok(MsgType::Tcreate),
+            115 => Ok(MsgType::Rcreate),
+            116 => Ok(MsgType::Tread),
+            117 => Ok(MsgType::Rread),
+            118 => Ok(MsgType::Twrite),
+            119 => Ok(MsgType::Rwrite),
+            120 => Ok(MsgType::Tclunk),
+            121 => Ok(MsgType::Rclunk),
+            122 => Ok(MsgType::Tremove),
+            123 => Ok(MsgType::Rremove),
+            124 => Ok(MsgType::Tstat),
+            125 => Ok(MsgType::Rstat),
+            126 => Ok(MsgType::Twstat),
+            127 => Ok(MsgType::Rwstat),
+            _ => Err(DecodeError::UnknownMsgType),
+        }
     }
 }
 
-#[repr(C, packed)]
-#[derive(Debug, Copy, Clone, Default)]
+/// 13-byte qid: `type[1] version[4] path[8]` (intro(5)).
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub struct Qid {
     pub qid_type: u8,
     pub version: u32,
     pub path: u64,
 }
 
-#[repr(C, packed)]
-#[derive(Debug, Copy, Clone)]
-pub struct MsgHeader {
-    pub size: u32,
-    pub msg_type: u8,
-    pub tag: u16,
+/// `qid_type` constants per intro(5).
+pub mod qtype {
+    /// Directory.
+    pub const DIR: u8 = 0x80;
+    /// Append-only file.
+    pub const APPEND: u8 = 0x40;
+    /// Exclusive-use file.
+    pub const EXCL: u8 = 0x20;
+    /// Authentication file (auth(5)).
+    pub const AUTH: u8 = 0x08;
+    /// Plain file (zero high bits).
+    pub const FILE: u8 = 0x00;
 }
 
-#[derive(Debug, Clone, Default)]
+/// `mode` field constants (the high byte of a stat's mode field
+/// mirrors the qid's type bits per stat(5)).
+pub mod statmode {
+    pub const DIR: u32 = 0x8000_0000;
+    pub const APPEND: u32 = 0x4000_0000;
+    pub const EXCL: u32 = 0x2000_0000;
+    pub const AUTH: u32 = 0x0800_0000;
+}
+
+/// `Topen`/`Tcreate` mode-byte bottom 4 bits per open(5).
+pub mod oflag {
+    pub const READ: u8 = 0;
+    pub const WRITE: u8 = 1;
+    pub const RDWR: u8 = 2;
+    pub const EXEC: u8 = 3;
+    /// Truncate on open.
+    pub const TRUNC: u8 = 0x10;
+    /// Remove on close.
+    pub const RCLOSE: u8 = 0x40;
+}
+
+/// Variable-length stat structure (stat(5)). Encoded as
+/// `size[2] type[2] dev[4] qid[13] mode[4] atime[4] mtime[4]
+/// length[8] name[s] uid[s] gid[s] muid[s]` where `size` is the
+/// inclusive byte count of every field after `size` itself.
+///
+/// Field names mirror the spec; the rust-keyword-clashing `type`
+/// and `dev` are renamed to `kernel_type` / `kernel_dev`.
+#[derive(Clone, Debug, Default)]
 pub struct P9Stat {
-    pub size: u16,
-    pub ptype: u16,
-    pub dev: u32,
+    pub kernel_type: u16,
+    pub kernel_dev: u32,
     pub qid: Qid,
     pub mode: u32,
     pub atime: u32,
@@ -61,210 +176,332 @@ pub struct P9Stat {
 }
 
 impl P9Stat {
-    pub fn decode(buf: &mut P9Buffer) -> Self {
-        let size = buf.read_u16();
-        let start_offset = buf.offset;
-        let s = Self {
-            size,
-            ptype: buf.read_u16(),
-            dev: buf.read_u32(),
-            qid: buf.read_qid(),
-            mode: buf.read_u32(),
-            atime: buf.read_u32(),
-            mtime: buf.read_u32(),
-            length: buf.read_u64(),
-            name: buf.read_string(),
-            uid: buf.read_string(),
-            gid: buf.read_string(),
-            muid: buf.read_string(),
-        };
-        buf.offset = start_offset + size as usize;
-        s
+    /// Number of body bytes the encoder will emit AFTER the leading
+    /// `size[2]` field. The leading size itself encodes this count.
+    /// Used by Rstat outer framing (which wraps the stat body in its
+    /// own length prefix per stat(5)).
+    pub fn body_len(&self) -> usize {
+        // Fixed: type(2) + dev(4) + qid(13) + mode(4) + atime(4)
+        //      + mtime(4) + length(8) = 39
+        // Plus four length-prefixed strings: 4 * 2 + str lengths.
+        39 + 4 * 2 + self.name.len() + self.uid.len() + self.gid.len() + self.muid.len()
+    }
+
+    pub fn encode(&self, w: &mut WireWrite) -> Result<(), DecodeError> {
+        let body = self.body_len();
+        if body > u16::MAX as usize {
+            return Err(DecodeError::StringTooLong);
+        }
+        w.write_u16(body as u16)?;
+        w.write_u16(self.kernel_type)?;
+        w.write_u32(self.kernel_dev)?;
+        w.write_qid(&self.qid)?;
+        w.write_u32(self.mode)?;
+        w.write_u32(self.atime)?;
+        w.write_u32(self.mtime)?;
+        w.write_u64(self.length)?;
+        w.write_str(&self.name)?;
+        w.write_str(&self.uid)?;
+        w.write_str(&self.gid)?;
+        w.write_str(&self.muid)?;
+        Ok(())
+    }
+
+    pub fn decode(r: &mut WireRead) -> Result<Self, DecodeError> {
+        let _size = r.read_u16()?; // size[2] — informational; we read by field
+        let kernel_type = r.read_u16()?;
+        let kernel_dev = r.read_u32()?;
+        let qid = r.read_qid()?;
+        let mode = r.read_u32()?;
+        let atime = r.read_u32()?;
+        let mtime = r.read_u32()?;
+        let length = r.read_u64()?;
+        let name = r.read_str()?;
+        let uid = r.read_str()?;
+        let gid = r.read_str()?;
+        let muid = r.read_str()?;
+        Ok(Self {
+            kernel_type,
+            kernel_dev,
+            qid,
+            mode,
+            atime,
+            mtime,
+            length,
+            name,
+            uid,
+            gid,
+            muid,
+        })
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum P9Msg {
-    Tversion { msize: u32, version: String },
-    Rversion { msize: u32, version: String },
-    Rerror { ename: String },
-    Tattach { fid: u32, afid: u32, uname: String, aname: String },
-    Rattach { qid: Qid },
-    Twalk { fid: u32, newfid: u32, wnames: Vec<String> },
-    Rwalk { qids: Vec<Qid> },
-    Topen { fid: u32, mode: u8 },
-    Ropen { qid: Qid, iounit: u32 },
-    Tcreate { fid: u32, name: String, perm: u32, mode: u8 },
-    Rcreate { qid: Qid, iounit: u32 },
-    Tread { fid: u32, offset: u64, count: u32 },
-    Rread { data: Vec<u8> },
-    Twrite { fid: u32, offset: u64, data: Vec<u8> },
-    Rwrite { count: u32 },
-    Tclunk { fid: u32 },
-    Rclunk,
-    Tremove { fid: u32 },
-    Rremove,
-    Tstat { fid: u32 },
-    Rstat { stat: P9Stat },
-}
+// ── Wire I/O ────────────────────────────────────────────────────────
 
+/// Forward iterator over a byte buffer. Reads are little-endian
+/// (intro(5): all integers are little-endian on the wire).
 #[derive(Debug)]
-pub struct P9Buffer<'a> {
-    pub data: &'a mut [u8],
-    pub offset: usize,
+pub struct WireRead<'a> {
+    data: &'a [u8],
+    pos: usize,
 }
 
-impl<'a> P9Buffer<'a> {
+impl<'a> WireRead<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.data.len().saturating_sub(self.pos)
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
+        if self.pos + n > self.data.len() {
+            return Err(DecodeError::ShortBuffer);
+        }
+        let out = &self.data[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(out)
+    }
+
+    pub fn read_u8(&mut self) -> Result<u8, DecodeError> {
+        Ok(self.take(1)?[0])
+    }
+
+    pub fn read_u16(&mut self) -> Result<u16, DecodeError> {
+        let b = self.take(2)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+
+    pub fn read_u32(&mut self) -> Result<u32, DecodeError> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    pub fn read_u64(&mut self) -> Result<u64, DecodeError> {
+        let b = self.take(8)?;
+        let mut a = [0u8; 8];
+        a.copy_from_slice(b);
+        Ok(u64::from_le_bytes(a))
+    }
+
+    pub fn read_str(&mut self) -> Result<String, DecodeError> {
+        let n = self.read_u16()? as usize;
+        let bytes = self.take(n)?;
+        Ok(String::from_utf8_lossy(bytes).into_owned())
+    }
+
+    pub fn read_qid(&mut self) -> Result<Qid, DecodeError> {
+        let qid_type = self.read_u8()?;
+        let version = self.read_u32()?;
+        let path = self.read_u64()?;
+        Ok(Qid {
+            qid_type,
+            version,
+            path,
+        })
+    }
+}
+
+/// Forward writer over a byte buffer. Same little-endian
+/// convention as [`WireRead`].
+#[derive(Debug)]
+pub struct WireWrite<'a> {
+    data: &'a mut [u8],
+    pos: usize,
+}
+
+impl<'a> WireWrite<'a> {
     pub fn new(data: &'a mut [u8]) -> Self {
-        Self { data, offset: 0 }
+        Self { data, pos: 0 }
     }
 
-    pub fn write_u8(&mut self, val: u8) { self.data[self.offset] = val; self.offset += 1; }
-    pub fn write_u16(&mut self, val: u16) { self.data[self.offset..self.offset + 2].copy_from_slice(&val.to_le_bytes()); self.offset += 2; }
-    pub fn write_u32(&mut self, val: u32) { self.data[self.offset..self.offset + 4].copy_from_slice(&val.to_le_bytes()); self.offset += 4; }
-    pub fn write_u64(&mut self, val: u64) { self.data[self.offset..self.offset + 8].copy_from_slice(&val.to_le_bytes()); self.offset += 8; }
-    pub fn write_string(&mut self, val: &str) {
-        self.write_u16(val.len() as u16);
-        self.data[self.offset..self.offset + val.len()].copy_from_slice(val.as_bytes());
-        self.offset += val.len();
-    }
-    pub fn write_qid(&mut self, qid: &Qid) {
-        self.write_u8(qid.qid_type);
-        self.write_u32(qid.version);
-        self.write_u64(qid.path);
+    pub fn pos(&self) -> usize {
+        self.pos
     }
 
-    pub fn read_u8(&mut self) -> u8 { let val = self.data[self.offset]; self.offset += 1; val }
-    pub fn read_u16(&mut self) -> u16 { let val = u16::from_le_bytes([self.data[self.offset], self.data[self.offset + 1]]); self.offset += 2; val }
-    pub fn read_u32(&mut self) -> u32 { let val = u32::from_le_bytes([self.data[self.offset], self.data[self.offset+1], self.data[self.offset+2], self.data[self.offset+3]]); self.offset += 4; val }
-    pub fn read_u64(&mut self) -> u64 {
-        let mut b = [0u8; 8];
-        b.copy_from_slice(&self.data[self.offset..self.offset+8]);
-        self.offset += 8;
-        u64::from_le_bytes(b)
+    pub fn capacity(&self) -> usize {
+        self.data.len()
     }
-    pub fn read_string(&mut self) -> String {
-        let len = self.read_u16() as usize;
-        let s = String::from_utf8_lossy(&self.data[self.offset..self.offset + len]).into_owned();
-        self.offset += len;
-        s
+
+    fn put(&mut self, bytes: &[u8]) -> Result<(), DecodeError> {
+        if self.pos + bytes.len() > self.data.len() {
+            return Err(DecodeError::OutOfRoom);
+        }
+        self.data[self.pos..self.pos + bytes.len()].copy_from_slice(bytes);
+        self.pos += bytes.len();
+        Ok(())
     }
-    pub fn read_qid(&mut self) -> Qid {
-        Qid { qid_type: self.read_u8(), version: self.read_u32(), path: self.read_u64() }
+
+    pub fn write_u8(&mut self, v: u8) -> Result<(), DecodeError> {
+        self.put(&[v])
+    }
+
+    pub fn write_u16(&mut self, v: u16) -> Result<(), DecodeError> {
+        self.put(&v.to_le_bytes())
+    }
+
+    pub fn write_u32(&mut self, v: u32) -> Result<(), DecodeError> {
+        self.put(&v.to_le_bytes())
+    }
+
+    pub fn write_u64(&mut self, v: u64) -> Result<(), DecodeError> {
+        self.put(&v.to_le_bytes())
+    }
+
+    pub fn write_str(&mut self, s: &str) -> Result<(), DecodeError> {
+        if s.len() > u16::MAX as usize {
+            return Err(DecodeError::StringTooLong);
+        }
+        self.write_u16(s.len() as u16)?;
+        self.put(s.as_bytes())
+    }
+
+    pub fn write_qid(&mut self, q: &Qid) -> Result<(), DecodeError> {
+        self.write_u8(q.qid_type)?;
+        self.write_u32(q.version)?;
+        self.write_u64(q.path)
+    }
+
+    /// Patch the leading `size[4]` field after the body has been
+    /// written. Used by `frame_message` to back-fill the total
+    /// frame length.
+    pub fn patch_u32_at(&mut self, offset: usize, v: u32) -> Result<(), DecodeError> {
+        if offset + 4 > self.pos {
+            return Err(DecodeError::OutOfRoom);
+        }
+        self.data[offset..offset + 4].copy_from_slice(&v.to_le_bytes());
+        Ok(())
     }
 }
 
-impl P9Msg {
-    pub fn msg_type(&self) -> MsgType {
-        match self {
-            P9Msg::Tversion { .. } => MsgType::Tversion,
-            P9Msg::Rversion { .. } => MsgType::Rversion,
-            P9Msg::Rerror { .. } => MsgType::Rerror,
-            P9Msg::Tattach { .. } => MsgType::Tattach,
-            P9Msg::Rattach { .. } => MsgType::Rattach,
-            P9Msg::Twalk { .. } => MsgType::Twalk,
-            P9Msg::Rwalk { .. } => MsgType::Rwalk,
-            P9Msg::Topen { .. } => MsgType::Topen,
-            P9Msg::Ropen { .. } => MsgType::Ropen,
-            P9Msg::Tcreate { .. } => MsgType::Tcreate,
-            P9Msg::Rcreate { .. } => MsgType::Rcreate,
-            P9Msg::Tread { .. } => MsgType::Tread,
-            P9Msg::Rread { .. } => MsgType::Rread,
-            P9Msg::Twrite { .. } => MsgType::Twrite,
-            P9Msg::Rwrite { .. } => MsgType::Rwrite,
-            P9Msg::Tclunk { .. } => MsgType::Tclunk,
-            P9Msg::Rclunk => MsgType::Rclunk,
-            P9Msg::Tremove { .. } => MsgType::Tremove,
-            P9Msg::Rremove => MsgType::Rremove,
-            P9Msg::Tstat { .. } => MsgType::Tstat,
-            P9Msg::Rstat { .. } => MsgType::Rstat,
-        }
-    }
+// ── Header + per-message helpers ───────────────────────────────────
 
-    pub fn encode(&self, buf: &mut P9Buffer) {
-        match self {
-            P9Msg::Tversion { msize, version } => {
-                buf.write_u32(*msize);
-                buf.write_string(version);
-            }
-            P9Msg::Tattach { fid, afid, uname, aname } => {
-                buf.write_u32(*fid);
-                buf.write_u32(*afid);
-                buf.write_string(uname);
-                buf.write_string(aname);
-            }
-            P9Msg::Twalk { fid, newfid, wnames } => {
-                buf.write_u32(*fid);
-                buf.write_u32(*newfid);
-                buf.write_u16(wnames.len() as u16);
-                for name in wnames {
-                    buf.write_string(name);
-                }
-            }
-            P9Msg::Topen { fid, mode } => {
-                buf.write_u32(*fid);
-                buf.write_u8(*mode);
-            }
-            P9Msg::Tcreate { fid, name, perm, mode } => {
-                buf.write_u32(*fid);
-                buf.write_string(name);
-                buf.write_u32(*perm);
-                buf.write_u8(*mode);
-            }
-            P9Msg::Tread { fid, offset, count } => {
-                buf.write_u32(*fid);
-                buf.write_u64(*offset);
-                buf.write_u32(*count);
-            }
-            P9Msg::Twrite { fid, offset, data } => {
-                buf.write_u32(*fid);
-                buf.write_u64(*offset);
-                buf.write_u32(data.len() as u32);
-                buf.data[buf.offset..buf.offset + data.len()].copy_from_slice(data);
-                buf.offset += data.len();
-            }
-            P9Msg::Tclunk { fid } => {
-                buf.write_u32(*fid);
-            }
-            P9Msg::Tremove { fid } => {
-                buf.write_u32(*fid);
-            }
-            P9Msg::Tstat { fid } => {
-                buf.write_u32(*fid);
-            }
-            _ => unimplemented!("Encoding for {:?}", self),
-        }
+/// Validate a single Twalk path component per walk(5).
+pub fn validate_walk_name(name: &str) -> Result<(), DecodeError> {
+    let n = name.len();
+    if n == 0 || n > 255 {
+        return Err(DecodeError::InvalidWalkName);
     }
+    if name.as_bytes().contains(&b'/') {
+        return Err(DecodeError::InvalidWalkName);
+    }
+    Ok(())
+}
 
-    pub fn decode(mtype: MsgType, buf: &mut P9Buffer) -> Self {
-        match mtype {
-            MsgType::Rversion => P9Msg::Rversion { msize: buf.read_u32(), version: buf.read_string() },
-            MsgType::Rerror => P9Msg::Rerror { ename: buf.read_string() },
-            MsgType::Rattach => P9Msg::Rattach { qid: buf.read_qid() },
-            MsgType::Rwalk => {
-                let n = buf.read_u16() as usize;
-                let mut qids = Vec::with_capacity(n);
-                for _ in 0..n { qids.push(buf.read_qid()); }
-                P9Msg::Rwalk { qids }
-            }
-            MsgType::Ropen => P9Msg::Ropen { qid: buf.read_qid(), iounit: buf.read_u32() },
-            MsgType::Rcreate => P9Msg::Rcreate { qid: buf.read_qid(), iounit: buf.read_u32() },
-            MsgType::Rread => {
-                let n = buf.read_u32() as usize;
-                let mut data = Vec::with_capacity(n);
-                data.extend_from_slice(&buf.data[buf.offset..buf.offset + n]);
-                buf.offset += n;
-                P9Msg::Rread { data }
-            }
-            MsgType::Rwrite => P9Msg::Rwrite { count: buf.read_u32() },
-            MsgType::Rclunk => P9Msg::Rclunk,
-            MsgType::Rremove => P9Msg::Rremove,
-            MsgType::Rstat => {
-                let _n = buf.read_u16();
-                let stat = P9Stat::decode(buf);
-                P9Msg::Rstat { stat }
-            }
-            _ => unimplemented!("Decoding for {:?}", mtype),
-        }
+/// Decode the 7-byte frame header. Returns `(size, type, tag)`.
+pub fn decode_header(r: &mut WireRead) -> Result<(u32, MsgType, u16), DecodeError> {
+    let size = r.read_u32()?;
+    let mtype = MsgType::from_u8(r.read_u8()?)?;
+    let tag = r.read_u16()?;
+    Ok((size, mtype, tag))
+}
+
+/// Tversion body: `msize[4] version[s]`.
+pub fn encode_tversion(w: &mut WireWrite, msize: u32, version: &str) -> Result<(), DecodeError> {
+    w.write_u32(msize)?;
+    w.write_str(version)
+}
+
+/// Rversion body — same layout as Tversion.
+#[derive(Clone, Debug)]
+pub struct Rversion {
+    pub msize: u32,
+    pub version: String,
+}
+
+pub fn decode_rversion(r: &mut WireRead) -> Result<Rversion, DecodeError> {
+    let msize = r.read_u32()?;
+    let version = r.read_str()?;
+    Ok(Rversion { msize, version })
+}
+
+/// Tattach body: `fid[4] afid[4] uname[s] aname[s]`.
+pub fn encode_tattach(
+    w: &mut WireWrite,
+    fid: u32,
+    afid: u32,
+    uname: &str,
+    aname: &str,
+) -> Result<(), DecodeError> {
+    w.write_u32(fid)?;
+    w.write_u32(afid)?;
+    w.write_str(uname)?;
+    w.write_str(aname)
+}
+
+/// Twalk body: `fid[4] newfid[4] nwname[2] wname[s]*nwname`.
+pub fn encode_twalk(
+    w: &mut WireWrite,
+    fid: u32,
+    newfid: u32,
+    names: &[&str],
+) -> Result<(), DecodeError> {
+    if names.len() > 16 {
+        return Err(DecodeError::TooManyWalkNames);
     }
+    for n in names {
+        validate_walk_name(n)?;
+    }
+    w.write_u32(fid)?;
+    w.write_u32(newfid)?;
+    w.write_u16(names.len() as u16)?;
+    for n in names {
+        w.write_str(n)?;
+    }
+    Ok(())
+}
+
+/// Topen body: `fid[4] mode[1]`.
+pub fn encode_topen(w: &mut WireWrite, fid: u32, mode: u8) -> Result<(), DecodeError> {
+    w.write_u32(fid)?;
+    w.write_u8(mode)
+}
+
+/// Tread body: `fid[4] offset[8] count[4]`.
+pub fn encode_tread(w: &mut WireWrite, fid: u32, offset: u64, count: u32) -> Result<(), DecodeError> {
+    w.write_u32(fid)?;
+    w.write_u64(offset)?;
+    w.write_u32(count)
+}
+
+/// Tclunk body: `fid[4]`.
+pub fn encode_tclunk(w: &mut WireWrite, fid: u32) -> Result<(), DecodeError> {
+    w.write_u32(fid)
+}
+
+/// Tstat body: `fid[4]`.
+pub fn encode_tstat(w: &mut WireWrite, fid: u32) -> Result<(), DecodeError> {
+    w.write_u32(fid)
+}
+
+/// Rread body decode. Returns the data slice as an owned Vec since
+/// it crosses a buffer-lifetime boundary in most callers.
+pub fn decode_rread(r: &mut WireRead) -> Result<Vec<u8>, DecodeError> {
+    let count = r.read_u32()? as usize;
+    let mut v = Vec::with_capacity(count);
+    for _ in 0..count {
+        v.push(r.read_u8()?);
+    }
+    Ok(v)
+}
+
+/// Rwalk body decode. Returns the qid list (one per successfully-
+/// walked name).
+pub fn decode_rwalk(r: &mut WireRead) -> Result<Vec<Qid>, DecodeError> {
+    let n = r.read_u16()? as usize;
+    let mut v = Vec::with_capacity(n);
+    for _ in 0..n {
+        v.push(r.read_qid()?);
+    }
+    Ok(v)
+}
+
+/// Rerror body decode: `ename[s]`.
+pub fn decode_rerror(r: &mut WireRead) -> Result<String, DecodeError> {
+    r.read_str()
 }

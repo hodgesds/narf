@@ -1,76 +1,119 @@
-//! 9P Volume management.
+//! 9P2000 volume — `FsInstance` adapter.
+//!
+//! Mounts a 9P session over any `Transport` impl: issues Tversion +
+//! Tattach during `mount`, hands callers a `NinepNode` rooted at the
+//! attached fid. Per-call ops (lookup, read, etc.) live on the node.
+//!
+//! References: `version(5)`, `attach(5)`.
 
-use alloc::sync::{Arc, Weak};
-use narf_filesystem::{FsError, FsInstance, DirOps};
+use alloc::sync::Arc;
+use core::future::Future;
+
 use narf_driver_runtime::DomainId;
-use super::session::{P9Session, P9Transport};
-use super::message::{P9Msg, Qid};
-use super::node::P9Node;
+use narf_filesystem::{DirOps, FsError, FsInstance};
 
+use super::message::{
+    decode_header, decode_rerror, decode_rversion, encode_tattach, encode_tversion, qtype,
+    MsgType, Qid, WireRead, NOFID, NOTAG,
+};
+use super::node::NinepNode;
+use super::session::{frame_message, P9Session, Transport};
+
+/// 9P2000 base protocol version string (version(5)).
+pub const PROTO_VERSION: &str = "9P2000";
+
+/// Mounted 9P session.
 #[derive(Debug)]
-pub struct P9FileSystem {
+pub struct NinepVolume {
+    pub transport: Arc<dyn Transport>,
     pub session: Arc<P9Session>,
-    pub transport: Arc<dyn P9Transport>,
-    pub domain: DomainId,
     pub root_fid: u32,
     pub root_qid: Qid,
-    pub self_weak: Weak<P9FileSystem>,
+    pub domain: DomainId,
 }
 
-impl P9FileSystem {
-    pub async fn mount(transport: Arc<dyn P9Transport>, domain: DomainId, uname: &str, aname: &str) -> Result<Arc<Self>, FsError> {
-        let session = Arc::new(P9Session::new());
-        
-        // 1. Version Handshake
-        let resp = session.transaction(&*transport, P9Msg::Tversion { 
-            msize: session.max_msg_size, 
-            version: alloc::string::String::from("9P2000.u") 
-        }, domain).await?;
+impl NinepVolume {
+    /// Issue Tversion + Tattach over `transport`, return the mounted
+    /// session. uname / aname are empty (anonymous attach).
+    pub fn mount(
+        transport: Arc<dyn Transport>,
+        domain: DomainId,
+    ) -> impl Future<Output = Result<Arc<Self>, FsError>> + Send {
+        async move {
+            let session = Arc::new(P9Session::new());
 
-        if let P9Msg::Rversion { .. } = resp {
-            // Update session max_msg_size if server suggests smaller
-        } else {
-            return Err(FsError::Unsupported);
-        }
+            // ── Tversion ────────────────────────────────────────────
+            let req = frame_message(session.msize(), MsgType::Tversion, NOTAG, |w| {
+                encode_tversion(w, session.msize(), PROTO_VERSION)
+            })
+            .map_err(map_tx_err)?;
+            let reply = transport.rpc(&req).await.map_err(map_tx_err)?;
+            let mut r = WireRead::new(&reply);
+            let (_size, mt, _tag) = decode_header(&mut r).map_err(map_tx_err)?;
+            match mt {
+                MsgType::Rversion => {
+                    let rv = decode_rversion(&mut r).map_err(map_tx_err)?;
+                    if rv.version != PROTO_VERSION {
+                        return Err(FsError::Unsupported);
+                    }
+                    session.set_msize(rv.msize);
+                }
+                MsgType::Rerror => {
+                    let _ = decode_rerror(&mut r);
+                    return Err(FsError::Unsupported);
+                }
+                _ => return Err(FsError::Unsupported),
+            }
 
-        // 2. Attach
-        let root_fid = session.alloc_fid();
-        let resp = session.transaction(&*transport, P9Msg::Tattach { 
-            fid: root_fid, 
-            afid: 0xFFFFFFFF, // NOFID
-            uname: alloc::string::String::from(uname), 
-            aname: alloc::string::String::from(aname) 
-        }, domain).await?;
+            // ── Tattach ─────────────────────────────────────────────
+            let root_fid = session.alloc_fid();
+            let tag = session.alloc_tag();
+            let req = frame_message(session.msize(), MsgType::Tattach, tag, |w| {
+                encode_tattach(w, root_fid, NOFID, "", "")
+            })
+            .map_err(map_tx_err)?;
+            let reply = transport.rpc(&req).await.map_err(map_tx_err)?;
+            let mut r = WireRead::new(&reply);
+            let (_, mt, _) = decode_header(&mut r).map_err(map_tx_err)?;
+            let root_qid = match mt {
+                MsgType::Rattach => r.read_qid().map_err(map_tx_err)?,
+                MsgType::Rerror => {
+                    let _ = decode_rerror(&mut r);
+                    return Err(FsError::Unsupported);
+                }
+                _ => return Err(FsError::Unsupported),
+            };
+            // Sanity: per attach(5) the root must be a directory.
+            if (root_qid.qid_type & qtype::DIR) == 0 {
+                return Err(FsError::Unsupported);
+            }
 
-        let root_qid = if let P9Msg::Rattach { qid } = resp {
-            qid
-        } else {
-            return Err(FsError::Unsupported);
-        };
-
-        Ok(Arc::new_cyclic(|self_weak| {
-            Self {
-                session,
+            Ok(Arc::new(Self {
                 transport,
-                domain,
+                session,
                 root_fid,
                 root_qid,
-                self_weak: self_weak.clone(),
-            }
-        }))
+                domain,
+            }))
+        }
     }
 }
 
-impl FsInstance for P9FileSystem {
+fn map_tx_err<E: core::fmt::Debug>(_e: E) -> FsError {
+    FsError::Io(narf_block::BlockError::IOError)
+}
+
+impl FsInstance for NinepVolume {
+    fn name(&self) -> &str {
+        "9p"
+    }
+
     fn root(&self) -> Arc<dyn DirOps> {
-        Arc::new(P9Node::new(
-            self.self_weak.upgrade().expect("P9FileSystem root called after drop"),
+        Arc::new(NinepNode::new_root(
+            self.transport.clone(),
+            self.session.clone(),
             self.root_fid,
             self.root_qid,
         ))
-    }
-
-    fn name(&self) -> &str {
-        "9p"
     }
 }
