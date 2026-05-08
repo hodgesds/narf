@@ -20,6 +20,7 @@ narf-filesystem   = { path = "../filesystem" }
 narf-firmware     = { path = "../firmware" }
 narf-memory       = { path = "../memory" }
 narf-scheduler    = { path = "../scheduler" }
+narf-time         = { path = "../time" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 
 [lints]
