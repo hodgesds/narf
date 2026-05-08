@@ -12,10 +12,11 @@ name = "narf_aml"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib    = { path = "../lib" }
-narf-acpi   = { path = "../acpi" }
-narf-memory = { path = "../memory" }
-narf-time   = { path = "../time" }
+narf-lib         = { path = "../lib" }
+narf-acpi        = { path = "../acpi" }
+narf-memory      = { path = "../memory" }
+narf-time        = { path = "../time" }
+narf-kernel-test = { path = "../verification/kernel-test" }
 
 [lints]
 workspace = true

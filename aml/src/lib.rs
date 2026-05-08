@@ -53,6 +53,8 @@ pub mod prt_crs;
 pub mod resource;
 pub mod sync;
 
+mod tests;
+
 /// Run-time AML value, used by the method evaluator + Field
 /// accessors. `Name(...)` flat-constant decoding stays in
 /// `NameValue` for backwards compat; `Value` is the live form.
