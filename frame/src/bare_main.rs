@@ -18,6 +18,7 @@ extern crate alloc;
 // crate's test entries. (Crates that the kernel actually uses by
 // name pick themselves up — these are the test-only ones.)
 extern crate narf_bluetooth as _;
+extern crate narf_drivers_fs_ext2 as _;
 extern crate narf_drivers_fs_fat as _;
 extern crate narf_drivers_fs_minix as _;
 extern crate narf_drivers_fs_iso9660 as _;
