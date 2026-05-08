@@ -1,26 +1,47 @@
-//! ISO 9660 Node and Directory/File Operations.
+//! ISO 9660 Node — `FileOps` + `DirOps` implementations.
+//!
+//! Clean-room implementation. Directory walking, identifier decode,
+//! and file-extent reads all derive strictly from the public
+//! references below — no GPL/LGPL ISO 9660 source consulted.
+//!
+//! References:
+//! - ECMA-119 §6.8 (Directory Hierarchy — root, ".", ".." semantics).
+//! - ECMA-119 §7.6 (File Identifier syntax for files: name `.`
+//!   extension `;` version-1-to-32767).
+//! - ECMA-119 §9.1 (Directory Record — header, file identifier,
+//!   trailing padding to even-byte boundary).
+//! - ECMA-119 §9.1.11.1 (special identifiers: 0x00 = ".",
+//!   0x01 = "..").
+//! - ECMA-119 §6.5.1 / §7.6.3 (file extents are contiguous on the
+//!   medium; LBA + offset = byte position, no FAT-style chains).
+//! - OSDev Wiki, "ISO 9660 — Reading the Directory Tree".
+//!   <https://wiki.osdev.org/ISO_9660>
 
-use alloc::sync::Arc;
-use alloc::string::String;
-use alloc::vec::Vec;
 use alloc::boxed::Box;
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 
-use narf_block::BlockDevice;
-use narf_filesystem::{DirOps, FileOps, Stat, Mode, FileType, DirEntry, FsFuture, FsError};
-use narf_driver_runtime::{DmaBuffer, Cap, alloc_coherent};
-use narf_capabilities::Read;
+use narf_block::{BlockDevice, BlockError};
+use narf_filesystem::{
+    DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat,
+};
 use narf_lib::sync::IrqSafeSpinLock;
 
-use super::volume::Iso9660Volume;
-use super::dir::DirectoryRecord;
+use super::dir::{read_directory_record, DirectoryRecord};
+use super::volume::{read_extent, Iso9660Volume};
+use super::SECTOR_SIZE;
 
+/// Per-node state. ISO 9660 files/directories are immutable — a
+/// node only needs its starting extent + size + cached `Stat`.
 #[derive(Debug)]
 pub struct Iso9660NodeState {
-    pub extent_location: u32,
+    pub extent_lba: u32,
     pub data_length: u32,
     pub stat: Stat,
 }
 
+/// A file or directory in an ISO 9660 volume.
 #[derive(Debug)]
 pub struct Iso9660Node<B: BlockDevice> {
     pub volume: Arc<Iso9660Volume<B>>,
@@ -28,69 +49,66 @@ pub struct Iso9660Node<B: BlockDevice> {
 }
 
 impl<B: BlockDevice + 'static> Iso9660Node<B> {
-    pub fn new(volume: Arc<Iso9660Volume<B>>, record: &DirectoryRecord) -> Self {
-        let extent = record.extent_location[0]; // LE
-        let length = record.data_length[0];   // LE
-        
-        let mode = if record.is_directory() { Mode::DIR_RO } else { Mode::FILE_RO };
-
+    /// Build a node from a [`DirectoryRecord`].
+    pub fn from_record(volume: Arc<Iso9660Volume<B>>, record: &DirectoryRecord) -> Self {
+        let extent_lba = record.extent_lba_le();
+        let data_length = record.data_length_le();
+        let mode = if record.is_directory() {
+            Mode::DIR_RO
+        } else {
+            Mode::FILE_RO
+        };
+        let stat = Stat {
+            size: data_length as u64,
+            blocks: (data_length as u64).div_ceil(SECTOR_SIZE as u64),
+            mode,
+            mtime_cycles: 0,
+        };
         Self {
             volume,
             state: IrqSafeSpinLock::new(Iso9660NodeState {
-                extent_location: extent,
-                data_length: length,
-                stat: Stat {
-                    size: length as u64,
-                    blocks: (length as u64).div_ceil(2048),
-                    mode,
-                    mtime_cycles: 0,
-                },
+                extent_lba,
+                data_length,
+                stat,
             }),
         }
     }
 }
 
+// ── FileOps ─────────────────────────────────────────────────────────
+
 impl<B: BlockDevice + 'static> FileOps for Iso9660Node<B> {
+    /// Read up to `buf.len()` bytes starting at `offset`. ISO 9660
+    /// extents are contiguous on the medium (ECMA-119 §6.5.1), so
+    /// the byte-to-LBA mapping is trivially:
+    ///
+    ///   sector_lba    = extent_lba + (offset / SECTOR_SIZE)
+    ///   sector_offset = offset % SECTOR_SIZE
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
-            let state = self.state.lock();
-            if offset >= state.data_length as u64 {
+            let (extent_lba, data_length) = {
+                let g = self.state.lock();
+                (g.extent_lba, g.data_length)
+            };
+            if offset >= data_length as u64 {
                 return Ok(0);
             }
-            let mut remaining = core::cmp::min(buf.len() as u64, state.data_length as u64 - offset);
-            let start_lba = state.extent_location as u64 + (offset / 2048);
-            let mut sector_offset = (offset % 2048) as usize;
-            drop(state);
+            let mut remaining = core::cmp::min(buf.len() as u64, data_length as u64 - offset);
+            let mut current_lba = extent_lba as u64 + offset / SECTOR_SIZE as u64;
+            let mut sector_offset = (offset % SECTOR_SIZE as u64) as usize;
+            let mut total_read = 0usize;
 
-            let mut total_read = 0;
-            let mut current_lba = start_lba;
-
+            let mut sector = alloc::vec![0u8; SECTOR_SIZE];
             while remaining > 0 {
-                let block_size = 2048;
-                let temp_buf = alloc_coherent(block_size, self.volume.domain).map_err(|_| FsError::Io(narf_block::BlockError::IOError))?;
-                let cap: Cap<DmaBuffer, Read> = Cap::bootstrap();
-                
-                let req = narf_block::BlockRequest {
-                    op: narf_block::BlockOp::Read,
-                    lba: current_lba,
-                    blocks: 1,
-                    buffer: cap,
-                    qos: narf_block::QosHint::Latency,
-                    user_tag: 0,
-                };
-                let completion = self.volume.device.submit(req).await;
-                completion.result.map_err(FsError::Io)?;
-
-                let n = core::cmp::min(remaining as usize, block_size - sector_offset);
-                let temp_slice = unsafe { core::slice::from_raw_parts(temp_buf.phys_addr().raw() as *const u8, block_size) };
-                buf[total_read..total_read + n].copy_from_slice(&temp_slice[sector_offset..sector_offset + n]);
-
+                self.volume.read_sector(current_lba, &mut sector).await?;
+                let n = core::cmp::min(remaining as usize, SECTOR_SIZE - sector_offset);
+                buf[total_read..total_read + n]
+                    .copy_from_slice(&sector[sector_offset..sector_offset + n]);
                 total_read += n;
                 remaining -= n as u64;
                 current_lba += 1;
                 sector_offset = 0;
             }
-
             Ok(total_read)
         })
     }
@@ -108,21 +126,24 @@ impl<B: BlockDevice + 'static> FileOps for Iso9660Node<B> {
     }
 }
 
+// ── DirOps ──────────────────────────────────────────────────────────
+
 impl<B: BlockDevice + 'static> DirOps for Iso9660Node<B> {
     fn lookup(&self, _name: &str) -> Option<Arc<dyn FileOps>> {
-        unimplemented!("Iso9660Node::lookup - disk FS needs lookup_async")
+        // Disk-backed FS — synchronous lookup is unsupported. The
+        // VFS prefers `lookup_async` automatically.
+        None
     }
 
     fn lookup_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
         Box::pin(async move {
-            let mut scanner = DirectoryScanner::new(self.volume.clone(), {
-                let state = self.state.lock();
-                (state.extent_location, state.data_length)
-            });
-
-            while let Some((found_name, record)) = scanner.next().await? {
-                if found_name.eq_ignore_ascii_case(name) {
-                    return Ok(Arc::new(Iso9660Node::new(self.volume.clone(), &record)) as Arc<dyn FileOps>);
+            let entries = scan_directory(&self.volume, &self.state).await?;
+            for (found_name, record) in entries {
+                if names_match(&found_name, name) {
+                    return Ok(Arc::new(Iso9660Node::from_record(
+                        self.volume.clone(),
+                        &record,
+                    )) as Arc<dyn FileOps>);
                 }
             }
             Err(FsError::NotFound)
@@ -130,19 +151,18 @@ impl<B: BlockDevice + 'static> DirOps for Iso9660Node<B> {
     }
 
     fn lookup_dir(&self, _name: &str) -> Option<Arc<dyn DirOps>> {
-        unimplemented!("Iso9660Node::lookup_dir - disk FS needs lookup_dir_async")
+        None
     }
 
     fn lookup_dir_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
         Box::pin(async move {
-            let mut scanner = DirectoryScanner::new(self.volume.clone(), {
-                let state = self.state.lock();
-                (state.extent_location, state.data_length)
-            });
-
-            while let Some((found_name, record)) = scanner.next().await? {
-                if found_name.eq_ignore_ascii_case(name) && record.is_directory() {
-                    return Ok(Arc::new(Iso9660Node::new(self.volume.clone(), &record)) as Arc<dyn DirOps>);
+            let entries = scan_directory(&self.volume, &self.state).await?;
+            for (found_name, record) in entries {
+                if names_match(&found_name, name) && record.is_directory() {
+                    return Ok(Arc::new(Iso9660Node::from_record(
+                        self.volume.clone(),
+                        &record,
+                    )) as Arc<dyn DirOps>);
                 }
             }
             Err(FsError::NotFound)
@@ -150,119 +170,161 @@ impl<B: BlockDevice + 'static> DirOps for Iso9660Node<B> {
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
-        unimplemented!("Iso9660Node::iter - disk FS needs enumerate_async")
+        // Disk-backed FS — sync iteration is not supported. Use
+        // `enumerate_async` instead.
+        Box::new(core::iter::empty())
     }
 
     fn enumerate(&self, _cursor: usize, _max: usize) -> Vec<(String, FileType)> {
         Vec::new()
     }
 
-    fn enumerate_async<'a>(&'a self, cursor: usize, max: usize) -> FsFuture<'a, Vec<(String, FileType)>> {
+    fn enumerate_async<'a>(
+        &'a self,
+        cursor: usize,
+        max: usize,
+    ) -> FsFuture<'a, Vec<(String, FileType)>> {
         Box::pin(async move {
-            let mut scanner = DirectoryScanner::new(self.volume.clone(), {
-                let state = self.state.lock();
-                (state.extent_location, state.data_length)
-            });
-            let mut entries = Vec::new();
-            let mut count = 0;
-            while let Some((name, record)) = scanner.next().await? {
-                if count >= cursor {
-                    let ft = if record.is_directory() { FileType::Dir } else { FileType::File };
-                    entries.push((name, ft));
-                    if entries.len() >= max {
-                        break;
-                    }
+            let entries = scan_directory(&self.volume, &self.state).await?;
+            let mut out = Vec::new();
+            // Skip "." and ".." per the convention used elsewhere
+            // in NARF (memfs / FAT both omit them from
+            // `enumerate_async`); they're surfaced via `..`/`.` at
+            // the path-resolution layer instead.
+            let user_visible: Vec<_> = entries
+                .into_iter()
+                .filter(|(name, _)| name != "." && name != "..")
+                .collect();
+            for (i, (name, record)) in user_visible.into_iter().enumerate() {
+                if i < cursor {
+                    continue;
                 }
-                count += 1;
+                if out.len() >= max {
+                    break;
+                }
+                let ft = if record.is_directory() {
+                    FileType::Dir
+                } else {
+                    FileType::File
+                };
+                out.push((name, ft));
             }
-            Ok(entries)
+            Ok(out)
         })
     }
+
+    // All mutating methods inherit the trait defaults
+    // (`FsError::Unsupported`); ISO 9660 is read-only on principle
+    // (the on-disc layout is authored offline by mkisofs/xorriso),
+    // so we do not surface `unlink` / `create` / `mkdir` / etc.
 }
 
-struct DirectoryScanner<B: BlockDevice> {
-    volume: Arc<Iso9660Volume<B>>,
-    extent_location: u32,
-    data_length: u32,
-    offset_in_extent: u32,
-    buffer: Option<DmaBuffer>,
+// ── Directory scan ─────────────────────────────────────────────────
+
+/// Read a directory's entire extent into RAM and walk its records,
+/// returning `(name, record_header)` pairs. ECMA-119 §9.1.1
+/// guarantees a record never crosses a logical-sector boundary, so
+/// a `length == 0` byte means "skip to the next sector". We honour
+/// that by aligning the cursor up to the next 2KiB boundary.
+///
+/// The PVD field (§8.4.18) gives us the root extent; nested
+/// directory records carry the same `(extent_lba, data_length)`
+/// pair for their own bodies.
+async fn scan_directory<B: BlockDevice + 'static>(
+    volume: &Arc<Iso9660Volume<B>>,
+    state: &IrqSafeSpinLock<Iso9660NodeState>,
+) -> Result<Vec<(String, DirectoryRecord)>, FsError> {
+    let (extent_lba, data_length) = {
+        let g = state.lock();
+        (g.extent_lba, g.data_length)
+    };
+    if data_length == 0 {
+        return Ok(Vec::new());
+    }
+    let n_sectors = (data_length as usize).div_ceil(SECTOR_SIZE) as u32;
+    let body = read_extent(volume, extent_lba as u64, n_sectors).await?;
+
+    let mut out = Vec::new();
+    let mut offset: usize = 0;
+    let limit = core::cmp::min(body.len(), data_length as usize);
+    while offset < limit {
+        // Need at least a header byte to inspect.
+        if offset + 1 > body.len() {
+            break;
+        }
+        let length_byte = body[offset];
+        if length_byte == 0 {
+            // §9.1.1 — zero length marks "no more records in this
+            // sector". Round up to the next sector boundary and
+            // continue.
+            let next = (offset + SECTOR_SIZE) & !(SECTOR_SIZE - 1);
+            if next <= offset {
+                break;
+            }
+            offset = next;
+            continue;
+        }
+        if (length_byte as usize) < core::mem::size_of::<DirectoryRecord>() {
+            // Malformed: header is shorter than the fixed prefix.
+            return Err(FsError::Io(BlockError::IOError));
+        }
+        if offset + length_byte as usize > body.len() {
+            return Err(FsError::Io(BlockError::IOError));
+        }
+        let record = read_directory_record(&body, offset);
+        let id_off = offset + core::mem::size_of::<DirectoryRecord>();
+        let id_len = record.file_identifier_length as usize;
+        if id_off + id_len > body.len() {
+            return Err(FsError::Io(BlockError::IOError));
+        }
+        let id = &body[id_off..id_off + id_len];
+        let name = decode_file_identifier(id);
+        out.push((name, record));
+        offset += length_byte as usize;
+    }
+    Ok(out)
 }
 
-impl<B: BlockDevice + 'static> DirectoryScanner<B> {
-    fn new(volume: Arc<Iso9660Volume<B>>, info: (u32, u32)) -> Self {
-        Self {
-            volume,
-            extent_location: info.0,
-            data_length: info.1,
-            offset_in_extent: 0,
-            buffer: None,
+/// Decode an ISO 9660 file identifier (ECMA-119 §7.6 / §9.1.11) to
+/// a printable string.
+///
+/// - The two special single-byte identifiers `0x00` and `0x01` are
+///   reserved for the current directory (".") and parent directory
+///   ("..") records (§9.1.11.1).
+/// - Otherwise the identifier is `name "." extension ";" version`
+///   (`d-` or `d1-` characters). The `;version` suffix is dropped
+///   for display purposes — every disc tags every file with `;1`
+///   and the visible name conventionally omits it.
+/// - Directories carry no extension separator and no version suffix
+///   in practice, but our decoder is lenient: anything past `;` is
+///   stripped regardless.
+pub(crate) fn decode_file_identifier(bytes: &[u8]) -> String {
+    if bytes.len() == 1 {
+        match bytes[0] {
+            0x00 => return String::from("."),
+            0x01 => return String::from(".."),
+            _ => {}
         }
     }
-
-    async fn next(&mut self) -> Result<Option<(String, DirectoryRecord)>, FsError> {
-        loop {
-            if self.offset_in_extent >= self.data_length {
-                return Ok(None);
-            }
-
-            let sector_in_extent = self.offset_in_extent / 2048;
-            let offset_in_sector = (self.offset_in_extent % 2048) as usize;
-
-            if self.buffer.is_none() {
-                let lba = self.extent_location as u64 + sector_in_extent as u64;
-                let buf = alloc_coherent(2048, self.volume.domain).map_err(|_| FsError::Io(narf_block::BlockError::IOError))?;
-                let cap: Cap<DmaBuffer, Read> = Cap::bootstrap();
-                
-                let req = narf_block::BlockRequest {
-                    op: narf_block::BlockOp::Read,
-                    lba,
-                    blocks: 1,
-                    buffer: cap,
-                    qos: narf_block::QosHint::Latency,
-                    user_tag: 0,
-                };
-                let completion = self.volume.device.submit(req).await;
-                completion.result.map_err(FsError::Io)?;
-                self.buffer = Some(buf);
-            }
-
-            let buf = self.buffer.as_ref().unwrap();
-            let record_ptr = (buf.phys_addr().raw() + offset_in_sector as u64) as *const DirectoryRecord;
-            let record = unsafe { *record_ptr };
-
-            if record.length == 0 {
-                // End of sector, skip to next sector
-                self.offset_in_extent = (sector_in_extent + 1) * 2048;
-                self.buffer = None;
-                continue;
-            }
-
-            let name = if record.file_identifier_length == 1 {
-                let id_ptr = (buf.phys_addr().raw() + offset_in_sector as u64 + 33) as *const u8;
-                let id = unsafe { *id_ptr };
-                match id {
-                    0 => String::from("."),
-                    1 => String::from(".."),
-                    _ => String::from("?"),
-                }
-            } else {
-                let mut s = String::new();
-                for i in 0..record.file_identifier_length {
-                    let c_ptr = (buf.phys_addr().raw() + offset_in_sector as u64 + 33 + i as u64) as *const u8;
-                    let c = unsafe { *c_ptr };
-                    if c == b';' { break; } // Ignore version suffix
-                    s.push(c as char);
-                }
-                s
-            };
-
-            self.offset_in_extent += record.length as u32;
-            if self.offset_in_extent % 2048 == 0 {
-                self.buffer = None;
-            }
-
-            // ISO 9660 special names: "." and ".." are encoded as bytes 0 and 1.
-            return Ok(Some((name, record)));
+    let mut s = String::with_capacity(bytes.len());
+    for &b in bytes {
+        if b == b';' {
+            break;
         }
+        s.push(b as char);
     }
+    // ECMA-119 §7.6 leaves a trailing '.' on extensionless files
+    // (the separator is mandatory in d1-form). Strip it for the
+    // user-visible name.
+    if s.ends_with('.') {
+        s.pop();
+    }
+    s
+}
+
+/// Compare a stored ISO 9660 name (always uppercase per ECMA-119
+/// §7.4.1) against a user-supplied lookup key. ECMA-119 file
+/// identifiers are case-insensitive on the medium; we honour that.
+pub(crate) fn names_match(stored: &str, query: &str) -> bool {
+    stored.eq_ignore_ascii_case(query)
 }

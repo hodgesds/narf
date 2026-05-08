@@ -14,12 +14,26 @@ This driver provides a clean-room implementation of the ISO 9660 (ECMA-119) file
 
 ## 3. Public interface
 
-The driver implements the `FileSystem` trait from `narf-filesystem`.
+The driver implements `narf_filesystem::FsInstance`, with per-node `FileOps` and `DirOps`.
 
 ### Key Structs
 
-- `Iso9660FileSystem`: Root structure representing a mounted ISO volume.
-- `Iso9660Node`: Implementation of `VNode` (FileOps/DirOps) for ISO files and directories.
+- `Iso9660Volume<B: BlockDevice>`: mounted volume, owns the cached
+  PVD, `DomainId`, and the per-mount registered DMA scratch buffer.
+  Constructed via `Iso9660Volume::mount(device, domain) -> Arc<Self>`.
+- `Iso9660Node<B: BlockDevice>`: combined file/dir node returned by
+  `root()` / `lookup_async` / `lookup_dir_async`. Carries the
+  on-disc extent LBA + length plus the cached `Stat`.
+
+### DMA / cap-bound I/O
+
+A single `Cap<DmaBuffer, Write>` is minted at `mount()` via
+`narf_io::register_with_cap` and stored on the volume. Every
+sector op derives a `Read` cap from it (no `Cap::bootstrap()` in
+hot paths). Sector size is fixed at 2048 (ECMA-119 §6.1.2); the
+driver requires the underlying `BlockDevice::logical_block_size()`
+to be 2048 and rejects the mount with `FsError::Unsupported`
+otherwise.
 
 ## 4. Invariants
 
@@ -29,7 +43,28 @@ The driver implements the `FileSystem` trait from `narf-filesystem`.
 ## 5. Architecture notes
 
 - **Async-First:** Leverages NARF's async I/O for non-blocking directory traversal.
-- **Extension Discovery:** The driver automatically detects Joliet/Rock Ridge extensions during mount via SVD and System Use fields.
+- **Contiguous extents (§6.5.1, §7.6.3):** Files are laid out as a
+  single contiguous run of logical sectors starting at
+  `extent_location`; byte position = `extent_lba * 2048 + offset`.
+  No FAT-style cluster chains, no multi-extent fragmentation
+  decoding in the first wave (the multi-extent flag is recognised
+  but extra extents beyond the first are not followed yet).
+- **Directory walk (§9.1.1):** Records never cross a sector
+  boundary. A `length == 0` byte means "skip to the next sector".
+
+## 5a. Deferred extensions
+
+- **Joliet (Microsoft SVD):** SVD sectors are tolerated during the
+  descriptor walk but not parsed. Long names + Unicode are reported
+  via the PVD's 8.3 form for now.
+- **Rock Ridge (IEEE P1282):** System Use fields (`SP`, `NM`, `PX`,
+  `SL`, …) are not parsed. POSIX-shaped names, owners, permissions,
+  and symlinks remain on the deferred list.
+- **El Torito boot record:** Type-0 descriptors are skipped. Boot
+  loaders consume the boot catalogue out-of-band.
+- **Multi-session / multi-extent:** Single-session, single-extent
+  files only. The `MULTI_EXTENT` flag is recognised in `flags::`
+  but the second + later extents are not followed.
 
 ## 6. Dependencies
 
