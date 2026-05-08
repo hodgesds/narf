@@ -18,6 +18,7 @@ extern crate alloc;
 // crate's test entries. (Crates that the kernel actually uses by
 // name pick themselves up — these are the test-only ones.)
 extern crate narf_bluetooth as _;
+extern crate narf_drivers_fs_fat as _;
 extern crate narf_edid as _;
 extern crate narf_efi as _;
 extern crate narf_hid as _;
@@ -970,6 +971,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_scmi::register_initcalls();
             narf_shmem::register_initcalls();
             narf_initramfs::register_initcalls();
+            narf_filesystem::register_initcalls();
             narf_firmware::register_initcalls();
             narf_firmware_fw_cfg::register_initcalls();
             narf_firmware_smbios::register_initcalls();
@@ -1312,6 +1314,9 @@ fn run_async_demo() -> ! {
     narf_scheduler::init();
     let _ = writeln!(console::Writer, "  scheduler: ready queue initialised");
 
+    #[cfg(feature = "boot-init")]
+    boot_userspace_init();
+
     narf_scheduler::spawn(async {
         use core::fmt::Write as _;
         let start = narf_time::Instant::now();
@@ -1364,6 +1369,117 @@ fn run_async_demo() -> ! {
     // the isa-debug-exit device (x86_64) or semihosting (aarch64); on
     // real hardware it falls back to a quiet halt.
     unsafe { narf_arch::exit_kernel(0) }
+}
+
+/// Production boot of `userspace/init`. Sets up the syscall surface,
+/// the per-task subsystem stores, the address-space lookup the
+/// in-syscall handlers consult, then loads the verified
+/// `NARF_INIT_ELF` and spawns it on the scheduler as a
+/// `UserTaskFuture`.
+///
+/// Called from `run_async_demo` only when the `boot-init` feature
+/// is enabled. `kernel-test` builds route through
+/// `narf_verification::run_all_and_exit()` instead, so this fn
+/// never fires under `cargo xtask test`.
+#[cfg(all(feature = "boot-init", target_arch = "x86_64"))]
+fn boot_userspace_init() {
+    use core::fmt::Write as _;
+    use narf_userspace::{
+        bootstrap_init, brk_init, cwd_init, install_address_space_lookup,
+        install_core_syscalls, install_global, install_task_id_lookup,
+        install_user_task_hooks, load_user_process_with, sigaction_init, signal_init,
+        SyscallTable, UserTaskFuture,
+    };
+
+    let bytes = narf_verification::NARF_INIT_ELF;
+    if bytes.is_empty() {
+        let _ = writeln!(
+            console::Writer,
+            "  boot-init: NARF_INIT_ELF is empty — skipping init load"
+        );
+        return;
+    }
+
+    // Per-task subsystem stores. Idempotent — fine to call once.
+    bootstrap_init();
+    brk_init();
+    cwd_init();
+    sigaction_init();
+    signal_init();
+    narf_userspace::fd::init();
+
+    // Syscall table.
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // The handlers reach `current_task_id()` then look up its
+    // address space — this lookup goes through the scheduler's
+    // ready-queue scan.
+    install_address_space_lookup(|| {
+        let id = narf_scheduler::current_task_id();
+        narf_scheduler::address_space_of(id)
+    });
+    // Make `gettid` (and any handler that calls
+    // `current_task_id`) report the scheduler's TaskId rather
+    // than 0. Required for `sys_clone` to be observable from user
+    // code via `gettid()` returning distinct values per thread.
+    install_task_id_lookup(|| narf_scheduler::current_task_id().raw());
+
+    // Hooks the trap path needs to longjmp from int 0x80 back into
+    // the cooperative executor.
+    install_user_task_hooks();
+
+    // Parse + map the ELF into a fresh AddressSpace. We pass a
+    // single-element argv (`["init"]`) so the SysV-AMD64 stack
+    // gets a real `argc | argv[0] | NULL | NULL | AT_NULL` frame
+    // laid down — the bare `load_user_process` shape (no args)
+    // leaves rsp one past the mapped stack region, which traps
+    // the first `read [rsp]` inside `__libc_start_main`.
+    //
+    // SAFETY: the boot identity map covers low 4 GiB, the frame
+    // allocator was initialised earlier in `_start_rust`.
+    let proc = match unsafe { load_user_process_with(bytes, &["init"], &[], &[]) } {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = writeln!(
+                console::Writer,
+                "  boot-init: load_user_process_with failed: {e:?}"
+            );
+            return;
+        }
+    };
+    let pid = proc.pid;
+    let addr_space = proc.address_space.clone();
+
+    let _ = writeln!(
+        console::Writer,
+        "  boot-init: spawning init pid={} entry={:#x}",
+        pid.raw(),
+        proc.entry.0.as_u64()
+    );
+
+    let _id = narf_scheduler::spawn_user(
+        UserTaskFuture::new(proc),
+        narf_scheduler::TaskSpec::unthrottled(),
+        addr_space,
+    );
+}
+
+/// aarch64 stub. The user-mode-entry / IRET-equivalent + EL0 trap
+/// vector wiring (`narf_scheduler::enter_user_mode` on aarch64) is
+/// not on the Stage-3 path yet — the scheduler-side comment at
+/// `scheduler/src/lib.rs:362` flags `addr_space.activate()` as
+/// returning `NotImplemented` on aarch64. Until that lands, this
+/// is a no-op so a `cargo xtask run --arch=aarch64 --features
+/// boot-init` build still links.
+#[cfg(all(feature = "boot-init", not(target_arch = "x86_64")))]
+fn boot_userspace_init() {
+    use core::fmt::Write as _;
+    let _ = writeln!(
+        console::Writer,
+        "  boot-init: aarch64 user-mode entry not yet wired"
+    );
 }
 
 #[panic_handler]

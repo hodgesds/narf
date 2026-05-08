@@ -38,8 +38,11 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
     let testbin_enabled = env::var_os("CARGO_FEATURE_USER_MODE_TESTBIN").is_some();
+    let boot_init_enabled = env::var_os("CARGO_FEATURE_BOOT_INIT").is_some();
+    let testbin_dir = workspace.join("userspace").join("testbin");
+
+    // testbin: built only for the dedicated testbin runner.
     if testbin_enabled {
-        let testbin_dir = workspace.join("userspace").join("testbin");
         build_arch(
             &testbin_dir,
             &out_dir.join("testbin-target-x86_64"),
@@ -62,11 +65,63 @@ fn main() {
             "narf-testbin",
         );
     } else {
-        // Feature off — placeholders so both `env!()`-based
-        // `include_bytes!` sites compile cleanly.
         println!("cargo:rustc-env=NARF_TESTBIN_ELF_X86_64=/dev/null");
         println!("cargo:rustc-env=NARF_TESTBIN_ELF_AARCH64=/dev/null");
     }
+
+    // init + shell: built whenever the kernel intends to actually
+    // boot a userspace (boot-init), and ALSO under user-mode-testbin
+    // so the testbin runner can opt into init-style smokes if it
+    // wants. Both features yield the same env vars.
+    if boot_init_enabled || testbin_enabled {
+        let init_dir = workspace.join("userspace").join("init");
+        build_arch(
+            &init_dir,
+            &out_dir.join("init-target-x86_64"),
+            "x86_64-unknown-none",
+            &init_dir.join("init.ld"),
+            Some("code-model=large"),
+            "NARF_INIT_ELF_X86_64",
+            "init",
+        );
+        build_arch(
+            &init_dir,
+            &out_dir.join("init-target-aarch64"),
+            "aarch64-unknown-none",
+            &testbin_dir.join("testbin-aarch64.ld"),
+            None,
+            "NARF_INIT_ELF_AARCH64",
+            "init",
+        );
+
+        let shell_dir = workspace.join("userspace").join("shell");
+        build_arch(
+            &shell_dir,
+            &out_dir.join("shell-target-x86_64"),
+            "x86_64-unknown-none",
+            &shell_dir.join("shell.ld"),
+            Some("code-model=large"),
+            "NARF_SHELL_ELF_X86_64",
+            "shell",
+        );
+        build_arch(
+            &shell_dir,
+            &out_dir.join("shell-target-aarch64"),
+            "aarch64-unknown-none",
+            &testbin_dir.join("testbin-aarch64.ld"),
+            None,
+            "NARF_SHELL_ELF_AARCH64",
+            "shell",
+        );
+    } else {
+        // Placeholders so include_bytes!() on the consumer side
+        // resolves cleanly even when neither feature is enabled.
+        println!("cargo:rustc-env=NARF_INIT_ELF_X86_64=/dev/null");
+        println!("cargo:rustc-env=NARF_INIT_ELF_AARCH64=/dev/null");
+        println!("cargo:rustc-env=NARF_SHELL_ELF_X86_64=/dev/null");
+        println!("cargo:rustc-env=NARF_SHELL_ELF_AARCH64=/dev/null");
+    }
+
 
     let libc_validate_enabled = env::var_os("CARGO_FEATURE_NARF_LIBC_VALIDATE").is_some();
     if libc_validate_enabled {

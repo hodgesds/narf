@@ -33,6 +33,7 @@ narf-drivers         = { path = "../drivers" }
 narf-drivers-storage = { path = "../drivers/storage" }
 narf-drivers-usb     = { path = "../drivers/usb" }
 narf-drivers-platform = { path = "../drivers/platform" }
+narf-drivers-fs-fat   = { path = "../drivers/fs/fat" }
 narf-input           = { path = "../input" }
 narf-input-driver    = { path = "../drivers/input" }
 narf-graphics        = { path = "../graphics" }
@@ -109,6 +110,10 @@ user-mode-testbin = ["user-mode-e2e", "narf-verification/user-mode-testbin"]
 # end-to-end through the user-mode pipeline. Like user-mode-testbin,
 # this calls `exit_kernel(0)` on success and must run last.
 narf-libc-validate = ["user-mode-e2e", "narf-verification/narf-libc-validate"]
+# Build init+shell ELFs and load + spawn `init` from the production
+# `run_async_demo` boot path. Independent of `kernel-test`; opt in
+# with `cargo xtask run --arch=x86_64 --features boot-init`.
+boot-init = ["narf-verification/boot-init"]
 
 [lints]
 workspace = true

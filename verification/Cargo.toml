@@ -79,7 +79,13 @@ user-mode-e2e = []
 # `narf_arch::exit_kernel(0)` — terminating the kernel by design.
 # That kernel-exit is why this is split out: enabling it shadows any
 # tests that would have run after it.
-user-mode-testbin = ["user-mode-e2e"]
+user-mode-testbin = ["user-mode-e2e", "boot-init"]
+# Boot-time userspace init: build `userspace/init` and
+# `userspace/shell` ELFs and expose them as `NARF_INIT_ELF` /
+# `NARF_SHELL_ELF` consts. Doesn't imply the kernel-test harness —
+# `narf-frame` consumes the consts in its production `run_async_demo`
+# path so init can actually be loaded + spawned at boot.
+boot-init = []
 # Opt-in narf-libc validate-binary runner. Like user-mode-testbin,
 # this builds + loads a real Rust user binary — but the binary is
 # linked against `narf-libc` (the relibc-shaped libc shim) rather
