@@ -5871,36 +5871,8 @@ fn smoke_userspace_fd_table_roundtrip() -> TestResult {
 }
 kernel_test!(smoke_userspace_fd_table_roundtrip);
 
-fn smoke_userspace_install_core_syscalls_fills_table() -> TestResult {
-    // `install_core_syscalls` drops Write/Read/Close/Mmap/Munmap/
-    // ExitTask/Yield/Sleep handlers into a fresh table. Confirm
-    // every slot has both a name and a handler after install.
-    use narf_userspace::{install_core_syscalls, Syscall, SyscallTable};
+// `smoke_userspace_install_core_syscalls_fills_table` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-    let mut t = SyscallTable::new();
-    install_core_syscalls(&mut t);
-
-    let slots = [
-        Syscall::Write,
-        Syscall::Read,
-        Syscall::Close,
-        Syscall::Mmap,
-        Syscall::Munmap,
-        Syscall::ExitTask,
-        Syscall::Yield,
-        Syscall::Sleep,
-    ];
-    for s in slots {
-        if t.name_of(s).is_none() {
-            return TestResult::Fail("core syscall missing after install_core_syscalls");
-        }
-    }
-    if t.len() < slots.len() {
-        return TestResult::Fail("install_core_syscalls did not grow table to cover every slot");
-    }
-    TestResult::Pass
-}
-kernel_test!(smoke_userspace_install_core_syscalls_fills_table);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_load_user_process_builds_runnable_image() -> TestResult {
@@ -7438,35 +7410,8 @@ fn smoke_userspace_parse_minimal_elf64() -> TestResult {
 }
 kernel_test!(smoke_userspace_parse_minimal_elf64);
 
-fn smoke_userspace_syscall_table_roundtrip() -> TestResult {
-    use narf_userspace::{Syscall, SyscallTable};
+// `smoke_userspace_syscall_table_roundtrip` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-    // Pinned numbers.
-    if Syscall::Submit.raw() != 100 || Syscall::Bootstrap.raw() != 101 {
-        return TestResult::Fail("syscall numbers drifted");
-    }
-    if Syscall::from_raw(110) != Some(Syscall::OpenFile) {
-        return TestResult::Fail("from_raw(110) did not match OpenFile");
-    }
-    if Syscall::from_raw(999).is_some() {
-        return TestResult::Fail("from_raw(999) should be None");
-    }
-
-    let mut t = SyscallTable::new();
-    t.register(Syscall::Submit, "submit");
-    t.register(Syscall::Bootstrap, "bootstrap");
-    if t.len() != 2 {
-        return TestResult::Fail("register did not grow table");
-    }
-    if t.name_of(Syscall::Submit) != Some("submit") {
-        return TestResult::Fail("name_of mismatch");
-    }
-    if t.name_of(Syscall::Yield).is_some() {
-        return TestResult::Fail("unregistered syscall should return None");
-    }
-    TestResult::Pass
-}
-kernel_test!(smoke_userspace_syscall_table_roundtrip);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_frame_x86_64_gdt_user_descriptors() -> TestResult {

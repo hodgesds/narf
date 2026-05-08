@@ -1,7 +1,5 @@
 //! Per-crate kernel-test entries for `narf-userspace`.
 
-#![cfg(target_arch = "x86_64")]
-
 use alloc::sync::Arc;
 
 use narf_kernel_test::{kernel_test_in, TestResult};
@@ -17,8 +15,10 @@ use crate::{
 
 /// Static so the AS-lookup `fn` pointer can resolve it without a
 /// closure capture.
+#[cfg(target_arch = "x86_64")]
 static PARENT_AS: IrqSafeSpinLock<Option<Arc<AddressSpace>>> = IrqSafeSpinLock::new(None);
 
+#[cfg(target_arch = "x86_64")]
 fn lookup_parent_as() -> Option<Arc<AddressSpace>> {
     PARENT_AS.lock().clone()
 }
@@ -42,6 +42,7 @@ impl TrapContext for StubCtx {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn smoke_userspace_clone_shares_address_space() -> TestResult {
     // Direct exercise of `sys_clone` (Syscall::Clone = 56) without
     // entering ring 3. Wires the address-space lookup to a fixed
@@ -105,8 +106,10 @@ fn smoke_userspace_clone_shares_address_space() -> TestResult {
     crate::syscall::__test_clear_global();
     TestResult::Pass
 }
+#[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_userspace_clone_shares_address_space);
 
+#[cfg(target_arch = "x86_64")]
 fn smoke_userspace_clone_rejects_zero_entry_or_stack() -> TestResult {
     // Defence-in-depth on the handler — entry==0 or stack==0 is
     // invalid input and must surface InvalidOp without spawning
@@ -143,4 +146,68 @@ fn smoke_userspace_clone_rejects_zero_entry_or_stack() -> TestResult {
     crate::syscall::__test_clear_global();
     TestResult::Pass
 }
+#[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_userspace_clone_rejects_zero_entry_or_stack);
+
+// ── ported from verification ───────────────────────────────────────
+
+fn smoke_userspace_install_core_syscalls_fills_table() -> TestResult {
+    // `install_core_syscalls` drops Write/Read/Close/Mmap/Munmap/
+    // ExitTask/Yield/Sleep handlers into a fresh table. Confirm
+    // every slot has both a name and a handler after install.
+    use crate::{install_core_syscalls, Syscall, SyscallTable};
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+
+    let slots = [
+        Syscall::Write,
+        Syscall::Read,
+        Syscall::Close,
+        Syscall::Mmap,
+        Syscall::Munmap,
+        Syscall::ExitTask,
+        Syscall::Yield,
+        Syscall::Sleep,
+    ];
+    for s in slots {
+        if t.name_of(s).is_none() {
+            return TestResult::Fail("core syscall missing after install_core_syscalls");
+        }
+    }
+    if t.len() < slots.len() {
+        return TestResult::Fail("install_core_syscalls did not grow table to cover every slot");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_userspace_install_core_syscalls_fills_table);
+
+fn smoke_userspace_syscall_table_roundtrip() -> TestResult {
+    use crate::{Syscall, SyscallTable};
+
+    // Pinned numbers.
+    if Syscall::Submit.raw() != 100 || Syscall::Bootstrap.raw() != 101 {
+        return TestResult::Fail("syscall numbers drifted");
+    }
+    if Syscall::from_raw(110) != Some(Syscall::OpenFile) {
+        return TestResult::Fail("from_raw(110) did not match OpenFile");
+    }
+    if Syscall::from_raw(999).is_some() {
+        return TestResult::Fail("from_raw(999) should be None");
+    }
+
+    let mut t = SyscallTable::new();
+    t.register(Syscall::Submit, "submit");
+    t.register(Syscall::Bootstrap, "bootstrap");
+    if t.len() != 2 {
+        return TestResult::Fail("register did not grow table");
+    }
+    if t.name_of(Syscall::Submit) != Some("submit") {
+        return TestResult::Fail("name_of mismatch");
+    }
+    if t.name_of(Syscall::Yield).is_some() {
+        return TestResult::Fail("unregistered syscall should return None");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_userspace_syscall_table_roundtrip);
