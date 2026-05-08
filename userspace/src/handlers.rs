@@ -641,9 +641,9 @@ fn sys_open(ctx: &mut dyn TrapContext) {
         Some(o) => o,
         None if (flags & O_CREAT) != 0 && mnt_len == 0 => {
             match narf_filesystem::registry()
-                .resolve_parent_absolute(path, |_fs, parent, leaf| parent.create(leaf))
+                .resolve_parent_absolute(path, |_fs, parent, leaf| poll_once(parent.create(leaf)))
             {
-                Some(Ok(o)) => o,
+                Some(Some(Ok(o))) => o,
                 _ => {
                     ctx.set_return(fail);
                     return;
@@ -1008,10 +1008,10 @@ fn sys_ftruncate(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
     let outcome = fd::with_table(task, |t| {
         let entry = t.get(fd)?;
-        Some(entry.ops.truncate(len))
+        Some(poll_once(entry.ops.truncate(len)))
     });
     match outcome {
-        Some(Some(Ok(()))) => ctx.set_return(SyscallReturn::ok(0)),
+        Some(Some(Some(Ok(())))) => ctx.set_return(SyscallReturn::ok(0)),
         _ => ctx.set_return(fail),
     }
 }
@@ -1121,7 +1121,7 @@ fn sys_fallocate(ctx: &mut dyn TrapContext) {
         // Always ensure size >= offset + len. truncate handles
         // grow + zero-fill.
         if target_end > cur_size {
-            if ops.truncate(target_end).is_err() {
+            if poll_once(ops.truncate(target_end)).and_then(|r| r.ok()).is_none() {
                 return Some(false);
             }
         }
@@ -1283,9 +1283,9 @@ fn sys_truncate(ctx: &mut dyn TrapContext) {
         })
         .flatten();
     match ops {
-        Some(o) => match o.truncate(new_size) {
-            Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
-            Err(_) => ctx.set_return(fail),
+        Some(o) => match poll_once(o.truncate(new_size)) {
+            Some(Ok(())) => ctx.set_return(SyscallReturn::ok(0)),
+            _ => ctx.set_return(fail),
         },
         None => ctx.set_return(fail),
     }
@@ -1917,9 +1917,9 @@ fn sys_unlink(ctx: &mut dyn TrapContext) {
         }
     };
     let outcome = narf_filesystem::registry()
-        .resolve_parent_absolute(path, |_fs, parent, leaf| parent.unlink(leaf));
+        .resolve_parent_absolute(path, |_fs, parent, leaf| poll_once(parent.unlink(leaf)));
     match outcome {
-        Some(Ok(())) => ctx.set_return(SyscallReturn::ok(0)),
+        Some(Some(Ok(()))) => ctx.set_return(SyscallReturn::ok(0)),
         _ => ctx.set_return(fail),
     }
 }
@@ -1950,9 +1950,9 @@ fn sys_mkdir(ctx: &mut dyn TrapContext) {
         }
     };
     let outcome = narf_filesystem::registry()
-        .resolve_parent_absolute(path, |_fs, parent, leaf| parent.mkdir(leaf));
+        .resolve_parent_absolute(path, |_fs, parent, leaf| poll_once(parent.mkdir(leaf)));
     match outcome {
-        Some(Ok(_)) => ctx.set_return(SyscallReturn::ok(0)),
+        Some(Some(Ok(_))) => ctx.set_return(SyscallReturn::ok(0)),
         _ => ctx.set_return(fail),
     }
 }
@@ -1976,9 +1976,9 @@ fn sys_rmdir(ctx: &mut dyn TrapContext) {
         }
     };
     let outcome = narf_filesystem::registry()
-        .resolve_parent_absolute(path, |_fs, parent, leaf| parent.rmdir(leaf));
+        .resolve_parent_absolute(path, |_fs, parent, leaf| poll_once(parent.rmdir(leaf)));
     match outcome {
-        Some(Ok(())) => ctx.set_return(SyscallReturn::ok(0)),
+        Some(Some(Ok(()))) => ctx.set_return(SyscallReturn::ok(0)),
         _ => ctx.set_return(fail),
     }
 }
@@ -2035,10 +2035,10 @@ fn sys_rename(ctx: &mut dyn TrapContext) {
     let new_leaf = &new_path[new_split + 1..];
     let outcome = narf_filesystem::registry()
         .resolve_parent_absolute(old_path, |_fs, parent, old_leaf| {
-            parent.rename(old_leaf, new_leaf)
+            poll_once(parent.rename(old_leaf, new_leaf))
         });
     match outcome {
-        Some(Ok(())) => ctx.set_return(SyscallReturn::ok(0)),
+        Some(Some(Ok(()))) => ctx.set_return(SyscallReturn::ok(0)),
         _ => ctx.set_return(fail),
     }
 }
@@ -2149,10 +2149,10 @@ fn sys_symlink(ctx: &mut dyn TrapContext) {
     };
     let outcome = narf_filesystem::registry()
         .resolve_parent_absolute(link_path, |_fs, parent, leaf| {
-            parent.symlink(leaf, target_str)
+            poll_once(parent.symlink(leaf, target_str))
         });
     match outcome {
-        Some(Ok(_)) => ctx.set_return(SyscallReturn::ok(0)),
+        Some(Some(Ok(_))) => ctx.set_return(SyscallReturn::ok(0)),
         _ => ctx.set_return(fail),
     }
 }
@@ -3110,10 +3110,115 @@ fn sys_getppid(ctx: &mut dyn TrapContext) {
 }
 
 fn sys_gettid(ctx: &mut dyn TrapContext) {
-    // Single-threaded per process: tid coincides with pid. When
-    // threading lands this returns a distinct task id while
-    // sys_getpid returns the process's primary id.
+    // Returns the scheduler's TaskId for the currently-polling
+    // task. With `sys_clone` wired (Syscall::Clone = 56), threads
+    // in the same address space observe distinct tids here even
+    // though they share `getpid` (when process-group bookkeeping
+    // lands; today gettid==getpid since both go through the same
+    // task_id_lookup, but `clone` already produces distinct tids).
     ctx.set_return(SyscallReturn::ok(current_task_id()));
+}
+
+// ── clone(2): minimal-viable thread spawn ──────────────────────────
+//
+// See the Syscall::Clone doc-comment for the four-argument shape.
+// The handler resolves the caller's address space through the
+// installed AS lookup (the same one `current_address_space` uses
+// for fd handlers), clones the `Arc<AddressSpace>`, and spawns a
+// new `UserTaskFuture` that begins execution at the user-supplied
+// (entry_pc, stack_top) pair. The child's TaskId is returned to
+// the parent; the child observes a fresh TaskId via `gettid`.
+
+fn sys_clone(ctx: &mut dyn TrapContext) {
+    use crate::process::DEFAULT_USER_STACK_BYTES;
+
+    let args = *ctx.args();
+    let entry_pc = args.arg0;
+    let stack_top = args.arg1;
+    let _arg = args.arg2; // RDI to the new thread; we don't program it yet
+    let fs_base_arg = args.arg3;
+
+    // Reject obviously-bad inputs early. Zero entry/stack means
+    // the user didn't bother to fill in their args; reject.
+    if entry_pc == 0 || stack_top == 0 {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+
+    // Resolve the parent's address space. If no AS lookup has been
+    // installed, this is being called outside a real userspace boot
+    // (e.g. a unit test that forgot the wiring) — fail loudly.
+    let parent_as = match current_address_space() {
+        Some(a) => a,
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+
+    // Build a UserProcess that shares `address_space` with the
+    // parent. Each thread still gets its own PID for now (the
+    // scheduler tracks tasks individually; thread-group / `getpid`-
+    // returns-tgid semantics will land alongside futex / clone3).
+    let proc = crate::UserProcess {
+        pid: crate::alloc_pid(),
+        address_space: parent_as.clone(),
+        entry: crate::EntryPoint(narf_memory::VirtAddr::new(entry_pc)),
+        stack_top: narf_memory::VirtAddr::new(stack_top),
+        fs_base: if fs_base_arg != 0 {
+            Some(fs_base_arg)
+        } else {
+            // Inherit parent's FS_BASE. The current task's
+            // `UserProcess.fs_base` isn't directly reachable from
+            // the trap path, but the IA32_FS_BASE MSR holds the
+            // active value at this moment — the user_task poll
+            // wrote it. Reading it back is x86_64-specific.
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                use core::arch::asm;
+                let lo: u32;
+                let hi: u32;
+                const IA32_FS_BASE: u32 = 0xC000_0100;
+                asm!(
+                    "rdmsr",
+                    in("ecx") IA32_FS_BASE,
+                    out("eax") lo,
+                    out("edx") hi,
+                    options(nostack, preserves_flags),
+                );
+                let v = (lo as u64) | ((hi as u64) << 32);
+                if v == 0 {
+                    None
+                } else {
+                    Some(v)
+                }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            None
+        },
+    };
+    let _ = DEFAULT_USER_STACK_BYTES;
+
+    // Spawn the child on the scheduler. The same address-space Arc
+    // is attached so `address_space_of(child_tid)` returns it; the
+    // child's first poll will MOV CR3 to the shared root and iretq
+    // to (entry_pc, stack_top).
+    let address_space = proc.address_space.clone();
+    #[cfg(target_arch = "x86_64")]
+    {
+        let child_tid = narf_scheduler::spawn_user(
+            crate::user_task::UserTaskFuture::new(proc),
+            narf_scheduler::TaskSpec::unthrottled(),
+            address_space,
+        );
+        ctx.set_return(SyscallReturn::ok(child_tid.raw()));
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // aarch64 user_task::UserTaskFuture is x86_64-gated today.
+        let _ = (proc, address_space);
+        ctx.set_return(SyscallReturn::invalid_op());
+    }
 }
 
 // ── Per-task pgid table ────────────────────────────────────────────
@@ -5156,6 +5261,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::GetPid, "getpid", RawFnHandler(sys_getpid));
     table.install_raw(Syscall::GetPpid, "getppid", RawFnHandler(sys_getppid));
     table.install_raw(Syscall::Gettid, "gettid", RawFnHandler(sys_gettid));
+    table.install_raw(Syscall::Clone, "clone", RawFnHandler(sys_clone));
     table.install_raw(Syscall::GetUid, "getuid", RawFnHandler(sys_getuid));
     table.install_raw(Syscall::GetGid, "getgid", RawFnHandler(sys_getgid));
     table.install_raw(Syscall::SetUid, "setuid", RawFnHandler(sys_setuid));

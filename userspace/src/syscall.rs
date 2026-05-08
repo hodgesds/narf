@@ -568,11 +568,40 @@ pub enum Syscall {
     SchedSetparam = 223,
 
     /// Linux gettid(2): return the calling thread's distinct kernel
-    /// id (in multi-threaded processes pid identifies the process,
-    /// tid identifies the thread). NARF is single-threaded per
-    /// process, so gettid == getpid. Lands the surface so the
-    /// libc shim's ABI is right for when threading arrives.
+    /// task id. With `Clone` (56) wired, multi-threaded processes
+    /// observe distinct tids per thread; the value is the
+    /// scheduler's `TaskId.raw()` for the running task.
     Gettid = 168,
+
+    /// Linux clone(2) — minimal viable thread spawn. NARF doesn't
+    /// implement the full `flags / ptid / ctid / tls` surface;
+    /// instead it takes a four-argument shape that creates one new
+    /// task sharing the caller's address space:
+    ///
+    /// - `arg0 = entry_pc`  : user vaddr the new task starts at
+    /// - `arg1 = stack_top` : user RSP the new task starts on
+    ///                        (caller-allocated; kernel does NOT
+    ///                        validate that the page is mapped)
+    /// - `arg2 = arg`       : opaque u64 passed in RDI to `entry_pc`
+    /// - `arg3 = fs_base`   : if non-zero, value the kernel writes
+    ///                        into the new task's `IA32_FS_BASE` so
+    ///                        it can find its own TLS block. Zero
+    ///                        means "inherit parent's fs_base"
+    ///                        (suitable for child code that does
+    ///                        not touch TLS).
+    ///
+    /// Returns the new task's tid on success (non-zero), or
+    /// `SyscallReturn::invalid_op` if the parent's address space
+    /// could not be resolved (no AS lookup installed → not a real
+    /// userspace boot).
+    ///
+    /// Future work (tracked in MEMORY): clone3-shaped flags,
+    /// per-thread TLS allocation from PT_TLS template, futex /
+    /// thread-group bookkeeping. For now, two threads can exist in
+    /// one address space, gettid distinguishes them, and the
+    /// scheduler's per-task UserState/JmpBuf/FS_BASE machinery
+    /// already supports them.
+    Clone = 56,
 
     /// Linux tkill(2) / tgkill(2): like kill but targets a specific
     /// thread within a process group. NARF is single-threaded per
@@ -864,6 +893,7 @@ impl Syscall {
             221 => Syscall::SchedGetPriorityMin,
             222 => Syscall::SchedGetparam,
             223 => Syscall::SchedSetparam,
+            56 => Syscall::Clone,
             168 => Syscall::Gettid,
             169 => Syscall::Prctl,
             175 => Syscall::Tgkill,
