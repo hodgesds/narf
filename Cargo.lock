@@ -711,6 +711,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-drivers-fs-minix"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-block",
+ "narf-capabilities",
+ "narf-driver-runtime",
+ "narf-drivers",
+ "narf-filesystem",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+]
+
+[[package]]
 name = "narf-drivers-gpu"
 version = "0.0.0"
 dependencies = [
@@ -993,6 +1009,8 @@ dependencies = [
  "narf-crypto",
  "narf-drivers",
  "narf-drivers-fs-fat",
+ "narf-drivers-fs-iso9660",
+ "narf-drivers-fs-minix",
  "narf-drivers-gpu",
  "narf-drivers-i3c",
  "narf-drivers-net",
