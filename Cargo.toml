@@ -78,6 +78,7 @@ members = [
     "drivers/fs/ext2",
     "drivers/fs/minix",
     "drivers/fs/iso9660",
+    "drivers/fs/udf",
     "drivers/fs/9p",
     "userspace/init",
     "userspace/shell",

@@ -680,22 +680,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "narf-drivers-fs-exfat"
-version = "0.0.0"
-dependencies = [
- "narf-arch",
- "narf-block",
- "narf-capabilities",
- "narf-driver-runtime",
- "narf-drivers",
- "narf-filesystem",
- "narf-io",
- "narf-kernel-test",
- "narf-lib",
- "narf-memory",
-]
-
-[[package]]
 name = "narf-drivers-fs-ext2"
 version = "0.0.0"
 dependencies = [
@@ -745,6 +729,22 @@ dependencies = [
 
 [[package]]
 name = "narf-drivers-fs-minix"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-block",
+ "narf-capabilities",
+ "narf-driver-runtime",
+ "narf-drivers",
+ "narf-filesystem",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+]
+
+[[package]]
+name = "narf-drivers-fs-udf"
 version = "0.0.0"
 dependencies = [
  "narf-arch",
@@ -1042,11 +1042,11 @@ dependencies = [
  "narf-crypto",
  "narf-drivers",
  "narf-drivers-fs-9p",
- "narf-drivers-fs-exfat",
  "narf-drivers-fs-ext2",
  "narf-drivers-fs-fat",
  "narf-drivers-fs-iso9660",
  "narf-drivers-fs-minix",
+ "narf-drivers-fs-udf",
  "narf-drivers-gpu",
  "narf-drivers-i3c",
  "narf-drivers-net",
