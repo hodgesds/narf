@@ -259,7 +259,18 @@ pub fn alloc_frame_anywhere() -> Result<PhysFrame, FrameAllocError> {
 
 /// Return a previously-allocated frame to the pool. The frame's
 /// physical address selects which node bin it goes back into.
+///
+/// COW interaction: if the frame has a refcount > 1 (multiple
+/// `Arc<AddressSpace>`s share it via `clone_for_fork`), this call
+/// only decrements — the actual return-to-bin happens when the
+/// last reference drops. Frames that were never refcounted
+/// (default for everything outside the COW path) are returned
+/// immediately as before.
 pub fn free_frame(f: PhysFrame) {
+    if cow::dec_ref(f.start_address()) > 0 {
+        // Other ASes still reference this frame; don't return it.
+        return;
+    }
     let node = phys_to_node(f.start_address().raw());
     let mut g = ALLOC.lock();
     if !g.initialised {
@@ -269,6 +280,102 @@ pub fn free_frame(f: PhysFrame) {
         g.bins[node].push(f);
     } else {
         g.bins[0].push(f);
+    }
+}
+
+/// Per-frame reference counting for the COW-fork path.
+///
+/// `clone_for_fork` shares the parent's frames with the child by
+/// `inc_ref`-ing every frame and marking the PTEs read-only on
+/// both sides. The first user-mode write to such a page faults;
+/// the page-fault handler invokes `cow_split_on_write` which
+/// allocates a fresh frame, memcpys the bytes, repoints the
+/// faulting AS's PTE at the new frame, and `dec_ref`s the old
+/// shared frame. When the count drops back to 1, the surviving
+/// AS is the sole owner and subsequent writes don't fault.
+///
+/// Frames not registered here behave as if their refcount is 0:
+/// `free_frame` returns them immediately, matching the
+/// pre-existing single-owner semantics. The map is populated
+/// only for frames that go through `inc_ref`.
+pub mod cow {
+    use alloc::collections::BTreeMap;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    use narf_lib::sync::IrqSafeSpinLock;
+
+    use crate::PhysAddr;
+
+    static REFCOUNTS: IrqSafeSpinLock<Option<BTreeMap<u64, AtomicU32>>> =
+        IrqSafeSpinLock::new(None);
+
+    fn ensure() {
+        let mut g = REFCOUNTS.lock();
+        if g.is_none() {
+            *g = Some(BTreeMap::new());
+        }
+    }
+
+    /// Increment the refcount on `phys`. Returns the new count.
+    /// First call (frame previously had count 0 / unregistered)
+    /// inserts a count of 2 — the implicit "1" for the original
+    /// owner plus the "1" for the new sharer. Subsequent
+    /// `inc_ref`s add one each.
+    pub fn inc_ref(phys: PhysAddr) -> u32 {
+        ensure();
+        let mut g = REFCOUNTS.lock();
+        let map = g.as_mut().expect("refcounts initialised above");
+        let key = phys.raw();
+        let entry = map.entry(key).or_insert_with(|| AtomicU32::new(1));
+        // Bump from N to N+1; "first share" promotes the implicit
+        // owner from `1` (representing the original sole owner) to
+        // `2` (original + new sharer).
+        entry.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Decrement the refcount on `phys`. Returns the new count
+    /// (post-decrement). If `phys` was never `inc_ref`'d, returns
+    /// 0 — `free_frame` then returns the frame to the bin
+    /// directly, matching pre-COW semantics.
+    pub fn dec_ref(phys: PhysAddr) -> u32 {
+        let mut g = REFCOUNTS.lock();
+        let map = match g.as_mut() {
+            Some(m) => m,
+            None => return 0,
+        };
+        let key = phys.raw();
+        let entry = match map.get(&key) {
+            Some(e) => e,
+            None => return 0,
+        };
+        // We want the post-decrement value. If the count is
+        // already 1, drop the entry entirely so an unregistered
+        // frame's next `free_frame` doesn't have to look it up.
+        let prev = entry.fetch_sub(1, Ordering::AcqRel);
+        if prev <= 1 {
+            map.remove(&key);
+            0
+        } else {
+            prev - 1
+        }
+    }
+
+    /// Read-only peek at a frame's refcount. Returns 0 if the
+    /// frame was never registered; otherwise the current count.
+    pub fn count(phys: PhysAddr) -> u32 {
+        let g = REFCOUNTS.lock();
+        g.as_ref()
+            .and_then(|m| m.get(&phys.raw()))
+            .map(|c| c.load(Ordering::Acquire))
+            .unwrap_or(0)
+    }
+
+    /// Test hook — drop every recorded refcount. Tests that
+    /// exercise inc/dec sequences should call this to start from
+    /// a clean slate.
+    #[doc(hidden)]
+    pub fn __test_clear() {
+        *REFCOUNTS.lock() = None;
     }
 }
 

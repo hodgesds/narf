@@ -275,69 +275,59 @@ impl AddressSpace {
     }
 
     /// Duplicate this address space for a `fork(2)`-style child.
-    /// Allocates a fresh root page table (via `new_for_user`) and,
-    /// for every region, allocates new physical frames and `memcpy`s
-    /// the parent's bytes through the low-4-GiB identity map. The
-    /// returned address space owns its own frames — mutations on
-    /// either side do NOT propagate.
     ///
-    /// FIXME(cow): non-COW first cut. A real copy-on-write fork
-    /// would share frames via a per-frame refcount and split on the
-    /// first user-mode write fault. The eventual hook lives in
-    /// `narf_memory::region::cow_split_on_write` (not yet written);
-    /// until then we eagerly memcpy. Acceptable on small Stage-4
-    /// processes; expensive on large `brk` heaps.
+    /// **Copy-on-write.** Per region, the child shares the
+    /// parent's physical frames — `frame::cow::inc_ref(phys)` is
+    /// called on every page so the frame allocator knows two
+    /// owners (or more, for nested forks) share the page. The
+    /// returned `AddressSpace` carries the same `Region.phys` Vec
+    /// (cloned) as the parent and an extra cleared-WRITE flag in
+    /// `Region.perms`. The parent's regions are mutated in place
+    /// to also drop WRITE; both sides re-materialise lazily (the
+    /// caller's `materialize()` runs the page-table walk that
+    /// installs the read-only PTEs).
+    ///
+    /// On the first user-mode write to a shared page, the page-
+    /// fault handler calls [`Self::cow_split_on_write`] which
+    /// allocates a fresh frame, memcpys the contents, repoints
+    /// the faulting AS's PTE at the new frame, and `dec_ref`s the
+    /// old shared frame.
     ///
     /// # Safety
-    /// - The low-4-GiB identity map must be live (the same Stage-4
-    ///   contract `materialize` rides on); the byte-copy walks each
-    ///   region's parent + child frames through identity-mapped
-    ///   raw pointers.
-    /// - The frame allocator must be initialised.
-    /// - Caller must `materialize()` the returned AS before
-    ///   activating it; this routine does NOT walk page tables.
+    /// - Paging is live (same Stage-4 contract `materialize`
+    ///   rides on).
+    /// - The frame allocator + the COW refcount table are
+    ///   initialised.
+    /// - Caller must `materialize()` the returned AS *and*
+    ///   re-materialise the parent (since its pages just lost
+    ///   WRITE) before either is re-activated.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub unsafe fn clone_for_fork(&self) -> Result<Self, AddressSpaceError> {
         // SAFETY: caller's contract — paging is live.
         let child = unsafe { Self::new_for_user() }?;
 
-        let parent_regions = self.regions.lock().clone();
-
-        let mut child_regions: Vec<Region> = Vec::with_capacity(parent_regions.len());
-
-        for r in parent_regions.iter() {
-            let pages = r.phys.len();
-            let mut child_phys: Vec<PhysAddr> = Vec::with_capacity(pages);
-            for &parent_phys in r.phys.iter() {
-                let f = crate::frame::alloc_frame().map_err(|_| AddressSpaceError::OutOfRange)?;
-                let cphys = f.start_address();
-                // SAFETY: low-4-GiB identity map covers both parent
-                // and child phys frames; each is a 4 KiB page
-                // contiguous in physical memory; the source/dest
-                // ranges are non-overlapping (distinct frames the
-                // allocator just handed us).
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        parent_phys.raw() as *const u8,
-                        cphys.raw() as *mut u8,
-                        crate::frame::PAGE_SIZE as usize,
-                    );
+        // Mutate the parent's region table in place: drop WRITE
+        // on every region so the next `materialize()` installs RO
+        // PTEs and the first write traps. Snapshot the resulting
+        // region list to clone into the child.
+        let parent_regions: Vec<Region> = {
+            let mut g = self.regions.lock();
+            for r in g.iter_mut() {
+                // Bump the refcount on every backing frame.
+                for &p in r.phys.iter() {
+                    let _ = crate::frame::cow::inc_ref(p);
                 }
-                child_phys.push(cphys);
+                // Strip WRITE — both ASes start the post-fork
+                // window read-only and split on first write.
+                r.perms = RegionPerms(r.perms.0 & !RegionPerms::WRITE.0);
             }
-            child_regions.push(Region {
-                base: r.base,
-                len: r.len,
-                perms: r.perms,
-                phys: child_phys,
-            });
-        }
+            g.clone()
+        };
 
-        // Push the regions into the child AS via map_region so the
-        // overlap / alignment / phys-len invariants are re-checked
-        // for free. The parent is well-formed by construction so
-        // these never trip on a healthy parent.
-        for r in child_regions.into_iter() {
+        // The child's regions are a deep clone of the parent's
+        // (post-strip) — same vaddr base, same phys list, same
+        // (now WRITE-stripped) perms.
+        for r in parent_regions.into_iter() {
             child.map_region(r)?;
         }
 
@@ -347,6 +337,80 @@ impl AddressSpace {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub unsafe fn clone_for_fork(&self) -> Result<Self, AddressSpaceError> {
         Err(AddressSpaceError::NotImplemented)
+    }
+
+    /// Split a COW-shared page on first write.
+    ///
+    /// Find the region containing `vaddr`, allocate a fresh frame,
+    /// memcpy the old shared frame's contents into it, replace the
+    /// region's per-page phys entry with the new frame,
+    /// `dec_ref` the old frame, and re-mark the region's perms
+    /// with WRITE. The caller is responsible for re-materialising
+    /// the affected page in the live page-table tree (a real
+    /// page-fault handler would do that on the way back out of
+    /// the trap).
+    ///
+    /// Returns `Unmapped` if no region contains `vaddr`.
+    /// Returns `Ok(())` if the split succeeded OR if the frame
+    /// already had refcount 1 (sole owner — no split needed,
+    /// just regain WRITE).
+    ///
+    /// FIXME(pf-handler-integration): the actual #PF handler in
+    /// `frame/src/x86_64/trap.rs` doesn't yet route user-mode
+    /// write-to-RO faults to this routine. Until that lands the
+    /// COW pages stay RO at the page-table level and the first
+    /// write triggers the kernel's panic path. Today this routine
+    /// is exercised only by the unit tests below; production
+    /// fork() callers see the AS-clone + RO marking, not the
+    /// split-on-write semantics.
+    ///
+    /// # Safety
+    /// - The low-4-GiB identity map must be live (used to memcpy
+    ///   the old frame's bytes into the new one).
+    /// - The frame allocator + COW refcount table are
+    ///   initialised.
+    pub unsafe fn cow_split_on_write(&self, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
+        let mut g = self.regions.lock();
+        let v = vaddr.as_u64();
+        let region_idx = g
+            .iter()
+            .position(|r| {
+                let base = r.base.as_u64();
+                v >= base && v < base + r.len
+            })
+            .ok_or(AddressSpaceError::Unmapped)?;
+        let page_idx = ((v - g[region_idx].base.as_u64()) >> 12) as usize;
+        let old_phys = g[region_idx].phys[page_idx];
+
+        // If this frame's refcount is 1 (we're sole owner), just
+        // regain WRITE on the region. The dec_ref returns 0 in
+        // that case (post-decrement); we re-bump because we still
+        // own it.
+        let count = crate::frame::cow::count(old_phys);
+        if count <= 1 {
+            // Sole owner — no copy needed.
+            g[region_idx].perms = g[region_idx].perms | RegionPerms::WRITE;
+            return Ok(());
+        }
+
+        // Multiple owners. Allocate a private frame, copy bytes,
+        // dec_ref the shared one.
+        let new_frame =
+            crate::frame::alloc_frame().map_err(|_| AddressSpaceError::OutOfRange)?;
+        let new_phys = new_frame.start_address();
+        // SAFETY: low-4-GiB identity map covers both old + new
+        // frames; the source/dest ranges are non-overlapping.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                old_phys.raw() as *const u8,
+                new_phys.raw() as *mut u8,
+                crate::frame::PAGE_SIZE as usize,
+            );
+        }
+        let _new_count = crate::frame::cow::dec_ref(old_phys);
+        g[region_idx].phys[page_idx] = new_phys;
+        g[region_idx].perms = g[region_idx].perms | RegionPerms::WRITE;
+        Ok(())
     }
 
     /// Find the region covering `vaddr`, if any. Returns a copy

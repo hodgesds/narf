@@ -7163,29 +7163,60 @@ fn smoke_userspace_fork_distinct_address_space() -> TestResult {
         Some(r) => r,
         None => return TestResult::Fail("child region missing — fork didn't copy"),
     };
-    if parent_region.phys[0] == child_region.phys[0] {
-        return TestResult::Fail("child shares parent's physical frame — must be independent");
+    // Post-COW: parent and child SHARE the physical frame
+    // immediately after fork. The page-fault handler will split
+    // on first write via cow_split_on_write. Both regions also
+    // lose their WRITE bit (the trap path needs the fault).
+    if parent_region.phys[0] != child_region.phys[0] {
+        return TestResult::Fail("COW fork must share frames, not eagerly memcpy");
+    }
+    if narf_memory::frame::cow::count(parent_region.phys[0]) < 2 {
+        return TestResult::Fail("COW refcount should be >= 2 after fork");
+    }
+    if parent_region.perms.contains(narf_memory::RegionPerms::WRITE)
+        || child_region.perms.contains(narf_memory::RegionPerms::WRITE)
+    {
+        return TestResult::Fail("post-fork regions must lose WRITE pending split");
     }
 
-    // Verify the child's frame got the parent's bytes copied in.
-    // SAFETY: identity-mapped.
-    let child_word = unsafe { *(child_region.phys[0].raw() as *const u32) };
+    // Verify the shared frame still holds the sentinel byte
+    // (parent's bytes are visible to the child since they share).
+    let shared_word = unsafe { *(parent_region.phys[0].raw() as *const u32) };
+    if shared_word != 0xCAFEBABE {
+        return TestResult::Fail("shared COW frame lost the sentinel");
+    }
+
+    // Trigger a manual COW split on the child's side, then mutate
+    // the child's now-private frame and confirm the parent's
+    // shared frame is unchanged.
+    if unsafe { child_as.cow_split_on_write(VirtAddr::new(SENTINEL_VADDR)) }.is_err() {
+        return TestResult::Fail("cow_split_on_write failed");
+    }
+    let post_split_child = match child_as.lookup(VirtAddr::new(SENTINEL_VADDR)) {
+        Some(r) => r,
+        None => return TestResult::Fail("child region missing post-split"),
+    };
+    if post_split_child.phys[0] == parent_region.phys[0] {
+        return TestResult::Fail("split should have allocated a private child frame");
+    }
+    if !post_split_child.perms.contains(narf_memory::RegionPerms::WRITE) {
+        return TestResult::Fail("split should have restored WRITE on the child");
+    }
+    let child_word = unsafe { *(post_split_child.phys[0].raw() as *const u32) };
     if child_word != 0xCAFEBABE {
-        return TestResult::Fail("child frame did not inherit parent's bytes");
+        return TestResult::Fail("split didn't memcpy the parent's bytes");
     }
-
-    // Mutate the child's frame and confirm the parent's is
-    // unchanged (proves true independence).
     unsafe {
-        *(child_region.phys[0].raw() as *mut u32) = 0xDEADBEEF;
+        *(post_split_child.phys[0].raw() as *mut u32) = 0xDEADBEEF;
     }
     let parent_word = unsafe { *(parent_region.phys[0].raw() as *const u32) };
     if parent_word != 0xCAFEBABE {
-        return TestResult::Fail("mutating child frame leaked into parent");
+        return TestResult::Fail("mutating child's split frame leaked into parent");
     }
 
     *PARENT_AS.lock() = None;
     crate::syscall::__test_clear_global();
+    narf_memory::frame::cow::__test_clear();
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]

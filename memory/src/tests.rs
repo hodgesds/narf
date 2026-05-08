@@ -1185,3 +1185,133 @@ fn smoke_memory_address_space_region_table() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory", smoke_memory_address_space_region_table);
+
+fn smoke_memory_cow_refcount_round_trip() -> TestResult {
+    // Per-frame COW refcount: inc bumps from 1 (implicit owner)
+    // to 2; further inc bumps to 3; dec walks back down. The
+    // count drops to 0 once the last reference is released, at
+    // which point free_frame returns the frame to the bin.
+    use crate::frame::cow;
+
+    cow::__test_clear();
+    let f = match crate::frame::alloc_frame() {
+        Ok(f) => f,
+        Err(_) => return TestResult::Skip("frame allocator not initialised"),
+    };
+    let phys = f.start_address();
+    if cow::count(phys) != 0 {
+        return TestResult::Fail("fresh frame should have refcount 0 (unregistered)");
+    }
+    if cow::inc_ref(phys) != 2 {
+        return TestResult::Fail("first inc_ref should produce 2 (owner + sharer)");
+    }
+    if cow::inc_ref(phys) != 3 {
+        return TestResult::Fail("second inc_ref should produce 3");
+    }
+    if cow::dec_ref(phys) != 2 {
+        return TestResult::Fail("dec_ref should produce 2");
+    }
+    if cow::dec_ref(phys) != 1 {
+        return TestResult::Fail("dec_ref should produce 1");
+    }
+    if cow::dec_ref(phys) != 0 {
+        return TestResult::Fail("final dec_ref should produce 0");
+    }
+    if cow::count(phys) != 0 {
+        return TestResult::Fail("count after final dec should be 0");
+    }
+    crate::frame::free_frame(f);
+    cow::__test_clear();
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_memory_cow_refcount_round_trip);
+
+fn smoke_memory_clone_for_fork_shares_frames_then_splits() -> TestResult {
+    // End-to-end: parent AS with one region (1 page). After
+    // clone_for_fork, both ASes' Region.phys[0] equal the same
+    // PhysAddr and the COW refcount is 2; both lose WRITE.
+    // After cow_split_on_write on the child, the child's
+    // Region.phys[0] is a fresh frame, the parent's is unchanged,
+    // and the parent's bytes are visible in the child (memcpy
+    // proof).
+    use crate::address_space::{AddressSpace, Region, RegionPerms};
+    use crate::frame::cow;
+    use crate::VirtAddr;
+
+    cow::__test_clear();
+    let mut parent = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("AddressSpace::new_for_user not available"),
+    };
+    let frame = match crate::frame::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => return TestResult::Fail("alloc_frame parent"),
+    };
+    const VADDR: u64 = 0x0000_0080_0000_0000;
+    if parent
+        .map_region(Region {
+            base: VirtAddr::new(VADDR),
+            len: 4096,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![frame],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("map_region parent");
+    }
+    // Stamp a sentinel so the post-split memcpy is observable.
+    // SAFETY: identity-mapped phys; sole owner.
+    unsafe {
+        *(frame.raw() as *mut u32) = 0xC0FFEE_42;
+    }
+
+    let child = match unsafe { parent.clone_for_fork() } {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("clone_for_fork"),
+    };
+    let p_region = parent.lookup(VirtAddr::new(VADDR)).expect("parent region");
+    let c_region = child.lookup(VirtAddr::new(VADDR)).expect("child region");
+    if p_region.phys[0] != c_region.phys[0] {
+        return TestResult::Fail("COW: parent and child should share frames");
+    }
+    if cow::count(frame) != 2 {
+        return TestResult::Fail("COW: refcount should be 2 after fork");
+    }
+    if p_region.perms.contains(RegionPerms::WRITE)
+        || c_region.perms.contains(RegionPerms::WRITE)
+    {
+        return TestResult::Fail("COW: both regions must lose WRITE post-fork");
+    }
+
+    // Split the child's page.
+    if unsafe { child.cow_split_on_write(VirtAddr::new(VADDR)) }.is_err() {
+        return TestResult::Fail("cow_split_on_write");
+    }
+    let c_split = child.lookup(VirtAddr::new(VADDR)).expect("child post-split");
+    let p_post = parent.lookup(VirtAddr::new(VADDR)).expect("parent post-split");
+    if c_split.phys[0] == frame {
+        return TestResult::Fail("split should have allocated a new child frame");
+    }
+    if p_post.phys[0] != frame {
+        return TestResult::Fail("split must not move the parent's frame");
+    }
+    // SAFETY: identity-mapped.
+    let copied = unsafe { *(c_split.phys[0].raw() as *const u32) };
+    if copied != 0xC0FFEE_42 {
+        return TestResult::Fail("split didn't memcpy the sentinel");
+    }
+    if cow::count(frame) > 1 {
+        return TestResult::Fail("post-split: parent should be sole owner of original");
+    }
+    if !c_split.perms.contains(RegionPerms::WRITE) {
+        return TestResult::Fail("split should restore WRITE on the child");
+    }
+
+    // Cleanup — return the frames so subsequent tests in the
+    // same boot don't pressure the allocator.
+    crate::frame::free_frame(crate::frame::PhysFrame::new(c_split.phys[0]));
+    crate::frame::free_frame(crate::frame::PhysFrame::new(frame));
+    cow::__test_clear();
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_memory_clone_for_fork_shares_frames_then_splits);
