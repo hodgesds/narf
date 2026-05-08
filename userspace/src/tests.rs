@@ -6479,3 +6479,450 @@ fn build_unresolved_named_elf(strtab: &[u8]) -> alloc::vec::Vec<u8> {
 
     b
 }
+
+// ── relocated from verification ──
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_abi_dispatcher_serves_file_ops() -> TestResult {
+    // Bootstrap mints rings, kernel installs the
+    // abi-file-op-bridge, dispatcher runs on the kernel-side
+    // ends, user-side task issues an `OpCode::Open` followed by
+    // `OpCode::Read` against a stub-FS file mounted under
+    // `/test_abi`. The completion's result[0] carries the bytes-
+    // read count; the user-mapped buffer holds the file's bytes.
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU8, Ordering};
+    use narf_abi::{Dispatcher, NarfStatus, OpCode, Submission, Tag};
+    use narf_capabilities::{Cap, Grant};
+    use narf_filesystem::{
+        bootstrap_mount_authority, registry, DirEntry, DirOps, FileOps, FsFuture, FsInstance,
+        MountPoint, Stat,
+    };
+    use narf_memory::AddressSpace;
+    use crate::{
+        abi_file_op_bridge, install_address_space_lookup, install_core_syscalls, install_global,
+        install_task_id_lookup, syscall::__test_clear_global, SyscallTable,
+    };
+
+    static FILE_BYTES: &[u8] = b"VFS-via-ABI";
+    struct StubFile;
+    impl FileOps for StubFile {
+        fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+            alloc::boxed::Box::pin(async move {
+                let off = offset as usize;
+                if off >= FILE_BYTES.len() {
+                    return Ok(0);
+                }
+                let n = core::cmp::min(buf.len(), FILE_BYTES.len() - off);
+                buf[..n].copy_from_slice(&FILE_BYTES[off..off + n]);
+                Ok(n)
+            })
+        }
+        fn write<'a>(&'a self, _o: u64, b: &'a [u8]) -> FsFuture<'a, usize> {
+            let n = b.len();
+            alloc::boxed::Box::pin(async move { Ok(n) })
+        }
+        fn stat(&self) -> Stat {
+            Stat {
+                size: FILE_BYTES.len() as u64,
+                blocks: 1,
+                mode: narf_filesystem::Mode::FILE_RO,
+                mtime_cycles: 0,
+            }
+        }
+    }
+    struct StubDir;
+    impl DirOps for StubDir {
+        fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+            if name == "f" {
+                Some(Arc::new(StubFile))
+            } else {
+                None
+            }
+        }
+        fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
+            Box::new(core::iter::empty())
+        }
+    }
+    struct StubFs;
+    impl FsInstance for StubFs {
+        fn root(&self) -> Arc<dyn DirOps> {
+            Arc::new(StubDir)
+        }
+        fn name(&self) -> &str {
+            "stub_abi"
+        }
+    }
+
+    let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+    let _ = registry().mount(&auth, "/test_abi", StubFs);
+
+    static USER_AS_ABI: narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>> =
+        narf_lib::sync::IrqSafeSpinLock::new(None);
+    fn as_lookup() -> Option<Arc<AddressSpace>> {
+        USER_AS_ABI.lock().clone()
+    }
+    static FAKE_TASK: u64 = 0xABBA;
+    fn task_lookup() -> u64 {
+        FAKE_TASK
+    }
+
+    let addr_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => return TestResult::Fail("new_for_user failed"),
+    };
+    *USER_AS_ABI.lock() = Some(addr_space);
+
+    install_address_space_lookup(as_lookup);
+    install_task_id_lookup(task_lookup);
+    crate::fd::__test_reset();
+    crate::fd::init();
+    crate::bootstrap_init();
+    narf_abi::install_file_op_bridge(abi_file_op_bridge);
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Direct Bootstrap call (test runs in kernel context).
+    use crate::{kernel_syscall_entry, Syscall, SyscallArgs, SyscallReturn, TrapContext};
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
+    }
+    let mut ctx = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Bootstrap.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
+        return TestResult::Fail("Bootstrap returned non-Ok");
+    }
+
+    let kernel_ends = crate::take_kernel_ends(FAKE_TASK).expect("ke");
+    let user_ends = crate::take_user_ends(FAKE_TASK).expect("ue");
+
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+    OUTCOME.store(0, Ordering::Relaxed);
+
+    // Stable-static buffers for the path/mount/data so the user
+    // task can hand pointers across awaits without lifetime
+    // complications.
+    static PATH: &[u8] = b"f";
+    static MOUNT: &[u8] = b"/test_abi";
+    static mut READ_BUF: [u8; 16] = [0u8; 16];
+
+    narf_scheduler::init();
+    narf_scheduler::spawn(async move {
+        let mut d = Dispatcher::new(kernel_ends.sq_drain, kernel_ends.cq_prod);
+        d.run().await;
+    });
+    narf_scheduler::spawn(async move {
+        let mut sq = user_ends.sq_prod;
+        let mut cq = user_ends.cq_drain;
+
+        // Open(/test_abi, "f").
+        let mut sub = Submission::noop(Tag::new(0x10));
+        sub.op = OpCode::OpenFile;
+        sub.inline[0] = PATH.as_ptr() as u64;
+        sub.inline[1] = PATH.len() as u64;
+        sub.inline[2] = MOUNT.as_ptr() as u64;
+        sub.inline[3] = MOUNT.len() as u64;
+        sq.send(sub).await.unwrap();
+        let comp = cq.recv().await.unwrap();
+        if comp.status != NarfStatus::Ok || comp.result[0] != 3 {
+            OUTCOME.store(2, Ordering::Relaxed);
+            core::mem::drop(sq);
+            core::mem::drop(cq);
+            return;
+        }
+        let fd = comp.result[0];
+
+        // Read(fd, READ_BUF, 16).
+        let mut sub = Submission::noop(Tag::new(0x11));
+        sub.op = OpCode::Read;
+        sub.inline[0] = fd;
+        sub.inline[1] = unsafe { core::ptr::addr_of_mut!(READ_BUF) as u64 };
+        sub.inline[2] = 16;
+        sq.send(sub).await.unwrap();
+        let comp = cq.recv().await.unwrap();
+        if comp.status != NarfStatus::Ok {
+            OUTCOME.store(3, Ordering::Relaxed);
+            core::mem::drop(sq);
+            core::mem::drop(cq);
+            return;
+        }
+        let n = comp.result[0] as usize;
+        let buf = unsafe { &READ_BUF };
+        if &buf[..n] == FILE_BYTES {
+            OUTCOME.store(1, Ordering::Relaxed);
+        } else {
+            OUTCOME.store(4, Ordering::Relaxed);
+        }
+        core::mem::drop(sq);
+        core::mem::drop(cq);
+    });
+
+    narf_scheduler::run_until_empty();
+
+    *USER_AS_ABI.lock() = None;
+    crate::fd::__test_reset();
+    crate::handlers::__test_bootstrap_reset();
+    __test_clear_global();
+
+    match OUTCOME.load(Ordering::Relaxed) {
+        1 => TestResult::Pass,
+        2 => TestResult::Fail("Open completion was not Ok / fd != 3"),
+        3 => TestResult::Fail("Read completion was not Ok"),
+        4 => TestResult::Fail("Read bytes mismatched expected payload"),
+        _ => TestResult::Fail("user-side task did not complete"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_abi_dispatcher_serves_file_ops);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_abi_dispatcher_serves_mmap() -> TestResult {
+    // Same shape as smoke_abi_dispatcher_serves_file_ops, but
+    // exercises the Mmap/Munmap ring path. Submit `OpCode::Mmap`
+    // for one page → expect `Ok` with a non-zero user vaddr in
+    // `result[0]`. Then `OpCode::Munmap` that base → expect `Ok`.
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU8, Ordering};
+    use narf_abi::{Dispatcher, NarfStatus, OpCode, Submission, Tag};
+    use narf_memory::AddressSpace;
+    use crate::{
+        abi_file_op_bridge, install_address_space_lookup, install_core_syscalls, install_global,
+        install_task_id_lookup, syscall::__test_clear_global, SyscallTable,
+    };
+
+    static USER_AS_MMAP: narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>> =
+        narf_lib::sync::IrqSafeSpinLock::new(None);
+    fn as_lookup() -> Option<Arc<AddressSpace>> {
+        USER_AS_MMAP.lock().clone()
+    }
+    static FAKE_TASK: u64 = 0xACAC;
+    fn task_lookup() -> u64 {
+        FAKE_TASK
+    }
+
+    let addr_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => return TestResult::Fail("new_for_user failed"),
+    };
+    *USER_AS_MMAP.lock() = Some(addr_space);
+
+    install_address_space_lookup(as_lookup);
+    install_task_id_lookup(task_lookup);
+    crate::fd::__test_reset();
+    crate::fd::init();
+    crate::bootstrap_init();
+    narf_abi::install_file_op_bridge(abi_file_op_bridge);
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    use crate::{kernel_syscall_entry, Syscall, SyscallArgs, SyscallReturn, TrapContext};
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
+    }
+    let mut ctx = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Bootstrap.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
+        return TestResult::Fail("Bootstrap returned non-Ok");
+    }
+
+    let kernel_ends = crate::take_kernel_ends(FAKE_TASK).expect("ke");
+    let user_ends = crate::take_user_ends(FAKE_TASK).expect("ue");
+
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+    OUTCOME.store(0, Ordering::Relaxed);
+
+    narf_scheduler::init();
+    narf_scheduler::spawn(async move {
+        let mut d = Dispatcher::new(kernel_ends.sq_drain, kernel_ends.cq_prod);
+        d.run().await;
+    });
+    narf_scheduler::spawn(async move {
+        let mut sq = user_ends.sq_prod;
+        let mut cq = user_ends.cq_drain;
+
+        // Mmap(hint=0, len=0x1000, flags=0).
+        let mut sub = Submission::noop(Tag::new(0x20));
+        sub.op = OpCode::Mmap;
+        sub.inline[0] = 0;
+        sub.inline[1] = 0x1000;
+        sub.inline[2] = 0;
+        sq.send(sub).await.unwrap();
+        let comp = cq.recv().await.unwrap();
+        if comp.status != NarfStatus::Ok || comp.result[0] == 0 {
+            OUTCOME.store(2, Ordering::Relaxed);
+            core::mem::drop(sq);
+            core::mem::drop(cq);
+            return;
+        }
+        let base = comp.result[0];
+
+        // Munmap(base).
+        let mut sub = Submission::noop(Tag::new(0x21));
+        sub.op = OpCode::Munmap;
+        sub.inline[0] = base;
+        sq.send(sub).await.unwrap();
+        let comp = cq.recv().await.unwrap();
+        if comp.status != NarfStatus::Ok {
+            OUTCOME.store(3, Ordering::Relaxed);
+            core::mem::drop(sq);
+            core::mem::drop(cq);
+            return;
+        }
+        OUTCOME.store(1, Ordering::Relaxed);
+        core::mem::drop(sq);
+        core::mem::drop(cq);
+    });
+
+    narf_scheduler::run_until_empty();
+
+    *USER_AS_MMAP.lock() = None;
+    crate::fd::__test_reset();
+    crate::handlers::__test_bootstrap_reset();
+    __test_clear_global();
+
+    match OUTCOME.load(Ordering::Relaxed) {
+        1 => TestResult::Pass,
+        2 => TestResult::Fail("Mmap completion was not Ok / vaddr was 0"),
+        3 => TestResult::Fail("Munmap completion was not Ok"),
+        _ => TestResult::Fail("user-side task did not complete"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_abi_dispatcher_serves_mmap);
+
+fn smoke_syscall_versioning_dispatch() -> TestResult {
+    // Build a private SyscallTable with a v0 + v1 handler for the
+    // same syscall number, exercise dispatch_ctx_versioned for both
+    // versions, and assert each handler set its own canary value.
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use crate::{
+        syscall_number, syscall_pack, syscall_version, RawFnHandler, Syscall, SyscallArgs,
+        SyscallReturn, SyscallTable, TrapContext,
+    };
+
+    static V0_SEEN: AtomicU32 = AtomicU32::new(0);
+    static V1_SEEN: AtomicU32 = AtomicU32::new(0);
+    V0_SEEN.store(0, Ordering::Relaxed);
+    V1_SEEN.store(0, Ordering::Relaxed);
+
+    let mut table = SyscallTable::new();
+    table.install_raw(
+        Syscall::Yield,
+        "yield-v0",
+        RawFnHandler(|ctx: &mut dyn TrapContext| {
+            V0_SEEN.fetch_add(1, Ordering::Relaxed);
+            ctx.set_return(SyscallReturn {
+                value: 0xC0DE_0000,
+                status: 0,
+            });
+        }),
+    );
+    table.install_raw_versioned(
+        Syscall::Yield,
+        1,
+        RawFnHandler(|ctx: &mut dyn TrapContext| {
+            V1_SEEN.fetch_add(1, Ordering::Relaxed);
+            ctx.set_return(SyscallReturn {
+                value: 0xC0DE_0001,
+                status: 0,
+            });
+        }),
+    );
+
+    // Bit-packing helpers round-trip cleanly.
+    let raw = syscall_pack(1, Syscall::Yield);
+    if syscall_version(raw) != 1 {
+        return TestResult::Fail("version_of did not extract 1");
+    }
+    if syscall_number(raw) != Syscall::Yield.raw() {
+        return TestResult::Fail("number_of did not extract Yield");
+    }
+
+    // Manual ctx for dispatch.
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
+            false
+        }
+    }
+    let mut ctx0 = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
+    table.dispatch_ctx_versioned(Syscall::Yield, 0, &mut ctx0);
+    if ctx0.ret.map(|r| r.value) != Some(0xC0DE_0000) {
+        return TestResult::Fail("v0 dispatch did not return v0 sentinel");
+    }
+    if V0_SEEN.load(Ordering::Relaxed) != 1 || V1_SEEN.load(Ordering::Relaxed) != 0 {
+        return TestResult::Fail("v0 path did not invoke v0 handler exclusively");
+    }
+
+    let mut ctx1 = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
+    table.dispatch_ctx_versioned(Syscall::Yield, 1, &mut ctx1);
+    if ctx1.ret.map(|r| r.value) != Some(0xC0DE_0001) {
+        return TestResult::Fail("v1 dispatch did not return v1 sentinel");
+    }
+    if V1_SEEN.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("v1 path did not invoke v1 handler");
+    }
+
+    // Unknown version (v2) falls through to v0 — the documented
+    // "if no override, use canonical" rule.
+    let mut ctx2 = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
+    table.dispatch_ctx_versioned(Syscall::Yield, 2, &mut ctx2);
+    if ctx2.ret.map(|r| r.value) != Some(0xC0DE_0000) {
+        return TestResult::Fail("v2 unknown did not fall through to v0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_syscall_versioning_dispatch);

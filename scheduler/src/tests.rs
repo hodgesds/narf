@@ -510,3 +510,26 @@ fn smoke_scheduler_spawn_user_carries_address_space() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("scheduler", smoke_scheduler_spawn_user_carries_address_space);
+
+// ── relocated from verification ──
+
+fn smoke_sleep_future_waits() -> TestResult {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    crate::init();
+    let start = narf_time::Instant::now();
+    crate::spawn(async {
+        narf_time::sleep_cycles(10_000_000).await;
+        DONE.store(true, Ordering::Relaxed);
+    });
+    crate::run_until_empty();
+    let elapsed = narf_time::Instant::now().cycles_since(start);
+    if !DONE.load(Ordering::Relaxed) {
+        return TestResult::Fail("sleep future never completed");
+    }
+    if elapsed < 10_000_000 {
+        return TestResult::Fail("completed before deadline — sleep isn't blocking");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_sleep_future_waits);

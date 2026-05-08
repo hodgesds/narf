@@ -1416,3 +1416,19 @@ fn smoke_sctlr2_supported_path() -> TestResult {
 }
 #[cfg(target_arch = "aarch64")]
 kernel_test_in!("arch/sctlr2", smoke_sctlr2_supported_path);
+
+// ── relocated from verification ──
+
+#[cfg(target_arch = "aarch64")]
+fn smoke_aarch64_mpidr_aff_present() -> TestResult {
+    // MPIDR_EL1 reads cleanly + affinity-pack returns a value
+    // matching the table-registered BSP slot.
+    let aff = crate::aarch64::cpu::mpidr_aff();
+    // QEMU virt typically reports MPIDR_EL1 = 0x80000000 (UP bit
+    // set) so aff = 0. We accept anything; just verify the read
+    // doesn't fault.
+    let _ = aff;
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch", smoke_aarch64_mpidr_aff_present);

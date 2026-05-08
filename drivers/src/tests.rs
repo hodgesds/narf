@@ -382,3 +382,40 @@ fn smoke_param_slot_not_installed() -> TestResult {
     }
 }
 kernel_test_in!("drivers", smoke_param_slot_not_installed);
+
+// ── relocated from verification ──
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_bound_drivers_inventory() -> TestResult {
+    // After boot-time probe_all_pci, the bound-driver inventory
+    // should contain entries for every PCIe driver that
+    // successfully attached. Verify the expected names show up.
+    use crate::{bound_drivers, BoundKind};
+    let bound = bound_drivers();
+    if bound.is_empty() {
+        return TestResult::Fail("bound-driver inventory empty");
+    }
+    let names: alloc::vec::Vec<_> = bound.iter().map(|b| b.name.as_str()).collect();
+    for required in &["nvme0", "vblk0", "sata0", "xhci0"] {
+        if !names.iter().any(|n| n == required) {
+            return TestResult::Fail("missing required bound driver");
+        }
+    }
+    // Block-class drivers should outnumber RNG-class drivers.
+    let n_block = bound.iter().filter(|b| b.kind == BoundKind::Block).count();
+    let n_rng = bound.iter().filter(|b| b.kind == BoundKind::Rng).count();
+    if n_block <= n_rng {
+        return TestResult::Fail("expected more Block drivers than Rng");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("drivers", smoke_bound_drivers_inventory);
+
+fn smoke_drivers_reset_default_is_noop() -> TestResult {
+    use crate::{Driver, NoopDriver};
+    let mut d = NoopDriver::new();
+    let _f = d.reset();
+    TestResult::Pass
+}
+kernel_test_in!("drivers", smoke_drivers_reset_default_is_noop);

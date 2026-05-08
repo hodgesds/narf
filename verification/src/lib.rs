@@ -552,26 +552,8 @@ kernel_test!(smoke_x86_64_shoot_range_one_ipi);
 
 // `smoke_bus_iommu_group_default` migrated to bus/src/tests.rs (subsystem `"bus"`).
 
-fn smoke_sleep_future_waits() -> TestResult {
-    use core::sync::atomic::{AtomicBool, Ordering};
-    static DONE: AtomicBool = AtomicBool::new(false);
-    narf_scheduler::init();
-    let start = narf_time::Instant::now();
-    narf_scheduler::spawn(async {
-        narf_time::sleep_cycles(10_000_000).await;
-        DONE.store(true, Ordering::Relaxed);
-    });
-    narf_scheduler::run_until_empty();
-    let elapsed = narf_time::Instant::now().cycles_since(start);
-    if !DONE.load(Ordering::Relaxed) {
-        return TestResult::Fail("sleep future never completed");
-    }
-    if elapsed < 10_000_000 {
-        return TestResult::Fail("completed before deadline — sleep isn't blocking");
-    }
-    TestResult::Pass
-}
-kernel_test!(smoke_sleep_future_waits);
+// `smoke_sleep_future_waits` migrated to scheduler/src/tests.rs (subsystem `"scheduler"`).
+
 
 // `smoke_tracing_note_section_present` migrated to tracing/src/tests.rs (subsystem `"tracing"`).
 
@@ -701,6 +683,7 @@ fn smoke_virtio_mmio_probe() -> TestResult {
 #[cfg(target_arch = "aarch64")]
 kernel_test!(smoke_virtio_mmio_probe);
 
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_virtio_mmio_probe() -> TestResult {
     // x86_64 under QEMU q35 has no virtio-mmio transports (virtio
@@ -720,6 +703,7 @@ fn smoke_virtio_mmio_probe() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_virtio_mmio_probe);
+
 
 fn smoke_virtio_mmio_wrong_magic() -> TestResult {
     // Synthesise a fake MMIO window on the stack: a zeroed u32 at
@@ -751,6 +735,7 @@ fn smoke_virtio_mmio_wrong_magic() -> TestResult {
     }
 }
 kernel_test!(smoke_virtio_mmio_wrong_magic);
+
 
 // ── Stage-3 exit-gate integration ──────────────────────────────────
 //
@@ -1363,262 +1348,20 @@ kernel_test!(smoke_pci_probe_all_dispatches_nvme);
 
 // `smoke_rights_lattice_derive` migrated to capabilities/src/tests.rs (subsystem `"capabilities"`).
 
-fn smoke_syscall_versioning_dispatch() -> TestResult {
-    // Build a private SyscallTable with a v0 + v1 handler for the
-    // same syscall number, exercise dispatch_ctx_versioned for both
-    // versions, and assert each handler set its own canary value.
-    use core::sync::atomic::{AtomicU32, Ordering};
-    use narf_userspace::{
-        syscall_number, syscall_pack, syscall_version, RawFnHandler, Syscall, SyscallArgs,
-        SyscallReturn, SyscallTable, TrapContext,
-    };
+// `smoke_syscall_versioning_dispatch` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-    static V0_SEEN: AtomicU32 = AtomicU32::new(0);
-    static V1_SEEN: AtomicU32 = AtomicU32::new(0);
-    V0_SEEN.store(0, Ordering::Relaxed);
-    V1_SEEN.store(0, Ordering::Relaxed);
 
-    let mut table = SyscallTable::new();
-    table.install_raw(
-        Syscall::Yield,
-        "yield-v0",
-        RawFnHandler(|ctx: &mut dyn TrapContext| {
-            V0_SEEN.fetch_add(1, Ordering::Relaxed);
-            ctx.set_return(SyscallReturn {
-                value: 0xC0DE_0000,
-                status: 0,
-            });
-        }),
-    );
-    table.install_raw_versioned(
-        Syscall::Yield,
-        1,
-        RawFnHandler(|ctx: &mut dyn TrapContext| {
-            V1_SEEN.fetch_add(1, Ordering::Relaxed);
-            ctx.set_return(SyscallReturn {
-                value: 0xC0DE_0001,
-                status: 0,
-            });
-        }),
-    );
+// `smoke_pci_cap_walker_finds_msix` migrated to bus/src/tests.rs (subsystem `"bus"`).
 
-    // Bit-packing helpers round-trip cleanly.
-    let raw = syscall_pack(1, Syscall::Yield);
-    if syscall_version(raw) != 1 {
-        return TestResult::Fail("version_of did not extract 1");
-    }
-    if syscall_number(raw) != Syscall::Yield.raw() {
-        return TestResult::Fail("number_of did not extract Yield");
-    }
 
-    // Manual ctx for dispatch.
-    struct FakeCtx {
-        args: SyscallArgs,
-        ret: Option<SyscallReturn>,
-    }
-    impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs {
-            &self.args
-        }
-        fn set_return(&mut self, r: SyscallReturn) {
-            self.ret = Some(r);
-        }
-        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
-            false
-        }
-    }
-    let mut ctx0 = FakeCtx {
-        args: SyscallArgs::default(),
-        ret: None,
-    };
-    table.dispatch_ctx_versioned(Syscall::Yield, 0, &mut ctx0);
-    if ctx0.ret.map(|r| r.value) != Some(0xC0DE_0000) {
-        return TestResult::Fail("v0 dispatch did not return v0 sentinel");
-    }
-    if V0_SEEN.load(Ordering::Relaxed) != 1 || V1_SEEN.load(Ordering::Relaxed) != 0 {
-        return TestResult::Fail("v0 path did not invoke v0 handler exclusively");
-    }
+// `smoke_pci_express_cap_link_status` migrated to bus/src/tests.rs (subsystem `"bus"`).
 
-    let mut ctx1 = FakeCtx {
-        args: SyscallArgs::default(),
-        ret: None,
-    };
-    table.dispatch_ctx_versioned(Syscall::Yield, 1, &mut ctx1);
-    if ctx1.ret.map(|r| r.value) != Some(0xC0DE_0001) {
-        return TestResult::Fail("v1 dispatch did not return v1 sentinel");
-    }
-    if V1_SEEN.load(Ordering::Relaxed) != 1 {
-        return TestResult::Fail("v1 path did not invoke v1 handler");
-    }
 
-    // Unknown version (v2) falls through to v0 — the documented
-    // "if no override, use canonical" rule.
-    let mut ctx2 = FakeCtx {
-        args: SyscallArgs::default(),
-        ret: None,
-    };
-    table.dispatch_ctx_versioned(Syscall::Yield, 2, &mut ctx2);
-    if ctx2.ret.map(|r| r.value) != Some(0xC0DE_0000) {
-        return TestResult::Fail("v2 unknown did not fall through to v0");
-    }
-    TestResult::Pass
-}
-kernel_test!(smoke_syscall_versioning_dispatch);
+// `smoke_vector_alloc_block_contiguous` migrated to interrupts/src/tests.rs (subsystem `"interrupts"`).
 
-#[cfg(target_arch = "x86_64")]
-fn smoke_pci_cap_walker_finds_msix() -> TestResult {
-    // The QEMU NVMe device exposes a standard cap list with at
-    // minimum MSI-X (0x11), Power Management (0x01), and PCI Express
-    // (0x10). Walk it via the generic walker + assert MSI-X is
-    // present.
-    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
-    use narf_bus::{devices, BusKind};
-    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
-    let devs = devices();
-    let nvme = devs.iter().find(|d| {
-        matches!(&d.kind, BusKind::Pcie { .. }) && d.id.vendor == 0x1B36 && d.id.device == 0x0010
-    });
-    let Some(d) = nvme else {
-        return TestResult::Skip("no QEMU NVMe");
-    };
-    // SAFETY: bounded walk on identity-mapped cfg-space.
-    let off = match unsafe { narf_bus::pci_cap::find_cap(d, narf_bus::pci_cap::id::MSI_X) } {
-        Ok(Some(o)) => o,
-        _ => return TestResult::Fail("MSI-X cap not found"),
-    };
-    if off == 0 || off >= 0x100 {
-        return TestResult::Fail("MSI-X cap offset out of range");
-    }
-    // PCI Express cap should also exist on a QEMU NVMe.
-    match unsafe { narf_bus::pci_cap::find_cap(d, narf_bus::pci_cap::id::PCI_EXPRESS) } {
-        Ok(Some(_)) => {}
-        _ => return TestResult::Fail("PCI Express cap not found"),
-    }
-    TestResult::Pass
-}
-#[cfg(target_arch = "x86_64")]
-kernel_test!(smoke_pci_cap_walker_finds_msix);
 
-#[cfg(target_arch = "x86_64")]
-fn smoke_pci_express_cap_link_status() -> TestResult {
-    // Read the PCIe cap's link_status on QEMU NVMe and verify the
-    // link-speed/width fields decode to non-zero values.
-    use narf_bus::pci_express::read_status;
-    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
-    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
-    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
-    let devs = devices();
-    let nvme = devs.iter().find(|d| {
-        matches!(&d.kind, BusKind::Pcie { .. }) && d.id.vendor == 0x1B36 && d.id.device == 0x0010
-    });
-    let Some(d) = nvme.copied() else {
-        return TestResult::Skip("no QEMU NVMe");
-    };
-    let authority = bootstrap_registry_authority();
-    let (_h, cap) = match claim_device_cap(&authority, d.addr) {
-        Ok(ok) => ok,
-        Err(_) => return TestResult::Fail("claim_device_cap"),
-    };
-    let read_cap = match cap.derive() {
-        Ok(c) => c,
-        Err(_) => return TestResult::Fail("derive read"),
-    };
-    let s = match read_status(&read_cap, &d) {
-        Ok(s) => s,
-        Err(_) => return TestResult::Fail("read_status"),
-    };
-    if s.link_speed() == 0 {
-        return TestResult::Fail("link speed 0");
-    }
-    if s.link_width() == 0 {
-        return TestResult::Fail("link width 0");
-    }
-    if s.max_payload_supported() < 128 {
-        return TestResult::Fail("max payload < 128");
-    }
-    TestResult::Pass
-}
-#[cfg(target_arch = "x86_64")]
-kernel_test!(smoke_pci_express_cap_link_status);
+// `smoke_msix_program_block` migrated to bus/src/tests.rs (subsystem `"bus"`).
 
-fn smoke_vector_alloc_block_contiguous() -> TestResult {
-    // alloc_block(4) returns a contiguous run of 4 vectors.
-    use narf_interrupts::vector::{alloc_block, free, is_allocated};
-    let base = match alloc_block(4) {
-        Ok(b) => b,
-        Err(_) => return TestResult::Fail("alloc_block(4) failed"),
-    };
-    for i in 0..4 {
-        if !is_allocated(base + i) {
-            return TestResult::Fail("alloc_block bit not set");
-        }
-    }
-    for i in 0..4 {
-        if free(base + i).is_err() {
-            return TestResult::Fail("free during cleanup");
-        }
-    }
-    TestResult::Pass
-}
-kernel_test!(smoke_vector_alloc_block_contiguous);
-
-#[cfg(target_arch = "x86_64")]
-fn smoke_msix_program_block() -> TestResult {
-    // Alloc 4 contiguous IDT vectors + program block 0..4 of the
-    // QEMU NVMe MSI-X table to deliver them. We can't easily assert
-    // the device fires multiple IRQs from a smoke (the driver isn't
-    // running yet), but the structural path — alloc_block, walk the
-    // cap, program 4 entries, enable — must succeed without faulting.
-    use narf_bus::msix::enable_msix;
-    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
-    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
-    use narf_interrupts::vector;
-    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
-    let devs = devices();
-    let nvme = devs.iter().find(|d| {
-        matches!(&d.kind, BusKind::Pcie { .. }) && d.id.vendor == 0x1B36 && d.id.device == 0x0010
-    });
-    let Some(d) = nvme.copied() else {
-        return TestResult::Skip("no QEMU NVMe");
-    };
-    let authority = bootstrap_registry_authority();
-    let (_h, cap) = match claim_device_cap(&authority, d.addr) {
-        Ok(ok) => ok,
-        Err(_) => return TestResult::Fail("claim"),
-    };
-    let mut table = match enable_msix(&cap, &d) {
-        Ok(t) => t,
-        Err(_) => return TestResult::Fail("enable_msix"),
-    };
-    if table.size() < 4 {
-        return TestResult::Skip("table < 4");
-    }
-    if table.alloc_block(4).is_err() {
-        return TestResult::Fail("alloc_block(4)");
-    }
-    let base = match vector::alloc_block(4) {
-        Ok(b) => b,
-        Err(_) => return TestResult::Fail("vector::alloc_block"),
-    };
-    // SAFETY: we own the device cap; cap-list walk + writes target
-    // identity-mapped MMIO.
-    let block = unsafe { table.program_vector_block(0, 4, 0, base) };
-    let v = match block {
-        Ok(v) => v,
-        Err(_) => return TestResult::Fail("program_vector_block"),
-    };
-    if v.len() != 4 {
-        return TestResult::Fail("program_vector_block returned wrong count");
-    }
-    // Cleanup: release vectors. (Table allocation persists; OK,
-    // re-running enable_msix discovers the same N.)
-    for i in 0..4 {
-        let _ = vector::free(base + i);
-    }
-    TestResult::Pass
-}
-#[cfg(target_arch = "x86_64")]
-kernel_test!(smoke_msix_program_block);
 
 // `smoke_pci_cap_ext_walker` migrated to bus/src/tests.rs (subsystem `"bus"`).
 
@@ -1701,32 +1444,8 @@ fn smoke_net_e1000_arp_round_trip() -> TestResult {
 kernel_test!(smoke_net_e1000_arp_round_trip);
 
 
-#[cfg(target_arch = "x86_64")]
-fn smoke_bound_drivers_inventory() -> TestResult {
-    // After boot-time probe_all_pci, the bound-driver inventory
-    // should contain entries for every PCIe driver that
-    // successfully attached. Verify the expected names show up.
-    use narf_drivers::{bound_drivers, BoundKind};
-    let bound = bound_drivers();
-    if bound.is_empty() {
-        return TestResult::Fail("bound-driver inventory empty");
-    }
-    let names: alloc::vec::Vec<_> = bound.iter().map(|b| b.name.as_str()).collect();
-    for required in &["nvme0", "vblk0", "sata0", "xhci0"] {
-        if !names.iter().any(|n| n == required) {
-            return TestResult::Fail("missing required bound driver");
-        }
-    }
-    // Block-class drivers should outnumber RNG-class drivers.
-    let n_block = bound.iter().filter(|b| b.kind == BoundKind::Block).count();
-    let n_rng = bound.iter().filter(|b| b.kind == BoundKind::Rng).count();
-    if n_block <= n_rng {
-        return TestResult::Fail("expected more Block drivers than Rng");
-    }
-    TestResult::Pass
-}
-#[cfg(target_arch = "x86_64")]
-kernel_test!(smoke_bound_drivers_inventory);
+// `smoke_bound_drivers_inventory` migrated to drivers/src/tests.rs (subsystem `"drivers"`).
+
 
 // `smoke_slab_alloc_free_round_trip` migrated to memory/src/tests.rs (subsystem `"memory"`).
 
@@ -1753,19 +1472,8 @@ kernel_test!(smoke_percpu_current_id);
 // `smoke_percpu_storage_isolation` migrated to lib/src/tests.rs (subsystem `"lib"`).
 
 
-#[cfg(target_arch = "aarch64")]
-fn smoke_aarch64_mpidr_aff_present() -> TestResult {
-    // MPIDR_EL1 reads cleanly + affinity-pack returns a value
-    // matching the table-registered BSP slot.
-    let aff = narf_arch::aarch64::cpu::mpidr_aff();
-    // QEMU virt typically reports MPIDR_EL1 = 0x80000000 (UP bit
-    // set) so aff = 0. We accept anything; just verify the read
-    // doesn't fault.
-    let _ = aff;
-    TestResult::Pass
-}
-#[cfg(target_arch = "aarch64")]
-kernel_test!(smoke_aarch64_mpidr_aff_present);
+// `smoke_aarch64_mpidr_aff_present` migrated to arch/src/tests.rs (subsystem `"arch"`).
+
 
 fn smoke_smp_bsp_baseline() -> TestResult {
     use narf_lib::smp;
@@ -2052,23 +1760,8 @@ kernel_test!(smoke_smp_x86_64_cpuid_count);
 // `smoke_aml_eval_multiply_arg` migrated to aml/src/tests.rs (subsystem `"aml"`).
 
 
-#[cfg(target_arch = "x86_64")]
-fn smoke_frame_alloc_per_node_distribution() -> TestResult {
-    // After SRAT-driven rebalance, each NUMA node should hold a
-    // non-trivial slice of free frames. With QEMU's 2-node config
-    // (128 MiB each), both bins should be non-empty.
-    if !narf_memory::is_numa_aware() {
-        return TestResult::Fail("frame allocator not NUMA-rebalanced");
-    }
-    let n0 = narf_memory::node_free(0);
-    let n1 = narf_memory::node_free(1);
-    if n0 == 0 || n1 == 0 {
-        return TestResult::Fail("expected both nodes to hold free frames");
-    }
-    TestResult::Pass
-}
-#[cfg(target_arch = "x86_64")]
-kernel_test!(smoke_frame_alloc_per_node_distribution);
+// `smoke_frame_alloc_per_node_distribution` migrated to memory/src/tests.rs (subsystem `"memory"`).
+
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_frame_alloc_on_node_returns_local() -> TestResult {
@@ -2194,99 +1887,8 @@ fn smoke_drivers_net_nic_model_ids() -> TestResult {
 kernel_test!(smoke_drivers_net_nic_model_ids);
 
 
-fn smoke_memory_address_space_materialize() -> TestResult {
-    // Full flow: new_for_user allocates a fresh root, map_region
-    // records a region, materialize walks the region and installs
-    // real PTEs via the arch's 4-KiB mapper, then translate()
-    // against the new root finds the mapping with expected flags.
-    use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
+// `smoke_memory_address_space_materialize` migrated to memory/src/tests.rs (subsystem `"memory"`).
 
-    let mut a = unsafe { AddressSpace::new_for_user() }.expect("alloc AS");
-    // Pick a user virtual address outside every pre-existing
-    // mapping. On x86_64, low 4 GiB is identity-mapped via 1-GiB
-    // HUGE_PAGE entries in PML4[0]; pick PML4[1] (= 512 GiB). On
-    // aarch64 TTBR0 starts empty, so any low-half canonical VA is
-    // safe — use the same one for portability.
-    let vbase = 0x0000_0080_0000_0000u64; // 512 GiB
-                                          // Allocate a real phys frame to back it.
-    let target = match narf_memory::alloc_frame() {
-        Ok(f) => f.start_address(),
-        Err(_) => return TestResult::Skip("frame allocator drained"),
-    };
-
-    a.map_region(Region {
-        base: VirtAddr::new(vbase),
-        len: 0x1000,
-        perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![target],
-    })
-    .expect("map region");
-
-    if unsafe { a.materialize() }.is_err() {
-        return TestResult::Fail("materialize failed on fresh user root");
-    }
-
-    // Per-arch structural validation of the installed PTE.
-    #[cfg(target_arch = "x86_64")]
-    {
-        use narf_memory::x86_64::paging::{self, PtFlags};
-        let got = unsafe { paging::translate(a.root, VirtAddr::new(vbase)) };
-        match got {
-            Some(phys) => {
-                if phys != target {
-                    return TestResult::Fail("translate returned wrong phys");
-                }
-            }
-            None => return TestResult::Fail("translate found no mapping post-materialize"),
-        }
-        let flags = unsafe { paging::flags_at(a.root, VirtAddr::new(vbase)) };
-        match flags {
-            Some(f)
-                if f.contains(PtFlags::PRESENT)
-                    && f.contains(PtFlags::WRITABLE)
-                    && f.contains(PtFlags::USER)
-                    && f.contains(PtFlags::NO_EXEC) => {}
-            _ => return TestResult::Fail("x86_64 PTE missing expected flags"),
-        }
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        use narf_memory::aarch64::paging::{self, PtFlags};
-        let got = unsafe { paging::translate(a.root, VirtAddr::new(vbase)) };
-        match got {
-            Some(phys) => {
-                if phys != target {
-                    return TestResult::Fail("translate returned wrong phys");
-                }
-            }
-            None => return TestResult::Fail("translate found no mapping post-materialize"),
-        }
-        // Expect VALID + AF + UXN (non-exec default) + TYPE_PAGE.
-        let flags = unsafe { paging::flags_at(a.root, VirtAddr::new(vbase)) };
-        match flags {
-            Some(f) => {
-                let v = f.bits();
-                if v & 1 != 1 {
-                    return TestResult::Fail("aarch64 PTE not VALID");
-                }
-                if v & (1 << 10) == 0 {
-                    return TestResult::Fail("aarch64 PTE missing AF");
-                }
-                if v & (1 << 54) == 0 {
-                    return TestResult::Fail("aarch64 PTE missing UXN for non-exec region");
-                }
-            }
-            None => return TestResult::Fail("aarch64 flags_at returned None"),
-        }
-    }
-
-    // Idempotent second call.
-    if unsafe { a.materialize() }.is_err() {
-        return TestResult::Fail("second materialize should be idempotent");
-    }
-    TestResult::Pass
-}
-kernel_test!(smoke_memory_address_space_materialize);
 
 // `smoke_scheduler_spawn_user_carries_address_space` migrated to scheduler/src/tests.rs (subsystem `"scheduler"`).
 
@@ -2297,427 +1899,14 @@ kernel_test!(smoke_memory_address_space_materialize);
 // `smoke_ipc_mpsc_closed_surfaces` migrated to ipc/src/tests.rs (subsystem `"ipc"`).
 
 
-fn smoke_memory_address_space_region_table() -> TestResult {
-    use narf_memory::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
+// `smoke_memory_address_space_region_table` migrated to memory/src/tests.rs (subsystem `"memory"`).
 
-    let mut a = AddressSpace::empty();
-    if a.region_count() != 0 {
-        return TestResult::Fail("fresh AS has regions");
-    }
 
-    let rx = RegionPerms::READ | RegionPerms::EXEC;
-    let r1 = Region {
-        base: VirtAddr::new(0x4000),
-        len: 0x1000,
-        perms: rx,
-        phys: alloc::vec![PhysAddr::new(0x10_0000)],
-    };
-    if a.map_region(r1).is_err() {
-        return TestResult::Fail("first map failed");
-    }
+// `smoke_abi_dispatcher_serves_file_ops` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-    // Non-overlapping second region is fine.
-    let r2 = Region {
-        base: VirtAddr::new(0x5000),
-        len: 0x2000,
-        perms: rx,
-        phys: alloc::vec![PhysAddr::new(0x11_0000), PhysAddr::new(0x11_1000)],
-    };
-    if a.map_region(r2).is_err() {
-        return TestResult::Fail("second non-overlap map failed");
-    }
 
-    // Overlap is rejected.
-    let r_over = Region {
-        base: VirtAddr::new(0x6000),
-        len: 0x2000,
-        perms: rx,
-        phys: alloc::vec![PhysAddr::new(0x12_0000), PhysAddr::new(0x12_1000)],
-    };
-    match a.map_region(r_over) {
-        Err(AddressSpaceError::Overlap) => {}
-        _ => return TestResult::Fail("overlap should be rejected"),
-    }
+// `smoke_abi_dispatcher_serves_mmap` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
-    // Unaligned base is rejected.
-    let r_unaligned = Region {
-        base: VirtAddr::new(0x4123),
-        len: 0x1000,
-        perms: rx,
-        phys: alloc::vec![PhysAddr::new(0x13_0000)],
-    };
-    match a.map_region(r_unaligned) {
-        Err(AddressSpaceError::AlignmentMismatch) => {}
-        _ => return TestResult::Fail("unaligned base should be rejected"),
-    }
-
-    // lookup finds the covering region (inside r2's 0x5000..0x7000).
-    let hit = a.lookup(VirtAddr::new(0x6123));
-    if hit.map(|r| r.base) != Some(VirtAddr::new(0x5000)) {
-        return TestResult::Fail("lookup did not find covering region");
-    }
-
-    // activate on a fresh AS (root still 0) surfaces OutOfRange —
-    // this path doesn't touch CR3.
-    match a.activate() {
-        Err(AddressSpaceError::OutOfRange) => {}
-        _ => return TestResult::Fail("activate on unset root should surface OutOfRange"),
-    }
-
-    // Unmap removes by base.
-    let removed = a.unmap_region(VirtAddr::new(0x5000));
-    if removed.map(|r| r.len) != Ok(0x2000) {
-        return TestResult::Fail("unmap did not return correct region");
-    }
-    if a.region_count() != 1 {
-        return TestResult::Fail("unmap did not shrink region count");
-    }
-    TestResult::Pass
-}
-kernel_test!(smoke_memory_address_space_region_table);
-
-#[cfg(target_arch = "x86_64")]
-fn smoke_abi_dispatcher_serves_file_ops() -> TestResult {
-    // Bootstrap mints rings, kernel installs the
-    // abi-file-op-bridge, dispatcher runs on the kernel-side
-    // ends, user-side task issues an `OpCode::Open` followed by
-    // `OpCode::Read` against a stub-FS file mounted under
-    // `/test_abi`. The completion's result[0] carries the bytes-
-    // read count; the user-mapped buffer holds the file's bytes.
-    use alloc::boxed::Box;
-    use alloc::sync::Arc;
-    use core::sync::atomic::{AtomicU8, Ordering};
-    use narf_abi::{Dispatcher, NarfStatus, OpCode, Submission, Tag};
-    use narf_capabilities::{Cap, Grant};
-    use narf_filesystem::{
-        bootstrap_mount_authority, registry, DirEntry, DirOps, FileOps, FsFuture, FsInstance,
-        MountPoint, Stat,
-    };
-    use narf_memory::AddressSpace;
-    use narf_userspace::{
-        abi_file_op_bridge, install_address_space_lookup, install_core_syscalls, install_global,
-        install_task_id_lookup, syscall::__test_clear_global, SyscallTable,
-    };
-
-    static FILE_BYTES: &[u8] = b"VFS-via-ABI";
-    struct StubFile;
-    impl FileOps for StubFile {
-        fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
-            alloc::boxed::Box::pin(async move {
-                let off = offset as usize;
-                if off >= FILE_BYTES.len() {
-                    return Ok(0);
-                }
-                let n = core::cmp::min(buf.len(), FILE_BYTES.len() - off);
-                buf[..n].copy_from_slice(&FILE_BYTES[off..off + n]);
-                Ok(n)
-            })
-        }
-        fn write<'a>(&'a self, _o: u64, b: &'a [u8]) -> FsFuture<'a, usize> {
-            let n = b.len();
-            alloc::boxed::Box::pin(async move { Ok(n) })
-        }
-        fn stat(&self) -> Stat {
-            Stat {
-                size: FILE_BYTES.len() as u64,
-                blocks: 1,
-                mode: narf_filesystem::Mode::FILE_RO,
-                mtime_cycles: 0,
-            }
-        }
-    }
-    struct StubDir;
-    impl DirOps for StubDir {
-        fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
-            if name == "f" {
-                Some(Arc::new(StubFile))
-            } else {
-                None
-            }
-        }
-        fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
-            Box::new(core::iter::empty())
-        }
-    }
-    struct StubFs;
-    impl FsInstance for StubFs {
-        fn root(&self) -> Arc<dyn DirOps> {
-            Arc::new(StubDir)
-        }
-        fn name(&self) -> &str {
-            "stub_abi"
-        }
-    }
-
-    let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
-    let _ = registry().mount(&auth, "/test_abi", StubFs);
-
-    static USER_AS_ABI: narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>> =
-        narf_lib::sync::IrqSafeSpinLock::new(None);
-    fn as_lookup() -> Option<Arc<AddressSpace>> {
-        USER_AS_ABI.lock().clone()
-    }
-    static FAKE_TASK: u64 = 0xABBA;
-    fn task_lookup() -> u64 {
-        FAKE_TASK
-    }
-
-    let addr_space = match unsafe { AddressSpace::new_for_user() } {
-        Ok(a) => Arc::new(a),
-        Err(_) => return TestResult::Fail("new_for_user failed"),
-    };
-    *USER_AS_ABI.lock() = Some(addr_space);
-
-    install_address_space_lookup(as_lookup);
-    install_task_id_lookup(task_lookup);
-    narf_userspace::fd::__test_reset();
-    narf_userspace::fd::init();
-    narf_userspace::bootstrap_init();
-    narf_abi::install_file_op_bridge(abi_file_op_bridge);
-    __test_clear_global();
-    let mut t = SyscallTable::new();
-    install_core_syscalls(&mut t);
-    install_global(t);
-
-    // Direct Bootstrap call (test runs in kernel context).
-    use narf_userspace::{kernel_syscall_entry, Syscall, SyscallArgs, SyscallReturn, TrapContext};
-    struct FakeCtx {
-        args: SyscallArgs,
-        ret: Option<SyscallReturn>,
-    }
-    impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs {
-            &self.args
-        }
-        fn set_return(&mut self, r: SyscallReturn) {
-            self.ret = Some(r);
-        }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
-            false
-        }
-    }
-    let mut ctx = FakeCtx {
-        args: SyscallArgs::default(),
-        ret: None,
-    };
-    kernel_syscall_entry(Syscall::Bootstrap.raw(), &mut ctx);
-    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
-        return TestResult::Fail("Bootstrap returned non-Ok");
-    }
-
-    let kernel_ends = narf_userspace::take_kernel_ends(FAKE_TASK).expect("ke");
-    let user_ends = narf_userspace::take_user_ends(FAKE_TASK).expect("ue");
-
-    static OUTCOME: AtomicU8 = AtomicU8::new(0);
-    OUTCOME.store(0, Ordering::Relaxed);
-
-    // Stable-static buffers for the path/mount/data so the user
-    // task can hand pointers across awaits without lifetime
-    // complications.
-    static PATH: &[u8] = b"f";
-    static MOUNT: &[u8] = b"/test_abi";
-    static mut READ_BUF: [u8; 16] = [0u8; 16];
-
-    narf_scheduler::init();
-    narf_scheduler::spawn(async move {
-        let mut d = Dispatcher::new(kernel_ends.sq_drain, kernel_ends.cq_prod);
-        d.run().await;
-    });
-    narf_scheduler::spawn(async move {
-        let mut sq = user_ends.sq_prod;
-        let mut cq = user_ends.cq_drain;
-
-        // Open(/test_abi, "f").
-        let mut sub = Submission::noop(Tag::new(0x10));
-        sub.op = OpCode::OpenFile;
-        sub.inline[0] = PATH.as_ptr() as u64;
-        sub.inline[1] = PATH.len() as u64;
-        sub.inline[2] = MOUNT.as_ptr() as u64;
-        sub.inline[3] = MOUNT.len() as u64;
-        sq.send(sub).await.unwrap();
-        let comp = cq.recv().await.unwrap();
-        if comp.status != NarfStatus::Ok || comp.result[0] != 3 {
-            OUTCOME.store(2, Ordering::Relaxed);
-            core::mem::drop(sq);
-            core::mem::drop(cq);
-            return;
-        }
-        let fd = comp.result[0];
-
-        // Read(fd, READ_BUF, 16).
-        let mut sub = Submission::noop(Tag::new(0x11));
-        sub.op = OpCode::Read;
-        sub.inline[0] = fd;
-        sub.inline[1] = unsafe { core::ptr::addr_of_mut!(READ_BUF) as u64 };
-        sub.inline[2] = 16;
-        sq.send(sub).await.unwrap();
-        let comp = cq.recv().await.unwrap();
-        if comp.status != NarfStatus::Ok {
-            OUTCOME.store(3, Ordering::Relaxed);
-            core::mem::drop(sq);
-            core::mem::drop(cq);
-            return;
-        }
-        let n = comp.result[0] as usize;
-        let buf = unsafe { &READ_BUF };
-        if &buf[..n] == FILE_BYTES {
-            OUTCOME.store(1, Ordering::Relaxed);
-        } else {
-            OUTCOME.store(4, Ordering::Relaxed);
-        }
-        core::mem::drop(sq);
-        core::mem::drop(cq);
-    });
-
-    narf_scheduler::run_until_empty();
-
-    *USER_AS_ABI.lock() = None;
-    narf_userspace::fd::__test_reset();
-    narf_userspace::handlers::__test_bootstrap_reset();
-    __test_clear_global();
-
-    match OUTCOME.load(Ordering::Relaxed) {
-        1 => TestResult::Pass,
-        2 => TestResult::Fail("Open completion was not Ok / fd != 3"),
-        3 => TestResult::Fail("Read completion was not Ok"),
-        4 => TestResult::Fail("Read bytes mismatched expected payload"),
-        _ => TestResult::Fail("user-side task did not complete"),
-    }
-}
-#[cfg(target_arch = "x86_64")]
-kernel_test!(smoke_abi_dispatcher_serves_file_ops);
-
-#[cfg(target_arch = "x86_64")]
-fn smoke_abi_dispatcher_serves_mmap() -> TestResult {
-    // Same shape as smoke_abi_dispatcher_serves_file_ops, but
-    // exercises the Mmap/Munmap ring path. Submit `OpCode::Mmap`
-    // for one page → expect `Ok` with a non-zero user vaddr in
-    // `result[0]`. Then `OpCode::Munmap` that base → expect `Ok`.
-    use alloc::sync::Arc;
-    use core::sync::atomic::{AtomicU8, Ordering};
-    use narf_abi::{Dispatcher, NarfStatus, OpCode, Submission, Tag};
-    use narf_memory::AddressSpace;
-    use narf_userspace::{
-        abi_file_op_bridge, install_address_space_lookup, install_core_syscalls, install_global,
-        install_task_id_lookup, syscall::__test_clear_global, SyscallTable,
-    };
-
-    static USER_AS_MMAP: narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>> =
-        narf_lib::sync::IrqSafeSpinLock::new(None);
-    fn as_lookup() -> Option<Arc<AddressSpace>> {
-        USER_AS_MMAP.lock().clone()
-    }
-    static FAKE_TASK: u64 = 0xACAC;
-    fn task_lookup() -> u64 {
-        FAKE_TASK
-    }
-
-    let addr_space = match unsafe { AddressSpace::new_for_user() } {
-        Ok(a) => Arc::new(a),
-        Err(_) => return TestResult::Fail("new_for_user failed"),
-    };
-    *USER_AS_MMAP.lock() = Some(addr_space);
-
-    install_address_space_lookup(as_lookup);
-    install_task_id_lookup(task_lookup);
-    narf_userspace::fd::__test_reset();
-    narf_userspace::fd::init();
-    narf_userspace::bootstrap_init();
-    narf_abi::install_file_op_bridge(abi_file_op_bridge);
-    __test_clear_global();
-    let mut t = SyscallTable::new();
-    install_core_syscalls(&mut t);
-    install_global(t);
-
-    use narf_userspace::{kernel_syscall_entry, Syscall, SyscallArgs, SyscallReturn, TrapContext};
-    struct FakeCtx {
-        args: SyscallArgs,
-        ret: Option<SyscallReturn>,
-    }
-    impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs {
-            &self.args
-        }
-        fn set_return(&mut self, r: SyscallReturn) {
-            self.ret = Some(r);
-        }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
-            false
-        }
-    }
-    let mut ctx = FakeCtx {
-        args: SyscallArgs::default(),
-        ret: None,
-    };
-    kernel_syscall_entry(Syscall::Bootstrap.raw(), &mut ctx);
-    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
-        return TestResult::Fail("Bootstrap returned non-Ok");
-    }
-
-    let kernel_ends = narf_userspace::take_kernel_ends(FAKE_TASK).expect("ke");
-    let user_ends = narf_userspace::take_user_ends(FAKE_TASK).expect("ue");
-
-    static OUTCOME: AtomicU8 = AtomicU8::new(0);
-    OUTCOME.store(0, Ordering::Relaxed);
-
-    narf_scheduler::init();
-    narf_scheduler::spawn(async move {
-        let mut d = Dispatcher::new(kernel_ends.sq_drain, kernel_ends.cq_prod);
-        d.run().await;
-    });
-    narf_scheduler::spawn(async move {
-        let mut sq = user_ends.sq_prod;
-        let mut cq = user_ends.cq_drain;
-
-        // Mmap(hint=0, len=0x1000, flags=0).
-        let mut sub = Submission::noop(Tag::new(0x20));
-        sub.op = OpCode::Mmap;
-        sub.inline[0] = 0;
-        sub.inline[1] = 0x1000;
-        sub.inline[2] = 0;
-        sq.send(sub).await.unwrap();
-        let comp = cq.recv().await.unwrap();
-        if comp.status != NarfStatus::Ok || comp.result[0] == 0 {
-            OUTCOME.store(2, Ordering::Relaxed);
-            core::mem::drop(sq);
-            core::mem::drop(cq);
-            return;
-        }
-        let base = comp.result[0];
-
-        // Munmap(base).
-        let mut sub = Submission::noop(Tag::new(0x21));
-        sub.op = OpCode::Munmap;
-        sub.inline[0] = base;
-        sq.send(sub).await.unwrap();
-        let comp = cq.recv().await.unwrap();
-        if comp.status != NarfStatus::Ok {
-            OUTCOME.store(3, Ordering::Relaxed);
-            core::mem::drop(sq);
-            core::mem::drop(cq);
-            return;
-        }
-        OUTCOME.store(1, Ordering::Relaxed);
-        core::mem::drop(sq);
-        core::mem::drop(cq);
-    });
-
-    narf_scheduler::run_until_empty();
-
-    *USER_AS_MMAP.lock() = None;
-    narf_userspace::fd::__test_reset();
-    narf_userspace::handlers::__test_bootstrap_reset();
-    __test_clear_global();
-
-    match OUTCOME.load(Ordering::Relaxed) {
-        1 => TestResult::Pass,
-        2 => TestResult::Fail("Mmap completion was not Ok / vaddr was 0"),
-        3 => TestResult::Fail("Munmap completion was not Ok"),
-        _ => TestResult::Fail("user-side task did not complete"),
-    }
-}
-#[cfg(target_arch = "x86_64")]
-kernel_test!(smoke_abi_dispatcher_serves_mmap);
 
 // `smoke_userspace_spawn_dispatcher_for_helper` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 
@@ -5162,105 +4351,14 @@ kernel_test!(smoke_frame_x86_64_run_narf_libc_validate);
 // perturbed `smoke_audio_submit_shmem_zero_copy`. Aggregating
 // them here keeps the build-order shape stable.
 
-fn smoke_drivers_reset_default_is_noop() -> TestResult {
-    use narf_drivers::{Driver, NoopDriver};
-    let mut d = NoopDriver::new();
-    let _f = d.reset();
-    TestResult::Pass
-}
-kernel_test!(smoke_drivers_reset_default_is_noop);
+// `smoke_drivers_reset_default_is_noop` migrated to drivers/src/tests.rs (subsystem `"drivers"`).
 
-fn smoke_hotplug_default_dispatcher_round_trip() -> TestResult {
-    use alloc::sync::Arc;
-    use core::sync::atomic::{AtomicU32, Ordering};
-    use narf_bus::hotplug::{
-        __clear_listeners, dispatch_event, install_default_dispatcher, listener_count,
-        HotplugEvent, HotplugListener,
-    };
-    use narf_bus::{BusAddr, DeviceId, PcieAddr};
 
-    __clear_listeners();
-    if listener_count() != 0 {
-        return TestResult::Fail("listener list not empty after clear");
-    }
-    if install_default_dispatcher().is_err() {
-        return TestResult::Fail("install_default_dispatcher");
-    }
+// `smoke_hotplug_default_dispatcher_round_trip` migrated to bus/src/tests.rs (subsystem `"bus"`).
 
-    static ATTACHES: AtomicU32 = AtomicU32::new(0);
-    static DETACHES: AtomicU32 = AtomicU32::new(0);
-    struct Tally;
-    impl HotplugListener for Tally {
-        fn on_event(&self, ev: HotplugEvent) {
-            match ev {
-                HotplugEvent::Attach { .. } => {
-                    ATTACHES.fetch_add(1, Ordering::Relaxed);
-                }
-                HotplugEvent::Detach { .. } => {
-                    DETACHES.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-    }
-    let auth = narf_bus::bootstrap_registry_authority();
-    if narf_bus::hotplug::register_listener(&auth, Arc::new(Tally)).is_err() {
-        return TestResult::Fail("register Tally");
-    }
-    if listener_count() != 2 {
-        return TestResult::Fail("expected 2 listeners after default + tally");
-    }
 
-    let baseline_a = ATTACHES.load(Ordering::Relaxed);
-    let baseline_d = DETACHES.load(Ordering::Relaxed);
-    let addr = BusAddr::Pcie(PcieAddr {
-        segment: 0,
-        bus: 0,
-        device: 31,
-        function: 0,
-    });
+// `smoke_aer_classifier_severity` migrated to bus/src/tests.rs (subsystem `"bus"`).
 
-    dispatch_event(HotplugEvent::Attach {
-        addr,
-        device_id: DeviceId {
-            vendor: 0x1234,
-            device: 0x5678,
-            class: 0,
-        },
-    });
-    dispatch_event(HotplugEvent::Detach { addr });
-
-    if ATTACHES.load(Ordering::Relaxed) != baseline_a + 1 {
-        return TestResult::Fail("Attach not delivered to tally listener");
-    }
-    if DETACHES.load(Ordering::Relaxed) != baseline_d + 1 {
-        return TestResult::Fail("Detach not delivered to tally listener");
-    }
-    __clear_listeners();
-    TestResult::Pass
-}
-kernel_test!(smoke_hotplug_default_dispatcher_round_trip);
-
-fn smoke_aer_classifier_severity() -> TestResult {
-    use narf_bus::pci_cap_ext::{classify_aer, AerSeverity};
-
-    if classify_aer(0, 0, 0).is_some() {
-        return TestResult::Fail("zero status produced an event");
-    }
-    if classify_aer(0, 0, 1) != Some(AerSeverity::Correctable) {
-        return TestResult::Fail("correctable bit didn't classify");
-    }
-    if classify_aer(1 << 4, 0, 0) != Some(AerSeverity::NonFatal) {
-        return TestResult::Fail("uncorr w/o severity should be NonFatal");
-    }
-    if classify_aer(1 << 4, 1 << 4, 0) != Some(AerSeverity::Fatal) {
-        return TestResult::Fail("uncorr matched severity should be Fatal");
-    }
-    if classify_aer(1 << 4, 0, 1) != Some(AerSeverity::Correctable) {
-        return TestResult::Fail("correctable should win over uncorr");
-    }
-    TestResult::Pass
-}
-kernel_test!(smoke_aer_classifier_severity);
 
 // `smoke_power_dstate_classification` migrated to power/src/tests.rs (subsystem `"power"`).
 
@@ -5443,6 +4541,7 @@ fn smoke_compat_win_load_pe_pipeline() -> TestResult {
 
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_compat_win_load_pe_pipeline);
+
 
 #[cfg(feature = "user-mode-e2e")]
 fn smoke_firmware_install_syscall_round_trip() -> TestResult {

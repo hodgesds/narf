@@ -1113,3 +1113,231 @@ fn smoke_aer_header_log_decodes_le() -> TestResult {
 }
 
 kernel_test_in!("bus/pcie-aer", smoke_aer_header_log_decodes_le);
+
+// ── relocated from verification ──
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_pci_cap_walker_finds_msix() -> TestResult {
+    // The QEMU NVMe device exposes a standard cap list with at
+    // minimum MSI-X (0x11), Power Management (0x01), and PCI Express
+    // (0x10). Walk it via the generic walker + assert MSI-X is
+    // present.
+    use crate::x86_64::ECAM_DEFAULT_BASE;
+    use crate::{devices, BusKind};
+    let _ = unsafe { crate::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let nvme = devs.iter().find(|d| {
+        matches!(&d.kind, BusKind::Pcie { .. }) && d.id.vendor == 0x1B36 && d.id.device == 0x0010
+    });
+    let Some(d) = nvme else {
+        return TestResult::Skip("no QEMU NVMe");
+    };
+    // SAFETY: bounded walk on identity-mapped cfg-space.
+    let off = match unsafe { crate::pci_cap::find_cap(d, crate::pci_cap::id::MSI_X) } {
+        Ok(Some(o)) => o,
+        _ => return TestResult::Fail("MSI-X cap not found"),
+    };
+    if off == 0 || off >= 0x100 {
+        return TestResult::Fail("MSI-X cap offset out of range");
+    }
+    // PCI Express cap should also exist on a QEMU NVMe.
+    match unsafe { crate::pci_cap::find_cap(d, crate::pci_cap::id::PCI_EXPRESS) } {
+        Ok(Some(_)) => {}
+        _ => return TestResult::Fail("PCI Express cap not found"),
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("bus", smoke_pci_cap_walker_finds_msix);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_pci_express_cap_link_status() -> TestResult {
+    // Read the PCIe cap's link_status on QEMU NVMe and verify the
+    // link-speed/width fields decode to non-zero values.
+    use crate::pci_express::read_status;
+    use crate::x86_64::ECAM_DEFAULT_BASE;
+    use crate::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+    let _ = unsafe { crate::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let nvme = devs.iter().find(|d| {
+        matches!(&d.kind, BusKind::Pcie { .. }) && d.id.vendor == 0x1B36 && d.id.device == 0x0010
+    });
+    let Some(d) = nvme.copied() else {
+        return TestResult::Skip("no QEMU NVMe");
+    };
+    let authority = bootstrap_registry_authority();
+    let (_h, cap) = match claim_device_cap(&authority, d.addr) {
+        Ok(ok) => ok,
+        Err(_) => return TestResult::Fail("claim_device_cap"),
+    };
+    let read_cap = match cap.derive() {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("derive read"),
+    };
+    let s = match read_status(&read_cap, &d) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("read_status"),
+    };
+    if s.link_speed() == 0 {
+        return TestResult::Fail("link speed 0");
+    }
+    if s.link_width() == 0 {
+        return TestResult::Fail("link width 0");
+    }
+    if s.max_payload_supported() < 128 {
+        return TestResult::Fail("max payload < 128");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("bus", smoke_pci_express_cap_link_status);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_msix_program_block() -> TestResult {
+    // Alloc 4 contiguous IDT vectors + program block 0..4 of the
+    // QEMU NVMe MSI-X table to deliver them. We can't easily assert
+    // the device fires multiple IRQs from a smoke (the driver isn't
+    // running yet), but the structural path — alloc_block, walk the
+    // cap, program 4 entries, enable — must succeed without faulting.
+    use crate::msix::enable_msix;
+    use crate::x86_64::ECAM_DEFAULT_BASE;
+    use crate::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+    use narf_interrupts::vector;
+    let _ = unsafe { crate::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let nvme = devs.iter().find(|d| {
+        matches!(&d.kind, BusKind::Pcie { .. }) && d.id.vendor == 0x1B36 && d.id.device == 0x0010
+    });
+    let Some(d) = nvme.copied() else {
+        return TestResult::Skip("no QEMU NVMe");
+    };
+    let authority = bootstrap_registry_authority();
+    let (_h, cap) = match claim_device_cap(&authority, d.addr) {
+        Ok(ok) => ok,
+        Err(_) => return TestResult::Fail("claim"),
+    };
+    let mut table = match enable_msix(&cap, &d) {
+        Ok(t) => t,
+        Err(_) => return TestResult::Fail("enable_msix"),
+    };
+    if table.size() < 4 {
+        return TestResult::Skip("table < 4");
+    }
+    if table.alloc_block(4).is_err() {
+        return TestResult::Fail("alloc_block(4)");
+    }
+    let base = match vector::alloc_block(4) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("vector::alloc_block"),
+    };
+    // SAFETY: we own the device cap; cap-list walk + writes target
+    // identity-mapped MMIO.
+    let block = unsafe { table.program_vector_block(0, 4, 0, base) };
+    let v = match block {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("program_vector_block"),
+    };
+    if v.len() != 4 {
+        return TestResult::Fail("program_vector_block returned wrong count");
+    }
+    // Cleanup: release vectors. (Table allocation persists; OK,
+    // re-running enable_msix discovers the same N.)
+    for i in 0..4 {
+        let _ = vector::free(base + i);
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("bus", smoke_msix_program_block);
+
+fn smoke_hotplug_default_dispatcher_round_trip() -> TestResult {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use crate::hotplug::{
+        __clear_listeners, dispatch_event, install_default_dispatcher, listener_count,
+        HotplugEvent, HotplugListener,
+    };
+    use crate::{BusAddr, DeviceId, PcieAddr};
+
+    __clear_listeners();
+    if listener_count() != 0 {
+        return TestResult::Fail("listener list not empty after clear");
+    }
+    if install_default_dispatcher().is_err() {
+        return TestResult::Fail("install_default_dispatcher");
+    }
+
+    static ATTACHES: AtomicU32 = AtomicU32::new(0);
+    static DETACHES: AtomicU32 = AtomicU32::new(0);
+    struct Tally;
+    impl HotplugListener for Tally {
+        fn on_event(&self, ev: HotplugEvent) {
+            match ev {
+                HotplugEvent::Attach { .. } => {
+                    ATTACHES.fetch_add(1, Ordering::Relaxed);
+                }
+                HotplugEvent::Detach { .. } => {
+                    DETACHES.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+    let auth = crate::bootstrap_registry_authority();
+    if crate::hotplug::register_listener(&auth, Arc::new(Tally)).is_err() {
+        return TestResult::Fail("register Tally");
+    }
+    if listener_count() != 2 {
+        return TestResult::Fail("expected 2 listeners after default + tally");
+    }
+
+    let baseline_a = ATTACHES.load(Ordering::Relaxed);
+    let baseline_d = DETACHES.load(Ordering::Relaxed);
+    let addr = BusAddr::Pcie(PcieAddr {
+        segment: 0,
+        bus: 0,
+        device: 31,
+        function: 0,
+    });
+
+    dispatch_event(HotplugEvent::Attach {
+        addr,
+        device_id: DeviceId {
+            vendor: 0x1234,
+            device: 0x5678,
+            class: 0,
+        },
+    });
+    dispatch_event(HotplugEvent::Detach { addr });
+
+    if ATTACHES.load(Ordering::Relaxed) != baseline_a + 1 {
+        return TestResult::Fail("Attach not delivered to tally listener");
+    }
+    if DETACHES.load(Ordering::Relaxed) != baseline_d + 1 {
+        return TestResult::Fail("Detach not delivered to tally listener");
+    }
+    __clear_listeners();
+    TestResult::Pass
+}
+kernel_test_in!("bus", smoke_hotplug_default_dispatcher_round_trip);
+
+fn smoke_aer_classifier_severity() -> TestResult {
+    use crate::pci_cap_ext::{classify_aer, AerSeverity};
+
+    if classify_aer(0, 0, 0).is_some() {
+        return TestResult::Fail("zero status produced an event");
+    }
+    if classify_aer(0, 0, 1) != Some(AerSeverity::Correctable) {
+        return TestResult::Fail("correctable bit didn't classify");
+    }
+    if classify_aer(1 << 4, 0, 0) != Some(AerSeverity::NonFatal) {
+        return TestResult::Fail("uncorr w/o severity should be NonFatal");
+    }
+    if classify_aer(1 << 4, 1 << 4, 0) != Some(AerSeverity::Fatal) {
+        return TestResult::Fail("uncorr matched severity should be Fatal");
+    }
+    if classify_aer(1 << 4, 0, 1) != Some(AerSeverity::Correctable) {
+        return TestResult::Fail("correctable should win over uncorr");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bus", smoke_aer_classifier_severity);

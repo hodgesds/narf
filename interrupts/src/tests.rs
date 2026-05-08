@@ -188,3 +188,26 @@ fn smoke_tlb_shootdown_bridge_smp_fanout() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("interrupts/ipi", smoke_tlb_shootdown_bridge_smp_fanout);
+
+// ── relocated from verification ──
+
+fn smoke_vector_alloc_block_contiguous() -> TestResult {
+    // alloc_block(4) returns a contiguous run of 4 vectors.
+    use crate::vector::{alloc_block, free, is_allocated};
+    let base = match alloc_block(4) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("alloc_block(4) failed"),
+    };
+    for i in 0..4 {
+        if !is_allocated(base + i) {
+            return TestResult::Fail("alloc_block bit not set");
+        }
+    }
+    for i in 0..4 {
+        if free(base + i).is_err() {
+            return TestResult::Fail("free during cleanup");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("interrupts", smoke_vector_alloc_block_contiguous);

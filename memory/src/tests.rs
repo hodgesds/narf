@@ -992,3 +992,196 @@ fn smoke_slab_magazine_hot_path() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory", smoke_slab_magazine_hot_path);
+
+// ── relocated from verification ──
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_frame_alloc_per_node_distribution() -> TestResult {
+    // After SRAT-driven rebalance, each NUMA node should hold a
+    // non-trivial slice of free frames. With QEMU's 2-node config
+    // (128 MiB each), both bins should be non-empty.
+    if !crate::is_numa_aware() {
+        return TestResult::Fail("frame allocator not NUMA-rebalanced");
+    }
+    let n0 = crate::node_free(0);
+    let n1 = crate::node_free(1);
+    if n0 == 0 || n1 == 0 {
+        return TestResult::Fail("expected both nodes to hold free frames");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_frame_alloc_per_node_distribution);
+
+fn smoke_memory_address_space_materialize() -> TestResult {
+    // Full flow: new_for_user allocates a fresh root, map_region
+    // records a region, materialize walks the region and installs
+    // real PTEs via the arch's 4-KiB mapper, then translate()
+    // against the new root finds the mapping with expected flags.
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    let mut a = unsafe { AddressSpace::new_for_user() }.expect("alloc AS");
+    // Pick a user virtual address outside every pre-existing
+    // mapping. On x86_64, low 4 GiB is identity-mapped via 1-GiB
+    // HUGE_PAGE entries in PML4[0]; pick PML4[1] (= 512 GiB). On
+    // aarch64 TTBR0 starts empty, so any low-half canonical VA is
+    // safe — use the same one for portability.
+    let vbase = 0x0000_0080_0000_0000u64; // 512 GiB
+                                          // Allocate a real phys frame to back it.
+    let target = match crate::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => return TestResult::Skip("frame allocator drained"),
+    };
+
+    a.map_region(Region {
+        base: VirtAddr::new(vbase),
+        len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![target],
+    })
+    .expect("map region");
+
+    if unsafe { a.materialize() }.is_err() {
+        return TestResult::Fail("materialize failed on fresh user root");
+    }
+
+    // Per-arch structural validation of the installed PTE.
+    #[cfg(target_arch = "x86_64")]
+    {
+        use crate::x86_64::paging::{self, PtFlags};
+        let got = unsafe { paging::translate(a.root, VirtAddr::new(vbase)) };
+        match got {
+            Some(phys) => {
+                if phys != target {
+                    return TestResult::Fail("translate returned wrong phys");
+                }
+            }
+            None => return TestResult::Fail("translate found no mapping post-materialize"),
+        }
+        let flags = unsafe { paging::flags_at(a.root, VirtAddr::new(vbase)) };
+        match flags {
+            Some(f)
+                if f.contains(PtFlags::PRESENT)
+                    && f.contains(PtFlags::WRITABLE)
+                    && f.contains(PtFlags::USER)
+                    && f.contains(PtFlags::NO_EXEC) => {}
+            _ => return TestResult::Fail("x86_64 PTE missing expected flags"),
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        use crate::aarch64::paging::{self, PtFlags};
+        let got = unsafe { paging::translate(a.root, VirtAddr::new(vbase)) };
+        match got {
+            Some(phys) => {
+                if phys != target {
+                    return TestResult::Fail("translate returned wrong phys");
+                }
+            }
+            None => return TestResult::Fail("translate found no mapping post-materialize"),
+        }
+        // Expect VALID + AF + UXN (non-exec default) + TYPE_PAGE.
+        let flags = unsafe { paging::flags_at(a.root, VirtAddr::new(vbase)) };
+        match flags {
+            Some(f) => {
+                let v = f.bits();
+                if v & 1 != 1 {
+                    return TestResult::Fail("aarch64 PTE not VALID");
+                }
+                if v & (1 << 10) == 0 {
+                    return TestResult::Fail("aarch64 PTE missing AF");
+                }
+                if v & (1 << 54) == 0 {
+                    return TestResult::Fail("aarch64 PTE missing UXN for non-exec region");
+                }
+            }
+            None => return TestResult::Fail("aarch64 flags_at returned None"),
+        }
+    }
+
+    // Idempotent second call.
+    if unsafe { a.materialize() }.is_err() {
+        return TestResult::Fail("second materialize should be idempotent");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_memory_address_space_materialize);
+
+fn smoke_memory_address_space_region_table() -> TestResult {
+    use crate::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    let mut a = AddressSpace::empty();
+    if a.region_count() != 0 {
+        return TestResult::Fail("fresh AS has regions");
+    }
+
+    let rx = RegionPerms::READ | RegionPerms::EXEC;
+    let r1 = Region {
+        base: VirtAddr::new(0x4000),
+        len: 0x1000,
+        perms: rx,
+        phys: alloc::vec![PhysAddr::new(0x10_0000)],
+    };
+    if a.map_region(r1).is_err() {
+        return TestResult::Fail("first map failed");
+    }
+
+    // Non-overlapping second region is fine.
+    let r2 = Region {
+        base: VirtAddr::new(0x5000),
+        len: 0x2000,
+        perms: rx,
+        phys: alloc::vec![PhysAddr::new(0x11_0000), PhysAddr::new(0x11_1000)],
+    };
+    if a.map_region(r2).is_err() {
+        return TestResult::Fail("second non-overlap map failed");
+    }
+
+    // Overlap is rejected.
+    let r_over = Region {
+        base: VirtAddr::new(0x6000),
+        len: 0x2000,
+        perms: rx,
+        phys: alloc::vec![PhysAddr::new(0x12_0000), PhysAddr::new(0x12_1000)],
+    };
+    match a.map_region(r_over) {
+        Err(AddressSpaceError::Overlap) => {}
+        _ => return TestResult::Fail("overlap should be rejected"),
+    }
+
+    // Unaligned base is rejected.
+    let r_unaligned = Region {
+        base: VirtAddr::new(0x4123),
+        len: 0x1000,
+        perms: rx,
+        phys: alloc::vec![PhysAddr::new(0x13_0000)],
+    };
+    match a.map_region(r_unaligned) {
+        Err(AddressSpaceError::AlignmentMismatch) => {}
+        _ => return TestResult::Fail("unaligned base should be rejected"),
+    }
+
+    // lookup finds the covering region (inside r2's 0x5000..0x7000).
+    let hit = a.lookup(VirtAddr::new(0x6123));
+    if hit.map(|r| r.base) != Some(VirtAddr::new(0x5000)) {
+        return TestResult::Fail("lookup did not find covering region");
+    }
+
+    // activate on a fresh AS (root still 0) surfaces OutOfRange —
+    // this path doesn't touch CR3.
+    match a.activate() {
+        Err(AddressSpaceError::OutOfRange) => {}
+        _ => return TestResult::Fail("activate on unset root should surface OutOfRange"),
+    }
+
+    // Unmap removes by base.
+    let removed = a.unmap_region(VirtAddr::new(0x5000));
+    if removed.map(|r| r.len) != Ok(0x2000) {
+        return TestResult::Fail("unmap did not return correct region");
+    }
+    if a.region_count() != 1 {
+        return TestResult::Fail("unmap did not shrink region count");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_memory_address_space_region_table);
