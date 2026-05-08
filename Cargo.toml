@@ -74,6 +74,8 @@ members = [
     "firmware/fdt",
     "initramfs",
     "drivers/fs/fat",
+    "drivers/fs/exfat",
+    "drivers/fs/ext2",
     "drivers/fs/minix",
     "drivers/fs/iso9660",
     "drivers/fs/9p",

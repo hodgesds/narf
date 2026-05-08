@@ -20,6 +20,7 @@ extern crate alloc;
 extern crate narf_bluetooth as _;
 extern crate narf_drivers_fs_ext2 as _;
 extern crate narf_drivers_fs_fat as _;
+extern crate narf_drivers_fs_exfat as _;
 extern crate narf_drivers_fs_minix as _;
 extern crate narf_drivers_fs_iso9660 as _;
 extern crate narf_drivers_fs_9p as _;
