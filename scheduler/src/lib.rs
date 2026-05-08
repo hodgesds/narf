@@ -73,6 +73,12 @@ pub use narf_arch::x86_64::{
     USER_RFLAGS,
 };
 
+#[cfg(target_arch = "aarch64")]
+pub use narf_arch::aarch64::{
+    enter_user_mode, enter_user_mode_resume, longjmp, set_user_tls_base, setjmp, JmpBuf,
+    UserState, USER_SPSR,
+};
+
 // `halt_forever` is the right "I should never reach here" sink for
 // the user-task hook fast-paths in `narf-userspace`. Re-exported
 // for the same reason the user-mode primitives are: avoids a fresh

@@ -462,7 +462,48 @@ impl AddressSpace {
         }
     }
 
-    #[cfg(not(target_arch = "x86_64"))]
+    /// aarch64 sibling of the x86_64 `remap_page`. Same contract:
+    /// look up the region containing `vaddr`, install a fresh PTE
+    /// for that 4 KiB page reflecting the region's current
+    /// `phys[i]` + `perms`. Used by the data-abort handler after
+    /// `cow_split_on_write` repointed the per-page phys entry.
+    #[cfg(target_arch = "aarch64")]
+    pub unsafe fn remap_page(&self, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
+        use crate::aarch64::paging::{map_4kb, unmap_4kb, MapError, PtFlags};
+        if self.root.as_u64() == 0 {
+            return Err(AddressSpaceError::OutOfRange);
+        }
+        let page_va = VirtAddr::new(vaddr.as_u64() & !0xFFF);
+        let g = self.regions.lock();
+        let v = page_va.as_u64();
+        let region = g
+            .iter()
+            .find(|r| {
+                let base = r.base.as_u64();
+                v >= base && v < base + r.len
+            })
+            .ok_or(AddressSpaceError::Unmapped)?;
+        let page_idx = ((v - region.base.as_u64()) >> 12) as usize;
+        let phys = region.phys[page_idx];
+
+        // Mirror the materialize() flag derivation for aarch64.
+        let mut flags = PtFlags::AP_RW_EL1;
+        if !region.perms.contains(RegionPerms::EXEC) {
+            flags = flags | PtFlags::UXN | PtFlags::PXN;
+        }
+
+        // SAFETY: root is a valid translation table; `page_va`
+        // sits inside `region`. unmap_4kb invalidates the local
+        // TLB; map_4kb installs the fresh leaf.
+        let _ = unsafe { unmap_4kb(self.root, page_va) };
+        match unsafe { map_4kb(self.root, page_va, phys, flags) } {
+            Ok(()) => Ok(()),
+            Err(MapError::AlreadyMapped) => Ok(()),
+            Err(_) => Err(AddressSpaceError::NotImplemented),
+        }
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub unsafe fn remap_page(&self, _vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
         Err(AddressSpaceError::NotImplemented)
     }

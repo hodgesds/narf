@@ -353,6 +353,64 @@ pub unsafe fn map_4kb(
     Ok(())
 }
 
+/// Tear down a 4 KiB mapping at `virt` under `root`. Returns the
+/// physical address that was mapped, or `MapError::AlreadyMapped`
+/// if no leaf entry was present (overloaded for symmetry with
+/// the x86_64 path; the meaning is "nothing was mapped here").
+/// Intermediate tables are left intact — the eventual
+/// refcounted-table sweep will reap them.
+///
+/// # Safety
+/// Same identity-mapping precondition as `map_4kb`.
+pub unsafe fn unmap_4kb(root: PhysAddr, virt: VirtAddr) -> Result<PhysAddr, MapError> {
+    if !is_canonical(virt) {
+        return Err(MapError::NonCanonical);
+    }
+    if virt.as_u64() & 0xFFF != 0 {
+        return Err(MapError::UnalignedVirt);
+    }
+    let idx = WalkIndices::from_virt(virt);
+    // SAFETY: `root` is identity-mapped per caller contract.
+    let l0 = unsafe { &mut *(root.raw() as *mut PageTable) };
+    let e = l0.entries[idx.l0];
+    if !e.is_valid() || (e.0 & 0b11) != 0b11 {
+        return Err(MapError::AlreadyMapped);
+    }
+    let l1 = unsafe { &mut *(e.addr().raw() as *mut PageTable) };
+    let e = l1.entries[idx.l1];
+    if !e.is_valid() || (e.0 & 0b11) != 0b11 {
+        return Err(MapError::AlreadyMapped);
+    }
+    let l2 = unsafe { &mut *(e.addr().raw() as *mut PageTable) };
+    let e = l2.entries[idx.l2];
+    if !e.is_valid() || (e.0 & 0b11) != 0b11 {
+        return Err(MapError::AlreadyMapped);
+    }
+    let l3 = unsafe { &mut *(e.addr().raw() as *mut PageTable) };
+    let leaf = l3.entries[idx.l3];
+    if !leaf.is_valid() {
+        return Err(MapError::AlreadyMapped);
+    }
+    let prev_phys = leaf.addr();
+    l3.entries[idx.l3] = PageTableEntry(0);
+    // TLB invalidation for the page (VAE1IS — by VA at EL1
+    // inner-shareable). Wrap in DSB to order the table mutation
+    // before the TLB op, and ISB after to drain.
+    let va_page = virt.as_u64() >> 12;
+    // SAFETY: TLBI/DSB/ISB at EL1 are unconditional.
+    unsafe {
+        core::arch::asm!(
+            "dsb ishst",
+            "tlbi vale1is, {va}",
+            "dsb ish",
+            "isb",
+            va = in(reg) va_page,
+            options(nostack, preserves_flags),
+        );
+    }
+    Ok(prev_phys)
+}
+
 /// Walk the table at `root` and return the physical address mapped
 /// at `virt`, or `None` if unmapped.
 pub unsafe fn translate(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {

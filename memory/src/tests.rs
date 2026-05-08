@@ -1316,7 +1316,7 @@ fn smoke_memory_clone_for_fork_shares_frames_then_splits() -> TestResult {
 }
 kernel_test_in!("memory", smoke_memory_clone_for_fork_shares_frames_then_splits);
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn smoke_memory_remap_page_picks_up_perms_and_phys() -> TestResult {
     // After cow_split_on_write rewrites a region's per-page phys
     // entry + restores WRITE on the region, remap_page must walk
@@ -1325,7 +1325,10 @@ fn smoke_memory_remap_page_picks_up_perms_and_phys() -> TestResult {
     // resolves (via paging::translate) to the new phys.
     use crate::address_space::{AddressSpace, Region, RegionPerms};
     use crate::frame::cow;
+    #[cfg(target_arch = "x86_64")]
     use crate::x86_64::paging::translate;
+    #[cfg(target_arch = "aarch64")]
+    use crate::aarch64::paging::translate;
     use crate::VirtAddr;
 
     cow::__test_clear();
@@ -1406,5 +1409,5 @@ fn smoke_memory_remap_page_picks_up_perms_and_phys() -> TestResult {
     cow::__test_clear();
     TestResult::Pass
 }
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 kernel_test_in!("memory", smoke_memory_remap_page_picks_up_perms_and_phys);

@@ -122,13 +122,19 @@ pub extern "C" fn rust_aarch64_sync(frame: &TrapFrame) -> ! {
     unsafe { narf_arch::exit_kernel(42) }
 }
 
-/// Synchronous-exception dispatcher entered via `__narf_vec_sync_spx`.
+/// Synchronous-exception dispatcher entered via `__narf_vec_sync_spx`
+/// or `__narf_vec_sync_el0`.
 ///
 /// Reads `ESR_EL1.EC` and routes:
 /// - `EC = 0b010101` (SVC from AArch64): marshal x0..x5 + x8 into a
 ///   `SyscallArgs`, call `kernel_syscall_entry`, store the return
 ///   value + status in `frame.x0` / `frame.x1` so RESTORE_ALL_GPRS
 ///   + `eret` delivers them back to user space. Returns normally.
+/// - `EC = 0b100100` (Data Abort from lower EL): if the ISS reports
+///   a permission fault on a write access from EL0, route into the
+///   COW recovery path (cow_split_on_write + remap_page). Mirrors
+///   the x86_64 #PF handler. Returns normally on successful split;
+///   falls through to fatal otherwise.
 /// - Anything else: fatal — delegates to `rust_aarch64_sync` which
 ///   prints diagnostics and calls `exit_kernel`.
 #[unsafe(no_mangle)]
@@ -138,6 +144,7 @@ pub extern "C" fn rust_aarch64_sync_dispatch(frame: &mut TrapFrame) {
     let ec = (esr >> 26) & 0x3F;
 
     const EC_SVC_AARCH64: u64 = 0b01_0101;
+    const EC_DATA_ABORT_LOWER_EL: u64 = 0b10_0100;
 
     if ec == EC_SVC_AARCH64 {
         // Convention: x8 = syscall number, x0..x5 = args. Return
@@ -149,7 +156,45 @@ pub extern "C" fn rust_aarch64_sync_dispatch(frame: &mut TrapFrame) {
         return;
     }
 
-    // Non-SVC synchronous exception — fatal.
+    if ec == EC_DATA_ABORT_LOWER_EL {
+        // ISS field for a Data Abort (Arm ARM D17.2.40):
+        //   bit  6  (WnR)  : 0 = read, 1 = write
+        //   bits [5:0] DFSC: fault status code. Top 4 bits 0b0011
+        //                    indicate a permission fault (level
+        //                    encoded in the low 2 bits).
+        let iss = esr & 0x01FF_FFFF;
+        const ISS_WNR: u64 = 1 << 6;
+        const DFSC_MASK: u64 = 0x3F;
+        const DFSC_PERMISSION_FAULT_TOP: u64 = 0b00_1100;
+        let is_write = (iss & ISS_WNR) != 0;
+        let dfsc = iss & DFSC_MASK;
+        let is_perm_fault = (dfsc & 0b11_1100) == DFSC_PERMISSION_FAULT_TOP;
+        if is_write && is_perm_fault {
+            // SAFETY: FAR_EL1 read at EL1 is always defined.
+            let far = unsafe { sysreg::read_far_el1() };
+            if let Some(as_arc) = narf_userspace::active_user_as() {
+                let v = narf_memory::VirtAddr::new(far);
+                // SAFETY: low-RAM identity map is live, frame
+                // allocator + COW refcount table initialised at
+                // boot; AS is the active user AS by construction
+                // (the trap arrived from EL0).
+                let split_ok = unsafe { as_arc.cow_split_on_write(v) }.is_ok();
+                if split_ok {
+                    // SAFETY: same identity-map argument; the
+                    // region was just touched by the split.
+                    let remap_ok = unsafe { as_arc.remap_page(v) }.is_ok();
+                    if remap_ok {
+                        return;
+                    }
+                }
+            }
+        }
+        // Fall through to fatal if the abort wasn't a recoverable
+        // user-mode COW write — genuine bugs surface on the
+        // existing diagnostic path.
+    }
+
+    // Non-recoverable synchronous exception — fatal.
     rust_aarch64_sync(frame);
 }
 

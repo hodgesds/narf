@@ -33,37 +33,21 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub use narf_scheduler::UserState;
 
-/// `UserState` for non-x86_64 arches. Same role as the x86_64
-/// re-export (capture the user-mode CPU state at trap time so
-/// fork()'s child can resume at the parent's syscall return
-/// point), shaped for the aarch64 register file: 31 GPRs +
-/// post-trap PC + user-mode SP + saved PSTATE.
-///
-/// The aarch64 EL0 ↔ EL1 polling round-trip (the equivalent of
-/// `enter_user_mode_resume` on x86_64) lands separately; this
-/// type is what `Aarch64TrapContext::save_user_state` populates.
-#[cfg(not(target_arch = "x86_64"))]
+/// Stub `UserState` for non-x86_64 / non-aarch64 arches so this
+/// module compiles uniformly. The arch-specific definition lives
+/// in `narf_arch::<arch>::user_mode::UserState` and is re-exported
+/// via `narf_scheduler` for the supported arches above.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct UserState {
-    /// x0..=x30 in index order.
-    pub x: [u64; 31],
-    /// Post-trap PC — ELR_EL1 at trap entry, advanced past the
-    /// trapping `svc #0` instruction.
     pub pc: u64,
-    /// User-mode SP — SP_EL0, untouched by the EL1 trap path
-    /// (which swapped to SP_EL1).
     pub sp: u64,
-    /// Saved PSTATE — SPSR_EL1 at trap entry. Restored on `eret`.
     pub spsr: u64,
-    /// `1` once the trap path has populated this snapshot, `0`
-    /// otherwise. Symmetric with the x86_64 `valid` field so
-    /// resume paths can distinguish a captured state from a
-    /// zeroed placeholder.
-    pub valid: u64,
+    pub x: [u64; 31],
 }
 
 /// Reason the trap handler longjmp'd back into the polling routine.
@@ -274,12 +258,14 @@ pub(crate) fn exit_hook() -> Option<ExitHook> {
 // in flight at any time → a single global `AtomicPtr<JmpBuf>` slot
 // is sufficient. SMP bring-up will swap this for a per-CPU slot.
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub use narf_scheduler::JmpBuf;
 
-/// Stub `JmpBuf` for non-x86_64 arches. The aarch64 EL0/EL1 polling
-/// round-trip lands separately.
-#[cfg(not(target_arch = "x86_64"))]
+/// Stub `JmpBuf` for arches without a real implementation. The
+/// arch-specific `JmpBuf` lives in
+/// `narf_arch::<arch>::user_mode::JmpBuf` and is re-exported via
+/// `narf_scheduler` for x86_64 / aarch64.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct JmpBuf {
@@ -345,11 +331,6 @@ pub fn install_user_task_hooks() {
     install_yield_hook(user_task_yield_hook);
     install_exit_hook(user_task_exit_hook);
 }
-
-/// Non-x86 stub. The polling-future round-trip on aarch64 lands
-/// alongside the EL0 ↔ EL1 save/restore primitives.
-#[cfg(not(target_arch = "x86_64"))]
-pub fn install_user_task_hooks() {}
 
 /// Polling future that drives a user-mode process to completion via
 /// the scheduler's ready queue. Construct with [`UserTaskFuture::new`]
@@ -604,36 +585,276 @@ impl core::future::Future for UserTaskFuture {
     }
 }
 
-/// Non-x86 stub. The polling future on aarch64 follows the EL0/EL1
-/// save/restore primitives.
-#[cfg(not(target_arch = "x86_64"))]
+// ── aarch64 polling future ─────────────────────────────────────────
+
+/// Aarch64 sibling of the x86_64 UserTaskFuture. Same lifecycle:
+/// install_current → activate user TTBR0 → setjmp → eret to EL0 →
+/// trap-back longjmps into the polling routine via CURRENT_JMP.
+///
+/// `activate()` on aarch64 still returns `NotImplemented` until
+/// the kernel heap migrates off its TTBR0 identity map (separate
+/// FIXME in `memory/src/address_space.rs::activate`). When
+/// `activate()` fails we degrade gracefully: log via the polling
+/// state, return `Poll::Ready(())` without attempting EL0 entry,
+/// and behave like a plain async task that just resolved. Once
+/// activate lands, the future Just Works without further changes.
+#[cfg(target_arch = "aarch64")]
+pub struct UserTaskFuture {
+    process: crate::UserProcess,
+    ctx: UserTaskCtx,
+    jmp: UnsafeCell<JmpBuf>,
+    state: TaskState,
+    /// Snapshot of the kernel's TTBR0_EL1 captured on the first
+    /// poll so we can restore it on the trap-back path. `None`
+    /// until the first poll runs.
+    saved_ttbr0: core::cell::Cell<Option<u64>>,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl core::fmt::Debug for UserTaskFuture {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("UserTaskFuture")
+            .field("pid", &self.process.pid)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+// SAFETY: identical reasoning to the x86_64 impl — single-CPU
+// cooperative executor, the future never escapes the executor's
+// Pin<Box<...>>, the UnsafeCell-wrapped JmpBuf is only written by
+// poll between install_current and setjmp.
+#[cfg(target_arch = "aarch64")]
+unsafe impl Send for UserTaskFuture {}
+
+#[cfg(target_arch = "aarch64")]
+impl UserTaskFuture {
+    /// Construct a fresh polling future for `process`. Hand to
+    /// `narf_scheduler::spawn_user` to schedule it.
+    pub fn new(process: crate::UserProcess) -> Self {
+        Self {
+            process,
+            ctx: UserTaskCtx::new(),
+            jmp: UnsafeCell::new(JmpBuf::default()),
+            state: TaskState::Initial,
+            saved_ttbr0: core::cell::Cell::new(None),
+        }
+    }
+
+    /// Construct a polling future seeded with a pre-populated
+    /// `UserState`. First poll calls `enter_user_mode_resume`
+    /// against the saved state instead of `enter_user_mode(pc,
+    /// sp)`. Used by `sys_fork` so the child wakes at the
+    /// parent's post-`svc #0` PC with x0=0 / x1=0 (POSIX fork
+    /// return).
+    pub fn resume_with(process: crate::UserProcess, state: UserState) -> Self {
+        let ctx = UserTaskCtx::new();
+        // SAFETY: just constructed `ctx`; sole owner.
+        unsafe {
+            *ctx.state.get() = state;
+        }
+        Self {
+            process,
+            ctx,
+            jmp: UnsafeCell::new(JmpBuf::default()),
+            state: TaskState::Running,
+            saved_ttbr0: core::cell::Cell::new(None),
+        }
+    }
+
+    pub fn process(&self) -> &crate::UserProcess {
+        &self.process
+    }
+
+    pub fn task_state(&self) -> TaskState {
+        self.state
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl core::future::Future for UserTaskFuture {
+    type Output = ();
+
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<()> {
+        // SAFETY: don't move out of Pin; only project to fields
+        // whose address stability we own.
+        let this = unsafe { self.get_unchecked_mut() };
+
+        if this.state == TaskState::Exited {
+            return core::task::Poll::Ready(());
+        }
+
+        // Snapshot kernel TTBR0_EL1 once. Subsequent polls land
+        // back here via the trap path; we restore on the way out.
+        if this.saved_ttbr0.get().is_none() {
+            let ttbr0: u64;
+            // SAFETY: reading TTBR0_EL1 has no side effects.
+            unsafe {
+                core::arch::asm!("mrs {v}, TTBR0_EL1", v = out(reg) ttbr0,
+                    options(nostack, preserves_flags));
+            }
+            this.saved_ttbr0.set(Some(ttbr0));
+        }
+
+        // Activate the user AS. Until the kernel heap migrates
+        // off TTBR0, this returns NotImplemented; degrade by
+        // resolving Ready immediately (no EL0 entry possible).
+        if this.process.address_space.activate().is_err() {
+            // No state change — the task essentially never ran
+            // user code. Fan out the exit observers and resolve.
+            notify_task_exited(this.process.pid.raw());
+            this.state = TaskState::Exited;
+            return core::task::Poll::Ready(());
+        }
+
+        // Publish per-task pointers the trap path consults.
+        install_current(&mut this.ctx as *mut _);
+        CURRENT_JMP.store(this.jmp.get(), Ordering::Release);
+
+        // Program the per-task TLS thread pointer if the binary
+        // staged a TLS block. AArch64 stores it in TPIDR_EL0;
+        // pairing the write with the AS activation keeps the
+        // "outgoing user task's MSRs" mental model intact.
+        if let Some(tls_base) = this.process.fs_base {
+            // SAFETY: writing TPIDR_EL0 at EL1 is unconditional
+            // and has no side effects on EL1 state.
+            unsafe {
+                narf_scheduler::set_user_tls_base(tls_base);
+            }
+        }
+
+        // Mask all DAIF (IRQ/FIQ/SError/Debug) across the eret —
+        // the EL0 entry's SPSR carries the user-mode DAIF; the
+        // trap-back path keeps DAIF masked through the longjmp.
+        // SAFETY: msr DAIFSet has no memory effect.
+        unsafe {
+            core::arch::asm!("msr DAIFSet, #0xF", options(nomem, nostack, preserves_flags));
+        }
+
+        // setjmp. On the initial call returns 0; the hooks
+        // longjmp back here with a non-zero EXIT_REASON_*.
+        // SAFETY: jmp is a valid JmpBuf for the duration of this
+        // poll body; Pin pins the address.
+        let saved = unsafe { narf_scheduler::setjmp(this.jmp.get()) };
+
+        if saved == 0 {
+            match this.state {
+                TaskState::Initial => {
+                    this.state = TaskState::Running;
+                    let pc = this.process.entry.0.as_u64();
+                    let sp = this.process.stack_top.as_u64();
+                    // SAFETY: AS is activated; the user mappings
+                    // for pc + sp live in the now-active TTBR0.
+                    unsafe { narf_scheduler::enter_user_mode(pc, sp) }
+                }
+                TaskState::Running => {
+                    // SAFETY: a prior poll's trap path populated
+                    // ctx.state via TrapContext::save_user_state.
+                    unsafe {
+                        narf_scheduler::enter_user_mode_resume(this.ctx.state.get())
+                    }
+                }
+                TaskState::Exited => unreachable!("guarded above"),
+            }
+        }
+
+        // Longjmp path: a hook fired, control is back on the
+        // kernel-side stack. Restore the kernel's saved TTBR0
+        // and keep DAIF masked.
+        let ttbr0 = this.saved_ttbr0.get().expect("saved_ttbr0 set on entry");
+        // SAFETY: ttbr0 came from a prior MSR snapshot of the
+        // active kernel root; restoring is symmetric.
+        unsafe {
+            core::arch::asm!(
+                "msr TTBR0_EL1, {v}",
+                "isb",
+                v = in(reg) ttbr0,
+                options(nostack, preserves_flags),
+            );
+            // Local TLB invalidate (broadcast not needed here —
+            // the ready queue serialises this task).
+            core::arch::asm!(
+                "tlbi vmalle1",
+                "dsb ish",
+                "isb",
+                options(nostack, preserves_flags),
+            );
+            core::arch::asm!("msr DAIFSet, #0xF", options(nomem, nostack, preserves_flags));
+        }
+
+        clear_current();
+        CURRENT_JMP.store(core::ptr::null_mut(), Ordering::Release);
+
+        let reason = saved as u32;
+        if reason == EXIT_REASON_EXITED {
+            notify_task_exited(this.process.pid.raw());
+            this.state = TaskState::Exited;
+            core::task::Poll::Ready(())
+        } else {
+            cx.waker().wake_by_ref();
+            core::task::Poll::Pending
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn user_task_yield_hook(_uctx: *mut UserTaskCtx) -> ! {
+    let p = CURRENT_JMP.load(Ordering::Acquire);
+    if p.is_null() {
+        narf_scheduler::halt_forever();
+    }
+    // SAFETY: same contract as the x86_64 sibling — the polling
+    // routine guarantees CURRENT_JMP points at a live JmpBuf for
+    // the duration of the user-mode round-trip.
+    unsafe { narf_scheduler::longjmp(p as *const _, EXIT_REASON_YIELDED as u64) }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn user_task_exit_hook(_uctx: *mut UserTaskCtx) -> ! {
+    let p = CURRENT_JMP.load(Ordering::Acquire);
+    if p.is_null() {
+        narf_scheduler::halt_forever();
+    }
+    // SAFETY: same as above.
+    unsafe { narf_scheduler::longjmp(p as *const _, EXIT_REASON_EXITED as u64) }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn install_user_task_hooks() {
+    install_yield_hook(user_task_yield_hook);
+    install_exit_hook(user_task_exit_hook);
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[derive(Debug)]
 pub struct UserTaskFuture {
     _process: crate::UserProcess,
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 impl UserTaskFuture {
     pub fn new(process: crate::UserProcess) -> Self {
         Self { _process: process }
     }
 
-    /// aarch64 stub. The EL0 ↔ EL1 polling round-trip isn't wired
-    /// yet, so resuming from a saved state is identical to a fresh
-    /// task — both end up as the `Poll::Ready(())` no-op below.
     pub fn resume_with(process: crate::UserProcess, _state: UserState) -> Self {
         Self { _process: process }
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 impl core::future::Future for UserTaskFuture {
     type Output = ();
     fn poll(
         self: core::pin::Pin<&mut Self>,
         _cx: &mut core::task::Context<'_>,
     ) -> core::task::Poll<()> {
-        // aarch64 polling round-trip not yet implemented.
         core::task::Poll::Ready(())
     }
 }
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn install_user_task_hooks() {}
