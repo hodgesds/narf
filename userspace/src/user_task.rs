@@ -390,6 +390,37 @@ impl UserTaskFuture {
         }
     }
 
+    /// Construct a polling future seeded with a pre-populated
+    /// `UserState`. The first poll calls `enter_user_mode_resume`
+    /// instead of `enter_user_mode(entry, rsp)`, so the task wakes
+    /// up at the saved (rip, rsp) with all GPRs / RFLAGS restored
+    /// from `state` rather than at `process.entry` / `process.stack_top`.
+    ///
+    /// Used by `sys_fork`: the child inherits the parent's trap-
+    /// frame snapshot with `rax` rewritten to 0 so user code reads
+    /// the POSIX "child got 0 from fork()" return value when its
+    /// `int 0x80` returns. The `process.entry` / `process.stack_top`
+    /// fields on the parent's `UserProcess` aren't consulted here —
+    /// they're only meaningful for the load-time path.
+    pub fn resume_with(process: crate::UserProcess, state: UserState) -> Self {
+        let ctx = UserTaskCtx::new();
+        // SAFETY: we just constructed `ctx` and own the only handle
+        // to it; nobody else can race the cell write.
+        unsafe {
+            *ctx.state.get() = state;
+        }
+        Self {
+            process,
+            ctx,
+            jmp: UnsafeCell::new(JmpBuf::default()),
+            // Skip `Initial` so the first poll takes the
+            // `enter_user_mode_resume` arm and walks the saved
+            // state instead of the (entry, stack_top) pair.
+            state: TaskState::Running,
+            saved_cr3: core::cell::Cell::new(None),
+        }
+    }
+
     /// Borrow the inner process — useful for inspection from tests.
     pub fn process(&self) -> &crate::UserProcess {
         &self.process
@@ -568,6 +599,13 @@ pub struct UserTaskFuture {
 #[cfg(not(target_arch = "x86_64"))]
 impl UserTaskFuture {
     pub fn new(process: crate::UserProcess) -> Self {
+        Self { _process: process }
+    }
+
+    /// aarch64 stub. The EL0 ↔ EL1 polling round-trip isn't wired
+    /// yet, so resuming from a saved state is identical to a fresh
+    /// task — both end up as the `Poll::Ready(())` no-op below.
+    pub fn resume_with(process: crate::UserProcess, _state: UserState) -> Self {
         Self { _process: process }
     }
 }

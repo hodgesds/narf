@@ -3227,20 +3227,18 @@ fn sys_clone(ctx: &mut dyn TrapContext) {
 // task runs alongside in the same memory map (POSIX threads),
 // sys_fork allocates a fresh AS, copies every region's pages by
 // value via `AddressSpace::clone_for_fork`, and spawns the child
-// against the duplicate. Returns the child's tid to the parent.
+// against the duplicate. The child's first poll calls
+// `enter_user_mode_resume` against a snapshot of the parent's
+// trap frame with `rax = 0`, so the child wakes up at the
+// instruction *after* its `int 0x80` and reads the POSIX "child
+// got 0 from fork()" return value. Returns the child's tid to
+// the parent.
 //
 // Inheritance: AS (copied), fd table (copied via `fd::fork`), cwd
 // (copied via `cwd_fork`), brk (copied via `brk_fork`), sigaction
-// handlers (copied via `sigaction_fork`).
-//
-// FIXME(trap-frame-inheritance): real POSIX fork resumes the
-// child at the instruction *after* its syscall, with RAX rewritten
-// to 0. NARF's `UserTaskFuture::new` always starts a process at
-// its load-time (entry, stack_top); we don't yet have a way to
-// seed the child with the parent's saved trap frame. This is
-// "fork-shaped AS-clone + spawn", suitable for proving the cloning
-// machinery, but a true POSIX fork() ABI requires extending
-// `UserTaskFuture` to accept a pre-seeded UserState.
+// handlers (copied via `sigaction_fork`), trap-frame state (copied
+// via `TrapContext::save_user_state`, with rax mutated to 0 in
+// the child).
 //
 // FIXME(cow): non-COW first cut. Every PT_LOAD page is eagerly
 // memcpy'd at fork time. The eventual hook lives in
@@ -3273,12 +3271,48 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
     }
     let child_as = alloc::sync::Arc::new(child_as);
 
+    // Snapshot the parent's trap frame BEFORE we set the parent's
+    // own return value below. The snapshot captures rax = whatever
+    // it was on `int 0x80` entry (Syscall::Fork = 57); we mutate
+    // the child's copy to 0 so the child reads "0" from its
+    // resumed syscall — POSIX semantics.
+    //
+    // On arches whose TrapContext can't save user state today
+    // (aarch64), the save_user_state default returns false; in
+    // that case we fall back to `UserTaskFuture::new` against the
+    // parent's load-time entry/stack — closer to the old behaviour
+    // and structurally still valid (the AS is duplicated, fds are
+    // copied), just without true resume-at-syscall semantics.
+    #[cfg(target_arch = "x86_64")]
+    let child_state: Option<crate::user_task::UserState> = {
+        use core::mem::MaybeUninit;
+        let mut s = MaybeUninit::<crate::user_task::UserState>::zeroed();
+        // SAFETY: the destination is `size_of::<UserState>()` bytes
+        // of zeroed stack — the trait's contract.
+        let ok = unsafe { ctx.save_user_state(s.as_mut_ptr() as *mut u8) };
+        if ok {
+            // SAFETY: save_user_state returned true → it wrote a
+            // valid UserState into `s`.
+            let mut snap = unsafe { s.assume_init() };
+            snap.rax = 0;
+            Some(snap)
+        } else {
+            None
+        }
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let child_state: Option<crate::user_task::UserState> = None;
+
     let parent_pid = current_task_id();
     let child_pid = crate::alloc_pid();
     let proc = crate::UserProcess {
         pid: child_pid,
         address_space: child_as.clone(),
-        // Parent's load-time entry (see trap-frame FIXME above).
+        // entry / stack_top are NOT consulted when we resume the
+        // child via UserTaskFuture::resume_with — the saved state
+        // carries the real (rip, rsp). They're left at zero
+        // sentinels so a subsequent `Initial`-path poll (e.g. on
+        // an arch without save_user_state) is obviously broken.
         entry: crate::EntryPoint(narf_memory::VirtAddr::new(0)),
         stack_top: narf_memory::VirtAddr::new(0),
         fs_base: {
@@ -3305,8 +3339,14 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
 
     #[cfg(target_arch = "x86_64")]
     {
+        let future = match child_state {
+            Some(state) => crate::user_task::UserTaskFuture::resume_with(proc, state),
+            // Fallback if save_user_state didn't fire (test contexts
+            // with synthetic TrapContexts whose stub returns false).
+            None => crate::user_task::UserTaskFuture::new(proc),
+        };
         let child_tid = narf_scheduler::spawn_user(
-            crate::user_task::UserTaskFuture::new(proc),
+            future,
             narf_scheduler::TaskSpec::unthrottled(),
             child_as,
         );
@@ -3321,7 +3361,7 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let _ = (proc, child_as, child_pid, parent_pid);
+        let _ = (proc, child_as, child_pid, parent_pid, child_state);
         ctx.set_return(SyscallReturn::invalid_op());
     }
 }
