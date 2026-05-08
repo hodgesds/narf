@@ -36,18 +36,34 @@ use core::sync::atomic::{AtomicPtr, Ordering};
 #[cfg(target_arch = "x86_64")]
 pub use narf_scheduler::UserState;
 
-/// Stub `UserState` for non-x86_64 arches so this module compiles
-/// uniformly. The aarch64 EL0 ↔ EL1 round-trip with proper save/
-/// restore lands separately; until then, this is just a typed
-/// placeholder.
+/// `UserState` for non-x86_64 arches. Same role as the x86_64
+/// re-export (capture the user-mode CPU state at trap time so
+/// fork()'s child can resume at the parent's syscall return
+/// point), shaped for the aarch64 register file: 31 GPRs +
+/// post-trap PC + user-mode SP + saved PSTATE.
+///
+/// The aarch64 EL0 ↔ EL1 polling round-trip (the equivalent of
+/// `enter_user_mode_resume` on x86_64) lands separately; this
+/// type is what `Aarch64TrapContext::save_user_state` populates.
 #[cfg(not(target_arch = "x86_64"))]
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct UserState {
-    pub pc: u64,
-    pub sp: u64,
-    pub spsr: u64,
+    /// x0..=x30 in index order.
     pub x: [u64; 31],
+    /// Post-trap PC — ELR_EL1 at trap entry, advanced past the
+    /// trapping `svc #0` instruction.
+    pub pc: u64,
+    /// User-mode SP — SP_EL0, untouched by the EL1 trap path
+    /// (which swapped to SP_EL1).
+    pub sp: u64,
+    /// Saved PSTATE — SPSR_EL1 at trap entry. Restored on `eret`.
+    pub spsr: u64,
+    /// `1` once the trap path has populated this snapshot, `0`
+    /// otherwise. Symmetric with the x86_64 `valid` field so
+    /// resume paths can distinguish a captured state from a
+    /// zeroed placeholder.
+    pub valid: u64,
 }
 
 /// Reason the trap handler longjmp'd back into the polling routine.

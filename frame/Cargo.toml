@@ -74,6 +74,7 @@ narf-observability   = { path = "../observability" }
 narf-filesystem      = { path = "../filesystem" }
 narf-userspace       = { path = "../userspace" }
 narf-user-runtime    = { path = "../user-runtime" }
+narf-kernel-test     = { path = "../verification/kernel-test" }
 narf-verification    = { path = "../verification", optional = true }
 
 [features]

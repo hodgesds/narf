@@ -3272,18 +3272,24 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
     let child_as = alloc::sync::Arc::new(child_as);
 
     // Snapshot the parent's trap frame BEFORE we set the parent's
-    // own return value below. The snapshot captures rax = whatever
-    // it was on `int 0x80` entry (Syscall::Fork = 57); we mutate
-    // the child's copy to 0 so the child reads "0" from its
-    // resumed syscall — POSIX semantics.
+    // own return value below. The snapshot captures the syscall-
+    // return register (rax on x86_64, x0+x1 on aarch64) holding
+    // whatever the user code passed at trap entry; we mutate the
+    // child's copy to 0 so the child reads "0" from its resumed
+    // syscall — POSIX semantics.
     //
-    // On arches whose TrapContext can't save user state today
-    // (aarch64), the save_user_state default returns false; in
-    // that case we fall back to `UserTaskFuture::new` against the
-    // parent's load-time entry/stack — closer to the old behaviour
-    // and structurally still valid (the AS is duplicated, fds are
-    // copied), just without true resume-at-syscall semantics.
-    #[cfg(target_arch = "x86_64")]
+    // On x86_64 the `int 0x80` trap path's save_user_state writes
+    // a fully-populated UserState; the child's first poll calls
+    // `enter_user_mode_resume` and lands at the parent's
+    // post-syscall RIP. On aarch64 save_user_state populates the
+    // analogous UserState (PC = ELR_EL1, SP = SP_EL0, x[0..=30] +
+    // SPSR), but `UserTaskFuture::resume_with` on aarch64 is
+    // currently a no-op pending the EL0 polling pipeline — the
+    // saved state is captured for forward-compat but not yet
+    // restored. Test contexts whose synthetic TrapContext can't
+    // save user state (the trait default returns false) fall back
+    // to `UserTaskFuture::new` against the parent's load-time
+    // (entry, stack_top).
     let child_state: Option<crate::user_task::UserState> = {
         use core::mem::MaybeUninit;
         let mut s = MaybeUninit::<crate::user_task::UserState>::zeroed();
@@ -3294,14 +3300,25 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
             // SAFETY: save_user_state returned true → it wrote a
             // valid UserState into `s`.
             let mut snap = unsafe { s.assume_init() };
-            snap.rax = 0;
+            // Rewrite the syscall-return register(s) for the
+            // child. Per-arch since UserState's field names
+            // differ.
+            #[cfg(target_arch = "x86_64")]
+            {
+                snap.rax = 0;
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                // aarch64 set_return writes value→x0, status→x1.
+                // Child sees SyscallReturn::ok(0) ⇒ x0=0, x1=0.
+                snap.x[0] = 0;
+                snap.x[1] = 0;
+            }
             Some(snap)
         } else {
             None
         }
     };
-    #[cfg(not(target_arch = "x86_64"))]
-    let child_state: Option<crate::user_task::UserState> = None;
 
     let parent_pid = current_task_id();
     let child_pid = crate::alloc_pid();
@@ -3337,33 +3354,26 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
         },
     };
 
-    #[cfg(target_arch = "x86_64")]
-    {
-        let future = match child_state {
-            Some(state) => crate::user_task::UserTaskFuture::resume_with(proc, state),
-            // Fallback if save_user_state didn't fire (test contexts
-            // with synthetic TrapContexts whose stub returns false).
-            None => crate::user_task::UserTaskFuture::new(proc),
-        };
-        let child_tid = narf_scheduler::spawn_user(
-            future,
-            narf_scheduler::TaskSpec::unthrottled(),
-            child_as,
-        );
-        // POSIX inheritance — fd / cwd / brk / sigaction handlers
-        // are copied; pending signals reset (handled by sigaction_fork
-        // not touching the pending bitmap).
-        crate::fd::fork(parent_pid, child_tid.raw());
-        cwd_fork(parent_pid, child_tid.raw());
-        brk_fork(parent_pid, child_tid.raw());
-        sigaction_fork(parent_pid, child_tid.raw());
-        ctx.set_return(SyscallReturn::ok(child_tid.raw()));
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = (proc, child_as, child_pid, parent_pid, child_state);
-        ctx.set_return(SyscallReturn::invalid_op());
-    }
+    let future = match child_state {
+        Some(state) => crate::user_task::UserTaskFuture::resume_with(proc, state),
+        // Fallback if save_user_state didn't fire (test contexts
+        // with synthetic TrapContexts whose stub returns false).
+        None => crate::user_task::UserTaskFuture::new(proc),
+    };
+    let child_tid = narf_scheduler::spawn_user(
+        future,
+        narf_scheduler::TaskSpec::unthrottled(),
+        child_as,
+    );
+    // POSIX inheritance — fd / cwd / brk / sigaction handlers are
+    // copied; pending signals reset (handled by sigaction_fork
+    // not touching the pending bitmap).
+    crate::fd::fork(parent_pid, child_tid.raw());
+    cwd_fork(parent_pid, child_tid.raw());
+    brk_fork(parent_pid, child_tid.raw());
+    sigaction_fork(parent_pid, child_tid.raw());
+    let _ = child_pid; // tid != pid distinction lands with thread-group bookkeeping
+    ctx.set_return(SyscallReturn::ok(child_tid.raw()));
 }
 
 // ── Per-task pgid table ────────────────────────────────────────────

@@ -227,7 +227,186 @@ impl<'a> TrapContext for Aarch64TrapContext<'a> {
         self.frame.x30 = rsp;
         true
     }
+
+    /// Snapshot the user-mode CPU state for fork(2)'s
+    /// trap-frame inheritance path. Same shape contract as the
+    /// x86_64 implementation: caller passes a writable region of
+    /// at least `size_of::<UserState>()` bytes, this routine
+    /// writes the saved x0..=x30 GPRs, the post-trap PC (ELR),
+    /// the user-mode SP (SP_EL0 — still holding the user value
+    /// because the EL1 trap path swapped to SP_EL1), and SPSR.
+    ///
+    /// `valid` is set to 1 so resume paths can distinguish a
+    /// captured state from a zeroed placeholder.
+    unsafe fn save_user_state(&self, out: *mut u8) -> bool {
+        use narf_userspace::user_task::UserState;
+        // SAFETY: caller declared `out` is writable for at least
+        // `size_of::<UserState>()` bytes — the trait's contract.
+        let s = unsafe { &mut *(out as *mut UserState) };
+        let f = &self.frame;
+        // x0..=x30 (31 registers).
+        s.x[0]  = f.x0;
+        s.x[1]  = f.x1;
+        s.x[2]  = f.x2;
+        s.x[3]  = f.x3;
+        s.x[4]  = f.x4;
+        s.x[5]  = f.x5;
+        s.x[6]  = f.x6;
+        s.x[7]  = f.x7;
+        s.x[8]  = f.x8;
+        s.x[9]  = f.x9;
+        s.x[10] = f.x10;
+        s.x[11] = f.x11;
+        s.x[12] = f.x12;
+        s.x[13] = f.x13;
+        s.x[14] = f.x14;
+        s.x[15] = f.x15;
+        s.x[16] = f.x16;
+        s.x[17] = f.x17;
+        s.x[18] = f.x18;
+        s.x[19] = f.x19;
+        s.x[20] = f.x20;
+        s.x[21] = f.x21;
+        s.x[22] = f.x22;
+        s.x[23] = f.x23;
+        s.x[24] = f.x24;
+        s.x[25] = f.x25;
+        s.x[26] = f.x26;
+        s.x[27] = f.x27;
+        s.x[28] = f.x28;
+        s.x[29] = f.x29;
+        s.x[30] = f.x30;
+        // PC: ELR_EL1 was advanced past the trapping `svc #0`
+        // instruction by the architecturally-correct trap path,
+        // so resuming here lands at the next user instruction.
+        s.pc = f.elr;
+        // SPSR_EL1 carries the user-mode PSTATE (NZCV / DAIF /
+        // mode bits) the resume path will restore.
+        s.spsr = f.spsr;
+        // SP: at trap time we swapped to SP_EL1 (kernel stack);
+        // the user's SP_EL0 still holds the user-mode stack
+        // pointer untouched. Read it via MSR — legal at EL1.
+        let sp_el0: u64;
+        // SAFETY: reading SP_EL0 at EL1 is unconditionally
+        // defined; it has no side effects on EL1 state.
+        unsafe {
+            core::arch::asm!(
+                "mrs {v}, SP_EL0",
+                v = out(reg) sp_el0,
+                options(nostack, preserves_flags),
+            );
+        }
+        s.sp = sp_el0;
+        s.valid = 1;
+        true
+    }
 }
+
+// ── Kernel-test smokes for the aarch64 TrapContext save path ──────
+
+use narf_kernel_test::{kernel_test_in, TestResult};
+
+fn smoke_aarch64_trap_save_user_state_round_trip() -> TestResult {
+    // Build a synthetic TrapFrame with deterministic GPRs / ELR /
+    // SPSR, wrap it in Aarch64TrapContext, snapshot via
+    // save_user_state, and verify every field landed in the
+    // expected slot. SP_EL0 is hardware-readable from kernel
+    // mode; we set it before the call so the saved `s.sp`
+    // matches.
+    use core::mem::MaybeUninit;
+    use narf_userspace::user_task::UserState;
+
+    // Dummy frame — every register slot gets a unique sentinel
+    // so a swapped pair would be obvious in the assertion.
+    let mut frame = TrapFrame {
+        x30: 0x3030_3030_3030_3030,
+        _pad: 0,
+        elr: 0xE1E1_E1E1_E1E1_E1E1u64,
+        spsr: 0x0000_0000_8000_0000, // arbitrary PSTATE
+        x0:  0x0000_0000_0000_0000,
+        x1:  0x0101_0101_0101_0101,
+        x2:  0x0202_0202_0202_0202,
+        x3:  0x0303_0303_0303_0303,
+        x4:  0x0404_0404_0404_0404,
+        x5:  0x0505_0505_0505_0505,
+        x6:  0x0606_0606_0606_0606,
+        x7:  0x0707_0707_0707_0707,
+        x8:  0x0808_0808_0808_0808,
+        x9:  0x0909_0909_0909_0909,
+        x10: 0x0A0A_0A0A_0A0A_0A0A,
+        x11: 0x0B0B_0B0B_0B0B_0B0B,
+        x12: 0x0C0C_0C0C_0C0C_0C0C,
+        x13: 0x0D0D_0D0D_0D0D_0D0D,
+        x14: 0x0E0E_0E0E_0E0E_0E0E,
+        x15: 0x0F0F_0F0F_0F0F_0F0F,
+        x16: 0x1010_1010_1010_1010,
+        x17: 0x1111_1111_1111_1111,
+        x18: 0x1212_1212_1212_1212,
+        x19: 0x1313_1313_1313_1313,
+        x20: 0x1414_1414_1414_1414,
+        x21: 0x1515_1515_1515_1515,
+        x22: 0x1616_1616_1616_1616,
+        x23: 0x1717_1717_1717_1717,
+        x24: 0x1818_1818_1818_1818,
+        x25: 0x1919_1919_1919_1919,
+        x26: 0x1A1A_1A1A_1A1A_1A1A,
+        x27: 0x1B1B_1B1B_1B1B_1B1B,
+        x28: 0x1C1C_1C1C_1C1C_1C1C,
+        x29: 0x1D1D_1D1D_1D1D_1D1D,
+    };
+
+    // Pre-load SP_EL0 with a sentinel and remember the prior
+    // value so the test is non-disruptive across re-runs.
+    const SP_SENTINEL: u64 = 0x7F00_0000_0000_BEEF;
+    let prior_sp_el0: u64;
+    // SAFETY: SP_EL0 read/write at EL1 is unconditional and has
+    // no side effects when EL0 is not currently executing.
+    unsafe {
+        core::arch::asm!(
+            "mrs {p}, SP_EL0",
+            "msr SP_EL0, {n}",
+            p = out(reg) prior_sp_el0,
+            n = in(reg) SP_SENTINEL,
+            options(nostack, preserves_flags),
+        );
+    }
+
+    let ctx = Aarch64TrapContext::from_svc(&mut frame);
+    let mut buf = MaybeUninit::<UserState>::zeroed();
+    // SAFETY: destination is a freshly-zeroed `UserState`-sized
+    // stack slot — the trait's contract.
+    let ok = unsafe { ctx.save_user_state(buf.as_mut_ptr() as *mut u8) };
+
+    // Restore the prior SP_EL0 immediately so any later test
+    // that depends on it observes the boot-state value.
+    unsafe {
+        core::arch::asm!(
+            "msr SP_EL0, {p}",
+            p = in(reg) prior_sp_el0,
+            options(nostack, preserves_flags),
+        );
+    }
+
+    if !ok {
+        return TestResult::Fail("save_user_state returned false");
+    }
+    // SAFETY: save_user_state returned true → it wrote a valid
+    // UserState into the buffer.
+    let s = unsafe { buf.assume_init() };
+
+    if s.x[0]  != 0x0000_0000_0000_0000 { return TestResult::Fail("x0 mismatch"); }
+    if s.x[1]  != 0x0101_0101_0101_0101 { return TestResult::Fail("x1 mismatch"); }
+    if s.x[15] != 0x0F0F_0F0F_0F0F_0F0F { return TestResult::Fail("x15 mismatch"); }
+    if s.x[28] != 0x1C1C_1C1C_1C1C_1C1C { return TestResult::Fail("x28 mismatch"); }
+    if s.x[29] != 0x1D1D_1D1D_1D1D_1D1D { return TestResult::Fail("x29 mismatch"); }
+    if s.x[30] != 0x3030_3030_3030_3030 { return TestResult::Fail("x30 mismatch"); }
+    if s.pc    != 0xE1E1_E1E1_E1E1_E1E1u64 { return TestResult::Fail("pc != ELR"); }
+    if s.spsr  != 0x0000_0000_8000_0000 { return TestResult::Fail("spsr mismatch"); }
+    if s.sp    != SP_SENTINEL { return TestResult::Fail("sp != SP_EL0"); }
+    if s.valid != 1 { return TestResult::Fail("valid != 1"); }
+    TestResult::Pass
+}
+kernel_test_in!("aarch64", smoke_aarch64_trap_save_user_state_round_trip);
 
 fn dump_frame(f: &TrapFrame) {
     let _ = writeln!(Writer, "  x0:  {:#018x}   x1:  {:#018x}", f.x0, f.x1);
