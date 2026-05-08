@@ -1,0 +1,27 @@
+[package]
+name         = "narf-drivers-fs-minix"
+description  = "Clean room MINIX (V1/V2/V3) filesystem driver. Read-only first cut."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_fs_minix"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib          = { path = "../../../lib" }
+narf-arch         = { path = "../../../arch" }
+narf-drivers      = { path = "../../" }
+narf-driver-runtime = { path = "../../runtime" }
+narf-capabilities = { path = "../../../capabilities" }
+narf-memory       = { path = "../../../memory" }
+narf-block        = { path = "../../../block" }
+narf-filesystem   = { path = "../../../filesystem" }
+narf-io           = { path = "../../../io" }
+narf-kernel-test  = { path = "../../../verification/kernel-test" }
+
+[lints]
+workspace = true
