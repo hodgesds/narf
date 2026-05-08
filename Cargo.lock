@@ -499,6 +499,7 @@ name = "narf-aml"
 version = "0.0.0"
 dependencies = [
  "narf-acpi",
+ "narf-kernel-test",
  "narf-lib",
  "narf-memory",
  "narf-time",

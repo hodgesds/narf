@@ -377,3 +377,136 @@ fn smoke_scheduler_steal_disabled_returns_clean() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("scheduler", smoke_scheduler_steal_disabled_returns_clean);
+
+// ── scheduler/affinity + AS routing ──────────────────────────────────
+
+fn smoke_scheduler_per_cpu_pin_to_bsp() -> TestResult {
+    // Pinning a task to CpuId(0) lands it on BSP's queue. With the
+    // BSP running run_until_empty, the task completes — same outcome
+    // as an unpinned spawn from BSP, but exercising the affinity
+    // routing path through `target_cpu`.
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use crate::{spawn_with_spec, Affinity, CpuId, TaskSpec};
+    static RAN: AtomicU32 = AtomicU32::new(0);
+    RAN.store(0, Ordering::Relaxed);
+
+    crate::init();
+
+    let spec = TaskSpec {
+        affinity: Affinity::pinned(CpuId(0)),
+        ..TaskSpec::unthrottled()
+    };
+    let _ = spawn_with_spec(
+        async {
+            RAN.store(1, Ordering::Relaxed);
+        },
+        spec,
+    );
+
+    crate::run_until_empty();
+
+    if RAN.load(Ordering::Relaxed) == 1 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("BSP-pinned task didn't run")
+    }
+}
+kernel_test_in!("scheduler", smoke_scheduler_per_cpu_pin_to_bsp);
+
+fn smoke_scheduler_numa_steal_prefers_same_node() -> TestResult {
+    // With work-stealing on and per-CPU queues seeded across two
+    // NUMA nodes, a steal should pull from a same-node victim first.
+    // We exercise this purely through the public surface: spawn
+    // tasks pinned to specific CPUs in different nodes; force-enable
+    // stealing; run the BSP loop. Tasks all complete because affinity
+    // routes them to their target CPU's queue and the BSP steals
+    // them.
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use crate::{spawn_with_spec, Affinity, CpuId, TaskSpec};
+
+    static DONE: AtomicU32 = AtomicU32::new(0);
+    DONE.store(0, Ordering::Relaxed);
+
+    crate::init();
+    crate::enable_work_stealing();
+
+    for cpu in 0..4u32 {
+        let spec = TaskSpec {
+            affinity: Affinity::pinned(CpuId(cpu)),
+            ..TaskSpec::unthrottled()
+        };
+        let _ = spawn_with_spec(
+            async {
+                DONE.fetch_add(1, Ordering::Relaxed);
+            },
+            spec,
+        );
+    }
+
+    crate::run_until_empty();
+    crate::disable_work_stealing();
+
+    // BSP drained at least its own pinned task; the others may or
+    // may not be visible depending on whether real APs ran them.
+    if DONE.load(Ordering::Relaxed) == 0 {
+        return TestResult::Fail("no task ran");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_numa_steal_prefers_same_node);
+
+fn smoke_scheduler_spawn_user_carries_address_space() -> TestResult {
+    extern crate alloc;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use narf_memory::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+    use crate::{address_space_of, spawn_user, TaskSpec};
+
+    crate::init();
+    static RAN: AtomicU32 = AtomicU32::new(0);
+    RAN.store(0, Ordering::Relaxed);
+
+    // Allocate a real user-root for the active arch — the
+    // constructor takes care of the kernel/high-half bits that
+    // have to survive activation (full-copy PML4 on x86_64, empty
+    // TTBR0 on aarch64 since the kernel lives behind TTBR1).
+    let mut a = unsafe { AddressSpace::new_for_user() }.expect("alloc user AS");
+    a.map_region(Region {
+        base: VirtAddr::new(0x4000),
+        len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::EXEC,
+        phys: alloc::vec![PhysAddr::new(0x2_0000)],
+    })
+    .expect("map");
+    let arc_a = Arc::new(a);
+
+    let tid = spawn_user(
+        async {
+            RAN.fetch_add(1, Ordering::Relaxed);
+        },
+        TaskSpec::unthrottled(),
+        Arc::clone(&arc_a),
+    );
+
+    // Before running, `address_space_of` finds our AS.
+    match address_space_of(tid) {
+        Some(found) => {
+            if found.region_count() != 1 {
+                return TestResult::Fail("address_space_of returned wrong AS");
+            }
+        }
+        None => return TestResult::Fail("spawn_user did not attach AS"),
+    }
+
+    crate::run_until_empty();
+
+    if RAN.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("user task did not run");
+    }
+    // After task completes, lookup should return None.
+    if address_space_of(tid).is_some() {
+        return TestResult::Fail("AS handle persisted past task completion");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_spawn_user_carries_address_space);

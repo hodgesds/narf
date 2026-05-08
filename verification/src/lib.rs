@@ -2714,83 +2714,11 @@ fn smoke_acpi_srat_synthetic_memory_entry() -> TestResult {
 }
 kernel_test!(smoke_acpi_srat_synthetic_memory_entry);
 
-fn smoke_scheduler_per_cpu_pin_to_bsp() -> TestResult {
-    // Pinning a task to CpuId(0) lands it on BSP's queue. With the
-    // BSP running run_until_empty, the task completes — same outcome
-    // as an unpinned spawn from BSP, but exercising the affinity
-    // routing path through `target_cpu`.
-    use core::sync::atomic::{AtomicU32, Ordering};
-    use narf_scheduler::{spawn_with_spec, Affinity, CpuId, TaskSpec};
-    static RAN: AtomicU32 = AtomicU32::new(0);
-    RAN.store(0, Ordering::Relaxed);
+// `smoke_scheduler_per_cpu_pin_to_bsp` migrated to scheduler/src/tests.rs (subsystem `"scheduler"`).
 
-    narf_scheduler::init();
 
-    let spec = TaskSpec {
-        affinity: Affinity::pinned(CpuId(0)),
-        ..TaskSpec::unthrottled()
-    };
-    let _ = spawn_with_spec(
-        async {
-            RAN.store(1, Ordering::Relaxed);
-        },
-        spec,
-    );
+// `smoke_scheduler_numa_steal_prefers_same_node` migrated to scheduler/src/tests.rs (subsystem `"scheduler"`).
 
-    narf_scheduler::run_until_empty();
-
-    if RAN.load(Ordering::Relaxed) == 1 {
-        TestResult::Pass
-    } else {
-        TestResult::Fail("BSP-pinned task didn't run")
-    }
-}
-kernel_test!(smoke_scheduler_per_cpu_pin_to_bsp);
-
-fn smoke_scheduler_numa_steal_prefers_same_node() -> TestResult {
-    // With work-stealing on and per-CPU queues seeded across two
-    // NUMA nodes, a steal should pull from a same-node victim first.
-    // We exercise this purely through the public surface: spawn
-    // tasks pinned to specific CPUs in different nodes; force-enable
-    // stealing; run the BSP loop. Tasks all complete because affinity
-    // routes them to their target CPU's queue and the BSP steals
-    // them. The point of the smoke is "stealing didn't deadlock with
-    // NUMA preferences active"; finer-grained behavioural checks
-    // would need per-CPU runtime hooks not yet present.
-    use core::sync::atomic::{AtomicU32, Ordering};
-    use narf_scheduler::{spawn_with_spec, Affinity, CpuId, TaskSpec};
-
-    static DONE: AtomicU32 = AtomicU32::new(0);
-    DONE.store(0, Ordering::Relaxed);
-
-    narf_scheduler::init();
-    narf_scheduler::enable_work_stealing();
-
-    for cpu in 0..4u32 {
-        let spec = TaskSpec {
-            affinity: Affinity::pinned(CpuId(cpu)),
-            ..TaskSpec::unthrottled()
-        };
-        let _ = spawn_with_spec(
-            async {
-                DONE.fetch_add(1, Ordering::Relaxed);
-            },
-            spec,
-        );
-    }
-
-    narf_scheduler::run_until_empty();
-    narf_scheduler::disable_work_stealing();
-
-    // BSP drained at least its own pinned task; the others may or
-    // may not be visible depending on whether real APs ran them.
-    // We just need the scheduler not to wedge.
-    if DONE.load(Ordering::Relaxed) == 0 {
-        return TestResult::Fail("no task ran");
-    }
-    TestResult::Pass
-}
-kernel_test!(smoke_scheduler_numa_steal_prefers_same_node);
 
 // `smoke_scheduler_steal_disabled_returns_clean` migrated to scheduler/src/tests.rs (subsystem `"scheduler"`).
 
@@ -2917,155 +2845,14 @@ fn smoke_memory_address_space_materialize() -> TestResult {
 }
 kernel_test!(smoke_memory_address_space_materialize);
 
-fn smoke_scheduler_spawn_user_carries_address_space() -> TestResult {
-    use alloc::sync::Arc;
-    use core::sync::atomic::{AtomicU32, Ordering};
-    use narf_memory::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
-    use narf_scheduler::{address_space_of, spawn_user, TaskSpec};
+// `smoke_scheduler_spawn_user_carries_address_space` migrated to scheduler/src/tests.rs (subsystem `"scheduler"`).
 
-    narf_scheduler::init();
-    static RAN: AtomicU32 = AtomicU32::new(0);
-    RAN.store(0, Ordering::Relaxed);
 
-    // Allocate a real user-root for the active arch — the
-    // constructor takes care of the kernel/high-half bits that
-    // have to survive activation (full-copy PML4 on x86_64, empty
-    // TTBR0 on aarch64 since the kernel lives behind TTBR1).
-    let mut a = unsafe { AddressSpace::new_for_user() }.expect("alloc user AS");
-    a.map_region(Region {
-        base: VirtAddr::new(0x4000),
-        len: 0x1000,
-        perms: RegionPerms::READ | RegionPerms::EXEC,
-        phys: alloc::vec![PhysAddr::new(0x2_0000)],
-    })
-    .expect("map");
-    let arc_a = Arc::new(a);
+// `smoke_ipc_mpsc_multi_producer_roundtrip` migrated to ipc/src/tests.rs (subsystem `"ipc"`).
 
-    let tid = spawn_user(
-        async {
-            RAN.fetch_add(1, Ordering::Relaxed);
-        },
-        TaskSpec::unthrottled(),
-        Arc::clone(&arc_a),
-    );
 
-    // Before running, `address_space_of` finds our AS.
-    match address_space_of(tid) {
-        Some(found) => {
-            if found.region_count() != 1 {
-                return TestResult::Fail("address_space_of returned wrong AS");
-            }
-        }
-        None => return TestResult::Fail("spawn_user did not attach AS"),
-    }
+// `smoke_ipc_mpsc_closed_surfaces` migrated to ipc/src/tests.rs (subsystem `"ipc"`).
 
-    narf_scheduler::run_until_empty();
-
-    if RAN.load(Ordering::Relaxed) != 1 {
-        return TestResult::Fail("user task did not run");
-    }
-    // After task completes, lookup should return None.
-    if address_space_of(tid).is_some() {
-        return TestResult::Fail("AS handle persisted past task completion");
-    }
-    TestResult::Pass
-}
-kernel_test!(smoke_scheduler_spawn_user_carries_address_space);
-
-fn smoke_ipc_mpsc_multi_producer_roundtrip() -> TestResult {
-    use core::sync::atomic::{AtomicU32, Ordering};
-    use narf_ipc::{mpsc_channel, MpscRecvError};
-
-    narf_scheduler::init();
-    static DRAINED: AtomicU32 = AtomicU32::new(0);
-    DRAINED.store(0, Ordering::Relaxed);
-
-    let (tx, rx) = mpsc_channel::<u32>(16);
-    let tx2 = tx.clone();
-    let tx3 = tx.clone();
-
-    // Three producer tasks + one consumer.
-    narf_scheduler::spawn(async move {
-        for i in 0..4 {
-            tx.try_send(0xA000 + i).unwrap();
-        }
-    });
-    narf_scheduler::spawn(async move {
-        for i in 0..4 {
-            tx2.try_send(0xB000 + i).unwrap();
-        }
-    });
-    narf_scheduler::spawn(async move {
-        for i in 0..4 {
-            tx3.try_send(0xC000 + i).unwrap();
-        }
-    });
-
-    narf_scheduler::spawn(async move {
-        let mut rx = rx;
-        for _ in 0..12 {
-            match rx.recv().await {
-                Ok(_v) => {
-                    DRAINED.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(MpscRecvError::Closed) => break,
-            }
-        }
-        // Dropping `rx` latches closed for future producer attempts.
-    });
-
-    narf_scheduler::run_until_empty();
-
-    if DRAINED.load(Ordering::Relaxed) != 12 {
-        return TestResult::Fail("consumer did not drain all three producers' messages");
-    }
-    TestResult::Pass
-}
-kernel_test!(smoke_ipc_mpsc_multi_producer_roundtrip);
-
-fn smoke_ipc_mpsc_closed_surfaces() -> TestResult {
-    use narf_ipc::{mpsc_channel, MpscRecvError, MpscSendError};
-
-    let (tx, rx) = mpsc_channel::<u8>(2);
-
-    // Fill the channel then attempt a third send → Full.
-    tx.try_send(1).unwrap();
-    tx.try_send(2).unwrap();
-    match tx.try_send(3) {
-        Err(MpscSendError::Full(3)) => {}
-        _ => return TestResult::Fail("full channel did not report Full"),
-    }
-
-    // Drop consumer → subsequent sends are Closed.
-    drop(rx);
-    match tx.try_send(4) {
-        Err(MpscSendError::Closed(4)) => {}
-        _ => return TestResult::Fail("dropped consumer did not surface Closed"),
-    }
-    if !tx.is_closed() {
-        return TestResult::Fail("is_closed lies");
-    }
-
-    // Consumer-side Closed: use a fresh pair, drop sender explicitly.
-    let (tx2, rx2) = mpsc_channel::<u8>(2);
-    drop(tx2);
-    // Existing queued elements come out first; since we never sent
-    // anything, try_recv on empty + closed → Closed.
-    match rx2.try_recv() {
-        // Note: our close-signal comes from consumer drop, not
-        // producer drop. So producer-dropped-but-consumer-alive
-        // returns Ok(None) here, not Closed. That matches the impl
-        // — we don't track producer count separately.
-        Ok(None) => {}
-        _ => {
-            return TestResult::Fail(
-                "empty channel without producer-count tracking should surface Ok(None)",
-            )
-        }
-    }
-    TestResult::Pass
-}
-kernel_test!(smoke_ipc_mpsc_closed_surfaces);
 
 fn smoke_memory_address_space_region_table() -> TestResult {
     use narf_memory::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};

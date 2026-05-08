@@ -394,3 +394,100 @@ fn smoke_exit_gate_revoked_cap_rejected() -> TestResult {
     }
 }
 kernel_test_in!("ipc", smoke_exit_gate_revoked_cap_rejected);
+
+// ── ipc/mpsc ───────────────────────────────────────────────────────
+
+fn smoke_ipc_mpsc_multi_producer_roundtrip() -> TestResult {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use crate::{mpsc_channel, MpscRecvError};
+
+    narf_scheduler::init();
+    static DRAINED: AtomicU32 = AtomicU32::new(0);
+    DRAINED.store(0, Ordering::Relaxed);
+
+    let (tx, rx) = mpsc_channel::<u32>(16);
+    let tx2 = tx.clone();
+    let tx3 = tx.clone();
+
+    // Three producer tasks + one consumer.
+    narf_scheduler::spawn(async move {
+        for i in 0..4 {
+            tx.try_send(0xA000 + i).unwrap();
+        }
+    });
+    narf_scheduler::spawn(async move {
+        for i in 0..4 {
+            tx2.try_send(0xB000 + i).unwrap();
+        }
+    });
+    narf_scheduler::spawn(async move {
+        for i in 0..4 {
+            tx3.try_send(0xC000 + i).unwrap();
+        }
+    });
+
+    narf_scheduler::spawn(async move {
+        let mut rx = rx;
+        for _ in 0..12 {
+            match rx.recv().await {
+                Ok(_v) => {
+                    DRAINED.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(MpscRecvError::Closed) => break,
+            }
+        }
+        // Dropping `rx` latches closed for future producer attempts.
+    });
+
+    narf_scheduler::run_until_empty();
+
+    if DRAINED.load(Ordering::Relaxed) != 12 {
+        return TestResult::Fail("consumer did not drain all three producers' messages");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("ipc", smoke_ipc_mpsc_multi_producer_roundtrip);
+
+fn smoke_ipc_mpsc_closed_surfaces() -> TestResult {
+    use crate::{mpsc_channel, MpscRecvError, MpscSendError};
+
+    let (tx, rx) = mpsc_channel::<u8>(2);
+
+    // Fill the channel then attempt a third send → Full.
+    tx.try_send(1).unwrap();
+    tx.try_send(2).unwrap();
+    match tx.try_send(3) {
+        Err(MpscSendError::Full(3)) => {}
+        _ => return TestResult::Fail("full channel did not report Full"),
+    }
+
+    // Drop consumer → subsequent sends are Closed.
+    drop(rx);
+    match tx.try_send(4) {
+        Err(MpscSendError::Closed(4)) => {}
+        _ => return TestResult::Fail("dropped consumer did not surface Closed"),
+    }
+    if !tx.is_closed() {
+        return TestResult::Fail("is_closed lies");
+    }
+
+    // Consumer-side Closed: use a fresh pair, drop sender explicitly.
+    let (tx2, rx2) = mpsc_channel::<u8>(2);
+    drop(tx2);
+    // Existing queued elements come out first; since we never sent
+    // anything, try_recv on empty + closed → Closed.
+    match rx2.try_recv() {
+        // Note: our close-signal comes from consumer drop, not
+        // producer drop. So producer-dropped-but-consumer-alive
+        // returns Ok(None) here, not Closed.
+        Ok(None) => {}
+        _ => {
+            return TestResult::Fail(
+                "empty channel without producer-count tracking should surface Ok(None)",
+            )
+        }
+    }
+    let _ = MpscRecvError::Closed;
+    TestResult::Pass
+}
+kernel_test_in!("ipc", smoke_ipc_mpsc_closed_surfaces);
