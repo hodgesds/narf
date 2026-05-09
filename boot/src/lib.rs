@@ -26,3 +26,24 @@ pub mod x86_64;
 pub mod aarch64;
 
 pub use info::{BootError, BootInfo, MemRegion, MemRegionKind, RawBootInfo};
+
+/// Bootloader-supplied kernel command-line as a `&'static str`.
+/// Empty before the per-arch `parse_raw` runs, or when the loader
+/// passed no cmdline. See `boot/specification/cmdline.md` (TBD)
+/// for the recognized flag set; today the kernel parses:
+///
+/// - `safe_mode` / `safe_mode=N` — equivalent to `stop_at=subsys`.
+/// - `stop_at=<stage>` — halt initcall execution after the named
+///   stage. Valid: early, core, postcore, arch, subsys, fs,
+///   device, late.
+///
+/// Anything else is ignored. Unknown flags do not abort boot.
+#[cfg(target_arch = "x86_64")]
+pub fn cmdline() -> &'static str {
+    x86_64::cmdline()
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn cmdline() -> &'static str {
+    ""
+}

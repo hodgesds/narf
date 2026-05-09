@@ -229,12 +229,78 @@ pub fn restore_fb_hook(prior: usize) {
     FB_HOOK.store(prior, Ordering::Release);
 }
 
-/// Panic sink — no allocation, no re-entry. `frame/`'s panic handler
-/// forwards here.
+/// Panic sink — no allocation, no re-entry, lock-free.
+///
+/// Bypasses the regular `CONSOLE.lock` because the panicking
+/// CPU may already hold it (e.g. panicked mid-`write_str`); a
+/// blocking lock attempt would deadlock against itself. Writes
+/// directly to the UART backend AND to the framebuffer hook
+/// (when installed) so the message reaches both serial and the
+/// laptop screen.
+///
+/// Re-entrance guard: `IN_PANIC` short-circuits a recursive
+/// panic (e.g. if the FB hook panics during its own write) so
+/// we don't loop forever.
 pub fn panic_sink(info: &core::panic::PanicInfo<'_>) -> ! {
-    // Try our best; if `write_str` faults, we still halt below.
-    let _ = writeln!(Writer, "\n*** KERNEL PANIC ***");
-    let _ = writeln!(Writer, "{info}");
+    use core::sync::atomic::AtomicBool;
+
+    static IN_PANIC: AtomicBool = AtomicBool::new(false);
+    if IN_PANIC.swap(true, Ordering::AcqRel) {
+        // Recursive panic — just halt without trying to log
+        // anything new.
+        narf_arch::halt_forever();
+    }
+
+    // Format into a small fixed-size buffer + emit to both
+    // sinks. Using `core::fmt::Write` against a stack buffer
+    // avoids allocation and avoids the CONSOLE.lock path.
+    struct StackBuf {
+        bytes: [u8; 1024],
+        len: usize,
+    }
+    impl fmt::Write for StackBuf {
+        fn write_str(&mut self, s: &str) -> fmt::Result {
+            for &b in s.as_bytes() {
+                if self.len < self.bytes.len() {
+                    self.bytes[self.len] = b;
+                    self.len += 1;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let mut buf = StackBuf {
+        bytes: [0; 1024],
+        len: 0,
+    };
+    let _ = writeln!(buf, "\n*** KERNEL PANIC ***");
+    let _ = writeln!(buf, "{info}");
+    let msg = &buf.bytes[..buf.len];
+
+    // Direct write to UART backend, no lock acquisition.
+    if let Some(kind) = CONSOLE.kind.get() {
+        let base = CONSOLE.base.load(Ordering::Acquire) as usize;
+        if base != 0 {
+            // SAFETY: kind + base published Release; we accept
+            // the risk of interleaving with another CPU's
+            // mid-write — better than deadlocking on the lock.
+            // Real panics are single-CPU events most of the
+            // time anyway.
+            unsafe {
+                backend::write_bytes(base, *kind, msg);
+            }
+        }
+    }
+
+    // Direct call into the FB hook, also lock-free.
+    let h = FB_HOOK.load(Ordering::Acquire);
+    if h != 0 {
+        // SAFETY: stored as `FbHook as usize` in `set_fb_hook`.
+        let f: FbHook = unsafe { core::mem::transmute(h) };
+        f(msg);
+    }
+
     narf_arch::halt_forever();
 }
 

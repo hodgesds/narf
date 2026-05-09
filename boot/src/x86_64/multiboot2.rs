@@ -261,6 +261,28 @@ pub unsafe fn framebuffer(info_ptr: usize) -> Option<FramebufferInfo> {
     None
 }
 
+/// Walk for the `cmdline` tag (type 1). Returns the bootloader-supplied
+/// kernel command-line as a byte slice (no NUL terminator). Returns
+/// `None` when the bootloader didn't pass a cmdline.
+///
+/// # Safety
+/// `info_ptr` must point at a valid multiboot2 info struct; the
+/// cmdline string must be NUL-terminated within the tag's `size`.
+pub unsafe fn cmdline(info_ptr: usize) -> Option<&'static [u8]> {
+    // SAFETY: caller contract.
+    for (ty, size, payload) in unsafe { TagIter::new(info_ptr) } {
+        if ty != TAG_CMDLINE {
+            continue;
+        }
+        // Tag header is 8 bytes; payload is the string itself.
+        let max = (size as usize).saturating_sub(8);
+        // SAFETY: bounds-checked.
+        let s = unsafe { read_cstr(payload, max) };
+        return Some(s);
+    }
+    None
+}
+
 /// # Safety
 /// `phys + max` must be readable.
 unsafe fn read_cstr<'a>(phys: usize, max: usize) -> &'a [u8] {

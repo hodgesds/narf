@@ -139,6 +139,22 @@ pub unsafe fn initramfs_module(info_ptr: usize) -> Option<(u64, u64)> {
     None
 }
 
+/// Read the kernel command-line that the PVH loader stashed at
+/// `hdr.cmdline_paddr`. Returns `None` when the field is zero.
+///
+/// # Safety
+/// `info_ptr` must point at a valid `hvm_start_info`; the cmdline
+/// pointer must address a NUL-terminated string in readable memory.
+pub unsafe fn cmdline(info_ptr: usize) -> Option<&'static [u8]> {
+    // SAFETY: caller-provided pointer to a valid PVH header.
+    let hdr = unsafe { (info_ptr as *const HvmStartInfo).read_unaligned() };
+    if hdr.magic != MAGIC || hdr._cmdline == 0 {
+        return None;
+    }
+    // SAFETY: PVH spec; bound the scan at 512 bytes.
+    Some(unsafe { read_cstr(hdr._cmdline as usize, 512) })
+}
+
 /// Read a NUL-terminated ASCII string from phys + bound the
 /// length at `max`. Returned slice borrows from physical memory;
 /// caller must drop it before the bootloader's reserved

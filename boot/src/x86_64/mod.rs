@@ -23,8 +23,42 @@ static mut MEMORY_MAP: [MemRegion; MAX_MEM_REGIONS] = [MemRegion {
 }; MAX_MEM_REGIONS];
 static mut MEMORY_MAP_LEN: usize = 0;
 
-/// Backing for the command-line string; empty in Stage 1.
-static CMDLINE: &str = "";
+/// Backing buffer for the bootloader-supplied command-line. Copied
+/// out of the transient bootinfo region during `parse_raw`, then
+/// borrowed as a `&'static str` for the rest of boot.
+const CMDLINE_CAP: usize = 512;
+static mut CMDLINE_BUF: [u8; CMDLINE_CAP] = [0; CMDLINE_CAP];
+static mut CMDLINE_LEN: usize = 0;
+
+/// Borrow the populated command-line as a `&'static str`. Empty
+/// before `parse_raw` runs, or when the bootloader passed no
+/// cmdline. Invalid UTF-8 bytes are dropped (best-effort lossy
+/// decode is reserved for diagnostics; the kernel only cares about
+/// ASCII flags).
+pub fn cmdline() -> &'static str {
+    // SAFETY: written exactly once at boot before any reader runs.
+    unsafe {
+        let len = core::ptr::addr_of!(CMDLINE_LEN).read();
+        let bytes = core::slice::from_raw_parts(core::ptr::addr_of!(CMDLINE_BUF).cast::<u8>(), len);
+        core::str::from_utf8(bytes).unwrap_or("")
+    }
+}
+
+/// Copy a bootloader-supplied cmdline byte slice into the static
+/// backing buffer. Truncates at `CMDLINE_CAP - 1` bytes.
+///
+/// # Safety
+/// Single-threaded boot path: caller must invoke before any other
+/// thread observes `cmdline()`.
+unsafe fn store_cmdline(src: &[u8]) {
+    let n = src.len().min(CMDLINE_CAP - 1);
+    // SAFETY: single-writer in the boot path.
+    unsafe {
+        let dst = core::ptr::addr_of_mut!(CMDLINE_BUF).cast::<u8>();
+        core::ptr::copy_nonoverlapping(src.as_ptr(), dst, n);
+        core::ptr::addr_of_mut!(CMDLINE_LEN).write(n);
+    }
+}
 
 /// Consume the raw bootloader payload and produce a validated `BootInfo`.
 ///
@@ -101,9 +135,21 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
         Protocol::Pvh => None,
     };
 
+    // SAFETY: payload validated; single-threaded boot.
+    let cmdline_bytes = unsafe {
+        match proto {
+            Protocol::Multiboot2 => multiboot2::cmdline(info_ptr),
+            Protocol::Pvh => pvh::cmdline(info_ptr),
+        }
+    };
+    if let Some(bytes) = cmdline_bytes {
+        // SAFETY: single-threaded boot, before any other thread runs.
+        unsafe { store_cmdline(bytes) };
+    }
+
     Ok(BootInfo {
         memory_map: regions,
-        cmdline: CMDLINE,
+        cmdline: cmdline(),
         uart_phys: PhysAddr::new(UART_DEFAULT_PORT as u64),
         uart_virt: VirtAddr::new(UART_DEFAULT_PORT as u64), // pre-MMU identity
         dtb_phys: None,

@@ -76,6 +76,50 @@ pub fn narf_cpu_to_node(cpu: u32) -> u32 {
     narf_acpi::cpu_node(cpu).unwrap_or(0)
 }
 
+/// Parse `stop_at=<stage>` and `safe_mode[=...]` from a kernel
+/// command-line. Returns the highest stage that should run; defaults
+/// to `Stage::Late` (run everything). Unknown stage names fall back
+/// to `Stage::Late` with no error — diagnostics-only.
+fn parse_stop_at(cmdline: &str) -> narf_init::Stage {
+    use narf_init::Stage;
+    let mut last = Stage::Late;
+    for tok in cmdline.split_ascii_whitespace() {
+        let (key, val) = match tok.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (tok, ""),
+        };
+        match key {
+            "stop_at" => {
+                let s = match val {
+                    "early" => Stage::Early,
+                    "core" => Stage::Core,
+                    "postcore" => Stage::PostCore,
+                    "arch" => Stage::Arch,
+                    "subsys" => Stage::Subsys,
+                    "fs" => Stage::Fs,
+                    "device" => Stage::Device,
+                    "late" => Stage::Late,
+                    _ => continue,
+                };
+                if (s as u8) < (last as u8) {
+                    last = s;
+                }
+            }
+            "safe_mode" => {
+                // Stop after Subsys: the kernel core, drivers
+                // registry, ACPI, MMU + heap are up; PCI probe,
+                // FS mount, FB-console, and userspace spawn are
+                // all skipped.
+                if (Stage::Subsys as u8) < (last as u8) {
+                    last = Stage::Subsys;
+                }
+            }
+            _ => {}
+        }
+    }
+    last
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
     // Step 1: bring up the early serial console before doing anything else,
@@ -1530,7 +1574,23 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // summary (call counts + cycles) to console + (after
             // Stage::Late, since fb-console-install lives there)
             // the framebuffer.
-            let _ = narf_init::run_all_through(narf_init::Stage::Late);
+            //
+            // The cmdline `stop_at=<stage>` flag (see narf_boot::
+            // cmdline) caps the run, e.g. `stop_at=device` halts
+            // before Late so the FB-console + virtio-gpu splash
+            // don't run. `safe_mode` is shorthand for
+            // `stop_at=subsys`. Useful for narrowing real-HW
+            // bring-up failures: each stage that completes prints
+            // a summary line, the next stage is the suspect.
+            let last_stage = parse_stop_at(narf_boot::cmdline());
+            if last_stage != narf_init::Stage::Late {
+                let _ = writeln!(
+                    console::Writer,
+                    "  cmdline: stop_at={} (stages after this will be skipped)",
+                    last_stage.name()
+                );
+            }
+            let _ = narf_init::run_all_through(last_stage);
             let _ = narf_init::print_summary(&mut console::Writer);
         }
         Err(e) => {
