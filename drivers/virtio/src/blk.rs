@@ -1,14 +1,27 @@
 //! narf-drivers-virtio — virtio-blk device driver.
 //!
-//! Spec: `drivers/virtio/specification/spec.md`. Stage 3 subset:
-//! block-device trait implementation, feature negotiation skeleton,
-//! and request submission via virtqueue.
+//! Spec: VirtIO 1.2 §5.2 (Block Device).
+//!   <https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html>
+//!
+//! MSI-X queue mapping (VirtIO 1.2 §4.1.5.1.3 — `queue_msix_vector`):
+//! the modern PCI transport's common-cfg lets us bind one MSI-X
+//! vector per virtqueue. virtio-blk has a single request virtqueue
+//! (queue 0), so this driver allocates one IDT vector and writes
+//! `queue_msix_vector = 0` against `queue_select = 0`. After
+//! `enable_msix`, `submit_async` builds the `WaitForIrq` future
+//! BEFORE ringing the queue-notify doorbell — required so a
+//! synchronously-delivered MSI-X (QEMU completes virtio-blk reads
+//! inline on `kick`) cannot slip past the waiter's baseline.
+//!
+//! The polled `poll()` path is preserved unchanged for callers that
+//! drive completion from a pump task instead of an IRQ.
 
 use alloc::collections::BTreeMap;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
+use crate::pci::{discover, map_cap, VirtioPciError};
 use crate::{
     queue::{VirtqDesc, Virtqueue, VirtqueueLayout, VIRTQ_DESC_F_WRITE},
     VirtioMmioDevice,
@@ -21,9 +34,15 @@ use narf_block::{
     BlockCompletion, BlockDevice, BlockError, BlockFeature, BlockOp, BlockRequest, CancelResult,
     LbaRange,
 };
+use narf_bus::{BusDevice, BusDeviceCap, MsixTable};
+use narf_capabilities::{Cap, Write};
 use narf_io::{alloc_coherent, DmaBuffer, GetPhysAddr};
 use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
+
+/// Virtqueue index for the virtio-blk request queue. virtio-blk has
+/// a single request queue per VirtIO 1.2 §5.2.2.
+const REQUEST_QUEUE: u16 = 0;
 
 /// A VirtIO block device.
 #[derive(Debug)]
@@ -35,6 +54,14 @@ pub struct VirtioBlkDevice {
     queue_buf: Option<DmaBuffer>,
     /// DMA pool for request headers and status bytes.
     pool: Option<DmaPool>,
+    /// IDT vector bound to the request virtqueue when MSI-X is
+    /// enabled. `None` means polled-only completion. Async callers
+    /// observe completion via
+    /// `narf_interrupts::wait_for_irq(self.irq_vector.unwrap())`.
+    pub irq_vector: Option<u8>,
+    /// MSI-X table mapping kept alive for the lifetime of the device
+    /// so the programmed vector stays delivered.
+    msix: Option<MsixTable>,
 }
 
 #[derive(Debug)]
@@ -64,6 +91,10 @@ pub enum VirtioError {
     NoQueues,
     UnsupportedVersion,
     QueueTooLarge,
+    /// MSI-X programming failed — typically because the underlying
+    /// transport isn't PCIe (virtio-mmio uses a single legacy IRQ
+    /// line and has no MSI-X capability).
+    NoMsix,
 }
 
 /// A simple pool of DMA-safe buffers for virtio-blk request headers
@@ -119,6 +150,8 @@ impl VirtioBlkDevice {
             inner: IrqSafeSpinLock::new(None),
             queue_buf: None,
             pool: None,
+            irq_vector: None,
+            msix: None,
         }
     }
 
@@ -216,6 +249,58 @@ impl VirtioBlkDevice {
         Ok(())
     }
 
+    /// Bind the request virtqueue (queue 0) to a fresh MSI-X vector.
+    /// After this call, completion is observable via
+    /// `narf_interrupts::wait_for_irq(self.irq_vector.unwrap())` and
+    /// `submit_async` uses the IRQ path. The polled `poll()` keeps
+    /// working unchanged.
+    ///
+    /// Per VirtIO 1.2 §4.1.5.1.3, this writes `queue_select = 0`
+    /// followed by `queue_msix_vector = 0` on the modern PCI common
+    /// configuration so the device delivers the MSI-X it was
+    /// programmed with on used-ring activity for queue 0. The actual
+    /// programming is delegated to `crate::pci::enable_msix_queue`,
+    /// the canonical virtio MSI-X path shared with virtio-net etc.
+    ///
+    /// Returns `VirtioError::NoMsix` if the device lacks MSI-X (most
+    /// commonly: `device.kind` is `BusKind::VirtioMmio` rather than
+    /// PCIe). The legacy MMIO transport has no MSI-X capability and
+    /// callers should keep using the polled `poll()` drain.
+    ///
+    /// # Safety
+    /// Caller owns the device's BAR + cfg-space exclusively for the
+    /// duration of this call.
+    pub unsafe fn enable_msix(
+        &mut self,
+        cap: &Cap<BusDeviceCap, Write>,
+        device: &BusDevice,
+    ) -> Result<u8, VirtioError> {
+        // Discover the virtio-PCI capability list and map the
+        // common-cfg region. Both fail cleanly (and surface as
+        // `NoMsix`) if the device isn't a virtio-PCI transport.
+        // SAFETY: caller asserts exclusive ownership of cfg-space.
+        let caps = unsafe { discover(device) }.map_err(|_| VirtioError::NoMsix)?;
+        // SAFETY: caller-owned device; cap describes a real BAR slot.
+        let common = unsafe { map_cap(device, &caps.common) }.map_err(|_| VirtioError::NoMsix)?;
+        // SAFETY: caller-owned device; common is a freshly mapped
+        // BAR-backed region we exclusively reference through the local
+        // `common` binding.
+        let (vector, table) =
+            unsafe { crate::pci::enable_msix_queue(&common, cap, device, REQUEST_QUEUE) }
+                .map_err(map_msix_err)?;
+
+        // Install a no-op sync handler. `wait_for_irq` is driven by
+        // the dispatch table's `fire_count` bump that happens
+        // unconditionally inside `on_irq`, so the handler body can be
+        // empty — the async submit path drains the used ring after
+        // the await resolves.
+        narf_interrupts::install_handler(vector, blk_irq_noop);
+
+        self.irq_vector = Some(vector);
+        self.msix = Some(table);
+        Ok(vector)
+    }
+
     /// Poll for completions.
     pub fn poll(&self) {
         let mut inner_guard = self.inner.lock();
@@ -240,7 +325,58 @@ impl VirtioBlkDevice {
             }
         }
     }
+
+    /// Submit a request and await completion via MSI-X. The
+    /// `WaitForIrq` future is constructed BEFORE the queue-notify
+    /// doorbell write so a synchronously-delivered MSI-X (QEMU
+    /// completes virtio-blk reads inline on `kick`) cannot fire
+    /// between submit + await — the future's baseline snapshot of
+    /// `fire_count` happens in `wait_for_irq()`'s constructor before
+    /// the device sees the avail-ring update.
+    ///
+    /// Falls back to the polled completion path (just calls
+    /// `submit().await`, relying on an external pump to call
+    /// `poll()`) when MSI-X is not enabled.
+    pub async fn submit_async(&self, req: BlockRequest) -> BlockCompletion {
+        // Take a snapshot of the IRQ vector before submitting so the
+        // waiter exists with the correct baseline fire-count even if
+        // the device completes the request synchronously inside the
+        // doorbell write (QEMU virtio-blk does this for cached I/O).
+        // Pattern mirrors `drivers/nvme/src/lib.rs::submit_io_irq` and
+        // `drivers/virtio/src/blk_pci.rs::read_sector_irq_async`.
+        let waiter = self.irq_vector.map(narf_interrupts::wait_for_irq);
+        let fut = self.submit(req);
+        if let Some(w) = waiter {
+            // Await the IRQ first so we don't busy-poll the used
+            // ring. The handler is a no-op, but `on_irq` bumps
+            // `fire_count` which resolves `WaitForIrq`.
+            let _ = w.await;
+            // Drain the used ring + wake the per-request waker.
+            self.poll();
+        }
+        // The Future returned by `submit` is the source of truth for
+        // the completion. Whether MSI-X drove the wake or the caller's
+        // pump did, the future resolves once `poll()` removes the
+        // request from `requests`.
+        fut.await
+    }
 }
+
+fn map_msix_err(e: VirtioPciError) -> VirtioError {
+    match e {
+        VirtioPciError::NotPcie | VirtioPciError::NoVendorCap | VirtioPciError::NoCommonCfg => {
+            VirtioError::NoMsix
+        }
+        _ => VirtioError::NoMsix,
+    }
+}
+
+/// Sync ISR for the virtio-blk request virtqueue. Body intentionally
+/// empty: `narf_interrupts::dispatch::on_irq` increments `fire_count`
+/// before invoking this handler, which is the only thing
+/// `wait_for_irq.await` observes. The async submit path drains the
+/// used ring after the await resolves.
+fn blk_irq_noop() {}
 
 impl BlockDevice for VirtioBlkDevice {
     fn logical_block_size(&self) -> u32 {
