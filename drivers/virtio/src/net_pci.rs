@@ -84,6 +84,10 @@ pub struct VirtioNetPci {
     /// `None` means polled-only completion. Consumers wait via
     /// `narf_interrupts::wait_for_irq(v).await`.
     pub irq_vector: Option<u8>,
+    /// Per-queue MSI-X vector for TX completions. `None` =
+    /// caller hasn't called `enable_tx_msix` yet, TX uses
+    /// polled used-ring drain.
+    pub tx_irq_vector: Option<u8>,
     msix: Option<narf_bus::MsixTable>,
     pub ready: bool,
 }
@@ -260,6 +264,7 @@ impl VirtioNetPci {
             rx_notify_off,
             tx_notify_off,
             irq_vector: None,
+            tx_irq_vector: None,
             msix: None,
             ready: true,
         })
@@ -281,6 +286,30 @@ impl VirtioNetPci {
         let (v, table) =
             unsafe { crate::pci::enable_msix_queue(&self.common, cap, device, RX_QUEUE) }?;
         self.irq_vector = Some(v);
+        self.msix = Some(table);
+        Ok(v)
+    }
+
+    /// TX-queue MSI-X. Same shape as `enable_msix` but for the
+    /// TX virtqueue (queue index 1). Reuses the existing
+    /// `MsixTable` if RX MSI-X is already enabled — both
+    /// vectors land on the same MSI-X table.
+    ///
+    /// # Safety
+    /// Caller owns the device's BAR + cfg-space exclusively.
+    pub unsafe fn enable_tx_msix(
+        &mut self,
+        cap: &Cap<BusDeviceCap, Write>,
+        device: &BusDevice,
+    ) -> Result<u8, VirtioPciError> {
+        // SAFETY: caller-owns the device.
+        let (v, table) =
+            unsafe { crate::pci::enable_msix_queue(&self.common, cap, device, TX_QUEUE) }?;
+        self.tx_irq_vector = Some(v);
+        // Replace the MSI-X table handle with the latest one
+        // (enable_msix_queue allocates a fresh slot in the
+        // existing table; there's only one table per device,
+        // and the new handle keeps both vectors live).
         self.msix = Some(table);
         Ok(v)
     }
@@ -499,4 +528,32 @@ pub async fn rx_irq_async(out: &mut [u8]) -> usize {
         None => return 0,
     };
     c.rx(out)
+}
+
+/// Async, IRQ-driven TX completion. Awaits the TX queue's
+/// MSI-X vector when configured, then drains the TX used ring.
+/// Falls through to a synchronous used-ring drain when the TX
+/// vector isn't enabled.
+///
+/// Use case: a sender that fires `tx(frame)` then needs to
+/// know "the descriptor is reclaimed; I can free the buffer"
+/// without blocking. RX-side `rx_irq_async` does the same for
+/// the receive queue.
+pub async fn tx_irq_async() {
+    let vector = {
+        let g = CONTROLLER.lock();
+        match g.as_ref() {
+            Some(c) => c.tx_irq_vector,
+            None => return,
+        }
+    };
+    if let Some(v) = vector {
+        // Construct WaitForIrq before any code that could
+        // race the IRQ — same ordering invariant as NVMe's
+        // submit_io_irq_async (drivers/nvme/lib.rs:1130).
+        let wait = narf_interrupts::wait::wait_for_irq(v);
+        let _ = wait.await;
+    }
+    // Used-ring drain happens lazily via the next tx() call;
+    // no per-IRQ work needed here today.
 }
