@@ -1158,16 +1158,33 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // AP bring-up via INIT-SIPI-SIPI. Trampoline lands at
                 // phys 0x8000; APs enter `_ap_start_rust` after the
                 // 16→32→64 mode walk.
-                // SAFETY: memory + LAPIC + IDT/GDT all initialised
-                // above; identity map covers 0x8000.
-                let started = unsafe { x86_64::smp::start_aps() };
-                narf_memory::beacon::paint(16, 0x0040_FFFF); // TEAL: SMP up
-                let _ = writeln!(
-                    console::Writer,
-                    "  smp: started {} AP(s); {} CPU(s) online",
-                    started,
-                    narf_lib::smp::online_count()
-                );
+                //
+                // `nosmp` cmdline flag skips the AP-bringup path
+                // entirely. Useful for QEMU TCG (whose x2APIC ICR
+                // emulation is incomplete and #GPs the BSP
+                // mid-IPI), and as a fallback on real silicon
+                // when SMP isn't a critical-path requirement.
+                let nosmp = narf_boot::cmdline()
+                    .split_ascii_whitespace()
+                    .any(|t| t == "nosmp");
+                if nosmp {
+                    let _ = writeln!(
+                        console::Writer,
+                        "  smp: SKIPPED via nosmp cmdline (BSP only)"
+                    );
+                    narf_memory::beacon::paint(16, 0x00808080); // GRAY: SMP skipped
+                } else {
+                    // SAFETY: memory + LAPIC + IDT/GDT all initialised
+                    // above; identity map covers 0x8000.
+                    let started = unsafe { x86_64::smp::start_aps() };
+                    narf_memory::beacon::paint(16, 0x0040_FFFF); // TEAL: SMP up
+                    let _ = writeln!(
+                        console::Writer,
+                        "  smp: started {} AP(s); {} CPU(s) online",
+                        started,
+                        narf_lib::smp::online_count()
+                    );
+                }
             }
             #[cfg(target_arch = "aarch64")]
             {
