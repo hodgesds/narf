@@ -1080,34 +1080,21 @@ impl FsInstance for VirtiofsMount {
 #[derive(Debug)]
 struct VirtiofsRoot;
 
+// Stage-3 placeholder. The FUSE/DAX transport that backs virtiofs is
+// Stage-4 work; until then the root looks like an empty, read-only
+// directory rather than panicking on access. The `*_async` variants
+// inherit the trait default of `FsError::Unsupported`, which is the
+// correct shape for a callable-but-unbacked filesystem.
 impl DirOps for VirtiofsRoot {
     fn lookup(&self, _name: &str) -> Option<Arc<dyn FileOps>> {
-        unimplemented!("virtiofs lookup — Stage 4 wires FUSE/DAX")
-    }
-
-    fn lookup_async<'a>(&'a self, _name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
-        Box::pin(async move {
-            unimplemented!("virtiofs lookup_async — Stage 4 wires FUSE/DAX")
-        })
-    }
-
-    fn lookup_dir_async<'a>(&'a self, _name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
-        Box::pin(async move {
-            unimplemented!("virtiofs lookup_dir_async — Stage 4 wires FUSE/DAX")
-        })
+        None
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
-        unimplemented!("virtiofs iter — Stage 4 wires FUSE READDIR")
+        Box::new(core::iter::empty())
     }
 
     fn enumerate(&self, _cursor: usize, _max: usize) -> Vec<(String, FileType)> {
-        unimplemented!("virtiofs enumerate — Stage 4 wires FUSE READDIR")
-    }
-
-    fn enumerate_async<'a>(&'a self, _cursor: usize, _max: usize) -> FsFuture<'a, Vec<(String, FileType)>> {
-        Box::pin(async move {
-            unimplemented!("virtiofs enumerate_async — Stage 4 wires FUSE READDIR")
-        })
+        Vec::new()
     }
 }

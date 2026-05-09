@@ -155,6 +155,131 @@ impl FileOps for DevZero {
     }
 }
 
+/// `/dev/console` — typed-byte stream backed by `narf_input`.
+///
+/// Reads pull pending key-press events off `narf_input`'s global
+/// ring, translate them into ASCII bytes (printable keys, Enter
+/// → `\n`, Backspace → `0x7F`), and copy into the user buffer.
+/// Releases / modifier keys / non-translatable codes are
+/// dropped silently. Returns 0 immediately when nothing is queued
+/// (non-blocking semantics — callers that want blocking reads
+/// poll-and-yield in user space until the next key arrives).
+///
+/// Writes go to the kernel console (UART + framebuffer if
+/// installed) so user code can `write(open("/dev/console"))` for
+/// stdout-equivalent output without an explicit fd-table lookup
+/// against fd 1/2.
+struct DevConsole;
+
+/// Translate one `KeyCode` (with live modifier state) into one
+/// printable ASCII byte. Returns `None` for non-translatable keys
+/// (modifiers, function keys, navigation cluster). The shift map
+/// matches a US-QWERTY layout — internationalisation is a follow-up
+/// (real systems consult `/etc/keymaps`).
+fn key_to_ascii(code: narf_input::KeyCode, mods: narf_input::Modifiers) -> Option<u8> {
+    use narf_input::{KeyCode as K, Modifiers as M};
+    let shift = mods.contains(M::SHIFT) ^ mods.contains(M::CAPS_LOCK);
+    let base = match code {
+        K::A => b'a', K::B => b'b', K::C => b'c', K::D => b'd', K::E => b'e',
+        K::F => b'f', K::G => b'g', K::H => b'h', K::I => b'i', K::J => b'j',
+        K::K => b'k', K::L => b'l', K::M => b'm', K::N => b'n', K::O => b'o',
+        K::P => b'p', K::Q => b'q', K::R => b'r', K::S => b's', K::T => b't',
+        K::U => b'u', K::V => b'v', K::W => b'w', K::X => b'x', K::Y => b'y',
+        K::Z => b'z',
+        K::Key0 => return Some(if shift { b')' } else { b'0' }),
+        K::Key1 => return Some(if shift { b'!' } else { b'1' }),
+        K::Key2 => return Some(if shift { b'@' } else { b'2' }),
+        K::Key3 => return Some(if shift { b'#' } else { b'3' }),
+        K::Key4 => return Some(if shift { b'$' } else { b'4' }),
+        K::Key5 => return Some(if shift { b'%' } else { b'5' }),
+        K::Key6 => return Some(if shift { b'^' } else { b'6' }),
+        K::Key7 => return Some(if shift { b'&' } else { b'7' }),
+        K::Key8 => return Some(if shift { b'*' } else { b'8' }),
+        K::Key9 => return Some(if shift { b'(' } else { b'9' }),
+        K::Space => return Some(b' '),
+        K::Enter | K::KpEnter => return Some(b'\n'),
+        K::Tab => return Some(b'\t'),
+        K::Backspace => return Some(0x7F),
+        K::Escape => return Some(0x1B),
+        K::Minus => return Some(if shift { b'_' } else { b'-' }),
+        K::Equal => return Some(if shift { b'+' } else { b'=' }),
+        K::LeftBrace => return Some(if shift { b'{' } else { b'[' }),
+        K::RightBrace => return Some(if shift { b'}' } else { b']' }),
+        K::Backslash => return Some(if shift { b'|' } else { b'\\' }),
+        K::Semicolon => return Some(if shift { b':' } else { b';' }),
+        K::Apostrophe => return Some(if shift { b'"' } else { b'\'' }),
+        K::Grave => return Some(if shift { b'~' } else { b'`' }),
+        K::Comma => return Some(if shift { b'<' } else { b',' }),
+        K::Dot => return Some(if shift { b'>' } else { b'.' }),
+        K::Slash => return Some(if shift { b'?' } else { b'/' }),
+        _ => return None,
+    };
+    Some(if shift { base.to_ascii_uppercase() } else { base })
+}
+
+impl FileOps for DevConsole {
+    fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        // Pull events off the global input ring, translating each
+        // key-press to a byte. Stop when the user buffer is full
+        // or the ring runs dry. Non-blocking — callers wanting
+        // blocking behaviour loop in user space until n>0.
+        let mut written = 0usize;
+        while written < buf.len() {
+            let ev = match narf_input::pop_global() {
+                Some(e) => e,
+                None => break,
+            };
+            if let narf_input::InputEvent::Key(k) = ev {
+                if !k.pressed {
+                    continue;
+                }
+                if let Some(b) = key_to_ascii(k.code, k.modifiers) {
+                    buf[written] = b;
+                    written += 1;
+                }
+            }
+        }
+        Box::pin(async move { Ok(written) })
+    }
+
+    fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+        // Same path as `sys_write` to fd 1/2: forward to the kernel
+        // console (UART + framebuffer hook if installed). Treat
+        // non-UTF-8 input as best-effort lossy by way of
+        // `from_utf8_lossy` — `write_str` is the only public sink.
+        let n = buf.len();
+        if let Ok(s) = core::str::from_utf8(buf) {
+            narf_console::write_str(s);
+        } else {
+            // Slow path: emit bytes one-by-one as `?` substitutes
+            // for invalid UTF-8 — matches the standard library's
+            // handling and keeps the byte count truthful.
+            for &b in buf {
+                if b.is_ascii() {
+                    narf_console::write_str(unsafe {
+                        core::str::from_utf8_unchecked(core::slice::from_ref(&b))
+                    });
+                } else {
+                    narf_console::write_str("?");
+                }
+            }
+        }
+        Box::pin(async move { Ok(n) })
+    }
+
+    fn stat(&self) -> Stat {
+        Stat {
+            size: 0,
+            blocks: 0,
+            mode: Mode {
+                file_type: FileType::Special,
+                perms: 0o666,
+            },
+            mtime_cycles: 0,
+        }
+    }
+}
+
 /// `DevFs` root directory — exposes `null` and `zero` as fixed
 /// children. No mutation surface (the trait defaults return
 /// `Unsupported` on every override-able method).
@@ -167,6 +292,9 @@ impl DirOps for DevDir {
             "zero" => Some(Arc::new(DevZero) as Arc<dyn FileOps>),
             "random" => Some(Arc::new(DevRandom) as Arc<dyn FileOps>),
             "urandom" => Some(Arc::new(DevRandom) as Arc<dyn FileOps>),
+            "console" | "tty" | "tty0" => {
+                Some(Arc::new(DevConsole) as Arc<dyn FileOps>)
+            }
             _ => None,
         }
     }
@@ -187,22 +315,13 @@ impl DirOps for DevDir {
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
         // Names are `&'static str` literals — fine for DirEntry.
         const ENTRIES: &[DirEntry] = &[
-            DirEntry {
-                name: "null",
-                file_type: FileType::Special,
-            },
-            DirEntry {
-                name: "zero",
-                file_type: FileType::Special,
-            },
-            DirEntry {
-                name: "random",
-                file_type: FileType::Special,
-            },
-            DirEntry {
-                name: "urandom",
-                file_type: FileType::Special,
-            },
+            DirEntry { name: "null", file_type: FileType::Special },
+            DirEntry { name: "zero", file_type: FileType::Special },
+            DirEntry { name: "random", file_type: FileType::Special },
+            DirEntry { name: "urandom", file_type: FileType::Special },
+            DirEntry { name: "console", file_type: FileType::Special },
+            DirEntry { name: "tty", file_type: FileType::Special },
+            DirEntry { name: "tty0", file_type: FileType::Special },
         ];
         Box::new(ENTRIES.iter().copied())
     }
@@ -213,6 +332,9 @@ impl DirOps for DevDir {
             ("zero", FileType::Special),
             ("random", FileType::Special),
             ("urandom", FileType::Special),
+            ("console", FileType::Special),
+            ("tty", FileType::Special),
+            ("tty0", FileType::Special),
         ];
         entries
             .iter()

@@ -83,7 +83,7 @@ fn smoke_initramfs_pvh_module_parser() -> TestResult {
     // reading them via `read_volatile` works under the kernel
     // identity map (or here, since we never dereference them —
     // the parser only walks the modlist + cmdline string).
-    use narf_boot::x86_64::multiboot2::initramfs_module;
+    use narf_boot::x86_64::pvh::initramfs_module;
 
     // Layout the modlist-cmdline as one byte slice; the parser
     // reads cmdline_paddr as a pointer to NUL-terminated bytes.
@@ -139,7 +139,7 @@ kernel_test_in!("initramfs", smoke_initramfs_pvh_module_parser);
 fn smoke_initramfs_pvh_module_parser_no_match() -> TestResult {
     // Same shape as the prior smoke but with a non-matching
     // cmdline ("vmlinux"). The parser must return `None`.
-    use narf_boot::x86_64::multiboot2::initramfs_module;
+    use narf_boot::x86_64::pvh::initramfs_module;
     let cmdline: &'static [u8] = alloc::boxed::Box::leak(b"vmlinux\0".to_vec().into_boxed_slice());
     let modlist_bytes = {
         let mut v = alloc::vec::Vec::with_capacity(32);

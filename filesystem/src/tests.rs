@@ -538,6 +538,89 @@ fn smoke_filesystem_devfs_random_urandom() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_filesystem_devfs_random_urandom);
 
+fn smoke_filesystem_devfs_console_keystrokes() -> TestResult {
+    // Push a sequence of `KeyEvent`s onto `narf_input`'s global ring,
+    // then read `/dev/console` and verify each press surfaces as the
+    // expected ASCII byte. Exercises the full keyboard-→-VFS path
+    // without depending on a live xHCI controller.
+    use core::pin::Pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use crate::{bootstrap_mount_authority, registry, DevFs};
+    use narf_input::{init_global_ring, push_global, InputEvent, KeyCode, KeyEvent, Modifiers};
+
+    fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
+        fn raw_waker() -> RawWaker {
+            unsafe fn no_clone(_: *const ()) -> RawWaker { raw_waker() }
+            unsafe fn no_op(_: *const ()) {}
+            const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
+            RawWaker::new(core::ptr::null(), &VTAB)
+        }
+        let waker = unsafe { Waker::from_raw(raw_waker()) };
+        let mut cx = Context::from_waker(&waker);
+        let pinned = unsafe { Pin::new_unchecked(&mut fut) };
+        match pinned.poll(&mut cx) {
+            Poll::Ready(v) => Some(v),
+            Poll::Pending => None,
+        }
+    }
+
+    // Make sure the ring exists. Idempotent — production code lights
+    // it up at boot via `narf_input::register_initcalls`.
+    init_global_ring(64);
+
+    // Drain anything previously queued (other smokes / boot-time
+    // events) so the assert below sees only what we push here.
+    while narf_input::pop_global().is_some() {}
+
+    let auth = bootstrap_mount_authority();
+    // /dev may already be mounted by an earlier smoke; mount_default
+    // returns Busy in that case and we ignore — the existing mount
+    // is what we want.
+    let _ = registry().mount(&auth, "/dev/console-test-mount", DevFs::new());
+    let console = registry()
+        .resolve_absolute("/dev/console-test-mount/console", |fs, rel| {
+            crate::resolve(fs.root(), rel).ok()
+        })
+        .flatten();
+    let console = match console {
+        Some(c) => c,
+        None => return TestResult::Fail("resolve /dev/console failed"),
+    };
+
+    // Push: 'h', 'I' (shift held), '1', '\n', release of 'h'.
+    let mods_none = Modifiers::EMPTY;
+    let mods_shift = Modifiers::SHIFT;
+    push_global(InputEvent::Key(KeyEvent { code: KeyCode::H, pressed: true, modifiers: mods_none }));
+    push_global(InputEvent::Key(KeyEvent { code: KeyCode::I, pressed: true, modifiers: mods_shift }));
+    push_global(InputEvent::Key(KeyEvent { code: KeyCode::Key1, pressed: true, modifiers: mods_none }));
+    push_global(InputEvent::Key(KeyEvent { code: KeyCode::Enter, pressed: true, modifiers: mods_none }));
+    push_global(InputEvent::Key(KeyEvent { code: KeyCode::H, pressed: false, modifiers: mods_none }));
+
+    let mut buf = [0u8; 16];
+    let n = match poll_once(console.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("/dev/console read returned Pending or Err"),
+    };
+    if n != 4 {
+        return TestResult::Fail("expected 4 translated bytes (h, I, 1, \\n)");
+    }
+    if &buf[..n] != b"hI1\n" {
+        return TestResult::Fail("translation produced unexpected bytes");
+    }
+
+    // Second read with empty ring returns 0 (non-blocking).
+    let mut buf = [0u8; 4];
+    let n = match poll_once(console.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("second /dev/console read returned Pending or Err"),
+    };
+    if n != 0 {
+        return TestResult::Fail("empty ring should return 0 bytes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_filesystem_devfs_console_keystrokes);
+
 fn smoke_filesystem_devfs_mount_default_idempotent() -> TestResult {
     use crate::{mount_devfs_default, registry};
 

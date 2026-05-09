@@ -19,6 +19,8 @@ narf-block        = { path = "../block" }
 narf-io           = { path = "../io" }
 narf-scheduler    = { path = "../scheduler" }
 narf-time         = { path = "../time" }
+narf-input        = { path = "../input" }
+narf-console      = { path = "../console" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 
 [lints]

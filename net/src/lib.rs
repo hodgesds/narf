@@ -534,10 +534,10 @@ pub mod virtio_net {
             false
         } // Until Stage 4 binds the device.
         fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
-            unimplemented!("virtio-net rx_ring: Stage 4 binds drivers/virtio/")
+            &self.rx
         }
         fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
-            unimplemented!("virtio-net tx_ring: Stage 4 binds drivers/virtio/")
+            &self.tx
         }
     }
 }
