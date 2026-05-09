@@ -77,10 +77,14 @@ unsafe fn read_byte(fd: i32) -> Option<u8> {
         }
         // n == 0 → no input queued. Yield via a short sleep so
         // other tasks (the keyboard pump, the scheduler tick) get
-        // CPU. 1 second matches `libc::sleep`'s coarse resolution
-        // today; refining to ~10 ms is a follow-up.
+        // CPU. `libc::sleep(0)` is a no-op (sys_sleep early-returns
+        // on ns==0), which would hot-spin posix_read and burn the
+        // kernel heap inside whatever per-read allocation devfs
+        // does. usleep(10_000) = 10 ms gives a reasonable typing
+        // latency while letting the executor round-robin other
+        // tasks, including init's deadline-park sleep.
         unsafe {
-            libc::sleep(0);
+            libc::usleep(10_000);
         }
     }
 }

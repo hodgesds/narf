@@ -31,7 +31,7 @@
 #![allow(dead_code)]
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub use narf_scheduler::UserState;
@@ -72,6 +72,14 @@ pub enum UserExit {
 /// `JmpBuf` (rbx/rbp/r12-r15/rsp/rip = 64 bytes) or an aarch64
 /// equivalent without forcing this module to import either.
 /// Callers cast as appropriate.
+///
+/// `sleep_deadline_ns` is the per-task absolute monotonic-ns
+/// deadline used by `sys_sleep`'s polling-future path. `0` means
+/// "not sleeping". Set by the syscall handler before it longjmps
+/// back; consulted by `UserTaskFuture::poll` before any user-mode
+/// re-entry — if `now < deadline`, the future returns `Pending`
+/// + `wake_by_ref` without entering user mode, letting the
+/// executor round-robin other tasks.
 #[repr(C)]
 pub struct UserTaskCtx {
     pub state: UnsafeCell<UserState>,
@@ -79,6 +87,12 @@ pub struct UserTaskCtx {
     /// Cell used by the trap handler to signal *why* it longjmp'd.
     /// Polling routine reads this after setjmp returns non-zero.
     pub exit_reason: UnsafeCell<u32>,
+    /// Absolute monotonic-ns deadline for `sys_sleep`. `0` means
+    /// not sleeping. AtomicU64 (rather than UnsafeCell<u64>) so a
+    /// future SMP rework — where the syscall handler and poller
+    /// might briefly share visibility across cores — keeps the
+    /// same shape.
+    pub sleep_deadline_ns: AtomicU64,
 }
 
 // SAFETY: cells are accessed only from the polling routine and
@@ -95,6 +109,7 @@ impl UserTaskCtx {
             state: UnsafeCell::new(UserState::default()),
             arch_jmp_buf: UnsafeCell::new([0; 8]),
             exit_reason: UnsafeCell::new(0),
+            sleep_deadline_ns: AtomicU64::new(0),
         }
     }
 }
@@ -451,6 +466,42 @@ impl core::future::Future for UserTaskFuture {
             return core::task::Poll::Ready(());
         }
 
+        // sys_sleep parks the task by stashing an absolute deadline
+        // here and longjmp'ing back. Until the deadline fires,
+        // re-poll without re-entering user mode — that gives the
+        // executor a chance to round-robin other ready tasks
+        // (kernel async work, other user tasks) instead of
+        // burning the CPU inside an iretq loop.
+        //
+        // Throttle: pure `wake_by_ref()` re-poll burns the executor
+        // hot — every round visits every slot, so a 5-second user
+        // sleep in a tight `puts+sleep` loop generates millions of
+        // poll round-trips and surfaced as a heap OOM in practice
+        // (some allocator path on the way to/from each visit).
+        // Busy-wait a small fixed chunk here, ticking the sleep
+        // pumps so kernel async tasks still make forward progress,
+        // then return Pending. The scale is tuned for ~1 ms per
+        // park iteration: short enough not to perturb other tasks,
+        // long enough to keep heap pressure flat.
+        let deadline = this.ctx.sleep_deadline_ns.load(Ordering::Acquire);
+        if deadline != 0 {
+            let now = narf_scheduler::narf_time::monotonic_ns();
+            if now < deadline {
+                const PARK_CHUNK_NS: u64 = 1_000_000;
+                let chunk_end = now.saturating_add(PARK_CHUNK_NS).min(deadline);
+                while narf_scheduler::narf_time::monotonic_ns() < chunk_end {
+                    crate::handlers::sleep_pumps::run();
+                    core::hint::spin_loop();
+                }
+                cx.waker().wake_by_ref();
+                return core::task::Poll::Pending;
+            }
+            // Deadline reached — clear so the next sys_sleep
+            // call doesn't see stale state, then fall through
+            // to the normal resume path.
+            this.ctx.sleep_deadline_ns.store(0, Ordering::Release);
+        }
+
         // Snapshot kernel CR3 once, on the first poll. Subsequent
         // polls re-activate the user AS, so we always land back on
         // the kernel root via the trap-back / cleanup path.
@@ -685,6 +736,24 @@ impl core::future::Future for UserTaskFuture {
 
         if this.state == TaskState::Exited {
             return core::task::Poll::Ready(());
+        }
+
+        // sys_sleep park-via-deadline + throttle (mirrors x86_64 —
+        // see the sibling poll body for the rationale).
+        let deadline = this.ctx.sleep_deadline_ns.load(Ordering::Acquire);
+        if deadline != 0 {
+            let now = narf_scheduler::narf_time::monotonic_ns();
+            if now < deadline {
+                const PARK_CHUNK_NS: u64 = 1_000_000;
+                let chunk_end = now.saturating_add(PARK_CHUNK_NS).min(deadline);
+                while narf_scheduler::narf_time::monotonic_ns() < chunk_end {
+                    crate::handlers::sleep_pumps::run();
+                    core::hint::spin_loop();
+                }
+                cx.waker().wake_by_ref();
+                return core::task::Poll::Pending;
+            }
+            this.ctx.sleep_deadline_ns.store(0, Ordering::Release);
         }
 
         // Snapshot kernel TTBR0_EL1 once. Subsequent polls land

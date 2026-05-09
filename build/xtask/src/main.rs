@@ -897,7 +897,18 @@ fn main() -> Result<()> {
             run_cmd(&args)
         }
         Cmd::Image(args) => image_cmd(&args),
-        Cmd::IsoBoot(args) => iso_boot_cmd(&args),
+        Cmd::IsoBoot(mut args) => {
+            // Default-on boot-init so the ISO actually spawns the
+            // userspace init + shell tasks; without it the kernel
+            // halts at the async-demo exit gate before reaching
+            // boot_userspace_init().
+            if args.features.is_empty() {
+                args.features = "boot-init".into();
+            } else if !args.features.contains("boot-init") {
+                args.features.push_str(",boot-init");
+            }
+            iso_boot_cmd(&args)
+        }
         Cmd::Demo(mut args) => {
             if args.features.is_empty() {
                 args.features = "kernel-test,user-mode-testbin".into();

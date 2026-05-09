@@ -4344,27 +4344,24 @@ fn sys_noop_ok(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(0));
 }
 
-// ── Sleep — spin-wait until monotonic_ns advances by arg0 ─────────
+// ── Sleep ─────────────────────────────────────────────────────────
 //
 // `Syscall::Sleep` carries the requested sleep in nanoseconds in
-// `arg0`. Stage-4 first cut: spin on `core::hint::spin_loop()` until
-// the kernel's monotonic clock has advanced by at least the requested
-// span. Why a spin and not a Future:
+// `arg0`. Two paths:
 //
-//   - Syscall handlers run inside a CPU trap, not as a scheduler
-//     task, so there's no `.await` we can use to yield. The trap
-//     context has a single linear flow ending in `iretq` back to user.
-//   - A real `nanosleep` would suspend the calling task on a timer
-//     wheel and let the scheduler park the CPU. That requires the
-//     polling-future "trap-as-future" model from c85cb9f to be live
-//     for arbitrary user tasks, not just the testbin/validate
-//     trampolines. Until that lands every sleep handler fundamentally
-//     blocks the calling CPU.
-//
-// The handler is correct for now (it does sleep for the requested
-// duration) but pessimal for throughput. The follow-up is to route
-// Sleep through `narf_time::sleep_cycles` once every user task is
-// itself a polling future.
+//   1. Polling-future path (the normal case for `UserTaskFuture`-
+//      driven user tasks): stash an absolute deadline on the
+//      current `UserTaskCtx`, mark the saved RAX = 0, save the
+//      user state, and longjmp back into the polling routine
+//      with `EXIT_REASON_YIELDED`. The next poll observes the
+//      deadline, returns `Pending` until it expires, and only
+//      then re-enters user mode at the post-syscall instruction.
+//      This frees the executor to round-robin other ready tasks
+//      while the sleeper is parked.
+//   2. Fallback busy-wait (test trampolines / pre-polling-future
+//      contexts): spin until monotonic_ns advances past the
+//      deadline, ticking registered sleep_pumps so background
+//      kernel work makes forward progress.
 // ── GetRandom — arg0=buf, arg1=len, arg2=flags(ignored) ─────────────
 //
 // Fill the caller's user-mode buffer with random bytes. Stage-4
@@ -4457,8 +4454,36 @@ fn sys_sleep(ctx: &mut dyn TrapContext) {
     let start = narf_scheduler::narf_time::monotonic_ns();
     // Saturating add: u64 overflow on `start + ns` is structurally
     // impossible at realistic clock rates, but the saturate keeps
-    // the loop bound tight against pathological inputs.
+    // the deadline tight against pathological inputs.
     let deadline = start.saturating_add(ns);
+
+    // Polling-future path: stash the deadline on the current
+    // UserTaskCtx, bake the eventual return value (Ok(0)) into the
+    // saved RAX so the user reads it on resume, save the user
+    // state, then longjmp back via the yield hook. The next
+    // `UserTaskFuture::poll` consults the deadline and parks the
+    // task without re-entering user mode until it expires.
+    if let (Some(uctx), Some(hook)) = (
+        crate::user_task::current_user_task(),
+        crate::user_task::yield_hook(),
+    ) {
+        ctx.set_return(SyscallReturn::ok(0));
+        // SAFETY: uctx is valid for the lifetime of the polling
+        // routine (its caller, on the same CPU) which holds it
+        // pinned. We're about to never return.
+        unsafe {
+            let uc = &*uctx;
+            uc.sleep_deadline_ns
+                .store(deadline, core::sync::atomic::Ordering::Release);
+            ctx.save_user_state(uc.state.get() as *mut u8);
+            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            hook(uctx);
+        }
+        // unreachable
+    }
+
+    // Fallback busy-wait (no polling future installed — test
+    // trampolines, sub-polling test harnesses, etc.).
     while narf_scheduler::narf_time::monotonic_ns() < deadline {
         sleep_pumps::run();
         core::hint::spin_loop();
