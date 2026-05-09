@@ -73,23 +73,66 @@ pub const HIGHER_HALF_PDPT_INDEX: usize = 510;
 /// - Every address range the kernel will access after this call must
 ///   be covered by the identity map being built (currently the low
 ///   4 GiB + the high-half -2 GiB window).
+/// Static-BSS storage for the four early page tables.
+///
+/// The frame allocator can return frames anywhere in usable RAM,
+/// including above 4 GiB on machines where QEMU/UEFI splits RAM
+/// around the PCI hole (q35 with -m ≥ 4G puts ~1 GiB of RAM at
+/// 0x100000000+; real Zen2 laptops with 16 GiB do the same).
+/// The boot.S identity map only covers 0..4 GiB, so a
+/// high-frame return would page-fault on the first
+/// `zero_at`/`write_identity` call.
+///
+/// Putting the tables in BSS guarantees they live within the
+/// kernel image's load region (0x1000000+, well under 4 GiB)
+/// and are therefore always reachable. Each `PageTable` is
+/// `#[repr(C, align(4096))]` so the BSS layout is correct
+/// for direct CR3 use.
+#[repr(C, align(4096))]
+struct EarlyPageTables {
+    pml4: PageTable,
+    pdpt_lo: PageTable,
+    pdpt_hi_mmio: PageTable,
+    pdpt_hi: PageTable,
+}
+
+const ZERO_ENTRIES: [PageTableEntry; 512] = [PageTableEntry::EMPTY; 512];
+static mut EARLY_PAGE_TABLES: EarlyPageTables = EarlyPageTables {
+    pml4: PageTable { entries: ZERO_ENTRIES },
+    pdpt_lo: PageTable { entries: ZERO_ENTRIES },
+    pdpt_hi_mmio: PageTable { entries: ZERO_ENTRIES },
+    pdpt_hi: PageTable { entries: ZERO_ENTRIES },
+};
+
 pub unsafe fn init_mmu() -> Result<PhysAddr, MmuError> {
-    // Step 1: allocate + zero the page tables we'll populate:
-    // - PML4 root
-    // - PDPT for low identity (PML4[0]: virt 0 → phys 0, 4 GiB)
-    // - PDPT for high-MMIO identity (PML4[1]: virt 512 GiB → phys
-    //   512 GiB, 512 GiB). Lets us reach 64-bit BARs that UEFI
-    //   firmware places between 512 GiB and 1 TiB without
-    //   colliding with low-half test virtual addresses.
-    // - PDPT for the high-half kernel window (PML4[511])
-    let pml4_frame = alloc_frame()?;
-    let pdpt_lo_frame = alloc_frame()?;
-    let pdpt_hi_mmio_frame = alloc_frame()?;
-    let pdpt_hi_frame = alloc_frame()?;
-    let pml4_addr = pml4_frame.start_address();
-    let pdpt_lo_addr = pdpt_lo_frame.start_address();
-    let pdpt_hi_mmio_addr = pdpt_hi_mmio_frame.start_address();
-    let pdpt_hi_addr = pdpt_hi_frame.start_address();
+    use crate::beacon;
+    // Use BSS-resident page tables (see `EarlyPageTables` doc) so
+    // the four storage buffers are guaranteed to be in the
+    // boot.S 4-GiB identity-mapped window. Asking the frame
+    // allocator could return a frame above 4 GiB on machines
+    // with the PCI-hole RAM split, which would fault on the
+    // first write.
+    //
+    // The address-of yields a HIGH-HALF VIRTUAL address (kernel
+    // is linked at `KERNEL_VIRT_BASE = 0xFFFFFFFF80000000`).
+    // CR3 + PageTableEntry::new both want PHYSICAL addresses, so
+    // subtract the kernel virt base to convert. The boot.S
+    // higher-half mapping makes `phys = virt - 0xFFFFFFFF80000000`
+    // exact for kernel-image symbols.
+    //
+    // SAFETY: single-threaded boot path; this is the only writer
+    // to `EARLY_PAGE_TABLES`.
+    const KERNEL_VIRT_BASE: u64 = 0xFFFF_FFFF_8000_0000;
+    let tables_ptr = unsafe { core::ptr::addr_of_mut!(EARLY_PAGE_TABLES) };
+    let pml4_virt = unsafe { core::ptr::addr_of_mut!((*tables_ptr).pml4) } as u64;
+    let pdpt_lo_virt = unsafe { core::ptr::addr_of_mut!((*tables_ptr).pdpt_lo) } as u64;
+    let pdpt_hi_mmio_virt = unsafe { core::ptr::addr_of_mut!((*tables_ptr).pdpt_hi_mmio) } as u64;
+    let pdpt_hi_virt = unsafe { core::ptr::addr_of_mut!((*tables_ptr).pdpt_hi) } as u64;
+    let pml4_addr = PhysAddr::new(pml4_virt.wrapping_sub(KERNEL_VIRT_BASE));
+    let pdpt_lo_addr = PhysAddr::new(pdpt_lo_virt.wrapping_sub(KERNEL_VIRT_BASE));
+    let pdpt_hi_mmio_addr = PhysAddr::new(pdpt_hi_mmio_virt.wrapping_sub(KERNEL_VIRT_BASE));
+    let pdpt_hi_addr = PhysAddr::new(pdpt_hi_virt.wrapping_sub(KERNEL_VIRT_BASE));
+    beacon::paint(10, 0x0080_FFFF); // dim cyan: page-table addresses fixed
 
     // These frames came from the allocator and are identity-mapped in
     // the boot.S page tables (the low 1 GiB huge page covers them),
@@ -98,6 +141,7 @@ pub unsafe fn init_mmu() -> Result<PhysAddr, MmuError> {
     PageTable::zero_at(pdpt_lo_addr.as_mut_ptr::<PageTable>());
     PageTable::zero_at(pdpt_hi_mmio_addr.as_mut_ptr::<PageTable>());
     PageTable::zero_at(pdpt_hi_addr.as_mut_ptr::<PageTable>());
+    beacon::paint(11, 0x0080_FF80); // dim lime: zero_at done
 
     // Step 2: populate.
     let flags_ptr = PtFlags::PRESENT | PtFlags::WRITABLE;
@@ -114,6 +158,7 @@ pub unsafe fn init_mmu() -> Result<PhysAddr, MmuError> {
             let slot = PhysAddr::new(pdpt_lo_addr.raw() + gib * 8);
             write_identity::<PageTableEntry>(slot, entry);
         }
+        beacon::paint(12, 0x00FF_FF80); // dim yellow: low identity done
 
         // High-MMIO identity (PML4[1]: virt 512 GiB ≤ V < 1 TiB →
         // phys 512 GiB ≤ P < 1 TiB). Covers UEFI-assigned 64-bit
@@ -141,6 +186,7 @@ pub unsafe fn init_mmu() -> Result<PhysAddr, MmuError> {
             let slot = PhysAddr::new(pdpt_hi_mmio_addr.raw() + gib * 8);
             write_identity::<PageTableEntry>(slot, entry);
         }
+        beacon::paint(13, 0x00FF_8080); // dim orange: hi-MMIO done
 
         // High-half PML4[511] + PDPT[510] → phys 0 (1 GiB huge page).
         // Virtual 0xFFFF_FFFF_8000_0000 + x maps to physical 0 + x.
@@ -152,6 +198,7 @@ pub unsafe fn init_mmu() -> Result<PhysAddr, MmuError> {
         let hh_slot = PhysAddr::new(pdpt_hi_addr.raw() + (HIGHER_HALF_PDPT_INDEX as u64) * 8);
         write_identity::<PageTableEntry>(hh_slot, hh_entry);
     }
+    beacon::paint(14, 0x00FF_80FF); // dim magenta: higher-half done, about to CR3
 
     // Step 3 from console/ §3.1: *caller* prints the handoff line
     // before calling us so a panic across the CR3 swap is visible.
