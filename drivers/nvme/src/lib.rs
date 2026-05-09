@@ -951,12 +951,21 @@ impl Controller {
             return Err(NvmeError::OutOfRange);
         }
 
-        // Submit + ring doorbell + snapshot baseline. All
-        // self-borrows released at the closing brace.
-        let baseline = {
+        // CRITICAL ORDERING: construct the WaitForIrq future
+        // BEFORE writing the SQ doorbell. WaitForIrq snapshots
+        // fire_count at construction (interrupts/wait.rs:31).
+        // If we doorbell first then construct the future, an
+        // MSI that lands in the ~microsecond window in between
+        // bumps fire_count, the future captures the post-IRQ
+        // value as its baseline, and the await parks forever
+        // waiting for a second MSI that never comes.
+        let wait = narf_interrupts::wait_for_irq(v);
+
+        // Submit + ring doorbell. All self-borrows released at
+        // the closing brace.
+        {
             let io = self.io.as_mut().ok_or(NvmeError::NoIoQueue)?;
             let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
-            let baseline = narf_interrupts::fire_count(v);
             let mut sqe = Sqe::zero();
             sqe.cdw0 = opcode as u32;
             sqe.nsid = DEFAULT_NSID;
@@ -976,15 +985,12 @@ impl Controller {
             unsafe {
                 bar0.write32(io.sq_db_off(), io.sq_tail as u32);
             }
-            baseline
-        };
+        }
 
-        // Park until the MSI-X completion fires. fire_count
-        // increments inside dispatch::on_irq before the waker
-        // runs, so a same-CPU race that fires the IRQ between
-        // submit-doorbell and .await is handled by the
-        // baseline check inside wait_for_irq's poll body.
-        let _ = narf_interrupts::wait_for_irq(v).await;
+        // Park until the MSI-X completion fires. The first
+        // poll returns Ready if MSI fired between the future's
+        // construction (above, pre-doorbell) and now.
+        let _ = wait.await;
 
         // Drain the CQE + ring CQ-head doorbell.
         let io = self.io.as_mut().ok_or(NvmeError::NoIoQueue)?;
@@ -1008,10 +1014,6 @@ impl Controller {
                 status: nvme_status,
             });
         }
-        // Ignore unused baseline check — wait_for_irq already
-        // honours its own baseline snapshot to handle the
-        // submit-fires-before-await race.
-        let _ = baseline;
         Ok(())
     }
 
