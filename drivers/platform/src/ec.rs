@@ -343,6 +343,40 @@ pub fn __test_reset_sci() {
     EC_GPE_BIT.store(u64::MAX, Ordering::Release);
 }
 
+/// Test helper: invoke the per-GPE dispatcher without going through
+/// the GPE block read (which needs live MMIO/PIO). Subscribers see
+/// the same `PlatformEvent::UnclaimedGpe` / `EcQuery` notifications
+/// the real path would generate; AML evaluation is genuine — when
+/// the namespace is loaded with `\\_GPE._L42` the test sees that
+/// method evaluated, otherwise the unclaimed-GPE notification fires.
+#[cfg(target_arch = "x86_64")]
+#[doc(hidden)]
+pub fn __test_handle_gpe(gpe_num: u32) {
+    handle_gpe(gpe_num);
+}
+
+/// Test helper: walk a synthetic status-byte array as if the real
+/// GPE block had latched these bits. Dispatches each set bit
+/// through `handle_gpe`. Does NOT attempt to clear the status
+/// (no real HW). Useful for verifying the bit-walk arithmetic +
+/// fan-out to subscribers.
+#[cfg(target_arch = "x86_64")]
+#[doc(hidden)]
+pub fn __test_dispatch_synthetic_block(base_gsi: u32, status: &[u8]) {
+    for (byte_idx, byte) in status.iter().enumerate() {
+        if *byte == 0 {
+            continue;
+        }
+        for bit in 0..8 {
+            if byte & (1 << bit) == 0 {
+                continue;
+            }
+            let gpe_num = base_gsi + (byte_idx as u32 * 8) + bit;
+            handle_gpe(gpe_num);
+        }
+    }
+}
+
 /// Wire the SCI dispatcher to the FADT-supplied SCI_INT line.
 ///
 /// Spec citations:

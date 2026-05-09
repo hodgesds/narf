@@ -96,6 +96,83 @@ kernel_test_in!(
     smoke_ec_sci_dispatch_notifies_subscribers
 );
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_ec_handle_gpe_unclaimed_notifies() -> TestResult {
+    use crate::ec;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    ec::__test_reset_sci();
+    let last = Arc::new(AtomicU32::new(0));
+    let l = last.clone();
+    ec::subscribe_platform_event(move |ev| {
+        if let ec::PlatformEvent::UnclaimedGpe(n) = ev {
+            l.store(n, Ordering::Release);
+        }
+    });
+    // Pick a GPE bit unlikely to have any AML _Lxx/_Exx method
+    // wired by QEMU's stock DSDT (we want the fall-through
+    // unclaimed path). 0x42 is reserved territory on every QEMU
+    // board.
+    ec::__test_handle_gpe(0x42);
+    if last.load(Ordering::Acquire) != 0x42 {
+        return TestResult::Fail("UnclaimedGpe(0x42) was not notified");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "drivers/platform/ec",
+    smoke_ec_handle_gpe_unclaimed_notifies
+);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_ec_synthetic_gpe_block_walk() -> TestResult {
+    // Verify the bit-walk arithmetic in dispatch_gpe_block by
+    // injecting a synthetic status-byte array. base_gsi=0,
+    // status[0]=0b0000_0010 + status[1]=0b0001_0000 means GPEs
+    // 1 and 12 fired. Both should land in handle_gpe and (since
+    // no AML method exists for either) emit UnclaimedGpe with
+    // the correct GPE numbers.
+    use crate::ec;
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+    use core::sync::atomic::Ordering;
+
+    ec::__test_reset_sci();
+    let seen = Arc::new(narf_lib::sync::IrqSafeSpinLock::new(Vec::<u32>::new()));
+    let s = seen.clone();
+    ec::subscribe_platform_event(move |ev| {
+        if let ec::PlatformEvent::UnclaimedGpe(n) = ev {
+            s.lock().push(n);
+        }
+    });
+    // status[8] = 0b0000_1100 → bits 2 and 3 set in byte 8
+    // → gpe_num = 0 + 8*8 + 2 = 0x42 and = 0x43. Both are
+    // unclaimed in QEMU's stock DSDT (no \_GPE._L42/_E42 etc).
+    ec::__test_dispatch_synthetic_block(
+        0,
+        &[0, 0, 0, 0, 0, 0, 0, 0, 0b0000_1100],
+    );
+    let g = seen.lock();
+    if g.len() != 2 {
+        return TestResult::Fail("expected 2 unclaimed-gpe events");
+    }
+    if !g.contains(&0x42) {
+        return TestResult::Fail("expected UnclaimedGpe(0x42)");
+    }
+    if !g.contains(&0x43) {
+        return TestResult::Fail("expected UnclaimedGpe(0x43)");
+    }
+    let _ = Ordering::Release; // keep import alive
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "drivers/platform/ec",
+    smoke_ec_synthetic_gpe_block_walk
+);
+
 fn smoke_lid_subscriber_install_and_reset() -> TestResult {
     use crate::lid;
     use alloc::sync::Arc;
