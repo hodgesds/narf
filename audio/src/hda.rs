@@ -5,9 +5,19 @@
 //! of which expose the standard Intel HDA programming model.
 //!
 //! Reference: **Intel "High Definition Audio Specification" rev 1.0a**
-//! (free PDF, intel.com). Section numbers in comments below refer to
-//! that document. Codec verb encodings come from the same spec
-//! (§7.3) and the codec vendor's datasheet.
+//! (<https://www.intel.com/content/www/us/en/standards/intel-high-definition-audio-specification.html>).
+//! Section numbers in comments below refer to that document. Codec
+//! verb encodings come from the same spec (§7.3) and the codec
+//! vendor's datasheet.
+//!
+//! Spec sections used for IRQ wiring:
+//! - §3.3.13 INTSTS — global / controller / per-stream IRQ summary.
+//!   Bits are RO; clear underlying source registers to deassert.
+//! - §3.3.14 INTCTL — GIE (bit 31), CIE (bit 30), SIE per-stream.
+//! - §3.3.21 CORBCTL — CMEIE (bit 0), CORBRUN (bit 1).
+//! - §3.3.36 RIRBCTL — RINTCTL (bit 0), RIRBDMAEN (bit 1),
+//!   RIRBOIC (bit 2).
+//! - §3.3.37 RIRBSTS — RINTFL (bit 0), RIRBOIS (bit 2). W1C.
 //!
 //! Live surface: bring the controller out of reset, allocate CORB +
 //! RIRB rings, walk STATESTS for live codec slots, fetch each
@@ -35,9 +45,11 @@
 //! controller exposes. Output streams start at `0x80 + 0x20 *
 //! GCAP.iss`.
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicU64, Ordering};
 
-use narf_bus::{bar, BusDevice, BusDeviceCap};
+use narf_bus::{bar, enable_msix, BusDevice, BusDeviceCap, MsixTable};
+#[cfg(target_arch = "x86_64")]
+use narf_bus::BusKind;
 use narf_capabilities::{Cap, Write};
 use narf_io::{alloc_coherent, DmaBuffer};
 use narf_lib::id::DomainId;
@@ -80,8 +92,9 @@ const REG_GCTL: u64 = 0x08;
 #[allow(dead_code)]
 const REG_WAKEEN: u64 = 0x0C;
 const REG_STATESTS: u64 = 0x0E;
-#[allow(dead_code)]
+/// INTCTL — controller IRQ enables (§3.3.14). 32-bit at 0x20.
 const REG_INTCTL: u64 = 0x20;
+/// INTSTS — controller IRQ summary (§3.3.13). 32-bit at 0x24, RO.
 const REG_INTSTS: u64 = 0x24;
 
 // CORB block (§3.3.21–§3.3.27).
@@ -101,7 +114,9 @@ const REG_RIRBUBASE: u64 = 0x54;
 const REG_RIRBWP: u64 = 0x58;
 const REG_RINTCNT: u64 = 0x5A;
 const REG_RIRBCTL: u64 = 0x5C;
-#[allow(dead_code)]
+/// RIRBSTS — Response Interrupt Status (§3.3.37). Byte at 0x5D.
+/// Bits are write-1-to-clear; clearing deasserts the controller's
+/// RIRB IRQ source (CIS in INTSTS).
 const REG_RIRBSTS: u64 = 0x5D;
 #[allow(dead_code)]
 const REG_RIRBSIZE: u64 = 0x5E;
@@ -112,13 +127,18 @@ const GCTL_CRST: u32 = 1 << 0; // controller reset (1 = leave reset)
 const GCTL_FCNTRL: u32 = 1 << 1; // flush control
 const GCTL_UNSOL: u32 = 1 << 8; // accept unsolicited responses
 
-// CORBCTL / RIRBCTL bits.
+// CORBCTL bits (§3.3.21).
 const CORBCTL_CMEIE: u8 = 1 << 0; // memory-error interrupt enable
 const CORBCTL_RUN: u8 = 1 << 1; // CORBRUN — start DMA engine
-#[allow(dead_code)]
+
+// RIRBCTL bits (§3.3.36).
 const RIRBCTL_RINTCTL: u8 = 1 << 0; // response interrupt enable
 const RIRBCTL_RUN: u8 = 1 << 1; // RIRBDMAEN
 const RIRBCTL_OIC: u8 = 1 << 2; // overrun interrupt enable
+
+// RIRBSTS bits (§3.3.37) — write-1-to-clear.
+const RIRBSTS_RINTFL: u8 = 1 << 0; // response interrupt flag
+const RIRBSTS_RIRBOIS: u8 = 1 << 2; // response overrun interrupt status
 
 // CORBSIZE / RIRBSIZE: bits[1:0] select size, bits[7:4] are SZCAP.
 // Encoding: 0=2 entries (8 B), 1=16 entries (64 B), 2=256 entries
@@ -129,10 +149,13 @@ const RIRBSIZE_256: u8 = 2;
 // INTCTL bits (§3.3.14).
 #[allow(dead_code)]
 const INTCTL_SIE_MASK: u32 = 0x3FFF_FFFF; // per-stream IRQ enables (bits 0..29)
-#[allow(dead_code)]
-const INTCTL_CIE: u32 = 1 << 30; // controller IRQ enable
-#[allow(dead_code)]
+const INTCTL_CIE: u32 = 1 << 30; // controller IRQ enable (RIRB + STATESTS)
 const INTCTL_GIE: u32 = 1 << 31; // global IRQ enable
+
+// INTSTS bits (§3.3.13) — read-only summary; clear underlying source.
+#[allow(dead_code)]
+const INTSTS_GIS: u32 = 1 << 31; // global IRQ status (any source)
+const INTSTS_CIS: u32 = 1 << 30; // controller IRQ status (RIRB / wake)
 
 // CORB / RIRB sizing: at least 256 entries by spec (§3.3.24, §3.3.31).
 // CORB entries are 4 B → 1024 B ring. RIRB entries are 8 B → 2048 B.
@@ -286,11 +309,55 @@ pub struct IntelHda {
     /// the next cycle.
     period: DmaBuffer,
 
-    /// IDT vector if MSI-X is wired, `None` for polled mode (Stage-4
-    /// default — playback isn't running, so no IRQ load).
+    /// IDT vector wired to this controller's IRQ source — MSI-X
+    /// table entry 0 when MSI-X negotiation succeeds, otherwise the
+    /// GSI routed via PCI _PRT + IOAPIC. `None` only when both
+    /// negotiation paths fail (driver then falls back to polled
+    /// `send_verb` callers, which still work).
     pub irq_vector: Option<u8>,
 
+    /// MSI-X table handle owned by this controller. `Some` when
+    /// `bring_up` successfully programmed table entry 0; `None`
+    /// for the legacy INTx fallback. Held for ownership / lifetime
+    /// — the IRQ delivery path doesn't poke the table after init.
+    #[allow(dead_code)]
+    msix: Option<MsixTable>,
+
     pub ready: bool,
+}
+
+/// BAR0 physical base for the bound HDA controller, set in `bring_up`
+/// and read by the sync ISR. Stored as a raw `u64` so the IRQ handler
+/// can clear RIRBSTS without going through the `IrqSafeSpinLock`
+/// guarding the controller (which a CORB submitter may be holding).
+///
+/// Zero means "no controller bound yet" — the ISR returns early.
+static HDA_BAR0_PHYS: AtomicU64 = AtomicU64::new(0);
+
+/// Sync IRQ handler — runs in IRQ context. Reads INTSTS to confirm
+/// our line, then clears RIRBSTS bits W1C so the level-triggered INTx
+/// line deasserts (HDA spec §3.3.13: INTSTS is RO, deassert by
+/// clearing the source register; §3.3.37: RIRBSTS is W1C). The
+/// awaiting task drains the RIRB ring itself — keeping this handler
+/// minimal lets it coexist with `IrqSafeSpinLock`-protected senders.
+fn hda_isr() {
+    let base = HDA_BAR0_PHYS.load(Ordering::Acquire);
+    if base == 0 {
+        return;
+    }
+    // SAFETY: `base` was set from a live, identity-mapped BAR0
+    // mapping that lives as long as the controller. We only touch
+    // INTSTS (RO) and RIRBSTS (W1C byte) — both fixed offsets within
+    // the spec-mandated 0x80-byte global register window.
+    unsafe {
+        let intsts = narf_arch::mmio::read32(base + REG_INTSTS);
+        if intsts & INTSTS_CIS != 0 {
+            // RIRB is the only CIS source we currently enable
+            // (CMEIE in CORBCTL also routes to CIS when triggered).
+            // Clear both RINTFL + RIRBOIS in one byte W1C write.
+            narf_arch::mmio::write8(base + REG_RIRBSTS, RIRBSTS_RINTFL | RIRBSTS_RIRBOIS);
+        }
+    }
 }
 
 impl core::fmt::Debug for IntelHda {
@@ -331,7 +398,7 @@ impl IntelHda {
     /// duration of init.
     pub unsafe fn bring_up(
         device: &BusDevice,
-        _cap: &Cap<BusDeviceCap, Write>,
+        cap: &Cap<BusDeviceCap, Write>,
     ) -> Result<Self, HdaError> {
         // 1. Map BAR0 — the HDA register window.
         // SAFETY: caller-asserted exclusive ownership.
@@ -511,8 +578,13 @@ impl IntelHda {
             bar0.write16(REG_RINTCNT, 1);
         }
 
-        // 11. Start the DMA engines: CORBCTL.RUN + RIRBCTL.RUN.
-        //     Leave CMEIE / RINTCTL / OIC off — Stage-4 polls.
+        // 11. Start the DMA engines: CORBCTL.RUN + CMEIE +
+        //     RIRBCTL.RUN + RINTCTL + OIC. RINTCTL (§3.3.36 bit 0)
+        //     turns RIRB-completion delivery on; the controller
+        //     latches RINTFL after each `RINTCNT` responses
+        //     (§3.3.32 — we set RINTCNT=1 above so every response
+        //     fires). The IRQ side is gated globally further down
+        //     by INTCTL.GIE | INTCTL.CIE.
         // SAFETY: BAR0 mapped.
         unsafe {
             let blk = bar0.read32(REG_CORBCTL & !0x3);
@@ -523,7 +595,8 @@ impl IntelHda {
             let blk = bar0.read32(REG_RIRBCTL & !0x3);
             bar0.write32(
                 REG_RIRBCTL & !0x3,
-                (blk & 0xFFFF_FF00) | (RIRBCTL_RUN | RIRBCTL_OIC) as u32,
+                (blk & 0xFFFF_FF00)
+                    | (RIRBCTL_RUN | RIRBCTL_RINTCTL | RIRBCTL_OIC) as u32,
             );
         }
 
@@ -710,9 +783,41 @@ impl IntelHda {
             bar0.write32(sd + SD_CTL, 1u32 << SDCTL_STREAM_TAG_SHIFT);
         }
 
-        // 16. INTCTL: leave global IRQ disabled until the playback /
-        //     capture data plane wires MSI-X. Stage-4 keeps the
-        //     polling path; smoke tests don't exercise IRQs here.
+        // 16. Wire the controller-summary IRQ. Try MSI-X (HDA spec
+        //     §6.2.5 — controllers expose MSI-X cap with at least
+        //     one vector); fall back to legacy INTx via PCI _PRT.
+        //     Per HDA spec §3.3.13/§3.3.14, the global IRQ enable
+        //     (INTCTL.GIE) and controller-class enable (INTCTL.CIE)
+        //     gate RIRB delivery once RINTCTL is on.
+        //
+        // Publish BAR0 phys for the sync ISR *before* any path that
+        // unmasks the line. The ISR returns early on a zero base,
+        // but once a route is live the next IRQ must find a valid
+        // base to W1C RIRBSTS (otherwise INTx storms).
+        HDA_BAR0_PHYS.store(bar0.phys.raw(), Ordering::Release);
+
+        // Clear any latched RIRBSTS state from bring-up so the first
+        // armed IRQ reflects only fresh activity.
+        // SAFETY: BAR0 mapped, byte W1C at fixed spec offset.
+        unsafe {
+            bar0.write8(REG_RIRBSTS, RIRBSTS_RINTFL | RIRBSTS_RIRBOIS);
+        }
+
+        let (msix, irq_vector) = match Self::try_enable_msix(cap, device) {
+            Ok((tbl, v)) => (Some(tbl), Some(v)),
+            Err(_) => match Self::try_install_intx(cap, device) {
+                Some(v) => (None, Some(v)),
+                None => (None, None),
+            },
+        };
+
+        if irq_vector.is_some() {
+            // Arm INTCTL last: GIE | CIE. SIE bits stay 0 (no
+            // playback stream subscribed yet). SAFETY: BAR0 mapped.
+            unsafe {
+                bar0.write32(REG_INTCTL, INTCTL_GIE | INTCTL_CIE);
+            }
+        }
 
         Ok(Self {
             bar0,
@@ -730,9 +835,99 @@ impl IntelHda {
             out_stream_idx: out_idx,
             _bdl: bdl,
             period: silence,
-            irq_vector: None,
+            irq_vector,
+            msix,
             ready: true,
         })
+    }
+
+    /// Walk the controller's MSI-X capability, allocate an IDT
+    /// vector + table slot, program slot 0 to deliver to BSP, and
+    /// flip the global MSI-X enable. Returns `(table, vector)` on
+    /// success. Failure propagates to the bring-up path which falls
+    /// back to INTx via `try_install_intx`. Mirrors xhci's identical
+    /// negotiation (drivers/usb/src/xhci.rs::try_enable_msix).
+    fn try_enable_msix(
+        cap: &Cap<BusDeviceCap, Write>,
+        device: &BusDevice,
+    ) -> Result<(MsixTable, u8), HdaError> {
+        let mut msix = enable_msix(cap, device).map_err(|_| HdaError::DmaAllocFailed)?;
+        let v = narf_interrupts::vector::alloc().map_err(|_| HdaError::DmaAllocFailed)?;
+        let _ = msix.alloc_vector().ok_or(HdaError::DmaAllocFailed)?;
+        // Install our handler before any path that can fire `v` —
+        // MSI-X is edge-triggered so a missed handler wouldn't
+        // storm, but the dispatch table must exist before the wake.
+        narf_interrupts::install_handler(v, hda_isr);
+        // Deliver to APIC id 0 (BSP). On aarch64 this routes through
+        // the GIC ITS doorbell with EventID=v.
+        // SAFETY: caller holds the BusDeviceCap; we own the MSI-X
+        // table (no other writer); we issue this write before the
+        // global enable so the device can't fire stale data.
+        let _ = unsafe { msix.program_vector(0, 0, v) }
+            .map_err(|_| HdaError::DmaAllocFailed)?;
+        // SAFETY: cfg-space write to a known cap-list offset.
+        let _ = unsafe { msix.enable() }.map_err(|_| HdaError::DmaAllocFailed)?;
+        Ok((msix, v))
+    }
+
+    /// Legacy INTx fallback: read PCI INTERRUPT_PIN, look up the
+    /// (bridge, slot, pin) triple in the AML `_PRT` routing table,
+    /// allocate an IDT vector, install the HDA sync handler, and
+    /// program the IOAPIC redirection-table entry for the resolved
+    /// GSI. PCI INTx is level-triggered, active-low (PCI Local Bus
+    /// Spec §2.2.6); the ISR clears RIRBSTS to deassert.
+    ///
+    /// Mirrors drivers/usb/src/xhci.rs::try_install_intx — same
+    /// _PRT walk + IOAPIC routing path. We don't yet evaluate
+    /// `_PRT.source` (interrupt-link devices); entries with a
+    /// named link source return `None` and the caller falls
+    /// through to the polled `send_verb` path.
+    #[cfg(target_arch = "x86_64")]
+    fn try_install_intx(
+        cap: &Cap<BusDeviceCap, Write>,
+        device: &BusDevice,
+    ) -> Option<u8> {
+        let pin = narf_bus::pci::read_intx_pin(cap, device).ok()?;
+        if pin == 0 || pin > 4 {
+            return None;
+        }
+        let slot = match device.kind {
+            BusKind::Pcie { addr, .. } => addr.device,
+            _ => return None,
+        };
+        // PCI _PRT pin is 0-based (0=INTA..3=INTD); cfg-space pin
+        // is 1-based.
+        let prt_pin = pin - 1;
+        let route = narf_aml::irq_routing::route_for("\\_SB.PCI0", slot, prt_pin)?;
+        if route.entry.source.is_some() {
+            return None;
+        }
+        let gsi = route.entry.source_index;
+        let v = narf_interrupts::vector::alloc().ok()?;
+        // BAR0_PHYS was published by the caller before we got here,
+        // so the ISR can W1C RIRBSTS on the first IRQ that lands.
+        narf_interrupts::install_handler(v, hda_isr);
+        // PCI INTx is level / active-low.
+        // SAFETY: vector + handler set above before the route.
+        let ok = unsafe {
+            narf_acpi::ioapic::route_gsi_to_vector(
+                gsi,
+                v,
+                0, // dest = BSP
+                narf_acpi::ioapic::POLARITY_LOW | narf_acpi::ioapic::TRIGGER_LEVEL,
+            )
+        };
+        if !ok {
+            return None;
+        }
+        Some(v)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    fn try_install_intx(
+        _cap: &Cap<BusDeviceCap, Write>,
+        _device: &BusDevice,
+    ) -> Option<u8> {
+        None
     }
 
     /// `(input_streams, output_streams, bidir_streams)` from GCAP.
@@ -1187,10 +1382,96 @@ impl IntelHda {
         }
     }
 
-    /// IRQ-driven controller-event drain. Reads and clears
-    /// INTSTS / RIRBSTS / per-stream STS bits. Stage-4 stub —
-    /// callers don't yet exist; this is the surface the data
-    /// plane will hook into.
+    /// IRQ-driven verb dispatch — async sibling to [`Self::send_verb`].
+    /// Posts the verb to CORB, kicks CORBWP, then awaits the next
+    /// RIRB-completion IRQ (RINTCTL set in `bring_up`, RINTCNT=1 so
+    /// every response fires) before reading the response slot.
+    ///
+    /// Falls back to the polled path if MSI-X / INTx negotiation
+    /// failed during `bring_up` — this keeps `irq_vector == None`
+    /// callers working without branching at every call site.
+    ///
+    /// Race-safety: `wait_for_irq(v)` snapshots `fire_count(v)` on
+    /// construction. We construct it *before* writing CORBWP so an
+    /// IRQ that fires between the write and the future's first poll
+    /// still flips the future Ready (see
+    /// `interrupts/src/wait.rs` race-safety doc + the matching
+    /// pattern in `drivers/nvme/src/lib.rs::submit_io_irq`).
+    ///
+    /// # Safety
+    /// Caller owns the BAR0 mapping (the post-bring-up driver does).
+    pub async unsafe fn send_verb_async(&self, verb: u32) -> Result<u32, HdaError> {
+        let v = match self.irq_vector {
+            Some(v) => v,
+            None => {
+                // SAFETY: caller-asserted exclusive ownership.
+                return unsafe { self.send_verb(verb) };
+            }
+        };
+
+        // 1. Reserve the RIRB slot we expect the response in. Locking
+        //    `corb_wp` for the whole submit + slot-publish sequence
+        //    keeps multiple concurrent senders from racing on the
+        //    write pointer.
+        let next = {
+            let mut g = self.corb_wp.lock();
+            let n = (*g + 1) % CORB_ENTRIES as u16;
+            *g = n;
+            n
+        };
+
+        // 2. Place verb in CORB[next]. SAFETY: identity-mapped DMA,
+        //    slot inside the 1 KiB ring.
+        unsafe {
+            let slot = (self.corb_phys + (next as u64) * 4) as *mut u32;
+            slot.write_volatile(verb);
+        }
+        compiler_fence(Ordering::SeqCst);
+
+        // 3. Construct the IRQ future BEFORE poking CORBWP — the
+        //    future captures `fire_count(v)` as its baseline, so any
+        //    IRQ that lands after this point is guaranteed to flip
+        //    it Ready on poll.
+        loop {
+            let waiter = narf_interrupts::wait_for_irq(v);
+
+            // 4. Kick CORBWP — controller fetches the new verb,
+            //    sends it down the link, and on the codec response
+            //    raises RINTFL → INTSTS.CIS → our IRQ vector.
+            // SAFETY: BAR0 mapped.
+            unsafe {
+                self.bar0.write16(REG_CORBWP, next);
+            }
+
+            let _ = waiter.await;
+
+            // 5. After the wake, RIRBWP may have advanced past
+            //    `next` (if multiple verbs were in flight). Confirm
+            //    our slot is filled before reading; if not, re-arm
+            //    (a different IRQ source on this vector woke us).
+            // SAFETY: BAR0 mapped.
+            let rwp = unsafe { self.bar0.read16(REG_RIRBWP) };
+            if !rirb_advanced_past(rwp, next, RIRB_ENTRIES as u16) {
+                continue;
+            }
+            {
+                let mut g = self.rirb_rp.lock();
+                *g = next;
+            }
+            // SAFETY: identity-mapped DMA, slot inside 2 KiB ring.
+            let resp = unsafe {
+                let slot = (self.rirb_phys + (next as u64) * 8) as *const u32;
+                slot.read_volatile()
+            };
+            return Ok(resp);
+        }
+    }
+
+    /// Out-of-IRQ controller-event drain — clears INTSTS-summarised
+    /// source registers (RIRBSTS via W1C). The sync ISR also clears
+    /// RIRBSTS to deassert level INTx; this method exists for
+    /// quiescence sweeps where we want a synchronous bookkeeping
+    /// pass without armed delivery.
     ///
     /// # Safety
     /// Caller owns the BAR0 window exclusively.
@@ -1200,19 +1481,29 @@ impl IntelHda {
         if intsts == 0 {
             return;
         }
-        // GIS bit 31 is the global summary; per-stream bits 0..29.
-        // Clear RIRB status (write-1-to-clear) when CIS bit 30 set.
-        if intsts & (1 << 30) != 0 {
-            // SAFETY: same.
+        // CIS (bit 30) — RIRB / CMEI / wake. RIRBSTS bits are W1C
+        // at byte 0x5D; clear both response-side bits in one write.
+        if intsts & INTSTS_CIS != 0 {
+            // SAFETY: BAR0 mapped, byte W1C at fixed spec offset.
             unsafe {
-                let cur = self.bar0.read32(REG_RIRBCTL & !0x3);
-                // RIRBSTS @ byte 0x5D — bit pattern (RINTFL=0,
-                // RIRBOIS=2). Clear by writing 1s to those bits.
                 self.bar0
-                    .write32(REG_RIRBCTL & !0x3, (cur & 0xFFFF_00FF) | (0x05 << 8));
+                    .write8(REG_RIRBSTS, RIRBSTS_RINTFL | RIRBSTS_RIRBOIS);
             }
         }
     }
+}
+
+/// True when `rwp` has reached or crossed `target` in a `size`-entry
+/// RIRB ring (modulo wrap). Used by `send_verb_async` to confirm
+/// hardware filled the slot we claim before reading it. The CORB+RIRB
+/// advance in lockstep (HDA spec §3.3.30), so reaching `target` means
+/// our slot is filled.
+#[inline]
+fn rirb_advanced_past(rwp: u16, target: u16, size: u16) -> bool {
+    // Treat the ring symmetrically across wrap: any rwp inside the
+    // half-window starting at `target` counts as "past".
+    let dist = (rwp.wrapping_sub(target)) % size;
+    dist < (size / 2)
 }
 
 /// Single-step verb dispatch over CORB/RIRB. Submits one verb,

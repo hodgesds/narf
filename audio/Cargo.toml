@@ -20,9 +20,13 @@ narf-memory       = { path = "../memory" }
 narf-userspace    = { path = "../userspace" }
 narf-drivers-virtio = { path = "../drivers/virtio" }
 narf-shmem        = { path = "../shmem" }
+narf-arch         = { path = "../arch" }
 narf-bus          = { path = "../bus" }
 narf-io           = { path = "../io" }
 narf-drivers      = { path = "../drivers" }
+narf-interrupts   = { path = "../interrupts" }
+narf-acpi         = { path = "../acpi" }
+narf-aml          = { path = "../aml" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 
 [features]

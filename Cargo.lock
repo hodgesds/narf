@@ -517,12 +517,16 @@ dependencies = [
 name = "narf-audio"
 version = "0.0.0"
 dependencies = [
+ "narf-acpi",
+ "narf-aml",
+ "narf-arch",
  "narf-bus",
  "narf-capabilities",
  "narf-drivers",
  "narf-drivers-virtio",
  "narf-firmware",
  "narf-init",
+ "narf-interrupts",
  "narf-io",
  "narf-kernel-test",
  "narf-lib",
