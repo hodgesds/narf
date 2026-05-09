@@ -925,6 +925,96 @@ impl Controller {
         Ok(())
     }
 
+    /// Async sibling of `submit_io_irq`. Submits the command,
+    /// then `wait_for_irq(vector).await`s the MSI-X completion
+    /// instead of spinning on `fire_count`. Lets the executor
+    /// run other tasks during the I/O — the difference between
+    /// "kernel pauses for the entire I/O" and "kernel does
+    /// other work while the device is busy".
+    ///
+    /// Borrows on `self.io` / `self.bar0_region` are scoped to
+    /// the synchronous setup + completion-drain phases so the
+    /// `.await` doesn't hold a mutable borrow across the
+    /// suspension point.
+    pub async fn submit_io_irq_async(
+        &mut self,
+        opcode: u8,
+        lba: u64,
+        n_blocks: u16,
+        buf: &DmaBuffer,
+    ) -> Result<(), NvmeError> {
+        let v = self.irq_vector.ok_or(NvmeError::Msix)?;
+        if n_blocks == 0 {
+            return Ok(());
+        }
+        if self.nsze != 0 && lba.saturating_add(n_blocks as u64) > self.nsze {
+            return Err(NvmeError::OutOfRange);
+        }
+
+        // Submit + ring doorbell + snapshot baseline. All
+        // self-borrows released at the closing brace.
+        let baseline = {
+            let io = self.io.as_mut().ok_or(NvmeError::NoIoQueue)?;
+            let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+            let baseline = narf_interrupts::fire_count(v);
+            let mut sqe = Sqe::zero();
+            sqe.cdw0 = opcode as u32;
+            sqe.nsid = DEFAULT_NSID;
+            sqe.prp1 = buf.phys_addr().raw();
+            sqe.cdw10 = (lba & 0xFFFF_FFFF) as u32;
+            sqe.cdw11 = (lba >> 32) as u32;
+            sqe.cdw12 = (n_blocks - 1) as u32;
+            let cid = io.next_cid;
+            io.next_cid = io.next_cid.wrapping_add(1);
+            sqe.cdw0 = (sqe.cdw0 & 0x0000_FFFF) | ((cid as u32) << 16);
+            // SAFETY: queue page-aligned; sq_tail bounded.
+            unsafe {
+                write_sqe(&io.sq_buf, io.sq_tail, &sqe);
+            }
+            io.sq_tail = (io.sq_tail + 1) % io.depth;
+            // SAFETY: identity-mapped MMIO doorbell.
+            unsafe {
+                bar0.write32(io.sq_db_off(), io.sq_tail as u32);
+            }
+            baseline
+        };
+
+        // Park until the MSI-X completion fires. fire_count
+        // increments inside dispatch::on_irq before the waker
+        // runs, so a same-CPU race that fires the IRQ between
+        // submit-doorbell and .await is handled by the
+        // baseline check inside wait_for_irq's poll body.
+        let _ = narf_interrupts::wait_for_irq(v).await;
+
+        // Drain the CQE + ring CQ-head doorbell.
+        let io = self.io.as_mut().ok_or(NvmeError::NoIoQueue)?;
+        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+        // SAFETY: cq_buf is a live identity-mapped DMA page.
+        let cqe = unsafe { peek_cqe(&io.cq_buf, io.cq_head) };
+        io.cq_head = (io.cq_head + 1) % io.depth;
+        if io.cq_head == 0 {
+            io.cq_phase ^= 1;
+        }
+        // SAFETY: identity-mapped MMIO doorbell. Writing here
+        // tells the controller it's free to MSI again on the
+        // next completion past head.
+        unsafe {
+            bar0.write32(io.cq_db_off(), io.cq_head as u32);
+        }
+        let nvme_status = cqe.status >> 1;
+        if nvme_status != 0 {
+            return Err(NvmeError::CommandFailed {
+                cmd: opcode,
+                status: nvme_status,
+            });
+        }
+        // Ignore unused baseline check — wait_for_irq already
+        // honours its own baseline snapshot to handle the
+        // submit-fires-before-await race.
+        let _ = baseline;
+        Ok(())
+    }
+
     fn nvm_io(
         &mut self,
         opcode: u8,
