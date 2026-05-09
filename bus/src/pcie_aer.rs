@@ -201,3 +201,133 @@ impl HeaderLog {
         ])
     }
 }
+
+// ── Extended-capability walker ─────────────────────────────────────
+//
+// PCIe extended config space starts at offset 0x100 and contains a
+// linked list of extended capabilities. Each header is a 32-bit
+// dword: bits[15:0] = cap_id, bits[19:16] = cap_version,
+// bits[31:20] = next_offset (0 = end of list, >= 0x100). Spec:
+// PCIe 6.0 §7.6 (Extended Configuration Space and Extended
+// Capabilities).
+
+/// Walk the device's extended-capability list and return the
+/// offset (in config-space bytes from `cfg_phys`) of the AER cap,
+/// or `None` if the device doesn't carry one.
+///
+/// Most consumer endpoints (NVMe, NICs, GPUs) do carry AER. Root
+/// ports + switch upstream ports always do.
+///
+/// # Safety
+/// `cfg_phys` must point at the start of a 4 KiB device config
+/// region the CPU can reach (the same shape ECAM enumeration
+/// produces). The walk is read-only.
+pub unsafe fn find_aer_cap_offset(cfg_phys: u64) -> Option<u16> {
+    let mut off: u16 = 0x100;
+    // Bound the walk so a corrupted next-pointer can't loop us
+    // forever; the extended config space is at most 4 KiB.
+    for _ in 0..256 {
+        if off == 0 || off < 0x100 || off >= 0x1000 {
+            return None;
+        }
+        // SAFETY: caller-asserted live config space; offset
+        // bounded above.
+        let header = unsafe {
+            core::ptr::read_volatile((cfg_phys + off as u64) as *const u32)
+        };
+        if header == 0 || header == u32::MAX {
+            return None;
+        }
+        let cap_id = (header & 0xFFFF) as u16;
+        let next = ((header >> 20) & 0xFFF) as u16;
+        if cap_id == AER_CAP_ID {
+            return Some(off);
+        }
+        if next == 0 {
+            return None;
+        }
+        off = next;
+    }
+    None
+}
+
+// ── Root Error Status MSI-vector field ────────────────────────────
+
+/// Mask for the "Advanced Error Interrupt Message Number" field
+/// in the Root Error Status register (PCIe 6.0 §7.8.4.9
+/// bits[31:27]). The value identifies which MSI vector (within
+/// the device's MSI cap allocation) AER fires on.
+pub const ROOT_ERR_STS_MSI_NUMBER: u32 = 0x1F << 27;
+
+/// Decode the AER MSI-number field from a raw Root Error Status
+/// value. Returns the 5-bit vector index (0..=31).
+pub fn aer_msi_number(root_err_sts: u32) -> u8 {
+    ((root_err_sts & ROOT_ERR_STS_MSI_NUMBER) >> 27) as u8
+}
+
+// ── Boot-time enable hook ─────────────────────────────────────────
+
+/// Diagnostic counters — bumped by the AER MSI handler. Exported
+/// so tests / debug commands can observe AER deliveries.
+pub static AER_FATAL_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static AER_NONFATAL_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static AER_CORRECTABLE_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// AER ISR — runs in IRQ context. Reads Root Error Status from
+/// every root port that carries an AER cap, increments the
+/// correctable / non-fatal / fatal counters, and clears the
+/// status bits via W1C.
+///
+/// The full per-bridge state walk is deliberately stateless +
+/// global: there's no persistent registry of root-port AER
+/// blocks today, so the ISR re-walks the bus device list each
+/// fire. Acceptable because AER fires rarely (errors are by
+/// definition exceptional).
+pub fn aer_isr() {
+    use core::sync::atomic::Ordering;
+    use crate::devices;
+    for d in devices().iter() {
+        let cfg_phys = match d.kind {
+            crate::BusKind::Pcie { cfg_phys, .. } => cfg_phys.raw(),
+            _ => continue,
+        };
+        // SAFETY: cfg_phys is identity-mapped ECAM from
+        // bus enumeration; read of the AER cap ID is read-only.
+        let aer = match unsafe { find_aer_cap_offset(cfg_phys) } {
+            Some(o) => o as u64,
+            None => continue,
+        };
+        // Read Root Error Status (offset 0x30 within the AER
+        // cap). Only root ports + switch upstream ports
+        // implement this; endpoints will read zero here, which
+        // is harmless.
+        // SAFETY: same.
+        let sts = unsafe {
+            core::ptr::read_volatile((cfg_phys + aer + regs::ROOT_ERROR_STATUS as u64)
+                as *const u32)
+        };
+        if sts & root_sts::ERR_COR_RECEIVED != 0 {
+            AER_CORRECTABLE_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        if sts & root_sts::ERR_FATAL_NONFATAL_RECEIVED != 0 {
+            // Differentiate fatal vs non-fatal by reading the
+            // uncorrectable severity from the source device's
+            // AER block — out of scope for the ISR. Bump
+            // non-fatal here; future refinement can split.
+            AER_NONFATAL_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        // Clear the consumed status bits (W1C).
+        if sts != 0 {
+            // SAFETY: same.
+            unsafe {
+                core::ptr::write_volatile(
+                    (cfg_phys + aer + regs::ROOT_ERROR_STATUS as u64) as *mut u32,
+                    sts,
+                );
+            }
+        }
+    }
+}

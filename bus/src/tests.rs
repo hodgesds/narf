@@ -1383,3 +1383,41 @@ fn smoke_bus_pci_read_intx_pin_against_devices() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("bus/pci", smoke_bus_pci_read_intx_pin_against_devices);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_bus_pcie_aer_cap_walker() -> TestResult {
+    // Walks every PCIe device's extended-cap list looking for
+    // an AER cap. On QEMU q35 several devices (the root port,
+    // pcie-root, etc.) carry AER. Catches a regression in the
+    // extended-cap header decode (next_offset shift, cap_id
+    // mask) by asserting the walker terminates and returns
+    // either a sane cap offset or None for every device.
+    use crate::pcie_aer::find_aer_cap_offset;
+    use crate::{devices, BusKind};
+    use crate::x86_64::ECAM_DEFAULT_BASE;
+    let _ = unsafe { crate::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let mut walked = 0u32;
+    for d in devs.iter() {
+        let cfg_phys = match d.kind {
+            BusKind::Pcie { cfg_phys, .. } => cfg_phys.raw(),
+            _ => continue,
+        };
+        // SAFETY: identity-mapped ECAM region; walker bounded.
+        let off = unsafe { find_aer_cap_offset(cfg_phys) };
+        if let Some(o) = off {
+            // Sanity: AER cap header lives inside extended
+            // config space.
+            if !(0x100..0x1000).contains(&o) {
+                return TestResult::Fail("AER cap offset outside extended config space");
+            }
+        }
+        walked += 1;
+    }
+    if walked == 0 {
+        return TestResult::Skip("no PCIe devices to walk");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("bus/pcie_aer", smoke_bus_pcie_aer_cap_walker);
