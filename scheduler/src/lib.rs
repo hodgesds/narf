@@ -307,6 +307,18 @@ impl TaskSpec {
 /// per-CPU ready queue. Idempotent within a test run: re-init drops
 /// any tasks left over from a prior round, which is what test setup
 /// wants.
+///
+/// **Smoke tests using `spawn` + `run_until_empty` MUST call
+/// `init()` first.** The boot-time queue carries long-lived
+/// kernel async tasks (USB HID supervisor, FB drain, scheduler
+/// step pump, etc.) that are parked indefinitely on
+/// `sleep_cycles` / `wait_for_irq`. Without re-initialising the
+/// queue, a smoke's `run_until_empty` would try to drive those
+/// zombies too — round 1 polls them all (each returns Pending),
+/// `ready_this_round = 0`, `local_empty = false` → executor
+/// hits `halt_until_irq` and waits forever for an IRQ that
+/// would only re-arm one of the zombies (typically a timer tick
+/// that satisfies a sleep deadline far in the future).
 pub fn init() {
     for q in READY.iter() {
         *q.lock() = Some(VecDeque::new());

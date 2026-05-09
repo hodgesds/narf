@@ -19,6 +19,7 @@ narf-memory       = { path = "../../memory" }
 narf-block        = { path = "../../block" }
 narf-bus          = { path = "../../bus" }
 narf-interrupts   = { path = "../../interrupts" }
+narf-scheduler    = { path = "../../scheduler" }
 narf-drivers      = { path = "../../drivers" }
 narf-init         = { path = "../../init" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }

@@ -856,3 +856,63 @@ fn smoke_admin_set_features_boot_partition_wp_layout() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/nvme/admin", smoke_admin_set_features_boot_partition_wp_layout);
+
+fn smoke_executor_minimal_spawn() -> TestResult {
+    // Minimal: spawn one task that completes immediately.
+    // Must `init` first to drop any stale tasks left in the
+    // queue by earlier kernel-test work — without that, our
+    // spawn-then-run_until_empty would also try to drive
+    // those zombies and could hang on a parked-forever one.
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    narf_scheduler::init();
+    let done = Arc::new(AtomicBool::new(false));
+    let done_c = done.clone();
+    narf_scheduler::spawn(async move {
+        done_c.store(true, Ordering::Release);
+    });
+    narf_scheduler::run_until_empty();
+    if !done.load(Ordering::Acquire) {
+        return TestResult::Fail("single-task spawn didn't complete");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme", smoke_executor_minimal_spawn);
+
+fn smoke_wait_for_irq_through_executor() -> TestResult {
+    // Validates the full executor + waker + wait_for_irq +
+    // dispatch::on_irq chain end-to-end without depending on
+    // hardware MSI delivery.
+    //
+    // Spawns task A that awaits a fresh vector, then task B
+    // that synthetically fires the vector via on_irq. The
+    // second task's on_irq increments fire_count + wakes
+    // task A's installed waker. run_until_empty drives both.
+    //
+    // No bounded timeout — a hang here would be a real bug.
+    // `init()` first to drop stale zombie tasks from earlier
+    // smokes (otherwise run_until_empty waits on them too).
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    narf_scheduler::init();
+    let v = match narf_interrupts::vector::alloc() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("vector::alloc"),
+    };
+    let done = Arc::new(AtomicBool::new(false));
+    let done_c = done.clone();
+    narf_scheduler::spawn(async move {
+        let _ = narf_interrupts::wait_for_irq(v).await;
+        done_c.store(true, Ordering::Release);
+    });
+    narf_scheduler::spawn(async move {
+        narf_interrupts::on_irq(v);
+    });
+    narf_scheduler::run_until_empty();
+    if !done.load(Ordering::Acquire) {
+        return TestResult::Fail("first task didn't wake from synthetic IRQ");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme", smoke_wait_for_irq_through_executor);
