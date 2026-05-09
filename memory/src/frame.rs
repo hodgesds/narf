@@ -214,6 +214,50 @@ pub fn alloc_frame() -> Result<PhysFrame, FrameAllocError> {
     alloc_frame_on(preferred)
 }
 
+/// Phys-address ceiling for early boot. While set, alloc_frame*
+/// returns only frames whose physical address is strictly below
+/// this value. Reason: pre-MMU-init code (per-domain PML4 setup,
+/// init_mmu's own page tables, anything that writes through
+/// `phys.raw() as *mut T`) only works when phys is in the
+/// boot.S identity map (currently 0..4 GiB). On systems with
+/// the q35 PCI-hole RAM split (real Zen2 laptops with 16 GiB,
+/// QEMU q35 with -m ≥ 4G) usable RAM straddles 4 GiB; an
+/// unconstrained allocator would hand out high frames and
+/// trigger a #PF on first access.
+///
+/// Default 4 GiB. Cleared (set to 0 = unlimited) by
+/// `release_early_ceiling()` once a kernel direct map covers
+/// all RAM — typically after MMU init + a high-mem ioremap pass.
+static EARLY_PHYS_CEILING: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(4u64 << 30);
+
+/// Allow the allocator to return frames at any physical address.
+/// Call once a kernel direct map covers all installed RAM.
+pub fn release_early_ceiling() {
+    EARLY_PHYS_CEILING.store(0, core::sync::atomic::Ordering::Release);
+}
+
+/// Pop a frame from `bin` whose phys address is below the early
+/// ceiling. Returns None if no qualifying frame is available.
+fn pop_below_ceiling(bin: &mut Vec<PhysFrame>) -> Option<PhysFrame> {
+    let ceil = EARLY_PHYS_CEILING.load(core::sync::atomic::Ordering::Acquire);
+    if ceil == 0 {
+        return bin.pop();
+    }
+    // Walk back-to-front so popping a low frame is O(1) once we
+    // find one. Real-HW free pools have low + high frames
+    // intermixed by the LIFO push order in `init_from_map`; on
+    // the laptop the first push iterates 0x1000000..0xc0000000
+    // (low) then 0x100000000..end (high), so high frames sit on
+    // top of the stack and a naive pop returns them first.
+    for i in (0..bin.len()).rev() {
+        if bin[i].start_address().raw() < ceil {
+            return Some(bin.swap_remove(i));
+        }
+    }
+    None
+}
+
 /// Allocate one 4 KiB frame, preferring `node`'s bin. Falls back to
 /// other nodes when `node`'s bin is empty.
 pub fn alloc_frame_on(node: usize) -> Result<PhysFrame, FrameAllocError> {
@@ -224,18 +268,18 @@ pub fn alloc_frame_on(node: usize) -> Result<PhysFrame, FrameAllocError> {
 
     if !g.numa_aware {
         // Pre-rebalance: everything's in bin 0.
-        return g.bins[0].pop().ok_or(FrameAllocError::Exhausted);
+        return pop_below_ceiling(&mut g.bins[0]).ok_or(FrameAllocError::Exhausted);
     }
 
     let preferred = node.min(MAX_NUMA_NODES - 1);
-    if let Some(f) = g.bins[preferred].pop() {
+    if let Some(f) = pop_below_ceiling(&mut g.bins[preferred]) {
         return Ok(f);
     }
 
     // Fallback: round-robin from the next-highest node, wrapping.
     for offset in 1..MAX_NUMA_NODES {
         let i = (preferred + offset) % MAX_NUMA_NODES;
-        if let Some(f) = g.bins[i].pop() {
+        if let Some(f) = pop_below_ceiling(&mut g.bins[i]) {
             return Ok(f);
         }
     }
@@ -250,7 +294,7 @@ pub fn alloc_frame_anywhere() -> Result<PhysFrame, FrameAllocError> {
         return Err(FrameAllocError::Uninitialised);
     }
     for bin in g.bins.iter_mut() {
-        if let Some(f) = bin.pop() {
+        if let Some(f) = pop_below_ceiling(bin) {
             return Ok(f);
         }
     }
