@@ -285,3 +285,60 @@ pub fn __reset_for_test() {
     *HPET.lock() = None;
     BASE_OVERRIDE.store(0, Ordering::Release);
 }
+
+/// HPET-driven TSC calibration. Snaps HPET + TSC at the start of a
+/// short busy-wait, then again at the end, and computes
+/// `tsc_hz = Δtsc * hpet_hz / Δhpet`. Returns `Some(hz)` on
+/// success or `None` if HPET isn't initialised, the period reads
+/// degenerate, or no HPET ticks were observed during the wait
+/// (clock stuck — the caller should retry from a different source).
+///
+/// The `calibration_window_hpet_ticks` argument bounds the
+/// busy-wait length in HPET ticks. With a typical 14.318 MHz HPET,
+/// a 100 ms window is ~1.4M ticks — long enough to dwarf the few
+/// hundred TSC cycles that bracket a single MMIO read, short
+/// enough to keep boot snappy.
+#[cfg(target_arch = "x86_64")]
+pub fn calibrate_tsc_via_hpet(calibration_window_hpet_ticks: u64) -> Option<u64> {
+    let hpet_hz = frequency_hz();
+    if hpet_hz == 0 || calibration_window_hpet_ticks == 0 {
+        return None;
+    }
+    let g = HPET.lock();
+    let dev = g.as_ref()?;
+    // SAFETY: HPET singleton is alive for the lock scope; the
+    // window read is volatile + naturally aligned.
+    let hpet_t0 = unsafe { dev.read_counter() };
+    let tsc_t0 = narf_arch::x86_64::tsc::rdtsc();
+    let hpet_deadline = hpet_t0.wrapping_add(calibration_window_hpet_ticks);
+    // Tight loop on HPET — RDTSC + an MMIO read per iteration is
+    // fine for a one-shot boot-time calibration.
+    loop {
+        // SAFETY: same as above.
+        let now = unsafe { dev.read_counter() };
+        if now.wrapping_sub(hpet_t0) >= calibration_window_hpet_ticks
+            || now == hpet_deadline
+        {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    // SAFETY: same.
+    let hpet_t1 = unsafe { dev.read_counter() };
+    let tsc_t1 = narf_arch::x86_64::tsc::rdtsc();
+    drop(g);
+    let d_hpet = hpet_t1.wrapping_sub(hpet_t0);
+    let d_tsc = tsc_t1.wrapping_sub(tsc_t0);
+    if d_hpet == 0 {
+        return None;
+    }
+    // tsc_hz = d_tsc * hpet_hz / d_hpet — widen to u128 to keep
+    // the multiply from overflowing for fast TSCs (~5 GHz × ~14 MHz
+    // hpet_hz × ~1.4M ticks ≈ 10^17, fits in u128 trivially).
+    let hz = ((d_tsc as u128) * (hpet_hz as u128) / (d_hpet as u128)) as u64;
+    if hz == 0 {
+        None
+    } else {
+        Some(hz)
+    }
+}

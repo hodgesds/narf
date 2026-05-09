@@ -1546,6 +1546,44 @@ fn run_async_demo() -> ! {
         );
     }
 
+    // Bring up HPET (default base 0xFED00000 on every x86_64
+    // chipset since ICH; ACPI HPET-table override hooks in once
+    // the parser lands) so the TSC calibration below has a
+    // cross-check source. Failure is non-fatal — calibrate_clocks
+    // still tries CPUID 0x15 / 0x16 first, only falls through to
+    // HPET when both miss.
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: BSP, single-threaded boot context.
+        match unsafe { narf_time::hpet::init() } {
+            Ok(()) => {
+                let hz = narf_time::hpet::frequency_hz();
+                let _ = writeln!(
+                    console::Writer,
+                    "  hpet: enabled @ {} MHz",
+                    hz / 1_000_000
+                );
+            }
+            Err(e) => {
+                let _ = writeln!(console::Writer, "  hpet: probe failed: {e:?}");
+            }
+        }
+        let tsc_hz = narf_time::calibrate_clocks();
+        if tsc_hz != 0 {
+            let _ = writeln!(
+                console::Writer,
+                "  tsc: calibrated to {} MHz ({} cyc/ns)",
+                tsc_hz / 1_000_000,
+                (tsc_hz / 1_000_000_000).max(1)
+            );
+        } else {
+            let _ = writeln!(
+                console::Writer,
+                "  tsc: calibration failed — running in raw-tick units"
+            );
+        }
+    }
+
     narf_scheduler::init();
     let _ = writeln!(console::Writer, "  scheduler: ready queue initialised");
 

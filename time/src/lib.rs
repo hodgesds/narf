@@ -161,3 +161,67 @@ impl Future for SleepUntil {
 pub fn sleep_cycles(cycles: u64) -> SleepUntil {
     SleepUntil::new(Instant::now().plus_cycles(cycles))
 }
+
+/// One-shot boot-time clock calibration. Picks the best TSC-Hz
+/// estimate available — Intel CPUID 0x15 / 0x16 first, then a
+/// HPET cross-check — and pushes the resulting cycles-per-ns into
+/// the wall module so `monotonic_ns()` reports real nanoseconds
+/// instead of raw TSC ticks. Returns the chosen TSC Hz, or 0 if
+/// every source failed (in which case `cycles_per_ns` stays at 1
+/// and timing remains in raw-tick units — better than panicking).
+///
+/// HPET must already be `init`'d when this is called for the
+/// HPET fallback to fire. Idempotent: subsequent calls return the
+/// cached frequency without re-measuring.
+#[cfg(target_arch = "x86_64")]
+pub fn calibrate_clocks() -> u64 {
+    let cached = narf_arch::x86_64::tsc::frequency_hz();
+    if cached != 0 {
+        return cached;
+    }
+    // CPUID-driven path. When 0x15 returns a non-zero crystal
+    // frequency this is the most accurate source we have; 0x16's
+    // base-frequency-in-MHz is coarser (rounded to MHz) but still
+    // beats nominal.
+    let mut hz = narf_arch::x86_64::tsc::calibrate_via_cpuid();
+    if hz == 0 {
+        // CPUID gave us nothing — fall back to the HPET cross-check.
+        // A 100 ms window at the ~14.318 MHz HPET found on every
+        // x86_64 chipset since ICH = ~1.43M ticks; bumps to whatever
+        // the actual HPET reports if higher (some Coffee Lake parts
+        // run HPET at 24 MHz).
+        let hpet_hz = hpet::frequency_hz();
+        if hpet_hz != 0 {
+            let window = (hpet_hz / 10).max(1); // ~100 ms
+            if let Some(measured) = hpet::calibrate_tsc_via_hpet(window) {
+                narf_arch::x86_64::tsc::set_hz_via_hpet(measured);
+                hz = measured;
+            }
+        }
+    }
+    if hz != 0 {
+        // wall::set_cycles_per_ns clamps to >= 1, so the divide in
+        // monotonic_ns is safe. Round down: a fractional Hz/ns
+        // ratio (e.g., 3.5 GHz → 3 cycles/ns) makes monotonic_ns
+        // report time slightly faster than reality, which is
+        // preferable to slightly slower (timeouts fire early
+        // rather than late).
+        let cpns = (hz / 1_000_000_000).max(1) as u32;
+        wall::set_cycles_per_ns(cpns);
+    }
+    hz
+}
+
+/// aarch64 calibrate_clocks stub. The Generic Timer's
+/// `CNTFRQ_EL0` reports the counter's Hz directly — wiring that
+/// into `set_cycles_per_ns` is a follow-up; for now the kernel
+/// runs in raw-tick units on aarch64.
+#[cfg(target_arch = "aarch64")]
+pub fn calibrate_clocks() -> u64 {
+    0
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn calibrate_clocks() -> u64 {
+    0
+}
