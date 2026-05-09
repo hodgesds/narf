@@ -275,8 +275,13 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
     // in later stages rather than a boot panic).
     #[cfg(target_arch = "x86_64")]
     {
+        // Fine-grained early-boot beacons (slots 22+ are
+        // diagnostic, used to localize hangs between ORANGE and
+        // PURPLE on real HW).
+        narf_memory::beacon::paint(22, 0x00FFA500); // amber: post-orange / pre-features
         // SAFETY: CPUID is always legal at CPL=0.
         let feats = unsafe { narf_arch::x86_64::Features::probe() };
+        narf_memory::beacon::paint(23, 0x00FFB347); // peach: CPUID done
         let _ = writeln!(
             console::Writer,
             "  features: nx={} tsc_inv={} pku={} pks={} uipi={} rdseed={} rdrand={}",
@@ -288,6 +293,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             feats.rdseed,
             feats.rdrand
         );
+        narf_memory::beacon::paint(24, 0x0000FF80); // mint: features-writeln OK
 
         // Domain-enforcer selection. PKS is the fast path (single
         // WRMSR per crossing); when it's absent — typically AMD
@@ -327,10 +333,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // SAFETY: PCID is a baseline x86_64 feature on all
             // long-mode CPUs; the bootloader-provided CR3's low bits
             // are zero.
+            narf_memory::beacon::paint(25, 0x0000FFC0); // aqua: pre-PCID
             unsafe {
                 narf_arch::x86_64::pcid::enable_pcide();
                 narf_arch::x86_64::pcid::init();
             }
+            narf_memory::beacon::paint(26, 0x0040FFC0); // pale-cyan: PCID init done
             // Allocate + register 16 per-domain PML4 clones, spread
             // across NUMA nodes. Domain D's PML4 lands on node
             // (D % num_nodes) so PML4 reads on a CPU local to that
@@ -351,6 +359,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // ASID/PCID allocator before populating per-domain PML4s.
             narf_memory::asid_alloc::allocator_init();
             narf_memory::per_domain_root::init();
+            narf_memory::beacon::paint(27, 0x0080FFC0); // sea-green: pre-PML4 loop
             let mut registered = 0u8;
             for domain in 0u8..16 {
                 let node = (domain as usize) % num_nodes;
