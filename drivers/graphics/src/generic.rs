@@ -35,7 +35,16 @@ impl GenericFb {
     /// # Safety
     /// Caller asserts the physical range is mapped and exclusive.
     pub unsafe fn framebuffer(&self) -> Framebuffer {
+        // `Framebuffer::new` takes stride in PIXELS per row, not
+        // bytes per row. Convert pitch (bytes) → stride (pixels)
+        // via `self.stride()`. Passing pitch directly was a 4×
+        // overshoot at 32bpp: pixels painted in the wrong place
+        // and writes ran off the end of the FB. Visible on real
+        // HW where the FB has no slack; QEMU's larger FB partly
+        // hid the bug.
         // SAFETY: caller assertion.
-        unsafe { Framebuffer::new(self.addr as *mut u32, self.width, self.height, self.pitch) }
+        unsafe {
+            Framebuffer::new(self.addr as *mut u32, self.width, self.height, self.stride())
+        }
     }
 }
