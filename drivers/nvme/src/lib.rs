@@ -43,6 +43,7 @@ use narf_bus::{enable_msix, map_bar, BusDevice, BusDeviceCap, MmioRegion, MsixTa
 use narf_capabilities::{Cap, Write};
 use narf_io::{alloc_coherent, DmaBuffer};
 use narf_lib::id::DomainId;
+use narf_memory::{PhysAddr, PAGE_SIZE};
 
 // ── Errors ──────────────────────────────────────────────────────────
 
@@ -79,6 +80,12 @@ pub enum NvmeError {
     OutOfRange,
     /// MSI-X enable / vector allocation / programming failed.
     Msix,
+    /// A multi-page transfer asked for more pages than fit in a
+    /// single PRP-list. With 4-KiB MPS the cap is 511 entries
+    /// beyond PRP1 (one entry of the 512 reserved for chaining
+    /// in the future). Callers split larger transfers across
+    /// multiple submissions.
+    TooManyPages,
 }
 
 // ── Register offsets (NVMe base spec §3.1) ──────────────────────────
@@ -706,6 +713,39 @@ impl Controller {
         self.nvm_io(IoOpcode::Write as u8, lba, n_blocks, buf)
     }
 
+    /// Multi-page NVM Read covering `n_blocks` LBAs into the
+    /// caller-supplied list of physical 4-KiB page addresses.
+    ///
+    /// `pages[0]` becomes PRP1; `pages[1]` (if present) becomes PRP2
+    /// for ≤ 2-page transfers; larger transfers allocate a one-page
+    /// PRP-list with `pages[1..]` as 8-byte little-endian phys-addr
+    /// entries (PRP-list chaining is not yet implemented — caps at
+    /// 511 entries past PRP1, i.e. ≤ 2 MiB per submission at 4 KiB MPS).
+    /// Each `pages[i]` for `i ≥ 1` must be 4-KiB aligned (NVMe base
+    /// spec §4.1.2).
+    ///
+    /// Used by callers (e.g. the FAT loader for init/shell ELFs) that
+    /// need transfers larger than the single-page `read_lba` path.
+    pub fn read_lba_pages(
+        &mut self,
+        lba: u64,
+        n_blocks: u16,
+        pages: &[PhysAddr],
+    ) -> Result<(), NvmeError> {
+        self.nvm_io_multipage(IoOpcode::Read as u8, lba, n_blocks, pages)
+    }
+
+    /// Symmetric to `read_lba_pages`: submit an NVM Write covering
+    /// `n_blocks` LBAs from the caller-supplied page list.
+    pub fn write_lba_pages(
+        &mut self,
+        lba: u64,
+        n_blocks: u16,
+        pages: &[PhysAddr],
+    ) -> Result<(), NvmeError> {
+        self.nvm_io_multipage(IoOpcode::Write as u8, lba, n_blocks, pages)
+    }
+
     /// Create the I/O queue pair with MSI-X-driven completions.
     ///
     /// Walks the device's MSI-X capability, allocates an IDT vector
@@ -911,6 +951,88 @@ impl Controller {
         // CDW12 bits[15:0] = NLB-1; flags (LR/FUA/PRINFO) zero.
         sqe.cdw12 = (n_blocks - 1) as u32;
         // SAFETY: io queue + bar are live; buf is identity-mapped DMA.
+        unsafe {
+            io.submit(bar0, sqe)?;
+        }
+        Ok(())
+    }
+
+    /// Multi-page PRP-list NVM I/O. See `read_lba_pages` for the
+    /// public-API contract. The PRP-list buffer is allocated on
+    /// demand and held alive across `submit` so the controller's DMA
+    /// reads against it complete before the buffer drops.
+    fn nvm_io_multipage(
+        &mut self,
+        opcode: u8,
+        lba: u64,
+        n_blocks: u16,
+        pages: &[PhysAddr],
+    ) -> Result<(), NvmeError> {
+        let io = self.io.as_mut().ok_or(NvmeError::NoIoQueue)?;
+        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+        if n_blocks == 0 || pages.is_empty() {
+            return Ok(());
+        }
+        if self.nsze != 0 && lba.saturating_add(n_blocks as u64) > self.nsze {
+            return Err(NvmeError::OutOfRange);
+        }
+
+        let mut sqe = Sqe::zero();
+        sqe.cdw0 = opcode as u32;
+        sqe.nsid = DEFAULT_NSID;
+        sqe.cdw10 = (lba & 0xFFFF_FFFF) as u32;
+        sqe.cdw11 = (lba >> 32) as u32;
+        sqe.cdw12 = (n_blocks - 1) as u32;
+
+        sqe.prp1 = pages[0].raw();
+
+        // Hold the PRP-list buffer across the submit so its DMA
+        // memory stays mapped for the controller. Dropped after
+        // `submit` returns (which is synchronous: it polls the CQ).
+        let _prp_list_keepalive: Option<DmaBuffer>;
+
+        match pages.len() {
+            1 => {
+                sqe.prp2 = 0;
+                _prp_list_keepalive = None;
+            }
+            2 => {
+                sqe.prp2 = pages[1].raw();
+                _prp_list_keepalive = None;
+            }
+            _ => {
+                // PRP-list with chaining: a single 4-KiB list page
+                // holds up to 512 8-byte entries. Cap at 511 so a
+                // future change can dedicate the last slot to a
+                // chain pointer; reject larger transfers for now.
+                let entries = pages.len() - 1;
+                const MAX_PRP_LIST_ENTRIES: usize = 511;
+                if entries > MAX_PRP_LIST_ENTRIES {
+                    return Err(NvmeError::TooManyPages);
+                }
+                let buf = alloc_coherent(PAGE_SIZE as usize, DomainId::DRIVER_0)
+                    .map_err(|_| NvmeError::OutOfDmaMemory)?;
+                // SAFETY: alloc_coherent zero-fills + page-aligns the
+                // buffer; the kernel-mapped pointer stays valid for
+                // the buffer's lifetime, which we extend across the
+                // submit by binding to `_prp_list_keepalive`. NVMe
+                // expects little-endian 8-byte phys addresses; on a
+                // little-endian target a plain `write_volatile<u64>`
+                // produces that layout.
+                unsafe {
+                    let entries_ptr = buf.as_mut_ptr() as *mut u64;
+                    for (i, p) in pages[1..].iter().enumerate() {
+                        core::ptr::write_volatile(entries_ptr.add(i), p.raw());
+                    }
+                }
+                sqe.prp2 = buf.phys_addr().raw();
+                _prp_list_keepalive = Some(buf);
+            }
+        }
+
+        // SAFETY: io queue + bar are live; pages + the optional
+        // PRP-list page are identity-mapped DMA owned by the caller
+        // / by `_prp_list_keepalive` respectively.
         unsafe {
             io.submit(bar0, sqe)?;
         }

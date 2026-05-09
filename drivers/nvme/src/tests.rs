@@ -200,6 +200,98 @@ fn smoke_nvme_io_round_trip() -> TestResult {
 }
 kernel_test_in!("drivers/nvme", smoke_nvme_io_round_trip);
 
+fn smoke_nvme_io_multipage_round_trip() -> TestResult {
+    // 8-KiB transfer (16 LBAs at 512 B) across a 2-page PRP-list:
+    // exercises the PRP1 + PRP2 = pages[1] short-list path. Ensures
+    // the controller correctly DMA-reads/writes both pages.
+    use crate::Controller;
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+    use narf_io::alloc_coherent;
+    use narf_lib::id::DomainId;
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let nvme_dev = devs.iter().find(|d| {
+        matches!(d.kind, BusKind::Pcie { .. }) && d.id.vendor == 0x1B36 && d.id.device == 0x0010
+    });
+    let Some(dev) = nvme_dev.copied() else {
+        return TestResult::Skip("no QEMU NVMe controller");
+    };
+    let authority = bootstrap_registry_authority();
+    let (_h, dev_cap) = match claim_device_cap(&authority, dev.addr) {
+        Ok(ok) => ok,
+        Err(_) => return TestResult::Fail("claim_device_cap failed"),
+    };
+    let mut ctrl = Controller::from_device(dev);
+    if ctrl.bring_up(&dev_cap).is_err() {
+        return TestResult::Fail("Controller::bring_up failed");
+    }
+    if ctrl.create_io_queue().is_err() {
+        return TestResult::Fail("Controller::create_io_queue failed");
+    }
+    if ctrl.lba_bytes != 512 {
+        return TestResult::Skip("non-512B LBAs (test assumes 8KiB == 16 LBAs)");
+    }
+
+    // Allocate two coherent pages — they don't have to be physically
+    // contiguous, which is exactly what PRP-list buys us.
+    let page_a = match alloc_coherent(4096, DomainId::DRIVER_0) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("alloc_coherent page A"),
+    };
+    let page_b = match alloc_coherent(4096, DomainId::DRIVER_0) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("alloc_coherent page B"),
+    };
+    // Stamp a page-distinct pattern across both pages so a swapped /
+    // truncated DMA shows up as a mismatch. Use volatile so the
+    // compiler can't elide writes to memory the controller will
+    // observe.
+    unsafe {
+        let pa = page_a.phys_addr().raw() as *mut u8;
+        let pb = page_b.phys_addr().raw() as *mut u8;
+        for i in 0..4096usize {
+            core::ptr::write_volatile(pa.add(i), (i as u8).wrapping_add(0x11));
+            core::ptr::write_volatile(pb.add(i), (i as u8).wrapping_add(0xC3));
+        }
+    }
+    let pages = [page_a.phys_addr(), page_b.phys_addr()];
+
+    // Write 16 LBAs (8 KiB) at LBA 1024 — far enough from LBA 0/1
+    // that the existing single-page round-trip's footprint isn't in
+    // play.
+    if ctrl.write_lba_pages(1024, 16, &pages).is_err() {
+        return TestResult::Fail("write_lba_pages failed");
+    }
+    // Zero both pages, then read back — anything the controller
+    // returns has to match what we wrote.
+    unsafe {
+        let pa = page_a.phys_addr().raw() as *mut u8;
+        let pb = page_b.phys_addr().raw() as *mut u8;
+        for i in 0..4096usize {
+            core::ptr::write_volatile(pa.add(i), 0);
+            core::ptr::write_volatile(pb.add(i), 0);
+        }
+    }
+    if ctrl.read_lba_pages(1024, 16, &pages).is_err() {
+        return TestResult::Fail("read_lba_pages failed");
+    }
+    for i in 0..4096usize {
+        unsafe {
+            let pa = page_a.phys_addr().raw() as *const u8;
+            let pb = page_b.phys_addr().raw() as *const u8;
+            if core::ptr::read_volatile(pa.add(i)) != (i as u8).wrapping_add(0x11) {
+                return TestResult::Fail("page A read-back mismatch");
+            }
+            if core::ptr::read_volatile(pb.add(i)) != (i as u8).wrapping_add(0xC3) {
+                return TestResult::Fail("page B read-back mismatch");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme", smoke_nvme_io_multipage_round_trip);
+
 fn smoke_nvme_block_device_async_round_trip() -> TestResult {
     // Async-trait round-trip: route a `BlockOp::Write` + `BlockOp::Read`
     // through `NvmeBlockDevice` (the `block::BlockDevice` impl) and
