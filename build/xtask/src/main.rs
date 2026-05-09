@@ -811,6 +811,7 @@ default_entry: 1
 /NARF
     protocol: multiboot2
     path: boot():/boot/narf-frame
+    cmdline: nosmp
 ";
     std::fs::write(limine_stage.join("limine.conf"), cfg).context("writing limine.conf")?;
 
