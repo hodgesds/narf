@@ -144,6 +144,32 @@ pub fn write_str(s: &str) {
     }
 }
 
+/// Enable RX-data-available IRQ on the active UART. After this
+/// call, the chipset asserts the platform's UART IRQ line
+/// (typically ISA IRQ 4 for COM1) when bytes arrive — caller
+/// is responsible for routing that IRQ through the IOAPIC and
+/// installing a handler that drains via `try_read_byte` before
+/// turning this on.
+///
+/// No-op when the console isn't initialised yet.
+#[cfg(target_arch = "x86_64")]
+pub fn enable_rx_irq() {
+    let _g = CONSOLE.lock.lock();
+    let kind = match CONSOLE.kind.get() {
+        Some(k) => *k,
+        None => return,
+    };
+    let base = CONSOLE.base.load(Ordering::Acquire) as usize;
+    if base == 0 {
+        return;
+    }
+    // SAFETY: kind + base published Release; lock held; backend
+    // call is a single port write.
+    unsafe {
+        backend::enable_rx_irq(base, kind);
+    }
+}
+
 /// Non-blocking single-byte read from the active UART, or `None` if
 /// nothing is queued (RX FIFO empty / pre-init / unknown kind). Used
 /// by the kernel's serial-input pump (registered as a sleep_pump

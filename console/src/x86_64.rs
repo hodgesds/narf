@@ -18,6 +18,28 @@ const LSR_THR_EMPTY: u8 = 1 << 5;
 /// LSR bit 0 — Data Ready (RX FIFO has at least one byte).
 const LSR_DATA_READY: u8 = 1 << 0;
 
+/// IER bit 0 — Received Data Available interrupt enable.
+const IER_RDA: u8 = 1 << 0;
+
+/// Enable RX-data-available IRQ on the 16550A at port `base`.
+/// Pairs with the IOAPIC routing of ISA IRQ 4 in
+/// `frame/bare_main`'s serial-IRQ install path.
+///
+/// # Safety
+/// Hardware assumptions per `init`. Caller must have routed
+/// IRQ 4 through the IOAPIC + installed a handler before
+/// calling — otherwise the level-triggered IRQ would fire
+/// against an unhandled vector.
+pub unsafe fn enable_rx_irq(base: usize, kind: UartKind) {
+    debug_assert_eq!(kind, UartKind::Uart16550);
+    let port = base as u16;
+    // SAFETY: caller-asserted live UART; IER is at offset 1
+    // when DLAB=0 (set during init).
+    unsafe {
+        outb(port + 1, IER_RDA);
+    }
+}
+
 /// Program the UART to 115200 8N1, FIFO on, interrupts off. `base` is an
 /// x86 I/O port number (truncated to `u16`).
 ///

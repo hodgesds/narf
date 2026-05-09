@@ -12,9 +12,14 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         libc::puts(b"NARF Userspace Init started!\n\0".as_ptr());
         libc::puts(b"Mounting /dev (if not already mounted)...\n\0".as_ptr());
 
+        // No real work yet — block effectively forever rather
+        // than busy-waking on a fixed cadence. saturating_mul
+        // in libc::sleep caps at u64::MAX ns (~580 years), so
+        // u32::MAX seconds parks for the kernel's entire
+        // foreseeable uptime. Replace with a real `pause()` /
+        // signal-wait primitive when signals + reaping land.
         loop {
-            libc::puts(b"init: idle...\n\0".as_ptr());
-            libc::sleep(5);
+            libc::sleep(u32::MAX);
         }
     }
 }

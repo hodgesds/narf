@@ -1849,7 +1849,77 @@ fn boot_userspace_init() {
             }
         }
     }
+    // Keep the pump as a defensive backstop — runs whenever a
+    // user task parks in sys_sleep. The IRQ path below is the
+    // primary delivery mechanism; the pump catches anything
+    // that slips past (e.g. on systems where IRQ 4 routing
+    // failed).
     narf_userspace::handlers::sleep_pumps::register(serial_input_pump);
+
+    // Real IRQ-driven serial RX: install a handler at ISA IRQ 4
+    // (COM1's standard line), route the GSI through the IOAPIC,
+    // then enable the 16550A's IER.RDA bit so the chipset
+    // asserts the line when bytes arrive. Failure leaves the
+    // pump as the only delivery path; success makes typing on
+    // the console latency-free instead of bounded by the
+    // ~10-50 ms scheduler tick the pump rides.
+    #[cfg(target_arch = "x86_64")]
+    {
+        // The handler drains the same way the pump does — bounded
+        // at 16 bytes/IRQ to keep the ISR latency predictable
+        // for level-triggered IRQs that re-fire if the line stays
+        // asserted (which it would until the FIFO drains).
+        fn serial_isr() {
+            for _ in 0..16 {
+                match narf_console::try_read_byte() {
+                    Some(b) => {
+                        let _ = narf_input::push_global(narf_input::InputEvent::AsciiByte(b));
+                    }
+                    None => break,
+                }
+            }
+        }
+        // ISA IRQ 4 → GSI (with ISO override resolution) →
+        // IOAPIC. PC AT default for IRQ 4 is edge-triggered
+        // active-high, but ACPI may override — copied from the
+        // pattern in drivers/input/lib.rs::install_isa_irq.
+        let mut overrides =
+            [narf_acpi::IsaOverride::default(); narf_acpi::MAX_ISA_OVERRIDES];
+        let n = narf_acpi::copy_isa_overrides(&mut overrides);
+        let (gsi, flags) = overrides[..n]
+            .iter()
+            .find(|ov| ov.bus == 0 && ov.source == 4)
+            .map(|ov| {
+                let pol = match ov.flags & 0b11 {
+                    0b11 => narf_acpi::ioapic::POLARITY_LOW,
+                    _ => narf_acpi::ioapic::POLARITY_HIGH,
+                };
+                let trig = match (ov.flags >> 2) & 0b11 {
+                    0b11 => narf_acpi::ioapic::TRIGGER_LEVEL,
+                    _ => narf_acpi::ioapic::TRIGGER_EDGE,
+                };
+                (ov.gsi, pol | trig)
+            })
+            .unwrap_or((
+                4,
+                narf_acpi::ioapic::POLARITY_HIGH | narf_acpi::ioapic::TRIGGER_EDGE,
+            ));
+        if let Ok(v) = narf_interrupts::vector::alloc() {
+            narf_interrupts::install_handler(v, serial_isr);
+            // SAFETY: vector + handler installed before
+            // unmasking the IOAPIC entry + enabling IER.
+            let routed =
+                unsafe { narf_acpi::ioapic::route_gsi_to_vector(gsi, v, 0, flags) };
+            if routed {
+                narf_console::enable_rx_irq();
+                let _ = writeln!(
+                    console::Writer,
+                    "  serial: IRQ 4 → GSI {} → vec {} (RX IRQ enabled)",
+                    gsi, v
+                );
+            }
+        }
+    }
 
     // Helper: load + spawn one user binary. Both init and shell go
     // through the same path; the only difference is the argv[0]
