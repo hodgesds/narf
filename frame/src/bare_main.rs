@@ -748,6 +748,13 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                     n,
                                     devs
                                 );
+                                if let Some((a, b)) = narf_aml::evaluate_s5() {
+                                    let _ = writeln!(
+                                        console::Writer,
+                                        "  aml: \\_S5 → SLP_TYPa={} SLP_TYPb={}",
+                                        a, b
+                                    );
+                                }
                                 // Snapshot — later tests that mutate
                                 // the live namespace can still consult
                                 // the boot-time numbers.
@@ -1148,10 +1155,19 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     // values when the namespace doesn't carry
                     // `\_S5` (extremely rare on spec-conformant
                     // ACPI 2.0+ firmware).
-                    let (typa, typb) = narf_aml::evaluate_s5().unwrap_or((
-                        narf_power::system::QEMU_S5_SLP_TYPA,
-                        narf_power::system::QEMU_S5_SLP_TYPB,
-                    ));
+                    // Prefer AML-derived `\_S5` values; fall back to
+                    // QEMU defaults when missing OR when the
+                    // namespace declares a degenerate
+                    // `Package(0,0,0,0)` (QEMU q35 ships this — a
+                    // SLP_TYP of 0 means "enter S0" which would be
+                    // a no-op write to PM1a_CNT).
+                    let (typa, typb) = match narf_aml::evaluate_s5() {
+                        Some((0, 0)) | None => (
+                            narf_power::system::QEMU_S5_SLP_TYPA,
+                            narf_power::system::QEMU_S5_SLP_TYPB,
+                        ),
+                        Some(p) => p,
+                    };
                     narf_power::system::power_off(typa, typb);
                 }
             });
