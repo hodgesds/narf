@@ -71,6 +71,19 @@ pub fn run_all() -> Summary {
     let mut fail = 0usize;
     let mut skip = 0usize;
     let mut current: &'static str = "";
+
+    // Capture failing test names so we can re-emit them AFTER the
+    // summary line. Without this, a flaky 1-of-1386 fail scrolls
+    // past the harness's terminal window and the summary "1 fail"
+    // is the last thing visible — useless for diagnosis.
+    // Cap at 32 distinct failures; anything more and the suite
+    // is broken enough that the inline [FAIL] lines are the
+    // useful signal anyway.
+    const MAX_FAILED_RECORD: usize = 32;
+    let mut failed: [(&'static str, &'static str, &'static str); MAX_FAILED_RECORD] =
+        [("", "", ""); MAX_FAILED_RECORD];
+    let mut failed_n: usize = 0;
+
     for t in ts {
         // Subsystem header — printed when we transition.
         if t.subsystem != current {
@@ -92,6 +105,10 @@ pub fn run_all() -> Summary {
             }
             TestResult::Fail(why) => {
                 let _ = writeln!(Writer, "  [FAIL] {}: {}", t.name, why);
+                if failed_n < MAX_FAILED_RECORD {
+                    failed[failed_n] = (t.subsystem, t.name, why);
+                    failed_n += 1;
+                }
                 fail += 1;
             }
             TestResult::Skip(why) => {
@@ -105,6 +122,21 @@ pub fn run_all() -> Summary {
         "── summary: {} pass, {} fail, {} skip ──",
         pass, fail, skip
     );
+    // Re-emit failure list AFTER the summary so a `tail -N` from
+    // the harness consumer captures both the count AND the names.
+    if fail > 0 {
+        let _ = writeln!(Writer, "── failing tests ──");
+        for (sub, name, why) in &failed[..failed_n] {
+            let _ = writeln!(Writer, "  {} / {}: {}", sub, name, why);
+        }
+        if fail > failed_n {
+            let _ = writeln!(
+                Writer,
+                "  ... and {} more (record buffer full)",
+                fail - failed_n
+            );
+        }
+    }
 
     if fail == 0 {
         Summary::AllOk
