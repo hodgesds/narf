@@ -162,6 +162,24 @@ pub fn decode_value(bytes: &[u8]) -> Result<Value, AmlError> {
     eval_term_arg(bytes, &mut cur, &mut state)
 }
 
+/// Advance `cur` past exactly one TermArg in `bytes`. Discards
+/// the produced value. Used by the namespace builder to step
+/// past `If`/`While` predicates so the body's term-list can be
+/// walked at the parent scope.
+///
+/// Same eval state caveats as `decode_value` — opcodes that
+/// reference Locals/Args or call methods may not advance
+/// correctly. For namespace-build time we only care about the
+/// `_OSI(...)` / `LEqual(_OSI, ...)` shapes that real DSDTs use
+/// in conditional predicates; both decode cleanly here because
+/// `_OSI` is a method call against a stub the eval treats as
+/// "returns Ones" (its real implementation lives outside this
+/// crate, but the cursor advances regardless of the value).
+pub fn skip_term_arg(bytes: &[u8], cur: &mut usize) -> Result<(), AmlError> {
+    let mut state = EvalState::new(&[]);
+    eval_term_arg(bytes, cur, &mut state).map(|_| ())
+}
+
 // ── Core walker ──────────────────────────────────────────────────────────────
 
 /// Walk a TermList bounded by `end` (exclusive index into `buf`).

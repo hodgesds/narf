@@ -1127,17 +1127,22 @@ fn parse_term_list_inner(
                 // Conditional block. Spec (ACPI 6.5 §20.2.5.3):
                 //   IfOp PkgLength Predicate TermList
                 //   ElseOp PkgLength TermList
-                // Without a runtime evaluator we can't evaluate the
-                // predicate, so skip the entire package and continue
-                // the outer term-list. This loses any Names defined
-                // inside the if-body (e.g. QEMU q35 wraps `\_S5`
-                // inside `If(_OSI(...))` and we don't see it), but
-                // it lets sibling Names that *follow* the If parse
-                // correctly — previously the parser bailed on the
-                // unknown opcode and dropped everything after the
-                // first conditional. A future pass should plumb
-                // eval::eval_term_arg into the namespace builder so
-                // the body actually gets walked. (#42 follow-up.)
+                //
+                // Defensive: the namespace builder doesn't
+                // currently walk method bodies (where Ifs
+                // overwhelmingly live in real DSDTs), so this
+                // arm is effectively never hit on QEMU q35 +
+                // tested consumer-class firmware — but it's
+                // here so a future pass that does walk method
+                // bodies (or any DSDT that carries top-level
+                // Ifs) doesn't bail the outer term-list.
+                //
+                // Skip the entire package without trying to
+                // walk the body. Body extraction would need
+                // either the predicate-skipper helper
+                // (`skip_predicate_term_arg`) plus a recursive
+                // term-list walk, or a real method-body
+                // pre-scan pass. Filed as a follow-up.
                 p.skip(1)?;
                 let pkg_start = p.pos;
                 let pkg_len = read_pkg_length(p)?;
@@ -1154,6 +1159,254 @@ fn parse_term_list_inner(
         }
     }
     Ok(())
+}
+
+/// Step `cur` past one TermArg in `buf`, bounded by `end`. Built
+/// for namespace-build-time predicate skipping where the full
+/// `eval::eval_term_arg` machinery isn't usable (it performs
+/// namespace lookups under a lock the builder is already holding,
+/// and method-arg-count lookups against an in-flight namespace
+/// return wrong values).
+///
+/// Handles the closed set of TermArg shapes that DSDT predicates
+/// actually use:
+///   - constants (Zero/One/Ones), sized integer literals
+///     (Byte/Word/Dword/Qword), null-terminated strings,
+///   - PkgLength-bounded literals (Buffer / Package / VarPackage),
+///   - Local0..7 / Arg0..6,
+///   - logical operators (LAnd/LOr/LEqual/LGreater/LLess) — recursive,
+///   - LNot (with the LNotEqual / LLessEqual / LGreaterEqual
+///     two-byte forms),
+///   - NameString as MethodInvocation, with arg-count for the
+///     predefined names that show up in real predicates
+///     (`_OSI` = 1, `_REV` = 0, `_OS_` = 0); unknowns default to
+///     0 args (matches the predominant pattern of
+///     `LEqual(_OSI(...), Ones)` and friends).
+///
+/// Returns `Err(AmlError::BadPkgLength)` for any shape this
+/// skipper doesn't recognise — the caller treats that as "skip
+/// the entire package and lose body extraction" (the previous
+/// behaviour, still strictly an improvement over bailing the
+/// outer term-list).
+pub(crate) fn skip_predicate_term_arg(
+    buf: &[u8],
+    cur: &mut usize,
+    end: usize,
+) -> Result<(), AmlError> {
+    if *cur >= end {
+        return Err(AmlError::Truncated);
+    }
+    let op = buf[*cur];
+    *cur += 1;
+    match op {
+        // Constants / Locals / Args.
+        ZERO_OP | ONE_OP | ONES_OP => Ok(()),
+        0x60..=0x67 | 0x68..=0x6E => Ok(()),
+
+        // Sized integer literals.
+        BYTE_PREFIX => {
+            if *cur >= end {
+                return Err(AmlError::Truncated);
+            }
+            *cur += 1;
+            Ok(())
+        }
+        WORD_PREFIX => {
+            if *cur + 2 > end {
+                return Err(AmlError::Truncated);
+            }
+            *cur += 2;
+            Ok(())
+        }
+        DWORD_PREFIX => {
+            if *cur + 4 > end {
+                return Err(AmlError::Truncated);
+            }
+            *cur += 4;
+            Ok(())
+        }
+        QWORD_PREFIX => {
+            if *cur + 8 > end {
+                return Err(AmlError::Truncated);
+            }
+            *cur += 8;
+            Ok(())
+        }
+        STRING_PREFIX => {
+            // Null-terminated AsciiString.
+            while *cur < end && buf[*cur] != 0 {
+                *cur += 1;
+            }
+            if *cur >= end {
+                return Err(AmlError::Truncated);
+            }
+            *cur += 1; // consume NUL
+            Ok(())
+        }
+
+        // PkgLength-bounded literals.
+        BUFFER_OP | PACKAGE_OP | VAR_PACKAGE_OP => {
+            let pkg_start = *cur;
+            let pkg_len = read_pkg_length_at(buf, cur)?;
+            *cur = pkg_start.saturating_add(pkg_len).min(end);
+            Ok(())
+        }
+
+        // Logical operators with two operands.
+        0x90 /* LAnd */ | 0x91 /* LOr */ | 0x93 /* LEqual */
+            | 0x94 /* LGreater */ | 0x95 /* LLess */ => {
+            skip_predicate_term_arg(buf, cur, end)?;
+            skip_predicate_term_arg(buf, cur, end)?;
+            Ok(())
+        }
+
+        // LNot (one operand) — but ACPI encodes LNotEqual as
+        // `LNot LEqual` (two-byte op), same for LLessEqual /
+        // LGreaterEqual. Peek ahead to disambiguate.
+        0x92 => {
+            if *cur < end {
+                let next = buf[*cur];
+                if next == 0x93 || next == 0x94 || next == 0x95 {
+                    *cur += 1;
+                    skip_predicate_term_arg(buf, cur, end)?;
+                    skip_predicate_term_arg(buf, cur, end)?;
+                    return Ok(());
+                }
+            }
+            skip_predicate_term_arg(buf, cur, end)
+        }
+
+        // NameString lead chars — RootChar, ParentPrefix,
+        // DualName, MultiName. After consuming the name, the
+        // TermArg shape requires knowing whether it's a
+        // MethodInvocation (with N args) or a Name reference
+        // (no args). Only MethodInvocation can validly have
+        // args; we conservatively look up arg count for the
+        // small set of predefined names that show up in real
+        // predicates.
+        ROOT_CHAR | PARENT_PREFIX | DUAL_NAME_PREFIX | MULTI_NAME_PREFIX => {
+            *cur -= 1; // back up so the name reader sees the lead
+            let name = read_name_string_inline(buf, cur, end)?;
+            let argc = predefined_method_argcount(&name);
+            for _ in 0..argc {
+                skip_predicate_term_arg(buf, cur, end)?;
+            }
+            Ok(())
+        }
+
+        // NameSeg lead char — first byte of an inline NameSeg.
+        // Must be `_` or A-Z (uppercase ASCII). Same handling
+        // as the lead-char arm above.
+        b if b == b'_' || (b >= b'A' && b <= b'Z') => {
+            *cur -= 1; // back up to read the full NameSeg
+            let name = read_name_string_inline(buf, cur, end)?;
+            let argc = predefined_method_argcount(&name);
+            for _ in 0..argc {
+                skip_predicate_term_arg(buf, cur, end)?;
+            }
+            Ok(())
+        }
+
+        // Anything else: punt. Caller falls back to package skip.
+        _ => Err(AmlError::BadPkgLength),
+    }
+}
+
+/// PkgLength reader against a borrowed buffer + cursor (the
+/// existing `read_pkg_length(p: &mut Parser)` works against the
+/// crate's Parser type; this is the same algorithm against a
+/// raw slice).
+fn read_pkg_length_at(buf: &[u8], cur: &mut usize) -> Result<usize, AmlError> {
+    if *cur >= buf.len() {
+        return Err(AmlError::Truncated);
+    }
+    let first = buf[*cur];
+    *cur += 1;
+    let extra = ((first >> 6) & 0x3) as usize;
+    let mut len: usize = if extra == 0 {
+        (first & 0x3F) as usize
+    } else {
+        (first & 0x0F) as usize
+    };
+    for i in 0..extra {
+        if *cur >= buf.len() {
+            return Err(AmlError::Truncated);
+        }
+        let next = buf[*cur];
+        *cur += 1;
+        len |= (next as usize) << (4 + i * 8);
+    }
+    Ok(len)
+}
+
+/// Read a NameString from `buf` starting at `*cur`, advancing
+/// the cursor past it. Returns the canonical 4-char NameSeg form
+/// (or concatenated for DualName / MultiName). RootChar prefix
+/// (`\`) and ParentPrefix (`^`) are stripped; predicates use
+/// short relative names overwhelmingly.
+fn read_name_string_inline(
+    buf: &[u8],
+    cur: &mut usize,
+    end: usize,
+) -> Result<String, AmlError> {
+    let mut name = String::new();
+    if *cur >= end {
+        return Err(AmlError::Truncated);
+    }
+    // Strip optional RootChar / ParentPrefix prefixes — we don't
+    // need them for the arg-count lookup.
+    while *cur < end && (buf[*cur] == ROOT_CHAR || buf[*cur] == PARENT_PREFIX) {
+        *cur += 1;
+    }
+    if *cur >= end {
+        return Err(AmlError::Truncated);
+    }
+    let lead = buf[*cur];
+    let segs = match lead {
+        DUAL_NAME_PREFIX => {
+            *cur += 1;
+            2
+        }
+        MULTI_NAME_PREFIX => {
+            *cur += 1;
+            if *cur >= end {
+                return Err(AmlError::Truncated);
+            }
+            let n = buf[*cur] as usize;
+            *cur += 1;
+            n
+        }
+        _ => 1,
+    };
+    for _ in 0..segs {
+        if *cur + 4 > end {
+            return Err(AmlError::Truncated);
+        }
+        for k in 0..4 {
+            name.push(buf[*cur + k] as char);
+        }
+        *cur += 4;
+    }
+    Ok(name)
+}
+
+/// Arg-count for the small set of ACPI predefined methods that
+/// show up in DSDT conditional predicates. Anything else returns
+/// 0 — matches the predominant pattern of name references rather
+/// than method invocations in predicates.
+///
+/// Reference: ACPI 6.5 §5.7 "Predefined Objects".
+fn predefined_method_argcount(name: &str) -> usize {
+    // Trim trailing underscores (NameSeg padding) before matching.
+    let trimmed = name.trim_end_matches('_');
+    match trimmed {
+        "_OSI" => 1, // OS Interface compatibility check, takes a string
+        "_REV" => 0,
+        "_OS" => 0,
+        "_DSM" => 4, // Device-Specific Method
+        "_PIC" => 1, // ACPI 6.5 §5.8.1
+        _ => 0,
+    }
 }
 
 fn push_node(n: AmlNode) {

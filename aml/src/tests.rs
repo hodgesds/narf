@@ -1343,6 +1343,31 @@ fn smoke_aml_irq_routing_register_and_query() -> TestResult {
 }
 kernel_test_in!("aml", smoke_aml_irq_routing_register_and_query);
 
+fn smoke_aml_skip_predicate_term_arg_decodes_lequal_osi() -> TestResult {
+    // Synthetic predicate: LEqual(_OSI("Linux"), Ones).
+    // Wire bytes (ACPI 6.5 §20.2.5):
+    //   0x93                 = LEqualOp
+    //   0x5F 0x4F 0x53 0x49  = NameSeg "_OSI"
+    //   0x0D "Linux" 0x00    = StringPrefix + 5 chars + NUL
+    //   0xFF                 = OnesOp
+    // Total: 1 + 4 + 7 + 1 = 13 bytes.
+    let buf: &[u8] = &[
+        0x93, // LEqual
+        b'_', b'O', b'S', b'I',
+        0x0D, b'L', b'i', b'n', b'u', b'x', 0x00,
+        0xFF,
+    ];
+    let mut cur = 0usize;
+    if crate::skip_predicate_term_arg(buf, &mut cur, buf.len()).is_err() {
+        return TestResult::Fail("skip_predicate_term_arg returned Err on LEqual(_OSI, Ones)");
+    }
+    if cur != buf.len() {
+        return TestResult::Fail("cursor didn't advance to end of predicate");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml", smoke_aml_skip_predicate_term_arg_decodes_lequal_osi);
+
 fn smoke_aml_namespace_walks_past_if_blocks() -> TestResult {
     // Sentinel for the If-skip behaviour added so the
     // namespace builder doesn't bail on the first

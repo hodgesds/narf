@@ -888,6 +888,8 @@ dependencies = [
 name = "narf-drivers-usb"
 version = "0.0.0"
 dependencies = [
+ "narf-acpi",
+ "narf-aml",
  "narf-arch",
  "narf-bus",
  "narf-capabilities",
