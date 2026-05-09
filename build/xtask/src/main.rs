@@ -951,7 +951,13 @@ fn iso_boot_cmd(args: &BuildArgs) -> Result<()> {
     // config IO, which the kernel's bus walker doesn't drive yet.
     cmd.arg("-machine").arg("q35");
     cmd.arg("-cpu").arg("max");
-    cmd.arg("-smp").arg("2");
+    // Default -smp 8 so iso-boot exercises the multi-core AP
+    // bring-up path; bumping past 2 catches AP-side bugs that
+    // single-socket-dual-core misses (APIC-id gaps, init-order
+    // races, percpu storage init). Override via XTASK_SMP for
+    // ad-hoc spelunking (XTASK_SMP=16, etc.).
+    let smp = std::env::var("XTASK_SMP").unwrap_or_else(|_| "8".into());
+    cmd.arg("-smp").arg(&smp);
     cmd.arg("-m").arg("1024M");
     cmd.arg("-cdrom").arg(&iso);
     cmd.arg("-serial").arg("stdio");

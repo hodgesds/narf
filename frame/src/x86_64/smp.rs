@@ -229,9 +229,15 @@ pub unsafe fn start_aps() -> u32 {
         TRAMPOLINE_PHYS
     );
 
-    let mut started = 0u32;
+    // Allocate stacks for every AP up front so a partial failure
+    // (frame allocator exhausted mid-batch) doesn't leave half the
+    // APs ready and half not. Skipped slots stay 0 in AP_STACKS;
+    // the trampoline halts the AP if its stack-top entry is 0.
+    // Stack-allocated viable list to avoid pulling `alloc` into
+    // this module — `MAX_CPUS` is a small fixed bound.
+    let mut viable_buf = [0u32; narf_lib::percpu::MAX_CPUS];
+    let mut viable_len: usize = 0;
     for logical in 1..total {
-        // Allocate a stack frame.
         let mut stack_top: u64 = 0;
         for _ in 0..AP_STACK_PAGES {
             match alloc_frame() {
@@ -243,55 +249,91 @@ pub unsafe fn start_aps() -> u32 {
                 }
                 Err(_) => {
                     let _ = writeln!(Writer, "  smp(x86): AP {}: stack alloc failed", logical);
-                    continue;
+                    break;
                 }
             }
         }
         if stack_top == 0 {
             continue;
         }
-
         // SAFETY: AP_STACKS is in .data; the only writer is the BSP
         // during this start_aps call, before the AP runs.
         unsafe {
             (*core::ptr::addr_of_mut!(AP_STACKS))[logical as usize] = stack_top;
         }
-        compiler_fence(Ordering::SeqCst);
+        viable_buf[viable_len] = logical;
+        viable_len += 1;
+    }
+    let viable = &viable_buf[..viable_len];
+    compiler_fence(Ordering::SeqCst);
 
-        // Send INIT-SIPI-SIPI. APIC id == logical id under QEMU virt
-        // with `-smp N -cpu max`.
-        let target = logical;
+    // Parallelise the INIT-SIPI-SIPI handshake across APs: a serial
+    // per-AP loop pays `(10ms + 200us)` for *every* AP (≈ 630ms wall
+    // time at 64 cores) — the SDM §10.4.4.1 timing constraints are
+    // *minimum* delays between phases against any single AP, so
+    // batching across APs is fine. With this shape the entire phase
+    // takes ~10.2ms regardless of AP count.
+    //
+    // APIC id == logical id under QEMU's `-smp N`; on real silicon
+    // MADT enumeration produces the same identity for the
+    // common-case Local APIC entries (apic_id == cpu_index). When
+    // ACPI ever surfaces a non-trivial mapping this loop wants a
+    // proper apic_id_for_logical(id) lookup.
 
-        // SAFETY: x2APIC enabled by init_bsp.
+    // SAFETY: x2APIC enabled by init_bsp.
+    for &logical in viable.iter() {
         unsafe {
-            narf_interrupts::x86_64::apic::send_init_ipi(target);
+            narf_interrupts::x86_64::apic::send_init_ipi(logical);
         }
-        delay_us(10_000); // 10 ms per Intel SDM §10.4.4.1
-                          // SAFETY: same.
-        unsafe {
-            narf_interrupts::x86_64::apic::send_startup_ipi(target, SIPI_VECTOR_PAGE);
-        }
-        delay_us(200); // ≥200 µs between SIPIs
-                       // SAFETY: same.
-        unsafe {
-            narf_interrupts::x86_64::apic::send_startup_ipi(target, SIPI_VECTOR_PAGE);
-        }
+    }
+    delay_us(10_000); // 10 ms per Intel SDM §10.4.4.1, single shared wait
 
-        let _ = writeln!(Writer, "  smp(x86): INIT-SIPI-SIPI to APIC {} sent", target);
+    // SAFETY: same.
+    for &logical in viable.iter() {
+        unsafe {
+            narf_interrupts::x86_64::apic::send_startup_ipi(logical, SIPI_VECTOR_PAGE);
+        }
+    }
+    delay_us(200); // ≥200 µs between SIPIs, single shared wait
 
-        // Wait for AP to mark itself online.
-        let mut spins = 0u32;
-        while !narf_lib::smp::is_online(logical) {
-            spins += 1;
-            if spins > 50_000_000 {
-                let _ = writeln!(Writer, "  smp(x86): AP {} never reported online", logical);
-                break;
+    // SAFETY: same.
+    for &logical in viable.iter() {
+        unsafe {
+            narf_interrupts::x86_64::apic::send_startup_ipi(logical, SIPI_VECTOR_PAGE);
+        }
+    }
+
+    let _ = writeln!(
+        Writer,
+        "  smp(x86): INIT-SIPI-SIPI broadcast to {} AP(s)",
+        viable_len
+    );
+
+    // Single shared online-spin watchdog instead of per-AP. Bound
+    // it generously enough that a slow-coming-up AP doesn't drop
+    // out, but tight enough that a wedged controller doesn't burn
+    // forever. ~500M spins ≈ 100-500 ms at modern clock speeds.
+    const ONLINE_SPIN_BUDGET: u64 = 500_000_000;
+    let mut spins = 0u64;
+    let mut started = 0u32;
+    loop {
+        started = viable
+            .iter()
+            .filter(|&&id| narf_lib::smp::is_online(id))
+            .count() as u32;
+        if started == viable_len as u32 {
+            break;
+        }
+        spins += 1;
+        if spins > ONLINE_SPIN_BUDGET {
+            for &id in viable.iter() {
+                if !narf_lib::smp::is_online(id) {
+                    let _ = writeln!(Writer, "  smp(x86): AP {} never reported online", id);
+                }
             }
-            core::hint::spin_loop();
+            break;
         }
-        if narf_lib::smp::is_online(logical) {
-            started += 1;
-        }
+        core::hint::spin_loop();
     }
     started
 }
