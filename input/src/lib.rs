@@ -265,6 +265,16 @@ pub enum InputEvent {
     Key(KeyEvent),
     Pointer(PointerEvent),
     Scroll(ScrollEvent),
+    /// Raw ASCII / control byte from a character-oriented source
+    /// (UART, virtio-console, ...). Producers that already speak
+    /// in terms of bytes (rather than scancodes + modifiers) push
+    /// this variant directly. Consumers wanting line-mode input
+    /// (TTY, devfs `/dev/console`) deliver the byte verbatim;
+    /// scancode-aware consumers (a future windowing system) will
+    /// ignore it. Only valid for printable + standard control
+    /// codes (Enter/Backspace/Esc); higher-bit / multibyte
+    /// sequences are passed through as-is.
+    AsciiByte(u8),
 }
 
 /// Bounded SPSC ring of input events. Producers (drivers, IRQ

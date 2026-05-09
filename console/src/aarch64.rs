@@ -19,6 +19,7 @@ const LCR_H: usize = 0x02C;
 const CR: usize = 0x030;
 
 const FR_TXFF: u32 = 1 << 5;
+const FR_RXFE: u32 = 1 << 4;
 
 /// Initialise PL011 to 8N1, 115200 baud assuming a 24 MHz UARTCLK (QEMU virt).
 ///
@@ -34,6 +35,22 @@ pub unsafe fn init(base: usize, kind: UartKind) {
         write_u32((base + FBRD) as *mut u32, 1);
         write_u32((base + LCR_H) as *mut u32, (1 << 4) | (0b11 << 5)); // FIFO, 8 bits
         write_u32((base + CR) as *mut u32, (1 << 9) | (1 << 8) | 1); // RXE|TXE|UARTEN
+    }
+}
+
+/// Non-blocking single-byte RX from a PL011 at MMIO `base`.
+/// `FR.RXFE` set means the RX FIFO is empty.
+///
+/// # Safety
+/// See `init`.
+pub unsafe fn try_read_byte(base: usize, kind: UartKind) -> Option<u8> {
+    debug_assert_eq!(kind, UartKind::Pl011);
+    // SAFETY: MMIO read of FR + DR, no side effects on TX state.
+    unsafe {
+        if read_u32((base + FR) as *const u32) & FR_RXFE != 0 {
+            return None;
+        }
+        Some(read_u32((base + DR) as *const u32) as u8)
     }
 }
 

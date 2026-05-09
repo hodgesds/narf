@@ -144,6 +144,30 @@ pub fn write_str(s: &str) {
     }
 }
 
+/// Non-blocking single-byte read from the active UART, or `None` if
+/// nothing is queued (RX FIFO empty / pre-init / unknown kind). Used
+/// by the kernel's serial-input pump (registered as a sleep_pump
+/// from `frame/bare_main.rs`) to drain typed bytes from `qemu -serial
+/// stdio` and from the platform serial port on real hardware, then
+/// push them onto `narf_input::GLOBAL_RING` as `InputEvent::AsciiByte`.
+///
+/// Holds the same coarse `CONSOLE.lock` as `write_str` so the RX read
+/// doesn't tear against a concurrent TX (only matters when the pump
+/// runs alongside another CPU writing — single-CPU today).
+pub fn try_read_byte() -> Option<u8> {
+    let _g = CONSOLE.lock.lock();
+    let kind = *CONSOLE.kind.get()?;
+    let base = CONSOLE.base.load(Ordering::Acquire) as usize;
+    if base == 0 {
+        return None;
+    }
+    // SAFETY: kind + base were published via Release by `early_init`
+    // / `remap_to_virtual`; we hold the coarse lock; the backend's
+    // `try_read_byte` is a one-shot LSR/FR + RBR/DR read with no TX
+    // side effects.
+    unsafe { backend::try_read_byte(base, kind) }
+}
+
 /// Type of the optional framebuffer fan-out callback. Boot-time
 /// install only; no per-call allocation.
 pub type FbHook = fn(&[u8]);

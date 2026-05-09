@@ -15,6 +15,8 @@ use narf_arch::x86_64::io_port::{inb, outb};
 
 /// LSR bit 5 — Transmitter Holding Register empty.
 const LSR_THR_EMPTY: u8 = 1 << 5;
+/// LSR bit 0 — Data Ready (RX FIFO has at least one byte).
+const LSR_DATA_READY: u8 = 1 << 0;
 
 /// Program the UART to 115200 8N1, FIFO on, interrupts off. `base` is an
 /// x86 I/O port number (truncated to `u16`).
@@ -38,6 +40,26 @@ pub unsafe fn init(base: usize, kind: UartKind) {
         outb(port + 3, 0x03); // LCR: 8 bits, no parity, 1 stop, DLAB off
         outb(port + 2, 0xC7); // FCR: enable FIFO, clear, 14-byte trigger
         outb(port + 4, 0x0B); // MCR: DTR | RTS | OUT2 (for future IRQ use)
+    }
+}
+
+/// Non-blocking single-byte RX from the 16550A at port `base`.
+/// Returns `Some(b)` if the RX FIFO had a byte ready, `None` otherwise.
+/// Drives the kernel's serial-input pump — drained from a sleep_pump
+/// (and in future, from a UART IRQ) and the bytes pushed onto
+/// `narf_input::GLOBAL_RING` as `InputEvent::AsciiByte`.
+///
+/// # Safety
+/// Hardware assumptions per `init`.
+pub unsafe fn try_read_byte(base: usize, kind: UartKind) -> Option<u8> {
+    debug_assert_eq!(kind, UartKind::Uart16550);
+    let port = base as u16;
+    // SAFETY: read LSR + RBR, no side effects on TX state.
+    unsafe {
+        if inb(port + 5) & LSR_DATA_READY == 0 {
+            return None;
+        }
+        Some(inb(port + 0))
     }
 }
 

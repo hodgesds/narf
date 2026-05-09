@@ -229,14 +229,24 @@ impl FileOps for DevConsole {
                 Some(e) => e,
                 None => break,
             };
-            if let narf_input::InputEvent::Key(k) = ev {
-                if !k.pressed {
-                    continue;
+            match ev {
+                narf_input::InputEvent::Key(k) => {
+                    if !k.pressed {
+                        continue;
+                    }
+                    if let Some(b) = key_to_ascii(k.code, k.modifiers) {
+                        buf[written] = b;
+                        written += 1;
+                    }
                 }
-                if let Some(b) = key_to_ascii(k.code, k.modifiers) {
+                narf_input::InputEvent::AsciiByte(b) => {
                     buf[written] = b;
                     written += 1;
                 }
+                // Pointer/Scroll events aren't readable through
+                // /dev/console — drop and keep going so they
+                // don't gum up keyboard input.
+                _ => {}
             }
         }
         Box::pin(async move { Ok(written) })

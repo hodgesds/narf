@@ -1691,6 +1691,23 @@ fn boot_userspace_init() {
     }
     narf_userspace::handlers::sleep_pumps::register(scheduler_step_pump);
 
+    // Drain any RX bytes the platform UART has queued (typed bytes
+    // via `qemu -serial stdio`, or a real serial console on bare
+    // metal) and publish them as `InputEvent::AsciiByte` on the
+    // global input ring so /dev/console reads see them. Bounded
+    // per-tick so a runaway producer can't monopolise the pump.
+    fn serial_input_pump() {
+        for _ in 0..16 {
+            match narf_console::try_read_byte() {
+                Some(b) => {
+                    let _ = narf_input::push_global(narf_input::InputEvent::AsciiByte(b));
+                }
+                None => break,
+            }
+        }
+    }
+    narf_userspace::handlers::sleep_pumps::register(serial_input_pump);
+
     // Helper: load + spawn one user binary. Both init and shell go
     // through the same path; the only difference is the argv[0]
     // string (which `__libc_start_main` consumes) and the binary
