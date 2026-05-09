@@ -4,7 +4,13 @@ target/
 **/*.rs.bk
 
 # Workspace lockfile policy: commit for the kernel workspace
-# Cargo.lock stays tracked
+# Cargo.lock stays tracked. The standalone user-binary
+# workspaces (userspace/init, userspace/shell) generate their
+# own lock files when verification/build.rs invokes cargo build
+# against them — those are reproducible from a clean checkout
+# and don't need to be tracked.
+/userspace/init/Cargo.lock
+/userspace/shell/Cargo.lock
 
 # Cargo xtask artefacts
 /build/out/

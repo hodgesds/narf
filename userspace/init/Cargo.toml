@@ -1,10 +1,20 @@
+# Empty [workspace] table makes this crate its own workspace
+# root. It MUST NOT participate in the main kernel workspace at
+# /home/daniel/git/narf/Cargo.toml — that workspace builds for
+# the host triple by default, and this crate's `#![no_main]`
+# `_start` collides with libc's Scrt1.o `_start`. The kernel's
+# verification/build.rs invokes `cargo build` against this
+# crate directly with a bare-metal target, which works because
+# we're now an isolated workspace.
+[workspace]
+
 [package]
 name         = "narf-init-process"
 description  = "NARF userspace init process."
 version      = "0.1.0"
-edition.workspace      = true
-rust-version.workspace = true
-license.workspace      = true
+edition      = "2021"
+rust-version = "1.85"
+license      = "MPL-2.0"
 
 [dependencies]
 narf-libc = { path = "../../narf-libc" }
@@ -13,5 +23,6 @@ narf-libc = { path = "../../narf-libc" }
 name = "init"
 path = "src/main.rs"
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"

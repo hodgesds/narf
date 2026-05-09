@@ -1,10 +1,15 @@
+# See userspace/init/Cargo.toml for the rationale — empty
+# [workspace] table makes this an isolated workspace root so
+# the kernel workspace doesn't try to build it for the host.
+[workspace]
+
 [package]
 name         = "narf-shell"
 description  = "NARF userspace shell."
 version      = "0.1.0"
-edition.workspace      = true
-rust-version.workspace = true
-license.workspace      = true
+edition      = "2021"
+rust-version = "1.85"
+license      = "MPL-2.0"
 
 [dependencies]
 narf-libc = { path = "../../narf-libc" }
@@ -13,5 +18,6 @@ narf-libc = { path = "../../narf-libc" }
 name = "shell"
 path = "src/main.rs"
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
