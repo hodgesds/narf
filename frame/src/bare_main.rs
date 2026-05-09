@@ -1141,10 +1141,18 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         console::Writer,
                         "  acpi: power button → entering S5"
                     );
-                    narf_power::system::power_off(
+                    // Prefer AML-derived (SLP_TYPa, SLP_TYPb) from
+                    // the firmware's `\_S5` package — real silicon
+                    // varies (Lenovo / HP / Asus often differ from
+                    // the QEMU 5/0 default). Fall back to QEMU's
+                    // values when the namespace doesn't carry
+                    // `\_S5` (extremely rare on spec-conformant
+                    // ACPI 2.0+ firmware).
+                    let (typa, typb) = narf_aml::evaluate_s5().unwrap_or((
                         narf_power::system::QEMU_S5_SLP_TYPA,
                         narf_power::system::QEMU_S5_SLP_TYPB,
-                    );
+                    ));
+                    narf_power::system::power_off(typa, typb);
                 }
             });
             narf_graphics_driver::register_initcalls();

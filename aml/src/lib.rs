@@ -357,6 +357,45 @@ pub fn device_hid(device_path: &str) -> Option<alloc::string::String> {
     }
 }
 
+/// Evaluate `\_S5` and return the platform's `(SLP_TYPa, SLP_TYPb)`
+/// values for ACPI S5 (soft-off). The namespace stores `\_S5_` as
+/// a `Name` whose body is a `Package(...)` of at least two
+/// integers — element 0 is SLP_TYPa, element 1 is SLP_TYPb;
+/// elements 2-3 are reserved.
+///
+/// Spec: ACPI 6.5 §7.4 (System State Definitions),
+/// §16.1.6 (`\_Sx` Object).
+/// <https://uefi.org/specs/ACPI/6.5/>
+///
+/// Returns `None` when the namespace hasn't been built yet, when
+/// `\_S5` is missing (rare — every spec-conformant DSDT carries
+/// it), when the body isn't a Package, or when fewer than two
+/// integer elements are present. Callers fall back to platform
+/// defaults (QEMU + most x86_64 firmware uses `(5, 0)`).
+pub fn evaluate_s5() -> Option<(u8, u8)> {
+    let node = find_node("\\_S5_").or_else(|| find_node("\\_S5"))?;
+    let (offset, length) = match node.value? {
+        NameValue::Unparsed { offset, length } if length > 0 => (offset, length),
+        _ => return None,
+    };
+    let mut body = alloc::vec![0u8; length];
+    let n = copy_aml_bytes(offset, &mut body);
+    if n < length {
+        return None;
+    }
+    let value = crate::eval::decode_value(&body).ok()?;
+    let pkg = match value {
+        crate::Value::Package(p) => p,
+        _ => return None,
+    };
+    if pkg.len() < 2 {
+        return None;
+    }
+    let typa = pkg[0].as_integer() as u8 & 0x7;
+    let typb = pkg[1].as_integer() as u8 & 0x7;
+    Some((typa, typb))
+}
+
 /// Decode the 32-bit EISA ID encoding used by ACPI `_HID` /
 /// `_CID` integer values into the canonical `"AAAxxxx"` string
 /// form. Bits[15:0] hold three 5-bit packed letters
