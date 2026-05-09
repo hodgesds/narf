@@ -63,6 +63,7 @@ fn smoke_aml_synthetic_scope_and_name() -> TestResult {
                 crate::AmlError::Acpi(_) => "acpi err",
                 crate::AmlError::BadNameSegment => "bad nameseg",
                 crate::AmlError::NoDsdt => "no dsdt",
+                crate::AmlError::MethodNotFound => "method not found",
             })
         }
     };
@@ -1289,3 +1290,55 @@ fn smoke_aml_prt_method_not_found() -> TestResult {
     }
 }
 kernel_test_in!("aml", smoke_aml_prt_method_not_found);
+
+fn smoke_aml_eisa_id_decode() -> TestResult {
+    // ACPI 6.5 §5.6.7 EISA-ID encoding round-trip. PNP0A03 (PCI
+    // host bridge) packs as 0x030AD041; PNP0A08 (PCIe host
+    // bridge) as 0x080AD041. Verifies `device_hid` decodes
+    // integer-encoded `_HID` values consumers see in practice.
+    let cases: &[(u32, &str)] = &[
+        (0x030A_D041, "PNP0A03"),
+        (0x080A_D041, "PNP0A08"),
+        (0x0103_D041, "PNP0301"),
+    ];
+    for (raw, expected) in cases {
+        let got = crate::eisa_id_from_u32(*raw);
+        if got != *expected {
+            return TestResult::Fail("eisa-id decode mismatch");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml", smoke_aml_eisa_id_decode);
+
+fn smoke_aml_irq_routing_register_and_query() -> TestResult {
+    // Register two synthetic PRT entries against a fake bridge,
+    // verify they round-trip through the global registry.
+    use crate::resource::PrtEntry;
+    crate::irq_routing::clear();
+    let entries = [
+        PrtEntry { address: 0x0001_FFFF, pin: 0, source: None, source_index: 11 },
+        PrtEntry { address: 0x0002_FFFF, pin: 1, source: None, source_index: 10 },
+    ];
+    crate::irq_routing::register_bridge("\\_SB.PCITEST", &entries);
+    if crate::irq_routing::len() != 2 {
+        return TestResult::Fail("registry length != 2 after register_bridge");
+    }
+    let r = crate::irq_routing::route_for("\\_SB.PCITEST", 1, 0);
+    let r = match r {
+        Some(r) => r,
+        None => return TestResult::Fail("route_for missed (slot 1, pin 0)"),
+    };
+    if r.entry.source_index != 11 {
+        return TestResult::Fail("route_for returned wrong GSI");
+    }
+    if crate::irq_routing::route_for("\\_SB.PCITEST", 0, 0).is_some() {
+        return TestResult::Fail("route_for matched a non-existent slot");
+    }
+    crate::irq_routing::clear();
+    if crate::irq_routing::len() != 0 {
+        return TestResult::Fail("clear didn't drain");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml", smoke_aml_irq_routing_register_and_query);

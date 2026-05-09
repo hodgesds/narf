@@ -50,18 +50,33 @@ impl From<ResourceError> for BridgeError {
 pub fn evaluate_prt_for(device_path: &str) -> Result<Vec<PrtEntry>, BridgeError> {
     let mut path = String::from(device_path);
     path.push_str("._PRT");
-    let method_path = path;
+    let prt_path = path;
 
-    // Confirm the node exists and is a Method.
-    let node = find_node(&method_path).ok_or(BridgeError::MethodNotFound)?;
-    if node.kind != NodeKind::Method {
-        return Err(BridgeError::MethodNotFound);
-    }
+    let node = find_node(&prt_path).ok_or(BridgeError::MethodNotFound)?;
+    let value = match node.kind {
+        NodeKind::Method => evaluate_method(&prt_path, &[])?,
+        NodeKind::Name => match node.value {
+            // Most QEMU / EDK2 firmware writes `Name(_PRT, Package
+            // {...})` rather than `Method(_PRT)`. Pull the recorded
+            // body bytes from the global AML store and feed them
+            // through the stateless decoder. The `Name` op + name
+            // segment have already been consumed during namespace
+            // build, so `(offset, length)` already points at the
+            // package opcode.
+            Some(crate::NameValue::Unparsed { offset, length }) => {
+                let mut body = alloc::vec![0u8; length];
+                let n = crate::copy_aml_bytes(offset, &mut body);
+                if n < length {
+                    return Err(AmlError::Truncated.into());
+                }
+                crate::eval::decode_value(&body)?
+            }
+            _ => return Err(BridgeError::BadReturn),
+        },
+        _ => return Err(BridgeError::MethodNotFound),
+    };
 
-    // Evaluate with no arguments.
-    let value = evaluate_method(&method_path, &[])?;
-
-    // _PRT must return a Package of sub-packages.
+    // _PRT must be a Package of sub-packages either way.
     match value {
         Value::Package(items) => Ok(decode_prt(&items)?),
         _ => Err(BridgeError::BadReturn),

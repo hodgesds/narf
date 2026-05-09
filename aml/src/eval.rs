@@ -123,9 +123,9 @@ impl EvalState {
 /// produced by `Return(...)` or `Value::Integer(0)` if the body falls through.
 pub fn evaluate_method(path: &str, args: &[Value]) -> Result<Value, AmlError> {
     // 1. Look up the node.
-    let node: AmlNode = crate::find_node(path).ok_or(AmlError::Truncated)?;
+    let node: AmlNode = crate::find_node(path).ok_or(AmlError::MethodNotFound)?;
     if node.kind != NodeKind::Method {
-        return Err(AmlError::Truncated);
+        return Err(AmlError::MethodNotFound);
     }
 
     // 2. Pull body bytes from the AML store.
@@ -146,6 +146,20 @@ pub fn evaluate_method(path: &str, args: &[Value]) -> Result<Value, AmlError> {
         Signal::Return(v) => Ok(v),
         _ => Ok(Value::Integer(0)),
     }
+}
+
+/// Decode a single AML term-arg from a byte slice as a `Value`.
+///
+/// This is the stateless variant of the inner `eval_term_arg`
+/// loop — useful for decoding `Name(X, Package(...))` bodies that
+/// the namespace builder stores as `NameValue::Unparsed{offset,
+/// length}`. There are no Locals / Args, so any opcode that needs
+/// per-frame state (Local0..Local7, Arg0..Arg6) returns
+/// `Value::Integer(0)`.
+pub fn decode_value(bytes: &[u8]) -> Result<Value, AmlError> {
+    let mut state = EvalState::new(&[]);
+    let mut cur = 0usize;
+    eval_term_arg(bytes, &mut cur, &mut state)
 }
 
 // ── Core walker ──────────────────────────────────────────────────────────────
@@ -794,11 +808,37 @@ fn eval_term_arg(buf: &[u8], cur: &mut usize, state: &mut EvalState) -> Result<V
         b if is_name_lead(b) => {
             *cur -= 1;
             let name = read_name_string(buf, cur, "\\")?;
-            // Look up the node and return its value.
-            match crate::find_node(&name) {
+            // Look up the node and return its value. For Unparsed
+            // bodies (Buffer / Package literals stored in Name
+            // nodes) we follow the (offset, length) into the AML
+            // store and run the stateless `decode_value` so a
+            // `Return (PRTP)` after a `Method(_PRT)` returns the
+            // actual Package, not Integer(0).
+            //
+            // The eval doesn't currently propagate the caller method's
+            // scope down here, so a relative lookup of `PRTP` from
+            // inside `\_SB.PCI0._PRT` first tries `\PRTP` (which
+            // misses) and falls back to a suffix search across the
+            // namespace. ACPI 6.5 §5.3 actually defines a
+            // root-then-walk-parents algorithm; this approximation is
+            // good enough for the patterns we see in QEMU + EDK2
+            // firmware (PRTA / PRTP / PIR* siblings of `_PRT`) and
+            // tightens up when full scope tracking lands.
+            let resolved = crate::find_node(&name)
+                .or_else(|| crate::find_node_by_suffix(&name));
+            match resolved {
                 Some(node) => match node.value {
                     Some(NameValue::Integer(v)) => Value::Integer(v),
                     Some(NameValue::String(s)) => Value::String(s),
+                    Some(NameValue::Unparsed { offset, length }) if length > 0 => {
+                        let mut body = alloc::vec![0u8; length];
+                        let n = crate::copy_aml_bytes(offset, &mut body);
+                        if n < length {
+                            Value::Integer(0)
+                        } else {
+                            decode_value(&body).unwrap_or(Value::Integer(0))
+                        }
+                    }
                     _ => Value::Integer(0),
                 },
                 None => Value::Integer(0),

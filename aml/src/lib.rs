@@ -48,6 +48,7 @@ use narf_memory::PhysAddr;
 
 pub mod eval;
 pub mod gpe;
+pub mod irq_routing;
 pub mod oregion;
 pub mod prt_crs;
 pub mod resource;
@@ -102,6 +103,12 @@ pub enum AmlError {
     BadNameSegment,
     /// DSDT was not present in the XSDT.
     NoDsdt,
+    /// `evaluate_method` couldn't find the requested method path,
+    /// or the path resolved to a non-Method node (Name / Device /
+    /// Field / etc.). Distinct from `Truncated` so callers (e.g.
+    /// the boot-time `_PIC` opt-in) can silently skip an absent
+    /// method instead of treating it as a parse failure.
+    MethodNotFound,
 }
 
 impl From<AcpiError> for AmlError {
@@ -245,6 +252,38 @@ pub fn find_node(path: &str) -> Option<AmlNode> {
     g.nodes.iter().find(|n| n.path == path).cloned()
 }
 
+/// Suffix-match fallback for the AML evaluator's relative-name
+/// lookups. Strips a leading `"\\"` from `path`, then returns the
+/// first node whose canonical path ends with `"." + tail` — so
+/// `"PRTP"` matches `"\\_SB.PCI0.PRTP"`. Used when the eval can't
+/// pin a name to the caller's exact scope (the eval doesn't yet
+/// thread caller-scope through every `read_name_string`).
+///
+/// This is an approximation of ACPI 6.5 §5.3's
+/// "scope-walk-up-then-root" rule; it works for sibling references
+/// inside a Method body (e.g. `Return(PRTP)` from `\_SB.PCI0._PRT`)
+/// but doesn't handle the rare case where two scopes export the
+/// same leaf name and only one is in-scope. Tightens to a real
+/// scope walk when the eval starts propagating
+/// `current_method_scope`.
+pub fn find_node_by_suffix(path: &str) -> Option<AmlNode> {
+    let tail = path.strip_prefix("\\").unwrap_or(path);
+    if tail.is_empty() {
+        return None;
+    }
+    let needle = {
+        let mut s = alloc::string::String::with_capacity(tail.len() + 1);
+        s.push('.');
+        s.push_str(tail);
+        s
+    };
+    let g = NAMESPACE.lock();
+    g.nodes
+        .iter()
+        .find(|n| n.path.ends_with(&needle))
+        .cloned()
+}
+
 /// Iterate every Device node, calling `f` with its path.
 ///
 /// `f` is called with the lock **released** — taking a snapshot
@@ -267,6 +306,18 @@ pub fn for_each_device<F: FnMut(&AmlNode)>(mut f: F) {
     }
 }
 
+/// Iterate every namespace node, calling `f`. Same lock-released
+/// callback contract as [`for_each_device`].
+pub fn for_each_node<F: FnMut(&AmlNode)>(mut f: F) {
+    let snapshot: alloc::vec::Vec<AmlNode> = {
+        let g = NAMESPACE.lock();
+        g.nodes.clone()
+    };
+    for n in &snapshot {
+        f(n);
+    }
+}
+
 /// Iterate every node of a specific kind, calling `f`.
 ///
 /// Same lock-released-during-callback contract as
@@ -283,6 +334,54 @@ pub fn for_each_node_of_kind<F: FnMut(&AmlNode)>(kind: NodeKind, mut f: F) {
     for n in &snapshot {
         f(n);
     }
+}
+
+/// Read a device's `_HID` property as a string. Returns the
+/// EISA-style ID (e.g. `"PNP0A03"`) when the namespace declares
+/// `_HID` as a literal `Name(_HID, "PNP0A03")` *or* as the more
+/// common integer-encoded EISA ID. The integer form is decoded via
+/// the standard EISA-ID-from-u32 algorithm (3 letters in
+/// bits[15:0] + 4 hex digits in bits[31:16]). Returns `None` when
+/// the device has no `_HID`, or when the value isn't a recognised
+/// shape.
+pub fn device_hid(device_path: &str) -> Option<alloc::string::String> {
+    use alloc::string::{String, ToString};
+    let mut hid_path = String::from(device_path);
+    hid_path.push_str("._HID");
+    let g = NAMESPACE.lock();
+    let node = g.nodes.iter().find(|n| n.path == hid_path)?;
+    match &node.value {
+        Some(NameValue::String(s)) => Some(s.clone()),
+        Some(NameValue::Integer(v)) => Some(eisa_id_from_u32(*v as u32)),
+        _ => None,
+    }
+}
+
+/// Decode the 32-bit EISA ID encoding used by ACPI `_HID` /
+/// `_CID` integer values into the canonical `"AAAxxxx"` string
+/// form. Bits[15:0] hold three 5-bit packed letters
+/// (`'A' + value - 1`); bits[31:16] hold a big-endian u16 of hex
+/// digits. The encoding is in ACPI 6.5 §5.6.7.
+pub fn eisa_id_from_u32(v: u32) -> alloc::string::String {
+    let l1 = ((v >> 2) & 0x1F) as u8;
+    let l2 = (((v & 0x3) << 3) | ((v >> 13) & 0x7)) as u8;
+    let l3 = ((v >> 8) & 0x1F) as u8;
+    let h0 = ((v >> 20) & 0xF) as u8;
+    let h1 = ((v >> 16) & 0xF) as u8;
+    let h2 = ((v >> 28) & 0xF) as u8;
+    let h3 = ((v >> 24) & 0xF) as u8;
+    fn nyb(n: u8) -> char {
+        if n < 10 { (b'0' + n) as char } else { (b'A' + n - 10) as char }
+    }
+    let mut s = alloc::string::String::with_capacity(7);
+    s.push(((l1 - 1) + b'A') as char);
+    s.push(((l2 - 1) + b'A') as char);
+    s.push(((l3 - 1) + b'A') as char);
+    s.push(nyb(h0));
+    s.push(nyb(h1));
+    s.push(nyb(h2));
+    s.push(nyb(h3));
+    s
 }
 
 /// Find the first Device node whose `_HID` property matches `hid`.
@@ -716,25 +815,72 @@ fn parse_term_list_inner(
                 p.skip(1)?;
                 let name = read_name_string(p, parent)?;
                 let path = full_path(name, parent);
-                // Body is a DataRefObject. Try to read a flat
-                // constant; on anything else we record an Unparsed
-                // value and skip to the next opcode-boundary
-                // heuristic — there's no PkgLength on Name so we
-                // peek the next byte after the value attempt.
-                // For Unparsed we conservatively skip 1 byte to
-                // avoid stalling; the parent's TermList loop will
-                // re-anchor on the next valid op.
-                let pos_before = p.pos;
-                let body_after = (p.pos + 1).min(p.buf.len());
-                let v = match try_read_simple_value(p, body_after) {
-                    Ok(v) => Some(v),
-                    Err(_) => {
-                        // Restore position; record Unparsed at this offset.
-                        p.pos = pos_before;
-                        Some(NameValue::Unparsed {
-                            offset: pos_before,
-                            length: 0,
-                        })
+                // Body is a DataRefObject. Three shapes worth
+                // distinguishing:
+                //
+                //   1. Flat constant (Zero/One/Byte/Word/Dword/Qword
+                //      /String). `try_read_simple_value` decodes +
+                //      advances; record `NameValue::Integer/String`.
+                //   2. Buffer (op 0x11) / Package (0x12) /
+                //      VarPackage (0x13). The body is `op | PkgLength
+                //      | payload`. We can't decode it inline (the
+                //      term-list parser doesn't run TermArgs) but we
+                //      MUST advance the cursor past the full body
+                //      so subsequent siblings parse correctly. Read
+                //      the PkgLength to get the right extent and
+                //      record `Unparsed { offset, length }` pointing
+                //      at the op byte so consumers (prt_crs,
+                //      eval::decode_value) can decode later.
+                //   3. Anything else — fall back to
+                //      `try_read_simple_value`'s catch-all (skips
+                //      one byte, records Unparsed{length: ...}).
+                let body_start = p.pos;
+                let op = p.peek().unwrap_or(0);
+                let v = if op == BUFFER_OP || op == PACKAGE_OP || op == VAR_PACKAGE_OP {
+                    // Skip the op byte, then read PkgLength to get
+                    // the rest of the body's size. PkgLength encodes
+                    // its own bytes + the payload; total body =
+                    // 1 (op) + pkg_len.
+                    p.skip(1)?;
+                    let pkg_payload_start = p.pos;
+                    let pkg_len = read_pkg_length(p)?;
+                    let total_body = 1 + pkg_len; // op + (pkglen + payload)
+                    let body_end = pkg_payload_start
+                        .checked_add(pkg_len)
+                        .ok_or(AmlError::Truncated)?
+                        .min(p.buf.len());
+                    p.pos = body_end;
+                    Some(NameValue::Unparsed {
+                        offset: base + body_start,
+                        length: total_body,
+                    })
+                } else {
+                    // Bound for the simple-value fallback. There's no
+                    // PkgLength on a flat Name body, so we let the
+                    // decoder consume what it recognises and only
+                    // skip one byte if it bails — the parent
+                    // TermList loop re-anchors on the next valid op.
+                    let body_after = (p.pos + 1).min(p.buf.len());
+                    match try_read_simple_value(p, body_after) {
+                        Ok(NameValue::Unparsed { offset, length }) => {
+                            // Translate cursor-relative offset into
+                            // an absolute AML-store offset for the
+                            // benefit of `eval::decode_value`.
+                            Some(NameValue::Unparsed {
+                                offset: base + offset,
+                                length,
+                            })
+                        }
+                        Ok(v) => Some(v),
+                        Err(_) => {
+                            // Defensive: if the helper threw
+                            // Truncated mid-decode, leave the cursor
+                            // alone and record a zero-length stub.
+                            Some(NameValue::Unparsed {
+                                offset: base + body_start,
+                                length: 0,
+                            })
+                        }
                     }
                 };
                 push_node(AmlNode {

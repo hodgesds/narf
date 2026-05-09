@@ -51,8 +51,15 @@ pub unsafe fn enumerate_n(ecam_base: PhysAddr, n_buses: u16) -> Vec<BusDevice> {
             // SAFETY: ecam_base + offset is inside the ECAM region per
             // the MAX_BUSES bound; reads are 4-byte aligned.
             let vendor_device = unsafe { ecam_read32(cfg0) };
-            if (vendor_device & 0xFFFF) == 0xFFFF {
-                continue; // slot empty
+            let v0 = vendor_device & 0xFFFF;
+            // PCI Local Bus 3.0: vendor ID `0xFFFF` means "no
+            // device responded" (cfg cycle aborted). Vendor ID
+            // `0x0000` is reserved + has been observed coming back
+            // from unmapped ECAM regions on UEFI platforms whose
+            // firmware-as-ROM mapping returns zeros instead of
+            // forwarding the cfg cycle. Treat both as empty.
+            if v0 == 0xFFFF || v0 == 0x0000 {
+                continue;
             }
 
             // SAFETY: same as above; offset 0x0C holds header/class.
@@ -68,7 +75,8 @@ pub unsafe fn enumerate_n(ecam_base: PhysAddr, n_buses: u16) -> Vec<BusDevice> {
                 let vd = unsafe { ecam_read32(cfg) };
                 let vendor = (vd & 0xFFFF) as u16;
                 let device = ((vd >> 16) & 0xFFFF) as u16;
-                if vendor == 0xFFFF {
+                // Same empty-slot test as the function-0 probe above.
+                if vendor == 0xFFFF || vendor == 0x0000 {
                     continue;
                 }
 
