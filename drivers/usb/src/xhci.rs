@@ -713,6 +713,12 @@ impl Xhci {
         let _ = unsafe { msix.program_vector(0, 0, v) }.map_err(|_| XhciError::NoMemory)?;
         // SAFETY: cfg-space write to a known cap-list offset.
         let _ = unsafe { msix.enable() }.map_err(|_| XhciError::NoMemory)?;
+        // Real ISR — drains the event ring + acknowledges
+        // interrupter IP. Replaces the previous fire-count-only
+        // pattern; the supervisor pump's wait_for_irq still
+        // observes the fire-count bump but the level-triggered
+        // IRQ now de-asserts cleanly.
+        narf_interrupts::install_handler(v, xhci_isr);
         Ok((msix, v))
     }
 
@@ -763,10 +769,10 @@ impl Xhci {
         }
         let gsi = route.entry.source_index;
         let v = narf_interrupts::vector::alloc().ok()?;
-        // No-op sync handler — the supervisor pump's
-        // wait_for_irq future observes the fire-count bump.
-        fn intx_noop_handler() {}
-        narf_interrupts::install_handler(v, intx_noop_handler);
+        // Real ISR — drains the event ring + acknowledges IP.
+        // PCI INTx is level-triggered: without the IMAN.IP write
+        // the line stays asserted and the IRQ re-fires forever.
+        narf_interrupts::install_handler(v, xhci_isr);
         // Program IOAPIC: PCI INTx is level / active-low.
         // SAFETY: vector + handler set above before the route.
         let ok = unsafe {
@@ -1764,4 +1770,56 @@ pub fn is_probed() -> bool {
 
 pub fn with_controller<R>(f: impl FnOnce(&Xhci) -> R) -> Option<R> {
     CONTROLLER.lock().as_ref().map(f)
+}
+
+/// xHCI ISR — runs in IRQ context.
+///
+/// Two responsibilities per xHCI base spec §5.5.2.3.3 +
+/// §4.17.5:
+/// 1. Acknowledge the level-triggered IRQ at the interrupter
+///    by writing 1 to IMAN.IP (the bit is RW1C). Without this,
+///    INTx-routed controllers re-assert the line forever and
+///    every other CPU also gets the same vector.
+/// 2. Drain pending event-ring TRBs so subsequent IRQs see a
+///    fresh ring rather than re-firing on stale events. The
+///    supervisor pump still inspects device state via
+///    `pump_all`, which is what produces user-visible HID
+///    events; this ISR just keeps the ring + IRQ-ack hygiene
+///    correct.
+///
+/// Bounded: drains at most 64 events per IRQ to keep handler
+/// latency predictable. A storm of events spreads across
+/// successive ISR invocations; the IMAN.IP write keeps the
+/// IRQ live until the ring is empty (next-tick if we hit the
+/// per-IRQ cap).
+fn xhci_isr() {
+    // Try-lock pattern would be ideal here, but IrqSafeSpinLock
+    // is non-poisonable + non-trying. The lock is held only
+    // for short windows by Xhci submit/poll paths; collision
+    // in IRQ context is rare and safe (IRQ delivery already
+    // disabled IF). If the controller's gone, no-op.
+    let g = CONTROLLER.lock();
+    let xhci = match g.as_ref() {
+        Some(x) => x,
+        None => return,
+    };
+    // Drain up to N events. poll_event takes the per-call
+    // er_dequeue + er_ccs spinlocks — same locks the
+    // command-issuance path uses but only for short windows.
+    const MAX_DRAIN_PER_IRQ: usize = 64;
+    for _ in 0..MAX_DRAIN_PER_IRQ {
+        if xhci.poll_event().is_none() {
+            break;
+        }
+    }
+    // Acknowledge IMAN.IP for interrupter 0. Read-modify-write:
+    // preserve IE, write 1 to IP (W1C).
+    let ir0 = xhci.rts_off + IR_BASE_OFF;
+    // SAFETY: identity-mapped MMIO; xhci stays alive for the
+    // duration of the lock guard.
+    unsafe {
+        let cur = xhci.mmio.read32(ir0 + IR_IMAN);
+        // Mask to (IE | IP) to W1C the IP bit while keeping IE set.
+        xhci.mmio.write32(ir0 + IR_IMAN, cur | IMAN_IP);
+    }
 }
