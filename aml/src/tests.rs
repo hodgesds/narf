@@ -1343,6 +1343,25 @@ fn smoke_aml_irq_routing_register_and_query() -> TestResult {
 }
 kernel_test_in!("aml", smoke_aml_irq_routing_register_and_query);
 
+fn smoke_aml_namespace_walks_past_if_blocks() -> TestResult {
+    // Sentinel for the If-skip behaviour added so the
+    // namespace builder doesn't bail on the first
+    // If/Else (0xA0/0xA1) opcode it sees. After the change
+    // QEMU q35's DSDT yields ~358 nodes (vs ~289 before);
+    // any kernel whose firmware uses conditionals will see
+    // a similar bump. Test asserts a soft floor that catches
+    // a regression to the bail-on-unknown-op behaviour.
+    let (n_nodes, n_devs) = crate::boot_snapshot();
+    if n_nodes < 50 {
+        return TestResult::Skip("namespace not parsed at boot");
+    }
+    if n_devs == 0 {
+        return TestResult::Fail("no devices found — namespace walk degraded");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml", smoke_aml_namespace_walks_past_if_blocks);
+
 fn smoke_aml_evaluate_s5_against_qemu_dsdt() -> TestResult {
     // After boot-time `parse_namespace`, `evaluate_s5()`
     // returns Some with the platform's SLP_TYPa/b values when

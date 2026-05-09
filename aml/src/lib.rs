@@ -528,6 +528,8 @@ const PARENT_PREFIX: u8 = b'^';
 const DUAL_NAME_PREFIX: u8 = 0x2E;
 const MULTI_NAME_PREFIX: u8 = 0x2F;
 const ONES_OP: u8 = 0xFF;
+const IF_OP: u8 = 0xA0;
+const ELSE_OP: u8 = 0xA1;
 
 // Extended opcodes (after 0x5B prefix).
 const EXT_MUTEX_OP: u8 = 0x01;
@@ -1120,6 +1122,27 @@ fn parse_term_list_inner(
                 // as opaque — bail out so the outer caller can
                 // re-anchor.
                 return Ok(());
+            }
+            IF_OP | ELSE_OP => {
+                // Conditional block. Spec (ACPI 6.5 §20.2.5.3):
+                //   IfOp PkgLength Predicate TermList
+                //   ElseOp PkgLength TermList
+                // Without a runtime evaluator we can't evaluate the
+                // predicate, so skip the entire package and continue
+                // the outer term-list. This loses any Names defined
+                // inside the if-body (e.g. QEMU q35 wraps `\_S5`
+                // inside `If(_OSI(...))` and we don't see it), but
+                // it lets sibling Names that *follow* the If parse
+                // correctly — previously the parser bailed on the
+                // unknown opcode and dropped everything after the
+                // first conditional. A future pass should plumb
+                // eval::eval_term_arg into the namespace builder so
+                // the body actually gets walked. (#42 follow-up.)
+                p.skip(1)?;
+                let pkg_start = p.pos;
+                let pkg_len = read_pkg_length(p)?;
+                let pkg_end = pkg_start.saturating_add(pkg_len).min(p.buf.len());
+                p.pos = pkg_end;
             }
             _ => {
                 // Anything else: best-effort skip of one byte.
