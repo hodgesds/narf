@@ -338,16 +338,18 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // long-mode CPUs; the bootloader-provided CR3's low bits
             // are zero.
             narf_memory::beacon::paint(25, 0x0000FFC0); // aqua: pre-PCID
-            // BUILD MARKER: bright RED at slot 33, painted right
-            // after slot 25 and BEFORE the call to enable_pcide.
-            // If you see RED here you're on this build (otherwise
-            // older ISO is on the USB stick).
-            narf_memory::beacon::paint(33, 0x00FF_0000);
+            // BUILD MARKER: bright RED at slot 26 (right next to
+            // the aqua at slot 25). Painted BEFORE calling
+            // enable_pcide so its presence proves: (a) this build
+            // is what's running, (b) we reached this point.
+            // Earlier marker at slot 33 was off-screen on
+            // 1024-wide UEFI GOP defaults.
+            narf_memory::beacon::paint(26, 0x00FF_0000);
             unsafe {
                 narf_arch::x86_64::pcid::enable_pcide();
                 narf_arch::x86_64::pcid::init();
             }
-            narf_memory::beacon::paint(26, 0x0040FFC0); // pale-cyan: PCID init done
+            narf_memory::beacon::paint(21, 0x0040FFC0); // pale-cyan: PCID init done
             // Allocate + register 16 per-domain PML4 clones, spread
             // across NUMA nodes. Domain D's PML4 lands on node
             // (D % num_nodes) so PML4 reads on a CPU local to that
