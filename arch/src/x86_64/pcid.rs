@@ -145,23 +145,12 @@ pub unsafe fn enable_pcide() {
     // PCID — setting the bit would #GP. All Zen / modern Intel
     // expose this; a missing bit means we're on truly legacy
     // silicon (or a hypervisor masking the feature).
-    let cpuid_ecx: u32;
-    unsafe {
-        core::arch::asm!(
-            "push rbx",
-            "mov eax, 1",
-            "cpuid",
-            "mov {ecx:e}, ecx",
-            "pop rbx",
-            ecx = out(reg) cpuid_ecx,
-            out("eax") _,
-            out("ecx") _,
-            out("edx") _,
-            options(nostack, preserves_flags),
-        );
-    }
+    //
+    // SAFETY: `__cpuid` is always legal at CPL=0; leaf 1 exists
+    // on every x86_64 CPU.
+    let leaf1 = unsafe { core::arch::x86_64::__cpuid(1) };
     crate::beacon_paint(28, 0x00C0FFC0); // post-CPUID
-    if cpuid_ecx & (1u32 << 17) == 0 {
+    if leaf1.ecx & (1u32 << 17) == 0 {
         crate::beacon_paint(29, 0x00FF0000); // RED — CPU has no PCID
         return;
     }
