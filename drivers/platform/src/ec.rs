@@ -440,30 +440,6 @@ pub fn init_sci(ec_gpe_bit: Option<u8>) {
                 narf_acpi::ioapic::POLARITY_LOW | narf_acpi::ioapic::TRIGGER_LEVEL,
             ));
 
-        // Locate the IOAPIC owning that GSI.
-        let mut ioapics = [narf_acpi::IoApic::default(); narf_acpi::MAX_IOAPICS];
-        let n_io = narf_acpi::copy_ioapics(&mut ioapics);
-        let target = ioapics[..n_io].iter().find_map(|io| {
-            // SAFETY: IOAPIC base from a checksummed MADT.
-            let h = unsafe { narf_acpi::ioapic::probe(io.address as u64, io.gsi_base) };
-            if gsi >= h.gsi_base && gsi <= h.gsi_end {
-                Some(h)
-            } else {
-                None
-            }
-        });
-        let target = match target {
-            Some(t) => t,
-            None => {
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "  acpi-ec: no IOAPIC covers SCI GSI {}",
-                    gsi
-                );
-                return;
-            }
-        };
-
         let vector = match narf_interrupts::vector::alloc() {
             Ok(v) => v,
             Err(_) => {
@@ -476,16 +452,14 @@ pub fn init_sci(ec_gpe_bit: Option<u8>) {
         };
         narf_interrupts::install_handler(vector, dispatch_sci);
 
-        // Program the IOAPIC redirection-table entry. Dest =
-        // BSP (APIC ID 0). SAFETY: vector + handler set above
-        // before unmask; IOAPIC handle freshly probed.
-        let ok = unsafe {
-            narf_acpi::ioapic::program_entry(&target, gsi, vector, 0, ioapic_flags)
-        };
+        // Route the GSI through the IOAPIC owning it. Dest = BSP
+        // (APIC id 0). SAFETY: vector + handler installed above
+        // before this routes the line.
+        let ok = unsafe { narf_acpi::ioapic::route_gsi_to_vector(gsi, vector, 0, ioapic_flags) };
         if !ok {
             let _ = writeln!(
                 narf_console::Writer,
-                "  acpi-ec: IOAPIC program_entry rejected GSI {}",
+                "  acpi-ec: IOAPIC route_gsi_to_vector rejected GSI {}",
                 gsi
             );
             return;
@@ -494,8 +468,8 @@ pub fn init_sci(ec_gpe_bit: Option<u8>) {
         narf_acpi::acpi_enable();
         let _ = writeln!(
             narf_console::Writer,
-            "  acpi-ec: SCI dispatcher installed (SCI_INT {} → GSI {} → vec {} on IOAPIC@{:#x}, level/active-low, ec_gpe={:?})",
-            pm.sci_int, gsi, vector, target.base_phys, ec_gpe_bit
+            "  acpi-ec: SCI dispatcher installed (SCI_INT {} → GSI {} → vec {}, level/active-low, ec_gpe={:?})",
+            pm.sci_int, gsi, vector, ec_gpe_bit
         );
     }
 }

@@ -22,6 +22,8 @@ narf-drivers      = { path = "../" }
 narf-init         = { path = "../../init" }
 narf-input        = { path = "../../input" }
 narf-interrupts   = { path = "../../interrupts" }
+narf-acpi         = { path = "../../acpi" }
+narf-aml          = { path = "../../aml" }
 narf-console      = { path = "../../console" }
 narf-scheduler    = { path = "../../scheduler" }
 narf-time         = { path = "../../time" }

@@ -203,3 +203,40 @@ pub unsafe fn read_id(h: &IoApicHandle) -> u8 {
     let v = unsafe { read_reg_locked(h.base_phys, IDX_IOAPICID) };
     ((v >> 24) & 0x0F) as u8
 }
+
+/// One-stop GSI → vector router: walks the MADT-discovered IOAPICs,
+/// finds the one whose range covers `gsi`, probes it, and programs
+/// its redirection-table entry to deliver `vector` to `dest_apic`
+/// with the given polarity / trigger / mask flags. Returns `true`
+/// on success.
+///
+/// Replaces the per-driver pattern of (probe IOAPIC, find covering,
+/// call program_entry) — used by `narf-drivers-platform::ec`'s SCI
+/// install and by the xHCI INTx fallback. Constants for `flags` live
+/// in this module: `POLARITY_*`, `TRIGGER_*`, `MASKED`.
+///
+/// # Safety
+/// Caller asserts `vector` is one `narf_interrupts` is willing to
+/// dispatch (typically freshly allocated via `vector::alloc`), and
+/// that the corresponding handler is installed before this routes
+/// the line — otherwise the next IRQ delivery hits an unconfigured
+/// dispatch slot.
+pub unsafe fn route_gsi_to_vector(
+    gsi: u32,
+    vector: u8,
+    dest_apic: u8,
+    flags: u32,
+) -> bool {
+    let mut ioapics = [crate::IoApic::default(); crate::MAX_IOAPICS];
+    let n = crate::copy_ioapics(&mut ioapics);
+    for io in &ioapics[..n] {
+        // SAFETY: IOAPIC base from a checksummed MADT.
+        let h = unsafe { probe(io.address as u64, io.gsi_base) };
+        if gsi >= h.gsi_base && gsi <= h.gsi_end {
+            // SAFETY: handle freshly probed; caller asserts vector
+            // + handler readiness.
+            return unsafe { program_entry(&h, gsi, vector, dest_apic, flags) };
+        }
+    }
+    false
+}

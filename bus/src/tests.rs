@@ -1341,3 +1341,45 @@ fn smoke_aer_classifier_severity() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bus", smoke_aer_classifier_severity);
+
+// ── PCI INTx pin reader smoke ──────────────────────────────────────
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_bus_pci_read_intx_pin_against_devices() -> TestResult {
+    // Walk every claimed PCIe device and verify read_intx_pin
+    // returns a value in {0, 1, 2, 3, 4} (PCI Local Bus Spec
+    // §6.2.4). 0 = no INTx; 1-4 = INTA-INTD. Anything else is
+    // a config-space read corruption — would catch a regression
+    // in pcie_cfg_phys's offset arithmetic.
+    use crate::x86_64::ECAM_DEFAULT_BASE;
+    use crate::{
+        bootstrap_registry_authority, claim_device_cap, devices, pci::read_intx_pin, BusKind,
+    };
+    let _ = unsafe { crate::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let mut tested = 0u32;
+    for d in devs.iter() {
+        if !matches!(d.kind, BusKind::Pcie { .. }) {
+            continue;
+        }
+        let authority = bootstrap_registry_authority();
+        let (_h, cap) = match claim_device_cap(&authority, d.addr) {
+            Ok(ok) => ok,
+            Err(_) => continue,
+        };
+        let pin = match read_intx_pin(&cap, d) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if pin > 4 {
+            return TestResult::Fail("INTERRUPT_PIN out of {0..4}");
+        }
+        tested += 1;
+    }
+    if tested == 0 {
+        return TestResult::Skip("no claimable PCIe devices");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("bus/pci", smoke_bus_pci_read_intx_pin_against_devices);

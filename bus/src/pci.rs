@@ -139,6 +139,31 @@ unsafe fn cfg_write16(cfg: PhysAddr, off: u64, value: u16) {
     compiler_fence(Ordering::SeqCst);
 }
 
+/// PCI config-space offset for the INTx pin field (PCI Local Bus
+/// Specification §6.2.4: byte 0x3D, values 0=no INTx, 1=INTA,
+/// 2=INTB, 3=INTC, 4=INTD).
+const INTERRUPT_PIN_OFFSET: u64 = 0x3D;
+
+/// Read the device's INTx interrupt-pin selector. Returns `0` for
+/// devices that don't drive a legacy INTx line, `1..=4` for
+/// INTA..INTD. Used by the INTx fallback in drivers (e.g. xHCI)
+/// when MSI-X cap walking fails — combined with the device's
+/// slot via the AML `_PRT` lookup it resolves to the GSI to
+/// route through the IOAPIC.
+///
+/// Cap-gated; the cap's epoch is checked.
+pub fn read_intx_pin(
+    cap: &Cap<BusDeviceCap, Write>,
+    device: &BusDevice,
+) -> Result<u8, PciError> {
+    cap.check_live()?;
+    let cfg = pcie_cfg_phys(device)?;
+    // SAFETY: cfg-space is identity-mapped for the lifetime of
+    // the BusDevice; offset 0x3D is well inside the type-0
+    // header.
+    Ok(unsafe { core::ptr::read_volatile((cfg.raw() + INTERRUPT_PIN_OFFSET) as *const u8) })
+}
+
 /// Compute the GIC ITS DeviceID for a PCIe function. ITS uses the
 /// bus master's RequesterID — for PCIe that's just the BDF packed
 /// into a 16-bit value: `(bus << 8) | (dev << 3) | fn`. Same shape

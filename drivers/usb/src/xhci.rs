@@ -656,14 +656,18 @@ impl Xhci {
             return Err(XhciError::StartFailed);
         }
 
-        // Try to bring up MSI-X for interrupter 0. Failure here is
-        // non-fatal — a controller without MSI-X (or one whose
-        // capability walk we can't honour) keeps the polling pump
-        // cadence in `usb-hid-supervisor`. Pattern mirrors
-        // `narf_drivers_nvme::Controller::create_io_queue_msix`.
+        // Try MSI-X first, fall back to legacy INTx via PCI _PRT
+        // + IOAPIC programming, fall back to polling if neither
+        // works. Cap walking failures, firmware MSI-X disable
+        // bits, and platforms whose firmware never enabled MSI-X
+        // all land in the INTx path. Pattern: same as the
+        // Linux pcie_msi → pcie_intx fallback chain.
         let (msix, irq_vector) = match Self::try_enable_msix(cap, device) {
             Ok((tbl, v)) => (Some(tbl), Some(v)),
-            Err(_) => (None, None),
+            Err(_) => match Self::try_install_intx(cap, device) {
+                Some(v) => (None, Some(v)),
+                None => (None, None),
+            },
         };
 
         Ok(Self {
@@ -693,7 +697,7 @@ impl Xhci {
     /// vector + table slot, program slot 0 to deliver to BSP, and
     /// flip the global MSI-X enable. Returns `(table, vector)` on
     /// success. Failure propagates to the bring-up path which
-    /// falls back to the polling pump.
+    /// falls back to INTx (try_install_intx) then to polling.
     fn try_enable_msix(
         cap: &Cap<BusDeviceCap, Write>,
         device: &BusDevice,
@@ -710,6 +714,80 @@ impl Xhci {
         // SAFETY: cfg-space write to a known cap-list offset.
         let _ = unsafe { msix.enable() }.map_err(|_| XhciError::NoMemory)?;
         Ok((msix, v))
+    }
+
+    /// Legacy INTx fallback: read PCI INTERRUPT_PIN, look up the
+    /// (bridge, slot, pin) triple in the AML `_PRT` routing
+    /// table, allocate an IDT vector, install a fire-counter
+    /// handler, and program the IOAPIC redirection-table entry
+    /// for the resolved GSI.
+    ///
+    /// PCI INTx is level-triggered, active-low (PCI Local Bus
+    /// Spec §2.2.6). We don't support `_PRT.source` (interrupt
+    /// link devices) yet — entries with a named link source
+    /// return None and the caller falls through to polling.
+    /// Real Ryzen / EDK2 firmware tends to expose direct GSI
+    /// _PRT entries (source = NULL), so this covers the common
+    /// case.
+    ///
+    /// The handler is a no-op fire counter — same pattern the
+    /// MSI-X path uses, where the actual event-ring drain is
+    /// done by the supervisor pump task awaiting `wait_for_irq`.
+    /// Returns the allocated vector, or None on any failure.
+    #[cfg(target_arch = "x86_64")]
+    fn try_install_intx(
+        cap: &Cap<BusDeviceCap, Write>,
+        device: &BusDevice,
+    ) -> Option<u8> {
+        let pin = narf_bus::pci::read_intx_pin(cap, device).ok()?;
+        if pin == 0 || pin > 4 {
+            return None; // device doesn't drive an INTx line
+        }
+        let slot = match device.kind {
+            narf_bus::BusKind::Pcie { addr, .. } => addr.device,
+            _ => return None,
+        };
+        // PCI _PRT pin is 0-based (0=INTA..3=INTD); cfg-space
+        // pin is 1-based. Map between them.
+        let prt_pin = pin - 1;
+        // Today every QEMU q35 bridge AML lives at "\\_SB.PCI0";
+        // real consumer BIOSes match this convention. Multi-root
+        // systems (rare) need bridge resolution from the device's
+        // segment/bus, filed as a follow-up if it ever fires.
+        let route = narf_aml::irq_routing::route_for("\\_SB.PCI0", slot, prt_pin)?;
+        if route.entry.source.is_some() {
+            // Named-link _PRT entry — needs link-device _CRS
+            // evaluation to learn the current GSI. Not yet
+            // supported.
+            return None;
+        }
+        let gsi = route.entry.source_index;
+        let v = narf_interrupts::vector::alloc().ok()?;
+        // No-op sync handler — the supervisor pump's
+        // wait_for_irq future observes the fire-count bump.
+        fn intx_noop_handler() {}
+        narf_interrupts::install_handler(v, intx_noop_handler);
+        // Program IOAPIC: PCI INTx is level / active-low.
+        // SAFETY: vector + handler set above before the route.
+        let ok = unsafe {
+            narf_acpi::ioapic::route_gsi_to_vector(
+                gsi,
+                v,
+                0, // dest = BSP
+                narf_acpi::ioapic::POLARITY_LOW | narf_acpi::ioapic::TRIGGER_LEVEL,
+            )
+        };
+        if !ok {
+            return None;
+        }
+        Some(v)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    fn try_install_intx(
+        _cap: &Cap<BusDeviceCap, Write>,
+        _device: &BusDevice,
+    ) -> Option<u8> {
+        None
     }
 
     pub fn version(&self) -> u16 {
