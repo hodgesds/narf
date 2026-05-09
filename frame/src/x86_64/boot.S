@@ -31,6 +31,24 @@ mb2_header_start:
     .long mb2_header_end - mb2_header_start          /* hdr length  */
     .long -(0xe85250d6 + 0 + (mb2_header_end - mb2_header_start)) /* checksum */
 
+    /* Framebuffer-request tag — multiboot2 §3.1.10 (type 5). Asks
+     * the bootloader to set up a graphical RGB framebuffer instead
+     * of leaving us in EGA text mode; without this, Limine on real
+     * hardware boots the kernel with no framebuffer info tag and
+     * we get a UART-only console. flags=1 (optional) so a loader
+     * that can't honour the request still boots us — the kernel
+     * already handles the no-FB case gracefully (serial console).
+     * Width/height/depth = 0 = "let the loader pick the preferred
+     * mode" (1024x768x32 on most QEMU/OVMF combos; native panel
+     * resolution on real hardware via GOP). */
+    .align 8
+    .short 5                                         /* type = 5    */
+    .short 1                                         /* flags = optional */
+    .long 20                                         /* size = 20   */
+    .long 0                                          /* width       */
+    .long 0                                          /* height      */
+    .long 0                                          /* depth       */
+
     /* End tag — type 0, flags 0, size 8. */
     .align 8
     .short 0
