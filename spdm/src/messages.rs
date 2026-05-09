@@ -8,6 +8,7 @@ use alloc::vec::Vec;
 
 pub const SPDM_VERSION_12: u8 = 0x12;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestCode {
     GetVersion = 0x84,
     GetCapabilities = 0xE1,
@@ -15,6 +16,7 @@ pub enum RequestCode {
     GetMeasurements = 0xE5,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseCode {
     Version = 0x04,
     Capabilities = 0x61,
@@ -34,6 +36,7 @@ pub enum ErrorCode {
     RequestResend = 0x08,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpdmHeader {
     pub version: u8,
     pub code: u8,
@@ -62,6 +65,7 @@ impl SpdmHeader {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GetVersionRequest;
 
 impl GetVersionRequest {
@@ -78,6 +82,7 @@ impl GetVersionRequest {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GetCapabilitiesRequest {
     pub ct_exponent: u8,
     pub flags: u32,
@@ -101,6 +106,7 @@ impl GetCapabilitiesRequest {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GetMeasurementsRequest {
     pub measurement_attributes: u8,
     pub measurement_operation: u8,

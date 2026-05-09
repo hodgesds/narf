@@ -329,7 +329,8 @@ pub fn __reset_for_test() {
 /// caller can compute its own time-conversion (the stats hold
 /// raw cycles).
 pub fn print_summary(w: &mut dyn core::fmt::Write) -> core::fmt::Result {
-    use core::fmt::Write as _;
+    // The Write trait is in scope via the `dyn` parameter type;
+    // method calls like writeln! resolve through that.
     writeln!(w, "  init summary:")?;
     writeln!(
         w,

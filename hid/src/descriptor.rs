@@ -249,8 +249,8 @@ pub fn parse(blob: &[u8]) -> Result<ReportDescriptor, DescriptorError> {
     let mut local = LocalState::default();
     let mut globals_stack: Vec<GlobalState> = Vec::new();
     let mut collection_stack: Vec<(u16, u16)> = Vec::new();
-    /// Bit offsets indexed by `report_id` — kept per (id, kind).
-    /// Kind is encoded as 0/1/2 for Input/Output/Feature.
+    // Bit offsets indexed by `report_id` — kept per (id, kind).
+    // Kind is encoded as 0/1/2 for Input/Output/Feature.
     let mut bit_offsets: [Vec<(u8, u32)>; 3] = Default::default();
     let mut has_report_ids = false;
 

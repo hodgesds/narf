@@ -6660,7 +6660,7 @@ fn smoke_abi_dispatcher_serves_file_ops() -> TestResult {
         let mut sub = Submission::noop(Tag::new(0x11));
         sub.op = OpCode::Read;
         sub.inline[0] = fd;
-        sub.inline[1] = unsafe { core::ptr::addr_of_mut!(READ_BUF) as u64 };
+        sub.inline[1] = core::ptr::addr_of_mut!(READ_BUF) as u64;
         sub.inline[2] = 16;
         sq.send(sub).await.unwrap();
         let comp = cq.recv().await.unwrap();
@@ -6671,7 +6671,12 @@ fn smoke_abi_dispatcher_serves_file_ops() -> TestResult {
             return;
         }
         let n = comp.result[0] as usize;
-        let buf = unsafe { &READ_BUF };
+        // SAFETY: single-threaded test; only this body reads
+        // READ_BUF after the syscall populates it. `&raw const`
+        // (Rust 2024) avoids the rust_2024_compatibility
+        // static_mut_refs lint by going through a raw pointer
+        // instead of a `&` reference.
+        let buf = unsafe { &*(&raw const READ_BUF) };
         if &buf[..n] == FILE_BYTES {
             OUTCOME.store(1, Ordering::Relaxed);
         } else {

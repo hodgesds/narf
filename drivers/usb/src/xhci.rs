@@ -318,6 +318,13 @@ pub struct Xhci {
     /// the supervisor pump can then `wait_for_irq(irq_vector).await`
     /// on event-ring updates instead of busy-polling. `None` falls
     /// back to the polling pump cadence.
+    ///
+    /// Held purely for ownership — never read after construction.
+    /// Drop releases the MSI-X cap (clears the global enable bit
+    /// + restores the device's INTx routing). `#[allow(dead_code)]`
+    /// because the field is load-bearing for Drop semantics; the
+    /// compiler can't see that.
+    #[allow(dead_code)]
     msix: Option<MsixTable>,
     /// IDT vector allocated for this controller's interrupter 0,
     /// or `None` if MSI-X wasn't enabled.

@@ -305,7 +305,7 @@ fn smoke_fat_mount_root_via_vfs_resolve() -> TestResult {
     
     use narf_block::ram::RamBlockDevice;
     use narf_filesystem::{
-        bootstrap_mount_authority, registry, resolve_async, FsInstance,
+        bootstrap_mount_authority, registry, resolve_async,
     };
     use narf_lib::id::DomainId;
 

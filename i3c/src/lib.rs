@@ -3,7 +3,6 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 use async_trait::async_trait;
 use core::task::Waker;
 use narf_capabilities::{CapKind, CapType};
@@ -55,6 +54,7 @@ pub fn register_initcalls() {}
 mod tests {
     use super::*;
     use alloc::sync::Arc;
+    use alloc::vec::Vec;
     use narf_kernel_test::{kernel_test_in, TestResult};
     use narf_lib::sync::IrqSafeSpinLock;
 

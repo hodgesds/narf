@@ -23,5 +23,13 @@ narf-scheduler    = { path = "../scheduler" }
 narf-time         = { path = "../time" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 
+[features]
+# Declared so `#[cfg(feature = "user-mode-e2e")]` in tests
+# don't trip the unexpected_cfgs lint. The frame crate's
+# `user-mode-e2e` feature drives the test-bin runner; this
+# entry mirrors the name so tests/ source can guard against
+# it.
+user-mode-e2e = []
+
 [lints]
 workspace = true

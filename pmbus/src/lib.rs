@@ -39,6 +39,7 @@ pub trait PmBusMonitor: Send + Sync {
     async fn read_telemetry(&self) -> Result<PowerReading, PmBusError>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PmBusInfo {
     pub manufacturer: Vec<u8>,
     pub model: Vec<u8>,

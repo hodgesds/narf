@@ -158,7 +158,9 @@ impl PayloadHeader {
             }
             let sof = u32::from_le_bytes([buf[p], buf[p + 1], buf[p + 2], buf[p + 3]]);
             let clock = (buf[p + 4] as u16) | (((buf[p + 5] as u16) & 0x07) << 8);
-            p += 6;
+            // No further reads of `p` in this scope — the SCR
+            // chunk is the last optional field before the
+            // constructor returns.
             Some((sof, clock))
         } else {
             None

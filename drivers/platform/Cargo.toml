@@ -32,5 +32,8 @@ narf-time         = { path = "../../time" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
 async-trait       = "0.1"
 
+[features]
+kernel-test = []
+
 [lints]
 workspace = true

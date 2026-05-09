@@ -26,5 +26,12 @@ narf-acpi         = { path = "../../acpi" }
 narf-aml          = { path = "../../aml" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
 
+[features]
+# Declared so `#[cfg(feature = "kernel-test")]` in src/ doesn't
+# trip the unexpected_cfgs lint. Empty body — gating is purely
+# at the source level; the kernel-test harness pulls these
+# crates through whether the feature is on or not.
+kernel-test = []
+
 [lints]
 workspace = true

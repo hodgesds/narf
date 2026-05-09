@@ -102,6 +102,9 @@ pub struct VirtioGpuPci {
     notify: VirtioRegion,
     notify_off_multiplier: u32,
     pub irq_vector: Option<u8>,
+    /// MSI-X table handle held purely for ownership — Drop
+    /// clears the global enable + restores INTx routing.
+    #[allow(dead_code)]
     msix: Option<narf_bus::MsixTable>,
     ctrl_q: IrqSafeSpinLock<Option<Virtqueue>>,
     _cursor_q: IrqSafeSpinLock<Option<Virtqueue>>,

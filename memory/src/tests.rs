@@ -1381,7 +1381,7 @@ fn smoke_memory_remap_page_picks_up_perms_and_phys() -> TestResult {
         // We don't have a direct mutator; cow_split_on_write
         // covers this in its own test. Here we round-trip via
         // unmap_region + map_region.
-        a.unmap_region(VirtAddr::new(VADDR));
+        let _ = a.unmap_region(VirtAddr::new(VADDR));
         if a
             .map_region(Region {
                 base: VirtAddr::new(VADDR),

@@ -38,6 +38,14 @@ pub struct SpdmSession<'a> {
     version: u8,
 }
 
+impl<'a> core::fmt::Debug for SpdmSession<'a> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SpdmSession")
+            .field("version", &self.version)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'a> SpdmSession<'a> {
     pub fn new(device: &'a dyn AttestationDevice) -> Self {
         Self {

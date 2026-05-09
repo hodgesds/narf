@@ -1037,8 +1037,11 @@ fn smoke_rcu_sleepable_sync_drains() -> TestResult {
 
     // Holder task — yields three times, then drops the guard.
     narf_scheduler::spawn(async move {
-        // SAFETY: CAP is set above on the same thread before spawn.
-        let cap = unsafe { CAP.as_ref().unwrap() };
+        // SAFETY: CAP is set above on the same thread before
+        // spawn. `&raw const` (Rust 2024) takes a raw pointer
+        // to the static without going through `&`, dodging the
+        // rust_2024_compatibility static_mut_refs lint.
+        let cap = unsafe { (*(&raw const CAP)).as_ref().unwrap() };
         let g = SCOPE.enter(cap).expect("enter must succeed");
         for _ in 0..3 {
             narf_scheduler::yield_now().await;
