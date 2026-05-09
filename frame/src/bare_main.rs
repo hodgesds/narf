@@ -1718,7 +1718,7 @@ fn boot_userspace_init() {
     //
     // SAFETY: low-4-GiB identity map is live, frame allocator
     // initialised in `_start_rust`.
-    fn spawn_one(name: &'static str, bytes: &'static [u8]) -> bool {
+    fn spawn_one(name: &'static str, bytes: &[u8]) -> bool {
         if bytes.is_empty() {
             let _ = writeln!(
                 console::Writer,
@@ -1753,6 +1753,54 @@ fn boot_userspace_init() {
         true
     }
 
+    // Try to load `/{name}` from whatever root filesystem is
+    // mounted at "/". Returns the file's bytes (heap-allocated, the
+    // caller hands them to `load_user_process_with` which copies
+    // into the new AS), or None if the file is missing / the read
+    // path errored / no root mount is present.
+    //
+    // The walk: registry().resolve_absolute strips the matching
+    // mount prefix and hands the FsInstance + the rest of the path
+    // to the closure; we then resolve_async against the FS root,
+    // stat for the size, and read the body in one shot. Capped at
+    // 16 MiB to bound the kernel-heap allocation in case the disk
+    // returns a huge stat.
+    async fn try_load_from_root(name: &'static str) -> Option<alloc::vec::Vec<u8>> {
+        use alloc::sync::Arc;
+        use alloc::vec::Vec;
+        use narf_filesystem::{registry, resolve_async, DirOps};
+
+        let abs = alloc::format!("/{}", name);
+        // Pull `(root_dir, rel_path)` out under the registry lock so
+        // we don't hold it across awaits.
+        let pair: Option<(Arc<dyn DirOps>, alloc::string::String)> =
+            registry().resolve_absolute(&abs, |fs, rel| {
+                (fs.root(), alloc::string::String::from(rel))
+            });
+        let (root, rel) = pair?;
+        let file = resolve_async(root, &rel).await.ok()?;
+        let stat = file.stat_async().await.ok()?;
+        let size = stat.size as usize;
+        const MAX_BIN: usize = 16 * 1024 * 1024;
+        if size == 0 || size > MAX_BIN {
+            return None;
+        }
+        let mut out = Vec::<u8>::with_capacity(size);
+        out.resize(size, 0);
+        // Loop until EOF or buf full — FileOps::read may return
+        // short on cross-cluster boundaries.
+        let mut filled = 0usize;
+        while filled < size {
+            let n = file.read(filled as u64, &mut out[filled..]).await.ok()?;
+            if n == 0 {
+                break;
+            }
+            filled += n;
+        }
+        out.truncate(filled);
+        Some(out)
+    }
+
     // Init is the canonical first user process; shell runs as a
     // peer (no fork/execve yet). Both reach `__libc_start_main`
     // now that `process::load_user_process_with` always stages a
@@ -1760,8 +1808,37 @@ fn boot_userspace_init() {
     // previous startup `#PF` came from `mov %fs:[0]` against
     // `FS_BASE = 0`. Shell is still gated behind the
     // `boot-init` cargo feature.
-    spawn_one("init", bytes);
-    spawn_one("shell", narf_verification::NARF_SHELL_ELF);
+    //
+    // Spawn a kernel async task to do the FAT-root resolution +
+    // user-task spawn. Prefer disk-loaded /init + /shell so the
+    // binaries can be iterated without rebuilding the kernel; fall
+    // back to the baked `narf_verification::*_ELF` blobs when the
+    // disk version is missing (smoke-test images that haven't been
+    // populated, real-HW first boot before initramfs lands).
+    let baked_init: &'static [u8] = bytes;
+    let baked_shell: &'static [u8] = narf_verification::NARF_SHELL_ELF;
+    narf_scheduler::spawn(async move {
+        match try_load_from_root("init").await {
+            Some(b) => {
+                let _ = writeln!(console::Writer, "  boot-init: init from disk ({} bytes)", b.len());
+                spawn_one("init", &b);
+            }
+            None => {
+                let _ = writeln!(console::Writer, "  boot-init: init from baked ELF (no /init on root)");
+                spawn_one("init", baked_init);
+            }
+        }
+        match try_load_from_root("shell").await {
+            Some(b) => {
+                let _ = writeln!(console::Writer, "  boot-init: shell from disk ({} bytes)", b.len());
+                spawn_one("shell", &b);
+            }
+            None => {
+                let _ = writeln!(console::Writer, "  boot-init: shell from baked ELF (no /shell on root)");
+                spawn_one("shell", baked_shell);
+            }
+        }
+    });
 }
 
 /// aarch64 boot-init stub.
