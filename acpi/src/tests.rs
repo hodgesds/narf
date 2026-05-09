@@ -1978,3 +1978,96 @@ fn smoke_acpi_gpe_block_parsed_at_boot() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("acpi", smoke_acpi_gpe_block_parsed_at_boot);
+
+// ── IOAPIC bit-position constants per Intel 82093AA §3.2.4 ─────────
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_acpi_ioapic_redir_bits_match_spec() -> TestResult {
+    use crate::ioapic::{MASKED, POLARITY_HIGH, POLARITY_LOW, TRIGGER_EDGE, TRIGGER_LEVEL};
+    // Spec: IOREDTBL low dword bit positions (Intel 82093AA §3.2.4):
+    //   bit 13 — INTPOL (0=active-high, 1=active-low)
+    //   bit 15 — TRIGGER (0=edge, 1=level)
+    //   bit 16 — MASK (1=masked)
+    if POLARITY_HIGH != 0 {
+        return TestResult::Fail("POLARITY_HIGH != 0");
+    }
+    if POLARITY_LOW != 1 << 13 {
+        return TestResult::Fail("POLARITY_LOW != bit 13");
+    }
+    if TRIGGER_EDGE != 0 {
+        return TestResult::Fail("TRIGGER_EDGE != 0");
+    }
+    if TRIGGER_LEVEL != 1 << 15 {
+        return TestResult::Fail("TRIGGER_LEVEL != bit 15");
+    }
+    if MASKED != 1 << 16 {
+        return TestResult::Fail("MASKED != bit 16");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("acpi/ioapic", smoke_acpi_ioapic_redir_bits_match_spec);
+
+// ── ISA-override-flags decode for SCI routing ──────────────────────
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_acpi_sci_iso_flag_decode() -> TestResult {
+    // ACPI 6.5 §5.2.12.5: ISO `flags` bits 0-1 = polarity,
+    // bits 2-3 = trigger. SCI defaults (when no override or
+    // when override says "bus default") are level / active-low.
+    use crate::ioapic::{POLARITY_HIGH, POLARITY_LOW, TRIGGER_EDGE, TRIGGER_LEVEL};
+
+    fn decode(flags: u16) -> u32 {
+        let pol = match flags & 0b11 {
+            0b01 => POLARITY_HIGH,
+            _ => POLARITY_LOW,
+        };
+        let trig = match (flags >> 2) & 0b11 {
+            0b01 => TRIGGER_EDGE,
+            _ => TRIGGER_LEVEL,
+        };
+        pol | trig
+    }
+    // Bus default (00, 00) → level / active-low for SCI.
+    if decode(0b0000) != POLARITY_LOW | TRIGGER_LEVEL {
+        return TestResult::Fail("bus-default flags != level/active-low");
+    }
+    // Explicit active-high edge.
+    if decode(0b0101) != POLARITY_HIGH | TRIGGER_EDGE {
+        return TestResult::Fail("0b0101 != active-high/edge");
+    }
+    // Explicit active-low level (matches SCI bus default).
+    if decode(0b1111) != POLARITY_LOW | TRIGGER_LEVEL {
+        return TestResult::Fail("0b1111 != active-low/level");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("acpi/ioapic", smoke_acpi_sci_iso_flag_decode);
+
+// ── FADT.RESET_REG decode ──────────────────────────────────────────
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_acpi_fadt_reset_register_present() -> TestResult {
+    // After boot, the FADT PM cache should carry a reset
+    // register. QEMU q35 always exposes one (port 0xCF9, value
+    // 0x0F per ICH9). Real platforms may omit it pre-ACPI 2.0
+    // — but everything QEMU/OVMF + every modern x86_64 carries
+    // RESET_REG.
+    let pm = match crate::fadt_pm() {
+        Some(p) => p,
+        None => return TestResult::Skip("FADT PM not parsed (boot order)"),
+    };
+    if pm.reset_reg_addr == 0 {
+        return TestResult::Skip("FADT carries no RESET_REG (pre-ACPI 2.0)");
+    }
+    // ACPI 6.5 §5.2.3.1: address space 0 = system memory,
+    // 1 = system I/O, 2 = PCI config. SCI port-IO is the
+    // common case; reject obviously-bogus address spaces.
+    if pm.reset_reg_addr_space > 2 {
+        return TestResult::Fail("RESET_REG address space out of range");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("acpi", smoke_acpi_fadt_reset_register_present);

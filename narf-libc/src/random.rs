@@ -25,18 +25,35 @@ pub const GRND_NONBLOCK: c_int = 1 << 0;
 pub const GRND_RANDOM:   c_int = 1 << 1;
 pub const GRND_INSECURE: c_int = 1 << 2;
 
+// SAFETY: see callers — every PRNG_STATE access is documented at
+// the use site as single-threaded user mode (no aliasing in
+// practice). The `&raw mut` form below is the Rust 2024 way to
+// take a raw pointer to a mutable static without going through a
+// `&mut` reference (which would risk UB if the static were ever
+// touched by a parallel signal handler).
+//
 // xorshift64 — fast, deterministic, sufficient for "give me bytes
 // that look random" use cases. Seeded with a non-zero constant so
 // the first call returns a valid stream.
 static mut PRNG_STATE: u64 = 0x9E37_79B9_7F4A_7C15;
 
 #[inline]
-fn xorshift64(state: &mut u64) -> u64 {
-    let mut x = *state;
+/// xorshift64 step. Takes a raw pointer (rather than `&mut u64`)
+/// so callers can hand it `&raw mut PRNG_STATE` without violating
+/// the rust_2024_compatibility lint about aliasing risk on
+/// mutable statics. Caller is responsible for ensuring no other
+/// reference to `state` exists for the duration of the call;
+/// every caller in this crate runs single-threaded user mode.
+unsafe fn xorshift64(state: *mut u64) -> u64 {
+    // SAFETY: caller-asserted exclusive access to `*state`.
+    let mut x = unsafe { *state };
     x ^= x << 13;
     x ^= x >> 7;
     x ^= x << 17;
-    *state = x;
+    // SAFETY: same.
+    unsafe {
+        *state = x;
+    }
     x
 }
 
@@ -67,9 +84,12 @@ pub unsafe extern "C" fn getrandom(
     let slice = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, buflen) };
     let mut i = 0usize;
     while i < buflen {
-        // SAFETY: single-threaded user mode; PRNG_STATE access is
-        // race-free.
-        let v = unsafe { xorshift64(&mut PRNG_STATE) };
+        // SAFETY: single-threaded user mode; PRNG_STATE access
+        // is race-free. xorshift64 takes a `*mut u64` so we
+        // can hand it a raw pointer derived from `&raw mut`
+        // without going through a `&mut` (which would trip the
+        // rust_2024_compatibility static_mut_refs lint).
+        let v = unsafe { xorshift64(&raw mut PRNG_STATE) };
         let chunk = v.to_le_bytes();
         let n = core::cmp::min(8, buflen - i);
         slice[i..i + n].copy_from_slice(&chunk[..n]);

@@ -660,6 +660,41 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                 );
                             }
                         }
+                        // FADT power-management surface — needed for
+                        // ACPI reboot (RESET_REG) + S5 power-off
+                        // (PM1a/b CNT). Parsing here populates the
+                        // narf_acpi::FADT_PM cache that
+                        // narf_power::system::reboot/power_off
+                        // consult.
+                        // SAFETY: same.
+                        match unsafe { narf_acpi::parse_fadt_pm(p) } {
+                            Ok(pm) => {
+                                let _ = writeln!(
+                                    console::Writer,
+                                    "  acpi: FADT PM parsed (RESET {:#x} = {:#x}, PM1a_CNT {:#x})",
+                                    pm.reset_reg_addr, pm.reset_value, pm.pm1a_cnt
+                                );
+                                // Arm the power-button enable bit so
+                                // PM1.PWRBTN sets reliably when the
+                                // user presses the chassis power
+                                // switch. Polling-side handler
+                                // installed below picks up the
+                                // status bit.
+                                if narf_acpi::power_button_arm() {
+                                    let _ = writeln!(
+                                        console::Writer,
+                                        "  acpi: power-button armed (PM1_EN.PWRBTN set)"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                let _ = writeln!(
+                                    console::Writer,
+                                    "  acpi: FADT PM parse skipped: {:?}",
+                                    e
+                                );
+                            }
+                        }
                         // SAFETY: same.
                         match unsafe { narf_acpi::parse_hmat(p) } {
                             Ok(n) => {
@@ -1066,6 +1101,26 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_drivers_storage::register_initcalls();
             narf_drivers_usb::register_initcalls();
             narf_drivers_platform::register_initcalls();
+            // Bridge: ACPI power-button events (delivered by the
+            // SCI dispatcher in narf-drivers-platform::ec) into
+            // the system-power surface. Subscribers run in SCI
+            // IRQ context — `system::power_off` is a never-
+            // returns terminal action, so calling it directly
+            // from the IRQ is safe (any locks held elsewhere
+            // become moot once the platform powers off).
+            #[cfg(target_arch = "x86_64")]
+            narf_drivers_platform::ec::subscribe_platform_event(|event| {
+                if event == narf_drivers_platform::ec::PlatformEvent::PowerButton {
+                    let _ = writeln!(
+                        console::Writer,
+                        "  acpi: power button → entering S5"
+                    );
+                    narf_power::system::power_off(
+                        narf_power::system::QEMU_S5_SLP_TYPA,
+                        narf_power::system::QEMU_S5_SLP_TYPB,
+                    );
+                }
+            });
             narf_graphics_driver::register_initcalls();
             narf_drivers_gpu::register_initcalls();
             narf_input_driver::register_initcalls();

@@ -343,11 +343,28 @@ pub fn __test_reset_sci() {
     EC_GPE_BIT.store(u64::MAX, Ordering::Release);
 }
 
-/// Wire the SCI dispatcher to the FADT-supplied SCI_INT vector. On
-/// x86_64 the SCI is delivered via the IOAPIC routed from the ISA
-/// IRQ named in `FADT.SCI_INT`. We install ourselves as the
-/// synchronous IRQ handler and let `narf_interrupts::on_irq` dispatch
-/// to us. No-op on non-x86 hosts.
+/// Wire the SCI dispatcher to the FADT-supplied SCI_INT line.
+///
+/// Spec citations:
+///   - **ACPI 6.5 §5.2.9** — `FADT.SCI_INT` is an *ISA IRQ
+///     number*. Real chipsets route it through an IOAPIC at a
+///     GSI determined by an MADT Interrupt Source Override
+///     (§5.2.12.5) when present, or 1:1 against the ISA IRQ
+///     when absent.
+///   - **ACPI 6.5 §5.2.12.5** — ISO `flags` carry polarity
+///     (bits 0-1) and trigger (bits 2-3) overrides. SCI's bus
+///     default is level / active-low.
+///   - **Intel 82093AA IOAPIC Datasheet §3.2.4** — IOREDTBL
+///     entry layout (vector, dest mode, polarity, trigger,
+///     mask, dest APIC).
+///   - <https://uefi.org/specs/ACPI/6.5/>
+///
+/// Flow: allocate an IDT vector, resolve SCI_INT → GSI through
+/// any matching ISO, locate the IOAPIC owning that GSI, program
+/// the redirection-table entry (level / active-low, fixed
+/// delivery, dest = BSP, unmasked), install `dispatch_sci` as
+/// the synchronous handler, and switch the platform from legacy
+/// (SMI-driven) to ACPI (SCI-driven) mode via FADT.SMI_CMD.
 pub fn init_sci(ec_gpe_bit: Option<u8>) {
     if let Some(b) = ec_gpe_bit {
         EC_GPE_BIT.store(b as u64, Ordering::Release);
@@ -361,20 +378,90 @@ pub fn init_sci(ec_gpe_bit: Option<u8>) {
         if pm.sci_int == 0 {
             return;
         }
-        // ISA IRQ → IDT vector mapping: legacy IOAPIC routes ISA IRQ
-        // N to vector 32 + N. SCI_INT in the FADT is reported as the
-        // ISA IRQ number (almost always 9 on laptops). The Stage-3
-        // IOAPIC bring-up has already programmed the routing table,
-        // so we just install our handler on the matching vector.
-        let vector = 32u8.saturating_add(pm.sci_int as u8);
+        let sci_int = pm.sci_int as u32;
+
+        // Resolve SCI_INT → (gsi, polarity|trigger flags) by
+        // walking MADT ISO entries. ACPI 6.5 §5.2.12.5: an
+        // entry whose `bus = 0` (ISA) and `source` matches our
+        // SCI_INT remaps the line; otherwise SCI_INT itself is
+        // the GSI. SCI's bus default is level / active-low.
+        let mut overrides = [narf_acpi::IsaOverride::default(); narf_acpi::MAX_ISA_OVERRIDES];
+        let n_ov = narf_acpi::copy_isa_overrides(&mut overrides);
+        let (gsi, ioapic_flags) = overrides[..n_ov]
+            .iter()
+            .find(|ov| ov.bus == 0 && ov.source as u32 == sci_int)
+            .map(|ov| {
+                let pol = match ov.flags & 0b11 {
+                    0b01 => narf_acpi::ioapic::POLARITY_HIGH,
+                    _ => narf_acpi::ioapic::POLARITY_LOW,
+                };
+                let trig = match (ov.flags >> 2) & 0b11 {
+                    0b01 => narf_acpi::ioapic::TRIGGER_EDGE,
+                    _ => narf_acpi::ioapic::TRIGGER_LEVEL,
+                };
+                (ov.gsi, pol | trig)
+            })
+            .unwrap_or((
+                sci_int,
+                narf_acpi::ioapic::POLARITY_LOW | narf_acpi::ioapic::TRIGGER_LEVEL,
+            ));
+
+        // Locate the IOAPIC owning that GSI.
+        let mut ioapics = [narf_acpi::IoApic::default(); narf_acpi::MAX_IOAPICS];
+        let n_io = narf_acpi::copy_ioapics(&mut ioapics);
+        let target = ioapics[..n_io].iter().find_map(|io| {
+            // SAFETY: IOAPIC base from a checksummed MADT.
+            let h = unsafe { narf_acpi::ioapic::probe(io.address as u64, io.gsi_base) };
+            if gsi >= h.gsi_base && gsi <= h.gsi_end {
+                Some(h)
+            } else {
+                None
+            }
+        });
+        let target = match target {
+            Some(t) => t,
+            None => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  acpi-ec: no IOAPIC covers SCI GSI {}",
+                    gsi
+                );
+                return;
+            }
+        };
+
+        let vector = match narf_interrupts::vector::alloc() {
+            Ok(v) => v,
+            Err(_) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  acpi-ec: vector::alloc failed for SCI"
+                );
+                return;
+            }
+        };
         narf_interrupts::install_handler(vector, dispatch_sci);
+
+        // Program the IOAPIC redirection-table entry. Dest =
+        // BSP (APIC ID 0). SAFETY: vector + handler set above
+        // before unmask; IOAPIC handle freshly probed.
+        let ok = unsafe {
+            narf_acpi::ioapic::program_entry(&target, gsi, vector, 0, ioapic_flags)
+        };
+        if !ok {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  acpi-ec: IOAPIC program_entry rejected GSI {}",
+                gsi
+            );
+            return;
+        }
+
         narf_acpi::acpi_enable();
         let _ = writeln!(
             narf_console::Writer,
-            "  acpi-ec: SCI dispatcher installed (IRQ{} → vec{}, ec_gpe={:?})",
-            pm.sci_int,
-            vector,
-            ec_gpe_bit
+            "  acpi-ec: SCI dispatcher installed (SCI_INT {} → GSI {} → vec {} on IOAPIC@{:#x}, level/active-low, ec_gpe={:?})",
+            pm.sci_int, gsi, vector, target.base_phys, ec_gpe_bit
         );
     }
 }

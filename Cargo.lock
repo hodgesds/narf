@@ -1330,6 +1330,7 @@ dependencies = [
  "narf-capabilities",
  "narf-console",
  "narf-init",
+ "narf-interrupts",
  "narf-kernel-test",
  "narf-lib",
  "narf-scheduler",

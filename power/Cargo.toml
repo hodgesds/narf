@@ -22,6 +22,7 @@ narf-scheduler    = { path = "../scheduler" }
 narf-capabilities = { path = "../capabilities" }
 narf-acpi         = { path = "../acpi" }
 narf-aml          = { path = "../aml" }
+narf-interrupts   = { path = "../interrupts" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 
 [lints]

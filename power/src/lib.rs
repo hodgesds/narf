@@ -36,6 +36,7 @@ extern crate alloc;
 pub mod psci;
 pub mod suspend;
 pub mod syscall;
+pub mod system;
 pub mod thermal;
 pub mod watchdog;
 

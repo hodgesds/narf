@@ -25,6 +25,7 @@
 
 extern crate alloc;
 
+pub mod ioapic;
 pub mod smbios;
 
 mod tests;
@@ -1697,6 +1698,13 @@ pub struct FadtPm {
     pub pm1b_cnt: u64,
     pub pm1_evt_len: u8,
     pub pm1_cnt_len: u8,
+    /// FADT RESET_REG (12-byte GAS at offset 116, present when
+    /// flags bit 10 is set). The address-space id selects how to
+    /// write `reset_value`: 1 = legacy I/O port, 0 = system memory
+    /// (MMIO), 2 = PCI config space.
+    pub reset_reg_addr_space: u8,
+    pub reset_reg_addr: u64,
+    pub reset_value: u8,
 }
 
 static FADT_PM: IrqSafeSpinLock<Option<FadtPm>> = IrqSafeSpinLock::new(None);
@@ -1767,6 +1775,19 @@ pub unsafe fn parse_fadt_pm(rsdp_phys: PhysAddr) -> Result<FadtPm, AcpiError> {
     let x_pm1a_cnt = gas_addr(172);
     let x_pm1b_cnt = gas_addr(184);
 
+    // RESET_REG: 12-byte GAS at offset 116, RESET_VALUE byte at 128.
+    // FADT minor revisions before 2.0 didn't carry these — guard on
+    // table length (must include through byte 128).
+    let (reset_reg_addr_space, reset_reg_addr, reset_value) = if total >= 129 {
+        let asid = body[116];
+        let addr = u64::from_le_bytes([
+            body[120], body[121], body[122], body[123], body[124], body[125], body[126], body[127],
+        ]);
+        (asid, addr, body[128])
+    } else {
+        (0, 0, 0)
+    };
+
     let pick = |x: u64, l: u64| if x != 0 { x } else { l };
 
     let pm = FadtPm {
@@ -1780,6 +1801,9 @@ pub unsafe fn parse_fadt_pm(rsdp_phys: PhysAddr) -> Result<FadtPm, AcpiError> {
         pm1b_cnt: pick(x_pm1b_cnt, legacy_pm1b_cnt),
         pm1_evt_len,
         pm1_cnt_len,
+        reset_reg_addr_space,
+        reset_reg_addr,
+        reset_value,
     };
     *FADT_PM.lock() = Some(pm);
     Ok(pm)
@@ -1863,6 +1887,137 @@ pub unsafe fn pm1_enter_sleep(slp_typ_a: u8, slp_typ_b: u8) {
         let val_b = ((slp_typ_b as u16 & 0x7) << 10) | 0x2000;
         // SAFETY: PM1B_CNT_BLK address from a checksummed FADT.
         unsafe { narf_arch::x86_64::io_port::outw(pm.pm1b_cnt as u16, val_b) };
+    }
+}
+
+/// PM1 enable register bit positions (mirror PM1_STS_*; ACPI 6.5
+/// §4.8.3.1.2). Setting the corresponding enable bit gates SCI
+/// generation on the matching status bit.
+pub const PM1_EN_TMR: u16 = 1 << 0;
+pub const PM1_EN_GBL: u16 = 1 << 5;
+pub const PM1_EN_PWRBTN: u16 = 1 << 8;
+pub const PM1_EN_SLPBTN: u16 = 1 << 9;
+pub const PM1_EN_RTC: u16 = 1 << 10;
+
+/// Arm the power-button enable bit so PM1.PWRBTN status triggers
+/// an SCI when pressed. Without this the platform may still latch
+/// the status bit but won't fire the interrupt — polling
+/// `pm1_status_read() & PM1_STS_PWRBTN` still works.
+///
+/// Returns `false` if the FADT hasn't been parsed yet or the
+/// PM1 control block is absent.
+#[cfg(target_arch = "x86_64")]
+pub fn power_button_arm() -> bool {
+    let pm = match fadt_pm() {
+        Some(p) => p,
+        None => return false,
+    };
+    // PM1 enable register sits at PM1*_EVT + (pm1_evt_len / 2)
+    // per ACPI 6.5 §4.8.3.1 — status occupies the lower half,
+    // enable the upper half.
+    if pm.pm1_evt_len == 0 {
+        return false;
+    }
+    let half = (pm.pm1_evt_len / 2) as u16;
+    let mut armed = false;
+    if pm.pm1a_evt != 0 {
+        let port = pm.pm1a_evt as u16 + half;
+        // SAFETY: PM1 enable port from a checksummed FADT.
+        unsafe {
+            let cur = narf_arch::x86_64::io_port::inw(port);
+            narf_arch::x86_64::io_port::outw(port, cur | PM1_EN_PWRBTN);
+        }
+        armed = true;
+    }
+    if pm.pm1b_evt != 0 {
+        let port = pm.pm1b_evt as u16 + half;
+        // SAFETY: same.
+        unsafe {
+            let cur = narf_arch::x86_64::io_port::inw(port);
+            narf_arch::x86_64::io_port::outw(port, cur | PM1_EN_PWRBTN);
+        }
+        armed = true;
+    }
+    armed
+}
+
+/// Returns `true` if PM1 status reports a pending power-button
+/// press. Caller is responsible for clearing the latch via
+/// `pm1_status_clear(PM1_STS_PWRBTN)` after acting on it.
+#[cfg(target_arch = "x86_64")]
+pub fn power_button_pressed() -> bool {
+    pm1_status_read() & PM1_STS_PWRBTN != 0
+}
+
+/// Reboot via FADT.RESET_REG. Returns `false` when the FADT
+/// didn't carry a reset register (set `Some` only on ACPI 2.0+
+/// revisions and platforms that opt in via the FACP fixed-feature
+/// flag), or when the address space is unsupported on this arch.
+/// On success the call doesn't return — the platform issues a
+/// hard reset within microseconds.
+///
+/// Address spaces (ACPI 6.5 §5.2.3.1):
+///   1 → System I/O   (port write, x86 outb)
+///   0 → System Memory (MMIO write)
+///   2 → PCI Config (not supported here yet — falls through to false)
+///
+/// # Safety
+/// The platform resets immediately on the write. Caller must have
+/// drained anything that needs to land first (file syncs, etc.).
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn reboot_via_fadt() -> bool {
+    let pm = match fadt_pm() {
+        Some(p) => p,
+        None => return false,
+    };
+    if pm.reset_reg_addr == 0 {
+        return false;
+    }
+    match pm.reset_reg_addr_space {
+        1 => {
+            // SAFETY: address space 1 = System I/O. RESET_REG_ADDR
+            // fits in u16 by spec; outb to that port issues the
+            // reset. Returns architecturally — but the platform
+            // resets before the next instruction retires.
+            unsafe {
+                narf_arch::x86_64::io_port::outb(pm.reset_reg_addr as u16, pm.reset_value);
+            }
+            true
+        }
+        0 => {
+            // SAFETY: address space 0 = System Memory. We don't
+            // know the access size from the GAS without parsing
+            // bit_width; assume byte access (matches ICH/PCH and
+            // most x86 platforms).
+            unsafe {
+                core::ptr::write_volatile(pm.reset_reg_addr as *mut u8, pm.reset_value);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// `\_S5` shutdown. Walks the AML namespace for the `\_S5_`
+/// package + writes the resulting SLP_TYPa / SLP_TYPb to
+/// PM1a_CNT / PM1b_CNT with SLP_EN set. Returns `false` when
+/// the namespace isn't loaded or `\_S5` is missing; on success
+/// the platform powers off and the call doesn't return.
+///
+/// Common QEMU defaults are SLP_TYPa = 5, SLP_TYPb = 0; real
+/// firmware varies (Linux's acpi/sleep.c does the same AML walk).
+/// Until the AML walk lands here we accept caller-supplied values
+/// — the wrapper at narf-acpi-runtime side picks them.
+///
+/// # Safety
+/// Platform powers off; caller must have flushed anything that
+/// needs to survive.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn shutdown_via_pm1(slp_typ_a: u8, slp_typ_b: u8) {
+    // SAFETY: forwarded to pm1_enter_sleep which is documented
+    // to never return on S5.
+    unsafe {
+        pm1_enter_sleep(slp_typ_a, slp_typ_b);
     }
 }
 
