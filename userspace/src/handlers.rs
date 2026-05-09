@@ -1,19 +1,19 @@
 //! Core syscall handler bodies.
 //!
-//! Stage-4 first-cut implementations of the POSIX-shaped syscalls
-//! the `Syscall` enum pinned earlier. These run in trap context
-//! after the arch trap stub has saved user registers and the
-//! `TrapContext` bridge is constructed. They don't yet carry the
-//! per-file-descriptor table or VFS open-file machinery real I/O
-//! needs — today's handlers are deliberate minimums:
+//! POSIX-shaped syscall implementations behind the `Syscall` enum.
+//! Each handler runs in trap context after the arch trap stub has
+//! saved user registers and the `TrapContext` bridge is constructed.
 //!
-//! - `Write` — writes `len` bytes from user virt `buf` to the
-//!   kernel console. Ignores `fd`. Returns bytes written.
-//! - `Read`  — returns 0 (EOF). Stage-4 will wire to the VFS.
-//! - `Close` — returns Ok. Stage-4 will look up a per-task fd table.
-//! - `Mmap`  — allocates one or more physical frames, installs an
-//!   R+W+U mapping in the calling task's AS, returns the virt addr.
-//! - `Munmap` — removes a region from the calling task's AS.
+//! - `Open` — resolves an absolute or per-mount path through the
+//!   VFS registry, allocates a new fd in the calling task's
+//!   `FdTable`, returns the fd.
+//! - `Read` / `Write` — look up the fd in the per-task table,
+//!   poll the resulting `FileOps::{read,write}` to completion via
+//!   `poll_once` (Stage-4 in-memory FSes resolve on first poll),
+//!   advance the per-fd offset, return bytes transferred. fd 1/2
+//!   bypass the table and write directly to the kernel console.
+//! - `Close` / `Dup` / `Dup2` / `Fcntl` — direct fd-table operations.
+//! - `Mmap` / `Munmap` — manipulate the calling task's `AddressSpace`.
 //! - `ExitTask` — rewrites the trap frame (via
 //!   `redirect_to_kernel`) to a landing pad the kernel publishes
 //!   through `set_exit_landing`.
@@ -3240,11 +3240,13 @@ fn sys_clone(ctx: &mut dyn TrapContext) {
 // via `TrapContext::save_user_state`, with rax mutated to 0 in
 // the child).
 //
-// FIXME(cow): non-COW first cut. Every PT_LOAD page is eagerly
-// memcpy'd at fork time. The eventual hook lives in
-// `narf_memory::region::cow_split_on_write` (not yet written);
-// until then we eagerly memcpy. Acceptable on Stage-4 processes;
-// expensive on large brk heaps.
+// COW: `clone_for_fork` shares the parent's frames with the
+// child via `narf_memory::frame::cow::inc_ref` and strips WRITE
+// on both regions. The first user-mode write faults; the trap
+// handler in `frame::<arch>::trap` calls `cow_split_on_write` +
+// `remap_page` to allocate a private frame, memcpy the bytes,
+// and restore WRITE on the faulting AS. Large brk heaps no
+// longer pay an up-front memcpy at fork time.
 
 fn sys_fork(ctx: &mut dyn TrapContext) {
     let parent_as = match current_address_space() {

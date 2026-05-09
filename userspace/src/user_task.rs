@@ -591,13 +591,13 @@ impl core::future::Future for UserTaskFuture {
 /// install_current → activate user TTBR0 → setjmp → eret to EL0 →
 /// trap-back longjmps into the polling routine via CURRENT_JMP.
 ///
-/// `activate()` on aarch64 still returns `NotImplemented` until
-/// the kernel heap migrates off its TTBR0 identity map (separate
-/// FIXME in `memory/src/address_space.rs::activate`). When
-/// `activate()` fails we degrade gracefully: log via the polling
-/// state, return `Poll::Ready(())` without attempting EL0 entry,
-/// and behave like a plain async task that just resolved. Once
-/// activate lands, the future Just Works without further changes.
+/// `activate()` on aarch64 swaps TTBR0_EL1 to the AS's root; the
+/// kernel keeps reading/writing through TTBR1's high-half mapping
+/// (every kernel-side phys access goes through
+/// `PhysAddr::kernel_ptr` / `kernel_mut_ptr`). If `activate()`
+/// returns Err (e.g. unset root, unsupported arch fallback), we
+/// degrade gracefully — fan out exit observers + return
+/// `Poll::Ready(())` — so the future never crashes the executor.
 #[cfg(target_arch = "aarch64")]
 pub struct UserTaskFuture {
     process: crate::UserProcess,

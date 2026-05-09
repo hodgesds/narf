@@ -625,10 +625,13 @@ pub enum Syscall {
     /// poll re-enters user mode (see `sys_fork` doc-comment for the
     /// pre-seeded UserState mechanism).
     ///
-    /// FIXME(cow): non-COW first cut. The eventual hook lives in
-    /// `narf_memory::region::cow_split_on_write` (not yet written);
-    /// until then we eagerly memcpy every page. Acceptable on Stage-4
-    /// processes; expensive on large brk heaps.
+    /// Copy-on-write: `clone_for_fork` shares the parent's frames
+    /// with the child via `narf_memory::frame::cow::inc_ref` and
+    /// strips WRITE on both regions. The first user-mode write
+    /// faults into `frame::*::trap`'s page-fault handler which
+    /// calls `AddressSpace::cow_split_on_write` + `remap_page` to
+    /// allocate a private frame, memcpy the bytes, and restore
+    /// WRITE — all without burning RAM upfront.
     Fork = 57,
 
     /// Linux tkill(2) / tgkill(2): like kill but targets a specific

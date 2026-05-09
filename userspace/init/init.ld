@@ -9,14 +9,15 @@
 
 ENTRY(_start)
 
-/* Everything gets collapsed into a single R+X PT_LOAD so the
+/* Everything gets collapsed into a single R+W+X PT_LOAD so the
  * Stage-4 one-segment-per-PT_LOAD loader sees a clean contiguous
- * page. Split R/X vs R-only segments would overlap the same page
- * and trip `AddressSpaceError::Overlap` on the second map_region.
- * When the loader grows sub-page segment coalescing, revisit.
+ * page AND .data / .bss writes from libc startup don't fault.
+ * Split R/X / R / RW segments would overlap the same page and
+ * trip `AddressSpaceError::Overlap` on the second map_region;
+ * sub-page coalescing in the loader is the long-term fix.
  */
 PHDRS {
-    image PT_LOAD FLAGS(5);   /* R + X */
+    image PT_LOAD FLAGS(7);   /* R + W + X */
 }
 
 SECTIONS {

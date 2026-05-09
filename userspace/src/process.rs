@@ -240,19 +240,45 @@ pub unsafe fn load_user_process_with(
     };
 
     // PT_TLS staging: if the binary names a TLS template, allocate
-    // a per-task block and program a thread pointer (returned as
-    // `fs_base`). The polling future + testbin runner plant this
-    // into `IA32_FS_BASE` on each user-mode entry. A binary without
-    // PT_TLS keeps `fs_base = None` and the entry path skips the
-    // wrmsr. aarch64 wires its tpidr_el0 equivalent in a follow-up
-    // round; until then `fs_base` stays `None` on non-x86_64.
+    // a per-task block + initial image and program the thread
+    // pointer. Even when PT_TLS is *absent*, we stage a minimal
+    // TCB-only TLS region — the Rust stdlib's lazy thread-locals,
+    // narf-libc's errno + stdio statics, and `narf_user_runtime::
+    // thread_pointer()` itself all emit `mov fs:[0]` to read the
+    // TCB self-pointer; with FS_BASE = 0 that load reads linear
+    // address 0 and the user task #PFs before reaching `main`.
+    // Synthesising an empty `TlsTemplate { mem_size = 0 }` makes
+    // `stage_tls` allocate a 4-KiB region whose first qword holds
+    // `*fs:[0] = fs_base`, satisfying the read.
     #[cfg(target_arch = "x86_64")]
-    let fs_base = if image.tls.is_some() {
+    let fs_base = {
+        // The synthetic-TLS path needs room *before* the TCB for
+        // negative-offset thread-local accesses. SysV-AMD64
+        // (and glibc / relibc / Rust stdlib) use the
+        // initial-exec model: TLS variables live at NEGATIVE
+        // offsets from `fs_base`; only the TCB self-pointer +
+        // dtv-vector fields sit at positive offsets. Errno in
+        // particular is generated as `*(fs:[0] - 8)` (see the
+        // narf_libc::stdio::fwrite disassembly that drove this).
+        // 4 KiB is overkill for narf-libc's small TLS surface
+        // today (errno + STDOUT slots) but matches the page-round
+        // already done downstream and leaves headroom for a
+        // future relibc swap.
+        const SYNTHETIC_TLS_HEADROOM: u64 = 4096;
+        let template = image.tls.clone().unwrap_or(crate::TlsTemplate {
+            file_off: 0,
+            file_size: 0,
+            mem_size: SYNTHETIC_TLS_HEADROOM,
+            align: 8,
+            vaddr: 0,
+        });
+        let synthetic_image = crate::ExecImage {
+            tls: Some(template),
+            ..image.clone()
+        };
         // SAFETY: low-4-GiB identity map + frame allocator are the
         // same Stage-4 invariants the rest of this routine rides on.
-        Some(unsafe { crate::tls::stage_tls(&image, bytes, &address_space) }?)
-    } else {
-        None
+        Some(unsafe { crate::tls::stage_tls(&synthetic_image, bytes, &address_space) }?)
     };
     #[cfg(not(target_arch = "x86_64"))]
     let fs_base: Option<u64> = None;

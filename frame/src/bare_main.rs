@@ -691,6 +691,111 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                 // the live namespace can still consult
                                 // the boot-time numbers.
                                 narf_aml::capture_boot_snapshot();
+
+                                // _PIC(1) — flip ACPI's interrupt mode
+                                // to APIC. ACPI defaults to PIC mode
+                                // (0); without this the firmware's
+                                // `_PRT` packages still describe
+                                // PIC-routed IRQs and the IOAPIC
+                                // tables we install below would race
+                                // the firmware. Many DSDTs simply
+                                // don't define `\_PIC` (QEMU's q35
+                                // does); a missing method is fine
+                                // and silently skipped.
+                                let pic = narf_aml::eval::evaluate_method(
+                                    "\\_PIC",
+                                    &[narf_aml::Value::Integer(1)],
+                                );
+                                match pic {
+                                    Ok(_) => {
+                                        let _ = writeln!(
+                                            console::Writer,
+                                            "  acpi: \\_PIC(1) — APIC mode declared"
+                                        );
+                                    }
+                                    Err(narf_aml::AmlError::MethodNotFound) => {
+                                        let _ = writeln!(
+                                            console::Writer,
+                                            "  acpi: \\_PIC absent — firmware doesn't \
+                                             distinguish PIC/APIC routing"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        let _ = writeln!(
+                                            console::Writer,
+                                            "  acpi: \\_PIC(1) failed: {:?}",
+                                            e
+                                        );
+                                    }
+                                }
+
+                                // For every PCIe root bridge (`_HID`
+                                // matches PNP0A03 PCI / PNP0A08 PCIe),
+                                // evaluate `_PRT` to learn the
+                                // per-slot/pin → GSI map. Stash the
+                                // result in `narf_aml::irq_routing`'s
+                                // global registry so the future
+                                // IOAPIC programmer (and PCI driver
+                                // bind path) can route legacy INTx
+                                // through the right vector.
+                                let mut prt_total = 0usize;
+                                let mut bridges = 0usize;
+                                narf_aml::for_each_device(|n| {
+                                    let hid = narf_aml::device_hid(&n.path)
+                                        .unwrap_or_default();
+                                    if hid != "PNP0A03" && hid != "PNP0A08" {
+                                        return;
+                                    }
+                                    bridges += 1;
+                                    match narf_aml::prt_crs::evaluate_prt_for(&n.path) {
+                                        Ok(entries) => {
+                                            prt_total += entries.len();
+                                            narf_aml::irq_routing::register_bridge(
+                                                &n.path, &entries,
+                                            );
+                                        }
+                                        Err(narf_aml::prt_crs::BridgeError::MethodNotFound) => {
+                                            // Some bridges have a
+                                            // Name(_PRT, ...) instead
+                                            // of Method — the bridge
+                                            // module flags those as
+                                            // MethodNotFound for
+                                            // now. Skip silently.
+                                        }
+                                        Err(e) => {
+                                            let _ = writeln!(
+                                                console::Writer,
+                                                "  acpi: _PRT eval at {} failed: {:?}",
+                                                n.path,
+                                                e
+                                            );
+                                        }
+                                    }
+                                });
+                                if bridges > 0 {
+                                    let _ = writeln!(
+                                        console::Writer,
+                                        "  acpi: walked {} PCIe root bridge(s), \
+                                         {} _PRT entries indexed",
+                                        bridges,
+                                        prt_total
+                                    );
+                                }
+                                // Diagnostic 2: dump first few device
+                                // paths to see what we have.
+                                let mut shown = 0u32;
+                                narf_aml::for_each_device(|n| {
+                                    if shown < 12 {
+                                        let hid = narf_aml::device_hid(&n.path)
+                                            .unwrap_or_default();
+                                        let _ = writeln!(
+                                            console::Writer,
+                                            "    dev: {} (HID={:?})",
+                                            n.path, hid
+                                        );
+                                        shown += 1;
+                                    }
+                                });
                             }
                             Err(e) => {
                                 let _ = writeln!(
@@ -1119,38 +1224,162 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             #[cfg(target_arch = "x86_64")]
             narf_init::register(narf_init::Stage::Late, "fb-console-install", || {
                 use narf_graphics::{FbConsole, Pixel32};
-                let r = narf_graphics_driver::bochs::with_controller(|d| {
-                    if !d.fb_reachable() {
+                // Pick the active scanout: bochs / virtio-gpu / amdgpu
+                // / generic. Generic is what Limine + UEFI hand us via
+                // the multiboot2 framebuffer tag — it has no doorbell,
+                // so writes land in pixels directly. The picker also
+                // covers the bochs path that QEMU `-kernel` lights up.
+                let scanout = match narf_fb::select_active() {
+                    Some(s) => s,
+                    None => {
+                        let _ = writeln!(
+                            console::Writer,
+                            "  splash: no active scanout — fb-console install skipped"
+                        );
+                        return narf_init::InitResult::NotPresent;
+                    }
+                };
+                // SAFETY: BSP, no concurrent draw. Each scanout's
+                // `framebuffer()` returns a Framebuffer wrapping a
+                // live identity-mapped pixel buffer; the bochs branch
+                // additionally requires `fb_reachable()`, so guard
+                // that one explicitly.
+                if scanout.name() == "bochs" {
+                    let reachable = narf_graphics_driver::bochs::with_controller(|d| {
+                        d.fb_reachable()
+                    })
+                    .unwrap_or(false);
+                    if !reachable {
+                        let phys = narf_graphics_driver::bochs::with_controller(|d| d.fb_phys())
+                            .unwrap_or(0);
                         let _ = writeln!(
                             console::Writer,
                             "  splash: bochs framebuffer at {:#x} above 4 GiB \
                              identity map; deferred until ioremap lands",
-                            d.fb_phys()
+                            phys
                         );
-                        return false;
+                        return narf_init::InitResult::NotPresent;
                     }
-                    // SAFETY: BSP, no concurrent draw.
-                    let fb = unsafe { d.framebuffer() };
-                    let con = FbConsole::new(fb, Pixel32::NARF_FG, Pixel32::NARF_BG);
-                    let (cols, rows) = (con.cols(), con.rows());
-                    narf_graphics::install_fb_console(con);
-                    console::set_fb_hook(narf_graphics::console::write_bytes);
-                    let _ = writeln!(
-                        console::Writer,
-                        "  splash: {}x{} bochs framebuffer console installed \
-                         ({} cols x {} rows of 8x8 glyphs)",
-                        cols * 8,
-                        rows * 8,
-                        cols,
-                        rows
-                    );
-                    true
-                });
-                match r {
-                    Some(true) => narf_init::InitResult::Ok,
-                    Some(false) => narf_init::InitResult::NotPresent,
-                    None => narf_init::InitResult::NotPresent,
                 }
+                let fb = unsafe { scanout.framebuffer() };
+                let con = FbConsole::new(fb, Pixel32::NARF_FG, Pixel32::NARF_BG);
+                let (cols, rows) = (con.cols(), con.rows());
+                let backend = scanout.name();
+                narf_graphics::install_fb_console(con);
+                console::set_fb_hook(narf_graphics::console::write_bytes);
+                let _ = writeln!(
+                    console::Writer,
+                    "  splash: {}x{} {} framebuffer console installed \
+                     ({} cols x {} rows of 8x8 glyphs)",
+                    cols * 8,
+                    rows * 8,
+                    backend,
+                    cols,
+                    rows
+                );
+                narf_init::InitResult::Ok
+            });
+
+            // Auto-mount root if a known FS lives on any probed
+            // block device. Tries the native NVMe async path first
+            // (uses the controller's polled-completion fast path)
+            // then walks `narf_block::block_devices()` (which holds
+            // every `BlockDeviceSync`-implementing driver — AHCI,
+            // RamBlockDevice, virtio-blk-as-sync) wrapped in
+            // `SyncBlock` so the FS layer's async surface is
+            // satisfied. First successful FAT mount wins; the rest
+            // skip silently.
+            //
+            // Most UEFI laptops carry FAT32 on the EFI System
+            // Partition + ext4/btrfs/NTFS on the data partition;
+            // FAT discovery here lights up at least the ESP. ext2
+            // / ext4 / etc. discovery lands when those FSes get
+            // matching `mount_*` helpers.
+            narf_init::register(narf_init::Stage::Late, "root-mount-auto", || {
+                use alloc::sync::Arc;
+                use core::future::Future;
+                use core::pin::Pin;
+                use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+                fn drive<F: Future>(mut fut: F) -> Option<F::Output> {
+                    unsafe fn no_clone(_: *const ()) -> RawWaker {
+                        RawWaker::new(core::ptr::null(), &VTAB)
+                    }
+                    unsafe fn no_op(_: *const ()) {}
+                    const VTAB: RawWakerVTable =
+                        RawWakerVTable::new(no_clone, no_op, no_op, no_op);
+                    // SAFETY: vtable holds null-pointer-clean stubs.
+                    let waker = unsafe {
+                        Waker::from_raw(RawWaker::new(core::ptr::null(), &VTAB))
+                    };
+                    let mut ctx = Context::from_waker(&waker);
+                    // SAFETY: stack-pinned for the duration of the loop.
+                    let mut pinned = unsafe { Pin::new_unchecked(&mut fut) };
+                    for _ in 0..1024 {
+                        match pinned.as_mut().poll(&mut ctx) {
+                            Poll::Ready(v) => return Some(v),
+                            Poll::Pending => continue,
+                        }
+                    }
+                    None
+                }
+
+                let auth = narf_filesystem::bootstrap_mount_authority();
+                let domain = narf_lib::id::DomainId::DRIVER_0;
+
+                // Native-async NVMe attempt first — cheaper and the
+                // common case on modern laptops.
+                if narf_drivers_nvme::is_probed() {
+                    let dev = Arc::new(narf_drivers_nvme::NvmeBlockDevice);
+                    let fut = narf_drivers_fs_fat::mount_fat(&auth, "/", dev, domain);
+                    if let Some(Ok(_handle)) = drive(fut) {
+                        let _ = writeln!(
+                            console::Writer,
+                            "  root-mount: FAT volume on nvme mounted at \"/\""
+                        );
+                        return narf_init::InitResult::Ok;
+                    }
+                }
+
+                // Walk every block-device-registry entry, wrap in
+                // SyncBlock, and try a FAT mount. Any device that
+                // turns out not to be FAT returns Unsupported; we
+                // skip and try the next.
+                for entry in narf_block::block_devices() {
+                    let dev = narf_block::SyncBlock::new(entry.dev.clone());
+                    let fut = narf_drivers_fs_fat::mount_fat(&auth, "/", dev, domain);
+                    match drive(fut) {
+                        Some(Ok(_handle)) => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  root-mount: FAT volume on {} mounted at \"/\"",
+                                entry.name
+                            );
+                            return narf_init::InitResult::Ok;
+                        }
+                        Some(Err(narf_filesystem::FsError::Unsupported)) => continue,
+                        Some(Err(narf_filesystem::FsError::Busy)) => {
+                            // Already mounted by an earlier attempt;
+                            // treat as success.
+                            return narf_init::InitResult::Ok;
+                        }
+                        Some(Err(e)) => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  root-mount: FAT mount on {} failed: {:?}",
+                                entry.name, e
+                            );
+                        }
+                        None => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  root-mount: {} mount future didn't settle in 1024 polls",
+                                entry.name
+                            );
+                        }
+                    }
+                }
+                narf_init::InitResult::NotPresent
             });
 
             narf_init::register(narf_init::Stage::Late, "virtio-gpu-splash", || {
@@ -1423,6 +1652,15 @@ fn boot_userspace_init() {
     // address space — this lookup goes through the scheduler's
     // ready-queue scan.
     install_address_space_lookup(|| {
+        // Prefer the executor-published "currently-polling AS" —
+        // address_space_of searches the run-queue, which doesn't
+        // include the popped-and-being-polled slot. The fallback
+        // is kept so kernel-side introspection paths that resolve
+        // by id (not currently-polling) still work for tasks that
+        // are sitting on the queue.
+        if let Some(a) = narf_scheduler::current_address_space() {
+            return Some(a);
+        }
         let id = narf_scheduler::current_task_id();
         narf_scheduler::address_space_of(id)
     });
@@ -1436,55 +1674,99 @@ fn boot_userspace_init() {
     // the cooperative executor.
     install_user_task_hooks();
 
-    // Parse + map the ELF into a fresh AddressSpace. We pass a
-    // single-element argv (`["init"]`) so the SysV-AMD64 stack
-    // gets a real `argc | argv[0] | NULL | NULL | AT_NULL` frame
-    // laid down — the bare `load_user_process` shape (no args)
-    // leaves rsp one past the mapped stack region, which traps
-    // the first `read [rsp]` inside `__libc_start_main`.
+    // Register a scheduler-step pump so the cooperative executor
+    // keeps draining its run-queue while a user task is parked in
+    // `sys_sleep`. Without this, the busy-wait loop in `sys_sleep`
+    // owns the only CPU for the entire deadline — every other
+    // kernel async task (FB drain, USB HID supervisor, the
+    // boot-time async demo, future device pumps) starves until the
+    // sleeper resumes, which in turn means the sleeper's own puts
+    // / writes never reach the console because nothing else can
+    // poll the IRQ-driven console writer's drain. Matches the
+    // pattern `fb-drain-task` already uses for the framebuffer
+    // command ring. Cheap: one extra fn-pointer call per spin
+    // iteration.
+    fn scheduler_step_pump() {
+        let _ = narf_scheduler::poll_one_round();
+    }
+    narf_userspace::handlers::sleep_pumps::register(scheduler_step_pump);
+
+    // Helper: load + spawn one user binary. Both init and shell go
+    // through the same path; the only difference is the argv[0]
+    // string (which `__libc_start_main` consumes) and the binary
+    // bytes. SysV-AMD64 demands a non-empty argv so the stack frame
+    // (`argc | argv[0] | NULL | NULL | AT_NULL`) is well-formed —
+    // the bare `load_user_process` shape leaves rsp past the mapped
+    // stack and traps on the first `read [rsp]`.
     //
-    // SAFETY: the boot identity map covers low 4 GiB, the frame
-    // allocator was initialised earlier in `_start_rust`.
-    let proc = match unsafe { load_user_process_with(bytes, &["init"], &[], &[]) } {
-        Ok(p) => p,
-        Err(e) => {
+    // SAFETY: low-4-GiB identity map is live, frame allocator
+    // initialised in `_start_rust`.
+    fn spawn_one(name: &'static str, bytes: &'static [u8]) -> bool {
+        if bytes.is_empty() {
             let _ = writeln!(
                 console::Writer,
-                "  boot-init: load_user_process_with failed: {e:?}"
+                "  boot-init: {name}: ELF is empty — skipping"
             );
-            return;
+            return false;
         }
-    };
-    let pid = proc.pid;
-    let addr_space = proc.address_space.clone();
+        let proc = match unsafe { load_user_process_with(bytes, &[name], &[], &[]) } {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = writeln!(
+                    console::Writer,
+                    "  boot-init: {name}: load_user_process_with failed: {e:?}"
+                );
+                return false;
+            }
+        };
+        let pid = proc.pid;
+        let entry = proc.entry.0.as_u64();
+        let addr_space = proc.address_space.clone();
+        let _ = writeln!(
+            console::Writer,
+            "  boot-init: spawning {name} pid={} entry={:#x}",
+            pid.raw(),
+            entry
+        );
+        narf_scheduler::spawn_user(
+            UserTaskFuture::new(proc),
+            narf_scheduler::TaskSpec::unthrottled(),
+            addr_space,
+        );
+        true
+    }
 
-    let _ = writeln!(
-        console::Writer,
-        "  boot-init: spawning init pid={} entry={:#x}",
-        pid.raw(),
-        proc.entry.0.as_u64()
-    );
-
-    let _id = narf_scheduler::spawn_user(
-        UserTaskFuture::new(proc),
-        narf_scheduler::TaskSpec::unthrottled(),
-        addr_space,
-    );
+    // Init is the canonical first user process; shell runs as a
+    // peer (no fork/execve yet). Both reach `__libc_start_main`
+    // now that `process::load_user_process_with` always stages a
+    // synthetic TLS region for binaries without PT_TLS — the
+    // previous startup `#PF` came from `mov %fs:[0]` against
+    // `FS_BASE = 0`. Shell is still gated behind the
+    // `boot-init` cargo feature.
+    spawn_one("init", bytes);
+    spawn_one("shell", narf_verification::NARF_SHELL_ELF);
 }
 
-/// aarch64 stub. The user-mode-entry / IRET-equivalent + EL0 trap
-/// vector wiring (`narf_scheduler::enter_user_mode` on aarch64) is
-/// not on the Stage-3 path yet — the scheduler-side comment at
-/// `scheduler/src/lib.rs:362` flags `addr_space.activate()` as
-/// returning `NotImplemented` on aarch64. Until that lands, this
-/// is a no-op so a `cargo xtask run --arch=aarch64 --features
-/// boot-init` build still links.
+/// aarch64 boot-init stub.
+///
+/// All the underlying primitives are now in place — `AddressSpace::activate`
+/// issues the architected `MSR TTBR0_EL1` sequence,
+/// `narf_arch::aarch64::user_mode::{enter_user_mode, enter_user_mode_resume}`
+/// drop into EL0 via `eret`, the EL1 vector table routes synchronous /
+/// IRQ / data-abort traps back through `frame::aarch64::trap`, and
+/// `UserTaskFuture` polls the EL0↔EL1 round-trip. What's missing is
+/// the plumbing wiring `userspace::loader::load_user_process_with` to
+/// the aarch64 init/shell ELFs (the loader's PT_LOAD segment-walker is
+/// arch-neutral, but the init/shell crates currently link against the
+/// x86_64 testbin layout). Until that ELF-side work lands the boot-init
+/// path stays a no-op so `cargo xtask run --arch=aarch64
+/// --features boot-init` still links and boots the kernel proper.
 #[cfg(all(feature = "boot-init", not(target_arch = "x86_64")))]
 fn boot_userspace_init() {
     use core::fmt::Write as _;
     let _ = writeln!(
         console::Writer,
-        "  boot-init: aarch64 user-mode entry not yet wired"
+        "  boot-init: aarch64 ELF wiring pending (kernel EL0 path is live)"
     );
 }
 

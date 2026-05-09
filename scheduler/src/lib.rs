@@ -173,12 +173,33 @@ pub fn disable_work_stealing() {
 /// migrate to a per-CPU slot read via `gs:[offset]`.
 static CURRENT_TASK: AtomicU64 = AtomicU64::new(0);
 
+/// Address space of the currently-polling task — published before
+/// `poll` so syscall handlers can resolve it without searching the
+/// run-queue (the slot has been popped and isn't visible to
+/// `address_space_of` during the poll body). Cleared on the way
+/// out. Lock-protected because boot establishes a kernel-only
+/// thread of control before any user task spawns; subsequent
+/// reads are infrequent (one per syscall) and writes are once per
+/// poll, so the lock cost is negligible.
+static ACTIVE_USER_AS: narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
 /// Read the currently-polling task's id. Returns `TaskId::NONE`
 /// when called outside any `poll` context (e.g. from boot or
 /// between rounds).
 #[inline]
 pub fn current_task_id() -> TaskId {
     TaskId(CURRENT_TASK.load(Ordering::Acquire))
+}
+
+/// Resolve the address space of the currently-polling task. This
+/// is the syscall-side companion to `address_space_of` that works
+/// during a poll body (when the slot has been popped from the
+/// run-queue and is no longer findable by id). Returns `None`
+/// when the active task is kernel-only (no AS) or the executor
+/// isn't currently polling.
+pub fn current_address_space() -> Option<Arc<AddressSpace>> {
+    ACTIVE_USER_AS.lock().clone()
 }
 
 struct TaskSlot {
@@ -360,11 +381,12 @@ where
 }
 
 /// Spawn a user-mode task carrying its own address space. Every
-/// poll of the task's future is preceded by
-/// `addr_space.activate()` — the Stage-4 arch backend will make
-/// this a real `MOV CR3` / `TTBR0_EL1` store. Until that lands
-/// `activate()` returns `NotImplemented` and the executor logs +
-/// proceeds (user code would trap, but the shape is exercised).
+/// poll of the task's future is preceded by `addr_space.activate()`,
+/// which on x86_64 issues a `MOV CR3` (with the right `compiler_fence`
+/// discipline) and on aarch64 issues the architected
+/// `MSR TTBR0_EL1 + DSB + TLBI VMALLE1 + DSB + ISB` sequence. Both
+/// paths are live; the only `NotImplemented` returns now come from
+/// arches outside the {x86_64, aarch64} matrix (they log + proceed).
 pub fn spawn_user<F>(f: F, spec: TaskSpec, addr_space: Arc<AddressSpace>) -> TaskId
 where
     F: Future<Output = ()> + Send + 'static,
@@ -525,6 +547,102 @@ fn make_waker(flag: Arc<AtomicBool>) -> Waker {
 /// CPU's queue are empty. Workers (APs) call this in a loop with no
 /// expectation of return; tests call it from BSP and rely on it
 /// returning once their spawned tasks complete.
+/// Drive one round of the local CPU's run-queue, polling **only
+/// kernel-side tasks** (`addr_space.is_none()`), and return.
+///
+/// Designed to be called from inside a syscall trap — most
+/// notably the `sys_sleep` busy-wait in
+/// `narf_userspace::handlers::sleep_pumps` — to keep kernel async
+/// work (FB drain, USB HID supervisor, the boot-time async demo,
+/// future device pumps) advancing while a user task is parked.
+///
+/// User-mode (AS-bearing) tasks are intentionally skipped:
+/// polling one of them inside a syscall handler would call
+/// `enter_user_mode` from a trap context whose `iretq` frame is
+/// still on the kernel stack, re-entering user code while another
+/// trap is in flight — the kernel stack would corrupt and the
+/// CR3 swap would race. User tasks resume normally on the
+/// outermost `run_until_empty` after the syscall returns.
+///
+/// Each kernel task is visited at most once. The function never
+/// `halt_until_irq`s. Returns the number of tasks that completed
+/// this round (`Ready` returns), purely as a diagnostic.
+pub fn poll_one_round() -> usize {
+    let cpu = narf_lib::percpu::current_cpu();
+    let cpu = if cpu < narf_lib::percpu::MAX_CPUS {
+        cpu
+    } else {
+        0
+    };
+
+    let round_len = {
+        let q = READY[cpu].lock();
+        match q.as_ref() {
+            Some(d) => d.len(),
+            None => return 0,
+        }
+    };
+    let mut ready_this_round = 0usize;
+
+    for _ in 0..round_len {
+        let mut slot = {
+            let mut q = READY[cpu].lock();
+            match q.as_mut().and_then(|d| d.pop_front()) {
+                Some(t) => t,
+                None => break,
+            }
+        };
+        // Skip user-mode tasks — see fn-level comment. Re-push so
+        // the outer run loop still sees them when this returns.
+        if slot.addr_space.is_some() {
+            let mut q = READY[cpu].lock();
+            q.as_mut().unwrap().push_back(slot);
+            continue;
+        }
+        if let Some(ref cap) = slot.spec.budget_cap {
+            if cap.check_live().is_err() {
+                continue;
+            }
+        }
+        if !slot.awake.swap(false, Ordering::Acquire) {
+            let mut q = READY[cpu].lock();
+            q.as_mut().unwrap().push_back(slot);
+            continue;
+        }
+        let waker = make_waker(slot.awake.clone());
+        let mut ctx = Context::from_waker(&waker);
+        let start = Instant::now();
+        // Save + restore identity around the inner poll. We're
+        // running INSIDE another task's poll (the user-mode
+        // syscall handler that called sleep_pumps); a blunt
+        // clear on exit would strip the outer task's
+        // CURRENT_TASK + ACTIVE_USER_AS publication and break
+        // its next syscall lookup. Pumps only ever poll
+        // kernel-only tasks (the user-task skip above), so the
+        // ACTIVE_USER_AS clear is unconditional — kernel tasks
+        // don't carry their own AS publication.
+        let outer_task = CURRENT_TASK.load(Ordering::Acquire);
+        let outer_as = ACTIVE_USER_AS.lock().clone();
+        CURRENT_TASK.store(slot.id.raw(), Ordering::Release);
+        // No `*ACTIVE_USER_AS.lock() = ...` here because kernel
+        // tasks have `addr_space.is_none()` (we filtered above).
+        let poll_result = slot.task.as_mut().poll(&mut ctx);
+        CURRENT_TASK.store(outer_task, Ordering::Release);
+        *ACTIVE_USER_AS.lock() = outer_as;
+        let elapsed = Instant::now().cycles_since(start);
+        slot.account.charge(elapsed, &slot.spec.budget);
+        narf_rcu::report_quiescent();
+        match poll_result {
+            Poll::Ready(()) => ready_this_round += 1,
+            Poll::Pending => {
+                let mut q = READY[cpu].lock();
+                q.as_mut().unwrap().push_back(slot);
+            }
+        }
+    }
+    ready_this_round
+}
+
 pub fn run_until_empty() {
     let cpu = narf_lib::percpu::current_cpu();
     let cpu = if cpu < narf_lib::percpu::MAX_CPUS {
@@ -573,12 +691,11 @@ pub fn run_until_empty() {
                 continue;
             }
 
-            // Stage-4: if the task owns an address space, activate it
-            // before polling so user-mode accesses land in the right
-            // low-half mappings. Today the arch backend isn't wired;
-            // `activate()` returns `NotImplemented` and we ignore the
-            // error — user tasks would trap, but kernel-only tasks
-            // are unaffected.
+            // If the task owns an address space, activate it before
+            // polling so user-mode accesses land in the right low-half
+            // mappings. Live on x86_64 (CR3 swap) and aarch64 (TTBR0
+            // swap). The error path remains so kernel-only tasks on
+            // unsupported arches keep running unchanged.
             if let Some(ref a) = slot.addr_space {
                 let _ = a.activate();
             }
@@ -586,14 +703,21 @@ pub fn run_until_empty() {
             let waker = make_waker(slot.awake.clone());
             let mut ctx = Context::from_waker(&waker);
             let start = Instant::now();
-            // Publish this slot's id as the currently-polling task
-            // so syscall handlers + introspection can identify the
-            // caller. Cleared after the poll so async code that
-            // defers via `.await` doesn't leak the id across yield
-            // points (the next round's task will re-publish).
+            // Publish this slot's id + AS as the currently-polling
+            // task so syscall handlers + introspection can identify
+            // the caller and resolve its mappings. Cleared after the
+            // poll so async code that defers via `.await` doesn't
+            // leak identity across yield points (the next round's
+            // task will re-publish). The AS publication makes
+            // `current_address_space()` work during the poll body —
+            // by the time we'd otherwise look the slot up via
+            // `address_space_of(id)` it's already been popped from
+            // the queue and thus invisible to that scan.
             CURRENT_TASK.store(slot.id.raw(), Ordering::Release);
+            *ACTIVE_USER_AS.lock() = slot.addr_space.clone();
             let poll_result = slot.task.as_mut().poll(&mut ctx);
             CURRENT_TASK.store(0, Ordering::Release);
+            *ACTIVE_USER_AS.lock() = None;
             let elapsed = Instant::now().cycles_since(start);
             slot.account.charge(elapsed, &slot.spec.budget);
 

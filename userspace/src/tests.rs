@@ -2527,9 +2527,12 @@ fn smoke_userspace_load_user_process_builds_runnable_image() -> TestResult {
         return TestResult::Fail("stack_top mis-computed");
     }
 
-    // AS should have the code segment + stack region.
-    if proc.address_space.region_count() != 2 {
-        return TestResult::Fail("address space should carry 2 regions");
+    // AS should have the code segment + stack region. On x86_64
+    // the loader also stages a synthetic TLS region (one page) for
+    // every binary that lacks PT_TLS, so the count is 3 there.
+    let expected_regions: usize = if cfg!(target_arch = "x86_64") { 3 } else { 2 };
+    if proc.address_space.region_count() != expected_regions {
+        return TestResult::Fail("address space carried unexpected region count");
     }
 
     // Code segment PTE installed.
@@ -2800,8 +2803,11 @@ fn smoke_userspace_load_user_process_with_interp() -> TestResult {
         return TestResult::Fail("entry should be interpreter entry + bias");
     }
 
-    if proc.address_space.region_count() != 4 {
-        return TestResult::Fail("expected 4 regions (program code/data + interp + stack)");
+    // Program code + program data + interp + stack (+ TLS region
+    // on x86_64 — see the synthetic-TLS path in load_user_process_with).
+    let expected_regions: usize = if cfg!(target_arch = "x86_64") { 5 } else { 4 };
+    if proc.address_space.region_count() != expected_regions {
+        return TestResult::Fail("unexpected region count after PT_INTERP load");
     }
 
     // Both program and interpreter pages must be materialised.
