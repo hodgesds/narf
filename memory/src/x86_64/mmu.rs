@@ -23,7 +23,7 @@
 #![cfg(target_arch = "x86_64")]
 
 use crate::paging::{write_cr3, write_identity, PageTable, PageTableEntry, PtFlags};
-use crate::{alloc_frame, FrameAllocError, PhysAddr};
+use crate::{FrameAllocError, PhysAddr};
 
 /// Errors from `init_mmu`. Stage-1 failure modes are limited to
 /// frame exhaustion and alloc-before-init.
@@ -123,7 +123,7 @@ pub unsafe fn init_mmu() -> Result<PhysAddr, MmuError> {
     // SAFETY: single-threaded boot path; this is the only writer
     // to `EARLY_PAGE_TABLES`.
     const KERNEL_VIRT_BASE: u64 = 0xFFFF_FFFF_8000_0000;
-    let tables_ptr = unsafe { core::ptr::addr_of_mut!(EARLY_PAGE_TABLES) };
+    let tables_ptr = core::ptr::addr_of_mut!(EARLY_PAGE_TABLES);
     let pml4_virt = unsafe { core::ptr::addr_of_mut!((*tables_ptr).pml4) } as u64;
     let pdpt_lo_virt = unsafe { core::ptr::addr_of_mut!((*tables_ptr).pdpt_lo) } as u64;
     let pdpt_hi_mmio_virt = unsafe { core::ptr::addr_of_mut!((*tables_ptr).pdpt_hi_mmio) } as u64;
