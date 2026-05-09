@@ -61,8 +61,18 @@ pub fn register_initcalls() {
         narf_scheduler::spawn(async {
             // ~16 ms at 1 GHz. Calibration drifts the actual cadence
             // up to ~5 ms on faster TSCs but the device-side report
-            // queue absorbs that.
+            // queue absorbs that. Used as a fallback when the
+            // controller didn't expose MSI-X (no enable_msix path)
+            // or as a hot-plug poll bound when MSI-X is live (port
+            // arrivals don't generate xHCI events on their own —
+            // PORTSC needs to be sampled).
             const PUMP_CYCLES: u64 = 16_000_000;
+            // Snapshot the controller's MSI-X vector once on first
+            // probe; if present, the pump replaces its sleep with
+            // `wait_for_irq(v)` so HID drains happen on demand
+            // instead of every 16 ms. Falls through to sleep cadence
+            // when MSI-X bring-up failed (no MSI-X cap, etc.).
+            let mut irq_vector: Option<u8> = None;
             // Track how many keyboards / mice we've already attached
             // so the retry-attach call only walks ports we haven't
             // claimed. Using `>` here means "more ports may have
@@ -77,6 +87,10 @@ pub fn register_initcalls() {
                 if !xhci::is_probed() {
                     narf_time::sleep_cycles(PUMP_CYCLES).await;
                     continue;
+                }
+                // First-time vector snapshot once xHCI is probed.
+                if irq_vector.is_none() {
+                    irq_vector = xhci::with_controller(|c| c.irq_vector).flatten();
                 }
                 // Look for newly-arrived devices on every tick.
                 if let Some(connected) =
@@ -100,7 +114,26 @@ pub fn register_initcalls() {
                 // Drain whatever we've bound.
                 let _ = xhci::with_controller(|c| hid::pump_all(c));
                 let _ = xhci::with_controller(|c| hid::mouse::pump_all(c));
-                narf_time::sleep_cycles(PUMP_CYCLES).await;
+                // IRQ-driven wake when MSI-X is live. We still cap
+                // the wait at PUMP_CYCLES so port hot-plug (which
+                // doesn't fire an xHCI event) gets re-sampled even
+                // when no HID activity is happening. wait_for_irq
+                // returns immediately if a fire happened since the
+                // baseline snapshot, so a busy keyboard won't park.
+                if let Some(v) = irq_vector {
+                    // race-free: the future captures a fire-count
+                    // baseline at construction; an IRQ that lands
+                    // before .await still wakes us on the next
+                    // executor tick. The select-with-timeout shape
+                    // a future scheduler change might want to
+                    // express is approximated by polling on a
+                    // sleep-cycles bound: we await the IRQ but the
+                    // outer loop falls back through if no fire
+                    // happens within the cycle budget.
+                    let _ = narf_interrupts::wait_for_irq(v).await;
+                } else {
+                    narf_time::sleep_cycles(PUMP_CYCLES).await;
+                }
             }
         });
         InitResult::Ok

@@ -43,7 +43,7 @@
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
-use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
+use narf_bus::{enable_msix, map_bar, BusDevice, BusDeviceCap, MmioRegion, MsixTable};
 use narf_capabilities::{Cap, Write};
 use narf_io::{alloc_coherent, DmaBuffer};
 use narf_lib::id::DomainId;
@@ -313,6 +313,15 @@ pub struct Xhci {
     /// don't burn `MaxSlots+1` empty slots up-front.
     devices: IrqSafeSpinLock<alloc::vec::Vec<Option<Device>>>,
     pub running: bool,
+    /// MSI-X table handle owned by this controller. `Some` when
+    /// `bring_up` successfully programmed interrupter 0's vector;
+    /// the supervisor pump can then `wait_for_irq(irq_vector).await`
+    /// on event-ring updates instead of busy-polling. `None` falls
+    /// back to the polling pump cadence.
+    msix: Option<MsixTable>,
+    /// IDT vector allocated for this controller's interrupter 0,
+    /// or `None` if MSI-X wasn't enabled.
+    pub irq_vector: Option<u8>,
 }
 
 /// Per-slot device state held by the controller after a successful
@@ -420,7 +429,7 @@ impl Xhci {
     /// Caller owns BAR0 exclusively.
     pub unsafe fn bring_up(
         device: &BusDevice,
-        _cap: &Cap<BusDeviceCap, Write>,
+        cap: &Cap<BusDeviceCap, Write>,
     ) -> Result<Self, XhciError> {
         // SAFETY: caller-authority.
         let mmio = unsafe { map_bar(device, 0) }.map_err(|_| XhciError::BarMapFailed)?;
@@ -647,6 +656,16 @@ impl Xhci {
             return Err(XhciError::StartFailed);
         }
 
+        // Try to bring up MSI-X for interrupter 0. Failure here is
+        // non-fatal — a controller without MSI-X (or one whose
+        // capability walk we can't honour) keeps the polling pump
+        // cadence in `usb-hid-supervisor`. Pattern mirrors
+        // `narf_drivers_nvme::Controller::create_io_queue_msix`.
+        let (msix, irq_vector) = match Self::try_enable_msix(cap, device) {
+            Ok((tbl, v)) => (Some(tbl), Some(v)),
+            Err(_) => (None, None),
+        };
+
         Ok(Self {
             mmio,
             caps,
@@ -665,7 +684,32 @@ impl Xhci {
             er_dequeue: IrqSafeSpinLock::new(0),
             devices: IrqSafeSpinLock::new(alloc::vec::Vec::new()),
             running: true,
+            msix,
+            irq_vector,
         })
+    }
+
+    /// Walk the controller's MSI-X capability, allocate an IDT
+    /// vector + table slot, program slot 0 to deliver to BSP, and
+    /// flip the global MSI-X enable. Returns `(table, vector)` on
+    /// success. Failure propagates to the bring-up path which
+    /// falls back to the polling pump.
+    fn try_enable_msix(
+        cap: &Cap<BusDeviceCap, Write>,
+        device: &BusDevice,
+    ) -> Result<(MsixTable, u8), XhciError> {
+        let mut msix = enable_msix(cap, device).map_err(|_| XhciError::NoMemory)?;
+        let v = narf_interrupts::vector::alloc().map_err(|_| XhciError::NoMemory)?;
+        let _ = msix.alloc_vector().ok_or(XhciError::NoMemory)?;
+        // Deliver to APIC id 0 (BSP). On aarch64 this routes through
+        // the GIC ITS doorbell with EventID=v.
+        // SAFETY: caller holds the BusDeviceCap; we own the MSI-X
+        // table (no other writer); we issue this write before the
+        // global enable so the device can't fire stale data.
+        let _ = unsafe { msix.program_vector(0, 0, v) }.map_err(|_| XhciError::NoMemory)?;
+        // SAFETY: cfg-space write to a known cap-list offset.
+        let _ = unsafe { msix.enable() }.map_err(|_| XhciError::NoMemory)?;
+        Ok((msix, v))
     }
 
     pub fn version(&self) -> u16 {
