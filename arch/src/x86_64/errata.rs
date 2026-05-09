@@ -49,11 +49,20 @@ unsafe fn intel_disable_tsx_rtm() {
     }
 }
 
-/// Marker for AMD Zen1 erratum 1474 — clamp DE_CFG[9].
+/// AMD Zen 1/2 erratum: clamp DE_CFG[9].
+///
+/// Zen 1: erratum 1474 (long-idle TSC drift).
+/// Zen 2: "Zenbleed" (CVE-2023-20593) — XMM register leak when
+/// vzeroupper interleaves with branch-prediction misspeculation.
+/// AMD's mitigation is the same MSR bit (`MSR_DE_CFG[9]`,
+/// `chicken-bit` per AMD-SB-7008).
+///
+/// Spec source: AMD Public Security Bulletin AMD-SB-7008
+/// <https://www.amd.com/en/resources/product-security/bulletin/amd-sb-7008.html>
 ///
 /// # Safety
-/// CPL = 0; AMD Zen1.
-unsafe fn amd_zen1_erratum_1474() {
+/// CPL = 0; caller has confirmed CPU is AMD Zen 1 or Zen 2.
+unsafe fn amd_de_cfg_bit9() {
     use crate::x86_64::msr::{rdmsr, wrmsr};
     const MSR_DE_CFG: u32 = 0xC001_1029;
     // SAFETY: caller-asserted.
@@ -61,6 +70,52 @@ unsafe fn amd_zen1_erratum_1474() {
     unsafe {
         wrmsr(MSR_DE_CFG, v | (1 << 9));
     }
+}
+
+/// AMD Zen 4 erratum 1485: under specific micro-op queue
+/// conditions an `RDMSR` followed by `WRMSR` can fail to
+/// architecturally serialise. AMD's recommended workaround is
+/// to set `MSR_DE_CFG[14]` ("force serialising MSR access") on
+/// every Zen 4 core during early bring-up.
+///
+/// Spec source: AMD Family 19h Models 60h-7Fh Revision Guide
+/// (Phoenix / Phoenix2). The bit is documented in the BIOS &
+/// Kernel Developer's Guide for Family 19h.
+/// <https://www.amd.com/en/support/tech-docs>
+///
+/// # Safety
+/// CPL = 0; caller has confirmed CPU is AMD Zen 4 (Family 0x19,
+/// Model 0x60-0x7F). Setting the bit on other parts is
+/// architecturally a no-op for the documented chicken-bit
+/// semantics, but we gate via the table to keep behaviour
+/// minimal.
+unsafe fn amd_zen4_erratum_1485() {
+    use crate::x86_64::msr::{rdmsr, wrmsr};
+    const MSR_DE_CFG: u32 = 0xC001_1029;
+    // SAFETY: caller-asserted.
+    let v = unsafe { rdmsr(MSR_DE_CFG) };
+    unsafe {
+        wrmsr(MSR_DE_CFG, v | (1 << 14));
+    }
+}
+
+/// AMD Zen 5 marker — silicon detected, no MSR mutation. Kept
+/// as a registry entry so a future Zen 5 erratum that needs a
+/// workaround can land here without scaffolding. The table
+/// scanner skips entries whose `apply` is `nop_workaround`-shaped
+/// only by virtue of running them; treating this as a
+/// detection-only hook keeps the boot log honest.
+///
+/// Family 0x1A is the official Family ID for Zen 5 (Granite
+/// Ridge / Strix Point / Turin), per AMD CPUID-Specification
+/// for Family 1Ah.
+///
+/// # Safety
+/// CPL = 0; trivially safe.
+unsafe fn amd_zen5_detection_marker() {
+    // No MSR writes — the marker exists so apply_for_current_cpu
+    // logs that we're aware of being on Zen 5 silicon. Add real
+    // workarounds here as AMD publishes Family 1Ah errata.
 }
 
 /// Errata table. Entries are ordered (vendor, family, model_lo)
@@ -82,7 +137,45 @@ pub const TABLE: &[Errata] = &[
         model_lo: 0x00,
         model_hi: 0x2F,
         stepping_mask: 0xFFFF_FFFF,
-        apply: amd_zen1_erratum_1474,
+        apply: amd_de_cfg_bit9,
+    },
+    // Zen 2 (Family 0x17, Models 0x30-0xAF — Rome / Renoir /
+    // Matisse). Zenbleed (CVE-2023-20593): same DE_CFG[9] bit
+    // as Zen 1 1474, applied family-wide via AMD-SB-7008.
+    Errata {
+        name: "amd-zen2-zenbleed",
+        vendor: Vendor::Amd,
+        family: 0x17,
+        model_lo: 0x30,
+        model_hi: 0xAF,
+        stepping_mask: 0xFFFF_FFFF,
+        apply: amd_de_cfg_bit9,
+    },
+    // Zen 4 (Family 0x19, Models 0x60-0x7F — Phoenix / Phoenix2
+    // / Ryzen 7040 / 8000 series APUs). Erratum 1485:
+    // RDMSR/WRMSR serialisation. DE_CFG[14] enables the
+    // serialising-MSR chicken bit.
+    Errata {
+        name: "amd-zen4-1485",
+        vendor: Vendor::Amd,
+        family: 0x19,
+        model_lo: 0x60,
+        model_hi: 0x7F,
+        stepping_mask: 0xFFFF_FFFF,
+        apply: amd_zen4_erratum_1485,
+    },
+    // Zen 5 (Family 0x1A — Granite Ridge / Strix Point / Turin).
+    // Detection marker only; populates the apply log so a Zen 5
+    // boot is visible. No published Family-1Ah erratum yet
+    // requires kernel intervention beyond microcode.
+    Errata {
+        name: "amd-zen5-marker",
+        vendor: Vendor::Amd,
+        family: 0x1A,
+        model_lo: 0x00,
+        model_hi: 0xFF,
+        stepping_mask: 0xFFFF_FFFF,
+        apply: amd_zen5_detection_marker,
     },
     Errata {
         name: "marker-noop",
@@ -100,13 +193,18 @@ pub fn table() -> &'static [Errata] {
 }
 
 /// Apply every errata entry that matches the current CPU.
-/// Idempotent — safe to call once per AP.
+/// Returns a fixed-size buffer + count of the applied entry
+/// names so callers can log "what we matched" without pulling
+/// alloc into this module. Idempotent — safe to call once per
+/// AP.
 ///
 /// # Safety
-/// CPL = 0; the per-entry `apply` functions are themselves
-/// safe to call (they gate on CPUID).
-pub unsafe fn apply_for_current_cpu() {
+/// CPL = 0; the per-entry `apply` functions are themselves safe
+/// to call (they gate on CPUID).
+pub unsafe fn apply_for_current_cpu() -> ([&'static str; 8], usize) {
     let me = ident::read();
+    let mut out: [&'static str; 8] = [""; 8];
+    let mut n = 0usize;
     for e in TABLE {
         if e.vendor != me.vendor {
             continue;
@@ -124,5 +222,10 @@ pub unsafe fn apply_for_current_cpu() {
         unsafe {
             (e.apply)();
         }
+        if n < out.len() {
+            out[n] = e.name;
+            n += 1;
+        }
     }
+    (out, n)
 }

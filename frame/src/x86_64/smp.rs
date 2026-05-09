@@ -144,6 +144,15 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
         narf_arch::x86_64::cpu::set_current_cpu(id);
     }
 
+    // 1b. Apply per-silicon errata on this AP. Same table as the
+    //     BSP — chicken bits like AMD DE_CFG[9] / [14] are
+    //     per-core MSRs, not core-cluster-shared, so each AP
+    //     needs the write itself. SAFETY: CPL=0; per-entry SAFETY
+    //     notes apply.
+    unsafe {
+        let _ = narf_arch::x86_64::errata::apply_for_current_cpu();
+    }
+
     // 2. Load the BSP-built IDT register on this CPU.
     // SAFETY: BSP populated IDT during init_traps; per-CPU IDTR
     // load is required even when entries are shared.

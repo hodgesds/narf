@@ -891,6 +891,76 @@ fn smoke_x86_errata_table_sorted() -> TestResult {
 kernel_test_in!("arch/errata", smoke_x86_errata_table_sorted);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_x86_errata_table_covers_zen_families() -> TestResult {
+    // Sanity: the table should carry an AMD entry for every Zen
+    // family we've documented workarounds for. If a future edit
+    // accidentally drops one (e.g. mass-rename of the apply
+    // function) this test catches it.
+    use crate::x86_64::errata;
+    use crate::x86_64::ident::Vendor;
+    let t = errata::table();
+    let mut zen1 = false;
+    let mut zen2 = false;
+    let mut zen4 = false;
+    let mut zen5 = false;
+    for e in t {
+        if e.vendor != Vendor::Amd {
+            continue;
+        }
+        // Each family expressed as the (family, model_lo, model_hi)
+        // tuple that uniquely identifies that Zen generation in
+        // the table.
+        match (e.family, e.model_lo, e.model_hi) {
+            (0x17, 0x00, 0x2F) => zen1 = true,
+            (0x17, 0x30, 0xAF) => zen2 = true,
+            (0x19, 0x60, 0x7F) => zen4 = true,
+            (0x1A, 0x00, 0xFF) => zen5 = true,
+            _ => {}
+        }
+    }
+    if !zen1 {
+        return TestResult::Fail("missing Zen 1 entry (family 0x17, model 0x00-0x2F)");
+    }
+    if !zen2 {
+        return TestResult::Fail("missing Zen 2 entry (family 0x17, model 0x30-0xAF)");
+    }
+    if !zen4 {
+        return TestResult::Fail("missing Zen 4 entry (family 0x19, model 0x60-0x7F)");
+    }
+    if !zen5 {
+        return TestResult::Fail("missing Zen 5 marker (family 0x1A)");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/errata", smoke_x86_errata_table_covers_zen_families);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_x86_errata_apply_returns_count() -> TestResult {
+    // apply_for_current_cpu returns ([&str; 8], usize) — make
+    // sure the count matches the number of non-empty names.
+    // SAFETY: pure CPUID reads + (potentially) DE_CFG MSR
+    // writes. Idempotent — boot-time apply already ran.
+    let (names, n) = unsafe { crate::x86_64::errata::apply_for_current_cpu() };
+    if n > names.len() {
+        return TestResult::Fail("count exceeds buffer length");
+    }
+    for name in &names[..n] {
+        if name.is_empty() {
+            return TestResult::Fail("name slot within count is empty");
+        }
+    }
+    for name in &names[n..] {
+        if !name.is_empty() {
+            return TestResult::Fail("name slot past count is non-empty");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/errata", smoke_x86_errata_apply_returns_count);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_lvt_pc_program_helper() -> TestResult {
     use crate::x86_64::pmi;
     // Use a kernel-mode buffer as a stand-in for the LAPIC MMIO

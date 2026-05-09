@@ -273,6 +273,32 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             let _ = writeln!(console::Writer, "  nx: unavailable");
         }
 
+        // CPU identification + per-silicon errata application.
+        // Errata table covers Zen 1 1474, Zen 2 Zenbleed
+        // (CVE-2023-20593), Zen 4 1485, plus a Zen 5 detection
+        // marker. apply_for_current_cpu walks the table and
+        // applies every entry whose vendor/family/model/stepping
+        // match the BSP. Idempotent — APs call the same function
+        // from `_ap_start_rust`.
+        let cpu = narf_arch::x86_64::ident::read();
+        let brand = narf_arch::x86_64::ident::brand_str(&cpu);
+        let _ = writeln!(
+            console::Writer,
+            "  cpu: {} (vendor {:?}, family {:#x}, model {:#x}, stepping {})",
+            brand, cpu.vendor, cpu.family, cpu.model, cpu.stepping
+        );
+        // SAFETY: CPL=0; per-entry SAFETY notes apply; gated by
+        // vendor/family/model match.
+        let (applied, n) = unsafe { narf_arch::x86_64::errata::apply_for_current_cpu() };
+        if n == 0 {
+            let _ = writeln!(console::Writer, "  errata: no entries matched this CPU");
+        } else {
+            let _ = writeln!(console::Writer, "  errata: applied {} entries:", n);
+            for e in &applied[..n] {
+                let _ = writeln!(console::Writer, "    - {}", e);
+            }
+        }
+
         // x2APIC + LAPIC timer. Gated on CPUID.x2APIC; absence leaves
         // the scheduler in its Stage-1 busy-poll mode, which still
         // works, just without timer IRQs.
