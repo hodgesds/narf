@@ -24,6 +24,7 @@ narf-input        = { path = "../../input" }
 narf-interrupts   = { path = "../../interrupts" }
 narf-console      = { path = "../../console" }
 narf-scheduler    = { path = "../../scheduler" }
+narf-time         = { path = "../../time" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
 
 [features]

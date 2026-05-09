@@ -677,6 +677,23 @@ impl Xhci {
     pub fn max_ports(&self) -> u8 {
         self.caps.max_ports
     }
+    /// `true` when the controller advertises `HCCPARAMS1.CSZ = 1`
+    /// (64-byte device + input contexts). Both 32-byte and 64-byte
+    /// strides are supported; this accessor is kept for tests +
+    /// diagnostics.
+    pub fn uses_64byte_contexts(&self) -> bool {
+        self.csz_64byte
+    }
+
+    /// Stride between adjacent contexts inside an Input or Device
+    /// Context page. 32 bytes when `HCCPARAMS1.CSZ=0`, 64 bytes
+    /// when `HCCPARAMS1.CSZ=1`. The xHCI 1.2 spec lays out only
+    /// the lower 32 bytes of fields in either case — the 64-byte
+    /// form pads the upper half with reserved zeros.
+    #[inline]
+    fn context_stride(&self) -> u64 {
+        if self.csz_64byte { 0x40 } else { 0x20 }
+    }
     pub fn is_running(&self) -> bool {
         self.running
     }
@@ -914,12 +931,11 @@ impl Xhci {
     /// Completion Event. Returns the slot id on success and stashes
     /// the per-slot state in `self.devices`.
     ///
-    /// 32-byte contexts only — controllers reporting HCCPARAMS1.CSZ=1
-    /// fail with `CmdFailed(0xFE)`.
+    /// Handles both 32-byte (CSZ=0) and 64-byte (CSZ=1) contexts —
+    /// the per-context stride is `0x20` or `0x40` respectively, but
+    /// the field layout *within* each context is identical (the
+    /// 64-byte form just pads the upper half).
     pub fn address_device(&self, slot_id: u8, port: u8, speed: PortSpeed) -> Result<u8, XhciError> {
-        if self.csz_64byte {
-            return Err(XhciError::CmdFailed(0xFE));
-        }
         if slot_id == 0 || slot_id > self.caps.max_slots {
             return Err(XhciError::CmdFailed(0xFD));
         }
@@ -927,9 +943,10 @@ impl Xhci {
             return Err(XhciError::BadPort);
         }
 
-        // 32-byte context: Input Context = 32 (Input Control) + 32
-        // (Slot) + 32 × 31 (EP). Total = 1024 bytes — fits cleanly
-        // in a 4 KiB page with room to spare.
+        // §6.2.5 Input Context layout. Per-context stride is 32 or
+        // 64 bytes depending on HCCPARAMS1.CSZ. Worst case (CSZ=1):
+        // 64 (Input Control) + 64 (Slot) + 64 × 31 (EP) = 2112 bytes
+        // — still fits in one 4 KiB page.
         let input = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
         let dev_ctx = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
         let ctrl_tr = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
@@ -938,11 +955,6 @@ impl Xhci {
         let dev_ctx_phys = dev_ctx.phys_addr().raw();
         let ctrl_tr_phys = ctrl_tr.phys_addr().raw();
 
-        // ── Input Context layout (32-byte cuts, §6.2.5) ────────────
-        // 0x00..0x20 : Input Control Context
-        // 0x20..0x40 : Slot Context
-        // 0x40..0x60 : EP0 (DCI 1) Context
-        //
         // Input Control Context (§6.2.5.1):
         //   dword0 = D-mask (drop), dword1 = A-mask (add).
         //   We add Slot (A0=1) + EP0 (A1=1).
@@ -978,9 +990,12 @@ impl Xhci {
             core::ptr::write_bytes(ctrl_tr_phys as *mut u8, 0, 4096);
         }
 
-        let input_ctrl = input_phys + 0x00;
-        let slot_ctx = input_phys + 0x20;
-        let ep0_ctx = input_phys + 0x40;
+        let cs = self.context_stride();
+        let input_ctrl = input_phys; // always at offset 0
+        let slot_ctx = input_phys + cs; // immediately after Input Control
+        let ep0_ctx = input_phys + cs * 2; // EP0 = DCI 1, indexed from Slot
+                                            // Equivalent computation is `input_phys
+                                            // + cs + cs * dci` with dci=1.
 
         // Input Control Context — A0 (Slot) + A1 (EP0).
         // SAFETY: identity-mapped DMA; offsets in-page.
@@ -1291,16 +1306,14 @@ impl Xhci {
         slot_id: u8,
         endpoints: &[EndpointConfig],
     ) -> Result<(), XhciError> {
-        if self.csz_64byte {
-            return Err(XhciError::CmdFailed(0xFE));
-        }
         if endpoints.is_empty() {
             return Ok(());
         }
 
         // Allocate Input Context (4 KiB, zeroed). Layout matches
-        // address_device — 0x00 Input Control, 0x20 Slot Ctx,
-        // 0x40+0x20*(dci-1) per-EP Ctx.
+        // address_device — Input Control at 0, Slot Ctx at one
+        // stride, per-EP Ctx at `stride * (1 + dci - 1)` =
+        // `stride * dci`. The stride is 32 or 64 depending on CSZ.
         let input = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
         let input_phys = input.phys_addr().raw();
         // SAFETY: identity-mapped DMA; fresh 4 KiB page.
@@ -1340,7 +1353,10 @@ impl Xhci {
                 core::ptr::write_bytes(tr_phys as *mut u8, 0, 4096);
             }
 
-            let ep_ctx = input_phys + 0x20 + (dci as u64) * 0x20;
+            // EP context at `cs + cs * dci` = `cs * (1 + dci)`. cs
+            // = 32 (CSZ=0) or 64 (CSZ=1).
+            let cs = self.context_stride();
+            let ep_ctx = input_phys + cs * (1 + dci as u64);
             let ep_d1 = (3 << 1)                                    // Error Count = 3
                       | (ep.kind.ep_type() << 3)                    // EP Type
                       | ((ep.max_packet as u32) << 16); // MaxPacketSize
@@ -1383,8 +1399,9 @@ impl Xhci {
         let slot_d0 = unsafe { core::ptr::read_volatile(dev_ctx_phys as *const u32) };
         let new_slot_d0 = (slot_d0 & !(0x1Fu32 << 27)) | (max_dci << 27);
         let slot_d1 = unsafe { core::ptr::read_volatile((dev_ctx_phys + 4) as *const u32) };
-        // Plant slot ctx into the input context.
-        let slot_ctx_off = input_phys + 0x20;
+        // Plant slot ctx into the input context — same stride as in
+        // address_device.
+        let slot_ctx_off = input_phys + self.context_stride();
         // SAFETY: same.
         unsafe {
             core::ptr::write_volatile(slot_ctx_off as *mut u32, new_slot_d0);

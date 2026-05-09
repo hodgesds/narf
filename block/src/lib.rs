@@ -41,7 +41,7 @@ pub use deadline::{DeadlineScheduler, Lane, STARVE_BOUND};
 pub use mq::{MqDeadlineScheduler, MAX_LANES};
 pub use registry::{
     block_device_count, block_devices, find_block_device, register_block_device, BlockDeviceSync,
-    BlockIoError, RegisteredBlockDevice,
+    BlockIoError, RegisteredBlockDevice, SyncBlock,
 };
 
 use core::future::Future;

@@ -200,6 +200,160 @@ fn smoke_nvme_io_round_trip() -> TestResult {
 }
 kernel_test_in!("drivers/nvme", smoke_nvme_io_round_trip);
 
+fn smoke_nvme_block_device_async_round_trip() -> TestResult {
+    // Async-trait round-trip: route a `BlockOp::Write` + `BlockOp::Read`
+    // through `NvmeBlockDevice` (the `block::BlockDevice` impl) and
+    // confirm we get back the bytes we wrote. Exercises the
+    // cap-resolution path that the VFS / filesystem stack will use.
+    use crate::{Controller, NvmeBlockDevice, CONTROLLER};
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use narf_block::{BlockDevice, BlockOp, BlockRequest, QosHint};
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+    use narf_io::{alloc_coherent, register_with_cap};
+    use narf_lib::id::DomainId;
+
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let nvme_dev = devices().iter().find(|d| {
+        matches!(d.kind, BusKind::Pcie { .. }) && d.id.vendor == 0x1B36 && d.id.device == 0x0010
+    }).copied();
+    let Some(dev) = nvme_dev else {
+        return TestResult::Skip("no QEMU NVMe controller");
+    };
+    let authority = bootstrap_registry_authority();
+    let (_h, dev_cap) = match claim_device_cap(&authority, dev.addr) {
+        Ok(ok) => ok,
+        Err(_) => return TestResult::Fail("claim_device_cap failed"),
+    };
+
+    // The other smoke tests in this file talk to a stack-local
+    // `Controller` and toggle `CC.EN` during their bring-up, which
+    // resets the QEMU NVMe device and orphans whatever I/O queue
+    // probe registered. Install a fresh `Controller` here
+    // unconditionally so we own a live I/O-queue pair against the
+    // device's *current* state.
+    {
+        let mut ctrl = Controller::from_device(dev);
+        if ctrl.bring_up(&dev_cap).is_err() {
+            return TestResult::Fail("Controller::bring_up failed");
+        }
+        if ctrl.create_io_queue().is_err() {
+            return TestResult::Fail("Controller::create_io_queue failed");
+        }
+        *CONTROLLER.lock() = Some(ctrl);
+    }
+
+    // Build a 4-KiB DMA buffer, hand it to the I/O registry to mint a
+    // `Cap<DmaBuffer, Write>` (the cap's slot.index is what
+    // `narf_io::resolve_cap` keys on).
+    let buf = match alloc_coherent(4096, DomainId::DRIVER_0) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("alloc_coherent failed"),
+    };
+    let phys = buf.phys_addr().raw();
+    // Write a sentinel pattern through the identity map.
+    // SAFETY: alloc_coherent returns a live identity-mapped DMA page.
+    unsafe {
+        for i in 0..512usize {
+            core::ptr::write_volatile((phys as *mut u8).add(i), (i as u8).wrapping_mul(0x37));
+        }
+    }
+    let write_cap = register_with_cap(buf);
+    // Downgrade Write→Read so the cap matches BlockRequest::buffer's type.
+    let read_cap = unsafe {
+        use narf_capabilities::{Cap, CapSlot, Read, Rights};
+        let s = write_cap.slot();
+        Cap::<narf_io::DmaBuffer, Read>::mint(CapSlot::new(
+            s.generation,
+            s.index,
+            Read::BITS,
+            narf_capabilities::CapKind::DmaBuffer as u32,
+        ))
+    };
+
+    let dev = NvmeBlockDevice;
+
+    // Drive the future to completion. NvmeBlockDevice's submit
+    // currently does the I/O synchronously inside the future body
+    // (polled completions on the I/O queue), so a single poll
+    // suffices — no waker plumbing needed.
+    fn poll_once<F: Future>(mut f: F) -> Option<F::Output> {
+        unsafe fn no_clone(_: *const ()) -> RawWaker {
+            RawWaker::new(core::ptr::null(), &VTAB)
+        }
+        unsafe fn no_op(_: *const ()) {}
+        const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
+        // SAFETY: vtable holds null-pointer-clean stubs.
+        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTAB)) };
+        let mut ctx = Context::from_waker(&waker);
+        // SAFETY: f is owned + pinned to a stack temporary.
+        let pinned = unsafe { Pin::new_unchecked(&mut f) };
+        match pinned.poll(&mut ctx) {
+            Poll::Ready(v) => Some(v),
+            Poll::Pending => None,
+        }
+    }
+
+    let write_req = BlockRequest {
+        op: BlockOp::Write { fua: false },
+        lba: 0,
+        blocks: 1,
+        buffer: read_cap.clone(),
+        qos: QosHint::Latency,
+        user_tag: 0xC0FFEE,
+    };
+    let comp = match poll_once(dev.submit(write_req)) {
+        Some(c) => c,
+        None => return TestResult::Fail("submit(Write) returned Pending"),
+    };
+    if comp.user_tag != 0xC0FFEE {
+        return TestResult::Fail("write completion lost user_tag");
+    }
+    if comp.result.is_err() {
+        return TestResult::Fail("submit(Write) returned an error");
+    }
+
+    // Zero the buffer so the read-back has something to overwrite.
+    // SAFETY: same identity-mapped DMA page.
+    unsafe {
+        for i in 0..4096usize {
+            core::ptr::write_volatile((phys as *mut u8).add(i), 0);
+        }
+    }
+
+    let read_req = BlockRequest {
+        op: BlockOp::Read,
+        lba: 0,
+        blocks: 1,
+        buffer: read_cap,
+        qos: QosHint::Latency,
+        user_tag: 0xBEEF,
+    };
+    let comp = match poll_once(dev.submit(read_req)) {
+        Some(c) => c,
+        None => return TestResult::Fail("submit(Read) returned Pending"),
+    };
+    if comp.user_tag != 0xBEEF {
+        return TestResult::Fail("read completion lost user_tag");
+    }
+    if comp.result.is_err() {
+        return TestResult::Fail("submit(Read) returned an error");
+    }
+
+    for i in 0..512usize {
+        // SAFETY: same DMA page; bounded read.
+        let v = unsafe { core::ptr::read_volatile((phys as *const u8).add(i)) };
+        let expected = (i as u8).wrapping_mul(0x37);
+        if v != expected {
+            return TestResult::Fail("async-trait read-back pattern mismatch");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme", smoke_nvme_block_device_async_round_trip);
+
 fn smoke_nvme_io_msix_irq_driven() -> TestResult {
     // End-to-end IRQ-driven NVMe I/O: bring up, enable MSI-X with
     // one vector wired to a fresh IDT slot, create the I/O queue

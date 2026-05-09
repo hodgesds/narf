@@ -296,6 +296,75 @@ fn smoke_fat_mount_ramblock_round_trip() -> TestResult {
 }
 kernel_test_in!("drivers/fs/fat", smoke_fat_mount_ramblock_round_trip);
 
+fn smoke_fat_mount_root_via_vfs_resolve() -> TestResult {
+    // The "mount root" path: register a FAT volume at "/" via the
+    // global VFS registry, then resolve "NARF.TXT" through
+    // `narf_filesystem::resolve`. Mirrors what the boot path will do
+    // once a real disk + bootloader handoff lands a block device
+    // under the root mount.
+    use alloc::sync::Arc;
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{
+        bootstrap_mount_authority, registry, resolve_async, FsInstance,
+    };
+    use narf_lib::id::DomainId;
+
+    use crate::mount_fat;
+
+    // Reuse the FAT12 fixture: 128-sector image with NARF.TXT (5 B
+    // body "narf\n") in the root dir.
+    let img = build_fat12_image(128, b"narf\n");
+    let device = RamBlockDevice::from_image(512, img);
+    let auth = bootstrap_mount_authority();
+
+    // Pick a path that won't collide with mounts other smoke tests
+    // may have left behind. (`/` itself is the eventual target but
+    // collides with the kernel's other root-mount tests.)
+    const MOUNT_PATH: &str = "/smoke-fat-root";
+
+    let _handle = match poll_once(mount_fat(&auth, MOUNT_PATH, device, DomainId::DRIVER_0)) {
+        Some(Ok(h)) => h,
+        Some(Err(_)) => return TestResult::Fail("mount_fat returned an FsError"),
+        None => return TestResult::Fail("mount_fat returned Pending on first poll"),
+    };
+
+    // VFS resolve: ask the registry for the named mount, take a
+    // strong reference to its root, and walk through `resolve_async`.
+    // FAT's sync `lookup()` is intentionally a stub (async-only IO);
+    // resolve_async is the correct entry point for any FS whose
+    // backing IO is async.
+    let root_dir = registry().with_mount(MOUNT_PATH, |fs| fs.root());
+    let root_dir = match root_dir {
+        Some(r) => r,
+        None => return TestResult::Fail("registered mount not found in VFS registry"),
+    };
+    let file = match poll_once(resolve_async(root_dir, "NARF.TXT")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("resolve_async(NARF.TXT) failed against root mount"),
+    };
+    if file.stat().size != 5 {
+        return TestResult::Fail("stat.size != 5 through VFS resolve");
+    }
+    let mut buf = [0u8; 8];
+    let n = match poll_once(file.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("file.read via VFS-resolved handle failed"),
+    };
+    if n != 5 || &buf[..n] != b"narf\n" {
+        return TestResult::Fail("NARF.TXT contents differ from fixture");
+    }
+    // Confirm the FS surfaces under the registered name (FAT12 →
+    // "fat12" per FsInstance::name()).
+    let name_ok = registry()
+        .with_mount(MOUNT_PATH, |fs| fs.name() == "fat12")
+        .unwrap_or(false);
+    if !name_ok {
+        return TestResult::Fail("registered mount didn't report fat12 name");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/fat", smoke_fat_mount_root_via_vfs_resolve);
+
 fn smoke_fat_create_write_read_unlink_round_trip() -> TestResult {
     // Empty FAT12 volume → create + write + re-lookup + read +
     // enumerate + unlink + confirm gone. Proves the mutating side of

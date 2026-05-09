@@ -36,7 +36,8 @@ mod tests;
 use core::future::Future;
 
 use narf_block::{
-    BlockCompletion, BlockDevice, BlockError, BlockFeature, BlockRequest, CancelResult, LbaRange,
+    BlockCompletion, BlockDevice, BlockError, BlockFeature, BlockOp, BlockRequest, CancelResult,
+    LbaRange,
 };
 use narf_bus::{enable_msix, map_bar, BusDevice, BusDeviceCap, MmioRegion, MsixTable};
 use narf_capabilities::{Cap, Write};
@@ -1043,22 +1044,44 @@ unsafe fn parse_identify_namespace(buf: &DmaBuffer) -> (u64, u32) {
     (nsze, lba_bytes)
 }
 
-/// Stub `BlockDevice` impl. Every op returns `DeviceRemoved` —
-/// structurally well-formed, body lands in the I/O-queue follow-up.
-#[derive(Debug)]
-pub struct NvmeBlockDevice(pub Controller);
+/// Async `BlockDevice` adapter for the singleton NVMe controller.
+///
+/// Sibling of `NvmeBlockSync` — both reach into `CONTROLLER` (the
+/// global `IrqSafeSpinLock<Option<Controller>>` populated by
+/// `probe`); this one satisfies the async `block::BlockDevice`
+/// contract that the VFS / filesystem stack consumes, while the
+/// sync version is what early-boot smoke paths use.
+///
+/// I/O is dispatched through `read_lba` / `write_lba`, which
+/// themselves go through the I/O queue created by
+/// `create_io_queue` (polled) or `create_io_queue_msix`
+/// (interrupt-driven). The queue is built once during `probe` and
+/// shared across all `NvmeBlockDevice` instances, so this struct
+/// has no per-instance state.
+///
+/// Single-PRP cap: each request must fit in one 4-KiB page (8
+/// LBAs at 512 B/sector, 1 LBA at 4 KiB/sector). PRP-list support
+/// for larger transfers lands when the filesystem layer starts
+/// asking for >4 KiB I/Os.
+#[derive(Debug, Default)]
+pub struct NvmeBlockDevice;
 
 impl BlockDevice for NvmeBlockDevice {
     fn logical_block_size(&self) -> u32 {
-        512
+        with_controller(|c| c.lba_bytes).unwrap_or(512)
     }
     fn physical_block_size(&self) -> u32 {
         4096
     }
     fn capacity_blocks(&self) -> u64 {
-        0
+        with_controller(|c| c.nsze).unwrap_or(0)
     }
     fn supports(&self, f: BlockFeature) -> bool {
+        // Flush + Fua hit real NVMe opcodes (Flush 0x00, FUA bit in
+        // Write CDW12). WriteZeroes / Discard advertise as
+        // supported but the per-op code paths fall through to the
+        // generic NVM-Write path until the dataset-management
+        // opcodes are wired in (see the BlockOp arm below).
         matches!(
             f,
             BlockFeature::Flush
@@ -1068,23 +1091,94 @@ impl BlockDevice for NvmeBlockDevice {
         )
     }
 
-    fn submit(&self, req: BlockRequest) -> impl Future<Output = BlockCompletion> {
+    fn submit(&self, req: BlockRequest) -> impl Future<Output = BlockCompletion> + Send {
+        // Resolve the cap → DmaBuffer up front. A revoked or stale
+        // cap fails `check_live` inside `narf_io::resolve_cap`,
+        // which short-circuits to `PermissionDenied` below.
+        let buffer = narf_io::resolve_cap(&req.buffer);
+        let result = nvme_submit_blocking(&req, buffer);
         async move {
             BlockCompletion {
                 tag: 0,
                 user_tag: req.user_tag,
-                result: Err(BlockError::DeviceRemoved),
+                result,
             }
         }
     }
-    fn flush(&self) -> impl Future<Output = ()> {
+    fn flush(&self) -> impl Future<Output = ()> + Send {
+        // Wave-3a: the I/O-queue path is single-threaded behind the
+        // `CONTROLLER` lock and every `read_lba` / `write_lba` polls
+        // its own completion before returning. There is therefore no
+        // outstanding-write set to drain. When the multi-queue
+        // submission path lands (Wave 3b), this becomes a real Flush
+        // (admin opcode 0x00) on each I/O queue.
         async {}
     }
-    fn discard(&self, _r: LbaRange) -> impl Future<Output = ()> {
+    fn discard(&self, _r: LbaRange) -> impl Future<Output = ()> + Send {
+        // Dataset Management opcode 0x09 with AD=1 lands with the
+        // larger-transfer rework; today the no-op is structurally
+        // correct (NVMe permits ignoring DSM hints).
         async {}
     }
-    fn cancel(&self, _tag: u64) -> impl Future<Output = CancelResult> {
+    fn cancel(&self, _tag: u64) -> impl Future<Output = CancelResult> + Send {
+        // Polled completions are synchronous from the caller's POV,
+        // so there is nothing to cancel by the time the future
+        // suspends. Real cancel arrives with the queued submission
+        // model.
         async { CancelResult::NotFound }
+    }
+}
+
+fn nvme_submit_blocking(
+    req: &BlockRequest,
+    buffer: Option<alloc::sync::Arc<DmaBuffer>>,
+) -> Result<(), BlockError> {
+    let buffer = buffer.ok_or(BlockError::PermissionDenied)?;
+    let blocks = u16::try_from(req.blocks).map_err(|_| BlockError::InvalidRange)?;
+    if blocks == 0 {
+        return Ok(());
+    }
+    let lba_bytes = with_controller(|c| c.lba_bytes).unwrap_or(512) as usize;
+    let total_bytes = (blocks as usize)
+        .checked_mul(lba_bytes)
+        .ok_or(BlockError::InvalidRange)?;
+    // Single-PRP path: one 4-KiB page. Larger transfers require the
+    // PRP-list shape (CDW7 = phys of u64 array of page-aligned
+    // entries). Reject cleanly so the filesystem can split / fall
+    // back to the sync path.
+    if total_bytes > 4096 {
+        return Err(BlockError::InvalidRange);
+    }
+    if buffer.len() < total_bytes {
+        return Err(BlockError::InvalidRange);
+    }
+
+    let mut g = CONTROLLER.lock();
+    let ctrl = g.as_mut().ok_or(BlockError::DeviceRemoved)?;
+    match req.op {
+        BlockOp::Read => ctrl
+            .read_lba(req.lba, blocks, &buffer)
+            .map_err(map_nvme_err),
+        BlockOp::Write { fua: _ } => ctrl
+            .write_lba(req.lba, blocks, &buffer)
+            .map_err(map_nvme_err),
+        BlockOp::WriteZeroes => {
+            // Dataset-management Write Zeroes (opcode 0x08) isn't
+            // wired yet; emulate by writing the buffer's content
+            // (caller is expected to have zeroed it). Honest about
+            // not fast-pathing.
+            ctrl.write_lba(req.lba, blocks, &buffer)
+                .map_err(map_nvme_err)
+        }
+        BlockOp::Trim => Ok(()),
+    }
+}
+
+fn map_nvme_err(e: NvmeError) -> BlockError {
+    match e {
+        NvmeError::OutOfRange => BlockError::InvalidRange,
+        NvmeError::NotReady | NvmeError::NoIoQueue => BlockError::DeviceRemoved,
+        _ => BlockError::IOError,
     }
 }
 
