@@ -14,6 +14,28 @@ pub mod percpu;
 
 mod tests;
 
+/// Optional boot-progress beacon hook. `frame/` installs a hook
+/// that paints a colored square to the bootloader-supplied
+/// framebuffer; arch-side code (e.g. CR4 toggles inside
+/// `pcid::enable_pcide`) calls this to leave a trail BEFORE any
+/// console / log output is reliable. No-op if no hook installed.
+///
+/// Living in `narf_arch` (vs `narf_memory::beacon`) avoids a
+/// circular dep: memory depends on arch.
+pub type BeaconFn = fn(u32, u32);
+static BEACON_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+pub fn set_beacon_hook(f: BeaconFn) {
+    BEACON_HOOK.store(f as usize, core::sync::atomic::Ordering::Release);
+}
+pub fn beacon_paint(slot: u32, color: u32) {
+    let v = BEACON_HOOK.load(core::sync::atomic::Ordering::Acquire);
+    if v != 0 {
+        // SAFETY: `v` was stored as `BeaconFn as usize` in `set_beacon_hook`.
+        let f: BeaconFn = unsafe { core::mem::transmute(v) };
+        f(slot, color);
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;
 #[cfg(target_arch = "x86_64")]

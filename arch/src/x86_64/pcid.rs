@@ -140,6 +140,32 @@ impl fmt::Display for DomainRights {
 /// bit, exposed since Zen). Caller must have ensured the current CR3
 /// has PCID = 0 in its low 12 bits.
 pub unsafe fn enable_pcide() {
+    // CPUID.01H:ECX.PCID[bit 17] reports support. Skip the
+    // CR4.PCIDE write entirely on a CPU that doesn't advertise
+    // PCID — setting the bit would #GP. All Zen / modern Intel
+    // expose this; a missing bit means we're on truly legacy
+    // silicon (or a hypervisor masking the feature).
+    let cpuid_ecx: u32;
+    unsafe {
+        core::arch::asm!(
+            "push rbx",
+            "mov eax, 1",
+            "cpuid",
+            "mov {ecx:e}, ecx",
+            "pop rbx",
+            ecx = out(reg) cpuid_ecx,
+            out("eax") _,
+            out("ecx") _,
+            out("edx") _,
+            options(nostack, preserves_flags),
+        );
+    }
+    crate::beacon_paint(28, 0x00C0FFC0); // post-CPUID
+    if cpuid_ecx & (1u32 << 17) == 0 {
+        crate::beacon_paint(29, 0x00FF0000); // RED — CPU has no PCID
+        return;
+    }
+
     // Intel SDM Vol 3 §4.10.1: setting CR4.PCIDE faults #GP if CR3
     // has any non-zero bits in 11:0. Bootloaders (Limine, real
     // UEFI loaders) sometimes leave the legacy CR3 PWT (bit 3) or
@@ -151,9 +177,12 @@ pub unsafe fn enable_pcide() {
     // SAFETY: BSP boot path; caller verified PCID support.
     unsafe {
         let cr3 = cr::read_cr3();
+        crate::beacon_paint(29, 0x00C0FF80); // post-read_cr3
         cr::write_cr3(cr3 & !0xFFFu64);
+        crate::beacon_paint(30, 0x0080FF80); // post-write_cr3 (cleared)
         let cr4 = cr::read_cr4();
         cr::write_cr4(cr4 | cr::CR4_PCIDE);
+        crate::beacon_paint(31, 0x0040FF40); // post-write_cr4 (PCIDE on)
     }
 }
 

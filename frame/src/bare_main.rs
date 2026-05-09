@@ -214,6 +214,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     4u64 << 30,
                 );
                 narf_memory::beacon::paint(0, 0x00FF_0000); // RED — _start_rust alive
+                // Wire arch-side beacon hook to memory beacon
+                // facility so arch code (pcid::enable_pcide etc.)
+                // can paint without depending on memory.
+                narf_arch::set_beacon_hook(narf_memory::beacon::paint);
             }
             fb
         } else {
