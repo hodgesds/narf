@@ -81,17 +81,30 @@ _start:
     push 0
     push eax
 
-    /* ── identity-map the first 1 GiB + higher-half mapping ── */
+    /* ── identity-map the first 4 GiB + higher-half mapping ──
+     *
+     * 4-GiB identity coverage matters for real-HW boot: UEFI GOP
+     * framebuffers on laptops often sit above 1 GiB phys (GPU
+     * BAR region, typically 0x80000000+). The kernel's
+     * post-MMU-init code paths assume the early identity map
+     * covers anything the bootloader's info structures point at;
+     * truncating to 1 GiB silently faults on the first FB write.
+     * Four PDPT entries with PS=1 cover 0..4 GiB at zero memory
+     * cost (PDPT is already a full page).
+     */
     lea eax, [pdpt]
     or  eax, 0x3                                /* P | RW */
-    
+
     mov [pml4], eax                             /* PML4[0] */
     mov [pml4 + 511 * 8], eax                   /* PML4[511] */
 
-    /* PDPT[0]   = 0 | (P | RW | PS)      — identity low 1-GiB */
-    /* PDPT[510] = 0 | (P | RW | PS)      — higher-half maps to phys 0 */
-    mov dword ptr [pdpt], 0x83
-    mov dword ptr [pdpt + 510 * 8], 0x83
+    /* PDPT[0..3] = 0..3 GiB | (P | RW | PS) — identity 0..4 GiB.
+     * PDPT[510]  = 0 | (P | RW | PS)         — higher-half = phys 0..1 GiB. */
+    mov dword ptr [pdpt + 0 * 8],     0x00000083  /* 0..1 GiB */
+    mov dword ptr [pdpt + 1 * 8],     0x40000083  /* 1..2 GiB */
+    mov dword ptr [pdpt + 2 * 8],     0x80000083  /* 2..3 GiB */
+    mov dword ptr [pdpt + 3 * 8],     0xC0000083  /* 3..4 GiB */
+    mov dword ptr [pdpt + 510 * 8],   0x00000083  /* higher-half */
 
     /* CR3 = &PML4 */
     mov eax, offset pml4

@@ -76,6 +76,46 @@ pub fn narf_cpu_to_node(cpu: u32) -> u32 {
     narf_acpi::cpu_node(cpu).unwrap_or(0)
 }
 
+/// Boot-progress beacon: paints a small horizontal bar of the
+/// requested 32-bit ARGB color at a given row index from the top
+/// of the framebuffer. Used by `_start_rust` to leave a visible
+/// "POST code" trail on the laptop screen long before the FB
+/// console is up. Each call uses a different `row_idx` so the
+/// bars stack vertically — if you see N bars, you got past
+/// stage N. Phys-write only; no allocator, no MMU dependency
+/// beyond the boot-time identity map (now 4 GiB; see
+/// `frame/src/x86_64/boot.S`).
+///
+/// `row_idx` is a small integer (0..16). Each row is 8 px tall
+/// and 256 px wide, drawn at the very top of the FB.
+///
+/// SAFETY: caller asserts FB phys is identity-mapped and writable.
+/// Pre-MMU-init contexts must respect the 4 GiB identity-map cap.
+#[cfg(target_arch = "x86_64")]
+unsafe fn boot_beacon(fb_info: &narf_boot::info::FramebufferInfo, row_idx: u32, color: u32) {
+    // Skip if FB is above the early 4-GiB identity map.
+    let phys = fb_info.addr.raw();
+    if phys >= (4u64 << 30) {
+        return;
+    }
+    let stride = (fb_info.pitch as u64) / ((fb_info.bpp as u64).max(8) / 8);
+    let base = phys as *mut u32;
+    let bar_h: u32 = 8;
+    let bar_w: u32 = 256;
+    let y0 = row_idx * bar_h;
+    let y1 = (y0 + bar_h).min(fb_info.height);
+    let x_max = bar_w.min(fb_info.width);
+    for y in y0..y1 {
+        for x in 0..x_max {
+            let off = (y as u64) * stride + (x as u64);
+            // SAFETY: caller asserts mapping; `off` < height*stride.
+            unsafe {
+                base.add(off as usize).write_volatile(color);
+            }
+        }
+    }
+}
+
 /// Install the framebuffer console early (right after MMU init)
 /// so subsequent kernel logs and panics paint to the laptop
 /// screen rather than only to serial. Best-effort: skips with a
@@ -183,6 +223,31 @@ fn parse_stop_at(cmdline: &str) -> narf_init::Stage {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
+    // Boot beacon #0 (red): "_start_rust entered". Painted before
+    // anything else so a black screen on real HW means we never
+    // even reached Rust. Requires a multiboot2 FB tag (we got
+    // one via the .multiboot2_header request); skipped in PVH /
+    // no-FB cases. See `boot_beacon` doc above for the meaning
+    // of each row.
+    #[cfg(target_arch = "x86_64")]
+    let early_fb: Option<narf_boot::info::FramebufferInfo> = {
+        if raw.magic == narf_boot::x86_64::multiboot2::BOOT_MAGIC {
+            // SAFETY: bootloader contract; payload is the mb2 info struct.
+            let info_ptr = raw.payload.raw() as usize;
+            let fb = unsafe { narf_boot::x86_64::multiboot2::framebuffer(info_ptr) };
+            if let Some(ref fb_info) = fb {
+                // SAFETY: 0..4 GiB identity map covers FB phys (or
+                // boot_beacon skips internally).
+                unsafe {
+                    boot_beacon(fb_info, 0, 0x00FF_0000); // RED — _start_rust alive
+                }
+            }
+            fb
+        } else {
+            None
+        }
+    };
+
     // Step 1: bring up the early serial console before doing anything else,
     // so any failure from here on is visible.
     #[cfg(target_arch = "x86_64")]
@@ -190,6 +255,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         // 16550A COM1 at I/O port 0x3F8 — hard-coded default. Real detection
         // lands with the ACPI/FDT parse in Wave 2.
         console::early_init(PhysAddr::new(0x3F8), UartKind::Uart16550);
+        // Beacon #1 (orange): UART up.
+        if let Some(ref fb_info) = early_fb {
+            unsafe { boot_beacon(fb_info, 1, 0x00FF_8000); }
+        }
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -567,6 +636,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 RAW_BOOT_INFO = Some(raw);
                 BOOT_INFO = Some(info.clone());
             }
+            // Beacon #2 (yellow): parse_raw succeeded.
+            #[cfg(target_arch = "x86_64")]
+            if let Some(ref fb_info) = early_fb {
+                unsafe { boot_beacon(fb_info, 2, 0x00FF_FF00); }
+            }
             let _ = writeln!(
                 console::Writer,
                 "  boot info: {} memory region(s), uart_phys={:?}",
@@ -647,6 +721,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             unsafe {
                 narf_memory::init_from_map(&regions, exclude);
             }
+            // Beacon #3 (green): frame allocator initialised.
+            #[cfg(target_arch = "x86_64")]
+            if let Some(ref fb_info) = early_fb {
+                unsafe { boot_beacon(fb_info, 3, 0x0000_FF00); }
+            }
 
             // Register the generic framebuffer if provided by the bootloader.
             if let Some(fb_info) = info.framebuffer {
@@ -698,6 +777,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             "  mmu: installed, PML4 @ {:?}, console remapped",
                             pml4
                         );
+                        // Beacon #4 (cyan): MMU init success.
+                        if let Some(ref fb_info) = early_fb {
+                            unsafe { boot_beacon(fb_info, 4, 0x0000_FFFF); }
+                        }
 
                         // Real-HW bring-up aid: install the FB
                         // console NOW, not at Stage::Late. Without
