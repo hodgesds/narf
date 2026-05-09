@@ -21,6 +21,9 @@ narf-time         = { path = "../../time" }
 narf-block        = { path = "../../block" }
 narf-drivers      = { path = "../" }
 narf-init         = { path = "../../init" }
+narf-interrupts   = { path = "../../interrupts" }
+narf-acpi         = { path = "../../acpi" }
+narf-aml          = { path = "../../aml" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
 
 [lints]

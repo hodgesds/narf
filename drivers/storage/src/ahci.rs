@@ -1,7 +1,27 @@
 //! AHCI HBA driver (Intel ICH9 + compatible).
 //!
-//! Spec: AHCI base 1.3.1. QEMU's q35 AHCI controller is at
-//! `8086:2922` (00:1f.2 by default); ICH9 family.
+//! Spec: AHCI 1.3.1 — Serial ATA Advanced Host Controller Interface.
+//! <https://www.intel.com/content/www/us/en/io/serial-ata/serial-ata-ahci-spec-rev1-3-1.html>
+//!
+//! Interrupt model (this revision):
+//! - HBA `GHC.IE` (bit 1) is the master "deliver any interrupt" gate
+//!   (§3.1.2). When clear no port-level IRQ ever leaves the HBA.
+//! - Per-port `PORT_IE` (offset +0x14) selects which events on a port
+//!   raise the port's bit in HBA `IS` (§3.3.6). We unmask the
+//!   completion-bearing events: D2H Register FIS (bit 0), PIO Setup
+//!   (bit 1), DMA Setup (bit 2), plus Task File Error (bit 30) so a
+//!   failing command doesn't sit unnoticed.
+//! - The ISR walks HBA `IS` to find ports with pending events
+//!   (§3.1.3), drains each port's `PORT_IS` (W1C), then clears the
+//!   port bit in HBA `IS` (also W1C).
+//! - `narf_interrupts::on_irq` (called from the registered sync
+//!   handler via the dispatch table) bumps a per-vector `fire_count`
+//!   and wakes any task awaiting `wait_for_irq`. Async I/O paths
+//!   (`*_async`) construct the wait future BEFORE writing PORT_CI so
+//!   they cannot race the IRQ.
+//!
+//! QEMU's q35 AHCI controller is at `8086:2922` (00:1f.2 by default);
+//! ICH9 family.
 //!
 //! HBA register layout (BAR5 = ABAR, MMIO):
 //!
@@ -36,9 +56,9 @@
 //! | +0x34   | SACT  | SATA Active                     |
 //! | +0x38   | CI    | Command Issue                   |
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicU8, AtomicUsize, Ordering};
 
-use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
+use narf_bus::{enable_msix, map_bar, BusDevice, BusDeviceCap, MmioRegion, MsixTable};
 use narf_capabilities::{Cap, Write};
 use narf_io::alloc_coherent;
 use narf_lib::id::DomainId;
@@ -54,21 +74,43 @@ const ABAR_BAR: u8 = 5;
 
 const HBA_CAP: u64 = 0x00;
 const HBA_GHC: u64 = 0x04;
+/// HBA Interrupt Status — one bit per port; W1C (AHCI 1.3.1 §3.1.3).
+const HBA_IS: u64 = 0x08;
 const HBA_PI: u64 = 0x0C;
 const HBA_VS: u64 = 0x10;
 
 // GHC bits.
 const GHC_HR: u32 = 1 << 0; // HBA Reset
+/// GHC.IE — Interrupt Enable, master gate (AHCI 1.3.1 §3.1.2).
+const GHC_IE: u32 = 1 << 1;
 const GHC_AE: u32 = 1 << 31; // AHCI Enable
 
 // Per-port offsets.
 const PORT_BASE_OFF: u64 = 0x100;
 const PORT_STRIDE: u64 = 0x80;
 
+/// PORT_IS — port interrupt status; W1C (AHCI 1.3.1 §3.3.5).
+const PORT_IS: u64 = 0x10;
+/// PORT_IE — port interrupt enable mask (AHCI 1.3.1 §3.3.6).
+const PORT_IE: u64 = 0x14;
 const PORT_CMD: u64 = 0x18;
 const PORT_SIG: u64 = 0x24;
 const PORT_SSTS: u64 = 0x28;
 const PORT_SERR: u64 = 0x30;
+/// PORT_CI — Command Issue, written to launch a command (§3.3.14).
+const PORT_CI: u64 = 0x38;
+
+// PORT_IE / PORT_IS event bits (AHCI 1.3.1 §3.3.6).
+const PIE_D2H_REG_FIS: u32 = 1 << 0; // Device-to-Host Register FIS Interrupt
+const PIE_PIO_SETUP_FIS: u32 = 1 << 1; // PIO Setup FIS Interrupt
+const PIE_DMA_SETUP_FIS: u32 = 1 << 2; // DMA Setup FIS Interrupt
+const PIE_TASK_FILE_ERR: u32 = 1 << 30; // Task File Error Status
+
+/// Mask of port-level events we unmask at bring-up. Anything outside
+/// this mask still stays in PORT_IS but does not raise the port's
+/// HBA-IS bit, so the ISR won't see it.
+const PORT_IE_MASK: u32 =
+    PIE_D2H_REG_FIS | PIE_PIO_SETUP_FIS | PIE_DMA_SETUP_FIS | PIE_TASK_FILE_ERR;
 
 // PORT_CMD bits.
 const CMD_ST: u32 = 1 << 0; // Start
@@ -195,7 +237,18 @@ impl Ahci {
         // SAFETY: same.
         let pi = unsafe { mmio.read32(HBA_PI) };
 
-        // Enumerate ports.
+        // Drain any stale per-port interrupt state and clear the
+        // master HBA IS bitmap (W1C, §3.1.3) before unmasking, so a
+        // pre-existing latched IS bit doesn't fire the moment GHC.IE
+        // is set.
+        // SAFETY: identity-mapped MMIO.
+        let stale_is = unsafe { mmio.read32(HBA_IS) };
+        // SAFETY: same.
+        unsafe {
+            mmio.write32(HBA_IS, stale_is);
+        }
+
+        // Enumerate ports + program per-port IRQ mask.
         let mut ports = alloc::vec::Vec::new();
         for n in 0..32 {
             if pi & (1u32 << n) == 0 {
@@ -213,8 +266,24 @@ impl Ahci {
             unsafe {
                 mmio.write32(off + PORT_SERR, serr);
             }
+            // Clear stale PORT_IS (W1C, §3.3.5) and unmask the
+            // events we care about (§3.3.6).
+            // SAFETY: same.
+            unsafe {
+                mmio.write32(off + PORT_IS, 0xFFFF_FFFF);
+                mmio.write32(off + PORT_IE, PORT_IE_MASK);
+            }
             let kind = PortKind::from_sig(sig, ssts);
             ports.push(PortInfo { index: n, kind });
+        }
+
+        // Now that per-port masks + stale IS are clean, flip the
+        // master IRQ enable (§3.1.2). The HBA still cannot deliver
+        // until the platform routes the vector (MSI-X / MSI / INTx),
+        // which happens in `probe`.
+        // SAFETY: same.
+        unsafe {
+            mmio.write32(HBA_GHC, GHC_AE | GHC_IE);
         }
 
         Ok(Self {
@@ -224,6 +293,92 @@ impl Ahci {
             pi,
             ports,
         })
+    }
+
+    /// Write the PORT_CI doorbell for the slot mask `bit` and wait
+    /// for completion via the IRQ path. The wait future is
+    /// constructed BEFORE the doorbell write — an IRQ landing
+    /// between doorbell and waiter-construction would let the
+    /// baseline fire-count capture a post-IRQ value and hang the
+    /// await forever (see `interrupts/src/wait.rs` and the matching
+    /// fix in `drivers/nvme/src/lib.rs::submit_io_irq_async`).
+    ///
+    /// # Safety
+    /// Caller owns the HBA + the named port exclusively;
+    /// `port_idx < 32`; PORT_CLB / PORT_FB / PORT_CMD are programmed
+    /// and `bit` corresponds to the slot whose command-table is set
+    /// up.
+    pub async unsafe fn issue_and_wait_async(
+        &self,
+        port_idx: u8,
+        bit: u32,
+    ) -> Result<(), AhciError> {
+        let off = PORT_BASE_OFF + (port_idx as u64) * PORT_STRIDE;
+        let vector = AHCI_IRQ_VECTOR.load(Ordering::Acquire);
+
+        if vector == 0 {
+            // No IRQ wired — issue + sync-poll.
+            compiler_fence(Ordering::SeqCst);
+            // SAFETY: identity-mapped MMIO.
+            unsafe {
+                self.mmio.write32(off + PORT_CI, bit);
+            }
+            // SAFETY: caller-asserted ownership.
+            return unsafe { self.issue_and_wait_sync(port_idx, bit) };
+        }
+
+        // Construct the waiter FIRST — captures the pre-doorbell
+        // fire_count baseline. Then ring CI. Then await.
+        let mut waiter = narf_interrupts::wait_for_irq(vector);
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            self.mmio.write32(off + PORT_CI, bit);
+        }
+
+        loop {
+            // SAFETY: identity-mapped MMIO.
+            let ci = unsafe { self.mmio.read32(off + PORT_CI) };
+            // SAFETY: same.
+            let tfd = unsafe { self.mmio.read32(off + 0x20) };
+            if tfd & 0x01 != 0 {
+                return Err(AhciError::ResetTimeout);
+            }
+            if ci & bit == 0 {
+                return Ok(());
+            }
+            // Park until the next IRQ. After wake-up, install a
+            // fresh waiter for the next iteration so we observe any
+            // IRQ that lands between this drain and the next CI
+            // read.
+            let _ = (&mut waiter).await;
+            waiter = narf_interrupts::wait_for_irq(vector);
+        }
+    }
+
+    /// Sync polled completion — kept for the existing block-device
+    /// path so smoke tests that call directly into `ahci_read_lba`
+    /// don't change behaviour.
+    ///
+    /// # Safety
+    /// Caller owns the HBA + the named port exclusively;
+    /// `port_idx < 32`; the slots in `bit` have already been issued.
+    pub unsafe fn issue_and_wait_sync(&self, port_idx: u8, bit: u32) -> Result<(), AhciError> {
+        let off = PORT_BASE_OFF + (port_idx as u64) * PORT_STRIDE;
+        for _ in 0..10_000_000u32 {
+            // SAFETY: identity-mapped MMIO.
+            let ci = unsafe { self.mmio.read32(off + PORT_CI) };
+            // SAFETY: same.
+            let tfd = unsafe { self.mmio.read32(off + 0x20) };
+            if tfd & 0x01 != 0 {
+                return Err(AhciError::ResetTimeout);
+            }
+            if ci & bit == 0 {
+                return Ok(());
+            }
+            core::hint::spin_loop();
+        }
+        Err(AhciError::ResetTimeout)
     }
 
     /// Stop a port — clears PORT_CMD.ST + PORT_CMD.FRE and waits for
@@ -687,6 +842,204 @@ pub unsafe fn ahci_read_lba(
     Ok(())
 }
 
+/// IRQ-driven sibling of [`ahci_read_lba`]. Identical wire-form +
+/// DMA-scratch shape; the only difference is that completion is
+/// signalled by an MSI-X / MSI / INTx interrupt walked by
+/// [`ahci_isr`] instead of by the host spin-polling PORT_CI.
+///
+/// Falls back to spin-polling when no IRQ path is wired (i.e. when
+/// `AHCI_IRQ_VECTOR` is 0). This keeps the function safe to call
+/// even when MSI-X / MSI / INTx negotiation failed at probe.
+///
+/// # Safety
+/// Same as [`ahci_read_lba`].
+pub async unsafe fn ahci_read_lba_async(
+    ahci: &Ahci,
+    port_idx: u8,
+    lba: u64,
+    n_sectors: u16,
+    out: &mut [u8],
+) -> Result<(), AhciError> {
+    if n_sectors == 0 || (n_sectors as usize) * 512 > 4096 {
+        return Err(AhciError::BarMapFailed);
+    }
+    if out.len() < (n_sectors as usize) * 512 {
+        return Err(AhciError::BarMapFailed);
+    }
+    let off = PORT_BASE_OFF + (port_idx as u64) * PORT_STRIDE;
+    // SAFETY: caller-asserted.
+    let _ = unsafe { ahci.port_idle(port_idx) };
+
+    let scratch = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| AhciError::BarMapFailed)?;
+    let base = scratch.phys_addr().raw();
+    let cmd_list = base + 0x000;
+    let fis_recv = base + 0x400;
+    let cmd_tbl = base + 0x500;
+    let data_buf = base + 0x600;
+    // SAFETY: identity-mapped DMA.
+    unsafe {
+        for i in 0..(0x600 + (n_sectors as usize) * 512) {
+            core::ptr::write_volatile((base + i as u64) as *mut u8, 0);
+        }
+    }
+    // SAFETY: identity-mapped DMA.
+    unsafe {
+        core::ptr::write_volatile(cmd_list as *mut u32, (1u32 << 16) | 5);
+        core::ptr::write_volatile((cmd_list + 4) as *mut u32, 0);
+        core::ptr::write_volatile((cmd_list + 8) as *mut u64, cmd_tbl);
+    }
+    // SAFETY: identity-mapped DMA.
+    unsafe {
+        core::ptr::write_volatile(cmd_tbl as *mut u8, 0x27);
+        core::ptr::write_volatile((cmd_tbl + 1) as *mut u8, 0x80);
+        core::ptr::write_volatile((cmd_tbl + 2) as *mut u8, 0x25);
+        core::ptr::write_volatile((cmd_tbl + 3) as *mut u8, 0);
+        core::ptr::write_volatile((cmd_tbl + 4) as *mut u8, (lba & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 5) as *mut u8, ((lba >> 8) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 6) as *mut u8, ((lba >> 16) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 7) as *mut u8, 0x40);
+        core::ptr::write_volatile((cmd_tbl + 8) as *mut u8, ((lba >> 24) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 9) as *mut u8, ((lba >> 32) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 10) as *mut u8, ((lba >> 40) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 12) as *mut u8, (n_sectors & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 13) as *mut u8, ((n_sectors >> 8) & 0xFF) as u8);
+    }
+    let prdt = cmd_tbl + 0x80;
+    let bytes = (n_sectors as u32) * 512;
+    // SAFETY: same.
+    unsafe {
+        core::ptr::write_volatile(prdt as *mut u64, data_buf);
+        core::ptr::write_volatile((prdt + 8) as *mut u32, 0);
+        core::ptr::write_volatile((prdt + 12) as *mut u32, bytes - 1);
+    }
+
+    // SAFETY: identity-mapped MMIO.
+    unsafe {
+        ahci.mmio.write32(off + 0x00, cmd_list as u32);
+        ahci.mmio.write32(off + 0x04, (cmd_list >> 32) as u32);
+        ahci.mmio.write32(off + 0x08, fis_recv as u32);
+        ahci.mmio.write32(off + 0x0C, (fis_recv >> 32) as u32);
+        let serr = ahci.mmio.read32(off + PORT_SERR);
+        ahci.mmio.write32(off + PORT_SERR, serr);
+        // Drain stale PORT_IS so an old latched bit can't get
+        // mis-attributed to this command.
+        ahci.mmio.write32(off + PORT_IS, 0xFFFF_FFFF);
+        let cmd = ahci.mmio.read32(off + PORT_CMD);
+        ahci.mmio.write32(off + PORT_CMD, cmd | CMD_FRE);
+        let cmd = ahci.mmio.read32(off + PORT_CMD);
+        ahci.mmio.write32(off + PORT_CMD, cmd | CMD_ST);
+    }
+
+    // Hand off to issue_and_wait_async — it constructs the IRQ
+    // waiter BEFORE writing PORT_CI, which closes the race
+    // documented in the module header.
+    // SAFETY: port set up above; bit 0 = slot 0.
+    let r = unsafe { ahci.issue_and_wait_async(port_idx, 1).await };
+    r?;
+
+    // SAFETY: identity-mapped DMA.
+    for i in 0..(n_sectors as usize) * 512 {
+        out[i] = unsafe { core::ptr::read_volatile((data_buf + i as u64) as *const u8) };
+    }
+    // SAFETY: caller-asserted.
+    let _ = unsafe { ahci.port_idle(port_idx) };
+    let _ = scratch;
+    Ok(())
+}
+
+/// IRQ-driven sibling of [`ahci_write_lba`]. Same shape as
+/// [`ahci_read_lba_async`].
+///
+/// # Safety
+/// Same as [`ahci_write_lba`].
+pub async unsafe fn ahci_write_lba_async(
+    ahci: &Ahci,
+    port_idx: u8,
+    lba: u64,
+    n_sectors: u16,
+    data: &[u8],
+) -> Result<(), AhciError> {
+    if n_sectors == 0 || (n_sectors as usize) * 512 > 4096 {
+        return Err(AhciError::BarMapFailed);
+    }
+    if data.len() < (n_sectors as usize) * 512 {
+        return Err(AhciError::BarMapFailed);
+    }
+    let off = PORT_BASE_OFF + (port_idx as u64) * PORT_STRIDE;
+    // SAFETY: caller-asserted.
+    let _ = unsafe { ahci.port_idle(port_idx) };
+
+    let scratch = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| AhciError::BarMapFailed)?;
+    let base = scratch.phys_addr().raw();
+    let cmd_list = base + 0x000;
+    let fis_recv = base + 0x400;
+    let cmd_tbl = base + 0x500;
+    let data_buf = base + 0x600;
+    // SAFETY: identity-mapped DMA.
+    unsafe {
+        for i in 0..0x600 {
+            core::ptr::write_volatile((base + i as u64) as *mut u8, 0);
+        }
+        for i in 0..(n_sectors as usize) * 512 {
+            core::ptr::write_volatile((data_buf + i as u64) as *mut u8, data[i]);
+        }
+    }
+    // SAFETY: identity-mapped DMA.
+    unsafe {
+        // bit 6 = W (write).
+        core::ptr::write_volatile(cmd_list as *mut u32, (1u32 << 16) | (1u32 << 6) | 5);
+        core::ptr::write_volatile((cmd_list + 4) as *mut u32, 0);
+        core::ptr::write_volatile((cmd_list + 8) as *mut u64, cmd_tbl);
+    }
+    // SAFETY: identity-mapped DMA.
+    unsafe {
+        core::ptr::write_volatile(cmd_tbl as *mut u8, 0x27);
+        core::ptr::write_volatile((cmd_tbl + 1) as *mut u8, 0x80);
+        core::ptr::write_volatile((cmd_tbl + 2) as *mut u8, 0x35);
+        core::ptr::write_volatile((cmd_tbl + 3) as *mut u8, 0);
+        core::ptr::write_volatile((cmd_tbl + 4) as *mut u8, (lba & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 5) as *mut u8, ((lba >> 8) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 6) as *mut u8, ((lba >> 16) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 7) as *mut u8, 0x40);
+        core::ptr::write_volatile((cmd_tbl + 8) as *mut u8, ((lba >> 24) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 9) as *mut u8, ((lba >> 32) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 10) as *mut u8, ((lba >> 40) & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 12) as *mut u8, (n_sectors & 0xFF) as u8);
+        core::ptr::write_volatile((cmd_tbl + 13) as *mut u8, ((n_sectors >> 8) & 0xFF) as u8);
+    }
+    let prdt = cmd_tbl + 0x80;
+    let bytes = (n_sectors as u32) * 512;
+    // SAFETY: same.
+    unsafe {
+        core::ptr::write_volatile(prdt as *mut u64, data_buf);
+        core::ptr::write_volatile((prdt + 8) as *mut u32, 0);
+        core::ptr::write_volatile((prdt + 12) as *mut u32, bytes - 1);
+    }
+
+    // SAFETY: identity-mapped MMIO.
+    unsafe {
+        ahci.mmio.write32(off + 0x00, cmd_list as u32);
+        ahci.mmio.write32(off + 0x04, (cmd_list >> 32) as u32);
+        ahci.mmio.write32(off + 0x08, fis_recv as u32);
+        ahci.mmio.write32(off + 0x0C, (fis_recv >> 32) as u32);
+        let serr = ahci.mmio.read32(off + PORT_SERR);
+        ahci.mmio.write32(off + PORT_SERR, serr);
+        ahci.mmio.write32(off + PORT_IS, 0xFFFF_FFFF);
+        let cmd = ahci.mmio.read32(off + PORT_CMD);
+        ahci.mmio.write32(off + PORT_CMD, cmd | CMD_FRE);
+        let cmd = ahci.mmio.read32(off + PORT_CMD);
+        ahci.mmio.write32(off + PORT_CMD, cmd | CMD_ST);
+    }
+
+    // SAFETY: port set up above.
+    unsafe { ahci.issue_and_wait_async(port_idx, 1).await }?;
+
+    // SAFETY: caller-asserted.
+    let _ = unsafe { ahci.port_idle(port_idx) };
+    let _ = scratch;
+    Ok(())
+}
+
 /// Issue ATA `READ FPDMA QUEUED` (NCQ, opcode 0x60) for a single
 /// outstanding command on slot `tag` (0..31), reading `n_sectors`
 /// 512-byte sectors at `lba`. Polled completion on PORT_CI bit
@@ -1016,16 +1369,183 @@ impl narf_block::BlockDeviceSync for AhciBlockSync {
 
 static CONTROLLER: IrqSafeSpinLock<Option<Ahci>> = IrqSafeSpinLock::new(None);
 
+/// IDT vector our ISR is installed on, or 0 if no IRQ path was
+/// successfully negotiated. Loaded by both ISR and async waiters.
+/// Stays at 0 until `try_setup_irq` succeeds.
+static AHCI_IRQ_VECTOR: AtomicU8 = AtomicU8::new(0);
+
+/// MMIO base for the registered HBA. Stored as `usize` so the ISR
+/// can reach it without locking (the ISR runs in IRQ context where
+/// taking `IrqSafeSpinLock` would deadlock if the lock was already
+/// held by the path that triggered the IRQ).
+static AHCI_MMIO_BASE: AtomicUsize = AtomicUsize::new(0);
+
+/// MSI-X table backing — kept alive for the life of the controller
+/// so its physical pages aren't reclaimed underneath us.
+static AHCI_MSIX: IrqSafeSpinLock<Option<MsixTable>> = IrqSafeSpinLock::new(None);
+
+/// Synchronous AHCI ISR. Called by `narf_interrupts::dispatch::on_irq`
+/// before the per-vector `fire_count` increment + waker fan-out. Job:
+/// drain the level-triggered IRQ source so the next event is allowed
+/// to fire.
+///
+/// Bounded work: HBA `IS` is a 32-bit per-port bitmap, so at worst
+/// we walk 32 ports per fire (AHCI 1.3.1 §3.1.3). Each port's
+/// `PORT_IS` is also a fixed 32-bit register. No unbounded loops.
+fn ahci_isr() {
+    let base = AHCI_MMIO_BASE.load(Ordering::Acquire);
+    if base == 0 {
+        return;
+    }
+    // SAFETY: identity-mapped MMIO; `base` is the ABAR PA stored
+    // post-bring-up, owned by the AHCI driver.
+    let is = unsafe { core::ptr::read_volatile((base as u64 + HBA_IS) as *const u32) };
+    if is == 0 {
+        return;
+    }
+    // Clear each port's per-port IS first (W1C inside the port,
+    // §3.3.5), then clear the HBA-wide IS bit (W1C, §3.1.3). Order
+    // matters: per spec the HBA IS bit only re-asserts if PORT_IS
+    // is non-zero after the host clears it, so draining PORT_IS
+    // first prevents an immediate re-fire.
+    for n in 0..32u8 {
+        let bit = 1u32 << n;
+        if is & bit == 0 {
+            continue;
+        }
+        let off = PORT_BASE_OFF + (n as u64) * PORT_STRIDE;
+        // SAFETY: same identity-mapped MMIO window.
+        let pis = unsafe { core::ptr::read_volatile((base as u64 + off + PORT_IS) as *mut u32) };
+        if pis != 0 {
+            // SAFETY: same.
+            unsafe {
+                core::ptr::write_volatile((base as u64 + off + PORT_IS) as *mut u32, pis);
+            }
+        }
+    }
+    // SAFETY: same.
+    unsafe {
+        core::ptr::write_volatile((base as u64 + HBA_IS) as *mut u32, is);
+    }
+}
+
+/// Try to bring up MSI-X for the AHCI controller. Mirrors
+/// `Xhci::try_enable_msix` — walks the cap, allocates an IDT vector,
+/// programs MSI-X table entry 0 to deliver to the BSP, then flips
+/// the global enable. Returns `(table, vector)` on success.
+fn try_enable_msix_ahci(
+    cap: &Cap<BusDeviceCap, Write>,
+    device: &BusDevice,
+) -> Option<(MsixTable, u8)> {
+    let mut msix = enable_msix(cap, device).ok()?;
+    let v = narf_interrupts::vector::alloc().ok()?;
+    let _ = msix.alloc_vector()?;
+    // SAFETY: we hold the BusDeviceCap and own the MSI-X table; the
+    // vector + handler are installed by the caller before enable().
+    unsafe { msix.program_vector(0, 0, v) }.ok()?;
+    // SAFETY: cfg-space write to a known cap-list offset.
+    unsafe { msix.enable() }.ok()?;
+    Some((msix, v))
+}
+
+/// Try MSI (single-vector) as a middle fallback between MSI-X and
+/// legacy INTx. Some emulated AHCI controllers expose the MSI cap
+/// but not MSI-X.
+#[cfg(target_arch = "x86_64")]
+fn try_enable_msi_ahci(
+    cap: &Cap<BusDeviceCap, Write>,
+    device: &BusDevice,
+) -> Option<u8> {
+    let mut cfg = narf_bus::msi::enable_msi(cap, device, 1).ok()?;
+    let v = narf_interrupts::vector::alloc().ok()?;
+    // SAFETY: caller-authority over cfg space; vector reserved.
+    let _ = unsafe { narf_bus::msi::program_msi(&mut cfg, 0, v) }.ok()?;
+    // SAFETY: same.
+    unsafe { narf_bus::msi::enable(&cfg) }.ok()?;
+    Some(v)
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn try_enable_msi_ahci(_cap: &Cap<BusDeviceCap, Write>, _device: &BusDevice) -> Option<u8> {
+    None
+}
+
+/// Legacy INTx fallback. Walks PCI INTERRUPT_PIN, looks the line up
+/// in the AML `_PRT`, allocates an IDT vector, and routes the GSI
+/// through the IOAPIC level/active-low.
+#[cfg(target_arch = "x86_64")]
+fn try_install_intx_ahci(cap: &Cap<BusDeviceCap, Write>, device: &BusDevice) -> Option<u8> {
+    let pin = narf_bus::pci::read_intx_pin(cap, device).ok()?;
+    if pin == 0 || pin > 4 {
+        return None;
+    }
+    let slot = match device.kind {
+        narf_bus::BusKind::Pcie { addr, .. } => addr.device,
+        _ => return None,
+    };
+    let prt_pin = pin - 1;
+    let route = narf_aml::irq_routing::route_for("\\_SB.PCI0", slot, prt_pin)?;
+    if route.entry.source.is_some() {
+        return None;
+    }
+    let gsi = route.entry.source_index;
+    let v = narf_interrupts::vector::alloc().ok()?;
+    // Handler is installed by the caller before this routes the GSI,
+    // so the first delivered IRQ already has the AHCI ISR registered.
+    // SAFETY: vector + handler set above before the route.
+    let ok = unsafe {
+        narf_acpi::ioapic::route_gsi_to_vector(
+            gsi,
+            v,
+            0,
+            narf_acpi::ioapic::POLARITY_LOW | narf_acpi::ioapic::TRIGGER_LEVEL,
+        )
+    };
+    if !ok {
+        return None;
+    }
+    Some(v)
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn try_install_intx_ahci(_cap: &Cap<BusDeviceCap, Write>, _device: &BusDevice) -> Option<u8> {
+    None
+}
+
+/// Negotiate an IRQ delivery path (MSI-X → MSI → INTx). On success,
+/// installs `ahci_isr` on the chosen vector + records the vector in
+/// `AHCI_IRQ_VECTOR`. On total failure leaves `AHCI_IRQ_VECTOR` at
+/// 0 — async paths will fall back to sync polling.
+fn try_setup_irq(cap: &Cap<BusDeviceCap, Write>, device: &BusDevice) {
+    if let Some((tbl, v)) = try_enable_msix_ahci(cap, device) {
+        narf_interrupts::install_handler(v, ahci_isr);
+        *AHCI_MSIX.lock() = Some(tbl);
+        AHCI_IRQ_VECTOR.store(v, Ordering::Release);
+        return;
+    }
+    if let Some(v) = try_enable_msi_ahci(cap, device) {
+        narf_interrupts::install_handler(v, ahci_isr);
+        AHCI_IRQ_VECTOR.store(v, Ordering::Release);
+        return;
+    }
+    if let Some(v) = try_install_intx_ahci(cap, device) {
+        narf_interrupts::install_handler(v, ahci_isr);
+        AHCI_IRQ_VECTOR.store(v, Ordering::Release);
+    }
+}
+
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if CONTROLLER.lock().is_some() {
         return Ok(());
     }
+    // Enable MEM_SPACE + BUS_MASTER. We leave INTX_DISABLE clear so
+    // that the legacy INTx fallback is reachable; if MSI / MSI-X
+    // negotiation succeeds, the device's INTx pin is still inert
+    // because no per-port IS bit will translate into an INTx
+    // assertion under the device's MSI-mode behaviour (PCIe spec
+    // §6.8: MSI/MSI-X enable in cfg-space suppresses INTx).
     narf_bus::pci::set_command(
         &cap,
         &device,
-        narf_bus::pci::cmd::MEM_SPACE
-            | narf_bus::pci::cmd::BUS_MASTER
-            | narf_bus::pci::cmd::INTX_DISABLE,
+        narf_bus::pci::cmd::MEM_SPACE | narf_bus::pci::cmd::BUS_MASTER,
     )
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
     // SAFETY: caller-authority over the device's BAR.
@@ -1033,6 +1553,11 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
+    // Stash MMIO base for the ISR before any IRQ can fire.
+    AHCI_MMIO_BASE.store(dev.mmio.phys.raw() as usize, Ordering::Release);
+    // Negotiate IRQ delivery (MSI-X → MSI → INTx). Best-effort —
+    // failure leaves the driver in sync-poll mode.
+    try_setup_irq(&cap, &device);
     *CONTROLLER.lock() = Some(dev);
     // Register against the unified block-device registry.
     narf_block::register_block_device(

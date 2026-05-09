@@ -875,11 +875,14 @@ dependencies = [
 name = "narf-drivers-storage"
 version = "0.0.0"
 dependencies = [
+ "narf-acpi",
+ "narf-aml",
  "narf-block",
  "narf-bus",
  "narf-capabilities",
  "narf-drivers",
  "narf-init",
+ "narf-interrupts",
  "narf-io",
  "narf-kernel-test",
  "narf-lib",
