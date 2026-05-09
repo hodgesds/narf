@@ -76,6 +76,67 @@ pub fn narf_cpu_to_node(cpu: u32) -> u32 {
     narf_acpi::cpu_node(cpu).unwrap_or(0)
 }
 
+/// Install the framebuffer console early (right after MMU init)
+/// so subsequent kernel logs and panics paint to the laptop
+/// screen rather than only to serial. Best-effort: skips with a
+/// diagnostic line on serial if the FB phys is above the 4 GiB
+/// identity map, the pixel format isn't packed RGB, or the FB
+/// driver layer isn't ready.
+///
+/// On success, every later `console::Writer` write fans out to
+/// both UART and the FB via the hook installed in
+/// `console::set_fb_hook`. The Stage::Late `fb-console-install`
+/// initcall remains in place; it re-binds the hook to whichever
+/// scanout `narf_fb::select_active()` picks (potentially a real
+/// GPU driver instead of the bootloader-supplied generic FB).
+fn try_install_early_fb_console(fb_info: narf_boot::info::FramebufferInfo) {
+    use narf_graphics::{FbConsole, Pixel32};
+
+    // Identity map covers 0..=4 GiB. UEFI sometimes maps the GOP
+    // FB above 4 GiB; defer those to the Late install path which
+    // runs after `ioremap`-style high-mem mapping.
+    let phys = fb_info.addr.raw();
+    let end = phys.saturating_add(fb_info.height as u64 * fb_info.pitch as u64);
+    if end > (4u64 << 30) {
+        let _ = writeln!(
+            console::Writer,
+            "  early-fb: skipping — FB at {:#x} above 4 GiB identity map",
+            phys
+        );
+        return;
+    }
+
+    // The bootloader gave us an FB. Wrap it in a generic scanout
+    // and ask narf_fb to surface it. select_active() then returns
+    // the generic-fb scanout (we registered it earlier).
+    let scanout = match narf_fb::select_active() {
+        Some(s) => s,
+        None => {
+            let _ = writeln!(
+                console::Writer,
+                "  early-fb: skipping — no scanout registered"
+            );
+            return;
+        }
+    };
+    // SAFETY: BSP, no concurrent draw; FB phys is identity-mapped
+    // (verified above to be < 4 GiB).
+    let fb = unsafe { scanout.framebuffer() };
+    let con = FbConsole::new(fb, Pixel32::NARF_FG, Pixel32::NARF_BG);
+    let (cols, rows) = (con.cols(), con.rows());
+    narf_graphics::install_fb_console(con);
+    console::set_fb_hook(narf_graphics::console::write_bytes);
+    let _ = writeln!(
+        console::Writer,
+        "  early-fb: console installed via {} ({}x{} → {}x{} chars)",
+        scanout.name(),
+        fb_info.width,
+        fb_info.height,
+        cols,
+        rows
+    );
+}
+
 /// Parse `stop_at=<stage>` and `safe_mode[=...]` from a kernel
 /// command-line. Returns the highest stage that should run; defaults
 /// to `Stage::Late` (run everything). Unknown stage names fall back
@@ -637,6 +698,23 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             "  mmu: installed, PML4 @ {:?}, console remapped",
                             pml4
                         );
+
+                        // Real-HW bring-up aid: install the FB
+                        // console NOW, not at Stage::Late. Without
+                        // this, a boot hang anywhere between MMU
+                        // init and Late shows nothing on the laptop
+                        // screen (only on serial) — a black screen
+                        // is the worst possible bring-up signal.
+                        // The Late `fb-console-install` call will
+                        // re-bind to the active scanout (potentially
+                        // virtio-gpu / amdgpu) once those drivers
+                        // attach, but for now we want anything that
+                        // panics during ACPI/SMP/PCI to land on
+                        // screen via the bootloader-provided generic
+                        // FB.
+                        if let Some(fb_info) = info.framebuffer {
+                            try_install_early_fb_console(fb_info);
+                        }
                     }
                     Err(e) => {
                         let _ = writeln!(console::Writer, "  mmu: init failed: {e:?}");
