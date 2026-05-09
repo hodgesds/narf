@@ -80,15 +80,19 @@ members = [
     "drivers/fs/iso9660",
     "drivers/fs/udf",
     "drivers/fs/9p",
-    "userspace/init",
-    "userspace/shell",
 ]
-# narf-testbin is built out-of-line by verification's build.rs
-# because it needs a distinct linker script and release profile.
-# Leaving it outside the `members` array keeps the kernel workspace's
-# fat-LTO release settings from contaminating the user binary.
+# narf-testbin / userspace/init / userspace/shell are built out-of-
+# line by verification's build.rs (and by xtask's iso-boot path)
+# because they need a bare-metal target (x86_64-unknown-none),
+# distinct linker scripts, and a release profile that doesn't
+# inherit the kernel workspace's fat-LTO settings. They define
+# `_start` in `#![no_main]` shape, which collides with libc's
+# Scrt1.o `_start` if cargo tries to build them for the host —
+# so they must NOT be workspace members.
 exclude = [
     "userspace/testbin",
+    "userspace/init",
+    "userspace/shell",
     "narf-libc",
     "narf-libc/validate",
 ]
