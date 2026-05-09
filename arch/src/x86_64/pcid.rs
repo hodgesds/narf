@@ -140,8 +140,18 @@ impl fmt::Display for DomainRights {
 /// bit, exposed since Zen). Caller must have ensured the current CR3
 /// has PCID = 0 in its low 12 bits.
 pub unsafe fn enable_pcide() {
-    // SAFETY: BSP boot path; caller verified PCID support and CR3 PCID=0.
+    // Intel SDM Vol 3 §4.10.1: setting CR4.PCIDE faults #GP if CR3
+    // has any non-zero bits in 11:0. Bootloaders (Limine, real
+    // UEFI loaders) sometimes leave the legacy CR3 PWT (bit 3) or
+    // PCD (bit 4) bits set; QEMU TCG happens to clear them, which
+    // is why this only manifests on real HW. Re-write CR3 with the
+    // low 12 bits masked off before enabling PCIDE so the write
+    // succeeds. Same physical PML4, just a clean CR3.
+    //
+    // SAFETY: BSP boot path; caller verified PCID support.
     unsafe {
+        let cr3 = cr::read_cr3();
+        cr::write_cr3(cr3 & !0xFFFu64);
         let cr4 = cr::read_cr4();
         cr::write_cr4(cr4 | cr::CR4_PCIDE);
     }
