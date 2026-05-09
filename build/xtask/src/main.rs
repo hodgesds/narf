@@ -475,6 +475,155 @@ fn build_fat12_nvme_image(total_sectors: u32, data: &[u8]) -> Vec<u8> {
     img
 }
 
+/// Build a FAT16 disk image at `out_path` populated with `/init`
+/// and `/shell` (cargo-built on demand from the userspace crates).
+/// Used by `iso-boot` so the kernel's `frame::boot_userspace_init`
+/// disk-load path takes over from the baked
+/// `narf_verification::*_ELF` fallback.
+///
+/// Requires mtools (`mformat`/`mcopy`) on the host. Returns an error
+/// when mtools is missing or any sub-step fails — the caller falls
+/// back to the legacy single-file FAT12 fixture.
+fn build_userspace_disk_image(workspace: &Path, out_path: &Path) -> Result<()> {
+    // mtools presence — check with `which`. mformat exits non-zero
+    // when invoked with no args, so a quick which is the cleanest
+    // probe.
+    if Command::new("which")
+        .arg("mformat")
+        .output()
+        .ok()
+        .and_then(|o| if o.status.success() { Some(()) } else { None })
+        .is_none()
+    {
+        bail!("mtools (mformat) not on PATH");
+    }
+    if Command::new("which")
+        .arg("mcopy")
+        .output()
+        .ok()
+        .and_then(|o| if o.status.success() { Some(()) } else { None })
+        .is_none()
+    {
+        bail!("mtools (mcopy) not on PATH");
+    }
+
+    let init_elf = build_user_binary(
+        workspace,
+        "userspace/init",
+        "init",
+        "init.ld",
+    )?;
+    let shell_elf = build_user_binary(
+        workspace,
+        "userspace/shell",
+        "shell",
+        "shell.ld",
+    )?;
+
+    // 16 MiB raw image — comfortable headroom for a few-hundred-KiB
+    // pair of user binaries plus future additions, well below FAT16's
+    // 2 GiB cap, well above the FAT16 minimum (~4 MiB after BPB
+    // overhead).
+    const IMG_BYTES: usize = 16 * 1024 * 1024;
+    if let Some(parent) = out_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(out_path, vec![0u8; IMG_BYTES])
+        .with_context(|| format!("failed to allocate {} byte image", IMG_BYTES))?;
+
+    // mformat -i <img> -F :: builds a FAT32; -F omits and lets
+    // mformat pick FAT16 when the image is too small for FAT32's
+    // 65525-cluster minimum. -v narf labels the volume.
+    let status = Command::new("mformat")
+        .arg("-i")
+        .arg(out_path)
+        .arg("-v")
+        .arg("NARF")
+        .arg("::")
+        .status()
+        .context("failed to spawn mformat")?;
+    if !status.success() {
+        bail!("mformat failed with {status}");
+    }
+
+    // mcopy -i <img> <src> ::/<dst> — drop the binaries at the FAT
+    // root. Lowercase `init` / `shell` matches what the kernel's
+    // `try_load_from_root("init"/"shell")` looks up.
+    for (src, dst) in [(&init_elf, "init"), (&shell_elf, "shell")] {
+        let status = Command::new("mcopy")
+            .arg("-i")
+            .arg(out_path)
+            .arg(src)
+            .arg(format!("::/{}", dst))
+            .status()
+            .context("failed to spawn mcopy")?;
+        if !status.success() {
+            bail!("mcopy {} failed with {status}", src.display());
+        }
+    }
+
+    Ok(())
+}
+
+/// Build a single user-space binary the same way verification/build.rs
+/// builds init/shell — same triple (x86_64-unknown-none),
+/// same linker script + code-model=large rustflag — into a
+/// dedicated target dir under target/iso-boot-userbins/. Returns
+/// the path to the produced ELF.
+fn build_user_binary(
+    workspace: &Path,
+    crate_dir: &str,
+    bin_name: &str,
+    linker_script_name: &str,
+) -> Result<PathBuf> {
+    let crate_path = workspace.join(crate_dir);
+    let linker_script = crate_path.join(linker_script_name);
+    let target_dir = workspace
+        .join("target")
+        .join("iso-boot-userbins")
+        .join(bin_name);
+    let triple = "x86_64-unknown-none";
+
+    // CARGO_ENCODED_RUSTFLAGS uses 0x1f (unit separator) between
+    // entries — verification/build.rs does the same. Keeps the
+    // separate `-C link-arg=-T...` and `-C relocation-model=static`
+    // flags from being parsed as a single shell-style string.
+    let rustflags = [
+        "-C".to_string(),
+        format!("link-arg=-T{}", linker_script.display()),
+        "-C".to_string(),
+        "relocation-model=static".to_string(),
+        "-C".to_string(),
+        "code-model=large".to_string(),
+    ]
+    .join("\x1f");
+
+    let status = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        .arg("build")
+        .arg("--release")
+        .arg("--target")
+        .arg(triple)
+        .arg("--target-dir")
+        .arg(&target_dir)
+        .arg("-Zbuild-std=core")
+        .arg("-Zbuild-std-features=")
+        .current_dir(&crate_path)
+        .env("CARGO_ENCODED_RUSTFLAGS", &rustflags)
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_TARGET_DIR")
+        .status()
+        .with_context(|| format!("failed to spawn cargo build for {}", bin_name))?;
+    if !status.success() {
+        bail!("cargo build for {} failed with {status}", bin_name);
+    }
+
+    let bin = target_dir.join(triple).join("release").join(bin_name);
+    if !bin.exists() {
+        bail!("expected output {} missing after cargo build", bin.display());
+    }
+    Ok(bin)
+}
+
 fn fat12_set(fat: &mut [u8], idx: u32, val: u16) {
     let off = (idx + idx / 2) as usize;
     let v = val & 0x0FFF;
@@ -752,8 +901,28 @@ fn iso_boot_cmd(args: &BuildArgs) -> Result<()> {
     // clobbers the FAT BPB if the image survives between runs. Forcing
     // a rewrite before iso-boot guarantees the boot-time
     // `root-mount-from-nvme` initcall sees a valid FAT volume.
+    //
+    // Try to populate the FAT root with /init + /shell so the
+    // boot-init disk-load path of frame::boot_userspace_init takes
+    // over from the baked narf_verification::*_ELF fallback. Needs
+    // mtools (mformat/mcopy) on the host; falls back to the
+    // hand-crafted single-file FAT12 image when mtools is missing.
     let _ = std::fs::remove_file(nvme_image_path());
-    let _ = nvme_image_path();
+    match build_userspace_disk_image(&root, &nvme_image_path()) {
+        Ok(()) => {
+            println!(
+                "xtask iso-boot: FAT16 disk image populated with /init + /shell at {}",
+                nvme_image_path().display()
+            );
+        }
+        Err(e) => {
+            println!(
+                "xtask iso-boot: skipping disk-userspace populate ({e}); falling back to single-file FAT12 fixture"
+            );
+            // Force the legacy hand-crafted image to be regenerated.
+            let _ = nvme_image_path();
+        }
+    }
     if !ovmf.is_file() {
         bail!(
             "OVMF firmware not found at {}; install `edk2-ovmf` (Arch) \

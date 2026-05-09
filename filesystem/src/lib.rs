@@ -579,12 +579,17 @@ impl VfsRegistry {
             return None;
         }
         let q = self.inner.lock();
-        // Find the longest matching mount path.
+        // Find the longest matching mount path. The root mount `/`
+        // is a special case: every absolute path is under it, but
+        // the "next byte must be `/`" predicate would reject e.g.
+        // `/init` because byte 1 is `i` not `/`. Special-case "/"
+        // so the root mount always matches as the fallback option.
         let mut best: Option<&Mount> = None;
         for m in q.iter() {
-            if abs == m.path
-                || (abs.starts_with(m.path) && abs.as_bytes().get(m.path.len()) == Some(&b'/'))
-            {
+            let is_match = abs == m.path
+                || m.path == "/"
+                || (abs.starts_with(m.path) && abs.as_bytes().get(m.path.len()) == Some(&b'/'));
+            if is_match {
                 if best.map(|b| b.path.len()).unwrap_or(0) < m.path.len() {
                     best = Some(m);
                 }
