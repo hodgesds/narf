@@ -28,6 +28,7 @@
 #![deny(missing_debug_implementations)]
 
 pub mod accel;
+pub mod clean;
 pub mod pq;
 pub mod tpm;
 
