@@ -812,6 +812,9 @@ dependencies = [
 name = "narf-drivers-net"
 version = "0.0.0"
 dependencies = [
+ "narf-acpi",
+ "narf-aml",
+ "narf-arch",
  "narf-bus",
  "narf-capabilities",
  "narf-driver-runtime",

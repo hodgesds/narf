@@ -19,6 +19,9 @@ narf-net          = { path = "../../net" }
 narf-bus          = { path = "../../bus" }
 narf-interrupts   = { path = "../../interrupts" }
 narf-memory       = { path = "../../memory" }
+narf-arch         = { path = "../../arch" }
+narf-acpi         = { path = "../../acpi" }
+narf-aml          = { path = "../../aml" }
 narf-drivers      = { path = "../" }
 narf-init         = { path = "../../init" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
