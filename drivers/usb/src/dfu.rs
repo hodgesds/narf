@@ -41,7 +41,7 @@
 
 use core::convert::TryFrom;
 
-use super::cdc::{check_class_specific, CdcError};
+use super::cdc::CdcError;
 
 // ── Class triple (DFU 1.1 §3.1) ──────────────────────────────────
 

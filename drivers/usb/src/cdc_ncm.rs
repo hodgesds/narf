@@ -58,7 +58,7 @@
 use alloc::vec::Vec;
 use core::convert::TryInto;
 
-use super::cdc::{check_class_specific, CdcError, FunctionalSubtype, CS_INTERFACE};
+use super::cdc::{check_class_specific, CdcError, FunctionalSubtype};
 
 // ── Class-specific request codes (NCM 1.0 §6.2) ──────────────────
 

@@ -345,7 +345,7 @@ pub fn for_each_node_of_kind<F: FnMut(&AmlNode)>(kind: NodeKind, mut f: F) {
 /// the device has no `_HID`, or when the value isn't a recognised
 /// shape.
 pub fn device_hid(device_path: &str) -> Option<alloc::string::String> {
-    use alloc::string::{String, ToString};
+    use alloc::string::String;
     let mut hid_path = String::from(device_path);
     hid_path.push_str("._HID");
     let g = NAMESPACE.lock();

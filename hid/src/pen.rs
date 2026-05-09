@@ -24,7 +24,6 @@
 //! etc.).
 
 extern crate alloc;
-use alloc::vec::Vec;
 
 use crate::descriptor::{Field, FieldKind, ReportDescriptor};
 use crate::report::{extract, ReportError};

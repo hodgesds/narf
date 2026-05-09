@@ -1182,13 +1182,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "narf-init-process"
-version = "0.1.0"
-dependencies = [
- "narf-libc",
-]
-
-[[package]]
 name = "narf-initramfs"
 version = "0.0.0"
 dependencies = [
@@ -1215,6 +1208,7 @@ name = "narf-input-driver"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "narf-acpi",
  "narf-aml",
  "narf-arch",
  "narf-console",
@@ -1272,13 +1266,6 @@ name = "narf-lib"
 version = "0.0.0"
 dependencies = [
  "narf-kernel-test",
-]
-
-[[package]]
-name = "narf-libc"
-version = "0.0.0"
-dependencies = [
- "narf-user-runtime",
 ]
 
 [[package]]
@@ -1395,13 +1382,6 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-scheduler",
-]
-
-[[package]]
-name = "narf-shell"
-version = "0.1.0"
-dependencies = [
- "narf-libc",
 ]
 
 [[package]]

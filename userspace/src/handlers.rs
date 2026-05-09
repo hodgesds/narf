@@ -3259,7 +3259,7 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
 
     // SAFETY: clone_for_fork's contract — paging is live; the
     // frame allocator was initialised at boot.
-    let mut child_as = match unsafe { parent_as.clone_for_fork() } {
+    let child_as = match unsafe { parent_as.clone_for_fork() } {
         Ok(a) => a,
         Err(_) => {
             ctx.set_return(SyscallReturn::invalid_op());

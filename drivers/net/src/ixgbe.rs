@@ -514,7 +514,7 @@ impl Ixgbe {
         cap: &Cap<BusDeviceCap, Write>,
         device: &BusDevice,
     ) -> Result<(), IxgbeError> {
-        let mut table = enable_msix(cap, device).map_err(|_| IxgbeError::MsixUnavailable)?;
+        let table = enable_msix(cap, device).map_err(|_| IxgbeError::MsixUnavailable)?;
         // Take vector 0 for "misc" (link / RX0 / TX0 collapsed).
         let _ = table.size(); // probed for completeness
                               // SAFETY: identity-mapped MMIO.

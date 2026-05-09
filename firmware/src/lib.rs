@@ -44,12 +44,9 @@ extern crate alloc;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use alloc::string::String;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use narf_capabilities::{Cap, CapKind, CapType, Read, Write};
-use narf_io::{alloc_coherent, DmaBuffer};
-use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 
 pub mod registry;

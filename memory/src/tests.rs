@@ -1020,7 +1020,7 @@ fn smoke_memory_address_space_materialize() -> TestResult {
     // against the new root finds the mapping with expected flags.
     use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
 
-    let mut a = unsafe { AddressSpace::new_for_user() }.expect("alloc AS");
+    let a = unsafe { AddressSpace::new_for_user() }.expect("alloc AS");
     // Pick a user virtual address outside every pre-existing
     // mapping. On x86_64, low 4 GiB is identity-mapped via 1-GiB
     // HUGE_PAGE entries in PML4[0]; pick PML4[1] (= 512 GiB). On
@@ -1110,7 +1110,7 @@ kernel_test_in!("memory", smoke_memory_address_space_materialize);
 fn smoke_memory_address_space_region_table() -> TestResult {
     use crate::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
 
-    let mut a = AddressSpace::empty();
+    let a = AddressSpace::empty();
     if a.region_count() != 0 {
         return TestResult::Fail("fresh AS has regions");
     }
@@ -1239,7 +1239,7 @@ fn smoke_memory_clone_for_fork_shares_frames_then_splits() -> TestResult {
     use crate::VirtAddr;
 
     cow::__test_clear();
-    let mut parent = match unsafe { AddressSpace::new_for_user() } {
+    let parent = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("AddressSpace::new_for_user not available"),
     };
@@ -1332,7 +1332,7 @@ fn smoke_memory_remap_page_picks_up_perms_and_phys() -> TestResult {
     use crate::VirtAddr;
 
     cow::__test_clear();
-    let mut a = match unsafe { AddressSpace::new_for_user() } {
+    let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("AddressSpace::new_for_user not available"),
     };

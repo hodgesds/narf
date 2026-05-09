@@ -14,7 +14,6 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use narf_ipc::shared_ring::SharedConsumer;
 use narf_lib::sync::IrqSafeSpinLock;
-use narf_memory::PhysAddr;
 
 use crate::cmd_ring::{self, DrawCmd, DrawRing, RING_DEPTH};
 use crate::{select_active, FbWriter};

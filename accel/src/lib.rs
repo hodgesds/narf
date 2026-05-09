@@ -3,10 +3,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 use async_trait::async_trait;
-use narf_capabilities::{Cap, Read, Write};
-use narf_io::DmaBuffer;
 
 pub mod device;
 

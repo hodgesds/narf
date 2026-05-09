@@ -36,7 +36,7 @@
 
 use core::convert::TryFrom;
 
-use super::cdc::{check_class_specific, CdcError, FunctionalSubtype, CS_INTERFACE};
+use super::cdc::{check_class_specific, CdcError, FunctionalSubtype};
 
 // ── CDC-ACM class-specific request codes (PSTN 1.2 §6.3) ─────────
 

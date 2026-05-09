@@ -17,14 +17,13 @@
 //! USB-IF class identifier per "USB Class Definitions for Wireless
 //! Controllers" v1.0: class 0xE0, subclass 0x01, protocol 0x01.
 
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Debug;
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::hci::{Command, Event, PacketType};
+use crate::hci::{Command, Event};
 
 /// USB Wireless-Controller class triple per §USB-IF Class Defs.
 pub const USB_CLASS_WIRELESS: u8 = 0xE0;

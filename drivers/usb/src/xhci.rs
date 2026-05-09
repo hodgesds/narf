@@ -917,7 +917,7 @@ impl Xhci {
         dword3_no_cycle: u32,
     ) -> Result<(), XhciError> {
         let mut enq_g = self.cmd_enqueue.lock();
-        let mut pcs_g = self.cmd_pcs.lock();
+        let pcs_g = self.cmd_pcs.lock();
         // Reserve slot N-1 for a Link TRB once we wrap; until then
         // the Stage-5 cut just refuses to enqueue past N-1. A real
         // driver would write a Link TRB at N-1 the first time it

@@ -39,10 +39,10 @@ use crate::x86_64::msr::{rdmsr, wrmsr};
 pub const MSR_MCG_CAP: u32 = 0x179;
 pub const MSR_MCG_STATUS: u32 = 0x17A;
 
-const MSR_MCi_CTL_BASE: u32 = 0x400;
-const MSR_MCi_STATUS_BASE: u32 = 0x401;
-const MSR_MCi_ADDR_BASE: u32 = 0x402;
-const MSR_MCi_MISC_BASE: u32 = 0x403;
+const MSR_MCI_CTL_BASE: u32 = 0x400;
+const MSR_MCI_STATUS_BASE: u32 = 0x401;
+const MSR_MCI_ADDR_BASE: u32 = 0x402;
+const MSR_MCI_MISC_BASE: u32 = 0x403;
 
 /// Decoded `MCG_CAP`. `count` is the number of MC banks; the
 /// other bits expose threshold / control hints.
@@ -145,7 +145,7 @@ pub unsafe fn mcg_status() -> u64 {
 /// reading past the architectural count is undefined.
 pub unsafe fn mci_status(i: u8) -> u64 {
     // SAFETY: caller-asserted.
-    unsafe { rdmsr(MSR_MCi_STATUS_BASE + 4 * i as u32) }
+    unsafe { rdmsr(MSR_MCI_STATUS_BASE + 4 * i as u32) }
 }
 
 /// Read MCi_ADDR for bank `i`.
@@ -155,7 +155,7 @@ pub unsafe fn mci_status(i: u8) -> u64 {
 /// matching MCi_STATUS has ADDRV (bit 58) set.
 pub unsafe fn mci_addr(i: u8) -> u64 {
     // SAFETY: caller-asserted.
-    unsafe { rdmsr(MSR_MCi_ADDR_BASE + 4 * i as u32) }
+    unsafe { rdmsr(MSR_MCI_ADDR_BASE + 4 * i as u32) }
 }
 
 /// Read MCi_MISC for bank `i`.
@@ -164,7 +164,7 @@ pub unsafe fn mci_addr(i: u8) -> u64 {
 /// Same as `mci_status`. Only meaningful when MISCV is set.
 pub unsafe fn mci_misc(i: u8) -> u64 {
     // SAFETY: caller-asserted.
-    unsafe { rdmsr(MSR_MCi_MISC_BASE + 4 * i as u32) }
+    unsafe { rdmsr(MSR_MCI_MISC_BASE + 4 * i as u32) }
 }
 
 /// Clear (write-1-clear) MCi_STATUS for bank `i`. Done after the
@@ -175,7 +175,7 @@ pub unsafe fn mci_misc(i: u8) -> u64 {
 pub unsafe fn clear_mci_status(i: u8) {
     // SAFETY: caller-asserted.
     unsafe {
-        wrmsr(MSR_MCi_STATUS_BASE + 4 * i as u32, 0);
+        wrmsr(MSR_MCI_STATUS_BASE + 4 * i as u32, 0);
     }
 }
 
@@ -191,11 +191,11 @@ pub unsafe fn init() {
         // Enable every error in the bank.
         // SAFETY: CPL=0.
         unsafe {
-            wrmsr(MSR_MCi_CTL_BASE + 4 * i as u32, !0u64);
+            wrmsr(MSR_MCI_CTL_BASE + 4 * i as u32, !0u64);
         }
         // SAFETY: same.
         unsafe {
-            wrmsr(MSR_MCi_STATUS_BASE + 4 * i as u32, 0);
+            wrmsr(MSR_MCI_STATUS_BASE + 4 * i as u32, 0);
         }
     }
 }

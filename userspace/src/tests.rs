@@ -3456,7 +3456,7 @@ fn smoke_userspace_init_sysv_stack_layout() -> TestResult {
     use narf_memory::{x86_64::paging, AddressSpace, Region, RegionPerms, VirtAddr};
     use crate::{init_sysv_stack, AuxEntry};
 
-    let mut as_ = match unsafe { AddressSpace::new_for_user() } {
+    let as_ = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Fail("new_for_user"),
     };
@@ -7098,7 +7098,7 @@ fn smoke_userspace_fork_distinct_address_space() -> TestResult {
     crate::syscall::__test_clear_global();
     narf_scheduler::init();
 
-    let mut parent_as_inner = match unsafe { AddressSpace::new_for_user() } {
+    let parent_as_inner = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Fail("AddressSpace::new_for_user"),
     };

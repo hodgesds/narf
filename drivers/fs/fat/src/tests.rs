@@ -302,7 +302,7 @@ fn smoke_fat_mount_root_via_vfs_resolve() -> TestResult {
     // `narf_filesystem::resolve`. Mirrors what the boot path will do
     // once a real disk + bootloader handoff lands a block device
     // under the root mount.
-    use alloc::sync::Arc;
+    
     use narf_block::ram::RamBlockDevice;
     use narf_filesystem::{
         bootstrap_mount_authority, registry, resolve_async, FsInstance,

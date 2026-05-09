@@ -5,7 +5,6 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use async_trait::async_trait;
-use narf_capabilities::{Cap, Grant, Read, Write};
 use narf_net::Interface;
 
 pub mod caps;

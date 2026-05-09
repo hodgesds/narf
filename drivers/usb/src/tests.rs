@@ -412,7 +412,7 @@ fn smoke_hid_diff_press_release_repeat() -> TestResult {
 kernel_test_in!("drivers/usb/hid", smoke_hid_diff_press_release_repeat);
 
 fn smoke_hid_rollover_suppressed() -> TestResult {
-    use crate::hid::{self, BootKeyboard, KbdReport};
+    use crate::hid::{BootKeyboard, KbdReport};
     use narf_input::{__reset_global_ring_for_test, init_global_ring, pop_global};
 
     init_global_ring(64);

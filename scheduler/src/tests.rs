@@ -470,7 +470,7 @@ fn smoke_scheduler_spawn_user_carries_address_space() -> TestResult {
     // constructor takes care of the kernel/high-half bits that
     // have to survive activation (full-copy PML4 on x86_64, empty
     // TTBR0 on aarch64 since the kernel lives behind TTBR1).
-    let mut a = unsafe { AddressSpace::new_for_user() }.expect("alloc user AS");
+    let a = unsafe { AddressSpace::new_for_user() }.expect("alloc user AS");
     a.map_region(Region {
         base: VirtAddr::new(0x4000),
         len: 0x1000,
