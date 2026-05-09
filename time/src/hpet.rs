@@ -1,8 +1,10 @@
 //! High Precision Event Timer (HPET) — clean-room.
 //!
 //! Spec: Intel **"IA-PC HPET (High Precision Event Timers)
-//! Specification"** rev 1.0a (free PDF, intel.com). Section
-//! references below (`§3.2`) point at that document.
+//! Specification"** rev 1.0a, October 2004, document 309216-001.
+//! Free PDF mirror:
+//! <https://www.intel.com/content/dam/www/public/us/en/documents/technical-specifications/software-developers-hpet-spec-1-0a.pdf>
+//! Section references (`§2.3`, `§3.2`) point at that document.
 //!
 //! HPET is a free-running monotonic counter at a fixed,
 //! firmware-discoverable frequency (~14.31818 MHz on most systems).
@@ -41,9 +43,36 @@
 //!
 //! Main Counter Value: free-running 64-bit (or 32-bit) counter.
 //!
-//! Stage cut: read-only counter access + frequency derivation. No
-//! comparator programming yet — that lands when the kernel needs a
-//! HPET-driven oneshot wakeup beyond the LAPIC timer.
+//! ## Per-timer comparator block (§2.3.5 / §2.3.6)
+//!
+//! Each timer N (0..NUM_TIM_CAP) has a 32-byte block at
+//! `base + 0x100 + 0x20*N`. Two registers per block matter for
+//! one-shot programming:
+//!
+//! | offset   | name                    | width |
+//! |----------|-------------------------|-------|
+//! | block+0  | Tn_CONFIG_AND_CAP       | u64   |
+//! | block+8  | Tn_COMPARATOR_VALUE     | u64   |
+//!
+//! `Tn_CONFIG_AND_CAP` low bits (§2.3.5):
+//!
+//! | bits      | field                                          |
+//! |-----------|------------------------------------------------|
+//! | [1]       | Tn_INT_TYPE_CNF — 0=edge, 1=level              |
+//! | [2]       | Tn_INT_ENB_CNF — 0=disabled, 1=enabled         |
+//! | [3]       | Tn_TYPE_CNF — 0=one-shot, 1=periodic           |
+//! | [4]       | Tn_PER_INT_CAP (RO) — periodic-mode supported  |
+//! | [5]       | Tn_SIZE_CAP (RO) — 0=32-bit, 1=64-bit timer    |
+//! | [6]       | Tn_VAL_SET_CNF — direct-write to accumulator   |
+//! | [8]       | Tn_32MODE_CNF — force 32-bit mode              |
+//! | [9..=13]  | Tn_INT_ROUTE_CNF — selected GSI                |
+//! | [14]      | Tn_FSB_EN_CNF — FSB-style MSI delivery         |
+//! | [15]      | Tn_FSB_INT_DEL_CAP (RO)                        |
+//! | [32..=63] | Tn_INT_ROUTE_CAP (RO) — bitmask of valid GSIs  |
+//!
+//! `General Interrupt Status` (§3.2.3) bit N is the level-mode
+//! latch for timer N: must be cleared (write-1-to-clear) before
+//! re-arming a level-triggered comparator.
 
 #![allow(dead_code)]
 
@@ -62,8 +91,23 @@ const REG_INT_STS: u64 = 0x020;
 const REG_MAIN_CNT: u64 = 0x0F0;
 const REG_TIMER_BASE: u64 = 0x100;
 const REG_TIMER_STRIDE: u64 = 0x20;
+const TIMER_REG_CONFIG: u64 = 0x00;
+const TIMER_REG_COMPARATOR: u64 = 0x08;
 
 const GEN_CONF_ENABLE_CNF: u64 = 1 << 0;
+
+// Per-timer Tn_CONFIG_AND_CAP bits (§2.3.5).
+const TN_INT_TYPE_CNF: u64 = 1 << 1;
+const TN_INT_ENB_CNF: u64 = 1 << 2;
+const TN_TYPE_CNF_PERIODIC: u64 = 1 << 3;
+const TN_PER_INT_CAP: u64 = 1 << 4;
+const TN_SIZE_CAP: u64 = 1 << 5;
+const TN_VAL_SET_CNF: u64 = 1 << 6;
+const TN_32MODE_CNF: u64 = 1 << 8;
+const TN_INT_ROUTE_CNF_SHIFT: u32 = 9;
+const TN_INT_ROUTE_CNF_MASK: u64 = 0x1F << TN_INT_ROUTE_CNF_SHIFT;
+const TN_FSB_EN_CNF: u64 = 1 << 14;
+const TN_INT_ROUTE_CAP_SHIFT: u32 = 32;
 
 /// One femtosecond.
 pub const FEMTOS_PER_SEC: u64 = 1_000_000_000_000_000;
@@ -177,6 +221,164 @@ impl Hpet {
     pub fn base_phys(&self) -> u64 {
         self.base_phys
     }
+
+    /// Per-timer block base for comparator `n`
+    /// (`base + 0x100 + 0x20*n`, §2.3).
+    #[inline]
+    fn timer_block(&self, n: u8) -> u64 {
+        self.base_phys + REG_TIMER_BASE + REG_TIMER_STRIDE * n as u64
+    }
+
+    /// Read `Tn_CONFIG_AND_CAP` (§2.3.5).
+    ///
+    /// # Safety
+    /// Caller asserts the HPET window is live and `n` is a valid
+    /// comparator index (`< caps.num_comparators`).
+    pub unsafe fn read_timer_config(&self, n: u8) -> u64 {
+        // SAFETY: caller-asserted live window + valid index.
+        unsafe { read_u64(self.timer_block(n) + TIMER_REG_CONFIG) }
+    }
+
+    /// Read `Tn_COMPARATOR_VALUE` (§2.3.6). Returns the full 64-bit
+    /// register; on a 32-bit timer the upper word is undefined per
+    /// spec, so callers must mask to 32 bits in that case.
+    ///
+    /// # Safety
+    /// Caller asserts the HPET window is live and `n` is a valid
+    /// comparator index.
+    pub unsafe fn read_timer_comparator(&self, n: u8) -> u64 {
+        // SAFETY: caller-asserted live window + valid index.
+        unsafe { read_u64(self.timer_block(n) + TIMER_REG_COMPARATOR) }
+    }
+
+    /// Returns the bitmask of GSIs this timer can route to
+    /// (`Tn_INT_ROUTE_CAP`, bits 32..=63 of `Tn_CONFIG_AND_CAP`,
+    /// §2.3.5). Bit `i` set means GSI `i` is a valid destination.
+    ///
+    /// # Safety
+    /// Same as [`read_timer_config`].
+    pub unsafe fn timer_route_cap(&self, n: u8) -> u32 {
+        // SAFETY: forwards.
+        let cfg = unsafe { self.read_timer_config(n) };
+        (cfg >> TN_INT_ROUTE_CAP_SHIFT) as u32
+    }
+
+    /// `true` if comparator `n` is a 64-bit timer
+    /// (`Tn_SIZE_CAP`, §2.3.5 bit 5).
+    ///
+    /// # Safety
+    /// Same as [`read_timer_config`].
+    pub unsafe fn timer_is_64bit(&self, n: u8) -> bool {
+        // SAFETY: forwards.
+        let cfg = unsafe { self.read_timer_config(n) };
+        cfg & TN_SIZE_CAP != 0
+    }
+
+    /// Program comparator `n` for a one-shot interrupt that fires
+    /// when the main counter reaches `deadline` (in HPET ticks).
+    ///
+    /// Sequence (§2.3.5 / §2.3.6):
+    ///   1. Disable the timer (`Tn_INT_ENB_CNF` cleared) so we can
+    ///      mutate config + comparator without delivering a stale
+    ///      interrupt.
+    ///   2. Force 32-bit mode (`Tn_32MODE_CNF`) on 32-bit timers so
+    ///      the high word of the 64-bit comparator register is
+    ///      ignored.
+    ///   3. Clear periodic + FSB; select level-trigger so the
+    ///      IOAPIC can drop one delivery if the deadline races us
+    ///      and re-arm cleanly via the status latch.
+    ///   4. Program `Tn_INT_ROUTE_CNF` to `gsi`.
+    ///   5. Write the comparator. For one-shot the spec only
+    ///      defines the comparator-as-deadline semantic when the
+    ///      timer is in non-periodic mode (`Tn_TYPE_CNF` clear),
+    ///      so `Tn_VAL_SET_CNF` is left clear.
+    ///   6. Clear the `General Interrupt Status` latch for this
+    ///      timer (write 1 to bit `n`) so a stale level-mode
+    ///      assertion from a previous arming doesn't immediately
+    ///      re-fire when we set `Tn_INT_ENB_CNF`.
+    ///   7. Set `Tn_INT_ENB_CNF`.
+    ///
+    /// # Safety
+    /// Caller asserts `n` is a valid comparator index, `gsi` is in
+    /// the bitmask returned by [`Self::timer_route_cap`], and the
+    /// HPET MMIO window is live + exclusively owned for the duration
+    /// of this call. Callers must arrange IDT vector + IOAPIC
+    /// programming so that the GSI lands at a real handler.
+    pub unsafe fn arm_oneshot_comparator(&self, n: u8, gsi: u8, deadline: u64) {
+        let block = self.timer_block(n);
+        // SAFETY: caller-asserted live window + valid index.
+        let mut cfg = unsafe { read_u64(block + TIMER_REG_CONFIG) };
+        // Step 1: disable + clear periodic / FSB / val-set so we're
+        // in a known one-shot, IRQ-disabled state.
+        cfg &= !(TN_INT_ENB_CNF
+            | TN_TYPE_CNF_PERIODIC
+            | TN_VAL_SET_CNF
+            | TN_FSB_EN_CNF
+            | TN_INT_ROUTE_CNF_MASK);
+        // Step 2/3: level-triggered (so a stale latch is observable
+        // + clearable rather than silently lost on edge).
+        cfg |= TN_INT_TYPE_CNF;
+        // Step 2 cont.: on 32-bit timers, force 32-bit mode so the
+        // upper bits of the 64-bit comparator register aren't
+        // consulted — the spec leaves them undefined on
+        // `Tn_SIZE_CAP == 0` parts.
+        if cfg & TN_SIZE_CAP == 0 {
+            cfg |= TN_32MODE_CNF;
+        }
+        // Step 4: route bits.
+        cfg |= ((gsi as u64) << TN_INT_ROUTE_CNF_SHIFT) & TN_INT_ROUTE_CNF_MASK;
+        // SAFETY: same.
+        unsafe { write_u64(block + TIMER_REG_CONFIG, cfg) };
+
+        // Step 5: program the deadline. Mask to 32 bits in 32-bit
+        // mode to avoid setting an unreachable comparator.
+        let value = if cfg & TN_32MODE_CNF != 0 {
+            deadline & 0xFFFF_FFFF
+        } else {
+            deadline
+        };
+        // SAFETY: same.
+        unsafe { write_u64(block + TIMER_REG_COMPARATOR, value) };
+
+        // Step 6: write-1-to-clear the level latch for this timer.
+        // The General Interrupt Status register is at REG_INT_STS;
+        // bit N corresponds to comparator N (§3.2.3). Other bits
+        // are write-zero-no-effect, so OR-write of just `1 << n` is
+        // safe.
+        // SAFETY: same.
+        unsafe { write_u64(self.base_phys + REG_INT_STS, 1u64 << n) };
+
+        // Step 7: enable interrupt delivery.
+        cfg |= TN_INT_ENB_CNF;
+        // SAFETY: same.
+        unsafe { write_u64(block + TIMER_REG_CONFIG, cfg) };
+    }
+
+    /// Disable comparator `n` (clear `Tn_INT_ENB_CNF`) and clear
+    /// any pending status latch.
+    ///
+    /// # Safety
+    /// Same as [`Self::arm_oneshot_comparator`].
+    pub unsafe fn disarm_comparator(&self, n: u8) {
+        let block = self.timer_block(n);
+        // SAFETY: caller-asserted live window + valid index.
+        let cfg = unsafe { read_u64(block + TIMER_REG_CONFIG) };
+        // SAFETY: same.
+        unsafe { write_u64(block + TIMER_REG_CONFIG, cfg & !TN_INT_ENB_CNF) };
+        // SAFETY: same.
+        unsafe { write_u64(self.base_phys + REG_INT_STS, 1u64 << n) };
+    }
+
+    /// Clear the level-mode latch for comparator `n` (§3.2.3).
+    /// Edge-triggered timers do not latch — calling this on an
+    /// edge-mode timer is a no-op the hardware silently absorbs.
+    ///
+    /// # Safety
+    /// Same as [`Self::arm_oneshot_comparator`].
+    pub unsafe fn clear_status(&self, n: u8) {
+        // SAFETY: caller-asserted live window + valid index.
+        unsafe { write_u64(self.base_phys + REG_INT_STS, 1u64 << n) };
+    }
 }
 
 // ── Singleton + raw reads ──────────────────────────────────────────
@@ -278,6 +480,113 @@ pub fn ticks_to_nanos(ticks: u64) -> u64 {
         }
         None => 0,
     }
+}
+
+/// Number of comparators reported by the singleton HPET (0 if HPET
+/// wasn't initialised).
+pub fn num_comparators() -> u8 {
+    HPET.lock().as_ref().map_or(0, |h| h.caps.num_comparators)
+}
+
+/// `Tn_INT_ROUTE_CAP` for comparator `n` — bitmask of GSIs the
+/// timer can drive. Returns 0 when HPET isn't initialised or `n`
+/// is out of range.
+pub fn timer_route_cap(n: u8) -> u32 {
+    let g = HPET.lock();
+    match g.as_ref() {
+        Some(h) if n < h.caps.num_comparators => {
+            // SAFETY: HPET singleton alive for the lock scope; index
+            // bounded against `num_comparators`.
+            unsafe { h.timer_route_cap(n) }
+        }
+        _ => 0,
+    }
+}
+
+/// `true` when comparator `n` is a 64-bit timer
+/// (`Tn_SIZE_CAP`, §2.3.5). `false` when HPET isn't initialised
+/// or `n` is out of range — callers should treat the comparator as
+/// 32-bit in that case (the safer assumption for deadline math).
+pub fn timer_is_64bit(n: u8) -> bool {
+    let g = HPET.lock();
+    match g.as_ref() {
+        Some(h) if n < h.caps.num_comparators => {
+            // SAFETY: same as `timer_route_cap`.
+            unsafe { h.timer_is_64bit(n) }
+        }
+        _ => false,
+    }
+}
+
+/// Outcome of [`arm_oneshot`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ArmError {
+    /// HPET wasn't initialised.
+    NotPresent,
+    /// `n >= num_comparators`.
+    BadComparator,
+    /// `gsi` is not a member of `Tn_INT_ROUTE_CAP` for this timer
+    /// — the comparator can't drive that line.
+    BadGsi,
+}
+
+/// Program comparator `n` for a one-shot wakeup at `deadline`
+/// (HPET ticks) routed to `gsi`. The caller must already have
+/// installed an IDT vector + IOAPIC redirection for `gsi` — this
+/// only touches the HPET MMIO. See `narf-interrupts::hpet_oneshot`
+/// for the integrated `vector::alloc` + IOAPIC + HPET path.
+///
+/// Returns `Err(BadGsi)` when `gsi` isn't in this timer's
+/// `Tn_INT_ROUTE_CAP`. The hardware is left untouched in the
+/// error case.
+///
+/// # Safety
+/// Caller asserts the HPET MMIO window is live and that the IDT /
+/// IOAPIC plumbing for `gsi` is in place before this fires.
+pub unsafe fn arm_oneshot(n: u8, gsi: u8, deadline: u64) -> Result<(), ArmError> {
+    let g = HPET.lock();
+    let h = g.as_ref().ok_or(ArmError::NotPresent)?;
+    if n >= h.caps.num_comparators {
+        return Err(ArmError::BadComparator);
+    }
+    // SAFETY: lock scope keeps singleton alive; index bounded.
+    let route_cap = unsafe { h.timer_route_cap(n) };
+    if gsi >= 32 || (route_cap & (1u32 << gsi)) == 0 {
+        return Err(ArmError::BadGsi);
+    }
+    // SAFETY: caller-asserted IDT/IOAPIC readiness; index bounded;
+    // GSI validated against the route-cap mask.
+    unsafe { h.arm_oneshot_comparator(n, gsi, deadline) };
+    Ok(())
+}
+
+/// Disarm comparator `n` (clear enable + status latch). Returns
+/// `Err` if HPET isn't initialised or `n` is out of range.
+///
+/// # Safety
+/// Caller asserts the HPET MMIO window is live.
+pub unsafe fn disarm(n: u8) -> Result<(), ArmError> {
+    let g = HPET.lock();
+    let h = g.as_ref().ok_or(ArmError::NotPresent)?;
+    if n >= h.caps.num_comparators {
+        return Err(ArmError::BadComparator);
+    }
+    // SAFETY: caller-asserted live window; index bounded.
+    unsafe { h.disarm_comparator(n) };
+    Ok(())
+}
+
+/// Read `Tn_CONFIG_AND_CAP` for comparator `n`, or `None` when HPET
+/// is not present / `n` is out of range. Diagnostic helper for
+/// drivers that want to inspect their programming.
+pub fn read_timer_config(n: u8) -> Option<u64> {
+    let g = HPET.lock();
+    let h = g.as_ref()?;
+    if n >= h.caps.num_comparators {
+        return None;
+    }
+    // SAFETY: HPET singleton alive for the lock scope; index bounded.
+    Some(unsafe { h.read_timer_config(n) })
 }
 
 #[doc(hidden)]

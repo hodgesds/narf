@@ -254,3 +254,110 @@ fn smoke_time_wall_offset_and_leap_smear() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("time", smoke_time_wall_offset_and_leap_smear);
+
+// ── HPET comparator-programming smokes ───────────────────────────
+
+fn smoke_hpet_arm_oneshot_rejects_when_uninitialised() -> TestResult {
+    use crate::hpet;
+    // Stash + reset so we don't clobber a real boot-initialised
+    // HPET. `__reset_for_test` is the canonical reset hook.
+    let was_present = hpet::is_present();
+    hpet::__reset_for_test();
+    // SAFETY: HPET singleton is empty.
+    let r = unsafe { hpet::arm_oneshot(0, 16, 0) };
+    let pass = matches!(r, Err(hpet::ArmError::NotPresent));
+    if was_present {
+        // Best-effort restore: re-init from the default base.
+        // SAFETY: single-threaded test boot.
+        let _ = unsafe { hpet::init() };
+    }
+    if pass {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("arm_oneshot accepted a missing HPET")
+    }
+}
+kernel_test_in!("time/hpet", smoke_hpet_arm_oneshot_rejects_when_uninitialised);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_hpet_arm_oneshot_rejects_bad_gsi() -> TestResult {
+    use crate::hpet;
+    if !hpet::is_present() {
+        return TestResult::Skip("HPET not initialised");
+    }
+    let cap = hpet::timer_route_cap(0);
+    // Pick a GSI bit definitely *not* in the cap mask. If every
+    // bit in 0..32 is set we can't construct a bad GSI — skip.
+    let mut bad: Option<u8> = None;
+    for g in 0u8..32 {
+        if cap & (1u32 << g) == 0 {
+            bad = Some(g);
+            break;
+        }
+    }
+    let bad = match bad {
+        Some(g) => g,
+        None => return TestResult::Skip("comparator 0 accepts every GSI in 0..32"),
+    };
+    // SAFETY: HPET window is live; we deliberately pass an invalid
+    // GSI to verify the validation gate.
+    let r = unsafe { hpet::arm_oneshot(0, bad, hpet::read_counter().wrapping_add(1_000_000)) };
+    if matches!(r, Err(hpet::ArmError::BadGsi)) {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("arm_oneshot accepted a GSI outside Tn_INT_ROUTE_CAP")
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("time/hpet", smoke_hpet_arm_oneshot_rejects_bad_gsi);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_hpet_disarm_clears_enable_bit() -> TestResult {
+    use crate::hpet;
+    if !hpet::is_present() {
+        return TestResult::Skip("HPET not initialised");
+    }
+    let cap = hpet::timer_route_cap(0);
+    // Pick the lowest bit set in cap that's >= 16 if possible —
+    // safer than touching legacy ISA wiring during a smoke.
+    let mut g: Option<u8> = None;
+    for v in 16u8..32 {
+        if cap & (1u32 << v) != 0 {
+            g = Some(v);
+            break;
+        }
+    }
+    let g = match g {
+        Some(v) => v,
+        None => return TestResult::Skip("no safe GSI in comparator 0 route-cap"),
+    };
+    // Far-future deadline so the IRQ doesn't fire before we disarm.
+    // 1 << 40 ticks is ~1 day at 14 MHz. We're not enabling
+    // interrupts here so the comparator can't actually deliver,
+    // but a paranoid deadline is cheap.
+    let deadline = hpet::read_counter().wrapping_add(1u64 << 40);
+    // SAFETY: HPET window live; IDT/IOAPIC plumbing not required
+    // because we disarm before STI.
+    if unsafe { hpet::arm_oneshot(0, g, deadline) }.is_err() {
+        return TestResult::Fail("arm_oneshot rejected a route-cap GSI");
+    }
+    let cfg_after_arm = match hpet::read_timer_config(0) {
+        Some(v) => v,
+        None => return TestResult::Fail("read_timer_config returned None after arm"),
+    };
+    // Tn_INT_ENB_CNF is bit 2 (§2.3.5).
+    if cfg_after_arm & (1u64 << 2) == 0 {
+        return TestResult::Fail("Tn_INT_ENB_CNF not set after arm");
+    }
+    // SAFETY: HPET window live.
+    if unsafe { hpet::disarm(0) }.is_err() {
+        return TestResult::Fail("disarm returned error");
+    }
+    let cfg_after_disarm = hpet::read_timer_config(0).unwrap_or(0);
+    if cfg_after_disarm & (1u64 << 2) != 0 {
+        return TestResult::Fail("Tn_INT_ENB_CNF still set after disarm");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("time/hpet", smoke_hpet_disarm_clears_enable_bit);

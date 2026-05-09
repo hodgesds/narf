@@ -191,6 +191,106 @@ kernel_test_in!("interrupts/ipi", smoke_tlb_shootdown_bridge_smp_fanout);
 
 // ── relocated from verification ──
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_hpet_pick_gsi_skips_low_block() -> TestResult {
+    // pick_gsi(mask, 16) must skip GSIs in the legacy ISA block
+    // (0..16) even when `mask` bits there are set.
+    use crate::x86_64::hpet_oneshot::__pick_gsi_for_test as pick;
+    // Mask = 0..32 all set. With min_gsi=16 we expect GSI 16.
+    if pick(0xFFFF_FFFF, 16) != Some(16) {
+        return TestResult::Fail("did not skip ISA block");
+    }
+    // Mask = ISA-only. Expect None.
+    if pick(0x0000_FFFF, 16).is_some() {
+        return TestResult::Fail("returned a low GSI when only ISA bits set");
+    }
+    // Mask with a single high bit at GSI 22. Expect 22.
+    if pick(1u32 << 22, 16) != Some(22) {
+        return TestResult::Fail("did not pick the only high GSI");
+    }
+    // Empty mask.
+    if pick(0, 16).is_some() {
+        return TestResult::Fail("returned a GSI for an empty mask");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("interrupts/hpet", smoke_hpet_pick_gsi_skips_low_block);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_hpet_oneshot_fires_handler() -> TestResult {
+    // End-to-end: arm a HPET one-shot for ~1 ms in the future, STI,
+    // wait for the handler-installed atomic to flip. Skips when HPET
+    // wasn't initialised (some test boots run without ACPI parsing).
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use crate::x86_64::hpet_oneshot;
+
+    if !narf_time::hpet::is_present() {
+        return TestResult::Skip("HPET not initialised");
+    }
+    if narf_acpi::apic_id_at(0).is_none() {
+        return TestResult::Skip("MADT did not enumerate a local APIC");
+    }
+    // Need a comparator-0 with at least one safe GSI in its
+    // route-cap; QEMU's HPET reports route-cap = 0x00F0_0000 (GSIs
+    // 20-23) which is fine. Bare-metal that pins HPET to legacy
+    // routing might fail this — skip cleanly.
+    let cap = narf_time::hpet::timer_route_cap(0);
+    if (cap >> 16) == 0 {
+        return TestResult::Skip("HPET comparator 0 has no safe GSI");
+    }
+
+    static FIRED: AtomicBool = AtomicBool::new(false);
+    fn handler() {
+        FIRED.store(true, Ordering::Release);
+    }
+    FIRED.store(false, Ordering::Release);
+
+    let hpet_hz = narf_time::hpet::frequency_hz();
+    if hpet_hz == 0 {
+        return TestResult::Skip("HPET reported zero frequency");
+    }
+    // ~1 ms from now in HPET ticks. Cap to a sensible minimum so a
+    // very slow HPET still gives the IOAPIC programming time to
+    // settle before the deadline passes.
+    let ticks_in_1ms = (hpet_hz / 1000).max(1000);
+    let now = narf_time::hpet::read_counter();
+    let deadline = now.wrapping_add(ticks_in_1ms);
+
+    // SAFETY: HPET + APIC up; handler only touches a static atomic.
+    if let Err(e) = unsafe { hpet_oneshot::arm_oneshot(deadline, handler) } {
+        // Map common environmental failures to Skip so the smoke is
+        // diagnostic on bare metal that lacks the right plumbing.
+        return match e {
+            hpet_oneshot::HpetOneshotError::NoSafeGsi
+            | hpet_oneshot::HpetOneshotError::IoapicRoutingFailed => {
+                TestResult::Skip("IOAPIC route to HPET unavailable")
+            }
+            _ => TestResult::Fail("arm_oneshot returned an error"),
+        };
+    }
+
+    // SAFETY: HPET IRQ handler is wired; STI to receive it.
+    unsafe { narf_arch::enable_interrupts() };
+    let start = narf_time::Instant::now();
+    while !FIRED.load(Ordering::Acquire) {
+        // Wait up to ~250 ms of TSC time. The smoke runs early in
+        // boot so RDTSC frequency may be uncalibrated; we use a
+        // large cycle budget that's still a small wallclock.
+        if narf_time::Instant::now().cycles_since(start) > 1_000_000_000 {
+            // SAFETY: disable IRQs before bailing.
+            unsafe { narf_arch::disable_interrupts() };
+            return TestResult::Fail("HPET one-shot handler never fired");
+        }
+        core::hint::spin_loop();
+    }
+    // SAFETY: same.
+    unsafe { narf_arch::disable_interrupts() };
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("interrupts/hpet", smoke_hpet_oneshot_fires_handler);
+
 fn smoke_vector_alloc_block_contiguous() -> TestResult {
     // alloc_block(4) returns a contiguous run of 4 vectors.
     use crate::vector::{alloc_block, free, is_allocated};

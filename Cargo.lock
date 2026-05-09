@@ -1229,6 +1229,7 @@ dependencies = [
 name = "narf-interrupts"
 version = "0.0.0"
 dependencies = [
+ "narf-acpi",
  "narf-arch",
  "narf-kernel-test",
  "narf-lib",
