@@ -28,6 +28,10 @@ enum Cmd {
     Test(BuildArgs),
     /// Produce a bootable image.
     Image(BuildArgs),
+    /// Build the bootable Limine ISO and boot it under QEMU + OVMF.
+    /// Equivalent to `xtask image` followed by the matching
+    /// `qemu-system-x86_64 -bios OVMF.fd -cdrom <iso> ...` invocation.
+    IsoBoot(BuildArgs),
     /// Boot under QEMU with a graphical display + the user-mode
     /// testbin running.
     Demo(BuildArgs),
@@ -153,6 +157,15 @@ impl Arch {
                         "ide-hd,drive=sata0,bus=ide.0".into(),
                     ]);
                     args.extend_from_slice(&["-device".into(), "qemu-xhci,id=xhci0".into()]);
+                    // Boot-protocol keyboard hanging off the xHCI
+                    // controller so the `usb-hid-keyboard` initcall has
+                    // something to attach to. With this in place the
+                    // QEMU smoke harness exercises the full
+                    // xHCI → HID-boot-keyboard → narf_input pipeline.
+                    args.extend_from_slice(&[
+                        "-device".into(),
+                        "usb-kbd,bus=xhci0.0".into(),
+                    ]);
                     args.extend_from_slice(&[
                         "-vga".into(),
                         "none".into(),
@@ -409,9 +422,69 @@ fn nvme_image_path() -> PathBuf {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::write(&path, vec![0u8; 1024 * 1024]);
+        // 1 MiB FAT12 with NARF.TXT in the root. Mirrors
+        // `drivers/fs/fat/src/tests.rs::build_fat12_image` so the
+        // boot-time `root-mount-from-nvme` initcall can complete
+        // against this image in QEMU.
+        let img = build_fat12_nvme_image(2048, b"narf\n");
+        let _ = std::fs::write(&path, &img);
     }
     path
+}
+
+/// Minimal FAT12 image — single-FAT, single-root-dir-sector, one
+/// file (`NARF.TXT`) at cluster 2. Layout per Microsoft FATGEN §3.
+fn build_fat12_nvme_image(total_sectors: u32, data: &[u8]) -> Vec<u8> {
+    const LBS: usize = 512;
+    let mut img = vec![0u8; LBS * total_sectors as usize];
+
+    // BPB
+    img[0..3].copy_from_slice(&[0xEB, 0x3C, 0x90]);
+    img[3..11].copy_from_slice(b"NARFFAT ");
+    img[11..13].copy_from_slice(&(LBS as u16).to_le_bytes());
+    img[13] = 1;
+    img[14..16].copy_from_slice(&1u16.to_le_bytes());
+    img[16] = 2;
+    img[17..19].copy_from_slice(&16u16.to_le_bytes());
+    img[19..21].copy_from_slice(&(total_sectors as u16).to_le_bytes());
+    img[21] = 0xF8;
+    img[22..24].copy_from_slice(&1u16.to_le_bytes());
+    img[510] = 0x55;
+    img[511] = 0xAA;
+
+    // FAT 1 + FAT 2 — entry 0 media, entry 1 EOC, entry 2 EOC.
+    for &lba in &[1usize, 2usize] {
+        let fat = &mut img[lba * LBS..lba * LBS + LBS];
+        fat12_set(fat, 0, 0xFF8);
+        fat12_set(fat, 1, 0xFFF);
+        if !data.is_empty() {
+            fat12_set(fat, 2, 0xFFF);
+        }
+    }
+
+    if !data.is_empty() {
+        let root_lba = 3usize;
+        let entry = &mut img[root_lba * LBS..root_lba * LBS + 32];
+        entry[0..11].copy_from_slice(b"NARF    TXT");
+        entry[11] = 0x20;
+        entry[26..28].copy_from_slice(&2u16.to_le_bytes());
+        entry[28..32].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        let data_lba = 4usize;
+        img[data_lba * LBS..data_lba * LBS + data.len()].copy_from_slice(data);
+    }
+    img
+}
+
+fn fat12_set(fat: &mut [u8], idx: u32, val: u16) {
+    let off = (idx + idx / 2) as usize;
+    let v = val & 0x0FFF;
+    if idx % 2 == 0 {
+        fat[off] = (v & 0xFF) as u8;
+        fat[off + 1] = (fat[off + 1] & 0xF0) | (((v >> 8) & 0x0F) as u8);
+    } else {
+        fat[off] = (fat[off] & 0x0F) | (((v << 4) & 0xF0) as u8);
+        fat[off + 1] = ((v >> 4) & 0xFF) as u8;
+    }
 }
 
 fn workspace_root() -> Result<PathBuf> {
@@ -497,6 +570,316 @@ fn run_cmd(args: &BuildArgs) -> Result<()> {
     Ok(())
 }
 
+/// Produce a Limine-bootable UEFI ISO at
+/// `target/narf-<arch>.iso`. The ISO chainloads the kernel via the
+/// multiboot2 protocol, so the same ELF that QEMU `-kernel` boots
+/// (PVH) also boots from this ISO under OVMF / real UEFI firmware.
+///
+/// External dependencies discovered at runtime:
+///   - `xorriso` on `$PATH` — produces the El-Torito ISO.
+///   - Limine support files (`BOOTX64.EFI` for UEFI, `limine-bios.sys`
+///     + `limine-bios-cd.bin` for the legacy BIOS path) found at
+///     `$LIMINE_PATH`, `/usr/share/limine/`, or `vendor/limine/`.
+///   - `limine` binary (optional, only needed for BIOS install).
+fn image_cmd(args: &BuildArgs) -> Result<()> {
+    if !matches!(args.arch, Arch::X86_64) {
+        bail!(
+            "xtask image: arch {:?} not yet supported (x86_64 only)",
+            args.arch.triple()
+        );
+    }
+    let root = workspace_root()?;
+    let out_dir = cargo_build(args, &root)?;
+    let kernel = out_dir.join(&args.package);
+    if !kernel.exists() {
+        bail!("expected kernel binary at {}", kernel.display());
+    }
+
+    let xorriso = which("xorriso").ok_or_else(|| {
+        anyhow!(
+            "`xorriso` not on $PATH — install with `pacman -S libisoburn` \
+             (Arch) or `apt install xorriso` (Debian/Ubuntu)"
+        )
+    })?;
+
+    let limine_dir = locate_limine().ok_or_else(|| {
+        anyhow!(
+            "Limine support files not found. Install via `pacman -S limine` \
+             (Arch) or `apt install limine` (Debian/Ubuntu), or set \
+             $LIMINE_PATH to a directory containing BOOTX64.EFI + \
+             limine-bios.sys + limine-bios-cd.bin."
+        )
+    })?;
+    let bootx64 = limine_dir.join("BOOTX64.EFI");
+    if !bootx64.exists() {
+        bail!(
+            "{} missing (Limine UEFI app); is `limine-uefi-x86-64` installed?",
+            bootx64.display()
+        );
+    }
+
+    let stage = root.join("target").join("iso-x86_64");
+    let _ = std::fs::remove_dir_all(&stage);
+    let boot_dir = stage.join("boot");
+    let limine_stage = boot_dir.join("limine");
+    let efi_dir = stage.join("EFI").join("BOOT");
+    std::fs::create_dir_all(&limine_stage).context("creating boot/limine/")?;
+    std::fs::create_dir_all(&efi_dir).context("creating EFI/BOOT/")?;
+
+    std::fs::copy(&kernel, boot_dir.join("narf-frame"))
+        .with_context(|| format!("copying kernel from {}", kernel.display()))?;
+    std::fs::copy(&bootx64, efi_dir.join("BOOTX64.EFI"))
+        .with_context(|| format!("copying {}", bootx64.display()))?;
+
+    // BIOS support files are nice-to-have. xorriso flags below
+    // reference them; if missing, drop the BIOS-side El-Torito
+    // entry so the ISO still builds (UEFI-only).
+    let bios_sys = limine_dir.join("limine-bios.sys");
+    let bios_cd = limine_dir.join("limine-bios-cd.bin");
+    let efi_cd = limine_dir.join("limine-uefi-cd.bin");
+    let have_bios = bios_sys.exists() && bios_cd.exists();
+    let have_efi_eltorito = efi_cd.exists();
+    if have_bios {
+        std::fs::copy(&bios_sys, limine_stage.join("limine-bios.sys"))?;
+        std::fs::copy(&bios_cd, limine_stage.join("limine-bios-cd.bin"))?;
+    }
+    if have_efi_eltorito {
+        std::fs::copy(&efi_cd, limine_stage.join("limine-uefi-cd.bin"))?;
+    }
+
+    // Limine v8+ config (`limine.conf`). The kernel is loaded as a
+    // multiboot2 binary because boot.S now exposes the §3.1 header.
+    // `serial: yes` mirrors Limine's own bring-up logging to COM1
+    // (16550A 0x3F8) so a `-serial stdio` QEMU run captures both
+    // Limine's stages and the kernel's UART writes.
+    let cfg = "\
+timeout: 0
+serial: yes
+verbose: yes
+quiet: no
+default_entry: 1
+
+/NARF
+    protocol: multiboot2
+    path: boot():/boot/narf-frame
+";
+    std::fs::write(limine_stage.join("limine.conf"), cfg).context("writing limine.conf")?;
+
+    let iso = root.join("target").join("narf-x86_64.iso");
+    let _ = std::fs::remove_file(&iso);
+
+    let mut cmd = Command::new(&xorriso);
+    cmd.arg("-as").arg("mkisofs").arg("-quiet");
+    if have_bios {
+        cmd.arg("-b")
+            .arg("boot/limine/limine-bios-cd.bin")
+            .arg("-no-emul-boot")
+            .arg("-boot-load-size")
+            .arg("4")
+            .arg("-boot-info-table");
+    }
+    if have_efi_eltorito {
+        cmd.arg("--efi-boot")
+            .arg("boot/limine/limine-uefi-cd.bin")
+            .arg("-efi-boot-part")
+            .arg("--efi-boot-image")
+            .arg("--protective-msdos-label");
+    }
+    cmd.arg(stage.as_os_str())
+        .arg("-o")
+        .arg(iso.as_os_str());
+
+    let status = cmd.status().context("running xorriso")?;
+    if !status.success() {
+        bail!("xorriso exited with {status}");
+    }
+
+    if have_bios {
+        if let Some(limine_bin) = which("limine") {
+            let st = Command::new(limine_bin)
+                .arg("bios-install")
+                .arg(&iso)
+                .status()
+                .context("running `limine bios-install`")?;
+            if !st.success() {
+                bail!("`limine bios-install` exited with {st}");
+            }
+        } else {
+            eprintln!(
+                "xtask image: skipping `limine bios-install` (binary not on $PATH); \
+                 ISO will still UEFI-boot, but legacy BIOS boot will be disabled."
+            );
+        }
+    }
+
+    println!("xtask image: wrote {}", iso.display());
+    let ovmf = ovmf_code_path();
+    println!(
+        "  test under QEMU UEFI:  qemu-system-x86_64 -bios {} -cpu max -m 1024M \\\n\
+         \x20                          -cdrom {} -serial stdio -display none -no-reboot",
+        ovmf.display(),
+        iso.display()
+    );
+    println!(
+        "  -cpu max is required: the kernel uses RDTSCP / RDSEED / etc. that the\n\
+         \x20 default qemu64 model doesn't expose.\n\
+         \x20 -m 1024M leaves room for the kernel image (~52 MiB at LOAD_BASE 16 MiB)\n\
+         \x20 + UEFI's reservations + the 32 MiB static heap arena."
+    );
+    Ok(())
+}
+
+/// Build a Limine ISO and boot it under QEMU with OVMF firmware.
+/// Mirrors `image_cmd` for the build half, then assembles the
+/// `qemu-system-x86_64 -bios <ovmf> -cdrom <iso> ...` invocation
+/// that lets the kernel exercise the UEFI handoff path end-to-end
+/// (the same path real consumer hardware takes).
+fn iso_boot_cmd(args: &BuildArgs) -> Result<()> {
+    if !matches!(args.arch, Arch::X86_64) {
+        bail!(
+            "xtask iso-boot: arch {:?} not yet supported (x86_64 only)",
+            args.arch.triple()
+        );
+    }
+    image_cmd(args)?;
+
+    let root = workspace_root()?;
+    let iso = root.join("target").join("narf-x86_64.iso");
+    let ovmf = ovmf_code_path();
+    // Regenerate the NVMe image — the kernel's NVMe smokes
+    // (`smoke_nvme_io_round_trip`, async round-trip, MSI-X round-trip)
+    // write sentinel patterns at LBA 0 / 1 to verify read-back, which
+    // clobbers the FAT BPB if the image survives between runs. Forcing
+    // a rewrite before iso-boot guarantees the boot-time
+    // `root-mount-from-nvme` initcall sees a valid FAT volume.
+    let _ = std::fs::remove_file(nvme_image_path());
+    let _ = nvme_image_path();
+    if !ovmf.is_file() {
+        bail!(
+            "OVMF firmware not found at {}; install `edk2-ovmf` (Arch) \
+             or `ovmf` (Debian/Ubuntu), or symlink the firmware here.",
+            ovmf.display()
+        );
+    }
+
+    // Same NVMe + virtio devices as the `-kernel` smoke harness so
+    // the boot-time `root-mount-from-nvme` initcall has a real
+    // FAT-formatted disk to try, and so virtio drivers see their
+    // expected backends.
+    let virtio = matches!(args.hw_profile, HwProfile::Full | HwProfile::VirtioOnly);
+    let legacy = matches!(args.hw_profile, HwProfile::Full | HwProfile::LegacyOnly);
+
+    let display = if args.display.is_empty() {
+        "none"
+    } else {
+        args.display.as_str()
+    };
+
+    let mut cmd = Command::new("qemu-system-x86_64");
+    cmd.arg("-bios").arg(&ovmf);
+    // q35 — same chipset the smoke harness uses. The default `pc`
+    // (i440FX) machine has no PCIe ECAM, only legacy CF8/CFC PCI
+    // config IO, which the kernel's bus walker doesn't drive yet.
+    cmd.arg("-machine").arg("q35");
+    cmd.arg("-cpu").arg("max");
+    cmd.arg("-smp").arg("2");
+    cmd.arg("-m").arg("1024M");
+    cmd.arg("-cdrom").arg(&iso);
+    cmd.arg("-serial").arg("stdio");
+    cmd.arg("-display").arg(display);
+    cmd.arg("-no-reboot");
+
+    if legacy {
+        cmd.arg("-drive")
+            .arg(format!(
+                "if=none,id=nvm0,format=raw,file={}",
+                nvme_image_path().display()
+            ))
+            .arg("-device")
+            .arg("nvme,drive=nvm0,serial=narf");
+    }
+    if virtio {
+        cmd.arg("-drive")
+            .arg(format!(
+                "if=none,id=vblk0,format=raw,file={}",
+                virtio_blk_image_path().display()
+            ))
+            .arg("-device")
+            .arg("virtio-blk-pci,drive=vblk0,disable-legacy=on,disable-modern=off");
+    }
+
+    println!("xtask iso-boot: launching qemu-system-x86_64 with ISO {}", iso.display());
+
+    let mut child = cmd.spawn().context("failed to spawn qemu-system-x86_64")?;
+    let secs = std::env::var("XTASK_QEMU_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(120);
+    match child.wait_timeout(Duration::from_secs(secs))? {
+        Some(status) => {
+            println!("xtask iso-boot: qemu exited with {status}");
+        }
+        None => {
+            child.kill()?;
+            child.wait()?;
+            bail!("xtask iso-boot: qemu timed out after {secs}s");
+        }
+    }
+    Ok(())
+}
+
+fn which(bin: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let p = dir.join(bin);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+fn locate_limine() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("LIMINE_PATH") {
+        let pb = PathBuf::from(p);
+        if pb.is_dir() {
+            return Some(pb);
+        }
+    }
+    for cand in ["/usr/share/limine", "/usr/local/share/limine"] {
+        let pb = PathBuf::from(cand);
+        if pb.is_dir() {
+            return Some(pb);
+        }
+    }
+    if let Ok(root) = workspace_root() {
+        let pb = root.join("vendor").join("limine");
+        if pb.is_dir() {
+            return Some(pb);
+        }
+    }
+    None
+}
+
+fn ovmf_code_path() -> PathBuf {
+    for cand in [
+        // Arch (edk2-ovmf >= 202311). The 4m variant ships with the
+        // newer x64 image; the legacy `OVMF_CODE.fd` was renamed.
+        "/usr/share/edk2/x64/OVMF.4m.fd",
+        "/usr/share/edk2-ovmf/x64/OVMF.4m.fd",
+        "/usr/share/edk2-ovmf/x64/OVMF_CODE.fd",
+        "/usr/share/edk2/x64/OVMF_CODE.fd",
+        "/usr/share/ovmf/x64/OVMF.fd",
+        "/usr/share/OVMF/OVMF_CODE.fd",
+    ] {
+        let pb = PathBuf::from(cand);
+        if pb.is_file() {
+            return pb;
+        }
+    }
+    PathBuf::from("OVMF_CODE.fd")
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
@@ -513,13 +896,8 @@ fn main() -> Result<()> {
             }
             run_cmd(&args)
         }
-        Cmd::Image(args) => {
-            eprintln!(
-                "xtask image: stub (arch={:?}); wires in with boot/ at Stage 1 Wave 1.",
-                args.arch.triple()
-            );
-            Ok(())
-        }
+        Cmd::Image(args) => image_cmd(&args),
+        Cmd::IsoBoot(args) => iso_boot_cmd(&args),
         Cmd::Demo(mut args) => {
             if args.features.is_empty() {
                 args.features = "kernel-test,user-mode-testbin".into();

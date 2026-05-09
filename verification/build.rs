@@ -32,6 +32,13 @@ fn main() {
     println!("cargo:rerun-if-changed=../narf-libc/validate/src/main.rs");
     println!("cargo:rerun-if-changed=../narf-libc/validate/validate.ld");
     println!("cargo:rerun-if-changed=../narf-libc/validate/Cargo.toml");
+    // boot-init feature: init + shell binaries.
+    println!("cargo:rerun-if-changed=../userspace/init/src/main.rs");
+    println!("cargo:rerun-if-changed=../userspace/init/init.ld");
+    println!("cargo:rerun-if-changed=../userspace/init/Cargo.toml");
+    println!("cargo:rerun-if-changed=../userspace/shell/src/main.rs");
+    println!("cargo:rerun-if-changed=../userspace/shell/shell.ld");
+    println!("cargo:rerun-if-changed=../userspace/shell/Cargo.toml");
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let workspace = manifest_dir.parent().unwrap().to_path_buf();

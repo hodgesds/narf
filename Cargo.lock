@@ -900,6 +900,7 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-scheduler",
+ "narf-time",
 ]
 
 [[package]]
@@ -992,7 +993,9 @@ version = "0.0.0"
 dependencies = [
  "narf-block",
  "narf-capabilities",
+ "narf-console",
  "narf-init",
+ "narf-input",
  "narf-io",
  "narf-kernel-test",
  "narf-lib",
@@ -1051,6 +1054,7 @@ dependencies = [
  "narf-aml",
  "narf-arch",
  "narf-audio",
+ "narf-block",
  "narf-bluetooth",
  "narf-boot",
  "narf-bus",
