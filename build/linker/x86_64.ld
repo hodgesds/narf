@@ -4,7 +4,15 @@
 
 ENTRY(_start)
 
-KERNEL_LOAD_BASE = 0x100000;
+/* 16 MiB. Modern UEFI firmware on x86_64 (OVMF on QEMU, real-world
+ * EDK2 builds, Lenovo / Dell / HP firmware) typically reserves the
+ * 0–16 MiB range for its own code, ACPI tables, and BootServices
+ * data. Loading the kernel above that line keeps the .data + .bss
+ * LOAD segment (~38 MiB once the 32-MiB static heap arena is
+ * accounted for) inside contiguous EfiConventionalMemory. The PVH
+ * direct-boot path (QEMU `-kernel`) honours the same ELF p_paddr,
+ * so this works for both protocols. */
+KERNEL_LOAD_BASE = 0x1000000;
 KERNEL_VIRT_BASE = 0xFFFFFFFF80000000;
 
 PHDRS
@@ -24,6 +32,10 @@ SECTIONS
 
     .boot : ALIGN(4K) {
         __boot_start = .;
+        /* Multiboot2 header must live in the first 32 KiB of the
+         * file; placing it at the head of the first PT_LOAD section
+         * keeps it well inside that window. */
+        KEEP(*(.multiboot2_header))
         KEEP(*(.boot .boot.*))
         __boot_end = .;
     } :boot

@@ -1,149 +1,266 @@
-//! Xen PVH `hvm_start_info` parser.
+//! Multiboot2 information-structure parser.
 //!
-//! (File named `multiboot2` for forward-compat with the eventual Limine /
-//! v2 integration; Stage 1 uses PVH because it's the only ELF64 path
-//! `qemu-system-x86_64 -kernel` supports out of the box. See `boot/` spec
-//! §5 for the design-time target; boot.S has the deviation note.)
+//! Spec: <https://www.gnu.org/software/grub/manual/multiboot2/multiboot.html>
+//! §3.1 (header) lives in `frame/src/x86_64/boot.S`; this module owns
+//! the §3.4 (boot-information) walk that runs after the loader hands
+//! control to `_start`.
 //!
-//! `hvm_start_info` layout (all little-endian):
+//! Tags this parser cares about (others are walked-and-skipped):
 //!
-//! ```text
-//! offset  field              type
-//! 0x00    magic              u32  = 0x336e_c578 ("xEn3")
-//! 0x04    version            u32
-//! 0x08    flags              u32
-//! 0x0C    nr_modules         u32
-//! 0x10    modlist_paddr      u64
-//! 0x18    cmdline_paddr      u64
-//! 0x20    rsdp_paddr         u64
-//! 0x28    memmap_paddr       u64
-//! 0x30    memmap_entries     u32
-//! 0x34    reserved           u32
-//! ```
+//! | type | name              | what we extract                       |
+//! |------|-------------------|---------------------------------------|
+//! |   1  | `cmdline`         | NUL-terminated string                  |
+//! |   3  | `module`          | `(start, size, cmdline)` per module    |
+//! |   6  | `mmap`            | `[entry]` of `(addr, len, type)`       |
+//! |   8  | `framebuffer`     | `(addr, pitch, w, h, bpp, type)`       |
+//! |  14  | `acpi_old_rsdp`   | 20-byte RSDP v1 copy                   |
+//! |  15  | `acpi_new_rsdp`   | XSDP (v2+); preferred over tag 14      |
 //!
-//! Each memmap entry is 24 bytes:
-//!
-//! ```text
-//! offset  field    type
-//! 0x00    addr     u64
-//! 0x08    size     u64
-//! 0x10    type     u32   (1 RAM, 2 reserved, 3 ACPI reclaim, 4 NVS,
-//!                         5 unusable, 6 disabled)
-//! 0x14    reserved u32
-//! ```
+//! Tag header is 8 bytes (`u32 type, u32 size`); payload starts
+//! right after; tags are 8-byte aligned (the next tag begins at
+//! `tag_start + ((size + 7) & !7)`). The structure begins with
+//! `u32 total_size, u32 reserved` and ends with a tag of type 0 +
+//! size 8.
 
 use narf_memory::PhysAddr;
 
-use crate::info::{MemRegion, MemRegionKind};
+use crate::info::{FramebufferInfo, MemRegion, MemRegionKind};
 
-/// Magic at offset 0 of a `hvm_start_info` struct.
-pub const MAGIC: u32 = 0x336e_c578;
+/// Magic the bootloader places in EAX when launching us via the
+/// multiboot2 protocol.
+pub const BOOT_MAGIC: u64 = 0x36d76289;
+
+const TAG_END: u32 = 0;
+const TAG_CMDLINE: u32 = 1;
+const TAG_MODULE: u32 = 3;
+const TAG_MMAP: u32 = 6;
+const TAG_FRAMEBUFFER: u32 = 8;
+const TAG_ACPI_OLD_RSDP: u32 = 14;
+const TAG_ACPI_NEW_RSDP: u32 = 15;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
-struct HvmStartInfo {
-    magic: u32,
-    _version: u32,
-    _flags: u32,
-    _nr_modules: u32,
-    _modlist: u64,
-    _cmdline: u64,
-    rsdp_paddr: u64,
-    memmap_paddr: u64,
-    memmap_entries: u32,
-    _reserved: u32,
+struct TagHeader {
+    ty: u32,
+    size: u32,
 }
 
 #[repr(C)]
 #[derive(Copy, Clone)]
-struct MemmapEntry {
-    addr: u64,
-    size: u64,
+struct MmapTagPrefix {
+    /// Tag header.
+    _hdr: TagHeader,
+    entry_size: u32,
+    entry_version: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct MmapEntry {
+    base_addr: u64,
+    length: u64,
     ty: u32,
     _reserved: u32,
 }
 
-/// Check whether the given physical address points at something that looks
-/// like an `hvm_start_info` (has the PVH magic at offset 0). Reads are
-/// done via `read_unaligned` so we never UB on a misaligned pointer.
-///
-/// # Safety
-/// `payload` must point at at least 4 bytes of readable memory.
-pub unsafe fn is_hvm_start_info(payload: PhysAddr) -> bool {
-    // SAFETY: caller promises 4-byte readability.
-    let magic = unsafe { (payload.raw() as *const u32).read_unaligned() };
-    magic == MAGIC
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct FramebufferTag {
+    _hdr: TagHeader,
+    addr: u64,
+    pitch: u32,
+    width: u32,
+    height: u32,
+    bpp: u8,
+    fb_type: u8,
+    _reserved: u16,
+    // colour-format fields follow; we don't decode them yet.
 }
 
-/// Read the RSDP physical address advertised in the PVH `hvm_start_info`
-/// struct. Returns `None` if the field is zero.
+/// Iterate the tag list. The `info_ptr` must point at a multiboot2
+/// information structure (`u32 total_size, u32 reserved` then tags).
 ///
-/// # Safety
-/// `info_ptr` must point at a valid `hvm_start_info`.
-pub unsafe fn rsdp_phys(info_ptr: usize) -> Option<u64> {
-    // SAFETY: caller-provided pointer to a valid PVH header.
-    let hdr = unsafe { (info_ptr as *const HvmStartInfo).read_unaligned() };
-    if hdr.magic != MAGIC || hdr.rsdp_paddr == 0 {
-        None
-    } else {
-        Some(hdr.rsdp_paddr)
+/// Returns `(type, size, payload_ptr)` for each tag up to (but not
+/// including) the END tag.
+struct TagIter {
+    cursor: usize,
+    end: usize,
+}
+
+impl TagIter {
+    /// # Safety
+    /// `info_ptr` must point at a valid multiboot2 information
+    /// structure with the trailing tag list still in memory.
+    unsafe fn new(info_ptr: usize) -> Self {
+        // SAFETY: caller-asserted readability of the 8-byte
+        // information-struct header.
+        let total = unsafe { (info_ptr as *const u32).read_unaligned() } as usize;
+        Self {
+            cursor: info_ptr + 8,
+            end: info_ptr + total,
+        }
     }
 }
 
-/// Walk the PVH `hvm_start_info` module-list and return the
-/// phys range of the first module whose cmdline is `"initramfs"`
-/// (case-insensitive). Returns `(start, size)` in bytes.
+impl Iterator for TagIter {
+    type Item = (u32, u32, usize);
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cursor + 8 > self.end {
+            return None;
+        }
+        // SAFETY: bounds-checked above.
+        let hdr = unsafe { (self.cursor as *const TagHeader).read_unaligned() };
+        if hdr.ty == TAG_END {
+            return None;
+        }
+        let payload = self.cursor + 8;
+        let stride = ((hdr.size as usize) + 7) & !7;
+        self.cursor += stride.max(8);
+        Some((hdr.ty, hdr.size, payload))
+    }
+}
+
+/// Walk the information struct and write up to `out_cap` parsed
+/// memory regions. Returns the count written (0 if the mmap tag is
+/// missing).
 ///
-/// PVH `hvm_modlist_entry` layout (32 bytes, little-endian):
+/// # Safety
+/// - `info_ptr` must point at a valid multiboot2 info struct.
+/// - `out` must be writable for `out_cap` `MemRegion` entries.
+pub unsafe fn parse_memory_map(info_ptr: usize, out: *mut MemRegion, out_cap: usize) -> usize {
+    if out_cap == 0 {
+        return 0;
+    }
+    // SAFETY: caller contract.
+    for (ty, size, payload) in unsafe { TagIter::new(info_ptr) } {
+        if ty != TAG_MMAP {
+            continue;
+        }
+        // SAFETY: tag bounded by total_size; we read the prefix and
+        // then iterate entries up to (size - 16) / entry_size.
+        let prefix = unsafe {
+            ((payload - 8) as *const MmapTagPrefix).read_unaligned()
+        };
+        if prefix.entry_size as usize == 0 {
+            return 0;
+        }
+        let body = payload + 8; // skip entry_size + entry_version
+        let body_len = (size as usize).saturating_sub(16);
+        let n = (body_len / prefix.entry_size as usize).min(out_cap);
+        for i in 0..n {
+            let entry_ptr = body + i * prefix.entry_size as usize;
+            // SAFETY: bounds-checked.
+            let e = unsafe { (entry_ptr as *const MmapEntry).read_unaligned() };
+            let kind = match e.ty {
+                1 => MemRegionKind::Usable,
+                3 => MemRegionKind::AcpiReclaimable,
+                4 => MemRegionKind::AcpiNvs,
+                _ => MemRegionKind::Reserved,
+            };
+            // SAFETY: out is valid for out_cap entries and i < out_cap.
+            unsafe {
+                out.add(i).write(MemRegion {
+                    start: PhysAddr::new(e.base_addr),
+                    len: e.length,
+                    kind,
+                });
+            }
+        }
+        return n;
+    }
+    0
+}
+
+/// Return the RSDP physical address. Prefers the ACPI v2+ tag (15)
+/// over the v1 tag (14); both carry an embedded RSDP whose `rsdt_addr`
+/// (v1) or `xsdt_addr` (v2) field is what callers actually want, but
+/// the ACPI parser walks an RSDP, so we hand back the *embedded
+/// RSDP's* phys address (= payload + 0).
+///
+/// # Safety
+/// `info_ptr` must point at a valid multiboot2 info struct.
+pub unsafe fn rsdp_phys(info_ptr: usize) -> Option<u64> {
+    let mut v1: Option<u64> = None;
+    // SAFETY: caller contract.
+    for (ty, _size, payload) in unsafe { TagIter::new(info_ptr) } {
+        match ty {
+            TAG_ACPI_NEW_RSDP => return Some(payload as u64),
+            TAG_ACPI_OLD_RSDP => v1 = Some(payload as u64),
+            _ => {}
+        }
+    }
+    v1
+}
+
+/// Walk the module list and return the first module whose cmdline is
+/// `"initramfs"` (case-insensitive). Returns `(start, size)` in bytes.
+///
+/// Module tag layout (after the 8-byte header):
 ///
 /// ```text
 /// offset  field          type
-/// 0x00    paddr          u64
-/// 0x08    size           u64
-/// 0x10    cmdline_paddr  u64
-/// 0x18    reserved       u64
+/// 0x00    mod_start      u32
+/// 0x04    mod_end        u32
+/// 0x08    string         u8[] (NUL-terminated, padded to 8-byte align)
 /// ```
 ///
-/// `cmdline_paddr` is 0 when the bootloader supplied no cmdline,
-/// in which case the entry is skipped. `nr_modules == 0` returns
-/// `None` immediately.
-///
 /// # Safety
-/// - `info_ptr` must point at a valid `hvm_start_info` whose magic
-///   matches the PVH constant.
-/// - The modlist + each cmdline string must be readable for the
-///   bytes they describe (bootloader contract).
+/// `info_ptr` must point at a valid multiboot2 info struct; each
+/// module's string must be NUL-terminated within the tag's `size`.
 pub unsafe fn initramfs_module(info_ptr: usize) -> Option<(u64, u64)> {
-    // SAFETY: caller-provided pointer to a valid PVH header.
-    let hdr = unsafe { (info_ptr as *const HvmStartInfo).read_unaligned() };
-    if hdr.magic != MAGIC || hdr._nr_modules == 0 || hdr._modlist == 0 {
-        return None;
-    }
-    let n = hdr._nr_modules as usize;
-    for i in 0..n {
-        let entry_ptr = hdr._modlist as usize + i * core::mem::size_of::<HvmModlistEntry>();
-        // SAFETY: bootloader contract guarantees `n` valid
-        // entries at `modlist_paddr`.
-        let e = unsafe { (entry_ptr as *const HvmModlistEntry).read_unaligned() };
-        if e.cmdline_paddr == 0 {
+    // SAFETY: caller contract.
+    for (ty, size, payload) in unsafe { TagIter::new(info_ptr) } {
+        if ty != TAG_MODULE {
             continue;
         }
-        // SAFETY: cmdline is a NUL-terminated ASCII string at
-        // `cmdline_paddr` per the PVH spec. We bound the scan at
-        // 256 bytes; "initramfs" fits in 9 + NUL.
-        let cmd = unsafe { read_cstr(e.cmdline_paddr as usize, 256) };
+        if (size as usize) < 16 {
+            continue;
+        }
+        // SAFETY: bounds-checked.
+        let mod_start = unsafe { (payload as *const u32).read_unaligned() } as u64;
+        let mod_end = unsafe { ((payload + 4) as *const u32).read_unaligned() } as u64;
+        let str_start = payload + 8;
+        let str_max = (size as usize).saturating_sub(16);
+        // SAFETY: string lives within the tag.
+        let cmd = unsafe { read_cstr(str_start, str_max) };
         if cmd.eq_ignore_ascii_case(b"initramfs") {
-            return Some((e.paddr, e.size));
+            let len = mod_end.saturating_sub(mod_start);
+            return Some((mod_start, len));
         }
     }
     None
 }
 
-/// Read a NUL-terminated ASCII string from phys + bound the
-/// length at `max`. Returned slice borrows from physical memory;
-/// caller must drop it before the bootloader's reserved
-/// region can be reclaimed.
+/// Walk the framebuffer tag (type 8). Returns `None` when the
+/// bootloader didn't supply one or the format isn't a packed
+/// linear RGB framebuffer (`fb_type == 1`).
 ///
+/// # Safety
+/// `info_ptr` must point at a valid multiboot2 info struct.
+pub unsafe fn framebuffer(info_ptr: usize) -> Option<FramebufferInfo> {
+    // SAFETY: caller contract.
+    for (ty, _size, payload) in unsafe { TagIter::new(info_ptr) } {
+        if ty != TAG_FRAMEBUFFER {
+            continue;
+        }
+        // SAFETY: tag covers `FramebufferTag` minus the colour-format trailer.
+        let fb = unsafe { ((payload - 8) as *const FramebufferTag).read_unaligned() };
+        if fb.fb_type != 1 {
+            // Type 0 is indexed colour, type 2 is EGA text — the kernel
+            // framebuffer console assumes packed RGB.
+            return None;
+        }
+        return Some(FramebufferInfo {
+            addr: PhysAddr::new(fb.addr),
+            width: fb.width,
+            height: fb.height,
+            pitch: fb.pitch,
+            bpp: fb.bpp,
+        });
+    }
+    None
+}
+
 /// # Safety
 /// `phys + max` must be readable.
 unsafe fn read_cstr<'a>(phys: usize, max: usize) -> &'a [u8] {
@@ -158,51 +275,4 @@ unsafe fn read_cstr<'a>(phys: usize, max: usize) -> &'a [u8] {
     }
     // SAFETY: same readability contract; len ≤ max.
     unsafe { core::slice::from_raw_parts(phys as *const u8, len) }
-}
-
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct HvmModlistEntry {
-    paddr: u64,
-    size: u64,
-    cmdline_paddr: u64,
-    _reserved: u64,
-}
-
-/// Walk the `hvm_start_info` at `info_ptr`, writing up to `out_cap` parsed
-/// memory regions into `out`. Returns the count written.
-///
-/// # Safety
-/// - `info_ptr` must point at a valid `hvm_start_info`.
-/// - `out` must be writable for `out_cap` `MemRegion` entries.
-pub unsafe fn parse_memory_map(info_ptr: usize, out: *mut MemRegion, out_cap: usize) -> usize {
-    // SAFETY: caller guarantees a valid hvm_start_info at info_ptr.
-    let hdr = unsafe { (info_ptr as *const HvmStartInfo).read_unaligned() };
-    if hdr.magic != MAGIC || out_cap == 0 {
-        return 0;
-    }
-    let count = (hdr.memmap_entries as usize).min(out_cap);
-    let base = hdr.memmap_paddr as usize;
-
-    for i in 0..count {
-        let entry_ptr = base + i * core::mem::size_of::<MemmapEntry>();
-        // SAFETY: caller contract: memmap covers
-        // `memmap_entries * sizeof(MemmapEntry)` bytes of valid memory.
-        let e = unsafe { (entry_ptr as *const MemmapEntry).read_unaligned() };
-        let kind = match e.ty {
-            1 => MemRegionKind::Usable,
-            3 => MemRegionKind::AcpiReclaimable,
-            4 => MemRegionKind::AcpiNvs,
-            _ => MemRegionKind::Reserved,
-        };
-        // SAFETY: out valid for out_cap MemRegions; i < count <= out_cap.
-        unsafe {
-            out.add(i).write(MemRegion {
-                start: PhysAddr::new(e.addr),
-                len: e.size,
-                kind,
-            });
-        }
-    }
-    count
 }

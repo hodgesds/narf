@@ -1,6 +1,7 @@
-//! x86_64 multiboot2 handoff.
+//! x86_64 boot-protocol handoffs (PVH + multiboot2).
 
 pub mod multiboot2;
+pub mod pvh;
 
 use narf_memory::{PhysAddr, VirtAddr};
 
@@ -31,25 +32,38 @@ static CMDLINE: &str = "";
 /// Caller must supply the exact `RawBootInfo` the bootloader left in the
 /// entry registers; reading from a random pointer is undefined.
 pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
-    // PVH doesn't set EAX to any documented magic, so we discriminate on
-    // the *payload's* content: if it has the `hvm_start_info` magic at
-    // offset 0 we parse that. The EAX-provided magic is unused today
-    // and will regain meaning when Limine / Multiboot2 is wired in.
-    // SAFETY: the bootloader contract guarantees at least 4 bytes of
-    // readable memory at `payload`.
-    let is_pvh = unsafe { multiboot2::is_hvm_start_info(raw.payload) };
-    if !is_pvh {
-        return Err(BootError::BadMagic);
-    }
+    // Two protocols share `_start` (see frame/src/x86_64/boot.S):
+    //   - Multiboot2: EAX = 0x36d76289, EBX = phys(mbi).
+    //   - PVH:        EAX = undefined,  EBX = phys(hvm_start_info).
+    // Discriminate first on the magic; fall back to the payload-magic
+    // probe so PVH (which doesn't set a documented EAX) still works.
+    let info_ptr = raw.payload.raw() as usize;
+    let proto = if raw.magic == multiboot2::BOOT_MAGIC {
+        Protocol::Multiboot2
+    } else {
+        // SAFETY: bootloader contract guarantees ≥ 4 bytes of readable
+        // memory at the payload pointer.
+        if unsafe { pvh::is_hvm_start_info(raw.payload) } {
+            Protocol::Pvh
+        } else {
+            return Err(BootError::BadMagic);
+        }
+    };
 
-    // SAFETY: bootloader contract — the payload pointer targets an
-    // hvm_start_info with the documented trailing memmap buffer.
+    // SAFETY: payload pointer + protocol determined above.
     let count = unsafe {
-        multiboot2::parse_memory_map(
-            raw.payload.raw() as usize,
-            core::ptr::addr_of_mut!(MEMORY_MAP).cast::<MemRegion>(),
-            MAX_MEM_REGIONS,
-        )
+        match proto {
+            Protocol::Pvh => pvh::parse_memory_map(
+                info_ptr,
+                core::ptr::addr_of_mut!(MEMORY_MAP).cast::<MemRegion>(),
+                MAX_MEM_REGIONS,
+            ),
+            Protocol::Multiboot2 => multiboot2::parse_memory_map(
+                info_ptr,
+                core::ptr::addr_of_mut!(MEMORY_MAP).cast::<MemRegion>(),
+                MAX_MEM_REGIONS,
+            ),
+        }
     };
 
     // SAFETY: `count` is the return value from the parser; we write to the
@@ -59,7 +73,7 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
     }
 
     // Minimum Wave-1 validation: at least one Usable region with ≥ 1 MiB.
-    // SAFETY: MEMORY_MAP[..count] was initialised by parse_memory_map.
+    // SAFETY: MEMORY_MAP[..count] was initialised by the parser above.
     let regions = unsafe {
         core::slice::from_raw_parts(core::ptr::addr_of!(MEMORY_MAP).cast::<MemRegion>(), count)
     };
@@ -70,17 +84,22 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
         return Err(BootError::NoUsableRam);
     }
 
-    // SAFETY: PVH header validated above.
-    let rsdp = unsafe { multiboot2::rsdp_phys(raw.payload.raw() as usize) }.map(PhysAddr::new);
+    // SAFETY: payload validated above by the protocol probe.
+    let rsdp = unsafe {
+        match proto {
+            Protocol::Pvh => pvh::rsdp_phys(info_ptr),
+            Protocol::Multiboot2 => multiboot2::rsdp_phys(info_ptr),
+        }
+    }
+    .map(PhysAddr::new);
 
-    // Initramfs handoff: scan the multiboot2 module-list for a
-    // module whose cmdline is `"initramfs"` (case-insensitive).
-    // PVH boots reuse the same `hvm_modlist_entry` shape via the
-    // multiboot2 stub, so a single parser path covers both. The
-    // module's `start` is 4-KiB-aligned by the bootloader; we
-    // keep it as-is here and let `narf-initramfs` enforce that
-    // invariant before staging.
-    let initramfs = scan_initramfs_module(raw);
+    let initramfs = scan_initramfs_module(raw, proto);
+    let framebuffer = match proto {
+        // SAFETY: payload validated above.
+        Protocol::Multiboot2 => unsafe { multiboot2::framebuffer(info_ptr) },
+        // PVH doesn't carry framebuffer info today.
+        Protocol::Pvh => None,
+    };
 
     Ok(BootInfo {
         memory_map: regions,
@@ -90,24 +109,36 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
         dtb_phys: None,
         acpi_rsdp_phys: rsdp,
         initramfs,
-        framebuffer: None,
+        framebuffer,
     })
 }
 
-/// Scan the PVH `hvm_start_info` module-list for the first
-/// entry whose cmdline is `"initramfs"` (case-insensitive).
-/// Returns the module's phys range as a `MemRegion` of kind
-/// `Reserved` (initramfs lives outside Usable RAM by spec). `None`
-/// when no matching module is present, when the bootloader didn't
-/// pass PVH magic, or when the info pointer is null.
-fn scan_initramfs_module(raw: &crate::RawBootInfo) -> Option<MemRegion> {
+#[derive(Copy, Clone)]
+enum Protocol {
+    Pvh,
+    Multiboot2,
+}
+
+/// Scan the bootloader-provided module list for the first entry
+/// whose cmdline is `"initramfs"` (case-insensitive). Both PVH
+/// (`hvm_modlist_entry`) and multiboot2 (tag type 3) are supported;
+/// the per-protocol parsers in `pvh::initramfs_module` /
+/// `multiboot2::initramfs_module` differ in tag layout but return
+/// the same `(start, size)` shape.
+fn scan_initramfs_module(raw: &crate::RawBootInfo, proto: Protocol) -> Option<MemRegion> {
     if raw.payload.raw() == 0 {
         return None;
     }
-    // SAFETY: bootloader contract — `raw.payload` points at a
-    // valid `hvm_start_info`; magic mismatch returns `None` from
-    // the parser without dereferencing modlist memory.
-    let (start, size) = unsafe { multiboot2::initramfs_module(raw.payload.raw() as usize)? };
+    let info_ptr = raw.payload.raw() as usize;
+    // SAFETY: bootloader contract — `raw.payload` points at a valid
+    // info struct of the matching protocol; magic mismatch returns
+    // `None` from the parser without dereferencing modlist memory.
+    let (start, size) = unsafe {
+        match proto {
+            Protocol::Pvh => pvh::initramfs_module(info_ptr)?,
+            Protocol::Multiboot2 => multiboot2::initramfs_module(info_ptr)?,
+        }
+    };
     if size == 0 {
         return None;
     }

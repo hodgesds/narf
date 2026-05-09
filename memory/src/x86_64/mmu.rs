@@ -74,13 +74,21 @@ pub const HIGHER_HALF_PDPT_INDEX: usize = 510;
 ///   be covered by the identity map being built (currently the low
 ///   4 GiB + the high-half -2 GiB window).
 pub unsafe fn init_mmu() -> Result<PhysAddr, MmuError> {
-    // Step 1: allocate and zero a PML4 + PDPT (for low identity) +
-    // another PDPT for the high-half window.
+    // Step 1: allocate + zero the page tables we'll populate:
+    // - PML4 root
+    // - PDPT for low identity (PML4[0]: virt 0 → phys 0, 4 GiB)
+    // - PDPT for high-MMIO identity (PML4[1]: virt 512 GiB → phys
+    //   512 GiB, 512 GiB). Lets us reach 64-bit BARs that UEFI
+    //   firmware places between 512 GiB and 1 TiB without
+    //   colliding with low-half test virtual addresses.
+    // - PDPT for the high-half kernel window (PML4[511])
     let pml4_frame = alloc_frame()?;
     let pdpt_lo_frame = alloc_frame()?;
+    let pdpt_hi_mmio_frame = alloc_frame()?;
     let pdpt_hi_frame = alloc_frame()?;
     let pml4_addr = pml4_frame.start_address();
     let pdpt_lo_addr = pdpt_lo_frame.start_address();
+    let pdpt_hi_mmio_addr = pdpt_hi_mmio_frame.start_address();
     let pdpt_hi_addr = pdpt_hi_frame.start_address();
 
     // These frames came from the allocator and are identity-mapped in
@@ -88,6 +96,7 @@ pub unsafe fn init_mmu() -> Result<PhysAddr, MmuError> {
     // so the raw pointer is valid for a 4 KiB write.
     PageTable::zero_at(pml4_addr.as_mut_ptr::<PageTable>());
     PageTable::zero_at(pdpt_lo_addr.as_mut_ptr::<PageTable>());
+    PageTable::zero_at(pdpt_hi_mmio_addr.as_mut_ptr::<PageTable>());
     PageTable::zero_at(pdpt_hi_addr.as_mut_ptr::<PageTable>());
 
     // Step 2: populate.
@@ -103,6 +112,33 @@ pub unsafe fn init_mmu() -> Result<PhysAddr, MmuError> {
             let phys = PhysAddr::new(gib << 30);
             let entry = PageTableEntry::new(phys, flags_1gb);
             let slot = PhysAddr::new(pdpt_lo_addr.raw() + gib * 8);
+            write_identity::<PageTableEntry>(slot, entry);
+        }
+
+        // High-MMIO identity (PML4[1]: virt 512 GiB ≤ V < 1 TiB →
+        // phys 512 GiB ≤ P < 1 TiB). Covers UEFI-assigned 64-bit
+        // BARs whose phys address sits above the low-4 GiB window.
+        // OVMF on QEMU q35 places NVMe / virtio-PCI BARs around
+        // phys 0xC0_0000_0000 (768 GiB); on real consumer hardware
+        // the BARs typically sit between 0x80_0000_0000 and
+        // 0xFE_0000_0000.
+        //
+        // PDPT[0] of this PML4 slot is reserved: user-mode binaries
+        // (init / shell / testbin) link at virt
+        // 0x0000_0080_0000_1000 which decodes to PML4[1] PDPT[0]
+        // PD[0] PT[1]. Mapping PDPT[0] as a 1-GiB huge page would
+        // collide with the user `materialize`'s 4-KiB descent.
+        // Skipping it costs nothing — phys 512 GiB ≤ P < 513 GiB
+        // is RAM territory in any sane laptop, never MMIO.
+        let pml4_hi_mmio_entry = PageTableEntry::new(pdpt_hi_mmio_addr, flags_ptr);
+        let pml4_hi_mmio_slot = PhysAddr::new(pml4_addr.raw() + 1 * 8);
+        write_identity::<PageTableEntry>(pml4_hi_mmio_slot, pml4_hi_mmio_entry);
+        for gib in 1u64..512 {
+            // Each PDPT entry covers virt 512 GiB + gib * 1 GiB,
+            // identity-mapped to the matching phys.
+            let phys = PhysAddr::new((512 + gib) << 30);
+            let entry = PageTableEntry::new(phys, flags_1gb);
+            let slot = PhysAddr::new(pdpt_hi_mmio_addr.raw() + gib * 8);
             write_identity::<PageTableEntry>(slot, entry);
         }
 

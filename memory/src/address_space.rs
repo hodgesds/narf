@@ -104,10 +104,8 @@ impl AddressSpace {
     /// root (aarch64) inheriting every kernel-half entry from the
     /// currently-active root. The returned `AddressSpace` can be
     /// populated with user regions via `map_region` and activated
-    /// via `activate()` — which on x86_64 is now a real `MOV CR3`.
-    ///
-    /// aarch64 returns `NotImplemented` until the TTBR0 primitive
-    /// lands in `memory/src/aarch64/paging.rs`.
+    /// via `activate()` (real `MOV CR3` on x86_64; real
+    /// `MSR TTBR0_EL1` on aarch64).
     ///
     /// # Safety
     /// Caller must run with paging enabled. Post-construction the
@@ -194,9 +192,8 @@ impl AddressSpace {
     }
 
     /// Materialise all pending regions into actual page-table entries.
-    /// On x86_64 walks each region's pages and calls `map_4kb` on the
-    /// AS's PML4 root; on aarch64 returns `NotImplemented` until the
-    /// 4 KiB map primitive lands.
+    /// Walks each region's pages and calls `map_4kb` on the AS's
+    /// root translation table — PML4 on x86_64, L0 on aarch64.
     ///
     /// # Safety
     /// The AS must have been constructed via `new_for_user` (so
@@ -525,14 +522,26 @@ impl AddressSpace {
 
     /// Make this address-space the active one. On x86_64 issues a
     /// `MOV CR3` with the right `compiler_fence` discipline; on
-    /// aarch64 returns `NotImplemented` until the TTBR0_EL1
-    /// primitive lands.
+    /// aarch64 issues `MSR TTBR0_EL1` with the architected
+    /// MSR + DSB + TLBI + ISB sequence (see
+    /// `aarch64::paging::write_ttbr0_el1`).
     ///
     /// # Safety invariants (x86_64)
     /// - `self.root` must have been constructed via `new_for_user`,
     ///   which copies the currently-active kernel-half entries.
     ///   Activating a PML4 without kernel mappings triple-faults
     ///   on the next instruction fetch.
+    ///
+    /// # Safety invariants (aarch64)
+    /// - `self.root` must point at a valid L0 table (the only
+    ///   safe path is `new_for_user` → `new_user_ttbr0`).
+    /// - The kernel must run on a TTBR1-resolved stack and
+    ///   reach all phys-as-virt sites through `kernel_ptr` /
+    ///   `kernel_mut_ptr`. Both invariants land at boot — the
+    ///   `_start_rust_entry` switch to `stack_top_virt` and the
+    ///   tree-wide migration of phys-as-virt accessors —
+    ///   so callers in the Stage-4 scheduler / fork path don't
+    ///   need to re-establish them.
     pub fn activate(&self) -> Result<(), AddressSpaceError> {
         if self.root.as_u64() == 0 {
             return Err(AddressSpaceError::OutOfRange);

@@ -1,8 +1,42 @@
 /*
  * NARF x86_64 boot stub.
  *
- * Multiboot2 entry → long mode → _start_rust(magic: u64, payload: u64).
+ * Two entry protocols share `_start`:
+ *
+ *   1. Xen PVH (`.note.Xen` ELFNOTE 18) — QEMU `-kernel` direct boot.
+ *      Loader sets EBX = phys(`hvm_start_info`); EAX is undefined, so
+ *      the Rust side discriminates by reading the `xEn3` magic from
+ *      the payload itself.
+ *   2. Multiboot2 (`.multiboot2_header` in the first 32 KiB of the
+ *      file) — Limine, GRUB, and any other multiboot2-aware loader.
+ *      Loader sets EAX = 0x36d76289 and EBX = phys(mbi struct).
+ *
+ * The code in `_start` doesn't need to know which protocol it was
+ * launched under: it just stashes EAX + EBX in (RDI, RSI) for
+ * `_start_rust`, which routes on the magic.
  */
+
+/* ─── Multiboot2 header ────────────────────────────────────────────
+ *
+ * Spec: <https://www.gnu.org/software/grub/manual/multiboot2/>
+ * §3.1 — header layout. Must be 8-byte aligned and in the first
+ * 32 KiB of the file. Placed at the very start of the `.boot`
+ * section so the file offset is small.
+ */
+.section .multiboot2_header, "a"
+.align 8
+mb2_header_start:
+    .long 0xe85250d6                                /* magic       */
+    .long 0                                          /* arch i386   */
+    .long mb2_header_end - mb2_header_start          /* hdr length  */
+    .long -(0xe85250d6 + 0 + (mb2_header_end - mb2_header_start)) /* checksum */
+
+    /* End tag — type 0, flags 0, size 8. */
+    .align 8
+    .short 0
+    .short 0
+    .long 8
+mb2_header_end:
 
 .section .note.Xen, "a"
 .align 4

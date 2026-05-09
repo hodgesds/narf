@@ -207,6 +207,19 @@ pub unsafe fn new_user_pml4_on(node: usize) -> Result<PhysAddr, PageTableAllocEr
         );
     }
 
+    // Clear PML4[1] in the user copy. The kernel uses PML4[1] for
+    // its high-MMIO identity window (virt 512 GiB ≤ V < 1 TiB); if
+    // the entry survived the bulk copy, every user `materialize`
+    // would write its 4-KiB descents into the kernel-shared PDPT
+    // (cross-process mapping pollution). User binaries link in this
+    // same PML4[1] slot anyway (start at virt 0x0000_0080_0000_1000),
+    // so a clean slate is the right starting state.
+    // SAFETY: `phys` is identity-mapped; the slot lives at offset
+    // 1 * 8 = 8 bytes into the freshly-copied PML4 page.
+    unsafe {
+        ptr::write_volatile((phys.raw() + 1 * 8) as *mut u64, 0);
+    }
+
     Ok(phys)
 }
 
