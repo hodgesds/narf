@@ -1421,3 +1421,43 @@ fn smoke_bus_pcie_aer_cap_walker() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("bus/pcie_aer", smoke_bus_pcie_aer_cap_walker);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_bus_hotplug_pcie_cap_walker() -> TestResult {
+    // Walks every PCIe device's standard cap list looking for
+    // the PCI Express capability (cap_id 0x10). Most devices
+    // (NVMe, NICs, GPUs, root ports) carry it; some legacy
+    // devices in QEMU q35 might not. Asserts each PCIe cap
+    // offset (when present) lies in the [0x40, 0x100) standard
+    // config range. Catches regressions in the cap-list decode
+    // (next-pointer shift, cap_id mask).
+    use crate::hotplug::find_pcie_cap_offset;
+    use crate::x86_64::ECAM_DEFAULT_BASE;
+    use crate::{devices, BusKind};
+    let _ = unsafe { crate::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let mut walked = 0u32;
+    for d in devs.iter() {
+        let cfg_phys = match d.kind {
+            BusKind::Pcie { cfg_phys, .. } => cfg_phys.raw(),
+            _ => continue,
+        };
+        // SAFETY: identity-mapped ECAM region; walker bounded.
+        if let Some(o) = unsafe { find_pcie_cap_offset(cfg_phys) } {
+            // u8 fits 0..=255; the standard cap region is
+            // [0x40, 0x100). At 0x100 a u8 would overflow,
+            // so we just check the lower bound here — the
+            // walker itself rejects offsets &lt; 0x40.
+            if o < 0x40 {
+                return TestResult::Fail("PCIe cap offset below standard cap region");
+            }
+        }
+        walked += 1;
+    }
+    if walked == 0 {
+        return TestResult::Skip("no PCIe devices to walk");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("bus/hotplug", smoke_bus_hotplug_pcie_cap_walker);

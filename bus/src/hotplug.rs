@@ -187,3 +187,200 @@ pub fn install_default_dispatcher() -> Result<(), HotplugError> {
     let auth = crate::registry::bootstrap_registry_authority();
     register_listener(&auth, Arc::new(DefaultDispatcher))
 }
+
+// ── PCIe Express cap walker + slot-control surface ─────────────────
+//
+// PCIe hot-plug lives behind the device's PCI Express capability
+// (cap_id 0x10) in the standard cap list at config offset 0x34
+// (Capabilities Pointer). Within the PCIe cap:
+//   +0x14 : Slot Capabilities (DW)  — bit 6 = HotPlugCapable
+//   +0x18 : Slot Control       (W)  — interrupt-enable bits
+//   +0x1A : Slot Status        (W)  — W1C status bits (same layout)
+//
+// Spec: PCIe 6.0 §7.5.3 (PCI Express Capability Structure).
+
+/// PCI capability ID for PCI Express.
+pub const PCIE_CAP_ID: u8 = 0x10;
+
+/// PCIe cap register offsets (relative to the start of the PCIe
+/// capability block).
+pub mod pcie_cap {
+    pub const SLOT_CAPABILITIES: u16 = 0x14;
+    pub const SLOT_CONTROL: u16 = 0x18;
+    pub const SLOT_STATUS: u16 = 0x1A;
+}
+
+/// Slot Capabilities bits we care about.
+pub mod slot_cap {
+    /// HotPlugCapable — set when the slot can generate hot-plug
+    /// events (typically root ports + downstream switch ports).
+    pub const HOT_PLUG_CAPABLE: u32 = 1 << 6;
+}
+
+/// Slot Control / Slot Status bit positions (same layout for
+/// both — Control enables the events, Status reports them
+/// W1C-style).
+pub mod slot_bits {
+    pub const ATTENTION_BUTTON_PRESSED: u16 = 1 << 0;
+    pub const POWER_FAULT_DETECTED: u16 = 1 << 1;
+    pub const MRL_SENSOR_CHANGED: u16 = 1 << 2;
+    pub const PRESENCE_DETECT_CHANGED: u16 = 1 << 3;
+    pub const COMMAND_COMPLETED: u16 = 1 << 4;
+    /// Slot Control: master switch for hot-plug interrupt
+    /// generation. Per-event enable bits 0..4 only fire when
+    /// this is also set.
+    pub const HOT_PLUG_INTERRUPT_ENABLE: u16 = 1 << 5;
+}
+
+/// Walk the device's standard PCI cap list and return the
+/// offset of the PCI Express capability (cap_id 0x10), or
+/// `None` if the device doesn't carry one. Bounded at 48
+/// iterations.
+///
+/// # Safety
+/// `cfg_phys` must point at a 256-byte (or 4 KiB) PCI config
+/// region the CPU can reach.
+pub unsafe fn find_pcie_cap_offset(cfg_phys: u64) -> Option<u8> {
+    // SAFETY: caller-asserted live config space; offset 0x34 is
+    // the standard Capabilities Pointer.
+    let mut off = unsafe { core::ptr::read_volatile((cfg_phys + 0x34) as *const u8) };
+    for _ in 0..48 {
+        if off < 0x40 {
+            return None;
+        }
+        // SAFETY: offset bounded.
+        let header =
+            unsafe { core::ptr::read_volatile((cfg_phys + off as u64) as *const u16) };
+        if header == 0 || header == u16::MAX {
+            return None;
+        }
+        let cap_id = (header & 0xFF) as u8;
+        let next = ((header >> 8) & 0xFF) as u8;
+        if cap_id == PCIE_CAP_ID {
+            return Some(off);
+        }
+        if next == 0 {
+            return None;
+        }
+        off = next;
+    }
+    None
+}
+
+/// Read Slot Capabilities for a PCIe cap at `pcie_off`.
+///
+/// # Safety
+/// Caller-asserted live config space + valid PCIe cap offset.
+pub unsafe fn read_slot_capabilities(cfg_phys: u64, pcie_off: u8) -> u32 {
+    // SAFETY: caller assertion.
+    unsafe {
+        core::ptr::read_volatile(
+            (cfg_phys + pcie_off as u64 + pcie_cap::SLOT_CAPABILITIES as u64) as *const u32,
+        )
+    }
+}
+
+/// Read + W1C-clear Slot Status. Returns the bits that were
+/// set (and have now been cleared by the write).
+///
+/// # Safety
+/// Caller-asserted live config space + valid PCIe cap offset.
+pub unsafe fn read_and_clear_slot_status(cfg_phys: u64, pcie_off: u8) -> u16 {
+    // SAFETY: caller assertion.
+    let sts = unsafe {
+        core::ptr::read_volatile(
+            (cfg_phys + pcie_off as u64 + pcie_cap::SLOT_STATUS as u64) as *const u16,
+        )
+    };
+    if sts != 0 {
+        // SAFETY: same.
+        unsafe {
+            core::ptr::write_volatile(
+                (cfg_phys + pcie_off as u64 + pcie_cap::SLOT_STATUS as u64) as *mut u16,
+                sts,
+            );
+        }
+    }
+    sts
+}
+
+/// Read-modify-write Slot Control to OR in the requested bits
+/// (typically `HOT_PLUG_INTERRUPT_ENABLE | PRESENCE_DETECT_CHANGED`
+/// to enable presence-detect-driven hot-plug events).
+///
+/// # Safety
+/// Caller-asserted live config space + valid PCIe cap offset
+/// + caller owns the device exclusively.
+pub unsafe fn enable_slot_irqs(cfg_phys: u64, pcie_off: u8, bits: u16) {
+    // SAFETY: caller assertion.
+    unsafe {
+        let cur = core::ptr::read_volatile(
+            (cfg_phys + pcie_off as u64 + pcie_cap::SLOT_CONTROL as u64) as *const u16,
+        );
+        core::ptr::write_volatile(
+            (cfg_phys + pcie_off as u64 + pcie_cap::SLOT_CONTROL as u64) as *mut u16,
+            cur | bits,
+        );
+    }
+}
+
+/// Hot-plug ISR — runs in IRQ context. Walks every PCIe
+/// device, reads SlotStatus on every hot-plug-capable bridge,
+/// dispatches the corresponding `HotplugEvent` via the
+/// existing dispatcher.
+///
+/// Detach vs attach: PRESENCE_DETECT_CHANGED indicates a state
+/// transition; SlotStatus.PresenceDetectState (bit 6) tells us
+/// the new state. The dispatched event uses the bridge's own
+/// BusAddr as the slot identifier — consumers (the bus rescan
+/// path) re-probe to learn the new device's actual function.
+///
+/// Stateless re-walk on every fire — acceptable because hot-
+/// plug is rare. Caller wires this into a vector when MSI for
+/// the bridge is set up.
+pub fn hotplug_isr() {
+    use core::sync::atomic::Ordering;
+    for d in crate::devices().iter() {
+        let cfg_phys = match d.kind {
+            crate::BusKind::Pcie { cfg_phys, .. } => cfg_phys.raw(),
+            _ => continue,
+        };
+        // SAFETY: cfg_phys from ECAM enumeration; cap walker
+        // bounded.
+        let pcie_off = match unsafe { find_pcie_cap_offset(cfg_phys) } {
+            Some(o) => o,
+            None => continue,
+        };
+        // SAFETY: cap offset just validated.
+        let scap = unsafe { read_slot_capabilities(cfg_phys, pcie_off) };
+        if scap & slot_cap::HOT_PLUG_CAPABLE == 0 {
+            continue;
+        }
+        // SAFETY: same.
+        let sts = unsafe { read_and_clear_slot_status(cfg_phys, pcie_off) };
+        if sts & slot_bits::PRESENCE_DETECT_CHANGED != 0 {
+            HOTPLUG_EVENT_COUNT.fetch_add(1, Ordering::Relaxed);
+            // SAFETY: same.
+            let pd_state = unsafe {
+                core::ptr::read_volatile(
+                    (cfg_phys + pcie_off as u64 + pcie_cap::SLOT_STATUS as u64)
+                        as *const u16,
+                )
+            } & (1 << 6)
+                != 0;
+            if pd_state {
+                dispatch_event(HotplugEvent::Attach {
+                    addr: d.addr,
+                    device_id: d.id,
+                });
+            } else {
+                dispatch_event(HotplugEvent::Detach { addr: d.addr });
+            }
+        }
+    }
+}
+
+/// Hot-plug event count — bumped by `hotplug_isr` each time
+/// it observes a presence-detect change. Diagnostic.
+pub static HOTPLUG_EVENT_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
