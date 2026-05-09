@@ -213,10 +213,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     fb_info.height,
                     4u64 << 30,
                 );
-                // BUILD MARKER v3: slot 0 used to be RED in every
-                // prior ISO. If you see CYAN here, you have THIS
-                // build. If you still see RED, the burn didn't
-                // take (or your screen is rendering an older ISO).
+                // BUILD MARKER v4: a SOLID 32-px-tall PURPLE bar
+                // across the entire top of the screen. Painted
+                // before any per-slot beacon. If you don't see
+                // purple covering the whole top edge, this build
+                // isn't running.
+                narf_memory::beacon::paint_build_stripe(0x00800080); // PURPLE
                 narf_memory::beacon::paint(0, 0x0000FFFF); // CYAN — _start_rust alive
                 // Wire arch-side beacon hook to memory beacon
                 // facility so arch code (pcid::enable_pcide etc.)

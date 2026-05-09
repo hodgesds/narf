@@ -72,6 +72,35 @@ pub fn register(phys_addr: u64, stride_px: u32, width: u32, height: u32, phys_ce
     FB_PHYS_CEILING.store(phys_ceiling, Ordering::Release);
 }
 
+/// Paint a HUGE diagonal stripe across the FB — a build-marker
+/// of last resort. Covers the top 32 px × 1024 px so it's
+/// impossible to mistake for any per-slot beacon. Use a single
+/// distinctive color and bump it across builds to prove the
+/// running kernel matches what was just compiled.
+pub fn paint_build_stripe(color: u32) {
+    let phys = FB_PHYS.load(Ordering::Acquire);
+    if phys == 0 {
+        return;
+    }
+    let stride = FB_STRIDE_PX.load(Ordering::Acquire) as u64;
+    let width = FB_WIDTH.load(Ordering::Acquire);
+    let height = FB_HEIGHT.load(Ordering::Acquire);
+    let h: u32 = 32;
+    let y_max = h.min(height);
+    let x_max = width;
+    let base = phys as *mut u32;
+    for y in 0..y_max {
+        for x in 0..x_max {
+            let off = (y as u64) * stride + (x as u64);
+            // SAFETY: registrar asserts FB phys is identity-mapped
+            // and writable; bounds checked above.
+            unsafe {
+                base.add(off as usize).write_volatile(color);
+            }
+        }
+    }
+}
+
 /// Paint a colored square at horizontal slot `slot_idx` (top of FB).
 /// 32 × 16 px with 4 px gap; up to 32 slots in a 1024-px-wide FB.
 /// Skips silently if no FB is registered or the FB phys exceeds the
