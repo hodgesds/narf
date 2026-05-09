@@ -338,6 +338,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // long-mode CPUs; the bootloader-provided CR3's low bits
             // are zero.
             narf_memory::beacon::paint(25, 0x0000FFC0); // aqua: pre-PCID
+            // BUILD MARKER: bright RED at slot 33, painted right
+            // after slot 25 and BEFORE the call to enable_pcide.
+            // If you see RED here you're on this build (otherwise
+            // older ISO is on the USB stick).
+            narf_memory::beacon::paint(33, 0x00FF_0000);
             unsafe {
                 narf_arch::x86_64::pcid::enable_pcide();
                 narf_arch::x86_64::pcid::init();
