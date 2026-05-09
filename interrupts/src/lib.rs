@@ -41,6 +41,11 @@ pub const VECTOR_TIMER: u8 = 32;
 /// per-CPU shootdown slot then signals via x2APIC ICR all-but-self;
 /// the handler runs INVLPG and bumps an ack counter.
 pub const VECTOR_TLB_SHOOTDOWN: u8 = 0xF0;
+/// LAPIC error vector — programmed into LVT_ERROR. Reading
+/// IA32_X2APIC_ESR after writing 0 to it (Intel SDM Vol 3
+/// §11.5.3) reports which error bits latched. Diagnostic
+/// only — the kernel doesn't recover from APIC errors.
+pub const VECTOR_APIC_ERROR: u8 = 0xFE;
 pub const VECTOR_SPURIOUS: u8 = 0xFF;
 
 /// Send end-of-interrupt to the LAPIC.

@@ -34,6 +34,11 @@ const APIC_SIVR_MSR: u32 = 0x0000_080F;
 const APIC_LVT_TIMER_MSR: u32 = 0x0000_0832;
 const APIC_TIMER_INIT_MSR: u32 = 0x0000_0838;
 const APIC_TIMER_DIV_MSR: u32 = 0x0000_083E;
+/// LVT Error register (Intel SDM Vol 3 §10.5.1).
+const APIC_LVT_ERROR_MSR: u32 = 0x0000_0837;
+/// IA32_X2APIC_ESR — Error Status Register. Read after writing
+/// 0 to itself per Intel SDM §11.5.3.
+const APIC_ESR_MSR: u32 = 0x0000_0828;
 
 /// SIVR bit 8: APIC software enable.
 const SIVR_ENABLE: u64 = 1 << 8;
@@ -92,8 +97,52 @@ pub unsafe fn init_bsp() {
         );
         // Mask the timer explicitly until `start_timer` is called.
         wrmsr(APIC_LVT_TIMER_MSR, LVT_MASKED);
+        // LVT Error: program vector + unmask. The handler reads
+        // ESR for diagnostics. Spec: Intel SDM Vol 3 §10.5.1.
+        wrmsr(APIC_LVT_ERROR_MSR, super::super::VECTOR_APIC_ERROR as u64);
     }
+    install_apic_diag_handlers();
 }
+
+/// Install the diagnostic handlers for the APIC error +
+/// spurious vectors. Both run in IRQ context: ESR is sampled
+/// via the documented "write 0, read" sequence (Intel SDM
+/// §11.5.3); spurious is just counted via the dispatch
+/// fire-count infrastructure (no body needed).
+///
+/// Idempotent — installs the same handler pointers on every
+/// call. AP path doesn't need to install separately because
+/// the dispatch table is global, but each AP DOES need its
+/// own LVT_ERROR programmed (handled in init_ap).
+fn install_apic_diag_handlers() {
+    crate::dispatch::install(super::super::VECTOR_APIC_ERROR, apic_error_handler);
+    crate::dispatch::install(super::super::VECTOR_SPURIOUS, apic_spurious_handler);
+}
+
+fn apic_error_handler() {
+    // SDM §11.5.3: ESR latches errors but only updates on a
+    // write. Write 0, then read to drain.
+    // SAFETY: APIC is live; ESR MSR is well-defined.
+    let esr = unsafe {
+        wrmsr(APIC_ESR_MSR, 0);
+        rdmsr(APIC_ESR_MSR)
+    };
+    APIC_ERROR_LATCH.fetch_or(esr, core::sync::atomic::Ordering::Relaxed);
+    APIC_ERROR_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn apic_spurious_handler() {
+    APIC_SPURIOUS_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Diagnostic counters — public so tests / debug commands can
+/// observe latched APIC errors + spurious-vector deliveries.
+pub static APIC_ERROR_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static APIC_ERROR_LATCH: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static APIC_SPURIOUS_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 /// Start the LAPIC timer in periodic mode firing IRQ `timer_vector`.
 ///
@@ -246,6 +295,9 @@ pub unsafe fn init_ap() {
             SIVR_ENABLE | (super::super::VECTOR_SPURIOUS as u64),
         );
         wrmsr(APIC_LVT_TIMER_MSR, LVT_MASKED);
+        // LVT Error: per-CPU; APs need this independently of
+        // BSP since LVT MSRs are not shared.
+        wrmsr(APIC_LVT_ERROR_MSR, super::super::VECTOR_APIC_ERROR as u64);
     }
 }
 
