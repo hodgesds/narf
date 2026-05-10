@@ -344,13 +344,6 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // long-mode CPUs; the bootloader-provided CR3's low bits
             // are zero.
             narf_memory::beacon::paint(25, 0x0000FFC0); // aqua: pre-PCID
-            // BUILD MARKER: bright RED at slot 26 (right next to
-            // the aqua at slot 25). Painted BEFORE calling
-            // enable_pcide so its presence proves: (a) this build
-            // is what's running, (b) we reached this point.
-            // Earlier marker at slot 33 was off-screen on
-            // 1024-wide UEFI GOP defaults.
-            narf_memory::beacon::paint(26, 0x00FF_0000);
             unsafe {
                 narf_arch::x86_64::pcid::enable_pcide();
                 narf_arch::x86_64::pcid::init();
@@ -1107,21 +1100,34 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     }
                 }
 
-                // PCIe enumeration. Prefer the MCFG-derived ECAM
-                // base when ACPI was parsed; fall back to the QEMU
-                // q35 hardcoded default. SAFETY: ECAM base is
-                // identity-mapped; the walker only does
-                // naturally-aligned reads + rejects 0xFFFF vendors.
-                let ecam = narf_acpi::mcfg_ecam_base()
-                    .map(narf_memory::PhysAddr::new)
-                    .unwrap_or(narf_bus::x86_64::ECAM_DEFAULT_BASE);
-                let n_dev = unsafe { narf_bus::init(ecam) };
-                let _ = writeln!(
-                    console::Writer,
-                    "  bus: PCIe ECAM walk @ {:?} found {} function(s)",
-                    ecam,
-                    n_dev
-                );
+                // PCIe enumeration only when ACPI's MCFG actually
+                // tells us where ECAM lives. On hosts without MCFG
+                // (e.g. QEMU `-machine pc` / i440fx without
+                // explicit PCIe wiring) we used to fall back to the
+                // q35 hardcoded base 0xb000_0000 — which is
+                // unmapped or backed by random RAM there, so the
+                // walker would return phantom devices and any
+                // subsequent driver probe could hang.
+                //
+                // No-MCFG → skip enumeration. No PCIe devices, no
+                // probes. Drivers' Stage::Device initcalls then
+                // see nothing registered and return NotPresent, per
+                // the no-block-on-missing-hardware rule.
+                if let Some(ecam_phys) = narf_acpi::mcfg_ecam_base() {
+                    let ecam = narf_memory::PhysAddr::new(ecam_phys);
+                    let n_dev = unsafe { narf_bus::init(ecam) };
+                    let _ = writeln!(
+                        console::Writer,
+                        "  bus: PCIe ECAM walk @ {:?} found {} function(s)",
+                        ecam,
+                        n_dev
+                    );
+                } else {
+                    let _ = writeln!(
+                        console::Writer,
+                        "  bus: PCIe enumeration skipped — no ACPI MCFG (legacy host?)"
+                    );
+                }
 
                 // SMP CPU count: prefer MADT (canonical APIC
                 // enumeration), then SRAT (covers multi-socket
@@ -1995,8 +2001,21 @@ fn run_async_demo() -> ! {
     }
     let _ = writeln!(
         console::Writer,
-        "  halting — Stage 1 exit-gate demo complete."
+        "  halting — Stage 1 exit-gate demo complete. (5s pause so the screen can be read)"
     );
+
+    // TSC-based busy-wait: synchronous (we're at end-of-boot,
+    // executor not running for an async sleep). 5 GHz × 5s =
+    // 2.5e10 cycles is the pad — runs faster on slower CPUs,
+    // never longer than ~5s on a 5 GHz core.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let start = unsafe { core::arch::x86_64::_rdtsc() };
+        let target = start.wrapping_add(25_000_000_000u64);
+        while unsafe { core::arch::x86_64::_rdtsc() } < target {
+            core::hint::spin_loop();
+        }
+    }
 
     // SAFETY: exit_kernel is infallible; on QEMU it exits cleanly via
     // the isa-debug-exit device (x86_64) or semihosting (aarch64); on

@@ -68,12 +68,38 @@ static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 /// - Must run on the BSP, exactly once.
 /// - CPUID must confirm x2APIC; caller gates on `Features::probe`.
 /// - Interrupts are assumed disabled at the call site.
+/// Set true by `init_bsp` only after the IA32_APIC_BASE.EXTD bit
+/// is verified to have stuck. QEMU TCG's qemu64 model advertises
+/// x2APIC in CPUID but the EXTD WRMSR is a silent no-op there; we
+/// can't trust CPUID alone. Other LAPIC entry points check this
+/// flag before doing x2APIC MSR writes that would otherwise #GP.
+pub static X2APIC_ACTIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 pub unsafe fn init_bsp() {
     // SAFETY: caller confirmed x2APIC support via CPUID.
+    // Two-step enable (some AMD silicon won't accept EN+EXTD in
+    // a single WRMSR — needs APIC enabled first, then EXTD).
     let base = unsafe { rdmsr(IA32_APIC_BASE) };
-    unsafe {
-        wrmsr(IA32_APIC_BASE, base | APIC_BASE_EN | APIC_BASE_EXTD);
+    if base & APIC_BASE_EN == 0 {
+        // SAFETY: enabling APIC is always safe at CPL=0.
+        unsafe {
+            wrmsr(IA32_APIC_BASE, base | APIC_BASE_EN);
+        }
     }
+    let after_en = unsafe { rdmsr(IA32_APIC_BASE) };
+    // SAFETY: separately set EXTD (x2APIC mode).
+    unsafe {
+        wrmsr(IA32_APIC_BASE, after_en | APIC_BASE_EXTD);
+    }
+    // Verify x2APIC actually came up. Skip the rest of init if
+    // not — kernel can boot without LAPIC IRQs (timer driven by
+    // TSC busy-wait, drivers fall back to polling).
+    let confirm = unsafe { rdmsr(IA32_APIC_BASE) };
+    if confirm & APIC_BASE_EXTD == 0 {
+        return;
+    }
+    X2APIC_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
 
     // Mask every IRQ on both 8259 PICs. This is the legacy-PIC
     // compatible way of saying "I don't want any interrupts from
@@ -153,6 +179,9 @@ pub static APIC_SPURIOUS_COUNT: core::sync::atomic::AtomicU64 =
 /// # Safety
 /// `init_bsp` must have run; caller still owns IRQ masking.
 pub unsafe fn start_timer(timer_vector: u8, initial_count: u32) {
+    if !X2APIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
     // SAFETY: APIC is enabled by init_bsp.
     unsafe {
         wrmsr(APIC_TIMER_DIV_MSR, DIV_16);
@@ -182,6 +211,9 @@ pub unsafe fn stop_timer() {
 /// Call exactly once per IRQ dispatch, from inside the handler.
 #[inline]
 pub unsafe fn eoi() {
+    if !X2APIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
     // SAFETY: APIC is initialised; EOI write has no side effect beyond
     // unblocking the same-or-lower-priority interrupts.
     unsafe {

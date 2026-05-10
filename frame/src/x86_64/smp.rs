@@ -227,6 +227,51 @@ pub unsafe fn start_aps() -> u32 {
         return 0;
     }
 
+    // Detect QEMU TCG via CPUID hypervisor signature (leaf
+    // 0x40000000): EBX:ECX:EDX spells the hypervisor name. KVM is
+    // "KVMKVMKVM\0\0\0" (full hardware-assisted virt, x2APIC ICR
+    // works). TCG is "TCGTCGTCGTCG" — its x2APIC ICR (MSR 0x830)
+    // emulation is incomplete and the WRMSR triple-faults the BSP
+    // mid-IPI. Auto-skip SMP under TCG so the boot continues
+    // single-CPU rather than wedging here.
+    let hv_present = {
+        let leaf1 = unsafe { core::arch::x86_64::__cpuid(1) };
+        leaf1.ecx & (1u32 << 31) != 0
+    };
+    if hv_present {
+        let hv = unsafe { core::arch::x86_64::__cpuid(0x4000_0000) };
+        let mut sig = [0u8; 12];
+        sig[0..4].copy_from_slice(&hv.ebx.to_le_bytes());
+        sig[4..8].copy_from_slice(&hv.ecx.to_le_bytes());
+        sig[8..12].copy_from_slice(&hv.edx.to_le_bytes());
+        // TCG signature.
+        if &sig == b"TCGTCGTCGTCG" {
+            let _ = writeln!(
+                Writer,
+                "  smp(x86): SKIPPED — QEMU TCG detected (incomplete x2APIC ICR emulation)"
+            );
+            return 0;
+        }
+        // Other hypervisors (KVM, VMware, Hyper-V) — proceed with SMP.
+    }
+
+    // Real-HW gate: only attempt SMP if x2APIC actually came up.
+    // init_bsp verifies IA32_APIC_BASE.EXTD stuck after the WRMSR
+    // and only then sets X2APIC_ACTIVE. Without that, every WRMSR
+    // we'd issue to MSR 0x830 (x2APIC ICR) would #GP. Some real
+    // CPUs / firmware combinations advertise x2APIC in CPUID but
+    // refuse the EXTD bit (BIOS-locked, virtualization layer
+    // mismatch, etc.) — degrade to single-CPU rather than crash.
+    if !narf_interrupts::x86_64::apic::X2APIC_ACTIVE
+        .load(core::sync::atomic::Ordering::Acquire)
+    {
+        let _ = writeln!(
+            Writer,
+            "  smp(x86): SKIPPED — x2APIC not active (init_bsp couldn't enable EXTD)"
+        );
+        return 0;
+    }
+
     // SAFETY: BSP, post-paging.
     unsafe {
         install_trampoline();

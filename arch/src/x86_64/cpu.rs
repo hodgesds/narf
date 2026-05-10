@@ -30,22 +30,59 @@ use core::arch::asm;
 /// aarch64 server parts).
 pub const MAX_CPUS: usize = 64;
 
+/// Cached "does this CPU support RDTSCP?" flag. Set on first call.
+/// QEMU TCG's qemu64 model claims RDTSCP support in CPUID but
+/// raises #UD when the instruction executes — so we can't trust
+/// CPUID alone. We probe by reading CPUID.80000001h:EDX[27], and
+/// if absent, fall back to returning 0 (single-CPU answer that's
+/// correct for the BSP).
+///
+/// 0 = unknown (probe needed), 1 = no RDTSCP, 2 = has RDTSCP.
+static RDTSCP_STATE: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(0);
+
+#[inline(never)]
+fn probe_rdtscp() -> bool {
+    // CPUID.80000001h:EDX[27] = RDTSCP support bit.
+    // SAFETY: __cpuid is always legal at CPL=0.
+    let leaf = unsafe { core::arch::x86_64::__cpuid(0x8000_0001) };
+    leaf.edx & (1u32 << 27) != 0
+}
+
 /// Return the executing CPU's logical index. Single-CPU today; once
 /// AP bring-up populates IA32_TSC_AUX per CPU, this picks up the
 /// right value automatically.
+///
+/// Falls back to returning 0 (BSP) on CPU models that don't
+/// implement RDTSCP — e.g. QEMU TCG's `qemu64` default model.
 ///
 /// # Safety
 /// Reading TSC_AUX is always defined at CPL=0; the function is safe
 /// to call from any context.
 #[inline]
 pub fn current_cpu() -> u32 {
+    use core::sync::atomic::Ordering;
+    let state = RDTSCP_STATE.load(Ordering::Acquire);
+    let has_rdtscp = match state {
+        2 => true,
+        1 => false,
+        _ => {
+            let supported = probe_rdtscp();
+            RDTSCP_STATE.store(if supported { 2 } else { 1 }, Ordering::Release);
+            supported
+        }
+    };
+    if !has_rdtscp {
+        // BSP fallback. APs will set their TSC_AUX during
+        // startup; in pre-AP single-CPU boot, 0 is the right
+        // answer. When AP bring-up lands, we'll need a real
+        // CPUID-leaf-0Bh-based fallback for non-RDTSCP CPUs.
+        return 0;
+    }
     let mut aux: u32;
     let mut _hi: u32;
     let mut _lo: u32;
-    // SAFETY: RDTSCP reads TSC + IA32_TSC_AUX. Available since
-    // Nehalem (2008) / Bulldozer (2011) — universal on hardware
-    // we target. Today the AUX MSR is zero on the BSP; AP bring-up
-    // will write each AP's index in.
+    // SAFETY: probe above confirmed RDTSCP support.
     unsafe {
         asm!(
             "rdtscp",
