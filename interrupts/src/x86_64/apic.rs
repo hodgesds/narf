@@ -87,31 +87,35 @@ pub unsafe fn init_bsp() {
             wrmsr(IA32_APIC_BASE, base | APIC_BASE_EN);
         }
     }
-    let after_en = unsafe { rdmsr(IA32_APIC_BASE) };
-    // SAFETY: separately set EXTD (x2APIC mode).
-    unsafe {
-        wrmsr(IA32_APIC_BASE, after_en | APIC_BASE_EXTD);
-    }
-    // Verify x2APIC actually came up. Skip the rest of init if
-    // not — kernel can boot without LAPIC IRQs (timer driven by
-    // TSC busy-wait, drivers fall back to polling).
-    let confirm = unsafe { rdmsr(IA32_APIC_BASE) };
-    if confirm & APIC_BASE_EXTD == 0 {
-        return;
-    }
-    X2APIC_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
 
-    // Mask every IRQ on both 8259 PICs. This is the legacy-PIC
-    // compatible way of saying "I don't want any interrupts from
-    // you" — writes 0xFF to the master data port (0x21) and the
-    // slave data port (0xA1). Stage-3 can revisit if we need PIC
-    // support for some legacy device.
+    // Mask every IRQ on both 8259 PICs regardless of which APIC
+    // mode we end up in — the LAPIC is the interrupt path.
     // SAFETY: I/O-port writes to 0x21 / 0xA1 are standard PIC data.
     unsafe {
         use narf_arch::x86_64::io_port::outb;
         outb(0x21, 0xFF);
         outb(0xA1, 0xFF);
     }
+
+    let after_en = unsafe { rdmsr(IA32_APIC_BASE) };
+    // SAFETY: separately set EXTD (x2APIC mode).
+    unsafe {
+        wrmsr(IA32_APIC_BASE, after_en | APIC_BASE_EXTD);
+    }
+    // Verify x2APIC actually came up. If not, fall back to xAPIC
+    // MMIO mode — sufficient for SMP startup (INIT/SIPI), IPIs
+    // (TLB shootdown), and IRQ delivery. Used under QEMU TCG and
+    // any host whose firmware refuses the EXTD bit.
+    let confirm = unsafe { rdmsr(IA32_APIC_BASE) };
+    if confirm & APIC_BASE_EXTD == 0 {
+        // SAFETY: LAPIC MMIO is identity-mapped (low 4 GiB).
+        unsafe {
+            init_lapic_xapic();
+        }
+        install_apic_diag_handlers();
+        return;
+    }
+    X2APIC_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
 
     // Spurious-interrupt vector register: enable + vector 0xFF for
     // stray interrupts. Bit 8 = software enable.
@@ -128,6 +132,28 @@ pub unsafe fn init_bsp() {
         wrmsr(APIC_LVT_ERROR_MSR, super::super::VECTOR_APIC_ERROR as u64);
     }
     install_apic_diag_handlers();
+}
+
+/// xAPIC MMIO initialisation: program SIVR (software-enable +
+/// spurious vector), mask LVT_TIMER, and program LVT_ERROR. Used
+/// by both init_bsp and init_ap when x2APIC isn't live.
+///
+/// # Safety
+/// - LAPIC MMIO base must be identity-mapped + accessible.
+/// - APIC_BASE.EN must already be set.
+unsafe fn init_lapic_xapic() {
+    let sivr = (XAPIC_MMIO_BASE + 0x0F0) as *mut u32;
+    let lvt_timer = (XAPIC_MMIO_BASE + 0x320) as *mut u32;
+    let lvt_error = (XAPIC_MMIO_BASE + 0x370) as *mut u32;
+    // SAFETY: caller upholds MMIO + EN preconditions.
+    unsafe {
+        core::ptr::write_volatile(
+            sivr,
+            (SIVR_ENABLE as u32) | (super::super::VECTOR_SPURIOUS as u32),
+        );
+        core::ptr::write_volatile(lvt_timer, LVT_MASKED as u32);
+        core::ptr::write_volatile(lvt_error, super::super::VECTOR_APIC_ERROR as u32);
+    }
 }
 
 /// Install the diagnostic handlers for the APIC error +
@@ -264,24 +290,44 @@ pub unsafe fn apic_id() -> u32 {
     unsafe { rdmsr(0x0000_0802) as u32 }
 }
 
+/// Default xAPIC MMIO base. Used as the fallback when x2APIC isn't
+/// active. APIC_BASE_MSR can carry a different base in theory, but
+/// every consumer board we'd run on leaves this default in place.
+const XAPIC_MMIO_BASE: u64 = 0xFEE0_0000;
+
 /// Send an INIT IPI (assert) to the target APIC.
 ///
-/// Used as the first step of the INIT-SIPI-SIPI bring-up sequence.
-/// Delivery mode = 0b101 (INIT), level = 1 (assert), trigger = 0
-/// (edge).
+/// Routes through x2APIC ICR (MSR 0x830) when `X2APIC_ACTIVE`, or
+/// through xAPIC MMIO ICR (LAPIC base + 0x300/0x310) otherwise.
+/// xAPIC fallback covers QEMU TCG (incomplete x2APIC ICR
+/// emulation) and any host whose firmware refuses the EXTD bit.
 ///
 /// # Safety
-/// x2APIC must be enabled. Caller is responsible for the 10 ms
+/// LAPIC must have been initialized by `init_bsp` (whether or not
+/// x2APIC actually came up). Caller is responsible for the 10 ms
 /// delay PSCI/Intel SDM recommends between INIT and SIPI.
 #[inline]
 pub unsafe fn send_init_ipi(target_apic_id: u32) {
-    let dest = (target_apic_id as u64) << 32;
     // INIT (delivery mode 0b101 = 0x500), level=assert (bit 14),
     // trigger=edge (bit 15 = 0), destination=physical (bit 11 = 0).
-    let icr = dest | 0x0000_4500;
-    // SAFETY: MSR 0x830 is x2APIC ICR.
-    unsafe {
-        wrmsr(APIC_ICR_MSR, icr);
+    let icr_lo: u32 = 0x0000_4500;
+    if X2APIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
+        let dest = (target_apic_id as u64) << 32;
+        // SAFETY: MSR 0x830 is x2APIC ICR.
+        unsafe {
+            wrmsr(APIC_ICR_MSR, dest | icr_lo as u64);
+        }
+    } else {
+        // xAPIC MMIO fallback. ICR_HI carries the destination
+        // APIC ID in bits 24..31; ICR_LO carries the IPI fields.
+        // Writing ICR_LO triggers the IPI, so write ICR_HI first.
+        let lapic_hi = (XAPIC_MMIO_BASE + 0x310) as *mut u32;
+        let lapic_lo = (XAPIC_MMIO_BASE + 0x300) as *mut u32;
+        // SAFETY: LAPIC MMIO is identity-mapped (low 4 GiB).
+        unsafe {
+            core::ptr::write_volatile(lapic_hi, (target_apic_id & 0xFF) << 24);
+            core::ptr::write_volatile(lapic_lo, icr_lo);
+        }
     }
 }
 
@@ -291,17 +337,31 @@ pub unsafe fn send_init_ipi(target_apic_id: u32) {
 /// trampoline, divided by 4 KiB (so 0x8000 → 0x08). The AP starts
 /// executing at `CS:IP = (vector_page << 8) : 0x0000` in real mode.
 ///
+/// Routes through x2APIC ICR or xAPIC MMIO ICR — see
+/// `send_init_ipi` for the rationale.
+///
 /// # Safety
-/// x2APIC must be enabled. Caller must have already issued INIT
-/// + waited 10 ms.
+/// LAPIC must be initialized. Caller must have already issued
+/// INIT + waited 10 ms.
 #[inline]
 pub unsafe fn send_startup_ipi(target_apic_id: u32, vector_page: u8) {
-    let dest = (target_apic_id as u64) << 32;
-    // SIPI (delivery mode 0b110 = 0x600) + vector (low 8 bits).
-    let icr = dest | 0x0000_4600 | (vector_page as u64);
-    // SAFETY: MSR 0x830 is x2APIC ICR.
-    unsafe {
-        wrmsr(APIC_ICR_MSR, icr);
+    // SIPI (delivery mode 0b110 = 0x600), level=assert (bit 14)
+    // + vector (low 8 bits).
+    let icr_lo: u32 = 0x0000_4600 | (vector_page as u32);
+    if X2APIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
+        let dest = (target_apic_id as u64) << 32;
+        // SAFETY: MSR 0x830 is x2APIC ICR.
+        unsafe {
+            wrmsr(APIC_ICR_MSR, dest | icr_lo as u64);
+        }
+    } else {
+        let lapic_hi = (XAPIC_MMIO_BASE + 0x310) as *mut u32;
+        let lapic_lo = (XAPIC_MMIO_BASE + 0x300) as *mut u32;
+        // SAFETY: LAPIC MMIO is identity-mapped (low 4 GiB).
+        unsafe {
+            core::ptr::write_volatile(lapic_hi, (target_apic_id & 0xFF) << 24);
+            core::ptr::write_volatile(lapic_lo, icr_lo);
+        }
     }
 }
 
@@ -314,12 +374,32 @@ pub unsafe fn send_startup_ipi(target_apic_id: u32, vector_page: u8) {
 /// - CPUID must confirm x2APIC support (gated by BSP).
 /// - Interrupts disabled at call time.
 pub unsafe fn init_ap() {
-    // SAFETY: x2APIC support is BSP-confirmed.
+    // SAFETY: APIC base MSR read is unconditional.
     let base = unsafe { rdmsr(IA32_APIC_BASE) };
-    unsafe {
-        wrmsr(IA32_APIC_BASE, base | APIC_BASE_EN | APIC_BASE_EXTD);
+    if base & APIC_BASE_EN == 0 {
+        // SAFETY: enabling APIC is always safe at CPL=0.
+        unsafe {
+            wrmsr(IA32_APIC_BASE, base | APIC_BASE_EN);
+        }
     }
-    // Spurious vector + software enable.
+    // If the BSP couldn't get x2APIC up (TCG / firmware-locked),
+    // mirror that on the AP — initialise the LAPIC via xAPIC
+    // MMIO instead. Cross-CPU IPI senders already route through
+    // xAPIC MMIO when X2APIC_ACTIVE is false.
+    if !X2APIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
+        // SAFETY: LAPIC MMIO is identity-mapped + APIC_BASE.EN set.
+        unsafe {
+            init_lapic_xapic();
+        }
+        return;
+    }
+    // SAFETY: BSP confirmed x2APIC supports EXTD.
+    unsafe {
+        let after_en = rdmsr(IA32_APIC_BASE);
+        wrmsr(IA32_APIC_BASE, after_en | APIC_BASE_EXTD);
+    }
+    // Spurious vector + software enable. x2APIC MSRs (0x800+) are
+    // only valid once EXTD took.
     // SAFETY: x2APIC is now live on this CPU.
     unsafe {
         wrmsr(
