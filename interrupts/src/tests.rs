@@ -367,3 +367,52 @@ fn smoke_dispatch_in_irq_observed_inside_handler() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("interrupts", smoke_dispatch_in_irq_observed_inside_handler);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_atomic_pool_usable_from_real_irq_handler() -> TestResult {
+    // End-to-end: install a synchronous handler that leases an
+    // item from an AtomicPool, mutates it, returns it via Drop.
+    // Fire the vector. Post-handler, the pool's free count
+    // returns to baseline — the IRQ-side Drop ran through the
+    // pool's IrqSafeSpinLock without deadlock.
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_memory::atomic_pool::AtomicPool;
+
+    // 0xE1: unused vector; 0xE0 is the in_irq() observation
+    // test above.
+    const TEST_VEC: u8 = 0xE1;
+
+    static POOL: narf_lib::sync::OnceLock<AtomicPool<u64>> =
+        narf_lib::sync::OnceLock::new();
+    let pool = POOL.get_or_init(|| AtomicPool::new(2, || 0u64));
+
+    static OBSERVED: AtomicU64 = AtomicU64::new(0);
+
+    fn handler() {
+        let pool = POOL.get().expect("pool initialised");
+        let mut h = pool.try_get().expect("pool not empty in handler");
+        *h = 0xDEAD_BEEF;
+        OBSERVED.store(*h, Ordering::Release);
+        // h drops here, returns the item to the pool.
+    }
+
+    let before = pool.free_count();
+
+    crate::dispatch::install(TEST_VEC, handler);
+    OBSERVED.store(0, Ordering::Release);
+    // SAFETY: vector is unused outside this test.
+    unsafe {
+        core::arch::asm!("int {v}", v = const TEST_VEC, options(nomem, nostack));
+    }
+    crate::dispatch::clear_handler(TEST_VEC);
+
+    if OBSERVED.load(Ordering::Acquire) != 0xDEAD_BEEF {
+        return TestResult::Fail("handler didn't run / wrote wrong value");
+    }
+    if pool.free_count() != before {
+        return TestResult::Fail("Drop in IRQ ctx didn't return item to pool");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("interrupts", smoke_atomic_pool_usable_from_real_irq_handler);

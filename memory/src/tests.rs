@@ -1898,3 +1898,64 @@ kernel_test_in!("memory/context", smoke_context_predicate_drives_assert);
 // Note: end-to-end "real IRQ handler observes in_irq() == true"
 // test lives in interrupts/src/tests.rs (memory crate doesn't
 // depend on narf-interrupts).
+
+fn smoke_atomic_pool_drain_and_refill() -> TestResult {
+    // Acceptance #7 substrate: pool of N pre-allocated items
+    // drains via try_get, refills as Pooled handles drop.
+    use crate::atomic_pool::AtomicPool;
+
+    static POOL: narf_lib::sync::OnceLock<AtomicPool<u64>> =
+        narf_lib::sync::OnceLock::new();
+    let pool = POOL.get_or_init(|| AtomicPool::new(4, || 0u64));
+
+    if pool.capacity() != 4 {
+        return TestResult::Fail("capacity didn't stick");
+    }
+    if pool.free_count() != 4 {
+        return TestResult::Fail("post-init free_count != capacity");
+    }
+
+    // Drain all 4.
+    let h0 = pool.try_get().expect("get 0");
+    let h1 = pool.try_get().expect("get 1");
+    let h2 = pool.try_get().expect("get 2");
+    let h3 = pool.try_get().expect("get 3");
+    if pool.free_count() != 0 {
+        return TestResult::Fail("post-drain free_count != 0");
+    }
+
+    // Empty pool returns None.
+    if pool.try_get().is_some() {
+        return TestResult::Fail("drained pool should return None");
+    }
+
+    // Drop one — count goes back up by 1.
+    drop(h0);
+    if pool.free_count() != 1 {
+        return TestResult::Fail("drop didn't return item to pool");
+    }
+
+    // Re-lease the freed slot, mutate it, return it, lease again
+    // — same physical Box should come back.
+    let mut h_again = pool.try_get().expect("re-lease");
+    *h_again = 42;
+    drop(h_again);
+    let h_check = pool.try_get().expect("re-lease 2");
+    if *h_check != 42 {
+        return TestResult::Fail("pool didn't preserve mutation across drop");
+    }
+
+    // Cleanup: drop everything.
+    drop(h1);
+    drop(h2);
+    drop(h3);
+    drop(h_check);
+    if pool.free_count() != 4 {
+        return TestResult::Fail("not all items returned after drop");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/atomic_pool", smoke_atomic_pool_drain_and_refill);
+// End-to-end "AtomicPool used from real IRQ handler" test lives
+// in interrupts/src/tests.rs (memory crate doesn't depend on
+// narf-interrupts).

@@ -13,6 +13,7 @@ extern crate alloc;
 pub mod addr;
 pub mod address_space;
 pub mod beacon;
+pub mod atomic_pool;
 pub mod buddy;
 pub mod asid_alloc;
 pub mod context;
