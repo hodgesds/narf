@@ -1626,3 +1626,59 @@ fn smoke_slab_large_alloc_steady_state() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory", smoke_slab_large_alloc_steady_state);
+
+fn smoke_buddy_oom_returns_empty() -> TestResult {
+    // Acceptance criterion #9 (heap-migration spec §5.9): with
+    // a small free pool, attempting to allocate a block bigger
+    // than the pool returns the empty/error sentinel — the buddy
+    // does NOT panic, fall back, or coalesce phantom RAM.
+    use crate::buddy::{BuddyZone, MAX_ORDER};
+
+    // Synthetic 1 MiB pool = 256 frames. Donated at frame 0x100
+    // (above the LOW_RESERVED low-MiB skip used by the live
+    // allocator, but irrelevant here — this zone is local).
+    const SYNTH_BASE_FRAME: u64 = 0x100;
+    const POOL_FRAMES: u64 = 256;
+    let mut zone = BuddyZone::new();
+    zone.donate(SYNTH_BASE_FRAME, POOL_FRAMES);
+
+    // 2 MiB request (order 9 = 512 frames) into a 1 MiB pool —
+    // must return None. Spec wording: "1 MiB total free RAM,
+    // attempting to allocate 2 MiB returns Err".
+    if zone.alloc(9).is_some() {
+        return TestResult::Fail("over-pool request unexpectedly succeeded");
+    }
+    // Order beyond MAX_ORDER also rejected uniformly.
+    if zone.alloc(MAX_ORDER + 1).is_some() {
+        return TestResult::Fail("order > MAX_ORDER unexpectedly succeeded");
+    }
+
+    // The pool's still intact afterwards — failed allocs don't
+    // strand frames. Drain it via the largest fitting order
+    // (256 frames = order 8) and verify exhaustion.
+    let f = zone.alloc(8);
+    if f.is_none() {
+        return TestResult::Fail("order-8 should fit a 1 MiB pool");
+    }
+    if zone.alloc(0).is_some() {
+        return TestResult::Fail("post-drain alloc should return None");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/buddy", smoke_buddy_oom_returns_empty);
+
+fn smoke_alloc_pages_on_rejects_oversize_order() -> TestResult {
+    // Public frame API: alloc_pages_on must surface Exhausted for
+    // requests that the buddy can't represent. Order > MAX_ORDER
+    // is rejected before touching the pool.
+    use crate::buddy::MAX_ORDER;
+    use crate::frame::{alloc_pages_on, FrameAllocError};
+    match alloc_pages_on(0, MAX_ORDER + 1) {
+        Err(FrameAllocError::Exhausted) => TestResult::Pass,
+        Err(FrameAllocError::Uninitialised) => {
+            TestResult::Skip("frame allocator not initialised in this flavour")
+        }
+        Ok(_) => TestResult::Fail("oversize order should fail, not succeed"),
+    }
+}
+kernel_test_in!("memory/buddy", smoke_alloc_pages_on_rejects_oversize_order);
