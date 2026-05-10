@@ -1529,3 +1529,100 @@ fn smoke_hugepage_1g_reserve_picks_aligned_chunk() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory/hugepage", smoke_hugepage_1g_reserve_picks_aligned_chunk);
+
+fn smoke_slab_steady_state_under_churn() -> TestResult {
+    // Acceptance criterion #4 from the heap-migration spec: a
+    // 1000-iteration alloc/free loop must hold steady at the
+    // working-set size, not grow unboundedly. Exercise multiple
+    // size classes (each with its own magazines + central free
+    // list) so a leak in any one of them shows up.
+    use core::alloc::Layout;
+    use crate::slab;
+
+    // One representative layout per class index. Sizes are chosen
+    // to fall squarely inside their class so rounding doesn't move
+    // them around between iterations.
+    // Indices match slab's power-of-two layout: class i serves
+    // (MIN_BLOCK << i) bytes, MIN_BLOCK = 16, N_CLASSES = 9.
+    let layouts = [
+        (Layout::from_size_align(16, 8).unwrap(), 0usize),
+        (Layout::from_size_align(64, 16).unwrap(), 2),
+        (Layout::from_size_align(256, 16).unwrap(), 4),
+        (Layout::from_size_align(1024, 16).unwrap(), 6),
+        (Layout::from_size_align(4096, 16).unwrap(), 8),
+    ];
+
+    let before = slab::stats();
+
+    // Churn loop. Each iteration alloc+free of every class —
+    // 5 classes × 1000 = 5000 allocs, 5000 frees. After the
+    // loop, in_use for every touched class must equal its
+    // baseline.
+    for _ in 0..1000 {
+        for &(layout, _) in &layouts {
+            let p = match slab::alloc(layout) {
+                Ok(p) => p,
+                Err(_) => return TestResult::Fail("alloc failed during churn"),
+            };
+            // SAFETY: just allocated with this exact layout.
+            unsafe { slab::dealloc(p, layout) };
+        }
+    }
+
+    let after = slab::stats();
+    for &(_, class_idx) in &layouts {
+        let b = before.classes[class_idx].in_use;
+        let a = after.classes[class_idx].in_use;
+        if a != b {
+            return TestResult::Fail("class in_use drifted from baseline");
+        }
+    }
+    if after.large_in_use != before.large_in_use {
+        return TestResult::Fail("large_in_use drifted (none of these layouts are large)");
+    }
+
+    // Backing page growth is allowed (magazines + slabs hold onto
+    // pages for reuse) but bounded — each class shouldn't have
+    // grown by more than a handful of pages relative to the burst
+    // working set. 64 pages per class is generous (4096-block
+    // class only needs 1 block per alloc, so ~5000 frames worst
+    // case if magazines fail; 64 means we *did* batch).
+    for &(_, class_idx) in &layouts {
+        let g_before = before.classes[class_idx].grown;
+        let g_after = after.classes[class_idx].grown;
+        let delta = g_after - g_before;
+        if delta > 64 {
+            return TestResult::Fail("backing pages grew unboundedly under churn");
+        }
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_slab_steady_state_under_churn);
+
+fn smoke_slab_large_alloc_steady_state() -> TestResult {
+    // Same property for the >max_class_size path that routes
+    // straight to the page-frame buddy. Uses a 16 KiB allocation
+    // (above the 8 KiB largest size class).
+    use core::alloc::Layout;
+    use crate::slab;
+
+    let layout = Layout::from_size_align(16384, 16).unwrap();
+    let before = slab::stats().large_in_use;
+
+    for _ in 0..256 {
+        let p = match slab::alloc(layout) {
+            Ok(p) => p,
+            Err(_) => return TestResult::Fail("large alloc failed during churn"),
+        };
+        // SAFETY: just allocated.
+        unsafe { slab::dealloc(p, layout) };
+    }
+
+    let after = slab::stats().large_in_use;
+    if after != before {
+        return TestResult::Fail("large_in_use drifted from baseline");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_slab_large_alloc_steady_state);
