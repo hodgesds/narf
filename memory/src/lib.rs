@@ -59,8 +59,8 @@ pub const KERNEL_PHYS_OFFSET: u64 = 0xFFFF_FF80_0000_0000;
 pub const KERNEL_PHYS_OFFSET: u64 = 0;
 pub use frame::{
     alloc_frame, alloc_frame_anywhere, alloc_frame_on, free_frame, init_from_map, is_numa_aware,
-    node_free, rebalance_to_topology, release_early_ceiling, stats as frame_stats,
-    FrameAllocError, FrameStats, PhysFrame, UsableRegion, MAX_NUMA_NODES as FRAME_MAX_NUMA_NODES,
-    PAGE_SHIFT, PAGE_SIZE,
+    node_free, rebalance_to_topology, release_early_ceiling, reserve_for_slab_promotion,
+    stats as frame_stats, FrameAllocError, FrameStats, PhysFrame, UsableRegion,
+    MAX_NUMA_NODES as FRAME_MAX_NUMA_NODES, PAGE_SHIFT, PAGE_SIZE,
 };
 pub use heap::BumpAllocator;

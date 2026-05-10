@@ -178,22 +178,30 @@ pub unsafe fn init_from_map(usable: &[UsableRegion], exclude: &[(u64, u64)]) {
     guard.total_frames = total;
     guard.reserved_frames = reserved;
     guard.numa_aware = false;
-    // Pre-reserve Vec capacity in every zone so split/coalesce
-    // pushes never grow the underlying Vec at runtime. Critical
-    // for deadlock-avoidance once the slab is the global allocator:
-    // a Vec growth would route through slab → buddy → ALLOC.lock()
-    // (already held by us) → recursive deadlock.
-    //
-    // Done HERE while the global allocator is still bump (so the
-    // capacity allocation itself doesn't recurse).
-    for zone in guard.zones.iter_mut() {
-        zone.reserve_growth_capacity(total);
-    }
     // NOTE: we deliberately do NOT promote the global allocator to
-    // the slab here. `rebalance_to_topology` (called later from
-    // bare_main, after ACPI SRAT parsing) does its own work; promote
-    // happens after that, via an explicit
-    // `crate::heap::promote_to_slab()` call from bare_main.
+    // the slab here, and we do not pre-reserve buddy Vec capacity
+    // until after `rebalance_to_topology` has redistributed frames
+    // to their proper NUMA zones. `reserve_for_slab_promotion()`
+    // does the per-zone reservation just before promote_to_slab —
+    // sized to the actual zone contents, not the worst-case
+    // total. Both are called from bare_main once ACPI is up.
+}
+
+/// Pre-reserve buddy Vec capacity in every populated zone so that
+/// split / coalesce pushes never realloc-grow at runtime. Critical
+/// for deadlock-avoidance once the slab is the global allocator:
+/// a Vec growth would route through slab → buddy → `ALLOC.lock()`
+/// (already held by the buddy) → recursive deadlock.
+///
+/// Call this once, AFTER `rebalance_to_topology` has populated
+/// each zone, and BEFORE `crate::heap::promote_to_slab()` flips
+/// the global allocator. While we're still on bump, the
+/// reservation allocations themselves don't recurse.
+pub fn reserve_for_slab_promotion() {
+    let mut g = ALLOC.lock();
+    for zone in g.zones.iter_mut() {
+        zone.reserve_growth_capacity();
+    }
 }
 
 /// Donate the byte range `[start, end)` to `zone`, splitting around

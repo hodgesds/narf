@@ -105,13 +105,27 @@ impl BuddyZone {
     ///
     /// MUST be called while the global allocator is still bump (i.e.
     /// before `promote_to_slab`).
-    pub fn reserve_growth_capacity(&mut self, total_frames: usize) {
+    pub fn reserve_growth_capacity(&mut self) {
+        // Empty zone: nothing donated, so nothing will ever come
+        // back via free either. Skip the reservation entirely so
+        // unused NUMA slots don't burn bootstrap memory.
+        if self.total_frames == 0 {
+            return;
+        }
         for order in 0..NUM_ORDERS {
-            // Worst-case blocks at this order = total_frames / 2^order.
-            // Add slack for fragmentation and donate's leading partial
-            // block.
-            let cap = (total_frames >> order).max(64) + 64;
-            // Reserve in addition to current len so we don't realloc later.
+            // Pessimistic worst-case bound: every frame is its own
+            // order-0 block at this order. Caps each order at the
+            // natural physical maximum.
+            let physical_max = (self.total_frames >> order).max(64) + 64;
+            // Realistic working bound: current contents + headroom
+            // for split/coalesce churn. The actual peak depends on
+            // workload fragmentation; 16 K entries per order absorbs
+            // bursty splits of MAX_ORDER blocks down to order 0
+            // (each split adds at most NUM_ORDERS-1 entries spread
+            // across lower orders).
+            const HEADROOM: usize = 16 * 1024;
+            let working = self.free_lists[order].len() + HEADROOM;
+            let cap = working.min(physical_max);
             let need = cap.saturating_sub(self.free_lists[order].capacity());
             if need > 0 {
                 self.free_lists[order].reserve_exact(need);

@@ -26,12 +26,11 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::slab;
 
 /// Bootstrap arena size. Has to cover every allocation up to the
-/// point `promote_to_slab()` is called. While we're still
-/// debugging the slab promotion path, this stays at the old
-/// 128 MiB so tests don't run out — once the slab is solid,
-/// drop back to ~4 MiB (real boot's pre-promotion footprint is
-/// on the order of 100 KiB).
-pub const BOOTSTRAP_CAPACITY: usize = 128 << 20;
+/// point `promote_to_slab()` is called. Pre-promotion includes
+/// ACPI table parse, MADT/SRAT/HMAT topology, NUMA rebalance,
+/// and per-zone buddy capacity reservation. Empirically ~2 MiB
+/// on a 16 GiB / 16-node system; 8 MiB gives 4× headroom.
+pub const BOOTSTRAP_CAPACITY: usize = 8 << 20;
 
 /// Byte storage for the bootstrap bump arena. Lives in `.bss`,
 /// 16-byte aligned for any alignment ≤ 16 to be trivially satisfiable.

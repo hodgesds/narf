@@ -825,9 +825,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                 // memory_node() is populated. Subsequent
                                 // alloc_frame() calls honour locality.
                                 narf_memory::rebalance_to_topology();
+                                narf_memory::reserve_for_slab_promotion();
                                 let _ = writeln!(
                                     console::Writer,
-                                    "  heap: promoting global allocator from bump to slab..."
+                                    "  heap: promoting bump→slab (bootstrap used: {} / {} bytes)",
+                                    narf_memory::heap::used_bytes(),
+                                    narf_memory::heap::capacity_bytes()
                                 );
                                 narf_memory::heap::promote_to_slab();
                                 let _ = writeln!(
