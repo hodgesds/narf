@@ -214,10 +214,30 @@ fn donate_around_excludes(
     }
 }
 
+/// Lowest phys address the buddy is allowed to hand out. The first
+/// MiB of physical RAM is conventionally reserved on x86 — it
+/// contains the BIOS data area, the IVT (real-mode), the EBDA,
+/// the SMP AP trampoline (0x8000), VGA framebuffer remnants, and
+/// other firmware-owned regions. Even though the bootloader
+/// memory map sometimes marks it "Available", handing it out as
+/// a real allocation collides with these uses (most painfully:
+/// the AP trampoline at 0x8000).
+///
+/// The previous Vec-based frame allocator masked this because
+/// `Vec::pop` returned high frames first; the buddy, splitting
+/// from any order, can return low frames early. Skip the first
+/// MiB unconditionally.
+const LOW_RESERVED_BYTES: u64 = 0x100000;
+
 /// Donate `[start, end)` (page-aligned) to `zone` as a single contiguous run.
+/// Skips the first MiB of phys (BIOS / SMP trampoline territory).
 fn donate_range(zone: &mut BuddyZone, start: u64, end: u64) {
     debug_assert_eq!(start & (PAGE_SIZE - 1), 0);
     debug_assert_eq!(end & (PAGE_SIZE - 1), 0);
+    if end <= start {
+        return;
+    }
+    let start = start.max(LOW_RESERVED_BYTES);
     if end <= start {
         return;
     }
