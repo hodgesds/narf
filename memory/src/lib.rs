@@ -17,6 +17,7 @@ pub mod buddy;
 pub mod asid_alloc;
 pub mod frame;
 pub mod heap;
+pub mod hugepage;
 pub mod per_domain_root;
 pub mod slab;
 pub mod spd5;

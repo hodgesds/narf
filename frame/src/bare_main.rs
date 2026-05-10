@@ -141,6 +141,21 @@ fn try_install_early_fb_console(fb_info: narf_boot::info::FramebufferInfo) {
 /// command-line. Returns the highest stage that should run; defaults
 /// to `Stage::Late` (run everything). Unknown stage names fall back
 /// to `Stage::Late` with no error — diagnostics-only.
+/// Parse `key=N` out of cmdline, returning N as `usize`. Used by
+/// the hugepage pre-reservation path for `hugepages_2m=N` and
+/// `hugepages_1g=N`. Returns 0 if absent or malformed — the
+/// hugepage path treats 0 as "no reservation".
+fn parse_cmdline_count(cmdline: &str, key: &str) -> usize {
+    for tok in cmdline.split_ascii_whitespace() {
+        if let Some((k, v)) = tok.split_once('=') {
+            if k == key {
+                return v.parse().unwrap_or(0);
+            }
+        }
+    }
+    0
+}
+
 fn parse_stop_at(cmdline: &str) -> narf_init::Stage {
     use narf_init::Stage;
     let mut last = Stage::Late;
@@ -703,12 +718,28 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     len: r.len,
                 })
                 .collect();
-            let exclude: &[(u64, u64)] = &[(kstart, kend)];
+
+            // Hugepage pre-reservation: parse cmdline `hugepages_2m=N`
+            // and `hugepages_1g=N`; carve naturally-aligned chunks
+            // out of the usable regions BEFORE the buddy gets them.
+            // Whatever's left (head misalignment + tail of each
+            // region) is donated to the buddy via init_from_map.
+            let want_2m = parse_cmdline_count(narf_boot::cmdline(), "hugepages_2m");
+            let want_1g = parse_cmdline_count(narf_boot::cmdline(), "hugepages_1g");
+            let huge_excludes = if want_2m > 0 || want_1g > 0 {
+                narf_memory::hugepage::reserve_from_regions(&regions, want_2m, want_1g)
+            } else {
+                alloc::vec::Vec::new()
+            };
+            let mut excludes: alloc::vec::Vec<(u64, u64)> =
+                alloc::vec::Vec::with_capacity(1 + huge_excludes.len());
+            excludes.push((kstart, kend));
+            excludes.extend(huge_excludes.iter().copied());
 
             // SAFETY: first call, BSP, memory map came from parse_raw
             // which validated magic + min-RAM.
             unsafe {
-                narf_memory::init_from_map(&regions, exclude);
+                narf_memory::init_from_map(&regions, &excludes);
             }
                             narf_memory::beacon::paint(6, 0x0000_FF00); // GREEN: frame alloc
 

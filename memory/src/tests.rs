@@ -1411,3 +1411,121 @@ fn smoke_memory_remap_page_picks_up_perms_and_phys() -> TestResult {
 }
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 kernel_test_in!("memory", smoke_memory_remap_page_picks_up_perms_and_phys);
+
+fn smoke_hugepage_2m_reserve_alloc_free() -> TestResult {
+    use crate::hugepage::{
+        alloc_hugepage_2m, free_hugepage, reserve_from_regions, stats, HugeAllocError,
+        HUGEPAGE_2M_BYTES,
+    };
+    use crate::frame::UsableRegion;
+    use crate::PhysAddr;
+
+    // Synthetic 16 MiB region aligned to 2 MiB. The phys addresses
+    // here are bookkeeping-only — we never touch the memory, so it
+    // doesn't matter that they don't correspond to real RAM.
+    // Picked far above any realistic kernel-image footprint to
+    // avoid colliding with anything else's bookkeeping.
+    const SYNTH_BASE: u64 = 0x1_0000_0000;
+    const PAGES: usize = 4;
+    let region = UsableRegion {
+        start: PhysAddr::new(SYNTH_BASE),
+        len: (PAGES as u64) * HUGEPAGE_2M_BYTES,
+    };
+
+    let before = stats();
+    let excludes = reserve_from_regions(&[region], PAGES, 0);
+    if excludes.len() != PAGES {
+        return TestResult::Fail("reserve_from_regions returned wrong exclude count");
+    }
+    let after_reserve = stats();
+    if after_reserve.free_2m - before.free_2m != PAGES {
+        return TestResult::Fail("free_2m didn't grow by reserve count");
+    }
+
+    // Drain exactly PAGES new allocations.
+    let mut allocated = alloc::vec::Vec::new();
+    for _ in 0..PAGES {
+        match alloc_hugepage_2m() {
+            Ok(f) => {
+                if f.phys() & (HUGEPAGE_2M_BYTES - 1) != 0 {
+                    return TestResult::Fail("alloc_hugepage_2m returned unaligned phys");
+                }
+                allocated.push(f);
+            }
+            Err(_) => return TestResult::Fail("alloc_hugepage_2m exhausted before PAGES"),
+        }
+    }
+
+    // Free one back, alloc one — roundtrip works.
+    let returned = allocated.pop().unwrap();
+    free_hugepage(returned);
+    match alloc_hugepage_2m() {
+        Ok(f) => allocated.push(f),
+        Err(_) => return TestResult::Fail("alloc after free returned Empty"),
+    }
+
+    // Drain leaves pool back at `before`. We've alloc'd PAGES from
+    // our reservation; free them all to restore.
+    for f in allocated.drain(..) {
+        free_hugepage(f);
+    }
+    // Now drain the PAGES we reserved so the pool returns to its
+    // entry state (no test pollution for siblings).
+    for _ in 0..PAGES {
+        if alloc_hugepage_2m().is_err() {
+            return TestResult::Fail("teardown drain hit Empty early");
+        }
+    }
+    // (PAGES+1)th alloc — should be Empty (assuming nothing else
+    // reserved 2M pages this boot, which is the default).
+    if before.free_2m == 0 {
+        match alloc_hugepage_2m() {
+            Err(HugeAllocError::Empty) => {}
+            _ => return TestResult::Fail("expected Empty after draining test reservation"),
+        }
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("memory/hugepage", smoke_hugepage_2m_reserve_alloc_free);
+
+fn smoke_hugepage_1g_reserve_picks_aligned_chunk() -> TestResult {
+    use crate::hugepage::{reserve_from_regions, stats, HUGEPAGE_1G_BYTES};
+    use crate::frame::UsableRegion;
+    use crate::PhysAddr;
+
+    // Region whose start is mis-aligned: head is dropped, the one
+    // 1 GiB-aligned chunk is taken, the tail stays for the buddy.
+    // Pick a base that's NOT 1 GiB aligned but that admits one
+    // aligned 1 GiB chunk somewhere inside.
+    const SYNTH_BASE: u64 = 0x10_0000_0000 + 0x1234_5000; // mis-aligned
+    let region = UsableRegion {
+        start: PhysAddr::new(SYNTH_BASE),
+        // 3 GiB — easily fits one aligned chunk regardless of
+        // where the head lands.
+        len: 3 * HUGEPAGE_1G_BYTES,
+    };
+
+    let before = stats();
+    let excludes = reserve_from_regions(&[region], 0, 1);
+    if excludes.len() != 1 {
+        return TestResult::Fail("expected exactly one 1G exclude");
+    }
+    let (excl_start, excl_end) = excludes[0];
+    if excl_start & (HUGEPAGE_1G_BYTES - 1) != 0 {
+        return TestResult::Fail("1 GiB exclude start not aligned");
+    }
+    if excl_end - excl_start != HUGEPAGE_1G_BYTES {
+        return TestResult::Fail("1 GiB exclude wrong length");
+    }
+    let after = stats();
+    if after.free_1g - before.free_1g != 1 {
+        return TestResult::Fail("free_1g didn't grow by 1");
+    }
+
+    // Teardown: drain the one we reserved so the pool returns to
+    // its prior state.
+    let _ = crate::hugepage::alloc_hugepage_1g();
+    TestResult::Pass
+}
+kernel_test_in!("memory/hugepage", smoke_hugepage_1g_reserve_picks_aligned_chunk);
