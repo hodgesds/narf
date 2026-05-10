@@ -126,10 +126,12 @@ The in-kernel trap entry (`frame/`) calls
 
 ```rust
 pub fn on_irq(vector: u8) {
+    narf_lib::context::enter_irq();                // 1. depth++
     let s = &SLOTS[vector as usize];
-    s.fired.fetch_add(1, Release);                 // 1. count++ first
-    if let Some(h) = HANDLERS[vector].load() { h(); }  // 2. sync handler
-    if let Some(w) = s.waker.lock().take() { w.wake(); } // 3. async wake
+    s.fired.fetch_add(1, Release);                 // 2. count++
+    if let Some(h) = HANDLERS[vector].load() { h(); }  // 3. sync handler
+    if let Some(w) = s.waker.lock().take() { w.wake(); } // 4. async wake
+    narf_lib::context::exit_irq();                 // 5. depth--
 }
 ```
 
@@ -137,6 +139,14 @@ The order — increment first, sync handler second, waker third
 — is the contract every consumer relies on. A waker observing
 the wake call is guaranteed that any subsequent `fire_count`
 read sees the increment (release-acquire ordering).
+
+The `enter_irq` / `exit_irq` brackets give every handler-side
+caller (drivers, allocators, locks) a true `in_irq()` answer
+via `narf_lib::context::in_irq()`. `narf-memory`'s
+`AllocContext::Sleepable` debug-asserts on this in slab::alloc
+so a driver that accidentally calls `Box::new` from its ISR
+panics in dev builds. Verified end-to-end by
+`smoke_dispatch_in_irq_observed_inside_handler` (interrupts).
 
 ## 9. Capability surface
 

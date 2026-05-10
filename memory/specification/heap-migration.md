@@ -542,99 +542,99 @@ during boot. Doesn't touch IRQ-only allocations.
 
 ## 4. Migration phases
 
+**Status as of 2026-05-10**: phases 0-4 + 6 are landed; phase 5
+(domain tagging) is held until Stage 4. See the per-phase
+notes below for the actual commits + what remains.
+
 ### Phase 0 — keep bump alive, raise ceiling
 
-Already done. `HEAP_CAPACITY = 128 << 20`. Buys time for the rest.
-Acceptance: real-hardware boot completes through Stage::Late + ticks
-without alloc panic.
+**Done.** `HEAP_CAPACITY = 128 << 20`. Bought time for the rest.
+Real-hardware boot completes through Stage::Late + ticks without
+alloc panic.
 
 ### Phase 1 — buddy under the existing frame API
 
-Replace `memory::frame::ALLOC.bins: [Vec<PhysFrame>; MAX_NUMA_NODES]`
-with `[BuddyZone; MAX_NUMA_NODES]`. `alloc_frame_on` continues to
-work; new `alloc_pages_on(node, order)` lights up.
-
-- Add `memory/src/buddy.rs` with the per-zone splay and free-list
-  arrays
-- Rewrite `init_from_map` to feed regions to the buddy as initial
-  large blocks, not as individual frames
-- Test: existing frame allocator tests pass. New tests for higher
-  orders + coalescing.
-
-Risk: page-table allocators (`new_user_pml4_on`) still call
-`alloc_frame` (= `alloc_pages(0)`). Should be transparent.
-
-Estimated cost: 1-2 days work, ~600 lines + tests.
+**Done** (`f7b5ea2`). `memory::frame::ALLOC.bins` replaced with
+`[BuddyZone; MAX_NUMA_NODES]`. `alloc_pages_on(node, order)` is
+the public entry; `alloc_frame_on` is the order=0 case. See
+`memory/src/buddy.rs`. Pre-existing frame-allocator tests still
+pass; new tests cover split / coalesce / OOM
+(`smoke_buddy_oom_returns_empty`).
 
 ### Phase 2 — slab on top of buddy, alongside bump
 
-Add `memory/src/slab.rs`. Don't make it the global allocator yet;
-expose `slab_alloc` / `slab_free` as named functions. Migrate
-specific high-churn sites (scheduler `TaskSlot`, capability
-allocations, FB ring entries) to use the slab.
+**Done** (`8a0e389`). `memory/src/slab.rs` is on top of the
+buddy. Multi-page allocations route through `alloc_pages_on(0,
+order)` via a `pages_to_order` helper. Heap is a hybrid
+bootstrap-bump → slab (`memory/src/heap.rs`): bump until
+`heap::promote_to_slab()` flips `SLAB_LIVE`, slab afterwards.
+`dealloc` checks `in_bootstrap(ptr)` to route freeing to the
+right path (bump-era allocations stay leaked but bounded). Per
+the original phase split this is "alongside bump" *and* the
+phase-3 global-allocator flip in one — once SLAB_LIVE flips,
+the global allocator is effectively the slab.
 
-Acceptance: bump arena usage drops measurably for a full boot pass
-(probably 30-50% lower).
+### Phase 3 — bootstrap arena shrunk
 
-Estimated cost: 2-3 days, ~800 lines + tests.
+**Done** (`075bd99`). `BOOTSTRAP_CAPACITY` cut from 128 MiB
+to 8 MiB after two changes:
 
-### Phase 3 — flip the global allocator
+1. Buddy capacity reservation moved out of `init_from_map` and
+   into `reserve_for_slab_promotion()`, called from bare_main
+   between `rebalance_to_topology` and `promote_to_slab`.
+   Per-zone reservation uses each zone's actual frame count
+   instead of the global total in every zone.
+2. Reservation skips zones with `total_frames == 0`. On a
+   16-NUMA-slot setup the empty zones used to burn ~1.4 MiB
+   each on speculative capacity.
 
-Swap `#[global_allocator]` from `BumpAllocator` to `SlabAllocator`.
-Bump becomes the early-boot bootstrap allocator (used only between
-`_start_rust` and the slab being live).
-
-The early-boot window: between MMU init and the buddy being seeded.
-Bootstrap pattern: a tiny 64 KiB bump arena for the very-early
-allocations, switch over once `init_from_map` + buddy + slab are
-ready.
-
-Acceptance: Stage-1 boot completes with the slab as global
-allocator. Existing `cargo xtask test` suite (1386 cases) passes.
-Boot heap usage: should be ~50 MiB, not 128 MiB.
-
-Estimated cost: 1-2 days, mostly debugging the early-boot ordering.
+Real boot pre-promotion footprint: ~750 KiB (vs 16 MiB
+before). 8 MiB ceiling = 4× headroom. Drop further once we're
+confident in the slab promotion path.
 
 ### Phase 4 — per-CPU magazines
 
-Add per-CPU magazine cache on top of the central slab. Lock-free
-hot path for the common case (alloc/free of a recent object).
-
-Acceptance: alloc latency benchmark shows 5-10x improvement for the
-hot path (single-object alloc/free in a loop).
-
-Estimated cost: 2-3 days, ~400 lines + benchmarks.
+**Done** in slab.rs from the start; the central path was
+written with magazines from day one. The `try_alloc_atomic`
+API (`7c0b34f`) exposes the magazine-only fast path directly
+to IRQ-context callers; `try_dealloc_atomic` returns
+`AtomicDeallocFull` instead of draining when the magazine
+overflows, so IRQ-side code never takes the central lock.
 
 ### Phase 5 — domain tagging
 
-Plumb `DomainId` through `SlabOpts`. Default-domain allocations work
-exactly as before. Stage-4 work later wires the tag into PKEY /
-domain isolation.
-
-Estimated cost: 1 day surface change, deferred until Stage 4.
+**Deferred to Stage 4.** Surface unchanged; plumbing the
+`DomainId` through `SlabOpts` is meaningless until the
+domain-isolation backbone (PKEY/MTE/PCID per domain) is wired
+up beyond what Stage 1 ships.
 
 ### Phase 6 — hugepage pool (separate from buddy)
 
-Add `memory/src/hugepage.rs` with the 2 MiB / 1 GiB pools.
-`init_from_map` walks usable regions, reserves naturally-aligned
-hugepages BEFORE the buddy gets the rest. Pool size policy:
+**Done** (`54a1b73`). `memory/src/hugepage.rs` with 2 MiB and
+1 GiB pools. `reserve_from_regions(usable, want_2m, want_1g)`
+walks the memory map at boot, carves leading naturally-aligned
+chunks out of each region up to the cmdline-bounded targets
+(`hugepages_2m=N` / `hugepages_1g=N`), and returns the
+byte-range excludes that `init_from_map` skips when donating
+to the buddy. `alloc_hugepage_2m` / `alloc_hugepage_1g` return
+`HugeFrame`s; pool exhaustion returns `Err(Empty)` (no
+buddy-coalesce fallback). Tests:
+`smoke_hugepage_2m_reserve_alloc_free` and
+`smoke_hugepage_1g_reserve_picks_aligned_chunk`.
 
-- 2 MiB: reserve up to N pages (N from cmdline `hugepages_2m=N`,
-  default 0).
-- 1 GiB: reserve up to N pages (cmdline `hugepages_1g=N`,
-  default 0).
+### Status (2026-05-10)
 
-`alloc_hugepage_2m()` / `alloc_hugepage_1g()` return `HugeFrame`s
-backed by those pre-reserved chunks. No coalescing from buddy —
-explicit pool only. `free_hugepage` returns the page to the pool.
-
-Acceptance: with `hugepages_2m=8` on cmdline, eight 2 MiB
-allocations succeed and a ninth fails with `Empty`. Free four
-and four more allocations succeed.
-
-Estimated cost: 1 day, ~300 lines + tests. No Stage-1 driver
-needs hugepages, so this phase can land any time after Phase 1
-(buddy is what carves up the leftover non-hugepage RAM).
+| Acceptance | Status | Notes |
+|---|---|---|
+| #1 HW boot, no panic | ✅ | Boots on Zen2 laptop |
+| #2 cargo xtask test passes | ✅ | 1402 / 0 / 34 |
+| #3 Memory accounting | 🟡 | `frame_stats` + `slab::stats` exist; per-domain accounting waits on Stage 4 |
+| #4 Steady-state under churn | ✅ | `smoke_slab_steady_state_under_churn` (1000-iter × 5 classes) + `_large_alloc_` |
+| #5 Sleepable assert | ✅ | `AllocContext::Sleepable.debug_assert_consistent()` panics from IRQ ctx; `slab::alloc` asserts on entry |
+| #6 Atomic-context perf | ✅ | `try_alloc_atomic` / `try_dealloc_atomic` magazine-only; perf bench `smoke_slab_atomic_perf_bounded` (loose TCG bound; tighten on real HW) |
+| #7 Pre-allocated pools | 🟡 | Substrate landed (`memory/src/atomic_pool.rs`, end-to-end IRQ test); driver consumers TBD |
+| #8 Reclaim under load | ⏳ | Needs shrinker subsystem (Stage 3+) |
+| #9 OOM behavior | ✅ | `try_alloc_pages` returns `Err(Exhausted)`; `smoke_buddy_oom_returns_empty` |
 
 ## 5. Acceptance criteria (overall)
 
@@ -669,33 +669,44 @@ needs hugepages, so this phase can land any time after Phase 1
 
 ## 7. Open questions
 
-- **Should slab caches per CPU pin to a NUMA node?** If yes, every
-  alloc consults `current_cpu()`. Probably yes for performance, no
-  for simplicity in Phase 3. Defer to Phase 4.
-- **What's the fast-path lock for the central slab?** Simple
-  `IrqSafeSpinLock` works; a per-class lock-free freelist would be
+- **Should slab caches per CPU pin to a NUMA node?** Resolved
+  by Phase 4 — magazines are per-CPU, central is global.
+  NUMA-pinned magazines defer to a future perf pass.
+- **What's the fast-path lock for the central slab?** Currently
+  `IrqSafeSpinLock`; per-class lock-free freelist would be
   faster. Deferring.
-- **Pool the very-early bootstrap arena from .bss or from buddy?**
-  `.bss` is simpler (no chicken-and-egg); 64 KiB is small enough.
+- **Pool the very-early bootstrap arena from .bss or from
+  buddy?** Resolved: `.bss`-backed bump arena
+  (`BOOTSTRAP_CAPACITY = 8 << 20`).
 
 ## 8. Files this touches
 
-- `memory/src/heap.rs` — gut bump, replace with bootstrap-bump +
-  global-allocator that delegates to slab once live
-- `memory/src/buddy.rs` — new (per-zone, per-NUMA-node free lists)
-- `memory/src/slab.rs` — new (per-CPU magazines + central slabs)
-- `memory/src/hugepage.rs` — new (boot-reserved 2 MiB / 1 GiB pool)
-- `memory/src/zone.rs` — new (Dma32 / Normal / HugePage enum + zone
-  selection logic)
-- `memory/src/alloc_context.rs` — new (`AllocContext` + scope tokens
-  + debug enforcement)
-- `memory/src/shrinker.rs` — new (`Shrinker` trait + registry +
-  watermark walker task)
-- `memory/src/atomic_pool.rs` — new (driver-side pre-allocated
-  fixed-size pool)
-- `memory/src/accounting.rs` — new (`AllocStats`, per-domain charge)
-- `memory/src/frame.rs` — switch backing store from `Vec` per node
-  to `BuddyZone` per node; expose zone-aware variants
+Landed (status as of 2026-05-10):
+
+- `memory/src/heap.rs` — hybrid bootstrap-bump → slab global
+  allocator (Phase 2 + 3)
+- `memory/src/buddy.rs` — per-zone free lists, donate / alloc /
+  free / drain_into / reserve_growth_capacity (Phase 1)
+- `memory/src/slab.rs` — per-CPU magazines + central slabs +
+  `try_alloc_atomic` / `try_dealloc_atomic` (Phase 2 + 4)
+- `memory/src/hugepage.rs` — boot-reserved 2 MiB / 1 GiB pool
+  (Phase 6)
+- `memory/src/atomic_pool.rs` — driver-side `AtomicPool<T>`
+  fixed-capacity pool, IRQ-safe (acceptance #7 substrate)
+- `memory/src/context.rs` — `AllocContext { Sleepable | Atomic
+  | IrqOff }`, `is_sleepable()`, debug-asserts at slab entry
+  (acceptance #5)
+- `memory/src/frame.rs` — `BuddyZone` per NUMA node,
+  `alloc_pages_on(node, order)`, `reserve_for_slab_promotion`
 - `memory/src/lib.rs` — public exports
-- `memory/specification/spec.md` — mark §3 buddy/slab as Stage-1
-  delivered (instead of "Wave 2" placeholder)
+- `lib/src/context.rs` — per-CPU IRQ-depth tracker
+  (`enter_irq` / `exit_irq` wired into `interrupts::dispatch`)
+
+Pending (Stage 3+ / Stage 4):
+
+- `memory/src/zone.rs` — Dma32 / Normal / HugePage zone selector
+- `memory/src/shrinker.rs` — `Shrinker` trait + registry +
+  watermark walker (acceptance #8)
+- `memory/src/accounting.rs` — per-domain `AllocStats`
+  (acceptance #3 second half)
+- Domain plumbing through `SlabOpts` (Phase 5)

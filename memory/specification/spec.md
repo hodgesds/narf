@@ -245,6 +245,28 @@ flip.
 Stage 1: buddy + page tables + identity map for the Frame.
 Stage 2: domain manager, PKS/MTE enable, per-domain slab allocator.
 
+**Status (2026-05-10)** — Stage 1 heap migration largely
+done. See `heap-migration.md` for the per-phase / per-acceptance
+breakdown. Modules in tree:
+
+- `buddy.rs` — per-NUMA-zone free lists, orders 0..10 (4 KiB
+  to 4 MiB), donate / alloc / free / drain_into.
+- `slab.rs` — power-of-two size classes 16..4096, per-CPU
+  magazines + central per-class lists, `try_alloc_atomic` /
+  `try_dealloc_atomic` for IRQ-context callers.
+- `heap.rs` — hybrid bootstrap-bump → slab `#[global_allocator]`,
+  `BOOTSTRAP_CAPACITY = 8 << 20`.
+- `hugepage.rs` — boot-reserved 2 MiB / 1 GiB pool (cmdline
+  `hugepages_2m=N` / `hugepages_1g=N`), no buddy fallback.
+- `atomic_pool.rs` — driver-side `AtomicPool<T>` fixed-capacity
+  pool for IRQ-critical paths that can't tolerate even
+  `try_alloc_atomic` failure.
+- `context.rs` — `is_sleepable()`, `irqs_enabled()`,
+  `AllocContext` enum, debug assert at slab-alloc entry.
+
+Stage 2 / 4 still owe: domain tagging through `SlabOpts`,
+shrinker subsystem, per-domain accounting.
+
 ## 8. Resolved decisions
 
 ### 8.1 Domain multiplexing policy (resolved)

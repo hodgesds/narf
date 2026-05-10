@@ -154,6 +154,29 @@ define_typed_id!(DomainId, u8);
 
 Eliminates "is this a `u32` a PID or a CPU id?" bug class.
 
+### 3.6 Execution-context tracking (`context`)
+
+Per-CPU IRQ-depth counter that the arch IRQ dispatcher
+brackets around every interrupt body. Lets allocators and
+synchronization primitives ask "am I in IRQ?" without each
+crate growing its own ad-hoc tracking.
+
+```rust
+pub fn enter_irq();          // bump this CPU's depth
+pub fn exit_irq();           // saturating-at-0
+pub fn in_irq() -> bool;     // depth > 0
+```
+
+`narf-interrupts::dispatch::on_irq` calls `enter_irq` /
+`exit_irq` around every synchronous handler + waker run.
+`narf-memory::context` composes this with the arch
+RFLAGS.IF / DAIF.I read to expose `is_sleepable()` and the
+`AllocContext { Sleepable | Atomic | IrqOff }` enum that
+`slab::alloc` debug-asserts on.
+
+Storage: `[AtomicU32; MAX_CPUS]` indexed by `current_cpu()`.
+Lock-free; only the owning CPU writes its cell.
+
 ## 4. Invariants & safety properties
 
 - All `no_std`-clean. No hidden `alloc` dependency without a
