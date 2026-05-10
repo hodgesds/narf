@@ -73,6 +73,11 @@ pub fn clear_handler(vector: u8) {
 /// Cheap: one atomic increment + one lock acquisition.
 #[inline]
 pub fn on_irq(vector: u8) {
+    // Bracket the entire IRQ body with enter_irq/exit_irq so
+    // anything called from the synchronous handler (driver code,
+    // allocators, etc.) sees `narf_lib::context::in_irq() == true`
+    // and routes through the atomic-context allocator paths.
+    narf_lib::context::enter_irq();
     let s = &SLOTS[vector as usize];
     s.fired.fetch_add(1, Ordering::Release);
 
@@ -91,6 +96,7 @@ pub fn on_irq(vector: u8) {
     if let Some(w) = waker {
         w.wake();
     }
+    narf_lib::context::exit_irq();
 }
 
 /// Snapshot of a vector's fire count. Tasks awaiting the IRQ compare

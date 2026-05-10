@@ -14,6 +14,7 @@
 
 pub mod assert;
 pub mod bitmap;
+pub mod context;
 pub mod id;
 pub mod intrusive;
 pub mod percpu;

@@ -1814,3 +1814,84 @@ fn smoke_slab_atomic_perf_bounded() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_slab_atomic_perf_bounded);
+
+fn smoke_context_initial_state_sleepable() -> TestResult {
+    // At test-suite entry the BSP is in process context: no IRQ
+    // is being serviced. is_sleepable() must be true. We don't
+    // assert on irqs_enabled() because parts of boot legitimately
+    // run with IRQs masked and the sleepable predicate
+    // intentionally only gates on in_irq().
+    use crate::context::is_sleepable;
+    if narf_lib::context::in_irq() {
+        return TestResult::Fail("test entry should not be in IRQ context");
+    }
+    if !is_sleepable() {
+        return TestResult::Fail("test entry should be sleepable");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/context", smoke_context_initial_state_sleepable);
+
+fn smoke_context_enter_exit_round_trip() -> TestResult {
+    // enter_irq increments, in_irq becomes true, is_sleepable
+    // becomes false, exit_irq restores. The depth counter
+    // saturates at 0 on extra exits — verify too.
+    use crate::context::is_sleepable;
+    use narf_lib::context::{enter_irq, exit_irq, in_irq};
+
+    if in_irq() {
+        return TestResult::Fail("precondition: not in IRQ");
+    }
+    enter_irq();
+    if !in_irq() {
+        return TestResult::Fail("enter_irq didn't bump depth");
+    }
+    if is_sleepable() {
+        return TestResult::Fail("in_irq context must NOT be sleepable");
+    }
+    // Nested enter/exit.
+    enter_irq();
+    exit_irq();
+    if !in_irq() {
+        return TestResult::Fail("nested exit shouldn't drop depth to 0");
+    }
+    exit_irq();
+    if in_irq() {
+        return TestResult::Fail("balanced exits should clear depth");
+    }
+    // Saturate-at-0: extra exit doesn't underflow.
+    exit_irq();
+    if in_irq() {
+        return TestResult::Fail("over-exit must saturate at 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/context", smoke_context_enter_exit_round_trip);
+
+fn smoke_context_predicate_drives_assert() -> TestResult {
+    // Acceptance criterion #5: the AllocContext debug assertion
+    // sources its decision from `is_sleepable()`. We can't
+    // observe a panic non-destructively in this kernel (panic
+    // is `-> !`), so we exercise the predicate the assert reads
+    // — same shape: enter IRQ, predicate must say "not
+    // sleepable", exit, predicate must say "sleepable" again.
+    use crate::context::is_sleepable;
+    use narf_lib::context::{enter_irq, exit_irq};
+
+    if !is_sleepable() {
+        return TestResult::Fail("test entry should be sleepable");
+    }
+    enter_irq();
+    let in_irq_sleepable = is_sleepable();
+    exit_irq();
+    if in_irq_sleepable {
+        return TestResult::Fail(
+            "is_sleepable() inside IRQ ctx must be false (else assert is silent)",
+        );
+    }
+    if !is_sleepable() {
+        return TestResult::Fail("post-exit should be sleepable again");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory/context", smoke_context_predicate_drives_assert);

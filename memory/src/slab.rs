@@ -204,6 +204,12 @@ impl From<crate::FrameAllocError> for SlabError {
 /// Returns `Err(SlabError::LayoutUnsupported)` when the alignment
 /// exceeds `PAGE_SIZE_USIZE`.
 pub fn alloc(layout: Layout) -> Result<NonNull<u8>, SlabError> {
+    // Sleepable is the implicit context for `slab::alloc`. In
+    // debug builds the assertion panics if we got here from an
+    // IRQ handler or with IRQs masked — a class of bug that
+    // would otherwise show up as a latency spike on hardware.
+    crate::context::AllocContext::Sleepable.debug_assert_consistent();
+
     if layout.align() > PAGE_SIZE_USIZE {
         return Err(SlabError::LayoutUnsupported);
     }

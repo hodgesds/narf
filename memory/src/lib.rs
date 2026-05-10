@@ -15,6 +15,7 @@ pub mod address_space;
 pub mod beacon;
 pub mod buddy;
 pub mod asid_alloc;
+pub mod context;
 pub mod frame;
 pub mod heap;
 pub mod hugepage;
