@@ -4,6 +4,59 @@ Plan for replacing the Stage-1 bump allocator (`memory/src/heap.rs`,
 `HEAP_CAPACITY` static) with the buddy + slab pair the main spec
 already calls for.
 
+## 0. Provenance — clean-room implementation
+
+**Mandatory invariant:** every line of code that lands as part of
+this migration is clean-room. No GPL-licensed source — and in
+particular no Linux kernel mm/ source — is read, referenced,
+ported, paraphrased, or used as a model. Same rule that produced
+`crypto/src/clean/` (SHA-256/512, ChaCha20-Poly1305, HKDF) and
+the same reasoning: NARF is MPL-2.0 and must remain
+distributable without GPL contamination concerns.
+
+What's allowed:
+
+- **Published specifications and academic literature.** Knuth Vol 1
+  §2.5 "Dynamic Storage Allocation" (buddy system, original 1965
+  Knowlton paper). Bonwick 1994 USENIX paper on the slab allocator.
+  Bonwick & Adams 2001 USENIX paper on per-CPU magazines + vmem.
+  Any peer-reviewed paper — paper text is not GPL.
+- **Hardware vendor manuals.** Intel SDM Vol 3, AMD APM Vol 2 for
+  paging / TLB / WC / MTRR semantics.
+- **MIT/BSD/Apache/MPL-licensed reference implementations** for
+  cross-checking algorithmic correctness, ONLY consulted at the
+  ALGORITHM level (e.g., "buddy coalesces by XOR'ing the frame
+  number with the order's size to find the buddy"), never at the
+  code level.
+- **Our own existing modules.** `frame.rs` API surface, capability
+  patterns, `IrqSafeSpinLock` discipline.
+
+What's forbidden:
+
+- Reading Linux mm/ source (`mm/page_alloc.c`, `mm/slab.c`,
+  `mm/slub.c`, `mm/vmalloc.c`, etc.) for any reason.
+- Reading any GPLv2 / GPLv3 / LGPL allocator source: jemalloc is
+  BSD-2 (allowed for algorithm xref), tcmalloc is Apache-2
+  (allowed), but glibc malloc is LGPL (forbidden), the Linux SLUB
+  is GPL (forbidden), the ZGC allocator from OpenJDK is GPL
+  w/ Classpath (avoid).
+- Using AI-assisted code generation that was trained on Linux
+  kernel source without explicit clean-room provenance —
+  Claude generations for this work cite only this spec, the
+  algorithm-level papers/manuals above, and the existing NARF
+  codebase.
+
+Each new file (`memory/src/buddy.rs`, `slab.rs`, etc.) opens with
+a comment block stating:
+
+```
+// Clean-room implementation. Algorithm refs: <papers cited>.
+// No GPL source consulted.
+```
+
+Code review on PRs touching these files explicitly checks for
+provenance compliance.
+
 ## 1. Current state
 
 - `BumpAllocator` is the global allocator (`#[global_allocator]`).
