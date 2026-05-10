@@ -22,7 +22,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 /// per-task tables). 4 MiB gives enough headroom for the current
 /// suite plus a few rounds of growth before the Wave-2 buddy+slab
 /// replacement (per `memory/` spec) makes the question moot.
-pub const HEAP_CAPACITY: usize = 32 << 20;
+pub const HEAP_CAPACITY: usize = 128 << 20;
 
 /// Byte storage for the bump arena. Lives in `.bss`; aligned to 16 so
 /// any alignment ≤ 16 alloc request is trivially satisfiable.
