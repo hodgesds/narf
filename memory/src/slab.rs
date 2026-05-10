@@ -231,6 +231,82 @@ pub unsafe fn dealloc(ptr: NonNull<u8>, layout: Layout) {
     }
 }
 
+/// Atomic-context allocation: magazine-only fast path. Never
+/// touches the central free list, never grows a fresh page,
+/// never invokes reclaim. Returns `None` immediately if the
+/// per-CPU magazine for the requested size class is empty.
+///
+/// Targeted at IRQ handlers and other sections that hold an
+/// `IrqSafeSpinLock` — anywhere going to the central lock could
+/// deadlock or block longer than the caller can tolerate. Pair
+/// with `try_dealloc_atomic` so frees in the same context don't
+/// bounce off the central lock either.
+///
+/// O(1) hot path, no atomics beyond the per-class `in_use`
+/// counter. Spec acceptance criterion #6 targets this at < 100 ns
+/// (success) / < 200 ns (failure) on the bring-up CPU.
+///
+/// Allocations beyond the largest size class always return
+/// `None` — large allocs go through the buddy, which the atomic
+/// path won't touch.
+pub fn try_alloc_atomic(layout: Layout) -> Option<NonNull<u8>> {
+    if layout.align() > PAGE_SIZE_USIZE {
+        return None;
+    }
+    let need = layout.size().max(layout.align()).max(MIN_BLOCK);
+    let c = class_for(need)?;
+    let class = &CLASSES[c];
+    let cpu = current_cpu();
+    // SAFETY: per-CPU access invariant — only the active CPU
+    // touches its own magazine cell.
+    let mag = unsafe { &mut *class.magazines[cpu].inner.get() };
+    if mag.top == 0 {
+        return None;
+    }
+    mag.top -= 1;
+    let blk = mag.stack[mag.top].take().expect("magazine top non-null");
+    class.in_use.fetch_add(1, Ordering::Relaxed);
+    Some(blk.cast())
+}
+
+/// Atomic-context dealloc: push to the per-CPU magazine if it
+/// has room. If the magazine is full, returns
+/// `Err(AtomicDeallocFull)` rather than draining to the central
+/// list (which would take the central lock). Caller is expected
+/// to defer the free to a sleepable context, or arrange for
+/// magazine drain ahead of the IRQ-critical section.
+///
+/// # Safety
+/// Same contract as `dealloc`: `ptr` must have come from a
+/// matching `alloc` / `try_alloc_atomic` call with the same
+/// effective size class.
+pub unsafe fn try_dealloc_atomic(
+    ptr: NonNull<u8>,
+    layout: Layout,
+) -> Result<(), AtomicDeallocFull> {
+    let need = layout.size().max(layout.align()).max(MIN_BLOCK);
+    let c = match class_for(need) {
+        Some(c) => c,
+        None => return Err(AtomicDeallocFull),
+    };
+    let class = &CLASSES[c];
+    let cpu = current_cpu();
+    // SAFETY: per-CPU access invariant.
+    let mag = unsafe { &mut *class.magazines[cpu].inner.get() };
+    if mag.top >= MAG_SIZE {
+        return Err(AtomicDeallocFull);
+    }
+    mag.stack[mag.top] = Some(ptr.cast::<FreeBlock>());
+    mag.top += 1;
+    class.in_use.fetch_sub(1, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Returned by `try_dealloc_atomic` when the per-CPU magazine
+/// is full. Caller defers the free to a sleepable context.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct AtomicDeallocFull;
+
 fn alloc_class(c: usize) -> Result<NonNull<u8>, SlabError> {
     let class = &CLASSES[c];
     let cpu = current_cpu();

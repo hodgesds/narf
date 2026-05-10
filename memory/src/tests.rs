@@ -1682,3 +1682,135 @@ fn smoke_alloc_pages_on_rejects_oversize_order() -> TestResult {
     }
 }
 kernel_test_in!("memory/buddy", smoke_alloc_pages_on_rejects_oversize_order);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_slab_atomic_alloc_magazine_only() -> TestResult {
+    // try_alloc_atomic must succeed when the magazine is warm
+    // (returns the same blocks the magazine holds, no central
+    // refill, no buddy growth) and return None when the magazine
+    // is drained — never blocking, never sleeping.
+    use core::alloc::Layout;
+    use crate::slab;
+
+    let layout = Layout::from_size_align(64, 16).unwrap();
+    // Warm the magazine with a normal alloc/free roundtrip.
+    let p = slab::alloc(layout).expect("warm-up alloc");
+    // SAFETY: just allocated.
+    unsafe { slab::dealloc(p, layout) };
+
+    // Atomic alloc → succeeds because the magazine has the block
+    // we just freed.
+    let p = match slab::try_alloc_atomic(layout) {
+        Some(p) => p,
+        None => return TestResult::Fail("warm magazine should serve atomic alloc"),
+    };
+    // Atomic dealloc → returns Ok (magazine has room).
+    // SAFETY: just allocated by the matching atomic path.
+    if unsafe { slab::try_dealloc_atomic(p, layout) }.is_err() {
+        return TestResult::Fail("non-full magazine should accept atomic dealloc");
+    }
+
+    // Drain the magazine. Repeatedly atomic-alloc until None —
+    // we must hit None without ever blocking on the central
+    // free list. (May take up to MAG_SIZE iterations.)
+    let mut drained = alloc::vec::Vec::new();
+    for _ in 0..32 {
+        match slab::try_alloc_atomic(layout) {
+            Some(p) => drained.push(p),
+            None => break,
+        }
+    }
+    // Now should return None until something refills.
+    if slab::try_alloc_atomic(layout).is_some() {
+        return TestResult::Fail("drained magazine should return None");
+    }
+
+    // Cleanup: free everything via the regular path so we don't
+    // strand blocks across tests.
+    for p in drained {
+        // SAFETY: blocks came from the same size class.
+        unsafe { slab::dealloc(p, layout) };
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_slab_atomic_alloc_magazine_only);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_slab_atomic_perf_bounded() -> TestResult {
+    // Acceptance criterion #6: try_alloc_atomic hot path < 100 ns,
+    // failure path < 200 ns. We measure cycles via RDTSC and
+    // convert at a 1 GHz floor (so 100 ns = 100 cycles minimum).
+    //
+    // QEMU TCG runs the kernel under binary translation, so the
+    // observed cycle counts are wildly inflated. We use a loose
+    // upper bound (< 50 000 cycles ≈ 50 µs at 1 GHz) just to
+    // catch true degenerate paths (e.g. accidentally taking the
+    // central lock). Real-HW perf is a follow-up benchmark.
+    use core::alloc::Layout;
+    use core::arch::x86_64::_rdtsc;
+    use crate::slab;
+
+    let layout = Layout::from_size_align(64, 16).unwrap();
+
+    // Warm-up: pre-fill the magazine with N blocks so the hot
+    // path doesn't take the slow refill route on the first iter.
+    const N: usize = 64;
+    let mut warm = alloc::vec::Vec::with_capacity(N);
+    for _ in 0..N {
+        warm.push(slab::alloc(layout).expect("warm-up alloc"));
+    }
+    for p in warm.drain(..) {
+        // SAFETY: just allocated.
+        unsafe { slab::dealloc(p, layout) };
+    }
+
+    // Hot path: alloc + dealloc pairs from the warm magazine.
+    const ITERS: u64 = 1024;
+    // SAFETY: RDTSC is unconditionally available on every x86_64
+    // QEMU model + every supported real-HW target.
+    let t0 = unsafe { _rdtsc() };
+    for _ in 0..ITERS {
+        let p = slab::try_alloc_atomic(layout).expect("warm magazine");
+        // SAFETY: just allocated atomically.
+        let _ = unsafe { slab::try_dealloc_atomic(p, layout) };
+    }
+    let t1 = unsafe { _rdtsc() };
+    let hot_cycles_per_pair = (t1 - t0) / ITERS;
+    if hot_cycles_per_pair > 50_000 {
+        return TestResult::Fail("hot-path try_alloc_atomic took absurdly long");
+    }
+
+    // Failure path: drain the magazine, then measure repeated
+    // try_alloc_atomic that all return None.
+    let mut drained = alloc::vec::Vec::new();
+    while let Some(p) = slab::try_alloc_atomic(layout) {
+        drained.push(p);
+        if drained.len() > 64 {
+            break;
+        }
+    }
+    let t0 = unsafe { _rdtsc() };
+    for _ in 0..ITERS {
+        if slab::try_alloc_atomic(layout).is_some() {
+            // Magazine refilled by another CPU? Drain it.
+            // (Kernel tests run on BSP single-CPU; this shouldn't
+            // happen, but bail to avoid skewing the measurement.)
+            return TestResult::Fail("magazine refilled mid-failure-loop");
+        }
+    }
+    let t1 = unsafe { _rdtsc() };
+    let fail_cycles = (t1 - t0) / ITERS;
+    if fail_cycles > 50_000 {
+        return TestResult::Fail("failure-path try_alloc_atomic took absurdly long");
+    }
+
+    // Cleanup.
+    for p in drained {
+        // SAFETY: blocks came from the same size class.
+        unsafe { slab::dealloc(p, layout) };
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_slab_atomic_perf_bounded);
