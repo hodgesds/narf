@@ -28,6 +28,7 @@ use alloc::vec::Vec;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::PhysAddr;
+use crate::buddy::{self, BuddyZone, MAX_ORDER};
 
 /// Page size in bytes. x86_64 / aarch64 both use 4 KiB as the base size.
 pub const PAGE_SIZE: u64 = 4096;
@@ -90,25 +91,25 @@ pub enum FrameAllocError {
     Uninitialised,
 }
 
-/// Per-node free-stack allocator. Index 0 holds everything pre-
+/// Per-node buddy zone. Index 0 holds everything pre-
 /// `rebalance_to_topology`; post-rebalance each node has only the
 /// frames whose physical addresses map to its proximity domain.
 #[derive(Debug)]
 pub struct FrameAllocator {
-    bins: [Vec<PhysFrame>; MAX_NUMA_NODES],
+    zones: [BuddyZone; MAX_NUMA_NODES],
     initialised: bool,
     total_frames: usize,
     reserved_frames: usize,
     /// Set after `rebalance_to_topology` completes; alloc + free
-    /// honour per-node bins from this point on. Pre-flag, every
-    /// allocation comes out of bin 0.
+    /// honour per-node zones from this point on. Pre-flag, every
+    /// allocation comes out of zones[0].
     numa_aware: bool,
 }
 
-const NEW_VEC: Vec<PhysFrame> = Vec::new();
+const NEW_ZONE: BuddyZone = BuddyZone::new();
 
 static ALLOC: IrqSafeSpinLock<FrameAllocator> = IrqSafeSpinLock::new(FrameAllocator {
-    bins: [NEW_VEC; MAX_NUMA_NODES],
+    zones: [NEW_ZONE; MAX_NUMA_NODES],
     initialised: false,
     total_frames: 0,
     reserved_frames: 0,
@@ -138,10 +139,10 @@ pub struct UsableRegion {
 ///   violating this hands out bogus frames that will fault on first
 ///   touch.
 pub unsafe fn init_from_map(usable: &[UsableRegion], exclude: &[(u64, u64)]) {
-    // Two-pass to avoid Vec growth thrashing.
     let mut total = 0usize;
     let mut reserved = 0usize;
-    let mut pageable = 0usize;
+    let mut guard = ALLOC.lock();
+    // First pass: count total + reserved frames for stats.
     for r in usable {
         let start = r.start.raw();
         let end = start + r.len;
@@ -152,56 +153,109 @@ pub unsafe fn init_from_map(usable: &[UsableRegion], exclude: &[(u64, u64)]) {
             total += 1;
             if is_excluded(a, exclude) {
                 reserved += 1;
-            } else {
-                pageable += 1;
             }
             a += PAGE_SIZE;
         }
     }
-
-    let mut bin0: Vec<PhysFrame> = Vec::with_capacity(pageable);
+    // Second pass: donate sub-ranges that don't overlap any
+    // excluded range. Each exclude is (lo_byte, hi_byte) — a
+    // half-open byte range. Sub-divide each region accordingly
+    // so the buddy gets contiguous sub-ranges to coalesce.
     for r in usable {
-        let start = r.start.raw();
-        let end = start + r.len;
-        let first = (start + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        let last = end & !(PAGE_SIZE - 1);
-        let mut a = first;
-        while a + PAGE_SIZE <= last {
-            if !is_excluded(a, exclude) {
-                bin0.push(PhysFrame::new(PhysAddr::new(a)));
-            }
-            a += PAGE_SIZE;
+        let region_start = (r.start.raw() + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let region_end = (r.start.raw() + r.len) & !(PAGE_SIZE - 1);
+        if region_start >= region_end {
+            continue;
         }
+        donate_around_excludes(
+            &mut guard.zones[0],
+            region_start,
+            region_end,
+            exclude,
+        );
     }
-
-    let mut guard = ALLOC.lock();
-    guard.bins[0] = bin0;
     guard.initialised = true;
     guard.total_frames = total;
     guard.reserved_frames = reserved;
     guard.numa_aware = false;
 }
 
+/// Donate the byte range `[start, end)` to `zone`, splitting around
+/// any excluded sub-ranges. Aligns each sub-range to page boundaries
+/// before donating.
+fn donate_around_excludes(
+    zone: &mut BuddyZone,
+    start: u64,
+    end: u64,
+    exclude: &[(u64, u64)],
+) {
+    // Walk left to right, emitting sub-ranges between excludes.
+    let mut cursor = start;
+    // Collect overlapping excludes, sorted by start.
+    let mut hits: Vec<(u64, u64)> = exclude
+        .iter()
+        .copied()
+        .filter(|&(lo, hi)| hi > start && lo < end)
+        .map(|(lo, hi)| (lo.max(start), hi.min(end)))
+        .collect();
+    hits.sort_by_key(|&(lo, _)| lo);
+    for (lo, hi) in hits {
+        // Round excluded range OUT to page boundaries (anything
+        // touching an excluded byte is fully reserved).
+        let lo_page = lo & !(PAGE_SIZE - 1);
+        let hi_page = (hi + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        if cursor < lo_page {
+            donate_range(zone, cursor, lo_page);
+        }
+        cursor = hi_page.max(cursor);
+    }
+    if cursor < end {
+        donate_range(zone, cursor, end);
+    }
+}
+
+/// Donate `[start, end)` (page-aligned) to `zone` as a single contiguous run.
+fn donate_range(zone: &mut BuddyZone, start: u64, end: u64) {
+    debug_assert_eq!(start & (PAGE_SIZE - 1), 0);
+    debug_assert_eq!(end & (PAGE_SIZE - 1), 0);
+    if end <= start {
+        return;
+    }
+    let first_frame = start >> PAGE_SHIFT;
+    let frame_count = (end - start) >> PAGE_SHIFT;
+    zone.donate(first_frame, frame_count);
+}
+
 fn is_excluded(addr: u64, exclude: &[(u64, u64)]) -> bool {
     exclude.iter().any(|&(lo, hi)| addr >= lo && addr < hi)
 }
 
-/// Redistribute frames currently in bin 0 across per-NUMA-node bins
-/// according to `narf_phys_to_node`. Call this once after ACPI SRAT
-/// has been parsed (`narf_acpi::parse_srat`). Idempotent — repeated
-/// calls are no-ops.
+/// Redistribute frames currently in zones[0] across per-NUMA-node
+/// zones according to `narf_phys_to_node`. Call this once after ACPI
+/// SRAT has been parsed (`narf_acpi::parse_srat`). Idempotent —
+/// repeated calls are no-ops.
+///
+/// The buddy is per-zone; we move whole free blocks based on the
+/// node of their starting frame. (A multi-frame block crossing a
+/// node boundary stays with its starting node — rare in practice
+/// since SRAT memory ranges are typically aligned to large
+/// boundaries.)
 pub fn rebalance_to_topology() {
     let mut g = ALLOC.lock();
     if g.numa_aware || !g.initialised {
         return;
     }
-
-    // Drain bin 0 into a temporary, then redistribute.
-    let drained: Vec<PhysFrame> = core::mem::replace(&mut g.bins[0], Vec::new());
-
-    for f in drained {
-        let node = phys_to_node(f.start_address().raw());
-        g.bins[node].push(f);
+    // Move blocks from zones[0] to their proper node zones.
+    // Two-pass to avoid borrow-checker issues with simultaneous
+    // mutable access to two zone slots.
+    for target in 1..MAX_NUMA_NODES {
+        let (left, right) = g.zones.split_at_mut(target);
+        let dst = &mut right[0];
+        let src = &mut left[0];
+        src.drain_into(dst, |frame_no| {
+            let phys = frame_no << PAGE_SHIFT;
+            phys_to_node(phys) == target
+        });
     }
     g.numa_aware = true;
 }
@@ -228,7 +282,7 @@ pub fn alloc_frame() -> Result<PhysFrame, FrameAllocError> {
 /// Default 4 GiB. Cleared (set to 0 = unlimited) by
 /// `release_early_ceiling()` once a kernel direct map covers
 /// all RAM — typically after MMU init + a high-mem ioremap pass.
-static EARLY_PHYS_CEILING: core::sync::atomic::AtomicU64 =
+pub(crate) static EARLY_PHYS_CEILING: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(4u64 << 30);
 
 /// Allow the allocator to return frames at any physical address.
@@ -237,29 +291,22 @@ pub fn release_early_ceiling() {
     EARLY_PHYS_CEILING.store(0, core::sync::atomic::Ordering::Release);
 }
 
-/// Pop a frame from `bin` whose phys address is below the early
-/// ceiling. Returns None if no qualifying frame is available.
-fn pop_below_ceiling(bin: &mut Vec<PhysFrame>) -> Option<PhysFrame> {
-    let ceil = EARLY_PHYS_CEILING.load(core::sync::atomic::Ordering::Acquire);
-    if ceil == 0 {
-        return bin.pop();
-    }
-    // Walk back-to-front so popping a low frame is O(1) once we
-    // find one. Real-HW free pools have low + high frames
-    // intermixed by the LIFO push order in `init_from_map`; on
-    // the laptop the first push iterates 0x1000000..0xc0000000
-    // (low) then 0x100000000..end (high), so high frames sit on
-    // top of the stack and a naive pop returns them first.
-    for i in (0..bin.len()).rev() {
-        if bin[i].start_address().raw() < ceil {
-            return Some(bin.swap_remove(i));
-        }
-    }
-    None
+/// Pop a frame from `zone` whose phys address is below the early
+/// ceiling. Returns None if no qualifying block is available at
+/// order 0. Uses the buddy zone's `alloc_below` which honors the
+/// ceiling at the frame-number level.
+fn alloc_below_ceiling(zone: &mut BuddyZone) -> Option<PhysFrame> {
+    let ceil_frame = buddy::early_ceiling_frame();
+    let frame_no = if ceil_frame == u64::MAX {
+        zone.alloc(0)?
+    } else {
+        zone.alloc_below(0, ceil_frame)?
+    };
+    Some(buddy::frame_from_no(frame_no))
 }
 
-/// Allocate one 4 KiB frame, preferring `node`'s bin. Falls back to
-/// other nodes when `node`'s bin is empty.
+/// Allocate one 4 KiB frame, preferring `node`'s zone. Falls back
+/// to other nodes when `node`'s zone is empty.
 pub fn alloc_frame_on(node: usize) -> Result<PhysFrame, FrameAllocError> {
     let mut g = ALLOC.lock();
     if !g.initialised {
@@ -267,19 +314,19 @@ pub fn alloc_frame_on(node: usize) -> Result<PhysFrame, FrameAllocError> {
     }
 
     if !g.numa_aware {
-        // Pre-rebalance: everything's in bin 0.
-        return pop_below_ceiling(&mut g.bins[0]).ok_or(FrameAllocError::Exhausted);
+        // Pre-rebalance: everything's in zones[0].
+        return alloc_below_ceiling(&mut g.zones[0]).ok_or(FrameAllocError::Exhausted);
     }
 
     let preferred = node.min(MAX_NUMA_NODES - 1);
-    if let Some(f) = pop_below_ceiling(&mut g.bins[preferred]) {
+    if let Some(f) = alloc_below_ceiling(&mut g.zones[preferred]) {
         return Ok(f);
     }
 
     // Fallback: round-robin from the next-highest node, wrapping.
     for offset in 1..MAX_NUMA_NODES {
         let i = (preferred + offset) % MAX_NUMA_NODES;
-        if let Some(f) = pop_below_ceiling(&mut g.bins[i]) {
+        if let Some(f) = alloc_below_ceiling(&mut g.zones[i]) {
             return Ok(f);
         }
     }
@@ -293,12 +340,64 @@ pub fn alloc_frame_anywhere() -> Result<PhysFrame, FrameAllocError> {
     if !g.initialised {
         return Err(FrameAllocError::Uninitialised);
     }
-    for bin in g.bins.iter_mut() {
-        if let Some(f) = pop_below_ceiling(bin) {
+    for zone in g.zones.iter_mut() {
+        if let Some(f) = alloc_below_ceiling(zone) {
             return Ok(f);
         }
     }
     Err(FrameAllocError::Exhausted)
+}
+
+/// Allocate a contiguous block of `1 << order` frames. `order=0`
+/// is one frame (same as `alloc_frame_on`); `order=10` is 4 MiB.
+/// Phase-1 buddy allocator entry point.
+pub fn alloc_pages_on(node: usize, order: u8) -> Result<PhysFrame, FrameAllocError> {
+    if order > MAX_ORDER {
+        return Err(FrameAllocError::Exhausted);
+    }
+    let mut g = ALLOC.lock();
+    if !g.initialised {
+        return Err(FrameAllocError::Uninitialised);
+    }
+    let preferred = node.min(MAX_NUMA_NODES - 1);
+    let zone_idx = if g.numa_aware { preferred } else { 0 };
+    let ceil = buddy::early_ceiling_frame();
+    let try_alloc = |z: &mut BuddyZone| -> Option<u64> {
+        if ceil == u64::MAX {
+            z.alloc(order)
+        } else {
+            z.alloc_below(order, ceil)
+        }
+    };
+    if let Some(no) = try_alloc(&mut g.zones[zone_idx]) {
+        return Ok(buddy::frame_from_no(no));
+    }
+    if !g.numa_aware {
+        return Err(FrameAllocError::Exhausted);
+    }
+    for offset in 1..MAX_NUMA_NODES {
+        let i = (preferred + offset) % MAX_NUMA_NODES;
+        if let Some(no) = try_alloc(&mut g.zones[i]) {
+            return Ok(buddy::frame_from_no(no));
+        }
+    }
+    Err(FrameAllocError::Exhausted)
+}
+
+/// Free a contiguous block of `1 << order` frames previously
+/// returned from `alloc_pages_on`.
+pub fn free_pages(frame: PhysFrame, order: u8) {
+    if order > MAX_ORDER {
+        return;
+    }
+    let phys = frame.start_address().raw();
+    let node = phys_to_node(phys);
+    let mut g = ALLOC.lock();
+    if !g.initialised {
+        return;
+    }
+    let zone_idx = if g.numa_aware { node } else { 0 };
+    g.zones[zone_idx].free(buddy::frame_no(frame), order);
 }
 
 /// Return a previously-allocated frame to the pool. The frame's
@@ -320,11 +419,8 @@ pub fn free_frame(f: PhysFrame) {
     if !g.initialised {
         return;
     }
-    if g.numa_aware {
-        g.bins[node].push(f);
-    } else {
-        g.bins[0].push(f);
-    }
+    let zone_idx = if g.numa_aware { node } else { 0 };
+    g.zones[zone_idx].free(buddy::frame_no(f), 0);
 }
 
 /// Per-frame reference counting for the COW-fork path.
@@ -426,7 +522,7 @@ pub mod cow {
 /// Snapshot of allocator usage (aggregate across nodes).
 pub fn stats() -> FrameStats {
     let g = ALLOC.lock();
-    let free: usize = g.bins.iter().map(|b| b.len()).sum();
+    let free: usize = g.zones.iter().map(|z| z.free_frame_count()).sum();
     FrameStats {
         total: g.total_frames,
         free,
@@ -441,7 +537,7 @@ pub fn node_free(node: usize) -> usize {
         return 0;
     }
     let g = ALLOC.lock();
-    g.bins[node].len()
+    g.zones[node].free_frame_count()
 }
 
 /// True once `rebalance_to_topology` has run.

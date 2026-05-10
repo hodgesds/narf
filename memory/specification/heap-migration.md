@@ -16,30 +16,56 @@ distributable without GPL contamination concerns.
 
 What's allowed:
 
-- **Published specifications and academic literature.** Knuth Vol 1
-  §2.5 "Dynamic Storage Allocation" (buddy system, original 1965
-  Knowlton paper). Bonwick 1994 USENIX paper on the slab allocator.
-  Bonwick & Adams 2001 USENIX paper on per-CPU magazines + vmem.
-  Any peer-reviewed paper — paper text is not GPL.
-- **Hardware vendor manuals.** Intel SDM Vol 3, AMD APM Vol 2 for
-  paging / TLB / WC / MTRR semantics.
+- **Published specifications and academic literature.**
+  - Knuth, "The Art of Computer Programming" Vol 1 §2.5 "Dynamic
+    Storage Allocation" — the buddy system as documented after
+    Knowlton's 1965 paper.
+    <https://www.informit.com/store/art-of-computer-programming-volume-1-fundamental-9780201896831>
+  - Knowlton, K. C. (1965). "A fast storage allocator." Comm. ACM
+    8(10): 623–625. <https://dl.acm.org/doi/10.1145/365628.365655>
+  - Bonwick, J. (1994). "The Slab Allocator: An Object-Caching
+    Kernel Memory Allocator." USENIX Summer 1994.
+    <https://www.usenix.org/legacy/publications/library/proceedings/bos94/full_papers/bonwick.ps>
+  - Bonwick, J. & Adams, J. (2001). "Magazines and Vmem: Extending
+    the Slab Allocator to Many CPUs and Arbitrary Resources."
+    USENIX 2001.
+    <https://www.usenix.org/legacy/event/usenix01/full_papers/bonwick/bonwick.pdf>
+  - Any peer-reviewed paper — paper text is not GPL.
+- **Hardware vendor manuals.**
+  - Intel® 64 and IA-32 Architectures Software Developer's Manual,
+    Vol 3 (System Programming Guide).
+    <https://www.intel.com/sdm>
+  - AMD64 Architecture Programmer's Manual, Vol 2 (System
+    Programming).
+    <https://www.amd.com/system/files/TechDocs/24593.pdf>
 - **MIT/BSD/Apache/MPL-licensed reference implementations** for
   cross-checking algorithmic correctness, ONLY consulted at the
   ALGORITHM level (e.g., "buddy coalesces by XOR'ing the frame
   number with the order's size to find the buddy"), never at the
   code level.
+  - jemalloc — BSD-2.
+    <https://github.com/jemalloc/jemalloc/blob/dev/COPYING>
+  - tcmalloc — Apache-2.
+    <https://github.com/google/tcmalloc/blob/master/LICENSE>
+  - illumos kernel slab — CDDL-1.0 (allowed for algorithm xref;
+    Bonwick's original implementation).
+    <https://github.com/illumos/illumos-gate/blob/master/usr/src/uts/common/os/kmem.c>
 - **Our own existing modules.** `frame.rs` API surface, capability
   patterns, `IrqSafeSpinLock` discipline.
 
 What's forbidden:
 
-- Reading Linux mm/ source (`mm/page_alloc.c`, `mm/slab.c`,
-  `mm/slub.c`, `mm/vmalloc.c`, etc.) for any reason.
-- Reading any GPLv2 / GPLv3 / LGPL allocator source: jemalloc is
-  BSD-2 (allowed for algorithm xref), tcmalloc is Apache-2
-  (allowed), but glibc malloc is LGPL (forbidden), the Linux SLUB
-  is GPL (forbidden), the ZGC allocator from OpenJDK is GPL
-  w/ Classpath (avoid).
+- Reading Linux `mm/` source for any reason. Specifically excluded:
+  - `mm/page_alloc.c`, `mm/slab.c`, `mm/slub.c`, `mm/slob.c`,
+    `mm/vmalloc.c`, `mm/page-writeback.c`, `mm/oom_kill.c`,
+    `mm/shrinker.c`, `mm/compaction.c`, `mm/memory_hotplug.c`.
+  - Anything under <https://github.com/torvalds/linux/tree/master/mm>.
+- Reading any GPLv2 / GPLv3 / LGPL allocator source.
+  - glibc malloc — LGPL.
+    <https://sourceware.org/git/?p=glibc.git;a=tree;f=malloc>
+  - musl malloc — MIT-style, but its mallocng is influenced by
+    glibc; treat with caution.
+  - OpenJDK ZGC — GPLv2 + Classpath. Avoid.
 - Using AI-assisted code generation that was trained on Linux
   kernel source without explicit clean-room provenance —
   Claude generations for this work cite only this spec, the
