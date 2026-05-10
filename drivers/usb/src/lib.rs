@@ -52,12 +52,16 @@ pub fn register_initcalls() {
     // a real device that finishes its USB reset before the Nth tick
     // gets attached then. On real silicon devices typically appear
     // within ~50 ms of run-bit go.
-    narf_init::register(Stage::Device, "usb-hid-supervisor", || {
-        // Spawn unconditionally — the supervisor's poll loop picks
-        // up xHCI as soon as it probes (Stage::Device's
-        // `pci-probe-all` runs after this initcall in registration
-        // order). The body short-circuits while `is_probed()` is
-        // false so we don't burn cycles on every tick.
+    // Stage::Late so this runs AFTER `pci-probe-all` in
+    // Stage::Device — `xhci::is_probed()` is then accurate. Per
+    // the no-block-on-missing-hardware rule we early-return
+    // NotPresent when no xHCI controller is bound, which avoids
+    // spawning a forever-sleeping supervisor task on systems
+    // without USB 3.0.
+    narf_init::register(Stage::Late, "usb-hid-supervisor", || {
+        if !xhci::is_probed() {
+            return InitResult::NotPresent;
+        }
         narf_scheduler::spawn(async {
             // ~16 ms at 1 GHz. Calibration drifts the actual cadence
             // up to ~5 ms on faster TSCs but the device-side report
