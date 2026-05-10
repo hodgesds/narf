@@ -441,6 +441,32 @@ pub fn find_device_by_hid(hid: &str) -> Option<AmlNode> {
     None
 }
 
+/// Find every device whose normalized `_HID` (string form, with
+/// EISA-integer encodings decoded to `PNPxxxx` / `ACPIxxxx`) equals
+/// `hid`. Used by enumerators that expect multiple instances of the
+/// same controller class (e.g. AMD FCH I2C, where Zen2 typically
+/// exposes 2-4 controllers).
+pub fn find_all_devices_by_hid(hid: &str) -> Vec<AmlNode> {
+    let mut out = Vec::new();
+    let mut paths: Vec<String> = Vec::new();
+    {
+        let g = NAMESPACE.lock();
+        for device in g.nodes.iter().filter(|n| n.kind == NodeKind::Device) {
+            paths.push(device.path.clone());
+        }
+    }
+    for path in paths {
+        if let Some(s) = device_hid(&path) {
+            if s == hid {
+                if let Some(node) = find_node(&path) {
+                    out.push(node);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Walk the DSDT + every SSDT and build the namespace. Idempotent —
 /// repeated calls clear the table and rebuild.
 ///
