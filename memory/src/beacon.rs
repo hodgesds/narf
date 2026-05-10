@@ -72,6 +72,18 @@ pub fn register(phys_addr: u64, stride_px: u32, width: u32, height: u32, phys_ce
     FB_PHYS_CEILING.store(phys_ceiling, Ordering::Release);
 }
 
+/// Diagnostic accessor: raw FB phys for direct-write debugging.
+#[doc(hidden)]
+pub fn __fb_phys() -> u64 {
+    FB_PHYS.load(Ordering::Acquire)
+}
+
+/// Diagnostic accessor: stride in pixels.
+#[doc(hidden)]
+pub fn __fb_stride() -> u32 {
+    FB_STRIDE_PX.load(Ordering::Acquire)
+}
+
 /// Paint a HUGE diagonal stripe across the FB — a build-marker
 /// of last resort. Covers the top 32 px × 1024 px so it's
 /// impossible to mistake for any per-slot beacon. Use a single
@@ -101,10 +113,53 @@ pub fn paint_build_stripe(color: u32) {
     }
 }
 
+/// Paint a colored square at horizontal slot `slot_idx`, ROW
+/// `row_idx`. Each row is 20 px tall (16 px square + 4 px gap)
+/// so up to ~38 rows fit in a 768-px-tall FB.
+#[inline(never)]
+pub fn paint_at(slot_idx: u32, row_idx: u32, color: u32) {
+    let phys = FB_PHYS.load(Ordering::Acquire);
+    if phys == 0 {
+        return;
+    }
+    let ceiling = FB_PHYS_CEILING.load(Ordering::Acquire);
+    if ceiling != 0 && phys >= ceiling {
+        return;
+    }
+    let stride = FB_STRIDE_PX.load(Ordering::Acquire) as u64;
+    let width = FB_WIDTH.load(Ordering::Acquire);
+    let height = FB_HEIGHT.load(Ordering::Acquire);
+    let slot_w: u32 = 32;
+    let slot_h: u32 = 16;
+    let gap: u32 = 4;
+    let row_pitch: u32 = slot_h + gap;
+    let x0 = slot_idx * (slot_w + gap);
+    let y0 = row_idx * row_pitch;
+    if x0 >= width || y0 >= height {
+        return;
+    }
+    let x1 = (x0 + slot_w).min(width);
+    let y1 = (y0 + slot_h).min(height);
+    let base = phys as *mut u32;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let off = (y as u64) * stride + (x as u64);
+            // SAFETY: registrar asserts FB phys is identity-mapped
+            // and writable; bounds checked above.
+            unsafe {
+                base.add(off as usize).write_volatile(color);
+            }
+        }
+    }
+    // Note: previously had SFENCE here to flush WC buffers, but
+    // that wasn't the actual bug and removing it doesn't matter.
+}
+
 /// Paint a colored square at horizontal slot `slot_idx` (top of FB).
 /// 32 × 16 px with 4 px gap; up to 32 slots in a 1024-px-wide FB.
 /// Skips silently if no FB is registered or the FB phys exceeds the
 /// registered ceiling.
+#[inline(never)]
 pub fn paint(slot_idx: u32, color: u32) {
     let phys = FB_PHYS.load(Ordering::Acquire);
     if phys == 0 {

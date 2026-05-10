@@ -231,6 +231,33 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         return;
     }
 
+    // Paint a HUGE diagnostic block to FB so real-HW boots
+    // without serial can see WHICH vector fired. Uses the
+    // beacon facility — slot index = vector number, color
+    // encodes vector range. Painted BEFORE writeln so even if
+    // console writes don't reach FB, the beacon block does.
+    {
+        // Color: distinct per common vector for easy ID.
+        let color: u32 = match frame.vector {
+            6 => 0x00FF0000,  // #UD red
+            13 => 0x00FF8000, // #GP orange
+            14 => 0x00FFFF00, // #PF yellow
+            8 => 0x00FF00FF,  // #DF magenta
+            18 => 0x000000FF, // #MC blue
+            _ => 0x00FFFFFF,  // anything else = white
+        };
+        // Paint slot = vector index in row 3 (y=60-76, well
+        // below earlier diagnostic rows so it's visible
+        // alongside any other beacons).
+        narf_memory::beacon::paint_at(frame.vector as u32, 3, color);
+        // Also paint a big bar across the whole top of row 4
+        // (y=80-96) for visibility — color matches the vector
+        // color so even if vector-slot is off-screen it's
+        // obvious a fault happened.
+        for slot in 0..16u32 {
+            narf_memory::beacon::paint_at(slot, 4, color);
+        }
+    }
     let _ = writeln!(Writer, "\n*** CPU EXCEPTION ***");
     let _ = writeln!(
         Writer,
