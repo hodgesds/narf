@@ -39,6 +39,15 @@ pub enum ProbeError {
     /// Device's cfg-space / BAR layout disagrees with what the driver
     /// expected (firmware bug, wrong device ID, etc.).
     BadDevice,
+    /// Class-match backstops (e.g. amdgpu's `MatchKind::Class { 0x03 }`
+    /// catching every PCI VGA controller) need to bail when the
+    /// vendor / device specifics don't actually fit them. Returning
+    /// this instead of `BadDevice` keeps the probe trace clean —
+    /// `probe_log` skips this variant so a real-HW boot doesn't get
+    /// flooded with `BadDevice` lines for every cross-vendor class
+    /// match. Not a failure in any meaningful sense; a more
+    /// specific match should pick the device up.
+    NotForThisDriver,
     /// Generic free-form error message — useful when a probe wants to
     /// surface a one-line reason without a typed variant.
     Other(&'static str),
@@ -230,8 +239,15 @@ pub fn probe_all(
         }
         let result = (m.probe)(*d, cap);
         if PROBE_LOG.load(core::sync::atomic::Ordering::Acquire) {
-            let err_dbg: Option<ProbeError> = result.err();
-            probe_log(_name, _vid, _did, /*pre=*/ false, err_dbg);
+            // NotForThisDriver = class-backstop saw a device the
+            // driver isn't responsible for. Suppress the post-call
+            // log line so the trace stays useful on real HW where
+            // every VGA / NIC / class-matched device would otherwise
+            // emit a `BadDevice`-flavour line per backstop.
+            if !matches!(result, Err(ProbeError::NotForThisDriver)) {
+                let err_dbg: Option<ProbeError> = result.err();
+                probe_log(_name, _vid, _did, /*pre=*/ false, err_dbg);
+            }
         }
         match result {
             Ok(()) => bound += 1,

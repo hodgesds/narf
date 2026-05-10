@@ -132,30 +132,26 @@ impl FbConsole {
     fn newline(&mut self) {
         self.cur_col = 0;
         if self.cur_row + 1 >= self.rows {
-            self.scroll_up_one_row();
+            // Screen full. The previous behaviour memmoved the
+            // entire framebuffer up one row (~8 MiB on 1080p)
+            // through write-uncached MMIO — hundreds of ms per
+            // newline on real HW, the visible cause of "one
+            // line per second" boot output.
+            //
+            // Wrap the cursor back to row 0 instead and clear
+            // the new line. Loses scrollback (the next ~135
+            // lines overwrite the prior screen), but boot
+            // throughput stops being framebuffer-bound. Real
+            // scrollback wants a shadow buffer + page-flip,
+            // separate work.
+            self.cur_row = 0;
         } else {
             self.cur_row += 1;
         }
-    }
-
-    /// Memmove rows[1..] into rows[0..rows-1], then clear the bottom row.
-    fn scroll_up_one_row(&mut self) {
-        let stride = self.fb.stride as usize;
-        let row_pixels = stride * GLYPH_H as usize;
-        let rows_to_move = (self.rows - 1) as usize;
-        let total_move_pixels = rows_to_move * row_pixels;
-        let base = self.fb.base() as *mut u32;
-        // SAFETY: src/dst both within the FB buffer (size = stride * height * 4),
-        // overlap is fine for ptr::copy (memmove semantics).
-        unsafe {
-            let dst = base;
-            let src = base.add(row_pixels);
-            ptr::copy(src, dst, total_move_pixels);
-        }
-        // Clear the new bottom row.
-        let bottom_y = (self.rows - 1) * GLYPH_H;
-        self.fb
-            .fill_rect(0, bottom_y, self.fb.width, GLYPH_H, self.bg);
+        // Clear the row we're about to write to so old text
+        // doesn't bleed through.
+        let y = self.cur_row * GLYPH_H;
+        self.fb.fill_rect(0, y, self.fb.width, GLYPH_H, self.bg);
     }
 }
 

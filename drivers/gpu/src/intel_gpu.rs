@@ -261,7 +261,7 @@ pub fn probe(
         return Ok(());
     }
     if device.id.vendor != INTEL_VENDOR {
-        return Err(narf_bus::ProbeError::BadDevice);
+        return Err(narf_bus::ProbeError::NotForThisDriver);
     }
     narf_bus::pci::set_command(
         &cap,

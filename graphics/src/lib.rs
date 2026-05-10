@@ -131,12 +131,40 @@ impl Framebuffer {
 
     /// Draw an opaque 8x8 monochrome glyph: bit 7..=0 of byte `n` is
     /// row `n` left-to-right, MSB = leftmost pixel.
+    ///
+    /// Hot path on real-HW boot — every console line draws ~80 of
+    /// these. The previous implementation called `draw_pixel` 64
+    /// times per glyph (full bounds check + write_volatile each),
+    /// which on a UEFI GOP framebuffer mapped UC turned every
+    /// console line into hundreds of milliseconds of uncached
+    /// MMIO. This version bounds-checks once and writes 8 pixels
+    /// per row in a tight loop with no per-pixel branching off
+    /// the function call stack.
     pub fn draw_glyph_8x8(&mut self, x: u32, y: u32, glyph: &[u8; 8], fg: Pixel32, bg: Pixel32) {
+        // Whole-glyph clip: drop the call if any pixel would land
+        // off-screen. Cheaper than 64 per-pixel checks and matches
+        // the FB console's invariant (row/col multiplied by 8 + 8
+        // fits inside width/height).
+        if x.saturating_add(8) > self.width || y.saturating_add(8) > self.height {
+            return;
+        }
+        let fg_raw = fg.raw();
+        let bg_raw = bg.raw();
+        let stride = self.stride;
+        let base = self.base;
         for (row, byte) in glyph.iter().enumerate() {
-            for col in 0..8 {
-                let on = (byte >> (7 - col)) & 1 != 0;
-                let p = if on { fg } else { bg };
-                self.draw_pixel(x + col as u32, y + row as u32, p);
+            // SAFETY: bounds checked above (x+8 ≤ width, y+8 ≤ height,
+            // stride ≥ width). Each offset is < stride * height.
+            unsafe {
+                let row_base = base.offset(((y + row as u32) * stride + x) as isize);
+                ptr::write_volatile(row_base.offset(0), if byte & 0x80 != 0 { fg_raw } else { bg_raw });
+                ptr::write_volatile(row_base.offset(1), if byte & 0x40 != 0 { fg_raw } else { bg_raw });
+                ptr::write_volatile(row_base.offset(2), if byte & 0x20 != 0 { fg_raw } else { bg_raw });
+                ptr::write_volatile(row_base.offset(3), if byte & 0x10 != 0 { fg_raw } else { bg_raw });
+                ptr::write_volatile(row_base.offset(4), if byte & 0x08 != 0 { fg_raw } else { bg_raw });
+                ptr::write_volatile(row_base.offset(5), if byte & 0x04 != 0 { fg_raw } else { bg_raw });
+                ptr::write_volatile(row_base.offset(6), if byte & 0x02 != 0 { fg_raw } else { bg_raw });
+                ptr::write_volatile(row_base.offset(7), if byte & 0x01 != 0 { fg_raw } else { bg_raw });
             }
         }
     }

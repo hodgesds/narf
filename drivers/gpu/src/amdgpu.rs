@@ -664,7 +664,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // reject non-AMD vendors so virtio-gpu / Bochs / Intel VGA
     // fall through to their own drivers.
     if device.id.vendor != AMD_VENDOR {
-        return Err(narf_bus::ProbeError::BadDevice);
+        return Err(narf_bus::ProbeError::NotForThisDriver);
     }
     narf_bus::pci::set_command(
         &cap,
