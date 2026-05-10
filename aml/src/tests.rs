@@ -1406,3 +1406,59 @@ fn smoke_aml_evaluate_s5_against_qemu_dsdt() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("aml", smoke_aml_evaluate_s5_against_qemu_dsdt);
+
+fn smoke_aml_namespace_walks_into_if_body() -> TestResult {
+    // Synthetic DSDT body containing a top-level If whose body
+    // declares a Device. Pre-#43 the namespace builder skipped
+    // the entire If package, so the inner Device wasn't
+    // registered. Post-fix it should be.
+    //
+    // Encoded:
+    //   IfOp PkgLength(9) ZeroOp DeviceOp(ExtOp 0x5B 0x82) PkgLength(5) "DEV1"
+    let body: alloc::vec::Vec<u8> = alloc::vec![
+        0xA0, // IfOp
+        0x09, // PkgLength = 1(self) + 1(predicate) + 7(device) = 9
+        0x00, // ZeroOp predicate
+        0x5B, 0x82, // ExtOp DeviceOp
+        0x05, // PkgLength = 1(self) + 4(NameSeg) = 5
+        b'D', b'E', b'V', b'1',
+    ];
+
+    if crate::__parse_body_for_test(&body, "\\").is_err() {
+        return TestResult::Fail("parse_body failed");
+    }
+    if crate::find_node("\\DEV1").is_none() {
+        return TestResult::Fail("Device inside If body wasn't registered");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml", smoke_aml_namespace_walks_into_if_body);
+
+fn smoke_aml_namespace_walks_into_else_body() -> TestResult {
+    // Synthetic DSDT: If(Zero){Device(D1)} Else {Device(D2)}.
+    // Both branches contribute to the static namespace, so both
+    // devices must register regardless of predicate.
+    //
+    // If pkg: IfOp PkgLength(9) ZeroOp DeviceOp PkgLength(5) "EID1"
+    // Else pkg: ElseOp PkgLength(8) DeviceOp PkgLength(5) "EID2"
+    let body: alloc::vec::Vec<u8> = alloc::vec![
+        // If(Zero) { Device(EID1) {} }
+        0xA0, 0x09, 0x00,
+        0x5B, 0x82, 0x05, b'E', b'I', b'D', b'1',
+        // Else { Device(EID2) {} }
+        0xA1, 0x08,
+        0x5B, 0x82, 0x05, b'E', b'I', b'D', b'2',
+    ];
+
+    if crate::__parse_body_for_test(&body, "\\").is_err() {
+        return TestResult::Fail("parse_body failed");
+    }
+    if crate::find_node("\\EID1").is_none() {
+        return TestResult::Fail("Device inside If body wasn't registered");
+    }
+    if crate::find_node("\\EID2").is_none() {
+        return TestResult::Fail("Device inside Else body wasn't registered");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml", smoke_aml_namespace_walks_into_else_body);

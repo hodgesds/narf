@@ -1128,25 +1128,43 @@ fn parse_term_list_inner(
                 //   IfOp PkgLength Predicate TermList
                 //   ElseOp PkgLength TermList
                 //
-                // Defensive: the namespace builder doesn't
-                // currently walk method bodies (where Ifs
-                // overwhelmingly live in real DSDTs), so this
-                // arm is effectively never hit on QEMU q35 +
-                // tested consumer-class firmware — but it's
-                // here so a future pass that does walk method
-                // bodies (or any DSDT that carries top-level
-                // Ifs) doesn't bail the outer term-list.
-                //
-                // Skip the entire package without trying to
-                // walk the body. Body extraction would need
-                // either the predicate-skipper helper
-                // (`skip_predicate_term_arg`) plus a recursive
-                // term-list walk, or a real method-body
-                // pre-scan pass. Filed as a follow-up.
+                // Recurse into the body's TermList so any
+                // Device / Method / Name etc. declared inside
+                // a top-level conditional registers in the
+                // namespace. Both branches of an If/Else
+                // declare the same names statically (the body
+                // is part of the namespace regardless of
+                // run-time predicate value), so walking
+                // unconditionally is correct for namespace
+                // building.
+                let is_if = op == IF_OP;
                 p.skip(1)?;
                 let pkg_start = p.pos;
                 let pkg_len = read_pkg_length(p)?;
                 let pkg_end = pkg_start.saturating_add(pkg_len).min(p.buf.len());
+
+                if is_if {
+                    // Skip the predicate TermArg. If the
+                    // skipper can't decode it, fall back to
+                    // jumping past the whole package — same
+                    // behaviour as before this change, just
+                    // localised.
+                    if skip_predicate_term_arg(p.buf, &mut p.pos, pkg_end).is_err() {
+                        p.pos = pkg_end;
+                        continue;
+                    }
+                }
+
+                // Recurse into the body. Use the soft-fail
+                // wrapper so a malformed inner body doesn't
+                // abort the outer walk.
+                if p.pos < pkg_end {
+                    parse_term_list(p, parent, count, pkg_end, base)?;
+                }
+                // Re-anchor at pkg_end regardless of how far
+                // the inner walk progressed — guards against
+                // partial sub-walks leaving the cursor inside
+                // an undecoded tail.
                 p.pos = pkg_end;
             }
             _ => {
