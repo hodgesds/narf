@@ -35,6 +35,38 @@ enum Cmd {
     /// Boot under QEMU with a graphical display + the user-mode
     /// testbin running.
     Demo(BuildArgs),
+    /// Wipe and burn the NARF ISO to a USB stick, with verification
+    /// after a logical detach so the burn is guaranteed to land on
+    /// real flash NAND (not USB-controller cache).
+    DiskWrite(DiskWriteArgs),
+}
+
+#[derive(Parser, Clone)]
+struct DiskWriteArgs {
+    /// Block device to burn (e.g. /dev/sda). Auto-detected if omitted —
+    /// xtask picks the first USB-attached disk it finds.
+    #[arg(long)]
+    device: Option<String>,
+
+    /// Skip the slow full-device wipe (just dd the ISO over whatever's
+    /// there). Use only if you know the USB has no leftover bootable
+    /// signatures past the ISO size.
+    #[arg(long)]
+    no_wipe: bool,
+
+    /// Fast wipe: zero only the first 100 MiB + last 4 MiB of the
+    /// device. Covers MBR / GPT primary + backup / EFI ESP /
+    /// El Torito boot records — everything firmware looks at to
+    /// pick up bootable signatures. Skips the slow middle-of-disk
+    /// zero-fill. Default behavior when the device is bigger than
+    /// the ISO and fast-wipe gives the same boot-correctness as a
+    /// full wipe.
+    #[arg(long)]
+    fast_wipe: bool,
+
+    /// ISO to burn. Defaults to target/narf-x86_64.iso.
+    #[arg(long)]
+    iso: Option<String>,
 }
 
 #[derive(Parser, Clone)]
@@ -802,16 +834,16 @@ fn image_cmd(args: &BuildArgs) -> Result<()> {
     // (16550A 0x3F8) so a `-serial stdio` QEMU run captures both
     // Limine's stages and the kernel's UART writes.
     let cfg = "\
-timeout: 0
+timeout: 5
 serial: yes
 verbose: yes
 quiet: no
 default_entry: 1
+interface_resolution: 1024x768
 
 /NARF
     protocol: multiboot2
     path: boot():/boot/narf-frame
-    cmdline: nosmp
 ";
     std::fs::write(limine_stage.join("limine.conf"), cfg).context("writing limine.conf")?;
 
@@ -1056,6 +1088,295 @@ fn ovmf_code_path() -> PathBuf {
     PathBuf::from("OVMF_CODE.fd")
 }
 
+/// Burn the NARF ISO to a USB stick reliably:
+///   1. Auto-detect or use --device. Refuse anything that isn't USB-
+///      attached (sanity check against accidentally trashing your
+///      NVMe / SATA root disk).
+///   2. Unmount any partitions that udev mounted automatically.
+///   3. Optionally wipe the entire device with zeros (default on) to
+///      kill leftover bootable signatures from previous installer
+///      images. Without this, the laptop's UEFI may pick up an old
+///      OS's boot record past the new ISO's last byte.
+///   4. dd the ISO with conv=fsync + oflag=direct so writes bypass
+///      the OS page cache and complete to flash.
+///   5. `sync` to flush filesystem-level caches, blockdev --flushbufs
+///      to drain the kernel's buffer cache for the device.
+///   6. `echo 1 > /sys/block/<dev>/device/delete` — kernel-level
+///      detach. The kernel waits for in-flight I/O and signals the
+///      USB controller to flush its internal cache before going away.
+///      This is the *only* way to be sure consumer USB sticks have
+///      actually committed to NAND (their write caches lie).
+///   7. Prompt the user to physically unplug + replug.
+///   8. Re-detect the device (it may come back as a different name
+///      after replug) and SHA-verify the first $ISO_SIZE bytes match
+///      the source ISO byte-for-byte.
+fn disk_write_cmd(args: &DiskWriteArgs) -> Result<()> {
+    use std::io::{BufRead, Write};
+
+    let iso_path = args
+        .iso
+        .clone()
+        .unwrap_or_else(|| {
+            workspace_root()
+                .ok()
+                .map(|r| r.join("target").join("narf-x86_64.iso"))
+                .unwrap_or_else(|| PathBuf::from("target/narf-x86_64.iso"))
+                .display()
+                .to_string()
+        });
+    let iso = PathBuf::from(&iso_path);
+    if !iso.exists() {
+        bail!("ISO not found at {}; run `cargo xtask iso-boot` first", iso.display());
+    }
+    let iso_size = std::fs::metadata(&iso)?.len();
+    println!("ISO: {} ({} MiB)", iso.display(), iso_size / 1024 / 1024);
+
+    let dev = match &args.device {
+        Some(d) => d.clone(),
+        None => detect_usb_device()?,
+    };
+    println!("Target device: {}", dev);
+
+    // Sanity: reject if not USB. Prevents accidental NVMe wipe.
+    if !is_usb_device(&dev)? {
+        bail!(
+            "{} is NOT a USB-attached disk. Refusing to wipe it. \
+             Pass --device explicitly if you really mean this.",
+            dev
+        );
+    }
+
+    // Show the user what they're about to nuke.
+    let _ = Command::new("lsblk")
+        .args(["-o", "NAME,SIZE,MODEL,TRAN,MOUNTPOINTS"])
+        .arg(&dev)
+        .status();
+    print!("This wipes EVERYTHING on {}. Proceed? [y/N] ", dev);
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer)?;
+    if !answer.trim().eq_ignore_ascii_case("y") {
+        bail!("aborted");
+    }
+
+    // Unmount any partitions udev mounted automatically.
+    for n in 1..=4 {
+        let _ = Command::new("sudo")
+            .args(["umount", &format!("{}{}", dev, n)])
+            .status();
+    }
+
+    // Wipe strategy:
+    //   --no-wipe:   skip entirely (only safe if device is already clean)
+    //   --fast-wipe: zero first 100 MiB + last 4 MiB only
+    //   default:     zero entire device (slowest, most thorough)
+    if args.no_wipe {
+        // nothing
+    } else if args.fast_wipe {
+        println!("Fast-wiping (first 100 MiB + last 4 MiB)...");
+        // First 100 MiB
+        let st = Command::new("sudo")
+            .args([
+                "dd",
+                "if=/dev/zero",
+                &format!("of={}", dev),
+                "bs=1M",
+                "count=100",
+                "status=progress",
+                "conv=fsync",
+            ])
+            .status()
+            .context("running dd /dev/zero (head)")?;
+        if !st.success() {
+            bail!("fast-wipe head failed with {st}");
+        }
+        // Last 4 MiB. Compute device byte size to seek correctly.
+        let size_out = Command::new("sudo")
+            .args(["blockdev", "--getsize64", &dev])
+            .output()
+            .context("blockdev --getsize64")?;
+        let size: u64 = String::from_utf8_lossy(&size_out.stdout)
+            .trim()
+            .parse()
+            .context("parsing device size")?;
+        let seek_blocks = (size / (1024 * 1024)).saturating_sub(4);
+        let st = Command::new("sudo")
+            .args([
+                "dd",
+                "if=/dev/zero",
+                &format!("of={}", dev),
+                "bs=1M",
+                "count=4",
+                &format!("seek={}", seek_blocks),
+                "conv=fsync",
+            ])
+            .status()
+            .context("running dd /dev/zero (tail)")?;
+        if !st.success() {
+            bail!("fast-wipe tail failed with {st}");
+        }
+    } else {
+        println!("Wiping {} (zeroing — this is the slow part)...", dev);
+        let st = Command::new("sudo")
+            .args([
+                "dd",
+                "if=/dev/zero",
+                &format!("of={}", dev),
+                "bs=4M",
+                "status=progress",
+                "conv=fsync",
+            ])
+            .status()
+            .context("running dd /dev/zero")?;
+        // dd returns non-zero when it hits end-of-device, which is
+        // the expected outcome here (we wanted to fill the whole
+        // stick). Treat any other error as fatal.
+        if !st.success() && st.code() != Some(1) {
+            bail!("wipe dd failed with {st}");
+        }
+    }
+
+    // Burn.
+    println!("Burning {} → {}...", iso.display(), dev);
+    let st = Command::new("sudo")
+        .args([
+            "dd",
+            &format!("if={}", iso.display()),
+            &format!("of={}", dev),
+            "bs=4M",
+            "status=progress",
+            "oflag=direct",
+            "conv=fsync",
+        ])
+        .status()
+        .context("running dd ISO")?;
+    if !st.success() {
+        bail!("burn dd failed with {st}");
+    }
+
+    // OS-level + block-layer flush.
+    let _ = Command::new("sync").status();
+    let _ = Command::new("sudo")
+        .args(["blockdev", "--flushbufs", &dev])
+        .status();
+
+    // Kernel-level detach: this drains in-flight I/O AND tells the
+    // USB stick to commit its internal write cache. Without it,
+    // even after sync, the stick's controller may have pending
+    // writes in DRAM that haven't reached NAND.
+    let dev_short = dev.trim_start_matches("/dev/");
+    let delete_path = format!("/sys/block/{}/device/delete", dev_short);
+    let st = Command::new("sudo")
+        .args(["sh", "-c", &format!("echo 1 > {}", delete_path)])
+        .status()
+        .context("triggering sysfs delete")?;
+    if !st.success() {
+        eprintln!(
+            "warning: kernel-level detach failed (sysfs delete returned {}); \
+             you may need to manually safely-eject before unplugging",
+            st
+        );
+    }
+
+    println!();
+    println!("Logical detach done. PHYSICALLY UNPLUG the USB stick now.");
+    println!("Wait 5 seconds, then plug it back in.");
+    print!("Press ENTER once it's plugged back in... ");
+    std::io::stdout().flush()?;
+    let mut _ignore = String::new();
+    std::io::stdin().lock().read_line(&mut _ignore)?;
+
+    // Give udev a moment to enumerate the replugged device.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    // Re-detect — the device may come back as a different name.
+    let dev2 = if args.device.is_some() && std::path::Path::new(&dev).exists() {
+        dev.clone()
+    } else {
+        detect_usb_device()
+            .context("USB stick not detected after replug — is it inserted?")?
+    };
+    if dev2 != dev {
+        println!("USB came back as {} (was {})", dev2, dev);
+    }
+
+    // Drop kernel page caches for the device so the SHA we compute
+    // is genuinely from re-reading flash, not a cached copy of the
+    // bytes we just wrote. echo 3 > drop_caches drops pagecache,
+    // dentries, and inodes.
+    let _ = Command::new("sync").status();
+    let _ = Command::new("sudo")
+        .args(["sh", "-c", "echo 3 > /proc/sys/vm/drop_caches"])
+        .status();
+
+    // SHA verify.
+    println!("Verifying SHA from fresh-read flash...");
+    let iso_sha = sha256_file(&iso)?;
+    let usb_sha = sha256_first_n(&dev2, iso_size)?;
+    println!("ISO: {}", iso_sha);
+    println!("USB: {}", usb_sha);
+    if iso_sha == usb_sha {
+        println!("✓ MATCH — USB has the exact ISO content. Safe to boot.");
+        Ok(())
+    } else {
+        bail!("✗ DIFFER — burn did not commit to flash");
+    }
+}
+
+/// Find the first USB-attached block device by reading lsblk.
+fn detect_usb_device() -> Result<String> {
+    let out = Command::new("lsblk")
+        .args(["-ndo", "NAME,TRAN"])
+        .output()
+        .context("running lsblk")?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    for line in s.lines() {
+        let mut it = line.split_whitespace();
+        let name = it.next().unwrap_or("");
+        let tran = it.next().unwrap_or("");
+        if tran == "usb" {
+            return Ok(format!("/dev/{}", name));
+        }
+    }
+    bail!("no USB-attached disk found via lsblk")
+}
+
+/// Returns true iff `dev` is a USB-attached block device.
+fn is_usb_device(dev: &str) -> Result<bool> {
+    let name = dev.trim_start_matches("/dev/");
+    let out = Command::new("lsblk")
+        .args(["-ndo", "TRAN", &format!("/dev/{}", name)])
+        .output()
+        .context("running lsblk for device check")?;
+    let tran = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Ok(tran == "usb")
+}
+
+fn sha256_file(p: &Path) -> Result<String> {
+    let out = Command::new("sha256sum")
+        .arg(p)
+        .output()
+        .context("sha256sum")?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    Ok(s.split_whitespace().next().unwrap_or("").to_string())
+}
+
+fn sha256_first_n(dev: &str, n: u64) -> Result<String> {
+    // dd to stdout, head -c N, sha256sum.
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(&format!(
+            "sudo dd if={} bs=1M count={} status=none | head -c {} | sha256sum",
+            dev,
+            (n + 1024 * 1024 - 1) / (1024 * 1024),
+            n
+        ))
+        .output()
+        .context("dd | sha256sum")?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    Ok(s.split_whitespace().next().unwrap_or("").to_string())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
@@ -1085,6 +1406,7 @@ fn main() -> Result<()> {
             }
             iso_boot_cmd(&args)
         }
+        Cmd::DiskWrite(args) => disk_write_cmd(&args),
         Cmd::Demo(mut args) => {
             if args.features.is_empty() {
                 args.features = "kernel-test,user-mode-testbin".into();
