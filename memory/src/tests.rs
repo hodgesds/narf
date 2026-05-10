@@ -1895,3 +1895,6 @@ fn smoke_context_predicate_drives_assert() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory/context", smoke_context_predicate_drives_assert);
+// Note: end-to-end "real IRQ handler observes in_irq() == true"
+// test lives in interrupts/src/tests.rs (memory crate doesn't
+// depend on narf-interrupts).

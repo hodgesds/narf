@@ -311,3 +311,59 @@ fn smoke_vector_alloc_block_contiguous() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("interrupts", smoke_vector_alloc_block_contiguous);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_dispatch_in_irq_observed_inside_handler() -> TestResult {
+    // End-to-end: install a synchronous handler on an unused
+    // vector, fire it via `int <vec>`, and verify the handler
+    // body observes `narf_lib::context::in_irq() == true`. This
+    // proves dispatch.rs's enter_irq/exit_irq instrumentation
+    // reaches real IRQ context (not just simulated context the
+    // memory-crate unit tests use).
+    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    // Vector 0xE0: outside the standard reserved set
+    // (32 = timer, 0xF0 = TLB shootdown, 0xFE = APIC error,
+    // 0xFF = spurious). Unallocated in the kernel today.
+    const TEST_VEC: u8 = 0xE0;
+
+    static FIRED: AtomicBool = AtomicBool::new(false);
+    static IN_IRQ_SEEN: AtomicU32 = AtomicU32::new(2); // sentinel
+
+    fn handler() {
+        FIRED.store(true, Ordering::Release);
+        IN_IRQ_SEEN.store(
+            if narf_lib::context::in_irq() { 1 } else { 0 },
+            Ordering::Release,
+        );
+    }
+
+    crate::dispatch::install(TEST_VEC, handler);
+    FIRED.store(false, Ordering::Release);
+    IN_IRQ_SEEN.store(2, Ordering::Release);
+
+    // Fire via software interrupt. The trap path routes
+    // vectors >= 32 through on_irq, which is the
+    // instrumentation under test.
+    // SAFETY: handler installed above; vector is unallocated
+    // outside this test.
+    unsafe {
+        core::arch::asm!("int {v}", v = const TEST_VEC, options(nomem, nostack));
+    }
+
+    crate::dispatch::clear_handler(TEST_VEC);
+
+    if !FIRED.load(Ordering::Acquire) {
+        return TestResult::Fail("synchronous handler didn't run");
+    }
+    if IN_IRQ_SEEN.load(Ordering::Acquire) != 1 {
+        return TestResult::Fail("handler didn't observe in_irq() == true");
+    }
+    // Post-handler: depth back to 0.
+    if narf_lib::context::in_irq() {
+        return TestResult::Fail("post-handler depth didn't return to 0");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("interrupts", smoke_dispatch_in_irq_observed_inside_handler);
