@@ -257,9 +257,9 @@ $ cargo xtask test --arch=x86_64
 
 | crate               | role                                                     |
 | ------------------- | -------------------------------------------------------- |
-| `narf-lib`          | Typed IDs, SpinLock, OnceLock, Bitmap, IntrusiveList.    |
+| `narf-lib`          | Typed IDs, SpinLock, OnceLock, Bitmap, IntrusiveList, per-CPU IRQ-depth tracker. |
 | `narf-arch`         | HAL: halt, interrupts, io_port, msr/cr, cpuid, pks.      |
-| `narf-memory`       | PhysAddr/VirtAddr, bump heap, PhysFrame allocator, paging API, MMU bring-up. |
+| `narf-memory`       | PhysAddr/VirtAddr, **buddy + slab + per-CPU magazines + hugepage pool + AtomicPool + AllocContext**, paging, MMU bring-up. |
 | `narf-boot`         | RawBootInfo, PVH / FDT memory-map parse.                 |
 | `narf-console`      | 16550A / PL011 + `remap_to_virtual` handoff plumbing.    |
 | `narf-time`         | Instant from TSC/CNTPCT + `SleepUntil` Future.           |
@@ -547,11 +547,13 @@ slow path in `frame/`, cooperative-cancel state machine in `abi/`.
 
 - **Higher-half migration**. Linker script lives at phys 0x100000,
   code-model=small. Every Stage-2+ convention expects -2 GiB kernel.
-- **Full buddy allocator**. `memory::frame` is free-stack / 4 KiB only.
-  Buddy + `Folio { order, head }` land when 2 MiB / 1 GiB mapping
-  gets consumers.
-- **Slab heap**. Retires the 1 MiB bump arena. Currently the bump arena
-  is ~50% consumed by the frame allocator's free-stack Vec.
+- ~~**Full buddy allocator**~~ — landed (`memory/src/buddy.rs`,
+  per-NUMA zones, orders 0..10).
+- ~~**Slab heap**~~ — landed (`memory/src/slab.rs` with per-CPU
+  magazines, hybrid bump→slab global allocator). Bootstrap arena
+  is `.bss`-backed at 8 MiB; ~750 KiB used pre-promotion on real
+  HW. See `memory/specification/heap-migration.md` for the
+  per-phase status.
 - **`frame/` trap-prologue PKRS save**. Scaffolding only. Once the
   scheduler's context-switch save/restore needs it (Stage 3 direct
   context transfer), wire the PKRS save into the trap prologue.
@@ -565,10 +567,9 @@ slow path in `frame/`, cooperative-cancel state machine in `abi/`.
    multiboot2 for future compat, but its contents parse
    `hvm_start_info`.
 2. **Low-half linking**. Kernel links at phys 0x100000 today.
-3. **Bump heap** under `#[global_allocator]` — not the buddy+slab.
-4. **aarch64 FDT walker is a stub** — synthesises a 128-MiB region
+3. **aarch64 FDT walker is a stub** — synthesises a 128-MiB region
    from QEMU-virt defaults.
-5. **Formal `DomainPrimitive` trait not declared yet** — the
+4. **Formal `DomainPrimitive` trait not declared yet** — the
    `arch::x86_64::pks` module has the shape (save/restore/get/set),
    but the trait itself waits for aarch64 MTE to provide the second
    implementation needed to justify the abstraction.
@@ -846,7 +847,8 @@ The critical-path Stage-2 items remaining:
    Low-value until APs come up.
 
 Parallel-safe micro-tasks:
-- Replace free-stack frame allocator with a buddy.
+- ~~Replace free-stack frame allocator with a buddy~~ — done
+  (`memory/src/buddy.rs`).
 - `rcu/` stub API so downstream crates don't retrofit.
 - `tracing/` USDT marker macro — `.note.narf.probes` section exists.
 
