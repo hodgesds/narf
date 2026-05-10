@@ -825,6 +825,15 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                 // memory_node() is populated. Subsequent
                                 // alloc_frame() calls honour locality.
                                 narf_memory::rebalance_to_topology();
+                                let _ = writeln!(
+                                    console::Writer,
+                                    "  heap: promoting global allocator from bump to slab..."
+                                );
+                                narf_memory::heap::promote_to_slab();
+                                let _ = writeln!(
+                                    console::Writer,
+                                    "  heap: slab is live"
+                                );
                                 let n_nodes = narf_acpi::node_count() as usize;
                                 let mut totals = 0usize;
                                 for i in 0..n_nodes.min(narf_memory::FRAME_MAX_NUMA_NODES) {
@@ -839,8 +848,8 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                 }
                                 let _ = writeln!(
                                     console::Writer,
-                                    "  frames: NUMA-rebalanced ({} per-node total)",
-                                    totals
+                                    "  frames: NUMA-rebalanced ({} per-node total); slab live"
+                                    , totals
                                 );
                             }
                             Err(e) => {
@@ -931,6 +940,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                 );
                             }
                         }
+                        let _ = writeln!(
+                            console::Writer,
+                            "  aml: parsing namespace..."
+                        );
                         // SAFETY: same.
                         match unsafe { narf_aml::parse_namespace(p) } {
                             Ok(n) => {

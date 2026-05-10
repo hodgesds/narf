@@ -87,6 +87,38 @@ impl BuddyZone {
         }
     }
 
+    /// Pre-allocate Vec capacity in every order's free list. Critical
+    /// for deadlock-avoidance once the slab is the global allocator:
+    /// without pre-reservation, a buddy `alloc()` that splits blocks
+    /// into lower orders does `Vec::push` which may need to grow the
+    /// Vec, which routes to the global allocator (now slab), which
+    /// itself calls back into the buddy (`alloc_frame` for slab page
+    /// growth) — and the outer caller is holding `frame::ALLOC.lock()`.
+    /// Recursive lock acquisition deadlocks.
+    ///
+    /// Pre-allocating capacity up-front means `Vec::push` never has
+    /// to grow during runtime. Total entries across all orders is
+    /// bounded by `total_frames` (worst case: every frame is its own
+    /// order-0 block), so reserving that much in order 0 is the
+    /// pessimistic bound. Higher orders need progressively less.
+    /// Cost: ~2x `total_frames * 8` bytes of capacity.
+    ///
+    /// MUST be called while the global allocator is still bump (i.e.
+    /// before `promote_to_slab`).
+    pub fn reserve_growth_capacity(&mut self, total_frames: usize) {
+        for order in 0..NUM_ORDERS {
+            // Worst-case blocks at this order = total_frames / 2^order.
+            // Add slack for fragmentation and donate's leading partial
+            // block.
+            let cap = (total_frames >> order).max(64) + 64;
+            // Reserve in addition to current len so we don't realloc later.
+            let need = cap.saturating_sub(self.free_lists[order].capacity());
+            if need > 0 {
+                self.free_lists[order].reserve_exact(need);
+            }
+        }
+    }
+
     /// Donate a contiguous range of frames `[first_frame .. first_frame + frame_count)`
     /// to this zone. Splits into the largest naturally-aligned blocks
     /// the range can support.
@@ -229,30 +261,38 @@ impl BuddyZone {
         self.total_frames
     }
 
-    /// Move every free block to another zone. Used by
-    /// `rebalance_to_topology` to reassign bin 0 across NUMA nodes.
-    /// `predicate(frame_no)` returns true iff the block belongs in
-    /// the destination zone.
+    /// Move every free block to another zone where `predicate` is
+    /// true. Used by `rebalance_to_topology` to reassign zone 0
+    /// across NUMA nodes.
+    ///
+    /// Implemented as in-place swap-removal so we don't allocate
+    /// temporary Vecs — the global allocator may itself call back
+    /// into the buddy (slab refill), and we're holding the
+    /// frame-allocator lock for the duration. Allocating here
+    /// would recurse and deadlock.
     pub fn drain_into(
         &mut self,
         dest: &mut BuddyZone,
         predicate: impl Fn(u64) -> bool,
     ) {
         for order in 0..NUM_ORDERS {
-            let mut keep = Vec::new();
-            for frame in self.free_lists[order].drain(..) {
+            let mut i = 0;
+            while i < self.free_lists[order].len() {
+                let frame = self.free_lists[order][i];
                 if predicate(frame) {
+                    self.free_lists[order].swap_remove(i);
                     let block_frames = order_frames(order as u8) as usize;
                     self.free_frames -= block_frames;
                     self.total_frames -= block_frames;
                     dest.free_lists[order].push(frame);
                     dest.free_frames += block_frames;
                     dest.total_frames += block_frames;
+                    // Don't increment i — swap_remove pulled a
+                    // new element into position i.
                 } else {
-                    keep.push(frame);
+                    i += 1;
                 }
             }
-            self.free_lists[order] = keep;
         }
     }
 }

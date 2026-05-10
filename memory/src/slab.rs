@@ -1,5 +1,20 @@
 //! Size-class slab allocator over the page-frame buddy.
 //!
+//! # Clean-room provenance
+//!
+//! Algorithm references:
+//!   - Bonwick, J. (1994). "The Slab Allocator: An Object-Caching
+//!     Kernel Memory Allocator." USENIX Summer 1994.
+//!     <https://www.usenix.org/legacy/publications/library/proceedings/bos94/full_papers/bonwick.ps>
+//!   - Bonwick, J. & Adams, J. (2001). "Magazines and Vmem:
+//!     Extending the Slab Allocator to Many CPUs and Arbitrary
+//!     Resources." USENIX 2001.
+//!     <https://www.usenix.org/legacy/event/usenix01/full_papers/bonwick/bonwick.pdf>
+//!
+//! No GPL source consulted. See `memory/specification/heap-migration.md` §0.
+//!
+//! # Shape
+//!
 //! Single-CPU today; the per-CPU magazine layer slots on top once
 //! SMP brings up application processors. The shape:
 //!
@@ -41,7 +56,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use narf_lib::percpu::{current_cpu, MAX_CPUS};
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::frame::{alloc_frame, free_frame, PhysFrame};
+use crate::buddy::MAX_ORDER;
+use crate::frame::{alloc_frame, alloc_pages_on, free_frame, free_pages, PhysFrame};
 use crate::PAGE_SIZE;
 
 /// Local `usize` view of `PAGE_SIZE` (which the rest of the crate
@@ -335,24 +351,37 @@ fn alloc_large(layout: Layout) -> Result<NonNull<u8>, SlabError> {
     if n_pages == 0 {
         return Err(SlabError::LayoutUnsupported);
     }
-    if n_pages > 1 {
-        // Multi-page contiguous allocations need a buddy / region
-        // allocator that we don't yet expose. Stage-5 follow-up.
-        return Err(SlabError::LayoutUnsupported);
-    }
-    let frame = alloc_frame()?;
+    // Find the smallest buddy order that fits n_pages.
+    // order N covers 1 << N pages.
+    let order = pages_to_order(n_pages)?;
+    let frame = alloc_pages_on(0, order)?;
     LARGE_IN_USE.fetch_add(1, Ordering::Relaxed);
     let p = frame.start_address().kernel_mut_ptr::<u8>();
     // SAFETY: `p` is reachable through the per-arch kernel
-    // mapping + page-aligned.
+    // mapping + page-aligned to its order.
     Ok(unsafe { NonNull::new_unchecked(p) })
 }
 
-unsafe fn dealloc_large(ptr: NonNull<u8>, _layout: Layout) {
+unsafe fn dealloc_large(ptr: NonNull<u8>, layout: Layout) {
     let phys = crate::PhysAddr::new(ptr.as_ptr() as u64);
     let frame = PhysFrame::new(phys);
-    free_frame(frame);
+    let n_pages = (layout.size() + PAGE_SIZE_USIZE - 1) / PAGE_SIZE_USIZE;
+    let order = pages_to_order(n_pages).unwrap_or(0);
+    free_pages(frame, order);
     LARGE_IN_USE.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// Smallest buddy order that fits `n_pages`. Returns Err when the
+/// requested page count exceeds MAX_ORDER (1 << 10 = 4 MiB).
+fn pages_to_order(n_pages: usize) -> Result<u8, SlabError> {
+    if n_pages == 0 {
+        return Ok(0);
+    }
+    let order = (n_pages.next_power_of_two().trailing_zeros()) as u8;
+    if order > MAX_ORDER {
+        return Err(SlabError::LayoutUnsupported);
+    }
+    Ok(order)
 }
 
 /// Per-class diagnostic snapshot.

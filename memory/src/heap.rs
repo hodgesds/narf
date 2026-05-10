@@ -1,86 +1,143 @@
-//! Stage-1 bump allocator backing `#[global_allocator]`.
+//! Hybrid bootstrap-bump + slab global allocator.
 //!
-//! This is explicitly NOT the Stage-2 allocator described in `memory/`
-//! §3. It's a tiny linear arena over a compile-time-sized `static`
-//! buffer, there purely so we can use `alloc::{boxed, vec}` in the
-//! scheduler / time subsystems before the buddy allocator lands.
+//! Two-phase global allocation:
 //!
-//! Free is a no-op: bump allocators don't reclaim. Sizing is tuned so
-//! Stage 1 never exhausts it — if it does, `alloc_error_handler` fires
-//! and the kernel halts with a visible error.
+//! 1. **Bootstrap phase** (from `_start_rust` until the buddy is
+//!    seeded by `init_from_map`). Allocations come from a small
+//!    static bump arena in `.bss` — single-page tables, capability
+//!    bookkeeping, and other very-early kernel objects fit easily
+//!    in a few MiB.
+//! 2. **Slab phase** (after `promote_to_slab()` is called).
+//!    Allocations route to `crate::slab` (per-CPU magazines + central
+//!    size-class free lists), which is in turn backed by the buddy.
+//!
+//! Promotion is one-way: once we're on the slab, we don't fall back.
+//! `dealloc` checks the pointer's address: if it's inside the
+//! bootstrap arena, it's a bump-era allocation that we can't reclaim
+//! (typical bump semantics); otherwise it's a slab object and gets
+//! freed properly.
+//!
+//! See `memory/specification/heap-migration.md` for the full plan.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-/// Heap capacity. The Stage-1 bump allocator never reclaims, so the
-/// total budget is the sum of every allocation made for the lifetime
-/// of the kernel — including every smoke test's mounts / fd tables /
-/// MemFs files in a single QEMU boot. 1 MiB was the original Stage-1
-/// floor and was tight by the time Tier-3 VFS work landed
-/// (185+ tests, each retaining state in the global registry +
-/// per-task tables). 4 MiB gives enough headroom for the current
-/// suite plus a few rounds of growth before the Wave-2 buddy+slab
-/// replacement (per `memory/` spec) makes the question moot.
-pub const HEAP_CAPACITY: usize = 128 << 20;
+use crate::slab;
 
-/// Byte storage for the bump arena. Lives in `.bss`; aligned to 16 so
-/// any alignment ≤ 16 alloc request is trivially satisfiable.
+/// Bootstrap arena size. Has to cover every allocation up to the
+/// point `promote_to_slab()` is called. While we're still
+/// debugging the slab promotion path, this stays at the old
+/// 128 MiB so tests don't run out — once the slab is solid,
+/// drop back to ~4 MiB (real boot's pre-promotion footprint is
+/// on the order of 100 KiB).
+pub const BOOTSTRAP_CAPACITY: usize = 128 << 20;
+
+/// Byte storage for the bootstrap bump arena. Lives in `.bss`,
+/// 16-byte aligned for any alignment ≤ 16 to be trivially satisfiable.
 #[repr(C, align(16))]
-struct HeapBacking(UnsafeCell<[u8; HEAP_CAPACITY]>);
+struct HeapBacking(UnsafeCell<[u8; BOOTSTRAP_CAPACITY]>);
 unsafe impl Sync for HeapBacking {}
 
-static HEAP: HeapBacking = HeapBacking(UnsafeCell::new([0; HEAP_CAPACITY]));
+static HEAP: HeapBacking = HeapBacking(UnsafeCell::new([0; BOOTSTRAP_CAPACITY]));
 static OFFSET: AtomicUsize = AtomicUsize::new(0);
 
-/// The global-allocator adapter.
+/// True once the slab is initialized and ready to serve allocations.
+/// Flipped by `promote_to_slab()` after `init_from_map`.
+static SLAB_LIVE: AtomicBool = AtomicBool::new(false);
+
+/// Promote the global allocator from bootstrap-bump to slab. Call
+/// exactly once, after `init_from_map` has populated the buddy.
+/// Allocations made before this point stay in the bootstrap arena
+/// (and stay leaked, per bump semantics); allocations after route
+/// to the slab.
+pub fn promote_to_slab() {
+    SLAB_LIVE.store(true, Ordering::Release);
+}
+
+/// The hybrid global allocator. Pre-promotion: bump arena.
+/// Post-promotion: slab routes to size-class central + per-CPU
+/// magazines.
 pub struct BumpAllocator;
 
 impl core::fmt::Debug for BumpAllocator {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("BumpAllocator")
-            .field("used", &OFFSET.load(Ordering::Relaxed))
-            .field("capacity", &HEAP_CAPACITY)
+            .field("bootstrap_used", &OFFSET.load(Ordering::Relaxed))
+            .field("bootstrap_capacity", &BOOTSTRAP_CAPACITY)
+            .field("slab_live", &SLAB_LIVE.load(Ordering::Relaxed))
             .finish()
     }
 }
 
+/// Returns true iff `ptr` lies inside the bootstrap arena's bytes.
+/// Used by `dealloc` to route freeing to the right path.
+fn in_bootstrap(ptr: *mut u8) -> bool {
+    let base = HEAP.0.get() as *mut u8 as usize;
+    let end = base + BOOTSTRAP_CAPACITY;
+    let p = ptr as usize;
+    p >= base && p < end
+}
+
 unsafe impl GlobalAlloc for BumpAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // Slab path — only available post-promotion.
+        if SLAB_LIVE.load(Ordering::Acquire) {
+            match slab::alloc(layout) {
+                Ok(p) => return p.as_ptr(),
+                Err(_) => return core::ptr::null_mut(),
+            }
+        }
+        // Bootstrap bump fast path.
         let align = layout.align().max(1);
         let size = layout.size();
-
-        // Lock-free bump: CAS on a `(offset)` atomic. Align up, add size,
-        // reject if we'd overrun the arena.
         loop {
             let cur = OFFSET.load(Ordering::Relaxed);
             let aligned = (cur + align - 1) & !(align - 1);
             let end = match aligned.checked_add(size) {
-                Some(e) if e <= HEAP_CAPACITY => e,
+                Some(e) if e <= BOOTSTRAP_CAPACITY => e,
                 _ => return core::ptr::null_mut(),
             };
             if OFFSET
                 .compare_exchange_weak(cur, end, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
-                // SAFETY: `aligned..end` lies entirely inside HEAP.0.
+                // SAFETY: `aligned..end` lies inside HEAP.0.
                 let base = HEAP.0.get() as *mut u8;
                 return unsafe { base.add(aligned) };
             }
         }
     }
 
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
-        // Bump: never reclaim. Stage 2's slab owns this responsibility.
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // Pointers from the bootstrap arena can't be freed (bump
+        // doesn't track sizes per slot). Skipping is correct —
+        // those bytes stay leaked, but the arena is small + bounded.
+        if in_bootstrap(ptr) {
+            return;
+        }
+        // SAFETY: caller asserts the pointer/layout pair came from
+        // a prior `alloc` call. By construction, anything not in the
+        // bootstrap arena came from the slab.
+        if let Some(nn) = core::ptr::NonNull::new(ptr) {
+            unsafe {
+                slab::dealloc(nn, layout);
+            }
+        }
     }
 }
 
-/// Snapshot of arena usage for diagnostics.
+/// Snapshot of bootstrap arena usage for diagnostics. Does NOT
+/// include slab usage — see `crate::slab::stats()` for that.
 pub fn used_bytes() -> usize {
     OFFSET.load(Ordering::Relaxed)
 }
 
-/// Total capacity.
+/// Bootstrap arena total capacity.
 pub const fn capacity_bytes() -> usize {
-    HEAP_CAPACITY
+    BOOTSTRAP_CAPACITY
 }
+
+/// Backwards-compat alias. The constant is now BOOTSTRAP_CAPACITY,
+/// but external diagnostics may still reference HEAP_CAPACITY.
+pub const HEAP_CAPACITY: usize = BOOTSTRAP_CAPACITY;

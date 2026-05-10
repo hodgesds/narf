@@ -178,6 +178,22 @@ pub unsafe fn init_from_map(usable: &[UsableRegion], exclude: &[(u64, u64)]) {
     guard.total_frames = total;
     guard.reserved_frames = reserved;
     guard.numa_aware = false;
+    // Pre-reserve Vec capacity in every zone so split/coalesce
+    // pushes never grow the underlying Vec at runtime. Critical
+    // for deadlock-avoidance once the slab is the global allocator:
+    // a Vec growth would route through slab → buddy → ALLOC.lock()
+    // (already held by us) → recursive deadlock.
+    //
+    // Done HERE while the global allocator is still bump (so the
+    // capacity allocation itself doesn't recurse).
+    for zone in guard.zones.iter_mut() {
+        zone.reserve_growth_capacity(total);
+    }
+    // NOTE: we deliberately do NOT promote the global allocator to
+    // the slab here. `rebalance_to_topology` (called later from
+    // bare_main, after ACPI SRAT parsing) does its own work; promote
+    // happens after that, via an explicit
+    // `crate::heap::promote_to_slab()` call from bare_main.
 }
 
 /// Donate the byte range `[start, end)` to `zone`, splitting around
