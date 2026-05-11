@@ -109,6 +109,135 @@ fn smoke_io_iommu_stub_map_unmap() -> TestResult {
 }
 kernel_test_in!("io", smoke_io_iommu_stub_map_unmap);
 
+// ── IOMMU detection + identity-map ───────────────────────────────
+
+fn smoke_iommu_initial_state_is_disabled_or_identity() -> TestResult {
+    // Either the test boot ran narf_io::iommu::init (Identity) or
+    // it didn't get that far (Disabled). Anything else means
+    // someone snuck in PerDomain mode without test coverage.
+    use crate::iommu;
+    match iommu::mode() {
+        iommu::IommuMode::Disabled | iommu::IommuMode::Identity => TestResult::Pass,
+        iommu::IommuMode::PerDomain => TestResult::Fail("PerDomain mode active without backend"),
+    }
+}
+kernel_test_in!("io/iommu", smoke_iommu_initial_state_is_disabled_or_identity);
+
+fn smoke_iommu_force_identity_makes_map_passthrough() -> TestResult {
+    // Force identity mode in the test fixture (so this passes
+    // even on a boot path that didn't bring up real IVRS/DMAR
+    // tables) and verify map_phys is a pure pass-through.
+    use crate::iommu;
+
+    let prev_mode = iommu::mode();
+    iommu::__force_identity_for_test();
+    let pass_through = iommu::map_phys(0xCAFE_F000).map(|x| x == 0xCAFE_F000).unwrap_or(false);
+    let unmap_through = iommu::unmap_iova(0xCAFE_F000).map(|x| x == 0xCAFE_F000).unwrap_or(false);
+    if !pass_through {
+        iommu::__reset_for_test();
+        return TestResult::Fail("identity map_phys must be a pass-through");
+    }
+    if !unmap_through {
+        iommu::__reset_for_test();
+        return TestResult::Fail("identity unmap_iova must be a pass-through");
+    }
+    iommu::__reset_for_test();
+    // Restore prior mode hint by re-running a no-op. (We can't
+    // perfectly restore without re-running init, but follow-on
+    // tests reset themselves explicitly.)
+    let _ = prev_mode;
+    TestResult::Pass
+}
+kernel_test_in!("io/iommu", smoke_iommu_force_identity_makes_map_passthrough);
+
+fn smoke_iommu_double_init_rejected() -> TestResult {
+    // The second call to init must report AlreadyInitialised
+    // without flipping mode back through Disabled.
+    use crate::iommu;
+    iommu::__reset_for_test();
+    iommu::__force_identity_for_test();
+    match iommu::init() {
+        Err(iommu::IommuInitError::AlreadyInitialised) => {
+            iommu::__reset_for_test();
+            TestResult::Pass
+        }
+        _ => {
+            iommu::__reset_for_test();
+            TestResult::Fail("double init must return AlreadyInitialised")
+        }
+    }
+}
+kernel_test_in!("io/iommu", smoke_iommu_double_init_rejected);
+
+fn smoke_iommu_context_map_returns_identity_iova() -> TestResult {
+    // Allocate a coherent buffer, force-identity the IOMMU, map
+    // it through an IommuContext — the returned IOVA must equal
+    // the buffer's host-physical address (identity mode).
+    use crate::iommu;
+    use crate::{alloc_coherent, free_coherent, IommuContext};
+    use narf_lib::id::DomainId;
+
+    let dom = DomainId::DRIVER_0;
+    let buf = match alloc_coherent(256, dom) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Skip("frame allocator unavailable"),
+    };
+    let phys = buf.phys_addr().raw();
+
+    iommu::__force_identity_for_test();
+    let ctx = IommuContext::new(dom);
+    let iova = match ctx.map(&buf, 0) {
+        Ok(v) => v,
+        Err(_) => {
+            iommu::__reset_for_test();
+            free_coherent(buf);
+            return TestResult::Fail("map under identity mode returned Err");
+        }
+    };
+    if iova != phys {
+        iommu::__reset_for_test();
+        free_coherent(buf);
+        return TestResult::Fail("identity-mode IOVA must equal the buffer phys");
+    }
+    if ctx.unmap(iova, buf.len()).is_err() {
+        iommu::__reset_for_test();
+        free_coherent(buf);
+        return TestResult::Fail("identity-mode unmap returned Err");
+    }
+    if ctx.mapping_count() != 0 {
+        iommu::__reset_for_test();
+        free_coherent(buf);
+        return TestResult::Fail("mapping count not reset after unmap");
+    }
+
+    iommu::__reset_for_test();
+    free_coherent(buf);
+    TestResult::Pass
+}
+kernel_test_in!("io/iommu", smoke_iommu_context_map_returns_identity_iova);
+
+fn smoke_iommu_init_no_tables_returns_no_tables_parsed() -> TestResult {
+    // With both IVRS and DMAR un-parsed, init must report
+    // NoTablesParsed (so callers know to parse first).
+    // We can only verify this when the real boot path didn't
+    // already populate the parser caches; otherwise the
+    // condition is unreachable in tests.
+    use crate::iommu;
+    iommu::__reset_for_test();
+    if narf_acpi::is_ivrs_known() || narf_acpi::is_dmar_known() {
+        return TestResult::Skip("ACPI tables already parsed in this boot");
+    }
+    match iommu::init() {
+        Err(iommu::IommuInitError::NoTablesParsed) => TestResult::Pass,
+        other => {
+            iommu::__reset_for_test();
+            let _ = other;
+            TestResult::Fail("init without parsed tables should be NoTablesParsed")
+        }
+    }
+}
+kernel_test_in!("io/iommu", smoke_iommu_init_no_tables_returns_no_tables_parsed);
+
 fn smoke_ioremap_direct_round_trip() -> TestResult {
     // Allocate a frame, scribble a sentinel through the identity
     // map, ioremap it as WriteBack-cached memory, read the

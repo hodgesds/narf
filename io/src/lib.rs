@@ -11,6 +11,7 @@
 
 extern crate alloc;
 
+pub mod iommu;
 mod tests;
 
 use core::fmt;
@@ -357,19 +358,35 @@ impl IommuContext {
         self.mappings.load(Ordering::Relaxed)
     }
 
-    pub fn map(&self, buf: &DmaBuffer, _fixed_iova: u64) -> Result<u64, IoError> {
+    /// Translate a buffer's host-physical address into a device-
+    /// usable IOVA via the active IOMMU backend. In identity
+    /// mode (the only mode active right now) the IOVA equals
+    /// the buffer's `phys`. The `fixed_iova` argument is
+    /// retained as a hint for future per-domain modes that may
+    /// honour caller-chosen virtual addresses; identity mode
+    /// ignores it.
+    pub fn map(&self, buf: &DmaBuffer, fixed_iova: u64) -> Result<u64, IoError> {
         if buf.domain() != self.domain {
             return Err(IoError::DomainMismatch);
         }
+        let iova = match iommu::mode() {
+            iommu::IommuMode::Disabled => fixed_iova.max(buf.phys.as_u64()),
+            iommu::IommuMode::Identity => iommu::map_phys(buf.phys.as_u64())?,
+            iommu::IommuMode::PerDomain => return Err(IoError::NotMapped),
+        };
         self.mappings.fetch_add(1, Ordering::Relaxed);
-        Ok(_fixed_iova)
+        Ok(iova)
     }
 
-    pub fn unmap(&self, _iova: u64, _len: usize) -> Result<(), IoError> {
+    pub fn unmap(&self, iova: u64, _len: usize) -> Result<(), IoError> {
         let prev = self.mappings.fetch_sub(1, Ordering::Relaxed);
         if prev == 0 {
+            self.mappings.fetch_add(1, Ordering::Relaxed); // restore
             return Err(IoError::NotMapped);
         }
+        // Identity / disabled paths don't actually touch
+        // hardware; per-domain mode walks the table.
+        let _ = iommu::unmap_iova(iova)?;
         Ok(())
     }
 }

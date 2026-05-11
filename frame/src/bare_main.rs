@@ -974,6 +974,44 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                 );
                             }
                         }
+                        // IOMMU topology: IVRS (AMD-Vi) + DMAR
+                        // (Intel VT-d). Either one being present
+                        // is enough for narf_io::iommu::init below
+                        // to pick a backend.
+                        // SAFETY: same.
+                        match unsafe { narf_acpi::parse_ivrs(p) } {
+                            Ok(n) => {
+                                let _ = writeln!(
+                                    console::Writer,
+                                    "  acpi: IVRS parsed, {} IOMMU(s)",
+                                    n
+                                );
+                            }
+                            Err(e) => {
+                                let _ = writeln!(
+                                    console::Writer,
+                                    "  acpi: IVRS parse skipped: {:?}",
+                                    e
+                                );
+                            }
+                        }
+                        // SAFETY: same.
+                        match unsafe { narf_acpi::parse_dmar(p) } {
+                            Ok(n) => {
+                                let _ = writeln!(
+                                    console::Writer,
+                                    "  acpi: DMAR parsed, {} DRHD(s)",
+                                    n
+                                );
+                            }
+                            Err(e) => {
+                                let _ = writeln!(
+                                    console::Writer,
+                                    "  acpi: DMAR parse skipped: {:?}",
+                                    e
+                                );
+                            }
+                        }
                         let _ = writeln!(
                             console::Writer,
                             "  aml: parsing namespace..."
@@ -2012,6 +2050,37 @@ fn run_async_demo() -> ! {
                 let _ = writeln!(
                     console::Writer,
                     "  timer_pump: init failed ({:?}) — sleeps will busy-poll",
+                    e
+                );
+            }
+        }
+    }
+
+    // IOMMU probe + identity-map enable. Drivers doing DMA
+    // benefit from a known-good translation path (no SMMU faults
+    // on virtualized hosts; future per-driver isolation slots
+    // in here). Failure is non-fatal — alloc_coherent + the
+    // IommuContext::map fallback still hand out identity-
+    // equivalent addresses, so drivers see the same behaviour
+    // they did before the IOMMU work landed.
+    {
+        match narf_io::iommu::init() {
+            Ok(mode) => {
+                let caps = narf_io::iommu::caps();
+                let _ = writeln!(
+                    console::Writer,
+                    "  iommu: {} initialised in {:?} mode ({} unit(s), max_iova_bits {}, IR {})",
+                    narf_io::iommu::vendor(),
+                    mode,
+                    narf_io::iommu::unit_count(),
+                    caps.max_iova_bits,
+                    if caps.interrupt_remap { "supported" } else { "absent" },
+                );
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    console::Writer,
+                    "  iommu: init skipped ({:?}) — drivers use identity-equivalence",
                     e
                 );
             }
