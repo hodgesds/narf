@@ -303,6 +303,38 @@ RustCrypto remains available but unaudited; drivers needing
 them mark `requires_unaudited_crypto = true` in their
 manifest and the cert chain must explicitly authorise.
 
+**Licensing:** every adopted crate is MIT- and/or Apache-2.0-
+licensed; **no GPL-derived code is pulled in or referenced**.
+That keeps the workspace (MPL-2.0) compatible with the kernel
+license posture. Crate licenses are reverified each time the
+audit baseline is bumped.
+
+#### 9.2.1 Clean-room implementations
+
+In parallel with the RustCrypto wrappers, `crypto/src/` holds
+from-scratch implementations of the primitives we need to be
+able to ship without an external dependency. Every algorithm
+is implemented directly from its public specification — no code
+copied, transliterated, or paraphrased from a GPL source — and
+the canonical references are linked in-module:
+
+| Algorithm        | Module                       | Authoritative spec                                                    |
+|------------------|------------------------------|------------------------------------------------------------------------|
+| SHA-256          | `sha256.rs`                  | <https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.180-4.pdf>          |
+| SHA-512          | `sha512.rs`                  | <https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.180-4.pdf>          |
+| ChaCha20         | `chacha20.rs`                | <https://datatracker.ietf.org/doc/html/rfc8439>                        |
+| Poly1305         | `poly1305.rs`                | <https://datatracker.ietf.org/doc/html/rfc8439#section-2.5>            |
+| ChaCha20-Poly1305 AEAD | `aead.rs`              | <https://datatracker.ietf.org/doc/html/rfc8439#section-2.8>            |
+| HKDF-SHA-256     | `hkdf.rs`                    | <https://datatracker.ietf.org/doc/html/rfc5869>                        |
+| Curve25519 / Ed25519 field arith. | `curve25519.rs` | <https://datatracker.ietf.org/doc/html/rfc7748>, <https://datatracker.ietf.org/doc/html/rfc8032>, <https://cr.yp.to/ecdh/curve25519-20060209.pdf>, <https://eprint.iacr.org/2008/522.pdf> |
+| Ed25519 signing/verify | `ed25519.rs`           | <https://datatracker.ietf.org/doc/html/rfc8032>                        |
+
+Known-answer tests live in `crypto/src/primitive_tests.rs`.
+Each test cites its source vector (FIPS 180-4 SHA examples,
+RFC 8032 §7.1, RFC 8439 §2.4.2 / §2.5.2 / §2.8.2, RFC 5869
+Appendix A.1) so the clean-room provenance can be re-audited
+from the test suite alone.
+
 ### 9.3 FIPS mode (resolved)
 
 **Decision:** **FIPS-compliance is a Stage 5+ effort**, not
