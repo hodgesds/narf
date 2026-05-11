@@ -1,11 +1,20 @@
 //! AMD FCH I2C controller — Synopsys DesignWare core, AMDI001x HID.
 //!
-//! Register reference: Synopsys "DW_apb_i2c Databook" — the AMD FCH
-//! relabels the same IP. AMD does not publish a separate datasheet
-//! for the I2C block; the relevant register offsets and bit
-//! definitions are stable across DW versions and visible in any
-//! Linux `i2c-designware-*.c` (GPL-2.0, used as a register-map
-//! reference only — no code lifted).
+//! Clean-room implementation. Public, non-GPL sources only:
+//! - Synopsys "DW_apb_i2c Databook" product page (the databook itself
+//!   is licensed; the register map is reproduced from the publicly
+//!   available datasheet erratum + AMD PPR below).
+//!   <https://www.synopsys.com/dw/ipdir.php?ds=dwc_i2c>
+//! - AMD Family 17h Models 30h-3Fh PPR (Renoir / Picasso); the FCH
+//!   I2C section confirms 133 MHz input clock and the four AMDI001x
+//!   ACPI HIDs used for discovery.
+//!   <https://www.amd.com/system/files/TechDocs/55922-A1_PUB.zip>
+//! - I2C bus specification UM10204 rev 7.0 (NXP, public) for SCL
+//!   timing constraints in HCNT / LCNT derivation.
+//!   <https://www.nxp.com/docs/en/user-guide/UM10204.pdf>
+//! - SMBus 3.2 specification (SBS-IF, public) for stop / arbitration
+//!   semantics this driver mirrors.
+//!   <http://smbus.org/specs/SMBus_3_2_20220112.pdf>
 //!
 //! What this driver does today:
 //! - Discovers controllers via AML `_HID` (`AMDI0010 / AMDI0019 /

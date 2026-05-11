@@ -1234,14 +1234,15 @@ dependencies = [
  "narf-arch",
  "narf-console",
  "narf-drivers",
+ "narf-drivers-i2c",
  "narf-drivers-virtio",
  "narf-fb",
- "narf-i3c",
  "narf-init",
  "narf-input",
  "narf-interrupts",
  "narf-kernel-test",
  "narf-lib",
+ "narf-scheduler",
 ]
 
 [[package]]

@@ -387,3 +387,378 @@ fn smoke_wbdi_recogniser_rejects_non_wbdi() -> TestResult {
 }
 
 kernel_test_in!("drivers/input/wbdi", smoke_wbdi_recogniser_rejects_non_wbdi);
+
+// ── I2C-HID ────────────────────────────────────────────────────────
+//
+// Mock I2cBus implementation that records every transfer and lets
+// each test stage canned reads. Lets us verify the protocol framing
+// without needing a real touchpad on a real I2C bus.
+
+mod i2c_hid_smokes {
+    use alloc::boxed::Box;
+    use alloc::collections::VecDeque;
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+    use async_trait::async_trait;
+    use core::sync::atomic::{AtomicI32, Ordering};
+    use narf_drivers_i2c::{I2cBus, I2cError, I2cOp};
+    use narf_kernel_test::{kernel_test_in, TestResult};
+    use narf_lib::sync::IrqSafeSpinLock;
+
+    use crate::i2c_hid::{HidDescriptor, I2cHidDriver, I2cHidError, HID_DESC_LENGTH};
+
+    #[derive(Debug)]
+    struct MockBus {
+        /// Pre-staged bytes the bus returns in order, one Vec per
+        /// I2cOp::Read in the order they're encountered.
+        canned_reads: IrqSafeSpinLock<VecDeque<Vec<u8>>>,
+        /// Captured Write payloads, one per I2cOp::Write.
+        captured_writes: IrqSafeSpinLock<Vec<Vec<u8>>>,
+    }
+
+    impl MockBus {
+        fn new() -> Self {
+            Self {
+                canned_reads: IrqSafeSpinLock::new(VecDeque::new()),
+                captured_writes: IrqSafeSpinLock::new(Vec::new()),
+            }
+        }
+        fn stage_read(&self, data: Vec<u8>) {
+            self.canned_reads.lock().push_back(data);
+        }
+        fn writes(&self) -> Vec<Vec<u8>> {
+            self.captured_writes.lock().clone()
+        }
+    }
+
+    #[async_trait]
+    impl I2cBus for MockBus {
+        async fn transfer(&self, _addr: u8, ops: &mut [I2cOp<'_>]) -> Result<(), I2cError> {
+            for op in ops.iter_mut() {
+                match op {
+                    I2cOp::Write(data) => {
+                        self.captured_writes.lock().push((*data).to_vec());
+                    }
+                    I2cOp::Read(buf) => {
+                        let canned = self
+                            .canned_reads
+                            .lock()
+                            .pop_front()
+                            .unwrap_or_else(|| alloc::vec![0u8; buf.len()]);
+                        let n = canned.len().min(buf.len());
+                        buf[..n].copy_from_slice(&canned[..n]);
+                        for byte in buf.iter_mut().skip(n) {
+                            *byte = 0;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        fn name(&self) -> &str {
+            "mock-i2c"
+        }
+    }
+
+    fn make_descriptor_bytes() -> Vec<u8> {
+        let mut buf = alloc::vec![0u8; HID_DESC_LENGTH];
+        let put16 = |buf: &mut [u8], off: usize, v: u16| {
+            buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
+        };
+        put16(&mut buf, 0, HID_DESC_LENGTH as u16); // wHIDDescLength
+        put16(&mut buf, 2, 0x0100); // bcdVersion
+        put16(&mut buf, 4, 100); // wReportDescLength
+        put16(&mut buf, 6, 0x0002); // wReportDescRegister
+        put16(&mut buf, 8, 0x0003); // wInputRegister
+        put16(&mut buf, 10, 32); // wMaxInputLength
+        put16(&mut buf, 12, 0x0004); // wOutputRegister
+        put16(&mut buf, 14, 32); // wMaxOutputLength
+        put16(&mut buf, 16, 0x0005); // wCommandRegister
+        put16(&mut buf, 18, 0x0006); // wDataRegister
+        put16(&mut buf, 20, 0x04F3); // wVendorID (Elan)
+        put16(&mut buf, 22, 0x3045); // wProductID
+        put16(&mut buf, 24, 0x0001); // wVersionID
+        buf
+    }
+
+    fn smoke_i2c_hid_descriptor_round_trip() -> TestResult {
+        let bytes = make_descriptor_bytes();
+        let d = match HidDescriptor::parse(&bytes) {
+            Ok(d) => d,
+            Err(_) => return TestResult::Fail("parse failed on valid descriptor"),
+        };
+        if d.w_hid_desc_length != 30 {
+            return TestResult::Fail("wHIDDescLength mismatch");
+        }
+        if d.bcd_version != 0x0100 {
+            return TestResult::Fail("bcdVersion mismatch");
+        }
+        if d.w_input_register != 0x0003 || d.w_command_register != 0x0005 {
+            return TestResult::Fail("operating registers mismatch");
+        }
+        if d.w_vendor_id != 0x04F3 {
+            return TestResult::Fail("VID mismatch");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/i2c-hid", smoke_i2c_hid_descriptor_round_trip);
+
+    fn smoke_i2c_hid_descriptor_rejects_short_buf() -> TestResult {
+        match HidDescriptor::parse(&[0u8; 10]) {
+            Err(I2cHidError::BadDescriptor) => TestResult::Pass,
+            _ => TestResult::Fail("short buffer should have been rejected"),
+        }
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_i2c_hid_descriptor_rejects_short_buf
+    );
+
+    fn smoke_i2c_hid_descriptor_rejects_wrong_length_field() -> TestResult {
+        let mut bytes = make_descriptor_bytes();
+        bytes[0] = 0x10; // length field claims 0x0010 instead of 0x001E
+        match HidDescriptor::parse(&bytes) {
+            Err(I2cHidError::BadDescriptor) => TestResult::Pass,
+            _ => TestResult::Fail("wrong length field should have been rejected"),
+        }
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_i2c_hid_descriptor_rejects_wrong_length_field
+    );
+
+    fn smoke_i2c_hid_descriptor_rejects_wrong_major_version() -> TestResult {
+        let mut bytes = make_descriptor_bytes();
+        bytes[3] = 0x02; // bcdVersion = 0x0200 (major 2, we expect major 1)
+        match HidDescriptor::parse(&bytes) {
+            Err(I2cHidError::BadDescriptor) => TestResult::Pass,
+            _ => TestResult::Fail("major-version mismatch should have been rejected"),
+        }
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_i2c_hid_descriptor_rejects_wrong_major_version
+    );
+
+    fn run_async<F>(fut: F) -> TestResult
+    where
+        F: core::future::Future<Output = TestResult> + Send + 'static,
+    {
+        narf_scheduler::init();
+        let result = Arc::new(AtomicI32::new(-1));
+        let r = result.clone();
+        narf_scheduler::spawn(async move {
+            let outcome = fut.await;
+            let code = match outcome {
+                TestResult::Pass => 0,
+                TestResult::Fail(_) => 1,
+                TestResult::Skip(_) => 2,
+            };
+            r.store(code, Ordering::SeqCst);
+        });
+        narf_scheduler::run_until_empty();
+        match result.load(Ordering::SeqCst) {
+            0 => TestResult::Pass,
+            1 => TestResult::Fail("inner fut failed"),
+            2 => TestResult::Skip("inner fut skipped"),
+            _ => TestResult::Fail("async task didn't complete"),
+        }
+    }
+
+    fn smoke_i2c_hid_read_descriptor_emits_register_then_read() -> TestResult {
+        let bus = Arc::new(MockBus::new());
+        bus.stage_read(make_descriptor_bytes());
+        let bus_dyn: Arc<dyn I2cBus> = bus.clone();
+        let mut drv = I2cHidDriver::new(bus_dyn, 0x2c, 0x0001);
+        let bus_for_check = bus.clone();
+        run_async(async move {
+            match drv.read_descriptor().await {
+                Ok(d) => {
+                    if d.w_command_register != 0x0005 {
+                        return TestResult::Fail("descriptor command-reg wrong after read");
+                    }
+                }
+                Err(_) => return TestResult::Fail("read_descriptor errored"),
+            }
+            // Bus should have seen exactly one Write of [reg_lo, reg_hi]
+            let writes = bus_for_check.writes();
+            if writes.len() != 1 {
+                return TestResult::Fail("expected exactly 1 write before the read");
+            }
+            if writes[0] != alloc::vec![0x01, 0x00] {
+                return TestResult::Fail("descriptor register address bytes wrong");
+            }
+            TestResult::Pass
+        })
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_i2c_hid_read_descriptor_emits_register_then_read
+    );
+
+    fn smoke_i2c_hid_reset_writes_command_then_polls_input() -> TestResult {
+        let bus = Arc::new(MockBus::new());
+        // Stage descriptor read, then a 0-length post-RESET sentinel.
+        bus.stage_read(make_descriptor_bytes());
+        bus.stage_read(alloc::vec![0u8, 0u8]);
+        let bus_dyn: Arc<dyn I2cBus> = bus.clone();
+        let mut drv = I2cHidDriver::new(bus_dyn, 0x2c, 0x0001);
+        let bus_for_check = bus.clone();
+        run_async(async move {
+            if drv.read_descriptor().await.is_err() {
+                return TestResult::Fail("descriptor read failed");
+            }
+            if drv.reset().await.is_err() {
+                return TestResult::Fail("reset failed");
+            }
+            let writes = bus_for_check.writes();
+            // Expect: [desc_reg], [cmd_addr_lo, cmd_addr_hi, 0, 0x01],
+            // [input_reg_lo, input_reg_hi]
+            if writes.len() != 3 {
+                return TestResult::Fail("expected 3 writes (desc, cmd, input)");
+            }
+            // RESET command bytes: cmd_addr=0x0005, data=0, opcode=0x01
+            if writes[1] != alloc::vec![0x05, 0x00, 0x00, 0x01] {
+                return TestResult::Fail("RESET command framing wrong");
+            }
+            // Input register address (0x0003)
+            if writes[2] != alloc::vec![0x03, 0x00] {
+                return TestResult::Fail("input register address wrong");
+            }
+            TestResult::Pass
+        })
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_i2c_hid_reset_writes_command_then_polls_input
+    );
+
+    fn smoke_i2c_hid_set_power_validates_state() -> TestResult {
+        let bus = Arc::new(MockBus::new());
+        bus.stage_read(make_descriptor_bytes());
+        let bus_dyn: Arc<dyn I2cBus> = bus.clone();
+        let mut drv = I2cHidDriver::new(bus_dyn, 0x2c, 0x0001);
+        run_async(async move {
+            drv.read_descriptor().await.unwrap();
+            // 2 = invalid power state
+            match drv.set_power(2).await {
+                Err(I2cHidError::BadPowerState) => TestResult::Pass,
+                _ => TestResult::Fail("invalid power state should have been rejected"),
+            }
+        })
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_i2c_hid_set_power_validates_state
+    );
+
+    fn smoke_i2c_hid_set_power_sleep_writes_correct_command() -> TestResult {
+        let bus = Arc::new(MockBus::new());
+        bus.stage_read(make_descriptor_bytes());
+        let bus_dyn: Arc<dyn I2cBus> = bus.clone();
+        let mut drv = I2cHidDriver::new(bus_dyn, 0x2c, 0x0001);
+        let bus_for_check = bus.clone();
+        run_async(async move {
+            drv.read_descriptor().await.unwrap();
+            if drv
+                .set_power(crate::i2c_hid::POWER_SLEEP)
+                .await
+                .is_err()
+            {
+                return TestResult::Fail("set_power(SLEEP) errored");
+            }
+            let writes = bus_for_check.writes();
+            // writes[0] is the descriptor register read.
+            // writes[1] is the SET_POWER cmd: cmd_addr=0x0005, data=0x01, opcode=0x08
+            if writes[1] != alloc::vec![0x05, 0x00, 0x01, 0x08] {
+                return TestResult::Fail("SET_POWER(SLEEP) command framing wrong");
+            }
+            TestResult::Pass
+        })
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_i2c_hid_set_power_sleep_writes_correct_command
+    );
+
+    fn smoke_i2c_hid_input_report_decode() -> TestResult {
+        // First 2 bytes = total length (8) LSB; next 6 bytes = payload.
+        let bus = Arc::new(MockBus::new());
+        bus.stage_read(make_descriptor_bytes());
+        // Input report: length=8, payload=[1,2,3,4,5,6]; pad to
+        // wMaxInputLength (32 bytes) with zeros.
+        let mut report = alloc::vec![0u8; 32];
+        report[0..2].copy_from_slice(&8u16.to_le_bytes());
+        report[2..8].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        bus.stage_read(report);
+        let bus_dyn: Arc<dyn I2cBus> = bus.clone();
+        let mut drv = I2cHidDriver::new(bus_dyn, 0x2c, 0x0001);
+        run_async(async move {
+            drv.read_descriptor().await.unwrap();
+            let mut buf = [0u8; 16];
+            match drv.read_input_report(&mut buf).await {
+                Ok(6) => {
+                    if buf[..6] != [1, 2, 3, 4, 5, 6] {
+                        TestResult::Fail("payload bytes wrong")
+                    } else {
+                        TestResult::Pass
+                    }
+                }
+                Ok(other) => {
+                    let _ = other;
+                    TestResult::Fail("payload length wrong")
+                }
+                Err(_) => TestResult::Fail("read_input_report errored"),
+            }
+        })
+    }
+    kernel_test_in!("drivers/input/i2c-hid", smoke_i2c_hid_input_report_decode);
+
+    fn smoke_i2c_hid_input_report_zero_means_no_data() -> TestResult {
+        let bus = Arc::new(MockBus::new());
+        bus.stage_read(make_descriptor_bytes());
+        // Length=0 → device has nothing to report.
+        bus.stage_read(alloc::vec![0u8; 32]);
+        let bus_dyn: Arc<dyn I2cBus> = bus.clone();
+        let mut drv = I2cHidDriver::new(bus_dyn, 0x2c, 0x0001);
+        run_async(async move {
+            drv.read_descriptor().await.unwrap();
+            let mut buf = [0u8; 16];
+            match drv.read_input_report(&mut buf).await {
+                Ok(0) => TestResult::Pass,
+                _ => TestResult::Fail("len=0 should have returned 0 bytes"),
+            }
+        })
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_i2c_hid_input_report_zero_means_no_data
+    );
+
+    fn smoke_i2c_hid_uninitialised_rejects_ops() -> TestResult {
+        // No descriptor read first → reset/set_power/read_input
+        // should all return NotInitialised.
+        let bus: Arc<dyn I2cBus> = Arc::new(MockBus::new());
+        let drv = I2cHidDriver::new(bus, 0x2c, 0x0001);
+        run_async(async move {
+            match drv.reset().await {
+                Err(I2cHidError::NotInitialised) => {}
+                _ => return TestResult::Fail("reset should require descriptor"),
+            }
+            match drv.set_power(0).await {
+                Err(I2cHidError::NotInitialised) => {}
+                _ => return TestResult::Fail("set_power should require descriptor"),
+            }
+            let mut buf = [0u8; 4];
+            match drv.read_input_report(&mut buf).await {
+                Err(I2cHidError::NotInitialised) => {}
+                _ => return TestResult::Fail("read_input_report should require descriptor"),
+            }
+            TestResult::Pass
+        })
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_i2c_hid_uninitialised_rejects_ops
+    );
+}
