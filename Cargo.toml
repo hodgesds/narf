@@ -45,6 +45,7 @@ members = [
     "drivers/nvme",
     "drivers/net",
     "drivers/wireless",
+    "drivers/i2c",
     "drivers/i3c",
     "drivers/gpu",
     "drivers/storage",

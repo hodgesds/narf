@@ -1,0 +1,219 @@
+//! Subsystem smokes for `narf-drivers-i2c`.
+//!
+//! Two concerns:
+//! - The `I2cBus` trait + registry behave consistently (insert /
+//!   list / find / dedupe, hermetic reset between tests).
+//! - The AMD FCH driver's pre-flight checks fire correctly against
+//!   a synthetic MMIO backing — `probe_component_type` separates a
+//!   real DesignWare core from a bogus mapping, and `enable` writes
+//!   the expected register sequence.
+//!
+//! No live-hardware assertions here — those happen at boot when the
+//! `amd-fch-i2c` initcall logs each controller it finds. These
+//! smokes just exercise the code paths that don't need a real I2C
+//! device wedged into a real FCH.
+
+extern crate alloc;
+
+use alloc::boxed::Box;
+use alloc::string::ToString;
+use alloc::sync::Arc;
+use async_trait::async_trait;
+use narf_kernel_test::{kernel_test_in, TestResult};
+
+use crate::amd_fch::{recognised_hids, AmdFchI2c};
+use crate::{registry, I2cBus, I2cError, I2cOp};
+use narf_memory::PhysAddr;
+
+// ── Mock I2C bus ─────────────────────────────────────────────────
+
+#[derive(Debug)]
+struct MockBus {
+    name: alloc::string::String,
+}
+
+#[async_trait]
+impl I2cBus for MockBus {
+    async fn transfer(&self, _addr: u8, _ops: &mut [I2cOp<'_>]) -> Result<(), I2cError> {
+        Ok(())
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+// ── Synthetic MMIO backing for AMD FCH ───────────────────────────
+//
+// 256 B of zeroed memory (the DW register window is < 0x100 except
+// for IC_COMP_TYPE at 0xfc). We seed COMP_TYPE so probe_component
+// passes; the driver's enable + poll loops then run against the
+// rest of the buffer happily because every "wait for bit clear"
+// sees an initial 0.
+
+const DW_COMP_TYPE: u32 = 0x4457_0140;
+
+fn make_synthetic_mmio(seed_comp_type: bool) -> (PhysAddr, u64) {
+    // 256 B aligned to 4 B (Vec<u32> guarantees 4-byte alignment).
+    // Leak into a Box so the kernel-test harness can hold the addr
+    // for the lifetime of the test without lifetime tracking.
+    let buf: Box<[u32; 64]> = Box::new([0u32; 64]);
+    let raw = Box::leak(buf);
+    if seed_comp_type {
+        // IC_COMP_TYPE is at byte offset 0xfc -> u32 index 63.
+        raw[63] = DW_COMP_TYPE;
+    }
+    let phys = raw.as_ptr() as u64;
+    (PhysAddr::new(phys), 256)
+}
+
+// ── Smokes ───────────────────────────────────────────────────────
+
+fn smoke_i2c_registry_dedupes_by_name() -> TestResult {
+    registry::__reset_for_test();
+    let a = Arc::new(MockBus {
+        name: "\\_SB.I2CA".to_string(),
+    });
+    let b = Arc::new(MockBus {
+        name: "\\_SB.I2CA".to_string(),
+    });
+    let r1 = registry::register_unique(a.clone());
+    let r2 = registry::register_unique(b.clone());
+    if registry::count() != 1 {
+        return TestResult::Fail("dedupe didn't collapse identical name");
+    }
+    if !Arc::ptr_eq(&r1, &r2) {
+        return TestResult::Fail("dedupe should return the existing Arc");
+    }
+    if registry::find("\\_SB.I2CA").is_none() {
+        return TestResult::Fail("find missed the registered bus");
+    }
+    if registry::find("\\_SB.NOPE").is_some() {
+        return TestResult::Fail("find returned a bus that wasn't registered");
+    }
+    registry::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers-i2c", smoke_i2c_registry_dedupes_by_name);
+
+fn smoke_i2c_registry_lists_multiple_buses() -> TestResult {
+    registry::__reset_for_test();
+    for name in ["\\_SB.I2CA", "\\_SB.I2CB", "\\_SB.I2CC"] {
+        registry::register_unique(Arc::new(MockBus {
+            name: name.to_string(),
+        }));
+    }
+    if registry::count() != 3 {
+        return TestResult::Fail("expected 3 registered buses");
+    }
+    let names: alloc::vec::Vec<_> = registry::list().iter().map(|b| b.name().to_string()).collect();
+    for want in ["\\_SB.I2CA", "\\_SB.I2CB", "\\_SB.I2CC"] {
+        if !names.iter().any(|n| n == want) {
+            return TestResult::Fail("listed buses missing one we registered");
+        }
+    }
+    registry::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("drivers-i2c", smoke_i2c_registry_lists_multiple_buses);
+
+fn smoke_amd_fch_recognises_zen2_hid() -> TestResult {
+    // The Zen2 laptop bring-up target uses AMDI0019 — guard against
+    // someone trimming the list and silently dropping bring-up
+    // hardware coverage.
+    if !recognised_hids().iter().any(|h| *h == "AMDI0019") {
+        return TestResult::Fail("AMDI0019 (Zen2 FCH) not in recognised HID list");
+    }
+    if !recognised_hids().iter().any(|h| *h == "AMDI0010") {
+        return TestResult::Fail("AMDI0010 (Zen / Zen+) not in recognised HID list");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers-i2c", smoke_amd_fch_recognises_zen2_hid);
+
+fn smoke_amd_fch_probe_rejects_bad_mmio() -> TestResult {
+    // No COMP_TYPE seed -> probe must reject with BadHardware. This
+    // is the "MMIO mapping points at the wrong device" guard.
+    let (phys, len) = make_synthetic_mmio(false);
+    let drv = AmdFchI2c::new("smoke-bad".to_string(), phys, len, None);
+    match drv.probe_component_type() {
+        Err(I2cError::BadHardware) => TestResult::Pass,
+        Err(other) => {
+            let _ = other;
+            TestResult::Fail("probe_component_type should return BadHardware on COMP_TYPE=0")
+        }
+        Ok(()) => TestResult::Fail("probe_component_type accepted COMP_TYPE=0"),
+    }
+}
+kernel_test_in!("drivers-i2c", smoke_amd_fch_probe_rejects_bad_mmio);
+
+fn smoke_amd_fch_probe_accepts_good_mmio() -> TestResult {
+    let (phys, len) = make_synthetic_mmio(true);
+    let drv = AmdFchI2c::new("smoke-good".to_string(), phys, len, None);
+    match drv.probe_component_type() {
+        Ok(()) => TestResult::Pass,
+        Err(_) => TestResult::Fail("probe_component_type rejected real DW magic"),
+    }
+}
+kernel_test_in!("drivers-i2c", smoke_amd_fch_probe_accepts_good_mmio);
+
+fn smoke_amd_fch_enable_writes_expected_regs() -> TestResult {
+    let (phys, len) = make_synthetic_mmio(true);
+    let drv = AmdFchI2c::new("smoke-enable".to_string(), phys, len, None);
+    if drv.enable().is_err() {
+        return TestResult::Fail("enable() failed unexpectedly");
+    }
+    // Inspect the synthetic backing by re-reading via raw ptr.
+    // SAFETY: we know the buffer is a leaked Box<[u32; 64]>; phys
+    // is the address of the first element.
+    let base = phys.raw() as *const u32;
+    // IC_CON @ offset 0 (u32 index 0) — should have MASTER + SPEED_FAST + SLAVE_DIS + RESTART_EN
+    let ic_con = unsafe { core::ptr::read_volatile(base) };
+    let want = 1u32 | (0b10 << 1) | (1 << 6) | (1 << 5);
+    if ic_con != want {
+        return TestResult::Fail("IC_CON not programmed to master/fast/slave-dis/restart-en");
+    }
+    // IC_ENABLE @ 0x6c (u32 index 27) should be 1 after enable.
+    let ic_enable = unsafe { core::ptr::read_volatile(base.add(0x6c / 4)) };
+    if ic_enable != 1 {
+        return TestResult::Fail("IC_ENABLE not 1 after enable()");
+    }
+    // After disable() it should be 0.
+    drv.disable();
+    let ic_enable = unsafe { core::ptr::read_volatile(base.add(0x6c / 4)) };
+    if ic_enable != 0 {
+        return TestResult::Fail("IC_ENABLE not 0 after disable()");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers-i2c", smoke_amd_fch_enable_writes_expected_regs);
+
+fn smoke_amd_fch_transfer_refuses_when_disabled() -> TestResult {
+    // A driver instance that hasn't run enable() must reject
+    // transfer attempts with BadHardware — defends against client
+    // drivers racing the controller's bring-up.
+    narf_scheduler::init();
+    let (phys, len) = make_synthetic_mmio(true);
+    let drv = AmdFchI2c::new("smoke-noenable".to_string(), phys, len, None);
+    let bus: Arc<dyn I2cBus> = Arc::new(drv);
+    let result = Arc::new(core::sync::atomic::AtomicI32::new(-1));
+    let r = result.clone();
+    narf_scheduler::spawn(async move {
+        let mut buf = [0u8; 4];
+        let mut ops = [I2cOp::Read(&mut buf)];
+        let outcome = bus.transfer(0x2c, &mut ops).await;
+        let code = match outcome {
+            Err(I2cError::BadHardware) => 0,
+            Err(_) => 1,
+            Ok(()) => 2,
+        };
+        r.store(code, core::sync::atomic::Ordering::SeqCst);
+    });
+    narf_scheduler::run_until_empty();
+    match result.load(core::sync::atomic::Ordering::SeqCst) {
+        0 => TestResult::Pass,
+        1 => TestResult::Fail("expected BadHardware before enable(), got different error"),
+        2 => TestResult::Fail("transfer succeeded against a not-yet-enabled controller"),
+        _ => TestResult::Fail("transfer task didn't run"),
+    }
+}
+kernel_test_in!("drivers-i2c", smoke_amd_fch_transfer_refuses_when_disabled);

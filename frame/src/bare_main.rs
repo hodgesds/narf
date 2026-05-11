@@ -1443,6 +1443,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_drivers_net::register_initcalls();
             narf_drivers_wireless::register_initcalls();
             narf_drivers_i3c::register_initcalls();
+            narf_drivers_i2c::register_initcalls();
             narf_drivers_storage::register_initcalls();
             narf_drivers_usb::register_initcalls();
             narf_drivers_platform::register_initcalls();

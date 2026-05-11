@@ -1,0 +1,102 @@
+//! I2C bus trait + AMD FCH controller driver.
+//!
+//! Two layers:
+//! - `I2cBus` trait + `I2cOp` + a process-global registry of buses,
+//!   so HID-over-I2C and other client drivers can locate a bus by
+//!   name (typically the ACPI path of the controller) without
+//!   plumbing an Arc through every initcall.
+//! - `amd_fch` — an AMD FCH I2C controller driver. The FCH I2C IP is
+//!   the Synopsys DesignWare core lightly relabelled, so the register
+//!   map below is the standard DW-i2c map. Discovery walks the AML
+//!   namespace for `AMDI0010 / AMDI0019 / AMDI0510 / AMDI0011`,
+//!   decodes `_CRS` for MMIO base + IRQ, and hands the resulting
+//!   driver instance to the registry.
+
+#![no_std]
+#![forbid(unsafe_op_in_unsafe_fn)]
+#![deny(missing_debug_implementations)]
+
+extern crate alloc;
+
+pub mod amd_fch;
+pub mod registry;
+
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use async_trait::async_trait;
+
+/// One operation in an I2C transfer. The bus issues a single
+/// (repeated-)START between ops and a STOP after the last op. Repeated
+/// reads/writes against the same target inside one `transfer()` call
+/// are atomic with respect to other tasks holding the bus mutex.
+#[derive(Debug)]
+pub enum I2cOp<'a> {
+    Write(&'a [u8]),
+    Read(&'a mut [u8]),
+}
+
+/// Surface for I2C errors. Stays narrow on purpose: drivers turn
+/// hardware-specific failure registers into one of these so callers
+/// can decide policy (retry / abandon / log) without learning every
+/// controller's quirks.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum I2cError {
+    /// Target NACK'd its address phase — the device is not present
+    /// at this slave address.
+    Nack,
+    /// Bus arbitration loss (multi-master). Rare on AMD FCH (no
+    /// other master in PC layouts) but the controller still flags it.
+    ArbLost,
+    /// Generic transfer abort raised by the controller (TX_ABRT).
+    /// `code` carries the controller-specific abort reason for logs.
+    Abort(u32),
+    /// Transfer didn't complete within the bus mutex's timeout.
+    Timeout,
+    /// Hardware register read returned an impossible value (read 0
+    /// from the DW component-type register, etc.). Usually means the
+    /// MMIO mapping points at the wrong place.
+    BadHardware,
+}
+
+/// Async I2C bus interface. The implementor owns the controller's
+/// MMIO + any IRQ vector and serialises concurrent transfers via its
+/// own internal mutex — callers just `.transfer().await`.
+#[async_trait]
+pub trait I2cBus: Send + Sync + core::fmt::Debug {
+    /// Issue a sequence of ops against the 7-bit target address
+    /// `addr`. Single (repeated-)START between ops, STOP after last.
+    async fn transfer(&self, addr: u8, ops: &mut [I2cOp<'_>]) -> Result<(), I2cError>;
+
+    /// Identifier for the registry — typically the ACPI path of the
+    /// controller (e.g. `\_SB.I2CA`). Unique within a single boot.
+    fn name(&self) -> &str;
+}
+
+/// Discover, instantiate, and register every supported I2C controller.
+/// Stage::Device entry — called once during boot. Idempotent only in
+/// the sense that re-running it on hardware that's already been
+/// programmed will reprogram the registers; the registry's
+/// `register_unique` collapses duplicate controller paths.
+pub fn register_initcalls() {
+    use narf_init::{InitResult, Stage};
+    narf_init::register(Stage::Device, "amd-fch-i2c", || {
+        let n = amd_fch::probe_all();
+        if n == 0 {
+            // No AMD FCH I2C controllers in the namespace — quiet
+            // success on non-AMD platforms (e.g. QEMU virt) is the
+            // right behaviour, the i2c-hid initcall logs the absence
+            // when it can't find a controller for its children.
+            InitResult::NotPresent
+        } else {
+            InitResult::Ok
+        }
+    });
+}
+
+/// Snapshot of every registered I2C bus. Cheap clone — Arcs only.
+pub fn registered_buses() -> Vec<alloc::sync::Arc<dyn I2cBus>> {
+    registry::list()
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod tests;

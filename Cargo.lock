@@ -799,6 +799,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-drivers-i2c"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "narf-acpi",
+ "narf-aml",
+ "narf-arch",
+ "narf-console",
+ "narf-init",
+ "narf-interrupts",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-scheduler",
+]
+
+[[package]]
 name = "narf-drivers-i3c"
 version = "0.1.0"
 dependencies = [
@@ -1085,6 +1102,7 @@ dependencies = [
  "narf-drivers-fs-minix",
  "narf-drivers-fs-udf",
  "narf-drivers-gpu",
+ "narf-drivers-i2c",
  "narf-drivers-i3c",
  "narf-drivers-net",
  "narf-drivers-nvme",
