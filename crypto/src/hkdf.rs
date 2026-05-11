@@ -3,7 +3,7 @@
 //! Implementation of HMAC-based Key Derivation Function according to RFC 5869.
 //! Reference: <https://datatracker.ietf.org/doc/html/rfc5869>
 
-use crate::clean::sha256::Sha256;
+use crate::sha256::Sha256;
 
 /// HMAC-SHA-256 implementation.
 /// Reference: <https://datatracker.ietf.org/doc/html/rfc2104>

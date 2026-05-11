@@ -28,11 +28,25 @@
 #![deny(missing_debug_implementations)]
 
 pub mod accel;
-pub mod clean;
 pub mod pq;
 pub mod tpm;
 
+// Cleanroom primitive implementations — every algorithm is implemented
+// directly from its public specification (FIPS / RFC / paper) with the
+// authoritative reference linked in-module. See `crypto/specification/
+// spec.md` §9.2.1 for the licensing posture and reference table.
+pub mod aead;
+pub mod chacha20;
+pub mod curve25519;
+pub mod ed25519;
+pub mod hkdf;
+pub mod poly1305;
+pub mod sha256;
+pub mod sha512;
+
 mod tests;
+#[cfg(test)]
+mod primitive_tests;
 
 extern crate alloc;
 
@@ -260,7 +274,11 @@ pub fn hkdf_expand(
 ) -> Result<Vec<u8>, CryptoError> {
     cap.check_live()?;
 
-    use hkdf::Hkdf as HkdfImpl;
+    // The local `crate::hkdf` cleanroom module shadows the external
+    // `hkdf` crate inside this crate, so name the RustCrypto crate
+    // absolutely. Same precaution would apply for `sha2` if we ever
+    // shadowed it (today our local module is `sha256`, no conflict).
+    use ::hkdf::Hkdf as HkdfImpl;
     use sha2::Sha256;
 
     // RFC 5869: Extract-then-Expand. `Hkdf::new` does Extract; `expand`

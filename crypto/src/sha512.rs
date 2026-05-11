@@ -2,16 +2,9 @@
 //!
 //! Implementation of the SHA-512 cryptographic hash function according to FIPS 180-4.
 //! Reference: <https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.180-4.pdf>
-//!
-//! SHA-512 produces a 512-bit (64-byte) message digest. It operates on 1024-bit 
-//! blocks and uses 64-bit words for its internal state and operations.
 
 #![allow(dead_code)]
 
-/// SHA-512 round constants K.
-/// These are the first 64 bits of the fractional parts of the cube roots of the 
-/// first 80 prime numbers.
-/// Reference: FIPS 180-4 Section 4.2.3
 const K: [u64; 80] = [
     0x428a2f98d728ae22, 0x7137449123ef65cd, 0xb5c0fbcfec4d3b2f, 0xe9b5dba58189dbbc,
     0x3956c25bf348b538, 0x59f111f1b605d019, 0x923f82a4af194f9b, 0xab1c5ed5da6d8118,
@@ -35,33 +28,21 @@ const K: [u64; 80] = [
     0x4cc5d4becb3e42b6, 0x597f299cfc657e2a, 0x5fcb6fab3ad6faec, 0x6c44198c4a475817,
 ];
 
-/// Initial hash values H(0).
-/// These are the first 64 bits of the fractional parts of the square roots of the 
-/// first 8 prime numbers.
-/// Reference: FIPS 180-4 Section 5.3.5
 const H0: [u64; 8] = [
     0x6a09e667f3bcc908, 0xbb67ae8584caa73b, 0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1,
     0x510e527fade682d1, 0x9b05688c2b3e6c1f, 0x1f83d9abfb41bd6b, 0x5be0cd19137e2179,
 ];
 
-/// SHA-512 state tracker.
 #[derive(Clone, Debug)]
 pub struct Sha512 {
     h: [u64; 8],
     buffer: [u8; 128],
     buffer_len: usize,
-    total_len: u128, // total message length in bits
-}
-
-impl Default for Sha512 {
-    fn default() -> Self {
-        Self::new()
-    }
+    total_len: u128,
 }
 
 impl Sha512 {
-    /// Create a new SHA-512 instance with initial hash values.
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             h: H0,
             buffer: [0; 128],
@@ -70,52 +51,49 @@ impl Sha512 {
         }
     }
 
-    /// Update the hash state with additional data.
     pub fn update(&mut self, data: &[u8]) {
         self.total_len += (data.len() as u128) * 8;
         let mut pos = 0;
         while pos < data.len() {
-            let take = core::cmp::min(128 - self.buffer_len, data.len() - pos);
+            let take = if 128 - self.buffer_len < data.len() - pos { 128 - self.buffer_len } else { data.len() - pos };
             self.buffer[self.buffer_len..self.buffer_len + take].copy_from_slice(&data[pos..pos + take]);
             self.buffer_len += take;
             pos += take;
 
             if self.buffer_len == 128 {
-                let buf = self.buffer;
-                self.compress(&buf);
+                let block = self.buffer;
+                self.compress(&block);
                 self.buffer_len = 0;
             }
         }
     }
 
-    /// Finalize the hash and return the 64-byte digest.
     pub fn finalize(mut self) -> [u8; 64] {
         let bit_len = self.total_len;
         
         // Append padding bit '1' (0x80)
-        self.update(&[0x80]);
+        // Manual append instead of update to avoid double-counting total_len
+        self.buffer[self.buffer_len] = 0x80;
+        self.buffer_len += 1;
 
-        // If not enough space for the 128-bit length, process current block and start a new one
         if self.buffer_len > 112 {
             while self.buffer_len < 128 {
                 self.buffer[self.buffer_len] = 0;
                 self.buffer_len += 1;
             }
-            let buf = self.buffer;
-            self.compress(&buf);
+            let block = self.buffer;
+            self.compress(&block);
             self.buffer_len = 0;
         }
 
-        // Fill remaining buffer with zeros until length field
         while self.buffer_len < 112 {
             self.buffer[self.buffer_len] = 0;
             self.buffer_len += 1;
         }
 
-        // Append length as a 128-bit big-endian integer
         self.buffer[112..128].copy_from_slice(&bit_len.to_be_bytes());
-        let buf = self.buffer;
-        self.compress(&buf);
+        let block = self.buffer;
+        self.compress(&block);
 
         let mut result = [0u8; 64];
         for i in 0..8 {
@@ -124,24 +102,21 @@ impl Sha512 {
         result
     }
 
-    /// SHA-512 compression function.
-    /// Reference: FIPS 180-4 Section 6.4.2
     fn compress(&mut self, block: &[u8; 128]) {
         let mut w = [0u64; 80];
-        // Prepare message schedule
         for i in 0..16 {
-            w[i] = u64::from_be_bytes(block[i * 8..(i + 1) * 8].try_into().unwrap());
+            w[i] = u64::from_be_bytes([
+                block[i * 8], block[i * 8 + 1], block[i * 8 + 2], block[i * 8 + 3],
+                block[i * 8 + 4], block[i * 8 + 5], block[i * 8 + 6], block[i * 8 + 7]
+            ]);
         }
 
         for i in 16..80 {
-            // sigma0(x) = ROTR1(x) ^ ROTR8(x) ^ SHR7(x)
             let s0 = w[i - 15].rotate_right(1) ^ w[i - 15].rotate_right(8) ^ (w[i - 15] >> 7);
-            // sigma1(x) = ROTR19(x) ^ ROTR61(x) ^ SHR6(x)
             let s1 = w[i - 2].rotate_right(19) ^ w[i - 2].rotate_right(61) ^ (w[i - 2] >> 6);
             w[i] = s1.wrapping_add(w[i - 7]).wrapping_add(s0).wrapping_add(w[i - 16]);
         }
 
-        // Initialize working variables
         let mut a = self.h[0];
         let mut b = self.h[1];
         let mut c = self.h[2];
@@ -151,14 +126,10 @@ impl Sha512 {
         let mut g = self.h[6];
         let mut h = self.h[7];
 
-        // 80 rounds of transformation
         for i in 0..80 {
-            // Sigma1(x) = ROTR14(x) ^ ROTR18(x) ^ ROTR41(x)
             let s1 = e.rotate_right(14) ^ e.rotate_right(18) ^ e.rotate_right(41);
             let ch = (e & f) ^ ((!e) & g);
             let temp1 = h.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
-            
-            // Sigma0(x) = ROTR28(x) ^ ROTR34(x) ^ ROTR39(x)
             let s0 = a.rotate_right(28) ^ a.rotate_right(34) ^ a.rotate_right(39);
             let maj = (a & b) ^ (a & c) ^ (b & c);
             let temp2 = s0.wrapping_add(maj);
@@ -173,7 +144,6 @@ impl Sha512 {
             a = temp1.wrapping_add(temp2);
         }
 
-        // Add transformed values back to hash state
         self.h[0] = self.h[0].wrapping_add(a);
         self.h[1] = self.h[1].wrapping_add(b);
         self.h[2] = self.h[2].wrapping_add(c);

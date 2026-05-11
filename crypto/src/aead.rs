@@ -5,8 +5,8 @@
 //! Reference: <https://datatracker.ietf.org/doc/html/rfc8439#section-2.8>
 //! Reference: <https://en.wikipedia.org/wiki/Poly1305>
 
-use crate::clean::chacha20::{chacha20_block, chacha20_init, chacha20_xor};
-use crate::clean::poly1305::Poly1305;
+use crate::chacha20::{chacha20_block, chacha20_init, chacha20_xor};
+use crate::poly1305::Poly1305;
 
 /// ChaCha20-Poly1305 AEAD seal.
 /// Reference: <https://datatracker.ietf.org/doc/html/rfc8439#section-2.8>
