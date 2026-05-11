@@ -366,6 +366,256 @@ fn smoke_aml_resource_memory32fixed_large_tag() -> TestResult {
 }
 kernel_test_in!("aml", smoke_aml_resource_memory32fixed_large_tag);
 
+fn smoke_aml_resource_i2c_serial_bus_decode() -> TestResult {
+    // Real-shape I2cSerialBus descriptor for a touchpad at 7-bit
+    // address 0x2C on bus "\\_SB.I2CA" running 400 kHz.
+    //
+    // Large tag 0x8E (0x0E + bit-7 set) followed by 2-byte length.
+    // Common header (9 bytes): rev=1, src_idx=0, bus_type=1 (I2C),
+    // gen_flags=0, type_flags=0 (7-bit addr), type_rev=1,
+    // type_data_len=6.
+    // Type-specific (6 bytes): connection_speed=400_000 LE,
+    // slave_address=0x2C LE.
+    // ResourceSource: "\\_SB.I2CA\0" (10 bytes).
+    let res_src = b"\\_SB.I2CA\0";
+    let payload_len = 9u16 + 6 + res_src.len() as u16; // = 25
+    let mut buf = alloc::vec::Vec::new();
+    buf.push(0x8E); // large tag 0x0E
+    buf.extend_from_slice(&payload_len.to_le_bytes());
+    // Common Serial Bus header
+    buf.extend_from_slice(&[
+        0x01, 0x00, 0x01, 0x00, // rev, src_idx, bus_type=I2C, gen_flags
+        0x00, 0x00, 0x01, // type_flags=0 (7-bit), type_rev=1
+        0x06, 0x00, // type_data_len=6
+    ]);
+    // I2C type-specific data
+    buf.extend_from_slice(&400_000u32.to_le_bytes());
+    buf.extend_from_slice(&0x002Cu16.to_le_bytes());
+    // ResourceSource string
+    buf.extend_from_slice(res_src);
+    // EndTag
+    buf.extend_from_slice(&[0x79, 0x00]);
+
+    let items = match crate::resource::decode_resource_template(&buf) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("decode failed"),
+    };
+    if items.len() != 2 {
+        return TestResult::Fail("expected 2 items");
+    }
+    match &items[0] {
+        crate::resource::ResourceItem::I2cSerialBus {
+            slave_address,
+            addr_10bit,
+            connection_speed,
+            slave_mode,
+            resource_source,
+            resource_source_index,
+        } => {
+            if *slave_address != 0x2C {
+                return TestResult::Fail("slave_address wrong");
+            }
+            if *addr_10bit {
+                return TestResult::Fail("addr_10bit should be false");
+            }
+            if *connection_speed != 400_000 {
+                return TestResult::Fail("connection_speed wrong");
+            }
+            if *slave_mode {
+                return TestResult::Fail("slave_mode should be false");
+            }
+            if resource_source != "\\_SB.I2CA" {
+                return TestResult::Fail("resource_source wrong");
+            }
+            if *resource_source_index != 0 {
+                return TestResult::Fail("resource_source_index wrong");
+            }
+        }
+        _ => return TestResult::Fail("item[0] not I2cSerialBus"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("aml", smoke_aml_resource_i2c_serial_bus_decode);
+
+fn smoke_aml_resource_i2c_serial_bus_10bit() -> TestResult {
+    // Same shape as above but 10-bit addressing flag set.
+    let res_src = b"\\_SB.I2CB\0";
+    let payload_len = 9u16 + 6 + res_src.len() as u16;
+    let mut buf = alloc::vec::Vec::new();
+    buf.push(0x8E);
+    buf.extend_from_slice(&payload_len.to_le_bytes());
+    buf.extend_from_slice(&[
+        0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x06, 0x00, // type_flags=0x0001 (10-bit)
+    ]);
+    buf.extend_from_slice(&100_000u32.to_le_bytes());
+    buf.extend_from_slice(&0x0150u16.to_le_bytes());
+    buf.extend_from_slice(res_src);
+    buf.extend_from_slice(&[0x79, 0x00]);
+
+    let items = crate::resource::decode_resource_template(&buf)
+        .unwrap_or_else(|_| alloc::vec::Vec::new());
+    match items.first() {
+        Some(crate::resource::ResourceItem::I2cSerialBus {
+            addr_10bit: true,
+            slave_address: 0x0150,
+            connection_speed: 100_000,
+            ..
+        }) => TestResult::Pass,
+        _ => TestResult::Fail("10-bit I2cSerialBus didn't decode"),
+    }
+}
+kernel_test_in!("aml", smoke_aml_resource_i2c_serial_bus_10bit);
+
+fn smoke_aml_resource_gpio_int_decode() -> TestResult {
+    // GpioInt for a touchpad attention line: edge-triggered, active
+    // low, single pin 130, parented to "\\_SB.GPIO".
+    //
+    // Header (19 payload bytes from offset 3..22 in spec, i.e.
+    // payload[0..19]):
+    //   rev=1, conn_type=0 (Interrupt), gen_flags=2 bytes,
+    //   intr_io_flags=0x000A (edge|active-low: bit0=0, bits1-2=01,
+    //   actually we want polarity=1 for active-low → bits1-2=01 → 0x02;
+    //   bit3=shared=0, bit4=wake=0; bit0=0 means edge), so 0x0002.
+    //   pin_config=1 (pull-up), drive_strength=0, debounce=0,
+    //   pin_table_offset (from descriptor start) = 22 (just past header),
+    //   res_src_idx=0, res_src_name_offset = 22 + 2 (one pin) = 24.
+    //
+    // Pins: 1 pin = 2 bytes, then resource source string + NUL.
+    let res_src = b"\\_SB.GPIO\0";
+    let pin_count = 1usize;
+    let pin_bytes = pin_count * 2;
+    // Payload = 20 (header) + pin_bytes + res_src.len()
+    let payload_len = 20u16 + pin_bytes as u16 + res_src.len() as u16;
+    let header_total = 3u16; // 1 tag byte + 2 length bytes
+    let pin_off = header_total + 20; // = 23
+    let res_off = pin_off + pin_bytes as u16; // = 25
+
+    let mut buf = alloc::vec::Vec::new();
+    buf.push(0x8C); // large tag 0x0C
+    buf.extend_from_slice(&payload_len.to_le_bytes());
+    // Header bytes 0..19
+    buf.push(0x01); // rev
+    buf.push(0x00); // conn_type=0 (Interrupt)
+    buf.extend_from_slice(&0x0001u16.to_le_bytes()); // general flags (consumer)
+    buf.extend_from_slice(&0x0002u16.to_le_bytes()); // intr_io_flags: edge, active-low
+    buf.push(0x01); // pin_config = pull-up
+    buf.extend_from_slice(&0u16.to_le_bytes()); // drive strength
+    buf.extend_from_slice(&50u16.to_le_bytes()); // debounce_timeout 500us
+    buf.extend_from_slice(&pin_off.to_le_bytes());
+    buf.push(0x00); // res_src_idx
+    buf.extend_from_slice(&res_off.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes()); // vendor data offset
+    buf.extend_from_slice(&0u16.to_le_bytes()); // vendor data length
+    // Pin Table: pin 130
+    buf.extend_from_slice(&130u16.to_le_bytes());
+    // ResourceSource
+    buf.extend_from_slice(res_src);
+    // EndTag
+    buf.extend_from_slice(&[0x79, 0x00]);
+
+    let items = crate::resource::decode_resource_template(&buf)
+        .unwrap_or_else(|_| alloc::vec::Vec::new());
+    match items.first() {
+        Some(crate::resource::ResourceItem::GpioInt {
+            level_triggered: false,
+            polarity: 1,
+            shared: false,
+            wake: false,
+            pin_config: 1,
+            debounce_timeout: 50,
+            pins,
+            resource_source,
+            resource_source_index: 0,
+        }) => {
+            if pins != &alloc::vec![130u16] {
+                return TestResult::Fail("pins wrong");
+            }
+            if resource_source != "\\_SB.GPIO" {
+                return TestResult::Fail("resource_source wrong");
+            }
+            TestResult::Pass
+        }
+        Some(other) => {
+            let _ = other;
+            TestResult::Fail("GpioInt fields didn't match expected")
+        }
+        None => TestResult::Fail("no items decoded"),
+    }
+}
+kernel_test_in!("aml", smoke_aml_resource_gpio_int_decode);
+
+fn smoke_aml_resource_gpio_io_decode() -> TestResult {
+    // GpioIo for a touchpad RESET# line: shared=false, pull-none,
+    // drive=2000 (10-µA units → 20 mA), one pin at 12 on "\\_SB.GPIO".
+    let res_src = b"\\_SB.GPIO\0";
+    let pin_bytes = 2usize;
+    let payload_len = 20u16 + pin_bytes as u16 + res_src.len() as u16;
+    let pin_off = 23u16;
+    let res_off = pin_off + pin_bytes as u16;
+
+    let mut buf = alloc::vec::Vec::new();
+    buf.push(0x8C);
+    buf.extend_from_slice(&payload_len.to_le_bytes());
+    buf.push(0x01); // rev
+    buf.push(0x01); // conn_type=1 (IO)
+    buf.extend_from_slice(&0x0001u16.to_le_bytes());
+    buf.extend_from_slice(&0x0000u16.to_le_bytes()); // io_flags: not shared
+    buf.push(0x03); // pin_config = pull-none
+    buf.extend_from_slice(&2000u16.to_le_bytes()); // drive_strength
+    buf.extend_from_slice(&100u16.to_le_bytes()); // debounce
+    buf.extend_from_slice(&pin_off.to_le_bytes());
+    buf.push(0x00);
+    buf.extend_from_slice(&res_off.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&12u16.to_le_bytes());
+    buf.extend_from_slice(res_src);
+    buf.extend_from_slice(&[0x79, 0x00]);
+
+    let items = crate::resource::decode_resource_template(&buf)
+        .unwrap_or_else(|_| alloc::vec::Vec::new());
+    match items.first() {
+        Some(crate::resource::ResourceItem::GpioIo {
+            shared: false,
+            pin_config: 3,
+            drive_strength: 2000,
+            debounce_timeout: 100,
+            pins,
+            resource_source,
+            resource_source_index: 0,
+        }) => {
+            if pins != &alloc::vec![12u16] {
+                return TestResult::Fail("pins wrong");
+            }
+            if resource_source != "\\_SB.GPIO" {
+                return TestResult::Fail("resource_source wrong");
+            }
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("GpioIo didn't decode as expected"),
+    }
+}
+kernel_test_in!("aml", smoke_aml_resource_gpio_io_decode);
+
+fn smoke_aml_resource_serial_bus_unknown_type_falls_through() -> TestResult {
+    // Bus type 2 = SPI. Not decoded yet; should land in Unknown
+    // rather than asserting/panicking.
+    let payload_len = 9u16 + 0 + 0;
+    let mut buf = alloc::vec::Vec::new();
+    buf.push(0x8E);
+    buf.extend_from_slice(&payload_len.to_le_bytes());
+    buf.extend_from_slice(&[0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00]);
+    buf.extend_from_slice(&[0x79, 0x00]);
+
+    let items = crate::resource::decode_resource_template(&buf)
+        .unwrap_or_else(|_| alloc::vec::Vec::new());
+    match items.first() {
+        Some(crate::resource::ResourceItem::Unknown { tag: 0x8E, .. }) => TestResult::Pass,
+        _ => TestResult::Fail("SPI bus type should fall through to Unknown"),
+    }
+}
+kernel_test_in!("aml", smoke_aml_resource_serial_bus_unknown_type_falls_through);
+
 fn smoke_aml_prt_decode() -> TestResult {
     use crate::Value;
     let entries_raw = alloc::vec![

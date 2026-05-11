@@ -467,6 +467,45 @@ fn report_crs(path: &str) {
                             flags, gsis
                         );
                     }
+                    ResourceItem::I2cSerialBus {
+                        slave_address,
+                        connection_speed,
+                        resource_source,
+                        ..
+                    } => {
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "    _CRS: I2cSerialBus addr={:#04x} speed={}Hz src={:?}",
+                            slave_address, connection_speed, resource_source
+                        );
+                    }
+                    ResourceItem::GpioInt {
+                        level_triggered,
+                        polarity,
+                        pins,
+                        resource_source,
+                        ..
+                    } => {
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "    _CRS: GpioInt {{trig={}, pol={}, pins={:?}, src={:?}}}",
+                            if *level_triggered { "level" } else { "edge" },
+                            polarity,
+                            pins,
+                            resource_source
+                        );
+                    }
+                    ResourceItem::GpioIo {
+                        pins,
+                        resource_source,
+                        ..
+                    } => {
+                        let _ = writeln!(
+                            narf_console::Writer,
+                            "    _CRS: GpioIo pins={:?} src={:?}",
+                            pins, resource_source
+                        );
+                    }
                     ResourceItem::Unknown { tag, payload } => {
                         let _ = writeln!(
                             narf_console::Writer,

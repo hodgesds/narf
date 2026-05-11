@@ -62,6 +62,69 @@ pub enum ResourceItem {
     },
     /// Large Extended Interrupt Descriptor (large tag 0x09): flags, GSI list.
     ExtendedIrq { flags: u8, gsis: Vec<u32> },
+    /// Large GPIO Connection Descriptor (large tag 0x0C), Connection Type 0
+    /// = Interrupt. ACPI 6.5 §6.4.3.8.1. Used by HID-over-I2C children that
+    /// route their attention line through a host GPIO controller.
+    GpioInt {
+        /// `true` = level-triggered, `false` = edge-triggered (bit 0 of
+        /// the Interrupt and IO Flags word).
+        level_triggered: bool,
+        /// 0 = active high, 1 = active low, 2 = active both (bits 1-2).
+        polarity: u8,
+        /// `true` = shared (bit 3).
+        shared: bool,
+        /// `true` = wake-capable (bit 4).
+        wake: bool,
+        /// 0 = default, 1 = pull-up, 2 = pull-down, 3 = pull-none
+        /// (Pin Configuration byte).
+        pin_config: u8,
+        /// Debounce timeout in 10-µs units (zero = none).
+        debounce_timeout: u16,
+        /// Pin numbers within the parent GPIO controller's pin space.
+        pins: Vec<u16>,
+        /// AML path of the GPIO controller (`ResourceSource`); empty
+        /// string when absent.
+        resource_source: String,
+        /// Index inside the named ResourceSource (typically 0).
+        resource_source_index: u8,
+    },
+    /// Large GPIO Connection Descriptor (large tag 0x0C), Connection Type 1
+    /// = IO. ACPI 6.5 §6.4.3.8.1. Used for GPIO output / programmable
+    /// device-state pins (touchpad RESET#, sensor enable, etc.).
+    GpioIo {
+        /// 0 = exclusive, 1 = shared (bit 3 of IO flags).
+        shared: bool,
+        /// 0 = default, 1 = pull-up, 2 = pull-down, 3 = pull-none.
+        pin_config: u8,
+        /// Output drive strength in 10-µA units (zero = controller default).
+        drive_strength: u16,
+        /// Debounce timeout in 10-µs units.
+        debounce_timeout: u16,
+        /// Pin numbers within the parent GPIO controller's pin space.
+        pins: Vec<u16>,
+        /// AML path of the GPIO controller.
+        resource_source: String,
+        /// Index inside the named ResourceSource.
+        resource_source_index: u8,
+    },
+    /// Large Serial Bus Connection Descriptor (large tag 0x0E) with Bus
+    /// Type 1 = I2C. ACPI 6.5 §6.4.3.8.2.1. Carries the slave address +
+    /// bus reference for an I2C-attached child device (HID-over-I2C
+    /// touchpad, sensor hub, etc.).
+    I2cSerialBus {
+        /// 7-bit (or 10-bit when `addr_10bit`) slave address.
+        slave_address: u16,
+        /// `true` = 10-bit addressing mode (Type-Specific Flags bit 0).
+        addr_10bit: bool,
+        /// Bus speed in Hz (Standard 100k / Fast 400k / Fast+ 1M / etc.).
+        connection_speed: u32,
+        /// `true` = device acts as bus slave (rare). General-flags bit 0.
+        slave_mode: bool,
+        /// AML path of the I2C controller node (`ResourceSource`).
+        resource_source: String,
+        /// Index inside the named ResourceSource.
+        resource_source_index: u8,
+    },
     /// EndTag — small tag 0x79. Emitted so callers can verify termination.
     EndTag,
     /// Any descriptor type we don't decode. Carries the raw tag byte and payload.
@@ -427,6 +490,14 @@ pub fn decode_resource_template(buf: &[u8]) -> Result<Vec<ResourceItem>, Resourc
                         }
                     }
                 }
+                // Large tag 0x0C = GPIO Connection Descriptor
+                0x0C => {
+                    items.push(decode_gpio_connection(tag, payload));
+                }
+                // Large tag 0x0E = Serial Bus Connection Descriptor
+                0x0E => {
+                    items.push(decode_serial_bus(tag, payload));
+                }
                 _ => {
                     items.push(ResourceItem::Unknown {
                         tag,
@@ -434,6 +505,162 @@ pub fn decode_resource_template(buf: &[u8]) -> Result<Vec<ResourceItem>, Resourc
                     });
                 }
             }
+        }
+    }
+}
+
+// ── GPIO + Serial-Bus helpers ────────────────────────────────────────────────
+
+/// Decode a GPIO Connection Descriptor (large tag 0x0C) — both
+/// Interrupt (type 0) and IO (type 1) sub-types. ACPI 6.5 §6.4.3.8.1.
+///
+/// All offsets in the payload are derived by subtracting 3 from the
+/// spec's "from start of descriptor" offsets (1 tag byte + 2 length
+/// bytes consumed before we land in the payload slice).
+fn decode_gpio_connection(tag: u8, payload: &[u8]) -> ResourceItem {
+    // Header is 20 payload bytes (descriptor offset 3..22 inclusive,
+    // i.e. payload indices 0..19) before the variable Pin Table /
+    // Resource Source / Vendor blocks begin.
+    if payload.len() < 20 {
+        return ResourceItem::Unknown {
+            tag,
+            payload: payload.to_vec(),
+        };
+    }
+    // payload[0] = Revision ID
+    let conn_type = payload[1];
+    // payload[2..4] = General Flags (only bit 0 = ConsumerProducer)
+    let intr_io_flags = u16::from_le_bytes([payload[4], payload[5]]);
+    let pin_config = payload[6];
+    let drive_strength = u16::from_le_bytes([payload[7], payload[8]]);
+    let debounce_timeout = u16::from_le_bytes([payload[9], payload[10]]);
+    let pin_table_off_desc = u16::from_le_bytes([payload[11], payload[12]]) as usize;
+    let resource_source_index = payload[13];
+    let res_src_name_off_desc = u16::from_le_bytes([payload[14], payload[15]]) as usize;
+    // payload[16..18] = Vendor Data Offset (unused here)
+    // payload[18..20] = Vendor Data Length (unused; out of range for short payloads)
+
+    // Offsets in spec are from the start of the descriptor (including
+    // the 3-byte tag+length header), so subtract 3 to land in payload.
+    let pin_off = pin_table_off_desc.saturating_sub(3);
+    let res_off = res_src_name_off_desc.saturating_sub(3);
+
+    // Pin Table runs from pin_off until either res_off (if present and
+    // non-zero) or end of payload. Each pin is a u16 LE.
+    let pin_end = if res_src_name_off_desc != 0 && res_off > pin_off && res_off <= payload.len() {
+        res_off
+    } else {
+        payload.len()
+    };
+    let mut pins = Vec::new();
+    if pin_off <= payload.len() && pin_end <= payload.len() && pin_end >= pin_off {
+        let pin_bytes = &payload[pin_off..pin_end];
+        for chunk in pin_bytes.chunks_exact(2) {
+            pins.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+        }
+    }
+
+    // ResourceSource is a NUL-terminated ASCII string.
+    let resource_source = if res_src_name_off_desc != 0 && res_off < payload.len() {
+        let tail = &payload[res_off..];
+        let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+        String::from_utf8_lossy(&tail[..end]).into_owned()
+    } else {
+        String::new()
+    };
+
+    match conn_type {
+        0 => ResourceItem::GpioInt {
+            level_triggered: intr_io_flags & 0x0001 != 0,
+            polarity: ((intr_io_flags >> 1) & 0x0003) as u8,
+            shared: intr_io_flags & 0x0008 != 0,
+            wake: intr_io_flags & 0x0010 != 0,
+            pin_config,
+            debounce_timeout,
+            pins,
+            resource_source,
+            resource_source_index,
+        },
+        1 => ResourceItem::GpioIo {
+            shared: intr_io_flags & 0x0008 != 0,
+            pin_config,
+            drive_strength,
+            debounce_timeout,
+            pins,
+            resource_source,
+            resource_source_index,
+        },
+        _ => ResourceItem::Unknown {
+            tag,
+            payload: payload.to_vec(),
+        },
+    }
+}
+
+/// Decode a Serial Bus Connection Descriptor (large tag 0x0E). Only
+/// `BusType == 1` (I2C) is decoded; SPI / UART / CSI-2 fall through
+/// to `Unknown` until a driver needs them. ACPI 6.5 §6.4.3.8.2.1.
+fn decode_serial_bus(tag: u8, payload: &[u8]) -> ResourceItem {
+    // Common Serial Bus header occupies payload[0..9].
+    if payload.len() < 9 {
+        return ResourceItem::Unknown {
+            tag,
+            payload: payload.to_vec(),
+        };
+    }
+    // payload[0] = Revision ID
+    let resource_source_index = payload[1];
+    let bus_type = payload[2];
+    let general_flags = payload[3];
+    let type_specific_flags = u16::from_le_bytes([payload[4], payload[5]]);
+    // payload[6] = Type Specific Revision ID
+    let type_data_len = u16::from_le_bytes([payload[7], payload[8]]) as usize;
+
+    // Type-specific data follows immediately after the 9-byte common
+    // header; ResourceSource string follows that. Vendor data after.
+    let type_data_start = 9usize;
+    let type_data_end = type_data_start + type_data_len;
+    if type_data_end > payload.len() {
+        return ResourceItem::Unknown {
+            tag,
+            payload: payload.to_vec(),
+        };
+    }
+
+    // ResourceSource: NUL-terminated string between type-specific data
+    // and (optional) vendor block. We don't have an explicit length,
+    // so read until NUL or end of payload.
+    let res_src_bytes = &payload[type_data_end..];
+    let end = res_src_bytes
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(res_src_bytes.len());
+    let resource_source = String::from_utf8_lossy(&res_src_bytes[..end]).into_owned();
+
+    if bus_type == 0x01 {
+        // I2C type-specific data: ConnectionSpeed (4 bytes) +
+        // SlaveAddress (2 bytes).
+        if type_data_len < 6 {
+            return ResourceItem::Unknown {
+                tag,
+                payload: payload.to_vec(),
+            };
+        }
+        let td = &payload[type_data_start..type_data_end];
+        let connection_speed = u32::from_le_bytes([td[0], td[1], td[2], td[3]]);
+        let slave_address = u16::from_le_bytes([td[4], td[5]]);
+        ResourceItem::I2cSerialBus {
+            slave_address,
+            addr_10bit: type_specific_flags & 0x0001 != 0,
+            connection_speed,
+            slave_mode: general_flags & 0x0001 != 0,
+            resource_source,
+            resource_source_index,
+        }
+    } else {
+        ResourceItem::Unknown {
+            tag,
+            payload: payload.to_vec(),
         }
     }
 }
