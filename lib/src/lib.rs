@@ -12,11 +12,14 @@
 #![feature(negative_impls)]
 #![allow(incomplete_features)]
 
+extern crate alloc;
+
 pub mod assert;
 pub mod bitmap;
 pub mod context;
 pub mod id;
 pub mod intrusive;
+pub mod mutex;
 pub mod percpu;
 pub mod smp;
 pub mod sync;

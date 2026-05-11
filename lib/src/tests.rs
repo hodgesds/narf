@@ -100,6 +100,195 @@ kernel_test_in!("lib", smoke_lib_bug_on_false_is_silent);
 
 // ── relocated from verification (subsystem 'lib') ──
 
+// ── async Mutex ───────────────────────────────────────────────────
+
+extern crate alloc;
+
+fn smoke_async_mutex_try_lock_round_trip() -> TestResult {
+    use crate::mutex::Mutex;
+    let m: Mutex<u32> = Mutex::new(7);
+    let g = match m.try_lock() {
+        Some(g) => g,
+        None => return TestResult::Fail("try_lock on free mutex returned None"),
+    };
+    if *g != 7 {
+        return TestResult::Fail("guard read wrong value");
+    }
+    if m.try_lock().is_some() {
+        return TestResult::Fail("try_lock while held should return None");
+    }
+    drop(g);
+    if m.try_lock().is_none() {
+        return TestResult::Fail("try_lock after release should succeed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("lib", smoke_async_mutex_try_lock_round_trip);
+
+fn smoke_async_mutex_release_wakes_waiter() -> TestResult {
+    use crate::mutex::Mutex;
+    use alloc::sync::Arc;
+    use alloc::task::Wake;
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::task::{Context, Poll, Waker};
+
+    struct CountingWaker {
+        n: AtomicUsize,
+    }
+    impl Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.n.fetch_add(1, Ordering::Relaxed);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.n.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let m: Mutex<u32> = Mutex::new(0);
+    let holder = m.try_lock().unwrap();
+
+    let cw = Arc::new(CountingWaker {
+        n: AtomicUsize::new(0),
+    });
+    let waker: Waker = cw.clone().into();
+    let mut cx = Context::from_waker(&waker);
+
+    let mut f = m.lock();
+    if !matches!(Pin::new(&mut f).poll(&mut cx), Poll::Pending) {
+        return TestResult::Fail("poll on contended lock should be Pending");
+    }
+    if cw.n.load(Ordering::Relaxed) != 0 {
+        return TestResult::Fail("no wake expected before release");
+    }
+
+    drop(holder);
+    if cw.n.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("release must wake exactly one waiter");
+    }
+    if !matches!(Pin::new(&mut f).poll(&mut cx), Poll::Ready(_)) {
+        return TestResult::Fail("woken waiter should grab lock");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("lib", smoke_async_mutex_release_wakes_waiter);
+
+fn smoke_async_mutex_fifo_order() -> TestResult {
+    use crate::mutex::Mutex;
+    use alloc::sync::Arc;
+    use alloc::task::Wake;
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::task::{Context, Poll, Waker};
+
+    struct CW {
+        n: AtomicUsize,
+    }
+    impl Wake for CW {
+        fn wake(self: Arc<Self>) {
+            self.n.fetch_add(1, Ordering::Relaxed);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.n.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let mk = || {
+        let cw = Arc::new(CW {
+            n: AtomicUsize::new(0),
+        });
+        let w: Waker = cw.clone().into();
+        (w, cw)
+    };
+
+    let m: Mutex<u32> = Mutex::new(0);
+    let holder = m.try_lock().unwrap();
+    let (w1, cw1) = mk();
+    let (w2, cw2) = mk();
+    let mut cx1 = Context::from_waker(&w1);
+    let mut cx2 = Context::from_waker(&w2);
+    let mut f1 = m.lock();
+    let mut f2 = m.lock();
+    let _ = Pin::new(&mut f1).poll(&mut cx1);
+    let _ = Pin::new(&mut f2).poll(&mut cx2);
+
+    drop(holder);
+    if cw1.n.load(Ordering::Relaxed) != 1 || cw2.n.load(Ordering::Relaxed) != 0 {
+        return TestResult::Fail("first release should wake only first waiter (FIFO)");
+    }
+    let g1 = match Pin::new(&mut f1).poll(&mut cx1) {
+        Poll::Ready(g) => g,
+        Poll::Pending => return TestResult::Fail("woken first waiter should be Ready"),
+    };
+    drop(g1);
+    if cw2.n.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("second release should wake second waiter");
+    }
+    let _g2 = match Pin::new(&mut f2).poll(&mut cx2) {
+        Poll::Ready(g) => g,
+        Poll::Pending => return TestResult::Fail("second waiter should grab lock"),
+    };
+    TestResult::Pass
+}
+kernel_test_in!("lib", smoke_async_mutex_fifo_order);
+
+fn smoke_async_mutex_dropped_waiter_chains() -> TestResult {
+    // Release wakes A; A is dropped before re-polling. The Drop impl
+    // must hand the lock down the chain so B isn't stranded.
+    use crate::mutex::Mutex;
+    use alloc::sync::Arc;
+    use alloc::task::Wake;
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::task::{Context, Poll, Waker};
+
+    struct CW {
+        n: AtomicUsize,
+    }
+    impl Wake for CW {
+        fn wake(self: Arc<Self>) {
+            self.n.fetch_add(1, Ordering::Relaxed);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.n.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let mk = || {
+        let cw = Arc::new(CW {
+            n: AtomicUsize::new(0),
+        });
+        let w: Waker = cw.clone().into();
+        (w, cw)
+    };
+
+    let m: Mutex<u32> = Mutex::new(0);
+    let holder = m.try_lock().unwrap();
+    let (wa, cwa) = mk();
+    let (wb, cwb) = mk();
+    let mut cxa = Context::from_waker(&wa);
+    let mut cxb = Context::from_waker(&wb);
+    let mut fa = m.lock();
+    let mut fb = m.lock();
+    let _ = Pin::new(&mut fa).poll(&mut cxa);
+    let _ = Pin::new(&mut fb).poll(&mut cxb);
+
+    drop(holder);
+    if cwa.n.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("A should be woken first");
+    }
+    drop(fa);
+    if cwb.n.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("dropping woken-uncompleted waiter must wake next in chain");
+    }
+    if !matches!(Pin::new(&mut fb).poll(&mut cxb), Poll::Ready(_)) {
+        return TestResult::Fail("B should be Ready after chained wake");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("lib", smoke_async_mutex_dropped_waiter_chains);
+
 fn smoke_percpu_storage_isolation() -> TestResult {
     // PerCpu<T: Copy> — verify the BSP cell is reachable + iter()
     // yields MAX_CPUS entries. Mutation requires T's interior
