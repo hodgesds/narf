@@ -161,14 +161,9 @@ fn smoke_crypto_pq_fips_gate() -> TestResult {
 }
 kernel_test_in!("crypto", smoke_crypto_pq_fips_gate);
 
-
-
 // ── Hardware-accelerated crypto ───────────────────────────────────
 
-
-
 fn smoke_crypto_accel_features_probe_runs() -> TestResult {
-
     use crate::accel::Features;
 
     let _ = Features::probe();
@@ -176,12 +171,9 @@ fn smoke_crypto_accel_features_probe_runs() -> TestResult {
     // Boolean values; we don't assert specific results — varies by host.
 
     TestResult::Pass
-
 }
 
 kernel_test_in!("crypto/accel", smoke_crypto_accel_features_probe_runs);
-
-
 
 fn smoke_crypto_accel_features_struct_default() -> TestResult {
     use crate::accel::Features;
