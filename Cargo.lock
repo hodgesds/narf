@@ -782,6 +782,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-drivers-gpio"
+version = "0.0.0"
+dependencies = [
+ "narf-acpi",
+ "narf-aml",
+ "narf-arch",
+ "narf-console",
+ "narf-init",
+ "narf-interrupts",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+]
+
+[[package]]
 name = "narf-drivers-gpu"
 version = "0.0.0"
 dependencies = [
@@ -1101,6 +1116,7 @@ dependencies = [
  "narf-drivers-fs-iso9660",
  "narf-drivers-fs-minix",
  "narf-drivers-fs-udf",
+ "narf-drivers-gpio",
  "narf-drivers-gpu",
  "narf-drivers-i2c",
  "narf-drivers-i3c",

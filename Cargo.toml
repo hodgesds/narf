@@ -46,6 +46,7 @@ members = [
     "drivers/net",
     "drivers/wireless",
     "drivers/i2c",
+    "drivers/gpio",
     "drivers/i3c",
     "drivers/gpu",
     "drivers/storage",

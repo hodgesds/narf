@@ -31,6 +31,7 @@ narf-drivers-net     = { path = "../drivers/net" }
 narf-drivers-wireless = { path = "../drivers/wireless" }
 narf-drivers-i3c      = { path = "../drivers/i3c" }
 narf-drivers-i2c      = { path = "../drivers/i2c" }
+narf-drivers-gpio     = { path = "../drivers/gpio" }
 narf-drivers         = { path = "../drivers" }
 narf-drivers-storage = { path = "../drivers/storage" }
 narf-drivers-usb     = { path = "../drivers/usb" }
@@ -102,6 +103,7 @@ kernel-test  = [
     "narf-i3c/kernel-test",
     "narf-drivers-i3c/kernel-test",
     "narf-drivers-i2c/kernel-test",
+    "narf-drivers-gpio/kernel-test",
     "narf-pwm/kernel-test",
     "narf-pmbus/kernel-test",
     "narf-spdm/kernel-test",
