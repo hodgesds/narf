@@ -17,6 +17,8 @@ narf-capabilities = { path = "../capabilities" }
 narf-tpm          = { path = "../tpm" }
 narf-memory       = { path = "../memory" }
 narf-arch         = { path = "../arch" }
+narf-interrupts   = { path = "../interrupts" }
+narf-io           = { path = "../io" }
 narf-scheduler    = { path = "../scheduler" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 async-trait       = "0.1"

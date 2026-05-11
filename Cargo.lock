@@ -659,6 +659,8 @@ dependencies = [
  "async-trait",
  "narf-arch",
  "narf-capabilities",
+ "narf-interrupts",
+ "narf-io",
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
@@ -1240,6 +1242,7 @@ dependencies = [
 name = "narf-io"
 version = "0.0.0"
 dependencies = [
+ "narf-acpi",
  "narf-capabilities",
  "narf-kernel-test",
  "narf-lib",

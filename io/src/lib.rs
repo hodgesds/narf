@@ -102,6 +102,19 @@ pub fn unregister<R: narf_capabilities::Rights>(cap: Cap<DmaBuffer, R>) {
     }
 }
 
+/// Index-keyed counterpart to `unregister`. Used by the driver
+/// framework's reclaim path to drop a `Cap<DmaBuffer, _>`'s backing
+/// without the framework having to round-trip through the typed cap.
+/// Bumps the object-table epoch (so every outstanding cap fails
+/// `check_live`) and clears the registry slot.
+pub fn unregister_by_index(index: u32) {
+    let _ = narf_capabilities::object_table::bump_epoch(index);
+    let mut r = REGISTRY.lock();
+    if let Some(slot) = r.get_mut(index as usize) {
+        *slot = None;
+    }
+}
+
 /// Resolve a capability slot index to the underlying DmaBuffer.
 /// Returns `None` if the index never existed or has been
 /// `unregister`-ed.

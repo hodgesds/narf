@@ -419,3 +419,193 @@ fn smoke_drivers_reset_default_is_noop() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers", smoke_drivers_reset_default_is_noop);
+
+fn smoke_drivers_unbind_after_quiesce() -> TestResult {
+    use crate::{
+        bootstrap_authority, registry, DomainPolicy, DriverManifest, DriverPhase, NoopDriver,
+    };
+
+    static MANIFEST: DriverManifest = DriverManifest {
+        name: "noop.unbind-1",
+        domain_policy: DomainPolicy::Shared,
+        caps_required: &[],
+    };
+
+    let authority = bootstrap_authority();
+    let handle = match registry().register(&authority, &MANIFEST, NoopDriver::new()) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("register"),
+    };
+    narf_scheduler::init();
+    narf_scheduler::spawn(async {
+        let _ = registry().start_named("noop.unbind-1").await;
+        let _ = registry().quiesce_named("noop.unbind-1").await;
+    });
+    narf_scheduler::run_until_empty();
+
+    if registry().unbind_named("noop.unbind-1").is_err() {
+        return TestResult::Fail("unbind_named on Quiesced returned Err");
+    }
+    if registry().is_registered("noop.unbind-1") {
+        return TestResult::Fail("entry still present after unbind");
+    }
+    // Self-cap should be revoked.
+    if handle.is_live() {
+        return TestResult::Fail("driver self-cap still live after unbind");
+    }
+    // Status snapshot taken now must be None — entry's gone.
+    if registry()
+        .with_entry("noop.unbind-1", |_| DriverPhase::Loaded)
+        .is_some()
+    {
+        return TestResult::Fail("with_entry still sees a phase");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers", smoke_drivers_unbind_after_quiesce);
+
+fn smoke_drivers_unbind_refuses_started() -> TestResult {
+    use crate::{bootstrap_authority, registry, DomainPolicy, DriverManifest, NoopDriver};
+
+    static MANIFEST: DriverManifest = DriverManifest {
+        name: "noop.unbind-refuse",
+        domain_policy: DomainPolicy::Shared,
+        caps_required: &[],
+    };
+
+    let authority = bootstrap_authority();
+    if registry()
+        .register(&authority, &MANIFEST, NoopDriver::new())
+        .is_err()
+    {
+        return TestResult::Fail("register");
+    }
+    narf_scheduler::init();
+    narf_scheduler::spawn(async {
+        let _ = registry().start_named("noop.unbind-refuse").await;
+    });
+    narf_scheduler::run_until_empty();
+
+    if registry().unbind_named("noop.unbind-refuse").is_ok() {
+        return TestResult::Fail("unbind on Started should refuse");
+    }
+    // Caller now quiesces and retries; expected to succeed.
+    narf_scheduler::init();
+    narf_scheduler::spawn(async {
+        let _ = registry().quiesce_named("noop.unbind-refuse").await;
+    });
+    narf_scheduler::run_until_empty();
+    if registry().unbind_named("noop.unbind-refuse").is_err() {
+        return TestResult::Fail("unbind after quiesce failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers", smoke_drivers_unbind_refuses_started);
+
+fn smoke_drivers_unbind_from_loaded() -> TestResult {
+    use crate::{bootstrap_authority, registry, DomainPolicy, DriverManifest, NoopDriver};
+
+    static MANIFEST: DriverManifest = DriverManifest {
+        name: "noop.unbind-loaded",
+        domain_policy: DomainPolicy::Shared,
+        caps_required: &[],
+    };
+
+    let authority = bootstrap_authority();
+    if registry()
+        .register(&authority, &MANIFEST, NoopDriver::new())
+        .is_err()
+    {
+        return TestResult::Fail("register");
+    }
+    if registry().unbind_named("noop.unbind-loaded").is_err() {
+        return TestResult::Fail("unbind on Loaded should succeed");
+    }
+    if registry().is_registered("noop.unbind-loaded") {
+        return TestResult::Fail("entry still present");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers", smoke_drivers_unbind_from_loaded);
+
+fn smoke_drivers_unbind_releases_idt_vector() -> TestResult {
+    use crate::{
+        bootstrap_authority, registry, DomainPolicy, DriverManifest, NoopDriver, ReclaimToken,
+        __drain_vector_quarantine_for_test,
+    };
+
+    static MANIFEST: DriverManifest = DriverManifest {
+        name: "noop.unbind-vec",
+        domain_policy: DomainPolicy::Shared,
+        caps_required: &[],
+    };
+
+    let authority = bootstrap_authority();
+    if registry()
+        .register(&authority, &MANIFEST, NoopDriver::new())
+        .is_err()
+    {
+        return TestResult::Fail("register");
+    }
+    let v = match narf_interrupts::vector::alloc() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("vector::alloc"),
+    };
+    if !narf_interrupts::vector::is_allocated(v) {
+        return TestResult::Fail("freshly-alloc'd vector not marked allocated");
+    }
+    if registry()
+        .track_reclaim("noop.unbind-vec", ReclaimToken::IdtVector(v))
+        .is_err()
+    {
+        return TestResult::Fail("track_reclaim");
+    }
+    if registry().unbind_named("noop.unbind-vec").is_err() {
+        return TestResult::Fail("unbind_named");
+    }
+    // Vector is in quarantine — still marked allocated until next epoch.
+    if !narf_interrupts::vector::is_allocated(v) {
+        return TestResult::Fail("vector freed before quarantine drain");
+    }
+    __drain_vector_quarantine_for_test();
+    if narf_interrupts::vector::is_allocated(v) {
+        return TestResult::Fail("vector still allocated after drain");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers", smoke_drivers_unbind_releases_idt_vector);
+
+fn smoke_drivers_unbind_then_re_register() -> TestResult {
+    use crate::{bootstrap_authority, registry, DomainPolicy, DriverManifest, NoopDriver};
+
+    static MANIFEST: DriverManifest = DriverManifest {
+        name: "noop.unbind-rereg",
+        domain_policy: DomainPolicy::Shared,
+        caps_required: &[],
+    };
+
+    let authority = bootstrap_authority();
+    if registry()
+        .register(&authority, &MANIFEST, NoopDriver::new())
+        .is_err()
+    {
+        return TestResult::Fail("first register");
+    }
+    if registry().unbind_named("noop.unbind-rereg").is_err() {
+        return TestResult::Fail("unbind");
+    }
+    // Same name should now register cleanly — DuplicateName can't trip
+    // because the previous entry is gone.
+    if registry()
+        .register(&authority, &MANIFEST, NoopDriver::new())
+        .is_err()
+    {
+        return TestResult::Fail("re-register after unbind");
+    }
+    if !registry().is_registered("noop.unbind-rereg") {
+        return TestResult::Fail("re-registered entry not present");
+    }
+    let _ = registry().unbind_named("noop.unbind-rereg");
+    TestResult::Pass
+}
+kernel_test_in!("drivers", smoke_drivers_unbind_then_re_register);

@@ -70,6 +70,57 @@ use narf_capabilities::{Cap, CapError, CapKind, CapType, Grant, Write};
 use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 
+// ── Reclaim tokens ──────────────────────────────────────────────────
+//
+// A driver records the resources it claimed (IDT vectors, MMIO ranges,
+// DMA buffer slots) so `unbind_named` can give them back without the
+// driver code itself having to expose a teardown ritual. The tokens
+// are vendored in this crate — driver code calls `track_reclaim()`
+// during `start`, and the framework executes the matching release in
+// reverse-registration order during unbind.
+
+/// One owned resource the driver wants the framework to release on
+/// unbind. Variants stay narrow on purpose: the framework knows how
+/// to free exactly these kinds because each maps onto a public API in
+/// `interrupts/`, `drivers/domain_alloc`, or `io/`. Anything more
+/// exotic (custom IPC channels, driver-private slabs) the driver
+/// should free in its own `quiesce` and not park in the registry.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ReclaimToken {
+    /// IDT vector returned by `narf_interrupts::vector::alloc`. Freed
+    /// after a one-epoch quarantine so an in-flight IRQ raised before
+    /// `clear_handler` cannot race a fresh allocation.
+    IdtVector(u8),
+    /// VA range returned by `claim_mmio_in_domain`. Released
+    /// immediately — the page tables come down synchronously.
+    MmioRange { domain: u8, va_base: u64, len: usize },
+    /// Object-table slot of a `Cap<DmaBuffer, _>` previously minted
+    /// via `narf_io::register_with_cap`. The matching backing buffer
+    /// is dropped via `narf_io::unregister_by_index`.
+    DmaCapSlot(u32),
+}
+
+/// Vectors held in quarantine for one unbind cycle before being
+/// returned to the IDT allocator. A new unbind drains the previous
+/// epoch's quarantine and parks its own freshly-released vectors.
+static VECTOR_QUARANTINE: IrqSafeSpinLock<Vec<u8>> = IrqSafeSpinLock::new(Vec::new());
+
+fn quarantine_swap(new: Vec<u8>) -> Vec<u8> {
+    let mut q = VECTOR_QUARANTINE.lock();
+    core::mem::replace(&mut *q, new)
+}
+
+/// Test-only: drain the vector quarantine immediately, releasing
+/// every parked vector to the IDT allocator. Hermetic unbind smokes
+/// use this to assert end-state without spinning a second unbind.
+#[doc(hidden)]
+pub fn __drain_vector_quarantine_for_test() {
+    let drained = quarantine_swap(Vec::new());
+    for v in drained {
+        let _ = narf_interrupts::vector::free(v);
+    }
+}
+
 // ── Cap marker ──────────────────────────────────────────────────────
 
 /// Cap-type marker for driver-framework administrative + per-driver
@@ -211,6 +262,15 @@ pub enum DriverPhase {
     Quiescing,
     /// `quiesce` completed.
     Quiesced,
+    /// A task is currently running `unbind_named`. The reclaim list
+    /// is being drained and the per-driver cap is about to be
+    /// revoked. No new lifecycle calls are accepted.
+    Unbinding,
+    /// Unbind completed. The registry entry has been removed; this
+    /// phase is observable only in the brief window between the
+    /// reclaim drain and the registry erase, plus via any
+    /// `DriverStatus` snapshot a caller stashed before unbind.
+    Unbound,
 }
 
 /// An entry in the registry.
@@ -220,6 +280,11 @@ struct Registered {
     handle: Cap<DriverHandle, Write>,
     domain: DomainId,
     phase: DriverPhase,
+    /// Resources the driver asked the framework to reclaim on unbind.
+    /// Released in reverse-registration order so dependencies (e.g.
+    /// vector handler vs. vector itself) come down in the right
+    /// sequence.
+    reclaim: Vec<ReclaimToken>,
 }
 
 impl core::fmt::Debug for Registered {
@@ -294,6 +359,7 @@ impl DriverRegistry {
             handle,
             domain,
             phase: DriverPhase::Loaded,
+            reclaim: Vec::new(),
         });
         Ok(handle)
     }
@@ -401,9 +467,14 @@ impl DriverRegistry {
             let mut q = self.inner.lock();
             let entry = q.iter_mut().find(|r| r.manifest.name == name).ok_or(())?;
             // Reset is legal from any phase except in-flight start /
-            // quiesce — those would corrupt the &mut driver alias.
+            // quiesce — those would corrupt the &mut driver alias —
+            // and is meaningless once unbind has begun (no driver to
+            // reset).
             match entry.phase {
-                DriverPhase::Starting | DriverPhase::Quiescing => return Ok(()),
+                DriverPhase::Starting
+                | DriverPhase::Quiescing
+                | DriverPhase::Unbinding
+                | DriverPhase::Unbound => return Ok(()),
                 _ => {}
             }
             (&mut *entry.driver) as *mut dyn Driver
@@ -415,6 +486,118 @@ impl DriverRegistry {
         let driver: &mut dyn Driver = unsafe { &mut *driver_ptr };
         driver.reset().await;
         Ok(())
+    }
+
+    /// Record a reclaim token against the named driver. Drivers call
+    /// this from `start` (or any helper invoked therein) so the
+    /// framework can release the resource on `unbind_named`. Returns
+    /// `Err(())` if no entry by that name exists or the entry is
+    /// already past Quiesced — at that point the driver no longer
+    /// owns its resources.
+    pub fn track_reclaim(&self, name: &str, token: ReclaimToken) -> Result<(), ()> {
+        let mut q = self.inner.lock();
+        let entry = q.iter_mut().find(|r| r.manifest.name == name).ok_or(())?;
+        match entry.phase {
+            DriverPhase::Unbinding | DriverPhase::Unbound => return Err(()),
+            _ => {}
+        }
+        entry.reclaim.push(token);
+        Ok(())
+    }
+
+    /// Tear the driver down: revoke its self-cap, drain reclaim
+    /// tokens, and remove the registry entry. The driver must be
+    /// past `Started` (i.e. Loaded → straight unbind, or Quiesced).
+    /// Calls against an in-flight start/quiesce return `Err(())`
+    /// so the caller can re-poll after the lifecycle settles.
+    ///
+    /// Released in reverse-registration order — drivers add resources
+    /// in dependency order, so reverse order is the natural teardown.
+    /// IDT vectors are quarantined for one unbind cycle so an in-
+    /// flight IRQ that races `clear_handler` cannot dispatch into a
+    /// freshly-allocated vector slot.
+    pub fn unbind_named(&self, name: &str) -> Result<(), ()> {
+        let (handle_to_revoke, reclaim_tokens) = {
+            let mut q = self.inner.lock();
+            let pos = q
+                .iter()
+                .position(|r| r.manifest.name == name)
+                .ok_or(())?;
+            let entry = &mut q[pos];
+            match entry.phase {
+                DriverPhase::Loaded | DriverPhase::Quiesced => {}
+                DriverPhase::Starting | DriverPhase::Quiescing | DriverPhase::Unbinding => {
+                    return Err(());
+                }
+                DriverPhase::Started => {
+                    // Caller must quiesce first. We refuse rather than
+                    // silently quiescing because the quiesce future
+                    // may be long-running and shouldn't sneak through
+                    // a synchronous unbind path.
+                    return Err(());
+                }
+                DriverPhase::Unbound => return Ok(()),
+            }
+            entry.phase = DriverPhase::Unbinding;
+            let tokens = core::mem::take(&mut entry.reclaim);
+            let handle = entry.handle;
+            (handle, tokens)
+        };
+
+        // Drain reclaim tokens outside the registry lock so the
+        // releases (some of which themselves take internal locks)
+        // can't deadlock. Per the doc, reverse order.
+        let mut quarantine_new: Vec<u8> = Vec::new();
+        for token in reclaim_tokens.into_iter().rev() {
+            match token {
+                ReclaimToken::IdtVector(v) => {
+                    narf_interrupts::dispatch::clear_handler(v);
+                    narf_interrupts::dispatch::clear_waker(v);
+                    quarantine_new.push(v);
+                }
+                ReclaimToken::MmioRange { domain, va_base, len } => {
+                    // SAFETY: the driver registered the same range
+                    // via claim_mmio_in_domain; the ownership chain
+                    // is the registration itself.
+                    let _ = unsafe { domain_alloc::release(domain, va_base, len) };
+                }
+                ReclaimToken::DmaCapSlot(idx) => {
+                    narf_io::unregister_by_index(idx);
+                }
+            }
+        }
+
+        // Swap our new quarantine in; previous epoch's vectors are
+        // returned to the IDT allocator now (one-epoch delay).
+        let drained_prev = quarantine_swap(quarantine_new);
+        for v in drained_prev {
+            let _ = narf_interrupts::vector::free(v);
+        }
+
+        // Revoke the per-driver cap. Every outstanding clone observes
+        // Err(Revoked) on its next check_live — the driver instance
+        // is finished even if some component held onto the handle.
+        handle_to_revoke.revoke();
+
+        // Erase the entry and finalise phase. Held under the lock so
+        // a concurrent `with_entry` either sees the Unbinding state
+        // or no entry at all — never a partially-torn-down record.
+        let mut q = self.inner.lock();
+        if let Some(pos) = q.iter().position(|r| r.manifest.name == name) {
+            // Mark Unbound for any test snapshot taken between phases.
+            q[pos].phase = DriverPhase::Unbound;
+            q.remove(pos);
+        }
+        Ok(())
+    }
+
+    /// `true` iff a driver with this `name` is currently registered.
+    /// After `unbind_named` succeeds this returns `false`.
+    pub fn is_registered(&self, name: &str) -> bool {
+        self.inner
+            .lock()
+            .iter()
+            .any(|r| r.manifest.name == name)
     }
 
     /// Read-only accessor: run `f` against the named driver's phase +
