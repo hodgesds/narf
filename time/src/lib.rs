@@ -16,12 +16,13 @@
 
 pub mod hpet;
 pub mod rtc;
+pub mod timer_wheel;
 pub mod wall;
 
 mod tests;
 pub use wall::{
-    begin_leap_smear, monotonic_ns, now_wall, set_cycles_per_ns, set_wall_offset,
-    set_wall_offset_uncapped, WallClock, WallError, WallInstant,
+    begin_leap_smear, cycles_per_ns, monotonic_ns, now_wall, set_cycles_per_ns,
+    set_wall_offset, set_wall_offset_uncapped, WallClock, WallError, WallInstant,
 };
 
 use core::future::Future;
@@ -124,21 +125,29 @@ pub fn busy_wait_cycles(cycles: u64) {
     }
 }
 
-/// Future that yields Pending until `deadline` has passed. The executor's
-/// polling loop advances its own idea of time by repolling; we use a
-/// no-op waker so the Future never actively schedules itself — the
-/// cooperative executor just drains Pending tasks in a loop.
+/// Future that yields Pending until `deadline` has passed,
+/// driven by an IRQ-armed timer wheel rather than busy-poll.
 ///
-/// This is the Stage-1 sleep primitive; Wave 2's timer-wheel + IRQ-driven
-/// waker will replace it with event-driven wakeups.
+/// On first poll, the future registers `(deadline, waker)`
+/// with `timer_wheel::register`. When the wheel's HPET arm
+/// fires the deadline, the waker runs and the next poll
+/// returns `Ready`. If the wheel is full (more than
+/// `MAX_SLEEPERS` concurrent sleepers), the future falls
+/// back to self-wake busy-poll so the system keeps making
+/// progress at the cost of CPU. Drop while pending cancels
+/// the wheel slot.
 #[derive(Debug)]
 pub struct SleepUntil {
     deadline: Instant,
+    handle: Option<timer_wheel::SleepHandle>,
 }
 
 impl SleepUntil {
     pub fn new(deadline: Instant) -> Self {
-        Self { deadline }
+        Self {
+            deadline,
+            handle: None,
+        }
     }
 }
 
@@ -146,13 +155,50 @@ impl Future for SleepUntil {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if Instant::now() >= self.deadline {
-            Poll::Ready(())
-        } else {
-            // Schedule an immediate re-poll. With the Stage-1 cooperative
-            // executor this is what advances through Pending tasks.
+        let this = self.get_mut();
+        if Instant::now() >= this.deadline {
+            if let Some(h) = this.handle.take() {
+                timer_wheel::cancel(h);
+            }
+            return Poll::Ready(());
+        }
+        match this.handle {
+            Some(h) => {
+                if !timer_wheel::refresh_waker(h, cx.waker().clone()) {
+                    // Slot recycled (fired + reused) but our
+                    // deadline hasn't passed — must've been a
+                    // spurious wake. Re-register.
+                    this.handle = None;
+                    return Pin::new(this).poll(cx);
+                }
+            }
+            None => {
+                match timer_wheel::register(this.deadline.as_cycles(), cx.waker().clone()) {
+                    Ok(h) => {
+                        this.handle = Some(h);
+                    }
+                    Err(timer_wheel::WheelError::Full) => {
+                        // Fall back: self-wake busy-poll.
+                        cx.waker().wake_by_ref();
+                    }
+                }
+            }
+        }
+        // No installed arm callback (typical in early-boot or
+        // bare-test contexts): the wheel won't fire on its own,
+        // so degrade to self-wake busy-poll. This keeps the
+        // executor making progress at the cost of CPU.
+        if !timer_wheel::arm_callback_installed() {
             cx.waker().wake_by_ref();
-            Poll::Pending
+        }
+        Poll::Pending
+    }
+}
+
+impl Drop for SleepUntil {
+    fn drop(&mut self) {
+        if let Some(h) = self.handle.take() {
+            timer_wheel::cancel(h);
         }
     }
 }

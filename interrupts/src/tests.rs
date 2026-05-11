@@ -291,6 +291,78 @@ fn smoke_hpet_oneshot_fires_handler() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("interrupts/hpet", smoke_hpet_oneshot_fires_handler);
 
+// ── Timer-wheel pump (HPET-driven SleepUntil) ────────────────────
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_timer_pump_drives_wheel_sleep() -> TestResult {
+    // End-to-end: register a SleepUntil for ~1 ms ahead, STI, await
+    // by polling. The HPET pump (init'd in bare_main) must arm
+    // HPET, fire on deadline, and the wheel callback must wake the
+    // SleepUntil so its next poll reports Ready.
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::task::{Context, Poll};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use alloc::sync::Arc;
+    use alloc::task::Wake;
+    use crate::x86_64::timer_pump;
+
+    if !timer_pump::is_initialised() {
+        return TestResult::Skip("timer_pump not initialised");
+    }
+
+    struct CW(AtomicUsize);
+    impl Wake for CW {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let cw = Arc::new(CW(AtomicUsize::new(0)));
+    let waker: core::task::Waker = cw.clone().into();
+    let mut cx = Context::from_waker(&waker);
+
+    // ~5 ms in the future: comfortably > IOAPIC programming latency,
+    // well under any reasonable test timeout.
+    let cycles_per_ns = narf_time::cycles_per_ns() as u64;
+    let cycles_5ms = cycles_per_ns * 5_000_000;
+    let deadline = narf_time::Instant::now().plus_cycles(cycles_5ms);
+    let mut s = narf_time::SleepUntil::new(deadline);
+
+    if !matches!(Pin::new(&mut s).poll(&mut cx), Poll::Pending) {
+        return TestResult::Fail("first poll should be Pending");
+    }
+
+    // SAFETY: timer_pump is initialised; HPET will deliver via IOAPIC.
+    unsafe { narf_arch::enable_interrupts() };
+
+    let start = narf_time::Instant::now();
+    let mut woken = false;
+    while narf_time::Instant::now().cycles_since(start) < cycles_per_ns * 500_000_000 {
+        if cw.0.load(Ordering::Relaxed) > 0 {
+            woken = true;
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    // SAFETY: re-disable IRQs before returning.
+    unsafe { narf_arch::disable_interrupts() };
+
+    if !woken {
+        return TestResult::Fail("timer_wheel never woke the sleep waker");
+    }
+
+    if !matches!(Pin::new(&mut s).poll(&mut cx), Poll::Ready(())) {
+        return TestResult::Fail("post-wake poll should be Ready");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("interrupts/timer", smoke_timer_pump_drives_wheel_sleep);
+
 fn smoke_vector_alloc_block_contiguous() -> TestResult {
     // alloc_block(4) returns a contiguous run of 4 vectors.
     use crate::vector::{alloc_block, free, is_allocated};

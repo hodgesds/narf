@@ -361,3 +361,188 @@ fn smoke_hpet_disarm_clears_enable_bit() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("time/hpet", smoke_hpet_disarm_clears_enable_bit);
+
+// ── Timer wheel ──────────────────────────────────────────────────
+
+extern crate alloc;
+
+fn make_noop_waker() -> core::task::Waker {
+    use alloc::sync::Arc;
+    use alloc::task::Wake;
+    struct Noop;
+    impl Wake for Noop {
+        fn wake(self: Arc<Self>) {}
+    }
+    Arc::new(Noop).into()
+}
+
+fn smoke_wheel_register_then_fire_due_wakes() -> TestResult {
+    use crate::timer_wheel;
+    use alloc::sync::Arc;
+    use alloc::task::Wake;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    timer_wheel::__reset_for_test();
+
+    struct W(AtomicUsize);
+    impl Wake for W {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let cw = Arc::new(W(AtomicUsize::new(0)));
+    let waker: core::task::Waker = cw.clone().into();
+
+    timer_wheel::set_arm_callback(timer_wheel::__test_arm_callback);
+
+    let _h = timer_wheel::register(100, waker).expect("register");
+    if timer_wheel::ARM_FIRED.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("arm callback should fire on first registration");
+    }
+    if timer_wheel::LAST_ARM_DEADLINE.load(Ordering::Relaxed) != 100 {
+        return TestResult::Fail("arm deadline mismatch");
+    }
+    if timer_wheel::next_deadline_cycles() != Some(100) {
+        return TestResult::Fail("next_deadline_cycles mismatch");
+    }
+
+    if timer_wheel::fire_due(50) != 0 {
+        return TestResult::Fail("nothing should fire before deadline");
+    }
+    if cw.0.load(Ordering::Relaxed) != 0 {
+        return TestResult::Fail("waker fired prematurely");
+    }
+    if timer_wheel::fire_due(150) != 1 {
+        return TestResult::Fail("expected exactly one fire");
+    }
+    if cw.0.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("waker not invoked on fire_due");
+    }
+    if timer_wheel::next_deadline_cycles().is_some() {
+        return TestResult::Fail("wheel should be empty after fire");
+    }
+
+    timer_wheel::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("time/wheel", smoke_wheel_register_then_fire_due_wakes);
+
+fn smoke_wheel_arm_only_on_new_min() -> TestResult {
+    use crate::timer_wheel;
+    use core::sync::atomic::Ordering;
+
+    timer_wheel::__reset_for_test();
+    timer_wheel::set_arm_callback(timer_wheel::__test_arm_callback);
+
+    let h_far = timer_wheel::register(1000, make_noop_waker()).unwrap();
+    if timer_wheel::ARM_FIRED.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("first registration must arm");
+    }
+    let _h_later = timer_wheel::register(2000, make_noop_waker()).unwrap();
+    if timer_wheel::ARM_FIRED.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("registration with later deadline must NOT re-arm");
+    }
+    let _h_earlier = timer_wheel::register(500, make_noop_waker()).unwrap();
+    if timer_wheel::ARM_FIRED.load(Ordering::Relaxed) != 2 {
+        return TestResult::Fail("registration with earlier deadline must re-arm");
+    }
+    if timer_wheel::LAST_ARM_DEADLINE.load(Ordering::Relaxed) != 500 {
+        return TestResult::Fail("re-arm should target the new min");
+    }
+    timer_wheel::cancel(h_far);
+
+    timer_wheel::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("time/wheel", smoke_wheel_arm_only_on_new_min);
+
+fn smoke_wheel_cancel_removes_slot() -> TestResult {
+    use crate::timer_wheel;
+
+    timer_wheel::__reset_for_test();
+
+    let h = timer_wheel::register(500, make_noop_waker()).unwrap();
+    if timer_wheel::occupied() != 1 {
+        return TestResult::Fail("occupied count after register");
+    }
+    timer_wheel::cancel(h);
+    if timer_wheel::occupied() != 0 {
+        return TestResult::Fail("cancel should free the slot");
+    }
+    // Stale cancel — must be silent.
+    timer_wheel::cancel(h);
+
+    timer_wheel::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("time/wheel", smoke_wheel_cancel_removes_slot);
+
+fn smoke_wheel_full_returns_err() -> TestResult {
+    use crate::timer_wheel;
+    use alloc::vec::Vec;
+
+    timer_wheel::__reset_for_test();
+    let mut handles: Vec<timer_wheel::SleepHandle> = Vec::new();
+    for i in 0..timer_wheel::MAX_SLEEPERS {
+        let h = match timer_wheel::register(1000 + i as u64, make_noop_waker()) {
+            Ok(h) => h,
+            Err(_) => return TestResult::Fail("wheel rejected before MAX_SLEEPERS"),
+        };
+        handles.push(h);
+    }
+    match timer_wheel::register(99_999, make_noop_waker()) {
+        Err(timer_wheel::WheelError::Full) => {}
+        _ => return TestResult::Fail("MAX+1 registration should be Full"),
+    }
+    for h in handles {
+        timer_wheel::cancel(h);
+    }
+    timer_wheel::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("time/wheel", smoke_wheel_full_returns_err);
+
+fn smoke_sleep_until_uses_wheel() -> TestResult {
+    // SleepUntil registers with the wheel on first poll, then
+    // returns Ready when fire_due crosses its deadline.
+    use crate::{timer_wheel, Instant, SleepUntil};
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::task::{Context, Poll};
+
+    timer_wheel::__reset_for_test();
+    let waker = make_noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    let deadline = Instant::now().plus_cycles(1_000_000_000);
+    let mut s = SleepUntil::new(deadline);
+    if !matches!(Pin::new(&mut s).poll(&mut cx), Poll::Pending) {
+        return TestResult::Fail("future-deadline poll should be Pending");
+    }
+    if timer_wheel::occupied() != 1 {
+        return TestResult::Fail("SleepUntil should have registered with wheel");
+    }
+    // Crossing the deadline + a re-poll → Ready. We can't actually
+    // wait that long; instead, pretend the deadline already passed
+    // by calling fire_due with a far-future time.
+    let woken = timer_wheel::fire_due(u64::MAX);
+    if woken != 1 {
+        return TestResult::Fail("fire_due should wake the registered SleepUntil");
+    }
+    // After fire_due, polling SleepUntil sees Instant::now() <
+    // deadline still (we lied to fire_due), but the slot is gone
+    // — refresh_waker returns false and the recursive poll
+    // re-registers. That's the spurious-wake path.
+    // Instead, drop and verify cleanup.
+    drop(s);
+    if timer_wheel::occupied() != 0 {
+        return TestResult::Fail("drop should clean wheel");
+    }
+
+    timer_wheel::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("time/wheel", smoke_sleep_until_uses_wheel);

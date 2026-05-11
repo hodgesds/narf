@@ -3,6 +3,7 @@
 pub mod apic;
 pub mod hpet_oneshot;
 pub mod ipi;
+pub mod timer_pump;
 
 pub use apic::{eoi, init_bsp, self_ipi, start_timer, stop_timer, timer_ticks};
 pub use hpet_oneshot::{arm_oneshot as arm_hpet_oneshot, HpetOneshotError};

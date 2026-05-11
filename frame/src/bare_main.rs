@@ -1997,6 +1997,27 @@ fn run_async_demo() -> ! {
         }
     }
 
+    // Bring up the HPET timer-wheel pump now that HPET, IDT, and
+    // the IOAPIC are all live. Future `SleepUntil` registrations
+    // arm HPET via this pump rather than busy-polling the
+    // executor. Failure is non-fatal — sleep_cycles falls back
+    // to self-wake busy-poll when no arm callback is installed.
+    #[cfg(target_arch = "x86_64")]
+    {
+        match narf_interrupts::x86_64::timer_pump::init() {
+            Ok(()) => {
+                let _ = writeln!(console::Writer, "  timer_pump: HPET wheel armed");
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    console::Writer,
+                    "  timer_pump: init failed ({:?}) — sleeps will busy-poll",
+                    e
+                );
+            }
+        }
+    }
+
     narf_scheduler::init();
     let _ = writeln!(console::Writer, "  scheduler: ready queue initialised");
 

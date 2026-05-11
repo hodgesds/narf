@@ -147,6 +147,13 @@ pub fn set_cycles_per_ns(cpns: u32) {
     CYCLES_PER_NS.store(cpns.max(1), Ordering::Release);
 }
 
+/// Read the calibrated cycles-per-ns. Returns ≥ 1 even before
+/// calibration so divides stay well-defined.
+#[inline]
+pub fn cycles_per_ns() -> u32 {
+    CYCLES_PER_NS.load(Ordering::Relaxed).max(1)
+}
+
 /// Current monotonic-ns since boot (cycles ÷ cycles-per-ns).
 #[inline]
 pub fn monotonic_ns() -> u64 {
