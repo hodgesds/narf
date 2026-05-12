@@ -1086,7 +1086,19 @@ impl Xhci {
     /// attached device into Default state. The PORTSC change bits
     /// at [17..23] are RW1C — preserve the RO/RW fields below them
     /// when writing back. Returns the post-reset PORTSC value.
+    ///
+    /// AMD FCH USB2 controllers + many integrated HID devices
+    /// (per the AMD chipset datasheet's Hot Reset note + on-screen
+    /// PORTSC capture): the controller routinely bounces CCS
+    /// during reset (CCS toggles 1→0→1, fires PORTSC.CSC, the new
+    /// connect cycle leaves PED=0 and PLS=Polling). USB 2.0
+    /// §11.5.1.5 + xHCI 1.2 §4.19.5 both note that a port reset
+    /// can re-trigger device-initiated detach/attach handshaking;
+    /// the spec-compliant response is to re-issue PR until the
+    /// link comes up cleanly. We cap at RESET_RETRIES to bound
+    /// boot time on a truly dead port.
     pub fn port_reset(&self, port: u8) -> Result<u32, XhciError> {
+        const RESET_RETRIES: u32 = 5;
         if port == 0 || port > self.caps.max_ports {
             return Err(XhciError::BadPort);
         }
@@ -1113,6 +1125,33 @@ impl Xhci {
                 core::hint::spin_loop();
             }
         }
+        let mut last_err = XhciError::PortResetTimeout;
+        for _retry in 0..RESET_RETRIES {
+            match self.port_reset_once(port, off) {
+                Ok(v) => return Ok(v),
+                Err(e) => last_err = e,
+            }
+            // Brief gap between attempts so the device's USB SIE
+            // can settle before the next PR pulse — same idea as
+            // TRSTRCY but on the controller side. ~5 ms.
+            let tsc_hz = narf_time::calibrate_clocks();
+            if tsc_hz > 0 {
+                narf_time::busy_wait_cycles((tsc_hz / 1000) * 5);
+            } else {
+                for _ in 0..500_000u32 {
+                    core::hint::spin_loop();
+                }
+            }
+        }
+        Err(last_err)
+    }
+
+    /// One reset attempt. Factored out so `port_reset` can retry
+    /// on a CSC-bounce or PED-drop without re-doing the CCS
+    /// debounce.
+    fn port_reset_once(&self, port: u8, off: u64) -> Result<u32, XhciError> {
+        // SAFETY: identity-mapped MMIO; off bounded by caller.
+        let cur = unsafe { self.mmio.read32(off) };
         // Mask RW1C change bits to 0 in the value we write so we
         // don't accidentally clear them; OR in PORTSC_PR + PP to
         // assert reset and keep power on.
