@@ -216,6 +216,15 @@ pub struct E1000 {
     mmio: MmioRegion,
     /// TX descriptor-ring DMA buffer.
     tx_ring: DmaBuffer,
+    /// Persistent TX frame buffers, one per descriptor slot
+    /// (audit #4: pre-fix `tx()` did `alloc_coherent(4096)` per
+    /// frame and dropped it on return — under AMD-Vi a freed
+    /// page could be reused while the NIC still had a delayed
+    /// DMA in flight, corrupting whatever owns the recycled
+    /// page). Pool sized to TX_RING_LEN; slot index matches the
+    /// descriptor index, so `tx()` writes into `tx_pool[slot]`
+    /// before pointing the descriptor's `addr` at it.
+    tx_pool: alloc::vec::Vec<DmaBuffer>,
     /// Driver-side TDT cursor (tail).
     tx_tail: IrqSafeSpinLock<u32>,
     /// RX descriptor-ring DMA buffer.
@@ -336,9 +345,19 @@ impl E1000 {
             let _ = mmio.read32(REG_ICR);
         }
 
-        // 4. Allocate TX descriptor ring.
+        // 4. Allocate TX descriptor ring + persistent per-slot
+        //    frame buffers. The buffers outlive any single tx()
+        //    call so a delayed DMA write (AMD-Vi turn-around
+        //    latency) can't land on a freed page.
         let tx_ring = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| E1000Error::NoMemory)?;
         let ring_phys = tx_ring.phys_addr().raw();
+        let mut tx_pool: alloc::vec::Vec<DmaBuffer> =
+            alloc::vec::Vec::with_capacity(TX_RING_LEN);
+        for _ in 0..TX_RING_LEN {
+            let b =
+                alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| E1000Error::NoMemory)?;
+            tx_pool.push(b);
+        }
         // Zero the ring (alloc_coherent guarantees fresh memory but
         // we're explicit).
         // SAFETY: identity-mapped DMA.
@@ -464,6 +483,7 @@ impl E1000 {
         Ok(Self {
             mmio,
             tx_ring,
+            tx_pool,
             tx_tail: IrqSafeSpinLock::new(0),
             rx_ring,
             rx_pool,
@@ -562,18 +582,20 @@ impl E1000 {
         if frame.len() == 0 || frame.len() > 1518 {
             return Err(E1000Error::FrameTooLong);
         }
-        // Stage the frame into a fresh DMA scratch page.
-        let scratch = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| E1000Error::NoMemory)?;
-        let phys = scratch.phys_addr().raw();
-        // SAFETY: identity-mapped DMA.
+        // Pick the next TX descriptor slot, then reuse that
+        // slot's persistent DMA buffer (audit #4 — pre-fix this
+        // alloc_coherent'd a fresh page per frame and dropped it
+        // on return).
+        let mut tail_g = self.tx_tail.lock();
+        let slot = (*tail_g) as usize % TX_RING_LEN;
+        let phys = self.tx_pool[slot].phys_addr().raw();
+        // SAFETY: identity-mapped DMA buffer; bounds-checked by
+        // the FrameTooLong guard above (1518 < 4096).
         unsafe {
             for (i, b) in frame.iter().enumerate() {
                 core::ptr::write_volatile((phys + i as u64) as *mut u8, *b);
             }
         }
-        // Pick the next TX descriptor slot.
-        let mut tail_g = self.tx_tail.lock();
-        let slot = (*tail_g) as usize % TX_RING_LEN;
         let ring_phys = self.tx_ring.phys_addr().raw();
         let desc_addr = ring_phys + (slot * 16) as u64;
         let desc = TxDesc {
@@ -613,8 +635,6 @@ impl E1000 {
             }
             core::hint::spin_loop();
         }
-        // scratch drops here.
-        let _ = scratch;
         Ok(())
     }
 
@@ -633,20 +653,23 @@ impl E1000 {
     /// caller is responsible for awaiting completion (via the
     /// `tx_async` wrapper, which holds the scratch buffer alive
     /// until DD is observed).
-    fn tx_enqueue(&self, frame: &[u8]) -> Result<(usize, DmaBuffer), E1000Error> {
+    fn tx_enqueue(&self, frame: &[u8]) -> Result<usize, E1000Error> {
         if frame.len() == 0 || frame.len() > 1518 {
             return Err(E1000Error::FrameTooLong);
         }
-        let scratch = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| E1000Error::NoMemory)?;
-        let phys = scratch.phys_addr().raw();
-        // SAFETY: identity-mapped DMA.
+        // Persistent per-slot buffer (audit #4); same change as the
+        // sync `tx()` path. Returns just the slot id now since the
+        // buffer is owned by the controller and doesn't need to
+        // be moved through the async future.
+        let mut tail_g = self.tx_tail.lock();
+        let slot = (*tail_g) as usize % TX_RING_LEN;
+        let phys = self.tx_pool[slot].phys_addr().raw();
+        // SAFETY: identity-mapped DMA buffer; bounds-checked above.
         unsafe {
             for (i, b) in frame.iter().enumerate() {
                 core::ptr::write_volatile((phys + i as u64) as *mut u8, *b);
             }
         }
-        let mut tail_g = self.tx_tail.lock();
-        let slot = (*tail_g) as usize % TX_RING_LEN;
         let ring_phys = self.tx_ring.phys_addr().raw();
         let desc_addr = ring_phys + (slot * 16) as u64;
         let desc = TxDesc {
@@ -669,7 +692,7 @@ impl E1000 {
             self.mmio.write32(REG_TDT, next_tail);
         }
         *tail_g = next_tail;
-        Ok((slot, scratch))
+        Ok(slot)
     }
 
     /// Drain one received frame from the RX ring, copying it into
@@ -880,10 +903,10 @@ pub async fn tx_async(frame: &[u8]) -> Result<(), E1000Error> {
     // completes before we await, the post-enqueue fire-count check
     // inside `WaitForIrq::poll` resolves immediately.
     let waiter = narf_interrupts::wait::wait_for_irq(vector);
-    let (slot, scratch) =
+    let slot =
         match with_controller(|c| c.tx_enqueue(frame)).unwrap_or(Err(E1000Error::UnsupportedDevice))
         {
-            Ok(t) => t,
+            Ok(s) => s,
             Err(e) => {
                 drop(waiter);
                 return Err(e);
@@ -896,6 +919,5 @@ pub async fn tx_async(frame: &[u8]) -> Result<(), E1000Error> {
     while !with_controller(|c| c.tx_slot_done(slot)).unwrap_or(false) {
         let _ = narf_interrupts::wait::wait_for_irq(vector).await;
     }
-    drop(scratch);
     Ok(())
 }

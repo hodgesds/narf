@@ -199,6 +199,11 @@ pub struct RtlNic {
     mmio: MmioRegion,
     /// TX descriptor ring DMA buffer (`RING_LEN * 16` bytes).
     tx_ring: DmaBuffer,
+    /// Persistent per-slot TX frame buffers (audit #4 — pre-fix
+    /// every tx()/tx_async() did `alloc_coherent(4096)` per
+    /// frame and dropped it on return). Pool length matches
+    /// RING_LEN so slot index trivially keys into the pool.
+    tx_pool: alloc::vec::Vec<DmaBuffer>,
     /// Driver-side TX producer cursor (next slot to fill).
     tx_head: IrqSafeSpinLock<u32>,
     /// RX descriptor ring DMA buffer (`RING_LEN * 16` bytes).
@@ -289,6 +294,12 @@ impl RtlNic {
         for _ in 0..RING_LEN {
             rx_pool.push(
                 alloc_coherent(RX_BUF_LEN, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?,
+            );
+        }
+        let mut tx_pool: alloc::vec::Vec<DmaBuffer> = alloc::vec::Vec::with_capacity(RING_LEN);
+        for _ in 0..RING_LEN {
+            tx_pool.push(
+                alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?,
             );
         }
 
@@ -394,6 +405,7 @@ impl RtlNic {
         Ok(Self {
             mmio,
             tx_ring,
+            tx_pool,
             tx_head: IrqSafeSpinLock::new(0),
             rx_ring,
             rx_pool,
@@ -452,20 +464,16 @@ impl RtlNic {
         if frame.is_empty() || frame.len() > 1518 {
             return Err(NicError::FrameTooLong);
         }
-        // Stage the frame into a per-call DMA scratch page. A real
-        // driver pools these — Stage-4 cut keeps allocator pressure
-        // explicit instead of hiding it.
-        let scratch = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?;
-        let phys = scratch.phys_addr().raw();
-        // SAFETY: identity-mapped DMA page.
+        // Persistent per-slot buffer (audit #4); index by slot.
+        let mut head_g = self.tx_head.lock();
+        let slot = (*head_g) as usize % RING_LEN;
+        let phys = self.tx_pool[slot].phys_addr().raw();
+        // SAFETY: identity-mapped DMA buffer; bounds-checked above.
         unsafe {
             for (i, b) in frame.iter().enumerate() {
                 core::ptr::write_volatile((phys + i as u64) as *mut u8, *b);
             }
         }
-
-        let mut head_g = self.tx_head.lock();
-        let slot = (*head_g) as usize % RING_LEN;
         let ring_phys = self.tx_ring.phys_addr().raw();
         let desc_addr = ring_phys + (slot * 16) as u64;
 
@@ -536,8 +544,7 @@ impl RtlNic {
             }
             core::hint::spin_loop();
         }
-        // scratch drops here — the chip no longer references it.
-        let _ = scratch;
+        // (no scratch drop — buffer is persistent in tx_pool)
         Ok(())
     }
 
@@ -642,22 +649,23 @@ impl RtlNic {
         let v = self.irq_vector.ok_or(NicError::MsixSetup)?;
         let waiter = narf_interrupts::wait_for_irq(v);
 
-        // Stage frame + descriptor (same shape as polled `transmit`,
-        // minus the OWN-clear spin at the end).
-        let scratch = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| NicError::NoMemory)?;
-        let phys = scratch.phys_addr().raw();
-        // SAFETY: identity-mapped DMA page.
-        unsafe {
-            for (i, b) in frame.iter().enumerate() {
-                core::ptr::write_volatile((phys + i as u64) as *mut u8, *b);
-            }
-        }
-
+        // Stage frame into the persistent per-slot buffer (audit
+        // #4); same shape as polled `transmit`, minus the OWN-clear
+        // spin at the end.
         let slot;
         let desc_addr;
+        let phys;
         {
             let mut head_g = self.tx_head.lock();
             slot = (*head_g) as usize % RING_LEN;
+            phys = self.tx_pool[slot].phys_addr().raw();
+            // SAFETY: identity-mapped DMA buffer; bounds-checked by
+            // FrameTooLong guard.
+            unsafe {
+                for (i, b) in frame.iter().enumerate() {
+                    core::ptr::write_volatile((phys + i as u64) as *mut u8, *b);
+                }
+            }
             desc_addr = self.tx_ring.phys_addr().raw() + (slot * 16) as u64;
             // SAFETY: identity-mapped DMA ring.
             let cur_flags = unsafe { core::ptr::read_volatile(desc_addr as *const u32) };
@@ -693,8 +701,7 @@ impl RtlNic {
         // wait_for_irq fires on a fresh edge.
         let _ = waiter.await;
         let _ = self.ack_isr();
-        // scratch lives until awaiter resumes — drop here.
-        let _ = scratch;
+        // (no scratch drop — buffer is persistent in tx_pool)
         Ok(())
     }
 

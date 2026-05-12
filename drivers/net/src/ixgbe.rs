@@ -203,6 +203,10 @@ pub enum IxgbeError {
 pub struct Ixgbe {
     pub(crate) mmio: MmioRegion,
     pub(crate) tx_ring: DmaBuffer,
+    /// Persistent per-slot TX frame buffers (audit #4 — pre-fix
+    /// `tx()` did `alloc_coherent(4096)` per frame and dropped it
+    /// on return). Indexed by descriptor slot.
+    pub(crate) tx_pool: Vec<DmaBuffer>,
     pub(crate) rx_ring: DmaBuffer,
     /// Held to keep the per-descriptor DMA buffers alive for the
     /// lifetime of the controller; addresses live inside the RX
@@ -300,9 +304,16 @@ impl Ixgbe {
             mmio.write32(REG_CTRL_EXT, cur | CTRL_EXT_DRV_LOAD | CTRL_EXT_NS_DIS);
         }
 
-        // 6. Set up the TX ring (queue 0).
+        // 6. Set up the TX ring (queue 0) + persistent per-slot
+        //    frame buffers (audit #4).
         let tx_ring = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| IxgbeError::NoMemory)?;
         let tx_phys = tx_ring.phys_addr().raw();
+        let mut tx_pool: Vec<DmaBuffer> = Vec::with_capacity(TX_RING_LEN);
+        for _ in 0..TX_RING_LEN {
+            tx_pool.push(
+                alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| IxgbeError::NoMemory)?,
+            );
+        }
         // SAFETY: identity-mapped DMA.
         unsafe {
             for i in 0..(TX_RING_LEN * 16) {
@@ -382,6 +393,7 @@ impl Ixgbe {
         Ok(Self {
             mmio,
             tx_ring,
+            tx_pool,
             rx_ring,
             rx_pool,
             tx_tail: IrqSafeSpinLock::new(0),
@@ -403,16 +415,16 @@ impl Ixgbe {
         if frame.is_empty() || frame.len() > 1518 {
             return Err(IxgbeError::FrameTooLong);
         }
-        let scratch = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| IxgbeError::NoMemory)?;
-        let phys = scratch.phys_addr().raw();
-        // SAFETY: identity-mapped DMA.
+        // Persistent per-slot buffer (audit #4).
+        let mut tail_g = self.tx_tail.lock();
+        let slot = (*tail_g) as usize % TX_RING_LEN;
+        let phys = self.tx_pool[slot].phys_addr().raw();
+        // SAFETY: identity-mapped DMA buffer; bounds-checked above.
         unsafe {
             for (i, b) in frame.iter().enumerate() {
                 core::ptr::write_volatile((phys + i as u64) as *mut u8, *b);
             }
         }
-        let mut tail_g = self.tx_tail.lock();
-        let slot = (*tail_g) as usize % TX_RING_LEN;
         let ring_phys = self.tx_ring.phys_addr().raw();
         let desc_addr = ring_phys + (slot * 16) as u64;
         let desc = AdvTxDesc {
@@ -450,7 +462,7 @@ impl Ixgbe {
             }
             core::hint::spin_loop();
         }
-        let _ = scratch;
+        // (no scratch drop — buffer is persistent in tx_pool)
         Ok(())
     }
 
