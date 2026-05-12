@@ -1393,7 +1393,19 @@ fn main() -> Result<()> {
             }
             run_cmd(&args)
         }
-        Cmd::Image(args) => image_cmd(&args),
+        Cmd::Image(mut args) => {
+            // Default-on boot-init for parity with `iso-boot`. An
+            // image without it boots to the async-demo loop and
+            // never spawns /init or /shell, which is almost never
+            // what someone running `xtask image` wants — they're
+            // building an ISO to actually run.
+            if args.features.is_empty() {
+                args.features = "boot-init".into();
+            } else if !args.features.contains("boot-init") {
+                args.features.push_str(",boot-init");
+            }
+            image_cmd(&args)
+        }
         Cmd::IsoBoot(mut args) => {
             // Default-on boot-init so the ISO actually spawns the
             // userspace init + shell tasks; without it the kernel
