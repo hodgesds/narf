@@ -210,15 +210,29 @@ impl<T: ?Sized> IrqSafeSpinLock<T> {
         IrqSafeSpinLockGuard {
             lock: &self.inner,
             saved,
+            _not_send: core::marker::PhantomData,
         }
     }
 }
 
 /// Guard for [`IrqSafeSpinLock`]. Restores the caller's IRQ state on
 /// drop and releases the lock.
+///
+/// **Intentionally `!Send`** — `_not_send` field forces this guard
+/// to live entirely on a single thread / CPU and, more importantly,
+/// makes any `async fn` that holds it across `.await` itself
+/// `!Send`. That breaks `narf_scheduler::spawn<F: Future + Send>`
+/// at compile time, so the cursor-pump / driver-async deadlock
+/// pattern from the audit (IrqSafeSpinLock guard held across the
+/// IRQ wake the future is waiting for) becomes a build error
+/// instead of a run-time hang. Use `narf_lib::mutex::Mutex` when
+/// you need to hold a lock across `.await`.
 pub struct IrqSafeSpinLockGuard<'a, T: ?Sized> {
     lock: &'a SpinLock<T>,
     saved: IrqSavedState,
+    /// `*const ()` is `!Send`; the marker propagates that to the
+    /// guard so any future capturing the guard becomes `!Send`.
+    _not_send: core::marker::PhantomData<*const ()>,
 }
 
 impl<T: ?Sized> fmt::Debug for IrqSafeSpinLockGuard<'_, T> {

@@ -337,10 +337,18 @@ impl<B: BlockDevice + 'static> FatNode<B> {
             let last_cluster_index = if len == 0 { 0 } else { (len - 1) / bytes_per_cluster };
 
             if cluster < 2 {
-                let mut g = self.state.lock();
-                g.stat.size = len;
-                g.stat.blocks = len.div_ceil(self.volume.bpb.bytes_per_sec as u64);
-                drop(g);
+                // Block-scope the IrqSafeSpinLock guard so it's
+                // dropped *before* the .await below. The
+                // !Send-marker on IrqSafeSpinLockGuard catches
+                // missed drops at compile time; explicit `drop(g)`
+                // doesn't shrink the future's captured-state
+                // lifetime in async fns the way it does in sync
+                // code.
+                {
+                    let mut g = self.state.lock();
+                    g.stat.size = len;
+                    g.stat.blocks = len.div_ceil(self.volume.bpb.bytes_per_sec as u64);
+                }
                 self.sync_metadata().await?;
                 return Ok(());
             }
