@@ -31,7 +31,12 @@ use crate::{FbWriter, Rect};
 
 const PANEL_BG: Pixel32 = Pixel32(0xFF0A_1428); // dark navy
 const PANEL_FG: Pixel32 = Pixel32(0xFFE0_E0E0); // light grey
-const PANEL_HEIGHT: u32 = 8 * 5; // 5 lines of 8x8 text + padding
+/// Number of klog tail lines displayed under the live-state lines.
+/// 12 fits comfortably under a 1280×800 FB while leaving room for
+/// a little headroom + padding above the panel.
+const KLOG_TAIL_LINES: usize = 12;
+const HEADER_LINES: u32 = 3;
+const PANEL_HEIGHT: u32 = 8 * (HEADER_LINES + KLOG_TAIL_LINES as u32 + 1); // header + klog tail + separator
 const PANEL_PAD: u32 = 4;
 
 /// Paint the status panel into the bottom of the active FB. Best-
@@ -80,19 +85,35 @@ pub fn paint(fb: &FbWriter) {
         crate::cursor::dropped_for_no_fb(),
     );
 
-    let lines = [
-        fb_line.as_str(),
-        dev_line.as_str(),
-        cursor_line.as_str(),
-        "(this panel updates only at boot end; reboot to refresh)",
-    ];
+    let header = [fb_line.as_str(), dev_line.as_str(), cursor_line.as_str()];
     // SAFETY: cursor renderer also borrows the framebuffer without
     // a higher-level lock; the status panel paints once at boot
     // before user-task pumps tighten contention.
     let mut fbm = unsafe { fb.scanout_for_cursor_mut() };
     let mut y = panel_y + PANEL_PAD;
-    for line in lines.iter() {
+    for line in header.iter() {
         fbm.draw_string_8x8(PANEL_PAD, y, line, PANEL_FG, PANEL_BG);
+        y += 8;
+    }
+    // Separator + klog tail. Truncates each line to ~150 chars so a
+    // wide log line doesn't overflow the FB width (1280 / 8 = 160
+    // glyphs, leaves a small margin).
+    fbm.draw_string_8x8(
+        PANEL_PAD,
+        y,
+        "--- recent log (klog tail) ----------------------------------",
+        PANEL_FG,
+        PANEL_BG,
+    );
+    y += 8;
+    let max_chars = ((w - PANEL_PAD * 2) / 8) as usize;
+    for line in narf_console::klog::tail(KLOG_TAIL_LINES).iter() {
+        let truncated = if line.len() > max_chars {
+            &line[..max_chars]
+        } else {
+            line.as_str()
+        };
+        fbm.draw_string_8x8(PANEL_PAD, y, truncated, PANEL_FG, PANEL_BG);
         y += 8;
     }
     let _ = fb.flush(Rect::new(0, panel_y, w, PANEL_HEIGHT + PANEL_PAD));

@@ -14,6 +14,8 @@ use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use narf_lib::sync::{IrqSafeSpinLock, OnceLock};
 use narf_memory::{PhysAddr, VirtAddr};
 
+pub mod klog;
+
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;
 #[cfg(target_arch = "x86_64")]
@@ -122,6 +124,12 @@ pub fn remap_to_virtual(virt: VirtAddr) {
 /// prevent interleaved output across CPUs (harmless on Stage 1's single CPU,
 /// correct when AP bring-up lands in Stage 2).
 pub fn write_str(s: &str) {
+    // Mirror to the kernel log ring *first*, before taking the
+    // console lock. klog uses its own IrqSafe lock so panic-time
+    // writes (which may already hold the console lock via the
+    // panic_sink path) still capture without a deadlock risk.
+    klog::record(s);
+
     let _g = CONSOLE.lock.lock();
     let kind = match CONSOLE.kind.get() {
         Some(k) => *k,

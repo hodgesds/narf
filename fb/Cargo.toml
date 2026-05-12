@@ -27,6 +27,7 @@ narf-shmem        = { path = "../shmem" }
 narf-input        = { path = "../input" }
 narf-drivers-i2c  = { path = "../drivers/i2c" }
 narf-drivers-gpio = { path = "../drivers/gpio" }
+narf-console      = { path = "../console" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 
 [lints]
