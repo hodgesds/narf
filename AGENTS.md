@@ -156,6 +156,37 @@ real HW. `block_on_spin` is fine because it doesn't disable IRQs.
 executor poll** (`CURRENT_TASK != 0`) — caught at the call site
 instead of becoming a silent re-entrant deadlock.
 
+**Compile-time enforcement: `IrqSafeSpinLockGuard` is `!Send`.** Any
+`async fn` that holds an `IrqSafeSpinLock` guard across `.await`
+becomes itself `!Send`, breaking the `Send` bound in
+`narf_scheduler::spawn`. Build error instead of a runtime hang.
+Use a block scope (`{ let g = lock.lock(); ... }; foo().await`) to
+shrink the guard's lifetime explicitly — `drop(g)` does **not**
+shrink an async future's captured-state lifetime the way it does
+in sync code.
+
+### Sync-wrapper decision tree
+
+A sync wrapper (`BlockDeviceSync::read`, future `FsOps` sync paths,
+etc.) needs `block_on` ONLY when its underlying driver path
+**waits on an IRQ**. If the driver polls a hardware register
+(MMIO read of a "done" bit) without IRQ involvement, the existing
+hold-lock-across-busy-spin pattern is correct — no IRQ wake means
+no deadlock risk under IrqSafeSpinLock.
+
+| Sync wrapper | Underlying path | Migration? |
+|---|---|---|
+| `NvmeBlockSync::read/write` | `read_lba`/`write_lba` polled CQE | no |
+| `AhciBlockSync::read/write` | polled DD bit | no |
+| `VirtioBlkBlockSync::read/write` | polled used-ring | no |
+
+If a future driver needs IRQ-driven sync I/O (e.g. NVMe over
+MSI-X for latency-sensitive workloads), the migration is:
+1. Convert the per-driver `IrqSafeSpinLock<Option<Controller>>`
+   to `narf_lib::mutex::Mutex<Option<Controller>>` (async-safe).
+2. Have the async path take `&self` + internally lock the Mutex.
+3. Sync wrapper calls `block_on(driver.read_async(...))`.
+
 **Why this exists:** the audit (commit `de5dabc`) found drivers
 re-implementing 10M-iteration spin loops on MMIO registers in
 NVMe / AHCI / e1000 / r8169 / ixgbe. Each spin froze the cursor /
