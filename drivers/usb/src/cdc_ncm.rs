@@ -459,6 +459,7 @@ impl<'a> ParsedNtb<'a> {
 #[cfg(any(test, feature = "kernel-test"))]
 pub mod tests {
     use super::*;
+    use crate::cdc::CS_INTERFACE;
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     fn smoke_ncm_descriptor() -> TestResult {
