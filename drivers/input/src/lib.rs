@@ -19,18 +19,34 @@ pub mod i8042;
 pub mod i8042_mouse;
 pub mod wbdi;
 
-/// Stage::Device initcalls for this driver crate. i8042 init is
-/// best-effort — a missing PS/2 controller (USB-only systems,
-/// virtio-input-only) returns NotPresent rather than failing.
+/// Stage::Device initcalls for this driver crate.
 ///
-/// IRQ wiring: each i8042 channel's handler (`i8042::on_irq1`,
-/// `i8042_mouse::on_irq12`) gets routed through the IOAPIC at
-/// its ISA-default GSI (1 for keyboard, 12 for mouse), with any
-/// MADT Interrupt Source Override applied to remap the line.
-/// ISA bus default for both lines is edge-triggered active-high
-/// (PC AT spec); ISO overrides are honoured if present.
-#[cfg(target_arch = "x86_64")]
+/// Cross-arch: i2c-hid (PNP0C50 over an AMD-FCH or other I2C
+/// controller). Dominant input class on ARM laptops/tablets and
+/// modern x86 thin-and-lights — the cfg gate below previously
+/// confined the whole register_initcalls body to x86_64 and
+/// silently dropped i2c-hid on aarch64.
+///
+/// x86_64-only: i8042 PS/2 keyboard + mouse (no PS/2 controller
+/// outside legacy PC platforms).
+///
+/// IRQ wiring (x86_64 i8042 path): each channel's handler
+/// (`i8042::on_irq1`, `i8042_mouse::on_irq12`) gets routed
+/// through the IOAPIC at its ISA-default GSI (1 for keyboard, 12
+/// for mouse), with any MADT Interrupt Source Override applied
+/// to remap the line. ISA bus default = edge-triggered
+/// active-high (PC AT spec); ISO overrides honoured if present.
 pub fn register_initcalls() {
+    // i2c-hid-probe + i2c-hid-bind run on every arch — they
+    // walk the AML namespace which is arch-independent.
+    i2c_hid::register_initcalls();
+
+    #[cfg(target_arch = "x86_64")]
+    register_i8042_initcalls();
+}
+
+#[cfg(target_arch = "x86_64")]
+fn register_i8042_initcalls() {
     use narf_init::{InitResult, Stage};
     narf_init::register(Stage::Device, "i8042-kbd", || {
         // SAFETY: BSP boot context, no other agent driving 0x60/0x64.
@@ -62,11 +78,6 @@ pub fn register_initcalls() {
             Err(_) => InitResult::NotPresent,
         }
     });
-    // Register i2c-hid-probe + i2c-hid-bind directly into Stage::Device.
-    // Doing it inside another Stage::Device initcall would land them in
-    // the registry vec *after* the snapshot is taken, so they'd never
-    // run in this pass.
-    i2c_hid::register_initcalls();
 }
 
 /// Wrapper to convert the `unsafe fn on_irq1` to the safe `fn()`
@@ -129,9 +140,6 @@ fn install_isa_irq(isa_irq: u8, handler: fn()) -> bool {
     // unmasks the line.
     unsafe { narf_acpi::ioapic::route_gsi_to_vector(gsi, v, 0, flags) }
 }
-
-#[cfg(not(target_arch = "x86_64"))]
-pub fn register_initcalls() {}
 
 // Per-crate smoke tests register against `narf-kernel-test` and
 // land in the same `narf.tests` ELF section as the rest of the

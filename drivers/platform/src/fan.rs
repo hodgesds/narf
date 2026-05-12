@@ -162,6 +162,18 @@ pub struct PwmFan {
     name: &'static str,
     pwm: Arc<dyn PwmDevice>,
     channel: u32,
+    /// Coalesce target. set_level stores the latest requested
+    /// level here; the worker reads + applies it. Pre-fix every
+    /// set_level spawned a fresh task — a thermal loop oscillating
+    /// at a few Hz could pile dozens of pending tasks into the
+    /// scheduler queue (audit #5).
+    target_level: core::sync::atomic::AtomicU8,
+    /// `true` while a worker task is in flight. set_level only
+    /// spawns a new worker when this is false; the running worker
+    /// loops while target_level changes during its iteration so
+    /// every level update gets applied without per-call spawn
+    /// churn.
+    worker_inflight: core::sync::atomic::AtomicBool,
 }
 
 impl core::fmt::Debug for PwmFan {
@@ -175,7 +187,13 @@ impl core::fmt::Debug for PwmFan {
 
 impl PwmFan {
     pub fn new(name: &'static str, pwm: Arc<dyn PwmDevice>, channel: u32) -> Self {
-        Self { name, pwm, channel }
+        Self {
+            name,
+            pwm,
+            channel,
+            target_level: core::sync::atomic::AtomicU8::new(0),
+            worker_inflight: core::sync::atomic::AtomicBool::new(false),
+        }
     }
 }
 
@@ -185,27 +203,82 @@ impl CoolingDevice for PwmFan {
     }
 
     fn set_level(&self, level: u8) {
-        // Standard PC fans are 25 kHz PWM; that's also the Intel 4-wire
-        // fan spec, so it's a safe default for the cases this driver
-        // targets.
-        let freq = 25_000u32;
-        let period_ns = 1_000_000_000u64 / freq as u64;
-        let duty_ns = (period_ns * level as u64) / 255;
-
-        let config = PwmConfig {
-            frequency_hz: freq,
-            duty_cycle_ns: duty_ns,
-            polarity: Polarity::Normal,
-        };
-
+        use core::sync::atomic::Ordering;
+        // Update the coalesced target. The in-flight worker (if
+        // any) re-reads on each iteration so this update will be
+        // applied without spawning a new task.
+        self.target_level.store(level, Ordering::Release);
+        // Try to claim the worker slot. If a worker is already
+        // running, this returns Err and we just leave the target
+        // for it to pick up.
+        if self
+            .worker_inflight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        // Spawn the single worker. It loops as long as the target
+        // changes during one apply — flushes the latest value
+        // before clearing the in-flight flag.
         let p = self.pwm.clone();
         let ch = self.channel;
+        // SAFETY: target_level + worker_inflight are read by the
+        // worker via raw pointer below. They live in `self` which
+        // is held by an Arc kept alive by the fan registry; the
+        // pointer outlives the worker as long as the registry
+        // doesn't drop the fan, which only happens at shutdown.
+        let target_ptr =
+            (&self.target_level as *const core::sync::atomic::AtomicU8) as usize;
+        let inflight_ptr =
+            (&self.worker_inflight as *const core::sync::atomic::AtomicBool) as usize;
         narf_scheduler::spawn(async move {
-            let _ = p.set_config(ch, &config).await;
-            if level > 0 {
-                let _ = p.enable(ch).await;
-            } else {
-                let _ = p.disable(ch).await;
+            // SAFETY: pointers are to fields of an Arc-kept-alive
+            // PwmFan; safe to dereference for the duration of
+            // this task.
+            let target =
+                unsafe { &*(target_ptr as *const core::sync::atomic::AtomicU8) };
+            let inflight = unsafe {
+                &*(inflight_ptr as *const core::sync::atomic::AtomicBool)
+            };
+            // Standard PC / Intel 4-wire fan: 25 kHz PWM.
+            const FREQ: u32 = 25_000;
+            const PERIOD_NS: u64 = 1_000_000_000u64 / FREQ as u64;
+            loop {
+                let lvl = target.load(Ordering::Acquire);
+                let duty_ns = (PERIOD_NS * lvl as u64) / 255;
+                let cfg = PwmConfig {
+                    frequency_hz: FREQ,
+                    duty_cycle_ns: duty_ns,
+                    polarity: Polarity::Normal,
+                };
+                let _ = p.set_config(ch, &cfg).await;
+                if lvl > 0 {
+                    let _ = p.enable(ch).await;
+                } else {
+                    let _ = p.disable(ch).await;
+                }
+                // If the target hasn't changed since we started
+                // this iteration, release the slot. Re-checking
+                // after the release would race with another
+                // set_level — order is: drop slot, then re-check.
+                // If the racer set the target between our load and
+                // our store(false), they'll see worker_inflight =
+                // true and skip; we re-acquire below and apply.
+                inflight.store(false, Ordering::Release);
+                let cur = target.load(Ordering::Acquire);
+                if cur == lvl {
+                    return;
+                }
+                // Target changed under us. Try to re-claim the
+                // slot; if someone else got here first, they'll
+                // apply the change.
+                if inflight
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    return;
+                }
             }
         });
     }
