@@ -1862,16 +1862,25 @@ impl Xhci {
         // Ring the slot's control-EP doorbell.
         self.ring_slot_doorbell(slot_id, DCI_CONTROL_EP);
 
-        // Wait for a Transfer Event whose source TRB matches our
-        // Status Stage (Status carries IOC=1; on success the
-        // engine raises one Transfer Event after Status). We don't
-        // gate on a specific TRB pointer because some controllers
-        // emit a Transfer Event for Data Stage too — accept the
-        // first Transfer Event for this slot.
+        // Wait for a Transfer Event from this slot's Control EP
+        // (DCI=1). Audit F-41: filter on Endpoint ID (dword3
+        // bits[20:16]) as well as Slot ID — the prior loose
+        // slot-only filter would consume an interrupt-IN event
+        // landing at the same time as a control transfer, leaving
+        // the actual Status-Stage event in the queue and the
+        // interrupt-IN poll missing data. We don't gate on a
+        // specific TRB pointer because some controllers emit a
+        // Transfer Event for Data Stage too — accept the first
+        // Transfer Event for this (slot, EP=1) pair.
         let xfer = TRB_TYPE_TRANSFER_EVENT << TRB_TYPE_SHIFT;
         let want_slot = (slot_id as u32) << 24;
+        let want_ep = (DCI_CONTROL_EP) << 16;
         let ev = self
-            .await_event(|t| (t[3] & TRB_TYPE_MASK) == xfer && (t[3] & 0xFF00_0000) == want_slot)?;
+            .await_event(|t| {
+                (t[3] & TRB_TYPE_MASK) == xfer
+                    && (t[3] & 0xFF00_0000) == want_slot
+                    && (t[3] & 0x001F_0000) == want_ep
+            })?;
         let ccode = ((ev[2] >> 24) & 0xFF) as u8;
         // Completion code 1 = Success, 13 = Short Packet (also OK
         // for Get Descriptor when the device-reported length is
@@ -2216,10 +2225,17 @@ impl Xhci {
         self.ep_enqueue_normal(slot_id, dci, phys, out.len() as u32)?;
         self.ring_slot_doorbell(slot_id, dci as u32);
 
+        // Audit F-41: filter Transfer Events by both Slot ID and
+        // Endpoint ID so a parallel control transfer (DCI=1) on the
+        // same slot doesn't steal our event.
         let xfer = TRB_TYPE_TRANSFER_EVENT << TRB_TYPE_SHIFT;
         let want_slot = (slot_id as u32) << 24;
-        let ev = self
-            .await_event(|t| (t[3] & TRB_TYPE_MASK) == xfer && (t[3] & 0xFF00_0000) == want_slot)?;
+        let want_ep = (dci as u32) << 16;
+        let ev = self.await_event(|t| {
+            (t[3] & TRB_TYPE_MASK) == xfer
+                && (t[3] & 0xFF00_0000) == want_slot
+                && (t[3] & 0x001F_0000) == want_ep
+        })?;
         let ccode = ((ev[2] >> 24) & 0xFF) as u8;
         if ccode != 1 && ccode != 13 {
             return Err(XhciError::CmdFailed(ccode));
@@ -2270,8 +2286,12 @@ impl Xhci {
 
         let xfer = TRB_TYPE_TRANSFER_EVENT << TRB_TYPE_SHIFT;
         let want_slot = (slot_id as u32) << 24;
-        let ev = self
-            .await_event(|t| (t[3] & TRB_TYPE_MASK) == xfer && (t[3] & 0xFF00_0000) == want_slot)?;
+        let want_ep = (dci as u32) << 16;
+        let ev = self.await_event(|t| {
+            (t[3] & TRB_TYPE_MASK) == xfer
+                && (t[3] & 0xFF00_0000) == want_slot
+                && (t[3] & 0x001F_0000) == want_ep
+        })?;
         let ccode = ((ev[2] >> 24) & 0xFF) as u8;
         if ccode != 1 {
             return Err(XhciError::CmdFailed(ccode));
