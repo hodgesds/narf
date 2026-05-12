@@ -20,6 +20,8 @@ narf-acpi           = { path = "../../acpi" }
 narf-drivers        = { path = "../../drivers" }
 narf-init           = { path = "../../init" }
 narf-drivers-i2c    = { path = "../i2c" }
+narf-drivers-gpio   = { path = "../gpio" }
+narf-hid            = { path = "../../hid" }
 narf-scheduler      = { path = "../../scheduler" }
 narf-aml            = { path = "../../aml" }
 narf-fb             = { path = "../../fb" }

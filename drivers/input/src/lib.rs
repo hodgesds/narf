@@ -12,6 +12,7 @@
 extern crate alloc;
 
 pub mod i2c_hid;
+pub mod i2c_hid_bind;
 #[cfg(target_arch = "x86_64")]
 pub mod i8042;
 #[cfg(target_arch = "x86_64")]
@@ -61,10 +62,11 @@ pub fn register_initcalls() {
             Err(_) => InitResult::NotPresent,
         }
     });
-    narf_init::register(Stage::Device, "i2c-hid", || {
-        i2c_hid::register_initcalls();
-        InitResult::Ok
-    });
+    // Register i2c-hid-probe + i2c-hid-bind directly into Stage::Device.
+    // Doing it inside another Stage::Device initcall would land them in
+    // the registry vec *after* the snapshot is taken, so they'd never
+    // run in this pass.
+    i2c_hid::register_initcalls();
 }
 
 /// Wrapper to convert the `unsafe fn on_irq1` to the safe `fn()`

@@ -762,3 +762,136 @@ mod i2c_hid_smokes {
         smoke_i2c_hid_uninitialised_rejects_ops
     );
 }
+
+// ── i2c-hid auto-binding ──────────────────────────────────────────
+//
+// Smokes for the bind helper + PTP→PointerEvent translator. The
+// bind helper itself depends on AML namespace + I2C registry state
+// that's not trivially fakeable in a smoke, so we cover the pure
+// translation path here and rely on real-HW bring-up to exercise
+// the discovery pass end-to-end.
+
+mod i2c_hid_bind_smokes {
+    use alloc::vec::Vec;
+    use narf_hid::ptp::{DecodedContact, DecodedReport};
+    use narf_input::{
+        InputEvent, PointerButtons, __reset_global_ring_for_test, init_global_ring, pop_global,
+    };
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    use crate::i2c_hid_bind::__push_ptp_pointer_for_test as push_ptp_pointer;
+
+    fn one_contact(x: i32, y: i32, tip: bool) -> DecodedReport {
+        DecodedReport {
+            contacts: alloc::vec![DecodedContact {
+                tip_switch: tip,
+                contact_id: 0,
+                x,
+                y,
+                pressure: None,
+                in_range: tip,
+                confidence: true,
+            }],
+            contact_count: 1,
+            scan_time: 0,
+            button1: false,
+        }
+    }
+
+    fn smoke_ptp_pointer_emits_relative_motion() -> TestResult {
+        init_global_ring(8);
+        __reset_global_ring_for_test();
+        let mut lx: Option<i32> = None;
+        let mut ly: Option<i32> = None;
+        let mut lb = false;
+
+        // First touch: no last position → dx/dy=0, suppressed.
+        push_ptp_pointer(&one_contact(100, 200, true), &mut lx, &mut ly, &mut lb);
+        if pop_global().is_some() {
+            return TestResult::Fail("first touch should produce zero-delta and be suppressed");
+        }
+
+        // Second touch: deltas = (5, 7).
+        push_ptp_pointer(&one_contact(105, 207, true), &mut lx, &mut ly, &mut lb);
+        match pop_global() {
+            Some(InputEvent::Pointer(p)) => {
+                if p.dx != 5 || p.dy != 7 {
+                    return TestResult::Fail("dx/dy mismatch on motion");
+                }
+                if p.buttons != PointerButtons::EMPTY {
+                    return TestResult::Fail("no button should be set");
+                }
+            }
+            _ => return TestResult::Fail("expected PointerEvent on motion"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/i2c-hid", smoke_ptp_pointer_emits_relative_motion);
+
+    fn smoke_ptp_pointer_button_change_emits_event() -> TestResult {
+        init_global_ring(8);
+        __reset_global_ring_for_test();
+        let mut lx: Option<i32> = None;
+        let mut ly: Option<i32> = None;
+        let mut lb = false;
+
+        let mut r = one_contact(50, 50, true);
+        // First sample primes the deltas; suppressed (no motion).
+        push_ptp_pointer(&r, &mut lx, &mut ly, &mut lb);
+        let _ = pop_global();
+
+        // Same coordinates, button1 transitions false→true. Should
+        // emit a PointerEvent carrying the button bit even with
+        // zero motion.
+        r.button1 = true;
+        push_ptp_pointer(&r, &mut lx, &mut ly, &mut lb);
+        match pop_global() {
+            Some(InputEvent::Pointer(p)) => {
+                if p.dx != 0 || p.dy != 0 {
+                    return TestResult::Fail("dx/dy should be zero on button-only");
+                }
+                if !p.buttons.contains(PointerButtons::LEFT) {
+                    return TestResult::Fail("LEFT button should be set");
+                }
+            }
+            _ => return TestResult::Fail("expected PointerEvent on button transition"),
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_ptp_pointer_button_change_emits_event
+    );
+
+    fn smoke_ptp_pointer_no_active_contact_resets_origin() -> TestResult {
+        init_global_ring(8);
+        __reset_global_ring_for_test();
+        let mut lx: Option<i32> = None;
+        let mut ly: Option<i32> = None;
+        let mut lb = false;
+
+        push_ptp_pointer(&one_contact(10, 20, true), &mut lx, &mut ly, &mut lb);
+        push_ptp_pointer(&one_contact(15, 25, true), &mut lx, &mut ly, &mut lb);
+        let _: Vec<_> = (0..2).filter_map(|_| pop_global()).collect();
+
+        // Lift: no active contact. Should reset last_x/y so the next
+        // touch doesn't emit a huge fake delta.
+        push_ptp_pointer(&one_contact(0, 0, false), &mut lx, &mut ly, &mut lb);
+        let _ = pop_global();
+        if lx.is_some() || ly.is_some() {
+            return TestResult::Fail("lift should clear last position");
+        }
+
+        // New touch far away: first sample after lift must be
+        // suppressed (would be a huge delta against stale prev).
+        push_ptp_pointer(&one_contact(500, 500, true), &mut lx, &mut ly, &mut lb);
+        if pop_global().is_some() {
+            return TestResult::Fail("first touch after lift should be suppressed");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid",
+        smoke_ptp_pointer_no_active_contact_resets_origin
+    );
+}

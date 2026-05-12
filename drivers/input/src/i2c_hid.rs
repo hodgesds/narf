@@ -406,13 +406,12 @@ impl Driver for I2cHidDriver {
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
     narf_init::register(Stage::Device, "i2c-hid-probe", || {
-        // Discovery pass: enumerate every PNP0C50 child + log the
-        // I2C controllers already brought up by `amd-fch-i2c`. Once
-        // narf-aml grows I2cSerialBus + GpioInt resource decoding,
-        // this pass can match a child to its parent bus by the
-        // ResourceSource path inside I2cSerialBus and instantiate
-        // an `I2cHidDriver` automatically. Until then, instantiation
-        // is hand-driven by board-bring-up shims (and by tests).
+        // Discovery + logging pass: enumerate every PNP0C50 child +
+        // log the I2C controllers already brought up by
+        // `amd-fch-i2c`. The actual driver-instance construction +
+        // pump-task spawn happens in `i2c-hid-bind` below, which
+        // runs after this pass so the per-child `_CRS` summary lands
+        // before the bind log line.
 
         let buses = narf_drivers_i2c::registered_buses();
         let _ = writeln!(
@@ -438,6 +437,19 @@ pub fn register_initcalls() {
             let _ = writeln!(narf_console::Writer, "  i2c-hid: no PNP0C50 children found");
         }
         InitResult::Ok
+    });
+    narf_init::register(Stage::Device, "i2c-hid-bind", || {
+        let n = crate::i2c_hid_bind::bind_all();
+        let _ = writeln!(
+            narf_console::Writer,
+            "  i2c-hid-bind: {} HID-over-I2C device(s) bound",
+            n
+        );
+        if n == 0 {
+            InitResult::NotPresent
+        } else {
+            InitResult::Ok
+        }
     });
 }
 
