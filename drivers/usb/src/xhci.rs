@@ -2060,26 +2060,37 @@ impl Xhci {
             });
         }
 
-        // Slot Context: dword0 bits[31:27] = Context Entries. Read
-        // the running device-context's slot ctx so we don't clobber
-        // Speed / Hub / Route String fields that AddressDevice set.
+        // Slot Context: per xHCI §4.6.6 step 1, copy ALL Slot
+        // Context dwords from the running Device Context into the
+        // Input Slot Context, then update Context Entries
+        // (dword0 bits[31:27]) to reflect the new max DCI. Pre-fix
+        // (audit F-31) only copied dword0/1 — leaving dword2/3
+        // (TT info, interrupter target, USB device address) zeroed,
+        // which the engine writes back to the Device Context after
+        // command processing. On real hardware that wipes the
+        // assigned device address and leaves the slot in Default
+        // state, breaking later control transfers.
         // SAFETY: identity-mapped DCBAA[slot_id] points at the
         // slot's device context.
         let dev_ctx_phys = unsafe {
             let dcbaa_phys = self.dcbaa.phys_addr().raw();
             core::ptr::read_volatile((dcbaa_phys + (slot_id as u64) * 8) as *const u64)
         };
-        // SAFETY: dev_ctx_phys came from DCBAA which we plant; DMA-mapped.
-        let slot_d0 = unsafe { core::ptr::read_volatile(dev_ctx_phys as *const u32) };
-        let new_slot_d0 = (slot_d0 & !(0x1Fu32 << 27)) | (max_dci << 27);
-        let slot_d1 = unsafe { core::ptr::read_volatile((dev_ctx_phys + 4) as *const u32) };
-        // Plant slot ctx into the input context — same stride as in
-        // address_device.
         let slot_ctx_off = input_phys + self.context_stride();
-        // SAFETY: same.
+        // Copy the full Slot Context (4 dwords; bytes 0..16). The
+        // remainder of the per-context stride is reserved/RsvdZ
+        // and was zeroed by the page-zero above.
+        // SAFETY: identity-mapped DMA on both ends; both regions
+        // owned and 4 KiB.
         unsafe {
-            core::ptr::write_volatile(slot_ctx_off as *mut u32, new_slot_d0);
-            core::ptr::write_volatile((slot_ctx_off + 4) as *mut u32, slot_d1);
+            for off in 0..4u64 {
+                let v = core::ptr::read_volatile((dev_ctx_phys + off * 4) as *const u32);
+                core::ptr::write_volatile((slot_ctx_off + off * 4) as *mut u32, v);
+            }
+            // Refresh Context Entries with the new max DCI.
+            let d0 = core::ptr::read_volatile(slot_ctx_off as *const u32);
+            let new_d0 = (d0 & !(0x1Fu32 << 27)) | (max_dci << 27);
+            core::ptr::write_volatile(slot_ctx_off as *mut u32, new_d0);
         }
 
         // Input Control Context: dword1 = add mask.
