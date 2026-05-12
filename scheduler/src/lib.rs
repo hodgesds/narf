@@ -745,6 +745,20 @@ pub fn run_until_empty() {
                     ready_this_round += 1; /* drop slot */
                 }
                 Poll::Pending => {
+                    // Did the poll itself self-wake? `yield_now()` and
+                    // `SleepUntil`'s busy-poll fallback both call
+                    // `cx.waker().wake_by_ref()` which flips awake
+                    // back to true before Poll::Pending returns.
+                    // Counting that as forward progress for this
+                    // round is what keeps the executor alive on
+                    // hosts where timer IRQs misfire (real-HW
+                    // laptops where the LAPIC didn't enumerate
+                    // cleanly, etc.) — without it, halt_until_irq
+                    // sleeps forever and busy-polling futures stop
+                    // making progress despite their self-wakes.
+                    if slot.awake.load(Ordering::Acquire) {
+                        ready_this_round += 1;
+                    }
                     let mut q = READY[cpu].lock();
                     q.as_mut().unwrap().push_back(slot);
                 }
@@ -768,8 +782,8 @@ pub fn run_until_empty() {
         }
 
         if ready_this_round == 0 {
-            // Polled some Pending tasks but nothing completed; idle
-            // until an IRQ delivers a wake.
+            // Polled some Pending tasks but nothing self-woke and
+            // nothing completed; idle until an IRQ delivers a wake.
             narf_arch::halt_until_irq();
         }
     }
