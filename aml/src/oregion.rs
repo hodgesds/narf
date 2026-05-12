@@ -68,12 +68,27 @@ pub struct OpRegionInfo {
 pub struct FieldInfo {
     /// Absolute path to the field name.
     pub path: String,
-    /// Absolute path to the parent OpRegion.
+    /// Absolute path to the parent OpRegion (for plain Field) or
+    /// the data register (for IndexField — the field's "region"
+    /// is conceptually `_INDIRECT_`; reads/writes route through
+    /// `index_field` below).
     pub region_path: String,
     pub bit_offset: u64,
     pub bit_length: u64,
     /// ACPI access-type: 0=AnyAcc 1=ByteAcc 2=WordAcc 3=DWordAcc 4=QWordAcc
     pub access_kind: u8,
+    /// `Some` when this field belongs to an IndexField (audit
+    /// #7 full impl). Reads write the field's byte offset to the
+    /// index register, then read the data register; writes write
+    /// the offset then the value.
+    pub index_field: Option<IndexFieldRef>,
+}
+
+/// Index/data register pair for an IndexField member.
+#[derive(Clone, Debug)]
+pub struct IndexFieldRef {
+    pub index_reg_path: String,
+    pub data_reg_path: String,
 }
 
 /// Errors from `read_field`.
@@ -492,6 +507,22 @@ pub fn read_field(path: &str) -> Result<u64, FieldAccessError> {
     if fi.bit_length > 64 {
         return Err(FieldAccessError::TooWide);
     }
+    // Audit #7 IndexField: write the field's byte offset to the
+    // index register, then read the data register. Field
+    // bit_offset is in bits; convert to bytes for the index
+    // register write.
+    if let Some(ref idx) = fi.index_field {
+        let byte_off = fi.bit_offset / 8;
+        write_field(&idx.index_reg_path, byte_off).ok();
+        // Read full unit then mask to the field's bit width.
+        let raw = read_field(&idx.data_reg_path).unwrap_or(0);
+        let mask = if fi.bit_length >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << fi.bit_length) - 1
+        };
+        return Ok(raw & mask);
+    }
     let region = region_for(&fi.region_path).ok_or(FieldAccessError::NoRegion)?;
     let access_bytes = access_unit_bytes(fi.access_kind);
     let access_bits = (access_bytes * 8) as u64;
@@ -533,6 +564,12 @@ pub fn write_field(path: &str, value: u64) -> Result<(), FieldAccessError> {
     let fi = field_for(path).ok_or(FieldAccessError::NoField)?;
     if fi.bit_length > 64 {
         return Err(FieldAccessError::TooWide);
+    }
+    // Audit #7 IndexField: index←offset, data←value.
+    if let Some(ref idx) = fi.index_field {
+        let byte_off = fi.bit_offset / 8;
+        write_field(&idx.index_reg_path, byte_off)?;
+        return write_field(&idx.data_reg_path, value);
     }
     let region = region_for(&fi.region_path).ok_or(FieldAccessError::NoRegion)?;
     let access_bytes = access_unit_bytes(fi.access_kind);
@@ -776,26 +813,60 @@ pub(crate) fn parse_field_body(
     // Region name that this Field references.
     let region_name = read_name_string(p, parent)?;
     let region_path = full_path(region_name, parent);
-    parse_field_list(p, parent, &region_path, pkg_end)
+    parse_field_list(p, parent, &region_path, pkg_end, None)
 }
 
-/// Parse the FieldFlags + FieldList portion of a Field /
-/// IndexField / BankField body. Caller has already consumed any
-/// preceding NameStrings + register references and points the
-/// cursor at the FieldFlags byte. `region_path` is the synthetic
-/// "addresses against this" region for the registered field
-/// entries — for plain Field this is the OpRegion path, for
-/// IndexField it's the data-register path.
+/// Parse an IndexField body. Caller has already consumed the
+/// IndexField extended opcode + PkgLength; this fn reads the
+/// two register NameStrings + FieldFlags + FieldList and
+/// registers each inner field with an IndexFieldRef so reads
+/// drive index←offset, data→ value (audit #7 full impl).
+pub(crate) fn parse_index_field_body(
+    p: &mut Parser<'_>,
+    parent: &str,
+    pkg_end: usize,
+) -> Result<(), AmlError> {
+    let index_name = read_name_string(p, parent)?;
+    let data_name = read_name_string(p, parent)?;
+    let index_reg_path = full_path(index_name, parent);
+    let data_reg_path = full_path(data_name, parent);
+    parse_field_list(
+        p,
+        parent,
+        "\\__INDIRECT__",
+        pkg_end,
+        Some(IndexFieldRef {
+            index_reg_path,
+            data_reg_path,
+        }),
+    )
+}
+
+/// Same as parse_index_field_body but for BankField — currently
+/// no bank-switch driving (the bank value gets written to the
+/// bank register at registration time only). Most platforms use
+/// IndexField; BankField is rare. TODO: pre-write the bank
+/// register before each access to actually switch banks.
+pub(crate) fn parse_bank_field_body(
+    p: &mut Parser<'_>,
+    parent: &str,
+    pkg_end: usize,
+) -> Result<(), AmlError> {
+    let region_name = read_name_string(p, parent)?;
+    let _bank_reg = read_name_string(p, parent)?;
+    // skip bank-value TermArg via the eval helper.
+    let _ = crate::eval::skip_term_arg(p.buf, &mut p.pos);
+    let region_path = full_path(region_name, parent);
+    parse_field_list(p, parent, &region_path, pkg_end, None)
+}
+
+/// Backwards-compat shim — old callers used this name.
 pub(crate) fn parse_indirect_field_body(
     p: &mut Parser<'_>,
     parent: &str,
     pkg_end: usize,
 ) -> Result<(), AmlError> {
-    // No region name to read — caller already consumed the
-    // appropriate prefix. Use an empty path; field entries get
-    // registered under `parent` so namespace lookups work.
-    let region_path = String::from("\\__INDIRECT__");
-    parse_field_list(p, parent, &region_path, pkg_end)
+    parse_field_list(p, parent, "\\__INDIRECT__", pkg_end, None)
 }
 
 fn parse_field_list(
@@ -803,6 +874,7 @@ fn parse_field_list(
     parent: &str,
     region_path: &str,
     pkg_end: usize,
+    index_field: Option<IndexFieldRef>,
 ) -> Result<(), AmlError> {
     // FieldFlags: bits 0..=3 = access type, bit 4 = lock rule,
     //             bits 5..=6 = update rule.
@@ -855,6 +927,7 @@ fn parse_field_list(
                     bit_offset: bit_cursor,
                     bit_length: bit_len,
                     access_kind,
+                    index_field: index_field.clone(),
                 });
                 bit_cursor += bit_len;
             }

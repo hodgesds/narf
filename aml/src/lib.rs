@@ -1196,37 +1196,15 @@ fn parse_term_list_inner(
                         p.pos = pkg_end;
                     }
                     EXT_INDEX_FIELD_OP => {
-                        // IndexField (audit #7): two NameStrings
-                        // (index register + data register), then
-                        // FieldFlags, then the field list. Real
-                        // semantics: write field-offset to index,
-                        // read/write data. Minimum-viable here is
-                        // registering the field nodes via the
-                        // shared parse_field_body so Store-to-name
-                        // hits the right path; the index/data
-                        // indirection landing as a follow-up.
+                        // IndexField (audit #7): registers each
+                        // inner field with index/data register
+                        // refs so reads/writes drive
+                        // index←offset, data↔value via
+                        // oregion::read_field/write_field.
                         let pkg_start = p.pos;
                         let pkg_len = read_pkg_length(p)?;
                         let pkg_end = pkg_start + pkg_len;
-                        // Skip the two register NameStrings then
-                        // re-use parse_field_body. We pass a
-                        // synthetic parent so the inner fields
-                        // get registered with correct paths.
-                        let _index_reg = read_name_string(p, parent)?;
-                        let _data_reg = read_name_string(p, parent)?;
-                        // Rewind so parse_field_body can read the
-                        // FieldFlags + field list. parse_field_body
-                        // expects a region NameString first; we
-                        // synthesise by feeding the data_reg name
-                        // back as the "region" — IndexField fields
-                        // are addressed against the data register.
-                        let flags_pos = p.pos;
-                        let _ = flags_pos;
-                        // parse_field_body signature wants pkg_end +
-                        // a region NameString to be the next token.
-                        // Easiest: skip the rest manually by parsing
-                        // FieldFlags + field entries directly.
-                        let _ = oregion::parse_indirect_field_body(p, parent, pkg_end);
+                        let _ = oregion::parse_index_field_body(p, parent, pkg_end);
                         p.pos = pkg_end;
                         push_node(AmlNode {
                             path: full_path(String::new(), parent),
@@ -1239,23 +1217,10 @@ fn parse_term_list_inner(
                         *count += 1;
                     }
                     EXT_BANK_FIELD_OP => {
-                        // BankField: region NameString + bank
-                        // register NameString + bank value
-                        // TermArg + FieldFlags + field list.
-                        // Same minimum-viable: register inner
-                        // fields against the region.
                         let pkg_start = p.pos;
                         let pkg_len = read_pkg_length(p)?;
                         let pkg_end = pkg_start + pkg_len;
-                        let region_name = read_name_string(p, parent)?;
-                        let _region_path = full_path(region_name, parent);
-                        let _bank_reg = read_name_string(p, parent)?;
-                        // Skip bank-value TermArg by best-effort —
-                        // for typical literal it's 1-9 bytes. We
-                        // can't fully eval it at namespace-build
-                        // time, so use eval::skip_term_arg.
-                        let _ = crate::eval::skip_term_arg(p.buf, &mut p.pos);
-                        let _ = oregion::parse_indirect_field_body(p, parent, pkg_end);
+                        let _ = oregion::parse_bank_field_body(p, parent, pkg_end);
                         p.pos = pkg_end;
                         push_node(AmlNode {
                             path: full_path(String::new(), parent),
