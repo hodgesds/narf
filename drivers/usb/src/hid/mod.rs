@@ -57,8 +57,13 @@ pub const HID_PROTOCOL_KBD: u8 = 0x01;
 
 // Class-specific request codes from §7.2.
 pub(crate) const HID_REQ_SET_PROTOCOL: u8 = 0x0B;
+pub(crate) const HID_REQ_SET_IDLE: u8 = 0x0A;
 /// Boot protocol value (vs. 1 = Report Protocol).
 pub(crate) const HID_BOOT_PROTOCOL: u16 = 0;
+// Standard request code (USB 2.0 §9.4 table 9-4) for
+// SET_CONFIGURATION. Standard requests other than this aren't
+// needed in this driver, so we don't pull in a full enum.
+pub(crate) const STD_REQ_SET_CONFIGURATION: u8 = 0x09;
 
 pub mod mouse;
 
@@ -212,6 +217,22 @@ impl BootKeyboard {
                 &mut nothing,
             )
             .map_err(|_| HidError::SetProtocolFailed)?;
+        // SET_IDLE(duration=0, reportID=0) — HID §7.2.4. Tells
+        // the device "only send a report on state change", which
+        // is what we want for a polled-pump keyboard. Many
+        // BIOS-flashed keyboards will silently suppress reports
+        // until SET_IDLE has been issued at least once. Failure
+        // here is non-fatal (some devices STALL because they
+        // don't implement the request); SET_PROTOCOL was the
+        // load-bearing call.
+        let _ = xhci_dev.control_in(
+            slot_id,
+            0x21,
+            HID_REQ_SET_IDLE,
+            0, // (duration<<8) | reportID — both zero
+            interface_num as u16,
+            &mut nothing,
+        );
         Ok(BootKeyboard {
             slot_id,
             interrupt_in_ep,
@@ -408,42 +429,85 @@ fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
     xhci_dev.port_reset(port).map_err(HidError::Xhci)?;
     let speed = xhci_dev.port_speed(port).ok_or(HidError::NoInterruptIn)?;
     let slot_id = xhci_dev.enable_slot().map_err(HidError::Xhci)?;
-    xhci_dev
-        .address_device(slot_id, port, speed)
-        .map_err(HidError::Xhci)?;
+    // Slot-cleanup guard: any failure past this point must call
+    // disable_slot or we leak xHCI device contexts. xHCI MaxSlots
+    // on AMD is typically 32; an internal Renoir USB tree can hold
+    // 8+ devices, so even a few leaked slots break later
+    // enumeration. Manual `?` flow doesn't unwind, so explicit
+    // wrappers below.
+    let res = (|| -> Result<(), HidError> {
+        xhci_dev
+            .address_device(slot_id, port, speed)
+            .map_err(HidError::Xhci)?;
 
-    // Read the 9-byte cfg header to discover wTotalLength.
-    let mut head = [0u8; 9];
-    let n = xhci_dev
-        .get_config_descriptor(slot_id, 0, &mut head)
-        .map_err(HidError::Xhci)?;
-    if n < 9 {
-        return Err(HidError::NotBootKeyboard);
+        // Read the 9-byte cfg header to discover wTotalLength
+        // and the bConfigurationValue we'll feed SET_CONFIGURATION.
+        let mut head = [0u8; 9];
+        let n = xhci_dev
+            .get_config_descriptor(slot_id, 0, &mut head)
+            .map_err(HidError::Xhci)?;
+        if n < 9 {
+            return Err(HidError::NotBootKeyboard);
+        }
+        let total = u16::from_le_bytes([head[2], head[3]]) as usize;
+        if total < 9 || total > 4096 {
+            return Err(HidError::NotBootKeyboard);
+        }
+        // bConfigurationValue lives at offset +5 of the cfg
+        // descriptor (USB 2.0 §9.6.3 table 9-10). Required as
+        // the wValue of SET_CONFIGURATION below.
+        let cfg_value = head[5];
+
+        // Pull the full tree.
+        let mut full = alloc::vec![0u8; total];
+        let n2 = xhci_dev
+            .get_config_descriptor(slot_id, 0, &mut full)
+            .map_err(HidError::Xhci)?;
+        if n2 < total {
+            full.truncate(n2);
+        }
+
+        let (iface, ep) = find_boot_keyboard(&full)?;
+
+        // Configure the controller-side endpoint context first
+        // so the device-side SET_CONFIGURATION below can drive
+        // traffic through the now-running rings.
+        xhci_dev
+            .configure_endpoints(slot_id, &[ep])
+            .map_err(HidError::Xhci)?;
+
+        // SET_CONFIGURATION (USB 2.0 §9.4.7, bRequest=9). Without
+        // this, the device stays in Address state and any class
+        // request (SET_PROTOCOL, SET_IDLE) returns STALL — which
+        // is the entire reason the keyboard pipeline was silent
+        // on real-HW boots while QEMU's lax xhci stack worked.
+        // bmRequestType: Host-to-Device | Standard | Device = 0x00.
+        let mut nothing = [0u8; 0];
+        xhci_dev
+            .control_in(
+                slot_id,
+                0x00,
+                STD_REQ_SET_CONFIGURATION,
+                cfg_value as u16,
+                0,
+                &mut nothing,
+            )
+            .map_err(|_| HidError::SetProtocolFailed)?;
+
+        let interrupt_in_ep = ep.ep_addr & 0x0F; // DCI computed from this on RX
+        let dci = (interrupt_in_ep * 2) + 1;
+        let kbd = BootKeyboard::attach(xhci_dev, slot_id, iface, dci)?;
+        KEYBOARDS.lock().push(kbd);
+        Ok(())
+    })();
+    if res.is_err() {
+        // Free the slot so a retry doesn't leak xHCI device
+        // contexts. AMD Renoir's MaxSlots is typically 32 and a
+        // laptop with multiple internal USB devices can burn
+        // through them quickly across enumeration retries.
+        let _ = xhci_dev.disable_slot(slot_id);
     }
-    let total = u16::from_le_bytes([head[2], head[3]]) as usize;
-    if total < 9 || total > 4096 {
-        return Err(HidError::NotBootKeyboard);
-    }
-
-    // Pull the full tree.
-    let mut full = alloc::vec![0u8; total];
-    let n2 = xhci_dev
-        .get_config_descriptor(slot_id, 0, &mut full)
-        .map_err(HidError::Xhci)?;
-    if n2 < total {
-        full.truncate(n2);
-    }
-
-    let (iface, ep) = find_boot_keyboard(&full)?;
-    xhci_dev
-        .configure_endpoints(slot_id, &[ep])
-        .map_err(HidError::Xhci)?;
-
-    let interrupt_in_ep = ep.ep_addr & 0x0F; // DCI computed from this on RX
-    let dci = (interrupt_in_ep * 2) + 1;
-    let kbd = BootKeyboard::attach(xhci_dev, slot_id, iface, dci)?;
-    KEYBOARDS.lock().push(kbd);
-    Ok(())
+    res
 }
 
 /// Number of keyboards currently bound.

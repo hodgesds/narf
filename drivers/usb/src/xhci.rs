@@ -158,6 +158,7 @@ const TRB_TYPE_DATA_STAGE: u32 = 3;
 const TRB_TYPE_STATUS_STAGE: u32 = 4;
 const TRB_TYPE_LINK: u32 = 6;
 const TRB_TYPE_ENABLE_SLOT_CMD: u32 = 9;
+const TRB_TYPE_DISABLE_SLOT_CMD: u32 = 10;
 const TRB_TYPE_ADDRESS_DEVICE_CMD: u32 = 11;
 const TRB_TYPE_CONFIGURE_ENDPOINT_CMD: u32 = 12;
 const TRB_TYPE_NO_OP_CMD: u32 = 23;
@@ -1038,6 +1039,32 @@ impl Xhci {
         }
         let slot_id = ((ev[3] >> 24) & 0xFF) as u8;
         Ok(slot_id)
+    }
+
+    /// Disable Slot command (xHCI §4.6.4) — releases the slot's
+    /// device context back to the controller's free pool. Called
+    /// from the HID enumeration cleanup path when any post-
+    /// enable_slot step (Address Device, GET_DESCRIPTOR,
+    /// SET_CONFIGURATION, …) fails. Best-effort: an internal
+    /// failure here is logged via the returned error but the
+    /// caller should ignore it because the original failure is
+    /// what matters.
+    pub fn disable_slot(&self, slot_id: u8) -> Result<(), XhciError> {
+        if slot_id == 0 || slot_id > self.caps.max_slots {
+            return Err(XhciError::CmdFailed(0xFD));
+        }
+        let trb_type = TRB_TYPE_DISABLE_SLOT_CMD << TRB_TYPE_SHIFT;
+        // Slot ID rides in dword3[31:24], same encoding as the
+        // Command Completion Event from enable_slot returns it.
+        let d3 = trb_type | ((slot_id as u32) << 24);
+        self.submit_command(0, 0, 0, d3)?;
+        let cce_type = TRB_TYPE_CMD_COMPLETION << TRB_TYPE_SHIFT;
+        let ev = self.await_event(|t| (t[3] & TRB_TYPE_MASK) == cce_type)?;
+        let ccode = ((ev[2] >> 24) & 0xFF) as u8;
+        if ccode != 1 {
+            return Err(XhciError::CmdFailed(ccode));
+        }
+        Ok(())
     }
 
     /// Drain the Event Ring without dispatching anything. Useful in
