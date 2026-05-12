@@ -348,26 +348,52 @@ impl EventRing {
     }
 }
 
-/// Process-wide input event ring. Drivers push, consumers pop.
-/// Bounded at 256 events — enough for keyboard burst latency, small
-/// enough that a runaway producer doesn't eat unbounded heap.
-static GLOBAL_RING: IrqSafeSpinLock<Option<EventRing>> = IrqSafeSpinLock::new(None);
+/// Per-class event rings. Pre-fix every consumer popped from a
+/// single shared ring and re-pushed events it didn't care about
+/// (cursor pump consumed Pointer + re-pushed Key; /dev/console
+/// consumed Key/AsciiByte + re-pushed Pointer/Scroll). The
+/// ping-pong worked but interleavings re-ordered keystrokes vs
+/// pointer motion across consumers — first character after a
+/// click could land out of order.
+///
+/// One bounded ring per event class. Producer routes by variant;
+/// consumer pops the class it cares about. No re-push, no
+/// ordering surprises.
+///
+/// `KEY_RING` and `BYTE_RING` share a logical "console input"
+/// stream — `/dev/console` reads from both. Pointer + Scroll are
+/// separate because their consumers don't overlap.
+static KEY_RING: IrqSafeSpinLock<Option<EventRing>> = IrqSafeSpinLock::new(None);
+static POINTER_RING: IrqSafeSpinLock<Option<EventRing>> = IrqSafeSpinLock::new(None);
+static SCROLL_RING: IrqSafeSpinLock<Option<EventRing>> = IrqSafeSpinLock::new(None);
+static BYTE_RING: IrqSafeSpinLock<Option<EventRing>> = IrqSafeSpinLock::new(None);
 
-/// Initialise the global ring. Idempotent on repeat calls — the
-/// ring is reset rather than re-constructed so callers that hold
-/// `&'static` references stay valid.
-pub fn init_global_ring(capacity: usize) {
-    let mut g = GLOBAL_RING.lock();
-    match g.as_ref() {
-        Some(r) => r.__reset_for_test(),
-        None => *g = Some(EventRing::new(capacity)),
+fn ring_for(ev: &InputEvent) -> &'static IrqSafeSpinLock<Option<EventRing>> {
+    match ev {
+        InputEvent::Key(_) => &KEY_RING,
+        InputEvent::Pointer(_) => &POINTER_RING,
+        InputEvent::Scroll(_) => &SCROLL_RING,
+        InputEvent::AsciiByte(_) => &BYTE_RING,
     }
 }
 
-/// Push to the global ring. Silently drops if `init_global_ring`
-/// has not been called.
+/// Initialise all per-class rings. Idempotent — re-init resets
+/// existing rings rather than reconstructing.
+pub fn init_global_ring(capacity: usize) {
+    for ring in [&KEY_RING, &POINTER_RING, &SCROLL_RING, &BYTE_RING] {
+        let mut g = ring.lock();
+        match g.as_ref() {
+            Some(r) => r.__reset_for_test(),
+            None => *g = Some(EventRing::new(capacity)),
+        }
+    }
+}
+
+/// Push an event onto the appropriate per-class ring. Silently
+/// drops if `init_global_ring` hasn't been called.
 pub fn push_global(ev: InputEvent) -> bool {
-    let g = GLOBAL_RING.lock();
+    let ring = ring_for(&ev);
+    let g = ring.lock();
     if let Some(r) = g.as_ref() {
         r.push(ev)
     } else {
@@ -375,31 +401,87 @@ pub fn push_global(ev: InputEvent) -> bool {
     }
 }
 
-/// Pop from the global ring. `None` if empty or uninitialised.
-pub fn pop_global() -> Option<InputEvent> {
-    GLOBAL_RING.lock().as_ref().and_then(|r| r.pop())
-}
-
-/// Snapshot of pushed/dropped counters, useful for smoke tests.
-pub fn global_counters() -> (u64, u64) {
-    GLOBAL_RING
-        .lock()
-        .as_ref()
-        .map(|r| (r.pushed(), r.dropped()))
-        .unwrap_or((0, 0))
-}
-
-/// Test-only reset.
-#[doc(hidden)]
-pub fn __reset_global_ring_for_test() {
-    if let Some(r) = GLOBAL_RING.lock().as_ref() {
-        r.__reset_for_test();
+/// Pop a Key event. Returns `None` if empty or uninitialised.
+pub fn pop_key() -> Option<KeyEvent> {
+    let ev = KEY_RING.lock().as_ref().and_then(|r| r.pop())?;
+    if let InputEvent::Key(k) = ev {
+        Some(k)
+    } else {
+        None
     }
 }
 
-/// Stage::Subsys initcall: install the global event ring before
-/// any input driver pushes to it. Capacity 256 covers ~1 second
-/// of bursty keyboard / mouse input.
+/// Pop a Pointer event.
+pub fn pop_pointer() -> Option<PointerEvent> {
+    let ev = POINTER_RING.lock().as_ref().and_then(|r| r.pop())?;
+    if let InputEvent::Pointer(p) = ev {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+/// Pop a Scroll event.
+pub fn pop_scroll() -> Option<ScrollEvent> {
+    let ev = SCROLL_RING.lock().as_ref().and_then(|r| r.pop())?;
+    if let InputEvent::Scroll(s) = ev {
+        Some(s)
+    } else {
+        None
+    }
+}
+
+/// Pop one raw byte from the AsciiByte stream.
+pub fn pop_ascii_byte() -> Option<u8> {
+    let ev = BYTE_RING.lock().as_ref().and_then(|r| r.pop())?;
+    if let InputEvent::AsciiByte(b) = ev {
+        Some(b)
+    } else {
+        None
+    }
+}
+
+/// Generic pop — drains any non-empty ring, no ordering guarantee
+/// across classes. Kept for the boot-time diagnostic panel + a
+/// small set of tests; new consumers should use the typed
+/// variants. Order: Key → Pointer → Scroll → AsciiByte.
+pub fn pop_global() -> Option<InputEvent> {
+    for ring in [&KEY_RING, &POINTER_RING, &SCROLL_RING, &BYTE_RING] {
+        if let Some(ev) = ring.lock().as_ref().and_then(|r| r.pop()) {
+            return Some(ev);
+        }
+    }
+    None
+}
+
+/// Snapshot of pushed/dropped counters across all rings, useful
+/// for smoke tests + the FB status panel.
+pub fn global_counters() -> (u64, u64) {
+    let mut pushed = 0u64;
+    let mut dropped = 0u64;
+    for ring in [&KEY_RING, &POINTER_RING, &SCROLL_RING, &BYTE_RING] {
+        if let Some(r) = ring.lock().as_ref() {
+            pushed = pushed.saturating_add(r.pushed());
+            dropped = dropped.saturating_add(r.dropped());
+        }
+    }
+    (pushed, dropped)
+}
+
+/// Test-only: reset every per-class ring.
+#[doc(hidden)]
+pub fn __reset_global_ring_for_test() {
+    for ring in [&KEY_RING, &POINTER_RING, &SCROLL_RING, &BYTE_RING] {
+        if let Some(r) = ring.lock().as_ref() {
+            r.__reset_for_test();
+        }
+    }
+}
+
+/// Stage::Subsys initcall: install all per-class rings before any
+/// input driver pushes. Capacity 256 per ring — enough for
+/// keyboard burst latency, small enough that a runaway producer
+/// doesn't eat unbounded heap.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
     narf_init::register(Stage::Subsys, "input-event-ring", || {

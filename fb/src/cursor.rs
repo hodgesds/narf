@@ -21,7 +21,6 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use narf_graphics::Pixel32;
-use narf_input::InputEvent;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::{FbWriter, Rect};
@@ -130,48 +129,32 @@ fn restore(fb: &FbWriter, save: &SavedRect) -> Result<(), crate::FbWriteError> {
     )
 }
 
-/// Pop everything currently in the input ring, apply pointer
-/// events to the cursor state, re-push Key / Scroll / AsciiByte
-/// events so other consumers (`/dev/console` for the shell, etc.)
-/// still see them, and re-draw the sprite if pointer state moved.
-/// Idempotent on empty rings — the polling loop calls this at its
-/// own cadence.
+/// Drain the Pointer event ring, apply each event to the cursor
+/// state, and re-draw the sprite if anything moved. Per-class
+/// rings (audit #6) mean we no longer need the re-push hack —
+/// Key / AsciiByte / Scroll go to their own consumers via
+/// `narf_input::pop_key` / `pop_ascii_byte` / `pop_scroll`.
 pub fn drain_and_render(fb: &FbWriter) {
     init_centre(fb);
     let mut moved = false;
-    // Snapshot of how many events were in the ring at entry — we
-    // only consume that many. Re-pushed non-pointer events land at
-    // the back of the same ring; consuming them again next tick is
-    // fine, but doing it inside the same tick would loop forever.
-    // narf_input doesn't expose `len()` directly; cap by ring
-    // capacity (256) as a safety belt.
+    // Bound the drain by ring capacity (256) so a producer that's
+    // outpacing us doesn't trap the loop.
     for _ in 0..256 {
-        let ev = match narf_input::pop_global() {
-            Some(e) => e,
+        let p = match narf_input::pop_pointer() {
+            Some(p) => p,
             None => break,
         };
-        match ev {
-            InputEvent::Pointer(p) => {
-                let cx = POS_X.load(Ordering::Relaxed);
-                let cy = POS_Y.load(Ordering::Relaxed);
-                let nx = clamp_pos(cx, p.dx, fb.width(), W);
-                let ny = clamp_pos(cy, p.dy, fb.height(), H);
-                if nx != cx || ny != cy {
-                    POS_X.store(nx, Ordering::Release);
-                    POS_Y.store(ny, Ordering::Release);
-                    moved = true;
-                }
-                // p.buttons is dropped on the floor here — once the
-                // input dispatcher splits per-class, the pointer
-                // channel will carry the click bits.
-            }
-            // Re-push so /dev/console (the shell) and any future
-            // keyboard subscriber can still read these. Without this
-            // the cursor pump would silently steal every keystroke.
-            other => {
-                let _ = narf_input::push_global(other);
-            }
+        let cx = POS_X.load(Ordering::Relaxed);
+        let cy = POS_Y.load(Ordering::Relaxed);
+        let nx = clamp_pos(cx, p.dx, fb.width(), W);
+        let ny = clamp_pos(cy, p.dy, fb.height(), H);
+        if nx != cx || ny != cy {
+            POS_X.store(nx, Ordering::Release);
+            POS_Y.store(ny, Ordering::Release);
+            moved = true;
         }
+        // p.buttons is dropped on the floor — future click
+        // handling will read PointerButtons from the same channel.
     }
     if !moved {
         return;
@@ -214,12 +197,10 @@ pub fn sleep_pump_tick() {
     if let Some(fb) = crate::pump_writer_ref() {
         drain_and_render(fb);
     } else {
-        // Drain anyway so the input ring doesn't fill while we wait
-        // for an FB to come up.
-        while let Some(ev) = narf_input::pop_global() {
-            if matches!(ev, InputEvent::Pointer(_)) {
-                EVENTS_DROPPED_NO_FB.fetch_add(1, Ordering::Release);
-            }
+        // Drain pointer events anyway so the per-class ring
+        // doesn't fill while we wait for an FB to come up.
+        while narf_input::pop_pointer().is_some() {
+            EVENTS_DROPPED_NO_FB.fetch_add(1, Ordering::Release);
         }
     }
 }

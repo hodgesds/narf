@@ -219,45 +219,43 @@ fn key_to_ascii(code: narf_input::KeyCode, mods: narf_input::Modifiers) -> Optio
 
 impl FileOps for DevConsole {
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
-        // Pull events off the global input ring, translating each
-        // key-press to a byte. Stop when the user buffer is full
-        // or the ring runs dry. Non-blocking — callers wanting
-        // blocking behaviour loop in user space until n>0.
-        //
-        // Bounded by ring capacity (256) so a ring full of
-        // re-pushed Pointer events (consumed by the cursor pump,
-        // not by us) can't loop forever inside one call.
+        // Pull bytes from the per-class input rings (audit #6 —
+        // narf_input::pop_key + pop_ascii_byte). Pointer / Scroll
+        // events go to their own consumers; no re-push needed.
+        // Stop when the user buffer is full or both rings are dry.
+        // Non-blocking — callers wanting blocking behaviour loop
+        // in user space until n>0.
         let mut written = 0usize;
+        // Drain key presses + raw bytes in interleaved order so a
+        // burst of one class doesn't starve the other. Bound by
+        // ring capacity (256) per class to avoid pathological
+        // loops if a producer is faster than us.
         let mut iters = 0usize;
-        while written < buf.len() && iters < 256 {
+        while written < buf.len() && iters < 512 {
             iters += 1;
-            let ev = match narf_input::pop_global() {
-                Some(e) => e,
-                None => break,
-            };
-            match ev {
-                narf_input::InputEvent::Key(k) => {
-                    if !k.pressed {
-                        continue;
+            let mut produced = false;
+            // Drain one Key event if present.
+            if written < buf.len() {
+                if let Some(k) = narf_input::pop_key() {
+                    if k.pressed {
+                        if let Some(b) = key_to_ascii(k.code, k.modifiers) {
+                            buf[written] = b;
+                            written += 1;
+                        }
                     }
-                    if let Some(b) = key_to_ascii(k.code, k.modifiers) {
-                        buf[written] = b;
-                        written += 1;
-                    }
+                    produced = true;
                 }
-                narf_input::InputEvent::AsciiByte(b) => {
+            }
+            // Drain one AsciiByte if present.
+            if written < buf.len() {
+                if let Some(b) = narf_input::pop_ascii_byte() {
                     buf[written] = b;
                     written += 1;
+                    produced = true;
                 }
-                // Pointer/Scroll events aren't readable through
-                // /dev/console, but they ARE consumed by another
-                // subscriber (the cursor pump). Re-push so we
-                // don't silently steal them — without this, a
-                // shell looping on read() drains every Pointer
-                // event before the cursor pump can render it.
-                other => {
-                    let _ = narf_input::push_global(other);
-                }
+            }
+            if !produced {
+                break;
             }
         }
         Box::pin(async move { Ok(written) })
