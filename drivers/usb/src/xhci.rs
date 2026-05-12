@@ -695,13 +695,23 @@ impl Xhci {
         let dcbaa_phys = dcbaa.phys_addr().raw();
 
         // Allocate the Command Ring. 4 KiB = 256 TRBs (each 16 bytes).
-        // Initialize the cycle bit on each TRB to 0 (driver writes
-        // commands with cycle=1). Last TRB is the Link TRB pointing
-        // back to the start (we don't bother for the structural
-        // bring-up; the controller idles when the cycle bit doesn't
-        // match).
+        // Place a Link TRB at slot N-1 with TC=1 pointing back at the
+        // start so submit_command can wrap (audit F-39). Initialise
+        // the link's cycle bit to 0 — submit_command flips it (and
+        // toggles the producer cycle state) the first time it wraps,
+        // matching the controller's PCS=1 dequeue state.
         let cmd_ring = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
         let cmd_phys = cmd_ring.phys_addr().raw();
+        let cmd_link_off = ((CMD_RING_TRBS - 1) * 16) as u64;
+        let cmd_link_addr = cmd_phys + cmd_link_off;
+        let cmd_link_d3 = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC;
+        // SAFETY: identity-mapped DMA, in-page.
+        unsafe {
+            core::ptr::write_volatile(cmd_link_addr as *mut u32, cmd_phys as u32);
+            core::ptr::write_volatile((cmd_link_addr + 4) as *mut u32, (cmd_phys >> 32) as u32);
+            core::ptr::write_volatile((cmd_link_addr + 8) as *mut u32, 0);
+            core::ptr::write_volatile((cmd_link_addr + 12) as *mut u32, cmd_link_d3);
+        }
 
         // Optional: allocate scratchpad buffers if MAX_SCRATCHPAD_BUFS
         // is non-zero.
@@ -1157,13 +1167,23 @@ impl Xhci {
         dword3_no_cycle: u32,
     ) -> Result<(), XhciError> {
         let mut enq_g = self.cmd_enqueue.lock();
-        let pcs_g = self.cmd_pcs.lock();
-        // Reserve slot N-1 for a Link TRB once we wrap; until then
-        // the Stage-5 cut just refuses to enqueue past N-1. A real
-        // driver would write a Link TRB at N-1 the first time it
-        // hits the boundary and toggle PCS.
+        let mut pcs_g = self.cmd_pcs.lock();
+        // Audit F-39: when we hit the Link TRB at slot N-1, publish
+        // it with the *current* PCS so the controller follows it,
+        // then wrap enq=0 and toggle PCS so the next normal TRB we
+        // write also matches the post-link consumer cycle.
         if *enq_g >= CMD_RING_TRBS - 1 {
-            return Err(XhciError::CmdRingFull);
+            let link_addr = self.cmd_ring.phys_addr().raw() + ((CMD_RING_TRBS - 1) * 16) as u64;
+            let link_d3 = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC | (*pcs_g & TRB_CYCLE_BIT);
+            // SAFETY: identity-mapped DMA, in-page; only the cycle
+            // bit + TC bit need rewriting — the address dwords were
+            // planted at init time and don't change.
+            unsafe {
+                core::ptr::write_volatile((link_addr + 12) as *mut u32, link_d3);
+            }
+            compiler_fence(Ordering::SeqCst);
+            *enq_g = 0;
+            *pcs_g ^= TRB_CYCLE_BIT;
         }
 
         let trb_off = (*enq_g * 16) as u64;
@@ -1287,12 +1307,20 @@ impl Xhci {
         // Bounded spin-wait. On every iteration: (a) demux any
         // pending event off the ring into queues (also lets us
         // catch up if the ISR fired and we're racing), then (b)
-        // re-check the queues for our match.
-        for _ in 0..10_000_000u32 {
+        // re-check the queues for our match. Audit F-51: every
+        // ~4096 spins call sleep_pumps::run so the cursor / FB /
+        // serial console stay alive on a slow controller — we're
+        // run from sync init paths (initcalls, supervisor) and
+        // those paths are the *only* thing pumping the FB on
+        // single-CPU bring-up.
+        for i in 0..10_000_000u32 {
             // Demux any new ring entries.
             while self.demux_one_event().is_some() {}
             if let Some(ev) = try_match(self, &mut predicate) {
                 return Ok(ev);
+            }
+            if i & 0xFFF == 0 {
+                narf_scheduler::sleep_pumps::run();
             }
             core::hint::spin_loop();
         }
