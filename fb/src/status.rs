@@ -84,12 +84,20 @@ pub fn paint(fb: &FbWriter) {
         if crate::cursor::moves() > 0 { "ACTIVE" } else { "idle" },
     );
 
-    // Line 3: cursor renderer counters — "moves: N  drops: M"
-    // direct from the cursor module.
+    // Line 3: AML namespace + i2c-hid bind state. Tells us
+    // whether the touchpad path even saw its target devices.
+    let aml_node_count = narf_aml::node_count();
+    let mut amdi001x_count = 0u32;
+    for &hid in &["AMDI0010", "AMDI0019", "AMDI0510", "AMDI0011"] {
+        amdi001x_count += narf_aml::find_all_devices_by_hid(hid).len() as u32;
+    }
+    let pnp0c50_count = narf_aml::find_all_devices_by_hid("PNP0C50").len();
     let cursor_line = format!(
-        "cursor:    moves={}  drops_no_fb={}",
+        "AML: {} nodes  AMDI001x: {}  PNP0C50: {}  cursor moves: {}",
+        aml_node_count,
+        amdi001x_count,
+        pnp0c50_count,
         crate::cursor::moves(),
-        crate::cursor::dropped_for_no_fb(),
     );
 
     let header = [fb_line.as_str(), dev_line.as_str(), cursor_line.as_str()];

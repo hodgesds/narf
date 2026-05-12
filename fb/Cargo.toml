@@ -29,6 +29,7 @@ narf-drivers-i2c  = { path = "../drivers/i2c" }
 narf-drivers-gpio = { path = "../drivers/gpio" }
 narf-drivers-usb  = { path = "../drivers/usb" }
 narf-console      = { path = "../console" }
+narf-aml          = { path = "../aml" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 
 [lints]
