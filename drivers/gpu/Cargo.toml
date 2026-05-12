@@ -23,6 +23,7 @@ narf-drivers         = { path = ".." }
 narf-firmware        = { path = "../../firmware" }
 narf-bus             = { path = "../../bus" }
 narf-init            = { path = "../../init" }
+narf-scheduler       = { path = "../../scheduler" }
 
 [features]
 kernel-test = []

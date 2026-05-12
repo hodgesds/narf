@@ -528,15 +528,15 @@ impl AmdGpu {
         // Step 4-5: poll MP0_C2PMSG_64 for the done bit. PSP
         // typically responds within ~50 ms; bound the spin so a
         // wedged controller surfaces as FirmwareLoadFailed.
-        let mut last = 0u32;
-        for _ in 0..10_000_000u32 {
-            // SAFETY: same.
-            last = unsafe { mm_read(&self.regs, mp0_base + MP0_C2PMSG_64_REL) };
-            if last & PSP_STATUS_DONE_BIT != 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+        // responsive_spin ticks sleep_pumps so cursor/FB stay alive
+        // during this multi-millisecond wait.
+        let _ = narf_scheduler::responsive_spin(
+            // SAFETY: identity-mapped MMIO.
+            || unsafe { mm_read(&self.regs, mp0_base + MP0_C2PMSG_64_REL) } & PSP_STATUS_DONE_BIT != 0,
+            10_000_000,
+        );
+        // SAFETY: identity-mapped MMIO.
+        let last = unsafe { mm_read(&self.regs, mp0_base + MP0_C2PMSG_64_REL) };
         if last & PSP_STATUS_DONE_BIT == 0 {
             return Err(AmdgpuError::FirmwareLoadFailed);
         }
