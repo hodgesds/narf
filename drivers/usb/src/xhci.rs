@@ -565,16 +565,13 @@ impl Xhci {
                             mmio.write32(cap_off, cur | (1 << 24));
                         }
                         // Wait up to ~5s for BIOS to release.
-                        let mut released = false;
-                        for _ in 0..5_000_000u32 {
+                        // responsive_spin keeps cursor/FB/serial alive
+                        // while the BIOS hand-off SMI runs.
+                        let released = narf_scheduler::responsive_spin(
                             // SAFETY: same.
-                            let s = unsafe { mmio.read32(cap_off) };
-                            if (s & (1 << 16)) == 0 {
-                                released = true;
-                                break;
-                            }
-                            core::hint::spin_loop();
-                        }
+                            || unsafe { mmio.read32(cap_off) } & (1 << 16) == 0,
+                            5_000_000,
+                        );
                         // If BIOS never released, force-clear by
                         // writing 0 to the BIOS-Owned bit (we
                         // own it now regardless). Spec: stale
@@ -647,46 +644,35 @@ impl Xhci {
         unsafe {
             mmio.write32(op_off + OP_USBCMD, cmd & !USBCMD_RS);
         }
-        // Wait for HCH = 1.
-        for _ in 0..1_000_000u32 {
+        // Wait for HCH = 1. responsive_spin keeps cursor/FB alive
+        // while the controller halts.
+        let _ = narf_scheduler::responsive_spin(
             // SAFETY: same.
-            let s = unsafe { mmio.read32(op_off + OP_USBSTS) };
-            if s & USBSTS_HCH != 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+            || unsafe { mmio.read32(op_off + OP_USBSTS) } & USBSTS_HCH != 0,
+            1_000_000,
+        );
 
         // Reset.
         // SAFETY: same.
         unsafe {
             mmio.write32(op_off + OP_USBCMD, USBCMD_HCRST);
         }
-        for _ in 0..1_000_000u32 {
+        // responsive_spin ticks sleep_pumps across HCRST self-clear.
+        let reset_ok = narf_scheduler::responsive_spin(
             // SAFETY: same.
-            let v = unsafe { mmio.read32(op_off + OP_USBCMD) };
-            if v & USBCMD_HCRST == 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
-        // SAFETY: same.
-        let post = unsafe { mmio.read32(op_off + OP_USBCMD) };
-        if post & USBCMD_HCRST != 0 {
+            || unsafe { mmio.read32(op_off + OP_USBCMD) } & USBCMD_HCRST == 0,
+            1_000_000,
+        );
+        if !reset_ok {
             return Err(XhciError::ResetTimeout);
         }
         // Wait for CNR = 0.
-        for _ in 0..1_000_000u32 {
+        let cnr_clear = narf_scheduler::responsive_spin(
             // SAFETY: same.
-            let s = unsafe { mmio.read32(op_off + OP_USBSTS) };
-            if s & USBSTS_CNR == 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
-        // SAFETY: same.
-        let s = unsafe { mmio.read32(op_off + OP_USBSTS) };
-        if s & USBSTS_CNR != 0 {
+            || unsafe { mmio.read32(op_off + OP_USBSTS) } & USBSTS_CNR == 0,
+            1_000_000,
+        );
+        if !cnr_clear {
             return Err(XhciError::NotReady);
         }
 
@@ -838,17 +824,13 @@ impl Xhci {
         unsafe {
             mmio.write32(op_off + OP_USBCMD, USBCMD_RS | USBCMD_INTE);
         }
-        // Wait for HCH = 0.
-        let mut running = false;
-        for _ in 0..1_000_000u32 {
+        // Wait for HCH = 0. responsive_spin keeps cursor/FB alive
+        // across the start.
+        let running = narf_scheduler::responsive_spin(
             // SAFETY: same.
-            let s = unsafe { mmio.read32(op_off + OP_USBSTS) };
-            if s & USBSTS_HCH == 0 {
-                running = true;
-                break;
-            }
-            core::hint::spin_loop();
-        }
+            || unsafe { mmio.read32(op_off + OP_USBSTS) } & USBSTS_HCH == 0,
+            1_000_000,
+        );
         if !running {
             return Err(XhciError::StartFailed);
         }

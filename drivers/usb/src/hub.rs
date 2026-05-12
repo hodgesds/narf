@@ -219,25 +219,49 @@ impl UsbHub {
             port as u16,
             &mut nothing,
         )?;
-        for _ in 0..1_000u32 {
-            let s = self.port_status(xhci_dev, port)?;
-            let lo = s as u16;
-            if lo & PSTAT_RESET == 0 && lo & PSTAT_ENABLE != 0 {
-                // Clear the change bit so the next reset returns
-                // a fresh edge.
-                let _ = xhci_dev.control_in(
-                    self.slot_id,
-                    RT_HOST_TO_DEV_CLASS_OTHER,
-                    REQ_CLEAR_FEATURE,
-                    C_PORT_RESET,
-                    port as u16,
-                    &mut nothing,
-                );
-                return Ok(());
-            }
-            for _ in 0..100_000 {
-                core::hint::spin_loop();
-            }
+        // responsive_spin keeps cursor/FB/serial alive across a slow
+        // hub port-reset (each outer iter drives a control_in + a
+        // ~100k-cycle settle). Status-poll error and the success
+        // capture both surface via captured locals.
+        let mut status_err: Option<HubError> = None;
+        let mut got_reset = false;
+        let _ = narf_scheduler::responsive_spin(
+            || match self.port_status(xhci_dev, port) {
+                Ok(s) => {
+                    let lo = s as u16;
+                    if lo & PSTAT_RESET == 0 && lo & PSTAT_ENABLE != 0 {
+                        got_reset = true;
+                        return true;
+                    }
+                    // Per-outer-iter settle delay (matches the
+                    // pre-conversion 0..100_000 spin_loop spacing).
+                    for _ in 0..100_000 {
+                        core::hint::spin_loop();
+                    }
+                    false
+                }
+                Err(e) => {
+                    status_err = Some(e);
+                    true
+                }
+            },
+            1_000,
+        );
+        if let Some(e) = status_err {
+            return Err(e);
+        }
+        if got_reset {
+            // Clear the change bit so the next reset returns a
+            // fresh edge.
+            let _ = xhci_dev.control_in(
+                self.slot_id,
+                RT_HOST_TO_DEV_CLASS_OTHER,
+                REQ_CLEAR_FEATURE,
+                C_PORT_RESET,
+                port as u16,
+                &mut nothing,
+            );
+            return Ok(());
         }
         Err(HubError::PortResetTimeout)
     }
