@@ -155,8 +155,18 @@ pub fn find_boot_keyboard(cfg: &[u8]) -> Result<(u8, EndpointConfig), HidError> 
             //   +6 bInterfaceSubClass
             //   +7 bInterfaceProtocol
             4 if len >= 9 => {
+                // Audit F-72: don't require bInterfaceSubClass == Boot.
+                // Many modern internal laptop keyboards report Subclass=0
+                // (no boot interface) even though they accept
+                // SET_PROTOCOL(Boot) and emit boot-format reports. A
+                // strict Boot-only match silently dropped them. We
+                // still gate on bInterfaceProtocol == 1 (Keyboard) so
+                // the bind targets only kbd-shaped interfaces; the
+                // attach step issues SET_PROTOCOL(Boot) and abandons
+                // on STALL, so non-boot-capable devices fall through
+                // gracefully.
                 in_match = cfg[i + 5] == HID_INTERFACE_CLASS
-                    && cfg[i + 6] == HID_SUBCLASS_BOOT
+                    && (cfg[i + 6] == HID_SUBCLASS_BOOT || cfg[i + 6] == 0)
                     && cfg[i + 7] == HID_PROTOCOL_KBD;
                 if in_match {
                     iface_num = cfg[i + 2];

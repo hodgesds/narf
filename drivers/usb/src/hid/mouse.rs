@@ -101,11 +101,14 @@ pub fn find_boot_mouse(cfg: &[u8]) -> Result<(u8, EndpointConfig), HidError> {
         }
         let dtype = cfg[i + 1];
         match dtype {
-            // Interface Descriptor (§9.6.5): bInterfaceClass=HID,
-            // bInterfaceSubClass=Boot, bInterfaceProtocol=Mouse.
+            // Interface Descriptor (§9.6.5). Audit F-72: don't gate
+            // on bInterfaceSubClass == Boot — many modern HID
+            // pointing devices report Subclass=0 but still respond
+            // to SET_PROTOCOL(Boot). Gate on Protocol == Mouse only;
+            // the attach step issues SET_PROTOCOL and bails on STALL.
             4 if len >= 9 => {
                 in_match = cfg[i + 5] == HID_INTERFACE_CLASS
-                    && cfg[i + 6] == HID_SUBCLASS_BOOT
+                    && (cfg[i + 6] == HID_SUBCLASS_BOOT || cfg[i + 6] == 0)
                     && cfg[i + 7] == HID_PROTOCOL_MOUSE;
                 if in_match {
                     iface_num = cfg[i + 2];
