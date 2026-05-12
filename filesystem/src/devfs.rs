@@ -223,8 +223,14 @@ impl FileOps for DevConsole {
         // key-press to a byte. Stop when the user buffer is full
         // or the ring runs dry. Non-blocking — callers wanting
         // blocking behaviour loop in user space until n>0.
+        //
+        // Bounded by ring capacity (256) so a ring full of
+        // re-pushed Pointer events (consumed by the cursor pump,
+        // not by us) can't loop forever inside one call.
         let mut written = 0usize;
-        while written < buf.len() {
+        let mut iters = 0usize;
+        while written < buf.len() && iters < 256 {
+            iters += 1;
             let ev = match narf_input::pop_global() {
                 Some(e) => e,
                 None => break,
@@ -244,9 +250,14 @@ impl FileOps for DevConsole {
                     written += 1;
                 }
                 // Pointer/Scroll events aren't readable through
-                // /dev/console — drop and keep going so they
-                // don't gum up keyboard input.
-                _ => {}
+                // /dev/console, but they ARE consumed by another
+                // subscriber (the cursor pump). Re-push so we
+                // don't silently steal them — without this, a
+                // shell looping on read() drains every Pointer
+                // event before the cursor pump can render it.
+                other => {
+                    let _ = narf_input::push_global(other);
+                }
             }
         }
         Box::pin(async move { Ok(written) })
