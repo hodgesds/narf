@@ -118,8 +118,6 @@ const PORTSC_CHG_MASK: u32 = 0x00FE_0000;
 const PORTSC_CSC: u32 = 1 << 17; // Connect Status Change (RW1C)
 const PORTSC_PEC: u32 = 1 << 18; // Port Enable Change (RW1C)
 const PORTSC_PRC: u32 = 1 << 21; // Port Reset Change (RW1C)
-const PORTSC_WRC: u32 = 1 << 19; // Warm Port Reset Change (RW1C, USB3 only)
-const PORTSC_WPR: u32 = 1 << 31; // Warm Port Reset (RWS, USB3 only)
 
 // Interrupter Register Set (§5.5.2). One IR per interrupter,
 // 32 bytes apart, starting at RTSOFF + 0x20 (IR0).
@@ -1159,69 +1157,33 @@ impl Xhci {
                     };
                     if ok {
                         // USB 2.0 §7.1.7.3 / §9.2.6.2 (TRSTRCY,
-                        // Reset Recovery Time): the device needs
-                        // ≥10 ms of bus quiet between PR clearing
-                        // and the host driving the first SETUP
-                        // packet (which is what xHC does inside
-                        // Address Device with BSR=0). Without
-                        // this delay the SET_ADDRESS lands while
-                        // the device is still in its post-reset
-                        // recovery window and the device NACKs /
-                        // ignores it — the controller surfaces
-                        // that as Transfer Error (xHCI completion
-                        // code 4), exactly the
-                        // `address_device err=CmdFailed(4)` we
-                        // see on real Renoir HW.
-                        // ~1.5M spin_loop hints is roughly
-                        // 12-15 ms on a Zen2 core at the
-                        // post-init clock — comfortably above
-                        // the 10 ms minimum.
-                        for _ in 0..1_500_000u32 {
-                            core::hint::spin_loop();
+                        // Reset Recovery Time): ≥10 ms of bus
+                        // quiet between PR clearing and the host
+                        // driving the first SETUP packet. xHC's
+                        // Address Device with BSR=0 sends
+                        // SET_ADDRESS on the bus, so without this
+                        // delay the device NACKs and the
+                        // completion is surfaced as Transfer Error
+                        // (xHCI completion code 4). TSC-driven
+                        // busy_wait_cycles guarantees a real
+                        // wall-time delay regardless of compiler
+                        // / CPU spin_loop pacing.
+                        // calibrate_clocks() is idempotent and returns
+                        // cached TSC frequency in Hz on x86_64. Falls
+                        // back to a fixed spin loop if calibration
+                        // returned 0 (TSC not yet ready) so we never
+                        // hang on a degenerate busy_wait_cycles(0).
+                        let tsc_hz = narf_time::calibrate_clocks();
+                        if tsc_hz > 0 {
+                            narf_time::busy_wait_cycles((tsc_hz / 1000) * 12);
+                        } else {
+                            for _ in 0..1_500_000u32 {
+                                core::hint::spin_loop();
+                            }
                         }
                         return Ok(post);
                     }
                     for _ in 0..200 {
-                        core::hint::spin_loop();
-                    }
-                }
-                // Hot-reset PED-never-assert path. For USB3 ports,
-                // try Warm Port Reset (PORTSC bit 31) as the
-                // spec-required link-error recovery before giving
-                // up. Many AMD Renoir USB3 ports come out of cold
-                // boot in a U-state that needs WPR rather than PR
-                // to resync the link layer.
-                if proto == 3 {
-                    // SAFETY: same.
-                    let v = unsafe { self.mmio.read32(off) };
-                    let warm = (v & !PORTSC_CHG_MASK) & !PORTSC_PED | PORTSC_WPR | PORTSC_PP;
-                    // SAFETY: same.
-                    unsafe {
-                        self.mmio.write32(off, warm);
-                    }
-                    for _ in 0..2_500_000u32 {
-                        // SAFETY: same.
-                        let v = unsafe { self.mmio.read32(off) };
-                        if v & PORTSC_WPR == 0 && v & PORTSC_WRC != 0 {
-                            // Ack WRC (RW1C).
-                            let ack = (v & !PORTSC_CHG_MASK) | PORTSC_WRC;
-                            // SAFETY: same.
-                            unsafe {
-                                self.mmio.write32(off, ack);
-                            }
-                            // Re-check success criteria.
-                            // SAFETY: same.
-                            let post = unsafe { self.mmio.read32(off) };
-                            let ped = post & PORTSC_PED != 0;
-                            let pls = (post & PORTSC_PLS_MASK) >> 5;
-                            if ped && pls == 0 {
-                                for _ in 0..1_500_000u32 {
-                                    core::hint::spin_loop();
-                                }
-                                return Ok(post);
-                            }
-                            break;
-                        }
                         core::hint::spin_loop();
                     }
                 }
