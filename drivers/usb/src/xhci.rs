@@ -1641,23 +1641,51 @@ impl Xhci {
         let cce = TRB_TYPE_CMD_COMPLETION << TRB_TYPE_SHIFT;
         let want_slot = (slot_id as u32) << 24;
         let dword3 = trb_type | ((slot_id as u32) << 24);
+        // Snapshot PORTSC + speed + key slot-ctx values for the
+        // post-mortem log if Address Device fails. Reading PORTSC
+        // here also catches the "PED dropped after the TRSTRCY
+        // wait" failure mode where the controller transiently
+        // asserts PED post-reset then drops it as the device
+        // mis-handshakes.
+        // SAFETY: identity-mapped MMIO; port-range checked above.
+        let pre_portsc = unsafe {
+            self.mmio
+                .read32(self.op_off + OP_PORTSC_BASE + ((port as u64 - 1) * PORT_REGS_STRIDE))
+        };
+        let pre_pre_speed = (pre_portsc >> 10) & 0xF;
+        let pre_ped = pre_portsc & PORTSC_PED != 0;
+        let pre_pls = (pre_portsc & PORTSC_PLS_MASK) >> 5;
         self.submit_command(input_phys as u32, (input_phys >> 32) as u32, 0, dword3)?;
         let ev = self
             .await_event(|t| (t[3] & TRB_TYPE_MASK) == cce && (t[3] & 0xFF00_0000) == want_slot)?;
         let ccode = ((ev[2] >> 24) & 0xFF) as u8;
         if ccode != 1 {
-            // Surface controller-fatal diagnostics alongside the
-            // bare completion code. Helps disambiguate "device
-            // didn't respond" (ccode=4 with USBSTS clean) from
-            // "controller fell over" (ccode=4 with HSE/HCE set).
-            if let Some(diag) = self.snapshot_usbsts_diagnostics() {
-                use core::fmt::Write as _;
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "  xhci: address_device slot={} port={} ccode={} {}",
-                    slot_id, port, ccode, diag
-                );
-            }
+            // Diagnostic dump on Address Device failure. Lets us
+            // see WHY ccode=4 happens on real HW: which speed we
+            // told the controller, what PORTSC reported, whether
+            // USBSTS has any fatal bits, and what completion code
+            // came back. Logged unconditionally on failure (no
+            // dedupe) — the supervisor's per-port retry cap stops
+            // it from spamming.
+            use core::fmt::Write as _;
+            let usbsts_diag = self
+                .snapshot_usbsts_diagnostics()
+                .unwrap_or("USBSTS clean");
+            let _ = writeln!(
+                narf_console::Writer,
+                "  xhci: address_device FAIL slot={} port={} speed={:?} mps={} \
+                 ccode={} portsc={:#x} (psi={} ped={} pls={}) [{}]",
+                slot_id,
+                port,
+                speed,
+                mps,
+                ccode,
+                pre_portsc,
+                pre_pre_speed,
+                pre_ped,
+                pre_pls,
+                usbsts_diag,
+            );
             return Err(XhciError::CmdFailed(ccode));
         }
 
