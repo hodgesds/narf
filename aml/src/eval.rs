@@ -179,6 +179,45 @@ pub fn evaluate_method(path: &str, args: &[Value]) -> Result<Value, AmlError> {
     }
 }
 
+/// Walk every registered OpRegion and call its parent device's
+/// `_REG(RegionSpace, Connect)` method (audit #18). Per ACPI 6.5
+/// §6.5.4 the OS must call `_REG(space, 1)` on every device that
+/// owns an OpRegion in `space` BEFORE any field of that region
+/// is read; some EC and GenericSerialBus drivers refuse to
+/// operate until this notification has happened. Idempotent — a
+/// second call signals "still connected" and is a no-op for
+/// devices that don't implement _REG.
+pub fn notify_reg_handlers() {
+    use alloc::string::String;
+    let mut work: alloc::vec::Vec<(String, u64)> = alloc::vec::Vec::new();
+    crate::oregion::for_each_region(|r| {
+        // Region path looks like `\\_SB.PCI0.LPCB.EC0.RAM` —
+        // the parent device path is everything up to the last
+        // dot.
+        let device_path = match r.path.rfind('.') {
+            Some(i) => &r.path[..i],
+            None => return,
+        };
+        let space_id = match r.space {
+            crate::oregion::RegionSpace::SystemMemory => 0,
+            crate::oregion::RegionSpace::SystemIO => 1,
+            crate::oregion::RegionSpace::PciConfig => 2,
+            crate::oregion::RegionSpace::EmbeddedCtl => 3,
+            crate::oregion::RegionSpace::SmBus => 4,
+            crate::oregion::RegionSpace::Other(n) => n as u64,
+        };
+        let mut method_path = String::from(device_path);
+        method_path.push_str("._REG");
+        work.push((method_path, space_id));
+    });
+    for (path, space) in work {
+        let _ = evaluate_method(
+            &path,
+            &[Value::Integer(space), Value::Integer(1)],
+        );
+    }
+}
+
 /// `_OSI(string)` predefined method (ACPI 6.5 §5.7.2). Returns
 /// `Ones` (u64::MAX) when we claim to support the indicated OS /
 /// extension, `Zero` otherwise.

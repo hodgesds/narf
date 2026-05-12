@@ -536,6 +536,13 @@ pub unsafe fn parse_namespace(rsdp_phys: PhysAddr) -> Result<u32, AmlError> {
         })?;
         e?;
     }
+    // Audit #18: notify every device that owns an OpRegion that
+    // its region-space is now "connected". Required by ACPI 6.5
+    // §6.5.4 before any field read; EC + GenericSerialBus drivers
+    // notably refuse to operate without it. Best-effort —
+    // missing _REG methods just return MethodNotFound and we
+    // move on.
+    crate::eval::notify_reg_handlers();
     Ok(total)
 }
 
