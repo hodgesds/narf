@@ -1138,6 +1138,9 @@ impl Controller {
 /// returning `ControllerFailed` on timeout or `ControllerFatal` if
 /// `CFS` is set during the wait.
 fn wait_csts<F: Fn(u32) -> bool>(bar: &MmioRegion, ok: F) -> Result<(), NvmeError> {
+    // narf_scheduler::spin_tick (audit #7) ticks sleep_pumps every
+    // 1024 iterations so the cursor / FB / serial console stay
+    // alive while we busy-wait on a stuck controller.
     for _ in 0..1_000_000u32 {
         // SAFETY: identity-mapped MMIO, naturally aligned.
         let s = unsafe { bar.read32(REG_CSTS) };
@@ -1186,6 +1189,8 @@ unsafe fn peek_cqe(buf: &DmaBuffer, index: u16) -> Cqe {
 /// `ADMIN_Q_DEPTH * 16` bytes; `index < ADMIN_Q_DEPTH`.
 unsafe fn wait_cqe(buf: &DmaBuffer, index: u16, expected_phase: u16) -> Result<Cqe, NvmeError> {
     let base = buf.phys_addr().raw() as *const Cqe;
+    // spin_tick (audit #7) keeps cursor/FB/serial alive on a slow
+    // or stuck controller.
     for _ in 0..10_000_000u32 {
         // SAFETY: caller guarantees buf is page-aligned and large
         // enough; index is bounded.
