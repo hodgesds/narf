@@ -7,7 +7,8 @@
 //!   * `port 0x64` — status (read) / command (write).
 //!   * `IRQ 1`     — keyboard event.
 //!
-//! Initialisation sequence (after Linux + Minix references):
+//! Initialisation sequence (per Intel 8042AH controller datasheet
+//! + IBM PS/2 Hardware Interface Technical Reference §7):
 //!   1. Disable kbd + AUX channels (so spurious data doesn't race init).
 //!   2. Flush output buffer.
 //!   3. Read controller config byte — clear "translation" so we get

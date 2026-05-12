@@ -57,10 +57,15 @@ fn register_i8042_initcalls() {
                 // i8042 read it does is unsafe at module level,
                 // but installation through the dispatch table is
                 // safe (just stores a fn ptr).
-                if !install_isa_irq(1, on_irq1_safe) {
-                    // Routing failed — keyboard polled-only;
-                    // not fatal.
-                }
+                let irq_ok = install_isa_irq(1, on_irq1_safe);
+                I8042_KBD_IRQ_ROUTED.store(irq_ok, core::sync::atomic::Ordering::Release);
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  i8042-kbd: irq1 {} (events {} make it to narf_input)",
+                    if irq_ok { "routed" } else { "ROUTING FAILED" },
+                    if irq_ok { "will" } else { "won't" },
+                );
                 InitResult::Ok
             }
             Err(_) => InitResult::NotPresent,
@@ -70,15 +75,33 @@ fn register_i8042_initcalls() {
         // SAFETY: BSP, post-keyboard-init.
         match unsafe { i8042_mouse::init() } {
             Ok(()) => {
-                if !install_isa_irq(12, on_irq12_safe) {
-                    // Routing failed — mouse polled-only.
-                }
+                let irq_ok = install_isa_irq(12, on_irq12_safe);
+                I8042_MOUSE_IRQ_ROUTED.store(irq_ok, core::sync::atomic::Ordering::Release);
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  i8042-mouse: irq12 {}",
+                    if irq_ok { "routed" } else { "ROUTING FAILED" },
+                );
                 InitResult::Ok
             }
             Err(_) => InitResult::NotPresent,
         }
     });
 }
+
+/// IRQ-routing status flags so the FB status panel + diagnostics
+/// can show whether i8042 is wired all the way through. `true` =
+/// keyboard / mouse IRQs are routed to a vector and will fire the
+/// handler that pushes events into `narf_input`. `false` = init
+/// succeeded but the keyboard does literally nothing because no
+/// handler runs.
+#[cfg(target_arch = "x86_64")]
+pub static I8042_KBD_IRQ_ROUTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(target_arch = "x86_64")]
+pub static I8042_MOUSE_IRQ_ROUTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Wrapper to convert the `unsafe fn on_irq1` to the safe `fn()`
 /// signature `narf_interrupts::install_handler` expects.
