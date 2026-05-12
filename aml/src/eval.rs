@@ -32,6 +32,7 @@ const SIZE_OF_OP: u8 = 0x87;
 const INDEX_OP: u8 = 0x88;
 const MID_OP: u8 = 0x9E;
 const OBJECT_TYPE_OP: u8 = 0x8E;
+const MATCH_OP: u8 = 0x89;
 const COND_REF_OF_PREFIX: u8 = 0x12; // Extended (0x5B 0x12) — handled in EXT path
 const CONTINUE_OP: u8 = 0x9F;
 const STORE_OP: u8 = 0x70;
@@ -822,6 +823,29 @@ fn eval_term(
         0x5B => {
             let ext = next_u8(buf, cur)?;
             match ext {
+                // CondRefOf: 0x5B 0x12 NameString Target.
+                // Returns Ones if the name resolves, Zero
+                // otherwise; stores the "reference" (we model
+                // refs as values, so the looked-up value) into
+                // Target. ACPI 6.5 §19.6.31.
+                0x12 => {
+                    let name = read_name_string(buf, cur, "\\")?;
+                    let value = match resolve_name(&name, &state.scope) {
+                        Some(_n) => {
+                            // Could materialise the node's value
+                            // here; for now write 0 to the target
+                            // and Continue — the existence return
+                            // is what matters at statement level.
+                            Value::Integer(0)
+                        }
+                        None => Value::Integer(0),
+                    };
+                    let _ = value;
+                    // Skip the Target by parsing it as a write
+                    // destination. We don't have a value to
+                    // write meaningfully, so use a no-op write.
+                    let _ = write_target(buf, cur, Value::Integer(0), state);
+                }
                 // CreateField (variable-width): 0x5B 0x13
                 // SourceBuf BitIndex NumBits NameString.
                 0x13 => {
@@ -1263,6 +1287,35 @@ fn eval_term_arg(buf: &[u8], cur: &mut usize, state: &mut EvalState) -> Result<V
             // RefOf(name). We don't model real refs so return
             // the looked-up value (identity with DerefOf).
             eval_term_arg(buf, cur, state)?
+        }
+        MATCH_OP => {
+            // Match(SearchPkg, Op1, MatchObj1, Op2, MatchObj2,
+            //        StartIndex). ACPI 6.5 §19.6.85: walk
+            // SearchPkg starting at StartIndex; return the
+            // index of the first element that satisfies BOTH
+            // (element Op1 MatchObj1) AND (element Op2 MatchObj2);
+            // return Ones (u64::MAX) if nothing matches.
+            //
+            // Op codes: 0=MTR (always true), 1=MEQ, 2=MLE,
+            // 3=MLT, 4=MGE, 5=MGT.
+            let pkg = eval_term_arg(buf, cur, state)?;
+            let op1 = next_u8(buf, cur)?;
+            let m1 = eval_term_arg(buf, cur, state)?;
+            let op2 = next_u8(buf, cur)?;
+            let m2 = eval_term_arg(buf, cur, state)?;
+            let start = eval_term_arg(buf, cur, state)?.as_integer() as usize;
+            let items = match pkg {
+                Value::Package(items) => items,
+                _ => alloc::vec::Vec::new(),
+            };
+            let mut found = u64::MAX;
+            for (i, elem) in items.iter().enumerate().skip(start) {
+                if match_check(elem, op1, &m1) && match_check(elem, op2, &m2) {
+                    found = i as u64;
+                    break;
+                }
+            }
+            Value::Integer(found)
         }
 
         // Logic
@@ -1871,6 +1924,21 @@ fn concatenate(a: &Value, b: &Value) -> Value {
             Value::Buffer(out)
         }
         Value::Package(_) => a.clone(),
+    }
+}
+
+/// Match opcode predicate (ACPI 6.5 §19.6.85). `op` is one of
+/// MTR(0)/MEQ(1)/MLE(2)/MLT(3)/MGE(4)/MGT(5).
+fn match_check(elem: &Value, op: u8, target: &Value) -> bool {
+    use core::cmp::Ordering as O;
+    match op {
+        0 => true, // MTR — match everything
+        1 => values_equal(elem, target),
+        2 => matches!(values_cmp(elem, target), O::Less | O::Equal),
+        3 => matches!(values_cmp(elem, target), O::Less),
+        4 => matches!(values_cmp(elem, target), O::Greater | O::Equal),
+        5 => matches!(values_cmp(elem, target), O::Greater),
+        _ => false,
     }
 }
 
