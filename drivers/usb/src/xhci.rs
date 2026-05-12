@@ -313,6 +313,14 @@ pub struct Xhci {
     /// Event Ring Segment Table — one entry pointing at `event_ring`.
     _erst: DmaBuffer,
     _scratch: Option<DmaBuffer>,
+    /// Per-scratchpad-slot data pages. Audit F-01: pre-fix these
+    /// were dropped immediately after their phys was written into
+    /// the scratchpad buffer array, leaving the controller holding
+    /// dangling pointers and corrupting the FIRST device
+    /// transaction (manifested as Address Device → CmdFailed(4)
+    /// USB Transaction Error on real Renoir hardware). Now kept
+    /// alive for the controller's lifetime.
+    _scratch_pages: alloc::vec::Vec<DmaBuffer>,
     /// Producer-cycle state for the command ring (toggles on wrap).
     cmd_pcs: IrqSafeSpinLock<u32>,
     /// Next free TRB index in the command ring.
@@ -521,25 +529,82 @@ impl Xhci {
                 let hdr = unsafe { mmio.read32(cap_off) };
                 let cap_id = (hdr & 0xFF) as u8;
                 let next_dwords = ((hdr >> 8) & 0xFF) as u64;
-                if cap_id == 2 {
-                    // Supported Protocol Capability layout:
-                    //   +0x00  cap_hdr (id=2, next, MinorRev, MajorRev)
-                    //   +0x04  Name string ("USB ", LE)
-                    //   +0x08  Compatible Port Offset (byte0) +
-                    //          Compatible Port Count (byte1) +
-                    //          Protocol Defined (bytes 2..4)
-                    //   +0x0C  Protocol Slot Type
-                    let major = ((hdr >> 24) & 0xFF) as u8;
-                    // SAFETY: same.
-                    let pinfo = unsafe { mmio.read32(cap_off + 0x08) };
-                    let port_off = (pinfo & 0xFF) as usize;
-                    let port_count = ((pinfo >> 8) & 0xFF) as usize;
-                    for i in 0..port_count {
-                        let p = port_off + i;
-                        if p > 0 && p < 256 {
-                            port_protocols[p] = major;
+                match cap_id {
+                    1 => {
+                        // Audit F-08: USB Legacy Support
+                        // Capability (xHCI 1.2 §7.1). BIOS owns
+                        // the controller via SMM until we set
+                        // HC OS Owned (bit 24) and wait for
+                        // HC BIOS Owned (bit 16) to clear. SMI
+                        // arbitration during halt/reset can
+                        // corrupt MMIO writes — a known cause
+                        // of CmdFailed(4) on real laptops where
+                        // BIOS pre-arms USB legacy emulation.
+                        // SAFETY: same.
+                        let cur = unsafe { mmio.read32(cap_off) };
+                        // Set OS Owned (bit 24) without
+                        // disturbing other bits.
+                        // SAFETY: same.
+                        unsafe {
+                            mmio.write32(cap_off, cur | (1 << 24));
+                        }
+                        // Wait up to ~5s for BIOS to release.
+                        let mut released = false;
+                        for _ in 0..5_000_000u32 {
+                            // SAFETY: same.
+                            let s = unsafe { mmio.read32(cap_off) };
+                            if (s & (1 << 16)) == 0 {
+                                released = true;
+                                break;
+                            }
+                            core::hint::spin_loop();
+                        }
+                        // If BIOS never released, force-clear by
+                        // writing 0 to the BIOS-Owned bit (we
+                        // own it now regardless). Spec: stale
+                        // BIOS may not clear it.
+                        if !released {
+                            // SAFETY: same.
+                            let cur = unsafe { mmio.read32(cap_off) };
+                            // SAFETY: same.
+                            unsafe {
+                                mmio.write32(cap_off, cur & !(1u32 << 16));
+                            }
+                        }
+                        // Mask all SMI sources in USBLEGCTLSTS
+                        // (cap_off + 4): bits 0-12 are SMI
+                        // enables; bits 16-31 are SMI status
+                        // (RW1C). Clear status, disable SMIs.
+                        // SAFETY: same.
+                        let ctlsts = unsafe { mmio.read32(cap_off + 4) };
+                        // Preserve reserved bits; clear enables
+                        // (low half) + W1C status (high half).
+                        // SAFETY: same.
+                        unsafe {
+                            mmio.write32(cap_off + 4, ctlsts & 0xFFFF_0000);
                         }
                     }
+                    2 => {
+                        // Supported Protocol Capability layout:
+                        //   +0x00  cap_hdr (id=2, next, MinorRev, MajorRev)
+                        //   +0x04  Name string ("USB ", LE)
+                        //   +0x08  Compatible Port Offset (byte0) +
+                        //          Compatible Port Count (byte1) +
+                        //          Protocol Defined (bytes 2..4)
+                        //   +0x0C  Protocol Slot Type
+                        let major = ((hdr >> 24) & 0xFF) as u8;
+                        // SAFETY: same.
+                        let pinfo = unsafe { mmio.read32(cap_off + 0x08) };
+                        let port_off = (pinfo & 0xFF) as usize;
+                        let port_count = ((pinfo >> 8) & 0xFF) as usize;
+                        for i in 0..port_count {
+                            let p = port_off + i;
+                            if p > 0 && p < 256 {
+                                port_protocols[p] = major;
+                            }
+                        }
+                    }
+                    _ => {}
                 }
                 if next_dwords == 0 {
                     break;
@@ -637,17 +702,30 @@ impl Xhci {
         let max_scratch_hi = ((p2 >> 21) & 0x1F) as u32;
         let max_scratch_lo = ((p2 >> 27) & 0x1F) as u32;
         let max_scratch = (max_scratch_hi << 5) | max_scratch_lo;
+        let mut scratch_pages: alloc::vec::Vec<DmaBuffer> = alloc::vec::Vec::new();
         let scratch = if max_scratch > 0 {
             // One page holds 512 8-byte pointers — plenty for any
-            // realistic scratchpad count.
+            // realistic scratchpad count (max 1023 per spec).
             let sb = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
             let sb_phys = sb.phys_addr().raw();
-            // Allocate one scratchpad data page per slot (xhci spec
-            // says "one PAGESIZE buffer per scratchpad"; PAGESIZE is
-            // a u32 bitmap with one bit per supported size).
-            for i in 0..(max_scratch as usize).min(8) {
-                let p =
-                    alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
+            // PAGESIZE register tells us the natural scratchpad
+            // page size; xHCI 1.2 §5.4.3 says it's a bitmap where
+            // bit n means "supports 4 KiB << n". Use the lowest
+            // set bit. Almost every controller advertises bit 0
+            // (4 KiB); this is correct fallback.
+            // SAFETY: identity-mapped MMIO.
+            let pagesize_bits = unsafe { mmio.read32(op_off + OP_PAGESIZE) };
+            let page_shift = pagesize_bits.trailing_zeros();
+            let page_size = 4096usize << page_shift;
+            // Allocate ALL scratchpads (audit F-02 — pre-fix
+            // capped at 8, under-provisioning controllers reporting
+            // more) and KEEP them alive in scratch_pages
+            // (audit F-01 — pre-fix dropped them, dangling
+            // controller pointers).
+            scratch_pages.reserve(max_scratch as usize);
+            for i in 0..max_scratch as usize {
+                let p = alloc_coherent(page_size, DomainId::DRIVER_0)
+                    .map_err(|_| XhciError::NoMemory)?;
                 // SAFETY: identity-mapped DMA.
                 unsafe {
                     core::ptr::write_volatile(
@@ -655,13 +733,7 @@ impl Xhci {
                         p.phys_addr().raw(),
                     );
                 }
-                // p drops here — the controller holds the phys
-                // address only; the DmaBuffer's Drop frees the
-                // underlying frame, which would be a bug if we
-                // were going to actually use scratchpads. Stage-4
-                // structural-only — controller starts running but
-                // we don't enumerate devices.
-                let _ = p;
+                scratch_pages.push(p);
             }
             // Plant the scratchpad-buffer-array pointer at DCBAA[0].
             // SAFETY: identity-mapped DCBAA page.
@@ -673,14 +745,19 @@ impl Xhci {
             None
         };
 
-        // Program DCBAAP + CRCR.
+        // Program DCBAAP + CRCR. Audit F-55: 64-bit MMIO writes
+        // MUST be HIGH-then-LOW. Many AMD xHCI implementations
+        // latch the low-dword write to commit the full 64-bit
+        // value; if the high half is written second the
+        // controller may briefly see a truncated address and
+        // start a memory transaction against an invalid phys.
         // SAFETY: same.
         unsafe {
-            mmio.write32(op_off + OP_DCBAAP, dcbaa_phys as u32);
             mmio.write32(op_off + OP_DCBAAP + 4, (dcbaa_phys >> 32) as u32);
+            mmio.write32(op_off + OP_DCBAAP, dcbaa_phys as u32);
             // CRCR: bit 0 = Ring Cycle State (we use 1).
-            mmio.write32(op_off + OP_CRCR, (cmd_phys as u32) | 1);
             mmio.write32(op_off + OP_CRCR + 4, (cmd_phys >> 32) as u32);
+            mmio.write32(op_off + OP_CRCR, (cmd_phys as u32) | 1);
         }
 
         // ── Event ring setup (§4.9.4) ─────────────────────────────
@@ -713,12 +790,16 @@ impl Xhci {
         // for bring-up).
         let ir0 = rtsoff as u64 + IR_BASE_OFF;
         // SAFETY: identity-mapped MMIO.
+        // Order matters: ERSTSZ first (sizes the table), then
+        // ERDP (initial dequeue), THEN ERSTBA last (writing the
+        // table base commits the table walk per §5.5.2.3.2). All
+        // 64-bit pairs HI-then-LO (audit F-55).
         unsafe {
             mmio.write32(ir0 + IR_ERSTSZ, 1);
-            mmio.write32(ir0 + IR_ERDP_LO, er_phys as u32);
             mmio.write32(ir0 + IR_ERDP_HI, (er_phys >> 32) as u32);
-            mmio.write32(ir0 + IR_ERSTBA_LO, erst_phys as u32);
+            mmio.write32(ir0 + IR_ERDP_LO, er_phys as u32);
             mmio.write32(ir0 + IR_ERSTBA_HI, (erst_phys >> 32) as u32);
+            mmio.write32(ir0 + IR_ERSTBA_LO, erst_phys as u32);
             mmio.write32(ir0 + IR_IMOD, 0);
             mmio.write32(ir0 + IR_IMAN, IMAN_IP | IMAN_IE);
         }
@@ -773,6 +854,7 @@ impl Xhci {
             event_ring,
             _erst: erst,
             _scratch: scratch,
+            _scratch_pages: scratch_pages,
             cmd_pcs: IrqSafeSpinLock::new(1),
             cmd_enqueue: IrqSafeSpinLock::new(0),
             er_ccs: IrqSafeSpinLock::new(1),
@@ -1132,9 +1214,9 @@ impl Xhci {
         // SAFETY: identity-mapped MMIO.
         unsafe {
             self.mmio
-                .write32(ir0 + IR_ERDP_LO, (new_deq_phys as u32) | (ERDP_EHB as u32));
-            self.mmio
                 .write32(ir0 + IR_ERDP_HI, (new_deq_phys >> 32) as u32);
+            self.mmio
+                .write32(ir0 + IR_ERDP_LO, (new_deq_phys as u32) | (ERDP_EHB as u32));
         }
         Some([d0, d1, d2, d3])
     }
