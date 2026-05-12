@@ -444,6 +444,17 @@ static LAST_KBD_FAIL_STEP: [core::sync::atomic::AtomicU8; 256] = {
     [const { AtomicU8::new(0) }; 256]
 };
 
+/// Counts consecutive same-step failures per port. Used by
+/// `note_attach_fail` to re-emit a log line every N cycles even if
+/// the step hasn't changed (audit F-83) — useful when a device is
+/// genuinely stuck and a logfile reader needs the periodic signal
+/// to distinguish "still failing" from "logged once and forgotten".
+#[allow(dead_code)]
+static KBD_FAIL_REPEATS: [core::sync::atomic::AtomicU16; 256] = {
+    use core::sync::atomic::AtomicU16;
+    [const { AtomicU16::new(0) }; 256]
+};
+
 /// Identifiers for each step in `try_attach_port` — used as the
 /// dedup key + the symbolic name printed to klog.
 #[derive(Copy, Clone)]
@@ -484,8 +495,21 @@ impl AttachStep {
 fn note_attach_fail(port: u8, step: AttachStep, err: &HidError) {
     use core::fmt::Write as _;
     use core::sync::atomic::Ordering;
+    // Audit F-83: emit on first occurrence of a (port, step) pair,
+    // then suppress repeats for ~64 cycles so a stuck enumeration
+    // loop still surfaces a periodic "still failing" beat without
+    // flooding klog. The supervisor cycles ~16 ms apart on real
+    // hardware, so 64 ≈ once per second.
+    const REPEAT_MASK: u16 = 63;
     let prev = LAST_KBD_FAIL_STEP[port as usize].swap(step as u8, Ordering::AcqRel);
-    if prev == step as u8 {
+    let same_step = prev == step as u8;
+    let n = if same_step {
+        KBD_FAIL_REPEATS[port as usize].fetch_add(1, Ordering::AcqRel)
+    } else {
+        KBD_FAIL_REPEATS[port as usize].store(0, Ordering::Release);
+        0
+    };
+    if same_step && (n & REPEAT_MASK) != 0 {
         return;
     }
     let _ = writeln!(
@@ -500,6 +524,7 @@ fn note_attach_fail(port: u8, step: AttachStep, err: &HidError) {
 fn note_attach_ok(port: u8) {
     use core::sync::atomic::Ordering;
     LAST_KBD_FAIL_STEP[port as usize].store(0, Ordering::Release);
+    KBD_FAIL_REPEATS[port as usize].store(0, Ordering::Release);
 }
 
 /// Public per-port attach used by the supervisor's per-port
