@@ -253,6 +253,39 @@ fn resolve_name(name: &str, scope: &str) -> Option<crate::AmlNode> {
     crate::find_node_by_suffix(name)
 }
 
+/// Find the EC device (`_HID == "PNP0C09"`), evaluate its
+/// `_CRS`, extract the two FixedIo / Io descriptors that name
+/// the data + status/cmd ports, and stash them in
+/// `oregion::EC_PORTS` so subsequent EC OpRegion field accesses
+/// can drive the firmware command/data port handshake.
+///
+/// Spec: ACPI 6.5 §12. ASL convention is data port FIRST in
+/// _CRS, then status/cmd port second.
+pub fn discover_ec_ports() {
+    let ec = match crate::find_device_by_hid("PNP0C09") {
+        Some(n) => n,
+        None => return,
+    };
+    let items = match crate::prt_crs::evaluate_crs_for(&ec.path) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let mut ports: alloc::vec::Vec<u16> = alloc::vec::Vec::new();
+    for item in items {
+        match item {
+            crate::resource::ResourceItem::FixedIo { base, .. } => ports.push(base),
+            crate::resource::ResourceItem::Io { min, .. } => ports.push(min),
+            _ => {}
+        }
+        if ports.len() == 2 {
+            break;
+        }
+    }
+    if ports.len() == 2 {
+        crate::oregion::set_ec_ports(ports[0], ports[1]);
+    }
+}
+
 /// Walk every device with `_PR0` and drive each named
 /// PowerResource's `_ON` method (audit #19). Per ACPI 6.5 §7.3
 /// the OS must transition every PowerResource a device depends

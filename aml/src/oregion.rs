@@ -256,6 +256,133 @@ unsafe fn io_out(port: u16, width_bytes: usize, val: u64) {
 #[cfg(not(target_arch = "x86_64"))]
 unsafe fn io_out(_port: u16, _width_bytes: usize, _val: u64) {}
 
+// ── Embedded Controller (audit #4 real impl) ───────────────────────
+//
+// Per ACPI 6.5 §12. The EC provides a 256-byte address space
+// accessed through two I/O ports: a command/status port and a
+// data port (typically 0x66 + 0x62 on PC laptops). Field reads
+// land in `read_ec_byte`/`write_ec_byte` against the byte offset
+// declared by the AML Field {} block.
+//
+// Protocol:
+//   READ:  write 0x80 to cmd  → wait IBF=0
+//          write offset to data
+//          wait OBF=1
+//          read data port → returned byte
+//   WRITE: write 0x81 to cmd  → wait IBF=0
+//          write offset to data → wait IBF=0
+//          write value to data → wait IBF=0
+//
+// Status bits (read from command port): bit 0 = OBF (EC has
+// data ready for host), bit 1 = IBF (host wrote, EC hasn't
+// drained yet).
+
+const EC_CMD_READ: u8 = 0x80;
+const EC_CMD_WRITE: u8 = 0x81;
+const EC_SC_OBF: u8 = 0x01;
+const EC_SC_IBF: u8 = 0x02;
+const EC_TIMEOUT_POLLS: u32 = 1_000_000;
+
+static EC_PORTS: narf_lib::sync::IrqSafeSpinLock<Option<(u16, u16)>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Configure the EC's (data, status_cmd) port addresses. Called
+/// once during parse_namespace from `discover_ec_ports`.
+pub fn set_ec_ports(data: u16, cmd: u16) {
+    *EC_PORTS.lock() = Some((data, cmd));
+}
+
+#[cfg(target_arch = "x86_64")]
+fn ec_wait_ibf_clear() -> Result<(), FieldAccessError> {
+    let (_data, cmd) = match *EC_PORTS.lock() {
+        Some(p) => p,
+        None => return Err(FieldAccessError::Unsupported),
+    };
+    for _ in 0..EC_TIMEOUT_POLLS {
+        // SAFETY: cmd port owned by this driver, validated at
+        // EC discovery time.
+        let s = unsafe { io_in(cmd, 1) } as u8;
+        if s & EC_SC_IBF == 0 {
+            return Ok(());
+        }
+        core::hint::spin_loop();
+    }
+    Err(FieldAccessError::Unsupported)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn ec_wait_obf_set() -> Result<(), FieldAccessError> {
+    let (_data, cmd) = match *EC_PORTS.lock() {
+        Some(p) => p,
+        None => return Err(FieldAccessError::Unsupported),
+    };
+    for _ in 0..EC_TIMEOUT_POLLS {
+        // SAFETY: same.
+        let s = unsafe { io_in(cmd, 1) } as u8;
+        if s & EC_SC_OBF != 0 {
+            return Ok(());
+        }
+        core::hint::spin_loop();
+    }
+    Err(FieldAccessError::Unsupported)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn ec_read_byte(offset: u8) -> Result<u8, FieldAccessError> {
+    let (data, cmd) = match *EC_PORTS.lock() {
+        Some(p) => p,
+        None => return Err(FieldAccessError::Unsupported),
+    };
+    ec_wait_ibf_clear()?;
+    // SAFETY: ports owned by EC driver path; established at boot.
+    unsafe {
+        io_out(cmd, 1, EC_CMD_READ as u64);
+    }
+    ec_wait_ibf_clear()?;
+    // SAFETY: same.
+    unsafe {
+        io_out(data, 1, offset as u64);
+    }
+    ec_wait_obf_set()?;
+    // SAFETY: same.
+    Ok(unsafe { io_in(data, 1) } as u8)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn ec_write_byte(offset: u8, val: u8) -> Result<(), FieldAccessError> {
+    let (data, cmd) = match *EC_PORTS.lock() {
+        Some(p) => p,
+        None => return Err(FieldAccessError::Unsupported),
+    };
+    ec_wait_ibf_clear()?;
+    // SAFETY: ports owned by EC driver path; established at boot.
+    unsafe {
+        io_out(cmd, 1, EC_CMD_WRITE as u64);
+    }
+    ec_wait_ibf_clear()?;
+    // SAFETY: same.
+    unsafe {
+        io_out(data, 1, offset as u64);
+    }
+    ec_wait_ibf_clear()?;
+    // SAFETY: same.
+    unsafe {
+        io_out(data, 1, val as u64);
+    }
+    ec_wait_ibf_clear()?;
+    Ok(())
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn ec_read_byte(_offset: u8) -> Result<u8, FieldAccessError> {
+    Err(FieldAccessError::Unsupported)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn ec_write_byte(_offset: u8, _val: u8) -> Result<(), FieldAccessError> {
+    Err(FieldAccessError::Unsupported)
+}
+
 // ── PciConfig ECAM address resolution ────────────────────────────────────────
 
 /// Resolve a PciConfig OpRegion's effective ECAM byte address.
@@ -485,16 +612,26 @@ fn read_unit(
             Some(addr) => Ok(unsafe { mmio_read(addr + byte_offset_in_region, width) }),
             None => Err(FieldAccessError::Unsupported),
         },
-        // EC + GenericSerialBus stubs: return 0 instead of
-        // erroring so DSDT _DSM/_INI paths can flow through
-        // without aborting on Unsupported. Real protocol impl
-        // (EC command/data port handshake; GSB routing through
-        // the I2C registry) is a follow-up. The audit accepts
-        // this as a transitional state — many touchpad _DSMs
-        // touch GSB only for sub-functions we don't need at
-        // bring-up.
-        RegionSpace::EmbeddedCtl
-        | RegionSpace::GenericSerialBus
+        // EC: drive the firmware command/data-port protocol.
+        // Returns 0 (instead of Unsupported) when EC ports
+        // weren't discovered at boot, so non-EC platforms keep
+        // working.
+        RegionSpace::EmbeddedCtl => {
+            // EC byte offsets fit in u8 by spec — the EC
+            // address space is 256 bytes max.
+            let mut acc = 0u64;
+            for i in 0..width.min(8) {
+                let off = (byte_offset_in_region + i as u64) as u8;
+                let b = ec_read_byte(off).unwrap_or(0);
+                acc |= (b as u64) << (i * 8);
+            }
+            Ok(acc)
+        }
+        // GenericSerialBus stub still — full impl needs the
+        // I2C registry routing + bus-side block transactions
+        // (deferred — touchpad bring-up doesn't depend on it).
+        // Other rare spaces stubbed to 0 so AML flows through.
+        RegionSpace::GenericSerialBus
         | RegionSpace::GeneralPurposeIO
         | RegionSpace::SmBus
         | RegionSpace::Ipmi
@@ -538,10 +675,16 @@ fn write_unit(
             }
             None => Err(FieldAccessError::Unsupported),
         },
-        // EC + GenericSerialBus stubs: silently drop writes.
-        // See read_unit for the rationale + follow-up plan.
-        RegionSpace::EmbeddedCtl
-        | RegionSpace::GenericSerialBus
+        // EC writes — drive the WR_EC protocol.
+        RegionSpace::EmbeddedCtl => {
+            for i in 0..width.min(8) {
+                let off = (byte_offset_in_region + i as u64) as u8;
+                let v = ((val >> (i * 8)) & 0xff) as u8;
+                let _ = ec_write_byte(off, v);
+            }
+            Ok(())
+        }
+        RegionSpace::GenericSerialBus
         | RegionSpace::GeneralPurposeIO
         | RegionSpace::SmBus
         | RegionSpace::Ipmi

@@ -536,6 +536,12 @@ pub unsafe fn parse_namespace(rsdp_phys: PhysAddr) -> Result<u32, AmlError> {
         })?;
         e?;
     }
+    // Audit #4: discover the EC device's command/data ports
+    // from its _CRS so EmbeddedCtl OpRegion field accesses
+    // can drive the firmware protocol. Must run BEFORE
+    // notify_reg_handlers because _REG(EmbeddedCtl, 1) on the
+    // EC device may immediately trigger field accesses.
+    crate::eval::discover_ec_ports();
     // Audit #18: notify every device that owns an OpRegion that
     // its region-space is now "connected". Required by ACPI 6.5
     // §6.5.4 before any field read; EC + GenericSerialBus drivers
