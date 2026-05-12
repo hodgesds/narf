@@ -2140,12 +2140,22 @@ fn run_async_demo() -> ! {
             console::Writer,
             "  cursor: pump spawned (FB up)"
         );
-        // Paint a steady-state diagnostic panel into the bottom of
-        // the FB so real-HW boots (no serial console available) can
-        // *see* which drivers enumerated. Writes once; FB-console
-        // scroll afterwards may overwrite it but the I2C / GPIO /
-        // i8042 / cursor-state line is what matters at the moment
-        // we transition to interactive.
+    }
+    // Spawn the USB HID supervisor at the same point as the cursor
+    // pump for the same reason — Stage::Late spawn would be wiped
+    // by the scheduler::init() above. Without this the keyboard
+    // pipeline never runs even though every other piece (xHCI
+    // probe, attach helpers, klog) is wired.
+    if narf_drivers_usb::spawn_usb_hid_supervisor() {
+        let _ = writeln!(
+            console::Writer,
+            "  usb-hid: supervisor spawned (xHCI up)"
+        );
+    }
+    if cursor_spawned {
+        // Paint the diagnostic panel after both pumps are spawned
+        // so the supervisor has had at least one chance to log
+        // attach failures into klog before we snapshot.
         let cap = narf_fb::bootstrap_writer();
         if let Ok(panel_writer) = narf_fb::FbWriter::new(cap) {
             narf_fb::status::paint(&panel_writer);
