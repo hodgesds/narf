@@ -885,22 +885,21 @@ impl Controller {
         // bumps from the ISR. As a defensive belt-and-braces check
         // we also bail if the CQE phase flips first (e.g. if the
         // interrupt got lost; QEMU has been observed to do this on
-        // hot reset paths).
-        let mut spins = 0u32;
-        loop {
-            if narf_interrupts::fire_count(v) > baseline {
-                break;
-            }
-            // SAFETY: cq_buf is a live identity-mapped DMA page.
-            let cqe = unsafe { peek_cqe(&io.cq_buf, io.cq_head) };
-            if (cqe.status & 1) == (io.cq_phase & 1) {
-                break;
-            }
-            spins += 1;
-            if spins > 10_000_000 {
-                return Err(NvmeError::CompletionTimeout);
-            }
-            core::hint::spin_loop();
+        // hot reset paths). responsive_spin ticks sleep_pumps so the
+        // FB cursor / serial drain stay alive.
+        let done = narf_scheduler::responsive_spin(
+            || {
+                if narf_interrupts::fire_count(v) > baseline {
+                    return true;
+                }
+                // SAFETY: cq_buf is a live identity-mapped DMA page.
+                let cqe = unsafe { peek_cqe(&io.cq_buf, io.cq_head) };
+                (cqe.status & 1) == (io.cq_phase & 1)
+            },
+            10_000_000,
+        );
+        if !done {
+            return Err(NvmeError::CompletionTimeout);
         }
 
         // Drain the CQE.
@@ -1138,21 +1137,30 @@ impl Controller {
 /// returning `ControllerFailed` on timeout or `ControllerFatal` if
 /// `CFS` is set during the wait.
 fn wait_csts<F: Fn(u32) -> bool>(bar: &MmioRegion, ok: F) -> Result<(), NvmeError> {
-    // narf_scheduler::spin_tick (audit #7) ticks sleep_pumps every
-    // 1024 iterations so the cursor / FB / serial console stay
-    // alive while we busy-wait on a stuck controller.
-    for _ in 0..1_000_000u32 {
-        // SAFETY: identity-mapped MMIO, naturally aligned.
-        let s = unsafe { bar.read32(REG_CSTS) };
-        if (s & CSTS_CFS) != 0 {
-            return Err(NvmeError::ControllerFatal);
-        }
-        if ok(s) {
-            return Ok(());
-        }
-        core::hint::spin_loop();
+    // responsive_spin ticks sleep_pumps every ~4096 iterations so
+    // the cursor / FB / serial console stay alive while we busy-
+    // wait on a stuck controller.
+    let mut fatal = false;
+    let done = narf_scheduler::responsive_spin(
+        || {
+            // SAFETY: identity-mapped MMIO, naturally aligned.
+            let s = unsafe { bar.read32(REG_CSTS) };
+            if (s & CSTS_CFS) != 0 {
+                fatal = true;
+                return true;
+            }
+            ok(s)
+        },
+        1_000_000,
+    );
+    if fatal {
+        return Err(NvmeError::ControllerFatal);
     }
-    Err(NvmeError::ControllerFailed)
+    if done {
+        Ok(())
+    } else {
+        Err(NvmeError::ControllerFailed)
+    }
 }
 
 /// Write SQE `index` into the submission-queue DMA buffer.
@@ -1189,18 +1197,23 @@ unsafe fn peek_cqe(buf: &DmaBuffer, index: u16) -> Cqe {
 /// `ADMIN_Q_DEPTH * 16` bytes; `index < ADMIN_Q_DEPTH`.
 unsafe fn wait_cqe(buf: &DmaBuffer, index: u16, expected_phase: u16) -> Result<Cqe, NvmeError> {
     let base = buf.phys_addr().raw() as *const Cqe;
-    // spin_tick (audit #7) keeps cursor/FB/serial alive on a slow
-    // or stuck controller.
-    for _ in 0..10_000_000u32 {
-        // SAFETY: caller guarantees buf is page-aligned and large
-        // enough; index is bounded.
-        let cqe = unsafe { core::ptr::read_volatile(base.add(index as usize)) };
-        if (cqe.status & 1) == (expected_phase & 1) {
-            return Ok(cqe);
-        }
-        core::hint::spin_loop();
+    // responsive_spin keeps cursor/FB/serial alive on a slow or
+    // stuck controller.
+    let done = narf_scheduler::responsive_spin(
+        || {
+            // SAFETY: caller guarantees buf is page-aligned and large
+            // enough; index is bounded.
+            let cqe = unsafe { core::ptr::read_volatile(base.add(index as usize)) };
+            (cqe.status & 1) == (expected_phase & 1)
+        },
+        10_000_000,
+    );
+    if !done {
+        return Err(NvmeError::CompletionTimeout);
     }
-    Err(NvmeError::CompletionTimeout)
+    // SAFETY: caller guarantees buf is page-aligned and large enough.
+    let cqe = unsafe { core::ptr::read_volatile(base.add(index as usize)) };
+    Ok(cqe)
 }
 
 /// Pull our subset of fields out of the IDENTIFY CONTROLLER page.
