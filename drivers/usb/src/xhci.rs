@@ -191,6 +191,7 @@ const TRB_DIR_IN: u32 = 1 << 16;
 const TRB_IDT: u32 = 1 << 6;
 /// IOC — Interrupt On Completion, bit 5 of dword3.
 const TRB_IOC: u32 = 1 << 5;
+const TRB_TC: u32 = 1 << 1; // Toggle Cycle (Link TRB only, §6.4.4.1)
 /// CH — Chain bit, bit 4 of dword3.
 #[allow(dead_code)]
 const TRB_CH: u32 = 1 << 4;
@@ -373,8 +374,23 @@ pub struct EndpointState {
     pub dci: u8,
     pub max_packet: u16,
     pub kind: EndpointKind,
-    /// Transfer ring backing the endpoint (4 KiB / 256 TRBs).
+    /// Transfer ring backing the endpoint. Slots 0..CTRL_TR_TRBS-1
+    /// are usable Normal/Setup/Data/Status TRBs; the last slot
+    /// (CTRL_TR_TRBS-1) is reserved for a Link TRB pointing back
+    /// to slot 0 with TC=1 (toggle cycle). Without the Link TRB
+    /// the producer's `enq` would saturate at CTRL_TR_TRBS-1 and
+    /// every subsequent enqueue would return CmdRingFull —
+    /// silently killing the keyboard pump after ~64 reports.
     tr: DmaBuffer,
+    /// Persistent DMA scratch for bulk_in/bulk_out reuse. One 4
+    /// KiB page per endpoint, allocated at configure time and
+    /// kept alive for the endpoint's lifetime. Pre-fix, every
+    /// bulk_in / bulk_out call did `alloc_coherent(4096)` and
+    /// then dropped it at end-of-function — risky under AMD-Vi
+    /// (a freed page can be reused by the next allocation while
+    /// a delayed device write is still in flight) and slow
+    /// under any allocator pressure.
+    dma_buf: DmaBuffer,
     /// Producer-cycle state.
     pcs: u32,
     /// Next-free TRB index.
@@ -1229,6 +1245,20 @@ impl Xhci {
         let input_phys = input.phys_addr().raw();
         let dev_ctx_phys = dev_ctx.phys_addr().raw();
         let ctrl_tr_phys = ctrl_tr.phys_addr().raw();
+        // Plant a Link TRB at the last slot of the control transfer
+        // ring so ctrl_enqueue can wrap (audit #1 — same fix as the
+        // per-EP ring above). Cycle bit starts at 0; ctrl_pcs starts
+        // at 1 and toggles each wrap.
+        let ctrl_link_off = ((CTRL_TR_TRBS - 1) * 16) as u64;
+        let ctrl_link_addr = ctrl_tr_phys + ctrl_link_off;
+        let ctrl_link_d3 = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC;
+        // SAFETY: identity-mapped DMA; offset in-page.
+        unsafe {
+            core::ptr::write_volatile(ctrl_link_addr as *mut u32, ctrl_tr_phys as u32);
+            core::ptr::write_volatile((ctrl_link_addr + 4) as *mut u32, (ctrl_tr_phys >> 32) as u32);
+            core::ptr::write_volatile((ctrl_link_addr + 8) as *mut u32, 0);
+            core::ptr::write_volatile((ctrl_link_addr + 12) as *mut u32, ctrl_link_d3);
+        }
 
         // Input Control Context (§6.2.5.1):
         //   dword0 = D-mask (drop), dword1 = A-mask (add).
@@ -1386,8 +1416,21 @@ impl Xhci {
             .get_mut(slot_id as usize)
             .and_then(|s| s.as_mut())
             .ok_or(XhciError::CmdFailed(0xFC))?;
-        if dev.ctrl_enq >= CTRL_TR_TRBS - 1 {
-            return Err(XhciError::CmdRingFull);
+        if dev.ctrl_enq == CTRL_TR_TRBS - 1 {
+            // Wrap: re-stamp the Link TRB with current cycle, reset
+            // enq, toggle pcs. Same shape as ep_enqueue_normal's
+            // wrap branch.
+            let link_off = ((CTRL_TR_TRBS - 1) * 16) as u64;
+            let link_addr = dev.ctrl_tr.phys_addr().raw() + link_off;
+            let link_d3 =
+                (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC | (dev.ctrl_pcs & TRB_CYCLE_BIT);
+            // SAFETY: identity-mapped DMA, offset in-page.
+            unsafe {
+                core::ptr::write_volatile((link_addr + 12) as *mut u32, link_d3);
+            }
+            compiler_fence(Ordering::SeqCst);
+            dev.ctrl_enq = 0;
+            dev.ctrl_pcs ^= 1;
         }
         let trb_off = (dev.ctrl_enq * 16) as u64;
         let trb_addr = dev.ctrl_tr.phys_addr().raw() + trb_off;
@@ -1627,6 +1670,28 @@ impl Xhci {
             unsafe {
                 core::ptr::write_bytes(tr_phys as *mut u8, 0, 4096);
             }
+            // Plant a Link TRB at slot CTRL_TR_TRBS-1 pointing back
+            // to slot 0 with TC=1. Cycle bit starts at 0 (the
+            // producer's pcs starts at 1; first time we cross the
+            // Link, hardware sees Cycle=0 matching its initial CCS
+            // expectation, follows the link, and toggles. We toggle
+            // pcs in lockstep on the producer side).
+            let link_trb_off = ((CTRL_TR_TRBS - 1) * 16) as u64;
+            let link_addr = tr_phys + link_trb_off;
+            let link_d3 = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC; // TC=1, cycle=0
+            // SAFETY: identity-mapped DMA, offset checked.
+            unsafe {
+                core::ptr::write_volatile(link_addr as *mut u32, tr_phys as u32);
+                core::ptr::write_volatile((link_addr + 4) as *mut u32, (tr_phys >> 32) as u32);
+                core::ptr::write_volatile((link_addr + 8) as *mut u32, 0);
+                core::ptr::write_volatile((link_addr + 12) as *mut u32, link_d3);
+            }
+            // Persistent per-EP DMA scratch. One page; bulk_in /
+            // bulk_out reuse this instead of allocating on every
+            // call (audit #14: drop-then-reuse races with delayed
+            // DMA writes when the IOMMU is on).
+            let dma_buf =
+                alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
 
             // EP context at `cs + cs * dci` = `cs * (1 + dci)`. cs
             // = 32 (CSZ=0) or 64 (CSZ=1).
@@ -1656,6 +1721,7 @@ impl Xhci {
                 max_packet: ep.max_packet,
                 kind: ep.kind,
                 tr,
+                dma_buf,
                 pcs: 1,
                 enq: 0,
             });
@@ -1743,8 +1809,29 @@ impl Xhci {
             .get_mut(idx)
             .and_then(|s| s.as_mut())
             .ok_or(XhciError::CmdFailed(0xFA))?;
-        if ep.enq >= CTRL_TR_TRBS - 1 {
-            return Err(XhciError::CmdRingFull);
+        // Slot CTRL_TR_TRBS-1 is the Link TRB planted at ring
+        // construction. When enq reaches it, follow the link:
+        // re-update the Link TRB's cycle bit so hardware can
+        // see it as "valid + toggle" on its next dequeue, reset
+        // enq to 0, toggle pcs, then write the new Normal TRB
+        // at slot 0 with the toggled cycle.
+        if ep.enq == CTRL_TR_TRBS - 1 {
+            // Re-stamp the Link TRB with the *current* cycle so
+            // the engine consumes it. Without this, a Link TRB
+            // written at construction with cycle=0 stays valid
+            // forever (engine reads it once, follows it, but
+            // subsequent wraps need fresh cycle bits).
+            let link_off = ((CTRL_TR_TRBS - 1) * 16) as u64;
+            let link_addr = ep.tr.phys_addr().raw() + link_off;
+            let link_d3 =
+                (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC | (ep.pcs & TRB_CYCLE_BIT);
+            // SAFETY: identity-mapped DMA, offset in-page.
+            unsafe {
+                core::ptr::write_volatile((link_addr + 12) as *mut u32, link_d3);
+            }
+            compiler_fence(Ordering::SeqCst);
+            ep.enq = 0;
+            ep.pcs ^= 1;
         }
         let trb_off = (ep.enq * 16) as u64;
         let trb_addr = ep.tr.phys_addr().raw() + trb_off;
@@ -1773,11 +1860,14 @@ impl Xhci {
         if out.is_empty() || out.len() > 4096 {
             return Err(XhciError::CmdFailed(0xF9));
         }
-        let scratch = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
-        let phys = scratch.phys_addr().raw();
-        // SAFETY: identity-mapped DMA page.
+        // Reuse the per-EP persistent DMA buffer (audit #14).
+        let phys = self.ep_dma_phys(slot_id, dci)?;
+        // Zero only the prefix we'll read back so a stale page can't
+        // be confused with a 0-length response from the device.
+        // SAFETY: identity-mapped DMA page; bounds-checked by the
+        // upstream `out.len() > 4096` guard.
         unsafe {
-            core::ptr::write_bytes(phys as *mut u8, 0, 4096);
+            core::ptr::write_bytes(phys as *mut u8, 0, out.len());
         }
         self.ep_enqueue_normal(slot_id, dci, phys, out.len() as u32)?;
         self.ring_slot_doorbell(slot_id, dci as u32);
@@ -1796,8 +1886,23 @@ impl Xhci {
         for i in 0..xferred.min(out.len()) {
             out[i] = unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) };
         }
-        let _ = scratch;
         Ok(xferred)
+    }
+
+    /// Resolve the persistent DMA buffer phys for an endpoint.
+    fn ep_dma_phys(&self, slot_id: u8, dci: u8) -> Result<u64, XhciError> {
+        let g = self.devices.lock();
+        let dev = g
+            .get(slot_id as usize)
+            .and_then(|s| s.as_ref())
+            .ok_or(XhciError::CmdFailed(0xFC))?;
+        let idx = (dci as usize).saturating_sub(2);
+        let ep = dev
+            .eps
+            .get(idx)
+            .and_then(|s| s.as_ref())
+            .ok_or(XhciError::CmdFailed(0xFA))?;
+        Ok(ep.dma_buf.phys_addr().raw())
     }
 
     /// Issue a bulk-OUT write. Mirror of `bulk_in`: stages caller's
@@ -1808,9 +1913,9 @@ impl Xhci {
         if data.is_empty() || data.len() > 4096 {
             return Err(XhciError::CmdFailed(0xF9));
         }
-        let scratch = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
-        let phys = scratch.phys_addr().raw();
-        // SAFETY: identity-mapped DMA page.
+        // Reuse per-EP DMA buffer (audit #14).
+        let phys = self.ep_dma_phys(slot_id, dci)?;
+        // SAFETY: identity-mapped DMA page; bounds-checked by guard.
         unsafe {
             for (i, &b) in data.iter().enumerate() {
                 core::ptr::write_volatile((phys + i as u64) as *mut u8, b);
@@ -1829,7 +1934,6 @@ impl Xhci {
         }
         let residue = ev[2] & 0x00FF_FFFF;
         let acked = (data.len() as u32).saturating_sub(residue) as usize;
-        let _ = scratch;
         Ok(acked)
     }
 }
