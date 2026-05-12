@@ -131,28 +131,47 @@ fn restore(fb: &FbWriter, save: &SavedRect) -> Result<(), crate::FbWriteError> {
 }
 
 /// Pop everything currently in the input ring, apply pointer
-/// events to the cursor state, and re-draw if anything changed.
+/// events to the cursor state, re-push Key / Scroll / AsciiByte
+/// events so other consumers (`/dev/console` for the shell, etc.)
+/// still see them, and re-draw the sprite if pointer state moved.
 /// Idempotent on empty rings — the polling loop calls this at its
 /// own cadence.
 pub fn drain_and_render(fb: &FbWriter) {
     init_centre(fb);
     let mut moved = false;
-    while let Some(ev) = narf_input::pop_global() {
-        if let InputEvent::Pointer(p) = ev {
-            let cx = POS_X.load(Ordering::Relaxed);
-            let cy = POS_Y.load(Ordering::Relaxed);
-            let nx = clamp_pos(cx, p.dx, fb.width(), W);
-            let ny = clamp_pos(cy, p.dy, fb.height(), H);
-            if nx != cx || ny != cy {
-                POS_X.store(nx, Ordering::Release);
-                POS_Y.store(ny, Ordering::Release);
-                moved = true;
+    // Snapshot of how many events were in the ring at entry — we
+    // only consume that many. Re-pushed non-pointer events land at
+    // the back of the same ring; consuming them again next tick is
+    // fine, but doing it inside the same tick would loop forever.
+    // narf_input doesn't expose `len()` directly; cap by ring
+    // capacity (256) as a safety belt.
+    for _ in 0..256 {
+        let ev = match narf_input::pop_global() {
+            Some(e) => e,
+            None => break,
+        };
+        match ev {
+            InputEvent::Pointer(p) => {
+                let cx = POS_X.load(Ordering::Relaxed);
+                let cy = POS_Y.load(Ordering::Relaxed);
+                let nx = clamp_pos(cx, p.dx, fb.width(), W);
+                let ny = clamp_pos(cy, p.dy, fb.height(), H);
+                if nx != cx || ny != cy {
+                    POS_X.store(nx, Ordering::Release);
+                    POS_Y.store(ny, Ordering::Release);
+                    moved = true;
+                }
+                // p.buttons is dropped on the floor here — once the
+                // input dispatcher splits per-class, the pointer
+                // channel will carry the click bits.
             }
-            // Future: paint the click-state into the sprite. For now
-            // p.buttons is observable via narf_input::pop_global by a
-            // future consumer.
+            // Re-push so /dev/console (the shell) and any future
+            // keyboard subscriber can still read these. Without this
+            // the cursor pump would silently steal every keystroke.
+            other => {
+                let _ = narf_input::push_global(other);
+            }
         }
-        // Key + Scroll events are dropped here — see module doc.
     }
     if !moved {
         return;
