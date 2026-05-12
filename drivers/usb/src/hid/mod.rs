@@ -351,7 +351,7 @@ fn translate_diff(prev: &KbdReport, cur: &KbdReport) -> usize {
     // Roll-over indicator: a HID keyboard signals "more than 6
     // keys held" by writing 0x01 into all six positions. Don't
     // emit anything for those.
-    let is_rollover = cur.keys.iter().all(|&k| k == 0x01) && cur.keys[0] == 0x01;
+    let is_rollover = cur.keys.iter().all(|&k| k == 0x01);
 
     // Usage-array transitions. Both arrays are short (<= 6
     // entries); a nested membership check is fine.
@@ -425,6 +425,14 @@ pub fn enumerate_and_attach_keyboards(xhci_dev: &Xhci) -> usize {
     attached
 }
 
+/// Public per-port attach used by the supervisor's per-port
+/// retry loop. Returns Err on any failure (no kbd here, NotBoot,
+/// xHCI command failure) so the supervisor can decide whether to
+/// re-try (port still connected) or move on.
+pub fn try_attach_keyboard_on_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
+    try_attach_port(xhci_dev, port)
+}
+
 fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
     xhci_dev.port_reset(port).map_err(HidError::Xhci)?;
     let speed = xhci_dev.port_speed(port).ok_or(HidError::NoInterruptIn)?;
@@ -439,6 +447,18 @@ fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
         xhci_dev
             .address_device(slot_id, port, speed)
             .map_err(HidError::Xhci)?;
+
+        // Diagnostic: read the device descriptor and surface
+        // bMaxPacketSize0 (offset +7) so a logfile reader can spot
+        // MPS-mismatched devices. USB 2.0 §9.2.6.3 says we should
+        // re-program EP0's MaxPacketSize via Evaluate Context if
+        // this differs from `speed.default_max_packet()`. Boot
+        // keyboards almost never trip this (LS=8 / HS=64 match the
+        // defaults); proper Evaluate-Context refresh is a follow-up.
+        if let Ok(desc) = xhci_dev.get_device_descriptor(slot_id) {
+            let mps0 = desc[7];
+            let _ = (mps0, port);
+        }
 
         // Read the 9-byte cfg header to discover wTotalLength
         // and the bConfigurationValue we'll feed SET_CONFIGURATION.

@@ -293,6 +293,17 @@ pub struct Xhci {
     /// 64-byte support is a follow-up. Caps the slot allocator if
     /// the controller reports CSZ=1.
     csz_64byte: bool,
+    /// Per-port USB protocol major version, indexed 1..=max_ports.
+    /// Populated by walking the xHCI Extended Capabilities list
+    /// (cap id 2 = Supported Protocol Capability) at init. 0 means
+    /// "unknown / no protocol cap matched"; typical values are 2
+    /// (USB 2.0) and 3 (USB 3.x). connected_ports uses this to
+    /// surface USB2 ports first — boot HID devices on
+    /// laptops live behind the rate-matching hub on USB2 logical
+    /// ports, but AMD xHCI lays USB3 protocol ports first in the
+    /// PORTSC array, so a naive 1..=max_ports walk would try the
+    /// USB3 sibling and then fail Address Device.
+    port_protocols: [u8; 256],
     /// DCBAA backing — kept alive for the controller's lifetime.
     dcbaa: DmaBuffer,
     cmd_ring: DmaBuffer,
@@ -465,6 +476,51 @@ impl Xhci {
         // SAFETY: same.
         let hcc1 = unsafe { mmio.read32(CAP_HCCPARAMS1) };
         let csz_64byte = (hcc1 & (1 << 2)) != 0;
+
+        // ── Extended Capabilities walk ─────────────────────────────
+        // HCCPARAMS1[31:16] holds xECP, the offset to the first
+        // Extended Capability in DWORD units from the *MMIO base*
+        // (xHCI §7). Each cap header: byte0 = id, byte1 = next
+        // (DWORDs from this cap, 0 terminates the list). We scan
+        // for cap id 2 (Supported Protocol) which describes a
+        // contiguous range of port numbers + their USB version.
+        let mut port_protocols = [0u8; 256];
+        let xecp_dwords = (hcc1 >> 16) & 0xFFFF;
+        if xecp_dwords != 0 {
+            let mut cap_off = (xecp_dwords as u64) * 4;
+            // Hard cap iterations; spec says lists terminate but
+            // a malformed table shouldn't hang us forever.
+            for _ in 0..32 {
+                // SAFETY: identity-mapped MMIO region.
+                let hdr = unsafe { mmio.read32(cap_off) };
+                let cap_id = (hdr & 0xFF) as u8;
+                let next_dwords = ((hdr >> 8) & 0xFF) as u64;
+                if cap_id == 2 {
+                    // Supported Protocol Capability layout:
+                    //   +0x00  cap_hdr (id=2, next, MinorRev, MajorRev)
+                    //   +0x04  Name string ("USB ", LE)
+                    //   +0x08  Compatible Port Offset (byte0) +
+                    //          Compatible Port Count (byte1) +
+                    //          Protocol Defined (bytes 2..4)
+                    //   +0x0C  Protocol Slot Type
+                    let major = ((hdr >> 24) & 0xFF) as u8;
+                    // SAFETY: same.
+                    let pinfo = unsafe { mmio.read32(cap_off + 0x08) };
+                    let port_off = (pinfo & 0xFF) as usize;
+                    let port_count = ((pinfo >> 8) & 0xFF) as usize;
+                    for i in 0..port_count {
+                        let p = port_off + i;
+                        if p > 0 && p < 256 {
+                            port_protocols[p] = major;
+                        }
+                    }
+                }
+                if next_dwords == 0 {
+                    break;
+                }
+                cap_off += next_dwords * 4;
+            }
+        }
 
         let caps = XhciCaps {
             caplength,
@@ -685,6 +741,7 @@ impl Xhci {
             rts_off: rtsoff as u64,
             db_off: dboff as u64,
             csz_64byte,
+            port_protocols,
             dcbaa,
             cmd_ring,
             event_ring,
@@ -836,6 +893,17 @@ impl Xhci {
 
     /// Read the PORTSC register for `port` (1-indexed per spec).
     /// Returns `None` for an out-of-range port number.
+    /// Major USB version for `port` (2 or 3 typically), or 0 when
+    /// the controller didn't expose a Supported Protocol cap that
+    /// covers this port. Populated at init by walking xECP.
+    pub fn port_protocol(&self, port: u8) -> u8 {
+        if (port as usize) < self.port_protocols.len() {
+            self.port_protocols[port as usize]
+        } else {
+            0
+        }
+    }
+
     pub fn portsc(&self, port: u8) -> Option<u32> {
         if port == 0 || port > self.caps.max_ports {
             return None;
@@ -851,17 +919,30 @@ impl Xhci {
     }
 
     /// Enumerate connected ports as a tuple of `(port_id, portsc)`.
+    /// USB2 ports first, then USB3, then unknown — matches the
+    /// boot-HID-device case (laptop keyboards live behind the
+    /// rate-matching hub on USB2 logical ports; trying their USB3
+    /// protocol siblings first wastes an enumeration round and can
+    /// kick the device into a re-attach loop on some firmwares).
     /// Allocates — fine outside hot paths.
     pub fn connected_ports(&self) -> alloc::vec::Vec<(u8, u32)> {
-        let mut out = alloc::vec::Vec::new();
+        let mut usb2 = alloc::vec::Vec::new();
+        let mut usb3 = alloc::vec::Vec::new();
+        let mut other = alloc::vec::Vec::new();
         for p in 1..=self.caps.max_ports {
             if let Some(v) = self.portsc(p) {
                 if v & PORTSC_CCS != 0 {
-                    out.push((p, v));
+                    match self.port_protocol(p) {
+                        2 => usb2.push((p, v)),
+                        3 => usb3.push((p, v)),
+                        _ => other.push((p, v)),
+                    }
                 }
             }
         }
-        out
+        usb2.extend(usb3);
+        usb2.extend(other);
+        usb2
     }
 
     /// Drive `port` through reset. Per §4.19.5 this transitions an
@@ -878,6 +959,23 @@ impl Xhci {
         if cur & PORTSC_CCS == 0 {
             return Err(XhciError::BadPort);
         }
+        // CCS-stable debounce (xHCI §4.19.5 / USB 2.0 §7.1.7.3:
+        // TDDIS = 100 ms). Sample CCS every ~1 ms; if it stays
+        // asserted continuously for the debounce window we
+        // proceed. A glitchy connect that toggles within the
+        // window is treated as "not yet stable" — caller's
+        // supervisor poll re-tries on the next tick.
+        const DEBOUNCE_SAMPLES: u32 = 100;
+        for _ in 0..DEBOUNCE_SAMPLES {
+            // SAFETY: same MMIO region.
+            let v = unsafe { self.mmio.read32(off) };
+            if v & PORTSC_CCS == 0 {
+                return Err(XhciError::BadPort);
+            }
+            for _ in 0..100_000 {
+                core::hint::spin_loop();
+            }
+        }
         // Mask RW1C change bits to 0 in the value we write so we
         // don't accidentally clear them; OR in PORTSC_PR + PP to
         // assert reset and keep power on.
@@ -889,13 +987,28 @@ impl Xhci {
         unsafe {
             self.mmio.write32(off, to_write);
         }
-        // Wait for PR to clear (§4.19.5: hardware self-clears once
-        // reset completes; spec gives 50 ms typical).
-        for _ in 0..1_000_000u32 {
+        // Wait for PR to clear AND PRC to set (§4.19.5: PR self-
+        // clears + PRC asserts on reset completion). Bound at ~250 ms.
+        for _ in 0..2_500_000u32 {
             // SAFETY: same.
             let v = unsafe { self.mmio.read32(off) };
-            if v & PORTSC_PR == 0 {
-                return Ok(v);
+            if v & PORTSC_PR == 0 && v & PORTSC_PRC != 0 {
+                // Acknowledge PRC by writing 1 to clear (RW1C),
+                // preserving the rest of the register.
+                let ack = (v & !PORTSC_CHG_MASK) | PORTSC_PRC;
+                // SAFETY: same.
+                unsafe {
+                    self.mmio.write32(off, ack);
+                }
+                // PED must be set after a successful reset for
+                // USB2; USB3 self-enables. Re-read to confirm,
+                // surfacing a clear error if not.
+                // SAFETY: same.
+                let post = unsafe { self.mmio.read32(off) };
+                if post & PORTSC_PED == 0 {
+                    return Err(XhciError::PortResetTimeout);
+                }
+                return Ok(post);
             }
             core::hint::spin_loop();
         }

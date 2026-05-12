@@ -85,8 +85,18 @@ pub fn register_initcalls() {
             // succeeds twice), so the retry is benign even when the
             // count hasn't changed; a future port-mask snapshot
             // would tighten this.
-            let mut last_kbd = 0usize;
-            let mut last_mouse = 0usize;
+            // Per-port claimed-by-keyboard / claimed-by-mouse
+            // bitmasks. A port shows up here only after a
+            // successful enumerate_and_attach against it. The
+            // previous "if connected_count > last_kbd_count" gate
+            // permanently inhibited keyboard re-enumeration once
+            // any device (a hub, a mouse, internal BT) was on
+            // the bus, because last_kbd would jump to the total
+            // device count and the gate would never re-fire.
+            // Per-port masks let us re-try only the ports we
+            // haven't actually claimed yet.
+            let mut claimed_kbd: u128 = 0;
+            let mut claimed_mouse: u128 = 0;
             loop {
                 if !xhci::is_probed() {
                     narf_time::sleep_cycles(PUMP_CYCLES).await;
@@ -96,23 +106,31 @@ pub fn register_initcalls() {
                 if irq_vector.is_none() {
                     irq_vector = xhci::with_controller(|c| c.irq_vector).flatten();
                 }
-                // Look for newly-arrived devices on every tick.
-                if let Some(connected) =
-                    xhci::with_controller(|c| c.connected_ports().len())
-                {
-                    if connected > last_kbd {
-                        last_kbd = xhci::with_controller(|c| {
-                            hid::enumerate_and_attach_keyboards(c)
+                // Walk every connected port; attempt enumeration
+                // against any port we haven't already attached.
+                let connected_ports: alloc::vec::Vec<u8> = xhci::with_controller(|c| {
+                    c.connected_ports().iter().map(|(p, _)| *p).collect()
+                })
+                .unwrap_or_default();
+                for &p in &connected_ports {
+                    let bit = 1u128 << (p as u32 & 127);
+                    if claimed_kbd & bit == 0 {
+                        let attached = xhci::with_controller(|c| {
+                            hid::try_attach_keyboard_on_port(c, p).is_ok()
                         })
-                        .unwrap_or(0)
-                        .max(last_kbd);
+                        .unwrap_or(false);
+                        if attached {
+                            claimed_kbd |= bit;
+                        }
                     }
-                    if connected > last_mouse {
-                        last_mouse = xhci::with_controller(|c| {
-                            hid::mouse::enumerate_and_attach_mice(c)
+                    if claimed_mouse & bit == 0 {
+                        let attached = xhci::with_controller(|c| {
+                            hid::mouse::try_attach_mouse_on_port(c, p).is_ok()
                         })
-                        .unwrap_or(0)
-                        .max(last_mouse);
+                        .unwrap_or(false);
+                        if attached {
+                            claimed_mouse |= bit;
+                        }
                     }
                 }
                 // Drain whatever we've bound.

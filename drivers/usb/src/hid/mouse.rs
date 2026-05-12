@@ -245,6 +245,12 @@ pub fn enumerate_and_attach_mice(xhci_dev: &Xhci) -> usize {
     attached
 }
 
+/// Public per-port attach used by the supervisor's per-port
+/// retry loop. Same shape as the keyboard variant.
+pub fn try_attach_mouse_on_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
+    try_attach_port(xhci_dev, port)
+}
+
 fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
     xhci_dev.port_reset(port).map_err(HidError::Xhci)?;
     let speed = xhci_dev.port_speed(port).ok_or(HidError::NoInterruptIn)?;
