@@ -543,6 +543,12 @@ pub unsafe fn parse_namespace(rsdp_phys: PhysAddr) -> Result<u32, AmlError> {
     // missing _REG methods just return MethodNotFound and we
     // move on.
     crate::eval::notify_reg_handlers();
+    // Audit #19: power on every device whose _PR0 lists a
+    // PowerResource that we control. Per ACPI 6.5 §7.3 the OS
+    // must drive _PR0's PowerResources to ON before evaluating
+    // a device's _CRS. Devices without _PR0 are presumed
+    // always-on (no-op).
+    crate::eval::power_on_all_devices();
     Ok(total)
 }
 

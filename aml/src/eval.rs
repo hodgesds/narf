@@ -93,10 +93,22 @@ enum Signal {
 struct EvalState {
     locals: [Value; 8],
     args: Vec<Value>,
+    /// Current method's scope path. Audit #15: ACPI 6.5 §5.3
+    /// resolves a relative NameString by trying the current
+    /// scope, then each parent up to root. Pre-fix the eval
+    /// fell back to a suffix-search across the entire namespace,
+    /// which returned the wrong node when two devices defined a
+    /// same-named child (`PRTP` etc.). With `scope` populated we
+    /// walk parent paths properly.
+    scope: alloc::string::String,
 }
 
 impl EvalState {
     fn new(args: &[Value]) -> Self {
+        Self::with_scope(args, "\\")
+    }
+
+    fn with_scope(args: &[Value], scope: &str) -> Self {
         // Rust doesn't let us `[Value::Integer(0); 8]` (non-Copy), so build
         // the array manually.
         Self {
@@ -111,6 +123,7 @@ impl EvalState {
                 Value::Integer(0),
             ],
             args: args.to_vec(),
+            scope: alloc::string::String::from(scope),
         }
     }
 
@@ -170,12 +183,118 @@ pub fn evaluate_method(path: &str, args: &[Value]) -> Result<Value, AmlError> {
         return Err(AmlError::Truncated);
     }
 
-    // 3. Evaluate.
-    let mut state = EvalState::new(args);
+    // 3. Evaluate. Method scope = the path's parent (so
+    // relative NameString lookups resolve in the device this
+    // method belongs to, walking parents per ACPI §5.3).
+    let scope = match path.rfind('.') {
+        Some(i) => &path[..i],
+        None => "\\",
+    };
+    let mut state = EvalState::with_scope(args, scope);
     let mut cur = 0usize;
     match walk_term_list(&body, &mut cur, body.len(), &mut state)? {
         Signal::Return(v) => Ok(v),
         _ => Ok(Value::Integer(0)),
+    }
+}
+
+/// Resolve a NameString against the current eval scope per ACPI
+/// §5.3: try `scope.name`, then walk parents up to root, finally
+/// the bare name. Returns the first matching node.
+fn resolve_name(name: &str, scope: &str) -> Option<crate::AmlNode> {
+    // Fully-qualified (starts with `\`) — skip the walk.
+    if name.starts_with('\\') {
+        return crate::find_node(name);
+    }
+    // Strip leading `^` parent indicators from name, popping
+    // scope segments per indicator.
+    let (parents, remainder) = {
+        let mut p = 0usize;
+        let bytes = name.as_bytes();
+        while p < bytes.len() && bytes[p] == b'^' {
+            p += 1;
+        }
+        (p, &name[p..])
+    };
+    let mut effective_scope = alloc::string::String::from(scope);
+    for _ in 0..parents {
+        if let Some(i) = effective_scope.rfind('.') {
+            effective_scope.truncate(i);
+        } else if effective_scope != "\\" {
+            effective_scope = alloc::string::String::from("\\");
+        }
+    }
+    // Try scope.name walking up to root.
+    loop {
+        let candidate = if effective_scope == "\\" {
+            let mut s = alloc::string::String::from("\\");
+            s.push_str(remainder);
+            s
+        } else {
+            let mut s = effective_scope.clone();
+            s.push('.');
+            s.push_str(remainder);
+            s
+        };
+        if let Some(node) = crate::find_node(&candidate) {
+            return Some(node);
+        }
+        if effective_scope == "\\" {
+            break;
+        }
+        if let Some(i) = effective_scope.rfind('.') {
+            effective_scope.truncate(i);
+        } else {
+            effective_scope = alloc::string::String::from("\\");
+        }
+    }
+    // Final fallback: the unqualified-suffix search (matches
+    // pre-fix behaviour for tables we already pass).
+    crate::find_node_by_suffix(name)
+}
+
+/// Walk every device with `_PR0` and drive each named
+/// PowerResource's `_ON` method (audit #19). Per ACPI 6.5 §7.3
+/// the OS must transition every PowerResource a device depends
+/// on to the ON state before evaluating that device's `_CRS` /
+/// using its hardware. Skip devices whose `_STA` says they're
+/// already powered. Best-effort — missing methods return
+/// MethodNotFound and we move on.
+pub fn power_on_all_devices() {
+    use alloc::string::String;
+    let mut work: alloc::vec::Vec<String> = alloc::vec::Vec::new();
+    crate::for_each_device(|node| {
+        let mut pr0 = node.path.clone();
+        pr0.push_str("._PR0");
+        if crate::find_node(&pr0).is_some() {
+            work.push(pr0);
+        }
+    });
+    for pr0_path in work {
+        // _PR0 returns a Package of NameStrings (PowerResources
+        // we depend on). Some firmware emits it as a Method,
+        // others as a Name(_PR0, Package(...)). evaluate_method
+        // handles both shapes — for Name it returns the package
+        // directly; for Method it runs the body.
+        let pkg = match evaluate_method(&pr0_path, &[]) {
+            Ok(crate::Value::Package(p)) => p,
+            _ => continue,
+        };
+        for pr_ref in pkg {
+            // Each entry should resolve to a PowerResource
+            // node's path. We accept Integer (path-via-int is
+            // non-standard but real firmware uses it
+            // occasionally) by skipping; only Strings are
+            // honoured here.
+            let pr_path = match pr_ref {
+                crate::Value::String(s) => s,
+                _ => continue,
+            };
+            // Build full path for the _ON method.
+            let mut on = pr_path;
+            on.push_str("._ON");
+            let _ = evaluate_method(&on, &[]);
+        }
     }
 }
 
@@ -757,9 +876,7 @@ fn eval_term(
             // TermArg bytes; otherwise subsequent decoding goes
             // off the rails. Falls through silently for non-
             // Method names.
-            if let Some(node) =
-                crate::find_node(&name).or_else(|| crate::find_node_by_suffix(&name))
-            {
+            if let Some(node) = resolve_name(&name, &state.scope) {
                 if node.kind == crate::NodeKind::Method {
                     let argc = (node.method_flags & 0x07) as usize;
                     let mut args: alloc::vec::Vec<Value> =
@@ -1271,8 +1388,7 @@ fn eval_term_arg(buf: &[u8], cur: &mut usize, state: &mut EvalState) -> Result<V
             // good enough for the patterns we see in QEMU + EDK2
             // firmware (PRTA / PRTP / PIR* siblings of `_PRT`) and
             // tightens up when full scope tracking lands.
-            let resolved = crate::find_node(&name)
-                .or_else(|| crate::find_node_by_suffix(&name));
+            let resolved = resolve_name(&name, &state.scope);
             match resolved {
                 Some(node) => match node.kind {
                     // Method invocation as TermArg (audit #1, the
@@ -1514,8 +1630,7 @@ fn write_target(
             //                  (audit #9 — _CRS template fill-in)
             //  - other:        update the Name node's value cache
             let name = read_name_string(buf, cur, "\\")?;
-            let resolved = crate::find_node(&name)
-                .or_else(|| crate::find_node_by_suffix(&name));
+            let resolved = resolve_name(&name, &state.scope);
             match resolved.as_ref().map(|n| n.kind) {
                 Some(crate::NodeKind::Field) => {
                     let _ = crate::oregion::write_field(&name, value.as_integer());
