@@ -138,14 +138,12 @@ impl Rtl8139 {
         unsafe {
             mmio.write8(REG_CR, CR_RST);
         }
-        for _ in 0..1_000_000u32 {
-            // SAFETY: same.
-            let v = unsafe { mmio.read8(REG_CR) };
-            if v & CR_RST == 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+        // SAFETY: identity-mapped MMIO. responsive_spin ticks
+        // sleep_pumps so FB cursor / serial drain stay alive.
+        narf_scheduler::responsive_spin(
+            || unsafe { mmio.read8(REG_CR) } & CR_RST == 0,
+            1_000_000,
+        );
         // SAFETY: same.
         let post = unsafe { mmio.read8(REG_CR) };
         if post & CR_RST != 0 {
@@ -240,22 +238,20 @@ impl Rtl8139 {
         let mut idx_lock = self.tx_index.lock();
         let idx = *idx_lock;
         // Wait for this slot to be free (OWN cleared by chip after
-        // the previous transmission).
-        let mut spins = 0u32;
-        loop {
-            // SAFETY: identity-mapped MMIO.
-            let tsd = unsafe { self.mmio.read32(REG_TSD0 + (idx as u64) * 4) };
-            // After power-on TSD reads 0, which counts as OWN=0 +
-            // never-transmitted. The `OWN_clear after a TX` story
-            // is what we'd see in steady state.
-            if tsd & TSD_OWN == 0 || (tsd & TSD_TOK) != 0 {
-                break;
-            }
-            spins += 1;
-            if spins > 10_000_000 {
-                return Err(Rtl8139Error::TxBusy);
-            }
-            core::hint::spin_loop();
+        // the previous transmission). responsive_spin ticks
+        // sleep_pumps. After power-on TSD reads 0, which counts as
+        // OWN=0 + never-transmitted; in steady state we see
+        // OWN-clear after the prior TX completes.
+        let free = narf_scheduler::responsive_spin(
+            || {
+                // SAFETY: identity-mapped MMIO.
+                let tsd = unsafe { self.mmio.read32(REG_TSD0 + (idx as u64) * 4) };
+                tsd & TSD_OWN == 0 || (tsd & TSD_TOK) != 0
+            },
+            10_000_000,
+        );
+        if !free {
+            return Err(Rtl8139Error::TxBusy);
         }
         let buf_phys = self.tx_bufs[idx].phys_addr().raw();
         // SAFETY: identity-mapped DMA.

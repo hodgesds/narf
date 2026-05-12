@@ -263,14 +263,14 @@ impl WifiNic {
         // bound the spin so a wedged controller surfaces as
         // FirmwareLoadFailed rather than livelock.
         let mut status = regs::BHI_STATUS_RESET;
-        for _ in 0..10_000_000u32 {
-            // SAFETY: same.
-            status = unsafe { self.mmio.read32(bhi + regs::BHI_STATUS) };
-            if status != regs::BHI_STATUS_RESET {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+        narf_scheduler::responsive_spin(
+            || {
+                // SAFETY: identity-mapped MMIO.
+                status = unsafe { self.mmio.read32(bhi + regs::BHI_STATUS) };
+                status != regs::BHI_STATUS_RESET
+            },
+            10_000_000,
+        );
         if status != regs::BHI_STATUS_SUCCESS {
             return Err(WifiError::FirmwareLoadFailed);
         }

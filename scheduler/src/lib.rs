@@ -1022,6 +1022,31 @@ pub mod sleep_pumps {
     }
 }
 
+/// Bounded busy-poll that ticks `sleep_pumps` periodically so the
+/// FB cursor / serial drain / audio pump stay alive during driver
+/// reset/init busy-waits. Returns true if `done` returned true
+/// before `max_iters`, false on timeout.
+///
+/// The right primitive for "wait for an MMIO bit to flip" loops in
+/// hardware drivers: pre-fix every NIC + USB controller hand-
+/// rolled the spin loop, none ticked sleep_pumps, and a slow
+/// device init froze the visible system for the duration. Default
+/// every-4096-iters tick is invisible at MMIO read speeds and
+/// pump cost is trivial (a few atomic loads + indirect calls).
+#[inline]
+pub fn responsive_spin<F: FnMut() -> bool>(mut done: F, max_iters: u32) -> bool {
+    for i in 0..max_iters {
+        if done() {
+            return true;
+        }
+        if i & 0xFFF == 0 {
+            sleep_pumps::run();
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
 /// Drive a future to completion synchronously from outside the
 /// async executor. Polls the future; on Pending, runs the
 /// registered `sleep_pumps` (so cursor/FB/serial keep moving) and

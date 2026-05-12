@@ -174,14 +174,12 @@ impl Igc {
         unsafe {
             mmio.write32(REG_CTRL, ctrl | CTRL_RST);
         }
-        for _ in 0..1_000_000u32 {
-            // SAFETY: same.
-            let v = unsafe { mmio.read32(REG_CTRL) };
-            if v & CTRL_RST == 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+        // SAFETY: identity-mapped MMIO; ticks sleep_pumps so FB
+        // cursor / serial drain stay alive on a slow reset.
+        narf_scheduler::responsive_spin(
+            || unsafe { mmio.read32(REG_CTRL) } & CTRL_RST == 0,
+            1_000_000,
+        );
         // SAFETY: same.
         let after = unsafe { mmio.read32(REG_CTRL) };
         if after & CTRL_RST != 0 {
@@ -325,19 +323,14 @@ impl Igc {
         unsafe {
             self.mmio.write32(REG_TDT, next as u32);
         }
-        // Poll for Done bit.
-        let mut spins = 0u32;
-        loop {
+        // Poll for Done bit. responsive_spin ticks sleep_pumps.
+        let done = narf_scheduler::responsive_spin(
             // SAFETY: identity-mapped DMA.
-            let sta = unsafe { core::ptr::read_volatile((desc as *const u8).add(12)) };
-            if sta & TXD_STAT_DD != 0 {
-                break;
-            }
-            spins += 1;
-            if spins > 10_000_000 {
-                return Err(IgcError::ResetTimeout);
-            }
-            core::hint::spin_loop();
+            || unsafe { core::ptr::read_volatile((desc as *const u8).add(12)) } & TXD_STAT_DD != 0,
+            10_000_000,
+        );
+        if !done {
+            return Err(IgcError::ResetTimeout);
         }
         *tail = next;
         Ok(())

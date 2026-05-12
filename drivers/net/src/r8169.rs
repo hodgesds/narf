@@ -258,13 +258,14 @@ impl RtlNic {
         unsafe {
             mmio.write8(REG_CR, CR_RST);
         }
-        for _ in 0..1_000_000u32 {
-            // SAFETY: same.
-            if unsafe { mmio.read8(REG_CR) } & CR_RST == 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+        // Wait for hardware to clear CR.RST. Use the scheduler's
+        // responsive_spin so sleep_pumps tick during the wait —
+        // FB cursor / serial / audio stay alive on a slow reset.
+        narf_scheduler::responsive_spin(
+            // SAFETY: identity-mapped MMIO.
+            || unsafe { mmio.read8(REG_CR) } & CR_RST == 0,
+            1_000_000,
+        );
 
         // 2. Read MAC from IDR0..5. ID registers are byte-readable
         //    but only 4-byte writable, so we read four bytes + two
@@ -529,20 +530,17 @@ impl RtlNic {
         drop(head_g);
 
         // Poll for OWN → 0. With the ring serviced by NPQ this
-        // typically lands in microseconds; we cap the spin so a hung
+        // typically lands in microseconds; cap the spin so a hung
         // controller surfaces as TxTimeout instead of livelock.
-        let mut spins = 0u32;
-        loop {
+        // responsive_spin ticks sleep_pumps so the FB cursor /
+        // serial drain stay alive if NPQ is slow under load.
+        let owned = narf_scheduler::responsive_spin(
             // SAFETY: identity-mapped DMA ring.
-            let f = unsafe { core::ptr::read_volatile(desc_addr as *const u32) };
-            if f & TXD_OWN == 0 {
-                break;
-            }
-            spins += 1;
-            if spins > 10_000_000 {
-                return Err(NicError::TxTimeout);
-            }
-            core::hint::spin_loop();
+            || unsafe { core::ptr::read_volatile(desc_addr as *const u32) } & TXD_OWN == 0,
+            10_000_000,
+        );
+        if !owned {
+            return Err(NicError::TxTimeout);
         }
         // (no scratch drop — buffer is persistent in tx_pool)
         Ok(())
