@@ -164,6 +164,12 @@ pub struct AmlNode {
     /// the method body's first byte, plus the body length.
     /// `(0, 0)` for non-Method nodes.
     pub method_body: (usize, usize),
+    /// For `Method`: raw `MethodFlags` byte (ACPI 6.5 §20.2.5.2).
+    /// Bits[2:0] = ArgCount, bit 3 = SerializeFlag, bits[7:4] =
+    /// SyncLevel. The evaluator reads bits[2:0] to know how many
+    /// TermArgs to consume from the byte stream when this method
+    /// is invoked. 0 for non-Method nodes.
+    pub method_flags: u8,
 }
 
 /// Backing storage. We collect every parsed node into one Vec
@@ -871,6 +877,7 @@ fn parse_term_list_inner(
                     kind: NodeKind::Scope,
                     value: None,
                     method_body: (0, 0),
+                    method_flags: 0,
                 });
                 *count += 1;
                 parse_term_list(p, &path, count, pkg_end, base)?;
@@ -955,6 +962,7 @@ fn parse_term_list_inner(
                     kind: NodeKind::Name,
                     value: v,
                     method_body: (0, 0),
+                    method_flags: 0,
                 });
                 *count += 1;
             }
@@ -966,7 +974,7 @@ fn parse_term_list_inner(
                 let name = read_name_string(p, parent)?;
                 let path = full_path(name, parent);
                 // 1 byte MethodFlags follows the name.
-                let _flags = p.read_u8()?;
+                let flags = p.read_u8()?;
                 let body_off = base + p.pos;
                 let body_len = pkg_end.saturating_sub(p.pos);
                 push_node(AmlNode {
@@ -974,6 +982,7 @@ fn parse_term_list_inner(
                     kind: NodeKind::Method,
                     value: None,
                     method_body: (body_off, body_len),
+                    method_flags: flags,
                 });
                 *count += 1;
                 p.pos = pkg_end;
@@ -993,6 +1002,7 @@ fn parse_term_list_inner(
                             kind: NodeKind::Device,
                             value: None,
                             method_body: (0, 0),
+                    method_flags: 0,
                         });
                         *count += 1;
                         parse_term_list(p, &path, count, pkg_end, base)?;
@@ -1013,6 +1023,7 @@ fn parse_term_list_inner(
                             kind: NodeKind::Processor,
                             value: None,
                             method_body: (0, 0),
+                    method_flags: 0,
                         });
                         *count += 1;
                         parse_term_list(p, &path, count, pkg_end, base)?;
@@ -1033,6 +1044,7 @@ fn parse_term_list_inner(
                             kind: NodeKind::PowerResource,
                             value: None,
                             method_body: (0, 0),
+                    method_flags: 0,
                         });
                         *count += 1;
                         parse_term_list(p, &path, count, pkg_end, base)?;
@@ -1051,6 +1063,7 @@ fn parse_term_list_inner(
                             kind: NodeKind::ThermalZone,
                             value: None,
                             method_body: (0, 0),
+                    method_flags: 0,
                         });
                         *count += 1;
                         parse_term_list(p, &path, count, pkg_end, base)?;
@@ -1068,6 +1081,7 @@ fn parse_term_list_inner(
                             kind: NodeKind::Mutex,
                             value: None,
                             method_body: (0, 0),
+                    method_flags: 0,
                         });
                         *count += 1;
                     }
@@ -1079,6 +1093,7 @@ fn parse_term_list_inner(
                             kind: NodeKind::Event,
                             value: None,
                             method_body: (0, 0),
+                    method_flags: 0,
                         });
                         *count += 1;
                     }
@@ -1091,6 +1106,7 @@ fn parse_term_list_inner(
                             kind: NodeKind::OpRegion,
                             value: None,
                             method_body: (0, 0),
+                    method_flags: 0,
                         });
                         *count += 1;
                         // Try to decode RegionSpace + TermArg×2 and register
@@ -1113,6 +1129,7 @@ fn parse_term_list_inner(
                             kind: NodeKind::Field,
                             value: None,
                             method_body: (0, 0),
+                    method_flags: 0,
                         });
                         *count += 1;
                         // Parse individual field entries and register them.
@@ -1128,6 +1145,7 @@ fn parse_term_list_inner(
                             kind: NodeKind::Field,
                             value: None,
                             method_body: (0, 0),
+                    method_flags: 0,
                         });
                         *count += 1;
                         p.pos = pkg_end;

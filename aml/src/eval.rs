@@ -608,10 +608,25 @@ fn eval_term(
             // Put byte back so read_name_string can consume it.
             *cur -= 1;
             let name = read_name_string(buf, cur, "\\")?;
-            // If it resolves to a namespace node, it's either a method
-            // invocation or a name access used as a statement.  We treat
-            // both as a no-op at statement level (the value is discarded).
-            let _ = name;
+            // Method invocation as statement (audit #1). Even
+            // though the value is discarded at statement level we
+            // MUST advance the cursor past the right number of
+            // TermArg bytes; otherwise subsequent decoding goes
+            // off the rails. Falls through silently for non-
+            // Method names.
+            if let Some(node) =
+                crate::find_node(&name).or_else(|| crate::find_node_by_suffix(&name))
+            {
+                if node.kind == crate::NodeKind::Method {
+                    let argc = (node.method_flags & 0x07) as usize;
+                    let mut args: alloc::vec::Vec<Value> =
+                        alloc::vec::Vec::with_capacity(argc);
+                    for _ in 0..argc {
+                        args.push(eval_term_arg(buf, cur, state)?);
+                    }
+                    let _ = evaluate_method(&node.path, &args);
+                }
+            }
         }
 
         // ── Unknown: skip one byte ─────────────────────────────────────────
@@ -977,19 +992,45 @@ fn eval_term_arg(buf: &[u8], cur: &mut usize, state: &mut EvalState) -> Result<V
             let resolved = crate::find_node(&name)
                 .or_else(|| crate::find_node_by_suffix(&name));
             match resolved {
-                Some(node) => match node.value {
-                    Some(NameValue::Integer(v)) => Value::Integer(v),
-                    Some(NameValue::String(s)) => Value::String(s),
-                    Some(NameValue::Unparsed { offset, length }) if length > 0 => {
-                        let mut body = alloc::vec![0u8; length];
-                        let n = crate::copy_aml_bytes(offset, &mut body);
-                        if n < length {
-                            Value::Integer(0)
-                        } else {
-                            decode_value(&body).unwrap_or(Value::Integer(0))
+                Some(node) => match node.kind {
+                    // Method invocation as TermArg (audit #1, the
+                    // headline blocker for Renoir _CRS / _DSM
+                    // chains). Read N TermArgs from the byte
+                    // stream where N = method_flags & 0x07
+                    // (ArgCount), recursively call evaluate_method
+                    // with those args, return its value. Pre-fix
+                    // this branch resolved the Method node to its
+                    // value (None → Integer(0)) and silently
+                    // dropped the call — every helper-method
+                    // detour in DSDT/SSDT returned 0.
+                    crate::NodeKind::Method => {
+                        let argc = (node.method_flags & 0x07) as usize;
+                        let mut args: alloc::vec::Vec<Value> =
+                            alloc::vec::Vec::with_capacity(argc);
+                        for _ in 0..argc {
+                            args.push(eval_term_arg(buf, cur, state)?);
                         }
+                        // Recursive evaluate_method. ACPI 6.5
+                        // §5.7.5 specifies a max recursion depth
+                        // of "implementation defined" — we lean
+                        // on the kernel stack guard (~64 KiB)
+                        // rather than imposing a numeric cap.
+                        evaluate_method(&node.path, &args).unwrap_or(Value::Integer(0))
                     }
-                    _ => Value::Integer(0),
+                    _ => match node.value {
+                        Some(NameValue::Integer(v)) => Value::Integer(v),
+                        Some(NameValue::String(s)) => Value::String(s),
+                        Some(NameValue::Unparsed { offset, length }) if length > 0 => {
+                            let mut body = alloc::vec![0u8; length];
+                            let n = crate::copy_aml_bytes(offset, &mut body);
+                            if n < length {
+                                Value::Integer(0)
+                            } else {
+                                decode_value(&body).unwrap_or(Value::Integer(0))
+                            }
+                        }
+                        _ => Value::Integer(0),
+                    },
                 },
                 None => Value::Integer(0),
             }
