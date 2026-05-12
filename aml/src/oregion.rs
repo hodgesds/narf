@@ -599,7 +599,34 @@ pub(crate) fn parse_field_body(
     // Region name that this Field references.
     let region_name = read_name_string(p, parent)?;
     let region_path = full_path(region_name, parent);
+    parse_field_list(p, parent, &region_path, pkg_end)
+}
 
+/// Parse the FieldFlags + FieldList portion of a Field /
+/// IndexField / BankField body. Caller has already consumed any
+/// preceding NameStrings + register references and points the
+/// cursor at the FieldFlags byte. `region_path` is the synthetic
+/// "addresses against this" region for the registered field
+/// entries — for plain Field this is the OpRegion path, for
+/// IndexField it's the data-register path.
+pub(crate) fn parse_indirect_field_body(
+    p: &mut Parser<'_>,
+    parent: &str,
+    pkg_end: usize,
+) -> Result<(), AmlError> {
+    // No region name to read — caller already consumed the
+    // appropriate prefix. Use an empty path; field entries get
+    // registered under `parent` so namespace lookups work.
+    let region_path = String::from("\\__INDIRECT__");
+    parse_field_list(p, parent, &region_path, pkg_end)
+}
+
+fn parse_field_list(
+    p: &mut Parser<'_>,
+    parent: &str,
+    region_path: &str,
+    pkg_end: usize,
+) -> Result<(), AmlError> {
     // FieldFlags: bits 0..=3 = access type, bit 4 = lock rule,
     //             bits 5..=6 = update rule.
     let flags = p.read_u8()?;
@@ -647,7 +674,7 @@ pub(crate) fn parse_field_body(
 
                 register_field(FieldInfo {
                     path: field_path,
-                    region_path: region_path.clone(),
+                    region_path: alloc::string::String::from(region_path),
                     bit_offset: bit_cursor,
                     bit_length: bit_len,
                     access_kind,
