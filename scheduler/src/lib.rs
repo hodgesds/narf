@@ -1068,6 +1068,19 @@ pub fn block_on_spin<F: Future>(fut: F) -> F::Output {
 fn block_on_inner<F: Future>(mut fut: F, allow_halt: bool) -> F::Output {
     use core::pin::Pin;
     use core::task::{Context, Poll};
+    // Defensive: refuse to run from inside an executor poll. The
+    // executor publishes CURRENT_TASK before polling and clears
+    // after; if it's non-zero we're inside someone else's poll
+    // body, and recursing into block_on would deadlock the
+    // executor's polling loop. The same panic-on-misuse pattern
+    // as `init()`'s double-call check.
+    if CURRENT_TASK.load(Ordering::Acquire) != 0 {
+        panic!(
+            "narf_scheduler::block_on called from inside executor poll \
+             (CURRENT_TASK != 0) — would deadlock the polling loop. \
+             Use yield_now().await or restructure the caller as async."
+        );
+    }
     // Pin the future on the stack. Sound because `fut` is owned
     // by this function's stack frame and Rust prevents moving it
     // out from under our `&mut` for the function's lifetime.

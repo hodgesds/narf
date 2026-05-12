@@ -533,3 +533,49 @@ fn smoke_sleep_future_waits() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("scheduler", smoke_sleep_future_waits);
+
+// ── block_on / block_on_spin smokes ────────────────────────────────
+
+fn smoke_block_on_drives_ready_future() -> TestResult {
+    // Future immediately Ready: block_on returns its value after a
+    // single poll.
+    let v = crate::block_on(async { 42u32 });
+    if v == 42 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("block_on didn't return the future's value")
+    }
+}
+kernel_test_in!("scheduler", smoke_block_on_drives_ready_future);
+
+fn smoke_block_on_drives_yield_chain() -> TestResult {
+    // Future with two yield_now's: block_on must re-poll on each
+    // self-wake. Drives the awake-flag-reset + re-poll path.
+    let v = crate::block_on(async {
+        crate::yield_now().await;
+        crate::yield_now().await;
+        7u32
+    });
+    if v == 7 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("block_on lost the value after yield_now chain")
+    }
+}
+kernel_test_in!("scheduler", smoke_block_on_drives_yield_chain);
+
+fn smoke_block_on_spin_drives_yield_chain() -> TestResult {
+    // block_on_spin doesn't halt — safe to call when IRQs are
+    // disabled. Same shape as the cooperative variant; if the
+    // spin path were broken we'd hang.
+    let v = crate::block_on_spin(async {
+        crate::yield_now().await;
+        99u32
+    });
+    if v == 99 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("block_on_spin didn't return value")
+    }
+}
+kernel_test_in!("scheduler", smoke_block_on_spin_drives_yield_chain);

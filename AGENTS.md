@@ -137,6 +137,25 @@ while held and `halt_until_irq` waits for one. Migration patterns
 should drop the lock, capture any owned data (clone an `Arc`, copy a
 phys address), then `block_on(...)`. Use `block_on_spin` if you can't.
 
+**Same rule applies inside the awaited future.** Async driver
+functions that `block_on` is supposed to bridge to (e.g. NVMe's
+`submit_io_irq_async`) currently take `&mut Controller` via an
+`IrqSafeSpinLock` guard for their *entire* duration — which means
+the IRQ wake they're waiting for can never fire. The migration is
+**not** "wrap existing sync code in block_on"; it's:
+
+1. Convert per-driver lock from `IrqSafeSpinLock` to a regular
+   `Mutex` (safe to hold across await), OR
+2. Restructure the async path to release the lock before the
+   `.await` point and re-acquire after.
+
+Until that lands, `block_on(driver_async_fn(...))` will deadlock on
+real HW. `block_on_spin` is fine because it doesn't disable IRQs.
+
+`block_on` and `block_on_spin` both **panic on call from inside an
+executor poll** (`CURRENT_TASK != 0`) — caught at the call site
+instead of becoming a silent re-entrant deadlock.
+
 **Why this exists:** the audit (commit `de5dabc`) found drivers
 re-implementing 10M-iteration spin loops on MMIO registers in
 NVMe / AHCI / e1000 / r8169 / ixgbe. Each spin froze the cursor /
