@@ -166,6 +166,29 @@ pub fn acquire(path: &str, timeout_ms: u16) -> Result<bool, AmlError> {
     const MAX_ITERS: u32 = 5_000_000;
 
     loop {
+        // Audit #10: recursive ownership. Every AML evaluation
+        // uses the same KERNEL_OWNER, so a method that calls
+        // another method which both Acquire the same Mutex
+        // shouldn't deadlock — increment owner count instead.
+        // Decrement on Release; only flip locked back to 0 when
+        // the count drops to zero.
+        let recursive = {
+            let g = MUTEXES.lock();
+            if let Some(m) = g.iter().find(|m| m.path == path) {
+                if m.locked.load(Ordering::Acquire) == KERNEL_OWNER {
+                    m.owner.fetch_add(1, Ordering::Relaxed);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                return Err(AmlError::Truncated);
+            }
+        };
+        if recursive {
+            return Ok(true);
+        }
+
         // Try to CAS 0 → KERNEL_OWNER.
         let result = {
             let g = MUTEXES.lock();
@@ -179,7 +202,7 @@ pub fn acquire(path: &str, timeout_ms: u16) -> Result<bool, AmlError> {
         };
 
         if result {
-            // Set owner count to 1.
+            // Set owner count to 1 (first-time acquire).
             let g = MUTEXES.lock();
             if let Some(m) = g.iter().find(|m| m.path == path) {
                 m.owner.store(1, Ordering::Relaxed);
@@ -198,13 +221,18 @@ pub fn acquire(path: &str, timeout_ms: u16) -> Result<bool, AmlError> {
     }
 }
 
-/// Release the named Mutex.
+/// Release the named Mutex. Decrements the recursive owner
+/// count; only releases the lock when it reaches 0 (audit #10).
 pub fn release(path: &str) -> Result<(), AmlError> {
     ensure_mutex(path)?;
     let g = MUTEXES.lock();
     if let Some(m) = g.iter().find(|m| m.path == path) {
-        m.owner.store(0, Ordering::Relaxed);
-        m.locked.store(0, Ordering::Release);
+        // Decrement; release lock only when count hits 0.
+        let prev = m.owner.fetch_sub(1, Ordering::Relaxed);
+        if prev <= 1 {
+            m.owner.store(0, Ordering::Relaxed);
+            m.locked.store(0, Ordering::Release);
+        }
         Ok(())
     } else {
         Err(AmlError::Truncated)
