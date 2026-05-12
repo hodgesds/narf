@@ -22,6 +22,16 @@ const STRING_PREFIX: u8 = 0x0D;
 const QWORD_PREFIX: u8 = 0x0E;
 const BUFFER_OP: u8 = 0x11;
 const PACKAGE_OP: u8 = 0x12;
+// Audit #8 — reference / index / size opcodes that real DSDT
+// _PRT and _DSM bodies routinely use. ACPI 6.5 §20.2.5.4 +
+// §19.6.34/.65/.122/.111/.32/.85.
+const REF_OF_OP: u8 = 0x71;
+const DEREF_OF_OP: u8 = 0x83;
+const SIZE_OF_OP: u8 = 0x87;
+const INDEX_OP: u8 = 0x88;
+const MID_OP: u8 = 0x9E;
+const OBJECT_TYPE_OP: u8 = 0x8E;
+const COND_REF_OF_PREFIX: u8 = 0x12; // Extended (0x5B 0x12) — handled in EXT path
 const CONTINUE_OP: u8 = 0x9F;
 const STORE_OP: u8 = 0x70;
 const CONCAT_OP: u8 = 0x73;
@@ -920,6 +930,89 @@ fn eval_term_arg(buf: &[u8], cur: &mut usize, state: &mut EvalState) -> Result<V
             let r = concatenate(&a, &b);
             write_target(buf, cur, r.clone(), state)?;
             r
+        }
+
+        // Audit #8 — reference / index / size opcodes.
+        INDEX_OP => {
+            // Index(src, idx, target). For Buffer / String returns
+            // the byte at idx; for Package returns the indexed
+            // Value. We don't model real ACPI references, so the
+            // value is what gets stored — DerefOf becomes
+            // identity.
+            let src = eval_term_arg(buf, cur, state)?;
+            let idx = eval_term_arg(buf, cur, state)?.as_integer() as usize;
+            let r = match &src {
+                Value::Buffer(b) => Value::Integer(b.get(idx).copied().unwrap_or(0) as u64),
+                Value::String(s) => {
+                    Value::Integer(s.as_bytes().get(idx).copied().unwrap_or(0) as u64)
+                }
+                Value::Package(p) => p.get(idx).cloned().unwrap_or(Value::Integer(0)),
+                _ => Value::Integer(0),
+            };
+            write_target(buf, cur, r.clone(), state)?;
+            r
+        }
+        DEREF_OF_OP => {
+            // DerefOf(ref). We model references as plain Values
+            // already, so this is identity. Real ACPI semantics
+            // require following a Reference object; minimal cost
+            // for the common DerefOf(Index(...)) pattern that
+            // _PRT walking uses.
+            eval_term_arg(buf, cur, state)?
+        }
+        SIZE_OF_OP => {
+            // SizeOf(obj). Buffer → byte count; String → char
+            // count (excludes NUL); Package → element count.
+            let v = eval_term_arg(buf, cur, state)?;
+            Value::Integer(match v {
+                Value::Buffer(b) => b.len() as u64,
+                Value::String(s) => s.len() as u64,
+                Value::Package(p) => p.len() as u64,
+                _ => 0,
+            })
+        }
+        MID_OP => {
+            // Mid(src, idx, len, target). Returns substring /
+            // subbuffer of `src` starting at `idx` for `len`
+            // bytes, clamped to `src`'s end.
+            let src = eval_term_arg(buf, cur, state)?;
+            let idx = eval_term_arg(buf, cur, state)?.as_integer() as usize;
+            let len = eval_term_arg(buf, cur, state)?.as_integer() as usize;
+            let r = match &src {
+                Value::Buffer(b) => {
+                    let start = idx.min(b.len());
+                    let end = (start + len).min(b.len());
+                    Value::Buffer(b[start..end].to_vec())
+                }
+                Value::String(s) => {
+                    let bytes = s.as_bytes();
+                    let start = idx.min(bytes.len());
+                    let end = (start + len).min(bytes.len());
+                    Value::String(
+                        alloc::string::String::from_utf8_lossy(&bytes[start..end]).into_owned(),
+                    )
+                }
+                _ => Value::Integer(0),
+            };
+            write_target(buf, cur, r.clone(), state)?;
+            r
+        }
+        OBJECT_TYPE_OP => {
+            // ObjectType(obj) — ACPI 6.5 §19.6.93 returns the
+            // type code: 0=Uninitialised, 1=Integer, 2=String,
+            // 3=Buffer, 4=Package, ...
+            let v = eval_term_arg(buf, cur, state)?;
+            Value::Integer(match v {
+                Value::Integer(_) => 1,
+                Value::String(_) => 2,
+                Value::Buffer(_) => 3,
+                Value::Package(_) => 4,
+            })
+        }
+        REF_OF_OP => {
+            // RefOf(name). We don't model real refs so return
+            // the looked-up value (identity with DerefOf).
+            eval_term_arg(buf, cur, state)?
         }
 
         // Logic
