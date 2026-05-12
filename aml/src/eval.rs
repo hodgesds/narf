@@ -128,6 +128,20 @@ impl EvalState {
 /// the caller-supplied arguments, walks the TermList, and returns the value
 /// produced by `Return(...)` or `Value::Integer(0)` if the body falls through.
 pub fn evaluate_method(path: &str, args: &[Value]) -> Result<Value, AmlError> {
+    // 1a. Predefined methods we handle without consulting the AML
+    //     namespace. `_OSI(string)` (ACPI 6.5 §5.7.2) is the
+    //     compatibility shim DSDTs gate behaviour on — touchpad
+    //     firmware in particular keys on _OSI("Windows 2020") to
+    //     enable HID-over-I2C precision-touchpad mode. Without an
+    //     answer the namespace's `_OSI` method (if any) returns
+    //     None / 0 and the device falls back to a legacy code path
+    //     or NotPresent. We claim the same set Linux's
+    //     drivers/acpi/osi.c claims by default plus Linux="true"
+    //     (which Linux disables but for our bring-up target
+    //     compatibility wins over historical caution).
+    if path == "\\_OSI" || path.ends_with("._OSI") {
+        return Ok(predefined_osi(args));
+    }
     // 1. Look up the node.
     let node: AmlNode = crate::find_node(path).ok_or(AmlError::MethodNotFound)?;
     if node.kind != NodeKind::Method {
@@ -152,6 +166,62 @@ pub fn evaluate_method(path: &str, args: &[Value]) -> Result<Value, AmlError> {
         Signal::Return(v) => Ok(v),
         _ => Ok(Value::Integer(0)),
     }
+}
+
+/// `_OSI(string)` predefined method (ACPI 6.5 §5.7.2). Returns
+/// `Ones` (u64::MAX) when we claim to support the indicated OS /
+/// extension, `Zero` otherwise.
+///
+/// Coverage matches Linux's `acpi_osi_handler` defaults, plus we
+/// claim "Linux" = true. The Renoir-touchpad-relevant ones are
+/// "Windows 2015"+ (precision-touchpad capable) and "Linux"
+/// (some ASUS firmware exposes the proper HID descriptor only
+/// when this is true).
+fn predefined_osi(args: &[Value]) -> Value {
+    const TRUE: Value = Value::Integer(u64::MAX);
+    const FALSE: Value = Value::Integer(0);
+    let s = match args.first() {
+        Some(Value::String(s)) => s.as_str(),
+        _ => return FALSE,
+    };
+    // ACPI 5.0+ explicitly-supported strings. Add new "Windows
+    // YYYY" entries here as new firmware needs them.
+    matches!(
+        s,
+        "Windows 2000"
+            | "Windows 2001"
+            | "Windows 2001 SP1"
+            | "Windows 2001.1"
+            | "Windows 2001 SP2"
+            | "Windows 2001.1 SP1"
+            | "Windows 2006"
+            | "Windows 2006 SP1"
+            | "Windows 2006 SP2"
+            | "Windows 2006.1"
+            | "Windows 2009"
+            | "Windows 2012"
+            | "Windows 2013"
+            | "Windows 2015"
+            | "Windows 2016"
+            | "Windows 2017"
+            | "Windows 2017.2"
+            | "Windows 2018"
+            | "Windows 2018.2"
+            | "Windows 2019"
+            | "Windows 2020"
+            | "Windows 2020.2"
+            | "Windows 2021"
+            | "Windows 2022"
+            | "Linux"
+            | "Module Device"
+            | "Processor Device"
+            | "3.0 Thermal Model"
+            | "3.0 _SCP Extensions"
+            | "Extended Address Space Descriptor"
+            | "Processor Aggregator Device"
+    )
+    .then(|| TRUE)
+    .unwrap_or(FALSE)
 }
 
 /// Evaluate `<device_path>._DSM(uuid, revision, function, args)`.
