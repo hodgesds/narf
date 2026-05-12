@@ -209,17 +209,14 @@ impl Sdhci {
         unsafe {
             me.mmio.write8(REG_SOFT_RESET, SRST_ALL);
         }
-        for _ in 0..1_000_000u32 {
-            // SAFETY: same.
-            let v = unsafe { me.mmio.read8(REG_SOFT_RESET) };
-            if v & SRST_ALL == 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
-        // SAFETY: same.
-        let post = unsafe { me.mmio.read8(REG_SOFT_RESET) };
-        if post & SRST_ALL != 0 {
+        // responsive_spin ticks sleep_pumps every ~4096 iters so the
+        // FB cursor / serial drain stay alive during slow reset.
+        let done = narf_scheduler::responsive_spin(
+            // SAFETY: identity-mapped MMIO.
+            || unsafe { me.mmio.read8(REG_SOFT_RESET) } & SRST_ALL == 0,
+            1_000_000,
+        );
+        if !done {
             return Err(SdhciError::ResetTimeout);
         }
 
@@ -246,14 +243,14 @@ impl Sdhci {
         unsafe {
             me.mmio.write16(REG_CLOCK_CONTROL, clk);
         }
-        for _ in 0..1_000_000u32 {
-            // SAFETY: same.
-            let v = unsafe { me.mmio.read16(REG_CLOCK_CONTROL) };
-            if v & CLK_INTERNAL_STABLE != 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+        // responsive_spin keeps cursor/FB/serial alive while waiting
+        // for the internal clock to stabilise. Timeout ignored —
+        // original code fell through to SD_EN regardless.
+        let _ = narf_scheduler::responsive_spin(
+            // SAFETY: identity-mapped MMIO.
+            || unsafe { me.mmio.read16(REG_CLOCK_CONTROL) } & CLK_INTERNAL_STABLE != 0,
+            1_000_000,
+        );
         // SAFETY: same.
         let v = unsafe { me.mmio.read16(REG_CLOCK_CONTROL) };
         // SAFETY: same.
@@ -291,20 +288,23 @@ impl Sdhci {
     /// Wait for both CMD_INHIBIT and (when issuing a data-bearing
     /// command) DAT_INHIBIT to clear.
     fn wait_idle(&self, with_data: bool) -> Result<(), SdhciError> {
-        for _ in 0..10_000_000u32 {
+        let mask = if with_data {
+            PSTATE_CMD_INHIBIT | PSTATE_DAT_INHIBIT
+        } else {
+            PSTATE_CMD_INHIBIT
+        };
+        // responsive_spin keeps cursor/FB/serial alive on a stuck
+        // controller.
+        let done = narf_scheduler::responsive_spin(
             // SAFETY: identity-mapped MMIO.
-            let p = unsafe { self.mmio.read32(REG_PRESENT_STATE) };
-            let mask = if with_data {
-                PSTATE_CMD_INHIBIT | PSTATE_DAT_INHIBIT
-            } else {
-                PSTATE_CMD_INHIBIT
-            };
-            if p & mask == 0 {
-                return Ok(());
-            }
-            core::hint::spin_loop();
+            || unsafe { self.mmio.read32(REG_PRESENT_STATE) } & mask == 0,
+            10_000_000,
+        );
+        if done {
+            Ok(())
+        } else {
+            Err(SdhciError::CmdInhibitTimeout)
         }
-        Err(SdhciError::CmdInhibitTimeout)
     }
 
     /// Issue a command + poll until cmd-complete.
@@ -343,24 +343,22 @@ impl Sdhci {
             self.mmio
                 .write16(REG_COMMAND, make_cmd(idx, resp_kind, has_data));
         }
-        // Poll for command-complete (or error).
-        let mut spins = 0u32;
-        loop {
+        // Poll for command-complete (or error). responsive_spin
+        // ticks sleep_pumps so cursor/FB/serial stay alive.
+        let done = narf_scheduler::responsive_spin(
+            // SAFETY: identity-mapped MMIO.
+            || unsafe { self.mmio.read16(REG_NORMAL_INT_STS) } & (NIS_CMD_COMPLETE | NIS_ERROR) != 0,
+            10_000_000,
+        );
+        if !done {
+            return Err(SdhciError::CmdTimeout);
+        }
+        // SAFETY: identity-mapped MMIO.
+        let nis = unsafe { self.mmio.read16(REG_NORMAL_INT_STS) };
+        if nis & NIS_ERROR != 0 {
             // SAFETY: same.
-            let nis = unsafe { self.mmio.read16(REG_NORMAL_INT_STS) };
-            if nis & NIS_ERROR != 0 {
-                // SAFETY: same.
-                let eis = unsafe { self.mmio.read16(REG_ERROR_INT_STS) };
-                return Err(SdhciError::DeviceError(eis));
-            }
-            if nis & NIS_CMD_COMPLETE != 0 {
-                break;
-            }
-            spins += 1;
-            if spins > 10_000_000 {
-                return Err(SdhciError::CmdTimeout);
-            }
-            core::hint::spin_loop();
+            let eis = unsafe { self.mmio.read16(REG_ERROR_INT_STS) };
+            return Err(SdhciError::DeviceError(eis));
         }
         // Clear cmd-complete; preserve other bits for the data path.
         // SAFETY: same.
@@ -458,24 +456,22 @@ impl Sdhci {
         let _ = self.cmd(17, arg, RESP_48, true, tm, 512, 1)?;
 
         // Wait for buffer-read-ready, then drain 512 / 4 = 128
-        // u32 words from the buffer port.
-        let mut spins = 0u32;
-        loop {
+        // u32 words from the buffer port. responsive_spin keeps the
+        // FB cursor / serial drain alive on a slow controller.
+        let done = narf_scheduler::responsive_spin(
             // SAFETY: identity-mapped MMIO.
-            let nis = unsafe { self.mmio.read16(REG_NORMAL_INT_STS) };
-            if nis & NIS_ERROR != 0 {
-                // SAFETY: same.
-                let eis = unsafe { self.mmio.read16(REG_ERROR_INT_STS) };
-                return Err(SdhciError::DeviceError(eis));
-            }
-            if nis & NIS_BUFFER_READ_READY != 0 {
-                break;
-            }
-            spins += 1;
-            if spins > 10_000_000 {
-                return Err(SdhciError::PioStall);
-            }
-            core::hint::spin_loop();
+            || unsafe { self.mmio.read16(REG_NORMAL_INT_STS) } & (NIS_BUFFER_READ_READY | NIS_ERROR) != 0,
+            10_000_000,
+        );
+        if !done {
+            return Err(SdhciError::PioStall);
+        }
+        // SAFETY: identity-mapped MMIO.
+        let nis = unsafe { self.mmio.read16(REG_NORMAL_INT_STS) };
+        if nis & NIS_ERROR != 0 {
+            // SAFETY: same.
+            let eis = unsafe { self.mmio.read16(REG_ERROR_INT_STS) };
+            return Err(SdhciError::DeviceError(eis));
         }
         // SAFETY: identity-mapped MMIO.
         unsafe {
@@ -488,18 +484,13 @@ impl Sdhci {
             out[i * 4..i * 4 + 4].copy_from_slice(&bytes);
         }
         // Wait for transfer-complete.
-        let mut spins = 0u32;
-        loop {
-            // SAFETY: same.
-            let nis = unsafe { self.mmio.read16(REG_NORMAL_INT_STS) };
-            if nis & NIS_TRANSFER_COMPLETE != 0 {
-                break;
-            }
-            spins += 1;
-            if spins > 10_000_000 {
-                return Err(SdhciError::PioStall);
-            }
-            core::hint::spin_loop();
+        let done = narf_scheduler::responsive_spin(
+            // SAFETY: identity-mapped MMIO.
+            || unsafe { self.mmio.read16(REG_NORMAL_INT_STS) } & NIS_TRANSFER_COMPLETE != 0,
+            10_000_000,
+        );
+        if !done {
+            return Err(SdhciError::PioStall);
         }
         // SAFETY: same.
         unsafe {
@@ -515,23 +506,21 @@ impl Sdhci {
         let _ = self.cmd(24, arg, RESP_48, true, /*tm*/ 0, 512, 1)?;
 
         // Wait for buffer-write-ready, push 128 u32 words.
-        let mut spins = 0u32;
-        loop {
+        // responsive_spin ticks sleep_pumps so cursor/FB stay alive.
+        let done = narf_scheduler::responsive_spin(
             // SAFETY: identity-mapped MMIO.
-            let nis = unsafe { self.mmio.read16(REG_NORMAL_INT_STS) };
-            if nis & NIS_ERROR != 0 {
-                // SAFETY: same.
-                let eis = unsafe { self.mmio.read16(REG_ERROR_INT_STS) };
-                return Err(SdhciError::DeviceError(eis));
-            }
-            if nis & NIS_BUFFER_WRITE_READY != 0 {
-                break;
-            }
-            spins += 1;
-            if spins > 10_000_000 {
-                return Err(SdhciError::PioStall);
-            }
-            core::hint::spin_loop();
+            || unsafe { self.mmio.read16(REG_NORMAL_INT_STS) } & (NIS_BUFFER_WRITE_READY | NIS_ERROR) != 0,
+            10_000_000,
+        );
+        if !done {
+            return Err(SdhciError::PioStall);
+        }
+        // SAFETY: identity-mapped MMIO.
+        let nis = unsafe { self.mmio.read16(REG_NORMAL_INT_STS) };
+        if nis & NIS_ERROR != 0 {
+            // SAFETY: same.
+            let eis = unsafe { self.mmio.read16(REG_ERROR_INT_STS) };
+            return Err(SdhciError::DeviceError(eis));
         }
         // SAFETY: identity-mapped MMIO.
         unsafe {
@@ -551,18 +540,13 @@ impl Sdhci {
                 self.mmio.write32(REG_BUFFER_PORT, w);
             }
         }
-        let mut spins = 0u32;
-        loop {
-            // SAFETY: same.
-            let nis = unsafe { self.mmio.read16(REG_NORMAL_INT_STS) };
-            if nis & NIS_TRANSFER_COMPLETE != 0 {
-                break;
-            }
-            spins += 1;
-            if spins > 10_000_000 {
-                return Err(SdhciError::PioStall);
-            }
-            core::hint::spin_loop();
+        let done = narf_scheduler::responsive_spin(
+            // SAFETY: identity-mapped MMIO.
+            || unsafe { self.mmio.read16(REG_NORMAL_INT_STS) } & NIS_TRANSFER_COMPLETE != 0,
+            10_000_000,
+        );
+        if !done {
+            return Err(SdhciError::PioStall);
         }
         // SAFETY: same.
         unsafe {

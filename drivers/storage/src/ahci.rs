@@ -243,17 +243,14 @@ impl Ahci {
         unsafe {
             mmio.write32(HBA_GHC, GHC_AE | GHC_HR);
         }
-        for _ in 0..1_000_000u32 {
-            // SAFETY: same.
-            let v = unsafe { mmio.read32(HBA_GHC) };
-            if v & GHC_HR == 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
-        // SAFETY: same.
-        let ghc_after = unsafe { mmio.read32(HBA_GHC) };
-        if ghc_after & GHC_HR != 0 {
+        // responsive_spin ticks sleep_pumps so cursor/FB stay alive
+        // during HBA reset.
+        let done = narf_scheduler::responsive_spin(
+            // SAFETY: identity-mapped MMIO.
+            || unsafe { mmio.read32(HBA_GHC) } & GHC_HR == 0,
+            1_000_000,
+        );
+        if !done {
             return Err(AhciError::ResetTimeout);
         }
         // Re-enable AHCI mode after the reset (HR clears AE on some
@@ -398,20 +395,27 @@ impl Ahci {
     /// `port_idx < 32`; the slots in `bit` have already been issued.
     pub unsafe fn issue_and_wait_sync(&self, port_idx: u8, bit: u32) -> Result<(), AhciError> {
         let off = PORT_BASE_OFF + (port_idx as u64) * PORT_STRIDE;
-        for _ in 0..10_000_000u32 {
-            // SAFETY: identity-mapped MMIO.
-            let ci = unsafe { self.mmio.read32(off + PORT_CI) };
-            // SAFETY: same.
-            let tfd = unsafe { self.mmio.read32(off + 0x20) };
-            if tfd & 0x01 != 0 {
-                return Err(AhciError::ResetTimeout);
-            }
-            if ci & bit == 0 {
-                return Ok(());
-            }
-            core::hint::spin_loop();
+        // responsive_spin keeps cursor/FB alive while waiting for
+        // the controller to clear CI; bail early on TFD.ERR.
+        let mut errored = false;
+        let done = narf_scheduler::responsive_spin(
+            || {
+                // SAFETY: identity-mapped MMIO.
+                let ci = unsafe { self.mmio.read32(off + PORT_CI) };
+                // SAFETY: same.
+                let tfd = unsafe { self.mmio.read32(off + 0x20) };
+                if tfd & 0x01 != 0 {
+                    errored = true;
+                    return true;
+                }
+                ci & bit == 0
+            },
+            10_000_000,
+        );
+        if errored || !done {
+            return Err(AhciError::ResetTimeout);
         }
-        Err(AhciError::ResetTimeout)
+        Ok(())
     }
 
     /// Stop a port — clears PORT_CMD.ST + PORT_CMD.FRE and waits for
@@ -427,15 +431,17 @@ impl Ahci {
         unsafe {
             self.mmio.write32(off + PORT_CMD, cmd & !(CMD_ST | CMD_FRE));
         }
-        for _ in 0..1_000_000u32 {
-            // SAFETY: same.
-            let v = unsafe { self.mmio.read32(off + PORT_CMD) };
-            if v & (CMD_FR | CMD_CR) == 0 {
-                return Ok(());
-            }
-            core::hint::spin_loop();
+        // responsive_spin ticks sleep_pumps while CR/FR drain.
+        let done = narf_scheduler::responsive_spin(
+            // SAFETY: identity-mapped MMIO.
+            || unsafe { self.mmio.read32(off + PORT_CMD) } & (CMD_FR | CMD_CR) == 0,
+            1_000_000,
+        );
+        if done {
+            Ok(())
+        } else {
+            Err(AhciError::PortIdleTimeout)
         }
-        Err(AhciError::PortIdleTimeout)
     }
 
     /// HBA's capability bitmap.
@@ -580,24 +586,24 @@ impl Ahci {
             self.mmio.write32(off + 0x38, 1);
         }
 
-        // Poll until CI bit clears.
-        let mut ok = false;
-        for _ in 0..10_000_000u32 {
-            // SAFETY: same.
-            let ci = unsafe { self.mmio.read32(off + 0x38) };
-            // SAFETY: same.
-            let tfd = unsafe { self.mmio.read32(off + 0x20) };
-            if tfd & 0x01 != 0 {
-                // ERR
-                return Err(AhciError::ResetTimeout);
-            }
-            if ci & 1 == 0 {
-                ok = true;
-                break;
-            }
-            core::hint::spin_loop();
-        }
-        if !ok {
+        // Poll until CI bit clears. responsive_spin keeps cursor /
+        // FB / serial alive and bails on TFD.ERR.
+        let mut errored = false;
+        let done = narf_scheduler::responsive_spin(
+            || {
+                // SAFETY: identity-mapped MMIO.
+                let ci = unsafe { self.mmio.read32(off + 0x38) };
+                // SAFETY: same.
+                let tfd = unsafe { self.mmio.read32(off + 0x20) };
+                if tfd & 0x01 != 0 {
+                    errored = true;
+                    return true;
+                }
+                ci & 1 == 0
+            },
+            10_000_000,
+        );
+        if errored || !done {
             return Err(AhciError::ResetTimeout);
         }
 
@@ -717,22 +723,24 @@ pub unsafe fn ahci_write_lba(
         ahci.mmio.write32(off + 0x38, 1);
     }
 
-    let mut ok = false;
-    for _ in 0..10_000_000u32 {
-        // SAFETY: same.
-        let ci = unsafe { ahci.mmio.read32(off + 0x38) };
-        // SAFETY: same.
-        let tfd = unsafe { ahci.mmio.read32(off + 0x20) };
-        if tfd & 0x01 != 0 {
-            return Err(AhciError::ResetTimeout);
-        }
-        if ci & 1 == 0 {
-            ok = true;
-            break;
-        }
-        core::hint::spin_loop();
-    }
-    if !ok {
+    // responsive_spin ticks sleep_pumps so cursor/FB stay alive
+    // while waiting for the IDENTIFY DMA to finish.
+    let mut errored = false;
+    let done = narf_scheduler::responsive_spin(
+        || {
+            // SAFETY: identity-mapped MMIO.
+            let ci = unsafe { ahci.mmio.read32(off + 0x38) };
+            // SAFETY: same.
+            let tfd = unsafe { ahci.mmio.read32(off + 0x20) };
+            if tfd & 0x01 != 0 {
+                errored = true;
+                return true;
+            }
+            ci & 1 == 0
+        },
+        10_000_000,
+    );
+    if errored || !done {
         return Err(AhciError::ResetTimeout);
     }
     // SAFETY: caller-asserted.
@@ -858,22 +866,24 @@ pub unsafe fn ahci_read_lba(
         ahci.mmio.write32(off + 0x38, 1);
     }
 
-    let mut ok = false;
-    for _ in 0..10_000_000u32 {
-        // SAFETY: same.
-        let ci = unsafe { ahci.mmio.read32(off + 0x38) };
-        // SAFETY: same.
-        let tfd = unsafe { ahci.mmio.read32(off + 0x20) };
-        if tfd & 0x01 != 0 {
-            return Err(AhciError::ResetTimeout);
-        }
-        if ci & 1 == 0 {
-            ok = true;
-            break;
-        }
-        core::hint::spin_loop();
-    }
-    if !ok {
+    // responsive_spin ticks sleep_pumps so cursor/FB stay alive
+    // while waiting for READ DMA EXT to finish.
+    let mut errored = false;
+    let done = narf_scheduler::responsive_spin(
+        || {
+            // SAFETY: identity-mapped MMIO.
+            let ci = unsafe { ahci.mmio.read32(off + 0x38) };
+            // SAFETY: same.
+            let tfd = unsafe { ahci.mmio.read32(off + 0x20) };
+            if tfd & 0x01 != 0 {
+                errored = true;
+                return true;
+            }
+            ci & 1 == 0
+        },
+        10_000_000,
+    );
+    if errored || !done {
         return Err(AhciError::ResetTimeout);
     }
 
@@ -1292,22 +1302,24 @@ unsafe fn ahci_lba_ncq(
         ahci.mmio.write32(off + 0x38, bit); // PORT_CI
     }
 
-    let mut ok = false;
-    for _ in 0..10_000_000u32 {
-        // SAFETY: same.
-        let ci = unsafe { ahci.mmio.read32(off + 0x38) };
-        // SAFETY: same.
-        let tfd = unsafe { ahci.mmio.read32(off + 0x20) };
-        if tfd & 0x01 != 0 {
-            return Err(AhciError::ResetTimeout);
-        }
-        if ci & bit == 0 {
-            ok = true;
-            break;
-        }
-        core::hint::spin_loop();
-    }
-    if !ok {
+    // responsive_spin ticks sleep_pumps so cursor/FB stay alive
+    // during the user-issued R/W DMA.
+    let mut errored = false;
+    let done = narf_scheduler::responsive_spin(
+        || {
+            // SAFETY: identity-mapped MMIO.
+            let ci = unsafe { ahci.mmio.read32(off + 0x38) };
+            // SAFETY: same.
+            let tfd = unsafe { ahci.mmio.read32(off + 0x20) };
+            if tfd & 0x01 != 0 {
+                errored = true;
+                return true;
+            }
+            ci & bit == 0
+        },
+        10_000_000,
+    );
+    if errored || !done {
         return Err(AhciError::ResetTimeout);
     }
 
