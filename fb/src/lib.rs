@@ -799,6 +799,30 @@ pub fn register_initcalls() {
         let _ = narf_scheduler::spawn(task);
         InitResult::Ok
     });
+    narf_init::register(Stage::Late, "fb-status-refresh", || {
+        if select_active().is_none() {
+            return InitResult::NotPresent;
+        }
+        let cap = bootstrap_writer();
+        let writer = match FbWriter::new(cap) {
+            Ok(w) => w,
+            Err(_) => return InitResult::Error("FbWriter::new"),
+        };
+        // Refresh the status panel periodically so the diagnostic
+        // slots written by background drivers (USB enumeration,
+        // etc.) actually appear on screen. paint() is idempotent
+        // and re-rendering at ~4 Hz is invisible to users while
+        // staying current enough to catch transient failures.
+        narf_scheduler::spawn(async move {
+            loop {
+                status::paint(&writer);
+                // ~250 ms between repaints (4 Hz). Boot-time
+                // diagnostic refresh; not a hot path.
+                narf_time::sleep_cycles(800_000_000).await;
+            }
+        });
+        InitResult::Ok
+    });
     narf_init::register(Stage::Late, "fb-cursor-pump", || {
         if select_active().is_none() {
             return InitResult::NotPresent;

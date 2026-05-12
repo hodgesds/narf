@@ -23,6 +23,7 @@ narf-ipc          = { path = "../ipc" }
 narf-memory       = { path = "../memory" }
 narf-userspace    = { path = "../userspace" }
 narf-scheduler    = { path = "../scheduler" }
+narf-time         = { path = "../time" }
 narf-shmem        = { path = "../shmem" }
 narf-input        = { path = "../input" }
 narf-drivers-i2c  = { path = "../drivers/i2c" }
