@@ -533,16 +533,34 @@ fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
             err
         })?;
 
-        // Diagnostic: read the device descriptor and surface
-        // bMaxPacketSize0 (offset +7) so a logfile reader can spot
-        // MPS-mismatched devices. USB 2.0 §9.2.6.3 says we should
-        // re-program EP0's MaxPacketSize via Evaluate Context if
-        // this differs from `speed.default_max_packet()`. Boot
-        // keyboards almost never trip this (LS=8 / HS=64 match the
-        // defaults); proper Evaluate-Context refresh is a follow-up.
+        // GET_DESCRIPTOR(DEVICE) and refresh EP0 MaxPacketSize via
+        // Evaluate Context if the device's real bMaxPacketSize0
+        // differs from the speed-default we programmed at Address
+        // Device time (audit F-22 + F-23). This matters for full-
+        // speed devices (we initially seed MPS=8 — the smallest
+        // legal — and most FS devices are actually 8/16/32/64).
+        // High-speed defaults to 64 already.
         if let Ok(desc) = xhci_dev.get_device_descriptor(slot_id) {
-            let mps0 = desc[7];
-            let _ = (mps0, port);
+            let mps0 = desc[7] as u16;
+            // Valid Full-Speed values per USB 2.0 §9.6.1: 8/16/32/64.
+            // Low-Speed must be 8. High-Speed must be 64. SuperSpeed
+            // encodes the exponent (2^bMaxPacketSize0). Skip the
+            // refresh on weird values rather than blindly trusting.
+            let want = match speed {
+                xhci::PortSpeed::Low | xhci::PortSpeed::Full
+                    if matches!(mps0, 8 | 16 | 32 | 64) =>
+                {
+                    Some(mps0)
+                }
+                xhci::PortSpeed::High if mps0 == 64 => Some(64),
+                xhci::PortSpeed::Super | xhci::PortSpeed::SuperPlus if mps0 <= 13 => {
+                    Some(1u16 << mps0)
+                }
+                _ => None,
+            };
+            if let Some(real_mps) = want {
+                let _ = xhci_dev.evaluate_context_ep0_mps(slot_id, real_mps);
+            }
         }
 
         // Read the 9-byte cfg header to discover wTotalLength

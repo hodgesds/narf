@@ -161,6 +161,7 @@ const TRB_TYPE_ENABLE_SLOT_CMD: u32 = 9;
 const TRB_TYPE_DISABLE_SLOT_CMD: u32 = 10;
 const TRB_TYPE_ADDRESS_DEVICE_CMD: u32 = 11;
 const TRB_TYPE_CONFIGURE_ENDPOINT_CMD: u32 = 12;
+const TRB_TYPE_EVAL_CONTEXT_CMD: u32 = 13;
 const TRB_TYPE_NO_OP_CMD: u32 = 23;
 const TRB_TYPE_TRANSFER_EVENT: u32 = 32;
 const TRB_TYPE_CMD_COMPLETION: u32 = 33;
@@ -234,13 +235,20 @@ impl PortSpeed {
             _ => return None,
         })
     }
-    /// USB-2.0 §5.5.3 / USB 3 §9.6.1: control endpoint default
-    /// MaxPacketSize before the device reports its real value via
-    /// Get Descriptor(DEVICE).
+    /// xHCI 1.2 Table 13: initial Max Packet Size for the
+    /// Default Control Endpoint when populating the Input
+    /// Endpoint 0 Context for Address Device. Full-speed
+    /// devices may use 8/16/32/64; the host doesn't know
+    /// which until it reads the first 8 bytes of the Device
+    /// Descriptor, so the spec mandates programming 8 for FS
+    /// (the smallest legal MPS, guaranteed safe). After
+    /// GET_DESCRIPTOR returns the real bMaxPacketSize0, we
+    /// issue Evaluate Context to refresh the EP0 context if
+    /// it differs (audit F-22 + F-23).
     fn default_max_packet(self) -> u16 {
         match self {
             PortSpeed::Low => 8,
-            PortSpeed::Full => 64,
+            PortSpeed::Full => 8,
             PortSpeed::High => 64,
             PortSpeed::Super | PortSpeed::SuperPlus => 512,
         }
@@ -1549,6 +1557,105 @@ impl Xhci {
         // its contents during processing.
         let _ = input;
         Ok(slot_id)
+    }
+
+    /// Evaluate Context Command (§4.6.7 / §6.4.3.6) — refresh the
+    /// EP0 Max Packet Size after GET_DESCRIPTOR returns the device's
+    /// real `bMaxPacketSize0`. Audit F-22 + F-23: we initially seed
+    /// EP0 with the smallest legal MPS for the speed (8 for FS), then
+    /// fix it up here once the device tells us the true value.
+    ///
+    /// Input Context layout (§6.2.3.3, Evaluate Context variant):
+    ///   - Input Control: A0=0 (Slot not modified), A1=1 (EP0 add).
+    ///   - Slot Context: ignored (A0=0) but xHC reads dword0..1 anyway
+    ///     for some implementations — populate from current Device
+    ///     Context to be safe.
+    ///   - EP0 Context dword1: bits[31:16] = new Max Packet Size.
+    ///
+    /// Idempotent: if `new_mps` matches the cached value, returns Ok
+    /// without bothering the controller.
+    pub fn evaluate_context_ep0_mps(
+        &self,
+        slot_id: u8,
+        new_mps: u16,
+    ) -> Result<(), XhciError> {
+        if slot_id == 0 || slot_id > self.caps.max_slots {
+            return Err(XhciError::CmdFailed(0xFD));
+        }
+        // Snapshot current cached MPS + speed under the devices lock.
+        let (cur_mps, speed, port) = {
+            let g = self.devices.lock();
+            let d = g
+                .get(slot_id as usize)
+                .and_then(|x| x.as_ref())
+                .ok_or(XhciError::CmdFailed(0xFD))?;
+            (d.max_packet_ep0, d.speed, d.port)
+        };
+        if cur_mps == new_mps {
+            return Ok(());
+        }
+
+        let input = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
+        let input_phys = input.phys_addr().raw();
+        // SAFETY: identity-mapped DMA, 4 KiB contiguous, just allocated.
+        unsafe {
+            core::ptr::write_bytes(input_phys as *mut u8, 0, 4096);
+        }
+        let cs = self.context_stride();
+        let input_ctrl = input_phys;
+        let slot_ctx = input_phys + cs;
+        let ep0_ctx = input_phys + cs * 2;
+
+        // Add EP0 only (A1=1, A0=0). Drop mask = 0.
+        // SAFETY: identity-mapped, in-page.
+        unsafe {
+            core::ptr::write_volatile((input_ctrl + 4) as *mut u32, 1 << 1);
+        }
+        // Re-populate Slot Context dword0/1 (Context Entries=1 + Speed
+        // + Root Hub Port) so an xHC that snapshots them sees a sane
+        // shape even though A0=0.
+        let slot_d0 = (1u32 << 27) | ((speed as u32) << 20);
+        let slot_d1 = (port as u32) << 16;
+        // SAFETY: same.
+        unsafe {
+            core::ptr::write_volatile(slot_ctx as *mut u32, slot_d0);
+            core::ptr::write_volatile((slot_ctx + 4) as *mut u32, slot_d1);
+        }
+        // EP0 dword1 with the new MPS. Other EP0 fields (TR Dequeue
+        // Pointer, Avg TRB Length) are ignored by Evaluate Context per
+        // spec — the controller only consumes the MPS field for this
+        // command. Keep the EP-Type/Error-Count bits set so an xHC
+        // that requires a fully-formed EP context is still happy.
+        let ep0_d1 = (3 << 1)
+                   | (4 << 3)
+                   | ((new_mps as u32) << 16);
+        // SAFETY: same.
+        unsafe {
+            core::ptr::write_volatile((ep0_ctx + 4) as *mut u32, ep0_d1);
+        }
+        compiler_fence(Ordering::SeqCst);
+
+        let trb_type = TRB_TYPE_EVAL_CONTEXT_CMD << TRB_TYPE_SHIFT;
+        let dword3 = trb_type | ((slot_id as u32) << 24);
+        self.submit_command(input_phys as u32, (input_phys >> 32) as u32, 0, dword3)?;
+        let cce = TRB_TYPE_CMD_COMPLETION << TRB_TYPE_SHIFT;
+        let want_slot = (slot_id as u32) << 24;
+        let ev = self
+            .await_event(|t| (t[3] & TRB_TYPE_MASK) == cce && (t[3] & 0xFF00_0000) == want_slot)?;
+        let ccode = ((ev[2] >> 24) & 0xFF) as u8;
+        if ccode != 1 {
+            return Err(XhciError::CmdFailed(ccode));
+        }
+
+        // Update cache.
+        {
+            let mut g = self.devices.lock();
+            if let Some(Some(d)) = g.get_mut(slot_id as usize) {
+                d.max_packet_ep0 = new_mps;
+            }
+        }
+        let _ = input;
+        Ok(())
     }
 
     /// Ring the slot's doorbell. Dword layout (§5.6):
