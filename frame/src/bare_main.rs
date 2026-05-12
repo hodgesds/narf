@@ -842,6 +842,14 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         // SAFETY: RSDP is in identity-mapped RAM /
                         // ROM; the XSDT chain it leads to lives in
                         // ACPI-reclaimable RAM the boot map listed.
+                        // SRAT is informational (NUMA topology) — its
+                        // absence is *normal* for single-socket boxes
+                        // (most laptops, including the UM425I bring-up
+                        // target). Slab promotion must NOT be gated on
+                        // it; otherwise a no-SRAT host runs the whole
+                        // boot on the 8 MiB bootstrap arena and panics
+                        // with a 16-byte alloc failure once the AML
+                        // walk + Stage::Device probes catch up.
                         match unsafe { narf_acpi::parse_srat(p) } {
                             Ok(n) => {
                                 narf_memory::beacon::paint(15, 0x0080_FF40); // LIME: ACPI parsed
@@ -856,43 +864,48 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                 // memory_node() is populated. Subsequent
                                 // alloc_frame() calls honour locality.
                                 narf_memory::rebalance_to_topology();
-                                narf_memory::reserve_for_slab_promotion();
-                                let _ = writeln!(
-                                    console::Writer,
-                                    "  heap: promoting bump→slab (bootstrap used: {} / {} bytes)",
-                                    narf_memory::heap::used_bytes(),
-                                    narf_memory::heap::capacity_bytes()
-                                );
-                                narf_memory::heap::promote_to_slab();
-                                let _ = writeln!(
-                                    console::Writer,
-                                    "  heap: slab is live"
-                                );
-                                let n_nodes = narf_acpi::node_count() as usize;
-                                let mut totals = 0usize;
-                                for i in 0..n_nodes.min(narf_memory::FRAME_MAX_NUMA_NODES) {
-                                    let f = narf_memory::node_free(i);
-                                    totals += f;
-                                    let _ = writeln!(
-                                        console::Writer,
-                                        "    node {}: {} free frames",
-                                        i,
-                                        f
-                                    );
-                                }
-                                let _ = writeln!(
-                                    console::Writer,
-                                    "  frames: NUMA-rebalanced ({} per-node total); slab live"
-                                    , totals
-                                );
                             }
                             Err(e) => {
                                 let _ = writeln!(
                                     console::Writer,
-                                    "  acpi: SRAT parse skipped: {:?}",
+                                    "  acpi: SRAT parse skipped: {:?} (single-NUMA-node fallback)",
                                     e
                                 );
                             }
+                        }
+                        // Slab promotion runs unconditionally — it
+                        // only needs the buddy alive (init_from_map
+                        // already ran), not NUMA topology.
+                        {
+                            narf_memory::reserve_for_slab_promotion();
+                            let _ = writeln!(
+                                console::Writer,
+                                "  heap: promoting bump→slab (bootstrap used: {} / {} bytes)",
+                                narf_memory::heap::used_bytes(),
+                                narf_memory::heap::capacity_bytes()
+                            );
+                            narf_memory::heap::promote_to_slab();
+                            let _ = writeln!(
+                                console::Writer,
+                                "  heap: slab is live"
+                            );
+                            let n_nodes = narf_acpi::node_count().max(1) as usize;
+                            let mut totals = 0usize;
+                            for i in 0..n_nodes.min(narf_memory::FRAME_MAX_NUMA_NODES) {
+                                let f = narf_memory::node_free(i);
+                                totals += f;
+                                let _ = writeln!(
+                                    console::Writer,
+                                    "    node {}: {} free frames",
+                                    i,
+                                    f
+                                );
+                            }
+                            let _ = writeln!(
+                                console::Writer,
+                                "  frames: {} per-node total; slab live",
+                                totals
+                            );
                         }
                         // SAFETY: same RSDP, validated above.
                         match unsafe { narf_acpi::parse_madt(p) } {

@@ -29,8 +29,14 @@ use crate::slab;
 /// point `promote_to_slab()` is called. Pre-promotion includes
 /// ACPI table parse, MADT/SRAT/HMAT topology, NUMA rebalance,
 /// and per-zone buddy capacity reservation. Empirically ~2 MiB
-/// on a 16 GiB / 16-node system; 8 MiB gives 4× headroom.
-pub const BOOTSTRAP_CAPACITY: usize = 8 << 20;
+/// on a 16 GiB / 16-node system; 8 MiB worked through QEMU but
+/// real-HW laptops with denser device trees (dozens of PCI nodes,
+/// AML namespace nodes per platform device, multiple I2C / GPIO
+/// controllers + their HID children) blow past it before the slab
+/// comes up. 16 MiB gives ~8× headroom over the QEMU steady state
+/// while still costing only 16 MiB of `.bss` on a kernel that's
+/// already 50+ MiB.
+pub const BOOTSTRAP_CAPACITY: usize = 16 << 20;
 
 /// Byte storage for the bootstrap bump arena. Lives in `.bss`,
 /// 16-byte aligned for any alignment ≤ 16 to be trivially satisfiable.
