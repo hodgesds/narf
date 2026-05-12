@@ -4497,81 +4497,12 @@ fn sys_sleep(ctx: &mut dyn TrapContext) {
 /// task — register a pump here at boot so their work continues
 /// even while a user task is sleeping.
 ///
-/// The registry is fixed-size and lock-free: writes are
-/// boot-time, reads are hot-path. A `0` slot is "vacant".
-pub mod sleep_pumps {
-    use core::sync::atomic::{AtomicUsize, Ordering};
-
-    /// Maximum simultaneously-registered pumps. 8 is comfortably
-    /// over the foreseeable subsystem count (FB drain, future
-    /// audio drain, future input poll, etc.). Rejecting registers
-    /// past the cap is a boot-time programming error, surfaced as
-    /// a panic so it can't escape into a silent starvation bug.
-    const MAX_PUMPS: usize = 8;
-
-    /// One pump function — runs once per iteration of the sleep
-    /// busy-wait. Must not block, allocate, or take long-held
-    /// kernel locks; treat it like an IRQ handler.
-    pub type Pump = fn();
-
-    static SLOTS: [AtomicUsize; MAX_PUMPS] = [
-        AtomicUsize::new(0),
-        AtomicUsize::new(0),
-        AtomicUsize::new(0),
-        AtomicUsize::new(0),
-        AtomicUsize::new(0),
-        AtomicUsize::new(0),
-        AtomicUsize::new(0),
-        AtomicUsize::new(0),
-    ];
-
-    /// Register a pump. Boot-only; idempotent on the same
-    /// function pointer (registering the same `Pump` twice fills
-    /// two slots — callers should arrange to register exactly
-    /// once per subsystem).
-    pub fn register(p: Pump) {
-        let p_addr = p as usize;
-        for slot in SLOTS.iter() {
-            if slot
-                .compare_exchange(0, p_addr, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return;
-            }
-        }
-        panic!("sleep_pumps: registry full ({} slots)", MAX_PUMPS);
-    }
-
-    /// Run every registered pump in registration order. Called
-    /// from `sys_sleep` on each spin iteration.
-    pub fn run() {
-        for slot in SLOTS.iter() {
-            let p = slot.load(Ordering::Acquire);
-            if p == 0 {
-                // Slots are filled densely from index 0; the
-                // first 0 we see is the end of the live region.
-                return;
-            }
-            // SAFETY: slot was populated by `register` with a
-            // valid `Pump` (`fn()`), and the static lifetime is
-            // the kernel's. The atomic ensures we read a
-            // committed value.
-            let f: super::Pump = unsafe { core::mem::transmute(p) };
-            f();
-        }
-    }
-
-    /// Test hook — clear all slots so unit tests don't leak
-    /// pumps across runs.
-    #[doc(hidden)]
-    pub fn __reset_for_test() {
-        for slot in SLOTS.iter() {
-            slot.store(0, Ordering::Release);
-        }
-    }
-}
-
-type Pump = fn();
+/// Re-export of the canonical sleep-pump registry, which lives in
+/// narf-scheduler so driver crates can call `run()` from sync spin
+/// loops without depending on narf-userspace. Existing call sites
+/// (`sys_sleep`'s busy-wait + the FB drain pump registration)
+/// continue to use `narf_userspace::handlers::sleep_pumps`.
+pub use narf_scheduler::sleep_pumps;
 
 // ── Per-task cwd state ────────────────────────────────────────────
 //

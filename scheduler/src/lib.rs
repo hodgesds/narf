@@ -954,3 +954,120 @@ impl Future for YieldNow {
 pub fn yield_now() -> YieldNow {
     YieldNow { yielded: false }
 }
+
+/// Background-pump registry — fn-pointer hooks that scheduler-blocking
+/// busy-waits should tick periodically so subsystems whose forward
+/// progress depends on regular polling (FB drain, cursor renderer,
+/// future audio drain) don't freeze while a sync caller spins on
+/// hardware.
+///
+/// Shape: fixed-size lock-free static array of `usize` (transmuted
+/// `fn()` pointers). Registration is boot-only + idempotent on the
+/// same fn pointer (registering twice fills two slots — callers
+/// register exactly once per subsystem).
+///
+/// Used by:
+/// - `userspace::handlers::sys_sleep`'s busy-wait
+/// - Driver sync spin loops (NVMe, AHCI, NIC TX poll) — added so
+///   a stuck device doesn't freeze the cursor / FB / serial
+pub mod sleep_pumps {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    const MAX_PUMPS: usize = 8;
+    pub type Pump = fn();
+
+    static SLOTS: [AtomicUsize; MAX_PUMPS] = [
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    ];
+
+    pub fn register(p: Pump) {
+        let p_addr = p as usize;
+        for slot in SLOTS.iter() {
+            if slot
+                .compare_exchange(0, p_addr, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+        panic!("sleep_pumps: registry full ({} slots)", MAX_PUMPS);
+    }
+
+    pub fn run() {
+        for slot in SLOTS.iter() {
+            let p = slot.load(Ordering::Acquire);
+            if p == 0 {
+                return;
+            }
+            // SAFETY: slot was populated by `register` with a
+            // valid `Pump` (`fn()`), and the static lifetime is
+            // the kernel's.
+            let f: Pump = unsafe { core::mem::transmute(p) };
+            f();
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn __reset_for_test() {
+        for slot in SLOTS.iter() {
+            slot.store(0, Ordering::Release);
+        }
+    }
+}
+
+/// Drive a future to completion synchronously from outside the
+/// async executor. Polls the future; on Pending, runs the
+/// registered `sleep_pumps` (so cursor/FB/serial keep moving) and
+/// idles to `halt_until_irq` until something delivers a wake.
+/// Returns the future's output.
+///
+/// The right primitive for **sync→async bridges**: any sync
+/// subsystem (BlockDeviceSync, FsOps' sync wrappers, the eventual
+/// VFS sync paths) that wants to call into an already-async
+/// driver path uses block_on instead of spin-polling MMIO
+/// registers manually. Drivers should expose async functions
+/// (e.g. NVMe's submit_io_irq_async) and let block_on bridge.
+///
+/// **Do not call from inside an async task** — it would block the
+/// executor's polling loop. Caller should be a sync kernel
+/// context (boot, BlockDeviceSync trait method, panic dump path).
+pub fn block_on<F: Future>(mut fut: F) -> F::Output {
+    use core::pin::Pin;
+    use core::task::{Context, Poll};
+    // Pin the future on the stack. Caller's lifetime guarantees
+    // this is sound — F is owned by the caller's stack frame.
+    // SAFETY: `fut` is a unique mutable binding we never move
+    // again until the future completes.
+    let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
+    let awake = Arc::new(AtomicBool::new(true));
+    let waker = make_waker(awake.clone());
+    let mut ctx = Context::from_waker(&waker);
+    loop {
+        // Reset awake before polling so a wake during the poll
+        // body is observable on the next iteration.
+        awake.store(false, Ordering::Release);
+        match fut.as_mut().poll(&mut ctx) {
+            Poll::Ready(v) => return v,
+            Poll::Pending => {
+                // Tick the sleep pumps so cursor/FB/serial stay
+                // alive while we wait for an IRQ wake or
+                // self-wake from the future's busy-poll.
+                sleep_pumps::run();
+                if !awake.load(Ordering::Acquire) {
+                    // No wake observed during poll — idle until
+                    // something fires an IRQ. The IRQ handler
+                    // (or the future's own wake_by_ref) flips
+                    // awake, then halt_until_irq returns.
+                    narf_arch::halt_until_irq();
+                }
+            }
+        }
+    }
+}
