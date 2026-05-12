@@ -192,6 +192,58 @@ unsafe fn io_in(_port: u16, _width_bytes: usize) -> u64 {
     0
 }
 
+/// MMIO write of `width_bytes` at physical address `phys`.
+///
+/// # Safety
+/// `phys` must be a valid, identity-mapped physical address.
+unsafe fn mmio_write(phys: u64, width_bytes: usize, val: u64) {
+    // SAFETY: caller guarantees mapping.
+    unsafe {
+        match width_bytes {
+            1 => core::ptr::write_volatile(phys as *mut u8, val as u8),
+            2 => core::ptr::write_volatile(phys as *mut u16, val as u16),
+            4 => core::ptr::write_volatile(phys as *mut u32, val as u32),
+            8 => core::ptr::write_volatile(phys as *mut u64, val),
+            _ => {
+                for i in 0..width_bytes.min(8) {
+                    let b = ((val >> (i * 8)) & 0xff) as u8;
+                    core::ptr::write_volatile((phys + i as u64) as *mut u8, b);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn io_out(port: u16, width_bytes: usize, val: u64) {
+    // SAFETY: caller ensures port is a valid I/O port.
+    unsafe {
+        match width_bytes {
+            1 => core::arch::asm!(
+                "out dx, al",
+                in("dx") port,
+                in("al") val as u8,
+                options(nomem, nostack)
+            ),
+            2 => core::arch::asm!(
+                "out dx, ax",
+                in("dx") port,
+                in("ax") val as u16,
+                options(nomem, nostack)
+            ),
+            _ => core::arch::asm!(
+                "out dx, eax",
+                in("dx") port,
+                in("eax") val as u32,
+                options(nomem, nostack)
+            ),
+        }
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn io_out(_port: u16, _width_bytes: usize, _val: u64) {}
+
 // ── PciConfig ECAM address resolution ────────────────────────────────────────
 
 /// Resolve a PciConfig OpRegion's effective ECAM byte address.
@@ -302,60 +354,166 @@ pub fn read_field(path: &str) -> Result<u64, FieldAccessError> {
         return Err(FieldAccessError::TooWide);
     }
     let region = region_for(&fi.region_path).ok_or(FieldAccessError::NoRegion)?;
+    let access_bytes = access_unit_bytes(fi.access_kind);
+    let access_bits = (access_bytes * 8) as u64;
 
-    // Byte offset of the first bit within the region.
-    let byte_offset_in_region = fi.bit_offset / 8;
-    // Bit-within-byte offset.
-    let bit_in_byte = fi.bit_offset % 8;
-
-    // Width in bytes to read, rounded up to the access-kind alignment.
-    let access_bytes: usize = match fi.access_kind {
-        1 => 1, // ByteAcc
-        2 => 2, // WordAcc
-        3 => 4, // DWordAcc
-        4 => 8, // QWordAcc
-        _ => 1, // AnyAcc → byte
-    };
-
-    // Total bits spanned from the start of the access unit to the end of the field.
-    let bits_needed = bit_in_byte + fi.bit_length;
-    // How many access units we need.
-    let access_units = (bits_needed + access_bytes as u64 * 8 - 1) / (access_bytes as u64 * 8);
-    if access_units > 1 {
-        // Multi-unit field — too wide for our simple reader.
-        return Err(FieldAccessError::TooWide);
+    // Audit #6: multi-unit reads. Walk every access unit the
+    // field spans, gluing the slices together. Per ACPI §19.6.31
+    // the interpreter must issue access-aligned hardware
+    // transactions, even when a single field crosses unit
+    // boundaries — common for 32-bit fields at non-DWord-aligned
+    // offsets in EC layouts. Pre-fix this returned TooWide and
+    // every Field write to such a layout silently failed.
+    let first_unit_bit = (fi.bit_offset / access_bits) * access_bits;
+    let bit_in_unit = fi.bit_offset - first_unit_bit;
+    let units = ((bit_in_unit + fi.bit_length) + access_bits - 1) / access_bits;
+    let mut acc: u64 = 0;
+    for u in 0..units {
+        let unit_byte_offset = (first_unit_bit / 8) + u * access_bytes as u64;
+        let raw = read_unit(&region, unit_byte_offset, access_bytes)?;
+        acc |= raw << (u * access_bits);
     }
-
-    let phys_addr = region.offset + byte_offset_in_region;
-
-    // Perform the hardware read.
-    let raw = match region.space {
-        RegionSpace::SystemMemory => {
-            // SAFETY: we trust the AML table declared a valid address.
-            unsafe { mmio_read(phys_addr, access_bytes) }
-        }
-        RegionSpace::SystemIO => {
-            if phys_addr > 0xFFFF {
-                return Err(FieldAccessError::Unsupported);
-            }
-            // SAFETY: AML table asserted the port is valid.
-            unsafe { io_in(phys_addr as u16, access_bytes) }
-        }
-        RegionSpace::PciConfig => match resolve_pci_config_addr(&region) {
-            Some(addr) => unsafe { mmio_read(addr + byte_offset_in_region, access_bytes) },
-            None => return Err(FieldAccessError::Unsupported),
-        },
-        _ => return Err(FieldAccessError::Unsupported),
-    };
-
-    // Shift right by the bit-in-byte offset, then mask to bit_length.
-    let shifted = raw >> bit_in_byte;
+    let shifted = acc >> bit_in_unit;
     let mask = if fi.bit_length >= 64 {
         u64::MAX
     } else {
         (1u64 << fi.bit_length) - 1
     };
     Ok(shifted & mask)
+}
+
+/// Write a field by absolute path. Read-modify-write per
+/// access unit when the field doesn't cover the unit.
+///
+/// Audit #2/#3 fix — pre-fix there was no write path and AML
+/// `Store(value, FIELDNAME)` against an OpRegion field silently
+/// did nothing. DSDTs use this to drive GPIO state, EC
+/// commands, PCI-config registers (touchpad reset toggling,
+/// thermal-zone setpoints, etc.).
+pub fn write_field(path: &str, value: u64) -> Result<(), FieldAccessError> {
+    let fi = field_for(path).ok_or(FieldAccessError::NoField)?;
+    if fi.bit_length > 64 {
+        return Err(FieldAccessError::TooWide);
+    }
+    let region = region_for(&fi.region_path).ok_or(FieldAccessError::NoRegion)?;
+    let access_bytes = access_unit_bytes(fi.access_kind);
+    let access_bits = (access_bytes * 8) as u64;
+    let first_unit_bit = (fi.bit_offset / access_bits) * access_bits;
+    let bit_in_unit = fi.bit_offset - first_unit_bit;
+    let units = ((bit_in_unit + fi.bit_length) + access_bits - 1) / access_bits;
+    let val_mask = if fi.bit_length >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << fi.bit_length) - 1
+    };
+    let masked_val = value & val_mask;
+    // Compute aligned in-unit value bits per unit, RMW on each.
+    for u in 0..units {
+        let unit_byte_offset = (first_unit_bit / 8) + u * access_bytes as u64;
+        // Slice of the field's masked value that lands in unit u.
+        let slice_lo_bit = u * access_bits;
+        let in_unit_bit = if u == 0 { bit_in_unit } else { 0 };
+        let slice_hi_bit = ((u + 1) * access_bits).min(bit_in_unit + fi.bit_length);
+        let slice_width = slice_hi_bit - slice_lo_bit - in_unit_bit;
+        let unit_mask = if slice_width == 0 {
+            continue;
+        } else if slice_width >= access_bits {
+            // All-bits write — no need to RMW.
+            u64::MAX >> (64 - access_bits)
+        } else {
+            ((1u64 << slice_width) - 1) << in_unit_bit
+        };
+        let slice_val = (masked_val >> slice_lo_bit.saturating_sub(bit_in_unit)) & ((1u64 << slice_width) - 1);
+        let new_bits = (slice_val << in_unit_bit) & unit_mask;
+        // Update policy: AML field-flags update_rule (we don't
+        // currently parse it; default is Preserve = RMW). Always
+        // RMW unless writing the entire access unit.
+        let final_unit = if slice_width >= access_bits {
+            new_bits
+        } else {
+            let cur = read_unit(&region, unit_byte_offset, access_bytes)?;
+            (cur & !unit_mask) | new_bits
+        };
+        write_unit(&region, unit_byte_offset, access_bytes, final_unit)?;
+    }
+    Ok(())
+}
+
+#[inline]
+fn access_unit_bytes(access_kind: u8) -> usize {
+    match access_kind {
+        1 => 1, // ByteAcc
+        2 => 2, // WordAcc
+        3 => 4, // DWordAcc
+        4 => 8, // QWordAcc
+        _ => 1, // AnyAcc → byte
+    }
+}
+
+fn read_unit(
+    region: &OpRegionInfo,
+    byte_offset_in_region: u64,
+    width: usize,
+) -> Result<u64, FieldAccessError> {
+    match region.space {
+        RegionSpace::SystemMemory => {
+            // SAFETY: AML table declared a valid address.
+            Ok(unsafe { mmio_read(region.offset + byte_offset_in_region, width) })
+        }
+        RegionSpace::SystemIO => {
+            let port = region.offset + byte_offset_in_region;
+            if port > 0xFFFF {
+                return Err(FieldAccessError::Unsupported);
+            }
+            // SAFETY: AML asserted port is valid.
+            Ok(unsafe { io_in(port as u16, width) })
+        }
+        RegionSpace::PciConfig => match resolve_pci_config_addr(region) {
+            // SAFETY: ECAM identity-mapped at boot.
+            Some(addr) => Ok(unsafe { mmio_read(addr + byte_offset_in_region, width) }),
+            None => Err(FieldAccessError::Unsupported),
+        },
+        _ => Err(FieldAccessError::Unsupported),
+    }
+}
+
+fn write_unit(
+    region: &OpRegionInfo,
+    byte_offset_in_region: u64,
+    width: usize,
+    val: u64,
+) -> Result<(), FieldAccessError> {
+    match region.space {
+        RegionSpace::SystemMemory => {
+            // SAFETY: AML table declared a valid address.
+            unsafe {
+                mmio_write(region.offset + byte_offset_in_region, width, val);
+            }
+            Ok(())
+        }
+        RegionSpace::SystemIO => {
+            let port = region.offset + byte_offset_in_region;
+            if port > 0xFFFF {
+                return Err(FieldAccessError::Unsupported);
+            }
+            // SAFETY: AML asserted port is valid.
+            unsafe {
+                io_out(port as u16, width, val);
+            }
+            Ok(())
+        }
+        RegionSpace::PciConfig => match resolve_pci_config_addr(region) {
+            // SAFETY: ECAM identity-mapped at boot.
+            Some(addr) => {
+                unsafe {
+                    mmio_write(addr + byte_offset_in_region, width, val);
+                }
+                Ok(())
+            }
+            None => Err(FieldAccessError::Unsupported),
+        },
+        _ => Err(FieldAccessError::Unsupported),
+    }
 }
 
 // ── Test reset ────────────────────────────────────────────────────────────────

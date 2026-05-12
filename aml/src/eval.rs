@@ -1284,9 +1284,20 @@ fn write_target(
             state.set_arg((b - 0x68) as usize, value);
         }
         b if is_name_lead(b) => {
-            // Named target — resolve and update namespace node value.
+            // Named target — resolve. If it's a Field node, route
+            // through `oregion::write_field` to actually drive
+            // hardware (audit #2/#3). Otherwise update the
+            // namespace node's value (Name/Buffer/Package).
             let name = read_name_string(buf, cur, "\\")?;
-            update_node_value(&name, value);
+            let is_field = crate::find_node(&name)
+                .or_else(|| crate::find_node_by_suffix(&name))
+                .map(|n| n.kind == crate::NodeKind::Field)
+                .unwrap_or(false);
+            if is_field {
+                let _ = crate::oregion::write_field(&name, value.as_integer());
+            } else {
+                update_node_value(&name, value);
+            }
         }
         _ => {
             // Unexpected target byte — skip it.
