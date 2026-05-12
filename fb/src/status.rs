@@ -35,7 +35,7 @@ const PANEL_FG: Pixel32 = Pixel32(0xFFE0_E0E0); // light grey
 /// 12 fits comfortably under a 1280×800 FB while leaving room for
 /// a little headroom + padding above the panel.
 const KLOG_TAIL_LINES: usize = 12;
-const HEADER_LINES: u32 = 5;
+const HEADER_LINES: u32 = 6;
 const PANEL_HEIGHT: u32 = 8 * (HEADER_LINES + KLOG_TAIL_LINES as u32 + 1); // header + klog tail + separator
 const PANEL_PAD: u32 = 4;
 
@@ -111,6 +111,26 @@ pub fn paint(fb: &FbWriter) {
         ),
         None => alloc::string::String::from("xhci-ad LAST: (no failure)"),
     };
+    // Pinned i8042 status: covers init success + IRQ routing +
+    // key-push counter so the user can tell at a glance whether
+    // the kbd path is alive without scrolling klog.
+    let i8042_diag = {
+        use core::sync::atomic::Ordering;
+        let kbd_init = narf_input::I8042_KBD_INIT_OK.load(Ordering::Acquire);
+        let kbd_irq = narf_input::I8042_KBD_IRQ_ROUTED.load(Ordering::Acquire);
+        let mouse_init = narf_input::I8042_MOUSE_INIT_OK.load(Ordering::Acquire);
+        let mouse_irq = narf_input::I8042_MOUSE_IRQ_ROUTED.load(Ordering::Acquire);
+        let pushes = narf_input::KEY_PUSH_COUNT.load(Ordering::Relaxed);
+        format!(
+            "i8042: kbd init={} irq={} mouse init={} irq={} key-pushes={}",
+            if kbd_init { "ok" } else { "FAIL" },
+            if kbd_irq { "ok" } else { "FAIL" },
+            if mouse_init { "ok" } else { "FAIL" },
+            if mouse_irq { "ok" } else { "FAIL" },
+            pushes,
+        )
+    };
+
     let xhci_pr_diag = match narf_drivers_usb::xhci::PORT_RESET_LAST_FAIL.snapshot() {
         Some((seq, port, retry, reason, portsc)) => {
             let reason_name = match reason {
@@ -132,6 +152,7 @@ pub fn paint(fb: &FbWriter) {
         fb_line.as_str(),
         dev_line.as_str(),
         cursor_line.as_str(),
+        i8042_diag.as_str(),
         xhci_diag.as_str(),
         xhci_pr_diag.as_str(),
     ];

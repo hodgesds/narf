@@ -50,58 +50,49 @@ fn register_i8042_initcalls() {
     use narf_init::{InitResult, Stage};
     narf_init::register(Stage::Device, "i8042-kbd", || {
         // SAFETY: BSP boot context, no other agent driving 0x60/0x64.
-        match unsafe { i8042::init() } {
-            Ok(()) => {
-                // SAFETY: ISA IRQ → IOAPIC routing call; the
-                // handler is `pub unsafe fn on_irq1` because the
-                // i8042 read it does is unsafe at module level,
-                // but installation through the dispatch table is
-                // safe (just stores a fn ptr).
-                let irq_ok = install_isa_irq(1, on_irq1_safe);
-                I8042_KBD_IRQ_ROUTED.store(irq_ok, core::sync::atomic::Ordering::Release);
-                use core::fmt::Write as _;
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "  i8042-kbd: irq1 {} (events {} make it to narf_input)",
-                    if irq_ok { "routed" } else { "ROUTING FAILED" },
-                    if irq_ok { "will" } else { "won't" },
-                );
-                InitResult::Ok
-            }
-            Err(_) => InitResult::NotPresent,
+        let init_res = unsafe { i8042::init() };
+        let init_ok = init_res.is_ok();
+        narf_input::I8042_KBD_INIT_OK
+            .store(init_ok, core::sync::atomic::Ordering::Release);
+        if !init_ok {
+            return InitResult::NotPresent;
         }
+        // SAFETY: ISA IRQ → IOAPIC routing call; the handler is
+        // `pub unsafe fn on_irq1` because the i8042 read it does
+        // is unsafe at module level, but installation through the
+        // dispatch table is safe (just stores a fn ptr).
+        let irq_ok = install_isa_irq(1, on_irq1_safe);
+        narf_input::I8042_KBD_IRQ_ROUTED
+            .store(irq_ok, core::sync::atomic::Ordering::Release);
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "  i8042-kbd: init=ok irq1={}",
+            if irq_ok { "routed" } else { "ROUTING_FAILED" },
+        );
+        InitResult::Ok
     });
     narf_init::register(Stage::Device, "i8042-mouse", || {
         // SAFETY: BSP, post-keyboard-init.
-        match unsafe { i8042_mouse::init() } {
-            Ok(()) => {
-                let irq_ok = install_isa_irq(12, on_irq12_safe);
-                I8042_MOUSE_IRQ_ROUTED.store(irq_ok, core::sync::atomic::Ordering::Release);
-                use core::fmt::Write as _;
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "  i8042-mouse: irq12 {}",
-                    if irq_ok { "routed" } else { "ROUTING FAILED" },
-                );
-                InitResult::Ok
-            }
-            Err(_) => InitResult::NotPresent,
+        let init_res = unsafe { i8042_mouse::init() };
+        let init_ok = init_res.is_ok();
+        narf_input::I8042_MOUSE_INIT_OK
+            .store(init_ok, core::sync::atomic::Ordering::Release);
+        if !init_ok {
+            return InitResult::NotPresent;
         }
+        let irq_ok = install_isa_irq(12, on_irq12_safe);
+        narf_input::I8042_MOUSE_IRQ_ROUTED
+            .store(irq_ok, core::sync::atomic::Ordering::Release);
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "  i8042-mouse: init=ok irq12={}",
+            if irq_ok { "routed" } else { "ROUTING_FAILED" },
+        );
+        InitResult::Ok
     });
 }
-
-/// IRQ-routing status flags so the FB status panel + diagnostics
-/// can show whether i8042 is wired all the way through. `true` =
-/// keyboard / mouse IRQs are routed to a vector and will fire the
-/// handler that pushes events into `narf_input`. `false` = init
-/// succeeded but the keyboard does literally nothing because no
-/// handler runs.
-#[cfg(target_arch = "x86_64")]
-pub static I8042_KBD_IRQ_ROUTED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-#[cfg(target_arch = "x86_64")]
-pub static I8042_MOUSE_IRQ_ROUTED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
 
 /// Wrapper to convert the `unsafe fn on_irq1` to the safe `fn()`
 /// signature `narf_interrupts::install_handler` expects.

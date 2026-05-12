@@ -392,10 +392,15 @@ pub fn init_global_ring(capacity: usize) {
 /// Push an event onto the appropriate per-class ring. Silently
 /// drops if `init_global_ring` hasn't been called.
 pub fn push_global(ev: InputEvent) -> bool {
+    let is_key = matches!(ev, InputEvent::Key(_));
     let ring = ring_for(&ev);
     let g = ring.lock();
     if let Some(r) = g.as_ref() {
-        r.push(ev)
+        let ok = r.push(ev);
+        if ok && is_key {
+            KEY_PUSH_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        ok
     } else {
         false
     }
@@ -477,6 +482,33 @@ pub fn __reset_global_ring_for_test() {
         }
     }
 }
+
+/// Diagnostic flag set by the i8042 driver after `install_isa_irq`
+/// returns — `true` iff IRQ 1 routed cleanly, `false` if init
+/// succeeded but no IRQ vector / IOAPIC line was wired up. The FB
+/// status panel renders this so the user can see "kbd-irq=routed"
+/// vs "kbd-irq=FAIL" without serial / scrollback. Lives here in
+/// the lower `narf-input` crate (vs `narf-input-driver`) to break
+/// the dep cycle that would otherwise prevent `narf-fb` from
+/// reading it.
+pub static I8042_KBD_IRQ_ROUTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+pub static I8042_MOUSE_IRQ_ROUTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+/// Set by the i8042 driver to `true` once `init()` returns Ok at
+/// least once. `false` here + `(no failure)` for IRQ-routed flags
+/// means `i8042::init()` never even succeeded — likely no PS/2
+/// controller on the system (modern laptops with no legacy KBC).
+pub static I8042_KBD_INIT_OK: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+pub static I8042_MOUSE_INIT_OK: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+/// Per-class ring activity counters — increment on every
+/// successful `push_global` so the panel can show whether kbd
+/// IRQs are firing without requiring serial. If kbd-pushes stays
+/// at 0 across keystroke attempts, IRQ 1 isn't firing.
+pub static KEY_PUSH_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
 
 /// Stage::Subsys initcall: install all per-class rings before any
 /// input driver pushes. Capacity 256 per ring — enough for
