@@ -332,29 +332,29 @@ pub unsafe fn start_aps() -> u32 {
     // it generously enough that a slow-coming-up AP doesn't drop
     // out, but tight enough that a wedged controller doesn't burn
     // forever. ~500M spins ≈ 100-500 ms at modern clock speeds.
-    const ONLINE_SPIN_BUDGET: u64 = 500_000_000;
-    let mut spins = 0u64;
-    let started: u32;
-    loop {
-        let cur = viable
-            .iter()
-            .filter(|&&id| narf_lib::smp::is_online(id))
-            .count() as u32;
-        if cur == viable_len as u32 {
-            started = cur;
-            break;
-        }
-        spins += 1;
-        if spins > ONLINE_SPIN_BUDGET {
-            for &id in viable.iter() {
-                if !narf_lib::smp::is_online(id) {
-                    let _ = writeln!(Writer, "  smp(x86): AP {} never reported online", id);
-                }
+    // responsive_spin keeps cursor/FB/serial alive while we wait
+    // for APs to report online.
+    const ONLINE_SPIN_BUDGET: u32 = 500_000_000;
+    let _ = narf_scheduler::responsive_spin(
+        || {
+            viable
+                .iter()
+                .filter(|&&id| narf_lib::smp::is_online(id))
+                .count() as u32
+                == viable_len as u32
+        },
+        ONLINE_SPIN_BUDGET,
+    );
+    let started = viable
+        .iter()
+        .filter(|&&id| narf_lib::smp::is_online(id))
+        .count() as u32;
+    if started != viable_len as u32 {
+        for &id in viable.iter() {
+            if !narf_lib::smp::is_online(id) {
+                let _ = writeln!(Writer, "  smp(x86): AP {} never reported online", id);
             }
-            started = cur;
-            break;
         }
-        core::hint::spin_loop();
     }
     started
 }
