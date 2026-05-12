@@ -2138,6 +2138,20 @@ fn run_async_demo() -> ! {
         let ticks = narf_interrupts::aarch64::timer_ticks();
         let _ = writeln!(console::Writer, "  timer IRQs delivered: {} ticks", ticks);
     }
+
+    // If an FB scanout came up, spawn the cursor pump now (after
+    // `narf_scheduler::init()` ran so the queue won't be wiped),
+    // then enter run_forever so PointerEvents from i8042 / i2c-hid
+    // keep flowing into the cursor renderer. The kernel stays
+    // interactive until QEMU is killed externally.
+    if narf_fb::spawn_cursor_pump() {
+        let _ = writeln!(
+            console::Writer,
+            "  Stage 1 exit-gate demo complete; entering interactive run_forever (cursor pump spawned)"
+        );
+        narf_scheduler::run_forever();
+    }
+
     let _ = writeln!(
         console::Writer,
         "  halting — Stage 1 exit-gate demo complete. (5s pause so the screen can be read)"
