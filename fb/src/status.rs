@@ -35,7 +35,7 @@ const PANEL_FG: Pixel32 = Pixel32(0xFFE0_E0E0); // light grey
 /// 12 fits comfortably under a 1280×800 FB while leaving room for
 /// a little headroom + padding above the panel.
 const KLOG_TAIL_LINES: usize = 12;
-const HEADER_LINES: u32 = 3;
+const HEADER_LINES: u32 = 4;
 const PANEL_HEIGHT: u32 = 8 * (HEADER_LINES + KLOG_TAIL_LINES as u32 + 1); // header + klog tail + separator
 const PANEL_PAD: u32 = 4;
 
@@ -100,7 +100,24 @@ pub fn paint(fb: &FbWriter) {
         crate::cursor::moves(),
     );
 
-    let header = [fb_line.as_str(), dev_line.as_str(), cursor_line.as_str()];
+    // Pinned diagnostic slot for the latest xHCI Address Device
+    // failure, so the user can read the exact PORTSC + USBSTS
+    // values off-screen on bare-metal where serial / scrollback
+    // aren't available. Empty until the first failure.
+    let xhci_diag = match narf_drivers_usb::xhci::ADDR_DEV_LAST_FAIL.snapshot() {
+        Some((seq, slot, port, ccode, portsc, usbsts)) => format!(
+            "xhci-ad LAST: #{} slot={} port={} ccode={} PORTSC={:08x} USBSTS={:08x}",
+            seq, slot, port, ccode, portsc, usbsts,
+        ),
+        None => alloc::string::String::from("xhci-ad LAST: (no failure)"),
+    };
+
+    let header = [
+        fb_line.as_str(),
+        dev_line.as_str(),
+        cursor_line.as_str(),
+        xhci_diag.as_str(),
+    ];
     // SAFETY: cursor renderer also borrows the framebuffer without
     // a higher-level lock; the status panel paints once at boot
     // before user-task pumps tighten contention.

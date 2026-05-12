@@ -1660,31 +1660,20 @@ impl Xhci {
             .await_event(|t| (t[3] & TRB_TYPE_MASK) == cce && (t[3] & 0xFF00_0000) == want_slot)?;
         let ccode = ((ev[2] >> 24) & 0xFF) as u8;
         if ccode != 1 {
-            // Diagnostic dump on Address Device failure. Lets us
-            // see WHY ccode=4 happens on real HW: which speed we
-            // told the controller, what PORTSC reported, whether
-            // USBSTS has any fatal bits, and what completion code
-            // came back. Logged unconditionally on failure (no
-            // dedupe) — the supervisor's per-port retry cap stops
-            // it from spamming.
+            // Capture diagnostics in a static slot so the FB
+            // status panel can render them in a fixed location
+            // (readable off-screen on bare-metal where klog
+            // scroll-back / serial console aren't available).
+            // Tight hex single-line so even when it lands in the
+            // panel's last-N-lines klog tail it doesn't wrap.
+            // SAFETY: identity-mapped MMIO; OP_USBSTS in range.
+            let sts = unsafe { self.mmio.read32(self.op_off + OP_USBSTS) };
+            ADDR_DEV_LAST_FAIL.store_pack(slot_id, port, ccode, pre_portsc, sts);
             use core::fmt::Write as _;
-            let usbsts_diag = self
-                .snapshot_usbsts_diagnostics()
-                .unwrap_or("USBSTS clean");
             let _ = writeln!(
                 narf_console::Writer,
-                "  xhci: address_device FAIL slot={} port={} speed={:?} mps={} \
-                 ccode={} portsc={:#x} (psi={} ped={} pls={}) [{}]",
-                slot_id,
-                port,
-                speed,
-                mps,
-                ccode,
-                pre_portsc,
-                pre_pre_speed,
-                pre_ped,
-                pre_pls,
-                usbsts_diag,
+                "xhci-ad: p{} c{:x} ps{:08x} st{:08x} sp{:?}",
+                port, ccode, pre_portsc, sts, speed,
             );
             return Err(XhciError::CmdFailed(ccode));
         }
@@ -2401,6 +2390,56 @@ impl Xhci {
         Ok(acked)
     }
 }
+
+/// Last-failure capture for `address_device`. Read by the FB
+/// status panel so the user can read the diagnostic off-screen
+/// without serial console / scrollback access.
+#[derive(Debug)]
+pub struct AddrDevLastFail {
+    raw: core::sync::atomic::AtomicU64,
+    portsc: core::sync::atomic::AtomicU32,
+    usbsts: core::sync::atomic::AtomicU32,
+}
+impl AddrDevLastFail {
+    const fn new() -> Self {
+        Self {
+            raw: core::sync::atomic::AtomicU64::new(0),
+            portsc: core::sync::atomic::AtomicU32::new(0),
+            usbsts: core::sync::atomic::AtomicU32::new(0),
+        }
+    }
+    fn store_pack(&self, slot: u8, port: u8, ccode: u8, portsc: u32, usbsts: u32) {
+        // Pack slot/port/ccode/seq into the low 32 bits; high 32
+        // is a counter so a second failure doesn't get hidden by a
+        // raw-read snapshot of the previous one.
+        let prev = self.raw.load(core::sync::atomic::Ordering::Relaxed);
+        let seq = (prev >> 32) as u32 + 1;
+        let lo =
+            (slot as u64) | ((port as u64) << 8) | ((ccode as u64) << 16);
+        self.raw
+            .store(((seq as u64) << 32) | lo, core::sync::atomic::Ordering::Release);
+        self.portsc
+            .store(portsc, core::sync::atomic::Ordering::Release);
+        self.usbsts
+            .store(usbsts, core::sync::atomic::Ordering::Release);
+    }
+    /// Returns `(seq, slot, port, ccode, portsc, usbsts)` or
+    /// `None` if no failure recorded. seq=0 means "never failed".
+    pub fn snapshot(&self) -> Option<(u32, u8, u8, u8, u32, u32)> {
+        let raw = self.raw.load(core::sync::atomic::Ordering::Acquire);
+        let seq = (raw >> 32) as u32;
+        if seq == 0 {
+            return None;
+        }
+        let slot = (raw & 0xFF) as u8;
+        let port = ((raw >> 8) & 0xFF) as u8;
+        let ccode = ((raw >> 16) & 0xFF) as u8;
+        let portsc = self.portsc.load(core::sync::atomic::Ordering::Acquire);
+        let usbsts = self.usbsts.load(core::sync::atomic::Ordering::Acquire);
+        Some((seq, slot, port, ccode, portsc, usbsts))
+    }
+}
+pub static ADDR_DEV_LAST_FAIL: AddrDevLastFail = AddrDevLastFail::new();
 
 static CONTROLLER: IrqSafeSpinLock<Option<Xhci>> = IrqSafeSpinLock::new(None);
 
