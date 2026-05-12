@@ -425,18 +425,101 @@ pub fn enumerate_and_attach_keyboards(xhci_dev: &Xhci) -> usize {
     attached
 }
 
+/// Per-port last-failure step. Single byte per port indexed by
+/// (port-1). 0 = no failure recorded. Used by `note_attach_step`
+/// to dedupe log lines so the supervisor's 16-ms retry cadence
+/// doesn't fill the klog ring with the same failure repeatedly.
+static LAST_KBD_FAIL_STEP: [core::sync::atomic::AtomicU8; 256] = {
+    use core::sync::atomic::AtomicU8;
+    [const { AtomicU8::new(0) }; 256]
+};
+
+/// Identifiers for each step in `try_attach_port` — used as the
+/// dedup key + the symbolic name printed to klog.
+#[derive(Copy, Clone)]
+enum AttachStep {
+    Reset = 1,
+    Speed = 2,
+    EnableSlot = 3,
+    AddressDevice = 4,
+    GetCfgHeader = 5,
+    GetCfgFull = 6,
+    FindBootKbd = 7,
+    ConfigureEndpoints = 8,
+    SetConfiguration = 9,
+    SetProtocol = 10,
+}
+
+impl AttachStep {
+    fn name(self) -> &'static str {
+        match self {
+            AttachStep::Reset => "port_reset",
+            AttachStep::Speed => "port_speed",
+            AttachStep::EnableSlot => "enable_slot",
+            AttachStep::AddressDevice => "address_device",
+            AttachStep::GetCfgHeader => "get_cfg_head",
+            AttachStep::GetCfgFull => "get_cfg_full",
+            AttachStep::FindBootKbd => "find_boot_kbd",
+            AttachStep::ConfigureEndpoints => "configure_endpoints",
+            AttachStep::SetConfiguration => "set_configuration",
+            AttachStep::SetProtocol => "set_protocol",
+        }
+    }
+}
+
+/// Log a per-port attach failure to klog, deduped by step so a
+/// stuck enumeration loop doesn't fill the ring. Resets the
+/// recorded step to 0 on every successful attach so a later
+/// re-failure on the same port re-emits.
+fn note_attach_fail(port: u8, step: AttachStep, err: &HidError) {
+    use core::fmt::Write as _;
+    use core::sync::atomic::Ordering;
+    let prev = LAST_KBD_FAIL_STEP[port as usize].swap(step as u8, Ordering::AcqRel);
+    if prev == step as u8 {
+        return;
+    }
+    let _ = writeln!(
+        narf_console::Writer,
+        "  usb-hid: kbd port={} step={} err={:?}",
+        port,
+        step.name(),
+        err
+    );
+}
+
+fn note_attach_ok(port: u8) {
+    use core::sync::atomic::Ordering;
+    LAST_KBD_FAIL_STEP[port as usize].store(0, Ordering::Release);
+}
+
 /// Public per-port attach used by the supervisor's per-port
 /// retry loop. Returns Err on any failure (no kbd here, NotBoot,
 /// xHCI command failure) so the supervisor can decide whether to
 /// re-try (port still connected) or move on.
 pub fn try_attach_keyboard_on_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
-    try_attach_port(xhci_dev, port)
+    let r = try_attach_port(xhci_dev, port);
+    if r.is_ok() {
+        note_attach_ok(port);
+    }
+    r
 }
 
 fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
-    xhci_dev.port_reset(port).map_err(HidError::Xhci)?;
-    let speed = xhci_dev.port_speed(port).ok_or(HidError::NoInterruptIn)?;
-    let slot_id = xhci_dev.enable_slot().map_err(HidError::Xhci)?;
+    xhci_dev.port_reset(port).map_err(|e| {
+        let err = HidError::Xhci(e);
+        note_attach_fail(port, AttachStep::Reset, &err);
+        err
+    })?;
+    let speed = xhci_dev.port_speed(port).ok_or_else(|| {
+        let err = HidError::NoInterruptIn;
+        note_attach_fail(port, AttachStep::Speed, &err);
+        err
+    })?;
+    let slot_id = xhci_dev.enable_slot().map_err(|e| {
+        let err = HidError::Xhci(e);
+        note_attach_fail(port, AttachStep::EnableSlot, &err);
+        err
+    })?;
     // Slot-cleanup guard: any failure past this point must call
     // disable_slot or we leak xHCI device contexts. xHCI MaxSlots
     // on AMD is typically 32; an internal Renoir USB tree can hold
@@ -444,9 +527,11 @@ fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
     // enumeration. Manual `?` flow doesn't unwind, so explicit
     // wrappers below.
     let res = (|| -> Result<(), HidError> {
-        xhci_dev
-            .address_device(slot_id, port, speed)
-            .map_err(HidError::Xhci)?;
+        xhci_dev.address_device(slot_id, port, speed).map_err(|e| {
+            let err = HidError::Xhci(e);
+            note_attach_fail(port, AttachStep::AddressDevice, &err);
+            err
+        })?;
 
         // Diagnostic: read the device descriptor and surface
         // bMaxPacketSize0 (offset +7) so a logfile reader can spot
@@ -465,13 +550,21 @@ fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
         let mut head = [0u8; 9];
         let n = xhci_dev
             .get_config_descriptor(slot_id, 0, &mut head)
-            .map_err(HidError::Xhci)?;
+            .map_err(|e| {
+                let err = HidError::Xhci(e);
+                note_attach_fail(port, AttachStep::GetCfgHeader, &err);
+                err
+            })?;
         if n < 9 {
-            return Err(HidError::NotBootKeyboard);
+            let err = HidError::NotBootKeyboard;
+            note_attach_fail(port, AttachStep::GetCfgHeader, &err);
+            return Err(err);
         }
         let total = u16::from_le_bytes([head[2], head[3]]) as usize;
         if total < 9 || total > 4096 {
-            return Err(HidError::NotBootKeyboard);
+            let err = HidError::NotBootKeyboard;
+            note_attach_fail(port, AttachStep::GetCfgHeader, &err);
+            return Err(err);
         }
         // bConfigurationValue lives at offset +5 of the cfg
         // descriptor (USB 2.0 §9.6.3 table 9-10). Required as
@@ -482,19 +575,28 @@ fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
         let mut full = alloc::vec![0u8; total];
         let n2 = xhci_dev
             .get_config_descriptor(slot_id, 0, &mut full)
-            .map_err(HidError::Xhci)?;
+            .map_err(|e| {
+                let err = HidError::Xhci(e);
+                note_attach_fail(port, AttachStep::GetCfgFull, &err);
+                err
+            })?;
         if n2 < total {
             full.truncate(n2);
         }
 
-        let (iface, ep) = find_boot_keyboard(&full)?;
+        let (iface, ep) = find_boot_keyboard(&full).map_err(|e| {
+            note_attach_fail(port, AttachStep::FindBootKbd, &e);
+            e
+        })?;
 
         // Configure the controller-side endpoint context first
         // so the device-side SET_CONFIGURATION below can drive
         // traffic through the now-running rings.
-        xhci_dev
-            .configure_endpoints(slot_id, &[ep])
-            .map_err(HidError::Xhci)?;
+        xhci_dev.configure_endpoints(slot_id, &[ep]).map_err(|e| {
+            let err = HidError::Xhci(e);
+            note_attach_fail(port, AttachStep::ConfigureEndpoints, &err);
+            err
+        })?;
 
         // SET_CONFIGURATION (USB 2.0 §9.4.7, bRequest=9). Without
         // this, the device stays in Address state and any class
@@ -512,11 +614,18 @@ fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
                 0,
                 &mut nothing,
             )
-            .map_err(|_| HidError::SetProtocolFailed)?;
+            .map_err(|_| {
+                let err = HidError::SetProtocolFailed;
+                note_attach_fail(port, AttachStep::SetConfiguration, &err);
+                err
+            })?;
 
         let interrupt_in_ep = ep.ep_addr & 0x0F; // DCI computed from this on RX
         let dci = (interrupt_in_ep * 2) + 1;
-        let kbd = BootKeyboard::attach(xhci_dev, slot_id, iface, dci)?;
+        let kbd = BootKeyboard::attach(xhci_dev, slot_id, iface, dci).map_err(|e| {
+            note_attach_fail(port, AttachStep::SetProtocol, &e);
+            e
+        })?;
         KEYBOARDS.lock().push(kbd);
         Ok(())
     })();
