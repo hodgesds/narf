@@ -24,7 +24,13 @@ const BUFFER_OP: u8 = 0x11;
 const PACKAGE_OP: u8 = 0x12;
 const CONTINUE_OP: u8 = 0x9F;
 const STORE_OP: u8 = 0x70;
+const CONCAT_OP: u8 = 0x73;
 const ADD_OP: u8 = 0x72;
+const TO_BUFFER_OP: u8 = 0x96;
+const TO_DECIMAL_STRING_OP: u8 = 0x97;
+const TO_HEX_STRING_OP: u8 = 0x98;
+const TO_INTEGER_OP: u8 = 0x99;
+const TO_STRING_OP: u8 = 0x9C;
 const SUBTRACT_OP: u8 = 0x74;
 const INCREMENT_OP: u8 = 0x75;
 const DECREMENT_OP: u8 = 0x76;
@@ -369,6 +375,37 @@ fn eval_term(
         NOT_OP => {
             let a = eval_term_arg(buf, cur, state)?.as_integer();
             write_target(buf, cur, Value::Integer(!a), state)?;
+        }
+
+        // ── Conversion opcodes (audit #8) — operand TermArg, target ───
+        TO_BUFFER_OP => {
+            let src = eval_term_arg(buf, cur, state)?;
+            write_target(buf, cur, to_buffer(&src), state)?;
+        }
+        TO_INTEGER_OP => {
+            let src = eval_term_arg(buf, cur, state)?;
+            write_target(buf, cur, to_integer(&src), state)?;
+        }
+        TO_DECIMAL_STRING_OP => {
+            let src = eval_term_arg(buf, cur, state)?;
+            write_target(buf, cur, to_decimal_string(&src), state)?;
+        }
+        TO_HEX_STRING_OP => {
+            let src = eval_term_arg(buf, cur, state)?;
+            write_target(buf, cur, to_hex_string(&src), state)?;
+        }
+        TO_STRING_OP => {
+            // ToString(Buffer, Length, Target). Length is a TermArg
+            // — `Ones` (u64::MAX) means "until NUL or end of buffer".
+            let src = eval_term_arg(buf, cur, state)?;
+            let len = eval_term_arg(buf, cur, state)?.as_integer();
+            write_target(buf, cur, to_string(&src, len), state)?;
+        }
+        CONCAT_OP => {
+            // Concatenate(Source1, Source2, Target).
+            let a = eval_term_arg(buf, cur, state)?;
+            let b = eval_term_arg(buf, cur, state)?;
+            write_target(buf, cur, concatenate(&a, &b), state)?;
         }
 
         // ── Logic (no target, result is the value itself) ─────────────────
@@ -760,6 +797,46 @@ fn eval_term_arg(buf: &[u8], cur: &mut usize, state: &mut EvalState) -> Result<V
             r
         }
 
+        // ── Conversion opcodes (audit #8) — TermArg form ──────────────
+        TO_BUFFER_OP => {
+            let src = eval_term_arg(buf, cur, state)?;
+            let r = to_buffer(&src);
+            write_target(buf, cur, r.clone(), state)?;
+            r
+        }
+        TO_INTEGER_OP => {
+            let src = eval_term_arg(buf, cur, state)?;
+            let r = to_integer(&src);
+            write_target(buf, cur, r.clone(), state)?;
+            r
+        }
+        TO_DECIMAL_STRING_OP => {
+            let src = eval_term_arg(buf, cur, state)?;
+            let r = to_decimal_string(&src);
+            write_target(buf, cur, r.clone(), state)?;
+            r
+        }
+        TO_HEX_STRING_OP => {
+            let src = eval_term_arg(buf, cur, state)?;
+            let r = to_hex_string(&src);
+            write_target(buf, cur, r.clone(), state)?;
+            r
+        }
+        TO_STRING_OP => {
+            let src = eval_term_arg(buf, cur, state)?;
+            let len = eval_term_arg(buf, cur, state)?.as_integer();
+            let r = to_string(&src, len);
+            write_target(buf, cur, r.clone(), state)?;
+            r
+        }
+        CONCAT_OP => {
+            let a = eval_term_arg(buf, cur, state)?;
+            let b = eval_term_arg(buf, cur, state)?;
+            let r = concatenate(&a, &b);
+            write_target(buf, cur, r.clone(), state)?;
+            r
+        }
+
         // Logic
         LAND_OP => {
             let a = eval_term_arg(buf, cur, state)?.as_integer();
@@ -1137,6 +1214,159 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::String(x), Value::String(y)) => x == y,
         (Value::Package(x), Value::Package(y)) => x == y,
         _ => a.as_integer() == b.as_integer(),
+    }
+}
+
+/// ACPI 6.5 §19.6.143 ToBuffer. Integer → 8-byte little-endian
+/// buffer; String → UTF-8 bytes + trailing NUL; Buffer → identity.
+fn to_buffer(v: &Value) -> Value {
+    match v {
+        Value::Integer(n) => Value::Buffer(n.to_le_bytes().to_vec()),
+        Value::String(s) => {
+            let mut b = s.as_bytes().to_vec();
+            b.push(0);
+            Value::Buffer(b)
+        }
+        Value::Buffer(b) => Value::Buffer(b.clone()),
+        Value::Package(_) => Value::Buffer(alloc::vec::Vec::new()),
+    }
+}
+
+/// ACPI 6.5 §19.6.146 ToInteger. Integer → identity; Buffer → first
+/// 8 bytes as u64 little-endian; String → parsed decimal or
+/// `0x`-prefix hex (case-insensitive).
+fn to_integer(v: &Value) -> Value {
+    match v {
+        Value::Integer(_) => v.clone(),
+        Value::Buffer(_) => Value::Integer(v.as_integer()),
+        Value::String(s) => {
+            let s = s.trim();
+            let n = if let Some(stripped) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))
+            {
+                u64::from_str_radix(stripped, 16).unwrap_or(0)
+            } else {
+                s.parse::<u64>().unwrap_or(0)
+            };
+            Value::Integer(n)
+        }
+        Value::Package(_) => Value::Integer(0),
+    }
+}
+
+/// ACPI 6.5 §19.6.147 ToString(Buffer, Length). Stops at the first
+/// NUL byte or `len` bytes, whichever comes first. `len = u64::MAX`
+/// (the spec sentinel "ones") means "until NUL or end".
+fn to_string(v: &Value, len: u64) -> Value {
+    let bytes: alloc::vec::Vec<u8> = match v {
+        Value::Buffer(b) => b.clone(),
+        Value::String(s) => s.as_bytes().to_vec(),
+        Value::Integer(n) => n.to_le_bytes().to_vec(),
+        Value::Package(_) => alloc::vec::Vec::new(),
+    };
+    let cap = if len == u64::MAX || len > bytes.len() as u64 {
+        bytes.len()
+    } else {
+        len as usize
+    };
+    let mut out = alloc::string::String::new();
+    for &b in bytes.iter().take(cap) {
+        if b == 0 {
+            break;
+        }
+        out.push(b as char);
+    }
+    Value::String(out)
+}
+
+/// ACPI 6.5 §19.6.144 ToDecimalString. Integer → decimal text;
+/// Buffer → comma-joined per-byte decimals; String → identity.
+fn to_decimal_string(v: &Value) -> Value {
+    use core::fmt::Write as _;
+    match v {
+        Value::Integer(n) => {
+            let mut s = alloc::string::String::new();
+            let _ = write!(&mut s, "{}", n);
+            Value::String(s)
+        }
+        Value::String(s) => Value::String(s.clone()),
+        Value::Buffer(b) => {
+            let mut s = alloc::string::String::new();
+            for (i, byte) in b.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                let _ = write!(&mut s, "{}", byte);
+            }
+            Value::String(s)
+        }
+        Value::Package(_) => Value::String(alloc::string::String::new()),
+    }
+}
+
+/// ACPI 6.5 §19.6.145 ToHexString. Same shape as ToDecimalString
+/// but `0xNN` (uppercase) per byte.
+fn to_hex_string(v: &Value) -> Value {
+    use core::fmt::Write as _;
+    match v {
+        Value::Integer(n) => {
+            let mut s = alloc::string::String::new();
+            let _ = write!(&mut s, "{:X}", n);
+            Value::String(s)
+        }
+        Value::String(s) => Value::String(s.clone()),
+        Value::Buffer(b) => {
+            let mut s = alloc::string::String::new();
+            for (i, byte) in b.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                let _ = write!(&mut s, "0x{:02X}", byte);
+            }
+            Value::String(s)
+        }
+        Value::Package(_) => Value::String(alloc::string::String::new()),
+    }
+}
+
+/// ACPI 6.5 §19.6.21 Concatenate. Type of result follows type of
+/// `a`: two integers → 16-byte buffer; two strings → joined string;
+/// two buffers → joined buffer. Mixed types coerce `b` to `a`'s type.
+fn concatenate(a: &Value, b: &Value) -> Value {
+    match a {
+        Value::Integer(x) => {
+            // Integer + anything → buffer of `x` then `b` coerced
+            // to buffer.
+            let mut out = x.to_le_bytes().to_vec();
+            if let Value::Buffer(b2) = to_buffer(b) {
+                out.extend_from_slice(&b2);
+            }
+            Value::Buffer(out)
+        }
+        Value::String(s) => {
+            let mut out = s.clone();
+            match b {
+                Value::String(t) => out.push_str(t),
+                Value::Integer(n) => {
+                    use core::fmt::Write as _;
+                    let _ = write!(&mut out, "{}", n);
+                }
+                Value::Buffer(_) => {
+                    if let Value::String(t) = to_string(b, u64::MAX) {
+                        out.push_str(&t);
+                    }
+                }
+                Value::Package(_) => {}
+            }
+            Value::String(out)
+        }
+        Value::Buffer(x) => {
+            let mut out = x.clone();
+            if let Value::Buffer(b2) = to_buffer(b) {
+                out.extend_from_slice(&b2);
+            }
+            Value::Buffer(out)
+        }
+        Value::Package(_) => a.clone(),
     }
 }
 
