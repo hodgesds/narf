@@ -111,46 +111,53 @@ impl Smbus {
 
     /// Wait for HOST_BUSY to clear, then clear status latches.
     fn wait_idle(&self) -> Result<(), SmbusError> {
-        for _ in 0..1_000_000u32 {
+        // responsive_spin ticks sleep_pumps so cursor/FB stay alive.
+        let done = narf_scheduler::responsive_spin(
             // SAFETY: x86_64 PIO; SMBus IO window owned by us.
-            let s = unsafe { pio_in8(self.io_base + SMB_HST_STS) };
-            if s & STS_HOST_BUSY == 0 {
-                // Clear any pending status (write-1-clear).
-                // SAFETY: same.
-                unsafe {
-                    pio_out8(self.io_base + SMB_HST_STS, 0xFF);
-                }
-                return Ok(());
-            }
-            core::hint::spin_loop();
+            || unsafe { pio_in8(self.io_base + SMB_HST_STS) } & STS_HOST_BUSY == 0,
+            1_000_000,
+        );
+        if !done {
+            return Err(SmbusError::Busy);
         }
-        Err(SmbusError::Busy)
+        // Clear any pending status (write-1-clear).
+        // SAFETY: x86_64 PIO; SMBus IO window owned by us.
+        unsafe {
+            pio_out8(self.io_base + SMB_HST_STS, 0xFF);
+        }
+        Ok(())
     }
 
     /// Wait for INTR (success) or any error bit.
     fn wait_complete(&self) -> Result<(), SmbusError> {
-        for _ in 0..10_000_000u32 {
+        // responsive_spin ticks sleep_pumps so cursor/FB stay alive.
+        let done = narf_scheduler::responsive_spin(
             // SAFETY: x86_64 PIO.
-            let s = unsafe { pio_in8(self.io_base + SMB_HST_STS) };
-            if s & STS_BUS_ERR != 0 {
-                return Err(SmbusError::BusError);
-            }
-            if s & STS_DEV_ERR != 0 {
-                return Err(SmbusError::DeviceError);
-            }
-            if s & STS_FAILED != 0 {
-                return Err(SmbusError::Failed);
-            }
-            if s & STS_INTR != 0 {
-                // SAFETY: same — clear status.
-                unsafe {
-                    pio_out8(self.io_base + SMB_HST_STS, STS_INTR | STS_ALL_ERRS);
-                }
-                return Ok(());
-            }
-            core::hint::spin_loop();
+            || unsafe { pio_in8(self.io_base + SMB_HST_STS) }
+                & (STS_BUS_ERR | STS_DEV_ERR | STS_FAILED | STS_INTR)
+                != 0,
+            10_000_000,
+        );
+        if !done {
+            return Err(SmbusError::Timeout);
         }
-        Err(SmbusError::Timeout)
+        // SAFETY: x86_64 PIO.
+        let s = unsafe { pio_in8(self.io_base + SMB_HST_STS) };
+        if s & STS_BUS_ERR != 0 {
+            return Err(SmbusError::BusError);
+        }
+        if s & STS_DEV_ERR != 0 {
+            return Err(SmbusError::DeviceError);
+        }
+        if s & STS_FAILED != 0 {
+            return Err(SmbusError::Failed);
+        }
+        // INTR set — clear status.
+        // SAFETY: x86_64 PIO.
+        unsafe {
+            pio_out8(self.io_base + SMB_HST_STS, STS_INTR | STS_ALL_ERRS);
+        }
+        Ok(())
     }
 
     /// Read one byte at `cmd` from device at 7-bit `addr`.

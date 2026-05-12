@@ -62,27 +62,34 @@ impl AcpiEc {
 
     /// Wait for the Input Buffer to be empty.
     fn wait_ibf_empty(&self) -> Result<(), DriverError> {
-        for _ in 0..100_000 {
+        // responsive_spin ticks sleep_pumps so cursor/FB stay alive
+        // if the EC is wedged.
+        let done = narf_scheduler::responsive_spin(
             // SAFETY: validated EC status port from ECDT or standard base.
-            let sts = unsafe { narf_arch::x86_64::io_port::inb(self.control_port) };
-            if sts & EC_STS_IBF == 0 {
-                return Ok(());
-            }
-            core::hint::spin_loop();
+            || unsafe { narf_arch::x86_64::io_port::inb(self.control_port) } & EC_STS_IBF == 0,
+            100_000,
+        );
+        if done {
+            Ok(())
+        } else {
+            Err(DriverError::Timeout)
         }
-        Err(DriverError::Timeout)
     }
 
     /// Wait for the Output Buffer to be full.
     fn wait_obf_full(&self) -> Result<(), DriverError> {
-        for _ in 0..100_000 {
-            let sts = unsafe { narf_arch::x86_64::io_port::inb(self.control_port) };
-            if sts & EC_STS_OBF != 0 {
-                return Ok(());
-            }
-            core::hint::spin_loop();
+        // responsive_spin ticks sleep_pumps so cursor/FB stay alive
+        // if the EC is slow to publish a response.
+        let done = narf_scheduler::responsive_spin(
+            // SAFETY: validated EC status port.
+            || unsafe { narf_arch::x86_64::io_port::inb(self.control_port) } & EC_STS_OBF != 0,
+            100_000,
+        );
+        if done {
+            Ok(())
+        } else {
+            Err(DriverError::Timeout)
         }
-        Err(DriverError::Timeout)
     }
 
     pub fn read_byte(&self, addr: u8) -> Result<u8, DriverError> {

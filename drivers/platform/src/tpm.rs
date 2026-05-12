@@ -168,16 +168,13 @@ impl Tpm {
                 unsafe {
                     write32(base + REG_LOC_CTRL, LOC_CTRL_REQ_ACCESS);
                 }
-                let mut granted = false;
-                for _ in 0..1_000_000u32 {
-                    // SAFETY: same.
-                    let s = unsafe { read32(base + REG_LOC_STS) };
-                    if s & LOC_STS_GRANTED != 0 {
-                        granted = true;
-                        break;
-                    }
-                    core::hint::spin_loop();
-                }
+                // responsive_spin ticks sleep_pumps so cursor/FB stay
+                // alive while waiting for the locality to be granted.
+                let granted = narf_scheduler::responsive_spin(
+                    // SAFETY: identity-mapped MMIO.
+                    || unsafe { read32(base + REG_LOC_STS) } & LOC_STS_GRANTED != 0,
+                    1_000_000,
+                );
                 if !granted {
                     return Err(TpmError::LocalityTimeout);
                 }
@@ -254,14 +251,13 @@ impl Tpm {
             write32(self.base + REG_CRB_CTRL_REQ, CTRL_REQ_CMD_READY);
         }
         // Wait until idle clears (TPM is in command-ready state).
-        for _ in 0..1_000_000u32 {
-            // SAFETY: same.
-            let s = unsafe { read32(self.base + REG_CRB_CTRL_STS) };
-            if s & CTRL_STS_TPM_IDLE == 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+        // Timeout ignored, mirroring prior behaviour — the GO write
+        // below will fail loudly if the TPM never left idle.
+        let _ = narf_scheduler::responsive_spin(
+            // SAFETY: identity-mapped MMIO.
+            || unsafe { read32(self.base + REG_CRB_CTRL_STS) } & CTRL_STS_TPM_IDLE == 0,
+            1_000_000,
+        );
         // 2. Write command into the command buffer.
         // SAFETY: command buffer phys was published by firmware/ACPI.
         unsafe {
@@ -275,18 +271,15 @@ impl Tpm {
             write32(self.base + REG_CRB_CTRL_START, CTRL_START_GO);
         }
         // 4. Poll for start bit to self-clear (cmd complete).
-        let mut spins = 0u32;
-        loop {
-            // SAFETY: same.
-            let s = unsafe { read32(self.base + REG_CRB_CTRL_START) };
-            if s & CTRL_START_GO == 0 {
-                break;
-            }
-            spins += 1;
-            if spins > 50_000_000 {
-                return Err(TpmError::BusyTimeout);
-            }
-            core::hint::spin_loop();
+        // responsive_spin ticks sleep_pumps so cursor/FB stay alive
+        // during the multi-second worst case (RSA keygen, etc.).
+        let done = narf_scheduler::responsive_spin(
+            // SAFETY: identity-mapped MMIO.
+            || unsafe { read32(self.base + REG_CRB_CTRL_START) } & CTRL_START_GO == 0,
+            50_000_000,
+        );
+        if !done {
+            return Err(TpmError::BusyTimeout);
         }
         // 5. Read response. The size lives in bytes [2..6] of the
         //    response header (TPM2 §5.6 paragraphSize).
@@ -315,25 +308,22 @@ impl Tpm {
         unsafe {
             write8(self.base + REG_TIS_ACCESS, TIS_ACCESS_REQUEST_USE);
         }
-        for _ in 0..1_000_000u32 {
-            // SAFETY: same.
-            let a = unsafe { read8(self.base + REG_TIS_ACCESS) };
-            if a & TIS_ACCESS_ACTIVE != 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+        // responsive_spin ticks sleep_pumps so cursor/FB stay alive
+        // while the TPM acknowledges locality 0.
+        let _ = narf_scheduler::responsive_spin(
+            // SAFETY: identity-mapped MMIO.
+            || unsafe { read8(self.base + REG_TIS_ACCESS) } & TIS_ACCESS_ACTIVE != 0,
+            1_000_000,
+        );
         // 2. Write command into the FIFO.
         for b in cmd {
-            // Wait for STS.EXPECT before each byte.
-            for _ in 0..1_000_000u32 {
-                // SAFETY: same.
-                let s = unsafe { read8(self.base + REG_TIS_STS) };
-                if s & TIS_STS_EXPECT != 0 {
-                    break;
-                }
-                core::hint::spin_loop();
-            }
+            // Wait for STS.EXPECT before each byte. responsive_spin
+            // ticks sleep_pumps so cursor/FB stay alive on slow TPMs.
+            let _ = narf_scheduler::responsive_spin(
+                // SAFETY: identity-mapped MMIO.
+                || unsafe { read8(self.base + REG_TIS_STS) } & TIS_STS_EXPECT != 0,
+                1_000_000,
+            );
             // SAFETY: same.
             unsafe {
                 write8(self.base + REG_TIS_DATA_FIFO, *b);
@@ -344,19 +334,19 @@ impl Tpm {
         unsafe {
             write8(self.base + REG_TIS_STS, TIS_STS_GO);
         }
-        // 4. Wait for STS.DATA_AVAIL.
-        let mut spins = 0u32;
-        loop {
-            // SAFETY: same.
-            let s = unsafe { read8(self.base + REG_TIS_STS) };
-            if s & (TIS_STS_VALID | TIS_STS_DATA_AVAIL) == (TIS_STS_VALID | TIS_STS_DATA_AVAIL) {
-                break;
-            }
-            spins += 1;
-            if spins > 50_000_000 {
-                return Err(TpmError::BusyTimeout);
-            }
-            core::hint::spin_loop();
+        // 4. Wait for STS.DATA_AVAIL. responsive_spin ticks
+        // sleep_pumps so cursor/FB stay alive during multi-second
+        // worst cases.
+        let done = narf_scheduler::responsive_spin(
+            || {
+                // SAFETY: identity-mapped MMIO.
+                let s = unsafe { read8(self.base + REG_TIS_STS) };
+                s & (TIS_STS_VALID | TIS_STS_DATA_AVAIL) == (TIS_STS_VALID | TIS_STS_DATA_AVAIL)
+            },
+            50_000_000,
+        );
+        if !done {
+            return Err(TpmError::BusyTimeout);
         }
         // 5. Drain FIFO until DATA_AVAIL clears.
         let mut out: Vec<u8> = Vec::new();
