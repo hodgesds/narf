@@ -411,29 +411,24 @@ impl IntelHda {
             let g = bar0.read32(REG_GCTL);
             bar0.write32(REG_GCTL, g & !GCTL_CRST);
         }
-        // Wait for reset to take effect.
-        for _ in 0..10_000 {
+        // Wait for reset to take effect. responsive_spin ticks
+        // sleep_pumps so cursor/FB stay alive across the deassert.
+        let _ = narf_scheduler::responsive_spin(
             // SAFETY: same.
-            let g = unsafe { bar0.read32(REG_GCTL) };
-            if g & GCTL_CRST == 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+            || unsafe { bar0.read32(REG_GCTL) } & GCTL_CRST == 0,
+            10_000,
+        );
         // SAFETY: same.
         unsafe {
             bar0.write32(REG_GCTL, GCTL_CRST | GCTL_UNSOL);
         }
-        let mut crst_ok = false;
-        for _ in 0..50_000 {
+        // responsive_spin keeps cursor/FB alive while the
+        // controller comes out of reset.
+        let crst_ok = narf_scheduler::responsive_spin(
             // SAFETY: same.
-            let g = unsafe { bar0.read32(REG_GCTL) };
-            if g & GCTL_CRST != 0 {
-                crst_ok = true;
-                break;
-            }
-            core::hint::spin_loop();
-        }
+            || unsafe { bar0.read32(REG_GCTL) } & GCTL_CRST != 0,
+            50_000,
+        );
         if !crst_ok {
             return Err(HdaError::ResetTimeout);
         }
@@ -535,26 +530,22 @@ impl IntelHda {
         unsafe {
             bar0.write16(REG_CORBRP, 1 << 15);
         }
-        for _ in 0..10_000 {
+        // responsive_spin ticks sleep_pumps across the read-pointer
+        // reset handshake.
+        let _ = narf_scheduler::responsive_spin(
             // SAFETY: same.
-            let v = unsafe { bar0.read16(REG_CORBRP) };
-            if v & (1 << 15) != 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+            || unsafe { bar0.read16(REG_CORBRP) } & (1 << 15) != 0,
+            10_000,
+        );
         // SAFETY: same.
         unsafe {
             bar0.write16(REG_CORBRP, 0);
         }
-        for _ in 0..10_000 {
+        let _ = narf_scheduler::responsive_spin(
             // SAFETY: same.
-            let v = unsafe { bar0.read16(REG_CORBRP) };
-            if v & (1 << 15) == 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+            || unsafe { bar0.read16(REG_CORBRP) } & (1 << 15) == 0,
+            10_000,
+        );
         // CORBWP starts at 0; software writes the *next* slot's
         // index, hardware advances CORBRP to it.
         // SAFETY: same.
@@ -716,26 +707,22 @@ impl IntelHda {
         unsafe {
             bar0.write32(sd + SD_CTL, SDCTL_SRST);
         }
-        for _ in 0..10_000 {
+        // responsive_spin ticks sleep_pumps across the per-stream
+        // SRST handshake.
+        let _ = narf_scheduler::responsive_spin(
             // SAFETY: same.
-            let v = unsafe { bar0.read32(sd + SD_CTL) };
-            if v & SDCTL_SRST != 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+            || unsafe { bar0.read32(sd + SD_CTL) } & SDCTL_SRST != 0,
+            10_000,
+        );
         // SAFETY: same.
         unsafe {
             bar0.write32(sd + SD_CTL, 0);
         }
-        for _ in 0..10_000 {
+        let _ = narf_scheduler::responsive_spin(
             // SAFETY: same.
-            let v = unsafe { bar0.read32(sd + SD_CTL) };
-            if v & SDCTL_SRST == 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+            || unsafe { bar0.read32(sd + SD_CTL) } & SDCTL_SRST == 0,
+            10_000,
+        );
 
         // 14. Allocate BDL (must be 128-byte aligned, §3.6.2; a 4 KiB
         //     page satisfies that) + a single 4 KiB silence period.
@@ -1176,15 +1163,13 @@ impl IntelHda {
         unsafe {
             self.bar0.write32(sd + SD_CTL, cur | SDCTL_RUN);
         }
-        for _ in 0..1_000_000u32 {
+        // responsive_spin ticks sleep_pumps so cursor/FB stay
+        // alive while the engine acks RUN.
+        narf_scheduler::responsive_spin(
             // SAFETY: same.
-            let v = unsafe { self.bar0.read32(sd + SD_CTL) };
-            if v & SDCTL_RUN != 0 {
-                return true;
-            }
-            core::hint::spin_loop();
-        }
-        false
+            || unsafe { self.bar0.read32(sd + SD_CTL) } & SDCTL_RUN != 0,
+            1_000_000,
+        )
     }
 
     /// Stop the prepared output stream by clearing SDnCTL.RUN.
@@ -1201,15 +1186,13 @@ impl IntelHda {
         unsafe {
             self.bar0.write32(sd + SD_CTL, cur & !SDCTL_RUN);
         }
-        for _ in 0..1_000_000u32 {
+        // responsive_spin ticks sleep_pumps so cursor/FB stay
+        // alive while the engine acks the stop.
+        narf_scheduler::responsive_spin(
             // SAFETY: same.
-            let v = unsafe { self.bar0.read32(sd + SD_CTL) };
-            if v & SDCTL_RUN == 0 {
-                return true;
-            }
-            core::hint::spin_loop();
-        }
-        false
+            || unsafe { self.bar0.read32(sd + SD_CTL) } & SDCTL_RUN == 0,
+            1_000_000,
+        )
     }
 
     /// Read SDnLPIB — the linear position in the cyclic buffer at
@@ -1539,28 +1522,28 @@ unsafe fn send_verb_polled(
     }
 
     // 3. Poll RIRBWP for the matching response. RIRB entries are
-    //    8 bytes: u32 response + u32 response_extended.
+    //    8 bytes: u32 response + u32 response_extended. responsive_spin
+    //    ticks sleep_pumps so cursor/FB/serial stay alive across a
+    //    slow codec response.
     let target = next; // RIRB and CORB advance in lockstep
-    let mut spins = 0u32;
-    loop {
+    let done = narf_scheduler::responsive_spin(
         // SAFETY: BAR0 mapped.
-        let rwp = unsafe { bar0.read16(REG_RIRBWP) };
-        if rwp == target {
-            let mut g = rirb_rp.lock();
-            *g = rwp;
-            // SAFETY: identity-mapped DMA, slot inside the 2 KiB ring.
-            let resp = unsafe {
-                let slot = (rirb_phys + (rwp as u64) * 8) as *const u32;
-                slot.read_volatile()
-            };
-            return Ok(resp);
-        }
-        spins += 1;
-        if spins > 1_000_000 {
-            return Err(HdaError::CommandTimeout);
-        }
-        core::hint::spin_loop();
+        || unsafe { bar0.read16(REG_RIRBWP) } == target,
+        1_000_000,
+    );
+    if !done {
+        return Err(HdaError::CommandTimeout);
     }
+    // SAFETY: BAR0 mapped.
+    let rwp = unsafe { bar0.read16(REG_RIRBWP) };
+    let mut g = rirb_rp.lock();
+    *g = rwp;
+    // SAFETY: identity-mapped DMA, slot inside the 2 KiB ring.
+    let resp = unsafe {
+        let slot = (rirb_phys + (rwp as u64) * 8) as *const u32;
+        slot.read_volatile()
+    };
+    Ok(resp)
 }
 
 // ── Driver-match registration ──────────────────────────────────────

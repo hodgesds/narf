@@ -158,16 +158,13 @@ impl AcpDevice {
         unsafe {
             mmio.write32(regs::ACP_SOFT_RESET, regs::RESET_REQUEST);
         }
-        let mut done = false;
-        for _ in 0..1_000_000u32 {
+        // responsive_spin ticks sleep_pumps so cursor/FB stay alive
+        // during ACP soft-reset settle.
+        let done = narf_scheduler::responsive_spin(
             // SAFETY: same.
-            let v = unsafe { mmio.read32(regs::ACP_SOFT_RESET) };
-            if v & regs::RESET_DONE != 0 {
-                done = true;
-                break;
-            }
-            core::hint::spin_loop();
-        }
+            || unsafe { mmio.read32(regs::ACP_SOFT_RESET) } & regs::RESET_DONE != 0,
+            1_000_000,
+        );
         if !done {
             return Err(AcpError::ResetTimeout);
         }
@@ -226,17 +223,14 @@ impl AcpDevice {
             self.mmio.write32(regs::ACP_RI_KICK, 1);
         }
 
-        // Wait for ACP_STATUS.READY.
-        let mut ready = false;
-        for _ in 0..10_000_000u32 {
+        // Wait for ACP_STATUS.READY. responsive_spin ticks
+        // sleep_pumps so cursor/FB/serial stay alive across the
+        // ~10ms RI DMA load.
+        let ready = narf_scheduler::responsive_spin(
             // SAFETY: same.
-            let s = unsafe { self.mmio.read32(regs::ACP_STATUS) };
-            if s & regs::STATUS_READY != 0 {
-                ready = true;
-                break;
-            }
-            core::hint::spin_loop();
-        }
+            || unsafe { self.mmio.read32(regs::ACP_STATUS) } & regs::STATUS_READY != 0,
+            10_000_000,
+        );
         if !ready {
             return Err(AcpError::FirmwareLoadFailed);
         }
