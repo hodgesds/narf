@@ -1126,8 +1126,8 @@ impl Xhci {
             }
         }
         let mut last_err = XhciError::PortResetTimeout;
-        for _retry in 0..RESET_RETRIES {
-            match self.port_reset_once(port, off) {
+        for retry in 0..RESET_RETRIES {
+            match self.port_reset_once(port, off, retry as u8) {
                 Ok(v) => return Ok(v),
                 Err(e) => last_err = e,
             }
@@ -1149,7 +1149,7 @@ impl Xhci {
     /// One reset attempt. Factored out so `port_reset` can retry
     /// on a CSC-bounce or PED-drop without re-doing the CCS
     /// debounce.
-    fn port_reset_once(&self, port: u8, off: u64) -> Result<u32, XhciError> {
+    fn port_reset_once(&self, port: u8, off: u64, retry: u8) -> Result<u32, XhciError> {
         // SAFETY: identity-mapped MMIO; off bounded by caller.
         let cur = unsafe { self.mmio.read32(off) };
         // First: ack ALL stale RW1C change bits left over from a
@@ -1265,12 +1265,16 @@ impl Xhci {
                             // SAFETY: same MMIO region.
                             let v = unsafe { self.mmio.read32(off) };
                             if v & PORTSC_CSC != 0 {
+                                PORT_RESET_LAST_FAIL
+                                    .store(port, retry, PortResetFailReason::CscBounce, v);
                                 let ack = (v & !PORTSC_CHG_MASK) | PORTSC_CSC;
                                 // SAFETY: same.
                                 unsafe { self.mmio.write32(off, ack); }
                                 return Err(XhciError::PortResetTimeout);
                             }
                             if v & PORTSC_PED == 0 {
+                                PORT_RESET_LAST_FAIL
+                                    .store(port, retry, PortResetFailReason::PedDrop, v);
                                 return Err(XhciError::PortResetTimeout);
                             }
                             stable_post = v;
@@ -2529,6 +2533,69 @@ impl AddrDevLastFail {
     }
 }
 pub static ADDR_DEV_LAST_FAIL: AddrDevLastFail = AddrDevLastFail::new();
+
+/// Last-failure capture for `port_reset_once`. Lets the FB
+/// status panel show why the retry loop is bouncing — the
+/// PORTSC value at the bounce detection point + which retry
+/// caught it + the failure reason (CSC vs PED-drop vs PR/PRC
+/// timeout).
+#[derive(Debug)]
+pub struct PortResetLastFail {
+    raw: core::sync::atomic::AtomicU64,
+    portsc: core::sync::atomic::AtomicU32,
+}
+impl PortResetLastFail {
+    const fn new() -> Self {
+        Self {
+            raw: core::sync::atomic::AtomicU64::new(0),
+            portsc: core::sync::atomic::AtomicU32::new(0),
+        }
+    }
+    fn store(&self, port: u8, retry: u8, reason: PortResetFailReason, portsc: u32) {
+        let prev = self.raw.load(core::sync::atomic::Ordering::Relaxed);
+        let seq = (prev >> 32) as u32 + 1;
+        let lo = (port as u64)
+            | ((retry as u64) << 8)
+            | ((reason as u64 & 0xFF) << 16);
+        self.raw
+            .store(((seq as u64) << 32) | lo, core::sync::atomic::Ordering::Release);
+        self.portsc
+            .store(portsc, core::sync::atomic::Ordering::Release);
+    }
+    /// `(seq, port, retry, reason, portsc)` or None if no fail recorded.
+    pub fn snapshot(&self) -> Option<(u32, u8, u8, u8, u32)> {
+        let raw = self.raw.load(core::sync::atomic::Ordering::Acquire);
+        let seq = (raw >> 32) as u32;
+        if seq == 0 {
+            return None;
+        }
+        Some((
+            seq,
+            (raw & 0xFF) as u8,
+            ((raw >> 8) & 0xFF) as u8,
+            ((raw >> 16) & 0xFF) as u8,
+            self.portsc.load(core::sync::atomic::Ordering::Acquire),
+        ))
+    }
+}
+pub static PORT_RESET_LAST_FAIL: PortResetLastFail = PortResetLastFail::new();
+
+#[repr(u8)]
+#[derive(Copy, Clone, Debug)]
+pub enum PortResetFailReason {
+    /// CSC (Connect Status Change) fired during the post-reset
+    /// stability debounce — the device disconnected/reconnected.
+    CscBounce = 1,
+    /// PED dropped during the post-reset stability debounce — the
+    /// reset succeeded transiently but the link came undone.
+    PedDrop = 2,
+    /// PR didn't self-clear / PRC didn't set within the wait
+    /// window. Almost always a dead port.
+    PrTimeout = 3,
+    /// Success-criteria poll timed out (PED never asserted, or
+    /// PLS never reached U0 on USB3).
+    PedNeverSet = 4,
+}
 
 static CONTROLLER: IrqSafeSpinLock<Option<Xhci>> = IrqSafeSpinLock::new(None);
 
