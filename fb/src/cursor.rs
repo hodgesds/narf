@@ -173,6 +173,21 @@ pub fn drain_and_render(fb: &FbWriter) {
             }
         }
     }
+    // Re-paint the diagnostic panel every ~0.5 s so the klog tail
+    // stays live (boot-time snapshot was painted once before the
+    // executor started; after that, fresh log lines never reach the
+    // panel without this). Throttled by a wall-clock check to avoid
+    // burning the FB on every scheduler tick.
+    static LAST_REPAINT_NS: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+    let now_ns = narf_scheduler::narf_time::monotonic_ns();
+    let last = LAST_REPAINT_NS.load(Ordering::Acquire);
+    const REPAINT_INTERVAL_NS: u64 = 500_000_000;
+    if now_ns.saturating_sub(last) > REPAINT_INTERVAL_NS {
+        LAST_REPAINT_NS.store(now_ns, Ordering::Release);
+        crate::status::paint(fb);
+    }
+
     if !moved {
         return;
     }
