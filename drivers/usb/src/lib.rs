@@ -58,11 +58,13 @@ pub fn register_initcalls() {
     // NotPresent when no xHCI controller is bound, which avoids
     // spawning a forever-sleeping supervisor task on systems
     // without USB 3.0.
-    // No `usb-hid-supervisor` initcall: the supervisor is spawned
-    // by `spawn_usb_hid_supervisor()` from bare_main *after* the
-    // second `narf_scheduler::init()`. That init wipes the ready
-    // queue for hermetic test isolation; a task spawned here would
-    // be silently dropped (same shape as fb-cursor-pump).
+    narf_init::register(Stage::Late, "usb-hid-supervisor", || {
+        if !xhci::is_probed() {
+            return InitResult::NotPresent;
+        }
+        spawn_supervisor_task();
+        InitResult::Ok
+    });
     narf_init::register(Stage::Device, "usb-mass-storage", || {
         if !xhci::is_probed() {
             return InitResult::NotPresent;
@@ -80,16 +82,7 @@ pub fn register_initcalls() {
 /// xHCI port the controller reports as connected, attempts to
 /// bind a HID Boot Keyboard and Boot Mouse on each, then loops
 /// pumping interrupt-IN reports onto the global input ring.
-///
-/// Called by bare_main *after* the second `narf_scheduler::init()`
-/// so the spawn survives — the Stage::Late initcall point is too
-/// early because that init wipes the ready queue.
-///
-/// No-op (returns false) when no xHCI controller has probed.
-pub fn spawn_usb_hid_supervisor() -> bool {
-    if !xhci::is_probed() {
-        return false;
-    }
+fn spawn_supervisor_task() {
     narf_scheduler::spawn(async {
         const PUMP_CYCLES: u64 = 16_000_000;
         let mut irq_vector: Option<u8> = None;
@@ -139,5 +132,4 @@ pub fn spawn_usb_hid_supervisor() -> bool {
             }
         }
     });
-    true
 }

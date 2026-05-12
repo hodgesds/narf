@@ -2102,8 +2102,18 @@ fn run_async_demo() -> ! {
         }
     }
 
-    narf_scheduler::init();
-    let _ = writeln!(console::Writer, "  scheduler: ready queue initialised");
+    // NOTE: do NOT call narf_scheduler::init() here. It already
+    // ran before AP bring-up (line ~1247) and the queues survive.
+    // A second init() unconditionally wipes every per-CPU
+    // VecDeque, dropping any task spawned by Stage::Late
+    // initcalls (cursor pump, USB HID supervisor, FB drain task,
+    // anything else that spawns long-running work). That was a
+    // silent kill — tasks vanished without a panic and the
+    // affected subsystems just stopped working on real HW.
+    let _ = writeln!(
+        console::Writer,
+        "  scheduler: ready queues already live (no re-init)"
+    );
 
     #[cfg(feature = "boot-init")]
     boot_userspace_init();
@@ -2134,33 +2144,21 @@ fn run_async_demo() -> ! {
     // futures (init / shell) loop forever, so run_until_empty never
     // returns; if we waited until after to spawn the pump, the
     // mouse would never move.
-    let cursor_spawned = narf_fb::spawn_cursor_pump();
-    if cursor_spawned {
-        let _ = writeln!(
-            console::Writer,
-            "  cursor: pump spawned (FB up)"
-        );
-    }
-    // Spawn the USB HID supervisor at the same point as the cursor
-    // pump for the same reason — Stage::Late spawn would be wiped
-    // by the scheduler::init() above. Without this the keyboard
-    // pipeline never runs even though every other piece (xHCI
-    // probe, attach helpers, klog) is wired.
-    if narf_drivers_usb::spawn_usb_hid_supervisor() {
-        let _ = writeln!(
-            console::Writer,
-            "  usb-hid: supervisor spawned (xHCI up)"
-        );
-    }
-    if cursor_spawned {
-        // Paint the diagnostic panel after both pumps are spawned
-        // so the supervisor has had at least one chance to log
-        // attach failures into klog before we snapshot.
+    // Cursor pump + USB HID supervisor are spawned by their own
+    // Stage::Late initcalls — no manual re-spawn needed now that
+    // the redundant scheduler::init() above is gone.
+    if narf_fb::info().is_some() {
         let cap = narf_fb::bootstrap_writer();
         if let Ok(panel_writer) = narf_fb::FbWriter::new(cap) {
             narf_fb::status::paint(&panel_writer);
         }
     }
+    // FB up implies the cursor-pump task was spawned by the
+    // fb-cursor-pump initcall (and the USB HID supervisor by
+    // its own initcall). Used as the gate for run_forever
+    // below — when there's an interactive surface, we don't
+    // exit after the demo.
+    let interactive = narf_fb::info().is_some();
 
     let _ = writeln!(
         console::Writer,
@@ -2185,13 +2183,13 @@ fn run_async_demo() -> ! {
         let _ = writeln!(console::Writer, "  timer IRQs delivered: {} ticks", ticks);
     }
 
-    // If the cursor pump (and any user tasks) were spawned, the
-    // executor only got here because every task is parked AND
-    // there's nothing to steal — usually a transient state. Switch
-    // to run_forever so timer/IRQ wakes resume polling instead of
-    // exiting; without this the kernel would proceed to the
-    // exit-kernel path and tear down the still-live tasks.
-    if cursor_spawned {
+    // Interactive boot (FB up → cursor pump + USB HID supervisor
+    // are alive): switch to run_forever so timer/IRQ wakes resume
+    // polling instead of exiting. Without this the kernel would
+    // proceed to the exit-kernel path and tear down still-live
+    // tasks. Headless boots (no FB) fall through to the existing
+    // 5 s pause + exit_kernel path.
+    if interactive {
         let _ = writeln!(
             console::Writer,
             "  Stage 1 exit-gate demo complete; entering interactive run_forever"

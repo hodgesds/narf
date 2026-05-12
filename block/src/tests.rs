@@ -135,7 +135,7 @@ fn smoke_block_encrypted_round_trip() -> TestResult {
         }
     }
 
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
     let inner = Arc::new(MemoryBlockDevice {
         data: IrqSafeSpinLock::new(alloc::vec![0u8; 1024 * 512]),
     });

@@ -84,7 +84,7 @@ mod tests {
     }
 
     fn smoke_pmbus_read_cycle() -> TestResult {
-        narf_scheduler::init();
+        narf_scheduler::__reset_queues_for_test();
         let mock = Arc::new(MockPmBus {
             reads: AtomicU32::new(0),
         });

@@ -320,8 +320,38 @@ impl TaskSpec {
 /// would only re-arm one of the zombies (typically a timer tick
 /// that satisfies a sleep deadline far in the future).
 pub fn init() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static INITIALIZED: AtomicBool = AtomicBool::new(false);
+    if INITIALIZED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        // Double-init is a *bug*. Pre-fix this path
+        // unconditionally re-built every per-CPU VecDeque, silently
+        // dropping any task spawned in between (cursor pump + USB
+        // HID supervisor were historic victims — both spawned
+        // during Stage::Late initcalls and disappeared when
+        // bare_main re-init'd before run_async_demo). Panic now so
+        // the mistake surfaces at the call site instead of becoming
+        // a silent kill weeks later. Tests that need a fresh queue
+        // call `__reset_queues_for_test` explicitly.
+        panic!("narf_scheduler::init() called twice — would wipe spawned tasks; use __reset_queues_for_test in tests");
+    }
     for q in READY.iter() {
         *q.lock() = Some(VecDeque::new());
+    }
+}
+
+/// Test-only hook: clear every ready queue without re-running
+/// `init()`. Hermetic isolation between verification smokes that
+/// build their own task graph and need an empty queue without
+/// touching the one-shot `INITIALIZED` flag in `init`.
+#[doc(hidden)]
+pub fn __reset_queues_for_test() {
+    for q in READY.iter() {
+        if let Some(d) = q.lock().as_mut() {
+            d.clear();
+        }
     }
 }
 

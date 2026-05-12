@@ -124,7 +124,7 @@ mod tests {
     }
 
     fn smoke_pwm_async() -> TestResult {
-        narf_scheduler::init();
+        narf_scheduler::__reset_queues_for_test();
         let pwm = Arc::new(MockPwm {
             state: IrqSafeSpinLock::new(Vec::new()),
             channels: 4,

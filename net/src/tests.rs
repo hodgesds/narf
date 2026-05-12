@@ -12,7 +12,7 @@ fn smoke_net_loopback_register() -> TestResult {
 
     // Scheduler must be live: register_loopback_named spawns a
     // forwarder task at registration time (per the Stage-3 spec).
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
 
     let authority = bootstrap_authority();
     let before = registry().len();
@@ -63,7 +63,7 @@ fn smoke_net_loopback_roundtrip() -> TestResult {
     OUTCOME.store(0, Ordering::Relaxed);
     GOT_LEN.store(0, Ordering::Relaxed);
 
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
 
     let authority = bootstrap_authority();
     if register_loopback_named(&authority, "lo.smoke-roundtrip").is_err() {
@@ -137,7 +137,7 @@ kernel_test_in!("net", smoke_net_loopback_roundtrip);
 fn smoke_net_loopback_revoked_authority() -> TestResult {
     use crate::{bootstrap_authority, register_loopback_named, RegisterError};
 
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
 
     let authority = bootstrap_authority();
     authority.revoke();

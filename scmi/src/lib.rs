@@ -111,7 +111,7 @@ mod tests {
     }
 
     fn smoke_scmi_async_mock() -> TestResult {
-        narf_scheduler::init();
+        narf_scheduler::__reset_queues_for_test();
         let success = Arc::new(AtomicUsize::new(0));
         let s = success.clone();
 

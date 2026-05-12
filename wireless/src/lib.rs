@@ -191,7 +191,7 @@ mod tests {
     }
 
     fn smoke_wireless_scan_busy_logic() -> TestResult {
-        narf_scheduler::init();
+        narf_scheduler::__reset_queues_for_test();
         let mock = Arc::new(MockWireless::new());
         let success = Arc::new(AtomicBool::new(false));
 
@@ -222,7 +222,7 @@ mod tests {
     kernel_test_in!("wireless", smoke_wireless_scan_busy_logic);
 
     fn smoke_wireless_association_state() -> TestResult {
-        narf_scheduler::init();
+        narf_scheduler::__reset_queues_for_test();
         let mock = Arc::new(MockWireless::new());
         let success = Arc::new(AtomicBool::new(false));
 

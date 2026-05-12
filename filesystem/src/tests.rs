@@ -106,7 +106,7 @@ fn smoke_fs_initramfs_read() -> TestResult {
         None => return TestResult::Fail("resolve(hello) returned None"),
     };
 
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
     narf_scheduler::spawn(async move {
         let mut buf = [0u8; 16];
         let n = match file.read(0, &mut buf).await {

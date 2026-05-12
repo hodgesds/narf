@@ -544,7 +544,7 @@ mod i2c_hid_smokes {
     where
         F: core::future::Future<Output = TestResult> + Send + 'static,
     {
-        narf_scheduler::init();
+        narf_scheduler::__reset_queues_for_test();
         let result = Arc::new(AtomicI32::new(-1));
         let r = result.clone();
         narf_scheduler::spawn(async move {

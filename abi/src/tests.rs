@@ -83,7 +83,7 @@ fn smoke_abi_ring_roundtrip() -> TestResult {
     static RECEIVED_TAG: AtomicU64 = AtomicU64::new(0);
 
     RECEIVED_TAG.store(0, Ordering::Relaxed);
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
 
     let (mut sq_tx, mut sq_rx) = crate::submission_channel::<4>();
     let (mut cq_tx, mut cq_rx) = crate::completion_channel::<4>();
@@ -122,7 +122,7 @@ fn smoke_abi_dispatcher_roundtrip() -> TestResult {
 
     static OUTCOME: AtomicU8 = AtomicU8::new(0);
 
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
 
     let (mut sq_tx, sq_rx) = submission_channel::<4>();
     let (cq_tx, mut cq_rx) = completion_channel::<4>();
@@ -189,7 +189,7 @@ fn smoke_abi_cancel_before_target_marks_cancelled() -> TestResult {
 
     static OUTCOME: AtomicU8 = AtomicU8::new(0);
 
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
     let (mut sq_tx, sq_rx) = submission_channel::<4>();
     let (cq_tx, mut cq_rx) = completion_channel::<4>();
 
@@ -246,7 +246,7 @@ fn smoke_abi_cancel_non_cancellable_marks_request() -> TestResult {
 
     static OUTCOME: AtomicU8 = AtomicU8::new(0);
 
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
     let (mut sq_tx, sq_rx) = submission_channel::<4>();
     let (cq_tx, mut cq_rx) = completion_channel::<4>();
 
@@ -302,7 +302,7 @@ fn smoke_abi_dispatch_latency_accumulates() -> TestResult {
 
     let before = ABI_DISPATCH_LATENCY.welford().count;
 
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
     let (mut sq_tx, sq_rx) = submission_channel::<4>();
     let (cq_tx, mut cq_rx) = completion_channel::<4>();
 
@@ -360,7 +360,7 @@ fn smoke_abi_linked_chain_cancels_forward() -> TestResult {
 
     static OUTCOME: AtomicU8 = AtomicU8::new(0);
 
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
     let (mut sq_tx, sq_rx) = submission_channel::<8>();
     let (cq_tx, mut cq_rx) = completion_channel::<8>();
 
@@ -443,7 +443,7 @@ fn smoke_abi_cancel_stale_tag_is_noop() -> TestResult {
 
     static OUTCOME: AtomicU8 = AtomicU8::new(0);
 
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
     let (mut sq_tx, sq_rx) = submission_channel::<4>();
     let (cq_tx, mut cq_rx) = completion_channel::<4>();
 

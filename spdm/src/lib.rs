@@ -204,7 +204,7 @@ mod tests {
     }
 
     fn smoke_spdm_session_flow() -> TestResult {
-        narf_scheduler::init();
+        narf_scheduler::__reset_queues_for_test();
         let success = Arc::new(core::sync::atomic::AtomicBool::new(false));
         let s = success.clone();
 

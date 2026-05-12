@@ -243,7 +243,7 @@ fn smoke_drivers_register_and_lifecycle() -> TestResult {
         _ => return TestResult::Fail("post-register phase not Loaded"),
     }
 
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
     narf_scheduler::spawn(async {
         let _ = registry().start_named("noop.smoke-1").await;
     });
@@ -253,7 +253,7 @@ fn smoke_drivers_register_and_lifecycle() -> TestResult {
         _ => return TestResult::Fail("post-start phase not Started"),
     }
 
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
     narf_scheduler::spawn(async {
         let _ = registry().quiesce_named("noop.smoke-1").await;
     });
@@ -263,7 +263,7 @@ fn smoke_drivers_register_and_lifecycle() -> TestResult {
         _ => return TestResult::Fail("post-quiesce phase not Quiesced"),
     }
 
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
     narf_scheduler::spawn(async {
         let _ = registry().start_named("noop.smoke-1").await;
         let _ = registry().quiesce_named("noop.smoke-1").await;
@@ -436,7 +436,7 @@ fn smoke_drivers_unbind_after_quiesce() -> TestResult {
         Ok(h) => h,
         Err(_) => return TestResult::Fail("register"),
     };
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
     narf_scheduler::spawn(async {
         let _ = registry().start_named("noop.unbind-1").await;
         let _ = registry().quiesce_named("noop.unbind-1").await;
@@ -480,7 +480,7 @@ fn smoke_drivers_unbind_refuses_started() -> TestResult {
     {
         return TestResult::Fail("register");
     }
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
     narf_scheduler::spawn(async {
         let _ = registry().start_named("noop.unbind-refuse").await;
     });
@@ -490,7 +490,7 @@ fn smoke_drivers_unbind_refuses_started() -> TestResult {
         return TestResult::Fail("unbind on Started should refuse");
     }
     // Caller now quiesces and retries; expected to succeed.
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
     narf_scheduler::spawn(async {
         let _ = registry().quiesce_named("noop.unbind-refuse").await;
     });

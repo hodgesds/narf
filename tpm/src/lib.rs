@@ -131,7 +131,7 @@ mod tests {
     }
 
     fn smoke_tpm_get_random() -> TestResult {
-        narf_scheduler::init();
+        narf_scheduler::__reset_queues_for_test();
         let mock = Arc::new(MockTpm::new());
         let success = Arc::new(AtomicU32::new(0));
 
@@ -154,7 +154,7 @@ mod tests {
     kernel_test_in!("tpm", smoke_tpm_get_random);
 
     fn smoke_tpm_pcr_extension() -> TestResult {
-        narf_scheduler::init();
+        narf_scheduler::__reset_queues_for_test();
         let mock = Arc::new(MockTpm::new());
         let m = mock.clone();
         narf_scheduler::spawn(async move {

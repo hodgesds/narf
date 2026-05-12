@@ -126,7 +126,7 @@ fn smoke_power_device_pm_lifecycle() -> TestResult {
         Err(_) => return TestResult::Fail("register_device_pm rejected a live cap"),
     };
 
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
     narf_scheduler::spawn(async move {
         let _ = suspend_device(handle).await;
         let _ = resume_device(handle).await;

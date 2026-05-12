@@ -28,7 +28,7 @@ fn smoke_ipc_spsc_round_trip() -> TestResult {
     static SUM: AtomicU64 = AtomicU64::new(0);
 
     SUM.store(0, Ordering::Relaxed);
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
 
     let (mut tx, mut rx) = crate::channel::<u64, 4>();
 
@@ -154,7 +154,7 @@ fn smoke_ipc_spsc_close_eof() -> TestResult {
     static OUTCOME: AtomicU8 = AtomicU8::new(0); // 0=pending, 1=closed, 2=unexpected
 
     OUTCOME.store(0, Ordering::Relaxed);
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
 
     let (tx, mut rx) = crate::channel::<u32, 4>();
 
@@ -192,7 +192,7 @@ fn smoke_ipc_spsc_drain_then_eof() -> TestResult {
 
     COUNT.store(0, Ordering::Relaxed);
     CLOSED.store(0, Ordering::Relaxed);
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
 
     let (mut tx, mut rx) = crate::channel::<u32, 4>();
     narf_scheduler::spawn(async move {
@@ -253,7 +253,7 @@ fn smoke_exit_gate_buffer_handoff() -> TestResult {
     READ_LEN.store(0, Ordering::Relaxed);
 
     let (mut tx, mut rx) = crate::channel::<Handoff, 2>();
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
 
     // "Driver domain" task: allocate, fill, hand off.
     narf_scheduler::spawn(async move {
@@ -351,7 +351,7 @@ fn smoke_exit_gate_revoked_cap_rejected() -> TestResult {
     OUTCOME.store(0, Ordering::Relaxed);
 
     let (mut tx, mut rx) = crate::channel::<Handoff, 2>();
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
 
     narf_scheduler::spawn(async move {
         let Ok(buf) = alloc_coherent(16, DomainId::DRIVER_0) else {
@@ -401,7 +401,7 @@ fn smoke_ipc_mpsc_multi_producer_roundtrip() -> TestResult {
     use core::sync::atomic::{AtomicU32, Ordering};
     use crate::{mpsc_channel, MpscRecvError};
 
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
     static DRAINED: AtomicU32 = AtomicU32::new(0);
     DRAINED.store(0, Ordering::Relaxed);
 

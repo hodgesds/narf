@@ -191,7 +191,7 @@ fn smoke_amd_fch_transfer_refuses_when_disabled() -> TestResult {
     // A driver instance that hasn't run enable() must reject
     // transfer attempts with BadHardware — defends against client
     // drivers racing the controller's bring-up.
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
     let (phys, len) = make_synthetic_mmio(true);
     let drv = AmdFchI2c::new("smoke-noenable".to_string(), phys, len, None);
     let bus: Arc<dyn I2cBus> = Arc::new(drv);

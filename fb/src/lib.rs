@@ -705,25 +705,6 @@ fn init_pump_writer(writer: FbWriter) {
     }
 }
 
-/// Spawn the cursor pump as a scheduler task. Called by the
-/// production boot path *after* the final `narf_scheduler::init()`
-/// so the pump survives. No-op (returns false) if no scanout is up
-/// or `FbWriter::new` fails — caller can treat false as "no
-/// cursor". Idempotent: subsequent calls just spawn another pump
-/// (which is safe but pointless), so call exactly once.
-pub fn spawn_cursor_pump() -> bool {
-    if select_active().is_none() {
-        return false;
-    }
-    let cap = bootstrap_writer();
-    let writer = match FbWriter::new(cap) {
-        Ok(w) => w,
-        Err(_) => return false,
-    };
-    let _ = narf_scheduler::spawn(cursor::pump(writer));
-    true
-}
-
 /// Borrow the boot-cached pump writer if one was installed.
 /// `None` before `fb-drain-task` runs, or when no scanout was
 /// active. Used by the cursor sleep-pump tick to avoid minting a
@@ -823,15 +804,20 @@ pub fn register_initcalls() {
             return InitResult::NotPresent;
         }
         // Sleep-pump tick wires the cursor into the sys_sleep
-        // busy-wait — same justification as the FB drain pump:
-        // without it the cursor freezes while a user task is
-        // parked. The async pump task is *not* spawned here
-        // because bare_main re-runs `narf_scheduler::init()`
-        // after Stage::Late completes (it wipes the ready queue
-        // for hermetic test isolation), which would silently
-        // drop a pump task spawned now. Production boot calls
-        // `narf_fb::spawn_cursor_pump()` after the second init.
+        // busy-wait so the pointer keeps moving while a user
+        // task is parked.
         narf_userspace::handlers::sleep_pumps::register(cursor::sleep_pump_tick);
+        // Spawn the async cursor pump task. Survives because
+        // bare_main no longer re-inits the scheduler after
+        // Stage::Late (the redundant second init() that used to
+        // wipe Stage::Late spawns is gone; init() now panics on
+        // double-call so this can't silently regress).
+        let cap = bootstrap_writer();
+        let writer = match FbWriter::new(cap) {
+            Ok(w) => w,
+            Err(_) => return InitResult::Error("FbWriter::new"),
+        };
+        let _ = narf_scheduler::spawn(cursor::pump(writer));
         InitResult::Ok
     });
     narf_init::register(Stage::Late, "fb-client-demo", || {

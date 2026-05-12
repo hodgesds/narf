@@ -10,7 +10,7 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 fn smoke_scheduler_drives_future() -> TestResult {
     use core::sync::atomic::{AtomicUsize, Ordering};
     static COUNT: AtomicUsize = AtomicUsize::new(0);
-    crate::init();
+    crate::__reset_queues_for_test();
     for _ in 0..3 {
         crate::spawn(async {
             COUNT.fetch_add(1, Ordering::Relaxed);
@@ -63,7 +63,7 @@ fn smoke_scheduler_respects_waker() -> TestResult {
     POLLS.store(0, Ordering::Relaxed);
     *PARKED_WAKER.lock() = None;
 
-    crate::init();
+    crate::__reset_queues_for_test();
     crate::spawn(Parked { ready: false });
     crate::spawn(async {
         // Yield once so Parked gets a turn to register its waker, then
@@ -110,7 +110,7 @@ fn smoke_scheduler_budget_cap_revokes_task() -> TestResult {
     }
 
     RUNS.store(0, Ordering::Relaxed);
-    crate::init();
+    crate::__reset_queues_for_test();
 
     let cap: Cap<CpuBudget, narf_capabilities::Spend> = Cap::bootstrap();
     // Spawn a second task that revokes the budget cap after a few
@@ -246,7 +246,7 @@ fn smoke_scheduler_donate_to_reorders_head() -> TestResult {
     static FIRST_TAG: AtomicU32 = AtomicU32::new(0);
     FIRST_TAG.store(0, Ordering::Relaxed);
 
-    crate::init();
+    crate::__reset_queues_for_test();
 
     let donation: Cap<Task, Invoke> = Cap::bootstrap();
 
@@ -286,7 +286,7 @@ fn smoke_scheduler_current_task_id_during_poll() -> TestResult {
         return TestResult::Fail("current_task_id leaked across tests");
     }
 
-    crate::init();
+    crate::__reset_queues_for_test();
     static OBSERVED: AtomicU64 = AtomicU64::new(u64::MAX);
     OBSERVED.store(u64::MAX, Ordering::Relaxed);
 
@@ -309,7 +309,7 @@ fn smoke_scheduler_donate_to_rejects_revoked_cap() -> TestResult {
     use crate::{donate_to, DonateError, Task, TaskId};
     use narf_capabilities::{Cap, Invoke};
 
-    crate::init();
+    crate::__reset_queues_for_test();
     let cap: Cap<Task, Invoke> = Cap::bootstrap();
     cap.revoke();
     match donate_to(TaskId(1), &cap) {
@@ -327,7 +327,7 @@ fn smoke_scheduler_donate_to_missing_target() -> TestResult {
     use crate::{donate_to, DonateError, Task, TaskId};
     use narf_capabilities::{Cap, Invoke};
 
-    crate::init();
+    crate::__reset_queues_for_test();
     let cap: Cap<Task, Invoke> = Cap::bootstrap();
     // An id far past any live task's id — guaranteed not to match.
     match donate_to(TaskId(u64::MAX), &cap) {
@@ -371,7 +371,7 @@ fn smoke_scheduler_steal_disabled_returns_clean() -> TestResult {
     // With work-stealing off (the default), an empty BSP queue causes
     // run_until_empty to return promptly. A test that calls it with
     // an empty queue must not block.
-    crate::init();
+    crate::__reset_queues_for_test();
     crate::disable_work_stealing();
     crate::run_until_empty();
     TestResult::Pass
@@ -390,7 +390,7 @@ fn smoke_scheduler_per_cpu_pin_to_bsp() -> TestResult {
     static RAN: AtomicU32 = AtomicU32::new(0);
     RAN.store(0, Ordering::Relaxed);
 
-    crate::init();
+    crate::__reset_queues_for_test();
 
     let spec = TaskSpec {
         affinity: Affinity::pinned(CpuId(0)),
@@ -427,7 +427,7 @@ fn smoke_scheduler_numa_steal_prefers_same_node() -> TestResult {
     static DONE: AtomicU32 = AtomicU32::new(0);
     DONE.store(0, Ordering::Relaxed);
 
-    crate::init();
+    crate::__reset_queues_for_test();
     crate::enable_work_stealing();
 
     for cpu in 0..4u32 {
@@ -462,7 +462,7 @@ fn smoke_scheduler_spawn_user_carries_address_space() -> TestResult {
     use narf_memory::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
     use crate::{address_space_of, spawn_user, TaskSpec};
 
-    crate::init();
+    crate::__reset_queues_for_test();
     static RAN: AtomicU32 = AtomicU32::new(0);
     RAN.store(0, Ordering::Relaxed);
 
@@ -516,7 +516,7 @@ kernel_test_in!("scheduler", smoke_scheduler_spawn_user_carries_address_space);
 fn smoke_sleep_future_waits() -> TestResult {
     use core::sync::atomic::{AtomicBool, Ordering};
     static DONE: AtomicBool = AtomicBool::new(false);
-    crate::init();
+    crate::__reset_queues_for_test();
     let start = narf_time::Instant::now();
     crate::spawn(async {
         narf_time::sleep_cycles(10_000_000).await;

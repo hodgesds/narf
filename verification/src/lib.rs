@@ -800,7 +800,7 @@ fn smoke_block_device_trait() -> TestResult {
     use narf_io::{alloc_coherent, register_with_cap};
     use narf_lib::id::DomainId;
 
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
 
     // 1. Probe a fake device (null addr).
     let mmio = unsafe { VirtioMmioDevice::probe_raw(0) };
@@ -857,7 +857,7 @@ fn smoke_exit_gate_virtio_blk() -> TestResult {
 
     static OUTCOME: AtomicU8 = AtomicU8::new(0);
 
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
 
     // 1. Setup rings and server.
     let (mut req_tx, req_rx) = narf_ipc::channel::<BlockRequest, 4>();
@@ -1065,7 +1065,7 @@ fn smoke_rcu_sleepable_sync_drains() -> TestResult {
         CAP_SET.store(true, Ordering::Release);
     }
 
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
 
     // Holder task — yields three times, then drops the guard.
     narf_scheduler::spawn(async move {
@@ -1127,7 +1127,7 @@ fn smoke_rcu_sleepable_timeout() -> TestResult {
         CAP = Some(SleepableReader::bootstrap_cap());
     }
 
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
 
     // Holder task — holds the guard until DONE flips. Yields each
     // round so the executor doesn't deadlock.
@@ -3201,7 +3201,7 @@ fn smoke_userspace_user_task_future_yield_exit() -> TestResult {
 
     // Boot the executor + wire the user-task hooks so Yield/Exit
     // longjmps reach the polling future.
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
     install_user_task_hooks();
 
     // The user task itself, plus a ".join()" outer task that flips

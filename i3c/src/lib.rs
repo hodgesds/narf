@@ -84,7 +84,7 @@ mod tests {
     }
 
     fn smoke_i3c_transfer() -> TestResult {
-        narf_scheduler::init();
+        narf_scheduler::__reset_queues_for_test();
         let mock = Arc::new(MockI3c {
             transfers: IrqSafeSpinLock::new(Vec::new()),
         });

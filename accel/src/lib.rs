@@ -116,7 +116,7 @@ mod tests {
     }
 
     fn smoke_accel_submit_wait_cycle() -> TestResult {
-        narf_scheduler::init();
+        narf_scheduler::__reset_queues_for_test();
         let mock = Arc::new(MockAccel::new());
         let success = Arc::new(AtomicU64::new(0));
 

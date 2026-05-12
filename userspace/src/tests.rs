@@ -55,7 +55,7 @@ fn smoke_userspace_clone_shares_address_space() -> TestResult {
     //      thread-style "shared AS" guarantee).
 
     crate::syscall::__test_clear_global();
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
 
     let parent_as = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
@@ -116,7 +116,7 @@ fn smoke_userspace_clone_rejects_zero_entry_or_stack() -> TestResult {
     // a task. Does NOT require an AS lookup to be installed.
 
     crate::syscall::__test_clear_global();
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
     install_global(t);
@@ -283,7 +283,7 @@ fn smoke_userspace_spawn_dispatcher_for_helper() -> TestResult {
         return TestResult::Fail("Bootstrap returned non-Ok");
     }
 
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
     let dispatcher_task = spawn_dispatcher_for(FAKE_TASK);
     if dispatcher_task.is_none() {
         return TestResult::Fail("spawn_dispatcher_for returned None");
@@ -551,7 +551,7 @@ fn smoke_userspace_bootstrap_rings_round_trip() -> TestResult {
     static OUTCOME: AtomicU8 = AtomicU8::new(0);
     OUTCOME.store(0, Ordering::Relaxed);
 
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
     narf_scheduler::spawn(async move {
         let mut d = Dispatcher::new(kernel_ends.sq_drain, kernel_ends.cq_prod);
         d.run().await;
@@ -6630,7 +6630,7 @@ fn smoke_abi_dispatcher_serves_file_ops() -> TestResult {
     static MOUNT: &[u8] = b"/test_abi";
     static mut READ_BUF: [u8; 16] = [0u8; 16];
 
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
     narf_scheduler::spawn(async move {
         let mut d = Dispatcher::new(kernel_ends.sq_drain, kernel_ends.cq_prod);
         d.run().await;
@@ -6777,7 +6777,7 @@ fn smoke_abi_dispatcher_serves_mmap() -> TestResult {
     static OUTCOME: AtomicU8 = AtomicU8::new(0);
     OUTCOME.store(0, Ordering::Relaxed);
 
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
     narf_scheduler::spawn(async move {
         let mut d = Dispatcher::new(kernel_ends.sq_drain, kernel_ends.cq_prod);
         d.run().await;
@@ -7101,7 +7101,7 @@ fn smoke_userspace_fork_distinct_address_space() -> TestResult {
     use narf_memory::{Region, RegionPerms, VirtAddr};
 
     crate::syscall::__test_clear_global();
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
 
     let parent_as_inner = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
@@ -7242,7 +7242,7 @@ fn smoke_userspace_fork_inherits_fd_table() -> TestResult {
     use crate::fd;
 
     crate::syscall::__test_clear_global();
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
     fd::init();
 
     let parent_as = match unsafe { AddressSpace::new_for_user() } {
@@ -7300,7 +7300,7 @@ fn smoke_userspace_fork_rejects_without_address_space() -> TestResult {
     // Defence-in-depth: with no AS lookup installed, fork must
     // return InvalidOp rather than panic / spawn a bogus task.
     crate::syscall::__test_clear_global();
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
     *PARENT_AS.lock() = None;
     install_address_space_lookup(lookup_parent_as); // returns None
 
@@ -7347,7 +7347,7 @@ fn smoke_userspace_fork_resumes_child_with_rax_zero() -> TestResult {
     use crate::user_task::UserState;
 
     crate::syscall::__test_clear_global();
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
 
     let parent_as = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),

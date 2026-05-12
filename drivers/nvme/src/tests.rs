@@ -865,7 +865,7 @@ fn smoke_executor_minimal_spawn() -> TestResult {
     // those zombies and could hang on a parked-forever one.
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicBool, Ordering};
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
     let done = Arc::new(AtomicBool::new(false));
     let done_c = done.clone();
     narf_scheduler::spawn(async move {
@@ -895,7 +895,7 @@ fn smoke_wait_for_irq_through_executor() -> TestResult {
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicBool, Ordering};
 
-    narf_scheduler::init();
+    narf_scheduler::__reset_queues_for_test();
     let v = match narf_interrupts::vector::alloc() {
         Ok(v) => v,
         Err(_) => return TestResult::Fail("vector::alloc"),
