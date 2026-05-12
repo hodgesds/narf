@@ -102,9 +102,19 @@ fn spawn_supervisor_task() {
                 c.connected_ports().iter().map(|(p, _)| *p).collect()
             })
             .unwrap_or_default();
+            // Audit F-87: avoid double port_reset per cycle. Each
+            // try_attach_*_on_port unconditionally calls port_reset
+            // and a second reset within the same cycle disturbs the
+            // device's link state — some FS keyboards re-enter
+            // Default state and reject the next Address Device. If
+            // the kbd attach already failed on a port this cycle,
+            // skip the mouse attempt; conversely if kbd already
+            // claimed it, mouse skip is automatic via claimed_mouse.
+            let mut tried_this_cycle: u128 = 0;
             for &p in &connected_ports {
                 let bit = 1u128 << (p as u32 & 127);
                 if claimed_kbd & bit == 0 {
+                    tried_this_cycle |= bit;
                     let attached = xhci::with_controller(|c| {
                         hid::try_attach_keyboard_on_port(c, p).is_ok()
                     })
@@ -113,7 +123,12 @@ fn spawn_supervisor_task() {
                         claimed_kbd |= bit;
                     }
                 }
-                if claimed_mouse & bit == 0 {
+                // Skip mouse if kbd was attempted this cycle (success
+                // or fail) — both helpers issue their own port_reset,
+                // and back-to-back resets disturb the device. The
+                // alternate-class interface gets retried next tick if
+                // still unclaimed.
+                if claimed_mouse & bit == 0 && tried_this_cycle & bit == 0 {
                     let attached = xhci::with_controller(|c| {
                         hid::mouse::try_attach_mouse_on_port(c, p).is_ok()
                     })

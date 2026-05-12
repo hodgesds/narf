@@ -1129,15 +1129,34 @@ impl Xhci {
                 unsafe {
                     self.mmio.write32(off, ack);
                 }
-                // PED must be set after a successful reset for
-                // USB2; USB3 self-enables. Re-read to confirm,
-                // surfacing a clear error if not.
-                // SAFETY: same.
-                let post = unsafe { self.mmio.read32(off) };
-                if post & PORTSC_PED == 0 {
-                    return Err(XhciError::PortResetTimeout);
+                // Audit F-12..F-19: success criteria differs per
+                // protocol revision. xHCI 1.2 §4.19.5 says both
+                // USB2 and USB3 should set PED on successful
+                // reset, but on USB3 the link must also reach U0
+                // (PLS=0) before PED is meaningful, and the link
+                // training takes a few additional ms. Wait a bit
+                // longer for either:
+                //   USB3 port → PLS == U0 AND PED == 1
+                //   USB2 port → PED == 1
+                // before declaring failure.
+                let proto = self.port_protocols[port as usize];
+                for _ in 0..50_000u32 {
+                    // SAFETY: same.
+                    let post = unsafe { self.mmio.read32(off) };
+                    let ped = post & PORTSC_PED != 0;
+                    let pls = (post & PORTSC_PLS_MASK) >> 5;
+                    let ok = match proto {
+                        3 => ped && pls == 0,
+                        _ => ped,
+                    };
+                    if ok {
+                        return Ok(post);
+                    }
+                    for _ in 0..200 {
+                        core::hint::spin_loop();
+                    }
                 }
-                return Ok(post);
+                return Err(XhciError::PortResetTimeout);
             }
             core::hint::spin_loop();
         }
