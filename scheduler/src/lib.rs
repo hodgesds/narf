@@ -1025,24 +1025,52 @@ pub mod sleep_pumps {
 /// Drive a future to completion synchronously from outside the
 /// async executor. Polls the future; on Pending, runs the
 /// registered `sleep_pumps` (so cursor/FB/serial keep moving) and
-/// idles to `halt_until_irq` until something delivers a wake.
+/// **idles to `halt_until_irq`** until something delivers a wake.
 /// Returns the future's output.
 ///
-/// The right primitive for **sync→async bridges**: any sync
-/// subsystem (BlockDeviceSync, FsOps' sync wrappers, the eventual
-/// VFS sync paths) that wants to call into an already-async
-/// driver path uses block_on instead of spin-polling MMIO
-/// registers manually. Drivers should expose async functions
-/// (e.g. NVMe's submit_io_irq_async) and let block_on bridge.
+/// The right primitive for **sync→async bridges in normal kernel
+/// context**: any sync subsystem (BlockDeviceSync, FsOps' sync
+/// wrappers, the eventual VFS sync paths) that wants to call into
+/// an already-async driver path. Drivers should expose async
+/// functions (e.g. NVMe's submit_io_irq_async) and let block_on
+/// bridge instead of every driver hand-rolling spin loops.
 ///
-/// **Do not call from inside an async task** — it would block the
-/// executor's polling loop. Caller should be a sync kernel
-/// context (boot, BlockDeviceSync trait method, panic dump path).
-pub fn block_on<F: Future>(mut fut: F) -> F::Output {
+/// **Constraints:**
+/// - Caller MUST NOT hold any `IrqSafeSpinLock`. Those locks
+///   disable IRQs while held, and `halt_until_irq` waits for an
+///   IRQ — would deadlock forever. Use [`block_on_spin`] for the
+///   IRQ-disabled / lock-held variant.
+/// - Caller MUST NOT be inside an executor poll. block_on doesn't
+///   yield to the executor; nested invocation deadlocks the
+///   polling loop. (No runtime check; callers are expected to
+///   know which context they're in.)
+/// - The awaited future must be IRQ-driven or self-waking. A
+///   future that depends on another scheduler task to make
+///   progress will hang because block_on doesn't run the executor.
+pub fn block_on<F: Future>(fut: F) -> F::Output {
+    block_on_inner(fut, /* allow_halt = */ true)
+}
+
+/// Spin-only sync→async bridge. Same shape as [`block_on`] but
+/// never calls `halt_until_irq`, so safe to call with IRQs
+/// disabled (any caller holding an `IrqSafeSpinLock`, panic
+/// dump path, IRQ handler, SMP startup before the BSP timer is
+/// armed). Trade-off: 100% CPU during the wait. Sleep-pumps
+/// still tick so cursor/FB/serial don't freeze under the spin.
+///
+/// Same async-task and IRQ-driven-future constraints as
+/// [`block_on`].
+pub fn block_on_spin<F: Future>(fut: F) -> F::Output {
+    block_on_inner(fut, /* allow_halt = */ false)
+}
+
+#[inline]
+fn block_on_inner<F: Future>(mut fut: F, allow_halt: bool) -> F::Output {
     use core::pin::Pin;
     use core::task::{Context, Poll};
-    // Pin the future on the stack. Caller's lifetime guarantees
-    // this is sound — F is owned by the caller's stack frame.
+    // Pin the future on the stack. Sound because `fut` is owned
+    // by this function's stack frame and Rust prevents moving it
+    // out from under our `&mut` for the function's lifetime.
     // SAFETY: `fut` is a unique mutable binding we never move
     // again until the future completes.
     let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
@@ -1050,22 +1078,26 @@ pub fn block_on<F: Future>(mut fut: F) -> F::Output {
     let waker = make_waker(awake.clone());
     let mut ctx = Context::from_waker(&waker);
     loop {
-        // Reset awake before polling so a wake during the poll
-        // body is observable on the next iteration.
+        // Reset awake before polling so a wake landing during
+        // the poll body is observable on the next iteration.
         awake.store(false, Ordering::Release);
         match fut.as_mut().poll(&mut ctx) {
             Poll::Ready(v) => return v,
             Poll::Pending => {
                 // Tick the sleep pumps so cursor/FB/serial stay
-                // alive while we wait for an IRQ wake or
-                // self-wake from the future's busy-poll.
+                // alive while we wait for an IRQ wake or self-
+                // wake from the future's busy-poll.
                 sleep_pumps::run();
-                if !awake.load(Ordering::Acquire) {
-                    // No wake observed during poll — idle until
-                    // something fires an IRQ. The IRQ handler
-                    // (or the future's own wake_by_ref) flips
-                    // awake, then halt_until_irq returns.
+                if allow_halt && !awake.load(Ordering::Acquire) {
+                    // Cooperative path: idle until something
+                    // fires an IRQ. IRQ handler (or the future's
+                    // own wake_by_ref) flips awake, then
+                    // halt_until_irq returns.
                     narf_arch::halt_until_irq();
+                } else {
+                    // Spin path: re-poll immediately. Cheap
+                    // back-off via spin_loop hint.
+                    core::hint::spin_loop();
                 }
             }
         }
