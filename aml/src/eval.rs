@@ -786,14 +786,21 @@ fn eval_term_arg(buf: &[u8], cur: &mut usize, state: &mut EvalState) -> Result<V
             Value::Integer(if values_equal(&a, &b) { 1 } else { 0 })
         }
         LGREATER_OP => {
-            let a = eval_term_arg(buf, cur, state)?.as_integer();
-            let b = eval_term_arg(buf, cur, state)?.as_integer();
-            Value::Integer(if a > b { 1 } else { 0 })
+            // ACPI 6.5 §19.6.87: like LEqual, operates on Integer,
+            // String, and Buffer element-wise. Pre-fix this coerced
+            // both sides via as_integer() — same Buffer-truncation
+            // bug already fixed for LEqual; _DSM and _CRS templates
+            // that branch on a Buffer-vs-Buffer ordering would
+            // silently take the wrong branch.
+            let a = eval_term_arg(buf, cur, state)?;
+            let b = eval_term_arg(buf, cur, state)?;
+            Value::Integer(if values_cmp(&a, &b) == core::cmp::Ordering::Greater { 1 } else { 0 })
         }
         LLESS_OP => {
-            let a = eval_term_arg(buf, cur, state)?.as_integer();
-            let b = eval_term_arg(buf, cur, state)?.as_integer();
-            Value::Integer(if a < b { 1 } else { 0 })
+            // ACPI 6.5 §19.6.88, same shape as LGreater.
+            let a = eval_term_arg(buf, cur, state)?;
+            let b = eval_term_arg(buf, cur, state)?;
+            Value::Integer(if values_cmp(&a, &b) == core::cmp::Ordering::Less { 1 } else { 0 })
         }
 
         // Buffer: BufferOp PkgLength SizeTermArg ByteList
@@ -1130,6 +1137,21 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::String(x), Value::String(y)) => x == y,
         (Value::Package(x), Value::Package(y)) => x == y,
         _ => a.as_integer() == b.as_integer(),
+    }
+}
+
+/// Ordering comparison for `LGreater` / `LLess`. ACPI 6.5 §19.6.87
+/// + §19.6.88 say these operate on Integer, String, and Buffer
+/// types — same coverage as `LEqual`. Buffer + String compare
+/// lexicographically. Mixed types fall back to integer coercion
+/// (matches the integer-only pre-fix behaviour for the common case).
+/// Package ordering isn't defined by ACPI; we coerce to integer
+/// so the result is at least deterministic.
+fn values_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
+    match (a, b) {
+        (Value::Buffer(x), Value::Buffer(y)) => x.cmp(y),
+        (Value::String(x), Value::String(y)) => x.cmp(y),
+        _ => a.as_integer().cmp(&b.as_integer()),
     }
 }
 
