@@ -85,11 +85,22 @@ pub fn register_initcalls() {
 fn spawn_supervisor_task() {
     narf_scheduler::spawn(async {
         const PUMP_CYCLES: u64 = 16_000_000;
+        // Cap per-port enumeration attempts. After this many
+        // consecutive failures (typically all PortResetTimeout on a
+        // dead USB3 port that the rate-matching hub has internally
+        // routed elsewhere, OR a port whose attached device
+        // genuinely doesn't speak HID), give up to stop burning
+        // cycles + log noise. 8 retries × ~16 ms supervisor cadence
+        // = ~125 ms of grace before we move on.
+        const MAX_PER_PORT_RETRIES: u8 = 8;
         let mut irq_vector: Option<u8> = None;
         // Per-port claimed-by-keyboard / claimed-by-mouse
         // bitmasks (audit #9 fix).
         let mut claimed_kbd: u128 = 0;
         let mut claimed_mouse: u128 = 0;
+        // Per-port retry counters. Indexed by port id (1..=128).
+        let mut kbd_fail_count = [0u8; 128];
+        let mut mouse_fail_count = [0u8; 128];
         loop {
             if !xhci::is_probed() {
                 narf_time::sleep_cycles(PUMP_CYCLES).await;
@@ -113,7 +124,8 @@ fn spawn_supervisor_task() {
             let mut tried_this_cycle: u128 = 0;
             for &p in &connected_ports {
                 let bit = 1u128 << (p as u32 & 127);
-                if claimed_kbd & bit == 0 {
+                let pi = (p as usize) & 127;
+                if claimed_kbd & bit == 0 && kbd_fail_count[pi] < MAX_PER_PORT_RETRIES {
                     tried_this_cycle |= bit;
                     let attached = xhci::with_controller(|c| {
                         hid::try_attach_keyboard_on_port(c, p).is_ok()
@@ -121,6 +133,9 @@ fn spawn_supervisor_task() {
                     .unwrap_or(false);
                     if attached {
                         claimed_kbd |= bit;
+                        kbd_fail_count[pi] = 0;
+                    } else {
+                        kbd_fail_count[pi] = kbd_fail_count[pi].saturating_add(1);
                     }
                 }
                 // Skip mouse if kbd was attempted this cycle (success
@@ -128,13 +143,19 @@ fn spawn_supervisor_task() {
                 // and back-to-back resets disturb the device. The
                 // alternate-class interface gets retried next tick if
                 // still unclaimed.
-                if claimed_mouse & bit == 0 && tried_this_cycle & bit == 0 {
+                if claimed_mouse & bit == 0
+                    && tried_this_cycle & bit == 0
+                    && mouse_fail_count[pi] < MAX_PER_PORT_RETRIES
+                {
                     let attached = xhci::with_controller(|c| {
                         hid::mouse::try_attach_mouse_on_port(c, p).is_ok()
                     })
                     .unwrap_or(false);
                     if attached {
                         claimed_mouse |= bit;
+                        mouse_fail_count[pi] = 0;
+                    } else {
+                        mouse_fail_count[pi] = mouse_fail_count[pi].saturating_add(1);
                     }
                 }
             }

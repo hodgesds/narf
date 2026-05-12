@@ -101,8 +101,10 @@ const USBCMD_INTE: u32 = 1 << 2; // Interrupter Enable
 
 // USBSTS bits.
 const USBSTS_HCH: u32 = 1 << 0; // Host Controller Halted
-const USBSTS_CNR: u32 = 1 << 11; // Controller Not Ready
+const USBSTS_HSE: u32 = 1 << 2; // Host System Error (RW1C — fatal: PCIe / mem fault)
 const USBSTS_EINT: u32 = 1 << 3; // Event Interrupt (w1c)
+const USBSTS_HCE: u32 = 1 << 12; // Host Controller Error (internal HC fault)
+const USBSTS_CNR: u32 = 1 << 11; // Controller Not Ready
 
 // PORTSC bits (§5.4.8).
 const PORTSC_CCS: u32 = 1 << 0; // Current Connect Status (RO)
@@ -1173,11 +1175,18 @@ impl Xhci {
                         // back to a fixed spin loop if calibration
                         // returned 0 (TSC not yet ready) so we never
                         // hang on a degenerate busy_wait_cycles(0).
+                        // 25 ms (vs the 10 ms USB 2.0 minimum) — many
+                        // real-world FS devices document needing 15-20
+                        // ms of bus quiet to stabilise their SIE
+                        // before responding to SET_ADDRESS, and
+                        // boot-time is dominated by initcall serial
+                        // logging anyway so the extra 13 ms per port
+                        // is invisible to the user.
                         let tsc_hz = narf_time::calibrate_clocks();
                         if tsc_hz > 0 {
-                            narf_time::busy_wait_cycles((tsc_hz / 1000) * 12);
+                            narf_time::busy_wait_cycles((tsc_hz / 1000) * 25);
                         } else {
-                            for _ in 0..1_500_000u32 {
+                            for _ in 0..3_000_000u32 {
                                 core::hint::spin_loop();
                             }
                         }
@@ -1297,6 +1306,40 @@ impl Xhci {
                 .write32(ir0 + IR_ERDP_LO, (new_deq_phys as u32) | (ERDP_EHB as u32));
         }
         Some([d0, d1, d2, d3])
+    }
+
+    /// Snapshot USBSTS and clear any RW1C error bits, returning a
+    /// human-readable suffix when something concerning is set.
+    /// Called from the cmd-completion error path so a CmdFailed
+    /// surfaces *why* in the log rather than just the bare
+    /// completion code. Defensive: HSE / HCE are fatal-class
+    /// signals from the controller (PCIe fault, internal HC error)
+    /// — surface them via the log so a future debugger can spot
+    /// "controller fell over" vs "device misbehaved".
+    fn snapshot_usbsts_diagnostics(&self) -> Option<&'static str> {
+        // SAFETY: identity-mapped MMIO; OP_USBSTS within bounds.
+        let s = unsafe { self.mmio.read32(self.op_off + OP_USBSTS) };
+        let mut clear = 0u32;
+        let label = if s & USBSTS_HSE != 0 {
+            clear |= USBSTS_HSE;
+            Some("USBSTS.HSE (host system error)")
+        } else if s & USBSTS_HCE != 0 {
+            // HCE is RO; clearing requires HCRST. We can only log.
+            Some("USBSTS.HCE (internal controller error)")
+        } else if s & USBSTS_HCH != 0 {
+            Some("USBSTS.HCH (controller halted)")
+        } else if s & USBSTS_CNR != 0 {
+            Some("USBSTS.CNR (controller not ready)")
+        } else {
+            None
+        };
+        if clear != 0 {
+            // SAFETY: same; HSE is RW1C, write-back to clear.
+            unsafe {
+                self.mmio.write32(self.op_off + OP_USBSTS, clear);
+            }
+        }
+        label
     }
 
     /// Demux one Event Ring entry into the per-class queues. Used
@@ -1603,6 +1646,18 @@ impl Xhci {
             .await_event(|t| (t[3] & TRB_TYPE_MASK) == cce && (t[3] & 0xFF00_0000) == want_slot)?;
         let ccode = ((ev[2] >> 24) & 0xFF) as u8;
         if ccode != 1 {
+            // Surface controller-fatal diagnostics alongside the
+            // bare completion code. Helps disambiguate "device
+            // didn't respond" (ccode=4 with USBSTS clean) from
+            // "controller fell over" (ccode=4 with HSE/HCE set).
+            if let Some(diag) = self.snapshot_usbsts_diagnostics() {
+                use core::fmt::Write as _;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  xhci: address_device slot={} port={} ccode={} {}",
+                    slot_id, port, ccode, diag
+                );
+            }
             return Err(XhciError::CmdFailed(ccode));
         }
 
