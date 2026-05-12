@@ -38,6 +38,7 @@ pub mod cursor;
 pub mod drain_task;
 pub mod gop;
 pub mod registry;
+pub mod status;
 pub mod vbe;
 
 mod tests;
@@ -748,6 +749,18 @@ impl FbWriter {
     /// FbWriters race the underlying MMIO).
     pub(crate) unsafe fn scanout_for_cursor(&self) -> narf_graphics::Framebuffer {
         // SAFETY: forwarded to caller — see method docs.
+        unsafe { self.scanout.framebuffer() }
+    }
+
+    /// Mutable variant for the status panel's `draw_string_8x8`
+    /// pass (which takes `&mut Framebuffer`). Same exclusivity
+    /// caveat as `scanout_for_cursor`; called once at end of boot
+    /// before user tasks tighten contention.
+    ///
+    /// # Safety
+    /// Same as `scanout_for_cursor`.
+    pub(crate) unsafe fn scanout_for_cursor_mut(&self) -> narf_graphics::Framebuffer {
+        // SAFETY: forwarded to caller.
         unsafe { self.scanout.framebuffer() }
     }
 }

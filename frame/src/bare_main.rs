@@ -2140,6 +2140,16 @@ fn run_async_demo() -> ! {
             console::Writer,
             "  cursor: pump spawned (FB up)"
         );
+        // Paint a steady-state diagnostic panel into the bottom of
+        // the FB so real-HW boots (no serial console available) can
+        // *see* which drivers enumerated. Writes once; FB-console
+        // scroll afterwards may overwrite it but the I2C / GPIO /
+        // i8042 / cursor-state line is what matters at the moment
+        // we transition to interactive.
+        let cap = narf_fb::bootstrap_writer();
+        if let Ok(panel_writer) = narf_fb::FbWriter::new(cap) {
+            narf_fb::status::paint(&panel_writer);
+        }
     }
 
     let _ = writeln!(

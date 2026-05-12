@@ -25,6 +25,8 @@ narf-userspace    = { path = "../userspace" }
 narf-scheduler    = { path = "../scheduler" }
 narf-shmem        = { path = "../shmem" }
 narf-input        = { path = "../input" }
+narf-drivers-i2c  = { path = "../drivers/i2c" }
+narf-drivers-gpio = { path = "../drivers/gpio" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 
 [lints]
