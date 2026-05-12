@@ -17,6 +17,7 @@ narf-arch   = { path = "../arch" }
 narf-memory = { path = "../memory" }
 narf-time   = { path = "../time" }
 narf-acpi   = { path = "../acpi" }
+narf-scheduler = { path = "../scheduler" }
 narf-kernel-test = { path = "../verification/kernel-test" }
 
 [lints]

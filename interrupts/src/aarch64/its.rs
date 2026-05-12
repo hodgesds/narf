@@ -344,18 +344,23 @@ unsafe fn submit_command(cmd: &[u64; 4]) -> Result<(), ItsError> {
 
     // Poll CREADR until it catches up. ITS may pause if it hits a
     // Stalled state, but for our well-formed commands QEMU drains
-    // immediately.
-    for _ in 0..1_000_000u32 {
-        // SAFETY: identity-mapped MMIO.
-        let cr = unsafe { read_u64(GITS_CREADR) };
-        // Note: GITS_CREADR low bit = Stalled. Mask it off for the
-        // catch-up compare.
-        if (cr & !1) == new_tail {
-            return Ok(());
-        }
-        core::hint::spin_loop();
+    // immediately. responsive_spin ticks sleep_pumps so the FB
+    // cursor / serial drain stay alive on a Stalled ITS.
+    let done = narf_scheduler::responsive_spin(
+        || {
+            // SAFETY: identity-mapped MMIO.
+            let cr = unsafe { read_u64(GITS_CREADR) };
+            // Note: GITS_CREADR low bit = Stalled. Mask it off
+            // for the catch-up compare.
+            (cr & !1) == new_tail
+        },
+        1_000_000,
+    );
+    if done {
+        Ok(())
+    } else {
+        Err(ItsError::CmdTimeout)
     }
-    Err(ItsError::CmdTimeout)
 }
 
 // ── helpers — 64-bit MMIO. The aarch64 backend in narf_arch only
