@@ -1182,15 +1182,48 @@ impl Xhci {
                         // boot-time is dominated by initcall serial
                         // logging anyway so the extra 13 ms per port
                         // is invisible to the user.
+                        // Diagnostic on real Renoir HW: PORTSC.CSC
+                        // fires and PED drops between this match
+                        // and the address_device call (the device
+                        // bounces the link after our reset).
+                        // Sample PORTSC over the TRSTRCY window
+                        // and require *both*:
+                        //   - PED stays 1 the whole time
+                        //   - CSC never fires
+                        // Also doubles as the TRSTRCY
+                        // (USB 2.0 §7.1.7.3 ≥10 ms recovery
+                        // delay) so address_device's SET_ADDRESS
+                        // lands cleanly. If we see CSC or
+                        // PED-drop we ack the change bits and
+                        // surface PortResetTimeout so the caller
+                        // retries the whole port_reset cycle.
                         let tsc_hz = narf_time::calibrate_clocks();
-                        if tsc_hz > 0 {
-                            narf_time::busy_wait_cycles((tsc_hz / 1000) * 25);
+                        let total_cycles: u64 = if tsc_hz > 0 {
+                            (tsc_hz / 1000) * 25
                         } else {
-                            for _ in 0..3_000_000u32 {
-                                core::hint::spin_loop();
+                            2_500_000
+                        };
+                        let start = narf_time::now_cycles();
+                        let mut stable_post = post;
+                        loop {
+                            // SAFETY: same MMIO region.
+                            let v = unsafe { self.mmio.read32(off) };
+                            if v & PORTSC_CSC != 0 {
+                                let ack = (v & !PORTSC_CHG_MASK) | PORTSC_CSC;
+                                // SAFETY: same.
+                                unsafe { self.mmio.write32(off, ack); }
+                                return Err(XhciError::PortResetTimeout);
                             }
+                            if v & PORTSC_PED == 0 {
+                                return Err(XhciError::PortResetTimeout);
+                            }
+                            stable_post = v;
+                            if narf_time::now_cycles().wrapping_sub(start) >= total_cycles {
+                                break;
+                            }
+                            core::hint::spin_loop();
                         }
-                        return Ok(post);
+                        return Ok(stable_post);
                     }
                     for _ in 0..200 {
                         core::hint::spin_loop();
