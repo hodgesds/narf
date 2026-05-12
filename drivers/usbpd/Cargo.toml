@@ -15,6 +15,7 @@ path = "src/lib.rs"
 narf-lib          = { path = "../../lib" }
 narf-usbpd        = { path = "../../usbpd" }
 narf-capabilities = { path = "../../capabilities" }
+narf-scheduler    = { path = "../../scheduler" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
 
 [features]

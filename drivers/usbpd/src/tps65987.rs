@@ -156,15 +156,30 @@ impl Tps65987 {
     /// Wait for the chip to clear Cmd1 (firmware ack). Polls a
     /// bounded number of times — caller picks the cadence.
     fn wait_cmd1_clear(&self, retries: u32) -> Result<(), TcpcError> {
-        for _ in 0..retries {
-            let mut buf = [0u8; 4];
-            self.bus.read_burst(self.addr, REG_CMD1, &mut buf)?;
-            if buf == [0u8; 4] {
-                return Ok(());
-            }
-            core::hint::spin_loop();
+        // responsive_spin ticks sleep_pumps so cursor/FB stay alive
+        // while the PD chip processes a 4CC command.
+        let mut bus_err: Option<TcpcError> = None;
+        let done = narf_scheduler::responsive_spin(
+            || {
+                let mut buf = [0u8; 4];
+                match self.bus.read_burst(self.addr, REG_CMD1, &mut buf) {
+                    Ok(()) => buf == [0u8; 4],
+                    Err(e) => {
+                        bus_err = Some(e.into());
+                        true
+                    }
+                }
+            },
+            retries,
+        );
+        if let Some(e) = bus_err {
+            return Err(e);
         }
-        Err(TcpcError::TransmitFailed)
+        if done {
+            Ok(())
+        } else {
+            Err(TcpcError::TransmitFailed)
+        }
     }
 
     /// Issue a 4CC command + 0..=64 byte payload. Blocks until the
