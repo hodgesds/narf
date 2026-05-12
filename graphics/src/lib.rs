@@ -99,6 +99,28 @@ impl Framebuffer {
         }
     }
 
+    /// Read a single pixel back from the framebuffer. Returns the
+    /// raw stored value; reading off-screen yields `None`. UEFI GOP
+    /// framebuffers are typically mapped UC, so reads are slow —
+    /// callers that need to save a region (e.g. the cursor renderer
+    /// preserving pixels under the sprite) should batch a single
+    /// read pass over the rect, not call this per-pixel from a hot
+    /// loop. Volatile read so the compiler doesn't fold reads across
+    /// other drawing calls.
+    #[inline]
+    pub fn read_pixel(&self, x: u32, y: u32) -> Option<Pixel32> {
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        // SAFETY: bounds-checked above; stride*y + x < buffer size,
+        // and Framebuffer owns the mapping for its lifetime.
+        let raw = unsafe {
+            let off = (y * self.stride + x) as isize;
+            ptr::read_volatile(self.base.offset(off))
+        };
+        Some(Pixel32(raw))
+    }
+
     /// Set a single pixel. Out-of-bounds calls are silently ignored
     /// — drawing helpers are clipping by design.
     #[inline]

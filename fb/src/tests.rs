@@ -1048,3 +1048,192 @@ fn smoke_vbe_mode_info_block_to_framebuffer() -> TestResult {
 }
 
 kernel_test_in!("fb/vbe", smoke_vbe_mode_info_block_to_framebuffer);
+
+// ── cursor renderer ────────────────────────────────────────────────
+
+fn smoke_cursor_renderer_moves_on_pointer_event() -> TestResult {
+    use crate::{
+        bootstrap_writer, clear_test_scanout, cursor, install_test_scanout, test_scanout_pixel,
+        FbWriter,
+    };
+    use narf_input::{
+        init_global_ring, push_global, InputEvent, PointerButtons, PointerEvent,
+        __reset_global_ring_for_test,
+    };
+
+    install_test_scanout(64, 64);
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    cursor::__reset_for_test();
+
+    let cap = bootstrap_writer();
+    let w = match FbWriter::new(cap) {
+        Ok(w) => w,
+        Err(_) => {
+            clear_test_scanout();
+            return TestResult::Fail("FbWriter::new");
+        }
+    };
+
+    // First draw centres at (32, 32). Push a delta of (+5, +5);
+    // sprite top-left should land at (37, 37). drain_and_render
+    // both initialises and processes events.
+    let _ = push_global(InputEvent::Pointer(PointerEvent {
+        dx: 5,
+        dy: 5,
+        buttons: PointerButtons::EMPTY,
+    }));
+    cursor::drain_and_render(&w);
+    if cursor::moves() == 0 {
+        clear_test_scanout();
+        return TestResult::Fail("expected at least one move");
+    }
+    // The cursor sprite is solid white (Pixel32(0xFFFF_FFFF)). Probe
+    // the top-left corner of where it should be.
+    match test_scanout_pixel(37, 37) {
+        Some(p) if p.raw() == 0xFFFF_FFFF => {}
+        Some(other) => {
+            let _ = other;
+            clear_test_scanout();
+            return TestResult::Fail("sprite pixel not white at expected position");
+        }
+        None => {
+            clear_test_scanout();
+            return TestResult::Fail("expected pixel readable");
+        }
+    }
+    clear_test_scanout();
+    TestResult::Pass
+}
+kernel_test_in!("fb/cursor", smoke_cursor_renderer_moves_on_pointer_event);
+
+fn smoke_cursor_renderer_restores_under_sprite_on_move() -> TestResult {
+    use crate::{
+        bootstrap_writer, clear_test_scanout, cursor, install_test_scanout, test_scanout_pixel,
+        FbWriter, Rect,
+    };
+    use narf_graphics::Pixel32;
+    use narf_input::{
+        init_global_ring, push_global, InputEvent, PointerButtons, PointerEvent,
+        __reset_global_ring_for_test,
+    };
+
+    install_test_scanout(64, 64);
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    cursor::__reset_for_test();
+
+    let cap = bootstrap_writer();
+    let w = match FbWriter::new(cap) {
+        Ok(w) => w,
+        Err(_) => {
+            clear_test_scanout();
+            return TestResult::Fail("FbWriter::new");
+        }
+    };
+
+    // Paint a known background colour over the entire FB so we can
+    // verify the cursor restored it correctly after moving away.
+    let bg = Pixel32::rgb(0x12, 0x34, 0x56);
+    let _ = w.fill(Rect::new(0, 0, 64, 64), bg);
+
+    // Move 1: dx=0, dy=0 → no move recorded (skipped). Push a real
+    // delta that lands the sprite at (32+5, 32+5) = (37, 37).
+    let _ = push_global(InputEvent::Pointer(PointerEvent {
+        dx: 5,
+        dy: 5,
+        buttons: PointerButtons::EMPTY,
+    }));
+    cursor::drain_and_render(&w);
+    let moves_after_first = cursor::moves();
+
+    // Move 2: shift further. Sprite should land at (37+10, 37+10).
+    let _ = push_global(InputEvent::Pointer(PointerEvent {
+        dx: 10,
+        dy: 10,
+        buttons: PointerButtons::EMPTY,
+    }));
+    cursor::drain_and_render(&w);
+    if cursor::moves() <= moves_after_first {
+        clear_test_scanout();
+        return TestResult::Fail("second move not counted");
+    }
+
+    // The pixels at (37, 37) — old cursor location — should now be
+    // back to the background colour. The new sprite is at (47, 47).
+    match test_scanout_pixel(37, 37) {
+        Some(p) if p == bg => {}
+        Some(_) => {
+            clear_test_scanout();
+            return TestResult::Fail("background not restored under old cursor");
+        }
+        None => {
+            clear_test_scanout();
+            return TestResult::Fail("oob pixel");
+        }
+    }
+    match test_scanout_pixel(47, 47) {
+        Some(p) if p.raw() == 0xFFFF_FFFF => {}
+        _ => {
+            clear_test_scanout();
+            return TestResult::Fail("sprite not at new position");
+        }
+    }
+    clear_test_scanout();
+    TestResult::Pass
+}
+kernel_test_in!("fb/cursor", smoke_cursor_renderer_restores_under_sprite_on_move);
+
+fn smoke_cursor_renderer_clamps_to_fb_bounds() -> TestResult {
+    use crate::{
+        bootstrap_writer, clear_test_scanout, cursor, install_test_scanout, FbWriter,
+    };
+    use narf_input::{
+        init_global_ring, push_global, InputEvent, PointerButtons, PointerEvent,
+        __reset_global_ring_for_test,
+    };
+
+    install_test_scanout(64, 64);
+    init_global_ring(8);
+    __reset_global_ring_for_test();
+    cursor::__reset_for_test();
+
+    let cap = bootstrap_writer();
+    let w = match FbWriter::new(cap) {
+        Ok(w) => w,
+        Err(_) => {
+            clear_test_scanout();
+            return TestResult::Fail("FbWriter::new");
+        }
+    };
+
+    // Wild positive delta — cursor should clamp to (width-W, height-H)
+    // rather than wrap or go OOB. Wild negative — clamps to (0, 0).
+    let _ = push_global(InputEvent::Pointer(PointerEvent {
+        dx: 10_000,
+        dy: 10_000,
+        buttons: PointerButtons::EMPTY,
+    }));
+    cursor::drain_and_render(&w);
+    if cursor::moves() == 0 {
+        clear_test_scanout();
+        return TestResult::Fail("expected positive-clamp move");
+    }
+    let _ = push_global(InputEvent::Pointer(PointerEvent {
+        dx: -10_000,
+        dy: -10_000,
+        buttons: PointerButtons::EMPTY,
+    }));
+    cursor::drain_and_render(&w);
+    // No way to read POS_X/Y directly — verify by what's drawn:
+    // cursor sprite at (0, 0) means top-left WxH should now be white.
+    if let Some(p) = crate::test_scanout_pixel(0, 0) {
+        if p.raw() != 0xFFFF_FFFF {
+            clear_test_scanout();
+            return TestResult::Fail("expected sprite at (0,0) after negative clamp");
+        }
+    }
+    clear_test_scanout();
+    TestResult::Pass
+}
+kernel_test_in!("fb/cursor", smoke_cursor_renderer_clamps_to_fb_bounds);

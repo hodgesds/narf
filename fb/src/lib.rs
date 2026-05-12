@@ -34,6 +34,7 @@ extern crate alloc;
 
 pub mod client;
 pub mod cmd_ring;
+pub mod cursor;
 pub mod drain_task;
 pub mod gop;
 pub mod registry;
@@ -703,6 +704,35 @@ fn init_pump_writer(writer: FbWriter) {
     }
 }
 
+/// Borrow the boot-cached pump writer if one was installed.
+/// `None` before `fb-drain-task` runs, or when no scanout was
+/// active. Used by the cursor sleep-pump tick to avoid minting a
+/// fresh `Cap::bootstrap()` per call.
+pub(crate) fn pump_writer_ref() -> Option<&'static FbWriter> {
+    // SAFETY: PUMP_WRITER is initialised once at boot; subsequent
+    // accesses are read-only. The returned reference is valid for
+    // the lifetime of the static.
+    unsafe { (&*PUMP_WRITER.0.get()).as_ref() }
+}
+
+impl FbWriter {
+    /// Acquire the underlying `Framebuffer` view for the cursor
+    /// renderer's read-pixel pass. `pub(crate)` because direct
+    /// framebuffer access bypasses the cap-checked write helpers
+    /// (fill / blit / flush) — only the cursor save-restore loop
+    /// is allowed to use it, and it only reads.
+    ///
+    /// # Safety
+    /// Caller must ensure no other agent holds a `Framebuffer`
+    /// view of the same scanout for the lifetime of the returned
+    /// value (FbWriter is the FB owner; concurrent draws by other
+    /// FbWriters race the underlying MMIO).
+    pub(crate) unsafe fn scanout_for_cursor(&self) -> narf_graphics::Framebuffer {
+        // SAFETY: forwarded to caller — see method docs.
+        unsafe { self.scanout.framebuffer() }
+    }
+}
+
 /// Stage::Late initcall: log which backend won the picker, then
 /// run a small kernel-resident producer→ring→consumer→FB demo
 /// that proves the architectural chain end-to-end. The demo is
@@ -754,6 +784,23 @@ pub fn register_initcalls() {
         }
         let task = drain_task::DrainTask::new(writer);
         let _ = narf_scheduler::spawn(task);
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Late, "fb-cursor-pump", || {
+        if select_active().is_none() {
+            return InitResult::NotPresent;
+        }
+        let cap = bootstrap_writer();
+        let writer = match FbWriter::new(cap) {
+            Ok(w) => w,
+            Err(_) => return InitResult::Error("FbWriter::new"),
+        };
+        let _ = narf_scheduler::spawn(cursor::pump(writer));
+        // Also register a sleep-pump tick so the cursor moves while
+        // a user task is parked in sys_sleep — same justification as
+        // the FB drain pump (without it, an idle user task starves
+        // the async scheduler and the pointer freezes).
+        narf_userspace::handlers::sleep_pumps::register(cursor::sleep_pump_tick);
         InitResult::Ok
     });
     narf_init::register(Stage::Late, "fb-client-demo", || {
