@@ -82,10 +82,6 @@ narf-kernel-test     = { path = "../verification/kernel-test" }
 narf-verification    = { path = "../verification", optional = true }
 
 [features]
-# Default-on: build the production ISO with userspace init + shell
-# loaded by the boot path. To strip them out for a minimal kernel
-# (e.g. test harness) build with `--no-default-features`.
-default = ["boot-init"]
 # Self-test: trigger a #UD at end-of-boot to prove the IDT dispatches.
 # Off by default; enable with `cargo xtask run --arch=x86_64 --features idt-selftest`.
 idt-selftest = []
