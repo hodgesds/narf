@@ -148,6 +148,49 @@ pub fn evaluate_method(path: &str, args: &[Value]) -> Result<Value, AmlError> {
     }
 }
 
+/// Evaluate `<device_path>._DSM(uuid, revision, function, args)`.
+///
+/// `_DSM` is the standard ACPI extension hook for vendor-specific
+/// device methods (HID-over-I2C descriptor register discovery, NVMe
+/// admin pass-through, USB-C connector class, etc.). The signature
+/// is fixed (ACPI 6.5 §9.1.1):
+///   - Arg0: Buffer (16-byte mixed-endian Microsoft GUID).
+///   - Arg1: Integer (revision number; func 0 returns the supported-
+///     function bitmap for this revision).
+///   - Arg2: Integer (function index; 0 = "what do you support").
+///   - Arg3: Package (function-specific args; empty Package for
+///     functions that take no parameters, like the HID-over-I2C
+///     descriptor lookup).
+///
+/// Returns `Err(MethodNotFound)` if the device has no `_DSM`. Caller
+/// decides what to do with `Value::Buffer(vec![0])` returns (the
+/// AML idiom for "function not implemented").
+pub fn evaluate_dsm(
+    device_path: &str,
+    uuid: [u8; 16],
+    revision: u64,
+    function: u64,
+    args: Value,
+) -> Result<Value, AmlError> {
+    let method = if device_path.ends_with('.') {
+        let mut s = String::from(device_path);
+        s.push_str("_DSM");
+        s
+    } else {
+        let mut s = String::from(device_path);
+        s.push('.');
+        s.push_str("_DSM");
+        s
+    };
+    let args = [
+        Value::Buffer(uuid.to_vec()),
+        Value::Integer(revision),
+        Value::Integer(function),
+        args,
+    ];
+    evaluate_method(&method, &args)
+}
+
 /// Decode a single AML term-arg from a byte slice as a `Value`.
 ///
 /// This is the stateless variant of the inner `eval_term_arg`
@@ -733,9 +776,14 @@ fn eval_term_arg(buf: &[u8], cur: &mut usize, state: &mut EvalState) -> Result<V
             Value::Integer(if a == 0 { 1 } else { 0 })
         }
         LEQUAL_OP => {
-            let a = eval_term_arg(buf, cur, state)?.as_integer();
-            let b = eval_term_arg(buf, cur, state)?.as_integer();
-            Value::Integer(if a == b { 1 } else { 0 })
+            // ACPI 6.5 §19.6.86: LEqual operates on Integer, String,
+            // and Buffer types element-wise. Coercing to integer (the
+            // pre-fix behaviour) makes _DSM UUID comparisons against
+            // Buffer literals always succeed-or-fail incorrectly,
+            // because both sides truncate to their first 8 bytes.
+            let a = eval_term_arg(buf, cur, state)?;
+            let b = eval_term_arg(buf, cur, state)?;
+            Value::Integer(if values_equal(&a, &b) { 1 } else { 0 })
         }
         LGREATER_OP => {
             let a = eval_term_arg(buf, cur, state)?.as_integer();
@@ -1071,6 +1119,19 @@ fn update_node_value(path: &str, value: Value) {
 }
 
 // ── Low-level helpers ─────────────────────────────────────────────────────────
+
+/// ACPI 6.5 §19.6.86 LEqual semantics: Integer/Integer compare
+/// numerically; String/String and Buffer/Buffer compare element-wise.
+/// Mixed types fall back to integer coercion (matches the prior
+/// behaviour for the integer-vs-integer common case).
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Buffer(x), Value::Buffer(y)) => x == y,
+        (Value::String(x), Value::String(y)) => x == y,
+        (Value::Package(x), Value::Package(y)) => x == y,
+        _ => a.as_integer() == b.as_integer(),
+    }
+}
 
 #[inline]
 fn next_u8(buf: &[u8], cur: &mut usize) -> Result<u8, AmlError> {

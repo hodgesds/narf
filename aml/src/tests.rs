@@ -1712,3 +1712,125 @@ fn smoke_aml_namespace_walks_into_else_body() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("aml", smoke_aml_namespace_walks_into_else_body);
+
+fn smoke_aml_lequal_compares_buffers_byte_wise() -> TestResult {
+    // Method(\BCMP, 0) { Return(LEqual(Buffer(){0x11, 0x22}, Buffer(){0x11, 0x22})) }
+    // Pre-fix this returned 1 too (both buffers coerce to u64=0x2211),
+    // so prove the new code by also testing the inequal case.
+    //
+    // Buffer encoding: BUFFER_OP PkgLen SizeTermArg ByteData…
+    //   PkgLen content = 1 (PkgLen byte) + 1 (size byte) + 2 (data) = 4
+    let buf_eq: &[u8] = &[
+        0x11, // BUFFER_OP
+        0x05, // PkgLength = 5 (1 PkgLen + 2 size + 2 data)
+        0x0A, 0x02, // size = BytePrefix 2
+        0x11, 0x22, // payload
+    ];
+    let buf_ne: &[u8] = &[
+        0x11, 0x05, 0x0A, 0x02, 0x11, 0x33, // differs in byte 1
+    ];
+
+    let mut body: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    body.push(0xA4); // ReturnOp
+    body.push(0x93); // LEqualOp
+    body.extend_from_slice(buf_eq);
+    body.extend_from_slice(buf_eq);
+    let blob = build_eval_method_blob(b"BCMP", 0, &body);
+    if crate::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("parse failed (eq)");
+    }
+    match crate::eval::evaluate_method("\\BCMP", &[]) {
+        Ok(crate::Value::Integer(1)) => {}
+        _ => return TestResult::Fail("equal buffers should compare equal"),
+    }
+
+    let mut body2: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    body2.push(0xA4);
+    body2.push(0x93);
+    body2.extend_from_slice(buf_eq);
+    body2.extend_from_slice(buf_ne);
+    let blob2 = build_eval_method_blob(b"BCMN", 0, &body2);
+    if crate::__parse_body_for_test(&blob2, "\\").is_err() {
+        return TestResult::Fail("parse failed (ne)");
+    }
+    match crate::eval::evaluate_method("\\BCMN", &[]) {
+        Ok(crate::Value::Integer(0)) => TestResult::Pass,
+        _ => TestResult::Fail("differing buffers should compare unequal"),
+    }
+}
+kernel_test_in!("aml", smoke_aml_lequal_compares_buffers_byte_wise);
+
+fn smoke_aml_evaluate_dsm_returns_value() -> TestResult {
+    // Build Device(\TSTD) { Method(_DSM, 4) { Return(0x1234) } }.
+    // 4-arg method flag = 0x04 in the low 3 bits.
+    //
+    // _DSM body: 0xA4 0x0B 0x34 0x12 = ReturnOp WordPrefix 0x1234.
+    let dsm_body: &[u8] = &[0xA4, 0x0B, 0x34, 0x12];
+    // MethodOp PkgLen \_DSM flags body
+    // PkgLen content = 1 (PkgLen) + 4 (NameSeg "_DSM") + 1 (flags) + body = 10
+    let method_blob: alloc::vec::Vec<u8> = {
+        let mut v = alloc::vec::Vec::new();
+        v.push(0x14); // MethodOp
+        v.push(10); // PkgLength
+        v.extend_from_slice(b"_DSM"); // relative NameSeg under Device scope
+        v.push(0x04); // 4-arg
+        v.extend_from_slice(dsm_body);
+        v
+    };
+    // Device(\TSTD): 0x5B 0x82 PkgLen \TSTD body
+    // PkgLen content = 1 (PkgLen) + 1 (root) + 4 (NameSeg) + method_blob.len()
+    let dev_pkg = 1 + 1 + 4 + method_blob.len();
+    let mut blob: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    blob.push(0x5B);
+    blob.push(0x82);
+    blob.push(dev_pkg as u8);
+    blob.push(b'\\');
+    blob.extend_from_slice(b"TSTD");
+    blob.extend_from_slice(&method_blob);
+    if crate::__parse_body_for_test(&blob, "\\").is_err() {
+        return TestResult::Fail("parse failed");
+    }
+    let uuid = [
+        0xA2, 0x8D, 0x1C, 0x4F, 0xA0, 0xD5, 0x7B, 0x4C, 0x81, 0x69, 0x3D, 0x2D, 0xBF, 0xCA, 0x3C,
+        0x03,
+    ];
+    match crate::eval::evaluate_dsm(
+        "\\TSTD",
+        uuid,
+        1,
+        1,
+        crate::Value::Package(alloc::vec::Vec::new()),
+    ) {
+        Ok(crate::Value::Integer(0x1234)) => TestResult::Pass,
+        Ok(other) => {
+            let _ = other;
+            TestResult::Fail("_DSM should have returned Integer(0x1234)")
+        }
+        Err(_) => TestResult::Fail("evaluate_dsm errored"),
+    }
+}
+kernel_test_in!("aml", smoke_aml_evaluate_dsm_returns_value);
+
+fn smoke_aml_evaluate_dsm_missing_method_errors() -> TestResult {
+    // Device(\TSTE) with no _DSM child — call should return MethodNotFound.
+    let blob: &[u8] = &[
+        0x5B, 0x82, // Device
+        6, // PkgLength = 1 (PkgLen) + 1 (root) + 4 (NameSeg) = 6
+        b'\\', b'T', b'S', b'T', b'E',
+    ];
+    if crate::__parse_body_for_test(blob, "\\").is_err() {
+        return TestResult::Fail("parse failed");
+    }
+    let uuid = [0u8; 16];
+    match crate::eval::evaluate_dsm(
+        "\\TSTE",
+        uuid,
+        1,
+        0,
+        crate::Value::Package(alloc::vec::Vec::new()),
+    ) {
+        Err(crate::AmlError::MethodNotFound) => TestResult::Pass,
+        _ => TestResult::Fail("missing _DSM should surface as MethodNotFound"),
+    }
+}
+kernel_test_in!("aml", smoke_aml_evaluate_dsm_missing_method_errors);

@@ -406,19 +406,43 @@ fn push_ptp_pointer(
     ));
 }
 
-/// Try to evaluate `<path>._DSM` with the Microsoft HID-over-I2C
-/// UUID + function index 1, which returns the device's HID
-/// descriptor register. Currently a stub — the AML evaluator does
-/// not yet support Buffer + Package method args, so we always
-/// return None and the caller falls back to
-/// `DEFAULT_HID_DESC_REGISTER`. Keeping the hook here so the wire-up
-/// is one Edit away when narf-aml grows the plumbing.
-fn resolve_hid_desc_register(_path: &str) -> Option<u16> {
-    // TODO: build Value::Buffer(uuid_bytes) + Value::Integer(rev) +
-    // Value::Integer(func_idx) + Value::Package([]) and call
-    // narf_aml::eval::evaluate_method("<path>._DSM", &args). Decode
-    // the returned Value::Integer as the descriptor register.
-    None
+/// Microsoft HID-over-I2C `_DSM` UUID, in the byte order ACPI
+/// expects (mixed-endian Microsoft GUID): the first 4-byte group is
+/// little-endian, the next two 2-byte groups are little-endian, and
+/// the trailing 8 bytes are big-endian. Source UUID:
+/// 4F1C8DA2-D5A0-4C7B-8169-3D2DBFCA3C03 (Microsoft HID-over-I2C
+/// spec §3.1).
+const HID_OVER_I2C_DSM_UUID: [u8; 16] = [
+    0xA2, 0x8D, 0x1C, 0x4F, // 4F1C8DA2 (LE)
+    0xA0, 0xD5, // D5A0      (LE)
+    0x7B, 0x4C, // 4C7B      (LE)
+    0x81, 0x69, // 8169      (BE)
+    0x3D, 0x2D, 0xBF, 0xCA, 0x3C, 0x03, // 3D2DBFCA3C03 (BE)
+];
+
+/// Function index for "return the HID descriptor register address",
+/// per the Microsoft spec §3.1.1.
+const HID_OVER_I2C_DSM_FUNC_DESC_REG: u64 = 1;
+
+/// Try to evaluate `<path>._DSM(HID-over-I2C UUID, rev=1, func=1, ())`
+/// to discover the device's HID descriptor register. Returns `None`
+/// when `_DSM` is absent, when it returns a non-Integer value (the
+/// AML idiom for "function not implemented"), or when the integer
+/// doesn't fit in u16.
+fn resolve_hid_desc_register(path: &str) -> Option<u16> {
+    let r = narf_aml::eval::evaluate_dsm(
+        path,
+        HID_OVER_I2C_DSM_UUID,
+        1,
+        HID_OVER_I2C_DSM_FUNC_DESC_REG,
+        narf_aml::Value::Package(alloc::vec::Vec::new()),
+    )
+    .ok()?;
+    let n = r.as_integer();
+    if n == 0 || n > u16::MAX as u64 {
+        return None;
+    }
+    Some(n as u16)
 }
 
 #[doc(hidden)]
