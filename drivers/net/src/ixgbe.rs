@@ -266,23 +266,26 @@ impl Ixgbe {
         unsafe {
             mmio.write32(REG_CTRL, CTRL_RST_MASK);
         }
-        let mut spins = 0u32;
-        loop {
-            // SAFETY: same.
-            let v = unsafe { mmio.read32(REG_CTRL) };
-            if v & CTRL_RST_MASK == 0 {
-                break;
-            }
-            spins += 1;
-            if spins > 1_000_000 {
-                return Err(IxgbeError::ResetTimeout);
-            }
-            core::hint::spin_loop();
+        // responsive_spin ticks sleep_pumps so cursor / serial /
+        // audio drain stay alive on a slow reset.
+        let cleared = narf_scheduler::responsive_spin(
+            // SAFETY: identity-mapped MMIO.
+            || unsafe { mmio.read32(REG_CTRL) } & CTRL_RST_MASK == 0,
+            1_000_000,
+        );
+        if !cleared {
+            return Err(IxgbeError::ResetTimeout);
         }
-        // Datasheet §4.6.3.2 — wait ~10 ms for FW handshake. Burn
-        // some spins as a Stage-1 stand-in (a sleep_pump comes later).
-        for _ in 0..200_000 {
-            core::hint::spin_loop();
+        // Datasheet §4.6.3.2 — wait ~10 ms for FW handshake.
+        // TSC-based busy_wait gives real wall-clock time vs the
+        // 200_000 spin_loop estimate that varied with CPU clock.
+        let tsc_hz = narf_time::calibrate_clocks();
+        if tsc_hz > 0 {
+            narf_time::busy_wait_cycles((tsc_hz / 1000) * 10);
+        } else {
+            for _ in 0..1_000_000 {
+                core::hint::spin_loop();
+            }
         }
 
         // 3. Re-mask after reset.
@@ -332,19 +335,13 @@ impl Ixgbe {
             mmio.write32(TX_TXDCTL, dctl | TXDCTL_ENABLE);
         }
         // Poll for queue-enable to take effect (§7.2.3.4.1).
-        let mut spins = 0u32;
-        loop {
-            // SAFETY: same.
-            let v = unsafe { mmio.read32(TX_TXDCTL) };
-            if v & TXDCTL_ENABLE != 0 {
-                break;
-            }
-            spins += 1;
-            if spins > 1_000_000 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+        // responsive_spin ticks sleep_pumps; failure is non-fatal
+        // here (queue may come up later), matching prior behaviour.
+        let _ = narf_scheduler::responsive_spin(
+            // SAFETY: identity-mapped MMIO.
+            || unsafe { mmio.read32(TX_TXDCTL) } & TXDCTL_ENABLE != 0,
+            1_000_000,
+        );
 
         // 7. RX ring + pool.
         let rx_ring = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| IxgbeError::NoMemory)?;
@@ -447,20 +444,15 @@ impl Ixgbe {
         drop(tail_g);
 
         // Poll DD: olinfo's low 4 bits of [3:0] (status) carry DD.
-        // The advanced write-back lays status at olinfo[3:0]
+        // Advanced write-back lays status at olinfo[3:0]
         // (§7.2.3.2.4 write-back layout).
-        let mut spins = 0u32;
-        loop {
+        let done = narf_scheduler::responsive_spin(
             // SAFETY: identity-mapped DMA.
-            let olinfo = unsafe { core::ptr::read_volatile((desc_addr + 12) as *const u32) };
-            if olinfo & ADVTXD_STAT_DD != 0 {
-                break;
-            }
-            spins += 1;
-            if spins > 10_000_000 {
-                return Err(IxgbeError::TxTimeout);
-            }
-            core::hint::spin_loop();
+            || unsafe { core::ptr::read_volatile((desc_addr + 12) as *const u32) } & ADVTXD_STAT_DD != 0,
+            10_000_000,
+        );
+        if !done {
+            return Err(IxgbeError::TxTimeout);
         }
         // (no scratch drop — buffer is persistent in tx_pool)
         Ok(())
@@ -593,18 +585,22 @@ fn eeprom_read_word(mmio: &MmioRegion, addr: u16) -> Result<u16, IxgbeError> {
     unsafe {
         mmio.write32(REG_EERD, eerd_start(addr));
     }
-    let mut spins = 0u32;
-    loop {
-        // SAFETY: same.
-        let v = unsafe { mmio.read32(REG_EERD) };
-        if v & EERD_DONE != 0 {
-            return Ok(eeprom_decode(v));
-        }
-        spins += 1;
-        if spins > 1_000_000 {
-            return Err(IxgbeError::EepromTimeout);
-        }
-        core::hint::spin_loop();
+    // EEPROM read is short (microseconds typically) but the
+    // helper still ticks sleep_pumps in case of a wedged chip
+    // or hot-plug-during-init pathology.
+    let mut last = 0u32;
+    let done = narf_scheduler::responsive_spin(
+        || {
+            // SAFETY: identity-mapped MMIO.
+            last = unsafe { mmio.read32(REG_EERD) };
+            last & EERD_DONE != 0
+        },
+        1_000_000,
+    );
+    if done {
+        Ok(eeprom_decode(last))
+    } else {
+        Err(IxgbeError::EepromTimeout)
     }
 }
 

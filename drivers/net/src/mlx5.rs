@@ -386,20 +386,20 @@ impl Mlx5Hca {
 
         // Poll the initializing register at 0x0FFC until bit 31
         // clears. Two-second worst case per PRM §1.6.
-        let mut spins = 0u32;
-        loop {
-            // SAFETY: identity-mapped MMIO.
-            let v = unsafe { mmio.read32(ISEG_INITIALIZING as u64) };
-            // Register is BE on the wire; read32 returns LE-host
-            // bytes, so swap.
-            if (v.swap_bytes() & INITIALIZING_BIT) == 0 {
-                break;
-            }
-            spins += 1;
-            if spins > INIT_POLL_LIMIT {
-                return Err(Mlx5Error::InitTimeout);
-            }
-            core::hint::spin_loop();
+        // responsive_spin ticks sleep_pumps so cursor / serial /
+        // audio drain stay alive across the multi-second wait.
+        let ready = narf_scheduler::responsive_spin(
+            || {
+                // SAFETY: identity-mapped MMIO.
+                let v = unsafe { mmio.read32(ISEG_INITIALIZING as u64) };
+                // Register is BE on the wire; read32 returns
+                // LE-host bytes, so swap.
+                (v.swap_bytes() & INITIALIZING_BIT) == 0
+            },
+            INIT_POLL_LIMIT,
+        );
+        if !ready {
+            return Err(Mlx5Error::InitTimeout);
         }
 
         // Snapshot the init segment region. We do byte-by-byte reads
@@ -501,20 +501,15 @@ impl Mlx5Hca {
         self.ring_cmd_doorbell(1);
 
         // Poll the slot's status_own byte until the ownership bit
-        // clears.
+        // clears. responsive_spin ticks sleep_pumps.
         let own_phys = slot_phys + CQE_OFF_STATUS_OWN as u64;
-        let mut spins = 0u32;
-        loop {
+        let done = narf_scheduler::responsive_spin(
             // SAFETY: identity-mapped DMA.
-            let v = unsafe { core::ptr::read_volatile(own_phys as *const u8) };
-            if v & STATUS_OWN_BIT == 0 {
-                break;
-            }
-            spins += 1;
-            if spins > CMD_POLL_LIMIT {
-                return Err(Mlx5Error::CmdTimeout);
-            }
-            core::hint::spin_loop();
+            || unsafe { core::ptr::read_volatile(own_phys as *const u8) } & STATUS_OWN_BIT == 0,
+            CMD_POLL_LIMIT,
+        );
+        if !done {
+            return Err(Mlx5Error::CmdTimeout);
         }
 
         // Read the completed CQE back out.
@@ -647,19 +642,15 @@ impl Mlx5Hca {
         self.ring_cmd_doorbell(1);
 
         // Poll for completion.
+        // Poll until ownership clears. responsive_spin ticks sleep_pumps.
         let own_phys = slot_phys + CQE_OFF_STATUS_OWN as u64;
-        let mut spins = 0u32;
-        loop {
+        let done = narf_scheduler::responsive_spin(
             // SAFETY: identity-mapped DMA.
-            let v = unsafe { core::ptr::read_volatile(own_phys as *const u8) };
-            if v & STATUS_OWN_BIT == 0 {
-                break;
-            }
-            spins += 1;
-            if spins > CMD_POLL_LIMIT {
-                return Err(Mlx5Error::CmdTimeout);
-            }
-            core::hint::spin_loop();
+            || unsafe { core::ptr::read_volatile(own_phys as *const u8) } & STATUS_OWN_BIT == 0,
+            CMD_POLL_LIMIT,
+        );
+        if !done {
+            return Err(Mlx5Error::CmdTimeout);
         }
 
         // Decode CQE status; even on failure we want to surface
@@ -746,18 +737,13 @@ impl Mlx5Hca {
         self.ring_cmd_doorbell(1);
 
         let own_phys = slot_phys + CQE_OFF_STATUS_OWN as u64;
-        let mut spins = 0u32;
-        loop {
+        let done = narf_scheduler::responsive_spin(
             // SAFETY: identity-mapped DMA.
-            let v = unsafe { core::ptr::read_volatile(own_phys as *const u8) };
-            if v & STATUS_OWN_BIT == 0 {
-                break;
-            }
-            spins += 1;
-            if spins > CMD_POLL_LIMIT {
-                return Err(Mlx5Error::CmdTimeout);
-            }
-            core::hint::spin_loop();
+            || unsafe { core::ptr::read_volatile(own_phys as *const u8) } & STATUS_OWN_BIT == 0,
+            CMD_POLL_LIMIT,
+        );
+        if !done {
+            return Err(Mlx5Error::CmdTimeout);
         }
 
         let mut completed = [0u8; CQE_LEN];

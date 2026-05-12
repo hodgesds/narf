@@ -28,6 +28,7 @@ narf-kernel-test  = { path = "../../verification/kernel-test" }
 narf-driver-runtime = { path = "../runtime", default-features = false, features = ["kernel"] }
 narf-firmware    = { path = "../../firmware" }
 narf-scheduler   = { path = "../../scheduler" }
+narf-time        = { path = "../../time" }
 
 [lints]
 workspace = true

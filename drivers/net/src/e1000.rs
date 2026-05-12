@@ -310,15 +310,13 @@ impl E1000 {
         unsafe {
             mmio.write32(REG_CTRL, CTRL_RST);
         }
-        // Wait for RST to clear.
-        for _ in 0..1_000_000u32 {
-            // SAFETY: identity-mapped.
-            let v = unsafe { mmio.read32(REG_CTRL) };
-            if v & CTRL_RST == 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
+        // Wait for RST to clear. responsive_spin ticks sleep_pumps
+        // every ~4096 iters so FB cursor / serial drain stay alive.
+        narf_scheduler::responsive_spin(
+            // SAFETY: identity-mapped MMIO.
+            || unsafe { mmio.read32(REG_CTRL) } & CTRL_RST == 0,
+            1_000_000,
+        );
 
         // 2. Read MAC from RAL/RAH.
         // SAFETY: identity-mapped.
@@ -621,19 +619,14 @@ impl E1000 {
         *tail_g = next_tail;
         drop(tail_g);
 
-        // Poll for DD.
-        let mut spins = 0u32;
-        loop {
+        // Poll for DD. responsive_spin ticks sleep_pumps.
+        let done = narf_scheduler::responsive_spin(
             // SAFETY: identity-mapped DMA.
-            let status = unsafe { core::ptr::read_volatile((desc_addr + 12) as *const u8) };
-            if status & TXD_STAT_DD != 0 {
-                break;
-            }
-            spins += 1;
-            if spins > 10_000_000 {
-                return Err(E1000Error::TxTimeout);
-            }
-            core::hint::spin_loop();
+            || unsafe { core::ptr::read_volatile((desc_addr + 12) as *const u8) } & TXD_STAT_DD != 0,
+            10_000_000,
+        );
+        if !done {
+            return Err(E1000Error::TxTimeout);
         }
         Ok(())
     }
