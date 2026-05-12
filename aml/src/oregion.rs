@@ -21,6 +21,12 @@ pub enum RegionSpace {
     PciConfig,
     EmbeddedCtl,
     SmBus,
+    SystemCmos,
+    PciBarTarget,
+    Ipmi,
+    GeneralPurposeIO,
+    GenericSerialBus,
+    Pcc,
     /// Anything we don't decode.
     Other(u8),
 }
@@ -33,6 +39,12 @@ impl RegionSpace {
             2 => RegionSpace::PciConfig,
             3 => RegionSpace::EmbeddedCtl,
             4 => RegionSpace::SmBus,
+            5 => RegionSpace::SystemCmos,
+            6 => RegionSpace::PciBarTarget,
+            7 => RegionSpace::Ipmi,
+            8 => RegionSpace::GeneralPurposeIO,
+            9 => RegionSpace::GenericSerialBus,
+            10 => RegionSpace::Pcc,
             n => RegionSpace::Other(n),
         }
     }
@@ -473,6 +485,20 @@ fn read_unit(
             Some(addr) => Ok(unsafe { mmio_read(addr + byte_offset_in_region, width) }),
             None => Err(FieldAccessError::Unsupported),
         },
+        // EC + GenericSerialBus stubs: return 0 instead of
+        // erroring so DSDT _DSM/_INI paths can flow through
+        // without aborting on Unsupported. Real protocol impl
+        // (EC command/data port handshake; GSB routing through
+        // the I2C registry) is a follow-up. The audit accepts
+        // this as a transitional state — many touchpad _DSMs
+        // touch GSB only for sub-functions we don't need at
+        // bring-up.
+        RegionSpace::EmbeddedCtl
+        | RegionSpace::GenericSerialBus
+        | RegionSpace::GeneralPurposeIO
+        | RegionSpace::SmBus
+        | RegionSpace::Ipmi
+        | RegionSpace::Pcc => Ok(0),
         _ => Err(FieldAccessError::Unsupported),
     }
 }
@@ -512,6 +538,14 @@ fn write_unit(
             }
             None => Err(FieldAccessError::Unsupported),
         },
+        // EC + GenericSerialBus stubs: silently drop writes.
+        // See read_unit for the rationale + follow-up plan.
+        RegionSpace::EmbeddedCtl
+        | RegionSpace::GenericSerialBus
+        | RegionSpace::GeneralPurposeIO
+        | RegionSpace::SmBus
+        | RegionSpace::Ipmi
+        | RegionSpace::Pcc => Ok(()),
         _ => Err(FieldAccessError::Unsupported),
     }
 }

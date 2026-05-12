@@ -204,6 +204,12 @@ pub fn notify_reg_handlers() {
             crate::oregion::RegionSpace::PciConfig => 2,
             crate::oregion::RegionSpace::EmbeddedCtl => 3,
             crate::oregion::RegionSpace::SmBus => 4,
+            crate::oregion::RegionSpace::SystemCmos => 5,
+            crate::oregion::RegionSpace::PciBarTarget => 6,
+            crate::oregion::RegionSpace::Ipmi => 7,
+            crate::oregion::RegionSpace::GeneralPurposeIO => 8,
+            crate::oregion::RegionSpace::GenericSerialBus => 9,
+            crate::oregion::RegionSpace::Pcc => 10,
             crate::oregion::RegionSpace::Other(n) => n as u64,
         };
         let mut method_path = String::from(device_path);
