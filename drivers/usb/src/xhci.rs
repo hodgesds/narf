@@ -1082,23 +1082,12 @@ impl Xhci {
         usb2
     }
 
-    /// Drive `port` through reset. Per §4.19.5 this transitions an
-    /// attached device into Default state. The PORTSC change bits
-    /// at [17..23] are RW1C — preserve the RO/RW fields below them
-    /// when writing back. Returns the post-reset PORTSC value.
-    ///
-    /// AMD FCH USB2 controllers + many integrated HID devices
-    /// (per the AMD chipset datasheet's Hot Reset note + on-screen
-    /// PORTSC capture): the controller routinely bounces CCS
-    /// during reset (CCS toggles 1→0→1, fires PORTSC.CSC, the new
-    /// connect cycle leaves PED=0 and PLS=Polling). USB 2.0
-    /// §11.5.1.5 + xHCI 1.2 §4.19.5 both note that a port reset
-    /// can re-trigger device-initiated detach/attach handshaking;
-    /// the spec-compliant response is to re-issue PR until the
-    /// link comes up cleanly. We cap at RESET_RETRIES to bound
-    /// boot time on a truly dead port.
+    /// Drive `port` through reset. Per xHCI 1.2 §4.19.5 this
+    /// transitions an attached device into Default state. The
+    /// PORTSC change bits at [17..23] are RW1C — preserve the
+    /// RO/RW fields below them when writing back. Returns the
+    /// post-reset PORTSC value.
     pub fn port_reset(&self, port: u8) -> Result<u32, XhciError> {
-        const RESET_RETRIES: u32 = 5;
         if port == 0 || port > self.caps.max_ports {
             return Err(XhciError::BadPort);
         }
@@ -1125,53 +1114,20 @@ impl Xhci {
                 core::hint::spin_loop();
             }
         }
-        let mut last_err = XhciError::PortResetTimeout;
-        for retry in 0..RESET_RETRIES {
-            match self.port_reset_once(port, off, retry as u8) {
-                Ok(v) => return Ok(v),
-                Err(e) => last_err = e,
-            }
-            // Brief gap between attempts so the device's USB SIE
-            // can settle before the next PR pulse — same idea as
-            // TRSTRCY but on the controller side. ~5 ms.
-            let tsc_hz = narf_time::calibrate_clocks();
-            if tsc_hz > 0 {
-                narf_time::busy_wait_cycles((tsc_hz / 1000) * 5);
-            } else {
-                for _ in 0..500_000u32 {
-                    core::hint::spin_loop();
-                }
-            }
-        }
-        Err(last_err)
+        self.port_reset_once(port, off)
     }
 
-    /// One reset attempt. Factored out so `port_reset` can retry
-    /// on a CSC-bounce or PED-drop without re-doing the CCS
-    /// debounce.
-    fn port_reset_once(&self, port: u8, off: u64, retry: u8) -> Result<u32, XhciError> {
+    /// One reset attempt. Spec-compliant single-shot per xHCI 1.2
+    /// §4.19.5: assert PR, wait for PR to self-clear + PRC to set,
+    /// ack PRC, verify PED is set (USB2) or PED + PLS=U0 (USB3),
+    /// then wait TRSTRCY (USB 2.0 §7.1.7.3 / §9.2.6.2) before the
+    /// caller drives the next bus transaction.
+    fn port_reset_once(&self, port: u8, off: u64) -> Result<u32, XhciError> {
         // SAFETY: identity-mapped MMIO; off bounded by caller.
         let cur = unsafe { self.mmio.read32(off) };
-        // First: ack ALL stale RW1C change bits left over from a
-        // prior attempt or initial state (CSC, PEC, WRC, OCC,
-        // PRC, PLC, CEC). Without this clear, the success-criteria
-        // check below sees a CSC=1 from the previous bounce and
-        // incorrectly fails the new attempt before it even gets
-        // a chance to settle. Write 1s to all change bits to
-        // clear them; preserve everything else (we omit PR + PP
-        // since we'll set them in the next write).
-        if cur & PORTSC_CHG_MASK != 0 {
-            // SAFETY: same.
-            unsafe {
-                self.mmio.write32(off, (cur & !PORTSC_PED) | PORTSC_CHG_MASK);
-            }
-        }
-        // Second: assert PR + keep PP. Mask RW1C change bits to 0
-        // in the value we write so this write doesn't ALSO clear
-        // change bits (we want them to stay clear from the prior
-        // write), and skip PED (RW1C, leave 0).
-        // SAFETY: same.
-        let cur = unsafe { self.mmio.read32(off) };
+        // Assert PR + keep PP. Mask RW1C change bits to 0 so this
+        // write doesn't accidentally clear them, and skip PED
+        // (RW1C, leave 0).
         let to_write = (cur & !PORTSC_CHG_MASK)
             & !PORTSC_PED
             | PORTSC_PR
@@ -1214,95 +1170,35 @@ impl Xhci {
                         _ => ped,
                     };
                     if ok {
-                        // USB 2.0 §7.1.7.3 / §9.2.6.2 (TRSTRCY,
-                        // Reset Recovery Time): ≥10 ms of bus
-                        // quiet between PR clearing and the host
-                        // driving the first SETUP packet. xHC's
-                        // Address Device with BSR=0 sends
-                        // SET_ADDRESS on the bus, so without this
-                        // delay the device NACKs and the
-                        // completion is surfaced as Transfer Error
-                        // (xHCI completion code 4). TSC-driven
-                        // busy_wait_cycles guarantees a real
-                        // wall-time delay regardless of compiler
-                        // / CPU spin_loop pacing.
-                        // calibrate_clocks() is idempotent and returns
-                        // cached TSC frequency in Hz on x86_64. Falls
-                        // back to a fixed spin loop if calibration
-                        // returned 0 (TSC not yet ready) so we never
-                        // hang on a degenerate busy_wait_cycles(0).
-                        // 25 ms (vs the 10 ms USB 2.0 minimum) — many
-                        // real-world FS devices document needing 15-20
-                        // ms of bus quiet to stabilise their SIE
-                        // before responding to SET_ADDRESS, and
-                        // boot-time is dominated by initcall serial
-                        // logging anyway so the extra 13 ms per port
-                        // is invisible to the user.
-                        // Diagnostic on real Renoir HW: PORTSC.CSC
-                        // fires and PED drops between this match
-                        // and the address_device call (the device
-                        // bounces the link after our reset).
-                        // Sample PORTSC over the TRSTRCY window
-                        // and require *both*:
-                        //   - PED stays 1 the whole time
-                        //   - CSC never fires
-                        // Also doubles as the TRSTRCY
-                        // (USB 2.0 §7.1.7.3 ≥10 ms recovery
-                        // delay) so address_device's SET_ADDRESS
-                        // lands cleanly. If we see CSC or
-                        // PED-drop we ack the change bits and
-                        // surface PortResetTimeout so the caller
-                        // retries the whole port_reset cycle.
+                        // TRSTRCY (USB 2.0 §7.1.7.3 / §9.2.6.2):
+                        // ≥10 ms of bus quiet between PR clearing
+                        // and the host driving the first SETUP
+                        // packet, so address_device's SET_ADDRESS
+                        // lands after the device's reset-recovery
+                        // window. TSC-driven so the wait is real
+                        // wall-clock time independent of CPU
+                        // spin_loop pacing. Falls back to a fixed
+                        // spin if TSC isn't calibrated yet (early
+                        // boot) so we don't degenerate to
+                        // busy_wait_cycles(0).
                         let tsc_hz = narf_time::calibrate_clocks();
-                        let total_cycles: u64 = if tsc_hz > 0 {
-                            (tsc_hz / 1000) * 25
+                        if tsc_hz > 0 {
+                            narf_time::busy_wait_cycles((tsc_hz / 1000) * 25);
                         } else {
-                            2_500_000
-                        };
-                        let start = narf_time::now_cycles();
-                        let mut stable_post = post;
-                        loop {
-                            // SAFETY: same MMIO region.
-                            let v = unsafe { self.mmio.read32(off) };
-                            if v & PORTSC_CSC != 0 {
-                                PORT_RESET_LAST_FAIL
-                                    .store(port, retry, PortResetFailReason::CscBounce, v);
-                                let ack = (v & !PORTSC_CHG_MASK) | PORTSC_CSC;
-                                // SAFETY: same.
-                                unsafe { self.mmio.write32(off, ack); }
-                                return Err(XhciError::PortResetTimeout);
+                            for _ in 0..3_000_000u32 {
+                                core::hint::spin_loop();
                             }
-                            if v & PORTSC_PED == 0 {
-                                PORT_RESET_LAST_FAIL
-                                    .store(port, retry, PortResetFailReason::PedDrop, v);
-                                return Err(XhciError::PortResetTimeout);
-                            }
-                            stable_post = v;
-                            if narf_time::now_cycles().wrapping_sub(start) >= total_cycles {
-                                break;
-                            }
-                            core::hint::spin_loop();
                         }
-                        return Ok(stable_post);
+                        return Ok(post);
                     }
                     for _ in 0..200 {
                         core::hint::spin_loop();
                     }
                 }
-                // PED never asserted (USB2) / PED+PLS never reached
-                // U0 (USB3) within the success-criteria poll.
-                // SAFETY: identity-mapped MMIO; off bounded.
-                let snap = unsafe { self.mmio.read32(off) };
-                PORT_RESET_LAST_FAIL.store(port, retry, PortResetFailReason::PedNeverSet, snap);
                 return Err(XhciError::PortResetTimeout);
             }
             core::hint::spin_loop();
         }
-        // Outer wait: PR never self-cleared OR PRC never set in the
-        // ~250 ms window. Almost always a dead/disconnected port.
-        // SAFETY: identity-mapped MMIO; off bounded.
-        let snap = unsafe { self.mmio.read32(off) };
-        PORT_RESET_LAST_FAIL.store(port, retry, PortResetFailReason::PrTimeout, snap);
         Err(XhciError::PortResetTimeout)
     }
 
@@ -1744,40 +1640,11 @@ impl Xhci {
         let cce = TRB_TYPE_CMD_COMPLETION << TRB_TYPE_SHIFT;
         let want_slot = (slot_id as u32) << 24;
         let dword3 = trb_type | ((slot_id as u32) << 24);
-        // Snapshot PORTSC + speed + key slot-ctx values for the
-        // post-mortem log if Address Device fails. Reading PORTSC
-        // here also catches the "PED dropped after the TRSTRCY
-        // wait" failure mode where the controller transiently
-        // asserts PED post-reset then drops it as the device
-        // mis-handshakes.
-        // SAFETY: identity-mapped MMIO; port-range checked above.
-        let pre_portsc = unsafe {
-            self.mmio
-                .read32(self.op_off + OP_PORTSC_BASE + ((port as u64 - 1) * PORT_REGS_STRIDE))
-        };
-        let pre_pre_speed = (pre_portsc >> 10) & 0xF;
-        let pre_ped = pre_portsc & PORTSC_PED != 0;
-        let pre_pls = (pre_portsc & PORTSC_PLS_MASK) >> 5;
         self.submit_command(input_phys as u32, (input_phys >> 32) as u32, 0, dword3)?;
         let ev = self
             .await_event(|t| (t[3] & TRB_TYPE_MASK) == cce && (t[3] & 0xFF00_0000) == want_slot)?;
         let ccode = ((ev[2] >> 24) & 0xFF) as u8;
         if ccode != 1 {
-            // Capture diagnostics in a static slot so the FB
-            // status panel can render them in a fixed location
-            // (readable off-screen on bare-metal where klog
-            // scroll-back / serial console aren't available).
-            // Tight hex single-line so even when it lands in the
-            // panel's last-N-lines klog tail it doesn't wrap.
-            // SAFETY: identity-mapped MMIO; OP_USBSTS in range.
-            let sts = unsafe { self.mmio.read32(self.op_off + OP_USBSTS) };
-            ADDR_DEV_LAST_FAIL.store_pack(slot_id, port, ccode, pre_portsc, sts);
-            use core::fmt::Write as _;
-            let _ = writeln!(
-                narf_console::Writer,
-                "xhci-ad: p{} c{:x} ps{:08x} st{:08x} sp{:?}",
-                port, ccode, pre_portsc, sts, speed,
-            );
             return Err(XhciError::CmdFailed(ccode));
         }
 
@@ -2492,119 +2359,6 @@ impl Xhci {
         let acked = (data.len() as u32).saturating_sub(residue) as usize;
         Ok(acked)
     }
-}
-
-/// Last-failure capture for `address_device`. Read by the FB
-/// status panel so the user can read the diagnostic off-screen
-/// without serial console / scrollback access.
-#[derive(Debug)]
-pub struct AddrDevLastFail {
-    raw: core::sync::atomic::AtomicU64,
-    portsc: core::sync::atomic::AtomicU32,
-    usbsts: core::sync::atomic::AtomicU32,
-}
-impl AddrDevLastFail {
-    const fn new() -> Self {
-        Self {
-            raw: core::sync::atomic::AtomicU64::new(0),
-            portsc: core::sync::atomic::AtomicU32::new(0),
-            usbsts: core::sync::atomic::AtomicU32::new(0),
-        }
-    }
-    fn store_pack(&self, slot: u8, port: u8, ccode: u8, portsc: u32, usbsts: u32) {
-        // Pack slot/port/ccode/seq into the low 32 bits; high 32
-        // is a counter so a second failure doesn't get hidden by a
-        // raw-read snapshot of the previous one.
-        let prev = self.raw.load(core::sync::atomic::Ordering::Relaxed);
-        let seq = (prev >> 32) as u32 + 1;
-        let lo =
-            (slot as u64) | ((port as u64) << 8) | ((ccode as u64) << 16);
-        self.raw
-            .store(((seq as u64) << 32) | lo, core::sync::atomic::Ordering::Release);
-        self.portsc
-            .store(portsc, core::sync::atomic::Ordering::Release);
-        self.usbsts
-            .store(usbsts, core::sync::atomic::Ordering::Release);
-    }
-    /// Returns `(seq, slot, port, ccode, portsc, usbsts)` or
-    /// `None` if no failure recorded. seq=0 means "never failed".
-    pub fn snapshot(&self) -> Option<(u32, u8, u8, u8, u32, u32)> {
-        let raw = self.raw.load(core::sync::atomic::Ordering::Acquire);
-        let seq = (raw >> 32) as u32;
-        if seq == 0 {
-            return None;
-        }
-        let slot = (raw & 0xFF) as u8;
-        let port = ((raw >> 8) & 0xFF) as u8;
-        let ccode = ((raw >> 16) & 0xFF) as u8;
-        let portsc = self.portsc.load(core::sync::atomic::Ordering::Acquire);
-        let usbsts = self.usbsts.load(core::sync::atomic::Ordering::Acquire);
-        Some((seq, slot, port, ccode, portsc, usbsts))
-    }
-}
-pub static ADDR_DEV_LAST_FAIL: AddrDevLastFail = AddrDevLastFail::new();
-
-/// Last-failure capture for `port_reset_once`. Lets the FB
-/// status panel show why the retry loop is bouncing — the
-/// PORTSC value at the bounce detection point + which retry
-/// caught it + the failure reason (CSC vs PED-drop vs PR/PRC
-/// timeout).
-#[derive(Debug)]
-pub struct PortResetLastFail {
-    raw: core::sync::atomic::AtomicU64,
-    portsc: core::sync::atomic::AtomicU32,
-}
-impl PortResetLastFail {
-    const fn new() -> Self {
-        Self {
-            raw: core::sync::atomic::AtomicU64::new(0),
-            portsc: core::sync::atomic::AtomicU32::new(0),
-        }
-    }
-    fn store(&self, port: u8, retry: u8, reason: PortResetFailReason, portsc: u32) {
-        let prev = self.raw.load(core::sync::atomic::Ordering::Relaxed);
-        let seq = (prev >> 32) as u32 + 1;
-        let lo = (port as u64)
-            | ((retry as u64) << 8)
-            | ((reason as u64 & 0xFF) << 16);
-        self.raw
-            .store(((seq as u64) << 32) | lo, core::sync::atomic::Ordering::Release);
-        self.portsc
-            .store(portsc, core::sync::atomic::Ordering::Release);
-    }
-    /// `(seq, port, retry, reason, portsc)` or None if no fail recorded.
-    pub fn snapshot(&self) -> Option<(u32, u8, u8, u8, u32)> {
-        let raw = self.raw.load(core::sync::atomic::Ordering::Acquire);
-        let seq = (raw >> 32) as u32;
-        if seq == 0 {
-            return None;
-        }
-        Some((
-            seq,
-            (raw & 0xFF) as u8,
-            ((raw >> 8) & 0xFF) as u8,
-            ((raw >> 16) & 0xFF) as u8,
-            self.portsc.load(core::sync::atomic::Ordering::Acquire),
-        ))
-    }
-}
-pub static PORT_RESET_LAST_FAIL: PortResetLastFail = PortResetLastFail::new();
-
-#[repr(u8)]
-#[derive(Copy, Clone, Debug)]
-pub enum PortResetFailReason {
-    /// CSC (Connect Status Change) fired during the post-reset
-    /// stability debounce — the device disconnected/reconnected.
-    CscBounce = 1,
-    /// PED dropped during the post-reset stability debounce — the
-    /// reset succeeded transiently but the link came undone.
-    PedDrop = 2,
-    /// PR didn't self-clear / PRC didn't set within the wait
-    /// window. Almost always a dead port.
-    PrTimeout = 3,
-    /// Success-criteria poll timed out (PED never asserted, or
-    /// PLS never reached U0 on USB3).
-    PedNeverSet = 4,
 }
 
 static CONTROLLER: IrqSafeSpinLock<Option<Xhci>> = IrqSafeSpinLock::new(None);
