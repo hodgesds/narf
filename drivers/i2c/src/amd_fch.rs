@@ -49,6 +49,7 @@ use async_trait::async_trait;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use narf_aml::resource::ResourceItem;
+use narf_lib::mutex::Mutex as AsyncMutex;
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::PhysAddr;
 
@@ -144,8 +145,15 @@ pub struct AmdFchI2c {
     /// means we couldn't allocate a vector or route the GSI; the
     /// state machine falls back to `yield_now()` polling.
     irq_vector: Option<u8>,
-    /// Bus-wide mutex — only one transfer in flight at a time.
-    bus: IrqSafeSpinLock<()>,
+    /// Bus-wide async mutex — only one transfer in flight at a
+    /// time. **Must be a `narf_lib::mutex::Mutex`, not an
+    /// `IrqSafeSpinLock`**: `transfer()` awaits inside the
+    /// critical section (`wait_until(...).await` for FIFO drain
+    /// and STOP completion), and IrqSafeSpinLock disables IRQs
+    /// while held — would deadlock the executor's timer/IRQ
+    /// wakes during the await. See AGENTS.md "Sync → async
+    /// bridge primitives" for the rule.
+    bus: AsyncMutex<()>,
     /// Set true after `start()` programs the controller. Defends
     /// against transfers that race a not-yet-started bus.
     enabled: AtomicBool,
@@ -183,7 +191,7 @@ impl AmdFchI2c {
             mmio_base,
             mmio_len,
             irq_vector,
-            bus: IrqSafeSpinLock::new(()),
+            bus: AsyncMutex::new(()),
             enabled: AtomicBool::new(false),
             last_target: AtomicU8::new(0xff), // 0xff = sentinel "no cached target"
         }
@@ -320,12 +328,13 @@ impl I2cBus for AmdFchI2c {
         if !self.enabled.load(Ordering::Acquire) {
             return Err(I2cError::BadHardware);
         }
-        // Take the bus. IrqSafeSpinLock is OK here because each
-        // transfer is bounded (poll budget) and the controller never
-        // stalls inside the lock without progress — but we drop the
-        // lock immediately if we have to await an IRQ, by re-locking
-        // around each FIFO interaction below.
-        let _bus_guard = self.bus.lock();
+        // Take the bus async-mutex. The guard lives across the
+        // .await calls below (FIFO-drain wait_until, STOP wait);
+        // narf_lib::mutex::Mutex is the right primitive because
+        // it doesn't disable IRQs and so the executor can deliver
+        // wakes while we're parked. An IrqSafeSpinLock here would
+        // deadlock the executor's timer/IRQ delivery during await.
+        let _bus_guard = self.bus.lock().await;
 
         // Reprogram IC_TAR only if the target changed since last
         // transfer — IC_TAR writes require disable/enable, which is
