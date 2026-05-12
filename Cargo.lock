@@ -1146,6 +1146,7 @@ dependencies = [
  "narf-input",
  "narf-input-driver",
  "narf-interrupts",
+ "narf-io",
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",

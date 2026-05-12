@@ -24,6 +24,7 @@ narf-time          = { path = "../time" }
 narf-scheduler     = { path = "../scheduler" }
 narf-interrupts    = { path = "../interrupts" }
 narf-bus           = { path = "../bus" }
+narf-io            = { path = "../io" }
 narf-block         = { path = "../block" }
 narf-drivers-nvme    = { path = "../drivers/nvme" }
 narf-drivers-virtio  = { path = "../drivers/virtio" }
