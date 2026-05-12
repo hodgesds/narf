@@ -125,6 +125,62 @@ pub enum ResourceItem {
         /// Index inside the named ResourceSource.
         resource_source_index: u8,
     },
+    /// Large Serial Bus Connection Descriptor with Bus Type 2 = SPI.
+    /// ACPI 6.5 §6.4.3.8.2.2. Used by Renoir fingerprint readers,
+    /// some BT controllers, and various embedded sensors.
+    SpiSerialBus {
+        device_selection: u16,
+        /// Wire mode + polarity flags (Type-Specific Flags).
+        wire_mode_3wire: bool,
+        device_polarity_low: bool,
+        data_bit_length: u8,
+        clock_phase: u8,
+        clock_polarity: u8,
+        connection_speed: u32,
+        slave_mode: bool,
+        resource_source: String,
+        resource_source_index: u8,
+    },
+    /// Large Serial Bus Connection Descriptor with Bus Type 3 = UART.
+    /// ACPI 6.5 §6.4.3.8.2.3. Used by laptop BT controllers connected
+    /// over the FCH UART.
+    UartSerialBus {
+        baud_rate: u32,
+        rx_fifo_size: u16,
+        tx_fifo_size: u16,
+        parity: u8,
+        lines_in_use: u8,
+        flow_control: u8,
+        stop_bits: u8,
+        data_bits: u8,
+        endianness_big: bool,
+        slave_mode: bool,
+        resource_source: String,
+        resource_source_index: u8,
+    },
+    /// GPIO PinFunction Connection Descriptor (large tag 0x0D).
+    /// ACPI 6.5 §6.4.3.8.5. Used by Renoir for non-default pin
+    /// muxing of GPIO pins (e.g. pin acts as alt-function instead
+    /// of as a generic GPIO).
+    PinFunction {
+        shared: bool,
+        pull: u8,
+        function_number: u16,
+        pins: Vec<u16>,
+        resource_source: String,
+        resource_source_index: u8,
+    },
+    /// PinConfig Connection Descriptor (large tag 0x0F). ACPI 6.5
+    /// §6.4.3.8.6. Used to override drive-strength / pull-up
+    /// configuration on specific pins.
+    PinConfig {
+        shared: bool,
+        config_type: u8,
+        config_value: u32,
+        pins: Vec<u16>,
+        resource_source: String,
+        resource_source_index: u8,
+    },
     /// EndTag — small tag 0x79. Emitted so callers can verify termination.
     EndTag,
     /// Any descriptor type we don't decode. Carries the raw tag byte and payload.
@@ -494,9 +550,17 @@ pub fn decode_resource_template(buf: &[u8]) -> Result<Vec<ResourceItem>, Resourc
                 0x0C => {
                     items.push(decode_gpio_connection(tag, payload));
                 }
+                // Large tag 0x0D = PinFunction (audit #14).
+                0x0D => {
+                    items.push(decode_pin_function(tag, payload));
+                }
                 // Large tag 0x0E = Serial Bus Connection Descriptor
                 0x0E => {
                     items.push(decode_serial_bus(tag, payload));
+                }
+                // Large tag 0x0F = PinConfig (audit #14).
+                0x0F => {
+                    items.push(decode_pin_config(tag, payload));
                 }
                 _ => {
                     items.push(ResourceItem::Unknown {
@@ -637,31 +701,205 @@ fn decode_serial_bus(tag: u8, payload: &[u8]) -> ResourceItem {
         .unwrap_or(res_src_bytes.len());
     let resource_source = String::from_utf8_lossy(&res_src_bytes[..end]).into_owned();
 
-    if bus_type == 0x01 {
-        // I2C type-specific data: ConnectionSpeed (4 bytes) +
-        // SlaveAddress (2 bytes).
-        if type_data_len < 6 {
-            return ResourceItem::Unknown {
-                tag,
-                payload: payload.to_vec(),
-            };
+    let td = &payload[type_data_start..type_data_end];
+    match bus_type {
+        0x01 => {
+            // I2C type-specific data: ConnectionSpeed (4) +
+            // SlaveAddress (2).
+            if type_data_len < 6 {
+                return ResourceItem::Unknown {
+                    tag,
+                    payload: payload.to_vec(),
+                };
+            }
+            let connection_speed = u32::from_le_bytes([td[0], td[1], td[2], td[3]]);
+            let slave_address = u16::from_le_bytes([td[4], td[5]]);
+            ResourceItem::I2cSerialBus {
+                slave_address,
+                addr_10bit: type_specific_flags & 0x0001 != 0,
+                connection_speed,
+                slave_mode: general_flags & 0x0001 != 0,
+                resource_source,
+                resource_source_index,
+            }
         }
-        let td = &payload[type_data_start..type_data_end];
-        let connection_speed = u32::from_le_bytes([td[0], td[1], td[2], td[3]]);
-        let slave_address = u16::from_le_bytes([td[4], td[5]]);
-        ResourceItem::I2cSerialBus {
-            slave_address,
-            addr_10bit: type_specific_flags & 0x0001 != 0,
-            connection_speed,
-            slave_mode: general_flags & 0x0001 != 0,
-            resource_source,
-            resource_source_index,
+        0x02 => {
+            // SPI type-specific data: ConnectionSpeed (4) +
+            // DataBitLength (1) + Phase (1) + Polarity (1) +
+            // DeviceSelection (2). 9 bytes.
+            if type_data_len < 9 {
+                return ResourceItem::Unknown {
+                    tag,
+                    payload: payload.to_vec(),
+                };
+            }
+            let connection_speed = u32::from_le_bytes([td[0], td[1], td[2], td[3]]);
+            let data_bit_length = td[4];
+            let clock_phase = td[5];
+            let clock_polarity = td[6];
+            let device_selection = u16::from_le_bytes([td[7], td[8]]);
+            ResourceItem::SpiSerialBus {
+                device_selection,
+                wire_mode_3wire: type_specific_flags & 0x0001 != 0,
+                device_polarity_low: type_specific_flags & 0x0002 != 0,
+                data_bit_length,
+                clock_phase,
+                clock_polarity,
+                connection_speed,
+                slave_mode: general_flags & 0x0001 != 0,
+                resource_source,
+                resource_source_index,
+            }
         }
-    } else {
-        ResourceItem::Unknown {
+        0x03 => {
+            // UART type-specific data: BaudRate (4) +
+            // RxFifoSize (2) + TxFifoSize (2) + Parity (1) +
+            // LinesInUse (1) — 10 bytes total.
+            if type_data_len < 10 {
+                return ResourceItem::Unknown {
+                    tag,
+                    payload: payload.to_vec(),
+                };
+            }
+            let baud_rate = u32::from_le_bytes([td[0], td[1], td[2], td[3]]);
+            let rx_fifo_size = u16::from_le_bytes([td[4], td[5]]);
+            let tx_fifo_size = u16::from_le_bytes([td[6], td[7]]);
+            let parity = td[8];
+            let lines_in_use = td[9];
+            // Type-Specific Flags layout (ACPI §6.4.3.8.2.3):
+            // bits 0-1 = flow control, 2-3 = stop bits, 4-7 =
+            // data bits, 8 = big-endian.
+            let flow_control = (type_specific_flags & 0x3) as u8;
+            let stop_bits = ((type_specific_flags >> 2) & 0x3) as u8;
+            let data_bits = ((type_specific_flags >> 4) & 0x7) as u8;
+            ResourceItem::UartSerialBus {
+                baud_rate,
+                rx_fifo_size,
+                tx_fifo_size,
+                parity,
+                lines_in_use,
+                flow_control,
+                stop_bits,
+                data_bits,
+                endianness_big: type_specific_flags & 0x0100 != 0,
+                slave_mode: general_flags & 0x0001 != 0,
+                resource_source,
+                resource_source_index,
+            }
+        }
+        _ => ResourceItem::Unknown {
             tag,
             payload: payload.to_vec(),
-        }
+        },
+    }
+}
+
+/// Decode a PinFunction (large tag 0x0D) connection descriptor.
+fn decode_pin_function(_tag: u8, payload: &[u8]) -> ResourceItem {
+    if payload.len() < 18 {
+        return ResourceItem::Unknown {
+            tag: 0x0D,
+            payload: payload.to_vec(),
+        };
+    }
+    // Layout per ACPI 6.5 §6.4.3.8.5:
+    //   +0x00 RevisionId (1)
+    //   +0x01 Flags (2)         bit 0 = shared
+    //   +0x03 Pull (1)
+    //   +0x04 FunctionNumber (2)
+    //   +0x06 PinTableOffset (2)
+    //   +0x08 ResourceSourceIndex (1)
+    //   +0x09 ResourceSourceNameOffset (2)
+    //   +0x0B VendorOffset (2)
+    //   +0x0D VendorLength (2)
+    //   +0x0F PinTable... (each pin: 2 bytes)
+    let flags = u16::from_le_bytes([payload[1], payload[2]]);
+    let pull = payload[3];
+    let function_number = u16::from_le_bytes([payload[4], payload[5]]);
+    let pin_off = u16::from_le_bytes([payload[6], payload[7]]) as usize;
+    let resource_source_index = payload[8];
+    let res_src_off = u16::from_le_bytes([payload[9], payload[10]]) as usize;
+    // Pin offsets are descriptor-relative (include the 3-byte
+    // descriptor header); subtract 3 to land in payload.
+    let pin_off = pin_off.saturating_sub(3);
+    let res_src_off = res_src_off.saturating_sub(3);
+    let pin_end = if res_src_off > pin_off && res_src_off <= payload.len() {
+        res_src_off
+    } else {
+        payload.len()
+    };
+    let mut pins = Vec::new();
+    let mut p = pin_off;
+    while p + 2 <= pin_end {
+        pins.push(u16::from_le_bytes([payload[p], payload[p + 1]]));
+        p += 2;
+    }
+    let resource_source = if res_src_off < payload.len() {
+        let tail = &payload[res_src_off..];
+        let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+        String::from_utf8_lossy(&tail[..end]).into_owned()
+    } else {
+        String::new()
+    };
+    ResourceItem::PinFunction {
+        shared: flags & 0x1 != 0,
+        pull,
+        function_number,
+        pins,
+        resource_source,
+        resource_source_index,
+    }
+}
+
+/// Decode a PinConfig (large tag 0x0F) descriptor.
+fn decode_pin_config(_tag: u8, payload: &[u8]) -> ResourceItem {
+    if payload.len() < 18 {
+        return ResourceItem::Unknown {
+            tag: 0x0F,
+            payload: payload.to_vec(),
+        };
+    }
+    // Layout per ACPI 6.5 §6.4.3.8.6:
+    //   +0x00 RevisionId (1)
+    //   +0x01 Flags (2)
+    //   +0x03 PinConfigType (1)
+    //   +0x04 PinConfigValue (4)
+    //   +0x08 PinTableOffset (2)
+    //   +0x0A ResourceSourceIndex (1)
+    //   +0x0B ResourceSourceNameOffset (2)
+    let flags = u16::from_le_bytes([payload[1], payload[2]]);
+    let config_type = payload[3];
+    let config_value = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    let pin_off = u16::from_le_bytes([payload[8], payload[9]]) as usize;
+    let resource_source_index = payload[10];
+    let res_src_off = u16::from_le_bytes([payload[11], payload[12]]) as usize;
+    let pin_off = pin_off.saturating_sub(3);
+    let res_src_off = res_src_off.saturating_sub(3);
+    let pin_end = if res_src_off > pin_off && res_src_off <= payload.len() {
+        res_src_off
+    } else {
+        payload.len()
+    };
+    let mut pins = Vec::new();
+    let mut p = pin_off;
+    while p + 2 <= pin_end {
+        pins.push(u16::from_le_bytes([payload[p], payload[p + 1]]));
+        p += 2;
+    }
+    let resource_source = if res_src_off < payload.len() {
+        let tail = &payload[res_src_off..];
+        let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+        String::from_utf8_lossy(&tail[..end]).into_owned()
+    } else {
+        String::new()
+    };
+    ResourceItem::PinConfig {
+        shared: flags & 0x1 != 0,
+        config_type,
+        config_value,
+        pins,
+        resource_source,
+        resource_source_index,
     }
 }
 
