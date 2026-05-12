@@ -1152,11 +1152,28 @@ impl Xhci {
     fn port_reset_once(&self, port: u8, off: u64) -> Result<u32, XhciError> {
         // SAFETY: identity-mapped MMIO; off bounded by caller.
         let cur = unsafe { self.mmio.read32(off) };
-        // Mask RW1C change bits to 0 in the value we write so we
-        // don't accidentally clear them; OR in PORTSC_PR + PP to
-        // assert reset and keep power on.
+        // First: ack ALL stale RW1C change bits left over from a
+        // prior attempt or initial state (CSC, PEC, WRC, OCC,
+        // PRC, PLC, CEC). Without this clear, the success-criteria
+        // check below sees a CSC=1 from the previous bounce and
+        // incorrectly fails the new attempt before it even gets
+        // a chance to settle. Write 1s to all change bits to
+        // clear them; preserve everything else (we omit PR + PP
+        // since we'll set them in the next write).
+        if cur & PORTSC_CHG_MASK != 0 {
+            // SAFETY: same.
+            unsafe {
+                self.mmio.write32(off, (cur & !PORTSC_PED) | PORTSC_CHG_MASK);
+            }
+        }
+        // Second: assert PR + keep PP. Mask RW1C change bits to 0
+        // in the value we write so this write doesn't ALSO clear
+        // change bits (we want them to stay clear from the prior
+        // write), and skip PED (RW1C, leave 0).
+        // SAFETY: same.
+        let cur = unsafe { self.mmio.read32(off) };
         let to_write = (cur & !PORTSC_CHG_MASK)
-            & !PORTSC_PED          // PED is RW1C; leave clear
+            & !PORTSC_PED
             | PORTSC_PR
             | PORTSC_PP;
         // SAFETY: same.
