@@ -313,16 +313,19 @@ fn ec_wait_ibf_clear() -> Result<(), FieldAccessError> {
         Some(p) => p,
         None => return Err(FieldAccessError::Unsupported),
     };
-    for _ in 0..EC_TIMEOUT_POLLS {
-        // SAFETY: cmd port owned by this driver, validated at
-        // EC discovery time.
-        let s = unsafe { io_in(cmd, 1) } as u8;
-        if s & EC_SC_IBF == 0 {
-            return Ok(());
-        }
-        core::hint::spin_loop();
+    // responsive_spin ticks sleep_pumps so cursor/FB stay alive
+    // while the EC drains its input buffer.
+    let done = narf_scheduler::responsive_spin(
+        // SAFETY: cmd port owned by this driver, validated at EC
+        // discovery time.
+        || unsafe { io_in(cmd, 1) } as u8 & EC_SC_IBF == 0,
+        EC_TIMEOUT_POLLS,
+    );
+    if done {
+        Ok(())
+    } else {
+        Err(FieldAccessError::Unsupported)
     }
-    Err(FieldAccessError::Unsupported)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -331,15 +334,18 @@ fn ec_wait_obf_set() -> Result<(), FieldAccessError> {
         Some(p) => p,
         None => return Err(FieldAccessError::Unsupported),
     };
-    for _ in 0..EC_TIMEOUT_POLLS {
+    // responsive_spin ticks sleep_pumps so cursor/FB stay alive
+    // while the EC fills its output buffer.
+    let done = narf_scheduler::responsive_spin(
         // SAFETY: same.
-        let s = unsafe { io_in(cmd, 1) } as u8;
-        if s & EC_SC_OBF != 0 {
-            return Ok(());
-        }
-        core::hint::spin_loop();
+        || unsafe { io_in(cmd, 1) } as u8 & EC_SC_OBF != 0,
+        EC_TIMEOUT_POLLS,
+    );
+    if done {
+        Ok(())
+    } else {
+        Err(FieldAccessError::Unsupported)
     }
-    Err(FieldAccessError::Unsupported)
 }
 
 #[cfg(target_arch = "x86_64")]
