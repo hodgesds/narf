@@ -60,7 +60,40 @@ use core::sync::atomic::{compiler_fence, AtomicU8, AtomicUsize, Ordering};
 
 use narf_bus::{enable_msix, map_bar, BusDevice, BusDeviceCap, MmioRegion, MsixTable};
 use narf_capabilities::{Cap, Write};
-use narf_io::alloc_coherent;
+use narf_io::{alloc_coherent, DmaBuffer};
+
+/// Persistent shared scratch for the per-LBA AHCI paths (audit
+/// #3: pre-fix every read/write/identify did
+/// `alloc_coherent(4096)` and dropped it at function end — under
+/// AMD-Vi the freed page could be reused while the controller
+/// still had a delayed DMA write in flight). Single global
+/// 4 KiB shared because all callers serialize on the per-port
+/// busy register; concurrent multi-port AHCI (rare) would still
+/// be correct under this lock but slower than per-port scratches.
+/// Layout matches the per-call buffers: cmd_list@0x000,
+/// fis_recv@0x400, cmd_tbl@0x500, data_buf@0x600 (offsets used
+/// by every path below).
+static AHCI_SCRATCH: narf_lib::sync::IrqSafeSpinLock<Option<DmaBuffer>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+fn with_ahci_scratch<R>(f: impl FnOnce(&DmaBuffer) -> R) -> Option<R> {
+    let mut g = AHCI_SCRATCH.lock();
+    if g.is_none() {
+        *g = alloc_coherent(4096, DomainId::DRIVER_0).ok();
+    }
+    g.as_ref().map(f)
+}
+
+/// Return the persistent scratch phys address, lazily allocating
+/// on first use. Returns 0 on alloc failure (caller checks).
+/// Thin wrapper around the locked accessor that gives back just
+/// the `phys` so the caller's existing buffer-access code (which
+/// works in raw u64 offsets) doesn't need to nest in a closure.
+/// SAFETY: callers serialise on per-port busy registers; the
+/// returned phys is stable for the controller's lifetime.
+fn ahci_scratch_phys() -> u64 {
+    with_ahci_scratch(|b| b.phys_addr().raw()).unwrap_or(0)
+}
 use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -577,7 +610,7 @@ impl Ahci {
         // Stop the port.
         // SAFETY: caller-asserted.
         let _ = unsafe { self.port_idle(port_idx) };
-        let _ = scratch;
+        // (no scratch drop needed — buffer is persistent now)
         Ok(out)
     }
 }
@@ -605,8 +638,14 @@ pub unsafe fn ahci_write_lba(
     // SAFETY: caller-asserted.
     let _ = unsafe { ahci.port_idle(port_idx) };
 
-    let scratch = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| AhciError::BarMapFailed)?;
-    let base = scratch.phys_addr().raw();
+    // Persistent shared scratch (audit #3 — pre-fix this was
+    // alloc_coherent per call, dropped on return; freed page
+    // could be reused while AHCI still had a delayed DMA in
+    // flight under AMD-Vi).
+    let base = ahci_scratch_phys();
+    if base == 0 {
+        return Err(AhciError::BarMapFailed);
+    }
     let cmd_list = base + 0x000;
     let fis_recv = base + 0x400;
     let cmd_tbl = base + 0x500;
@@ -698,7 +737,7 @@ pub unsafe fn ahci_write_lba(
     }
     // SAFETY: caller-asserted.
     let _ = unsafe { ahci.port_idle(port_idx) };
-    let _ = scratch;
+    // (no scratch drop needed — buffer is persistent now)
     Ok(())
 }
 
@@ -729,8 +768,14 @@ pub unsafe fn ahci_read_lba(
     // SAFETY: caller-asserted.
     let _ = unsafe { ahci.port_idle(port_idx) };
 
-    let scratch = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| AhciError::BarMapFailed)?;
-    let base = scratch.phys_addr().raw();
+    // Persistent shared scratch (audit #3 — pre-fix this was
+    // alloc_coherent per call, dropped on return; freed page
+    // could be reused while AHCI still had a delayed DMA in
+    // flight under AMD-Vi).
+    let base = ahci_scratch_phys();
+    if base == 0 {
+        return Err(AhciError::BarMapFailed);
+    }
     let cmd_list = base + 0x000;
     let fis_recv = base + 0x400;
     let cmd_tbl = base + 0x500;
@@ -838,7 +883,7 @@ pub unsafe fn ahci_read_lba(
     }
     // SAFETY: caller-asserted.
     let _ = unsafe { ahci.port_idle(port_idx) };
-    let _ = scratch;
+    // (no scratch drop needed — buffer is persistent now)
     Ok(())
 }
 
@@ -870,8 +915,14 @@ pub async unsafe fn ahci_read_lba_async(
     // SAFETY: caller-asserted.
     let _ = unsafe { ahci.port_idle(port_idx) };
 
-    let scratch = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| AhciError::BarMapFailed)?;
-    let base = scratch.phys_addr().raw();
+    // Persistent shared scratch (audit #3 — pre-fix this was
+    // alloc_coherent per call, dropped on return; freed page
+    // could be reused while AHCI still had a delayed DMA in
+    // flight under AMD-Vi).
+    let base = ahci_scratch_phys();
+    if base == 0 {
+        return Err(AhciError::BarMapFailed);
+    }
     let cmd_list = base + 0x000;
     let fis_recv = base + 0x400;
     let cmd_tbl = base + 0x500;
@@ -943,7 +994,7 @@ pub async unsafe fn ahci_read_lba_async(
     }
     // SAFETY: caller-asserted.
     let _ = unsafe { ahci.port_idle(port_idx) };
-    let _ = scratch;
+    // (no scratch drop needed — buffer is persistent now)
     Ok(())
 }
 
@@ -969,8 +1020,14 @@ pub async unsafe fn ahci_write_lba_async(
     // SAFETY: caller-asserted.
     let _ = unsafe { ahci.port_idle(port_idx) };
 
-    let scratch = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| AhciError::BarMapFailed)?;
-    let base = scratch.phys_addr().raw();
+    // Persistent shared scratch (audit #3 — pre-fix this was
+    // alloc_coherent per call, dropped on return; freed page
+    // could be reused while AHCI still had a delayed DMA in
+    // flight under AMD-Vi).
+    let base = ahci_scratch_phys();
+    if base == 0 {
+        return Err(AhciError::BarMapFailed);
+    }
     let cmd_list = base + 0x000;
     let fis_recv = base + 0x400;
     let cmd_tbl = base + 0x500;
@@ -1036,7 +1093,7 @@ pub async unsafe fn ahci_write_lba_async(
 
     // SAFETY: caller-asserted.
     let _ = unsafe { ahci.port_idle(port_idx) };
-    let _ = scratch;
+    // (no scratch drop needed — buffer is persistent now)
     Ok(())
 }
 
@@ -1132,8 +1189,14 @@ unsafe fn ahci_lba_ncq(
     // SAFETY: caller-asserted.
     let _ = unsafe { ahci.port_idle(port_idx) };
 
-    let scratch = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| AhciError::BarMapFailed)?;
-    let base = scratch.phys_addr().raw();
+    // Persistent shared scratch (audit #3 — pre-fix this was
+    // alloc_coherent per call, dropped on return; freed page
+    // could be reused while AHCI still had a delayed DMA in
+    // flight under AMD-Vi).
+    let base = ahci_scratch_phys();
+    if base == 0 {
+        return Err(AhciError::BarMapFailed);
+    }
     let cmd_list = base + 0x000;
     let fis_recv = base + 0x400;
     let cmd_tbl = base + 0x500;
@@ -1257,7 +1320,7 @@ unsafe fn ahci_lba_ncq(
     }
     // SAFETY: caller-asserted.
     let _ = unsafe { ahci.port_idle(port_idx) };
-    let _ = scratch;
+    // (no scratch drop needed — buffer is persistent now)
     Ok(())
 }
 

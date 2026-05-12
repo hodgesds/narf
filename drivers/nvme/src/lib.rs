@@ -1440,6 +1440,23 @@ static CONTROLLER: IrqSafeSpinLock<Option<Controller>> = IrqSafeSpinLock::new(No
 #[derive(Debug)]
 pub struct NvmeBlockSync;
 
+/// Persistent DMA scratch shared by NvmeBlockSync::read + write.
+/// Both paths serialize on CONTROLLER.lock() so a single 4 KiB
+/// buffer is safe to share. Pre-fix every read/write call did
+/// `alloc_coherent(4096)` and dropped the result at function-end
+/// — under AMD-Vi the freed page could be reused while the
+/// controller still had a delayed DMA write in flight (audit #2).
+/// Lazy-init on first use; lives for the controller's lifetime.
+static NVME_SCRATCH_BUF: IrqSafeSpinLock<Option<DmaBuffer>> = IrqSafeSpinLock::new(None);
+
+fn with_nvme_scratch<R>(f: impl FnOnce(&DmaBuffer) -> R) -> Option<R> {
+    let mut g = NVME_SCRATCH_BUF.lock();
+    if g.is_none() {
+        *g = alloc_coherent(4096, DomainId::DRIVER_0).ok();
+    }
+    g.as_ref().map(f)
+}
+
 impl narf_block::BlockDeviceSync for NvmeBlockSync {
     fn lba_size(&self) -> u32 {
         with_controller(|c| c.lba_bytes).unwrap_or(512)
@@ -1457,27 +1474,28 @@ impl narf_block::BlockDeviceSync for NvmeBlockSync {
         if out.len() < need {
             return Err(narf_block::BlockIoError::BufferTooSmall);
         }
-        // Allocate a single 4 KiB DMA buffer for the transfer (NVMe
-        // controllers happily handle one PRP1).
-        let buf = match alloc_coherent(4096, DomainId::DRIVER_0) {
-            Ok(b) => b,
-            Err(_) => return Err(narf_block::BlockIoError::DriverError),
-        };
-        let phys = buf.phys_addr().raw();
-        // Capped at 8 sectors for the single-PRP path.
         if need > 4096 {
             return Err(narf_block::BlockIoError::BufferTooSmall);
         }
-        let mut g = CONTROLLER.lock();
-        let ctrl = g.as_mut().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
-        ctrl.read_lba(lba, n_blocks, &buf)
-            .map_err(|_| narf_block::BlockIoError::DriverError)?;
-        // SAFETY: identity-mapped DMA buffer.
-        for i in 0..need {
-            out[i] = unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) };
+        // Reuse the persistent NVMe scratch (audit #2). Both
+        // read+write serialize on CONTROLLER.lock() so the shared
+        // buffer is safe.
+        let res = with_nvme_scratch(|buf| -> Result<(), narf_block::BlockIoError> {
+            let phys = buf.phys_addr().raw();
+            let mut g = CONTROLLER.lock();
+            let ctrl = g.as_mut().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
+            ctrl.read_lba(lba, n_blocks, buf)
+                .map_err(|_| narf_block::BlockIoError::DriverError)?;
+            // SAFETY: identity-mapped DMA buffer.
+            for i in 0..need {
+                out[i] = unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) };
+            }
+            Ok(())
+        });
+        match res {
+            Some(r) => r,
+            None => Err(narf_block::BlockIoError::DriverError),
         }
-        let _ = buf;
-        Ok(())
     }
     fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), narf_block::BlockIoError> {
         let need = (n_blocks as usize) * 512;
@@ -1487,23 +1505,24 @@ impl narf_block::BlockDeviceSync for NvmeBlockSync {
         if need > 4096 {
             return Err(narf_block::BlockIoError::BufferTooSmall);
         }
-        let buf = match alloc_coherent(4096, DomainId::DRIVER_0) {
-            Ok(b) => b,
-            Err(_) => return Err(narf_block::BlockIoError::DriverError),
-        };
-        let phys = buf.phys_addr().raw();
-        // SAFETY: identity-mapped DMA.
-        unsafe {
-            for i in 0..need {
-                core::ptr::write_volatile((phys + i as u64) as *mut u8, data[i]);
+        let res = with_nvme_scratch(|buf| -> Result<(), narf_block::BlockIoError> {
+            let phys = buf.phys_addr().raw();
+            // SAFETY: identity-mapped DMA.
+            unsafe {
+                for i in 0..need {
+                    core::ptr::write_volatile((phys + i as u64) as *mut u8, data[i]);
+                }
             }
+            let mut g = CONTROLLER.lock();
+            let ctrl = g.as_mut().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
+            ctrl.write_lba(lba, n_blocks, buf)
+                .map_err(|_| narf_block::BlockIoError::DriverError)?;
+            Ok(())
+        });
+        match res {
+            Some(r) => r,
+            None => Err(narf_block::BlockIoError::DriverError),
         }
-        let mut g = CONTROLLER.lock();
-        let ctrl = g.as_mut().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
-        ctrl.write_lba(lba, n_blocks, &buf)
-            .map_err(|_| narf_block::BlockIoError::DriverError)?;
-        let _ = buf;
-        Ok(())
     }
 }
 
