@@ -23,7 +23,7 @@ pub mod wait;
 mod tests;
 
 pub use dispatch::{fire_count, install as install_handler, on_irq, SyncHandler, NUM_VECTORS};
-pub use wait::{wait_for_irq, WaitForIrq};
+pub use wait::{wait_for_irq, wait_for_irq_until, WaitForIrq};
 
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;

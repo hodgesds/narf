@@ -208,6 +208,156 @@ pub fn sleep_cycles(cycles: u64) -> SleepUntil {
     SleepUntil::new(Instant::now().plus_cycles(cycles))
 }
 
+/// Wall-clock deadline anchored to a future TSC reading. Cheap to
+/// copy + check; use this instead of ad-hoc `for _ in 0..N` iter
+/// counts when the wait should be bounded by real wall time
+/// rather than an arbitrary spin budget that varies with CPU
+/// clock.
+///
+/// Constructors round to `cycles_per_ns` granularity (set by
+/// `calibrate_clocks`); on a system where calibration failed
+/// (cycles_per_ns falls through to 1) the *_ms / *_us / *_ns
+/// helpers degrade to "1 cycle per ns" which means timeouts fire
+/// later in wall time than nominal — caller should either tune
+/// the cycle count directly or accept the longer-than-asked
+/// wait. `expired()` is monotonic w.r.t. wall time once the TSC
+/// is calibrated.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Deadline(Instant);
+
+impl Deadline {
+    /// Construct a deadline at the given absolute `Instant`.
+    #[inline]
+    pub const fn at(instant: Instant) -> Self {
+        Self(instant)
+    }
+
+    /// Construct a deadline `cycles` TSC ticks from now.
+    #[inline]
+    pub fn after_cycles(cycles: u64) -> Self {
+        Self(Instant::now().plus_cycles(cycles))
+    }
+
+    /// Construct a deadline `ns` nanoseconds from now. Uses the
+    /// calibrated `cycles_per_ns`; falls back to 1 ns ≈ 1 cycle
+    /// when calibration hasn't completed.
+    #[inline]
+    pub fn after_ns(ns: u64) -> Self {
+        let cpns = wall::cycles_per_ns().max(1) as u64;
+        Self::after_cycles(ns.saturating_mul(cpns))
+    }
+
+    /// Construct a deadline `us` microseconds from now.
+    #[inline]
+    pub fn after_us(us: u64) -> Self {
+        Self::after_ns(us.saturating_mul(1_000))
+    }
+
+    /// Construct a deadline `ms` milliseconds from now.
+    #[inline]
+    pub fn after_ms(ms: u64) -> Self {
+        Self::after_ns(ms.saturating_mul(1_000_000))
+    }
+
+    /// True iff the current TSC reading has reached or passed the
+    /// deadline.
+    #[inline]
+    pub fn expired(&self) -> bool {
+        Instant::now() >= self.0
+    }
+
+    /// TSC cycles remaining until the deadline; 0 once past.
+    #[inline]
+    pub fn remaining_cycles(&self) -> u64 {
+        self.0.cycles_since(Instant::now())
+    }
+
+    /// Underlying Instant — handy when constructing a `SleepUntil`.
+    #[inline]
+    pub const fn as_instant(&self) -> Instant {
+        self.0
+    }
+}
+
+/// Returned by `timeout` / `poll_bit_async` when the deadline
+/// passes before the inner work completes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Elapsed;
+
+/// Wrap a future with a wall-clock deadline. Resolves to
+/// `Ok(output)` if the inner future completes first, or
+/// `Err(Elapsed)` if the deadline passes first. Cancels the
+/// inner future via Drop on timeout.
+///
+/// Cheap-when-not-firing: when the inner future completes
+/// promptly the timer-wheel slot is cancelled in `drop` without
+/// the wheel ever having to fire. The combinator polls the inner
+/// future first on each round so a ready inner short-circuits
+/// the deadline check.
+#[inline]
+pub fn timeout<F: Future>(deadline: Deadline, fut: F) -> Timeout<F> {
+    Timeout {
+        fut,
+        sleep: SleepUntil::new(deadline.as_instant()),
+    }
+}
+
+/// Future returned by [`timeout`].
+#[derive(Debug)]
+pub struct Timeout<F> {
+    fut: F,
+    sleep: SleepUntil,
+}
+
+impl<F: Future> Future for Timeout<F> {
+    type Output = Result<F::Output, Elapsed>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: `self` is pinned; we project to `fut` and
+        // `sleep` by raw pointer to avoid pulling in
+        // `pin_project_lite`. Neither field is moved out — only
+        // re-pinned for the inner poll call.
+        let this = unsafe { self.get_unchecked_mut() };
+        let fut = unsafe { Pin::new_unchecked(&mut this.fut) };
+        match fut.poll(cx) {
+            Poll::Ready(v) => return Poll::Ready(Ok(v)),
+            Poll::Pending => {}
+        }
+        let sleep = unsafe { Pin::new_unchecked(&mut this.sleep) };
+        match sleep.poll(cx) {
+            Poll::Ready(()) => Poll::Ready(Err(Elapsed)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// Async equivalent of `narf_scheduler::responsive_spin` for
+/// callers already running inside an async task: poll a
+/// hardware bit (or any cheap predicate) at `sample_interval`
+/// resolution, sleeping between samples via the timer wheel
+/// instead of busy-waiting. Returns `Ok` once `probe` returns
+/// true, `Err(Elapsed)` if `deadline` passes first.
+///
+/// Use when the wait is expected to be milliseconds-scale (long
+/// enough that yielding to the executor + sleeping in the wheel
+/// pays back the wake-up overhead). For sub-microsecond waits,
+/// `narf_scheduler::responsive_spin` is cheaper.
+pub async fn poll_bit_async<F: FnMut() -> bool>(
+    mut probe: F,
+    sample_interval_cycles: u64,
+    deadline: Deadline,
+) -> Result<(), Elapsed> {
+    loop {
+        if probe() {
+            return Ok(());
+        }
+        if deadline.expired() {
+            return Err(Elapsed);
+        }
+        sleep_cycles(sample_interval_cycles).await;
+    }
+}
+
 /// One-shot boot-time clock calibration. Picks the best TSC-Hz
 /// estimate available — Intel CPUID 0x15 / 0x16 first, then a
 /// HPET cross-check — and pushes the resulting cycles-per-ns into

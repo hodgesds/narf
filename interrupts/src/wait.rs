@@ -32,6 +32,24 @@ pub fn wait_for_irq(vector: u8) -> WaitForIrq {
     }
 }
 
+/// Wait for the next IRQ at `vector`, but bail with `Err(Elapsed)`
+/// if `deadline` passes first. Thin wrapper over [`wait_for_irq`]
+/// + [`narf_time::timeout`] — drivers that want a wall-clock-bounded
+/// IRQ wait should reach for this rather than hand-rolling a
+/// `select` between the IRQ future and a `sleep_cycles` future.
+///
+/// Race-safe in the same way `wait_for_irq` is: the baseline
+/// snapshot happens at construction, so an IRQ landing between
+/// `wait_for_irq_until(...)` and the first poll still resolves
+/// the wait. On timeout the inner `WaitForIrq` is dropped and
+/// its waker slot is cleared.
+pub fn wait_for_irq_until(
+    vector: u8,
+    deadline: narf_time::Deadline,
+) -> narf_time::Timeout<WaitForIrq> {
+    narf_time::timeout(deadline, wait_for_irq(vector))
+}
+
 /// Future returned by [`wait_for_irq`].
 #[derive(Debug)]
 pub struct WaitForIrq {

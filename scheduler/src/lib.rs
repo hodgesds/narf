@@ -1047,6 +1047,37 @@ pub fn responsive_spin<F: FnMut() -> bool>(mut done: F, max_iters: u32) -> bool 
     false
 }
 
+/// Deadline-driven counterpart to `responsive_spin`. Polls
+/// `done()` until it returns true or the wall-clock `deadline`
+/// passes; same `sleep_pumps`-tick cadence in between. Use this
+/// when the wait should be bounded by real wall time rather than
+/// an arbitrary iteration count that varies with CPU clock —
+/// e.g. spec-defined "controller must respond within 100 ms" or
+/// "hub reset takes max 50 ms".
+///
+/// Returns true if `done` succeeded before the deadline, false
+/// on timeout.
+#[inline]
+pub fn responsive_spin_until<F: FnMut() -> bool>(
+    mut done: F,
+    deadline: narf_time::Deadline,
+) -> bool {
+    let mut i: u32 = 0;
+    loop {
+        if done() {
+            return true;
+        }
+        if deadline.expired() {
+            return false;
+        }
+        if i & 0xFFF == 0 {
+            sleep_pumps::run();
+        }
+        core::hint::spin_loop();
+        i = i.wrapping_add(1);
+    }
+}
+
 /// Drive a future to completion synchronously from outside the
 /// async executor. Polls the future; on Pending, runs the
 /// registered `sleep_pumps` (so cursor/FB/serial keep moving) and
