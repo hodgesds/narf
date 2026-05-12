@@ -65,15 +65,22 @@ pub fn paint(fb: &FbWriter) {
     // Best signal: "if both >= 1 the bind pass had something to work
     // with". For a real HID-bound count we'd need a registry on the
     // input side; follow-up.
+    let xhci_up = narf_drivers_usb::xhci::is_probed();
+    let kbd_n = narf_drivers_usb::hid::attached_keyboard_count();
+    let mouse_n = narf_drivers_usb::hid::mouse::attached_mouse_count();
+    let connected_ports = if xhci_up {
+        narf_drivers_usb::xhci::with_controller(|c| c.connected_ports().len()).unwrap_or(0)
+    } else {
+        0
+    };
     let dev_line = format!(
-        "I2C buses: {}  GPIO ctrls: {}  i8042: {}  cursor pump: {}",
+        "I2C: {}  GPIO: {}  xHCI: {}  ports: {}  kbd: {}  mouse: {}  cursor: {}",
         i2c_n,
         gpio_n,
-        if narf_drivers_i2c::registered_buses().is_empty() && gpio_n == 0 {
-            "skip"
-        } else {
-            "see log"
-        },
+        if xhci_up { "up" } else { "no" },
+        connected_ports,
+        kbd_n,
+        mouse_n,
         if crate::cursor::moves() > 0 { "ACTIVE" } else { "idle" },
     );
 
