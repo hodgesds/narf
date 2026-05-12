@@ -19,6 +19,7 @@
 extern crate alloc;
 
 pub mod amd_fch;
+pub mod gsb;
 pub mod registry;
 
 use alloc::boxed::Box;
@@ -88,6 +89,12 @@ pub fn register_initcalls() {
             // when it can't find a controller for its children.
             InitResult::NotPresent
         } else {
+            // Install the GenericSerialBus dispatcher so AML
+            // OperationRegion(..., GenericSerialBus, ...) field
+            // accesses route through the I2C registry. Audit #5
+            // real impl. Idempotent — set_gsb_dispatcher just
+            // overwrites the fn pointer.
+            narf_aml::oregion::set_gsb_dispatcher(gsb::dispatch);
             InitResult::Ok
         }
     });

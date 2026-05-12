@@ -398,6 +398,57 @@ fn ec_write_byte(_offset: u8, _val: u8) -> Result<(), FieldAccessError> {
     Err(FieldAccessError::Unsupported)
 }
 
+// ── GenericSerialBus dispatcher hook (audit #5 real impl) ──────────
+//
+// AML's OperationRegion(..., GenericSerialBus, ...) field reads /
+// writes route through a fn-pointer registered at boot by the
+// driver crate that owns the relevant bus (drivers/i2c for I2C-
+// attached devices). aml can't depend on drivers/i2c directly
+// without a cycle (i2c → aml for namespace walks); the hook
+// inverts the dependency.
+//
+// The dispatcher receives the *OpRegion path* (which is enough
+// for the dispatcher to walk back up to the parent device, read
+// its I2cSerialBus / SpiSerialBus _CRS, and route to the right
+// bus instance), the byte offset within the region, the access
+// width, and Some(value) on writes / None on reads.
+//
+// Returns the read value (always 0 for writes).
+
+/// Operation kind for the dispatcher.
+#[derive(Copy, Clone, Debug)]
+pub enum GsbOp {
+    Read { width: usize },
+    Write { width: usize, value: u64 },
+}
+
+/// Dispatcher signature. `region_path` lets the implementation
+/// walk back to the parent device's _CRS. `byte_offset` is the
+/// bit_offset/8 from the AML field declaration. Returns the
+/// read value or 0 on write/error.
+pub type GsbDispatcher = fn(region_path: &str, byte_offset: u64, op: GsbOp) -> u64;
+
+static GSB_DISPATCHER: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Install the GenericSerialBus dispatcher. Boot-only — call
+/// once during driver init. drivers/i2c registers the I2C
+/// handler at Stage::Device after its bus registry is up.
+pub fn set_gsb_dispatcher(d: GsbDispatcher) {
+    GSB_DISPATCHER.store(d as usize, core::sync::atomic::Ordering::Release);
+}
+
+fn gsb_dispatch(region_path: &str, byte_offset: u64, op: GsbOp) -> u64 {
+    let p = GSB_DISPATCHER.load(core::sync::atomic::Ordering::Acquire);
+    if p == 0 {
+        return 0;
+    }
+    // SAFETY: p was stored via `set_gsb_dispatcher` from a valid
+    // GsbDispatcher fn pointer; static lifetime is the kernel's.
+    let f: GsbDispatcher = unsafe { core::mem::transmute(p) };
+    f(region_path, byte_offset, op)
+}
+
 // ── PciConfig ECAM address resolution ────────────────────────────────────────
 
 /// Resolve a PciConfig OpRegion's effective ECAM byte address.
@@ -664,12 +715,18 @@ fn read_unit(
             }
             Ok(acc)
         }
-        // GenericSerialBus stub still — full impl needs the
-        // I2C registry routing + bus-side block transactions
-        // (deferred — touchpad bring-up doesn't depend on it).
+        // GenericSerialBus: route to the registered dispatcher.
+        // The dispatcher (typically drivers/i2c installed at
+        // Stage::Device) walks region.path → parent device →
+        // I2cSerialBus _CRS → bus registry → block_on(transfer).
+        // No dispatcher installed (test build, no I2C) → 0.
+        RegionSpace::GenericSerialBus => Ok(gsb_dispatch(
+            &region.path,
+            byte_offset_in_region,
+            GsbOp::Read { width },
+        )),
         // Other rare spaces stubbed to 0 so AML flows through.
-        RegionSpace::GenericSerialBus
-        | RegionSpace::GeneralPurposeIO
+        RegionSpace::GeneralPurposeIO
         | RegionSpace::SmBus
         | RegionSpace::Ipmi
         | RegionSpace::Pcc => Ok(0),
@@ -721,8 +778,15 @@ fn write_unit(
             }
             Ok(())
         }
-        RegionSpace::GenericSerialBus
-        | RegionSpace::GeneralPurposeIO
+        RegionSpace::GenericSerialBus => {
+            let _ = gsb_dispatch(
+                &region.path,
+                byte_offset_in_region,
+                GsbOp::Write { width, value: val },
+            );
+            Ok(())
+        }
+        RegionSpace::GeneralPurposeIO
         | RegionSpace::SmBus
         | RegionSpace::Ipmi
         | RegionSpace::Pcc => Ok(()),
