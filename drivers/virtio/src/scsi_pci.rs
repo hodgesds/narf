@@ -281,23 +281,30 @@ impl VirtioScsiPci {
             self.notify.write16(off, CMDQ0_IDX);
         }
 
-        let mut spins = 0u32;
-        loop {
-            let elem = {
-                let mut g = self.cmdq.lock();
-                let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
-                q.poll_used()
-            };
-            if let Some((id, _)) = elem {
-                if id == head as u32 {
-                    break;
-                }
-            }
-            spins += 1;
-            if spins > 10_000_000 {
-                return Err(VirtioPciError::QueueTooSmall);
-            }
-            core::hint::spin_loop();
+        // responsive_spin ticks sleep_pumps so cursor/FB stay alive
+        // while waiting for the device to publish a used-ring entry.
+        let mut q_err = false;
+        let done = narf_scheduler::responsive_spin(
+            || {
+                let elem = {
+                    let mut g = self.cmdq.lock();
+                    match g.as_mut() {
+                        Some(q) => q.poll_used(),
+                        None => {
+                            q_err = true;
+                            return true;
+                        }
+                    }
+                };
+                matches!(elem, Some((id, _)) if id == head as u32)
+            },
+            10_000_000,
+        );
+        if q_err {
+            return Err(VirtioPciError::NoQueues);
+        }
+        if !done {
+            return Err(VirtioPciError::QueueTooSmall);
         }
         // Read back response.
         let mut resp = VirtioScsiCmdResp {
@@ -383,23 +390,30 @@ impl VirtioScsiPci {
         unsafe {
             self.notify.write16(off, CTRLQ_IDX);
         }
-        let mut spins = 0u32;
-        loop {
-            let elem = {
-                let mut g = self.ctrlq.lock();
-                let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
-                q.poll_used()
-            };
-            if let Some((id, _)) = elem {
-                if id == head as u32 {
-                    break;
-                }
-            }
-            spins += 1;
-            if spins > 10_000_000 {
-                return Err(VirtioPciError::QueueTooSmall);
-            }
-            core::hint::spin_loop();
+        // responsive_spin ticks sleep_pumps so cursor/FB stay alive
+        // while waiting for the device to publish a used-ring entry.
+        let mut q_err = false;
+        let done = narf_scheduler::responsive_spin(
+            || {
+                let elem = {
+                    let mut g = self.ctrlq.lock();
+                    match g.as_mut() {
+                        Some(q) => q.poll_used(),
+                        None => {
+                            q_err = true;
+                            return true;
+                        }
+                    }
+                };
+                matches!(elem, Some((id, _)) if id == head as u32)
+            },
+            10_000_000,
+        );
+        if q_err {
+            return Err(VirtioPciError::NoQueues);
+        }
+        if !done {
+            return Err(VirtioPciError::QueueTooSmall);
         }
         // SAFETY: identity-mapped DMA.
         let response = unsafe { core::ptr::read_volatile(resp_phys as *const u8) };

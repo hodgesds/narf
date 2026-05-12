@@ -218,24 +218,38 @@ impl VirtioRngPci {
         unsafe {
             self.notify.write16(off, 0);
         }
-        let mut spins = 0u32;
-        let used_len = loop {
-            let elem = {
-                let mut g = self.queue.lock();
-                let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
-                q.poll_used()
-            };
-            if let Some((id, l)) = elem {
-                if id == head as u32 {
-                    break l as usize;
+        // responsive_spin ticks sleep_pumps so cursor/FB stay alive
+        // while waiting for the device to complete the descriptor.
+        let mut used_len: usize = 0;
+        let mut q_err = false;
+        let done = narf_scheduler::responsive_spin(
+            || {
+                let elem = {
+                    let mut g = self.queue.lock();
+                    match g.as_mut() {
+                        Some(q) => q.poll_used(),
+                        None => {
+                            q_err = true;
+                            return true;
+                        }
+                    }
+                };
+                if let Some((id, l)) = elem {
+                    if id == head as u32 {
+                        used_len = l as usize;
+                        return true;
+                    }
                 }
-            }
-            spins += 1;
-            if spins > 10_000_000 {
-                return Err(VirtioPciError::CompletionTimeout);
-            }
-            core::hint::spin_loop();
-        };
+                false
+            },
+            10_000_000,
+        );
+        if q_err {
+            return Err(VirtioPciError::NoQueues);
+        }
+        if !done {
+            return Err(VirtioPciError::CompletionTimeout);
+        }
         let n = used_len.min(len);
         // SAFETY: identity-mapped DMA.
         for i in 0..n {

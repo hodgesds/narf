@@ -451,24 +451,30 @@ impl VirtioConsolePci {
             self.notify.write16(off, QIDX_TX);
         }
 
-        // Poll for completion.
-        let mut spins = 0u32;
-        loop {
-            let elem = {
-                let mut g = self.tx_queue.lock();
-                let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
-                q.poll_used()
-            };
-            if let Some((id, _)) = elem {
-                if id == head as u32 {
-                    break;
-                }
-            }
-            spins += 1;
-            if spins > 10_000_000 {
-                return Err(VirtioPciError::QueueTooSmall);
-            }
-            core::hint::spin_loop();
+        // Poll for completion. responsive_spin ticks sleep_pumps so
+        // cursor/FB stay alive on a slow / wedged device.
+        let mut q_err = false;
+        let done = narf_scheduler::responsive_spin(
+            || {
+                let elem = {
+                    let mut g = self.tx_queue.lock();
+                    match g.as_mut() {
+                        Some(q) => q.poll_used(),
+                        None => {
+                            q_err = true;
+                            return true;
+                        }
+                    }
+                };
+                matches!(elem, Some((id, _)) if id == head as u32)
+            },
+            10_000_000,
+        );
+        if q_err {
+            return Err(VirtioPciError::NoQueues);
+        }
+        if !done {
+            return Err(VirtioPciError::QueueTooSmall);
         }
         let mut g = self.tx_queue.lock();
         if let Some(q) = g.as_mut() {

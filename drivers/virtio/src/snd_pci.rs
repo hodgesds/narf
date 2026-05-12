@@ -325,28 +325,33 @@ impl VirtioSoundPci {
             );
         }
         // Poll used ring for the matching head, bounded.
-        let mut spins = 0u32;
-        loop {
-            let elem = {
-                let mut g = self.control_q.lock();
-                let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
-                q.poll_used()
-            };
-            match elem {
-                Some((id, _)) if id == head as u32 => break,
-                Some(_) => continue,
-                None => {
-                    spins += 1;
-                    if spins > 10_000_000 {
-                        let mut g = self.control_q.lock();
-                        if let Some(q) = g.as_mut() {
-                            q.free_chain(head);
+        // responsive_spin ticks sleep_pumps so cursor/FB stay alive.
+        let mut q_err = false;
+        let done = narf_scheduler::responsive_spin(
+            || {
+                let elem = {
+                    let mut g = self.control_q.lock();
+                    match g.as_mut() {
+                        Some(q) => q.poll_used(),
+                        None => {
+                            q_err = true;
+                            return true;
                         }
-                        return Err(VirtioPciError::QueueTooSmall);
                     }
-                    core::hint::spin_loop();
-                }
+                };
+                matches!(elem, Some((id, _)) if id == head as u32)
+            },
+            10_000_000,
+        );
+        if q_err {
+            return Err(VirtioPciError::NoQueues);
+        }
+        if !done {
+            let mut g = self.control_q.lock();
+            if let Some(q) = g.as_mut() {
+                q.free_chain(head);
             }
+            return Err(VirtioPciError::QueueTooSmall);
         }
         // SAFETY: identity-mapped DMA.
         let status = unsafe { core::ptr::read_volatile(resp_phys as *const u32) };
@@ -483,28 +488,34 @@ impl VirtioSoundPci {
                 2,
             );
         }
-        let mut spins = 0u32;
-        loop {
-            let elem = {
-                let mut g = self.tx_q.lock();
-                let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
-                q.poll_used()
-            };
-            match elem {
-                Some((id, _)) if id == head as u32 => break,
-                Some(_) => continue,
-                None => {
-                    spins += 1;
-                    if spins > 10_000_000 {
-                        let mut g = self.tx_q.lock();
-                        if let Some(q) = g.as_mut() {
-                            q.free_chain(head);
+        // responsive_spin ticks sleep_pumps so cursor/FB / audio
+        // pump itself stay alive while waiting for tx-q completion.
+        let mut q_err = false;
+        let done = narf_scheduler::responsive_spin(
+            || {
+                let elem = {
+                    let mut g = self.tx_q.lock();
+                    match g.as_mut() {
+                        Some(q) => q.poll_used(),
+                        None => {
+                            q_err = true;
+                            return true;
                         }
-                        return Err(VirtioPciError::QueueTooSmall);
                     }
-                    core::hint::spin_loop();
-                }
+                };
+                matches!(elem, Some((id, _)) if id == head as u32)
+            },
+            10_000_000,
+        );
+        if q_err {
+            return Err(VirtioPciError::NoQueues);
+        }
+        if !done {
+            let mut g = self.tx_q.lock();
+            if let Some(q) = g.as_mut() {
+                q.free_chain(head);
             }
+            return Err(VirtioPciError::QueueTooSmall);
         }
         // SAFETY: identity-mapped DMA.
         let status = unsafe { core::ptr::read_volatile(status_phys as *const u32) };

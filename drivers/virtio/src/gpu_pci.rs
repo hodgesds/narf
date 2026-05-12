@@ -423,28 +423,36 @@ impl VirtioGpuPci {
         unsafe {
             self.notify.write16(off, 0);
         }
-        let mut spins = 0u32;
-        loop {
-            let elem = {
-                let mut g = self.ctrl_q.lock();
-                let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
-                q.poll_used()
-            };
-            if let Some((id, _)) = elem {
-                if id == head as u32 {
+        // responsive_spin ticks sleep_pumps so cursor/FB stay alive
+        // while waiting for the device to publish a used-ring entry.
+        let mut q_err = false;
+        let done = narf_scheduler::responsive_spin(
+            || {
+                let elem = {
                     let mut g = self.ctrl_q.lock();
-                    if let Some(q) = g.as_mut() {
-                        q.free_chain(head);
+                    match g.as_mut() {
+                        Some(q) => q.poll_used(),
+                        None => {
+                            q_err = true;
+                            return true;
+                        }
                     }
-                    return Ok(());
-                }
-            }
-            spins += 1;
-            if spins > 10_000_000 {
-                return Err(VirtioPciError::CompletionTimeout);
-            }
-            core::hint::spin_loop();
+                };
+                matches!(elem, Some((id, _)) if id == head as u32)
+            },
+            10_000_000,
+        );
+        if q_err {
+            return Err(VirtioPciError::NoQueues);
         }
+        if !done {
+            return Err(VirtioPciError::CompletionTimeout);
+        }
+        let mut g = self.ctrl_q.lock();
+        if let Some(q) = g.as_mut() {
+            q.free_chain(head);
+        }
+        Ok(())
     }
 
     /// Internal: write a 24-byte ctrl_hdr at offset 0 of req_buf,

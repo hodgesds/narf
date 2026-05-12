@@ -254,25 +254,37 @@ impl VirtioFsPci {
         unsafe {
             self.notify.write16(off, REQUEST_IDX_0);
         }
-        let mut spins = 0u32;
-        let used_len: u32;
-        loop {
-            let elem = {
-                let mut g = self.requestq.lock();
-                let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
-                q.poll_used()
-            };
-            if let Some((id, len)) = elem {
-                if id == head as u32 {
-                    used_len = len;
-                    break;
+        // responsive_spin ticks sleep_pumps so cursor/FB stay alive
+        // while waiting for the device to publish a used-ring entry.
+        let mut used_len: u32 = 0;
+        let mut q_err = false;
+        let done = narf_scheduler::responsive_spin(
+            || {
+                let elem = {
+                    let mut g = self.requestq.lock();
+                    match g.as_mut() {
+                        Some(q) => q.poll_used(),
+                        None => {
+                            q_err = true;
+                            return true;
+                        }
+                    }
+                };
+                if let Some((id, len)) = elem {
+                    if id == head as u32 {
+                        used_len = len;
+                        return true;
+                    }
                 }
-            }
-            spins += 1;
-            if spins > 10_000_000 {
-                return Err(VirtioPciError::QueueTooSmall);
-            }
-            core::hint::spin_loop();
+                false
+            },
+            10_000_000,
+        );
+        if q_err {
+            return Err(VirtioPciError::NoQueues);
+        }
+        if !done {
+            return Err(VirtioPciError::QueueTooSmall);
         }
         let n = (used_len as usize).min(resp_max);
         let mut out = alloc::vec![0u8; n];
