@@ -1408,16 +1408,36 @@ impl Xhci {
         }
         compiler_fence(Ordering::SeqCst);
 
-        // Issue Address Device. TRB layout (§6.4.3.4):
+        // Address Device — two-phase per Linux's xhci-hcd
+        // workaround for devices that fail BSR=0 with USB
+        // Transaction Error (xHCI completion code 4). Phase 1
+        // BSR=1 just programs the slot context (no bus traffic);
+        // phase 2 BSR=0 issues SET_ADDRESS. Many internal
+        // laptop keyboards (Renoir UM425I included, per real-HW
+        // logs) refuse the single-shot BSR=0 path and need this
+        // dance.
+        // TRB layout (§6.4.3.4):
         //   dword0/1 = Input Context phys (low/high)
         //   dword2 = reserved
-        //   dword3 = TRB Type | Slot ID << 24 | (BSR=0)
+        //   dword3 = TRB Type | Slot ID << 24 | BSR (bit 9)
+        const TRB_BSR: u32 = 1 << 9;
         let trb_type = TRB_TYPE_ADDRESS_DEVICE_CMD << TRB_TYPE_SHIFT;
-        let dword3 = trb_type | ((slot_id as u32) << 24);
-        self.submit_command(input_phys as u32, (input_phys >> 32) as u32, 0, dword3)?;
-        // Wait for Command Completion Event for this slot.
         let cce = TRB_TYPE_CMD_COMPLETION << TRB_TYPE_SHIFT;
         let want_slot = (slot_id as u32) << 24;
+
+        // Phase 1: BSR=1 (no SET_ADDRESS on bus, just program
+        // the slot context).
+        let dword3_bsr = trb_type | ((slot_id as u32) << 24) | TRB_BSR;
+        self.submit_command(input_phys as u32, (input_phys >> 32) as u32, 0, dword3_bsr)?;
+        let ev1 = self
+            .await_event(|t| (t[3] & TRB_TYPE_MASK) == cce && (t[3] & 0xFF00_0000) == want_slot)?;
+        let ccode1 = ((ev1[2] >> 24) & 0xFF) as u8;
+        if ccode1 != 1 {
+            return Err(XhciError::CmdFailed(ccode1));
+        }
+        // Phase 2: BSR=0 — actually send SET_ADDRESS on the bus.
+        let dword3 = trb_type | ((slot_id as u32) << 24);
+        self.submit_command(input_phys as u32, (input_phys >> 32) as u32, 0, dword3)?;
         let ev = self
             .await_event(|t| (t[3] & TRB_TYPE_MASK) == cce && (t[3] & 0xFF00_0000) == want_slot)?;
         let ccode = ((ev[2] >> 24) & 0xFF) as u8;
