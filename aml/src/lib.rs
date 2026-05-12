@@ -134,6 +134,11 @@ pub enum NodeKind {
     Field,
     /// `OpRegion(...)` declared. Body unparsed today.
     OpRegion,
+    /// `CreateBitField` / `CreateByteField` / `CreateWordField` /
+    /// `CreateDWordField` / `CreateQWordField` / `CreateField` —
+    /// a named bit/byte slice into an existing Buffer. Source +
+    /// extent live in `buffer_field`.
+    BufferField,
 }
 
 /// A simple constant value attached to a `Name(...)` node when the
@@ -145,9 +150,16 @@ pub enum NameValue {
     Integer(u64),
     /// A null-terminated AsciiString literal.
     String(String),
-    /// Any non-trivial body we don't decode: `Buffer(...)`,
-    /// `Package(...)`, computed expressions, etc. The (offset,
-    /// length) lets a future evaluator pick it up.
+    /// Live mutable Buffer — used when CreateXxxField writes
+    /// splice into the underlying Buffer of a Name(...). The Vec
+    /// owns its bytes via the global allocator (slab) so updates
+    /// don't grow the AML store.
+    Buffer(Vec<u8>),
+    /// Live mutable Package — used by `Store(value, name)` when
+    /// the destination was a `Name(BUF, Package(...))`.
+    Package(Vec<NameValue>),
+    /// Any other unrecognised non-trivial body we don't decode.
+    /// `(offset, length)` lets a future evaluator pick it up.
     Unparsed { offset: usize, length: usize },
 }
 
@@ -170,6 +182,23 @@ pub struct AmlNode {
     /// TermArgs to consume from the byte stream when this method
     /// is invoked. 0 for non-Method nodes.
     pub method_flags: u8,
+    /// For `BufferField`: full path of the source Buffer + bit
+    /// offset + bit length. Reads return the bit-slice as an
+    /// Integer; writes (Store-to-this-name) read the source
+    /// buffer, splice in the new bits, write back via
+    /// `update_node_value`. `None` for non-BufferField nodes.
+    pub buffer_field: Option<BufferFieldRef>,
+}
+
+/// Where a `BufferField` slice points.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BufferFieldRef {
+    /// Absolute path of the source Buffer (e.g. `\_SB.PCI0.CRS`).
+    pub source_path: String,
+    /// Bit offset into the source buffer.
+    pub bit_offset: u64,
+    /// Bit length of this field's slice.
+    pub bit_length: u64,
 }
 
 /// Backing storage. We collect every parsed node into one Vec
@@ -878,6 +907,7 @@ fn parse_term_list_inner(
                     value: None,
                     method_body: (0, 0),
                     method_flags: 0,
+                    buffer_field: None,
                 });
                 *count += 1;
                 parse_term_list(p, &path, count, pkg_end, base)?;
@@ -963,6 +993,7 @@ fn parse_term_list_inner(
                     value: v,
                     method_body: (0, 0),
                     method_flags: 0,
+                    buffer_field: None,
                 });
                 *count += 1;
             }
@@ -983,6 +1014,7 @@ fn parse_term_list_inner(
                     value: None,
                     method_body: (body_off, body_len),
                     method_flags: flags,
+                    buffer_field: None,
                 });
                 *count += 1;
                 p.pos = pkg_end;
@@ -1003,6 +1035,7 @@ fn parse_term_list_inner(
                             value: None,
                             method_body: (0, 0),
                     method_flags: 0,
+                    buffer_field: None,
                         });
                         *count += 1;
                         parse_term_list(p, &path, count, pkg_end, base)?;
@@ -1024,6 +1057,7 @@ fn parse_term_list_inner(
                             value: None,
                             method_body: (0, 0),
                     method_flags: 0,
+                    buffer_field: None,
                         });
                         *count += 1;
                         parse_term_list(p, &path, count, pkg_end, base)?;
@@ -1045,6 +1079,7 @@ fn parse_term_list_inner(
                             value: None,
                             method_body: (0, 0),
                     method_flags: 0,
+                    buffer_field: None,
                         });
                         *count += 1;
                         parse_term_list(p, &path, count, pkg_end, base)?;
@@ -1064,6 +1099,7 @@ fn parse_term_list_inner(
                             value: None,
                             method_body: (0, 0),
                     method_flags: 0,
+                    buffer_field: None,
                         });
                         *count += 1;
                         parse_term_list(p, &path, count, pkg_end, base)?;
@@ -1082,6 +1118,7 @@ fn parse_term_list_inner(
                             value: None,
                             method_body: (0, 0),
                     method_flags: 0,
+                    buffer_field: None,
                         });
                         *count += 1;
                     }
@@ -1094,6 +1131,7 @@ fn parse_term_list_inner(
                             value: None,
                             method_body: (0, 0),
                     method_flags: 0,
+                    buffer_field: None,
                         });
                         *count += 1;
                     }
@@ -1107,6 +1145,7 @@ fn parse_term_list_inner(
                             value: None,
                             method_body: (0, 0),
                     method_flags: 0,
+                    buffer_field: None,
                         });
                         *count += 1;
                         // Try to decode RegionSpace + TermArg×2 and register
@@ -1130,6 +1169,7 @@ fn parse_term_list_inner(
                             value: None,
                             method_body: (0, 0),
                     method_flags: 0,
+                    buffer_field: None,
                         });
                         *count += 1;
                         // Parse individual field entries and register them.
@@ -1146,6 +1186,7 @@ fn parse_term_list_inner(
                             value: None,
                             method_body: (0, 0),
                     method_flags: 0,
+                    buffer_field: None,
                         });
                         *count += 1;
                         p.pos = pkg_end;
@@ -1483,6 +1524,137 @@ pub(crate) fn update_name_value(path: &str, value: NameValue) {
     if let Some(node) = g.nodes.iter_mut().find(|n| n.path == path) {
         node.value = Some(value);
     }
+}
+
+/// Register a `BufferField` node (CreateXxxField). Audit #9: real
+/// _CRS bodies use these to compose the returned Buffer by writing
+/// into named bit/byte/word/dword/qword slots. Reads return the
+/// bit-slice as Integer; writes splice into the source buffer.
+pub fn register_buffer_field(path: &str, source_path: &str, bit_offset: u64, bit_length: u64) {
+    push_node(AmlNode {
+        path: alloc::string::String::from(path),
+        kind: NodeKind::BufferField,
+        value: None,
+        method_body: (0, 0),
+        method_flags: 0,
+        buffer_field: Some(BufferFieldRef {
+            source_path: alloc::string::String::from(source_path),
+            bit_offset,
+            bit_length,
+        }),
+    });
+}
+
+/// Read the current Buffer bytes of a Name node. Materialises
+/// from the AML store on first call if the body is `Unparsed`,
+/// then caches as `NameValue::Buffer` for subsequent O(1) reads
+/// and in-place writes (audit #9 — splice instead of append-and-
+/// repoint, so live updates don't bloat the AML store).
+pub fn read_name_as_buffer(path: &str) -> Option<alloc::vec::Vec<u8>> {
+    {
+        let g = NAMESPACE.lock();
+        if let Some(node) = g.nodes.iter().find(|n| n.path == path) {
+            if let Some(NameValue::Buffer(ref b)) = node.value {
+                return Some(b.clone());
+            }
+        }
+    }
+    // Not yet materialised — decode from the AML store.
+    let node = find_node(path)?;
+    let buf = match node.value? {
+        NameValue::Buffer(b) => b,
+        NameValue::Unparsed { offset, length } if length > 0 => {
+            let mut body = alloc::vec![0u8; length];
+            let n = copy_aml_bytes(offset, &mut body);
+            if n < length {
+                return None;
+            }
+            let v = crate::eval::decode_value(&body).ok()?;
+            match v {
+                crate::Value::Buffer(b) => b,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    // Cache the decoded form on the node so future reads/writes
+    // skip the AML decode + work in place.
+    let mut g = NAMESPACE.lock();
+    if let Some(node) = g.nodes.iter_mut().find(|n| n.path == path) {
+        node.value = Some(NameValue::Buffer(buf.clone()));
+    }
+    Some(buf)
+}
+
+/// Splice `value` into the Name node's underlying Buffer at the
+/// given bit slice. Updates the buffer in place via
+/// `NameValue::Buffer` so the AML store doesn't grow on every
+/// CreateXxxField write.
+pub fn write_buffer_field(source_path: &str, bit_offset: u64, bit_length: u64, value: u64) {
+    // Make sure the source is materialised as NameValue::Buffer.
+    let _ = read_name_as_buffer(source_path);
+    let mut g = NAMESPACE.lock();
+    let node = match g.nodes.iter_mut().find(|n| n.path == source_path) {
+        Some(n) => n,
+        None => return,
+    };
+    let buf = match node.value {
+        Some(NameValue::Buffer(ref mut b)) => b,
+        _ => return,
+    };
+    let total_bits = (bit_offset + bit_length) as usize;
+    let need_bytes = (total_bits + 7) / 8;
+    if buf.len() < need_bytes {
+        buf.resize(need_bytes, 0);
+    }
+    let mut bit = bit_offset as usize;
+    let end = (bit_offset + bit_length) as usize;
+    let mut v = value;
+    while bit < end {
+        let byte_idx = bit / 8;
+        let in_byte = bit % 8;
+        let take = (8 - in_byte).min(end - bit);
+        let mask = ((1u64 << take) - 1) as u8;
+        let val_bits = (v & mask as u64) as u8;
+        buf[byte_idx] = (buf[byte_idx] & !(mask << in_byte)) | (val_bits << in_byte);
+        v >>= take;
+        bit += take;
+    }
+}
+
+/// Read a BufferField bit-slice as a u64. Returns 0 on missing
+/// node, missing source buffer, or out-of-range slice.
+pub fn read_buffer_field(field_path: &str) -> u64 {
+    let node = match find_node(field_path) {
+        Some(n) => n,
+        None => return 0,
+    };
+    let bf = match node.buffer_field {
+        Some(b) => b,
+        None => return 0,
+    };
+    let buf = match read_name_as_buffer(&bf.source_path) {
+        Some(b) => b,
+        None => return 0,
+    };
+    let mut acc = 0u64;
+    let mut bit = bf.bit_offset as usize;
+    let end = (bf.bit_offset + bf.bit_length) as usize;
+    let mut out_shift = 0u32;
+    while bit < end && (out_shift as usize) < 64 {
+        let byte_idx = bit / 8;
+        if byte_idx >= buf.len() {
+            break;
+        }
+        let in_byte = bit % 8;
+        let take = (8 - in_byte).min(end - bit);
+        let mask = ((1u64 << take) - 1) as u8;
+        let bits = (buf[byte_idx] >> in_byte) & mask;
+        acc |= (bits as u64) << out_shift;
+        out_shift += take as u32;
+        bit += take;
+    }
+    acc
 }
 
 /// Reset the namespace. Test-only.

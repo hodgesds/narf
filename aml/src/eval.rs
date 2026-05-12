@@ -709,6 +709,56 @@ fn eval_term(
             }
         }
 
+        // CreateXxxField — buffer field declarations (audit #9).
+        // SourceBuf is grammatically a TermArg but in practice
+        // it's almost always a NameString naming the source
+        // Buffer (`Name(BUFR, Buffer() {...})` then
+        // `CreateWordField(BUFR, 8, IRQF)` etc.). Snoop at the
+        // first byte: if it's a name lead, read it as a path
+        // and register a BufferField; otherwise consume the
+        // TermArg + the index + name and skip registration.
+        0x8D | 0x8C | 0x8B | 0x8A | 0x8F => {
+            let (kind_bits_per_unit, _name) = match buf[*cur..].first() {
+                Some(b) if is_name_lead(*b) => {
+                    let src = read_name_string(buf, cur, "\\")?;
+                    (Some(src), false)
+                }
+                _ => {
+                    let _ = eval_term_arg(buf, cur, state)?;
+                    (None, true)
+                }
+            };
+            let idx = eval_term_arg(buf, cur, state)?.as_integer();
+            let name = read_name_string(buf, cur, "\\")?;
+            if let Some(src) = kind_bits_per_unit {
+                let (bit_offset, bit_length) = match op {
+                    0x8D => (idx, 1),         // CreateBitField
+                    0x8C => (idx * 8, 8),     // CreateByteField
+                    0x8B => (idx * 8, 16),    // CreateWordField
+                    0x8A => (idx * 8, 32),    // CreateDWordField
+                    0x8F => (idx * 8, 64),    // CreateQWordField
+                    _ => unreachable!(),
+                };
+                crate::register_buffer_field(&name, &src, bit_offset, bit_length);
+            }
+        }
+        0x13 => {
+            // CreateField (variable-width).
+            let src_path = match buf[*cur..].first() {
+                Some(b) if is_name_lead(*b) => Some(read_name_string(buf, cur, "\\")?),
+                _ => {
+                    let _ = eval_term_arg(buf, cur, state)?;
+                    None
+                }
+            };
+            let bit_idx = eval_term_arg(buf, cur, state)?.as_integer();
+            let bit_len = eval_term_arg(buf, cur, state)?.as_integer();
+            let name = read_name_string(buf, cur, "\\")?;
+            if let Some(src) = src_path {
+                crate::register_buffer_field(&name, &src, bit_idx, bit_len);
+            }
+        }
+
         // ── Unknown: skip one byte ─────────────────────────────────────────
         _ => {
             // Best-effort: skip unrecognized opcodes.
@@ -1180,6 +1230,18 @@ fn eval_term_arg(buf: &[u8], cur: &mut usize, state: &mut EvalState) -> Result<V
                         // rather than imposing a numeric cap.
                         evaluate_method(&node.path, &args).unwrap_or(Value::Integer(0))
                     }
+                    // BufferField read (audit #9). Returns the
+                    // bit-slice as Integer (max 64 bits).
+                    crate::NodeKind::BufferField => {
+                        Value::Integer(crate::read_buffer_field(&node.path))
+                    }
+                    // Field read (audit #2/#3 sister of write).
+                    // Routes through oregion::read_field so the
+                    // returned value reflects current hardware
+                    // state, not the namespace cache.
+                    crate::NodeKind::Field => {
+                        Value::Integer(crate::oregion::read_field(&node.path).unwrap_or(0))
+                    }
                     _ => match node.value {
                         Some(NameValue::Integer(v)) => Value::Integer(v),
                         Some(NameValue::String(s)) => Value::String(s),
@@ -1377,19 +1439,29 @@ fn write_target(
             state.set_arg((b - 0x68) as usize, value);
         }
         b if is_name_lead(b) => {
-            // Named target — resolve. If it's a Field node, route
-            // through `oregion::write_field` to actually drive
-            // hardware (audit #2/#3). Otherwise update the
-            // namespace node's value (Name/Buffer/Package).
+            // Named target — resolve. Routing:
+            //  - Field:        oregion::write_field (drives HW)
+            //  - BufferField:  splice into the source Buffer
+            //                  (audit #9 — _CRS template fill-in)
+            //  - other:        update the Name node's value cache
             let name = read_name_string(buf, cur, "\\")?;
-            let is_field = crate::find_node(&name)
-                .or_else(|| crate::find_node_by_suffix(&name))
-                .map(|n| n.kind == crate::NodeKind::Field)
-                .unwrap_or(false);
-            if is_field {
-                let _ = crate::oregion::write_field(&name, value.as_integer());
-            } else {
-                update_node_value(&name, value);
+            let resolved = crate::find_node(&name)
+                .or_else(|| crate::find_node_by_suffix(&name));
+            match resolved.as_ref().map(|n| n.kind) {
+                Some(crate::NodeKind::Field) => {
+                    let _ = crate::oregion::write_field(&name, value.as_integer());
+                }
+                Some(crate::NodeKind::BufferField) => {
+                    if let Some(bf) = resolved.and_then(|n| n.buffer_field) {
+                        crate::write_buffer_field(
+                            &bf.source_path,
+                            bf.bit_offset,
+                            bf.bit_length,
+                            value.as_integer(),
+                        );
+                    }
+                }
+                _ => update_node_value(&name, value),
             }
         }
         _ => {
