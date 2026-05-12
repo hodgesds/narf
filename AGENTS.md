@@ -110,6 +110,56 @@ Each links to its owning spec for the full text.
 | 12 | `SeqLock<T: Copy>` bound is load-bearing (torn-state sampling is UB without `Copy`). `SpinLockGuard<'_, T, IrqState>` typestate makes mixed-IRQ-context use a compile error. | `lib/` §3 |
 | 13 | AI-originated TCB PRs include `safety-argument.toml` referencing `security-model/` invariants by `section#Lline`; CI rejects unresolvable refs. Audit trail is SLSA in-toto + `narf-agent` predicate. | `process/` §6.3, §6.5 |
 
+## Sync → async bridge primitives (`narf_scheduler`)
+
+Drivers and sync subsystems should **never hand-roll spin loops on
+hardware registers**. Use the right primitive from `narf_scheduler`:
+
+| Primitive | When to use | Lock-safe? | CPU |
+|---|---|---|---|
+| `spawn(fut)` | Normal async work in executor context | yes | scheduler-managed |
+| `yield_now().await` | Cooperative yield from inside an async task | yes | yields |
+| `block_on(fut)` | Sync caller bridging to async path; **no IrqSafeSpinLock held** | **no** (halts on IRQ) | idles between IRQs |
+| `block_on_spin(fut)` | Same as above but caller holds an `IrqSafeSpinLock`, is in an IRQ handler, or runs in a panic / SMP-startup path with IRQs disabled | yes | 100% spin |
+| `sleep_pumps::run()` | Inside any waiting loop (or as a periodic tick) — drives FB drain, cursor pump, future audio drain | yes | trivial |
+
+**Constraints both `block_on` variants share:**
+- **Never call from inside an executor poll** — re-entrant deadlock; the
+  executor's polling loop blocks waiting for a future that needs the
+  same loop to make progress. No runtime check; caller's responsibility.
+- **The awaited future must be IRQ-driven or self-waking.** A future
+  that depends on another scheduler task to make progress will hang
+  because `block_on` doesn't run the executor.
+
+**Cooperative `block_on` lock rule (load-bearing):** holding any
+`IrqSafeSpinLock` across `block_on` deadlocks. The lock disables IRQs
+while held and `halt_until_irq` waits for one. Migration patterns
+should drop the lock, capture any owned data (clone an `Arc`, copy a
+phys address), then `block_on(...)`. Use `block_on_spin` if you can't.
+
+**Why this exists:** the audit (commit `de5dabc`) found drivers
+re-implementing 10M-iteration spin loops on MMIO registers in
+NVMe / AHCI / e1000 / r8169 / ixgbe. Each spin froze the cursor /
+FB / serial console for the wait duration. The unified primitives
+let drivers hand the wait off to a single mechanism that ticks
+sleep_pumps + idles cleanly.
+
+**Per-driver migration is bespoke.** Drivers expose async functions
+(e.g. NVMe's `submit_io_irq_async`); their sync wrappers
+(`BlockDeviceSync::read`/`write`) call `block_on(...)` after dropping
+their per-driver locks. Don't sweep `spin_tick` everywhere — the
+abstraction lives in `block_on`, not in every driver.
+
+## Stage::Late spawn rule (load-bearing)
+
+`narf_scheduler::init()` panics on a second call (since commit `3f4eadd`
+— `__reset_queues_for_test` is the test-only equivalent). The historic
+"second `init()` in `run_async_demo` silently wipes Stage::Late spawns"
+bug killed the cursor pump and USB HID supervisor for weeks before
+diagnosis; the panic now surfaces double-init at the call site.
+
+Drivers can spawn from Stage::Late initcalls again; the spawn survives.
+
 ## AI-agent rules (from `process/…/spec.md`)
 
 Binding. The full spec governs; this table is a cheat sheet.
