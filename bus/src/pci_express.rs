@@ -198,17 +198,26 @@ pub fn function_level_reset(
     // that have it; this fallback is a coarse busy-wait.
     let start = narf_time::Instant::now();
     let target_cycles = 200_000_000u64; // ~200 ms at 1 GHz; over-budget by design
-    while start.cycles_since(narf_time::Instant::now()) < target_cycles {
-        // After the spec-mandated wait, a pingback read of Vendor ID
-        // returning != 0xFFFF means the function is back. Polling
-        // in the loop lets us bail early when the device is ready.
-        let cfg_phys = pcie_cfg_phys(device)?;
-        // SAFETY: identity-mapped MMIO; offset 0x00 = Vendor ID.
-        let vid = unsafe { cfg_read16(cfg_phys, 0x00) };
-        if vid != 0xFFFF {
-            return Ok(());
-        }
-        core::hint::spin_loop();
+    let cfg_phys = pcie_cfg_phys(device)?;
+    // responsive_spin ticks sleep_pumps so cursor/FB stay alive
+    // across the post-FLR settle wait. `done` returns true when
+    // the device is back (vid != 0xFFFF) OR the wall-clock budget
+    // is exhausted; we re-check vid_back after to disambiguate.
+    let mut vid_back = false;
+    let _ = narf_scheduler::responsive_spin(
+        || {
+            // SAFETY: identity-mapped ECAM; offset 0x00 = Vendor ID.
+            let vid = unsafe { cfg_read16(cfg_phys, 0x00) };
+            if vid != 0xFFFF {
+                vid_back = true;
+                return true;
+            }
+            start.cycles_since(narf_time::Instant::now()) >= target_cycles
+        },
+        u32::MAX,
+    );
+    if vid_back {
+        return Ok(());
     }
     Err(PcieCapError::FlrTimeout)
 }
