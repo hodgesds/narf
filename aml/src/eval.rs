@@ -22,6 +22,7 @@ const STRING_PREFIX: u8 = 0x0D;
 const QWORD_PREFIX: u8 = 0x0E;
 const BUFFER_OP: u8 = 0x11;
 const PACKAGE_OP: u8 = 0x12;
+const VAR_PACKAGE_OP: u8 = 0x13;
 // Audit #8 — reference / index / size opcodes that real DSDT
 // _PRT and _DSM bodies routinely use. ACPI 6.5 §20.2.5.4 +
 // §19.6.34/.65/.122/.111/.32/.85.
@@ -624,6 +625,23 @@ fn eval_term(
         0x5B => {
             let ext = next_u8(buf, cur)?;
             match ext {
+                // CreateField (variable-width): 0x5B 0x13
+                // SourceBuf BitIndex NumBits NameString.
+                0x13 => {
+                    let src_path = match buf[*cur..].first() {
+                        Some(b) if is_name_lead(*b) => Some(read_name_string(buf, cur, "\\")?),
+                        _ => {
+                            let _ = eval_term_arg(buf, cur, state)?;
+                            None
+                        }
+                    };
+                    let bit_idx = eval_term_arg(buf, cur, state)?.as_integer();
+                    let bit_len = eval_term_arg(buf, cur, state)?.as_integer();
+                    let name = read_name_string(buf, cur, "\\")?;
+                    if let Some(src) = src_path {
+                        crate::register_buffer_field(&name, &src, bit_idx, bit_len);
+                    }
+                }
                 // StallOp: 0x5B 0x21  TermArg(microseconds)
                 0x21 => {
                     let us = eval_term_arg(buf, cur, state)?.as_integer();
@@ -742,22 +760,9 @@ fn eval_term(
                 crate::register_buffer_field(&name, &src, bit_offset, bit_length);
             }
         }
-        0x13 => {
-            // CreateField (variable-width).
-            let src_path = match buf[*cur..].first() {
-                Some(b) if is_name_lead(*b) => Some(read_name_string(buf, cur, "\\")?),
-                _ => {
-                    let _ = eval_term_arg(buf, cur, state)?;
-                    None
-                }
-            };
-            let bit_idx = eval_term_arg(buf, cur, state)?.as_integer();
-            let bit_len = eval_term_arg(buf, cur, state)?.as_integer();
-            let name = read_name_string(buf, cur, "\\")?;
-            if let Some(src) = src_path {
-                crate::register_buffer_field(&name, &src, bit_idx, bit_len);
-            }
-        }
+        // (CreateField is extended 0x5B 0x13, handled in the EXT
+        // branch above. The bare 0x13 at statement level isn't
+        // generally emitted as a standalone TermObj.)
 
         // ── Unknown: skip one byte ─────────────────────────────────────────
         _ => {
@@ -1137,6 +1142,25 @@ fn eval_term_arg(buf: &[u8], cur: &mut usize, state: &mut EvalState) -> Result<V
             let num_elems = next_u8(buf, cur)? as usize;
             let mut items = Vec::with_capacity(num_elems);
             // Evaluate up to num_elems TermArgs within pkg bounds.
+            while *cur < pkg_end && items.len() < num_elems {
+                let item = eval_term_arg(buf, cur, state)?;
+                items.push(item);
+            }
+            *cur = pkg_end.min(buf.len());
+            Value::Package(items)
+        }
+        // VarPackage (audit #12): VarPackageOp PkgLength
+        // NumElementsTermArg TermList. Same shape as PACKAGE_OP
+        // but the element count is a TermArg (eval'd) instead
+        // of a u8 byte. Used by _DSM that returns dynamically-
+        // sized packages and any DSDT routine that builds a
+        // package with a runtime length.
+        VAR_PACKAGE_OP => {
+            let pkg_start = *cur;
+            let pkg_len = read_pkg_length(buf, cur)?;
+            let pkg_end = pkg_start + pkg_len;
+            let num_elems = eval_term_arg(buf, cur, state)?.as_integer() as usize;
+            let mut items = Vec::with_capacity(num_elems);
             while *cur < pkg_end && items.len() < num_elems {
                 let item = eval_term_arg(buf, cur, state)?;
                 items.push(item);
