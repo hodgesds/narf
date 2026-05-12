@@ -1289,10 +1289,20 @@ impl Xhci {
                         core::hint::spin_loop();
                     }
                 }
+                // PED never asserted (USB2) / PED+PLS never reached
+                // U0 (USB3) within the success-criteria poll.
+                // SAFETY: identity-mapped MMIO; off bounded.
+                let snap = unsafe { self.mmio.read32(off) };
+                PORT_RESET_LAST_FAIL.store(port, retry, PortResetFailReason::PedNeverSet, snap);
                 return Err(XhciError::PortResetTimeout);
             }
             core::hint::spin_loop();
         }
+        // Outer wait: PR never self-cleared OR PRC never set in the
+        // ~250 ms window. Almost always a dead/disconnected port.
+        // SAFETY: identity-mapped MMIO; off bounded.
+        let snap = unsafe { self.mmio.read32(off) };
+        PORT_RESET_LAST_FAIL.store(port, retry, PortResetFailReason::PrTimeout, snap);
         Err(XhciError::PortResetTimeout)
     }
 
