@@ -325,6 +325,16 @@ pub struct Xhci {
     /// is unused. Sized lazily on first `address_device` so we
     /// don't burn `MaxSlots+1` empty slots up-front.
     devices: IrqSafeSpinLock<alloc::vec::Vec<Option<Device>>>,
+    /// Demuxed event queues populated by `xhci_isr` (and by sync
+    /// callers when they happen to dequeue a TE not destined for
+    /// them). Resolves audit findings #2 + #11: the ISR no longer
+    /// drops events on the floor + sync `await_event` reads from
+    /// the per-class queue instead of racing the ISR for the next
+    /// event off the ring. Bounded depths — events overflow into
+    /// `events_overflowed` which is a diagnostic counter.
+    cmd_events: IrqSafeSpinLock<alloc::collections::VecDeque<[u32; 4]>>,
+    transfer_events: IrqSafeSpinLock<alloc::collections::VecDeque<[u32; 4]>>,
+    events_overflowed: core::sync::atomic::AtomicU32,
     pub running: bool,
     /// MSI-X table handle owned by this controller. `Some` when
     /// `bring_up` successfully programmed interrupter 0's vector;
@@ -768,6 +778,9 @@ impl Xhci {
             er_ccs: IrqSafeSpinLock::new(1),
             er_dequeue: IrqSafeSpinLock::new(0),
             devices: IrqSafeSpinLock::new(alloc::vec::Vec::new()),
+            cmd_events: IrqSafeSpinLock::new(alloc::collections::VecDeque::new()),
+            transfer_events: IrqSafeSpinLock::new(alloc::collections::VecDeque::new()),
+            events_overflowed: core::sync::atomic::AtomicU32::new(0),
             running: true,
             msix,
             irq_vector,
@@ -1126,22 +1139,70 @@ impl Xhci {
         Some([d0, d1, d2, d3])
     }
 
-    /// Spin-wait for the next event matching `predicate`. Bounded by
-    /// `~10M spins` to surface a hung controller as `CmdTimeout`
-    /// rather than livelock.
+    /// Demux one Event Ring entry into the per-class queues. Used
+    /// by both the ISR drain and the sync `await_event` path so a
+    /// command/transfer event the wait isn't interested in still
+    /// gets stashed for whichever waiter does want it. Returns the
+    /// event so direct callers can also inspect.
+    fn demux_one_event(&self) -> Option<[u32; 4]> {
+        let ev = self.poll_event()?;
+        let ty = (ev[3] & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT;
+        const MAX_DEPTH: usize = 64;
+        let queue: &IrqSafeSpinLock<alloc::collections::VecDeque<[u32; 4]>> = match ty {
+            t if t == TRB_TYPE_CMD_COMPLETION => &self.cmd_events,
+            t if t == TRB_TYPE_TRANSFER_EVENT => &self.transfer_events,
+            _ => return Some(ev),
+        };
+        let mut g = queue.lock();
+        if g.len() >= MAX_DEPTH {
+            // Drop oldest to keep memory bounded; bump the counter
+            // so a future debugger can spot the loss.
+            g.pop_front();
+            self.events_overflowed
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        g.push_back(ev);
+        Some(ev)
+    }
+
+    /// Drain queued events of either class into a closure until the
+    /// predicate matches. Resolves audit #11: the ISR can populate
+    /// the queue between submit and await without the sync waiter
+    /// timing out, because the await reads the queue (not the
+    /// raw event ring directly).
     fn await_event(
         &self,
         mut predicate: impl FnMut(&[u32; 4]) -> bool,
     ) -> Result<[u32; 4], XhciError> {
-        for _ in 0..10_000_000u32 {
-            if let Some(ev) = self.poll_event() {
-                if predicate(&ev) {
-                    return Ok(ev);
+        // Helper: try to pop any queued event matching predicate
+        // from either class queue. Returns None if no match in
+        // either queue. Drains non-matching entries back into a
+        // local buffer so they survive for the next await.
+        let try_match = |me: &Self, p: &mut dyn FnMut(&[u32; 4]) -> bool| -> Option<[u32; 4]> {
+            for q in [&me.cmd_events, &me.transfer_events] {
+                let mut g = q.lock();
+                if let Some(pos) = g.iter().position(|ev| p(ev)) {
+                    return g.remove(pos);
                 }
-                // Not the event we wanted — keep draining; another
-                // command might be racing through. (Stage-5 cut is
-                // single-flight; this just keeps the dequeue moving.)
-                continue;
+            }
+            None
+        };
+
+        // First pass: maybe the event we want already arrived
+        // (ISR populated it, or a prior await left it in queue).
+        if let Some(ev) = try_match(self, &mut predicate) {
+            return Ok(ev);
+        }
+
+        // Bounded spin-wait. On every iteration: (a) demux any
+        // pending event off the ring into queues (also lets us
+        // catch up if the ISR fired and we're racing), then (b)
+        // re-check the queues for our match.
+        for _ in 0..10_000_000u32 {
+            // Demux any new ring entries.
+            while self.demux_one_event().is_some() {}
+            if let Some(ev) = try_match(self, &mut predicate) {
+                return Ok(ev);
             }
             core::hint::spin_loop();
         }
@@ -2054,12 +2115,16 @@ fn xhci_isr() {
         Some(x) => x,
         None => return,
     };
-    // Drain up to N events. poll_event takes the per-call
-    // er_dequeue + er_ccs spinlocks — same locks the
-    // command-issuance path uses but only for short windows.
+    // Demux up to N events into the per-class queues so any
+    // sync waiter (await_event) sees its event regardless of
+    // whether the ISR or the waiter dequeued it from the ring.
+    // Pre-fix the ISR called poll_event and dropped the result,
+    // racing with await_event for the very Transfer Event the
+    // sync waiter expected — surfaced as CmdTimeout under MSI-X
+    // load (audit #11).
     const MAX_DRAIN_PER_IRQ: usize = 64;
     for _ in 0..MAX_DRAIN_PER_IRQ {
-        if xhci.poll_event().is_none() {
+        if xhci.demux_one_event().is_none() {
             break;
         }
     }
