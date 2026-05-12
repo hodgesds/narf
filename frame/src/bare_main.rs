@@ -2129,6 +2129,19 @@ fn run_async_demo() -> ! {
         let _ = writeln!(console::Writer, "  async demo: done");
     });
 
+    // Spawn the cursor pump *before* run_until_empty so it's in the
+    // queue when the executor starts. With boot-init the user task
+    // futures (init / shell) loop forever, so run_until_empty never
+    // returns; if we waited until after to spawn the pump, the
+    // mouse would never move.
+    let cursor_spawned = narf_fb::spawn_cursor_pump();
+    if cursor_spawned {
+        let _ = writeln!(
+            console::Writer,
+            "  cursor: pump spawned (FB up)"
+        );
+    }
+
     let _ = writeln!(
         console::Writer,
         "  scheduler: spawning 1 task, running to completion"
@@ -2152,15 +2165,16 @@ fn run_async_demo() -> ! {
         let _ = writeln!(console::Writer, "  timer IRQs delivered: {} ticks", ticks);
     }
 
-    // If an FB scanout came up, spawn the cursor pump now (after
-    // `narf_scheduler::init()` ran so the queue won't be wiped),
-    // then enter run_forever so PointerEvents from i8042 / i2c-hid
-    // keep flowing into the cursor renderer. The kernel stays
-    // interactive until QEMU is killed externally.
-    if narf_fb::spawn_cursor_pump() {
+    // If the cursor pump (and any user tasks) were spawned, the
+    // executor only got here because every task is parked AND
+    // there's nothing to steal — usually a transient state. Switch
+    // to run_forever so timer/IRQ wakes resume polling instead of
+    // exiting; without this the kernel would proceed to the
+    // exit-kernel path and tear down the still-live tasks.
+    if cursor_spawned {
         let _ = writeln!(
             console::Writer,
-            "  Stage 1 exit-gate demo complete; entering interactive run_forever (cursor pump spawned)"
+            "  Stage 1 exit-gate demo complete; entering interactive run_forever"
         );
         narf_scheduler::run_forever();
     }
