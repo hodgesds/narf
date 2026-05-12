@@ -388,6 +388,12 @@ pub struct Device {
     ctrl_pcs: u32,
     /// Next-free TRB index on the control TR.
     ctrl_enq: usize,
+    /// Persistent 4 KiB DMA scratch for control-IN data stages
+    /// (audit F-45). Avoids alloc_coherent / drop churn on every
+    /// GET_DESCRIPTOR / SET_CONFIGURATION call. 4 KiB is enough
+    /// for any standard descriptor we fetch (max wTotalLength is
+    /// 4096 here).
+    ctrl_data: DmaBuffer,
     /// Per-endpoint state for non-control endpoints (DCI 2..31).
     /// Indexed by `dci - 2`. Bound when `configure_endpoints` runs.
     eps: alloc::vec::Vec<Option<EndpointState>>,
@@ -1439,6 +1445,7 @@ impl Xhci {
         let input = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
         let dev_ctx = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
         let ctrl_tr = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
+        let ctrl_data = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
 
         let input_phys = input.phys_addr().raw();
         let dev_ctx_phys = dev_ctx.phys_addr().raw();
@@ -1592,6 +1599,7 @@ impl Xhci {
             ctrl_tr,
             ctrl_pcs: 1,
             ctrl_enq: 0,
+            ctrl_data,
             eps: alloc::vec::Vec::new(),
         };
         let mut g = self.devices.lock();
@@ -1791,13 +1799,22 @@ impl Xhci {
             // a u16; w_length is just the SETUP-packet field.
         }
         let w_length = out.len() as u16;
-        // Stage a DMA buffer for the data stage. One 4 KiB page is
-        // plenty for any standard descriptor we fetch in Stage-5.
-        let data = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
-        let data_phys = data.phys_addr().raw();
-        // Zero the data buffer so a stale page can't be confused
-        // with the device response on a 0-length read.
-        // SAFETY: identity-mapped DMA page.
+        // Audit F-45: reuse the per-slot persistent control-data
+        // buffer instead of alloc_coherent every call. The buffer
+        // lives in the Device struct and is freed when the slot is
+        // disabled. 4 KiB is enough for any descriptor we fetch
+        // (max wTotalLength capped at 4096 by the kbd path).
+        let data_phys = {
+            let g = self.devices.lock();
+            let d = g
+                .get(slot_id as usize)
+                .and_then(|x| x.as_ref())
+                .ok_or(XhciError::CmdFailed(0xFD))?;
+            d.ctrl_data.phys_addr().raw()
+        };
+        // Zero so a stale buffer can't be confused with the device
+        // response on a short read.
+        // SAFETY: identity-mapped DMA page; persistent and 4 KiB.
         unsafe {
             core::ptr::write_bytes(data_phys as *mut u8, 0, 4096);
         }
@@ -1873,7 +1890,6 @@ impl Xhci {
         for i in 0..copy {
             out[i] = unsafe { core::ptr::read_volatile((data_phys + i as u64) as *const u8) };
         }
-        let _ = data;
         Ok(xferred)
     }
 
