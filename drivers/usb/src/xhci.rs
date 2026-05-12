@@ -1577,34 +1577,26 @@ impl Xhci {
         }
         compiler_fence(Ordering::SeqCst);
 
-        // Address Device — two-phase per Linux's xhci-hcd
-        // workaround for devices that fail BSR=0 with USB
-        // Transaction Error (xHCI completion code 4). Phase 1
-        // BSR=1 just programs the slot context (no bus traffic);
-        // phase 2 BSR=0 issues SET_ADDRESS. Many internal
-        // laptop keyboards (Renoir UM425I included, per real-HW
-        // logs) refuse the single-shot BSR=0 path and need this
-        // dance.
+        // Address Device — single BSR=0 call (xHCI 1.2 §4.6.5).
+        // Earlier code did a two-phase BSR=1-then-BSR=0 dance as
+        // a speculative quirk. That turned out to be the cause
+        // of the USB Transaction Error (CmdFailed 4) on real
+        // Renoir hardware: the spec says the Input Context is
+        // consumed during Address Device processing, so feeding
+        // the same Input Context to a second Address Device
+        // (BSR=0) after BSR=1 left the controller using stale
+        // state and SET_ADDRESS landed mid-bus. Linux upstream
+        // xhci-hcd uses BSR=0 directly for normal addressing
+        // and only does BSR=1 under the XHCI_BROKEN_FW quirk
+        // (which AMD Renoir does NOT carry).
+        //
         // TRB layout (§6.4.3.4):
         //   dword0/1 = Input Context phys (low/high)
         //   dword2 = reserved
-        //   dword3 = TRB Type | Slot ID << 24 | BSR (bit 9)
-        const TRB_BSR: u32 = 1 << 9;
+        //   dword3 = TRB Type | Slot ID << 24
         let trb_type = TRB_TYPE_ADDRESS_DEVICE_CMD << TRB_TYPE_SHIFT;
         let cce = TRB_TYPE_CMD_COMPLETION << TRB_TYPE_SHIFT;
         let want_slot = (slot_id as u32) << 24;
-
-        // Phase 1: BSR=1 (no SET_ADDRESS on bus, just program
-        // the slot context).
-        let dword3_bsr = trb_type | ((slot_id as u32) << 24) | TRB_BSR;
-        self.submit_command(input_phys as u32, (input_phys >> 32) as u32, 0, dword3_bsr)?;
-        let ev1 = self
-            .await_event(|t| (t[3] & TRB_TYPE_MASK) == cce && (t[3] & 0xFF00_0000) == want_slot)?;
-        let ccode1 = ((ev1[2] >> 24) & 0xFF) as u8;
-        if ccode1 != 1 {
-            return Err(XhciError::CmdFailed(ccode1));
-        }
-        // Phase 2: BSR=0 — actually send SET_ADDRESS on the bus.
         let dword3 = trb_type | ((slot_id as u32) << 24);
         self.submit_command(input_phys as u32, (input_phys >> 32) as u32, 0, dword3)?;
         let ev = self
