@@ -2443,9 +2443,11 @@ fn sys_mmap(ctx: &mut dyn TrapContext) {
             return;
         }
         // Reject if any existing region overlaps the requested
-        // [hint, hint + len) window. Real Linux mmap MAP_FIXED
-        // *replaces* the prior mapping; we choose to fail loudly
-        // since the caller explicitly asked for this exact vaddr.
+        // [hint, hint + len) window. POSIX.1-2017 §3.3.3 leaves
+        // overlap behaviour implementation-defined: some systems
+        // silently replace the prior mapping, but we choose to
+        // fail loudly since the caller explicitly asked for this
+        // exact vaddr — silent overwrite hides bugs.
         let snap = as_ref.regions_snapshot();
         let lo = hint;
         let hi = hint.saturating_add(len);
