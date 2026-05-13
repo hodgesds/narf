@@ -528,12 +528,13 @@ impl AmdGpu {
         // Step 4-5: poll MP0_C2PMSG_64 for the done bit. PSP
         // typically responds within ~50 ms; bound the spin so a
         // wedged controller surfaces as FirmwareLoadFailed.
-        // responsive_spin ticks sleep_pumps so cursor/FB stay alive
-        // during this multi-millisecond wait.
-        let _ = narf_scheduler::responsive_spin(
+        // responsive_spin_until ticks sleep_pumps so cursor/FB stay
+        // alive during this multi-millisecond wait. 500 ms wedge
+        // threshold (10x typical PSP TA-load latency).
+        let _ = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped MMIO.
             || unsafe { mm_read(&self.regs, mp0_base + MP0_C2PMSG_64_REL) } & PSP_STATUS_DONE_BIT != 0,
-            10_000_000,
+            narf_time::Deadline::after_ms(500),
         );
         // SAFETY: identity-mapped MMIO.
         let last = unsafe { mm_read(&self.regs, mp0_base + MP0_C2PMSG_64_REL) };
