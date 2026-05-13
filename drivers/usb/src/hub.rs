@@ -225,7 +225,10 @@ impl UsbHub {
         // capture both surface via captured locals.
         let mut status_err: Option<HubError> = None;
         let mut got_reset = false;
-        let _ = narf_scheduler::responsive_spin(
+        // 100 ms wall-clock budget (USB 2.0 §11.5.1.5 TDRST max
+        // 50 ms + ~10 ms TDRSTR + headroom). Pre-conversion was
+        // 1_000 outer iters × ~100k inner spin ≈ same order.
+        let _ = narf_scheduler::responsive_spin_until(
             || match self.port_status(xhci_dev, port) {
                 Ok(s) => {
                     let lo = s as u16;
@@ -245,7 +248,7 @@ impl UsbHub {
                     true
                 }
             },
-            1_000,
+            narf_time::Deadline::after_ms(100),
         );
         if let Some(e) = status_err {
             return Err(e);
