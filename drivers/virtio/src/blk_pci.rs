@@ -350,10 +350,10 @@ impl VirtioBlkPci {
         unsafe {
             self.notify.write16(notify_off, 0);
         }
-        // responsive_spin ticks sleep_pumps so cursor/FB stay alive
+        // responsive_spin_until ticks sleep_pumps so cursor/FB stay alive
         // during the IDENTIFY-style probe completion wait.
         let mut q_err = false;
-        let done = narf_scheduler::responsive_spin(
+        let done = narf_scheduler::responsive_spin_until(
             || {
                 let elem = {
                     let mut g = self.queue.lock();
@@ -367,7 +367,7 @@ impl VirtioBlkPci {
                 };
                 matches!(elem, Some((id, _)) if id == head as u32)
             },
-            10_000_000,
+            narf_time::Deadline::after_ms(1_000),
         );
         if q_err {
             return Err(VirtioPciError::NoQueues);
@@ -464,10 +464,10 @@ impl VirtioBlkPci {
             self.notify.write16(notify_off, 0);
         }
 
-        // Poll the used ring for our completion. responsive_spin
+        // Poll the used ring for our completion. responsive_spin_until
         // ticks sleep_pumps so cursor/FB stay alive on slow I/O.
         let mut q_err = false;
-        let done = narf_scheduler::responsive_spin(
+        let done = narf_scheduler::responsive_spin_until(
             || {
                 let elem = {
                     let mut g = self.queue.lock();
@@ -481,7 +481,7 @@ impl VirtioBlkPci {
                 };
                 matches!(elem, Some((id, _)) if id == head as u32)
             },
-            10_000_000,
+            narf_time::Deadline::after_ms(1_000),
         );
         if q_err {
             return Err(VirtioPciError::NoQueues);
@@ -590,11 +590,11 @@ impl VirtioBlkPci {
         payload_phys: u64,
         out: &mut [u8; 512],
     ) -> Result<(), VirtioPciError> {
-        // responsive_spin ticks sleep_pumps so cursor/FB stay alive
+        // responsive_spin_until ticks sleep_pumps so cursor/FB stay alive
         // while waiting for our completion. Foreign-id used entries
         // are consumed inline and don't count against the bound.
         let mut q_err = false;
-        let done = narf_scheduler::responsive_spin(
+        let done = narf_scheduler::responsive_spin_until(
             || {
                 let elem = {
                     let mut g = self.queue.lock();
@@ -608,7 +608,7 @@ impl VirtioBlkPci {
                 };
                 matches!(elem, Some((id, _)) if id == head as u32)
             },
-            10_000_000,
+            narf_time::Deadline::after_ms(1_000),
         );
         if q_err {
             return Err(VirtioPciError::NoQueues);
@@ -712,10 +712,10 @@ impl VirtioBlkPci {
     /// Drain a previously submitted write. Returns Ok if the device
     /// reported success.
     pub fn drain_write(&self, head: u16, status_phys: u64) -> Result<(), VirtioPciError> {
-        // responsive_spin ticks sleep_pumps so cursor/FB stay alive
+        // responsive_spin_until ticks sleep_pumps so cursor/FB stay alive
         // while waiting for our write completion.
         let mut q_err = false;
-        let done = narf_scheduler::responsive_spin(
+        let done = narf_scheduler::responsive_spin_until(
             || {
                 let elem = {
                     let mut g = self.queue.lock();
@@ -729,7 +729,7 @@ impl VirtioBlkPci {
                 };
                 matches!(elem, Some((id, _)) if id == head as u32)
             },
-            10_000_000,
+            narf_time::Deadline::after_ms(1_000),
         );
         if q_err {
             return Err(VirtioPciError::NoQueues);
@@ -829,9 +829,9 @@ impl VirtioBlkPci {
         // device actually completes this request. The IRQ will still
         // fire during this poll (MSI-X is wired), so the caller's
         // post-submit fire_count check still observes the wakeup.
-        // responsive_spin ticks sleep_pumps so cursor/FB stay alive.
+        // responsive_spin_until ticks sleep_pumps so cursor/FB stay alive.
         let mut q_err = false;
-        let done = narf_scheduler::responsive_spin(
+        let done = narf_scheduler::responsive_spin_until(
             || {
                 let elem = {
                     let mut g = self.queue.lock();
@@ -845,7 +845,7 @@ impl VirtioBlkPci {
                 };
                 matches!(elem, Some((id, _)) if id == head as u32)
             },
-            10_000_000,
+            narf_time::Deadline::after_ms(1_000),
         );
         if q_err {
             return Err(VirtioPciError::NoQueues);

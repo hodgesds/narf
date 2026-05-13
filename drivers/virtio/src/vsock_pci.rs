@@ -452,10 +452,10 @@ impl VirtioVsockPci {
         unsafe {
             self.notify.write16(off, 1);
         }
-        // responsive_spin ticks sleep_pumps so cursor/FB stay alive
+        // responsive_spin_until ticks sleep_pumps so cursor/FB stay alive
         // while waiting for the device to publish a used-ring entry.
         let mut q_err = false;
-        let done = narf_scheduler::responsive_spin(
+        let done = narf_scheduler::responsive_spin_until(
             || {
                 let elem = {
                     let mut g = self.tx_queue.lock();
@@ -469,7 +469,7 @@ impl VirtioVsockPci {
                 };
                 matches!(elem, Some((id, _)) if id == head as u32)
             },
-            10_000_000,
+            narf_time::Deadline::after_ms(1_000),
         );
         if q_err {
             return Err(VirtioPciError::NoQueues);

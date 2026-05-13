@@ -451,10 +451,10 @@ impl VirtioConsolePci {
             self.notify.write16(off, QIDX_TX);
         }
 
-        // Poll for completion. responsive_spin ticks sleep_pumps so
+        // Poll for completion. responsive_spin_until ticks sleep_pumps so
         // cursor/FB stay alive on a slow / wedged device.
         let mut q_err = false;
-        let done = narf_scheduler::responsive_spin(
+        let done = narf_scheduler::responsive_spin_until(
             || {
                 let elem = {
                     let mut g = self.tx_queue.lock();
@@ -468,7 +468,7 @@ impl VirtioConsolePci {
                 };
                 matches!(elem, Some((id, _)) if id == head as u32)
             },
-            10_000_000,
+            narf_time::Deadline::after_ms(1_000),
         );
         if q_err {
             return Err(VirtioPciError::NoQueues);

@@ -325,9 +325,9 @@ impl VirtioSoundPci {
             );
         }
         // Poll used ring for the matching head, bounded.
-        // responsive_spin ticks sleep_pumps so cursor/FB stay alive.
+        // responsive_spin_until ticks sleep_pumps so cursor/FB stay alive.
         let mut q_err = false;
-        let done = narf_scheduler::responsive_spin(
+        let done = narf_scheduler::responsive_spin_until(
             || {
                 let elem = {
                     let mut g = self.control_q.lock();
@@ -341,7 +341,7 @@ impl VirtioSoundPci {
                 };
                 matches!(elem, Some((id, _)) if id == head as u32)
             },
-            10_000_000,
+            narf_time::Deadline::after_ms(1_000),
         );
         if q_err {
             return Err(VirtioPciError::NoQueues);
@@ -488,10 +488,10 @@ impl VirtioSoundPci {
                 2,
             );
         }
-        // responsive_spin ticks sleep_pumps so cursor/FB / audio
+        // responsive_spin_until ticks sleep_pumps so cursor/FB / audio
         // pump itself stay alive while waiting for tx-q completion.
         let mut q_err = false;
-        let done = narf_scheduler::responsive_spin(
+        let done = narf_scheduler::responsive_spin_until(
             || {
                 let elem = {
                     let mut g = self.tx_q.lock();
@@ -505,7 +505,7 @@ impl VirtioSoundPci {
                 };
                 matches!(elem, Some((id, _)) if id == head as u32)
             },
-            10_000_000,
+            narf_time::Deadline::after_ms(1_000),
         );
         if q_err {
             return Err(VirtioPciError::NoQueues);
