@@ -210,7 +210,9 @@ fn polltest_run(fd: i32) {
 }
 
 fn pidtest_run(fd: i32) {
-    // Read /proc/self/comm — should be non-empty.
+    // Read /proc/self/comm — should contain "shell\n" at boot
+    // (set_proc_comm seeded by bare_main when the boot-init
+    // spawns it).
     let pfd = unsafe {
         libc::posix_open(b"/proc/self/comm\0".as_ptr() as *const i8, 0, 0)
     };
@@ -223,8 +225,64 @@ fn pidtest_run(fd: i32) {
         libc::posix::read(pfd, buf.as_mut_ptr() as *mut _, buf.len())
     };
     let _ = unsafe { libc::posix::close(pfd) };
+    if n <= 0 || !buf[..n as usize].starts_with(b"shell") {
+        unsafe { write_all(fd, b"pidtest: /proc/self/comm != shell\n"); }
+        return;
+    }
+    // PR_SET_NAME → "renamed" → /proc/self/comm reflects it.
+    let mut newname = [0u8; 16];
+    newname[..7].copy_from_slice(b"renamed");
+    let _ = unsafe { libc::prctl(15 /* PR_SET_NAME */, newname.as_ptr() as u64, 0) };
+    let pfd = unsafe {
+        libc::posix_open(b"/proc/self/comm\0".as_ptr() as *const i8, 0, 0)
+    };
+    let mut buf = [0u8; 64];
+    let n = unsafe {
+        libc::posix::read(pfd, buf.as_mut_ptr() as *mut _, buf.len())
+    };
+    let _ = unsafe { libc::posix::close(pfd) };
+    if n <= 0 || !buf[..n as usize].starts_with(b"renamed") {
+        unsafe { write_all(fd, b"pidtest: PR_SET_NAME didn't propagate\n"); }
+        return;
+    }
+    // Restore comm so other tests aren't confused.
+    let mut restore = [0u8; 16];
+    restore[..5].copy_from_slice(b"shell");
+    let _ = unsafe { libc::prctl(15, restore.as_ptr() as u64, 0) };
+    // /proc/self/maps — should have at least one line containing
+    // [stack] or [heap] or [text].
+    let pfd = unsafe {
+        libc::posix_open(b"/proc/self/maps\0".as_ptr() as *const i8, 0, 0)
+    };
+    let mut mbuf = [0u8; 1024];
+    let n = unsafe {
+        libc::posix::read(pfd, mbuf.as_mut_ptr() as *mut _, mbuf.len())
+    };
+    let _ = unsafe { libc::posix::close(pfd) };
     if n <= 0 {
-        unsafe { write_all(fd, b"pidtest: empty /proc/self/comm\n"); }
+        unsafe { write_all(fd, b"pidtest: empty /proc/self/maps\n"); }
+        return;
+    }
+    // Search for at least one VMA bracket-label.
+    let mbytes = &mbuf[..n as usize];
+    let has_label = mbytes.windows(7).any(|w| w == b"[stack]")
+        || mbytes.windows(6).any(|w| w == b"[heap]")
+        || mbytes.windows(6).any(|w| w == b"[text]");
+    if !has_label {
+        unsafe { write_all(fd, b"pidtest: /proc/self/maps has no labelled VMA\n"); }
+        return;
+    }
+    // /proc/self/cmdline — should be "shell\0" (boot-init seeded).
+    let pfd = unsafe {
+        libc::posix_open(b"/proc/self/cmdline\0".as_ptr() as *const i8, 0, 0)
+    };
+    let mut cbuf = [0u8; 64];
+    let n = unsafe {
+        libc::posix::read(pfd, cbuf.as_mut_ptr() as *mut _, cbuf.len())
+    };
+    let _ = unsafe { libc::posix::close(pfd) };
+    if n != 6 || &cbuf[..6] != b"shell\0" {
+        unsafe { write_all(fd, b"pidtest: /proc/self/cmdline != shell\\0\n"); }
         return;
     }
     // Read /proc/self/stat — should start with our pid.

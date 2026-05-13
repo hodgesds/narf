@@ -2271,6 +2271,7 @@ fn boot_userspace_init() {
     cwd_init();
     sigaction_init();
     signal_init();
+    narf_userspace::handlers::init_per_task_state();
     narf_userspace::fd::init();
     // Wire ^C / ^\ / ^Z input-byte handling into the console
     // driver so they deliver SIGINT/SIGQUIT/SIGTSTP to the
@@ -2458,11 +2459,16 @@ fn boot_userspace_init() {
             pid.raw(),
             entry
         );
-        narf_scheduler::spawn_user(
+        let tid = narf_scheduler::spawn_user(
             UserTaskFuture::new(proc),
             narf_scheduler::TaskSpec::unthrottled(),
             addr_space,
         );
+        // /proc/[pid]/cmdline + comm seed for the boot-spawned
+        // process. argv = ["init"] / ["shell"] is the convention
+        // load_user_process_with uses above.
+        narf_userspace::handlers::set_proc_argv(tid.raw(), &[name]);
+        narf_userspace::handlers::set_proc_comm(tid.raw(), name);
         true
     }
 

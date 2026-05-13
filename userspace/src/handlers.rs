@@ -4200,6 +4200,13 @@ fn sys_prctl(ctx: &mut dyn TrapContext) {
                 ctx.set_return(fail);
                 return;
             }
+            // Mirror into PROC_COMM so /proc/[pid]/comm reflects
+            // the new name. The byte buffer is NUL-padded; trim
+            // before storing.
+            let nul_pos = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+            if let Ok(s) = core::str::from_utf8(&name[..nul_pos]) {
+                set_proc_comm(task, s);
+            }
             ctx.set_return(SyscallReturn::ok(0));
         }
         PR_GET_NAME => {
@@ -5282,6 +5289,14 @@ fn sys_execve(ctx: &mut dyn TrapContext) {
 
     let task = current_task_id();
 
+    // /proc/[pid]/cmdline + comm: preserve argv as NUL-separated
+    // bytes, derive comm from argv[0]'s basename (Linux convention).
+    set_proc_argv(task, &argv_refs);
+    if let Some(first) = argv_refs.first() {
+        let basename = first.rsplit('/').next().unwrap_or(first);
+        set_proc_comm(task, basename);
+    }
+
     // Step 5: swap the scheduler slot's AS Arc. Without this the
     // poll path's later activate() would still target the old AS
     // until the future's process.address_space update lands.
@@ -5899,6 +5914,62 @@ pub fn signal_pending_of(task: u64) -> u32 {
         .unwrap_or(0)
 }
 
+// ── /proc/[pid]/{cmdline,comm} backing tables ───────────────────
+//
+// Both are populated at task-creation time (boot init, sys_execve)
+// and queried by the proc_task_info hook below. The comm name is
+// also writable through prctl(PR_SET_NAME).
+
+static PROC_ARGV: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+static PROC_COMM: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u64, alloc::string::String>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Store NUL-separated argv bytes for a task. /proc/[pid]/cmdline
+/// reads this exact byte stream — Linux's shape is `argv[0]\0argv[1]\0...`.
+pub fn set_proc_argv(pid: u64, argv: &[&str]) {
+    let mut packed = alloc::vec::Vec::new();
+    for s in argv {
+        packed.extend_from_slice(s.as_bytes());
+        packed.push(0);
+    }
+    let mut g = PROC_ARGV.lock();
+    let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
+    map.insert(pid, packed);
+}
+
+/// Pre-packed variant — the caller already owns the NUL-separated bytes.
+pub fn set_proc_argv_packed(pid: u64, packed: alloc::vec::Vec<u8>) {
+    let mut g = PROC_ARGV.lock();
+    let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
+    map.insert(pid, packed);
+}
+
+/// Set the per-task comm name. Truncated to 15 bytes per Linux's
+/// PR_SET_NAME (TASK_COMM_LEN = 16 including NUL).
+pub fn set_proc_comm(pid: u64, name: &str) {
+    let trimmed: alloc::string::String =
+        name.chars().take(15).collect();
+    let mut g = PROC_COMM.lock();
+    let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
+    map.insert(pid, trimmed);
+}
+
+fn proc_argv_of(pid: u64) -> alloc::vec::Vec<u8> {
+    let g = PROC_ARGV.lock();
+    g.as_ref()
+        .and_then(|m| m.get(&pid).cloned())
+        .unwrap_or_default()
+}
+
+fn proc_comm_of(pid: u64) -> Option<alloc::string::String> {
+    let g = PROC_COMM.lock();
+    g.as_ref().and_then(|m| m.get(&pid).cloned())
+}
+
 /// /proc/self pid hook — returns the current task id.
 pub fn proc_current_pid() -> u64 {
     current_task_id()
@@ -5936,16 +6007,61 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
     // the standard DEFAULT_USER_STACK_BASE + DEFAULT_USER_STACK_BYTES.
     let stack_top = crate::process::DEFAULT_USER_STACK_BASE
         + crate::process::DEFAULT_USER_STACK_BYTES;
-    // Comm name — Stage-1 default. Real per-task name tracking
-    // would come through a `set_task_comm(pid, name)` accessor
-    // (PR_SET_NAME-style) once any consumer needs it.
-    let comm = if pid == 0 {
-        alloc::string::String::from("kernel")
-    } else {
-        alloc::format!("task-{}", pid)
-    };
-    // cmdline — empty until argv tracking lands at exec time.
-    let cmdline = alloc::vec::Vec::new();
+    // Comm name — from the PROC_COMM table (written at exec time
+    // or via prctl(PR_SET_NAME)). Falls back to a "task-N"
+    // default when no name has been set.
+    let comm = proc_comm_of(pid).unwrap_or_else(|| {
+        if pid == 0 {
+            alloc::string::String::from("kernel")
+        } else {
+            alloc::format!("task-{}", pid)
+        }
+    });
+    // cmdline — argv preserved at exec time. Empty for bare-spawn
+    // tasks (initramfs init / shell) until their argv is recorded.
+    let cmdline = proc_argv_of(pid);
+    // VMAs — walk the task's AS regions table. Linux's
+    // /proc/[pid]/maps tags certain ranges with brackets ([heap],
+    // [stack]); we apply the same labels by matching base address.
+    use narf_filesystem::procfs::ProcVma;
+    use narf_memory::RegionPerms;
+    let mut vmas = alloc::vec::Vec::new();
+    if let Some(as_arc) = narf_scheduler::address_space_of(narf_scheduler::TaskId(pid))
+        .or_else(|| {
+            // Currently-polling task isn't in the queue scan;
+            // fall back to the active-AS slot.
+            if pid == current_task_id() {
+                narf_scheduler::current_address_space()
+            } else {
+                None
+            }
+        })
+    {
+        for r in as_arc.regions_snapshot() {
+            let base = r.base.as_u64();
+            let end = base + r.len;
+            let prot = r.perms.prot_only();
+            let label: &'static str =
+                if base == crate::process::DEFAULT_USER_STACK_BASE {
+                    "[stack]"
+                } else if base == 0x8000_0000_0000_u64 || (base & 0xffff_ffff_0000_0000) == 0x8000_0000 {
+                    "[text]"
+                } else if brk_top != 0 && base <= brk_top && brk_top <= end {
+                    "[heap]"
+                } else {
+                    ""
+                };
+            vmas.push(ProcVma {
+                start: base,
+                end,
+                readable: prot.contains(RegionPerms::READ),
+                writable: prot.contains(RegionPerms::WRITE),
+                executable: prot.contains(RegionPerms::EXEC),
+                shared: false,
+                label,
+            });
+        }
+    }
     Some(ProcTaskInfo {
         pid,
         comm,
@@ -5953,6 +6069,7 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
         brk_top,
         stack_top,
         cmdline,
+        vmas,
     })
 }
 

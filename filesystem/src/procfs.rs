@@ -47,6 +47,25 @@ pub struct ProcTaskInfo {
     pub stack_top: u64,
     /// argv joined with NULs (Linux /proc/[pid]/cmdline shape).
     pub cmdline: Vec<u8>,
+    /// VMA list — one entry per address-space region. Filled by
+    /// the kernel hook from the AS's regions table; rendered into
+    /// /proc/[pid]/maps text by `render_maps`.
+    pub vmas: Vec<ProcVma>,
+}
+
+/// One virtual-memory area entry. Mirrors what `/proc/[pid]/maps`
+/// reports per line: range, protection bits, and an optional name.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct ProcVma {
+    pub start: u64,
+    pub end: u64,
+    pub readable: bool,
+    pub writable: bool,
+    pub executable: bool,
+    pub shared: bool,
+    /// Optional Linux-style label (`[heap]`, `[stack]`, `[vdso]`).
+    /// Empty for anonymous mappings.
+    pub label: &'static str,
 }
 
 type CurrentPidFn = fn() -> u64;
@@ -441,38 +460,30 @@ fn render_status(info: &ProcTaskInfo) -> String {
 }
 
 fn render_maps(info: &ProcTaskInfo) -> String {
-    // Linux /proc/[pid]/maps is one VMA per line:
+    // Linux /proc/[pid]/maps shape:
     //   start-end perms offset dev:major:minor inode pathname
-    // Stage-1: emit two synthetic lines (text image + heap) so
-    // tools that scan for "[heap]" / executable mappings find
-    // something. Real per-VMA enumeration lands when the FS layer
-    // grows a `region_iter()` accessor through the address-space
-    // hook.
+    // We omit dev:major:minor (NARF doesn't yet model per-VMA
+    // backing files); pathname slot carries our label or empty.
     let mut s = String::new();
-    let _ = core::fmt::Write::write_fmt(
-        &mut s,
-        format_args!(
-            "0000008000000000-0000008000010000 r-xp 00000000 00:00 0          [text]\n"
-        ),
-    );
-    if info.brk_top > 0 {
+    for v in info.vmas.iter() {
+        let r = if v.readable { 'r' } else { '-' };
+        let w = if v.writable { 'w' } else { '-' };
+        let x = if v.executable { 'x' } else { '-' };
+        let p = if v.shared { 's' } else { 'p' };
         let _ = core::fmt::Write::write_fmt(
             &mut s,
             format_args!(
-                "0000008000010000-{:016x} rw-p 00000000 00:00 0          [heap]\n",
-                info.brk_top.max(0x8000_0001_0000),
+                "{:016x}-{:016x} {}{}{}{} 00000000 00:00 0",
+                v.start, v.end, r, w, x, p,
             ),
         );
-    }
-    if info.stack_top > 0 {
-        let _ = core::fmt::Write::write_fmt(
-            &mut s,
-            format_args!(
-                "{:016x}-{:016x} rw-p 00000000 00:00 0          [stack]\n",
-                info.stack_top.saturating_sub(0x100_0000),
-                info.stack_top,
-            ),
-        );
+        if !v.label.is_empty() {
+            let _ = core::fmt::Write::write_fmt(
+                &mut s,
+                format_args!("          {}", v.label),
+            );
+        }
+        s.push('\n');
     }
     s
 }
