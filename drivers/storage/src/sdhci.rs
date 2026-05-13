@@ -209,12 +209,14 @@ impl Sdhci {
         unsafe {
             me.mmio.write8(REG_SOFT_RESET, SRST_ALL);
         }
-        // responsive_spin ticks sleep_pumps every ~4096 iters so the
-        // FB cursor / serial drain stay alive during slow reset.
-        let done = narf_scheduler::responsive_spin(
+        // responsive_spin_until ticks sleep_pumps every ~4096 iters
+        // so the FB cursor / serial drain stay alive during the
+        // reset. SDHCI 4.20 §3.6 says SRST_ALL self-clears within
+        // 100 ms on a healthy controller.
+        let done = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped MMIO.
             || unsafe { me.mmio.read8(REG_SOFT_RESET) } & SRST_ALL == 0,
-            1_000_000,
+            narf_time::Deadline::after_ms(100),
         );
         if !done {
             return Err(SdhciError::ResetTimeout);
@@ -243,13 +245,14 @@ impl Sdhci {
         unsafe {
             me.mmio.write16(REG_CLOCK_CONTROL, clk);
         }
-        // responsive_spin keeps cursor/FB/serial alive while waiting
-        // for the internal clock to stabilise. Timeout ignored —
-        // original code fell through to SD_EN regardless.
-        let _ = narf_scheduler::responsive_spin(
+        // responsive_spin_until keeps cursor/FB/serial alive while
+        // waiting for the internal clock to stabilise. SDHCI 4.20
+        // §2.2.14 caps stable-bit assertion at 150 ms. Timeout
+        // ignored — original code fell through to SD_EN regardless.
+        let _ = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped MMIO.
             || unsafe { me.mmio.read16(REG_CLOCK_CONTROL) } & CLK_INTERNAL_STABLE != 0,
-            1_000_000,
+            narf_time::Deadline::after_ms(150),
         );
         // SAFETY: same.
         let v = unsafe { me.mmio.read16(REG_CLOCK_CONTROL) };
@@ -293,12 +296,15 @@ impl Sdhci {
         } else {
             PSTATE_CMD_INHIBIT
         };
-        // responsive_spin keeps cursor/FB/serial alive on a stuck
-        // controller.
-        let done = narf_scheduler::responsive_spin(
+        // responsive_spin_until keeps cursor/FB/serial alive on a
+        // stuck controller. SDHCI 4.20 §3.7: any in-flight command
+        // must complete within the data-timeout window programmed
+        // in REG_TIMEOUT_CTRL. 1 s is a comfortable upper bound for
+        // the longest plausible card response.
+        let done = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped MMIO.
             || unsafe { self.mmio.read32(REG_PRESENT_STATE) } & mask == 0,
-            10_000_000,
+            narf_time::Deadline::after_ms(1_000),
         );
         if done {
             Ok(())
@@ -343,12 +349,14 @@ impl Sdhci {
             self.mmio
                 .write16(REG_COMMAND, make_cmd(idx, resp_kind, has_data));
         }
-        // Poll for command-complete (or error). responsive_spin
-        // ticks sleep_pumps so cursor/FB/serial stay alive.
-        let done = narf_scheduler::responsive_spin(
+        // Poll for command-complete (or error). responsive_spin_until
+        // ticks sleep_pumps so cursor/FB/serial stay alive. 1 s
+        // wall-clock budget is comfortably above the longest
+        // plausible single-command latency.
+        let done = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped MMIO.
             || unsafe { self.mmio.read16(REG_NORMAL_INT_STS) } & (NIS_CMD_COMPLETE | NIS_ERROR) != 0,
-            10_000_000,
+            narf_time::Deadline::after_ms(1_000),
         );
         if !done {
             return Err(SdhciError::CmdTimeout);
@@ -456,12 +464,13 @@ impl Sdhci {
         let _ = self.cmd(17, arg, RESP_48, true, tm, 512, 1)?;
 
         // Wait for buffer-read-ready, then drain 512 / 4 = 128
-        // u32 words from the buffer port. responsive_spin keeps the
-        // FB cursor / serial drain alive on a slow controller.
-        let done = narf_scheduler::responsive_spin(
+        // u32 words from the buffer port. responsive_spin_until keeps
+        // the FB cursor / serial drain alive on a slow controller.
+        // 1 s budget covers the worst plausible read latency.
+        let done = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped MMIO.
             || unsafe { self.mmio.read16(REG_NORMAL_INT_STS) } & (NIS_BUFFER_READ_READY | NIS_ERROR) != 0,
-            10_000_000,
+            narf_time::Deadline::after_ms(1_000),
         );
         if !done {
             return Err(SdhciError::PioStall);
@@ -483,11 +492,11 @@ impl Sdhci {
             let bytes = w.to_le_bytes();
             out[i * 4..i * 4 + 4].copy_from_slice(&bytes);
         }
-        // Wait for transfer-complete.
-        let done = narf_scheduler::responsive_spin(
+        // Wait for transfer-complete. 1 s wall-clock budget.
+        let done = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped MMIO.
             || unsafe { self.mmio.read16(REG_NORMAL_INT_STS) } & NIS_TRANSFER_COMPLETE != 0,
-            10_000_000,
+            narf_time::Deadline::after_ms(1_000),
         );
         if !done {
             return Err(SdhciError::PioStall);
@@ -506,11 +515,12 @@ impl Sdhci {
         let _ = self.cmd(24, arg, RESP_48, true, /*tm*/ 0, 512, 1)?;
 
         // Wait for buffer-write-ready, push 128 u32 words.
-        // responsive_spin ticks sleep_pumps so cursor/FB stay alive.
-        let done = narf_scheduler::responsive_spin(
+        // responsive_spin_until ticks sleep_pumps so cursor/FB stay
+        // alive. 1 s wall-clock budget.
+        let done = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped MMIO.
             || unsafe { self.mmio.read16(REG_NORMAL_INT_STS) } & (NIS_BUFFER_WRITE_READY | NIS_ERROR) != 0,
-            10_000_000,
+            narf_time::Deadline::after_ms(1_000),
         );
         if !done {
             return Err(SdhciError::PioStall);
@@ -540,10 +550,10 @@ impl Sdhci {
                 self.mmio.write32(REG_BUFFER_PORT, w);
             }
         }
-        let done = narf_scheduler::responsive_spin(
+        let done = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped MMIO.
             || unsafe { self.mmio.read16(REG_NORMAL_INT_STS) } & NIS_TRANSFER_COMPLETE != 0,
-            10_000_000,
+            narf_time::Deadline::after_ms(1_000),
         );
         if !done {
             return Err(SdhciError::PioStall);

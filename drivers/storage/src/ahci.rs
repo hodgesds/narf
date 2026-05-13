@@ -243,12 +243,13 @@ impl Ahci {
         unsafe {
             mmio.write32(HBA_GHC, GHC_AE | GHC_HR);
         }
-        // responsive_spin ticks sleep_pumps so cursor/FB stay alive
-        // during HBA reset.
-        let done = narf_scheduler::responsive_spin(
+        // responsive_spin_until ticks sleep_pumps so cursor/FB stay
+        // alive during HBA reset. AHCI 1.3.1 §10.4.3: HBA reset
+        // self-clears within 1 s.
+        let done = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped MMIO.
             || unsafe { mmio.read32(HBA_GHC) } & GHC_HR == 0,
-            1_000_000,
+            narf_time::Deadline::after_ms(1_000),
         );
         if !done {
             return Err(AhciError::ResetTimeout);
@@ -395,10 +396,13 @@ impl Ahci {
     /// `port_idx < 32`; the slots in `bit` have already been issued.
     pub unsafe fn issue_and_wait_sync(&self, port_idx: u8, bit: u32) -> Result<(), AhciError> {
         let off = PORT_BASE_OFF + (port_idx as u64) * PORT_STRIDE;
-        // responsive_spin keeps cursor/FB alive while waiting for
-        // the controller to clear CI; bail early on TFD.ERR.
+        // responsive_spin_until keeps cursor/FB alive while waiting
+        // for the controller to clear CI; bail early on TFD.ERR.
+        // 30 s wall-clock budget covers the worst-case ATA DMA
+        // timeout for spinning rust (per ATA-8 §4.20.1 the longest
+        // legitimate command is bounded well below this).
         let mut errored = false;
-        let done = narf_scheduler::responsive_spin(
+        let done = narf_scheduler::responsive_spin_until(
             || {
                 // SAFETY: identity-mapped MMIO.
                 let ci = unsafe { self.mmio.read32(off + PORT_CI) };
@@ -410,7 +414,7 @@ impl Ahci {
                 }
                 ci & bit == 0
             },
-            10_000_000,
+            narf_time::Deadline::after_ms(30_000),
         );
         if errored || !done {
             return Err(AhciError::ResetTimeout);
@@ -431,11 +435,13 @@ impl Ahci {
         unsafe {
             self.mmio.write32(off + PORT_CMD, cmd & !(CMD_ST | CMD_FRE));
         }
-        // responsive_spin ticks sleep_pumps while CR/FR drain.
-        let done = narf_scheduler::responsive_spin(
+        // responsive_spin_until ticks sleep_pumps while CR/FR drain.
+        // AHCI 1.3.1 §10.3.2: post-clear-ST the engine drains within
+        // 500 ms; FR drain after clear-FRE is similar.
+        let done = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped MMIO.
             || unsafe { self.mmio.read32(off + PORT_CMD) } & (CMD_FR | CMD_CR) == 0,
-            1_000_000,
+            narf_time::Deadline::after_ms(500),
         );
         if done {
             Ok(())
@@ -586,10 +592,12 @@ impl Ahci {
             self.mmio.write32(off + 0x38, 1);
         }
 
-        // Poll until CI bit clears. responsive_spin keeps cursor /
-        // FB / serial alive and bails on TFD.ERR.
+        // Poll until CI bit clears. responsive_spin_until keeps cursor
+        // / FB / serial alive and bails on TFD.ERR. IDENTIFY DEVICE
+        // is sub-millisecond on real hardware; 5 s wall-clock budget
+        // covers a stuck/slow controller without hanging boot.
         let mut errored = false;
-        let done = narf_scheduler::responsive_spin(
+        let done = narf_scheduler::responsive_spin_until(
             || {
                 // SAFETY: identity-mapped MMIO.
                 let ci = unsafe { self.mmio.read32(off + 0x38) };
@@ -601,7 +609,7 @@ impl Ahci {
                 }
                 ci & 1 == 0
             },
-            10_000_000,
+            narf_time::Deadline::after_ms(5_000),
         );
         if errored || !done {
             return Err(AhciError::ResetTimeout);
@@ -723,10 +731,11 @@ pub unsafe fn ahci_write_lba(
         ahci.mmio.write32(off + 0x38, 1);
     }
 
-    // responsive_spin ticks sleep_pumps so cursor/FB stay alive
-    // while waiting for the IDENTIFY DMA to finish.
+    // responsive_spin_until ticks sleep_pumps so cursor/FB stay
+    // alive while waiting for WRITE DMA EXT to finish. 30 s
+    // wall-clock budget for spinning rust worst-case.
     let mut errored = false;
-    let done = narf_scheduler::responsive_spin(
+    let done = narf_scheduler::responsive_spin_until(
         || {
             // SAFETY: identity-mapped MMIO.
             let ci = unsafe { ahci.mmio.read32(off + 0x38) };
@@ -738,7 +747,7 @@ pub unsafe fn ahci_write_lba(
             }
             ci & 1 == 0
         },
-        10_000_000,
+        narf_time::Deadline::after_ms(30_000),
     );
     if errored || !done {
         return Err(AhciError::ResetTimeout);
@@ -866,10 +875,11 @@ pub unsafe fn ahci_read_lba(
         ahci.mmio.write32(off + 0x38, 1);
     }
 
-    // responsive_spin ticks sleep_pumps so cursor/FB stay alive
-    // while waiting for READ DMA EXT to finish.
+    // responsive_spin_until ticks sleep_pumps so cursor/FB stay
+    // alive while waiting for READ DMA EXT to finish. 30 s
+    // wall-clock budget for spinning rust worst-case.
     let mut errored = false;
-    let done = narf_scheduler::responsive_spin(
+    let done = narf_scheduler::responsive_spin_until(
         || {
             // SAFETY: identity-mapped MMIO.
             let ci = unsafe { ahci.mmio.read32(off + 0x38) };
@@ -881,7 +891,7 @@ pub unsafe fn ahci_read_lba(
             }
             ci & 1 == 0
         },
-        10_000_000,
+        narf_time::Deadline::after_ms(30_000),
     );
     if errored || !done {
         return Err(AhciError::ResetTimeout);
@@ -1302,10 +1312,11 @@ unsafe fn ahci_lba_ncq(
         ahci.mmio.write32(off + 0x38, bit); // PORT_CI
     }
 
-    // responsive_spin ticks sleep_pumps so cursor/FB stay alive
-    // during the user-issued R/W DMA.
+    // responsive_spin_until ticks sleep_pumps so cursor/FB stay
+    // alive during the user-issued R/W DMA. 30 s wall-clock budget
+    // for spinning rust worst-case.
     let mut errored = false;
-    let done = narf_scheduler::responsive_spin(
+    let done = narf_scheduler::responsive_spin_until(
         || {
             // SAFETY: identity-mapped MMIO.
             let ci = unsafe { ahci.mmio.read32(off + 0x38) };
@@ -1317,7 +1328,7 @@ unsafe fn ahci_lba_ncq(
             }
             ci & bit == 0
         },
-        10_000_000,
+        narf_time::Deadline::after_ms(30_000),
     );
     if errored || !done {
         return Err(AhciError::ResetTimeout);
