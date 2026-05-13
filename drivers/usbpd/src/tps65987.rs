@@ -153,13 +153,13 @@ impl Tps65987 {
         self.bus.write_burst(self.addr, REG_CMD1, &code)
     }
 
-    /// Wait for the chip to clear Cmd1 (firmware ack). Polls a
-    /// bounded number of times — caller picks the cadence.
-    fn wait_cmd1_clear(&self, retries: u32) -> Result<(), TcpcError> {
-        // responsive_spin ticks sleep_pumps so cursor/FB stay alive
-        // while the PD chip processes a 4CC command.
+    /// Wait for the chip to clear Cmd1 (firmware ack). Polls until
+    /// the supplied deadline expires.
+    fn wait_cmd1_clear(&self, deadline: narf_time::Deadline) -> Result<(), TcpcError> {
+        // responsive_spin_until ticks sleep_pumps so cursor/FB stay
+        // alive while the PD chip processes a 4CC command.
         let mut bus_err: Option<TcpcError> = None;
-        let done = narf_scheduler::responsive_spin(
+        let done = narf_scheduler::responsive_spin_until(
             || {
                 let mut buf = [0u8; 4];
                 match self.bus.read_burst(self.addr, REG_CMD1, &mut buf) {
@@ -170,7 +170,7 @@ impl Tps65987 {
                     }
                 }
             },
-            retries,
+            deadline,
         );
         if let Some(e) = bus_err {
             return Err(e);
@@ -192,7 +192,10 @@ impl Tps65987 {
             self.bus.write_burst(self.addr, REG_DATA1, data)?;
         }
         self.write_cmd1(code)?;
-        self.wait_cmd1_clear(100_000)
+        // TPS65987 4CC commands typically complete in a few ms;
+        // 1 s is a wedge threshold (firmware-update commands can
+        // take ~hundreds of ms per the TI TRM).
+        self.wait_cmd1_clear(narf_time::Deadline::after_ms(1000))
     }
 
     /// Decode CC pin state from Type-C Status. The TPS65987's

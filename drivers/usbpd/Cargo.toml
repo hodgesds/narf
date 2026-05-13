@@ -16,6 +16,7 @@ narf-lib          = { path = "../../lib" }
 narf-usbpd        = { path = "../../usbpd" }
 narf-capabilities = { path = "../../capabilities" }
 narf-scheduler    = { path = "../../scheduler" }
+narf-time         = { path = "../../time" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
 
 [features]
