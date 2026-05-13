@@ -912,3 +912,120 @@ invariants. Totals after the Stage-4 round: **x86_64 134 pass,
 aarch64 124 pass + 3 skip** (same three skips as Stage 3 —
 arch-gated bus test, sleepable-RCU detail, virtio probe without
 hardware).
+
+## Post-Stage-4 session — primitives + driver hardening
+
+This session added a coherent family of wall-clock-bounded async
+primitives, swept them across every driver, and closed the
+boot-blocker gaps that prevented `cargo xtask image` from
+delivering a working interactive shell.
+
+### New core primitives (in `narf-time` / `narf-scheduler` / `narf-interrupts`)
+
+| primitive | purpose |
+|-----------|---------|
+| `narf_time::Deadline` | TSC-anchored deadline. `after_cycles/ns/us/ms` + `expired()` + `remaining_cycles()`. |
+| `narf_time::Elapsed` | Marker error for the timeout-aware combinators. |
+| `narf_time::timeout(d, fut)` | Wraps any future with a wall-clock deadline. Polls inner first; `Drop` cancels the wheel slot when inner completes. |
+| `narf_time::poll_bit_async(probe, sample, deadline)` | Async equivalent of `responsive_spin` — yields between samples via `sleep_cycles` instead of busy-waiting. |
+| `narf_scheduler::responsive_spin(done, max_iters)` | Bounded busy-poll that ticks `sleep_pumps::run()` every 4096 iters so cursor / serial / audio drain stay alive. |
+| `narf_scheduler::responsive_spin_until(done, deadline)` | Same as above but driven by a wall-clock deadline. |
+| `narf_interrupts::wait_for_irq_until(vec, deadline)` | Thin composition of `wait_for_irq` + `timeout`. |
+
+### Driver-wide sweep
+
+Every kernel-side MMIO busy-poll across the driver tree was
+migrated through two passes:
+
+1. **`responsive_spin` rollout** (~14 commits, ~70 sites) —
+   replaced hand-rolled `for _ in 0..N { core::hint::spin_loop() }`
+   loops with `responsive_spin` so device-init busy-waits stop
+   freezing the on-screen cursor / serial drain / audio pump.
+   Coverage: drivers/{nvme, usb, storage (sdhci+ahci), virtio
+   (12 transports), platform (smbus+ec+tpm), usbpd, gpu, net (6
+   NICs)} + bus PCIe FLR + aml EC ports + interrupts ITS +
+   audio (acp6+hda) + bluetooth + frame SMP AP-online wait.
+
+2. **Deadline migration** (~14 commits) — the iter counts in
+   the responsive_spin sites that were really time budgets in
+   disguise migrated to `responsive_spin_until` with named
+   `Deadline::after_ms(N)` calls citing the spec section that
+   set the budget. Same coverage, plus drivers/usb/hub +
+   platform/tpm. After this round, **zero call sites use the
+   iter-count form** — the helper is reserved for callers that
+   genuinely want a try-budget.
+
+### USB stack — spec-compliant baseline
+
+The Renoir bring-up cycle taught us that speculative quirk
+fixes don't scale. Landed the spec-defensible work, reverted
+the rest:
+
+- F-01 keep scratchpad pages alive across init.
+- F-08 USB Legacy Support BIOS handoff (xECP cap 1).
+- F-22 default EP0 MPS = 8 for FS per xHCI Table 13.
+- F-23 Evaluate Context Command (TRB type 13) refreshes EP0 MPS
+  after GET_DESCRIPTOR returns the device's real bMaxPacketSize0.
+- F-31 Configure Endpoint copies the FULL slot context (4 dwords)
+  from the live device context, not just dword0/1.
+- F-39 cmd ring wraps via Link TRB.
+- F-41 Transfer Events filtered by (Slot, EP) instead of slot-only.
+- F-45 per-slot persistent control-transfer DMA scratch.
+- F-51 + sweep: `await_event` ticks sleep_pumps.
+- F-55 64-bit MMIO writes reordered HI-then-LO (DCBAAP / CRCR /
+  ERSTBA / ERDP).
+- F-72 accept Subclass=0 HID interfaces, not only Boot.
+- F-83 supervisor re-emits attach failure log every 64 cycles.
+- F-87 supervisor avoids double port_reset within one cycle.
+- TRSTRCY ≥10 ms TSC-driven recovery wait inside `port_reset`.
+
+The Renoir-specific port_reset speculation (5x retry, CSC/PED
+debounce, stale-bits clear, two-phase BSR Address Device, WPR
+fallback) was reverted — the data the diagnostics surfaced
+(PORTSC=0x000006E1 with PED=0/PLS=U0 contradictory state)
+points at AMD's rate-matching hub topology that needs proper
+USB2/USB3 sibling-port pairing. That's bigger than retry hacks
+can paper over and is out of scope without the right hardware.
+
+### Input-pipeline observability
+
+`narf-input` now exposes counters for both `KEY_PUSH_COUNT` and
+`ASCII_PUSH_COUNT` / `ASCII_POP_COUNT`. `i8042` driver pins
+init+IRQ-routing status in `I8042_KBD_INIT_OK` /
+`I8042_KBD_IRQ_ROUTED` / `I8042_MOUSE_*` statics. The FB status
+panel renders all of these in a fixed line + repaints at 4 Hz
+via the new `fb-status-refresh` task. End-to-end shell input on
+QEMU verified — `help` + Enter at the `narf>` prompt produces
+`commands: help echo uname pid exit`.
+
+### Boot path
+
+- `cargo xtask image` now defaults `boot-init` on so the ISO
+  reaches the shell prompt without a follow-up `--features`
+  argument.
+- HPET timer-wheel pump now arms cleanly on QEMU. `pick_gsi`
+  used to scan only GSIs ≥ 16, but QEMU's HPET timer 0
+  route_cap is exactly `0x4` (GSI 2 only — historically PIT
+  cascade). Falls back through GSIs 0-15 skipping known legacy
+  assignments (0=PIT, 1=kbd, 8=RTC, 13=FPU). `sleep_cycles` is
+  no longer self-wake busy-poll; it parks on real timer IRQs.
+- Fast SYSCALL/SYSRET path live on x86_64. Naked-asm entry in
+  `frame::x86_64::syscall::syscall_entry_x86_64` shares
+  dispatch with the legacy `int 0x80` path via
+  `kernel_syscall_entry_plain`. STAR / LSTAR / FMASK MSRs +
+  EFER.SCE programmed in `init_traps()`. The userspace libc
+  shim still uses int 0x80 today — switching it is a follow-up.
+
+### Stage 4 blockers — updated status
+
+From STATUS.md §855 prior-session list:
+
+1. **Real syscall trap handler** — int 0x80 path was already
+   wired and exercises the full SyscallTable dispatch (verified
+   end-to-end via the shell calling posix_open/read/write).
+   This session added the fast SYSCALL/SYSRET MSR path on top
+   so the standard x86_64 calling convention works — both
+   paths funnel into `kernel_syscall_entry_plain`. **Closed.**
+2. Per-process address spaces (memory/PML4 isolation) — still
+   pending.
+3. External relibc — still out of tree.
