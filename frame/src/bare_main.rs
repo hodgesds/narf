@@ -1764,12 +1764,27 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 if narf_drivers_nvme::is_probed() {
                     let dev = Arc::new(narf_drivers_nvme::NvmeBlockDevice);
                     let fut = narf_drivers_fs_fat::mount_fat(&auth, "/", dev, domain);
-                    if let Some(Ok(_handle)) = drive(fut) {
-                        let _ = writeln!(
-                            console::Writer,
-                            "  root-mount: FAT volume on nvme mounted at \"/\""
-                        );
-                        return narf_init::InitResult::Ok;
+                    match drive(fut) {
+                        Some(Ok(_handle)) => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  root-mount: FAT volume on nvme mounted at \"/\""
+                            );
+                            return narf_init::InitResult::Ok;
+                        }
+                        Some(Err(e)) => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  root-mount: FAT mount on nvme failed: {:?}",
+                                e
+                            );
+                        }
+                        None => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  root-mount: nvme mount future didn't settle in 1024 polls"
+                            );
+                        }
                     }
                 }
 

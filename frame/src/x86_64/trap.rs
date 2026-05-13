@@ -187,7 +187,7 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
     //     instruction succeeds.
     // On any failure we fall through to the panic path so the
     // existing diagnostic still fires on genuine bugs.
-    if frame.vector == 14 && (frame.cs & 3) == 3 {
+    if frame.vector == 14 {
         // PF error code (Intel SDM Vol. 3 §4.7):
         //   bit 0 (P): set if fault was a present-page violation
         //   bit 1 (W): set if write
@@ -202,20 +202,32 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
             core::arch::asm!("mov {v}, cr2", v = out(reg) cr2,
                 options(nostack, preserves_flags));
         }
-        // Demand paging: P=0 + U=1 means the page wasn't mapped
-        // at fault time. Try to back it from the active user AS's
-        // lazy region table. This handles `mmap`'s default
-        // deferred-allocation path: the syscall installs the
-        // bookkeeping with `phys[i] == 0` and the first user
-        // touch lands here to allocate + zero + install the PTE.
-        // Falls through to COW / panic on any error so the
-        // existing diagnostic still fires for genuine bugs.
-        if (ec & (PF_P | PF_U)) == PF_U {
+        // Canonical lower-half (user) addresses: bit 47 clear.
+        // 0x0000_8000_0000_0000 is the first non-canonical lower
+        // address; anything strictly below is in the user half.
+        let cr2_in_user_half = cr2 < 0x0000_8000_0000_0000;
+        let from_user = (frame.cs & 3) == 3;
+
+        // Demand paging: P=0 means the page wasn't mapped at fault
+        // time. Two cases get serviced through the active user AS's
+        // lazy region table:
+        //   (a) CPL=3 fault on any vaddr — `mmap`'s deferred-alloc
+        //       path: the syscall installs `phys[i] == 0` and the
+        //       first user touch lands here.
+        //   (b) CPL=0 fault on a USER vaddr — the kernel writing
+        //       through to a user buffer that hasn't been touched
+        //       yet (e.g. a syscall handler reading/writing a
+        //       caller-supplied buffer that came from a fresh mmap
+        //       grow). Same backing path; the supervisor bit on the
+        //       error code just means we got there from kernel mode.
+        // Falls through to COW / panic on any error so the existing
+        // diagnostic still fires for genuine bugs.
+        let p_clear = (ec & PF_P) == 0;
+        if p_clear && (from_user || cr2_in_user_half) {
             if let Some(as_arc) = narf_userspace::active_user_as() {
                 let v = narf_memory::VirtAddr::new(cr2);
                 // SAFETY: identity map live, AS belongs to the
-                // task whose CR3 is currently active (we just
-                // probed CPL=3).
+                // task whose CR3 is currently active.
                 if unsafe { as_arc.demand_alloc_page(v) }.is_ok() {
                     return;
                 }

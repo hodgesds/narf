@@ -63,14 +63,6 @@ fn current_task_id() -> u64 {
 
 fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
     use core::pin::Pin;
-    fn raw_waker() -> RawWaker {
-        unsafe fn no_clone(_: *const ()) -> RawWaker {
-            raw_waker()
-        }
-        unsafe fn no_op(_: *const ()) {}
-        const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
-        RawWaker::new(core::ptr::null(), &VTAB)
-    }
     // SAFETY: vtable holds null-pointer-clean stubs; the waker is
     // never woken (poll_once expects Ready on the first poll).
     let waker = unsafe { Waker::from_raw(raw_waker()) };
@@ -82,6 +74,37 @@ fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
         Poll::Ready(v) => Some(v),
         Poll::Pending => None,
     }
+}
+
+fn raw_waker() -> RawWaker {
+    unsafe fn no_clone(_: *const ()) -> RawWaker {
+        raw_waker()
+    }
+    unsafe fn no_op(_: *const ()) {}
+    const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
+    RawWaker::new(core::ptr::null(), &VTAB)
+}
+
+/// Spin-pump a Future to completion inside a syscall. Caller must
+/// guarantee the future makes progress without external wakeups (the
+/// kernel's block-device drivers — NVMe in particular — are
+/// internally polled, so async FS futures complete after at most a
+/// handful of re-polls). Bounded to 65 536 iterations as a hard
+/// safety cap; returns `None` on overrun (caller surfaces EIO).
+fn poll_blocking<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
+    use core::pin::Pin;
+    // SAFETY: same waker as poll_once; never delivers wake events.
+    let waker = unsafe { Waker::from_raw(raw_waker()) };
+    let mut ctx = Context::from_waker(&waker);
+    // SAFETY: we own `fut` by value; pin to the stack temporary.
+    let mut pinned = unsafe { Pin::new_unchecked(&mut fut) };
+    for _ in 0..65_536 {
+        match pinned.as_mut().poll(&mut ctx) {
+            Poll::Ready(v) => return Some(v),
+            Poll::Pending => continue,
+        }
+    }
+    None
 }
 
 // ── Per-task AS lookup shim ────────────────────────────────────────
@@ -617,7 +640,8 @@ fn sys_open(ctx: &mut dyn TrapContext) {
     let ops = if mnt_len == 0 {
         narf_filesystem::registry()
             .resolve_absolute(path, |fs, rel| {
-                narf_filesystem::resolve(fs.root(), rel).ok()
+                poll_blocking(narf_filesystem::resolve_async(fs.root(), rel))
+                    .and_then(|r| r.ok())
             })
             .flatten()
     } else {
@@ -630,7 +654,10 @@ fn sys_open(ctx: &mut dyn TrapContext) {
             }
         };
         narf_filesystem::registry()
-            .with_mount(mount, |fs| narf_filesystem::resolve(fs.root(), path).ok())
+            .with_mount(mount, |fs| {
+                poll_blocking(narf_filesystem::resolve_async(fs.root(), path))
+                    .and_then(|r| r.ok())
+            })
             .flatten()
     };
 
@@ -642,7 +669,7 @@ fn sys_open(ctx: &mut dyn TrapContext) {
         Some(o) => o,
         None if (flags & O_CREAT) != 0 && mnt_len == 0 => {
             match narf_filesystem::registry()
-                .resolve_parent_absolute(path, |_fs, parent, leaf| poll_once(parent.create(leaf)))
+                .resolve_parent_absolute(path, |_fs, parent, leaf| poll_blocking(parent.create(leaf)))
             {
                 Some(Some(Ok(o))) => o,
                 _ => {
@@ -703,7 +730,7 @@ fn sys_write(ctx: &mut dyn TrapContext) {
             None => return Err(()),
         };
         let off = entry.offset;
-        let written = poll_once(entry.ops.write(off, slice))
+        let written = poll_blocking(entry.ops.write(off, slice))
             .and_then(|r| r.ok())
             .unwrap_or(0);
         entry.offset = off.saturating_add(written as u64);
@@ -737,7 +764,7 @@ fn sys_read(ctx: &mut dyn TrapContext) {
             None => return Err(()),
         };
         let off = entry.offset;
-        let read = poll_once(entry.ops.read(off, slice))
+        let read = poll_blocking(entry.ops.read(off, slice))
             .and_then(|r| r.ok())
             .unwrap_or(0);
         entry.offset = off.saturating_add(read as u64);
@@ -1009,7 +1036,7 @@ fn sys_ftruncate(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
     let outcome = fd::with_table(task, |t| {
         let entry = t.get(fd)?;
-        Some(poll_once(entry.ops.truncate(len)))
+        Some(poll_blocking(entry.ops.truncate(len)))
     });
     match outcome {
         Some(Some(Some(Ok(())))) => ctx.set_return(SyscallReturn::ok(0)),
@@ -1045,7 +1072,7 @@ fn sys_pread64(ctx: &mut dyn TrapContext) {
     let outcome = fd::with_table(task, |t| {
         let entry = t.get(fd)?;
         let ops = entry.ops.clone();
-        let n = poll_once(ops.read(offset, slice))
+        let n = poll_blocking(ops.read(offset, slice))
             .and_then(|r| r.ok())
             .unwrap_or(0);
         Some(n)
@@ -1077,7 +1104,7 @@ fn sys_pwrite64(ctx: &mut dyn TrapContext) {
     let outcome = fd::with_table(task, |t| {
         let entry = t.get(fd)?;
         let ops = entry.ops.clone();
-        let n = poll_once(ops.write(offset, slice))
+        let n = poll_blocking(ops.write(offset, slice))
             .and_then(|r| r.ok())
             .unwrap_or(0);
         Some(n)
@@ -1122,7 +1149,7 @@ fn sys_fallocate(ctx: &mut dyn TrapContext) {
         // Always ensure size >= offset + len. truncate handles
         // grow + zero-fill.
         if target_end > cur_size {
-            if poll_once(ops.truncate(target_end)).and_then(|r| r.ok()).is_none() {
+            if poll_blocking(ops.truncate(target_end)).and_then(|r| r.ok()).is_none() {
                 return Some(false);
             }
         }
@@ -1134,7 +1161,7 @@ fn sys_fallocate(ctx: &mut dyn TrapContext) {
             let chunk = [0u8; 4096];
             while cur < zero_end {
                 let span = core::cmp::min(zero_end - cur, chunk.len() as u64) as usize;
-                let n = poll_once(ops.write(cur, &chunk[..span]))
+                let n = poll_blocking(ops.write(cur, &chunk[..span]))
                     .and_then(|r| r.ok())
                     .unwrap_or(0);
                 if n == 0 {
@@ -1213,13 +1240,13 @@ fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
     let mut copied = 0usize;
     while copied < len {
         let span = core::cmp::min(len - copied, chunk.len());
-        let read_n = poll_once(in_ops.read(cur_in, &mut chunk[..span]))
+        let read_n = poll_blocking(in_ops.read(cur_in, &mut chunk[..span]))
             .and_then(|r| r.ok())
             .unwrap_or(0);
         if read_n == 0 {
             break;
         }
-        let write_n = poll_once(out_ops.write(cur_out, &chunk[..read_n]))
+        let write_n = poll_blocking(out_ops.write(cur_out, &chunk[..read_n]))
             .and_then(|r| r.ok())
             .unwrap_or(0);
         if write_n == 0 {
@@ -1284,7 +1311,7 @@ fn sys_truncate(ctx: &mut dyn TrapContext) {
         })
         .flatten();
     match ops {
-        Some(o) => match poll_once(o.truncate(new_size)) {
+        Some(o) => match poll_blocking(o.truncate(new_size)) {
             Some(Ok(())) => ctx.set_return(SyscallReturn::ok(0)),
             _ => ctx.set_return(fail),
         },
@@ -1918,7 +1945,7 @@ fn sys_unlink(ctx: &mut dyn TrapContext) {
         }
     };
     let outcome = narf_filesystem::registry()
-        .resolve_parent_absolute(path, |_fs, parent, leaf| poll_once(parent.unlink(leaf)));
+        .resolve_parent_absolute(path, |_fs, parent, leaf| poll_blocking(parent.unlink(leaf)));
     match outcome {
         Some(Some(Ok(()))) => ctx.set_return(SyscallReturn::ok(0)),
         _ => ctx.set_return(fail),
@@ -1951,7 +1978,7 @@ fn sys_mkdir(ctx: &mut dyn TrapContext) {
         }
     };
     let outcome = narf_filesystem::registry()
-        .resolve_parent_absolute(path, |_fs, parent, leaf| poll_once(parent.mkdir(leaf)));
+        .resolve_parent_absolute(path, |_fs, parent, leaf| poll_blocking(parent.mkdir(leaf)));
     match outcome {
         Some(Some(Ok(_))) => ctx.set_return(SyscallReturn::ok(0)),
         _ => ctx.set_return(fail),
@@ -1977,7 +2004,7 @@ fn sys_rmdir(ctx: &mut dyn TrapContext) {
         }
     };
     let outcome = narf_filesystem::registry()
-        .resolve_parent_absolute(path, |_fs, parent, leaf| poll_once(parent.rmdir(leaf)));
+        .resolve_parent_absolute(path, |_fs, parent, leaf| poll_blocking(parent.rmdir(leaf)));
     match outcome {
         Some(Some(Ok(()))) => ctx.set_return(SyscallReturn::ok(0)),
         _ => ctx.set_return(fail),
@@ -2036,7 +2063,7 @@ fn sys_rename(ctx: &mut dyn TrapContext) {
     let new_leaf = &new_path[new_split + 1..];
     let outcome = narf_filesystem::registry()
         .resolve_parent_absolute(old_path, |_fs, parent, old_leaf| {
-            poll_once(parent.rename(old_leaf, new_leaf))
+            poll_blocking(parent.rename(old_leaf, new_leaf))
         });
     match outcome {
         Some(Some(Ok(()))) => ctx.set_return(SyscallReturn::ok(0)),
@@ -2100,7 +2127,7 @@ fn sys_readlink(ctx: &mut dyn TrapContext) {
     let target_len = st.size as usize;
     let len = core::cmp::min(buf_len, target_len);
     let mut staging = alloc::vec![0u8; len];
-    let n = match poll_once(file.read(0, &mut staging)) {
+    let n = match poll_blocking(file.read(0, &mut staging)) {
         Some(Ok(n)) => n,
         _ => {
             ctx.set_return(fail);
@@ -2150,7 +2177,7 @@ fn sys_symlink(ctx: &mut dyn TrapContext) {
     };
     let outcome = narf_filesystem::registry()
         .resolve_parent_absolute(link_path, |_fs, parent, leaf| {
-            poll_once(parent.symlink(leaf, target_str))
+            poll_blocking(parent.symlink(leaf, target_str))
         });
     match outcome {
         Some(Some(Ok(_))) => ctx.set_return(SyscallReturn::ok(0)),

@@ -207,17 +207,73 @@ pub unsafe fn new_user_pml4_on(node: usize) -> Result<PhysAddr, PageTableAllocEr
         );
     }
 
-    // Clear PML4[1] in the user copy. The kernel uses PML4[1] for
-    // its high-MMIO identity window (virt 512 GiB ≤ V < 1 TiB); if
-    // the entry survived the bulk copy, every user `materialize`
-    // would write its 4-KiB descents into the kernel-shared PDPT
-    // (cross-process mapping pollution). User binaries link in this
-    // same PML4[1] slot anyway (start at virt 0x0000_0080_0000_1000),
-    // so a clean slate is the right starting state.
-    // SAFETY: `phys` is identity-mapped; the slot lives at offset
-    // 1 * 8 = 8 bytes into the freshly-copied PML4 page.
-    unsafe {
-        ptr::write_volatile((phys.raw() + 1 * 8) as *mut u64, 0);
+    // PML4[1] is shared between two consumers:
+    //   - Kernel high-MMIO identity (virt 512 GiB ≤ V < 1 TiB,
+    //     mapped via 1 GiB huge pages in PDPT[1..512] of the
+    //     kernel's PML4[1]). The NVMe / virtio / xHCI BARs that
+    //     UEFI assigns above 4 GiB live here (e.g. QEMU q35 places
+    //     NVMe BAR0 at phys 0xC0_0000_0000 = 768 GiB).
+    //   - User binaries link at virt 0x0000_0080_0000_1000 which
+    //     decodes to PML4[1] PDPT[0] PD[0] PT[1]. The user
+    //     `materialize` populates the PT/PD/PDPT[0] subtree.
+    //
+    // The bulk-copy above made PML4[1] point at the kernel's own
+    // PDPT, which means a user materialize would walk and *write*
+    // through to the kernel-shared PDPT — cross-AS mapping pollution
+    // and a security boundary leak.
+    //
+    // Fix: allocate a fresh PDPT for this user AS, copy the
+    // kernel's PDPT[1..512] entries (the high-MMIO 1-GiB pages)
+    // into it, leave PDPT[0] zero so the user's materialize can
+    // safely descend into a private PD/PT subtree.
+    let kernel_pml4_e1: u64 = unsafe {
+        ptr::read_volatile((cur_pml4.raw() + 1 * 8) as *const u64)
+    };
+    if kernel_pml4_e1 & 1 != 0 {
+        let kernel_pdpt_phys = PhysAddr::new(kernel_pml4_e1 & 0x000f_ffff_ffff_f000);
+        let user_pdpt_frame = crate::frame::alloc_frame_on(node)
+            .map_err(|_| PageTableAllocError::NoFrame)?;
+        let user_pdpt_phys = user_pdpt_frame.start_address();
+        // Zero the fresh PDPT.
+        // SAFETY: identity-mapped freshly-allocated frame.
+        unsafe {
+            ptr::write_bytes(user_pdpt_phys.raw() as *mut u8, 0, 4096);
+        }
+        // Copy kernel PDPT[1..512] (skip PDPT[0] — that's where the
+        // user binary lives, must stay private to this AS).
+        // SAFETY: source + destination are both identity-mapped
+        // 4 KiB-aligned page frames.
+        unsafe {
+            for i in 1usize..512 {
+                let src = (kernel_pdpt_phys.raw() as usize + i * 8) as *const u64;
+                let dst = (user_pdpt_phys.raw() as usize + i * 8) as *mut u64;
+                ptr::write_volatile(dst, ptr::read_volatile(src));
+            }
+        }
+        // Replace PML4[1] in the user copy with a pointer at the
+        // fresh PDPT. Preserve PRESENT / WRITABLE from the kernel
+        // entry but force USER=1 — the kernel PML4[1] is U=0
+        // (kernel-only high-MMIO), but in the user AS this slot
+        // also serves the user binary at virt 0x0000_0080_0000_1000,
+        // and a CPL=3 walk requires U=1 at every level. The
+        // kernel-MMIO PDPT entries themselves carry U=0, so a
+        // user-mode access at high-MMIO virts still faults at the
+        // PDPT level — only the user's own PDPT[0] subtree is
+        // reachable from CPL=3.
+        let preserved_flags = (kernel_pml4_e1 & 0xfff) | (1 << 2); // USER bit
+        let new_e1 = user_pdpt_phys.raw() | preserved_flags;
+        // SAFETY: `phys` is identity-mapped; PML4[1] lives 8 bytes in.
+        unsafe {
+            ptr::write_volatile((phys.raw() + 1 * 8) as *mut u64, new_e1);
+        }
+    } else {
+        // Kernel didn't map PML4[1] at all (legacy boot path). Fall
+        // back to a clean clear so the user materialize allocates a
+        // fresh PDPT through `map_4kb`'s walker.
+        // SAFETY: same — PML4[1] slot at offset 8.
+        unsafe {
+            ptr::write_volatile((phys.raw() + 1 * 8) as *mut u64, 0);
+        }
     }
 
     Ok(phys)

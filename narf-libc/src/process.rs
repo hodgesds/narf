@@ -497,7 +497,13 @@ impl Drop for OwnedBuf {
 /// `path` must be a valid `&str` for the duration of the call.
 unsafe fn read_file_to_vec(path: &str) -> Option<OwnedBuf> {
     const O_RDONLY: u64 = 0;
-    let fd = narf_user_runtime::open_flags(path, "/", O_RDONLY)?;
+    // mount="" → kernel takes the absolute-path branch
+    // (registry.resolve_absolute), which is the only form that
+    // both supports leading-slash paths and walks every mount.
+    // Passing mount="/" would route through with_mount("/",...) +
+    // resolve(fs.root(), "/shell") — the FAT resolver treats "/"
+    // as the root component and rejects the resulting empty leaf.
+    let fd = narf_user_runtime::open_flags(path, "", O_RDONLY)?;
     // SAFETY: malloc-backed growable buffer.
     let mut out = unsafe { OwnedBuf::with_capacity(64 * 1024) }?;
     let mut chunk = [0u8; 4096];
