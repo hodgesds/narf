@@ -1063,3 +1063,44 @@ artefact stands between the Stage-4 surface as it ships today
 and the spec's Stage-4 exit criterion ("relibc-linked standard
 Rust binary doing block + network I/O through capability-gated
 paths").
+
+### Memory-management surface — what's wired
+
+Confirmation pass against the "any other primitives?" question:
+
+- **Page-fault handler (x86_64 + aarch64)**: COW write-fault
+  recovery wired. The user-mode #PF path reads CR2, looks up
+  the active user AS via `narf_userspace::active_user_as()`,
+  calls `AddressSpace::cow_split_on_write(vaddr)` (allocates
+  private frame, memcpys shared bytes, dec_refs old frame,
+  restores WRITE on the region), then `remap_page(vaddr)` to
+  rewrite the live PTE so the next user-mode instruction
+  succeeds. Anything not COW-shaped falls through to the
+  panic / probe-recovery path. Generic demand paging
+  (PROT_NONE lazy populate, swap-in, stack-grow on guard
+  page) is NOT implemented — Stage-4 use case has all process
+  pages pre-allocated by mmap/brk, so this is a perf
+  optimization rather than a correctness gap.
+- **`brk` / `sbrk`**: kernel handler `sys_brk` is complete —
+  per-task BTreeMap of break tops keyed on TaskId, query path
+  on `arg0 == 0`, grow path that allocates frames + maps R/W
+  into the task AS, shrink path that lowers the recorded break
+  (with a known-leak TODO for unmapping shrunken pages).
+  Userspace C-ABI shims `brk(*mut u8) -> i32` and
+  `sbrk(isize) -> *mut u8` added in this session.
+- **`mmap` / `munmap`**: fully implemented. mmap allocates one
+  zeroed frame per page, installs a Region with READ|WRITE
+  perms in the task AS, materialises PTEs. munmap walks the
+  AS region table and removes the matching base.
+- **`malloc` / `free` / `realloc` / `calloc` / `aligned_alloc`
+  / `posix_memalign`**: implemented in narf-libc. First-fit
+  freelist over `mmap`-grown chunks. The shell + init exercise
+  this path at every userspace allocation today.
+
+What's NOT in place (all post-Stage-4):
+- True demand paging (lazy frame allocation on first touch).
+- Stack-grow guard page → fresh frame on user-mode write fault.
+- Page reclaim / swap (no swap device).
+- Page coalescing in narf-libc's freelist.
+- mmap shrink-on-munmap that returns frames to the allocator.
+- brk shrink that returns frames (currently a TODO).
