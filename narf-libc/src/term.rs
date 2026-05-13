@@ -55,10 +55,9 @@ pub const TCSANOW:   c_int = 0;
 pub const TCSADRAIN: c_int = 1;
 pub const TCSAFLUSH: c_int = 2;
 
-/// `tcgetattr(fd, *out)` — populate `*out` with a "no-attributes"
-/// default termios and report success on a real tty fd, or -1 with
-/// `errno = ENOTTY` for everything else. NARF's only "tty" is fd 0
-/// (the kernel console) per the existing isatty wiring.
+/// `tcgetattr(fd, *out)` — read terminal attributes. Round-trips
+/// the kernel-side per-task termios store so a subsequent
+/// `tcsetattr` value is observed.
 ///
 /// # Safety
 /// `t` must be a writable `*mut termios` if non-null.
@@ -69,36 +68,34 @@ pub unsafe extern "C" fn tcgetattr(fd: c_int, t: *mut termios) -> c_int {
         crate::errno::set_errno(ENOTTY);
         return -1;
     }
-    // SAFETY: caller-supplied writable struct; populate with the
-    // canonical "C raw input" defaults — the real values would
-    // require a kernel termios surface.
-    unsafe {
-        *t = termios::default();
-        // Set sensible defaults: CREAD enabled, VTIME/VMIN at 0/1.
-        (*t).c_cflag = 0x0080; // CREAD
-    }
-    0
+    // SAFETY: kernel writes the 60-byte KTermios shape into the
+    // user buffer. The libc `termios` struct matches the same
+    // layout (4*tcflag + line + 32 cc + 2 speed).
+    let r = unsafe {
+        narf_user_runtime::syscall2_raw(218, fd as u64, t as u64)
+    };
+    if (r as i64) < 0 { -1 } else { 0 }
 }
 
-/// `tcsetattr(fd, action, *t)` — accept the request and report
-/// success on a tty fd; -1 with `errno = ENOTTY` otherwise. We
-/// never actually mutate state (no kernel termios), but the
-/// round-trip is enough for libreadline to think it has switched
-/// to raw mode.
+/// `tcsetattr(fd, action, *t)` — write terminal attributes.
 ///
 /// # Safety
 /// `t` must be a valid `*const termios` if non-null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tcsetattr(
     fd:      c_int,
-    _action: c_int,
-    _t:      *const termios,
+    action:  c_int,
+    t:       *const termios,
 ) -> c_int {
     if unsafe { crate::fd::isatty(fd) } == 0 {
         crate::errno::set_errno(ENOTTY);
         return -1;
     }
-    0
+    if t.is_null() { return -1; }
+    let r = unsafe {
+        narf_user_runtime::syscall3_raw(219, fd as u64, action as u64, t as u64)
+    };
+    if (r as i64) < 0 { -1 } else { 0 }
 }
 
 /// `tcflush(fd, what)` — accept-and-ignore drain request.

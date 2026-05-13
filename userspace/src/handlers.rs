@@ -781,6 +781,10 @@ fn sys_read(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
+    // Track the foreground task: any read syscall counts as "this
+    // task is currently consuming console input." When the input
+    // ring later observes ^C, this is the task SIGINT goes to.
+    note_console_reader(current_task_id());
     // SAFETY: same contract as `sys_write` — user pointer in the
     // active AS, length-bounded.
     let slice = unsafe { core::slice::from_raw_parts_mut(ptr, len) };
@@ -6619,6 +6623,156 @@ fn sys_sock_send_zc(ctx: &mut dyn TrapContext) {
     }
 }
 
+// ── Terminal attributes (termios) ───────────────────────────────
+//
+// Per-task kernel-side termios store. tcgetattr/tcsetattr round
+// trip through this so consumers (libreadline, password prompts,
+// Rust's Stdin::lock) see the values they wrote. The console
+// driver consults the same storage to decide whether to deliver
+// ^C as SIGINT (ISIG bit), echo input (ECHO bit), buffer until
+// newline (ICANON bit).
+//
+// The c_lflag bits that matter here:
+const ICANON: u32 = 0x0002;
+const ECHO_FLAG: u32 = 0x0008;
+const ISIG: u32 = 0x0001;
+
+/// Wire-stable termios image. 60 bytes — matches glibc's shape on
+/// x86_64 (4*tcflag + 1 line-disc + 32 cc + 2 speed).
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct KTermios {
+    pub c_iflag: u32,
+    pub c_oflag: u32,
+    pub c_cflag: u32,
+    pub c_lflag: u32,
+    pub c_line: u8,
+    pub c_cc: [u8; 32],
+    pub _pad: [u8; 3],
+    pub c_ispeed: u32,
+    pub c_ospeed: u32,
+}
+
+impl KTermios {
+    pub const fn cooked() -> Self {
+        Self {
+            c_iflag: 0,
+            c_oflag: 0,
+            c_cflag: 0x0080, // CREAD
+            c_lflag: ICANON | ECHO_FLAG | ISIG,
+            c_line: 0,
+            c_cc: [0; 32],
+            _pad: [0; 3],
+            c_ispeed: 0,
+            c_ospeed: 0,
+        }
+    }
+}
+
+static TASK_TERMIOS: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u64, KTermios>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+pub fn termios_of_task(task: u64) -> KTermios {
+    let g = TASK_TERMIOS.lock();
+    g.as_ref()
+        .and_then(|m| m.get(&task).copied())
+        .unwrap_or(KTermios::cooked())
+}
+
+pub fn set_termios_of_task(task: u64, t: KTermios) {
+    let mut g = TASK_TERMIOS.lock();
+    let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
+    map.insert(task, t);
+}
+
+/// Most recent task to read from the console. Tracked so the
+/// console driver knows which task to deliver SIGINT to when ^C
+/// is read. Updated on each console read.
+static FOREGROUND_TASK: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+pub fn note_console_reader(task: u64) {
+    FOREGROUND_TASK.store(task, Ordering::Release);
+}
+
+pub fn foreground_task() -> u64 {
+    FOREGROUND_TASK.load(Ordering::Acquire)
+}
+
+/// Console driver hook: called from DevConsole.read when the input
+/// byte stream contains a control character that the current
+/// foreground task's termios maps to a signal. ^C → SIGINT (2),
+/// ^\ → SIGQUIT (3), ^Z → SIGTSTP (20). Returns true if the byte
+/// was consumed as a signal (don't deliver to user); false otherwise.
+pub fn maybe_deliver_signal_for_input(byte: u8) -> bool {
+    let task = foreground_task();
+    if task == 0 {
+        return false;
+    }
+    let t = termios_of_task(task);
+    if t.c_lflag & ISIG == 0 {
+        return false;
+    }
+    let signum = match byte {
+        0x03 => 2,  // SIGINT
+        0x1C => 3,  // SIGQUIT
+        0x1A => 20, // SIGTSTP
+        _ => return false,
+    };
+    // Set the pending bit; the trap-return signal-delivery hook
+    // picks it up next time the task returns to user mode.
+    let mut g = SIGNAL_PENDING.lock();
+    let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
+    let slot = map.entry(task).or_insert(0);
+    *slot |= 1u32 << signum;
+    true
+}
+
+fn sys_tcgetattr(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let _fd = args.arg0;
+    let out = args.arg1 as *mut u8;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if out.is_null() {
+        ctx.set_return(fail);
+        return;
+    }
+    let task = current_task_id();
+    let t = termios_of_task(task);
+    // SAFETY: user out pointer; per-byte volatile write is serviced
+    // by demand-paging if the page is fresh.
+    unsafe {
+        let bytes: [u8; core::mem::size_of::<KTermios>()] = core::mem::transmute(t);
+        for (i, &b) in bytes.iter().enumerate() {
+            core::ptr::write_volatile(out.add(i), b);
+        }
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+fn sys_tcsetattr(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let _fd = args.arg0;
+    let _action = args.arg1;
+    let in_ptr = args.arg2 as *const u8;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if in_ptr.is_null() {
+        ctx.set_return(fail);
+        return;
+    }
+    let task = current_task_id();
+    let mut bytes = [0u8; core::mem::size_of::<KTermios>()];
+    unsafe {
+        for i in 0..bytes.len() {
+            bytes[i] = core::ptr::read_volatile(in_ptr.add(i));
+        }
+    }
+    let t: KTermios = unsafe { core::mem::transmute(bytes) };
+    set_termios_of_task(task, t);
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
 // ── I/O multiplexing — poll / epoll / eventfd / timerfd / signalfd ──
 
 /// poll(2) entry: walk a user-supplied array of pollfd, OR each
@@ -7188,6 +7342,8 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::TimerfdCreate, "timerfd_create", RawFnHandler(sys_timerfd_create));
     table.install_raw(Syscall::TimerfdSettime, "timerfd_settime", RawFnHandler(sys_timerfd_settime));
     table.install_raw(Syscall::Signalfd, "signalfd", RawFnHandler(sys_signalfd));
+    table.install_raw(Syscall::Tcgetattr, "tcgetattr", RawFnHandler(sys_tcgetattr));
+    table.install_raw(Syscall::Tcsetattr, "tcsetattr", RawFnHandler(sys_tcsetattr));
     table.install_raw(
         Syscall::FbConnect,
         "fb_connect",

@@ -574,6 +574,15 @@ pub enum Syscall {
     /// ptr, arg2 = sizemask, arg3 = flags.
     Signalfd = 217,
 
+    /// `tcgetattr(fd, &termios)` — read terminal attributes.
+    /// arg0 = fd, arg1 = termios out ptr (60 bytes per glibc
+    /// shape). Returns 0 on success, !0u64 on error.
+    Tcgetattr = 218,
+
+    /// `tcsetattr(fd, action, &termios)` — write terminal attributes.
+    /// arg0 = fd, arg1 = action, arg2 = termios in ptr.
+    Tcsetattr = 219,
+
     /// Open an FB connection to a scanout. `arg0` = scanout id (0
     /// for the active scanout). Returns a non-zero `FbHandleId` on
     /// success, 0 on failure (no backend / OOM / not authorised).
@@ -1173,6 +1182,8 @@ impl Syscall {
             215 => Syscall::TimerfdCreate,
             216 => Syscall::TimerfdSettime,
             217 => Syscall::Signalfd,
+            218 => Syscall::Tcgetattr,
+            219 => Syscall::Tcsetattr,
             130 => Syscall::RingKick,
             140 => Syscall::GetPid,
             141 => Syscall::GetPpid,

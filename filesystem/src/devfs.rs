@@ -171,6 +171,25 @@ impl FileOps for DevZero {
 /// against fd 1/2.
 struct DevConsole;
 
+/// Optional fn-ptr hook the userspace crate installs at boot so
+/// the console driver can ask "is this byte a signal-shaped
+/// control character that should be delivered to the foreground
+/// task instead of being returned through read?". Stored as a
+/// raw usize so this crate doesn't need a direct dep on
+/// userspace's signal-pending table. See
+/// `userspace::handlers::maybe_deliver_signal_for_input` for the
+/// canonical implementation.
+static CONSOLE_SIGNAL_HOOK: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Install the signal-character hook. Pass a `fn(u8) -> bool`
+/// whose return value is `true` iff the byte was consumed as a
+/// signal (and should NOT appear in the read buffer). NULL
+/// disables.
+pub fn install_console_signal_hook(hook: fn(u8) -> bool) {
+    CONSOLE_SIGNAL_HOOK.store(hook as usize, core::sync::atomic::Ordering::Release);
+}
+
 /// Translate one `KeyCode` (with live modifier state) into one
 /// printable ASCII byte. Returns `None` for non-translatable keys
 /// (modifiers, function keys, navigation cluster). The shift map
@@ -226,6 +245,13 @@ impl FileOps for DevConsole {
         // Non-blocking — callers wanting blocking behaviour loop
         // in user space until n>0.
         let mut written = 0usize;
+        // Note: an externally-installed signal hook (set by
+        // `userspace::handlers::install_console_signal_hook`)
+        // optionally intercepts ^C / ^\ / ^Z and turns them into
+        // a SIGINT/SIGQUIT/SIGTSTP delivery instead of letting
+        // the byte through. The hook is a fn ptr so this crate
+        // doesn't need a direct dep on userspace's signal table.
+        let signal_hook = CONSOLE_SIGNAL_HOOK.load(core::sync::atomic::Ordering::Acquire);
         // Drain key presses + raw bytes in interleaved order so a
         // burst of one class doesn't starve the other. Bound by
         // ring capacity (256) per class to avoid pathological
@@ -239,8 +265,20 @@ impl FileOps for DevConsole {
                 if let Some(k) = narf_input::pop_key() {
                     if k.pressed {
                         if let Some(b) = key_to_ascii(k.code, k.modifiers) {
-                            buf[written] = b;
-                            written += 1;
+                            // Signal-shaped control char check.
+                            let consumed = if signal_hook != 0 {
+                                // SAFETY: hook ptr installed at boot; signature
+                                // matches `fn(u8) -> bool`.
+                                let hook: fn(u8) -> bool =
+                                    unsafe { core::mem::transmute(signal_hook) };
+                                hook(b)
+                            } else {
+                                false
+                            };
+                            if !consumed {
+                                buf[written] = b;
+                                written += 1;
+                            }
                         }
                     }
                     produced = true;
@@ -249,8 +287,17 @@ impl FileOps for DevConsole {
             // Drain one AsciiByte if present.
             if written < buf.len() {
                 if let Some(b) = narf_input::pop_ascii_byte() {
-                    buf[written] = b;
-                    written += 1;
+                    let consumed = if signal_hook != 0 {
+                        let hook: fn(u8) -> bool =
+                            unsafe { core::mem::transmute(signal_hook) };
+                        hook(b)
+                    } else {
+                        false
+                    };
+                    if !consumed {
+                        buf[written] = b;
+                        written += 1;
+                    }
                     produced = true;
                 }
             }

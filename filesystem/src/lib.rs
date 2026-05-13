@@ -66,7 +66,7 @@ pub mod memfs;
 pub mod page_cache;
 
 mod tests;
-pub use devfs::{mount_default as mount_devfs_default, DevFs};
+pub use devfs::{install_console_signal_hook, mount_default as mount_devfs_default, DevFs};
 pub use fuse::{
     FuseInHeader, FuseInitFlag, FuseInitIn, FuseInitOut, FuseOpcode, FuseOutHeader,
     FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION,

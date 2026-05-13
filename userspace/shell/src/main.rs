@@ -43,6 +43,33 @@ fn make_sockaddr_un(buf: &mut [u8; 110], path: &[u8]) -> u32 {
     (2 + n) as u32
 }
 
+fn termtest_run(fd: i32) {
+    let mut t1 = libc::termios::default();
+    let r = unsafe { libc::tcgetattr(0, &mut t1) };
+    if r != 0 {
+        unsafe { write_all(fd, b"termtest: tcgetattr failed\n"); }
+        return;
+    }
+    let orig_lflag = t1.c_lflag;
+    // Flip ECHO (bit 0x8) to verify round-trip.
+    t1.c_lflag = orig_lflag ^ 0x8;
+    let r = unsafe { libc::tcsetattr(0, 0, &t1) };
+    if r != 0 {
+        unsafe { write_all(fd, b"termtest: tcsetattr failed\n"); }
+        return;
+    }
+    let mut t2 = libc::termios::default();
+    let _ = unsafe { libc::tcgetattr(0, &mut t2) };
+    if t2.c_lflag != orig_lflag ^ 0x8 {
+        unsafe { write_all(fd, b"termtest: c_lflag round-trip mismatch\n"); }
+        return;
+    }
+    // Restore.
+    t1.c_lflag = orig_lflag;
+    let _ = unsafe { libc::tcsetattr(0, 0, &t1) };
+    unsafe { write_all(fd, b"termtest: ok (tcgetattr/tcsetattr round-trip)\n"); }
+}
+
 // Globals for condwait. The cond + mutex are static so the worker
 // extern "C" fn can address them without a per-thread arg.
 static mut CONDWAIT_MTX: libc::pthread_mutex_t = libc::pthread_mutex_t {
@@ -489,6 +516,13 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
             write_all(fd, s);
             write_all(fd, NEWLINE);
         }
+    } else if cmd == b"termtest" {
+        // termtest — exercise tcgetattr / tcsetattr round-trip:
+        //   1. tcgetattr(stdin) → snapshot
+        //   2. flip a flag, tcsetattr → write back
+        //   3. tcgetattr again → confirm flag persists
+        //   4. restore original
+        termtest_run(fd);
     } else if cmd == b"condwait" {
         // condwait — spawn 4 threads that cond_wait on a shared
         // condvar; main sleeps 50ms then broadcasts; all threads

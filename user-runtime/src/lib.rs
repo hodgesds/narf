@@ -1350,6 +1350,16 @@ pub unsafe fn syscall0_raw(num: u64) -> u64 {
     unsafe { syscall0(num) }
 }
 
+#[inline]
+pub unsafe fn syscall2_raw(num: u64, a0: u64, a1: u64) -> u64 {
+    unsafe { syscall2(num, a0, a1) }
+}
+
+#[inline]
+pub unsafe fn syscall3_raw(num: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+    unsafe { syscall3(num, a0, a1, a2) }
+}
+
 pub const SYS_SIGRETURN: u64 = 187;
 
 pub const SYS_SOCKET: u64 = 197;

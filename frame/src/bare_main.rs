@@ -2272,6 +2272,12 @@ fn boot_userspace_init() {
     sigaction_init();
     signal_init();
     narf_userspace::fd::init();
+    // Wire ^C / ^\ / ^Z input-byte handling into the console
+    // driver so they deliver SIGINT/SIGQUIT/SIGTSTP to the
+    // foreground task instead of bubbling up as ASCII bytes.
+    narf_filesystem::install_console_signal_hook(
+        narf_userspace::handlers::maybe_deliver_signal_for_input,
+    );
 
     // Syscall table.
     let mut t = SyscallTable::new();
