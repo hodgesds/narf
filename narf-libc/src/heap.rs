@@ -88,15 +88,86 @@ fn page_round_up(n: usize) -> usize {
     (n + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
 }
 
-/// Push `chunk` onto the free list. Caller owns `chunk` and must
+/// Push `chunk` onto the free list AND attempt forward / backward
+/// coalescing with adjacent free chunks so long-running churn
+/// doesn't fragment the free list. Caller owns `chunk` and must
 /// have already written `chunk.size`; we set `chunk.next` here.
+///
+/// Coalescing strategy: walk the existing free list once. For each
+/// candidate `c`:
+///   - if `c` is immediately after `chunk` (chunk + chunk.size == c)
+///     unlink `c` and grow `chunk.size` by `c.size` (forward merge).
+///   - if `chunk` is immediately after `c` (c + c.size == chunk)
+///     drop `chunk` into `c` by growing `c.size` and re-using `c`'s
+///     existing list slot (backward merge).
+/// At most one match in either direction per push since the free
+/// list is sorted by no particular order — the next call's pass
+/// catches multi-step chains. O(n) per free; acceptable for narf-
+/// libc's typical free-list depth (small).
 ///
 /// # Safety
 /// `chunk` must point to a valid `Chunk` header with `size`
 /// initialised. The chunk must not already be on the free list.
 unsafe fn push_free(chunk: *mut Chunk) {
-    // Single-threaded today: load → write next → store. The CAS
-    // loop is cheap insurance for a future MT runtime.
+    // SAFETY: invariant — chunk.size was set by caller.
+    let chunk_size = unsafe { (*chunk).size };
+    let chunk_end = (chunk as usize).wrapping_add(chunk_size);
+
+    // First pass: scan for adjacent neighbours and coalesce in
+    // place.
+    let mut prev: *mut Chunk = ptr::null_mut();
+    let mut cur = FREE_LIST.load(Ordering::Acquire);
+    while !cur.is_null() {
+        // SAFETY: list invariant.
+        let cur_size = unsafe { (*cur).size };
+        // SAFETY: same.
+        let cur_next = unsafe { (*cur).next };
+        let cur_end = (cur as usize).wrapping_add(cur_size);
+
+        if cur as usize == chunk_end {
+            // Forward merge: cur sits immediately after chunk.
+            // Unlink cur from the list, grow chunk by cur.size.
+            if prev.is_null() {
+                FREE_LIST.store(cur_next, Ordering::Release);
+            } else {
+                // SAFETY: prev was deref'd already.
+                unsafe { (*prev).next = cur_next; }
+            }
+            // SAFETY: chunk is caller-owned.
+            unsafe { (*chunk).size = chunk_size + cur_size; }
+            // Restart the scan since chunk grew and might now
+            // coalesce with another neighbour.
+            return unsafe { push_free(chunk) };
+        }
+
+        if chunk as usize == cur_end {
+            // Backward merge: chunk sits immediately after cur.
+            // Grow cur by chunk.size — chunk's storage becomes
+            // part of cur, no list mutation needed since cur is
+            // already on the list.
+            // SAFETY: cur was deref'd already.
+            unsafe { (*cur).size = cur_size + chunk_size; }
+            // Re-run push for the (now grown) cur to catch a
+            // second-step forward merge with a neighbour just
+            // after the original chunk.
+            // Detach cur first so push_free below sees a fresh
+            // chunk to slot back in.
+            if prev.is_null() {
+                FREE_LIST.store(cur_next, Ordering::Release);
+            } else {
+                // SAFETY: prev was deref'd already.
+                unsafe { (*prev).next = cur_next; }
+            }
+            return unsafe { push_free(cur) };
+        }
+
+        prev = cur;
+        cur = cur_next;
+    }
+
+    // No coalescing match — push `chunk` onto the head as before.
+    // Single-threaded: load → write next → store. The CAS loop is
+    // cheap insurance for a future MT runtime.
     loop {
         let head = FREE_LIST.load(Ordering::Acquire);
         // SAFETY: `chunk` is caller-owned; writing `next` is fine.
