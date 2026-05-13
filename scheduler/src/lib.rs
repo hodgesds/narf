@@ -465,6 +465,36 @@ pub fn address_space_of(id: TaskId) -> Option<Arc<AddressSpace>> {
     None
 }
 
+/// Replace the address space attached to `id`. Returns the
+/// previous Arc so the caller can decide what to do with it
+/// (e.g. drop immediately to free the old AS's frames + page-
+/// table pages, or hold it briefly to continue running on the
+/// old AS until the trap-return swap takes effect).
+///
+/// Used by `execve` to swap the current task's AS to the freshly-
+/// loaded program AS without re-spawning the task — the task id,
+/// its place in the ready queue, and any in-flight syscall
+/// bookkeeping (fd table, brk, sigaction handlers) all stay
+/// keyed to the same id.
+///
+/// Returns None if no slot with that id is on any ready queue.
+pub fn replace_address_space(
+    id: TaskId,
+    new_arc: Arc<AddressSpace>,
+) -> Option<Arc<AddressSpace>> {
+    for q in READY.iter() {
+        let mut g = q.lock();
+        if let Some(ref mut dq) = *g {
+            if let Some(slot) = dq.iter_mut().find(|s| s.id == id) {
+                let prev = slot.addr_space.take();
+                slot.addr_space = Some(new_arc);
+                return prev;
+            }
+        }
+    }
+    None
+}
+
 /// Errors `donate_to` can return.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DonateError {

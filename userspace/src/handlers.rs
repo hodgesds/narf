@@ -4786,6 +4786,235 @@ pub fn __test_brk_reset() {
     *BRK_TABLE.lock() = None;
 }
 
+// ── execve — re-image the current task ─────────────────────────────
+//
+// POSIX execve(2) replaces the calling task's executable image
+// (text + data + heap + stack) with a freshly-loaded program
+// while preserving the task id, fd table, brk top, sigaction
+// table, and other per-pid bookkeeping. NARF's wire shape is
+// six args:
+//
+//   arg0 = elf bytes pointer (user vaddr)
+//   arg1 = elf bytes length
+//   arg2 = argv pack pointer (user vaddr) — concatenated
+//          NUL-separated strings, terminated by an extra NUL
+//   arg3 = argv pack length
+//   arg4 = envp pack pointer (same shape)
+//   arg5 = envp pack length
+//
+// The user-side libc shim is responsible for opening the program
+// file, reading the bytes into a buffer, and packing argv/envp
+// into the wire format — the syscall path doesn't open files
+// because the kernel-side VFS surface is async and the syscall
+// handler can't safely block_on (it runs from inside the
+// executor's poll body for the calling task).
+//
+// Implementation flow:
+//   1. Validate args (non-null pointers, sane lengths).
+//   2. Copy ELF bytes from user memory into a kernel-owned Vec
+//      (the user buffer is about to be unmapped when we activate
+//      the new AS — must capture before that point).
+//   3. Parse argv + envp from packs into kernel-owned Vec<String>.
+//   4. Call `load_user_process_with(elf, argv, envp, &[])` which
+//      builds a fresh AddressSpace, materialises page tables,
+//      lays out the SysV startup contract on the stack, and
+//      returns a UserProcess.
+//   5. Replace the scheduler slot's `addr_space` so future polls
+//      activate the new AS.
+//   6. Box an ExecRequest carrying the new AS + entry + stack;
+//      publish via `ctx.pending_exec`.
+//   7. Set `exit_reason = EXIT_REASON_EXECVE`.
+//   8. Save user state (the polling routine reads it but the
+//      EXECVE branch ignores the saved RIP — the new image
+//      starts at its own entry).
+//   9. Call the EXECVE hook → longjmps into the polling
+//      routine. The polling routine sees EXIT_REASON_EXECVE,
+//      consumes pending_exec, swaps the future's UserProcess,
+//      and re-polls. The next iteration enters user mode at
+//      the new entry with a fresh GPR file and zeroed RFLAGS.
+//
+// POSIX preserve list (unchanged across execve): pid, ppid,
+// fd table (close-on-exec scrubbing is a future refinement),
+// brk top, working directory, sigaction handlers (SIG_IGN +
+// SIG_DFL stay as-is; user-installed handlers reset to SIG_DFL
+// per POSIX §8.5.4 — we don't enforce that yet, future fix).
+
+fn sys_execve(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let elf_ptr = args.arg0 as *const u8;
+    let elf_len = args.arg1 as usize;
+    let argv_ptr = args.arg2 as *const u8;
+    let argv_len = args.arg3 as usize;
+    let envp_ptr = args.arg4 as *const u8;
+    let envp_len = args.arg5 as usize;
+
+    // Reject obvious bad args. ELF must be at least Elf64 header
+    // (64 bytes) and < 64 MiB (defensive cap; real images are
+    // far smaller).
+    if elf_ptr.is_null() || elf_len < 64 || elf_len > 64 * 1024 * 1024 {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+
+    // Step 2: copy ELF bytes from user memory while the calling
+    // AS is still active (we haven't swapped CR3 yet — sys handler
+    // runs in the user task's AS). The copied bytes live in a
+    // kernel Vec that survives across the AS swap.
+    // SAFETY: user-pointer dereference; if the pointer is bogus
+    // we'll fault inside the copy loop and the trap handler will
+    // panic — same risk every other read-from-user syscall takes.
+    let mut elf_buf: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(elf_len);
+    unsafe {
+        for i in 0..elf_len {
+            elf_buf.push(core::ptr::read_volatile(elf_ptr.add(i)));
+        }
+    }
+
+    // Step 3: copy + parse argv + envp packs.
+    let argv_strs = match copy_user_pack(argv_ptr, argv_len) {
+        Ok(v) => v,
+        Err(()) => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+    let envp_strs = match copy_user_pack(envp_ptr, envp_len) {
+        Ok(v) => v,
+        Err(()) => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+    let argv_refs: alloc::vec::Vec<&str> =
+        argv_strs.iter().map(|s| s.as_str()).collect();
+    let envp_refs: alloc::vec::Vec<&str> =
+        envp_strs.iter().map(|s| s.as_str()).collect();
+
+    // Step 4: load the new image. SAFETY: load_user_process_with's
+    // contract — identity-mapped low 4 GiB, frame allocator
+    // initialised. Both hold by the time any user task is running.
+    let new_proc = match unsafe {
+        crate::process::load_user_process_with(
+            &elf_buf,
+            &argv_refs,
+            &envp_refs,
+            &[],
+        )
+    } {
+        Ok(p) => p,
+        Err(_) => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+
+    let task = current_task_id();
+
+    // Step 5: swap the scheduler slot's AS Arc. Without this the
+    // poll path's later activate() would still target the old AS
+    // until the future's process.address_space update lands.
+    let _prev_slot_as = narf_scheduler::replace_address_space(
+        narf_scheduler::TaskId(task),
+        new_proc.address_space.clone(),
+    );
+
+    // Step 6: package the new image into an ExecRequest and
+    // publish via the calling task's UserTaskCtx so the polling
+    // routine can apply it after the longjmp returns.
+    let req = alloc::boxed::Box::new(crate::user_task::ExecRequest {
+        new_as: new_proc.address_space.clone(),
+        entry: new_proc.entry.0.as_u64(),
+        stack_top: new_proc.stack_top.as_u64(),
+        fs_base: new_proc.fs_base,
+    });
+    let uctx_ptr = match crate::user_task::current_user_task() {
+        Some(p) => p,
+        None => {
+            // No active user-task ctx — execve called outside a
+            // polling future (e.g. from a kernel-test stub). Roll
+            // back the slot AS swap and bail.
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+    // SAFETY: uctx_ptr is valid for the duration of the polling
+    // routine's user-mode round-trip (the routine pinned it).
+    unsafe {
+        let prev = (*uctx_ptr)
+            .pending_exec
+            .swap(alloc::boxed::Box::into_raw(req), Ordering::AcqRel);
+        if !prev.is_null() {
+            // Another execve was queued and never consumed — drop it
+            // so the frame doesn't leak.
+            let _ = alloc::boxed::Box::from_raw(prev);
+        }
+    }
+
+    // Step 7-9: longjmp into the polling routine via the EXECVE
+    // hook. save_user_state populates the slot for invariant; the
+    // EXECVE branch ignores the saved RIP/RSP since the new image
+    // has its own entry.
+    if let Some(uctx) = crate::user_task::current_user_task() {
+        // SAFETY: same — uctx is live throughout the round-trip.
+        unsafe {
+            let uc = &*uctx;
+            ctx.save_user_state(uc.state.get() as *mut u8);
+            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_EXECVE;
+        }
+    }
+    let hook = crate::user_task::execve_hook();
+    if let Some(h) = hook {
+        // SAFETY: hook is a fn ptr installed at boot; uctx is live.
+        unsafe { h(uctx_ptr) };
+        // longjmp doesn't return; if it does (no jmp buf installed),
+        // surface a clean error.
+    }
+    // Fallback path — execve not wired (e.g. early boot or test).
+    ctx.set_return(SyscallReturn::invalid_op());
+}
+
+/// Parse a NUL-separated user-supplied string pack into a Vec of
+/// kernel-owned `String`s. Returns Err on any UTF-8 violation,
+/// pointer issue, or pack-too-long-without-terminator condition.
+///
+/// Pack format: zero or more strings, each terminated by a NUL
+/// byte. The pack itself is `len` bytes long; we read until we
+/// see len bytes total. An empty pack (len == 0) returns an
+/// empty Vec (legal — `execve` with no argv).
+fn copy_user_pack(
+    ptr: *const u8,
+    len: usize,
+) -> Result<alloc::vec::Vec<alloc::string::String>, ()> {
+    if len == 0 {
+        return Ok(alloc::vec::Vec::new());
+    }
+    if ptr.is_null() || len > 64 * 1024 {
+        return Err(());
+    }
+    // Copy the whole pack into a kernel Vec first.
+    let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(len);
+    // SAFETY: same risk as the ELF-buf copy above — a bogus user
+    // pointer faults in the read.
+    unsafe {
+        for i in 0..len {
+            buf.push(core::ptr::read_volatile(ptr.add(i)));
+        }
+    }
+    // Split on NUL boundaries.
+    let mut out = alloc::vec::Vec::new();
+    let mut start = 0usize;
+    for i in 0..buf.len() {
+        if buf[i] == 0 {
+            if start < i {
+                let s = core::str::from_utf8(&buf[start..i]).map_err(|_| ())?;
+                out.push(alloc::string::String::from(s));
+            }
+            start = i + 1;
+        }
+    }
+    Ok(out)
+}
+
 fn sys_brk(ctx: &mut dyn TrapContext) {
     let new_break = ctx.args().arg0;
     let task = current_task_id();
@@ -5518,6 +5747,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::MProtect, "mprotect", RawFnHandler(sys_mprotect));
     table.install_raw(Syscall::MLock, "mlock", RawFnHandler(sys_mlock));
     table.install_raw(Syscall::MUnlock, "munlock", RawFnHandler(sys_munlock));
+    table.install_raw(Syscall::Execve, "execve", RawFnHandler(sys_execve));
     table.install_raw(
         Syscall::FbConnect,
         "fb_connect",

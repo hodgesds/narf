@@ -70,6 +70,7 @@ pub const SYS_MUNMAP: u64 = 121;
 pub const SYS_MPROTECT: u64 = 172;
 pub const SYS_MLOCK: u64 = 173;
 pub const SYS_MUNLOCK: u64 = 174;
+pub const SYS_EXECVE: u64 = 179;
 pub const SYS_FB_CONNECT: u64 = 240;
 pub const SYS_FB_INFO: u64 = 241;
 pub const SYS_FB_RING_MAP: u64 = 242;
@@ -1102,6 +1103,50 @@ pub unsafe fn munmap(addr: *mut u8) -> Result<(), ()> {
 pub unsafe fn mprotect(addr: *mut u8, len: usize, prot: i32) -> Result<(), ()> {
     // SAFETY: SYS_MPROTECT signature: arg0 base, arg1 len, arg2 prot.
     let r = unsafe { syscall3(SYS_MPROTECT, addr as u64, len as u64, prot as u64) };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+/// Re-image the calling task with `elf_bytes`. argv/envp are
+/// supplied as concatenated NUL-separated string packs (each
+/// string ends with a NUL; the whole pack is `*_len` bytes).
+/// Empty packs (len=0, ptr=null) are legal.
+///
+/// This call does NOT return on success — control resumes at the
+/// new image's entry point with a fresh GPR file. Returns
+/// `Err(())` on argument validation / ELF parse failure / OOM
+/// (in which case the calling task continues running its old
+/// image and observes the error).
+///
+/// # Safety
+/// `elf_bytes` and the argv/envp packs must reference live,
+/// readable bytes in the calling task's address space for the
+/// duration of the call.
+#[inline]
+pub unsafe fn execve(
+    elf_bytes: *const u8,
+    elf_len: usize,
+    argv_pack: *const u8,
+    argv_len: usize,
+    envp_pack: *const u8,
+    envp_len: usize,
+) -> Result<(), ()> {
+    // SAFETY: SYS_EXECVE 6-arg signature; the new-image side never
+    // returns through here.
+    let r = unsafe {
+        syscall6(
+            SYS_EXECVE,
+            elf_bytes as u64,
+            elf_len as u64,
+            argv_pack as u64,
+            argv_len as u64,
+            envp_pack as u64,
+            envp_len as u64,
+        )
+    };
     if r == 0 {
         Ok(())
     } else {

@@ -94,6 +94,20 @@ pub trait TrapContext {
     fn returning_to_user(&self) -> bool {
         false
     }
+
+    /// Rewrite the trap frame so the upcoming return lands in
+    /// user mode at `entry_rip` with stack `entry_rsp`. Used by
+    /// `execve` to discard the post-syscall continuation in the
+    /// caller's old image and resume in the freshly-loaded
+    /// program. Sets CS=UCODE, SS=UDATA, RFLAGS to a clean user-
+    /// mode value (interrupts enabled, no flags set), and zeros
+    /// the GPR file so the new program doesn't observe stale
+    /// register values from the caller. Returns `true` when the
+    /// arch supports the rewrite (x86_64 today); `false`
+    /// elsewhere.
+    fn redirect_to_user(&mut self, _entry_rip: u64, _entry_rsp: u64) -> bool {
+        false
+    }
 }
 
 // ── Numbers ─────────────────────────────────────────────────────────
@@ -354,6 +368,23 @@ pub enum Syscall {
     /// addr, arg1 = length in bytes. Ok(0) on success, InvalidOp
     /// on no-region.
     MUnlock = 174,
+
+    /// `execve(elf_buf, elf_len, argv_pack, argv_len, envp_pack,
+    /// envp_len)` — re-image the calling task with a freshly-
+    /// loaded program while preserving pid / fd table / brk top /
+    /// signal handlers. The user-side libc shim opens the program
+    /// file, reads bytes into a buffer, packs argv/envp into
+    /// concatenated NUL-separated strings, and issues this
+    /// syscall. The kernel-side handler copies the buffers into
+    /// kernel memory, parses the ELF, builds a new AddressSpace +
+    /// stack via `process::load_user_process_with`, and longjmps
+    /// the polling routine via the EXECVE hook so the future's
+    /// UserProcess gets swapped to the new image.
+    ///
+    /// Doesn't return on success — the next user-mode resume
+    /// lands at the new image's entry. Returns InvalidOp on bad
+    /// args, ELF parse failure, or out-of-task-context call.
+    Execve = 179,
 
     /// Open an FB connection to a scanout. `arg0` = scanout id (0
     /// for the active scanout). Returns a non-zero `FbHandleId` on
@@ -926,6 +957,7 @@ impl Syscall {
             172 => Syscall::MProtect,
             173 => Syscall::MLock,
             174 => Syscall::MUnlock,
+            179 => Syscall::Execve,
             130 => Syscall::RingKick,
             140 => Syscall::GetPid,
             141 => Syscall::GetPpid,

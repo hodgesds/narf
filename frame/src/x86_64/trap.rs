@@ -397,6 +397,49 @@ impl<'a> TrapContext for X86TrapContext<'a> {
         true
     }
 
+    fn redirect_to_user(&mut self, entry_rip: u64, entry_rsp: u64) -> bool {
+        // Rewrite the trap frame so the upcoming iretq lands in
+        // user mode at the freshly-loaded program's entry. Used
+        // by execve to discard the caller's post-syscall
+        // continuation (the old image's text is about to be
+        // unmapped) and resume execution in the new image.
+        //
+        // Selectors: UCODE/UDATA carry RPL=3 so iretq enters CPL=3.
+        //
+        // RFLAGS: 0x202 = IF (interrupts enabled) + reserved bit
+        // 1 (always 1 per Intel SDM Vol 1 §3.4.3). Discards any
+        // user-controllable flag state from the caller — the new
+        // program starts with a clean flag word.
+        //
+        // GPRs: zeroed — POSIX execve says the new image observes
+        // unspecified register values; zeroing is the most
+        // defensible "no information leak from caller" choice.
+        // The crt0 / _start prologue reads argv/envp from rsp,
+        // not from registers, so no useful information is lost.
+        self.frame.rip = entry_rip;
+        self.frame.cs = super::gdt::UCODE_SEL as u64;
+        self.frame.rsp = entry_rsp;
+        self.frame.ss = super::gdt::UDATA_SEL as u64;
+        self.frame.rflags = 0x202;
+        // Zero GPRs.
+        self.frame.rax = 0;
+        self.frame.rbx = 0;
+        self.frame.rcx = 0;
+        self.frame.rdx = 0;
+        self.frame.rsi = 0;
+        self.frame.rdi = 0;
+        self.frame.rbp = 0;
+        self.frame.r8 = 0;
+        self.frame.r9 = 0;
+        self.frame.r10 = 0;
+        self.frame.r11 = 0;
+        self.frame.r12 = 0;
+        self.frame.r13 = 0;
+        self.frame.r14 = 0;
+        self.frame.r15 = 0;
+        true
+    }
+
     unsafe fn save_user_state(&self, out: *mut u8) -> bool {
         use super::user::UserState;
         // SAFETY: caller declared `out` is writable for at least

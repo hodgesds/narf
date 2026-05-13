@@ -93,6 +93,13 @@ pub struct UserTaskCtx {
     /// might briefly share visibility across cores — keeps the
     /// same shape.
     pub sleep_deadline_ns: AtomicU64,
+    /// Set non-null by `sys_execve` to hand a freshly-built
+    /// `ExecRequest` to the polling routine. The routine takes
+    /// ownership via `Box::from_raw` after the EXECVE longjmp
+    /// returns and uses it to swap the future's `process.address_
+    /// space` / `entry` / `stack_top` for the new image's values.
+    /// Reset to null on consumption.
+    pub pending_exec: AtomicPtr<ExecRequest>,
 }
 
 // SAFETY: cells are accessed only from the polling routine and
@@ -110,6 +117,7 @@ impl UserTaskCtx {
             arch_jmp_buf: UnsafeCell::new([0; 8]),
             exit_reason: UnsafeCell::new(0),
             sleep_deadline_ns: AtomicU64::new(0),
+            pending_exec: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
 }
@@ -125,6 +133,30 @@ impl core::fmt::Debug for UserTaskCtx {
 // stale slot can't masquerade as a real exit.
 pub const EXIT_REASON_YIELDED: u32 = 1;
 pub const EXIT_REASON_EXITED: u32 = 2;
+/// Set by `sys_execve` when the calling task is about to be
+/// re-imaged with a freshly-loaded program. The polling routine
+/// reads `pending_exec`, swaps `process.address_space` /
+/// `process.entry` / `process.stack_top` to the new image's
+/// values, transitions back to `TaskState::Initial`, and re-
+/// enters user mode at the new entry point. The task's id, fd
+/// table, brk top, signal handler table, and per-pid bookkeeping
+/// are all preserved (POSIX execve(2)).
+pub const EXIT_REASON_EXECVE: u32 = 3;
+
+/// Body of an `execve` request handed from the syscall handler
+/// to the polling routine. Heap-allocated and stored in
+/// `UserTaskCtx::pending_exec` as a raw pointer; the polling
+/// routine takes ownership via `Box::from_raw` after the longjmp
+/// returns. Owns its own `Arc<AddressSpace>` so the new AS
+/// stays alive across the brief window between syscall handler
+/// completion and polling-routine swap.
+#[derive(Debug)]
+pub struct ExecRequest {
+    pub new_as: alloc::sync::Arc<narf_memory::AddressSpace>,
+    pub entry: u64,
+    pub stack_top: u64,
+    pub fs_base: Option<u64>,
+}
 
 /// Single-task slot the polling routine populates before transitioning
 /// to user mode. Trap handlers consult this to find the calling
@@ -176,6 +208,7 @@ type ExitHook = unsafe fn(*mut UserTaskCtx) -> !;
 
 static YIELD_HOOK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 static EXIT_HOOK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+static EXECVE_HOOK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Install the `Yield`-from-user-mode hook. Call once at boot per
 /// CPU's polling executor.
@@ -186,6 +219,14 @@ pub fn install_yield_hook(hook: ExitHook) {
 /// Install the `ExitTask`-from-user-mode hook.
 pub fn install_exit_hook(hook: ExitHook) {
     EXIT_HOOK.store(hook as *mut (), Ordering::Release);
+}
+
+/// Install the `Execve`-from-user-mode hook. Same shape as the
+/// other hooks; longjmps the polling routine with
+/// `EXIT_REASON_EXECVE` after the syscall handler has published
+/// the new image's `ExecRequest` into `ctx.pending_exec`.
+pub fn install_execve_hook(hook: ExitHook) {
+    EXECVE_HOOK.store(hook as *mut (), Ordering::Release);
 }
 
 // ── Process-exit observers ────────────────────────────────────────
@@ -249,6 +290,16 @@ pub(crate) fn yield_hook() -> Option<ExitHook> {
 #[inline]
 pub(crate) fn exit_hook() -> Option<ExitHook> {
     let p = EXIT_HOOK.load(Ordering::Acquire);
+    if p.is_null() {
+        None
+    } else {
+        Some(unsafe { core::mem::transmute::<*mut (), ExitHook>(p) })
+    }
+}
+
+#[inline]
+pub fn execve_hook() -> Option<ExitHook> {
+    let p = EXECVE_HOOK.load(Ordering::Acquire);
     if p.is_null() {
         None
     } else {
@@ -333,6 +384,23 @@ unsafe fn user_task_exit_hook(_uctx: *mut UserTaskCtx) -> ! {
     unsafe { narf_scheduler::longjmp(p as *const _, EXIT_REASON_EXITED as u64) }
 }
 
+/// Longjmp helper used by `sys_execve`: signals the polling
+/// routine that the task is being re-imaged. The handler has
+/// already published the new image's `ExecRequest` into
+/// `ctx.pending_exec`; the polling routine reads it after
+/// setjmp returns and swaps `process.address_space` /
+/// `process.entry` / `process.stack_top` accordingly.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn user_task_execve_hook(_uctx: *mut UserTaskCtx) -> ! {
+    let p = CURRENT_JMP.load(Ordering::Acquire);
+    if p.is_null() {
+        narf_scheduler::halt_forever();
+    }
+    // SAFETY: see exit_hook — CURRENT_JMP points at a live
+    // JmpBuf for the duration of the user-mode round-trip.
+    unsafe { narf_scheduler::longjmp(p as *const _, EXIT_REASON_EXECVE as u64) }
+}
+
 /// Wire the static yield + exit hooks into the syscall handlers'
 /// hook slots. Idempotent — safe to call once at boot or on every
 /// test setup; subsequent calls just re-store the same fn ptrs.
@@ -345,6 +413,7 @@ unsafe fn user_task_exit_hook(_uctx: *mut UserTaskCtx) -> ! {
 pub fn install_user_task_hooks() {
     install_yield_hook(user_task_yield_hook);
     install_exit_hook(user_task_exit_hook);
+    install_execve_hook(user_task_execve_hook);
 }
 
 /// Polling future that drives a user-mode process to completion via
@@ -626,6 +695,39 @@ impl core::future::Future for UserTaskFuture {
             notify_task_exited(this.process.pid.raw());
             this.state = TaskState::Exited;
             core::task::Poll::Ready(())
+        } else if reason == EXIT_REASON_EXECVE {
+            // sys_execve handed us a pre-built ExecRequest: swap
+            // the future's UserProcess to point at the new image's
+            // AS / entry / stack, transition back to Initial so
+            // the next iteration of the polling routine enters
+            // user mode at the new entry, and immediately re-poll.
+            // POSIX execve(2) preserves the task's PID, fd table,
+            // brk top, and signal handler table — those live in
+            // crate-side tables keyed by pid, untouched here.
+            let req_ptr = this.ctx.pending_exec.swap(
+                core::ptr::null_mut(),
+                Ordering::AcqRel,
+            );
+            if !req_ptr.is_null() {
+                // SAFETY: the syscall handler allocated this with
+                // `Box::into_raw(Box::new(ExecRequest{..}))` and
+                // published the pointer into `pending_exec` before
+                // longjmp'ing here; we're the sole consumer.
+                let req = unsafe { alloc::boxed::Box::from_raw(req_ptr) };
+                this.process.address_space = req.new_as;
+                this.process.entry = crate::EntryPoint(
+                    narf_memory::VirtAddr::new(req.entry),
+                );
+                this.process.stack_top =
+                    narf_memory::VirtAddr::new(req.stack_top);
+                this.process.fs_base = req.fs_base;
+                this.state = TaskState::Initial;
+            }
+            // Repoll — the next iteration runs the Initial-state
+            // path which calls activate() on the new AS and
+            // enter_user_mode at the new entry.
+            cx.waker().wake_by_ref();
+            core::task::Poll::Pending
         } else {
             // EXIT_REASON_YIELDED or any unknown reason — repoll.
             // Wake immediately so the executor visits us again on
