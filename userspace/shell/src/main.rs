@@ -133,7 +133,49 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
     }
     if cmd == b"help" {
         unsafe {
-            write_all(fd, b"commands: help echo uname pid exit\n");
+            write_all(fd, b"commands: help echo uname pid exec exit\n");
+        }
+    } else if cmd == b"exec" {
+        // exec <path> — POSIX-style replace-current-task with the
+        // ELF at <path>. Argv passed: ["<path>"] (basename
+        // convention is left to the caller's path). Envp empty.
+        // On success this call NEVER returns — we never get to
+        // print "unknown command" or anything else.
+        let path = skip_ws(rest);
+        // Also trim trailing whitespace + control chars.
+        let path: &[u8] = {
+            let mut end = path.len();
+            while end > 0 && (path[end - 1] == b' ' || path[end - 1] < 0x20) {
+                end -= 1;
+            }
+            &path[..end]
+        };
+        if path.is_empty() {
+            unsafe { write_all(fd, b"exec: missing path\n"); }
+        } else {
+            // Build a NUL-terminated path on the stack (cap at
+            // 256 bytes — anything longer is rejected as bad
+            // input).
+            let mut pbuf = [0u8; 256];
+            if path.len() >= pbuf.len() {
+                unsafe { write_all(fd, b"exec: path too long\n"); }
+            } else {
+                pbuf[..path.len()].copy_from_slice(path);
+                let argv0 = pbuf.as_ptr() as *const i8;
+                let argv: [*const i8; 2] = [argv0, core::ptr::null()];
+                let envp: [*const i8; 1] = [core::ptr::null()];
+                let rc = unsafe {
+                    libc::execve(argv0, argv.as_ptr(), envp.as_ptr())
+                };
+                // execve returns only on failure.
+                let mut buf = [0u8; 32];
+                let s = u32_to_decimal(rc as u32, &mut buf);
+                unsafe {
+                    write_all(fd, b"exec: failed (rc=");
+                    write_all(fd, s);
+                    write_all(fd, b")\n");
+                }
+            }
         }
     } else if cmd == b"echo" {
         unsafe {
