@@ -562,7 +562,7 @@ pub fn resolve_async<'a>(root: Arc<dyn DirOps>, path: &'a str) -> FsFuture<'a, A
 /// Path is stored as `&'static str` for Stage-3 simplicity — every
 /// mount in the harness today is mount-once-at-boot.
 pub struct Mount {
-    pub path: &'static str,
+    pub path: alloc::string::String,
     pub fs: Arc<dyn FsInstance>,
     pub handle: Cap<MountPoint, Write>,
 }
@@ -570,7 +570,7 @@ pub struct Mount {
 impl fmt::Debug for Mount {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Mount")
-            .field("path", &self.path)
+            .field("path", &self.path.as_str())
             .field("fs", &self.fs.name())
             .finish_non_exhaustive()
     }
@@ -610,7 +610,7 @@ impl VfsRegistry {
     pub fn mount<F: FsInstance>(
         &self,
         authority: &Cap<MountPoint, Grant>,
-        path: &'static str,
+        path: &str,
         fs: F,
     ) -> Result<Cap<MountPoint, Write>, FsError> {
         authority.check_live()?;
@@ -622,11 +622,44 @@ impl VfsRegistry {
         let handle: Cap<MountPoint, Write> = Cap::<MountPoint, Write>::bootstrap();
         let arc: Arc<dyn FsInstance> = Arc::new(fs);
         q.push(Mount {
-            path,
+            path: alloc::string::String::from(path),
             fs: arc,
             handle,
         });
         Ok(handle)
+    }
+
+    /// Mount with a pre-built `Arc<dyn FsInstance>`. Used by the
+    /// sys_mount path where the FS is constructed by a driver-side
+    /// helper that already returns an Arc.
+    pub fn mount_arc(
+        &self,
+        authority: &Cap<MountPoint, Grant>,
+        path: &str,
+        fs: Arc<dyn FsInstance>,
+    ) -> Result<Cap<MountPoint, Write>, FsError> {
+        authority.check_live()?;
+
+        let mut q = self.inner.lock();
+        if q.iter().any(|m| m.path == path) {
+            return Err(FsError::Busy);
+        }
+        let handle: Cap<MountPoint, Write> = Cap::<MountPoint, Write>::bootstrap();
+        q.push(Mount {
+            path: alloc::string::String::from(path),
+            fs,
+            handle,
+        });
+        Ok(handle)
+    }
+
+    /// List mount paths. Used by `/proc/mounts`-shaped surfaces and by
+    /// statfs when the caller wants to know what's where. Returns
+    /// owned Strings so the lock is released before the caller walks
+    /// the result.
+    pub fn list(&self) -> alloc::vec::Vec<alloc::string::String> {
+        let q = self.inner.lock();
+        q.iter().map(|m| m.path.clone()).collect()
     }
 
     /// Unmount the FS at `path`. The `handle` cap must be live and
@@ -691,7 +724,7 @@ impl VfsRegistry {
         for m in q.iter() {
             let is_match = abs == m.path
                 || m.path == "/"
-                || (abs.starts_with(m.path) && abs.as_bytes().get(m.path.len()) == Some(&b'/'));
+                || (abs.starts_with(m.path.as_str()) && abs.as_bytes().get(m.path.len()) == Some(&b'/'));
             if is_match {
                 if best.map(|b| b.path.len()).unwrap_or(0) < m.path.len() {
                     best = Some(m);
@@ -746,7 +779,7 @@ impl VfsRegistry {
         let mut best: Option<&Mount> = None;
         for m in q.iter() {
             if parent_path == m.path
-                || (parent_path.starts_with(m.path)
+                || (parent_path.starts_with(m.path.as_str())
                     && parent_path.as_bytes().get(m.path.len()) == Some(&b'/'))
             {
                 if best.map(|b| b.path.len()).unwrap_or(0) < m.path.len() {

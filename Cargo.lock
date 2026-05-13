@@ -1528,8 +1528,10 @@ name = "narf-userspace"
 version = "0.0.0"
 dependencies = [
  "narf-abi",
+ "narf-block",
  "narf-capabilities",
  "narf-console",
+ "narf-drivers-fs-fat",
  "narf-filesystem",
  "narf-firmware",
  "narf-kernel-test",

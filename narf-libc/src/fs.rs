@@ -151,3 +151,131 @@ pub unsafe extern "C" fn chmod(path: *const i8, mode: u32) -> i32 {
 pub unsafe extern "C" fn umask(mask: u32) -> u32 {
     narf_user_runtime::umask(mask)
 }
+
+// ── mount / umount / statvfs (POSIX-2017) ───────────────────────
+
+/// POSIX `<sys/statvfs.h>` `struct statvfs`. Layout matches the
+/// kernel's StatfsBuf so a libc client can read the bytes the
+/// kernel returns directly.
+#[repr(C)]
+#[derive(Default, Debug)]
+pub struct statvfs {
+    pub f_bsize: u64,
+    pub f_frsize: u64,
+    pub f_blocks: u64,
+    pub f_bfree: u64,
+    pub f_bavail: u64,
+    pub f_files: u64,
+    pub f_ffree: u64,
+    pub f_namemax: u64,
+}
+
+/// `mount(source, target, fstype, flags, data)` — Linux-style
+/// `mount(2)`. Forwards to the kernel SYS_MOUNT. `flags` and
+/// `data` are accepted for ABI compatibility but ignored today.
+///
+/// # Safety
+/// All three string arguments must be NUL-terminated C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mount(
+    source: *const i8,
+    target: *const i8,
+    fstype: *const i8,
+    _flags: u64,
+    _data: *const u8,
+) -> i32 {
+    if source.is_null() || target.is_null() || fstype.is_null() {
+        crate::errno::set_errno(crate::errno::EINVAL);
+        return -1;
+    }
+    // SAFETY: caller-asserted NUL-terminators.
+    let src = unsafe { crate::posix::cstr_to_str(source as *const _) };
+    let tgt = unsafe { crate::posix::cstr_to_str(target as *const _) };
+    let typ = unsafe { crate::posix::cstr_to_str(fstype as *const _) };
+    // SAFETY: forwarded with live &str.
+    match unsafe { narf_user_runtime::mount(src, tgt, typ) } {
+        Ok(()) => 0,
+        Err(()) => {
+            crate::errno::set_errno(crate::errno::EINVAL);
+            -1
+        }
+    }
+}
+
+/// `umount(target)` — POSIX-2017 single-arg unmount. Forwards
+/// to `umount2(target, 0)`.
+///
+/// # Safety
+/// `target` must be a NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn umount(target: *const i8) -> i32 {
+    // SAFETY: forwarded.
+    unsafe { umount2(target, 0) }
+}
+
+/// `umount2(target, flags)` — Linux-shaped umount with options.
+/// Today flags are accepted but not interpreted.
+///
+/// # Safety
+/// `target` must be a NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn umount2(target: *const i8, flags: u32) -> i32 {
+    if target.is_null() {
+        crate::errno::set_errno(crate::errno::EINVAL);
+        return -1;
+    }
+    // SAFETY: caller-asserted NUL-terminator.
+    let tgt = unsafe { crate::posix::cstr_to_str(target as *const _) };
+    // SAFETY: forwarded.
+    match unsafe { narf_user_runtime::umount2(tgt, flags) } {
+        Ok(()) => 0,
+        Err(()) => {
+            crate::errno::set_errno(crate::errno::EINVAL);
+            -1
+        }
+    }
+}
+
+/// `statvfs(path, &buf)` — POSIX-2017 statvfs. Fills `buf` with
+/// stats about the FS that covers `path`.
+///
+/// # Safety
+/// `path` must be a NUL-terminated C string; `buf` must be a
+/// writable `statvfs` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn statvfs(path: *const i8, buf: *mut statvfs) -> i32 {
+    if path.is_null() || buf.is_null() {
+        crate::errno::set_errno(crate::errno::EINVAL);
+        return -1;
+    }
+    // SAFETY: caller-asserted NUL-terminator.
+    let p = unsafe { crate::posix::cstr_to_str(path as *const _) };
+    // SAFETY: forwarded; buf is writable per caller contract.
+    match unsafe { narf_user_runtime::statfs(p, buf as *mut u8) } {
+        Ok(()) => 0,
+        Err(()) => {
+            crate::errno::set_errno(2 /* ENOENT */);
+            -1
+        }
+    }
+}
+
+/// `fstatvfs(fd, &buf)` — POSIX-2017 fstatvfs.
+///
+/// # Safety
+/// `buf` must be a writable `statvfs` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fstatvfs(fd: i32, buf: *mut statvfs) -> i32 {
+    if buf.is_null() || fd < 0 {
+        crate::errno::set_errno(crate::errno::EINVAL);
+        return -1;
+    }
+    // SAFETY: forwarded.
+    match unsafe { narf_user_runtime::fstatfs(fd as u32, buf as *mut u8) } {
+        Ok(()) => 0,
+        Err(()) => {
+            crate::errno::set_errno(9 /* EBADF */);
+            -1
+        }
+    }
+}

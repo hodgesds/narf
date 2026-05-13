@@ -397,6 +397,33 @@ pub enum Syscall {
     /// on no-children / timeout.
     Wait4 = 181,
 
+    /// `mount(source, target, fstype, flags, data)` — mount the
+    /// filesystem named by `fstype` (a packed string like "fat" or
+    /// "ext2") at the absolute path `target`, backed by the
+    /// block-device path `source`. arg0 = source ptr, arg1 = source
+    /// len, arg2 = target ptr, arg3 = target len, arg4 = packed
+    /// (fstype_ptr<<32 | fstype_len). flags + data passed via the
+    /// extended-args ABI. Returns 0 on success, !0u64 on failure
+    /// (POSIX -1 + errno path; libc maps to errno).
+    Mount = 182,
+
+    /// `umount2(target, flags)` — unmount the filesystem mounted at
+    /// the absolute path `target`. arg0 = target ptr, arg1 = target
+    /// len, arg2 = flags (currently ignored — POSIX MNT_FORCE et al.
+    /// land later). Returns 0 on success, !0u64 on failure.
+    Umount2 = 183,
+
+    /// `statfs(path, &buf)` — fill `buf` (struct statvfs-shaped) with
+    /// stats about the filesystem covering `path`. arg0 = path ptr,
+    /// arg1 = path len, arg2 = buf ptr (must point at a 64-byte
+    /// region in user memory). Returns 0 on success, !0u64 on
+    /// failure.
+    Statfs = 184,
+
+    /// `fstatfs(fd, &buf)` — same as `statfs` but addressed by an
+    /// open fd. arg0 = fd, arg1 = buf ptr. Returns 0 / !0u64.
+    Fstatfs = 185,
+
     /// Open an FB connection to a scanout. `arg0` = scanout id (0
     /// for the active scanout). Returns a non-zero `FbHandleId` on
     /// success, 0 on failure (no backend / OOM / not authorised).
@@ -970,6 +997,10 @@ impl Syscall {
             174 => Syscall::MUnlock,
             179 => Syscall::Execve,
             181 => Syscall::Wait4,
+            182 => Syscall::Mount,
+            183 => Syscall::Umount2,
+            184 => Syscall::Statfs,
+            185 => Syscall::Fstatfs,
             130 => Syscall::RingKick,
             140 => Syscall::GetPid,
             141 => Syscall::GetPpid,

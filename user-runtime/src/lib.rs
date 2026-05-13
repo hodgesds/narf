@@ -72,6 +72,10 @@ pub const SYS_MLOCK: u64 = 173;
 pub const SYS_MUNLOCK: u64 = 174;
 pub const SYS_EXECVE: u64 = 179;
 pub const SYS_WAIT4: u64 = 181;
+pub const SYS_MOUNT: u64 = 182;
+pub const SYS_UMOUNT2: u64 = 183;
+pub const SYS_STATFS: u64 = 184;
+pub const SYS_FSTATFS: u64 = 185;
 pub const SYS_FB_CONNECT: u64 = 240;
 pub const SYS_FB_INFO: u64 = 241;
 pub const SYS_FB_RING_MAP: u64 = 242;
@@ -1189,6 +1193,89 @@ pub unsafe fn execve(
     } else {
         Err(())
     }
+}
+
+/// `mount(source, target, fstype, flags, data)` — mount the
+/// filesystem named by `fstype` at the absolute path `target`,
+/// backed by the block-device named `source`. Returns `Ok(())`
+/// on success, `Err(())` on failure.
+///
+/// The kernel side (`Syscall::Mount = 182`) packs `fstype_ptr`
+/// and `fstype_len` into the upper / lower halves of arg4 to
+/// stay within the 5-arg syscall ABI.
+///
+/// # Safety
+/// The four string slices must point at live, valid UTF-8 for
+/// the duration of the call.
+#[inline]
+pub unsafe fn mount(source: &str, target: &str, fstype: &str) -> Result<(), ()> {
+    let packed_fstype =
+        ((fstype.as_ptr() as u64) << 32) | (fstype.len() as u64 & 0xFFFF_FFFF);
+    // SAFETY: SYS_MOUNT 5-arg signature.
+    let r = unsafe {
+        syscall5(
+            SYS_MOUNT,
+            source.as_ptr() as u64,
+            source.len() as u64,
+            target.as_ptr() as u64,
+            target.len() as u64,
+            packed_fstype,
+        )
+    };
+    if r == 0 { Ok(()) } else { Err(()) }
+}
+
+/// `umount2(target, flags)` — unmount the filesystem at `target`.
+/// Flags follow Linux's `umount2(2)` (today: ignored — MNT_FORCE /
+/// MNT_DETACH land later).
+///
+/// # Safety
+/// `target` must be live valid UTF-8 for the duration of the call.
+#[inline]
+pub unsafe fn umount2(target: &str, flags: u32) -> Result<(), ()> {
+    // SAFETY: SYS_UMOUNT2 3-arg signature.
+    let r = unsafe {
+        syscall3(
+            SYS_UMOUNT2,
+            target.as_ptr() as u64,
+            target.len() as u64,
+            flags as u64,
+        )
+    };
+    if r == 0 { Ok(()) } else { Err(()) }
+}
+
+/// `statfs(path, &buf)` — fill `buf` with stats about the FS
+/// covering `path`. `buf` must point at a 64-byte region (matches
+/// the kernel's StatfsBuf shape).
+///
+/// # Safety
+/// `path` must be live valid UTF-8 for the duration of the call;
+/// `buf` must be writable for at least 64 bytes.
+#[inline]
+pub unsafe fn statfs(path: &str, buf: *mut u8) -> Result<(), ()> {
+    // SAFETY: SYS_STATFS 3-arg signature.
+    let r = unsafe {
+        syscall3(
+            SYS_STATFS,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            buf as u64,
+        )
+    };
+    if r == 0 { Ok(()) } else { Err(()) }
+}
+
+/// `fstatfs(fd, &buf)` — same as `statfs` but addressed by an
+/// open file descriptor.
+///
+/// # Safety
+/// `buf` must be writable for at least 64 bytes.
+#[inline]
+pub unsafe fn fstatfs(fd: u32, buf: *mut u8) -> Result<(), ()> {
+    // SAFETY: SYS_FSTATFS 2-arg signature.
+    let r = unsafe { syscall2(SYS_FSTATFS, fd as u64, buf as u64) };
+    if r == 0 { Ok(()) } else { Err(()) }
 }
 
 /// Force-back every demand-paged page in `[addr, addr+len)` and

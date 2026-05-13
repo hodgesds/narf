@@ -58,7 +58,7 @@ use narf_lib::id::DomainId;
 ///   path is already mounted (mapped through from `VfsRegistry`).
 pub async fn mount_fat<B: BlockDevice + 'static>(
     authority: &Cap<MountPoint, Grant>,
-    path: &'static str,
+    path: &str,
     device: Arc<B>,
     domain: DomainId,
 ) -> Result<Cap<MountPoint, Write>, FsError> {
