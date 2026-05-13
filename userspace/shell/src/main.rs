@@ -43,6 +43,73 @@ fn make_sockaddr_un(buf: &mut [u8; 110], path: &[u8]) -> u32 {
     (2 + n) as u32
 }
 
+fn polltest_run(fd: i32) {
+    // Step 1: create an eventfd, poll with 10ms timeout, expect 0.
+    let efd = unsafe { libc::eventfd(0, 0) };
+    if efd < 0 {
+        unsafe { write_all(fd, b"polltest: eventfd() failed\n"); }
+        return;
+    }
+    let mut pf = libc::pollfd { fd: efd, events: libc::POLLIN, revents: 0 };
+    let r = unsafe { libc::poll(&mut pf as *mut _, 1, 10) };
+    if r != 0 {
+        unsafe { write_all(fd, b"polltest: poll(empty)!=0\n"); }
+        return;
+    }
+    // Step 2: write 1 to eventfd.
+    let one_le: [u8; 8] = 1u64.to_le_bytes();
+    let n = unsafe {
+        libc::posix::write(efd, one_le.as_ptr() as *const _, 8)
+    };
+    if n != 8 {
+        unsafe { write_all(fd, b"polltest: write(efd) short\n"); }
+        return;
+    }
+    // Step 3: poll, expect 1 ready.
+    pf.revents = 0;
+    let r = unsafe { libc::poll(&mut pf as *mut _, 1, 100) };
+    if r != 1 || (pf.revents & libc::POLLIN) == 0 {
+        unsafe { write_all(fd, b"polltest: poll after write != ready\n"); }
+        return;
+    }
+    // Step 4: read counter, expect 1.
+    let mut rbuf = [0u8; 8];
+    let n = unsafe {
+        libc::posix::read(efd, rbuf.as_mut_ptr() as *mut _, 8)
+    };
+    if n != 8 || u64::from_le_bytes(rbuf) != 1 {
+        unsafe { write_all(fd, b"polltest: efd read != 1\n"); }
+        return;
+    }
+    // Step 5: timerfd, 50ms one-shot, poll up to 200ms.
+    let tfd = unsafe { libc::timerfd_create(1 /* CLOCK_MONOTONIC */, 0) };
+    if tfd < 0 {
+        unsafe { write_all(fd, b"polltest: timerfd_create failed\n"); }
+        return;
+    }
+    // itimerspec { interval = 0, value = 50ms }.
+    let its = libc::itimerspec {
+        it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
+        it_value:    libc::timespec { tv_sec: 0, tv_nsec: 50_000_000 },
+    };
+    let r = unsafe {
+        libc::timerfd_settime(tfd, 0, &its as *const _, core::ptr::null_mut())
+    };
+    if r != 0 {
+        unsafe { write_all(fd, b"polltest: timerfd_settime failed\n"); }
+        return;
+    }
+    let mut tpf = libc::pollfd { fd: tfd, events: libc::POLLIN, revents: 0 };
+    let r = unsafe { libc::poll(&mut tpf as *mut _, 1, 200) };
+    if r != 1 {
+        unsafe { write_all(fd, b"polltest: timerfd poll != ready\n"); }
+        return;
+    }
+    let _ = unsafe { libc::posix::close(efd) };
+    let _ = unsafe { libc::posix::close(tfd) };
+    unsafe { write_all(fd, b"polltest: ok (eventfd+timerfd+poll)\n"); }
+}
+
 extern "C" fn socktest_listener(_arg: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
     use core::sync::atomic::Ordering;
     let lfd = unsafe { libc::socket(1 /* AF_UNIX */, 1 /* SOCK_STREAM */, 0) };
@@ -350,6 +417,14 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
             write_all(fd, s);
             write_all(fd, NEWLINE);
         }
+    } else if cmd == b"polltest" {
+        // polltest — exercise eventfd + poll + timerfd:
+        //   1. eventfd; poll(events=POLLIN, timeout=10ms) → 0 (timeout)
+        //   2. write 1 to the eventfd
+        //   3. poll → 1 (ready)
+        //   4. read 8 bytes → counter value 1
+        //   5. timerfd 50ms one-shot; poll(timeout=200ms) → 1 (ready)
+        polltest_run(fd);
     } else if cmd == b"socktest" {
         // socktest — spawn a worker that binds an AF_UNIX listener
         // at /sock/test, accepts one connection, reads "ping" and

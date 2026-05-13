@@ -323,7 +323,32 @@ pub trait FileOps: Send + Sync {
     fn set_perms<'a>(&'a self, _perms: u16) -> FsFuture<'a, ()> {
         Box::pin(async move { Err(FsError::Unsupported) })
     }
+
+    /// POSIX-2017 `poll(2)` readiness query. Returns the OR of
+    /// the POLL_* bits below for the events currently satisfied
+    /// on this file. The default returns `POLL_IN | POLL_OUT`
+    /// (always-ready) which matches the semantics for regular
+    /// files (where read/write never block); FSes that can block
+    /// (sockets, pipes, eventfds, ttys) override.
+    fn poll_readiness(&self) -> u32 {
+        POLL_IN | POLL_OUT
+    }
 }
+
+// ── POSIX poll(2) event bits ────────────────────────────────────
+
+/// `POLLIN` — data available to read.
+pub const POLL_IN: u32 = 0x0001;
+/// `POLLPRI` — urgent (out-of-band) data available.
+pub const POLL_PRI: u32 = 0x0002;
+/// `POLLOUT` — file is writable without blocking.
+pub const POLL_OUT: u32 = 0x0004;
+/// `POLLERR` — error condition (always set in revents).
+pub const POLL_ERR: u32 = 0x0008;
+/// `POLLHUP` — peer closed the connection / pipe end gone.
+pub const POLL_HUP: u32 = 0x0010;
+/// `POLLNVAL` — fd not open / invalid.
+pub const POLL_NVAL: u32 = 0x0020;
 
 /// Per-directory async op surface. `lookup` is synchronous because
 /// the only Stage-3 directory implementation (initramfs) is a flat

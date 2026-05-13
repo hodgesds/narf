@@ -212,6 +212,33 @@ impl FileOps for SocketFile {
             mtime_cycles: 0,
         }
     }
+
+    fn poll_readiness(&self) -> u32 {
+        let state = self.state.lock();
+        match &*state {
+            SocketState::Fresh => 0,
+            SocketState::UnixListener { pending, .. } => {
+                if pending.is_empty() {
+                    0
+                } else {
+                    narf_filesystem::POLL_IN
+                }
+            }
+            SocketState::UnixConnected { rx, tx } => {
+                let mut bits = 0;
+                if rx.has_data() {
+                    bits |= narf_filesystem::POLL_IN;
+                }
+                if tx.has_space() {
+                    bits |= narf_filesystem::POLL_OUT;
+                }
+                if rx.is_closed() {
+                    bits |= narf_filesystem::POLL_HUP;
+                }
+                bits
+            }
+        }
+    }
 }
 
 impl SocketFile {
@@ -473,6 +500,14 @@ impl RingBuf {
 
     fn close(&self) {
         self.closed.store(true, Ordering::Release);
+    }
+
+    fn has_data(&self) -> bool {
+        self.inner.lock().len > 0
+    }
+
+    fn has_space(&self) -> bool {
+        self.inner.lock().len < RING_CAP
     }
 }
 

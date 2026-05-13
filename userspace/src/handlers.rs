@@ -5766,6 +5766,20 @@ pub fn signal_pending_of(task: u64) -> u32 {
         .unwrap_or(0)
 }
 
+/// Clear the pending bit for `signum` on `task`. Used by signalfd
+/// after delivering the signal through the fd path.
+pub fn clear_signal_pending(task: u64, signum: u32) {
+    if signum >= 32 {
+        return;
+    }
+    let mut g = SIGNAL_PENDING.lock();
+    if let Some(map) = g.as_mut() {
+        if let Some(slot) = map.get_mut(&task) {
+            *slot &= !(1u32 << signum);
+        }
+    }
+}
+
 /// Diagnostic: peek the block mask for `task`.
 pub fn signal_mask_of(task: u64) -> u32 {
     SIGNAL_MASK
@@ -6605,6 +6619,412 @@ fn sys_sock_send_zc(ctx: &mut dyn TrapContext) {
     }
 }
 
+// ── I/O multiplexing — poll / epoll / eventfd / timerfd / signalfd ──
+
+/// poll(2) entry: walk a user-supplied array of pollfd, OR each
+/// fd's poll_readiness against the requested events, write revents,
+/// return number of ready fds. Yield + re-poll on no-progress
+/// when timeout != 0.
+fn sys_poll(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let pollfds_ptr = args.arg0 as *mut u8;
+    let n = args.arg1 as usize;
+    let timeout_ms = args.arg2 as i64;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if n > 1024 {
+        ctx.set_return(fail);
+        return;
+    }
+    if n == 0 {
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+    if pollfds_ptr.is_null() {
+        ctx.set_return(fail);
+        return;
+    }
+    // Each pollfd is [fd: i32 (4 B), events: i16 (2 B), revents: i16 (2 B)] = 8 B.
+    const PF_LEN: usize = 8;
+    let total = n * PF_LEN;
+    // Pull the user buffer into a kernel scratch.
+    let mut user_buf = alloc::vec![0u8; total];
+    unsafe {
+        for i in 0..total {
+            user_buf[i] = core::ptr::read_volatile(pollfds_ptr.add(i));
+        }
+    }
+    let task = current_task_id();
+    let deadline_ns = if timeout_ms < 0 {
+        None
+    } else {
+        let now = narf_scheduler::narf_time::monotonic_ns();
+        Some(now.saturating_add((timeout_ms as u64).saturating_mul(1_000_000)))
+    };
+    loop {
+        let mut ready = 0u64;
+        for i in 0..n {
+            let off = i * PF_LEN;
+            let fd_raw = i32::from_le_bytes([
+                user_buf[off],
+                user_buf[off + 1],
+                user_buf[off + 2],
+                user_buf[off + 3],
+            ]);
+            let events = u16::from_le_bytes([user_buf[off + 4], user_buf[off + 5]]) as u32;
+            let revents = if fd_raw < 0 {
+                0
+            } else {
+                let fd = fd_raw as u32;
+                let readiness = fd::with_table(task, |t| {
+                    t.get(fd).map(|e| e.ops.poll_readiness())
+                })
+                .flatten();
+                match readiness {
+                    Some(r) => (r & events) as u16,
+                    None => narf_filesystem::POLL_NVAL as u16,
+                }
+            };
+            user_buf[off + 6..off + 8].copy_from_slice(&revents.to_le_bytes());
+            if revents != 0 {
+                ready += 1;
+            }
+        }
+        if ready > 0 || timeout_ms == 0 {
+            // Copy revents back to user.
+            unsafe {
+                for i in 0..total {
+                    core::ptr::write_volatile(pollfds_ptr.add(i), user_buf[i]);
+                }
+            }
+            ctx.set_return(SyscallReturn::ok(ready));
+            return;
+        }
+        if let Some(deadline) = deadline_ns {
+            let now = narf_scheduler::narf_time::monotonic_ns();
+            if now >= deadline {
+                // Timeout — write back zero revents (already done)
+                // and return 0.
+                unsafe {
+                    for i in 0..total {
+                        core::ptr::write_volatile(pollfds_ptr.add(i), user_buf[i]);
+                    }
+                }
+                ctx.set_return(SyscallReturn::ok(0));
+                return;
+            }
+        }
+        // Yield ~1ms, then re-walk.
+        if let (Some(uctx), Some(hook)) = (
+            crate::user_task::current_user_task(),
+            crate::user_task::yield_hook(),
+        ) {
+            // Stash partial revents back to user; the longjmp
+            // doesn't return through us so they'd be lost.
+            // BUT we're going to loop, not exit — only write back
+            // after the loop finds something ready or times out.
+            // No-op write; real write happens on the success path.
+            ctx.set_return(SyscallReturn::ok(0));
+            let park = 1_000_000u64;
+            let dl = narf_scheduler::narf_time::monotonic_ns().saturating_add(park);
+            unsafe {
+                let uc = &*uctx;
+                uc.sleep_deadline_ns.store(dl, Ordering::Release);
+                ctx.save_user_state(uc.state.get() as *mut u8);
+                *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                hook(uctx);
+            }
+            // unreachable
+        }
+        // Test fallback: just spin briefly.
+        let chunk_end = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
+        while narf_scheduler::narf_time::monotonic_ns() < chunk_end {
+            sleep_pumps::run();
+            core::hint::spin_loop();
+        }
+    }
+}
+
+fn sys_epoll_create(ctx: &mut dyn TrapContext) {
+    let _flags = ctx.args().arg0;
+    let ep = crate::io_mux::EpollFile::new();
+    epoll_arc_register(&ep);
+    let task = current_task_id();
+    let new_fd = match fd::with_table(task, |t| {
+        t.open(crate::fd::FdEntry { ops: ep, offset: 0, flags: 0 })
+    }) {
+        Some(n) => n,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            return;
+        }
+    };
+    ctx.set_return(SyscallReturn::ok(new_fd as u64));
+}
+
+const EPOLL_CTL_ADD: u32 = 1;
+const EPOLL_CTL_DEL: u32 = 2;
+const EPOLL_CTL_MOD: u32 = 3;
+
+fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let epfd = args.arg0 as u32;
+    let op = args.arg1 as u32;
+    let fd = args.arg2 as i32;
+    let event_ptr = args.arg3 as *const u8;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    let task = current_task_id();
+    let ep_arc = match epoll_arc_from_fd(task, epfd) {
+        Some(e) => e,
+        None => { ctx.set_return(fail); return; }
+    };
+    if op == EPOLL_CTL_DEL {
+        ep_arc.ctl_del(fd);
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+    // ADD / MOD need to read the event struct (events: u32 + data: u64 = 12 B).
+    if event_ptr.is_null() {
+        ctx.set_return(fail);
+        return;
+    }
+    let mut events_bytes = [0u8; 4];
+    let mut data_bytes = [0u8; 8];
+    unsafe {
+        for i in 0..4 {
+            events_bytes[i] = core::ptr::read_volatile(event_ptr.add(i));
+        }
+        for i in 0..8 {
+            data_bytes[i] = core::ptr::read_volatile(event_ptr.add(4 + i));
+        }
+    }
+    let entry = crate::io_mux::EpollEntry {
+        events: u32::from_le_bytes(events_bytes),
+        user_data: u64::from_le_bytes(data_bytes),
+    };
+    match op {
+        EPOLL_CTL_ADD => ep_arc.ctl_add(fd, entry),
+        EPOLL_CTL_MOD => ep_arc.ctl_mod(fd, entry),
+        _ => {
+            ctx.set_return(fail);
+            return;
+        }
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let epfd = args.arg0 as u32;
+    let events_out = args.arg1 as *mut u8;
+    let max = args.arg2 as usize;
+    let timeout_ms = args.arg3 as i64;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    let task = current_task_id();
+    let ep_arc = match epoll_arc_from_fd(task, epfd) {
+        Some(e) => e,
+        None => { ctx.set_return(fail); return; }
+    };
+    let deadline_ns = if timeout_ms < 0 {
+        None
+    } else {
+        let now = narf_scheduler::narf_time::monotonic_ns();
+        Some(now.saturating_add((timeout_ms as u64).saturating_mul(1_000_000)))
+    };
+    loop {
+        let snap = ep_arc.snapshot();
+        let mut written = 0;
+        for (fd, entry) in snap.iter() {
+            if written >= max {
+                break;
+            }
+            let fd_u = if *fd < 0 { continue; } else { *fd as u32 };
+            let readiness = fd::with_table(task, |t| {
+                t.get(fd_u).map(|e| e.ops.poll_readiness())
+            })
+            .flatten()
+            .unwrap_or(0);
+            let active = readiness & entry.events;
+            if active != 0 {
+                let off = written * 12;
+                unsafe {
+                    let bytes = active.to_le_bytes();
+                    for i in 0..4 {
+                        core::ptr::write_volatile(events_out.add(off + i), bytes[i]);
+                    }
+                    let dbytes = entry.user_data.to_le_bytes();
+                    for i in 0..8 {
+                        core::ptr::write_volatile(events_out.add(off + 4 + i), dbytes[i]);
+                    }
+                }
+                written += 1;
+            }
+        }
+        if written > 0 || timeout_ms == 0 {
+            ctx.set_return(SyscallReturn::ok(written as u64));
+            return;
+        }
+        if let Some(dl) = deadline_ns {
+            if narf_scheduler::narf_time::monotonic_ns() >= dl {
+                ctx.set_return(SyscallReturn::ok(0));
+                return;
+            }
+        }
+        // Yield 1ms.
+        if let (Some(uctx), Some(hook)) = (
+            crate::user_task::current_user_task(),
+            crate::user_task::yield_hook(),
+        ) {
+            ctx.set_return(SyscallReturn::ok(0));
+            let park = 1_000_000u64;
+            let dl = narf_scheduler::narf_time::monotonic_ns().saturating_add(park);
+            unsafe {
+                let uc = &*uctx;
+                uc.sleep_deadline_ns.store(dl, Ordering::Release);
+                ctx.save_user_state(uc.state.get() as *mut u8);
+                *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                hook(uctx);
+            }
+        }
+        let chunk_end = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
+        while narf_scheduler::narf_time::monotonic_ns() < chunk_end {
+            sleep_pumps::run();
+            core::hint::spin_loop();
+        }
+    }
+}
+
+// EpollFile recovery from FdEntry — same shape as the SocketFile
+// side table since Arc<dyn FileOps> can't be downcast generically.
+static EPOLL_ARCS: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<usize, alloc::sync::Arc<crate::io_mux::EpollFile>>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+fn epoll_arc_register(arc: &alloc::sync::Arc<crate::io_mux::EpollFile>) {
+    let key = alloc::sync::Arc::as_ptr(arc) as usize;
+    let mut g = EPOLL_ARCS.lock();
+    let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
+    map.insert(key, arc.clone());
+}
+
+fn epoll_arc_from_fd(task: u64, fd: u32) -> Option<alloc::sync::Arc<crate::io_mux::EpollFile>> {
+    let arc_ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten()?;
+    let raw = alloc::sync::Arc::as_ptr(&arc_ops) as *const () as usize;
+    let g = EPOLL_ARCS.lock();
+    g.as_ref()?.get(&raw).cloned()
+}
+
+fn sys_eventfd(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let initval = args.arg0;
+    let flags = args.arg1 as u32;
+    let efd = crate::io_mux::EventFd::new(initval, flags);
+    let task = current_task_id();
+    let new_fd = match fd::with_table(task, |t| {
+        t.open(crate::fd::FdEntry { ops: efd, offset: 0, flags: 0 })
+    }) {
+        Some(n) => n,
+        None => { ctx.set_return(SyscallReturn::ok((-1i64) as u64)); return; }
+    };
+    ctx.set_return(SyscallReturn::ok(new_fd as u64));
+}
+
+fn sys_timerfd_create(ctx: &mut dyn TrapContext) {
+    let _ = ctx.args();
+    let tfd = crate::io_mux::TimerFd::new();
+    timerfd_arc_register(&tfd);
+    let task = current_task_id();
+    let new_fd = match fd::with_table(task, |t| {
+        t.open(crate::fd::FdEntry { ops: tfd, offset: 0, flags: 0 })
+    }) {
+        Some(n) => n,
+        None => { ctx.set_return(SyscallReturn::ok((-1i64) as u64)); return; }
+    };
+    ctx.set_return(SyscallReturn::ok(new_fd as u64));
+}
+
+fn sys_timerfd_settime(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let fd = args.arg0 as u32;
+    let _flags = args.arg1;
+    let new_value_ptr = args.arg2 as *const u8;
+    let _old_value_ptr = args.arg3 as *mut u8;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    let task = current_task_id();
+    if new_value_ptr.is_null() {
+        ctx.set_return(fail);
+        return;
+    }
+    // itimerspec is { interval: timespec, value: timespec } where
+    // timespec = { tv_sec: i64, tv_nsec: i64 } = 16 B. Total 32 B.
+    let mut buf = [0u8; 32];
+    unsafe {
+        for i in 0..32 {
+            buf[i] = core::ptr::read_volatile(new_value_ptr.add(i));
+        }
+    }
+    let interval_sec = i64::from_le_bytes(buf[0..8].try_into().unwrap());
+    let interval_ns = i64::from_le_bytes(buf[8..16].try_into().unwrap());
+    let value_sec = i64::from_le_bytes(buf[16..24].try_into().unwrap());
+    let value_ns = i64::from_le_bytes(buf[24..32].try_into().unwrap());
+    let interval_total = (interval_sec as u64).saturating_mul(1_000_000_000)
+        .saturating_add(interval_ns as u64);
+    let value_total = (value_sec as u64).saturating_mul(1_000_000_000)
+        .saturating_add(value_ns as u64);
+    let now = narf_scheduler::narf_time::monotonic_ns();
+    let next_fire = if value_total == 0 { 0 } else { now.saturating_add(value_total) };
+    let tfd = match timerfd_arc_from_fd(task, fd) {
+        Some(t) => t,
+        None => { ctx.set_return(fail); return; }
+    };
+    tfd.arm(next_fire, interval_total);
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+static TIMERFD_ARCS: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<usize, alloc::sync::Arc<crate::io_mux::TimerFd>>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+fn timerfd_arc_register(arc: &alloc::sync::Arc<crate::io_mux::TimerFd>) {
+    let key = alloc::sync::Arc::as_ptr(arc) as usize;
+    let mut g = TIMERFD_ARCS.lock();
+    let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
+    map.insert(key, arc.clone());
+}
+
+fn timerfd_arc_from_fd(task: u64, fd: u32) -> Option<alloc::sync::Arc<crate::io_mux::TimerFd>> {
+    let arc_ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten()?;
+    let raw = alloc::sync::Arc::as_ptr(&arc_ops) as *const () as usize;
+    let g = TIMERFD_ARCS.lock();
+    g.as_ref()?.get(&raw).cloned()
+}
+
+fn sys_signalfd(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let _fd_arg = args.arg0 as i64; // -1 = create new
+    let mask_ptr = args.arg1 as *const u8;
+    let _sizemask = args.arg2;
+    let _flags = args.arg3;
+    let mut mask: u64 = 0;
+    if !mask_ptr.is_null() {
+        unsafe {
+            let mut bytes = [0u8; 8];
+            for i in 0..8 {
+                bytes[i] = core::ptr::read_volatile(mask_ptr.add(i));
+            }
+            mask = u64::from_le_bytes(bytes);
+        }
+    }
+    let task = current_task_id();
+    let sfd = crate::io_mux::SignalFd::new(mask, task);
+    let new_fd = match fd::with_table(task, |t| {
+        t.open(crate::fd::FdEntry { ops: sfd, offset: 0, flags: 0 })
+    }) {
+        Some(n) => n,
+        None => { ctx.set_return(SyscallReturn::ok((-1i64) as u64)); return; }
+    };
+    ctx.set_return(SyscallReturn::ok(new_fd as u64));
+}
+
 fn sys_sigaction(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let signum = args.arg0 as usize;
@@ -6760,6 +7180,14 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::SocketSetSockOpt, "setsockopt", RawFnHandler(sys_socket_setsockopt));
     table.install_raw(Syscall::SockRegisterBuf, "sock_register_buf", RawFnHandler(sys_sock_register_buf));
     table.install_raw(Syscall::SockSendZc, "sock_send_zc", RawFnHandler(sys_sock_send_zc));
+    table.install_raw(Syscall::Poll, "poll", RawFnHandler(sys_poll));
+    table.install_raw(Syscall::EpollCreate, "epoll_create", RawFnHandler(sys_epoll_create));
+    table.install_raw(Syscall::EpollCtl, "epoll_ctl", RawFnHandler(sys_epoll_ctl));
+    table.install_raw(Syscall::EpollWait, "epoll_wait", RawFnHandler(sys_epoll_wait));
+    table.install_raw(Syscall::Eventfd, "eventfd", RawFnHandler(sys_eventfd));
+    table.install_raw(Syscall::TimerfdCreate, "timerfd_create", RawFnHandler(sys_timerfd_create));
+    table.install_raw(Syscall::TimerfdSettime, "timerfd_settime", RawFnHandler(sys_timerfd_settime));
+    table.install_raw(Syscall::Signalfd, "signalfd", RawFnHandler(sys_signalfd));
     table.install_raw(
         Syscall::FbConnect,
         "fb_connect",

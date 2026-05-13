@@ -46,18 +46,62 @@ pub struct pollfd {
     pub revents: i16,
 }
 
-/// `poll(*fds, nfds, timeout)` — refuse with ENOSYS.
+/// `poll(*fds, nfds, timeout)` — wait for events on the given fds.
+///
+/// The kernel side does single-shot polls + parks the task ~1ms
+/// when nothing is ready; we loop here until either an event
+/// arrives or the user-supplied timeout elapses. This mirrors how
+/// libc::pthread_join wraps narf_user_runtime::futex_wait.
 ///
 /// # Safety
-/// Pointer arguments are not dereferenced.
+/// `fds` must point at a writable array of `nfds` `pollfd` records.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn poll(
-    _fds:     *mut pollfd,
-    _nfds:    nfds_t,
-    _timeout: c_int,
+    fds:     *mut pollfd,
+    nfds:    nfds_t,
+    timeout: c_int,
 ) -> c_int {
-    // SAFETY: forwarded.
-    unsafe { enosys_minus_one() }
+    if fds.is_null() && nfds != 0 {
+        crate::errno::set_errno(22 /* EINVAL */);
+        return -1;
+    }
+    // Compute an absolute deadline if a positive timeout was given;
+    // -1 = block forever, 0 = single non-blocking poll, > 0 = ms.
+    let mut ts = crate::time::timespec { tv_sec: 0, tv_nsec: 0 };
+    let _ = unsafe { crate::time::clock_gettime(1 /* CLOCK_MONOTONIC */, &mut ts as *mut _) };
+    let now_ns = (ts.tv_sec as u64).saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as u64);
+    let deadline_ns: Option<u64> = match timeout {
+        n if n < 0 => None,
+        0 => Some(now_ns), // immediate
+        n => Some(now_ns.saturating_add((n as u64).saturating_mul(1_000_000))),
+    };
+    loop {
+        // Single-shot kernel poll — returns the count of ready fds
+        // (>= 0) or -1 on error. The kernel itself parks the task
+        // ~1ms when nothing's ready; that yield is what lets other
+        // tasks make progress.
+        let r = narf_user_runtime::poll(fds as *mut u8, nfds as usize, 0);
+        if r > 0 {
+            return r;
+        }
+        if r < 0 {
+            crate::errno::set_errno(22);
+            return -1;
+        }
+        // r == 0: nothing ready. Check the user-side timeout.
+        if let Some(dl) = deadline_ns {
+            let mut ts = crate::time::timespec { tv_sec: 0, tv_nsec: 0 };
+            let _ = unsafe { crate::time::clock_gettime(1, &mut ts as *mut _) };
+            let now = (ts.tv_sec as u64).saturating_mul(1_000_000_000)
+                .saturating_add(ts.tv_nsec as u64);
+            if now >= dl {
+                return 0;
+            }
+        }
+        // Yield ~1ms so the parked task gets de-prioritised.
+        let _ = unsafe { crate::process::usleep(1000) };
+    }
 }
 
 // ── select ──────────────────────────────────────────────────────────
@@ -127,20 +171,74 @@ pub struct timeval_select {
 }
 
 /// `select(nfds, *readfds, *writefds, *exceptfds, *timeout)` —
-/// refuse with ENOSYS.
+/// translate to a `poll()` call. Builds a temporary pollfd array
+/// covering [0..nfds), maps fd_set bits to POLLIN/POLLOUT/POLLPRI,
+/// then writes the result back into the fd_sets.
 ///
 /// # Safety
-/// Pointer arguments are not dereferenced.
+/// All non-NULL arguments must point at valid storage of the
+/// declared shape.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn select(
-    _nfds:      c_int,
-    _readfds:   *mut fd_set,
-    _writefds:  *mut fd_set,
-    _exceptfds: *mut fd_set,
-    _timeout:   *mut timeval_select,
+    nfds:      c_int,
+    readfds:   *mut fd_set,
+    writefds:  *mut fd_set,
+    exceptfds: *mut fd_set,
+    timeout:   *mut timeval_select,
 ) -> c_int {
-    // SAFETY: forwarded.
-    unsafe { enosys_minus_one() }
+    if nfds < 0 || nfds as usize > FD_SETSIZE {
+        crate::errno::set_errno(22 /* EINVAL */);
+        return -1;
+    }
+    let n = nfds as usize;
+    // Build pollfd[].
+    let mut pf = [pollfd { fd: 0, events: 0, revents: 0 }; FD_SETSIZE];
+    let mut count: usize = 0;
+    for fd in 0..n {
+        let want_r = !readfds.is_null() && unsafe { FD_ISSET(fd as c_int, readfds) } != 0;
+        let want_w = !writefds.is_null() && unsafe { FD_ISSET(fd as c_int, writefds) } != 0;
+        let want_e = !exceptfds.is_null() && unsafe { FD_ISSET(fd as c_int, exceptfds) } != 0;
+        if !want_r && !want_w && !want_e { continue; }
+        let mut events = 0i16;
+        if want_r { events |= POLLIN; }
+        if want_w { events |= POLLOUT; }
+        if want_e { events |= POLLPRI; }
+        pf[count] = pollfd { fd: fd as c_int, events, revents: 0 };
+        count += 1;
+    }
+    let timeout_ms: c_int = if timeout.is_null() {
+        -1
+    } else {
+        // SAFETY: caller-provided timeval pointer.
+        let t = unsafe { *timeout };
+        let total_us = t.tv_sec.saturating_mul(1_000_000).saturating_add(t.tv_usec);
+        ((total_us / 1000) as c_int).max(0)
+    };
+    let r = narf_user_runtime::poll(pf.as_mut_ptr() as *mut u8, count, timeout_ms);
+    if r < 0 {
+        crate::errno::set_errno(22 /* EINVAL */);
+        return -1;
+    }
+    // Clear the user fd_sets and re-populate from revents.
+    if !readfds.is_null() { unsafe { FD_ZERO(readfds); } }
+    if !writefds.is_null() { unsafe { FD_ZERO(writefds); } }
+    if !exceptfds.is_null() { unsafe { FD_ZERO(exceptfds); } }
+    let mut hits = 0;
+    for i in 0..count {
+        let p = pf[i];
+        if p.revents == 0 { continue; }
+        if (p.revents & POLLIN) != 0 && !readfds.is_null() {
+            unsafe { FD_SET(p.fd, readfds); }
+        }
+        if (p.revents & POLLOUT) != 0 && !writefds.is_null() {
+            unsafe { FD_SET(p.fd, writefds); }
+        }
+        if (p.revents & POLLPRI) != 0 && !exceptfds.is_null() {
+            unsafe { FD_SET(p.fd, exceptfds); }
+        }
+        hits += 1;
+    }
+    hits
 }
 
 // ── epoll ───────────────────────────────────────────────────────────
@@ -167,58 +265,78 @@ pub struct epoll_event {
     pub data:   epoll_data,
 }
 
-/// `epoll_create(size)` — refuse with ENOSYS.
+/// `epoll_create(size)` — `size` is ignored per Linux 2.6.8+;
+/// equivalent to `epoll_create1(0)`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn epoll_create(_size: c_int) -> c_int {
-    // SAFETY: forwarded.
-    unsafe { enosys_minus_one() }
+    narf_user_runtime::epoll_create(0)
 }
 
-/// `epoll_create1(flags)` — refuse with ENOSYS.
+/// `epoll_create1(flags)` — create a new epoll fd.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn epoll_create1(_flags: c_int) -> c_int {
-    // SAFETY: forwarded.
-    unsafe { enosys_minus_one() }
+pub unsafe extern "C" fn epoll_create1(flags: c_int) -> c_int {
+    narf_user_runtime::epoll_create(flags as u32)
 }
 
-/// `epoll_ctl(epfd, op, fd, *event)` — refuse with ENOSYS.
+/// `epoll_ctl(epfd, op, fd, *event)`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn epoll_ctl(
-    _epfd:  c_int,
-    _op:    c_int,
-    _fd:    c_int,
-    _event: *mut epoll_event,
+    epfd:  c_int,
+    op:    c_int,
+    fd:    c_int,
+    event: *mut epoll_event,
 ) -> c_int {
-    // SAFETY: forwarded.
-    unsafe { enosys_minus_one() }
+    let r = narf_user_runtime::epoll_ctl(epfd, op as u32, fd, event as *const u8);
+    if r < 0 { crate::errno::set_errno(22); }
+    r
 }
 
-/// `epoll_wait(epfd, *events, maxevents, timeout)` — refuse with ENOSYS.
+/// `epoll_wait(epfd, *events, maxevents, timeout)`. Loops the
+/// kernel single-shot epoll_wait + user-side timeout the same way
+/// `poll()` does.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn epoll_wait(
-    _epfd:      c_int,
-    _events:    *mut epoll_event,
-    _maxevents: c_int,
-    _timeout:   c_int,
+    epfd:      c_int,
+    events:    *mut epoll_event,
+    maxevents: c_int,
+    timeout:   c_int,
 ) -> c_int {
-    // SAFETY: forwarded.
-    unsafe { enosys_minus_one() }
+    let mut ts = crate::time::timespec { tv_sec: 0, tv_nsec: 0 };
+    let _ = unsafe { crate::time::clock_gettime(1, &mut ts as *mut _) };
+    let now_ns = (ts.tv_sec as u64).saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as u64);
+    let deadline_ns: Option<u64> = match timeout {
+        n if n < 0 => None,
+        0 => Some(now_ns),
+        n => Some(now_ns.saturating_add((n as u64).saturating_mul(1_000_000))),
+    };
+    loop {
+        let r = narf_user_runtime::epoll_wait(epfd, events as *mut u8, maxevents, 0);
+        if r > 0 { return r; }
+        if r < 0 { crate::errno::set_errno(22); return -1; }
+        if let Some(dl) = deadline_ns {
+            let mut ts = crate::time::timespec { tv_sec: 0, tv_nsec: 0 };
+            let _ = unsafe { crate::time::clock_gettime(1, &mut ts as *mut _) };
+            let now = (ts.tv_sec as u64).saturating_mul(1_000_000_000)
+                .saturating_add(ts.tv_nsec as u64);
+            if now >= dl { return 0; }
+        }
+        let _ = unsafe { crate::process::usleep(1000) };
+    }
 }
 
 // ── eventfd / timerfd / signalfd ────────────────────────────────────
 
-/// `eventfd(initval, flags)` — refuse with ENOSYS.
+/// `eventfd(initval, flags)` — counter-backed event fd.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn eventfd(_initval: u32, _flags: c_int) -> c_int {
-    // SAFETY: forwarded.
-    unsafe { enosys_minus_one() }
+pub unsafe extern "C" fn eventfd(initval: u32, flags: c_int) -> c_int {
+    narf_user_runtime::eventfd(initval as u64, flags as u32)
 }
 
-/// `timerfd_create(clockid, flags)` — refuse with ENOSYS.
+/// `timerfd_create(clockid, flags)` — timer-backed fd.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn timerfd_create(_clockid: c_int, _flags: c_int) -> c_int {
-    // SAFETY: forwarded.
-    unsafe { enosys_minus_one() }
+pub unsafe extern "C" fn timerfd_create(clockid: c_int, flags: c_int) -> c_int {
+    narf_user_runtime::timerfd_create(clockid as u32, flags as u32)
 }
 
 #[repr(C)]
@@ -228,16 +346,22 @@ pub struct itimerspec {
     pub it_value:    crate::time::timespec,
 }
 
-/// `timerfd_settime(fd, flags, *new, *old)` — refuse with ENOSYS.
+/// `timerfd_settime(fd, flags, *new, *old)` — arm the timer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn timerfd_settime(
-    _fd:    c_int,
-    _flags: c_int,
-    _new:   *const itimerspec,
-    _old:   *mut itimerspec,
+    fd:    c_int,
+    flags: c_int,
+    new:   *const itimerspec,
+    old:   *mut itimerspec,
 ) -> c_int {
-    // SAFETY: forwarded.
-    unsafe { enosys_minus_one() }
+    let r = narf_user_runtime::timerfd_settime(
+        fd,
+        flags as u32,
+        new as *const u8,
+        old as *mut u8,
+    );
+    if r < 0 { crate::errno::set_errno(22); }
+    r
 }
 
 /// `timerfd_gettime(fd, *cur)` — refuse with ENOSYS.
@@ -247,15 +371,20 @@ pub unsafe extern "C" fn timerfd_gettime(_fd: c_int, _cur: *mut itimerspec) -> c
     unsafe { enosys_minus_one() }
 }
 
-/// `signalfd(fd, *mask, flags)` — refuse with ENOSYS. The `mask`
-/// is taken as a `*const c_void` because we don't ship sigset_t in
-/// this module.
+/// `signalfd(fd, *mask, flags)` — receive signals via an fd.
+/// `mask` is a `sigset_t`-shaped 8-byte bitmask.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn signalfd(
-    _fd:    c_int,
-    _mask:  *const c_void,
-    _flags: c_int,
+    fd:    c_int,
+    mask:  *const c_void,
+    flags: c_int,
 ) -> c_int {
-    // SAFETY: forwarded.
-    unsafe { enosys_minus_one() }
+    let r = narf_user_runtime::signalfd(
+        fd,
+        mask as *const u64,
+        8,
+        flags as u32,
+    );
+    if r < 0 { crate::errno::set_errno(22); }
+    r
 }

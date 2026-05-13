@@ -41,6 +41,7 @@ pub mod fd;
 pub mod handlers;
 pub mod interp;
 pub mod loader;
+pub mod io_mux;
 pub mod pipe;
 pub mod process;
 pub mod socket;

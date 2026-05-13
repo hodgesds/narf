@@ -1364,6 +1364,97 @@ pub const SYS_GETSOCKOPT: u64 = 206;
 pub const SYS_SETSOCKOPT: u64 = 207;
 pub const SYS_SOCK_REGISTER_BUF: u64 = 208;
 pub const SYS_SOCK_SEND_ZC: u64 = 209;
+pub const SYS_POLL: u64 = 210;
+pub const SYS_EPOLL_CREATE: u64 = 211;
+pub const SYS_EPOLL_CTL: u64 = 212;
+pub const SYS_EPOLL_WAIT: u64 = 213;
+pub const SYS_EVENTFD: u64 = 214;
+pub const SYS_TIMERFD_CREATE: u64 = 215;
+pub const SYS_TIMERFD_SETTIME: u64 = 216;
+pub const SYS_SIGNALFD: u64 = 217;
+
+/// `poll(pollfds, n, timeout_ms)`. Returns the number of fds with
+/// ready events, 0 on timeout, -1 on error.
+#[inline]
+pub fn poll(pollfds: *mut u8, n: usize, timeout_ms: i32) -> i32 {
+    let r = unsafe {
+        syscall3(SYS_POLL, pollfds as u64, n as u64, timeout_ms as i64 as u64)
+    };
+    r as i32
+}
+
+#[inline]
+pub fn epoll_create(flags: u32) -> i32 {
+    let r = unsafe { syscall1(SYS_EPOLL_CREATE, flags as u64) };
+    r as i32
+}
+
+#[inline]
+pub fn epoll_ctl(epfd: i32, op: u32, fd: i32, event: *const u8) -> i32 {
+    let r = unsafe {
+        syscall4(SYS_EPOLL_CTL, epfd as u64, op as u64, fd as u64, event as u64)
+    };
+    r as i32
+}
+
+#[inline]
+pub fn epoll_wait(epfd: i32, events_out: *mut u8, max: i32, timeout_ms: i32) -> i32 {
+    let r = unsafe {
+        syscall4(
+            SYS_EPOLL_WAIT,
+            epfd as u64,
+            events_out as u64,
+            max as u64,
+            timeout_ms as i64 as u64,
+        )
+    };
+    r as i32
+}
+
+#[inline]
+pub fn eventfd(initval: u64, flags: u32) -> i32 {
+    let r = unsafe { syscall2(SYS_EVENTFD, initval, flags as u64) };
+    r as i32
+}
+
+#[inline]
+pub fn timerfd_create(clockid: u32, flags: u32) -> i32 {
+    let r = unsafe { syscall2(SYS_TIMERFD_CREATE, clockid as u64, flags as u64) };
+    r as i32
+}
+
+#[inline]
+pub fn timerfd_settime(
+    fd: i32,
+    flags: u32,
+    new_value: *const u8,
+    old_value: *mut u8,
+) -> i32 {
+    let r = unsafe {
+        syscall4(
+            SYS_TIMERFD_SETTIME,
+            fd as u64,
+            flags as u64,
+            new_value as u64,
+            old_value as u64,
+        )
+    };
+    r as i32
+}
+
+#[inline]
+pub fn signalfd(fd: i32, mask_ptr: *const u64, sizemask: usize, flags: u32) -> i32 {
+    let r = unsafe {
+        syscall4(
+            SYS_SIGNALFD,
+            fd as i64 as u64,
+            mask_ptr as u64,
+            sizemask as u64,
+            flags as u64,
+        )
+    };
+    r as i32
+}
 
 /// `socket(domain, type, protocol)` — returns a new socket fd or -1.
 #[inline]

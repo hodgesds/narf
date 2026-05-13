@@ -529,6 +529,51 @@ pub enum Syscall {
     /// path goes async).
     SockSendZc = 209,
 
+    // ── I/O multiplexing (210-219) ────────────────────────────────
+
+    /// `poll(pollfds, n, timeout_ms)`. arg0 = ptr to a packed
+    /// array of `[fd: i32, events: u16, revents: u16]` triples,
+    /// arg1 = element count, arg2 = timeout in ms (-1 = block
+    /// indefinitely, 0 = non-blocking, >0 = bounded wait). The
+    /// kernel writes `revents` for each entry. Returns the
+    /// number of entries with non-zero revents, 0 on timeout,
+    /// !0u64 on error. select(2) and pselect(2) are libc-side
+    /// translations to this syscall.
+    Poll = 210,
+
+    /// `epoll_create1(flags)` — create an epoll instance fd.
+    /// arg0 = flags (only EPOLL_CLOEXEC = 0x80000 honoured).
+    EpollCreate = 211,
+
+    /// `epoll_ctl(epfd, op, fd, &event)`. arg0 = epfd,
+    /// arg1 = op (EPOLL_CTL_ADD = 1, MOD = 3, DEL = 2),
+    /// arg2 = target fd, arg3 = event ptr (events u32 + data u64).
+    EpollCtl = 212,
+
+    /// `epoll_wait(epfd, events_out, maxevents, timeout_ms)`.
+    /// arg0 = epfd, arg1 = events_out ptr, arg2 = max,
+    /// arg3 = timeout_ms.
+    EpollWait = 213,
+
+    /// `eventfd2(initval, flags)` — semaphore-shaped fd.
+    /// arg0 = initial counter value, arg1 = flags.
+    Eventfd = 214,
+
+    /// `timerfd_create(clockid, flags)` — timer-backed fd.
+    /// arg0 = clockid (0 = CLOCK_REALTIME, 1 = CLOCK_MONOTONIC),
+    /// arg1 = flags.
+    TimerfdCreate = 215,
+
+    /// `timerfd_settime(fd, flags, &new_value, &old_value)` —
+    /// arm the timer. arg0 = fd, arg1 = flags, arg2 = new_value
+    /// itimerspec ptr, arg3 = old_value out (may be 0).
+    TimerfdSettime = 216,
+
+    /// `signalfd4(fd, &mask, sizemask, flags)` — receive signals
+    /// via an fd. arg0 = fd (-1 = create new), arg1 = sigmask
+    /// ptr, arg2 = sizemask, arg3 = flags.
+    Signalfd = 217,
+
     /// Open an FB connection to a scanout. `arg0` = scanout id (0
     /// for the active scanout). Returns a non-zero `FbHandleId` on
     /// success, 0 on failure (no backend / OOM / not authorised).
@@ -1120,6 +1165,14 @@ impl Syscall {
             207 => Syscall::SocketSetSockOpt,
             208 => Syscall::SockRegisterBuf,
             209 => Syscall::SockSendZc,
+            210 => Syscall::Poll,
+            211 => Syscall::EpollCreate,
+            212 => Syscall::EpollCtl,
+            213 => Syscall::EpollWait,
+            214 => Syscall::Eventfd,
+            215 => Syscall::TimerfdCreate,
+            216 => Syscall::TimerfdSettime,
+            217 => Syscall::Signalfd,
             130 => Syscall::RingKick,
             140 => Syscall::GetPid,
             141 => Syscall::GetPpid,
