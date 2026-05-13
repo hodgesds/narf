@@ -422,33 +422,136 @@ pub fn resolve(root: Arc<dyn DirOps>, path: &str) -> Result<Arc<dyn FileOps>, Fs
     current_dir.lookup(leaf).ok_or(FsError::NotFound)
 }
 
-/// Resolve a relative path asynchronously.
+/// Resolve a relative path asynchronously, with POSIX-2017 (SUSv4)
+/// semantics:
+///
+/// - `.` and empty components are skipped per §4.13.
+/// - `..` walks up one level, clamped at `root` (Linux semantics — the
+///   spec leaves above-root behaviour implementation-defined; clamping
+///   matches what every UNIX shell expects). The mount-root is the
+///   bound; `..` from `/foo` returns the mount-root, never escapes
+///   the mount.
+/// - Symlinks encountered mid-path are followed transparently per
+///   §4.13. A 40-hop cap (the SUSv4 minimum guarantee for SYMLOOP_MAX)
+///   bounds the recursion; exceeding it returns
+///   `FsError::InvalidPath` (POSIX would name this `ELOOP`).
+/// - An absolute symlink target restarts the walk from `root`.
 pub fn resolve_async<'a>(root: Arc<dyn DirOps>, path: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+    let initial = alloc::string::String::from(path);
     Box::pin(async move {
-        if path.is_empty() {
+        if initial.is_empty() {
             return Err(FsError::InvalidPath);
         }
-        if path.as_bytes()[0] == b'/' {
+        if initial.as_bytes()[0] == b'/' {
             return Err(FsError::InvalidPath);
         }
 
-        let mut current_dir = root;
-        let mut components: Vec<&str> = path.split('/').filter(|s| !s.is_empty() && *s != ".").collect();
-        
-        if components.is_empty() {
-             return Err(FsError::InvalidPath);
+        // Components left to consume, head-first so symlink targets can
+        // splice in at the front of the remainder.
+        let mut remaining: alloc::collections::VecDeque<alloc::string::String> = initial
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(alloc::string::String::from)
+            .collect();
+        if remaining.is_empty() {
+            return Err(FsError::InvalidPath);
         }
 
-        let last = components.pop().unwrap();
+        // POSIX-2017 SYMLOOP_MAX guaranteed minimum (§<limits.h>): 8.
+        // We pick 40 to match Linux, which has been the de-facto
+        // ceiling user code expects since the 2.6 series.
+        const SYMLOOP_MAX: usize = 40;
+        let mut symlinks_followed = 0usize;
 
-        for segment in components {
-            if segment == ".." {
-                return Err(FsError::InvalidPath);
+        // Walk position. `parent_chain` remembers the prefix so `..`
+        // can pop one level without re-resolving from root each time.
+        let mut current_dir: Arc<dyn DirOps> = root.clone();
+        let mut parent_chain: alloc::vec::Vec<Arc<dyn DirOps>> = alloc::vec::Vec::new();
+
+        while let Some(seg) = remaining.pop_front() {
+            if seg == "." {
+                continue;
             }
-            current_dir = current_dir.lookup_dir_async(segment).await?;
-        }
+            if seg == ".." {
+                // Pop one level; if we're already at the mount-root,
+                // .. is a no-op (POSIX root.. == root).
+                if let Some(p) = parent_chain.pop() {
+                    current_dir = p;
+                }
+                continue;
+            }
 
-        current_dir.lookup_async(last).await
+            // Decide intermediate vs final by peeking the queue.
+            let is_final = remaining.is_empty();
+
+            // Always lookup as file first. Even an "intermediate"
+            // segment may be a symlink-to-directory, which is reached
+            // through the file-shape lookup.
+            let f = current_dir.lookup_async(&seg).await?;
+            let kind = f.stat_async().await?.mode.file_type;
+
+            if kind == FileType::Symlink {
+                if symlinks_followed >= SYMLOOP_MAX {
+                    return Err(FsError::InvalidPath);
+                }
+                symlinks_followed += 1;
+                // Read the target. POSIX symlink targets are bounded
+                // by SYMLINK_MAX (typically 4096); we cap defensively
+                // at a single page.
+                let mut buf = alloc::vec![0u8; 4096];
+                let n = f.read(0, &mut buf).await?;
+                let target = core::str::from_utf8(&buf[..n])
+                    .map_err(|_| FsError::InvalidPath)?;
+                let absolute = target.starts_with('/');
+                let target_components: alloc::vec::Vec<alloc::string::String> = target
+                    .split('/')
+                    .filter(|s| !s.is_empty())
+                    .map(alloc::string::String::from)
+                    .collect();
+                if absolute {
+                    // Restart from the mount-root for absolute targets.
+                    parent_chain.clear();
+                    current_dir = root.clone();
+                }
+                // Splice target components at the front of remaining.
+                // Push in reverse so the first target component pops
+                // off the queue next.
+                for c in target_components.into_iter().rev() {
+                    remaining.push_front(c);
+                }
+                continue;
+            }
+
+            if is_final {
+                // Last component, ordinary file/dir. Hand back the
+                // FileOps; the caller decides what to do with a Dir
+                // (most likely an open-on-directory which different
+                // syscalls treat differently).
+                return Ok(f);
+            }
+
+            // Intermediate: must be a directory we can descend into.
+            if kind != FileType::Dir {
+                return Err(FsError::NotFound);
+            }
+            let next = match current_dir.lookup_dir_async(&seg).await {
+                Ok(d) => d,
+                Err(FsError::Unsupported) => current_dir
+                    .lookup_dir(&seg)
+                    .ok_or(FsError::NotFound)?,
+                Err(e) => return Err(e),
+            };
+            parent_chain.push(current_dir);
+            current_dir = next;
+        }
+        // We consumed every component without returning. Path
+        // resolved to current_dir (a directory). Re-route through
+        // a dummy lookup so callers get back something concrete —
+        // POSIX `open(".")` returns a fd to the directory itself.
+        // Until DirOps→FileOps coercion exists, surface this as
+        // InvalidPath; callers wanting "open the directory" route
+        // through dirfd APIs instead.
+        Err(FsError::InvalidPath)
     })
 }
 
