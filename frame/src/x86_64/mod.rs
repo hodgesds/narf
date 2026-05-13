@@ -8,6 +8,7 @@ pub mod gdt;
 pub mod idt;
 pub mod percpu;
 pub mod smp;
+pub mod syscall;
 pub mod trap;
 pub mod user;
 
@@ -28,5 +29,12 @@ pub unsafe fn init_traps() {
         gdt::init();
         percpu::init_bsp();
         idt::init();
+        // Enable the fast SYSCALL/SYSRET path now that GDT,
+        // per-CPU GS, and IDT are all live. After this, user
+        // tasks running `syscall` land in
+        // `syscall::syscall_entry_x86_64`. The legacy `int 0x80`
+        // path stays wired for callers that prefer it (and to
+        // exercise the trap-frame-driven dispatch).
+        syscall::enable();
     }
 }
