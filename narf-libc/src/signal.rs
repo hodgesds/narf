@@ -179,12 +179,23 @@ pub struct sigset_t {
 
 /// `siginfo_t` — minimal shape; only `si_signo` is filled today.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug)]
 pub struct siginfo_t {
     pub si_signo: c_int,
     pub si_errno: c_int,
     pub si_code:  c_int,
     pub _pad:     [u8; 116], // matches glibc's 128-byte total
+}
+
+impl Default for siginfo_t {
+    fn default() -> Self {
+        Self {
+            si_signo: 0,
+            si_errno: 0,
+            si_code: 0,
+            _pad: [0; 116],
+        }
+    }
 }
 
 /// `sigemptyset(set)` — clear all bits.

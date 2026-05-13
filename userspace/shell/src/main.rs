@@ -209,6 +209,36 @@ fn polltest_run(fd: i32) {
     unsafe { write_all(fd, b"polltest: ok (eventfd+timerfd+poll)\n"); }
 }
 
+fn mqtest_run(fd: i32) {
+    let name = b"/mqtest\0";
+    let q = unsafe {
+        libc::ipc::mq_open(name.as_ptr() as *const i8, 0o100 /* O_CREAT */, 0o600, core::ptr::null())
+    };
+    if q < 0 {
+        unsafe { write_all(fd, b"mqtest: mq_open failed\n"); }
+        return;
+    }
+    let payload = b"hello mq";
+    let r = unsafe {
+        libc::ipc::mq_send(q, payload.as_ptr() as *const i8, payload.len(), 0)
+    };
+    if r != 0 {
+        unsafe { write_all(fd, b"mqtest: mq_send failed\n"); }
+        return;
+    }
+    let mut buf = [0u8; 64];
+    let n = unsafe {
+        libc::ipc::mq_receive(q, buf.as_mut_ptr() as *mut i8, buf.len(), core::ptr::null_mut())
+    };
+    if n != payload.len() as isize || &buf[..n as usize] != payload {
+        unsafe { write_all(fd, b"mqtest: mq_receive payload mismatch\n"); }
+        return;
+    }
+    let _ = unsafe { libc::ipc::mq_close(q) };
+    let _ = unsafe { libc::ipc::mq_unlink(name.as_ptr() as *const i8) };
+    unsafe { write_all(fd, b"mqtest: ok (mq_send/mq_receive round-trip)\n"); }
+}
+
 fn proctest_open_read(path: &[u8]) -> Option<usize> {
     // path includes the trailing NUL.
     let pfd = unsafe { libc::posix_open(path.as_ptr() as *const i8, 0, 0) };
@@ -846,6 +876,10 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         //   4. read 8 bytes → counter value 1
         //   5. timerfd 50ms one-shot; poll(timeout=200ms) → 1 (ready)
         polltest_run(fd);
+    } else if cmd == b"mqtest" {
+        // mqtest — open a POSIX message queue, send "hello", receive,
+        // verify, unlink.
+        mqtest_run(fd);
     } else if cmd == b"proctest" {
         // proctest — read /proc/cpuinfo + /proc/uptime + /proc/mounts;
         // verify each is non-empty and starts with the expected prefix.

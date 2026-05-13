@@ -184,35 +184,56 @@ pub struct msqid_ds {
 pub const MSG_NOERROR: c_int = 0o10000;
 pub const MSG_EXCEPT:  c_int = 0o20000;
 
-/// `msgget(key, msgflg)` — stub.
+/// `msgget(key, msgflg)` — Sys-V message queue. Routes through
+/// POSIX MQ — name "/sysv-mq-<key-hex>".
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn msgget(_key: key_t, _msgflg: c_int) -> c_int {
-    enosys_minus_one_int()
+pub unsafe extern "C" fn msgget(key: key_t, msgflg: c_int) -> c_int {
+    let mut name = [0u8; 24];
+    let prefix = b"/sysv-mq-";
+    for (i, &b) in prefix.iter().enumerate() { name[i] = b; }
+    let hex = b"0123456789abcdef";
+    let kraw = key as u32;
+    for i in 0..8 {
+        name[9 + i] = hex[((kraw >> ((7 - i) * 4)) & 0xF) as usize];
+    }
+    name[17] = 0;
+    let oflag = if msgflg & 0o1000 /* IPC_CREAT */ != 0 { 0o100 } else { 0 };
+    unsafe { crate::ipc::mq_open(name.as_ptr() as *const i8, oflag, 0o600, core::ptr::null()) }
 }
 
-/// `msgsnd(msqid, msgp, msgsz, msgflg)` — stub.
+/// `msgsnd(msqid, msgp, msgsz, msgflg)` — Sys-V message send.
+/// The first 8 bytes of `msgp` are the type field; we forward the
+/// payload (type + bytes) as-is to mq_send.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn msgsnd(
-    _msqid:  c_int,
-    _msgp:   *const c_void,
-    _msgsz:  size_t,
+    msqid:  c_int,
+    msgp:   *const c_void,
+    msgsz:  size_t,
     _msgflg: c_int,
 ) -> c_int {
-    enosys_minus_one_int()
+    if msgp.is_null() { return -1; }
+    // Sys-V message: { mtype: i64, mtext[msgsz] }
+    let total = msgsz.saturating_add(8);
+    unsafe {
+        crate::ipc::mq_send(msqid, msgp as *const i8, total, 0)
+    }
 }
 
-/// `msgrcv(msqid, msgp, msgsz, msgtyp, msgflg)` — stub. Return
-/// type is `ssize_t` per POSIX.
+/// `msgrcv(msqid, msgp, msgsz, msgtyp, msgflg)` — Sys-V receive.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn msgrcv(
-    _msqid:  c_int,
-    _msgp:   *mut c_void,
-    _msgsz:  size_t,
+    msqid:  c_int,
+    msgp:   *mut c_void,
+    msgsz:  size_t,
     _msgtyp: i64,
     _msgflg: c_int,
 ) -> isize {
-    crate::errno::set_errno(ENOSYS);
-    -1
+    if msgp.is_null() { return -1; }
+    let total = msgsz.saturating_add(8);
+    let n = unsafe {
+        crate::ipc::mq_receive(msqid, msgp as *mut i8, total, core::ptr::null_mut())
+    };
+    if n < 0 { -1 } else { n - 8 } // Sys-V returns text length (excluding mtype)
 }
 
 /// `msgctl(msqid, cmd, buf)` — stub.

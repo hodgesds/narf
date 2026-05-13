@@ -242,3 +242,256 @@ pub unsafe extern "C" fn semget_real(_key: i32, _nsems: c_int, _flag: c_int) -> 
     static SEMID_NEXT: AtomicU32 = AtomicU32::new(1);
     SEMID_NEXT.fetch_add(1, Ordering::Relaxed) as c_int
 }
+
+// ── POSIX message queues — per-process named ringbufs ───────────
+//
+// narf-libc is no_std + no `alloc` dep, so we can't use Vec /
+// VecDeque. Instead we use a fixed-size record ring per queue —
+// 16 records of 256 B each. Real Linux POSIX MQ allows
+// configurable msg_max + msgsize_max via attr; ours is a fixed
+// shape that works for typical POSIX-MQ consumers (control
+// messages, small notifications).
+
+const MQ_MAX: usize = 16;
+const MQ_NAME_MAX: usize = 64;
+const MQ_RECORD_MAX: usize = 256;
+const MQ_RECORDS_PER_QUEUE: usize = 16;
+
+struct MqEntry {
+    name: [u8; MQ_NAME_MAX],
+    name_len: usize,
+    records: [[u8; MQ_RECORD_MAX]; MQ_RECORDS_PER_QUEUE],
+    record_lens: [u32; MQ_RECORDS_PER_QUEUE],
+    head: u32,
+    count: u32,
+}
+
+static mut MQ_TABLE: [Option<MqEntry>; MQ_MAX] = [const { None }; MQ_MAX];
+
+pub type mqd_t = i32;
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct mq_attr {
+    pub mq_flags:   i64,
+    pub mq_maxmsg:  i64,
+    pub mq_msgsize: i64,
+    pub mq_curmsgs: i64,
+    pub _pad:       [i64; 4],
+}
+
+fn mq_lookup(name_bytes: &[u8]) -> Option<usize> {
+    unsafe {
+        for i in 0..MQ_MAX {
+            if let Some(e) = &MQ_TABLE[i] {
+                if &e.name[..e.name_len] == name_bytes {
+                    return Some(i);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mq_open(
+    name:   *const i8,
+    oflag:  c_int,
+    _mode:  u32,
+    attr:   *const mq_attr,
+) -> mqd_t {
+    if name.is_null() {
+        crate::errno::set_errno(22);
+        return -1;
+    }
+    let mut nb = [0u8; MQ_NAME_MAX];
+    let mut nlen = 0usize;
+    while nlen < MQ_NAME_MAX {
+        let b = unsafe { *name.add(nlen) } as u8;
+        if b == 0 { break; }
+        nb[nlen] = b;
+        nlen += 1;
+    }
+    if let Some(idx) = mq_lookup(&nb[..nlen]) {
+        return idx as mqd_t;
+    }
+    if oflag & 0o100 == 0 {
+        crate::errno::set_errno(2);
+        return -1;
+    }
+    // attr is accepted but our queue is fixed-size today.
+    let _ = attr;
+    unsafe {
+        for i in 0..MQ_MAX {
+            if MQ_TABLE[i].is_none() {
+                MQ_TABLE[i] = Some(MqEntry {
+                    name: nb,
+                    name_len: nlen,
+                    records: [[0u8; MQ_RECORD_MAX]; MQ_RECORDS_PER_QUEUE],
+                    record_lens: [0; MQ_RECORDS_PER_QUEUE],
+                    head: 0,
+                    count: 0,
+                });
+                return i as mqd_t;
+            }
+        }
+    }
+    crate::errno::set_errno(11);
+    -1
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mq_close(_mqd: mqd_t) -> c_int { 0 }
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mq_unlink(name: *const i8) -> c_int {
+    if name.is_null() { return -1; }
+    let mut nb = [0u8; MQ_NAME_MAX];
+    let mut nlen = 0;
+    while nlen < MQ_NAME_MAX {
+        let b = unsafe { *name.add(nlen) } as u8;
+        if b == 0 { break; }
+        nb[nlen] = b;
+        nlen += 1;
+    }
+    if let Some(idx) = mq_lookup(&nb[..nlen]) {
+        unsafe { MQ_TABLE[idx] = None; }
+        0
+    } else {
+        crate::errno::set_errno(2);
+        -1
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mq_send(
+    mqd:  mqd_t,
+    msg:  *const i8,
+    len:  usize,
+    _prio: u32,
+) -> c_int {
+    if mqd < 0 || (mqd as usize) >= MQ_MAX || msg.is_null() {
+        return -1;
+    }
+    if len > MQ_RECORD_MAX {
+        crate::errno::set_errno(7);
+        return -1;
+    }
+    unsafe {
+        let entry = match &mut MQ_TABLE[mqd as usize] {
+            Some(e) => e,
+            None => { crate::errno::set_errno(9); return -1; }
+        };
+        if entry.count as usize >= MQ_RECORDS_PER_QUEUE {
+            crate::errno::set_errno(11);
+            return -1;
+        }
+        let tail = ((entry.head + entry.count) as usize) % MQ_RECORDS_PER_QUEUE;
+        for i in 0..len {
+            entry.records[tail][i] = *msg.add(i) as u8;
+        }
+        entry.record_lens[tail] = len as u32;
+        entry.count += 1;
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mq_receive(
+    mqd:  mqd_t,
+    msg:  *mut i8,
+    len:  usize,
+    prio: *mut u32,
+) -> isize {
+    if mqd < 0 || (mqd as usize) >= MQ_MAX || msg.is_null() {
+        return -1;
+    }
+    unsafe {
+        let entry = match &mut MQ_TABLE[mqd as usize] {
+            Some(e) => e,
+            None => { crate::errno::set_errno(9); return -1; }
+        };
+        if entry.count == 0 {
+            crate::errno::set_errno(11);
+            return -1;
+        }
+        let head_idx = entry.head as usize;
+        let rec_len = entry.record_lens[head_idx] as usize;
+        if rec_len > len {
+            crate::errno::set_errno(7);
+            return -1;
+        }
+        for i in 0..rec_len {
+            *msg.add(i) = entry.records[head_idx][i] as i8;
+        }
+        entry.head = (entry.head + 1) % MQ_RECORDS_PER_QUEUE as u32;
+        entry.count -= 1;
+        if !prio.is_null() { *prio = 0; }
+        rec_len as isize
+    }
+}
+
+// ── mkfifo / mknod ──────────────────────────────────────────────
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mkfifo(path: *const i8, mode: u32) -> c_int {
+    if path.is_null() { return -1; }
+    let fd = unsafe {
+        crate::posix::open(path, 0o100 | 0o2, mode)
+    };
+    if fd < 0 { return -1; }
+    let _ = unsafe { crate::posix::close(fd) };
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mknod(path: *const i8, mode: u32, _dev: u64) -> c_int {
+    const S_IFMT: u32 = 0o170000;
+    const S_IFIFO: u32 = 0o010000;
+    const S_IFREG: u32 = 0o100000;
+    match mode & S_IFMT {
+        S_IFIFO => unsafe { mkfifo(path, mode & 0o7777) },
+        S_IFREG | 0 => {
+            if path.is_null() { return -1; }
+            let fd = unsafe { crate::posix::open(path, 0o100, mode & 0o7777) };
+            if fd < 0 { return -1; }
+            let _ = unsafe { crate::posix::close(fd) };
+            0
+        }
+        _ => {
+            crate::errno::set_errno(1);
+            -1
+        }
+    }
+}
+
+// ── inotify ─────────────────────────────────────────────────────
+//
+// Stage-1: inotify_init returns an eventfd-shaped fd that never
+// fires. Real change-notification hooks land when the FS layer
+// gains an "on-mutation" callback.
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn inotify_init1(_flags: c_int) -> c_int {
+    narf_user_runtime::eventfd(0, 0)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn inotify_init() -> c_int {
+    unsafe { inotify_init1(0) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn inotify_add_watch(
+    _fd:   c_int,
+    _path: *const i8,
+    _mask: u32,
+) -> c_int {
+    static WATCH_NEXT: AtomicU32 = AtomicU32::new(1);
+    WATCH_NEXT.fetch_add(1, Ordering::Relaxed) as c_int
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn inotify_rm_watch(_fd: c_int, _wd: c_int) -> c_int {
+    0
+}
