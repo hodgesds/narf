@@ -123,10 +123,17 @@ fn enosys_minus_one_int() -> c_int {
     -1
 }
 
-/// `shmget(key, size, shmflg)` — stub.
+/// `shmget(key, size, shmflg)` — Sys-V shared memory routed
+/// through POSIX shm_open. The returned fd doubles as the
+/// Sys-V shmid; consumers that ftruncate before mmap get the
+/// expected shape.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn shmget(_key: key_t, _size: size_t, _shmflg: c_int) -> c_int {
-    enosys_minus_one_int()
+pub unsafe extern "C" fn shmget(key: key_t, size: size_t, shmflg: c_int) -> c_int {
+    let fd = unsafe { crate::ipc::shmget_real(key as i32, size as usize, shmflg) };
+    if fd < 0 { return -1; }
+    // Size the underlying memfile to `size`.
+    let _ = unsafe { crate::posix::ftruncate(fd, size as i64) };
+    fd
 }
 
 /// `shmat(shmid, shmaddr, shmflg)` — stub returning `(void*)-1`.
@@ -251,14 +258,16 @@ pub const GETZCNT:  c_int = 15;
 pub const SETVAL:   c_int = 16;
 pub const SETALL:   c_int = 17;
 
-/// `semget(key, nsems, semflg)` — stub.
+/// `semget(key, nsems, semflg)` — Sys-V counter array. Backed by
+/// a per-semid sem_t in a libc-side table; semop's per-element
+/// `sem_num` indexes the array.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn semget(
-    _key:    key_t,
-    _nsems:  c_int,
-    _semflg: c_int,
+    key:    key_t,
+    nsems:  c_int,
+    semflg: c_int,
 ) -> c_int {
-    enosys_minus_one_int()
+    unsafe { crate::ipc::semget_real(key as i32, nsems, semflg) }
 }
 
 /// `semop(semid, sops, nsops)` — stub.

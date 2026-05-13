@@ -209,6 +209,87 @@ fn polltest_run(fd: i32) {
     unsafe { write_all(fd, b"polltest: ok (eventfd+timerfd+poll)\n"); }
 }
 
+// Globals for shmtest: a sem_t shared between two threads + the
+// shm-open path used by both.
+static mut SHMTEST_SEM: libc::ipc::sem_t = libc::ipc::sem_t { _opaque: [0; 32] };
+static SHMTEST_RESULT: AtomicU32 = AtomicU32::new(0);
+const SHMTEST_NAME: &[u8] = b"/shmtest\0";
+const SHMTEST_PAYLOAD: &[u8] = b"hello shm";
+
+extern "C" fn shmtest_consumer(_arg: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+    use core::sync::atomic::Ordering;
+    // Wait for the producer to publish.
+    unsafe { libc::ipc::sem_wait(&raw mut SHMTEST_SEM); }
+    // Open the same shm by name + read.
+    let fd = unsafe {
+        libc::ipc::shm_open(SHMTEST_NAME.as_ptr() as *const i8, 0 /* O_RDONLY */, 0)
+    };
+    if fd < 0 {
+        SHMTEST_RESULT.store(0xE1, Ordering::SeqCst);
+        return core::ptr::null_mut();
+    }
+    let mut buf = [0u8; 32];
+    let n = unsafe {
+        libc::posix::read(fd, buf.as_mut_ptr() as *mut _, SHMTEST_PAYLOAD.len())
+    };
+    if n != SHMTEST_PAYLOAD.len() as isize
+        || &buf[..SHMTEST_PAYLOAD.len()] != SHMTEST_PAYLOAD
+    {
+        SHMTEST_RESULT.store(0xE2, Ordering::SeqCst);
+        return core::ptr::null_mut();
+    }
+    let _ = unsafe { libc::posix::close(fd) };
+    SHMTEST_RESULT.store(1, Ordering::SeqCst);
+    core::ptr::null_mut()
+}
+
+fn shmtest_run(fd: i32) {
+    use core::sync::atomic::Ordering;
+    SHMTEST_RESULT.store(0, Ordering::SeqCst);
+    unsafe { let _ = libc::ipc::sem_init(&raw mut SHMTEST_SEM, 0, 0); }
+    // Producer: shm_open + write payload, then sem_post.
+    let pfd = unsafe {
+        libc::ipc::shm_open(
+            SHMTEST_NAME.as_ptr() as *const i8,
+            0o100 | 0o2 /* O_CREAT | O_RDWR */,
+            0o600,
+        )
+    };
+    if pfd < 0 {
+        unsafe { write_all(fd, b"shmtest: shm_open(producer) failed\n"); }
+        return;
+    }
+    let n = unsafe {
+        libc::posix::write(pfd, SHMTEST_PAYLOAD.as_ptr() as *const _, SHMTEST_PAYLOAD.len())
+    };
+    if n != SHMTEST_PAYLOAD.len() as isize {
+        unsafe { write_all(fd, b"shmtest: write(producer) short\n"); }
+        return;
+    }
+    let _ = unsafe { libc::posix::close(pfd) };
+    // Spawn consumer + signal it.
+    let mut tid: u64 = 0;
+    let attr = core::ptr::null::<libc::pthread_attr_t>();
+    let _ = unsafe {
+        libc::pthread_create(&mut tid as *mut u64, attr, shmtest_consumer, core::ptr::null_mut())
+    };
+    unsafe { libc::ipc::sem_post(&raw mut SHMTEST_SEM); }
+    let _ = unsafe { libc::pthread_join(tid, core::ptr::null_mut()) };
+    let _ = unsafe { libc::ipc::shm_unlink(SHMTEST_NAME.as_ptr() as *const i8) };
+    let r = SHMTEST_RESULT.load(Ordering::SeqCst);
+    if r == 1 {
+        unsafe { write_all(fd, b"shmtest: ok (shm_open+sem ping->pong)\n"); }
+    } else {
+        let mut buf = [0u8; 12];
+        let s = u32_to_decimal(r, &mut buf);
+        unsafe {
+            write_all(fd, b"shmtest: failed stage=0x");
+            write_all(fd, s);
+            write_all(fd, NEWLINE);
+        }
+    }
+}
+
 // Build a sockaddr_in (16 bytes): family u16 + port u16 BE +
 // in_addr u32 BE + 8 bytes zero. Returns total length (= 16).
 fn make_sockaddr_in(buf: &mut [u8; 16], port: u16, ip: u32) -> u32 {
@@ -652,6 +733,11 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         //   4. read 8 bytes → counter value 1
         //   5. timerfd 50ms one-shot; poll(timeout=200ms) → 1 (ready)
         polltest_run(fd);
+    } else if cmd == b"shmtest" {
+        // shmtest — shm_open + ftruncate + 2-thread sem coordination.
+        // Thread A creates a shm segment, writes "hello", sem_post.
+        // Thread B sem_waits, opens the same shm, reads, verifies.
+        shmtest_run(fd);
     } else if cmd == b"tcptest" {
         // tcptest — same shape as socktest but AF_INET / 127.0.0.1
         // / port 8000. Worker thread binds + listens + accepts +

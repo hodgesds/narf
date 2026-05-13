@@ -1421,6 +1421,17 @@ pub fn register_initcalls() {
         mount_devfs_default();
         InitResult::Ok
     });
+    // POSIX shm: mount an empty memfs at /dev/shm so shm_open just
+    // becomes open("/dev/shm/<name>", flags). Sized for typical
+    // C++ std::shared_memory + lock-free queue scratch — grows on
+    // demand.
+    narf_init::register(Stage::Fs, "devshm-mount", || {
+        let auth = bootstrap_mount_authority();
+        let _ = registry().mount(&auth, "/dev/shm", MemFs::new("shm"));
+        // /tmp is also POSIX-required (mkstemp, std::tmpfile).
+        let _ = registry().mount(&auth, "/tmp", MemFs::new("tmp"));
+        InitResult::Ok
+    });
 }
 
 /// Stage 3 placeholder for a virtiofs mount. Stage 4 wires the DAX
