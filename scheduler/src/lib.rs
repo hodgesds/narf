@@ -465,6 +465,27 @@ pub fn address_space_of(id: TaskId) -> Option<Arc<AddressSpace>> {
     None
 }
 
+/// Snapshot of every task currently sitting on a per-CPU ready
+/// queue. Used by /proc to enumerate `[pid]` subdirectories and
+/// by debug surfaces (`ps`-style introspection).
+///
+/// Intentionally returns owned Vec rather than an iterator: the
+/// per-CPU lock is dropped before any caller code runs, so the
+/// snapshot can become stale immediately. Stale-but-consistent is
+/// the right semantic for /proc — Linux reports the same shape.
+pub fn all_task_ids() -> alloc::vec::Vec<TaskId> {
+    let mut out = alloc::vec::Vec::new();
+    for q in READY.iter() {
+        let g = q.lock();
+        if let Some(ref dq) = *g {
+            for slot in dq.iter() {
+                out.push(slot.id);
+            }
+        }
+    }
+    out
+}
+
 /// Replace the address space attached to `id`. Returns the
 /// previous Arc so the caller can decide what to do with it
 /// (e.g. drop immediately to free the old AS's frames + page-

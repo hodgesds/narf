@@ -5899,6 +5899,63 @@ pub fn signal_pending_of(task: u64) -> u32 {
         .unwrap_or(0)
 }
 
+/// /proc/self pid hook — returns the current task id.
+pub fn proc_current_pid() -> u64 {
+    current_task_id()
+}
+
+/// /proc enumerator — returns every live task id.
+pub fn proc_list_pids() -> alloc::vec::Vec<u64> {
+    narf_scheduler::all_task_ids()
+        .into_iter()
+        .map(|t| t.0)
+        .collect()
+}
+
+/// /proc/[pid]/* metadata accessor.
+pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo> {
+    use narf_filesystem::procfs::ProcTaskInfo;
+    // Don't gate on "is on a ready queue" — the currently-running
+    // task has been popped from its queue for polling and would
+    // fail that check while it's the very task asking. Treat any
+    // pid that matches the caller OR a queued task as live.
+    let current = current_task_id();
+    let live = pid == current
+        || narf_scheduler::all_task_ids().iter().any(|t| t.0 == pid);
+    if !live {
+        return None;
+    }
+    // brk top — pull from the per-task BRK_TABLE. May be 0 if the
+    // task hasn't called brk yet.
+    let brk_top = {
+        let g = BRK_TABLE.lock();
+        g.as_ref().and_then(|m| m.get(&pid).copied()).unwrap_or(0)
+    };
+    // Stack top — from the AS's regions table, look for the top
+    // RW-X region with the user-stack base. Stage-1 just reports
+    // the standard DEFAULT_USER_STACK_BASE + DEFAULT_USER_STACK_BYTES.
+    let stack_top = crate::process::DEFAULT_USER_STACK_BASE
+        + crate::process::DEFAULT_USER_STACK_BYTES;
+    // Comm name — Stage-1 default. Real per-task name tracking
+    // would come through a `set_task_comm(pid, name)` accessor
+    // (PR_SET_NAME-style) once any consumer needs it.
+    let comm = if pid == 0 {
+        alloc::string::String::from("kernel")
+    } else {
+        alloc::format!("task-{}", pid)
+    };
+    // cmdline — empty until argv tracking lands at exec time.
+    let cmdline = alloc::vec::Vec::new();
+    Some(ProcTaskInfo {
+        pid,
+        comm,
+        state: 'R',
+        brk_top,
+        stack_top,
+        cmdline,
+    })
+}
+
 /// Clear the pending bit for `signum` on `task`. Used by signalfd
 /// after delivering the signal through the fd path.
 pub fn clear_signal_pending(task: u64, signum: u32) {

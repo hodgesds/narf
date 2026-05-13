@@ -2278,6 +2278,13 @@ fn boot_userspace_init() {
     narf_filesystem::install_console_signal_hook(
         narf_userspace::handlers::maybe_deliver_signal_for_input,
     );
+    // /proc per-pid hooks — exposes the live scheduler task list +
+    // per-task metadata to /proc/[pid]/* and /proc/self/*.
+    narf_filesystem::procfs::install_proc_hooks(
+        narf_userspace::handlers::proc_current_pid,
+        narf_userspace::handlers::proc_list_pids,
+        narf_userspace::handlers::proc_task_info,
+    );
 
     // Syscall table.
     let mut t = SyscallTable::new();

@@ -209,6 +209,78 @@ fn polltest_run(fd: i32) {
     unsafe { write_all(fd, b"polltest: ok (eventfd+timerfd+poll)\n"); }
 }
 
+fn pidtest_run(fd: i32) {
+    // Read /proc/self/comm — should be non-empty.
+    let pfd = unsafe {
+        libc::posix_open(b"/proc/self/comm\0".as_ptr() as *const i8, 0, 0)
+    };
+    if pfd < 0 {
+        unsafe { write_all(fd, b"pidtest: open(/proc/self/comm) failed\n"); }
+        return;
+    }
+    let mut buf = [0u8; 64];
+    let n = unsafe {
+        libc::posix::read(pfd, buf.as_mut_ptr() as *mut _, buf.len())
+    };
+    let _ = unsafe { libc::posix::close(pfd) };
+    if n <= 0 {
+        unsafe { write_all(fd, b"pidtest: empty /proc/self/comm\n"); }
+        return;
+    }
+    // Read /proc/self/stat — should start with our pid.
+    let pfd = unsafe {
+        libc::posix_open(b"/proc/self/stat\0".as_ptr() as *const i8, 0, 0)
+    };
+    if pfd < 0 {
+        unsafe { write_all(fd, b"pidtest: open(/proc/self/stat) failed\n"); }
+        return;
+    }
+    let mut sbuf = [0u8; 256];
+    let n = unsafe {
+        libc::posix::read(pfd, sbuf.as_mut_ptr() as *mut _, sbuf.len())
+    };
+    let _ = unsafe { libc::posix::close(pfd) };
+    if n <= 0 {
+        unsafe { write_all(fd, b"pidtest: empty /proc/self/stat\n"); }
+        return;
+    }
+    // First field of stat is pid in ASCII.
+    let mut pid_from_stat: u32 = 0;
+    for i in 0..n as usize {
+        let b = sbuf[i];
+        if b == b' ' { break; }
+        if (b as char).is_ascii_digit() {
+            pid_from_stat = pid_from_stat * 10 + ((b - b'0') as u32);
+        } else {
+            unsafe { write_all(fd, b"pidtest: stat field 0 not numeric\n"); }
+            return;
+        }
+    }
+    // Also call getpid() and confirm equality.
+    let our_pid = unsafe { libc::getpid() } as u32;
+    if pid_from_stat != our_pid {
+        unsafe {
+            write_all(fd, b"pidtest: pid mismatch self=");
+            let mut ab = [0u8; 12];
+            let s = u32_to_decimal(our_pid, &mut ab);
+            write_all(fd, s);
+            write_all(fd, b" stat=");
+            let mut bb = [0u8; 12];
+            let s2 = u32_to_decimal(pid_from_stat, &mut bb);
+            write_all(fd, s2);
+            write_all(fd, NEWLINE);
+        }
+        return;
+    }
+    unsafe {
+        write_all(fd, b"pidtest: ok (/proc/self/stat pid=");
+        let mut buf = [0u8; 12];
+        let s = u32_to_decimal(our_pid, &mut buf);
+        write_all(fd, s);
+        write_all(fd, b" matches getpid())\n");
+    }
+}
+
 fn flocktest_run(fd: i32) {
     // Two distinct fds against the same /tmp file (different
     // open() calls give different FdEntry but the same backing
@@ -913,6 +985,10 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         //   4. read 8 bytes → counter value 1
         //   5. timerfd 50ms one-shot; poll(timeout=200ms) → 1 (ready)
         polltest_run(fd);
+    } else if cmd == b"pidtest" {
+        // pidtest — read /proc/self/{stat,comm,status},
+        // /proc/<our-pid>/comm, verify pid matches.
+        pidtest_run(fd);
     } else if cmd == b"flocktest" {
         // flocktest — open the same path twice; first dup gets
         // LOCK_EX, second dup's LOCK_EX|LOCK_NB fails (EX held);
