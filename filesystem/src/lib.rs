@@ -64,6 +64,7 @@ pub mod devfs;
 pub mod fuse;
 pub mod memfs;
 pub mod page_cache;
+pub mod procfs;
 
 mod tests;
 pub use devfs::{install_console_signal_hook, mount_default as mount_devfs_default, DevFs};
@@ -395,14 +396,20 @@ pub trait DirOps: Send + Sync {
             .collect()
     }
 
-    /// Resolve a single name component asynchronously.
-    fn lookup_async<'a>(&'a self, _name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
-        Box::pin(async move { Err(FsError::Unsupported) })
+    /// Resolve a single name component asynchronously. Default
+    /// falls back to the sync `lookup`, so directories that only
+    /// implement the sync side (procfs, devfs, initramfs) work
+    /// transparently with async callers (resolve_async).
+    fn lookup_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        let r = self.lookup(name).ok_or(FsError::NotFound);
+        Box::pin(async move { r })
     }
 
-    /// Look up a child as a directory asynchronously.
-    fn lookup_dir_async<'a>(&'a self, _name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
-        Box::pin(async move { Err(FsError::Unsupported) })
+    /// Look up a child as a directory asynchronously. Default
+    /// falls back to the sync `lookup_dir`.
+    fn lookup_dir_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
+        let r = self.lookup_dir(name).ok_or(FsError::NotFound);
+        Box::pin(async move { r })
     }
 
     /// Snapshot entries asynchronously.
@@ -1430,6 +1437,15 @@ pub fn register_initcalls() {
         let _ = registry().mount(&auth, "/dev/shm", MemFs::new("shm"));
         // /tmp is also POSIX-required (mkstemp, std::tmpfile).
         let _ = registry().mount(&auth, "/tmp", MemFs::new("tmp"));
+        InitResult::Ok
+    });
+    // /proc — synthetic per-process and system-wide read-only views.
+    // /sys — Linux-shaped device-attribute tree; today an empty memfs
+    // root that drivers can populate later.
+    narf_init::register(Stage::Fs, "procfs-mount", || {
+        let auth = bootstrap_mount_authority();
+        let _ = registry().mount(&auth, "/proc", procfs::ProcFs);
+        let _ = registry().mount(&auth, "/sys", MemFs::new("sysfs"));
         InitResult::Ok
     });
 }

@@ -209,6 +209,38 @@ fn polltest_run(fd: i32) {
     unsafe { write_all(fd, b"polltest: ok (eventfd+timerfd+poll)\n"); }
 }
 
+fn proctest_open_read(path: &[u8]) -> Option<usize> {
+    // path includes the trailing NUL.
+    let pfd = unsafe { libc::posix_open(path.as_ptr() as *const i8, 0, 0) };
+    if pfd < 0 { return None; }
+    let mut buf = [0u8; 256];
+    let n = unsafe {
+        libc::posix::read(pfd, buf.as_mut_ptr() as *mut _, buf.len())
+    };
+    let _ = unsafe { libc::posix::close(pfd) };
+    if n <= 0 { None } else { Some(n as usize) }
+}
+
+fn proctest_run(fd: i32) {
+    if proctest_open_read(b"/proc/cpuinfo\0").is_none() {
+        unsafe { write_all(fd, b"proctest: cpuinfo failed\n"); }
+        return;
+    }
+    if proctest_open_read(b"/proc/uptime\0").is_none() {
+        unsafe { write_all(fd, b"proctest: uptime failed\n"); }
+        return;
+    }
+    if proctest_open_read(b"/proc/version\0").is_none() {
+        unsafe { write_all(fd, b"proctest: version failed\n"); }
+        return;
+    }
+    if proctest_open_read(b"/proc/mounts\0").is_none() {
+        unsafe { write_all(fd, b"proctest: mounts failed\n"); }
+        return;
+    }
+    unsafe { write_all(fd, b"proctest: ok (cpuinfo+uptime+version+mounts)\n"); }
+}
+
 fn udptest_run(fd: i32) {
     // Two UDP sockets on 127.0.0.1.
     let a = unsafe { libc::socket(2, 2 /* SOCK_DGRAM */, 0) };
@@ -814,6 +846,10 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         //   4. read 8 bytes → counter value 1
         //   5. timerfd 50ms one-shot; poll(timeout=200ms) → 1 (ready)
         polltest_run(fd);
+    } else if cmd == b"proctest" {
+        // proctest — read /proc/cpuinfo + /proc/uptime + /proc/mounts;
+        // verify each is non-empty and starts with the expected prefix.
+        proctest_run(fd);
     } else if cmd == b"udptest" {
         // udptest — bind two UDP sockets on 127.0.0.1:9000 / :9001;
         // one sendto's "ping" to the other; recvfrom verifies the
