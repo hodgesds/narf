@@ -111,11 +111,13 @@ impl Smbus {
 
     /// Wait for HOST_BUSY to clear, then clear status latches.
     fn wait_idle(&self) -> Result<(), SmbusError> {
-        // responsive_spin ticks sleep_pumps so cursor/FB stay alive.
-        let done = narf_scheduler::responsive_spin(
+        // responsive_spin_until ticks sleep_pumps so cursor/FB stay
+        // alive. SMBus 3.0 §4.3 caps a single transaction at 35 ms
+        // (T_TIMEOUT); 100 ms is the wedge threshold.
+        let done = narf_scheduler::responsive_spin_until(
             // SAFETY: x86_64 PIO; SMBus IO window owned by us.
             || unsafe { pio_in8(self.io_base + SMB_HST_STS) } & STS_HOST_BUSY == 0,
-            1_000_000,
+            narf_time::Deadline::after_ms(100),
         );
         if !done {
             return Err(SmbusError::Busy);
@@ -130,13 +132,15 @@ impl Smbus {
 
     /// Wait for INTR (success) or any error bit.
     fn wait_complete(&self) -> Result<(), SmbusError> {
-        // responsive_spin ticks sleep_pumps so cursor/FB stay alive.
-        let done = narf_scheduler::responsive_spin(
+        // responsive_spin_until ticks sleep_pumps so cursor/FB stay
+        // alive. SMBus 3.0 §4.3 T_TIMEOUT 35 ms upper bound; 250 ms
+        // wedge threshold.
+        let done = narf_scheduler::responsive_spin_until(
             // SAFETY: x86_64 PIO.
             || unsafe { pio_in8(self.io_base + SMB_HST_STS) }
                 & (STS_BUS_ERR | STS_DEV_ERR | STS_FAILED | STS_INTR)
                 != 0,
-            10_000_000,
+            narf_time::Deadline::after_ms(250),
         );
         if !done {
             return Err(SmbusError::Timeout);

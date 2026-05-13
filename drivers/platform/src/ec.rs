@@ -62,12 +62,14 @@ impl AcpiEc {
 
     /// Wait for the Input Buffer to be empty.
     fn wait_ibf_empty(&self) -> Result<(), DriverError> {
-        // responsive_spin ticks sleep_pumps so cursor/FB stay alive
-        // if the EC is wedged.
-        let done = narf_scheduler::responsive_spin(
+        // responsive_spin_until ticks sleep_pumps so cursor/FB stay
+        // alive if the EC is wedged. ACPI 6.5 §5.2.15: an EC
+        // command is bounded by T_EC (~10 ms typical); 100 ms wedge
+        // threshold.
+        let done = narf_scheduler::responsive_spin_until(
             // SAFETY: validated EC status port from ECDT or standard base.
             || unsafe { narf_arch::x86_64::io_port::inb(self.control_port) } & EC_STS_IBF == 0,
-            100_000,
+            narf_time::Deadline::after_ms(100),
         );
         if done {
             Ok(())
@@ -78,12 +80,13 @@ impl AcpiEc {
 
     /// Wait for the Output Buffer to be full.
     fn wait_obf_full(&self) -> Result<(), DriverError> {
-        // responsive_spin ticks sleep_pumps so cursor/FB stay alive
-        // if the EC is slow to publish a response.
-        let done = narf_scheduler::responsive_spin(
+        // responsive_spin_until ticks sleep_pumps so cursor/FB stay
+        // alive if the EC is slow to publish a response. 100 ms
+        // wedge threshold (T_EC ~10 ms typical).
+        let done = narf_scheduler::responsive_spin_until(
             // SAFETY: validated EC status port.
             || unsafe { narf_arch::x86_64::io_port::inb(self.control_port) } & EC_STS_OBF != 0,
-            100_000,
+            narf_time::Deadline::after_ms(100),
         );
         if done {
             Ok(())
