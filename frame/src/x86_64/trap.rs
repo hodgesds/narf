@@ -488,40 +488,177 @@ impl<'a> TrapContext for X86TrapContext<'a> {
     }
 
     fn deliver_signal(&mut self, handler_vaddr: u64, signum: u32) -> bool {
-        // Synthetic frame on the user stack: push saved_rip and
-        // signum so the handler is reached by an `iretq` to
-        // `handler_vaddr` with a fresh `rsp` two words below the
-        // trapping rsp. The handler is `extern "C" fn(u32)` —
-        // SysV first integer arg lives in rdi (= signum), and
-        // the handler's `ret` epilogue pops `[saved_rip]` (the
-        // first word at the new rsp) so execution resumes at
-        // exactly the trapping instruction.
+        // POSIX-compliant signal delivery. Saves the full pre-trap
+        // user context as a SigContext on the user stack so the
+        // handler can return through sys_sigreturn (sycall 187),
+        // which restores every register exactly. Pre-fix the path
+        // only saved RIP — handlers that clobbered callee-saved
+        // regs (per SysV C ABI compliant handlers don't, but signal
+        // handlers commonly do non-trivial work) corrupted the
+        // resumed thread.
         //
-        // Layout after the push (low → high):
-        //   [new_rsp + 0]  = saved_rip   (handler's `ret` pops)
-        //   [new_rsp + 8]  = signum (zero-extended to u64) — kept
-        //                    as a record for debug, never read
-        //                    by the handler
+        // Stack layout after delivery (low → high addresses):
         //
-        // CR3 is still the user's at this point (the trap path
-        // doesn't switch CR3 for int-0x80), so direct writes to
-        // the user vaddr resolve through the live page tables.
-        let new_rsp = self.frame.rsp.wrapping_sub(16);
-        // SAFETY: `new_rsp` lives in the calling task's user AS
-        // (the very stack the trapping instruction was using); we
-        // store two qwords at the freshly-allocated 16-byte slot.
-        // A bad user RSP faults the user into its own #PF, not
-        // ours. The pointer is u64-aligned because user code
-        // observes 16-byte stack alignment at every call site;
-        // even if it's only 8-byte aligned, x86_64 supports
-        // unaligned u64 stores.
+        //   [new_rsp + 0  ]  fallback_return (handler's `ret` pops
+        //                    this if it doesn't go through
+        //                    sigreturn; we point it at the saved
+        //                    RIP so a degenerate handler that just
+        //                    returns lands at the trapping
+        //                    instruction without state restoration)
+        //   [new_rsp + 8  ]  SigContext { ... }   (fits in 192 B)
+        //
+        // The handler `handler_vaddr` is what libc registered via
+        // sigaction — typically a libc-provided trampoline that
+        // dispatches to the user's actual handler then calls
+        // sys_sigreturn (syscall 187), which restores the
+        // SigContext frame. A user that registers a raw handler
+        // (no libc) falls through to the fallback_return path.
+        //
+        // Handler signature: `extern "C" fn(c_int)` — signum in rdi.
+        // sigcontext addr in rsi.
+        let fallback_return = self.frame.rip;
+
+        // Build the SigContext on the user stack. Total bytes:
+        // 128 (SysV red zone — caller's data above RSP) +
+        // size_of::<SigContext>() (176) + 8 (fallback_return slot).
+        // Skipping the red zone means we'd clobber bytes the caller
+        // legitimately stored above its declared RSP (e.g. the call
+        // frame's return address that the function hasn't pushed
+        // yet under SysV-amd64 §3.2.2).
+        let ctx_size = core::mem::size_of::<SigContext>() as u64;
+        const SYSV_RED_ZONE: u64 = 128;
+        let raw_rsp = self.frame.rsp.wrapping_sub(SYSV_RED_ZONE + ctx_size + 8);
+        // Align the new RSP to 16-byte boundary, then `| 0x8`. The
+        // handler is reached via iretq (no implicit `call` push), so
+        // it must see RSP at the position a `call` would have left
+        // it: 16k + 8. The function prologue's `push rbp` then lands
+        // at 16k.
+        let new_rsp = (raw_rsp & !0xFu64) | 0x8;
+
+        let ctx_vaddr = new_rsp + 8;
+        let ctx = SigContext {
+            r15: self.frame.r15,
+            r14: self.frame.r14,
+            r13: self.frame.r13,
+            r12: self.frame.r12,
+            r11: self.frame.r11,
+            r10: self.frame.r10,
+            r9: self.frame.r9,
+            r8: self.frame.r8,
+            rbp: self.frame.rbp,
+            rdi: self.frame.rdi,
+            rsi: self.frame.rsi,
+            rdx: self.frame.rdx,
+            rcx: self.frame.rcx,
+            rbx: self.frame.rbx,
+            rax: self.frame.rax,
+            rip: self.frame.rip,
+            rflags: self.frame.rflags,
+            rsp: self.frame.rsp,
+            signum: signum as u64,
+            _pad: [0; 3],
+        };
+
+        // SAFETY: the user stack is mapped in the active CR3; the
+        // CPU is at CPL=0 holding the trap; writes through the user
+        // vaddr cross the demand-paging branch on the new bytes if
+        // needed.
         unsafe {
-            core::ptr::write_volatile(new_rsp as *mut u64, self.frame.rip);
-            core::ptr::write_volatile((new_rsp + 8) as *mut u64, signum as u64);
+            core::ptr::write_volatile(new_rsp as *mut u64, fallback_return);
+            core::ptr::write_volatile(ctx_vaddr as *mut SigContext, ctx);
         }
+
         self.frame.rsp = new_rsp;
         self.frame.rdi = signum as u64;
+        // The trampoline reads sigcontext via rsi (libc convention).
+        self.frame.rsi = ctx_vaddr;
         self.frame.rip = handler_vaddr;
         true
     }
+
+    fn perform_sigreturn(&mut self, sc_vaddr: u64) -> bool {
+        // SAFETY: same conditions as deliver_signal — we're at CPL=0
+        // holding the trap frame for the calling task; sc_vaddr is
+        // the explicit sigcontext addr the trampoline forwarded
+        // (originally set in RSI by deliver_signal).
+        unsafe { perform_sigreturn(self, sc_vaddr) }
+    }
+}
+
+/// Saved register state for a signal-delivery sigreturn round-trip.
+/// Layout matches what `sys_sigreturn` reads back from user RSP+8.
+/// Wire-stable: the libc-side trampoline / debugger walks the same
+/// shape.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct SigContext {
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub r11: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
+    pub rbp: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rdx: u64,
+    pub rcx: u64,
+    pub rbx: u64,
+    pub rax: u64,
+    pub rip: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+    pub signum: u64,
+    pub _pad: [u64; 3],
+}
+
+/// Restore a SigContext frame at user RSP+8 into the live trap
+/// frame. Called from `sys_sigreturn`. The user RSP at entry is
+/// pointing at the trampoline-return slot; the SigContext sits 8
+/// bytes above. After restore the trap path's iretq lands the user
+/// back at the saved RIP with full register state.
+///
+/// # Safety
+/// Must be called from the int-0x80 trap-handler context after
+/// kernel_syscall_entry has run; `self.frame` is the live trap
+/// frame about to be popped by iretq.
+unsafe fn perform_sigreturn(ctx: &mut X86TrapContext<'_>, sc_vaddr: u64) -> bool {
+    if (ctx.frame.cs & 3) != 3 {
+        return false;
+    }
+    if sc_vaddr == 0 {
+        return false;
+    }
+    // SAFETY: user-supplied vaddr; the read goes through the active
+    // user AS. A bogus addr faults user-side.
+    let sc = unsafe { core::ptr::read_volatile(sc_vaddr as *const SigContext) };
+    use core::fmt::Write as _;
+    ctx.frame.r15 = sc.r15;
+    ctx.frame.r14 = sc.r14;
+    ctx.frame.r13 = sc.r13;
+    ctx.frame.r12 = sc.r12;
+    ctx.frame.r11 = sc.r11;
+    ctx.frame.r10 = sc.r10;
+    ctx.frame.r9 = sc.r9;
+    ctx.frame.r8 = sc.r8;
+    ctx.frame.rbp = sc.rbp;
+    ctx.frame.rdi = sc.rdi;
+    ctx.frame.rsi = sc.rsi;
+    ctx.frame.rdx = sc.rdx;
+    ctx.frame.rcx = sc.rcx;
+    ctx.frame.rbx = sc.rbx;
+    ctx.frame.rax = sc.rax;
+    ctx.frame.rip = sc.rip;
+    // Preserve only IF (bit 9) + TF (bit 8) from the saved RFLAGS
+    // (POSIX requires the trap context's flags to be restored
+    // verbatim, but a malicious user setting NT/IOPL bits could
+    // escape sandboxing on a future fork; mask to the safe set).
+    const SAFE_RFLAGS: u64 = (1 << 9) | (1 << 8) | (1 << 0); // IF, TF, CF
+    let preserved = sc.rflags & SAFE_RFLAGS;
+    let kept_kernel = ctx.frame.rflags & !SAFE_RFLAGS;
+    ctx.frame.rflags = preserved | kept_kernel;
+    ctx.frame.rsp = sc.rsp;
+    true
 }

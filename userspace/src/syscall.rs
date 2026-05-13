@@ -84,6 +84,17 @@ pub trait TrapContext {
         false
     }
 
+    /// Pop a SigContext frame at the user vaddr `sc_vaddr` (passed
+    /// explicitly because the libc trampoline's intervening call
+    /// frames shift RSP between deliver_signal and sigreturn) and
+    /// restore the live trap context from it. Inverse of
+    /// `deliver_signal`. Returns true if the restore succeeded;
+    /// false if the arch hasn't implemented sigreturn (in which
+    /// case `sys_sigreturn` surfaces InvalidOp).
+    fn perform_sigreturn(&mut self, _sc_vaddr: u64) -> bool {
+        false
+    }
+
     /// Whether the trap is about to return to user mode. The
     /// signal-delivery hook only fires on user-bound returns;
     /// kernel-bound returns (e.g. from a `redirect_to_kernel`
@@ -431,6 +442,17 @@ pub enum Syscall {
     /// affect its own view. Other flags are accepted but ignored.
     /// Returns 0 on success, !0u64 on failure.
     Unshare = 186,
+
+    /// `sigreturn()` — restore the calling task's user-mode trap
+    /// context from a SigContext frame at the current RSP. Called
+    /// from a libc-provided signal trampoline after the user's
+    /// handler returns. Never returns through the syscall ABI; the
+    /// handler instead resumes execution at the saved RIP with all
+    /// GP registers, RSP, and RFLAGS restored to their pre-delivery
+    /// values. Linux numbering is 15 (32-bit) / 313 (64-bit
+    /// rt_sigreturn); we pick 187 to keep the recently-added range
+    /// contiguous.
+    Sigreturn = 187,
 
     /// Open an FB connection to a scanout. `arg0` = scanout id (0
     /// for the active scanout). Returns a non-zero `FbHandleId` on
@@ -1010,6 +1032,7 @@ impl Syscall {
             184 => Syscall::Statfs,
             185 => Syscall::Fstatfs,
             186 => Syscall::Unshare,
+            187 => Syscall::Sigreturn,
             130 => Syscall::RingKick,
             140 => Syscall::GetPid,
             141 => Syscall::GetPpid,

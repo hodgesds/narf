@@ -20,7 +20,11 @@
 #![no_main]
 
 use core::panic::PanicInfo;
+use core::sync::atomic::AtomicU32;
 use narf_libc as libc;
+
+/// Counts signal-handler hits for the `raise` smoke command.
+static RAISED: AtomicU32 = AtomicU32::new(0);
 
 const PROMPT: &[u8] = b"narf> ";
 const NEWLINE: &[u8] = b"\n";
@@ -194,6 +198,48 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
             write_all(fd, b"pid: ");
             write_all(fd, s);
             write_all(fd, NEWLINE);
+        }
+    } else if cmd == b"raise" {
+        // raise <signum> — install a tiny handler for the named
+        // signal, raise(signum) to deliver it to ourselves, then
+        // confirm the handler ran. Exercises the full kill ->
+        // delivery -> sigreturn loop.
+        let s = skip_ws(rest);
+        let mut signum: i32 = 0;
+        for &b in s.iter() {
+            if (b as char).is_ascii_digit() {
+                signum = signum * 10 + ((b - b'0') as i32);
+            } else {
+                break;
+            }
+        }
+        if signum == 0 {
+            unsafe { write_all(fd, b"raise: missing signum\n"); }
+        } else {
+            // Install the smoke handler. RAISED counts hits.
+            extern "C" fn smoke_handler(_n: i32) {
+                use core::sync::atomic::Ordering;
+                RAISED.fetch_add(1, Ordering::SeqCst);
+            }
+            let prior = unsafe {
+                libc::signal(signum, smoke_handler as usize)
+            };
+            let _ = prior;
+            // Self-deliver via raise(2).
+            let r = unsafe { libc::raise(signum) };
+            // Read back the count and report.
+            let count = RAISED.load(core::sync::atomic::Ordering::SeqCst);
+            let mut buf = [0u8; 12];
+            let s = u32_to_decimal(count, &mut buf);
+            unsafe {
+                write_all(fd, b"raise: rc=");
+                let mut rc_buf = [0u8; 12];
+                let rc_s = u32_to_decimal(r as u32, &mut rc_buf);
+                write_all(fd, rc_s);
+                write_all(fd, b" handler-hits=");
+                write_all(fd, s);
+                write_all(fd, NEWLINE);
+            }
         }
     } else if cmd == b"exit" {
         return false;

@@ -1267,6 +1267,49 @@ pub unsafe fn statfs(path: &str, buf: *mut u8) -> Result<(), ()> {
     if r == 0 { Ok(()) } else { Err(()) }
 }
 
+/// `sigreturn(sc_vaddr)` — restore the trap context from the
+/// SigContext frame at `sc_vaddr`. Called by the libc signal
+/// trampoline after the user's handler returns. Never returns
+/// through the ABI: the kernel rewrites the trap frame and the
+/// iretq lands the user at the trapping instruction with full
+/// register state restored.
+///
+/// The vaddr is passed explicitly (originally received by the
+/// trampoline in RSI from deliver_signal) because the trampoline's
+/// intervening user-handler `call` shifts RSP between deliver
+/// and sigreturn — the kernel can't infer the sigcontext location
+/// from the live RSP.
+///
+/// # Safety
+/// Caller must hold a SigContext deliver_signal placed at
+/// `sc_vaddr`. Calling from any other context corrupts the trap
+/// frame.
+#[inline]
+pub unsafe fn sigreturn_with(sc_vaddr: u64) -> ! {
+    // SAFETY: SYS_SIGRETURN takes a single sc_vaddr arg; the
+    // kernel rewrites the trap frame and the iretq lands at the
+    // saved RIP.
+    let _ = unsafe { syscall1(SYS_SIGRETURN, sc_vaddr) };
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Raw 0-arg syscall — escape hatch for `extern "C"` shims that need
+/// to issue an arbitrary syscall number without going through a
+/// typed wrapper. The libc signal trampoline uses this to issue
+/// SYS_SIGRETURN from a `-> !` context.
+///
+/// # Safety
+/// `num` must be a valid kernel syscall number; the syscall must
+/// either return through normal ABI or rewrite the trap frame.
+#[inline]
+pub unsafe fn syscall0_raw(num: u64) -> u64 {
+    unsafe { syscall0(num) }
+}
+
+pub const SYS_SIGRETURN: u64 = 187;
+
 /// `unshare(flags)` — POSIX 2008 / Linux unshare(2). Today only
 /// CLONE_NEWNS = 0x00020000 has effect (snapshots the global
 /// mount table into a per-task private MountNamespace). Other

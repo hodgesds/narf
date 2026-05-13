@@ -6094,6 +6094,17 @@ pub fn sigaction_lookup(task: u64, signum: usize) -> Option<u64> {
     slots[signum]
 }
 
+fn sys_sigreturn(ctx: &mut dyn TrapContext) {
+    // arg0 = SigContext vaddr (from libc trampoline, originally
+    // delivered in RSI by deliver_signal). The trampoline keeps it
+    // alive across the user's signal-handler call.
+    let sc_vaddr = ctx.args().arg0;
+    if !ctx.perform_sigreturn(sc_vaddr) {
+        ctx.set_return(SyscallReturn::invalid_op());
+    }
+}
+
+
 fn sys_sigaction(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let signum = args.arg0 as usize;
@@ -6236,6 +6247,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Statfs, "statfs", RawFnHandler(sys_statfs));
     table.install_raw(Syscall::Fstatfs, "fstatfs", RawFnHandler(sys_fstatfs));
     table.install_raw(Syscall::Unshare, "unshare", RawFnHandler(sys_unshare));
+    table.install_raw(Syscall::Sigreturn, "sigreturn", RawFnHandler(sys_sigreturn));
     table.install_raw(
         Syscall::FbConnect,
         "fb_connect",
