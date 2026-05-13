@@ -2462,24 +2462,15 @@ fn sys_mmap(ctx: &mut dyn TrapContext) {
         as_ref.reserve_mmap_va(len)
     };
 
-    // Allocate one frame per page and zero each. The freelist returns
-    // frames out of order so we collect into a per-page scatter list.
-    let mut phys_list: alloc::vec::Vec<narf_memory::PhysAddr> =
-        alloc::vec::Vec::with_capacity(pages as usize);
-    for _ in 0..pages {
-        let p = match narf_memory::alloc_frame() {
-            Ok(f) => f.start_address(),
-            Err(_) => {
-                ctx.set_return(SyscallReturn::invalid_op());
-                return;
-            }
-        };
-        // SAFETY: identity-mapped in low 4 GiB; phys is page-aligned.
-        unsafe {
-            core::ptr::write_bytes(p.raw() as *mut u8, 0, 4096);
-        }
-        phys_list.push(p);
-    }
+    // Lazy-back: install the region with `phys[i] == 0` for every
+    // page. The first user-mode access to each page faults with
+    // P=0 + U=1; the kernel #PF handler invokes
+    // `AddressSpace::demand_alloc_page` to allocate + zero + map
+    // a frame on the spot. Old behaviour (eager-back every page
+    // up front) is no longer the default — `mlock` provides the
+    // explicit force-back for callers that need it.
+    let phys_list: alloc::vec::Vec<narf_memory::PhysAddr> =
+        alloc::vec![narf_memory::PhysAddr::new(0); pages as usize];
 
     // Install + materialise.
     if as_ref
@@ -3006,6 +2997,43 @@ fn sys_munmap(ctx: &mut dyn TrapContext) {
 ///
 /// Returns Ok(0) on success, InvalidOp on bad AS or no
 /// intersecting regions.
+/// `mlock(addr, len)` — force-back lazy pages + set LOCKED flag.
+/// arg0 = base, arg1 = len. Ok(0) on success, InvalidOp on
+/// failure (no region intersects, OOM, AS lookup failed).
+fn sys_mlock(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let as_ref = match current_address_space() {
+        Some(a) => a,
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+    match as_ref.mlock_range(VirtAddr::new(args.arg0), args.arg1) {
+        Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
+        Err(_) => ctx.set_return(SyscallReturn::invalid_op()),
+    }
+}
+
+/// `munlock(addr, len)` — clear LOCKED flag (frames stay backed
+/// since no swap exists yet to reclaim them). arg0 = base,
+/// arg1 = len. Ok(0) on success, InvalidOp if no region
+/// intersects.
+fn sys_munlock(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let as_ref = match current_address_space() {
+        Some(a) => a,
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+    match as_ref.munlock_range(VirtAddr::new(args.arg0), args.arg1) {
+        Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
+        Err(_) => ctx.set_return(SyscallReturn::invalid_op()),
+    }
+}
+
 fn sys_mprotect(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let as_ref = match current_address_space() {
@@ -5486,6 +5514,8 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Mmap, "mmap", RawFnHandler(sys_mmap));
     table.install_raw(Syscall::Munmap, "munmap", RawFnHandler(sys_munmap));
     table.install_raw(Syscall::MProtect, "mprotect", RawFnHandler(sys_mprotect));
+    table.install_raw(Syscall::MLock, "mlock", RawFnHandler(sys_mlock));
+    table.install_raw(Syscall::MUnlock, "munlock", RawFnHandler(sys_munlock));
     table.install_raw(
         Syscall::FbConnect,
         "fb_connect",

@@ -196,13 +196,33 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         const PF_W: u64 = 1 << 1;
         const PF_U: u64 = 1 << 2;
         let ec = frame.error_code;
-        if (ec & (PF_P | PF_W | PF_U)) == (PF_P | PF_W | PF_U) {
-            let cr2: u64;
-            // SAFETY: reading CR2 at CPL=0 is always defined.
-            unsafe {
-                core::arch::asm!("mov {v}, cr2", v = out(reg) cr2,
-                    options(nostack, preserves_flags));
+        let cr2: u64;
+        // SAFETY: reading CR2 at CPL=0 is always defined.
+        unsafe {
+            core::arch::asm!("mov {v}, cr2", v = out(reg) cr2,
+                options(nostack, preserves_flags));
+        }
+        // Demand paging: P=0 + U=1 means the page wasn't mapped
+        // at fault time. Try to back it from the active user AS's
+        // lazy region table. This handles `mmap`'s default
+        // deferred-allocation path: the syscall installs the
+        // bookkeeping with `phys[i] == 0` and the first user
+        // touch lands here to allocate + zero + install the PTE.
+        // Falls through to COW / panic on any error so the
+        // existing diagnostic still fires for genuine bugs.
+        if (ec & (PF_P | PF_U)) == PF_U {
+            if let Some(as_arc) = narf_userspace::active_user_as() {
+                let v = narf_memory::VirtAddr::new(cr2);
+                // SAFETY: identity map live, AS belongs to the
+                // task whose CR3 is currently active (we just
+                // probed CPL=3).
+                if unsafe { as_arc.demand_alloc_page(v) }.is_ok() {
+                    return;
+                }
             }
+        }
+        // COW write-fault recovery: P+W+U → split on write.
+        if (ec & (PF_P | PF_W | PF_U)) == (PF_P | PF_W | PF_U) {
             if let Some(as_arc) = narf_userspace::active_user_as() {
                 let v = narf_memory::VirtAddr::new(cr2);
                 // SAFETY: low-4-GiB identity map is live, frame

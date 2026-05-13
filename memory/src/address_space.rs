@@ -32,9 +32,29 @@ impl RegionPerms {
     pub const WRITE: RegionPerms = RegionPerms(1 << 1);
     pub const READ: RegionPerms = RegionPerms(1 << 2);
 
+    /// Internal flag: this region is `mlock`'d. The kernel ensures
+    /// every page is backed (no zero entries in `phys`) and a
+    /// future swap / page-reclaim pass will leave it alone.
+    /// Stored in `RegionPerms` rather than as a separate `Region`
+    /// field so existing `Region { ... }` constructors keep
+    /// compiling — the bit lives outside the POSIX prot range
+    /// (READ/WRITE/EXEC = bits 0..2) so it never confuses the
+    /// `materialize` flag-translation paths.
+    pub const LOCKED: RegionPerms = RegionPerms(1 << 8);
+
+    /// Mask isolating the POSIX prot bits (READ | WRITE | EXEC).
+    /// Used by callers that want to compare permissions without
+    /// caring about the internal LOCKED bit.
+    pub const PROT_MASK: RegionPerms = RegionPerms(0b111);
+
     #[inline]
     pub const fn contains(self, o: RegionPerms) -> bool {
         self.0 & o.0 == o.0
+    }
+
+    #[inline]
+    pub const fn prot_only(self) -> RegionPerms {
+        RegionPerms(self.0 & Self::PROT_MASK.0)
     }
 }
 
@@ -52,6 +72,15 @@ impl core::ops::BitOr for RegionPerms {
 /// physical frames in general; the earlier "single base + assume
 /// contiguous" shape silently miscompiled multi-page mappings any
 /// time the freelist had been touched between page allocations.
+///
+/// A `phys[i]` of `PhysAddr::new(0)` means "lazily allocated — the
+/// frame hasn't been backed yet, allocate on first touch via the
+/// page-fault demand-paging path." `mmap` may use this; `mlock`
+/// walks the region and forces every zero entry to be backed.
+///
+/// `perms` carries the POSIX prot bits (READ/WRITE/EXEC) plus a
+/// few internal flags in the high bits — see `RegionPerms::LOCKED`
+/// for `mlock` state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Region {
     pub base: VirtAddr,
@@ -59,6 +88,7 @@ pub struct Region {
     pub perms: RegionPerms,
     /// Per-page phys backing. Length must equal `len / 4096`; an
     /// empty Vec is a structural error rejected by `map_region`.
+    /// `PhysAddr::new(0)` slots are unbacked (demand paging).
     pub phys: Vec<PhysAddr>,
 }
 
@@ -285,6 +315,254 @@ impl AddressSpace {
         self.regions.lock().len()
     }
 
+    /// Demand-paging entry point — called from the user-mode #PF
+    /// handler when CR2 (x86_64) / FAR_EL1 (aarch64) lands inside
+    /// a known region whose `phys[i]` is the zero sentinel
+    /// (lazy-allocated). Allocates a fresh zeroed frame, records
+    /// it in the region's `phys` slot, and installs the leaf PTE
+    /// with the region's perms.
+    ///
+    /// Returns `Ok(())` on a successful page-in (caller resumes
+    /// the faulting instruction). Returns `Unmapped` if no
+    /// region contains `vaddr` (genuine SEGV — caller falls
+    /// through to its panic / signal path). Returns
+    /// `AlignmentMismatch` if the slot was already backed
+    /// (spurious fault — usually a TLB shootdown race; safe to
+    /// retry from the trap).
+    ///
+    /// # Safety
+    /// - Identity-map of low 4 GiB must be live (used to zero
+    ///   the fresh frame and walk the page tables).
+    /// - `self.root` must be a valid page-table root for the AS
+    ///   currently active on this CPU (caller's CR3 / TTBR0).
+    /// - Frame allocator must be initialised.
+    #[cfg(target_arch = "x86_64")]
+    pub unsafe fn demand_alloc_page(&self, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
+        use crate::x86_64::paging::{map_4kb, MapError, PtFlags};
+        let v = vaddr.as_u64() & !0xFFFu64;
+        let mut regions = self.regions.lock();
+        for r in regions.iter_mut() {
+            let rb = r.base.as_u64();
+            let re = rb.saturating_add(r.len);
+            if v < rb || v >= re {
+                continue;
+            }
+            // PROT_NONE: the fault is a real access violation, not
+            // a demand-paging miss. Surface as Unmapped so the
+            // trap handler reports the SEGV cleanly.
+            if r.perms.prot_only().0 == 0 {
+                return Err(AddressSpaceError::Unmapped);
+            }
+            let i = ((v - rb) >> 12) as usize;
+            if i >= r.phys.len() {
+                return Err(AddressSpaceError::OutOfRange);
+            }
+            if r.phys[i].raw() != 0 {
+                // Already backed — spurious fault (TLB stale).
+                return Err(AddressSpaceError::AlignmentMismatch);
+            }
+            // Allocate + zero the fresh frame.
+            let phys = crate::frame::alloc_frame()
+                .map_err(|_| AddressSpaceError::OutOfRange)?
+                .start_address();
+            // SAFETY: identity-mapped DMA-equivalent; frame just
+            // returned by allocator is exclusively ours.
+            unsafe {
+                core::ptr::write_bytes(phys.raw() as *mut u8, 0, 4096);
+            }
+            r.phys[i] = phys;
+
+            // Build PTE flags from region perms.
+            let mut flags = PtFlags::USER;
+            if r.perms.contains(RegionPerms::WRITE) {
+                flags = flags | PtFlags::WRITABLE;
+            }
+            if !r.perms.contains(RegionPerms::EXEC) {
+                flags = flags | PtFlags::NO_EXEC;
+            }
+            // SAFETY: identity map + AS is live (we're being
+            // called from the active CR3's #PF handler).
+            match unsafe { map_4kb(self.root, VirtAddr::new(v), phys, flags) } {
+                Ok(()) | Err(MapError::AlreadyMapped) => return Ok(()),
+                Err(_) => return Err(AddressSpaceError::NotImplemented),
+            }
+        }
+        Err(AddressSpaceError::Unmapped)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub unsafe fn demand_alloc_page(&self, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
+        use crate::aarch64::paging::{map_4kb, MapError, PtFlags};
+        let v = vaddr.as_u64() & !0xFFFu64;
+        let mut regions = self.regions.lock();
+        for r in regions.iter_mut() {
+            let rb = r.base.as_u64();
+            let re = rb.saturating_add(r.len);
+            if v < rb || v >= re {
+                continue;
+            }
+            if r.perms.prot_only().0 == 0 {
+                return Err(AddressSpaceError::Unmapped);
+            }
+            let i = ((v - rb) >> 12) as usize;
+            if i >= r.phys.len() {
+                return Err(AddressSpaceError::OutOfRange);
+            }
+            if r.phys[i].raw() != 0 {
+                return Err(AddressSpaceError::AlignmentMismatch);
+            }
+            let phys = crate::frame::alloc_frame()
+                .map_err(|_| AddressSpaceError::OutOfRange)?
+                .start_address();
+            // SAFETY: identity-mapped per allocator contract.
+            unsafe {
+                core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, 4096);
+            }
+            r.phys[i] = phys;
+            let mut flags = PtFlags::AP_RW_EL1;
+            if !r.perms.contains(RegionPerms::EXEC) {
+                flags = flags | PtFlags::UXN | PtFlags::PXN;
+            }
+            // SAFETY: same.
+            match unsafe { map_4kb(self.root, VirtAddr::new(v), phys, flags) } {
+                Ok(()) | Err(MapError::AlreadyMapped) => return Ok(()),
+                Err(_) => return Err(AddressSpaceError::NotImplemented),
+            }
+        }
+        Err(AddressSpaceError::Unmapped)
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub unsafe fn demand_alloc_page(&self, _vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
+        Err(AddressSpaceError::NotImplemented)
+    }
+
+    /// `mlock(base, len)` — force-back every lazy page in regions
+    /// intersecting `[base, base + len)` and set the LOCKED flag.
+    /// Returns Unmapped if no region intersects.
+    pub fn mlock_range(
+        &self,
+        base: VirtAddr,
+        len: u64,
+    ) -> Result<(), AddressSpaceError> {
+        let lo = base.as_u64();
+        let hi = lo.saturating_add(len);
+        // Force-back any zero phys entries first; do this with
+        // the lock dropped so frame allocation doesn't recurse
+        // on an IRQ-safe lock. Snapshot the region indices.
+        let mut touched_any = false;
+        let mut backings: alloc::vec::Vec<(usize, alloc::vec::Vec<usize>)> =
+            alloc::vec::Vec::new();
+        {
+            let g = self.regions.lock();
+            for (idx, r) in g.iter().enumerate() {
+                let rb = r.base.as_u64();
+                let re = rb.saturating_add(r.len);
+                if rb >= hi || re <= lo {
+                    continue;
+                }
+                touched_any = true;
+                let mut needed = alloc::vec::Vec::new();
+                for (i, p) in r.phys.iter().enumerate() {
+                    if p.raw() == 0 {
+                        needed.push(i);
+                    }
+                }
+                if !needed.is_empty() {
+                    backings.push((idx, needed));
+                }
+            }
+        }
+        if !touched_any {
+            return Err(AddressSpaceError::Unmapped);
+        }
+        // Allocate frames outside the lock.
+        let mut allocations: alloc::vec::Vec<(usize, alloc::vec::Vec<(usize, PhysAddr)>)> =
+            alloc::vec::Vec::with_capacity(backings.len());
+        for (idx, slots) in backings {
+            let mut filled = alloc::vec::Vec::with_capacity(slots.len());
+            for slot in slots {
+                let phys = crate::frame::alloc_frame()
+                    .map_err(|_| AddressSpaceError::OutOfRange)?
+                    .start_address();
+                // SAFETY: identity-mapped on x86_64; aarch64
+                // uses kernel_mut_ptr for the same purpose.
+                unsafe {
+                    #[cfg(target_arch = "x86_64")]
+                    core::ptr::write_bytes(phys.raw() as *mut u8, 0, 4096);
+                    #[cfg(target_arch = "aarch64")]
+                    core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, 4096);
+                }
+                filled.push((slot, phys));
+            }
+            allocations.push((idx, filled));
+        }
+        // Re-acquire the lock and stamp the new frames + flag.
+        // Then re-materialise so PTEs land for the freshly-backed
+        // pages.
+        let mut to_materialise = alloc::vec::Vec::new();
+        {
+            let mut g = self.regions.lock();
+            for (idx, slots) in allocations {
+                if let Some(r) = g.get_mut(idx) {
+                    for (slot, phys) in slots {
+                        if r.phys[slot].raw() == 0 {
+                            r.phys[slot] = phys;
+                        } else {
+                            // Raced with a demand fault that beat
+                            // us to it — give the frame back.
+                            crate::frame::free_frame(crate::frame::PhysFrame::new(phys));
+                        }
+                    }
+                    r.perms = RegionPerms(r.perms.0 | RegionPerms::LOCKED.0);
+                    to_materialise.push(r.clone());
+                }
+            }
+            // Also flag any region we touched but didn't have to
+            // back (already-fully-backed mlock'd region).
+            for r in g.iter_mut() {
+                let rb = r.base.as_u64();
+                let re = rb.saturating_add(r.len);
+                if rb >= hi || re <= lo {
+                    continue;
+                }
+                r.perms = RegionPerms(r.perms.0 | RegionPerms::LOCKED.0);
+            }
+        }
+        // SAFETY: same identity-map invariant; touched regions
+        // are valid bookkeeping entries.
+        unsafe { self.rewrite_perms_pages(&to_materialise) };
+        Ok(())
+    }
+
+    /// `munlock(base, len)` — clear the LOCKED flag on every
+    /// region intersecting `[base, base + len)`. Frames stay
+    /// backed (no swap exists yet to reclaim them). Returns
+    /// Unmapped if no region intersects.
+    pub fn munlock_range(
+        &self,
+        base: VirtAddr,
+        len: u64,
+    ) -> Result<(), AddressSpaceError> {
+        let lo = base.as_u64();
+        let hi = lo.saturating_add(len);
+        let mut g = self.regions.lock();
+        let mut touched = false;
+        for r in g.iter_mut() {
+            let rb = r.base.as_u64();
+            let re = rb.saturating_add(r.len);
+            if rb >= hi || re <= lo {
+                continue;
+            }
+            touched = true;
+            r.perms = RegionPerms(r.perms.0 & !RegionPerms::LOCKED.0);
+        }
+        if !touched {
+            return Err(AddressSpaceError::Unmapped);
+        }
+        Ok(())
+    }
+
     /// Change permissions on every region whose base lies in
     /// `[base, base + len)`. The active PTEs are rewritten in
     /// place via the same primitives `materialize` uses, so the
@@ -359,7 +637,7 @@ impl AddressSpace {
             // PROT_NONE: tear down the leaf PTEs without freeing
             // the underlying frames (region.phys still owns them).
             // The next mprotect-back-to-RW just re-installs.
-            if r.perms.0 == 0 {
+            if r.perms.prot_only().0 == 0 {
                 for i in 0..r.phys.len() {
                     let v = VirtAddr::new(r.base.as_u64() + ((i as u64) << 12));
                     // SAFETY: same identity-map invariant.
@@ -392,7 +670,7 @@ impl AddressSpace {
             return;
         }
         for r in regions {
-            if r.perms.0 == 0 {
+            if r.perms.prot_only().0 == 0 {
                 for i in 0..r.phys.len() {
                     let v = VirtAddr::new(r.base.as_u64() + ((i as u64) << 12));
                     // SAFETY: see x86_64 variant.
@@ -445,7 +723,7 @@ impl AddressSpace {
             // not present), which `frame::x86_64::trap` reports
             // as a clean SEGV-equivalent. Used for stack guard
             // pages + post-mprotect(PROT_NONE) regions.
-            if r.perms.0 == 0 {
+            if r.perms.prot_only().0 == 0 {
                 continue;
             }
             let mut flags = PtFlags::USER;
@@ -457,6 +735,13 @@ impl AddressSpace {
             }
 
             for (i, p) in r.phys.iter().enumerate() {
+                // Lazy / unbacked: phys[i] == 0 means the
+                // demand-paging path will allocate + install on
+                // first user-mode access. Skip here so the PTE
+                // stays absent and the access faults with P=0.
+                if p.raw() == 0 {
+                    continue;
+                }
                 let v = crate::VirtAddr::new(r.base.as_u64() + ((i as u64) << 12));
                 // SAFETY: `self.root` is a valid PML4 per the
                 // `new_for_user` contract; pages walked are within
@@ -482,7 +767,7 @@ impl AddressSpace {
         for r in regions.iter() {
             // PROT_NONE region: no PTE installed. See x86_64
             // counterpart for rationale.
-            if r.perms.0 == 0 {
+            if r.perms.prot_only().0 == 0 {
                 continue;
             }
             // aarch64 perm translation:
@@ -497,6 +782,9 @@ impl AddressSpace {
                 flags = flags | PtFlags::UXN | PtFlags::PXN;
             }
             for (i, p) in r.phys.iter().enumerate() {
+                if p.raw() == 0 {
+                    continue;
+                }
                 let v = crate::VirtAddr::new(r.base.as_u64() + ((i as u64) << 12));
                 // SAFETY: root is valid per `new_for_user`; pages
                 // covered are within the just-allocated region.
