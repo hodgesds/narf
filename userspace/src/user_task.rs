@@ -642,8 +642,17 @@ impl core::future::Future for UserTaskFuture {
                     // SAFETY: the AS is activated and the user
                     // mappings cover entry + rsp by construction
                     // (load_user_process_with mapped them). Never
-                    // returns — control reaches CPL=3.
-                    unsafe { narf_scheduler::enter_user_mode(entry, rsp) }
+                    // returns — control reaches CPL=3. When the
+                    // process carries an entry_arg (clone(2) for
+                    // pthread start), deliver it as the first
+                    // SysV integer arg (RDI).
+                    if let Some(arg) = this.process.entry_arg {
+                        unsafe {
+                            narf_scheduler::enter_user_mode_with_arg(entry, rsp, arg)
+                        }
+                    } else {
+                        unsafe { narf_scheduler::enter_user_mode(entry, rsp) }
+                    }
                 }
                 TaskState::Running => {
                     // SAFETY: a prior poll's trap path populated

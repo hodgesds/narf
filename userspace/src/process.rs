@@ -51,6 +51,13 @@ pub struct UserProcess {
     /// each user-mode entry so `mov rax, fs:[N]` lands in the
     /// per-task TLS block.
     pub fs_base: Option<u64>,
+    /// First-arg value to pass into the entry point (as RDI on
+    /// x86_64). Used by `clone(2)` so a thread's start routine
+    /// receives its argument; ordinary `_start` doesn't read RDI
+    /// (argc/argv come off the stack). `None` defers to whatever
+    /// is in the trap frame's RDI at first iretq (= 0 for fresh
+    /// tasks), preserving the historical no-arg behaviour.
+    pub entry_arg: Option<u64>,
 }
 
 /// Errors from `load_user_process`.
@@ -314,6 +321,7 @@ pub unsafe fn load_user_process_with(
         entry,
         stack_top: VirtAddr::new(rsp),
         fs_base,
+        entry_arg: None,
     })
 }
 

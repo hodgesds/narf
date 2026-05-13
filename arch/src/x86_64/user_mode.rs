@@ -256,6 +256,40 @@ pub unsafe extern "C" fn enter_user_mode(rip: u64, rsp: u64) -> ! {
     );
 }
 
+/// Variant of `enter_user_mode` that delivers `arg` to the user
+/// entry point in RDI. Used by `clone(2)` so a thread's start
+/// routine reads its argument the way a normal SysV-AMD64 function
+/// receives its first integer parameter (`extern "C" fn(arg)` —
+/// arg in RDI).
+///
+/// # Safety
+/// Same as `enter_user_mode`; `arg` is a plain u64 the user code
+/// interprets per its own contract.
+#[unsafe(naked)]
+pub unsafe extern "C" fn enter_user_mode_with_arg(
+    rip: u64,
+    rsp: u64,
+    arg: u64,
+) -> ! {
+    naked_asm!(
+        // SysV: rip in rdi, rsp in rsi, arg in rdx.
+        "swapgs",
+        "push {udata}",                   // ss
+        "push rsi",                       // rsp
+        "push {rflags}",                  // rflags (IF=1)
+        "push {ucode}",                   // cs
+        "push rdi",                       // rip
+        // Move arg from rdx into rdi so the user sees it as the
+        // first SysV integer arg. rdx is caller-saved per SysV
+        // and we're about to iretq, so clobbering it is fine.
+        "mov rdi, rdx",
+        "iretq",
+        udata  = const UDATA_SEL,
+        ucode  = const UCODE_SEL,
+        rflags = const USER_RFLAGS,
+    );
+}
+
 /// Resume user mode at the state captured in `*state`. Restores
 /// every GPR + RIP + RFLAGS + RSP via the iretq frame; never
 /// returns.

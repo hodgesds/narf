@@ -26,6 +26,10 @@ use narf_libc as libc;
 /// Counts signal-handler hits for the `raise` smoke command.
 static RAISED: AtomicU32 = AtomicU32::new(0);
 
+/// Shared counter the `threads` smoke command increments from
+/// every worker thread.
+static COUNTER: AtomicU32 = AtomicU32::new(0);
+
 const PROMPT: &[u8] = b"narf> ";
 const NEWLINE: &[u8] = b"\n";
 
@@ -198,6 +202,62 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
             write_all(fd, b"pid: ");
             write_all(fd, s);
             write_all(fd, NEWLINE);
+        }
+    } else if cmd == b"threads" {
+        // threads <N> — spawn N threads, each increments a shared
+        // atomic counter K times, joins all, prints total. Exercises
+        // the full clone -> trampoline -> exit -> futex_wake -> join
+        // loop end-to-end.
+        let s = skip_ws(rest);
+        let mut n: i32 = 0;
+        for &b in s.iter() {
+            if (b as char).is_ascii_digit() {
+                n = n * 10 + ((b - b'0') as i32);
+            } else {
+                break;
+            }
+        }
+        if n <= 0 || n > 16 {
+            unsafe { write_all(fd, b"threads: pass 1..16\n"); }
+        } else {
+            const K: u32 = 1000;
+            COUNTER.store(0, core::sync::atomic::Ordering::SeqCst);
+            extern "C" fn worker(_arg: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+                use core::sync::atomic::Ordering;
+                for _ in 0..K {
+                    COUNTER.fetch_add(1, Ordering::SeqCst);
+                }
+                core::ptr::null_mut()
+            }
+            let mut tids = [0u64; 16];
+            for i in 0..n as usize {
+                let attr = core::ptr::null::<libc::pthread_attr_t>();
+                let _rc = unsafe {
+                    libc::pthread_create(
+                        &mut tids[i] as *mut u64,
+                        attr,
+                        worker,
+                        core::ptr::null_mut(),
+                    )
+                };
+            }
+            for i in 0..n as usize {
+                let _ = unsafe {
+                    libc::pthread_join(tids[i], core::ptr::null_mut())
+                };
+            }
+            let total = COUNTER.load(core::sync::atomic::Ordering::SeqCst);
+            let mut buf = [0u8; 16];
+            let s = u32_to_decimal(total, &mut buf);
+            unsafe {
+                write_all(fd, b"threads: total=");
+                write_all(fd, s);
+                write_all(fd, b" expected=");
+                let mut e_buf = [0u8; 16];
+                let e_s = u32_to_decimal((n as u32) * K, &mut e_buf);
+                write_all(fd, e_s);
+                write_all(fd, NEWLINE);
+            }
         }
     } else if cmd == b"raise" {
         // raise <signum> — install a tiny handler for the named

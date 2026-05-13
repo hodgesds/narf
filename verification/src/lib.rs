@@ -3196,6 +3196,7 @@ fn smoke_userspace_user_task_future_yield_exit() -> TestResult {
         entry: narf_userspace::EntryPoint(VirtAddr::new(CODE_VADDR)),
         stack_top: VirtAddr::new(stack_top),
         fs_base: None,
+        entry_arg: None,
     };
     let address_space_clone = proc.address_space.clone();
 

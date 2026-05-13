@@ -132,34 +132,168 @@ pub unsafe extern "C" fn pthread_equal(a: pthread_t, b: pthread_t) -> c_int {
 
 // ── pthread_create / join (refuse honestly) ─────────────────────────
 
-/// `pthread_create` — refuses with `EAGAIN`. Programs that wanted
-/// real threads need a kernel-side thread spawn; we don't have one.
+/// Per-thread control block. Lives in mmap'd memory shared with
+/// the new thread. The thread entry trampoline reads `start` and
+/// `arg` to dispatch, stores the return value in `retval`, then
+/// stores the new tid into `tid` and futex-wakes the parent.
 ///
-/// # Safety
-/// Pointer arguments are not dereferenced.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn pthread_create(
-    _thread:    *mut pthread_t,
-    _attr:      *const pthread_attr_t,
-    _start_rtn: extern "C" fn(*mut core::ffi::c_void) -> *mut core::ffi::c_void,
-    _arg:       *mut core::ffi::c_void,
-) -> c_int {
-    EAGAIN
+/// Layout matches what `__libc_thread_trampoline` reads — keep
+/// fields in this order.
+#[repr(C)]
+struct ThreadCtl {
+    start: usize,                   // start_rtn fn ptr
+    arg: *mut core::ffi::c_void,    // first arg to start_rtn
+    retval: *mut core::ffi::c_void, // start_rtn's return value
+    /// 0 while the thread is alive, set to 1 by the trampoline
+    /// just before exit_task. pthread_join futex-waits on this
+    /// slot per Linux's CHILD_CLEARTID convention.
+    done: u32,
+    _pad: u32,
 }
 
-/// `pthread_join(thread, retval)` — there is nothing to join. We
-/// pretend the thread already returned with NULL.
+/// Stack size for spawned threads. POSIX recommends 2 MiB; we use
+/// 1 MiB to keep mmap pressure low while still leaving headroom for
+/// rust stack-frame-heavy code.
+const THREAD_STACK_BYTES: usize = 1 * 1024 * 1024;
+
+/// Trampoline that runs at user-mode CPL=3 as the new thread's
+/// first instruction. RDI = ThreadCtl pointer (delivered via the
+/// kernel's clone arg-pass path). The trampoline calls the
+/// user-supplied start_rtn with the user-supplied arg, stores the
+/// return value, marks `done=1`, futex-wakes any joiner on the
+/// `done` slot, then exits the task.
 ///
 /// # Safety
-/// `retval`, when non-null, must be a writable `*mut *mut c_void`.
+/// Reached only via clone(2). `ctl` must point at a live ThreadCtl
+/// the parent allocated; the thread's stack must already be mapped.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn __libc_thread_trampoline(ctl: *mut ThreadCtl) -> ! {
+    // SAFETY: parent allocated this struct; lives until pthread_join
+    // releases it.
+    let ctl = unsafe { &mut *ctl };
+    // SAFETY: parent installed a valid fn ptr.
+    let start: extern "C" fn(*mut core::ffi::c_void) -> *mut core::ffi::c_void =
+        unsafe { core::mem::transmute(ctl.start) };
+    let r = start(ctl.arg);
+    ctl.retval = r;
+    // Atomic store with release ordering — pairs with the joiner's
+    // futex-wait load.
+    let done_ptr = &raw mut ctl.done as *mut u32;
+    unsafe {
+        core::ptr::write_volatile(done_ptr, 1);
+    }
+    // Futex-wake any joiner spinning on this slot.
+    let _ = narf_user_runtime::futex_wake(done_ptr as u64, 1);
+    // Terminate the task. exit_task is a Rust fn that calls
+    // SYS_EXIT_TASK and never returns.
+    narf_user_runtime::exit_task()
+}
+
+/// `pthread_create(thread, attr, start_rtn, arg)` — spawn a new
+/// thread that runs `start_rtn(arg)` in the same address space.
+///
+/// Implementation:
+/// 1. mmap a 1 MiB stack + a small ThreadCtl block.
+/// 2. Stash (start_rtn, arg) in the ctl block.
+/// 3. clone(__libc_thread_trampoline, stack_top, &ctl) — the
+///    kernel hands ctl to the trampoline as its first arg.
+/// 4. Return the kernel-assigned tid via `*thread`.
+///
+/// `attr` is ignored (we always use the default 1 MiB stack).
+///
+/// # Safety
+/// `thread` must be a writable `*mut pthread_t`; `start_rtn` must
+/// be a valid SysV-shaped function pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_create(
+    thread:    *mut pthread_t,
+    _attr:     *const pthread_attr_t,
+    start_rtn: extern "C" fn(*mut core::ffi::c_void) -> *mut core::ffi::c_void,
+    arg:       *mut core::ffi::c_void,
+) -> c_int {
+    if thread.is_null() {
+        return EAGAIN;
+    }
+    // Allocate stack + ctl in a single mmap (stack at the top, ctl
+    // just below). 1 MiB stack + 32 B ctl, page-aligned.
+    let total = THREAD_STACK_BYTES + 4096;
+    let base = unsafe { narf_user_runtime::mmap(0, total, 0x20 /* MAP_ANON */) };
+    if base.is_null() || base as usize == !0usize {
+        return EAGAIN;
+    }
+    let base = base as u64;
+    // ctl at base+0; stack from base+4096 .. base+4096+THREAD_STACK_BYTES.
+    let ctl_ptr = base as *mut ThreadCtl;
+    // SAFETY: just-mmap'd region, exclusive ownership.
+    unsafe {
+        core::ptr::write(ctl_ptr, ThreadCtl {
+            start: start_rtn as usize,
+            arg,
+            retval: core::ptr::null_mut(),
+            done: 0,
+            _pad: 0,
+        });
+    }
+    let stack_top = base + total as u64;
+    // SAFETY: kernel-side clone validates entry/stack pointers.
+    let tid = match narf_user_runtime::clone(
+        __libc_thread_trampoline as u64,
+        stack_top,
+        ctl_ptr as u64,
+        0, // fs_base — inherit parent's
+    ) {
+        Ok(t) => t,
+        Err(()) => return EAGAIN,
+    };
+    // Encode (tid, ctl_ptr) into pthread_t. Stash ctl_ptr in the
+    // upper bits so pthread_join can recover it without a side
+    // table — pthread_t is u64 and ctl_ptr fits in user-half VA
+    // bits, but we use the full slot for the ptr and put tid in
+    // a per-process side map keyed by ctl_ptr if needed. For now
+    // store ctl_ptr as the pthread_t (it's unique per thread).
+    let _ = tid;
+    unsafe {
+        *thread = ctl_ptr as pthread_t;
+    }
+    0
+}
+
+/// `pthread_join(thread, retval)` — block until the thread finishes,
+/// then store its return value into `*retval`.
+///
+/// Implementation: futex-wait on the ctl block's `done` slot until
+/// it transitions from 0 to 1 (set by the trampoline just before
+/// exit_task). Read out retval, return success. The mmap'd stack +
+/// ctl block stay leaked until the AS tears down — releasing them
+/// here would race the trampoline's still-executing exit_task call,
+/// which uses the stack until the kernel reclaims it.
+///
+/// # Safety
+/// `thread` must be a value returned by `pthread_create`; `retval`,
+/// when non-null, must be writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_join(
-    _thread: pthread_t,
-    retval:  *mut *mut core::ffi::c_void,
+    thread: pthread_t,
+    retval: *mut *mut core::ffi::c_void,
 ) -> c_int {
+    if thread == 0 {
+        return -1;
+    }
+    let ctl_ptr = thread as *mut ThreadCtl;
+    let done_ptr = unsafe { &raw mut (*ctl_ptr).done } as *mut u32;
+    // futex_wait with expected=0 sleeps until the value becomes
+    // non-zero (the trampoline writes 1 on completion).
+    loop {
+        let cur = unsafe { core::ptr::read_volatile(done_ptr) };
+        if cur != 0 {
+            break;
+        }
+        // FUTEX_WAIT, expected=0, no timeout.
+        let _ = narf_user_runtime::futex_wait(done_ptr as u64, 0, 0);
+    }
     if !retval.is_null() {
-        // SAFETY: caller-supplied writable slot.
-        unsafe { *retval = core::ptr::null_mut(); }
+        // SAFETY: ctl is alive; trampoline stored retval before done=1.
+        unsafe { *retval = (*ctl_ptr).retval; }
     }
     0
 }

@@ -69,8 +69,8 @@ pub use narf_capabilities::Invoke;
 // exists (`narf-scheduler` → `narf-arch`); this just exposes it.
 #[cfg(target_arch = "x86_64")]
 pub use narf_arch::x86_64::{
-    enter_user_mode, enter_user_mode_resume, longjmp, set_user_fs_base, setjmp, JmpBuf, UserState,
-    USER_RFLAGS,
+    enter_user_mode, enter_user_mode_resume, enter_user_mode_with_arg, longjmp,
+    set_user_fs_base, setjmp, JmpBuf, UserState, USER_RFLAGS,
 };
 
 #[cfg(target_arch = "aarch64")]

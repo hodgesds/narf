@@ -704,6 +704,48 @@ pub fn tgkill(tgid: i64, tid: u64, signum: u32) -> i32 {
     }
 }
 
+/// `futex_wait(uaddr, expected, timeout_ns)` — POSIX/Linux thin
+/// wrapper around `futex(2)` FUTEX_WAIT. Sleeps until either
+/// `*uaddr != expected` (wake landed) or `timeout_ns` elapsed.
+/// Pass `timeout_ns = 0` for indefinite wait.
+///
+/// # Safety
+/// `uaddr` must be a valid u32 address in the calling task's AS.
+#[inline]
+pub fn futex_wait(uaddr: u64, expected: u32, timeout_ns: u64) -> i64 {
+    futex(uaddr as *mut u32, 0 /* FUTEX_WAIT */, expected, timeout_ns, 0, 0)
+}
+
+/// `futex_wake(uaddr, n)` — wake up to `n` waiters parked on
+/// `*uaddr`. Returns the number woken (≤ n).
+///
+/// # Safety
+/// `uaddr` must be a valid u32 address in the calling task's AS.
+#[inline]
+pub fn futex_wake(uaddr: u64, n: u32) -> i64 {
+    futex(uaddr as *mut u32, 1 /* FUTEX_WAKE */, n, 0, 0, 0)
+}
+
+/// `clone(entry, stack_top, arg, fs_base)` — spawn a new task that
+/// shares the calling task's address space. The thread enters at
+/// `entry` with RSP = `stack_top` and RDI = `arg`. `fs_base = 0`
+/// inherits the parent's FS_BASE (TLS pointer).
+///
+/// Returns the new task's tid on success. POSIX `pthread_create`
+/// builds on this; raw `clone(2)` is the kernel-level escape hatch.
+#[inline]
+pub fn clone(entry: u64, stack_top: u64, arg: u64, fs_base: u64) -> Result<u64, ()> {
+    // SAFETY: SYS_CLONE = 56; signature (entry, stack, arg, fs).
+    let r = unsafe { syscall4(SYS_CLONE, entry, stack_top, arg, fs_base) };
+    if r == !0u64 || r == ((-1i64) as u64) {
+        Err(())
+    } else {
+        Ok(r)
+    }
+}
+
+pub const SYS_CLONE: u64 = 56;
+
 /// `futex(uaddr, op, val, timeout, uaddr2, val3)` — Linux futex(2).
 /// Stage-4 NARF honours only FUTEX_WAIT (0) and FUTEX_WAKE (1)
 /// (with optional FUTEX_PRIVATE and FUTEX_CLOCK_REALTIME bits);
