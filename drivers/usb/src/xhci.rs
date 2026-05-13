@@ -564,13 +564,15 @@ impl Xhci {
                         unsafe {
                             mmio.write32(cap_off, cur | (1 << 24));
                         }
-                        // Wait up to ~5s for BIOS to release.
-                        // responsive_spin keeps cursor/FB/serial alive
-                        // while the BIOS hand-off SMI runs.
-                        let released = narf_scheduler::responsive_spin(
+                        // Wait up to 5s for BIOS to release.
+                        // responsive_spin_until keeps cursor/FB/serial
+                        // alive while the BIOS hand-off SMI runs;
+                        // wall-clock budget is now explicit instead
+                        // of a CPU-clock-dependent iter count.
+                        let released = narf_scheduler::responsive_spin_until(
                             // SAFETY: same.
                             || unsafe { mmio.read32(cap_off) } & (1 << 16) == 0,
-                            5_000_000,
+                            narf_time::Deadline::after_ms(5_000),
                         );
                         // If BIOS never released, force-clear by
                         // writing 0 to the BIOS-Owned bit (we
@@ -644,12 +646,14 @@ impl Xhci {
         unsafe {
             mmio.write32(op_off + OP_USBCMD, cmd & !USBCMD_RS);
         }
-        // Wait for HCH = 1. responsive_spin keeps cursor/FB alive
-        // while the controller halts.
-        let _ = narf_scheduler::responsive_spin(
+        // Wait for HCH = 1. responsive_spin_until keeps cursor/FB
+        // alive while the controller halts. xHCI 1.2 §5.4.1.1 says
+        // the controller must halt within 16 ms of clearing R/S; use
+        // a 100 ms budget so a slow controller still has headroom.
+        let _ = narf_scheduler::responsive_spin_until(
             // SAFETY: same.
             || unsafe { mmio.read32(op_off + OP_USBSTS) } & USBSTS_HCH != 0,
-            1_000_000,
+            narf_time::Deadline::after_ms(100),
         );
 
         // Reset.
@@ -657,20 +661,24 @@ impl Xhci {
         unsafe {
             mmio.write32(op_off + OP_USBCMD, USBCMD_HCRST);
         }
-        // responsive_spin ticks sleep_pumps across HCRST self-clear.
-        let reset_ok = narf_scheduler::responsive_spin(
+        // responsive_spin_until ticks sleep_pumps across HCRST
+        // self-clear. xHCI §4.2: HCRST should self-clear within
+        // 100 ms on a healthy controller.
+        let reset_ok = narf_scheduler::responsive_spin_until(
             // SAFETY: same.
             || unsafe { mmio.read32(op_off + OP_USBCMD) } & USBCMD_HCRST == 0,
-            1_000_000,
+            narf_time::Deadline::after_ms(100),
         );
         if !reset_ok {
             return Err(XhciError::ResetTimeout);
         }
-        // Wait for CNR = 0.
-        let cnr_clear = narf_scheduler::responsive_spin(
+        // Wait for CNR = 0. xHCI §4.2: post-reset the controller may
+        // hold CNR for up to ~1 s while it loads device-context
+        // structures and runs internal POST.
+        let cnr_clear = narf_scheduler::responsive_spin_until(
             // SAFETY: same.
             || unsafe { mmio.read32(op_off + OP_USBSTS) } & USBSTS_CNR == 0,
-            1_000_000,
+            narf_time::Deadline::after_ms(1_000),
         );
         if !cnr_clear {
             return Err(XhciError::NotReady);
@@ -824,12 +832,14 @@ impl Xhci {
         unsafe {
             mmio.write32(op_off + OP_USBCMD, USBCMD_RS | USBCMD_INTE);
         }
-        // Wait for HCH = 0. responsive_spin keeps cursor/FB alive
-        // across the start.
-        let running = narf_scheduler::responsive_spin(
+        // Wait for HCH = 0. responsive_spin_until keeps cursor/FB
+        // alive across the start. xHCI 1.2 §5.4.1.1 says the
+        // controller starts running within ~16 ms of setting R/S;
+        // 100 ms gives slow QEMU/firmware variants headroom.
+        let running = narf_scheduler::responsive_spin_until(
             // SAFETY: same.
             || unsafe { mmio.read32(op_off + OP_USBSTS) } & USBSTS_HCH == 0,
-            1_000_000,
+            narf_time::Deadline::after_ms(100),
         );
         if !running {
             return Err(XhciError::StartFailed);
@@ -1119,8 +1129,14 @@ impl Xhci {
             self.mmio.write32(off, to_write);
         }
         // Wait for PR to clear AND PRC to set (§4.19.5: PR self-
-        // clears + PRC asserts on reset completion). Bound at ~250 ms.
-        for _ in 0..2_500_000u32 {
+        // clears + PRC asserts on reset completion). Bound at 250 ms
+        // wall-clock — replaces the prior CPU-clock-dependent
+        // 2.5M-iter spin budget.
+        let pr_deadline = narf_time::Deadline::after_ms(250);
+        loop {
+            if pr_deadline.expired() {
+                break;
+            }
             // SAFETY: same.
             let v = unsafe { self.mmio.read32(off) };
             if v & PORTSC_PR == 0 && v & PORTSC_PRC != 0 {
@@ -1378,27 +1394,32 @@ impl Xhci {
             return Ok(ev);
         }
 
-        // Bounded spin-wait. On every iteration: (a) demux any
-        // pending event off the ring into queues (also lets us
-        // catch up if the ISR fired and we're racing), then (b)
-        // re-check the queues for our match. Audit F-51: every
+        // Bounded wall-clock wait (~250 ms). On every iteration:
+        // (a) demux any pending event off the ring into queues (also
+        // lets us catch up if the ISR fired and we're racing), then
+        // (b) re-check the queues for our match. Audit F-51: every
         // ~4096 spins call sleep_pumps::run so the cursor / FB /
         // serial console stay alive on a slow controller — we're
         // run from sync init paths (initcalls, supervisor) and
         // those paths are the *only* thing pumping the FB on
         // single-CPU bring-up.
-        for i in 0..10_000_000u32 {
+        let deadline = narf_time::Deadline::after_ms(250);
+        let mut i: u32 = 0;
+        loop {
             // Demux any new ring entries.
             while self.demux_one_event().is_some() {}
             if let Some(ev) = try_match(self, &mut predicate) {
                 return Ok(ev);
             }
+            if deadline.expired() {
+                return Err(XhciError::CmdTimeout);
+            }
             if i & 0xFFF == 0 {
                 narf_scheduler::sleep_pumps::run();
             }
             core::hint::spin_loop();
+            i = i.wrapping_add(1);
         }
-        Err(XhciError::CmdTimeout)
     }
 
     /// Issue an Enable Slot command (§4.6.3) and wait for the
