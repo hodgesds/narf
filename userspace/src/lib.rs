@@ -43,6 +43,7 @@ pub mod interp;
 pub mod loader;
 pub mod pipe;
 pub mod process;
+pub mod socket;
 pub mod syscall;
 #[cfg(target_arch = "x86_64")]
 pub mod tls;

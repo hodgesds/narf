@@ -1352,6 +1352,141 @@ pub unsafe fn syscall0_raw(num: u64) -> u64 {
 
 pub const SYS_SIGRETURN: u64 = 187;
 
+pub const SYS_SOCKET: u64 = 197;
+pub const SYS_BIND: u64 = 198;
+pub const SYS_LISTEN: u64 = 199;
+pub const SYS_ACCEPT: u64 = 201;
+pub const SYS_CONNECT: u64 = 202;
+pub const SYS_SOCKET_SEND: u64 = 203;
+pub const SYS_SOCKET_RECV: u64 = 204;
+pub const SYS_SHUTDOWN: u64 = 205;
+pub const SYS_GETSOCKOPT: u64 = 206;
+pub const SYS_SETSOCKOPT: u64 = 207;
+pub const SYS_SOCK_REGISTER_BUF: u64 = 208;
+pub const SYS_SOCK_SEND_ZC: u64 = 209;
+
+/// `socket(domain, type, protocol)` — returns a new socket fd or -1.
+#[inline]
+pub fn socket(domain: u32, kind: u32, proto: u32) -> i32 {
+    let r = unsafe { syscall3(SYS_SOCKET, domain as u64, kind as u64, proto as u64) };
+    r as i32
+}
+
+/// `bind(fd, addr, addrlen)`. Returns 0 on success, -1 on failure.
+#[inline]
+pub fn bind(fd: i32, addr: *const u8, addrlen: u32) -> i32 {
+    let r = unsafe { syscall3(SYS_BIND, fd as u64, addr as u64, addrlen as u64) };
+    r as i32
+}
+
+/// `listen(fd, backlog)`.
+#[inline]
+pub fn listen(fd: i32, backlog: u32) -> i32 {
+    let r = unsafe { syscall2(SYS_LISTEN, fd as u64, backlog as u64) };
+    r as i32
+}
+
+/// `accept(fd, addr_out, addrlen_out)` — returns the new connected
+/// fd or -1. addr_out / addrlen_out may be NULL.
+#[inline]
+pub fn accept(fd: i32, addr_out: *mut u8, addrlen_out: *mut u32) -> i32 {
+    let r = unsafe {
+        syscall3(SYS_ACCEPT, fd as u64, addr_out as u64, addrlen_out as u64)
+    };
+    r as i32
+}
+
+/// `connect(fd, addr, addrlen)`.
+#[inline]
+pub fn connect(fd: i32, addr: *const u8, addrlen: u32) -> i32 {
+    let r = unsafe {
+        syscall3(SYS_CONNECT, fd as u64, addr as u64, addrlen as u64)
+    };
+    r as i32
+}
+
+/// `sendto(fd, buf, len, flags, addr, addrlen)`. addr/addrlen may
+/// be NULL/0 for connected sockets (i.e. POSIX `send`).
+#[inline]
+pub fn sendto(
+    fd: i32,
+    buf: *const u8,
+    len: usize,
+    flags: u32,
+    addr: *const u8,
+    addrlen: u32,
+) -> isize {
+    let r = unsafe {
+        syscall6(
+            SYS_SOCKET_SEND,
+            fd as u64,
+            buf as u64,
+            len as u64,
+            flags as u64,
+            addr as u64,
+            addrlen as u64,
+        )
+    };
+    r as isize
+}
+
+/// `recvfrom(fd, buf, len, flags, addr_out, addrlen_out)`.
+#[inline]
+pub fn recvfrom(
+    fd: i32,
+    buf: *mut u8,
+    len: usize,
+    flags: u32,
+    addr_out: *mut u8,
+    addrlen_out: *mut u32,
+) -> isize {
+    let r = unsafe {
+        syscall6(
+            SYS_SOCKET_RECV,
+            fd as u64,
+            buf as u64,
+            len as u64,
+            flags as u64,
+            addr_out as u64,
+            addrlen_out as u64,
+        )
+    };
+    r as isize
+}
+
+/// `shutdown(fd, how)`. how: 0 = SHUT_RD, 1 = SHUT_WR, 2 = SHUT_RDWR.
+#[inline]
+pub fn shutdown(fd: i32, how: u32) -> i32 {
+    let r = unsafe { syscall2(SYS_SHUTDOWN, fd as u64, how as u64) };
+    r as i32
+}
+
+/// ZC fast path: register a user buffer with the kernel, returns
+/// an opaque buf_id usable in `send_zc`.
+#[inline]
+pub fn sock_register_buffer(ptr: *const u8, len: usize) -> i32 {
+    let r = unsafe {
+        syscall2(SYS_SOCK_REGISTER_BUF, ptr as u64, len as u64)
+    };
+    r as i32
+}
+
+/// ZC fast path: send a slice of a registered buffer over `fd`.
+#[inline]
+pub fn sock_send_zc(fd: i32, buf_id: u32, off: u64, len: u64, flags: u32) -> isize {
+    let r = unsafe {
+        syscall5(
+            SYS_SOCK_SEND_ZC,
+            fd as u64,
+            buf_id as u64,
+            off,
+            len,
+            flags as u64,
+        )
+    };
+    r as isize
+}
+
 /// `unshare(flags)` — POSIX 2008 / Linux unshare(2). Today only
 /// CLONE_NEWNS = 0x00020000 has effect (snapshots the global
 /// mount table into a per-task private MountNamespace). Other

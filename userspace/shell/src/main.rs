@@ -26,6 +26,153 @@ use narf_libc as libc;
 /// Counts signal-handler hits for the `raise` smoke command.
 static RAISED: AtomicU32 = AtomicU32::new(0);
 
+/// Path used by the `socktest` smoke command. Static so both the
+/// listener thread and the connecter agree.
+const SOCKTEST_PATH: &[u8] = b"/sock/test\0";
+
+/// Build a sockaddr_un on the stack with the given path bytes.
+/// Returns (struct, total length).
+fn make_sockaddr_un(buf: &mut [u8; 110], path: &[u8]) -> u32 {
+    // sa_family = 1 (AF_UNIX), little-endian u16
+    buf[0] = 1;
+    buf[1] = 0;
+    let n = core::cmp::min(path.len(), 108);
+    for i in 0..n {
+        buf[2 + i] = path[i];
+    }
+    (2 + n) as u32
+}
+
+extern "C" fn socktest_listener(_arg: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+    use core::sync::atomic::Ordering;
+    let lfd = unsafe { libc::socket(1 /* AF_UNIX */, 1 /* SOCK_STREAM */, 0) };
+    if lfd < 0 {
+        SOCKTEST_RESULT.store(0xE1, Ordering::SeqCst);
+        return core::ptr::null_mut();
+    }
+    let mut addr_buf = [0u8; 110];
+    let alen = make_sockaddr_un(&mut addr_buf, SOCKTEST_PATH);
+    let r = unsafe {
+        libc::bind(lfd, addr_buf.as_ptr() as *const libc::sockaddr, alen)
+    };
+    if r < 0 {
+        SOCKTEST_RESULT.store(0xE2, Ordering::SeqCst);
+        return core::ptr::null_mut();
+    }
+    let r = unsafe { libc::listen(lfd, 4) };
+    if r < 0 {
+        SOCKTEST_RESULT.store(0xE3, Ordering::SeqCst);
+        return core::ptr::null_mut();
+    }
+    SOCKTEST_LISTENING.store(1, Ordering::SeqCst);
+    let cfd = unsafe {
+        libc::accept(lfd, core::ptr::null_mut(), core::ptr::null_mut())
+    };
+    if cfd < 0 {
+        SOCKTEST_RESULT.store(0xE4, Ordering::SeqCst);
+        return core::ptr::null_mut();
+    }
+    // Read "ping" (4 bytes).
+    let mut rbuf = [0u8; 16];
+    let n = unsafe {
+        libc::recv(cfd, rbuf.as_mut_ptr() as *mut core::ffi::c_void, rbuf.len(), 0)
+    };
+    if n != 4 || &rbuf[..4] != b"ping" {
+        SOCKTEST_RESULT.store(0xE5, Ordering::SeqCst);
+        return core::ptr::null_mut();
+    }
+    // Write "pong".
+    let n = unsafe {
+        libc::send(cfd, b"pong".as_ptr() as *const core::ffi::c_void, 4, 0)
+    };
+    if n != 4 {
+        SOCKTEST_RESULT.store(0xE6, Ordering::SeqCst);
+        return core::ptr::null_mut();
+    }
+    SOCKTEST_RESULT.store(1, Ordering::SeqCst);
+    // Release the listener path so subsequent runs can re-bind.
+    let _ = unsafe { libc::posix::close(lfd) };
+    let _ = unsafe { libc::posix::close(cfd) };
+    core::ptr::null_mut()
+}
+
+static SOCKTEST_LISTENING: AtomicU32 = AtomicU32::new(0);
+static SOCKTEST_RESULT: AtomicU32 = AtomicU32::new(0);
+
+fn socktest_run(fd: i32) {
+    use core::sync::atomic::Ordering;
+    SOCKTEST_LISTENING.store(0, Ordering::SeqCst);
+    SOCKTEST_RESULT.store(0, Ordering::SeqCst);
+    // Spawn the listener thread.
+    let mut tid: u64 = 0;
+    let attr = core::ptr::null::<libc::pthread_attr_t>();
+    let rc = unsafe {
+        libc::pthread_create(
+            &mut tid as *mut u64,
+            attr,
+            socktest_listener,
+            core::ptr::null_mut(),
+        )
+    };
+    if rc != 0 {
+        unsafe { write_all(fd, b"socktest: pthread_create failed\n"); }
+        return;
+    }
+    // Spin until the listener says it's bound + listening. The
+    // 1-CPU executor gives the listener a slice every time we
+    // yield (sleep with non-zero ns triggers the scheduler's
+    // park-and-repoll path; sleep(0) is a fast no-op kernel-side
+    // and would never yield).
+    while SOCKTEST_LISTENING.load(Ordering::SeqCst) == 0 {
+        unsafe { libc::usleep(1000); } // 1 ms
+    }
+    // Parent: connect, write ping, read pong.
+    let cfd = unsafe { libc::socket(1, 1, 0) };
+    if cfd < 0 {
+        unsafe { write_all(fd, b"socktest: parent socket() failed\n"); }
+        return;
+    }
+    let mut addr_buf = [0u8; 110];
+    let alen = make_sockaddr_un(&mut addr_buf, SOCKTEST_PATH);
+    let r = unsafe {
+        libc::connect(cfd, addr_buf.as_ptr() as *const libc::sockaddr, alen)
+    };
+    if r < 0 {
+        unsafe { write_all(fd, b"socktest: parent connect() failed\n"); }
+        return;
+    }
+    let n = unsafe {
+        libc::send(cfd, b"ping".as_ptr() as *const core::ffi::c_void, 4, 0)
+    };
+    if n != 4 {
+        unsafe { write_all(fd, b"socktest: parent send(ping) short\n"); }
+        return;
+    }
+    let mut rbuf = [0u8; 16];
+    let n = unsafe {
+        libc::recv(cfd, rbuf.as_mut_ptr() as *mut core::ffi::c_void, rbuf.len(), 0)
+    };
+    if n != 4 || &rbuf[..4] != b"pong" {
+        unsafe { write_all(fd, b"socktest: parent recv != pong\n"); }
+        return;
+    }
+    // Join the listener.
+    let _ = unsafe { libc::pthread_join(tid, core::ptr::null_mut()) };
+    let _ = unsafe { libc::posix::close(cfd) };
+    let result = SOCKTEST_RESULT.load(Ordering::SeqCst);
+    if result == 1 {
+        unsafe { write_all(fd, b"socktest: ok (ping<->pong over AF_UNIX)\n"); }
+    } else {
+        let mut buf = [0u8; 12];
+        let s = u32_to_decimal(result, &mut buf);
+        unsafe {
+            write_all(fd, b"socktest: failed listener-stage=0x");
+            write_all(fd, s);
+            write_all(fd, NEWLINE);
+        }
+    }
+}
+
 /// Shared counter the `threads` smoke command increments from
 /// every worker thread.
 static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -203,6 +350,13 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
             write_all(fd, s);
             write_all(fd, NEWLINE);
         }
+    } else if cmd == b"socktest" {
+        // socktest — spawn a worker that binds an AF_UNIX listener
+        // at /sock/test, accepts one connection, reads "ping" and
+        // writes "pong". Parent connects, writes "ping", reads
+        // "pong", joins. Validates socket / bind / listen /
+        // accept / connect / send / recv end-to-end.
+        socktest_run(fd);
     } else if cmd == b"threads" {
         // threads <N> — spawn N threads, each increments a shared
         // atomic counter K times, joins all, prints total. Exercises

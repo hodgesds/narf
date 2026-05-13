@@ -2441,6 +2441,21 @@ fn sys_getdents64(ctx: &mut dyn TrapContext) {
 fn sys_close(ctx: &mut dyn TrapContext) {
     let fd = ctx.args().arg0 as u32;
     let task = current_task_id();
+    // Before removing the fd, peek the FileOps Arc; if it's a
+    // SocketFile, run its unregister hook so a bound listener
+    // releases its path slot for re-use.
+    let arc_ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten();
+    if let Some(ops) = arc_ops {
+        let raw = alloc::sync::Arc::as_ptr(&ops) as *const ();
+        if let Some(sock) = socket_arc_lookup(raw) {
+            sock.unregister();
+            // Drop the side-table reference too.
+            let mut g = SOCKET_ARCS.lock();
+            if let Some(map) = g.as_mut() {
+                map.remove(&(raw as usize));
+            }
+        }
+    }
     let ok = fd::with_table(task, |t| t.close(fd)).unwrap_or(false);
     if ok {
         ctx.set_return(SyscallReturn::ok(0));
@@ -6219,6 +6234,377 @@ fn sys_sigreturn(ctx: &mut dyn TrapContext) {
 }
 
 
+// ── Sockets — POSIX shims over the SocketOp dispatcher ───────────
+//
+// Both POSIX-shaped syscalls (sys_socket / sys_bind / ...) and the
+// future ZC ring opcodes call into `socket::SocketFile::dispatch_op`.
+// Per the design doc: kernel surface stays small, libc translates
+// POSIX sockaddr_* unions in/out, the dispatcher owns per-family
+// state.
+
+fn current_socket(fd: u32) -> Option<alloc::sync::Arc<crate::socket::SocketFile>> {
+    let task = current_task_id();
+    fd::with_table(task, |t| t.get(fd).cloned())
+        .flatten()
+        .and_then(|entry| {
+            // Downcast Arc<dyn FileOps> → Arc<SocketFile>. Manual
+            // because Arc downcast for trait objects isn't in core;
+            // we identify a SocketFile by raw-pointer comparison
+            // through a marker — but simpler: try downcast via
+            // unsafe transmute is risky. Use a manual pattern: keep
+            // a side table mapping fd → Arc<SocketFile>.
+            let raw = alloc::sync::Arc::as_ptr(&entry.ops) as *const ();
+            socket_arc_lookup(raw)
+        })
+}
+
+// Side table to enable Arc<dyn FileOps> -> Arc<SocketFile> recovery.
+// `fd::FdEntry` stores Arc<dyn FileOps>; `dyn FileOps` is not
+// `Any`, so a downcast isn't possible. Stage-1: register the
+// concrete Arc when the socket is created; look it up by the same
+// raw pointer the FdEntry holds.
+static SOCKET_ARCS: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<usize, alloc::sync::Arc<crate::socket::SocketFile>>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+fn socket_arc_register(arc: &alloc::sync::Arc<crate::socket::SocketFile>) {
+    let key = alloc::sync::Arc::as_ptr(arc) as usize;
+    let mut g = SOCKET_ARCS.lock();
+    let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
+    map.insert(key, arc.clone());
+}
+
+fn socket_arc_lookup(
+    raw: *const (),
+) -> Option<alloc::sync::Arc<crate::socket::SocketFile>> {
+    let g = SOCKET_ARCS.lock();
+    g.as_ref()?.get(&(raw as usize)).cloned()
+}
+
+fn copy_user_addr(ptr: u64, len: u64) -> Option<crate::socket::SockAddr> {
+    if ptr == 0 || len < 2 || len > 110 {
+        return None;
+    }
+    // Family is the first u16 (host byte order). Body is the rest.
+    let mut family_bytes = [0u8; 2];
+    unsafe {
+        family_bytes[0] = core::ptr::read_volatile(ptr as *const u8);
+        family_bytes[1] = core::ptr::read_volatile((ptr + 1) as *const u8);
+    }
+    let family = u16::from_le_bytes(family_bytes);
+    let body_len = (len - 2) as usize;
+    let mut body = alloc::vec![0u8; body_len];
+    unsafe {
+        for i in 0..body_len {
+            body[i] = core::ptr::read_volatile((ptr + 2 + i as u64) as *const u8);
+        }
+    }
+    Some(crate::socket::SockAddr { family, body })
+}
+
+fn sys_socket(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let domain = args.arg0 as u16;
+    let kind = args.arg1 as u32;
+    let _proto = args.arg2;
+    let sock = crate::socket::SocketFile::new(domain, kind);
+    socket_arc_register(&sock);
+    let task = current_task_id();
+    let new_fd = match fd::with_table(task, |t| {
+        t.open(crate::fd::FdEntry {
+            ops: sock.clone(),
+            offset: 0,
+            flags: 0,
+        })
+    }) {
+        Some(n) => n,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            return;
+        }
+    };
+    ctx.set_return(SyscallReturn::ok(new_fd as u64));
+}
+
+fn sys_socket_bind(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let fd = args.arg0 as u32;
+    let addr_ptr = args.arg1;
+    let addr_len = args.arg2;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    let sock = match current_socket(fd) {
+        Some(s) => s,
+        None => { ctx.set_return(fail); return; }
+    };
+    let addr = match copy_user_addr(addr_ptr, addr_len) {
+        Some(a) => a,
+        None => { ctx.set_return(fail); return; }
+    };
+    match sock.dispatch_op(crate::socket::SocketOp::Bind { addr }) {
+        crate::socket::SocketOpResult::Ok(_) => ctx.set_return(SyscallReturn::ok(0)),
+        _ => ctx.set_return(fail),
+    }
+}
+
+fn sys_socket_listen(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let fd = args.arg0 as u32;
+    let backlog = args.arg1 as u32;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    let sock = match current_socket(fd) {
+        Some(s) => s,
+        None => { ctx.set_return(fail); return; }
+    };
+    match sock.dispatch_op(crate::socket::SocketOp::Listen { backlog }) {
+        crate::socket::SocketOpResult::Ok(_) => ctx.set_return(SyscallReturn::ok(0)),
+        _ => ctx.set_return(fail),
+    }
+}
+
+fn sys_socket_accept(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let fd = args.arg0 as u32;
+    let _addr_out = args.arg1;
+    let _addr_len_out = args.arg2;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    let sock = match current_socket(fd) {
+        Some(s) => s,
+        None => { ctx.set_return(fail); return; }
+    };
+    // Single-shot: pop pending if any, else WouldBlock-style yield
+    // mirroring sys_futex. Caller (libc accept) loops.
+    match sock.dispatch_op(crate::socket::SocketOp::Accept) {
+        crate::socket::SocketOpResult::Accepted { socket, .. } => {
+            socket_arc_register(&socket);
+            let task = current_task_id();
+            let new_fd = match fd::with_table(task, |t| {
+                t.open(crate::fd::FdEntry {
+                    ops: socket,
+                    offset: 0,
+                    flags: 0,
+                })
+            }) {
+                Some(n) => n,
+                None => {
+                    ctx.set_return(fail);
+                    return;
+                }
+            };
+            ctx.set_return(SyscallReturn::ok(new_fd as u64));
+        }
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::WouldBlock) => {
+            // Yield like sys_futex / sys_sleep do: park ~1ms so
+            // other tasks (notably the connecter) make progress;
+            // user-side libc loops over us.
+            if let (Some(uctx), Some(hook)) = (
+                crate::user_task::current_user_task(),
+                crate::user_task::yield_hook(),
+            ) {
+                ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+                let deadline = narf_scheduler::narf_time::monotonic_ns()
+                    .saturating_add(1_000_000);
+                unsafe {
+                    let uc = &*uctx;
+                    uc.sleep_deadline_ns.store(deadline, Ordering::Release);
+                    ctx.save_user_state(uc.state.get() as *mut u8);
+                    *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                    hook(uctx);
+                }
+            }
+            ctx.set_return(fail);
+        }
+        _ => ctx.set_return(fail),
+    }
+}
+
+fn sys_socket_connect(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let fd = args.arg0 as u32;
+    let addr_ptr = args.arg1;
+    let addr_len = args.arg2;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    let sock = match current_socket(fd) {
+        Some(s) => s,
+        None => { ctx.set_return(fail); return; }
+    };
+    let addr = match copy_user_addr(addr_ptr, addr_len) {
+        Some(a) => a,
+        None => { ctx.set_return(fail); return; }
+    };
+    match sock.dispatch_op(crate::socket::SocketOp::Connect { addr }) {
+        crate::socket::SocketOpResult::Ok(_) => ctx.set_return(SyscallReturn::ok(0)),
+        _ => ctx.set_return(fail),
+    }
+}
+
+fn sys_socket_send(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let fd = args.arg0 as u32;
+    let buf_ptr = args.arg1 as *const u8;
+    let buf_len = args.arg2 as usize;
+    let flags = args.arg3 as u32;
+    // arg4 / arg5 are sendto's (addr, addrlen) — ignored for AF_UNIX
+    // SOCK_STREAM connected sockets.
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    let sock = match current_socket(fd) {
+        Some(s) => s,
+        None => { ctx.set_return(fail); return; }
+    };
+    if buf_ptr.is_null() && buf_len != 0 {
+        ctx.set_return(fail);
+        return;
+    }
+    // SAFETY: per-byte read through identity-mapped active AS;
+    // bad pointer faults user-side.
+    let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(buf_len);
+    unsafe {
+        for i in 0..buf_len {
+            buf.push(core::ptr::read_volatile(buf_ptr.add(i)));
+        }
+    }
+    match sock.dispatch_op(crate::socket::SocketOp::Send {
+        buf: &buf,
+        flags,
+        addr: None,
+    }) {
+        crate::socket::SocketOpResult::Ok(n) => ctx.set_return(SyscallReturn::ok(n)),
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::WouldBlock) => {
+            // Yield + retry from libc.
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        _ => ctx.set_return(fail),
+    }
+}
+
+fn sys_socket_recv(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let fd = args.arg0 as u32;
+    let buf_ptr = args.arg1 as *mut u8;
+    let buf_len = args.arg2 as usize;
+    let flags = args.arg3 as u32;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    let sock = match current_socket(fd) {
+        Some(s) => s,
+        None => { ctx.set_return(fail); return; }
+    };
+    if buf_ptr.is_null() && buf_len != 0 {
+        ctx.set_return(fail);
+        return;
+    }
+    let mut buf = alloc::vec![0u8; buf_len];
+    let result = sock.dispatch_op(crate::socket::SocketOp::Recv {
+        buf: &mut buf,
+        flags,
+    });
+    match result {
+        crate::socket::SocketOpResult::Received { n, .. } => {
+            // Copy back into user.
+            unsafe {
+                for i in 0..n {
+                    core::ptr::write_volatile(buf_ptr.add(i), buf[i]);
+                }
+            }
+            ctx.set_return(SyscallReturn::ok(n as u64));
+        }
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::WouldBlock) => {
+            // Yield ~1ms; libc loops.
+            if let (Some(uctx), Some(hook)) = (
+                crate::user_task::current_user_task(),
+                crate::user_task::yield_hook(),
+            ) {
+                ctx.set_return(SyscallReturn::ok(0));
+                let deadline = narf_scheduler::narf_time::monotonic_ns()
+                    .saturating_add(1_000_000);
+                unsafe {
+                    let uc = &*uctx;
+                    uc.sleep_deadline_ns.store(deadline, Ordering::Release);
+                    ctx.save_user_state(uc.state.get() as *mut u8);
+                    *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                    hook(uctx);
+                }
+            }
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        _ => ctx.set_return(fail),
+    }
+}
+
+fn sys_socket_shutdown(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let fd = args.arg0 as u32;
+    let how = args.arg1 as u32;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    let sock = match current_socket(fd) {
+        Some(s) => s,
+        None => { ctx.set_return(fail); return; }
+    };
+    match sock.dispatch_op(crate::socket::SocketOp::Shutdown { how }) {
+        crate::socket::SocketOpResult::Ok(_) => ctx.set_return(SyscallReturn::ok(0)),
+        _ => ctx.set_return(fail),
+    }
+}
+
+fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
+    // Stage-1: every getsockopt returns success with len=0 to keep
+    // libc happy. Real per-option storage lands once a consumer
+    // (TCP) needs it.
+    let _ = ctx.args();
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+fn sys_socket_setsockopt(ctx: &mut dyn TrapContext) {
+    // Stage-1: accept and ignore. Real setsockopt routing lands
+    // alongside TCP.
+    let _ = ctx.args();
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+fn sys_sock_register_buf(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let ptr = args.arg0;
+    let len = args.arg1;
+    let task = current_task_id();
+    match crate::socket::register_user_buffer(task, ptr, len) {
+        Some(id) => ctx.set_return(SyscallReturn::ok(id as u64)),
+        None => ctx.set_return(SyscallReturn::ok((-1i64) as u64)),
+    }
+}
+
+fn sys_sock_send_zc(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let fd = args.arg0 as u32;
+    let buf_id = args.arg1 as u32;
+    let off = args.arg2;
+    let len = args.arg3;
+    let _flags = args.arg4 as u32;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    let task = current_task_id();
+    let (vaddr, slice_len) = match crate::socket::registered_buffer_slice(task, buf_id, off, len) {
+        Some(s) => s,
+        None => { ctx.set_return(fail); return; }
+    };
+    let sock = match current_socket(fd) {
+        Some(s) => s,
+        None => { ctx.set_return(fail); return; }
+    };
+    // Zero-copy contract: the kernel reads directly from the
+    // pinned user vaddr. For AF_UNIX SOCK_STREAM the destination
+    // is an in-kernel ring, so "zero-copy" still means a single
+    // memcpy — once the NIC TX path lands, this becomes a real
+    // descriptor enqueue with no copy.
+    let buf: &[u8] = unsafe {
+        core::slice::from_raw_parts(vaddr as *const u8, slice_len as usize)
+    };
+    match sock.dispatch_op(crate::socket::SocketOp::Send {
+        buf,
+        flags: 0,
+        addr: None,
+    }) {
+        crate::socket::SocketOpResult::Ok(n) => ctx.set_return(SyscallReturn::ok(n)),
+        _ => ctx.set_return(fail),
+    }
+}
+
 fn sys_sigaction(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let signum = args.arg0 as usize;
@@ -6362,6 +6748,18 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Fstatfs, "fstatfs", RawFnHandler(sys_fstatfs));
     table.install_raw(Syscall::Unshare, "unshare", RawFnHandler(sys_unshare));
     table.install_raw(Syscall::Sigreturn, "sigreturn", RawFnHandler(sys_sigreturn));
+    table.install_raw(Syscall::SocketOpen, "socket", RawFnHandler(sys_socket));
+    table.install_raw(Syscall::SocketBind, "bind", RawFnHandler(sys_socket_bind));
+    table.install_raw(Syscall::SocketListen, "listen", RawFnHandler(sys_socket_listen));
+    table.install_raw(Syscall::SocketAccept, "accept", RawFnHandler(sys_socket_accept));
+    table.install_raw(Syscall::SocketConnect, "connect", RawFnHandler(sys_socket_connect));
+    table.install_raw(Syscall::SocketSend, "send", RawFnHandler(sys_socket_send));
+    table.install_raw(Syscall::SocketRecv, "recv", RawFnHandler(sys_socket_recv));
+    table.install_raw(Syscall::SocketShutdown, "shutdown", RawFnHandler(sys_socket_shutdown));
+    table.install_raw(Syscall::SocketGetSockOpt, "getsockopt", RawFnHandler(sys_socket_getsockopt));
+    table.install_raw(Syscall::SocketSetSockOpt, "setsockopt", RawFnHandler(sys_socket_setsockopt));
+    table.install_raw(Syscall::SockRegisterBuf, "sock_register_buf", RawFnHandler(sys_sock_register_buf));
+    table.install_raw(Syscall::SockSendZc, "sock_send_zc", RawFnHandler(sys_sock_send_zc));
     table.install_raw(
         Syscall::FbConnect,
         "fb_connect",

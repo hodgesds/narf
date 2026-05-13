@@ -1,0 +1,552 @@
+//! Socket dispatcher + AF_UNIX SOCK_STREAM backend.
+//!
+//! Two entry shapes call into this module:
+//! - POSIX-shaped syscalls (`sys_socket`/`sys_bind`/...) in
+//!   `handlers.rs`, which copy buffers across the syscall ABI.
+//! - Ring opcodes from the io-submission ring (`SockRegisterBuf`,
+//!   `SockSendZc`) for the zerocopy fast path.
+//!
+//! Both paths land in `dispatch_op`. The dispatcher routes based
+//! on `SocketDomain`; per-family backends own connection state.
+//! `SocketFile` implements `narf_filesystem::FileOps` so socket
+//! fds live in the same per-task fd table as regular files; the
+//! existing `read`/`write`/`close` syscalls work on a socket fd
+//! transparently.
+//!
+//! Stage-1 family: AF_UNIX SOCK_STREAM. A bound listener
+//! registers its path in a global `LISTENERS` map; `connect()`
+//! finds it, builds two SPSC ring buffers (one per direction),
+//! and pushes a fresh accepted endpoint into the listener's
+//! pending-accept queue. AF_INET TCP slots into the same shape
+//! when the IP stack lands — `dispatch_op` switches on family,
+//! everything below shares the SocketFile/FdEntry plumbing.
+
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, VecDeque};
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+use narf_filesystem::{FileOps, FsError, FsFuture, Mode, Stat};
+use narf_lib::sync::IrqSafeSpinLock;
+
+// ── POSIX-numbered constants ────────────────────────────────────
+
+pub const AF_UNIX: u16 = 1;
+pub const AF_INET: u16 = 2;
+pub const AF_INET6: u16 = 10;
+
+pub const SOCK_STREAM: u32 = 1;
+pub const SOCK_DGRAM: u32 = 2;
+
+pub const SHUT_RD: u32 = 0;
+pub const SHUT_WR: u32 = 1;
+pub const SHUT_RDWR: u32 = 2;
+
+// ── Address shape ───────────────────────────────────────────────
+
+/// Wire-stable address. POSIX sockaddr_* unions translate to/from
+/// this shape libc-side; the kernel only deals with `(family, body)`.
+/// Body length is up to 108 bytes (matches Unix sun_path max).
+#[derive(Clone, Debug)]
+pub struct SockAddr {
+    pub family: u16,
+    pub body: Vec<u8>,
+}
+
+// ── Socket op dispatcher ────────────────────────────────────────
+
+#[derive(Debug)]
+pub enum SocketOp<'a> {
+    Bind { addr: SockAddr },
+    Listen { backlog: u32 },
+    Accept,
+    Connect { addr: SockAddr },
+    Send { buf: &'a [u8], flags: u32, addr: Option<SockAddr> },
+    Recv { buf: &'a mut [u8], flags: u32 },
+    Shutdown { how: u32 },
+}
+
+#[derive(Debug)]
+pub enum SocketOpResult {
+    Ok(u64),
+    Accepted { socket: Arc<SocketFile>, peer: Option<SockAddr> },
+    Received { n: usize, peer: Option<SockAddr> },
+    Err(SockError),
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SockError {
+    BadFd,
+    InvalidArg,
+    NotSupported,
+    NotConnected,
+    AlreadyConnected,
+    WouldBlock,
+    AddrInUse,
+    AddrNotAvail,
+    ConnectionRefused,
+    Pipe,
+}
+
+impl SockError {
+    /// Map onto the libc-style errno value the user sees on -1.
+    pub fn errno(self) -> i32 {
+        match self {
+            Self::BadFd => 9,             // EBADF
+            Self::InvalidArg => 22,       // EINVAL
+            Self::NotSupported => 95,     // ENOTSUP
+            Self::NotConnected => 107,    // ENOTCONN
+            Self::AlreadyConnected => 56, // EISCONN
+            Self::WouldBlock => 11,       // EAGAIN
+            Self::AddrInUse => 98,        // EADDRINUSE
+            Self::AddrNotAvail => 99,     // EADDRNOTAVAIL
+            Self::ConnectionRefused => 111, // ECONNREFUSED
+            Self::Pipe => 32,             // EPIPE
+        }
+    }
+}
+
+// ── SocketFile (FileOps impl, lives in fd table) ────────────────
+
+pub struct SocketFile {
+    pub domain: u16,
+    pub kind: u32,
+    state: IrqSafeSpinLock<SocketState>,
+}
+
+enum SocketState {
+    /// Freshly-created, no bind/connect yet.
+    Fresh,
+    /// AF_UNIX bound listener at the named path.
+    UnixListener {
+        path: String,
+        backlog: u32,
+        /// Connections that have been initiated by `connect()` but
+        /// haven't yet been picked up by `accept()`. The other
+        /// half of each pair is given to the connecter.
+        pending: VecDeque<Arc<SocketFile>>,
+    },
+    /// AF_UNIX connected endpoint. Two ring buffers — one for
+    /// each direction — shared between this end and the peer.
+    UnixConnected {
+        /// Bytes the local end SENDS (peer reads).
+        tx: Arc<RingBuf>,
+        /// Bytes the local end RECEIVES (peer writes).
+        rx: Arc<RingBuf>,
+    },
+}
+
+impl SocketFile {
+    pub fn new(domain: u16, kind: u32) -> Arc<Self> {
+        Arc::new(Self {
+            domain,
+            kind,
+            state: IrqSafeSpinLock::new(SocketState::Fresh),
+        })
+    }
+
+    /// Tear down listener-registry entries owned by this socket.
+    /// Called from sys_close so the path is reusable on the next
+    /// bind. Idempotent — closing a non-listener socket is a no-op.
+    pub fn unregister(&self) {
+        let path = {
+            let state = self.state.lock();
+            match &*state {
+                SocketState::UnixListener { path, .. } => Some(path.clone()),
+                _ => None,
+            }
+        };
+        if let Some(p) = path {
+            let mut g = LISTENERS.lock();
+            if let Some(map) = g.as_mut() {
+                map.remove(&p);
+            }
+        }
+    }
+}
+
+impl core::fmt::Debug for SocketFile {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SocketFile")
+            .field("domain", &self.domain)
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FileOps for SocketFile {
+    fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move {
+            // POSIX `read` on a socket == `recv` with flags=0.
+            let r = self.do_recv(buf, 0);
+            match r {
+                Ok((n, _)) => Ok(n),
+                Err(SockError::WouldBlock) => Ok(0),
+                Err(_) => Err(FsError::Unsupported),
+            }
+        })
+    }
+
+    fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move {
+            // POSIX `write` on a socket == `send` with flags=0.
+            let r = self.do_send(buf, 0, None);
+            match r {
+                Ok(n) => Ok(n),
+                Err(_) => Err(FsError::Unsupported),
+            }
+        })
+    }
+
+    fn stat(&self) -> Stat {
+        Stat {
+            size: 0,
+            blocks: 0,
+            mode: Mode {
+                file_type: narf_filesystem::FileType::Special,
+                perms: 0o600,
+            },
+            mtime_cycles: 0,
+        }
+    }
+}
+
+impl SocketFile {
+    /// Per-op dispatcher. The SocketOp enum carries the operation
+    /// shape; the per-family branch executes it. POSIX syscall
+    /// shims and ring opcodes both call this.
+    pub fn dispatch_op(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
+        if self.domain != AF_UNIX || self.kind != SOCK_STREAM {
+            return SocketOpResult::Err(SockError::NotSupported);
+        }
+        match op {
+            SocketOp::Bind { addr } => {
+                if addr.family != AF_UNIX {
+                    return SocketOpResult::Err(SockError::InvalidArg);
+                }
+                let path = match core::str::from_utf8(&addr.body) {
+                    Ok(s) => alloc::string::String::from(s.trim_end_matches('\0')),
+                    Err(_) => return SocketOpResult::Err(SockError::InvalidArg),
+                };
+                if path.is_empty() {
+                    return SocketOpResult::Err(SockError::InvalidArg);
+                }
+                let mut state = self.state.lock();
+                match &*state {
+                    SocketState::Fresh => {
+                        let mut listeners = LISTENERS.lock();
+                        let map = listeners.get_or_insert_with(BTreeMap::new);
+                        if map.contains_key(&path) {
+                            return SocketOpResult::Err(SockError::AddrInUse);
+                        }
+                        // We can't put the listener in the map yet
+                        // (we only have &Arc here) — record the
+                        // path in our state, and have Listen() do
+                        // the actual map insert. POSIX bind+listen
+                        // are always called in sequence on stream
+                        // sockets so this is fine.
+                        *state = SocketState::UnixListener {
+                            path,
+                            backlog: 0,
+                            pending: VecDeque::new(),
+                        };
+                        SocketOpResult::Ok(0)
+                    }
+                    _ => SocketOpResult::Err(SockError::InvalidArg),
+                }
+            }
+            SocketOp::Listen { backlog } => {
+                let mut state = self.state.lock();
+                match &mut *state {
+                    SocketState::UnixListener { path, backlog: b, .. } => {
+                        *b = backlog;
+                        let path = path.clone();
+                        drop(state);
+                        let mut listeners = LISTENERS.lock();
+                        let map = listeners.get_or_insert_with(BTreeMap::new);
+                        map.insert(path, self.clone());
+                        SocketOpResult::Ok(0)
+                    }
+                    _ => SocketOpResult::Err(SockError::InvalidArg),
+                }
+            }
+            SocketOp::Accept => {
+                // Pop from the pending queue. Caller (sys_accept)
+                // wraps this in a yield-loop until something arrives.
+                let mut state = self.state.lock();
+                match &mut *state {
+                    SocketState::UnixListener { pending, .. } => {
+                        if let Some(s) = pending.pop_front() {
+                            SocketOpResult::Accepted { socket: s, peer: None }
+                        } else {
+                            SocketOpResult::Err(SockError::WouldBlock)
+                        }
+                    }
+                    _ => SocketOpResult::Err(SockError::InvalidArg),
+                }
+            }
+            SocketOp::Connect { addr } => {
+                if addr.family != AF_UNIX {
+                    return SocketOpResult::Err(SockError::InvalidArg);
+                }
+                let path = match core::str::from_utf8(&addr.body) {
+                    Ok(s) => alloc::string::String::from(s.trim_end_matches('\0')),
+                    Err(_) => return SocketOpResult::Err(SockError::InvalidArg),
+                };
+                let listener = {
+                    let listeners = LISTENERS.lock();
+                    listeners
+                        .as_ref()
+                        .and_then(|m| m.get(&path).cloned())
+                };
+                let listener = match listener {
+                    Some(l) => l,
+                    None => return SocketOpResult::Err(SockError::ConnectionRefused),
+                };
+                // Mint two ring buffers; one direction each.
+                let a_to_b = Arc::new(RingBuf::new());
+                let b_to_a = Arc::new(RingBuf::new());
+                // Give the new accepted endpoint to the listener's
+                // pending queue; configure our local state with
+                // the matching pair.
+                let server_end = SocketFile::new(AF_UNIX, SOCK_STREAM);
+                {
+                    let mut srv_state = server_end.state.lock();
+                    *srv_state = SocketState::UnixConnected {
+                        tx: b_to_a.clone(),
+                        rx: a_to_b.clone(),
+                    };
+                }
+                {
+                    let mut lst = listener.state.lock();
+                    if let SocketState::UnixListener { pending, .. } = &mut *lst {
+                        pending.push_back(server_end);
+                    } else {
+                        return SocketOpResult::Err(SockError::ConnectionRefused);
+                    }
+                }
+                // Configure our (client) end.
+                let mut state = self.state.lock();
+                match &*state {
+                    SocketState::Fresh => {
+                        *state = SocketState::UnixConnected {
+                            tx: a_to_b,
+                            rx: b_to_a,
+                        };
+                        SocketOpResult::Ok(0)
+                    }
+                    _ => SocketOpResult::Err(SockError::AlreadyConnected),
+                }
+            }
+            SocketOp::Send { buf, flags, addr: _ } => {
+                match self.do_send(buf, flags, None) {
+                    Ok(n) => SocketOpResult::Ok(n as u64),
+                    Err(e) => SocketOpResult::Err(e),
+                }
+            }
+            SocketOp::Recv { buf, flags } => {
+                match self.do_recv(buf, flags) {
+                    Ok((n, peer)) => SocketOpResult::Received { n, peer },
+                    Err(e) => SocketOpResult::Err(e),
+                }
+            }
+            SocketOp::Shutdown { how } => {
+                let state = self.state.lock();
+                match &*state {
+                    SocketState::UnixConnected { tx, rx } => {
+                        if how == SHUT_WR || how == SHUT_RDWR {
+                            tx.close();
+                        }
+                        if how == SHUT_RD || how == SHUT_RDWR {
+                            rx.close();
+                        }
+                        SocketOpResult::Ok(0)
+                    }
+                    _ => SocketOpResult::Err(SockError::NotConnected),
+                }
+            }
+        }
+    }
+
+    fn do_send(
+        &self,
+        buf: &[u8],
+        _flags: u32,
+        _addr: Option<SockAddr>,
+    ) -> Result<usize, SockError> {
+        let state = self.state.lock();
+        match &*state {
+            SocketState::UnixConnected { tx, .. } => {
+                if tx.is_closed() {
+                    return Err(SockError::Pipe);
+                }
+                let n = tx.write(buf);
+                if n == 0 && !buf.is_empty() {
+                    Err(SockError::WouldBlock)
+                } else {
+                    Ok(n)
+                }
+            }
+            _ => Err(SockError::NotConnected),
+        }
+    }
+
+    fn do_recv(
+        &self,
+        buf: &mut [u8],
+        _flags: u32,
+    ) -> Result<(usize, Option<SockAddr>), SockError> {
+        let state = self.state.lock();
+        match &*state {
+            SocketState::UnixConnected { rx, .. } => {
+                let n = rx.read(buf);
+                if n == 0 && !buf.is_empty() && !rx.is_closed() {
+                    Err(SockError::WouldBlock)
+                } else {
+                    Ok((n, None))
+                }
+            }
+            _ => Err(SockError::NotConnected),
+        }
+    }
+}
+
+// ── In-kernel SPSC byte ring ────────────────────────────────────
+
+const RING_CAP: usize = 64 * 1024;
+
+#[derive(Debug)]
+pub struct RingBuf {
+    inner: IrqSafeSpinLock<RingInner>,
+    closed: AtomicBool,
+}
+
+#[derive(Debug)]
+struct RingInner {
+    buf: Vec<u8>,
+    head: usize,
+    len: usize,
+}
+
+impl RingBuf {
+    fn new() -> Self {
+        Self {
+            inner: IrqSafeSpinLock::new(RingInner {
+                buf: alloc::vec![0u8; RING_CAP],
+                head: 0,
+                len: 0,
+            }),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    fn write(&self, src: &[u8]) -> usize {
+        let mut g = self.inner.lock();
+        let avail = RING_CAP - g.len;
+        let n = core::cmp::min(src.len(), avail);
+        for i in 0..n {
+            let pos = (g.head + g.len + i) % RING_CAP;
+            g.buf[pos] = src[i];
+        }
+        g.len += n;
+        n
+    }
+
+    fn read(&self, dst: &mut [u8]) -> usize {
+        let mut g = self.inner.lock();
+        let n = core::cmp::min(dst.len(), g.len);
+        for i in 0..n {
+            let pos = (g.head + i) % RING_CAP;
+            dst[i] = g.buf[pos];
+        }
+        g.head = (g.head + n) % RING_CAP;
+        g.len -= n;
+        n
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+}
+
+// ── Bound-listener registry ─────────────────────────────────────
+
+static LISTENERS: IrqSafeSpinLock<Option<BTreeMap<String, Arc<SocketFile>>>> =
+    IrqSafeSpinLock::new(None);
+
+// ── ZC fast-path: registered buffer pool ────────────────────────
+
+static REGISTERED_BUFS: IrqSafeSpinLock<Option<BTreeMap<u32, RegBuf>>> =
+    IrqSafeSpinLock::new(None);
+static NEXT_BUF_ID: AtomicU32 = AtomicU32::new(1);
+
+#[derive(Debug)]
+struct RegBuf {
+    /// User vaddr of the registered region.
+    base: u64,
+    len: u64,
+    /// Owning task id; only this task can reference it via the id.
+    owner: u64,
+}
+
+pub fn register_user_buffer(owner: u64, ptr: u64, len: u64) -> Option<u32> {
+    if ptr == 0 || len == 0 {
+        return None;
+    }
+    let id = NEXT_BUF_ID.fetch_add(1, Ordering::Relaxed);
+    let mut g = REGISTERED_BUFS.lock();
+    let map = g.get_or_insert_with(BTreeMap::new);
+    map.insert(id, RegBuf {
+        base: ptr,
+        len,
+        owner,
+    });
+    Some(id)
+}
+
+pub fn registered_buffer_slice(
+    owner: u64,
+    buf_id: u32,
+    off: u64,
+    len: u64,
+) -> Option<(u64, u64)> {
+    let g = REGISTERED_BUFS.lock();
+    let m = g.as_ref()?;
+    let r = m.get(&buf_id)?;
+    if r.owner != owner {
+        return None;
+    }
+    if off.checked_add(len)? > r.len {
+        return None;
+    }
+    Some((r.base + off, len))
+}
+
+// ── Ensure FileOps is `'static`-safe across move. SocketFile uses
+//    Arc-shared rings; cloning the Arc into another fd table is the
+//    intended dup() shape. ──────────────────────────────────────
+
+#[allow(dead_code)]
+fn _assert_send_sync() {
+    fn assert<T: Send + Sync>() {}
+    assert::<SocketFile>();
+    assert::<RingBuf>();
+}
+
+// ── Stub for the future pin shape used by the dispatcher. The
+//    `dispatch_op` calls today are synchronous; once we add an
+//    async accept queue we'll surface a Pin<Box<...>>. Kept here
+//    so the symbol is referenced from handlers.rs without an
+//    "unused import" warning. ──────────────────────────────────
+
+#[allow(dead_code)]
+fn _force_pin() -> Pin<Box<dyn core::future::Future<Output = ()> + Send>> {
+    Box::pin(async {})
+}

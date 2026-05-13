@@ -454,6 +454,81 @@ pub enum Syscall {
     /// contiguous.
     Sigreturn = 187,
 
+    // ── Sockets (197-209) ─────────────────────────────────────────
+    //
+    // The kernel exposes BOTH a POSIX-shaped surface (one syscall
+    // per BSD socket call) AND a ring-opcode dispatcher path. Both
+    // entry shapes route through the same `SocketOp` dispatcher in
+    // `userspace::socket` — POSIX syscalls copy buffers across the
+    // ABI boundary; the ZC opcodes (208/209) reference pre-pinned
+    // buffer slots from a registered pool. libc defaults to POSIX;
+    // hot paths opt into ZC via `narf_register_buffer()`.
+
+    /// `socket(domain, type, protocol)` → fd. arg0 = domain
+    /// (AF_UNIX = 1, AF_INET = 2, AF_INET6 = 10), arg1 = type
+    /// (SOCK_STREAM = 1, SOCK_DGRAM = 2), arg2 = protocol (0 for
+    /// the family default). Returns the new fd; -1 on failure.
+    SocketOpen = 197,
+
+    /// `bind(fd, addr, addrlen)`. arg0 = fd, arg1 = addr ptr,
+    /// arg2 = addrlen. addr layout per `narf_socket::SockAddr`
+    /// (family u16 + body bytes); libc translates POSIX
+    /// sockaddr_in / sockaddr_un / sockaddr_in6 in/out.
+    SocketBind = 198,
+
+    /// `listen(fd, backlog)`. arg0 = fd, arg1 = backlog.
+    SocketListen = 199,
+
+    /// `accept(fd, addr_out, addrlen_out)` → fd. arg0 = listening
+    /// fd, arg1 = addr_out (may be 0), arg2 = addrlen_out (may be
+    /// 0). Blocks until a connection arrives; returns the new
+    /// connected fd.
+    SocketAccept = 201,
+
+    /// `connect(fd, addr, addrlen)`. arg0 = fd, arg1 = addr ptr,
+    /// arg2 = addrlen. Blocks until peer accepts (for SOCK_STREAM).
+    SocketConnect = 202,
+
+    /// `sendto(fd, buf, len, flags, addr, addrlen)`. The 6-arg
+    /// shape covers both `send()` (addr=NULL, addrlen=0) and
+    /// `sendto()`. arg0 = fd, arg1 = buf ptr, arg2 = len,
+    /// arg3 = flags (POSIX MSG_*), arg4 = addr ptr, arg5 = addrlen.
+    SocketSend = 203,
+
+    /// `recvfrom(fd, buf, len, flags, addr_out, addrlen_out)`.
+    /// Mirror of SocketSend. arg0 = fd, arg1 = buf, arg2 = len,
+    /// arg3 = flags, arg4 = addr_out, arg5 = addrlen_out.
+    SocketRecv = 204,
+
+    /// `shutdown(fd, how)`. how: 0 = SHUT_RD, 1 = SHUT_WR,
+    /// 2 = SHUT_RDWR.
+    SocketShutdown = 205,
+
+    /// `getsockopt(fd, level, opt, buf, len_out)`. arg0 = fd,
+    /// arg1 = level, arg2 = optname, arg3 = buf ptr, arg4 = len
+    /// in/out u32 ptr.
+    SocketGetSockOpt = 206,
+
+    /// `setsockopt(fd, level, opt, buf, len)`.
+    SocketSetSockOpt = 207,
+
+    /// ZC fast path: register a user buffer for zerocopy I/O.
+    /// `register_buffer(ptr, len) → buf_id`. The kernel pins the
+    /// pages and assigns an opaque id usable in `SockSendZc`.
+    /// Lifetime: until `unregister_buffer` (not yet wired) or task
+    /// exit. arg0 = ptr, arg1 = len. Returns buf_id (u32) or -1.
+    SockRegisterBuf = 208,
+
+    /// ZC fast path: send a registered buffer slice.
+    /// `send_zc(fd, buf_id, off, len, flags)`. arg0 = fd,
+    /// arg1 = buf_id, arg2 = offset within buffer, arg3 = byte
+    /// length, arg4 = flags. The user must not modify the buffer
+    /// region until completion fires through the per-task
+    /// completion ring (today: completion is synchronous —
+    /// completion-ring delivery lands when the kernel-side NIC
+    /// path goes async).
+    SockSendZc = 209,
+
     /// Open an FB connection to a scanout. `arg0` = scanout id (0
     /// for the active scanout). Returns a non-zero `FbHandleId` on
     /// success, 0 on failure (no backend / OOM / not authorised).
@@ -1033,6 +1108,18 @@ impl Syscall {
             185 => Syscall::Fstatfs,
             186 => Syscall::Unshare,
             187 => Syscall::Sigreturn,
+            197 => Syscall::SocketOpen,
+            198 => Syscall::SocketBind,
+            199 => Syscall::SocketListen,
+            201 => Syscall::SocketAccept,
+            202 => Syscall::SocketConnect,
+            203 => Syscall::SocketSend,
+            204 => Syscall::SocketRecv,
+            205 => Syscall::SocketShutdown,
+            206 => Syscall::SocketGetSockOpt,
+            207 => Syscall::SocketSetSockOpt,
+            208 => Syscall::SockRegisterBuf,
+            209 => Syscall::SockSendZc,
             130 => Syscall::RingKick,
             140 => Syscall::GetPid,
             141 => Syscall::GetPpid,

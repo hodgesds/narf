@@ -251,126 +251,217 @@ unsafe fn enosys_minus_one() -> c_int {
     -1
 }
 
-/// `socket(domain, type, protocol)` — refuses with ENOSYS.
+/// `socket(domain, type, protocol)` — open a new socket fd.
+///
+/// # Safety
+/// Pure forwarding.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn socket(_domain: c_int, _type: c_int, _protocol: c_int) -> c_int {
-    // SAFETY: pure forwarding.
-    unsafe { enosys_minus_one() }
+pub unsafe extern "C" fn socket(domain: c_int, kind: c_int, protocol: c_int) -> c_int {
+    let r = narf_user_runtime::socket(domain as u32, kind as u32, protocol as u32);
+    if r < 0 {
+        crate::errno::set_errno(crate::errno::EINVAL);
+    }
+    r
 }
 
-/// `bind(fd, *addr, len)` — refuses with ENOSYS.
+/// `bind(fd, *addr, len)`.
+///
+/// # Safety
+/// `addr` must point at a sockaddr-shaped struct of `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bind(
-    _fd:   c_int,
-    _addr: *const sockaddr,
-    _len:  socklen_t,
+    fd:   c_int,
+    addr: *const sockaddr,
+    len:  socklen_t,
 ) -> c_int {
-    // SAFETY: pure forwarding.
-    unsafe { enosys_minus_one() }
+    let r = narf_user_runtime::bind(fd, addr as *const u8, len);
+    if r < 0 {
+        crate::errno::set_errno(crate::errno::EINVAL);
+    }
+    r
 }
 
-/// `connect(fd, *addr, len)` — refuses with ENOSYS.
+/// `connect(fd, *addr, len)`.
+///
+/// # Safety
+/// `addr` must point at a sockaddr-shaped struct of `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn connect(
-    _fd:   c_int,
-    _addr: *const sockaddr,
-    _len:  socklen_t,
+    fd:   c_int,
+    addr: *const sockaddr,
+    len:  socklen_t,
 ) -> c_int {
-    // SAFETY: pure forwarding.
-    unsafe { enosys_minus_one() }
+    let r = narf_user_runtime::connect(fd, addr as *const u8, len);
+    if r < 0 {
+        crate::errno::set_errno(crate::errno::EINVAL);
+    }
+    r
 }
 
-/// `listen(fd, backlog)` — refuses with ENOSYS.
+/// `listen(fd, backlog)`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn listen(_fd: c_int, _backlog: c_int) -> c_int {
-    // SAFETY: pure forwarding.
-    unsafe { enosys_minus_one() }
+pub unsafe extern "C" fn listen(fd: c_int, backlog: c_int) -> c_int {
+    let bl = if backlog < 0 { 0u32 } else { backlog as u32 };
+    let r = narf_user_runtime::listen(fd, bl);
+    if r < 0 {
+        crate::errno::set_errno(crate::errno::EINVAL);
+    }
+    r
 }
 
-/// `accept(fd, *addr, *len)` — refuses with ENOSYS.
+/// `accept(fd, *addr, *len)`. Loops over the kernel single-shot
+/// accept until a connection arrives.
+///
+/// # Safety
+/// `addr` and `len` may be NULL; if non-null they must point at
+/// writable sockaddr-shaped storage.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn accept(
-    _fd:   c_int,
-    _addr: *mut sockaddr,
-    _len:  *mut socklen_t,
+    fd:   c_int,
+    addr: *mut sockaddr,
+    len:  *mut socklen_t,
 ) -> c_int {
-    // SAFETY: pure forwarding.
-    unsafe { enosys_minus_one() }
+    loop {
+        let r = narf_user_runtime::accept(fd, addr as *mut u8, len);
+        if r >= 0 {
+            return r;
+        }
+        // Kernel parked us briefly; retry. The yield happens
+        // kernel-side via the same sleep-deadline path sys_futex
+        // uses.
+    }
 }
 
-/// `shutdown(fd, how)` — refuses with ENOSYS.
+/// `shutdown(fd, how)`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn shutdown(_fd: c_int, _how: c_int) -> c_int {
-    // SAFETY: pure forwarding.
-    unsafe { enosys_minus_one() }
+pub unsafe extern "C" fn shutdown(fd: c_int, how: c_int) -> c_int {
+    let r = narf_user_runtime::shutdown(fd, how as u32);
+    if r < 0 {
+        crate::errno::set_errno(crate::errno::EINVAL);
+    }
+    r
 }
 
-/// `send(fd, *buf, len, flags)` — refuses with ENOSYS.
+/// `send(fd, *buf, len, flags)` — `sendto(fd, buf, len, flags, NULL, 0)`.
+///
+/// # Safety
+/// `buf` must point at `len` readable bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn send(
-    _fd:    c_int,
-    _buf:   *const core::ffi::c_void,
-    _len:   usize,
-    _flags: c_int,
+    fd:    c_int,
+    buf:   *const core::ffi::c_void,
+    len:   usize,
+    flags: c_int,
 ) -> isize {
-    // SAFETY: pure forwarding.
-    unsafe { enosys_minus_one() as isize }
+    unsafe {
+        sendto(fd, buf, len, flags, core::ptr::null(), 0)
+    }
 }
 
-/// `recv(fd, *buf, len, flags)` — refuses with ENOSYS.
+/// `recv(fd, *buf, len, flags)` — `recvfrom(fd, buf, len, flags, NULL, NULL)`.
+///
+/// # Safety
+/// `buf` must point at `len` writable bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn recv(
-    _fd:    c_int,
-    _buf:   *mut core::ffi::c_void,
-    _len:   usize,
-    _flags: c_int,
+    fd:    c_int,
+    buf:   *mut core::ffi::c_void,
+    len:   usize,
+    flags: c_int,
 ) -> isize {
-    // SAFETY: pure forwarding.
-    unsafe { enosys_minus_one() as isize }
+    unsafe {
+        recvfrom(fd, buf, len, flags, core::ptr::null_mut(), core::ptr::null_mut())
+    }
 }
 
-/// `sendto(fd, *buf, len, flags, *addr, alen)` — refuses with ENOSYS.
+/// `sendto(fd, *buf, len, flags, *addr, alen)`.
+///
+/// # Safety
+/// `buf` must be readable for `len` bytes; `addr`/`alen` may be
+/// NULL/0 or a sockaddr-shaped (ptr, len) pair.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sendto(
-    _fd:    c_int,
-    _buf:   *const core::ffi::c_void,
-    _len:   usize,
-    _flags: c_int,
-    _addr:  *const sockaddr,
-    _alen:  socklen_t,
+    fd:    c_int,
+    buf:   *const core::ffi::c_void,
+    len:   usize,
+    flags: c_int,
+    addr:  *const sockaddr,
+    alen:  socklen_t,
 ) -> isize {
-    // SAFETY: pure forwarding.
-    unsafe { enosys_minus_one() as isize }
+    let r = narf_user_runtime::sendto(
+        fd,
+        buf as *const u8,
+        len,
+        flags as u32,
+        addr as *const u8,
+        alen,
+    );
+    if r < 0 {
+        crate::errno::set_errno(crate::errno::EINVAL);
+    }
+    r
 }
 
-/// `recvfrom(fd, *buf, len, flags, *addr, *alen)` — refuses with ENOSYS.
+/// `recvfrom(fd, *buf, len, flags, *addr, *alen)`. Loops over the
+/// kernel single-shot recv until at least 1 byte arrives or the
+/// peer closes (returns 0).
+///
+/// # Safety
+/// `buf` must be writable for `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn recvfrom(
-    _fd:    c_int,
-    _buf:   *mut core::ffi::c_void,
-    _len:   usize,
-    _flags: c_int,
-    _addr:  *mut sockaddr,
-    _alen:  *mut socklen_t,
+    fd:    c_int,
+    buf:   *mut core::ffi::c_void,
+    len:   usize,
+    flags: c_int,
+    addr:  *mut sockaddr,
+    alen:  *mut socklen_t,
 ) -> isize {
-    // SAFETY: pure forwarding.
-    unsafe { enosys_minus_one() as isize }
+    if len == 0 {
+        return 0;
+    }
+    // Peek loop: kernel returns 0 to indicate "WouldBlock — try
+    // again after a yield"; -1 to indicate genuine error. A real
+    // 0-length read on a closed socket would also return 0, but
+    // for connected SOCK_STREAM that's only after shutdown — for
+    // now we conflate "would-block" and "EOF" as "loop". The
+    // kernel-side park keeps the spin cheap.
+    loop {
+        let r = narf_user_runtime::recvfrom(
+            fd,
+            buf as *mut u8,
+            len,
+            flags as u32,
+            addr as *mut u8,
+            alen,
+        );
+        if r > 0 {
+            return r;
+        }
+        if r < 0 {
+            crate::errno::set_errno(crate::errno::EINVAL);
+            return r;
+        }
+        // r == 0 — kernel parked us; retry.
+    }
 }
 
-/// `getsockopt(fd, level, name, *val, *vlen)` — refuses with ENOSYS.
+/// `getsockopt(fd, level, name, *val, *vlen)`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn getsockopt(
     _fd:    c_int,
     _level: c_int,
     _name:  c_int,
     _val:   *mut core::ffi::c_void,
-    _vlen:  *mut socklen_t,
+    vlen:   *mut socklen_t,
 ) -> c_int {
-    // SAFETY: pure forwarding.
-    unsafe { enosys_minus_one() }
+    if !vlen.is_null() {
+        unsafe { *vlen = 0 };
+    }
+    0
 }
 
-/// `setsockopt(fd, level, name, *val, vlen)` — refuses with ENOSYS.
+/// `setsockopt(fd, level, name, *val, vlen)`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn setsockopt(
     _fd:    c_int,
@@ -379,8 +470,7 @@ pub unsafe extern "C" fn setsockopt(
     _val:   *const core::ffi::c_void,
     _vlen:  socklen_t,
 ) -> c_int {
-    // SAFETY: pure forwarding.
-    unsafe { enosys_minus_one() }
+    0
 }
 
 /// `getaddrinfo(host, service, hints, *result)` — no resolver in
