@@ -106,10 +106,10 @@ pub const INIT_SEGMENT_LEN: usize = 0x1000;
 /// must poll it clear before issuing any command.
 const INITIALIZING_BIT: u32 = 1 << 31;
 
-/// PRM-documented worst-case startup wait (~2 s) before the driver
-/// should declare the HCA dead. Scaled to spin-loop iterations; on
-/// real silicon a sleep-pump is preferred — Stage 1 just polls.
-const INIT_POLL_LIMIT: u32 = 20_000_000;
+/// PRM-documented worst-case startup wait (~2 s per §1.6) before the
+/// driver should declare the HCA dead. Wall-clock budget — replaces
+/// the prior CPU-clock-dependent 20M-iter spin estimate.
+const INIT_DEADLINE_MS: u64 = 2_000;
 
 /// Stage 3: cmdq sizing.
 ///
@@ -119,10 +119,10 @@ const INIT_POLL_LIMIT: u32 = 20_000_000;
 const STAGE3_CMDQ_LOG_SIZE: u8 = 0;
 const STAGE3_CMDQ_PAGE_LEN: usize = 4096;
 
-/// Per-CQE polling budget. mlx5 NOP / QUERY_HCA_CAP latency is
-/// well under a microsecond; we give plenty of headroom for a busy
-/// host before declaring the firmware hung.
-const CMD_POLL_LIMIT: u32 = 50_000_000;
+/// Per-CQE polling deadline. mlx5 NOP / QUERY_HCA_CAP latency is
+/// well under a microsecond; 5 s wall-clock gives plenty of headroom
+/// for a busy host before declaring the firmware hung.
+const CMD_DEADLINE_MS: u64 = 5_000;
 
 /// Capability groups for `QUERY_HCA_CAP` (PRM §15.2). Encoded into
 /// the op_mod field; combined with a "current vs max" bit.
@@ -386,9 +386,9 @@ impl Mlx5Hca {
 
         // Poll the initializing register at 0x0FFC until bit 31
         // clears. Two-second worst case per PRM §1.6.
-        // responsive_spin ticks sleep_pumps so cursor / serial /
-        // audio drain stay alive across the multi-second wait.
-        let ready = narf_scheduler::responsive_spin(
+        // responsive_spin_until ticks sleep_pumps so cursor / serial
+        // / audio drain stay alive across the multi-second wait.
+        let ready = narf_scheduler::responsive_spin_until(
             || {
                 // SAFETY: identity-mapped MMIO.
                 let v = unsafe { mmio.read32(ISEG_INITIALIZING as u64) };
@@ -396,7 +396,7 @@ impl Mlx5Hca {
                 // LE-host bytes, so swap.
                 (v.swap_bytes() & INITIALIZING_BIT) == 0
             },
-            INIT_POLL_LIMIT,
+            narf_time::Deadline::after_ms(INIT_DEADLINE_MS),
         );
         if !ready {
             return Err(Mlx5Error::InitTimeout);
@@ -501,12 +501,12 @@ impl Mlx5Hca {
         self.ring_cmd_doorbell(1);
 
         // Poll the slot's status_own byte until the ownership bit
-        // clears. responsive_spin ticks sleep_pumps.
+        // clears. responsive_spin_until ticks sleep_pumps.
         let own_phys = slot_phys + CQE_OFF_STATUS_OWN as u64;
-        let done = narf_scheduler::responsive_spin(
+        let done = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped DMA.
             || unsafe { core::ptr::read_volatile(own_phys as *const u8) } & STATUS_OWN_BIT == 0,
-            CMD_POLL_LIMIT,
+            narf_time::Deadline::after_ms(CMD_DEADLINE_MS),
         );
         if !done {
             return Err(Mlx5Error::CmdTimeout);
@@ -642,12 +642,13 @@ impl Mlx5Hca {
         self.ring_cmd_doorbell(1);
 
         // Poll for completion.
-        // Poll until ownership clears. responsive_spin ticks sleep_pumps.
+        // Poll until ownership clears. responsive_spin_until ticks
+        // sleep_pumps.
         let own_phys = slot_phys + CQE_OFF_STATUS_OWN as u64;
-        let done = narf_scheduler::responsive_spin(
+        let done = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped DMA.
             || unsafe { core::ptr::read_volatile(own_phys as *const u8) } & STATUS_OWN_BIT == 0,
-            CMD_POLL_LIMIT,
+            narf_time::Deadline::after_ms(CMD_DEADLINE_MS),
         );
         if !done {
             return Err(Mlx5Error::CmdTimeout);
@@ -737,10 +738,10 @@ impl Mlx5Hca {
         self.ring_cmd_doorbell(1);
 
         let own_phys = slot_phys + CQE_OFF_STATUS_OWN as u64;
-        let done = narf_scheduler::responsive_spin(
+        let done = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped DMA.
             || unsafe { core::ptr::read_volatile(own_phys as *const u8) } & STATUS_OWN_BIT == 0,
-            CMD_POLL_LIMIT,
+            narf_time::Deadline::after_ms(CMD_DEADLINE_MS),
         );
         if !done {
             return Err(Mlx5Error::CmdTimeout);

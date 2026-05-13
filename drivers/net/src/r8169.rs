@@ -258,13 +258,14 @@ impl RtlNic {
         unsafe {
             mmio.write8(REG_CR, CR_RST);
         }
-        // Wait for hardware to clear CR.RST. Use the scheduler's
-        // responsive_spin so sleep_pumps tick during the wait —
-        // FB cursor / serial / audio stay alive on a slow reset.
-        narf_scheduler::responsive_spin(
+        // Wait for hardware to clear CR.RST. responsive_spin_until
+        // ticks sleep_pumps so FB cursor / serial / audio stay alive
+        // on a slow reset. RTL8169 CR.RST self-clears within ~1 ms
+        // typical (datasheet §2.3 Table 3); 100 ms wedge threshold.
+        narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped MMIO.
             || unsafe { mmio.read8(REG_CR) } & CR_RST == 0,
-            1_000_000,
+            narf_time::Deadline::after_ms(100),
         );
 
         // 2. Read MAC from IDR0..5. ID registers are byte-readable
@@ -530,14 +531,15 @@ impl RtlNic {
         drop(head_g);
 
         // Poll for OWN → 0. With the ring serviced by NPQ this
-        // typically lands in microseconds; cap the spin so a hung
+        // typically lands in microseconds; cap the wait so a hung
         // controller surfaces as TxTimeout instead of livelock.
-        // responsive_spin ticks sleep_pumps so the FB cursor /
-        // serial drain stay alive if NPQ is slow under load.
-        let owned = narf_scheduler::responsive_spin(
+        // responsive_spin_until ticks sleep_pumps so the FB cursor
+        // / serial drain stay alive if NPQ is slow under load.
+        // 250 ms wall-clock budget covers worst-case Tx congestion.
+        let owned = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped DMA ring.
             || unsafe { core::ptr::read_volatile(desc_addr as *const u32) } & TXD_OWN == 0,
-            10_000_000,
+            narf_time::Deadline::after_ms(250),
         );
         if !owned {
             return Err(NicError::TxTimeout);

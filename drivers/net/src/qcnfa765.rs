@@ -260,16 +260,17 @@ impl WifiNic {
         }
 
         // Step 4: poll BHI_STATUS. Spec says ~200 ms typical;
-        // bound the spin so a wedged controller surfaces as
-        // FirmwareLoadFailed rather than livelock.
+        // bound the wait so a wedged controller surfaces as
+        // FirmwareLoadFailed rather than livelock. 1 s wall-clock
+        // budget gives ample headroom over the typical ~200 ms.
         let mut status = regs::BHI_STATUS_RESET;
-        narf_scheduler::responsive_spin(
+        narf_scheduler::responsive_spin_until(
             || {
                 // SAFETY: identity-mapped MMIO.
                 status = unsafe { self.mmio.read32(bhi + regs::BHI_STATUS) };
                 status != regs::BHI_STATUS_RESET
             },
-            10_000_000,
+            narf_time::Deadline::after_ms(1_000),
         );
         if status != regs::BHI_STATUS_SUCCESS {
             return Err(WifiError::FirmwareLoadFailed);

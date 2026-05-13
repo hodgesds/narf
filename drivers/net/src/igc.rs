@@ -174,11 +174,13 @@ impl Igc {
         unsafe {
             mmio.write32(REG_CTRL, ctrl | CTRL_RST);
         }
-        // SAFETY: identity-mapped MMIO; ticks sleep_pumps so FB
-        // cursor / serial drain stay alive on a slow reset.
-        narf_scheduler::responsive_spin(
+        // SAFETY: identity-mapped MMIO; responsive_spin_until ticks
+        // sleep_pumps so FB cursor / serial drain stay alive on a
+        // slow reset. Intel I225 datasheet §8.2.3.1: CTRL.RST self-
+        // clears within ~10 ms; 100 ms is the wedge threshold.
+        narf_scheduler::responsive_spin_until(
             || unsafe { mmio.read32(REG_CTRL) } & CTRL_RST == 0,
-            1_000_000,
+            narf_time::Deadline::after_ms(100),
         );
         // SAFETY: same.
         let after = unsafe { mmio.read32(REG_CTRL) };
@@ -323,11 +325,13 @@ impl Igc {
         unsafe {
             self.mmio.write32(REG_TDT, next as u32);
         }
-        // Poll for Done bit. responsive_spin ticks sleep_pumps.
-        let done = narf_scheduler::responsive_spin(
+        // Poll for Done bit. responsive_spin_until ticks sleep_pumps.
+        // 250 ms wall-clock budget covers a worst-case Tx-side
+        // congestion stall on a single packet.
+        let done = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped DMA.
             || unsafe { core::ptr::read_volatile((desc as *const u8).add(12)) } & TXD_STAT_DD != 0,
-            10_000_000,
+            narf_time::Deadline::after_ms(250),
         );
         if !done {
             return Err(IgcError::ResetTimeout);

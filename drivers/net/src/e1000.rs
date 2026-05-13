@@ -310,12 +310,14 @@ impl E1000 {
         unsafe {
             mmio.write32(REG_CTRL, CTRL_RST);
         }
-        // Wait for RST to clear. responsive_spin ticks sleep_pumps
-        // every ~4096 iters so FB cursor / serial drain stay alive.
-        narf_scheduler::responsive_spin(
+        // Wait for RST to clear. responsive_spin_until ticks
+        // sleep_pumps every ~4096 iters so FB cursor / serial drain
+        // stay alive. e1000 datasheet §13.3.1: CTRL.RST self-clears
+        // within ~10 ms; 100 ms is the wedge threshold.
+        narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped MMIO.
             || unsafe { mmio.read32(REG_CTRL) } & CTRL_RST == 0,
-            1_000_000,
+            narf_time::Deadline::after_ms(100),
         );
 
         // 2. Read MAC from RAL/RAH.
@@ -619,11 +621,13 @@ impl E1000 {
         *tail_g = next_tail;
         drop(tail_g);
 
-        // Poll for DD. responsive_spin ticks sleep_pumps.
-        let done = narf_scheduler::responsive_spin(
+        // Poll for DD. responsive_spin_until ticks sleep_pumps.
+        // 250 ms wall-clock budget covers worst-case Tx-side
+        // congestion stall.
+        let done = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped DMA.
             || unsafe { core::ptr::read_volatile((desc_addr + 12) as *const u8) } & TXD_STAT_DD != 0,
-            10_000_000,
+            narf_time::Deadline::after_ms(250),
         );
         if !done {
             return Err(E1000Error::TxTimeout);

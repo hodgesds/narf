@@ -266,12 +266,14 @@ impl Ixgbe {
         unsafe {
             mmio.write32(REG_CTRL, CTRL_RST_MASK);
         }
-        // responsive_spin ticks sleep_pumps so cursor / serial /
-        // audio drain stay alive on a slow reset.
-        let cleared = narf_scheduler::responsive_spin(
+        // responsive_spin_until ticks sleep_pumps so cursor / serial
+        // / audio drain stay alive on a slow reset. ixgbe datasheet
+        // §4.6.3.1: CTRL.RST self-clears within 1 ms typical; 100 ms
+        // is the wedge threshold.
+        let cleared = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped MMIO.
             || unsafe { mmio.read32(REG_CTRL) } & CTRL_RST_MASK == 0,
-            1_000_000,
+            narf_time::Deadline::after_ms(100),
         );
         if !cleared {
             return Err(IxgbeError::ResetTimeout);
@@ -335,12 +337,13 @@ impl Ixgbe {
             mmio.write32(TX_TXDCTL, dctl | TXDCTL_ENABLE);
         }
         // Poll for queue-enable to take effect (§7.2.3.4.1).
-        // responsive_spin ticks sleep_pumps; failure is non-fatal
-        // here (queue may come up later), matching prior behaviour.
-        let _ = narf_scheduler::responsive_spin(
+        // responsive_spin_until ticks sleep_pumps; failure is
+        // non-fatal here (queue may come up later), matching prior
+        // behaviour. 100 ms wall-clock budget.
+        let _ = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped MMIO.
             || unsafe { mmio.read32(TX_TXDCTL) } & TXDCTL_ENABLE != 0,
-            1_000_000,
+            narf_time::Deadline::after_ms(100),
         );
 
         // 7. RX ring + pool.
@@ -445,11 +448,12 @@ impl Ixgbe {
 
         // Poll DD: olinfo's low 4 bits of [3:0] (status) carry DD.
         // Advanced write-back lays status at olinfo[3:0]
-        // (§7.2.3.2.4 write-back layout).
-        let done = narf_scheduler::responsive_spin(
+        // (§7.2.3.2.4 write-back layout). 250 ms wall-clock budget
+        // covers a worst-case Tx-side congestion stall.
+        let done = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped DMA.
             || unsafe { core::ptr::read_volatile((desc_addr + 12) as *const u32) } & ADVTXD_STAT_DD != 0,
-            10_000_000,
+            narf_time::Deadline::after_ms(250),
         );
         if !done {
             return Err(IxgbeError::TxTimeout);
@@ -587,15 +591,16 @@ fn eeprom_read_word(mmio: &MmioRegion, addr: u16) -> Result<u16, IxgbeError> {
     }
     // EEPROM read is short (microseconds typically) but the
     // helper still ticks sleep_pumps in case of a wedged chip
-    // or hot-plug-during-init pathology.
+    // or hot-plug-during-init pathology. 50 ms wall-clock wedge
+    // threshold.
     let mut last = 0u32;
-    let done = narf_scheduler::responsive_spin(
+    let done = narf_scheduler::responsive_spin_until(
         || {
             // SAFETY: identity-mapped MMIO.
             last = unsafe { mmio.read32(REG_EERD) };
             last & EERD_DONE != 0
         },
-        1_000_000,
+        narf_time::Deadline::after_ms(50),
     );
     if done {
         Ok(eeprom_decode(last))

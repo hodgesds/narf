@@ -138,11 +138,13 @@ impl Rtl8139 {
         unsafe {
             mmio.write8(REG_CR, CR_RST);
         }
-        // SAFETY: identity-mapped MMIO. responsive_spin ticks
-        // sleep_pumps so FB cursor / serial drain stay alive.
-        narf_scheduler::responsive_spin(
+        // SAFETY: identity-mapped MMIO. responsive_spin_until ticks
+        // sleep_pumps so FB cursor / serial drain stay alive. RTL8139
+        // CR.RST self-clears within tens of microseconds typical;
+        // 100 ms is the "real wedge" threshold.
+        narf_scheduler::responsive_spin_until(
             || unsafe { mmio.read8(REG_CR) } & CR_RST == 0,
-            1_000_000,
+            narf_time::Deadline::after_ms(100),
         );
         // SAFETY: same.
         let post = unsafe { mmio.read8(REG_CR) };
@@ -238,17 +240,18 @@ impl Rtl8139 {
         let mut idx_lock = self.tx_index.lock();
         let idx = *idx_lock;
         // Wait for this slot to be free (OWN cleared by chip after
-        // the previous transmission). responsive_spin ticks
+        // the previous transmission). responsive_spin_until ticks
         // sleep_pumps. After power-on TSD reads 0, which counts as
         // OWN=0 + never-transmitted; in steady state we see
-        // OWN-clear after the prior TX completes.
-        let free = narf_scheduler::responsive_spin(
+        // OWN-clear after the prior TX completes. 250 ms wall-clock
+        // budget covers a worst-case retried TX at the slowest link.
+        let free = narf_scheduler::responsive_spin_until(
             || {
                 // SAFETY: identity-mapped MMIO.
                 let tsd = unsafe { self.mmio.read32(REG_TSD0 + (idx as u64) * 4) };
                 tsd & TSD_OWN == 0 || (tsd & TSD_TOK) != 0
             },
-            10_000_000,
+            narf_time::Deadline::after_ms(250),
         );
         if !free {
             return Err(Rtl8139Error::TxBusy);
