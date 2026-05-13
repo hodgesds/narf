@@ -344,9 +344,11 @@ unsafe fn submit_command(cmd: &[u64; 4]) -> Result<(), ItsError> {
 
     // Poll CREADR until it catches up. ITS may pause if it hits a
     // Stalled state, but for our well-formed commands QEMU drains
-    // immediately. responsive_spin ticks sleep_pumps so the FB
-    // cursor / serial drain stay alive on a Stalled ITS.
-    let done = narf_scheduler::responsive_spin(
+    // immediately. responsive_spin_until ticks sleep_pumps so the
+    // FB cursor / serial drain stay alive on a Stalled ITS.
+    // 100 ms wedge threshold (a healthy ITS drains a single
+    // command in <<1 ms).
+    let done = narf_scheduler::responsive_spin_until(
         || {
             // SAFETY: identity-mapped MMIO.
             let cr = unsafe { read_u64(GITS_CREADR) };
@@ -354,7 +356,7 @@ unsafe fn submit_command(cmd: &[u64; 4]) -> Result<(), ItsError> {
             // for the catch-up compare.
             (cr & !1) == new_tail
         },
-        1_000_000,
+        narf_time::Deadline::after_ms(100),
     );
     if done {
         Ok(())
