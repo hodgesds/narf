@@ -708,3 +708,18 @@ pub unsafe extern "C" fn getegid() -> i32 {
     // SAFETY: forwarded.
     unsafe { getgid() }
 }
+
+/// `unshare(flags)` — Linux/POSIX2008 unshare(2). Today only
+/// CLONE_NEWNS (0x00020000) has effect — snapshots the calling
+/// task's view of the mount table into a private namespace. Other
+/// flag bits accepted for ABI compatibility, ignored.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn unshare(flags: u32) -> i32 {
+    match narf_user_runtime::unshare(flags) {
+        Ok(()) => 0,
+        Err(()) => {
+            crate::errno::set_errno(crate::errno::EINVAL);
+            -1
+        }
+    }
+}

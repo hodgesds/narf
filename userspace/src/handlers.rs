@@ -5296,8 +5296,23 @@ fn sys_mount(ctx: &mut dyn TrapContext) {
         }
     };
 
-    // Resolve `source` as a registered block-device name. Strip a
-    // leading "/dev/" so callers can pass either form.
+    let auth = narf_filesystem::bootstrap_mount_authority();
+    let domain = narf_lib::id::DomainId::DRIVER_0;
+
+    // Bind mount: `source` is an absolute path to an existing mount;
+    // `target` is the new path. No block device involved.
+    if fstype == "bind" {
+        return match narf_filesystem::registry()
+            .bind_mount(&auth, source.as_str(), target.as_str())
+        {
+            Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
+            Err(_) => ctx.set_return(fail),
+        };
+    }
+
+    // Block-device-backed mounts: resolve `source` as a registered
+    // block-device name. Strip a leading "/dev/" so callers can
+    // pass either form.
     let dev_name = source.strip_prefix("/dev/").unwrap_or(source.as_str());
     let entry = match narf_block::block_devices()
         .into_iter()
@@ -5309,9 +5324,6 @@ fn sys_mount(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-
-    let auth = narf_filesystem::bootstrap_mount_authority();
-    let domain = narf_lib::id::DomainId::DRIVER_0;
 
     let result = match fstype.as_str() {
         "fat" | "vfat" | "fat16" | "fat32" => {
@@ -5421,6 +5433,50 @@ fn sys_statfs(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(0));
     } else {
         ctx.set_return(fail);
+    }
+}
+
+// Per-task mount namespace table. Entries appear here when a task
+// calls unshare(CLONE_NEWNS); absent entries fall back to the
+// global VfsRegistry. Today every mount-touching syscall still
+// consults the global registry — the per-task lookup wires in
+// once a multi-namespace workload (a la container) needs it.
+static TASK_MOUNT_NS: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u64, alloc::sync::Arc<narf_filesystem::MountNamespace>>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+fn task_mount_ns_init() {
+    let mut g = TASK_MOUNT_NS.lock();
+    if g.is_none() {
+        *g = Some(alloc::collections::BTreeMap::new());
+    }
+}
+
+/// Look up the calling task's mount namespace. None means the task
+/// shares the global registry (the default).
+pub fn current_mount_namespace() -> Option<alloc::sync::Arc<narf_filesystem::MountNamespace>> {
+    let task = current_task_id();
+    let g = TASK_MOUNT_NS.lock();
+    g.as_ref().and_then(|m| m.get(&task).cloned())
+}
+
+fn sys_unshare(ctx: &mut dyn TrapContext) {
+    let flags = ctx.args().arg0;
+    const CLONE_NEWNS: u64 = 0x00020000;
+    if flags & CLONE_NEWNS == 0 {
+        // No-op for non-NS flags today.
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+    task_mount_ns_init();
+    let task = current_task_id();
+    let snap = narf_filesystem::MountNamespace::snapshot_global();
+    let mut g = TASK_MOUNT_NS.lock();
+    if let Some(m) = g.as_mut() {
+        m.insert(task, snap);
+        ctx.set_return(SyscallReturn::ok(0));
+    } else {
+        ctx.set_return(SyscallReturn::ok(!0u64));
     }
 }
 
@@ -6179,6 +6235,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Umount2, "umount2", RawFnHandler(sys_umount2));
     table.install_raw(Syscall::Statfs, "statfs", RawFnHandler(sys_statfs));
     table.install_raw(Syscall::Fstatfs, "fstatfs", RawFnHandler(sys_fstatfs));
+    table.install_raw(Syscall::Unshare, "unshare", RawFnHandler(sys_unshare));
     table.install_raw(
         Syscall::FbConnect,
         "fb_connect",

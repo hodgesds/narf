@@ -76,6 +76,7 @@ pub const SYS_MOUNT: u64 = 182;
 pub const SYS_UMOUNT2: u64 = 183;
 pub const SYS_STATFS: u64 = 184;
 pub const SYS_FSTATFS: u64 = 185;
+pub const SYS_UNSHARE: u64 = 186;
 pub const SYS_FB_CONNECT: u64 = 240;
 pub const SYS_FB_INFO: u64 = 241;
 pub const SYS_FB_RING_MAP: u64 = 242;
@@ -1263,6 +1264,17 @@ pub unsafe fn statfs(path: &str, buf: *mut u8) -> Result<(), ()> {
             buf as u64,
         )
     };
+    if r == 0 { Ok(()) } else { Err(()) }
+}
+
+/// `unshare(flags)` — POSIX 2008 / Linux unshare(2). Today only
+/// CLONE_NEWNS = 0x00020000 has effect (snapshots the global
+/// mount table into a per-task private MountNamespace). Other
+/// flag bits are accepted but ignored.
+#[inline]
+pub fn unshare(flags: u32) -> Result<(), ()> {
+    // SAFETY: SYS_UNSHARE 1-arg signature.
+    let r = unsafe { syscall1(SYS_UNSHARE, flags as u64) };
     if r == 0 { Ok(()) } else { Err(()) }
 }
 

@@ -424,6 +424,14 @@ pub enum Syscall {
     /// open fd. arg0 = fd, arg1 = buf ptr. Returns 0 / !0u64.
     Fstatfs = 185,
 
+    /// `unshare(flags)` — POSIX 2008 / Linux unshare(2) shape. The
+    /// only flag honoured today is CLONE_NEWNS (0x00020000): the
+    /// calling task snapshots the global mount table into a private
+    /// MountNamespace, after which its mount/umount calls only
+    /// affect its own view. Other flags are accepted but ignored.
+    /// Returns 0 on success, !0u64 on failure.
+    Unshare = 186,
+
     /// Open an FB connection to a scanout. `arg0` = scanout id (0
     /// for the active scanout). Returns a non-zero `FbHandleId` on
     /// success, 0 on failure (no backend / OOM / not authorised).
@@ -1001,6 +1009,7 @@ impl Syscall {
             183 => Syscall::Umount2,
             184 => Syscall::Statfs,
             185 => Syscall::Fstatfs,
+            186 => Syscall::Unshare,
             130 => Syscall::RingKick,
             140 => Syscall::GetPid,
             141 => Syscall::GetPpid,

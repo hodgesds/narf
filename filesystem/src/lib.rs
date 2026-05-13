@@ -661,11 +661,117 @@ pub fn registry() -> &'static VfsRegistry {
     &REGISTRY
 }
 
+// ── Per-task mount namespaces (Linux unshare(CLONE_NEWNS)) ──────
+//
+// A `MountNamespace` is a snapshot of the global mount table that
+// a task can hold privately. After `unshare_mountns`, subsequent
+// mount/umount calls from that task affect only its private NS;
+// other tasks continue to see the global registry. The default —
+// every task at boot — points at the shared global registry.
+//
+// The full divergence semantics (resolve_absolute consults the
+// caller's NS, fork inherits parent NS, exec preserves NS) are
+// scaffolded here; the syscall path that wires the NS lookup at
+// every mount-touching site lands as the consumer crates need
+// per-task views (today every NARF task shares the global view —
+// the work is structural until a multi-namespace workload appears).
+
+/// Snapshot-shaped mount table. Holds an owned Vec of mounts so a
+/// per-task NS can diverge from the global registry without
+/// affecting it.
+#[derive(Debug)]
+pub struct MountNamespace {
+    inner: IrqSafeSpinLock<Vec<Mount>>,
+}
+
+impl MountNamespace {
+    /// Build a private namespace seeded with the current global
+    /// registry's mounts. The mounts share the underlying
+    /// `Arc<dyn FsInstance>` — a bind-mount-style relationship,
+    /// not a deep copy.
+    pub fn snapshot_global() -> Arc<Self> {
+        let g = REGISTRY.inner.lock();
+        // Re-mint per-mount handles so the NS owns its own caps.
+        // The original handles in the global registry stay live.
+        let copied: Vec<Mount> = g
+            .iter()
+            .map(|m| Mount {
+                path: m.path.clone(),
+                fs: m.fs.clone(),
+                handle: Cap::<MountPoint, Write>::bootstrap(),
+            })
+            .collect();
+        Arc::new(Self {
+            inner: IrqSafeSpinLock::new(copied),
+        })
+    }
+
+    /// Resolve an absolute path against this namespace.
+    pub fn resolve_absolute<R, F>(&self, abs: &str, f: F) -> Option<R>
+    where
+        F: FnOnce(&dyn FsInstance, &str) -> R,
+    {
+        if abs.is_empty() || abs.as_bytes()[0] != b'/' {
+            return None;
+        }
+        let q = self.inner.lock();
+        let mut best: Option<&Mount> = None;
+        for m in q.iter() {
+            let is_match = abs == m.path.as_str()
+                || m.path == "/"
+                || (abs.starts_with(m.path.as_str())
+                    && abs.as_bytes().get(m.path.len()) == Some(&b'/'));
+            if is_match {
+                if best.map(|b| b.path.len()).unwrap_or(0) < m.path.len() {
+                    best = Some(m);
+                }
+            }
+        }
+        let m = best?;
+        let rel = &abs[m.path.len()..];
+        let rel = rel.strip_prefix('/').unwrap_or(rel);
+        Some(f(&*m.fs, rel))
+    }
+
+    /// List the mount paths in this namespace.
+    pub fn list(&self) -> Vec<String> {
+        let q = self.inner.lock();
+        q.iter().map(|m| m.path.clone()).collect()
+    }
+}
+
 /// Bootstrap the mount-authority cap. TCB-only path — the kernel
 /// calls this once at boot and hands the result to whatever subsystem
 /// actually mounts the initial root.
 pub fn bootstrap_mount_authority() -> Cap<MountPoint, Grant> {
     Cap::<MountPoint, Grant>::bootstrap()
+}
+
+/// FsInstance adapter that forwards root() / name() to another
+/// FsInstance. Used to implement `bind_mount` — the bound mount
+/// shares the source FS's root directory directly, no copying.
+struct BindMount {
+    inner: Arc<dyn FsInstance>,
+}
+
+impl fmt::Debug for BindMount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BindMount")
+            .field("inner", &self.inner.name())
+            .finish_non_exhaustive()
+    }
+}
+
+impl FsInstance for BindMount {
+    fn root(&self) -> Arc<dyn DirOps> {
+        self.inner.root()
+    }
+    fn name(&self) -> &str {
+        // POSIX `mount(2)` / `proc(5)` both report bind mounts with
+        // their source FS name; matches Linux's /proc/mounts shape
+        // where a bind mount lists the source FS type, not "bind".
+        self.inner.name()
+    }
 }
 
 impl VfsRegistry {
@@ -718,6 +824,42 @@ impl VfsRegistry {
             handle,
         });
         Ok(handle)
+    }
+
+    /// POSIX-2017 bind mount: register `target` as a synthetic mount
+    /// whose root is the directory currently visible at the absolute
+    /// path `source`. The bind doesn't copy any data — the synthetic
+    /// FsInstance forwards root() / name() to the source DirOps.
+    /// Useful for exposing a subtree of one filesystem at another
+    /// path without remounting the whole volume (Linux's
+    /// `mount --bind <source> <target>`).
+    pub fn bind_mount(
+        &self,
+        authority: &Cap<MountPoint, Grant>,
+        source: &str,
+        target: &str,
+    ) -> Result<Cap<MountPoint, Write>, FsError> {
+        authority.check_live()?;
+        // Resolve the source to a DirOps. We need both the source FS
+        // (for name()) and the directory at the source path.
+        // resolve_absolute hands the FS + the relative path; we walk
+        // the relative path to a DirOps via lookup_dir / lookup_dir_async.
+        // For Stage-3 simplicity, only the mount-root case is wired:
+        // `bind_mount("/a", "/b")` where `/a` is itself a mount.
+        let q = self.inner.lock();
+        let source_mount = q
+            .iter()
+            .find(|m| m.path == source)
+            .ok_or(FsError::NotFound)?;
+        let source_fs = source_mount.fs.clone();
+        if q.iter().any(|m| m.path == target) {
+            return Err(FsError::Busy);
+        }
+        drop(q);
+        let bind = alloc::sync::Arc::new(BindMount {
+            inner: source_fs,
+        });
+        self.mount_arc(authority, target, bind)
     }
 
     /// List mount paths. Used by `/proc/mounts`-shaped surfaces and by
