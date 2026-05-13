@@ -4738,8 +4738,137 @@ fn sys_noop_ok(ctx: &mut dyn TrapContext) {
 /// `AtomicU64` so a future SMP rework can keep the same shape.
 static GETRANDOM_STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// CPUID feature cache: bit 0 = RDRAND probed, bit 1 = RDRAND
+/// available, bit 2 = RDSEED probed, bit 3 = RDSEED available.
+/// Computed lazily on first use; subsequent calls bit-test.
+static RNG_FEATURES: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+#[cfg(target_arch = "x86_64")]
+fn cpu_has_rdrand() -> bool {
+    use core::sync::atomic::Ordering;
+    let f = RNG_FEATURES.load(Ordering::Acquire);
+    if f & 1 != 0 {
+        return f & 2 != 0;
+    }
+    // CPUID leaf 1: ECX bit 30 = RDRAND. RBX is reserved by LLVM
+    // so we save/restore it manually around the cpuid.
+    let ecx: u32;
+    unsafe {
+        core::arch::asm!(
+            "push rbx",
+            "cpuid",
+            "pop rbx",
+            inout("eax") 1u32 => _,
+            out("ecx") ecx,
+            out("edx") _,
+            options(preserves_flags),
+        );
+    }
+    let avail = (ecx >> 30) & 1 != 0;
+    let new = f | 1 | if avail { 2 } else { 0 };
+    RNG_FEATURES.store(new, Ordering::Release);
+    avail
+}
+
+#[cfg(target_arch = "x86_64")]
+fn cpu_has_rdseed() -> bool {
+    use core::sync::atomic::Ordering;
+    let f = RNG_FEATURES.load(Ordering::Acquire);
+    if f & 4 != 0 {
+        return f & 8 != 0;
+    }
+    // CPUID leaf 7 sub-leaf 0: EBX bit 18 = RDSEED. Save/restore
+    // rbx through r9 since LLVM owns rbx.
+    let ebx: u32;
+    unsafe {
+        core::arch::asm!(
+            "push rbx",
+            "cpuid",
+            "mov r9d, ebx",
+            "pop rbx",
+            inout("eax") 7u32 => _,
+            inout("ecx") 0u32 => _,
+            out("edx") _,
+            out("r9d") ebx,
+            options(preserves_flags),
+        );
+    }
+    let avail = (ebx >> 18) & 1 != 0;
+    let new = f | 4 | if avail { 8 } else { 0 };
+    RNG_FEATURES.store(new, Ordering::Release);
+    avail
+}
+
+#[cfg(target_arch = "x86_64")]
+fn rdrand_u64() -> Option<u64> {
+    if !cpu_has_rdrand() {
+        return None;
+    }
+    // RDRAND can fail (carry-flag clear); retry up to 10 times per
+    // Intel's recommendation in the SDM.
+    for _ in 0..10 {
+        let v: u64;
+        let cf: u8;
+        unsafe {
+            core::arch::asm!(
+                "rdrand {v}",
+                "setc {cf}",
+                v = out(reg) v,
+                cf = out(reg_byte) cf,
+                options(nostack, preserves_flags),
+            );
+        }
+        if cf != 0 {
+            return Some(v);
+        }
+    }
+    None
+}
+
+#[cfg(target_arch = "x86_64")]
+fn rdseed_u64() -> Option<u64> {
+    if !cpu_has_rdseed() {
+        return None;
+    }
+    // RDSEED is true entropy and may take many retries on
+    // contention; SDM recommends ~32 attempts before bailing.
+    for _ in 0..32 {
+        let v: u64;
+        let cf: u8;
+        unsafe {
+            core::arch::asm!(
+                "rdseed {v}",
+                "setc {cf}",
+                v = out(reg) v,
+                cf = out(reg_byte) cf,
+                options(nostack, preserves_flags),
+            );
+        }
+        if cf != 0 {
+            return Some(v);
+        }
+    }
+    None
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn rdrand_u64() -> Option<u64> { None }
+#[cfg(not(target_arch = "x86_64"))]
+fn rdseed_u64() -> Option<u64> { None }
+
 fn next_random_u32() -> u32 {
     use core::sync::atomic::Ordering;
+    // Cryptographic-grade entropy first: prefer RDSEED (true
+    // entropy from an on-die ring oscillator per Intel DRNG §3),
+    // fall back to RDRAND (PRNG seeded from RDSEED), fall back to
+    // the LCG only when neither instruction is available.
+    if let Some(v) = rdseed_u64() {
+        return (v >> 32) as u32 ^ v as u32;
+    }
+    if let Some(v) = rdrand_u64() {
+        return (v >> 32) as u32 ^ v as u32;
+    }
     let mut s = GETRANDOM_STATE.load(Ordering::Relaxed);
     if s == 0 {
         // Lazy seed from monotonic_ns mixed with the cycle counter
@@ -6461,8 +6590,11 @@ fn sys_socket_send(ctx: &mut dyn TrapContext) {
     let buf_ptr = args.arg1 as *const u8;
     let buf_len = args.arg2 as usize;
     let flags = args.arg3 as u32;
-    // arg4 / arg5 are sendto's (addr, addrlen) — ignored for AF_UNIX
-    // SOCK_STREAM connected sockets.
+    // arg4 / arg5: sendto's destination address (NULL/0 for
+    // connected stream sockets, non-NULL for connectionless
+    // datagram sends).
+    let addr_ptr = args.arg4;
+    let addr_len = args.arg5;
     let fail = SyscallReturn::ok((-1i64) as u64);
     let sock = match current_socket(fd) {
         Some(s) => s,
@@ -6480,10 +6612,15 @@ fn sys_socket_send(ctx: &mut dyn TrapContext) {
             buf.push(core::ptr::read_volatile(buf_ptr.add(i)));
         }
     }
+    let dest = if addr_ptr != 0 && addr_len >= 2 {
+        copy_user_addr(addr_ptr, addr_len)
+    } else {
+        None
+    };
     match sock.dispatch_op(crate::socket::SocketOp::Send {
         buf: &buf,
         flags,
-        addr: None,
+        addr: dest,
     }) {
         crate::socket::SocketOpResult::Ok(n) => ctx.set_return(SyscallReturn::ok(n)),
         crate::socket::SocketOpResult::Err(crate::socket::SockError::WouldBlock) => {

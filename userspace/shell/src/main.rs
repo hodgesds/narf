@@ -209,6 +209,87 @@ fn polltest_run(fd: i32) {
     unsafe { write_all(fd, b"polltest: ok (eventfd+timerfd+poll)\n"); }
 }
 
+fn udptest_run(fd: i32) {
+    // Two UDP sockets on 127.0.0.1.
+    let a = unsafe { libc::socket(2, 2 /* SOCK_DGRAM */, 0) };
+    let b = unsafe { libc::socket(2, 2, 0) };
+    if a < 0 || b < 0 {
+        unsafe { write_all(fd, b"udptest: socket() failed\n"); }
+        return;
+    }
+    let mut ab = [0u8; 16];
+    let mut bb = [0u8; 16];
+    let alen = make_sockaddr_in(&mut ab, 9000, 0x7F000001);
+    let blen = make_sockaddr_in(&mut bb, 9001, 0x7F000001);
+    let r1 = unsafe { libc::bind(a, ab.as_ptr() as *const _, alen) };
+    let r2 = unsafe { libc::bind(b, bb.as_ptr() as *const _, blen) };
+    if r1 != 0 || r2 != 0 {
+        unsafe { write_all(fd, b"udptest: bind() failed\n"); }
+        return;
+    }
+    // a → b
+    let n = unsafe {
+        libc::sendto(
+            a,
+            b"ping".as_ptr() as *const _,
+            4, 0,
+            bb.as_ptr() as *const _,
+            blen,
+        )
+    };
+    if n != 4 {
+        unsafe { write_all(fd, b"udptest: sendto != 4\n"); }
+        return;
+    }
+    // b reads.
+    let mut rbuf = [0u8; 16];
+    let mut peer = [0u8; 16];
+    let mut peerlen: u32 = 16;
+    let n = unsafe {
+        libc::recvfrom(
+            b,
+            rbuf.as_mut_ptr() as *mut _,
+            rbuf.len(), 0,
+            peer.as_mut_ptr() as *mut _,
+            &mut peerlen as *mut u32,
+        )
+    };
+    if n != 4 || &rbuf[..4] != b"ping" {
+        unsafe { write_all(fd, b"udptest: recvfrom payload != ping\n"); }
+        return;
+    }
+    let _ = unsafe { libc::posix::close(a) };
+    let _ = unsafe { libc::posix::close(b) };
+    unsafe { write_all(fd, b"udptest: ok (UDP loopback ping)\n"); }
+}
+
+fn entropytest_run(fd: i32) {
+    let mut a = [0u8; 32];
+    let mut b = [0u8; 32];
+    // narf_user_runtime exposes getrandom directly; libc::getrandom
+    // is reachable via the random module too.
+    let n1 = unsafe {
+        libc::random::getrandom(a.as_mut_ptr() as *mut _, 32, 0)
+    };
+    let n2 = unsafe {
+        libc::random::getrandom(b.as_mut_ptr() as *mut _, 32, 0)
+    };
+    if n1 != 32 || n2 != 32 {
+        unsafe { write_all(fd, b"entropytest: getrandom short\n"); }
+        return;
+    }
+    let all_zero = a.iter().all(|&x| x == 0);
+    if all_zero {
+        unsafe { write_all(fd, b"entropytest: 32 bytes all zero (stuck PRNG)\n"); }
+        return;
+    }
+    if a == b {
+        unsafe { write_all(fd, b"entropytest: two 32-byte draws equal (broken PRNG)\n"); }
+        return;
+    }
+    unsafe { write_all(fd, b"entropytest: ok (32B distinct + non-zero)\n"); }
+}
+
 // Globals for shmtest: a sem_t shared between two threads + the
 // shm-open path used by both.
 static mut SHMTEST_SEM: libc::ipc::sem_t = libc::ipc::sem_t { _opaque: [0; 32] };
@@ -733,6 +814,16 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         //   4. read 8 bytes → counter value 1
         //   5. timerfd 50ms one-shot; poll(timeout=200ms) → 1 (ready)
         polltest_run(fd);
+    } else if cmd == b"udptest" {
+        // udptest — bind two UDP sockets on 127.0.0.1:9000 / :9001;
+        // one sendto's "ping" to the other; recvfrom verifies the
+        // payload + the peer (port 9000) appears.
+        udptest_run(fd);
+    } else if cmd == b"entropytest" {
+        // entropytest — getrandom 32 bytes twice; assert non-zero
+        // and non-equal (would fail on a stuck-zero PRNG / would
+        // statistically never repeat with 256 bits).
+        entropytest_run(fd);
     } else if cmd == b"shmtest" {
         // shmtest — shm_open + ftruncate + 2-thread sem coordination.
         // Thread A creates a shm segment, writes "hello", sem_post.
