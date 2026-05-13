@@ -2409,7 +2409,9 @@ static MMAP_CURSOR: AtomicU64 = AtomicU64::new(0x0000_4080_0000_0000);
 
 fn sys_mmap(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
+    let hint = args.arg0;
     let len = ((args.arg1 as u64 + 0xFFF) & !0xFFFu64).max(0x1000);
+    let flags = args.arg2 as u32;
     let as_ref = match current_address_space() {
         Some(a) => a,
         None => {
@@ -2418,12 +2420,47 @@ fn sys_mmap(ctx: &mut dyn TrapContext) {
         }
     };
 
-    // Pick a fresh user virt by bumping the per-AS cursor (NOT the
-    // legacy global — pre-fix, two processes mmap'ing in parallel
-    // would race-bump the same atomic and end up with overlapping
-    // virts in distinct PML4s).
+    // POSIX mmap flag bits — pinned in narf-libc::sys, mirrored
+    // here so the kernel can decode without a libc dep:
+    //   MAP_FIXED     = 0x10  — use `hint` as the actual base
+    //                   (must be page-aligned, must not collide
+    //                   with an existing region in the AS).
+    //   MAP_ANONYMOUS = 0x20  — currently the only mode supported.
+    //                   File-backed mmap returns InvalidOp at the
+    //                   libc shim before we ever see the syscall.
+    const MAP_FIXED: u32 = 0x10;
+
+    // Pick a fresh user virt. With MAP_FIXED honour the caller's
+    // hint (page-aligned, no collision with an existing region);
+    // otherwise bump the per-AS cursor (NOT the legacy global —
+    // pre-fix, two processes mmap'ing in parallel would race-bump
+    // the same atomic and end up with overlapping virts in
+    // distinct PML4s).
     let pages = len >> 12;
-    let base = as_ref.reserve_mmap_va(len);
+    let base = if flags & MAP_FIXED != 0 {
+        if hint == 0 || hint & 0xFFF != 0 {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+        // Reject if any existing region overlaps the requested
+        // [hint, hint + len) window. Real Linux mmap MAP_FIXED
+        // *replaces* the prior mapping; we choose to fail loudly
+        // since the caller explicitly asked for this exact vaddr.
+        let snap = as_ref.regions_snapshot();
+        let lo = hint;
+        let hi = hint.saturating_add(len);
+        if snap.iter().any(|r| {
+            let rb = r.base.as_u64();
+            let re = rb.saturating_add(r.len);
+            !(re <= lo || rb >= hi)
+        }) {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+        hint
+    } else {
+        as_ref.reserve_mmap_va(len)
+    };
 
     // Allocate one frame per page and zero each. The freelist returns
     // frames out of order so we collect into a per-page scatter list.
@@ -4742,20 +4779,28 @@ fn sys_brk(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    // Shrink path: walk the per-page regions the grow path
-    // installed (one Region per 4 KiB page, base = page vaddr) and
-    // unmap each one in [new_break_aligned, cur_aligned). Each
-    // unmap_region call now walks PTEs + free_frame's the underlying
-    // physical page (memory/address_space.rs `unmap_region_pages`),
-    // so the frames return to the allocator instead of leaking.
+    // Shrink path: walk the per-grow-call brk regions (each one
+    // base ≥ BRK_DEFAULT_BASE) and unmap any whose base falls
+    // entirely within [new_break_aligned, cur_aligned). Each
+    // unmap_region call walks PTEs + free_frame's the underlying
+    // physical pages so frames return to the allocator. A grow
+    // region whose base sits BELOW new_break but extends past it
+    // is left intact — partial unmapping would need a region-
+    // split primitive; documented limitation, slight over-keep
+    // bounded by the grow chunk size (one page on the smallest
+    // grow, larger when the user calls brk(big_jump)).
     if new_break < cur {
         if let Some(as_ref) = current_address_space() {
-            let cur_aligned = (cur + 0xFFF) & !0xFFFu64;
             let new_aligned = (new_break + 0xFFF) & !0xFFFu64;
-            let mut va = new_aligned;
-            while va < cur_aligned {
-                let _ = as_ref.unmap_region(VirtAddr::new(va));
-                va += 0x1000;
+            let mut bases_to_unmap: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+            for r in as_ref.regions_snapshot().iter() {
+                let rb = r.base.as_u64();
+                if rb >= BRK_DEFAULT_BASE && rb >= new_aligned {
+                    bases_to_unmap.push(rb);
+                }
+            }
+            for b in bases_to_unmap {
+                let _ = as_ref.unmap_region(VirtAddr::new(b));
             }
         }
         BRK_TABLE
@@ -4767,9 +4812,11 @@ fn sys_brk(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    // Grow path: page-align both ends, allocate + map every fresh page
-    // R+W into the calling task's AS. Any failure rolls the break
-    // back to `cur` (POSIX brk failure contract).
+    // Grow path: allocate frames + install a SINGLE Region for
+    // the whole new range (was one Region per page pre-fix —
+    // bookkeeping bloated linearly with heap size and the shrink
+    // path had to iterate page-by-page). On failure roll the
+    // break back to `cur` (POSIX brk failure contract).
     let as_ref = match current_address_space() {
         Some(a) => a,
         None => {
@@ -4779,8 +4826,20 @@ fn sys_brk(ctx: &mut dyn TrapContext) {
     };
     let cur_aligned = (cur + 0xFFF) & !0xFFFu64;
     let new_aligned = (new_break + 0xFFF) & !0xFFFu64;
-    let mut va = cur_aligned;
-    while va < new_aligned {
+    let pages = (new_aligned - cur_aligned) >> 12;
+    if pages == 0 {
+        // Within-page grow — just record the new break, no PTE work.
+        BRK_TABLE
+            .lock()
+            .as_mut()
+            .expect("brk_init")
+            .insert(task, new_break);
+        ctx.set_return(SyscallReturn::ok(new_break));
+        return;
+    }
+    let mut phys_list: alloc::vec::Vec<narf_memory::PhysAddr> =
+        alloc::vec::Vec::with_capacity(pages as usize);
+    for _ in 0..pages {
         let phys = match narf_memory::alloc_frame() {
             Ok(f) => f.start_address(),
             Err(_) => {
@@ -4792,19 +4851,19 @@ fn sys_brk(ctx: &mut dyn TrapContext) {
         unsafe {
             core::ptr::write_bytes(phys.raw() as *mut u8, 0, 0x1000);
         }
-        if as_ref
-            .map_region(Region {
-                base: VirtAddr::new(va),
-                len: 0x1000,
-                perms: RegionPerms::READ | RegionPerms::WRITE,
-                phys: alloc::vec![phys],
-            })
-            .is_err()
-        {
-            ctx.set_return(SyscallReturn::ok(cur));
-            return;
-        }
-        va += 0x1000;
+        phys_list.push(phys);
+    }
+    if as_ref
+        .map_region(Region {
+            base: VirtAddr::new(cur_aligned),
+            len: pages * 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: phys_list,
+        })
+        .is_err()
+    {
+        ctx.set_return(SyscallReturn::ok(cur));
+        return;
     }
     if unsafe { as_ref.materialize() }.is_err() {
         ctx.set_return(SyscallReturn::ok(cur));
