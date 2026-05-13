@@ -191,20 +191,13 @@ pub fn function_level_reset(
     // 3. Set DevCtl.InitiateFLR (bit 15).
     let _ = set_device_control(cap, device, 1 << 15)?;
 
-    // 4. Bounded wait — 100 ms minimum per spec; ~200 ms slack.
-    // We spin on a loop bound that's far longer than QEMU needs and
-    // that real silicon comfortably finishes within. The exact
-    // wall-clock is calibrated by `narf_time::Instant` in callers
-    // that have it; this fallback is a coarse busy-wait.
-    let start = narf_time::Instant::now();
-    let target_cycles = 200_000_000u64; // ~200 ms at 1 GHz; over-budget by design
+    // 4. Bounded wait — 100 ms minimum per PCIe Base §6.6.2 (FLR
+    // completion); 200 ms wedge threshold. responsive_spin_until
+    // ticks sleep_pumps so cursor/FB stay alive across the
+    // post-FLR settle wait.
     let cfg_phys = pcie_cfg_phys(device)?;
-    // responsive_spin ticks sleep_pumps so cursor/FB stay alive
-    // across the post-FLR settle wait. `done` returns true when
-    // the device is back (vid != 0xFFFF) OR the wall-clock budget
-    // is exhausted; we re-check vid_back after to disambiguate.
     let mut vid_back = false;
-    let _ = narf_scheduler::responsive_spin(
+    let _ = narf_scheduler::responsive_spin_until(
         || {
             // SAFETY: identity-mapped ECAM; offset 0x00 = Vendor ID.
             let vid = unsafe { cfg_read16(cfg_phys, 0x00) };
@@ -212,9 +205,9 @@ pub fn function_level_reset(
                 vid_back = true;
                 return true;
             }
-            start.cycles_since(narf_time::Instant::now()) >= target_cycles
+            false
         },
-        u32::MAX,
+        narf_time::Deadline::after_ms(200),
     );
     if vid_back {
         return Ok(());
