@@ -43,6 +43,7 @@ pub mod getopt;
 pub mod heap;
 pub mod io;
 pub mod ipc;
+pub mod xattr;
 pub mod locale;
 pub mod math;
 pub mod net;

@@ -6760,6 +6760,109 @@ fn sys_sock_send_zc(ctx: &mut dyn TrapContext) {
     }
 }
 
+// ── flock(2) — advisory file locking ────────────────────────────
+//
+// Per-file lock state keyed by the FdEntry's Arc<dyn FileOps>
+// raw pointer (so dup'd fds share a lock; distinct files get
+// distinct locks). Stage-1: shared (LOCK_SH = N readers) /
+// exclusive (LOCK_EX = single writer) / unlock (LOCK_UN). Lock
+// owner tracking lets a future LOCK_EX acquire detect "this
+// task already holds an exclusive lock" and return success.
+
+const LOCK_SH: u32 = 1;
+const LOCK_EX: u32 = 2;
+const LOCK_NB: u32 = 4;
+const LOCK_UN: u32 = 8;
+
+#[derive(Default, Debug)]
+struct FlockEntry {
+    /// Number of shared (read) holders. > 0 means SH-locked.
+    shared_count: u32,
+    /// Task id holding an exclusive lock; 0 means no exclusive.
+    exclusive_owner: u64,
+}
+
+static FLOCK_TABLE: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<usize, FlockEntry>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+fn flock_try(file_ptr: usize, op: u32, task: u64) -> Result<(), ()> {
+    let mut g = FLOCK_TABLE.lock();
+    let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
+    let e = map.entry(file_ptr).or_default();
+    if op & LOCK_UN != 0 {
+        if e.exclusive_owner == task {
+            e.exclusive_owner = 0;
+        } else if e.shared_count > 0 {
+            e.shared_count -= 1;
+        }
+        return Ok(());
+    }
+    if op & LOCK_EX != 0 {
+        // Exclusive: succeed iff no shared, no other exclusive.
+        if e.exclusive_owner == task { return Ok(()); }
+        if e.shared_count == 0 && e.exclusive_owner == 0 {
+            e.exclusive_owner = task;
+            return Ok(());
+        }
+        return Err(());
+    }
+    if op & LOCK_SH != 0 {
+        // Shared: succeed iff no exclusive (or we hold it).
+        if e.exclusive_owner == 0 || e.exclusive_owner == task {
+            e.shared_count += 1;
+            return Ok(());
+        }
+        return Err(());
+    }
+    Err(())
+}
+
+fn sys_flock(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let fd = args.arg0 as u32;
+    let op = args.arg1 as u32;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    let task = current_task_id();
+    let arc_ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten();
+    let arc_ops = match arc_ops {
+        Some(a) => a,
+        None => { ctx.set_return(fail); return; }
+    };
+    let file_ptr = alloc::sync::Arc::as_ptr(&arc_ops) as *const () as usize;
+    let nonblock = op & LOCK_NB != 0;
+    loop {
+        if flock_try(file_ptr, op, task).is_ok() {
+            ctx.set_return(SyscallReturn::ok(0));
+            return;
+        }
+        if nonblock {
+            ctx.set_return(fail);
+            return;
+        }
+        // Yield ~1ms then retry. Same shape as sys_futex's wait
+        // loop — the unlock side bumps the table; we just re-poll.
+        if let (Some(uctx), Some(hook)) = (
+            crate::user_task::current_user_task(),
+            crate::user_task::yield_hook(),
+        ) {
+            ctx.set_return(fail);
+            let dl = narf_scheduler::narf_time::monotonic_ns()
+                .saturating_add(1_000_000);
+            unsafe {
+                let uc = &*uctx;
+                uc.sleep_deadline_ns.store(dl, Ordering::Release);
+                ctx.save_user_state(uc.state.get() as *mut u8);
+                *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                hook(uctx);
+            }
+            // unreachable
+        }
+        ctx.set_return(fail);
+        return;
+    }
+}
+
 // ── Terminal attributes (termios) ───────────────────────────────
 //
 // Per-task kernel-side termios store. tcgetattr/tcsetattr round
@@ -7481,6 +7584,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Signalfd, "signalfd", RawFnHandler(sys_signalfd));
     table.install_raw(Syscall::Tcgetattr, "tcgetattr", RawFnHandler(sys_tcgetattr));
     table.install_raw(Syscall::Tcsetattr, "tcsetattr", RawFnHandler(sys_tcsetattr));
+    table.install_raw(Syscall::Flock, "flock", RawFnHandler(sys_flock));
     table.install_raw(
         Syscall::FbConnect,
         "fb_connect",

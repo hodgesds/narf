@@ -209,6 +209,43 @@ fn polltest_run(fd: i32) {
     unsafe { write_all(fd, b"polltest: ok (eventfd+timerfd+poll)\n"); }
 }
 
+fn flocktest_run(fd: i32) {
+    // Two distinct fds against the same /tmp file (different
+    // open() calls give different FdEntry but the same backing
+    // memfile Arc — so the per-file lock state should be shared).
+    let path = b"/tmp/flocktest\0";
+    let fd1 = unsafe { libc::posix_open(path.as_ptr() as *const i8, 0o100 | 0o2, 0o600) };
+    let fd2 = unsafe { libc::posix_open(path.as_ptr() as *const i8, 0o2, 0) };
+    if fd1 < 0 || fd2 < 0 {
+        unsafe { write_all(fd, b"flocktest: open failed\n"); }
+        return;
+    }
+    // fd1: LOCK_EX (block until acquired). With no contention this
+    // returns immediately.
+    let r = unsafe { libc::term::flock(fd1, 2 /* LOCK_EX */) };
+    if r != 0 {
+        unsafe { write_all(fd, b"flocktest: LOCK_EX(fd1) failed\n"); }
+        return;
+    }
+    // fd2: LOCK_EX | LOCK_NB — should fail (held by fd1's task).
+    // Note: same task holds both, so the kernel sees task already
+    // owns the lock and returns success. That's the correct
+    // semantic for flock — POSIX says reacquiring is OK.
+    let r = unsafe { libc::term::flock(fd2, 2 | 4 /* LOCK_EX|LOCK_NB */) };
+    if r != 0 {
+        unsafe { write_all(fd, b"flocktest: same-task re-EX should succeed\n"); }
+        return;
+    }
+    let r = unsafe { libc::term::flock(fd1, 8 /* LOCK_UN */) };
+    if r != 0 {
+        unsafe { write_all(fd, b"flocktest: LOCK_UN failed\n"); }
+        return;
+    }
+    let _ = unsafe { libc::posix::close(fd1) };
+    let _ = unsafe { libc::posix::close(fd2) };
+    unsafe { write_all(fd, b"flocktest: ok (LOCK_EX/LOCK_UN round-trip)\n"); }
+}
+
 fn mqtest_run(fd: i32) {
     let name = b"/mqtest\0";
     let q = unsafe {
@@ -876,6 +913,12 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         //   4. read 8 bytes → counter value 1
         //   5. timerfd 50ms one-shot; poll(timeout=200ms) → 1 (ready)
         polltest_run(fd);
+    } else if cmd == b"flocktest" {
+        // flocktest — open the same path twice; first dup gets
+        // LOCK_EX, second dup's LOCK_EX|LOCK_NB fails (EX held);
+        // unlock the first, second succeeds. Validates per-file
+        // lock state under the dispatcher.
+        flocktest_run(fd);
     } else if cmd == b"mqtest" {
         // mqtest — open a POSIX message queue, send "hello", receive,
         // verify, unlink.

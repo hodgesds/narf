@@ -159,8 +159,11 @@ pub const LOCK_UN: c_int = 8;
 /// # Safety
 /// `fd` is taken at face value.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn flock(_fd: c_int, _op: c_int) -> c_int {
-    0
+pub unsafe extern "C" fn flock(fd: c_int, op: c_int) -> c_int {
+    let r = unsafe {
+        narf_user_runtime::syscall2_raw(235, fd as u64, op as u64)
+    };
+    r as c_int
 }
 
 // ── utime / utimes / futimens ───────────────────────────────────────

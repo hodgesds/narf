@@ -583,6 +583,13 @@ pub enum Syscall {
     /// arg0 = fd, arg1 = action, arg2 = termios in ptr.
     Tcsetattr = 219,
 
+    /// `flock(fd, op)` — POSIX advisory file lock. arg0 = fd,
+    /// arg1 = op (LOCK_SH=1, LOCK_EX=2, LOCK_UN=8, LOCK_NB=4
+    /// OR'd in for non-blocking). Per-file (Arc-keyed) lock state
+    /// kept in a kernel-side map; conflicting acquires block via
+    /// the same yield-on-no-progress path sys_futex uses.
+    Flock = 235,
+
     /// Open an FB connection to a scanout. `arg0` = scanout id (0
     /// for the active scanout). Returns a non-zero `FbHandleId` on
     /// success, 0 on failure (no backend / OOM / not authorised).
@@ -1184,6 +1191,7 @@ impl Syscall {
             217 => Syscall::Signalfd,
             218 => Syscall::Tcgetattr,
             219 => Syscall::Tcsetattr,
+            235 => Syscall::Flock,
             130 => Syscall::RingKick,
             140 => Syscall::GetPid,
             141 => Syscall::GetPpid,
