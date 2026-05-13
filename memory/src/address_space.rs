@@ -88,16 +88,37 @@ pub struct AddressSpace {
     /// acts as "not-yet-initialised" sentinel.
     pub root: PhysAddr,
     regions: IrqSafeSpinLock<Vec<Region>>,
+    /// Per-AS mmap cursor: next free virt for a no-hint mmap.
+    /// Lives here (not on a single global) so each process gets its
+    /// own monotonically-increasing arena instead of a shared race.
+    /// Initial value 0x4080_0000_0000 matches the prior global —
+    /// well above the ELF + brk regions and below the user stack.
+    mmap_cursor: core::sync::atomic::AtomicU64,
 }
 
 impl AddressSpace {
+    /// Default base for the per-AS mmap cursor. Matches the prior
+    /// global MMAP_CURSOR so existing user binaries continue to see
+    /// mmap returning addresses in the same broad range.
+    pub const MMAP_CURSOR_BASE: u64 = 0x0000_4080_0000_0000;
+
     /// Fresh address space with no regions. Stage-4 arch backend
     /// must assign `root` to a freshly-allocated page-table frame.
     pub const fn empty() -> Self {
         Self {
             root: PhysAddr::new(0),
             regions: IrqSafeSpinLock::new(Vec::new()),
+            mmap_cursor: core::sync::atomic::AtomicU64::new(Self::MMAP_CURSOR_BASE),
         }
+    }
+
+    /// Atomically reserve `bytes` of contiguous virtual address
+    /// from the per-AS mmap cursor and return the base. Bytes are
+    /// page-rounded by the caller; this routine just bumps.
+    #[inline]
+    pub fn reserve_mmap_va(&self, bytes: u64) -> u64 {
+        self.mmap_cursor
+            .fetch_add(bytes, core::sync::atomic::Ordering::Relaxed)
     }
 
     /// Allocate a fresh user-mode PML4 (x86_64) or TTBR0 page-table
@@ -118,6 +139,7 @@ impl AddressSpace {
         Ok(Self {
             root: phys,
             regions: IrqSafeSpinLock::new(Vec::new()),
+            mmap_cursor: core::sync::atomic::AtomicU64::new(Self::MMAP_CURSOR_BASE),
         })
     }
 
@@ -131,6 +153,7 @@ impl AddressSpace {
         Ok(Self {
             root: phys,
             regions: IrqSafeSpinLock::new(Vec::new()),
+            mmap_cursor: core::sync::atomic::AtomicU64::new(Self::MMAP_CURSOR_BASE),
         })
     }
 
@@ -261,6 +284,119 @@ impl AddressSpace {
     pub fn region_count(&self) -> usize {
         self.regions.lock().len()
     }
+
+    /// Change permissions on every region whose base lies in
+    /// `[base, base + len)`. The active PTEs are rewritten in
+    /// place via the same primitives `materialize` uses, so the
+    /// next user-mode access to the affected pages observes the
+    /// new flags. Does NOT split a region — the caller must align
+    /// `base` to a region's existing base and `len` to that
+    /// region's `len` if they want surgical control. For the
+    /// per-page regions installed by `sys_brk`-grow / `sys_mmap`'s
+    /// per-page form, that means callers can change perms at any
+    /// page granularity.
+    ///
+    /// Returns `Unmapped` if no regions intersect the requested
+    /// range. Otherwise returns `Ok(())` after applying perms to
+    /// every matching region.
+    pub fn change_perms_range(
+        &self,
+        base: VirtAddr,
+        len: u64,
+        new_perms: RegionPerms,
+    ) -> Result<(), AddressSpaceError> {
+        let lo = base.as_u64();
+        let hi = lo.saturating_add(len);
+        // Snapshot + mutate the bookkeeping under the lock; do
+        // the PTE walk after dropping the lock so a concurrent
+        // map_region on a non-overlapping region doesn't block.
+        let touched: Vec<Region> = {
+            let mut g = self.regions.lock();
+            let mut hits = Vec::new();
+            for r in g.iter_mut() {
+                let rb = r.base.as_u64();
+                let re = rb.saturating_add(r.len);
+                if rb >= hi || re <= lo {
+                    continue;
+                }
+                r.perms = new_perms;
+                hits.push(r.clone());
+            }
+            hits
+        };
+        if touched.is_empty() {
+            return Err(AddressSpaceError::Unmapped);
+        }
+        // SAFETY: same identity-mapping precondition as
+        // `materialize`. Each touched region's pages were
+        // previously installed with map_4kb; we re-install with
+        // the new flag set, which on x86_64's map_4kb takes the
+        // AlreadyMapped path on the second pass. We reach the
+        // PTE-level update by tearing down + re-installing each
+        // page (cheaper than adding a per-arch in-place mutate
+        // helper, since map_4kb already handles the leaf rewrite).
+        unsafe { self.rewrite_perms_pages(&touched) };
+        Ok(())
+    }
+
+    /// PTE-walk helper for `change_perms_range`. For each page in
+    /// each region: unmap_4kb to recover the phys + clear the
+    /// leaf PTE, then map_4kb with the new perms to reinstall.
+    /// invlpg is issued by both calls, so the CPU's TLB observes
+    /// the new flags on the next access.
+    ///
+    /// # Safety
+    /// Identity-map contract identical to `unmap_region_pages`.
+    /// Region.phys must remain valid for the duration of the
+    /// call; we only re-target the same phys.
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn rewrite_perms_pages(&self, regions: &[Region]) {
+        use crate::x86_64::paging::{map_4kb, unmap_4kb, PtFlags};
+        if self.root.as_u64() == 0 {
+            return;
+        }
+        for r in regions {
+            let mut flags = PtFlags::USER;
+            if r.perms.contains(RegionPerms::WRITE) {
+                flags = flags | PtFlags::WRITABLE;
+            }
+            if !r.perms.contains(RegionPerms::EXEC) {
+                flags = flags | PtFlags::NO_EXEC;
+            }
+            for (i, p) in r.phys.iter().enumerate() {
+                let v = VirtAddr::new(r.base.as_u64() + ((i as u64) << 12));
+                // SAFETY: identity-mapped; v lies inside r which
+                // was bookkept by a prior map_region.
+                let _ = unsafe { unmap_4kb(self.root, v) };
+                // SAFETY: same.
+                let _ = unsafe { map_4kb(self.root, v, *p, flags) };
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn rewrite_perms_pages(&self, regions: &[Region]) {
+        use crate::aarch64::paging::{map_4kb, unmap_4kb, PtFlags};
+        if self.root.as_u64() == 0 {
+            return;
+        }
+        for r in regions {
+            let mut flags = PtFlags::AP_RW_EL1;
+            if !r.perms.contains(RegionPerms::EXEC) {
+                flags = flags | PtFlags::UXN | PtFlags::PXN;
+            }
+            for (i, p) in r.phys.iter().enumerate() {
+                let v = VirtAddr::new(r.base.as_u64() + ((i as u64) << 12));
+                // SAFETY: see x86_64 variant.
+                let _ = unsafe { unmap_4kb(self.root, v) };
+                // SAFETY: same.
+                let _ = unsafe { map_4kb(self.root, v, *p, flags) };
+            }
+        }
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    unsafe fn rewrite_perms_pages(&self, _regions: &[Region]) {}
 
     /// Snapshot of the region list — returns an owned `Vec<Region>`
     /// so callers can iterate without holding the lock.

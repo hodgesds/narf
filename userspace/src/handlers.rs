@@ -2400,6 +2400,11 @@ fn sys_close(ctx: &mut dyn TrapContext) {
 // its PML4 entry — putting user mappings under it would deny user
 // access at the PML4 walk level even with USER set on every level
 // below).
+// Legacy global mmap cursor — kept until every internal caller of
+// `MMAP_CURSOR.fetch_add(...)` (FB shmem ring, NVMe queue maps, etc.
+// inside this crate) is migrated to the per-AS variant. New code
+// should always use `as_ref.reserve_mmap_va(...)` for the active
+// AS.
 static MMAP_CURSOR: AtomicU64 = AtomicU64::new(0x0000_4080_0000_0000);
 
 fn sys_mmap(ctx: &mut dyn TrapContext) {
@@ -2413,9 +2418,12 @@ fn sys_mmap(ctx: &mut dyn TrapContext) {
         }
     };
 
-    // Pick a fresh user virt by bumping the cursor.
+    // Pick a fresh user virt by bumping the per-AS cursor (NOT the
+    // legacy global — pre-fix, two processes mmap'ing in parallel
+    // would race-bump the same atomic and end up with overlapping
+    // virts in distinct PML4s).
     let pages = len >> 12;
-    let base = MMAP_CURSOR.fetch_add(len, Ordering::Relaxed);
+    let base = as_ref.reserve_mmap_va(len);
 
     // Allocate one frame per page and zero each. The freelist returns
     // frames out of order so we collect into a per-page scatter list.
@@ -2944,6 +2952,44 @@ fn sys_munmap(ctx: &mut dyn TrapContext) {
     let base = VirtAddr::new(args.arg0);
     match as_ref.unmap_region(base) {
         Ok(_) => ctx.set_return(SyscallReturn::ok(0)),
+        Err(_) => ctx.set_return(SyscallReturn::invalid_op()),
+    }
+}
+
+/// `mprotect(base, len, prot)` — change permissions on every
+/// region in the calling task's AS that intersects `[base,
+/// base + len)`. Walks the region table, mutates `Region.perms`,
+/// then re-installs the affected pages' PTEs with the new flag
+/// set via `AddressSpace::change_perms_range`.
+///
+/// `prot` follows the POSIX bit layout we pin in `narf-libc`:
+///   - bit 0 = PROT_READ
+///   - bit 1 = PROT_WRITE
+///   - bit 2 = PROT_EXEC
+///
+/// Returns Ok(0) on success, InvalidOp on bad AS or no
+/// intersecting regions.
+fn sys_mprotect(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let as_ref = match current_address_space() {
+        Some(a) => a,
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+    let base = VirtAddr::new(args.arg0);
+    let len = args.arg1;
+    let prot = args.arg2 as u32;
+    let mut perms = RegionPerms::READ;
+    if prot & 0b010 != 0 {
+        perms = perms | RegionPerms::WRITE;
+    }
+    if prot & 0b100 != 0 {
+        perms = perms | RegionPerms::EXEC;
+    }
+    match as_ref.change_perms_range(base, len, perms) {
+        Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
         Err(_) => ctx.set_return(SyscallReturn::invalid_op()),
     }
 }
@@ -5380,6 +5426,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Close, "close", RawFnHandler(sys_close));
     table.install_raw(Syscall::Mmap, "mmap", RawFnHandler(sys_mmap));
     table.install_raw(Syscall::Munmap, "munmap", RawFnHandler(sys_munmap));
+    table.install_raw(Syscall::MProtect, "mprotect", RawFnHandler(sys_mprotect));
     table.install_raw(
         Syscall::FbConnect,
         "fb_connect",
