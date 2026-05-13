@@ -209,6 +209,121 @@ fn polltest_run(fd: i32) {
     unsafe { write_all(fd, b"polltest: ok (eventfd+timerfd+poll)\n"); }
 }
 
+// Build a sockaddr_in (16 bytes): family u16 + port u16 BE +
+// in_addr u32 BE + 8 bytes zero. Returns total length (= 16).
+fn make_sockaddr_in(buf: &mut [u8; 16], port: u16, ip: u32) -> u32 {
+    // sa_family = AF_INET = 2 (LE u16)
+    buf[0] = 2; buf[1] = 0;
+    // port (BE)
+    let pb = port.to_be_bytes();
+    buf[2] = pb[0]; buf[3] = pb[1];
+    // ip (BE)
+    let ib = ip.to_be_bytes();
+    buf[4] = ib[0]; buf[5] = ib[1]; buf[6] = ib[2]; buf[7] = ib[3];
+    for i in 8..16 { buf[i] = 0; }
+    16
+}
+
+static TCPTEST_LISTENING: AtomicU32 = AtomicU32::new(0);
+static TCPTEST_RESULT: AtomicU32 = AtomicU32::new(0);
+
+extern "C" fn tcptest_listener(_arg: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+    use core::sync::atomic::Ordering;
+    let lfd = unsafe { libc::socket(2 /* AF_INET */, 1 /* SOCK_STREAM */, 0) };
+    if lfd < 0 {
+        TCPTEST_RESULT.store(0xE1, Ordering::SeqCst);
+        return core::ptr::null_mut();
+    }
+    let mut addr_buf = [0u8; 16];
+    let alen = make_sockaddr_in(&mut addr_buf, 8000, 0x7F000001 /* 127.0.0.1 */);
+    let r = unsafe {
+        libc::bind(lfd, addr_buf.as_ptr() as *const libc::sockaddr, alen)
+    };
+    if r < 0 { TCPTEST_RESULT.store(0xE2, Ordering::SeqCst); return core::ptr::null_mut(); }
+    let r = unsafe { libc::listen(lfd, 4) };
+    if r < 0 { TCPTEST_RESULT.store(0xE3, Ordering::SeqCst); return core::ptr::null_mut(); }
+    TCPTEST_LISTENING.store(1, Ordering::SeqCst);
+    let cfd = unsafe { libc::accept(lfd, core::ptr::null_mut(), core::ptr::null_mut()) };
+    if cfd < 0 { TCPTEST_RESULT.store(0xE4, Ordering::SeqCst); return core::ptr::null_mut(); }
+    let mut rbuf = [0u8; 16];
+    let n = unsafe {
+        libc::recv(cfd, rbuf.as_mut_ptr() as *mut core::ffi::c_void, rbuf.len(), 0)
+    };
+    if n != 4 || &rbuf[..4] != b"ping" {
+        TCPTEST_RESULT.store(0xE5, Ordering::SeqCst);
+        return core::ptr::null_mut();
+    }
+    let n = unsafe {
+        libc::send(cfd, b"pong".as_ptr() as *const core::ffi::c_void, 4, 0)
+    };
+    if n != 4 { TCPTEST_RESULT.store(0xE6, Ordering::SeqCst); return core::ptr::null_mut(); }
+    TCPTEST_RESULT.store(1, Ordering::SeqCst);
+    let _ = unsafe { libc::posix::close(lfd) };
+    let _ = unsafe { libc::posix::close(cfd) };
+    core::ptr::null_mut()
+}
+
+fn tcptest_run(fd: i32) {
+    use core::sync::atomic::Ordering;
+    TCPTEST_LISTENING.store(0, Ordering::SeqCst);
+    TCPTEST_RESULT.store(0, Ordering::SeqCst);
+    let mut tid: u64 = 0;
+    let attr = core::ptr::null::<libc::pthread_attr_t>();
+    let rc = unsafe {
+        libc::pthread_create(&mut tid as *mut u64, attr, tcptest_listener, core::ptr::null_mut())
+    };
+    if rc != 0 {
+        unsafe { write_all(fd, b"tcptest: pthread_create failed\n"); }
+        return;
+    }
+    while TCPTEST_LISTENING.load(Ordering::SeqCst) == 0 {
+        unsafe { libc::usleep(1000); }
+    }
+    let cfd = unsafe { libc::socket(2, 1, 0) };
+    if cfd < 0 {
+        unsafe { write_all(fd, b"tcptest: parent socket() failed\n"); }
+        return;
+    }
+    let mut addr_buf = [0u8; 16];
+    let alen = make_sockaddr_in(&mut addr_buf, 8000, 0x7F000001);
+    let r = unsafe {
+        libc::connect(cfd, addr_buf.as_ptr() as *const libc::sockaddr, alen)
+    };
+    if r < 0 {
+        unsafe { write_all(fd, b"tcptest: parent connect() failed\n"); }
+        return;
+    }
+    let n = unsafe {
+        libc::send(cfd, b"ping".as_ptr() as *const core::ffi::c_void, 4, 0)
+    };
+    if n != 4 {
+        unsafe { write_all(fd, b"tcptest: parent send(ping) short\n"); }
+        return;
+    }
+    let mut rbuf = [0u8; 16];
+    let n = unsafe {
+        libc::recv(cfd, rbuf.as_mut_ptr() as *mut core::ffi::c_void, rbuf.len(), 0)
+    };
+    if n != 4 || &rbuf[..4] != b"pong" {
+        unsafe { write_all(fd, b"tcptest: parent recv != pong\n"); }
+        return;
+    }
+    let _ = unsafe { libc::pthread_join(tid, core::ptr::null_mut()) };
+    let _ = unsafe { libc::posix::close(cfd) };
+    let result = TCPTEST_RESULT.load(Ordering::SeqCst);
+    if result == 1 {
+        unsafe { write_all(fd, b"tcptest: ok (ping<->pong over 127.0.0.1:8000)\n"); }
+    } else {
+        let mut buf = [0u8; 12];
+        let s = u32_to_decimal(result, &mut buf);
+        unsafe {
+            write_all(fd, b"tcptest: failed listener-stage=0x");
+            write_all(fd, s);
+            write_all(fd, NEWLINE);
+        }
+    }
+}
+
 extern "C" fn socktest_listener(_arg: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
     use core::sync::atomic::Ordering;
     let lfd = unsafe { libc::socket(1 /* AF_UNIX */, 1 /* SOCK_STREAM */, 0) };
@@ -537,6 +652,13 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         //   4. read 8 bytes → counter value 1
         //   5. timerfd 50ms one-shot; poll(timeout=200ms) → 1 (ready)
         polltest_run(fd);
+    } else if cmd == b"tcptest" {
+        // tcptest — same shape as socktest but AF_INET / 127.0.0.1
+        // / port 8000. Worker thread binds + listens + accepts +
+        // reads "ping", writes "pong"; parent connects + writes
+        // "ping" + reads "pong" + joins. Validates AF_INET TCP
+        // loopback through the same dispatcher AF_UNIX uses.
+        tcptest_run(fd);
     } else if cmd == b"socktest" {
         // socktest — spawn a worker that binds an AF_UNIX listener
         // at /sock/test, accepts one connection, reads "ping" and

@@ -137,6 +137,23 @@ enum SocketState {
         /// Bytes the local end RECEIVES (peer writes).
         rx: Arc<RingBuf>,
     },
+    /// AF_INET SOCK_STREAM bound listener at (addr, port). Stage-1
+    /// loopback only — connect to 127.0.0.1 finds the listener
+    /// in the INET_LISTENERS map; non-loopback addresses fail
+    /// with ConnectionRefused until the NIC TX path lands.
+    InetListener {
+        addr: u32,
+        port: u16,
+        backlog: u32,
+        pending: VecDeque<Arc<SocketFile>>,
+    },
+    /// AF_INET connected endpoint — same ring shape as UnixConnected.
+    InetConnected {
+        tx: Arc<RingBuf>,
+        rx: Arc<RingBuf>,
+        peer_addr: u32,
+        peer_port: u16,
+    },
 }
 
 impl SocketFile {
@@ -149,21 +166,32 @@ impl SocketFile {
     }
 
     /// Tear down listener-registry entries owned by this socket.
-    /// Called from sys_close so the path is reusable on the next
-    /// bind. Idempotent — closing a non-listener socket is a no-op.
+    /// Called from sys_close so the path / port is reusable on the
+    /// next bind. Idempotent — non-listener sockets are no-ops.
     pub fn unregister(&self) {
-        let path = {
+        enum Reg { Unix(String), Inet(u32, u16), None }
+        let reg = {
             let state = self.state.lock();
             match &*state {
-                SocketState::UnixListener { path, .. } => Some(path.clone()),
-                _ => None,
+                SocketState::UnixListener { path, .. } => Reg::Unix(path.clone()),
+                SocketState::InetListener { addr, port, .. } => Reg::Inet(*addr, *port),
+                _ => Reg::None,
             }
         };
-        if let Some(p) = path {
-            let mut g = LISTENERS.lock();
-            if let Some(map) = g.as_mut() {
-                map.remove(&p);
+        match reg {
+            Reg::Unix(p) => {
+                let mut g = LISTENERS.lock();
+                if let Some(map) = g.as_mut() {
+                    map.remove(&p);
+                }
             }
+            Reg::Inet(a, p) => {
+                let mut g = INET_LISTENERS.lock();
+                if let Some(map) = g.as_mut() {
+                    map.remove(&(a, p));
+                }
+            }
+            Reg::None => {}
         }
     }
 }
@@ -217,14 +245,16 @@ impl FileOps for SocketFile {
         let state = self.state.lock();
         match &*state {
             SocketState::Fresh => 0,
-            SocketState::UnixListener { pending, .. } => {
+            SocketState::UnixListener { pending, .. }
+            | SocketState::InetListener { pending, .. } => {
                 if pending.is_empty() {
                     0
                 } else {
                     narf_filesystem::POLL_IN
                 }
             }
-            SocketState::UnixConnected { rx, tx } => {
+            SocketState::UnixConnected { rx, tx }
+            | SocketState::InetConnected { rx, tx, .. } => {
                 let mut bits = 0;
                 if rx.has_data() {
                     bits |= narf_filesystem::POLL_IN;
@@ -246,9 +276,14 @@ impl SocketFile {
     /// shape; the per-family branch executes it. POSIX syscall
     /// shims and ring opcodes both call this.
     pub fn dispatch_op(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
-        if self.domain != AF_UNIX || self.kind != SOCK_STREAM {
-            return SocketOpResult::Err(SockError::NotSupported);
+        match (self.domain, self.kind) {
+            (AF_UNIX, SOCK_STREAM) => self.dispatch_unix_stream(op),
+            (AF_INET, SOCK_STREAM) => self.dispatch_inet_stream(op),
+            _ => SocketOpResult::Err(SockError::NotSupported),
         }
+    }
+
+    fn dispatch_unix_stream(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
         match op {
             SocketOp::Bind { addr } => {
                 if addr.family != AF_UNIX {
@@ -398,6 +433,159 @@ impl SocketFile {
         }
     }
 
+    /// AF_INET SOCK_STREAM dispatcher. Loopback only — connect to
+    /// 127.0.0.1 finds the listener in INET_LISTENERS and pairs
+    /// up two ring buffers. Non-loopback addresses fail with
+    /// ConnectionRefused; that path lights up when the NIC TX
+    /// path + TCP state machine land.
+    fn dispatch_inet_stream(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
+        match op {
+            SocketOp::Bind { addr } => {
+                if addr.family != AF_INET || addr.body.len() < 6 {
+                    return SocketOpResult::Err(SockError::InvalidArg);
+                }
+                // sockaddr_in body: port (u16 BE) + ip (u32 BE).
+                let port = u16::from_be_bytes([addr.body[0], addr.body[1]]);
+                let ip = u32::from_be_bytes([
+                    addr.body[2],
+                    addr.body[3],
+                    addr.body[4],
+                    addr.body[5],
+                ]);
+                let mut state = self.state.lock();
+                match &*state {
+                    SocketState::Fresh => {
+                        let key = (ip, port);
+                        let mut listeners = INET_LISTENERS.lock();
+                        let map = listeners.get_or_insert_with(BTreeMap::new);
+                        if map.contains_key(&key) {
+                            return SocketOpResult::Err(SockError::AddrInUse);
+                        }
+                        *state = SocketState::InetListener {
+                            addr: ip,
+                            port,
+                            backlog: 0,
+                            pending: VecDeque::new(),
+                        };
+                        SocketOpResult::Ok(0)
+                    }
+                    _ => SocketOpResult::Err(SockError::InvalidArg),
+                }
+            }
+            SocketOp::Listen { backlog } => {
+                let mut state = self.state.lock();
+                match &mut *state {
+                    SocketState::InetListener { addr, port, backlog: b, .. } => {
+                        *b = backlog;
+                        let key = (*addr, *port);
+                        drop(state);
+                        let mut listeners = INET_LISTENERS.lock();
+                        let map = listeners.get_or_insert_with(BTreeMap::new);
+                        map.insert(key, self.clone());
+                        SocketOpResult::Ok(0)
+                    }
+                    _ => SocketOpResult::Err(SockError::InvalidArg),
+                }
+            }
+            SocketOp::Accept => {
+                let mut state = self.state.lock();
+                match &mut *state {
+                    SocketState::InetListener { pending, .. } => {
+                        if let Some(s) = pending.pop_front() {
+                            SocketOpResult::Accepted { socket: s, peer: None }
+                        } else {
+                            SocketOpResult::Err(SockError::WouldBlock)
+                        }
+                    }
+                    _ => SocketOpResult::Err(SockError::InvalidArg),
+                }
+            }
+            SocketOp::Connect { addr } => {
+                if addr.family != AF_INET || addr.body.len() < 6 {
+                    return SocketOpResult::Err(SockError::InvalidArg);
+                }
+                let port = u16::from_be_bytes([addr.body[0], addr.body[1]]);
+                let ip = u32::from_be_bytes([
+                    addr.body[2],
+                    addr.body[3],
+                    addr.body[4],
+                    addr.body[5],
+                ]);
+                // Look up the listener. Loopback (127.x.x.x) and
+                // 0.0.0.0 (INADDR_ANY) listeners both match.
+                let listener = {
+                    let listeners = INET_LISTENERS.lock();
+                    let m = listeners.as_ref();
+                    m.and_then(|m| {
+                        m.get(&(ip, port))
+                            .or_else(|| m.get(&(0, port)))
+                            .cloned()
+                    })
+                };
+                let listener = match listener {
+                    Some(l) => l,
+                    None => return SocketOpResult::Err(SockError::ConnectionRefused),
+                };
+                let a_to_b = Arc::new(RingBuf::new());
+                let b_to_a = Arc::new(RingBuf::new());
+                let server_end = SocketFile::new(AF_INET, SOCK_STREAM);
+                {
+                    let mut srv_state = server_end.state.lock();
+                    *srv_state = SocketState::InetConnected {
+                        tx: b_to_a.clone(),
+                        rx: a_to_b.clone(),
+                        peer_addr: ip,
+                        peer_port: port,
+                    };
+                }
+                {
+                    let mut lst = listener.state.lock();
+                    if let SocketState::InetListener { pending, .. } = &mut *lst {
+                        pending.push_back(server_end);
+                    } else {
+                        return SocketOpResult::Err(SockError::ConnectionRefused);
+                    }
+                }
+                let mut state = self.state.lock();
+                match &*state {
+                    SocketState::Fresh => {
+                        *state = SocketState::InetConnected {
+                            tx: a_to_b,
+                            rx: b_to_a,
+                            peer_addr: ip,
+                            peer_port: port,
+                        };
+                        SocketOpResult::Ok(0)
+                    }
+                    _ => SocketOpResult::Err(SockError::AlreadyConnected),
+                }
+            }
+            SocketOp::Send { buf, flags, addr: _ } => {
+                match self.do_send(buf, flags, None) {
+                    Ok(n) => SocketOpResult::Ok(n as u64),
+                    Err(e) => SocketOpResult::Err(e),
+                }
+            }
+            SocketOp::Recv { buf, flags } => {
+                match self.do_recv(buf, flags) {
+                    Ok((n, peer)) => SocketOpResult::Received { n, peer },
+                    Err(e) => SocketOpResult::Err(e),
+                }
+            }
+            SocketOp::Shutdown { how } => {
+                let state = self.state.lock();
+                match &*state {
+                    SocketState::InetConnected { tx, rx, .. } => {
+                        if how == SHUT_WR || how == SHUT_RDWR { tx.close(); }
+                        if how == SHUT_RD || how == SHUT_RDWR { rx.close(); }
+                        SocketOpResult::Ok(0)
+                    }
+                    _ => SocketOpResult::Err(SockError::NotConnected),
+                }
+            }
+        }
+    }
+
     fn do_send(
         &self,
         buf: &[u8],
@@ -405,19 +593,19 @@ impl SocketFile {
         _addr: Option<SockAddr>,
     ) -> Result<usize, SockError> {
         let state = self.state.lock();
-        match &*state {
-            SocketState::UnixConnected { tx, .. } => {
-                if tx.is_closed() {
-                    return Err(SockError::Pipe);
-                }
-                let n = tx.write(buf);
-                if n == 0 && !buf.is_empty() {
-                    Err(SockError::WouldBlock)
-                } else {
-                    Ok(n)
-                }
-            }
-            _ => Err(SockError::NotConnected),
+        let tx = match &*state {
+            SocketState::UnixConnected { tx, .. }
+            | SocketState::InetConnected { tx, .. } => tx,
+            _ => return Err(SockError::NotConnected),
+        };
+        if tx.is_closed() {
+            return Err(SockError::Pipe);
+        }
+        let n = tx.write(buf);
+        if n == 0 && !buf.is_empty() {
+            Err(SockError::WouldBlock)
+        } else {
+            Ok(n)
         }
     }
 
@@ -427,16 +615,16 @@ impl SocketFile {
         _flags: u32,
     ) -> Result<(usize, Option<SockAddr>), SockError> {
         let state = self.state.lock();
-        match &*state {
-            SocketState::UnixConnected { rx, .. } => {
-                let n = rx.read(buf);
-                if n == 0 && !buf.is_empty() && !rx.is_closed() {
-                    Err(SockError::WouldBlock)
-                } else {
-                    Ok((n, None))
-                }
-            }
-            _ => Err(SockError::NotConnected),
+        let rx = match &*state {
+            SocketState::UnixConnected { rx, .. }
+            | SocketState::InetConnected { rx, .. } => rx,
+            _ => return Err(SockError::NotConnected),
+        };
+        let n = rx.read(buf);
+        if n == 0 && !buf.is_empty() && !rx.is_closed() {
+            Err(SockError::WouldBlock)
+        } else {
+            Ok((n, None))
         }
     }
 }
@@ -514,6 +702,12 @@ impl RingBuf {
 // ── Bound-listener registry ─────────────────────────────────────
 
 static LISTENERS: IrqSafeSpinLock<Option<BTreeMap<String, Arc<SocketFile>>>> =
+    IrqSafeSpinLock::new(None);
+
+/// AF_INET listener registry keyed by (ip, port). Loopback only
+/// today; non-loopback addrs are accepted at bind() but no
+/// connect path serves them until the NIC TX side wires in.
+static INET_LISTENERS: IrqSafeSpinLock<Option<BTreeMap<(u32, u16), Arc<SocketFile>>>> =
     IrqSafeSpinLock::new(None);
 
 // ── ZC fast-path: registered buffer pool ────────────────────────
