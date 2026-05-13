@@ -388,3 +388,154 @@ pub unsafe extern "C" fn signalfd(
     if r < 0 { crate::errno::set_errno(22); }
     r
 }
+
+// ── POSIX timers (timer_create / settime / gettime / delete) ────
+
+/// `timer_t` — opaque handle. Internally an index into a small
+/// per-process table; the table entry stores the backing timerfd
+/// + the sigevent metadata.
+pub type timer_t = i32;
+
+/// `<signal.h>` `union sigval` — opaque pointer/int.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub union sigval {
+    pub sival_int: c_int,
+    pub sival_ptr: *mut core::ffi::c_void,
+}
+
+impl Default for sigval {
+    fn default() -> Self { Self { sival_int: 0 } }
+}
+
+/// `<signal.h>` `struct sigevent` — describes how the timer
+/// notifies the process on expiry.
+#[repr(C)]
+pub struct sigevent {
+    pub sigev_value:    sigval,
+    pub sigev_signo:    c_int,
+    pub sigev_notify:   c_int,
+    pub sigev_pad:      [u8; 52],
+}
+
+pub const SIGEV_SIGNAL: c_int = 0;
+pub const SIGEV_NONE:   c_int = 1;
+pub const SIGEV_THREAD: c_int = 2;
+
+/// Per-process timer table. Each slot holds the kernel timerfd
+/// + the signum to deliver on expiry (or 0 for SIGEV_NONE).
+struct PosixTimer {
+    timerfd: c_int,
+    signum:  c_int,
+}
+
+const MAX_POSIX_TIMERS: usize = 32;
+static mut POSIX_TIMERS: [Option<PosixTimer>; MAX_POSIX_TIMERS] =
+    [const { None }; MAX_POSIX_TIMERS];
+
+/// `timer_create(clockid, evp, timerid)` — allocate a timer.
+///
+/// # Safety
+/// `timerid` must be writable; `evp` (when non-null) must point at
+/// a valid sigevent.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn timer_create(
+    clockid: c_int,
+    evp:     *const sigevent,
+    timerid: *mut timer_t,
+) -> c_int {
+    if timerid.is_null() {
+        return -1;
+    }
+    let signum = if evp.is_null() {
+        14 /* SIGALRM — POSIX default for timer_create */
+    } else {
+        unsafe {
+            if (*evp).sigev_notify == SIGEV_NONE {
+                0
+            } else {
+                (*evp).sigev_signo
+            }
+        }
+    };
+    // Allocate the underlying timerfd kernel-side.
+    let tfd = narf_user_runtime::timerfd_create(clockid as u32, 0);
+    if tfd < 0 {
+        return -1;
+    }
+    // Take the next free slot.
+    // SAFETY: single-threaded user mode invariant.
+    let slot = unsafe {
+        let mut found: Option<usize> = None;
+        for i in 0..MAX_POSIX_TIMERS {
+            if POSIX_TIMERS[i].is_none() {
+                POSIX_TIMERS[i] = Some(PosixTimer { timerfd: tfd, signum });
+                found = Some(i);
+                break;
+            }
+        }
+        found
+    };
+    let id = match slot {
+        Some(i) => i as timer_t,
+        None => {
+            crate::errno::set_errno(11); // EAGAIN
+            return -1;
+        }
+    };
+    unsafe { *timerid = id; }
+    0
+}
+
+/// `timer_settime(timerid, flags, new_value, old_value)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn timer_settime(
+    timerid: timer_t,
+    flags:   c_int,
+    new_value: *const itimerspec,
+    old_value: *mut itimerspec,
+) -> c_int {
+    if (timerid as usize) >= MAX_POSIX_TIMERS {
+        return -1;
+    }
+    let tfd = unsafe {
+        match &POSIX_TIMERS[timerid as usize] {
+            Some(t) => t.timerfd,
+            None => return -1,
+        }
+    };
+    narf_user_runtime::timerfd_settime(
+        tfd,
+        flags as u32,
+        new_value as *const u8,
+        old_value as *mut u8,
+    )
+}
+
+/// `timer_gettime(timerid, cur)` — query remaining time. Stage-1
+/// returns zeros (the kernel doesn't yet expose timerfd_gettime).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn timer_gettime(
+    _timerid: timer_t,
+    cur:      *mut itimerspec,
+) -> c_int {
+    if cur.is_null() { return -1; }
+    unsafe { *cur = itimerspec::default(); }
+    0
+}
+
+/// `timer_delete(timerid)` — release.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn timer_delete(timerid: timer_t) -> c_int {
+    if (timerid as usize) >= MAX_POSIX_TIMERS {
+        return -1;
+    }
+    let tfd = unsafe {
+        match POSIX_TIMERS[timerid as usize].take() {
+            Some(t) => t.timerfd,
+            None => return -1,
+        }
+    };
+    let _ = unsafe { crate::posix::close(tfd) };
+    0
+}
