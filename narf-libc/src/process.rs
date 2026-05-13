@@ -232,48 +232,170 @@ pub unsafe extern "C" fn vfork() -> i32 {
     -1
 }
 
-/// `execve(path, argv, envp)` — refuses with ENOSYS.
+/// `execve(path, argv, envp)` — re-image the calling task with the
+/// program at `path`. POSIX shape: `argv` and `envp` are
+/// NULL-terminated arrays of NUL-terminated C strings. argv[0]
+/// conventionally repeats the basename of `path`.
+///
+/// Implementation:
+///   1. open(path, O_RDONLY); fstat-equivalent via lseek-end to
+///      get the size; read into a heap buffer; close.
+///   2. Pack argv into a single concatenated NUL-separated buffer
+///      (each string ends with NUL; the whole pack is `argv_len`
+///      bytes). Same for envp. Empty input → empty pack.
+///   3. Hand off to `narf_user_runtime::execve` which issues the
+///      kernel SYS_EXECVE. On success the kernel rewrites the
+///      task's address space + entry point and resumes user mode
+///      at the new image — this call NEVER returns.
+///
+/// On failure (file not found, ELF parse error, OOM): returns -1
+/// with errno set, the calling task continues running its old
+/// image.
 ///
 /// # Safety
-/// All arguments are taken at face value; we don't dereference.
+/// `path` must be a valid NUL-terminated C string. `argv` /
+/// `envp` must be NULL-terminated arrays of valid NUL-terminated
+/// C strings.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn execve(
-    _path: *const i8,
-    _argv: *const *const i8,
-    _envp: *const *const i8,
+    path: *const i8,
+    argv: *const *const i8,
+    envp: *const *const i8,
 ) -> i32 {
-    crate::errno::set_errno(ENOSYS);
-    -1
+    if path.is_null() {
+        crate::errno::set_errno(crate::errno::EINVAL);
+        return -1;
+    }
+    let path_str = match unsafe { c_str_to_str(path) } {
+        Some(s) => s,
+        None => {
+            crate::errno::set_errno(crate::errno::EINVAL);
+            return -1;
+        }
+    };
+    // Read the program file into a buffer.
+    let elf = match unsafe { read_file_to_vec(path_str) } {
+        Some(v) => v,
+        None => {
+            crate::errno::set_errno(2); // ENOENT
+            return -1;
+        }
+    };
+    // Pack argv + envp.
+    let argv_pack = match unsafe { pack_cstr_array(argv) } {
+        Some(b) => b,
+        None => {
+            crate::errno::set_errno(crate::errno::EINVAL);
+            return -1;
+        }
+    };
+    let envp_pack = match unsafe { pack_cstr_array(envp) } {
+        Some(b) => b,
+        None => {
+            crate::errno::set_errno(crate::errno::EINVAL);
+            return -1;
+        }
+    };
+
+    let elf_slice = elf.as_slice();
+    let argv_slice = argv_pack.as_slice();
+    let envp_slice = envp_pack.as_slice();
+
+    // SAFETY: pointers + lengths come from heap-owned buffers we
+    // built above; the runtime call doesn't return on success.
+    match unsafe {
+        narf_user_runtime::execve(
+            elf_slice.as_ptr(),
+            elf_slice.len(),
+            argv_slice.as_ptr(),
+            argv_slice.len(),
+            envp_slice.as_ptr(),
+            envp_slice.len(),
+        )
+    } {
+        Ok(()) => {
+            // Unreachable on success — kernel resumes new image
+            // directly. If we get here, the new image returned
+            // immediately (which is itself a defensible state for
+            // a buggy / instant-exit program). Surface as -1 +
+            // ENOEXEC.
+            crate::errno::set_errno(8); // ENOEXEC
+            -1
+        }
+        Err(()) => {
+            crate::errno::set_errno(8); // ENOEXEC
+            -1
+        }
+    }
 }
 
-/// `execv(path, argv)` — refuses with ENOSYS.
+/// `execv(path, argv)` — `execve(path, argv, environ)`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn execv(_path: *const i8, _argv: *const *const i8) -> i32 {
-    crate::errno::set_errno(ENOSYS);
-    -1
+pub unsafe extern "C" fn execv(path: *const i8, argv: *const *const i8) -> i32 {
+    // SAFETY: forwarded; ENVIRON is the libc-published env array.
+    // Read as *const *const u8 (the canonical declaration), cast
+    // to *const *const i8 for execve's signature.
+    let envp = unsafe { crate::env::ENVIRON } as *const *const i8;
+    unsafe { execve(path, argv, envp) }
 }
 
-/// `execvp(file, argv)` — refuses with ENOSYS.
+/// `execvp(file, argv)` — like `execv` but searches `$PATH` if
+/// `file` doesn't contain a slash. The minimal shape: if `file`
+/// contains a `/`, treat as a literal path; otherwise prepend
+/// `"/bin/"` and try once. Real PATH-searching can land later.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn execvp(_file: *const i8, _argv: *const *const i8) -> i32 {
-    crate::errno::set_errno(ENOSYS);
-    -1
+pub unsafe extern "C" fn execvp(file: *const i8, argv: *const *const i8) -> i32 {
+    if file.is_null() {
+        crate::errno::set_errno(crate::errno::EINVAL);
+        return -1;
+    }
+    let s = match unsafe { c_str_to_str(file) } {
+        Some(s) => s,
+        None => {
+            crate::errno::set_errno(crate::errno::EINVAL);
+            return -1;
+        }
+    };
+    if s.contains('/') {
+        // SAFETY: forwarded.
+        return unsafe { execv(file, argv) };
+    }
+    // /bin/<file> fallback. Build a NUL-terminated path on the
+    // stack — capped at 256 bytes to keep the stack frame bounded.
+    let mut buf = [0u8; 256];
+    let prefix = b"/bin/";
+    if prefix.len() + s.len() + 1 > buf.len() {
+        crate::errno::set_errno(crate::errno::EINVAL);
+        return -1;
+    }
+    buf[..prefix.len()].copy_from_slice(prefix);
+    buf[prefix.len()..prefix.len() + s.len()].copy_from_slice(s.as_bytes());
+    // SAFETY: NUL-terminated by the zero-init above.
+    unsafe { execv(buf.as_ptr() as *const i8, argv) }
 }
 
-/// `waitpid(pid, *status, options)` — no children to wait on; we
-/// report -1 with ECHILD.
 const ECHILD: i32 = 10;
 
+/// `waitpid(pid, *status, options)` — block (or poll under
+/// WNOHANG) until a child of the calling task exits. Maps to
+/// SYS_WAIT4 with rusage = NULL. Returns the reaped child pid
+/// on success, 0 on WNOHANG-with-no-exited-child, -1 + ECHILD
+/// on no-children / timeout.
+///
 /// # Safety
 /// `status`, when non-null, must be a writable `*mut i32`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn waitpid(_pid: i32, status: *mut i32, _options: i32) -> i32 {
-    if !status.is_null() {
-        // SAFETY: caller-supplied writable slot.
-        unsafe { *status = 0; }
+pub unsafe extern "C" fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32 {
+    // SAFETY: forwarded; runtime issues SYS_WAIT4.
+    match unsafe {
+        narf_user_runtime::wait4(pid as i64, status, options as u32, core::ptr::null_mut())
+    } {
+        Ok(reaped) => reaped as i32,
+        Err(()) => {
+            crate::errno::set_errno(ECHILD);
+            -1
+        }
     }
-    crate::errno::set_errno(ECHILD);
-    -1
 }
 
 /// `wait(*status)` — same as `waitpid(-1, status, 0)`.
@@ -281,6 +403,184 @@ pub unsafe extern "C" fn waitpid(_pid: i32, status: *mut i32, _options: i32) -> 
 pub unsafe extern "C" fn wait(status: *mut i32) -> i32 {
     // SAFETY: forwarded.
     unsafe { waitpid(-1, status, 0) }
+}
+
+/// Owned heap buffer backed by `narf-libc`'s malloc/free. Used by
+/// `read_file_to_vec` + `pack_cstr_array` since narf-libc itself
+/// is `no_std + no alloc-crate` (the workspace heap allocator
+/// isn't available; we stand on our own malloc).
+struct OwnedBuf {
+    ptr: *mut u8,
+    len: usize,
+    cap: usize,
+}
+
+impl OwnedBuf {
+    /// Pre-allocate `cap` bytes. Returns None on alloc failure.
+    /// `len = 0` initially.
+    unsafe fn with_capacity(cap: usize) -> Option<Self> {
+        if cap == 0 {
+            return Some(Self {
+                ptr: core::ptr::null_mut(),
+                len: 0,
+                cap: 0,
+            });
+        }
+        // SAFETY: malloc returns either null or a pointer to a
+        // freshly-allocated region of the requested size.
+        let ptr = unsafe { crate::heap::malloc(cap) };
+        if ptr.is_null() {
+            return None;
+        }
+        Some(Self { ptr, len: 0, cap })
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        if self.ptr.is_null() {
+            return &[];
+        }
+        // SAFETY: ptr points to `len` valid bytes per our writes.
+        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    /// Append `bytes`. Reallocs (doubling) on overflow. Returns
+    /// false on alloc failure.
+    unsafe fn push_slice(&mut self, bytes: &[u8]) -> bool {
+        if self.len + bytes.len() > self.cap {
+            let mut new_cap = self.cap.max(64);
+            while new_cap < self.len + bytes.len() {
+                new_cap = match new_cap.checked_mul(2) {
+                    Some(v) => v,
+                    None => return false,
+                };
+            }
+            // SAFETY: realloc handles ptr.is_null() like malloc.
+            let new_ptr = unsafe { crate::heap::realloc(self.ptr, new_cap) };
+            if new_ptr.is_null() {
+                return false;
+            }
+            self.ptr = new_ptr;
+            self.cap = new_cap;
+        }
+        // SAFETY: dest range fits in [self.ptr+len, self.ptr+cap).
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                self.ptr.add(self.len),
+                bytes.len(),
+            );
+        }
+        self.len += bytes.len();
+        true
+    }
+
+    unsafe fn push_byte(&mut self, b: u8) -> bool {
+        unsafe { self.push_slice(&[b]) }
+    }
+}
+
+impl Drop for OwnedBuf {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            // SAFETY: ptr came from our malloc / realloc.
+            unsafe { crate::heap::free(self.ptr); }
+        }
+    }
+}
+
+/// Read the file at `path` into a heap-owned buffer. Walks
+/// open → repeated read → close; returns None on any error or
+/// if the file exceeds 64 MiB (matching the kernel-side execve
+/// cap).
+///
+/// # Safety
+/// `path` must be a valid `&str` for the duration of the call.
+unsafe fn read_file_to_vec(path: &str) -> Option<OwnedBuf> {
+    const O_RDONLY: u64 = 0;
+    let fd = narf_user_runtime::open_flags(path, "/", O_RDONLY)?;
+    // SAFETY: malloc-backed growable buffer.
+    let mut out = unsafe { OwnedBuf::with_capacity(64 * 1024) }?;
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = narf_user_runtime::read(fd, &mut chunk);
+        if n == 0 {
+            break;
+        }
+        if out.len + n > 64 * 1024 * 1024 {
+            let _ = narf_user_runtime::close(fd);
+            return None;
+        }
+        // SAFETY: chunk is valid for `n` bytes per the runtime
+        // contract.
+        if !unsafe { out.push_slice(&chunk[..n]) } {
+            let _ = narf_user_runtime::close(fd);
+            return None;
+        }
+    }
+    let _ = narf_user_runtime::close(fd);
+    Some(out)
+}
+
+/// Pack a NULL-terminated array of NUL-terminated C strings into
+/// a single concatenated NUL-separated buffer. Empty / NULL
+/// input returns an empty buffer (matching the kernel's "len = 0
+/// is legal" convention).
+///
+/// # Safety
+/// `arr` must be either NULL or a NULL-terminated array of valid
+/// NUL-terminated C strings.
+unsafe fn pack_cstr_array(arr: *const *const i8) -> Option<OwnedBuf> {
+    // SAFETY: malloc-backed growable buffer.
+    let mut out = unsafe { OwnedBuf::with_capacity(64) }?;
+    if arr.is_null() {
+        return Some(out);
+    }
+    let mut i = 0isize;
+    loop {
+        // SAFETY: caller asserted NULL-terminated array.
+        let p = unsafe { *arr.offset(i) };
+        if p.is_null() {
+            break;
+        }
+        // SAFETY: caller asserted NUL-terminated string.
+        let s = match unsafe { c_str_to_str(p) } {
+            Some(s) => s,
+            None => break,
+        };
+        // SAFETY: bytes valid for s.len().
+        if !unsafe { out.push_slice(s.as_bytes()) } {
+            return None;
+        }
+        if !unsafe { out.push_byte(0) } {
+            return None;
+        }
+        i += 1;
+    }
+    Some(out)
+}
+
+/// Walk a NUL-terminated C string, returning a `&str` view if it
+/// holds valid UTF-8 (capped at 4 KiB to bound a runaway pointer).
+///
+/// # Safety
+/// `p` must be either NULL or a NUL-terminated C string in the
+/// calling task's AS.
+unsafe fn c_str_to_str<'a>(p: *const i8) -> Option<&'a str> {
+    if p.is_null() {
+        return None;
+    }
+    let mut len = 0usize;
+    while len < 4096 {
+        // SAFETY: caller asserted NUL-terminated.
+        let b = unsafe { *p.add(len) };
+        if b == 0 {
+            break;
+        }
+        len += 1;
+    }
+    // SAFETY: bytes [0..len) read above without faulting.
+    let bytes = unsafe { core::slice::from_raw_parts(p as *const u8, len) };
+    core::str::from_utf8(bytes).ok()
 }
 
 // ── session / process group stubs ───────────────────────────────────
