@@ -276,6 +276,74 @@ impl WalkIndices {
     }
 }
 
+/// Tear down every subtree of a user-mode TTBR0 root and return
+/// the root frame itself to the allocator.
+///
+/// AArch64 user TTBR0 starts empty (the kernel lives in TTBR1 per
+/// `new_user_ttbr0`'s comment) so every present entry in the root
+/// is user-private — no kernel-half to skip. Walks all four levels
+/// (L0 → L1 → L2 → L3), freeing intermediate page-table frames on
+/// the way back up. Leaf L3 entries (data pages) are NOT freed
+/// here; the `AddressSpace::Drop` path arranges for
+/// `unmap_region_pages` to release every region's data frames first
+/// so this routine only reclaims the page-table pages themselves.
+///
+/// Reference: ARM ARM (DDI 0487 §D8) translation-table descriptor
+/// formats — bit 0 = VALID, bit 1 = TYPE (1 = table at L0/L1/L2,
+/// page at L3; 0 = block stop). Block entries at L1/L2 (1 GiB /
+/// 2 MiB pages) are skipped.
+///
+/// # Safety
+/// - `root` must be identity-reachable (allocator contract).
+/// - All data-page leaves must already have been released.
+/// - No CPU may be using `root` as its active TTBR0.
+pub unsafe fn free_user_ttbr0_tree(root: PhysAddr) {
+    use crate::frame::{free_frame, PhysFrame};
+    if root.raw() == 0 {
+        return;
+    }
+    /// True if this entry is present AND a TABLE (not a block).
+    /// At L0 every present entry is a table per ARM ARM. At L1/L2
+    /// a block entry stops the walk and must be skipped.
+    fn is_table_descriptor(e: PageTableEntry) -> bool {
+        e.is_valid() && (e.0 & 0b10) != 0
+    }
+    // SAFETY: identity-reachable per caller contract.
+    let l0 = unsafe { &mut *root.kernel_mut_ptr::<PageTable>() };
+    for l0_idx in 0..512usize {
+        let l0e = l0.entries[l0_idx];
+        if !is_table_descriptor(l0e) {
+            continue;
+        }
+        let l1_pa = l0e.addr();
+        // SAFETY: same.
+        let l1 = unsafe { &mut *l1_pa.kernel_mut_ptr::<PageTable>() };
+        for l1_idx in 0..512usize {
+            let l1e = l1.entries[l1_idx];
+            if !is_table_descriptor(l1e) {
+                continue;
+            }
+            let l2_pa = l1e.addr();
+            // SAFETY: same.
+            let l2 = unsafe { &mut *l2_pa.kernel_mut_ptr::<PageTable>() };
+            for l2_idx in 0..512usize {
+                let l2e = l2.entries[l2_idx];
+                if !is_table_descriptor(l2e) {
+                    continue;
+                }
+                // L3 — leaf-level table; data frames already
+                // released by `unmap_region_pages`. Reclaim the
+                // table page itself.
+                free_frame(PhysFrame::new(l2e.addr()));
+            }
+            free_frame(PhysFrame::new(l2_pa));
+        }
+        free_frame(PhysFrame::new(l1_pa));
+        l0.entries[l0_idx] = PageTableEntry::EMPTY;
+    }
+    free_frame(PhysFrame::new(root));
+}
+
 /// aarch64 "canonical": top 16 bits are either all-0 (low half /
 /// user) or all-1 (high half / kernel).
 fn is_canonical(v: VirtAddr) -> bool {

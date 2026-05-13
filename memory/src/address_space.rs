@@ -169,15 +169,92 @@ impl AddressSpace {
         Ok(())
     }
 
-    /// Remove a region whose base address matches `base`.
+    /// Remove a region whose base address matches `base` AND release
+    /// every page it owned: walk the per-page PTEs via the per-arch
+    /// `unmap_4kb`, and return each underlying physical frame to the
+    /// allocator via `frame::free_frame` (which dec_refs on the COW
+    /// path so shared frames survive until the last owner drops).
+    ///
+    /// Pre-fix this only popped the bookkeeping entry — the PTEs and
+    /// the frames stayed live, leaking until the AS itself was
+    /// dropped (which itself didn't free anything either). This
+    /// closes both leaks for the `munmap` / `brk`-shrink paths;
+    /// process-exit teardown rides on the new `Drop for AddressSpace`
+    /// (below) which calls into the same primitive for every
+    /// surviving region plus the page-table pages themselves.
     pub fn unmap_region(&self, base: VirtAddr) -> Result<Region, AddressSpaceError> {
         let mut regions = self.regions.lock();
         let idx = regions
             .iter()
             .position(|r| r.base == base)
             .ok_or(AddressSpaceError::Unmapped)?;
-        Ok(regions.swap_remove(idx))
+        let region = regions.swap_remove(idx);
+        // Drop the lock before walking PTEs so a Drop-time recursive
+        // tear-down (or a parallel materialise on a different region)
+        // doesn't reentrant-deadlock.
+        drop(regions);
+        unsafe { self.unmap_region_pages(&region) };
+        Ok(region)
     }
+
+    /// Walk a region's per-page PTEs, unmap each, and return its
+    /// frame to the allocator. Used by `unmap_region` and by
+    /// `Drop for AddressSpace`.
+    ///
+    /// # Safety
+    /// `self.root` must be a valid identity-reachable PML4 / L0 root.
+    /// Pages covered by `region` were previously installed via
+    /// `materialize`. Concurrent access to the same region from
+    /// another thread is the caller's problem (`unmap_region` holds
+    /// no lock during this walk on purpose — see its comment).
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn unmap_region_pages(&self, region: &Region) {
+        use crate::frame::{free_frame, PhysFrame};
+        use crate::x86_64::paging::unmap_4kb;
+        if self.root.as_u64() == 0 {
+            return;
+        }
+        let pages = (region.len + 0xFFF) >> 12;
+        for i in 0..pages {
+            let v = VirtAddr::new(region.base.as_u64() + (i << 12));
+            // SAFETY: same identity-mapping precondition as
+            // `materialize`; `v` lies inside `region` which was
+            // bookkept by `map_region`.
+            match unsafe { unmap_4kb(self.root, v) } {
+                Ok(phys) => {
+                    free_frame(PhysFrame::new(phys));
+                }
+                // Already-unmapped (double munmap, or the region was
+                // partially materialised) is benign: the bookkeeping
+                // is gone now, the frames either never landed or are
+                // already back in the allocator.
+                Err(_) => {}
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn unmap_region_pages(&self, region: &Region) {
+        use crate::aarch64::paging::unmap_4kb;
+        use crate::frame::{free_frame, PhysFrame};
+        if self.root.as_u64() == 0 {
+            return;
+        }
+        let pages = (region.len + 0xFFF) >> 12;
+        for i in 0..pages {
+            let v = VirtAddr::new(region.base.as_u64() + (i << 12));
+            // SAFETY: see x86_64 variant.
+            match unsafe { unmap_4kb(self.root, v) } {
+                Ok(phys) => {
+                    free_frame(PhysFrame::new(phys));
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    unsafe fn unmap_region_pages(&self, _region: &Region) {}
 
     /// Number of mapped regions.
     #[inline]
@@ -600,5 +677,58 @@ impl AddressSpace {
 impl Default for AddressSpace {
     fn default() -> Self {
         Self::empty()
+    }
+}
+
+impl Drop for AddressSpace {
+    /// Process-exit teardown: log + (eventually) release every
+    /// still-mapped region's data frames, free the per-AS page-
+    /// table pages, and return the root PML4 (x86_64) / L0
+    /// (aarch64) frame to the allocator. Called automatically when
+    /// the last `Arc<AddressSpace>` for a retiring user task drops.
+    ///
+    /// Pre-fix the AS struct dropping was a silent leak — `root`
+    /// is a `PhysAddr` (no destructor), so the user-private page
+    /// tables + every data frame the task had mapped stayed live
+    /// until reboot. Fixed by walking the per-arch tear-down
+    /// helpers in the right order:
+    ///   1. `unmap_region_pages` for each region → frees data
+    ///      frames + zeros leaf PTEs.
+    ///   2. `free_user_pml4_tree` (x86_64) / `free_user_ttbr0_tree`
+    ///      (aarch64) → walks the user-half subtree, frees
+    ///      intermediate page-table pages, frees the root.
+    ///
+    /// Safety: a Drop runs after the last `Arc` reference is
+    /// released, so no CPU can be holding `self.root` as its
+    /// active CR3 / TTBR0 (the scheduler MOV-CR3s on every poll;
+    /// a retired task is off the ready queue). Kernel-half PML4
+    /// entries on x86_64 are not freed — only the user half
+    /// (entries 0..=255) and the PML4 frame itself.
+    fn drop(&mut self) {
+        // Take ownership of the region list to avoid borrowing
+        // through &mut self below; the list is about to be
+        // dropped anyway.
+        let regions = core::mem::take(&mut *self.regions.lock());
+        for r in regions.iter() {
+            // SAFETY: see unmap_region_pages — same identity-map
+            // contract; no CPU is using self.root at this point
+            // since we're past the last Arc reference.
+            unsafe { self.unmap_region_pages(r) };
+        }
+        // Now reclaim the page-table pages themselves. The
+        // sentinel root == 0 means an `empty()` AS that never
+        // got a real page-table allocation; nothing to free.
+        if self.root.as_u64() != 0 {
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: same — last reference gone, no active CR3.
+            unsafe {
+                crate::x86_64::paging::free_user_pml4_tree(self.root);
+            }
+            #[cfg(target_arch = "aarch64")]
+            // SAFETY: same — last reference gone, no active TTBR0.
+            unsafe {
+                crate::aarch64::paging::free_user_ttbr0_tree(self.root);
+            }
+        }
     }
 }

@@ -586,6 +586,80 @@ pub unsafe fn unmap_4kb(pml4_phys: PhysAddr, virt: VirtAddr) -> Result<PhysAddr,
     Ok(removed.addr())
 }
 
+/// Tear down every user-half subtree of `pml4_phys` and return the
+/// PML4 frame itself to the allocator.
+///
+/// Walks PML4 entries 0..=255 (the user half — entries 256..=511
+/// belong to the shared kernel half installed by `new_user_pml4`'s
+/// full-copy of the kernel PML4 and MUST stay live for other
+/// processes). For each present user-half entry: descend into the
+/// PDPT, then PD, then PT, freeing each intermediate page-table
+/// frame on the way back up. Leaf PT entries are NOT followed —
+/// data-page frames must already have been released by
+/// `AddressSpace::unmap_region_pages` for every materialised
+/// region; this routine only reclaims the page-table pages
+/// themselves.
+///
+/// Intel SDM Vol. 3 §4.5 paging-structure layout: each table is
+/// 4 KiB / 512 entries. Bit 0 = present, bit 7 = HUGE_PAGE on
+/// PDPT/PD entries (must skip — those don't point at a child
+/// table). After the walk, the PML4 frame itself goes back to the
+/// allocator.
+///
+/// # Safety
+/// - `pml4_phys` must be identity-reachable (same precondition
+///   as the rest of this module).
+/// - The PML4 must have been allocated via `new_user_pml4` (so
+///   PML4[1] was cleared) — calling this on the kernel PML4
+///   would free the kernel's own page-table pages.
+/// - All data-page leaves must already have been released. The
+///   `AddressSpace::Drop` path arranges this by calling
+///   `unmap_region_pages` for every region before invoking us.
+/// - No CPU may be using `pml4_phys` as its active CR3 at the
+///   time of the call.
+pub unsafe fn free_user_pml4_tree(pml4_phys: PhysAddr) {
+    use crate::frame::{free_frame, PhysFrame};
+    if pml4_phys.raw() == 0 {
+        return;
+    }
+    // SAFETY: identity-reachable per caller contract.
+    let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
+    for slot in 0..=255usize {
+        let pml4e = pml4.entries[slot];
+        if !pml4e.is_present() {
+            continue;
+        }
+        let pdpt_pa = pml4e.addr();
+        // SAFETY: identity-reachable; PDPT is a page-table frame.
+        let pdpt = unsafe { &mut *pdpt_pa.as_mut_ptr::<PageTable>() };
+        for pdpt_idx in 0..512usize {
+            let pdpte = pdpt.entries[pdpt_idx];
+            if !pdpte.is_present() || pdpte.flags().contains(PtFlags::HUGE_PAGE) {
+                continue;
+            }
+            let pd_pa = pdpte.addr();
+            // SAFETY: same.
+            let pd = unsafe { &mut *pd_pa.as_mut_ptr::<PageTable>() };
+            for pd_idx in 0..512usize {
+                let pde = pd.entries[pd_idx];
+                if !pde.is_present() || pde.flags().contains(PtFlags::HUGE_PAGE) {
+                    continue;
+                }
+                // PT — leaf-level table; data frames already freed
+                // by AddressSpace::unmap_region_pages. Just reclaim
+                // the table page itself.
+                free_frame(PhysFrame::new(pde.addr()));
+            }
+            free_frame(PhysFrame::new(pd_pa));
+        }
+        free_frame(PhysFrame::new(pdpt_pa));
+        // Clear the PML4 slot so a stray reuse panics noisily.
+        pml4.entries[slot] = PageTableEntry::EMPTY;
+    }
+    // Finally release the PML4 itself.
+    free_frame(PhysFrame::new(pml4_phys));
+}
+
 /// Return the PT-level flags currently set for `virt`, or `None` if
 /// unmapped / resolved at a huge-page level. Useful for verifying that
 /// a `map_4kb` call preserved the flags the caller requested (especially

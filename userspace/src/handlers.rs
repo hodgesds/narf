@@ -4696,10 +4696,22 @@ fn sys_brk(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    // Shrink path: lower the recorded break without unmapping. TODO:
-    // Stage-4 follow-up to actually unmap shrunken pages so the phys
-    // frames return to the allocator.
+    // Shrink path: walk the per-page regions the grow path
+    // installed (one Region per 4 KiB page, base = page vaddr) and
+    // unmap each one in [new_break_aligned, cur_aligned). Each
+    // unmap_region call now walks PTEs + free_frame's the underlying
+    // physical page (memory/address_space.rs `unmap_region_pages`),
+    // so the frames return to the allocator instead of leaking.
     if new_break < cur {
+        if let Some(as_ref) = current_address_space() {
+            let cur_aligned = (cur + 0xFFF) & !0xFFFu64;
+            let new_aligned = (new_break + 0xFFF) & !0xFFFu64;
+            let mut va = new_aligned;
+            while va < cur_aligned {
+                let _ = as_ref.unmap_region(VirtAddr::new(va));
+                va += 0x1000;
+            }
+        }
         BRK_TABLE
             .lock()
             .as_mut()
