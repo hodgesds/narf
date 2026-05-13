@@ -296,7 +296,9 @@ const EC_CMD_READ: u8 = 0x80;
 const EC_CMD_WRITE: u8 = 0x81;
 const EC_SC_OBF: u8 = 0x01;
 const EC_SC_IBF: u8 = 0x02;
-const EC_TIMEOUT_POLLS: u32 = 1_000_000;
+/// ACPI 6.5 §5.2.15: an EC command is bounded by T_EC (~10 ms
+/// typical); 100 ms wedge threshold.
+const EC_TIMEOUT_MS: u64 = 100;
 
 static EC_PORTS: narf_lib::sync::IrqSafeSpinLock<Option<(u16, u16)>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
@@ -313,13 +315,13 @@ fn ec_wait_ibf_clear() -> Result<(), FieldAccessError> {
         Some(p) => p,
         None => return Err(FieldAccessError::Unsupported),
     };
-    // responsive_spin ticks sleep_pumps so cursor/FB stay alive
-    // while the EC drains its input buffer.
-    let done = narf_scheduler::responsive_spin(
+    // responsive_spin_until ticks sleep_pumps so cursor/FB stay
+    // alive while the EC drains its input buffer.
+    let done = narf_scheduler::responsive_spin_until(
         // SAFETY: cmd port owned by this driver, validated at EC
         // discovery time.
         || unsafe { io_in(cmd, 1) } as u8 & EC_SC_IBF == 0,
-        EC_TIMEOUT_POLLS,
+        narf_time::Deadline::after_ms(EC_TIMEOUT_MS),
     );
     if done {
         Ok(())
@@ -334,12 +336,12 @@ fn ec_wait_obf_set() -> Result<(), FieldAccessError> {
         Some(p) => p,
         None => return Err(FieldAccessError::Unsupported),
     };
-    // responsive_spin ticks sleep_pumps so cursor/FB stay alive
-    // while the EC fills its output buffer.
-    let done = narf_scheduler::responsive_spin(
+    // responsive_spin_until ticks sleep_pumps so cursor/FB stay
+    // alive while the EC fills its output buffer.
+    let done = narf_scheduler::responsive_spin_until(
         // SAFETY: same.
         || unsafe { io_in(cmd, 1) } as u8 & EC_SC_OBF != 0,
-        EC_TIMEOUT_POLLS,
+        narf_time::Deadline::after_ms(EC_TIMEOUT_MS),
     );
     if done {
         Ok(())
