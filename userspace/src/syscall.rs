@@ -333,6 +333,15 @@ pub enum Syscall {
     /// Unmap memory.
     Munmap = 121,
 
+    /// Change protection on a memory range. arg0 = base addr,
+    /// arg1 = length in bytes, arg2 = POSIX-shape prot bitmask
+    /// (1 = READ, 2 = WRITE, 4 = EXEC). Walks the calling AS's
+    /// region table and rewrites every page's PTE in place via
+    /// `AddressSpace::change_perms_range`. Returns Ok(0) on
+    /// success, InvalidOp if no region intersects the requested
+    /// range or the AS lookup failed.
+    MProtect = 172,
+
     /// Open an FB connection to a scanout. `arg0` = scanout id (0
     /// for the active scanout). Returns a non-zero `FbHandleId` on
     /// success, 0 on failure (no backend / OOM / not authorised).
@@ -901,6 +910,7 @@ impl Syscall {
             234 => Syscall::Chown,
             120 => Syscall::Mmap,
             121 => Syscall::Munmap,
+            172 => Syscall::MProtect,
             130 => Syscall::RingKick,
             140 => Syscall::GetPid,
             141 => Syscall::GetPpid,

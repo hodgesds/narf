@@ -73,12 +73,26 @@ pub unsafe extern "C" fn munmap(addr: *mut c_void, _len: usize) -> c_int {
     }
 }
 
-/// `mprotect(addr, len, prot)` — accept and ignore. NARF's per-page
-/// protection is handled by the kernel-side mapping flags at mmap
-/// time; we don't expose a runtime flip.
+/// `mprotect(addr, len, prot)` — flip permissions on an existing
+/// mapping. Returns 0 on success, -1 + errno=ENOMEM on failure
+/// (no region intersects the range; AS lookup failed; bad bits in
+/// `prot`). Backed by the kernel SYS_MPROTECT introduced this
+/// session.
+///
+/// `prot` follows POSIX: PROT_READ=1, PROT_WRITE=2, PROT_EXEC=4.
+/// The kernel side ignores PROT_NONE (always installs READ at
+/// minimum); call `munmap` if you actually want to drop the
+/// mapping.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mprotect(_addr: *mut c_void, _len: usize, _prot: c_int) -> c_int {
-    0
+pub unsafe extern "C" fn mprotect(addr: *mut c_void, len: usize, prot: c_int) -> c_int {
+    // SAFETY: forwarded; user-runtime issues SYS_MPROTECT.
+    match unsafe { narf_user_runtime::mprotect(addr as *mut u8, len, prot) } {
+        Ok(()) => 0,
+        Err(()) => {
+            crate::errno::set_errno(12); // ENOMEM
+            -1
+        }
+    }
 }
 
 /// `mlock(addr, len)` — accept and ignore.

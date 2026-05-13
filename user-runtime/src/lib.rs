@@ -67,6 +67,7 @@ pub const SYS_FSTAT: u64 = 116;
 pub const SYS_PIPE: u64 = 117;
 pub const SYS_MMAP: u64 = 120;
 pub const SYS_MUNMAP: u64 = 121;
+pub const SYS_MPROTECT: u64 = 172;
 pub const SYS_FB_CONNECT: u64 = 240;
 pub const SYS_FB_INFO: u64 = 241;
 pub const SYS_FB_RING_MAP: u64 = 242;
@@ -1079,6 +1080,26 @@ pub unsafe fn fb_disconnect(handle: u64) -> Result<(), ()> {
 pub unsafe fn munmap(addr: *mut u8) -> Result<(), ()> {
     // SAFETY: SYS_MUNMAP signature: arg0 addr.
     let r = unsafe { syscall1(SYS_MUNMAP, addr as u64) };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+/// Change memory-protection flags on the range `[addr, addr+len)`.
+/// `prot` follows the POSIX bit layout (PROT_READ=1, PROT_WRITE=2,
+/// PROT_EXEC=4). Returns `Ok(())` on success, `Err(())` on
+/// failure (no region intersects the range / AS lookup failed).
+///
+/// # Safety
+/// `addr` should point at a previously-mmap'd region in the
+/// caller's AS. Lowering perms to less than what the caller is
+/// actively using crashes on the next access.
+#[inline]
+pub unsafe fn mprotect(addr: *mut u8, len: usize, prot: i32) -> Result<(), ()> {
+    // SAFETY: SYS_MPROTECT signature: arg0 base, arg1 len, arg2 prot.
+    let r = unsafe { syscall3(SYS_MPROTECT, addr as u64, len as u64, prot as u64) };
     if r == 0 {
         Ok(())
     } else {
